@@ -2706,30 +2706,40 @@ function expandCdTarget(rest, home) {
 }
 
 // #5957 (review r11) — the names a statement binds, read word by word as bash reads them, so argument text
-// (`echo D=5`, `git commit -m "fix for D"`) binds nothing. A binding is: a leading run of `NAME=` / `NAME+=` /
-// `NAME[…]=` words with no command word after it (`A=1 D=/x true` binds only for `true`), a declaration
-// builtin's `NAME=` operand, a `NAME=` / `NAME++` inside arithmetic (`((…))`, `$((…))`, `$[…]`, an assignment's
-// subscript) and `${NAME=…}` / `${NAME:=…}`. A binding builtin (`read`, `for`, `eval`, …) in command position
-// lands in `any`: it may bind any name, and `eval` / `source` / `.` (opaque) even names the text never shows.
-// Offsets are into `text`; the caller drops the ones inside a child shell. One linear pass.
+// (`echo D=5`, `git commit -m "fix for D"`, `${X:-D=5}`) binds nothing. A binding is: a leading run of `NAME=`
+// / `NAME+=` / `NAME[…]=` words with no command word after it (`A=1 D=/x true` binds only for `true`), a
+// declaration builtin's `NAME=` operand (and `local`'s bare names), the names among a binding builtin's
+// operands (`read -r D`, `for D in`, `printf -v D`, `unset D`, `mapfile D`, `getopts o D`), and a `NAME=` /
+// `NAME++` inside arithmetic (`((…))`, `$((…))`, `$[…]`, `let`, a subscript). `${D:=x}` binds nothing a known
+// (non-empty) value would lose. Options after `time` / `command` / `builtin` keep command position, and a
+// function body (`f() { D=1; }`) binds nothing until called. An opaque command word (`eval`, `source`, `.`,
+// `trap`, or one only known at run time: `$X`, `` `…` ``) lands in `any`: it may bind any name, even names the
+// text never shows. Offsets are into `text`; the caller drops the ones inside a child shell. One linear pass.
 const DECLARATION_BUILTINS = new Set(['declare', 'typeset', 'export', 'readonly', 'local']);
-const BINDING_BUILTINS = new Set(['local', 'read', 'for', 'select', 'mapfile', 'readarray', 'unset', 'let', 'getopts', 'eval', 'source', '.']);
-const OPAQUE_BUILTINS = new Set(['eval', 'source', '.']);
-// words after which the next word is still in command position
+// builtins that bind the names among their operands, with the option letters that take an argument
+const OPERAND_BUILTINS = new Map([['read', 'pdutnNi'], ['mapfile', 'dnOsuCc'], ['readarray', 'dnOsuCc'], ['unset', ''], ['getopts', '']]);
+const OPAQUE_BUILTINS = new Set(['eval', 'source', '.', 'trap']);
+// words after which the next word is still in command position (after the OPTION_LEADS, its options too)
 const LEAD_WORDS = new Set(['if', 'then', 'else', 'elif', 'while', 'until', 'do', 'time', '!', 'command', 'builtin', 'coproc', 'function']);
+const OPTION_LEADS = new Set(['time', 'command', 'builtin']);
 const ARITH_SITE = /([A-Za-z_]\w*)[ \t]*(?:\+\+|--|(?:<<|>>|[-+*/%&|^])?=(?!=))|(?:\+\+|--)[ \t]*([A-Za-z_]\w*)/y;
-const PARAM_SITE = /([A-Za-z_]\w*)(?:\[[^\]]{0,256}\])?[:+]?=(?!=)/y;
 const ASSIGN_WORD = /^([A-Za-z_]\w*)(?:\[([^\]]*)\])?\+?=/;
-const PRINTF_V = /[ \t]+-v/y;
+const NAME_WORD = /^([A-Za-z_]\w*)(?:\[|$)/;
 function boundNames(text) {
   const s = String(text);
   const sites = [];
   const any = [];
-  const stack = [];                   // dq | tick | sub | param | arith | arithb (`$[…]`)
-  let mode = 'cmd';                   // cmd: a word here is an assignment or the command word; decl; arg
+  const stack = [];                   // dq | tick | sub | param | arith | arithb (`$[…]`, a `${…}` subscript)
+  let mode = 'cmd';                   // cmd | decl | operands | loop | printf | printfv | let | arg
   let pending = [];                   // leading assignments: bound only when no command word follows
   let target = false;                 // the next word is a redirection target
   let start = -1;                     // where the current top-level word began
+  let opts = '';                      // operands mode: the option letters that take an argument
+  let skip = false;                   // operands mode: this word is an option's argument
+  let bare = false;                   // decl mode: a bare name binds too (`local D`)
+  let afterLead = '';                 // the lead word just read (`time`, `command`, `function`, …)
+  let fnDef = false;                  // a function name was just read: its `{` body binds nothing
+  let stop = false;
   const site = (re, i) => {
     if (/[\w$]/.test(s[i - 1] ?? ' ')) return;
     re.lastIndex = i;
@@ -2747,29 +2757,54 @@ function boundNames(text) {
   };
   const single = (i) => { const j = s.indexOf("'", i + 1); return j < 0 ? s.length : j; };
   const ansi = (i) => { let j = i + 2; while (j < s.length && s[j] !== "'") j += s[j] === '\\' ? 2 : 1; return j; };
-  const endCommand = () => { sites.push(...pending); pending = []; mode = 'cmd'; target = false; };
+  const endCommand = () => { sites.push(...pending); pending = []; mode = 'cmd'; target = false; skip = false; afterLead = ''; fnDef = false; };
+  const commandWord = (raw, word, at) => {
+    pending = [];
+    mode = 'arg';
+    if (OPAQUE_BUILTINS.has(word) || /^"?(?:\$(?!')|`)/.test(raw)) any.push({ at });
+    else if (DECLARATION_BUILTINS.has(word)) { mode = 'decl'; bare = word === 'local'; }
+    else if (OPERAND_BUILTINS.has(word)) { mode = 'operands'; opts = OPERAND_BUILTINS.get(word); }
+    else if (word === 'for' || word === 'select') mode = 'loop';
+    else if (word === 'printf' || word === 'let') mode = word;
+  };
   const finish = (end) => {
     if (start < 0) return;
     const at = start;
     const raw = s.slice(at, end);
     start = -1;
     if (target) { target = false; return; }
-    if (raw === '{' || raw === '}') { mode = 'cmd'; return; }
+    const lead = afterLead;
+    afterLead = '';
+    if (raw === '{' || raw === '}') { stop = raw === '{' && fnDef; mode = 'cmd'; fnDef = false; return; }
+    fnDef = false;
     const a = raw.match(ASSIGN_WORD);
-    if (a && mode !== 'arg' && a[2] !== undefined) {
-      for (let j = at + a[1].length + 1; j < at + a[1].length + 1 + a[2].length; j++) site(ARITH_SITE, j);
-    }
+    const word = raw.replace(/^\$'(.*)'$/s, '$1').replace(/['"\\]/g, '');
+    const name = word.match(NAME_WORD)?.[1];
+    const subscript = () => {
+      if (a?.[2] !== undefined) for (let j = at + a[1].length + 1; j < at + a[1].length + 1 + a[2].length; j++) site(ARITH_SITE, j);
+    };
     if (mode === 'cmd') {
-      if (a) { pending.push({ name: a[1], at }); return; }
-      if (LEAD_WORDS.has(raw)) return;
-      pending = [];
-      const word = raw.replace(/['"\\]/g, '');
-      mode = DECLARATION_BUILTINS.has(word) ? 'decl' : 'arg';
-      PRINTF_V.lastIndex = end;
-      if (BINDING_BUILTINS.has(word) || (word === 'printf' && PRINTF_V.test(s))) any.push({ at, opaque: OPAQUE_BUILTINS.has(word) });
-    } else if (mode === 'decl' && a) sites.push({ name: a[1], at });
+      if (lead === 'function' || /^[A-Za-z_][\w-]*\(\)$/.test(raw)) { fnDef = true; return; }
+      if (a) { subscript(); pending.push({ name: a[1], at }); return; }
+      if (OPTION_LEADS.has(lead) && raw.startsWith('-')) { afterLead = lead; return; }
+      if (LEAD_WORDS.has(raw)) { afterLead = raw; return; }
+      commandWord(raw, word, at);
+    } else if (mode === 'decl') {
+      if (a) { subscript(); sites.push({ name: a[1], at }); } else if (bare && name) sites.push({ name, at });
+    } else if (mode === 'operands') {
+      if (skip) skip = false;
+      else if (word.startsWith('-')) skip = opts.includes(word.at(-1));
+      else if (name) sites.push({ name, at });
+    } else if (mode === 'loop') {
+      if (name) sites.push({ name, at });
+      mode = 'arg';
+    } else if (mode === 'printf') mode = word === '-v' ? 'printfv' : 'arg';
+    else if (mode === 'printfv') {
+      if (name) sites.push({ name, at });
+      mode = 'arg';
+    } else if (mode === 'let') for (let j = at; j < end; j++) site(ARITH_SITE, j);
   };
-  for (let i = 0; i < s.length; i++) {
+  for (let i = 0; i < s.length && !stop; i++) {
     const ch = s[i];
     const top = stack.at(-1);
     if (top === 'tick') { if (ch === '\\') i += 1; else if (ch === '`') stack.pop(); continue; }
@@ -2784,7 +2819,7 @@ function boundNames(text) {
       else if (ch === "'") i = single(i);
       else if (ch === '"') stack.push('dq');
       else if ((ch === '$' && '({['.includes(s[i + 1] ?? ' ')) || ch === '`') i = opener(i);
-      else if (top === 'param') { if (ch === '}') stack.pop(); else site(PARAM_SITE, i); }
+      else if (top === 'param') { if (ch === '}') stack.pop(); else if (ch === '[') stack.push('arithb'); }
       else if (top === 'arithb') { if (ch === ']') stack.pop(); else if (ch === '[') stack.push('arithb'); else site(ARITH_SITE, i); }
       else if (ch === '(') stack.push(top);
       else if (ch === ')') stack.pop();
@@ -2792,6 +2827,14 @@ function boundNames(text) {
       continue;
     }
     if (ch === ' ' || ch === '\t') { finish(i); continue; }
+    // a redirection (`>f`, `2>&1`, `&>f`): the next word is its target, not a command word
+    if ((ch === '<' || ch === '>' || (ch === '&' && s[i + 1] === '>')) && s[i + 1] !== '(') {
+      if (start >= 0 && /^\d+$/.test(s.slice(start, i))) start = -1;   // an fd number (`2>f`)
+      else finish(i);
+      while ('<>&|'.includes(s[i + 1] ?? ' ') && s[i + 2] !== '(') i += 1;
+      target = true;
+      continue;
+    }
     if (ch === '\n' || ch === ';' || ch === '&' || ch === '|') { finish(i); endCommand(); continue; }
     if (ch === ')') { finish(i); endCommand(); continue; }
     if (ch === '(' && start < 0) {
@@ -2800,13 +2843,6 @@ function boundNames(text) {
       continue;
     }
     if (ch === '#' && start < 0) break;                          // a comment
-    if ((ch === '<' || ch === '>') && s[i + 1] !== '(') {
-      if (start >= 0 && /^\d+$/.test(s.slice(start, i))) start = -1;   // an fd number (`2>f`)
-      else finish(i);
-      while ('<>&|'.includes(s[i + 1] ?? ' ') && s[i + 2] !== '(') i += 1;
-      target = true;
-      continue;
-    }
     if (start < 0) start = i;
     if (ch === '\\') i += 1;
     else if (ch === "'") i = single(i);
@@ -2815,7 +2851,7 @@ function boundNames(text) {
     else if (ch === '$' || ch === '`') i = opener(i);
     else if (ch === '(' || ch === '<' || ch === '>') { stack.push('sub'); if (ch !== '(') i += 1; }  // `a=(…)`, `<(…)`
   }
-  finish(s.length);
+  if (!stop) finish(s.length);
   endCommand();
   return { sites, any };
 }
@@ -2841,10 +2877,21 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
 // cwd above keeps main's single answer; this set only ever ADDS directories a daemon-clone write is checked
 // against, so it over-approximates on purpose (`(cd <clone>; ls); git commit` is refused too).
 export function resolveCdLandings(command, reportedCwd, resolvePath = resolve, home = process.env.HOME ?? null) {
-  return [...new Set(analyzeCwd(command, reportedCwd, resolvePath, home, { left: { n: NESTED_NODE_CAP }, depth: 0 }).landings)];
+  return resolveCwdAndLandings(command, reportedCwd, resolvePath, home).landings;
+}
+// both in one walk (the hook's call); a fault in the landing walk keeps the effective cwd and no landings
+const NESTED_CWD_BYTES = 1 << 16;
+export function resolveCwdAndLandings(command, reportedCwd, resolvePath = resolve, home = process.env.HOME ?? null) {
+  try {
+    const r = analyzeCwd(command, reportedCwd, resolvePath, home, { left: { n: NESTED_NODE_CAP, bytes: NESTED_CWD_BYTES }, depth: 0 });
+    return { cwd: r.cwd, landings: [...new Set(r.landings)] };
+  } catch {
+    return { cwd: resolveEffectiveCwd(command, reportedCwd, resolvePath, home), landings: [] };
+  }
 }
 
-// `nest` (null: the effective cwd only) carries the shared budget (`left.n`) and depth of the re-executed-string walk
+// `nest` (null: the effective cwd only) carries the shared budget (`left.n` analyses, `left.bytes` of input)
+// and depth of the re-executed-string walk
 function analyzeCwd(command, reportedCwd, resolvePath, home, nest) {
   // r3 audit — a heredoc BODY is data. A `cd /elsewhere` line (or an apostrophe that desyncs the quote
   // scanner) inside a PR-body heredoc must not steer, or break, the cwd resolution; `decide` already strips
@@ -2904,6 +2951,8 @@ function analyzeCwd(command, reportedCwd, resolvePath, home, nest) {
   // the value it had THEN (other names keep the base's last-value reading)
   const history = Object.create(null);
   const homeNames = new Set();
+  const childVals = Object.create(null);                      // a child shell's expandable assignments
+  const childHomes = [];
   let assignHome = initialHome;
   const record = (name, at, value) => {
     if (value === undefined) delete vars[name];
@@ -2914,8 +2963,8 @@ function analyzeCwd(command, reportedCwd, resolvePath, home, nest) {
   // `D+=x`, `D[0]=x`, `declare D=/x`, `read D`, `for D in …`): a home-derived name learns it changed there.
   // A bare `export D` / `readonly D` keeps the value, so declaration words count only through `D=`; argument
   // text (`echo D=5`) binds nothing (boundNames). A binding inside a child shell (`( D=/tmp )`, `X=$(D=/tmp)`)
-  // leaves the parent's value alone; a binding builtin in this shell (`eval "$(…)"`) still counts every name
-  // the statement mentions. `lead` is the offset of the statement's leading `NAME=` word, which the walk reads
+  // leaves the parent's value alone; an opaque command word in this shell (`eval "$(…)"`, `$X`) still counts
+  // every name the statement mentions. `lead` is the offset of the statement's leading `NAME=` word, which the walk reads
   // itself: `leadBound` says whether bash binds it (no command word follows it).
   const scanned = [];
   const rebound = (at, lead = -1) => {
@@ -2925,7 +2974,7 @@ function analyzeCwd(command, reportedCwd, resolvePath, home, nest) {
     const sites = b.sites.filter((x) => here(x.at));
     return {
       names: builtins.length ? (segs[at].match(/[A-Za-z_]\w*/g) ?? []) : sites.filter((x) => x.at !== lead).map((x) => x.name),
-      opaque: builtins.some((w) => w.opaque),
+      opaque: builtins.length > 0,
       leadBound: sites.some((x) => x.at === lead),
     };
   };
@@ -2935,6 +2984,14 @@ function analyzeCwd(command, reportedCwd, resolvePath, home, nest) {
       const c = stmt.trim().match(/^(?:export\s+)?([A-Za-z_]\w*)=(\S+)$/);
       if (c && !/[`$(~]/.test(c[2])) vars[c[1]] = c[2].replace(/^(['"])(.*)\1$/, '$2');
       return;
+    }
+    // a child shell's assignment (`( D=~/c; cd "$D" … )`), which a cd in that same child shell reads: kept for
+    // the landings only
+    const ca = stmt.match(/^([\s(]*)(?:export\s+)?([A-Za-z_]\w*)=(\S+)/);
+    if (ca && depths[at][ca[1].length] > 0) {
+      const expanded = expandCdTarget(ca[3].replace(/\)+$/, ''), assignHome);
+      if (expanded) childVals[ca[2]] = expanded;
+      if (ca[2] === 'HOME' && usableHome(expanded)) childHomes.push(expanded);
     }
     const m = stmt.trim().match(/^(?:export\s+)?([A-Za-z_]\w*)=(.+)$/);
     if (m && inChild(at)) {
@@ -3008,27 +3065,49 @@ function analyzeCwd(command, reportedCwd, resolvePath, home, nest) {
     // still unexpanded / globby → fail safe; a `[` is a glob only outside quotes
     return usable(target, quoted) ? absolute(target) : null;
   };
-  // the landings of segment `at` (resolveCdLandings): a cd behind openers (`(cd`, `((cd`, `{ cd`, `if cd`, …),
-  // read against what the walk knows here, plus the first cd of each re-executed string in it, read after this
-  // command's earlier plain assignments. A home-derived name a child shell may have set also lands on its
-  // literal reading.
+  // the landings of segment `at` (resolveCdLandings): any cd the segment starts with — behind openers (`(cd`,
+  // `((cd`, `{ cd`, `if cd`, `command cd`, …), spelled `\cd` / `"cd"` / `pushd`, after options (`-P`, `--`), or
+  // a later top-level one — read against what the walk knows here; plus the first cd of each re-executed string
+  // in it, read after this command's last plain assignment of each name it mentions. A name or HOME a child
+  // shell may have set also lands on that reading.
+  const CD_ANYWHERE = /^[ \t\n]*(?:(?:\(|(?:\{|!|if|then|else|elif|while|until|do|time|command|builtin)[ \t\n])[ \t\n]*)*(?:\\?cd|"cd"|'cd'|pushd)[ \t]+([^]*)$/;
+  let assignAt = null;                                        // name → the plain top-level segments assigning it
+  const prefixFor = (at, text) => {
+    if (!assignAt) {
+      assignAt = new Map();
+      segs.forEach((s, k) => {
+        const a = !commented[k] && !inChild(k) && s.match(/^\s*(?:export\s+)?([A-Za-z_]\w*)=/);
+        if (a) (assignAt.get(a[1]) ?? assignAt.set(a[1], []).get(a[1])).push(k);
+      });
+    }
+    const last = (name) => (assignAt.get(name) ?? []).filter((k) => k < at).at(-1);
+    const ks = new Set();
+    for (const [, name] of text.matchAll(/\$\{?([A-Za-z_]\w*)/g)) if (last(name) !== undefined) ks.add(last(name));
+    if (/~|\$\{?HOME\b/.test(text) || [...ks].some((k) => /~|\$\{?HOME\b/.test(segs[k]))) {
+      if (last('HOME') !== undefined) ks.add(last('HOME'));
+    }
+    return [...ks].sort((x, y) => x - y).map((k) => segs[k]).join('\n');
+  };
   const landingsOf = (at) => {
     const out = [];
-    const opened = segs[at].match(/^[ \t\n]*(?:(?:\(|(?:\{|!|if|then|else|elif|while|until|do|time)[ \t\n])[ \t\n]*)+cd[ \t]+([^]*)$/);
-    if (opened) {
-      const cut = maskQuoted(opened[1]).search(/[)`]/);     // `(cd /P)`: the operand ends at an unquoted `)`
-      const rest = cut < 0 ? opened[1] : opened[1].slice(0, cut);
-      const target = cdTarget(at, rest.trim(), rest);
+    const found = segs[at].match(CD_ANYWHERE);
+    if (found) {
+      const cut = maskQuoted(found[1]).search(/[)`]/);       // `(cd /P)`: the operand ends at an unquoted `)`
+      const rest = (cut < 0 ? found[1] : found[1].slice(0, cut)).replace(/^(?:-[LPe@]+[ \t]+)*(?:--[ \t]+)?/, '');
+      const raw = rest.trim();
+      const target = cdTarget(at, raw, rest);
       if (target) out.push(target);
-      const v = rest.trim().split(/\s+/)[0].replace(/^"(.*)"$/, '$1').match(/^\$\{?([A-Za-z_]\w*)\}?$/);
-      if (v && homeNames.has(v[1]) && usable(vars[v[1]], false)) out.push(absolute(vars[v[1]]));
+      const v = raw.split(/\s+/)[0].replace(/^"(.*)"$/, '$1').match(/^\$\{?([A-Za-z_]\w*)\}?$/);
+      for (const alt of v ? [vars[v[1]], childVals[v[1]]] : []) if (usable(alt, false)) out.push(absolute(alt));
+      if (homeSpelled(raw)) for (const h of childHomes) { const t = expandCdTarget(rest, h); if (t) out.push(absolute(t)); }
     }
-    const prefix = () => segs.slice(0, at).filter((s, k) => !commented[k] && !inChild(k)
-      && /^\s*(?:export\s+)?[A-Za-z_]\w*=/.test(s)).join('\n');
     for (const text of nestedCommandStrings(segs[at])) {
-      if (nest.left.n <= 0 || nest.depth >= NESTED_DEPTH_CAP || !/(?:^|[\s;&|(`{!])cd[ \t]/.test(text)) continue;
+      if (nest.left.n <= 0 || nest.depth >= NESTED_DEPTH_CAP || !/(?:cd|pushd)\W/.test(text)) continue;
+      const input = `${prefixFor(at, text)}\n${text}`;
+      if (input.length > nest.left.bytes) continue;
       nest.left.n -= 1;
-      const inner = analyzeCwd(`${prefix()}\n${text}`, reportedCwd, resolvePath, home, { left: nest.left, depth: nest.depth + 1 });
+      nest.left.bytes -= input.length;
+      const inner = analyzeCwd(input, reportedCwd, resolvePath, home, { left: nest.left, depth: nest.depth + 1 });
       if (inner.cwd !== reportedCwd) out.push(inner.cwd);
       out.push(...inner.landings);
     }
@@ -3894,8 +3973,10 @@ export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLi
   // `primaryCwd`/lease context — a daemon clone is neither a primary checkout nor an ordinary leased lane):
   // see `daemonCloneWriteReason`'s own doc for the two shapes it catches and the one it deliberately does not.
   // #5957 (review r11) — and against every other directory a `cd` in the command may land a command in
-  // (`resolveCdLandings`: a child shell, a group, a re-executed string)
-  const daemonWrite = [cwd, ...landingCwds].reduce((r, dir) => r ?? daemonCloneWriteReason(s, { cwd: dir, roots: daemonCloneRoots }), null);
+  // (`resolveCdLandings`: a child shell, a group, a re-executed string), with a compound word peeled off the
+  // segment (`then git checkout …`, `do rm …`) so the command it starts is still seen
+  const bare = s.replace(/^(?:(?:then|do|else|elif|if|while|until|time|!|\{)[ \t\n]+)+/, '');
+  const daemonWrite = [cwd, ...landingCwds].reduce((r, dir) => r ?? daemonCloneWriteReason(bare, { cwd: dir, roots: daemonCloneRoots }), null);
   if (daemonWrite) return daemonWrite;
 
   // xpnhz4o — a bare full-suite run. Before the raw-heavy arm so a bare `vitest run` gets THIS message (which
@@ -4924,10 +5005,11 @@ if (IS_CLI) {
     const rp = (p) => { try { return realpathSync(p); } catch { return p; } };
     // #2335 — the reported cwd resets to the primary between calls; honour a leading `cd <lane>` so a genuine
     // lane mutation isn't misread as a primary one (and the #2323 git call runs in the lane, not the primary).
-    const cwd = rp(resolveEffectiveCwd(cmd, ev.cwd || process.cwd()));
+    // #5957 — and every other directory a `cd` may land a command in (checked by the daemon-clone arm only)
+    const resolved = resolveCwdAndLandings(cmd, ev.cwd || process.cwd());
+    const cwd = rp(resolved.cwd);
     effectiveCwd = cwd;
-    // only ever adds directories to check; a fault here must not take the rest of the guard down with it
-    try { landingCwds = resolveCdLandings(cmd, ev.cwd || process.cwd()).map(rp); } catch { landingCwds = []; }
+    landingCwds = resolved.landings.map(rp);
     const weRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
     const workspace = dirname(weRoot);
     const primaries = ['webeverything', 'web-everything', 'frontierui', 'plateau-app'].map((r) => rp(join(workspace, r)));

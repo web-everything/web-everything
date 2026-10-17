@@ -831,13 +831,38 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
       'D=~/x; D=/clone; D=/tmp :; cd "$D" && ls',      // a prefix binds only for its command (bash, not posix mode)
       'D=~/x; D=/clone; [[ D=5 ]]; cd "$D" && ls',
       'D=~/x; D=/clone; case D=5 in x) :;; esac; cd "$D" && ls',
+      // self-review r11 — operator words of `${…}`, `&>`, a function body never called, and a builtin's
+      // non-name operands bind nothing; `${D:=x}` cannot change a name that already has a value
+      'D=~/x; D=/clone; echo ${X:-D=5} ${X:+D=5} ${X#D=} ${X%D=*} ${X/D=/y}; cd "$D" && ls',
+      'D=~/x; D=/clone; git commit -m "${X:-D=5}"; cd "$D" && ls',
+      'D=~/x; D=/clone; echo hi &>/dev/null D=5; cd "$D" && ls',
+      'D=~/x; D=/clone; f() { D=/tmp; }; cd "$D" && ls',
+      'D=~/x; D=/clone; function f { D=/tmp; }; cd "$D" && ls',
+      'D=~/x; D=/clone; echo ${D:=/tmp}; cd "$D" && ls',
+      'D=~/x; D=/clone; echo "${D=/tmp}"; cd "$D" && ls',
+      'D=~/x; D=/clone; for f in "$D"/x; do :; done; cd "$D" && ls',
+      'D=~/x; D=/clone; read -r X < "$D/f"; cd "$D" && ls',
+      'D=~/x; D=/clone; read X <<< D=5; cd "$D" && ls',
+      'D=~/x; D=/clone; read -p D X; cd "$D" && ls',
+      'D=~/x; D=/clone; printf "%s" D; cd "$D" && ls',
     ]) expect(at(cmd), JSON.stringify(cmd)).toBe('/clone');
     for (const cmd of [
       'D=~/x; D=/clone; echo "$((D=5))"; cd "$D" && ls',
       'D=~/x; D=/clone; echo $(( D = 5 )); cd "$D" && ls',
-      'D=~/x; D=/clone; echo ${D:=/tmp}; cd "$D" && ls',
-      'D=~/x; D=/clone; echo "${D=/tmp}"; cd "$D" && ls',
+      'D=~/x; D=/clone; echo $((D++)); cd "$D" && ls',
       'D=~/x; D=/clone; echo ${a[D=5]}; cd "$D" && ls',
+      'D=~/x; D=/clone; command -p read D; cd "$D" && ls',
+      'D=~/x; D=/clone; time -p read D; cd "$D" && ls',
+      "D=~/x; D=/clone; $'read' D; cd \"$D\" && ls",
+      'D=~/x; D=/clone; "read" -r D; cd "$D" && ls',
+      'D=~/x; D=/clone; read -a D; cd "$D" && ls',
+      'D=~/x; D=/clone; mapfile -t D < f; cd "$D" && ls',
+      'D=~/x; D=/clone; getopts ab D; cd "$D" && ls',
+      'D=~/x; D=/clone; unset -v D; cd "$D" && ls',
+      'D=~/x; D=/clone; local D; cd "$D" && ls',
+      'D=~/x; D=/clone; let "D = 5"; cd "$D" && ls',
+      'D=~/x; D=/clone; X=eval; $X D=/tmp; cd "$D" && ls',
+      'D=~/x; D=/clone; trap "D=/tmp" DEBUG; cd "$D" && ls',
       'D=~/x; D=/clone; a[D=5]=1; cd "$D" && ls',
       'D=~/x; D=/clone; command read D; cd "$D" && ls',
       'D=~/x; D=/clone; >f D=/tmp; cd "$D" && ls',
@@ -846,7 +871,6 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
       'D=~/x; D=/clone; export A=1 D+=/x; cd "$D" && ls',
       'D=~/x; D=/clone; A="x y" D=/tmp; cd "$D" && ls',
       'D=~/x; D=/clone; let D=5; cd "$D" && ls',
-      'D=~/x; D=/clone; f() { D=/tmp; }; cd "$D" && ls',
     ]) expect(at(cmd), JSON.stringify(cmd)).toBe(REPORTED);
   });
   it('a HOME rebinding the plain walk cannot read leaves home unknown', () => {
@@ -865,6 +889,11 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
       'HOME=/a; eval "$X"; cd ~/clone && ls',
       'HOME=/a; source ./env; cd ~/clone && ls',
       'HOME=/a; HOME+=/b; D=~/clone; cd "$D" && ls',
+      'HOME=/a; time -p eval HOME=/b; cd ~/clone && ls',
+      'HOME=/a; command -p eval HOME=/b; cd ~/clone && ls',
+      "HOME=/a; $'eval' HOME=/b; cd ~/clone && ls",
+      'HOME=/a; X=eval; $X HOME=/b; cd ~/clone && ls',
+      'HOME=/a; trap "HOME=/b" DEBUG; cd ~/clone && ls',
     ]) expect(at(cmd), JSON.stringify(cmd)).toBe(REPORTED);
     // text that binds nothing here keeps the home this shell has
     expect(at('HOME=/a; echo HOME=/b; cd ~/clone && ls')).toBe('/a/clone');
@@ -912,6 +941,28 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     ]) expect(lands(cmd), JSON.stringify(cmd)).toContain('/P');
     expect(lands('HOME=/h; (cd ~/P; git checkout)')).toContain('/h/P');
     expect(lands('(cd ~/clone; ls)')).toContain(`${HOME}/clone`);
+    // self-review r11 — a later top-level cd, cd options and spellings, and a child shell's own assignment
+    for (const cmd of [
+      'cd /lane && cd /P && git checkout --detach',
+      'cd /x 2>/dev/null; cd /P',
+      'cd -P /P && git checkout',
+      'cd -L -- /P',
+      'command cd /P',
+      'builtin cd /P',
+      '\\cd /P',
+      '"cd" /P',
+      'pushd /P',
+      'D=~/lane; ( D=/P; cd "$D" && git checkout --detach )',
+    ]) expect(lands(cmd), JSON.stringify(cmd)).toContain('/P');
+    expect(lands('D=~/lane; ( D=~/c; cd "$D" && git checkout --detach )')).toContain(`${HOME}/c`);
+    expect(lands('(HOME=/h; cd ~/P)')).toContain('/h/P');
+    // the effective cwd still keeps main's reading of an option
+    expect(at('cd -P /P && ls')).toBe(`${REPORTED}/-P`);
+    // the re-executed-string walk stays bounded however many strings and assignments come before them
+    const started = Date.now();
+    lands(`${'D=~/c; '.repeat(5000)}${'eval "cd /P"; '.repeat(64)}git checkout --detach`);
+    lands(`${'D=/x; '.repeat(5000)}${'X=$(cd "$D"); '.repeat(200)}`);
+    expect(Date.now() - started).toBeLessThan(8000);
     for (const cmd of [
       'echo "(cd /P)"',
       "echo '$(cd /P)'",
@@ -3993,6 +4044,9 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
     ['a brace group', `{ cd ${fakeClone}; git checkout --detach; }`],
     ['a subshell cd of a literal variable', `D=${fakeClone}; (cd "$D"; git checkout --detach)`],
     ['a subshell cd of a home spelling', '(cd ~/some-new-daemon-clone; git checkout --detach)'],
+    ['an if condition', `if cd ${fakeClone}; then git checkout --detach; fi`],
+    ['a later top-level cd', `cd ${lane} && cd ${fakeClone} && git checkout --detach`],
+    ['a cd option', `cd -P ${fakeClone} && git checkout --detach`],
   ])('DENIES a mutation after a child-shell cd into the clone: %s', (_name, command) => {
     const out = runHook(command, lane, root);
     expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
