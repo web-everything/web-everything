@@ -1,3 +1,4 @@
+import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { advisoryLabelOutcome } from '../lib/review-advisory-outcome.mjs';
 export { advisoryLabelOutcome, deriveAdvisoryOutcome } from '../lib/review-advisory-outcome.mjs';
 import { openOperatorSendBacks, renderOperatorSendBackReviewBlock, operatorSendBackVerdict } from '../lib/operator-send-backs.mjs';
@@ -842,6 +843,7 @@ export function reviewSeatOptionsForRun(record, settings, live = {}) {
   const [codexAdvisory, correctnessAdvisory, antigravityReview, agyCorrectnessAdvisory] = OPTIONAL_SEATS.map(seated);
   return {
     securitySeat: securitySeatFromRun(record),
+    cardOnlyLight: read.cardOnlyLight === true,
     codexAdvisory, correctnessAdvisory, antigravityReview,
     ...(Number.isSafeInteger(read.minNonClaudeSeats) && read.minNonClaudeSeats >= 0 ? { minNonClaudeSeats: read.minNonClaudeSeats } : {}),
     seatSettings: { ...(settings ?? {}), agyCorrectnessAdvisory, preserveSavedRoster: true },
@@ -1571,6 +1573,12 @@ export function buildReviewJudgeRequest({ read, lens, aim = '', seatProvider = n
     // the security seat — and the correctness one with it — `--tools ''`. That is #3158, and it is open.
     allowedTools: REVIEW_JUROR_TOOLS,
   };
+}
+
+/** The single blocking Codex correctness seat for a verified card-only net diff. */
+export function buildCardOnlyJudgeRequest(read, aim = '') {
+  const { allowedTools, model, seatProvider, ...request } = buildReviewJudgeRequest({ read, lens: 'correctness', aim });
+  return { ...request, providerName: 'codex', mandate: request.mandate + '\n\n' + CODEX_ADVISORY_SANDBOX_CORRECTION };
 }
 
 /**
@@ -2331,6 +2339,7 @@ export function reviewPrOperation({
   // as it always was. Only a CALLER that has read the PR's touch-set before the run starts may pass `false` (see
   // `seatSecurityForTouchSet`); a resume reads it off the saved run (`securitySeatFromRun`), never re-derives it.
   securitySeat = true,
+  cardOnlyLight = false,
   // Zero is reserved for historical declaration fixtures; operational settings require at least one.
   minNonClaudeSeats = seatSettings?.minNonClaudeSeats ?? 1,
 } = {}) {
@@ -2341,7 +2350,8 @@ export function reviewPrOperation({
     if (Number(codexAdvisory) + Number(correctnessAdvisory) < minNonClaudeSeats) codexAdvisory = true;
     if (Number(codexAdvisory) + Number(correctnessAdvisory) < minNonClaudeSeats) correctnessAdvisory = true;
   }
-  const agyCorrectness = seatSettings?.agyCorrectnessAdvisory === true;
+  if (cardOnlyLight) { codexAdvisory = false; correctnessAdvisory = false; antigravityReview = false; minNonClaudeSeats = 1; }
+  const agyCorrectness = !cardOnlyLight && seatSettings?.agyCorrectnessAdvisory === true;
   if (agyCorrectness && (MANDATORY_LENSES.includes(AGY_CORRECTNESS_LENS) || PANEL_LENSES.includes(AGY_CORRECTNESS_LENS))) {
     throw new Error(`review-pr: \`AGY_CORRECTNESS_LENS\` (${AGY_CORRECTNESS_LENS}) must stay outside MANDATORY_LENSES/PANEL_LENSES — it is advisory only.`);
   }
@@ -2582,6 +2592,9 @@ export function reviewPrOperation({
           readPr({ pr: view.input.pr, repo: view.input.repo }),
           { pr: view.input.pr, repo: view.input.repo, careLevel: view.input.careLevel },
         );
+        if (cardOnlyLight && (view.input.lens !== 'correctness' || !isCardOnlyDiff([...finding.netChangedFiles, ...finding.netRenameSources]))) {
+          throw new Error('card-only light lane contradicted by pinned net diff or lens');
+        }
         // The roster was chosen from a file list read BEFORE the run; the net list just computed is the ground truth.
         assertRosterHolds({
           declared: securitySeat !== false, netChangedFiles: [...finding.netChangedFiles, ...finding.netRenameSources],
@@ -2590,7 +2603,7 @@ export function reviewPrOperation({
         // THE ROSTER, RECORDED BY THE BUILD ITSELF (not an input a caller could name): a resume reads it back with
         // `securitySeatFromRun`, so a seat that failed or has not answered yet cannot change it. `seatSteps` and the
         // minimum are read back the same way by `reviewSeatOptionsForRun`, at every cursor position.
-        return { ...finding, securitySeat: securitySeat !== false, seatSteps: seats.map((seat) => seat.step), minNonClaudeSeats };
+        return { ...finding, cardOnlyLight, securitySeat: securitySeat !== false, seatSteps: seats.map((seat) => seat.step), minNonClaudeSeats };
       },
     }),
 
@@ -2600,7 +2613,7 @@ export function reviewPrOperation({
     // `buildReviewJudgeRequest`, shared with the `judgeSecurity` seat below so the two differ in one field.
     judge: judgeStep({
       reads: ['input.lens', 'input.aim', 'findings.read'],
-      request: (view) => buildReviewJudgeRequest({
+      request: (view) => cardOnlyLight ? buildCardOnlyJudgeRequest(view.findings.read, view.input.aim) : buildReviewJudgeRequest({
         read: view.findings.read,
         lens: view.input.lens,
         // #3094 — the caller's aim rides in the MANDATE, beside the goal. `input.aim` is DECLARED in `reads`
@@ -2640,7 +2653,7 @@ export function reviewPrOperation({
           read: view.findings.read,
           lens: SECURITY_LENS,
           aim: typeof view.input.aim === 'string' ? view.input.aim : '',
-          seatProvider: directiveFor(SECURITY_LENS, view.findings.read),
+          seatProvider: cardOnlyLight ? null : directiveFor(SECURITY_LENS, view.findings.read),
         }),
       }),
     } : {}),
@@ -2800,7 +2813,7 @@ export function reviewPrOperation({
         // act on.
         const seats = [
           // `tools: true` (#4815) — the panel jurors are tool-bearing (`allowedTools: REVIEW_JUROR_TOOLS`), so they bypass the confirmation turn.
-          { step: JUDGE_STEPS[0], lens: view.input.lens, answer: view.findings.judge, tools: true },
+          { step: JUDGE_STEPS[0], lens: view.input.lens, answer: view.findings.judge, tools: true, ...(cardOnlyLight ? { provider: 'codex' } : {}) },
           ...(securitySeat !== false ? [{ step: SECURITY_SEAT_STEP, lens: SECURITY_LENS, answer: view.findings.judgeSecurity, tools: true }] : []),
           // #xqa9ttq — THE THIRD SEAT, ONLY WHEN SEATED. `ADVISORY_JUDGE_LENS` is a LITERAL here, exactly
           // like `SECURITY_LENS` above, for the same reason: it is not caller-negotiable. `provider: 'codex'`
@@ -3437,7 +3450,7 @@ export function reviewPrOperation({
     );
   }
 
-  return declaration;
+  return Object.freeze({ ...declaration, cardOnlyLight });
 }
 
 /**

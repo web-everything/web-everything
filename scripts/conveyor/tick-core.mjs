@@ -693,11 +693,12 @@ export function planPrepareSpawns({ unshaped = [], decisions = [], investigation
   // #4504 advisory — ROTATE the cap: least-attempted candidates first (a stable sort, so ties keep plan order),
   // and an item whose prepare-item attempts reached the retry cap is held with a note instead of re-dispatched.
   // Without this, the first two candidates in `plan.held` order held the cap forever when un-preparable.
+  // An explicit just-in-time window order takes precedence over attempt rotation.
   const attemptsOf = (num) => Number(itemPrepareAttempts?.[normNum(num)]) || 0;
   const itemCandidates = (Array.isArray(needsPrepare) ? needsPrepare : [])
     .filter((p) => p?.num != null && !prepareHeld.has(normNum(p.num)))
     .map((p, i) => ({ p, i, n: attemptsOf(p.num) }))
-    .sort((a, b) => a.n - b.n || a.i - b.i)
+    .sort((a, b) => (a.p.prepareWindowOrder ?? Infinity) - (b.p.prepareWindowOrder ?? Infinity) || a.n - b.n || a.i - b.i)
     .map(({ p }) => p);
   for (const p of itemCandidates) {
     if (!guardNums.has(normNum(p.num)) && attemptsOf(p.num) >= itemPrepareRetryCap) {
@@ -1285,8 +1286,8 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   // needs-prepare item has no separate `state` derivation step either. Guard RETENTION for this kind uses
   // `heldGuardPending` (the wide set just above), never this narrow one — see that set's own comment for why.
   // Card 80 — a `prepare-stale` card (old stamp, or scope drift since `preparedAgainstSha`) is re-prepared the
-  // same way. And with `config.prepareAheadWindow` set (the build daemon passes 4), only the cards within the next
-  // N to build (pinned first) are prepared now; the rest wait, noted `prepare-ahead-window`.
+  // same way. And with `config.prepareAheadWindow` set (the build daemon passes prepare.aheadCount (default 20)), only the cards within the next
+  // N to build (build.priority, then ready-queue order) are prepared now; the rest wait, noted `prepare-ahead-window`.
   // builder-starved — a card the caller holds (`bookkeeping.prepareHeldNums`) never takes a window slot.
   const prepareAutoSize = config.prepareAutoSize === true || (
     config.prepareAutoSize === undefined && Array.isArray(config.launchKinds)
@@ -1302,9 +1303,17 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   });
   const prepareCandidates = (Array.isArray(plan.held) ? plan.held : [])
     .filter((h) => h && (h.reason === 'needs-prepare' || h.reason === 'prepare-stale' || (prepareAutoSize && h.reason === 'no-size')) && h.num != null);
+  const readyOrder = new Map(queue.map((r, i) => [normNum(r.num), i]));
+  const stalePriority = new Map(queue
+    .filter(r => Number.isFinite(r.buildPriority))
+    .map(r => [normNum(r.num), r.buildPriority]));
+  const staleRank = h => h.reason === 'prepare-stale' ? stalePriority.get(normNum(h.num)) ?? Infinity : Infinity;
   const needsPrepareHeld = prepareCandidates
     .filter((h) => !prepareWindow || prepareWindow.has(normNum(h.num)))
-    .map((h) => ({ num: h.num }));
+    // Stale operator-priority cards get the slots first, then fresh cards in ready order.
+    .sort((a, b) => prepareWindow ? staleRank(a) - staleRank(b)
+      || (readyOrder.get(normNum(a.num)) ?? Infinity) - (readyOrder.get(normNum(b.num)) ?? Infinity) : 0)
+    .map((h, i) => ({ num: h.num, ...(prepareWindow ? { prepareWindowOrder: i } : {}) }));
   const prepareWindowNotes = prepareWindow
     ? prepareCandidates.filter((h) => !prepareWindow.has(normNum(h.num))).map((h) => ({
       kind: 'prepare-ahead-window', num: h.num,

@@ -104,3 +104,9 @@ describe('builder cap policy', () => {
     expect(isBuilderPr({ headRefName })).toBe(false);
   });
 });
+
+it('recognizes assembled prepare PRs without treating per-card retention refs as PR provenance', () => {
+  expect(isBuilderPr({ headRefName: 'lane/prepare-batch-7101-3' })).toBe(true);
+  expect(isBuilderPr({ headRefName: 'lane/prepare-batch-x123abc-2' })).toBe(true);
+  expect(isBuilderPr({ headRefName: 'lane/prep-7101' })).toBe(false);
+});
