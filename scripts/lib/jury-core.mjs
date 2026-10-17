@@ -3512,7 +3512,8 @@ export function renderReferralRecord(record, { operatorRulings = [] } = {}) {
   if (!validateReferralRecord(record)) throw new TypeError('invalid mandatory referral record');
   return `Mandatory review owner: ${record.reviewer.id} (${record.reviewer.lens}).\n`
     + `CONFIRMED broken/unrecoverable findings require a finding-specific block/card/not-real ruling.\n`
-    + record.referrals.map(f => `- ${f.key}: ${f.finding.summary}${referralRecheck(record, f.key) && !record.rulings.some(r => r.key === f.key) ? ' — needs re-check on live head' : ''}`).join('\n')
+    + record.referrals.map(f => `- ${f.key}: ${f.finding.summary}${referralRecheck(record, f.key) && !record.rulings.some(r => r.key === f.key)
+      && !(record.carried ?? []).some(c => c.key === f.key) ? ' — needs re-check on live head' : ''}`).join('\n')
     + (record.superseded ?? []).map(s => `\n- ${s.key}: ${s.reason} (by run ${s.by.runId})`).join('')
     + (record.carried ?? []).map(c => `\n- ${c.key}: ${carriedReasonText(c, { operatorRulings })} (${carriedActor(c, { operatorRulings })} ${c.result}, from ${c.from.head}, run ${c.from.runId})`).join('')
     + (record.dropped ?? []).map(d => `\n- ${d.key}: ${d.reason}`).join('')

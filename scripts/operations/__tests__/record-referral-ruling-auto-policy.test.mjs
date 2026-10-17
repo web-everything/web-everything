@@ -197,6 +197,12 @@ describe('automatic policy respects authenticated operator decisions', () => {
         .toThrow(/protection.*unknown/i);
     }
   });
+  it.each(['', '(no file)'])('a %j target line is never compared in the original file it does not cite', (file) => {
+    const source = record({ h: oldHead, reviewerResult: 'not-real' }), target = record({ runId: 'review-pr-copy', file });
+    // Only the new side changed at line 20: the original citation is intact, so its not-real still protects.
+    const changed = new Set([20]); changed.old = new Set();
+    expect(harness(thread(source, target), { changedLines: () => changed }).plan({ finding: target.referrals[0].key }).verdict.noop).toBe(true);
+  });
   it('only renewed citation changes allow auto-block after an older reviewer not-real (#5399)', async () => {
     const source = record({ h: oldHead, reviewerResult: 'not-real', summary: 'forged-author and quoted-marker controls absent' });
     const target = record({ runId: 'review-pr-copy', summary: source.referrals[0].finding.summary });

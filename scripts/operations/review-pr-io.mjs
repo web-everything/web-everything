@@ -1155,14 +1155,13 @@ export function createReviewPrSinks({
         // The re-check must be durable, not only on the prompt copy: an omitted or interrupted answer (or a record a
         // run before this one already attempted) leaves the finding pending, and only a persisted marker keeps automatic
         // policy from blocking it. An existing record never changes its `referrals`, so the marker goes to `rechecks`.
+        // Every matching key is marked, settled or not: a carry withdrawn later makes it pending again between review
+        // runs, and readers only act on the marker while the gate holds the key pending.
         if (rechecks.size) {
-          const records = readReferralRecords(state.comments, context(state)).records;
-          const operatorRulings = readOperatorRulings(state.comments, context(state)).rulings;
           for (let i = 0; i < existing.length; i++) {
             const record = existing[i];
-            const pending = new Set(referralRecordState(record, { ...context(state), records, operatorRulings }).pending);
             const unmarked = activeReferrals(record)
-              .filter(f => rechecks.has(f.key) && pending.has(f.key) && !referralRecheck(record, f.key))
+              .filter(f => rechecks.has(f.key) && !referralRecheck(record, f.key))
               .map(f => ({ key: f.key, status: rechecks.get(f.key).status, fromHead: rechecks.get(f.key).fromHead, head: record.head }));
             if (!unmarked.length) continue;
             const updated = { ...record, rechecks: [...(record.rechecks ?? []), ...unmarked] };

@@ -1400,6 +1400,20 @@ describe('#4315 durable referral effects', () => {
     expect(() => planOperatorRuling(read, { repo: 'o/r', pr: 7, finding: 'all-open', ruling: 'block',
       actor: 'auto-policy', channel: 'test', reason: 'test' })).toThrow(/needs re-check on live head/);
   });
+  it('marks a settled current-head copy too, so a later withdrawal leaves no unmarked pending key', async () => {
+    const h = harness({ readChangedLines: () => null });
+    const old = seedReferrals(h, ['judgeCorrectnessAdvisory']);
+    const copy = { ...old, head: h.state.headRefOid, runId: 'current', reviewer: mandatoryReferralReviewer('current'),
+      attempted: true, rulings: [] };
+    const key = copy.referrals[0].key;
+    copy.rulings = [{ id: 'current:0', key, reviewerId: copy.reviewer.id, lens: copy.reviewer.lens, result: 'not-real',
+      rationale: 'fixed on this head', evidence: ['diff'] }];
+    h.state.comments.push({ body: renderReferralRecord(copy), author: { login: 'web-everything' } });
+    await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(askedKeys(h)).not.toContain(key);
+    expect(currentOf(h).rechecks).toEqual([{ key, status: 'needs re-check on live head', fromHead: old.head, head: h.state.headRefOid }]);
+    expect(currentOf(h).rulings).toEqual(copy.rulings);
+  });
   it('a re-check marker is append-only and must name a live-head finding from another head', () => {
     const h = harness({});
     const record = { ...seedReferrals(h, ['judgeCorrectnessAdvisory'], h.state.headRefOid), runId: 'current',

@@ -144,8 +144,9 @@ function readProtectionContext(thread, { repo, pr, readJson, cardReadable, chang
       if (!file || (!missing(target.file) && file !== exactCitedPath(target.file))) return null;
       const changed = linesFor(repo, base, head, file);
       if (!(changed instanceof Set) || (changed.size && !(changed.old instanceof Set))) return null;
+      // A target with no path cites no line in this file, so only the original citation is compared here.
       return !changesTouchCitedLines(changed.old ?? changed, [source.line])
-        && !changesTouchCitedLines(changed, [target.line]);
+        && (missing(target.file) || !changesTouchCitedLines(changed, [target.line]));
     } });
 }
 
