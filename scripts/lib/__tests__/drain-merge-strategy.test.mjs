@@ -601,6 +601,19 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [result] })).toMatchObject({ enqueued: true });
     expect(h.calls.some(c => c.includes('--add-label') && c.includes('red-team:clear'))).toBe(true);
   });
+  it.each([false, true])('holds a confirmed break before the gate acts (scheduled=%s)', async scheduled => {
+    const { renderRedTeamComment } = await import('../../operations/review-extra-seats.mjs');
+    const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
+      pr: 5283, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+      findings: [{ summary: 'unresolved security break', category: 'security', impactIfUnfixed: 'broken', confirmedByRecheck: true }],
+    }) }];
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'],
+      liveComments: thread, evidence: { scheduled, inFlight: false, recorded: true, loopPayload: null } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: thread })).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')) || c[2] === 'comment')).toBe(false);
+    expect(h.calls.some(c => c.includes('--add-label') && c.includes('red-team:blocked'))).toBe(true);
+    expect(h.calls.some(c => c.includes('--add-label') && c.includes('red-team:clear'))).toBe(false);
+  });
   it('reads a complete comment thread larger than 1 MiB', () => {
     const result = { user: { login: 'web-everything[bot]' }, body: `<!-- we:red-team-advisory pr=5283 rev=${HEAD} -->\n### Post-accept red team — no break found` };
     const bulk = Array.from({ length: 24 }, () => ({ user: { login: 'someone' }, body: 'x'.repeat(50_000) }));

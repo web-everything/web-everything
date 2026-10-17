@@ -301,6 +301,7 @@ function operatorRuled(records, pr, head) {
 
 
 /** Shared live-head disposition reader. Recorded per-finding actions override today's policy.
+ * Without a recorded action, policy send-back candidates still block admission while the gate acts.
  * Older round-cap records omit indices: all remaining send-back candidates belong to the operator.
  */
 export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env } = {}) {
@@ -331,7 +332,7 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
   const sendBack = [], held = [];
   for (const f of result?.findings ?? []) {
     const action = actions.get(f.index) ?? (legacyHeld && f.confirmed ? 'held' : null) ?? (plan.sendBack.includes(f)
-      ? outcome === GATE_OUTCOMES.ROUND_CAP ? 'held' : outcome === GATE_OUTCOMES.SENT_BACK ? 'send-back' : null : null);
+      ? outcome === GATE_OUTCOMES.ROUND_CAP ? 'held' : 'send-back' : null);
     if (ruled) continue;
     if (action === 'held') held.push(f);
     if (action === 'send-back') sendBack.push(f);

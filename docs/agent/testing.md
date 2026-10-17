@@ -75,7 +75,10 @@ observation of missing routing, even when no acceptance marker accompanies it.
 Queue admission and operator escalation share `red-team-gate.mjs#readRedTeamDisposition`.
 Read the live head's recorded per-finding gate actions before consulting current policy:
 a card/advisory record releases that finding, while sent-back and round-cap records retain
-only their unresolved findings. Legacy cap comments omit indices; exclude separately
+only their unresolved findings. Without a recorded per-finding action, a policy send-back
+candidate still blocks enqueue and derives `red-team:blocked`, even if no run is currently
+owed. A card record for another finding (or a failed card action) cannot release it.
+Legacy cap comments omit indices; exclude separately
 recorded card/advisory findings before surfacing the remaining confirmed breaks. Acceptance
 labels alone do not prove an operator ruled on a cap-held break; use the sanctioned
 head-bound clearance ceremony, including proven identical-contribution carries.

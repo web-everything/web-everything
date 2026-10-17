@@ -118,14 +118,31 @@ describe('durable head-bound red-team admission', () => {
   it('honors recorded cards and advisory actions over current policy, per break', () => {
     const result = clean(head, 'web-everything', [...broken, { ...broken[0], summary: 'security break', category: 'security' }]);
     const record = { ...bot, body: `${redTeamGateMarker(5283, head, 'card-queued')}\n- 1 finding(s) filed as a follow-up card (#1).` };
-    expect(hold({ comments: [result, record] })).toBeNull();
+    expect(hold({ comments: [result, record] })).toMatch(/requiring send-back/);
     const capped = { ...gate(head, 'round-cap'), body: `${gate(head, 'round-cap').body}\n- 1 confirmed break(s) NOT sent back: review round 5 has reached the round cap (5). The operator rules on them.` };
     expect(hold({ comments: [result, capped, record] })).toMatch(/requiring send-back/);
     const advisory = { ...record, body: `${record.body}\n- 1 finding(s) left advisory (#2).` };
+    expect(hold({ comments: [result, advisory] })).toBeNull();
     expect(hold({ comments: [result, capped, advisory] })).toBeNull();
   });
-  it('does not invent a send-back when the gate has no recorded hold', () => {
-    expect(hold({ comments: [clean(head, 'web-everything', broken)] })).toBeNull();
+  it.each([
+    ['no gate record', []],
+    ['a gate record for another head', [gate(prior, 'card-queued')]],
+    ['a gate record for another PR', [{ ...gate(head, 'card-queued'), body: redTeamGateMarker(9999, head, 'card-queued') }]],
+    ['an untrusted gate record', [{ ...gate(head, 'card-queued'), author: { login: 'attacker' } }]],
+    ['a gate outcome without per-finding actions', [gate(head, 'card-queued')]],
+    ['a failed card action', [{ ...gate(head, 'card-queued'), body: `${redTeamGateMarker(5283, head, 'card-queued')}\n- 1 finding(s) filed as a follow-up card (#1). FILING FAILED` }]],
+  ])('holds a confirmed break with no recorded action: %s', (_name, gates) => {
+    expect(hold({ comments: [clean(head, 'web-everything', broken), ...gates] })).toMatch(/requiring send-back/);
+  });
+  it('holds a carried confirmed break without a recorded gate action, even when no run is owed', () => {
+    for (const over of [{}, { scheduled: false, loopPayload: null }, { env: { WE_REVIEW_RED_TEAM: 'off' } }]) {
+      expect(hold({ ...over, comments: [carry({ findings: broken })] })).toMatch(/requiring send-back/);
+    }
+  });
+  it.each([undefined, 'unknown'])('holds a confirmed security break with %s impact and no gate action', impactIfUnfixed => {
+    const findings = [{ ...broken[0], category: 'security', impactIfUnfixed }];
+    expect(hold({ comments: [clean(head, 'web-everything', findings)] })).toMatch(/requiring send-back/);
   });
   it.each(['WE_REVIEW_RED_TEAM', 'WE_REVIEW_EXTRA_SEATS'])('does not owe a pass with %s off', key => {
     expect(hold({ scheduled: false, env: { [key]: '0' } })).toBeNull();
