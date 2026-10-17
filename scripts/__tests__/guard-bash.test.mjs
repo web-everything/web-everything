@@ -610,7 +610,8 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('cd "$D"; D=/b')).toBe(REPORTED);
     for (const rebind of ['IFS= read -r D <<< /b', 'if read -r D <<< /b', '\\read D <f', 'command -p read D <f',
       'x=$(D=1) D=/b', 'echo $(D=1) $((D=5))', 'f(){ D=/b', 'exec {D}>/dev/null', 'coproc D { cat; }',
-      'printf -v "$X" %s /b', 'while read D']) {
+      'printf -v "$X" %s /b', 'while read D', 'case a in a) D=/b', 'case $1 in\n  a) D=/b ;;\nesac', 'f () { D=/b',
+      'time -p D=/b', '>/dev/null D=/b', 'N=$((D=5))', 'for ((D=0;D<1;D++))']) {
       expect(at(`D=/a; ${rebind}; cd "$D"`), rebind).toBe(REPORTED);
     }
   });

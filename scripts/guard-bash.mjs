@@ -2499,7 +2499,7 @@ function expandWord(s, home) {
 // Statements are read word by word, so a NAME= that is only an argument (`echo D=5`, `env D=5 cmd`) binds
 // nothing. Every scan is linear.
 const SPECIAL_BUILTIN = /^(?::|\.|break|continue|eval|exec|exit|export|readonly|return|set|shift|source|times|trap|unset)$/;
-const COMMAND_PREFIX = new Set(['if', 'then', 'else', 'elif', 'do', 'while', 'until', 'time', '!', '{', '}']);
+const COMMAND_PREFIX = new Set(['if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{', '}']);
 const ASSIGNMENT_WORD = /^([A-Za-z_]\w*)(?:\[[^\]\s]{0,64}\])?\+?=/;
 const REDIRECT_OP = /^(?:\d+|&)?(?:[<>]{1,2}|<>|>\||[<>]&)$/;
 const rebindPatterns = new Map();
@@ -2552,14 +2552,20 @@ const unquoted = (word) => word.replace(/[\\'"]/g, '');
 
 // Does this statement rebind `name` in the current shell in a way `valueAfter` cannot read?
 function rebindsUnreadably(s, name, p) {
+  if (rebindsInArithmetic(s, p)) return true;
   const words = shellWords(s);
   let chain = false;                                                        // `name` assigned in the prefix chain
   let j = 0;
   for (; j < words.length; j++) {
     const word = unquoted(words[j]);
     if (COMMAND_PREFIX.has(word) || /^[\w.:-]+\(\)\{?$/.test(words[j])) continue; // reserved word, function header
+    if (words[j + 1] === '()') { j++; continue; }                           // `f () {`
     if (word === 'function') { j++; continue; }
-    if (word === 'builtin' || word === 'command') { while (words[j + 1] === '-p') j++; continue; }
+    if (word === 'case') { while (j + 1 < words.length && words[j] !== 'in') j++; continue; }
+    if (/\)$/.test(word) && !words[j].includes('=')) continue;              // a case arm's pattern
+    if (word === 'builtin' || word === 'command' || word === 'time') { while (words[j + 1] === '-p') j++; continue; }
+    if (REDIRECT_OP.test(words[j])) { j++; continue; }                      // an operator, then its target
+    if (/^(?:\d+|&)?[<>]/.test(words[j])) continue;                         // an operator glued to its target
     const assigned = words[j].match(ASSIGNMENT_WORD);
     if (assigned) { chain ||= assigned[1] === name; continue; }
     break;
@@ -2581,11 +2587,15 @@ function rebindsUnreadably(s, name, p) {
   if (/^(?:read|mapfile|readarray|getopts|unset|wait|declare|typeset|local|let)$/.test(command)) {
     return operands.some((w) => p.operand.test(w) || w.startsWith('$'));
   }
+  return false;
+}
+
+// Does `s` assign `name` through a `{NAME}>` descriptor, or in an arithmetic context (`((…))`, `$((…))`, `[[…]]`)
+// outside a child shell?
+function rebindsInArithmetic(s, p) {
   const masked = maskQuotedKeepingExpansions(s);
   if (p.descriptor.test(masked)) return true;
-  if (!/\(\(|\[\[/.test(masked)) return false;
-  // An arithmetic context: any assignment to `name` outside a child shell rebinds it.
-  return arithmeticOutsideChild(masked, p.arithmetic);
+  return /\(\(|\[\[/.test(masked) && arithmeticOutsideChild(masked, p.arithmetic);
 }
 
 // Does `re` (global) match `masked` anywhere outside a child shell (`( … )`, `$( … )`, backticks)? `((` and `$((`
@@ -2661,6 +2671,7 @@ function valueAfter(stmt, name, value, home) {
     const [, exported, append, rest] = assignment;
     const word = rest.startsWith('(') ? null : expandWord(rest, home);      // `NAME=(…)` is an array
     if (!word) return null;
+    if (rebindsInArithmetic(rest.slice(word.end), p)) return null;
     const words = shellWords(rest.slice(word.end));
     if (exported && words.some((w) => p.valued.test(unquoted(w)) || w.startsWith('$'))) return null;
     if (!exported) {
