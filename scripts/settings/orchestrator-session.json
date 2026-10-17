@@ -1,0 +1,20 @@
+{
+  "$comment": "Opt-in operator responsiveness policy. session.orchestratorMode defaults to false; WE_ORCHESTRATOR_SESSION=1 enables it. session.orchestratorDelegateCommands is an array of executable command prefixes (defaults in orchestrator-session-settings.mjs); an override replaces the whole array. Subagents and daemon workers are always excluded. operator-session-bootstrap currently records no session identity.",
+  "session": {
+    "orchestratorDelegateCommands": [
+      "node scripts/operations/run.mjs verify",
+      "node scripts/operations/run.mjs verify-lane",
+      "node scripts/verify-lane.mjs",
+      "node scripts/operations/run.mjs open-pr",
+      "node scripts/readiness/heavy-admission.mjs run",
+      "npx vitest",
+      "npm run check:standards",
+      "npm run test:unit",
+      "node scripts/daemon-rebuild.mjs",
+      "node scripts/daemon-load-overlay.mjs",
+      "node scripts/daemon-overlay.mjs add",
+      "node scripts/codex-direct-task.mjs",
+      "node scripts/gemini-direct-task.mjs"
+    ]
+  }
+}

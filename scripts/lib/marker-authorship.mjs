@@ -11,7 +11,7 @@
  *   `we:scripts/conveyor/stand-down.mjs`'s own header), and a fake rearm/ci-heal/advisory-fix/conflict-fix marker
  *   inflates that PR's round count toward `cap-exhausted`, silently swallowing a real fixer's remaining rounds.
  *
- * THE SIGNAL: `author.login`, NOT a comment-body substring. `gh pr list/view --json comments` (the shape every
+ * THE SIGNAL: GitHub-assigned `author.login` (GraphQL) or `user.login` (REST), NOT a comment-body substring. `gh pr list/view --json comments` (the shape every
  * caller in this repo actually reads — confirmed live, `web-everything/web-everything#2578`/`#2602`/`#2607`,
  * 2026-09-24) returns each comment's poster as `author.login`, a field GitHub itself assigns from the real
  * authenticated identity that posted the comment. A comment BODY can say anything a commenter likes; `author.login`
@@ -93,21 +93,21 @@ export const OPERATOR_LOGINS = Object.freeze(
  *  in this repo uses. */
 const bodyOf = (c) => (typeof c === 'string' ? c : c?.body);
 
-/** The comment's `author.login`, lower-cased, or `''` when absent/not-an-object/bare-string (a bare string has
+/** The comment's GraphQL `author.login` or REST `user.login`, lower-cased, or `''` when absent/not-an-object/bare-string (a bare string has
  *  no author at all, and is therefore never automation- or operator-authored — fail closed). */
 const loginOf = (c) => {
   if (typeof c !== 'object' || c === null) return '';
-  const login = c.author?.login;
+  const login = c.author?.login ?? c.user?.login;
   return typeof login === 'string' ? login.toLowerCase() : '';
 };
 
 /**
  * we:scripts/lib/marker-authorship.mjs#isAutomationAuthored — did THIS repo's own conveyor automation write this
- * comment? PRIMARY signal: `author.login` against {@link AUTOMATION_LOGINS} (read-stable — see this file's own
+ * comment? PRIMARY signal: `author.login` / `user.login` against {@link AUTOMATION_LOGINS} (read-stable — see this file's own
  * header for why `viewerDidAuthor` alone is not). `viewerDidAuthor === true` is accepted as an ADDITIONAL path
  * (true whenever the read itself runs under the automation's own credential). Fails closed on anything else,
  * including a bare string (no author at all) or a missing/blank login.
- * @param {{viewerDidAuthor?:boolean, author?:{login?:string}}|string|null|undefined} c
+ * @param {{viewerDidAuthor?:boolean, author?:{login?:string}, user?:{login?:string}}|string|null|undefined} c
  * @returns {boolean}
  */
 export function isAutomationAuthored(c) {
@@ -119,10 +119,10 @@ export function isAutomationAuthored(c) {
 
 /**
  * we:scripts/lib/marker-authorship.mjs#isOperatorAuthored — did the repo OPERATOR write this comment (by hand,
- * or a daemon that fell back to the operator's own credential)? `author.login` against {@link OPERATOR_LOGINS}
+ * or a daemon that fell back to the operator's own credential)? `author.login` / `user.login` against {@link OPERATOR_LOGINS}
  * only — the operator's read credential is never assumed to make `viewerDidAuthor` meaningful here, since the
  * usual reader is the automation's own credential, not the operator's.
- * @param {{author?:{login?:string}}|string|null|undefined} c
+ * @param {{author?:{login?:string}, user?:{login?:string}}|string|null|undefined} c
  * @returns {boolean}
  */
 export function isOperatorAuthored(c) {
@@ -135,9 +135,9 @@ export function isOperatorAuthored(c) {
  * repo runs a comment through before matching its leading line. True iff the comment is automation-authored
  * ({@link isAutomationAuthored}) OR operator-authored ({@link isOperatorAuthored}) — see this file's header for
  * why both principals count identically for every marker. A comment from any other login, or with no author
- * information at all (a bare string, or an object with no `author`), is never trusted — fail closed, the
+ * information at all (a bare string, or an object with neither `author` nor `user`), is never trusted — fail closed, the
  * direction every sibling counter in this repo already takes on a malformed/missing field.
- * @param {{viewerDidAuthor?:boolean, author?:{login?:string}}|string|null|undefined} c
+ * @param {{viewerDidAuthor?:boolean, author?:{login?:string}, user?:{login?:string}}|string|null|undefined} c
  * @returns {boolean}
  */
 export function isTrustedMarkerAuthor(c) {
@@ -148,7 +148,7 @@ export function isTrustedMarkerAuthor(c) {
  * we:scripts/lib/marker-authorship.mjs#countTrustedLeadingMarker — the ONE shared leading-line + trusted-author
  * count every marker counter in this repo now delegates to, so the narrowing rule (leading line, trusted author,
  * tolerant shapes) is written exactly once. Pure.
- * @param {Array<{body?:string, viewerDidAuthor?:boolean, author?:{login?:string}}|string>|null|undefined} comments
+ * @param {Array<{body?:string, viewerDidAuthor?:boolean, author?:{login?:string}, user?:{login?:string}}|string>|null|undefined} comments
  * @param {string} marker - the marker's stable leading-line string.
  * @returns {number}
  */
