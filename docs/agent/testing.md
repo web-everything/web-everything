@@ -132,6 +132,14 @@ Probe identical-content commits, changed trees, expiry, disabled reuse, failure 
 results through the real rebuild fixture, plus actual check selection through `runLiveSmoke`.
 Run these suites through the host heavy-admission queue.
 
+## Daemon entry import regression
+
+`daemon-entries-import.test.mjs` cold-imports every `DAEMON_ENTRY_MODULES` entry from the
+rebuild boot smoke in a separate eval-mode Node child, without invoking daemon main functions.
+Keep this in the unit tier: shared-process imports can hide ordering-dependent ESM cycles.
+Process liveness helpers shared by drain evidence and review jobs live in the dependency-free
+`scripts/lib/pid-alive.mjs`; importing the job store for a helper pulls in dispatch and reconcile.
+
 ## Smoke sentinel worker isolation
 
 Daemon rebuild dispatch dry-runs force `WE_WORKER_WRAPPER=off` so injected spawners capture both fix and
@@ -1232,6 +1240,48 @@ the standard → platform → tool → env cascade and logs its source. Replay b
 queue listings; include same-head holds, abbreviated legacy Head markers and missing/older timestamps.
 
 ## Drain enqueue confirmation
+
+Post-accept admission imports the review scheduler’s `redTeamOwedFor` and `redTeamEnabled` over
+the exact repo/PR/head review payload; acceptance labels alone never establish an owed pass.
+An owed pass waits for the trusted red-team result marker for the exact PR and live head. Replay both GraphQL `author.login` and REST `user.login` bot comments, plus untrusted
+lookalikes. Persist red-team pending age and retry time per PR/head in queue state and preserve it
+through follow-up writes. `drain.redTeamPendingBackoffSec` defaults to 300; a newly observed comment
+can wake the head early. `drain.redTeamPendingMaxMin` defaults to 45; even during backoff, an accepted
+head past that age must log a named health smell and recheck complete comments and run evidence.
+A recorded or live pass still waits. With neither, request through an available review dispatch hook;
+if unavailable, `drain.enqueueWhenRedTeamNeverScheduled` (default true) permits enqueue with a loud
+“red team never scheduled” note and its source. The current drain has no standalone red-team request
+queue, so it uses the fallback. Test restarts, head resets, request/fallback, policy provenance and
+comment-read backoff before the deadline. Review jobs publish head-bound running/finished evidence
+in the shared operations sidecar. Store the host, PID namespace (where available) and process birth time with the pid: a live pid
+with a different birth time is a reused process, not an active red team. An unavailable birth-time
+probe preserves the conservative liveness result. Normalize the birth-time probe to UTC and the C
+locale in both writer and reader. A running status from another host or PID namespace stays held
+until its result arrives; a local pid probe cannot prove a remote process has crashed. Replay both
+cases, plus old records without birth-time metadata and finished records. Also replay acceptance
+with empty status and run stores: labels alone still do not schedule work (#5439/#5443). The
+persisted accepting run must hold admission before the job's first running-status write. Missing
+or pruned run evidence remains the explicit label-only boundary, rather than an invented accept.
+A confirmed send-back finding still holds during the result-comment → gate-label race. Queue
+admission must also read the exact combined comment emitted by verdict carry: gate markers,
+the carried marker and producer prose, then the re-keyed advisory. Test the real review job's
+carry path, CRLF, stale/foreign/untrusted markers and malformed or quoted layouts. An operator's
+later `clear-human` ceremony on the same head releases findings handed over at the round cap;
+an ordinary accept, restamp alone, superseded clearance or ruling before the finding does not.
+Preserve a proven ruling through chains of identical-contribution carries. Both paginated comment
+reads (admission and clearance dedupe) allow 256 MiB with a timeout; exercise a thread above
+Node's default 1 MiB using a real child process, retaining the complete thread and clearance stamp.
+Queue removal probes must observe `isInMergeQueue=false` after `dequeuePullRequest`, and replay the gate and
+drain backstop to verify one mutation and one reason comment. Include a PR missing `ready-to-merge`
+from the unfiltered open listing, without a durable follow-up entry. Discover membership once per
+sweep through the shared batched merge-queue reader before revalidating any individual PR. Assert
+one discovery call and zero per-PR reads for 150 non-queued rows, for each send-back label shape;
+mixed listings must revalidate only queued rows. Failed or incomplete discovery (including more
+than 100 entries) skips the sweep and retries next pass, without an expensive per-row fallback.
+Manual queue entries also follow the existing label policy; membership alone never authorizes a
+dequeue without fresh labels. Table-test every gate outcome: only `sent-back` invokes removal;
+`round-cap` stays operator-owned under the current ruling. Both safeguards resolve through
+the `drain` policy cascade and default on; test off switches without using the host's live GitHub IO.
 
 Queue enqueue tests must distinguish mutation responses from membership reads: a returned entry is
 followed by GraphQL `isInMergeQueue` plus the judged head. The installed `gh pr view --json` does not
