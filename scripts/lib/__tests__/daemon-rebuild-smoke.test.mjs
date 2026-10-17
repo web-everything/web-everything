@@ -7,7 +7,7 @@ import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { rebuildClone, readRebuildState } from '../daemon-rebuild.mjs';
 import { addOverlay, readOverlayState } from '../daemon-overlays.mjs';
-import { dispatchSmokeSuspects } from '../daemon-rebuild/smoke.mjs';
+import { dispatchSmokeSuspects, smokeFailureFiles } from '../daemon-rebuild/smoke.mjs';
 import { checkDaemonEntriesBoot, DAEMON_ENTRIES_ENV } from '../daemon-boot-smoke.mjs';
 import { runRealDispatchSmoke } from '../daemon-load-overlay.mjs';
 import { alertsFilePath } from '../daemon-rebuild/state.mjs';
@@ -153,9 +153,28 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
     });
     const text = readRebuildState(f.cloneDir, f.env).held.details[0].detail;
     for (const entry of entries) expect(text).toContain(`${entry}: child failed (signal=null, exitCode=1, attempts=1`);
-    expect(text.match(/class=RangeError: q{68} stderr=/g)).toHaveLength(6);
+    expect(text.match(/ stderr=\S+ class=RangeError: q{68}$/gm)).toHaveLength(6);
     expect(text.length).toBeLessThanOrEqual(4_000);
     expectAbsent(sinksOf(f, result), ['kiloword4x', 'mmmmmmmm', 'q'.repeat(69)]);
+  });
+
+  it('a boot failure still names its culprit files: typed paths read from the raw text in-process, not from the summary', async () => {
+    const root = '/tmp/work';
+    const stderr = [
+      'file:///tmp/work/scripts/conveyor/review.mjs:20',
+      "SyntaxError: The requested module '../takeover-budget.mjs' does not provide an export named 'x'",
+      'file:///etc/outside.mjs:1',
+    ].join('\n');
+    const boot = await checkDaemonEntriesBoot({ root, log: { error() {} }, diagnosticsDir: mktemp('we-rebuild-dsmoke-diag-'),
+      env: { [DAEMON_ENTRIES_ENV]: 'fixture.mjs', WE_SMOKE_BOOT_SIGNAL_RETRIES: '0' },
+      runChild: async () => { throw Object.assign(new Error('exited 1'), { status: 1, signal: null, stderr }); },
+    });
+    expect(boot.detail).not.toContain('review.mjs');
+    expect(boot.entries[0].files).toEqual(['scripts/conveyor/review.mjs', 'scripts/takeover-budget.mjs']);
+    expect(smokeFailureFiles([{ name: 'daemon-entries-boot', ...boot }], { candidatePath: root }))
+      .toEqual(['scripts/conveyor/review.mjs', 'scripts/takeover-budget.mjs']);
+    // A typed path outside the plain repo-relative shape is ignored.
+    expect(smokeFailureFiles([{ detail: '', entries: [{ files: ['../x.mjs', 'a b.mjs', 'ok/y.mjs'] }] }], { candidatePath: root })).toEqual(['ok/y.mjs']);
   });
 
   /** The real dispatch smoke, its worker launch injected: `onLaunch` plays the launched worker. */

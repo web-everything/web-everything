@@ -406,6 +406,11 @@ describe('smoke diagnostics carry an allow-listed summary, never raw child text 
     expect(smokeErrorClass("TypeError: can't open `sierra` file")).toBe('TypeError: can<…>');
     expect(smokeErrorClass(`TypeError: x${String.fromCharCode(0x2028)}tangocred17x`)).toBe('TypeError: x');
     expect(smokeErrorClass('')).toBeNull();
+    // Typographic, guillemet and fullwidth quotes are masked; bidi/zero-width characters dropped; token shapes redacted.
+    const q = (o, c) => `TypeError: bad ${String.fromCharCode(o)}uniformword1x${String.fromCharCode(c)} end`;
+    for (const [o, c] of [[0x201c, 0x201d], [0x2018, 0x2019], [0xab, 0xbb], [0xff02, 0xff02]]) expect(smokeErrorClass(q(o, c))).toBe('TypeError: bad <…> end');
+    expect(smokeErrorClass(`TypeError: a${String.fromCharCode(0x202e)}b${String.fromCharCode(0x200b)}c`)).toBe('TypeError: abc');
+    expect(smokeErrorClass('FetchError: to https://x:ghp_victorword2xAAAA@h failed')).not.toContain('victorword2x');
   });
 
   it('writeStderrTail: a fresh 0600 file under a 0700 dir; nothing to write or a failed write yields null', () => {

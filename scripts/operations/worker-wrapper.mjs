@@ -27,7 +27,7 @@
  * so the tests run it against a fake child. The CLI at the bottom runs a JSON spec detached.
  */
 import { spawn } from 'node:child_process';
-import { appendFileSync, closeSync, constants, fstatSync, mkdirSync, openSync, readFileSync, readSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -327,7 +327,9 @@ async function runWorkerOnce(spec, io, stop) {
                 bytes = bytes.subarray(br + 1);
                 discardStderrLine = false;
               }
-              // Raw worker text: owner-only on disk. The smoke reads its tail into a 0600 file and removes this capture.
+              // Raw worker text: owner-only on disk. The smoke reads its tail into a 0600 file and removes this capture;
+              // once removed it stays removed (a later chunk must not recreate it in the scratch dir).
+              if (stderrBytes > 0 && !existsSync(file)) return;
               appendFileSync(file, bytes, { mode: 0o600 });
               stderrBytes += bytes.length;
               // Bounded on disk, newest lines kept: past the cap, compact the file to the whole lines in its last 64 KiB.

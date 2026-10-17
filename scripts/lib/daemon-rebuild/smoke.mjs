@@ -6,7 +6,7 @@ import {
   SMOKE_ENVIRONMENT_VERDICTS, loadDifferentialEnabled, envLoadRetryDelayMs, isLoadShapedRow, busyPoolSkippedChecks,
   redactDetail,
 } from './smoke-classify/index.mjs';
-import { pickSmokeDiagnostics } from '../daemon-boot-smoke.mjs';
+import { isRepoFile, pickSmokeDiagnostics, sourceFilesIn } from '../daemon-boot-smoke.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidate } from './state.mjs';
 import { releaseBuildLease } from './lease.mjs';
@@ -79,34 +79,14 @@ export function smokePassIdentity(git, sha, cloneKind = 'daemon') {
 
 // ── smoke-rejection helpers ────────────────────────────────────────────────────────────────────────────────
 
-/** PURE: repository files named by complete source locations in raw smoke failure details. */
+/** PURE: repository files named by complete source locations in raw smoke failure details, plus the typed `files`
+ *  a boot check's entries carry (its detail is a summary: the locations were read from the raw child text in-process). */
 export function smokeFailureFiles(failedRows, { candidatePath }) {
   const files = new Set();
-  const prefix = candidatePath ? candidatePath.replace(/\/$/, '') + '/' : null;
-  const add = (path) => {
-    const normalized = posix.normalize(path);
-    if (normalized !== '.' && normalized !== '..' && !normalized.startsWith('../') && !posix.isAbsolute(normalized)) {
-      files.add(normalized);
-      return normalized;
-    }
-    return null;
-  };
   for (const row of failedRows || []) {
-    const detail = String(row?.detail ?? '');
-    const importers = [];
-    for (const match of detail.matchAll(/(?:file:\/\/(\/[^\s"'<>():]+)|(\/[^\s"'<>():]+\.(?:mjs|js|cjs|json|ts))):\d+/g)) {
-      const absolute = match[1] ?? match[2];
-      const relative = prefix && absolute.startsWith(prefix)
-        ? absolute.slice(prefix.length)
-        : absolute.match(/\/[^/]+\.candidate-[^/]+\/(.+)$/)?.[1];
-      if (relative) {
-        const importer = add(relative);
-        if (importer) importers.push(importer);
-      }
-    }
-    for (const match of detail.matchAll(/The requested module '([^']+)'/g)) {
-      if (!match[1].startsWith('./') && !match[1].startsWith('../')) continue;
-      for (const importer of importers) add(posix.join(posix.dirname(importer), match[1]));
+    for (const file of sourceFilesIn(row?.detail, candidatePath)) files.add(file);
+    for (const entry of Array.isArray(row?.entries) ? row.entries : []) {
+      for (const file of Array.isArray(entry?.files) ? entry.files : []) if (isRepoFile(file)) files.add(file);
     }
   }
   return [...files].sort();

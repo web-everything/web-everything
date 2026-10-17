@@ -15,9 +15,12 @@ dispatch smoke failure detail, held state, self-sync alert and PR comment carry 
 allow-listed summary (`daemon-boot-smoke.mjs#pickSmokeDiagnostics`): entry name, signal, exit
 code, attempts, launch start time, session/transcript presence, and an error class. The class is
 the first line matching `^[A-Z][A-Za-z]*Error:`, cut to 80 chars, with every quoted string
-(an unterminated one runs to the line end) replaced by `<…>`; a bare `Error:` line has none. The
-raw output's last 30 lines go only to a new owner-only (0600) file under
-`<daemon state dir>/smoke-diagnostics` (0700, newest 50 kept), and the summary names its path.
+(ASCII, typographic, guillemet and fullwidth; an unterminated one runs to the line end) replaced
+by `<…>`, control/format characters dropped and token shapes redacted; a bare `Error:` line has
+none. The raw output's last 30 lines go only to a new owner-only (0600) file under
+`<daemon state dir>/smoke-diagnostics` (0700, newest 500 kept), and the summary names its path.
+Culprit attribution reads typed repo-relative `files` the boot check extracts from the raw text
+in-process (`sourceFilesIn`), never the text itself.
 A transcript denial is counted, never quoted. Test with sentinel words that are not
 secret-shaped, so only the design can keep them out of every sink.
 Cover retry recovery, exhausted retries, non-signal refusal and concurrency with injected children;

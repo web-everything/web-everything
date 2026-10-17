@@ -50,6 +50,17 @@ describe('runWorker: the job record and the result channels', () => {
     expect(JSON.parse(readFileSync(join(diagnosticsDir, 'first-output.json'), 'utf8')).ms).toBeGreaterThanOrEqual(0);
   });
 
+  it('a capture the smoke has removed is never recreated by later stderr', async () => {
+    const diagnosticsDir = tmp();
+    const file = join(diagnosticsDir, 'wrapper.stderr');
+    const s = spec({ diagnosticsDir, argv: ['-e', `process.stderr.write('first\\n'); setTimeout(() => { process.stderr.write('late\\n'); process.stdout.write(${JSON.stringify(claudeStdout(DONE))}); }, 600)`] });
+    const run = runWorker(s);
+    for (let i = 0; i < 100 && !existsSync(file); i++) await new Promise((r) => setTimeout(r, 20));
+    rmSync(file);
+    await run;
+    expect(existsSync(file)).toBe(false);
+  });
+
   it('bounds the captured smoke stderr on disk and keeps its newest bytes', async () => {
     const diagnosticsDir = tmp();
     const s = spec({ diagnosticsDir, argv: ['-e', `for (let i = 0; i < 40; i++) process.stderr.write('x'.repeat(64 * 1024) + '\\n'); process.stderr.write('newest line\\n'); process.stdout.write(${JSON.stringify(claudeStdout(DONE))})`] });

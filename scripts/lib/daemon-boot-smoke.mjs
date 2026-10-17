@@ -54,9 +54,10 @@
 
 import { randomBytes } from 'node:crypto';
 import { closeSync, constants, fchmodSync, mkdirSync, openSync, readdirSync, rmSync, statSync, writeSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, posix } from 'node:path';
 
 import { resolveChildTimeoutMs, runBounded } from './bounded-child.mjs';
+import { redactDetail } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
 import { daemonStateDir } from './daemon-last-good.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
@@ -73,16 +74,20 @@ export function smokeDiagnosticsDir(env = process.env) {
 
 const ERROR_CLASS_LINE = /^[A-Z][A-Za-z]*Error:/;
 const LINE_SPLIT = new RegExp(`\\r\\n|[\\n\\r${String.fromCharCode(0x85, 0x2028, 0x2029)}]`);
-const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
-const QUOTES = new Set(['"', "'", '`']);
+// Control AND format characters (bidi overrides, zero-width): none may reach an alert.
+const CONTROL_CHARS = /[\p{Cc}\p{Cf}]/gu;
+/** Each opening quote and its closer: ASCII, typographic, guillemets and fullwidth. */
+const QUOTES = new Map([['"', '"'], ["'", "'"], ['`', '`'], ...[[0x201c, 0x201d], [0x2018, 0x2019], [0x201e, 0x201c],
+  [0xab, 0xbb], [0xbb, 0xab], [0xff02, 0xff02], [0xff07, 0xff07]].map(([o, c]) => [String.fromCharCode(o), String.fromCharCode(c)])]);
 
 /** Every quoted string (backslash escapes honoured) replaced with `<…>`; an unterminated one runs to the end. */
 function maskQuoted(line) {
   let out = '';
   for (let i = 0; i < line.length; i++) {
-    if (!QUOTES.has(line[i])) { out += line[i]; continue; }
+    const close = QUOTES.get(line[i]);
+    if (close === undefined) { out += line[i]; continue; }
     let j = i + 1;
-    while (j < line.length && line[j] !== line[i]) j += line[j] === '\\' ? 2 : 1;
+    while (j < line.length && line[j] !== close) j += line[j] === '\\' ? 2 : 1;
     out += '<…>';
     i = j;
   }
@@ -92,15 +97,54 @@ function maskQuoted(line) {
 /**
  * The error class of untrusted child output: its first line matching `^[A-Z][A-Za-z]*Error:`, cut to 80 chars, with
  * every quoted string replaced by `<…>` (a quote left open by the line end or the cut hides the rest). Null when no
- * line matches. This is the ONLY child text a smoke summary carries.
+ * line matches. This is the ONLY child text a smoke summary carries; token shapes in it are redacted too.
  */
 export function smokeErrorClass(text) {
   try {
     const line = String(text ?? '').split(LINE_SPLIT).find((l) => ERROR_CLASS_LINE.test(l));
-    return line === undefined ? null : maskQuoted(line.slice(0, 80)).replace(CONTROL_CHARS, '');
+    return line === undefined ? null : redactDetail(maskQuoted(line.slice(0, 80)).replace(CONTROL_CHARS, ''));
   } catch {
     return null;
   }
+}
+
+const REPO_FILE = /^[A-Za-z0-9_@+-][A-Za-z0-9._@+/-]{0,255}$/;
+/** A repo-relative source path in a plain charset, no `..` segment: the only shape a summary's `files` may hold. */
+export const isRepoFile = (p) => typeof p === 'string' && REPO_FILE.test(p) && !p.split('/').includes('..');
+
+/**
+ * PURE: the repo files named by complete source locations (`file:///…:N`, `/abs/x.mjs:N`) in raw child text under
+ * `candidatePath` (or a `*.candidate-*` tree), plus `The requested module './x'` resolved against those importers.
+ * Read in-process from the raw text, so a summary can name the culprit files without carrying the text.
+ */
+export function sourceFilesIn(text, candidatePath) {
+  const files = new Set();
+  const raw = String(text ?? '');
+  const prefix = candidatePath ? candidatePath.replace(/\/$/, '') + '/' : null;
+  const add = (path) => {
+    const normalized = posix.normalize(path);
+    if (normalized !== '.' && normalized !== '..' && !normalized.startsWith('../') && !posix.isAbsolute(normalized)) {
+      files.add(normalized);
+      return normalized;
+    }
+    return null;
+  };
+  const importers = [];
+  for (const match of raw.matchAll(/(?:file:\/\/(\/[^\s"'<>():]+)|(\/[^\s"'<>():]+\.(?:mjs|js|cjs|json|ts))):\d+/g)) {
+    const absolute = match[1] ?? match[2];
+    const relative = prefix && absolute.startsWith(prefix)
+      ? absolute.slice(prefix.length)
+      : absolute.match(/\/[^/]+\.candidate-[^/]+\/(.+)$/)?.[1];
+    if (relative) {
+      const importer = add(relative);
+      if (importer) importers.push(importer);
+    }
+  }
+  for (const match of raw.matchAll(/The requested module '([^']+)'/g)) {
+    if (!match[1].startsWith('./') && !match[1].startsWith('../')) continue;
+    for (const importer of importers) add(posix.join(posix.dirname(importer), match[1]));
+  }
+  return [...files];
 }
 
 /** A signal name, an integer exit code: anything else from a child-shaped error object reads as null. */
@@ -122,8 +166,10 @@ const SUMMARY_FIELDS = Object.freeze({
   transcriptAppeared: isBool,
   firstOutputMs: (v) => Number.isFinite(v) && v >= 0,
   attempts: isCount,
-  errorClass: (v) => typeof v === 'string' && v.length <= 120 && ERROR_CLASS_LINE.test(v) && !LINE_SPLIT.test(v),
   stderrFile: (v) => typeof v === 'string' && PATH_TEXT.test(v),
+  // Last: the one field holding child text, so in a `k=v` rendering it cannot pose as a later field.
+  errorClass: (v) => typeof v === 'string' && v.length <= 120 && ERROR_CLASS_LINE.test(v) && !LINE_SPLIT.test(v)
+    && v === v.replace(CONTROL_CHARS, '') && v === redactDetail(v),
 });
 
 /** The allow-listed form of a smoke diagnostics object (null for a non-object): typed fields only, every other
@@ -135,7 +181,8 @@ export function pickSmokeDiagnostics(d) {
 
 const TAIL_LINES = 30;
 const TAIL_READ_CHARS = 64 * 1024;
-const KEEP_DIAGNOSTICS = 50;
+// Room for several rebuilds' worth (up to 6 entries × retries × smoke passes each) across every clone sharing the dir.
+const KEEP_DIAGNOSTICS = 500;
 
 /** Keep the newest {@link KEEP_DIAGNOSTICS} entries of the diagnostics dir, so failed smokes never grow it unbounded. */
 function pruneDiagnostics(dir) {
@@ -297,13 +344,16 @@ export function buildEntryBootScript(entry) {
 async function bootOneEntry(entry, { root, timeoutMs, runChild, env, diagnosticsDir, now }) {
   const startedAt = new Date(now()).toISOString();
   const keep = (text) => writeStderrTail(text, { dir: diagnosticsDir, label: `boot-${entry}`, now });
+  // The culprit attribution (`daemon-rebuild/smoke.mjs#smokeFailureFiles`) reads these typed paths, not the text.
+  const filesIn = (text) => sourceFilesIn(text, root).filter(isRepoFile);
   let out;
   try {
     out = await runChild('node', ['--input-type=module', '-e', buildEntryBootScript(entry)], { cwd: root, timeoutMs, env });
   } catch (e) {
     const stderr = String(e?.stderr ?? '');
     return { entry, ok: false, kind: 'child failed', startedAt, signal: smokeSignal(e?.signal), exitCode: smokeExitCode(e?.status),
-      errorClass: smokeErrorClass(stderr) ?? smokeErrorClass(e?.message), stderrFile: keep(stderr || e?.message) };
+      errorClass: smokeErrorClass(stderr) ?? smokeErrorClass(e?.message), files: filesIn(`${stderr}\n${e?.message ?? ''}`),
+      stderrFile: keep(stderr || e?.message) };
   }
   let parsed;
   try {
@@ -317,13 +367,14 @@ async function bootOneEntry(entry, { root, timeoutMs, runChild, env, diagnostics
   // The boot script joins its stack lines with ' | '.
   const error = String(parsed?.error ?? '').split(' | ').join('\n');
   return { entry, ok: false, kind: 'import failed', startedAt, signal: null, exitCode: null,
-    errorClass: smokeErrorClass(error), stderrFile: keep(error) };
+    errorClass: smokeErrorClass(error), files: filesIn(error), stderrFile: keep(error) };
 }
 
-/** One failed entry's summary line: typed fields, the error class and the local file — never child text. */
+/** One failed entry's summary line: typed fields, the local file, and the error class LAST (it is child text, so it
+ *  cannot pose as a later field) — never other child text. */
 function entrySummary(r) {
   return `- ${r.entry}: ${r.kind} (signal=${r.signal}, exitCode=${r.exitCode}, attempts=${r.attempts.length}, startedAt=${r.startedAt})`
-    + ` class=${r.errorClass ?? 'none'} stderr=${r.stderrFile ?? 'none'}`;
+    + ` stderr=${r.stderrFile ?? 'none'} class=${r.errorClass ?? 'none'}`;
 }
 
 /**
