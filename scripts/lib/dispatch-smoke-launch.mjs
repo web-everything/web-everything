@@ -5,7 +5,7 @@
  *   own modules, its own launch path) and makes the same request `createDispatchSinks` hands `defaultClaudeProvider`
  *   for a ci-heal/fix dispatch. Prints `{handle, wrapperPid, cwd}` as its last line.
  *
- *   argv: <tree> <slug> <kind> <pr> <sessionId> <prompt> <model>
+ *   argv: <tree> <slug> <kind> <pr> <sessionId> <prompt> <model> [diagnosticsDir] [launchStartedMs]
  *
  * It is spawned as a process by `we:scripts/lib/daemon-load-overlay.mjs#runRealDispatchSmoke` and NEVER imported:
  * it loads modules from a computed path, and a computed `import(...)` in a file the review code path reaches makes
@@ -16,10 +16,12 @@
 import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 
-const [tree, slug, kind, pr, sessionId, prompt, model] = process.argv.slice(2);
+const [tree, slug, kind, pr, sessionId, prompt, model, diagnosticsDir, launchStartedMs] = process.argv.slice(2);
 if (!model) throw new Error('dispatch smoke requires an explicit policy model');
 const imp = (p) => import(pathToFileURL(join(tree, p)).href);
 const io = await imp('scripts/operations/dispatch-lane-io.mjs');
+const wrapped = diagnosticsDir ? await imp('scripts/operations/worker-wrapper-launch.mjs') : null;
+const wrapper = diagnosticsDir ? await imp('scripts/operations/worker-wrapper.mjs') : null;
 const iso = await imp('scripts/lib/dispatch-bg-isolation.mjs');
 const cwd = io.ensureDispatchSessionCwd(io.dispatchSessionCwd(sessionId, { root: tree }));
 const isolated = iso.isolateDispatchSession(cwd);
@@ -31,5 +33,9 @@ const handle = io.defaultClaudeProvider({
   systemPromptFile: io.DISPATCHED_AGENT_SYSTEM_PROMPT_FILE, settingsEnv: resolveEnv(cwd),
   worktreeSettings: (isolated && isolated.worktreeSettings) || null,
   reportWrapped: (pid) => { wrapperPid = pid; },
-});
+}, diagnosticsDir ? {
+  launchWrapped: (request) => wrapped.launchWrappedClaudeWorker({
+    ...request, launch: (spec, opts) => wrapper.launchDetached({ ...spec, diagnosticsDir, diagnosticsStartedAt: new Date(Number(launchStartedMs)).toISOString() }, opts),
+  }),
+} : {});
 process.stdout.write('\n' + JSON.stringify({ handle, wrapperPid, cwd }) + '\n');

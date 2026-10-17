@@ -896,6 +896,78 @@ describe('runRealDispatchSmoke — the smoke worker\'s completion record goes to
   beforeEach(() => { work = mkdtempSync(join(tmpdir(), 'dlo-scratch-test-')); });
   afterEach(() => { rmSync(work, { recursive: true, force: true }); });
 
+  function launchFixture(action = () => {}) {
+    return vi.fn((_node, args, opts) => {
+      const [, , slug, , , sessionId, prompt, , scratch] = args;
+      const [, marker, nonce] = prompt.match(/process\.argv\[2\]\)" '([^']+)' '([^']+)'/);
+      action({ slug, sessionId, marker, nonce, store: opts.env.OPERATION_COMPLETIONS_DIR, scratch });
+      return { status: 0, stdout: JSON.stringify({ handle: 'pid:12345', wrapperPid: 12345 }), stderr: '' };
+    });
+  }
+  const fastSettings = () => ({ ...overlaySafetySettings({}, { readSettings: () => null }), smokeTimeoutMs: 0 });
+  const finish = ({ marker, nonce, store, slug }) => {
+    writeFileSync(marker, nonce);
+    writeFileSync(join(store, `${slug}.json`), JSON.stringify({ status: 'done' }));
+  };
+  const smoke = (spawn, extra = {}) => runRealDispatchSmoke({ tree: '.', env: {}, settings: fastSettings(), spawn, home: join(work, 'home'), log: quietLog, probeAlive: () => false, ...extra });
+
+  it('retries a launch timeout once with fresh evidence, then accepts the passing worker', async () => {
+    const spawn = launchFixture((a) => { if (spawn.mock.calls.length === 2) finish(a); });
+    const r = await smoke(spawn);
+    expect(r).toMatchObject({ ok: true, note: 'retried after launch timeout' });
+    expect(spawn).toHaveBeenCalledTimes(2);
+    expect(spawn.mock.calls[0][1][5]).not.toBe(spawn.mock.calls[1][1][5]);
+    expect(spawn.mock.calls[0][2].env.OPERATION_COMPLETIONS_DIR).not.toBe(spawn.mock.calls[1][2].env.OPERATION_COMPLETIONS_DIR);
+  });
+
+  it('rejects two launch timeouts with both attempts diagnostics and stops live wrappers', async () => {
+    const spawn = launchFixture(({ scratch }) => {
+      writeFileSync(join(scratch, 'wrapper.stderr'), Array.from({ length: 40 }, (_, n) => `line ${n}`).join('\n'));
+      writeFileSync(join(scratch, 'first-output.json'), JSON.stringify({ ms: 17 }));
+    });
+    const stopWrapper = vi.fn();
+    const r = await smoke(spawn, { probeAlive: () => true, stopWrapper });
+    expect(spawn).toHaveBeenCalledTimes(2);
+    expect(stopWrapper).toHaveBeenCalledTimes(2);
+    expect(r).toMatchObject({ ok: false, reason: 'timeout', diagnostics: { wrapperPid: 12345, wrapperAliveAtTimeout: true, sessionAppeared: false, transcriptAppeared: false, firstOutputMs: 17 } });
+    expect(r.diagnostics.stderrTail.split('\n')).toHaveLength(30);
+    expect(r.diagnostics.launchStartedAt).toMatch(/^\d{4}-/);
+    expect(r.detail).toContain('line 39');
+    expect(r.attempts).toHaveLength(2);
+  });
+
+  it('does not retry a worker that finishes without its commands', async () => {
+    const spawn = launchFixture(({ store, slug }) => writeFileSync(join(store, `${slug}.json`), JSON.stringify({ status: 'done' })));
+    expect(await smoke(spawn)).toMatchObject({ ok: false, reason: 'no-commands-ran' });
+    expect(spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['marker', 'session', 'transcript'])('does not retry a timeout with %s evidence', async (evidence) => {
+    const spawn = launchFixture(({ marker, nonce, sessionId }) => {
+      if (evidence === 'marker') writeFileSync(marker, nonce);
+      else {
+        const dir = join(work, 'home', '.claude', evidence === 'session' ? 'sessions' : 'projects/test');
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, evidence === 'session' ? '123.json' : `${sessionId}.jsonl`), JSON.stringify({ sessionId }));
+      }
+    });
+    expect(await smoke(spawn)).toMatchObject({ ok: false, reason: 'timeout' });
+    expect(spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it('resolves the retry limit and source, allowing disable but never more than one retry', async () => {
+    expect(fastSettings()).toMatchObject({ dispatchLaunchRetries: 1, dispatchLaunchRetriesSource: 'standard' });
+    const readSettings = () => ({ overlaySmoke: { dispatchLaunchRetries: 0 } });
+    expect(overlaySafetySettings({}, { readSettings })).toMatchObject({ dispatchLaunchRetries: 0, dispatchLaunchRetriesSource: 'tool' });
+    expect(overlaySafetySettings({ WE_OVERLAY_DISPATCH_LAUNCH_RETRIES: '1' }, { readSettings })).toMatchObject({ dispatchLaunchRetries: 1, dispatchLaunchRetriesSource: 'env' });
+    expect(overlaySafetySettings({ WE_OVERLAY_DISPATCH_LAUNCH_RETRIES: '2' }, { readSettings }).dispatchLaunchRetries).toBe(0);
+    const spawn = launchFixture();
+    const log = { error: vi.fn() };
+    await smoke(spawn, { settings: { ...fastSettings(), dispatchLaunchRetries: 0, dispatchLaunchRetriesSource: 'tool' }, log });
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('dispatchLaunchRetries=0 (source tool)'));
+  });
+
   it('pins OPERATION_COMPLETIONS_DIR to a fresh scratch dir in the child env AND in the prompt\'s own report command, and leaves a real store untouched', async () => {
     const realStore = join(work, 'REAL-completions');
     mkdirSync(realStore, { recursive: true });

@@ -119,6 +119,20 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
     const stale = result.alerts.find(a => a.kind === 'clone-held-stale');
     expect(stale.detail.broken.details).toEqual(held.details);
   });
+  it('keeps timeout launch diagnostics in the failure alert, including all stderr tail lines', async () => {
+    const f = makeFixture();
+    addDispatchOverlay(f);
+    const diagnostics = { wrapperPid: 42, wrapperAliveAtTimeout: true, launchStartedAt: '2026-10-16T00:00:00Z', sessionAppeared: false, transcriptAppeared: false, firstOutputMs: null,
+      stderrTail: Array.from({ length: 30 }, (_, i) => `frame ${i} ${'x'.repeat(30)}`).join('\n') + '\nghp_secret' };
+    const r = await rebuild(f, async () => ({ ok: false, reason: 'timeout', detail: 'launch timeout', diagnostics, attempts: [{ reason: 'timeout', diagnostics }] }));
+    expect(r.adopted).toBeFalsy();
+    const alert = r.alerts.find((a) => a.kind === 'dispatch-smoke-failed').detail;
+    expect(alert.diagnostics).toMatchObject({ wrapperPid: 42, wrapperAliveAtTimeout: true, firstOutputMs: null });
+    expect(alert.diagnostics.stderrTail).toContain('frame 29');
+    expect(alert.diagnostics.stderrTail).not.toContain('ghp_secret');
+    expect(alert.attempts[0].diagnostics).toEqual(alert.diagnostics);
+  });
+
   it('a candidate whose new overlay fails the dispatch smoke is never adopted; the clone stays on last-good', async () => {
     const f = makeFixture();
     const lastGood = head(f);

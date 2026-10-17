@@ -59,6 +59,7 @@ import {
 } from 'node:fs';
 import { readHeadSha, isSafeBranchName } from './daemon-self-sync.mjs';
 import { gitRun } from './main-staleness.mjs';
+import { cascadePolicy } from './policy-cascade.mjs';
 import { readRoutingPolicy, resolvePolicyModel } from './dispatch-routing-policy-io.mjs';
 import { repairCloneRefs } from './lane-repair.mjs';
 import { addOverlay, removeOverlay, appendOverlayEvent } from './daemon-overlays.mjs';
@@ -201,11 +202,17 @@ function readSettingsFile() {
 
 /**
  * The overlay-safety settings: built-in defaults, then `overlaySafety` in daemon-rebuild-settings.json, then env.
- * An invalid value falls back to the default (never to "off").
+ * An invalid safety value falls back to the default (never to "off"). Launch retries use the overlaySmoke policy cascade.
  * @returns {{dispatchSmoke:'on'|'off', dispatchPaths:string[], noPr:'warn'|'refuse', smokeTimeoutMs:number, smokeKind:'ci-heal'|'fix'}}
  */
 export function overlaySafetySettings(env = process.env, { readSettings = readSettingsFile } = {}) {
-  const file = (readSettings() || {}).overlaySafety || {};
+  const declared = readSettings() || {};
+  const file = declared.overlaySafety || {};
+  const retries = cascadePolicy('overlaySmoke', declared.overlaySmoke, {
+    standard: { dispatchLaunchRetries: 1 }, env,
+    envValues: { dispatchLaunchRetries: env.WE_OVERLAY_DISPATCH_LAUNCH_RETRIES === undefined ? undefined : Number(env.WE_OVERLAY_DISPATCH_LAUNCH_RETRIES) },
+    valid: { dispatchLaunchRetries: (v) => Number.isInteger(v) && v >= 0 && v <= 1 },
+  });
   const pick = (envVal, fileVal, allowed, dflt) => {
     for (const v of [envVal, fileVal]) {
       const t = typeof v === 'string' ? v.trim() : v;
@@ -218,6 +225,8 @@ export function overlaySafetySettings(env = process.env, { readSettings = readSe
   const filePaths = Array.isArray(file.dispatchPaths) && file.dispatchPaths.every((x) => typeof x === 'string') ? file.dispatchPaths : null;
   const timeout = Number(env?.WE_OVERLAY_DISPATCH_SMOKE_TIMEOUT_MS ?? file.smokeTimeoutMs);
   return {
+    dispatchLaunchRetries: retries.value.dispatchLaunchRetries,
+    dispatchLaunchRetriesSource: retries.sources.dispatchLaunchRetries,
     dispatchSmoke: pick(env?.WE_OVERLAY_DISPATCH_SMOKE, file.dispatchSmoke, ['on', 'off'], 'on'),
     dispatchPaths: envPaths || filePaths || [...DISPATCH_PATH_DEFAULTS],
     noPr: pick(env?.WE_OVERLAY_NO_PR, file.noPr, ['warn', 'refuse'], 'warn'),
@@ -374,9 +383,9 @@ export function dispatchSmokePrompt({ tree, store, marker, nonce, slug, kind, pr
  * {@link judgeDispatchSmoke}). Its completion record and spec go to a scratch store, never the real one.
  * @returns {Promise<{ok:boolean, reason:string, detail?:string, sessionId:string, handle?:string|null, wrapperPid?:number|null, scratch:string, transcript?:string|null, ms:number}>}
  */
-export async function runRealDispatchSmoke({
+async function runRealDispatchSmokeAttempt({
   tree, env = process.env, settings = overlaySafetySettings(env), spawn = spawnSync, pollMs = 2_000, home = homedir(), log = console,
-  routingPolicy = readRoutingPolicy(),
+  routingPolicy = readRoutingPolicy(), probeAlive = isAlive, stopWrapper = (pid) => process.kill(pid, 'SIGTERM'),
 }) {
   const t0 = Date.now();
   const scratch = mkdtempSync(join(tmpdir(), 'we-overlay-dispatch-smoke-'));
@@ -393,7 +402,7 @@ export async function runRealDispatchSmoke({
   const base = { sessionId, scratch };
   const model = resolvePolicyModel('claude', routingPolicy.aliases.claude.haiku ? 'haiku' : 'sonnet', routingPolicy);
   log.error?.(`daemon-load-overlay: dispatch smoke — launching one real ${kind} worker model=${model} (source routing-policy cheapest Claude alias) from ${tree} (scratch store ${store})`);
-  const launch = spawn(process.execPath, [LAUNCH_HARNESS_FILE, tree, slug, kind, pr, sessionId, prompt, model], {
+  const launch = spawn(process.execPath, [LAUNCH_HARNESS_FILE, tree, slug, kind, pr, sessionId, prompt, model, scratch, String(t0)], {
     cwd: tree, env: childEnv, encoding: 'utf8', timeout: 120_000, killSignal: 'SIGKILL',
   });
   if (launch.status !== 0) {
@@ -407,8 +416,21 @@ export async function runRealDispatchSmoke({
   const deadline = t0 + settings.smokeTimeoutMs;
   let verdict;
   let transcript = null;
+  let session = null;
+  let markerAppeared = false;
+  let recordAppeared = false;
   const observe = (timedOut) => {
     transcript = transcript || findTranscript(ids, home);
+    const sessionDir = join(home, '.claude', 'sessions');
+    try {
+      session ||= readdirSync(sessionDir).map((n) => join(sessionDir, n)).find((f) => ids.filter(Boolean).includes(readJson(f)?.sessionId)) || null;
+    } catch { /* no session file yet */ }
+    const jobsDir = join(home, '.claude', 'jobs');
+    try {
+      session ||= readdirSync(jobsDir).map((n) => join(jobsDir, n, 'state.json')).find((f) => ids.filter(Boolean).includes(readJson(f)?.sessionId)) || null;
+    } catch { /* no background job file yet */ }
+    markerAppeared ||= existsSync(marker);
+    recordAppeared ||= existsSync(join(store, `${slug}.json`));
     const markerText = existsSync(marker) ? readFileSync(marker, 'utf8').trim() : null;
     return judgeDispatchSmoke({
       nonce, marker: markerText, record: readJson(join(store, `${slug}.json`)), denials: transcript ? transcriptDenials(transcript) : [], timedOut,
@@ -422,16 +444,47 @@ export async function runRealDispatchSmoke({
   // A wrapped worker writes its own final record when `claude -p` exits — wait for it (bounded) and judge that too.
   if (verdict.ok && wrapperPid) {
     const until = Math.min(deadline, Date.now() + 90_000);
-    while (isAlive(wrapperPid) && Date.now() < until) await sleep(pollMs);
+    while (probeAlive(wrapperPid) && Date.now() < until) await sleep(pollMs);
     verdict = observe(false);
     if (verdict.pending) verdict = { ok: true, reason: 'passed' };
   }
-  if (!verdict.ok && verdict.reason === 'timeout' && isAlive(wrapperPid)) {
-    try { process.kill(wrapperPid, 'SIGTERM'); } catch { /* already gone */ }
-  }
-  return {
-    ...base, ...verdict, handle, wrapperPid, transcript, ms: Date.now() - t0,
+  const diagnostics = {
+    wrapperPid, wrapperAliveAtTimeout: verdict.reason === 'timeout' ? probeAlive(wrapperPid) : null,
+    launchStartedAt: new Date(t0).toISOString(),
+    stderrTail: (() => { try { return readFileSync(join(scratch, 'wrapper.stderr'), 'utf8').trimEnd().split('\n').slice(-30).join('\n'); } catch { return ''; } })(),
+    sessionAppeared: !!session, transcriptAppeared: !!transcript,
+    firstOutputMs: readJson(join(scratch, 'first-output.json'))?.ms ?? null,
   };
+  if (!verdict.ok && verdict.reason === 'timeout' && diagnostics.wrapperAliveAtTimeout) {
+    try { stopWrapper(wrapperPid); } catch { /* already gone */ }
+  }
+  const launchTimeout = verdict.reason === 'timeout' && !markerAppeared && !recordAppeared && !session && !transcript;
+  if (!verdict.ok) verdict.detail = `${verdict.detail || verdict.reason}; diagnostics=${JSON.stringify(diagnostics)}`;
+  return {
+    ...base, ...verdict, handle, wrapperPid, transcript, diagnostics, launchTimeout, ms: Date.now() - t0,
+  };
+}
+
+/** Retry only a launch timeout with no evidence that the worker started its task. Each attempt has its own store and session. */
+export async function runRealDispatchSmoke(args) {
+  const settings = args.settings ?? overlaySafetySettings(args.env ?? process.env);
+  const retries = settings.dispatchLaunchRetries === 0 ? 0 : 1;
+  const log = args.log ?? console;
+  log.error?.(`daemon-load-overlay: overlaySmoke.dispatchLaunchRetries=${retries} (source ${settings.dispatchLaunchRetriesSource ?? 'standard'})`);
+  const attempts = [];
+  for (let attempt = 0; ; attempt++) {
+    const result = await runRealDispatchSmokeAttempt({ ...args, settings });
+    attempts.push(result);
+    if (!result.launchTimeout || attempt >= retries) {
+      if (attempt > 0) {
+        result.note = 'retried after launch timeout';
+        result.detail = `${result.detail ?? result.reason}; ${result.note}; attempts=${JSON.stringify(attempts.map((r) => ({ reason: r.reason, diagnostics: r.diagnostics })))}`;
+        log.error?.(`daemon-load-overlay: dispatch smoke ${result.reason} — ${result.note}`);
+      }
+      return { ...result, attempts: attempts.map((r) => ({ reason: r.reason, diagnostics: r.diagnostics })), ms: attempts.reduce((n, r) => n + r.ms, 0) };
+    }
+    log.error?.(`daemon-load-overlay: retrying dispatch smoke after launch timeout — ${result.detail}`);
+  }
 }
 
 /**

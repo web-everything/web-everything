@@ -1212,3 +1212,18 @@ needs-you feed (honoring `WE_NEEDS_YOU_FEED`). No Claude session or judgment ste
 Run `nightly-coroner-*.test.mjs` under `scripts/conveyor/__tests__/` through heavy admission.
 Cover ET boundaries and DST, persisted job adoption/catch-up, source logging, cursor continuity,
 publication deduplication, real isolated extraction, and release without cursor advance on failure.
+
+### Overlay dispatch launch timeouts
+
+The real overlay dispatch smoke keeps its five-minute budget per attempt. Resolve
+`overlaySmoke.dispatchLaunchRetries` through the policy cascade (default 1, allowed 0–1;
+`WE_OVERLAY_DISPATCH_LAUNCH_RETRIES` overrides it) and log its source. Retry only a timeout
+with no marker file, completion record, Claude session file, or transcript. Use a fresh
+scratch store and session ID, retain both attempts' diagnostics, and report
+“retried after launch timeout” on recovery. Assertion failures never retry.
+The smoke opts into wrapper stderr capture and first-byte timing; missing output is
+represented by `firstOutputMs: null`, not zero. Failure alerts retain the wrapper PID,
+liveness at timeout, launch time, session/transcript presence and the last 30 stderr lines.
+Exercise the launch with injected processes and isolated homes; wrapper output capture
+also has a real Node-child probe in `worker-wrapper.test.mjs`. Run these suites through
+`node scripts/readiness/heavy-admission.mjs run -- npx vitest run <files>`.

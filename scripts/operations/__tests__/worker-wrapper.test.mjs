@@ -40,6 +40,14 @@ function spec(over = {}, dir = tmp()) {
 const read = (s) => tryReadCompletion(s.session, s.completionsDir);
 
 describe('runWorker: the job record and the result channels', () => {
+  it('captures opt-in smoke stderr and first output from a real child', async () => {
+    const diagnosticsDir = tmp();
+    const s = spec({ diagnosticsDir, argv: ['-e', `process.stderr.write('launch diagnostic\\n'); process.stdout.write(${JSON.stringify(claudeStdout(DONE))})`] });
+    await runWorker(s);
+    expect(readFileSync(join(diagnosticsDir, 'wrapper.stderr'), 'utf8')).toBe('launch diagnostic\n');
+    expect(JSON.parse(readFileSync(join(diagnosticsDir, 'first-output.json'), 'utf8')).ms).toBeGreaterThanOrEqual(0);
+  });
+
   it('writes a started record with pid, timeout and deadline BEFORE the child exits, then a done envelope', async () => {
     const writes = [];
     const s = spec({ argv: ['-e', `setTimeout(()=>process.stdout.write(${JSON.stringify(claudeStdout(DONE))}), 150)`] });

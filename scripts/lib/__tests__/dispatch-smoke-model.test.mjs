@@ -16,7 +16,7 @@ describe('overlay smoke model pin', () => {
     const spawn = vi.fn(() => ({ status: 1, stderr: 'stop after capturing launch' }));
     const result = await runRealDispatchSmoke({ tree: '/tree', env: {}, routingPolicy: policy, spawn, log: { error: vi.fn() } });
     dirs.push(result.scratch);
-    expect(spawn.mock.calls[0][1].at(-1)).toBe(haiku ? policy.aliases.claude.haiku : policy.aliases.claude.sonnet);
+    expect(spawn.mock.calls[0][1][7]).toBe(haiku ? policy.aliases.claude.haiku : policy.aliases.claude.sonnet);
   });
 
   it('the subprocess harness forwards the pinned model as a launch table', () => {

@@ -474,6 +474,7 @@ export async function smokeAndAdopt({
   /** xhiqxz3 — a passed dispatch smoke: say so (the proof line the live daemon's log carries). */
   const dispatchPassedAlert = (d) => alert('dispatch-smoke-passed', {
     suspects: d.suspects.map((s) => ({ ref: s.ref, pr: s.pr, matched: s.matched })),
+    note: d.result.note ?? null,
     ms: d.result.ms ?? null, sessionId: d.result.sessionId ?? null,
   });
   /** xhiqxz3 — a FAILED dispatch smoke: never adopt; hold on last-good. A definite failure drops just the suspect
@@ -484,6 +485,8 @@ export async function smokeAndAdopt({
     const why = `dispatch-smoke-failed: ${result.reason}${result.detail ? ` — ${result.detail}` : ''}`;
     alert('dispatch-smoke-failed', {
       reason: result.reason, detail: redactDetail(result.detail ?? ''),
+      diagnostics: result.diagnostics ? { ...result.diagnostics, stderrTail: String(result.diagnostics.stderrTail ?? '').split('\n').map((line) => redactDetail(line)).join('\n') } : null,
+      attempts: result.attempts?.map((a) => ({ ...a, diagnostics: a.diagnostics ? { ...a.diagnostics, stderrTail: String(a.diagnostics.stderrTail ?? '').split('\n').map((line) => redactDetail(line)).join('\n') } : null })) ?? [],
       suspects: suspects.map((s) => ({ ref: s.ref, pr: s.pr, matched: s.matched })),
       evidence: result.scratch ?? null, transcript: result.transcript ?? null,
       action: definite ? 'dropped-suspects' : 'retry-with-backoff',

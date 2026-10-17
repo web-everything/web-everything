@@ -27,7 +27,7 @@
  * so the tests run it against a fake child. The CLI at the bottom runs a JSON spec detached.
  */
 import { spawn } from 'node:child_process';
-import { closeSync, constants, fstatSync, mkdirSync, openSync, readFileSync, readSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, constants, fstatSync, mkdirSync, openSync, readFileSync, readSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -295,6 +295,22 @@ async function runWorkerOnce(spec, io, stop) {
   let graceTimer = null;
   const spawnWithPid = (cmd, argv, opts) => {
     const child = spawnFn(cmd, argv, opts);
+    // Opt-in smoke evidence: persist the first byte time and stderr while the worker is still running.
+    if (spec.diagnosticsDir) {
+      let first = true;
+      for (const [stream, name] of [[child.stdout, 'worker.stdout'], [child.stderr, 'wrapper.stderr']]) {
+        stream?.on?.('data', (chunk) => {
+          try {
+            if (first) {
+              writeFileSync(join(spec.diagnosticsDir, 'first-output.json'), JSON.stringify({ ms: clock() - Date.parse(spec.diagnosticsStartedAt ?? started.startedAt) }));
+              first = false;
+            }
+            // stdout is only a first-byte signal; stderr is the diagnostic tail.
+            if (name === 'wrapper.stderr') appendFileSync(join(spec.diagnosticsDir, name), chunk);
+          } catch { /* diagnostics cannot interrupt the worker */ }
+        });
+      }
+    }
     // An operator stop is forwarded to the child; one that ignores it is SIGKILLed after a grace, so the wrapper still writes its record.
     // The child's exit ends the window in which a stop can still have stopped it: a TERM that lands after a clean exit (before the spawn
     // promise settles) must not turn a finished result into `aborted`.
@@ -525,7 +541,12 @@ export function launchDetached(spec, { specDir, spawnFn = spawn, nodePath = proc
   // Owner-only permissions; the child deletes it once read.
   const { env: _env, ...safe } = spec;
   writeFileSync(specFile, `${JSON.stringify({ ...safe, specDir })}\n`, { mode: 0o600 });
-  const child = spawnFn(nodePath, [entry, `--spec=${specFile}`], { detached: true, stdio: 'ignore', env: markWorkerEnv(sanitizeSpawnEnv(spec.env ?? process.env)) });
+  let stderrFd;
+  let child;
+  try {
+    if (spec.diagnosticsDir) stderrFd = openSync(join(spec.diagnosticsDir, 'wrapper.stderr'), 'a', 0o600);
+    child = spawnFn(nodePath, [entry, `--spec=${specFile}`], { detached: true, stdio: stderrFd === undefined ? 'ignore' : ['ignore', 'ignore', stderrFd], env: markWorkerEnv(sanitizeSpawnEnv(spec.env ?? process.env)) });
+  } finally { if (stderrFd !== undefined) closeSync(stderrFd); }
   child.unref?.();
   return { wrapperPid: child.pid, specFile };
 }
