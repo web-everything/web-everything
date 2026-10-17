@@ -31,25 +31,33 @@ export const validFastChecks = v => checkNames(v) || (!!v && typeof v === 'objec
   && Object.keys(v).length > 0 && Object.entries(v).every(([key, names]) => repoKeyForSlug(key) === key && checkNames(names)));
 export const FIX_TIMING_DEFAULTS = Object.freeze({ joinCiAndReview: true, joinWaitMaxMin: 15 });
 const RED = new Set(['failure', 'error', 'timed_out', 'cancelled', 'action_required', 'startup_failure']);
-/** Review-dependent gates are red while a review is owed; they are not CI failures. */
-export function ciRedOnHead({ headSha, checks } = {}) {
+/**
+ * Checks that are never a CI failure a heal repairs: the review-dependent gates (red while a review is owed) and
+ * we:scripts/operations/pr-status.mjs#CI_TRUTH_EXCLUDED_CHECKS (a test pins that this list covers it).
+ */
+export const NON_HEALABLE_CHECKS = Object.freeze(['review-gate', 'merge-gate', 'soak-replay-gate']);
+/** The CI-heal rule (reconcile-core `splitFailingChecks`): a known required set names the healable checks. */
+const isHealable = (row, requiredChecks) => {
+  const name = row.name ?? row.context;
+  return Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks.includes(name) : !NON_HEALABLE_CHECKS.includes(name);
+};
+/** Is a healable check red on this head? An optional red (CodeQL, with a known required set) is not. */
+export function ciRedOnHead({ headSha, checks, requiredChecks = null } = {}) {
   if (!headSha) return false;
-  return collapseRollupToLatestPerName(checks).some(row =>
-    !['review-gate', 'merge-gate'].includes(row.name ?? row.context)
+  return collapseRollupToLatestPerName(checks).some(row => isHealable(row, requiredChecks)
     && (!row.head_sha || row.head_sha === headSha)
     && RED.has(String(row.conclusion ?? row.state ?? '').toLowerCase()));
 }
 export function reviewStartGate({ headSha, checks, requiredChecks, repo, policy = REVIEW_TIMING_DEFAULTS } = {}) {
   if (policy.startAfter === 'ci-green') return reviewCiGate({ headSha, checks, requiredChecks });
-  // Only required failures have a CI-heal owner. Optional failures must not strand review.
-  const healable = new Set(requiredChecks ?? []);
-  const requiredRows = (Array.isArray(checks) ? checks : []).filter(row => healable.has(row.name ?? row.context));
-  if (ciRedOnHead({ headSha, checks: requiredRows })) return { allowed: false, headSha, reason: 'ci-red', affected: [] };
+  // Only required failures have a CI-heal owner. Optional failures, or any red under an unknown set, must not strand review.
+  if (Array.isArray(requiredChecks) && requiredChecks.length && ciRedOnHead({ headSha, checks, requiredChecks }))
+    return { allowed: false, headSha, reason: 'ci-red', affected: [] };
   if (policy.startAfter === 'push') return { allowed: typeof headSha === 'string' && !!headSha.trim(), headSha, reason: typeof headSha === 'string' && headSha.trim() ? 'push' : 'missing-head', affected: [] };
   return reviewCiGate({ headSha, checks, requiredChecks: fastChecksFor(policy.fastChecks, repo) ?? requiredChecks });
 }
-export function reviewMustVoid({ reviewedHead, currentHead, checks, policy = REVIEW_TIMING_DEFAULTS } = {}) {
-  return !reviewedHead || reviewedHead !== currentHead || (policy.cancelOnCiRed && ciRedOnHead({ headSha: currentHead, checks }));
+export function reviewMustVoid({ reviewedHead, currentHead, checks, requiredChecks = null, policy = REVIEW_TIMING_DEFAULTS } = {}) {
+  return !reviewedHead || reviewedHead !== currentHead || (policy.cancelOnCiRed && ciRedOnHead({ headSha: currentHead, checks, requiredChecks }));
 }
 /** Unreadable sizes and binary deltas require full review. Mechanical status must be proved by the caller. */
 export function rereviewMode({ priorHead, head, lines, files, mechanical = false, policy = REVIEW_TIMING_DEFAULTS } = {}) {
@@ -73,13 +81,13 @@ export function joinedFixDecision({ ciFailed = false, reviewFindings = false, fi
 /**
  * PURE: select timestamped head-local readiness facts. findings are validated producer records supplied by caller.
  * With a known required set, only REQUIRED failures count: those are the only ones a CI heal repairs, so an optional
- * red (CodeQL) must not start the joined-fix clock or release a live reviewer's liveness hold.
+ * red (CodeQL) must not start the joined-fix clock or release a live reviewer's liveness hold. An unknown set falls
+ * back to the heal path's own rule (every check but {@link NON_HEALABLE_CHECKS}).
  */
 export function fixReadiness({ headSha, checks = [], findings = [], reviewPending = false, requiredChecks = null } = {}) {
-  const required = Array.isArray(requiredChecks) && requiredChecks.length ? new Set(requiredChecks) : null;
   const latest = collapseRollupToLatestPerName(checks).filter(row =>
     !['review-gate', 'merge-gate'].includes(row.name ?? row.context) && (!row.head_sha || row.head_sha === headSha));
-  const failed = latest.filter(row => (!required || required.has(row.name ?? row.context))
+  const failed = latest.filter(row => isHealable(row, requiredChecks)
     && RED.has(String(row.conclusion ?? row.state ?? '').toLowerCase()));
   const times = [...failed.map(row => row.completed_at ?? row.completedAt), ...findings.map(row => row.createdAt)]
     .map(t => Date.parse(t)).filter(Number.isFinite);

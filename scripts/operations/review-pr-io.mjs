@@ -935,7 +935,8 @@ export function createReviewPrSinks({
     try { ci = await publishGate({ ...args, policy, expectedHead: payload.reviewedHead }); }
     catch { /* CI read faults do not void a completed review. The head is checked independently. */ }
     if (ci?.reason === 'head-changed' || (ci?.headSha && ci.headSha !== payload.reviewedHead)
-      || reviewMustVoid({ reviewedHead: payload.reviewedHead, currentHead: payload.reviewedHead, checks: ci?.checks, policy }))
+      || reviewMustVoid({ reviewedHead: payload.reviewedHead, currentHead: payload.reviewedHead, checks: ci?.checks,
+        requiredChecks: ci?.requiredChecks, policy }))
       throw notApplied('review void: head moved or CI became red');
     await assertHead();
   };

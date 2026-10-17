@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { REVIEW_TIMING_DEFAULTS as review, FIX_TIMING_DEFAULTS as fix,
-  reviewStartGate, reviewMustVoid, rereviewMode, joinedFixDecision, fixReadiness, fastChecksFor } from '../review-timing.mjs';
+  reviewStartGate, reviewMustVoid, rereviewMode, joinedFixDecision, fixReadiness, fastChecksFor, NON_HEALABLE_CHECKS } from '../review-timing.mjs';
+import { CI_TRUTH_EXCLUDED_CHECKS } from '../../operations/pr-status.mjs';
 import { resolveTimingPolicy } from '../review-timing-settings.mjs';
 const head = 'a'.repeat(40);
 const check = (name, conclusion = 'success', extra = {}) => ({ name, head_sha: head, status: 'completed', conclusion, ...extra });
@@ -51,6 +52,19 @@ describe('parallel review start and void', () => {
     expect(reviewMustVoid({ ...args, policy: { ...review, cancelOnCiRed: false } })).toBe(false);
     expect(reviewMustVoid({ ...args, currentHead: 'b'.repeat(40), policy: { ...review, cancelOnCiRed: false } })).toBe(true);
     expect(reviewMustVoid({ ...args, checks: [check('review-gate', 'failure'), check('merge-gate', 'failure')], policy: { ...review, cancelOnCiRed: true } })).toBe(false);
+  });
+  it('cancellation voids only for a healable red: an optional check never voids a finished review', () => {
+    const cancel = { ...review, cancelOnCiRed: true };
+    const args = { reviewedHead: head, currentHead: head, policy: cancel, requiredChecks: ['integration'] };
+    expect(reviewMustVoid({ ...args, checks: [check('CodeQL', 'failure'), check('integration')] })).toBe(false);
+    expect(reviewMustVoid({ ...args, checks: [check('integration', 'failure')] })).toBe(true);
+    // Unknown set: the CI-heal rule — soak-replay-gate is never healable, any other red is.
+    expect(reviewMustVoid({ ...args, requiredChecks: null, checks: [check('soak-replay-gate', 'failure')] })).toBe(false);
+    expect(reviewMustVoid({ ...args, requiredChecks: null, checks: [check('CodeQL', 'failure')] })).toBe(true);
+  });
+  it('the non-healable list covers the CI-truth exclusions the heal path uses', () => {
+    for (const name of CI_TRUTH_EXCLUDED_CHECKS) expect(NON_HEALABLE_CHECKS).toContain(name);
+    expect(fixReadiness({ headSha: head, checks: [check('soak-replay-gate', 'failure')] }).ciFailures).toEqual([]);
   });
   it.each(['fast-checks', 'push'])('ignores optional red checks under %s but blocks healable required failures', startAfter => {
     const checks = [...fast.map(n => check(n)), check('CodeQL', 'failure')];

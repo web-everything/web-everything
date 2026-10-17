@@ -18,6 +18,14 @@ it.each([REVIEW_EFFECTS.LABEL, REVIEW_EFFECTS.ADVISORY_NOTE, REVIEW_EFFECTS.STAC
   await expect(sinks[effect]({ pr: 7, repo: 'o/n', reviewedHead: head, body: 'verdict' })).rejects.toThrow('review void');
   expect(runNode).not.toHaveBeenCalled(); expect(postComment).not.toHaveBeenCalled();
 });
+it('with cancellation on, an optional red never voids a finished review', async () => {
+  const postComment = vi.fn();
+  const sinks = createReviewPrSinks({ readPublishHead: () => head, env: { WE_REVIEW_CANCEL_ON_CI_RED: 'true' }, postComment,
+    publishGate: () => ({ headSha: head, requiredChecks: ['unit'],
+      checks: [{ name: 'CodeQL', head_sha: head, conclusion: 'failure' }, { name: 'unit', head_sha: head, conclusion: 'success' }] }) });
+  await expect(sinks[REVIEW_EFFECTS.ADVISORY_NOTE]({ pr: 7, repo: 'o/n', reviewedHead: head, body: 'verdict' })).resolves.toEqual({ posted: true });
+  expect(postComment).toHaveBeenCalledTimes(1);
+});
 it('publishes an advisory on same-head red CI when cancellation is disabled', async () => {
   const postComment = vi.fn();
   const sinks = createReviewPrSinks({ readPublishHead: () => head, env: { WE_REVIEW_CANCEL_ON_CI_RED: 'false' }, postComment,

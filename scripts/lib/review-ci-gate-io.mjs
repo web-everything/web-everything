@@ -86,7 +86,9 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
         }).rows;
       }
     } catch { /* Unreadable excusal evidence preserves the original failed checks. */ }
-    return withSource({ ...reviewStartGate({ headSha, repo, requiredChecks: trustedRequired && required.source !== 'timing-policy' ? required.checks : [], checks, policy }), checks });
+    const requiredChecks = trustedRequired && required.source !== 'timing-policy' ? required.checks : [];
+    // `requiredChecks` rides along so a publish-time void judges only healable reds, as review start does.
+    return withSource({ ...reviewStartGate({ headSha, repo, requiredChecks, checks, policy }), checks, requiredChecks });
   } catch (error) {
     return { allowed: false, headSha, startAfter: policy.startAfter, reason: 'unreadable-ci', error: String(error?.message ?? error) };
   }
