@@ -584,6 +584,10 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     // a paren in a comment, a case arm or a ${…} body cannot be counted: main's resolution
     expect(at('( case x in a) true;; esac\nHOME=/q\n)\ncd ~/x')).toBe(`${REPORTED}/~/x`);
     expect(at('(\necho ${x//)/}\nHOME=/q\n)\ncd ~/x')).toBe(`${REPORTED}/~/x`);
+    // an escaped paren is text, never a subshell boundary
+    expect(at('echo \\(; HOME=/q; echo \\); cd ~/x')).toBe('/q/x');
+    expect(at('( echo \\)\nHOME=/q\necho \\(\n)\ncd ~/x')).toBe(`${HOME}/x`);
+    expect(at('D=~/x; ( echo \\)\nD=/tmp\necho \\(\n)\ncd "$D"')).toBe(`${HOME}/x`);
     // a comment's paren is comment text: the subshell stays open, or there is none
     expect(at('( true # )\nHOME=/q\n)\ncd ~/x')).toBe(`${HOME}/x`);
     expect(at('true # (\nHOME=/q\ntrue # )\ncd ~/x')).toBe('/q/x');

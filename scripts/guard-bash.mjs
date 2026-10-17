@@ -2850,7 +2850,7 @@ const UNREADABLE_SCOPE = new RegExp('&&|\\|\\||(?:^|[^&<>])&(?![&>])|\\$\\{[^}]*
   + '|(?:^|[\\s;&|()])(?:if|then|else|elif|fi|while|until|for|select|do|done|function|case|esac|coproc|[{}])(?=[\\s;&|()]|$)');
 function homeCdTarget(cmd, { segments, pipedFrom }, home) {
   // Only plain statements up to the first cd are read: their spans in the text, quotes and comments blanked.
-  const masked = maskQuoted(cmd);
+  const masked = maskQuoted(cmd).replace(/\\[\s\S]/g, (escape) => (escape[1] === '\n' ? ' \n' : '  ')); // `\(` is text
   const spans = [];
   for (const stmt of segments) {
     const at = cmd.indexOf(stmt, spans.length ? spans.at(-1)[1] : 0);
