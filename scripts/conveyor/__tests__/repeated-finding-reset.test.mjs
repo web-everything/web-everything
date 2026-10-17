@@ -187,15 +187,18 @@ it('review regressions: a finding repeated in real rendered comments for two hea
   const { renderVerdictWriteUp, renderAdvisoryNote } = await import('../../operations/review-pr.mjs');
   const { buildVerdictComment } = await import('../../review-set-label.mjs');
   const { REVIEW_PR_CHANNEL } = await import('../../lib/review-escalation.mjs');
-  const round = (n, { summary = 'envelope hash includes the footer', advisory = false } = {}) => {
+  const round = (n, { summary = 'envelope hash includes the footer', advisory = false, bare = false, deferred = n } = {}) => {
+    // review-pr-io's readLatestFixRange ends the latest fix range at the reviewed head.
     const read = { repo: 'o/r', pr: 7, degraded: false, netBasis: { base: `${n}`.repeat(40), rev: `${n + 1}`.repeat(40) },
-      netChangedFiles: Array(n).fill('a.mjs'), latestFix: { priorHead: `${n}`.repeat(40), head: `${n + 2}`.repeat(40) } };
+      netChangedFiles: Array(n).fill('a.mjs'), latestFix: { priorHead: `${n}`.repeat(40), head: `${n + 1}`.repeat(40) } };
+    const state = bare ? {} : { failure_scenario: 'the key never matches', verdict: n % 2 ? 'PLAUSIBLE' : 'CONFIRMED',
+      impactIfUnfixed: n % 2 ? 'broken' : 'degraded', citationScope: n % 2 ? 'unverifiable' : undefined,
+      prevention: 'add a golden fixture', preventionCaptured: n % 2 === 0 };
     const verdict = { verdict: 'changes', lensVerdicts: { correctness: 'changes' }, lenses: ['correctness'],
-      findings: [{ file: 'a.mjs', line: 10 + n, summary, failure_scenario: 'the key never matches', category: 'correctness/correctness',
-        severity: 'blocking', verdict: n % 2 ? 'PLAUSIBLE' : 'CONFIRMED', impactIfUnfixed: 'broken',
-        prevention: 'add a golden fixture', preventionCaptured: n % 2 === 0 }],
-      deferredAdvisory: Array.from({ length: n }, (_, i) => ({ category: 'simplicity/x', file: `d${n}.mjs`, line: i + 1, summary: `advice ${n}` })),
-      uncorroboratedRetirements: advisory ? [{ reason: `not reproduced on round ${n}` }] : [],
+      findings: [{ file: 'a.mjs', line: 10 + n, summary, category: 'correctness/correctness', severity: 'blocking', ...state }],
+      deferredAdvisory: Array.from({ length: deferred }, (_, i) => ({ category: 'simplicity/x', file: `d${n}.mjs`, line: i + 1, summary: `advice ${n}` })),
+      // Disputes are dropped only after a head-bound card section; alone they stay in identity (a missed repeat).
+      uncorroboratedRetirements: advisory && deferred ? [{ reason: `not reproduced on round ${n}` }] : [],
       skippedSeats: [{ lens: 'agy-correctness', reason: `quota reset 2026-10-2${n}T18:18:21Z` }] };
     const body = advisory ? renderAdvisoryNote({ read, verdict })
       : buildVerdictComment({ to: 'changes', actor: 'agent (unattended review-loop)', channel: REVIEW_PR_CHANNEL,
@@ -207,14 +210,28 @@ it('review regressions: a finding repeated in real rendered comments for two hea
     const first = round(1, { advisory }), second = round(2, { advisory });
     expect(first.body).toMatch(/Net basis: `1{40}\.\.2{40}`/);
     expect(first.body).toContain('### Card suggestions (filed later) (1)');
+    expect(first.body).toContain('CITATION NOT IN THE NET DIFF');
     expect(repeatedFindingPlan([first, end, second]).action).toBe('stand-down');
     expect(repeatedFindingPlan([c(`scope-baseline: ${'a'.repeat(40)}`), first, end, second]).action).toBe('reset');
+    expect(repeatedFindingPlan([round(1, { advisory, bare: true }), end, round(2, { advisory, bare: true, deferred: 0 })]).action).toBe('stand-down');
     expect(repeatedFindingPlan([first, end, round(2, { advisory, summary: 'a different defect' })]).action).toBe('patch');
-    // Juror text shaped like the renderer's own tail keeps its full text in identity.
-    for (const fake of ['\n\n---\n\n**Decision:** `changes`', '\n\n### Card suggestions (filed later) (1)\nLater-round advisory findings x\n- `a` `b` — c',
-      '\n\n**Advisory outcome:** `changes` — x']) {
-      expect(repeatedFindingPlan([round(1, { advisory, summary: `same prefix${fake} one` }), end,
-        round(2, { advisory, summary: `same prefix${fake} two` })]).action).toBe('patch');
+    for (const bare of [false, true]) {
+      for (const deferred of [0, undefined]) {
+        // Juror text shaped like the renderer's own tail or state keeps its full text in identity, including when it
+        // ends the finding (no scenario, tags or prevention) and when the real section it copies is absent.
+        for (const [one, two] of [
+          ...['\n\n---\n\n**Decision:** `changes`', '\n\n**Advisory outcome:** `changes` — x', '\n\n**Disputed by one verifier answer (1):** x\n- y',
+            '\n\n### Card suggestions (filed later) (1)\nLater-round advisory findings on code the latest fix (`00000000..00000000`) did not touch, x\n- `a` `b` — c',
+          ].map(fake => [`same prefix${fake} one`, `same prefix${fake} two`]),
+          ['cache key _[⚠️ CITATION NOT IN THE NET DIFF drops the sha]_', 'cache key _[⚠️ CITATION NOT IN THE NET DIFF drops the base]_'],
+          ['x _[CONFIRMED]_ y', 'x y'],
+          // A state line that ENDS a bare finding renders exactly as the renderer's own would; inside one it is text.
+          ...bare ? [] : [['x\n  - _Prevention (captured):_ y', 'x\n  - _Prevention (OWED — file it):_ y']],
+        ]) {
+          expect(repeatedFindingPlan([round(1, { advisory, bare, deferred, summary: one }), end,
+            round(2, { advisory, bare, deferred, summary: two })]).action, JSON.stringify([advisory, bare, deferred, one])).toBe('patch');
+        }
+      }
     }
   }
 });

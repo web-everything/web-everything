@@ -12,49 +12,77 @@ export function resolveFixSafety({ env = process.env, tool = readSettings().fix,
     valid: { alertAtRoundCap: v => typeof v === 'boolean', resetOnRepeatedFinding: v => typeof v === 'boolean' },
     envValues: { alertAtRoundCap: bool(env.WE_FIX_ALERT_AT_ROUND_CAP), resetOnRepeatedFinding: bool(env.WE_FIX_RESET_ON_REPEATED_FINDING) } });
 }
-// Per-round renderer state is not identity: the verify tag, the citation-scope note and whether a
-// prevention was captured change between heads for the same finding.
-const roundState = text => text
-  .replace(/ _\[(?:CONFIRMED|PLAUSIBLE|SPECULATIVE)\]_| _\[\u26a0\ufe0f CITATION NOT IN THE NET DIFF[^\]\n]*\]_/g, '')
-  .replace(/_Prevention \((?:captured|OWED \u2014 file it)\):_/g, '_Prevention:_');
-const normalized = text => roundState(text).normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+const normalized = text => text.normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
 const key = (f, envelope) => JSON.stringify([f.lens, f.file, normalized(f.claim), envelope]);
-// review-pr renders per-head sections after the findings (card suggestions, verifier disputes, the
-// advisory outcome) and a `---` trailer (Decision, Net basis with the head sha). Drop the trailer from
-// its LAST occurrence, so juror text before it is kept, then peel each section only in its exact shape.
-const TRAILER = /\n\n---\n\n(?:\*\*Decision:\*\* |Net basis: |\u26a0\ufe0f DEGRADED BASIS )/g;
-const TAIL_SECTIONS = [
-  ['\n\n**Advisory outcome:** ', /^\n\n\*\*Advisory outcome:\*\* `[^`\n]+` \u2014 [^\n]*$/, () => true],
-  ['\n\n**Disputed by one verifier answer (', /^\n\n\*\*Disputed by one verifier answer \((\d+)\):\*\* [^\n]*((?:\n- [^\n]*)+)$/,
-    (n, bullets) => bullets >= 1 && bullets <= n],
-  ['\n\n### Card suggestions (filed later) (', /^\n\n### Card suggestions \(filed later\) \((\d+)\)\nLater-round advisory findings [^\n]*((?:\n- `[^`\n]*` `[^`\n]*` \u2014 [^\n]*)*)$/,
-    (n, bullets) => bullets === n],
-];
+// review-pr renders a `---` trailer after the findings (Decision, skipped seats, Net basis with the head
+// sha). Cut at its LAST occurrence, so juror text shaped like it stays in identity.
+const TRAILER = /\n\n---\n\n(?:\*\*Decision:\*\* |Net basis: |⚠️ DEGRADED BASIS )/g;
+// Before the trailer: card suggestions, then (advisory notes) verifier disputes, then the outcome line.
+// Juror text can copy that shape, so the section is dropped only when its fix range names the head the
+// renderer's own Net basis line names. The fixed-text outcome line stays in identity.
+const CARDS = '\n\n### Card suggestions (filed later) (';
+const CARD_SHAPE = new RegExp('^\\n\\n### Card suggestions \\(filed later\\) \\((\\d+)\\)\\n'
+  + 'Later-round advisory findings on code the latest fix \\(`[0-9a-f]{8}\\.\\.([0-9a-f]{8})`\\) did not touch,[^\\n]*'
+  + '((?:\\n- `[^`\\n]*` `[^`\\n]*` — [^\\n]*)+)'
+  + '(?:\\n\\n\\*\\*Disputed by one verifier answer \\(\\d+\\):\\*\\* [^\\n]*(?:\\n- [^\\n]*)+)?'
+  + '(\\n\\n\\*\\*Advisory outcome:\\*\\* [^\\n]*)?$');
 function withoutRendererTail(envelope) {
   const trailer = [...envelope.matchAll(TRAILER)].at(-1);
   if (!trailer) return envelope;
-  let rest = envelope.slice(0, trailer.index);
-  for (const [start, shape, counted] of TAIL_SECTIONS) {
-    const at = rest.lastIndexOf(start), m = at < 0 ? null : shape.exec(rest.slice(at));
-    if (m && counted(Number(m[1]), (m[2] ?? '').split('\n- ').length - 1)) rest = rest.slice(0, at);
+  const rest = envelope.slice(0, trailer.index);
+  const head = [...envelope.slice(trailer.index).matchAll(/^Net basis: `[0-9a-f]+\.\.([0-9a-f]{8})[0-9a-f]*`/gm)].at(-1)?.[1];
+  const at = rest.lastIndexOf(CARDS), m = at < 0 ? null : CARD_SHAPE.exec(rest.slice(at));
+  if (!m || !head || m[2] !== head || Number(m[1]) !== m[3].split('\n- ').length - 1) return rest;
+  return rest.slice(0, at) + (m[4] ?? '');
+}
+// Per-round finding state is not identity: the verify, citation-scope and impact tags that end a
+// finding's text, and whether its prevention line was captured. Mirrors parseFindings' blocks and only
+// touches those rendered positions, where juror text reads exactly as the renderer's own would.
+const BOUNDARY = /^(?:### |\*\*Advisory outcome:|---\s*$|Net basis:)/;
+const PREVENTION = /^(\s+- _Prevention) \((?:captured|OWED — file it)\):_/;
+const TAGS = new RegExp('(?: _\\[(?:CONFIRMED|PLAUSIBLE|SPECULATIVE)\\]_)?'
+  + '(?: _\\[⚠️ CITATION NOT IN THE NET DIFF — reported, but withheld from the verdict; re-cite it to block\\]_)?'
+  + '(?: _\\[impact if unfixed: \\w+\\]_)?$');
+function withoutFindingState(envelope) {
+  const lines = envelope.split('\n');
+  let block = null, lens = false;
+  const close = () => {
+    if (!block) return;
+    let last = block.at(-1);
+    if (block.length > 1 && PREVENTION.test(lines[last])) {
+      lines[last] = lines[last].replace(PREVENTION, '$1:_');
+      last = block.at(-2);
+    }
+    lines[last] = lines[last].replace(TAGS, '');
+    block = null;
+  };
+  for (const [n, line] of lines.entries()) {
+    if (BOUNDARY.test(line)) break;
+    if (/^\*\*([^*/]+)\/([^*]+)\*\*\s*\(\d+\)/.test(line)) { close(); lens = true; continue; }
+    if (lens && /^- `([^`:]+?)(?::(\d+))?`\s+—\s+/.test(line)) { close(); block = [n]; continue; }
+    if (block && line.trim()) block.push(n);
   }
-  return rest;
+  close();
+  return lines.join('\n');
 }
 // Markdown does not distinguish a multiline summary from injected headings/bullets.
 // Bind a repeat to the complete rendered Findings envelope, including text the compact
 // parser may treat as a footer. Ambiguous formatting can decline a reset, never grant one.
-function findingEnvelope(body) {
-  const text = body.replace(/\r\n?|[\u2028\u2029]/g, '\n');
+function reviewIdentity(body) {
+  const text = body.replace(/\r\n?|[\u{2028}\u{2029}]/gu, '\n');
   const heading = /^### Findings[^\n]*$/m.exec(text);
-  if (!heading) return '';
-  const envelope = withoutRendererTail(text.slice(heading.index + heading[0].length));
+  if (!heading) return { findings: [], envelope: '' };
+  const end = heading.index + heading[0].length;
+  const envelope = withoutFindingState(withoutRendererTail(text.slice(end)));
+  // Claims are parsed from the same cleaned text, so both halves of the key share one normalization.
+  const findings = parseFindings(text.slice(0, end) + envelope, { maxClaimChars: Infinity, fullClaim: true });
   const anchors = /^- `([^`\n]+?)(?::(\d+))?`\s+—\s+/gm;
   const declared = heading[0].match(/\((\d+)\)/)?.[1];
   // Strip moving source coordinates only when the declared count agrees with the
   // complete envelope; a fake bullet inside a summary must keep its own numeric text.
   if (declared === undefined || Number(declared) !== [...envelope.matchAll(anchors)].length
-    || Number(declared) !== [...envelope.matchAll(/^- /gm)].length) return envelope;
-  return envelope.replace(anchors, (_match, file) => `- \`${file}\` — `);
+    || Number(declared) !== [...envelope.matchAll(/^- /gm)].length) return { findings, envelope };
+  return { findings, envelope: envelope.replace(anchors, (_match, file) => `- \`${file}\` — `) };
 }
 export function repeatedFindingPlan(comments, { enabled = true } = {}) {
   if (!enabled) return { action: 'patch' };
@@ -70,9 +98,9 @@ export function repeatedFindingPlan(comments, { enabled = true } = {}) {
       if (!c.body.includes(FIX_END_INFRA_STALL_PREFIX)) fix++;
       continue;
     }
-    const findings = parseFindings(c.body, { maxClaimChars: Infinity, fullClaim: true });
+    const identity = reviewIdentity(c.body), findings = identity.findings;
     if (!findings.length) continue;
-    const envelope = createHash('sha256').update(normalized(findingEnvelope(c.body))).digest('hex');
+    const envelope = createHash('sha256').update(normalized(identity.envelope)).digest('hex');
     // Only the latest finding-bearing review determines whether a repeat still stands.
     repeated = false;
     for (const f of findings) {
