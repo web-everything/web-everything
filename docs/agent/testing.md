@@ -1329,7 +1329,9 @@ Validate a build card against the fetched WE origin/main backlog before acquirin
 identities are permanent card refusals, while an unavailable Git read remains a retryable observation:
 the clone-wide `card-lookup-unavailable` code, never charged to the card's retry budget. Because history
 outlives a launch, late-launch (quick-schedule) attempts are counted apart from real failures, and the
-orphan pass keys its failure on the dead claim so a retried release never charges it twice.
+orphan pass keys its failure on the dead claim so a retried release never charges it twice. The ledger
+keeps every key charged to a card, not only the last: orphan (`orphan:`) and fail-group (`group:`)
+records interleave every tick while a release throws, and each must still dedupe its own attempt.
 
 Prepare discovery searches each card's current lane identity, bornAs lane identity and title, then
 unions the complete results. Never use an unfiltered repository PR listing as the launch guard's proof

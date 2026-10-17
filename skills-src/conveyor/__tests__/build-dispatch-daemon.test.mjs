@@ -4083,6 +4083,24 @@ describe('grouped BUILD daemon ticks', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it('fail-group and orphan adoption recording in the same tick never re-charge each other\'s attempt (PR #5453)', async () => {
+    vi.stubEnv('WE_BUILD_GROUP_MEMBER_FAILURE', 'fail-group');
+    const dir = mkdtempSync(join(tmpdir(), 'group-orphan-charge-once-'));
+    const path = join(dir, 'failures.json');
+    try {
+      const effects = fixture({ claims: rows.map((r, i) => ({ ...r, ...(i ? { groupLead: '7101' } : {}) })),
+        settled: [{ num: '7101', runId: 'run-7101', startedAt: '2099-01-01T00:00:00Z', outcome: 'pr-opened', groupDropped: ['7102'] }] });
+      const settings = { baseMs: 1000, maxMs: 5000, maxAttempts: 3 };
+      effects.recordBuildFailure = o => recordBuildFailureAt(o, { path, now: 0, settings });
+      // The orphan pass runs first each tick and records the dead lead claim before its (throwing) release.
+      effects.adoptOrphans = () => [recordBuildFailureAt({ num: '7101', reason: 'build-not-started: orphan-released',
+        attemptKey: 'orphan:2099-01-01T00:00:00Z' }, { path, now: 0, settings })];
+      effects.releaseClaim = () => { throw new Error('lock store unavailable'); };
+      for (let i = 0; i < 3; i++) await runBuildDispatchTick({ live: true, policy, effects }).catch(() => {});
+      expect(JSON.parse(readFileSync(path, 'utf8')).items['7101']).toMatchObject({ attempts: 2, exhausted: false });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('ignores stale drop results from an older lead attempt', async () => {
     const effects = fixture({ claims: rows.map((r, i) => ({ ...r, ...(i ? { groupLead: '7101' } : {}) })),
       settled: [{ num: '7101', startedAt: '2000-01-01T00:00:00Z', outcome: 'pr-opened', groupDropped: ['7102'] }] });

@@ -13,6 +13,8 @@ import { redactSpawnText } from '../lib/describe-spawn-failure.mjs';
 
 export const buildFailurePath = () => join(resolveCoordinationRoot(), 'build-dispatch-failures.json');
 const OUTPUT_CAP = 2000;
+// Attempt keys already charged to a card. Far above any maxAttempts, so a live key is never evicted.
+const ATTEMPT_KEY_CAP = 32;
 
 function read(path) {
   if (!existsSync(path)) return { items: {} };
@@ -30,8 +32,9 @@ function save(state, path) {
 
 /**
  * Record one failed build dispatch. `output` is the captured child output (falls back to `reason`). `attemptKey`
- * names the attempt (e.g. the dead claim): a repeat with the same key charges nothing, so a step that records before
- * a release it may retry never charges one attempt twice. Late-launch (quick-schedule) attempts are counted apart
+ * names the attempt (e.g. the dead claim): a repeat of any key already charged to the card charges nothing, so a step
+ * that records before a release it may retry never charges one attempt twice — even when another path (orphan
+ * adoption, fail-group) records its own attempt for the same card in between. Late-launch (quick-schedule) attempts are counted apart
  * from real failures: the history is retained across a confirmed launch, and lateness must not spend the card's
  * failure budget (PR #5453).
  */
@@ -39,7 +42,10 @@ export function recordBuildFailure({ num, reason, output, attemptKey }, { path =
   const state = read(path);
   const key = String(num);
   const prev = state.items[key];
-  if (attemptKey != null && prev?.attemptKey === String(attemptKey)) return prev;
+  // Every key charged so far, not only the last: interleaved paths must not erase each other's evidence. A record
+  // written before the list existed carries one `attemptKey`.
+  const chargedKeys = Array.isArray(prev?.attemptKeys) ? prev.attemptKeys : prev?.attemptKey != null ? [prev.attemptKey] : [];
+  if (attemptKey != null && chargedKeys.includes(String(attemptKey))) return prev;
   // Redact BEFORE cutting: a cut taken first can slice a credential's recognisable prefix off and leave its tail
   // unredactable. The reason code is read off the raw text — redaction never changes what a code pattern matches.
   const rawText = String(output ?? reason ?? '').trim();
@@ -59,7 +65,8 @@ export function recordBuildFailure({ num, reason, output, attemptKey }, { path =
   const record = {
     num: key, attempts,
     scheduleAttempts: { ...counts, [schedule]: attempts },
-    ...(attemptKey != null ? { attemptKey: String(attemptKey) } : {}),
+    ...(attemptKey != null || chargedKeys.length
+      ? { attemptKeys: (attemptKey != null ? [...chargedKeys, String(attemptKey)] : chargedKeys).slice(-ATTEMPT_KEY_CAP) } : {}),
     reasonCode,
     reason: redactSpawnText(reason ?? '').slice(0, 400),
     output: text.slice(0, OUTPUT_CAP),

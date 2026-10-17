@@ -523,6 +523,32 @@ describe('a late launch (effect-in-flight) retries quickly, not on the failure p
       expect(rec('launch-died: x')).toMatchObject({ attempts: 2, exhausted: false });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+  it('interleaved attempt keys charge each attempt once, whatever was recorded in between (PR #5453)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'attempt-keys-'));
+    try {
+      const path = join(dir, 'b.json');
+      const rec = (attemptKey, reason = 'launch-died: x') => recordBuildFailure({ num: '7101', reason, ...(attemptKey ? { attemptKey } : {}) }, { path, now: 0, settings: S });
+      // Orphan adoption and the fail-group pass both re-record their own attempt every tick while a release throws.
+      for (let tick = 0; tick < 3; tick++) { rec('orphan:2099-01-01T00:00:00Z'); rec('group:2099-01-01T00:00:00Z'); }
+      expect(rec('orphan:2099-01-01T00:00:00Z')).toMatchObject({ attempts: 2, exhausted: false });
+      // An unkeyed failure is a new attempt, and does not erase the keys already charged.
+      expect(rec(null)).toMatchObject({ attempts: 3, exhausted: true });
+      expect(rec('group:2099-01-01T00:00:00Z')).toMatchObject({ attempts: 3 });
+      expect(rec('orphan:2099-01-01T00:00:00Z')).toMatchObject({ attempts: 3 });
+      // A genuinely new attempt is still charged.
+      expect(rec('orphan:2099-01-02T00:00:00Z')).toMatchObject({ attempts: 4 });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('a record written with the older single attemptKey still deduplicates that key (PR #5453)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'attempt-key-legacy-'));
+    try {
+      const path = join(dir, 'b.json');
+      writeFileSync(path, JSON.stringify({ items: { 7101: { num: '7101', attempts: 1, attemptKey: 'orphan:a', reasonCode: 'launch-died', retryAfter: null } } }));
+      expect(recordBuildFailure({ num: '7101', reason: 'launch-died: x', attemptKey: 'orphan:a' }, { path, now: 0, settings: S })).toMatchObject({ attempts: 1 });
+      expect(recordBuildFailure({ num: '7101', reason: 'launch-died: x', attemptKey: 'group:a' }, { path, now: 0, settings: S })).toMatchObject({ attempts: 2 });
+      expect(recordBuildFailure({ num: '7101', reason: 'launch-died: x', attemptKey: 'orphan:a' }, { path, now: 0, settings: S })).toMatchObject({ attempts: 2 });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it('a healed (unknown -> transient) prepare record with that evidence is released on the quick window (releaseDuePrepareRetries threads the reason code)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'quick-retry-healed-'));
     try {
