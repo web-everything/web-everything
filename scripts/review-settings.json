@@ -1,4 +1,5 @@
 {
+  "routeTestGamingToFixer": true,
   "referralDefault": "auto-block",
   "scopedRereview": "shadow",
   "roundBudget": 3,
