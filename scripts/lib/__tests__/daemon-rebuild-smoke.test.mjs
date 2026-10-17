@@ -166,8 +166,8 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
     ['PRIVATEKEY=opaqueCredential123', 'PRIVATEKEY=<redacted>'],
     ['passkey: opaqueCredential123', 'passkey=<redacted>'],
     ['"token": "ab\\"opaqueCredential123"', 'token=<redacted>'],
-    ['ＴＯＫＥＮ=opaqueCredential123', 'TOKEN=<redacted>'],
-    ['TO​KEN=opaqueCredential123', 'TOKEN=<redacted>'],
+    [`${String.fromCharCode(0xff34, 0xff2f, 0xff2b, 0xff25, 0xff2e)}=opaqueCredential123`, 'TOKEN=<redacted>'],
+    [`TO${String.fromCharCode(0x200b)}KEN=opaqueCredential123`, 'TOKEN=<redacted>'],
   ])('redacts the generic key assignment %s', (line, expected) => {
     expect(redactSecrets(line)).not.toContain('opaqueCredential123');
     expect(redactSecrets(line)).toContain(expected);

@@ -7,7 +7,8 @@ const MAX_BOOT_DETAIL = 16_000;
 // CR, U+0085, U+2028 and U+2029 end a line; every other control character (but tab and newline) is dropped.
 const LINE_BREAKS = new RegExp(`\\r\\n?|[${String.fromCharCode(0x85, 0x2028, 0x2029)}]`, 'g');
 const CONTROLS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u0084\u0086-\u009f]/g;
-const INVISIBLE = /[­​-‏‪-‮⁠-⁤﻿]/g;
+// Soft hyphen, zero-width and direction marks, word joiners and the BOM — built from code points, never written raw.
+const INVISIBLE = new RegExp(`[${String.fromCharCode(0xad)}${String.fromCharCode(0x200b)}-${String.fromCharCode(0x200f)}${String.fromCharCode(0x202a)}-${String.fromCharCode(0x202e)}${String.fromCharCode(0x2060)}-${String.fromCharCode(0x2064)}${String.fromCharCode(0xfeff)}]`, 'g');
 
 /**
  * One line with every known secret shape redacted — the shapes of `ci-heal-mark.mjs#redactSecrets` (tokens, keys,
@@ -77,7 +78,8 @@ function redactOrphanedKeys(text) {
  * 4x the cap BEFORE redaction (bounding regex work) and to the cap after it, so a cut never slices a secret's prefix.
  */
 export function redactSecrets(text) {
-  // NFKC folds fullwidth letters and invisible characters are dropped, so `ＴＯＫＥＮ=` / `TO​KEN=` still match.
+  // NFKC folds fullwidth letters and invisible characters are dropped, so a fullwidth or zero-width-split `TOKEN=`
+  // still matches.
   const normalised = redactOrphanedKeys(String(text ?? '').normalize('NFKC').replace(LINE_BREAKS, '\n').replace(CONTROLS, '').replace(INVISIBLE, '')
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|$)/g, '<redacted private key>'));
   return normalised.split('\n').map((raw) => {
