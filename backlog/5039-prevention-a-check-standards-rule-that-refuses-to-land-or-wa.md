@@ -22,3 +22,7 @@ Idempotency key (do not edit): approval-prevention-key:web-everything/web-everyt
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5518 (finding 3: `we:backlog/xrkgjr3-overlap-yield-held.md:1` — Add a check:standards rule that refuses an active card whose Acceptance or edge-case lines still contain the literal 'TODO'.)
