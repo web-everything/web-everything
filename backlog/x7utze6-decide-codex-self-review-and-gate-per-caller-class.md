@@ -4,7 +4,8 @@ size: 3
 status: active
 scaffoldedBy: "fix-5485"
 dateScaffolded: "2026-10-17"
-scope: ["we:scripts/operations/codex-worker.mjs", "we:scripts/lib/probation-launcher.mjs", "we:scripts/conveyor/concurrent-baseline-comparison.mjs"]
+scope: ["we:scripts/operations/codex-worker.mjs", "we:scripts/lib/probation-launcher.mjs", "we:scripts/conveyor/concurrent-baseline-comparison.mjs", "we:scripts/lib/__tests__/codex-caller-policy.test.mjs"]
+scopeRationale: "we:scripts/codex-direct-task.mjs is named only as the CLI whose invocations the new test lists; the change is in its callers."
 dateOpened: "2026-10-17"
 tags: []
 ---
