@@ -1,4 +1,3 @@
-import { deriveVerdict } from '../lib/jury-core.mjs';
 import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
 /**
  * @file scripts/operations/cli-adapter.mjs
@@ -1023,6 +1022,9 @@ export async function driveRun({
   parallelJudges = false, seatLanes = null, log = (line) => { try { process.stderr.write(`${line}\n`); } catch { /* best effort */ } },
 } = {}) {
   let current = run;
+  // jury-core pulls in markdown-it; lightweight CLIs also import this adapter from
+  // scripts-only clones. Load the verdict helper only for review seat observations.
+  const deriveVerdict = run.op === 'review-pr' ? (await import('../lib/jury-core.mjs')).deriveVerdict : null;
   const recordSeat = (seat) => {
     if (current.op !== 'review-pr' || seat.request?.skipSpawn) return;
     const { value, telemetry } = seat.ok ? unwrapJudgeOutcome(seat.value) : { value: null, telemetry: null };
