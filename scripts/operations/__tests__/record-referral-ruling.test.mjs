@@ -124,6 +124,14 @@ describe('#4979 the sanctioned writer', () => {
     card: { requested: 'xvm9vbu', ref: CARD, readable: true }, now: '2026-10-04T14:30:00Z', clearerId: 's', ...over });
   const input = (over = {}) => ({ repo, pr: 7, finding: 'all-open', ruling: 'card', actor: 'chalbert', channel: 'claude-code-chat', reason: 'Accept', ...over });
 
+  it('persists optional not-real cause and finding lens through the marked comment', () => {
+    const plan = planOperatorRuling(read({ card: null }), input({ ruling: 'not-real', cause: 'stale-head-reraise' }));
+    const parsed = parseOperatorRulingComment(gh(plan.body)).record;
+    expect(parsed.rulings[0]).toMatchObject({ cause: 'stale-head-reraise', lens: 'judgeCorrectnessAdvisory' });
+    expect(readOperatorRulings([gh(plan.body)]).rulings[0]).toMatchObject({ cause: 'stale-head-reraise', lens: 'judgeCorrectnessAdvisory' });
+    expect(() => planOperatorRuling(read(), input({ cause: 'test-nit' }))).toThrow(/--cause/);
+    expect(() => planOperatorRuling(read(), input({ ruling: 'not-real', cause: 'invented' }))).toThrow(/--cause/);
+  });
   it('lists the open findings on the live head (blocked and pending), numbered in thread order', () => {
     expect(read().open.map((o) => [o.index, o.state, o.summary])).toEqual([[1, 'blocked', 'first'], [2, 'pending', 'second']]);
     expect(selectFindings(read().open, '2').map((o) => o.summary)).toEqual(['second']);
