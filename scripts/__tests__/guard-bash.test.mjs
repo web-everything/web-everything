@@ -575,11 +575,39 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('HOME=/a; HOME=/x B=/y; cd ~/clone')).toBe('/x/clone');
     // HOME read, not rebound, changes nothing
     expect(at('HOME=/a; echo "$HOME"; export HOME; cd ~/clone')).toBe('/a/clone');
+    expect(at('echo "HOME=$HOME"; cd ~/clone')).toBe(`${HOME}/clone`);
+    expect(at(`printf '%s\\n' "\${HOME}"; cd ~/clone`)).toBe(`${HOME}/clone`);
+    expect(at("echo 'HOME=/z'; cd ~/clone")).toBe(`${HOME}/clone`);
+    // an array append adds an element; $HOME is element 0 and is unchanged
+    expect(at('HOME=/a; HOME+=(/c); cd ~/clone')).not.toBe('/a(/c)/clone');
+    // a redirection after the assignment is not a command
+    expect(at('HOME=/a; HOME=/b 2>/dev/null; cd ~/clone')).toBe('/b/clone');
+    expect(at('HOME=/a; HOME=/b > /dev/null; cd ~/clone')).toBe('/b/clone');
+    // a quoted paren opens no child shell, so the real rebinding after it still counts
+    expect(at('HOME=/a; FOO="(" HOME=/b; cd ~/clone')).not.toBe('/a/clone');
+    expect(at('HOME=/a; export FOO="(" HOME=/b; cd ~/clone')).not.toBe('/a/clone');
+    expect(at('HOME=/a; read "HOME" <f; cd ~/clone')).toBe(REPORTED);
+    expect(at('HOME=/a; let "HOME=1"; cd ~/clone')).toBe(REPORTED);
+    // inside a child shell the parent keeps its value
+    expect(at('HOME=/a; ( HOME=/z ); x=$(HOME=/z; echo); cd ~/clone')).toBe('/a/clone');
+  });
+  it('a pathological HOME[ run stays linear', () => {
+    const started = Date.now();
+    expect(at(`${'HOME['.repeat(40000)}; cd ~/clone`)).toBe(`${HOME}/clone`);
+    expect(Date.now() - started).toBeLessThan(2000);
   });
   it('an ordinary variable append extends the literal instead of leaving it stale', () => {
     expect(at('D=/a; D+=/b; cd "$D"')).toBe('/a/b');
     expect(at('D=/a; export D+=/b; cd $D')).toBe('/a/b');
     expect(at('D=/a; D+=$(pwd); cd "$D"')).toBe(REPORTED);
+  });
+  it('any other ordinary-variable rebinding before the cd leaves it unknown, never stale', () => {
+    for (const rebind of ['X=1 D=/b', 'D[0]=/b', 'read D <f', 'printf -v D %s /b', 'declare D=/b', 'unset D',
+      'eval "D=/b"', 'D=(/b)']) {
+      expect(at(`D=/a; ${rebind}; cd "$D"`), rebind).toBe(REPORTED);
+    }
+    expect(at('D=/a; D=/b true; cd "$D"')).toBe('/a');
+    expect(at('cd "$D"; D=/b')).toBe(REPORTED);
   });
   it('leaves unquoted bracket globs unresolved', () => {
     expect(at('cd ~/[c]lone')).toBe(REPORTED);

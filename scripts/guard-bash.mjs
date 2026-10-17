@@ -2493,45 +2493,113 @@ function expandWord(s, home) {
   return { text: out, end: i };
 }
 
-// HOME rebound by anything but a plain literal assignment: an arithmetic or array-element assignment,
-// `${HOME=…}`, `++HOME`, a name-binding builtin's operand, or text run by eval/source. The resolver cannot
-// read the new value, so home becomes unknown — never the stale one.
-const HOME_LVALUE = /(?:\+\+|--)\s*HOME(?!\w)|(?<![\w$./-])HOME(?:\[[^\]]*\])?\s*(?:\+\+|--|(?:[-+*/%&|^]|<<|>>)?=(?!=))/;
-const BINDS_NAME_OPERANDS = /^(?:(?:builtin|command|time|!)\s+)*(?:read|mapfile|readarray|getopts|unset|for|select|wait|printf|declare|typeset|local)(?=\s|$)/;
+// A variable rebound by anything but a plain literal assignment — an arithmetic or array-element assignment,
+// `${NAME=…}`, `++NAME`, a later word of a multi-assignment, a name-binding builtin's operand, or text run by
+// eval/source — cannot be read here, so it becomes unknown, never the stale value. Every pattern is linear.
+const NAME_BINDER = /^(?:(?:builtin|command|time|!)\s+)*(read|mapfile|readarray|getopts|unset|for|select|wait|printf|declare|typeset|local|let|export|readonly)(?=\s|$)/;
 const RUNS_OPAQUE_TEXT = /^(?:(?:builtin|command|time|!)\s+)*(?:eval|source|\.)(?=\s|$)/;
 const SPECIAL_BUILTIN = /^(?::|\.|break|continue|eval|exec|exit|export|readonly|return|set|shift|source|times|trap|unset)$/;
+const REDIRECT_OP = /^(?:\d+|&)?(?:[<>]{1,2}|<>|>\||[<>]&)$/;
+const rebindPatterns = new Map();
+function rebindingOf(name) {
+  if (!rebindPatterns.has(name)) {
+    const index = '(?:\\[[^\\]\\s]{0,64}\\])?';
+    rebindPatterns.set(name, {
+      assignment: new RegExp(`^(export\\s+)?${name}(\\+?)=(.*)$`),
+      lvalue: new RegExp(`(?:\\+\\+|--)\\s*${name}(?!\\w)|(?<![\\w{$./-])${name}${index}\\s*(?:\\+\\+|--|(?:[-+*/%&|^]|<<|>>)?=(?!=))`),
+      operand: new RegExp(`(?<![\\w{$./-])${name}(?!\\w)`),
+      valued: new RegExp(`(?<![\\w{$./-])${name}${index}\\+?=`),
+      printfTarget: new RegExp(`(?:^|\\s)-v\\s*${name}(?!\\w)`),
+      repeated: new RegExp(`^${name}(?:\\W|$)`),
+    });
+  }
+  return rebindPatterns.get(name);
+}
 
-// Is a position whose preceding statement text is `prefix` inside a child shell (`( … )`, `$( … )`, backticks)?
-// Arithmetic `((` / `$((` opens none.
+// The statement with quoted text blanked to spaces (same length), keeping `$(…)`, `${…}` and backticks inside
+// double quotes, where an assignment still runs (`maskQuoted` below blanks those too). Quoted text is never a
+// rebinding or a child-shell paren.
+function maskQuotedKeepingExpansions(s) {
+  let out = '';
+  let quote = null;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (quote === "'") { out += ' '; if (ch === "'") quote = null; continue; }
+    if (ch === '\\') { out += i + 1 < s.length ? '  ' : ' '; i++; continue; }
+    if (quote === '"') {
+      if (ch === '"') { quote = null; out += ' '; continue; }
+      const open = ch === '`' ? '`' : ch === '$' && (s[i + 1] === '(' || s[i + 1] === '{') ? s[i + 1] : null;
+      if (!open) { out += ' '; continue; }
+      let end = s.length;
+      if (open === '`') {
+        const close = s.indexOf('`', i + 1);
+        if (close >= 0) end = close + 1;
+      } else {
+        const close = open === '(' ? ')' : '}';
+        for (let j = i + 1, depth = 0; j < s.length; j++) {
+          if (s[j] === open) depth++;
+          else if (s[j] === close && --depth === 0) { end = j + 1; break; }
+        }
+      }
+      out += s.slice(i, end);
+      i = end - 1;
+      continue;
+    }
+    if (ch === "'" || ch === '"') { quote = ch; out += ' '; continue; }
+    out += ch;
+  }
+  return out;
+}
+
+// Is a position whose preceding (masked) statement text is `prefix` inside a child shell (`( … )`, `$( … )`,
+// backticks)? Arithmetic `((` / `$((` opens none.
 function inChildShell(prefix) {
   const p = prefix.replace(/\$?\(\(/g, '');
   return (p.match(/\(/g) || []).length > (p.match(/\)/g) || []).length || (p.match(/`/g) || []).length % 2 === 1;
 }
 
-// HOME after one statement runs: `home` unchanged, the newly assigned absolute path, or null (unknown).
-function homeAfter(stmt, home) {
+// `name`'s value after one statement runs: `value` unchanged, the newly assigned text, or null (unknown).
+// `home` expands a `~`/`$HOME` in the assigned word (null = expand nothing).
+function valueAfter(stmt, name, value, home) {
   const s = stmt.trim();
-  const assignment = s.match(/^(export\s+)?HOME(\+?)=(.*)$/);
+  const p = rebindingOf(name);
+  const assignment = s.match(p.assignment);
   if (assignment) {
     const [, exported, append, rest] = assignment;
-    const word = expandWord(rest, home);
+    const word = rest.startsWith('(') ? null : expandWord(rest, home);      // `NAME=(…)` is an array
     if (!word) return null;
     const after = rest.slice(word.end).trim();
-    if (exported && HOME_LVALUE.test(after)) return null;
+    if (exported && p.lvalue.test(maskQuotedKeepingExpansions(after))) return null;
     if (!exported && after) {
       const words = after.split(/\s+/);
-      const assignsOnly = words.every((w) => /^[A-Za-z_]\w*\+?=[^'"`$()\\<>]*$/.test(w) && !/^HOME\W/.test(w));
-      // A command after it makes this a prefix assignment that ends with that command (a special builtin
-      // keeps it under POSIX mode, so that one stays unknown).
-      if (!assignsOnly) return /^[\w./:-]+$/.test(words[0]) && !SPECIAL_BUILTIN.test(words[0]) ? home : null;
+      for (let j = 0; j < words.length; j++) {
+        const w = words[j];
+        if (REDIRECT_OP.test(w)) { j++; continue; }                         // an operator, then its target
+        if (/^(?:\d+|&)?[<>]/.test(w)) continue;                            // an operator glued to its target
+        if (/^[A-Za-z_]\w*\+?=[^'"`$()\\<>]*$/.test(w) && !p.repeated.test(w)) continue;
+        // A command follows, so this is a prefix assignment that ends with that command (a special builtin
+        // keeps it under POSIX mode, so that one stays unknown).
+        return /^[\w./:-]+$/.test(w) && !SPECIAL_BUILTIN.test(w) ? value : null;
+      }
     }
-    const value = append ? (home ? home + word.text : null) : word.text;
-    return value?.startsWith('/') ? value : null;
+    if (!append) return word.text;
+    return typeof value === 'string' ? value + word.text : null;
   }
   if (RUNS_OPAQUE_TEXT.test(s)) return null;
-  if (BINDS_NAME_OPERANDS.test(s) && /(?<![\w$./-])HOME(?!\w)/.test(s)) return null;
-  const lvalue = HOME_LVALUE.exec(s);
-  return lvalue && !inChildShell(s.slice(0, lvalue.index)) ? null : home;
+  const bare = s.replace(/['"]/g, '');                                      // `read "NAME"` binds NAME too
+  const binder = bare.match(NAME_BINDER)?.[1];
+  if (binder === 'printf' ? p.printfTarget.test(bare)
+    : binder === 'export' || binder === 'readonly' ? p.valued.test(bare)
+      : binder && p.operand.test(bare)) return null;
+  const masked = maskQuotedKeepingExpansions(s);
+  const lvalue = p.lvalue.exec(masked);
+  return lvalue && !inChildShell(masked.slice(0, lvalue.index)) ? null : value;
+}
+
+// HOME after one statement runs: unchanged, the newly assigned absolute path, or null (unknown).
+function homeAfter(stmt, home) {
+  const value = valueAfter(stmt, 'HOME', home, home);
+  return value?.startsWith('/') ? value : null;
 }
 
 // #2335 — the harness resets the reported Bash cwd to the PRIMARY checkout between tool calls, so the
@@ -2554,27 +2622,11 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   if (!cmd) return reportedCwd;
   const parsed = parseSegments(cmd);
   if (parsed.unterminated) return reportedCwd;
-  // Collect simple literal `VAR=value` / `export VAR=value` assignments (no command-subst/globs) in order.
-  const vars = Object.create(null);
-  for (const stmt of parsed.segments) {
-    const m = stmt.trim().match(/^(?:export\s+)?([A-Za-z_]\w*)(\+?)=(.+)$/);
-    if (!m) continue;
-    const [, name, append] = m;
-    let val = m[3].trim();
-    val = /[`$(]/.test(val) ? null : val.replace(/^(['"])(.*)\1$/, '$2'); // command-subst / nested expansion → skip
-    if (val === null || /\s/.test(val)) {                     // single-token literal only
-      if (append) delete vars[name];                          // an unreadable append leaves no stale value
-    } else if (!append) {
-      vars[name] = val;
-    } else if (name in vars) {
-      vars[name] += val;
-    }
-  }
   // First `cd <target>` statement wins (that is where the command lands before the mutation runs).
-  // Only HOME gains expansion semantics here. Keep the base's literal-variable collection above:
-  // declarations without values and assignments inside subshells must not erase a known parent value.
+  // Only HOME gains expansion semantics here; a `$VAR` target reads the literal assignments before the cd.
+  // Declarations without values and assignments inside subshells never erase a known parent value.
   let currentHome = typeof home === 'string' && home.startsWith('/') ? home : null;
-  for (const stmt of parsed.segments) {
+  for (const [k, stmt] of parsed.segments.entries()) {
     currentHome = homeAfter(stmt, currentHome);
     const cd = stmt.trim().match(/^cd\s+(.+)$/);
     if (!cd) continue;
@@ -2587,7 +2639,11 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
     let target = cd[1].trim().split(/\s+/)[0];                // first arg only (ignore trailing redirs/opts)
     target = target.replace(/^(['"])(.*)\1$/, '$2');          // strip surrounding quotes
     const v = target.match(/^\$\{?([A-Za-z_]\w*)\}?$/);       // whole target is $VAR / ${VAR}
-    if (v) target = vars[v[1]] ?? '';
+    if (v) {
+      let value = null;                                       // a single-token literal only
+      for (const before of parsed.segments.slice(0, k)) value = valueAfter(before, v[1], value, null);
+      target = value && !/\s/.test(value) ? value : '';
+    }
     if (!target || /[`$(*?\[]/.test(target)) return reportedCwd; // still unexpanded / globby → fail safe
     return target.startsWith('/') ? target : resolvePath(reportedCwd || '.', target);
   }
