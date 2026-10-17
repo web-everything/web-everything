@@ -64,3 +64,21 @@ it('a later accept on the head closes the earlier finding episode', () => {
   expect(result.dispatch[0]).toMatchObject({ kind: 'ci-heal' });
   expect(result.dispatch[0].joinedInputs).toBeUndefined();
 });
+it('an optional red check never releases a live reviewer, so no duplicate review is dispatched', () => {
+  const reviewer = { name: 'review-7', pid: 123, pidAlive: true, state: 'working' };
+  const row = pr({ statusCheckRollup: [check('standards'), check('test-shard (1)'), check('test'), check('CodeQL', 'FAILURE')] });
+  for (const at of [now, now + 15 * 60_000, now + 60 * 60_000]) {
+    const result = plan(row, { agents: [reviewer], now: at });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'live-process', prNumber: 7 }));
+  }
+  expect(plan(row, { now: now + 15 * 60_000 }).dispatch.map(d => d.kind)).toEqual(['review']);
+});
+it('a reviewer set aside for a CI heal past the join cap releases only the heal, never a second review', () => {
+  const reviewer = { name: 'review-7', pid: 123, pidAlive: true, state: 'working' };
+  for (const [requiredChecks, rollup] of [[['test'], [check('standards'), check('test-shard (1)'), check('test', 'FAILURE')]],
+    [null, [check('standards'), check('test-shard (1)'), check('CodeQL', 'FAILURE')]]]) {
+    const result = planReconcile({ prs: [pr({ statusCheckRollup: rollup })], requiredChecks, now: now + 15 * 60_000, agents: [reviewer] });
+    expect(result.dispatch.map(d => d.kind)).toEqual(['ci-heal']);
+  }
+});

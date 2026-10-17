@@ -1339,16 +1339,17 @@ function refuseUnreviewable({ pr, refuse, withPhase, extra = {} }) {
 }
 
 /** Head-local inputs for the joined-fix policy; prior and superseded verdicts cannot reopen findings. */
-function timingFacts(pr, { agents = [], repo, reviewDispatched = false } = {}) {
+const isReviewerBinding = b => /^review-/.test(b.agent?.name ?? b.agent?.sessionSlug ?? '');
+function timingFacts(pr, { agents = [], repo, requiredChecks = null, reviewDispatched = false } = {}) {
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
   const latest = comments.filter(c => isTrustedMarkerAuthor(c) && verdictJudged(c, pr.headRefOid)).at(-1);
   const body = String(latest?.body ?? '').trimStart();
   const findings = latest && (body.startsWith('🔁 review — changes requested')
     || (body.includes('**Advisory outcome:**') && /Advisory outcome:\*\*\s*`?changes/.test(body))) ? [latest] : [];
-  const reviewers = bindAgents(pr, agents, repo).filter(b => /^review-/.test(b.agent?.name ?? b.agent?.sessionSlug ?? ''));
+  const reviewers = bindAgents(pr, agents, repo).filter(isReviewerBinding);
   const reviewCanFinish = reviewDispatched || Boolean(assessLiveness(reviewers));
   return fixReadiness({ headSha: pr.headRefOid, checks: pr.statusCheckRollup, findings,
-    reviewPending: reviewCanFinish });
+    reviewPending: reviewCanFinish, requiredChecks });
 }
 
 /** A shared prerequisite for every review emission, including advisory review branches. */
@@ -1961,6 +1962,8 @@ export function planReconcile({
   const dispatch = [];
   const refusals = [];
   const notes = [];
+  // PR number → the live reviewer the joined-fix cap set aside for a CI heal. It still refuses a second review.
+  const liveReviewers = new Map();
   const counts = durableCounts && typeof durableCounts === 'object' ? durableCounts : {};
   const ciHealCap = Number.isInteger(ciHealCapArg) && ciHealCapArg >= 0 ? ciHealCapArg : ciHealBudget.cap;
   const ciHealCapSource = ciHealCap === ciHealCapArg ? 'caller' : ciHealBudget.capSource;
@@ -2382,11 +2385,17 @@ export function planReconcile({
 
     // ── REFUSAL 4 — liveness, from a live process. The binding is derived and its evidence travels with the
     // refusal, because the derivation itself has been observed to be wrong (#3283).
-    const readiness = timingFacts(pr, { agents, repo });
+    const readiness = timingFacts(pr, { agents, repo, requiredChecks });
     const join = joinedFixDecision({ ...readiness, now, policy: fixTiming });
     // After the cap a CI fixer may proceed while a review winds down. Its publish guard voids a red-head verdict.
+    // Only a REQUIRED failure counts (a CI heal repairs nothing else), and the stripped reviewer still blocks a review.
     const ignoreReview = readiness.ciFailed && fixTiming.joinCiAndReview && join.action === 'dispatch';
-    const bound = bindAgents(pr, agents, repo).filter(b => !(ignoreReview && /^review-/.test(b.agent?.name ?? b.agent?.sessionSlug ?? '')));
+    const allBound = bindAgents(pr, agents, repo);
+    const bound = allBound.filter(b => !(ignoreReview && isReviewerBinding(b)));
+    if (ignoreReview) {
+      const liveReviewer = assessLiveness(allBound.filter(isReviewerBinding));
+      if (liveReviewer) liveReviewers.set(prNumber, liveReviewer);
+    }
 
     // xilx617 (epic #4075/#3383) — the durable per-session infra-retry streak, surfaced independently of
     // whatever `assessLiveness` below returns (a capped session may already read `selfReportedDone` — finished,
@@ -3585,9 +3594,15 @@ export function planReconcile({
   }
   const timedDispatch = [];
   for (const entry of dispatch) {
+    const liveReviewer = entry.kind === 'review' ? liveReviewers.get(entry.prNumber) : null;
+    if (liveReviewer) {
+      refusals.push({ ...entry, kind: liveReviewer.kind, pid: liveReviewer.pid, sessionId: liveReviewer.sessionId,
+        why: `a review is still live on this PR (${liveReviewer.why}); the joined-fix cap releases a CI heal, never a second review` });
+      continue;
+    }
     if (!['fix', 'ci-heal'].includes(entry.kind)) { timedDispatch.push(entry); continue; }
     const pr = prs.find(p => Number(p.number) === entry.prNumber);
-    const facts = timingFacts(pr, { agents, repo,
+    const facts = timingFacts(pr, { agents, repo, requiredChecks,
       reviewDispatched: dispatch.some(d => d.prNumber === entry.prNumber && d.kind === 'review') });
     const decision = joinedFixDecision({ ...facts, now, policy: fixTiming });
     if (decision.action === 'wait') {

@@ -70,11 +70,17 @@ export function joinedFixDecision({ ciFailed = false, reviewFindings = false, fi
   return { action: 'dispatch', joined: false };
 }
 
-/** PURE: select timestamped head-local readiness facts. findings are validated producer records supplied by caller. */
-export function fixReadiness({ headSha, checks = [], findings = [], reviewPending = false } = {}) {
+/**
+ * PURE: select timestamped head-local readiness facts. findings are validated producer records supplied by caller.
+ * With a known required set, only REQUIRED failures count: those are the only ones a CI heal repairs, so an optional
+ * red (CodeQL) must not start the joined-fix clock or release a live reviewer's liveness hold.
+ */
+export function fixReadiness({ headSha, checks = [], findings = [], reviewPending = false, requiredChecks = null } = {}) {
+  const required = Array.isArray(requiredChecks) && requiredChecks.length ? new Set(requiredChecks) : null;
   const latest = collapseRollupToLatestPerName(checks).filter(row =>
     !['review-gate', 'merge-gate'].includes(row.name ?? row.context) && (!row.head_sha || row.head_sha === headSha));
-  const failed = latest.filter(row => RED.has(String(row.conclusion ?? row.state ?? '').toLowerCase()));
+  const failed = latest.filter(row => (!required || required.has(row.name ?? row.context))
+    && RED.has(String(row.conclusion ?? row.state ?? '').toLowerCase()));
   const times = [...failed.map(row => row.completed_at ?? row.completedAt), ...findings.map(row => row.createdAt)]
     .map(t => Date.parse(t)).filter(Number.isFinite);
   return { ciFailed: failed.length > 0, reviewFindings: findings.length > 0,

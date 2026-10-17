@@ -90,6 +90,12 @@ describe('joined fix round', () => {
     expect(fixReadiness({ headSha: head, checks: [check('unit', 'failure', { head_sha: 'b' })] }).ciFailed).toBe(false);
     expect(joinedFixDecision({ ...args, firstReadyAt: NaN }).action).toBe('dispatch');
   });
+  it('counts only required failures when the required set is known', () => {
+    const checks = [check('CodeQL', 'failure'), check('unit')];
+    expect(fixReadiness({ headSha: head, checks, requiredChecks: ['unit'] })).toMatchObject({ ciFailed: false, ciFailures: [] });
+    expect(fixReadiness({ headSha: head, checks: [...checks, check('unit', 'failure')], requiredChecks: ['unit'] }).ciFailures.map(r => r.name)).toEqual(['unit']);
+    expect(fixReadiness({ headSha: head, checks }).ciFailed).toBe(true); // unknown set keeps the old reading
+  });
 });
 it('resolves every timing leaf through the cascade, logging sources and rejecting malformed overrides', () => {
   const result = resolveTimingPolicy({ env: { WE_REVIEW_DELTA_MAX_LINES: '12', WE_FIX_JOIN_CI_AND_REVIEW: 'false' },
