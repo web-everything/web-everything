@@ -566,7 +566,7 @@ describe('#4194 runExtraSeats — the arc, with fakes', () => {
   });
 
   it('soak: a seat that fails, times out or throws never fails the run — it is only that seat\'s status', async () => {
-    const { io, rows } = fakeSeatIo({
+    const { io, rows, calls } = fakeSeatIo({
       runSeat: async (o) => {
         if (o.provider === 'codex') throw new Error('spawn ENOENT');
         return { timedOut: true, report: null };
@@ -578,6 +578,7 @@ describe('#4194 runExtraSeats — the arc, with fakes', () => {
     expect(rows.find((x) => x.provider === 'agy-claude').status).toBe('timeout');
     expect(rows.find((x) => x.provider === 'agy-gemini').status).toBe('timeout');
     expect(rows.every((x) => x.findingsCount === 0)).toBe(true);
+    expect(calls.at(-1)).toEqual(['rm', '/tmp/seat-scratch']);
   });
 
   it('kill switch: nothing is read or spawned', async () => {
