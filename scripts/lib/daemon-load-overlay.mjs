@@ -60,6 +60,8 @@ import {
 import { readHeadSha, isSafeBranchName } from './daemon-self-sync.mjs';
 import { gitRun } from './main-staleness.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
+import { strictEnvInteger } from './daemon-boot-smoke.mjs';
+import { redactSecrets } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
 import { readRoutingPolicy, resolvePolicyModel } from './dispatch-routing-policy-io.mjs';
 import { repairCloneRefs } from './lane-repair.mjs';
 import { addOverlay, removeOverlay, appendOverlayEvent } from './daemon-overlays.mjs';
@@ -210,7 +212,7 @@ export function overlaySafetySettings(env = process.env, { readSettings = readSe
   const file = declared.overlaySafety || {};
   const retries = cascadePolicy('overlaySmoke', declared.overlaySmoke, {
     standard: { dispatchLaunchRetries: 1 }, env,
-    envValues: { dispatchLaunchRetries: env.WE_OVERLAY_DISPATCH_LAUNCH_RETRIES === undefined ? undefined : Number(env.WE_OVERLAY_DISPATCH_LAUNCH_RETRIES) },
+    envValues: { dispatchLaunchRetries: strictEnvInteger(env.WE_OVERLAY_DISPATCH_LAUNCH_RETRIES) },
     valid: { dispatchLaunchRetries: (v) => Number.isInteger(v) && v >= 0 && v <= 1 },
   });
   const pick = (envVal, fileVal, allowed, dflt) => {
@@ -406,7 +408,7 @@ async function runRealDispatchSmokeAttempt({
     cwd: tree, env: childEnv, encoding: 'utf8', timeout: 120_000, killSignal: 'SIGKILL',
   });
   if (launch.status !== 0) {
-    return { ...base, ok: false, reason: 'launch-failed', detail: String(launch.stderr || launch.error?.message || '').trim().split('\n').slice(-3).join(' | '), ms: Date.now() - t0 };
+    return { ...base, ok: false, reason: 'launch-failed', detail: redactSecrets(String(launch.stderr || launch.error?.message || '').trim().split('\n').slice(-3).join(' | ')), ms: Date.now() - t0 };
   }
   let launched = {};
   try { launched = JSON.parse(String(launch.stdout).trim().split('\n').pop()); } catch { /* keep {} */ }
@@ -451,7 +453,8 @@ async function runRealDispatchSmokeAttempt({
   const diagnostics = {
     wrapperPid, wrapperAliveAtTimeout: verdict.reason === 'timeout' ? probeAlive(wrapperPid) : null,
     launchStartedAt: new Date(t0).toISOString(),
-    stderrTail: (() => { try { return readFileSync(join(scratch, 'wrapper.stderr'), 'utf8').trimEnd().split('\n').slice(-30).join('\n'); } catch { return ''; } })(),
+    // Redacted and line-bounded at the source, so no consumer of the result can persist a raw token.
+    stderrTail: (() => { try { return redactSecrets(readFileSync(join(scratch, 'wrapper.stderr'), 'utf8').trimEnd().split('\n').slice(-30).join('\n')); } catch { return ''; } })(),
     sessionAppeared: !!session, transcriptAppeared: !!transcript,
     firstOutputMs: readJson(join(scratch, 'first-output.json'))?.ms ?? null,
   };
@@ -459,7 +462,10 @@ async function runRealDispatchSmokeAttempt({
     try { stopWrapper(wrapperPid); } catch { /* already gone */ }
   }
   const launchTimeout = verdict.reason === 'timeout' && !markerAppeared && !recordAppeared && !session && !transcript;
-  if (!verdict.ok) verdict.detail = `${verdict.detail || verdict.reason}; diagnostics=${JSON.stringify(diagnostics)}`;
+  // The stderr tail stays in the structured `diagnostics` field only; `detail` carries flags, never stderr.
+  if (!verdict.ok) {
+    verdict.detail = `${verdict.detail || verdict.reason}; wrapperAliveAtTimeout=${diagnostics.wrapperAliveAtTimeout}, sessionAppeared=${diagnostics.sessionAppeared}, transcriptAppeared=${diagnostics.transcriptAppeared}, firstOutputMs=${diagnostics.firstOutputMs}`;
+  }
   return {
     ...base, ...verdict, handle, wrapperPid, transcript, diagnostics, launchTimeout, ms: Date.now() - t0,
   };
@@ -478,7 +484,7 @@ export async function runRealDispatchSmoke(args) {
     if (!result.launchTimeout || attempt >= retries) {
       if (attempt > 0) {
         result.note = 'retried after launch timeout';
-        result.detail = `${result.detail ?? result.reason}; ${result.note}; attempts=${JSON.stringify(attempts.map((r) => ({ reason: r.reason, diagnostics: r.diagnostics })))}`;
+        result.detail = `${result.detail ?? result.reason}; ${result.note}; attempts=${attempts.map((r) => r.reason).join(',')}`;
         log.error?.(`daemon-load-overlay: dispatch smoke ${result.reason} — ${result.note}`);
       }
       return { ...result, attempts: attempts.map((r) => ({ reason: r.reason, diagnostics: r.diagnostics })), ms: attempts.reduce((n, r) => n + r.ms, 0) };

@@ -932,8 +932,28 @@ describe('runRealDispatchSmoke — the smoke worker\'s completion record goes to
     expect(r).toMatchObject({ ok: false, reason: 'timeout', diagnostics: { wrapperPid: 12345, wrapperAliveAtTimeout: true, sessionAppeared: false, transcriptAppeared: false, firstOutputMs: 17 } });
     expect(r.diagnostics.stderrTail.split('\n')).toHaveLength(30);
     expect(r.diagnostics.launchStartedAt).toMatch(/^\d{4}-/);
-    expect(r.detail).toContain('line 39');
+    expect(r.diagnostics.stderrTail).toContain('line 39');
     expect(r.attempts).toHaveLength(2);
+  });
+
+  it('keeps wrapper stderr out of detail and logs, and redacts and bounds it at the source', async () => {
+    const secrets = ['ghp_secretAAAA', 'github_pat_secretBBBB', 'sk-ant-api03-secretCCCC', 'npm_secretDDDDDDDDDDDDDDDDDDDD', 'Bearer secretEEEE'];
+    const spawn = launchFixture(({ scratch }) => {
+      writeFileSync(join(scratch, 'wrapper.stderr'), [...secrets.map((s) => `token ${s}`), 'y'.repeat(20_000)].join('\n'));
+    });
+    const log = { error: vi.fn() };
+    const r = await smoke(spawn, { log });
+    expect(r).toMatchObject({ ok: false, reason: 'timeout' });
+    const logged = log.error.mock.calls.map((c) => c.join(' ')).join('\n');
+    for (const s of secrets) {
+      expect(r.detail).not.toContain(s);
+      expect(r.diagnostics.stderrTail).not.toContain(s);
+      expect(JSON.stringify(r.attempts)).not.toContain(s);
+      expect(logged).not.toContain(s);
+    }
+    expect(r.detail).not.toContain('token ');
+    expect(r.diagnostics.stderrTail).toContain('token ghp_<redacted>');
+    expect(Math.max(...r.diagnostics.stderrTail.split('\n').map((l) => l.length))).toBeLessThanOrEqual(500);
   });
 
   it('does not retry a worker that finishes without its commands', async () => {
@@ -961,6 +981,10 @@ describe('runRealDispatchSmoke — the smoke worker\'s completion record goes to
     expect(overlaySafetySettings({}, { readSettings })).toMatchObject({ dispatchLaunchRetries: 0, dispatchLaunchRetriesSource: 'tool' });
     expect(overlaySafetySettings({ WE_OVERLAY_DISPATCH_LAUNCH_RETRIES: '1' }, { readSettings })).toMatchObject({ dispatchLaunchRetries: 1, dispatchLaunchRetriesSource: 'env' });
     expect(overlaySafetySettings({ WE_OVERLAY_DISPATCH_LAUNCH_RETRIES: '2' }, { readSettings }).dispatchLaunchRetries).toBe(0);
+    for (const blank of ['', '  ', ' 0 ', '0x0', '-0']) {
+      expect(overlaySafetySettings({ WE_OVERLAY_DISPATCH_LAUNCH_RETRIES: blank }, { readSettings: () => null }))
+        .toMatchObject({ dispatchLaunchRetries: 1, dispatchLaunchRetriesSource: 'standard' });
+    }
     const spawn = launchFixture();
     const log = { error: vi.fn() };
     await smoke(spawn, { settings: { ...fastSettings(), dispatchLaunchRetries: 0, dispatchLaunchRetriesSource: 'tool' }, log });

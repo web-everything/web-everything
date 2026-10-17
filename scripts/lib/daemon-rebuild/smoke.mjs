@@ -519,7 +519,8 @@ export async function smokeAndAdopt({
   const dispatchFailed = async (d) => {
     const { result, suspects } = d;
     const definite = DISPATCH_SMOKE_DEFINITE.has(result.reason);
-    const why = `dispatch-smoke-failed: ${result.reason}${result.detail ? ` — ${result.detail}` : ''}`;
+    // Redacted and bounded once here: `why` reaches held state, the overlay list and the overlay event log.
+    const why = redactDetail(`dispatch-smoke-failed: ${result.reason}${result.detail ? ` — ${result.detail}` : ''}`);
     alert('dispatch-smoke-failed', {
       reason: result.reason, detail: redactDetail(result.detail ?? ''),
       diagnostics: result.diagnostics ? { ...result.diagnostics, stderrTail: String(result.diagnostics.stderrTail ?? '').split('\n').map((line) => redactDetail(line)).join('\n') } : null,

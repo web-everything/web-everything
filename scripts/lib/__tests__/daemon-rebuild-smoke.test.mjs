@@ -1,7 +1,7 @@
 /** @file xhiqxz3 — the daemon's TICK rebuild runs the real dispatch smoke (#4481's) inside its candidate smoke, so
  * an overlay that breaks the worker launch is never adopted. Real-git fixtures; the worker launch is injected. */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -131,6 +131,47 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
     expect(alert.diagnostics.stderrTail).toContain('frame 29');
     expect(alert.diagnostics.stderrTail).not.toContain('ghp_secret');
     expect(alert.attempts[0].diagnostics).toEqual(alert.diagnostics);
+  });
+  it('a definite dispatch-smoke failure persists no secret and no unbounded detail in any sink', async () => {
+    const f = makeFixture();
+    addDispatchOverlay(f);
+    const secrets = ['ghp_secretAAAA', 'sk-ant-api03-secretCCCC', 'npm_secretDDDDDDDDDDDDDDDDDDDD', 'Bearer secretEEEE'];
+    const detail = `worker exited; stderr ${secrets.join(' ')} ${'z'.repeat(20_000)}`;
+    const r = await rebuild(f, async () => ({ ok: false, reason: 'no-commands-ran', detail, diagnostics: { stderrTail: secrets.join('\n') } }));
+    expect(r.adopted).toBeFalsy();
+    expect(refs(f)).toEqual([]);
+    const dir = f.env.WE_DAEMON_OVERLAY_DIR;
+    const events = readdirSync(dir).filter((n) => n.endsWith('.events.jsonl'))
+      .flatMap((n) => readFileSync(join(dir, n), 'utf8').trim().split('\n').map((l) => JSON.parse(l)));
+    const dropped = events.find((e) => e.kind === 'dropped-dispatch-smoke-failed');
+    expect(dropped.reason).toContain('dispatch-smoke-failed: no-commands-ran');
+    expect(dropped.reason.length).toBeLessThanOrEqual(500);
+    const sinks = [JSON.stringify(events), JSON.stringify(readRebuildState(f.cloneDir, f.env)), JSON.stringify(r.alerts)];
+    for (const s of secrets) for (const sink of sinks) expect(sink).not.toContain(s);
+  });
+  it('bounds and redacts daemon-entries-boot tails without losing the last frames', async () => {
+    const f = makeFixture();
+    addDispatchOverlay(f);
+    const tail = Array.from({ length: 30 }, (_, i) => `frame ${i} ${'q'.repeat(5_000)}`).join('\n');
+    const boot = await checkDaemonEntriesBoot({ root: f.cloneDir,
+      env: { [DAEMON_ENTRIES_ENV]: 'a.mjs,b.mjs,c.mjs,d.mjs,e.mjs,f.mjs' }, log: { error() {} },
+      runChild: async () => { throw Object.assign(new Error('native abort'), {
+        signal: null, status: 1, stderr: `sk-ant-api03-secretCCCC npm_secretDDDDDDDDDDDDDDDDDDDD\n${tail}`,
+      }); },
+    });
+    const result = await rebuildClone({ root: f.cloneDir,
+      env: { ...f.env, WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' },
+      prState: async () => null, lockOpts: LOCK_OPTS, log: { error() {} },
+      runSmoke: async () => ({ verdict: 'code', smoke: { results: [{ name: 'daemon-entries-boot', ...boot }] } }),
+    });
+    const held = readRebuildState(f.cloneDir, f.env).held;
+    const text = held.details[0].detail;
+    expect(text).not.toContain('sk-ant-api03-secretCCCC');
+    expect(text).not.toContain('npm_secretDDDDDDDDDDDDDDDDDDDD');
+    expect(text).toContain('frame 29');
+    expect(Math.max(...text.split('\n').map((l) => l.length))).toBeLessThanOrEqual(500);
+    expect(text.length).toBeLessThanOrEqual(16_000);
+    expect(JSON.stringify(result.alerts)).not.toContain('sk-ant-api03-secretCCCC');
   });
 
   it('a candidate whose new overlay fails the dispatch smoke is never adopted; the clone stays on last-good', async () => {

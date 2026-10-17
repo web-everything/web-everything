@@ -55,13 +55,16 @@
 import { resolveChildTimeoutMs, runBounded } from './bounded-child.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
+import { redactSecrets } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
+
+/** An env integer, strictly decimal digits; empty, blank, signed or hex values read as unset (never as 0). */
+export const strictEnvInteger = (v) => (/^\d+$/.test(String(v ?? '')) ? Number(v) : undefined);
 
 /** Initial boots are bounded; only native signal deaths get serial retries. */
 export function resolveBootSettings(env = process.env) {
-  const integer = v => /^\d+$/.test(String(v ?? '')) ? Number(v) : undefined;
   const r = cascadePolicy('rebuildSmoke', readDeclaredSettings().settings?.rebuildSmoke, {
     env, standard: { bootSignalRetries: 1, bootConcurrency: 3 },
-    envValues: { bootSignalRetries: integer(env.WE_SMOKE_BOOT_SIGNAL_RETRIES), bootConcurrency: integer(env.WE_SMOKE_BOOT_CONCURRENCY) },
+    envValues: { bootSignalRetries: strictEnvInteger(env.WE_SMOKE_BOOT_SIGNAL_RETRIES), bootConcurrency: strictEnvInteger(env.WE_SMOKE_BOOT_CONCURRENCY) },
     valid: {
       bootSignalRetries: v => Number.isSafeInteger(v) && v >= 0,
       bootConcurrency: v => Number.isSafeInteger(v) && v > 0,
@@ -182,9 +185,9 @@ async function bootOneEntry(entry, { root, timeoutMs, runChild, env }) {
   } catch (e) {
     const signal = e?.signal ?? null;
     const exitCode = e?.status ?? e?.code ?? null;
-    const stderrTail = String(e?.stderr ?? '').trimEnd().split(/\r?\n/).slice(-30).join('\n');
+    const stderrTail = redactSecrets(String(e?.stderr ?? '').trimEnd().split(/\r?\n/).slice(-30).join('\n'));
     return { entry, ok: false, signal, exitCode, stderrTail,
-      error: `child failed: ${firstLine(e)} (signal=${signal}, exitCode=${exitCode})${stderrTail ? `\nstderr tail:\n${stderrTail}` : ''}` };
+      error: `child failed: ${redactSecrets(firstLine(e))} (signal=${signal}, exitCode=${exitCode})${stderrTail ? `\nstderr tail:\n${stderrTail}` : ''}` };
   }
   let parsed;
   try {

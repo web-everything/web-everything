@@ -9,7 +9,11 @@ Exit failures and `ok:false` never receive this retry. Both settings use the pol
 `scripts/settings/rebuild-smoke.json`, with env overrides `WE_SMOKE_BOOT_CONCURRENCY` and
 `WE_SMOKE_BOOT_SIGNAL_RETRIES`; log effective values and sources. Retain per-attempt signal,
 exit code and the last 30 stderr lines in the smoke result. Rebuild rejection/held/stale alerts
-must preserve boot tails beyond the ordinary detail caps while still redacting tokens.
+must preserve boot tails beyond the ordinary detail caps while still redacting secrets: redact
+stderr where it is read (`redactSecrets`: GitHub/Anthropic/npm/Slack tokens, AWS key ids, auth
+headers, 500-char lines), cap a boot detail at 16 KB keeping its head and newest lines, and keep
+a dispatch-smoke stderr tail in the structured `diagnostics` field only, never in `detail`, so the
+overlay event log and held state never carry it. Env integers are strict digits; empty is unset.
 Cover retry recovery, exhausted retries, non-signal refusal and concurrency with injected children;
 exercise diagnostic propagation through a real-git rebuild fixture. Run these suites through heavy admission.
 
