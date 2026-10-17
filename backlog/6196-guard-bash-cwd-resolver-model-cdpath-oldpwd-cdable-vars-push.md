@@ -1,4 +1,5 @@
 ---
+bornAs: xzo91er
 kind: story
 size: 5
 status: active
@@ -14,7 +15,7 @@ tags: []
 Found by the PR 5403 self-reviews. resolveEffectiveCwd (the static first-cd walk) still differs from bash in structural ways the PR did not change:
 
 - a set or prefix CDPATH, OLDPWD with `cd -`, `shopt -s cdable_vars`, `set -o posix` (prefix assignments then persist), and `pushd`;
-- `eval cd …`, `bash -c "cd …"`, a process substitution `<(cd …)` and a `cd` in a pipe or a background job (these are outside the base leading-cd resolver; broader landing analysis is deferred to #x5tbryq);
+- `eval cd …`, `bash -c "cd …"`, a process substitution `<(cd …)` and a `cd` in a pipe or a background job (these are outside the base leading-cd resolver; broader landing analysis is deferred to #6195);
 - a segment led by a keyword or a `case` pattern (`then git reset --hard`, `x) cd D && …`) is not judged by the per-segment arms, whatever its cwd;
 - the commands before the first cd run in the reported cwd, but the hook judges them in the effective cwd only (`git reset --hard; cd <lane>` from a daemon clone); judging the reported cwd too would deny the `cd <lane> && claim` idiom from a primary;
 - assignments after then/do/else (walked as if they ran);
