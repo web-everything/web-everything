@@ -979,6 +979,8 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
       '(HOME=/P; true | (HOME=/Q; true); cd ~ && git checkout --detach)',
       '(HOME=/P; (HOME=/Q); cd ~ && git checkout --detach)',
       '(HOME=/P\n(HOME=/Q; true)\ncd ~ && git checkout --detach)',
+      'true | (HOME=/P; cd ~ && git checkout --detach)',
+      'true | ( HOME=/P\n cd ~ && git checkout --detach )',
     ]) expect(lands(cmd), JSON.stringify(cmd)).toContain('/P');
     // the effective cwd still keeps main's reading of an option
     expect(at('cd -P /P && ls')).toBe(`${REPORTED}/-P`);

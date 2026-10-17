@@ -3140,10 +3140,11 @@ function analyzeCwd(command, reportedCwd, resolvePath, home, nest) {
       const v = raw.split(/\s+/)[0].replace(/^"(.*)"$/, '$1').match(/^\$\{?([A-Za-z_]\w*)\}?$/);
       for (const alt of v ? [vars[v[1]], childVals[v[1]]] : []) if (usable(alt, false)) out.push(absolute(alt));
       // the HOME a child shell enclosing this cd may have given itself: the latest one before it at each of the
-      // nearest CHILD_HOME_DEPTHS depths up to the cd's own (a deeper child shell has closed before the cd)
+      // nearest CHILD_HOME_DEPTHS depths up to one below the cd's own (a pipeline element's first segment reads
+      // one level deeper than the rest of its group; an extra reading only adds a landing)
       if (homeSpelled(raw)) {
         const own = depths[at][segs[at].length - found[1].length];
-        const upTo = countBelow(homeDepths, own + 1, (d) => d);
+        const upTo = countBelow(homeDepths, own + 2, (d) => d);
         const near = homeDepths.slice(Math.max(0, upTo - CHILD_HOME_DEPTHS), upTo);
         for (const d of near) {
           const child = lastBefore(childHomes.get(d), at + 1, (h) => h.at);
