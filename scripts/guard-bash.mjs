@@ -177,7 +177,6 @@ import { LEASE_FILENAME, isLeaseStale, isForeignLease, laneMarkedSlug, assertedL
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { usageReportSecretDir, USAGE_REPORT_KEYCHAIN_SERVICE } from './lib/usage-report-secret-paths.mjs';
 import { classifySession } from './operations/session-role.mjs';
-import { loadOrchestratorSessionSettings, ORCHESTRATOR_DELEGATE_COMMANDS } from './lib/orchestrator-session-settings.mjs';
 // #xpt9fvd — the shared daemon-clone registry `guard-lane.mjs`'s Edit/Write arm also reads, so the two guards
 // can never disagree about which paths are a resident daemon's OWN clone.
 import { daemonCloneRoots, isDaemonCloneRealpath } from './lib/daemon-clone-registry.mjs';
@@ -436,118 +435,6 @@ export function isDirectTaskInvocation(command) {
     const script = words[1] === '--' ? words[2] : words[1];
     return /(?:^|\/)(?:codex|gemini)-direct-task\.mjs$/.test(script || '');
   });
-}
-
-/** Match executable prefixes, including shell re-execution; quoted mentions remain data. */
-export function orchestratorDelegateReason(command, ctx = {}) {
-  if (!ctx.orchestratorMode || ctx.agentSession || ctx.dispatchKind) return null;
-  const nodeValueFlags = new Set([...NODE_SCRIPT_VALUE_FLAGS, '-C', '--conditions', '--input-type',
-    '--title', '--env-file', '--env-file-if-exists', '--icu-data-dir', '--openssl-config',
-    '--redirect-warnings', '--diagnostic-dir', '--trace-event-categories', '--trace-event-file-pattern',
-    '--cpu-prof-dir', '--cpu-prof-name', '--heap-prof-dir', '--heap-prof-name', '--snapshot-blob',
-    '--inspect-port', '--debug-port', '--inspect-publish-uid', '--max-old-space-size', '--max-semi-space-size',
-    '--stack-size', '--experimental-default-type', '--unhandled-rejections', '--dns-result-order',
-    '--allow-fs-read', '--allow-fs-write', '--build-snapshot-config', '--cpu-prof-interval', '--disable-proto',
-    '--disable-warning', '--experimental-policy', '--experimental-sea-config', '--heap-prof-interval',
-    '--heapsnapshot-near-heap-limit', '--heapsnapshot-signal', '--max-http-header-size',
-    '--network-family-autoselection-attempt-timeout', '--policy-integrity', '--report-directory', '--report-dir',
-    '--report-filename', '--report-signal', '--secure-heap', '--secure-heap-min', '--test-concurrency',
-    '--test-name-pattern', '--test-reporter', '--test-reporter-destination', '--test-shard',
-    '--test-skip-pattern', '--test-timeout', '--tls-cipher-list', '--tls-keylog', '--use-largepages',
-    '--v8-pool-size', '--watch-path']);
-  // npm accepts config options before both `run` and the script name, including separate values.
-  const npmValueFlags = new Set([...RUNNER_VALUE_FLAGS, ...(`
-    --_auth --access --also --audit-level --auth-type --before --ca --cache --cache-max --cache-min
-    --cafile --call --cert --cidr --cpu --depth --diff --diff-dst-prefix --diff-src-prefix --diff-unified
-    --editor --expect-result-count --fetch-retries --fetch-retry-factor --fetch-retry-maxtimeout
-    --fetch-retry-mintimeout --fetch-timeout --git --globalconfig --heading --https-proxy --include
-    --init-author-email --init-author-name --init-author-url --init-license --init-module --init-version
-    --init.author.email --init.author.name --init.author.url --init.license --init.module --init.version
-    --install-strategy --key --libc --local-address --location --lockfile-version --loglevel --logs-dir
-    --logs-max --maxsockets --message --node-options --noproxy --omit --only --os --otp --package
-    --pack-destination --prefix --preid --provenance-file --proxy --registry --replace-registry-host
-    --save-prefix --sbom-format --sbom-type --scope --script-shell --searchexclude --searchlimit
-    --searchopts --searchstaleness --shell --tag --tag-version-prefix --umask --user-agent --userconfig
-    --viewer --which --workspace
-  `).trim().split(/\s+/)]);
-  const normalize = (text) => {
-    const words = headWords(canonicalCommand(peelPollingSegment(text))).map(w => w.text);
-    if (words[0] === 'node') {
-      let i = 1;
-      const preloads = [];
-      let sourceMode = false;
-      while (words[i]?.startsWith('-') && words[i] !== '--' && words[i] !== '-') {
-        if (/^(?:--check|--help|--version)(?:=|$)|^-(?:c|[hv]$)/.test(words[i])) return [];
-        if (/^(?:--eval|--print)(?:=|$)|^-[ep]/.test(words[i])) {
-          sourceMode = true; // preloads still execute, including those specified after the source
-          i += /^(?:--eval|--print|-[ep]{1,2})$/.test(words[i]) ? 2 : 1;
-          continue;
-        }
-        const flag = words[i].split('=')[0].replaceAll('_', '-');
-        if (NODE_SCRIPT_VALUE_FLAGS.has(flag)) {
-          const value = words[i].includes('=') ? words[i].slice(words[i].indexOf('=') + 1) : words[i + 1];
-          if (value) preloads.push(['node', value.split('/').at(-1)]);
-        } else if (/^-r./.test(words[i])) preloads.push(['node', words[i].slice(2).split('/').at(-1)]);
-        i += !words[i].includes('=') && nodeValueFlags.has(flag) ? 2 : 1;
-      }
-      if (words[i] === '--') i += 1;
-      return [...preloads, ...(sourceMode ? [] : [['node', ...(words[i] ? [words[i].split('/').at(-1), ...words.slice(i + 1)] : [])]])];
-    }
-    if (words[0] === 'npm') {
-      let i = 1;
-      const skipOptions = () => {
-        while (words[i]?.startsWith('-')) {
-          if (words[i] === '--') { i += 1; break; }
-          const flag = words[i];
-          // Exact booleans take precedence over config-name abbreviations (e.g. --save vs --save-prefix).
-          const valueFlag = npmValueFlags.has(flag) || (!/^(?:--audit|--global|--provenance|--save)$/.test(flag)
-            && flag.startsWith('--') && [...npmValueFlags].some(known => known.startsWith(flag)));
-          i += !flag.includes('=') && (valueFlag || /^(?:true|false)$/.test(words[i + 1] || '')
-            || (flag === '--color' && words[i + 1] === 'always')) ? 2 : 1;
-        }
-      };
-      skipOptions();
-      if (words[i] === 'run' || words[i] === 'run-script') {
-        i += 1;
-        skipOptions();
-        return [['npm', 'run', ...words.slice(i)]];
-      }
-    }
-    return [words];
-  };
-  const prefixes = (ctx.orchestratorDelegateCommands ?? ORCHESTRATOR_DELEGATE_COMMANDS).flatMap(normalize);
-  const seen = new Set();
-  let budget = NESTED_NODE_CAP;
-  const matches = (text, depth = 0) => {
-    if (depth > NESTED_DEPTH_CAP || budget <= 0 || seen.has(text)) return false;
-    seen.add(text);
-    budget -= 1;
-    const { text: raw, heredocs } = heredocScan(text);
-    const segments = parseSegments(raw).segments;
-    for (const segment of segments) {
-      if (normalize(segment).some(words => prefixes.some(prefix => prefix.length
-        && prefix.every((word, i) => word === words[i])))) return true;
-    }
-    // Keep data heredocs opaque, but scan stdin scripts with the same bounded traversal as shell -c.
-    const nested = [...substitutionBodies(raw), ...segments.flatMap(nestedCommandStrings)];
-    for (const segment of segments) {
-      const tokens = shellTokens(segment);
-      const at = tokens.findIndex(token => token.op && /^(?:0)?<<<$/.test(token.text));
-      if (at >= 0 && tokens[at + 1] && heredocInterpreter(segment)?.kind === 'shell') {
-        nested.push(tokens[at + 1].text);
-      }
-    }
-    const group = leadingGroupBody(raw);
-    if (group !== null) nested.push(group);
-    for (const h of heredocs) {
-      if (heredocInterpreter(h.head)?.kind === 'shell') nested.push(h.body);
-      if (h.expand) nested.push(...substitutionBodies(h.body, [], true));
-    }
-    return nested.some(inner => matches(inner, depth + 1));
-  };
-  return matches(String(command || ''))
-    ? 'orchestrator session: delegate this to a background light agent (Agent tool, run_in_background, model haiku/sonnet), which runs it in its own foreground'
-    : null;
 }
 
 /** Whole-command check: retain both the shell background operator and the Bash tool parameter. Pure. */
@@ -1257,9 +1144,6 @@ export function parseSegments(command, { spliceContinuations = true } = {}) {
   // callers only ask "where does one command end"), so it rides as an extra field rather than a second parser.
   // `||` (logical or, not a pipe) is excluded: its second `|` is what the very next char test below reads.
   const pipedFrom = [];
-  const separators = [];         // `separators[i]` — the operator text that ended `segs[i]` ('' when none)
-  const commented = [];          // `commented[i]` — did `segs[i]` begin INSIDE a `#` comment (`# a; b` → ` b`)?
-  let startedInComment = false;
   let pendingPiped = false;      // segs[0] (the first segment) has no predecessor
   let cur = '';
   let unterminated = false;
@@ -1268,10 +1152,7 @@ export function parseSegments(command, { spliceContinuations = true } = {}) {
   let inComment = false;
   // A comment switches quoting off until END OF LINE — a separator does NOT end it (bash agrees: `# a; b`
   // is all comment). Only a newline clears it.
-  const cut = () => {
-    segs.push(cur); pipedFrom.push(pendingPiped); separators.push(''); commented.push(startedInComment);
-    cur = ''; atWordStart = true;
-  };
+  const cut = () => { segs.push(cur); pipedFrom.push(pendingPiped); cur = ''; atWordStart = true; };
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
     // Inside a `#` comment ONLY quoting is switched off; the comment TEXT and every separator in it are
@@ -1308,10 +1189,7 @@ export function parseSegments(command, { spliceContinuations = true } = {}) {
       // the `cut()` that finalizes THIS next segment.
       pendingPiped = ch === '|' && s[i + 1] !== '|';
       if (ch === '\n') inComment = false;
-      const start = i;
       while (i + 1 < s.length && /[;&|\n]/.test(s[i + 1])) { if (s[i + 1] === '\n') inComment = false; i += 1; }
-      separators[separators.length - 1] = s.slice(start, i + 1);
-      startedInComment = inComment;
       continue;
     }
     cur += ch;
@@ -1319,9 +1197,7 @@ export function parseSegments(command, { spliceContinuations = true } = {}) {
   }
   segs.push(cur);
   pipedFrom.push(pendingPiped);
-  separators.push('');
-  commented.push(startedInComment);
-  return { segments: segs, unterminated, continued, pipedFrom, separators, commented };
+  return { segments: segs, unterminated, continued, pipedFrom };
 }
 
 /** The segments-only view of `parseSegments` (the raw text of each `&&`/`||`/`;`/`&`/`|`/newline-separated
@@ -1392,7 +1268,7 @@ function groupEnd(s, open) {
  *  one opaque span instead lost `echo "`+"`"+`find . -name "*.ts"; yarn build`+"`"+`"` — the `"` before
  *  `*.ts` read as the run's closer, so the substitution's tail (a real `yarn build`) was never seen.
  *  `$'…'` is ANSI-C quoting, not a substitution, and falls through to the single-quote branch. */
-function substitutionBodies(s, out = [], heredoc = false) {
+function substitutionBodies(s, out = []) {
   let inDouble = false;
   // …and it must read a `#` COMMENT the way the rest of the parser already does. Without this, the
   // apostrophe in `# a note — don't forget` ⏎ `echo \`pnpm exec vite build\`` opened a phantom
@@ -1405,9 +1281,9 @@ function substitutionBodies(s, out = [], heredoc = false) {
     if (ch === '\n') { if (!inDouble) { inComment = false; atWordStart = true; } continue; }
     if (inComment) continue;
     if (ch === '\\') { i += 1; atWordStart = false; continue; }
-    if (!heredoc && !inDouble && ch === '#' && atWordStart) { inComment = true; continue; }
-    if (!heredoc && !inDouble && ch === "'") { const e = s.indexOf("'", i + 1); if (e === -1) return out; i = e; atWordStart = false; continue; }
-    if (!heredoc && ch === '"') { inDouble = !inDouble; atWordStart = false; continue; }
+    if (!inDouble && ch === '#' && atWordStart) { inComment = true; continue; }
+    if (!inDouble && ch === "'") { const e = s.indexOf("'", i + 1); if (e === -1) return out; i = e; atWordStart = false; continue; }
+    if (ch === '"') { inDouble = !inDouble; atWordStart = false; continue; }
     if (ch === '$' && s[i + 1] === '(') {
       const e = groupEnd(s, i + 1);
       const body = s.slice(i + 2, e === -1 ? s.length : e);
@@ -2331,61 +2207,32 @@ function shellWaits(text) {
   }
   return waits;
 }
+const HEREDOC_OPERATOR = /<<-?\s*(?:'[^']*'|"[^"]*"|\\?\w+)/g;
 /** What does a heredoc's HEAD line feed its body to: `{ kind: 'shell', prog }` (bash/sh/…, the body is a script of
  *  commands), `{ kind: 'script', prog }` (python/node/perl/…, the body is a program), or null — `cat`,
  *  `git commit -F -`, or a shell/interpreter given a script FILE (`node x.mjs <<EOF`: the body is that script's
  *  stdin DATA). A `cat <<EOF | bash` pipe is followed to its consumer. */
 function heredocInterpreter(head) {
-  let segs, pipedFrom;
-  try { ({ segments: segs, pipedFrom } = parseSegments(String(head || ''))); } catch { return null; }
+  let segs;
+  try { segs = parseSegments(String(head || '')).segments; } catch { return null; }
   const progOf = (words) => (words[0] || '').replace(/^.*\//, '');
-  const wordsOf = (seg) => {
-    const tokens = shellTokens(canonicalCommand(seg));
-    const words = [];
-    for (let i = 0; i < tokens.length; i++) {
-      if (tokens[i].op) { i += 1; continue; } // redirects and their operands are not script arguments
-      words.push(tokens[i].text);
-    }
-    return words;
-  };
+  const wordsOf = (seg) => headWords(canonicalCommand(seg.replace(HEREDOC_OPERATOR, ' '))).map((w) => w.text);
   const interpreters = new RegExp(`^(?:${WAIT_INTERPRETERS})$`);
   const kindOf = (seg) => {
     const words = wordsOf(seg);
-    if (progOf(words) === 'busybox' && SHELL_PROGRAMS.has(words[1])) words.shift();
     const prog = progOf(words);
     const shell = SHELL_PROGRAMS.has(prog);
     if (!shell && !interpreters.test(prog)) return null;
     const rest = words.slice(1);
-    if (shell) {
-      let stdin = false;
-      let i = 0;
-      for (; i < rest.length; i++) {
-        const word = rest[i];
-        if (word === '--') { i += 1; break; }
-        if (!/^[+-]./.test(word)) break;
-        // -c wins over -s; a later positional -s after a script file is just data.
-        if (/^-[A-Za-z]*c[A-Za-z]*$/.test(word) || word === '--help' || word === '--version') return null;
-        if (/^-[A-Za-z]*s/.test(word)) stdin = true;
-        if (/^(?:-[oO]|--rcfile|--init-file)$/.test(word) && rest[i + 1] && !rest[i + 1].startsWith('-')) i += 1;
-      }
-      if (stdin || i === rest.length || ['-', '/dev/stdin', '/dev/fd/0', '/proc/self/fd/0'].includes(rest[i])) {
-        return { kind: 'shell', prog };
-      }
-      return null;
-    }
+    if (shell && rest.includes('-s')) return { kind: 'shell', prog };
     if (rest.some((w) => w !== '-' && !w.startsWith('-'))) return null;   // a script file / `-c` string: stdin is data
     return { kind: shell ? 'shell' : 'script', prog };
   };
   const at = segs.findIndex((s) => s.includes('<<'));
   if (at < 0) return null;
-  const stdinOps = shellTokens(segs[at]).filter(token => token.op && /^(?:0)?</.test(token.text));
-  if (!/^(?:0)?<<<?$/.test(stdinOps.at(-1)?.text || '')) return null;
   const direct = kindOf(segs[at]);
   if (direct) return direct;
-  let consumer = at;
-  while (pipedFrom[consumer + 1]) consumer += 1;
-  if (consumer > at && shellTokens(segs[consumer]).some(token => token.op && /^(?:0)?</.test(token.text))) return null;
-  return /^(?:cat|tee)$/.test(progOf(wordsOf(segs[at]))) && consumer > at ? kindOf(segs[consumer]) : null;
+  return /^(?:cat|tee|printf|echo)$/.test(progOf(wordsOf(segs[at]))) && segs.length > at + 1 ? kindOf(segs[segs.length - 1]) : null;
 }
 /** A segment as its command: drop the loop/conditional keyword (`do bash -c '…'`) and a `timeout <dur>` prefix. */
 const peelPollingSegment = (seg) => seg.replace(/^\s*(?:(?:do|then|else|elif|if|while|until)\s+)+(?:!\s*)?/, '').replace(/^\s*timeout\s+(?:-\S+\s+)*\S+\s+/, '');
@@ -2585,212 +2432,6 @@ export function hasDestructiveLaneOp(command) {
   return segments.some((seg) => isDestructiveLaneGitOp(seg.trim()));
 }
 
-// #5957 (review r10) — the child-shell depth before every offset of every segment, carried across segments: an
-// assignment inside `( … )`, `$( … )`, `<( … )`, backticks, a `coproc` command or a pipeline / `&` element runs
-// in a child shell and never changes the parent's value. Only a subshell `(` counts. `((` / `$((` arithmetic
-// (and a `(` inside it) assigns in THIS shell, unless bash falls back to two subshells (see subshellDepths), and a `(` in quotes, an escape, `${…}` or a comment opens
-// nothing. A mis-scan errs toward depth 0, where a binding counts: an unmatched `)` only lowers the depth, never
-// below zero, a closing backtick (or `esac`) ends whatever opened inside it, `{ … }` is tracked only inside a
-// `coproc { … }` body, and a piped segment inside `case … esac` (`a|b)` is a pattern) stays as scanned. The
-// scan is linear: every lookback is bounded and every frame search pops what it passes.
-const PIPE_SEP = /^\|&?\n*$/;
-const BG_SEP = /^&\n*$/;
-const GROUP_SPAN = 64;
-// words after which a command (so a reserved word) starts
-const CMD_WORDS = ['then', 'do', 'else', 'elif', 'if', 'while', 'until', 'time', '{'];
-const CMD_CHAIN = 8;
-const COPROC_HEAD = /coproc[ \t]+(?:[A-Za-z_]\w*[ \t]+)?([{(])(?=[\s(]|$)/y;
-// review r11 — `((` / `$((` is arithmetic only when the pair its second `(` opens is closed by an adjacent
-// `))`; otherwise bash falls back to two nested subshells (`((cd /P; true) )`, `$((D=1; true) )`). The first
-// pass reads every `((` as arithmetic and records how each one closed; a second pass, run only when one fell
-// back, reads those as two child shells. An unclosed `((` stays arithmetic.
-function subshellDepths(segs, commented, seps = [], lastpipe = false) {
-  const closed = new Map();
-  const first = scanDepths(segs, commented, seps, lastpipe, new Set(), closed);
-  const fallback = new Set([...closed].filter(([, adjacent]) => !adjacent).map(([key]) => key));
-  return fallback.size ? scanDepths(segs, commented, seps, lastpipe, fallback, new Map()) : first;
-}
-function scanDepths(segs, commented, seps, lastpipe, fallback, closed) {
-  // { kind: sub | arith | tick | param | seg (a simple coproc command, to its segment end) | cobrace | brace |
-  //   case, sub: is a child shell, dq: the quoting it opened in, id: the `((` an inner arith frame belongs to }
-  const stack = [];
-  const open = { tick: 0, seg: 0, cobrace: 0, case: 0 };
-  let d = 0;
-  const push = (kind, sub, dq, id) => {
-    stack.push({ kind, sub, dq, id });
-    if (sub) d += 1;
-    if (kind in open) open[kind] += 1;
-  };
-  const pop = () => {
-    const top = stack.pop();
-    if (top.sub) d -= 1;
-    if (top.kind in open) open[top.kind] -= 1;
-    return top;
-  };
-  // pop down to and including the innermost frame of these kinds (the frames above it opened inside it)
-  const popTo = (kinds) => {
-    let dq = false;
-    while (stack.length) { const top = pop(); dq = top.dq; if (kinds.includes(top.kind)) break; }
-    return dq;
-  };
-  const outerStart = [];                                     // no frame open where the segment starts / ends
-  const outerEnd = [];
-  const depths = segs.map((seg, k) => {
-    const s = String(seg);
-    const out = new Array(s.length + 1).fill(d);
-    outerStart[k] = stack.length === 0;
-    if (commented[k]) { outerEnd[k] = stack.length === 0; return out; }
-    let dq = false;
-    let coBrace = -1;                                         // the offset of a `coproc [NAME] {`'s brace
-    // a reserved word's position: the start of a command (`{`, `}`, `case`, `esac` and `coproc` are words only
-    // there), or after one of `words` that itself starts a command (`echo time case` is no case). A chain longer
-    // than CMD_CHAIN words reads as no command start, which only leaves a frame unopened (depth 0).
-    const cmdStart = (i, words = CMD_WORDS, chain = 0) => {
-      let j = i - 1;
-      while (j >= 0 && (s[j] === ' ' || s[j] === '\t' || s[j] === '\n')) j -= 1;
-      if (j < 0 || ';&|(!'.includes(s[j])) return true;
-      if (chain >= CMD_CHAIN) return false;
-      const w = words.find((x) => j - x.length + 1 >= 0 && s.startsWith(x, j - x.length + 1)
-        && (j - x.length < 0 || /[\s;&|(]/.test(s[j - x.length])));
-      // `esac` after `in` only ever closes an open case frame; a `{` this scan opened is a command start
-      if (w === 'in' || (w === '{' && braceAt.has(j))) return true;
-      return w !== undefined && cmdStart(j - w.length + 1, CMD_WORDS, chain + 1);
-    };
-    const braceAt = new Set();                                // offsets of the `{` frames opened in this segment
-    // a `((` at offset i: two child shells where it falls back, else two arith frames (the inner one keyed)
-    const dparen = (i, dq) => {
-      const id = `${k}:${i}`;
-      if (fallback.has(id)) { push('sub', true, dq); push('sub', true, dq); } else { push('arith', false, dq); push('arith', false, dq, id); }
-    };
-    for (let i = 0; i < s.length; i++) {
-      out[i] = d;
-      const ch = s[i];
-      const top = stack.at(-1);
-      let skip = i;
-      if (ch === '\\') skip = i + 1;
-      else if (ch === '`') {
-        // a backtick substitution is a child shell; it may span segments (`X=\`D=/tmp; echo\``)
-        if (open.tick === 0) { push('tick', true, dq); dq = false; } else dq = popTo(['tick']);
-      } else if (ch === '$' && s[i + 1] === '{') {
-        // `${…}` is scanned, not skipped: its quotes, `$( … )` and backticks count, its `(`, `#` and words do not
-        push('param', false, dq);
-        dq = false;
-        skip = i + 1;
-      } else if (ch === '$' && s[i + 1] === '(') {
-        if (s[i + 2] === '(') { dparen(i + 1, dq); skip = i + 2; } else { push('sub', true, dq); skip = i + 1; }
-        dq = false;
-      } else if (dq) {
-        if (ch === '"') dq = false;
-      } else if (ch === '$' && s[i + 1] === "'") {
-        // `$'…'` (an escaped `\$'` never gets here: the backslash skipped it)
-        let j = i + 2;
-        while (j < s.length && s[j] !== "'") j += s[j] === '\\' ? 2 : 1;
-        skip = j;
-      } else if (top?.kind === 'param' && ch !== '"' && !(ch === "'" && !top.dq)) {
-        // inside `${…}` only the first bare `}` matters: bash does not nest a plain `{` there (`${X:-{}` is `{`),
-        // and a `'` is literal when the `${` was double-quoted
-        if (ch === '}') dq = pop().dq;
-      } else if (ch === '"') dq = true;
-      else if (ch === "'") skip = s.indexOf("'", i + 1) < 0 ? s.length : s.indexOf("'", i + 1);
-      else if (ch === '#' && (i === 0 || /[\s;&|()<>]/.test(s[i - 1]))) skip = s.length;
-      else if (ch === '(') {
-        const arith = top?.kind === 'arith';
-        if (!arith && s[i + 1] === '(') { dparen(i, dq); skip = i + 1; }
-        else push(arith ? 'arith' : 'sub', !arith, dq);
-      } else if (ch === ')') {
-        // a `)` right inside `case … esac` ends a pattern (`x) D=1;;`), not a subshell
-        while (stack.at(-1)?.kind === 'seg') pop();
-        if (stack.at(-1)?.kind === 'sub' || stack.at(-1)?.kind === 'arith') {
-          const f = pop();
-          dq = f.dq;
-          if (f.id !== undefined) closed.set(f.id, s[i + 1] === ')');
-        }
-      } else if (ch === 'c' && s.startsWith('case', i) && /\s/.test(s[i + 4] ?? '') && cmdStart(i)) {
-        push('case', false, dq);
-        skip = i + 3;
-      } else if (ch === 'e' && s.startsWith('esac', i) && /[\s;&|<>)]/.test(s[i + 4] ?? ' ')
-        && cmdStart(i, [...CMD_WORDS, 'in'])) {
-        if (open.case > 0) popTo(['case']);
-        skip = i + 3;
-      } else if (ch === 'c' && s.startsWith('coproc', i) && /\s/.test(s[i + 6] ?? '') && cmdStart(i)) {
-        // `coproc [NAME] { … }` runs its body in a child shell up to the matching `}`; `coproc ( … )` is a
-        // subshell already; `coproc cmd …` runs cmd in a child shell to the end of its segment
-        COPROC_HEAD.lastIndex = i;
-        const head = COPROC_HEAD.exec(s);
-        if (!head) push('seg', true, dq);
-        else if (head[1] === '{') coBrace = COPROC_HEAD.lastIndex - 1;
-        skip = i + 5;
-      } else if (ch === '{' && (i === coBrace || (open.cobrace > 0 && cmdStart(i))) && /\s/.test(s[i + 1] ?? ' ')) {
-        push(i === coBrace ? 'cobrace' : 'brace', i === coBrace, dq);
-        braceAt.add(i);
-      } else if (ch === '}' && open.cobrace > 0 && cmdStart(i) && /[\s;&|<>)]/.test(s[i + 1] ?? ' ')) {
-        popTo(['brace', 'cobrace']);
-      }
-      for (let j = i + 1; j <= Math.min(skip, s.length); j++) out[j] = d;
-      i = Math.max(i, Math.min(skip, s.length));
-    }
-    if (open.seg > 0) {
-      for (let f = stack.length - 1; f >= 0; f -= 1) {
-        if (stack[f].kind !== 'seg') continue;
-        if (stack[f].sub) d -= 1;
-        stack.splice(f, 1);
-      }
-      open.seg = 0;
-    }
-    out[s.length] = d;
-    outerEnd[k] = stack.length === 0;
-    return out;
-  });
-  // a pipeline element (`D=/tmp | true`, `true | read D`) and a background job (`D=/tmp &`) run in a child
-  // shell; with `lastpipe` the last pipeline element runs here. Only a separator with no frame open counts: a
-  // `|` inside `X=$(a | b)` or a `case` pattern (`a|b)`) leaves the segment as scanned, and one inside comment
-  // text is text. A segment with an unmatched `)` is never marked: in a pipeline element that is only a case
-  // pattern (`b) D=1` after `a|`, however the `case` was spelled) or the end of a subshell that already counts.
-  // An element that is a `{ … }` group spans its segments; any other brace in the group's segments, a frame or
-  // comment text there leaves the group as scanned.
-  const unmatchedClose = (k) => {
-    let n = 0;
-    for (const ch of String(segs[k])) if (ch === '(') n += 1; else if (ch === ')' && --n < 0) return true;
-    return false;
-  };
-  const leads = [];
-  const leading = (k) => {
-    if (leads[k]) return leads[k];
-    const t = String(segs[k]);
-    const opens = (t.match(/^\s*((?:\{\s+)+|\{$)/)?.[1].match(/\{/g) ?? []).length;
-    const closes = /^\s*\}(?:\s|$)/.test(t) ? 1 : 0;
-    const rest = t.replace(/^\s*(?:(?:\{\s+)+|\{$|\}(?=\s|$))/, '');
-    leads[k] = { opens, closes, clean: !/[{}]/.test(rest) && !commented[k] && outerStart[k] && outerEnd[k] };
-    return leads[k];
-  };
-  // the segments of the brace group that segment k closes (dir -1) or opens (dir 1), or null (also past
-  // GROUP_SPAN segments, which keeps many piped groups linear)
-  const group = (k, dir) => {
-    let n = 0;
-    for (let j = k; j >= 0 && j < segs.length && Math.abs(j - k) < GROUP_SPAN; j += dir) {
-      const g = leading(j);
-      if (!g.clean || (g.opens && g.closes)) return null;
-      n += dir < 0 ? g.closes - g.opens : g.opens - g.closes;
-      if (j === k && n <= 0) return null;
-      if (n === 0) return dir < 0 ? [j, k] : [k, j];
-      if (n < 0) return null;
-    }
-    return null;
-  };
-  const piped = new Array(segs.length).fill(false);
-  depths.forEach((_, k) => {
-    if (commented[k]) return;
-    const after = outerEnd[k] && !commented[k + 1] && (PIPE_SEP.test(seps[k] ?? '') || BG_SEP.test(seps[k] ?? ''));
-    const before = k > 0 && outerStart[k] && PIPE_SEP.test(seps[k - 1] ?? '') && !lastpipe;
-    if ((!after && !before) || unmatchedClose(k)) return;
-    piped[k] = true;
-    for (const [from, to] of [after && group(k, -1), before && group(k, 1)].filter(Boolean)) {
-      for (let j = from; j <= to; j += 1) piped[j] = true;
-    }
-  });
-  return depths.map((out, k) => (piped[k] ? out.map((x) => x + 1) : out));
-}
-
 // #5957 — the `cd` target is expanded quote-aware, so a home spelling (`~`, `~/x`, `$HOME`, `${HOME}`, the
 // double-quoted forms) lands on the SAME path as its absolute spelling and so reaches the same daemon-clone /
 // lane-lease guards. Quoting is kept until expansion is done: a quoted `~` and a single-quoted `$HOME` are
@@ -2810,8 +2451,7 @@ function expandCdTarget(rest, home) {
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
     if ((ch === '<' || ch === '>') && s[i + 1] === '(') return null;      // a process substitution's path
-    if (/[ \t\n]/.test(ch) || ch === '<' || ch === '>') break;             // first argument only
-    if (/\s/.test(ch)) return null;                  // bash keeps CR / NBSP / Unicode spaces IN the word
+    if (/\s/.test(ch) || ch === '<' || ch === '>') break;                  // first argument only
     if (ch === "'") {                                                      // single quotes: all literal
       const close = s.indexOf("'", i + 1);
       if (close < 0) return null;
@@ -2838,185 +2478,13 @@ function expandCdTarget(rest, home) {
     } else if (ch === '~' && i === 0) {                                    // only `~` / `~/…` — never `~user`, `~+`
       if (!/^(?:\/|$|\s|[<>])/.test(s.slice(1)) || !home) return null;
       out += home;
-    } else if (ch === '`' || ch === '*' || ch === '?' || ch === '[' || ch === '{') {  // glob / brace expansion
+    } else if (ch === '`' || ch === '*' || ch === '?' || ch === '[') {
       return null;
     } else {
       out += ch;
     }
   }
   return out || null;
-}
-
-// #5957 (review r11) — the names a statement binds, read word by word as bash reads them, so argument text
-// (`echo D=5`, `git commit -m "fix for D"`, `${X:-D=5}`) binds nothing. A binding is: a leading run of `NAME=`
-// / `NAME+=` / `NAME[…]=` words with no command word after it (`A=1 D=/x true` binds only for `true`), a
-// declaration builtin's `NAME=` operand (and `local`'s bare names), the names among a binding builtin's
-// operands (`read -r D`, `for D in`, `printf -v D`, `unset D`, `mapfile D`, `getopts o D`), and a `NAME=` /
-// `NAME++` inside arithmetic (`((…))`, `$((…))`, `$[…]`, `let`, a subscript). `${D:=x}` binds nothing a known
-// (non-empty) value would lose. Options after `time` / `command` / `builtin` keep command position, and a
-// function body (`f() { D=1; }`) binds nothing until called. An opaque command (`eval`, `source`, `.`, a
-// `trap … DEBUG|ERR|RETURN` that runs before later commands) lands in `any`: it may bind any name, even names
-// the text never shows. A command word only known at run time (`$X`, `` `…` ``) may be `eval`, so its `NAME=`
-// operands bind. Offsets are into `text`; the caller drops the ones inside a child shell. One linear pass.
-const DECLARATION_BUILTINS = new Set(['declare', 'typeset', 'export', 'readonly', 'local']);
-// builtins that bind the names among their operands, with the option letters that take an argument
-const OPERAND_BUILTINS = new Map([['read', 'pdutnNi'], ['mapfile', 'dnOsuCc'], ['readarray', 'dnOsuCc'], ['unset', ''], ['getopts', '']]);
-const OPAQUE_BUILTINS = new Set(['eval', 'source', '.']);
-// words after which the next word is still in command position (after the OPTION_LEADS, its options too)
-const LEAD_WORDS = new Set(['if', 'then', 'else', 'elif', 'while', 'until', 'do', 'time', '!', 'command', 'builtin', 'coproc', 'function']);
-const OPTION_LEADS = new Set(['time', 'command', 'builtin']);
-const ARITH_SITE = /([A-Za-z_]\w*)[ \t]*(?:\+\+|--|(?:<<|>>|[-+*/%&|^])?=(?!=))|(?:\+\+|--)[ \t]*([A-Za-z_]\w*)/y;
-const ASSIGN_WORD = /^([A-Za-z_]\w*)(?:\[([^\]]*)\])?\+?=/;
-const NAME_WORD = /^([A-Za-z_]\w*)(?:\[|$)/;
-function boundNames(text) {
-  const s = String(text);
-  const sites = [];
-  const any = [];
-  const stack = [];                   // dq | tick | sub | param | arith | arithb (`$[…]`, a `${…}` subscript)
-  let mode = 'cmd';                   // cmd | decl | operands | loop | printf | printfv | let | arg
-  let pending = [];                   // leading assignments: bound only when no command word follows
-  let target = false;                 // the next word is a redirection target
-  let start = -1;                     // where the current top-level word began
-  let opts = '';                      // operands mode: the option letters that take an argument
-  let skip = false;                   // operands mode: this word is an option's argument
-  let bare = false;                   // decl mode: a bare name binds too (`local D`)
-  let afterLead = '';                 // the lead word just read (`time`, `command`, `function`, …)
-  let fnDef = false;                  // a function name was just read: its `{` body binds nothing
-  let getoptsArgs = [];
-  let trapAt = -1;
-  let trapArgs = 0;
-  let stop = false;
-  const site = (re, i) => {
-    if (/[\w$]/.test(s[i - 1] ?? ' ')) return;
-    re.lastIndex = i;
-    const m = re.exec(s);
-    if (m) sites.push({ name: m[1] ?? m[2], at: i });
-  };
-  const opener = (i) => {             // a `$…` / backtick opener at i: the last offset it consumed
-    if (s[i] === '`') { stack.push('tick'); return i; }
-    const n = s[i + 1];
-    if (n === '(' && s[i + 2] === '(') { stack.push('arith', 'arith'); return i + 2; }
-    if (n === '(') { stack.push('sub'); return i + 1; }
-    if (n === '{') { stack.push('param'); return i + 1; }
-    if (n === '[') { stack.push('arithb'); return i + 1; }
-    return i;
-  };
-  const single = (i) => { const j = s.indexOf("'", i + 1); return j < 0 ? s.length : j; };
-  const ansi = (i) => { let j = i + 2; while (j < s.length && s[j] !== "'") j += s[j] === '\\' ? 2 : 1; return j; };
-  const endCommand = () => {
-    for (const p of pending) sites.push(p);
-    pending = []; mode = 'cmd'; target = false; skip = false; afterLead = ''; fnDef = false; getoptsArgs = []; trapArgs = 0;
-  };
-  const commandWord = (raw, word, at) => {
-    pending = [];
-    mode = 'arg';
-    if (OPAQUE_BUILTINS.has(word)) any.push({ at });
-    else if (word === 'trap') { mode = 'trap'; trapAt = at; }
-    else if (/^"?(?:\$(?!')|`)/.test(raw)) mode = 'dynamic';  // may be `eval`: its `NAME=` operands may bind
-    else if (DECLARATION_BUILTINS.has(word)) { mode = 'decl'; bare = word === 'local'; }
-    else if (word === 'getopts') mode = 'getopts';
-    else if (OPERAND_BUILTINS.has(word)) { mode = 'operands'; opts = OPERAND_BUILTINS.get(word); }
-    else if (word === 'for' || word === 'select') mode = 'loop';
-    else if (word === 'printf' || word === 'let') mode = word;
-  };
-  const finish = (end) => {
-    if (start < 0) return;
-    const at = start;
-    const raw = s.slice(at, end);
-    start = -1;
-    if (target) { target = false; return; }
-    const lead = afterLead;
-    afterLead = '';
-    if (raw === '{' || raw === '}') { stop = raw === '{' && fnDef; mode = 'cmd'; fnDef = false; return; }
-    fnDef = false;
-    const a = raw.match(ASSIGN_WORD);
-    const word = raw.replace(/^\$'(.*)'$/s, '$1').replace(/['"\\]/g, '');
-    const name = word.match(NAME_WORD)?.[1];
-    const subscript = () => {
-      if (a?.[2] !== undefined) for (let j = at + a[1].length + 1; j < at + a[1].length + 1 + a[2].length; j++) site(ARITH_SITE, j);
-    };
-    if (mode === 'cmd') {
-      if (lead === 'function' || /^[A-Za-z_][\w-]*\(\)$/.test(raw)) { fnDef = true; return; }
-      if (a) { subscript(); pending.push({ name: a[1], at }); return; }
-      if (OPTION_LEADS.has(lead) && raw.startsWith('-')) { afterLead = lead; return; }
-      if (LEAD_WORDS.has(raw)) { afterLead = raw; return; }
-      commandWord(raw, word, at);
-    } else if (mode === 'decl') {
-      if (a) { subscript(); sites.push({ name: a[1], at }); } else if (bare && name) sites.push({ name, at });
-    } else if (mode === 'operands') {
-      if (skip) skip = false;
-      else if (word === '-f' && !opts) mode = 'arg';              // `unset -f D` unsets a function
-      else if (word.startsWith('-')) skip = opts.includes(word.at(-1));
-      else if (name) sites.push({ name, at });
-    } else if (mode === 'getopts') {
-      if (!word.startsWith('-')) getoptsArgs.push({ name, at });
-      if (getoptsArgs.length === 2 && getoptsArgs[1].name) sites.push(getoptsArgs[1]);   // `getopts optstring NAME`
-    } else if (mode === 'trap') {
-      // the action, then its signals: one that may fire before a later command (any case, any `SIG` prefix,
-      // or one only known at run time) may bind anything; `EXIT` fires only at the end
-      if (trapArgs++ > 0 && (/^(?:SIG)?(?:DEBUG|ERR|RETURN)$/i.test(word) || /[$`]/.test(raw))) { any.push({ at: trapAt }); mode = 'arg'; }
-    } else if (mode === 'dynamic') {
-      const q = word.match(ASSIGN_WORD);                        // `$X "D=/x"` binds as `eval D=/x` would
-      if (q) sites.push({ name: q[1], at });
-    } else if (mode === 'loop') {
-      if (name) sites.push({ name, at });
-      mode = 'arg';
-    } else if (mode === 'printf') mode = word === '-v' ? 'printfv' : 'arg';
-    else if (mode === 'printfv') {
-      if (name) sites.push({ name, at });
-      mode = 'arg';
-    } else if (mode === 'let') for (let j = at; j < end; j++) site(ARITH_SITE, j);
-  };
-  for (let i = 0; i < s.length && !stop; i++) {
-    const ch = s[i];
-    const top = stack.at(-1);
-    if (top === 'tick') { if (ch === '\\') i += 1; else if (ch === '`') stack.pop(); continue; }
-    if (top === 'dq') {
-      if (ch === '\\') i += 1;
-      else if (ch === '"') stack.pop();
-      else if (ch === '$' || ch === '`') i = opener(i);
-      continue;
-    }
-    if (top) {
-      if (ch === '\\') i += 1;
-      else if (ch === "'") i = single(i);
-      else if (ch === '"') stack.push('dq');
-      else if ((ch === '$' && '({['.includes(s[i + 1] ?? ' ')) || ch === '`') i = opener(i);
-      else if (top === 'param') { if (ch === '}') stack.pop(); else if (ch === '[') stack.push('arithb'); }
-      else if (top === 'arithb') { if (ch === ']') stack.pop(); else if (ch === '[') stack.push('arithb'); else site(ARITH_SITE, i); }
-      else if (ch === '(') stack.push(top);
-      else if (ch === ')') stack.pop();
-      else if (top === 'arith') site(ARITH_SITE, i);
-      continue;
-    }
-    if (ch === ' ' || ch === '\t') { finish(i); continue; }
-    // a redirection (`>f`, `2>&1`, `&>f`): the next word is its target, not a command word
-    if ((ch === '<' || ch === '>' || (ch === '&' && s[i + 1] === '>')) && s[i + 1] !== '(') {
-      if (start >= 0 && /^\d+$/.test(s.slice(start, i))) start = -1;   // an fd number (`2>f`)
-      else finish(i);
-      while ('<>&|'.includes(s[i + 1] ?? ' ') && s[i + 2] !== '(') i += 1;
-      target = true;
-      continue;
-    }
-    if (ch === '\n' || ch === ';' || ch === '&' || ch === '|') { finish(i); endCommand(); continue; }
-    if (ch === ')') { finish(i); endCommand(); continue; }
-    if (ch === '(' && start < 0) {
-      endCommand();
-      if (s[i + 1] === '(') { stack.push('arith', 'arith'); i += 1; }
-      continue;
-    }
-    if (ch === '#' && start < 0) break;                          // a comment
-    if (start < 0) start = i;
-    if (ch === '\\') i += 1;
-    else if (ch === "'") i = single(i);
-    else if (ch === '$' && s[i + 1] === "'") i = ansi(i);
-    else if (ch === '"') stack.push('dq');
-    else if (ch === '$' || ch === '`') i = opener(i);
-    else if (ch === '(' || ch === '<' || ch === '>') { stack.push('sub'); if (ch !== '(') i += 1; }  // `a=(…)`, `<(…)`
-  }
-  if (!stop) finish(s.length);
-  endCommand();
-  return { sites, any };
 }
 
 // #2335 — the harness resets the reported Bash cwd to the PRIMARY checkout between tool calls, so the
@@ -3031,298 +2499,50 @@ function boundNames(text) {
 // The fix is to invoke with a directly-resolvable `cd` (a literal absolute path, or `LANE=/abs; cd "$LANE"` —
 // the standard lane idiom every skill already teaches), not to reach for a removed override.
 export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve, home = process.env.HOME ?? null) {
-  return analyzeCwd(command, reportedCwd, resolvePath, home, null).cwd;
-}
-
-// #5957 (review r11) — every OTHER directory the command's commands may run in: a `cd` inside a child shell
-// (`( … )`, the two subshells a `((…) )` falls back to, `$( … )`, backticks), behind a grouping or compound
-// word (`{ cd`, `if cd`, `! cd`), or in a re-executed string (`eval "cd …"`, `bash -c "cd …"`). The effective
-// cwd above keeps main's single answer; this set only ever ADDS directories a daemon-clone write is checked
-// against, so it over-approximates on purpose (`(cd <clone>; ls); git commit` is refused too).
-export function resolveCdLandings(command, reportedCwd, resolvePath = resolve, home = process.env.HOME ?? null) {
-  return resolveCwdAndLandings(command, reportedCwd, resolvePath, home).landings;
-}
-// both in one walk (the hook's call); a fault in the landing walk keeps the effective cwd and no landings
-const NESTED_CWD_BYTES = 1 << 16;
-const CHILD_HOME_DEPTHS = 8;
-export function resolveCwdAndLandings(command, reportedCwd, resolvePath = resolve, home = process.env.HOME ?? null) {
-  try {
-    const r = analyzeCwd(command, reportedCwd, resolvePath, home, { left: { n: NESTED_NODE_CAP, bytes: NESTED_CWD_BYTES }, depth: 0 });
-    return { cwd: r.cwd, landings: [...new Set(r.landings)] };
-  } catch {
-    return { cwd: resolveEffectiveCwd(command, reportedCwd, resolvePath, home), landings: [] };
-  }
-}
-
-// `nest` (null: the effective cwd only) carries the shared budget (`left.n` analyses, `left.bytes` of input)
-// and depth of the re-executed-string walk
-function analyzeCwd(command, reportedCwd, resolvePath, home, nest) {
   // r3 audit — a heredoc BODY is data. A `cd /elsewhere` line (or an apostrophe that desyncs the quote
   // scanner) inside a PR-body heredoc must not steer, or break, the cwd resolution; `decide` already strips
   // them before it parses, and this must agree with it. An unparseable command keeps the REPORTED cwd, which
   // is the conservative answer (the primary-cwd arms stay armed) — and `decide` denies it outright anyway.
   const cmd = stripHeredocBodies(String(command || ''));
-  if (!cmd) return { cwd: reportedCwd, landings: [] };
+  if (!cmd) return reportedCwd;
   const parsed = parseSegments(cmd);
-  if (parsed.unterminated) return { cwd: reportedCwd, landings: [] };
-  // bash splits words on space, tab and newline only; trim() and \s also drop CR, NBSP and other Unicode
-  // spaces, which bash keeps inside the word (an NBSP before `cd` makes it no cd, `D=~/x\r` keeps the CR).
-  const oddSpace = (s) => /[^\S \t\n]/.test(s);
-  // A home-derived value is trusted only from a statement that surely runs in THIS shell: nothing but `;` /
-  // newline before it, and no pipe or `&` after it (`a && D=~/x`, `D=~/x | true`, `HOME=/a & …` may not).
-  // bash lets blank and comment-only lines follow `&&` / `||` / `|`, so the walk back looks through them (a
-  // comment's own `;` / `&&` pieces included). And after any compound or grouping word (`if`, `then`, `do`,
-  // `{`, `(`, a function), whether a later line runs depends on structure the walk does not model: not plain.
-  const { segments: segs, separators: seps, commented } = parsed;
-  const blank = (k) => commented[k] || /^[ \t]*(?:#.*)?$/.test(segs[k]);
-  const compound = (k) => !blank(k) && (
-    /^\s*(?:if|then|else|elif|fi|do|done|while|until|for|case|esac|select|function|coproc|!)(?:\s|$)/.test(segs[k])
-    || /[(){}]/.test(segs[k].replace(/\$\{[A-Za-z_]\w*\}/g, '')));
-  const plain = (at) => {
-    for (let k = 0; k < at; k++) if (compound(k)) return false;
-    for (let k = at - 1; k >= 0; k--) {
-      if (!commented[k + 1] && !/^[;\n]+$/.test(seps[k])) return false;  // a separator inside a comment is text
-      if (!blank(k)) break;
-    }
-    return /^(?:[;\n]*|&&\n*|\|\|\n*)$/.test(seps[at]);
-  };
-  // A literal `HOME=…` statement sets the home later spellings expand against (unknown when unexpandable,
-  // conditional, followed by a command word — `HOME=/a true` binds it for `true` only — or glob-shaped).
-  const usableHome = (h) => (typeof h === 'string' && h.startsWith('/') && !/[*?[]/.test(h) ? h : null);
-  const initialHome = usableHome(home);
-  // the child-shell depth where a statement starts: an assignment there never reaches this shell (review r10)
-  // `lastpipe` may run the last pipeline element here: any `shopt` / `lastpipe` / `BASH_ENV` spelling, however
-  // quoted, or an `eval` / `source` / `.` that could set it unseen, keeps that element as scanned
-  const lastpipe = /shopt|lastpipe|BASH_ENV|\beval\b|\bsource\b|(?:^|[\s;&|(])\.\s/.test(cmd.replace(/['"\\]/g, ''));
-  const depths = subshellDepths(segs, commented, seps, lastpipe);
-  const inChild = (at) => depths[at][String(segs[at]).search(/\S|$/)] > 0;
-  const homeAfter = (stmt, h, at) => {
-    if (commented[at] || inChild(at)) return h;               // comment text (`true # ; HOME=/x`) binds nothing
-    const assignment = stmt.trim().match(/^(?:export\s+)?HOME=(.*)$/);
-    if (!assignment) {
-      // a HOME binding the plain reading below cannot follow (`HOME+=/x`, `{ HOME=/x; }`, `read HOME`, an
-      // `eval` / `source` that may set it unseen) leaves home unknown (review r11)
-      const b = rebound(at);
-      return b.opaque || b.names.includes('HOME') ? null : h;
-    }
-    const val = assignment[1].trim();
-    if (oddSpace(stmt) || /[ \t]/.test(val) || !plain(at)) return null;
-    return usableHome(expandCdTarget(val, h));
-  };
+  if (parsed.unterminated) return reportedCwd;
   // Collect simple literal `VAR=value` / `export VAR=value` assignments (no command-subst/globs) in order.
   const vars = Object.create(null);
-  // #5957 — every literal-shaped assignment in order, so a cd of a name with a home-derived assignment reads
-  // the value it had THEN (other names keep the base's last-value reading)
-  const history = Object.create(null);
-  const homeNames = new Set();
-  const childVals = Object.create(null);                      // a child shell's expandable assignments
-  // a child shell's HOME assignments, by child-shell depth: depth → [{ at, home }] in segment order
-  const childHomes = new Map();
-  const homeDepths = [];                                      // the depths that have one, ascending
-  // how many entries of the ascending `list` have a key below `at`, and the last of them: binary searches, so a
-  // cd costs no rescan
-  const countBelow = (list, at, key) => {
-    let lo = 0;
-    let hi = list.length;
-    while (lo < hi) { const mid = (lo + hi) >> 1; if (key(list[mid]) < at) lo = mid + 1; else hi = mid; }
-    return lo;
-  };
-  const lastBefore = (list, at, key) => list[countBelow(list, at, key) - 1];
-  let assignHome = initialHome;
-  const record = (name, at, value) => {
-    if (value === undefined) delete vars[name];
-    else vars[name] = value;
-    (history[name] ??= []).push({ at, value });
-  };
-  // Names a statement binds in a form the literal walk does not read (`{ D=/x; }`, `then D=/x`, `A=1 D=/x`,
-  // `D+=x`, `D[0]=x`, `declare D=/x`, `read D`, `for D in …`): a home-derived name learns it changed there.
-  // A bare `export D` / `readonly D` keeps the value, so declaration words count only through `D=`; argument
-  // text (`echo D=5`) binds nothing (boundNames). A binding inside a child shell (`( D=/tmp )`, `X=$(D=/tmp)`)
-  // leaves the parent's value alone; an opaque command word in this shell (`eval "$(…)"`, `$X`) still counts
-  // every name the statement mentions. `lead` is the offset of the statement's leading `NAME=` word, which the walk reads
-  // itself: `leadBound` says whether bash binds it (no command word follows it).
-  const scanned = [];
-  const rebound = (at, lead = -1) => {
-    const here = (i) => depths[at][i] === 0;
-    const b = (scanned[at] ??= boundNames(segs[at]));
-    const builtins = b.any.filter((w) => here(w.at));
-    const sites = b.sites.filter((x) => here(x.at));
-    return {
-      names: builtins.length ? (segs[at].match(/[A-Za-z_]\w*/g) ?? []) : sites.filter((x) => x.at !== lead).map((x) => x.name),
-      opaque: builtins.length > 0,
-      leadBound: sites.some((x) => x.at === lead),
-    };
-  };
-  parsed.segments.forEach((stmt, at) => {
-    if (commented[at]) {
-      // comment text binds nothing in bash; main still read a literal there, so keep that for ordinary names
-      const c = stmt.trim().match(/^(?:export\s+)?([A-Za-z_]\w*)=(\S+)$/);
-      if (c && !/[`$(~]/.test(c[2])) vars[c[1]] = c[2].replace(/^(['"])(.*)\1$/, '$2');
-      return;
-    }
-    // a child shell's assignment (`( D=~/c; cd "$D" … )`), which a cd in that same child shell reads: kept for
-    // the landings only
-    const ca = stmt.match(/^([\s(]*)(?:export\s+)?([A-Za-z_]\w*)=(\S+)/);
-    if (ca && depths[at][ca[1].length] > 0) {
-      const expanded = expandCdTarget(ca[3].replace(/\)+$/, ''), assignHome);
-      if (expanded) childVals[ca[2]] = expanded;
-      const depth = depths[at][ca[1].length];
-      if (ca[2] === 'HOME' && usableHome(expanded)) {
-        if (!childHomes.has(depth)) {
-          childHomes.set(depth, []);
-          homeDepths.splice(countBelow(homeDepths, depth, (d) => d), 0, depth);
-        }
-        childHomes.get(depth).push({ at, home: expanded });
-      }
-    }
+  for (const stmt of parsed.segments) {
     const m = stmt.trim().match(/^(?:export\s+)?([A-Za-z_]\w*)=(.+)$/);
-    if (m && inChild(at)) {
-      // a child shell's assignment (`( true; D=/tmp )`): main's literal reading for ordinary names; it never
-      // enters `history`, so a home-derived name keeps the value the parent gave it, and a home-spelled value
-      // (`D=~/x | true`) changes nothing
-      const literal = m[2].trim().replace(/^(['"])(.*)\1$/, '$2');
-      if (!/[`$(~]/.test(m[2]) && !/\s/.test(literal)) vars[m[1]] = literal;
-      return;
-    }
-    const b = rebound(at, m ? stmt.indexOf(`${m[1]}=`) : -1);
-    for (const name of b.names) (history[name] ??= []).push({ at, value: undefined });
-    // `coproc NAME { … }` binds NAME (to the coprocess's file descriptors) in this shell
-    const co = !inChild(at) && stmt.match(/^\s*coproc[ \t]+([A-Za-z_]\w*)[ \t]+[{(]/);
-    if (co) (history[co[1]] ??= []).push({ at, value: undefined });
-    // a leading assignment with a command word after it (`D=/x true`) binds only for that command: main
-    // skipped it as multi-word, and it changes nothing here either
-    if (m && b.leadBound) {
-      const val = m[2].trim();
-      const literal = val.replace(/^(['"])(.*)\1$/, '$2');    // strip matching surrounding quotes
-      // main skips a substitution / multi-word value; a home-derived name still learns that it changed
-      const unknown = () => (history[m[1]] ??= []).push({ at, value: undefined });
-      if (val.startsWith('~') || /\$(?:HOME(?!\w)|\{HOME\})/.test(val)) {
-        // bash expands an unquoted leading `~` and `$HOME` / `${HOME}` in an assignment value (`D=~/clone`,
-        // `D="$HOME/clone"`), against the home known at that statement. Anything it cannot expand exactly
-        // (`~user`, a `:~`, another variable, whitespace, an unknown home, a conditional statement) is unknown
-        // — except where main skipped the statement (a `$` / backtick / `(` value): then it changes nothing,
-        // so an earlier literal still resolves as it did there (review r8).
-        const expanded = oddSpace(stmt) || /\s|:~|[<>]/.test(val) || !plain(at) ? null : expandCdTarget(val, assignHome);
-        const value = expanded && !/\s/.test(expanded) ? expanded : undefined;
-        if (value !== undefined || !/[`$(]/.test(val)) {
-          homeNames.add(m[1]);
-          record(m[1], at, value);
-        } else unknown();
-      } else if (!/[`$(]/.test(val) && !/\s/.test(literal)) {
-        record(m[1], at, literal);                            // single-token literal only
-      } else unknown();
-    }
-    assignHome = homeAfter(stmt, assignHome, at);
-  });
+    if (!m) continue;
+    let val = m[2].trim();
+    if (/[`$(]/.test(val)) continue;                          // command-subst / nested expansion → skip
+    val = val.replace(/^(['"])(.*)\1$/, '$2');                // strip matching surrounding quotes
+    if (!/\s/.test(val)) vars[m[1]] = val;                    // single-token literal only
+  }
   // First `cd <target>` statement wins (that is where the command lands before the mutation runs).
   // Only HOME gains expansion semantics here. Keep the base's literal-variable collection above:
   // declarations without values and assignments inside subshells must not erase a known parent value.
-  let currentHome = initialHome;
-  const homeSpelled = (raw) => /^(?:~|\$HOME(?:\W|$)|\$\{HOME\}|"\$(?:HOME(?:\W|$)|\{HOME\}))/.test(raw);
-  const usable = (target, quoted) => target && !/[`$(*?]/.test(target) && (quoted || !target.includes('['));
-  const absolute = (target) => (target.startsWith('/') ? target : resolvePath(reportedCwd || '.', target));
-  // the directory a `cd` in segment `at` lands in, or null when unresolved; `raw` is its trimmed operand text
-  // and `rest` the operand as bash splits it after the cd word (null when bash would not split it there)
-  const cdTarget = (at, raw, rest) => {
-    // Expand only home spellings; ordinary targets keep the base resolver's interpretation.
-    if (homeSpelled(raw)) {
-      if (rest === null) return null;
-      const target = expandCdTarget(rest, currentHome);
-      if (target) return absolute(target);
-      // never answer less than main: with HOME unknown, a whole-target `$HOME` still resolves through the
-      // literal-variable map as it did there
-      if (currentHome !== null || !/^"?\$(?:HOME|\{HOME\})"?(?:\s|$)/.test(raw) || vars.HOME === undefined) return null;
+  let currentHome = typeof home === 'string' && home.startsWith('/') ? home : null;
+  for (const stmt of parsed.segments) {
+    const assignment = stmt.trim().match(/^(?:export\s+)?HOME=(.*)$/);
+    if (assignment) {
+      const value = expandCdTarget(assignment[1].trim(), currentHome);
+      currentHome = value?.startsWith('/') ? value : null;
     }
-    const word = raw.split(/\s+/)[0];                         // first arg only (ignore trailing redirs/opts)
-    const quoted = /^'[^']*'$|^"[^"]*"$/.test(word);          // one quoted run, nothing glued on
-    let target = word.replace(/^(['"])(.*)\1$/, '$2');        // strip surrounding quotes
-    // whole target is $VAR / ${VAR} — never inside single quotes, where `$D` is literal text
-    const v = word.startsWith("'") ? null : target.match(/^\$\{?([A-Za-z_]\w*)\}?$/);
-    if (v && homeNames.has(v[1])) {
-      // a home-derived name: the value assigned last BEFORE this cd, in a cd word bash reads as one word
-      const before = lastBefore(history[v[1]], at, (e) => e.at);
-      if (!before || rest === null || oddSpace(rest.match(/^[^ \t\n]*/)[0])) return null;
-      target = before.value ?? '';
-    } else if (v) target = vars[v[1]] ?? '';
-    // still unexpanded / globby → fail safe; a `[` is a glob only outside quotes
-    return usable(target, quoted) ? absolute(target) : null;
-  };
-  // the landings of segment `at` (resolveCdLandings): any cd the segment starts with — behind openers (`(cd`,
-  // `((cd`, `{ cd`, `if cd`, `command cd`, …), spelled `\cd` / `"cd"` / `pushd`, after options (`-P`, `--`), or
-  // a later top-level one — read against what the walk knows here; plus the first cd of each re-executed string
-  // in it, read after this command's last plain assignment of each name it mentions. A name or HOME a child
-  // shell may have set also lands on that reading.
-  const CD_ANYWHERE = /^[ \t\n]*(?:(?:\(|(?:\{|!|if|then|else|elif|while|until|do|time|command|builtin)[ \t\n])[ \t\n]*)*(?:\\?cd|"cd"|'cd'|pushd)[ \t]+([^]*)$/;
-  let assignAt = null;                                        // name → the plain top-level segments assigning it
-  const prefixFor = (at, text) => {
-    if (!assignAt) {
-      assignAt = new Map();
-      segs.forEach((s, k) => {
-        const a = !commented[k] && !inChild(k) && s.match(/^\s*(?:export\s+)?([A-Za-z_]\w*)=/);
-        if (a) (assignAt.get(a[1]) ?? assignAt.set(a[1], []).get(a[1])).push(k);
-      });
-    }
-    const last = (name) => lastBefore(assignAt.get(name) ?? [], at, (k) => k);
-    const ks = new Set();
-    for (const [, name] of text.matchAll(/\$\{?([A-Za-z_]\w*)/g)) if (last(name) !== undefined) ks.add(last(name));
-    if (/~|\$\{?HOME\b/.test(text) || [...ks].some((k) => /~|\$\{?HOME\b/.test(segs[k]))) {
-      if (last('HOME') !== undefined) ks.add(last('HOME'));
-    }
-    return [...ks].sort((x, y) => x - y).map((k) => segs[k]).join('\n');
-  };
-  const landingsOf = (at) => {
-    const out = [];
-    const found = segs[at].match(CD_ANYWHERE);
-    if (found) {
-      const cut = maskQuoted(found[1]).search(/[)`]/);       // `(cd /P)`: the operand ends at an unquoted `)`
-      const rest = (cut < 0 ? found[1] : found[1].slice(0, cut)).replace(/^(?:-[LPe@]+[ \t]+)*(?:--[ \t]+)?/, '');
-      const raw = rest.trim();
-      const target = cdTarget(at, raw, rest);
-      if (target) out.push(target);
-      const v = raw.split(/\s+/)[0].replace(/^"(.*)"$/, '$1').match(/^\$\{?([A-Za-z_]\w*)\}?$/);
-      for (const alt of v ? [vars[v[1]], childVals[v[1]]] : []) if (usable(alt, false)) out.push(absolute(alt));
-      // the HOME a child shell enclosing this cd may have given itself: the latest one before it at each of the
-      // nearest CHILD_HOME_DEPTHS depths up to one below the cd's own (a pipeline element's first segment reads
-      // one level deeper than the rest of its group; an extra reading only adds a landing)
-      if (homeSpelled(raw)) {
-        const own = depths[at][segs[at].length - found[1].length];
-        const upTo = countBelow(homeDepths, own + 2, (d) => d);
-        const near = homeDepths.slice(Math.max(0, upTo - CHILD_HOME_DEPTHS), upTo);
-        for (const d of near) {
-          const child = lastBefore(childHomes.get(d), at + 1, (h) => h.at);
-          const t = child && expandCdTarget(rest, child.home);
-          if (t) out.push(absolute(t));
-        }
-      }
-    }
-    for (const text of nestedCommandStrings(segs[at])) {
-      if (nest.left.n <= 0 || nest.depth >= NESTED_DEPTH_CAP || !/(?:cd|pushd)\W/.test(text)) continue;
-      const input = `${prefixFor(at, text)}\n${text}`;
-      if (input.length > nest.left.bytes) continue;
-      nest.left.n -= 1;
-      nest.left.bytes -= input.length;
-      const inner = analyzeCwd(input, reportedCwd, resolvePath, home, { left: nest.left, depth: nest.depth + 1 });
-      if (inner.cwd !== reportedCwd) out.push(inner.cwd);
-      for (const l of inner.landings) out.push(l);
-    }
-    return out;
-  };
-  let cwd;
-  const landings = new Set();
-  for (const [at, stmt] of segs.entries()) {
-    currentHome = homeAfter(stmt, currentHome, at);
-    if (nest && !commented[at]) for (const l of landingsOf(at)) landings.add(l);
-    if (cwd !== undefined) continue;
     const cd = stmt.trim().match(/^cd\s+(.+)$/);
     if (!cd) continue;
-    const bashCd = stmt.match(/^[ \t\n]*cd[ \t]+([^]*)$/);   // the cd word and its operand, as bash splits them
+    // Expand only home spellings; ordinary targets keep the base resolver's interpretation.
     const raw = cd[1].trim();
-    // a `cd` inside comment text (`true # ; cd ~/x`) never runs; a home-spelled one is not this PR's to resolve
-    if (commented[at] && (homeSpelled(raw) || homeNames.has(raw.match(/^"?\$\{?([A-Za-z_]\w*)/)?.[1]))) continue;
-    cwd = cdTarget(at, raw, bashCd ? bashCd[1] : null) ?? reportedCwd;
-    if (!nest) break;
+    if (/^(?:~|\$HOME(?:\W|$)|\$\{HOME\}|"\$(?:HOME(?:\W|$)|\{HOME\}))/.test(raw)) {
+      const target = expandCdTarget(raw, currentHome);
+      return target ? (target.startsWith('/') ? target : resolvePath(reportedCwd || '.', target)) : reportedCwd;
+    }
+    let target = cd[1].trim().split(/\s+/)[0];                // first arg only (ignore trailing redirs/opts)
+    target = target.replace(/^(['"])(.*)\1$/, '$2');          // strip surrounding quotes
+    const v = target.match(/^\$\{?([A-Za-z_]\w*)\}?$/);       // whole target is $VAR / ${VAR}
+    if (v) target = vars[v[1]] ?? '';
+    if (!target || /[`$(*?\[]/.test(target)) return reportedCwd; // still unexpanded / globby → fail safe
+    return target.startsWith('/') ? target : resolvePath(reportedCwd || '.', target);
   }
-  return { cwd: cwd ?? reportedCwd, landings };
+  return reportedCwd;
 }
 
 // ── #2968 — `git add` of an ENUMERATED path set, matched by EFFECT not flag spelling ──────────────────────
@@ -4154,7 +3374,7 @@ function globMatch(tokens, s) {
   return t === tokens.length;
 }
 
-export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLiveLease = false, markedLeaseSlug = null, contestedHolderSlug = null, dispatchKind = null, cwd = null, landingCwds = [], daemonCloneRoots = [], fixClaimedBranches = [], pushTargets = [], fixPushes = [] } = {}) {
+export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLiveLease = false, markedLeaseSlug = null, contestedHolderSlug = null, dispatchKind = null, cwd = null, daemonCloneRoots = [], fixClaimedBranches = [], pushTargets = [], fixPushes = [] } = {}) {
   const s = segment.trim();
   if (!s) return null;
 
@@ -4166,11 +3386,7 @@ export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLi
   // #xpt9fvd — a write targeting a DAEMON CLONE. Checked early and unconditionally (independent of
   // `primaryCwd`/lease context — a daemon clone is neither a primary checkout nor an ordinary leased lane):
   // see `daemonCloneWriteReason`'s own doc for the two shapes it catches and the one it deliberately does not.
-  // #5957 (review r11) — and against every other directory a `cd` in the command may land a command in
-  // (`resolveCdLandings`: a child shell, a group, a re-executed string), with a compound word peeled off the
-  // segment (`then git checkout …`, `do rm …`) so the command it starts is still seen
-  const bare = s.replace(/^(?:(?:then|do|else|elif|if|while|until|time(?:[ \t]+-p)?|!|\{)[ \t\n]+)+/, '');
-  const daemonWrite = [cwd, ...landingCwds].reduce((r, dir) => r ?? daemonCloneWriteReason(bare, { cwd: dir, roots: daemonCloneRoots }), null);
+  const daemonWrite = daemonCloneWriteReason(s, { cwd, roots: daemonCloneRoots });
   if (daemonWrite) return daemonWrite;
 
   // xpnhz4o — a bare full-suite run. Before the raw-heavy arm so a bare `vitest run` gets THIS message (which
@@ -4687,6 +3903,7 @@ export function stripHeredocBodies(command) {
 export function heredocScan(command) {
   const text = String(command || '');
   if (!text.includes('<<')) return { text, unterminated: parseSegments(text).unterminated, heredocs: [] };
+  const OPENER = /^<<-?\s*(?:'([^']+)'|"([^"]+)"|\\?([A-Za-z_]\w*))/;
   const kept = [];
   let line = '';
   let atWordStart = true;
@@ -4710,7 +3927,7 @@ export function heredocScan(command) {
       inComment = false;
       i += 1;
       if (pending !== null) {                                  // consume the heredoc BODY + its terminator
-        const { delim, expand } = pending;
+        const delim = pending;
         pending = null;
         const bodyLines = [];
         while (i < text.length) {
@@ -4720,7 +3937,7 @@ export function heredocScan(command) {
           if (body.trim() === delim) break;
           bodyLines.push(body);
         }
-        heredocs.push({ head, body: bodyLines.join('\n'), expand });
+        heredocs.push({ head, body: bodyLines.join('\n') });
       }
       continue;
     }
@@ -4734,29 +3951,8 @@ export function heredocScan(command) {
       atWordStart = false;
       continue;
     } else if (!inComment && ch === '<' && text[i + 1] === '<' && pending === null) {
-      if (text[i + 2] === '<') { line += '<<<'; i += 3; atWordStart = true; continue; }
-      let end = i + 2;
-      if (text[end] === '-') end += 1;
-      while (/[ \t]/.test(text[end] || '')) end += 1;
-      let delim = '';
-      let expand = true;
-      let hasDelimiter = false;
-      const delimiterStart = /[A-Za-z_'"\\]/.test(text[end] || ''); // preserve the existing exclusion of numeric arithmetic shifts
-      // A delimiter is one shell word: E"OF" and E\OF both mean literal EOF, with expansion disabled.
-      for (; delimiterStart && end < text.length && !/[\s;&|()<>]/.test(text[end]); end++) {
-        const part = scanRun(text, end, false);
-        if (part) {
-          if (part.kind === 'unterminated') unterminated = true;
-          delim += part.body;
-          expand = false;
-          hasDelimiter = true;
-          end = part.end;
-        } else { delim += text[end]; hasDelimiter = true; }
-      }
-      if (hasDelimiter) {
-        pending = { delim, expand };
-        line += text.slice(i, end); i = end; atWordStart = false; continue;
-      }
+      const m = text.slice(i).match(OPENER);
+      if (m) { pending = m[1] || m[2] || m[3]; line += m[0]; i += m[0].length; atWordStart = false; continue; }
     }
     line += ch;
     atWordStart = /[\s()]/.test(ch);
@@ -5025,8 +4221,6 @@ export function decide(command, ctx = {}) {
   if (bg) return bg;
   const directTask = backgroundedDirectTaskReason(command, ctx.runInBackground);
   if (directTask) return directTask;
-  const delegate = orchestratorDelegateReason(fullCommand, ctx);
-  if (delegate) return delegate;
   // #3105 — same whole-command timing as the check above: a dispatched agent's own gate call must be caught
   // before the per-segment split, since the property being checked (is this a verification-set invocation at
   // all) does not depend on which segment of a chained command it sits in.
@@ -5186,10 +4380,8 @@ if (IS_CLI) {
   let dispatchKind = null;
   let agentSession = false;
   let effectiveCwd = null;
-  let landingCwds = [];
   let daemonRoots = [];
   let hookSessionId = null;
-  let orchestratorSettings = {};
   try {
     const ev = JSON.parse(readFileSync(0, 'utf8'));
     cmd = (ev.tool_input || {}).command || '';
@@ -5210,8 +4402,6 @@ if (IS_CLI) {
     // blocks the `verify-lane.mjs run` gate the fix/ci-heal briefs tell the agent to run.
     agentSession = (typeof ev.agent_id === 'string' && ev.agent_id !== '') || !!dispatchKind
       || classifySession(process.env).role === 'worker';
-    orchestratorSettings = loadOrchestratorSessionSettings({ agentSession,
-      log: line => process.stderr.write(`guard-bash: ${line}\n`) }).value;
     // #2367 — the DURABLE session identity. Key on `CLAUDE_CODE_SESSION_ID` (env) FIRST — the SAME source
     // `lane-pool.mjs acquire` stamps into the lease's `ownerSession`, so my own lease can never read as foreign
     // due to a string-source mismatch (r2 correctness fix). The hook payload's `session_id` is only a secondary
@@ -5224,11 +4414,8 @@ if (IS_CLI) {
     const rp = (p) => { try { return realpathSync(p); } catch { return p; } };
     // #2335 — the reported cwd resets to the primary between calls; honour a leading `cd <lane>` so a genuine
     // lane mutation isn't misread as a primary one (and the #2323 git call runs in the lane, not the primary).
-    // #5957 — and every other directory a `cd` may land a command in (checked by the daemon-clone arm only)
-    const resolved = resolveCwdAndLandings(cmd, ev.cwd || process.cwd());
-    const cwd = rp(resolved.cwd);
+    const cwd = rp(resolveEffectiveCwd(cmd, ev.cwd || process.cwd()));
     effectiveCwd = cwd;
-    landingCwds = resolved.landings.map(rp);
     const weRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
     const workspace = dirname(weRoot);
     const primaries = ['webeverything', 'web-everything', 'frontierui', 'plateau-app'].map((r) => rp(join(workspace, r)));
@@ -5251,7 +4438,7 @@ if (IS_CLI) {
   if (/\bgit\b/.test(cmd) && /\bpush\b/.test(cmd)) {
     ({ fixPushes } = await computeFixClaimCtx(cmd, { caller: { sessionId: hookSessionId, who: process.env.WE_FIX_WHO || null, token: process.env.WE_FIX_TOKEN || null }, cwd: effectiveCwd || process.cwd() }));
   }
-  const guardCtx = { ...orchestratorSettings, primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, landingCwds, daemonCloneRoots: daemonRoots, fixPushes };
+  const guardCtx = { primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, fixPushes };
   const r = decide(cmd, guardCtx);
   if (r) {
     // #3311 — the deny is ALL-OR-NOTHING, so name the state-producing steps it takes down with it. Computed
