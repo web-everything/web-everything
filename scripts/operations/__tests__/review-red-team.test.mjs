@@ -3,10 +3,16 @@
  * Claude re-checks its claims; a confirmed break is a miss for the accepting seat and the builder. No real codex,
  * agy, claude, git or GitHub process: every effect is a fake.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { assertLaneCwd, buildJudgeArgv, deriveSessionId } from '../../lib/judge-spawn.mjs';
+import { parseRedTeamComment } from '../../lib/red-team-gate.mjs';
 
 import {
-  runRedTeam, redTeamEnabled, redTeamMarker, redTeamCommentPosted, redTeamAlreadyRan, resolveBuilder,
+  createRedTeamIo, speculateRedTeam, completeRedTeam, finishSpeculativeRedTeam, runRedTeam, redTeamEnabled, redTeamMarker, redTeamCommentPosted, redTeamAlreadyRan, resolveBuilder,
   buildRedTeamTask, buildRecheckRequest, applyRecheck, buildMissRows, renderRedTeamComment, replayPayload,
   reserveSeatCalls, RED_TEAM_ENV, EXTRA_SEATS_ENV, DAILY_CAP_ENV, PROVIDER_CAP_ENV, RED_TEAM_SEAT, RED_TEAM_MODELS,
   RED_TEAM_MISS_DISPATCH_KIND, ACCEPTING_SEAT_MODEL, DEFAULT_PROBE_INTERVAL_MS,
@@ -16,6 +22,12 @@ import { JUDGE_MODEL } from '../review-pr.mjs';
 import { REVIEW_SEAT_DISPATCH_KIND } from '../../lib/provider-routing.mjs';
 import { validateScorecard } from '../../conveyor/run-scorecard-store.mjs';
 import { buildDelegationMarker } from '../../lib/delegation-marker.mjs';
+import { resolveOperationRoute } from '../../lib/dispatch-routing-policy-io.mjs';
+
+vi.mock('../../lib/dispatch-routing-policy-io.mjs', async importOriginal => ({
+  ...await importOriginal(),
+  resolveOperationRoute: vi.fn(() => null),
+}));
 
 const REPO = 'web-everything/web-everything';
 const NOW = Date.parse('2026-09-26T15:00:00Z');
@@ -201,7 +213,8 @@ describe('x00g3tt — evidence, Claude re-check and confirmed misses', () => {
   it('a crashed re-check confirms nothing (a miss is never inferred)', async () => {
     const { io, rows } = fakeIo({ runRecheck: async () => { throw new Error('claude not logged in'); } });
     const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: {} }, io);
-    expect(r.recheckStatus).toMatch(/^error: .*logged in/);
+    expect(r.recheckStatus).toBe('error');
+    expect(r.comment.body).not.toContain('claude not logged in');
     expect(r.confirmedMissCount).toBe(0);
     expect(rows.filter((x) => x.dispatchKind === RED_TEAM_MISS_DISPATCH_KIND)).toEqual([]);
   });
@@ -484,5 +497,297 @@ describe('x00g3tt — review-job: the red team is the post-accept hook, after th
 
   it('summarizeRedTeam keeps the essentials', () => {
     expect(summarizeRedTeam({ status: 'skipped', reason: 'daily-cap' })).toEqual({ status: 'skipped', reason: 'daily-cap' });
+  });
+});
+
+
+describe('repo-grounded red-team re-check and card-only skips', () => {
+  it.each(['codex', 'antigravity'])('rejects incompatible providers when repository reads are enabled: %s', async provider => {
+    vi.mocked(resolveOperationRoute).mockReturnValue({ provider, model: 'test-model', effort: 'high' });
+    const spawnRecheck = vi.fn(async () => ({ value: { checks: [] } }));
+    try {
+      const io = createRedTeamIo({ env: {}, spawnRecheck });
+      const request = { pr: 5, lanePath: '/unused', rev: REV, readsRepo: true };
+      await expect(io.runRecheck(request)).rejects.toThrow('repo re-check requires the Claude read-only tool allow-list');
+      expect(spawnRecheck).not.toHaveBeenCalled();
+      await expect(io.runRecheck({ ...request, readsRepo: false })).resolves.toEqual({ checks: [] });
+      expect(spawnRecheck).toHaveBeenCalledTimes(1);
+      expect(spawnRecheck.mock.calls[0][0]).not.toHaveProperty('allowedTools');
+      expect(resolveOperationRoute).toHaveBeenCalledWith({ operation: 'review-recheck', available: ['claude', 'codex', 'antigravity'] });
+    } finally { vi.mocked(resolveOperationRoute).mockReset().mockReturnValue(null); }
+  });
+
+  const unsafeFilesRead = [
+    'AKIA' + '1234567890ABCDEF', 'src/AKIA' + '1234567890ABCDEF.mjs',
+    '![x](https://evil.example/beacon)', '[x](https://evil.example/beacon)',
+    '../outside', '/outside', 'a/../outside', 'a\\outside', 'a\nforged', 'a\rb', 'a\u2028b',
+    '`file`', '"file"', '--option', '\uff0e\uff0e/outside', 'a\u200bb', 'a%2fb',
+    'a\nb\n', 'a//b', './file', 'a/./b', '.git/config', 'a/'.repeat(301) + 'b',
+  ];
+
+  function evidenceStrings(value) {
+    if (typeof value === 'string') return [value];
+    if (value && typeof value === 'object') return Object.values(value).flatMap(evidenceStrings);
+    return [];
+  }
+
+  it.each(unsafeFilesRead)('scrubs unsafe filesRead at the comment and evidence sinks: %j', async unsafe => {
+    const { io, rows } = fakeIo({ runRecheck: async () => ({ checks: [{ index: 0, confirmed: false, reason: 'refuted', filesRead: [unsafe] }] }) });
+    const result = await runRedTeam({ pr: 5, repo: REPO, loopPayload: payload('accept'), env: {} }, io);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].findings[0]).toMatchObject({ file: BREAK.file, filesRead: [], recheckOutcome: 'unverifiable' });
+    expect(result.comment.body).not.toContain(unsafe);
+    // Inspect stored values: JSON property names include "file", and serialization escapes control characters.
+    for (const value of evidenceStrings(rows)) expect(value).not.toContain(unsafe);
+    // Direct rendering also covers retrying a legacy, unsanitized evidence row.
+    const body = renderRedTeamComment({ pr: 5, rev: REV, findings: [{ ...BREAK, filesRead: [unsafe] }], recheckStatus: 'ok', foldedVerdict: 'accept' });
+    expect(body).toContain('Files read: none');
+    expect(body).not.toContain(unsafe);
+  });
+
+  it('scrubs filesRead when completing speculative evidence and retrying legacy rows', async () => {
+    const first = fakeIo({ postComment: () => { throw new Error('offline'); } });
+    const p = payload('accept');
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: p.findings.read, env: {} }, first.io);
+    const unsafe = 'AKIA' + '1234567890ABCDEF';
+    pass.findings[0] = { ...pass.findings[0], confirmedByRecheck: false, recheckOutcome: 'not confirmed', filesRead: [unsafe] };
+    await completeRedTeam({ pr: 5, repo: REPO, loopPayload: p, pass }, first.io);
+    expect(first.rows[0].findings[0]).toMatchObject({ filesRead: [], recheckOutcome: 'unverifiable' });
+    first.rows[0].findings[0].filesRead = [unsafe];
+    first.rows[0].findings[0].recheckOutcome = 'not confirmed';
+    const again = fakeIo({ readRecords: () => first.rows });
+    const result = await runRedTeam({ pr: 5, repo: REPO, loopPayload: p, env: {} }, again.io);
+    expect(result.comment.body).toContain('[unverifiable]');
+    expect(result.comment.body).toContain('Files read: none');
+    expect(result.comment.body).not.toContain(unsafe);
+    expect(again.calls.some(c => c[0] === 'recheck')).toBe(false);
+  });
+
+  it('preserves safe relative filesRead and bounds evidence without truncating paths', () => {
+    const filesRead = ['src/a-b.mjs', 'packages/@scope/a+b.mjs', 'docs/.hidden_file.md'];
+    const [f] = applyRecheck([BREAK], { checks: [{ index: 0, confirmed: false, filesRead: [...filesRead, ...filesRead] }] });
+    expect(f.filesRead).toEqual(filesRead);
+    expect(f.recheckOutcome).toBe('not confirmed');
+    const [bounded] = applyRecheck([BREAK], { checks: [{ index: 0, confirmed: false, filesRead: Array.from({ length: 101 }, (_, i) => `file-${i}.mjs`) }] });
+    expect(bounded.filesRead).toHaveLength(100);
+  });
+
+  it.each(['summary', 'file', 'category', 'impactIfUnfixed', 'failure_scenario', 'recheckReason'])('scrubs model-controlled %s in rendered and stored findings', async field => {
+    const { io, rows } = fakeIo();
+    const p = payload('accept');
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: p.findings.read, env: {} }, io);
+    const secret = 'AKIA' + '1234567890ABCDEF';
+    pass.findings[0][field] = secret;
+    pass.parsed[RED_TEAM_SEAT.key].findings[0][field] = secret;
+    const result = await completeRedTeam({ pr: 5, repo: REPO, loopPayload: p, pass }, io);
+    expect(rows).toHaveLength(3); // Seat plus both accepting-review and builder miss rows.
+    expect(JSON.stringify(rows)).not.toContain(secret);
+    expect(result.comment.body).not.toContain(secret);
+    const body = renderRedTeamComment({ pr: 5, rev: REV, findings: pass.findings, recheckStatus: 'ok', foldedVerdict: 'changes' });
+    expect(body).not.toContain(secret);
+  });
+
+  it.each([true, false])('skips card-only probes before any reservation (speculative=%s)', async speculative => {
+    const p = payload('accept');
+    p.findings.read.netChangedFiles = ['backlog/123-card.md'];
+    const { io, calls, rows } = fakeIo();
+    const r = speculative
+      ? await speculateRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', read: p.findings.read, env: {} }, io)
+      : await runRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', loopPayload: p, env: {} }, io);
+    expect(r).toEqual({ status: 'skipped', reason: 'red team skipped: card-only' });
+    expect(calls.every(c => c[0] === 'log')).toBe(true);
+    expect(calls.some(c => c[1] === 'red team skipped: card-only')).toBe(true);
+    expect(calls.find(c => c[0] === 'log')[1]).toMatch(/recheckReadsRepo=true.*standard.*skipCardOnly=true.*standard/);
+    expect(rows).toEqual([]);
+  });
+
+  it.each([true, false])('includes rename sources before deciding to skip probes (speculative=%s)', async speculative => {
+    for (const [files, renameSources, skipped] of [
+      [['backlog/123-card.md'], ['scripts/x.mjs'], false],
+      [['scripts/x.mjs'], ['backlog/123-card.md'], false],
+      [['backlog/123-card.md'], ['backlog/122-card.md'], true],
+      [['backlog/123-card.md'], ['backlog/122-card.md', 'scripts/x.mjs'], false],
+      [['backlog/123-card.md'], 'scripts/x.mjs', false],
+      [['backlog/123-card.md'], ['backlog/../scripts/x.mjs'], false],
+      [[], ['backlog/122-card.md'], false],
+    ]) {
+      const p = payload('accept');
+      p.findings.read.netChangedFiles = files;
+      p.findings.read.netRenameSources = renameSources;
+      const { io, calls, rows } = fakeIo();
+      const result = speculative
+        ? await speculateRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', read: p.findings.read, env: {} }, io)
+        : await runRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', loopPayload: p, env: {} }, io);
+      expect(result.status).toBe(skipped ? 'skipped' : speculative ? 'speculated' : 'ran');
+      expect(calls.some(c => c[0] === 'recheck')).toBe(!skipped);
+      if (skipped) {
+        expect(result.reason).toBe('red team skipped: card-only');
+        expect(calls.every(c => c[0] === 'log')).toBe(true);
+        expect(rows).toEqual([]);
+      }
+    }
+  });
+
+  it.each([['backlog/123-card.md', 'code.mjs'], [], ['backlog/../code.mjs']])('does not skip a non-card or unknown diff: %j', async (...files) => {
+    const p = payload('accept');
+    p.findings.read.netChangedFiles = files;
+    const { io, calls } = fakeIo();
+    expect((await runRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', loopPayload: p, env: {} }, io)).status).toBe('ran');
+    const request = calls.find(c => c[0] === 'recheck')[1];
+    expect(request).toMatchObject({ lanePath: 'lane', rev: REV, readsRepo: true });
+    expect(request.mandate).toMatch(/open the cited files and their callers/);
+    expect(request.mandate).toMatch(/filesRead/);
+    expect(request.shape.properties.checks.items.required).toContain('filesRead');
+  });
+
+  it('rejects a speculative pass when rename sources change before completion', async () => {
+    const p = payload('accept');
+    p.findings.read.netChangedFiles = ['backlog/123-card.md'];
+    p.findings.read.netRenameSources = ['scripts/x.mjs'];
+    const { io, calls, rows } = fakeIo();
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: p.findings.read, env: {} }, io);
+    expect(pass.status).toBe('speculated');
+    p.findings.read.netRenameSources = ['scripts/y.mjs'];
+    expect(await finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload: p, pass, env: {} }, io)).toMatchObject({ status: 'stale' });
+    expect(rows).toEqual([]);
+    expect(calls.some(c => c[0] === 'post')).toBe(false);
+  });
+
+  it.each(['rename', 'copy'])('replay retains %s sources so code moved into backlog still probes', async kind => {
+    const p = replayPayload({
+      view: { title: 't', headRefOid: REV, files: [{ path: 'backlog/123-card.md' }] },
+      diffText: `diff --git a/scripts/x.mjs b/backlog/123-card.md\nsimilarity index 100%\n${kind} from scripts/x.mjs\n${kind} to backlog/123-card.md\n`,
+    });
+    expect(p.findings.read.netRenameSources).toEqual(['scripts/x.mjs']);
+    const { io, calls } = fakeIo();
+    const result = await runRedTeam({ pr: 5, repo: REPO, loopPayload: p, env: {} }, io);
+    expect(result.status).toBe('ran');
+    expect(calls.some(c => c[0] === 'recheck')).toBe(true);
+  });
+
+  it('allows the env override to run card-only probes without repository tools', async () => {
+    const p = payload('accept');
+    p.findings.read.netChangedFiles = ['backlog/123.md'];
+    const { io, calls } = fakeIo();
+    expect((await runRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', loopPayload: p,
+      env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false', WE_RED_TEAM_RECHECK_READS_REPO: '0' } }, io)).status).toBe('ran');
+    expect(calls.find(c => c[0] === 'recheck')[1]).toMatchObject({ readsRepo: false, mandate: expect.stringContaining('tools are disabled') });
+    expect(calls.find(c => c[0] === 'log')[1]).toMatch(/recheckReadsRepo=false.*env.*skipCardOnly=false.*env/);
+  });
+
+  it.each(['opaqueCredential_123', 'read /home/user/.env\nopaqueCredential_123', 'x'.repeat(10000)])('withholds unrecognized re-check reasons at every publication sink (case %#)', async secret => {
+    const first = fakeIo({
+      runRecheck: async () => ({ checks: [{ index: 0, confirmed: true, reason: secret, filesRead: ['x.mjs'] }] }),
+      postComment: () => { throw new Error('offline'); },
+    });
+    const p = payload('accept');
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: p.findings.read, env: {} }, first.io);
+    expect(pass.findings[0].recheckReason).toBe('reason withheld');
+    // Completion also accepts passes persisted before the restricted reason vocabulary.
+    pass.findings[0].recheckReason = secret;
+    const result = await completeRedTeam({ pr: 5, repo: REPO, loopPayload: p, pass }, first.io);
+    expect(result.comment.body).toContain('Re-check: reason withheld');
+    for (const value of evidenceStrings(first.rows)) expect(value).not.toContain(secret);
+    expect(renderRedTeamComment({ pr: 5, rev: REV, findings: [{ ...BREAK, recheckReason: secret }], recheckStatus: 'ok', foldedVerdict: 'accept' })).not.toContain(secret);
+    first.rows[0].findings[0].recheckReason = secret;
+    const retry = fakeIo({ readRecords: () => first.rows });
+    const resumed = await runRedTeam({ pr: 5, repo: REPO, loopPayload: p, env: {} }, retry.io);
+    expect(resumed.comment.body).toContain('Re-check: reason withheld');
+    expect(resumed.comment.body).not.toContain(secret);
+  });
+
+  it.each(['demonstrated break', 'relevant code refutes claim', 'insufficient evidence'])('accepts only the declared re-check reason vocabulary: %s', reason => {
+    const request = buildRecheckRequest({ pr: 5, repo: REPO, findings: [BREAK] });
+    expect(request.shape.properties.checks.items.properties.reason.enum).toContain(reason);
+    expect(applyRecheck([BREAK], { checks: [{ index: 0, confirmed: true, reason }] })[0].recheckReason).toBe(reason);
+  });
+
+  it('withholds raw juror errors and legacy re-check statuses from stored and public evidence', async () => {
+    const secret = 'opaqueCredential_456';
+    const first = fakeIo({
+      runRecheck: async () => { throw new Error(secret); },
+      postComment: () => { throw new Error('offline'); },
+    });
+    const p = payload('accept');
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: p.findings.read, env: {} }, first.io);
+    expect(pass.recheckStatus).toBe('error');
+    pass.recheckStatus = `error: ${secret}`;
+    const result = await completeRedTeam({ pr: 5, repo: REPO, loopPayload: p, pass }, first.io);
+    expect(result.comment.body).toContain('re-check error');
+    expect(result.comment.body).not.toContain(secret);
+    expect(first.rows[0].recheckStatus).toBe('error');
+    for (const value of evidenceStrings(first.rows)) expect(value).not.toContain(secret);
+    expect(renderRedTeamComment({ pr: 5, rev: REV, findings: [BREAK], recheckStatus: secret, foldedVerdict: 'accept' })).not.toContain(secret);
+    first.rows[0].recheckStatus = `error: ${secret}`;
+    const retry = fakeIo({ readRecords: () => first.rows });
+    const resumed = await runRedTeam({ pr: 5, repo: REPO, loopPayload: p, env: {} }, retry.io);
+    expect(resumed.comment.body).toContain('re-check error');
+    expect(resumed.comment.body).not.toContain(secret);
+  });
+
+  it.each([undefined, [], [''], ['../outside'], ['/outside']])('a negative without valid files read is unverifiable: %j', filesRead => {
+    const [f] = applyRecheck([BREAK], { checks: [{ index: 0, confirmed: false, reason: 'needs caller context', filesRead }] });
+    expect(f).toMatchObject({ confirmedByRecheck: false, recheckOutcome: 'unverifiable', filesRead: [] });
+    const body = renderRedTeamComment({ pr: 5, rev: REV, findings: [f], recheckStatus: 'ok', foldedVerdict: 'accept' });
+    expect(body).toContain('[unverifiable]');
+    expect(body).not.toContain('[not confirmed]');
+    expect(parseRedTeamComment(body).findings[0]).toMatchObject({ confirmed: false, recheckOutcome: 'unverifiable' });
+  });
+
+  it('distinguishes a grounded refutation from an unreadable claim', () => {
+    const checks = [{ index: 0, confirmed: false, reason: 'caller guards n', filesRead: ['x.mjs', 'caller.mjs'] }];
+    expect(applyRecheck([BREAK], { checks })[0].recheckOutcome).toBe('not confirmed');
+    expect(applyRecheck([BREAK], { checks: [{ ...checks[0], unverifiable: true }] })[0].recheckOutcome).toBe('unverifiable');
+  });
+
+  it.each([false, true])('persists unverifiable on comment retry, including legacy rows (legacy=%s)', async legacy => {
+    const first = fakeIo({ runRecheck: async () => ({ checks: [{ index: 0, confirmed: false, reason: 'no context', filesRead: [] }] }),
+      postComment: () => { throw new Error('offline'); } });
+    await runRedTeam({ pr: 5, repo: REPO, loopPayload: payload('accept'), env: {} }, first.io);
+    if (legacy) {
+      delete first.rows[0].findings[0].recheckOutcome;
+      delete first.rows[0].findings[0].filesRead;
+    }
+    const again = fakeIo({ readRecords: () => first.rows });
+    const result = await runRedTeam({ pr: 5, repo: REPO, loopPayload: payload('accept'), env: {} }, again.io);
+    expect(result.comment.body).toContain('[unverifiable]');
+    if (!legacy) expect(result.comment.body).toContain('Files read: none');
+  });
+
+  it.each([false, true])('the production re-check uses an independent pinned lane and cleans it (failure=%s)', async fail => {
+    const root = mkdtempSync(join(tmpdir(), 'red-team-recheck-test-'));
+    const git = (...args) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8' }).trim();
+    let cwd;
+    try {
+      git('init', '--quiet');
+      git('config', 'user.name', 'Recheck Test');
+      git('config', 'user.email', 'recheck@example.test');
+      writeFileSync(join(root, 'caller.mjs'), 'export const guard = true;');
+      git('add', '.');
+      git('commit', '--quiet', '-m', 'reviewed head');
+      const rev = git('rev-parse', 'HEAD');
+      writeFileSync(join(root, 'caller.mjs'), 'export const guard = false;');
+      git('commit', '--quiet', '-am', 'later unrelated head');
+      const io = createRedTeamIo({ env: {}, spawnRecheck: async opts => {
+        cwd = opts.cwd;
+        assertLaneCwd(cwd, opts.allowedTools);
+        expect(opts.allowedTools).toEqual(['Read', 'Glob', 'Grep']);
+        const argv = buildJudgeArgv({ ...opts, sessionId: deriveSessionId(opts.runId) });
+        expect(argv).toContain('--allowedTools');
+        expect(argv).not.toContain('Bash');
+        expect(execFileSync('git', ['-C', cwd, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()).toBe(rev);
+        expect(readFileSync(join(cwd, 'caller.mjs'), 'utf8')).toBe('export const guard = true;');
+        expect(existsSync(join(cwd, '.git', 'objects', 'info', 'alternates'))).toBe(false);
+        symlinkSync(join(root, 'caller.mjs'), join(cwd, 'outside.mjs'));
+        symlinkSync('caller.mjs', join(cwd, 'inside.mjs'));
+        if (fail) throw new Error('recheck failed');
+        return { value: { checks: [{ index: 0, confirmed: false, filesRead: ['caller.mjs', 'missing.mjs', 'outside.mjs', 'inside.mjs', '.git', '.git/config'] }] } };
+      } });
+      const request = { pr: 5, lanePath: root, rev, ...buildRecheckRequest({ pr: 5, repo: REPO, findings: [BREAK] }) };
+      if (fail) await expect(io.runRecheck(request)).rejects.toThrow('recheck failed');
+      else expect(await io.runRecheck(request)).toEqual({ checks: [{ index: 0, confirmed: false, filesRead: ['caller.mjs', 'inside.mjs'] }] });
+      expect(existsSync(cwd)).toBe(false);
+      expect(readFileSync(join(root, 'caller.mjs'), 'utf8')).toBe('export const guard = false;');
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
