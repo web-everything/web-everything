@@ -708,3 +708,60 @@ it('#5414 recorded heads: carries chalbert and updates acceptance as well as cle
   expect(posted[0]).toContain(`from=${old} to=${head}`);
   expect(logs.join('')).toContain('review.carryHumanClearanceAcrossNumbering=true (platform)');
 });
+
+// Observed with gh pr view 5403 --json comments,headRefOid on 2026-10-17.
+describe('#5403 clearance → prevention notice → numbering-only move', () => {
+  const comments = [
+  {
+    "id": "IC_kwDORBt1-c8AAAABc9nsTA",
+    "author": {
+      "login": "chalbert"
+    },
+    "authorAssociation": "MEMBER",
+    "body": "✅ review — `review:human` cleared via the sanctioned path\n\nCleared by chalbert via `review-set-label.mjs --to=clear-human` (#2895).\n\n> operator: Yes to all\n\nWhat this record proves: the clearance went through the sanctioned tool, so the label swap, the `reviewed-sha` stamp and this comment exist and agree. What it does NOT prove: that a human performed it. The actor name and the reason above are free text and nothing verifies who supplied them — #2895 deferred the unforgeable actor signal (no local construct survives an agent with shell access on the same machine), and #2946 is the durable fix.\n\nOperator approval (human review ceremony), 2026-10-17, at head 1847d5a. Operator: \"Yes to all\".\n\nBoth operator blocks are fixed with tests: main's literal-variable fallback is restored when HOME is unknown (hook-level deny rows), and home-derived ordinary variables are expanded (including +=, HOME rebinding and subshell isolation). 3d8763b restores main's orchestrator delegation, heredoc hardening and exec baseline that the branch had lost. The scope stays inside leading-cd home handling (all-landings is card x5tbryq). The advisory review accepted this head, and all gates pass.\n\n<!-- reviewed-sha: 1847d5a95180c890b12066d321c86492f69b800f -->\n<!-- reviewed-diff: 4cefa20412e79463ce05cd4952f23182f35ed300261a0c486756f1e05f8b4cf5 -->\n<!-- reviewed-contribution: f9e10e90488b8716889ce8ed521ee44f7fe96d30359e2aaa71c2fc55b9998810 -->\n<!-- cleared-human: chalbert -->\n<!-- cleared-by-actor: bd616854-1f67-4f80-8be5-40fe1456e3bf -->",
+    "createdAt": "2026-10-17T18:32:22Z",
+    "includesCreatedEdit": false,
+    "isMinimized": false,
+    "minimizedReason": "",
+    "reactionGroups": [],
+    "url": "https://github.com/web-everything/web-everything/pull/5403#issuecomment-6238628940",
+    "viewerDidAuthor": true
+  },
+  {
+    "id": "IC_kwDORBt1-c8AAAABc9n1JA",
+    "author": {
+      "login": "chalbert"
+    },
+    "authorAssociation": "MEMBER",
+    "body": "<!-- approval-prevention-filed:1847d5a95180c890b12066d321c86492f69b800f --> <!-- approval-prevention-job:prevention-card-mvcqhmu8-c1s2fd -->\nFiled the prevention guard(s) owed by web-everything/web-everything#5403's independent review, mechanically, on approval (operator rule, 2026-09-27) — queued for landing via a lane (tracking pid:15819).",
+    "createdAt": "2026-10-17T18:32:30Z",
+    "includesCreatedEdit": false,
+    "isMinimized": false,
+    "minimizedReason": "",
+    "reactionGroups": [],
+    "url": "https://github.com/web-everything/web-everything/pull/5403#issuecomment-6238631204",
+    "viewerDidAuthor": true
+  }
+];
+  const head = 'a4f64bada9fdaf725480907acb67fe4946085c77';
+  it.each([
+    ['exact filer notice', '', true],
+    ['appended prose', '\nDo not merge this PR.', false],
+    ['appended verdict', '\n**Verdict:** changes requested', false],
+  ])('%s', (_name, suffix, carries) => {
+    const posted = [];
+    const result = applyHumanClearanceCarry({
+      evidence: { humanClearance: { sha: '1847d5a95180c890b12066d321c86492f69b800f',
+        diff: '4cefa20412e79463ce05cd4952f23182f35ed300261a0c486756f1e05f8b4cf5', actor: 'chalbert' },
+        headSha: head, headDiffSha: head, headDiff: DIFF },
+      pr: 5403, setting: ON, log: quiet,
+      exec: (cmd, args) => { if (cmd === 'gh') posted.push([cmd, args]); return ''; },
+      proveNumbering: () => ({ ok: true, reason: 'numbering-only move' }),
+      readLiveEvidence: () => ({ headSha: head, reviews: [], comments: [comments[0],
+        { ...comments[1], body: comments[1].body + suffix }] }),
+    });
+    if (carries) expect(result).toMatchObject({ carried: { tier: 'numbering', recorded: true } });
+    else expect(result).toMatchObject({ action: 'defer', reason: expect.stringContaining('later verdict or unknown comment') });
+    expect(posted).toHaveLength(carries ? 1 : 0);
+  });
+});
