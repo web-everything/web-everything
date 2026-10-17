@@ -1463,9 +1463,16 @@ The health log records each effective value and source. Fixture and dry-run tick
 A stable `nightly-coroner-YYYY-MM-DD` job ID and retained daily records enforce one job per ET night
 without depending on health `state.json`. The next live tick catches up the most recent due night,
 including before tonight's deadline after a restart; multiple missed nights coalesce into one extraction.
-There is one attempt per night: a failed/crashed attempt is exposed as a health probe failure, and the
-next night's extraction still starts at the last successfully published cursor. This avoids a second
-extraction for the same night. Never prune daily job records without preserving the once-per-night ledger.
+`coroner.nightly.laneWaitMs` defaults to 600000 and is passed to lane-pool's normal `--wait-ms`.
+`attempts` defaults to 3; the daemon retries the whole run with exponential backoff starting at
+`retryBackoffMin` (10 minutes). `deadlineEt` defaults to `03:30` on the following ET calendar date;
+no attempts launch after that deadline, including late catch-up. DST uses New York wall time.
+Exhaustion or a missed deadline emits a deduplicated needs-you event and the `nightly-coroner-failed`
+health smell, naming the job, last error and attempts. `alertAfterProbeFailures` (default 3) also
+alerts on consecutive `nightlyCoronerJob` probe errors, including exceptions before a record exists.
+This smell notifies in shadow mode. A successful probe resets the streak.
+The next night's extraction still starts at the last successfully published cursor; retries recover
+an existing report through its receipt rather than extracting twice. Never prune daily job records without preserving the once-per-night ledger.
 
 The child leases a lane via the lane-pool CLI, runs its `coroner-extract.mjs` (which imports
 `coroner-rounds.mjs`) with explicit `--since`/`--until`, `--json`, `--no-save`, and releases the lane in

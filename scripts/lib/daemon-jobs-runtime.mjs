@@ -319,13 +319,13 @@ const sameGeneration = (a, b) => a.job.status === b.job.status && a.job.handle =
  * ONE reattach-and-admit pass. Run at boot and every tick.
  * @param {{store: object, kinds: Map<string, object>, maxConcurrent: number, clock?: object, observation?: object,
  *   probe?: Function, stop?: Function, launch?: Function, staleMs?: number, launchGraceMs?: number,
- *   backoffBaseMs?: number, snapshot?: object, heartbeatIntervalMs?: number, log?: Function}} o
+ *   deadlineAt?: (record: object) => number|null, backoffBaseMs?: number, snapshot?: object, heartbeatIntervalMs?: number, log?: Function}} o
  * @returns {Promise<{slept: boolean, gapMs: number, actions: object[], corrupt: string[]}>}
  */
 export async function reattachTick({
   store, kinds, maxConcurrent, clock, observation, probe = (h) => probeHandle(h), stop = (h) => stopHandle(h, { probe }),
   launch = launchJob, staleMs = DEFAULT_HEARTBEAT_STALE_MS, launchGraceMs = DEFAULT_LAUNCH_GRACE_MS,
-  backoffBaseMs = DEFAULT_BACKOFF_BASE_MS, snapshot, heartbeatIntervalMs, log = () => {},
+  backoffBaseMs = DEFAULT_BACKOFF_BASE_MS, snapshot, heartbeatIntervalMs, log = () => {}, deadlineAt = () => null,
 }) {
   const obs = observation ?? (clock ? clock.observe() : { now: Date.now(), slept: false, gapMs: 0 });
   const { now, slept, gapMs } = obs;
@@ -338,7 +338,11 @@ export async function reattachTick({
     const liveness = r.job.handle ? probe(r.job.handle) : null;
     const state = classifyJob(r, { now, liveness, staleMs, launchGraceMs, sleepDetected: slept });
     const kindDef = kinds.get(r.job.kind) ?? null;
-    const plan = planReattach(r, state, { kindDef });
+    const deadline = deadlineAt(r);
+    const expired = Number.isFinite(deadline) && now >= deadline && state !== 'terminal' && state !== 'foreign';
+    const plan = expired ? { type: 'fail', stopFirst: liveness === 'alive',
+      reason: `deadline exceeded; ${r.job.attempts}/${r.job.maxAttempts} attempts; last error: ${r.job.error ?? 'not completed'}` }
+      : planReattach(r, state, { kindDef });
     if (plan.type === 'none') continue;
     if (plan.stopFirst) {
       const res = await stop(r.job.handle);

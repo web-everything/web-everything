@@ -3,12 +3,16 @@ import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, existsSync
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { coronerNightDue, runNightlyCoronerJob, extractNightlyCoroner, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed } from '../nightly-coroner-job.mjs';
-import { createJobStore } from '../../lib/daemon-jobs-runtime.mjs';
+import { coronerNightDue, runNightlyCoronerJob, extractNightlyCoroner, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed, NIGHTLY_DEFAULTS, coronerDeadline } from '../nightly-coroner-job.mjs';
+import { createJobStore, reattachTick, runJob, JOB_ID_ENV, JOB_ATTEMPT_ENV } from '../../lib/daemon-jobs-runtime.mjs';
 import { HEALTH_WATCH_JOB_KINDS, HEALTH_NIGHTLY_CORONER_KIND } from '../../../skills-src/conveyor/daemon-manifest.mjs';
+import { parseFeedLine } from '../../operations/needs-you-feed.mjs';
+import { markLaunching } from '../../lib/daemon-jobs.mjs';
+import coronerSmell from '../health-smells/nightly-coroner-failed.mjs';
+import { emptyHealthState, runHealthTick } from '../health-watch-core.mjs';
 const roots = [];
 const temp = () => { const root = mkdtempSync(join(tmpdir(), 'nightly-coroner-')); roots.push(root); return root; };
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+afterEach(() => { vi.restoreAllMocks(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 it.each([
   ['2026-10-17T02:16:59Z', '2026-10-15', null],
   ['2026-10-17T02:17:00Z', '2026-10-15', '2026-10-16'],
@@ -32,20 +36,20 @@ it('resolves all cascade layers independently and logs enabled source', () => {
     : JSON.stringify({ coroner: { nightly: { enabled: false, at: '20:00' } } });
   const log = vi.fn();
   const out = resolveNightlyCoronerSettings({ read, log, env: {} });
-  expect(out.value).toEqual({ at: '21:00', enabled: false });
-  expect(out.sources).toEqual({ at: 'tool', enabled: 'platform' });
+  expect(out.value).toEqual({ ...NIGHTLY_DEFAULTS, at: '21:00', enabled: false });
+  expect(out.sources).toMatchObject({ at: 'tool', enabled: 'platform', laneWaitMs: 'standard' });
   expect(log.mock.calls[0][0]).toContain('enabled=false (platform)');
   const overridden = resolveNightlyCoronerSettings({ read, log, config: { coroner: { nightly: { at: '22:00' } } }, env: { WE_CORONER_NIGHTLY_ENABLED: 'true', WE_CORONER_NIGHTLY_AT: '23:11' } });
-  expect(overridden.sources).toEqual({ at: 'env', enabled: 'env' });
-  expect(overridden.value).toEqual({ at: '23:11', enabled: true });
+  expect(overridden.sources).toMatchObject({ at: 'env', enabled: 'env' });
+  expect(overridden.value).toEqual({ ...NIGHTLY_DEFAULTS, at: '23:11', enabled: true });
   const bad = resolveNightlyCoronerSettings({ read, log, env: { WE_CORONER_NIGHTLY_AT: '25:11' } });
   expect(bad.value.at).toBe('21:00'); expect(bad.errors.length).toBeGreaterThan(0);
   const missing = () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); };
-  expect(resolveNightlyCoronerSettings({ read: missing, log, env: {} }).value).toEqual({ enabled: true, at: '22:17' });
+  expect(resolveNightlyCoronerSettings({ read: missing, log, env: {} }).value).toEqual(NIGHTLY_DEFAULTS);
 });
 function jobOptions(root) {
   return { dir: root, store: createJobStore(join(root, 'jobs')), config: { enabled: true, at: '22:17' }, codeSha: 'abc',
-    reattach: vi.fn(async () => ({})), evict: vi.fn(), snapshot: {}, sourceRoot: root };
+    reattach: vi.fn(async () => ({})), evict: vi.fn(), snapshot: {}, sourceRoot: root, statusFeed: join(root, 'feed.jsonl') };
 }
 it('persists one job per night even when health state is lost, and catches up on restart', async () => {
   const root = temp(); const opts = jobOptions(root);
@@ -155,4 +159,94 @@ it('publishes real deterministic extraction output from isolated inputs', async 
   expect(text).toContain('"errorRates"');
   expect(text).toContain('"changeRequests"');
   expect(report.window.until).toBe(input.until);
+});
+it.each([
+  ['2026-10-16', '2026-10-17T07:30:00.000Z'],
+  ['2026-01-16', '2026-01-17T08:30:00.000Z'],
+  ['2026-03-07', '2026-03-08T07:30:00.000Z'],
+  ['2026-10-31', '2026-11-01T08:30:00.000Z'],
+])('resolves the next ET morning deadline for %s', (night, expected) => {
+  expect(new Date(coronerDeadline(night)).toISOString()).toBe(expected);
+});
+it('passes a positive normal lane-pool wait even for an invalid zero input', async () => {
+  const { input, io } = extraction(temp());
+  delete io.acquire;
+  io.run.mockResolvedValueOnce(JSON.stringify({ lane: 7, holder: 'test', path: join(io.root, 'lane') }));
+  await extractNightlyCoroner({ ...input, nightly: { laneWaitMs: 0 } }, io);
+  expect(io.run.mock.calls[0][0]).toContain('--wait-ms=600000');
+});
+async function driveNight({ failAlways = false, deadline = false } = {}) {
+  const root = temp(), { input, io } = extraction(root), opts = jobOptions(root);
+  opts.dir = input.dir;
+  let now = Date.parse(input.until);
+  vi.spyOn(Date, 'now').mockImplementation(() => now);
+  const promises = [];
+  io.acquire.mockRejectedValueOnce(new Error('no lane within 600000ms (lock contention)'));
+  if (failAlways) io.acquire.mockRejectedValue(new Error('gh throttle: retry later'));
+  opts.reattach = (args) => reattachTick({ ...args, observation: { now, slept: false, gapMs: 0 }, probe: () => 'dead',
+    launch: ({ store, id }) => {
+      const record = store.update(id, (r) => markLaunching(r, { at: new Date(now).toISOString() }));
+      promises.push(runJob({ env: { [JOB_ID_ENV]: id, [JOB_ATTEMPT_ENV]: String(record.job.attempts), OPERATION_RUNS_DIR: store.dir },
+        readStart: () => 'test-start', steps: [{ name: 'extract', run: ({ input: jobInput }) => extractNightlyCoroner(jobInput, io) }] }));
+      return record;
+    },
+  });
+  const tick = async () => {
+    const out = await runNightlyCoronerJob({ ...opts, now });
+    await Promise.all(promises.splice(0));
+    return out;
+  };
+  await tick(); // first extraction fails
+  await tick(); // dead child requeued with ten minute backoff
+  const id = 'nightly-coroner-2026-10-16';
+  expect(opts.store.read(id).job.nextAttemptAt).toBe('2026-10-17T02:27:00.000Z');
+  if (deadline) now = coronerDeadline(input.night);
+  else now += 10 * 60000;
+  await tick();
+  if (failAlways && !deadline) {
+    await tick(); // backoff doubles after attempt two
+    now += 20 * 60000;
+    await tick();
+  }
+  const result = await tick();
+  return { result, opts, io, input, record: opts.store.read(id), tick };
+}
+it('retries the whole daemon job after lane contention and writes the report and cursor', async () => {
+  const { record, io, input } = await driveNight();
+  expect(record.job.status).toBe('succeeded');
+  expect(record.job.attempts).toBe(2);
+  expect(readFileSync(join(io.home, 'coroner-2026-10-16.md'), 'utf8')).toContain('Nightly coroner');
+  expect(JSON.parse(readFileSync(join(input.dir, 'nightly-coroner-cursor.json'), 'utf8')).lastEnd).toBe(input.until);
+});
+it('exhausts attempts, retains the last error and publishes one needs-you failure event', async () => {
+  const { record, opts, tick, result } = await driveNight({ failAlways: true });
+  expect(record.job.status).toBe('failed');
+  expect(record.job.attempts).toBe(3);
+  expect(record.job.error).toContain('gh throttle');
+  expect(result.alerts[0]).toMatchObject({ attempts: 3, maxAttempts: 3 });
+  await tick();
+  const lines = readFileSync(opts.statusFeed, 'utf8').trim().split('\n');
+  expect(lines).toHaveLength(1);
+  expect(parseFeedLine(lines[0])).toMatchObject({ kind: 'coroner-failed', attempts: 3, error: expect.stringContaining('gh throttle') });
+  const health = runHealthTick(emptyHealthState(), { nightlyCoronerStatus: { alerts: result.alerts, threshold: 3 } }, [coronerSmell], Date.now(), { config: { mode: 'shadow' } });
+  expect(health.plan.some((p) => p.kind === 'notify' && !p.suppressed)).toBe(true);
+});
+it('expires queued retries at the ET deadline without another extraction', async () => {
+  const { record, io, opts } = await driveNight({ deadline: true });
+  expect(record.job.status).toBe('failed');
+  expect(record.job.error).toContain('deadline exceeded');
+  expect(io.acquire).toHaveBeenCalledOnce();
+  expect(readFileSync(opts.statusFeed, 'utf8')).toContain('deadline exceeded');
+});
+it('alerts on the configured consecutive probe failure threshold and resets on success', () => {
+  let state = emptyHealthState();
+  const now = Date.parse('2026-10-17T03:00:00Z');
+  const probes = { nightlyCoronerStatus: { alerts: [], threshold: 4 } };
+  for (let i = 1; i <= 4; i++) {
+    const result = runHealthTick(state, probes, [coronerSmell], now + i, { config: { mode: 'shadow' }, probeErrors: { nightlyCoronerJob: 'enqueue lock contention' } });
+    state = result.state;
+    expect(result.plan.some((p) => p.kind === 'notify' && !p.suppressed)).toBe(i === 4);
+  }
+  const success = runHealthTick(state, probes, [coronerSmell], now + 5);
+  expect(success.state.probeErrors.nightlyCoronerJob).toBeUndefined();
 });
