@@ -6373,7 +6373,7 @@ not resolve solely because its children land. Named acceptance coverage: slice 2
 Additional handoff coverage: slice 2 A2/A13–A16 (all competing rule pairs, literal table cells/domains,
 read-side cascade provenance, protected roots and ingress bounds); slice 3 A2–A3/A8/A11 (N+1 aggregation,
 repeat baselines, quadrant admission and bounds); slice 4 A6 and slice 5 A8 (surface-specific bounds).
-Each slice's Test plan and the decision's risk mapping identify repository-qualified planned test files;
-these are implementation destinations, not assertions that the tests exist today.
+Each slice's Test plan and the decision's risk mapping identify repository-qualified planned test files
+as implementation destinations.
 
 **Lineage:** `#xugqjw1` (ruled 2026-10-17). Reference: the operator's review stringency proposal artifact.
