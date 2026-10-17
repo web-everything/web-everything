@@ -1,3 +1,4 @@
+import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
 /**
  * @file scripts/operations/cli-adapter.mjs
  * @description THE COMMAND-LINE ADAPTER, DERIVED FROM A DECLARATION (#3035, under epic #3029).
@@ -925,7 +926,7 @@ export function createDefaultJudge({
   // Card 84 — a request carrying a `seatProvider` directive (`review.seatProvider.<lens>` = agy | shadow, or the
   // advisory agy seat) runs through the seat runner, which calls `judge` above for every Claude juror it needs.
   // A DYNAMIC import, like `defaultProviderQuotaHold`'s: this file is loaded by lightweight CLIs that never seat one.
-  return async (request, opts = null) => {
+  const routedJudge = async (request, opts = null) => {
     // #4815 — a request that already carries its own answer (`skipSpawn.answer`) spawns nothing: the step declared a judge turn
     // whose work turned out to be empty (no claim to verify) or impossible (no readable diff), and says what to record instead.
     if (request?.skipSpawn && typeof request.skipSpawn === 'object' && request.skipSpawn.answer != null) return judgeOutcome(request.skipSpawn.answer);
@@ -933,6 +934,8 @@ export function createDefaultJudge({
     const laneCwd = opts?.cwd || factoryCwd;
     return seatRunner(request, { claudeJudge: (r) => judge(r, opts), unwrap: unwrapJudgeOutcome, wrap: judgeOutcome, cwd: laneCwd ?? null });
   };
+  routedJudge.providerName = providerName;
+  return routedJudge;
 }
 
 /**
@@ -1019,6 +1022,24 @@ export async function driveRun({
   parallelJudges = false, seatLanes = null, log = (line) => { try { process.stderr.write(`${line}\n`); } catch { /* best effort */ } },
 } = {}) {
   let current = run;
+  // jury-core pulls in markdown-it; lightweight CLIs also import this adapter from
+  // scripts-only clones. Load the verdict helper only for review seat observations.
+  const deriveVerdict = run.op === 'review-pr' ? (await import('../lib/jury-core.mjs')).deriveVerdict : null;
+  const recordSeat = (seat) => {
+    if (current.op !== 'review-pr' || seat.request?.skipSpawn) return;
+    const { value, telemetry } = seat.ok ? unwrapJudgeOutcome(seat.value) : { value: null, telemetry: null };
+    current = withSeatTiming(current, seatTiming({
+      seat: seat.step, lens: seat.request?.lens,
+      provider: value?.seatProvider?.provider ?? seat.request?.providerName ?? judge.providerName ?? 'claude',
+      model: value?.seatProvider?.model ?? telemetry?.servedModel ?? telemetry?.model ?? seat.request?.model ?? null,
+      startedAt: new Date(seat.startedAt).toISOString(),
+      finishedAt: seat.finishedAt == null ? null : new Date(seat.finishedAt).toISOString(),
+      verdict: value?.verdict ?? (seat.finishedAt == null ? null : seat.ok ? (value?.skipped ? 'skipped' : Array.isArray(value?.findings) ? deriveVerdict({ findings: value.findings }) : 'unknown') : 'error'),
+      findingsCount: Array.isArray(value?.findings) ? value.findings.length : null,
+    }));
+    store.write(current);
+  };
+
   let pendingResume = resume;
   const applied = [];
   // Answers a concurrent batch already produced, keyed by step name, consumed as the engine reaches each seat.
@@ -1107,7 +1128,7 @@ export async function driveRun({
         const batch = planJudgeBatch(current, { registry }).filter((s) => s.step === stepName || !prefilled.has(s.step));
         if (batch.length > 1) {
           log(`parallel seats: run ${current.id} starting ${batch.length} seats together (${batch.map((s) => s.step).join(', ')})`);
-          for (const seat of await runJudgeBatch({ batch, judge, clock, seatLanes, log })) prefilled.set(seat.step, seat);
+          for (const seat of await runJudgeBatch({ batch, judge, clock, seatLanes, log, onSeat: recordSeat })) prefilled.set(seat.step, seat);
         }
       }
       const pre = prefilled.get(stepName);
@@ -1137,7 +1158,14 @@ export async function driveRun({
           // when the engine reaches it.
           current = dropSaved(recordSeatSpend(current, pre), stepName);
         }
-        try { returned = await judge(current.pending.request); } catch (e) {
+        const observation = current.op === 'review-pr' && !current.pending.request?.skipSpawn
+          ? { step: stepName, request: current.pending.request, startedAt: clock(), finishedAt: null } : null;
+        if (observation) recordSeat(observation);
+        try {
+          returned = await judge(current.pending.request);
+          if (observation) recordSeat({ ...observation, ok: true, value: returned, finishedAt: clock() });
+        } catch (e) {
+          if (observation) recordSeat({ ...observation, ok: false, finishedAt: clock() });
           if (e?.telemetry) {
             current = { ...current, telemetry: [...(current.telemetry ?? []), normalizeJudgeTelemetry({ step: current.pending.step, stepIndex, telemetry: { ...e.telemetry, model: e.telemetry.servedModel, lens: current.pending.request?.lens } })] };
             store.write(current);
