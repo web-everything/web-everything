@@ -1,7 +1,10 @@
 ---
 kind: decision
-status: open
+status: resolved
 dateOpened: "2026-10-17"
+dateStarted: "2026-10-17"
+dateResolved: "2026-10-17"
+codifiedIn: "docs/agent/platform-decisions.md#review-stringency-classified-outcomes"
 preparedDate: "2026-10-17"
 preparedAgainstSha: "b1f6b2a13957d40ae74cae4c3b1811400ae4e008"
 relatedReport: "reports/2026-10-17-review-stringency.md"
@@ -9,6 +12,55 @@ tags: ["review", "stringency", "debt", "settings"]
 ---
 
 # Decision: review stringency — classified findings, per-level outcomes, debt register
+
+## Ruling
+
+**Ruled 2026-10-17 by the operator (Nicolas Gilbert), in conversation.** Verbatim: *"Ok for your picks"*, in
+answer to the card's recommended defaults. The rule is codified at
+[we:docs/agent/platform-decisions.md#review-stringency-classified-outcomes](../docs/agent/platform-decisions.md#review-stringency-classified-outcomes).
+The prepared text below is kept as the lineage; where it differs from this section, this section wins.
+
+- **Fork 1 = (a).** The reviewer tags the class; a path or pattern rule table overrides the tag. Low confidence
+  caps the outcome at advisory except for always-block classes. An unknown class or a table gap is a block.
+- **Fork 2 = (a).** A level move is blocked while debt due at that level is open. The only ways past are paying
+  the debt, or an operator's recorded edit of that item's must-pay-before level.
+- **Fork 3 = (a), with its precondition.** A new backlog kind `debt`. The same slice must register the kind's
+  size rule and buildable rule and update every reference to the kind set. If that cannot ship together, the
+  ruling falls back to (b), kind `task` plus debt frontmatter fields.
+- **Always-block rows** are accepted as proposed.
+
+**Amended table** (order: internal delivery, dogfood, public preview, public release). It replaces the
+"The table" section below for the rows named here; all other rows stand as proposed.
+
+| Class group | Internal | Dogfood | Preview | Release |
+|---|---|---|---|---|
+| Missing test on guard or delivery code | B | B | B | B |
+| Missing test elsewhere | E | B | B | B |
+| Security, high severity | E | E | B | B |
+| Security, lower severity | D | D | B | B |
+| Standards conformance (raised) | E | E | B | B |
+| NEW: PR description wrong about what the change does | E | E | E | B |
+| Doc, card or PR-body drift | D | D | D | B |
+| Simplicity and style | A | A | A | D |
+
+Notes on the rows. The "PR description wrong" row is to be revisited once the ledger allows a cheap
+description-only round. "Standards" is no longer grouped with lower-severity security; it is its own row.
+
+**Outcomes.** Four: block, expedite, debt, advisory.
+- Expedite: the PR lands, the card goes to the top of the build queue with a deadline; past the deadline it goes
+  to the operator as needs-you. The deadline length is a setting.
+- **Advisory is redefined:** recorded in the ledger, never fixed per PR. Recurring classes become builder
+  lessons.
+- Settings: `advisory.lessons.enabled` (on), `advisory.lessons.schedule` (Sunday 20:00 ET),
+  `advisory.lessons.recurrenceThreshold` (5 per class per week), `advisory.lessons.promoteToRule` (proposed to
+  the operator, never automatic).
+- The current level is **internal delivery**. Every cell and value is a cascade setting with its source logged.
+
+**Build order.** 1 closed class list; 2 settings table used by the ruling step; 3 debt register (kind, expedite
+queue position, level gate); 4 plateau debt panel; 5 advisory lessons on the ledger. Slices: see the epic filed
+under this ruling (the epic's children carry the order as `blockedBy` edges).
+
+Reference document (operator's proposal): https://claude.ai/code/artifact/85ac690b-07a7-4946-9d05-126c6ee16667
 
 Operator ask, 2026-10-17: "Yes prepare the decision." Proposal document (operator's own):
 [review stringency proposal](https://claude.ai/code/artifact/85ac690b-07a7-4946-9d05-126c6ee16667).
