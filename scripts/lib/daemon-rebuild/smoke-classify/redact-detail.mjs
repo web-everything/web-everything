@@ -151,6 +151,16 @@ function valueEnd(text, nameAt, at) {
   BARE.lastIndex = at;
   if (!BARE.exec(text)) return -1;
   let end = BARE.lastIndex;
+  // A YAML plain value goes on over deeper-indented lines — only for a `name:` that starts its line, so a stack trace
+  // under `Error: token: …` is kept.
+  let lineStart = nameAt;
+  while (lineStart > 0 && isBlank(text[lineStart - 1])) lineStart--;
+  if (/^["']?[A-Za-z0-9_-]+["']?[^\S\n]*:/.test(text.slice(nameAt, at)) && (lineStart === 0 || text[lineStart - 1] === '\n')) {
+    let eol = end;
+    while (eol < text.length && text[eol] !== '\n') eol++;
+    const more = indentedEnd(text, eol, nameAt - lineStart);
+    if (more > 0) return more;
+  }
   // A shell line continuation: the word goes on at the start of the next line.
   while (text[end - 1] === '\\' && text[end] === '\n') {
     CONTINUED.lastIndex = end + 1;

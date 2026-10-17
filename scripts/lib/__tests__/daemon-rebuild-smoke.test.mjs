@@ -281,6 +281,7 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
       ['curly quotes', `password: ${String.fromCharCode(0x201c)}alpha bravo\ncharlie delta${String.fromCharCode(0x201d)}`],
       ['a subscript name', 'env["PASSWORD"] = "alpha bravo\ncharlie delta"'],
       ['a next-line quoted value', 'db:\n  password:\n    "alpha bravo\n    charlie delta"\n  host: db.local'],
+      ['a YAML plain value over indented lines', 'db:\n  password: alpha bravo\n    charlie delta\n  host: db.local'],
     ])('%s never leaks a line of its value', (_shape, value) => {
       const text = `starting worker\n${value}\nFATAL: connection refused`;
       for (const [sink, out] of Object.entries(sinks(text))) expect([sink, leaks(out)]).toEqual([sink, []]);
@@ -305,6 +306,9 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
         expect(leaks(redactSecrets(text))).toEqual([]);
         expect(leaks(redactedTail(text))).toEqual([]);
       }
+    });
+    it('keeps a stack trace under an error line that merely contains a pair', () => {
+      expect(redactSecrets('Error: token: invalid\n    at run (x.js:1:1)')).toBe('Error: token=<redacted>\n    at run (x.js:1:1)');
     });
     it('a cut tail of long lines keeps its error message: the readings never swallow past the value bound', () => {
       const lines = Array.from({ length: 200 }, (_, n) => `frame ${n} ${'x'.repeat(1_200)}`);
