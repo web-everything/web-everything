@@ -150,11 +150,34 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
     const sinks = [JSON.stringify(events), JSON.stringify(readRebuildState(f.cloneDir, f.env)), JSON.stringify(r.alerts)];
     for (const s of secrets) for (const sink of sinks) expect(sink).not.toContain(s);
   });
+  it.each([
+    ['SERVICE_KEY=opaqueCredential123', 'SERVICE_KEY=<redacted>'],
+    ['export PRIVATE_KEY="opaqueCredential123"', 'export PRIVATE_KEY=<redacted>'],
+    ['"stripe-key": "opaqueCredential123"', 'stripe-key=<redacted>'],
+    ['KEY: opaqueCredential123', 'KEY=<redacted>'],
+    ['config serviceKey=opaqueCredential123', 'config serviceKey=<redacted>'],
+    ['--signing-key opaqueCredential123', '--signing-key=<redacted>'],
+    // A plain word before the assignment must not swallow it.
+    ['monkey token=opaqueCredential123', 'monkey token=<redacted>'],
+    ['Auth token=opaqueCredential123', 'Auth token=<redacted>'],
+  ])('redacts the generic key assignment %s', (line, expected) => {
+    expect(redactSecrets(line)).not.toContain('opaqueCredential123');
+    expect(redactSecrets(line)).toContain(expected);
+  });
+  it.each(['monkey=banana', 'hockey: score 3', 'turkey sandwich'])('leaves a word merely ending in "key" alone: %s', (line) => {
+    expect(redactSecrets(line)).toBe(line);
+  });
   it('redactedTail redacts before it cuts: an orphaned PEM body, CR runs, and a hostile key=value run stay bounded', () => {
     const body = Array.from({ length: 40 }, () => 'MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ');
     const orphan = [...body.slice(-20), '-----END PRIVATE KEY-----', 'after'].join('\n');
     expect(redactSecrets(orphan)).not.toContain('MIIEvQ');
     expect(redactSecrets(orphan)).toContain('after');
+    // An orphan longer than any line cap (an 8192-bit key), and one whose final body line is short.
+    const long = ['before', ...Array.from({ length: 120 }, (_, n) => `MIIJQgIBADANBgkqhkiG9w0BAQEFAASCCSwwggkoAgEAAoICAQ${String(n).padStart(3, '0')}`),
+      'AbC=', '-----END RSA PRIVATE KEY-----', 'after'].join('\n');
+    expect(redactSecrets(long)).not.toContain('MIIJQg');
+    expect(redactSecrets(long)).not.toContain('AbC=');
+    expect(redactSecrets(long).split('\n')).toEqual(['before', '<redacted private key>', 'after']);
     const cut = redactedTail(['-----BEGIN PRIVATE KEY-----', ...body, '-----END PRIVATE KEY-----', 'x'.repeat(70 * 1024)].join('\n'));
     expect(cut).not.toContain('MIIEvQ');
     const crs = redactedTail(Array.from({ length: 30 }, () => 'p\r'.repeat(500)).join('\n'));

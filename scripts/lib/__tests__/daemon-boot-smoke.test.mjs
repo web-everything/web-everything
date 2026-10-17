@@ -223,6 +223,13 @@ describe('checkDaemonEntriesBoot — injected runChild (no real subprocess)', ()
     expect(r.detail).toContain('unparsable');
   });
 
+  it('redacts a secret quoted by the unparsable-output error in entries[].error', async () => {
+    const r = await checkDaemonEntriesBoot(ctx(async () => 'x ghp_secretAAAA'));
+    expect(r.ok).toBe(false);
+    expect(r.entries[0].error).toContain('unparsable child output');
+    expect(JSON.stringify(r.entries)).not.toContain('ghp_secretAAAA');
+  });
+
   it('refuses an unsafe override entry BEFORE spawning anything (#4468 review — traversal/absolute/scheme)', async () => {
     let spawned = false;
     const r = await checkDaemonEntriesBoot({

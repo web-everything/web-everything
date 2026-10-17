@@ -351,15 +351,16 @@ function findTranscript(ids, home = homedir()) {
   return null;
 }
 
-/** The last `bytes` of a file as text ('' when unreadable); a partial first line is dropped when the read starts mid-file. */
-function readFileTail(file, bytes = 64 * 1024) {
+/** The last `bytes` of a file as text ('' when unreadable); a partial first line is dropped when the read starts mid-file.
+ *  One read of at most `bytes`, positioned at the final window (`read` is injectable so a test can pin that range). */
+export function readFileTail(file, bytes = 64 * 1024, read = readSync) {
   let fd;
   try {
     fd = openSync(file, 'r');
     const size = fstatSync(fd).size;
     const start = Math.max(0, size - bytes);
     const buf = Buffer.alloc(size - start);
-    const n = readSync(fd, buf, 0, buf.length, start);
+    const n = read(fd, buf, 0, buf.length, start);
     const text = buf.subarray(0, n).toString('utf8');
     return start > 0 ? text.slice(text.indexOf('\n') + 1) : text;
   } catch {
@@ -450,10 +451,12 @@ async function runRealDispatchSmokeAttempt({
       session ||= readdirSync(jobsDir).map((n) => join(jobsDir, n, 'state.json')).find((f) => ids.filter(Boolean).includes(readJson(f)?.sessionId)) || null;
     } catch { /* no background job file yet */ }
     markerAppeared ||= existsSync(marker);
-    recordAppeared ||= existsSync(join(store, `${slug}.json`));
+    const record = readJson(join(store, `${slug}.json`));
+    // The wrapper writes its own `started` record when it spawns the child; only a later record shows the task ran.
+    recordAppeared ||= !!record && record.status !== 'started';
     const markerText = existsSync(marker) ? readFileSync(marker, 'utf8').trim() : null;
     return judgeDispatchSmoke({
-      nonce, marker: markerText, record: readJson(join(store, `${slug}.json`)), denials: transcript ? transcriptDenials(transcript) : [], timedOut,
+      nonce, marker: markerText, record, denials: transcript ? transcriptDenials(transcript) : [], timedOut,
     });
   };
   for (;;) {

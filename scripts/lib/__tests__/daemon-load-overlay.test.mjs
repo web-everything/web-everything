@@ -20,7 +20,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
-  mkdtempSync, mkdirSync, readdirSync, writeFileSync, rmSync, existsSync,
+  mkdtempSync, mkdirSync, readdirSync, writeFileSync, rmSync, existsSync, readSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -305,7 +305,7 @@ describe('mergeOverlayRef / dryRunOverlay — REAL git (temp repos), proving the
 // command and the child env through the REAL completion-cli against a real store dir and asserts it stays empty.
 import {
   overlaySafetySettings, matchDispatchPaths, overlayDispatchFiles, judgeDispatchSmoke, withDispatchSmoke, runRealDispatchSmoke,
-  rollbackVersionIfCurrent, DISPATCH_PATH_DEFAULTS,
+  rollbackVersionIfCurrent, DISPATCH_PATH_DEFAULTS, readFileTail,
 } from '../daemon-load-overlay.mjs';
 
 const quietLog = { error: () => {}, log: () => {} };
@@ -963,10 +963,10 @@ describe('runRealDispatchSmoke — the smoke worker\'s completion record goes to
 
   it('keeps wrapper stderr out of detail and logs, and redacts and bounds it at the source', async () => {
     const secrets = ['ghp_secretAAAA', 'github_pat_secretBBBB', 'sk-ant-api03-secretCCCC', 'npm_secretDDDDDDDDDDDDDDDDDDDD', 'Bearer secretEEEE',
-      'secretFFFF', 'hunter2hunter2', 'pa55word'];
+      'secretFFFF', 'hunter2hunter2', 'pa55word', 'opaqueCredential123'];
     const spawn = launchFixture(({ scratch }) => {
       writeFileSync(join(scratch, 'wrapper.stderr'), [...secrets.slice(0, 5).map((s) => `token ${s}`),
-        'OPENAI_API_KEY=secretFFFF', 'progress\rDB_PASSWORD=hunter2hunter2', 'clone https://bot:pa55word@example.com/x', 'y'.repeat(20_000)].join('\n'));
+        'OPENAI_API_KEY=secretFFFF', 'SERVICE_KEY=opaqueCredential123', 'progress\rDB_PASSWORD=hunter2hunter2', 'clone https://bot:pa55word@example.com/x', 'y'.repeat(20_000)].join('\n'));
     });
     const log = { error: vi.fn() };
     const r = await smoke(spawn, { log });
@@ -981,6 +981,34 @@ describe('runRealDispatchSmoke — the smoke worker\'s completion record goes to
     expect(r.detail).not.toContain('token ');
     expect(r.diagnostics.stderrTail).toContain('token ghp_<redacted>');
     expect(Math.max(...r.diagnostics.stderrTail.split('\n').map((l) => l.length))).toBeLessThanOrEqual(500);
+  });
+
+  it('retries a launch timeout whose only record is the wrapper\'s own started record', async () => {
+    const spawn = launchFixture((a) => {
+      if (spawn.mock.calls.length === 2) finish(a);
+      else writeFileSync(join(a.store, `${a.slug}.json`), JSON.stringify({ status: 'started', pid: 12345 }));
+    });
+    const r = await smoke(spawn);
+    expect(spawn).toHaveBeenCalledTimes(2);
+    expect(r).toMatchObject({ ok: true, note: 'retried after launch timeout' });
+  });
+
+  it('reads at most the final 64 KiB of wrapper stderr', () => {
+    const file = join(work, 'wrapper.stderr');
+    const text = Array.from({ length: 4_000 }, (_, n) => `line ${String(n).padStart(4, '0')} ${'s'.repeat(40)}`).join('\n');
+    writeFileSync(file, text);
+    const size = Buffer.byteLength(text);
+    const reads = [];
+    const tail = readFileTail(file, 64 * 1024, (fd, buf, off, len, pos) => { reads.push({ len, pos }); return readSync(fd, buf, off, len, pos); });
+    expect(reads.length).toBeGreaterThan(0);
+    for (const r of reads) {
+      expect(r.len).toBeLessThanOrEqual(65_536);
+      expect(r.pos).toBe(size - 65_536);
+    }
+    expect(tail).not.toContain('line 0000');
+    expect(tail.endsWith(text.split('\n').pop())).toBe(true);
+    expect(text.endsWith(tail)).toBe(true);
+    expect(tail.startsWith('line ')).toBe(true);
   });
 
   it('does not retry a worker that finishes without its commands', async () => {
