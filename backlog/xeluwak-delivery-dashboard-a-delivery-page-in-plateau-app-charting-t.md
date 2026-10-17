@@ -13,7 +13,7 @@ tags: []
 
 # Delivery dashboard: a /delivery/ page in plateau-app charting the metrics history
 
-A /delivery page in plateau-app (the product), routed like the /wip page: a route template in plateau-app:index.html, a nav link, a title entry and a mount in plateau-app:src/main.ts, and a view in plateau-app:src/delivery/delivery-view.ts. It reads ONLY the collector history file (delivery-metrics, JSON lines, which stays in WE) and charts trends per measure group: throughput, speed, quality, operator load, trust, reliability, cost. Dev port 4000. [A1] Executable: npm test -- src/delivery (run in plateau-app).
+A /delivery page in plateau-app (the product), routed like the /wip page: a route template in plateau-app:index.html, a nav link, a title entry and a mount in plateau-app:src/main.ts, and a view in plateau-app:src/delivery/delivery-view.ts. It reads ONLY the collector history file (delivery-metrics, JSON lines, which stays in WE) and charts trends per measure group: throughput, speed, quality, operator load, trust, reliability, cost. Also shows a "Delivery protocols" panel listing each protocol's stage (proposed → defined → fixtures → live) with its rule and fixture counts and the overall percent of delivery decisions behind a protocol, read from the collector's delivery protocols measure group. Dev port 4000. [A1] Executable: npm test -- src/delivery (run in plateau-app).
 
 ## Acceptance
 
