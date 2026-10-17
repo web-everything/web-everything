@@ -31,6 +31,7 @@ import { appendFileSync, closeSync, constants, fstatSync, mkdirSync, openSync, r
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { CUT_MARKER } from '../lib/daemon-rebuild/smoke-classify/redact-detail.mjs';
 import { finishEnvelopeRecord, isValidSessionSlug, newEnvelopeRecord, redactFreeText } from './completion-record.mjs';
 import { resolveCompletionsDir, tryReadCompletion, withCompletionLock, writeCompletion } from './completion-store.mjs';
 import { claudeWorkerResultSchema } from './worker-result.mjs';
@@ -334,7 +335,9 @@ async function runWorkerOnce(spec, io, stop) {
               if (stderrBytes > DIAGNOSTIC_STDERR_MAX_BYTES) {
                 const kept = readFileSync(file).subarray(-DIAGNOSTIC_STDERR_KEEP_BYTES);
                 const br = firstLineBreak(kept);
-                const whole = br >= 0 ? kept.subarray(br + 1) : Buffer.alloc(0);
+                // The kept lines may start inside a multiline value, so the file opens with the cut marker its reader
+                // (`redactedTail`) redacts against.
+                const whole = Buffer.concat([Buffer.from(`${CUT_MARKER}\n`), br >= 0 ? kept.subarray(br + 1) : Buffer.alloc(0)]);
                 writeFileSync(file, whole);
                 stderrBytes = whole.length;
                 // No break in the window: it was all one unfinished line, so its remainder must not start the file.

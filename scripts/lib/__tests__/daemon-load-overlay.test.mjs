@@ -307,7 +307,7 @@ import {
   overlaySafetySettings, matchDispatchPaths, overlayDispatchFiles, judgeDispatchSmoke, withDispatchSmoke, runRealDispatchSmoke,
   rollbackVersionIfCurrent, DISPATCH_PATH_DEFAULTS, readFileTail,
 } from '../daemon-load-overlay.mjs';
-import { redactedTail } from '../daemon-rebuild/smoke-classify/redact-detail.mjs';
+import { CUT_MARKER, redactedTail } from '../daemon-rebuild/smoke-classify/redact-detail.mjs';
 
 const quietLog = { error: () => {}, log: () => {} };
 
@@ -1008,14 +1008,27 @@ describe('runRealDispatchSmoke — the smoke worker\'s completion record goes to
     }
     expect(tail).not.toContain('line 0000');
     expect(tail.endsWith(text.split('\n').pop())).toBe(true);
-    expect(text.endsWith(tail)).toBe(true);
-    expect(tail.startsWith('line ')).toBe(true);
+    // A mid-file read is marked cut, then holds whole lines only.
+    expect(tail.startsWith(`${CUT_MARKER}\nline `)).toBe(true);
+    expect(text.endsWith(tail.slice(CUT_MARKER.length + 1))).toBe(true);
+  });
+
+  it('a mid-file read that opens inside a multiline quoted value never leaks the value', () => {
+    const file = join(work, 'multiline.stderr');
+    // The 64 KiB read starts inside the opener's line, so its first whole line (`bravo`) is inside the value.
+    const tail = Array.from({ length: 1_500 }, (_, n) => `tail line ${n} ${'x'.repeat(28)}`).join('\n');
+    const text = `DB_PASSWORD="${'y'.repeat(4_000)} alpha\nbravo\ncharlie delta" FATAL\n${tail}`;
+    writeFileSync(file, text);
+    expect(text.length - 64 * 1024).toBeLessThan(text.indexOf('bravo'));
+    const out = redactedTail(readFileTail(file), 5_000);
+    for (const w of ['alpha', 'bravo', 'charlie', 'delta']) expect(out).not.toContain(w);
+    expect(out).toContain('tail line 0');
   });
 
   it('never returns a mid-line window: drops to the first break of any kind, and withholds a window with none', () => {
     const cr = join(work, 'cr.stderr');
     writeFileSync(cr, 'progress 50%\r'.repeat(6_000));
-    expect(readFileTail(cr).startsWith('progress 50%')).toBe(true);
+    expect(readFileTail(cr).startsWith(`${CUT_MARKER}\nprogress 50%`)).toBe(true);
     const oneLine = join(work, 'one-line.stderr');
     writeFileSync(oneLine, `export DB_PASSWORD="${'secretword '.repeat(8_000)}" FATAL`);
     expect(redactedTail(readFileTail(oneLine))).not.toContain('secretword');

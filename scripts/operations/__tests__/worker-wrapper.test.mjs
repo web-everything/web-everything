@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { writeStoredAwaitVerify, clearStoredAwaitVerify, awaitVerifyStoreKey } from '../../conveyor/await-verify.mjs';
+import { CUT_MARKER, redactedTail } from '../../lib/daemon-rebuild/smoke-classify/redact-detail.mjs';
 import { validateCompletionRecord } from '../completion-record.mjs';
 import { tryReadCompletion, writeCompletion } from '../completion-store.mjs';
 import { WORKER_MARKER_ENV, WORKER_MARKER_VALUE } from '../session-role.mjs';
@@ -81,8 +82,32 @@ describe('runWorker: the job record and the result channels', () => {
     await runWorker(s);
     const captured = readFileSync(join(diagnosticsDir, 'wrapper.stderr'), 'utf8');
     expect(captured.length).toBeLessThan(1_200 * 1_000);
-    expect(captured.split('\n').filter(Boolean).every((l) => l.startsWith('L'))).toBe(true);
+    // A compacted file is marked cut, then holds whole lines only.
+    expect(captured.startsWith(`${CUT_MARKER}\n`)).toBe(true);
+    expect(captured.slice(CUT_MARKER.length + 1).split('\n').filter(Boolean).every((l) => l.startsWith('L'))).toBe(true);
   });
+
+  it('a compaction that keeps the tail of a multiline quoted value never lets its reader leak it', async () => {
+    const diagnosticsDir = tmp();
+    // 960 KB of filler, the opener, then 50 long lines (100 KB) inside the value: the 1 MiB compaction keeps 64 KiB of
+    // the value's lines with no opener.
+    const script = [
+      "const filler = 'f'.repeat(99) + '\\n';",
+      'for (let i = 0; i < 9_600; i++) process.stderr.write(filler);',
+      "process.stderr.write('export DB_PASSWORD=\"alpha\\nbravo\\n');",
+      "for (let i = 0; i < 50; i++) process.stderr.write('t'.repeat(1_999) + '\\n');",
+      "process.stderr.write('charlie delta\" FATAL\\nafter line\\n');",
+      `process.stdout.write(${JSON.stringify(claudeStdout(DONE))});`,
+    ].join('\n');
+    await runWorker(spec({ diagnosticsDir, argv: ['-e', script] }));
+    const captured = readFileSync(join(diagnosticsDir, 'wrapper.stderr'), 'utf8');
+    expect(captured.startsWith(`${CUT_MARKER}\n`)).toBe(true);
+    expect(captured).not.toContain('DB_PASSWORD');
+    expect(captured).toContain('charlie delta');
+    const out = redactedTail(captured, 1_000);
+    for (const w of ['alpha', 'bravo', 'charlie', 'delta']) expect(out).not.toContain(w);
+    expect(out).toContain('after line');
+  }, 30_000);
 
   it('writes a started record with pid, timeout and deadline BEFORE the child exits, then a done envelope', async () => {
     const writes = [];

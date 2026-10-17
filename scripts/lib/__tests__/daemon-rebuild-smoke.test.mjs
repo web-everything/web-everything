@@ -9,7 +9,7 @@ import { rebuildClone, readRebuildState } from '../daemon-rebuild.mjs';
 import { addOverlay, readOverlayState } from '../daemon-overlays.mjs';
 import { dispatchSmokeSuspects } from '../daemon-rebuild/smoke.mjs';
 import { checkDaemonEntriesBoot, DAEMON_ENTRIES_ENV } from '../daemon-boot-smoke.mjs';
-import { redactDetail, redactSecrets, redactedTail } from '../daemon-rebuild/smoke-classify/redact-detail.mjs';
+import { CUT_MARKER, redactDetail, redactSecrets, redactedTail } from '../daemon-rebuild/smoke-classify/redact-detail.mjs';
 
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
@@ -247,6 +247,83 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
         expect(out).toMatch(/withheld/);
         expect(out).not.toContain('ghp_secret');
       }
+    });
+  });
+  describe('redacts multiline quoted assignments before splitting stderr lines (PR 5460 round 8)', () => {
+    const SECRET_WORDS = ['alpha', 'bravo', 'charlie', 'delta'];
+    const leaks = (out) => SECRET_WORDS.filter((w) => out.includes(w));
+    const sinks = (text) => ({
+      redactSecrets: redactSecrets(text), redactedTail: redactedTail(text),
+      redactDetail: redactDetail(text), bootDetail: redactDetail(text, 'daemon-entries-boot'),
+    });
+    it.each([
+      ['a double-quoted value', 'DB_PASSWORD="alpha bravo\ncharlie delta"'],
+      ['a single-quoted value', "DB_PASSWORD='alpha bravo\ncharlie delta'"],
+      ['a backtick value', 'token: `alpha bravo\ncharlie delta`'],
+      ['a triple-quoted value', 'password = """alpha "bravo"\ncharlie delta"""'],
+      ['a value over three lines', 'export API_TOKEN="alpha\nbravo\ncharlie\ndelta"'],
+      ['a CRLF and U+2028 split value', `DB_PASSWORD="alpha bravo\r\ncharlie${String.fromCharCode(0x2028)}delta"`],
+      ['a JSON key with a multiline value', '{"password": "alpha bravo\ncharlie delta"}'],
+      ['a flag with a multiline value', '--token "alpha bravo\ncharlie delta"'],
+      ['a Node inspect concatenation', "{ password: 'alpha bravo\\n' +\n    'charlie delta' }"],
+      ['a concatenation led by +', "secret = 'alpha bravo'\n  + 'charlie delta'"],
+      ['a YAML block scalar', 'db:\n  password: |\n    alpha bravo\n    charlie delta\n  host: db.local'],
+      ['a YAML folded scalar', 'password: >-\n  alpha bravo\n  charlie delta\nhost: db.local'],
+      ['a YAML value on the next line', 'db:\n  password:\n    alpha bravo charlie delta\n  host: db.local'],
+      // The shell joins `alpha\<newline>bravo…` into one word.
+      ['a backslash-continued value', 'export DB_PASSWORD=alpha\\\nbravo\\\ncharliedelta'],
+    ])('%s never leaks a line of its value', (_shape, value) => {
+      const text = `starting worker\n${value}\nFATAL: connection refused`;
+      for (const [sink, out] of Object.entries(sinks(text))) expect([sink, leaks(out)]).toEqual([sink, []]);
+      expect(redactSecrets(text)).toContain('FATAL: connection refused');
+      expect(redactSecrets(text)).toContain('starting worker');
+    });
+    it('fails closed on an unterminated quoted value: the rest of the text is redacted', () => {
+      const out = redactSecrets('ok\nDB_PASSWORD="alpha bravo\ncharlie delta\nmore');
+      expect(leaks(out)).toEqual([]);
+      expect(out.startsWith('ok\nDB_PASSWORD=<redacted>')).toBe(true);
+    });
+    it('treats a quoted value longer than its line bound as unterminated, never as closed by a far quote', () => {
+      const body = Array.from({ length: 80 }, (_, n) => `alpha line ${n}`).join('\n');
+      const out = redactSecrets(`DB_PASSWORD="${body}"\nafter`);
+      expect(out).not.toContain('alpha');
+    });
+    it('keeps a closed multiline value from swallowing what follows it', () => {
+      expect(redactSecrets('DB_PASSWORD="alpha\nbravo" exit=1\nnext line')).toBe('DB_PASSWORD=<redacted> exit=1\nnext line');
+    });
+    it('a 64 KiB tail window that opens inside a multiline quoted value never leaks its tail', () => {
+      const tail = Array.from({ length: 1_400 }, (_, n) => `tail line ${String(n).padStart(4, '0')} ${'x'.repeat(28)}`).join('\n');
+      for (const q of ['"', "'", '`', '"""']) {
+        // The 64 KiB window cuts the opener's line, so its first whole line (`bravo`) is inside the value.
+        const text = `DB_PASSWORD=${q}${'y'.repeat(8_000)} alpha\nbravo\ncharlie delta${q} FATAL\n${tail}`;
+        const cut = text.length - 64 * 1024;
+        expect(cut).toBeGreaterThan(text.indexOf('DB_PASSWORD'));
+        expect(cut).toBeLessThan(text.indexOf('bravo'));
+        const out = redactedTail(text, 5_000);
+        expect(leaks(out)).toEqual([]);
+        expect(out).toContain('tail line 0000');
+        expect(leaks(redactSecrets(`bravo\ncharlie delta${q} FATAL\nok`, { cut: true }))).toEqual([]);
+      }
+    });
+    it('a text cut at its start (CUT_MARKER) is read as possibly opening inside a value, in every continuation shape', () => {
+      for (const body of ['charlie delta" FATAL\nok', "  'charlie delta'\nok", '    charlie delta\nok', 'charlie delta\nok']) {
+        expect(leaks(redactedTail(`${CUT_MARKER}\n${body}`))).toEqual([]);
+        expect(redactedTail(`${CUT_MARKER}\n${body}`)).toContain('ok');
+      }
+      // Under the cut reading, the first quote may close the cut-off value — and may also OPEN one. Both are covered.
+      expect(leaks(redactSecrets('x\nDB_PASSWORD="alpha\nbravo"\nok', { cut: true }))).toEqual([]);
+      // Text that was never cut keeps its first line.
+      expect(redactedTail('charlie delta\nok')).toContain('charlie delta');
+    });
+    it('the rebuild alert sink redacts a multiline quoted credential in a diagnostics stderr tail', async () => {
+      const f = makeFixture();
+      addDispatchOverlay(f);
+      const stderrTail = 'boot\nDB_PASSWORD="alpha bravo\ncharlie delta"\nFATAL: refused';
+      const diagnostics = { wrapperPid: 7, stderrTail };
+      const r = await rebuild(f, async () => ({ ok: false, reason: 'timeout', detail: `launch timeout ${stderrTail}`, diagnostics, attempts: [{ reason: 'timeout', diagnostics }] }));
+      const alert = r.alerts.find((a) => a.kind === 'dispatch-smoke-failed').detail;
+      expect(alert.diagnostics.stderrTail).toContain('FATAL: refused');
+      for (const sink of [JSON.stringify(r.alerts), JSON.stringify(readRebuildState(f.cloneDir, f.env))]) expect(leaks(sink)).toEqual([]);
     });
   });
   it('redactedTail redacts before it cuts: an orphaned PEM body, CR runs, and a hostile key=value run stay bounded', () => {
