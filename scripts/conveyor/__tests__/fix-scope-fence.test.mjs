@@ -330,6 +330,29 @@ describe('the live scope fence adapter over a real repository', () => {
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
   });
 
+  it.each([
+    ['restoring the removal under the new name after a rename-aware merge', false],
+    ['keeping the renamed file in a rename/delete conflict over a PR deletion', true],
+  ])('a catch-up over an upstream rename of a PR path blocks %s', (_, prDeletes) => {
+    const r = realRepo();
+    try {
+      r.write('guard.mjs', restored); r.commit('initial');
+      r.git(['checkout', '-qb', 'pr']);
+      if (prDeletes) r.git(['rm', '-q', 'guard.mjs']); else r.write('guard.mjs', 'function guard() {}\n');
+      const head = r.commit('removal');
+      r.git(['checkout', '-q', 'main']); r.git(['mv', 'guard.mjs', 'moved.mjs']); const base = r.commit('upstream rename');
+      r.git(['checkout', '-q', 'pr']);
+      try { r.git([...ident, 'merge', '-q', '--no-edit', base]); } catch { r.git(['add', 'moved.mjs']); r.git([...ident, 'commit', '-q', '--no-edit']); }
+      r.write('moved.mjs', restored);
+      if (r.git(['status', '--porcelain']).trim()) r.commit('repair');
+      const sha = r.git(['rev-parse', 'HEAD']).trim();
+      const { result, push } = liveFence(r, { head, sha, base, compare: 'identical' });
+      expect(result).toMatchObject({ ok: false, scopeFence: true, terminal: true });
+      expect(result.reason).toContain(readded);
+      expect(push).not.toHaveBeenCalled();
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+
   it('reads the commit the push sends, not a lane replace ref that hides it', () => {
     const r = realRepo();
     try {

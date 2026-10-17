@@ -94,7 +94,16 @@ export function createScopeFencedPush({ root, exec = execFileSync, env = process
       // A path the PR changed (since any merge base) is judged against the PR head, so restoring a removal the base still
       // holds counts, as does every line a conflict resolution keeps (upstream's included: fails closed). Any other path
       // is upstream's file unless the push differs from the merged base, which also catches a revert of upstream's change.
-      const pr = new Set(git(['merge-base', '--all', head, merged]).split('\n').filter(Boolean).flatMap(b => names(b, head)));
+      // Upstream's rename of a PR path still holds what the PR removed there, so its new name is judged against head too.
+      const bases = git(['merge-base', '--all', head, merged]).split('\n').filter(Boolean);
+      const pr = new Set(bases.flatMap(b => names(b, head)));
+      for (const b of bases) {
+        const f = git([...FENCE_DIFF.filter(a => a !== '--no-renames'), '-M', '-l0', '--diff-filter=R', '--name-status', '-z', b, merged, '--']).split('\0');
+        for (let i = 0; i + 2 < f.length; i += 3) {
+          if (!/^R\d*$/.test(f[i])) throw new Error('upstream rename list unreadable');
+          if (pr.has(f[i + 1])) pr.add(f[i + 2]);
+        }
+      }
       const literal = magic => p => `:(top,literal${magic})${p}`;
       const prPaths = changed.filter(p => pr.has(p));
       return { paths: [...prPaths, ...names(merged, sha).filter(p => !pr.has(p))],
