@@ -46,7 +46,7 @@ describe('mechanical round enrichment port (#5948)', () => {
     enrichBaseRef: p => p, enrichSystemFix: p => p, enrichEscalationBase: p => p,
     enrichFixClaims: p => p, enrichTimeouts: p => p, enrichReferralHolds: p => p,
     enrichLedgerHolds: p => p, enrichRulings: p => p, enrichScopeBloat: p => p,
-    enrichCodeQL: p => p, enrichOwedMainRule: () => {}, env: { WE_REVIEW_ROUND_CAP: '5' },
+    enrichCodeQL: p => p, enrichOwedMainRule: () => {}, env: { WE_REVIEW_ROUND_CAP: '5', WE_REVIEW_START_AFTER: 'ci-green' },
     now: Date.parse('2026-10-10T12:00:00Z') });
 
   it.each([['we', false, true], ['we', true, false], ['frontierui', false, false],
@@ -131,6 +131,7 @@ it('maps repo slugs before binding and refuses unknown repos before IO', async (
   const { runReconcilePass } = await import('../reconcile-pass.mjs');
   const requiredChecks = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'];
   const options = {
+    env: { WE_REVIEW_START_AFTER: 'ci-green' },
     readRequiredChecks: () => ({ checks: requiredChecks, source: 'live' }),
     readPrs: () => [{ statusCheckRollup: requiredChecks.map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })), number: 49, headRefName: 'lane/1-x', headRefOid: 'a'.repeat(40), labels: [{ name: 'review:pending' }], comments: [] }],
     readAgents: () => [{ name: 'review-fui-49', pidAlive: true, pid: 1 }], enrich: (agents) => agents,

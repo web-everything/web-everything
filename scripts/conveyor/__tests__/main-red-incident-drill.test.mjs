@@ -30,7 +30,9 @@ import { probeAndOwnMainCi, ledgerPathIn } from '../main-ci-red-io.mjs';
 import smell from '../health-smells/main-ci-red.mjs';
 import { emptyHealthState, runHealthTick } from '../health-watch-core.mjs';
 import { NOTIFY_EVEN_IN_SHADOW } from '../health-smells-notify-list.mjs';
-import { planReconcile as planReconcileCore } from '../reconcile-core.mjs';
+import { planReconcile as planReconcileCoreWithTiming } from '../reconcile-core.mjs';
+// This historical fixture exercises the serial policy; new defaults have their own timing suite.
+const planReconcileCore = options => planReconcileCoreWithTiming({ reviewTiming: { startAfter: 'ci-green' }, fixTiming: { joinCiAndReview: false }, ...options });
 import { planMainRedRebases } from '../main-red-recovery.mjs';
 import { planBuildDispatch, BUILD_DISPATCH_POLICY } from '../build-dispatch-policy.mjs';
 import { resolveDraft } from '../../pr-land.mjs';

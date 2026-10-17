@@ -88,7 +88,7 @@ describe('settings and row evidence', () => {
 });
 const identity = x => x;
 function plan({ setting = 'on', draft = false, testRed = false, readVerdict = () => verdict(), ...extra } = {}) {
-  return runReconcilePass({ readPrs: () => [{ number: 4965, headRefOid: sha, headRefName: 'lane/4965-example', baseRefName: 'main', labels: [{ name: 'review:pending' }], comments: [], isDraft: draft, statusCheckRollup: [row, { ...green, conclusion: testRed ? 'FAILURE' : 'SUCCESS' }] }],
+  return runReconcilePass({ env: { WE_REVIEW_START_AFTER: 'ci-green' }, readPrs: () => [{ number: 4965, headRefOid: sha, headRefName: 'lane/4965-example', baseRefName: 'main', labels: [{ name: 'review:pending' }], comments: [], isDraft: draft, statusCheckRollup: [row, { ...green, conclusion: testRed ? 'FAILURE' : 'SUCCESS' }] }],
     readAgents: () => [], enrich: identity, readRequiredChecks: () => ({ checks: ['test', 'merge-gate'] }), readChecks: () => [row, green],
     readMergeGateVerdict: readVerdict, readFreeze: () => ({ error: 'not needed' }), mergeGateSetting: { value: setting },
     enrichMainRed: prs => ({ prs, mainRedWindows: [] }),
@@ -187,7 +187,7 @@ describe('fresh review CI merge-gate holds', () => {
   const rest = { ...row, status: 'completed', conclusion: 'failure', head_sha: sha,
     details_url: 'https://github.com/owner/repo/actions/runs/100/job/123' };
   function gate(extra = {}) {
-    return readReviewCiGate({ repo, pr: 4965, readHead: () => sha, readLabels: () => [],
+    return readReviewCiGate({ policy: { startAfter: 'ci-green' }, repo, pr: 4965, readHead: () => sha, readLabels: () => [],
       readChecks: () => [rest, { context: 'legacy', state: 'success' }],
       readRequired: () => ({ source: 'live', checks: ['merge-gate', 'legacy'] }),
       readMergeGateVerdict: () => verdict(), readFreeze: () => ({ error: 'unused' }), mergeGateSetting: 'on', ...extra });
@@ -294,7 +294,7 @@ describe('facts-first review CI merge-gate refusals', () => {
   const readRequired = () => ({ source: 'live', checks: ['merge-gate', 'test'] });
   async function gate(failedCheck, live) {
     const { readReviewCiGateFactsFirst } = await import('../review-facts.mjs');
-    return readReviewCiGateFactsFirst({ repo, pr, live, liveHead: () => sha,
+    return readReviewCiGateFactsFirst({ policy: { startAfter: 'ci-green' }, repo, pr, live, liveHead: () => sha,
       readRequired, mergeGateSetting: 'on',
       lookup: () => ({ facts: { state: 'open', headSha: sha, labels: ['review:pending'],
         checks: ['merge-gate', 'test'].map(name => ({ name, conclusion: name === failedCheck ? 'failure' : 'success' })),
@@ -306,7 +306,7 @@ describe('facts-first review CI merge-gate refusals', () => {
     const live = vi.fn(() => allowed);
     expect(await gate('merge-gate', live)).toEqual(allowed);
     expect(live).toHaveBeenCalledTimes(1);
-    expect(live).toHaveBeenCalledWith({ repo, pr, readRequired, mergeGateSetting: 'on' });
+    expect(live).toHaveBeenCalledWith({ repo, pr, readRequired, mergeGateSetting: 'on', policy: { startAfter: 'ci-green' } });
   });
   it('still trusts a completed test failure without reading the live gate', async () => {
     const live = vi.fn(() => ({ allowed: true }));

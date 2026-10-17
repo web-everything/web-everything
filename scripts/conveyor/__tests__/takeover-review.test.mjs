@@ -2,7 +2,9 @@
 import { describe, it, expect } from 'vitest';
 import { takeoverReviewGrant, OPERATOR_TAKEOVER_PREFIX } from '../takeover-review.mjs';
 import { takeoverMarkerBody, takeoverVoidMarkerBody } from '../fix-takeover.mjs';
-import { planReconcile } from '../reconcile-core.mjs';
+import { planReconcile as planReconcileWithTiming } from '../reconcile-core.mjs';
+// This historical fixture exercises the serial policy; new defaults have their own timing suite.
+const planReconcile = options => planReconcileWithTiming({ reviewTiming: { startAfter: 'ci-green' }, fixTiming: { joinCiAndReview: false }, ...options });
 import { resolveReviewSettings, validateReviewSettings } from '../../lib/review-settings.mjs';
 
 const BOT = { login: 'web-everything' };

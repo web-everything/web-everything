@@ -398,7 +398,7 @@ describe('x6n7c2p required checks before review — fresh dispatch boundary', ()
     let headReads = 0;
     let spawns = 0;
     let sessionWrites = 0;
-    const ciGate = ({ repo, pr }) => readReviewCiGate({ repo, pr,
+    const ciGate = ({ repo, pr }) => readReviewCiGate({ repo, pr, policy: { startAfter: 'ci-green' },
       readHead: args => { reads.push(['head', args]); return state === 'head-moved' && headReads++ ? 'b'.repeat(40) : headSha; },
       readRequired: args => { reads.push(['required', args]); return { source: ['stale-cache', 'fallback'].includes(state) ? state : 'live', checks: ['test', 'daemon-soak'] }; },
       readChecks: args => {
@@ -432,7 +432,7 @@ it('x6n7c2p required checks before review — default job four-tick soak spends 
       acquirableLanes: () => 1, tagRound: row => rounds.push(row.round), tagStatus: () => {}, statusCandidates: () => [], holdReconcile: () => [],
       dispatch: options => dispatchReviewByMode({ ...options, mode: 'job', root: '/daemon', dir,
         checkStaleness: FRESH, readCompletion: () => null, resolveSettingsEnv: () => ({}),
-        ciGate: args => readReviewCiGate({ ...args, readHead: () => head.repeat(40),
+        ciGate: args => readReviewCiGate({ ...args, policy: { startAfter: 'ci-green' }, readHead: () => head.repeat(40),
           readRequired: () => ({ source: 'live', checks: ['test', 'daemon-soak'] }),
           readChecks: () => [{ name: 'test', status: 'completed', conclusion: 'success' }, { name: 'daemon-soak', status, conclusion }],
         }), spawnJob: () => { spawns++; return 4242; },

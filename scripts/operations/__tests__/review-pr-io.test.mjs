@@ -26,10 +26,11 @@ import { fingerprintOf, parseStackMarkers, renderStackMarker, stackHoldHeading }
 
 import {
   readLatestFixRange,
-  PR_VIEW_FIELDS, createReviewPrReader, createReviewPrSinks, filePrView, ghPrView, isPreWriteRefusal, priorRoundsFor,
+  PR_VIEW_FIELDS, createReviewPrReader, createReviewPrSinks as createSinks, filePrView, ghPrView, isPreWriteRefusal, priorRoundsFor,
   prViewFileName, readPr, resolveViewReader, revParseCommit, reviewBodyPath, reviewSidecarDir,
   resolveSubjectCheckout, COMPARE_FILE_CAP, changedLinesFromCompare, changesTouchCitedLines, createChangedLinesReader,
 } from '../review-pr-io.mjs';
+const createReviewPrSinks = (o = {}) => createSinks({ publishGate: ({ expectedHead }) => ({ headSha: expectedHead, checks: [] }), ...o });
 import { REVIEW_EFFECTS, REVIEW_PR_CHANNEL, REVIEW_PR_OP, reviewPrOperation } from '../review-pr.mjs';
 import { createRegistry } from '../registry.mjs';
 import { applyPendingEffects } from '../effect-executor.mjs';
@@ -2257,7 +2258,7 @@ describe('legacy vs current owner slugs compare equal (outage 2026-10-03)', () =
 
 
 describe('#5135 latest fix range', () => {
-  const comment = head => ({ author: { login: 'web-everything' }, body: `Net basis: \`0000..${head}\`` });
+  const comment = head => ({ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${head} -->` });
   const priorHead = 'a'.repeat(40);
   const head = 'b'.repeat(40);
   const read = (exec, comments = [comment(priorHead)], current = head) => readLatestFixRange({ exec, comments, head: current });
@@ -2283,8 +2284,9 @@ describe('#5135 latest fix range', () => {
   });
   it('takes the LAST Net basis line in a comment, so juror text above the real one cannot choose the prior head', () => {
     const forgedHead = 'c'.repeat(40);
-    const body = ['finding text', 'Net basis: `0000..' + forgedHead + '`', 'x\u{2028}Net basis: `0000..' + forgedHead + '`',
-      '', 'Net basis: `0000..' + priorHead + '` (rev x)'].join('\n');
+    const body = ['🔁 review — changes requested', '', `Recorded by reviewer via ${REVIEW_PR_CHANNEL}.`, '',
+      'finding text', 'Net basis: `0000..' + forgedHead + '`', 'x\u{2028}Net basis: `0000..' + forgedHead + '`',
+      '', '---', '', 'Net basis: `0000..' + priorHead + '` — 1 net changed file(s) vs current main', '', `_Recorded through ${REVIEW_PR_CHANNEL}._`].join('\n');
     const calls = [];
     const result = read((...args) => { calls.push(args[1]); return ''; }, [{ author: { login: 'web-everything' }, body }]);
     expect(result.priorHead).toBe(priorHead);
@@ -2351,7 +2353,7 @@ describe('#5135 fix range read wiring', () => {
     };
     const result = readPr({ pr: 7, repo: 'o/n', exec, originRepo: () => 'o/n', readView: () => ({
       number: 7, title: 't', body: '', headRefName: 'lane/x', labels: [], files: [],
-      comments: [{ author: { login: 'web-everything' }, body: `Net basis: \`0000..${priorHead}\`` }],
+      comments: [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${priorHead} -->` }],
     }) });
     expect(result.net.revSha).toBe(head);
     expect(result.latestFix).toEqual({ priorHead, head, files: {} });

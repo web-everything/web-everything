@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 /**
  * @file scripts/conveyor/review-hold-reconcile.mjs
  * @description THE REVIEW-HOLD RECONCILE SWEEP (#x01u7az) — a one-time-and-ongoing cleanup pass for two
@@ -252,6 +253,7 @@ export function sweepReviewHoldLabels({
       });
       const r = numberingRestamp({ repo: slug, pr: pr.number, state, reviews, provider, dryRun, cwd: noCheckout ? undefined : cwd,
         readNetDiff, readLiveState, exec, guardReferrals: assertMandatoryReferralsCleared,
+        acceptCarry: acceptCarry ?? (resolveTimingPolicy().review.skipDrainMechanical ? 'on' : 'off'),
         ...(noCheckout ? { prove: () => ({ ok: false, retryable: true, reason: 'no checkout for repository' }) } : {}) });
       // A pass that withdrew, posted or failed is read again next pass. A clean one settles the check until it expires —
       // briefly when the formal reviews were unreadable, since without them a record they strand looks like any other.

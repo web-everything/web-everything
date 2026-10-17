@@ -1,3 +1,4 @@
+import { reviewStartGate, REVIEW_TIMING_DEFAULTS, joinedFixDecision, fixReadiness, FIX_TIMING_DEFAULTS } from '../lib/review-timing.mjs';
 /**
  * reconcile-core.mjs — the PURE reconcile pass (#3296): compare DESIRED delivery state against ACTUAL, for
  * every open PR, and return what to dispatch plus every refusal and the fact each turned on.
@@ -292,6 +293,7 @@ export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-tim
  *   `scope-bloat` / `ruling-dispute` — see the comments on the list below.
  */
 export const REFUSAL_KINDS = Object.freeze([
+  'fix-join-wait',
   'review-ci', 'review-referrals-pending',
   'stood-down', 'load-flake-hold', 'load-flake-rearm-owed', 'no-findings', 'cap-exhausted',
   'live-process', 'awaiting-permission', 'liveness-unknown',
@@ -1336,9 +1338,20 @@ function refuseUnreviewable({ pr, refuse, withPhase, extra = {} }) {
   return false;
 }
 
+/** Head-local inputs for the joined-fix policy; prior and superseded verdicts cannot reopen findings. */
+function timingFacts(pr) {
+  const comments = Array.isArray(pr?.comments) ? pr.comments : [];
+  const latest = comments.filter(c => isTrustedMarkerAuthor(c) && verdictJudged(c, pr.headRefOid)).at(-1);
+  const body = String(latest?.body ?? '').trimStart();
+  const findings = latest && (body.startsWith('🔁 review — changes requested')
+    || (body.includes('**Advisory outcome:**') && /Advisory outcome:\*\*\s*`?changes/.test(body))) ? [latest] : [];
+  return fixReadiness({ headSha: pr.headRefOid, checks: pr.statusCheckRollup, findings,
+    reviewPending: labelNames(pr.labels).some(l => ['review:pending', 'review-status:reviewing'].includes(l)) });
+}
+
 /** A shared prerequisite for every review emission, including advisory review branches. */
 function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }) {
-  const ci = reviewCiGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup });
+  const ci = reviewStartGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup, policy: pr.reviewTiming });
   if (!ci.allowed) refuse('review-ci', {
     ...withPhase, ...extra, ci,
     why: `${ci.reason}: ${ci.affected.map(row => `${row.name}=${row.reason}`).join(', ')}`,
@@ -1498,7 +1511,7 @@ function dispatchReviewRow({
   // accounting below, but it passes every gate ABOVE (referral hold, scope-bloat, draft, already-reviewed-head) and
   // the CI gate: it is this function's review, never a second hand-rolled copy of it.
   if (advisoryReview) {
-    if (advisoryReview.ciWaived !== true && !reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra })) return;
+    if ((advisoryReview.ciWaived !== true || pr.reviewTiming?.startAfter !== 'ci-green') && !reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra })) return;
     dispatch.push({
       ...base, ...withPhase, kind: 'review', findings: countFindings(pr?.comments), ...extra,
       advisoryReview: { head: advisoryReview.head, reason: advisoryReview.reason,
@@ -1876,6 +1889,7 @@ export function missingReviewLabel(pr) {
   return isAiGeneratedPr(pr) && !pr.labels.some(l => (typeof l === 'string' ? l : l.name).startsWith('review:'));
 }
 
+
 export function planReconcile({
   repo = 'we', prs = [], agents = [], durableCounts = {}, now = 0, roundCap = NEGOTIATION_ROUND_CAP, ciHealCap: ciHealCapArg = null,
   // `ciHeal.*` budget cascade ({@link resolveCiHealBudget}); the IO shell may pass the resolved layers. An explicit
@@ -1916,7 +1930,7 @@ export function planReconcile({
   // Optional and pure DATA IN: this file stays IO-free, so the caller (`we:scripts/conveyor/reconcile-pass.mjs`)
   // is the one that fetches (and caches) the live set; omitted, `classifyPr` falls back to its own exclusion-
   // list default unchanged — byte-identical behaviour to before this param existed.
-  requiredChecks = null,
+  requiredChecks = null, reviewTiming = REVIEW_TIMING_DEFAULTS, fixTiming = FIX_TIMING_DEFAULTS,
   advisoryReviewOnHumanHandoff = 'off', unlabeledRedAgentPr = 'off',
   // xilx617 (epic #4075/#3383) — the bound a `live-process` refusal must overrun before it also gets a
   // surfaced `session-overrun` note (see {@link LIVE_SESSION_OVERRUN_MS}'s own docblock). A `planReconcile`
@@ -1938,6 +1952,7 @@ export function planReconcile({
   // (`owed-ci-rerun`) — it is the one PR main is waiting for. `null` (default) = before this card, byte-identical.
   mainRedPriority = null,
 } = {}) {
+  prs = prs.map(pr => ({ ...pr, reviewTiming }));
   const isMainFixPriority = (n) => mainRedPriorityRank(n, mainRedPriority, { now, repo }) === 0;
   const dispatch = [];
   const refusals = [];
@@ -2363,7 +2378,11 @@ export function planReconcile({
 
     // ── REFUSAL 4 — liveness, from a live process. The binding is derived and its evidence travels with the
     // refusal, because the derivation itself has been observed to be wrong (#3283).
-    const bound = bindAgents(pr, agents, repo);
+    const readiness = timingFacts(pr);
+    const join = joinedFixDecision({ ...readiness, now, policy: fixTiming });
+    // After the cap a CI fixer may proceed while a review winds down. Its publish guard voids a red-head verdict.
+    const ignoreReview = readiness.ciFailed && fixTiming.joinCiAndReview && join.action === 'dispatch';
+    const bound = bindAgents(pr, agents, repo).filter(b => !(ignoreReview && /^review-/.test(b.agent?.name ?? b.agent?.sessionSlug ?? '')));
 
     // xilx617 (epic #4075/#3383) — the durable per-session infra-retry streak, surfaced independently of
     // whatever `assessLiveness` below returns (a capped session may already read `selfReportedDone` — finished,
@@ -3037,6 +3056,11 @@ export function planReconcile({
       // Live PR #4631 — only REQUIRED failures are healed or named as the failure; a non-required red (`merge-gate`,
       // red by design until #4715) is reported beside it, never healed. The budget is the heals since the PR's last
       // non-mechanical head ({@link ciHealBudgetResetAt}), not every heal it ever had.
+      if (fixTiming.joinCiAndReview && readiness.ciFailed && readiness.reviewFindings && roundAttempts() >= effectiveRoundCap) {
+        refuseCapExhausted({ ...withPhase, attempts: roundAttempts(), cap: effectiveRoundCap, capKind: 'fix',
+          why: 'joined CI/review repair cannot bypass the review-fix round cap' });
+        continue;
+      }
       const failing = splitFailingChecks(pr?.statusCheckRollup, requiredChecks);
       const healBudget = healBudgetFor(pr);
       const ciHealAttempts = healBudget.chargeable;
@@ -3072,6 +3096,7 @@ export function planReconcile({
       } else {
         dispatch.push({
           ...base, ...withPhase, ...refund, ...healFacts, ...owedMainRuleFact, kind: 'ci-heal', attempts: ciHealAttempts,
+          ...(fixTiming.joinCiAndReview && readiness.reviewFindings ? { reviewFixAttempts: roundAttempts() } : {}),
           why: `a required check is failing (${failing.required.join(', ') || 'unnamed'}), nothing live is working it, and ${ciHealAttempts} of ${ciHealCap} CI-heal attempts are spent`
             + (healBudget.log.resetAt ? ` since ${healBudget.log.resetBy}'s push at ${healBudget.log.resetAt}` : '')
             + ` (cap from ${ciHealCapSource})`
@@ -3554,7 +3579,26 @@ export function planReconcile({
     const since = fixWaitingSince(sourcePr?.comments) || sourcePr?.createdAt;
     if (since) entry.waitingSince = since;
   }
-  return { dispatch, refusals, notes };
+  const timedDispatch = [];
+  for (const entry of dispatch) {
+    if (!['fix', 'ci-heal'].includes(entry.kind)) { timedDispatch.push(entry); continue; }
+    const pr = prs.find(p => Number(p.number) === entry.prNumber);
+    const facts = timingFacts(pr);
+    const decision = joinedFixDecision({ ...facts, now, policy: fixTiming });
+    if (decision.action === 'wait') {
+      refusals.push({ ...entry, kind: 'fix-join-wait', deadline: decision.deadline,
+        why: 'waiting for the other CI/review input within fix.joinWaitMaxMin' });
+      continue;
+    }
+    if (decision.joined) {
+      // One fix worker, using the existing fix claim shared with CI-heal; never emit a second healer.
+      if (timedDispatch.some(d => d.prNumber === entry.prNumber && d.joinedInputs)) continue;
+      timedDispatch.push({ ...entry, kind: 'fix', findings: facts.findings.length,
+        attempts: entry.reviewFixAttempts ?? entry.attempts,
+        joinedInputs: { head: pr.headRefOid, ciFailures: facts.ciFailures, reviewFindings: facts.findings.map(c => c.body) } });
+    } else timedDispatch.push(entry);
+  }
+  return { dispatch: timedDispatch, refusals, notes };
 }
 
 /**

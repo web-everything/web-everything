@@ -1,0 +1,60 @@
+/** Pure review/fixer timing decisions. Inputs always describe one pinned head. */
+import { reviewCiGate } from './review-ci-gate.mjs';
+import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
+
+export const REVIEW_TIMING_DEFAULTS = Object.freeze({
+  startAfter: 'fast-checks', fastChecks: ['standards', 'test-shard (1)'], cancelOnCiRed: true,
+  deltaMaxLines: 50, deltaMaxFiles: 3, skipDrainMechanical: true,
+});
+export const FIX_TIMING_DEFAULTS = Object.freeze({ joinCiAndReview: true, joinWaitMaxMin: 15 });
+const RED = new Set(['failure', 'error', 'timed_out', 'cancelled', 'action_required', 'startup_failure']);
+/** Review-dependent gates are red while a review is owed; they are not CI failures. */
+export function ciRedOnHead({ headSha, checks } = {}) {
+  if (!headSha) return false;
+  return collapseRollupToLatestPerName(checks).some(row =>
+    !['review-gate', 'merge-gate'].includes(row.name ?? row.context)
+    && (!row.head_sha || row.head_sha === headSha)
+    && RED.has(String(row.conclusion ?? row.state ?? '').toLowerCase()));
+}
+export function reviewStartGate({ headSha, checks, requiredChecks, policy = REVIEW_TIMING_DEFAULTS } = {}) {
+  if (policy.startAfter === 'ci-green') return reviewCiGate({ headSha, checks, requiredChecks });
+  if (ciRedOnHead({ headSha, checks })) return { allowed: false, headSha, reason: 'ci-red', affected: [] };
+  if (policy.startAfter === 'push') return { allowed: typeof headSha === 'string' && !!headSha.trim(), headSha, reason: typeof headSha === 'string' && headSha.trim() ? 'push' : 'missing-head', affected: [] };
+  return reviewCiGate({ headSha, checks, requiredChecks: policy.startAfter === 'ci-green' ? requiredChecks : policy.fastChecks });
+}
+export function reviewMustVoid({ reviewedHead, currentHead, checks, policy = REVIEW_TIMING_DEFAULTS } = {}) {
+  return !reviewedHead || reviewedHead !== currentHead || (policy.cancelOnCiRed && ciRedOnHead({ headSha: currentHead, checks }));
+}
+/** Unreadable sizes and binary deltas require full review. Mechanical status must be proved by the caller. */
+export function rereviewMode({ priorHead, head, lines, files, mechanical = false, policy = REVIEW_TIMING_DEFAULTS } = {}) {
+  if (!priorHead || !head || priorHead === head) return 'full';
+  if (mechanical && policy.skipDrainMechanical) return 'carry';
+  return Number.isSafeInteger(lines) && lines >= 0 && Number.isSafeInteger(files) && files >= 0
+    && lines <= policy.deltaMaxLines && files <= policy.deltaMaxFiles ? 'delta' : 'full';
+}
+/** Cap is measured from the FIRST available input, never reset by a later poll. No expected counterpart means no wait. */
+export function joinedFixDecision({ ciFailed = false, reviewFindings = false, firstReadyAt, otherPending = false,
+  now, policy = FIX_TIMING_DEFAULTS } = {}) {
+  if (!ciFailed && !reviewFindings) return { action: 'none' };
+  if (!policy.joinCiAndReview) return { action: 'dispatch', joined: false };
+  if (ciFailed && reviewFindings) return { action: 'dispatch', joined: true };
+  const deadline = firstReadyAt + policy.joinWaitMaxMin * 60_000;
+  if (otherPending && Number.isFinite(firstReadyAt) && Number.isFinite(now) && now < deadline)
+    return { action: 'wait', deadline };
+  return { action: 'dispatch', joined: false };
+}
+
+/** PURE: select timestamped head-local readiness facts. findings are validated producer records supplied by caller. */
+export function fixReadiness({ headSha, checks = [], findings = [], reviewPending = false } = {}) {
+  const latest = collapseRollupToLatestPerName(checks).filter(row =>
+    !['review-gate', 'merge-gate'].includes(row.name ?? row.context) && (!row.head_sha || row.head_sha === headSha));
+  const failed = latest.filter(row => RED.has(String(row.conclusion ?? row.state ?? '').toLowerCase()));
+  const times = [...failed.map(row => row.completed_at ?? row.completedAt), ...findings.map(row => row.createdAt)]
+    .map(t => Date.parse(t)).filter(Number.isFinite);
+  return { ciFailed: failed.length > 0, reviewFindings: findings.length > 0,
+    firstReadyAt: times.length ? Math.min(...times) : NaN,
+    otherPending: failed.length > 0 ? reviewPending && findings.length === 0
+      : latest.some(row => ['queued', 'in_progress', 'pending', 'waiting', 'requested'].includes(String(row.status ?? row.state).toLowerCase())),
+    ciFailures: failed.map(row => ({ name: row.name ?? row.context, conclusion: row.conclusion ?? row.state,
+      detailsUrl: row.details_url ?? row.detailsUrl ?? row.targetUrl ?? null })), findings };
+}

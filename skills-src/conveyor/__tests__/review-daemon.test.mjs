@@ -1562,7 +1562,7 @@ it('x6n7c2p required checks before review — synthetic #3432 four-tick soak spe
       readPrs: () => [{ number: 3432, labels: [{ name: 'review:pending' }] }], readAgents: () => [],
       acquirableLanes: () => 1, tagRound, tagStatus: () => {}, statusCandidates: () => [], holdReconcile: () => [],
       dispatch: options => dispatchReview({ ...options, root: '/repo', checkStaleness: () => ({ fresh: true, behind: 0 }),
-        ciGate: args => readReviewCiGate({ ...args, readHead: () => head.repeat(40),
+        ciGate: args => readReviewCiGate({ ...args, policy: { startAfter: 'ci-green' }, readHead: () => head.repeat(40),
           readRequired: () => ({ source: 'live', checks: ['test', 'daemon-soak'] }),
           readChecks: () => [{ name: 'test', status: 'completed', conclusion: 'success' }, { name: 'daemon-soak', status, conclusion }],
         }),

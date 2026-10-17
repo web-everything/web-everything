@@ -13,7 +13,7 @@ const grant = (by = 1) => ({ author: { login: 'chalbert' }, body: grants.buildRo
 const sendBack = { id: 'operator', author: { login: 'chalbert' }, createdAt: '2026-10-15T10:00Z',
   body: '🔁 review — changes requested\n\nRecorded by chalbert via chat.\n\nRepair at head aaaaaaa.' };
 const end = { author: bot, body: '🔓 conveyor fix-end' };
-const plan = (comments, options = {}, over = {}) => core.planReconcile({ repo: 'we', requiredChecks: ['gate'],
+const plan = (comments, options = {}, over = {}) => core.planReconcile({ reviewTiming: { startAfter: 'ci-green' }, repo: 'we', requiredChecks: ['gate'],
   now: Date.parse('2026-10-15T12:00Z'), roundCap: 6, prs: [{ number: 5169, state: 'OPEN',
     headRefName: 'lane/5169-repair', headRefOid: 'a'.repeat(40), mergeStateStatus: 'CLEAN',
     labels: [{ name: 'review:changes' }], statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }],

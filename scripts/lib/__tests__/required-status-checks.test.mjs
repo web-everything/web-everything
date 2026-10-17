@@ -488,7 +488,7 @@ describe('defaultReadRequiredStatusChecks', () => {
     });
     const now = Date.now();
     getRequiredStatusChecks({ repo, cachePath, now, readChecks: () => ['test', 'security-scan'] });
-    const gate = readReviewCiGate({ repo, pr: 1, readHead: () => 'a'.repeat(40),
+    const gate = readReviewCiGate({ repo, pr: 1, policy: { startAfter: 'ci-green' }, readHead: () => 'a'.repeat(40),
       readRequired: o => getRequiredStatusChecks({ ...o, cachePath, now: now + 1, readChecks }),
       readChecks: () => [
         { name: 'test', status: 'completed', conclusion: 'success' },

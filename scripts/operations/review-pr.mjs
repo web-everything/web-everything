@@ -1377,6 +1377,7 @@ export function shapeReadFinding(raw, { pr, repo, careLevel } = {}) {
       scored: net.scored === true,
     },
     diffText: String(diff.text || ''),
+    deltaReview: raw.deltaReview ?? null,
     diffScored: diff.scored === true,
     // Held item 177 — set only when this PR is a stacked top and the diff above was taken from the stack base (the
     // bottom PR's head merged into this PR's merge-base with main) instead of main. `null` = the main basis.
@@ -1433,7 +1434,11 @@ export function renderJudgeInput(read) {
         '',
       ]
       : ['## Net diff vs current main', '']),
-    read.diffText?.trim() || '_(the net diff could not be resolved — see the degraded note)_',
+    ...(read.deltaReview ? [
+      `## Delta review: ${read.deltaReview.priorHead}..${read.deltaReview.head}`,
+      'Judge only this delta and whether it resolves the prior findings below. Use surrounding code as context; do not reopen unrelated code.',
+      read.deltaReview.text, '## Prior findings to verify', read.deltaReview.priorFindings,
+    ] : [read.diffText?.trim() || '_(the net diff could not be resolved — see the degraded note)_']),
   ];
   return lines.join('\n');
 }
@@ -3140,6 +3145,7 @@ export function reviewPrOperation({
             pr: view.input.pr,
             repo: view.input.repo,
             body: renderAdvisoryNote({ read, verdict: view.verdict }),
+            reviewedHead: read.netBasis?.rev,
           },
           // IDEMPOTENT: FALSE. It posts a real, durable `gh pr comment` — replaying it on an unknown outcome
           // would risk a second one, exactly the reason `record`'s own LABEL effect is `false` (see there).
@@ -3276,7 +3282,7 @@ export function reviewPrOperation({
         if (plan.stackHold) {
           return [{
             type: REVIEW_EFFECTS.STACK_HOLD,
-            payload: { pr, repo, bodyFile, marker: plan.stackHold.marker, note: plan.stackHold.note },
+            payload: { pr, repo, bodyFile, reviewedHead: read.netBasis?.rev, marker: plan.stackHold.marker, note: plan.stackHold.note },
             idempotent: false,
           }];
         }
@@ -3302,6 +3308,7 @@ export function reviewPrOperation({
               // #2898 — the single home renders WHAT IT IS GIVEN. Told, not guessed: this operation is the
               // only thing that knows a run came through it, and the comment's own footer already says so.
               channel: REVIEW_PR_CHANNEL,
+              reviewedHead: read.netBasis?.rev,
               bodyFile,
               addLabel: decision.addLabel,
               removeLabels: presentRemoveLabels(decision.removeLabels, read.labels),

@@ -6,7 +6,8 @@ import { newRunRecord, tryReadRun, writeRun } from '../../operations/run-store.m
 import { mandatoryReferralReviewer, mandatoryReferralState, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
 import { referralCardReadable } from '../../lib/referral-card-readable.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
-import { runReconcilePass } from '../reconcile-pass.mjs';
+import { runReconcilePass as runReconcilePassWithTiming } from '../reconcile-pass.mjs';
+const runReconcilePass = (options = {}) => runReconcilePassWithTiming({ ...options, env: { WE_REVIEW_START_AFTER: 'ci-green', WE_FIX_JOIN_CI_AND_REVIEW: 'false', ...options.env } });
 import { countFindings } from '../reconcile-core.mjs';
 import {
   reviewRunEvidence, readReviewRunEvidence, decideReferralHold, enrichPrsWithReferralHolds,

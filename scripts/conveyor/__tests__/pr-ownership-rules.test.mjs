@@ -1,7 +1,9 @@
 // @vitest-environment node
 import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
-import { planReconcile } from '../reconcile-core.mjs';
+import { planReconcile as planReconcileCore } from '../reconcile-core.mjs';
+// These replays select the serial policy; the default fast gate is covered below.
+const planReconcile = options => planReconcileCore({ reviewTiming: { startAfter: 'ci-green' }, fixTiming: { joinCiAndReview: false }, ...options });
 import { resolvePrOwnershipSettings, loadPrOwnershipSettings } from '../pr-ownership-settings.mjs';
 import { ownerFor, assessPrOwnership, assessOwnership } from '../../operations/pr-ownership.mjs';
 import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
@@ -156,4 +158,13 @@ describe('ownership settings cascade', () => {
     expect(() => loadPrOwnershipSettings({ readFile: () => '{' })).toThrow();
     expect(() => loadPrOwnershipSettings({ readFile: () => '{}', readDeclared: () => ({ errors: ['bad'] }) })).toThrow();
   });
+});
+
+it('the default fast-check policy does not dispatch a CI-red advisory through the legacy waiver', () => {
+  const fx = fixture(escalated);
+  for (const check of fx.pr.statusCheckRollup) if (check.name === 'test') check.conclusion = 'FAILURE';
+  fx.pr.statusCheckRollup.push(...['standards', 'test-shard (1)'].map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })));
+  const result = planReconcileCore({ repo: 'we', prs: [fx.pr], now: Date.parse(fx.observedAt), requiredChecks: checks, ...on });
+  expect(reviews(result)).toEqual([]);
+  expect(result.refusals).toContainEqual(expect.objectContaining({ reviewRefusal: expect.objectContaining({ kind: 'review-ci' }) }));
 });

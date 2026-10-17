@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { buildLedgerEvent, EVENT_TYPES } from '../../lib/verdict-ledger.mjs';
 import { derivePrState } from '../../lib/pr-state.mjs';
-import { runReconcilePass, enrichPrsWithLedgerHolds } from '../reconcile-pass.mjs';
+import { runReconcilePass as runReconcilePassWithTiming, enrichPrsWithLedgerHolds } from '../reconcile-pass.mjs';
+const runReconcilePass = (options = {}) => runReconcilePassWithTiming({ ...options, env: { WE_REVIEW_START_AFTER: 'ci-green', WE_FIX_JOIN_CI_AND_REVIEW: 'false', ...options.env } });
 import {
   resolveReadSource, resolveReadSources, compareHolds, applyLedgerHolds, ledgerHoldStep, ledgerSnapshot,
   journalChanges, resetLedgerSnapshots, renderLedgerShadowSummary, readStoreName, defaultJournalWriter, ledgerDeciding,

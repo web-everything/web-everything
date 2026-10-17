@@ -3,7 +3,9 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { countRealFixRounds, planReconcile, resolveRoundCap } from '../reconcile-core.mjs';
+import { countRealFixRounds, planReconcile as planReconcileWithTiming, resolveRoundCap } from '../reconcile-core.mjs';
+// This historical fixture exercises the serial policy; new defaults have their own timing suite.
+const planReconcile = options => planReconcileWithTiming({ reviewTiming: { startAfter: 'ci-green' }, fixTiming: { joinCiAndReview: false }, ...options });
 import { readRoundCommits, enrichPrsWithMechanicalRound, BOUNCE_PREFIX, LANE_MANIFEST } from '../mechanical-round-cap.mjs';
 import { LANE_MANIFEST as DRAIN_MANIFEST } from '../../lib/rebase-drop-manifest.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';

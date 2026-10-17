@@ -5,7 +5,9 @@
  */
 import { describe, it, expect } from 'vitest';
 import { runAwaitVerifyPass, isEarlyPushOwed, buildAwaitVerifyResumePrompt, formatAwaitVerifyLines, AWAIT_VERIFY_LIMITS } from '../await-verify-pass.mjs';
-import { planReconcile } from '../reconcile-core.mjs';
+import { planReconcile as planReconcileWithTiming } from '../reconcile-core.mjs';
+// This historical fixture exercises the serial policy; new defaults have their own timing suite.
+const planReconcile = options => planReconcileWithTiming({ reviewTiming: { startAfter: 'ci-green' }, fixTiming: { joinCiAndReview: false }, ...options });
 import { classifyPr, attachLiveFixClaim } from '../../merge-ai-prs.mjs';
 import { dispatchCiHeal } from '../../operations/ci-heal-pr-dispatch.mjs';
 

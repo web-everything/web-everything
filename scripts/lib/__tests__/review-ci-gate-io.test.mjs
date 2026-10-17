@@ -3,10 +3,11 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getRequiredStatusChecks } from '../required-status-checks.mjs';
-import { readReviewCiGate, readReviewHead, readReviewChecks, formatReviewCiSkip } from '../review-ci-gate-io.mjs';
+import { readReviewCiGate as readGate, readReviewHead, readReviewChecks, formatReviewCiSkip } from '../review-ci-gate-io.mjs';
+const readReviewCiGate = o => readGate({ policy: { startAfter: 'ci-green' }, ...o });
 const headSha = 'a'.repeat(40);
 function fixture(over = {}) {
-  return { repo: 'other/product', pr: 3432, readHead: vi.fn(() => headSha),
+  return { policy: { startAfter: 'ci-green' }, repo: 'other/product', pr: 3432, readHead: vi.fn(() => headSha),
     readRequired: vi.fn(() => ({ source: 'live', checks: ['custom'] })),
     readChecks: vi.fn(() => [{ name: 'custom', status: 'completed', conclusion: 'success' }]), ...over };
 }
@@ -148,4 +149,12 @@ describe('formatReviewCiSkip — the real error behind unreadable-ci is logged (
       affected: [{ name: 'soak-replay-gate', reason: 'failure' }, { name: 'test', reason: 'pending' }] }))
       .toBe('review-ci: required-checks-not-successful: soak-replay-gate=failure, test=pending');
   });
+});
+
+it('fast-check dispatch reads all head checks without waiting for branch-protection discovery', () => {
+  const readRequired = vi.fn(() => { throw Error('protection unavailable'); });
+  const io = fixture({ policy: { startAfter: 'fast-checks', fastChecks: ['standards', 'test-shard (1)'] }, readRequired,
+    readChecks: () => ['standards', 'test-shard (1)'].map(name => ({ name, head_sha: headSha, status: 'completed', conclusion: 'success' })) });
+  expect(readGate(io)).toMatchObject({ allowed: true, headSha, source: 'timing-policy' });
+  expect(readRequired).not.toHaveBeenCalled();
 });

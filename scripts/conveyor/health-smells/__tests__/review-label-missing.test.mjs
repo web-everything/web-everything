@@ -48,7 +48,7 @@ describe('xe8y12n durable missing review observations', () => {
     const before = planReconcile({ prs: [pr] });
     expect(before.notes).toContainEqual(expect.objectContaining({ kind: 'review-label-missing', prNumber: 3239 }));
     expect(before.dispatch).toEqual([]);
-    const after = planReconcile({ requiredChecks: ['gate'], prs: [{ ...pr, labels: [{ name: 'review:pending' }], statusCheckRollup: [{ name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' }] }] });
+    const after = planReconcile({ reviewTiming: { startAfter: 'ci-green' }, requiredChecks: ['gate'], prs: [{ ...pr, labels: [{ name: 'review:pending' }], statusCheckRollup: [{ name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' }] }] });
     expect(after.dispatch).toContainEqual(expect.objectContaining({ kind: 'review' }));
   });
 });

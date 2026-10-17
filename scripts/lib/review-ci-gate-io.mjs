@@ -1,3 +1,5 @@
+import { reviewStartGate } from './review-timing.mjs';
+import { resolveTimingPolicy } from './review-timing-settings.mjs';
 /** Fresh repo-explicit review eligibility, with injectable read-only GitHub IO. */
 import { readGh } from './proc-read.mjs';
 import { getRequiredStatusChecks } from './required-status-checks.mjs';
@@ -34,7 +36,7 @@ export const readReviewChecks = ({ repo, headSha, run = gh }) => [
 export function readReviewCiGate({ repo, pr, readHead, readLabels,
   readHeadAndLabels = readReviewHeadAndLabels,
   readMergeGateVerdict = defaultReadMergeGateVerdict, readFreeze = readSharedFreeze, mergeGateSetting,
-  readChecks = readReviewChecks, readRequired = getRequiredStatusChecks } = {}) {
+  readChecks = readReviewChecks, readRequired = getRequiredStatusChecks, policy = resolveTimingPolicy().review } = {}) {
   let headSha = null;
   let labels;
   // Keep the existing injected SHA reader; absent label evidence can never excuse a failure.
@@ -47,7 +49,8 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
     if (typeof repo !== 'string' || !/^[^/]+\/[^/]+$/.test(repo)) throw new Error('explicit repo required');
     headSha = head({ repo, pr });
     if (typeof headSha !== 'string' || !headSha.trim()) return reviewCiGate({ headSha });
-    const required = readRequired({ repo, ttlMs: 0 });
+    const required = policy.startAfter === 'ci-green'
+      ? readRequired({ repo, ttlMs: 0 }) : { source: 'timing-policy', checks: policy.fastChecks };
     const stale = required?.source === 'stale-cache';
     const cacheAgeMs = required?.cacheAgeMs;
     const trustedStale = stale && Number.isFinite(cacheAgeMs) && cacheAgeMs >= 0 && cacheAgeMs <= MAX_STALE_CACHE_AGE_MS;
@@ -55,7 +58,7 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
       ...(stale ? { cacheAgeMs, reason: `${result.reason} (stale-cache cache-age-ms=${cacheAgeMs ?? 'unknown'})` } : {}),
     });
     // Repo-declared requirements are code-reviewed policy, not the last-resort fallback.
-    if (!['live', 'cache', 'declared'].includes(required?.source) && !trustedStale) {
+    if (!['live', 'cache', 'declared', 'timing-policy'].includes(required?.source) && !trustedStale) {
       return withSource({ allowed: false, headSha, reason: 'untrusted-required-set' });
     }
     let checks = readChecks({ repo, headSha });
@@ -70,7 +73,7 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
         }).rows;
       }
     } catch { /* Unreadable excusal evidence preserves the original failed checks. */ }
-    return withSource(reviewCiGate({ headSha, requiredChecks: required.checks, checks }));
+    return withSource({ ...reviewStartGate({ headSha, requiredChecks: required.checks, checks, policy }), checks, startAfter: policy.startAfter });
   } catch (error) {
     return { allowed: false, headSha, reason: 'unreadable-ci', error: String(error?.message ?? error) };
   }

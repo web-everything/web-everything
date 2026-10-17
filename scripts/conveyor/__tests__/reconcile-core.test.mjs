@@ -80,7 +80,7 @@ const AUTOMATION = { login: 'web-everything' };
 
 const lbl = (...names) => names.map((name) => ({ name }));
 // These fixtures model a repository whose one required check is gate. Specific CI cases override the set.
-const planReconcile = options => planReconcileCore({ requiredChecks: ['gate'], ...options });
+const planReconcile = options => planReconcileCore({ reviewTiming: { startAfter: 'ci-green' }, requiredChecks: ['gate'], ...options });
 const greenRollup = [{ name: 'gate', status: 'completed', conclusion: 'success' }];
 const pendingRollup = [{ name: 'gate', status: 'in_progress', conclusion: null }];
 const redRollup = [{ name: 'gate', status: 'completed', conclusion: 'failure' }];

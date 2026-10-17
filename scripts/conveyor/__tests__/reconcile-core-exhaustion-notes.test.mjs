@@ -22,11 +22,13 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it, expect } from 'vitest';
 
 import {
-  resolveRoundCap, planReconcile, markSelfReportedDone, assessLiveness,
+  resolveRoundCap, planReconcile as planReconcileWithTiming, markSelfReportedDone, assessLiveness,
   INFRA_RETRY_CAP, INFRA_RETRY_COOLOFF_MS, INFRA_RETRY_CAPPED_COOLOFF_MS, LIVE_SESSION_OVERRUN_MS,
   PERMISSION_RETRY_CAP, PERMISSION_BLOCKED_COOLOFF_MS, PERMISSION_CAPPED_COOLOFF_MS,
   CONFLICT_FIX_ROUND_CAP, ADVISORY_FIX_ROUND_CAP, CI_HEAL_ROUND_CAP,
 } from '../reconcile-core.mjs';
+// This historical fixture exercises the serial policy; new defaults have their own timing suite.
+const planReconcile = options => planReconcileWithTiming({ reviewTiming: { startAfter: 'ci-green' }, fixTiming: { joinCiAndReview: false }, ...options });
 import { buildRoundExtensionComment } from '../round-extension-mark.mjs';
 import { OPERATOR_LOGINS } from '../../lib/marker-authorship.mjs';
 import { noteEpisodeKey, buildNoteComment, hasPostedNoteComment } from '../reconcile-note-comment.mjs';

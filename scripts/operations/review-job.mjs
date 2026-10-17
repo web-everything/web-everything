@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.mjs';
 /**
  * @file scripts/operations/review-job.mjs
@@ -76,7 +77,7 @@ import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.m
 import { spawn, spawnSync } from 'node:child_process';
 import { execRead } from '../lib/proc-read.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
-import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
+import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker } from '../lib/rebase-verdict-carry.mjs';
 import { redTeamGateMarker, redTeamMarker } from '../lib/red-team-gate.mjs';
 
 import { randomUUID } from 'node:crypto';
@@ -273,7 +274,10 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
   });
   return {
     root,
-    carryAcrossRebaseSetting: () => resolveCarryAcrossRebase({ env }),
+    carryAcrossRebaseSetting: () => {
+      const timing = resolveTimingPolicy({ env });
+      return { value: timing.review.skipDrainMechanical ? 'on' : 'off', source: timing.sources.review.skipDrainMechanical };
+    },
     readCarryEvidence: ({ pr, repo }) => {
       const view = JSON.parse(execRead('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], { cwd: root, env }));
       const comments = readCompletePrComments(pr, { repo, exec: (f, a, o) => execRead(f, a, { ...o, cwd: root, env }) });
@@ -863,7 +867,7 @@ export function dispatchReviewJob({
 
   const ci = ciGate({ repo: planned.repo, pr: planned.pr });
   // Card 273, #5157: a waiver is pinned to readable CI on this exact head.
-  const waived = typeof ci?.headSha === 'string' && typeof advisoryCiWaiver?.head === 'string'
+  const waived = (!ci?.startAfter || ci.startAfter === 'ci-green') && typeof ci?.headSha === 'string' && typeof advisoryCiWaiver?.head === 'string'
     && ci.headSha.length > 0 && ci.headSha.toLowerCase() === advisoryCiWaiver.head.toLowerCase()
     && !['head-changed', 'unreadable-ci', 'missing-head', 'unknown-required-set', 'untrusted-required-set'].includes(String(ci.reason ?? '').split(' (')[0])
     && !(ci.affected ?? []).some(row => ['wrong-head', 'malformed', 'missing'].includes(row.reason));

@@ -605,7 +605,7 @@ export function dispatchReview({
   }
   const ci = ciGate({ repo: planned.repo, pr: planned.pr });
   // Card 273, #5157: a waiver is pinned to readable CI on this exact head.
-  const waived = typeof ci?.headSha === 'string' && typeof advisoryCiWaiver?.head === 'string'
+  const waived = (!ci?.startAfter || ci.startAfter === 'ci-green') && typeof ci?.headSha === 'string' && typeof advisoryCiWaiver?.head === 'string'
     && ci.headSha.length > 0 && ci.headSha.toLowerCase() === advisoryCiWaiver.head.toLowerCase()
     && !['head-changed', 'unreadable-ci', 'missing-head', 'unknown-required-set', 'untrusted-required-set'].includes(String(ci.reason ?? '').split(' (')[0])
     && !(ci.affected ?? []).some(row => ['wrong-head', 'malformed', 'missing'].includes(row.reason));

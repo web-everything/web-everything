@@ -1,3 +1,7 @@
+import { reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
+import { rereviewMode, reviewMustVoid } from '../lib/review-timing.mjs';
+import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
+import { readReviewCiGate } from '../lib/review-ci-gate-io.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
@@ -211,7 +215,7 @@ export function readPr({
   // an operator sees WHERE it looked rather than only that it failed. Message-only; decides nothing.
   probed = null,
   // Card 5469 — the declared `scopedRereview` mode (we:scripts/review-settings.json); injectable for tests.
-  scopedRereview = null,
+  scopedRereview = null, timingPolicy = resolveTimingPolicy().review,
   // Card 5471 — the declared `roundBudget` K, and the ledger reader the round count comes from; injectable for tests.
   roundBudget = null,
   readLedgerRows = defaultReadLedgerRows,
@@ -308,6 +312,25 @@ export function readPr({
       } catch { stackBase = null; }
     }
   }
+  const latestFix = readLatestFixRange({ exec: gitExec, comments: view.comments, head: revSha });
+  let deltaReview = null;
+  if (latestFix.priorHead && !latestFix.error && latestFix.head === revSha) {
+    try {
+      const text = String(gitExec('git', ['diff', '--no-ext-diff', '--no-color', '--no-renames', latestFix.priorHead, revSha],
+        { encoding: 'utf8', maxBuffer: LATEST_FIX_DIFF_MAX_BUFFER }));
+      const stat = String(gitExec('git', ['diff', '--numstat', '-z', '--no-renames', latestFix.priorHead, revSha],
+        { encoding: 'utf8', maxBuffer: LATEST_FIX_DIFF_MAX_BUFFER })).split('\0').filter(Boolean);
+      const lines = stat.reduce((sum, row) => {
+        const [a, d] = row.split('\t');
+        return /^\d+$/.test(a) && /^\d+$/.test(d) ? sum + Number(a) + Number(d) : NaN;
+      }, 0);
+      if (rereviewMode({ priorHead: latestFix.priorHead, head: revSha, lines, files: stat.length, policy: timingPolicy }) === 'delta') {
+        // Retain the FULL net basis/fingerprint for acceptance and roster checks. Only the juror diff is narrowed.
+        deltaReview = { priorHead: latestFix.priorHead, head: revSha, lines, files: stat.length, text,
+          priorFindings: (view.comments ?? []).filter(c => isTrustedMarkerAuthor(c) && reviewedHeadsOf(c).includes(latestFix.priorHead)).map(c => c.body).join('\n\n') };
+      }
+    } catch { /* unreadable delta requires full review */ }
+  }
   const scopedMode = resolveScopedRereviewMode(scopedRereview);
   const budget = resolveRoundBudget(roundBudget);
 
@@ -339,7 +362,7 @@ export function readPr({
     // recording it would pin the basis to a tree that was never read.
     comments: view.comments,
     net: { ...netPaths, revSha },
-    latestFix: readLatestFixRange({ exec: gitExec, comments: view.comments, head: revSha }),
+    latestFix, deltaReview,
     diff: netText,
     ...(stackBase ? { stackBase } : {}),
     // Card 5469 — carried only when the shadow is on (or `on`, card 5470), so an `off` read is byte-identical to before.
@@ -497,9 +520,8 @@ export function readLatestFixRange(options = {}) {
     const current = typeof head === 'string' && /^[0-9a-f]+$/i.test(head) ? head.toLowerCase() : null;
     for (const comment of (Array.isArray(comments) ? comments : []).slice().reverse()) {
       if (!isTrustedMarkerAuthor(comment) || typeof comment.body !== 'string') continue;
-      // The LAST line-anchored match: the renderer emits the real `Net basis:` line after the juror text, so a line
-      // forged above it by a PR author must not choose the prior head.
-      const reviewed = [...comment.body.matchAll(/^Net basis: `([0-9a-f]+)\.\.([0-9a-f]+)`/gim)].at(-1)?.[2]?.toLowerCase();
+      // The producer-validated footer names the reviewed head; quoted or forged juror text cannot select a basis.
+      const reviewed = reviewedHeadsOf(comment).at(-1)?.toLowerCase();
       if (reviewed && (!current || (!reviewed.startsWith(current) && !current.startsWith(reviewed)))) {
         priorHead = reviewed;
         break;
@@ -840,6 +862,7 @@ export function createReviewPrSinks({
   root = REPO_ROOT,
   env = process.env,
   referralJudge = judgeSpawn,
+  publishGate = readReviewCiGate,
   readChangedLines,
   mirrorReferral = (record) => appendJuryEvent(`${record.repo}#${record.pr}`, { type: 'mandatory-referrals', round: 0, record }, { root }),
   cardReadable = (ref) => referralCardReadable(ref, root),
@@ -876,7 +899,15 @@ export function createReviewPrSinks({
   readLedgerRows = defaultReadLedgerRows,
   appendLedgerRow = (row) => appendVerdict(row),
   appendShadowJournal = (entry) => appendScopedRereviewJournal(entry, { env }),
-} = {}) {
+ } = {}) {
+  const assertPublishable = async payload => {
+    // Legacy persisted effects without a pinned head retain their existing refusal path.
+    if (!payload.reviewedHead) return;
+    const policy = resolveTimingPolicy({ env }).review;
+    const ci = await publishGate({ repo: payload.repo, pr: payload.pr, policy, expectedHead: payload.reviewedHead });
+    if (!ci?.checks || reviewMustVoid({ reviewedHead: payload.reviewedHead, currentHead: ci.headSha, checks: ci.checks, policy }))
+      throw notApplied('review void: head moved, CI became red, or current CI could not be read');
+  };
   return {
     [REVIEW_EFFECTS.MANDATORY_REFERRALS]: async (payload, ctx) => {
       const { read } = payload;
@@ -1280,6 +1311,7 @@ export function createReviewPrSinks({
     // It posts the staged write-up (with the markers) AND applies the label, in the #2964 order it owns. This
     // sink adds no policy of its own: it builds argv, runs it, and reports.
     [REVIEW_EFFECTS.LABEL]: async (payload, ctx) => {
+      await assertPublishable(payload);
       // The SAME run-scoped path effect 0 wrote — both sinks derive it from `ctx.runId`, which is one run's id
       // for every effect in that run, so 1 always posts the write-up 0 staged and never a sibling run's.
       const bodyPath = reviewBodyPath({ root, runId: ctx?.runId, bodyFile: payload.bodyFile });
@@ -1445,6 +1477,7 @@ export function createReviewPrSinks({
     // No label is touched (the same reason `ADVISORY_NOTE` avoids the single home): the accept must not become
     // `review:accepted` while the bottom PR is open. `review-job.mjs` reads the marker back to hold or carry.
     [REVIEW_EFFECTS.STACK_HOLD]: async (payload, ctx) => {
+      await assertPublishable(payload);
       const bodyPath = reviewBodyPath({ root, runId: ctx?.runId, bodyFile: payload.bodyFile });
       let staged = '';
       try { staged = readFileSync(bodyPath, 'utf8'); } catch { staged = ''; }
@@ -1469,6 +1502,7 @@ export function createReviewPrSinks({
     // `postComment` is the exact primitive that single home itself calls for its own comment write, so this
     // reuses it directly rather than re-implementing a `gh pr comment` invocation a third time.
     [REVIEW_EFFECTS.ADVISORY_NOTE]: async (payload) => {
+      await assertPublishable(payload);
       postComment(payload.repo, payload.pr, String(payload.body));
       return { posted: true };
     },

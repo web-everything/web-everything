@@ -12,7 +12,9 @@ import {
   assessScopeBloat, scopeBloatLimits, cardIdFromTitle, parseCardScope, inScope, enrichPrsWithScopeBloat,
   recordScopeBloatRefresh, scopeBloatRefreshFor, MARKER_RETRIES_PER_HEAD, SCOPE_BLOAT_REASON,
 } from '../scope-bloat.mjs';
-import { planReconcile as planReconcileCore } from '../reconcile-core.mjs';
+import { planReconcile as planReconcileCoreWithTiming } from '../reconcile-core.mjs';
+// This historical fixture exercises the serial policy; new defaults have their own timing suite.
+const planReconcileCore = options => planReconcileCoreWithTiming({ reviewTiming: { startAfter: 'ci-green' }, fixTiming: { joinCiAndReview: false }, ...options });
 import { planFixesFromReconcile, withScopeBloat } from '../reconcile-fix-dispatch.mjs';
 import { buildRebaseOntoMainComment } from '../main-red-recovery.mjs';
 import { readNetFiles } from '../scope-bloat.mjs';

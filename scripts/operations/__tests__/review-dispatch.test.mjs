@@ -805,7 +805,7 @@ describe('x6n7c2p required checks before review — fresh dispatch boundary', ()
     let headReads = 0;
     let spawns = 0;
     let sessionWrites = 0;
-    const ciGate = ({ repo, pr }) => readReviewCiGate({ repo, pr,
+    const ciGate = ({ repo, pr }) => readReviewCiGate({ repo, pr, policy: { startAfter: 'ci-green' },
       readHead: args => { reads.push(['head', args]); return state === 'head-moved' && headReads++ ? 'b'.repeat(40) : headSha; },
       readRequired: args => { reads.push(['required', args]); return { source: ['stale-cache', 'fallback'].includes(state) ? state : 'live', checks: ['test', 'daemon-soak'] }; },
       readChecks: args => {

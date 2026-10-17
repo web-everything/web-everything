@@ -376,3 +376,42 @@ Settings cascade env > `scripts/settings/needs-you-feed.json` > defaults (`enabl
 Disabling the feed retires queued and running jobs on the next health-watch tick, revoking ownership before
 signalling the producer. Failed signal attempts retain the handle for retirement on a later tick.
 Daemon seam: a future daemon may consume the same `bootstrapPlan()` object instead of a chat session.
+
+## Review timing and joined fixes
+
+Operator policy (2026-10-16): review overlaps CI. `review.startAfter` defaults to
+`fast-checks`; `review.fastChecks` defaults to `standards` and `test-shard (1)`.
+The independent standards CI job lets these finish before the aggregate gate.
+Card-only changes publish a green shard receipt for their intentionally empty unit
+scope, so skipped tests cannot strand review.
+`ci-green` restores the complete required-check prerequisite; `push` starts at the
+head. A missing, pending or wrong-head fast check cannot release review. With
+`review.cancelOnCiRed` (default true), the publication sink voids a running
+review's verdict when CI turns red; a changed head always voids it. The merge
+requirements remain enforced by the merge gate.
+
+A changed head gets a delta review when additions plus deletions are at most
+`review.deltaMaxLines` (50) across at most `review.deltaMaxFiles` (3). Binary or
+unreadable deltas get full review. Jurors judge the delta and its prior findings;
+the full contribution basis remains pinned for acceptance and roster checks.
+`review.skipDrainMechanical` (default true) enables existing proven numbering and
+identical-contribution carry writers. Commit subjects alone never prove a carry:
+JIT numbering needs the existing exact rewrite proof, a drain rebase needs the
+same contribution, and an empty recovery commit preserves that contribution.
+A refused carry falls back to review, preserving existing human/referral holds.
+
+`fix.joinCiAndReview` defaults true. When CI failures and head-local review
+findings are both ready, one existing fix worker gets both inputs. When the
+counterpart is pending, `fix.joinWaitMaxMin` (15) caps the wait from the first
+result timestamp. Polls never reset it; missing timestamps do not create an
+unbounded wait. The same policy applies with CI or review finishing first.
+
+Timing settings resolve per leaf through standard defaults, platform `review` /
+`fix` preferences, tool settings (`scripts/review-settings.json` and the `fix`
+block in `scripts/settings/fix.json`), then environment. Environment names are
+`WE_REVIEW_START_AFTER`, `WE_REVIEW_FAST_CHECKS` (JSON array),
+`WE_REVIEW_CANCEL_ON_CI_RED`, `WE_REVIEW_DELTA_MAX_LINES`,
+`WE_REVIEW_DELTA_MAX_FILES`, `WE_REVIEW_SKIP_DRAIN_MECHANICAL`,
+`WE_FIX_JOIN_CI_AND_REVIEW`, and `WE_FIX_JOIN_WAIT_MAX_MIN`. Invalid values leave
+the lower layer effective. The shared cascade logs effective values and sources
+in the daemon log.
