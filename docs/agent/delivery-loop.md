@@ -408,10 +408,12 @@ off, and CI read faults alone do not discard a completed verdict.
 
 A changed head gets a delta review when additions plus deletions are at most
 `review.deltaMaxLines` (50) across at most `review.deltaMaxFiles` (3), both for
-this fix and for the total change since the last FULL review. Each verdict's footer
-records that full review's head (`Full-review anchor:`); a full review anchors on its
-own head. A missing anchor means the prior review was full; two different anchors
-on the prior head's verdicts force a full review. Binary or
+this fix and for the total change since the last FULL review. Each review-pr
+verdict's `Net basis` footer line ends with that full review's head
+(`Full-review anchor:`); a full review anchors on its own head. The anchor is read
+only from that producer line. A prior verdict with no anchor (older verdicts, a
+degraded basis, restamp or carry records) or with two different anchors forces a
+full review. Binary or
 unreadable deltas get full review. So does a head with a verdict newer than the
 prior head's review (a post-accept red-team bounce carries no reviewed-head
 marker, so a delta would drop its findings), and a thread at the 100-comment read

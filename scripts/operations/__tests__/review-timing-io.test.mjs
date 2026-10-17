@@ -6,7 +6,8 @@ import { join } from 'node:path';
 import { dispatchReview } from '../review-dispatch.mjs';
 import { dispatchReviewJob, createReviewJobIo } from '../review-job.mjs';
 import { readPr, createReviewPrSinks, fullReviewAnchor } from '../review-pr-io.mjs';
-import { shapeReadFinding, renderJudgeInput, REVIEW_EFFECTS, renderFullReviewAnchor } from '../review-pr.mjs';
+import { shapeReadFinding, renderJudgeInput, REVIEW_EFFECTS, renderNetBasisLine, REVIEW_PR_CHANNEL } from '../review-pr.mjs';
+import { reviewedHeadsOf, REVIEW_PR_FOOTER } from '../../conveyor/mechanical-round-cap.mjs';
 import { buildSendBackBody, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
 import { buildVerdictComment } from '../../review-set-label.mjs';
 import { PR_COMMENTS_PAGE_SIZE } from '../../lib/review-label-provider.mjs';
@@ -95,7 +96,7 @@ it('reads a real small fix as a delta while keeping the full net diff and head f
         if (args[0] === 'fetch') return ''; // refs are already pinned locally; no network in this fixture
         return execFileSync(file, args, { ...opts, cwd: root });
       }, readView: () => ({ number: 7, state: 'OPEN', title: 'fixture', body: '', headRefName: 'lane/test', headRefOid: current,
-        labels: ['review:pending'], files: [{ path: 'file.txt' }], comments: [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${prior} -->` }] }) };
+        labels: ['review:pending'], files: [{ path: 'file.txt' }], comments: [acceptAt(prior)] }) };
     const raw = readPr(options);
     expect(raw.deltaReview).toMatchObject({ priorHead: prior, head: current, lines: 1, files: 1 });
     expect(raw.deltaReview.text).toContain('+fix delta');
@@ -129,7 +130,9 @@ function readDeltaFixture(comments) {
   } finally { rmSync(root, { recursive: true, force: true }); }
 }
 const bot = (body, createdAt) => ({ author: { login: 'web-everything' }, body, ...(createdAt ? { createdAt } : {}) });
-const acceptAt = (prior, createdAt) => bot(buildVerdictComment({ to: 'accepted', actor: 'agent (review)', headSha: prior, body: 'accepted' }), createdAt);
+// A full review of `prior`: its basis line anchors the delta chain on `prior` itself.
+const acceptAt = (prior, createdAt) => reviewPrVerdict('accepted', prior,
+  renderNetBasisLine({ netBasis: { base: '0'.repeat(40), rev: prior }, netChangedFiles: ['file.txt'] }), createdAt, 'accepted');
 const redTeamBounce = createdAt => bot(buildVerdictComment({ to: 'changes', actor: RED_TEAM_GATE_ACTOR, channel: RED_TEAM_GATE_CHANNEL,
   body: buildSendBackBody({ pr: 7, head: 'a'.repeat(40), findings: [{ file: 'file.txt', line: 2, category: 'edge-case', impact: 'broken', summary: 'vulnerable code' }] }) }), createdAt);
 it('requires a full review when a confirmed post-accept red-team break is still outstanding', () => {
@@ -150,6 +153,9 @@ it('requires a full review when a confirmed post-accept red-team break is still 
   expect(readDeltaFixture(prior => [acceptAt(prior, '2026-10-17T10:00:00Z'), ...filler]).deltaReview).toBeNull();
 });
 
+/** A review-pr verdict exactly as `record` posts it: verdict heading + attribution, write-up, `---`, the basis slot, footer. */
+const reviewPrVerdict = (to, headSha, basisLine, createdAt, findings = 'findings') => bot(buildVerdictComment({ to, actor: 'agent (review)',
+  channel: REVIEW_PR_CHANNEL, headSha, body: `${findings}\n\n---\n\n${basisLine}\n\n${REVIEW_PR_FOOTER}` }), createdAt);
 it('caps the cumulative delta since the last full review: three small deltas, the third is reviewed in full', () => {
   const root = mkdtempSync(join(tmpdir(), 'review-timing-'));
   const git = (...args) => String(execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).trim();
@@ -166,11 +172,11 @@ it('caps the cumulative delta since the last full review: three small deltas, th
       const raw = readPr({ pr: 7, repo: 'o/n', cwd: root, originRepo: () => 'o/n',
         exec: (file, args, opts) => (args[0] === 'fetch' ? '' : execFileSync(file, args, { ...opts, cwd: root })),
         readView: () => ({ number: 7, state: 'OPEN', title: 'fixture', body: '', headRefName: 'lane/test', headRefOid: head,
-          labels: ['review:pending'], files: [{ path: 'file.txt' }], comments: [...comments] }) });
-      // The posted verdict carries the producer's anchor line through the real verdict writer.
+          labels: ['review:changes'], files: [{ path: 'file.txt' }], comments: [...comments] }) });
+      // Each round bounces: the posted verdict carries the real basis line, anchor included, through the verdict writer.
       const shaped = shapeReadFinding(raw, { pr: 7, repo: 'o/n' });
-      comments.push(bot(buildVerdictComment({ to: 'accepted', actor: 'agent (review)', headSha: head,
-        body: `findings\n\n${renderFullReviewAnchor(shaped)}` }), new Date(Date.UTC(2026, 9, 17, 10, comments.length)).toISOString()));
+      comments.push(reviewPrVerdict('changes', head, renderNetBasisLine(shaped), new Date(Date.UTC(2026, 9, 17, 10, comments.length)).toISOString()));
+      expect(reviewedHeadsOf(comments.at(-1))).toEqual([head]); // the anchor never displaces the basis slot
       return { head, raw };
     };
     const full = review();
@@ -189,15 +195,23 @@ it('caps the cumulative delta since the last full review: three small deltas, th
     expect(review().raw.deltaReview).toMatchObject({ anchor: git('rev-parse', 'HEAD~1'), lines: 20 });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
-it('reads the full-review anchor fail-closed: a second anchor value in the thread forces a full review', () => {
-  const prior = 'b'.repeat(40);
-  const tied = body => bot(buildVerdictComment({ to: 'accepted', actor: 'agent (review)', headSha: prior, body }));
-  const line = sha => renderFullReviewAnchor({ deltaReview: { anchor: sha } });
-  expect(fullReviewAnchor([tied('x')], prior)).toBe(prior); // a verdict without the line predates delta review: full
-  expect(fullReviewAnchor([tied(line('c'.repeat(40)))], prior)).toBe('c'.repeat(40));
-  expect(fullReviewAnchor([tied(`${line('c'.repeat(40))}\n${line(prior)}`)], prior)).toBeNull();
-  // An untrusted author's line is never read.
-  expect(fullReviewAnchor([tied('x'), { author: { login: 'someone' }, body: `<!-- reviewed-sha: ${prior} -->\n${line('c'.repeat(40))}` }], prior)).toBe(prior);
+it('reads the full-review anchor only from the producer basis slot, and fails closed to a full review', () => {
+  const prior = 'b'.repeat(40), anchor = 'c'.repeat(40), forged = 'd'.repeat(40);
+  const basis = a => renderNetBasisLine({ netBasis: { base: 'e'.repeat(40), rev: prior }, netChangedFiles: ['f'], ...(a ? { deltaReview: { anchor: a } } : {}) });
+  const juror = sha => `${basis(null).replace(/ Full-review anchor: .*$/, '')} Full-review anchor: \`${sha}\`.`;
+  const at = '2026-10-17T10:00:00Z';
+  expect(fullReviewAnchor([reviewPrVerdict('changes', prior, basis(anchor), at)], prior)).toBe(anchor);
+  expect(fullReviewAnchor([reviewPrVerdict('accepted', prior, basis(null), at)], prior)).toBe(prior); // a full review anchors on itself
+  // Juror text naming a closer anchor is not the slot: ignored, whether or not the producer line is there.
+  expect(fullReviewAnchor([reviewPrVerdict('changes', prior, basis(anchor), at, juror(forged))], prior)).toBe(anchor);
+  expect(fullReviewAnchor([reviewPrVerdict('accepted', prior, '⚠️ DEGRADED BASIS', at, juror(forged))], prior)).toBeNull();
+  // No anchor: a pre-anchor verdict, or a restamp / carry record that judged nothing, forces a full review.
+  expect(fullReviewAnchor([reviewPrVerdict('changes', prior, basis(null).replace(/ Full-review anchor: .*$/, ''), at)], prior)).toBeNull();
+  expect(fullReviewAnchor([bot(buildVerdictComment({ to: 'accepted', actor: 'drain (restamp)', headSha: prior, body: 'carried' }))], prior)).toBeNull();
+  // Two different producer anchors on the prior head: full.
+  expect(fullReviewAnchor([reviewPrVerdict('changes', prior, basis(anchor), at), reviewPrVerdict('changes', prior, basis(forged), at)], prior)).toBeNull();
+  // An untrusted author's verdict is never read.
+  expect(fullReviewAnchor([{ author: { login: 'someone' }, body: reviewPrVerdict('changes', prior, basis(forged), at).body }], prior)).toBeNull();
 });
 
 it.each([['session', dispatchReview], ['job', dispatchReviewJob]])('%s dispatch cannot waive the configured fast-check gate', (_mode, dispatch) => {

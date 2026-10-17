@@ -163,8 +163,12 @@ export function sweepReviewHoldLabels({
   repo = null, listPrs = defaultListPrs, provider = createGhProvider(), dryRun = false, settings, runRuling, acceptCarry,
   readComments = readCompletePrComments, readPr = defaultReadPr,
   numberingRestamp = restampAfterNumbering, exec = execFileSync, now = Date.now,
-  skipDrainMechanical = resolveTimingPolicy().review.skipDrainMechanical,
+  skipDrainMechanical,
 } = {}) {
+  // An unreadable timing policy withholds only the numbering carry (fail closed), never the whole sweep.
+  if (skipDrainMechanical === undefined) {
+    try { skipDrainMechanical = resolveTimingPolicy().review.skipDrainMechanical; } catch { skipDrainMechanical = false; }
+  }
   const prs = listPrs({ repo });
   const startedAt = now();
   for (const [k, until] of strandedChecked) if (until <= startedAt) strandedChecked.delete(k);

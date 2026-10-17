@@ -3,8 +3,9 @@ import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join as joinPath } from 'node:path';
 import { renderReferralRecord, mandatoryReferralReviewer, explainPanelOutcome } from '../../lib/jury-core.mjs';
-import { createReviewPrSinks } from '../review-pr-io.mjs';
-import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
+import { createReviewPrSinks, fullReviewAnchor } from '../review-pr-io.mjs';
+import { assertMandatoryReferralsCleared, buildVerdictComment } from '../../review-set-label.mjs';
+import { reviewedHeadsOf } from '../../conveyor/mechanical-round-cap.mjs';
 /**
  * @file review-pr.test.mjs — the `review-pr` declaration and its derived command line (#3035).
  *
@@ -1500,10 +1501,16 @@ describe('the write-up reports the seats that ACTUALLY judged, and no others', (
     const { run } = atConfirm({ registry, input: { ...BASE_INPUT }, id: 'run-wu-anchor' });
     const { read, verdict } = { read: run.findings.read, verdict: run.verdict };
     const anchor = 'c'.repeat(40);
-    for (const render of [r => renderVerdictWriteUp({ read: r, verdict, answer: 'accept', actor: 'op' }), r => renderAdvisoryNote({ read: r, verdict })]) {
-      if (read.netBasis.rev) expect(render(read)).toContain(`Full-review anchor: \`${read.netBasis.rev}\``);
-      expect(render({ ...read, deltaReview: { anchor } })).toContain(`Full-review anchor: \`${anchor}\``);
+    const pinned = { ...read, netBasis: { ...read.netBasis, rev: 'd'.repeat(40) } };
+    for (const render of [r => renderVerdictWriteUp({ read: r, verdict, answer: 'changes', actor: 'op' }), r => renderAdvisoryNote({ read: r, verdict })]) {
+      expect(render(pinned)).toContain(`Full-review anchor: \`${'d'.repeat(40)}\``);
+      expect(render({ ...pinned, deltaReview: { anchor } })).toContain(`Full-review anchor: \`${anchor}\``);
     }
+    // The anchor rides on the basis line, so a posted bounce still names the head it judged and its anchor.
+    const bounce = { author: { login: 'web-everything' }, body: buildVerdictComment({ to: 'changes', actor: 'op', channel: REVIEW_PR_CHANNEL,
+      body: renderVerdictWriteUp({ read: { ...pinned, deltaReview: { anchor } }, verdict, answer: 'changes', actor: 'op' }) }) };
+    expect(reviewedHeadsOf(bounce)).toEqual(['d'.repeat(40)]);
+    expect(fullReviewAnchor([bounce], 'd'.repeat(40))).toBe(anchor);
   });
 
   it('lists BOTH mandatory lenses now that both judged — and still no lens as `(no verdict)`', () => {

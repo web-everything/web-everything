@@ -1,4 +1,4 @@
-import { isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
+import { basisLineOf, isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
 import { rereviewMode, reviewMustVoid } from '../lib/review-timing.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { readReviewCiGate, readReviewHead } from '../lib/review-ci-gate-io.mjs';
@@ -77,7 +77,7 @@ import { siblingsFor } from '../bootstrap-session.mjs';
 // behind it) into a CI job. Re-exported below: every existing importer of this module is unchanged.
 import { PR_VIEW_FIELDS, prViewFileName } from '../lib/pr-view-transport.mjs';
 import { defaultOriginRepo } from './record-verdict-io.mjs';
-import { REVIEW_EFFECTS, FULL_REVIEW_ANCHOR_LINE } from './review-pr.mjs';
+import { REVIEW_EFFECTS, FULL_REVIEW_ANCHOR } from './review-pr.mjs';
 import { canonicalizeSlug } from '../lib/constellation-repos.mjs';
 import { isValidRunId } from './run-record.mjs';
 // mechanical-dispatcher — the `AWAITING_ADVISORY_CLEAR` sink's own label name, imported rather than restated.
@@ -531,15 +531,17 @@ export function outstandingVerdictSince(comments, priorHead) {
 }
 
 /**
- * The head of the last FULL review in `priorHead`'s chain, from the producer anchor line on the trusted verdicts that
- * judged `priorHead`. No line: that review predates delta review, so it was full and anchors on itself. Two different
- * values (a quoted or forged line beside the producer's): `null`, which forces a full review. Pure.
+ * The head of the last FULL review in `priorHead`'s chain, read ONLY from the producer's `Net basis` slot line of the
+ * trusted verdicts that judged `priorHead` (juror text cannot reach that slot). `null` forces a full review: no anchor
+ * at all (a verdict that predates the anchor, a degraded basis, or a restamp / carry / clear-human record that judged
+ * nothing), or two different anchors. Pure.
  */
 export function fullReviewAnchor(comments, priorHead) {
   const anchors = new Set((Array.isArray(comments) ? comments : [])
     .filter(c => isTrustedMarkerAuthor(c) && typeof c.body === 'string' && reviewedHeadsOf(c).includes(priorHead))
-    .flatMap(c => [...c.body.matchAll(FULL_REVIEW_ANCHOR_LINE)].map(m => m[1])));
-  return anchors.size === 0 ? priorHead : anchors.size === 1 ? [...anchors][0] : null;
+    .map(basisLineOf).filter(b => b && priorHead.startsWith(b.sha))
+    .map(b => FULL_REVIEW_ANCHOR.exec(b.line)?.[1]).filter(Boolean));
+  return anchors.size === 1 ? [...anchors][0] : null;
 }
 
 /** #5135 — output cap for the latest-fix `git diff`; past it the read fails and the scope falls back to `all`. */

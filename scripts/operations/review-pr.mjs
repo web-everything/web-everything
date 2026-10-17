@@ -1123,14 +1123,21 @@ function pinnedSha(value) {
 }
 
 /**
- * The footer line naming the head of the last FULL review; a delta review's cumulative cap is measured from it. Plain
- * text like `Net basis:`, because the verdict writer escapes HTML comments in a posted body.
+ * The head of the last FULL review, written at the end of the producer's `Net basis` line: a delta review's cumulative
+ * cap is measured from it. It rides on that line because only the line at the fixed footer slot is producer text
+ * (we:scripts/conveyor/mechanical-round-cap.mjs#basisLineOf); a line of its own could be written by a juror.
  */
-export const FULL_REVIEW_ANCHOR_LINE = /^Full-review anchor: `([0-9a-f]{40})`/gm;
-/** A full review anchors on its own head; a delta review carries its chain's anchor forward. Unpinned: no line. */
+export const FULL_REVIEW_ANCHOR = / Full-review anchor: `([0-9a-f]{40})`\.$/;
+/** A full review anchors on its own head; a delta review carries its chain's anchor forward. Unpinned: nothing. */
 export function renderFullReviewAnchor(read) {
   const sha = read?.deltaReview ? pinnedSha(read.deltaReview.anchor) : pinnedSha(read?.netBasis?.rev);
-  return sha ? `Full-review anchor: \`${sha}\`${read?.deltaReview ? ' (this was a delta review)' : ' (this review)'}` : '';
+  return sha ? ` Full-review anchor: \`${sha}\`.` : '';
+}
+/** The producer's `Net basis` footer line, shared by the verdict write-up and the advisory note. */
+export function renderNetBasisLine(read) {
+  return `Net basis: \`${read.netBasis.base ?? '?'}..${read.netBasis.rev ?? '?'}\`${renderRevProvenance(read.netBasis)} — `
+    + `${read.netChangedFiles.length} net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.`
+    + renderFullReviewAnchor(read);
 }
 
 /**
@@ -1921,9 +1928,7 @@ export function renderVerdictWriteUp({ read, verdict, answer, actor, reason = ''
   const basis = read.degraded
     ? `⚠️ DEGRADED BASIS (\`${read.degradedReason}\`) — the net diff vs current main could not be resolved, so the `
       + 'file list below may be inflated by sibling-lane content this PR does not touch (#2450).'
-    : `Net basis: \`${read.netBasis.base ?? '?'}..${read.netBasis.rev ?? '?'}\`${renderRevProvenance(read.netBasis)} — `
-      + `${read.netChangedFiles.length} net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.`
-      + (renderFullReviewAnchor(read) ? `\n${renderFullReviewAnchor(read)}` : '');
+    : renderNetBasisLine(read);
   return [
     body,
     ...renderDeferredAdvisorySection({ read, verdict }),
@@ -2222,9 +2227,7 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
   const basis = read.degraded
     ? `⚠️ DEGRADED BASIS (\`${read.degradedReason}\`) — the net diff vs current main could not be resolved, so `
       + 'the file list above may be inflated by sibling-lane content this PR does not touch (#2450).'
-    : `Net basis: \`${read.netBasis.base ?? '?'}..${read.netBasis.rev ?? '?'}\`${renderRevProvenance(read.netBasis)} — `
-      + `${read.netChangedFiles.length} net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.`
-      + (renderFullReviewAnchor(read) ? `\n${renderFullReviewAnchor(read)}` : '');
+    : renderNetBasisLine(read);
   return [
     `${ADVISORY_NOTE_MARKER} ${reasonLine}`,
     'This PR carries `review:human`. The independent',
