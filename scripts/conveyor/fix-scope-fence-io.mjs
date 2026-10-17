@@ -6,7 +6,42 @@ import { planFixesFromReconcile, fetchPrDiffScope, fetchPrDiffPaths, fetchCardSc
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 import { unescapeTsvField } from './pr-comments-list.mjs';
 import { buildStandDownComment, STAND_DOWN_LABEL } from './stand-down.mjs';
-import { fencedPush, operatorScope, removalMarkers, resolveScopeFence, ScopeFenceEvidenceError, ScopeFenceHeadMovedError } from './fix-scope-fence.mjs';
+import { addedLines, commonLines, fencedPush, operatorScope, removalMarkers, resolveScopeFence, ScopeFenceEvidenceError, ScopeFenceHeadMovedError } from './fix-scope-fence.mjs';
+
+/**
+ * Pins the diff output the fence parses against lane config and attributes: no colour, every file as text (a binary
+ * attribute or driver, `core.bigFileThreshold` or NUL sniffing would otherwise print only "Binary files differ"),
+ * whole-tree paths, and submodule changes always listed.
+ */
+const FENCE_DIFF = ['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--no-color', '--text', '--no-relative', '--ignore-submodules=none', '--submodule=short'];
+const OID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
+const MAX_MERGED = 20;
+
+/**
+ * The newest commit a catch-up merge (`git merge <base sha>`) brought into `sha`, when GitHub confirms it is part of the
+ * PR's base; null otherwise. Only GitHub's answer counts: a merge parent is fixer-chosen, so an unverified one is
+ * treated as the fixer's own change.
+ */
+export function mergedBase({ git, gh, repo, head, sha, base }) {
+  const parents = git(['rev-list', '--first-parent', '--merges', '--parents', `${head}..${sha}`])
+    .split('\n').flatMap(line => line.trim().split(' ').slice(2)).filter(p => OID.test(p));
+  const isAncestor = (a, b) => {
+    try { git(['merge-base', '--is-ancestor', a, b]); return true; } catch (e) {
+      if (e.status === 1) return false;
+      throw e;
+    }
+  };
+  const merged = [...new Set(parents)].filter(p => !isAncestor(p, head));
+  if (!merged.length || merged.length > MAX_MERGED || !OID.test(String(base ?? ''))) return null;
+  const newest = merged.find(c => merged.every(o => o === c || isAncestor(o, c)));
+  if (!newest) return null;
+  let status;
+  try { status = gh(['api', `repos/${repo}/compare/${newest}...${base}`, '--jq', '.status']).trim(); } catch (e) {
+    if (/HTTP (?:404|422)/.test(String(e?.stderr ?? e?.message ?? e))) return null;
+    throw e;
+  }
+  return status === 'ahead' || status === 'identical' ? newest : null;
+}
 
 const COMMITS_QUERY = 'query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){commits(first:100,after:$endCursor){totalCount pageInfo{hasNextPage endCursor} nodes{commit{oid message}}}}}}';
 
@@ -38,7 +73,7 @@ export function createScopeFencedPush({ root, exec = execFileSync, env = process
       readContext: () => {
         const key = repoKeyForSlug(repo);
         if (!key) throw new Error('unknown repo');
-        const view = JSON.parse(gh(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefName,headRefOid']));
+        const { baseRefOid: base = null, ...view } = JSON.parse(gh(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefName,headRefOid,baseRefOid']));
         if (!/^[0-9a-f]{40}$/.test(view.headRefOid)) throw new Error('missing PR head');
         const comments = readComments(pr, { repo, exec });
         const operator = operatorScope(comments);
@@ -58,9 +93,9 @@ export function createScopeFencedPush({ root, exec = execFileSync, env = process
         const scope = result.planned[0]?.scope;
         if (!scope?.length) throw new Error('declared scope could not be resolved');
         const removed = [...operator.removed, ...commitMarkers];
-        return { scope, repo: key, removed, head: view.headRefOid, comments };
+        return { scope, repo: key, removed, head: view.headRefOid, base, comments };
       },
-      readDiff: ({ head }) => {
+      readDiff: ({ head, base }) => {
         // Commit-to-commit reads only; hardening is supplied by the daemon's git port.
         // Prove our saved commit exists before attributing a missing remote head to branch movement.
         git(['cat-file', '-e', `${sha}^{commit}`]);
@@ -72,9 +107,14 @@ export function createScopeFencedPush({ root, exec = execFileSync, env = process
           if (e.status === 1) throw new ScopeFenceHeadMovedError(head, sha);
           throw e;
         }
-        const paths = git(['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--name-only', '-z', head, sha, '--']).split('\0').filter(Boolean);
-        const patch = git(['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '-U0', head, sha, '--']);
-        return { paths, patch };
+        const names = (from, to) => git([...FENCE_DIFF, '--name-only', '-z', from, to, '--']).split('\0').filter(Boolean);
+        const added = (from, to) => addedLines(git([...FENCE_DIFF, '-U0', from, to, '--']));
+        const paths = names(head, sha);
+        const merged = mergedBase({ git, gh, repo, head, sha, base });
+        if (!merged) return { paths, additions: added(head, sha) };
+        // A path neither the PR (since the merge base) nor the fixer (against the merged base) changed carries only upstream's change.
+        const own = new Set([...names(git(['merge-base', head, merged]).trim(), head), ...names(merged, sha)]);
+        return { paths: paths.filter(p => own.has(p)), additions: commonLines(added(head, sha), added(merged, sha)) };
       },
       standDown: (reason, { head, comments }) => {
         const body = buildStandDownComment({ reason: 'scope-increase', detail: reason, head });

@@ -198,3 +198,94 @@ describe('the live scope fence adapter', () => {
     expect(r.writes.some(args => args.includes('review-status:stood-down'))).toBe(true);
   });
 });
+
+describe('the live scope fence adapter over a real repository', () => {
+  const ident = ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', '-c', 'core.hooksPath=/dev/null'];
+  let createScopeFencedPush, laneGitConfigArgs;
+  beforeAll(async () => {
+    ({ createScopeFencedPush } = await import('../fix-scope-fence-io.mjs'));
+    ({ laneGitConfigArgs } = await import('../../lib/lane-git-hardening.mjs'));
+  }, 60_000);
+  /** A real repo plus the daemon-shaped git port (`-C lane` and the lane hardening pins) the fence is handed. */
+  function realRepo() {
+    const dir = mkdtempSync(join(tmpdir(), 'fix-scope-fence-live-'));
+    const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' };
+    const git = args => String(execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', env }));
+    const port = args => String(execFileSync('git', ['-C', dir, ...laneGitConfigArgs(), ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env }));
+    const write = (file, text) => writeFileSync(join(dir, file), text);
+    const commit = message => { git(['add', '.']); git([...ident, 'commit', '-qm', message]); return git(['rev-parse', 'HEAD']).trim(); };
+    git(['init', '-q', '-b', 'main']);
+    return { dir, git, port, write, commit };
+  }
+  /** The live adapter against a fake GitHub: the PR head and base, one marker commit, and the compare verdict for a merged commit. */
+  function liveFence(repo, { head, sha, base = null, compare = 'ahead' }) {
+    const writes = [], compares = [];
+    const exec = (file, args) => {
+      expect(file).toBe('gh');
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefName: 'lane/scope-fence', headRefOid: head, baseRefOid: base });
+      if (args[0] === 'api' && args[1] === 'graphql') return `1\n${head}\tremoval\\n\\nscope-removed: cdLandings\n`;
+      if (args[0] === 'api' && /\/compare\//.test(args[1])) {
+        compares.push(args[1]);
+        if (compare === 404) throw Object.assign(new Error('gh: Not Found (HTTP 404)'), { status: 1, stderr: 'gh: No commit found for SHA (HTTP 404)' });
+        return `${compare}\n`;
+      }
+      if (args[0] === 'api') return 'diff --git a/guard.mjs b/guard.mjs\n--- a/guard.mjs\n+++ b/guard.mjs\n';
+      if (args[0] === 'pr' && args[1] === 'diff') return 'guard.mjs\n';
+      writes.push(args); return '';
+    };
+    const fence = createScopeFencedPush({ root: '.', exec, env: {}, log: () => {},
+      loadItems: () => [{ num: '5957', slug: 'leading-cd', scope: ['we:guard.mjs'] }], readComments: () => [] });
+    const push = vi.fn(() => ({ ok: true }));
+    return { result: fence({ repo: 'web-everything/web-everything', pr: 5403, sha, git: repo.port, push }), push, writes, compares };
+  }
+
+  it.each([
+    ['an info/attributes binary mark', r => r.write('.git/info/attributes', 'guard.mjs binary\n')],
+    ['a diff driver declared binary', r => { r.write('.git/info/attributes', '* diff=opaque\n'); r.git(['config', 'diff.opaque.binary', 'true']); }],
+    ['a big-file threshold below the file size', r => r.git(['config', 'core.bigFileThreshold', '1'])],
+    ['forced colour output', r => { r.git(['config', 'color.ui', 'always']); r.git(['config', 'color.diff', 'always']); }],
+    ['NUL bytes that make git sniff the file as binary', () => {}, '\0'],
+  ])('still sees a re-added removed identifier under %s', (_, setup, tail = '') => {
+    const r = realRepo();
+    try {
+      r.write('guard.mjs', `function cdLandings() {}\n${tail}`); r.commit('initial');
+      r.write('guard.mjs', `// leading cd only\n${tail}`); const head = r.commit('removal');
+      setup(r);
+      r.write('guard.mjs', `function cdLandings() {}\n${tail}`); const sha = r.commit('fixer re-addition');
+      const { result, push } = liveFence(r, { head, sha });
+      expect(result).toMatchObject({ ok: false, scopeFence: true, terminal: true });
+      expect(result.reason).toContain('re-adds operator-removed identifier: cdLandings');
+      expect(push).not.toHaveBeenCalled();
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+
+  /** The brief's sanctioned catch-up: repair on the PR head, then `git merge --no-edit <base sha>` of an upstream change. */
+  function catchUp(r, { upstream = 'export const other = 2;\n', fixer = 'function guard() { return 2; }\n', smuggle = false } = {}) {
+    r.write('guard.mjs', 'function guard() {}\n'); r.write('other.mjs', 'export const other = 1;\n'); r.commit('initial');
+    r.git(['checkout', '-qb', 'pr']); r.write('guard.mjs', 'function guard() { return 1; }\n'); const head = r.commit('removal');
+    r.git(['checkout', '-q', 'main']); r.write('other.mjs', upstream); const base = r.commit('upstream');
+    r.git(['checkout', '-q', 'pr']); r.write('guard.mjs', fixer); r.commit('repair');
+    r.git([...ident, 'merge', '-q', '--no-edit', base]);
+    if (smuggle) { r.write('other.mjs', `${upstream}export const smuggled = 1;\n`); r.git(['add', 'other.mjs']); r.git([...ident, 'commit', '-q', '--amend', '--no-edit']); }
+    return { head, base, sha: r.git(['rev-parse', 'HEAD']).trim() };
+  }
+  it.each([
+    ['an in-scope repair merged with the base', {}, 'identical', null],
+    ['an upstream line that happens to name a removed identifier', { upstream: 'export const cdLandings = 2;\n' }, 'ahead', null],
+    ['an out-of-scope edit smuggled into the merge commit', { smuggle: true }, 'identical', 'outside declared scope: other.mjs'],
+    ['a merged commit GitHub does not place on the base', {}, 'diverged', 'outside declared scope: other.mjs'],
+    ['a merged commit GitHub does not know', {}, 404, 'outside declared scope: other.mjs'],
+    ['a removed identifier re-added alongside the catch-up', { fixer: 'function cdLandings() {}\n' }, 'identical', 're-adds operator-removed identifier: cdLandings'],
+  ])('a base catch-up merge: %s', (_, shape, compare, violation) => {
+    const r = realRepo();
+    try {
+      const { head, base, sha } = catchUp(r, shape);
+      const { result, push, compares } = liveFence(r, { head, sha, base, compare });
+      expect(compares).toEqual([`repos/web-everything/web-everything/compare/${base}...${base}`]);
+      if (!violation) { expect(result).toEqual({ ok: true }); expect(push).toHaveBeenCalledOnce(); return; }
+      expect(result).toMatchObject({ ok: false, scopeFence: true, terminal: true });
+      expect(result.reason).toContain(violation);
+      expect(push).not.toHaveBeenCalled();
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+});

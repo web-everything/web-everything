@@ -70,17 +70,33 @@ export function inertText(value, max = 200) {
 
 const LISTED_VIOLATIONS = 20;
 
-export function scopeFenceDecision({ scope = [], repo, paths = [], patch = '', removed = [], policy }) {
-  if (policy?.enabled === false) return { action: 'push', violations: [] };
-  const allowed = scope.filter(s => !s.includes(':') || s.startsWith(`${repo}:`)).map(s => s.replace(/^[^:]+:/, '').split('#')[0]);
-  const outside = paths.filter(p => !allowed.some(s => coversFile(`${repo}:${s}`, `${repo}:${p}`) || (!/[*?]/.test(s) && p.startsWith(`${s.replace(/\/$/, '')}/`))));
+/** The added lines of a plain `git diff -U0` patch, file headers excluded. */
+export function addedLines(patch = '') {
   let inHunk = false;
-  const additions = patch.split('\n').filter(line => {
+  return patch.split('\n').filter(line => {
     if (line.startsWith('diff --git ')) inHunk = false;
     if (line.startsWith('@@ ')) inHunk = true;
     return line.startsWith('+') && (inHunk || !line.startsWith('+++ '));
-  }).join('\n');
-  const addedIdentifiers = new Set(additions.match(/[A-Za-z_$][\w$]*/g) ?? []);
+  });
+}
+
+/** Lines added relative to BOTH parents of a catch-up merge (multiset): the fixer's, never only upstream's or only the PR's. */
+export function commonLines(a, b) {
+  const counts = new Map();
+  for (const line of b) counts.set(line, (counts.get(line) ?? 0) + 1);
+  return a.filter(line => {
+    const n = counts.get(line) ?? 0;
+    if (n) counts.set(line, n - 1);
+    return n > 0;
+  });
+}
+
+/** `additions` (lines) wins over `patch` when the caller already attributed the added lines. */
+export function scopeFenceDecision({ scope = [], repo, paths = [], patch = '', additions = addedLines(patch), removed = [], policy }) {
+  if (policy?.enabled === false) return { action: 'push', violations: [] };
+  const allowed = scope.filter(s => !s.includes(':') || s.startsWith(`${repo}:`)).map(s => s.replace(/^[^:]+:/, '').split('#')[0]);
+  const outside = paths.filter(p => !allowed.some(s => coversFile(`${repo}:${s}`, `${repo}:${p}`) || (!/[*?]/.test(s) && p.startsWith(`${s.replace(/\/$/, '')}/`))));
+  const addedIdentifiers = new Set(additions.join('\n').match(/[A-Za-z_$][\w$]*/g) ?? []);
   const identifiers = [...new Set(removed)].filter(id => addedIdentifiers.has(id));
   const violations = [...outside.map(p => `outside declared scope: ${inertText(p)}`), ...identifiers.map(id => `re-adds operator-removed identifier: ${inertText(id)}`)];
   if (!violations.length) return { action: 'push', violations };
