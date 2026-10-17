@@ -57,7 +57,7 @@ import { createReferralGhProvider } from '../lib/review-comment-edit.mjs';
 // (`planAdvisoryLabels`) lives in the leaf, the writes go through the same provider port as the note above.
 import { ADVISORY_LABEL_META, advisoryCoversHead, labelNames, planAdvisoryLabels } from '../lib/advisory-labels.mjs';
 // #3007 — the real verdict ledger, behind the reserved `verdict-ledger.append` seam. See the LEDGER sink.
-import { EVENT_TYPES, appendVerdict, buildLedgerEvent, buildVerdictRecord, foldRepo, parseLedgerEvents, verdictBears, verdictForLabelTarget, verdictLedgerPath } from '../lib/verdict-ledger.mjs';
+import { EVENT_TYPES, appendVerdict, buildLedgerEvent, buildVerdictRecord, foldRepo, observedLedgerHead, parseLedgerEvents, verdictBears, verdictForLabelTarget, verdictLedgerPath } from '../lib/verdict-ledger.mjs';
 // Card 5469 — the scoped re-review shadow: the declared setting and the pure round rules.
 import { isValidRoundBudget, resolveReviewSettings, resolveReviewSettingSource, SCOPED_REREVIEW_MODES, ROUND_BUDGET_OFF } from '../lib/review-settings.mjs';
 import { acceptanceIds, enclosingSymbol, foldFindingStatuses, lastReviewedHead, reviewRoundOf, reviewScope, shadowRound,
@@ -1412,9 +1412,10 @@ export function createReviewPrSinks({
     // missed, and it APPENDS — a second row for one verdict in an append-only authority, which nothing can
     // undo. Verdict comparison fails the other way: its one ambiguity is a verdict that legitimately REPEATS
     // (a second `accepted` after a re-review), where the sink treats the earlier identical row as this
-    // round's and writes nothing. That usually costs only a duplicate history row saying what the ledger already
-    // says. The one exception fails closed: a later hold on a superseded or missing head (which the fold applies)
-    // stays current until a fresh row lands, so the PR stays held, never released. An under-write of a redundant row against an unrecoverable
+    // round's and writes nothing. That costs a duplicate history row saying what the ledger already says, because
+    // on the live head the comparison is against `current`: a later hold the fold applied is never mistaken for
+    // this round's write. A replay that lands after a newer park re-asserts this round's verdict over it, exactly
+    // as the base current-verdict comparison did. An under-write of a redundant row against an unrecoverable
     // double-write of a real one is not a close call.
     //
     // The DECLARATION is unchanged (`we:scripts/operations/review-pr.mjs` still declares
@@ -1440,9 +1441,14 @@ export function createReviewPrSinks({
       // This is the reviewed head, possibly from a delayed effect, not a live lifecycle observation.
       // The label writer observes the live PR; the reconciliation row witnesses only its own review.
       const folded = foldRepo(payload.repo).get(pr);
-      // A delayed completion can remain historical. Its replay must still find that write rather than
-      // appending a new timestamped row forever. Within a head, compare the latest bearing verdict.
-      const existing = folded?.history.findLast(row => verdictBears(row.verdict) && row.coverage?.headSha === headSha);
+      // On the live witnessed head the review must be the CURRENT verdict: a later hold the fold applies (a
+      // headless or stale-snapshot drain park) is not answered by an older accept at this head.
+      // A delayed completion for another head stays historical. Its replay must still find that write rather
+      // than appending a new timestamped row forever, so it compares the latest bearing verdict at its head.
+      const history = folded?.history ?? [];
+      const existing = history.length && observedLedgerHead(history) === headSha
+        ? (folded.current?.coverage?.headSha === headSha ? folded.current : null)
+        : history.findLast(row => verdictBears(row.verdict) && row.coverage?.headSha === headSha);
       if (existing?.verdict === verdict) {
         return {
           reconciled: true,

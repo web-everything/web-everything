@@ -44,6 +44,7 @@ export const PR_EVENTS_DEFAULTS = Object.freeze({
   minWakeGapMs: 10_000,           // never tick back-to-back faster than this, however busy the feed is
   timeoutMs: 8_000,
   limit: 200,
+  maxObservationsPerPoll: 25,     // head observations (each a live `gh pr view` + ledger write) one poll may run
 });
 
 export function defaultStateDir(env = process.env) {
@@ -196,6 +197,19 @@ export function createEventWaker(o) {
     const relevant = [];
     const all = [];
     let wakeReason = null;
+    // Head observation is a synchronous live read + ledger write. Bound it: only allow-listed repos, each PR
+    // once per poll, at most `maxObservationsPerPoll`, and an observer failure never costs the wake.
+    const observed = new Set();
+    let observeSkipped = 0;
+    const observe = (e, pr) => {
+      const key = `${e.repo}#${pr}`;
+      if (observed.has(key)) return;
+      if (observed.size >= PR_EVENTS_DEFAULTS.maxObservationsPerPoll) { observeSkipped += 1; return; }
+      observed.add(key);
+      try { observeHead(e, pr); } catch (err) {
+        log.error(`pr-events(${role}): head observation for ${key} failed (non-fatal): ${String(err?.message || err).split('\n')[0]}`);
+      }
+    };
     for (let page = 0; page < 5; page += 1) {
       const r = await poll(st.cursor, { url, token });
       if (!r.ok) {
@@ -214,13 +228,14 @@ export function createEventWaker(o) {
       for (const e of r.events) {
         all.push(e);
         // Only PR lifecycle events assert an open live head. Check/review SHAs can be historical.
-        if (e.type === 'pull_request' && e.state === 'open' && (!repos?.length || repos.includes(e.repo))) {
-          for (const pr of e.prs ?? []) observeHead(e, pr);
+        if (e.type === 'pull_request' && e.state === 'open' && repos?.length && repos.includes(e.repo)) {
+          for (const pr of e.prs ?? []) observe(e, pr);
         }
         if (isRelevantEvent(e, role, { repos })) relevant.push(e);
       }
       if (!r.more) break;
     }
+    if (observeSkipped) log.error(`pr-events(${role}): skipped ${observeSkipped} head observation(s) past the per-poll cap of ${PR_EVENTS_DEFAULTS.maxObservationsPerPoll}; the next sighting or pass records them`);
     for (const f of forward) {
       const hits = all.filter((e) => isRelevantEvent(e, f.role, { repos }));
       if (!hits.length) continue;

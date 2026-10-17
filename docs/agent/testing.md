@@ -1550,8 +1550,9 @@ Legacy runs without seat observations are omitted; absent times are never recons
 head before the writer's own judgment. `ledger.firstSeenRows` and `ledger.headMoveInvalidation` default to
 true through the policy cascade; effective values and sources are logged. A first-seen row imports existing
 review holds and records the observed label state, but an acceptance label alone cannot manufacture a
-content-witnessed clearance. `node scripts/operations/ledger-backfill.mjs --dry-run` counts missing rows for
-all open PRs (paginated); omit `--dry-run` to append through the normal ledger writer and lock.
+content-witnessed clearance. A PR whose rows name no head yet (for example only a headless drain park) is
+still baselined. `node scripts/operations/ledger-backfill.mjs --dry-run` counts open PRs with no witnessed
+head (paginated); omit `--dry-run` to append through the normal ledger writer and lock.
 
 `head-moved` is a holding verdict at the new head and ends implicit approval scope. A `carried` verdict
 requires the previous live acceptance to name the immediately preceding head, plus an existing numbering,
@@ -1560,13 +1561,19 @@ Observation preconditions are rechecked inside the home append lock and each tra
 baseline cannot overwrite a review or a delayed head observation overwrite a newer one. Feed events re-read
 GitHub's live head because delivered events and drain list snapshots may describe an older head. The bare
 event waker defaults to a no-op observer; the production wrapper opts into ledger observation explicitly.
+The waker observes only repos on its allowlist (none without one), each PR once per poll and at most
+`PR_EVENTS_DEFAULTS.maxObservationsPerPoll`; an observer failure is logged and never drops the wake.
+The drain observes each PR's live head before its holds; an exemption a late head move ended is re-emitted,
+using the same `eventsSinceHeadMove` boundary as the pr-state view.
 Completed reviews witness their own pinned head even if observation writes are disabled or missed;
 delayed verdicts for superseded heads remain history and do not clear outstanding holds. A later explicit
 live transition can return to an earlier head. Once a head is witnessed, a hold with no head or a
 superseded head (for example a drain park built from an old list snapshot) still applies without moving
 the witnessed head, while such a clear stays history.
 Reconciliation requires a full 40-hex reviewed SHA and normalizes case before checking for an existing
-verdict. A missing review base appends nothing: the reconcile effect prints a loud `ledger-write-skip`
+verdict. On the live witnessed head the existing verdict must be the current one, so a later headless or
+stale-head hold is answered by a fresh row; a delayed completion for another head matches its own history
+row instead. A missing review base appends nothing: the reconcile effect prints a loud `ledger-write-skip`
 line and completes, so it is not retried on every resume. A malformed base is refused before append. A
 live head must never be substituted for a missing review witness.
 Regression coverage includes the four observation-setting combinations, late transition/completion order,

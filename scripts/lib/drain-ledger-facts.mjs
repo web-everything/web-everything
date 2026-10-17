@@ -6,7 +6,7 @@
  * changes a drain decision. Ledger clearance stays fail-closed on missing or unreadable evidence.
  */
 import { readFileSync } from 'node:fs';
-import { appendVerdict, buildLedgerEvent, buildVerdictRecord, EVENT_TYPES, foldVerdictLedger,
+import { appendVerdict, buildLedgerEvent, buildVerdictRecord, EVENT_TYPES, eventsSinceHeadMove, foldVerdictLedger,
   parseLedgerEvents, readLedgerEventsFromStore, resolveLedgerBoardDetail, resolveLedgerStoreChoice, validateLedgerEvent,
   VERDICT_LEDGER_STORES, verdictLedgerPath } from './verdict-ledger.mjs';
 
@@ -43,7 +43,8 @@ function planRows({ verdicts, repo, events, now }, emit) {
     const mine = normalized.filter(e => e.pr === pr && slug(e.repo) === slug(repo));
     const folded = foldVerdictLedger(mine.filter(isVerdict)).get(pr);
     const common = { repo, pr, at: now, source: DRAIN_FACTS_SOURCE, declaredActor: 'drain' };
-    const lastExempt = mine.filter(e => e.type === EVENT_TYPES.REVIEW_EXEMPT).at(-1);
+    // The same head-move boundary the pr-state view applies: an exemption a late head move ended does not stand.
+    const lastExempt = eventsSinceHeadMove(mine, folded).filter(e => e.type === EVENT_TYPES.REVIEW_EXEMPT).at(-1);
     if (v.reviewGate?.reviewExempt === true && (!folded?.current || folded.current.verdict === 'head-moved')
       && lastExempt?.headSha !== head) {
       emit('exempt', buildLedgerEvent, { ...common, type: EVENT_TYPES.REVIEW_EXEMPT, headSha: head, basis: EXEMPT_BASIS });

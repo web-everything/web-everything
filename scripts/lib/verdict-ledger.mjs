@@ -778,10 +778,19 @@ export function observedLedgerHead(events) {
     || events.map(e => e.headSha).filter(Boolean).at(-1);
 }
 
+/** One PR's events with what a head move ended removed: approvals, exemptions and verdicts before the PR's latest
+ *  applied `head-moved` row (`folded.lastHeadMove`). The ONE boundary rule, shared by the pr-state view and the
+ *  drain's exemption dedup, so the two cannot disagree about whether an exemption still stands. */
+export function eventsSinceHeadMove(events, folded) {
+  const boundary = events.indexOf(folded?.lastHeadMove);
+  if (boundary < 0) return events;
+  return events.filter((e, i) => i >= boundary || ![EVENT_TYPES.APPROVAL, EVENT_TYPES.REVIEW_EXEMPT, EVENT_TYPES.VERDICT].includes(e.type));
+}
+
 /** Lifecycle observations are conditional at the locked/transport tip, never against a stale snapshot. */
 export function ledgerObservationApplies(row, existing) {
   const mine = existing.filter(e => e.repo.toLowerCase() === row.repo.toLowerCase() && e.pr === row.pr);
-  if (row.source === 'first-seen') return mine.length === 0;
+  if (row.source === 'first-seen') return !mine.length || !observedLedgerHead(mine);
   if (['head-moved', 'carried'].includes(row.verdict)) {
     const head = observedLedgerHead(mine);
     if (head !== row.fromHead) return false;

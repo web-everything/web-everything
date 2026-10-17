@@ -11,7 +11,7 @@
  * No callers are switched by this slice.
  */
 import { derivePrState as derivePrPhase } from './pr-state-core.mjs';
-import { EVENT_TYPES, foldVerdictLedger, verdictLabel, validateLedgerEvent } from './verdict-ledger.mjs';
+import { EVENT_TYPES, eventsSinceHeadMove, foldVerdictLedger, verdictLabel, validateLedgerEvent } from './verdict-ledger.mjs';
 import { deriveReferrals, openReferralKeys } from './pr-state/referrals.mjs';
 import { evaluateHolds } from './pr-state/holds/index.mjs';
 import { approvalLiftsAfter } from './pr-state/holds/verdict.mjs';
@@ -53,8 +53,7 @@ export function ledgerView(events, facts) {
   // Fold the complete stream so a delayed transition cannot erase a review that already witnessed its head.
   const folded = scope ? foldVerdictLedger(mine.filter(isVerdictRow)).get(scope.pr) ?? null : null;
   // Approvals have legacy implicit head scope. A movement boundary ends that scope.
-  const boundary = mine.indexOf(folded?.lastHeadMove);
-  if (boundary >= 0) mine = mine.filter((e, i) => i >= boundary || ![EVENT_TYPES.APPROVAL, EVENT_TYPES.REVIEW_EXEMPT, EVENT_TYPES.VERDICT].includes(e.type));
+  mine = eventsSinceHeadMove(mine, folded);
   const cur = folded?.current ?? null;
   let clears = !!folded?.clears;
   // A human hold is lifted by a LATER valid approval (unexpired delegation, provable clock); an unknown position never lifts.

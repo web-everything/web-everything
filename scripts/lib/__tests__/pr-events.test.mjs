@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   withPrEvents, resolvePrEventsConfig, pollEvents, classifyFeedHealth, effectiveIntervalMs, isRelevantEvent,
-  createEventWaker, readPrEventsStatuses, makeDrainNudgeForward,
+  createEventWaker, readPrEventsStatuses, makeDrainNudgeForward, PR_EVENTS_DEFAULTS,
 } from '../pr-events.mjs';
 
 const quiet = { error: () => {} };
@@ -24,10 +24,44 @@ it('keeps a bare event waker free of ledger IO while the production wrapper opts
   const poll = async () => ({ ok: true, cursor: 1, events: [event], more: false });
   await createEventWaker({ role: 'review', poll }).pollOnce();
   expect(observeLedgerPrEvent).not.toHaveBeenCalled();
-  const effects = withPrEvents({}, { role: 'review', poll, log: quiet, minWakeGapMs: 0,
+  const effects = withPrEvents({}, { role: 'review', repos: ['a/b'], poll, log: quiet, minWakeGapMs: 0,
     env: { WE_PR_EVENTS: '1', WE_PR_EVENTS_URL: 'https://example.invalid', WE_PR_EVENTS_TOKEN: 'test', WE_PR_EVENTS_STATE_DIR: mkdtempSync(join(tmpdir(), 'pr-events-observe-')) } });
   await effects.sleep(1);
   expect(observeLedgerPrEvent).toHaveBeenCalledWith(event, 1);
+});
+
+describe('bounded head observation inside the poll loop', () => {
+  const open = (repo, prs) => ({ type: 'pull_request', repo, prs, state: 'open', action: 'synchronize' });
+  const waker = (events, o = {}) => createEventWaker({ role: 'review', repos: ['a/b'], log: quiet,
+    poll: async () => ({ ok: true, cursor: 1, events, more: false }), ...o });
+
+  it('a throwing observer is logged per event and never drops the wake or the remaining sightings', async () => {
+    const seen = [];
+    const errors = [];
+    const observeHead = (_e, pr) => { if (pr === 1) throw new Error('boom'); seen.push(pr); };
+    const r = await waker([open('a/b', [1, 2])], { observeHead, log: { error: (s) => errors.push(s) } }).pollOnce();
+    expect(seen).toEqual([2]);
+    expect(r.wake).toBe(true);
+    expect(errors.join('\n')).toContain('head observation for a/b#1 failed (non-fatal): boom');
+  });
+
+  it('observes each PR once per poll and caps the observations, saying how many it dropped', async () => {
+    const seen = [];
+    const errors = [];
+    const prs = Array.from({ length: PR_EVENTS_DEFAULTS.maxObservationsPerPoll + 5 }, (_, i) => i + 1);
+    await waker([open('a/b', [1, 1]), open('a/b', [1]), open('a/b', prs)], {
+      observeHead: (_e, pr) => seen.push(pr), log: { error: (s) => errors.push(s) } }).pollOnce();
+    expect(seen).toEqual(prs.slice(0, PR_EVENTS_DEFAULTS.maxObservationsPerPoll));
+    expect(errors.join('\n')).toContain('skipped 5 head observation(s) past the per-poll cap');
+  });
+
+  it('observes nothing without a repo allowlist, and nothing outside it', async () => {
+    const seen = [];
+    const observeHead = (e, pr) => seen.push(`${e.repo}#${pr}`);
+    await waker([open('a/b', [1])], { repos: null, observeHead }).pollOnce();
+    await waker([open('x/y', [1]), open('a/b', [2])], { observeHead }).pollOnce();
+    expect(seen).toEqual(['a/b#2']);
+  });
 });
 
 describe('flag + config', () => {

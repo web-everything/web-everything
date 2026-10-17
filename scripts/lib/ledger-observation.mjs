@@ -53,7 +53,9 @@ export function planLedgerObservation({ repo, pr, headSha, state = 'OPEN', label
   pr = Number(pr);
   const mine = events.filter(e => e.repo.toLowerCase() === repo.toLowerCase() && e.pr === pr);
   const fields = { repo, pr, headSha, at: now, declaredActor: 'ledger-observer' };
-  if (!mine.length) {
+  const oldHead = mine.length ? observedLedgerHead(mine) : null;
+  // No witnessed head yet, including a PR whose only rows are headless (a drain park with no readable head).
+  if (!oldHead) {
     if (!settings.value.firstSeenRows) return [];
     const label = labelVerdictOf(labels);
     // An acceptance label alone has no content witness. Import holds, never manufacture approval.
@@ -61,8 +63,7 @@ export function planLedgerObservation({ repo, pr, headSha, state = 'OPEN', label
     return [buildVerdictRecord({ ...fields, verdict, source: 'first-seen', state: label ?? 'unreviewed',
       reason: 'first observed open head; labels alone do not prove an acceptance' })];
   }
-  const oldHead = observedLedgerHead(mine);
-  if (!settings.value.headMoveInvalidation || !oldHead || oldHead === headSha) return [];
+  if (!settings.value.headMoveInvalidation || oldHead === headSha) return [];
   const current = foldVerdictLedger(mine).get(pr)?.current;
   // Never carry a stale acceptance through an intervening unreviewed head or a hold.
   const canCarry = current?.clears === true && current.coverage?.headSha === oldHead;

@@ -80,6 +80,39 @@ describe('open-head ledger observations', () => {
     expect(movedAfterPark).toMatchObject({ verdict: 'head-moved', fromHead: head });
     expect(foldVerdictLedger([...parked, movedAfterPark]).get(1).current).toBe(movedAfterPark);
   });
+  it('baselines a PR whose only rows are headless, then records its head moves', () => {
+    const park = buildVerdictRecord({ repo, pr: 1, verdict: 'human', source: 'merge-ai-prs', at: now });
+    const [baseline] = plan({ events: [park], labels: ['review:human'] });
+    expect(baseline).toMatchObject({ source: 'first-seen', coverage: { headSha: next } });
+    expect(ledgerObservationApplies(baseline, [park])).toBe(true);
+    expect(ledgerObservationApplies(baseline, [park, baseline])).toBe(false);
+    const events = [park, baseline];
+    expect(foldVerdictLedger(events).get(1)).toMatchObject({ clears: false });
+    expect(plan({ events })).toEqual([]);
+    expect(plan({ events, headSha: 'c'.repeat(40) })[0]).toMatchObject({ verdict: 'head-moved', fromHead: next });
+  });
+  it('backfills a PR whose only rows are headless', async () => {
+    const events = [buildVerdictRecord({ repo, pr: 1, verdict: 'human', source: 'merge-ai-prs', at: now })];
+    const prs = [{ number: 1, headRefOid: next, state: 'OPEN', labels: ['review:human'] }];
+    const append = row => { events.push(row); return { ok: true }; };
+    expect(await backfillLedger({ repo, prs, events, append, settings, now })).toMatchObject({ missing: 1, written: 1 });
+    expect(events.at(-1)).toMatchObject({ source: 'first-seen', coverage: { headSha: next } });
+    expect(await backfillLedger({ repo, prs, events, append, settings, now })).toMatchObject({ missing: 0, written: 0 });
+  });
+  it('never lets a carry prover upgrade a hold or an unreviewed head into a clearing carry', () => {
+    // Deliberate pins on the two existing carry guards (planLedgerObservation#canCarry, ledgerObservationApplies).
+    const always = () => 'tree-identical';
+    for (const verdict of ['changes', 'human', 'pending']) {
+      const held = [accepted(), buildVerdictRecord({ repo, pr: 1, headSha: head, verdict, source: 'test', at: now })];
+      expect(plan({ events: held, proveCarry: always })[0]).toMatchObject({ verdict: 'head-moved', clears: false });
+    }
+    const moved = plan({ headSha: next })[0];
+    expect(plan({ events: [accepted(), moved], headSha: 'c'.repeat(40), proveCarry: always })[0]).toMatchObject({ verdict: 'head-moved', fromHead: next });
+    const forged = buildVerdictRecord({ repo, pr: 1, headSha: next, fromHead: head, verdict: 'carried', carryRule: 'tree-identical', source: 'head-observer', at: now });
+    const changes = buildVerdictRecord({ repo, pr: 1, headSha: head, verdict: 'changes', source: 'test', at: now });
+    expect(ledgerObservationApplies(forged, [changes])).toBe(false);
+    expect(ledgerObservationApplies(forged, [accepted()])).toBe(true);
+  });
   it('does not let a stale transition end approval scope on the current head', () => {
     const human = buildVerdictRecord({ repo, pr: 1, headSha: next, verdict: 'human', source: 'test', at: now });
     const approval = buildLedgerEvent({ repo, pr: 1, at: now, source: 'test', type: 'approval', approval: 'clear-human' });
@@ -111,6 +144,19 @@ describe('open-head ledger observations', () => {
       verdicts: [{ repo, num: 1, headSha: next, decision: 'merge', reviewGate: { reviewExempt: true } }] });
     expect(fresh).toHaveLength(1);
     expect(derivePrState([...events, ...fresh], facts).clears).toBe(true);
+  });
+  it('re-emits a new-head exemption that a late head move pushed behind its boundary', () => {
+    const baseline = plan({ events: [], headSha: head })[0];
+    const earlyExempt = buildLedgerEvent({ repo, pr: 1, at: now, source: 'test', type: 'review-exempt', headSha: next, basis: 'no review owed' });
+    const lateMove = plan({ events: [baseline] })[0];
+    const events = [baseline, earlyExempt, lateMove];
+    expect(derivePrState(events, facts).clears).toBe(false);
+    const fresh = planDrainLedgerFacts({ repo, events, now,
+      verdicts: [{ repo, num: 1, headSha: next, decision: 'merge', reviewGate: { reviewExempt: true } }] });
+    expect(fresh).toHaveLength(1);
+    expect(derivePrState([...events, ...fresh], facts).clears).toBe(true);
+    expect(planDrainLedgerFacts({ repo, events: [...events, ...fresh], now,
+      verdicts: [{ repo, num: 1, headSha: next, decision: 'merge', reviewGate: { reviewExempt: true } }] })).toEqual([]);
   });
   it('records the numbering carry rule and covers the new head', () => {
     const carried = plan({ proveCarry: () => 'numbering-only' })[0];
@@ -163,7 +209,7 @@ describe('open-head ledger observations', () => {
   it('feeds open PR sightings to the observer and ignores historical check SHAs', async () => {
     const seen = [];
     const event = { type: 'pull_request', repo, prs: [1], sha: next, state: 'open', action: 'synchronize' };
-    const waker = createEventWaker({ role: 'review', observeHead: (...args) => seen.push(args),
+    const waker = createEventWaker({ role: 'review', repos: [repo], observeHead: (...args) => seen.push(args),
       poll: async () => ({ ok: true, cursor: 1, events: [event, { ...event, type: 'check_run' }, { ...event, state: 'closed' }], more: false }) });
     await waker.pollOnce();
     expect(seen).toEqual([[event, 1]]);

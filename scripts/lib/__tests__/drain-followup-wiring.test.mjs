@@ -7,7 +7,8 @@
  */
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
+import { parseLedgerEvents } from '../verdict-ledger.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -34,6 +35,8 @@ if (a[0] === 'api' && a[1] === 'graphql') out(openPrPageFixture(prs.filter(p => 
 if (a[0] === 'pr' && a[1] === 'view') {
   const p = prs.find(p => String(p.number) === a[2]);
   if (!p) process.exit(1);
+  // The ledger observer's live read (state,headRefOid,labels): FU_LIVE_HEAD is the live head, unlike the listed one.
+  if (process.env.FU_LIVE_HEAD && a.includes('state,headRefOid,labels')) out({ state: landed(p.number) ? 'MERGED' : 'OPEN', headRefOid: process.env.FU_LIVE_HEAD, labels: p.labels });
   out({ ...p, state: landed(p.number) ? 'MERGED' : 'OPEN', mergedAt: landed(p.number) ? '2026-10-10T00:00:00Z' : null });
 }
 if (a[0] === 'pr' && a[1] === 'merge') { fs.appendFileSync(F + '.attempts', a[2] + '\\n'); fs.writeFileSync(F + '.merged-' + a[2], ''); process.exit(0); }
@@ -142,6 +145,22 @@ describe('x4y74wj — the drain hands its post-merge follow-up to a detached job
     expect(result.followupJob).toBeUndefined();
     expect(result.derivedFailed.map((f) => f.cmd)).toEqual(['npm run gen:inventory', 'npm run gen:reference-index']);
   }, 30000);
+
+  // PR #5492 — the drain's own per-PR ledger observation, through the real CLI: it reads the LIVE head (never the
+  // listed snapshot `sha-3001`), records first sight, and on a later pass records the head move from it.
+  it('the drain pass records first sight and then a head move from the live head, not the listed one', () => {
+    const ledgerDir = mkdtempSync(join(tmpdir(), 'drain-fu-ledger-'));
+    const A = 'a'.repeat(40), B = 'b'.repeat(40);
+    const rows = () => readdirSync(ledgerDir, { recursive: true }).filter((f) => String(f).endsWith('.jsonl'))
+      .flatMap((f) => parseLedgerEvents(readFileSync(join(ledgerDir, String(f)), 'utf8'))).filter((r) => r.pr === 3001);
+    try {
+      runCli({ env: { WE_VERDICT_LEDGER_DIR: ledgerDir, FU_LIVE_HEAD: A } });
+      expect(rows().filter((r) => r.source === 'first-seen')).toMatchObject([{ coverage: { headSha: A } }]);
+      runCli({ env: { WE_VERDICT_LEDGER_DIR: ledgerDir, FU_LIVE_HEAD: B } });
+      expect(rows().filter((r) => r.verdict === 'head-moved')).toMatchObject([{ fromHead: A, coverage: { headSha: B } }]);
+      expect(rows().filter((r) => r.source === 'first-seen')).toHaveLength(1);
+    } finally { rmSync(ledgerDir, { recursive: true, force: true }); }
+  }, 60000);
 });
 
 describe('handOffDrainFollowup', () => {

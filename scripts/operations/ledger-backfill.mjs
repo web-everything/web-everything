@@ -3,7 +3,7 @@
 import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { appendVerdict, readLedgerEventsFromStore } from '../lib/verdict-ledger.mjs';
+import { appendVerdict, observedLedgerHead, readLedgerEventsFromStore } from '../lib/verdict-ledger.mjs';
 import { drainLedgerReadStore } from '../lib/drain-ledger-facts.mjs';
 import { planLedgerObservation, resolveLedgerObservationSettings, logLedgerObservationSettings } from '../lib/ledger-observation.mjs';
 
@@ -13,7 +13,9 @@ export async function backfillLedger({ repo, prs, events, dryRun = false, append
   const result = { repo, dryRun, open: prs.length, missing: 0, planned: 0, written: 0 };
   for (const pr of prs) {
     const number = pr.number;
-    if (events.some(e => e.repo.toLowerCase() === repo.toLowerCase() && e.pr === number)) continue;
+    // Already baselined means a witnessed head, not merely a row: a headless drain park is not a baseline.
+    const mine = events.filter(e => e.repo.toLowerCase() === repo.toLowerCase() && e.pr === number);
+    if (mine.length && observedLedgerHead(mine)) continue;
     result.missing++;
     const rows = planLedgerObservation({ repo, pr: number, headSha: pr.headRefOid ?? pr.head?.sha,
       labels: (pr.labels ?? []).map(l => typeof l === 'string' ? l : l.name), state: pr.state ?? 'OPEN', events, settings, now });

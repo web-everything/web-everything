@@ -423,6 +423,22 @@ describe('the ledger and notice sinks', () => {
     expect(foldVerdictLedger(rows).get(7).current.coverage.headSha).toBe('b'.repeat(40));
   });
 
+  it.each([['headless', null], ['superseded-head', HEAD]])('reconciles acceptance after a later %s hold on the live head', async (_kind, parkHead) => {
+    const B = 'b'.repeat(40);
+    appendVerdict(buildVerdictRecord({ repo: 'o/n', pr: 7, verdict: 'accepted', source: 'test', headSha: HEAD, at: '2026-10-17T10:00:00.000Z' }));
+    appendVerdict(buildVerdictRecord({ repo: 'o/n', pr: 7, verdict: 'accepted', source: 'test', headSha: B, at: '2026-10-17T11:00:00.000Z' }));
+    // A drain park with no readable head, or one built from an older list snapshot. The fold applies both.
+    appendVerdict(buildVerdictRecord({ repo: 'o/n', pr: 7, verdict: 'human', source: 'merge-ai-prs', headSha: parkHead, at: '2026-10-17T12:00:00.000Z' }));
+    expect(foldVerdictLedger(readVerdictLedger('o/n')).get(7).clears).toBe(false);
+    const sinks = createReviewPrSinks({ root });
+    // A fresh review accepts B, and the label writer's own append missed: the older accept for B is not this round's.
+    const payload = { pr: 7, repo: 'o/n', to: 'accepted', headSha: B };
+    expect(await sinks[REVIEW_EFFECTS.LEDGER](payload, CTX)).toMatchObject({ reconciled: false });
+    expect(foldVerdictLedger(readVerdictLedger('o/n')).get(7)).toMatchObject({ clears: true, current: { coverage: { headSha: B } } });
+    expect(await sinks[REVIEW_EFFECTS.LEDGER](payload, CTX)).toMatchObject({ reconciled: true });
+    expect(readVerdictLedger('o/n')).toHaveLength(4);
+  });
+
   it('RECONCILES against the row the single home already wrote — it does not append a second one', async () => {
     // Effect 1 shells `we:scripts/review-set-label.mjs`, which is the single home of BOTH the label swap and
     // the ledger row. By the time this sink runs the row exists, and appending again would put two rows in an
