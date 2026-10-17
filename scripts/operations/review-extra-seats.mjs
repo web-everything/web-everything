@@ -64,10 +64,11 @@ import {
   REVIEW_SEAT_DISPATCH_KIND, REVIEW_SEAT_PROVIDERS, reviewSeatTaskType, selectReviewSeatProvider,
 } from '../lib/provider-routing.mjs';
 import {
-  findingCorroboratedBy, foldRedTeamVerdict, IMPACT_LEVELS, normalizeFinding, redTeamRequired, VERDICTS,
+  findingCorroboratedBy, foldRedTeamVerdict, IMPACT_LEVELS, normalizeFinding,
 } from '../lib/jury-core.mjs';
-import { ADVISORY_OUTCOMES } from '../lib/advisory-labels.mjs';
-import { advisoryLabelOutcome, renameSourcePaths } from './review-pr.mjs';
+import { renameSourcePaths } from './review-pr.mjs';
+import { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTeamOwedFor } from '../lib/review-red-team-policy.mjs';
+export { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTeamOwedFor } from '../lib/review-red-team-policy.mjs';
 import { expectationForLens, huntBriefForLens } from '../lib/review-core.mjs';
 import { appendScorecard, readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { scrubPublish } from '../lib/secret-scrub.mjs';
@@ -80,8 +81,6 @@ import { RED_TEAM_UNVERIFIABLE_TAG, readRedTeamProbes, RED_TEAM_COMMENT_MARKER, 
 const THIS_FILE = fileURLToPath(import.meta.url);
 const REPO_ROOT = resolve(dirname(THIS_FILE), '..', '..');
 
-/** Kill switch: `0` (or `off`/`false`) turns every added seat off. Unset = on. */
-export const EXTRA_SEATS_ENV = 'WE_REVIEW_EXTRA_SEATS';
 /** Wall per seat call. Gemini gets half per attempt, since its script may resume once. */
 export const SEAT_TIMEOUT_ENV = 'WE_REVIEW_EXTRA_SEAT_TIMEOUT_MS';
 export const DEFAULT_SEAT_TIMEOUT_MS = 12 * 60 * 1000;
@@ -98,12 +97,6 @@ const MAX_TEXT = 600;
 const QUOTA_RE = /\b(rate[ -]?limit|usage limit|quota|insufficient[_ ]quota|resource[_ ]exhausted|too many requests|429)\b/i;
 
 // ── PURE ────────────────────────────────────────────────────────────────────────────────────────────────────────
-
-/** @returns {boolean} false only when the kill switch is explicitly thrown. PURE. */
-export function extraSeatsEnabled(env = process.env) {
-  const raw = String(env?.[EXTRA_SEATS_ENV] ?? '').trim().toLowerCase();
-  return !['0', 'off', 'false', 'no'].includes(raw);
-}
 
 /** @returns {number} the per-call wall in ms (≥ 60s), else the default. PURE. */
 export function resolveSeatTimeoutMs(env = process.env) {
@@ -428,7 +421,7 @@ function publishable(text) {
  */
 export function buildSeatRows({
   callId, pr, repo, provider, model, effort, seats, call, parsed, claudeFindings, claudeVerdict = null, quota = {}, durationMs = null, evidence = {},
-  changedFiles = null,
+  changedFiles = null, startedAt = null, finishedAt = null,
 }) {
   const provenance = provider?.startsWith('agy-')
     ? { ...agyRunEvidence({ requestedModel: model }), ...pickAgyEvidence(evidence) }
@@ -457,7 +450,7 @@ export function buildSeatRows({
       item: null, handle: `review-${pr}`,
       pr, repo,
       seat: s.seat, lens: s.lens, taskType: reviewSeatTaskType(s.key),
-      callId, status,
+      callId, status, startedAt, finishedAt,
       seatVerdict: status === 'ok' ? seatParse.verdict : null,
       claudeVerdict,
       findingsCount: findings.length,
@@ -628,12 +621,14 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
         } catch (e) {
           run = { report: null, error: String(e?.message ?? e) };
         }
+        const finishedAt = new Date(io.now()).toISOString();
         const call = classifySeatCall(provider, run);
         const parsed = call.status === 'ok' ? repoRelativeFindings(parseSeatAnswer(call.text, group), scratch) : {};
         const quota = { usedPercent: run?.report?.quotaUsedPercent ?? null, resetsAt: toIsoInstant(run?.report?.quotaResetsAt) };
         const rows = buildSeatRows({
           evidence: run?.report ?? {},
-          callId, pr, repo, provider, model, effort, seats: group, call, parsed, claudeFindings, claudeVerdict, quota, durationMs: io.now() - t0,
+          callId, pr, repo, provider, model, effort, seats: group, call, parsed, claudeFindings, claudeVerdict, quota, durationMs: Date.parse(finishedAt) - t0,
+          startedAt: new Date(t0).toISOString(), finishedAt,
           changedFiles: read.netChangedFiles ?? null,
         });
         for (const row of rows) {
@@ -876,7 +871,6 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
 // run instead finishes any effect (miss row, delegation trial, comment) that failed after that row was written.
 // The `red-team-replay` CLI never writes the store at all.
 
-export const RED_TEAM_ENV = 'WE_REVIEW_RED_TEAM';
 export const RED_TEAM_SEAT = Object.freeze({ seat: 'red-team', lens: 'red-team', key: 'red-team' });
 export const RED_TEAM_RUBRIC = 'review-red-team.1';
 export const RED_TEAM_MISS_DISPATCH_KIND = 'red-team-miss';
@@ -902,34 +896,6 @@ const FORBIDDEN_TRIAL_TASK_TYPES = Object.freeze(['self-fix', 'other']);
 // Card x1b8hlo — the marker and the finding tags are single-sourced in the light gate module, whose parser reads this
 // comment back (a confirmed `broken` break goes back to the fixer); re-exported so existing importers keep working.
 export { RED_TEAM_COMMENT_MARKER, redTeamMarker };
-
-/** @returns {boolean} false when either kill switch is thrown. PURE. */
-export function redTeamEnabled(env = process.env) {
-  const raw = String(env?.[RED_TEAM_ENV] ?? '').trim().toLowerCase();
-  return extraSeatsEnabled(env) && !['0', 'off', 'false', 'no'].includes(raw);
-}
-
-/**
- * Card xyyuvyz — IS THE RED TEAM OWED FOR THIS FINISHED REVIEW? PURE. The one gate the job, the sequential pass and
- * the speculative finish all read, so they can never disagree. Owed on EVERY head the panel accepts:
- *   - a recorded accept ({@link redTeamRequired}); or
- *   - a `review:human` ADVISORY accept: the run reduced to `needs-human` only because the human gate applies
- *     (`verdict.humanRequired`), and the panel itself reduces to accept — the SAME `advisoryLabelOutcome` the advisory
- *     note states and the `advisory:accepted` label applies (a pinned, non-degraded read; no blocked or pending
- *     referral). Live gap #4722: the red team broke head ea117e881, the fix landed as e125ac999, the panel accepted
- *     it under `review:human`, and no red team ran on the fixed head.
- * Once per head is not decided here: the pass keys its row and comment by `(pr, netBasis.rev)` and resumes, never
- * re-runs, a head that already has a clean row.
- * @param {object|null} loopPayload - `review-loop-cli.mjs --json`'s payload.
- * @returns {boolean}
- */
-export function redTeamOwedFor(loopPayload) {
-  const verdict = loopPayload?.verdict;
-  if (!verdict || typeof verdict !== 'object') return false;
-  if (redTeamRequired(verdict.verdict ?? null)) return true;
-  if (verdict.verdict !== VERDICTS.NEEDS_HUMAN || verdict.humanRequired !== true) return false;
-  return advisoryLabelOutcome({ read: loopPayload?.findings?.read, verdict }) === ADVISORY_OUTCOMES.ACCEPT;
-}
 
 /** The `not-owed` reason both passes report, naming the advisory case so a skip is never read as "no accept". PURE. */
 function notOwedReason(loopPayload) {
@@ -1345,7 +1311,7 @@ export function redTeamReadFingerprint(read) {
  * prior clean row a `prior-row` status instead of finishing that row's effects (no effect before the verdict).
  */
 export async function speculateRedTeam({
-  pr, repo, lanePath, read, claudeFindings = null, env = process.env, post = true, record = true, onReserved = null, resume = true,
+  pr, repo, lanePath, read, claudeFindings = null, env = process.env, post = true, record = true, onReserved = null, onTiming = () => {}, resume = true,
 } = {}, io = createRedTeamIo({ env })) {
   try {
     if (!redTeamEnabled(env)) return { status: 'disabled', reason: `${RED_TEAM_ENV}=${env?.[RED_TEAM_ENV] ?? ''} ${EXTRA_SEATS_ENV}=${env?.[EXTRA_SEATS_ENV] ?? ''}`.trim() };
@@ -1419,6 +1385,8 @@ export async function speculateRedTeam({
     let call;
     let parsed = {};
     let durationMs = null;
+    let startedAt = null;
+    let finishedAt = null;
     let quota = {};
     let evidence = {};
     let headMessage = '';
@@ -1436,11 +1404,17 @@ export async function speculateRedTeam({
         pr, repo, title: read.title, dir: scratch, diffFile, bodyFile, inline, changedFiles: read.netChangedFiles ?? [], claudeFindings, openOperatorSendBacks: read.openOperatorSendBacks,
       }));
       const t0 = io.now();
+      startedAt = new Date(t0).toISOString();
+      const observe = (values) => { try { onTiming({ callId, provider, model, effort, rev, startedAt, ...values }); } catch { /* timing never changes review results */ } };
+      observe({ finishedAt: null });
       let run;
       try { run = await io.runSeat({ provider, taskFile, dir: scratch, model, effort, timeoutMs }); } catch (e) { run = { report: null, error: String(e?.message ?? e) }; }
-      durationMs = io.now() - t0;
+      finishedAt = new Date(io.now()).toISOString();
+      durationMs = Date.parse(finishedAt) - t0;
       call = classifySeatCall(provider, run);
       if (call.status === 'ok') parsed = repoRelativeFindings(parseSeatAnswer(call.text, [RED_TEAM_SEAT]), scratch);
+      observe({ finishedAt, verdict: parsed[RED_TEAM_SEAT.key]?.verdict ?? null,
+        findingsCount: parsed[RED_TEAM_SEAT.key]?.findings?.length ?? null });
       evidence = run?.report ?? {};
       quota = { usedPercent: run?.report?.quotaUsedPercent ?? null, resetsAt: toIsoInstant(run?.report?.quotaResetsAt) };
     } finally {
@@ -1466,7 +1440,7 @@ export async function speculateRedTeam({
     }
     return {
       status: 'speculated', rev, readFingerprint: redTeamReadFingerprint(read), title: read.title ?? '', body: read.body ?? '',
-      changedFiles: read.netChangedFiles ?? null, provider, model, effort, callId, call, parsed, evidence, quota, durationMs,
+      changedFiles: read.netChangedFiles ?? null, provider, model, effort, callId, call, parsed, evidence, quota, durationMs, startedAt, finishedAt,
       headMessage, findings, recheckStatus, callsUsedToday: usedByProvider[provider] + 1, dailyCap: caps[provider],
     };
   } catch (e) {
@@ -1489,7 +1463,7 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
     let records = [];
     try { records = io.readRecords(); } catch (e) { io.log(`red team: could not read the scorecard store (${e.message}) — treating it as empty`); }
     const [seatRow] = buildSeatRows({
-      evidence,
+      evidence, startedAt: pass.startedAt, finishedAt: pass.finishedAt,
       callId, pr, repo, provider, model, effort, seats: [RED_TEAM_SEAT], call, parsed, claudeFindings, claudeVerdict: verdict, quota, durationMs,
       changedFiles: pass.changedFiles ?? null,
     });
@@ -1733,6 +1707,7 @@ if (IS_CLI) {
         result = await speculateRedTeam({
           pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), read: sunk.read, resume: false,
           onReserved: (r) => writeJson(`${outPath}.reserved`, r),
+          onTiming: (r) => writeJson(`${outPath}.reserved`, r),
         });
       }
       writeJson(outPath, { ...result, timings: { startedAt, readAt, finishedAt: Date.now() } });

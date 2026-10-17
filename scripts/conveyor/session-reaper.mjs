@@ -2449,13 +2449,35 @@ export function runSessionReaperPass({
   };
 }
 
-function main(argv) {
+/**
+ * THE CLI's ARGV-TO-REPORT DRIVER (#5725) — the whole body of `node session-reaper.mjs [flags]`, callable in-process.
+ * Parses the real flags, builds the real resolvers, runs the real {@link runSessionReaperPass}, prints the report and
+ * RETURNS the exit code instead of terminating the process, so a test can drive the real argv mapping without paying a
+ * fresh Node child per case. The executable entrypoint below supplies the unchanged production defaults.
+ *
+ * `io` is leaf IO only — never a replacement pass or classifier:
+ *  - `exec`   runs every external command the driver itself wires (`claude agents`/`claude stop`, `gh`, `git`, `ps`);
+ *  - `sleep`  is the stop-retry wait ({@link stopSessionWithRetry});
+ *  - `stdout`/`stderr` receive the JSON report / the text report and the pass's log lines;
+ *  - `backlogDir` replaces the import-time `WE_BACKLOG_DIR` capture for ground truth;
+ *  - `isPidAlive` replaces the pid probe of the pid-dead axis.
+ * The hook subcommands, the retention sweep and the dispatch-scratch sweep keep their production IO.
+ * @param {string[]} argv
+ * @param {{exec?:Function, sleep?:(ms:number)=>void, stdout?:(s:string)=>void, stderr?:(s:string)=>void, backlogDir?:string, isPidAlive?:(pid:number)=>boolean}} [io]
+ * @returns {number} the process exit code
+ */
+export function runSessionReaperCli(argv, io = {}) {
+  const exec = io.exec ?? execFileSync;
+  const sleep = io.sleep ?? sleepSyncMs;
+  const writeOut = io.stdout ?? ((s) => process.stdout.write(s));
+  const writeErr = io.stderr ?? ((s) => process.stderr.write(s));
+  const log = (m) => writeErr(m + '\n');
   const flags = parseFlags(argv);
   const dryRun = !!flags['dry-run'];
   // `--no-ground-truth` is an escape hatch back to the original state-only axis, for a rollback or an
   // A/B live comparison — the default is ON, matching the operator's own instruction that this axis should
   // actually run, not merely exist.
-  const groundTruthFor = flags['no-ground-truth'] ? null : makeGroundTruthResolver({ exec: execFileSync });
+  const groundTruthFor = flags['no-ground-truth'] ? null : makeGroundTruthResolver({ exec, backlogDir: io.backlogDir });
   // `--no-completion-record` is the same kind of rollback escape hatch, for the newer (epic #3383) axis.
   const completionFor = flags['no-completion-record'] ? null : makeCompletionResolver();
   // `--allowed-cwd=<path>` scopes reaping to sessions spawned from that checkout (see `classifySessionReap`'s
@@ -2481,7 +2503,7 @@ function main(argv) {
   // `--no-stall-detection` is the same kind of rollback escape hatch, for the #4090 no-net-outcome axis —
   // default ON, since a looping bot that is never stopped is exactly the gap this axis exists to close. (Named
   // "stall", not "no-outcome", so the flag itself doesn't read as a double negative.)
-  const noOutcomeFor = flags['no-stall-detection'] ? null : makeNoOutcomeResolver();
+  const noOutcomeFor = flags['no-stall-detection'] ? null : makeNoOutcomeResolver({ exec });
   // `--no-chat-spawn-guard` is the same rollback escape hatch, for the #4091 chat-spawn scope guard — default
   // ON: a session with no recorded link is unaffected, so this is safe to run unconditionally.
   const chatSpawnGuardFor = flags['no-chat-spawn-guard'] ? null : makeChatSpawnGuardResolver();
@@ -2498,7 +2520,7 @@ function main(argv) {
     : makeIdleFinishedResolver(flags['idle-finished-minutes'] !== undefined ? { thresholdMs: Number(flags['idle-finished-minutes']) * 60 * 1000 } : {});
   // `--no-pid-dead-detection` is the same rollback escape hatch, for the #ghost-sessions-inflate-cap pid-dead
   // axis — default ON, same convention as every other axis this epic ships.
-  const pidDeadFor = flags['no-pid-dead-detection'] ? null : makePidDeadResolver();
+  const pidDeadFor = flags['no-pid-dead-detection'] ? null : makePidDeadResolver({ isPidAlive: io.isPidAlive, scanPs: () => scanPsOutput({ exec }) });
   // `--retention-sweep` OPTS IN to the #4089 retention pass — deliberately OPT-IN, not opt-out like this
   // file's other axes: unlike ground-truth/hung-detection/backstop-completion (which only ever change a STOP
   // decision), the retention sweep DELETES files and calls `claude rm` — a materially different blast radius
@@ -2526,18 +2548,22 @@ function main(argv) {
     });
   };
 
-  const result = runSessionReaperPass({ groundTruthFor, completionFor, allowedCwd, neverReapWorking, idleThresholdMs, dryRun, hungFor, backstopCompletion, noOutcomeFor, chatSpawnGuardFor, authExpiredFor, idleFinishedFor, awaitingVerifyFor, pidDeadFor, rateSession });
+  // The listing and the stop BIND the driver's executor and sleep explicitly: the pass calls `stop({ handle, exec:
+  // execFileSync })`, so forwarding `stopSessionWithRetry` unchanged would bypass an injected executor.
+  const listAgents = () => defaultListAgents({ exec, all: true });
+  const stop = ({ handle }) => stopSessionWithRetry({ handle, exec, sleep });
+  const result = runSessionReaperPass({ listAgents, stop, log, groundTruthFor, completionFor, allowedCwd, neverReapWorking, idleThresholdMs, dryRun, hungFor, backstopCompletion, noOutcomeFor, chatSpawnGuardFor, authExpiredFor, idleFinishedFor, awaitingVerifyFor, pidDeadFor, rateSession });
   const retentionResult = runRetention ? runRetentionSweepPass({ dryRun }) : null;
   const dispatchScratchResult = runDispatchScratchSweep ? runDispatchScratchSweepPass({ dryRun }) : null;
 
   if (result.unreadable) {
     // Matches the pre-#3383 CLI exactly: an unreadable listing means nothing safe to act on — exit clean, no
     // stdout report (the warning already went to stderr inside `runSessionReaperPass`).
-    process.exit(0);
+    return 0;
   }
 
   if (flags.json) {
-    process.stdout.write(JSON.stringify({ ...result, retention: retentionResult, dispatchScratch: dispatchScratchResult }, null, 2) + '\n');
+    writeOut(JSON.stringify({ ...result, retention: retentionResult, dispatchScratch: dispatchScratchResult }, null, 2) + '\n');
   } else {
     const { scanned, stopped, alreadyGone, failures, anomalies, backstopWritten, wouldStop, wouldWriteBackstop, kept } = result;
     log(
@@ -2561,7 +2587,7 @@ function main(argv) {
   // `id` (the anomaly case — see the loop above) — mirrors lease-reaper.mjs's own convention, so a cron/loop
   // wrapper can tell a clean sweep from a partial one. `runQuiet` (the runner's own caller) swallows this
   // either way — it is surfaced for anyone invoking the CLI directly.
-  process.exit(result.failures > 0 || result.anomalies > 0 ? 1 : 0);
+  return result.failures > 0 || result.anomalies > 0 ? 1 : 0;
 }
 
 /**
@@ -2607,5 +2633,5 @@ if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
   const [sub] = process.argv.slice(2);
   if (sub === 'stamp-chat-spawn') runStampChatSpawnHook();
   else if (sub === 'mark-chat-ended') runMarkChatEndedHook();
-  else main(process.argv.slice(2));
+  else process.exitCode = runSessionReaperCli(process.argv.slice(2));
 }
