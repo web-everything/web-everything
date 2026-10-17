@@ -18,13 +18,13 @@ import { parseReviewedSha } from '../lib/review-escalation.mjs';
 import { readStore, resolveScorecardStorePath } from './run-scorecard-store.mjs';
 import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 
-// review-extra-seats -> review-pr -> reconcile-core -> this module. A static import breaks cold ESM startup.
-// Load only on an eligible decision, after module initialization. Until ready, retain the hold (next daemon tick).
+// Keep evidence reads independent of the seat runner and its CLI/review dependency graph.
+// Load only on an eligible decision. Until ready, retain the hold (next daemon tick).
 let redTeamReaders;
 let redTeamReadersLoading;
 /** Test seam: wait for the same lazy readers a daemon decision starts. @test-only-export-ok */
 export function loadRedTeamHoldReaders() {
-  return redTeamReadersLoading ??= import('../operations/review-extra-seats.mjs')
+  return redTeamReadersLoading ??= import('../lib/red-team-evidence.mjs')
     .then(readers => { redTeamReaders = readers; }, () => {});
 }
 

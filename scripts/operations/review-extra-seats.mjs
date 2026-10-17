@@ -75,7 +75,8 @@ import { appendScorecard, readStore, resolveScorecardStorePath } from '../convey
 import { scrubPublish } from '../lib/secret-scrub.mjs';
 import { parseDelegationMarker } from '../lib/delegation-marker.mjs';
 import { logDelegationTrial } from '../conveyor/log-delegation-trial.mjs';
-import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { RED_TEAM_SEAT, redTeamCommentPosted, priorRedTeamRow } from '../lib/red-team-evidence.mjs';
+export { RED_TEAM_SEAT, redTeamCommentPosted, priorRedTeamRow } from '../lib/red-team-evidence.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { RED_TEAM_UNVERIFIABLE_TAG, readRedTeamProbes, RED_TEAM_COMMENT_MARKER, RED_TEAM_CONFIRMED_TAG, RED_TEAM_UNCONFIRMED_TAG, redTeamMarker } from '../lib/red-team-gate.mjs';
 
@@ -969,7 +970,6 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
 // run instead finishes any effect (miss row, delegation trial, comment) that failed after that row was written.
 // The `red-team-replay` CLI never writes the store at all.
 
-export const RED_TEAM_SEAT = Object.freeze({ seat: 'red-team', lens: 'red-team', key: 'red-team' });
 export const RED_TEAM_RUBRIC = 'review-red-team.1';
 export const RED_TEAM_MISS_DISPATCH_KIND = 'red-team-miss';
 /** The red team digs deeper than an advisory lens, so it runs at the higher effort each provider offers. */
@@ -999,20 +999,6 @@ export { RED_TEAM_COMMENT_MARKER, redTeamMarker };
 function notOwedReason(loopPayload) {
   const v = loopPayload?.verdict ?? {};
   return `review verdict is ${v.verdict ?? 'missing'}${v.humanRequired === true ? ' (human gate; the panel did not reduce to accept)' : ''}, not accept`;
-}
-
-/** Did a TRUSTED principal already post this head's red-team comment? A marker from any other login never counts. PURE. */
-export function redTeamCommentPosted(comments, pr, rev) {
-  const marker = redTeamMarker(pr, rev);
-  return (Array.isArray(comments) ? comments : []).some((c) => {
-    const body = typeof c === 'string' ? c : c?.body;
-    return typeof body === 'string' && body.trimStart().startsWith(marker) && isTrustedMarkerAuthor(c);
-  });
-}
-
-/** The latest red-team seat row that ran cleanly for this `(pr, head)`, or null. PURE. */
-export function priorRedTeamRow(records, pr, rev) {
-  return seatRows(records).filter((r) => r.seat === RED_TEAM_SEAT.seat && r.pr === Number(pr) && r.rev === rev && r.status === 'ok').at(-1) ?? null;
 }
 
 /**
