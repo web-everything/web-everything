@@ -46,10 +46,10 @@ describe('health responder closed decision table', () => {
       expect(decide(i)[0].rule).toBe('owner-refused');
     }
   });
-  it('keeps PR liveness alerts observation-only even with a permitted action plan', () => {
+  it.each(['pr-no-movement', 'nightly-coroner-failed'])('keeps %s alerts observation-only even with a permitted action plan', (smell) => {
     const i = input();
     const e = i.episodes[0], facts = i.subjectFacts[e.key];
-    e.smell = 'pr-no-movement'; e.key = `${e.smell}::${e.subject}`;
+    e.smell = smell; e.key = `${e.smell}::${e.subject}`;
     e.recommendation = 'Grant rounds and re-arm review';
     facts.episodeKey = e.key;
     i.subjectFacts = { [e.key]: facts };
