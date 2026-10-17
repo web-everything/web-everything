@@ -13,7 +13,8 @@ import { redactSpawnText } from '../lib/describe-spawn-failure.mjs';
 
 export const buildFailurePath = () => join(resolveCoordinationRoot(), 'build-dispatch-failures.json');
 const OUTPUT_CAP = 2000;
-// Attempt keys already charged to a card. Far above any maxAttempts, so a live key is never evicted.
+// Attempt keys already charged to a card, newest last. Only the newest claim or settled row is ever re-recorded,
+// so evicting the oldest keys never lets a live attempt charge again.
 const ATTEMPT_KEY_CAP = 32;
 
 function read(path) {
@@ -29,6 +30,14 @@ function save(state, path) {
   chmodSync(temp, 0o600);
   renameSync(temp, path);
 }
+
+/**
+ * One dispatch attempt's identity, shared by every path that charges it: the dispatch row's own `startedAt`. Orphan
+ * adoption (keyed on the dead claim) and the fail-group pass (keyed on the settled row) can charge the SAME dispatch
+ * in one tick; one key means one charge. Null when the row carries no start time — each path then falls back to a
+ * key of its own.
+ */
+export const dispatchAttemptKey = (startedAt) => (typeof startedAt === 'string' && startedAt !== '' ? `dispatch:${startedAt}` : null);
 
 /**
  * Record one failed build dispatch. `output` is the captured child output (falls back to `reason`). `attemptKey`

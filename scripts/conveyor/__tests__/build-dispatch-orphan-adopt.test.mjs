@@ -13,7 +13,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord } from '../../operations/run-record.mjs';
-import { recordBuildFailure, listBuildBackoffs } from '../build-dispatch-failures.mjs';
+import { recordBuildFailure, listBuildBackoffs, dispatchAttemptKey } from '../build-dispatch-failures.mjs';
 import {
   defaultCurrentLaneSession, classifyClaimLiveness, decideOrphanAction, findLatestBuildRow, findLatestInFlightBuildRow,
   adoptOrphanedBuildClaims, checkResumable, defaultSessionLiveness, settleDeliveredRow, spawnResumeDelivery, MAX_RESUME_ATTEMPTS,
@@ -1035,6 +1035,15 @@ describe('x87v3ed — orphan release charges the card a backoff failure and retu
       await pass('2026-10-16T01:00:00.000Z');
       expect(listBuildBackoffs({ path, now: 0 })[0]).toMatchObject({ attempts: 2 });
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('keys a dead dispatch on its row start time, the key the fail-group pass shares (PR #5453)', async () => {
+    const failures = [];
+    const row = buildRow({ num: '7101', handle: 'pid:98761' });
+    row.entry.startedAt = '2099-01-01T00:00:00Z';
+    await adoptFixtureClaims(dead('7101', { findRow: () => row, recordFailure: (o) => failures.push(o),
+      listClaims: () => [{ pid: 98761, meta: { kind: 'build', num: '7101', claimedAt: '2098-12-31T23:59:59Z' } }] }));
+    expect(failures).toEqual([expect.objectContaining({ num: '7101', attemptKey: dispatchAttemptKey('2099-01-01T00:00:00Z') })]);
+    expect(failures[0].attemptKey).toBe('dispatch:2099-01-01T00:00:00Z');
   });
   it('records nothing when the dead dispatch had in fact delivered a PR', async () => {
     const failures = [];
