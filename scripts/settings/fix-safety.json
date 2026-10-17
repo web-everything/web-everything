@@ -1,0 +1,4 @@
+{
+  "$comment": "fix.alertAtRoundCap publishes a durable needs-you event immediately, including quiet hours. fix.resetOnRepeatedFinding restores an operator scope-baseline plus later fully in-scope linear commits on the second identical lens/file/normalised claim after a fix. No baseline or ambiguous history stands down. Both default true; WE_FIX_ALERT_AT_ROUND_CAP and WE_FIX_RESET_ON_REPEATED_FINDING override through the policy cascade.",
+  "fix": { "alertAtRoundCap": true, "resetOnRepeatedFinding": true }
+}

@@ -586,17 +586,9 @@ describe('PR #4715 context movement and manifest-drop replay', () => {
         posted.push(args[args.indexOf('--body') + 1]); return '';
       };
       const result = applyHumanClearanceCarry({ evidence: { humanClearance, headSha, headDiff, headDiffSha: headSha }, pr: 4715, cwd: dir, exec, dryRun: false, mainRef: 'main', setting: ON, log: (s) => logs.push(s), ...(mode === 'default' ? {} : { equivalence: mode === 'changed' ? 'contribution' : mode }) });
-      if (mode === 'strict' || mode === 'changed') {
-        expect(result).toBe(null); expect(posted).toHaveLength(0);
-        expect(logs.join('')).toContain('net diff changed');
-      } else {
-        expect(result.carried).toMatchObject({ recorded: true, tier: 'contribution', mechanicalReason: expect.stringContaining('replay') });
-        expect(posted).toHaveLength(1);
-        expect(posted[0]).toContain(`human-clearance-carried: from=${cleared} to=${headSha}`);
-        expect(posted[0]).toContain("added/removed lines are identical");
-        expect(posted[0]).not.toContain('byte-identical');
-        expect(logs.join('')).toContain('tier contribution');
-      }
+      // Changed context bytes (and the manifest drop) change stable patch-id: all modes fail closed.
+      expect(result).toBe(null); expect(posted).toHaveLength(0);
+      expect(logs.join('')).toContain('net patch-id differs');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

@@ -252,3 +252,13 @@ it('the notes reader carries the CodeQL drain hold into daemon re-verification',
   });
   expect(out.prsByNumber.get(5033)).toEqual(enriched);
 });
+
+it('publishes a cap immediately even when its durable note was already posted', () => {
+  const publish = vi.fn();
+  const note = { kind: 'round-cap-exhausted', prNumber: 5403, attempts: 5, cap: 5, capKind: 'fix', text: 'round cap exhausted' };
+  const pr = { number: 5403, headRefOid: 'a'.repeat(40), comments: [{ author: { login: 'web-everything' }, body: buildNoteComment(note) }] };
+  runReconcileNotesAllRepos({ repos: ['we'], dryRun: false, publish,
+    tick: () => ({ notes: [note], prsByNumber: new Map([[5403, pr]]) }),
+    safety: { value: { alertAtRoundCap: true }, sources: { alertAtRoundCap: 'test' } }, postComment: () => { throw Error('already posted'); } });
+  expect(publish).toHaveBeenCalledWith(expect.objectContaining({ pr: 5403, kind: 'at-round-limit', head: pr.headRefOid }));
+});

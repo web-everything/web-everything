@@ -5733,7 +5733,7 @@ async function runCli() {
               humanClearedSha, headSha: tamperHeadSha, pinnedHeadSha: v.listedHeadSha || v.headSha || null,
               readHeadDiff: (sha) => (diffExec ? readNetDiffAtHead({ exec: diffExec, headSha: sha, headRef: v.headRef }) : null),
               applyNumberingCarry: (carryEvidence) => applyHumanClearanceCarry({ evidence: carryEvidence,
-                pr: v.num, repo: slug, exec: diffExec, dryRun: DRY_RUN, numberingOnly: true,
+                pr: v.num, repo: slug, exec: diffExec, dryRun: DRY_RUN, numberingOnly: false,
                 readNumberingLiveEvidence: () => readLiveDrainCarryEvidence({ pr: v.num, repo: slug, exec: diffExec }),
               }),
             });

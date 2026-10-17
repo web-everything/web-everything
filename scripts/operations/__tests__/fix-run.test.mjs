@@ -1544,3 +1544,19 @@ describe('acquire launcher diagnostics', () => {
     expect(resolveAcquireWaitPolicy({ WE_FIX_RUN_ACQUIRE_WAIT_MS: value })).toEqual({ ms: 120000, source: 'standard' });
   });
 });
+
+it('routes a repeated finding from the Claude fixer to the mechanical launcher', () => {
+  const finding = { author: { login: 'web-everything' }, body: '🔁 review — changes requested\n### Findings (1)\n**correctness/bug** (1)\n- `a.mjs:10` — repeated bug' };
+  const comments = [finding, { author: { login: 'web-everything' }, body: '🔓 conveyor fix-end' }, finding];
+  const spawnBorrowed = vi.fn(() => 'pid:4242'), spawnAgent = vi.fn();
+  const out = dispatchFix({ pr: 7, itemNum: '7', lane: 2, laneRef: 'lane/7-x', scope: ['we:a.mjs'], headRefOid: 'a'.repeat(40) }, {
+    root: '/repo', repo: 'we', executorDecision: { executor: 'claude', source: 'test' },
+    readFixClaim: () => null, acquireClaim: () => ({ ok: true }), releaseClaim: () => {}, stampExecutor: () => {},
+    readHistoryInputs: () => ({ comments, commits: [] }), postNotice: () => {}, readBrief: () => 'brief {{PR_NUM}}',
+    spawnBorrowed, spawnAgent, writeBorrowedPrompt: () => '/tmp/p.md',
+    checkoutExists: () => true, readPackageJson: () => ({ scripts: {} }),
+  });
+  expect(spawnAgent).not.toHaveBeenCalled();
+  expect(spawnBorrowed).toHaveBeenCalledOnce();
+  expect(out.agentId).toBe('pid:4242');
+});

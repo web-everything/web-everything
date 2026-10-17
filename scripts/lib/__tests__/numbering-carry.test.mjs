@@ -333,7 +333,7 @@ describe('proveNumberingOnlyMove read-only regressions', () => {
     } });
     expect(carry).toMatchObject({ carry: false, applicable: true });
     const writes = [];
-    const restamp = restampAfterNumbering({ repo: 'o/n', pr: 5025, exec: r.exec,
+    const restamp = restampAfterNumbering({ netPatchSetting: { value: false, source: 'test-numbering-only' }, repo: 'o/n', pr: 5025, exec: r.exec,
       state: { labels: ['review:pending'], headRefOid: r.head,
         comments: [{ author: { login: 'chalbert' }, body: `✅ review — human cleared\n<!-- reviewed-sha: ${r.from} -->\n<!-- cleared-human: chalbert -->` }] },
       reviews: [], enabled: true, acceptCarry: 'on', guardReferrals: () => {},
@@ -620,7 +620,7 @@ describe('numbering acceptance restamp', () => {
       posted.push({ author: { login: 'chalbert' }, body });
       return out;
     } };
-    return restampAfterNumbering({ repo: 'o/n', pr: 5025, state, reviews,
+    return restampAfterNumbering({ netPatchSetting: { value: false, source: 'test-numbering-only' }, repo: 'o/n', pr: 5025, state, reviews,
       readLiveState: () => ({ state: { ...state, comments: [...state.comments, ...posted] }, reviews }),
       ...over, ...(provider ? { provider } : {}) });
   };
@@ -654,7 +654,7 @@ describe('numbering acceptance restamp', () => {
       const labels = ['review:pending'];
       const reviews = [];
       const readLiveState = () => ({ state: { labels: [...labels], headRefOid: TO, comments: thread.map((c) => ({ ...c })) }, reviews: [...reviews] });
-      const step = (over = {}) => restampAfterNumbering({ repo: 'o/n', pr: 5025, state: readLiveState().state, reviews: [...reviews],
+      const step = (over = {}) => restampAfterNumbering({ netPatchSetting: { value: false, source: 'test-numbering-only' }, repo: 'o/n', pr: 5025, state: readLiveState().state, reviews: [...reviews],
         provider, readLiveState, prove: ok, ...over });
       return { thread, calls, provider, readLiveState, step, labels, reviews };
     };

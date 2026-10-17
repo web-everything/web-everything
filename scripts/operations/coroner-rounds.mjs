@@ -28,7 +28,7 @@ export function normalizeComment(c) {
 }
 
 /** Findings from a review / advisory body: `**lens/category** (n)` groups of `- \`file:line\` — claim — …` lines. */
-export function parseFindings(body) {
+export function parseFindings(body, { maxClaimChars = 220 } = {}) {
   const out = [];
   const section = String(body).split(/^### Findings[^\n]*$/m)[1];
   if (!section) return out;
@@ -39,7 +39,7 @@ export function parseFindings(body) {
     if (head) { lens = head[1].trim(); category = head[2].trim(); continue; }
     const item = line.match(/^- `([^`:]+?)(?::(\d+))?`\s+—\s+(.*)$/);
     if (item && lens) {
-      current = { file: item[1], line: item[2] ? Number(item[2]) : null, lens, category, claim: clip(item[3].split(/\s+—\s+/)[0], 220), confidence: item[3].match(/_\[(CONFIRMED|PLAUSIBLE|SPECULATIVE)\]_/)?.[1] ?? null, impact: item[3].match(/impact if unfixed: (\w+)/)?.[1] ?? null };
+      current = { file: item[1], line: item[2] ? Number(item[2]) : null, lens, category, claim: clip(item[3].split(/\s+—\s+/)[0], maxClaimChars), confidence: item[3].match(/_\[(CONFIRMED|PLAUSIBLE|SPECULATIVE)\]_/)?.[1] ?? null, impact: item[3].match(/impact if unfixed: (\w+)/)?.[1] ?? null };
       out.push(current); continue;
     }
     const prevention = line.match(/^\s+- _Prevention[^:]*:_\s*(.*)$/);

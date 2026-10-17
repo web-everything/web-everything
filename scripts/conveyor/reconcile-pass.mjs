@@ -1848,17 +1848,18 @@ export function readTimeoutEvidence(pr, { repo, exec = execFileSyncThrottled, ts
           || run.repository.full_name !== repo || job.run_attempt !== run.run_attempt) throw new Error('wrong-run-head-attempt');
       // Outage fix: a cancelled / startup_failure / no-runner job has NO log, so the read below 404'd and the PR
       // was refused forever. Classify first; never read a log that cannot exist.
-      const infra = isInfraCancelledJob(job);
+      const cancelledShard = /^(?:test|soak)-shard(?:\s|$)/.test(job.name ?? '') && String(job.conclusion).toLowerCase() === 'cancelled';
+      const infra = cancelledShard || isInfraCancelledJob(job);
       return { repo, head, run: run.id, job: job.id, name: job.name, attempt: job.run_attempt, workflow: run.path,
         aggregateGate: isAggregateGateFailure(job), status: job.status, conclusion: job.conclusion, logJob: job.id, logAttempt: job.run_attempt,
-        url: job.html_url, infra, log: infra ? '' : readLog(job) };
+        url: job.html_url, infra, cancelledShard, log: infra ? '' : readLog(job) };
     });
     const infraClass = classifyInfraCancelled(jobs);
     if (infraClass.kind === 'infra-only') {
       const after = api(`repos/${repo}/pulls/${pr.number}`);
       if (after.head.sha !== head) throw new Error('stale-head');
       const signature = createHash('sha256').update(JSON.stringify(['infra-cancelled', head, infraClass.runs.map((r) => r.run).sort()])).digest('hex');
-      return { eligible: true, infraCancelled: true, repo, pr: pr.number, head, signature,
+      return { eligible: true, infraCancelled: true, cancelledShard: jobs.some(j => j.cancelledShard), repo, pr: pr.number, head, signature,
         jobs: infraClass.runs.map((r) => ({ repo, head, run: r.run, job: r.job, attempt: r.attempt })) };
     }
     if (infraClass.kind === 'mixed') return { eligible: false, reason: 'mixed-infra-cancelled-and-real-failure' };
@@ -1910,7 +1911,7 @@ export function enrichPrsWithTimeoutEvidence(prs, {
     }
     let timeoutRetry = read(pr, { repo });
     if (timeoutRetry?.infraCancelled) {
-      timeoutRetry = infraMode === 'rerun' ? { ...timeoutRetry, cap: infraMaxReruns }
+      timeoutRetry = infraMode === 'rerun' ? { ...timeoutRetry, cap: timeoutRetry.cancelledShard ? 1 : infraMaxReruns }
         : { eligible: false, reason: 'infra-cancelled-heal-mode' };
     }
     return { ...pr, timeoutRetry, timeoutRetryBudget };

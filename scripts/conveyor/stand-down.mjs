@@ -71,6 +71,7 @@ export const STAND_DOWN_LABEL = 'review-status:stood-down';
  * `superseded` is the one non-agent entry: the supersede watch posts it (card xiqtf7w).
  */
 export const STAND_DOWN_REASONS = Object.freeze({
+  'repeated-finding': 'repeated finding',
   // PRs #4992/#4993/#4965, 2026-10-12: exhausted loops belong in the visible operator queue.
   'fix-loop-exhausted': 'repair sessions on this head exhausted the re-arm or raw session budget, so the loop parked it for a person',
   'needs-judgment': 'the reviewer\'s finding needs a judgment the fix agent could not safely make, so it did NOT guess',

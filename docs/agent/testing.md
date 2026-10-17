@@ -33,6 +33,29 @@ Injected Gemini subprocess tests must set `ANTIGRAVITY_QUOTA_DIR` to a per-test 
 real backend holds otherwise prevent even the fake child from starting. Real POC branch-sync fixtures
 must pass a temporary `lockRoot` through `withPocLandLock`, preserving the mutex without touching host locks.
 
+## PR time-loss safeguards
+
+`fix.alertAtRoundCap` publishes through the needs-you feed as soon as the notes pass observes exhaustion,
+independently of note-comment dedup and quiet-hour desktop delivery. Polling must include `needsPerson`
+rows so it does not clear and reopen those events, losing the original idle timestamp.
+`fix.resetOnRepeatedFinding` keys full normalised claims by lens and file (not moving line numbers),
+requires a trusted completed fix between sightings, and accepts `scope-baseline: <full sha>` only from
+an operator comment. A corrective tree reset preserves published ancestry and replays only whole linear
+commits inside the declared scope; unreadable or ambiguous history stands down. Test real Git trees,
+untrusted markers, changed lens/text, no intervening fix, and the launcher path for every executor.
+
+`review.carryAcrossIdenticalNetPatch` compares nonempty `git patch-id --stable` outputs for each head's
+net diff against its own merge-base with main. Context offsets can move; changed context bytes can change
+the patch-id and must refuse. Human carries bind both Git diffs to the recorded and pinned fingerprints,
+then re-read the complete thread and formal reviews through the existing writer. Automated carries use
+the same guarded numbering-restamp writer. Keep numbering-only fixtures explicitly on that proof so they
+cannot silently reach real Git when the new fallback runs. Exercise real offset-only rebases and holds.
+
+Review-held gates belong to review regardless of advisory settings; unrelated failed checks still need
+repair. Cancelled test/soak shards, including long-running cancellations, use the existing rerun ledger
+once per head before heal. Do not let the stale-CI fallback grant a second rerun after that allowance.
+The read-only Actions workflow cannot keep a completed job pending, so its exit-code hold stays intact.
+
 ## Human clearance across empty commits
 
 An empty recovery commit can carry a fingerprinted human clearance when `rev-parse --verify
