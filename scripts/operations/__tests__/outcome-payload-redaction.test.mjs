@@ -46,6 +46,12 @@ const SHAPES = [
   ['locale-quoted shell value', `GH_TOKEN=$"${OPAQUE}" node x`],
   ['flag value with adjacent shell quotes', `claude --token ''"${OPAQUE}" x`],
   ['JSON-escaped shell double quotes', JSON.stringify({ e: `GH_TOKEN="${OPAQUE}" node` })],
+  ['single-quoted header value', `headers: { authorization: 'Basic ${OPAQUE}' }`],
+  ['cookie list past 4096 characters', `COOKIE=${'a'.repeat(4100)}${OPAQUE}`],
+  ['URL userinfo past 256 characters', `https://${'S'.repeat(257)}${OPAQUE}@github.com/x`],
+  ['curl -b far along its line', `curl ${'x'.repeat(300)} -b sid=${OPAQUE}`],
+  ['single-quoted dict key', `{'GH_TOKEN': '${OPAQUE}'}`],
+  ['header pair array', `[["Api-Key","${OPAQUE}"]]`],
 ];
 
 const runOf = (text) => ({ op: 'dispatch-lane', id: 'r', cursor: 1, status: 'failed',

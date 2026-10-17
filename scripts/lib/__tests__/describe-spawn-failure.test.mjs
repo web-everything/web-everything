@@ -127,6 +127,23 @@ describe('redactSpawnText', () => {
     }
     expect(redactSpawnText(`GH_TOKEN=''"opaque1" node x`, { env: {} })).toBe('GH_TOKEN=<redacted> node x');
     expect(redactSpawnText('{"Authorization":["Basic opaque1"],"ok":1}', { env: {} })).toBe('{"Authorization":"<redacted-env>","ok":1}');
+    // Self-review siblings: single-quoted headers, the other length bounds, a mid-value quote, more key forms.
+    for (const text of ["headers: { authorization: 'Basic opaque1' }", "{ Authorization: [ 'Basic opaque2' ] }", "Cookie: sid='opaque3'",
+      `COOKIE=${'a'.repeat(4100)}opaque4`, `--cookie ${'a'.repeat(4100)}opaque5`, `Cookie%3A${'a'.repeat(4100)}opaque6`,
+      `https://${'S'.repeat(257)}opaque7@github.com/x`, `curl ${'x'.repeat(300)} -b sid=opaque8`, 'Cookie: sid=ab"opaque9 rest',
+      "{'GH_TOKEN': 'opaqueA'}", '[["Api-Key","opaqueB"]]', '[["PRIVATE-TOKEN","opaqueC"]]', "{ GH_TOKEN: [ 'opaqueD' ] }",
+      JSON.stringify({ e: 'COOKIE=a="opaqueE"', ok: 1 })]) {
+      expect(redactSpawnText(text, { env: {} })).not.toContain('opaque');
+    }
+    // A quote that does not open a value part never swallows the next line, or a JSON string's own close.
+    for (const text of ['time=1 msg="login failed token=abc" err=401\nWorkspace not trusted', 'error: password=abc" rejected\nWorkspace not trusted',
+      'Error: "--token abc" invalid\nWorkspace not trusted']) {
+      expect(redactSpawnText(text, { env: {} })).toMatch(/<redacted>.*\nWorkspace not trusted$/);
+    }
+    for (const text of ['{"error":"token=abc\\" is bad","code":1}', '{"e":"Cookie: a=\\"x","ok":"Workspace not trusted"}',
+      '[{"e":"Authorization: x \\"y"},{"ok":"Workspace not trusted"}]']) {
+      expect(() => JSON.parse(redactSpawnText(text, { env: {} }))).not.toThrow();
+    }
     // A quote that closes the surrounding JSON string still ends the value.
     expect(redactSpawnText('{"e":"GH_TOKEN=abc","ok":"1 2"}', { env: {} })).toBe('{"e":"GH_TOKEN=<redacted>","ok":"1 2"}');
     expect(redactSpawnText('{"e":"Cookie: a=1","ok":"x y"}', { env: {} })).toBe('{"e":"Cookie: <redacted>","ok":"x y"}');
@@ -141,7 +158,8 @@ describe('redactSpawnText', () => {
     for (const text of ['a.'.repeat(100000), 'a='.repeat(100000), 'a://'.repeat(50000), '"a":'.repeat(50000), '--settings {"'.repeat(20000),
       ' '.repeat(300000), ' -b'.repeat(100000), 'cookie '.repeat(45000), 'Cookie: ="'.repeat(30000), 'Cookie: =\\\\"'.repeat(30000),
       `Cookie: ${'a=" '.repeat(30000)}`, `GH_TOKEN=${'\\\\"x '.repeat(30000)}`, `GH_TOKEN=${'a"'.repeat(50000)}`, `${'x Cookie: '.repeat(20000)}"`,
-      `{"GH_TOKEN":${'['.repeat(50000)}`]) {
+      `{"GH_TOKEN":${'['.repeat(50000)}`, `GH_TOKEN=${'\\'.repeat(200000)}`, `--token ${'\\'.repeat(200000)}`, `Cookie: ${'\\'.repeat(200000)}"`,
+      `COOKIE=${'\\'.repeat(200000)}"x`, `curl -b${' -b'.repeat(100000)}`, `Cookie: ${'a"'.repeat(100000)}`]) {
       redactSpawnText(text, { env: {} });
     }
     expect(Date.now() - started).toBeLessThan(2000);
