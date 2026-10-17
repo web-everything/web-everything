@@ -2,6 +2,7 @@
 import { normalizeComment, parseFindings } from '../operations/coroner-rounds.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 
 export function resolveFixSafety({ env = process.env, tool = readSettings().fix, platform } = {}) {
   const bool = v => v === undefined ? undefined : /^(true|1|on)$/i.test(v) ? true : /^(false|0|off)$/i.test(v) ? false : v;
@@ -15,7 +16,7 @@ export function repeatedFindingPlan(comments, { enabled = true } = {}) {
   const seen = new Map(); let fix = 0, baseline = null, repeated = false;
   for (const raw of comments ?? []) {
     const c = normalizeComment(raw);
-    if (!c.trusted) continue;
+    if (!isTrustedMarkerAuthor({ author: { login: c.login } })) continue;
     if (c.operator) {
       const marker = c.body.match(/^(?:<!--\s*)?scope-baseline:\s*([0-9a-f]{40})(?:\s*-->)?\s*$/m);
       if (marker) baseline = marker[1];
