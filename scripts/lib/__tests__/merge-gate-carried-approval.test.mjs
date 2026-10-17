@@ -39,16 +39,20 @@ describe('shared carry proof against real git', () => {
   });
   it('refuses an author commit changing the PR diff', () => {
     const r = repository(); const c = r.commit('src/x.txt', 'new author change\n');
-    expect(r.prove(r.evidence(c))).toMatchObject({ carry: false, reason: expect.stringContaining('net diff changed') });
+    expect(r.prove(r.evidence(c))).toMatchObject({ carry: false, reason: expect.stringContaining('net patch-id differs') });
   });
-  it('refuses non-merge author commits even when their final net diff is identical', () => {
+  it('carries identical net patches after non-merge author commits only with the net-patch route enabled', () => {
     const r = repository();
     r.commit('src/x.txt', 'temporary author change\n');
     const c = r.commit('src/x.txt', 'PR change\n');
-    expect(r.prove(r.evidence(c))).toMatchObject({ carry: false, reason: expect.stringContaining('not a merge') });
+    // The net-patch rule measures the final change, independently of intermediate commits.
+    expect(r.prove(r.evidence(c))).toMatchObject({ carry: true, tier: 'net-patch', fromSha: r.a, toSha: c });
+    expect(proveHumanClearanceCarry({ evidence: r.evidence(c), cwd: r.cwd, exec: execFileSync,
+      netPatchSetting: { value: false, source: 'test' } }))
+      .toMatchObject({ carry: false, reason: expect.stringContaining('not a merge') });
   });
   it('refuses conflict resolution changing the PR lines', () => {
-    expect(repository({ conflict: true }).prove()).toMatchObject({ carry: false, reason: expect.stringContaining('net diff changed') });
+    expect(repository({ conflict: true }).prove()).toMatchObject({ carry: false, reason: expect.stringContaining('net patch-id differs') });
   });
   it.each([false, true])('carries an empty recovery commit through the writer; tree changed=%s', (changed) => {
     const r = repository();

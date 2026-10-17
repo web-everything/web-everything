@@ -50,6 +50,8 @@ the patch-id and must refuse. Human carries bind both Git diffs to the recorded 
 then re-read the complete thread and formal reviews through the existing writer. Automated carries use
 the same guarded numbering-restamp writer. Keep numbering-only fixtures explicitly on that proof so they
 cannot silently reach real Git when the new fallback runs. Exercise real offset-only rebases and holds.
+Pass the evidence repository's `cwd` into `proveIdenticalNetPatch` even with a cwd-bound exec wrapper:
+the reader supplies a `cwd` option, and an undefined value can otherwise override the wrapper's directory.
 
 Review-held gates belong to review regardless of advisory settings; unrelated failed checks still need
 repair. Cancelled test/soak shards, including long-running cancellations, use the existing rerun ledger

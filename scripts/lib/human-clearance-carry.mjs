@@ -231,7 +231,8 @@ export function proveHumanClearanceCarry({ evidence, enabled = true, exec, cwd, 
     const hasFingerprint = [clearance.diff, clearance.contribution].some(v => typeof v === 'string' && /^[0-9a-f]{64}$/i.test(v));
     if (!hasFingerprint && !numberingOnly) return { ...pre, carry: false, applicable: true };
     if (!numberingOnly && hasFingerprint && netPatchSetting.value) {
-      const patch = proveIdenticalNetPatch({ exec: gitExec, fromSha: clearance.sha, toSha: evidence.headSha, mainRef });
+      // The patch reader supplies its own cwd option; keep it bound to this evidence's repository.
+      const patch = proveIdenticalNetPatch({ exec: gitExec, cwd, fromSha: clearance.sha, toSha: evidence.headSha, mainRef });
       if (patch.ok) {
         // The git objects must describe the recorded approval and the pinned live diff, not just each other.
         const old = liveCarryFingerprints(patch.fromDiff), live = liveCarryFingerprints(patch.toDiff);
