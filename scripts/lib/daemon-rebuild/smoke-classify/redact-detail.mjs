@@ -24,52 +24,70 @@ function redactShapes(text) {
 }
 
 // A whole word (one start per word, so a long text costs linear time) followed by its separator on the same line:
-// `name=`, `name:`, `"name": `, or `--name ` (a flag's value follows whitespace).
-const NAME_SEP = /(?<![A-Za-z0-9_-])(["']?)(--?)?([A-Za-z0-9_][A-Za-z0-9_-]*)\1([^\S\n]*[=:][^\S\n]*|[^\S\n]+)/g;
+// `name=`, `name:`, `"name": `, `["name"] = `, or `--name ` (a flag's value follows whitespace).
+const NAME_SEP = /(?<![A-Za-z0-9_-])(["']?)(--?)?([A-Za-z0-9_][A-Za-z0-9_-]*)\1\]?([^\S\n]*[=:][^\S\n]*|[^\S\n]+)/g;
 // A secret word, or a generic key name (`KEY`, `*_KEY`, `*-key`, `PRIVATEKEY`, camelCase `serviceKey`) — never a
 // word that merely contains "key" (`monkey`, `keyboard`).
 const SECRET_NAME = /token|secret|password|passwd|api[_-]?key|auth|credential|(?:private|access|ssh|pass|signing|encryption|master)key|(?:^|[^A-Za-z])key(?![a-z])/i;
 const CAMEL_KEY = /[a-z0-9]Key(?![a-z])/;
 
-// A value may span lines: a quoted string (longest delimiter first, so `"""` is never read as an empty `""`), parts
-// joined by `+` (Node's inspect form), a YAML block or next-line scalar, or a backslash-continued bare word.
-const QUOTES = ['"""', "'''", '"', "'", '`'];
-// A quoted value still open after this many lines is read as unterminated: everything after its quote is redacted.
+// A value may span lines: a quoted string (longest delimiter first, so `"""` is never read as an empty `""`; curly
+// quotes too; a `$`, `(`, `[` or string-kind prefix such as `r"""` before it), parts joined by `+` (Node's inspect
+// form) or written back to back (shell), a YAML block or next-line scalar, or a backslash-continued bare word.
+const QUOTES = [['"""', '"""'], ["'''", "'''"], ['"', '"'], ["'", "'"], ['`', '`'],
+  [String.fromCharCode(0x201c), String.fromCharCode(0x201d)], [String.fromCharCode(0x2018), String.fromCharCode(0x2019)]];
+const QUOTE_PREFIX = /(?:[$([]|[rRbBuUfF]{1,2})?/y;
+// A quoted value still open after this many lines or chars is read as unterminated: everything after its quote is
+// redacted. The char bound also keeps a cut text's readings (below) from swallowing a long-line tail whole.
 const MAX_VALUE_LINES = 64;
-const JOIN = /\s*\+\s*/y;
+const MAX_VALUE_CHARS = 8 * 1024;
+const JOIN = /\s*\+\s*|(?=["'`])/y;
 const BLOCK_INDICATOR = /[|>][1-9+-]{0,2}[^\S\n]*(?:#[^\n]*)?(?=\n|$)/y;
 const BARE = /\S+/y;
 const CONTINUED = /[^\S\n]*\S*/y;
 const isBlank = (c) => c === ' ' || c === '\t';
 
-/** The end of a `q`-quoted value whose body starts at `from` (just past the quote), or -1 when it does not close
- *  within {@link MAX_VALUE_LINES} lines. Linear in the span scanned. */
-function quotedEnd(text, from, q) {
+/** The end of a quoted value closed by `close` whose body starts at `from` (just past the opening quote), or -1 when
+ *  it does not close within {@link MAX_VALUE_LINES} lines and {@link MAX_VALUE_CHARS} chars. Linear in the span
+ *  scanned. */
+function quotedEnd(text, from, close) {
   let lines = 0;
-  for (let i = from; i < text.length; i++) {
+  const limit = Math.min(text.length, from + MAX_VALUE_CHARS);
+  for (let i = from; i < limit; i++) {
     if (text[i] === '\\') {
       // An escaped character never closes the value; an escaped line break still counts toward the bound.
       i++;
       if (text[i] === '\n' && ++lines > MAX_VALUE_LINES) return -1;
     } else if (text[i] === '\n') {
       if (++lines > MAX_VALUE_LINES) return -1;
-    } else if (text.startsWith(q, i)) {
-      return i + q.length;
+    } else if (text.startsWith(close, i)) {
+      return i + close.length;
     }
   }
   return -1;
 }
 
-/** Past a quoted value ending at `end`, every further quoted part joined to it by `+`; an unterminated part runs to
- *  the end of the text. */
+/** The quote (`[open, close]`) a value opens at `at`, past an optional prefix (`$'…'`, `r"""…"""`, `("…")`), with the
+ *  index of its body; null when the value is not quoted. */
+function openQuote(text, at) {
+  QUOTE_PREFIX.lastIndex = at;
+  const start = QUOTE_PREFIX.exec(text) ? QUOTE_PREFIX.lastIndex : at;
+  for (const p of [start, at]) {
+    const pair = QUOTES.find(([open]) => text.startsWith(open, p));
+    if (pair) return { close: pair[1], body: p + pair[0].length };
+  }
+  return null;
+}
+
+/** Past a quoted value ending at `end`, every further quoted part joined to it by `+` or written right after it; an
+ *  unterminated part runs to the end of the text. */
 function joinedEnd(text, end) {
   for (;;) {
     JOIN.lastIndex = end;
     if (!JOIN.exec(text)) return end;
-    const at = JOIN.lastIndex;
-    const q = QUOTES.find((d) => text.startsWith(d, at));
-    if (!q) return end;
-    const next = quotedEnd(text, at + q.length, q);
+    const quote = openQuote(text, JOIN.lastIndex);
+    if (!quote) return end;
+    const next = quotedEnd(text, quote.body, quote.close);
     if (next < 0) return text.length;
     end = next;
   }
@@ -97,21 +115,38 @@ function indentedEnd(text, eol, indent, max = Infinity) {
 /** Where the value of the secret pair whose name starts at `nameAt` and whose value starts at `at` ends, or -1 when
  *  it has none. Fails closed: an unterminated quoted value runs to the end of the text. */
 function valueEnd(text, nameAt, at) {
-  const q = QUOTES.find((d) => text.startsWith(d, at));
-  if (q) {
-    const end = quotedEnd(text, at + q.length, q);
+  // A pair inside a quoted word (`bash -x` prints `'DB_PASSWORD=alpha<newline>bravo'`): the value runs to that quote.
+  const outer = QUOTES.find(([open]) => text.startsWith(open, nameAt - open.length));
+  if (outer && !openQuote(text, at)) {
+    const end = quotedEnd(text, at, outer[1]);
+    return end < 0 ? text.length : end;
+  }
+  const quote = openQuote(text, at);
+  if (quote) {
+    const end = quotedEnd(text, quote.body, quote.close);
     return end < 0 ? text.length : joinedEnd(text, end);
   }
   BLOCK_INDICATOR.lastIndex = at;
   const block = BLOCK_INDICATOR.test(text);
   if (block || at >= text.length || text[at] === '\n') {
-    // YAML: a block scalar (`|`, `>`) is every deeper-indented line below; a bare `name:` takes the next one.
+    // YAML: a block scalar (`|`, `>`) is every deeper-indented line below; a bare `name:` takes the next line, or
+    // the whole quoted value that starts there.
     const eol = block ? BLOCK_INDICATOR.lastIndex : at;
     const lineStart = text.lastIndexOf('\n', nameAt - 1) + 1;
     let indent = 0;
     while (isBlank(text[lineStart + indent])) indent++;
     const end = indentedEnd(text, eol, indent, block ? Infinity : 1);
-    return end < 0 ? (block ? eol : -1) : end;
+    if (end < 0) return block ? eol : -1;
+    if (!block) {
+      let next = eol + 1;
+      while (isBlank(text[next])) next++;
+      const inner = openQuote(text, next);
+      if (inner) {
+        const close = quotedEnd(text, inner.body, inner.close);
+        return close < 0 ? text.length : joinedEnd(text, close);
+      }
+    }
+    return end;
   }
   BARE.lastIndex = at;
   if (!BARE.exec(text)) return -1;
@@ -125,19 +160,26 @@ function valueEnd(text, nameAt, at) {
   return end;
 }
 
-/** Each `name=value` / `name: value` / `--name value` span from `from` on whose name is a secret name, as
- *  `{start, end, label}`. The text is scanned whole, so a value that spans lines is redacted whole. A plain name never
- *  consumes its value, so `monkey: token=…` still reaches the `token=` pair. */
-function assignmentSpans(text, from = 0) {
-  const spans = [];
+/**
+ * Each `name=value` / `name: value` / `--name value` span from `from` on (whose name starts before `stop`) whose name
+ * is a secret name, pushed onto `spans` as `{start, end, label}`. The text is scanned whole, so a value that spans
+ * lines is redacted whole. A plain name never consumes its value, so `monkey: token=…` still reaches the `token=` pair.
+ * A value that spans lines may really have closed on its first line (a line cut upstream, `…"`, leaves its quote open
+ * until the NEXT pair's quote), so its later lines are scanned for pairs too, once, with values free to run past it.
+ */
+function assignmentSpans(text, spans, from = 0, stop = Infinity, nested = false) {
   NAME_SEP.lastIndex = from;
-  for (let m = NAME_SEP.exec(text); m; m = NAME_SEP.exec(text)) {
+  for (let m = NAME_SEP.exec(text); m && m.index < stop; m = NAME_SEP.exec(text)) {
     const [whole, , dashes = '', name, sep] = m;
     const secret = (SECRET_NAME.test(name) || CAMEL_KEY.test(name)) && (dashes || /[=:]/.test(sep));
     if (!secret) continue;
     const end = valueEnd(text, m.index, m.index + whole.length);
     if (end < 0) continue;
     spans.push({ start: m.index, end, label: `${dashes}${name}=<redacted>` });
+    // Scanned within the span only (an unbounded `indexOf` per pair would be quadratic on one long line).
+    let eol = m.index;
+    while (eol < end && text[eol] !== '\n') eol++;
+    if (!nested && eol < end) assignmentSpans(text, spans, eol + 1, end, true);
     NAME_SEP.lastIndex = end;
   }
   return spans;
@@ -153,14 +195,13 @@ function assignmentSpans(text, from = 0) {
  */
 function cutOpenEnds(text) {
   const ends = [];
-  for (const q of QUOTES) {
-    const end = quotedEnd(text, 0, q);
+  for (const [, close] of QUOTES) {
+    const end = quotedEnd(text, 0, close);
     if (end >= 0) ends.push(joinedEnd(text, end));
   }
-  const lead = /^\s*\+?\s*/.exec(text)[0].length;
-  const q = QUOTES.find((d) => text.startsWith(d, lead));
-  if (q) {
-    const end = quotedEnd(text, lead + q.length, q);
+  const quote = openQuote(text, /^\s*\+?\s*/.exec(text)[0].length);
+  if (quote) {
+    const end = quotedEnd(text, quote.body, quote.close);
     if (end >= 0) ends.push(joinedEnd(text, end));
   }
   ends.push(indentedEnd(text, -1, 0));
@@ -177,13 +218,14 @@ function cutOpenEnds(text) {
  * that might close the cut-off value, or might open a new one, is safe either way.
  */
 function redactAssignments(text, cut) {
-  const spans = assignmentSpans(text);
+  const spans = assignmentSpans(text, []);
   if (cut && text) {
     for (const end of cutOpenEnds(text)) {
-      spans.push({ start: 0, end, label: '<redacted>' }, ...assignmentSpans(text, end));
+      spans.push({ start: 0, end, label: '<redacted>' });
+      assignmentSpans(text, spans, end);
     }
-    spans.sort((a, b) => a.start - b.start || b.end - a.end);
   }
+  spans.sort((a, b) => a.start - b.start || b.end - a.end);
   let out = '';
   let from = 0;
   for (const s of spans) {

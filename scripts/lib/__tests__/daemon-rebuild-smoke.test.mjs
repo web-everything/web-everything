@@ -272,6 +272,15 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
       ['a YAML value on the next line', 'db:\n  password:\n    alpha bravo charlie delta\n  host: db.local'],
       // The shell joins `alpha\<newline>bravo…` into one word.
       ['a backslash-continued value', 'export DB_PASSWORD=alpha\\\nbravo\\\ncharliedelta'],
+      // Self-review round: the quote before the name (`bash -x`), prefixed and adjacent quotes, curly quotes.
+      ['a bash -x trace (quote before the name)', "+ export 'DB_PASSWORD=alpha bravo\ncharlie delta'"],
+      ['a $-quoted value', "PASSWORD=$'alpha bravo\ncharlie delta'"],
+      ['a raw triple-quoted value', 'password = r"""alpha bravo\ncharlie delta"""'],
+      ['a parenthesised value', 'PASSWORD=("alpha bravo\ncharlie delta")'],
+      ['adjacent shell quotes', `PASSWORD="alpha"'bravo\ncharlie delta'`],
+      ['curly quotes', `password: ${String.fromCharCode(0x201c)}alpha bravo\ncharlie delta${String.fromCharCode(0x201d)}`],
+      ['a subscript name', 'env["PASSWORD"] = "alpha bravo\ncharlie delta"'],
+      ['a next-line quoted value', 'db:\n  password:\n    "alpha bravo\n    charlie delta"\n  host: db.local'],
     ])('%s never leaks a line of its value', (_shape, value) => {
       const text = `starting worker\n${value}\nFATAL: connection refused`;
       for (const [sink, out] of Object.entries(sinks(text))) expect([sink, leaks(out)]).toEqual([sink, []]);
@@ -291,11 +300,31 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
     it('keeps a closed multiline value from swallowing what follows it', () => {
       expect(redactSecrets('DB_PASSWORD="alpha\nbravo" exit=1\nnext line')).toBe('DB_PASSWORD=<redacted> exit=1\nnext line');
     });
+    it('a line cut upstream (its quote left open) never lets the next pair\'s value through', () => {
+      for (const text of ['DB_PASSWORD="alpha bravo…\nAPI_TOKEN="charlie delta"\nnext', 'DB_PASSWORD="alpha bravo…\nAPI_TOKEN="charlie delta\nnext']) {
+        expect(leaks(redactSecrets(text))).toEqual([]);
+        expect(leaks(redactedTail(text))).toEqual([]);
+      }
+    });
+    it('a cut tail of long lines keeps its error message: the readings never swallow past the value bound', () => {
+      const lines = Array.from({ length: 200 }, (_, n) => `frame ${n} ${'x'.repeat(1_200)}`);
+      const out = redactSecrets([...lines, "Error: Cannot find module 'left-pad'", '    at require (node:internal)'].join('\n'), { cut: true });
+      expect(out).toContain("Error: Cannot find module 'left-pad'");
+    });
+    it('many pairs in a cut text never overflow the stack (no withheld detail)', () => {
+      const out = redactSecrets('key=1\n'.repeat(130_000), { cut: true });
+      expect(out).not.toMatch(/withheld/);
+      expect(out).toContain('key=<redacted>');
+      // One long line of quoted pairs stays linear (a per-pair newline search to the end of text would not).
+      const t0 = Date.now();
+      redactSecrets('token="a" '.repeat(100_000), { cut: true });
+      expect(Date.now() - t0).toBeLessThan(3_000);
+    });
     it('a 64 KiB tail window that opens inside a multiline quoted value never leaks its tail', () => {
       const tail = Array.from({ length: 1_400 }, (_, n) => `tail line ${String(n).padStart(4, '0')} ${'x'.repeat(28)}`).join('\n');
       for (const q of ['"', "'", '`', '"""']) {
         // The 64 KiB window cuts the opener's line, so its first whole line (`bravo`) is inside the value.
-        const text = `DB_PASSWORD=${q}${'y'.repeat(8_000)} alpha\nbravo\ncharlie delta${q} FATAL\n${tail}`;
+        const text = `DB_PASSWORD=${q}${'y'.repeat(6_000)} alpha\nbravo\ncharlie delta${q} FATAL\n${tail}`;
         const cut = text.length - 64 * 1024;
         expect(cut).toBeGreaterThan(text.indexOf('DB_PASSWORD'));
         expect(cut).toBeLessThan(text.indexOf('bravo'));

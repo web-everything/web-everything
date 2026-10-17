@@ -89,22 +89,18 @@ describe('runWorker: the job record and the result channels', () => {
 
   it('a compaction that keeps the tail of a multiline quoted value never lets its reader leak it', async () => {
     const diagnosticsDir = tmp();
-    // 960 KB of filler, the opener, then 50 long lines (100 KB) inside the value: the 1 MiB compaction keeps 64 KiB of
-    // the value's lines with no opener.
+    // 1.2 MiB of blocks that are almost all quoted value, so wherever the 1 MiB compaction cuts, the kept 64 KiB
+    // very likely opens inside a value whose opener it dropped — and is safe wherever it opens.
     const script = [
-      "const filler = 'f'.repeat(99) + '\\n';",
-      'for (let i = 0; i < 9_600; i++) process.stderr.write(filler);',
-      "process.stderr.write('export DB_PASSWORD=\"alpha\\nbravo\\n');",
-      "for (let i = 0; i < 50; i++) process.stderr.write('t'.repeat(1_999) + '\\n');",
-      "process.stderr.write('charlie delta\" FATAL\\nafter line\\n');",
+      "const block = 'export DB_PASSWORD=\"alpha bravo\\n' + 'alpha bravo\\n'.repeat(50) + 'charlie delta\" FATAL\\n';",
+      'for (let i = 0; i < 2_000; i++) process.stderr.write(block);',
+      "process.stderr.write('after line\\n');",
       `process.stdout.write(${JSON.stringify(claudeStdout(DONE))});`,
     ].join('\n');
     await runWorker(spec({ diagnosticsDir, argv: ['-e', script] }));
     const captured = readFileSync(join(diagnosticsDir, 'wrapper.stderr'), 'utf8');
     expect(captured.startsWith(`${CUT_MARKER}\n`)).toBe(true);
-    expect(captured).not.toContain('DB_PASSWORD');
-    expect(captured).toContain('charlie delta');
-    const out = redactedTail(captured, 1_000);
+    const out = redactedTail(captured, 100_000);
     for (const w of ['alpha', 'bravo', 'charlie', 'delta']) expect(out).not.toContain(w);
     expect(out).toContain('after line');
   }, 30_000);
