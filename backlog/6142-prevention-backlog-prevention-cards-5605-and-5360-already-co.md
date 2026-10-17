@@ -41,3 +41,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5525 (finding 4: `we:backlog/xyzpgol-overlap-yield-known-holds.md:24` — Add the already-filed check:standards gate 5668 requiring each Acceptance and edge-case line to carry a repo-qualified planned test, case name and assertion before a card can go active.)
