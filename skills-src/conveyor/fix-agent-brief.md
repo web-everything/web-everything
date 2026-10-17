@@ -232,6 +232,8 @@ not one (its own text says so, twice), so nothing here ever touches `review:huma
 
 Make the smallest change that addresses the finding, in `$LANE`, on the lane's **current branch** (its local
 `main` — do **NOT** `git checkout -b`; the single-branch hook blocks branch creation even in a lane clone).
+The declared scope and operator send-back exclusions are binding. Stay inside this scope; anything else → stand down with a scope-increase request. An `Out of scope:` or `x<id> carries` line is an operator exclusion. Never re-add identifiers listed in `scope-removed:` on an operator send-back or removal commit. Name the proposed addition and why it needs wider scope; the harness records a scope-increase stand-down in needs-you and does not push it. `fix.scopeFence.enabled` defaults true; `fix.scopeFence.mode` defaults `stand-down` (`warn` posts a note and permits the push). Both resolve through the policy cascade with sources logged.
+
 Keep scope tight: the repair's files should stay within `{{SCOPE}}`. Do not fold in unrelated work, and do not
 weaken or delete a test to sidestep the finding.
 

@@ -758,10 +758,10 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
             (report.standDownAnswered ??= []).push({ repo, number: pr.number, title: pr.title,
               answeredAt: standDownAnswers.latestOperatorAnswerAt(comments) });
           }
-        } else if (unresolved && standDownQueueSection === 'needs-you'
-          && standDownTrailerReason(unresolved.body) === 'needs-judgment') {
+        } else if (unresolved && (standDownTrailerReason(unresolved.body) === 'scope-increase'
+          || (standDownQueueSection === 'needs-you' && standDownTrailerReason(unresolved.body) === 'needs-judgment'))) {
           const reason = standDownReason(unresolved.body) ?? '';
-          const clause = STAND_DOWN_REASONS['needs-judgment'];
+          const clause = STAND_DOWN_REASONS[standDownTrailerReason(unresolved.body)];
           const question = reason === clause ? '' : reason.startsWith(`${clause}. `) ? reason.slice(clause.length + 2) : reason;
           const remaining = remainingStandDownFindings?.({ ...pr, comments }, { repo }) ?? [];
           (report.needsYouStandDowns ??= []).push({ repo, number: pr.number, title: pr.title,
