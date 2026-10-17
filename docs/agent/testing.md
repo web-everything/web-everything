@@ -1432,6 +1432,14 @@ bases share a conservative bucket. At `build.unconfirmedLaunchMax` (2), hold for
 redacted evidence. Both leaves use standard → platform `build` → tool `build` → environment
 (`WE_BUILD_UNCONFIRMED_LAUNCH_MAX`, `WE_BUILD_UNCONFIRMED_COOLDOWN_MIN`), with source logging.
 Replay two unconfirmed launches through detached settlement, restart, cooldown expiry and changed bases.
+Attempt exhaustion takes precedence over the unconfirmed cooldown: replay mixed failures with the last
+unconfirmed launch reaching the attempt cap, then verify the hold survives cooldown expiry until re-arm.
+Guard the shared CLI/HTTP `outcomePayload` with secret-bearing dispatch error and handle fixtures;
+new receipt fields require explicit payload assertions. Exercise raw producer envelopes too, since the
+daemon parser must scrub effect errors and verdict reasons independently. Detached settlement must
+redact stdout/stderr before truncating excerpts and attaching them to tick failure reasons. Decode
+JSON string values before scrubbing; omit undecodable structured excerpts so escaped credentials
+cannot return through the parse-error fallback.
 
 Launch admission and launch confirmation do not prove delivery. Retain the build failure ledger across
 both, including daemon restarts; clear it only after observing a delivering PR. Before releasing an

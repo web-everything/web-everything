@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { recordBuildFailure, clearBuildFailure, listBuildBackoffs } from '../../../scripts/conveyor/build-dispatch-failures.mjs';
@@ -9,6 +9,8 @@ import { adoptOrphanedBuildClaims } from '../../../scripts/conveyor/build-dispat
 import { outcomePayload } from '../../../scripts/operations/cli-adapter.mjs';
 import { readDispatchOutcome } from '../build-dispatch-daemon.mjs';
 import { readBuildUnconfirmedSettings } from '../../../scripts/lib/build-unconfirmed-settings.mjs';
+import { redactSpawnText } from '../../../scripts/lib/describe-spawn-failure.mjs';
+import { startDetachedLaunch } from '../../../scripts/conveyor/pending-launches.mjs';
 
 const scope = ['plateau-app:src/a.ts'];
 const tickOut = () => ({
@@ -36,6 +38,66 @@ describe('non-blocking launch (78b)', () => {
   let lockRoot;
   beforeEach(() => { lockRoot = mkdtempSync(join(tmpdir(), 'bdd-nb-')); });
   afterEach(() => { rmSync(lockRoot, { recursive: true, force: true }); });
+
+  it.each(['failed', 'indeterminate'])('redacts %s dispatch receipts at the public payload and daemon boundaries', async (status) => {
+    // Shared payload guard: CLI JSON and HTTP run routes both use outcomePayload.
+    // Include settings JSON, assignment, bearer and token shapes across line/quote boundaries.
+    const secret = 'ghp_fixtureSecret123456789';
+    const error = `Command failed: worker --settings {"env":{"GH_TOKEN":"${secret}"}}\n\r\u2028\`" -- ../ GH_TOKEN=${secret} Bearer ${secret}`;
+    const effect = { key: 'receipt#0', type: 'conveyor.dispatch-delivery-agent', status,
+      handle: `worker GH_TOKEN=${secret}`, error };
+    const run = { id: 'secret-receipt', op: 'dispatch-lane', effects: [effect], verdict: { dispatching: true } };
+    const envelope = outcomePayload({ run, stopped: 'effect-halted', error: new Error(error) });
+    // Any additional receipt field needs an explicit public-payload/redaction assertion here.
+    expect(Object.keys(envelope.effects[0]).sort()).toEqual(['error', 'handle', 'key', 'status', 'type']);
+    expect(envelope.effects[0].error).toBe(redactSpawnText(error));
+    expect(envelope.effects[0].handle).toBe(redactSpawnText(effect.handle));
+    expect(envelope.error).toBe(redactSpawnText(error));
+    expect(JSON.stringify(envelope)).not.toContain(secret);
+    // Also defend older/raw producers that bypass the serializer entirely.
+    for (const input of [envelope, { run }]) {
+      const outcome = readDispatchOutcome(JSON.stringify(input));
+      expect(outcome).toMatchObject({ dispatching: false, reason: redactSpawnText(error) });
+      const tick = await runBuildDispatchTick({ live: true, effects: effectsFor(lockRoot, {
+        settleLaunches: () => ({ pending: [], settled: [{ num: '3827', kind: 'build', outcome }] }),
+        dispatch: () => outcome,
+      }) });
+      expect(tick.launchSettlement.settled[0].reason).toBe(redactSpawnText(error));
+      expect(tick.failures.length).toBeGreaterThan(0);
+      for (const failure of tick.failures) expect(failure.reason).toBe(redactSpawnText(error));
+      expect(JSON.stringify(tick)).not.toContain(secret);
+    }
+  });
+
+  it.each(['reason', 'why'])('redacts the dispatch verdict %s fallback', (field) => {
+    const reason = 'refused GH_TOKEN=ghp_fixtureSecret123456789';
+    const envelope = outcomePayload({ run: { id: 'refusal', op: 'dispatch-lane', effects: [], verdict: { dispatching: false, [field]: reason } }, stopped: 'complete' });
+    expect(envelope.verdict[field]).toBe(redactSpawnText(reason));
+    expect(readDispatchOutcome(JSON.stringify({ verdict: { dispatching: false, [field]: reason } })).reason)
+      .toBe(redactSpawnText(reason));
+  });
+
+  it.each(['empty', 'invalid', 'failed', 'partial'])('redacts detached %s output before excerpts reach tick reasons', async (kind) => {
+    const secret = 'ghp_fixtureSecret123456789';
+    const opaque = 'opaqueDiagnosticCredential123';
+    const error = `Command failed: GH_TOKEN=${secret} {"env":{"GH_TOKEN":"${opaque}"}}`;
+    const rec = startDetachedLaunch({ root: lockRoot, num: '3827', kind: 'build', argv: [], env: {}, cwd: lockRoot,
+      spawn: () => ({ pid: 9, unref() {} }) });
+    const envelope = JSON.stringify({ verdict: { dispatching: true },
+      effects: [{ type: 'conveyor.dispatch-delivery-agent', status: 'failed', error }] });
+    const text = kind === 'empty' ? '' : kind === 'invalid' ? error : kind === 'partial' ? `${envelope}\nextra diagnostic` : envelope;
+    writeFileSync(rec.outFile, text);
+    // Place a token across the excerpt boundary: redaction must precede slicing.
+    writeFileSync(rec.errFile, `${'x'.repeat(155)} ${error}`);
+    const tick = await runBuildDispatchTick({ live: true, effects: effectsFor(lockRoot, {
+      settleLaunches: () => cliSettleLaunches({ root: lockRoot, isPidAlive: () => false }),
+      dispatch: () => ({ dispatching: false, reason: 'retry declined' }),
+    }) });
+    expect(tick.launchSettlement.settled[0].reason).toContain('<redacted-token>');
+    expect(JSON.stringify(tick)).not.toContain(secret);
+    expect(JSON.stringify(tick)).not.toContain('fixtureSecret');
+    expect(JSON.stringify(tick)).not.toContain(opaque);
+  });
 
   it('confirms the real CLI dispatch envelope from its persisted receipt, without a later liveness rescue', async () => {
     const { createFileRunStore } = await import('../../../scripts/operations/run-store.mjs');

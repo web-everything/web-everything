@@ -208,18 +208,19 @@ export function readDispatchOutcome(text) {
     }
     return { dispatching: false, reason: 'no verdict in dispatch-lane output' };
   }
-  const result = { dispatching: false, reason: verdict.reason ?? verdict.why ?? null,
+  const reason = verdict.reason ?? verdict.why;
+  const result = { dispatching: false, reason: reason == null ? null : redactSpawnText(reason),
     lane: verdict.lane ?? null, sessionSlug: verdict.sessionSlug ?? null };
   // A planner declining to launch (lane cap, plan re-read race, freeze) is a typed refusal, not a failed
   // prepare: the caller retries next tick instead of holding. Only launch/parse failures fall through untyped.
   if (!verdict.dispatching) return { ...result, refused: true };
   const effect = run.effects?.find(e => e.type === 'conveyor.dispatch-delivery-agent');
-  if (effect?.error) return { ...result, reason: effect.error };
+  if (effect?.error) return { ...result, reason: redactSpawnText(effect.error) };
   if (!effect || !['in-flight', 'applied'].includes(effect.status)
     || typeof effect.handle !== 'string' || !effect.handle.trim()) {
     return { ...result, reason: `dispatch launch not confirmed (${effect?.status ?? 'missing effect'}; no running session)` };
   }
-  return { ...result, dispatching: true, handle: effect.handle };
+  return { ...result, dispatching: true, handle: redactSpawnText(effect.handle) };
 }
 
 /**

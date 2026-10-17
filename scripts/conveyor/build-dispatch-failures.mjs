@@ -50,6 +50,9 @@ export function recordBuildFailure({ num, reason, output, base = null }, { path 
     return { num: key, attempts: state.items[key]?.attempts ?? 0, reasonCode, cloneWide: true, reason: redactSpawnText(reason ?? '').slice(0, 400),
       output: text.slice(0, OUTPUT_CAP), recordedAt: new Date(now).toISOString(), retryAfter: null, exhausted: false };
   }
+  // A cooldown may extend a retry window, but must never revive an exhausted card.
+  const verdict = reasonCode === CARD_REFUSAL_CODE ? { retryAfter: null, exhausted: true }
+    : backoffVerdict({ attempts, now, settings, code: reasonCode });
   const record = {
     num: key, attempts,
     base, unconfirmedLaunches,
@@ -58,8 +61,8 @@ export function recordBuildFailure({ num, reason, output, base = null }, { path 
     output: text.slice(0, OUTPUT_CAP),
     recordedAt: new Date(now).toISOString(),
     // A card-level refusal is permanent: it is withheld at once (exhausted), not re-tried on a cooldown.
-    ...(reasonCode === CARD_REFUSAL_CODE ? { retryAfter: null, exhausted: true } : backoffVerdict({ attempts, now, settings, code: reasonCode })),
-    ...(cooldown ? { unconfirmedCooldown: true, exhausted: false,
+    ...verdict,
+    ...(cooldown && !verdict.exhausted ? { unconfirmedCooldown: true,
       retryAfter: new Date(now + unconfirmed.unconfirmedCooldownMin * 60_000).toISOString() } : {}),
   };
   state.items[key] = record;
