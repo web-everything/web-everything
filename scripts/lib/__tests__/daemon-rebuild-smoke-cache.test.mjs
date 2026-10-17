@@ -7,9 +7,12 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { rebuildClone, readRebuildState, readyCandidatePath } from '../daemon-rebuild.mjs';
-import { addOverlay } from '../daemon-overlays.mjs';
+import { SMOKE_CHECKS, runLiveSmoke } from '../daemon-live-smoke.mjs';
+import { addOverlay, readOverlays } from '../daemon-overlays.mjs';
 import { writeRebuildState } from '../daemon-rebuild/state.mjs';
-import { smokePassKey, smokePassIdentity, smokePassTtlMs } from '../daemon-rebuild/smoke.mjs';
+import { smokePassKey, smokePassIdentity, smokePassTtlMs, resolveSmokeReuse } from '../daemon-rebuild/smoke.mjs';
+
+vi.mock('../resource-admission.mjs', () => ({ shadowAdmission: vi.fn(), admit: vi.fn() }));
 
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
@@ -72,7 +75,7 @@ function makeFixture() {
 }
 
 const LOCK_OPTS = { waitMs: 1500, pollMs: 20 };
-const PASS = { verdict: 'pass', attempts: 1, smoke: { results: [] } };
+const PASS = { verdict: 'pass', attempts: 1, smoke: { results: SMOKE_CHECKS.map(({ name }) => ({ name, ok: true })) } };
 const FAIL = { verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'x', detail: 'boom' }] } };
 
 beforeEach(() => { tempDirs.length = 0; });
@@ -85,7 +88,7 @@ const rebuild = (f, runSmoke, extra = {}) => rebuildClone({
   root: f.cloneDir, env: f.env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS, ...extra,
 });
 const head = (f) => gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim();
-const identity = (f, sha) => smokePassIdentity((args) => git(f.cloneDir, args), sha);
+const identity = (f, sha) => smokePassIdentity((args) => git(f.cloneDir, args), sha, 'clone');
 
 // Move main to a distinct commit with identical content, and restore the clone's original base.
 function repeatTree(f, base) {
@@ -96,7 +99,40 @@ function repeatTree(f, base) {
 }
 
 describe('durable smoke pass cache', () => {
-  it('adopts a new SHA of a proven tree after the ready record was cleared, without a worktree', async () => {
+  it.each([false, true])('keeps healthy overlays when a cached fallback shares the broken harness (already running: %s)', async (alreadyRunning) => {
+    const f = makeFixture();
+    const base = head(f);
+    advanceMain(f.originDir, dir => writeFile(dir, 'main.txt', 'm'));
+    await rebuild(f, async () => PASS);
+    if (!alreadyRunning) gitOk(f.cloneDir, ['reset', '--hard', base]);
+    pushBranch(f.originDir, 'lane/healthy', dir => writeFile(dir, 'overlay.txt', 'healthy'));
+    addOverlay(f.cloneDir, { ref: 'lane/healthy' }, { env: f.env });
+    const calls = [];
+    const smoke = async (options) => {
+      const result = await runLiveSmoke({ ...options, runChild: async (cmd, args, opts) => {
+        if (opts.env.GH_CALLER === 'rebuild-smoke:dispatch-dry-run') return 'malformed JSON';
+        if (args[1] === 'list') return '[]';
+        if (args[1] === 'acquire') return JSON.stringify({ lane: 2 });
+        if (cmd === 'node') return JSON.stringify({ ok: true });
+        return '';
+      } });
+      calls.push({ options, result });
+      return { verdict: result.pass ? 'pass' : 'code', smoke: result };
+    };
+    const result = await rebuild(f, smoke);
+    expect(result.reason).toBe('harness-broken-adopted-not-worse');
+    expect(readOverlays(f.cloneDir, { env: f.env }).map(row => row.ref)).toContain('lane/healthy');
+    expect(calls).toHaveLength(3);
+    for (const { options, result: checked } of calls) {
+      expect(options.reuseCode).toBe(false);
+      expect(checked.results.find(row => row.name === 'dispatch-dry-run')).toMatchObject({ ok: false,
+        detail: expect.stringContaining('unparsable output') });
+      expect(checked.results.filter(row => SMOKE_CHECKS.find(check => check.name === row.name)?.kind === 'env').every(row => row.ok)).toBe(true);
+    }
+    expect(calls.slice(1).every(({ options }) => options.changedFiles === null)).toBe(true);
+  });
+
+  it('reuses code proof for an identical tree while materializing and re-running env checks', async () => {
     const f = makeFixture();
     const base = head(f);
     advanceMain(f.originDir, (dir) => writeFile(dir, 'a.txt', 'a'));
@@ -112,15 +148,14 @@ describe('durable smoke pass cache', () => {
     expect(target).not.toBe(first);
     expect(identity(f, target)).toEqual(identity(f, first));
     const run = vi.fn((args, opts) => spawnSync('git', args, { ...opts, encoding: 'utf8' }));
-    const second = await rebuild(f, smoke, { run });
+    const log = { error: vi.fn() };
+    const second = await rebuild(f, smoke, { run, log });
+    expect(log.error).toHaveBeenCalledWith(`daemon-rebuild: smoke reused from ${proofs[0].passedAt} on tree ${proofs[0].tree} (env checks re-run)`);
     expect(second.adopted).toBe(true);
     expect(head(f)).toBe(target);
-    expect(smoke).toHaveBeenCalledTimes(1);
-    expect(run.mock.calls.some(([args]) => args.includes('worktree') && args.includes('add'))).toBe(false);
-    expect(second.alerts).toContainEqual({ kind: 'smoke-skipped-proven-tree', detail: {
-      tree: proofs[0].tree, provenAt: proofs[0].passedAt,
-      reason: 'tree already passed a full smoke (same lock, node, harness)',
-    } });
+    expect(smoke).toHaveBeenCalledTimes(2);
+    expect(smoke.mock.calls[1][0].reuseCode).toBe(true);
+    expect(run.mock.calls.some(([args]) => args.includes('worktree') && args.includes('add'))).toBe(true);
     expect(readRebuildState(f.cloneDir, f.env).smokePassed).toEqual(proofs);
   });
 
@@ -136,11 +171,14 @@ describe('durable smoke pass cache', () => {
     expect(identity(f, head(f)).key).not.toBe(first.key);
   });
 
-  it.each(['code', 'transient', 'threw', 'cached', 'busy'])('does not record a %s result', async (kind) => {
+  it.each(['code', 'transient', 'threw', 'cached', 'busy', 'partial', 'skipped', 'disabled'])('does not record a %s result', async (kind) => {
     const f = makeFixture();
     const base = head(f);
     const target = advanceMain(f.originDir, (dir) => writeFile(dir, 'a.txt', 'a'));
     const smoke = vi.fn(async () => {
+      if (kind === 'partial') return { ...PASS, smoke: { results: PASS.smoke.results.slice(1) } };
+      if (kind === 'skipped') return { ...PASS, smoke: { results: PASS.smoke.results.map(row => ({ ...row, skipped: true })) } };
+      if (kind === 'disabled') return { ...PASS, disabled: true };
       if (kind === 'threw') throw new Error('smoke error');
       if (kind === 'cached') return { ...PASS, cached: true };
       if (kind === 'busy') return { verdict: 'pass', smoke: { results: [{ name: 'pool', ok: true, skipReason: 'busy-pool' }] } };
@@ -191,7 +229,7 @@ describe('durable smoke pass cache', () => {
 
   it('smokes an expired proof and deduplicates the refreshed entry', async () => {
     const f = makeFixture();
-    f.env.WE_DAEMON_SMOKE_PASS_TTL_MS = '1000';
+    f.env.WE_REBUILD_SMOKE_REUSE_HOURS = String(1 / 3600);
     const base = head(f);
     advanceMain(f.originDir, (dir) => writeFile(dir, 'a.txt', 'a'));
     const time = Date.now();
@@ -203,6 +241,45 @@ describe('durable smoke pass cache', () => {
     const proofs = readRebuildState(f.cloneDir, f.env).smokePassed;
     expect(proofs).toHaveLength(1);
     expect(proofs[0].passedAt).toBe(new Date(time + 1001).toISOString());
+  });
+
+  it.each(['disabled', 'partial', 'env-failed'])('%s cannot bypass a new smoke', async kind => {
+    const f = makeFixture();
+    const base = head(f);
+    advanceMain(f.originDir, dir => writeFile(dir, 'a.txt', 'a'));
+    await rebuild(f, async () => kind === 'partial' ? { verdict: 'pass', smoke: { results: [] } } : PASS);
+    repeatTree(f, base);
+    if (kind === 'disabled') f.env.WE_REBUILD_SMOKE_REUSE_ENABLED = '0';
+    const smoke = vi.fn(async () => kind === 'env-failed'
+      ? { verdict: 'code', smoke: { results: [{ name: 'daemon-entries-boot', ok: false, detail: 'boot failed' }] } } : PASS);
+    const result = await rebuild(f, smoke);
+    expect(smoke.mock.calls[0][0].reuseCode).toBe(kind === 'env-failed');
+    if (kind === 'env-failed') {
+      expect(result.moved).toBe(false);
+      expect(head(f)).toBe(base);
+      expect(result.reason).toBe('smoke-reused-env-failed');
+      expect(smoke).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('runs all six env rows and skips only code rows in the live runner', async () => {
+    const runChild = vi.fn(async (cmd, args) => {
+      if (args[1] === 'list') return '[]';
+      if (args[1] === 'acquire') return JSON.stringify({ lane: 2 });
+      if (cmd === 'node') return JSON.stringify({ ok: true });
+      return '';
+    });
+    const smoke = await runLiveSmoke({ root: '.', env: {}, runChild, reuseCode: true,
+      changedFiles: [], closureOf: () => { throw new Error('must not inspect closure'); } });
+    expect(smoke.pass).toBe(true);
+    expect(smoke.results.filter(row => row.skipped).map(row => row.name)).toEqual(['reconcile-dry-run', 'dispatch-dry-run']);
+    expect(smoke.results.filter(row => !row.skipped).map(row => row.name)).toEqual(SMOKE_CHECKS.filter(row => row.kind === 'env').map(row => row.name));
+    expect(SMOKE_CHECKS.every(row => ['code', 'env'].includes(row.kind))).toBe(true);
+    const failed = await runLiveSmoke({ root: '.', env: {}, reuseCode: true, runChild: async (cmd, args, opts) => {
+      if (cmd === 'gh') throw new Error('environment failed');
+      return runChild(cmd, args, opts);
+    } });
+    expect(failed.pass).toBe(false);
   });
 
   it('retains only the newest five proofs', async () => {
@@ -218,12 +295,12 @@ describe('durable smoke pass cache', () => {
     expect(proofs[0].key).toBe(identity(f, head(f)).key);
   });
 
-  it.each(['lockHash', 'nodeVersion', 'harnessHash'])('does not reuse a proof with a different %s', async (field) => {
+  it.each(['lockHash', 'nodeVersion', 'harnessHash', 'cloneKind'])('does not reuse a proof with a different %s', async (field) => {
     const f = makeFixture();
     const target = advanceMain(f.originDir, (dir) => writeFile(dir, 'a.txt', 'a'));
     gitOk(f.cloneDir, ['fetch', '-q', 'origin']);
     const tree = identity(f, target).tree;
-    const parts = { tree, lockHash: '', nodeVersion: process.version,
+    const parts = { tree, cloneKind: 'clone', lockHash: '', nodeVersion: process.version,
       harnessHash: createHash('sha256').update(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../daemon-live-smoke.mjs'))).digest('hex') };
     expect(smokePassKey(parts)).toBe(identity(f, target).key);
     writeRebuildState(f.cloneDir, { smokePassed: [{ tree, key: smokePassKey({ ...parts, [field]: 'different' }), passedAt: new Date().toISOString() }] }, f.env);
@@ -232,9 +309,13 @@ describe('durable smoke pass cache', () => {
     expect(smoke).toHaveBeenCalledTimes(1);
   });
 
-  it('defaults to two hours and honors zero and explicit TTL settings', () => {
-    expect(smokePassTtlMs({})).toBe(7_200_000);
-    expect(smokePassTtlMs({ WE_DAEMON_SMOKE_PASS_TTL_MS: '0' })).toBe(0);
-    expect(smokePassTtlMs({ WE_DAEMON_SMOKE_PASS_TTL_MS: '123' })).toBe(123);
+  it('defaults to twelve hours and resolves overrides with sources', () => {
+    expect(smokePassTtlMs({})).toBe(43_200_000);
+    expect(resolveSmokeReuse({ WE_REBUILD_SMOKE_REUSE_ENABLED: '0', WE_REBUILD_SMOKE_REUSE_HOURS: '3' })).toMatchObject({
+      reuseEnabled: false, reuseHours: 3, sources: { reuseEnabled: 'env', reuseHours: 'env' },
+    });
+    expect(resolveSmokeReuse({ WE_REBUILD_SMOKE_REUSE_HOURS: '-1' }).reuseHours).toBe(12);
+    expect(smokePassTtlMs({ WE_REBUILD_SMOKE_REUSE_HOURS: '0' })).toBe(0);
+    expect(smokePassTtlMs({ WE_REBUILD_SMOKE_REUSE_HOURS: '2' })).toBe(7_200_000);
   });
 }, 60_000);
