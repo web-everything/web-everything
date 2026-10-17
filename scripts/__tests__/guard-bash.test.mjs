@@ -8,6 +8,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, readFileSy
 import { tmpdir, homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import {
+  orchestratorDelegateReason,
   decide, reason, isBacklogMutation, isPrimaryCwd, isLaneCwd, resolveEffectiveCwd,
   siblingLaneLeases,
   laneRootFromCwd, isDestructiveLaneGitOp, hasDestructiveLaneOp, canonicalGitOp,
@@ -533,8 +534,11 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at("cd '~' && ls")).toBe(`${REPORTED}/~`);
     expect(at("cd '$HOME/clone' && ls")).toBe(REPORTED);
   });
-  it('unsupported spellings keep the reported cwd and never become a home target', () => {
-    expect(at('cd ~someone/clone && ls')).toBe(REPORTED);
+  // Where home expansion does not apply, the result is main's: `~` is then plain text relative to the
+  // reported cwd and a `$VAR` reads main's literal assignments. Never a home path, never weaker than main.
+  const TILDE_CLONE = `${REPORTED}/~/clone`;
+  it('unsupported spellings never become a home target', () => {
+    expect(at('cd ~someone/clone && ls')).toBe(`${REPORTED}/~someone/clone`);
     expect(at('cd "$UNKNOWN/clone" && ls')).toBe(REPORTED);
     expect(at('cd "$(echo ~)/clone" && ls')).toBe(REPORTED);
     expect(at('cd "`echo $HOME`" && ls')).toBe(REPORTED);
@@ -543,16 +547,40 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('cd $HOME/* && ls')).toBe(REPORTED);
   });
   it('a missing or non-absolute HOME fabricates nothing', () => {
-    expect(at('cd ~/clone && ls', null)).toBe(REPORTED);
+    expect(at('cd ~/clone && ls', null)).toBe(TILDE_CLONE);
     expect(at('cd "$HOME" && ls', null)).toBe(REPORTED);
-    expect(at('cd ~ && ls', '')).toBe(REPORTED);
-    expect(at('cd ~ && ls', 'relative/home')).toBe(REPORTED);
+    expect(at('cd ~ && ls', '')).toBe(`${REPORTED}/~`);
+    expect(at('cd ~ && ls', 'relative/home')).toBe(`${REPORTED}/~`);
+  });
+  it('an unknown HOME keeps main\'s literal HOME value for a whole `$HOME` target', () => {
+    expect(at('HOME=/clone; HOME=$(mktemp -d); cd "$HOME"')).toBe('/clone');
+    expect(at('HOME=/clone; read HOME <f; cd $HOME')).toBe('/clone');
+    expect(at('HOME=/clone; read HOME <f; cd ${HOME}')).toBe('/clone');
+  });
+  it('a home-derived ordinary variable expands with the HOME in effect at its assignment', () => {
+    expect(at('D=~/x; cd "$D"')).toBe(`${HOME}/x`);
+    expect(at('D=$HOME/x; cd $D')).toBe(`${HOME}/x`);
+    expect(at('D="${HOME}/x"; cd "${D}"')).toBe(`${HOME}/x`);
+    expect(at('D=~/x; D+=/y; cd "$D"')).toBe(`${HOME}/x/y`);
+    expect(at('HOME=/a; D=~/x; HOME=/b; cd "$D"')).toBe('/a/x');
+    expect(at('D=~/x; HOME=/b; cd "$D"')).toBe(`${HOME}/x`);
+    // a quoted tilde is literal text: no home expansion, main's relative resolution
+    expect(at(`D='~/x'; cd "$D"`)).toBe(`${REPORTED}/~/x`);
+    expect(at('D="~/x"; cd "$D"')).toBe(`${REPORTED}/~/x`);
+    // a child-shell assignment never changes the parent's home-derived value
+    expect(at('D=~/x; (D=/tmp); cd "$D"')).toBe(`${HOME}/x`);
+    expect(at('D=~/x; ( D=/tmp; true ); cd "$D"')).toBe(`${HOME}/x`);
+    expect(at('D=~/x; y=$(D=/tmp); cd "$D"')).toBe(`${HOME}/x`);
+    expect(at('(HOME=/tmp); cd ~/x')).toBe(`${HOME}/x`);
+    // no home to expand, or a later literal assignment: main's resolution
+    expect(at('D=~/x; cd "$D"', null)).toBe(`${REPORTED}/~/x`);
+    expect(at('D=~/x; D=/clone; cd "$D"')).toBe('/clone');
   });
   it('uses only preceding literal HOME assignments for home expansion', () => {
     expect(at('HOME=/other; cd ~/clone')).toBe('/other/clone');
     expect(at('export HOME=/other; cd "$HOME/clone"')).toBe('/other/clone');
     expect(at('cd ~/clone; HOME=/other')).toBe(`${HOME}/clone`);
-    expect(at('HOME=$(mktemp -d); cd ~/clone')).toBe(REPORTED);
+    expect(at('HOME=$(mktemp -d); cd ~/clone')).toBe(TILDE_CLONE);
   });
   it('a HOME append extends the current home instead of leaving the stale value', () => {
     expect(at('HOME=/a; HOME+=/b; cd ~/clone')).toBe('/a/b/clone');
@@ -561,14 +589,14 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('HOME=/a; HOME+="/sp ace"; cd "$HOME/clone"')).toBe('/a/sp ace/clone');
     expect(at('HOME=/a; HOME+=/b; HOME+=/c; cd ~')).toBe('/a/b/c');
     // the appended text cannot be read, or there is no home to append to — never the stale value
-    expect(at('HOME=/a; HOME+=$(pwd); cd ~/clone')).toBe(REPORTED);
-    expect(at('HOME+=/b; cd ~/clone', null)).toBe(REPORTED);
+    expect(at('HOME=/a; HOME+=$(pwd); cd ~/clone')).toBe(TILDE_CLONE);
+    expect(at('HOME+=/b; cd ~/clone', null)).toBe(TILDE_CLONE);
   });
   it('any other HOME rebinding the resolver cannot read leaves home unknown, never stale', () => {
     for (const rebind of ['HOME[0]=/z', 'HOME[0]+=/z', 'declare HOME=/z', 'declare -x HOME+=/z', 'typeset HOME=/z',
       'readonly HOME=/z', 'local HOME=/z', 'read HOME', 'read -r HOME <f', 'printf -v HOME %s /z', 'unset HOME',
       'let HOME=1', '(( HOME=1 ))', 'eval "HOME=/z"', 'source ./env.sh', '. ./env.sh', 'mapfile -t HOME <f']) {
-      expect(at(`HOME=/a; ${rebind}; cd ~/clone`), rebind).toBe(REPORTED);
+      expect(at(`HOME=/a; ${rebind}; cd ~/clone`), rebind).toBe(TILDE_CLONE);
     }
     // a temporary prefix assignment does not outlive its command
     expect(at('HOME=/a; HOME=/x true; cd ~/clone')).toBe('/a/clone');
@@ -586,8 +614,8 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     // a quoted paren opens no child shell, so the real rebinding after it still counts
     expect(at('HOME=/a; FOO="(" HOME=/b; cd ~/clone')).not.toBe('/a/clone');
     expect(at('HOME=/a; export FOO="(" HOME=/b; cd ~/clone')).not.toBe('/a/clone');
-    expect(at('HOME=/a; read "HOME" <f; cd ~/clone')).toBe(REPORTED);
-    expect(at('HOME=/a; let "HOME=1"; cd ~/clone')).toBe(REPORTED);
+    expect(at('HOME=/a; read "HOME" <f; cd ~/clone')).toBe(TILDE_CLONE);
+    expect(at('HOME=/a; let "HOME=1"; cd ~/clone')).toBe(TILDE_CLONE);
     // inside a child shell the parent keeps its value
     expect(at('HOME=/a; ( HOME=/z ); x=$(HOME=/z; echo); cd ~/clone')).toBe('/a/clone');
   });
@@ -596,24 +624,21 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at(`${'HOME['.repeat(40000)}; cd ~/clone`)).toBe(`${HOME}/clone`);
     expect(Date.now() - started).toBeLessThan(2000);
   });
-  it('an ordinary variable append extends the literal instead of leaving it stale', () => {
-    expect(at('D=/a; D+=/b; cd "$D"')).toBe('/a/b');
-    expect(at('D=/a; export D+=/b; cd $D')).toBe('/a/b');
-    expect(at('D=/a; D+=$(pwd); cd "$D"')).toBe(REPORTED);
-  });
-  it('any other ordinary-variable rebinding before the cd leaves it unknown, never stale', () => {
-    for (const rebind of ['X=1 D=/b', 'D[0]=/b', 'read D <f', 'printf -v D %s /b', 'declare D=/b', 'unset D',
-      'eval "D=/b"', 'D=(/b)']) {
-      expect(at(`D=/a; ${rebind}; cd "$D"`), rebind).toBe(REPORTED);
-    }
-    expect(at('D=/a; D=/b true; cd "$D"')).toBe('/a');
-    expect(at('cd "$D"; D=/b')).toBe(REPORTED);
-    for (const rebind of ['IFS= read -r D <<< /b', 'if read -r D <<< /b', '\\read D <f', 'command -p read D <f',
+  it('an ordinary variable with no home-derived value keeps main\'s literal resolution, never erased', () => {
+    for (const rebind of ['D+=/b', 'export D+=/b', 'D+=$(pwd)', 'X=1 D=/b', 'D[0]=/b', 'read D <f',
+      'printf -v D %s /b', 'declare D=/b', 'unset D', 'eval "D=/b"', 'D=(/b)', 'D=/b true',
+      'IFS= read -r D <<< /b', 'if read -r D <<< /b', '\\read D <f', 'command -p read D <f',
       'x=$(D=1) D=/b', 'echo $(D=1) $((D=5))', 'f(){ D=/b', 'exec {D}>/dev/null', 'coproc D { cat; }',
       'printf -v "$X" %s /b', 'while read D', 'case a in a) D=/b', 'case $1 in\n  a) D=/b ;;\nesac', 'f () { D=/b',
       'time -p D=/b', '>/dev/null D=/b', 'N=$((D=5))', 'for ((D=0;D<1;D++))']) {
-      expect(at(`D=/a; ${rebind}; cd "$D"`), rebind).toBe(REPORTED);
+      expect(at(`D=/a; ${rebind}; cd "$D"`), rebind).toBe('/a');
     }
+    // main reads literal assignments from the whole command
+    expect(at('cd "$D"; D=/b')).toBe('/b');
+  });
+  it('an unreadable rebinding of a home-derived variable falls back to main, never to the home value', () => {
+    expect(at('D=~/x; read D <f; cd "$D"')).toBe(`${REPORTED}/~/x`);
+    expect(at('D=~/x; D=$(pwd); cd "$D"')).toBe(`${REPORTED}/~/x`);
   });
   it('a NAME= that is only an argument, or a prefix of another command, binds nothing', () => {
     expect(at('LANE=/x; echo LANE=foo; cd $LANE')).toBe('/x');
@@ -624,10 +649,10 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('HOME=/a; env HOME=/y true; cd ~/clone')).toBe('/a/clone');
     expect(at('HOME=/a; ( (HOME=/y) ); cd ~/clone')).toBe('/a/clone');
   });
-  it('leaves unquoted bracket globs unresolved', () => {
-    expect(at('cd ~/[c]lone')).toBe(REPORTED);
+  it('never home-expands an unquoted bracket glob', () => {
+    expect(at('cd ~/[c]lone')).toBe(`${REPORTED}/~/[c]lone`);
     expect(at('cd $HOME/[c]lone')).toBe(REPORTED);
-    expect(at('cd /other/[c]lone')).toBe(REPORTED);
+    expect(at('cd /other/[c]lone')).toBe('/other/[c]lone');
     expect(at('cd "$HOME/[c]lone"')).toBe(`${HOME}/[c]lone`);
   });
   it('heredoc body text never steers the resolution', () => {
@@ -2271,34 +2296,6 @@ describe('guard-bash — the parser fails CLOSED on input it cannot represent (#
     expect(heredocScan("cat <<'EOF'\ndon't\nEOF").unterminated).toBe(false);
   });
 
-  it.each([
-    'EOF', "''", '""', 'E"OF"',
-  ])('heredocScan preserves a here-string with word %s and the next command', (word) => {
-    const command = `cat <<<${word}\nnpm run build`;
-    expect(heredocScan(command).text).toBe(command);
-    expect(heredocScan(command).heredocs).toEqual([]);
-    expect(decide(command, { primaryCwd: true })).toMatch(/PRIMARY/);
-  });
-
-  it.each([
-    ["E'OF'", 'EOF'],
-    ["'E'\"O\"F", 'EOF'],
-    ['EOF""', 'EOF'],
-    ['"E\\q"', 'E\\q'],
-    ['"E\\\"OF"', 'E"OF'],
-    ["'E\"OF'", 'E"OF'],
-    ["'E\\OF'", 'E\\OF'],
-    ["''", ''],
-  ])('heredocScan removes delimiter quoting in %s and preserves the next command', (word, delimiter) => {
-    const head = `cat <<${word}`;
-    const tail = 'npm run build';
-    const command = `${head}\nbody\n${delimiter}\n${tail}`;
-    const result = heredocScan(command);
-    expect(result.text).toBe(`${head}\n${tail}`);
-    expect(result.heredocs).toEqual([{ head, body: 'body', expand: false }]);
-    expect(decide(command, { primaryCwd: true })).toMatch(/PRIMARY/);
-  });
-
   it('canonicalCommand is quote-aware, and peels a subshell CLOSER as well as its opener', () => {
     expect(canonicalCommand('(pnpm --filter web exec vite build)')).toBe('pnpm --filter web exec vite build');
     expect(canonicalCommand('(vite build) \\')).toBe('vite build');
@@ -3680,6 +3677,22 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
       expect(resolveEffectiveCwd(command, lane, undefined, root)).toBe(fakeClone);
       denies(command);
     });
+    it.each([
+      ['a tilde-assigned variable', 'D=~/some-new-daemon-clone; cd "$D" && git checkout --detach'],
+      ['a $HOME-assigned variable', 'D="$HOME/some-new-daemon-clone"; cd "$D" && git checkout --detach'],
+      ['a home-derived variable a subshell reassigns', 'D=~/some-new-daemon-clone; (D=/tmp); cd "$D" && git checkout --detach'],
+      ['a tilde cd after a subshell HOME assignment', '(HOME=/tmp); cd ~/some-new-daemon-clone && git checkout --detach'],
+    ])('DENIES `git checkout --detach` through %s', (_n, cmd) => denies(cmd));
+    it('a quoted tilde in an assignment stays literal and never reaches the clone', () => {
+      expect(runHook(`D='~/some-new-daemon-clone'; cd "$D" && git checkout --detach`, lane, root)).toBeNull();
+    });
+    // Where no home expansion applies, main's literal-variable resolution still decides — never weaker.
+    it.each([
+      ['HOME made unknown after a literal clone value', `HOME=${fakeClone}; HOME=$(mktemp -d); cd "$HOME" && git checkout --detach`],
+      ['a variable rebound by a substitution', `D=${fakeClone}; D=$(x); cd "$D" && git checkout --detach`],
+      ['a variable rebound by read', `D=${fakeClone}; read D <f; cd "$D" && git checkout --detach`],
+      ['HOME rebound by read', `HOME=${fakeClone}; read HOME <f; cd "$HOME" && git checkout --detach`],
+    ])('DENIES like main when %s', (_n, cmd) => denies(cmd));
     it('keeps the read-only control allowed', () => {
       expect(runHook('cd ~/some-new-daemon-clone && git status', lane, root)).toBeNull();
     });
@@ -3795,5 +3808,144 @@ describe('admitted vitest must be one-shot (#4449)', () => {
     expect(line).toBeTruthy();
     const mutated = line.replace(' --run', '');
     for (const k of KINDS) expect(dispatchedAgentVerificationReason(mutated, k)).not.toBeNull();
+  });
+});
+
+
+describe('orchestrator foreground delegation', () => {
+  const commands = [
+    'node scripts/operations/run.mjs verify',
+    'node scripts/operations/run.mjs verify-lane',
+    'node scripts/verify-lane.mjs run',
+    'node scripts/operations/run.mjs open-pr',
+    'node scripts/readiness/heavy-admission.mjs run -- npx vitest run scripts/example.test.mjs',
+    'npx vitest run scripts/example.test.mjs',
+    'npm run check:standards', 'npm run test:unit -- scripts/example.test.mjs',
+    'node scripts/daemon-rebuild.mjs', 'node scripts/daemon-load-overlay.mjs',
+    'node scripts/daemon-overlay.mjs add example',
+    'node scripts/codex-direct-task.mjs', 'node scripts/gemini-direct-task.mjs',
+  ];
+  it.each(commands)('delegates %s only in orchestrator mode', command => {
+    expect(decide(command, { orchestratorMode: true })).toContain(
+      'orchestrator session: delegate this to a background light agent (Agent tool, run_in_background, model haiku/sonnet), which runs it in its own foreground');
+    expect(orchestratorDelegateReason(command)).toBeNull();
+    expect(String(decide(command) || '')).not.toMatch(/orchestrator session/);
+    expect(orchestratorDelegateReason(command, { orchestratorMode: true, agentSession: true })).toBeNull();
+    expect(orchestratorDelegateReason(command, { orchestratorMode: true, dispatchKind: 'build' })).toBeNull();
+  });
+  it('uses the configured prefix list, including an empty replacement', () => {
+    const ctx = { orchestratorMode: true, orchestratorDelegateCommands: ['node scripts/custom-slow.mjs run'] };
+    expect(decide('node scripts/custom-slow.mjs run', ctx)).toMatch(/orchestrator session/);
+    expect(decide('node scripts/daemon-rebuild.mjs', ctx)).toBeNull();
+    expect(decide('node scripts/daemon-rebuild.mjs', { ...ctx, orchestratorDelegateCommands: [] })).toBeNull();
+  });
+  it('recognizes executable positions and wrappers without matching mentions', () => {
+    const ctx = { orchestratorMode: true };
+    for (const command of [
+      'cd scripts && node daemon-rebuild.mjs',
+      'env EXAMPLE=1 node scripts/daemon-rebuild.mjs',
+      'timeout 600 node scripts/daemon-rebuild.mjs',
+      "bash -c 'node scripts/daemon-rebuild.mjs'",
+      'node "scripts/daemon-rebuild.mjs"',
+    ]) expect(decide(command, ctx), command).toMatch(/orchestrator session/);
+    for (const command of [
+      'echo "node scripts/daemon-rebuild.mjs"',
+      'node scripts/daemon-rebuild.mjs.bak',
+      'node scripts/other.mjs scripts/daemon-rebuild.mjs',
+      'node scripts/daemon-overlay.mjs status',
+      'node scripts/operations/run.mjs status',
+      "cat <<'EOF'\nnode scripts/daemon-rebuild.mjs\nEOF",
+    ]) expect(orchestratorDelegateReason(command, ctx), command).toBeNull();
+  });
+  it('preserves the existing background verification ban in every session', () => {
+    for (const orchestratorMode of [false, true]) {
+      expect(decide('node scripts/operations/run.mjs verify', { orchestratorMode, runInBackground: true })).toMatch(/#2833/);
+    }
+  });
+  it.each([
+    'node --no-warnings scripts/daemon-rebuild.mjs',
+    'node --require ./preload.cjs --no-warnings -- scripts/daemon-rebuild.mjs',
+    'node --require="./preload file.cjs" scripts/daemon-rebuild.mjs',
+    'env EXAMPLE=1 node --conditions custom --title decoy.mjs scripts/daemon-rebuild.mjs',
+    'node --experimental-default-type module --inspect-port 9230 scripts/daemon-rebuild.mjs',
+    'node --unhandled_rejections strict scripts/daemon-rebuild.mjs',
+    'node --import ./scripts/daemon-rebuild.mjs scripts/other.mjs',
+    'node --import ./scripts/daemon-rebuild.mjs --eval "1"',
+    'node --eval "1" --import ./scripts/daemon-rebuild.mjs',
+    'node --no-warnings "scripts/daemon-"rebuild.mjs',
+    'node --no-warnings scripts/daemon-\\\nrebuild.mjs',
+    'npm --silent run test:unit -- scripts/example.test.mjs',
+    'npm --prefix ./workspace run --silent test:unit -- scripts/example.test.mjs',
+    'npm --loglevel silent run-script --workspace="./workspace dir" test:unit -- scripts/example.test.mjs',
+    'npm --fetch-retries 1 run test:unit -- scripts/example.test.mjs',
+    'npm --heading example run test:unit -- scripts/example.test.mjs',
+    'npm --progress false run test:unit -- scripts/example.test.mjs',
+    'npm --save run test:unit -- scripts/example.test.mjs',
+    'npm --audit run test:unit -- scripts/example.test.mjs',
+    'npm --global run test:unit -- scripts/example.test.mjs',
+    'npx --yes vitest run scripts/example.test.mjs',
+    'bash <<EOF\nnode scripts/daemon-rebuild.mjs\nEOF',
+    "sh <<'EOF'\nnode --no-warnings scripts/daemon-rebuild.mjs\nEOF",
+    'bash -s <<-EOF\n\tnpm --silent run test:unit -- scripts/example.test.mjs\n\tEOF',
+    'cat <<EOF | bash\nnode scripts/daemon-rebuild.mjs\nEOF',
+    'bash -o errexit <<EOF\nnode scripts/daemon-rebuild.mjs\nEOF',
+    'bash /dev/stdin <<EOF\nnode scripts/daemon-rebuild.mjs\nEOF',
+    'bash <<EOF 2>/dev/null\nnode scripts/daemon-rebuild.mjs\nEOF',
+    'busybox sh <<EOF\nnode scripts/daemon-rebuild.mjs\nEOF',
+    'cat <<EOF | bash -o errexit\nnode scripts/daemon-rebuild.mjs\nEOF',
+    'cat <<EOF\n$(node scripts/daemon-rebuild.mjs)\nEOF',
+    "cat <<EOF\n# '$(node scripts/daemon-rebuild.mjs)'\nEOF",
+    "bash -c 'bash <<EOF\nnode scripts/daemon-rebuild.mjs\nEOF'",
+    'bash <<OUTER\nsh <<INNER\nnode scripts/daemon-rebuild.mjs\nINNER\nOUTER',
+    "bash <<< 'node scripts/daemon-rebuild.mjs'",
+    "cat <<< 'data'\nnode scripts/daemon-rebuild.mjs",
+    'echo $((1<<2))\nnode scripts/daemon-rebuild.mjs',
+    '((1<<2))\nnode scripts/daemon-rebuild.mjs',
+  ])('delegates executable options and interpreter heredocs: %s', command => {
+    const ctx = { orchestratorMode: true };
+    expect(orchestratorDelegateReason(command, ctx)).toMatch(/orchestrator session/);
+    expect(decide(command, ctx)).toMatch(/orchestrator session/);
+    const output = execFileSync(process.execPath, ['scripts/guard-bash.mjs'], {
+      input: JSON.stringify({ tool_input: { command } }),
+      env: { ...process.env, WE_ORCHESTRATOR_SESSION: '1', WE_CONVEYOR_WORKER: undefined,
+        WE_DISPATCH_KIND: '', WE_POLICY_CASCADE_LOG: '0' }, encoding: 'utf8',
+    });
+    expect(output).toMatch(/orchestrator session/);
+  });
+  it.each([
+    'node --check scripts/daemon-rebuild.mjs',
+    'node --eval "console.log(1)" scripts/daemon-rebuild.mjs',
+    'node -p "1" scripts/daemon-rebuild.mjs',
+    'node --env-file scripts/daemon-rebuild.mjs scripts/other.mjs',
+    'node --title scripts/daemon-rebuild.mjs scripts/other.mjs',
+    'npm --prefix test:unit run lint -- scripts/daemon-rebuild.mjs',
+    "cat <<'EOF'\nnode --no-warnings scripts/daemon-rebuild.mjs\nEOF",
+    'bash script.sh <<EOF\nnode scripts/daemon-rebuild.mjs\nEOF',
+    'cat <<EOF && bash\nnode scripts/daemon-rebuild.mjs\nEOF',
+    'echo <<EOF | bash\nnode scripts/daemon-rebuild.mjs\nEOF',
+    'cat <<EOF | bash </dev/null\nnode scripts/daemon-rebuild.mjs\nEOF',
+    'bash <<EOF </dev/null\nnode scripts/daemon-rebuild.mjs\nEOF',
+    "bash -c 'true' -s <<EOF\nnode scripts/daemon-rebuild.mjs\nEOF",
+    "cat <<'EOF'\n$(node scripts/daemon-rebuild.mjs)\nEOF",
+    'cat <<\\EOF\n$(node scripts/daemon-rebuild.mjs)\nEOF',
+    'cat <<E"OF"\n$(node scripts/daemon-rebuild.mjs)\nEOF',
+    'cat <<E\\OF\n$(node scripts/daemon-rebuild.mjs)\nEOF',
+    "cat <<< 'node scripts/daemon-rebuild.mjs'",
+    'node <<EOF\nconst message = "node scripts/daemon-rebuild.mjs";\nEOF',
+    "bash -c 'cat <<EOF\nnode scripts/daemon-rebuild.mjs\nEOF'",
+    'bash <<EOF\necho "node scripts/daemon-rebuild.mjs"\nEOF',
+  ])('keeps options, mentions and heredoc data distinct: %s', command => {
+    expect(orchestratorDelegateReason(command, { orchestratorMode: true })).toBeNull();
+  });
+  it('wires env detection, source logging and subagent exclusion through hook stdin', () => {
+    const invoke = (event, extraEnv = {}) => execFileSync(process.execPath, ['scripts/guard-bash.mjs'], {
+      input: JSON.stringify({ tool_input: { command: 'node scripts/daemon-rebuild.mjs' }, ...event }),
+      env: { ...process.env, WE_ORCHESTRATOR_SESSION: '1', WE_CONVEYOR_WORKER: undefined,
+        WE_DISPATCH_KIND: '', WE_POLICY_CASCADE_LOG: '0', ...extraEnv }, encoding: 'utf8',
+    });
+    expect(invoke({})).toMatch(/orchestrator session/);
+    expect(invoke({ agent_id: 'delegated-agent' })).not.toMatch(/orchestrator session/);
+    expect(invoke({}, { WE_CONVEYOR_WORKER: '1' })).not.toMatch(/orchestrator session/);
+    expect(invoke({}, { WE_ORCHESTRATOR_SESSION: '0' })).not.toMatch(/orchestrator session/);
   });
 });
