@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { recordRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
 import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.mjs';
 /**
  * @file scripts/operations/review-job.mjs
@@ -272,6 +273,10 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     ...(timeoutMs ? { timeout: timeoutMs, killSignal: 'SIGKILL' } : {}),
   });
   return {
+    redTeamStatus: input => {
+      try { recordRedTeamStatus(input, { env }); }
+      catch (e) { process.stderr.write(`review-job: red-team status write failed: ${e.message}\n`); }
+    },
     root,
     carryAcrossRebaseSetting: () => resolveCarryAcrossRebase({ env }),
     readCarryEvidence: ({ pr, repo }) => {
@@ -634,6 +639,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   // Card xyyuvyz — EVERY head the panel accepts, a `review:human` advisory accept included (`redTeamOwedFor`); once
   // per head is the pass's own `(pr, rev)` row + comment marker.
   const accepted = Boolean(seatsBox.input) && redTeamOwedFor(seatsBox.input.loopPayload);
+  if (accepted) io.redTeamStatus?.({ ...seatsBox.input, status: 'running' });
   if (spec) {
     try {
       out.redTeamSpeculative = settleSpeculativeRedTeam({ spec, accepted, out, input: seatsBox.input }, io);
@@ -665,6 +671,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
         ...(gate?.plan ? { sendBack: gate.plan.sendBack.length, card: gate.plan.card.length, advisory: gate.plan.advisory.length } : {}) };
     }
   }
+  if (accepted) io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: out.redTeam?.status ?? null });
   return out;
 }
 

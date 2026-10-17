@@ -15,8 +15,10 @@ const LIVE = `gh: Pull request Required workflows 'CI, CI, Merge gate, Merge gat
 function execFor(graphql = false) {
   return (cmd, args) => {
     if (cmd === 'git') return args[0] === 'diff' ? 'src/a.js\0' : '';
+    if (args[0] === 'api' && args.includes('--slurp')) return '[[]]';
     if (args[1] === 'comment') return '';
-    if (args[1] === 'view') return JSON.stringify({ id: 'PR_ID', headRefOid: HEAD });
+    // Pass live admission so the strategy reaches the required-workflows refusal under test.
+    if (args[1] === 'view') return JSON.stringify({ id: 'PR_ID', headRefOid: HEAD, labels: ['ready-to-merge'] });
     if (args[1] === 'graphql') {
       if (graphql) return JSON.stringify({ errors: [{ message: LIVE, type: 'UNPROCESSABLE', code: 'RULESET' }] });
       throw Object.assign(new Error('gh failed'), { stderr: LIVE });
@@ -36,7 +38,13 @@ describe('required-workflows refusal (ruleset 24930207)', () => {
     if (graphql) expect(out).toMatchObject({ type: 'UNPROCESSABLE', code: 'RULESET' });
   });
   it('strategy preserves its diagnostic, code and pinned head', () => {
-    const s = createDrainMergeStrategy({ localSlug: 'owner/repo', isLocalRepo: () => true, exec: execFor(), readFile: () => '{"pending":[],"followedUp":[]}', statePath: '/unused', writeState: () => {}, log: { write() {} }, resolved: { policy: resolveMergeDeliveryPolicy({ tool: { strategy: 'github-merge-queue' } }), note: null } });
+    const s = createDrainMergeStrategy({
+      localSlug: 'owner/repo', isLocalRepo: () => true, exec: execFor(),
+      readRedTeamEvidence: () => ({ loopPayload: null, inFlight: false, recorded: false }),
+      batching: { gate: () => ({ admit: true }) },
+      readFile: () => '{"pending":[],"followedUp":[]}', statePath: '/unused', writeState: () => {}, log: { write() {} },
+      resolved: { policy: resolveMergeDeliveryPolicy({ tool: { strategy: 'github-merge-queue' } }), note: null },
+    });
     try { s.enqueue({ num: 42 }, HEAD, { comments: [] }); expect.fail('must throw'); }
     catch (e) { expect(e.code).toBe('required-workflows-unsatisfied'); expect(e.headSha).toBe(HEAD); expect(e.message).toBe(`github-merge-queue enqueue FAILED (${LIVE}) — NOT merged directly; retried next pass`); }
   });
