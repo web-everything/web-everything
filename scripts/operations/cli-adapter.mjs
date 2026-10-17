@@ -46,6 +46,7 @@ import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
  */
 
 import { resolveOperationRoute } from '../lib/dispatch-routing-policy-io.mjs';
+import { redactSpawnText } from '../lib/describe-spawn-failure.mjs';
 import { pickAgyEvidence } from '../lib/antigravity-run-evidence.mjs';
 import { describeSubmit, extractSubmitResult } from './open-pr.mjs';
 import { advance, runStatus, startRun } from './engine.mjs';
@@ -1415,10 +1416,19 @@ export function outcomePayload({ run, stopped, error = null, applied = [], owned
     // no `effects` either, there was no way to recover a parked run's handle over HTTP at all. Reading the
     // record answers the same on every route.
     inFlight: run.effects.filter((e) => e.status === 'in-flight').map((e) => e.key),
-    pending: run.pending, verdict: run.verdict, findings: run.findings,
+    // Dispatch callers need the persisted receipt, including its handle, to confirm a launch.
+    // Keys alone prove neither a successful spawn nor which process owns the work.
+    // Sink errors can embed argv/settings credentials. This boundary serves CLI and HTTP alike.
+    ...(run.op === 'dispatch-lane' ? { effects: run.effects.map(({ key, type, status, handle, error }) =>
+      ({ key, type, status, handle: typeof handle === 'string' ? redactSpawnText(handle) : null,
+        ...(error ? { error: redactSpawnText(error) } : {}) })) } : {}),
+    pending: run.pending, verdict: run.op === 'dispatch-lane' && run.verdict ? { ...run.verdict,
+      ...(run.verdict.reason != null ? { reason: redactSpawnText(run.verdict.reason) } : {}),
+      ...(run.verdict.why != null ? { why: redactSpawnText(run.verdict.why) } : {}),
+    } : run.verdict, findings: run.findings,
     // The meter, and its total pre-summed — a consumer must not have to re-derive "what did this cost".
     telemetry: run.telemetry ?? [], spend: totalJudgeSpend(run),
-    ...(error ? { error: String(error.message ?? error) } : {}),
+    ...(error ? { error: redactSpawnText(error.message ?? error) } : {}),
   };
 }
 
