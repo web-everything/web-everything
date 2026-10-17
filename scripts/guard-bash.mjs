@@ -3891,7 +3891,7 @@ export function stripHeredocBodies(command) {
   return heredocScan(command).text;
 }
 
-/** `stripHeredocBodies` plus the parse state it reached. Pure. Returns `{ text, unterminated }`.
+/** `stripHeredocBodies` plus the parse state and `{ head, body, expand }` records it reached. Pure.
  *
  *  r3 audit — this pass is ITSELF a parser (it has to be: only an unquoted, un-commented `<<` opens a
  *  heredoc), so it has the same degrade-or-deny obligation as the splitter. An unterminated quoted run in
@@ -3903,7 +3903,9 @@ export function stripHeredocBodies(command) {
 export function heredocScan(command) {
   const text = String(command || '');
   if (!text.includes('<<')) return { text, unterminated: parseSegments(text).unterminated, heredocs: [] };
-  const OPENER = /^<<-?\s*(?:'([^']+)'|"([^"]+)"|\\?([A-Za-z_]\w*))/;
+  // A delimiter is ONE word, possibly made of several quoted/escaped runs. Reading only its first run
+  // (E in E"OF" or E\OF) would consume the terminator and every real command after it as body text.
+  const OPENER = /^<<-?[ \t]*((?:'[^'\n]*'|"(?:\\[^\n]|[^"\\\n])*"|\\[^\n]|[A-Za-z_0-9])+)(?=[ \t\r\n;&|<>()]|$)/;
   const kept = [];
   let line = '';
   let atWordStart = true;
@@ -3927,7 +3929,7 @@ export function heredocScan(command) {
       inComment = false;
       i += 1;
       if (pending !== null) {                                  // consume the heredoc BODY + its terminator
-        const delim = pending;
+        const { delim, expand } = pending;
         pending = null;
         const bodyLines = [];
         while (i < text.length) {
@@ -3937,7 +3939,7 @@ export function heredocScan(command) {
           if (body.trim() === delim) break;
           bodyLines.push(body);
         }
-        heredocs.push({ head, body: bodyLines.join('\n') });
+        heredocs.push({ head, body: bodyLines.join('\n'), expand });
       }
       continue;
     }
@@ -3950,9 +3952,16 @@ export function heredocScan(command) {
       i = run.end + 1;
       atWordStart = false;
       continue;
-    } else if (!inComment && ch === '<' && text[i + 1] === '<' && pending === null) {
+    } else if (!inComment && ch === '<' && text[i + 1] === '<' && text[i - 1] !== '<' && text[i + 2] !== '<' && pending === null) {
       const m = text.slice(i).match(OPENER);
-      if (m) { pending = m[1] || m[2] || m[3]; line += m[0]; i += m[0].length; atWordStart = false; continue; }
+      if (m) {
+        // Quote removal only: no parameter/command expansion is performed on a heredoc delimiter.
+        // In double quotes, bash removes a backslash only before $, `, ", or another backslash.
+        const delim = m[1].replace(/'([^']*)'|"((?:\\.|[^"\\])*)"|\\(.)/g,
+          (_, single, double, escaped) => single ?? (double === undefined ? escaped : double.replace(/\\([$`"\\])/g, '$1')));
+        pending = { delim, expand: !/['"\\]/.test(m[1]) };
+        line += m[0]; i += m[0].length; atWordStart = false; continue;
+      }
     }
     line += ch;
     atWordStart = /[\s()]/.test(ch);

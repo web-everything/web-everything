@@ -2201,6 +2201,34 @@ describe('guard-bash — the parser fails CLOSED on input it cannot represent (#
     expect(heredocScan("cat <<'EOF'\ndon't\nEOF").unterminated).toBe(false);
   });
 
+  it.each([
+    'EOF', "''", '""', 'E"OF"',
+  ])('heredocScan preserves a here-string with word %s and the next command', (word) => {
+    const command = `cat <<<${word}\nnpm run build`;
+    expect(heredocScan(command).text).toBe(command);
+    expect(heredocScan(command).heredocs).toEqual([]);
+    expect(decide(command, { primaryCwd: true })).toMatch(/PRIMARY/);
+  });
+
+  it.each([
+    ["E'OF'", 'EOF'],
+    ["'E'\"O\"F", 'EOF'],
+    ['EOF""', 'EOF'],
+    ['"E\\q"', 'E\\q'],
+    ['"E\\\"OF"', 'E"OF'],
+    ["'E\"OF'", 'E"OF'],
+    ["'E\\OF'", 'E\\OF'],
+    ["''", ''],
+  ])('heredocScan removes delimiter quoting in %s and preserves the next command', (word, delimiter) => {
+    const head = `cat <<${word}`;
+    const tail = 'npm run build';
+    const command = `${head}\nbody\n${delimiter}\n${tail}`;
+    const result = heredocScan(command);
+    expect(result.text).toBe(`${head}\n${tail}`);
+    expect(result.heredocs).toEqual([{ head, body: 'body', expand: false }]);
+    expect(decide(command, { primaryCwd: true })).toMatch(/PRIMARY/);
+  });
+
   it('canonicalCommand is quote-aware, and peels a subshell CLOSER as well as its opener', () => {
     expect(canonicalCommand('(pnpm --filter web exec vite build)')).toBe('pnpm --filter web exec vite build');
     expect(canonicalCommand('(vite build) \\')).toBe('vite build');
