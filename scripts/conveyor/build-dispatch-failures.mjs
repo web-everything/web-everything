@@ -49,11 +49,16 @@ export const dispatchAttemptKey = (startedAt) => (typeof startedAt === 'string' 
  */
 export function claimAttemptKeys(claims, lead) {
   const n = normNum(lead);
+  // A member claim older than the visible lead claim outlived an EARLIER dispatch (orphan adoption leaves member
+  // claims): its key names that attempt, and would dedupe every later real failure of this lead (PR #5472).
+  const leadAt = (claims ?? []).find((c) => c?.meta?.groupLead == null && normNum(c.meta?.num) === n)?.meta?.claimedAt;
+  const leadMs = typeof leadAt === 'string' ? Date.parse(leadAt) : NaN;
   return (claims ?? []).flatMap((c) => {
     const at = c?.meta?.claimedAt;
     if (typeof at !== 'string' || at === '') return [];
     if (c.meta.groupLead == null) return normNum(c.meta.num) === n ? [`orphan:${at}`] : [];
-    return normNum(c.meta.groupLead) === n ? [`member:${normNum(c.meta.num)}:${at}`] : [];
+    if (normNum(c.meta.groupLead) !== n) return [];
+    return Date.parse(at) < leadMs ? [] : [`member:${normNum(c.meta.num)}:${at}`];
   });
 }
 

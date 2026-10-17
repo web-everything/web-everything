@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { recordBuildFailure, clearBuildFailure, listBuildBackoffs } from '../../../scripts/conveyor/build-dispatch-failures.mjs';
+import { recordBuildFailure, clearBuildFailure, listBuildBackoffs, claimAttemptKeys } from '../../../scripts/conveyor/build-dispatch-failures.mjs';
 import { runBuildDispatchTick, cliHostLoadGate, cliSettleLaunches, cliLaunchConfirmed, createPrepareStatusReader } from '../build-dispatch-daemon.mjs';
 import { listBuildDispatchClaims, acquireBuildDispatchClaim, releaseBuildDispatchClaim } from '../../../scripts/conveyor/build-dispatch-claim.mjs';
 import { adoptOrphanedBuildClaims } from '../../../scripts/conveyor/build-dispatch-orphan-adopt.mjs';
@@ -407,6 +407,22 @@ it('a member claim left by an earlier launch never dedupes a later settled failu
     }
     expect(listBuildBackoffs({ path, now: 0 })[0]).toMatchObject({ num: '3827', attempts: 2 });
   } finally { rmSync(lockRoot, { recursive: true, force: true }); }
+});
+
+it('a member claim older than its lead claim names no attempt, so orphan and fail-group charges of later launches count', () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'bdd-5472-keys-')), 'failures.json');
+  const settings = { baseMs: 1000, maxMs: 5000, maxAttempts: 9 };
+  const claim = (num, at, groupLead) => ({ meta: { num, claimedAt: at, ...(groupLead ? { groupLead } : {}) } });
+  const stale = claim('11', '2026-10-17T00:00:00.000Z', '10');
+  expect(claimAttemptKeys([claim('10', '2026-10-17T01:00:00.000Z'), stale], '10')).toEqual(['orphan:2026-10-17T01:00:00.000Z']);
+  // With no lead claim visible the member keys still tie fail-group and orphan charges of one attempt.
+  expect(claimAttemptKeys([stale], '10')).toEqual(['member:11:2026-10-17T00:00:00.000Z']);
+  // Attempt 1 (lead t0 + member t0), then attempts 2 and 3 with the attempt-1 member claim left behind.
+  for (const [i, leadAt] of ['2026-10-17T00:00:00.000Z', '2026-10-17T01:00:00.000Z', '2026-10-17T02:00:00.000Z'].entries()) {
+    const keys = claimAttemptKeys([claim('10', leadAt), stale], '10');
+    expect(recordBuildFailure({ num: '10', reason: 'build-not-started: orphan-released', attemptKey: keys }, { path, now: 0, settings }))
+      .toMatchObject({ attempts: i + 1 });
+  }
 });
 
 it('a blocking launch failure is charged before its claim release, keyed so orphan adoption cannot charge it again', async () => {

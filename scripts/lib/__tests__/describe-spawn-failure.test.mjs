@@ -101,6 +101,16 @@ describe('redactSpawnText', () => {
       expect(out).not.toContain('opaque');
       if (/^[[{]/.test(text)) expect(() => JSON.parse(out)).not.toThrow();
     }
+    for (const text of ['COOKIE=a=1; s=opaqueC next', `curl -b${q}a=1; s=opaqueD${q} https://h`, 'x-api-key: "opaqueE"',
+      JSON.stringify({ e: 'x-api-key: "opaqueF"', ok: 1 }), 'Authorization: Bearer "opaqueG" x']) {
+      const out = redactSpawnText(text, { env: {} });
+      expect(out).not.toContain('opaque');
+      if (/^[[{]/.test(text)) expect(() => JSON.parse(out)).not.toThrow();
+    }
+    // A header value ending in a space never reads its JSON string's closing quote as an opening one.
+    expect(redactSpawnText('{"e":"Cookie: a ","ok":1}', { env: {} })).toBe('{"e":"Cookie: <redacted>","ok":1}');
+    expect(redactSpawnText('the cookie consent banner', { env: {} })).toBe('the cookie consent banner');
+    expect(redactSpawnText('["gh","auth","login"]', { env: {} })).toBe('["gh","auth","login"]');
     expect(redactSpawnText('git checkout -b lane/x failed', { env: {} })).toBe('git checkout -b lane/x failed');
     expect(redactSpawnText(JSON.stringify({ e: 'x', ok: 1, list: ['a', 'b'] }), { env: {} })).toBe('{"e":"x","ok":1,"list":["a","b"]}');
   });
@@ -111,7 +121,8 @@ describe('redactSpawnText', () => {
   });
   it('stays linear on long adversarial text', () => {
     const started = Date.now();
-    for (const text of ['a.'.repeat(100000), 'a='.repeat(100000), 'a://'.repeat(50000), '"a":'.repeat(50000), '--settings {"'.repeat(20000)]) {
+    for (const text of ['a.'.repeat(100000), 'a='.repeat(100000), 'a://'.repeat(50000), '"a":'.repeat(50000), '--settings {"'.repeat(20000),
+      ' '.repeat(300000), ' -b'.repeat(100000), 'cookie '.repeat(45000), 'Cookie: ="'.repeat(30000), 'Cookie: =\\\\"'.repeat(30000)]) {
       redactSpawnText(text, { env: {} });
     }
     expect(Date.now() - started).toBeLessThan(2000);

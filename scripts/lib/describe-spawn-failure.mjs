@@ -133,8 +133,12 @@ function jsonValueEnd(text, at, m) {
 const HEADER_NAME = String.raw`(?:proxy-)?authorization|(?:set-)?cookie|x-[a-z0-9-]{0,64}(?:token|key|secret|auth)[a-z0-9-]{0,64}`;
 // A quoted cookie value is bounded (256), so a long line of unclosed quotes is rescanned a bounded amount, never
 // quadratically. The escaped form closes at the same backslash depth it opened with.
-const HEADER_VALUE = String.raw`(?:="[^"\r\n]{0,256}"|=(?<hb>\\+)"(?:(?!\k<hb>")[^\r\n]){0,256}\k<hb>"|\\\\|\\[^nr"'\\]|'\\''|\r?\n[ \t]+|(?:\\r)?\\n[ \t]+|[^\r\n"'\\])*`;
-const COOKIE_LIST = String.raw`(?:'[^']{0,4096}'|"(?:[^"\\]|\\.){0,4096}"|[^\s"'\\]){1,4096}`;
+// A quote right after `=`, `:` or a space opens a quoted part (`a="1"`, `x-api-key: "…"`, `Bearer "…"`). A raw
+// one holds no `,{}` and closes before `;`, a space or the end — so `{"e":"Cookie: a ","ok":1}`'s closing quote
+// is never read as an opening one.
+const HEADER_VALUE = String.raw`(?:(?<=[=:\s])"[^"\r\n,{}]{0,256}"(?=[;\s]|$)|(?<=[=:\s])(?<hb>\\+)"(?:(?!\k<hb>")[^\r\n]){0,256}\k<hb>"|\\\\|\\[^nr"'\\]|'\\''|\r?\n[ \t]+|(?:\\r)?\\n[ \t]+|[^\r\n"'\\])*`;
+// One cookie list: quoted or bare parts, carried across `; ` when another `name=` follows (an env dump's form).
+const COOKIE_LIST = String.raw`(?:'[^']{0,4096}'|"(?:[^"\\]|\\.){0,4096}"|;[ \t]+(?=[A-Za-z0-9_.%-]{1,64}=)|[^\s"'\\]){1,4096}`;
 
 const TOKEN_SHAPES = [
   [/\b(?:gh[posru]_|github_pat_)[A-Za-z0-9_]{8,}/g, '<redacted-token>'],
@@ -156,13 +160,17 @@ const NAMED_VALUES = [
   [new RegExp(String.raw`\b(${HEADER_NAME})[ \t]*:${HEADER_VALUE}`, 'gi'), '$1: <redacted>'],
   [new RegExp(String.raw`\b(${HEADER_NAME})%3A[^\s&"'<>]{0,4096}`, 'gi'), '$1%3A<redacted>'],
   // `["Cookie","a=1; s=…"]`, `["--token","…"]` — a header list or argv array: the string after a credential name.
-  // Only an ARRAY element that is a bare name: an object value (after `:`) or a key (before `:`) never matches.
-  namedValueRule(/(?<=[[,]\s{0,8})(?<bs>\\*)"(?<name>[A-Za-z0-9_.-]{1,128})\k<bs>"\s*,\s*(?=\k<bs>")/g, jsonValueEnd,
-    (m) => `${m[0]}${m.groups.bs}"<redacted-env>${m.groups.bs}"`),
-  // `--cookie a=1;s=…`, `COOKIE=a=1;s=…`, curl's `-b 'a=1; s=…'`: a cookie list is one value, `;` included.
-  [new RegExp(String.raw`(?<![A-Za-z0-9_.-])(-{0,2}[A-Za-z0-9_.-]{0,64}cookie[A-Za-z0-9_.-]{0,64})(\s*=\s*|[ \t]+)${COOKIE_LIST}`, 'gi'),
-    '$1$2<redacted>'],
-  [new RegExp(String.raw`(?<=\bcurl\b[^\r\n]{0,512}?\s)-b([ \t]+)${COOKIE_LIST}`, 'g'), '-b$1<redacted>'],
+  // Only an ARRAY element that is a flag or a header name: an object value (after `:`), a key (before `:`) or a
+  // subcommand word (`["gh","auth","login"]`) never matches.
+  namedValueRule(new RegExp(String.raw`(?<=[[,]\s{0,8})(?<bs>\\*)"(?<name>-{1,2}[A-Za-z0-9_.-]{1,128}|${HEADER_NAME})\k<bs>"\s*,\s*(?=\k<bs>")`, 'gi'),
+    jsonValueEnd, (m) => `${m[0]}${m.groups.bs}"<redacted-env>${m.groups.bs}"`),
+  // `COOKIE=a=1; s=…`, `--cookie a=1;s=…`, curl's `-b 'a=1; s=…'` / `-b'…'`: a cookie list is one value, `;` included.
+  // A space-separated value only follows a FLAG, so prose (`cookie consent`) is left alone.
+  [new RegExp(String.raw`(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]{0,64}cookie[A-Za-z0-9_.-]{0,64})(\s*=\s*)${COOKIE_LIST}`, 'gi'), '$1$2<redacted>'],
+  [new RegExp(String.raw`(?<![A-Za-z0-9_.-])(-{1,2}[A-Za-z0-9_.-]{0,64}cookie[A-Za-z0-9_.-]{0,64})([ \t]+)${COOKIE_LIST}`, 'gi'), '$1$2<redacted>'],
+  // `-b` is matched FIRST and the bounded `curl` lookbehind checked only there; text with no `curl` skips the rule.
+  ((re) => (text) => (/\bcurl\b/.test(text) ? text.replace(re, '-b$1<redacted>') : text))(
+    new RegExp(String.raw`(?<=\s)-b(?<=\bcurl\b[^\r\n]{0,256}?\s-b)([ \t]*)(?=\S)${COOKIE_LIST}`, 'g')),
   [/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, 'Bearer <redacted>'],
   // `GH_TOKEN=…`, `export X_API_KEY=…`, `password: …`, `--token=…`.
   namedValueRule(new RegExp(String.raw`${IDENT}\s*[:=]\s*`, 'g'), stickyEnd(SHELL_VALUE), (m) => `${m[0]}<redacted>`),
