@@ -58,7 +58,8 @@ The drain owes a live-head red team only after a speculative or sequential pass 
 (recorded queued/running status or seat evidence). The review job records the pass as queued as
 soon as the loop returns an owed accept, before the added seats. Before that status exists, the
 persisted accepting review run for the live head holds (the loop labels the accept first), while
-the red team is enabled; the job's later status supersedes it. Labels alone never schedule one.
+the red team is enabled; the job's later status supersedes it, but a finished status older than
+that run (an earlier review of the same head) does not. Labels alone never schedule one.
 Card-only net diffs (including rename/copy sources) never owe a pass. A queued or running status
 is live only while its writer's pid is. A crashed scheduled pass, or an accepting run no job
 picked up, retains the 45-minute never-scheduled recovery path; live passes and recorded breaks

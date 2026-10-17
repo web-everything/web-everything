@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
@@ -40,6 +40,20 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     writeRun({ ...run, verdict: { verdict: 'changes' } }, f.runsDir);
     expect(readDrainRedTeamEvidence(f).scheduled).toBe(false);
     writeRun(run, f.runsDir);
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'skipped' }, f);
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toBeNull();
+  });
+  it('an earlier finished status on the same head never supersedes a newer accepting run', () => {
+    const f = fixture();
+    // Review 1 of this head did not accept; a re-review of the unchanged head accepts before its job writes a status.
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'not-owed' }, f);
+    const statusFile = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
+    utimesSync(statusFile, new Date(1_000_000), new Date(1_000_000));
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toBeNull();
+    writeRun({ ...newRunRecord({ id: 'review-pr-2', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), ...payload(f.head) }, f.runsDir);
+    expect(readDrainRedTeamEvidence(f)).toMatchObject({ scheduled: true, inFlight: false });
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toMatch(/no recorded result/);
+    // The re-review's own later status supersedes the run again.
     recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'skipped' }, f);
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toBeNull();
   });
