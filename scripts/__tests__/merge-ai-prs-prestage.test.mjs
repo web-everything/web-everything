@@ -1,0 +1,98 @@
+import { describe, it, expect } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
+
+const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
+const sha = 'a'.repeat(40);
+const fakeGh = `#!/usr/bin/env node
+const fs = require('node:fs');
+const a = process.argv.slice(2), pr = JSON.parse(fs.readFileSync(process.env.PRESTAGE_PR, 'utf8'));
+fs.appendFileSync(process.env.PRESTAGE_LOG, JSON.stringify(a) + '\\n');
+const out = x => { if (a.includes('-i')) process.stdout.write('HTTP/2 200 OK\\n\\n'); process.stdout.write(typeof x === 'string' ? x : JSON.stringify(x)); process.exit(0); };
+const page = ${openPrPageFixture};
+if (a[0] === 'repo') out('main');
+if (a[0] === 'pr' && a[1] === 'list') out([pr]);
+if (a[0] === 'pr' && a[1] === 'view') out(pr);
+if (a[0] === 'api') {
+  if (a[1] === 'user') out('chalbert');
+  const path = a.find(x => x.startsWith('repos/')) || '';
+  if (path.includes('/rules/branches/')) out(a.includes('--slurp') ? [[{type:'required_status_checks',parameters:{required_status_checks:[{context:'test'}]}}]] : [{type:'required_status_checks',parameters:{required_status_checks:[{context:'test'}]}}]);
+  if (path.endsWith('/branches/main')) out({ protected:false });
+  if (path.includes('/comments')) out([pr.comments]);
+  if (path.includes('/reviews')) out([[]]);
+  if (path.includes('/files')) out([[{filename:'README.md',status:'modified'}]]);
+  if (a[1] === 'graphql') {
+    const q = a.find(x => x.startsWith('query=')) || '';
+    if (q.includes('enqueuePullRequest')) { fs.writeFileSync(process.env.PRESTAGE_PR+'.queued',''); out({ data: { enqueuePullRequest: { mergeQueueEntry: { id:'E',position:1,state:'QUEUED' } } } }); }
+    if (q.includes('isInMergeQueue')) out({ data: { repository: { pullRequest: { headRefOid:pr.headRefOid, isInMergeQueue:fs.existsSync(process.env.PRESTAGE_PR+'.queued') } } } });
+    if (q.includes('mergeQueue(')) out({ data: { repository: { mergeQueue: { entries: { nodes:[],pageInfo:{hasNextPage:false} } } } } });
+    out(page([pr], q));
+  }
+}
+out([]);
+`;
+const fakeGit = `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:fixture/prestage.git\\n');
+else if (a[0] === 'merge-base' || a[0] === 'rev-parse') process.stdout.write('${sha}\\n');
+else if (a[0] === 'diff') {
+  if (a.includes('--name-only')) process.stdout.write('README.md\\0');
+  else if (a.includes('--numstat')) process.stdout.write('1\\t0\\tREADME.md\\n');
+  else process.stdout.write('diff --git a/README.md b/README.md\\n--- a/README.md\\n+++ b/README.md\\n@@ -1 +1 @@\\n-old\\n+new\\n');
+} else if (a[0] === 'show') process.exit(1);
+`;
+
+function world(fn) {
+  const dir = mkdtempSync(join(tmpdir(), 'prestage-cli-'));
+  try {
+    const bin = join(dir, 'bin'); mkdirSync(bin);
+    mkdirSync(join(dir, 'backlog'));
+    for (const [name, body] of [['gh', fakeGh], ['git', fakeGit]]) writeFileSync(join(bin, name), body, { mode: 0o755 });
+    const fixture = join(dir, 'pr.json'), log = join(dir, 'calls.jsonl'), settings = join(dir, 'settings.json'), coord = join(dir, 'coord');
+    writeFileSync(settings, JSON.stringify({ mergeDelivery: { strategy: 'github-merge-queue' } }));
+    const pr = { number: 42, id: 'PR_NODE', title: 'Update readme', body: 'Update the readme.', state: 'OPEN', isDraft: false,
+      headRefOid: sha, headRefName: 'lane/readme', baseRefName: 'main', mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED',
+      labels: [{name:'review:accepted'},{name:'ready-to-merge'}], files: [{path:'README.md',changeType:'MODIFIED'}],
+      commits: [{oid:sha,messageHeadline:'Update readme',authors:[{name:'Claude',email:'noreply@anthropic.com'}]}],
+      statusCheckRollup: [{name:'test',status:'IN_PROGRESS',conclusion:null,head_sha:sha}],
+      comments: [{author:{login:'chalbert'},body:'<!-- reviewed-sha: '+sha+' -->',createdAt:new Date().toISOString()}], reviews: [] };
+    const run = (green = false) => {
+      writeFileSync(fixture, JSON.stringify(pr)); writeFileSync(log, '');
+      const r = spawnSync(process.execPath, [script, '--this-repo','--label=ready-to-merge','--only=42', '--json',
+        '--no-drain-lease','--no-red-main-freeze','--no-rebase-drop','--no-heal-collision','--no-overlap-yield',
+        ...(green ? ['--from-green-event'] : [])], { cwd:dir,encoding:'utf8',timeout:30_000,
+        env: { ...process.env, PATH:bin+':'+process.env.PATH, PRESTAGE_PR:fixture,PRESTAGE_LOG:log,
+          WE_COORDINATION_ROOT:coord, LANE_POOL_ROOT:dir, WE_MERGE_DELIVERY_SETTINGS_FILE:settings,
+          WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE:'off',WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE:'off',
+          WE_DRAIN_WORKFLOW_EDIT_HUMAN:'off',WE_REVIEW_LEDGER_MODE:'off',WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES:'0' } });
+      expect(r.status, r.stderr + r.stdout).toBe(0);
+      return { report:JSON.parse(r.stdout), calls:readFileSync(log,'utf8').trim().split('\n').filter(Boolean).map(JSON.parse), stderr:r.stderr };
+    };
+    fn({pr,run,coord});
+  } finally { rmSync(dir,{recursive:true,force:true}); }
+}
+
+describe('real drain pre-stage path', () => {
+  it('prepares while pending, then a green event enqueues without listing or gate reads', () => world(({pr,run,coord}) => {
+    const first = run();
+    expect(first.stderr).toContain('prepared while CI pending (eligible=true)');
+    expect(first.report.enqueueOutcomes ?? []).toHaveLength(0);
+    expect(readdirSync(join(coord,'drain-prestage'))).toHaveLength(1);
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    const next = run(true);
+    expect(next.report, next.stderr).toMatchObject({prestaged:true,enqueueOutcomes:[{num:42,outcome:'enqueued'}]});
+    expect(next.calls.some(a => a[0] === 'pr' && a[1] === 'list' || a.some(x => x.includes('pullRequests(')))).toBe(false);
+    expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(true);
+  }));
+  it('a moved head falls back to a full listing', () => world(({pr,run}) => {
+    expect(run().stderr).toContain('eligible=true');
+    pr.headRefOid = 'b'.repeat(40);
+    const next = run(true);
+    expect(next.stderr).toContain('full fast drain');
+    expect(next.calls.some(a => a[0] === 'pr' && a[1] === 'list' || a.some(x => x.includes('pullRequests(')))).toBe(true);
+  }));
+});

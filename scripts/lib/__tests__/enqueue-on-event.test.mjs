@@ -209,7 +209,7 @@ describe('createEnqueueOnEvent', () => {
     advance(15_000);
     await handle.tick();
     expect(calls).toEqual([{
-      command: process.execPath, args: fastDrainArgs({ scriptRoot: '/code', num: 42 }),
+      command: process.execPath, args: [...fastDrainArgs({ scriptRoot: '/code', num: 42 }), '--from-green-event'],
       options: { cwd: '/clone', env: {}, stdio: ['ignore', 'pipe', 'pipe'] },
     }]);
     expect(handle.pending()).toEqual([]);
@@ -1544,5 +1544,33 @@ describe('child pass timings', () => {
     child.emit(event, event === 'close' ? 0 : new Error('fake child error'));
     await tick;
     expect(lines.find((line) => line.includes('fast drain exit'))).toContain(` · phases: ${phases}`);
+  });
+});
+
+
+describe('pre-staged green events', () => {
+  it('runs immediately before catch-up listing, even with optional checks pending', async () => {
+    const readCandidates = vi.fn();
+    const prestageCache = { get: () => ({ eligible: true }), drop: vi.fn() };
+    const { handle, calls } = setup({ prestageCache, readCandidates,
+      readPr: async () => ({ ...READY_PR, labels: [{ name: 'review:accepted' }],
+        statusCheckRollup: [{ name: 'optional', status: 'IN_PROGRESS' }] }),
+      resolveSetting: () => ({ enabled: true, debounceSeconds: 15, catchUp: { enabled: true, intervalMinutes: 10 } }),
+    });
+    handle.notePoll({ ok: true, marked: [mark()] });
+    await handle.tick();
+    expect(readCandidates).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].args).toContain('--from-green-event');
+  });
+  it('red drops preparation and withdraws a pending green wake', async () => {
+    const prestageCache = { get: () => ({ eligible: true }), drop: vi.fn() };
+    const { handle, calls } = setup({ prestageCache });
+    handle.notePoll({ ok: true, marked: [mark()] });
+    handle.notePoll({ ok: true, marked: [mark(42, 'check_run.completed=failure@13')] });
+    await handle.tick();
+    expect(prestageCache.drop).toHaveBeenCalledWith(REPO, 42);
+    expect(calls).toHaveLength(0);
+    expect(handle.pending()).toHaveLength(0);
   });
 });

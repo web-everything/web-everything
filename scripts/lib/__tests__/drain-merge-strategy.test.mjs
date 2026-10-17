@@ -781,3 +781,25 @@ describe('queue safeguard overrides and untracked queue entries', () => {
     expect(h.calls.some(c => c.some(a => String(a).includes('dequeuePullRequest')))).toBe(false);
   });
 });
+
+
+describe('drain pre-stage queue admission', () => {
+  it('reads red-team disposition while pending without queue or state writes, then reuses it', () => {
+    const { s, calls, state } = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'checking'], evidence: { loopPayload: null } });
+    const c = { num: 42, repo: null, headRef: 'lane/a' };
+    const prepared = s.prestage(c, HEAD);
+    expect(prepared.allowed).toBe(true);
+    expect(state()).toBeNull();
+    expect(calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+    calls.length = 0;
+    expect(s.enqueue(c, HEAD, { prepared, comments: prepared.comments })).toMatchObject({ enqueued: true });
+    // The post-enqueue clearance stamp retains its fresh dedupe read. Red-team admission is cached.
+    expect(calls.filter(call => call.includes('--slurp'))).toHaveLength(1);
+    expect(calls.some(call => call[0] === 'git')).toBe(false);
+  });
+  it('keeps held red-team dispositions ineligible', () => {
+    const { s } = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'checking'],
+      evidence: { loopPayload: { verdict: { verdict: 'accept' } }, inFlight: true } });
+    expect(s.prestage({ num: 42, repo: null }, HEAD).allowed).toBe(false);
+  });
+});

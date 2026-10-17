@@ -1533,3 +1533,14 @@ reads the existing runs folder without migration or writes; `OPERATION_RUNS_DIR`
 it. `--since=<iso>` selects runs by earliest seat start. Incomplete runs are shown but
 excluded from median, nearest-rank p90 and the >5-minute early-change share denominator.
 Legacy runs without seat observations are omitted; absent times are never reconstructed.
+
+## Drain CI pre-stage
+
+The drain caches non-CI gate dispositions for accepted pending heads in coordination storage,
+bound to repo, PR and head. Green check events may consume this preparation before listing;
+head, label, body/base changes and TTL expiry require the full fast drain. Every required
+context needs its own successful row before enqueue; missing, pending, cancelled and red
+contexts never authorize enqueue. Coupled candidates and branches requiring preparation
+keep the full cascade. Keep pre-stage tests separate from ordinary classification tests:
+preparation may evaluate the remaining gates while CI is pending, but must leave the real
+merge cascade before any enqueue. Regression home: `scripts/lib/__tests__/drain-prestage.test.mjs`.

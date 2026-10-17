@@ -265,7 +265,7 @@ export function readPinnedChangedFiles({ headSha, base = 'main', cwd, exec = exe
  * refusal and the queue entry therefore always describe the same commit.
  * @param {{repo:string, num:number, headSha:string, cwd:string, exec?:Function}} o  `cwd`: a clone of `repo`.
  */
-export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync }) {
+export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync, preparedSurface = null }) {
   if (!/^[\w.-]+\/[\w.-]+$/.test(String(repo)) || !Number.isInteger(Number(num))) {
     return { ok: false, held: true, humanOnly: false, retryable: true, reason: 'unreadable', paths: [], error: 'changed files unreadable (repo or PR number is malformed)' };
   }
@@ -278,7 +278,8 @@ export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync }) {
   if (pr?.headRefOid !== headSha) {
     return { ok: false, held: true, humanOnly: false, retryable: true, reason: 'head-moved', paths: [], error: `PR head is ${String(pr?.headRefOid).slice(0, 9)}, not the judged ${String(headSha).slice(0, 9)} — re-judge the new head before enqueueing` };
   }
-  const read = readPinnedChangedFiles({ headSha, base: pr?.baseRefName || 'main', cwd, exec });
+  const read = preparedSurface?.headSha === headSha && Array.isArray(preparedSurface.files) && preparedSurface.files.every(p => typeof p === 'string')
+    ? { files: preparedSurface.files } : readPinnedChangedFiles({ headSha, base: pr?.baseRefName || 'main', cwd, exec });
   const hold = workflowEditHold({ files: read.files, expectedCount: read.files?.length });
   if (hold.hold) return { ok: false, held: true, humanOnly: hold.humanOnly, retryable: hold.retryable === true, reason: hold.reason, paths: hold.paths, error: read.error ? `${hold.error}: ${read.error}` : hold.error };
   const queueState = () => readMergeQueueState({ repo, pr: num, readJson: args => JSON.parse(exec('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}') });
