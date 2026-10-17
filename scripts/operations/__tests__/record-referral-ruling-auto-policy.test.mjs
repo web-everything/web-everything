@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, mandatoryReferralState, normalizeFinding,
   referralFindingKey, renderReferralRecord, REFERRAL_CARRY_REASON } from '../../lib/jury-core.mjs';
-import { recordReferralRulingOperation } from '../record-referral-ruling.mjs';
+import { OPEN_FINDING_STATES, planRulingFollowUp, recordReferralRulingOperation } from '../record-referral-ruling.mjs';
 import { createRecordReferralRulingReader, createRecordReferralRulingSinks } from '../record-referral-ruling-io.mjs';
 import { advanceWhileRunning, startRun } from '../engine.mjs';
 import { applyPendingEffects } from '../effect-executor.mjs';
@@ -29,16 +29,16 @@ function ruling(rec, result = 'not-real', extra = {}) {
     actor: 'chalbert', channel: 'chat', reason: 'Operator decision', at: now, clearerId: 'operator-session',
     rulings: [{ runId: rec.runId, key: rec.referrals[0].key, result, ...(result === 'card' ? { card } : {}) }], ...extra }));
 }
-function harness(initial, { changedLines, compare = { status: 'identical', files: [] }, fileExists = true } = {}) {
-  const comments = [...initial], trace = [], warnings = [];
+function harness(initial, { changedLines, compare = { status: 'identical', files: [] }, fileExists = true, env = {} } = {}) {
+  const comments = [...initial], trace = [], warnings = [], logs = [];
   let liveHead = head;
   const readJson = (args) => args[0] === 'pr' ? { headRefOid: liveHead, body, comments }
     : args[1].includes('/compare/') ? (compare instanceof Error ? (() => { throw compare; })() : compare) : { type: fileExists ? 'file' : 'dir' };
   const reader = createRecordReferralRulingReader({ readJson, changedLines, assertFresh: () => {},
-    readable: () => true, log: () => {}, now: () => now, env: { CLAUDE_SESSION_ID: 'auto-session' } });
+    readable: () => true, log: (m) => logs.push(m), now: () => now, env: { CLAUDE_SESSION_ID: 'auto-session', ...env } });
   const operation = recordReferralRulingOperation({ readRulingContext: reader });
   const inputFor = (extra) => ({ repo, pr, finding: 'all-open', actor: 'auto-policy', ruling: 'block', channel: 'policy', reason: 'Policy', ...extra });
-  const sinks = createRecordReferralRulingSinks({ readJson, changedLines, readable: () => true,
+  const sinks = createRecordReferralRulingSinks({ readJson, changedLines, readable: () => true, env,
     appendEvents: async (events) => trace.push(['ledger', events]),
     post: (_repo, _pr, text) => { trace.push(['post', text]); comments.push(comment(text)); },
     warn: (text) => warnings.push(text), readPr: () => ({ headRefOid: liveHead, labels: [] }),
@@ -60,7 +60,7 @@ function harness(initial, { changedLines, compare = { status: 'identical', files
     const store = createMemoryRunStore(); store.write(run);
     return applyPendingEffects(run, { sinks, store });
   };
-  return { comments, trace, warnings, plan, execute, enginePlan, engineExecute, moveHead: () => { liveHead = oldHead; } };
+  return { comments, trace, warnings, logs, plan, execute, enginePlan, engineExecute, moveHead: () => { liveHead = oldHead; } };
 }
 const thread = (...records) => records.map((r) => comment(renderReferralRecord(r)));
 
@@ -211,6 +211,27 @@ describe('automatic policy respects authenticated operator decisions', () => {
     ruled.referrals[0].recheck = target.referrals[0].recheck;
     expect(harness(thread(ruled)).plan().verdict.record.rulings).toHaveLength(1);
   });
+  it('autoPolicyRespectsNotReal=false restores the old auto-block over a reviewer not-real, through reader and sinks', async () => {
+    const source = record({ h: oldHead, reviewerResult: 'not-real' }), target = record({ runId: 'review-pr-copy' });
+    const off = harness(thread(source, target), { env: { WE_REVIEW_AUTO_POLICY_RESPECTS_NOT_REAL: 'false' } });
+    const planned = off.plan();
+    expect(planned.verdict.record.rulings).toEqual([{ runId: target.runId, key: target.referrals[0].key, result: 'block' }]);
+    expect(off.logs).toContainEqual(expect.stringMatching(/^review\.autoPolicyRespectsNotReal=false \(source: [^)]*env/));
+    await off.execute(planned); // The writer's fresh read must honour the same switch, or the snapshot check refuses.
+    expect(off.trace.map(([kind]) => kind)).toContain('post');
+    expect(harness(thread(source, target)).plan().effects).toEqual([]);
+  });
+  it('an operator ruling on another finding re-arms while an interrupted re-check still waits', () => {
+    const recheck = record(), other = record({ runId: 'review-pr-other', summary: 'unrelated claim' });
+    recheck.referrals[0].recheck = { status: 'needs re-check on live head', fromHead: oldHead, head };
+    const h = harness(thread(recheck, other));
+    for (const ruling of ['not-real', 'block']) {
+      const planned = h.plan({ actor: 'chalbert', ruling, finding: other.referrals[0].key });
+      expect(planned.verdict.open.find((o) => o.runId === recheck.runId).state).toBe('needs-recheck');
+      expect(planned.verdict.followUp).toMatchObject({ action: 'rearm',
+        remaining: [{ seat: recheck.referrals[0].seat, file: 'scripts/x.mjs', line: 20, summary: 'protected list misses edits' }] });
+    }
+  });
   it('a late reviewer not-real stops the writer before any mutation', async () => {
     const target = record(), h = harness(thread(target));
     const planned = h.plan();
@@ -282,5 +303,17 @@ describe('automatic policy respects authenticated operator decisions', () => {
     const moved = harness(thread(target)), planned = moved.plan(); moved.moveHead();
     await expect(moved.execute(planned)).rejects.toThrow(/head moved/);
     expect(moved.trace).toEqual([]);
+  });
+});
+
+describe('the ruling follow-up handles every open-finding state', () => {
+  // A new state without a row here fails the lookup, so the follow-up cannot silently skip it.
+  const expected = { pending: 'rearm', 'needs-recheck': 'rearm', blocked: 'send-back' };
+  it.each(Object.values(OPEN_FINDING_STATES))('an unselected %s finding decides the follow-up', (state) => {
+    const ruled = { state: 'pending', runId: 'r', key: 'a', seat: 's', file: 'f', line: 1, summary: 'ruled' };
+    const other = { state, runId: 'r', key: 'b', seat: 's', file: 'g', line: 2, summary: 'other', rationale: 'held' };
+    expect(Object.keys(expected)).toContain(state);
+    expect(planRulingFollowUp({ open: [ruled, other], selected: [ruled], ruling: 'not-real', reason: 'x', enabled: true, head }))
+      .toMatchObject({ action: expected[state] });
   });
 });

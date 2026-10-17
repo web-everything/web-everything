@@ -62,6 +62,14 @@ export const OPERATOR_RULING_FOLLOW_UP_EFFECT = 'github.operator-referral-ruling
 /** Mirrors the derived label of PR #3889's ruling-needed sweep. */
 export const RULING_NEEDED_LABEL = 'advisory:ruling-needed';
 
+/** Every `state` an open finding can carry. A new state goes here and into exactly one predicate below. */
+export const OPEN_FINDING_STATES = Object.freeze({ PENDING: 'pending', NEEDS_RECHECK: 'needs-recheck', BLOCKED: 'blocked' });
+const AWAITING_STATES = new Set([OPEN_FINDING_STATES.PENDING, OPEN_FINDING_STATES.NEEDS_RECHECK]);
+/** Still waiting on an answer (operator ruling or reviewer re-check), so a ruling elsewhere must re-arm. PURE. */
+export const isAwaitingRuling = (o) => AWAITING_STATES.has(o?.state);
+/** Held by a standing `block`. PURE. */
+export const isBlockedFinding = (o) => o?.state === OPEN_FINDING_STATES.BLOCKED;
+
 /**
  * The findings still open on `head`: every active referral of a current-head record that the gate leaves
  * pending or blocked. Numbered from 1 in thread order. PURE.
@@ -97,7 +105,8 @@ export function openReferralFindings({ comments, repo, pr, head, body = '', crea
         const effective = s.rulings.filter((r) => r.key === f.key).at(-1);
         open.push({ index: open.length + 1, runId: record.runId, key: f.key, seat: f.seat,
           file: f.finding?.file ?? '', line: Number.isInteger(f.finding?.line) ? f.finding.line : null,
-          summary: f.finding?.summary ?? '', state: blocked ? 'blocked' : f.recheck ? 'needs-recheck' : 'pending',
+          summary: f.finding?.summary ?? '',
+          state: blocked ? OPEN_FINDING_STATES.BLOCKED : f.recheck ? OPEN_FINDING_STATES.NEEDS_RECHECK : OPEN_FINDING_STATES.PENDING,
           rationale: blocked ? (effective?.rationale ?? effective?.reason ?? '') : '' });
       }
     }
@@ -269,9 +278,10 @@ export function planRulingFollowUp({ open, selected, ruling, reason, enabled, he
   // Findings still waiting on a ruling after this one. The ruling comment itself wakes the paused review (the hold
   // reads it as a wake), so the review re-runs on this head and posts a fresh advisory; it just cannot clear the
   // label or send anything back yet. Say so, with the exact remaining set, instead of returning nothing.
-  const remaining = open.filter((o) => o.state === 'pending' && !isSelected(o));
+  // A reviewer-owned re-check counts too: it has no answer yet, so the PR is not settled.
+  const remaining = open.filter((o) => isAwaitingRuling(o) && !isSelected(o));
   if (remaining.length) return { action: 'rearm', remaining: remaining.map((o) => ({ seat: o.seat, file: o.file, line: o.line, summary: o.summary })) };
-  const blocked = open.filter((o) => isSelected(o) ? ruling === 'block' : o.state === 'blocked')
+  const blocked = open.filter((o) => isSelected(o) ? ruling === 'block' : isBlockedFinding(o))
     .map((o) => ({ seat: o.seat, file: o.file, line: o.line, summary: o.summary,
       rationale: isSelected(o) ? reason : o.rationale }));
   if (!blocked.length) return { action: 'resume' };
