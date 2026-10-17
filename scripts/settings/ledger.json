@@ -1,0 +1,4 @@
+{
+  "$comment": "ledger.firstSeenRows and ledger.headMoveInvalidation default true. Open-head observations use the existing ledger writer and lock; each effective value and source is logged. Acceptance labels alone never grant an imported clearance. Set false to disable the respective observation writer; readers still reject stale acceptance evidence.",
+  "ledger": { "firstSeenRows": true, "headMoveInvalidation": true }
+}

@@ -1,3 +1,4 @@
+import { observeLedgerHead } from '../lib/ledger-observation.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
@@ -1426,8 +1427,9 @@ export function createReviewPrSinks({
       // builder refuses, so say so as a refusal rather than recording a guessed disposition.
       const verdict = verdictForLabelTarget(payload.to);
       if (!verdict) throw notApplied(`verdict-ledger: unknown label target ${JSON.stringify(payload.to)}`);
+      observeLedgerHead({ repo: payload.repo, pr, headSha: payload.headSha });
       const folded = foldRepo(payload.repo).get(pr);
-      if (folded && folded.current && folded.current.verdict === verdict) {
+      if (folded && folded.current && folded.current.verdict === verdict && folded.current.coverage?.headSha === (payload.headSha ?? null)) {
         return {
           reconciled: true,
           path: verdictLedgerPath(payload.repo),
@@ -1446,6 +1448,7 @@ export function createReviewPrSinks({
         session: currentActorId(),
         channel: payload.channel || '',
         source: 'operation-reconcile',
+        headSha: payload.headSha,
         findingCount: Array.isArray(payload.findings) ? payload.findings.length : null,
       }));
       if (!appended.ok) throw notApplied(`verdict-ledger append refused: ${appended.errors.join('; ')}`);

@@ -1,3 +1,4 @@
+import { observeLedgerHead } from './lib/ledger-observation.mjs';
 import { mandatoryReferralState, readReferralRecords, referralRecordState } from './lib/jury-core.mjs';
 import { referralSeatDisabled } from './operations/review-seat-policy.mjs';
 import { readReviewRunEvidence } from './conveyor/review-referral-hold.mjs';
@@ -1249,6 +1250,7 @@ export function runReviewLabelCli({
   let referralCarry = null;
   try {
     const parsed = provider.readPrState(repo, pr);
+    observeLedgerHead({ repo, pr: Number(pr), headSha: parsed.headRefOid, state: parsed.state, labels: parsed.labels });
     if (['accepted', 'restamp', 'clear-human'].includes(to)) {
       referralCarry = assertMandatoryReferralsCleared(parsed, { repo, pr, ...referralOptions })?.carry ?? null;
     }

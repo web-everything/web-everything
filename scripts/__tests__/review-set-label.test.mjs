@@ -3762,7 +3762,7 @@ fs.writeFileSync('state.json', JSON.stringify(s));
     });
     const final = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8'));
     const ledger = existsSync(join(dir, 'ledger')) ? readdirSync(join(dir, 'ledger')).flatMap(f =>
-      readFileSync(join(dir, 'ledger', f), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse)) : [];
+      readFileSync(join(dir, 'ledger', f), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse)).filter(row => row.source !== 'first-seen') : [];
     const calls = existsSync(join(dir, 'calls.jsonl')) ? readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) : [];
     return { r, original, final, ledger, calls, added: final.comments.slice(comments.length + (race === 'acceptance' && final.reads >= 2 ? 1 : 0)) };
   }
@@ -3899,8 +3899,10 @@ fs.writeFileSync('state.json', JSON.stringify(s));
     expect(result.wrote, JSON.stringify(result.calls)).toBe(false);
     expect(result.final.labels).toEqual([{ name: 'review:pending' }]);
     expect(result.final.comments).toEqual([]);
-    // Nothing durable at all: not even the shadow ledger row.
-    expect(existsSync(join(dir, 'ledger'))).toBe(false);
+    // First sight records a baseline, but the refused approval writes no judgment or clearance.
+    const observed = existsSync(join(dir, 'ledger')) ? readdirSync(join(dir, 'ledger')).flatMap(f => readFileSync(join(dir, 'ledger', f), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse)) : [];
+    expect(observed).toHaveLength(result.calls.some(a => a[0] === 'pr' && a[1] === 'view') ? 1 : 0);
+    for (const row of observed) expect(row).toMatchObject({ source: 'first-seen', clears: false });
   };
 
   it('accepts exactly the compared head and net diff, stamping that head', () => {
@@ -4004,7 +4006,7 @@ describe('#5649 — approval rows at the label home', () => {
   }
   const CLEAR = ['77', '--repo=o/n', '--to=clear-human', '--actor=op', '--reason=operator said clear it'];
   const rows = () => readdirSync(ledgerDir).filter((f) => f.endsWith('.jsonl')).flatMap((f) =>
-    readFileSync(join(ledgerDir, f), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse));
+    readFileSync(join(ledgerDir, f), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse)).filter(row => row.source !== 'first-seen');
   const sink = () => { const seen = []; return { seen, fn: (row) => { seen.push(row); return appendVerdict(row); } }; };
 
   it('clear-human appends an approval row after the verdict row', () => {

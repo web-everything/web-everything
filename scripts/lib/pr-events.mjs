@@ -25,6 +25,7 @@
  *
  * CLI (operator check after setup):  node scripts/lib/pr-events.mjs poll [--cursor=N]
  */
+import { observeLedgerPrEvent } from './ledger-observation.mjs';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -169,7 +170,7 @@ export function createEventWaker(o) {
     healthyIntervalMs = PR_EVENTS_DEFAULTS.healthyIntervalMs, pollEveryMs = PR_EVENTS_DEFAULTS.pollEveryMs,
     staleAfterMs = PR_EVENTS_DEFAULTS.staleAfterMs, minWakeGapMs = PR_EVENTS_DEFAULTS.minWakeGapMs,
     poll = pollEvents, now = () => Date.now(), rawSleep = (ms) => new Promise((r) => { setTimeout(r, ms); }),
-    forward = [], log = console,
+    forward = [], log = console, observeHead = observeLedgerPrEvent,
   } = o;
   const writeStatus = o.writeStatus !== undefined ? o.writeStatus : (stateDir ? (s) => writeStatusFile(stateDir, role, s) : null);
   const st = { cursor: null, lastOkAt: null, lastFailAt: null, lastDeliveryAt: null, lastEventAt: null, lastError: null, initialized: false };
@@ -212,6 +213,10 @@ export function createEventWaker(o) {
       st.cursor = r.cursor;
       for (const e of r.events) {
         all.push(e);
+        // Only PR lifecycle events assert an open live head. Check/review SHAs can be historical.
+        if (e.type === 'pull_request' && e.state === 'open' && (!repos?.length || repos.includes(e.repo))) {
+          for (const pr of e.prs ?? []) observeHead(e, pr);
+        }
         if (isRelevantEvent(e, role, { repos })) relevant.push(e);
       }
       if (!r.more) break;

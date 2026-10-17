@@ -3343,6 +3343,7 @@ export function reviewPrOperation({
           {
             type: REVIEW_EFFECTS.LEDGER,
             payload: {
+              headSha: read?.netBasis?.rev ?? null,
               pr,
               repo,
               to,

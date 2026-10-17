@@ -1533,3 +1533,20 @@ reads the existing runs folder without migration or writes; `OPERATION_RUNS_DIR`
 it. `--since=<iso>` selects runs by earliest seat start. Incomplete runs are shown but
 excluded from median, nearest-rank p90 and the >5-minute early-change share denominator.
 Legacy runs without seat observations are omitted; absent times are never reconstructed.
+
+### Ledger open-head observations
+
+`ledger-observation.mjs` is the shared entry for review, drain and PR-event consumers. It records an open
+head before the writer's own judgment. `ledger.firstSeenRows` and `ledger.headMoveInvalidation` default to
+true through the policy cascade; effective values and sources are logged. A first-seen row imports existing
+review holds and records the observed label state, but an acceptance label alone cannot manufacture a
+content-witnessed clearance. `node scripts/operations/ledger-backfill.mjs --dry-run` counts missing rows for
+all open PRs (paginated); omit `--dry-run` to append through the normal ledger writer and lock.
+
+`head-moved` is a holding verdict at the new head and ends implicit approval scope. A `carried` verdict
+requires the previous live acceptance to name the immediately preceding head, plus an existing numbering,
+exact root-tree identity, or identical-net-patch proof; `fromHead` and `carryRule` retain the witness.
+Observation preconditions are rechecked inside the home append lock and each transport retry, so a delayed
+baseline cannot overwrite a review or a delayed head observation overwrite a newer one. Feed events re-read
+GitHub's live head because delivered events may describe an older head. Unreadable ledgers are write misses,
+never empty ledgers. These records do not change the authority rollout setting.

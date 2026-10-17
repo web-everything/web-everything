@@ -32,7 +32,7 @@ import {
   readFromTransportBranch,
   stageOnTransportBranch,
 } from './git-transport-branch.mjs';
-import { parseVerdictLog, parseLedgerEvents, ledgerEventId, checkLedgerAppendRows } from './verdict-ledger.mjs';
+import { parseVerdictLog, parseLedgerEvents, ledgerEventId, checkLedgerAppendRows, ledgerObservationApplies } from './verdict-ledger.mjs';
 import { registerLedgerStore } from './verdict-ledger-store.mjs';
 
 export const LEDGER_TRANSPORT_BRANCH = 'ops/review-requests';
@@ -191,9 +191,12 @@ export function appendLedgerRows({
           content: ({ existing }) => {
             const base = existing ?? '';
             const seen = new Set(parseLedgerEvents(base).map(ledgerEventId));
+            const prior = parseLedgerEvents(base);
             const fresh = lines.filter((line, i) => {
+              if (!ledgerObservationApplies(records[i], prior)) return false;
               if (seen.has(ids[i])) return false;
               seen.add(ids[i]);
+              prior.push(records[i]);
               return true;
             });
             written = fresh.length;

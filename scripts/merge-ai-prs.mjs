@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { observeLedgerHead } from './lib/ledger-observation.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
 import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, refreshHeldHead, retainApprovedHumanQueueHead } from './lib/approved-human-surface-hold.mjs';
 /**
@@ -6226,6 +6227,9 @@ async function runCli() {
     // Additive and fail-soft: runs before, and never alters, the stamping below. It dedups against one read of the
     // store its writes land in, taken before it writes, so a shared-store miss is retried next pass.
     const readDrainLedger = await readDrainLedgerSnapshot(verdicts.map((v) => v.repo || localSlug));
+    for (const v of verdicts) {
+      observeLedgerHead({ repo: v.repo || localSlug, pr: v.num, headSha: v.listedHeadSha || v.headSha, labels: v.labels }, { read: readDrainLedger });
+    }
     for (const v of skipped) {
       if (!v.reason || !(v.certifyLabel || v.aiGenerated)) continue;
       const held = recordDrainHold({ repo: v.repo || localSlug, pr: v.num, reason: v.reason, read: readDrainLedger });
