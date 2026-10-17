@@ -189,6 +189,9 @@ it('clears #4413 retry history when orphan adoption observes the dead worker\'s 
         readDelivery: () => ({ outcome: 'pr-open', pr: 9001, reason: 'PR #9001 is open' }), settleDelivered: () => {},
         releaseClaim: ({ num }) => releaseBuildDispatchClaim({ num, lockRoot }), releaseResumeMarker: () => {},
         clearFailure: ({ num }) => clearBuildFailure(num, { path }),
+        recordFailure: () => { throw new Error('delivered claim must not record failure'); },
+        releaseLaneLease: () => { throw new Error('delivered claim must not release a lane'); },
+        spawnResume: () => { throw new Error('delivered claim must not resume'); },
       }),
     }) });
     expect(r.orphanAdoption).toEqual([expect.objectContaining({ num: '4413', action: 'settled' })]);
