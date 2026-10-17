@@ -10,6 +10,7 @@
  *   rewritten. The parent acceptance looked stale despite no author change. This proof permits callers
  *   to carry it forward without trusting the drain's subject alone. Duplicate drops never qualify.
  */
+import { proveIdenticalNetPatch, resolveIdenticalNetPatchSetting, logIdenticalNetPatchSetting } from './identical-net-patch.mjs';
 import { readSettings } from './settings-files.mjs';
 import { cascadePolicy, platformPreference } from './policy-cascade.mjs';
 import { execFileSync } from 'node:child_process';
@@ -598,7 +599,7 @@ function refuseWithoutReferralGuard() { throw Error('no mandatory-referral guard
 /** IO: prove first, re-read before every write, record before labels; only settled proof outcomes are memoized. */
 export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFileSync, cwd, provider,
   readNetDiff, readLiveState, dryRun = false, writer = 'review-daemon', prove = proveNumberingOnlyMove,
-  numberingSetting = resolveNumberingHumanClearanceSetting(),
+  numberingSetting = resolveNumberingHumanClearanceSetting(), netPatchSetting = resolveIdenticalNetPatchSetting(),
   enabled = resolveHumanClearanceCarrySetting().value, acceptCarry = resolveAcceptCarryForward().value,
   guardReferrals = refuseWithoutReferralGuard } = {}) {
   const key = `${repo}#${pr}@${state?.headRefOid}`;
@@ -620,7 +621,7 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   if (!enabled || acceptCarry !== 'on') return null;
   if (settledRestamps.has(key)) return null;
   if (!plan.candidate) return plan.retryable ? { action: 'retry', reason: plan.reason } : null;
-  if (plan.human && !numberingSetting.value) return null;
+  if (plan.human && !numberingSetting.value && !netPatchSetting.value) return null;
   // Use the same live referral guard as the sanctioned acceptance writer, including label-only recovery.
   // A guard read failure is retryable and never settles the head or grants an acceptance.
   try { guardReferrals(state, { repo, pr }); }
@@ -648,9 +649,18 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
     return { action: 'restamped', from: plan.from, to: plan.to, human: plan.human, actor: plan.actor, labelsOnly: true,
       reason: 'labels finished for the numbering re-stamp already recorded on this head' };
   }
-  const proof = prove({ exec, cwd, fromSha: plan.from, toSha: plan.to });
+  const netSetting = netPatchSetting;
+  logIdenticalNetPatchSetting(netSetting);
+  // A disabled numbering proof is a setting, not a verdict: its refusal is never memoized, so switching it on takes effect.
+  const numberingOff = plan.human && !numberingSetting.value;
+  let proof = numberingOff ? { ok: false, reason: 'numbering carry disabled' } : prove({ exec, cwd, fromSha: plan.from, toSha: plan.to });
+  if (!proof.ok && netSetting.value) {
+    // An alternative proof cannot settle a head the first proof could not read: either retryable miss stays retryable.
+    const net = proveIdenticalNetPatch({ exec, cwd, fromSha: plan.from, toSha: plan.to });
+    proof = net.ok ? net : { ...net, retryable: Boolean(proof.retryable || net.retryable), reason: `${proof.reason}; net patch: ${net.reason}` };
+  }
   if (!proof.ok) {
-    if (!proof.retryable) settledRestamps.add(key);
+    if (!proof.retryable && !numberingOff) settledRestamps.add(key);
     return { action: proof.retryable ? 'retry' : 'refused', reason: proof.reason };
   }
   let headDiffText;

@@ -1,9 +1,10 @@
 {
-  "_note": "#4351 build-dispatch follow-up shape-equivalence pair for the build-dispatch daemon's open-PR read: `graphql` is what `defaultFetchOpenPrs` (gh pr list --json <OPEN_PR_LIST_FIELDS>) trimmed to the fields build-dispatch-policy.mjs actually reads (number, headRefName, labels, files, isDraft); `restPulls` is the same two PRs as `GET repos/o/r/pulls?state=open` would answer; `restFiles` is each PR's own `GET repos/o/r/pulls/{number}/files` page. `fetchOpenPrsRest` must turn `restPulls`+`restFiles` into exactly `graphql`.",
+  "_note": "#4351 build-dispatch follow-up shape-equivalence pair for the build-dispatch daemon's open-PR read: `graphql` is what `defaultFetchOpenPrs` (gh pr list --json <OPEN_PR_LIST_FIELDS>) trimmed to the fields build-dispatch-policy.mjs actually reads (number, headRefName, body, labels, files, isDraft); `restPulls` is the same two PRs as `GET repos/o/r/pulls?state=open` would answer; `restFiles` is each PR's own `GET repos/o/r/pulls/{number}/files` page. `fetchOpenPrsRest` must turn `restPulls`+`restFiles` into exactly `graphql`.",
   "graphql": [
     {
       "number": 2901,
       "headRefName": "lane/2901-fix-thing",
+      "body": "Delivered by the #3627 minimal delivery-agent pipeline",
       "labels": [{ "name": "review:pending" }],
       "files": [{ "path": "scripts/lib/gh-throttle.mjs" }, { "path": "scripts/conveyor/open-pr-fetch.mjs" }],
       "isDraft": false
@@ -11,6 +12,7 @@
     {
       "number": 2902,
       "headRefName": "lane/2902-other-thing",
+      "body": "",
       "labels": [],
       "files": [{ "path": "backlog/2902-other-thing.md" }],
       "isDraft": true
@@ -20,6 +22,7 @@
     {
       "number": 2901,
       "title": "WE #2901: fix thing",
+      "body": "Delivered by the #3627 minimal delivery-agent pipeline",
       "draft": false,
       "head": { "ref": "lane/2901-fix-thing", "sha": "aaa111" },
       "base": { "ref": "main" },

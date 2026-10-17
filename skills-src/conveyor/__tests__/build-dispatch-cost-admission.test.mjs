@@ -40,7 +40,7 @@ function fixture({ openPrs = 3, killSwitch = false, spawns = ['4501', '4502', '4
     costFacts: () => ({ cpuIdlePct, memFreePct: 80, minMemFreePct: 15, claudeUsdToday: 865.06 }),
   };
 }
-const policy = (costAdmission, extra = {}) => ({ ...BUILD_DISPATCH_POLICY, maxOpenPrs: 2, costAdmission, ...extra });
+const policy = (costAdmission, extra = {}) => ({ ...BUILD_DISPATCH_POLICY, maxOpenPrs: 2, maxOpenPrsCounts: 'all', costAdmission, ...extra });
 
 describe('build daemon — cost-class admission of item prepares', () => {
   it('OFF (today): the open-PR landing freeze holds every prepare', async () => {

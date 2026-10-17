@@ -111,12 +111,13 @@ export function seatFailureEvidence(error) {
  * @returns {Promise<Array<{step: string, stepIndex: number, request: object, ok: boolean, value?: *, error?: *,
  *   startedAt: number, finishedAt: number, cwd: (string|null)}>>} in batch order.
  */
-export async function runJudgeBatch({ batch, judge, clock = () => Date.now(), seatLanes = null, log = () => {} } = {}) {
+export async function runJudgeBatch({ batch, judge, clock = () => Date.now(), seatLanes = null, log = () => {}, onSeat = () => {} } = {}) {
   const results = new Array(batch.length);
   const leases = [];
   const launch = (k, cwd) => {
     const seat = batch[k];
     const startedAt = clock();
+    onSeat({ ...seat, startedAt, finishedAt: null });
     log(`parallel seats: ${seat.step} started${cwd ? ` in its own lane ${cwd}` : ''}`);
     return Promise.resolve()
       .then(() => (cwd ? judge(seat.request, { cwd }) : judge(seat.request)))
@@ -129,6 +130,7 @@ export async function runJudgeBatch({ batch, judge, clock = () => Date.now(), se
       )
       .then(() => {
         const result = results[k];
+        onSeat(result);
         const failure = result.failure;
         const tail = failure?.stderrTail.trim().replace(/\s+/g, ' ').slice(-200);
         const evidence = failure

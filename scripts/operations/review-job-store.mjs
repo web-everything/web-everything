@@ -14,8 +14,12 @@ import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { pidAlive } from '../lib/pid-alive.mjs';
+
 import { defaultListAgents } from './dispatch-lane-io.mjs';
 import { listWrappedWorkerAgents } from './worker-wrapper-launch.mjs';
+
+export { pidAlive } from '../lib/pid-alive.mjs';
 
 /** The checkout this module lives in — the same root `dispatch-lane-io.mjs#REPO_ROOT` resolves. */
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -40,12 +44,6 @@ function assertSlug(slug) {
 }
 export function jobRecordPath(slug, dir = reviewJobsDir()) { assertSlug(slug); return join(dir, `${slug}.json`); }
 export function jobLogPath(slug, dir = reviewJobsDir()) { assertSlug(slug); return join(dir, `${slug}.log`); }
-
-/** Three-valued pid probe, same contract as `reconcile-pass.mjs#probePid` (EPERM = alive, ESRCH = dead). */
-export function pidAlive(pid, kill = (p, s) => process.kill(p, s)) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try { kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; }
-}
 
 /** @returns {object|null} the record, or null when absent/unparseable (an unparseable record is not a live job). */
 export function readJobRecord(slug, dir = reviewJobsDir()) {

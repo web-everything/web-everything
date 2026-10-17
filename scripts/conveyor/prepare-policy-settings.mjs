@@ -2,9 +2,9 @@
 import { readSettings } from '../lib/settings-files.mjs';
 import { cascadePolicy, resolveCascade, platformPreference } from '../lib/policy-cascade.mjs';
 
-const standard = Object.freeze({ retryUnstampedOnce: true, autoSize: true, runner: 'codex', mergedGuardHours: 24 });
+const standard = Object.freeze({ retryUnstampedOnce: true, autoSize: true, runner: 'codex', mergedGuardHours: 24, maxPrListingCallsPerTick: 128 });
 const bool = v => typeof v === 'boolean';
-const valid = { retryUnstampedOnce: bool, autoSize: bool, runner: v => ['codex', 'claude', 'scope'].includes(v),
+const valid = { maxPrListingCallsPerTick: v => Number.isInteger(v) && v >= 0 && v <= 1000, retryUnstampedOnce: bool, autoSize: bool, runner: v => ['codex', 'claude', 'scope'].includes(v),
   mergedGuardHours: v => typeof v === 'number' && Number.isFinite(v) && v >= 0 };
 const parseBool = v => {
   if (bool(v)) return v;
@@ -19,6 +19,7 @@ const envValues = env => ({
   retryUnstampedOnce: parseBool(env?.WE_PREPARE_RETRY_UNSTAMPED_ONCE),
   autoSize: parseBool(env?.WE_PREPARE_AUTO_SIZE),
   runner: env?.WE_PREPARE_RUNNER,
+  maxPrListingCallsPerTick: env?.WE_PREPARE_MAX_PR_LISTING_CALLS_PER_TICK?.trim() ? Number(env.WE_PREPARE_MAX_PR_LISTING_CALLS_PER_TICK) : undefined,
   mergedGuardHours: typeof env?.WE_PREPARE_MERGED_GUARD_HOURS === 'string'
     && env.WE_PREPARE_MERGED_GUARD_HOURS.trim() !== '' ? Number(env.WE_PREPARE_MERGED_GUARD_HOURS) : undefined,
 });
@@ -26,11 +27,13 @@ const result = resolved => ({
   retryUnstampedOnce: resolved.value.retryUnstampedOnce,
   autoSize: resolved.value.autoSize,
   runner: resolved.value.runner,
+  maxPrListingCallsPerTick: resolved.value.maxPrListingCallsPerTick,
   mergedGuardHours: resolved.value.mergedGuardHours,
   sources: {
     retryUnstampedOnce: resolved.sources.retryUnstampedOnce,
     autoSize: resolved.sources.autoSize,
     runner: resolved.sources.runner,
+    maxPrListingCallsPerTick: resolved.sources.maxPrListingCallsPerTick,
     mergedGuardHours: resolved.sources.mergedGuardHours,
   },
 });

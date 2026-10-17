@@ -62,7 +62,7 @@ describe('shadow directives', () => {
   });
   it('logs the cascade once per distinct message', () => {
     const logs = [];
-    const options = { safeguards: { value: { ...shadowPolicy, sampleRate: 0.1 } }, policy: DEFAULT_ROUTING_POLICY, shadowModel: { value: 'unique-trial-model', source: 'env' }, log: (m) => logs.push(m) };
+    const options = { safeguards: { value: { ...shadowPolicy, sampleRate: 0.1, minNonClaudeSeats: 1 } }, policy: DEFAULT_ROUTING_POLICY, shadowModel: { value: 'unique-trial-model', source: 'env' }, log: (m) => logs.push(m) };
     loadReviewSeatSettings(options); loadReviewSeatSettings(options);
     expect(logs).toHaveLength(1);
     expect(logs[0]).toContain('env WE_REVIEW_SHADOW_AGY_MODEL');
@@ -70,7 +70,7 @@ describe('shadow directives', () => {
   });
   it('sanitizes the selection log through the shared log boundary', () => {
     const logs = [];
-    loadReviewSeatSettings({ safeguards: { value: { ...shadowPolicy, sampleRate: 0.1 } }, policy: DEFAULT_ROUTING_POLICY,
+    loadReviewSeatSettings({ safeguards: { value: { ...shadowPolicy, sampleRate: 0.1, minNonClaudeSeats: 1 } }, policy: DEFAULT_ROUTING_POLICY,
       shadowModel: { value: 'unique\nmodel\u001b\u200b', source: 'env' }, log: (message) => logs.push(message) });
     expect(logs).toHaveLength(1);
     expect(logs[0]).not.toMatch(/[\p{Cc}\p{Cf}\u2028\u2029]/u);
@@ -154,21 +154,61 @@ describe('shadow operational safeguards', () => {
   const resolve = (options = {}) => resolveReviewSeatSafeguards({ env: {}, platform: {}, readFile: () => '{}', log: () => {}, ...options });
   it('defaults off and logs each source through all four cascade layers', () => {
     const logs = [];
-    expect(resolve().value).toEqual({ shadowEnabled: false, scope: 'high-care', dailyCap: 100, sampleRate: 0.1 });
-    const result = resolve({ platform: { shadowSeats: { antigravity: { enabled: true, sampleRate: 0.2 } } },
+    expect(resolve().value).toEqual({ shadowEnabled: false, scope: 'high-care', dailyCap: 100, sampleRate: 0.1, minNonClaudeSeats: 1 });
+    const result = resolve({ platform: { shadowSeats: { antigravity: { enabled: true, sampleRate: 0.2 } }, minNonClaudeSeats: 2 },
       readFile: () => JSON.stringify({ shadowSeats: { antigravity: { enabled: false } } }),
-      env: { WE_REVIEW_SHADOW_AGY_DAILY_CAP: '3' }, log: m => logs.push(m) });
-    expect(result.sources).toEqual({ shadowEnabled: 'tool', sampleRate: 'platform', scope: 'standard', dailyCap: 'env' });
+      env: { WE_REVIEW_MIN_NON_CLAUDE_SEATS: '3', WE_REVIEW_SHADOW_AGY_DAILY_CAP: '3' }, log: m => logs.push(m) });
+    expect(result.sources).toEqual({ shadowEnabled: 'tool', sampleRate: 'platform', scope: 'standard', dailyCap: 'env', minNonClaudeSeats: 'env' });
     expect(logs.join(' ')).toContain('shadowEnabled=false (tool)');
     expect(logs.join(' ')).toContain('sampleRate=0.2 (platform)');
+    expect(logs.join(' ')).toContain('minNonClaudeSeats=3 (env)');
     expect(logs.join(' ')).toContain('dailyCap=3 (env)');
   });
-  it('refuses 100% and invalid caps with a logged warning', () => {
+  it('refuses 100%, invalid caps and invalid minima with a logged warning', () => {
     const logs = [];
-    const result = resolve({ env: { WE_REVIEW_SHADOW_AGY_SAMPLE_RATE: '1', WE_REVIEW_SHADOW_AGY_DAILY_CAP: '-1' }, log: m => logs.push(m) });
+    const result = resolve({ env: { WE_REVIEW_SHADOW_AGY_SAMPLE_RATE: '1', WE_REVIEW_MIN_NON_CLAUDE_SEATS: '0', WE_REVIEW_SHADOW_AGY_DAILY_CAP: '-1' }, log: m => logs.push(m) });
     expect(result.value.sampleRate).toBe(0.1);
+    expect(result.value.minNonClaudeSeats).toBe(1);
     expect(result.value.dailyCap).toBe(100);
     expect(logs.join(' ')).toContain('ignored invalid: env.sampleRate=1');
+  });
+  const safeguardCases = [
+    { key: 'shadowEnabled', leaf: false, config: value => ({ shadowSeats: { antigravity: { enabled: value } } }) },
+    { key: 'sampleRate', leaf: 0.2, config: value => ({ shadowSeats: { antigravity: { sampleRate: value } } }) },
+    { key: 'scope', leaf: 'sampled', config: value => ({ shadowSeats: { antigravity: { scope: value } } }) },
+    { key: 'dailyCap', leaf: 2, config: value => ({ shadowSeats: { antigravity: { dailyCap: value } } }) },
+    { key: 'minNonClaudeSeats', leaf: 2, config: value => ({ minNonClaudeSeats: value }) },
+  ];
+  for (const layer of ['platform', 'tool']) {
+    for (const { key, leaf, config } of safeguardCases) {
+      it.each([{ value: leaf }, { nested: { value: leaf } }, {}, { value: leaf, extra: 'invalid' }, [leaf], null])(
+        `rejects ${layer}.${key}=%j as a whole scalar setting`, (value) => {
+          const lower = { shadowEnabled: true, scope: 'sampled', dailyCap: 42, sampleRate: 0.3, minNonClaudeSeats: 3 };
+          const logs = [];
+          const result = resolve({
+            platform: layer === 'platform' ? config(value) : { shadowSeats: { antigravity: { enabled: true, scope: 'sampled', dailyCap: 42, sampleRate: 0.3 } }, minNonClaudeSeats: 3 },
+            readFile: () => JSON.stringify(layer === 'tool' ? config(value) : {}),
+            log: m => logs.push(m),
+          });
+          expect(result.value).toEqual(layer === 'tool' ? lower : { shadowEnabled: false, scope: 'high-care', dailyCap: 100, sampleRate: 0.1, minNonClaudeSeats: 1 });
+          expect(result.sources[key]).toBe(layer === 'tool' ? 'platform' : 'standard');
+          expect(result.invalid).toContain(`${layer}.${key}=${JSON.stringify(value)}`);
+          expect(logs.join(' ')).toContain(`${layer}.${key}=${JSON.stringify(value)}`);
+        });
+    }
+  }
+  it('rejects a nested platform enable without bypassing tool shadow-off through directive selection', () => {
+    const safeguards = resolve({ platform: { shadowSeats: { antigravity: { enabled: { value: false } } } },
+      readFile: () => JSON.stringify({ shadowSeats: { antigravity: { enabled: false } } }) });
+    const settings = loadReviewSeatSettings({ safeguards, policy: DEFAULT_ROUTING_POLICY,
+      shadowModel: { value: model, source: 'settings' }, log: () => {} });
+    for (const lens of ['correctness', 'security']) {
+      expect(seatProviderDirective(settings, lens, { repo: 'o/r', pr: 15 })).toBeNull();
+      expect(shadowSeatStatus(settings, { repo: 'o/r', pr: 15 })).toBe('off (setting)');
+    }
+    expect(safeguards.value.shadowEnabled).toBe(false);
+    expect(safeguards.sources.shadowEnabled).toBe('tool');
+    expect(safeguards.invalid).toEqual(['platform.shadowEnabled={"value":false}']);
   });
   it('disabled settings produce no shadow directive on either lens (no agy launch)', () => {
     const settings = loadReviewSeatSettings({ safeguards: resolve(), log: () => {} });

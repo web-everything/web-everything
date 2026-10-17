@@ -39,7 +39,7 @@ import {
   createDefaultJudge, runOperationCli, buildCliSpec, parseOperationArgv, cwdFlagValue, hasJsonFlag,
 } from './cli-adapter.mjs';
 import {
-  reviewPrOperation, REVIEW_PR_OP, securitySeatFromRun, codexAdvisoryFromEnv, correctnessAdvisoryFromEnv, antigravityReviewFromEnv,
+  reviewPrOperation, REVIEW_PR_OP, reviewSeatOptionsForRun, codexAdvisoryFromEnv, correctnessAdvisoryFromEnv, antigravityReviewFromEnv,
 } from './review-pr.mjs';
 import { createReviewPrReader, createReviewPrSinks, PR_VIEW_FIELDS, prViewFileName } from './review-pr-io.mjs';
 import { stagePrViewOperation, STAGE_PR_VIEW_OP } from './stage-pr-view.mjs';
@@ -184,15 +184,14 @@ export const OPERATIONS = Object.freeze({
   [HEALTH_RESPOND_OP]: () => ({ declaration: healthRespondOperation({ readDecisions: readLatestDecisions }), sinks: {} }),
   // #xqa9ttq — `codexAdvisory` reads `REVIEW_PR_CODEX_ADVISORY=1` off the environment (`codexAdvisoryFromEnv`,
   // `we:scripts/operations/review-pr.mjs`), OFF by default — see that flag's own docs for why it is an env
-  // var and not a CLI `--flag` (the step list is fixed here, before any run's argv is parsed) and why
-  // `record-verdict-io.mjs`'s resume registration now reads the SAVED RUN's roster instead (`codexAdvisoryFromRun`,
-  // PR #2117 review) - the env var only decides how a NEW run is started here.
+  // var and not a CLI `--flag` (the step list is fixed here, before any run's argv is parsed). Every resume
+  // registration reads the SAVED RUN's roster instead (`reviewSeatOptionsForRun`, PR #2117 / #5441 review) - the
+  // env var only decides how a NEW run is started here.
   // #x8n4crp / #3383 — `correctnessAdvisory` (`REVIEW_PR_CODEX_CORRECTNESS_ADVISORY`) and `antigravityReview`
   // (`REVIEW_PR_ANTIGRAVITY_REVIEW`) are the fourth and fifth seats, each read off its OWN env var by the same
   // reasoning (`correctnessAdvisoryFromEnv`/`antigravityReviewFromEnv`, `we:scripts/operations/review-pr.mjs`).
-  // `json` is the ONE operation-table entry that reads its `resolveOperation(name, opts)` opts at all — every
-  // other builder below still takes none, and passing the extra argument to a zero-arg arrow is a harmless
-  // no-op for them. See `createReviewPrSinks`'s own `json` doc (`we:scripts/operations/review-pr-io.mjs`) for
+  // `resumeId` reconstructs all seats from the saved run at any cursor; flags and minimums choose only NEW runs.
+  // See `createReviewPrSinks`'s own `json` doc (`we:scripts/operations/review-pr-io.mjs`) for
   // WHY this exists: a `--json` caller's stdout must stay pure JSON even when the `record` step's notice
   // effect fires mid-run.
   // #xu2pp2m — `cwd` IS THREADED INTO THE READER, not only into the judge factory. See
@@ -202,18 +201,25 @@ export const OPERATIONS = Object.freeze({
   // invocation with no `--cwd` is byte-identical to before.
   // `review.seatsByTouchSet` — `securitySeat` is the CALLER's choice, made before the run starts (the review
   // daemon's `review-loop-cli.mjs#chooseSecuritySeat`) or read off a saved run on `--resume` (below); default: seated.
-  [REVIEW_PR_OP]: ({ json = false, cwd = null, securitySeat = true } = {}) => ({
-    declaration: reviewPrOperation({
-      securitySeat,
-      readPr: createReviewPrReader(cwd ? { cwd } : {}),
-      codexAdvisory: codexAdvisoryFromEnv(),
-      correctnessAdvisory: correctnessAdvisoryFromEnv(),
-      antigravityReview: antigravityReviewFromEnv(),
-      // Card 84 — `review.seatProvider.<lens>` + the advisory agy seat (the `review-seat:mandatory:*` / `review-seat:advisory:agy-correctness` entries of we:scripts/lib/dispatch-routing-policy.json).
-      seatSettings: loadReviewSeatSettings(),
-    }),
-    sinks: createReviewPrSinks({ json }),
-  }),
+  [REVIEW_PR_OP]: ({ json = false, cwd = null, securitySeat = true, resumeId = null } = {}) => {
+    // A bad id or torn record falls back to the live roster, so the adapter's own resume read refuses it
+    // normally instead of this builder aborting resolveOperation with the root usage.
+    let savedRun = null;
+    if (resumeId) { try { savedRun = createFileRunStore().read(resumeId); } catch { savedRun = null; } }
+    const seatSettings = loadReviewSeatSettings();
+    const live = { codexAdvisory: codexAdvisoryFromEnv(), correctnessAdvisory: correctnessAdvisoryFromEnv(),
+      antigravityReview: antigravityReviewFromEnv() };
+    // A saved run keeps the roster it started with at every cursor position (`reviewSeatOptionsForRun`).
+    const seats = savedRun?.op === REVIEW_PR_OP
+      ? reviewSeatOptionsForRun(savedRun, seatSettings, live) : { securitySeat, ...live, seatSettings };
+    return {
+      declaration: reviewPrOperation({
+        ...seats,
+        readPr: createReviewPrReader(cwd ? { cwd } : {}),
+      }),
+      sinks: createReviewPrSinks({ json }),
+    };
+  },
   // backlog/xzdi27a-* — the sibling of `review-pr` for a BACKLOG CARD instead of a PR diff (no `gh`, no diff,
   // no confirm suspend: a prep review's verdict is a note + a commit, applied in one CLI call end to end).
   [REVIEW_PREP_OP]: () => ({
@@ -612,10 +618,8 @@ export function createCliJudgeFactory({ env = process.env, factory = createDefau
  * Build an isolated registry plus the bindings for ONE named operation. Throws on an unknown name.
  *
  * @param {string} name
- * @param {{json?: boolean}} [opts] - passed straight through to the table entry's builder. Every builder
- *   except `REVIEW_PR_OP`'s ignores it today (see the table above); it exists here so a CALLER can tell a
- *   builder what its OWN argv already says before the declaration it binds to is resolved — `json` is the one
- *   case that needs this (stdout purity under `--json`, `we:scripts/operations/review-pr-io.mjs`).
+ * @param {{json?: boolean, cwd?: string, securitySeat?: boolean, resumeId?: string}} [opts] - passed to the
+ *   builder before parsing: review-pr uses resumeId to reconstruct its saved roster and json/cwd for its IO.
  */
 export function resolveOperation(name, opts = {}) {
   // `Object.hasOwn`, never a bare bracket read: `OPERATIONS['toString']` on a normal-prototype object returns an
@@ -690,11 +694,11 @@ if (IS_CLI) {
     // #xu2pp2m — `cwd` rides alongside `json` for the SAME pre-parse reason (see `cwdFlagValue`): the
     // review-pr reader is built here, before the operation's own argv is parsed.
     // `review.seatsByTouchSet` — a `--resume` of a `review-pr` run is registered with the roster the run STARTED with.
-    const resumeId = name === REVIEW_PR_OP ? rest.find((a) => a.startsWith('--resume='))?.slice('--resume='.length) : undefined;
-    let securitySeat = true;
-    if (resumeId) { try { securitySeat = securitySeatFromRun(createFileRunStore().read(resumeId)); } catch { securitySeat = true; } }
+    // Match parseOperationArgv: the last occurrence wins, including a bare --resume clearing an earlier one.
+    const resumeId = name === REVIEW_PR_OP
+      ? rest.findLast((a) => a === '--resume' || a.startsWith('--resume='))?.slice('--resume='.length) : undefined;
     controlPolicy = rest.includes('--help') ? { zeroWrites: false, memoryStore: false } : operatorControlCliPolicy(name, rest);
-    resolved = resolveOperation(name, { preview: controlPolicy.zeroWrites, json: hasJsonFlag(rest), cwd: cwdFlagValue(rest), securitySeat });
+    resolved = resolveOperation(name, { preview: controlPolicy.zeroWrites, json: hasJsonFlag(rest), cwd: cwdFlagValue(rest), resumeId });
   } catch (e) {
     writeAllSync(1, `error: ${String(e.message ?? e)}\n\n${rootUsage()}\n`);
     process.exit(2);
