@@ -502,6 +502,251 @@ describe('guard-bash — resolveEffectiveCwd honours a leading `cd` (#2335)', ()
   });
 });
 
+describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading `cd` (#5957)', () => {
+  const REPORTED = '/ws/webeverything';
+  const HOME = '/home/dev';
+  const SPACED = '/home/dev with space';
+  const at = (cmd, home = HOME) => resolveEffectiveCwd(cmd, REPORTED, undefined, home);
+
+  it('bare tilde, tilde-slash, $HOME and ${HOME} reach the same path as the absolute spelling', () => {
+    expect(at('cd ~ && ls')).toBe(HOME);
+    expect(at('cd ~/clone && ls')).toBe(at(`cd ${HOME}/clone && ls`));
+    expect(at('cd $HOME/clone && ls')).toBe(`${HOME}/clone`);
+    expect(at('cd ${HOME}/clone && ls')).toBe(`${HOME}/clone`);
+    expect(at('cd "$HOME/clone" && ls')).toBe(`${HOME}/clone`);
+    expect(at('cd "${HOME}/clone" && ls')).toBe(`${HOME}/clone`);
+    expect(at('cd "$HOME" && ls')).toBe(HOME);
+  });
+  it('keeps a trailing slash and dot segments exactly as the absolute spelling would', () => {
+    expect(at('cd ~/clone/ && ls')).toBe(at(`cd ${HOME}/clone/ && ls`));
+    expect(at('cd ~/a/../clone && ls')).toBe(at(`cd ${HOME}/a/../clone && ls`));
+    expect(at('cd "$HOME/./clone" && ls')).toBe(at(`cd ${HOME}/./clone && ls`));
+  });
+  it('a home path containing spaces survives double quotes, and is unresolved when left unquoted', () => {
+    expect(at('cd "$HOME/clone" && ls', SPACED)).toBe(`${SPACED}/clone`);
+    expect(at('cd "${HOME}" && ls', SPACED)).toBe(SPACED);
+    expect(at('cd ~/clone && ls', SPACED)).toBe(`${SPACED}/clone`);
+    // unquoted $HOME word-splits in a real shell, so `cd` would fail — never a fabricated target
+    expect(at('cd $HOME/clone && ls', SPACED)).toBe(REPORTED);
+  });
+  it('quoted tilde and single-quoted HOME are literal shell text, not home aliases', () => {
+    expect(at('cd "~/clone" && ls')).toBe(`${REPORTED}/~/clone`);
+    expect(at("cd '~' && ls")).toBe(`${REPORTED}/~`);
+    expect(at("cd '$HOME/clone' && ls")).toBe(REPORTED);
+  });
+  // Where home expansion does not apply, the result is main's: `~` is then plain text relative to the
+  // reported cwd and a `$VAR` reads main's literal assignments. Never a home path, never weaker than main.
+  const TILDE_CLONE = `${REPORTED}/~/clone`;
+  it('unsupported spellings never become a home target', () => {
+    expect(at('cd ~someone/clone && ls')).toBe(`${REPORTED}/~someone/clone`);
+    expect(at('cd "$UNKNOWN/clone" && ls')).toBe(REPORTED);
+    expect(at('cd "$(echo ~)/clone" && ls')).toBe(REPORTED);
+    expect(at('cd "`echo $HOME`" && ls')).toBe(REPORTED);
+    expect(at('cd ${HOME:-/x}/clone && ls')).toBe(REPORTED);
+    expect(at('cd "$HOME/*" && ls')).toBe(`${HOME}/*`);
+    expect(at('cd $HOME/* && ls')).toBe(REPORTED);
+  });
+  it('a missing or non-absolute HOME fabricates nothing', () => {
+    expect(at('cd ~/clone && ls', null)).toBe(TILDE_CLONE);
+    expect(at('cd "$HOME" && ls', null)).toBe(REPORTED);
+    expect(at('cd ~ && ls', '')).toBe(`${REPORTED}/~`);
+    expect(at('cd ~ && ls', 'relative/home')).toBe(`${REPORTED}/~`);
+  });
+  it('an unknown HOME keeps main\'s literal HOME value for a whole `$HOME` target', () => {
+    expect(at('HOME=/clone; HOME=$(mktemp -d); cd "$HOME"')).toBe('/clone');
+    expect(at('HOME=/clone; read HOME <f; cd $HOME')).toBe('/clone');
+    expect(at('HOME=/clone; read HOME <f; cd ${HOME}')).toBe('/clone');
+  });
+  it('a home-derived ordinary variable expands with the HOME in effect at its assignment', () => {
+    expect(at('D=~/x; cd "$D"')).toBe(`${HOME}/x`);
+    expect(at('D=$HOME/x; cd $D')).toBe(`${HOME}/x`);
+    expect(at('D="${HOME}/x"; cd "${D}"')).toBe(`${HOME}/x`);
+    expect(at('D=~/x; D+=/y; cd "$D"')).toBe(`${HOME}/x/y`);
+    expect(at('HOME=/a; D=~/x; HOME=/b; cd "$D"')).toBe('/a/x');
+    expect(at('D=~/x; HOME=/b; cd "$D"')).toBe(`${HOME}/x`);
+    // a quoted tilde is literal text: no home expansion, main's relative resolution
+    expect(at(`D='~/x'; cd "$D"`)).toBe(`${REPORTED}/~/x`);
+    expect(at('D="~/x"; cd "$D"')).toBe(`${REPORTED}/~/x`);
+    // a child-shell assignment never changes the parent's home-derived value
+    expect(at('D=~/x; (D=/tmp); cd "$D"')).toBe(`${HOME}/x`);
+    expect(at('D=~/x; ( D=/tmp; true ); cd "$D"')).toBe(`${HOME}/x`);
+    expect(at('D=~/x; y=$(D=/tmp); cd "$D"')).toBe(`${HOME}/x`);
+    expect(at('(HOME=/tmp); cd ~/x')).toBe(`${HOME}/x`);
+    // any child shell — a subshell not opened by the assignment, a multi-line one, a pipeline member — counts
+    expect(at('D=~/x; (true; D=/tmp); cd "$D"')).toBe(`${HOME}/x`);
+    expect(at('D=~/x; ( true; D=/tmp ); cd "$D"')).toBe(`${HOME}/x`);
+    expect(at('D=~/x\n(\nD=/tmp\n)\ncd "$D"')).toBe(`${HOME}/x`);
+    expect(at('D=~/x; D=/tmp | cat; cd "$D"')).toBe(`${HOME}/x`);
+    expect(at('(true; HOME=/q); cd ~/x')).toBe(`${HOME}/x`);
+    expect(at('HOME=/q | cat; cd ~/x')).toBe(`${HOME}/x`);
+    // a background job is not visible in the statements: main's resolution, never the job's HOME
+    expect(at('HOME=/q & cd ~/x')).toBe(`${REPORTED}/~/x`);
+    // a paren in a comment, a case arm or a ${…} body cannot be counted: main's resolution
+    expect(at('( case x in a) true;; esac\nHOME=/q\n)\ncd ~/x')).toBe(`${REPORTED}/~/x`);
+    expect(at('(\necho ${x//)/}\nHOME=/q\n)\ncd ~/x')).toBe(`${REPORTED}/~/x`);
+    // a statement the splitter rewrote (a `\`-newline) is never matched to a later copy of its text
+    expect(at('true \\\nx;(\nHOME=/q\n);cd ~/x; echo "true x(";HOME=/q;echo ")"; cd ~/x')).toBe(`${REPORTED}/~/x`);
+    // an escaped paren is text, never a subshell boundary
+    expect(at('echo \\(; HOME=/q; echo \\); cd ~/x')).toBe('/q/x');
+    expect(at('( echo \\)\nHOME=/q\necho \\(\n)\ncd ~/x')).toBe(`${HOME}/x`);
+    expect(at('D=~/x; ( echo \\)\nD=/tmp\necho \\(\n)\ncd "$D"')).toBe(`${HOME}/x`);
+    // a comment's paren is comment text: the subshell stays open, or there is none
+    expect(at('( true # )\nHOME=/q\n)\ncd ~/x')).toBe(`${HOME}/x`);
+    expect(at('true # (\nHOME=/q\ntrue # )\ncd ~/x')).toBe('/q/x');
+    expect(at('( case x in a) true;; esac\ncd ~/x\n)\ngit status')).toBe(`${REPORTED}/~/x`);
+    // a paren inside "$( … )" or backticks, a body that may never run, or a conditional: main's resolution
+    expect(at('echo "$(echo "(")"; HOME=/q; echo "$(echo ")")"; cd ~/x')).toBe(`${REPORTED}/~/x`);
+    expect(at('x=`(true`; HOME=/q; y=`)`; cd ~/x')).toBe(`${REPORTED}/~/x`);
+    expect(at('f() { true; HOME=/q; }; cd ~/x')).toBe(`${REPORTED}/~/x`);
+    expect(at('f() {\nHOME=/q\n}\ncd ~/x')).toBe(`${REPORTED}/~/x`);
+    expect(at('while false; do\nHOME=/q\ndone\ncd ~/x')).toBe(`${REPORTED}/~/x`);
+    expect(at('false && HOME=/q; cd ~/x')).toBe(`${REPORTED}/~/x`);
+    expect(at('[ -d /q ] || D=~/x; cd "$D"')).toBe(`${REPORTED}/~/x`);
+    expect(at('cd ~/x & git status')).toBe(`${REPORTED}/~/x`);
+    // text after the first cd never steers it
+    expect(at('cd ~/x && git status # (note')).toBe(`${HOME}/x`);
+    // a cd in a child shell, or a target that leaks an operator, is never home-expanded
+    expect(at('(true; cd ~/x); git status')).toBe(`${REPORTED}/~/x)`);
+    expect(at('D=/clone; (true; D=~/x); cd $D')).toBe(`${REPORTED}/~/x)`); // main's resolution, never the home
+    // no home to expand, or a later literal assignment: main's resolution
+    expect(at('D=~/x; cd "$D"', null)).toBe(`${REPORTED}/~/x`);
+    expect(at('D=~/x; D=/clone; cd "$D"')).toBe('/clone');
+  });
+  it('uses only preceding literal HOME assignments for home expansion', () => {
+    expect(at('HOME=/other; cd ~/clone')).toBe('/other/clone');
+    expect(at('export HOME=/other; cd "$HOME/clone"')).toBe('/other/clone');
+    expect(at('cd ~/clone; HOME=/other')).toBe(`${HOME}/clone`);
+    expect(at('HOME=$(mktemp -d); cd ~/clone')).toBe(TILDE_CLONE);
+  });
+  it('a HOME append extends the current home instead of leaving the stale value', () => {
+    expect(at('HOME=/a; HOME+=/b; cd ~/clone')).toBe('/a/b/clone');
+    expect(at('HOME+=/b; cd ~/clone')).toBe(`${HOME}/b/clone`);
+    expect(at('HOME=/a; export HOME+=/c; cd "$HOME/clone"')).toBe('/a/c/clone');
+    expect(at('HOME=/a; HOME+="/sp ace"; cd "$HOME/clone"')).toBe('/a/sp ace/clone');
+    expect(at('HOME=/a; HOME+=/b; HOME+=/c; cd ~')).toBe('/a/b/c');
+    // the appended text cannot be read, or there is no home to append to — never the stale value
+    expect(at('HOME=/a; HOME+=$(pwd); cd ~/clone')).toBe(TILDE_CLONE);
+    expect(at('HOME+=/b; cd ~/clone', null)).toBe(TILDE_CLONE);
+  });
+  it('any other HOME rebinding the resolver cannot read leaves home unknown, never stale', () => {
+    for (const rebind of ['HOME[0]=/z', 'HOME[0]+=/z', 'declare HOME=/z', 'declare -x HOME+=/z', 'typeset HOME=/z',
+      'readonly HOME=/z', 'local HOME=/z', 'read HOME', 'read -r HOME <f', 'printf -v HOME %s /z', 'unset HOME',
+      'let HOME=1', '(( HOME=1 ))', 'eval "HOME=/z"', 'source ./env.sh', '. ./env.sh', 'mapfile -t HOME <f']) {
+      expect(at(`HOME=/a; ${rebind}; cd ~/clone`), rebind).toBe(TILDE_CLONE);
+    }
+    // a temporary prefix assignment does not outlive its command
+    expect(at('HOME=/a; HOME=/x true; cd ~/clone')).toBe('/a/clone');
+    expect(at('HOME=/a; HOME=/x B=/y; cd ~/clone')).toBe('/x/clone');
+    // HOME read, not rebound, changes nothing
+    expect(at('HOME=/a; echo "$HOME"; export HOME; cd ~/clone')).toBe('/a/clone');
+    expect(at('echo "HOME=$HOME"; cd ~/clone')).toBe(`${HOME}/clone`);
+    expect(at(`printf '%s\\n' "\${HOME}"; cd ~/clone`)).toBe(`${HOME}/clone`);
+    expect(at("echo 'HOME=/z'; cd ~/clone")).toBe(`${HOME}/clone`);
+    // an array append is not read here: home is unknown, never the appended text glued on
+    expect(at('HOME=/a; HOME+=(/c); cd ~/clone')).toBe(TILDE_CLONE);
+    // a redirection after the assignment is not a command
+    expect(at('HOME=/a; HOME=/b 2>/dev/null; cd ~/clone')).toBe('/b/clone');
+    expect(at('HOME=/a; HOME=/b > /dev/null; cd ~/clone')).toBe('/b/clone');
+    // a quoted paren opens no child shell, so the rebinding after it still counts: home is unknown, never /a
+    expect(at('HOME=/a; FOO="(" HOME=/b; cd ~/clone')).toBe(TILDE_CLONE);
+    expect(at('HOME=/a; export FOO="(" HOME=/b; cd ~/clone')).toBe(TILDE_CLONE);
+    expect(at('HOME=/a; read "HOME" <f; cd ~/clone')).toBe(TILDE_CLONE);
+    expect(at('HOME=/a; let "HOME=1"; cd ~/clone')).toBe(TILDE_CLONE);
+    // inside a child shell the parent keeps its value
+    expect(at('HOME=/a; ( HOME=/z ); x=$(HOME=/z; echo); cd ~/clone')).toBe('/a/clone');
+  });
+  it('a pathological HOME[ run stays linear', () => {
+    const started = Date.now();
+    expect(at(`${'HOME['.repeat(40000)}; cd ~/clone`)).toBe(`${HOME}/clone`);
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+  it('a pathological run of unclosed `${` stays linear', () => {
+    const started = Date.now();
+    expect(at(`true ${'${'.repeat(40000)}; cd ~/clone`)).toBe(`${HOME}/clone`);
+    expect(at(`echo ${'${'.repeat(40000)}`)).toBe(REPORTED);
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+  it('arithmetic outside (( )), an IFS change, a trap or a pathological name keeps main\'s resolution', () => {
+    for (const rebind of [': $[D=5]', 'x[D=6]=1', ': ${x[D=7]}', 'y=${D:0:D=9}']) {
+      expect(at(`D=~/x; ${rebind}; cd $D`), rebind).toBe(`${REPORTED}/~/x`);
+    }
+    expect(at('HOME=/clone; x[HOME=1]=1; cd ~')).toBe(`${REPORTED}/~`);
+    expect(at('D=~/cloneZjunk; IFS=Z; cd $D')).toBe(`${REPORTED}/~/cloneZjunk`);
+    expect(at('IFS=/; cd $HOME/x')).toBe(REPORTED);
+    expect(at("trap 'HOME=/clone' ERR; false; cd ~")).toBe(`${REPORTED}/~`);
+    // reading IFS or $IFS changes nothing
+    expect(at('echo "$IFS" ${IFS}; cd ~/x')).toBe(`${HOME}/x`);
+    // a huge variable name never throws out of the resolver (the hook would then fail open)
+    expect(at(`true; cd $${'V'.repeat(40000)}`)).toBe(REPORTED);
+  });
+  it('every rebinding scanner stays linear on hostile runs', () => {
+    const n = 40000;
+    for (const cmd of [
+      `D="${'${'.repeat(n)}"; cd ~/x`, `D="${'${x}'.repeat(n)}"; cd ~/x`, `D=1 ${'a '.repeat(n)}; cd ~/x`,
+      `(( ${'D=1,'.repeat(n)} )); cd ~/x`, `x=$((${'(D'.repeat(n)})); cd ~/x`, `HOME=/a ${'X=1 '.repeat(n)}; cd ~/x`,
+      `true ${'{D}'.repeat(n)}; cd "$D"`, `read ${'D '.repeat(n)}; cd "$D"`, `${'D=~/x; X=1; '.repeat(4000)}cd "$D"`,
+    ]) {
+      const started = Date.now();
+      at(cmd);
+      expect(Date.now() - started, cmd.slice(0, 20)).toBeLessThan(2000);
+    }
+  });
+  it('an ordinary variable with no home-derived value keeps main\'s literal resolution, never erased', () => {
+    for (const rebind of ['D+=/b', 'export D+=/b', 'D+=$(pwd)', 'X=1 D=/b', 'D[0]=/b', 'read D <f',
+      'printf -v D %s /b', 'declare D=/b', 'unset D', 'eval "D=/b"', 'D=(/b)', 'D=/b true',
+      'IFS= read -r D <<< /b', 'if read -r D <<< /b', '\\read D <f', 'command -p read D <f',
+      'x=$(D=1) D=/b', 'echo $(D=1) $((D=5))', 'f(){ D=/b', 'exec {D}>/dev/null', 'coproc D { cat; }',
+      'printf -v "$X" %s /b', 'while read D', 'case a in a) D=/b', 'case $1 in\n  a) D=/b ;;\nesac', 'f () { D=/b',
+      'time -p D=/b', '>/dev/null D=/b', 'N=$((D=5))', 'for ((D=0;D<1;D++))']) {
+      expect(at(`D=/a; ${rebind}; cd "$D"`), rebind).toBe('/a');
+    }
+    // main reads literal assignments from the whole command
+    expect(at('cd "$D"; D=/b')).toBe('/b');
+  });
+  it('an unreadable rebinding of a home-derived variable falls back to main, never to the home value', () => {
+    expect(at('D=~/x; read D <f; cd "$D"')).toBe(`${REPORTED}/~/x`);
+    expect(at('D=~/x; D=$(pwd); cd "$D"')).toBe(`${REPORTED}/~/x`);
+  });
+  it('a NAME= that is only an argument, or a prefix of another command, binds nothing', () => {
+    expect(at('LANE=/x; echo LANE=foo; cd $LANE')).toBe('/x');
+    expect(at('LANE=/x; env LANE=/y node -v; cd $LANE')).toBe('/x');
+    expect(at('lane=/x; node a.mjs --lane 5; cd $lane')).toBe('/x');
+    expect(at('src=/x; git add -- src; cd $src')).toBe('/x');
+    expect(at('HOME=/a; FOO=1 HOME=/y true; cd ~/clone')).toBe('/a/clone');
+    expect(at('HOME=/a; env HOME=/y true; cd ~/clone')).toBe('/a/clone');
+    expect(at('HOME=/a; ( (HOME=/y) ); cd ~/clone')).toBe('/a/clone');
+  });
+  it('never home-expands an unquoted bracket glob', () => {
+    expect(at('cd ~/[c]lone')).toBe(`${REPORTED}/~/[c]lone`);
+    expect(at('cd $HOME/[c]lone')).toBe(REPORTED);
+    expect(at('cd /other/[c]lone')).toBe('/other/[c]lone');
+    expect(at('cd "$HOME/[c]lone"')).toBe(`${HOME}/[c]lone`);
+  });
+  it('heredoc body text never steers the resolution', () => {
+    const cmd = `cat <<'EOF'\ncd ~/clone\nEOF`;
+    expect(at(cmd)).toBe(REPORTED);
+  });
+  it('pins the existing literal lane-variable behaviour', () => {
+    const LANE = '/ws/.lanes/web-everything/lane-5';
+    expect(at(`LANE=${LANE}; cd "$LANE" && ls`)).toBe(LANE);
+    expect(at(`LANE=${LANE}; cd \${LANE} && ls`)).toBe(LANE);
+    expect(at('cd relative/dir && ls')).toBe(`${REPORTED}/relative/dir`);
+  });
+  it('preserves the parent target after a home assignment is overwritten and a subshell assigns it', () => {
+    const clone = '/fixture/clone';
+    expect(at(`D=~/x; D=${clone}; ( D=/tmp ); cd "$D" && git checkout --detach`)).toBe(clone);
+  });
+  it('a home-spelled cd lands in the same lane root and ownership classification as the absolute spelling', () => {
+    const LANE_HOME = `${HOME}/.lanes/web-everything/lane-9`;
+    const viaHome = at('cd ~/.lanes/web-everything/lane-9/scripts && ls');
+    const viaAbs = at(`cd ${LANE_HOME}/scripts && ls`);
+    expect(viaHome).toBe(viaAbs);
+    expect(isLaneCwd(viaHome)).toBe(true);
+    expect(laneRootFromCwd(viaHome)).toBe(laneRootFromCwd(viaAbs));
+    expect(laneRootFromCwd(viaHome)).toBe(LANE_HOME);
+  });
+});
+
 describe('guard-bash — foreign-live-lease destructive-op block (#2367)', () => {
   it('laneRootFromCwd: extracts the lane ROOT from cwd at or under it; null off a lane', () => {
     expect(laneRootFromCwd('/ws/.lanes/web-everything/lane-8')).toBe('/ws/.lanes/web-everything/lane-8');
@@ -3433,10 +3678,10 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
   // The house idiom (see the #3311 CLI-boundary block above): vitest rewrites `import.meta.url` to a
   // non-file base, so `new URL(…, import.meta.url)` + `fileURLToPath` is NOT used here.
   const GUARD = join(dirname(fileURLToPath(import.meta.url)), '..', 'guard-bash.mjs');
-  const runHook = (command, cwd) => {
+  const runHook = (command, cwd, home) => {
     const res = execFileSync(process.execPath, [GUARD], {
       input: JSON.stringify({ tool_input: { command }, cwd }),
-      env: { ...process.env, WE_DAEMON_OVERLAY_DIR: overlayDir },
+      env: { ...process.env, WE_DAEMON_OVERLAY_DIR: overlayDir, ...(home ? { HOME: home } : {}) },
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'ignore'],
     }).trim();
@@ -3461,6 +3706,89 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
 
   it('ALLOWS the sanctioned overlay CLI invoked with --clone=<path> from a lane', () => {
     expect(runHook(`node scripts/daemon-overlay.mjs add --clone=${fakeClone} --ref=lane/fix`, lane)).toBeNull();
+  });
+  // These preserve main's single-directory behavior; the proposed shell strings are never executed.
+  it.each([
+    ['nested-subshell fallback', `((cd ${fakeClone}; git checkout --detach) )`, true],
+    ['subshell assignment', `D=${fakeClone}; ( D=/tmp; true ); cd "$D" && git checkout --detach`, false],
+    ['readonly without a value', `D=${fakeClone}; readonly D; cd "$D" && git checkout --detach`, false],
+    ['export without a value', `D=${fakeClone}; export D; cd "$D" && git checkout --detach`, false],
+  ])('retains the main refusal for %s', (_name, command, startsProtected) => {
+    const out = runHook(command, startsProtected ? fakeClone : lane);
+    expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+  });
+
+  // #5957 — a leading `cd` written with home shorthand must hit the same guard as its absolute spelling.
+  // HOME is the temp `root` here, so `~/some-new-daemon-clone` IS the registered clone. The command strings
+  // are inert: the hook only inspects them, it never runs the proposed checkout.
+  describe('home-spelled leading cd (#5957)', () => {
+    const denies = (cmd) => {
+      const out = runHook(cmd, lane, root);
+      expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+      expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+    };
+    it('the absolute spelling is denied (baseline)', () => {
+      denies(`cd ${fakeClone} && git checkout --detach`);
+    });
+    it.each([
+      ['tilde', 'cd ~/some-new-daemon-clone && git checkout --detach'],
+      ['$HOME', 'cd $HOME/some-new-daemon-clone && git checkout --detach'],
+      ['${HOME}', 'cd ${HOME}/some-new-daemon-clone && git checkout --detach'],
+      ['double-quoted $HOME', 'cd "$HOME/some-new-daemon-clone" && git checkout --detach'],
+      ['trailing slash', 'cd ~/some-new-daemon-clone/ && git checkout --detach'],
+      ['dot segments', 'cd ~/lane/../some-new-daemon-clone && git checkout --detach'],
+    ])('DENIES `git checkout --detach` after a %s cd into the registered clone', (_n, cmd) => denies(cmd));
+    it('DENIES detach using the parent value despite a subshell assignment after a home assignment', () => {
+      const command = `D=~/x; D=${fakeClone}; ( D=/tmp ); cd "$D" && git checkout --detach`;
+      expect(resolveEffectiveCwd(command, lane, undefined, root)).toBe(fakeClone);
+      denies(command);
+    });
+    it.each([
+      ['a tilde-assigned variable', 'D=~/some-new-daemon-clone; cd "$D" && git checkout --detach'],
+      ['a $HOME-assigned variable', 'D="$HOME/some-new-daemon-clone"; cd "$D" && git checkout --detach'],
+      ['a home-derived variable a subshell reassigns', 'D=~/some-new-daemon-clone; (D=/tmp); cd "$D" && git checkout --detach'],
+      ['a tilde cd after a subshell HOME assignment', '(HOME=/tmp); cd ~/some-new-daemon-clone && git checkout --detach'],
+      ['a home-derived variable a later subshell statement reassigns', 'D=~/some-new-daemon-clone; (true; D=/tmp); cd "$D" && git checkout --detach'],
+      ['a home-derived variable a pipeline member reassigns', 'D=~/some-new-daemon-clone; D=/tmp | cat; cd "$D" && git checkout --detach'],
+      ['a tilde-assigned variable with an unquoted target', 'D=~/some-new-daemon-clone; cd $D && git checkout --detach'],
+      ['a tilde-assigned variable with a braced target', 'D=~/some-new-daemon-clone; cd ${D} && git checkout --detach'],
+      ['a ${HOME}-assigned variable', 'D=${HOME}/some-new-daemon-clone; cd $D && git checkout --detach'],
+    ])('DENIES `git checkout --detach` through %s', (_n, cmd) => denies(cmd));
+    it('a quoted tilde in an assignment stays literal and never reaches the clone', () => {
+      expect(runHook(`D='~/some-new-daemon-clone'; cd "$D" && git checkout --detach`, lane, root)).toBeNull();
+      expect(runHook('D="~/some-new-daemon-clone"; cd "$D" && git checkout --detach', lane, root)).toBeNull();
+    });
+    // Where no home expansion applies, main's literal-variable resolution still decides — never weaker.
+    it.each([
+      ['HOME made unknown after a literal clone value', `HOME=${fakeClone}; HOME=$(mktemp -d); cd "$HOME" && git checkout --detach`],
+      ['a variable rebound by a substitution', `D=${fakeClone}; D=$(x); cd "$D" && git checkout --detach`],
+      ['a variable rebound by read', `D=${fakeClone}; read D <f; cd "$D" && git checkout --detach`],
+      ['HOME rebound by read', `HOME=${fakeClone}; read HOME <f; cd "$HOME" && git checkout --detach`],
+      ['HOME made unknown, with an unquoted target', `HOME=${fakeClone}; HOME=$(x); cd $HOME && git checkout --detach`],
+      ['HOME rebound by read, with a braced target', `HOME=${fakeClone}; read HOME <f; cd \${HOME} && git checkout --detach`],
+      ['HOME made unknown, with a quoted braced target', `HOME=${fakeClone}; HOME=$(x); cd "\${HOME}" && git checkout --detach`],
+      ['a variable rebound by read, with an unquoted target', `D=${fakeClone}; read D <f; cd $D && git checkout --detach`],
+      ['a variable rebound by a substitution, with a braced target', `D=${fakeClone}; D=$(x); cd \${D} && git checkout --detach`],
+      ['HOME appended inside the clone', `HOME=${fakeClone}; HOME+=/sub; cd "$HOME" && git checkout --detach`],
+    ])('DENIES like main when %s', (_n, cmd) => denies(cmd));
+    it('keeps the read-only control allowed', () => {
+      expect(runHook('cd ~/some-new-daemon-clone && git status', lane, root)).toBeNull();
+    });
+    it('does not treat a quoted tilde or single-quoted HOME as the home path', () => {
+      expect(runHook('cd "~/some-new-daemon-clone" && git checkout --detach', lane, root)).toBeNull();
+      expect(runHook("cd '$HOME/some-new-daemon-clone' && git checkout --detach", lane, root)).toBeNull();
+    });
+    it('fabricates no home target when HOME is unset', () => {
+      const res = execFileSync(process.execPath, [GUARD], {
+        input: JSON.stringify({ tool_input: { command: 'cd ~/some-new-daemon-clone && git checkout --detach' }, cwd: lane }),
+        env: { ...process.env, WE_DAEMON_OVERLAY_DIR: overlayDir, HOME: '' },
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'ignore'],
+      }).trim();
+      // unresolved target → reported cwd (the lane) → the clone is never reached → nothing to deny
+      expect(res).toBe('');
+    });
   });
 });
 
