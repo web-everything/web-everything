@@ -6,6 +6,9 @@ import { recordBuildFailure, clearBuildFailure, listBuildBackoffs } from '../../
 import { runBuildDispatchTick, cliHostLoadGate, cliSettleLaunches, cliLaunchConfirmed } from '../build-dispatch-daemon.mjs';
 import { listBuildDispatchClaims, acquireBuildDispatchClaim, releaseBuildDispatchClaim } from '../../../scripts/conveyor/build-dispatch-claim.mjs';
 import { adoptOrphanedBuildClaims } from '../../../scripts/conveyor/build-dispatch-orphan-adopt.mjs';
+import { outcomePayload } from '../../../scripts/operations/cli-adapter.mjs';
+import { readDispatchOutcome } from '../build-dispatch-daemon.mjs';
+import { readBuildUnconfirmedSettings } from '../../../scripts/lib/build-unconfirmed-settings.mjs';
 
 const scope = ['plateau-app:src/a.ts'];
 const tickOut = () => ({
@@ -33,6 +36,80 @@ describe('non-blocking launch (78b)', () => {
   let lockRoot;
   beforeEach(() => { lockRoot = mkdtempSync(join(tmpdir(), 'bdd-nb-')); });
   afterEach(() => { rmSync(lockRoot, { recursive: true, force: true }); });
+
+  it('confirms the real CLI dispatch envelope from its persisted receipt, without a later liveness rescue', async () => {
+    const { createFileRunStore } = await import('../../../scripts/operations/run-store.mjs');
+    const { startRun } = await import('../../../scripts/operations/engine.mjs');
+    const { createRegistry } = await import('../../../scripts/operations/registry.mjs');
+    const { dispatchLaneOperation } = await import('../../../scripts/operations/dispatch-lane.mjs');
+    const registry = createRegistry();
+    registry.register(dispatchLaneOperation({ readTick: () => ({}) }));
+    const store = createFileRunStore(lockRoot);
+    const run = startRun({ op: 'dispatch-lane', id: 'receipt-test', input: { num: '4415' }, registry });
+    run.verdict = { dispatching: true, lane: 16 };
+    run.effects = [{ key: 'receipt-test#2#0', stepIndex: 2, step: 'dispatch', index: 0,
+      type: 'conveyor.dispatch-delivery-agent', idempotent: false, payload: {}, status: 'in-flight', handle: 'pid:65420' }];
+    store.write(run);
+    const envelope = outcomePayload({ run: store.read(run.id), stopped: 'effect-in-flight' });
+    expect(readDispatchOutcome(JSON.stringify(envelope))).toMatchObject({ dispatching: true, handle: 'pid:65420', reason: null });
+    // A key with no handle, a declared effect, and a halted sink still fail closed.
+    for (const receipt of [{ ...run.effects[0], handle: null }, { ...run.effects[0], status: 'declared' },
+      { ...run.effects[0], status: 'failed', error: 'worker refused' }]) {
+      expect(readDispatchOutcome(JSON.stringify(outcomePayload({ run: { ...run, effects: [receipt] }, stopped: 'effect-halted' }))).dispatching).toBe(false);
+    }
+  });
+
+  it('unconfirmed twice on the same base cools down #4415 before any third launch, with durable needs-you evidence', async () => {
+    const path = join(lockRoot, 'failures.json');
+    let clock = 0;
+    const settings = { baseMs: 1, maxMs: 1, maxAttempts: 6 };
+    const reason = 'dispatch launch not confirmed (missing effect; no running session) [stdout: { "stopped": "effect-in-flight" }]';
+    const dispatch = vi.fn(() => ({ dispatching: true, pending: true }));
+    let settled = [];
+    const effects = () => effectsFor(lockRoot, {
+      planTick: () => { const t = tickOut(); t.decisions.spawnBuilds[0].num = '4415'; t.decisions.admission.queue[0].num = '4415'; t.decisions.admission.cleared[0].num = '4415'; return t; },
+      dispatch, settleLaunches: () => ({ pending: [], settled }),
+      recordBuildFailure: o => recordBuildFailure(o, { path, now: clock, settings }),
+      listBuildBackoffs: () => listBuildBackoffs({ path, now: clock }),
+    });
+    await runBuildDispatchTick({ live: true, effects: effects() });
+    settled = [{ num: '4415', kind: 'build', base: 'base-a', outcome: { dispatching: false, reason } }];
+    await runBuildDispatchTick({ live: true, effects: effects() });
+    settled = []; clock = 2;
+    await runBuildDispatchTick({ live: true, effects: effects() });
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    settled = [{ num: '4415', kind: 'build', base: 'base-a', outcome: { dispatching: false, reason: `${reason}; last attempt` } }];
+    const cooled = await runBuildDispatchTick({ live: true, effects: effects() });
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(cooled.needsYou).toContainEqual(expect.objectContaining({ num: '4415', step: 'launch-confirmation', reason: expect.stringContaining('last attempt') }));
+    expect(cooled.buildBackoffs).toContainEqual(expect.objectContaining({ num: '4415', unconfirmedCooldown: true, retryAfter: new Date(clock + 120 * 60_000).toISOString() }));
+    settled = []; clock = 60_000;
+    const restarted = await runBuildDispatchTick({ live: true, effects: effects() });
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(restarted.needsYou).toContainEqual(expect.objectContaining({ num: '4415', step: 'launch-confirmation' }));
+    clock = 120 * 60_000 + 3;
+    await runBuildDispatchTick({ live: true, effects: effects() });
+    expect(dispatch).toHaveBeenCalledTimes(3);
+  });
+
+  it('counts unconfirmed launches per base and resolves the cooldown cascade with source logging', () => {
+    const log = vi.fn();
+    const unconfirmed = readBuildUnconfirmedSettings({ platform: { unconfirmedLaunchMax: 3, unconfirmedCooldownMin: 50 },
+      tool: { unconfirmedCooldownMin: 60 }, env: { WE_BUILD_UNCONFIRMED_LAUNCH_MAX: '2', WE_POLICY_CASCADE_LOG: '1' }, log });
+    expect(unconfirmed).toEqual({ unconfirmedLaunchMax: 2, unconfirmedCooldownMin: 60 });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('unconfirmedLaunchMax=2 (env)'));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('unconfirmedCooldownMin=60 (tool)'));
+    expect(readBuildUnconfirmedSettings({ platform: {}, tool: {}, env: {} }))
+      .toEqual({ unconfirmedLaunchMax: 2, unconfirmedCooldownMin: 120 });
+    expect(readBuildUnconfirmedSettings({ platform: { unconfirmedLaunchMax: 4, unconfirmedCooldownMin: 45 },
+      tool: { unconfirmedLaunchMax: -1 }, env: { WE_BUILD_UNCONFIRMED_LAUNCH_MAX: 'oops', WE_BUILD_UNCONFIRMED_COOLDOWN_MIN: '0' } }))
+      .toEqual({ unconfirmedLaunchMax: 4, unconfirmedCooldownMin: 45 });
+    const path = join(lockRoot, 'base-failures.json');
+    const fail = base => recordBuildFailure({ num: '4415', base, reason: 'dispatch launch not confirmed' }, { path, now: 0, unconfirmed });
+    expect(fail('a').unconfirmedLaunches).toBe(1);
+    expect(fail('b').unconfirmedLaunches).toBe(1);
+    expect(fail('b')).toMatchObject({ unconfirmedLaunches: 2, unconfirmedCooldown: true, retryAfter: new Date(60 * 60_000).toISOString() });
+  });
 
   it('a pending launch keeps its claim and is not offered again; a launched settle keeps the claim', async () => {
     const settleLaunches = vi.fn(async () => ({ pending: [], settled: [] }));
@@ -65,10 +142,11 @@ describe('non-blocking launch (78b)', () => {
     try {
       const { startDetachedLaunch } = await import('../../../scripts/conveyor/pending-launches.mjs');
       const { writeFileSync } = await import('node:fs');
-      const rec = startDetachedLaunch({ root, num: '4131', kind: 'build', argv: ['x'], env: {}, cwd: root, spawn: () => ({ pid: 9, unref() {} }) });
+      const rec = startDetachedLaunch({ root, num: '4131', kind: 'build', base: 'launch-base', argv: ['x'], env: {}, cwd: root, spawn: () => ({ pid: 9, unref() {} }) });
       writeFileSync(rec.outFile, JSON.stringify({ run: { verdict: { dispatching: true }, effects: [{ type: 'conveyor.dispatch-delivery-agent', status: 'declared' }] } }));
       const yes = await cliSettleLaunches({ root, isPidAlive: () => false, confirmed: async () => true });
       expect(yes.settled[0].outcome.dispatching).toBe(true);
+      expect(yes.settled[0]).toMatchObject({ base: 'launch-base', outcome: { reason: null, confirmedBy: 'live-session' } });
       const rec2 = startDetachedLaunch({ root, num: '4132', kind: 'build', argv: ['x'], env: {}, cwd: root, spawn: () => ({ pid: 9, unref() {} }) });
       writeFileSync(rec2.outFile, JSON.stringify({ run: { verdict: { dispatching: true }, effects: [] } }));
       const no = await cliSettleLaunches({ root, isPidAlive: () => false, confirmed: async () => false });

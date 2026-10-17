@@ -21,7 +21,7 @@ const safe = (s) => String(s).replace(/[^A-Za-z0-9._-]/g, '_');
 const recordPath = (root, id) => join(root, `${id}.pending.json`);
 
 /** Spawn `node <argv>` detached, stdout/stderr to files, and persist the pending record. Never waits. */
-export function startDetachedLaunch({ root, num, kind, attempt = new Date().toISOString(), argv, env, cwd, workDir, spawn = nodeSpawn, now = Date.now }) {
+export function startDetachedLaunch({ root, num, kind, base = null, attempt = new Date().toISOString(), argv, env, cwd, workDir, spawn = nodeSpawn, now = Date.now }) {
   mkdirSync(root, { recursive: true });
   const id = `${safe(num)}-${safe(kind)}-${safe(attempt)}`;
   const outFile = join(root, `${id}.out`);
@@ -33,7 +33,7 @@ export function startDetachedLaunch({ root, num, kind, attempt = new Date().toIS
     child = spawn('node', argv, { cwd, env, detached: true, stdio: ['ignore', out, err] });
     child.unref?.();
   } finally { closeSync(out); closeSync(err); }
-  const record = { id, num: String(num), kind, attempt, pid: child?.pid ?? null, startedAt: new Date(now()).toISOString(), outFile, errFile, workDir: workDir ?? null };
+  const record = { id, num: String(num), kind, base, attempt, pid: child?.pid ?? null, startedAt: new Date(now()).toISOString(), outFile, errFile, workDir: workDir ?? null };
   writeFileSync(recordPath(root, id), JSON.stringify(record), { mode: 0o600 });
   return record;
 }

@@ -497,7 +497,7 @@ describe('a late launch (effect-in-flight) retries quickly, not on the failure p
   });
   // One assertion per call site that threads `code` into backoffVerdict (PR #4323 review): dropping it at any of them
   // silently sends a late launch back to the 5-60 min failure path.
-  it('a BUILD dispatch failure with that evidence also waits 30s (recordBuildFailure threads the reason code)', () => {
+  it('a BUILD initially retries quickly, then the unconfirmed guard overrides the quick schedule', () => {
     const dir = mkdtempSync(join(tmpdir(), 'quick-retry-build-'));
     try {
       const path = join(dir, 'b.json');
@@ -505,7 +505,9 @@ describe('a late launch (effect-in-flight) retries quickly, not on the failure p
       const r = recordBuildFailure({ num: '4647', reason: IN_FLIGHT }, { path, now, settings: DEFAULTS });
       expect(r).toMatchObject({ reasonCode: 'launch-in-flight', attempts: 1, exhausted: false });
       expect(Date.parse(r.retryAfter) - now).toBe(30_000);
-      expect(Date.parse(recordBuildFailure({ num: '4647', reason: IN_FLIGHT }, { path, now, settings: DEFAULTS }).retryAfter) - now).toBe(60_000);
+      const cooled = recordBuildFailure({ num: '4647', reason: IN_FLIGHT }, { path, now, settings: DEFAULTS });
+      expect(cooled).toMatchObject({ unconfirmedLaunches: 2, unconfirmedCooldown: true });
+      expect(Date.parse(cooled.retryAfter) - now).toBe(120 * 60_000);
       // the same record under the slow path still waits 5 min, so the assertion above can only pass via the code
       expect(Date.parse(recordBuildFailure({ num: '4648', reason: NOT_CONFIRMED }, { path, now, settings: DEFAULTS }).retryAfter) - now).toBe(5 * 60_000);
     } finally { rmSync(dir, { recursive: true, force: true }); }

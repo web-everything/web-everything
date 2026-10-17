@@ -1415,6 +1415,10 @@ export function outcomePayload({ run, stopped, error = null, applied = [], owned
     // no `effects` either, there was no way to recover a parked run's handle over HTTP at all. Reading the
     // record answers the same on every route.
     inFlight: run.effects.filter((e) => e.status === 'in-flight').map((e) => e.key),
+    // Dispatch callers need the persisted receipt, including its handle, to confirm a launch.
+    // Keys alone prove neither a successful spawn nor which process owns the work.
+    ...(run.op === 'dispatch-lane' ? { effects: run.effects.map(({ key, type, status, handle, error }) =>
+      ({ key, type, status, handle, ...(error ? { error } : {}) })) } : {}),
     pending: run.pending, verdict: run.verdict, findings: run.findings,
     // The meter, and its total pre-summed — a consumer must not have to re-derive "what did this cost".
     telemetry: run.telemetry ?? [], spend: totalJudgeSpend(run),
