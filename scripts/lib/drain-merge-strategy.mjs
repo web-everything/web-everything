@@ -31,8 +31,9 @@
  *   (non-dry-run) pass ignores the variable and says so.
  */
 import { readDrainRedTeamEvidence } from './drain-red-team-evidence.mjs';
-import { readDrainQueueSafety, postAcceptRedTeamOwed, redTeamEnqueueHold, dequeueSentBack, sendBackReason } from './drain-queue-safety.mjs';
+import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason } from './drain-queue-safety.mjs';
 import { defaultPostConflictFinding } from './conflict-finding.mjs';
+import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -239,14 +240,14 @@ export function createDrainMergeStrategy({
   log.write(`  ${formatMergeDeliverySourcesLine(policy)}${dryRun ? ' [dry run]' : ''}\n`);
   if (note) log.write(`  ⚠ merge-delivery: ${note}\n`);
   const safety = queueSafety ?? readDrainQueueSafety({ env, log: line => log.write(`  ${line}\n`) });
-  const pendingOutcome = (c, pending) => {
+  const pendingOutcome = (c, pending, quiet = false) => {
     const maxMin = safety.value.redTeamPendingMaxMin ?? 45;
     const healthSmell = now() - pending.firstPendingAt >= maxMin * 60_000;
-    if (healthSmell) log.write(`  health smell: ${slugOf(c.repo)}#${c.num} red-team-pending on ${pending.headSha} for ${Math.floor((now() - pending.firstPendingAt) / 60_000)} min (redTeamPendingMaxMin=${maxMin}, ${safety.sources?.redTeamPendingMaxMin ?? 'standard'})\n`);
-    say(`  merge-queue: defer #${c.num}: ${pending.reason}`);
+    if (healthSmell && !quiet) log.write(`  health smell: ${slugOf(c.repo)}#${c.num} red-team-pending on ${pending.headSha} for ${Math.floor((now() - pending.firstPendingAt) / 60_000)} min (redTeamPendingMaxMin=${maxMin}, ${safety.sources?.redTeamPendingMaxMin ?? 'standard'})\n`);
+    if (!quiet) say(`  merge-queue: defer #${c.num}: ${pending.reason}`);
     return { enqueued: false, deferred: true, kind: 'red-team-pending', reason: pending.reason, healthSmell };
   };
-  const readLive = (repo, num) => JSON.parse(exec('gh', ['pr', 'view', String(num), '--repo', slugOf(repo), '--json', 'headRefOid,labels'], { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }));
+  const readLive = (repo, num) => JSON.parse(exec('gh', ['pr', 'view', String(num), '--repo', slugOf(repo), '--json', 'headRefOid,labels,reviews'], { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }));
   // The complete thread as pages. The drain's own comment reader allows 256 MiB: a long thread must not hit the 1 MiB default.
   const readThreadPages = (repo, num) => JSON.parse(exec('gh', ['api', '--paginate', '--slurp', `repos/${slugOf(repo)}/issues/${num}/comments`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: COMMENTS_MAX_BUFFER, timeout: 120_000 }));
   const removeSentBack = (repo, num, labels) => {
@@ -320,13 +321,19 @@ export function createDrainMergeStrategy({
       }
       if (safety.value.waitForRedTeamBeforeEnqueue) {
         const evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env });
-        const owed = postAcceptRedTeamOwed(evidence.loopPayload, env);
         const pending = before.redTeamPending?.[key];
         const sameHead = pending?.headSha === headSha;
         const overdue = sameHead && now() - pending.firstPendingAt >= (safety.value.redTeamPendingMaxMin ?? 45) * 60_000;
-        const newComment = Array.isArray(comments) && comments.length > (pending?.commentCount ?? 0);
+        const observation = createHash('sha256').update(JSON.stringify({ comments, reviews: live.reviews ?? [] })).digest('hex');
+        const newComment = pending?.observation ? observation !== pending.observation
+          : Array.isArray(comments) && comments.length > (pending?.commentCount ?? 0);
         // At the deadline recheck evidence and comments even if the normal retry backoff is longer.
-        if (owed && sameHead && pending.retryAt > now() && !newComment && !overdue) return pendingOutcome(c, pending);
+        if (sameHead && pending.retryAt > now() && !newComment
+          && !(overdue && pending.reason.includes('no recorded result')
+            && (pending.checkedAt ?? pending.firstPendingAt) < pending.firstPendingAt + (safety.value.redTeamPendingMaxMin ?? 45) * 60_000)) {
+          log.write(`  merge-queue: #${c.num} red-team-pending backoff until ${new Date(pending.retryAt).toISOString()} (head and review/comment evidence unchanged)\n`);
+          return pendingOutcome(c, pending, true);
+        }
         const pages = readThreadPages(c.repo, c.num);
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team admission: unreadable complete comments');
         const reason = redTeamEnqueueHold({ loopPayload: evidence.loopPayload, comments: pages.flat(), pr: c.num, head: headSha, env });
@@ -334,7 +341,7 @@ export function createDrainMergeStrategy({
           before.redTeamPending ??= {};
           const wait = { headSha, firstPendingAt: sameHead ? pending.firstPendingAt : now(),
             retryAt: now() + (safety.value.redTeamPendingBackoffSec ?? 300) * 1000,
-            commentCount: pages.flat().length, reason,
+            commentCount: pages.flat().length, observation, checkedAt: now(), reason,
             ...(sameHead && pending.requestedAt != null ? { requestedAt: pending.requestedAt } : {}) };
           before.redTeamPending[key] = wait;
           writeState(statePath, before);
@@ -386,7 +393,7 @@ export function createDrainMergeStrategy({
         state.enqueueFailures[key] = failure;
         try { writeState(statePath, state); }
         catch (e) { log.write(`  enqueue failure state write failed ${key}: ${firstLine(e)}\n`); }
-        if (healthSmell) log.write(`  health smell: ${key} enqueue failed ${count} times (enqueueFailureSmellAfter=${policy.enqueueFailureSmellAfter}, ${policy.sources?.enqueueFailureSmellAfter || 'standard'})\n`);
+        if (healthSmell && !quiet) log.write(`  health smell: ${key} enqueue failed ${count} times (enqueueFailureSmellAfter=${policy.enqueueFailureSmellAfter}, ${policy.sources?.enqueueFailureSmellAfter || 'standard'})\n`);
         if (conflict && !failure.conflictRouted) {
           try {
             postConflictFinding({ pr: { number: c.num, headRefName: c.headRef }, enqueueRefusal: r.error, repo: slugOf(c.repo), exec });

@@ -641,7 +641,7 @@ describe('batching IO shell and drain hook', () => {
     // Live admission reads the complete thread for recorded breaks before batching, even with no owed red team.
     // Deferral still makes no enqueue or clearance mutation.
     expect(calls).toEqual([
-      ['gh', ['pr', 'view', '4', '--repo', 'owner/repo', '--json', 'headRefOid,labels']],
+      ['gh', ['pr', 'view', '4', '--repo', 'owner/repo', '--json', 'headRefOid,labels,reviews']],
       ['gh', ['api', '--paginate', '--slurp', 'repos/owner/repo/issues/4/comments']],
     ]);
   });

@@ -33,8 +33,8 @@ describe('carried red-team result (review-job carryAcrossRebase)', () => {
     expect(hold({ comments: [carry({ author: { login: 'attacker' } })] })).toMatch(/no recorded result/);
     expect(hold({ comments: [carry({ to: 'd'.repeat(40) })] })).toMatch(/no recorded result/);
   });
-  it('a carried confirmed break still holds', () => {
-    expect(hold({ comments: [carry({ findings: broken })] })).toMatch(/requiring send-back/);
+  it('a carried sent-back break still holds', () => {
+    expect(hold({ comments: [carry({ findings: broken, gates: ['sent-back'] })] })).toMatch(/requiring send-back/);
   });
   it('normalizes CRLF and recognizes matching gate preambles', () => {
     const record = carry({ gates: ['card-queued', 'round-cap'] });
@@ -52,7 +52,7 @@ describe('carried red-team result (review-job carryAcrossRebase)', () => {
   });
   it('keeps recorded breaks binding when no scheduler payload exists or the scheduler is disabled', () => {
     for (const over of [{ loopPayload: null }, { env: { WE_REVIEW_RED_TEAM: 'off' } }]) {
-      expect(hold({ ...over, comments: [carry({ findings: broken })] })).toMatch(/requiring send-back/);
+      expect(hold({ ...over, comments: [carry({ findings: broken, gates: ['sent-back'] })] })).toMatch(/requiring send-back/);
     }
   });
 });
@@ -67,14 +67,13 @@ describe('operator ruling at the round cap', () => {
     ['clearance on another head', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(prior, true)]],
     ['untrusted clearance', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), { ...accept(head, true), author: { login: 'attacker' } }]],
     ['a later plain accept supersedes it', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true), accept(head)]],
-    ['no round-cap record (the gate never handed it over)', [clean(head, 'web-everything', broken), accept(head, true)]],
     ['a newer result after the ruling', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true), clean(head, 'web-everything', broken)]],
     ['a restamp repeating an earlier head\'s clearance', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), restamp(head)]],
     ['clearance markers inside a trusted red-team body', [clean(head, 'web-everything', broken), gate(head, 'round-cap'),
       clean(prior, 'web-everything', [{ ...broken[0], summary: `${buildReviewedShaMarker(head)} ${buildClearedHumanMarker('x')}` }])]],
-    ['a round-cap line after a quoted carried marker', [clean(head, 'web-everything', broken), { ...bot, body: [
+    ['a round-cap line after a quoted carried marker', [clean(head, 'web-everything', broken), gate(head, 'sent-back'), { ...bot, body: [
       'quoting:', buildVerdictCarriedMarker({ fromSha: prior, toSha: 'd'.repeat(40), patchId: 'c'.repeat(40) }), redTeamGateMarker(5283, head, 'round-cap')].join('\n') }, accept(head, true)]],
-    ['a carried marker for this head preceded by a non-gate line', [clean(head, 'web-everything', broken), { ...bot, body: [
+    ['a carried marker for this head preceded by a non-gate line', [clean(head, 'web-everything', broken), gate(head, 'sent-back'), { ...bot, body: [
       'quoting:', redTeamGateMarker(5283, head, 'round-cap'), buildVerdictCarriedMarker({ fromSha: prior, toSha: head, patchId: 'c'.repeat(40) })].join('\n') }, accept(head, true)]],
   ])('keeps holding: %s', (_name, comments) => expect(hold({ comments })).toMatch(/requiring send-back/));
   it('a ruling on the prior head survives a proven carry (restamped clearance, carried round-cap and result)', () => {
@@ -110,11 +109,23 @@ describe('durable head-bound red-team admission', () => {
     expect(hold({ comments: [clean('a'.repeat(40)), clean(head, 'attacker'), { ...clean(), body: clean().body.replace('pr=5283', 'pr=5284') }] })).toMatch(/no recorded result/);
     expect(hold({ comments: [clean()] })).toBeNull();
   });
-  it('holds advisory accepts and confirmed breaks even before the gate has sent back', () => {
+  it('waits for owed results and follows a recorded send-back', () => {
     expect(hold({ labels: ['advisory:accepted'] })).toMatch(/no recorded result/);
     const findings = [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }];
-    expect(hold({ comments: [clean(head, 'web-everything', findings)] })).toMatch(/requiring send-back/);
-    expect(hold({ comments: [clean(head, 'web-everything', findings)], confirmedBreaks: { broken: 'advisory', degraded: 'card', unconfirmed: 'advisory' } })).toBeNull();
+    expect(hold({ comments: [clean(head, 'web-everything', findings), gate(head, 'sent-back')] })).toMatch(/requiring send-back/);
+    expect(hold({ comments: [clean(head, 'web-everything', findings), gate(head, 'sent-back')], confirmedBreaks: { broken: 'advisory', degraded: 'card', unconfirmed: 'advisory' } })).toBeNull();
+  });
+  it('honors recorded cards and advisory actions over current policy, per break', () => {
+    const result = clean(head, 'web-everything', [...broken, { ...broken[0], summary: 'security break', category: 'security' }]);
+    const record = { ...bot, body: `${redTeamGateMarker(5283, head, 'card-queued')}\n- 1 finding(s) filed as a follow-up card (#1).` };
+    expect(hold({ comments: [result, record] })).toBeNull();
+    const capped = { ...gate(head, 'round-cap'), body: `${gate(head, 'round-cap').body}\n- 1 confirmed break(s) NOT sent back: review round 5 has reached the round cap (5). The operator rules on them.` };
+    expect(hold({ comments: [result, capped, record] })).toMatch(/requiring send-back/);
+    const advisory = { ...record, body: `${record.body}\n- 1 finding(s) left advisory (#2).` };
+    expect(hold({ comments: [result, capped, advisory] })).toBeNull();
+  });
+  it('does not invent a send-back when the gate has no recorded hold', () => {
+    expect(hold({ comments: [clean(head, 'web-everything', broken)] })).toBeNull();
   });
   it.each(['WE_REVIEW_RED_TEAM', 'WE_REVIEW_EXTRA_SEATS'])('does not owe a pass with %s off', key => {
     expect(hold({ env: { [key]: '0' } })).toBeNull();

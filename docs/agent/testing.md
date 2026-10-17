@@ -52,6 +52,21 @@ The sequential and speculative paths skip before budget reservation and record t
 `red team skipped: card-only`. Setting `recheckReadsRepo=false` restores a tool-free re-check;
 negative answers without file reads remain unverifiable.
 
+## Drain red-team disposition and retry evidence
+
+Queue admission and operator escalation share `red-team-gate.mjs#readRedTeamDisposition`.
+Read the live head's recorded per-finding gate actions before consulting current policy:
+a card/advisory record releases that finding, while sent-back and round-cap records retain
+only their unresolved findings. Legacy cap comments omit indices; exclude separately
+recorded card/advisory findings before surfacing the remaining confirmed breaks. Acceptance
+labels alone do not prove an operator ruled on a cap-held break; use the sanctioned
+head-bound clearance ceremony, including proven identical-contribution carries.
+
+Persist red-team backoff independently of whether the scheduler currently owes a pass.
+The observed comments and live reviews wake a pending head when their evidence changes;
+otherwise a recorded break waits until its retry deadline, including after the health-smell
+age. Only missing-result scheduling gaps retain the maximum-age scheduling fallback.
+
 ## Codex usage accounting
 
 Every direct task, Codex delivery/fix worker, wrapped Codex dispatch worker, and Codex review
