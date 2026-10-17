@@ -10,8 +10,9 @@ Exit failures and `ok:false` never receive this retry. Both settings use the pol
 `WE_SMOKE_BOOT_SIGNAL_RETRIES`; log effective values and sources. Retain per-attempt signal,
 exit code and the last 30 stderr lines in the smoke result. Rebuild rejection/held/stale alerts
 must preserve boot tails beyond the ordinary detail caps while still redacting secrets: redact
-stderr where it is read (`redactSecrets`: the `ci-heal-mark.mjs` secret shapes, including
-`*_KEY=`/`*PASSWORD=` pairs, URL credentials and PEM keys; CR/U+2028 split lines; 500-char lines).
+stderr where it is read (`redactSecrets`: the `ci-heal-mark.mjs` secret shapes plus generic
+`*_KEY=` names, `*PASSWORD=` pairs, URL credentials and PEM keys, including a body whose BEGIN line
+was cut off; NFKC and invisible characters folded first; CR/U+2028 split lines; 500-char lines).
 A boot detail names every failed entry and its signal in its header and gives each failure an
 equal share of a 12 KB budget (16 KB backstop). A dispatch-smoke stderr tail stays in the
 structured `diagnostics` field only, never in `detail`; `detail` is redacted where the verdict is

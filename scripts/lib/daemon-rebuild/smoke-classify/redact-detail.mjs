@@ -7,11 +7,13 @@ const MAX_BOOT_DETAIL = 16_000;
 // CR, U+0085, U+2028 and U+2029 end a line; every other control character (but tab and newline) is dropped.
 const LINE_BREAKS = new RegExp(`\\r\\n?|[${String.fromCharCode(0x85, 0x2028, 0x2029)}]`, 'g');
 const CONTROLS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u0084\u0086-\u009f]/g;
+const INVISIBLE = /[­​-‏‪-‮⁠-⁤﻿]/g;
 
 /**
- * One line with every known secret shape redacted — the same shapes as `ci-heal-mark.mjs#redactSecrets`
- * (tokens, keys, JWTs, auth headers, PEM keys, URL credentials, `*_TOKEN=`/`*password:` style pairs), kept here
- * so the daemon smoke path does not import the conveyor's comment module. The key run is bounded (no quadratic scan).
+ * One line with every known secret shape redacted — the shapes of `ci-heal-mark.mjs#redactSecrets` (tokens, keys,
+ * JWTs, auth headers, PEM keys, URL credentials, `*_TOKEN=`/`*password:` style pairs) plus generic `*_KEY=` names,
+ * kept here so the daemon smoke path does not import the conveyor's comment module. The key run is bounded (no
+ * quadratic scan).
  */
 function redactLine(line) {
   return line
@@ -19,35 +21,52 @@ function redactLine(line) {
     .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|glpat-[A-Za-z0-9_-]{16,}|npm_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*)/g,
       (m) => `${m.match(/^(?:gh[pousr]_|github_pat_|glpat-|npm_|sk-ant-|sk-|AKIA|xox[baprs]-|AIza|eyJ)/)?.[0] ?? ''}<redacted>`)
     .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 <redacted>')
-    // `name=value` / `name: value` / `"name": "value"`, then `--name value`. Two passes, so a declined match (a plain
-    // word such as `monkey`) never swallows the `token=…` after it.
-    .replace(ASSIGNMENT, (m, _q, dashes, key) => (isSecretKeyName(key) ? `${dashes ?? ''}${key}=<redacted>` : m))
-    .replace(FLAG, (m, _q, dashes, key) => (isSecretKeyName(key) ? `${dashes}${key}=<redacted>` : m));
+    // `name=value` / `name: value` / `"name": "value"`, then `--name value`, then camelCase `serviceKey: value`. Only a
+    // secret name can match at all, so no match on a plain word (`monkey: token=…`) swallows the pair after it.
+    .replace(ASSIGNMENT, (_m, _q, dashes, key) => `${dashes ?? ''}${key}=<redacted>`)
+    .replace(FLAG, (_m, _q, dashes, key) => `${dashes}${key}=<redacted>`)
+    .replace(CAMEL_ASSIGNMENT, (_m, _q, key) => `${key}=<redacted>`);
 }
 
-const KEY_NAME = '[A-Za-z0-9_]{0,48}(?:token|secret|password|passwd|api[_-]?key|[_-]?key|auth|credential)[A-Za-z0-9_-]{0,48}';
-const VALUE = `("[^"]*"|'[^']*'|\\S+)`;
+// A secret word, or a generic key name (`KEY`, `*_KEY`, `*-key`, `PRIVATEKEY`) — never a word that merely contains
+// "key" (`monkey`, `keyboard`).
+const KEY_WORD = 'token|secret|password|passwd|api[_-]?key|auth|credential|[_-]?(?<![A-Za-z])key(?![a-z])|(?:private|access|ssh|pass|signing|encryption|master)key';
+const KEY_NAME = `[A-Za-z0-9_]{0,48}(?:${KEY_WORD})[A-Za-z0-9_-]{0,48}`;
+// A quoted value may hold spaces and escaped quotes.
+const VALUE = `("(?:[^"\\\\]|\\\\.)*"|'(?:[^'\\\\]|\\\\.)*'|\\S+)`;
 const ASSIGNMENT = new RegExp(`(["']?)(--?)?(${KEY_NAME})\\1(\\s*[=:]\\s*)${VALUE}`, 'gi');
 const FLAG = new RegExp(`(["']?)(--?)(${KEY_NAME})\\1\\s+${VALUE}`, 'gi');
-const SECRET_WORD = /token|secret|password|passwd|api[_-]?key|auth|credential/i;
-/** A secret-keyword name, or a generic key name: `KEY`, `*_KEY`, `*-key`, camelCase `serviceKey` — never a word that
- *  merely ends in "key" (`monkey`, `hockey`). */
-function isSecretKeyName(name) {
-  return SECRET_WORD.test(name) || /(?:^|[^A-Za-z])key/i.test(name) || /[a-z0-9]Key/.test(name);
-}
+const CAMEL_ASSIGNMENT = new RegExp(`(["']?)([A-Za-z0-9_]{0,48}[a-z0-9]Key)\\1\\s*[=:]\\s*${VALUE}`, 'g');
 
-const ORPHAN_END = /-----END [A-Z ]*PRIVATE KEY-----/;
-/** A key whose BEGIN line was cut off upstream: drop the base64 body lines right above its orphaned END line — the
- *  last body line may be short, earlier ones are 16+ chars — with no count cap, so a long key is never partly kept.
- *  Linear: each line is dropped at most once. */
+const ORPHAN_END = /-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/;
+const B64 = /[A-Za-z0-9+/=]/;
+// A body line, bare or indented, quoted, `\n`-escaped or `+`-joined (Node's inspect form); the last may be short.
+const BODY_LINE = /^\s*['"`]?[A-Za-z0-9+/=]{16,}(?:\\n)?['"`]?[\s+,]*$/;
+const LAST_BODY_LINE = /^\s*['"`]?[A-Za-z0-9+/=]+(?:\\n)?['"`]?[\s+,]*$/;
+/** Where a `\n`-escaped body (JSON) that runs up to `end` on the same line starts. Linear: one backward walk. */
+function escapedBodyStart(line, end) {
+  let i = end;
+  while (line.endsWith('\\n', i)) {
+    let k = i - 2;
+    while (k > 0 && B64.test(line[k - 1]) && !(line[k - 1] === 'n' && line[k - 2] === '\\')) k--;
+    if (k === i - 2) break;
+    i = k;
+  }
+  return i;
+}
+/** A key whose BEGIN line was cut off upstream: drop its body lines right above the orphaned END line, and a body
+ *  escaped onto the END line itself, with no count cap, so a long key is never partly kept. Linear: each line is
+ *  dropped at most once. */
 function redactOrphanedKeys(text) {
-  if (!text.includes('PRIVATE KEY-----')) return text;
+  if (!text.includes('PRIVATE KEY')) return text;
   const out = [];
   for (const line of text.split('\n')) {
-    if (!ORPHAN_END.test(line)) { out.push(line); continue; }
-    if (out.length && /^[A-Za-z0-9+/=]+$/.test(out[out.length - 1])) out.pop();
-    while (out.length && /^[A-Za-z0-9+/=]{16,}$/.test(out[out.length - 1])) out.pop();
-    out.push(line.replace(new RegExp(ORPHAN_END.source, 'g'), '<redacted private key>'));
+    const at = line.search(ORPHAN_END);
+    if (at < 0) { out.push(line); continue; }
+    if (out.length && LAST_BODY_LINE.test(out[out.length - 1])) out.pop();
+    while (out.length && BODY_LINE.test(out[out.length - 1])) out.pop();
+    const start = escapedBodyStart(line, at);
+    out.push(`${line.slice(0, start)}${line.slice(at).replace(new RegExp(ORPHAN_END.source, 'g'), '<redacted private key>')}`);
   }
   return out.join('\n');
 }
@@ -58,8 +77,9 @@ function redactOrphanedKeys(text) {
  * 4x the cap BEFORE redaction (bounding regex work) and to the cap after it, so a cut never slices a secret's prefix.
  */
 export function redactSecrets(text) {
-  const normalised = redactOrphanedKeys(String(text ?? '').replace(LINE_BREAKS, '\n').replace(CONTROLS, '')
-    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g, '<redacted private key>'));
+  // NFKC folds fullwidth letters and invisible characters are dropped, so `ＴＯＫＥＮ=` / `TO​KEN=` still match.
+  const normalised = redactOrphanedKeys(String(text ?? '').normalize('NFKC').replace(LINE_BREAKS, '\n').replace(CONTROLS, '').replace(INVISIBLE, '')
+    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|$)/g, '<redacted private key>'));
   return normalised.split('\n').map((raw) => {
     const line = redactLine(raw.length > MAX_LINE * 4 ? raw.slice(0, MAX_LINE * 4) : raw);
     return line.length > MAX_LINE ? `${line.slice(0, MAX_LINE - 1)}…` : line;

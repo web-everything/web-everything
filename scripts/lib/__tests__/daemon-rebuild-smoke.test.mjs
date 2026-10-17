@@ -160,11 +160,44 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
     // A plain word before the assignment must not swallow it.
     ['monkey token=opaqueCredential123', 'monkey token=<redacted>'],
     ['Auth token=opaqueCredential123', 'Auth token=<redacted>'],
+    ['monkey: token=opaqueCredential123', 'token=<redacted>'],
+    ['hockey:token=opaqueCredential123', 'token=<redacted>'],
+    ['--hotkey --token opaqueCredential123', '--token=<redacted>'],
+    ['PRIVATEKEY=opaqueCredential123', 'PRIVATEKEY=<redacted>'],
+    ['passkey: opaqueCredential123', 'passkey=<redacted>'],
+    ['"token": "ab\\"opaqueCredential123"', 'token=<redacted>'],
+    ['ＴＯＫＥＮ=opaqueCredential123', 'TOKEN=<redacted>'],
+    ['TO​KEN=opaqueCredential123', 'TOKEN=<redacted>'],
   ])('redacts the generic key assignment %s', (line, expected) => {
     expect(redactSecrets(line)).not.toContain('opaqueCredential123');
     expect(redactSecrets(line)).toContain(expected);
   });
-  it.each(['monkey=banana', 'hockey: score 3', 'turkey sandwich'])('leaves a word merely ending in "key" alone: %s', (line) => {
+  it.each([
+    ['indented (YAML)', (l) => `    ${l}`],
+    ['trailing whitespace', (l) => `${l}   `],
+    ['Node inspect', (l) => `  '${l}\\n' +`],
+  ])('drops an orphaned PEM body written %s', (_shape, wrap) => {
+    const body = Array.from({ length: 30 }, (_, n) => `MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ${String(n).padStart(2, '0')}`);
+    const text = ['head line', ...body.map(wrap), wrap('AbC='), '-----END PRIVATE KEY-----', 'tail'].join('\n');
+    expect(redactSecrets(text)).not.toContain('MIIEvQ');
+    expect(redactSecrets(text)).not.toContain('AbC=');
+    expect(redactSecrets(text)).toContain('tail');
+    expect(redactedTail(text)).not.toContain('MIIEvQ');
+  });
+  it('drops an orphaned PEM body escaped onto the END line itself (JSON), and a PGP key block', () => {
+    const json = `{"blob":"MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ\\nMIIEvQIBADANBgkq\\n-----END PRIVATE KEY-----\\n"}`;
+    expect(redactSecrets(json)).not.toContain('MIIEvQ');
+    expect(redactSecrets(json)).toContain('{"blob":"<redacted private key>');
+    const pgp = ['-----BEGIN PGP PRIVATE KEY BLOCK-----', 'lQOYBGVsecretbody', '-----END PGP PRIVATE KEY BLOCK-----', 'ok'].join('\n');
+    expect(redactSecrets(pgp)).not.toContain('lQOYBGV');
+    expect(redactSecrets(['lQOYBGVsecretbodyAAAAAAAA', '=AbCd', '-----END PGP PRIVATE KEY BLOCK-----'].join('\n'))).not.toContain('lQOYBGV');
+  });
+  it('keeps the key-name scan fast on hostile key runs', () => {
+    const t0 = Date.now();
+    for (const run of ['key', '_key', 'token', 'Key']) redactSecrets(run.repeat(Math.ceil(64 * 1024 / run.length)));
+    expect(Date.now() - t0).toBeLessThan(3_000);
+  });
+  it.each(['monkey=banana', 'hockey: score 3', 'turkey sandwich', 'keyboard: true'])('leaves a word merely ending in "key" alone: %s', (line) => {
     expect(redactSecrets(line)).toBe(line);
   });
   it('redactedTail redacts before it cuts: an orphaned PEM body, CR runs, and a hostile key=value run stay bounded', () => {

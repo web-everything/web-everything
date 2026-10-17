@@ -1011,6 +1011,12 @@ describe('runRealDispatchSmoke — the smoke worker\'s completion record goes to
     expect(tail.startsWith('line ')).toBe(true);
   });
 
+  it.skipIf(process.platform === 'win32')('never blocks on a FIFO left at the wrapper stderr path', () => {
+    const fifo = join(work, 'fifo.stderr');
+    execFileSync('mkfifo', [fifo]);
+    expect(readFileTail(fifo)).toBe('');
+  });
+
   it('does not retry a worker that finishes without its commands', async () => {
     const spawn = launchFixture(({ store, slug }) => writeFileSync(join(store, `${slug}.json`), JSON.stringify({ status: 'done' })));
     expect(await smoke(spawn)).toMatchObject({ ok: false, reason: 'no-commands-ran' });

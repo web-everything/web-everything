@@ -55,7 +55,7 @@ import { performance } from 'node:perf_hooks';
 import { setTimeout as sleepAsync } from 'node:timers/promises';
 import { homedir, tmpdir } from 'node:os';
 import {
-  closeSync, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync,
+  closeSync, constants, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync,
 } from 'node:fs';
 import { readHeadSha, isSafeBranchName } from './daemon-self-sync.mjs';
 import { gitRun } from './main-staleness.mjs';
@@ -356,8 +356,11 @@ function findTranscript(ids, home = homedir()) {
 export function readFileTail(file, bytes = 64 * 1024, read = readSync) {
   let fd;
   try {
-    fd = openSync(file, 'r');
-    const size = fstatSync(fd).size;
+    // O_NONBLOCK + O_NOFOLLOW: a FIFO or symlink left at the path must not block or redirect this synchronous read.
+    fd = openSync(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return '';
+    const size = stat.size;
     const start = Math.max(0, size - bytes);
     const buf = Buffer.alloc(size - start);
     const n = read(fd, buf, 0, buf.length, start);
