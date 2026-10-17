@@ -2,7 +2,7 @@
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/lib/numbering-carry.mjs"]
+scope: ["we:scripts/lib/numbering-carry.mjs", "we:scripts/lib/__tests__/numbering-carry-referral.test.mjs", "we:scripts/lib/__tests__/numbering-carry.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
@@ -37,7 +37,7 @@ Prove drain numbering before checking mandatory referrals, then check the accept
 
 ## Test plan
 
-- `numbering-carry-referral.test.mjs`: held referrals on either head; live-head holds initially, before the comment, and before labels; label-only recovery; live-head persistence/read failures; clean current-head evidence.
+- `we:scripts/lib/__tests__/numbering-carry-referral.test.mjs`: held referrals on either head; live-head holds initially, before the comment, and before labels; label-only recovery; live-head persistence/read failures; clean current-head evidence.
 - The same file pins unreadable, thrown, and negative write-time proof with clearing referral guards, zero writes before the comment, and withdrawal after the comment.
 - The named identity-scoping test asserts every proof's exact `fromSha`/`toSha` and both guards' `{repo, pr}` context. The unreadable-initial-proof test asserts only the live head is guarded and no writes occur.
-- `numbering-carry.test.mjs` retains the live re-read regression after both initial head checks.
+- `we:scripts/lib/__tests__/numbering-carry.test.mjs` retains the live re-read regression after both initial head checks.
