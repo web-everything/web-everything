@@ -730,6 +730,57 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
       'D=~/x; D=/clone; echo coproc { D=/tmp; }; cd "$D" && ls',   // not a coproc word
     ]) expect(at(cmd), JSON.stringify(cmd)).toBe(REPORTED);
   });
+  // r11 self-review — quoting the scan must read as bash does, so a this-shell assignment is never taken for a
+  // child's (the dangerous direction: a stale value kept)
+  it('an escaped `$\'`, a quoted `}` in `${…}` and `esac` right after `in` keep the scan in step', () => {
+    for (const cmd of [
+      "D=~/x; D=/tmp; echo \\$'\\' x '('; D=/clone; cd \"$D\" && git checkout --detach",
+      'D=~/x; D=/tmp; echo ${X:-"}"} "("; D=/clone; cd "$D" && git checkout --detach',
+      'D=~/x; D=/tmp; (case x in esac); D=/clone; cd "$D" && git checkout --detach',
+      'D=~/x; D=/tmp; echo "${X:-(}"; D=/clone; cd "$D" && ls',
+      'D=~/x; D=/tmp; echo ${#D} ${D#/} ${D%(*}; D=/clone; cd "$D" && ls',
+      'D=~/x; D=/tmp; X=$(echo | cat); D=/clone; cd "$D" && ls',
+    ]) expect(at(cmd), JSON.stringify(cmd)).toBe('/clone');
+    // the HOME walk reads the same scan: never the stale home
+    expect(at("HOME=/h; echo \\$'\\' x '('; HOME=/l; cd ~/clone && ls")).not.toBe('/h/clone');
+  });
+  it('a pipeline element, a background job and `$(…)` inside `${…}` are child shells', () => {
+    for (const cmd of [
+      'D=~/x; D=/clone; X=${Y:-$(D=/tmp)}; cd "$D" && ls',
+      'D=~/x; D=/clone; D=/tmp | true; cd "$D" && ls',
+      'D=~/x; D=/clone; true | D=/tmp; cd "$D" && ls',
+      'D=~/x; D=/clone; true |& D=/tmp; cd "$D" && ls',
+      'D=~/x; D=/clone; D=/tmp & cd "$D" && ls',
+      'D=~/x; D=/clone; D=~/q | true; cd "$D" && ls',
+      'D=/clone; D=~/q | true; cd "$D" && ls',
+      'D=~/x; D=/clone; echo x | while read D; do :; done; cd "$D" && ls',
+      'D=~/x; D=/clone; { D=/tmp; } | cat; cd "$D" && ls',
+      'D=~/x; D=/clone; { true; D=/tmp; } | cat; cd "$D" && ls',
+      'D=~/x; D=/clone; { { D=/tmp; }; } | cat; cd "$D" && ls',
+      'D=~/x; D=/clone; {\nD=/tmp\n} | cat; cd "$D" && ls',
+      'D=~/x; D=/clone; true | { true; D=/tmp; }; cd "$D" && ls',
+      'D=~/x; D=/clone; true # a | D=/tmp\ncd "$D" && ls',
+    ]) expect(at(cmd), JSON.stringify(cmd)).toBe('/clone');
+    expect(at('HOME=/h; HOME=/z | true; cd ~/clone && ls')).toBe('/h/clone');
+    for (const cmd of [
+      'shopt -s lastpipe; D=~/x; D=/clone; true | D=/tmp; cd "$D" && ls',  // the last element runs here
+      'D=~/x; D=/clone; case x in a|b) D=/tmp;; esac; cd "$D" && ls',     // `a|b)` is a pattern
+      'D=~/x; D=/clone; D=$(echo | cat); cd "$D" && ls',                  // the `|` is inside `$(…)`
+      'D=~/x; D=/clone; { D=/tmp; }; { a; } | cat; cd "$D" && ls',        // only the piped group
+    ]) expect(at(cmd), JSON.stringify(cmd)).not.toBe('/clone');
+  });
+  it('the child-shell scan stays linear on long commands', () => {
+    for (const cmd of [
+      `echo${' x case'.repeat(20000)}`,
+      `${'$('.repeat(20000)}${' {'.repeat(20000)}`,
+      `coproc { ${'coproc '.repeat(20000)}`,
+      `{ ${'a; '.repeat(20000)}${'} | x; '.repeat(20000)}`,
+    ]) {
+      const started = Date.now();
+      at(cmd);
+      expect(Date.now() - started).toBeLessThan(3000);
+    }
+  });
   it('a this-shell rebinding still counts, and a quoted, escaped or comment `(` opens no child shell', () => {
     for (const cmd of [
       'D=~/x; D=/clone; { D=/tmp; }; cd "$D" && ls',
@@ -753,10 +804,11 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
       'HOME=/a true; cd ~ && ls',
       'HOME=/a true; D="$HOME/x"; cd "$D" && ls',
       'true || HOME=/a; cd ~ && ls',
-      'HOME=/a | true; cd ~ && ls',
       "HOME='/p/h[a]'; cd ~ && ls",
       "HOME='/p/h*'; cd ~/x && ls",
     ]) expect(at(cmd), cmd).toBe(REPORTED);
+    // r11 — a piped HOME= runs in a child shell: this shell keeps its own home
+    expect(at('HOME=/a | true; cd ~ && ls')).toBe(HOME);
     expect(at('cd ~ && ls', '/p/h[a]')).toBe(REPORTED);
   });
   it('a single-quoted variable name is literal text, never a variable lookup', () => {
