@@ -387,6 +387,56 @@ it('a failed claim release after a settled launch failure never lets orphan adop
   } finally { rmSync(lockRoot, { recursive: true, force: true }); }
 });
 
+// Self-review variants of the same class: a stale member claim must not dedupe a later, genuine failure, and the
+// blocking launch path charges before it releases, so a release throw never leaves the attempt uncharged.
+it('a member claim left by an earlier launch never dedupes a later settled failure of its lead', async () => {
+  const lockRoot = mkdtempSync(join(tmpdir(), 'bdd-5472-member-'));
+  const path = join(lockRoot, 'failures.json');
+  const settings = { baseMs: 1000, maxMs: 5000, maxAttempts: 9 };
+  const record = (o) => recordBuildFailure(o, { path, now: 0, settings });
+  const settle = () => ({ pending: [], settled: [{ num: '3827', kind: 'build', outcome: { dispatching: false, reason: 'launch-died: no output' } }] });
+  try {
+    // An earlier launch's member claim that outlived it (orphan adoption leaves members).
+    acquireBuildDispatchClaim({ num: '200', scope, owner: 'h:1', pid: 98763, lockRoot, groupLead: '3827' });
+    for (let launch = 0; launch < 2; launch += 1) {
+      acquireBuildDispatchClaim({ num: '3827', scope, owner: 'h:1', pid: 98763, lockRoot });
+      const out = tickOut();
+      out.decisions.spawnBuilds = [];
+      await runBuildDispatchTick({ live: true, effects: effectsFor(lockRoot, { planTick: () => out, recordBuildFailure: record, settleLaunches: settle }) });
+      await new Promise((done) => setTimeout(done, 5)); // a distinct claimedAt for the next launch's claim
+    }
+    expect(listBuildBackoffs({ path, now: 0 })[0]).toMatchObject({ num: '3827', attempts: 2 });
+  } finally { rmSync(lockRoot, { recursive: true, force: true }); }
+});
+
+it('a blocking launch failure is charged before its claim release, keyed so orphan adoption cannot charge it again', async () => {
+  const lockRoot = mkdtempSync(join(tmpdir(), 'bdd-5472-blocking-'));
+  const path = join(lockRoot, 'failures.json');
+  const settings = { baseMs: 1000, maxMs: 5000, maxAttempts: 9 };
+  const record = (o) => recordBuildFailure(o, { path, now: 0, settings });
+  try {
+    let releases = 0;
+    const releaseClaim = ({ num }) => {
+      releases += 1;
+      if (releases === 1) throw new Error('EBUSY: transient release failure');
+      return releaseBuildDispatchClaim({ num, lockRoot });
+    };
+    await runBuildDispatchTick({ live: true, effects: effectsFor(lockRoot, {
+      releaseClaim, recordBuildFailure: record, dispatch: () => ({ dispatching: false, reason: 'launch-died: no output' }) }) });
+    expect(listBuildBackoffs({ path, now: 0 })[0]).toMatchObject({ num: '3827', attempts: 1 });
+    expect(listBuildDispatchClaims({ lockRoot, ignoreExpiry: true })).toHaveLength(1); // the release threw
+    await adoptOrphanedBuildClaims({
+      listClaims: () => listBuildDispatchClaims({ lockRoot, ignoreExpiry: true }),
+      isPidAlive: () => false, findRow: () => null, readResumeMarker: () => null, sessionLivenessFor: () => null,
+      readDelivery: () => null, settleDelivered: () => {}, resolveResumability: () => ({ resumable: false, reason: 'no row' }),
+      releaseClaim, releaseResumeMarker: () => {}, settleRow: () => {}, placeHold: () => {},
+      recordFailure: record, clearFailure: () => {}, releaseLaneLease: () => {},
+      spawnResume: () => { throw new Error('must not resume'); },
+    });
+    expect(listBuildBackoffs({ path, now: 0 })[0]).toMatchObject({ num: '3827', attempts: 1 });
+  } finally { rmSync(lockRoot, { recursive: true, force: true }); }
+});
+
 it('prepare discovery reads through the shared throttle by default on the sync path (PR #5453)', () => {
   const real = execFileSyncThrottled.getMockImplementation();
   execFileSyncThrottled.mockImplementation(() => { throw new Error('throttled-stub'); });

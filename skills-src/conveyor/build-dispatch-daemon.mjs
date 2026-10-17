@@ -487,6 +487,14 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // 78b — settle detached launches from earlier ticks BEFORE planning: a launched one keeps its claim (the run-store
   // row owns it from here); a failed one releases its claim and records the failure the same way a blocking launch did.
   // A still-pending one keeps its claim and keeps the item busy. Optional-chained for older effects stubs.
+  // A failed launch is charged BEFORE its claim is released, keyed by that claim: if the release throws, orphan
+  // adoption later charges the same dead claim under the same key and the ledger dedupes it (PR #5472 red team).
+  // Expired claims are read too, as orphan adoption reads them. Only the LEAD claim names the attempt: a member claim
+  // can outlive its launch (orphan adoption leaves members), and its stale key would dedupe a later, real failure.
+  const readClaimsForKeys = () => {
+    try { return effects.listClaims?.({ ignoreExpiry: true }) ?? []; } catch { return []; } // unkeyed charge, as before
+  };
+  const leadClaimKeys = (claimList, num) => claimAttemptKeys(claimList, num).filter(k => k.startsWith('orphan:'));
   const pendingLaunch = { build: new Set(), prepare: new Set() };
   const launchSettlement = { settled: [], pending: [] };
   const deferredLaunchFailures = [];
@@ -495,20 +503,15 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       const r = await effects.settleLaunches();
       for (const p of r.pending ?? []) (p.kind === 'prepare-item' ? pendingLaunch.prepare : pendingLaunch.build).add(normNum(p.num));
       launchSettlement.pending = r.pending ?? [];
-      // The claims this failure releases name its attempt: if a release throws, orphan adoption later charges the
-      // same dead claim under these keys, and the ledger dedupes it (PR #5472 red team). Expired claims too: orphan
-      // adoption reads past expiry, so a key missing here would charge twice there.
       let settleClaims = [];
-      if ((r.settled ?? []).some(st => !st.outcome?.dispatching && st.kind !== 'prepare-item')) {
-        try { settleClaims = effects.listClaims?.({ ignoreExpiry: true }) ?? []; } catch { /* no keys: the charge stays unkeyed, as before */ }
-      }
+      if ((r.settled ?? []).some(st => !st.outcome?.dispatching && st.kind !== 'prepare-item')) settleClaims = readClaimsForKeys();
       for (const st of r.settled ?? []) {
         const num = normNum(st.num);
         const isPrepare = st.kind === 'prepare-item';
         launchSettlement.settled.push({ num, kind: st.kind, launched: Boolean(st.outcome?.dispatching), reason: st.outcome?.reason ?? null });
         if (st.outcome?.dispatching) continue;
         // Persist before planning/launching again: the threshold must suppress this tick's retry too.
-        const attemptKey = isPrepare ? [] : claimAttemptKeys(settleClaims, num);
+        const attemptKey = isPrepare ? [] : leadClaimKeys(settleClaims, num);
         const failureRecord = !isPrepare ? effects.recordBuildFailure?.({ num, reason: st.outcome?.reason ?? 'not dispatched', output: st.outcome?.output ?? st.outcome?.reason, base: st.base,
           ...(attemptKey.length ? { attemptKey } : {}) }) : null;
         if (isPrepare) effects.releasePrepareClaim({ num }); else effects.releaseClaim({ num });
@@ -984,10 +987,14 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
           if (groupMembers.length) console.error(`build-dispatch-daemon: grouped build #${pick.num} members ${groupMembers.map(num => `#${num}`).join(',')} (related: ${groupMembers.map(num => `${num}=${group.related[num]}`).join(',')})`);
           // Launch confirmation is not delivery: retain prior failures until a PR is observed.
         } else {
+          // Charge first, keyed by the claim (see `leadClaimKeys`): a crash or throw in the releases below then
+          // leaves a charged attempt orphan adoption dedupes, never an uncharged one.
+          const attemptKey = leadClaimKeys(readClaimsForKeys(), pick.num);
+          const rec = effects.recordBuildFailure?.({ num: pick.num, reason: res?.reason ?? 'not dispatched', output: res?.output ?? res?.reason, base: res?.base,
+            ...(attemptKey.length ? { attemptKey } : {}) });
           claimed = false;
           effects.releaseClaim({ num: pick.num });
           releaseMembers();
-          const rec = effects.recordBuildFailure?.({ num: pick.num, reason: res?.reason ?? 'not dispatched', output: res?.output ?? res?.reason, base: res?.base });
           surfaceUnconfirmed(pick.num, rec);
           if (live) surfaceCardRefusal(pick.num, rec, res);
           failures.push({ num: pick.num, stage: 'dispatch', reason: res?.reason ?? 'not dispatched', ...(res?.stepRefused ? { step: res.stepRefused.step } : {}), ...(rec ? { reasonCode: rec.reasonCode, attempts: rec.attempts, retryAfter: rec.retryAfter, output: rec.output } : {}) });

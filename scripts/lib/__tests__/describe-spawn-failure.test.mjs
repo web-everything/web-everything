@@ -90,6 +90,20 @@ describe('redactSpawnText', () => {
     expect(out).not.toContain('opaque3');
     expect(JSON.parse(out)).toEqual({ error: 'x Cookie: <redacted>\nnext', ok: 1 });
   });
+  it('redacts every cookie-list form: quoted values, flags, env, curl -b, folding, arrays, escapes, URL encoding', () => {
+    const q = "'";
+    const inputs = ['Cookie: a="1"; s=opaque1', JSON.stringify({ e: 'Cookie: a="1"; s=opaque2', ok: 1 }), 'curl --cookie a=1;s=opaque3 https://h',
+      'COOKIE=a=1;s=opaque4 next', `curl -sS -b ${q}a=1; s=opaque5${q} https://h`, `${q}Cookie: a=1; it${q}\\${q}${q}s=opaque6${q}`,
+      'Cookie: a=1;\r\n  s=opaque7\r\nnext: ok', JSON.stringify([['Cookie', 'a=1; s=opaque8']]), JSON.stringify({ e: 'Cookie: a=1\\; s=opaque9' }),
+      'GET /x?h=Cookie%3Aa%3D1%3B%20s%3DopaqueA&z=1', JSON.stringify(['claude', '--token', 'opaqueB', '--model', 'x'])];
+    for (const text of inputs) {
+      const out = redactSpawnText(text, { env: {} });
+      expect(out).not.toContain('opaque');
+      if (/^[[{]/.test(text)) expect(() => JSON.parse(out)).not.toThrow();
+    }
+    expect(redactSpawnText('git checkout -b lane/x failed', { env: {} })).toBe('git checkout -b lane/x failed');
+    expect(redactSpawnText(JSON.stringify({ e: 'x', ok: 1, list: ['a', 'b'] }), { env: {} })).toBe('{"e":"x","ok":1,"list":["a","b"]}');
+  });
   it('keeps the key it redacts, and leaves effect keys and token counts alone', () => {
     expect(redactSpawnText('{"GH_TOKEN":"opaque1","key":"dispatch:3794","input_tokens":55}', { env: {} }))
       .toBe('{"GH_TOKEN":"<redacted-env>","key":"dispatch:3794","input_tokens":55}');
