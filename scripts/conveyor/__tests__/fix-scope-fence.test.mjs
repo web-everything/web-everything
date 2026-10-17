@@ -291,13 +291,14 @@ describe('the live scope fence adapter over a real repository', () => {
   });
 
   /** The PR removed the marked `cdLandings` from guard.mjs, which the base still holds until the PR merges; then a catch-up. */
-  function removalStillOnBase(r, { before, after, upstream = ['other.mjs', 'export const other = 2;\n'], resolve }) {
+  function removalStillOnBase(r, { before, after, upstream = ['other.mjs', 'export const other = 2;\n'], resolve, setup = () => {}, strategy = [] }) {
     r.write('guard.mjs', 'function cdLandings() {}\nfunction guard() {}\n'); r.write('other.mjs', 'export const other = 1;\n'); r.commit('initial');
     r.git(['checkout', '-qb', 'pr']); r.write('guard.mjs', 'function guard() {}\n'); const head = r.commit('removal');
     r.git(['checkout', '-q', 'main']); r.write(...upstream); const base = r.commit('upstream');
     r.git(['checkout', '-q', 'pr']);
+    setup(r);
     if (before) { r.write('guard.mjs', before); r.commit('repair'); }
-    try { r.git([...ident, 'merge', '-q', '--no-edit', base]); } catch {
+    try { r.git([...ident, 'merge', '-q', '--no-edit', ...strategy, base]); } catch {
       r.write('guard.mjs', resolve); r.git(['add', 'guard.mjs']); r.git([...ident, 'commit', '-q', '--no-edit']);
     }
     if (after) { r.write('guard.mjs', after); r.commit('repair'); }
@@ -305,20 +306,26 @@ describe('the live scope fence adapter over a real repository', () => {
   }
   const restored = 'function cdLandings() {}\nfunction guard() {}\n';
   const upstreamEdit = ['guard.mjs', 'function cdLandings() { return 2; }\nfunction guard() {}\n'];
+  const readded = 're-adds operator-removed identifier: cdLandings';
+  /** Daemon environments that switch every pathspec to literal must not empty the fence's path-limited reads. */
+  const literalEnv = r => (args, { env: extra, ...opts } = {}) => r.port(args, { ...opts, env: { GIT_LITERAL_PATHSPECS: '1', ...extra } });
   it.each([
-    ['blocks restoring a marked PR removal still present in the merged base, before the merge', { before: restored }, true],
-    ['blocks restoring a marked PR removal still present in the merged base, after the merge', { after: restored }, true],
-    ['blocks keeping the base side of a modify/delete conflict on a marked removal', { upstream: upstreamEdit, resolve: upstreamEdit[1] }, true],
-    ['pushes an unrelated repair merged with a base that still holds the removal', { before: 'function guard() { return 2; }\n' }, false],
-    ['pushes a conflict resolved by keeping the removal', { upstream: upstreamEdit, resolve: 'function guard() {}\n' }, false],
-  ])('a catch-up over a removal the base still holds: %s', (_, shape, refused) => {
+    ['blocks restoring a marked PR removal still present in the merged base, before the merge', { before: restored }, readded],
+    ['blocks restoring a marked PR removal still present in the merged base, after the merge', { after: restored }, readded],
+    ['blocks keeping the base side of a conflict on a marked removal', { upstream: upstreamEdit, resolve: upstreamEdit[1] }, readded],
+    ['blocks a lane merge=union attribute that merges the base side in cleanly', { upstream: upstreamEdit, setup: r => r.write('.git/info/attributes', '* merge=union\n') }, readded],
+    ['blocks a restore under a literal-pathspec environment', { before: restored, port: literalEnv }, readded],
+    ['blocks a catch-up that reverts upstream outside the scope', { strategy: ['-s', 'ours'] }, 'outside declared scope: other.mjs'],
+    ['pushes an unrelated repair merged with a base that still holds the removal', { before: 'function guard() { return 2; }\n' }, null],
+    ['pushes a conflict resolved by keeping the removal', { upstream: upstreamEdit, resolve: 'function guard() {}\n' }, null],
+  ])('a catch-up over a removal the base still holds: %s', (_, { port, ...shape }, violation) => {
     const r = realRepo();
     try {
       const { head, base, sha } = removalStillOnBase(r, shape);
-      const { result, push } = liveFence(r, { head, sha, base, compare: 'identical' });
-      if (!refused) { expect(result).toEqual({ ok: true }); expect(push).toHaveBeenCalledOnce(); return; }
+      const { result, push } = liveFence(r, { head, sha, base, compare: 'identical', ...(port ? { port: port(r) } : {}) });
+      if (!violation) { expect(result).toEqual({ ok: true }); expect(push).toHaveBeenCalledOnce(); return; }
       expect(result).toMatchObject({ ok: false, scopeFence: true, terminal: true });
-      expect(result.reason).toContain('re-adds operator-removed identifier: cdLandings');
+      expect(result.reason).toContain(violation);
       expect(push).not.toHaveBeenCalled();
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
   });

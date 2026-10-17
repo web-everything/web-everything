@@ -69,9 +69,10 @@ export function createScopeFencedPush({ root, exec = execFileSync, env = process
   return ({ repo, pr, sha, git: port, push }) => {
     // Commit-to-commit reads only; the port supplies the lane hardening. Replace refs, grafts and a commit-graph are lane
     // state that would show the fence a history the push never sends, and the buffer is sized for `--text` patches.
-    // The port merges `opts.env` over its own environment.
+    // The port merges `opts.env` over its own environment; the pathspec switches are pinned off so `:(literal)` magic holds.
     const git = args => port(['--no-replace-objects', '-c', 'core.commitGraph=false', ...args],
-      { maxBuffer: FENCE_MAX_BUFFER, timeout: 120_000, env: { GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null' } });
+      { maxBuffer: FENCE_MAX_BUFFER, timeout: 120_000, env: { GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null',
+        GIT_LITERAL_PATHSPECS: '0', GIT_GLOB_PATHSPECS: '0', GIT_NOGLOB_PATHSPECS: '0', GIT_ICASE_PATHSPECS: '0' } });
     const readDiff = ({ head, base, removed = [] }) => {
       // Prove our saved commit exists before attributing a missing remote head to branch movement.
       git(['cat-file', '-e', `${sha}^{commit}`]);
@@ -85,25 +86,19 @@ export function createScopeFencedPush({ root, exec = execFileSync, env = process
       }
       const names = (from, to) => git([...FENCE_DIFF, '--name-only', '-z', from, to, '--']).split('\0').filter(Boolean);
       // Patches are read only when there is a removed identifier to look for.
-      const added = (from, to, only = []) => removed.length ? addedLines(git([...FENCE_DIFF, '-U0', from, to, '--', ...only.map(p => `:(literal)${p}`)])) : [];
-      const paths = names(head, sha);
+      const added = (from, to, pathspec = []) => removed.length ? addedLines(git([...FENCE_DIFF, '-U0', from, to, '--', ...pathspec])) : [];
+      const changed = names(head, sha);
       const merged = mergedBase({ git, gh, repo, head, sha, base });
-      if (!merged) return { paths, additions: added(head, sha) };
-      // A path neither the PR (since the merge base) nor the fixer (against the merged base) changed carries only upstream's change.
-      const own = new Set([...names(git(['merge-base', head, merged]).trim(), head), ...names(merged, sha)]);
-      if (!removed.length) return { paths: paths.filter(p => own.has(p)), additions: [] };
-      // The fixer's lines are what the push adds to a plain catch-up merge of head and the merged base. The base still holds
-      // code the PR removed, so lines added against the base alone would hide a restored removal. A conflicted file's
-      // resolution is the fixer's choice: every line it adds against the PR head counts, upstream's included (fails closed).
-      let out;
-      try { out = git(['merge-tree', '--write-tree', '--name-only', '--no-messages', '-z', head, merged]); } catch (e) {
-        if (e.status !== 1 || e.stdout == null) throw e;
-        out = String(e.stdout);
-      }
-      const [tree, ...conflicted] = out.split('\0').filter(Boolean);
-      if (!OID.test(tree ?? '')) throw new Error('catch-up merge tree unreadable');
-      return { paths: paths.filter(p => own.has(p)),
-        additions: [...added(tree, sha), ...(conflicted.length ? added(head, sha, [...new Set(conflicted)]) : [])] };
+      if (!merged) return { paths: changed, additions: added(head, sha) };
+      // Attribution is by path, never by replaying a merge: a merge reads the lane's fixer-writable config and attributes.
+      // A path the PR changed (since any merge base) is judged against the PR head, so restoring a removal the base still
+      // holds counts, as does every line a conflict resolution keeps (upstream's included: fails closed). Any other path
+      // is upstream's file unless the push differs from the merged base, which also catches a revert of upstream's change.
+      const pr = new Set(git(['merge-base', '--all', head, merged]).split('\n').filter(Boolean).flatMap(b => names(b, head)));
+      const literal = magic => p => `:(top,literal${magic})${p}`;
+      const prPaths = changed.filter(p => pr.has(p));
+      return { paths: [...prPaths, ...names(merged, sha).filter(p => !pr.has(p))],
+        additions: [...(prPaths.length ? added(head, sha, prPaths.map(literal(''))) : []), ...added(merged, sha, [...pr].map(literal(',exclude')))] };
     };
     const resolved = resolveScopeFence({ env });
     const policy = resolved.value.scopeFence;
@@ -136,8 +131,9 @@ export function createScopeFencedPush({ root, exec = execFileSync, env = process
       },
       readDiff: context => {
         try { return readDiff(context); } catch (e) {
-          // Output too large to read in full will not shrink on retry: a person decides.
+          // Output too large to read in full, or a path list too long to pass, will not shrink on retry: a person decides.
           if (e?.code === 'ENOBUFS') throw new ScopeFenceEvidenceError(`git output exceeds ${FENCE_MAX_BUFFER / 1024 / 1024} MiB`, context);
+          if (e?.code === 'E2BIG') throw new ScopeFenceEvidenceError('PR path list exceeds the argument limit', context);
           throw e;
         }
       },
