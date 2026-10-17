@@ -1,0 +1,158 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import * as carry from '../numbering-carry.mjs';
+import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
+import { mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
+
+const repo = 'web-everything/web-everything', pr = 5505;
+const FROM = '7ae496bef00d2096959b5f6d20cfd0394b976898';
+const TO = '440cd1c4c18c773d1669189862322e9d0153b7b7';
+const OLD = 'a'.repeat(40);
+const authorBody = '<!-- authored-by-actor: author -->';
+const on = { value: true, source: 'test' }, off = { value: false, source: 'test' };
+function record(head) {
+  const original = { summary: 'Earlier finding requires a ruling', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+  const seat = 'judgeCorrectnessAdvisory', runId = `review-pr-${head}`;
+  return { author: { login: 'web-everything' }, body: renderReferralRecord({ version: 1, repo, pr, head, runId,
+    authorBody, reviewer: mandatoryReferralReviewer(runId), attempted: true, rulings: [],
+    referrals: [{ seat, original, finding: normalizeFinding(original), key: referralFindingKey(seat, original) }] }) };
+}
+const acceptance = { id: 'accepted-prior', author: { login: 'chalbert' }, createdAt: '2026-10-17T12:00:00Z',
+  body: `✅ review — accepted\n<!-- reviewed-sha: ${FROM} -->` };
+const cleanRun = { repo, pr, head: FROM, startedAt: 1, completedAt: 2, pending: [], parked: false, persistenceFailed: false };
+function replay({ held = false, prove = () => ({ ok: true, reason: 'verified numbering' }), setting,
+  onRead = () => {}, guardOverride, labelsOnly = false } = {}) {
+  const state = { state: 'OPEN', body: authorBody, labels: ['review:pending'], headRefOid: TO,
+    comments: [record(held ? FROM : OLD), acceptance] };
+  if (labelsOnly) state.comments.push({ author: { login: 'chalbert' },
+    body: carry.buildNumberingRestampBody({ fromSha: FROM, toSha: TO, human: false, writer: 'review-daemon' }) });
+  const checked = [], writes = [];
+  const guard = (s, context) => {
+    checked.push(s.headRefOid);
+    return assertMandatoryReferralsCleared(s, { ...context, env: {}, cardReadable: () => true,
+      readRuns: () => [cleanRun], readNetDiff: sha => ({ scored: true, text: `diff at ${sha}` }) });
+  };
+  const result = carry.restampAfterNumbering({ repo, pr, state, reviews: [], enabled: true, acceptCarry: 'on',
+    numberingSetting: on, netPatchSetting: off, ...(setting ? { referralEvidenceSetting: setting } : {}), prove,
+    guardReferrals: guardOverride ?? guard,
+    readLiveState: () => { onRead(state); return { state, reviews: [] }; },
+    provider: { postComment: (_r, _p, body) => {
+      writes.push('comment'); state.comments.push({ id: 'new', author: { login: 'chalbert' }, body });
+    }, setLabels: () => writes.push('labels'), editComment: () => writes.push('withdraw') } });
+  return { result, checked, writes, state };
+}
+afterEach(() => { carry._resetNumberingRestampMemo(); vi.restoreAllMocks(); });
+
+// Raw git plumbing for the five renamed/re-id'd cards in #5505. Exercise the real proof,
+// including bornAs stamps, rather than trusting a numbering subject or a mocked verdict.
+function cardsOnlyReader() {
+  const pairs = [['xh2rf6g', '6200'], ['xpdw3em', '6201'], ['xeluwak', '6202'], ['xxvode8', '6203'], ['x4pfhf5', '6204']];
+  const blobs = new Map();
+  const zero = '0'.repeat(40);
+  let raw = '';
+  for (const [i, [hash, number]] of pairs.entries()) {
+    const beforeOid = (i * 2 + 1).toString(16).padStart(40, '0');
+    const afterOid = (i * 2 + 2).toString(16).padStart(40, '0');
+    blobs.set(beforeOid, `---\nid: ${hash}\n---\nSee #${hash}.\n`);
+    blobs.set(afterOid, `---\nbornAs: ${hash}\nid: ${number}\n---\nSee #${number}.\n`);
+    raw += `:100644 000000 ${beforeOid} ${zero} D\0backlog/${hash}-card.md\0`;
+    raw += `:000000 100644 ${zero} ${afterOid} A\0backlog/${number}-card.md\0`;
+  }
+  return (_cmd, args) => {
+    let out;
+    if (args[0] === 'cat-file') out = args[1] === 'blob' ? blobs.get(args[2])
+      : args[1] === '-t' ? 'blob' : args[1] === '-s' ? String(Buffer.byteLength(blobs.get(args[2]))) : '';
+    else if (args[0] === 'rev-parse') out = FROM;
+    else if (args[0] === 'rev-list') out = `${TO} ${FROM}\n`;
+    else if (args[0] === 'log') out = `drain: JIT-number ${pairs.map(([h, n]) => `${h}→#${n}`).join(', ')} at land (#2288)\n`;
+    else if (args[0] === 'ls-tree' || args[0] === 'grep') out = '';
+    else if (args[0] === 'diff-tree') out = raw;
+    else throw Error(`Unexpected git read: ${args.join(' ')}`);
+    if (out === undefined) throw Error('Missing blob');
+    return Buffer.from(out);
+  };
+}
+
+describe('numbering carry referral evidence', () => {
+  it('re-stamps a proven numbering move using the clean accepted prior head at every write', () => {
+    const { result, checked, writes, state } = replay();
+    expect(result.action).toBe('restamped');
+    expect(checked).toEqual([FROM, FROM, FROM]);
+    expect(writes).toEqual(['comment', 'labels']);
+    expect(state.headRefOid).toBe(TO);
+  });
+  it('still refuses a held referral on the accepted prior head', () => {
+    const { result, checked, writes } = replay({ held: true });
+    expect(result).toMatchObject({ action: 'retry', reason: expect.stringContaining('mandatory referral hold') });
+    expect(checked).toEqual([FROM]);
+    expect(writes).toEqual([]);
+  });
+  it('an unproven move retains the current-head refusal', () => {
+    const { result, checked, writes } = replay({ prove: () => ({ ok: false, reason: 'author edit' }) });
+    expect(result).toMatchObject({ action: 'retry', reason: expect.stringContaining('no-current-head-review-evidence') });
+    expect(checked).toEqual([TO]);
+    expect(writes).toEqual([]);
+  });
+  it('proves and re-stamps the #5505 cards-only rename and re-id shape', () => {
+    const prove = options => carry.proveNumberingOnlyMove({ ...options, exec: cardsOnlyReader() });
+    expect(prove({ fromSha: FROM, toSha: TO })).toMatchObject({ ok: true, pairs: expect.arrayContaining([['xh2rf6g', '6200']]) });
+    expect(replay({ prove }).result.action).toBe('restamped');
+  });
+  it('setting off restores the old current-head refusal', () => {
+    const prove = vi.fn(() => ({ ok: true }));
+    const { result, checked, writes } = replay({ prove, setting: off });
+    expect(result.reason).toContain('no-current-head-review-evidence');
+    expect(checked).toEqual([TO]);
+    expect(prove).not.toHaveBeenCalled();
+    expect(writes).toEqual([]);
+  });
+  it('rechecks a referral that becomes held before writing', () => {
+    const { result, checked, writes } = replay({ onRead: state => state.comments.unshift(record(FROM)) });
+    expect(result).toMatchObject({ action: 'retry', reason: expect.stringContaining('mandatory referral hold') });
+    expect(checked).toEqual([FROM, FROM]);
+    expect(writes).toEqual([]);
+  });
+  it('re-proves the move before writing and falls back to the live-head guard on a read failure', () => {
+    const prove = vi.fn().mockReturnValueOnce({ ok: true, reason: 'numbering' })
+      .mockReturnValue({ ok: false, retryable: true, reason: 'unreadable recheck' });
+    const { result, checked, writes } = replay({ prove });
+    expect(result.reason).toContain('no-current-head-review-evidence');
+    expect(checked).toEqual([FROM, TO]);
+    expect(writes).toEqual([]);
+  });
+  it('still returns the original proof refusal if the live-head referral guard clears an unproven move', () => {
+    const checked = [];
+    const { result, writes } = replay({ prove: () => ({ ok: false, reason: 'non-numbering edit' }),
+      guardOverride: state => checked.push(state.headRefOid) });
+    expect(result).toEqual({ action: 'refused', reason: 'non-numbering edit' });
+    expect(checked).toEqual([TO]);
+    expect(writes).toEqual([]);
+  });
+  it('label-only recovery proves numbering and checks the accepted prior head', () => {
+    const { result, checked, writes } = replay({ labelsOnly: true });
+    expect(result).toMatchObject({ action: 'restamped', labelsOnly: true });
+    expect(checked).toEqual([FROM, FROM]);
+    expect(writes).toEqual(['labels']);
+  });
+  it('fails closed if the proof is unreadable', () => {
+    expect(replay({ prove: () => ({ ok: false, retryable: true, reason: 'unreadable' }) }).result.reason)
+      .toContain('no-current-head-review-evidence');
+  });
+  it('defaults on and resolves platform, tool and environment provenance', () => {
+    const resolve = carry.resolveNumberingCarryReferralEvidenceSetting;
+    expect(resolve({ env: {}, platform: {}, tool: {} })).toEqual({ value: true, source: 'standard' });
+    expect(resolve({ env: {}, platform: { numberingCarryReferralEvidence: false }, tool: {} }))
+      .toEqual({ value: false, source: 'platform' });
+    expect(resolve({ env: {}, platform: {}, tool: { numberingCarryReferralEvidence: false } }))
+      .toEqual({ value: false, source: 'tool' });
+    expect(resolve({ env: { WE_REVIEW_NUMBERING_CARRY_REFERRAL_EVIDENCE: 'off' }, platform: {}, tool: {} }))
+      .toEqual({ value: false, source: 'env' });
+    expect(resolve({ env: { WE_REVIEW_NUMBERING_CARRY_REFERRAL_EVIDENCE: 'invalid' },
+      platform: {}, tool: { numberingCarryReferralEvidence: false } }))
+      .toEqual({ value: false, source: 'tool' });
+  });
+  it('logs the setting and its source', () => {
+    const log = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    replay({ setting: { value: true, source: 'provenance-test' } });
+    expect(log.mock.calls.flat().join('')).toContain('review.numberingCarryReferralEvidence=true (provenance-test)');
+  });
+});
