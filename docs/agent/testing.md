@@ -1335,6 +1335,8 @@ tick while a release throws, and each must still dedupe its own attempt. Both ke
 row's start time (`dispatch:`), so the two paths charging one dead dispatch in one tick charge it once.
 A run row can be unreadable on one pass and back on the next, so orphan adoption passes the claim
 (`orphan:`) and the row as aliases of one attempt: any charged alias dedupes, and the new aliases join it.
+Group member claims (`member:`) are aliases on both paths too: orphan adoption can release the lead claim
+before the fail-group pass looks, but the member claims survive.
 
 Prepare discovery searches each card's current lane identity, bornAs lane identity and title, then
 unions the complete results. Never use an unfiltered repository PR listing as the launch guard's proof

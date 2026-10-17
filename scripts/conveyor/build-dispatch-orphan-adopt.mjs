@@ -77,7 +77,7 @@ import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { readGit } from '../lib/proc-read.mjs';
 import { readBuildDelivery } from './build-delivery-evidence.mjs';
-import { recordBuildFailure, clearBuildFailure, dispatchAttemptKey } from './build-dispatch-failures.mjs';
+import { recordBuildFailure, clearBuildFailure, dispatchAttemptKey, claimAttemptKeys } from './build-dispatch-failures.mjs';
 import { makeAwaitingVerifyResolver } from './await-verify.mjs';
 import { normNum } from './queue-store.mjs';
 import { DISPATCH_EFFECT } from '../operations/dispatch-lane.mjs';
@@ -610,11 +610,12 @@ export async function adoptOrphanedBuildClaims({
         // Hold BEFORE release (the wrapper's own `settleTerminal` order): a crash between the two must never
         // leave the item unheld and free to re-dispatch into the same failure.
         if (exhausted) placeHold({ num, reason: `orphan-adopt: ${attempts} resume attempt(s) died without settling` });
-        // Keyed by the dead claim AND its dispatch row: if the release below throws, the next pass re-records the
-        // SAME attempt, uncharged — whether or not the run row was readable on either pass — and the fail-group pass
-        // charging this same dispatch by its row shares the dispatch key.
-        const claimKey = claim.meta?.claimedAt || row?.runId;
-        const attemptKey = [claimKey ? `orphan:${claimKey}` : null, dispatchAttemptKey(row?.entry?.startedAt)].filter(Boolean);
+        // Keyed by the dead claim, its members' claims AND its dispatch row: if the release below throws, the next
+        // pass re-records the SAME attempt, uncharged — whether or not the run row was readable on either pass — and
+        // the fail-group pass charging this same dispatch (by its row or its surviving member claims) shares a key.
+        const claimKeys = claimAttemptKeys(claims, num);
+        const attemptKey = [...(claimKeys.length ? claimKeys : row?.runId ? [`orphan:${row.runId}`] : []),
+          dispatchAttemptKey(row?.entry?.startedAt)].filter(Boolean);
         recordFailure({ num, reason: `build-not-started: the dispatched build ended with no PR and no resolved card (${exhausted ? 'resume attempts exhausted' : 'orphan-released'}); backing the card off`,
           ...(attemptKey.length ? { attemptKey } : {}) });
         releaseClaim({ num });

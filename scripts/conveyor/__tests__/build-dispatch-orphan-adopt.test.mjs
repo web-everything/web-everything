@@ -1072,6 +1072,14 @@ describe('x87v3ed — orphan release charges the card a backoff failure and retu
           { path, now: 0, settings })).toMatchObject({ attempts: 1, exhausted: false });
       } finally { rmSync(dir, { recursive: true, force: true }); }
     });
+  it('keys a dead group lead on its surviving member claims too (PR #5453)', async () => {
+    const failures = [];
+    await adoptFixtureClaims(dead('7101', { findRow: () => null, recordFailure: (o) => failures.push(o),
+      listClaims: () => [{ pid: 98761, meta: { kind: 'build', num: '7101', claimedAt: 'c1' } },
+        { pid: 98761, meta: { kind: 'build', num: '7102', groupLead: '7101', claimedAt: 'c2' } },
+        { pid: 98761, meta: { kind: 'build', num: '7201', groupLead: '7200', claimedAt: 'c3' } }] }));
+    expect(failures.filter(f => f.num === '7101')).toEqual([expect.objectContaining({ attemptKey: ['orphan:c1', 'member:7102:c2'] })]);
+  });
   it('records nothing when the dead dispatch had in fact delivered a PR', async () => {
     const failures = [];
     await adoptFixtureClaims(dead('4388', {

@@ -10,6 +10,7 @@ import { dirname, join } from 'node:path';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { readBackoffSettings, backoffVerdict, buildEvidenceReasonCode, isCloneWideReasonCode, CARD_REFUSAL_CODE, QUICK_RETRY_REASON_CODES } from './retry-backoff.mjs';
 import { redactSpawnText } from '../lib/describe-spawn-failure.mjs';
+import { normNum } from './queue-store.mjs';
 
 export const buildFailurePath = () => join(resolveCoordinationRoot(), 'build-dispatch-failures.json');
 const OUTPUT_CAP = 2000;
@@ -38,6 +39,22 @@ function save(state, path) {
  * key of its own.
  */
 export const dispatchAttemptKey = (startedAt) => (typeof startedAt === 'string' && startedAt !== '' ? `dispatch:${startedAt}` : null);
+
+/**
+ * The claim aliases of one dispatch of `lead`: its own claim (`orphan:<claimedAt>`) and every group member's claim
+ * (`member:<num>:<claimedAt>`). A dispatch takes all of them once, so each names that attempt. Orphan adoption may
+ * release the lead claim (or see it past expiry) before the fail-group pass looks, while member claims survive: the
+ * member aliases still tie the two passes' charges to one attempt. A claim without a string `claimedAt` adds none.
+ */
+export function claimAttemptKeys(claims, lead) {
+  const n = normNum(lead);
+  return (claims ?? []).flatMap((c) => {
+    const at = c?.meta?.claimedAt;
+    if (typeof at !== 'string' || at === '') return [];
+    if (c.meta.groupLead == null) return normNum(c.meta.num) === n ? [`orphan:${at}`] : [];
+    return normNum(c.meta.groupLead) === n ? [`member:${normNum(c.meta.num)}:${at}`] : [];
+  });
+}
 
 /**
  * Record one failed build dispatch. `output` is the captured child output (falls back to `reason`). `attemptKey`

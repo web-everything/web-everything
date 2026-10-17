@@ -95,7 +95,7 @@ import { MAX_CONCURRENT_LANES_ENV } from '../../scripts/lib/lane-concurrency.mjs
 import { classifyPrepareFailure, recordPrepareFailure, readFailureState, readPrepareReleases, releasedAttempt, completePrepareFailures, releaseDuePrepareRetries, takePrepareRouteHolds, requeuePrepareRouteHold, rearmFalseHolds, NOT_CONFIRMED_FIX_LANDED_AT } from '../../scripts/conveyor/prepare-failure-policy.mjs';
 import { readLimitState, isBranchAllowedNow, isGlobalOffNow, countOpenPrsForDispatch, decideOpenPr } from '../../scripts/lib/pr-limit.mjs';
 import { CARD_REFUSAL_CODE } from '../../scripts/conveyor/retry-backoff.mjs';
-import { recordBuildFailure, clearBuildFailure, listBuildBackoffs, rearmBuildFailures, dispatchAttemptKey } from '../../scripts/conveyor/build-dispatch-failures.mjs';
+import { recordBuildFailure, clearBuildFailure, listBuildBackoffs, rearmBuildFailures, dispatchAttemptKey, claimAttemptKeys } from '../../scripts/conveyor/build-dispatch-failures.mjs';
 import { redactSpawnText } from '../../scripts/lib/describe-spawn-failure.mjs';
 
 import { resolveScorecardStorePath } from '../../scripts/conveyor/run-scorecard-store.mjs';
@@ -696,11 +696,12 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       // Do not immediately launch the failed group's released members again in this same tick.
       for (const c of groupClaims) heldNums.add(normNum(c.meta.num));
       // Keyed by the settled dispatch: the claims are released below and a throw there re-runs this next tick, and
-      // orphan adoption charging the same dispatch shares the key. A row with no start time keys on its run. The lead's
-      // surviving claim is an alias too: orphan adoption keys on it when it could not read the run row.
-      const leadClaimedAt = groupClaims.find(c => c.meta?.groupLead == null && normNum(c.meta?.num) === lead)?.meta?.claimedAt;
-      const attemptKey = [dispatchAttemptKey(settled.startedAt) ?? (settled.source ? `group:${settled.source}` : null),
-        leadClaimedAt ? `orphan:${leadClaimedAt}` : null].filter(Boolean);
+      // orphan adoption charging the same dispatch shares the key. A row with no start time keys on its run. The group's
+      // claims (lead and members) are aliases too: orphan adoption keys on them when it could not read the run row. Only
+      // when the row has a start time — the stale-claim guard above then ties these claims to this attempt.
+      const dispatchKey = dispatchAttemptKey(settled.startedAt);
+      const attemptKey = dispatchKey ? [dispatchKey, ...claimAttemptKeys(groupClaims, lead)]
+        : settled.source ? [`group:${settled.source}`] : [];
       const rec = live ? effects.recordBuildFailure?.({ num: lead, reason: 'group-member-dropped', output: `dropped members: ${settled.groupDropped.join(',')}`,
         ...(attemptKey.length ? { attemptKey } : {}) }) : null;
       groupFailures.push({ num: lead, stage: 'group', reason: 'group-member-dropped', ...(rec ? { reasonCode: rec.reasonCode, attempts: rec.attempts } : {}) });
