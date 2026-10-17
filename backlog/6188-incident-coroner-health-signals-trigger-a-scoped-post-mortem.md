@@ -1,17 +1,15 @@
 ---
-kind: story
-size: 5
-parent: "xhwmyig"
+bornAs: xhwmyig
+kind: epic
 status: open
-blockedBy: ["xl3a0ik"]
-scope: ["we:scripts/operations/incident-classify.mjs", "we:scripts/conveyor/nightly-coroner-job.mjs", "we:scripts/operations/incident-report.mjs"]
+scope: ["we:scripts/conveyor/incident-coroner-job.mjs", "we:scripts/operations/incident-*.mjs", "we:scripts/settings/incident-coroner.json", "we:scripts/conveyor/health-smells/"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Optional cheap LLM classification, nightly batch and metrics report
+# Incident coroner: health signals trigger a scoped post-mortem, triaged by impact into P0 fix, later card or operator pick
 
-When no rule matches, send only the evidence bundle to a cheap model (Haiku 5.5 or Codex direct, synchronous) for a schema-checked result: cause, confidence, fix, scope and size. Confidence below 0.8 escalates; it never auto-queues. The LLM is off by default, with a token cap per day in the setting. The nightly coroner consumes the later queue. A daily report built from the ledger gives four metrics: time from episode open to card, auto-resolved share, false-positive incidents, and operator escalations per day. Acceptance: a schema rejection test; LLM off by default; token cap per day in the setting; the report is generated from the ledger with the four metrics; a mocked-model test never auto-queues low confidence. Operator decision 2026-10-17 (a): auto-queue a P0 fix only when a fixed rule matched the cause; LLM-proposed fixes wait for one-click operator approval.
+The coroner runs only nightly and by hand. Health-watch already opens one episode per problem but nothing turns an episode into a card. Add a job that, per episode, extracts scoped evidence, picks a cause by rule (optionally Haiku or Codex), and acts by impact: urgent P0 card, later normal card or nightly batch, or a needs-you entry with a pick. Guarded by daily P0 budget, never-weaken-a-gate, quiet hours, an audit ledger, shadow mode first.
 
 ## Acceptance
 

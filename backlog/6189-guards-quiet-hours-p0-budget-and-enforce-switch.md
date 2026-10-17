@@ -1,9 +1,10 @@
 ---
+bornAs: xl3a0ik
 kind: story
 size: 5
-parent: "xhwmyig"
+parent: "6188"
 status: open
-blockedBy: ["x8a6951"]
+blockedBy: ["6187"]
 scope: ["we:scripts/operations/incident-guards.mjs", "we:scripts/lib/quiet-hours.mjs", "we:scripts/settings/incident-coroner.json"]
 dateOpened: "2026-10-17"
 tags: []

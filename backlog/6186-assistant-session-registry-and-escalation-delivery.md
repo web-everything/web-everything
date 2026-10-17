@@ -1,14 +1,16 @@
 ---
-kind: epic
+bornAs: xbrgqq5
+kind: story
+size: 5
 status: open
-scope: ["we:scripts/conveyor/incident-coroner-job.mjs", "we:scripts/operations/incident-*.mjs", "we:scripts/settings/incident-coroner.json", "we:scripts/conveyor/health-smells/"]
+scope: ["we:scripts/operations/", "we:scripts/conveyor/"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Incident coroner: health signals trigger a scoped post-mortem, triaged by impact into P0 fix, later card or operator pick
+# Assistant session registry and escalation delivery
 
-The coroner runs only nightly and by hand. Health-watch already opens one episode per problem but nothing turns an episode into a card. Add a job that, per episode, extracts scoped evidence, picks a cause by rule (optionally Haiku or Codex), and acts by impact: urgent P0 card, later normal card or nightly batch, or a needs-you entry with a pick. Guarded by daily P0 budget, never-weaken-a-gate, quiet hours, an audit ledger, shadow mode first.
+Make the operator session bootstrap write a durable registration (session id, account, host, capabilities, quiet policy, heartbeat), refreshed whenever sessions or accounts switch. Daemon escalations go to the needs-you feed plus a direct message to the live registered session, with evidence and a suggested pick. When no live session is registered (stale heartbeat), they fall back to a desktop or phone notification, or to the 07:00 digest during quiet hours. The session acknowledges each item in three steps: received, presented, decided. Operator 2026-10-17: "the assistant will move from handling to being on the receiver end".
 
 ## Acceptance
 

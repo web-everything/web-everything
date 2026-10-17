@@ -1,15 +1,18 @@
 ---
+bornAs: xiacg5p
 kind: story
 size: 5
+parent: "6188"
 status: open
-scope: ["we:scripts/operations/", "we:scripts/conveyor/"]
+blockedBy: ["6189"]
+scope: ["we:scripts/operations/incident-classify.mjs", "we:scripts/conveyor/nightly-coroner-job.mjs", "we:scripts/operations/incident-report.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Assistant session registry and escalation delivery
+# Optional cheap LLM classification, nightly batch and metrics report
 
-Make the operator session bootstrap write a durable registration (session id, account, host, capabilities, quiet policy, heartbeat), refreshed whenever sessions or accounts switch. Daemon escalations go to the needs-you feed plus a direct message to the live registered session, with evidence and a suggested pick. When no live session is registered (stale heartbeat), they fall back to a desktop or phone notification, or to the 07:00 digest during quiet hours. The session acknowledges each item in three steps: received, presented, decided. Operator 2026-10-17: "the assistant will move from handling to being on the receiver end".
+When no rule matches, send only the evidence bundle to a cheap model (Haiku 5.5 or Codex direct, synchronous) for a schema-checked result: cause, confidence, fix, scope and size. Confidence below 0.8 escalates; it never auto-queues. The LLM is off by default, with a token cap per day in the setting. The nightly coroner consumes the later queue. A daily report built from the ledger gives four metrics: time from episode open to card, auto-resolved share, false-positive incidents, and operator escalations per day. Acceptance: a schema rejection test; LLM off by default; token cap per day in the setting; the report is generated from the ledger with the four metrics; a mocked-model test never auto-queues low confidence. Operator decision 2026-10-17 (a): auto-queue a P0 fix only when a fixed rule matched the cause; LLM-proposed fixes wait for one-click operator approval.
 
 ## Acceptance
 

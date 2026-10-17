@@ -1,7 +1,8 @@
 ---
+bornAs: x334ind
 kind: story
 size: 8
-parent: "xhwmyig"
+parent: "6188"
 status: open
 scope: ["we:scripts/conveyor/incident-coroner-job.mjs", "we:scripts/operations/incident-triage.mjs", "we:scripts/operations/incident-ledger.mjs", "we:scripts/settings/incident-coroner.json", "we:skills-src/conveyor/daemon-manifest.mjs", "we:scripts/conveyor/health-smells-notify-list.mjs"]
 dateOpened: "2026-10-17"
