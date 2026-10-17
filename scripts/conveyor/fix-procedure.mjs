@@ -54,6 +54,7 @@
 import { recordFixPush } from './fix-push-state.mjs';
 import { markFixPushAwaitingCi } from './fix-push-ci.mjs';
 import { execFileSync } from 'node:child_process';
+import { readGit } from '../lib/proc-read.mjs';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { hostname } from 'node:os';
 import { resolve } from 'node:path';
@@ -825,7 +826,7 @@ if (IS_CLI) {
       const src = typeof flags.src === 'string' ? flags.src : 'HEAD';
       execFileSync('git', ['push', remote, `${src}:refs/heads/${branch}`], { stdio: ['ignore', 'inherit', 'inherit'] });
       const claim = listLiveFixClaims({ repo: repoKey }).find(e => e.meta?.branch === branch);
-      if (claim) markFixPushAwaitingCi({ repo: CONSTELLATION_REPOS[repoKey].slug, pr: claim.meta.pr, head: execFileSync('git', ['rev-parse', src], { encoding: 'utf8' }).trim() });
+      if (claim) markFixPushAwaitingCi({ repo: CONSTELLATION_REPOS[repoKey].slug, pr: claim.meta.pr, head: readGit(['rev-parse', src]).trim() });
       out({ ok: true, pushed: true, branch, repo: repoKey });
     }
     fail(USAGE);
