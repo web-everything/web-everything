@@ -539,14 +539,15 @@ export function numberingRestampSettled(repo, pr, head) { return settledRestamps
 const errorReason = (e) => String(e?.message ?? e).split('\n')[0];
 
 // Numbering carries missing review evidence from the accepted head, never a live-head
-// referral hold or read failure. Only the guard's specific missing-evidence refusal is
-// satisfied by the proven move and the prior head's independently checked clearance.
+// referral hold or read failure. Only the guard's explicit no-review-run code is
+// satisfied by the proven move and the prior head's independently checked clearance;
+// an unfinished live-head run shares the prose refusal but can never be overridden.
 function guardNumberingReferrals({ state, plan, proven, guardReferrals, repo, pr }) {
   if (!proven) return guardReferrals(state, { repo, pr });
   guardReferrals({ ...state, headRefOid: plan.from }, { repo, pr });
   try { return guardReferrals(state, { repo, pr }); }
   catch (e) {
-    if (!String(e?.message ?? e).startsWith('mandatory referral hold: no-current-head-review-evidence;')) throw e;
+    if (e?.code !== 'MANDATORY_REFERRAL_NO_REVIEW_RUN') throw e;
   }
 }
 
