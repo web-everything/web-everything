@@ -79,11 +79,11 @@ import { summarizeAgyEvents } from '../gemini-direct-task.mjs';
 import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import matter from 'gray-matter';
-import { lightRevalidationInput, parseLightVerdict } from './prepare-light-revalidate.mjs';
+import { lightRevalidationInput, lightWorkerRefusal, parseLightVerdict } from './prepare-light-revalidate.mjs';
 import { readPreparePolicy } from '../conveyor/prepare-policy-settings.mjs';
 import { readField, removeFrontmatterField } from '../backlog/frontmatter.mjs';
 import { parseCard } from '../lib/priority-order.mjs';
-import { appendScorecard as appendScorecardRow } from '../conveyor/run-scorecard-store.mjs';
+import { appendScorecard as appendScorecardRow, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
 import { hookSurfaceChanged, resetHookSurface, snapshotHookSurface, withHooksDisabled } from '../lib/git-hook-surface.mjs';
 import { AGY_CLAUDE_MODEL_BY_TIER, PROBATION_ROSTER, PROBATION_WORKERS, PROVEN_TASK_ENVELOPES, probationWorkerForRoute, isStatuteTierPath } from '../lib/provider-routing.mjs';
@@ -484,8 +484,13 @@ export async function runProbationBuild(args, io) {
       if (preparing && args.lightRevalidate && attempt === 0 && !groupMembers.length) {
         const input = lightRevalidationInput({ raw: item.raw, scope: item.scope, baseSha, policy: preparePolicy,
           diff: (sha, base, paths) => io.prepareScopeDiff(lanePath, sha, base, paths) });
+        const lightWorker = input && { ...PROBATION_WORKERS.codex, model: resolvePolicyModel('codex', 'sol'), effort: 'low', taskType: 'prepare' };
+        let refusal = null;
         if (input) {
-          const lightWorker = { ...PROBATION_WORKERS.codex, model: resolvePolicyModel('codex', 'sol'), effort: 'low', taskType: 'prepare' };
+          try { refusal = lightWorkerRefusal({ worker: lightWorker, records: io.readScorecards() }); } catch { refusal = 'trial history unreadable'; }
+          if (refusal) log(`light revalidation skipped: ${refusal}; full prepare`);
+        }
+        if (input && !refusal) {
           const lightTask = io.writeTaskFile(lanePath, 'prepare-light-revalidate.md', input);
           resultWorker = lightWorker;
           const answer = io.runWorker(buildWorkerArgv({ worker: lightWorker, weRoot: lanePath, dir: lanePath,
@@ -953,6 +958,14 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
   const node = (script, args, opts) => trySh(process.execPath, [join(opts.cwd, script), ...args], opts);
   return {
     log: (m) => console.error(m),
+    // Read-only, and unlike `readStore` a corrupt store throws: the light worker's veto check fails closed.
+    readScorecards: () => {
+      const file = resolveScorecardStorePath(env);
+      if (!existsSync(file)) return [];
+      const records = JSON.parse(readFileSync(file, 'utf8'))?.records;
+      if (!Array.isArray(records)) throw new Error('scorecard store has no records array');
+      return records.filter(r => r && typeof r === 'object');
+    },
     openBlockers(n, dir = repoRoot) {
       const item = this.findItem(n, dir);
       if (!item) throw new Error(`no backlog/${n}-*.md file in the checkout`);

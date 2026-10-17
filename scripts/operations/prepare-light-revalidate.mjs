@@ -2,6 +2,18 @@
 import { readField } from '../backlog/frontmatter.mjs';
 import { prepareCardStatus } from '../conveyor/prepare-result.mjs';
 import { fenceUntrusted, FENCED_DATA_RULE } from '../lib/mandate-fence.mjs';
+import { criticalMissesFor } from '../lib/critical-work.mjs';
+import { providerQuotaHold } from '../lib/provider-quota-hold.mjs';
+
+// The light worker skips the router, so it must pass the router's own admission checks itself:
+// the #4034 critical-miss veto on its exact triple and the provider's quota hold. Returns why not, or null.
+export function lightWorkerRefusal({ worker, records, now = Date.now() }) {
+  if (!Array.isArray(records)) return 'trial history unreadable';
+  const vetoed = criticalMissesFor(records, worker.taskType)
+    .some(v => v.provider === worker.provider && v.model === worker.model);
+  if (vetoed) return `critical miss on record for ${worker.provider}/${worker.model}/${worker.taskType}`;
+  return providerQuotaHold(records, worker.provider, now);
+}
 
 export function lightRevalidationInput({ raw, scope, baseSha, policy, diff }) {
   if (policy.lightRevalidate === false || !prepareCardStatus(raw).hasSections) return null;

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { lightRevalidationInput, parseLightVerdict } from '../prepare-light-revalidate.mjs';
+import { lightRevalidationInput, lightWorkerRefusal, parseLightVerdict } from '../prepare-light-revalidate.mjs';
 const raw = '---\npreparedDate: "2026-10-17"\npreparedAgainstSha: "aaaa1111"\n---\n## Design\nD\n## MVP\nM\n## Test plan\nT\n## Proof plan\nP\n';
 describe('light prepare evidence', () => {
   it.each(['</card>', '</scope-diff>', '</material>', '< / MaTeRiAl\r\n>',
@@ -30,6 +30,17 @@ describe('light prepare evidence', () => {
   ])('falls back to full prepare when evidence cannot be used: %j', overrides => {
     expect(lightRevalidationInput({ raw, scope: ['we:a.mjs'], baseSha: 'bbbb2222', policy: {},
       diff: () => 'a\nb', ...overrides })).toBeNull();
+  });
+  it('refuses the light worker exactly where the router would: its own critical-miss triple, a quota hold, no history', () => {
+    const worker = { provider: 'codex', model: 'gpt-6.1-sol', taskType: 'prepare' };
+    const miss = { ...worker, outcome: 'reworked' };
+    expect(lightWorkerRefusal({ worker, records: [miss] })).toContain('critical miss');
+    expect(lightWorkerRefusal({ worker, records: [{ ...miss, model: 'gpt-6.1-astra' }, { ...miss, taskType: 'doc-fix' },
+      { ...miss, role: 'supervise' }, { ...worker, outcome: 'clean' }] })).toBeNull();
+    const now = Date.parse('2026-10-17T12:00:00Z');
+    expect(lightWorkerRefusal({ worker, now, records: [{ provider: 'codex', status: 'quota-exhausted',
+      scoredAt: '2026-10-17T11:30:00Z' }] })).toContain('quota exhausted');
+    expect(lightWorkerRefusal({ worker, records: null })).toBe('trial history unreadable');
   });
   it.each(['still-valid', 'needs-reprepare'])('accepts a structured %s verdict', verdict => {
     expect(parseLightVerdict(JSON.stringify({ verdict, reason: 'Plan still covers the change.' })))

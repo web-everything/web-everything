@@ -872,7 +872,8 @@ describe('standalone prepare', () => {
   }
   const prepareArgs = () => args(codex, { taskType: 'prepare', scope: `we:${path}` });
   it.each(['still-valid', 'still-valid-gemini', 'needs-reprepare', 'over-cap', 'invalid', 'disabled', 'tampered',
-    'head-moved', 'hooks-changed', 'numstat-changed', 'stamp-retry-codex', 'stamp-retry-gemini'])(
+    'head-moved', 'hooks-changed', 'numstat-changed', 'stamp-retry-codex', 'stamp-retry-gemini',
+    'light-vetoed', 'light-quota-held', 'scorecards-unreadable'])(
     'scope-only stale preparation: %s uses the existing card-only landing arc', async mode => {
       const { io, calls } = prepareIo();
       const initial = prepared.replace('---\n', '---\npreparedDate: "2026-10-16"\npreparedAgainstSha: "aaaa1111"\n');
@@ -897,6 +898,14 @@ describe('standalone prepare', () => {
       io.findItem = () => ({ path, raw: current, spec: current, scope: ['we:docs/probation/probation.md'], slug: 'example' });
       io.preparePolicy = { autoSize: false, lightRevalidate: mode !== 'disabled', lightRevalidateMaxDiffLines: 2 };
       io.prepareScopeDiff = () => mode === 'over-cap' ? 'a\nb\nc\n' : 'a\nb\n';
+      // The light worker passes the router's own admission: a critical miss on its exact triple or an active
+      // codex quota hold sends the card to full preparation, and so does a trial history it cannot read.
+      io.readScorecards = () => {
+        if (mode === 'scorecards-unreadable') throw new Error('store unreadable');
+        if (mode === 'light-vetoed') return [{ provider: 'codex', model: 'gpt-6.1-sol', taskType: 'prepare', outcome: 'reworked' }];
+        if (mode === 'light-quota-held') return [{ provider: 'codex', status: 'quota-exhausted', scoredAt: new Date().toISOString() }];
+        return [{ provider: 'codex', model: 'gpt-6.1-sol', taskType: 'doc-fix', outcome: 'reworked' }];
+      };
       io.diffNumstat = () => mode === 'numstat-changed' && runs > 0 ? '1\t0\tdocs/unauthorized.md'
         : current === initial ? '' : `2\t0\t${path}`;
       io.writeTaskFile = (_d, name, text) => { tasks.push({ name, text }); return name; };
@@ -945,7 +954,14 @@ describe('standalone prepare', () => {
           prepDrift: { stale: false } }, { today: '2026-10-17', maxAgeDays: 3 })).toBeNull();
       } else {
         expect(current).toContain('Full preparation revised.');
-        expect(runs).toBe(['over-cap', 'disabled'].includes(mode) ? 1 : 2);
+        const skipped = ['over-cap', 'disabled', 'light-vetoed', 'light-quota-held', 'scorecards-unreadable'].includes(mode);
+        expect(runs).toBe(skipped ? 1 : 2);
+        if (skipped) {
+          expect(tasks.some(t => t.name === 'prepare-light-revalidate.md')).toBe(false);
+          expect(workerArgv[0]).toEqual(expect.arrayContaining([`--model=${originalWorker.model}`, '--task-file=probation-build-task.md']));
+          expect(workerArgv.flat()).not.toContain('--model=gpt-6.1-sol');
+          expect(scorecards[0]).toMatchObject({ executor: originalWorker.executor, model: originalWorker.model });
+        }
       }
       if (retry) {
         expect(workerArgv[1][0]).toBe(`/lanes/22/${originalWorker.launcher}`);
@@ -956,7 +972,7 @@ describe('standalone prepare', () => {
       }
       expect(calls.find(c => c[0] === 'commit')[1]).toEqual([path]);
       expect(tasks.find(t => t.name === 'prepare-light-revalidate.md')?.text ?? '').toContain(
-        ['over-cap', 'disabled'].includes(mode) ? '' : 'aaaa1111');
+        ['over-cap', 'disabled', 'light-vetoed', 'light-quota-held', 'scorecards-unreadable'].includes(mode) ? '' : 'aaaa1111');
     });
   it('writes grouped prepare and per-member refusal lines in the actual PR body', () => {
     const dir = mkdtempSync(join(tmpdir(), 'group-prepare-body-'));
