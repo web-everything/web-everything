@@ -724,6 +724,23 @@ describe('standalone task types and workers', () => {
       expect(rows.map((r) => r.item).sort()).toEqual(['1', '2', '3', '4']);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+
+  it('reads the light worker trial history from the shared store and throws when it is unusable', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'probation-scorecard-read-'));
+    const store = join(dir, '.conveyor', 'run-scorecards.json');
+    const read = () => realIo({ session: 's', env: { ...process.env, CONVEYOR_STATE_ROOT: dir } }).readScorecards();
+    try {
+      expect(read()).toEqual([]);
+      mkdirSync(join(dir, '.conveyor'));
+      const miss = { provider: 'codex', model: 'gpt-6.1-sol', taskType: 'prepare', outcome: 'reworked' };
+      writeFileSync(store, JSON.stringify({ version: 1, records: [miss, null] }));
+      expect(read()).toEqual([miss]);
+      writeFileSync(store, '{"version":1,"records":[');
+      expect(read).toThrow();
+      writeFileSync(store, JSON.stringify({ version: 1 }));
+      expect(read).toThrow('no records array');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
 });
 
 it('required store locks refuse writes under contention instead of falling back unlocked', () => {
