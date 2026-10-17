@@ -166,6 +166,9 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
     });
     const held = readRebuildState(f.cloneDir, f.env).held;
     const text = held.details[0].detail;
+    // Every failed entry keeps its name and exit code, even past the cap.
+    for (const entry of ['a.mjs', 'b.mjs', 'c.mjs', 'd.mjs', 'e.mjs', 'f.mjs']) expect(text).toContain(`${entry} (signal=null, exitCode=1)`);
+    expect(text.match(/frame 29/g)).toHaveLength(6);
     expect(text).not.toContain('sk-ant-api03-secretCCCC');
     expect(text).not.toContain('npm_secretDDDDDDDDDDDDDDDDDDDD');
     expect(text).toContain('frame 29');

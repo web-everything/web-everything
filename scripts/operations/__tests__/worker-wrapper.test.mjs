@@ -48,6 +48,15 @@ describe('runWorker: the job record and the result channels', () => {
     expect(JSON.parse(readFileSync(join(diagnosticsDir, 'first-output.json'), 'utf8')).ms).toBeGreaterThanOrEqual(0);
   });
 
+  it('bounds the captured smoke stderr on disk and keeps its newest bytes', async () => {
+    const diagnosticsDir = tmp();
+    const s = spec({ diagnosticsDir, argv: ['-e', `for (let i = 0; i < 40; i++) process.stderr.write('x'.repeat(64 * 1024) + '\\n'); process.stderr.write('newest line\\n'); process.stdout.write(${JSON.stringify(claudeStdout(DONE))})`] });
+    await runWorker(s);
+    const captured = readFileSync(join(diagnosticsDir, 'wrapper.stderr'), 'utf8');
+    expect(captured.length).toBeLessThanOrEqual(1024 * 1024 + 128 * 1024);
+    expect(captured.endsWith('newest line\n')).toBe(true);
+  });
+
   it('writes a started record with pid, timeout and deadline BEFORE the child exits, then a done envelope', async () => {
     const writes = [];
     const s = spec({ argv: ['-e', `setTimeout(()=>process.stdout.write(${JSON.stringify(claudeStdout(DONE))}), 150)`] });

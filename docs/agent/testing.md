@@ -10,10 +10,14 @@ Exit failures and `ok:false` never receive this retry. Both settings use the pol
 `WE_SMOKE_BOOT_SIGNAL_RETRIES`; log effective values and sources. Retain per-attempt signal,
 exit code and the last 30 stderr lines in the smoke result. Rebuild rejection/held/stale alerts
 must preserve boot tails beyond the ordinary detail caps while still redacting secrets: redact
-stderr where it is read (`redactSecrets`: GitHub/Anthropic/npm/Slack tokens, AWS key ids, auth
-headers, 500-char lines), cap a boot detail at 16 KB keeping its head and newest lines, and keep
-a dispatch-smoke stderr tail in the structured `diagnostics` field only, never in `detail`, so the
-overlay event log and held state never carry it. Env integers are strict digits; empty is unset.
+stderr where it is read (`redactSecrets`: the `ci-heal-mark.mjs` secret shapes, including
+`*_KEY=`/`*PASSWORD=` pairs, URL credentials and PEM keys; CR/U+2028 split lines; 500-char lines).
+A boot detail names every failed entry and its signal in its header and gives each failure an
+equal share of a 12 KB budget (16 KB backstop). A dispatch-smoke stderr tail stays in the
+structured `diagnostics` field only, never in `detail`; `detail` is redacted where the verdict is
+made, so the overlay event log, held state, thrown errors and logs never carry raw worker text.
+The wrapper's captured stderr compacts past 1 MiB, and only its last 64 KiB is read. Env integers
+are strict digits; empty is unset.
 Cover retry recovery, exhausted retries, non-signal refusal and concurrency with injected children;
 exercise diagnostic propagation through a real-git rebuild fixture. Run these suites through heavy admission.
 

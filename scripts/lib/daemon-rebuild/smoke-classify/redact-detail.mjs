@@ -2,30 +2,45 @@
  * detail, shared by the classifiers and the smoke-and-adopt ladder. Split out of daemon-rebuild.mjs (move-only).
  */
 
-/** Secret shapes a child's stderr or a crash dump can echo: GitHub, Anthropic, npm and Slack tokens, AWS key ids, auth headers. */
-const SECRET_PATTERNS = [
-  [/\b(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/g, '$1<redacted>'],
-  [/\b(sk-ant-)[A-Za-z0-9_-]+/g, '$1<redacted>'],
-  [/\b(npm_)[A-Za-z0-9]{20,}/g, '$1<redacted>'],
-  [/\b(xox[abposr]-)[A-Za-z0-9-]+/g, '$1<redacted>'],
-  [/\bAKIA[0-9A-Z]{16}\b/g, 'AKIA<redacted>'],
-  [/\b(Bearer|Basic|token)(\s+)[A-Za-z0-9._~+/=-]{8,}/gi, '$1$2<redacted>'],
-  [/\b(authorization|api[_-]?key|password|secret)(["']?\s*[:=]\s*["']?)[^\s"',;]+/gi, '$1$2<redacted>'],
-];
 const MAX_LINE = 500;
 const MAX_BOOT_DETAIL = 16_000;
+// CR, U+0085, U+2028 and U+2029 end a line; every other control character (but tab and newline) is dropped.
+const LINE_BREAKS = new RegExp(`\\r\\n?|[${String.fromCharCode(0x85, 0x2028, 0x2029)}]`, 'g');
+const CONTROLS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u0084\u0086-\u009f]/g;
 
-/** Every known secret shape redacted, and each line capped, so a stderr tail is safe to persist. */
-export function redactSecrets(text) {
-  let out = String(text ?? '');
-  for (const [re, to] of SECRET_PATTERNS) out = out.replace(re, to);
-  return out.split('\n').map((line) => (line.length > MAX_LINE ? `${line.slice(0, MAX_LINE - 1)}…` : line)).join('\n');
+/**
+ * One line with every known secret shape redacted — the same shapes as `ci-heal-mark.mjs#redactSecrets`
+ * (tokens, keys, JWTs, auth headers, PEM keys, URL credentials, `*_TOKEN=`/`*password:` style pairs), kept here
+ * so the daemon smoke path does not import the conveyor's comment module. The key run is bounded (no quadratic scan).
+ */
+function redactLine(line) {
+  return line
+    .replace(/(\/\/)[^/\s@]+@/g, '$1<redacted>@')
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|glpat-[A-Za-z0-9_-]{16,}|npm_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*)/g,
+      (m) => `${m.match(/^(?:gh[pousr]_|github_pat_|glpat-|npm_|sk-ant-|sk-|AKIA|xox[baprs]-|AIza|eyJ)/)?.[0] ?? ''}<redacted>`)
+    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 <redacted>')
+    .replace(/(["']?)(--?)?([A-Za-z0-9_]{0,48}(?:token|secret|password|passwd|api[_-]?key|auth|credential)[A-Za-z0-9_-]*)\1(\s*[=:]\s*|\s+)("[^"]*"|'[^']*'|\S+)/gi,
+      (m, _q, dashes, key, sep) => (dashes || /[=:]/.test(sep) ? `${dashes ?? ''}${key}=<redacted>` : m));
 }
 
-/** Boot diagnostics keep their stderr tails, bounded to the head (which names the failed entries) plus the newest
- *  lines; every other detail is one 500-char line. */
+/**
+ * Untrusted text (a child's stderr, a worker-written field) made safe to persist: line breaks normalised, control
+ * characters dropped, PEM private keys and secret shapes redacted, each line capped at 500 chars. Each line is cut to
+ * 4x the cap BEFORE redaction (bounding regex work) and to the cap after it, so a cut never slices a secret's prefix.
+ */
+export function redactSecrets(text) {
+  const normalised = String(text ?? '').replace(LINE_BREAKS, '\n').replace(CONTROLS, '')
+    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g, '<redacted private key>');
+  return normalised.split('\n').map((raw) => {
+    const line = redactLine(raw.length > MAX_LINE * 4 ? raw.slice(0, MAX_LINE * 4) : raw);
+    return line.length > MAX_LINE ? `${line.slice(0, MAX_LINE - 1)}…` : line;
+  }).join('\n');
+}
+
+/** Boot diagnostics keep their stderr tails (the check itself budgets each failed entry; this is the backstop:
+ *  head plus newest lines, 16 KB); every other detail is one 500-char line. */
 export function redactDetail(detail, checkName) {
+  if (checkName !== 'daemon-entries-boot') return redactSecrets(String(detail ?? '').slice(0, 8_000)).slice(0, 500);
   const text = redactSecrets(detail);
-  if (checkName !== 'daemon-entries-boot') return text.slice(0, 500);
   return text.length > MAX_BOOT_DETAIL ? `${text.slice(0, 2_000)}\n…\n${text.slice(-(MAX_BOOT_DETAIL - 2_003))}` : text;
 }

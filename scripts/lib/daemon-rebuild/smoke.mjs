@@ -655,7 +655,7 @@ export async function smokeAndAdopt({
   if (a.threw) {
     // `daemon-live-smoke.mjs` documents itself as never throwing — this is defense-in-depth only. Root was
     // never touched, so nothing to roll back; hold on last-good and let the next tick retry fresh.
-    alert('smoke-threw', String(a.threw?.message || a.threw));
+    alert('smoke-threw', redactDetail(String(a.threw?.message || a.threw)));
     await hold('smoke-threw', []);
     return { moved: false, reason: 'smoke-threw', plan, alerts: [...prepAlerts, ...alertsList] };
   }

@@ -545,6 +545,31 @@ describe('runDaemonLoadOverlay — dispatch smoke wiring, rollback of ONLY this 
     expect(r).toMatchObject({ adopted: false, rolledBack: true, reason: 'dispatch-smoke-failed', dispatchSmoke: { phase: 'candidate', result: { reason: 'commands-denied' } } });
   });
 
+  it('the rollback path redacts and bounds a worker-supplied detail before the event log, the thrown error and the log', async () => {
+    const secrets = ['ghp_secretAAAA', 'ANTHROPIC_API_KEY=sk-ant-api03-secretCCCC', 'DB_PASSWORD=hunter2hunter2', 'https://bot:pa55word@example.com'];
+    const appendEventFn = vi.fn();
+    const log = { error: vi.fn(), log: () => {} };
+    const thrown = [];
+    let calls = 0;
+    const rebuild = vi.fn(async ({ runSmoke }) => {
+      calls += 1;
+      if (calls === 1) {
+        try { await runSmoke({ root: '/cand', env: {} }); } catch (e) { thrown.push(String(e.message)); return { moved: false, reason: 'smoke-threw', alerts: [] }; }
+      }
+      return { moved: false, reason: 'up-to-date' };
+    });
+    await runDaemonLoadOverlay({
+      clone: '/c', ref: 'lane/x', installed: () => ({ inHead: true, tip: 'abc', head: 'deadbeef', reason: 'in-head' }), pr: 1, addOverlayFn: vi.fn(), rebuild, removeOverlayFn: vi.fn(() => ({ removed: true, list: [] })), appendEventFn, settings: settingsOn, log,
+      baseSmoke: async () => ({ verdict: 'pass' }),
+      inspect: () => ({ inTree: true, required: true, matched: ['scripts/operations/worker-wrapper-launch.mjs'] }),
+      dispatchSmoke: async () => ({ ok: false, reason: 'commands-denied', detail: `${secrets.join(' ')} ${'w'.repeat(20_000)}` }),
+    });
+    const reason = appendEventFn.mock.calls[0][1].reason;
+    expect(reason.length).toBeLessThanOrEqual(500);
+    const sinks = [reason, thrown.join('\n'), log.error.mock.calls.map((c) => c.join(' ')).join('\n')];
+    for (const s of ['secretAAAA', 'secretCCCC', 'hunter2hunter2', 'pa55word']) for (const sink of sinks) expect(sink).not.toContain(s);
+  });
+
   it('a candidate worker launch that THROWS removes ONLY this overlay and rebuilds without it — it is not left registered with a not-in-tree warning', async () => {
     const removeOverlayFn = vi.fn(() => ({ removed: true, list: [] }));
     let calls = 0;
@@ -937,9 +962,11 @@ describe('runRealDispatchSmoke — the smoke worker\'s completion record goes to
   });
 
   it('keeps wrapper stderr out of detail and logs, and redacts and bounds it at the source', async () => {
-    const secrets = ['ghp_secretAAAA', 'github_pat_secretBBBB', 'sk-ant-api03-secretCCCC', 'npm_secretDDDDDDDDDDDDDDDDDDDD', 'Bearer secretEEEE'];
+    const secrets = ['ghp_secretAAAA', 'github_pat_secretBBBB', 'sk-ant-api03-secretCCCC', 'npm_secretDDDDDDDDDDDDDDDDDDDD', 'Bearer secretEEEE',
+      'secretFFFF', 'hunter2hunter2', 'pa55word'];
     const spawn = launchFixture(({ scratch }) => {
-      writeFileSync(join(scratch, 'wrapper.stderr'), [...secrets.map((s) => `token ${s}`), 'y'.repeat(20_000)].join('\n'));
+      writeFileSync(join(scratch, 'wrapper.stderr'), [...secrets.slice(0, 5).map((s) => `token ${s}`),
+        'OPENAI_API_KEY=secretFFFF', 'progress\rDB_PASSWORD=hunter2hunter2', 'clone https://bot:pa55word@example.com/x', 'y'.repeat(20_000)].join('\n'));
     });
     const log = { error: vi.fn() };
     const r = await smoke(spawn, { log });

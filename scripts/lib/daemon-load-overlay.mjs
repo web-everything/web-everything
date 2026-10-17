@@ -55,13 +55,13 @@ import { performance } from 'node:perf_hooks';
 import { setTimeout as sleepAsync } from 'node:timers/promises';
 import { homedir, tmpdir } from 'node:os';
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
+  closeSync, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync,
 } from 'node:fs';
 import { readHeadSha, isSafeBranchName } from './daemon-self-sync.mjs';
 import { gitRun } from './main-staleness.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { strictEnvInteger } from './daemon-boot-smoke.mjs';
-import { redactSecrets } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
+import { redactDetail, redactSecrets } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
 import { readRoutingPolicy, resolvePolicyModel } from './dispatch-routing-policy-io.mjs';
 import { repairCloneRefs } from './lane-repair.mjs';
 import { addOverlay, removeOverlay, appendOverlayEvent } from './daemon-overlays.mjs';
@@ -311,7 +311,7 @@ export function judgeDispatchSmoke({ nonce, marker, record, denials = [], timedO
   const blocker = record?.result?.blocker ?? null;
   const blockerKind = typeof blocker === 'string' ? blocker : blocker?.kind;
   if (denials.length || (blockerKind && PERMISSION_BLOCKER.test(String(blockerKind))) || record?.denied) {
-    return { ok: false, reason: 'commands-denied', detail: denials[0] || blockerKind || String(record?.denied) };
+    return { ok: false, reason: 'commands-denied', detail: redactDetail(denials[0] || blockerKind || String(record?.denied)) };
   }
   if (record?.status === 'done') {
     return marker === nonce ? { ok: true, reason: 'passed' } : { ok: false, reason: 'no-commands-ran', detail: 'the worker finished without running its smoke commands' };
@@ -349,6 +349,24 @@ function findTranscript(ids, home = homedir()) {
     if (hit) return join(dir, p, hit);
   }
   return null;
+}
+
+/** The last `bytes` of a file as text ('' when unreadable); a partial first line is dropped when the read starts mid-file. */
+function readFileTail(file, bytes = 64 * 1024) {
+  let fd;
+  try {
+    fd = openSync(file, 'r');
+    const size = fstatSync(fd).size;
+    const start = Math.max(0, size - bytes);
+    const buf = Buffer.alloc(size - start);
+    const n = readSync(fd, buf, 0, buf.length, start);
+    const text = buf.subarray(0, n).toString('utf8');
+    return start > 0 ? text.slice(text.indexOf('\n') + 1) : text;
+  } catch {
+    return '';
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 }
 
 function readJson(file) {
@@ -454,7 +472,7 @@ async function runRealDispatchSmokeAttempt({
     wrapperPid, wrapperAliveAtTimeout: verdict.reason === 'timeout' ? probeAlive(wrapperPid) : null,
     launchStartedAt: new Date(t0).toISOString(),
     // Redacted and line-bounded at the source, so no consumer of the result can persist a raw token.
-    stderrTail: (() => { try { return redactSecrets(readFileSync(join(scratch, 'wrapper.stderr'), 'utf8').trimEnd().split('\n').slice(-30).join('\n')); } catch { return ''; } })(),
+    stderrTail: redactSecrets(readFileTail(join(scratch, 'wrapper.stderr')).trimEnd().split('\n').slice(-30).join('\n')),
     sessionAppeared: !!session, transcriptAppeared: !!transcript,
     firstOutputMs: readJson(join(scratch, 'first-output.json'))?.ms ?? null,
   };
@@ -506,9 +524,11 @@ async function runDispatchSmokeSafely(dispatchSmoke, args) {
   try {
     const r = await dispatchSmoke(args);
     // Anything that is not a verdict object is a failed smoke: `.ok` / `.reason` are read unguarded downstream.
-    return r && typeof r === 'object' && typeof r.ok === 'boolean' ? r : { ok: false, reason: 'smoke-bad-result' };
+    if (!(r && typeof r === 'object' && typeof r.ok === 'boolean')) return { ok: false, reason: 'smoke-bad-result' };
+    // Every rollback, event-log and thrown-error sink reads `detail`: make it safe once, here.
+    return r.detail === undefined ? r : { ...r, detail: redactDetail(r.detail) };
   } catch (e) {
-    return { ok: false, reason: 'smoke-threw', detail: String((e && e.message) || e).split('\n')[0] };
+    return { ok: false, reason: 'smoke-threw', detail: redactDetail(String((e && e.message) || e).split('\n')[0]) };
   }
 }
 
@@ -620,7 +640,7 @@ export async function runDaemonLoadOverlay({
 
   // ROLLBACK — remove ONLY this overlay, then recover through `rebuildWithout`: main + every other overlay, unchanged.
   const rollBack = async (out, ctl, rebuildWithout) => {
-    const why = `dispatch-smoke-failed: ${ctl.result.reason}${ctl.result.detail ? ` — ${ctl.result.detail}` : ''}`;
+    const why = redactDetail(`dispatch-smoke-failed: ${ctl.result.reason}${ctl.result.detail ? ` — ${ctl.result.detail}` : ''}`);
     log.error?.(`daemon-load-overlay: ${ref} FAILED the dispatch smoke (${ctl.phase}): ${why}. Removing it and recovering without it (other overlays untouched). Evidence: ${ctl.result.scratch ?? 'n/a'}${ctl.result.transcript ? `, transcript ${ctl.result.transcript}` : ''}`);
     try { removeOverlayFn(root, ref, { env, why }); } catch (e) {
       // The list could not be changed (e.g. its lock timed out): rebuilding now would just load the overlay again, and

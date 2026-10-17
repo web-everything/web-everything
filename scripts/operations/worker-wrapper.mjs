@@ -191,6 +191,9 @@ export function extractAgyResult(stdout) {
 export const OPERATOR_STOP_SIGNALS = Object.freeze(['SIGTERM', 'SIGINT', 'SIGHUP']);
 /** After a forwarded stop signal, a child that ignores it is SIGKILLed after this long, so the wrapper still writes its record. */
 const STOP_GRACE_MS = 5_000;
+/** Opt-in smoke stderr capture: compact past 1 MiB to the newest 64 KiB (exported for the cap test). */
+export const DIAGNOSTIC_STDERR_MAX_BYTES = 1024 * 1024;
+export const DIAGNOSTIC_STDERR_KEEP_BYTES = 64 * 1024;
 /** `spawnToCompletion` kills the child itself on a stream overflow and says so in the message (it sets `killed` too). */
 const isOverflow = (failure) => /maxBuffer exceeded/.test(String(failure?.message ?? ''));
 
@@ -298,6 +301,7 @@ async function runWorkerOnce(spec, io, stop) {
     // Opt-in smoke evidence: persist the first byte time and stderr while the worker is still running.
     if (spec.diagnosticsDir) {
       let first = true;
+      let stderrBytes = 0;
       for (const [stream, name] of [[child.stdout, 'worker.stdout'], [child.stderr, 'wrapper.stderr']]) {
         stream?.on?.('data', (chunk) => {
           try {
@@ -306,7 +310,16 @@ async function runWorkerOnce(spec, io, stop) {
               first = false;
             }
             // stdout is only a first-byte signal; stderr is the diagnostic tail.
-            if (name === 'wrapper.stderr') appendFileSync(join(spec.diagnosticsDir, name), chunk);
+            if (name === 'wrapper.stderr') {
+              const file = join(spec.diagnosticsDir, name);
+              appendFileSync(file, chunk);
+              stderrBytes += Buffer.byteLength(chunk);
+              // Bounded on disk, newest bytes kept: past the cap, compact the file to its last 64 KiB.
+              if (stderrBytes > DIAGNOSTIC_STDERR_MAX_BYTES) {
+                writeFileSync(file, readFileSync(file).subarray(-DIAGNOSTIC_STDERR_KEEP_BYTES));
+                stderrBytes = DIAGNOSTIC_STDERR_KEEP_BYTES;
+              }
+            }
           } catch { /* diagnostics cannot interrupt the worker */ }
         });
       }

@@ -195,7 +195,15 @@ async function bootOneEntry(entry, { root, timeoutMs, runChild, env }) {
   } catch (e) {
     return { entry, ok: false, error: `unparsable child output: ${firstLine(e)}` };
   }
-  return { entry, ok: !!parsed?.ok, error: parsed?.error };
+  return { entry, ok: !!parsed?.ok, error: parsed?.error === undefined ? undefined : redactSecrets(parsed.error) };
+}
+
+/** Each failed entry gets an equal share of the detail budget (its first and newest lines), so the redaction
+ *  backstop's 16 KB cap never drops a later entry's name or signal. */
+const BOOT_DETAIL_BUDGET = 12_000;
+function budgetedError(error, budget) {
+  const text = String(error ?? '');
+  return text.length > budget ? `${text.slice(0, 300)}\n…\n${text.slice(-(budget - 305))}` : text;
 }
 
 /**
@@ -243,8 +251,11 @@ export async function checkDaemonEntriesBoot({ root, budgets = {}, runChild = ru
   const notes = retryNotes ? ` — ${retryNotes}` : '';
   const failures = results.filter((r) => !r.ok);
   if (failures.length) {
-    const detail = failures.map((f) => `${f.entry}: ${f.error}`).join('; ');
-    return { ok: false, entries: results, detail: `${overrideMarker}${failures.length}/${results.length} daemon entr${failures.length === 1 ? 'y' : 'ies'} failed to boot: ${detail}${notes}` };
+    // The header names every failed entry and its signal; each failure then starts its own line.
+    const header = failures.map((f) => (f.signal || f.exitCode != null ? `${f.entry} (signal=${f.signal ?? null}, exitCode=${f.exitCode ?? null})` : f.entry)).join(', ');
+    const budget = Math.max(1_000, Math.floor(BOOT_DETAIL_BUDGET / failures.length));
+    const detail = failures.map((f) => `${f.entry}: ${budgetedError(f.error, budget)}`).join('\n');
+    return { ok: false, entries: results, detail: `${overrideMarker}${failures.length}/${results.length} daemon entr${failures.length === 1 ? 'y' : 'ies'} failed to boot: ${header}${notes}\n${detail}` };
   }
   return { ok: true, entries: results, detail: `${overrideMarker}all ${results.length} daemon entries booted clean: ${results.map((r) => r.entry).join(', ')}${notes}` };
 }
