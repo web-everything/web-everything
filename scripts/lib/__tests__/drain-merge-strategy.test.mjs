@@ -18,7 +18,7 @@ const policyOf = (strategy) => ({ policy: resolveMergeDeliveryPolicy({ tool: str
 
 const DRAIN = 'drain-bot';
 
-function harness({ strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, env = process.env, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false }, requestRedTeam } = {}) {
+function harness({ strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = process.env, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false }, requestRedTeam } = {}) {
   const calls = [];
   const logs = [];
   let stored = initial;
@@ -41,6 +41,9 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
     if (args[0] === 'pr' && args[1] === 'view' && viewThrows.includes(Number(args[2]))) throw new Error('gh: HTTP 502');
     if (args[0] === 'pr' && args[1] === 'view') { onView[args[2]]?.(); return JSON.stringify(ghView[args[2]] ?? { state: 'OPEN', headRefOid: HEAD, labels, id: 'PR_NODE' }); }
     if (args[0] === 'api' && args[1] === 'graphql') {
+      if (args.some(a => a.includes('mergeQueue(branch:'))) return JSON.stringify(queueFacts ?? { data: { repository: { mergeQueue: { entries: {
+        nodes: !removed && queued ? [{ pullRequest: { id: 'PR_NODE', number: 5283 } }] : [], pageInfo: { hasNextPage: false },
+      } } } } });
       if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: !removed && (queued || mutated) && (inQueue ?? true), headRefOid: HEAD } } } });
       if (args.some(a => a.includes('dequeuePullRequest'))) { removed = true; return JSON.stringify({ data: { dequeuePullRequest: { clientMutationId: null } } }); }
       mutated = true;
@@ -743,10 +746,34 @@ describe('queue safeguard overrides and untracked queue entries', () => {
     h.s.dequeueSendBacks([{ number: 5283, labels: [] }]);
     expect(h.calls.some(c => c.some(a => String(a).includes('dequeuePullRequest')))).toBe(false);
   });
-  it('sweeps open rows before ready filtering even without a follow-up record', () => {
-    const h = harness({ strategy: 'github-merge-queue', queued: true, labels: [] });
+  it.each([[[]], [['review:changes']], [['review:human']], [['review:pending']]])('bounds API calls for 150 non-queued open rows with labels %j', labels => {
+    const h = harness({ strategy: 'github-merge-queue', labels: [] });
+    h.s.dequeueSendBacks(Array.from({ length: 150 }, (_, i) => ({ number: i + 1, labels })));
+    expect(h.calls.length).toBeLessThanOrEqual(1);
+    expect(h.calls.some(c => c[1] === 'pr')).toBe(false);
+  });
+  it.each([
+    { errors: [{ message: 'rate limited' }] },
+    { data: { repository: { mergeQueue: null } } },
+    { data: { repository: { mergeQueue: { entries: { nodes: [{ pullRequest: { id: 'PR_NODE', number: 5283 } }], pageInfo: { hasNextPage: true } } } } } },
+  ])('does not fall back to per-row reads when queue discovery is incomplete', queueFacts => {
+    const h = harness({ strategy: 'github-merge-queue', labels: [], queued: true, queueFacts });
     h.s.dequeueSendBacks([{ number: 5283, labels: [] }]);
+    expect(h.calls).toHaveLength(1);
+    expect(h.logs.join('')).toMatch(/queue.*failed/i);
+  });
+  it('revalidates only queued rows even in a large listing', () => {
+    const h = harness({ strategy: 'github-merge-queue', labels: [], queued: true });
+    h.s.dequeueSendBacks([...Array.from({ length: 150 }, (_, i) => ({ number: i + 1, labels: [] })), { number: 5283, labels: [] }]);
+    expect(h.calls.filter(c => c[1] === 'pr' && c[2] === 'view' && c.includes('headRefOid,labels'))).toHaveLength(1);
     expect(h.calls.filter(c => c.some(a => String(a).includes('dequeuePullRequest')))).toHaveLength(1);
+  });
+  it.each([[[]], [['ready-to-merge', 'review:changes']], [['ready-to-merge', 'review:human']], [['ready-to-merge', 'review:pending']]])('sweeps a manually queued PR without a follow-up record and with labels %j once', labels => {
+    const h = harness({ strategy: 'github-merge-queue', queued: true, labels });
+    h.s.dequeueSendBacks([{ number: 5283, labels }]);
+    h.s.dequeueSendBacks([{ number: 5283, labels }]);
+    expect(h.calls.filter(c => c.some(a => String(a).includes('dequeuePullRequest')))).toHaveLength(1);
+    expect(h.calls.filter(c => c[2] === 'comment')).toHaveLength(1);
   });
   it('revalidates labels so an old listing cannot dequeue a newly ready PR', () => {
     const h = harness({ strategy: 'github-merge-queue', queued: true });

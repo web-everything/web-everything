@@ -41,7 +41,7 @@ import { mergeActionFor, enqueuePr, planQueueFollowUps, REQUIRED_WORKFLOWS_UNSAT
 import { getRequiredStatusChecks } from './required-status-checks.mjs';
 import { readSettings } from './settings-files.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
-import { createAdaptiveBatching } from './merge-queue-adaptive-batching.mjs';
+import { createAdaptiveBatching, readQueueFacts } from './merge-queue-adaptive-batching.mjs';
 import { cancelObsoleteQueueRuns } from './merge-queue-obsolete-runs.mjs';
 
 export const DRY_RUN_STRATEGY_ENV = 'WE_DRAIN_MERGE_STRATEGY';
@@ -246,7 +246,7 @@ export function createDrainMergeStrategy({
     say(`  merge-queue: defer #${c.num}: ${pending.reason}`);
     return { enqueued: false, deferred: true, kind: 'red-team-pending', reason: pending.reason, healthSmell };
   };
-  const readLive = (repo, num) => JSON.parse(exec('gh', ['pr', 'view', String(num), '--repo', slugOf(repo), '--json', 'headRefOid,labels'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+  const readLive = (repo, num) => JSON.parse(exec('gh', ['pr', 'view', String(num), '--repo', slugOf(repo), '--json', 'headRefOid,labels'], { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }));
   // The complete thread as pages. The drain's own comment reader allows 256 MiB: a long thread must not hit the 1 MiB default.
   const readThreadPages = (repo, num) => JSON.parse(exec('gh', ['api', '--paginate', '--slurp', `repos/${slugOf(repo)}/issues/${num}/comments`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: COMMENTS_MAX_BUFFER, timeout: 120_000 }));
   const removeSentBack = (repo, num, labels) => {
@@ -269,8 +269,14 @@ export function createDrainMergeStrategy({
     /** Live open rows are unfiltered by ready-to-merge; also covers entries not in our follow-up file. */
     dequeueSendBacks(rows = [], repo = null) {
       if (dryRun || !enqueueMode || !safety.value.dequeueOnSendBack || !isLocalRepo(repo)) return;
-      for (const row of rows) {
-        if (!Array.isArray(row.labels) || !sendBackReason(row.labels)) continue;
+      const candidates = rows.filter(row => Array.isArray(row.labels) && sendBackReason(row.labels));
+      if (!candidates.length) return;
+      // Discover membership once, before any per-PR read. An incomplete discovery retries next pass;
+      // never replace it with an API sweep of every non-ready open PR.
+      const queue = readQueueFacts({ repo: slugOf(repo), exec: (cmd, args, opts) => exec(cmd, args, { ...opts, timeout: 60_000 }) });
+      if (queue.error) { say(`  ⚠ merge-queue discovery failed (${queue.error}) — dequeue sweep retried next pass`); return; }
+      for (const row of candidates) {
+        if (!queue.inQueue.has(Number(row.number))) continue;
         try { removeSentBack(repo, row.number, readLive(repo, row.number).labels); }
         catch (e) { say(`  ⚠ merge-queue dequeue #${row.number} failed (${firstLine(e)}) — retried next pass`); }
       }

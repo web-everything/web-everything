@@ -1,10 +1,12 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
-import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
+import { readDrainRedTeamEvidence, recordRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
+import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
+import { pidStartTime } from '../pid-alive.mjs';
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -20,6 +22,56 @@ const payload = head => ({ verdict: { verdict: 'accept' }, findings: { read: { n
 describe('drain reads actual head-bound review scheduler inputs', () => {
   it('does not invent an accept when no review run exists', () => {
     expect(readDrainRedTeamEvidence(fixture())).toEqual({ loopPayload: null, recorded: false, inFlight: false });
+  });
+  it('pins the accepted-label boundary with empty status and run stores', () => {
+    const f = fixture();
+    const evidence = readDrainRedTeamEvidence(f);
+    // #5439/#5443: an acceptance label alone cannot invent scheduler work that never existed.
+    expect(redTeamEnqueueHold({ ...f, ...evidence, labels: ['review:accepted'], comments: [] })).toBeNull();
+    // A persisted accepting verdict holds even before the job publishes its first running status.
+    const run = { ...newRunRecord({ id: 'review-pr-5439', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), ...payload(f.head) };
+    writeRun(run, f.runsDir);
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), labels: ['review:accepted'], comments: [] })).toMatch(/no recorded result/);
+  });
+  it('does not mistake a reused pid for the original red-team process', () => {
+    const f = fixture();
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running' }, { ...f, readPidStart: () => 'original-start' });
+    expect(readDrainRedTeamEvidence({ ...f, isAlive: () => true, readPidStart: () => 'original-start' }).inFlight).toBe(true);
+    expect(readDrainRedTeamEvidence({ ...f, isAlive: () => true, readPidStart: () => 'reused-start' }).inFlight).toBe(false);
+  });
+  it.each([
+    [{ host: 'review-host' }, { host: 'drain-host' }],
+    [{ host: 'same-host', namespace: 'pid:[review]' }, { host: 'same-host', namespace: 'pid:[drain]' }],
+  ])('does not waive a process outside the local pid table', (writer, reader) => {
+    const f = fixture();
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running' }, { ...f, ...writer, readPidStart: () => 'start' });
+    expect(readDrainRedTeamEvidence({ ...f, ...reader, isAlive: () => false }).inFlight).toBe(true);
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'ran' }, { ...f, ...writer });
+    expect(readDrainRedTeamEvidence({ ...f, ...reader, isAlive: () => false })).toMatchObject({ inFlight: false, recorded: true });
+  });
+  it('preserves local liveness when the birth-time probe is unavailable or metadata is legacy', () => {
+    const f = fixture();
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running' }, { ...f, readPidStart: () => 'start' });
+    expect(readDrainRedTeamEvidence({ ...f, isAlive: () => true, readPidStart: () => null }).inFlight).toBe(true);
+    const path = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
+    const status = JSON.parse(readFileSync(path, 'utf8'));
+    delete status.host;
+    delete status.pidStart;
+    delete status.pidNamespace;
+    writeFileSync(path, JSON.stringify(status));
+    expect(readDrainRedTeamEvidence({ ...f, isAlive: () => true }).inFlight).toBe(true);
+    expect(readDrainRedTeamEvidence({ ...f, isAlive: () => false }).inFlight).toBe(false);
+  });
+  it('reads a bounded process birth-time probe and treats failures as unknown', () => {
+    expect(pidStartTime(42, (cmd, args, opts) => {
+      expect(cmd).toBe('ps');
+      expect(args).toEqual(['-p', '42', '-o', 'lstart=']);
+      expect(opts).toMatchObject({ timeout: 5000, maxBuffer: 4096, env: { LC_ALL: 'C', TZ: 'UTC' } });
+      return '  Fri Oct 16 12:34:56 2026\n';
+    })).toBe('Fri Oct 16 12:34:56 2026');
+    expect(pidStartTime(42, () => { throw new Error('unavailable'); })).toBeNull();
+    expect(pidStartTime(42, () => '  ')).toBeNull();
+    expect(pidStartTime(-1, () => { throw new Error('must not execute'); })).toBeNull();
   });
   it('reads the persisted review payload and rejects stale heads, other PRs and repos', () => {
     const f = fixture();

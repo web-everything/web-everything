@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { applyRedTeamGate, buildRedTeamCardInput, buildSendBackArgv, buildSendBackBody, gateExitCode, renderGateSummary, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
 import { runReviewJob } from '../review-job.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, redTeamGateMarker } from '../../lib/red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, redTeamGateMarker } from '../../lib/red-team-gate.mjs';
 import { runReviewLabelCli } from '../../review-set-label.mjs';
 
 const REPO = 'web-everything/web-everything';
@@ -319,6 +319,18 @@ describe('review-job runs the gate right after the red team', () => {
 
 
 describe('red-team send-back queue removal (#5283)', () => {
+  it.each(Object.values(GATE_OUTCOMES))('pins queue removal for recorded outcome %s (round-cap remains operator-owned)', async outcome => {
+    let queued = true;
+    let probes = 0;
+    const findings = outcome === GATE_OUTCOMES.SENT_BACK || outcome === GATE_OUTCOMES.ROUND_CAP
+      ? [F()] : [F({ impactIfUnfixed: 'degraded' })];
+    const { io } = fakeIo({ labels: ['review:changes'], comments: [comment(findings), {
+      author: { login: 'web-everything' }, body: redTeamGateMarker(4722, HEAD, outcome),
+    }], dequeueSentBack: () => { probes++; queued = false; } });
+    await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
+    expect(queued).toBe(outcome !== GATE_OUTCOMES.SENT_BACK);
+    expect(probes).toBe(outcome === GATE_OUTCOMES.SENT_BACK ? 1 : 0);
+  });
   it('dequeues at send-back once, including retry of an already recorded send-back', async () => {
     let queued = true;
     let removals = 0;

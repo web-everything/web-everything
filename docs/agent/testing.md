@@ -1164,7 +1164,15 @@ if unavailable, `drain.enqueueWhenRedTeamNeverScheduled` (default true) permits 
 “red team never scheduled” note and its source. The current drain has no standalone red-team request
 queue, so it uses the fallback. Test restarts, head resets, request/fallback, policy provenance and
 comment-read backoff before the deadline. Review jobs publish head-bound running/finished evidence
-in the shared operations sidecar; a pid probe distinguishes an active process from a crashed one.
+in the shared operations sidecar. Store the host, PID namespace (where available) and process birth time with the pid: a live pid
+with a different birth time is a reused process, not an active red team. An unavailable birth-time
+probe preserves the conservative liveness result. Normalize the birth-time probe to UTC and the C
+locale in both writer and reader. A running status from another host or PID namespace stays held
+until its result arrives; a local pid probe cannot prove a remote process has crashed. Replay both
+cases, plus old records without birth-time metadata and finished records. Also replay acceptance
+with empty status and run stores: labels alone still do not schedule work (#5439/#5443). The
+persisted accepting run must hold admission before the job's first running-status write. Missing
+or pruned run evidence remains the explicit label-only boundary, rather than an invented accept.
 A confirmed send-back finding still holds during the result-comment → gate-label race. Queue
 admission must also read the exact combined comment emitted by verdict carry: gate markers,
 the carried marker and producer prose, then the re-keyed advisory. Test the real review job's
@@ -1176,7 +1184,14 @@ reads (admission and clearance dedupe) allow 256 MiB with a timeout; exercise a 
 Node's default 1 MiB using a real child process, retaining the complete thread and clearance stamp.
 Queue removal probes must observe `isInMergeQueue=false` after `dequeuePullRequest`, and replay the gate and
 drain backstop to verify one mutation and one reason comment. Include a PR missing `ready-to-merge`
-from the unfiltered open listing, without a durable follow-up entry. Both safeguards resolve through
+from the unfiltered open listing, without a durable follow-up entry. Discover membership once per
+sweep through the shared batched merge-queue reader before revalidating any individual PR. Assert
+one discovery call and zero per-PR reads for 150 non-queued rows, for each send-back label shape;
+mixed listings must revalidate only queued rows. Failed or incomplete discovery (including more
+than 100 entries) skips the sweep and retries next pass, without an expensive per-row fallback.
+Manual queue entries also follow the existing label policy; membership alone never authorizes a
+dequeue without fresh labels. Table-test every gate outcome: only `sent-back` invokes removal;
+`round-cap` stays operator-owned under the current ruling. Both safeguards resolve through
 the `drain` policy cascade and default on; test off switches without using the host's live GitHub IO.
 
 Queue enqueue tests must distinguish mutation responses from membership reads: a returned entry is
