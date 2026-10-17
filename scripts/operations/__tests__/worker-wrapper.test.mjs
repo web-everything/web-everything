@@ -57,6 +57,23 @@ describe('runWorker: the job record and the result channels', () => {
     expect(captured.endsWith('newest line\n')).toBe(true);
   });
 
+  it('discards continuation chunks until a line break after compaction', async () => {
+    const diagnosticsDir = tmp();
+    // One quoted secret line over 1 MiB, streamed in 32 KiB pieces, so compaction fires in the middle of it.
+    const script = [
+      "process.stderr.write('before\\n');",
+      "process.stderr.write('export DB_PASSWORD=\"');",
+      "const piece = 'secretword '.repeat(3_000);",
+      'for (let i = 0; i < 120; i++) process.stderr.write(piece);',
+      "process.stderr.write('\" tail\\nafter line\\n');",
+      `process.stdout.write(${JSON.stringify(claudeStdout(DONE))});`,
+    ].join('\n');
+    await runWorker(spec({ diagnosticsDir, argv: ['-e', script] }));
+    const captured = readFileSync(join(diagnosticsDir, 'wrapper.stderr'), 'utf8');
+    expect(captured).not.toContain('secretword');
+    expect(captured).toContain('after line\n');
+  }, 30_000);
+
   it('compacts the captured smoke stderr at a line break, never mid-line', async () => {
     const diagnosticsDir = tmp();
     // 1,000-char lines that each start with `L`: a byte cut would leave the kept file starting inside a line.

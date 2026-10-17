@@ -194,6 +194,12 @@ const STOP_GRACE_MS = 5_000;
 /** Opt-in smoke stderr capture: compact past 1 MiB to the newest 64 KiB (exported for the cap test). */
 export const DIAGNOSTIC_STDERR_MAX_BYTES = 1024 * 1024;
 export const DIAGNOSTIC_STDERR_KEEP_BYTES = 64 * 1024;
+/** The index of the first LF or CR byte in `buf`; -1 when it has none. */
+function firstLineBreak(buf) {
+  const lf = buf.indexOf(0x0a);
+  const cr = buf.indexOf(0x0d);
+  return lf < 0 ? cr : cr < 0 ? lf : Math.min(lf, cr);
+}
 /** `spawnToCompletion` kills the child itself on a stream overflow and says so in the message (it sets `killed` too). */
 const isOverflow = (failure) => /maxBuffer exceeded/.test(String(failure?.message ?? ''));
 
@@ -302,6 +308,8 @@ async function runWorkerOnce(spec, io, stop) {
     if (spec.diagnosticsDir) {
       let first = true;
       let stderrBytes = 0;
+      // Set when compaction cut through a line: the rest of that line is dropped as it arrives, up to its line break.
+      let discardStderrLine = false;
       for (const [stream, name] of [[child.stdout, 'worker.stdout'], [child.stderr, 'wrapper.stderr']]) {
         stream?.on?.('data', (chunk) => {
           try {
@@ -312,16 +320,25 @@ async function runWorkerOnce(spec, io, stop) {
             // stdout is only a first-byte signal; stderr is the diagnostic tail.
             if (name === 'wrapper.stderr') {
               const file = join(spec.diagnosticsDir, name);
-              appendFileSync(file, chunk);
-              stderrBytes += Buffer.byteLength(chunk);
+              let bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+              if (discardStderrLine) {
+                const br = firstLineBreak(bytes);
+                if (br < 0) return;
+                bytes = bytes.subarray(br + 1);
+                discardStderrLine = false;
+              }
+              appendFileSync(file, bytes);
+              stderrBytes += bytes.length;
               // Bounded on disk, newest lines kept: past the cap, compact the file to the whole lines in its last 64 KiB
               // (a byte cut would leave a partial first line, which a reader could redact from a cut-open secret).
               if (stderrBytes > DIAGNOSTIC_STDERR_MAX_BYTES) {
                 const kept = readFileSync(file).subarray(-DIAGNOSTIC_STDERR_KEEP_BYTES);
-                const breaks = [kept.indexOf(0x0a), kept.indexOf(0x0d)].filter((i) => i >= 0);
-                const whole = breaks.length ? kept.subarray(Math.min(...breaks) + 1) : Buffer.alloc(0);
+                const br = firstLineBreak(kept);
+                const whole = br >= 0 ? kept.subarray(br + 1) : Buffer.alloc(0);
                 writeFileSync(file, whole);
                 stderrBytes = whole.length;
+                // No break in the window: it was all one unfinished line, so its remainder must not start the file.
+                if (br < 0) discardStderrLine = true;
               }
             }
           } catch { /* diagnostics cannot interrupt the worker */ }
