@@ -2741,6 +2741,8 @@ function boundNames(text) {
   let afterLead = '';                 // the lead word just read (`time`, `command`, `function`, …)
   let fnDef = false;                  // a function name was just read: its `{` body binds nothing
   let getoptsArgs = [];
+  let trapAt = -1;
+  let trapArgs = 0;
   let stop = false;
   const site = (re, i) => {
     if (/[\w$]/.test(s[i - 1] ?? ' ')) return;
@@ -2761,12 +2763,13 @@ function boundNames(text) {
   const ansi = (i) => { let j = i + 2; while (j < s.length && s[j] !== "'") j += s[j] === '\\' ? 2 : 1; return j; };
   const endCommand = () => {
     for (const p of pending) sites.push(p);
-    pending = []; mode = 'cmd'; target = false; skip = false; afterLead = ''; fnDef = false; getoptsArgs = [];
+    pending = []; mode = 'cmd'; target = false; skip = false; afterLead = ''; fnDef = false; getoptsArgs = []; trapArgs = 0;
   };
   const commandWord = (raw, word, at) => {
     pending = [];
     mode = 'arg';
-    if (OPAQUE_BUILTINS.has(word) || (word === 'trap' && /\b(?:DEBUG|ERR|RETURN)\b/.test(s.slice(at)))) any.push({ at });
+    if (OPAQUE_BUILTINS.has(word)) any.push({ at });
+    else if (word === 'trap') { mode = 'trap'; trapAt = at; }
     else if (/^"?(?:\$(?!')|`)/.test(raw)) mode = 'dynamic';  // may be `eval`: its `NAME=` operands may bind
     else if (DECLARATION_BUILTINS.has(word)) { mode = 'decl'; bare = word === 'local'; }
     else if (word === 'getopts') mode = 'getopts';
@@ -2806,8 +2809,13 @@ function boundNames(text) {
     } else if (mode === 'getopts') {
       if (!word.startsWith('-')) getoptsArgs.push({ name, at });
       if (getoptsArgs.length === 2 && getoptsArgs[1].name) sites.push(getoptsArgs[1]);   // `getopts optstring NAME`
+    } else if (mode === 'trap') {
+      // the action, then its signals: one that may fire before a later command (any case, any `SIG` prefix,
+      // or one only known at run time) may bind anything; `EXIT` fires only at the end
+      if (trapArgs++ > 0 && (/^(?:SIG)?(?:DEBUG|ERR|RETURN)$/i.test(word) || /[$`]/.test(raw))) { any.push({ at: trapAt }); mode = 'arg'; }
     } else if (mode === 'dynamic') {
-      if (a) sites.push({ name: a[1], at });
+      const q = word.match(ASSIGN_WORD);                        // `$X "D=/x"` binds as `eval D=/x` would
+      if (q) sites.push({ name: q[1], at });
     } else if (mode === 'loop') {
       if (name) sites.push({ name, at });
       mode = 'arg';
@@ -2965,7 +2973,7 @@ function analyzeCwd(command, reportedCwd, resolvePath, home, nest) {
   const history = Object.create(null);
   const homeNames = new Set();
   const childVals = Object.create(null);                      // a child shell's expandable assignments
-  const childHomes = new Set();                               // bounded: each one is tried for every home cd
+  const childHomes = [];                                      // { at, home }: a child shell's HOME assignments
   // the last entry of `list` (ordered by segment) before segment `at`: a binary search, so a cd costs no rescan
   const lastBefore = (list, at, key) => {
     let lo = 0;
@@ -3011,7 +3019,7 @@ function analyzeCwd(command, reportedCwd, resolvePath, home, nest) {
     if (ca && depths[at][ca[1].length] > 0) {
       const expanded = expandCdTarget(ca[3].replace(/\)+$/, ''), assignHome);
       if (expanded) childVals[ca[2]] = expanded;
-      if (ca[2] === 'HOME' && usableHome(expanded) && childHomes.size < 16) childHomes.add(expanded);
+      if (ca[2] === 'HOME' && usableHome(expanded)) childHomes.push({ at, home: expanded });
     }
     const m = stmt.trim().match(/^(?:export\s+)?([A-Za-z_]\w*)=(.+)$/);
     if (m && inChild(at)) {
@@ -3119,7 +3127,10 @@ function analyzeCwd(command, reportedCwd, resolvePath, home, nest) {
       if (target) out.push(target);
       const v = raw.split(/\s+/)[0].replace(/^"(.*)"$/, '$1').match(/^\$\{?([A-Za-z_]\w*)\}?$/);
       for (const alt of v ? [vars[v[1]], childVals[v[1]]] : []) if (usable(alt, false)) out.push(absolute(alt));
-      if (homeSpelled(raw)) for (const h of childHomes) { const t = expandCdTarget(rest, h); if (t) out.push(absolute(t)); }
+      // the HOME the latest child shell before this cd gave itself (a cd in that child reads it)
+      const child = homeSpelled(raw) && lastBefore(childHomes, at + 1, (h) => h.at);
+      const t = child && expandCdTarget(rest, child.home);
+      if (t) out.push(absolute(t));
     }
     for (const text of nestedCommandStrings(segs[at])) {
       if (nest.left.n <= 0 || nest.depth >= NESTED_DEPTH_CAP || !/(?:cd|pushd)\W/.test(text)) continue;

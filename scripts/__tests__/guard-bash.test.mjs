@@ -901,6 +901,11 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
       "HOME=/a; $'eval' HOME=/b; cd ~/clone && ls",
       'HOME=/a; X=eval; $X HOME=/b; cd ~/clone && ls',
       'HOME=/a; trap "HOME=/b" DEBUG; cd ~/clone && ls',
+      'HOME=/a; trap "HOME=/b" debug; cd ~/clone && ls',
+      'HOME=/a; T=DEBUG; trap "HOME=/b" $T; cd ~/clone && ls',
+      'HOME=/a; X=eval; $X "HOME=/b"; cd ~/clone && ls',
+      "HOME=/a; X=eval; $X 'HOME=/b'; cd ~/clone && ls",
+      'D=~/x; X=eval; $X "D=/b"; cd "$D" && ls',
     ]) expect(at(cmd), JSON.stringify(cmd)).toBe(REPORTED);
     // text that binds nothing here keeps the home this shell has
     expect(at('HOME=/a; echo HOME=/b; cd ~/clone && ls')).toBe('/a/clone');
@@ -966,6 +971,8 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     ]) expect(lands(cmd), JSON.stringify(cmd)).toContain('/P');
     expect(lands('D=~/lane; ( D=~/c; cd "$D" && git checkout --detach )')).toContain(`${HOME}/c`);
     expect(lands('(HOME=/h; cd ~/P)')).toContain('/h/P');
+    const decoys = Array.from({ length: 20 }, (_, i) => `(HOME=/h${i}; true); `).join('');
+    expect(lands(`${decoys}(HOME=/P; cd ~ && git checkout --detach)`)).toContain('/P');
     // the effective cwd still keeps main's reading of an option
     expect(at('cd -P /P && ls')).toBe(`${REPORTED}/-P`);
     // the re-executed-string walk stays bounded however many strings and assignments come before them
