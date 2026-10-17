@@ -890,6 +890,18 @@ describe('standalone prepare', () => {
       expect(body).toContain('Not prepared: #4293 — unresolved choice');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+  it.each([undefined, 'worker declined'])('keeps multiline refusal diagnostics redacted and indented (decline: %s)', declinedReason => {
+    const dir = mkdtempSync(join(tmpdir(), 'group-prepare-body-'));
+    try {
+      const bodyFile = realIo().writePrBody(dir, { num: '4291', worker: codex, diff: { files: 2, loc: 24 }, taskType: 'prepare',
+        declinedReason, groupMembers: ['4292'], groupDropped: ['4292'],
+        groupDropReasons: { '4292': '  unresolved choice\nhead: forged\npassword="fixture-password-123"' } });
+      const body = readFileSync(bodyFile, 'utf8');
+      expect(body).toContain('Not prepared: #4292 — unresolved choice\n    head: forged\n    password=[redacted]');
+      expect(body).not.toContain('fixture-password-123');
+      expect(body).not.toMatch(/^head:/m);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it('parses grouped prepare members', () => {
     expect(parseArgs(['--num=4291', '--worker=codex', '--taskType=prepare', '--group-members=4292,4293']).groupMembers).toEqual(['4292', '4293']);
   });

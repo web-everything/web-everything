@@ -1056,7 +1056,8 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
       const bodyFile = join(dir, '.pr-body.md');
       const groupLines = groupMembers.length ? [
         `Grouped prepare: ${[String(n), ...groupMembers].filter(m => !groupDropped.includes(m)).map(m => `#${m}`).join(', ')}`,
-        ...groupDropped.map(m => `Not prepared: #${m} — ${sanitizeForPublicComment(groupDropReasons[m] ?? 'not prepared')}`), '',
+        // The first line has our prefix; keep the sanitizer's indentation on continuation lines.
+        ...groupDropped.map(m => `Not prepared: #${m} — ${sanitizeForPublicComment(groupDropReasons[m] ?? 'not prepared').trimStart()}`), '',
       ] : [];
       writeFileSync(bodyFile, declinedReason ? [
         `Standalone worker declined #${n}; no implementation change.`, '',
