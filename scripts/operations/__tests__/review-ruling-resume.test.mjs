@@ -11,7 +11,8 @@ import { describe, it, expect, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { createRegistry } from '../registry.mjs';
 import { createFileRunStore, createMemoryRunStore } from '../run-store.mjs';
@@ -205,14 +206,16 @@ describe('ordinary review-pr CLI resume preserves the saved roster', () => {
       vi.stubEnv('REVIEW_PR_CODEX_ADVISORY', '0');
       vi.stubEnv('REVIEW_PR_CODEX_CORRECTNESS_ADVISORY', '0');
       vi.stubEnv('REVIEW_PR_ANTIGRAVITY_REVIEW', '0');
+      // Resolve a filesystem path without Vite rewriting a relative new URL as a browser asset.
+      const cliPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'run.mjs');
       for (const earlierFlags of [[], ['--resume=missing-earlier-run']]) {
-        const cli = spawnSync(process.execPath, [new URL('../run.mjs', import.meta.url).pathname,
+        const cli = spawnSync(process.execPath, [cliPath,
           'review-pr', ...earlierFlags, `--resume=${parked.run.id}`, '--json'], {
           encoding: 'utf8', timeout: 30_000,
           env: { ...process.env, WE_DAEMON_MANAGED_CLONE: '1', OPERATION_CALLS_DIR: join(dir, 'calls') },
         });
         expect(cli.error).toBeUndefined();
-        expect(cli.status).toBe(0);
+        expect(cli.status, cli.stdout + cli.stderr).toBe(0);
         expect(cli.stdout + cli.stderr).not.toContain('declaration changed');
         expect(JSON.parse(cli.stdout).pending.step).toBe('confirm');
       }
