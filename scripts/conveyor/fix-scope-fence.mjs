@@ -80,17 +80,6 @@ export function addedLines(patch = '') {
   });
 }
 
-/** Lines added relative to BOTH parents of a catch-up merge (multiset): the fixer's, never only upstream's or only the PR's. */
-export function commonLines(a, b) {
-  const counts = new Map();
-  for (const line of b) counts.set(line, (counts.get(line) ?? 0) + 1);
-  return a.filter(line => {
-    const n = counts.get(line) ?? 0;
-    if (n) counts.set(line, n - 1);
-    return n > 0;
-  });
-}
-
 /** `additions` (lines) wins over `patch` when the caller already attributed the added lines. */
 export function scopeFenceDecision({ scope = [], repo, paths = [], patch = '', additions = addedLines(patch), removed = [], policy }) {
   if (policy?.enabled === false) return { action: 'push', violations: [] };

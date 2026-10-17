@@ -6,7 +6,7 @@ import { planFixesFromReconcile, fetchPrDiffScope, fetchPrDiffPaths, fetchCardSc
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 import { unescapeTsvField } from './pr-comments-list.mjs';
 import { buildStandDownComment, STAND_DOWN_LABEL } from './stand-down.mjs';
-import { addedLines, commonLines, fencedPush, operatorScope, removalMarkers, resolveScopeFence, ScopeFenceEvidenceError, ScopeFenceHeadMovedError } from './fix-scope-fence.mjs';
+import { addedLines, fencedPush, operatorScope, removalMarkers, resolveScopeFence, ScopeFenceEvidenceError, ScopeFenceHeadMovedError } from './fix-scope-fence.mjs';
 
 /**
  * Pins the diff output the fence parses against lane config and attributes: no colour, every file as text (a binary
@@ -85,13 +85,25 @@ export function createScopeFencedPush({ root, exec = execFileSync, env = process
       }
       const names = (from, to) => git([...FENCE_DIFF, '--name-only', '-z', from, to, '--']).split('\0').filter(Boolean);
       // Patches are read only when there is a removed identifier to look for.
-      const added = (from, to) => removed.length ? addedLines(git([...FENCE_DIFF, '-U0', from, to, '--'])) : [];
+      const added = (from, to, only = []) => removed.length ? addedLines(git([...FENCE_DIFF, '-U0', from, to, '--', ...only.map(p => `:(literal)${p}`)])) : [];
       const paths = names(head, sha);
       const merged = mergedBase({ git, gh, repo, head, sha, base });
       if (!merged) return { paths, additions: added(head, sha) };
       // A path neither the PR (since the merge base) nor the fixer (against the merged base) changed carries only upstream's change.
       const own = new Set([...names(git(['merge-base', head, merged]).trim(), head), ...names(merged, sha)]);
-      return { paths: paths.filter(p => own.has(p)), additions: commonLines(added(head, sha), added(merged, sha)) };
+      if (!removed.length) return { paths: paths.filter(p => own.has(p)), additions: [] };
+      // The fixer's lines are what the push adds to a plain catch-up merge of head and the merged base. The base still holds
+      // code the PR removed, so lines added against the base alone would hide a restored removal. A conflicted file's
+      // resolution is the fixer's choice: every line it adds against the PR head counts, upstream's included (fails closed).
+      let out;
+      try { out = git(['merge-tree', '--write-tree', '--name-only', '--no-messages', '-z', head, merged]); } catch (e) {
+        if (e.status !== 1 || e.stdout == null) throw e;
+        out = String(e.stdout);
+      }
+      const [tree, ...conflicted] = out.split('\0').filter(Boolean);
+      if (!OID.test(tree ?? '')) throw new Error('catch-up merge tree unreadable');
+      return { paths: paths.filter(p => own.has(p)),
+        additions: [...added(tree, sha), ...(conflicted.length ? added(head, sha, [...new Set(conflicted)]) : [])] };
     };
     const resolved = resolveScopeFence({ env });
     const policy = resolved.value.scopeFence;
