@@ -1,5 +1,57 @@
 # Testing — Three-Tier Strategy
 
+## Red-team re-check evidence
+
+The post-accept re-check reads a separate, self-contained checkout pinned to `read.netBasis.rev`,
+never the released review lane's current HEAD or the red-team probe's working tree. Its Claude
+juror uses `judge-spawn.mjs` with `Read`, `Glob`, and `Grep` only, in an independent lane-shaped
+scratch directory; cleanup runs after success or failure. A configured provider unable to honor
+that tool allow-list fails the re-check rather than silently dropping repository access.
+`review-red-team.test.mjs` pins this with **rejects incompatible providers when repository reads
+are enabled**, parameterized over Codex and Antigravity, with a tool-free twin and zero spawns
+on refusal.
+The mandate requires reading cited files and callers and reporting repo-relative `filesRead`
+per claim. A negative answer with no files read, missing answer, unavailable context, or failed
+re-check is `unverifiable`, not `not confirmed`. That outcome and the files read survive evidence
+storage and comment retries; only confirmed findings count as misses.
+Model-reported paths pass the same secret scrub and strict ASCII path policy before evidence
+storage and comment rendering, including legacy retries. Unsafe entries are discarded whole;
+the policy checks at most 100 entries of at most 600 characters each, deduplicating valid paths.
+While the pinned clone exists, paths must resolve to regular files inside it; missing files,
+Git metadata, and symlinks escaping the clone are discarded. This validates reported evidence;
+it does not prove a tool actually read the file or confine the tool's filesystem access.
+Re-check reasons use a fixed vocabulary (`demonstrated break`, `relevant code refutes claim`,
+`insufficient evidence`); unknown text becomes `reason withheld`. Enforce this in the answer
+schema, parser, and publication paths, including completion of saved speculative passes and
+legacy comment retries. Pattern-based secret scrubbing cannot safely publish arbitrary text
+from a juror with filesystem access. Regression coverage: **withholds unrecognized re-check
+reasons at every publication sink**. Filesystem read confinement remains separate work.
+Provider failure text can contain raw juror output too: re-check statuses use fixed values
+(`ok`, `pending`, `not-needed`, `error`), including saved-pass completion and legacy retries.
+Regression coverage: **withholds raw juror errors and legacy re-check statuses from stored and
+public evidence**.
+Regression coverage: **scrubs unsafe filesRead at the comment and evidence sinks**,
+**scrubs filesRead when completing speculative evidence and retrying legacy rows**, and
+**the production re-check uses an independent pinned lane and cleans it**.
+For evidence leak assertions, inspect nested string values directly: JSON property names can
+match unsafe inputs such as `"file"`, while serialization can hide control characters by escaping them.
+
+`redTeam.recheckReadsRepo` and `redTeam.skipCardOnly` default to true. The cascade is standard
+→ platform (`delivery-platform-preferences.json`'s `redTeam` block) → tool
+(`scripts/settings/red-team.json`'s `redTeam` block) → environment
+(`WE_RED_TEAM_RECHECK_READS_REPO`, `WE_RED_TEAM_SKIP_CARD_ONLY`; true/false, on/off, 1/0).
+Effective values and sources are logged before probes. Card-only detection reuses
+`ci-card-only.mjs#isCardOnlyDiff` on the net changed-file list plus `netRenameSources` (both
+rename and copy sources); unknown/empty destination lists or malformed source lists do not skip.
+Moves into or out of `backlog/` probe whenever either side is code; card-to-card moves still skip.
+Regression coverage: **includes rename sources before deciding to skip probes**, covering both
+sequential and speculative paths. The speculative fingerprint also includes rename sources.
+Replay derives rename/copy sources from diff headers using the review reader's existing parser;
+**replay retains rename/copy sources so code moved into backlog still probes** pins that wiring.
+The sequential and speculative paths skip before budget reservation and record the reason
+`red team skipped: card-only`. Setting `recheckReadsRepo=false` restores a tool-free re-check;
+negative answers without file reads remain unverifiable.
+
 ## Codex usage accounting
 
 Every direct task, Codex delivery/fix worker, wrapped Codex dispatch worker, and Codex review
@@ -961,7 +1013,9 @@ under `prepare.mergedGuardHours` (default 24; 0 disables only the merged refusal
 without surviving dispatch history. Probe the time boundary with an injected clock, including a PR
 created over 24 hours ago but merged 21 minutes ago. Scope drift on a recently merged prepare
 records a "scope moved after prepare" note for the build step in the refusal and its persisted
-bookkeeping; it must never dispatch another prepare within the window.
+bookkeeping; it must never dispatch another prepare within the window. A card the planning pre-scan
+skips for that merge carries the same note and persists the same `prepareRefusals` record as a
+launch refusal; assert both on the planning tick, not only on a merge that appears after planning.
 A needs-you park in the newest ledger record refuses the launch while it is `held` and not `completed`.
 Any one of three things clears it: a stamp on main (it completes the record, so a hand stamp resolves
 the park), explicit `releasedAt`/`releasedBy` metadata, or a reviewed release of that exact attempt in
@@ -1298,6 +1352,48 @@ Failure counts/backoff live in that same state file; preserve them during follow
 membership, conflicting refusal, transient backoff across restarts, threshold provenance and stamp recovery
 with injected IO, never a live enqueue.
 
+### Builder cap and prepare cooldown
+
+`build.maxOpenPrsCounts` defaults to `builder`; `all` restores the earlier open-PR
+population. The policy cascade logs the effective value and source. Builder provenance
+is an explicit `lane/<card><optional-attempt>-build-*` or `lane/<card><optional-attempt>-prepare-*` ref (including hash identities)
+or the mechanical delivery wrapper's body signature. A generic lane ref, fixer, or
+Codex author does not prove ownership. The REST producer and normalized planner input
+must preserve `body`; the producer-contract test pins that path. Existing card-only
+and accepted exclusions still apply; scope and freeze-label guards inspect every PR.
+
+Before finalizing prepare picks, inspect the actual planned picks using
+`recentMergedPrepare`, shared with `prepareLaunchRefusal`. Add recent merges to the
+planner's prepare exclusions and re-plan the same tick so the next candidate gets the
+slot. Inspect selected group members before finalizing groups, refilling groups after
+cooldown skips. Share the same lookahead budget between leads and members; never scan
+the entire grouping pool. Bound it to eight distinct cards (at most 24 listing calls), leaving
+the shared tick budget available for launch guards. Log the elapsed minutes and PR number.
+Picks outside that window still pass the final launch guard. Replay a merge 20 minutes
+ago with one slot and a clean second candidate; include grouped members, hash aliases,
+guard-off, and older merges in the touched suites. Use the production reader in a tick
+with more than 50 held cards and late-ordered picks; assert the picks launch without
+listing-budget refusals. Also cover consecutive merged picks and group members beyond
+the lookahead limit, with uninspected replacements still passing final launch admission.
+
+### Build dispatch launch lifetime and prepare discovery
+
+Launch admission and launch confirmation do not prove delivery. Retain the build failure ledger across
+both, including daemon restarts; clear it only after observing a delivering PR. Before releasing an
+orphan claim, persist its failure so a failed ledger write keeps the claim. Regress the #4413 shape:
+pending launch → confirmed run → dead worker with no delivery → backed-off retry → exhausted attempts.
+Validate a build card against the fetched WE origin/main backlog before acquiring its claim; missing
+identities are permanent card refusals, while an unavailable Git read remains a retryable observation.
+
+Prepare discovery searches each card's current lane identity, bornAs lane identity and title, then
+unions the complete results. Never use an unfiltered repository PR listing as the launch guard's proof
+of absence. Cache component failures for the tick as well as successes. The prepare policy leaf
+`maxPrListingCallsPerTick` defaults to 128, resolves through standard/platform/tool/env, and logs its
+source; `WE_PREPARE_MAX_PR_LISTING_CALLS_PER_TICK` overrides it. Prefetch and lazy readers share the
+same budget, including failed commands. A component at its result cap or a spent budget refuses only
+that card. Test with over 500 unrelated PRs, all three identity forms, concurrency, repeated reads and
+budget exhaustion. GitHub calls use the shared throttle in both synchronous and asynchronous paths.
+
 ### Nightly coroner health job
 
 `nightly-coroner` is a detached health-watch job, independent of chat sessions and accounts.
@@ -1329,6 +1425,20 @@ needs-you feed (honoring `WE_NEEDS_YOU_FEED`). No Claude session or judgment ste
 Run `nightly-coroner-*.test.mjs` under `scripts/conveyor/__tests__/` through heavy admission.
 Cover ET boundaries and DST, persisted job adoption/catch-up, source logging, cursor continuity,
 publication deduplication, real isolated extraction, and release without cursor advance on failure.
+
+## Referral re-checks on the live head
+
+`review.recheckCarriedReferrals` and `review.autoPolicyRespectsNotReal` default true in
+`scripts/review-settings.json`, with standard → platform → tool → environment resolution and source diagnostics.
+Historical referrals persist a `recheck` provenance marker and go through the existing mandatory review against the pinned live net diff;
+changed or unavailable citations require re-check, never an inherited block. The reviewer must
+check the condition asserted in the finding, including function replacements, resolved settings
+and completed card splits or negative controls. Unchanged citation bytes alone do not prove a defect.
+Auto-policy respects authenticated operator and counted reviewer not-real decisions across heads,
+including exact claim copies with an empty or `(no file)` citation. Only proven changes at the
+original citation permit another automatic block; unavailable comparison evidence refuses the write.
+An interrupted re-check stays review-owned; auto-policy cannot replace its missing reviewer answer.
+This protection is narrower than gate clearance: a policy skip never accepts a PR.
 
 ## False-finding coroner pass
 

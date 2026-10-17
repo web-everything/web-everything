@@ -6,7 +6,7 @@
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { hasLabel } from './ai-pr-authorship.mjs';
 import { readSettings } from './settings-files.mjs';
-import { platformPreference, logCascadeSources } from './policy-cascade.mjs';
+import { platformPreference, logCascadeSources, cascadePolicy } from './policy-cascade.mjs';
 
 export const OPEN_PR_CAP_SCOPE_DEFAULTS = Object.freeze({ excludeCardOnly: true, excludeAccepted: true });
 // Keep the runtime leaf light; the test pins this to REVIEW_LABELS.accepted.
@@ -62,7 +62,7 @@ export function countOpenPrsForCap(openPrs, scope = OPEN_PR_CAP_SCOPE_DEFAULTS) 
 }
 
 export function formatOpenPrCap(c) {
-  const excluded = [];
+  const excluded = c.nonBuilder > 0 ? [`${c.nonBuilder} non-builder`] : [];
   const included = [];
   for (const [flag, count, label] of [['excludeCardOnly', 'cardOnly', 'card-only'], ['excludeAccepted', 'accepted', ACCEPTED_LABEL]]) {
     if (c[flag]) excluded.push(`${c[count]} ${label}`);
@@ -74,4 +74,25 @@ export function formatOpenPrCap(c) {
   const remaining = c.countedPrs.length - 15;
   const counted = listed ? ` — counted: ${listed}${remaining > 0 ? ` … (+${remaining} more)` : ''}` : '';
   return `${c.counted} of ${c.total} open PRs counted (${details})${counted}`;
+}
+
+/** Builder landing-cap population. Keep unrelated build leaves out of this cascade. */
+export function readBuilderPrCapSettings({ env = process.env, read = readSettings, platform, log } = {}) {
+  let tool;
+  try { tool = read()?.build; } catch { /* retain lower layers */ }
+  const layer = value => ['builder', 'all'].includes(value?.maxOpenPrsCounts)
+    ? { maxOpenPrsCounts: value.maxOpenPrsCounts } : {};
+  const resolved = cascadePolicy('build', layer(tool), {
+    standard: { maxOpenPrsCounts: 'builder' },
+    platform: layer(platform ?? platformPreference('build', { env })), env, log,
+    envValues: layer({ maxOpenPrsCounts: env.WE_BUILD_MAX_OPEN_PRS_COUNTS }),
+  });
+  return { maxOpenPrsCounts: resolved.value.maxOpenPrsCounts,
+    maxOpenPrsCountsSource: resolved.sources.maxOpenPrsCounts };
+}
+
+/** Positive launch provenance; a generic lane ref or an author identity is insufficient. */
+export function isBuilderPr(pr) {
+  return /^lane\/(?:[0-9]+|x[0-9a-z]{6})[a-z]?-(?:prepare|build)(?:-|$)/i.test(pr.headRefName ?? '')
+    || /Delivered by the #3627 minimal delivery-agent pipeline/.test(pr.body ?? '');
 }

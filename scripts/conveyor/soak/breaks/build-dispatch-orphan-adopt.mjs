@@ -263,6 +263,7 @@ export default {
         sessionLivenessFor: () => null, // every fixture handle is a pid (or none); no real ~/.claude/jobs read.
         // x87v3ed — recorded, never written to the host's real backoff store / lane pool.
         recordFailure: (o) => { failuresRecorded.push(String(o.num)); },
+        clearFailure: () => {}, // #9001 is delivered: never clear a row in the host's real backoff store.
         releaseLaneLease: (o) => { leasesReleased.push(o); },
       });
     } catch (e) {

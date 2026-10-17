@@ -18,7 +18,7 @@
  *     stops counting the moment it is no longer in-flight AND no open PR delivers it (merged, or the PR closed).
  *     Card xovjhwh (operator decision 2026-09-29): the delivered-by-open-PR side counts ONLY PRs this builder
  *     itself dispatched (per its own durable run records, `dispatchedByBuilder`) — a hand-dispatched worker's PR
- *     still counts toward `maxOpenPrs`/`hot-file`, but never toward this cap;
+ *     still participates in `hot-file`, but never toward this cap;
  *   - landing freeze: hold every new build while open PRs exceed `maxOpenPrs`, or while any open PR carries a
  *     label that means "a daemon failed to move this PR" (`freezeLabels`);
  *   - scope check against every open PR's files, and hot-file serialisation: no two in-flight builds (or two
@@ -26,18 +26,15 @@
  *   - branch names never start with a bare number (the delivery ref is `lane/<num>...`);
  *   - task-prefixed scratch files and draft-first PRs — declared here, enforced by the brief / PR #2813.
  *
- * `maxOpenPrs` vs `maxOpenItems` (#4353 task 4, decided from LIVE data 2026-09-28): kept as two distinct
- * thresholds, not folded into one. Live `openPrs` that day included
- * `lane/investigate-lane-reset` — a real open PR with no leading-digit delivery ref, so it counts toward
- * `maxOpenPrs` (total review/CI load this repo is carrying) but NOT toward `maxOpenItems` (backlog-card WIP).
- * The populations provably diverge in practice, so `maxOpenPrs` stays as the coarser "how much is open in this
- * repo at all" ceiling while `maxOpenItems` is the per-card pipeline cap this card adds.
+ * `maxOpenPrs` bounds this builder's review/CI backlog (build and prepare launch provenance),
+ * while `maxOpenItems` bounds delivery-card WIP. `build.maxOpenPrsCounts=all` restores
+ * the broader repo-wide population. Neither setting narrows scope or freeze-label checks.
  *
  * PURE: no fs, no clock, no child_process. Every input is passed in; unit-tested in
  * we:scripts/conveyor/__tests__/build-dispatch-policy.test.mjs.
  */
 
-import { OPEN_PR_CAP_SCOPE_DEFAULTS, readOpenPrCapScope, countOpenPrsForCap, formatOpenPrCap } from '../lib/open-pr-cap-scope.mjs';
+import { OPEN_PR_CAP_SCOPE_DEFAULTS, readOpenPrCapScope, countOpenPrsForCap, formatOpenPrCap, isBuilderPr } from '../lib/open-pr-cap-scope.mjs';
 import { normNum } from './queue-store.mjs';
 import { parseScopeEntry, pathsOverlap, firstScopeOverlap, overlapsInFlight } from '../readiness/overlap-chain.mjs';
 
@@ -47,6 +44,7 @@ export const BUILD_DISPATCH_POLICY = Object.freeze({
   maxConcurrentBuilds: 1, // --max-concurrent: Claude, including unknown legacy executors
   maxConcurrentExternalBuilds: 4, // Codex + Antigravity together
   maxOpenPrs: 12,
+  maxOpenPrsCounts: 'builder',
   // Operator ruling 2026-10-09: accepted and card-only PRs do not consume the landing cap.
   openPrCapScope: readOpenPrCapScope(),
   // #4353 — open items from build start until MERGE (durable in-flight ∪ delivered-by-open-PR), a tighter,
@@ -81,7 +79,7 @@ export const BUILD_DISPATCH_POLICY = Object.freeze({
   rules: Object.freeze([
     { id: 'cap', text: 'at most maxConcurrentBuilds Claude and maxConcurrentExternalBuilds external builds in flight', enforcedBy: 'build-dispatch-policy.mjs' },
     { id: 'wip-cap', text: 'at most maxOpenItems items open from build start until merge (durable in-flight ∪ delivered-by-open-PR)', enforcedBy: 'build-dispatch-policy.mjs' },
-    { id: 'landing-freeze', text: 'no new build while counted open PRs > maxOpenPrs (card-only and review:accepted PRs are not counted) or any open PR carries a freeze label', enforcedBy: 'build-dispatch-policy.mjs' },
+    { id: 'landing-freeze', text: 'no new build while counted builder PRs > maxOpenPrs (all mode restores repo-wide counting; existing card-only and review:accepted exclusions apply) or any open PR carries a freeze label', enforcedBy: 'build-dispatch-policy.mjs' },
     { id: 'main-red', text: "no new build while main's CI is red (setting freeze.mainRed; prepares and the main-fix owner exempt)", enforcedBy: 'build-dispatch-policy.mjs' },
     { id: 'scope-vs-open-prs', text: "a build whose scope overlaps an open PR's files waits for that PR", enforcedBy: 'build-dispatch-policy.mjs' },
     { id: 'hot-file', text: 'no two in-flight builds on the same file', enforcedBy: 'build-dispatch-policy.mjs' },
@@ -152,6 +150,7 @@ export function normalizeOpenPrs(byRepo) {
         repo,
         number: pr.number,
         headRefName: pr.headRefName ?? '',
+        body: pr.body ?? '',
         labels: (pr.labels || []).map((l) => (typeof l === 'string' ? l : l?.name)).filter(Boolean),
         files: (pr.files || []).map((f) => ({ repo, path: String(f?.path ?? f ?? '') })).filter((f) => f.path),
       });
@@ -202,7 +201,7 @@ function executorClass(executor) {
  *   default) keeps the OLD, unfiltered union — every existing caller/test that predates this card sees no
  *   change; the real daemon always passes its own set.
  * @returns {{freeze:{frozen:boolean, reasons:string[]}, slots:number, dispatch:Array<object>, hold:Array<object>,
- *   openPrCap:{total:number, counted:number, cardOnly:number, accepted:number, countedPrs:string[], cardOnlyPrs:string[], acceptedPrs:string[], cap:number},
+ *   openPrCap:{total:number, counted:number, cardOnly:number, accepted:number, nonBuilder?:number, countedPrs:string[], cardOnlyPrs:string[], acceptedPrs:string[], cap:number},
  *   openItems:{count:number, cap:number, nums:string[]}}} `openItems` is the PRE-TICK union
  *   (`{inFlight} ∪ {delivered-by-open-PR ∩ dispatchedByBuilder}`), #4353/xovjhwh — the value the `wip-cap` rule
  *   below checks and decrements.
@@ -222,7 +221,11 @@ export function planBuildDispatch({
   // tell an open-PR-count freeze (a build-WIP limit) from a kill switch or a freeze label (hold everything).
   const freezeKinds = new Set();
   if (killSwitch?.engaged) { freezeReasons.push(`kill switch engaged${killSwitch.reason ? ` (${killSwitch.reason})` : ''}`); freezeKinds.add('kill-switch'); }
-  const openPrCap = countOpenPrsForCap(openPrs, policy.openPrCapScope ?? OPEN_PR_CAP_SCOPE_DEFAULTS);
+  const capPrs = policy.maxOpenPrsCounts === 'all' ? openPrs : openPrs.filter(isBuilderPr);
+  const openPrCap = countOpenPrsForCap(capPrs, policy.openPrCapScope ?? OPEN_PR_CAP_SCOPE_DEFAULTS);
+  openPrCap.total = openPrs.length;
+  // Name the builder filter's exclusions, so the cap message accounts for every open PR in `total`.
+  if (policy.maxOpenPrsCounts !== 'all') openPrCap.nonBuilder = openPrs.length - capPrs.length;
   if (openPrCap.counted > policy.maxOpenPrs) { freezeReasons.push(`${formatOpenPrCap(openPrCap)} > maxOpenPrs ${policy.maxOpenPrs}`); freezeKinds.add('open-prs'); }
   // GLOBAL freeze set — `blocked:daemon-bug` only (#3383 continuation, live incident 2026-09-28). A per-PR
   // `*-stalled` label never reaches this set any more; it is still an ordinary open PR below, so the
