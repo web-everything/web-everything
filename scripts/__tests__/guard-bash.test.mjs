@@ -572,6 +572,18 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('D=~/x; ( D=/tmp; true ); cd "$D"')).toBe(`${HOME}/x`);
     expect(at('D=~/x; y=$(D=/tmp); cd "$D"')).toBe(`${HOME}/x`);
     expect(at('(HOME=/tmp); cd ~/x')).toBe(`${HOME}/x`);
+    // any child shell — a subshell not opened by the assignment, a multi-line one, a pipeline member — counts
+    expect(at('D=~/x; (true; D=/tmp); cd "$D"')).toBe(`${HOME}/x`);
+    expect(at('D=~/x; ( true; D=/tmp ); cd "$D"')).toBe(`${HOME}/x`);
+    expect(at('D=~/x\n(\nD=/tmp\n)\ncd "$D"')).toBe(`${HOME}/x`);
+    expect(at('D=~/x; D=/tmp | cat; cd "$D"')).toBe(`${HOME}/x`);
+    expect(at('(true; HOME=/q); cd ~/x')).toBe(`${HOME}/x`);
+    expect(at('HOME=/q | cat; cd ~/x')).toBe(`${HOME}/x`);
+    // a background job is not visible in the statements: main's resolution, never the job's HOME
+    expect(at('HOME=/q & cd ~/x')).toBe(`${REPORTED}/~/x`);
+    // a cd in a child shell, or a target that leaks an operator, is never home-expanded
+    expect(at('(true; cd ~/x); git status')).toBe(`${REPORTED}/~/x)`);
+    expect(at('D=/clone; (true; D=~/x); cd $D')).not.toMatch(new RegExp(`^${HOME}/`));
     // no home to expand, or a later literal assignment: main's resolution
     expect(at('D=~/x; cd "$D"', null)).toBe(`${REPORTED}/~/x`);
     expect(at('D=~/x; D=/clone; cd "$D"')).toBe('/clone');
@@ -3682,6 +3694,8 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
       ['a $HOME-assigned variable', 'D="$HOME/some-new-daemon-clone"; cd "$D" && git checkout --detach'],
       ['a home-derived variable a subshell reassigns', 'D=~/some-new-daemon-clone; (D=/tmp); cd "$D" && git checkout --detach'],
       ['a tilde cd after a subshell HOME assignment', '(HOME=/tmp); cd ~/some-new-daemon-clone && git checkout --detach'],
+      ['a home-derived variable a later subshell statement reassigns', 'D=~/some-new-daemon-clone; (true; D=/tmp); cd "$D" && git checkout --detach'],
+      ['a home-derived variable a pipeline member reassigns', 'D=~/some-new-daemon-clone; D=/tmp | cat; cd "$D" && git checkout --detach'],
     ])('DENIES `git checkout --detach` through %s', (_n, cmd) => denies(cmd));
     it('a quoted tilde in an assignment stays literal and never reaches the clone', () => {
       expect(runHook(`D='~/some-new-daemon-clone'; cd "$D" && git checkout --detach`, lane, root)).toBeNull();

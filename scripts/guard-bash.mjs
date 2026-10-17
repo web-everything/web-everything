@@ -2626,7 +2626,7 @@ function expandWord(s, home) {
     } else if (ch === '~' && i === 0) {                                    // only `~` / `~/…` — never `~user`, `~+`
       if (!/^(?:\/|$|\s|[<>])/.test(s.slice(1)) || !home) return null;
       out += home;
-    } else if (ch === '`' || ch === '*' || ch === '?' || ch === '[') {
+    } else if ('`*?[();|&'.includes(ch)) {                                // a glob, or a word that leaks an operator
       return null;
     } else {
       out += ch;
@@ -2842,25 +2842,38 @@ function homeAfter(stmt, home) {
 
 // The first `cd`'s target when it is reached through a home expansion — a home-spelled target, or a whole
 // `$VAR` whose value expanded `~`/`$HOME` (each assignment reads the HOME in effect at its own statement) —
-// else null, and `resolveEffectiveCwd` keeps main's literal-variable resolution.
-function homeCdTarget(segments, home) {
+// else null, and `resolveEffectiveCwd` keeps main's literal-variable resolution. A statement in a child shell
+// (a subshell, a `$( … )`, a pipeline member) never changes the parent's HOME or variables; a background `&`
+// is not visible in the segments, so a command with one keeps main's resolution.
+function homeCdTarget(cmd, { segments, pipedFrom }, home) {
+  const masked = maskQuotedKeepingExpansions(cmd);
+  if (/(?:^|[^&<>])&(?![&>])/.test(masked)) return null;
   let currentHome = typeof home === 'string' && home.startsWith('/') ? home : null;
   const homes = [];
-  for (const stmt of segments) {
+  const child = [];
+  let depth = 0;
+  for (const [i, stmt] of segments.entries()) {
+    const text = maskQuotedKeepingExpansions(stmt).trim();
+    child.push(depth > 0 || /^\((?!\()/.test(text) || !!pipedFrom[i] || !!pipedFrom[i + 1]);
+    for (const ch of text) depth = Math.max(0, depth + (ch === '(' ? 1 : ch === ')' ? -1 : 0));
+  }
+  for (const [i, stmt] of segments.entries()) {
     homes.push(currentHome);
     const cd = stmt.trim().match(/^cd\s+(.+)$/);
-    if (!cd) { currentHome = homeAfter(stmt, currentHome); continue; }
+    if (cd && child[i]) return null;
+    if (!cd) { if (!child[i]) currentHome = homeAfter(stmt, currentHome); continue; }
     const raw = cd[1].trim();
     if (/^(?:~|\$HOME(?:\W|$)|\$\{HOME\}|"\$(?:HOME(?:\W|$)|\{HOME\}))/.test(raw)) return expandCdTarget(raw, currentHome);
     const v = raw.split(/\s+/)[0].replace(/^(['"])(.*)\1$/, '$2').match(/^\$\{?([A-Za-z_]\w*)\}?$/);
     if (!v) return null;
     let value = null;
     let literal = null;                                       // the same chain with nothing home-expanded
-    for (const [j, before] of segments.slice(0, homes.length - 1).entries()) {
+    for (const [j, before] of segments.slice(0, i).entries()) {
+      if (child[j]) continue;
       value = valueAfter(before, v[1], value, homes[j]);
       literal = valueAfter(before, v[1], literal, null);
     }
-    return typeof value === 'string' && value !== literal && !/[\s`$(*?\[]/.test(value) ? value : null;
+    return typeof value === 'string' && value !== literal && !/[\s`$()*?\[]/.test(value) ? value : null;
   }
   return null;
 }
@@ -2886,7 +2899,7 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   const parsed = parseSegments(cmd);
   if (parsed.unterminated) return reportedCwd;
   // #5957 — a home-expanded target first; anything it cannot expand keeps the resolution below unchanged.
-  const homed = homeCdTarget(parsed.segments, home);
+  const homed = homeCdTarget(cmd, parsed, home);
   if (homed) return homed.startsWith('/') ? homed : resolvePath(reportedCwd || '.', homed);
   // Collect simple literal `VAR=value` / `export VAR=value` assignments (no command-subst/globs) in order.
   const vars = Object.create(null);
