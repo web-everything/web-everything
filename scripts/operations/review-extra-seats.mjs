@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { ownReviewScratch, removeReviewScratch, retainReviewScratch } from '../lib/review-scratch.mjs';
+import { ownReviewScratch, removeReviewScratch, retainReviewScratch, REVIEW_SCRATCH_PREFIXES } from '../lib/review-scratch.mjs';
 import { openOperatorSendBacks, renderOperatorSendBackReviewBlock } from '../lib/operator-send-backs.mjs';
 import { PROVIDER_CAP_ENV, resolveProviderCap } from './review-seat-policy.mjs';
 export { DAILY_CAP_ENV, DEFAULT_DAILY_CAP, PROVIDER_CAP_ENV, PROVIDER_CAP_DEFAULT, resolveProviderCap, resolveDailyCap } from './review-seat-policy.mjs';
@@ -759,6 +759,13 @@ export function withLedgerLock(path, fn, { timeoutMs = LEDGER_LOCK_TIMEOUT_MS, s
 export const ACTIVE_SEAT_PIDS = new Set();
 const ACTIVE_SEAT_PROCESSES = new Map();
 let stoppingSeats = false;
+let terminatingSeats = false;
+let stoppingAllSeats;
+
+function shutdownActiveSeats() {
+  terminatingSeats = true;
+  return killActiveSeats();
+}
 
 function trackSeat(child, signal = 'SIGTERM') {
   if (!child.pid) return child;
@@ -772,34 +779,76 @@ function trackSeat(child, signal = 'SIGTERM') {
   return child;
 }
 
-function stopSeat(pid) {
+const signalSeat = (pid, signal) => {
+  try { process.kill(-pid, signal); } catch { try { process.kill(pid, signal); } catch { /* gone */ } }
+};
+
+// Direct-task models start their own detached groups. Discover them while the
+// wrapper is still alive, before SIGKILL can orphan them and lose that ancestry.
+function seatDescendants(pid) {
+  const r = spawnSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf8', timeout: 2000, killSignal: 'SIGKILL', maxBuffer: 4 * 1024 * 1024 });
+  if (r.status !== 0) throw new Error('cannot observe review seat descendants before SIGKILL');
+  const rows = String(r.stdout).trim().split('\n').map(line => line.trim().split(/\s+/).map(Number));
+  if (!rows.some(([child]) => child === pid)) throw new Error('review seat absent from process snapshot');
+  const children = new Map();
+  for (const [child, parent] of rows) {
+    if (!Number.isSafeInteger(child) || child <= 0 || !Number.isSafeInteger(parent)) continue;
+    if (!children.has(parent)) children.set(parent, []);
+    children.get(parent).push(child);
+  }
+  const found = new Set([pid]);
+  for (const parent of found) for (const child of children.get(parent) ?? []) found.add(child);
+  return [...found].slice(1).reverse();
+}
+
+function stopSeat(pid, requestedSignal = 'SIGTERM') {
   const seat = ACTIVE_SEAT_PROCESSES.get(pid);
   if (seat?.stopping) return seat.stopping;
   // Direct-task wrappers own a second detached model group. Let their TERM handler
-  // kill that group before the wrapper exits; SIGKILL would orphan the model.
-  const signal = seat?.signal ?? 'SIGTERM';
-  try { process.kill(-pid, signal); } catch { try { process.kill(pid, signal); } catch { /* gone */ } }
-  let timer;
+  // kill that group before the wrapper exits. Escalation also kills detached descendants.
+  const signal = seat?.signal ?? requestedSignal;
+  signalSeat(pid, signal);
   let poll;
   const closed = seat?.closed ?? new Promise(resolveClosed => {
     poll = setInterval(() => { if (!ACTIVE_SEAT_PIDS.has(pid)) resolveClosed(); }, 20);
   });
-  const stopping = Promise.race([
-    closed,
-    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('review seat did not close after stop')), 10000); }),
-  ]).finally(() => { clearTimeout(timer); clearInterval(poll); });
+  const waitClosed = async ms => {
+    let timer;
+    try {
+      await Promise.race([closed, new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('review seat did not close after stop')), ms);
+      })]);
+    } finally { clearTimeout(timer); }
+  };
+  const stopping = (async () => {
+    try { await waitClosed(10000); }
+    catch {
+      let observationError;
+      try { for (const child of seatDescendants(pid)) signalSeat(child, 'SIGKILL'); }
+      catch (error) {
+        // Still stop the wrapper, but unknown detached children require retained scratch.
+        observationError = error;
+        retainReviewScratch();
+      }
+      signalSeat(pid, 'SIGKILL');
+      await waitClosed(1000);
+      if (observationError) throw observationError;
+    }
+  })().finally(() => { clearInterval(poll); });
   if (seat) seat.stopping = stopping;
   return stopping;
 }
 
 /** Stop every seat and wait for close before scratch cleanup, including speculative cancellation. */
-export function killActiveSeats() {
-  stoppingSeats = true;
+export function killActiveSeats(signal = 'SIGTERM') {
+  if (stoppingAllSeats) return stoppingAllSeats;
   if (!ACTIVE_SEAT_PIDS.size) return;
-  return Promise.all([...ACTIVE_SEAT_PIDS].map(stopSeat)).catch(error => {
-    retainReviewScratch();
-    throw error;
-  });
+  stoppingSeats = true;
+  stoppingAllSeats = Promise.allSettled([...ACTIVE_SEAT_PIDS].map(pid => stopSeat(pid, signal))).then(results => {
+    const failed = results.find(r => r.status === 'rejected');
+    if (failed) { retainReviewScratch(); throw failed.reason; }
+  }).finally(() => { stoppingSeats = false; stoppingAllSeats = undefined; });
+  return stoppingAllSeats;
 }
 
 export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storePath, lockTimeoutMs = LEDGER_LOCK_TIMEOUT_MS } = {}) {
@@ -843,13 +892,13 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
     // fetched: the lane's HEAD (or any ref) may already be another PR's by now.
     makeScratch: ({ lanePath, rev }) => {
       if (!isPinnedRev(rev)) throw new Error(`makeScratch: refusing an unpinned rev ${JSON.stringify(rev ?? null)} — only a commit id is safe on a released lane`);
-      const dir = mkdtempSync(join(tmpdir(), 'we-review-seat-'));
+      const dir = mkdtempSync(join(tmpdir(), REVIEW_SCRATCH_PREFIXES.seat));
       const git = (args) => {
         const r = spawnSync('git', args, { encoding: 'utf8', timeout: 5 * 60 * 1000 });
         if (r.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${String(r.stderr).trim().slice(0, 300)}`);
       };
       try {
-        ownReviewScratch(dir, killActiveSeats);
+        ownReviewScratch(dir, shutdownActiveSeats);
         git(['init', '--quiet', dir]);
         git(['-C', dir, 'fetch', '--quiet', '--no-tags', '--depth=1', lanePath, rev]);
         git(['-C', dir, 'checkout', '--quiet', '--detach', 'FETCH_HEAD']);
@@ -862,7 +911,7 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
     removeScratch: removeReviewScratch,
     writeFile: (path, text) => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, text); },
     runSeat: ({ provider, taskFile, dir, model, effort, timeoutMs }) => new Promise((resolvePromise) => {
-      if (stoppingSeats) {
+      if (stoppingSeats || terminatingSeats) {
         resolvePromise({ report: null, error: 'review seats are stopping', timedOut: false });
         return;
       }
@@ -1659,8 +1708,8 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
         if (readsRepo) {
           scratch = base.makeScratch({ lanePath, rev });
           // Keep the independent pinned clone under the lane shape assertLaneCwd enforces.
-          parent = mkdtempSync(join(tmpdir(), 'we-red-team-recheck-'));
-          ownReviewScratch(parent, killActiveSeats);
+          parent = mkdtempSync(join(tmpdir(), REVIEW_SCRATCH_PREFIXES.recheck));
+          ownReviewScratch(parent, shutdownActiveSeats);
           cwd = join(parent, '.lanes', 'red-team-recheck', 'lane-1');
           mkdirSync(dirname(cwd), { recursive: true });
           renameSync(scratch, cwd);
@@ -1674,7 +1723,7 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
           // Recheck providers spawn the model CLI itself, so it can be killed
           // directly. A PID-targeted launcher signal does not reach its group.
           spawnFn: (cli, argv, options) => {
-            if (stoppingSeats) throw new Error('review seats are stopping');
+            if (stoppingSeats || terminatingSeats) throw new Error('review seats are stopping');
             return trackSeat(spawn(cli, argv, { ...options, detached: true }), 'SIGKILL');
           },
         });

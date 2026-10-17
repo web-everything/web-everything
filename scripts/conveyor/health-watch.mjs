@@ -42,7 +42,7 @@
  *   node scripts/conveyor/health-watch.mjs unsilence --smell=ID [--subject=S]
  */
 import { sweepReviewTmp, probeDiskSpace } from './review-tmp-health.mjs';
-import { appendLines, feedPath } from '../operations/needs-you-feed.mjs';
+import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { superviseNeedsYouFeed } from './needs-you-feed-job.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { sealDueBatches } from '../operations/card-batch-seal-io.mjs';
@@ -56,7 +56,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import {
   existsSync, mkdirSync, readFileSync, readdirSync, statSync, realpathSync, writeFileSync, renameSync, openSync, readSync, closeSync, unlinkSync,
 } from 'node:fs';
-import { homedir, loadavg, cpus, tmpdir } from 'node:os';
+import { homedir, hostname, loadavg, cpus, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -1357,7 +1357,13 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   else if (prev.prSweep) state.prSweep = prev.prSweep;
   if (!flags['state-root'] && !flags['dry-run']) {
     for (const t of result.transitions.filter(t => t.type === 'opened' && t.episode?.smell === 'disk-space')) {
-      attempt('diskSpaceNeedsYou', () => appendLines(feedPath(), [`NEEDS-YOU host disk-space: ${t.episode.summary} ${JSON.stringify({ at: new Date(now).toISOString(), kind: 'disk-space', reason: t.episode.summary, episode: t.episode.id })}`]));
+      attempt('diskSpaceNeedsYou', () => publishAttention({
+        repo: `host/${hostname()}`, pr: 0,
+        // Episode report ids have minute precision. openedAt distinguishes even
+        // two openings in the same minute and supplies the feed's complete identity.
+        head: `${t.episode.subject}:${t.episode.openedAt}`, kind: 'disk-space',
+        reason: t.episode.summary, episode: t.episode.id,
+      }, { now }));
     }
   }
   if (tmpSweep) state.tmpSweep = { at: now, ...(tmpSweep.complete ? { completedAt: now } : {}), ...tmpSweep };

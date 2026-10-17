@@ -7,6 +7,27 @@ import { pathToFileURL } from 'node:url';
 const roots = [];
 afterEach(() => { for (const p of roots.splice(0)) rmSync(p, { recursive: true, force: true }); });
 const moduleUrl = pathToFileURL(resolve('scripts/operations/review-extra-seats.mjs')).href;
+it('keeps ownership metadata outside a pinned tree containing the former marker filename', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'we-seat-marker-test-')); roots.push(tmp);
+  const bin = join(tmp, 'bin'); mkdirSync(bin);
+  // Substitute only git's transport: checkout materializes an untrusted tracked file,
+  // refusing to overwrite untracked files just as git checkout does. No .git writes.
+  writeFileSync(join(bin, 'git'), `#!${process.execPath}
+    const { writeFileSync } = require('node:fs'); const { join } = require('node:path');
+    const args = process.argv.slice(2);
+    if (args.includes('checkout')) writeFileSync(join(args[1], '.we-review-owner.json'), 'tracked PR content', { flag: 'wx' });
+  `, { mode: 0o755 });
+  const code = `import { createExtraSeatsIo } from ${JSON.stringify(moduleUrl)};
+    import { readFileSync } from 'node:fs';
+    const io = createExtraSeatsIo(); const dir = io.makeScratch({ lanePath: 'fixture', rev: 'a'.repeat(40) });
+    if (readFileSync(dir + '/.we-review-owner.json', 'utf8') !== 'tracked PR content') throw new Error('tree modified');
+    io.removeScratch(dir);`;
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], {
+    env: { ...process.env, TMPDIR: tmp, PATH: `${bin}:${process.env.PATH}` }, encoding: 'utf8', timeout: 15000,
+  });
+  expect(r.status, r.stderr).toBe(0);
+  expect(readdirSync(tmp)).toEqual(['bin']);
+});
 it('removes a checkout whose pinned fetch fails before makeScratch returns', () => {
   const tmp = mkdtempSync(join(tmpdir(), 'we-seat-failure-test-')); roots.push(tmp);
   const code = `import { createExtraSeatsIo } from ${JSON.stringify(moduleUrl)};
@@ -24,6 +45,7 @@ it.each(['success', 'failure', 'SIGTERM', 'SIGINT', 'SIGHUP'])('removes owned ch
     ${mode === 'failure' ? "throw new Error('failed seat')" : mode === 'success' ? '' : `process.kill(process.pid, '${mode}'); setTimeout(() => {}, 10000);`}`;
   const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8', timeout: 15000 });
   expect(existsSync(dir), r.stderr).toBe(false);
+  expect(existsSync(`${dir}.owner.json`), r.stderr).toBe(false);
   if (mode === 'success') expect(r.status).toBe(0);
   else expect(r.status === 0).toBe(false);
 });
@@ -150,18 +172,34 @@ it('stops a tool-free recheck even after the last owned checkout was released', 
   }
 }, 30000);
 
-it('retains scratch through caller finally when the outer-wall stop cannot close the wrapper', async () => {
+it.each(['outer-wall', 'SIGTERM'])('escalates %s to SIGKILL for a TERM-ignoring wrapper and detached model', async mode => {
   const tmp = mkdtempSync(join(tmpdir(), 'we-seat-stuck-cleanup-')); roots.push(tmp);
   const dir = join(tmp, 'checkout'); mkdirSync(dir);
   mkdirSync(join(tmp, 'scripts'));
   const ready = join(tmp, 'ready');
+  const modelPidFile = join(tmp, 'model-pid');
+  const heartbeat = join(tmp, 'heartbeat');
   const result = join(tmp, 'result');
+  const modelCode = `import { writeFileSync } from 'node:fs';
+    process.on('SIGTERM', () => {}); let n = 0;
+    writeFileSync(${JSON.stringify(modelPidFile)}, String(process.pid));
+    setInterval(() => writeFileSync(${JSON.stringify(heartbeat)}, String(++n)), 20);`;
   writeFileSync(join(tmp, 'scripts', 'codex-direct-task.mjs'), `
     import { writeFileSync } from 'node:fs';
+    import { spawn } from 'node:child_process';
     process.on('SIGTERM', () => {});
+    spawn(process.execPath, ['--input-type=module', '-e', ${JSON.stringify(modelCode)}], { detached: true, stdio: 'ignore' });
     writeFileSync(${JSON.stringify(ready)}, String(process.pid));
     setInterval(() => {}, 1000); setTimeout(() => process.exit(), 30000);
   `);
+  // ps is sandbox-denied. Supply the real fixture PIDs at this OS observation boundary.
+  const bin = join(tmp, 'bin'); mkdirSync(bin);
+  writeFileSync(join(bin, 'ps'), `#!${process.execPath}
+    const { readFileSync } = require('node:fs');
+    const wrapper = readFileSync(${JSON.stringify(ready)}, 'utf8');
+    const model = readFileSync(${JSON.stringify(modelPidFile)}, 'utf8');
+    console.log(wrapper + ' 1\\n' + model + ' ' + wrapper);
+  `, { mode: 0o755 });
   const helper = pathToFileURL(resolve('scripts/lib/review-scratch.mjs')).href;
   const code = `import { createExtraSeatsIo, killActiveSeats } from ${JSON.stringify(moduleUrl)};
     import { ownReviewScratch, removeReviewScratch } from ${JSON.stringify(helper)};
@@ -169,19 +207,54 @@ it('retains scratch through caller finally when the outer-wall stop cannot close
     ownReviewScratch(${JSON.stringify(dir)}, killActiveSeats);
     let r;
     try { r = await createExtraSeatsIo({ root: ${JSON.stringify(tmp)} }).runSeat({
-      provider: 'codex', dir: ${JSON.stringify(dir)}, taskFile: 'unused', model: 'unused', effort: 'high', timeoutMs: -85000 });
+      provider: 'codex', dir: ${JSON.stringify(dir)}, taskFile: 'unused', model: 'unused', effort: 'high', timeoutMs: ${mode === 'outer-wall' ? -85000 : 60000} });
     } finally { removeReviewScratch(${JSON.stringify(dir)}); }
-    writeFileSync(${JSON.stringify(result)}, JSON.stringify(r)); process.exit(0);`;
+    writeFileSync(${JSON.stringify(result)}, JSON.stringify(r)); ${mode === 'outer-wall' ? 'process.exit(0);' : ''}`;
   let stderr = '';
-  const launcher = spawn(process.execPath, ['--input-type=module', '-e', code], { stdio: ['ignore', 'ignore', 'pipe'] });
+  const launcher = spawn(process.execPath, ['--input-type=module', '-e', code], {
+    stdio: ['ignore', 'ignore', 'pipe'], env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+  });
   launcher.stderr.on('data', d => { stderr += d; });
   try {
-    await waitFor(() => launcher.exitCode !== null, () => stderr);
-    expect(launcher.exitCode, stderr).toBe(0);
-    expect(JSON.parse(readFileSync(result, 'utf8'))).toMatchObject({ timedOut: true, error: 'review seat did not close after stop' });
-    expect(existsSync(dir)).toBe(true);
+    await waitFor(() => existsSync(heartbeat), () => stderr);
+    if (mode === 'SIGTERM') launcher.kill('SIGTERM');
+    await waitFor(() => launcher.exitCode !== null || launcher.signalCode !== null, () => stderr);
+    const pid = Number(readFileSync(ready, 'utf8'));
+    expect(() => process.kill(pid, 0), 'TERM-ignoring wrapper survived the stop window').toThrow();
+    const beat = readFileSync(heartbeat, 'utf8');
+    await new Promise(r => setTimeout(r, 100));
+    expect(readFileSync(heartbeat, 'utf8'), 'detached model survived SIGKILL escalation').toBe(beat);
+    if (mode === 'outer-wall') {
+      expect(launcher.exitCode, stderr).toBe(0);
+      expect(JSON.parse(readFileSync(result, 'utf8'))).toMatchObject({ timedOut: true });
+    } else expect(launcher.signalCode).toBe('SIGTERM');
+    expect(existsSync(dir)).toBe(false);
   } finally {
     if (existsSync(ready)) { try { process.kill(-Number(readFileSync(ready, 'utf8')), 'SIGKILL'); } catch {} }
+    if (existsSync(modelPidFile)) { try { process.kill(-Number(readFileSync(modelPidFile, 'utf8')), 'SIGKILL'); } catch {} }
     launcher.kill('SIGKILL');
   }
 }, 30000);
+
+it('permits another seat after speculative cancellation finishes', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'we-seat-cancel-resume-')); roots.push(tmp);
+  mkdirSync(join(tmp, 'scripts'));
+  const ready = join(tmp, 'ready');
+  writeFileSync(join(tmp, 'scripts', 'codex-direct-task.mjs'), `
+    import { existsSync, writeFileSync } from 'node:fs';
+    if (existsSync(${JSON.stringify(ready)})) console.log(JSON.stringify({ ok: true }));
+    else { writeFileSync(${JSON.stringify(ready)}, 'ready'); setInterval(() => {}, 1000); }
+  `);
+  const code = `import { createExtraSeatsIo, killActiveSeats } from ${JSON.stringify(moduleUrl)};
+    import { existsSync } from 'node:fs';
+    const io = createExtraSeatsIo({ root: ${JSON.stringify(tmp)} });
+    const args = { provider: 'codex', dir: ${JSON.stringify(tmp)}, taskFile: 'unused', model: 'unused', effort: 'high', timeoutMs: 1000 };
+    await killActiveSeats('SIGKILL');
+    const first = io.runSeat(args);
+    while (!existsSync(${JSON.stringify(ready)})) await new Promise(r => setTimeout(r, 20));
+    await killActiveSeats('SIGKILL'); await first;
+    const r = await io.runSeat(args);
+    if (r.error || r.exitCode !== 0) throw new Error(JSON.stringify(r));`;
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8', timeout: 15000 });
+  expect(r.status, r.stderr).toBe(0);
+});

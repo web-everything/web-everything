@@ -1,6 +1,12 @@
 // Own scratch paths from allocation onward, including failed git setup and catchable termination.
 import { rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+// Allocation and recovery share names; ownership metadata must never enter a PR's tree.
+export const REVIEW_SCRATCH_PREFIXES = Object.freeze({
+  seat: 'we-review-seat-', recheck: 'we-red-team-recheck-', overlay: 'we-overlay-dispatch-smoke-',
+});
+export const reviewScratchOwnerPath = dir => `${dir}.owner.json`;
+export const isReviewScratchName = name => Object.values(REVIEW_SCRATCH_PREFIXES)
+  .some(prefix => name.startsWith(prefix) && /^[\w-]+$/.test(name.slice(prefix.length)));
 const owned = new Set();
 const retained = new Set();
 let installed = false;
@@ -8,6 +14,7 @@ let stopSeats = () => {};
 export function removeReviewScratch(dir) {
   if (retained.has(dir)) return;
   rmSync(dir, { recursive: true, force: true });
+  if (owned.has(dir)) rmSync(reviewScratchOwnerPath(dir), { force: true });
   owned.delete(dir);
 }
 // A failed stop must survive callers' finally blocks. The TTL sweeper owns recovery.
@@ -58,6 +65,6 @@ export function ownReviewScratch(dir, stop) {
       process.on(signal, handler);
     }
   }
-  writeFileSync(join(dir, '.we-review-owner.json'), JSON.stringify({ pid: process.pid }));
+  writeFileSync(reviewScratchOwnerPath(dir), JSON.stringify({ pid: process.pid }), { flag: 'wx' });
   return dir;
 }

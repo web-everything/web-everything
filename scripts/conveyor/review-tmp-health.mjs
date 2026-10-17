@@ -2,6 +2,7 @@
 import { lstatSync, readdirSync, readFileSync, rmSync, statfsSync } from 'node:fs';
 import { join } from 'node:path';
 import { readBusyTopLevel } from './tmp-sweep.mjs';
+import { isReviewScratchName, reviewScratchOwnerPath } from '../lib/review-scratch.mjs';
 const positive = (v, fallback) => typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : fallback;
 const alive = pid => {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
@@ -16,21 +17,30 @@ export function sweepReviewTmp({ tmpRoot, config = {}, now = Date.now(), busy, d
   const ttlMs = positive(config.tmp?.reviewSeatTtlMin, 120) * 60000;
   const maxBytes = positive(config.tmp?.backlogIndexMaxMb, 2048) * 1024 ** 2;
   const result = { directories: 0, files: 0, bytesFreed: 0, busy: 0, errors: 0 };
-  // Failed process observation must never prevent cache capping, but fails closed for checkouts.
-  if (!busy) { try { busy = readBusyTopLevel(tmpRoot); } catch { busy = null; } }
+  let busyScanned = busy !== undefined;
   const cache = [];
   for (const name of readdirSync(tmpRoot)) {
     const path = join(tmpRoot, name);
     try {
       const st = lstatSync(path);
       if (!st.isDirectory()) continue; // never follow a top-level symlink
-      if (/^we-(?:review-seat|overlay-dispatch-smoke)-[\w-]+$/.test(name)) {
+      if (isReviewScratchName(name)) {
         if (now - st.mtimeMs < ttlMs) continue;
         let owner;
-        try { owner = JSON.parse(readFileSync(join(path, '.we-review-owner.json'), 'utf8')).pid; } catch { /* legacy checkout */ }
-        if (!busy || busy.has(name) || alive(owner)) { result.busy++; continue; }
+        try { owner = JSON.parse(readFileSync(reviewScratchOwnerPath(path), 'utf8')).pid; } catch { /* legacy checkout */ }
+        if (alive(owner)) { result.busy++; continue; }
+        // lsof is expensive. Observe once, only when an expired candidate needs it.
+        // Unknown observation preserves checkouts without preventing cache capping.
+        if (!busyScanned) {
+          busyScanned = true;
+          try { busy = readBusyTopLevel(tmpRoot); } catch { busy = null; }
+        }
+        if (!busy || busy.has(name)) { result.busy++; continue; }
         const size = bytes(path);
-        if (!dryRun) rmSync(path, { recursive: true, force: true });
+        if (!dryRun) {
+          rmSync(path, { recursive: true, force: true });
+          rmSync(reviewScratchOwnerPath(path), { force: true });
+        }
         result.directories++; result.bytesFreed += size;
       } else if (/^we-backlog-index-[\w-]+$/.test(name)) {
         for (const file of readdirSync(path)) {

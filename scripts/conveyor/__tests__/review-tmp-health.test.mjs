@@ -1,13 +1,15 @@
-import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, utimesSync } from 'node:fs';
+import { describe, it, expect, afterEach, vi } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, utimesSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { sweepReviewTmp, probeDiskSpace } from '../review-tmp-health.mjs';
 import disk from '../health-smells/disk-space.mjs';
 import { runHealthTick, emptyHealthState } from '../health-watch-core.mjs';
+const busyScan = vi.hoisted(() => vi.fn(() => new Set()));
+vi.mock('../tmp-sweep.mjs', () => ({ readBusyTopLevel: busyScan }));
 const roots = [];
 const root = () => { const p = mkdtempSync(join(tmpdir(), 'we-review-tmp-test-')); roots.push(p); return p; };
-afterEach(() => { for (const p of roots.splice(0)) rmSync(p, { recursive: true, force: true }); });
+afterEach(() => { for (const p of roots.splice(0)) rmSync(p, { recursive: true, force: true }); busyScan.mockReset(); busyScan.mockReturnValue(new Set()); });
 describe('review temporary storage health', () => {
   it('removes only expired seats and smoke dirs, preserving live owners and cwd holders', () => {
     const tmpRoot = root(); const now = Date.now();
@@ -17,16 +19,44 @@ describe('review temporary storage health', () => {
     };
     const expired = make('we-review-seat-abcdef', 121 * 60000);
     const smoke = make('we-overlay-dispatch-smoke-abcdef', 121 * 60000);
+    const recheck = make('we-red-team-recheck-abcdef', 121 * 60000);
     const young = make('we-review-seat-young1', 119 * 60000);
     const busy = make('we-review-seat-busy12', 121 * 60000);
     const live = make('we-review-seat-live12', 121 * 60000);
-    writeFileSync(join(live, '.we-review-owner.json'), JSON.stringify({ pid: process.pid }));
+    writeFileSync(`${live}.owner.json`, JSON.stringify({ pid: process.pid }));
     utimesSync(live, new Date(now - 121 * 60000), new Date(now - 121 * 60000));
     const other = make('unrelated-abcdef', 999 * 60000);
     const result = sweepReviewTmp({ tmpRoot, now, busy: new Set(['we-review-seat-busy12']), log: () => {} });
-    expect(result.directories).toBe(2); expect(result.bytesFreed).toBe(8);
-    for (const p of [expired, smoke]) expect(existsSync(p)).toBe(false);
+    expect(result.directories).toBe(3); expect(result.bytesFreed).toBe(12);
+    for (const p of [expired, smoke, recheck]) expect(existsSync(p)).toBe(false);
     for (const p of [young, busy, live, other]) expect(existsSync(p)).toBe(true);
+  });
+  it('does not scan busy cwds until an expired scratch candidate needs it', () => {
+    const tmpRoot = root(); mkdirSync(join(tmpRoot, 'we-review-seat-young'));
+    sweepReviewTmp({ tmpRoot, log: () => {} });
+    expect(busyScan).not.toHaveBeenCalled();
+    for (const name of ['we-review-seat-old', 'we-red-team-recheck-old']) {
+      const p = join(tmpRoot, name); mkdirSync(p); utimesSync(p, new Date(0), new Date(0));
+    }
+    expect(sweepReviewTmp({ tmpRoot, log: () => {} }).directories).toBe(2);
+    expect(busyScan).toHaveBeenCalledTimes(1);
+  });
+  it('preserves checkouts when cwd observation fails while still capping caches', () => {
+    const tmpRoot = root(); const seat = join(tmpRoot, 'we-review-seat-old'); mkdirSync(seat);
+    utimesSync(seat, new Date(0), new Date(0));
+    const cache = join(tmpRoot, 'we-backlog-index-test'); mkdirSync(cache); writeFileSync(join(cache, 'index'), 'cache');
+    busyScan.mockImplementation(() => { throw new Error('lsof failed'); });
+    const r = sweepReviewTmp({ tmpRoot, config: { tmp: { backlogIndexMaxMb: 0 } }, log: () => {} });
+    expect(r.busy).toBe(1); expect(r.files).toBe(1); expect(existsSync(seat)).toBe(true);
+  });
+  it('never follows a scratch symlink or trusts a marker in the PR tree', () => {
+    const tmpRoot = root(); const target = root();
+    symlinkSync(target, join(tmpRoot, 'we-review-seat-link'));
+    const seat = join(tmpRoot, 'we-review-seat-old'); mkdirSync(seat);
+    writeFileSync(join(seat, '.we-review-owner.json'), JSON.stringify({ pid: process.pid }));
+    utimesSync(seat, new Date(0), new Date(0));
+    expect(sweepReviewTmp({ tmpRoot, busy: new Set(), log: () => {} }).directories).toBe(1);
+    expect(existsSync(target)).toBe(true); expect(existsSync(seat)).toBe(false);
   });
   it('caps all backlog indexes together, evicting oldest files first', () => {
     const tmpRoot = root();
