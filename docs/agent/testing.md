@@ -1548,13 +1548,18 @@ Legacy runs without seat observations are omitted; absent times are never recons
 
 The drain caches non-CI gate dispositions for accepted pending heads carrying `ready-to-merge` in coordination storage,
 bound to repo, PR and head. Green check events may consume this preparation before listing;
-head, label, body/base changes and TTL expiry require the full fast drain. Every required
+head, label, body/base changes and TTL expiry require the full fast drain. So do the live fields the full
+classifier reads that move no cached signature: a `CHANGES_REQUESTED`/`REVIEW_REQUIRED` review decision,
+`mergeable` other than `MERGEABLE`, and a merge state other than `CLEAN`, `UNSTABLE` or `BLOCKED`. Every required
 context needs its own successful row before enqueue; missing, pending, cancelled and red
 contexts never authorize enqueue. A newly failed optional CodeQL check also vetoes admission when
 `drainBlocksOnCodeQL` is enabled. Red-team evidence and the complete comment thread are re-read at enqueue;
 the cache never substitutes for live release-label or red-team authorization. `checking` alone is ineligible,
 including at the event wake boundary. Cached admission also reads the live fix claim before admission and
 again inside the locked enqueue callback: a claim acquired while waiting for the lock must still veto enqueue.
+`enqueuePrestage` owns that in-lock re-read (`fixClaimHeld`) and the post-enqueue ledger facts (`recordLanded`,
+the same recorder the cascade calls after a confirmed enqueue: exemption, restamp, drain-hold release); it
+refuses the shortcut when either is not wired.
 Check-event marks lack required-context identity and head SHA: preserve pending wakes on non-success marks,
 then let the live required-check read drop red preparation. Coupled candidates, manifest-carrying heads and branches requiring preparation
 keep the full cascade. Keep pre-stage tests separate from ordinary classification tests:
@@ -1564,7 +1569,8 @@ merge cascade before any enqueue. Regression home: `scripts/lib/__tests__/drain-
 Pre-stage regression contracts (PR #5480): every enqueue entry point must cover throwing mutations
 (including required-workflow, conflict and unreadable-state failures). A shortcut refusal drops its cache
 and falls back without installing backoff that hides the error from ordinary cascade recovery. Keep
-table-driven coverage of every GitHub check conclusion, missing release labels, evidence added after
+table-driven coverage of every GitHub check conclusion at the `enqueuePrestage` boundary (not only at
+preparation), missing release labels, evidence added after
 preparation, optional CodeQL failures, coupled candidates and branch preparation. Include claims acquired
 after preparation, unreadable claim readers, and exceptions propagated through an async lock. The CLI fixture must
 assert pending manifest candidates cause no head writes or review writes, including a stale acceptance.

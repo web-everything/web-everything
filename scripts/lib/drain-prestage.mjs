@@ -55,9 +55,24 @@ export function createPrestageCache({ env = process.env, root = join(resolveCoor
   };
 }
 
-/** No listing or gate evaluation on a hit. Unknown/stale evidence delegates to the ordinary drain. */
-export async function enqueuePrestage({ cache, repo, num, settings, readPr, enqueue, withLock, blockOnCodeQL = loadDrainGateSettings().drainBlocksOnCodeQL }) {
-  if (!settings.value.prestageWhileCiRuns) return { fallback: true };
+const upper = v => String(v ?? '').toUpperCase();
+
+/** The live inputs the full classifier reads that move no cached signature: a native review, a conflict, the merge state. */
+export function prestageLiveHold(pr) {
+  if (['CHANGES_REQUESTED', 'REVIEW_REQUIRED'].includes(upper(pr.reviewDecision))) return `reviewDecision=${upper(pr.reviewDecision)}`;
+  if (upper(pr.mergeable) !== 'MERGEABLE') return `mergeable=${upper(pr.mergeable) || 'UNKNOWN'}`;
+  if (!['CLEAN', 'UNSTABLE', 'BLOCKED'].includes(upper(pr.mergeStateStatus))) return `mergeStateStatus=${upper(pr.mergeStateStatus) || 'UNKNOWN'}`;
+  return null;
+}
+
+/**
+ * No listing or gate evaluation on a hit. Unknown/stale evidence delegates to the ordinary drain.
+ * `fixClaimHeld` is re-read inside the merge-write lock (a fixer may claim the PR while this waits for it), and
+ * `recordLanded(candidate, headSha)` writes the ledger facts the full cascade writes after a confirmed enqueue.
+ * Both are required: without either one the shortcut is refused.
+ */
+export async function enqueuePrestage({ cache, repo, num, settings, readPr, enqueue, withLock, fixClaimHeld, recordLanded, blockOnCodeQL = loadDrainGateSettings().drainBlocksOnCodeQL }) {
+  if (!settings.value.prestageWhileCiRuns || typeof fixClaimHeld !== 'function' || typeof recordLanded !== 'function') return { fallback: true };
   const entry = cache.get(repo, num, settings.value.prestageTtlMin);
   if (!entry?.eligible) return { fallback: true };
   // Entries written before manifest preparation was excluded may still be within their TTL.
@@ -69,7 +84,8 @@ export async function enqueuePrestage({ cache, repo, num, settings, readPr, enqu
   try { pr = await readPr(); } catch { return { fallback: true }; }
   if (!pr || pr.headRefOid !== entry.headSha || pr.state !== 'OPEN' || pr.isDraft || pr.fixClaim?.who
       || !pr.labels?.some(l => (typeof l === 'string' ? l : l?.name) === 'ready-to-merge')
-      || labelSignature(pr.labels) !== entry.labels || pr.body !== entry.body || pr.baseRefName !== entry.baseRefName) {
+      || labelSignature(pr.labels) !== entry.labels || pr.body !== entry.body || pr.baseRefName !== entry.baseRefName
+      || prestageLiveHold(pr)) {
     cache.drop(repo, num);
     return { fallback: true };
   }
@@ -82,10 +98,14 @@ export async function enqueuePrestage({ cache, repo, num, settings, readPr, enqu
   if (ci === 'unknown') return { fallback: true };
   if (ci !== 'green') return { enqueued: false, reason: `required checks ${ci}` };
   try {
-    const locked = await withLock(() => enqueue(entry.candidate, entry.headSha, entry));
+    const locked = await withLock(() => (fixClaimHeld() ? { fallback: true } : enqueue(entry.candidate, entry.headSha, entry)));
     if (locked.ran === false) return { enqueued: false, reason: 'merge-write mutex held' };
     const result = await locked.result;
     if (result.fallback || result.enqueued) cache.drop(repo, num);
+    if (result.enqueued === true) {
+      // Fail-soft, as in the cascade: a ledger miss never undoes or repeats a confirmed enqueue.
+      try { await recordLanded(entry.candidate, entry.headSha); } catch { /* fail-soft */ }
+    }
     return result;
   } catch {
     // The ordinary cascade owns required-workflow refresh, conflict and stale-gate recovery.

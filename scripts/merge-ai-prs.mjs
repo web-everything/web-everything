@@ -955,6 +955,10 @@ export function attachLiveFixClaim(data, { claimKey, readClaim }) {
   return data;
 }
 
+/** Whether a live fix claim (or an unreadable claim store) holds the PR right now. */
+export const prestageFixClaimHeld = (num, { claimKey, readClaim = readLiveFixClaim }) =>
+  !!attachLiveFixClaim({ number: Number(num) }, { claimKey, readClaim }).fixClaim?.who;
+
 /**
  * Classify one PR into a merge/skip verdict. Pure — no gh calls. Returns
  *   { num, title, decision: 'merge'|'skip', reason, aiGenerated, certifyLabel, testGreen, state, mergeable }.
@@ -4587,6 +4591,19 @@ async function runCli() {
   const resolvedMergePolicy = resolveDrainMergePolicy({ dryRun: DRY_RUN });
   const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
+  // PR #5195 — the drain's ledger facts (review-exempt, carried-acceptance restamp, drain-hold release) can clear a
+  // head, so they are written per candidate only once an enqueue entry point CONFIRMS its merge or enqueue: the
+  // cascade below and the green-event pre-stage shortcut both call this one recorder. The pass-start `decision` is
+  // not enough: the fresh re-read, merge-queue freshness, branch preparation, the merge lock and the merge itself
+  // can each still refuse it. The ledger is re-read right before the write, never reused from pass start: a
+  // `changes`/`human` row appended mid-cascade must not be followed by a clearing restamp.
+  // Fail-soft: an unreadable ledger writes nothing, and a failed write never changes the landing.
+  const recordLandedLedgerFacts = async (c, headSha) => {
+    if (DRY_RUN) return;
+    const read = await readDrainLedgerSnapshot([c.repo || localSlug]);
+    const facts = recordDrainLedgerFacts({ verdicts: [{ ...c, decision: 'merge', listedHeadSha: headSha }], localSlug, read });
+    if (!facts.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} verdict-ledger drain facts (non-fatal) — ${facts.errors.slice(0, 3).join('; ')}\n`);
+  };
   const resolveListedChecks = (repo, prs) => mapWithConcurrency(prs, resolvedMergePolicy.policy.concurrency.gateReads, (pr) => resolveChecks(repo, pr));
   const fetchFreshPrForRevalidation = async (repo, num) => {
     try {
@@ -4970,16 +4987,13 @@ async function runCli() {
     const fast = blocked ? { fallback: true } : await enqueuePrestage({ cache: prestageCache, repo: localSlug, num: Number(onlyPr), settings: prestageSetting,
       readPr: async () => {
         const { stdout } = await execFileP('gh', ['pr', 'view', String(onlyPr), ...repoFlag(null), '--json',
-          'number,headRefOid,labels,statusCheckRollup,state,isDraft,body,baseRefName'], { encoding: 'utf8' });
+          'number,headRefOid,labels,statusCheckRollup,state,isDraft,body,baseRefName,reviewDecision,mergeable,mergeStateStatus'], { encoding: 'utf8' });
         return attachLiveFixClaim(JSON.parse(stdout), { claimKey: repoKeyForSlug(localSlug), readClaim: readLiveFixClaim });
       },
       withLock: fn => withLandWriteLock(fn, { runUnlockedOnContention: false }),
-      enqueue: (c, sha, entry) => {
-        // A fixer may take its durable claim while this drain waits for the merge-write lock.
-        const live = attachLiveFixClaim({ number: Number(onlyPr) }, { claimKey: repoKeyForSlug(localSlug), readClaim: readLiveFixClaim });
-        if (live.fixClaim?.who) return { fallback: true };
-        return mergeStrategy.enqueue(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments });
-      },
+      fixClaimHeld: () => prestageFixClaimHeld(onlyPr, { claimKey: repoKeyForSlug(localSlug) }),
+      enqueue: (c, sha, entry) => mergeStrategy.enqueue(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }),
+      recordLanded: recordLandedLedgerFacts,
     });
     if (!fast.fallback) {
       const result = { ok: true, prestaged: true, considered: 1, merged: [], failed: [], pendingRebased: [], deferred: [],
@@ -6291,18 +6305,6 @@ async function runCli() {
   }
 
   const merged = [];
-  // PR #5195 — the drain's ledger facts (review-exempt, carried-acceptance restamp, drain-hold release) can clear a
-  // head, so they are written per candidate only once the cascade below CONFIRMS its merge or enqueue. The
-  // pass-start `decision` is not enough: the fresh re-read, merge-queue freshness, branch preparation, the merge
-  // lock and the merge itself can each still refuse it. The ledger is re-read right before the write, never reused
-  // from pass start: a `changes`/`human` row appended mid-cascade must not be followed by a clearing restamp.
-  // Fail-soft: an unreadable ledger writes nothing, and a failed write never changes the landing.
-  const recordLandedLedgerFacts = async (c, headSha) => {
-    if (DRY_RUN) return;
-    const read = await readDrainLedgerSnapshot([c.repo || localSlug]);
-    const facts = recordDrainLedgerFacts({ verdicts: [{ ...c, decision: 'merge', listedHeadSha: headSha }], localSlug, read });
-    if (!facts.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} verdict-ledger drain facts (non-fatal) — ${facts.errors.slice(0, 3).join('; ')}\n`);
-  };
   const failedMerges = [];
   const enqueueOutcomes = [];
   // #2779-incident — the OTHER currently-open PR numbers for a candidate's own repo, at pass-start, EXCLUDING

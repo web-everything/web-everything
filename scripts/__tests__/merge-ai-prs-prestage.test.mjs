@@ -1,13 +1,16 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
-import { canConsumePrestagedAdmission } from '../merge-ai-prs.mjs';
+import { canConsumePrestagedAdmission, prestageFixClaimHeld } from '../merge-ai-prs.mjs';
 import { reserve } from '../readiness/file-locks.mjs';
 import { fixDispatchResource } from '../conveyor/fix-claim-store.mjs';
+import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
+import { createPrestageCache, resolvePrestageSettings, enqueuePrestage } from '../lib/drain-prestage.mjs';
+import { buildLedgerEvent, EVENT_TYPES } from '../lib/verdict-ledger.mjs';
 
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
 const sha = 'a'.repeat(40);
@@ -55,13 +58,13 @@ else if (a[0] === 'show') {
 }
 `;
 
-function world(fn, { slug = 'fixture/prestage' } = {}) {
+async function world(fn, { slug = 'fixture/prestage' } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'prestage-cli-'));
   try {
     const bin = join(dir, 'bin'); mkdirSync(bin);
     mkdirSync(join(dir, 'backlog'));
     for (const [name, body] of [['gh', fakeGh], ['git', fakeGit]]) writeFileSync(join(bin, name), body, { mode: 0o755 });
-    const fixture = join(dir, 'pr.json'), log = join(dir, 'calls.jsonl'), settings = join(dir, 'settings.json'), coord = join(dir, 'coord');
+    const fixture = join(dir, 'pr.json'), log = join(dir, 'calls.jsonl'), settings = join(dir, 'settings.json'), coord = join(dir, 'coord'), ledger = join(dir, 'ledger');
     writeFileSync(settings, JSON.stringify({ mergeDelivery: { strategy: 'github-merge-queue' } }));
     const pr = { number: 42, id: 'PR_NODE', title: 'Update readme', body: 'Update the readme.', state: 'OPEN', isDraft: false,
       headRefOid: sha, headRefName: 'lane/readme', baseRefName: 'main', mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED',
@@ -77,11 +80,12 @@ function world(fn, { slug = 'fixture/prestage' } = {}) {
         env: { ...process.env, PATH:bin+':'+process.env.PATH, PRESTAGE_PR:fixture,PRESTAGE_LOG:log, PRESTAGE_REPO:slug,
           WE_COORDINATION_ROOT:coord, LANE_POOL_ROOT:dir, WE_MERGE_DELIVERY_SETTINGS_FILE:settings,
           WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE:'off',WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE:numbering ? 'on' : 'off',
-          WE_DRAIN_WORKFLOW_EDIT_HUMAN:'off',WE_REVIEW_LEDGER_MODE:'off',WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES:'0' } });
+          WE_DRAIN_WORKFLOW_EDIT_HUMAN:'off',WE_REVIEW_LEDGER_MODE:'off',WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES:'0',
+          WE_VERDICT_LEDGER_DIR:ledger, WE_VERDICT_LEDGER_STORE:'home' } });
       expect(r.status, r.stderr + r.stdout).toBe(0);
       return { report:JSON.parse(r.stdout), calls:readFileSync(log,'utf8').trim().split('\n').filter(Boolean).map(JSON.parse), stderr:r.stderr };
     };
-    fn({pr,run,coord});
+    await fn({pr,run,coord,ledger,slug});
   } finally { rmSync(dir,{recursive:true,force:true}); }
 }
 
@@ -98,6 +102,45 @@ describe('real drain pre-stage path', () => {
     expect(next.report.prestaged).not.toBe(true);
     expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
   }, {slug:'web-everything/web-everything'}));
+  it('a fix claim acquired while waiting for the enqueue lock prevents cached enqueue', () => world(async ({pr,run,coord}) => {
+    expect(run().stderr).toContain('eligible=true');
+    const lockRoot = join(coord, 'fix-dispatch-claims');
+    const enqueue = vi.fn(() => ({ enqueued: true }));
+    const result = await enqueuePrestage({ cache: createPrestageCache({ root: join(coord, 'drain-prestage') }), repo: 'web-everything/web-everything', num: 42,
+      settings: resolvePrestageSettings({ env: {}, tool: {}, platform: {} }), recordLanded: vi.fn(), enqueue,
+      readPr: async () => ({ ...pr, statusCheckRollup: [{name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha}] }),
+      fixClaimHeld: () => prestageFixClaimHeld(42, { claimKey: 'we', readClaim: q => readLiveFixClaim({ ...q, lockRoot }) }),
+      // The initial read saw no claim; the fixer takes it while the drain waits for the merge-write lock.
+      withLock: fn => {
+        const now = Date.now();
+        expect(reserve(lockRoot, fixDispatchResource({repo:'we',pr:42,kind:'fixing'}), 'fixer:fix-42', now, new Date(now).toISOString(),
+          process.pid, 'unknown', 20, {who:'fix-42',ttlMinutes:20}).ok).toBe(true);
+        return { ran: true, result: fn() };
+      } });
+    expect(result).toEqual({ fallback: true });
+    expect(enqueue).not.toHaveBeenCalled();
+  }, {slug:'web-everything/web-everything'}));
+  it('a green-event enqueue releases the open drain hold, like the full cascade', () => world(({pr,run,ledger,slug}) => {
+    expect(run().stderr).toContain('eligible=true');
+    mkdirSync(ledger, { recursive: true });
+    const file = join(ledger, `${slug.replace('/', '-')}.jsonl`);
+    writeFileSync(file, JSON.stringify(buildLedgerEvent({ type: EVENT_TYPES.HOLD, repo: slug, pr: 42, at: new Date().toISOString(),
+      source: 'merge-ai-prs', declaredActor: 'drain', reasonCode: 'ci-red', holdSource: 'drain' })) + '\n');
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    const next = run(true);
+    expect(next.report, next.stderr).toMatchObject({prestaged:true,enqueueOutcomes:[{num:42,outcome:'enqueued'}]});
+    const rows = readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse);
+    expect(rows.filter(r => r.type === EVENT_TYPES.RELEASE)).toEqual([expect.objectContaining({ pr: 42, reasonCode: 'ci-red', holdSource: 'drain' })]);
+  }));
+  it('a native changes-requested review filed after preparation falls back to the full drain', () => world(({pr,run}) => {
+    expect(run().stderr).toContain('eligible=true');
+    Object.assign(pr, { reviewDecision: 'CHANGES_REQUESTED' });
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    const next = run(true);
+    expect(next.stderr).toContain('full fast drain');
+    expect(next.report.prestaged).not.toBe(true);
+    expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
+  }));
   it.each([[], ['checking']])('does not admit an accepted PR without ready-to-merge (%j)', (...labels) => world(({pr,run}) => {
     pr.labels = [{name:'review:accepted'}, ...labels.map(name => ({name}))];
     expect(run().stderr).not.toContain('eligible=true');

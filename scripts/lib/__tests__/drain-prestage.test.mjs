@@ -20,11 +20,14 @@ function fixture(options = {}) {
   cache.put(repo, 42, { headSha: head, labels: labelSignature(pr.labels), body: pr.body, baseRefName: 'main', requiredChecks: ['test'],
     eligible: true, candidate: { num: 42, repo, listedHeadSha: head }, queueAdmission: { allowed: true } });
   const enqueue = vi.fn(() => ({ enqueued: true }));
+  const recordLanded = vi.fn();
   const settings = resolvePrestageSettings({ env: {}, tool: {}, platform: {} });
   const readPr = vi.fn(async () => pr);
-  const run = () => enqueuePrestage({ cache, repo, num: 42, settings, readPr, enqueue, withLock: fn => ({ ran: true, result: fn() }), ...options });
-  return { cache, pr, enqueue, settings, run, readPr, advance: ms => { clock += ms; } };
+  const run = () => enqueuePrestage({ cache, repo, num: 42, settings, readPr, enqueue, recordLanded, fixClaimHeld: () => false,
+    withLock: fn => ({ ran: true, result: fn() }), ...options });
+  return { cache, pr, enqueue, recordLanded, settings, run, readPr, advance: ms => { clock += ms; } };
 }
+const green = f => { f.pr.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: head }; };
 
 describe('CI pre-stage', () => {
   it.each([{hasManifest:true}, {coupleCarrier:{num:43}}])('invalidates older unsafe cache entries (%j)', async candidate => {
@@ -88,12 +91,89 @@ describe('CI pre-stage', () => {
     expect(f.enqueue).not.toHaveBeenCalled();
     expect(f.cache.get(repo, 42, 30)).toBeNull();
   });
-  it('red drops the cache and never enqueues', async () => {
+  // Every non-success GitHub check-run conclusion and failing status-context state, at the enqueue boundary.
+  it.each([
+    ...['FAILURE', 'CANCELLED', 'TIMED_OUT', 'SKIPPED', 'NEUTRAL', 'STALE', 'ACTION_REQUIRED', 'STARTUP_FAILURE']
+      .map(conclusion => ({ name: 'test', status: 'COMPLETED', conclusion, head_sha: head })),
+    ...['FAILURE', 'ERROR'].map(state => ({ context: 'test', state })),
+  ])('red drops the cache and never enqueues (%j)', async row => {
     const f = fixture();
-    f.pr.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' };
+    f.pr.statusCheckRollup[0] = row;
     expect(await f.run()).toMatchObject({ enqueued: false, reason: 'required checks red' });
     expect(f.enqueue).not.toHaveBeenCalled();
+    expect(f.recordLanded).not.toHaveBeenCalled();
     expect(f.cache.get(repo, 42, 30)).toBeNull();
+  });
+  it.each([
+    ...['QUEUED', 'IN_PROGRESS', 'WAITING', 'PENDING', 'REQUESTED'].map(status => ({ name: 'test', status, conclusion: null, head_sha: head })),
+    ...['PENDING', 'EXPECTED'].map(state => ({ context: 'test', state })),
+  ])('pending keeps the cache and never enqueues (%j)', async row => {
+    const f = fixture();
+    f.pr.statusCheckRollup[0] = row;
+    expect(await f.run()).toMatchObject({ enqueued: false, reason: 'required checks pending' });
+    expect(f.enqueue).not.toHaveBeenCalled();
+    expect(f.cache.get(repo, 42, 30)).not.toBeNull();
+  });
+  it('a missing required context never authorizes enqueue', async () => {
+    const f = fixture();
+    f.pr.statusCheckRollup = [{ name: 'lint', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: head }];
+    expect(await f.run()).toEqual({ fallback: true });
+    expect(f.enqueue).not.toHaveBeenCalled();
+  });
+  // The full classifier reads these live fields; none of them moves the cache signature (head, labels, body, base).
+  it.each([
+    ['reviewDecision', 'CHANGES_REQUESTED'], ['reviewDecision', 'REVIEW_REQUIRED'], ['reviewDecision', 'changes_requested'],
+    ['mergeable', 'CONFLICTING'], ['mergeable', 'UNKNOWN'], ['mergeable', undefined],
+    ['mergeStateStatus', 'DIRTY'], ['mergeStateStatus', 'BEHIND'], ['mergeStateStatus', 'UNKNOWN'], ['mergeStateStatus', 'HAS_HOOKS'],
+  ])('a live %s=%s at green time falls back to the full drain', async (field, value) => {
+    const f = fixture();
+    green(f);
+    f.pr[field] = value;
+    expect(await f.run()).toEqual({ fallback: true });
+    expect(f.enqueue).not.toHaveBeenCalled();
+    expect(f.cache.get(repo, 42, 30)).toBeNull();
+  });
+  it.each([['APPROVED', 'CLEAN'], ['', 'BLOCKED'], [null, 'UNSTABLE']])('reviewDecision=%s with merge state %s still enqueues', async (reviewDecision, mergeStateStatus) => {
+    const f = fixture();
+    green(f);
+    Object.assign(f.pr, { reviewDecision, mergeStateStatus });
+    expect(await f.run()).toEqual({ enqueued: true });
+  });
+  it('a fix claim acquired while waiting for the enqueue lock prevents cached enqueue', async () => {
+    let claimed = false;
+    const f = fixture({ fixClaimHeld: () => claimed, withLock: fn => { claimed = true; return { ran: true, result: fn() }; } });
+    green(f);
+    expect(await f.run()).toEqual({ fallback: true });
+    expect(f.enqueue).not.toHaveBeenCalled();
+    expect(f.recordLanded).not.toHaveBeenCalled();
+    expect(f.cache.get(repo, 42, 30)).toBeNull();
+  });
+  it.each(['fixClaimHeld', 'recordLanded'])('refuses the shortcut when %s is not wired', async hook => {
+    const f = fixture({ [hook]: undefined });
+    green(f);
+    expect(await f.run()).toEqual({ fallback: true });
+    expect(f.enqueue).not.toHaveBeenCalled();
+  });
+  it('records the landed ledger facts for the cached candidate after a confirmed enqueue', async () => {
+    const f = fixture();
+    green(f);
+    expect(await f.run()).toEqual({ enqueued: true });
+    expect(f.recordLanded).toHaveBeenCalledTimes(1);
+    expect(f.recordLanded).toHaveBeenCalledWith(expect.objectContaining({ num: 42, repo }), head);
+  });
+  it.each([{ enqueued: false, reason: 'batching' }, { fallback: true }])('records no ledger facts without a confirmed enqueue (%j)', async result => {
+    const f = fixture();
+    green(f);
+    f.enqueue.mockReturnValue(result);
+    await f.run();
+    expect(f.recordLanded).not.toHaveBeenCalled();
+  });
+  it('a failing ledger write never undoes a confirmed enqueue', async () => {
+    const f = fixture();
+    green(f);
+    f.recordLanded.mockRejectedValue(new Error('ledger unreadable'));
+    expect(await f.run()).toEqual({ enqueued: true });
+    expect(f.enqueue).toHaveBeenCalledTimes(1);
   });
   it('rejects a newly failed optional CodeQL check on cached admission', async () => {
     const f = fixture();
