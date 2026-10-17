@@ -43,9 +43,11 @@ export const dispatchAttemptKey = (startedAt) => (typeof startedAt === 'string' 
  * Record one failed build dispatch. `output` is the captured child output (falls back to `reason`). `attemptKey`
  * names the attempt (e.g. the dead claim): a repeat of any key already charged to the card charges nothing, so a step
  * that records before a release it may retry never charges one attempt twice — even when another path (orphan
- * adoption, fail-group) records its own attempt for the same card in between. Late-launch (quick-schedule) attempts are counted apart
- * from real failures: the history is retained across a confirmed launch, and lateness must not spend the card's
- * failure budget (PR #5453).
+ * adoption, fail-group) records its own attempt for the same card in between. It may be a list of ALIASES for one
+ * attempt (the dead claim AND its dispatch row, when that row was readable): if any alias was charged, nothing is
+ * charged and the new aliases join the charged set, so an identity seen only on a later pass still links to the
+ * charge. Late-launch (quick-schedule) attempts are counted apart from real failures: the history is retained across a
+ * confirmed launch, and lateness must not spend the card's failure budget (PR #5453).
  */
 export function recordBuildFailure({ num, reason, output, attemptKey }, { path = buildFailurePath(), now = Date.now(), settings = readBackoffSettings() } = {}) {
   const state = read(path);
@@ -54,7 +56,17 @@ export function recordBuildFailure({ num, reason, output, attemptKey }, { path =
   // Every key charged so far, not only the last: interleaved paths must not erase each other's evidence. A record
   // written before the list existed carries one `attemptKey`.
   const chargedKeys = Array.isArray(prev?.attemptKeys) ? prev.attemptKeys : prev?.attemptKey != null ? [prev.attemptKey] : [];
-  if (attemptKey != null && chargedKeys.includes(String(attemptKey))) return prev;
+  const aliases = [...new Set((Array.isArray(attemptKey) ? attemptKey : [attemptKey]).filter(k => k != null && k !== '').map(String))];
+  const keepKeys = (keys) => [...new Set([...chargedKeys, ...keys])].slice(-ATTEMPT_KEY_CAP);
+  if (aliases.some(k => chargedKeys.includes(k))) {
+    // Already charged: learn the aliases this pass could see, so the other identity of the attempt dedupes too.
+    if (aliases.every(k => chargedKeys.includes(k))) return prev;
+    const linked = { ...prev, attemptKeys: keepKeys(aliases) };
+    delete linked.attemptKey;
+    state.items[key] = linked;
+    save(state, path);
+    return linked;
+  }
   // Redact BEFORE cutting: a cut taken first can slice a credential's recognisable prefix off and leave its tail
   // unredactable. The reason code is read off the raw text — redaction never changes what a code pattern matches.
   const rawText = String(output ?? reason ?? '').trim();
@@ -74,8 +86,7 @@ export function recordBuildFailure({ num, reason, output, attemptKey }, { path =
   const record = {
     num: key, attempts,
     scheduleAttempts: { ...counts, [schedule]: attempts },
-    ...(attemptKey != null || chargedKeys.length
-      ? { attemptKeys: (attemptKey != null ? [...chargedKeys, String(attemptKey)] : chargedKeys).slice(-ATTEMPT_KEY_CAP) } : {}),
+    ...(aliases.length || chargedKeys.length ? { attemptKeys: keepKeys(aliases) } : {}),
     reasonCode,
     reason: redactSpawnText(reason ?? '').slice(0, 400),
     output: text.slice(0, OUTPUT_CAP),

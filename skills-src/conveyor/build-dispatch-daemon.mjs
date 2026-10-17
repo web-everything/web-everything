@@ -696,10 +696,13 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       // Do not immediately launch the failed group's released members again in this same tick.
       for (const c of groupClaims) heldNums.add(normNum(c.meta.num));
       // Keyed by the settled dispatch: the claims are released below and a throw there re-runs this next tick, and
-      // orphan adoption charging the same dispatch shares the key. A row with no start time keys on its run.
-      const attemptKey = dispatchAttemptKey(settled.startedAt) ?? (settled.source ? `group:${settled.source}` : null);
+      // orphan adoption charging the same dispatch shares the key. A row with no start time keys on its run. The lead's
+      // surviving claim is an alias too: orphan adoption keys on it when it could not read the run row.
+      const leadClaimedAt = groupClaims.find(c => c.meta?.groupLead == null && normNum(c.meta?.num) === lead)?.meta?.claimedAt;
+      const attemptKey = [dispatchAttemptKey(settled.startedAt) ?? (settled.source ? `group:${settled.source}` : null),
+        leadClaimedAt ? `orphan:${leadClaimedAt}` : null].filter(Boolean);
       const rec = live ? effects.recordBuildFailure?.({ num: lead, reason: 'group-member-dropped', output: `dropped members: ${settled.groupDropped.join(',')}`,
-        ...(attemptKey ? { attemptKey } : {}) }) : null;
+        ...(attemptKey.length ? { attemptKey } : {}) }) : null;
       groupFailures.push({ num: lead, stage: 'group', reason: 'group-member-dropped', ...(rec ? { reasonCode: rec.reasonCode, attempts: rec.attempts } : {}) });
     }
   }

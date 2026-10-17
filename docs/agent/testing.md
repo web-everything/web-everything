@@ -1333,6 +1333,8 @@ orphan pass keys its failure on the dead claim so a retried release never charge
 keeps every key charged to a card, not only the last: orphan and fail-group records interleave every
 tick while a release throws, and each must still dedupe its own attempt. Both key a dispatch on its run
 row's start time (`dispatch:`), so the two paths charging one dead dispatch in one tick charge it once.
+A run row can be unreadable on one pass and back on the next, so orphan adoption passes the claim
+(`orphan:`) and the row as aliases of one attempt: any charged alias dedupes, and the new aliases join it.
 
 Prepare discovery searches each card's current lane identity, bornAs lane identity and title, then
 unions the complete results. Never use an unfiltered repository PR listing as the launch guard's proof

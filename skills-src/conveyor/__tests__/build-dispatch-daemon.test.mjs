@@ -4102,12 +4102,31 @@ describe('grouped BUILD daemon ticks', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it('fail-group never re-charges a dispatch orphan adoption charged by its claim while the run row was unreadable (PR #5453)', async () => {
+    vi.stubEnv('WE_BUILD_GROUP_MEMBER_FAILURE', 'fail-group');
+    const dir = mkdtempSync(join(tmpdir(), 'group-orphan-claim-alias-'));
+    const path = join(dir, 'failures.json');
+    try {
+      const effects = fixture({ claims: rows.map((r, i) => ({ ...r, ...(i ? { groupLead: '7101' } : {}) })),
+        settled: [{ num: '7101', source: 'run dispatch-lane-7101', startedAt: '2099-01-01T00:00:00Z', outcome: 'pr-opened', groupDropped: ['7102'] }] });
+      const settings = { baseMs: 1000, maxMs: 5000, maxAttempts: 2 };
+      const leadClaimedAt = effects.listClaims().find(c => c.meta.num === '7101').meta.claimedAt;
+      // The orphan pass saw no run row: it could key the dead dispatch on its claim alone.
+      recordBuildFailureAt({ num: '7101', reason: 'build-not-started: orphan-released', attemptKey: [`orphan:${leadClaimedAt}`] }, { path, now: 0, settings });
+      effects.recordBuildFailure = o => recordBuildFailureAt(o, { path, now: 0, settings });
+      effects.releaseClaim = () => { throw new Error('lock store unavailable'); };
+      for (let i = 0; i < 2; i++) await runBuildDispatchTick({ live: true, policy, effects }).catch(() => {});
+      expect(JSON.parse(readFileSync(path, 'utf8')).items['7101']).toMatchObject({ attempts: 1, exhausted: false });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('fail-group keys a settled row with no start time on its run, never on an empty key (PR #5453)', async () => {
     vi.stubEnv('WE_BUILD_GROUP_MEMBER_FAILURE', 'fail-group');
     const effects = fixture({ claims: rows.map((r, i) => ({ ...r, ...(i ? { groupLead: '7101' } : {}) })),
       settled: [{ num: '7101', source: 'run dispatch-lane-7101', startedAt: '', outcome: 'pr-opened', groupDropped: ['7102'] }] });
     await runBuildDispatchTick({ live: true, policy, effects });
-    expect(effects.recordBuildFailure).toHaveBeenCalledWith(expect.objectContaining({ num: '7101', attemptKey: 'group:run dispatch-lane-7101' }));
+    expect(effects.recordBuildFailure).toHaveBeenCalledWith(expect.objectContaining({ num: '7101', attemptKey: expect.arrayContaining(['group:run dispatch-lane-7101']) }));
+    expect(effects.recordBuildFailure.mock.calls[0][0].attemptKey).not.toContain('group:');
   });
 
   it('fail-group keys a settled row with a start time on the shared dispatch key (PR #5453)', async () => {
@@ -4115,7 +4134,7 @@ describe('grouped BUILD daemon ticks', () => {
     const effects = fixture({ claims: rows.map((r, i) => ({ ...r, ...(i ? { groupLead: '7101' } : {}) })),
       settled: [{ num: '7101', source: 'run dispatch-lane-7101', startedAt: '2099-01-01T00:00:00Z', outcome: 'pr-opened', groupDropped: ['7102'] }] });
     await runBuildDispatchTick({ live: true, policy, effects });
-    expect(effects.recordBuildFailure).toHaveBeenCalledWith(expect.objectContaining({ num: '7101', attemptKey: 'dispatch:2099-01-01T00:00:00Z' }));
+    expect(effects.recordBuildFailure).toHaveBeenCalledWith(expect.objectContaining({ num: '7101', attemptKey: expect.arrayContaining(['dispatch:2099-01-01T00:00:00Z']) }));
   });
 
   it('ignores stale drop results from an older lead attempt', async () => {
