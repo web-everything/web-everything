@@ -577,7 +577,7 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('D=${HOME}/clone; cd "${D}" && ls')).toBe(`${HOME}/clone`);
     expect(at('HOME=/other; D="$HOME/clone"; cd "$D" && ls')).toBe('/other/clone');
     expect(at("D='$HOME/clone'; cd \"$D\" && ls")).toBe(REPORTED);
-    expect(at('D=/a; D=$HOME$X; cd "$D" && ls')).toBe(REPORTED);
+    expect(at('D=$HOME$X; cd "$D" && ls')).toBe(REPORTED);
     expect(at('D="$HOME/a b"; cd "$D" && ls')).toBe(REPORTED);
     expect(at('D="$HOME/clone"; cd "$D" && ls', SPACED)).toBe(REPORTED);
   });
@@ -598,6 +598,28 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
       'true | D=~/x; cd "$D" && ls',
     ]) expect(at(cmd), cmd).toBe(REPORTED);
     expect(at('D=~/x && cd "$D" && ls')).toBe(`${HOME}/x`);
+  });
+  it('an assignment the walk cannot use never wipes a value main still resolved (review r8)', () => {
+    // main skips a `$`-valued assignment and keeps the earlier literal; never answer less than that
+    expect(at('D=/clone; [ x ] && D=$HOME/x; cd "$D" && ls')).toBe('/clone');
+    expect(at('D=/clone; true || D="$HOME/x"; cd "$D" && ls')).toBe('/clone');
+    expect(at('D=/clone; D="$HOME/x" | true; cd "$D" && ls')).toBe('/clone');
+    expect(at('D=/clone; D=$HOME$X; cd "$D" && ls')).toBe('/clone');
+    expect(at('D=/clone; D="$HOME/a b"; cd "$D" && ls')).toBe('/clone');
+    // an assignment that surely runs still counts
+    expect(at('D=/clone; D=~/x || true; cd "$D" && ls')).toBe(`${HOME}/x`);
+  });
+  it('a blank or comment-only line after `&&` / `||` / `|` keeps the next assignment conditional (review r8)', () => {
+    for (const cmd of [
+      'true ||  \nHOME=/a; cd ~/clone && ls',
+      'true || \t\nHOME=/a; cd ~/clone && ls',
+      'true || # note\nHOME=/a; cd ~/clone && ls',
+      'true ||\n\n  \nHOME=/a; cd ~/clone && ls',
+      '[ x ] &&  \nD=~/x; cd "$D" && ls',
+      'true |  \nD=~/x; cd "$D" && ls',
+    ]) expect(at(cmd), JSON.stringify(cmd)).toBe(REPORTED);
+    expect(at('true;  \nHOME=/a; cd ~/clone && ls')).toBe('/a/clone');
+    expect(at('# note\nHOME=/a; cd ~/clone && ls')).toBe('/a/clone');
   });
   it('a HOME assignment that is conditional, prefixes a command or is glob-shaped leaves home unknown', () => {
     for (const cmd of [

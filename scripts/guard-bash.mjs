@@ -2517,8 +2517,16 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   const oddSpace = (s) => /[^\S \t\n]/.test(s);
   // A home-derived value is trusted only from a statement that surely runs in THIS shell: nothing but `;` /
   // newline before it, and no pipe or `&` after it (`a && D=~/x`, `D=~/x | true`, `HOME=/a & …` may not).
-  const seps = parsed.separators;
-  const plain = (at) => (at === 0 || /^[;\n]+$/.test(seps[at - 1])) && /^(?:[;\n]*|&&\n*|\|\|\n*)$/.test(seps[at]);
+  // bash lets blank and comment-only lines follow `&&` / `||` / `|`, so the walk back looks through them.
+  const { segments: segs, separators: seps } = parsed;
+  const blank = (seg) => /^[ \t]*(?:#.*)?$/.test(seg);
+  const plain = (at) => {
+    for (let k = at - 1; k >= 0; k--) {
+      if (!/^[;\n]+$/.test(seps[k])) return false;
+      if (!blank(segs[k])) break;
+    }
+    return /^(?:[;\n]*|&&\n*|\|\|\n*)$/.test(seps[at]);
+  };
   // A literal `HOME=…` statement sets the home later spellings expand against (unknown when unexpandable,
   // conditional, followed by a command word — `HOME=/a true` binds it for `true` only — or glob-shaped).
   const usableHome = (h) => (typeof h === 'string' && h.startsWith('/') && !/[*?[]/.test(h) ? h : null);
@@ -2537,25 +2545,31 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   const history = Object.create(null);
   const homeNames = new Set();
   let assignHome = initialHome;
+  const record = (name, at, value) => {
+    if (value === undefined) delete vars[name];
+    else vars[name] = value;
+    (history[name] ??= []).push({ at, value });
+  };
   parsed.segments.forEach((stmt, at) => {
     const m = stmt.trim().match(/^(?:export\s+)?([A-Za-z_]\w*)=(.+)$/);
     if (m) {
       let val = m[2].trim();
-      let value;
       if (val.startsWith('~') || /\$(?:HOME(?!\w)|\{HOME\})/.test(val)) {
         // bash expands an unquoted leading `~` and `$HOME` / `${HOME}` in an assignment value (`D=~/clone`,
         // `D="$HOME/clone"`), against the home known at that statement. Anything it cannot expand exactly
-        // (`~user`, a `:~`, another variable, whitespace, an unknown home, a conditional statement) is unknown.
+        // (`~user`, a `:~`, another variable, whitespace, an unknown home, a conditional statement) is unknown
+        // — except where main skipped the statement (a `$` / backtick / `(` value): then it changes nothing,
+        // so an earlier literal still resolves as it did there (review r8).
         const expanded = oddSpace(stmt) || /\s|:~|[<>]/.test(val) || !plain(at) ? null : expandCdTarget(val, assignHome);
-        value = expanded && !/\s/.test(expanded) ? expanded : undefined;
-        homeNames.add(m[1]);
-        if (value === undefined) delete vars[m[1]];
-        else vars[m[1]] = value;
+        const value = expanded && !/\s/.test(expanded) ? expanded : undefined;
+        if (value !== undefined || !/[`$(]/.test(val)) {
+          homeNames.add(m[1]);
+          record(m[1], at, value);
+        }
       } else if (!/[`$(]/.test(val)) {                        // command-subst / nested expansion → skip
         val = val.replace(/^(['"])(.*)\1$/, '$2');            // strip matching surrounding quotes
-        if (!/\s/.test(val)) vars[m[1]] = value = val;        // single-token literal only
+        if (!/\s/.test(val)) record(m[1], at, val);           // single-token literal only
       }
-      (history[m[1]] ??= []).push({ at, value });
     }
     assignHome = homeAfter(stmt, assignHome, at);
   });
