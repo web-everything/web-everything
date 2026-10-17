@@ -4970,11 +4970,16 @@ async function runCli() {
     const fast = blocked ? { fallback: true } : await enqueuePrestage({ cache: prestageCache, repo: localSlug, num: Number(onlyPr), settings: prestageSetting,
       readPr: async () => {
         const { stdout } = await execFileP('gh', ['pr', 'view', String(onlyPr), ...repoFlag(null), '--json',
-          'headRefOid,labels,statusCheckRollup,state,isDraft,body,baseRefName'], { encoding: 'utf8' });
-        return JSON.parse(stdout);
+          'number,headRefOid,labels,statusCheckRollup,state,isDraft,body,baseRefName'], { encoding: 'utf8' });
+        return attachLiveFixClaim(JSON.parse(stdout), { claimKey: repoKeyForSlug(localSlug), readClaim: readLiveFixClaim });
       },
       withLock: fn => withLandWriteLock(fn, { runUnlockedOnContention: false }),
-      enqueue: (c, sha, entry) => mergeStrategy.enqueue(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }),
+      enqueue: (c, sha, entry) => {
+        // A fixer may take its durable claim while this drain waits for the merge-write lock.
+        const live = attachLiveFixClaim({ number: Number(onlyPr) }, { claimKey: repoKeyForSlug(localSlug), readClaim: readLiveFixClaim });
+        if (live.fixClaim?.who) return { fallback: true };
+        return mergeStrategy.enqueue(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments });
+      },
     });
     if (!fast.fallback) {
       const result = { ok: true, prestaged: true, considered: 1, merged: [], failed: [], pendingRebased: [], deferred: [],

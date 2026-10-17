@@ -67,7 +67,7 @@ export async function enqueuePrestage({ cache, repo, num, settings, readPr, enqu
   }
   let pr;
   try { pr = await readPr(); } catch { return { fallback: true }; }
-  if (!pr || pr.headRefOid !== entry.headSha || pr.state !== 'OPEN' || pr.isDraft
+  if (!pr || pr.headRefOid !== entry.headSha || pr.state !== 'OPEN' || pr.isDraft || pr.fixClaim?.who
       || !pr.labels?.some(l => (typeof l === 'string' ? l : l?.name) === 'ready-to-merge')
       || labelSignature(pr.labels) !== entry.labels || pr.body !== entry.body || pr.baseRefName !== entry.baseRefName) {
     cache.drop(repo, num);

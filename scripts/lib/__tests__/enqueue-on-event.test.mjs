@@ -1553,7 +1553,7 @@ describe('pre-staged green events', () => {
     const readCandidates = vi.fn();
     const prestageCache = { get: () => ({ eligible: true }), drop: vi.fn() };
     const { handle, calls } = setup({ prestageCache, readCandidates,
-      readPr: async () => ({ ...READY_PR, labels: [{ name: 'review:accepted' }],
+      readPr: async () => ({ ...READY_PR, labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }],
         statusCheckRollup: [{ name: 'optional', status: 'IN_PROGRESS' }] }),
       resolveSetting: () => ({ enabled: true, debounceSeconds: 15, catchUp: { enabled: true, intervalMinutes: 10 } }),
     });
@@ -1562,6 +1562,16 @@ describe('pre-staged green events', () => {
     expect(readCandidates).not.toHaveBeenCalled();
     expect(calls).toHaveLength(1);
     expect(calls[0].args).toContain('--from-green-event');
+  });
+  it.each([[], ['checking']])('does not wake a cached PR without ready-to-merge (%j)', async (...labels) => {
+    const prestageCache = { get: () => ({ eligible: true }), drop: vi.fn() };
+    const { handle, calls } = setup({ prestageCache,
+      readPr: async () => ({ ...READY_PR, labels: [{ name: 'review:accepted' }, ...labels.map(name => ({ name }))] }),
+    });
+    handle.notePoll({ ok: true, marked: [mark()] });
+    await handle.tick();
+    expect(calls).toHaveLength(0);
+    expect(handle.pending()).toHaveLength(0);
   });
   it.each(['success', 'skipped', 'neutral', 'cancelled', 'failure', 'timed_out', 'action_required', 'stale', 'startup_failure', null])('keeps the green wake after an unattributed %s event', async conclusion => {
     const prestageCache = { get: () => ({ eligible: true }), drop: vi.fn() };

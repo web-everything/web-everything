@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createPrestageCache, resolvePrestageSettings, prestageCi, labelSignature, enqueuePrestage } from '../drain-prestage.mjs';
-import { classifyPr, buildDrainVerdicts, needsManifestStripBeforeMerge } from '../../merge-ai-prs.mjs';
+import { classifyPr, buildDrainVerdicts, needsManifestStripBeforeMerge, attachLiveFixClaim } from '../../merge-ai-prs.mjs';
 import { aiPr } from '../../__tests__/fixtures/merge-ai-prs-fixtures.mjs';
 
 const roots = [];
@@ -47,6 +47,14 @@ describe('CI pre-stage', () => {
     f.pr.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: head };
     f.enqueue.mockRejectedValue(new Error('enqueue failed'));
     expect(await f.run()).toEqual({ fallback: true });
+    expect(f.cache.get(repo, 42, 30)).toBeNull();
+  });
+  it('drops admission when the async lock propagates an enqueue refusal', async () => {
+    const f = fixture({ withLock: async fn => ({ ran: true, result: await fn() }) });
+    f.pr.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: head };
+    f.enqueue.mockRejectedValue(Object.assign(new Error('required workflows refused'), { code: 'REQUIRED_WORKFLOWS_UNSATISFIED' }));
+    expect(await f.run()).toEqual({ fallback: true });
+    expect(f.enqueue).toHaveBeenCalledTimes(1);
     expect(f.cache.get(repo, 42, 30)).toBeNull();
   });
   it('computes the non-CI verdict while pending, without changing ordinary classification', () => {
@@ -102,6 +110,17 @@ describe('CI pre-stage', () => {
     const f = fixture({ blockOnCodeQL: false });
     f.pr.statusCheckRollup = [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, { name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE' }];
     expect(await f.run()).toEqual({ enqueued: true });
+  });
+  it.each(['held', 'unreadable'])('rejects cached admission when the live fix claim is %s', async variant => {
+    const f = fixture();
+    f.pr.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: head };
+    attachLiveFixClaim(f.pr, { claimKey: 'we', readClaim: () => {
+      if (variant === 'unreadable') throw new Error('claim store unreadable');
+      return { meta: { who: 'fix-42' } };
+    } });
+    expect(await f.run()).toEqual({ fallback: true });
+    expect(f.enqueue).not.toHaveBeenCalled();
+    expect(f.cache.get(repo, 42, 30)).toBeNull();
   });
   it.each([{ labels: [] }, { labels: [{ name: 'checking' }] }])('never consumes cached admission without the release label ($labels)', async ({ labels }) => {
     const f = fixture();

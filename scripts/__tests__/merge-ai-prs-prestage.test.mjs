@@ -6,6 +6,8 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
 import { canConsumePrestagedAdmission } from '../merge-ai-prs.mjs';
+import { reserve } from '../readiness/file-locks.mjs';
+import { fixDispatchResource } from '../conveyor/fix-claim-store.mjs';
 
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
 const sha = 'a'.repeat(40);
@@ -40,7 +42,7 @@ const fakeGit = `#!/usr/bin/env node
 const fs = require('node:fs');
 const a = process.argv.slice(2);
 fs.appendFileSync(process.env.PRESTAGE_LOG, JSON.stringify(['git', ...a]) + '\\n');
-if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:fixture/prestage.git\\n');
+if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:' + process.env.PRESTAGE_REPO + '.git\\n');
 else if (a[0] === 'merge-base' || a[0] === 'rev-parse') process.stdout.write('${sha}\\n');
 else if (a[0] === 'diff') {
   if (a.includes('--name-only')) process.stdout.write('README.md\\0');
@@ -53,7 +55,7 @@ else if (a[0] === 'show') {
 }
 `;
 
-function world(fn) {
+function world(fn, { slug = 'fixture/prestage' } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'prestage-cli-'));
   try {
     const bin = join(dir, 'bin'); mkdirSync(bin);
@@ -72,7 +74,7 @@ function world(fn) {
       const r = spawnSync(process.execPath, [script, '--this-repo','--label=ready-to-merge','--only=42', '--json',
         '--no-drain-lease','--no-red-main-freeze',...(!rebaseDrop ? ['--no-rebase-drop'] : []),'--no-heal-collision','--no-overlap-yield',
         ...(green ? ['--from-green-event'] : [])], { cwd:dir,encoding:'utf8',timeout:30_000,
-        env: { ...process.env, PATH:bin+':'+process.env.PATH, PRESTAGE_PR:fixture,PRESTAGE_LOG:log,
+        env: { ...process.env, PATH:bin+':'+process.env.PATH, PRESTAGE_PR:fixture,PRESTAGE_LOG:log, PRESTAGE_REPO:slug,
           WE_COORDINATION_ROOT:coord, LANE_POOL_ROOT:dir, WE_MERGE_DELIVERY_SETTINGS_FILE:settings,
           WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE:'off',WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE:numbering ? 'on' : 'off',
           WE_DRAIN_WORKFLOW_EDIT_HUMAN:'off',WE_REVIEW_LEDGER_MODE:'off',WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES:'0' } });
@@ -84,6 +86,18 @@ function world(fn) {
 }
 
 describe('real drain pre-stage path', () => {
+  it('a fix claim acquired after preparation prevents cached enqueue', () => world(({pr,run,coord}) => {
+    expect(run().stderr).toContain('eligible=true');
+    const now = Date.now();
+    expect(reserve(join(coord, 'fix-dispatch-claims'), fixDispatchResource({repo:'we',pr:42,kind:'fixing'}),
+      'fixer:fix-42', now, new Date(now).toISOString(), process.pid, 'unknown', 20,
+      {who:'fix-42',ttlMinutes:20}).ok).toBe(true);
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    const next = run(true);
+    expect(next.stderr).toContain('full fast drain');
+    expect(next.report.prestaged).not.toBe(true);
+    expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
+  }, {slug:'web-everything/web-everything'}));
   it.each([[], ['checking']])('does not admit an accepted PR without ready-to-merge (%j)', (...labels) => world(({pr,run}) => {
     pr.labels = [{name:'review:accepted'}, ...labels.map(name => ({name}))];
     expect(run().stderr).not.toContain('eligible=true');

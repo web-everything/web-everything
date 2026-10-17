@@ -620,7 +620,8 @@ export function createEnqueueOnEvent({
       if (held && (!backoffRounds || !signature || signature !== held.signature || catchUpRound > held.untilRound)) backoff.delete(p.num);
       if (pr && (pr.state && pr.state !== 'OPEN' || !pr.labels?.some(l => l?.name === READY_LABEL))) backoff.delete(p.num);
       const stagedGreen = greenEvent(p) && staged(p);
-      const w = stagedGreen && pr?.state === 'OPEN' && !pr.isDraft ? { wake: true } : wakeWorthy(pr);
+      const w = stagedGreen && pr?.state === 'OPEN' && !pr.isDraft
+        && pr.labels?.some(l => l?.name === READY_LABEL) ? { wake: true } : wakeWorthy(pr);
       if (!w.wake) {
         log(`${prefix} ${taken.causes.join(', ')} — not woken: ${w.reason}`);
         ran.push({ ...metadata, num: p.num, code: null, what: `not woken: ${w.reason}`, outcome: 'skipped' });

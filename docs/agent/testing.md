@@ -1542,7 +1542,9 @@ head, label, body/base changes and TTL expiry require the full fast drain. Every
 context needs its own successful row before enqueue; missing, pending, cancelled and red
 contexts never authorize enqueue. A newly failed optional CodeQL check also vetoes admission when
 `drainBlocksOnCodeQL` is enabled. Red-team evidence and the complete comment thread are re-read at enqueue;
-the cache never substitutes for live release-label or red-team authorization. `checking` alone is ineligible.
+the cache never substitutes for live release-label or red-team authorization. `checking` alone is ineligible,
+including at the event wake boundary. Cached admission also reads the live fix claim before admission and
+again inside the locked enqueue callback: a claim acquired while waiting for the lock must still veto enqueue.
 Check-event marks lack required-context identity and head SHA: preserve pending wakes on non-success marks,
 then let the live required-check read drop red preparation. Coupled candidates, manifest-carrying heads and branches requiring preparation
 keep the full cascade. Keep pre-stage tests separate from ordinary classification tests:
@@ -1553,7 +1555,8 @@ Pre-stage regression contracts (PR #5480): every enqueue entry point must cover 
 (including required-workflow, conflict and unreadable-state failures). A shortcut refusal drops its cache
 and falls back without installing backoff that hides the error from ordinary cascade recovery. Keep
 table-driven coverage of every GitHub check conclusion, missing release labels, evidence added after
-preparation, optional CodeQL failures, coupled candidates and branch preparation. The CLI fixture must
+preparation, optional CodeQL failures, coupled candidates and branch preparation. Include claims acquired
+after preparation, unreadable claim readers, and exceptions propagated through an async lock. The CLI fixture must
 assert pending manifest candidates cause no head writes or review writes, including a stale acceptance.
 The provisional `merge` disposition is used only to evaluate gates: collision healing, manifest rebuilding,
 review-label provisioning, clearance carry, baseline/ledger writes, parking and skip comments must suppress
