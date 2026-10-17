@@ -2,11 +2,12 @@
 bornAs: xrkgjr3
 kind: story
 size: 2
-status: active
+status: resolved
 scaffoldedBy: "overlap-yield-held"
 dateScaffolded: "2026-10-17"
 scope: ["we:scripts/conveyor/overlap-yield-enqueueable.mjs", "we:scripts/conveyor/__tests__/overlap-yield-enqueueable.test.mjs", "we:scripts/merge-ai-prs.mjs"]
 dateOpened: "2026-10-17"
+dateResolved: "2026-10-17"
 tags: []
 ---
 
