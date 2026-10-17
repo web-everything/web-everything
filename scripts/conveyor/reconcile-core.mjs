@@ -112,7 +112,7 @@ import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from '.
 import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
 import { planTakeover, notConvergingText, threadMayBeTruncated, openDefects, gateHoldReason } from './takeover-budget.mjs';
 import { takeoverReviewGrant } from './takeover-review.mjs';
-import { mechanicalRoundGrant, isReviewVerdictComment, verdictJudged, reviewedHeadsOf } from './mechanical-round-cap.mjs';
+import { mechanicalRoundGrant, isReviewVerdictComment, verdictJudged, verdictKind, reviewedHeadsOf } from './mechanical-round-cap.mjs';
 import { countConflictFixComments } from './conflict-fix-round-count.mjs';
 
 /** The ladder `planReconcile` uses when its caller supplies none: the platform default, Claude rungs only, no route
@@ -164,7 +164,7 @@ import { CONFLICT_LABEL } from './conflict-label.mjs';
 // advisory-after-cap (web-everything/web-everything#2766 live incident, 2026-09-27) — see the ADVISORY-FIX
 // cap-exhausted branch below for why the "is a fresh review owed on a stale advisory note" check reuses these
 // two, never a second reimplementation of "does the newest advisory comment name this PR's CURRENT head".
-import { ADVISORY_LABELS, latestAdvisory, advisoryCoversHead } from '../lib/advisory-labels.mjs';
+import { ADVISORY_LABELS, ADVISORY_OUTCOMES, latestAdvisory, advisoryCoversHead } from '../lib/advisory-labels.mjs';
 // we:backlog/x5uqim1-*.md (parent #4075, epic #3383) — LIVE INCIDENT 2026-09-25: a `ci-red` PR whose required
 // check failed only because `origin/main`'s own CI was red at that moment must never be handed to `ci-heal`,
 // which would "repair" code that was never broken. `isPrCiFailureOwedRerun` is the PURE leaf that decides this
@@ -1343,9 +1343,11 @@ const isReviewerBinding = b => /^review-/.test(b.agent?.name ?? b.agent?.session
 function timingFacts(pr, { agents = [], repo, requiredChecks = null, reviewDispatched = false } = {}) {
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
   const latest = comments.filter(c => isTrustedMarkerAuthor(c) && verdictJudged(c, pr.headRefOid)).at(-1);
-  const body = String(latest?.body ?? '').trimStart();
-  const findings = latest && (body.startsWith('🔁 review — changes requested')
-    || (body.includes('**Advisory outcome:**') && /Advisory outcome:\*\*\s*`?changes/.test(body))) ? [latest] : [];
+  // Structure only: a bounce verdict, or an advisory note whose own unquoted outcome line says `changes`. Text quoted
+  // inside another verdict (`> **Advisory outcome:** \`changes\``) is never a finding.
+  const kind = latest ? verdictKind(latest) : null;
+  const findings = kind === 'changes' || (kind === 'advisory' && latestAdvisory([latest])?.outcome === ADVISORY_OUTCOMES.CHANGES)
+    ? [latest] : [];
   const reviewers = bindAgents(pr, agents, repo).filter(isReviewerBinding);
   const reviewCanFinish = reviewDispatched || Boolean(assessLiveness(reviewers));
   return fixReadiness({ headSha: pr.headRefOid, checks: pr.statusCheckRollup, findings,

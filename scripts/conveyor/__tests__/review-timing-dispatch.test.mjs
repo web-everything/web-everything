@@ -2,6 +2,8 @@ import { it, expect } from 'vitest';
 import { planReconcile } from '../reconcile-core.mjs';
 import { planFixesFromReconcile, withPlannedContext } from '../reconcile-fix-dispatch.mjs';
 import { REVIEW_PR_CHANNEL } from '../../lib/review-escalation.mjs';
+import { buildVerdictComment } from '../../review-set-label.mjs';
+import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
 const head = 'a'.repeat(40);
 const now = Date.parse('2026-10-16T12:30:00Z');
 const labels = (...names) => names.map(name => ({ name }));
@@ -73,6 +75,21 @@ it('an optional red check never releases a live reviewer, so no duplicate review
     expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'live-process', prNumber: 7 }));
   }
   expect(plan(row, { now: now + 15 * 60_000 }).dispatch.map(d => d.kind)).toEqual(['review']);
+});
+it('quoted advisory text inside a trusted current-head accept is never a review finding, so the CI heal is not held', () => {
+  const quoted = buildVerdictComment({ to: 'accepted', actor: 'juror', headSha: head,
+    body: 'Prior advisory, quoted for context:\n\n> **Advisory outcome:** `changes` — blocking findings on this head' });
+  const accept = { author: { login: 'web-everything' }, createdAt: new Date(now - 60_000).toISOString(), body: quoted };
+  const reviewer = { name: 'review-7', pid: 123, pidAlive: true, state: 'working' };
+  const row = pr({ comments: [accept], statusCheckRollup: [check('test', 'FAILURE')] });
+  const result = plan(row);
+  expect(result.dispatch.map(d => d.kind)).toEqual(['ci-heal']);
+  expect(result.dispatch[0].joinedInputs).toBeUndefined();
+  // Even beside a live reviewer, no joined-fix wait is invented from the quote.
+  expect(plan(row, { agents: [reviewer] }).refusals.some(r => r.kind === 'fix-join-wait' && r.why?.includes('review'))).toBe(false);
+  // The structural, unquoted advisory outcome still counts.
+  const advisory = { ...accept, body: `${ADVISORY_NOTE_MARKER} reason\n\n**Verdict:** ❌ changes — blocking findings\n\nbody\n\n**Advisory outcome:** \`changes\` — blocking findings on this head; \`advisory:changes\` is applied.\n\n---\n\nNet basis: \`${'0'.repeat(40)}..${head}\` — 1 net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.\n\nthe human ceremony` };
+  expect(plan(pr({ comments: [advisory], statusCheckRollup: [check('test', 'FAILURE')] })).dispatch[0]).toMatchObject({ kind: 'fix', joinedInputs: { head } });
 });
 it('a reviewer set aside for a CI heal past the join cap releases only the heal, never a second review', () => {
   const reviewer = { name: 'review-7', pid: 123, pidAlive: true, state: 'working' };

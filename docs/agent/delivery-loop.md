@@ -428,9 +428,9 @@ The independent carry controls still apply: `WE_ACCEPT_CARRY_FORWARD` and
 `scripts/settings/accept-carry-forward.json` govern accept/numbering carry;
 `WE_REVIEW_CARRY_ACROSS_REBASE` and `scripts/settings/review.json`'s
 `carryAcrossRebase` govern rebase carry. Disabling either writer's own control
-prevents it from carrying even when `skipDrainMechanical` is true, and
-`skipDrainMechanical=false` stops the review-hold sweep's numbering carry; it never
-turns a carry on.
+prevents it from carrying even when `skipDrainMechanical` is true. The review-hold
+sweep's numbering carry reads only `resolveAcceptCarryForward()` and logs its value
+and source; `skipDrainMechanical` does not govern it.
 
 `fix.joinCiAndReview` defaults true. When CI failures and head-local review
 findings are both ready, one existing fix worker gets both inputs. When the
