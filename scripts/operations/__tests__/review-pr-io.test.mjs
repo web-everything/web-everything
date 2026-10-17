@@ -346,14 +346,48 @@ describe('the ledger and notice sinks', () => {
     });
   });
 
-  it.each([undefined, null, 'origin/lane/review', 'abc123', 'z'.repeat(40)])('refuses an unpinned reconcile head %s before appending, including on replay', async headSha => {
+  it.each([undefined, null, 'origin/lane/review', 'abc123', 'z'.repeat(40)])('skips an unpinned reconcile head %s loudly before appending, including on replay', async headSha => {
     appendVerdict(buildVerdictRecord({ repo: 'o/n', pr: 7, verdict: 'observed', source: 'first-seen', headSha: HEAD, at: '2026-10-17T12:00:00.000Z' }));
-    const sinks = createReviewPrSinks({ root });
+    const lines = [];
+    const sinks = createReviewPrSinks({ root, out: (l) => lines.push(l) });
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      await expect(sinks[REVIEW_EFFECTS.LEDGER]({ pr: 7, repo: 'o/n', to: 'accepted', headSha }, CTX))
-        .rejects.toThrow(/pinned.*head/);
+      expect(await sinks[REVIEW_EFFECTS.LEDGER]({ pr: 7, repo: 'o/n', to: 'accepted', headSha }, CTX))
+        .toMatchObject({ reconciled: false, skipped: 'unpinned-head' });
     }
+    expect(lines.filter((l) => l.startsWith('ledger-write-skip: o/n#7 no pinned review head'))).toHaveLength(2);
     expect(readVerdictLedger('o/n')).toHaveLength(1);
+  });
+
+  it('a degraded review with no pinned head completes through the real executor instead of failing the ledger effect on every resume', async () => {
+    const lines = [];
+    const real = createReviewPrSinks({ root, out: (l) => lines.push(l) });
+    const applied = [];
+    const sinks = Object.fromEntries(Object.values(REVIEW_EFFECTS).map((t) => [t, async () => { applied.push(t); return { ok: true }; }]));
+    sinks[REVIEW_EFFECTS.LEDGER] = async (payload, ctx) => { applied.push(REVIEW_EFFECTS.LEDGER); return real[REVIEW_EFFECTS.LEDGER](payload, ctx); };
+    const declaration = reviewPrOperation({ codexAdvisory: false, correctnessAdvisory: false, antigravityReview: false,
+      readPr: () => ({ state: 'OPEN', body: 'a PR body',
+        detail: { repo: 'o/n', pr: 7, title: 'degraded read', labels: ['review:pending'], humanRequired: false,
+          reviewClass: 'pending', disposition: { mode: 'converge', autoLand: false }, diffStat: [] },
+        net: { paths: ['x.mjs'], base: 'b'.repeat(40), rev: null, revRef: 'origin/lane/x', scored: true },
+        diff: { text: '--- a/x.mjs\n+++ b/x.mjs\n+change\n', scored: true } }) });
+    const registry = createRegistry();
+    registry.register(declaration);
+    const store = createMemoryRunStore();
+    let run = advanceWhileRunning(startRun({ op: REVIEW_PR_OP, id: 'run-unpinned', input: { repo: 'o/n', pr: 7 }, registry }), { registry });
+    for (let guard = 0; run.pending && guard < 20; guard += 1) {
+      if (run.pending.kind === 'judge') run = advanceWhileRunning(run, { registry, resume: { value: { summary: 'nothing blocking', findings: [] } } });
+      else if (run.pending.kind === 'confirm') run = advanceWhileRunning(run, { registry, resume: { value: 'accept' } });
+      else {
+        ({ run } = await applyPendingEffects(run, { sinks, store }));
+        expect(run.effects.filter((e) => e.status === 'failed')).toEqual([]);
+        run = advanceWhileRunning(run, { registry });
+      }
+    }
+    expect(applied).toContain(REVIEW_EFFECTS.LEDGER);
+    expect(applied.indexOf(REVIEW_EFFECTS.LEDGER_EVENTS)).toBeGreaterThan(applied.indexOf(REVIEW_EFFECTS.LEDGER));
+    expect(run.effects.find((e) => e.type === REVIEW_EFFECTS.LEDGER)).toMatchObject({ status: 'applied', result: { skipped: 'unpinned-head' } });
+    expect(lines.join('\n')).toContain('ledger-write-skip: o/n#7 no pinned review head');
+    expect(existsSync(verdictLedgerPath('o/n'))).toBe(false);
   });
 
   it('reconciles a fresh pinned review after a baseline on an older head and normalizes SHA case on replay', async () => {

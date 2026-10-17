@@ -1562,9 +1562,12 @@ GitHub's live head because delivered events and drain list snapshots may describ
 event waker defaults to a no-op observer; the production wrapper opts into ledger observation explicitly.
 Completed reviews witness their own pinned head even if observation writes are disabled or missed;
 delayed verdicts for superseded heads remain history and do not clear outstanding holds. A later explicit
-live transition can return to an earlier head. Reconciliation requires a full 40-hex reviewed SHA and
-normalizes case before checking for an existing verdict. Missing or unpinned review bases are refused
-before append; a live head must never be substituted for a missing review witness.
+live transition can return to an earlier head. Once a head is witnessed, a headless hold (for example a
+drain park with no readable head) still applies to that head, while a headless clear stays history.
+Reconciliation requires a full 40-hex reviewed SHA and normalizes case before checking for an existing
+verdict. A missing or unpinned review base appends nothing: the reconcile effect prints a loud
+`ledger-write-skip` line and completes, so it is not retried on every resume. A live head must never be
+substituted for a missing review witness.
 Regression coverage includes the four observation-setting combinations, late transition/completion order,
 stale drain snapshots, reconciliation replay, and first-seen/head-moved/carried transport retry races.
 Unreadable ledgers are write misses,

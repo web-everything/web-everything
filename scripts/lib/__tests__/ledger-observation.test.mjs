@@ -42,6 +42,29 @@ describe('open-head ledger observations', () => {
     const replayed = accepted();
     expect(foldVerdictLedger([accepted(), fresh, back, replayed]).get(1).current).toBe(replayed);
   });
+  it('keeps a headless hold after a witnessed head and leaves a headless clear as history', () => {
+    // The drain and pr-land park writers pass `headSha: v.headSha ?? null`; a hold must never vanish for that.
+    const baseline = plan({ events: [], headSha: head })[0];
+    const park = buildVerdictRecord({ repo, pr: 1, verdict: 'human', source: 'merge-ai-prs', at: now });
+    const parked = [baseline, accepted(), park];
+    expect(foldVerdictLedger(parked).get(1)).toMatchObject({ current: park, clears: false, outstandingHolds: [park] });
+    expect(derivePrState(parked, facts)).toMatchObject({ verdict: 'human', clears: false });
+    const moved = plan({ events: [baseline, accepted()] })[0];
+    const changes = buildVerdictRecord({ repo, pr: 1, verdict: 'changes', source: 'merge-ai-prs', at: now });
+    const heldAfterMove = [baseline, accepted(), moved, changes];
+    expect(foldVerdictLedger(heldAfterMove).get(1).current).toBe(changes);
+    // The observer reads the witnessed head, not the headless row's missing one: no repeat move, no rewind.
+    expect(plan({ events: heldAfterMove })).toEqual([]);
+    expect(plan({ events: heldAfterMove, headSha: 'c'.repeat(40) })[0]).toMatchObject({ verdict: 'head-moved', fromHead: next });
+    const headlessAccept = buildVerdictRecord({ repo, pr: 1, verdict: 'accepted', source: 'test', at: now });
+    const afterMove = [baseline, accepted(), moved, headlessAccept];
+    expect(foldVerdictLedger(afterMove).get(1)).toMatchObject({ current: moved, clears: false });
+    expect(derivePrState(afterMove, facts).clears).toBe(false);
+    // A headless hold never moves the witness, so the next live transition from that head still applies.
+    const movedAfterPark = plan({ events: parked })[0];
+    expect(movedAfterPark).toMatchObject({ verdict: 'head-moved', fromHead: head });
+    expect(foldVerdictLedger([...parked, movedAfterPark]).get(1).current).toBe(movedAfterPark);
+  });
   it('does not let a stale transition end approval scope on the current head', () => {
     const human = buildVerdictRecord({ repo, pr: 1, headSha: next, verdict: 'human', source: 'test', at: now });
     const approval = buildLedgerEvent({ repo, pr: 1, at: now, source: 'test', type: 'approval', approval: 'clear-human' });

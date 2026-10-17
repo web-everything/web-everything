@@ -1426,8 +1426,11 @@ export function createReviewPrSinks({
       // builder refuses, so say so as a refusal rather than recording a guessed disposition.
       const verdict = verdictForLabelTarget(payload.to);
       if (!verdict) throw notApplied(`verdict-ledger: unknown label target ${JSON.stringify(payload.to)}`);
+      // An unpinned or degraded read names no head to key the row on. A headless row could not be found again
+      // on replay, and a refusal would fail this effect on every resume. So skip loudly, as LEDGER_EVENTS does.
       if (typeof payload.headSha !== 'string' || !/^[0-9a-f]{40}$/i.test(payload.headSha)) {
-        throw notApplied('verdict-ledger: a pinned 40-hex review head is required');
+        out(`ledger-write-skip: ${payload.repo}#${pr} no pinned review head, so no reconcile row was recorded for this run; the label write is unaffected`);
+        return { reconciled: false, skipped: 'unpinned-head', path: verdictLedgerPath(payload.repo) };
       }
       const headSha = payload.headSha.toLowerCase();
       // This is the reviewed head, possibly from a delayed effect, not a live lifecycle observation.

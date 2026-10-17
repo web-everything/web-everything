@@ -771,7 +771,8 @@ export function ledgerEventId(row) {
 /** Latest witnessed head; late review-run/referral events do not rewind a lifecycle boundary. */
 export function observedLedgerHead(events) {
   const pr = events.at(-1)?.pr;
-  return foldVerdictLedger(events).get(pr)?.current?.coverage?.headSha
+  const { byPr, witnessedHeads } = foldWithWitness(events);
+  return witnessedHeads.get(pr) || byPr.get(pr)?.current?.coverage?.headSha
     || events.filter(e => e.source === 'first-seen').at(-1)?.coverage?.headSha
     || events.filter(e => e.type === EVENT_TYPES.REVIEW_EXEMPT).at(-1)?.headSha
     || events.map(e => e.headSha).filter(Boolean).at(-1);
@@ -864,7 +865,8 @@ export function parseLedgerEvents(text) {
  *   • "a hold is cleared by a later clearing record, never by deleting anything" → the clearing record is
  *     simply a later row, and there is no delete in this format to begin with.
  * A fresh review witnesses its own head even when an observation append missed or was disabled.
- * A delayed verdict for a previously superseded head remains history. An explicit live transition
+ * A delayed verdict for a previously superseded head remains history. Once a head is witnessed, a headless
+ * hold still applies (fail closed) and a headless clear stays history. An explicit live transition
  * can return to a previous head; a review completion alone cannot rewind to it.
  *
  * LATEST-WINS RUNS OVER THE **BEARING** ROWS ONLY (#3329), AND THIS IS WHERE NON-BEARING IS ENFORCED. An
@@ -879,6 +881,11 @@ export function parseLedgerEvents(text) {
  * @returns {Map<number, FoldedPr>} pr → state, in first-seen order.
  */
 export function foldVerdictLedger(records) {
+  return foldWithWitness(records).byPr;
+}
+
+/** The fold plus each PR's witnessed head, which a headless current hold does not carry on its own row. */
+function foldWithWitness(records) {
   /** @type {Map<number, FoldedPr>} */
   const byPr = new Map();
   const witnessedHeads = new Map();
@@ -906,7 +913,9 @@ export function foldVerdictLedger(records) {
       if (witnessed && r.fromHead !== witnessed) continue;
       if (r.fromHead) superseded.add(r.fromHead);
       superseded.delete(head); // a live transition may deliberately return to an earlier head
-    } else if (witnessed && (!head || superseded.has(head))) continue;
+    } else if (witnessed && (head ? superseded.has(head) : r.clears)) continue;
+    // A headless HOLD applies to the witnessed head (the drain's park writers may lack a head). A headless
+    // CLEAR stays history: it cannot say which head it cleared.
     if (head && (verdictBears(r.verdict) || r.source === 'first-seen')) {
       if (witnessed && witnessed !== head) superseded.add(witnessed);
       witnessedHeads.set(r.pr, head);
@@ -924,7 +933,7 @@ export function foldVerdictLedger(records) {
     bearing.forEach((r, i) => { if (r.clears) lastClearAt = i; });
     entry.outstandingHolds = bearing.slice(lastClearAt + 1).filter((r) => !r.clears);
   }
-  return byPr;
+  return { byPr, witnessedHeads };
 }
 
 /**
