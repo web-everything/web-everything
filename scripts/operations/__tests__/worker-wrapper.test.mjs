@@ -61,6 +61,20 @@ describe('runWorker: the job record and the result channels', () => {
     expect(existsSync(file)).toBe(false);
   });
 
+  it('a capture removed before the worker wrote any stderr is never recreated either', async () => {
+    const diagnosticsDir = tmp();
+    const file = join(diagnosticsDir, 'wrapper.stderr');
+    // `launchDetached` creates the capture before the worker starts.
+    writeFileSync(file, '', { mode: 0o600 });
+    const s = spec({ diagnosticsDir, argv: ['-e', `setTimeout(() => { process.stderr.write('late\\n'); process.stdout.write(${JSON.stringify(claudeStdout(DONE))}); }, 600)`] });
+    const run = runWorker(s);
+    // The `started` record is written the moment the child has a pid: the capture is removed after that, before any stderr.
+    for (let i = 0; i < 100 && !read(s); i++) await new Promise((r) => setTimeout(r, 20));
+    rmSync(file);
+    await run;
+    expect(existsSync(file)).toBe(false);
+  });
+
   it('bounds the captured smoke stderr on disk and keeps its newest bytes', async () => {
     const diagnosticsDir = tmp();
     const s = spec({ diagnosticsDir, argv: ['-e', `for (let i = 0; i < 40; i++) process.stderr.write('x'.repeat(64 * 1024) + '\\n'); process.stderr.write('newest line\\n'); process.stdout.write(${JSON.stringify(claudeStdout(DONE))})`] });

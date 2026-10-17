@@ -16,6 +16,7 @@ import {
   buildEntryBootScript, checkDaemonEntriesBoot, DAEMON_BOOT_SMOKE_CHECK, DAEMON_ENTRIES_ENV, DAEMON_ENTRY_MODULES,
   isSafeRelativeEntry, pickSmokeDiagnostics, resolveDaemonEntries, resolveBootSettings, smokeErrorClass, writeStderrTail,
 } from '../daemon-boot-smoke.mjs';
+import { redactDetail } from '../daemon-rebuild/smoke-classify/redact-detail.mjs';
 
 describe('resolveDaemonEntries', () => {
   it('uses the real list when no override is set', () => {
@@ -422,5 +423,63 @@ describe('smoke diagnostics carry an allow-listed summary, never raw child text 
     expect(writeStderrTail('', { dir: sub })).toBeNull();
     writeFileSync(join(dir, 'not-a-dir'), '');
     expect(writeStderrTail('x', { dir: join(dir, 'not-a-dir') })).toBeNull();
+  });
+
+  // V8 copies raw input into a JSON parse message without escaping its quotes, so pairing quotes leaves the text
+  // between them raw (self-review, PR 5460): only one cleanly bounded string may be masked in place.
+  const v8JsonError = (input) => { try { JSON.parse(input); } catch (e) { return String(e); } throw new Error('parsed'); };
+  const ctx = (runChild) => ({ root: '/candidate', budgets: { daemonBootMs: 1000 }, env: { [DAEMON_ENTRIES_ENV]: 'fixture.mjs' }, diagnosticsDir: dir, runChild });
+
+  it('an import failure parsing malformed JSON never carries the copied input in its class', async () => {
+    // V8 copies about 10 chars of the input around the bad token: `…"{"pw": hotel"... is not valid JSON`.
+    const error = v8JsonError('{"pw": hotel, "b": "india"}');
+    const r = await checkDaemonEntriesBoot(ctx(async () => JSON.stringify({ ok: false, error })));
+    expect(error).toContain('hotel');
+    expect(r.entries[0].errorClass).toMatch(/^SyntaxError: [^"']*<…>$/);
+    expect(JSON.stringify(r)).not.toContain('hotel');
+    expect(readFileSync(r.entries[0].stderrFile, 'utf8')).toContain('hotel');
+  });
+
+  it.each(['x"julietcred3x"', "'kilocred4x", 'a", limacred5x, "b'])('unparsable output %s: a fixed class, the output only in the file', async (out) => {
+    const r = await checkDaemonEntriesBoot(ctx(async () => out));
+    expect(r.entries[0]).toMatchObject({ kind: 'unparsable child output', errorClass: 'SyntaxError: unparsable child output' });
+    expect(JSON.stringify(r)).not.toMatch(/julietcred|kilocred|limacred/);
+  });
+
+  it('smokeErrorClass: several quotes, an unclean quote or a quote after the first hide everything from the first', () => {
+    expect(smokeErrorClass('TypeError: a "x", mikecred6x, "y"')).toBe('TypeError: a <…>');
+    expect(smokeErrorClass('TypeError: bad ..."novembercred7x" here')).toBe('TypeError: bad ...<…>');
+    expect(smokeErrorClass('TypeError: bad "x"oscarcred8x')).toBe('TypeError: bad <…>');
+    expect(smokeErrorClass(`TypeError: bad ${String.fromCharCode(0x201c)}x${String.fromCharCode(0x201d)} papacred9x ${String.fromCharCode(0x2019)}`)).toBe('TypeError: bad <…>');
+    expect(smokeErrorClass(v8JsonError('{"pw": quebeccred10x}'))).not.toContain('quebeccred10x');
+  });
+
+  it('smokeErrorClass: a class-shaped line inside a quote opened on an earlier line is never the class', () => {
+    expect(smokeErrorClass('Error: cfg "pw: a\nTypeError: romeocred11x"\n')).toBeNull();
+    expect(smokeErrorClass('Error: cfg "pw: a\nTypeError: sierracred12x"\nRangeError: real one')).toBe('RangeError: real one');
+    // A contraction is not an opening quote.
+    expect(smokeErrorClass("warning: can't load x\nTypeError: y is not a function")).toBe('TypeError: y is not a function');
+  });
+
+  it('a bounded-child timeout still reads as one; its stderr stays in the file', async () => {
+    const r = await checkDaemonEntriesBoot(ctx(async () => {
+      throw Object.assign(new Error('timed out after 1000ms (process group killed)'), { status: null, signal: 'SIGKILL', stderr: 'tangocred13x\n' });
+    }));
+    expect(r.entries[0].kind).toBe('child failed: timed out after 1000ms (process group killed)');
+    expect(r.detail).toContain('child failed: timed out after 1000ms');
+    expect(JSON.stringify(r)).not.toContain('tangocred13x');
+  });
+
+  it('redactDetail keeps a whole boot or dispatch summary (its file path is near the end), other details at 500', () => {
+    const summary = `timeout; ${'x'.repeat(600)}; stderrFile=/state/smoke-diagnostics/a.log`;
+    expect(redactDetail(summary, 'dispatch-smoke')).toBe(summary);
+    expect(redactDetail(summary, 'daemon-entries-boot')).toBe(summary);
+    expect(redactDetail(summary)).toHaveLength(500);
+  });
+
+  it('a bad injected clock never makes the check throw', async () => {
+    const r = await checkDaemonEntriesBoot({ ...ctx(async () => 'not json'), now: () => Number.NaN });
+    expect(r.ok).toBe(false);
+    expect(r.entries[0].startedAt).toBeNull();
   });
 });

@@ -501,9 +501,9 @@ export async function smokeAndAdopt({
     const { result, suspects } = d;
     const definite = DISPATCH_SMOKE_DEFINITE.has(result.reason);
     // Redacted and bounded once here: `why` reaches held state, the overlay list and the overlay event log.
-    const why = redactDetail(`dispatch-smoke-failed: ${result.reason}${result.detail ? ` — ${result.detail}` : ''}`);
+    const why = redactDetail(`dispatch-smoke-failed: ${result.reason}${result.detail ? ` — ${result.detail}` : ''}`, 'dispatch-smoke');
     alert('dispatch-smoke-failed', {
-      reason: result.reason, detail: redactDetail(result.detail ?? ''),
+      reason: result.reason, detail: redactDetail(result.detail ?? '', 'dispatch-smoke'),
       // The allow-listed summary only (typed fields, the error class, the 0600 stderr file's path) — never child text.
       diagnostics: pickSmokeDiagnostics(result.diagnostics),
       attempts: Array.isArray(result.attempts)

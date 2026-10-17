@@ -535,7 +535,8 @@ export async function runRealDispatchSmoke(args) {
     if (!result.launchTimeout || attempt >= retries) {
       if (attempt > 0) {
         result.note = 'retried after launch timeout';
-        result.detail = `${result.detail ?? result.reason}; ${result.note}; attempts=${attempts.map((r) => r.reason).join(',')}`;
+        // The note first: the summary ends with its error class (child text), which must not pose as a later field.
+        result.detail = `${result.note}; attempts=${attempts.map((r) => r.reason).join(',')}; ${result.detail ?? result.reason}`;
         log.error?.(`daemon-load-overlay: dispatch smoke ${result.reason} — ${result.note}`);
       }
       return { ...result, attempts: attempts.map((r) => ({ reason: r.reason, diagnostics: pickSmokeDiagnostics(r.diagnostics) })), ms: attempts.reduce((n, r) => n + r.ms, 0) };
@@ -559,7 +560,7 @@ async function runDispatchSmokeSafely(dispatchSmoke, args) {
     // Anything that is not a verdict object is a failed smoke: `.ok` / `.reason` are read unguarded downstream.
     if (!(r && typeof r === 'object' && typeof r.ok === 'boolean')) return { ok: false, reason: 'smoke-bad-result' };
     // Every rollback, event-log and thrown-error sink reads `detail` (allow-listed at the source); bound it once, here.
-    return r.detail === undefined ? r : { ...r, detail: redactDetail(r.detail) };
+    return r.detail === undefined ? r : { ...r, detail: redactDetail(r.detail, 'dispatch-smoke') };
   } catch (e) {
     // The daemon's own exception (a spawn error), not child output: its first line, bounded.
     return { ok: false, reason: 'smoke-threw', detail: redactDetail(String((e && e.message) || e).split('\n')[0]) };
@@ -674,7 +675,7 @@ export async function runDaemonLoadOverlay({
 
   // ROLLBACK — remove ONLY this overlay, then recover through `rebuildWithout`: main + every other overlay, unchanged.
   const rollBack = async (out, ctl, rebuildWithout) => {
-    const why = redactDetail(`dispatch-smoke-failed: ${ctl.result.reason}${ctl.result.detail ? ` — ${ctl.result.detail}` : ''}`);
+    const why = redactDetail(`dispatch-smoke-failed: ${ctl.result.reason}${ctl.result.detail ? ` — ${ctl.result.detail}` : ''}`, 'dispatch-smoke');
     log.error?.(`daemon-load-overlay: ${ref} FAILED the dispatch smoke (${ctl.phase}): ${why}. Removing it and recovering without it (other overlays untouched). Evidence: ${ctl.result.scratch ?? 'n/a'}${ctl.result.transcript ? `, transcript ${ctl.result.transcript}` : ''}`);
     try { removeOverlayFn(root, ref, { env, why }); } catch (e) {
       // The list could not be changed (e.g. its lock timed out): rebuilding now would just load the overlay again, and

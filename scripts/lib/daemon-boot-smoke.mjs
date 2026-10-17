@@ -80,29 +80,58 @@ const CONTROL_CHARS = /[\p{Cc}\p{Cf}]/gu;
 const QUOTES = new Map([['"', '"'], ["'", "'"], ['`', '`'], ...[[0x201c, 0x201d], [0x2018, 0x2019], [0x201e, 0x201c],
   [0xab, 0xbb], [0xbb, 0xab], [0xff02, 0xff02], [0xff07, 0xff07]].map(([o, c]) => [String.fromCharCode(o), String.fromCharCode(c)])]);
 
-/** Every quoted string (backslash escapes honoured) replaced with `<…>`; an unterminated one runs to the end. */
+const ANY_QUOTE = new Set([...QUOTES.keys(), ...QUOTES.values()]);
+const OPEN_BOUNDARY = /[\s([{<:=,]/u;
+const CLOSE_BOUNDARY = /[\s)\]}>.,;:!?]/u;
+
+/**
+ * Quoted text replaced with `<…>`. Pairing quotes is only trustworthy for ONE cleanly bounded string: V8 copies raw
+ * input into a JSON SyntaxError (`Unexpected token 'h', "{"pw": hunter2}" is not valid JSON`) without escaping its
+ * quotes, so pairing several would leave the text between them raw. So one string opened at a boundary, closed
+ * before one, with no other quote after it, is masked in place; any other shape hides everything from the first quote.
+ */
 function maskQuoted(line) {
-  let out = '';
+  let start = -1;
+  for (let i = 0; i < line.length && start < 0; i++) if (QUOTES.has(line[i])) start = i;
+  if (start < 0) return line;
+  const close = QUOTES.get(line[start]);
+  let j = start + 1;
+  while (j < line.length && line[j] !== close) j += line[j] === '\\' ? 2 : 1;
+  const rest = line.slice(j + 1);
+  const clean = j < line.length && (start === 0 || OPEN_BOUNDARY.test(line[start - 1]))
+    && (rest === '' || CLOSE_BOUNDARY.test(rest[0])) && ![...rest].some((c) => ANY_QUOTE.has(c));
+  return `${line.slice(0, start)}<…>${clean ? rest : ''}`;
+}
+
+/** The closer of a quote still open after `line` (null when none), starting from `open`. An apostrophe between two
+ *  letters (`can't`) is a contraction, not an opening quote. */
+function quoteOpenAfter(line, open) {
   for (let i = 0; i < line.length; i++) {
+    if (open !== null) {
+      if (line[i] === '\\') i++;
+      else if (line[i] === open) open = null;
+      continue;
+    }
     const close = QUOTES.get(line[i]);
-    if (close === undefined) { out += line[i]; continue; }
-    let j = i + 1;
-    while (j < line.length && line[j] !== close) j += line[j] === '\\' ? 2 : 1;
-    out += '<…>';
-    i = j;
+    if (close !== undefined && !(line[i] === "'" && /\p{L}/u.test(line[i - 1] ?? '') && /\p{L}/u.test(line[i + 1] ?? ''))) open = close;
   }
-  return out;
+  return open;
 }
 
 /**
- * The error class of untrusted child output: its first line matching `^[A-Z][A-Za-z]*Error:`, cut to 80 chars, with
- * every quoted string replaced by `<…>` (a quote left open by the line end or the cut hides the rest). Null when no
- * line matches. This is the ONLY child text a smoke summary carries; token shapes in it are redacted too.
+ * The error class of untrusted child output: its first line matching `^[A-Z][A-Za-z]*Error:` that does not sit inside
+ * a quote opened on an earlier line (a multi-line quoted value can hold a class-shaped line), cut to 80 chars, quoted
+ * text masked ({@link maskQuoted}). Null when no line qualifies. This is the ONLY child text a smoke summary carries;
+ * token shapes in it are redacted too.
  */
 export function smokeErrorClass(text) {
   try {
-    const line = String(text ?? '').split(LINE_SPLIT).find((l) => ERROR_CLASS_LINE.test(l));
-    return line === undefined ? null : redactDetail(maskQuoted(line.slice(0, 80)).replace(CONTROL_CHARS, ''));
+    let open = null;
+    for (const line of String(text ?? '').split(LINE_SPLIT)) {
+      if (open === null && ERROR_CLASS_LINE.test(line)) return redactDetail(maskQuoted(line.slice(0, 80)).replace(CONTROL_CHARS, ''));
+      open = quoteOpenAfter(line, open);
+    }
+    return null;
   } catch {
     return null;
   }
@@ -342,7 +371,8 @@ export function buildEntryBootScript(entry) {
  *  reported the same shape as an entry that threw on import, so the caller has one uniform per-entry result.
  *  The result is the allow-listed summary only: raw child output goes to {@link writeStderrTail}'s 0600 file. */
 async function bootOneEntry(entry, { root, timeoutMs, runChild, env, diagnosticsDir, now }) {
-  const startedAt = new Date(now()).toISOString();
+  let startedAt = null;
+  try { startedAt = new Date(now()).toISOString(); } catch { /* a bad injected clock: no start time, never a throw */ }
   const keep = (text) => writeStderrTail(text, { dir: diagnosticsDir, label: `boot-${entry}`, now });
   // The culprit attribution (`daemon-rebuild/smoke.mjs#smokeFailureFiles`) reads these typed paths, not the text.
   const filesIn = (text) => sourceFilesIn(text, root).filter(isRepoFile);
@@ -351,19 +381,20 @@ async function bootOneEntry(entry, { root, timeoutMs, runChild, env, diagnostics
     out = await runChild('node', ['--input-type=module', '-e', buildEntryBootScript(entry)], { cwd: root, timeoutMs, env });
   } catch (e) {
     const stderr = String(e?.stderr ?? '');
-    // The rebuild's own budget wrapper refusing to spawn (never child text): kept verbatim, matched exactly.
-    const budget = BUDGET_REFUSAL.exec(String(e?.message ?? ''));
-    return { entry, ok: false, kind: budget ? `child failed: ${budget[0]}` : 'child failed', startedAt, signal: smokeSignal(e?.signal), exitCode: smokeExitCode(e?.status),
+    // The rebuild's own budget refusal and the bounded child's own kill reasons (never child text): kept verbatim,
+    // matched exactly, so a timeout still reads as one.
+    const own = BUDGET_REFUSAL.exec(String(e?.message ?? '')) ?? BOUNDED_KILL.exec(String(e?.message ?? ''));
+    return { entry, ok: false, kind: own ? `child failed: ${own[0]}` : 'child failed', startedAt, signal: smokeSignal(e?.signal), exitCode: smokeExitCode(e?.status),
       errorClass: smokeErrorClass(stderr) ?? smokeErrorClass(e?.message), files: filesIn(`${stderr}\n${e?.message ?? ''}`),
       stderrFile: keep(stderr || e?.message) };
   }
   let parsed;
   try {
     parsed = JSON.parse(out);
-  } catch (e) {
-    // V8 quotes the unparsable output in its message; the class masks the quote, the output itself goes to the file.
+  } catch {
+    // V8's parse message copies raw output with unescaped quotes, so the class is fixed text; the output goes to the file.
     return { entry, ok: false, kind: 'unparsable child output', startedAt, signal: null, exitCode: null,
-      errorClass: smokeErrorClass(String(e)), stderrFile: keep(out) };
+      errorClass: 'SyntaxError: unparsable child output', stderrFile: keep(out) };
   }
   if (parsed?.ok) return { entry, ok: true, startedAt };
   // The boot script joins its stack lines with ' | '.
@@ -373,6 +404,8 @@ async function bootOneEntry(entry, { root, timeoutMs, runChild, env, diagnostics
 }
 
 const BUDGET_REFUSAL = /^skipped: rebuild smoke budget exhausted \(\d+ms left\)$/;
+/** `bounded-child.mjs#runBounded`'s own timeout / output-cap messages. */
+const BOUNDED_KILL = /^(?:timed out after \d+ms|output exceeded \d+ bytes) \(process group killed\)$/;
 
 /** One failed entry's summary line: typed fields, the local file, and the error class LAST (it is child text, so it
  *  cannot pose as a later field) — never other child text. */

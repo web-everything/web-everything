@@ -14,10 +14,12 @@ Smoke diagnostics never carry raw child stderr or stdout (operator decision, PR 
 dispatch smoke failure detail, held state, self-sync alert and PR comment carry only an
 allow-listed summary (`daemon-boot-smoke.mjs#pickSmokeDiagnostics`): entry name, signal, exit
 code, attempts, launch start time, session/transcript presence, and an error class. The class is
-the first line matching `^[A-Z][A-Za-z]*Error:`, cut to 80 chars, with every quoted string
-(ASCII, typographic, guillemet and fullwidth; an unterminated one runs to the line end) replaced
-by `<…>`, control/format characters dropped and token shapes redacted; a bare `Error:` line has
-none. The raw output's last 30 lines go only to a new owner-only (0600) file under
+the first line matching `^[A-Z][A-Za-z]*Error:` that is not inside a quote opened on an earlier
+line, cut to 80 chars, with its quoted text (ASCII, typographic, guillemet and fullwidth) replaced
+by `<…>`: one cleanly bounded string in place, any other shape (several quotes, an unterminated
+or glued-on one) from the first quote to the end, because V8's JSON parse messages copy input
+with unescaped quotes. Control/format characters are dropped and token shapes redacted; a bare
+`Error:` line has none, and unparsable child output gets a fixed class. The raw output's last 30 lines go only to a new owner-only (0600) file under
 `<daemon state dir>/smoke-diagnostics` (0700, newest 500 kept), and the summary names its path.
 Culprit attribution reads typed repo-relative `files` the boot check extracts from the raw text
 in-process (`sourceFilesIn`), never the text itself.

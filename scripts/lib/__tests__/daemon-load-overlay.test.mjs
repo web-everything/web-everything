@@ -574,7 +574,8 @@ describe('runDaemonLoadOverlay — dispatch smoke wiring, rollback of ONLY this 
       dispatchSmoke: async () => ({ ok: false, reason: 'commands-denied', detail: `${secrets.join(' ')} ${'w'.repeat(20_000)}` }),
     });
     const reason = appendEventFn.mock.calls[0][1].reason;
-    expect(reason.length).toBeLessThanOrEqual(500);
+    // The dispatch detail is an allow-listed summary, bounded at 4,000 so its trailing file path is never cut off.
+    expect(reason.length).toBeLessThanOrEqual(4_000);
     const sinks = [reason, thrown.join('\n'), log.error.mock.calls.map((c) => c.join(' ')).join('\n')];
     for (const s of ['secretAAAA', 'secretBBBB']) for (const sink of sinks) expect(sink).not.toContain(s);
   });
@@ -967,6 +968,8 @@ describe('runRealDispatchSmoke — the smoke worker\'s completion record goes to
     expect(spawn).toHaveBeenCalledTimes(2);
     expect(stopWrapper).toHaveBeenCalledTimes(2);
     expect(r).toMatchObject({ ok: false, reason: 'timeout', diagnostics: { wrapperPid: 12345, wrapperAliveAtTimeout: true, sessionAppeared: false, transcriptAppeared: false, firstOutputMs: 17 } });
+    // The retry note comes first: the summary's last field is the error class (child text), which cannot pose as it.
+    expect(r.detail).toMatch(/^retried after launch timeout; attempts=timeout,timeout; /);
     expect(r.diagnostics.launchStartedAt).toMatch(/^\d{4}-/);
     expect(r.diagnostics).not.toHaveProperty('stderrTail');
     // Each attempt's last 30 stderr lines are in its own 0600 file under the diagnostics dir; the capture is gone.

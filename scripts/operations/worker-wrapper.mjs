@@ -308,6 +308,8 @@ async function runWorkerOnce(spec, io, stop) {
     if (spec.diagnosticsDir) {
       let first = true;
       let stderrBytes = 0;
+      // `launchDetached` creates the capture before the worker starts: a capture already gone at a first chunk was removed.
+      const captureCreated = existsSync(join(spec.diagnosticsDir, 'wrapper.stderr'));
       // Set when compaction cut through a line: the rest of that line is dropped as it arrives, up to its line break.
       let discardStderrLine = false;
       for (const [stream, name] of [[child.stdout, 'worker.stdout'], [child.stderr, 'wrapper.stderr']]) {
@@ -329,7 +331,7 @@ async function runWorkerOnce(spec, io, stop) {
               }
               // Raw worker text: owner-only on disk. The smoke reads its tail into a 0600 file and removes this capture;
               // once removed it stays removed (a later chunk must not recreate it in the scratch dir).
-              if (stderrBytes > 0 && !existsSync(file)) return;
+              if ((stderrBytes > 0 || captureCreated) && !existsSync(file)) return;
               appendFileSync(file, bytes, { mode: 0o600 });
               stderrBytes += bytes.length;
               // Bounded on disk, newest lines kept: past the cap, compact the file to the whole lines in its last 64 KiB.
