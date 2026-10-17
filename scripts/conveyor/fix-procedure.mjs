@@ -51,7 +51,10 @@
  * holder is `who` (`WE_FIX_WHO`) PLUS that token (`WE_FIX_TOKEN`). Two workers passing the same conventional
  * `--who` are therefore still two authors. Anything else is "anyone else" and is refused.
  */
+import { recordFixPush } from './fix-push-state.mjs';
+import { markFixPushAwaitingCi, headCiVerdict, fixPushLabelPlan, readRequiredChecksSafe } from './fix-push-ci.mjs';
 import { execFileSync } from 'node:child_process';
+import { readGit } from '../lib/proc-read.mjs';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { hostname } from 'node:os';
 import { resolve } from 'node:path';
@@ -705,7 +708,7 @@ export async function fixBegin({
 export async function fixEnd({
   repo, pr, who, sessionId = callerIdentity().sessionId, token = callerIdentity().token, gh = ghDefault, labels = null, lockRoot = fixDispatchClaimRoot(),
   readCompletion = readCompletionDefault, readSelfReview = readSelfReviewDefault, clearSelfReview = null,
-  selfRelease = null,
+  selfRelease = null, recordPush = recordFixPush, readRequiredChecks = readRequiredChecksSafe,
 } = {}) {
   const repoKey = repoKeyOf(repo);
   const slug = CONSTELLATION_REPOS[repoKey].slug;
@@ -739,15 +742,58 @@ export async function fixEnd({
   const heldLabel = wasDraft && FIX_DRAFT_LABEL[draftReason] ? FIX_DRAFT_LABEL[draftReason] : FIXING_LABEL;
   const steps = [];
   let headSha = null;
-  try { headSha = JSON.parse(String(await gh(['pr', 'view', String(pr), '--repo', slug, '--json', 'headRefOid']))).headRefOid ?? null; } catch { headSha = null; }
+  let headLabels = [];
+  let rollup = [];
+  try {
+    const view = JSON.parse(String(await gh(['pr', 'view', String(pr), '--repo', slug, '--json', 'headRefOid,labels,statusCheckRollup'])));
+    headSha = view.headRefOid ?? null; headLabels = (view.labels ?? []).map(l => l.name ?? l); rollup = view.statusCheckRollup ?? [];
+  } catch { headSha = null; }
   let infraStall = false;
   try {
     infraStall = isInfraStallCompletion(await readCompletion(who), { sessionId, claimedAt: rel.entry?.meta?.claimedAt ?? null });
   } catch { infraStall = false; }
   const provider = labels ?? await labelProviderDefault();
+  // Raw agent pushes also pass through fix-end. A changed head proves a push since fix-begin;
+  // an unchanged head or infrastructure stand-down must not reset CI state.
+  // CI can finish between that push and fix-end: then this head's required-check verdict stands (fixPushLabelPlan).
+  if (headSha && rel.entry?.meta?.headSha && headSha !== rel.entry.meta.headSha && !infraStall) {
+    try {
+      recordPush({ repo: slug, pr: Number(pr), head: headSha });
+      const verdict = rollup.length ? headCiVerdict(rollup, readRequiredChecks(slug)) : 'pending';
+      const plan = fixPushLabelPlan(headLabels, verdict);
+      if (!plan.handOff) {
+        if (plan.remove.length) provider.setLabels(slug, Number(pr), { remove: plan.remove });
+        steps.push(`ci-${verdict}`);
+      } else {
+        provider.ensureLabel(slug, 'checking', { color: 'fbca04', description: 'Waiting for CI' });
+        provider.ensureLabel(slug, 'status:awaiting-ci', { color: 'fbca04', description: 'Waiting for CI — auto-managed' });
+        provider.setLabels(slug, Number(pr), { add: 'checking', remove: plan.remove.filter(l => l === 'ci:failed') });
+        provider.setLabels(slug, Number(pr), { add: 'status:awaiting-ci', remove: plan.remove.filter(l => l !== 'ci:failed') });
+        steps.push('awaiting-ci');
+      }
+    } catch (e) { steps.push(`awaiting-ci-failed: ${String(e?.message ?? e).split('\n')[0]}`); }
+  }
   try { provider.setLabels(slug, Number(pr), { remove: [heldLabel] }); steps.push('unlabel'); } catch (e) { steps.push(`unlabel-failed: ${String(e?.message ?? e).split('\n')[0]}`); }
   try { provider.postComment(slug, Number(pr), buildFixEndComment({ who, headSha, draft: wasDraft, infraStall })); steps.push('comment'); } catch (e) { steps.push(`comment-failed: ${String(e?.message ?? e).split('\n')[0]}`); }
   return { ok: true, pr: Number(pr), repo: repoKey, who, headSha, draft: wasDraft, reason: draftReason, infraStall, steps };
+}
+
+/**
+ * After `push` succeeded: hand the claimed PR's new head to CI. Best effort — the push already landed and the
+ * drain's CI-lifecycle label pass relabels the head from its own CI read, so a claim/git/gh failure is logged and
+ * reported, never thrown.
+ */
+export function handClaimedPushToCi({ repoKey, branch, src = 'HEAD' }, {
+  listClaims = listLiveFixClaims, revParse = ref => readGit(['rev-parse', ref]).trim(), mark = markFixPushAwaitingCi, log = () => {},
+} = {}) {
+  try {
+    const claim = listClaims({ repo: repoKey }).find(e => e.meta?.branch === branch);
+    if (!claim) return 'no-claim';
+    return mark({ repo: CONSTELLATION_REPOS[repoKey].slug, pr: claim.meta.pr, head: revParse(src) }) ? 'awaiting-ci' : 'skipped';
+  } catch (e) {
+    log(`fix-procedure: push landed; CI hand-off failed (the CI-lifecycle label pass relabels it):${String(e?.message ?? e).split('\n')[0]}`);
+    return 'failed';
+  }
 }
 
 // ── CLI ───────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -809,7 +855,8 @@ if (IS_CLI) {
       if (cmd === 'push-check') out({ ok: true, branch, repo: repoKey });
       const src = typeof flags.src === 'string' ? flags.src : 'HEAD';
       execFileSync('git', ['push', remote, `${src}:refs/heads/${branch}`], { stdio: ['ignore', 'inherit', 'inherit'] });
-      out({ ok: true, pushed: true, branch, repo: repoKey });
+      const awaitingCi = handClaimedPushToCi({ repoKey, branch, src }, { log: line => writeLineSync(2, line) });
+      out({ ok: true, pushed: true, branch, repo: repoKey, awaitingCi });
     }
     fail(USAGE);
   } catch (e) {

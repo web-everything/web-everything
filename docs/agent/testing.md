@@ -1494,6 +1494,32 @@ Run `nightly-coroner-*.test.mjs` under `scripts/conveyor/__tests__/` through hea
 Cover ET boundaries and DST, persisted job adoption/catch-up, source logging, cursor continuity,
 publication deduplication, real isolated extraction, and release without cursor advance on failure.
 
+## Automated repair hand-offs
+
+`review-set-label` and the red-team gate signal the local fix daemon after a successful
+send-back. CI lifecycle/status writers use the same `scripts/lib/fix-handoff.mjs` wake
+path after their existing classification; they do not classify failures a second time.
+The mailbox survives signals during a tick; one-second file polling interrupts the plain
+sleep without consuming native filesystem watchers, and the optional webhook sleep also checks the mailbox. `WE_FIX_HANDOFF_DIR`
+provides an isolated mailbox for tests. A wake only schedules a normal pass; claims,
+scope, host admission and attempt budgets remain authoritative.
+
+The shared policy cascade resolves `fix.sendBackReservedSlots` (standard 1),
+`fix.ciMissingAfterPushMin` (standard 10), and `drain.mergeableUnknownRepollSec`
+(standard 20), independently through platform preferences, declared tool settings and
+`WE_FIX_SEND_BACK_RESERVED_SLOTS`, `WE_FIX_CI_MISSING_AFTER_PUSH_MIN`, and
+`WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC`. The cascade logs the value and source in
+daemons. Ordinary repairs cannot consume reserved slots, even after memory pressure
+reduces the effective cap; a send-back still needs host admission.
+
+The fixer pusher ensures `checking` and `status:awaiting-ci` exist before marking its new
+head with them. Test an initially empty repository label catalog and a same-head retry;
+`gh pr edit --add-label` refuses labels that have not been created. The existing
+`ci-red-recovery-watch` missing-run pass re-requests absent CI after the configured
+age (using a recorded fixer push time when available), retaining its conflict, claim, head and retry-budget guards. The drain re-reads
+UNKNOWN listings before collecting head-bound context and also revalidates before
+merging, waiting for the configured delay at most three times per read stage.
+
 ## Referral re-checks on the live head
 
 `review.recheckCarriedReferrals` and `review.autoPolicyRespectsNotReal` default true in

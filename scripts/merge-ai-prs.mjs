@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
+import { writeLabelWithHandoff } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
 import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, refreshHeldHead, retainApprovedHumanQueueHead } from './lib/approved-human-surface-hold.mjs';
 /**
@@ -1146,15 +1148,16 @@ export function isTransientUnknownMergeability(verdict) {
   return !!verdict && verdict.decision !== 'merge' && /^not mergeable \(mergeable=UNKNOWN\)/.test(String(verdict.reason || ''));
 }
 
-/** Setting: how many extra re-reads a transient UNKNOWN gets, and the wait before each (bounded: ≤ 4 × 3 s). */
-export const UNKNOWN_MERGEABILITY_RETRY = Object.freeze({ retries: 4, delayMs: 3000 });
-/** Env knob: an integer 0–10 overrides `retries` (0 = the old single read). Anything else keeps the default. */
+/** Setting: how many extra re-reads a transient UNKNOWN gets, and the wait before each (bounded: ≤ 3 × 20 s by default). */
+export const UNKNOWN_MERGEABILITY_RETRY = Object.freeze({ retries: 3, delayMs: 20000 });
+/** Env knob: an integer 0–3 overrides `retries` (0 = the old single read). Anything else keeps the default. */
 export const UNKNOWN_MERGEABILITY_RETRY_ENV = 'WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES';
 export function resolveUnknownMergeabilityRetry(env = {}) {
+  const setting = { ...UNKNOWN_MERGEABILITY_RETRY, delayMs: resolveHandoffSettings('drain', { env }).value.mergeableUnknownRepollSec * 1000 };
   const raw = env?.[UNKNOWN_MERGEABILITY_RETRY_ENV];
-  if (typeof raw !== 'string' || !/^\d+$/.test(raw.trim())) return UNKNOWN_MERGEABILITY_RETRY;
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw.trim())) return setting;
   const n = Number(raw.trim());
-  return n <= 10 ? { ...UNKNOWN_MERGEABILITY_RETRY, retries: n } : UNKNOWN_MERGEABILITY_RETRY;
+  return n <= 3 ? { ...setting, retries: n } : setting;
 }
 
 /**
@@ -1165,10 +1168,26 @@ export function resolveUnknownMergeabilityRetry(env = {}) {
 export async function revalidateWithUnknownRetry({ read, opts, setting = UNKNOWN_MERGEABILITY_RETRY, sleep }) {
   let verdict = revalidateForMerge(await read(), opts);
   for (let attempt = 0; attempt < setting.retries && isTransientUnknownMergeability(verdict); attempt += 1) {
-    sleep(setting.delayMs);
+    await sleep(setting.delayMs);
     verdict = revalidateForMerge(await read(), opts);
   }
   return verdict;
+}
+
+/** Refresh UNKNOWN listing facts before reading head-bound manifests/commits or classifying the pass. */
+export async function repollUnknownListings({ prsByRepo, read, sleep, setting = UNKNOWN_MERGEABILITY_RETRY, concurrency = 4 }) {
+  const unknown = pr => String(pr.mergeable ?? '').toUpperCase() === 'UNKNOWN';
+  let pending = [...prsByRepo].flatMap(([repo, prs]) => prs.filter(unknown).map(pr => ({ repo, pr })));
+  for (let attempt = 0; pending.length && attempt < Math.min(3, setting.retries); attempt++) {
+    await sleep(setting.delayMs);
+    const unresolved = await mapWithConcurrency(pending, concurrency, async ({ repo, pr }) => {
+      const fresh = await read(repo, pr.number);
+      if (!fresh || fresh.number !== pr.number) return null;
+      Object.assign(pr, fresh);
+      return unknown(pr) ? { repo, pr } : null;
+    });
+    pending = unresolved.filter(Boolean);
+  }
 }
 
 /**
@@ -4892,7 +4911,7 @@ async function runCli() {
           } else {
             let ok = true;
             for (const rm of plan.toRemove) { try { execFileSync('gh', ['pr', 'edit', String(p.number), ...repoFlag(repo), '--remove-label', rm], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { ok = false; /* best-effort — the next pass retries */ } }
-            for (const add of plan.toAdd) { try { execFileSync('gh', ['pr', 'edit', String(p.number), ...repoFlag(repo), '--add-label', add], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { ok = false; /* a label race/permission miss is non-fatal — the next pass retries */ } }
+            for (const add of plan.toAdd) { try { writeLabelWithHandoff({ repo: repo || localSlug, pr: p.number, label: add, write: () => execFileSync('gh', ['pr', 'edit', String(p.number), ...repoFlag(repo), '--add-label', add], { stdio: ['ignore', 'ignore', 'pipe'] }) }); } catch { ok = false; /* a label race/permission miss is non-fatal — the next pass retries */ } }
             if (ok) { touched = true; if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} ci-lifecycle → "${desired}" (reconcile)\n`); }
           }
         }
@@ -5088,6 +5107,8 @@ async function runCli() {
   // #xc7p3q9 (B3) — when the blind context is NEVER collected (`RECONCILE` false: a bare `/merge` sweep or
   // `--no-reconcile-labels`), it is INCOMPLETE by construction — `contextComplete:false` — so the couple gate
   // fails closed (a coupled impl defers rather than orphan-landing past a carrier the gate cannot see).
+  const prsByRepo = narrowPrsByRepo(listings, { onlyPr, onlyRepo, repos: REPOS, isLocalRepo });
+  await repollUnknownListings({ prsByRepo, read: fetchFreshPrForRevalidation, setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) });
   const openPrContext = RECONCILE ? await __t.timeAsync('listing', () => __t.timeAsync('listing.context', () => collectContext(liveListingsByRepo))) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false });
   // #xc7p3q9 (R2) — the operator escape hatch symmetric to `--no-review-escalation`: `--assume-complete-context`
   // FORCES the context complete so a genuinely-stuck couple (e.g. a persistent read-noise fail-closed) can land
@@ -5103,7 +5124,6 @@ async function runCli() {
   // the cross-repo ordering context below.
   // #xc7p3q9 (Fix 4) — the REAL `--only`/`--repos` narrowing is now `narrowPrsByRepo` (shared with the
   // test suite so tests drive the same wiring runCli does).
-  const prsByRepo = narrowPrsByRepo(listings, { onlyPr, onlyRepo, repos: REPOS, isLocalRepo });
   // #2417 — fan out the per-PR commits + manifest reads across EVERY candidate PR at once (bounded pool),
   // cached across `--watch` passes on unchanged head SHA + body — was one serial `gh pr view --json commits` + one
   // serial manifest probe per PR, one repo at a time (~2×N serial `gh` round-trips a pass). The merge cascade
