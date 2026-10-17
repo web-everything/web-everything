@@ -511,6 +511,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const preparePolicy = effects.preparePolicy?.() ?? readPreparePolicy();
   let out = await effects.planTick(tickBookkeeping, { config: planConfigFrom(policy) });
   const planningSkips = [];
+  // The refusal record a planning skip persists (`prepareRefusals`), exactly as the launch guard would write it.
+  const planningSkipDetail = new Map();
   // Inspect actual picks, then refill skipped slots. Never scan the entire held backlog: each card costs up to
   // three synchronous listings from the same 128-call budget the final launch guard needs. Eight observations
   // bound this lookahead (including selected group members below) to 24 calls; picks beyond that window still
@@ -528,8 +530,14 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         now: effects.now?.() ?? Date.now(), mergedGuardHours: preparePolicy.mergedGuardHours });
       if (!merged) return;
       const reason = `skipped in planning: prepared ${merged.minutesAgo} min ago (#${merged.pr.number})`;
-      planningSkips.push({ num, reason });
-      console.error(`build-dispatch-daemon: prepare #${num} ${reason}`);
+      // Read the scope-drift hold from the plan that offered this card: a replan with it held may drop the hold.
+      const scopeHold = (out?.decisions?.admission?.held ?? []).find(h => normNum(h.num) === num
+        && h.reason === 'prepare-stale' && h.detail?.startsWith('scope changed since '));
+      const note = scopeHold ? `scope moved after prepare: ${scopeHold.detail}; build step must reconcile scope` : null;
+      planningSkips.push({ num, reason, ...(note ? { note } : {}) });
+      planningSkipDetail.set(num, { reason: `merged prepare PR #${merged.pr.number} (within ${preparePolicy.mergedGuardHours}h guard)`,
+        pr: merged.pr.number, head: merged.pr.headRefName ?? null, ...(note ? { note } : {}), ...(bornAs ? { bornAs } : {}) });
+      console.error(`build-dispatch-daemon: prepare #${num} ${reason}${note ? ` · ${note}` : ''}`);
     } catch { /* The launch guard still fails closed on an unreadable listing. */ }
   };
   while (typeof effects.listPreparePrs === 'function' && inspectedPrepares.size < 8) {
@@ -1470,11 +1478,14 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       groupDropped: [...groupDropped].slice(-200),
       itemPrepareAttempts,
       prepareRefusals: [
-        ...freshRefusals.filter(r => ![...prepare.refused, ...prepare.launched].some(x => normNum(x.num) === normNum(r.num))
+        ...freshRefusals.filter(r => ![...prepare.refused, ...prepare.launched, ...planningSkips].some(x => normNum(x.num) === normNum(r.num))
           && !finishedPrepares.has(normNum(r.num)))
           .map(r => probedRefusals.has(normNum(r.num)) ? { ...r, probed: true } : r),
         ...prepare.refused.map(r => ({ num: r.num, reason: r.reason, at: new Date(tickNowMs).toISOString(),
           ...refusalDetail.get(normNum(r.num)) })),
+        // A planning skip is a merged-prepare refusal decided earlier: persist it (and its scope note) the same way.
+        ...planningSkips.filter(r => !finishedPrepares.has(r.num))
+          .map(r => ({ num: r.num, at: new Date(tickNowMs).toISOString(), ...planningSkipDetail.get(r.num) })),
       ].slice(-200),
       prepareRecoveryPins: [...recoveryPins.values()].filter(p => !completedPrepares.has(normNum(p.num))).slice(-200),
       prepareGuards: (out?.nextState?.prepareGuards ?? []).filter((g) => !finishedPrepares.has(normNum(g.num))),

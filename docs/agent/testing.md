@@ -895,7 +895,9 @@ under `prepare.mergedGuardHours` (default 24; 0 disables only the merged refusal
 without surviving dispatch history. Probe the time boundary with an injected clock, including a PR
 created over 24 hours ago but merged 21 minutes ago. Scope drift on a recently merged prepare
 records a "scope moved after prepare" note for the build step in the refusal and its persisted
-bookkeeping; it must never dispatch another prepare within the window.
+bookkeeping; it must never dispatch another prepare within the window. A card the planning pre-scan
+skips for that merge carries the same note and persists the same `prepareRefusals` record as a
+launch refusal; assert both on the planning tick, not only on a merge that appears after planning.
 A needs-you park in the newest ledger record refuses the launch while it is `held` and not `completed`.
 Any one of three things clears it: a stamp on main (it completes the record, so a hand stamp resolves
 the park), explicit `releasedAt`/`releasedBy` metadata, or a reviewed release of that exact attempt in

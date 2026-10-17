@@ -4,6 +4,7 @@ import {
   prDeliversNum, normalizeOpenPrs, planBuildDispatch, reportOpenItems,
   prepareAheadNums, daysBetween, stampCoversClaim, collectBuildHolds,
 } from '../build-dispatch-policy.mjs';
+import { formatOpenPrCap } from '../../lib/open-pr-cap-scope.mjs';
 
 const BUILD_DISPATCH_POLICY = { ...DEFAULT_POLICY, maxOpenPrsCounts: 'all' };
 
@@ -599,5 +600,11 @@ describe('builder PR cap ownership', () => {
     expect(result.freeze.frozen).toBe(frozen);
     expect(result.openPrCap).toMatchObject({ total: 16, counted: count });
     expect(result.dispatch).toHaveLength(frozen ? 0 : 1);
+    // The cap message accounts for every open PR: the builder filter's exclusions are named, not silently lost.
+    const c = result.openPrCap;
+    expect(c.counted + c.cardOnly + c.accepted + (c.nonBuilder ?? 0)).toBe(c.total);
+    if (mode === 'builder') {
+      expect(formatOpenPrCap(c)).toBe('3 of 16 open PRs counted (not counted: 13 non-builder, 0 card-only, 0 review:accepted) — counted: #1 #2 #3');
+    }
   });
 });

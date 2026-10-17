@@ -77,6 +77,11 @@ describe('open PR cap scope', () => {
   it('omits the counted list when no PRs are counted', () => {
     expect(formatOpenPrCap(countOpenPrsForCap([]))).toBe('0 of 0 open PRs counted (not counted: 0 card-only, 0 review:accepted)');
   });
+  it('names PRs the builder filter excluded from the total', () => {
+    const c = { ...countOpenPrsForCap([pr(1, ['src/a.js'])]), total: 4, nonBuilder: 3 };
+    expect(formatOpenPrCap(c)).toBe('1 of 4 open PRs counted (not counted: 3 non-builder, 0 card-only, 0 review:accepted) — counted: #1');
+    expect(formatOpenPrCap({ ...c, total: 1, nonBuilder: 0 })).toBe('1 of 1 open PRs counted (not counted: 0 card-only, 0 review:accepted) — counted: #1');
+  });
 });
 
 describe('builder cap policy', () => {

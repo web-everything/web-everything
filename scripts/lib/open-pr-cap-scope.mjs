@@ -62,7 +62,7 @@ export function countOpenPrsForCap(openPrs, scope = OPEN_PR_CAP_SCOPE_DEFAULTS) 
 }
 
 export function formatOpenPrCap(c) {
-  const excluded = [];
+  const excluded = c.nonBuilder > 0 ? [`${c.nonBuilder} non-builder`] : [];
   const included = [];
   for (const [flag, count, label] of [['excludeCardOnly', 'cardOnly', 'card-only'], ['excludeAccepted', 'accepted', ACCEPTED_LABEL]]) {
     if (c[flag]) excluded.push(`${c[count]} ${label}`);

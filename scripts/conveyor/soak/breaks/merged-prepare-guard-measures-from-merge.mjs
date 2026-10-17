@@ -52,7 +52,8 @@ export default {
     };
     const planned = await runBuildDispatchTick({ live: true, effects });
     const planning = { claimed: [...claimed], dispatchCount: dispatched.length,
-      launched: planned.prepare.launched, skipped: planned.prepare.skippedInPlanning };
+      launched: planned.prepare.launched, skipped: planned.prepare.skippedInPlanning,
+      refusals: planned.nextBookkeeping.prepareRefusals };
     hideMergeDuringPlanning = true;
     const tick = await runBuildDispatchTick({ live: true, effects });
     // A large held backlog must not consume the reader's budget before the actual late-ordered pick.
@@ -87,6 +88,12 @@ export default {
     if (!report.planning.skipped.some(row => row.num === '5966'
       && row.reason === 'skipped in planning: prepared 20 min ago (#5399)')) {
       problems.push('missing planning skip measured from #5399 merge time');
+    }
+    // The planning skip must not drop the build step's reconciliation signal the launch guard used to write.
+    const planningNote = 'scope moved after prepare: scope changed since ';
+    if (!report.planning.skipped.some(row => row.num === '5966' && row.note?.includes(planningNote))
+      || !report.planning.refusals.some(row => row.num === '5966' && row.pr === 5399 && row.note?.includes(planningNote))) {
+      problems.push('planning skip dropped the scope-moved note or its persisted refusal record');
     }
     if (report.claimed.length || report.dispatchCount || report.launched.length) {
       problems.push('recently merged #5399 allowed a duplicate prepare claim/launch (#5438 shape)');

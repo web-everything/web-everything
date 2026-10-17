@@ -201,7 +201,7 @@ function executorClass(executor) {
  *   default) keeps the OLD, unfiltered union — every existing caller/test that predates this card sees no
  *   change; the real daemon always passes its own set.
  * @returns {{freeze:{frozen:boolean, reasons:string[]}, slots:number, dispatch:Array<object>, hold:Array<object>,
- *   openPrCap:{total:number, counted:number, cardOnly:number, accepted:number, countedPrs:string[], cardOnlyPrs:string[], acceptedPrs:string[], cap:number},
+ *   openPrCap:{total:number, counted:number, cardOnly:number, accepted:number, nonBuilder?:number, countedPrs:string[], cardOnlyPrs:string[], acceptedPrs:string[], cap:number},
  *   openItems:{count:number, cap:number, nums:string[]}}} `openItems` is the PRE-TICK union
  *   (`{inFlight} ∪ {delivered-by-open-PR ∩ dispatchedByBuilder}`), #4353/xovjhwh — the value the `wip-cap` rule
  *   below checks and decrements.
@@ -224,6 +224,8 @@ export function planBuildDispatch({
   const capPrs = policy.maxOpenPrsCounts === 'all' ? openPrs : openPrs.filter(isBuilderPr);
   const openPrCap = countOpenPrsForCap(capPrs, policy.openPrCapScope ?? OPEN_PR_CAP_SCOPE_DEFAULTS);
   openPrCap.total = openPrs.length;
+  // Name the builder filter's exclusions, so the cap message accounts for every open PR in `total`.
+  if (policy.maxOpenPrsCounts !== 'all') openPrCap.nonBuilder = openPrs.length - capPrs.length;
   if (openPrCap.counted > policy.maxOpenPrs) { freezeReasons.push(`${formatOpenPrCap(openPrCap)} > maxOpenPrs ${policy.maxOpenPrs}`); freezeKinds.add('open-prs'); }
   // GLOBAL freeze set — `blocked:daemon-bug` only (#3383 continuation, live incident 2026-09-28). A per-PR
   // `*-stalled` label never reaches this set any more; it is still an ordinary open PR below, so the

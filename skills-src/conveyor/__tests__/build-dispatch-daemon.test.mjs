@@ -2204,9 +2204,13 @@ describe('automatic item preparation', () => {
       if (launches) {
         expect(tick.prepare.refused).toEqual([]);
       } else {
+        // The planning skip carries the same reconciliation note and persisted refusal the launch guard writes.
+        const note = `scope moved after prepare: ${detail}; build step must reconcile scope`;
         expect(tick.prepare.refused).toEqual([]);
-        expect(tick.prepare.skippedInPlanning).toEqual([{ num: '5966', reason: expect.stringContaining('(#5399)') }]);
-        expect(log).toHaveBeenCalledWith(expect.stringContaining('skipped in planning: prepared'));
+        expect(tick.prepare.skippedInPlanning).toEqual([{ num: '5966', reason: expect.stringContaining('(#5399)'), note }]);
+        expect(tick.nextBookkeeping.prepareRefusals).toEqual([expect.objectContaining({ num: '5966', pr: 5399,
+          reason: 'merged prepare PR #5399 (within 24h guard)', note })]);
+        expect(log).toHaveBeenCalledWith(expect.stringContaining(note));
       }
     } finally { log.mockRestore(); }
   });
@@ -4136,7 +4140,11 @@ describe('grouped PREPARE daemon ticks', () => {
       expect(effects.acquirePrepareClaim.mock.calls.map(([a]) => a.num)).not.toContain('7203');
       expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({ num: '7201', groupMembers: ['7202', '7204', '7205'] }));
       expect(tick.prepare.refused).toEqual(_name === 'merged prepare PR' ? [] : [{ num: '7203', reason }]);
-      expect(tick.nextBookkeeping.prepareRefusals.map(r => r.num)).toEqual(_name === 'merged prepare PR' ? [] : ['7203']);
+      // A planning skip persists its merged-prepare refusal like a launch refusal does.
+      expect(tick.nextBookkeeping.prepareRefusals.map(r => r.num)).toEqual(['7203']);
+      if (_name === 'merged prepare PR') {
+        expect(tick.nextBookkeeping.prepareRefusals[0]).toMatchObject({ pr: 94, head: 'lane/7203e-prepare-x', reason });
+      }
       if (_name === 'merged prepare PR') expect(tick.prepare.skippedInPlanning).toEqual([{ num: '7203', reason: 'skipped in planning: prepared 60 min ago (#94)' }]);
     } finally { log.mockRestore(); }
   });
