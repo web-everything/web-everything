@@ -310,8 +310,13 @@ export function createResourceFixThrottle({
     tryAdmit(kind = 'fix', { sendBack = false } = {}) {
       if (live === null) { try { live = countLiveFixSessions(listClaims(), { alive }); } catch { live = 0; } }
       const c = currentCap();
-      const limit = sendBack ? c.effective : Math.max(0, c.effective - sendBackReservedSlots);
-      if (!sendBack && live >= limit && live < c.effective) return { admit: false, kind: 'send-back-reserved', why: `${sendBackReservedSlots} slot(s) reserved for send-backs inside cap ${c.effective}` };
+      // The reserve never takes the last slot: a cap of 1 still runs ordinary repairs. Its refusal IS a fixer-cap
+      // refusal (`kind: 'fix-cap'`), so every reader of that kind — the red-main past-the-cap bypass, the builder-slot
+      // borrow, the ci-heal reserve, the main-CI-red owner priority — treats a reserved slot like a full cap.
+      const reserved = Math.min(sendBackReservedSlots, Math.max(0, c.effective - 1));
+      if (!sendBack && live >= c.effective - reserved && live < c.effective) {
+        return { admit: false, kind: 'fix-cap', reserved: 'send-back', why: `${live} live fix/ci-heal session(s) >= ${c.effective - reserved} ordinary slot(s): ${reserved} of cap ${c.effective} reserved for send-backs; ${kind} deferred, no claim taken` };
+      }
       if (live >= c.effective) {
         return { admit: false, kind: 'fix-cap', why: `${live} live fix/ci-heal session(s) >= cap ${c.effective} (dynamic fixer cap: floor ${c.floor}, ceiling ${c.ceiling}; ${c.reason}); ${kind} deferred, no claim taken` };
       }

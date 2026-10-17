@@ -1040,7 +1040,7 @@ let lastFixQueueLength = null;
 export function fixQueueLengthOf(...results) {
   const waiting = new Set();
   for (const r of results) for (const x of (r?.refusals ?? [])) {
-    if (x?.kind === 'fix-cap' || x?.kind === 'send-back-reserved' || x?.kind === 'host-load') waiting.add(`${x.repo ?? ''}#${x.pr ?? x.prNumber}`);
+    if (x?.kind === 'fix-cap' || x?.kind === 'host-load') waiting.add(`${x.repo ?? ''}#${x.pr ?? x.prNumber}`);
   }
   return waiting.size;
 }
@@ -1101,11 +1101,12 @@ export function formatPassTiming(result) {
 /** Build the real effects for {@link runDaemonLoop}: a real tick of {@link runTickAllRepos} (`fix` +
  *  `ci-heal`, #xngv3vn), a real interval sleep, and a real keyed lease heartbeat. Kept as its own factory
  *  (mirroring `buildCliTickEffects` in runner.mjs) so `main()` stays a thin wire-up. */
-export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS, log = console } = {}) {
+export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS, log = console, handoffDir } = {}) {
   return {
     intervalMs,
     tickOnce: () => runTickAllRepos({ tagDispatchStatus: defaultTagDispatchStatus }),
-    sleep: createFixHandoffSleep(),
+    // A send-back or CI-red label write signals the hand-off mailbox; this sleep wakes on it instead of the interval.
+    sleep: createFixHandoffSleep(handoffDir ? { dir: handoffDir } : {}),
     heartbeat: () => heartbeatRunnerLease(RUNNER_LOCK_ROOT, owner, { key: RECONCILE_FIX_DISPATCH_LEASE_KEY }),
     onTick: (result) => {
       const {
@@ -1262,9 +1263,14 @@ async function main() {
   const { stoppedReason } = await runDaemonLoop(
     withPrEvents(withSelfSync(withGithubAppAuth(withFixDispatchClaimRefresh(buildCliDaemonEffects({ owner })), FIX_DISPATCH_APP_AUTH_OPTS), {
       root: selfRoot, onRestart: exits.restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
-    }), { role: 'fix', repos: FIX_DISPATCH_DAEMON_REPOS, localWake: createFixHandoffProbe() }),
+    }), fixDaemonPrEventsOptions()),
   );
   exits.loopEnded(stoppedReason);
+}
+
+/** The fix daemon's pr-events options: with webhook waking on, a local hand-off still wakes it first. */
+export function fixDaemonPrEventsOptions({ handoffDir } = {}) {
+  return { role: 'fix', repos: FIX_DISPATCH_DAEMON_REPOS, localWake: createFixHandoffProbe(handoffDir ? { dir: handoffDir } : {}) };
 }
 
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));

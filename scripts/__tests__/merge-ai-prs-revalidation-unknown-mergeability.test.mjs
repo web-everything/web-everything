@@ -135,3 +135,52 @@ it('bounds unresolved listings to three re-polls', async () => {
     read: async () => { reads++; return pr({ mergeable: 'UNKNOWN' }); }, sleep: async () => {} });
   expect(reads).toBe(3);
 });
+
+describe('drain.mergeableUnknownRepollSec — each cascade layer moves the re-poll wait', () => {
+  const none = { tool: {}, platform: {} };
+  it('standard: exactly 20 s', () => {
+    expect(resolveUnknownMergeabilityRetry({}, none).delayMs).toBe(20_000);
+  });
+  it('platform, then tool, then env (WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC) each win over the layer below', () => {
+    expect(resolveUnknownMergeabilityRetry({}, { tool: {}, platform: { mergeableUnknownRepollSec: 11 } }).delayMs).toBe(11_000);
+    expect(resolveUnknownMergeabilityRetry({}, { tool: { mergeableUnknownRepollSec: 9 }, platform: { mergeableUnknownRepollSec: 11 } }).delayMs).toBe(9_000);
+    expect(resolveUnknownMergeabilityRetry({ WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC: '7' }, { tool: { mergeableUnknownRepollSec: 9 }, platform: {} }).delayMs).toBe(7_000);
+  });
+  it('an out-of-range value falls back to the layer below', () => {
+    expect(resolveUnknownMergeabilityRetry({ WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC: '99999' }, none).delayMs).toBe(20_000);
+  });
+});
+
+describe('runCli wiring', () => {
+  it('re-polls UNKNOWN listings before the head-bound open-PR context is collected', async () => {
+    const { repollThenCollectContext } = await import('../merge-ai-prs.mjs');
+    const order = [];
+    const ctx = await repollThenCollectContext({
+      repoll: async () => { await Promise.resolve(); order.push('repoll'); },
+      collect: async () => { order.push('collect'); return { contextComplete: true }; },
+    });
+    expect(order).toEqual(['repoll', 'collect']);
+    expect(ctx).toEqual({ contextComplete: true });
+  });
+  it('a ci-lifecycle ci:failed add wakes the fix daemon after its write; a failed write wakes nothing', async () => {
+    const { applyCiLifecycleLabelPlan } = await import('../merge-ai-prs.mjs');
+    const calls = [];
+    const exec = (_cmd, args) => { calls.push(args.slice(-2)); if (args.includes('broken')) throw new Error('HTTP 422'); return ''; };
+    const signal = e => calls.push(['signal', e.label, e.repo, e.pr]);
+    expect(applyCiLifecycleLabelPlan({ plan: { toRemove: ['checking'], toAdd: ['ci:failed'] }, pr: 7, repo: null, slug: 'o/r', exec, signal })).toBe(true);
+    expect(calls).toEqual([['--remove-label', 'checking'], ['--add-label', 'ci:failed'], ['signal', 'ci:failed', 'o/r', 7]]);
+    calls.length = 0;
+    expect(applyCiLifecycleLabelPlan({ plan: { toRemove: [], toAdd: ['broken'] }, pr: 7, repo: 'o/r', exec, signal })).toBe(false);
+    expect(calls).toEqual([['--add-label', 'broken']]);
+  });
+  it('runCli routes its context read and its ci-lifecycle writes through those two seams', () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
+    const run = src.slice(src.indexOf('async function runCli('));
+    const seam = run.indexOf('await repollThenCollectContext({');
+    expect(seam).toBeGreaterThan(0);
+    expect(run.indexOf('collectContext(liveListingsByRepo)')).toBeGreaterThan(seam);
+    expect(run.indexOf('collectContext(liveListingsByRepo)')).toBe(run.lastIndexOf('collectContext(liveListingsByRepo)'));
+    expect(run).toContain('applyCiLifecycleLabelPlan({ plan, pr: p.number');
+    expect(run).not.toMatch(/'--add-label', add\]/);
+  });
+});

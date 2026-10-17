@@ -60,9 +60,20 @@ it('reserves exactly one send-back slot when no setting is supplied (the standar
     settings: { cutover: 'enforce', fixCap: { floor: 3, ceiling: 3 } }, gate: () => ({ admit: true }), log: () => {} });
   expect(throttleWith(1).tryAdmit('fix').admit).toBe(true); // a default of 2+ would refuse here
   const atReserve = throttleWith(2);
-  expect(atReserve.tryAdmit('fix')).toMatchObject({ admit: false, kind: 'send-back-reserved' }); // a default of 0 would admit
+  expect(atReserve.tryAdmit('fix')).toMatchObject({ admit: false, kind: 'fix-cap', reserved: 'send-back' }); // a default of 0 would admit
   expect(atReserve.tryAdmit('fix', { sendBack: true }).admit).toBe(true);
 });
+it.each([[1, 1], [1, 3], [2, 1], [2, 5], [3, 0], [4, 2]])(
+  'cap %i with %i reserved slot(s) still admits an ordinary repair — the reserve never takes the last slot', (cap, reserve) => {
+    const ordinary = cap - Math.min(reserve, cap - 1);
+    expect(ordinary).toBeGreaterThanOrEqual(1);
+    const throttleWith = live => createResourceFixThrottle({ env: {}, alive: () => true, readSnap: () => null, readHeavyWait: () => 0, sendBackReservedSlots: reserve,
+      listClaims: () => Array.from({ length: live }, (_, i) => ({ meta: { kind: 'fix', repo: 'we', pr: i + 1 } })),
+      settings: { cutover: 'enforce', fixCap: { floor: cap, ceiling: cap } }, gate: () => ({ admit: true }), log: () => {} });
+    expect(throttleWith(ordinary - 1).tryAdmit('ci-heal').admit).toBe(true);
+    expect(throttleWith(ordinary).tryAdmit('ci-heal').admit).toBe(false);
+    expect(throttleWith(cap - 1).tryAdmit('fix', { sendBack: true }).admit).toBe(true);
+  });
 
 import { vi } from 'vitest';
 import { runReconcileFixDispatch } from '../../conveyor/reconcile-fix-dispatch.mjs';
@@ -72,7 +83,7 @@ it('the live dispatch pass asks the throttle for the send-back slot only for a r
     { kind: 'fix', prNumber: 5402, headRefName: 'lane/5402-ci-red', labels: ['ci:failed'] },
   ];
   // Only the reserved send-back slot is free: whichever entry the pass marks sendBack is the one that dispatches.
-  const tryAdmit = vi.fn((_kind, { sendBack } = {}) => (sendBack ? { admit: true } : { admit: false, kind: 'send-back-reserved', why: 'reserved' }));
+  const tryAdmit = vi.fn((_kind, { sendBack } = {}) => (sendBack ? { admit: true } : { admit: false, kind: 'fix-cap', reserved: 'send-back', why: 'reserved' }));
   const dispatch = vi.fn(entry => ({ pr: entry.pr, lane: entry.lane }));
   const log = vi.spyOn(console, 'error').mockImplementation(() => {});
   let result;
@@ -89,7 +100,60 @@ it('the live dispatch pass asks the throttle for the send-back slot only for a r
   } finally { log.mockRestore(); }
   expect(tryAdmit).toHaveBeenCalledTimes(2);
   expect(dispatch.mock.calls.map(([entry]) => entry.pr)).toEqual([5401]);
-  expect(result.refusals).toContainEqual(expect.objectContaining({ pr: 5402, kind: 'send-back-reserved' }));
+  expect(result.refusals).toContainEqual(expect.objectContaining({ pr: 5402, kind: 'fix-cap' }));
+});
+
+// The real throttle through the real pass: cap 2, one live repair, so only the reserved send-back slot is open.
+const passWith = (entries, extra = {}) => {
+  const dispatch = vi.fn(entry => ({ pr: entry.pr, lane: entry.lane }));
+  const borrowGate = { consider: vi.fn(() => ({ borrow: false, why: 'borrow-off' })), clear: vi.fn() };
+  const dispatchThrottle = createResourceFixThrottle({ env: {}, alive: () => true, readSnap: () => null, readHeavyWait: () => 0,
+    listClaims: () => [{ meta: { kind: 'fix', repo: 'we', pr: 1 } }],
+    settings: { cutover: 'enforce', fixCap: { floor: 2, ceiling: 2 } }, gate: () => ({ admit: true }), log: () => {} });
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    const result = runReconcileFixDispatch({
+      root: '.', repo: 'we', checkStaleness: () => ({ fresh: true, behind: 0 }),
+      reconcile: () => ({ dispatch: entries, refusals: [] }),
+      findItemFn: key => ({ num: key, scope: [`we:scripts/${key}.mjs`] }),
+      fetchItemlessDiffPaths: () => [], resolveFallbackScope: () => [],
+      loadItems: () => [], pickFreeLanes: () => [3], listBuildClaims: () => [], listFixClaims: () => [],
+      dispatch, borrowGate, priorityShadow: null, readMainRedPriorityRecord: () => null, dispatchThrottle, ...extra,
+    });
+    return { result, dispatch, borrowGate };
+  } finally { log.mockRestore(); }
+};
+it('a red-main fix still passes the fixer cap when only the send-back reservation is left (base admitted it)', () => {
+  const { result, dispatch } = passWith([{ kind: 'fix', prNumber: 5269, headRefName: 'lane/302-red-main', mainFix: true, labels: ['ci:failed'] }]);
+  expect(dispatch.mock.calls.map(([entry]) => entry.pr)).toEqual([5269]);
+  expect(result.refusals).toEqual([]);
+});
+it('an ordinary repair held by the reservation may still borrow a builder slot, like any fixer-cap wait', () => {
+  const { result, dispatch, borrowGate } = passWith([{ kind: 'fix', prNumber: 5268, headRefName: 'lane/304-ordinary', labels: ['ci:failed'] }]);
+  expect(dispatch).not.toHaveBeenCalled();
+  expect(borrowGate.consider).toHaveBeenCalledWith({ repo: 'we', pr: 5268 });
+  expect(result.refusals).toEqual([expect.objectContaining({ pr: 5268, kind: 'fix-cap' })]);
+});
+
+import { buildCliDaemonEffects, fixDaemonPrEventsOptions } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
+it('the fix daemon\'s real effects sleep on the hand-off mailbox: a send-back wakes the interval sleep', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fix-handoff-daemon-'));
+  try {
+    const pending = buildCliDaemonEffects({ owner: 'x', handoffDir: dir }).sleep(60_000);
+    signalFixDispatch({ repo: 'o/r', pr: 3, label: 'review:changes' }, { dir });
+    await expect(pending).resolves.toBe('handoff');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+it('the fix daemon hands its pr-events waker a local hand-off probe for its role and repos', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fix-handoff-daemon-'));
+  try {
+    const opts = fixDaemonPrEventsOptions({ handoffDir: dir });
+    expect(opts.role).toBe('fix');
+    expect(opts.localWake()).toBe(false);
+    signalFixDispatch({ repo: 'o/r', pr: 4, label: 'ci:failed' }, { dir });
+    expect(opts.localWake()).toBe(true);
+    expect(opts.localWake()).toBe(false);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 import { runReviewLabelCli } from '../../review-set-label.mjs';

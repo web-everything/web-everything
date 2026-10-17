@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
-import { writeLabelWithHandoff } from './lib/fix-handoff.mjs';
+import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
 import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, refreshHeldHead, retainApprovedHumanQueueHead } from './lib/approved-human-surface-hold.mjs';
 /**
@@ -1152,8 +1152,9 @@ export function isTransientUnknownMergeability(verdict) {
 export const UNKNOWN_MERGEABILITY_RETRY = Object.freeze({ retries: 3, delayMs: 20000 });
 /** Env knob: an integer 0–3 overrides `retries` (0 = the old single read). Anything else keeps the default. */
 export const UNKNOWN_MERGEABILITY_RETRY_ENV = 'WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES';
-export function resolveUnknownMergeabilityRetry(env = {}) {
-  const setting = { ...UNKNOWN_MERGEABILITY_RETRY, delayMs: resolveHandoffSettings('drain', { env }).value.mergeableUnknownRepollSec * 1000 };
+export function resolveUnknownMergeabilityRetry(env = {}, layers = {}) {
+  // `layers` ({ tool, platform }) pins the cascade's file layers for a test; production reads the settings files.
+  const setting = { ...UNKNOWN_MERGEABILITY_RETRY, delayMs: resolveHandoffSettings('drain', { env, ...layers }).value.mergeableUnknownRepollSec * 1000 };
   const raw = env?.[UNKNOWN_MERGEABILITY_RETRY_ENV];
   if (typeof raw !== 'string' || !/^\d+$/.test(raw.trim())) return setting;
   const n = Number(raw.trim());
@@ -1172,6 +1173,27 @@ export async function revalidateWithUnknownRetry({ read, opts, setting = UNKNOWN
     verdict = revalidateForMerge(await read(), opts);
   }
   return verdict;
+}
+
+/** The pass's ordering: UNKNOWN listings are re-polled BEFORE the head-bound open-PR context is collected. */
+export async function repollThenCollectContext({ repoll, collect }) {
+  await repoll();
+  return collect();
+}
+
+/**
+ * Apply one PR's ci-lifecycle label plan: removals, then additions. Each addition goes through
+ * `writeLabelWithHandoff`, so a `ci:failed` written here wakes the fix daemon right after the write lands.
+ * Best effort: a failed write is skipped (the next pass retries). Returns whether every write landed.
+ */
+export function applyCiLifecycleLabelPlan({ plan, pr, repo = null, slug = repo, exec = execFileSync, signal = signalFixDispatch }) {
+  const flag = repo ? ['--repo', repo] : [];
+  let ok = true;
+  for (const rm of plan.toRemove) { try { exec('gh', ['pr', 'edit', String(pr), ...flag, '--remove-label', rm], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { ok = false; } }
+  for (const add of plan.toAdd) {
+    try { writeLabelWithHandoff({ repo: slug, pr, label: add, write: () => exec('gh', ['pr', 'edit', String(pr), ...flag, '--add-label', add], { stdio: ['ignore', 'ignore', 'pipe'] }) }, signal); } catch { ok = false; }
+  }
+  return ok;
 }
 
 /** Refresh UNKNOWN listing facts before reading head-bound manifests/commits or classifying the pass. */
@@ -4909,9 +4931,8 @@ async function runCli() {
             touched = true;
             if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} would reconcile ci-lifecycle → "${desired}"${plan.toRemove.length ? ` (drop ${plan.toRemove.join(', ')})` : ''}\n`);
           } else {
-            let ok = true;
-            for (const rm of plan.toRemove) { try { execFileSync('gh', ['pr', 'edit', String(p.number), ...repoFlag(repo), '--remove-label', rm], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { ok = false; /* best-effort — the next pass retries */ } }
-            for (const add of plan.toAdd) { try { writeLabelWithHandoff({ repo: repo || localSlug, pr: p.number, label: add, write: () => execFileSync('gh', ['pr', 'edit', String(p.number), ...repoFlag(repo), '--add-label', add], { stdio: ['ignore', 'ignore', 'pipe'] }) }); } catch { ok = false; /* a label race/permission miss is non-fatal — the next pass retries */ } }
+            // Best effort — a label race/permission miss is non-fatal; the next pass retries.
+            const ok = applyCiLifecycleLabelPlan({ plan, pr: p.number, repo, slug: repo || localSlug });
             if (ok) { touched = true; if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} ci-lifecycle → "${desired}" (reconcile)\n`); }
           }
         }
@@ -5108,8 +5129,10 @@ async function runCli() {
   // `--no-reconcile-labels`), it is INCOMPLETE by construction — `contextComplete:false` — so the couple gate
   // fails closed (a coupled impl defers rather than orphan-landing past a carrier the gate cannot see).
   const prsByRepo = narrowPrsByRepo(listings, { onlyPr, onlyRepo, repos: REPOS, isLocalRepo });
-  await repollUnknownListings({ prsByRepo, read: fetchFreshPrForRevalidation, setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) });
-  const openPrContext = RECONCILE ? await __t.timeAsync('listing', () => __t.timeAsync('listing.context', () => collectContext(liveListingsByRepo))) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false });
+  const openPrContext = await repollThenCollectContext({
+    repoll: () => repollUnknownListings({ prsByRepo, read: fetchFreshPrForRevalidation, setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) }),
+    collect: () => (RECONCILE ? __t.timeAsync('listing', () => __t.timeAsync('listing.context', () => collectContext(liveListingsByRepo))) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false })),
+  });
   // #xc7p3q9 (R2) — the operator escape hatch symmetric to `--no-review-escalation`: `--assume-complete-context`
   // FORCES the context complete so a genuinely-stuck couple (e.g. a persistent read-noise fail-closed) can land
   // short of editing the script. Prints a LOUD one-line waiver. Off by default; the fail-closed gate stays live.
