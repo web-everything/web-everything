@@ -196,6 +196,11 @@ describe('pollingLoopReason / decide — no polling', () => {
       expect(Date.now() - t0).toBeLessThan(2000);
     }
   });
+  it('heredocScan keeps the bodies it strips so interpreter-fed ones can be scanned', () => {
+    const r = heredocScan("python3 - <<'EOF'\nprint(1)\nEOF\necho done");
+    expect(r.text).toBe('python3 - <<\'EOF\'\necho done');
+    expect(r.heredocs).toEqual([{ head: "python3 - <<'EOF'", body: 'print(1)', expand: false }]);
+  });
   it.each([
     ['EOF', true],
     ["'EOF'", false],
