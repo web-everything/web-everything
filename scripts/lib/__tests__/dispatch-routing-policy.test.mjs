@@ -1,7 +1,8 @@
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync, copyFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, copyFileSync, readFileSync } from 'node:fs';
+import matter from 'gray-matter';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { validateRoutingPolicy, resolveOperationRoute } from '../dispatch-routing-policy.mjs';
@@ -269,20 +270,45 @@ it('preserves Claude build and documentation effort and fallback', () => {
   expect(resolveOperationRoute({ operation: 'build', taskType: 'doc-fix', available: ['claude'] }).effort).toBe('low');
 });
 
-it('routes 5209 scope as a feature build to Codex sol, preserving effort and Claude fallback', async () => {
-  const { taskTypeFor } = await import('../dispatch-task-type.mjs');
-  const scopePaths = ['we:scripts/conveyor/queue-prune.mjs', 'we:scripts/conveyor/queue.mjs',
-    'we:scripts/conveyor/__tests__/queue-prune.test.mjs', 'we:scripts/conveyor/__tests__/queue.test.mjs'];
-  const { taskType } = taskTypeFor({ kind: 'build', scopePaths });
-  expect(taskType).toBe('build-new-feature');
-  expect(resolveOperationRoute({ operation: 'build', taskType })).toMatchObject({
-    provider: 'codex', model: 'gpt-6.1-sol', effort: 'medium',
-    fallback: [{ provider: 'claude', model: 'claude-sonnet-5-5', effort: 'high' }],
+it('inherits feature probation by default and preserves explicit operator pins and fallback', () => {
+  const policy = copy();
+  expect(policy.taskTypes['build-new-feature']).toEqual({ inherit: true });
+  expect(policy.operations['build:build-new-feature']).toEqual({ inherit: true });
+  expect(resolveOperationRoute({ operation: 'build', taskType: 'build-new-feature', policy })).toBeNull();
+  expect(resolveOperationRoute({ operation: 'build', taskType: 'build-new-feature', gateClosed: true, policy })).toMatchObject({
+    provider: 'claude', model: 'claude-sonnet-5-5', fallback: [],
   });
-  expect(resolveOperationRoute({ operation: 'build', taskType, available: ['claude'] }))
-    .toMatchObject({ provider: 'claude', effort: 'high' });
-  expect(resolveOperationRoute({ operation: 'build', taskType, gateClosed: true }))
-    .toMatchObject({ provider: 'claude', fallback: [] });
+  expect(() => resolveOperationRoute({ operation: 'build', taskType: 'build-new-feature', gateClosed: true, availability: { claude: 'held' }, policy })).toThrow(/no available route/);
+  policy.taskTypes['build-new-feature'] = {
+    provider: 'codex', model: 'sol',
+    effort: { claude: 'medium', codex: 'medium', antigravity: 'medium', 'agy-claude': 'medium', 'agy-gemini': 'medium' },
+    fallback: [{ provider: 'claude', model: 'sonnet', effort: 'medium' }],
+  };
+  expect(policy.taskTypes['build-new-feature']).toMatchObject({
+    provider: policy.operations.build.provider, model: policy.operations.build.model,
+    effort: { codex: policy.operations.build.effort.codex },
+  });
+  const buildRoute = resolveOperationRoute({ operation: 'build', policy });
+  policy.operations.build = { inherit: true };
+  expect(resolveOperationRoute({ operation: 'build', taskType: 'build-new-feature', policy })).toMatchObject({
+    provider: buildRoute.provider, model: buildRoute.model, effort: buildRoute.effort, source: buildRoute.source,
+    fallback: [{ provider: 'claude', model: 'claude-sonnet-5-5', effort: 'medium' }],
+  });
+  expect(resolveOperationRoute({ operation: 'build', taskType: 'build-new-feature', available: ['claude'], policy })).toMatchObject({
+    provider: 'claude', model: 'claude-sonnet-5-5', effort: 'medium', fallback: [],
+  });
+});
+
+it('routes only card 5209 to Codex through its per-card override', () => {
+  const { data: card } = matter(readFileSync(new URL(
+    '../../../backlog/5209-prevention-delete-the-receipt-after-a-successful-apply-or-re.md', import.meta.url), 'utf8'));
+  expect(card.deliveryAgent).toBe('codex');
+  const route = decideDispatchRoute({ kind: 'build', size: card.size, scopePaths: card.scope,
+    deliveryAgent: card.deliveryAgent, deliveryAgentReason: card.deliveryAgentReason,
+  }, { routingPolicy: copy(), scorecards: [] });
+  expect(route).toMatchObject({ outcome: 'routed', taskType: 'build-new-feature', executed: 'codex',
+    override: { requestedVendor: 'codex' }, probationWorker: null });
+  expect(route.policyRoute).toBeUndefined();
 });
 
 it('preserves operator-protected Astra and ruling escalation routes', () => {
