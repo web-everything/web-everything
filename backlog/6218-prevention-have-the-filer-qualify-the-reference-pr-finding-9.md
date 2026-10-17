@@ -1,4 +1,5 @@
 ---
+bornAs: x7xiyav
 kind: story
 size: 3
 parent: "4075"
@@ -11,7 +12,7 @@ tags: []
 # Prevention — Have the filer qualify the reference ("PR finding 9") or give the "Already tracked" line the file… (from web-everything/web-everything#5521 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/xvj846g-prevention-a-pr-description-vs-diff-claim-check-on-behaviour.md:26` — Have the filer qualify the reference ("PR finding 9") or give the "Already tracked" line the file:line from the card's own list instead of a bare number. Add a unit test on the filer's rendering with a mixed tracked/untracked set.
+1. `we:backlog/6216-prevention-a-pr-description-vs-diff-claim-check-on-behaviour.md:26` — Have the filer qualify the reference ("PR finding 9") or give the "Already tracked" line the file:line from the card's own list instead of a bare number. Add a unit test on the filer's rendering with a mixed tracked/untracked set.
 
 Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 2 → #5605, finding 3 → #5360.
 
