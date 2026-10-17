@@ -79,12 +79,16 @@
  * Flags: --task=<text> | --task-file=<path> (one required), --dir=<existing dir> (default: fresh scratch
  * clone), --repo-root=<path> (default: this script's own repo root — where a scratch clone is cloned FROM),
  * --model=<model>, --effort=low|medium|high|xhigh|max|ultra, --timeout-ms=<n> (default 30 min), --gate=none|
- * standards|full (default none), --ephemeral, --no-stream (still logs to file, just not to stdout too),
+ * related|standards|full (default full), --ephemeral, --no-stream (still logs to file, just not to stdout too),
  * --log=<path> (default: alongside the target dir), --wire-origin-to-remote (#3782 — opt-in; a fresh scratch
  * clone's `origin` otherwise stays at the local repoRoot path, non-push-capable, with the real remote only
  * PRINTED for a human to wire up by hand), --json (machine-readable final report on stdout).
  */
 
+import { randomUUID } from 'node:crypto';
+import { formatCascadeSourcesLine } from './lib/policy-cascade.mjs';
+import { resolveBuildPolicy, renderBuildRequirements } from './lib/build-policy.mjs';
+import { runBuildSelfReview, renderSelfReviewNotes } from './lib/build-self-review.mjs';
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
 import {
   mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync,
@@ -231,7 +235,7 @@ export function buildCodexDirectTaskArgv({
  * @param {string} task
  * @returns {string}
  */
-export function buildCodexPrompt(task, { review = false } = {}) {
+export function buildCodexPrompt(task, { review = false, policy = resolveBuildPolicy() } = {}) {
   if (typeof task !== 'string' || !task.trim()) {
     throw new TypeError('codex-direct-task: `task` must be a non-empty string');
   }
@@ -247,6 +251,8 @@ export function buildCodexPrompt(task, { review = false } = {}) {
     + 'Run tests ONLY through the host heavy-run queue: `node scripts/readiness/heavy-admission.mjs run -- npx '
     + 'vitest run <test-file>` (or `npm run test:unit -- <test-file>`, `npm run check:standards`). Never run a '
     + 'bare `npx vitest`, `npm test`, or `node scripts/check-standards.mjs` — they skip the queue and overload the host.'
+    + '\n\n' + renderBuildRequirements({ policy, selfReview: false })
+    + (policy.selfReview.enabled ? `\n\nThe launcher owns the capped pre-review check (${policy.selfReview.maxRounds} repair rounds); do not start a second self-review loop.` : '')
   );
 }
 
@@ -584,29 +590,30 @@ export function captureDiff({ dir, startSha, execFn = defaultExecFn }) {
 
 /**
  * Optionally run this repo's own gate on the result — NEVER commits. `mode`:
- *   - `'none'` (default): does nothing.
- *   - `'standards'`: `npm run check:standards` only — fast, catches convention breaks.
- *   - `'full'`: `check:standards` + `npm run test:unit` (the WHOLE suite — this script does not attempt to
- *     compute which tests are "relevant to what changed"; that scoping is a real gap, called out in this
- *     script's own `--help` text and in the landing report rather than silently claimed).
+ *   - `'none'`: does nothing.
+ *   - `'standards'`: compatibility alias for standards only.
+ *   - `'related'`: diff-selected verify-lane gate.
+ *   - `'full'` (default for edit tasks): verify-lane whole unit tier plus standards.
  * @param {object} opts
  * @param {string} opts.dir
  * @param {'none'|'standards'|'full'} opts.mode
  * @param {Function} [opts.execFn]
  * @returns {{ran: boolean, mode: string, steps: {cmd: string, pass: boolean, output: string}[], pass: boolean}}
  */
-export function runGate({ dir, mode, execFn = defaultExecFn }) {
+export function runGate({ dir, mode, execFn = defaultExecFn, env = process.env }) {
   if (mode === 'none' || !mode) return { ran: false, mode: 'none', steps: [], pass: true };
+  if (!['full', 'related', 'standards'].includes(mode)) throw new Error('invalid build gate');
   const plan = mode === 'full'
-    // xaipsbs — both are the package scripts, which run through the host admission pool.
-    ? [['npm', ['run', 'check:standards']], ['npm', ['run', 'test:unit']]]
-    : [['npm', ['run', 'check:standards']]];
+    ? [['node', ['scripts/verify-lane.mjs', 'run', '--gate=npm run test:unit && npm run check:standards']]]
+    : mode === 'related' ? [['node', ['scripts/verify-lane.mjs', 'run']]]
+      : [['npm', ['run', 'check:standards']]];
+  const gateEnv = mode === 'related' ? { ...env, WE_BUILD_FINAL_GATE: 'related' } : env;
   const steps = [];
   for (const [bin, args] of plan) {
     let output = '';
     let pass = true;
     try {
-      output = execFn(bin, args, { cwd: dir });
+      output = execFn(bin, args, { cwd: dir, env: gateEnv });
     } catch (e) {
       pass = false;
       output = `${e.stdout ?? ''}${e.stderr ?? e.message ?? ''}`;
@@ -654,16 +661,18 @@ export async function runCodexDirectExec({
   tempRoot,
   env = process.env,
   review = false,
+  policy, resumeThreadId,
 } = {}) {
   // Inside `.git/` — NEVER inside the working tree. A real live run against this very script found the bug
   // this avoids: a last-message/log file written into `dir` shows up as an untracked `??` file and pollutes
   // `captureDiff`'s output with the SCRIPT's own bookkeeping instead of only the task's real changes. Mirrors
   // `we:scripts/lane-pool.mjs`'s own `DEPS_MARKER`/`LEASE_MARKER` convention — inside `.git/` is "never
   // tracked or git-cleaned... never seen by `git status --porcelain`" for exactly this reason.
-  const outputLastMessageFile = join(gitDir, 'codex-direct-task-last-message.txt');
+  const outputLastMessageFile = join(gitDir, review ? `codex-self-review-${randomUUID()}-last-message.txt` : 'codex-direct-task-last-message.txt');
   route ??= resolveCodexTaskRoute({ kind: taskKind ?? (review ? 'review' : 'worker'), size, epic, decision, care, mandatoryLens, model, effort, env, log });
-  const argv = buildCodexDirectTaskArgv({ route, cwd: dir, outputLastMessageFile, model, effort, ephemeral, review, writableRoots, tempRoot });
-  const prompt = buildCodexPrompt(task, { review });
+  let argv = buildCodexDirectTaskArgv({ route, cwd: dir, outputLastMessageFile, model, effort, ephemeral, review, writableRoots, tempRoot });
+  if (resumeThreadId) argv = ['exec', 'resume', '--json', '-m', model, '-c', `model_reasoning_effort=${effort}`, '-o', outputLastMessageFile, resumeThreadId, '-'];
+  const prompt = buildCodexPrompt(task, { review, policy });
   writeFileSync(logFile, ''); // truncate/create — this run owns the file from byte 0.
 
   return new Promise((resolvePromise, reject) => {
@@ -783,7 +792,7 @@ export async function codexDirectTask({
   tier, taskKind, size, epic, decision, care, mandatoryLens, log,
   ephemeral = false,
   timeoutMs = DEFAULT_TIMEOUT_MS,
-  gate = 'none',
+  gate,
   logFile,
   stream = true,
   installDeps = true,
@@ -795,6 +804,7 @@ export async function codexDirectTask({
   spawnFn = nodeSpawn,
   mkTempDir = (prefix) => mkdtempSync(prefix),
   existsFn = existsSync,
+  selfReviewFn,
   readQuotaFn = readRolloutQuota,
   collectQuotaFn = collectAndClearRolloutQuota,
 } = {}) {
@@ -802,6 +812,13 @@ export async function codexDirectTask({
     throw new TypeError('codex-direct-task: `task` must be a non-empty string');
   }
 
+  const policy = resolveBuildPolicy({ env });
+  if (gate !== undefined) { policy.finalGate = gate; policy.sources.finalGate = 'argument'; }
+  (log ?? (line => console.error(line)))(formatCascadeSourcesLine('build', { value: policy, sources: policy.sources }));
+  gate ??= review ? 'none' : policy.finalGate;
+  if (!['none', 'related', 'standards', 'full'].includes(gate)) throw new Error('invalid build gate');
+  if (!review && ephemeral && policy.selfReview.enabled) throw new Error('--ephemeral requires build.selfReview.enabled=false: a repair must resume the original builder');
+  const briefPolicy = { ...policy, finalGate: gate };
   let targetDir = dir;
   let scratch = null;
   if (!targetDir) {
@@ -820,7 +837,7 @@ export async function codexDirectTask({
   // Same `.git/`-hiding reasoning as `outputLastMessageFile` above — the default log file must never leak
   // into `captureDiff`'s output. A caller-supplied `--log=<path>` is trusted as-is (their choice, their risk).
   const gitDir = execFn('git', ['-C', targetDir, 'rev-parse', '--absolute-git-dir']).trim();
-  const resolvedLogFile = logFile || join(gitDir, 'codex-direct-task.jsonl');
+  const resolvedLogFile = logFile || join(gitDir, review ? `codex-self-review-${randomUUID()}.jsonl` : 'codex-direct-task.jsonl');
   mkdirSync(dirname(resolvedLogFile), { recursive: true });
 
   const route = resolveCodexTaskRoute({ kind: taskKind ?? (review ? 'review' : 'worker'), size, epic, decision, care, mandatoryLens,
@@ -833,15 +850,28 @@ export async function codexDirectTask({
   const writableRoots = review ? [] : [gitDir, resolve(admissionLockRoot(resolve(targetDir), env)), tempRoot];
   const run = await withCodexUsage({ model, effort, taskKind: usageTaskKind ?? taskKind ?? (review ? 'review' : 'worker'), caller, repo, pr, card, cwd: targetDir }, () => runCodexDirectExec({
     dir: targetDir, task, route, model, effort, ephemeral, timeoutMs, logFile: resolvedLogFile, stream, spawnFn, review,
-    gitDir, writableRoots, tempRoot, env,
+    gitDir, writableRoots, tempRoot, env, policy: briefPolicy,
   }), { env });
   const events = parseJsonlEvents(run.stdout);
   const summary = summarizeEvents(events);
   let lastMessage = null;
   try { lastMessage = readFileSync(run.outputLastMessageFile, 'utf8'); } catch { lastMessage = null; }
 
+  let gateResult = review ? runGate({ mode: 'none' }) : runGate({ dir: targetDir, mode: gate, execFn, env });
+  const selfReview = !review && run.code === 0 && !run.timedOut && gateResult.pass ? await runBuildSelfReview({
+    policy, dir: targetDir, env, ...(selfReviewFn ? { review: selfReviewFn } : {}),
+    readDiff: () => captureDiff({ dir: targetDir, startSha, execFn }).diff,
+    fix: async prompt => {
+      if (!summary.threadId) throw new Error('self-review requires the original builder session');
+      const fixed = await withCodexUsage({ model, effort, taskKind: 'fix', caller, repo, pr, card, cwd: targetDir },
+        () => runCodexDirectExec({ dir: targetDir, task: prompt, route, model, effort,
+          timeoutMs, logFile: resolvedLogFile, stream, spawnFn, gitDir, writableRoots, tempRoot, env,
+          policy: briefPolicy, resumeThreadId: summary.threadId }), { env });
+      if (fixed.code !== 0 || fixed.timedOut) throw new Error('self-review builder failed');
+    },
+    gate: () => { gateResult = runGate({ dir: targetDir, mode: gate, execFn, env }); return gateResult.pass; },
+  }) : { skipped: true, rounds: 0, notes: [] };
   const diff = captureDiff({ dir: targetDir, startSha, execFn });
-  const gateResult = runGate({ dir: targetDir, mode: gate, execFn });
 
   // #x8wbivt Fork 4: surface the quota signal for any run that actually persisted a rollout (an `--ephemeral`
   // run writes none — nothing to read). Default is read-ONLY (`readQuotaFn`/`readRolloutQuota`) to preserve
@@ -888,6 +918,8 @@ export async function codexDirectTask({
     lastMessage,
     diff,
     gate: gateResult,
+    selfReview,
+    buildPolicy: policy,
     // #x8wbivt Fork 4 — the ratified budget signal, mirroring `judge-spawn.mjs`/`judge-panel.mjs`'s
     // `costUsd`/timing reporting shape on the Claude side (no USD figure exists here; this is the real
     // consumption analogue Codex actually offers).
@@ -922,7 +954,7 @@ async function main() {
     console.log(
       'usage: node scripts/codex-direct-task.mjs --task=<text>|--task-file=<path> [--dir=<checkout>] '
       + '[--repo-root=<path>] [--model=<m>] [--effort=low|medium|high|xhigh|max|ultra] [--tier=haiku|sonnet|opus] '
-      + '[--task-kind=<kind>] [--size=<n>] [--care=low|normal|elevated|high] [--epic] [--decision] [--timeout-ms=<n>] [--gate=none|standards|full] [--ephemeral] [--clear-rollout-after-run] '
+      + '[--task-kind=<kind>] [--size=<n>] [--care=low|normal|elevated|high] [--epic] [--decision] [--timeout-ms=<n>] [--gate=full|related|none|standards] [--ephemeral] [--clear-rollout-after-run] '
       + '[--no-stream] [--log=<path>] [--no-install] [--wire-origin-to-remote] [--review] [--json]\n'
       + '  --review (#4194): a READ-ONLY review task — Codex runs under `-s read-only` and is told to answer in its '
       + 'final message (the report\'s `lastMessage`) instead of editing files.\n'
@@ -960,7 +992,7 @@ async function main() {
       care: flags.care, epic: Boolean(flags.epic), decision: Boolean(flags.decision),
       ephemeral: Boolean(flags.ephemeral),
       timeoutMs,
-      gate: flags.gate || 'none',
+      gate: flags.gate,
       logFile: flags.log ? resolve(flags.log) : undefined,
       stream: !flags['no-stream'],
       installDeps: !flags['no-install'],
@@ -974,6 +1006,7 @@ async function main() {
     return;
   }
 
+  if (report.exitCode !== 0 || report.timedOut || !report.gate.pass) process.exitCode = 1;
   if (flags.json) {
     console.log(JSON.stringify(report, null, 2));
   } else {
@@ -1001,6 +1034,7 @@ async function main() {
       console.log(`\n  gate (${report.gate.mode}): ${report.gate.pass ? 'PASS' : 'FAIL'}`);
       for (const s of report.gate.steps) console.log(`    ${s.pass ? '✓' : '✗'} ${s.cmd}`);
     }
+    if (report.selfReview.notes.length) console.log(renderSelfReviewNotes(report.selfReview));
     console.log('\n  NOTHING WAS COMMITTED OR PUSHED. Review the diff above (or `cd` into the dir and run `git diff`), then commit/land it yourself if you want it.');
     console.log('──────────────────────────────────────────────────────────\n');
   }

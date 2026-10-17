@@ -1,8 +1,9 @@
+import { resolveBuildPolicy, renderBuildRequirements } from './lib/build-policy.mjs';
 /**
  * @file worker-brief.mjs
  * @description Render the standard worker-brief block so dispatchers do not retype
  * drifting rules. Encodes operator handoff rules 20, 21, 23, 26 and "no pkill".
- * The pure renderer is shared by the injectable CLI and in-process callers.
+ * The renderer (including the living checklist) is shared by the injectable CLI and in-process callers.
  */
 import { writeFile as defaultWriteFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
@@ -23,7 +24,7 @@ const USAGE = `Usage: node scripts/worker-brief.mjs --purpose=<slug> --files=a,b
 `;
 
 /**
- * Render one standard block without IO or mutation of the caller's parameters.
+ * Render one standard block without mutation of the caller's parameters.
  * @param {object} params
  * @param {string} params.purpose
  * @param {string[]|string} params.files Allowed paths, or a comma-separated list.
@@ -35,7 +36,7 @@ const USAGE = `Usage: node scripts/worker-brief.mjs --purpose=<slug> --files=a,b
  *   keeps a re-dispatch or a generic slug from colliding with another live worker's registration.
  * @returns {string} Markdown with a trailing newline.
  */
-export function renderWorkerBrief({ purpose, files, edgeClone, proof = DEFAULT_PROOF, repo = 'we', reportLines = 8, owner = randomUUID().slice(0, 8) } = {}) {
+export function renderWorkerBrief({ purpose, files, edgeClone, proof = DEFAULT_PROOF, repo = 'we', reportLines = 8, owner = randomUUID().slice(0, 8), policy = resolveBuildPolicy({ log: line => console.error(line) }) } = {}) {
   if (typeof owner !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9-]*$/.test(owner)) throw new Error('--owner must be an alphanumeric token.');
   if (typeof purpose !== 'string' || !/^[a-z0-9][a-z0-9-]*$/.test(purpose)) {
     throw new Error('--purpose must be a lowercase slug ([a-z0-9][a-z0-9-]*).');
@@ -81,7 +82,7 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    Work only in the lane path it prints. Never branch or edit the primary checkout. Release the lane at the end:
    \`node scripts/lane-pool.mjs release --lane=<N> --session=<holder slug it printed>\`.
 4. **Codex for scoped coding.** Well-scoped coding sub-tasks (tests, mechanical edits, a single-file fix with clear
-   acceptance) go to Codex: \`node scripts/codex-direct-task.mjs --task-file=<f> --dir=<lane> --gate=standards\`.
+   acceptance) go to Codex: \`node scripts/codex-direct-task.mjs --task-file=<f> --dir=<lane> --gate=${policy.finalGate}\`.
    It is SYNCHRONOUS: run it in the foreground, never backgrounded, never wrapped in a wait. Review the diff before
    you commit. You keep root cause, design, edge adoption and live proof.
 5. **Red-green tests through the heavy queue.** Write the failing test first, then the fix.
@@ -105,6 +106,8 @@ checks it, and end. If you need the condition to happen, cause it through the sa
 what evidence shows it is yours. Never stop the operator's dev server.
 
 **Git.** No \`--force\`, no \`--no-verify\`, no history rewrite, no \`git add -A\`.
+
+${renderBuildRequirements({ policy })}
 
 **Times** are America/New_York (ET).
 

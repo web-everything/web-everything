@@ -1297,3 +1297,21 @@ false-findings / total-findings percentages without a matching denominator.
 For each confirmed cause, name a prevention, rank by frequency and mark NEW or COVERED-BY using the
 coroner's existing held-card checks. Daily summaries carry cause/lens/seat/PR-type counts plus the
 separate shadow count and read completeness.
+
+### Build completion safeguards
+
+Builder, fixer and Codex briefs embed `reviewer-expectations.md`. Maintain its concrete examples
+from recurring coroner findings. `scripts/settings/build.json` overrides the platform's `build` block:
+`finalGate` defaults to `full` (whole unit tier plus standards through heavy admission), with `related`
+and `none` escape settings; `selfReview.enabled` defaults true and `selfReview.maxRounds` defaults 2
+(0–10). `reviewerExpectations.enabled` defaults true. Sources use the shared policy-cascade formatter.
+Environment overrides are `WE_BUILD_FINAL_GATE`, `WE_BUILD_SELF_REVIEW_ENABLED`,
+`WE_BUILD_SELF_REVIEW_MAX_ROUNDS`, and `WE_BUILD_REVIEWER_EXPECTATIONS_ENABLED`.
+
+A green build gets one cheap correctness/security review of its net diff. Each repair resumes the
+original builder and re-runs the gate; at most `maxRounds` repairs occur, with a final observation
+and remaining notes carried into the PR body. The cheap self-check opens to independent review,
+never directly to acceptance. An unavailable review or red repair gate stops publication; neither is a clear verdict. Disabling self-review keeps the existing
+conveyor converge path; Codex skips the extra review. `finalGate=none` keeps Codex ungated and
+leaves conveyor's existing verification selection in place; `related` requests diff selection.
+Codex `--ephemeral` requires self-review disabled, since an ephemeral builder cannot be resumed.

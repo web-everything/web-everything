@@ -1,3 +1,6 @@
+import { beforeEach as beforeBuildPolicy, afterEach as afterBuildPolicy, vi as buildPolicyVi } from 'vitest';
+beforeBuildPolicy(() => buildPolicyVi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'false'));
+afterBuildPolicy(() => buildPolicyVi.unstubAllEnvs());
 /**
  * @file deliver-item-wrapper.test.mjs — argv-contract coverage for the #3627 minimal-delivery wrapper
  * PROTOTYPE (`we:scripts/operations/deliver-item-wrapper.mjs`). The file is still NOT wired into
@@ -3487,6 +3490,24 @@ describe('deliverItem (#3627 bug 13 — the success-path result string names the
 
   // #3850 Fork 2 — END-TO-END through the REAL `deliverItem`, not just `decideParkMode` in isolation: proves
   // the real spawned `provider.vendor` actually reaches the park decision and shows up in the real PR outcome.
+  it('caps configured self-review and publishes remaining notes after resuming the same builder', async () => {
+    vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'true');
+    vi.stubEnv('WE_BUILD_SELF_REVIEW_MAX_ROUNDS', '2');
+    const provider = { spawn: vi.fn(), vendor: 'claude' };
+    const reviewBuild = vi.fn(async () => ['a.mjs:1 remaining defect']);
+    const result = await deliverItem(
+      { item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999', attemptTag: '', runId: 'dispatch-lane-fixture', effectKey: 'dispatch:0:0' },
+      provider, { newSessionId: () => 'uuid-fixed', reviewBuild },
+    );
+    expect(result.result).toBe('PR #4321 (review:pending)');
+    expect(reviewBuild).toHaveBeenCalledTimes(3);
+    expect(provider.spawn).toHaveBeenCalledTimes(3);
+    for (const [call] of provider.spawn.mock.calls.slice(1)) expect(call.resumeSessionId).toBe('uuid-fixed');
+    expect(execFileSync.mock.calls.filter(([bin, args]) => bin === 'node' && args[1] === 'verify')).toHaveLength(3);
+    expect(execFileSync.mock.calls.some(([, args]) => args[0] === 'scripts/converge-cli.mjs')).toBe(false);
+    expect(readFileSync(join(lane, '.pr-body.md'), 'utf8')).toContain('a.mjs:1 remaining defect');
+  });
+
   it('a Claude-executed delivery (provider.vendor="claude", the real registered CLAUDE_RESTRICTED_PROVIDER shape) opens label-on-green (ready-to-merge)', async () => {
     const result = await deliverItem(
       { item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999', attemptTag: '', runId: 'dispatch-lane-fixture', effectKey: 'dispatch:0:0' },

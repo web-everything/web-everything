@@ -66,6 +66,8 @@
  * infra-blocked recovery / the lease-reaper / the session-reaper / the hiccup sink — best-effort, never gating
  * the tick.
  */
+import { renderBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
+
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { readDeclaredSettings } from '../lib/settings-files.mjs';
 import { advisorForLaunch, advisorLedgerRow, advisorLogLine, recordAdvisorRun } from '../lib/advisor-trial.mjs';
@@ -1359,7 +1361,7 @@ export function dispatchFix(planned, {
   // Fixer context pack (`fix.contextPack`, `fix.localTests`) — the template arrives with the finding verbatim, the code
   // at each named line, the PR's file list and the proof-only tests rule in front, and the sections the pack makes
   // redundant trimmed (we:scripts/conveyor/fix-context-pack.mjs). A test that injects `readBrief` gets its own text.
-  readBrief = (r) => packFixBrief(readFileSync(fixBriefPath(r), 'utf8')),
+  readBrief = (r) => packFixBrief(readFileSync(fixBriefPath(r), 'utf8')) + '\n\n' + renderBuildRequirements({ policy: resolveBuildPolicy({ log: line => console.error(line) }) }),
   packFixBrief = (template) => briefWithContextPack(template, { kind: 'fix', repo, toSlug: ghRepoSlug, pr: planned.pr, exec: execFileSyncThrottled }),
   mintSessionId = () => randomUUID(),
   spawnAgent = defaultSpawnAgent,

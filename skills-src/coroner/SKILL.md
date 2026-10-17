@@ -158,3 +158,10 @@ tool-free model summarise each into a schema-checked, worker-result-shaped recor
 drops invalid ones with a count, ranks blocker kinds by deterministic minutes lost, and prints the cost per run. Knob
 `coroner.sampleSize` (`--sample-size`, `WE_CORONER_SAMPLE_SIZE`, default 28). Stability rule: top-5 unchanged for 3 runs halves N
 (floor 5); a changed ranking returns to the large N. History: `~/workspace/.operations/metrics/perf/coroner-sample-ranking.jsonl`.
+
+## Recurring reviewer expectations
+
+The nightly coroner appends new recurring themes to
+[`docs/agent/reviewer-expectations.md`](../../docs/agent/reviewer-expectations.md).
+Give each theme a concrete rule and example, deduplicate existing rules, and preserve the
+checklist's portability. Builder, fixer and Codex briefs embed this living file.

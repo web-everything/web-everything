@@ -553,3 +553,8 @@ repair-only-CI, re-push, guarded-completion shape is identical.
   2026-09-26) this rule exists to prevent. The record changes no PR label; it is read by
   `we:scripts/conveyor/reconcile-core.mjs#markSelfReportedDone` and `we:scripts/conveyor/session-reaper.mjs`'s
   own completion-record axis.
+
+
+The dispatch composer appends the effective build safeguards and the contents of
+`docs/agent/reviewer-expectations.md`. Follow that configured block for the final gate
+and the capped pre-review check; the mechanical wrapper owns the check on wrapped builds.
