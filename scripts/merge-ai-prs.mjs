@@ -728,8 +728,7 @@ export function carryHumanClearanceOnIdenticalDiff({ setting, comments, reviews 
 
 /** The production tamper-park callback, shared with the carry wiring regression tests. */
 export function createTamperParkCarryCallback({ pr, repo, exec, dryRun = false, ...options } = {}) {
-  // An unreadable proof parks held-mechanical (retried by the carry sweep), never a fresh human park.
-  return evidence => applyHumanClearanceCarry({ ...options, evidence, pr, repo, exec, dryRun, deferUnreadProof: true,
+  return evidence => applyHumanClearanceCarry({ ...options, evidence, pr, repo, exec, dryRun,
     numberingOnly: !!evidence.humanClearance && !evidence.humanClearance.diff && !evidence.humanClearance.contribution,
     readNumberingLiveEvidence: options.readNumberingLiveEvidence
       ?? (() => readLiveDrainCarryEvidence({ pr, repo, exec })),

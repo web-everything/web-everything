@@ -617,35 +617,6 @@ describe('tamper-park callback through the durable human carry writer', () => {
   });
 });
 
-describe('review regressions: an unreadable net-patch proof defers instead of refusing a human clearance', () => {
-  const BASE = 'b'.repeat(40);
-  const headDiff = DIFF.replace('+new', '+changed');
-  it.each([['unreadable', 'retry'], ['different', 'refuse'], ['numbering unreadable', 'retry']])('net patch %s → %s', (shape, outcome) => {
-    const comments = [clearHumanComment(CLEARED, FP)], posted = [];
-    const exec = (cmd, args, opts) => {
-      if (cmd !== 'git') { posted.push(args); return ''; }
-      if (shape === 'unreadable') throw Error('git timed out');
-      if (args[0] === 'merge-base') return `${BASE}\n`;
-      if (args[0] === 'diff') return args.includes(CLEARED) ? DIFF : headDiff;
-      if (args[0] === 'patch-id') return `${opts.input === DIFF ? 'a'.repeat(40) : 'c'.repeat(40)} ${BASE}\n`;
-      throw Error(`unexpected git ${args[0]}`);
-    };
-    const proveNumbering = () => (shape === 'numbering unreadable'
-      ? { ok: false, retryable: true, reason: 'numbering proof failed: transient read' } : { ok: false, reason: 'unrelated byte' });
-    const callback = createTamperParkCarryCallback({ pr: 5463, repo: 'owner/repo', setting: ON, log: quiet,
-      numberingSetting: ON, netPatchSetting: ON, exec, proveNumbering,
-      readNumberingLiveEvidence: () => ({ headSha: HEAD, comments, reviews: [] }) });
-    const evidence = { humanClearance: latestHumanClearance(comments), headSha: HEAD, headDiffSha: HEAD, headDiff };
-    expect(callback(evidence)).toEqual(outcome === 'retry' ? expect.objectContaining({ action: 'defer', applyLabel: null }) : null);
-    // The drain's tamper park reads a retryable refusal as held-mechanical, never a fresh human park.
-    const result = carryHumanClearanceOnIdenticalDiff({ setting: 'on', comments, reviews: [],
-      humanClearedSha: CLEARED, headSha: HEAD, pinnedHeadSha: HEAD,
-      readHeadDiff: () => ({ scored: true, text: headDiff, rev: HEAD }), applyNumberingCarry: callback });
-    expect(result).toMatchObject({ carried: false, humanClearedSha: CLEARED, retryable: outcome === 'retry' });
-    expect(posted).toEqual([]);
-  });
-});
-
 describe('human clearance numbering tier', () => {
   const evidence = { humanClearance: { sha: CLEARED, diff: FP, actor: 'chalbert' },
     headSha: HEAD, headDiffSha: HEAD, headDiff: DIFF.replace('+new', '+numbered') };

@@ -230,9 +230,6 @@ export function proveHumanClearanceCarry({ evidence, enabled = true, exec, cwd, 
     // never consults git (or reaches the writer) without a recorded fingerprint.
     const hasFingerprint = [clearance.diff, clearance.contribution].some(v => typeof v === 'string' && /^[0-9a-f]{64}$/i.test(v));
     if (!hasFingerprint && !numberingOnly) return { ...pre, carry: false, applicable: true };
-    // A proof that could not be read is not a refusal: a later definitive miss stays retryable.
-    let unread = false;
-    const miss = (result) => (unread && !result.carry ? { ...result, retryable: true } : result);
     if (!numberingOnly && hasFingerprint && netPatchSetting.value) {
       // The patch reader supplies its own cwd option; keep it bound to this evidence's repository.
       const patch = proveIdenticalNetPatch({ exec: gitExec, cwd, fromSha: clearance.sha, toSha: evidence.headSha, mainRef });
@@ -245,7 +242,6 @@ export function proveHumanClearanceCarry({ evidence, enabled = true, exec, cwd, 
         }
       }
       // This is an alternative proof. A miss must leave independent tree/replay/numbering proofs intact.
-      unread = patch.retryable === true;
     }
     if (pre.carry) {
       // Exact root tree identity includes every blob, path and mode, including the manifest.
@@ -265,17 +261,16 @@ export function proveHumanClearanceCarry({ evidence, enabled = true, exec, cwd, 
       // SHA-bound clearance plus exact git bytes is sufficient even when the ceremony could not read a diff.
       // A scored, pinned live diff is still required to write the new record.
       if (!enabled || !numberingSetting.value || !/^[0-9a-f]{40}$/i.test(clearance.sha ?? '')
-        || !clearance.actor || !liveCarryFingerprints(evidence.headDiff).diff) return miss({ ...pre, carry: false, applicable: true });
+        || !clearance.actor || !liveCarryFingerprints(evidence.headDiff).diff) return { ...pre, carry: false, applicable: true };
       const proof = proveNumbering({ exec: gitExec, fromSha: clearance.sha, toSha: evidence.headSha, mainRef });
-      unread ||= proof.retryable === true;
       if (proof.ok) return { carry: true, applicable: true, fromSha: clearance.sha, toSha: evidence.headSha,
         fingerprint: liveCarryFingerprints(evidence.headDiff).diff || 'unscored', actor: clearance.actor,
         tier: 'numbering', mechanicalReason: proof.reason, reason: proof.reason };
-      return miss({ ...pre, carry: false, applicable: true, reason: `${pre.reason}; numbering tier: ${proof.reason}` });
+      return { ...pre, carry: false, applicable: true, reason: `${pre.reason}; numbering tier: ${proof.reason}` };
     }
     const mechanical = proveMechanicalMove({ exec: gitExec, fromSha: clearance.sha, toSha: evidence.headSha, mainRef, requireReplay: pre.tier === 'contribution' });
     const decision = decideHumanClearanceCarry({ ...inputs, mechanical });
-    return miss({ ...decision, applicable: true, ...(decision.carry ? { mechanicalReason: mechanical.reason, reason: mechanical.reason } : {}) });
+    return { ...decision, applicable: true, ...(decision.carry ? { mechanicalReason: mechanical.reason, reason: mechanical.reason } : {}) };
   } catch (e) {
     return { carry: false, applicable: true, reason: `carry proof failed: ${String(e?.message ?? e).split('\n')[0]}` };
   }
@@ -366,9 +361,8 @@ function liveCarryChange({ readLiveEvidence, carried }) {
  * (`readDrainAcceptance`, which carries `humanClearance` from {@link latestHumanClearance}, `headSha`, `headDiff`), decide the carry and — when it
  * holds — post the durable record BEFORE the caller honours it. Returns:
  *   null                                  — nothing to carry (today's behaviour, the gate decides as before);
- *   {action:'defer', applyLabel:null, reason} — carry proven but the record could not be written, or (only with
- *                                           `deferUnreadProof`) a proof could not be read and no other proof carried:
- *                                           skip this pass, write no label (never re-park a clearance we could not record);
+ *   {action:'defer', applyLabel:null, reason} — carry proven but the record could not be written: skip this pass,
+ *                                           write no label (never re-park a clearance we could not record);
  *   {carried:{fromSha,toSha,fingerprint,actor,recorded}} — carried; the caller binds the clearance to the head.
  * Every carry and every refused carry of a real clearance is logged to stderr (the daemon log).
  */
@@ -376,7 +370,7 @@ export function applyHumanClearanceCarry({
   evidence, pr, repo = null, cwd, exec, dryRun = false, mainRef = 'origin/main', readLiveEvidence = null, readNumberingLiveEvidence = null,
   equivalence = resolveCarryEquivalenceSetting().value, proveNumbering = proveNumberingOnlyMove,
   numberingSetting = resolveNumberingHumanClearanceSetting(), numberingOnly = false,
-  netPatchSetting = resolveIdenticalNetPatchSetting(), deferUnreadProof = false,
+  netPatchSetting = resolveIdenticalNetPatchSetting(),
   setting = resolveHumanClearanceCarrySetting(), log = (s) => process.stderr.write(s),
 } = {}) {
   const d = proveHumanClearanceCarry({ evidence, enabled: setting.value, exec, cwd, mainRef, equivalence, proveNumbering, numberingSetting, numberingOnly, netPatchSetting });
@@ -387,13 +381,7 @@ export function applyHumanClearanceCarry({
   logEquivalenceSettingOnce(equivalence, log);
   const tag = `${repo ? `${repo}` : ''}#${pr}`;
   if (!d.carry) {
-    const span = `${String(evidence?.humanClearance?.sha || '').slice(0, 9)}→${String(evidence?.headSha || '').slice(0, 9)}`;
-    if (d.retryable && deferUnreadProof) {
-      log(`  human-clearance-carry ${tag}: carry unproven this pass ${span} — ${d.reason}; deferring, no label change\n`);
-      return { action: 'defer', applyLabel: null,
-        reason: `human clearance carry (${span}) unproven: a proof could not be read (${d.reason}) — merge deferred this pass` };
-    }
-    log(`  human-clearance-carry ${tag}: NOT carried ${span} — ${d.reason}\n`);
+    log(`  human-clearance-carry ${tag}: NOT carried ${String(evidence?.humanClearance?.sha || '').slice(0, 9)}→${String(evidence?.headSha || '').slice(0, 9)} — ${d.reason}\n`);
     return null;
   }
   const carried = { fromSha: d.fromSha, toSha: d.toSha, fingerprint: d.fingerprint, actor: d.actor, tier: d.tier, mechanicalReason: d.mechanicalReason, recorded: false };

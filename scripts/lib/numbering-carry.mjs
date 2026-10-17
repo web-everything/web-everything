@@ -651,7 +651,7 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   }
   const netSetting = netPatchSetting;
   logIdenticalNetPatchSetting(netSetting);
-  // A disabled proof is a setting, not a verdict: its refusal is never memoized, so switching it on takes effect.
+  // A disabled numbering proof is a setting, not a verdict: its refusal is never memoized, so switching it on takes effect.
   const numberingOff = plan.human && !numberingSetting.value;
   let proof = numberingOff ? { ok: false, reason: 'numbering carry disabled' } : prove({ exec, cwd, fromSha: plan.from, toSha: plan.to });
   if (!proof.ok && netSetting.value) {
