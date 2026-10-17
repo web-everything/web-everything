@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createPrestageCache, resolvePrestageSettings, prestageCi, labelSignature, enqueuePrestage } from '../drain-prestage.mjs';
+import { createPrestageCache, resolvePrestageSettings, prestageCi, labelSignature, enqueuePrestage, prestageRequiredChecks } from '../drain-prestage.mjs';
 import { classifyPr, buildDrainVerdicts, needsManifestStripBeforeMerge, attachLiveFixClaim } from '../../merge-ai-prs.mjs';
 import { aiPr } from '../../__tests__/fixtures/merge-ai-prs-fixtures.mjs';
 
@@ -248,6 +248,42 @@ describe('CI pre-stage', () => {
   it.each(['FAILURE', 'CANCELLED', 'TIMED_OUT'])('does not prepare %s', conclusion => {
     const p = pending(); p.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion };
     expect(classifyPr(p, { preparePendingCi: true, queueRequiredChecks: ['test'] }).decision).toBe('skip');
+  });
+  // The drain's own `--check` gates the full drain too, so it must gate preparation and the cached enqueue.
+  it.each([
+    ['FAILURE', 'skip'], ['CANCELLED', 'skip'], ['SKIPPED', 'skip'], [null, 'skip'],
+    ['SUCCESS', 'merge'], ['PENDING', 'merge'],
+  ])('preparation honours an explicitly selected check (smoke=%s → %s)', (state, decision) => {
+    const p = pending();
+    if (state === 'PENDING') p.statusCheckRollup.push({ name: 'smoke', status: 'IN_PROGRESS', conclusion: null, head_sha: head });
+    else if (state) p.statusCheckRollup.push({ name: 'smoke', status: 'COMPLETED', conclusion: state, head_sha: head });
+    const v = classifyPr(p, { preparePendingCi: true, queueRequiredChecks: ['test'], requiredCheck: 'smoke' });
+    expect(v.decision).toBe(decision);
+    expect(!!v.prestagePendingCi).toBe(decision === 'merge');
+  });
+  it('the prepared check set includes the drain check once, and never invents one without queue checks', () => {
+    expect(prestageRequiredChecks(['test'], 'smoke')).toEqual(['test', 'smoke']);
+    expect(prestageRequiredChecks(['test'], 'test')).toEqual(['test']);
+    expect(prestageRequiredChecks(['test'], undefined)).toEqual(['test']);
+    expect(prestageRequiredChecks([], 'smoke')).toEqual([]);
+    expect(prestageRequiredChecks(null, 'smoke')).toBeNull();
+  });
+  it.each([
+    [{ name: 'smoke', status: 'COMPLETED', conclusion: 'FAILURE', head_sha: head }, { enqueued: false, reason: 'required checks red' }],
+    [{ name: 'smoke', status: 'IN_PROGRESS', conclusion: null, head_sha: head }, { enqueued: false, reason: 'required checks pending' }],
+    [null, { fallback: true }],
+  ])('a cached enqueue re-checks the drain check it was invoked with (%j)', async (row, expected) => {
+    const f = fixture({ requiredCheck: 'smoke' });
+    green(f);
+    if (row) f.pr.statusCheckRollup.push(row);
+    expect(await f.run()).toMatchObject(expected);
+    expect(f.enqueue).not.toHaveBeenCalled();
+  });
+  it('a cached enqueue with a green drain check still enqueues', async () => {
+    const f = fixture({ requiredCheck: 'smoke' });
+    green(f);
+    f.pr.statusCheckRollup.push({ name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: head });
+    expect(await f.run()).toEqual({ enqueued: true });
   });
   it('missing requirements, wrong-head rows and conflicts cannot grant a shortcut', () => {
     const p = pending();

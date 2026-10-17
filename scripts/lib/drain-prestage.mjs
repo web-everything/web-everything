@@ -20,6 +20,13 @@ export function resolvePrestageSettings({ env = process.env, tool, platform, log
 export const labelSignature = labels => Array.isArray(labels)
   ? JSON.stringify(labels.map(l => typeof l === 'string' ? l : l?.name).sort()) : null;
 
+/** The contexts a pending head must clear: GitHub's queue-required checks plus the drain's own `--check`, which the
+ *  full drain also gates on. Without known queue checks there is nothing to prepare against, so none is invented. */
+export function prestageRequiredChecks(queueRequiredChecks, requiredCheck) {
+  if (!Array.isArray(queueRequiredChecks) || !queueRequiredChecks.length) return queueRequiredChecks;
+  return [...new Set([...queueRequiredChecks, ...(requiredCheck ? [requiredCheck] : [])])];
+}
+
 /** Require a real row for EVERY required context, even if another check normally implies it. */
 export function prestageCi(pr, requiredChecks) {
   if (!Array.isArray(requiredChecks) || !requiredChecks.length || !Array.isArray(pr?.statusCheckRollup)) return 'unknown';
@@ -71,8 +78,9 @@ export function prestageLiveHold(pr) {
  * `beforeEnqueue(candidate, headSha, entry)` runs the cascade's pre-landing steps once every check passed,
  * `fixClaimHeld` is re-read inside the merge-write lock (a fixer may claim the PR while this waits for it), and
  * `recordLanded(candidate, headSha)` writes the ledger facts the full cascade writes after a confirmed enqueue.
+ * `requiredCheck` is this run's drain `--check`: it is re-checked even when preparation ran under another one.
  */
-export async function enqueuePrestage({ cache, repo, num, settings, readPr, enqueue, withLock, beforeEnqueue, fixClaimHeld, recordLanded, blockOnCodeQL = loadDrainGateSettings().drainBlocksOnCodeQL }) {
+export async function enqueuePrestage({ cache, repo, num, settings, readPr, enqueue, withLock, beforeEnqueue, fixClaimHeld, recordLanded, requiredCheck, blockOnCodeQL = loadDrainGateSettings().drainBlocksOnCodeQL }) {
   if (!settings.value.prestageWhileCiRuns || [beforeEnqueue, fixClaimHeld, recordLanded].some(hook => typeof hook !== 'function')) return { fallback: true };
   const entry = cache.get(repo, num, settings.value.prestageTtlMin);
   if (!entry?.eligible) return { fallback: true };
@@ -94,7 +102,7 @@ export async function enqueuePrestage({ cache, repo, num, settings, readPr, enqu
     cache.drop(repo, num);
     return { enqueued: false, reason: 'CodeQL check failed' };
   }
-  const ci = prestageCi(pr, entry.requiredChecks);
+  const ci = prestageCi(pr, prestageRequiredChecks(entry.requiredChecks, requiredCheck));
   if (ci === 'red') { cache.drop(repo, num); return { enqueued: false, reason: 'required checks red' }; }
   if (ci === 'unknown') return { fallback: true };
   if (ci !== 'green') return { enqueued: false, reason: `required checks ${ci}` };

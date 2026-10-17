@@ -73,9 +73,9 @@ async function world(fn, { slug = 'fixture/prestage' } = {}) {
       commits: [{oid:sha,messageHeadline:'Update readme',authors:[{name:'Claude',email:'noreply@anthropic.com'}]}],
       statusCheckRollup: [{name:'test',status:'IN_PROGRESS',conclusion:null,head_sha:sha}],
       comments: [{author:{login:'chalbert'},body:'<!-- reviewed-sha: '+sha+' -->',createdAt:new Date().toISOString()}], reviews: [] };
-    const run = (green = false, { rebaseDrop = false, numbering = false } = {}) => {
+    const run = (green = false, { rebaseDrop = false, numbering = false, args = [] } = {}) => {
       writeFileSync(fixture, JSON.stringify(pr)); writeFileSync(log, '');
-      const r = spawnSync(process.execPath, [script, '--this-repo','--label=ready-to-merge','--only=42', '--json',
+      const r = spawnSync(process.execPath, [script, '--this-repo','--label=ready-to-merge','--only=42', '--json', ...args,
         '--no-drain-lease','--no-red-main-freeze',...(!rebaseDrop ? ['--no-rebase-drop'] : []),'--no-heal-collision','--no-overlap-yield',
         ...(green ? ['--from-green-event'] : [])], { cwd:dir,encoding:'utf8',timeout:120_000, // a loaded host can push one real drain run past 30s
         env: { ...process.env, PATH:bin+':'+process.env.PATH, PRESTAGE_PR:fixture,PRESTAGE_LOG:log, PRESTAGE_REPO:slug,
@@ -132,6 +132,28 @@ describe('real drain pre-stage path', () => {
     expect(next.report, next.stderr).toMatchObject({prestaged:true,enqueueOutcomes:[{num:42,outcome:'enqueued'}]});
     const rows = readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse);
     expect(rows.filter(r => r.type === EVENT_TYPES.RELEASE)).toEqual([expect.objectContaining({ pr: 42, reasonCode: 'ci-red', holdSource: 'drain' })]);
+  }));
+  it('a failed explicitly selected --check is never prepared', () => world(({pr,run,coord}) => {
+    pr.statusCheckRollup.push({name:'smoke',status:'COMPLETED',conclusion:'FAILURE',head_sha:sha});
+    expect(run(false, { args:['--check=smoke'] }).stderr).not.toContain('prepared while CI pending');
+    expect(() => readdirSync(join(coord,'drain-prestage'))).toThrow();
+  }));
+  it('a green event re-checks the explicitly selected --check that failed after preparation', () => world(({pr,run}) => {
+    pr.statusCheckRollup.push({name:'smoke',status:'IN_PROGRESS',conclusion:null,head_sha:sha});
+    expect(run(false, { args:['--check=smoke'] }).stderr).toContain('eligible=true');
+    pr.statusCheckRollup = [{name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha},
+      {name:'smoke',status:'COMPLETED',conclusion:'FAILURE',head_sha:sha}];
+    const next = run(true, { args:['--check=smoke'] });
+    expect(next.report.prestaged, next.stderr).toBe(true);
+    expect(next.report.enqueueOutcomes).toMatchObject([{num:42,outcome:'not-enqueued',reason:'required checks red'}]);
+    expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
+  }));
+  it('a green event under a different --check than preparation still checks it', () => world(({pr,run}) => {
+    expect(run().stderr).toContain('eligible=true');
+    pr.statusCheckRollup = [{name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha},
+      {name:'smoke',status:'COMPLETED',conclusion:'FAILURE',head_sha:sha}];
+    const next = run(true, { args:['--check=smoke'] });
+    expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
   }));
   it('a native changes-requested review filed after preparation falls back to the full drain', () => world(({pr,run}) => {
     expect(run().stderr).toContain('eligible=true');

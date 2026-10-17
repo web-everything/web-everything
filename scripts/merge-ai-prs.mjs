@@ -186,7 +186,7 @@ import { deliveredItemNumsFromPr, deliveredHashFromPr, declaredResolvedIdsFromPr
 // leaf so plateau-app's drain-daemon guard can mirror it (and a cross-repo contract test can pin the mirror
 // to this source). See scripts/lib/reconcile-predicate.mjs for the full rationale.
 import { parseArgvFlags, reconcileWouldRunFor } from './lib/reconcile-predicate.mjs';
-import { createPrestageCache, resolvePrestageSettings, prestageCi, labelSignature, enqueuePrestage } from './lib/drain-prestage.mjs';
+import { createPrestageCache, resolvePrestageSettings, prestageCi, prestageRequiredChecks, labelSignature, enqueuePrestage } from './lib/drain-prestage.mjs';
 import { reviewCiGate } from './lib/review-ci-gate.mjs';
 import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, handleRequiredWorkflowsRefusal, resolveRefreshOnStaleMergeGate, handleStaleMergeGate } from './lib/merge-queue-enqueue.mjs';
 import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
@@ -995,7 +995,7 @@ export const prestageFixClaimHeld = (num, { claimKey, readClaim = readLiveFixCla
  */
 export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-merge', allowPendingReview = false, defaultBranch = null, blockOnCodeQL = DRAIN_GATE_SETTINGS.drainBlocksOnCodeQL, queueRequiredChecks = null, preparePendingCi = false } = {}) {
   const prestagePendingCi = preparePendingCi && hasLabel(pr, REVIEW_LABELS.accepted) && hasLabel(pr, 'ready-to-merge') && !pr.isDraft
-    && prestageCi(pr, queueRequiredChecks) === 'pending';
+    && prestageCi(pr, prestageRequiredChecks(queueRequiredChecks, requiredCheck)) === 'pending';
   const num = pr?.number;
   const title = pr?.title || '';
   const aiGenerated = isAiGeneratedPr(pr);
@@ -5028,6 +5028,7 @@ async function runCli() {
       beforeEnqueue: (c, sha, entry) => announceAndRetargetBeforeLand(c, { preread: fetchPrComments(c.repo, c.num), defaultBranch: entry.baseRefName }),
       enqueue: (c, sha, entry) => mergeStrategy.enqueue(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }),
       recordLanded: recordLandedLedgerFacts,
+      requiredCheck: REQUIRED,
     });
     if (!fast.fallback) {
       const result = { ok: true, prestaged: true, considered: 1, merged: [], failed: [], pendingRebased: [], deferred: [],
@@ -6461,7 +6462,7 @@ async function runCli() {
         branchPreparationRequired: branchPreparationRequired(c), queueAdmission });
       prestageCache.put(c.repo || localSlug, c.num, {
         headSha: c.listedHeadSha, labels: labelSignature(row.labels), body: row.body, baseRefName: row.baseRefName,
-        requiredChecks: queueRequiredChecksOf(c.repo), candidate: c, eligible, queueAdmission,
+        requiredChecks: prestageRequiredChecks(queueRequiredChecksOf(c.repo), REQUIRED), candidate: c, eligible, queueAdmission,
         conflict: c.mergeable, mergeability: c.state, gate: c.reviewGate,
         mergeGateInputs: { candidacy: c.decision, couple: { carrier: c.coupleCarrier ?? null, refs: c.manifestRepoRefs ?? [], defer: c.coupleDeferReason ?? null }, blockedBy: c.blockedBy },
         humanOnlySurface: { files: c.prestageHumanBasisFiles ?? c.changedFiles, humanRequired: c.humanRequired, reasons: c.escalateReasons },

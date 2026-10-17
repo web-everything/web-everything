@@ -1550,7 +1550,9 @@ The drain caches non-CI gate dispositions for accepted pending heads carrying `r
 bound to repo, PR and head. Green check events may consume this preparation before listing;
 head, label, body/base changes and TTL expiry require the full fast drain. So do the live fields the full
 classifier reads that move no cached signature: a `CHANGES_REQUESTED`/`REVIEW_REQUIRED` review decision,
-`mergeable` other than `MERGEABLE`, and a merge state other than `CLEAN`, `UNSTABLE` or `BLOCKED`. Every required
+`mergeable` other than `MERGEABLE`, and a merge state other than `CLEAN`, `UNSTABLE` or `BLOCKED`. The required
+set is GitHub's queue-required checks plus the drain's own `--check` (`prestageRequiredChecks`): a failed selected
+check is never prepared, and the green event re-checks the `--check` it was invoked with. Every required
 context needs its own successful row before enqueue; missing, pending, cancelled and red
 contexts never authorize enqueue. A newly failed optional CodeQL check also vetoes admission when
 `drainBlocksOnCodeQL` is enabled. Red-team evidence and the complete comment thread are re-read at enqueue;
