@@ -29,9 +29,9 @@ describe('parseRedTeamComment', () => {
     expect(p.findings[1]).toMatchObject({ index: 2, confirmed: true, category: 'failing-input', impact: 'degraded', line: 29 });
   });
 
-  it('is the exact inverse of the producer\'s renderer', () => {
+  it('round-trips published fields and withholds free-text re-check reasons', () => {
     const findings = [
-      { summary: 'a break', category: 'security', impactIfUnfixed: 'unrecoverable', file: 'a/b.mjs', line: 3, failure_scenario: 'do x', confirmedByRecheck: true, recheckReason: 'real' },
+      { summary: 'a break', category: 'security', impactIfUnfixed: 'unrecoverable', file: 'a/b.mjs', line: 3, failure_scenario: 'do x', confirmedByRecheck: true, recheckReason: 'demonstrated break' },
       { summary: 'maybe', category: 'edge-case', impactIfUnfixed: null, file: null, line: null, confirmedByRecheck: false, recheckReason: 'speculative' },
       { summary: 'slow', category: 'failing-input', impactIfUnfixed: 'cosmetic', file: 'c.mjs', line: null, confirmedByRecheck: true, recheckReason: null },
     ];
@@ -43,7 +43,10 @@ describe('parseRedTeamComment', () => {
       [2, false, 'edge-case', null, null, null],
       [3, true, 'failing-input', 'cosmetic', 'c.mjs', null],
     ]);
-    expect(p.findings[0]).toMatchObject({ summary: 'a break', scenario: 'do x', recheck: 'real' });
+    expect(p.findings[0]).toMatchObject({ summary: 'a break', scenario: 'do x', recheck: 'demonstrated break' });
+    expect(p.findings[1]).toMatchObject({ summary: 'maybe', recheck: 'reason withheld', recheckOutcome: 'unverifiable' });
+    expect(body).not.toContain('speculative');
+    expect(p.findings[2]).toMatchObject({ summary: 'slow', recheck: null });
   });
 
   it('a model-written field cannot forge a confirmed finding line (every rendered field is one line)', () => {
