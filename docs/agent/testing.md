@@ -1166,7 +1166,15 @@ queue, so it uses the fallback. Test restarts, head resets, request/fallback, po
 comment-read backoff before the deadline. Review jobs publish head-bound running/finished evidence
 in the shared operations sidecar; a pid probe distinguishes an active process from a crashed one.
 A confirmed send-back finding still holds during the result-comment → gate-label race. Queue
-removal probes must observe `isInMergeQueue=false` after `dequeuePullRequest`, and replay the gate and
+admission must also read the exact combined comment emitted by verdict carry: gate markers,
+the carried marker and producer prose, then the re-keyed advisory. Test the real review job's
+carry path, CRLF, stale/foreign/untrusted markers and malformed or quoted layouts. An operator's
+later `clear-human` ceremony on the same head releases findings handed over at the round cap;
+an ordinary accept, restamp alone, superseded clearance or ruling before the finding does not.
+Preserve a proven ruling through chains of identical-contribution carries. Both paginated comment
+reads (admission and clearance dedupe) allow 256 MiB with a timeout; exercise a thread above
+Node's default 1 MiB using a real child process, retaining the complete thread and clearance stamp.
+Queue removal probes must observe `isInMergeQueue=false` after `dequeuePullRequest`, and replay the gate and
 drain backstop to verify one mutation and one reason comment. Include a PR missing `ready-to-merge`
 from the unfiltered open listing, without a durable follow-up entry. Both safeguards resolve through
 the `drain` policy cascade and default on; test off switches without using the host's live GitHub IO.

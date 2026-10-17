@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { describe, it, expect } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -23,9 +24,15 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
   let stored = initial;
   let mutated = false;
   let removed = false;
-  const exec = (cmd, args) => {
+  const exec = (cmd, args, opts) => {
     calls.push([cmd, ...args]);
-    if (args.includes('--slurp')) return JSON.stringify([liveComments ?? ghView[args[2]]?.comments ?? []]);
+    if (args.includes('--slurp')) {
+      // Exercise Node's real output-buffer limit for the oversized-thread regression.
+      const out = JSON.stringify([liveComments ?? ghView[args[2]]?.comments ?? []]);
+      if (Buffer.byteLength(out) > 1024 * 1024) return execFileSync(process.execPath,
+        ['-e', 'process.stdin.pipe(process.stdout)'], { ...opts, input: out, stdio: ['pipe', 'pipe', 'pipe'] });
+      return out;
+    }
     if (args[0] === 'pr' && args[1] === 'merge') throw new Error('merge API must never be called');
     if (args[0] === 'pr' && args[1] === 'comment') return '';
     if (args[0] === 'api' && args[1] === 'user') { if (selfLogin == null) throw new Error('gh: not logged in'); return `${selfLogin}\n`; }
@@ -574,6 +581,47 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     const result = { ...identity, body: `<!-- we:red-team-advisory pr=5283 rev=${HEAD} -->\n### Post-accept red team — no break found` };
     const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], liveComments: [result] });
     expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [result] })).toMatchObject({ enqueued: true });
+  });
+  it('reads a complete comment thread larger than 1 MiB', () => {
+    const result = { user: { login: 'web-everything[bot]' }, body: `<!-- we:red-team-advisory pr=5283 rev=${HEAD} -->\n### Post-accept red team — no break found` };
+    const bulk = Array.from({ length: 24 }, () => ({ user: { login: 'someone' }, body: 'x'.repeat(50_000) }));
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], liveComments: [result, ...bulk] });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [result] })).toMatchObject({ enqueued: true });
+    // The clearance dedupe read is the same complete-thread read: it must not defer the stamp either.
+    expect(h.logs.join('')).not.toContain('clearance dedupe read failed');
+    expect(h.calls.filter(c => c[2] === 'comment')).toHaveLength(1);
+  });
+  it('enqueues on a REST-shaped carried clean result (carryAcrossRebase)', () => {
+    const prior = 'a'.repeat(40);
+    const carried = { user: { login: 'web-everything[bot]' }, body: [
+      `<!-- review-verdict-carried from=${prior} to=${HEAD} patch-id=${'c'.repeat(40)} -->`,
+      'Review verdict carried across an identical contribution.',
+      `<!-- we:red-team-advisory pr=5283 rev=${HEAD} -->`, '### Post-accept red team — no break found'].join('\n') };
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], liveComments: [carried] });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [carried] })).toMatchObject({ enqueued: true });
+  });
+  it('a real round-cap record followed by the clear-human renderer releases admission before retry backoff', async () => {
+    const { applyRedTeamGate } = await import('../../operations/red-team-gate-apply.mjs');
+    const { renderRedTeamComment } = await import('../../operations/review-extra-seats.mjs');
+    const { buildVerdictComment } = await import('../../review-set-label.mjs');
+    const { CONFIRMED_BREAKS_DEFAULTS } = await import('../red-team-gate.mjs');
+    const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
+      pr: 5283, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+      findings: [{ summary: 'known risk', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }],
+    }) }];
+    const labels = ['review:accepted', 'ready-to-merge'];
+    const gate = await applyRedTeamGate({ repo: LOCAL, pr: 5283 }, {
+      readPr: () => ({ headRefOid: HEAD, labels: ['review:human'], comments: thread }),
+      readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }), readRound: () => 5,
+      postComment: ({ body }) => thread.push({ user: { login: 'web-everything[bot]' }, body }),
+    });
+    expect(gate.outcome).toBe('round-cap');
+    const h = harness({ strategy: 'github-merge-queue', labels, liveComments: thread, now: () => 1000 });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: thread })).toMatchObject({ kind: 'red-team-pending' });
+    thread.push({ user: { login: 'web-everything[bot]' }, body: buildVerdictComment({
+      to: 'clear-human', actor: 'operator', headSha: HEAD, reason: 'accept the documented known risk',
+    }) });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: thread })).toMatchObject({ enqueued: true });
   });
   it('keeps an untrusted REST clean marker pending without enqueue or clearance', () => {
     const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'],

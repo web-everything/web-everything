@@ -14,6 +14,8 @@ import {
   RED_TEAM_DISCARD_DISPATCH_KIND, redTeamReadFingerprint, recordDiscardedRedTeam, ACTIVE_SEAT_PIDS, killActiveSeats,
 } from '../review-extra-seats.mjs';
 import { validateScorecard } from '../../conveyor/run-scorecard-store.mjs';
+import { redTeamEnqueueHold } from '../../lib/drain-queue-safety.mjs';
+import { renderRedTeamComment } from '../review-extra-seats.mjs';
 
 const REPO = 'web-everything/web-everything';
 const REV = 'a'.repeat(40);
@@ -70,6 +72,24 @@ function jobIo({ verdict = 'accept', setting = { value: 'on', enabled: true, sou
 const kinds = (calls) => calls.filter((c) => c[0] !== 'log').map((c) => c[0]);
 
 describe('runReviewJob under review.speculativeRedTeam', () => {
+  it('the actual carry comment releases queue admission without starting another review or red team', () => {
+    const head = 'b'.repeat(40);
+    const comments = [
+      { author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${REV} -->` },
+      { author: { login: 'web-everything' }, body: renderRedTeamComment({ pr: 10, rev: REV, findings: [], provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'accept' }) },
+    ];
+    const { io, calls } = jobIo({ over: {
+      carryAcrossRebaseSetting: () => ({ value: 'on', source: 'test' }),
+      readCarryEvidence: () => ({ headSha: head, comments }),
+      contributionPatchId: () => 'c'.repeat(40),
+      restampVerdict: () => ({ ok: true }),
+      postCarryComment: ({ body }) => comments.push({ user: { login: 'web-everything[bot]' }, body }),
+    } });
+    expect(runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io).outcome).toBe('carried');
+    expect(kinds(calls)).toEqual([]);
+    expect(redTeamEnqueueHold({ loopPayload: payload('accept'), comments, pr: 10, head, env: {} })).toBeNull();
+  });
+
   it.each([true, false])('publishes head-bound liveness around the accepted pass (speculative=%s)', enabled => {
     const events = [];
     const { io } = jobIo({ setting: { enabled }, over: {

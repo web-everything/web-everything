@@ -51,6 +51,7 @@ export const MERGE_DELIVERY_SETTINGS_FILE_ENV = 'WE_MERGE_DELIVERY_SETTINGS_FILE
 export const CLEARANCE_MARKER = 'we-drain-enqueue-clearance';
 const CLEARANCE_RE = new RegExp(`<!--\\s*${CLEARANCE_MARKER}\\s+head=([0-9a-f]{7,40})\\s*-->`, 'gi');
 const FOLLOWED_UP_CAP = 500;
+const COMMENTS_MAX_BUFFER = 256 * 1024 * 1024; // = merge-ai-prs PR_COMMENTS_MAX_BUFFER (that CLI imports this module)
 export const FOLLOW_UP_MAX_ATTEMPTS = 5;
 
 export function queueStatePath(env = process.env) { return join(resolveCoordinationRoot({ env }), 'drain-merge-queue-followups.json'); }
@@ -246,6 +247,8 @@ export function createDrainMergeStrategy({
     return { enqueued: false, deferred: true, kind: 'red-team-pending', reason: pending.reason, healthSmell };
   };
   const readLive = (repo, num) => JSON.parse(exec('gh', ['pr', 'view', String(num), '--repo', slugOf(repo), '--json', 'headRefOid,labels'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+  // The complete thread as pages. The drain's own comment reader allows 256 MiB: a long thread must not hit the 1 MiB default.
+  const readThreadPages = (repo, num) => JSON.parse(exec('gh', ['api', '--paginate', '--slurp', `repos/${slugOf(repo)}/issues/${num}/comments`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: COMMENTS_MAX_BUFFER, timeout: 120_000 }));
   const removeSentBack = (repo, num, labels) => {
     if (dryRun || !safety.value.dequeueOnSendBack || !Array.isArray(labels)) return;
     const reason = sendBackReason(labels);
@@ -318,7 +321,7 @@ export function createDrainMergeStrategy({
         const newComment = Array.isArray(comments) && comments.length > (pending?.commentCount ?? 0);
         // At the deadline recheck evidence and comments even if the normal retry backoff is longer.
         if (owed && sameHead && pending.retryAt > now() && !newComment && !overdue) return pendingOutcome(c, pending);
-        const pages = JSON.parse(exec('gh', ['api', '--paginate', '--slurp', `repos/${slugOf(c.repo)}/issues/${c.num}/comments`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+        const pages = readThreadPages(c.repo, c.num);
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team admission: unreadable complete comments');
         const reason = redTeamEnqueueHold({ loopPayload: evidence.loopPayload, comments: pages.flat(), pr: c.num, head: headSha, env });
         if (reason) {
@@ -403,7 +406,7 @@ export function createDrainMergeStrategy({
       // per pass, and only when some marker for this head exists) that fails or finds no match stamps again.
       if (!savedStamp) {
         try {
-          const pages = JSON.parse(exec('gh', ['api', '--paginate', '--slurp', `repos/${slugOf(c.repo)}/issues/${c.num}/comments`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+          const pages = readThreadPages(c.repo, c.num);
           if (!Array.isArray(pages) || pages.some(page => !Array.isArray(page))) throw new Error('malformed comments response');
           comments = [...(comments || []), ...pages.flat()];
         } catch (e) {
