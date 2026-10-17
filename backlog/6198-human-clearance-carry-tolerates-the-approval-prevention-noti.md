@@ -2,11 +2,12 @@
 bornAs: xuh9f10
 kind: story
 size: 2
-status: active
+status: resolved
 scaffoldedBy: "prevention-note-carry"
 dateScaffolded: "2026-10-17"
 scope: ["we:scripts/lib/accept-carry-forward.mjs", "we:scripts/lib/approval-prevention-notice.mjs", "we:scripts/lib/__tests__/"]
 dateOpened: "2026-10-17"
+dateResolved: "2026-10-17"
 tags: []
 ---
 
