@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { ownReviewScratch, removeReviewScratch } from '../lib/review-scratch.mjs';
 import { openOperatorSendBacks, renderOperatorSendBackReviewBlock } from '../lib/operator-send-backs.mjs';
 import { PROVIDER_CAP_ENV, resolveProviderCap } from './review-seat-policy.mjs';
 export { DAILY_CAP_ENV, DEFAULT_DAILY_CAP, PROVIDER_CAP_ENV, PROVIDER_CAP_DEFAULT, resolveProviderCap, resolveDailyCap } from './review-seat-policy.mjs';
@@ -638,7 +639,7 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
       });
       await Promise.all(calls);
     } finally {
-      if (scratch) { try { io.removeScratch(scratch); } catch { /* a stray temp dir is harmless */ } }
+      if (scratch) { try { io.removeScratch(scratch); } catch { io.log(`review scratch cleanup failed; TTL sweep will retry`); } }
     }
     return { status: 'ran', seats, skipped, callsUsedToday: totalUsedToday, dailyCap: totalDailyCap, providerUsage, rowsWritten };
   } catch (e) {
@@ -810,12 +811,18 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
         const r = spawnSync('git', args, { encoding: 'utf8', timeout: 5 * 60 * 1000 });
         if (r.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${String(r.stderr).trim().slice(0, 300)}`);
       };
-      git(['init', '--quiet', dir]);
-      git(['-C', dir, 'fetch', '--quiet', '--no-tags', '--depth=1', lanePath, rev]);
-      git(['-C', dir, 'checkout', '--quiet', '--detach', 'FETCH_HEAD']);
-      return dir;
+      try {
+        ownReviewScratch(dir, killActiveSeats);
+        git(['init', '--quiet', dir]);
+        git(['-C', dir, 'fetch', '--quiet', '--no-tags', '--depth=1', lanePath, rev]);
+        git(['-C', dir, 'checkout', '--quiet', '--detach', 'FETCH_HEAD']);
+        return dir;
+      } catch (error) {
+        removeReviewScratch(dir);
+        throw error;
+      }
     },
-    removeScratch: (dir) => rmSync(dir, { recursive: true, force: true }),
+    removeScratch: removeReviewScratch,
     writeFile: (path, text) => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, text); },
     runSeat: ({ provider, taskFile, dir, model, effort, timeoutMs }) => new Promise((resolvePromise) => {
       const argv = seatCallArgv({ provider, taskFile, dir, model, effort, timeoutMs, root });
@@ -1418,7 +1425,7 @@ export async function speculateRedTeam({
       evidence = run?.report ?? {};
       quota = { usedPercent: run?.report?.quotaUsedPercent ?? null, resetsAt: toIsoInstant(run?.report?.quotaResetsAt) };
     } finally {
-      if (scratch) { try { io.removeScratch(scratch); } catch { /* harmless */ } }
+      if (scratch) { try { io.removeScratch(scratch); } catch { io.log(`review scratch cleanup failed; TTL sweep will retry`); } }
     }
     const ran = call?.status === 'ok' && parsed?.[RED_TEAM_SEAT.key]?.ok === true;
     const rawFindings = ran ? (parsed[RED_TEAM_SEAT.key]?.findings ?? []) : [];
@@ -1611,9 +1618,11 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
           scratch = base.makeScratch({ lanePath, rev });
           // Keep the independent pinned clone under the lane shape assertLaneCwd enforces.
           parent = mkdtempSync(join(tmpdir(), 'we-red-team-recheck-'));
+          ownReviewScratch(parent, killActiveSeats);
           cwd = join(parent, '.lanes', 'red-team-recheck', 'lane-1');
           mkdirSync(dirname(cwd), { recursive: true });
           renameSync(scratch, cwd);
+          removeReviewScratch(scratch); // release the old, now empty path from ownership
           scratch = null;
         }
         const out = await spawn({
@@ -1628,7 +1637,7 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
           ? { ...c, filesRead: publishableFilesRead(c.filesRead, readsRepo ? cwd : null) } : c) };
       } finally {
         if (scratch) base.removeScratch(scratch);
-        if (parent) rmSync(parent, { recursive: true, force: true });
+        if (parent) removeReviewScratch(parent);
       }
     },
     logTrial: (row) => logDelegationTrial(row, storePath ? { path: storePath } : {}),

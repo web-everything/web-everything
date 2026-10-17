@@ -1515,3 +1515,20 @@ reads the existing runs folder without migration or writes; `OPERATION_RUNS_DIR`
 it. `--since=<iso>` selects runs by earliest seat start. Incomplete runs are shown but
 excluded from median, nearest-rank p90 and the >5-minute early-change share denominator.
 Legacy runs without seat observations are omitted; absent times are never reconstructed.
+
+## Review scratch disk retention
+
+Review seats use independent shallow pinned checkouts: a released lane's objects cannot be
+borrowed safely across reset/GC. Own the scratch immediately after allocation, clean failed
+setup as well as the run's `finally`, and register catchable signal/exit cleanup. SIGKILL and
+host crashes require the health-watch backstop. Ephemeral review paths bypass the persistent
+backlog index to avoid a full snapshot for every seat.
+
+Each health-watch tick sweeps `we-review-seat-*` and `we-overlay-dispatch-smoke-*` older than
+`config.json`'s `tmp.reviewSeatTtlMin` (120 minutes), preserving live owner PIDs and process
+working directories. Unknown cwd observation preserves checkouts. It also caps all
+`we-backlog-index-*` files together at `tmp.backlogIndexMaxMb` (2048 MiB), oldest first.
+Sweep logs include counts and bytes freed. Symlinks are never traversed.
+The `disk-space` smell probes available space on the checkout's writable data filesystem:
+warn below `health.diskFreeMinGb` (30 GiB), critical below 10 GiB. It opens immediately,
+notifies in shadow mode, and sends an opening event to the needs-you feed.

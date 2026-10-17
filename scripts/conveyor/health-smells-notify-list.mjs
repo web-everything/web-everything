@@ -26,6 +26,7 @@
  * (never approved to notify by any decision so far) stays record-only (shadow).
  */
 export const NOTIFY_EVEN_IN_SHADOW = new Set([
+  'disk-space',
   // Previously approved (earlier operator decisions; the old scattered `notifyEvenInShadow: true` field) — kept.
   'claude-auth-expired',
   'daemon-held-on-last-good',
