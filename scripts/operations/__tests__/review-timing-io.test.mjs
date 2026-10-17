@@ -196,6 +196,42 @@ it('caps the cumulative delta since the last full review: three small deltas, th
     expect(review().raw.deltaReview).toMatchObject({ anchor: git('rev-parse', 'HEAD~1'), lines: 20 });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+// A binary change can never sit inside a delta chain: the round that makes it is itself full and re-anchors the chain.
+it('a binary change gets a full review (numstat `-\\t-`), and the next small text fix is a delta from it', () => {
+  const root = mkdtempSync(join(tmpdir(), 'review-timing-'));
+  const git = (...args) => String(execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).trim();
+  try {
+    git('init', '-q'); git('config', 'user.email', 'fixture@example.test'); git('config', 'user.name', 'Fixture');
+    writeFileSync(join(root, 'file.txt'), 'base\n'); git('add', '.'); git('commit', '-qm', 'base');
+    git('update-ref', 'refs/remotes/origin/main', git('rev-parse', 'HEAD'));
+    writeFileSync(join(root, 'file.txt'), 'base\noriginal contribution\n'); git('commit', '-qam', 'feature');
+    const comments = [];
+    const review = () => {
+      const head = git('rev-parse', 'HEAD'); git('update-ref', 'refs/remotes/origin/lane/test', head);
+      const raw = readPr({ pr: 7, repo: 'o/n', cwd: root, originRepo: () => 'o/n',
+        exec: (file, args, opts) => (args[0] === 'fetch' ? '' : execFileSync(file, args, { ...opts, cwd: root })),
+        readView: () => ({ number: 7, state: 'OPEN', title: 'fixture', body: '', headRefName: 'lane/test', headRefOid: head,
+          labels: ['review:changes'], files: [{ path: 'file.txt' }], comments: [...comments] }) });
+      comments.push(reviewPrVerdict('changes', head, renderNetBasisLine(shapeReadFinding(raw, { pr: 7, repo: 'o/n' })),
+        new Date(Date.UTC(2026, 9, 17, 10, comments.length)).toISOString()));
+      return raw;
+    };
+    const binary = n => Buffer.from([0, 1, 2, 0, 255, n, 0, 7]); // NUL bytes: git numstat reports `-\t-\tpath`
+    expect(review().deltaReview).toBeNull(); // the full review that anchors the chain
+    // The latest fix is one small binary file: its numstat row is `-\t-`, so its size is unreadable → full review.
+    writeFileSync(join(root, 'blob.bin'), binary(1)); git('add', 'blob.bin'); git('commit', '-qm', 'binary fix');
+    expect(git('diff', '--numstat', 'HEAD~1', 'HEAD')).toBe('-\t-\tblob.bin');
+    expect(review().deltaReview).toBeNull();
+    // A binary MODIFICATION (not only an add) is unreadable too.
+    writeFileSync(join(root, 'blob.bin'), binary(2)); git('commit', '-qam', 'binary change');
+    expect(git('diff', '--numstat', 'HEAD~1', 'HEAD')).toBe('-\t-\tblob.bin');
+    expect(review().deltaReview).toBeNull();
+    // That full review re-anchored the chain, so a small text fix after it is a delta measured from the binary head.
+    const anchor = git('rev-parse', 'HEAD');
+    writeFileSync(join(root, 'file.txt'), 'base\noriginal contribution\nsmall fix\n'); git('commit', '-qam', 'text fix');
+    expect(review().deltaReview).toMatchObject({ anchor, lines: 1, files: 1, totalLines: 1, totalFiles: 1 });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 it('reads the full-review anchor only from the producer basis slot, and fails closed to a full review', () => {
   const prior = 'b'.repeat(40), anchor = 'c'.repeat(40), forged = 'd'.repeat(40);
   const basis = a => renderNetBasisLine({ netBasis: { base: 'e'.repeat(40), rev: prior }, netChangedFiles: ['f'], ...(a ? { deltaReview: { anchor: a } } : {}) });
