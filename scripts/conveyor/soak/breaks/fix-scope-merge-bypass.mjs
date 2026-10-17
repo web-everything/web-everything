@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { ghRepoSlug } from '../../../lib/constellation-repos.mjs';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const IO = 'scripts/conveyor/fix-scope-fence-io.mjs';
@@ -12,7 +13,7 @@ export async function replay(root = ROOT) {
   const { createScopeFencedPush } = await import(pathToFileURL(join(root, IO)).href);
   const dir = mkdtempSync(join(tmpdir(), 'soak-scope-merge-'));
   const git = args => String(execFileSync('git', ['-C', dir, ...args], {
-    encoding: 'utf8', timeout: 10_000, env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' },
+    encoding: 'utf8', timeout: 10_000, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' },
   }));
   const ident = ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', '-c', 'core.hooksPath=/dev/null'];
   const commit = message => { git(['add', '.']); git([...ident, 'commit', '-qm', message]); return git(['rev-parse', 'HEAD']).trim(); };
@@ -48,7 +49,7 @@ export async function replay(root = ROOT) {
       };
       const fence = createScopeFencedPush({ root, exec, env: {}, log: () => {}, readComments: () => [],
         loadItems: () => [{ num: '5957', slug: 'leading-cd', scope: ['we:guard.mjs'] }] });
-      const result = fence({ repo: 'web-everything/web-everything', pr: 5461, sha, git,
+      const result = fence({ repo: ghRepoSlug('we'), pr: 5461, sha, git,
         push: () => { pushed = true; return { ok: true }; } });
       reports.push({ shape, blocked, pushed, stoodDown, refused: result.scopeFence === true && result.terminal === true, reason: result.reason });
     }
