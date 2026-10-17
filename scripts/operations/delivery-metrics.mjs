@@ -4,6 +4,8 @@
  * Usage: node scripts/operations/delivery-metrics.mjs [--date=YYYY-MM-DD]
  *   [--backfill=N] [--dry-run] [--json]. Default: yesterday in America/New_York.
  * Backfill includes the selected day and its N-1 preceding calendar days (1..366).
+ * One invocation shares a 500-call GitHub budget; failed reads abort without
+ * writing history, so a rate-limited backfill cannot keep consuming API calls.
  *
  * HISTORY CONTRACT (dashboard/digest must consume this, not scrape upstream):
  * delivery-metrics.jsonl in resolveCoordinationRoot(); one schemaVersion:1 row/date.
@@ -39,7 +41,7 @@
  * No HTTP endpoint: body/rate/CSRF/reset-trigger controls do not apply.
  */
 import * as fs from 'node:fs';
-import { dirname, join, resolve, isAbsolute } from 'node:path';
+import { dirname, join, resolve, isAbsolute, relative } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
@@ -47,7 +49,7 @@ import { readDeclaredSettings } from '../lib/settings-files.mjs';
 import { withFileLock } from '../lib/atomic-json-file.mjs';
 import { percentile, readBounded, makeGh, collectInputs } from './coroner-extract.mjs';
 import { fixLoopLedgerPath, readFixLoopRows, isStubSession } from '../conveyor/fix-loop-ledger.mjs';
-import { feedPath, replay, parseFeedLine } from './needs-you-feed.mjs';
+import { feedPath, parseFeedLine } from './needs-you-feed.mjs';
 import { readShadowRuns, reclassifyRow } from '../lib/ledger-promotion-readiness.mjs';
 import { summarizeShadow } from '../lib/drain-ledger-shadow.mjs';
 import { sharedRunsDir } from './run-store.mjs';
@@ -113,15 +115,32 @@ const inDay = (at, window) => Date.parse(at) >= Date.parse(window.since) && Date
 const missing = (source, reason = 'source unavailable') => ({ source, reason });
 const good = source => source && !source.reason && Array.isArray(source.rows);
 
+/** Resolve declared paths within their physical root, including symlink targets. */
+function containedPath(root, path) {
+  if (typeof path !== 'string' || !path || isAbsolute(path) || path.split('/').includes('..')) return null;
+  try {
+    const target = fs.realpathSync(join(root, path)), rel = relative(fs.realpathSync(root), target);
+    return isAbsolute(rel) || rel.split('/').includes('..') ? null : target;
+  } catch { return null; }
+}
+
 export function protocolProgress(protocols, { root = ROOT } = {}) {
   const content = entry => {
-    if (!entry?.path || isAbsolute(entry.path) || entry.path.split('/').includes('..')) return false;
-    try { return fs.readFileSync(join(root, entry.path), 'utf8').includes(entry.contains ?? ''); } catch { return false; }
+    const path = containedPath(root, entry?.path);
+    if (!path) return false;
+    try { return fs.readFileSync(path, 'utf8').includes(entry.contains ?? ''); } catch { return false; }
   };
   return protocols.map(p => {
     const rules = (p.rules ?? []).filter(content), fixtures = (p.fixtures ?? []).filter(content), callers = (p.callers ?? []).filter(content);
-    if (p.fixtureDirectory && !isAbsolute(p.fixtureDirectory) && !p.fixtureDirectory.split('/').includes('..')) {
-      try { for (const name of fs.readdirSync(join(root, p.fixtureDirectory)).filter(n => n.endsWith('.json')).sort()) { json(join(root, p.fixtureDirectory, name)); fixtures.push({ path: `${p.fixtureDirectory}/${name}` }); } } catch { /* no valid fixture evidence */ }
+    const fixtureDirectory = containedPath(root, p.fixtureDirectory);
+    if (fixtureDirectory) {
+      try {
+        for (const name of fs.readdirSync(fixtureDirectory).filter(n => n.endsWith('.json')).sort()) {
+          const path = containedPath(root, `${p.fixtureDirectory}/${name}`);
+          if (!path) continue;
+          try { json(path); fixtures.push({ path: `${p.fixtureDirectory}/${name}` }); } catch { /* invalid fixture is not evidence; keep counting valid siblings */ }
+        }
+      } catch { /* fixture directory unavailable */ }
     }
     const defined = rules.length > 0 && rules.length === (p.rules ?? []).length;
     const stage = !defined ? 'proposed' : !fixtures.length ? 'defined' : callers.length ? 'live' : 'fixtures';
@@ -181,7 +200,9 @@ function readSource(path, source, parse = text => text.split('\n').filter(Boolea
 export function collectMerged(repo, window, gh) {
   const source = `github:${repo}:merged`, slug = CONSTELLATION_REPOS[repo].slug, rows = [];
   try {
-    const query = `repo:${slug} is:pr is:merged merged:>=${window.since} merged:<${window.until}`;
+    // GitHub requires one range qualifier. Its inclusive upper endpoint is
+    // filtered locally only after checking the full search census below.
+    const query = `repo:${slug} is:pr is:merged merged:${window.since}..${window.until}`;
     let expected;
     for (let page = 1; page <= 10; page++) {
       const result = gh(['api', `search/issues?q=${encodeURIComponent(query)}&per_page=100&page=${page}`]);
@@ -203,7 +224,7 @@ export function collectMerged(repo, window, gh) {
       if (result.items.length < 100) break;
     }
     if (rows.length !== expected || new Set(rows.map(p => p.number)).size !== rows.length) return missing(source, 'GitHub merge search truncated or unstable');
-    return { source, rows };
+    return { source, rows: rows.filter(p => inDay(p.mergedAt, window)) };
   } catch { return missing(source, 'GitHub read failed'); }
 }
 /** Use the existing run-history reader without resolveRunsDir's legacy migration writes. */
@@ -234,17 +255,25 @@ export async function collectDay(date, { env = process.env, settings, gh = makeG
     return rows;
   }, 1024 * 1024);
   const feed = feedPath({ env });
-  inputs.needsYou = readSource(feed, 'needs-you-feed', text => { if (text.split('\n').filter(Boolean).some(line => !parseFeedLine(line))) throw new Error('invalid feed'); return replay({ path: feed }); });
+  inputs.needsYou = readSource(feed, 'needs-you-feed', text => {
+    const rows = text.split('\n').filter(Boolean).map(parseFeedLine);
+    if (rows.some(row => !row)) throw new Error('invalid feed');
+    return rows;
+  });
   inputs.agreement = collectAgreement(date, { env, readShadow });
   for (const key of ['incidents', 'restarts', 'decisions']) {
     const path = sources[key];
-    inputs[key] = typeof path === 'string' && !isAbsolute(path) && !path.split('/').includes('..') ? readSource(join(coord, path), `coordination:${path}`) : missing(key, 'no timestamped event source declared');
+    const contained = containedPath(coord, path);
+    inputs[key] = contained ? readSource(contained, `coordination:${path}`) : missing(key, 'no readable timestamped event source declared within coordination root');
     if (good(inputs[key]) && inputs[key].rows.some(r => !Number.isFinite(Date.parse(r?.at)) || (key === 'restarts' && !['restart', 'crash'].includes(r.kind)) || (key === 'decisions' && r.protocol !== null && typeof r.protocol !== 'string'))) inputs[key] = missing(inputs[key].source, 'invalid event schema');
   }
   try {
     const data = coroner(window, { env: { ...env, WE_CORONER_COORD: coord }, gh: null });
     inputs.sessionsByProvider = {
       claude: data.sources.jobs.found || data.sources.archive.found ? { source: 'coroner:worker-job-starts', rows: data.sessions.map(s => ({ at: s.state.createdAt || s.state.updatedAt, provider: 'claude' })) } : missing('coroner:worker-job-starts'),
+      // collectExecutorLogs increments count only after filtering starts to this
+      // window; old rollouts never consume its 600-run cap. At the cap it cannot
+      // prove completeness, so retain null rather than publish a partial census.
       codex: data.sources.codexSessions?.count >= 600 ? missing('coroner:codex-rollouts', 'session census reached reader cap (600)') : data.sources.codexSessions?.found ? { source: 'coroner:codex-rollouts', rows: (data.executorRuns?.codex ?? []).map(s => ({ at: s.at, provider: 'codex' })) } : missing('coroner:codex-rollouts'),
       gemini: missing('gemini', 'no Gemini session reader declared'),
     };
@@ -264,7 +293,7 @@ export function writeHistory(file, rows) {
     finally { try { fs.unlinkSync(tmp); } catch { /* renamed or never created */ } }
   });
 }
-export async function main(argv = process.argv.slice(2), { env = process.env, now = new Date(), settings, collect, write = writeHistory, output = console.log, log = console.error } = {}) {
+export async function main(argv = process.argv.slice(2), { env = process.env, now = new Date(), settings, collect, gh, githubCallBudget = 500, readShadow, coroner, write = writeHistory, output = console.log, log = console.error } = {}) {
   const flags = {};
   for (const arg of argv) {
     const match = /^--(date|backfill)=(.+)$/.exec(arg);
@@ -277,9 +306,23 @@ export async function main(argv = process.argv.slice(2), { env = process.env, no
   if (effective.enabled.value === false) { if (flags.json) output('[]'); return []; }
   const date = flags.date ?? shift(localDate(now), -1), dates = backfillDates(date, flags.backfill === undefined ? 1 : Number(flags.backfill));
   const rows = [];
+  if (!Number.isSafeInteger(githubCallBudget) || githubCallBudget < 1) throw new Error('invalid GitHub call budget');
+  const readGh = gh ?? makeGh({ env });
+  let ghCalls = 0, ghFailure;
+  const boundedGh = args => {
+    if (ghFailure) throw ghFailure;
+    if (ghCalls >= githubCallBudget) throw (ghFailure = new Error('GitHub call budget exhausted; collect a smaller backfill'));
+    ghCalls++;
+    try {
+      const result = readGh(args);
+      if (result === null || result === undefined) ghFailure = new Error('GitHub read unavailable; collection aborted');
+      return result;
+    } catch { throw (ghFailure = new Error('GitHub read failed; collection aborted')); }
+  };
   const resolvedFile = { delivery: { metrics: Object.fromEntries(Object.entries(effective).filter(([k]) => k !== 'digestSchedule').map(([k, v]) => [k, v.value])), digest: { schedule: effective.digestSchedule.value } } };
   for (const day of dates) {
-    const inputs = await (collect ?? (d => collectDay(d, { env, settings: resolvedFile })))(day);
+    const inputs = await (collect ?? (d => collectDay(d, { env, settings: resolvedFile, gh: boundedGh, readShadow, coroner })))(day);
+    if (ghFailure) throw ghFailure;
     const row = snapshot({ date: day, inputs, settings: resolvedFile, now });
     row.settings = effective;
     rows.push(row);
