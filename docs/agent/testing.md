@@ -1441,7 +1441,17 @@ both, including daemon restarts; clear it only after observing a delivering PR. 
 orphan claim, persist its failure so a failed ledger write keeps the claim. Regress the #4413 shape:
 pending launch → confirmed run → dead worker with no delivery → backed-off retry → exhausted attempts.
 Validate a build card against the fetched WE origin/main backlog before acquiring its claim; missing
-identities are permanent card refusals, while an unavailable Git read remains a retryable observation.
+identities are permanent card refusals, while an unavailable Git read remains a retryable observation:
+the clone-wide `card-lookup-unavailable` code, never charged to the card's retry budget. Because history
+outlives a launch, late-launch (quick-schedule) attempts are counted apart from real failures, and the
+orphan pass keys its failure on the dead claim so a retried release never charges it twice. The ledger
+keeps every key charged to a card, not only the last: orphan and fail-group records interleave every
+tick while a release throws, and each must still dedupe its own attempt. Both key a dispatch on its run
+row's start time (`dispatch:`), so the two paths charging one dead dispatch in one tick charge it once.
+A run row can be unreadable on one pass and back on the next, so orphan adoption passes the claim
+(`orphan:`) and the row as aliases of one attempt: any charged alias dedupes, and the new aliases join it.
+Group member claims (`member:`) are aliases on both paths too: orphan adoption can release the lead claim
+before the fail-group pass looks, but the member claims survive.
 
 Prepare discovery searches each card's current lane identity, bornAs lane identity and title, then
 unions the complete results. Never use an unfiltered repository PR listing as the launch guard's proof
@@ -1570,3 +1580,39 @@ Prevention follow-up owed by this review: add an enqueue-call lint that recogniz
 try/catch and callbacks protected by `enqueuePrestage`. It must flag unprotected `mergeStrategy.enqueue`
 calls without treating the protected callback as an uncaught call. The throwing-entry-point regression
 contracts above are the immediate guard; the repository-wide lint remains separate tooling work.
+
+## Review scratch disk retention
+
+Review seats use independent shallow pinned checkouts: a released lane's objects cannot be
+borrowed safely across reset/GC. Own the scratch immediately after allocation, clean failed
+setup as well as the run's `finally`, and register catchable signal/exit cleanup. SIGKILL and
+host crashes require the health-watch backstop. Ephemeral review paths bypass the persistent
+backlog index to avoid a full snapshot for every seat.
+
+Signal cleanup stops seats before deleting their checkouts. Direct-task wrappers receive
+SIGTERM so their handlers can kill the models' separate detached process groups; cleanup
+waits for wrapper close. After ten seconds, a stuck wrapper and its observed descendants
+(including detached model groups) receive SIGKILL, with one further second to observe close.
+Unknown descendant observation or failure to close retains scratch for recovery. The outer
+timeout follows the same stop path. Re-check jurors are tracked too. Repeated signals cannot
+interrupt that wait or start another seat. Speculative cancellation holds new seats only
+until the cancellation finishes; process termination permanently stops further launches.
+A synchronous process exit requests shutdown and retains any checkout whose stop cannot
+be awaited. Retention survives callers' `finally` blocks for the health-watch sweeper.
+Ownership metadata lives at the sibling `<scratch>.owner.json`, outside the pinned worktree,
+so a tracked `.we-review-owner.json` cannot block checkout or forge the owner PID. Normal
+cleanup and the sweeper remove the sibling metadata together with its checkout.
+
+Each health-watch tick sweeps `we-review-seat-*`, `we-red-team-recheck-*`, and
+`we-overlay-dispatch-smoke-*` older than
+`config.json`'s `tmp.reviewSeatTtlMin` (120 minutes), preserving live owner PIDs and process
+working directories. Allocation and recovery share the review prefix constants. Busy cwd
+observation runs once only when an expired candidate needs it; unknown observation preserves
+checkouts. It also caps all
+`we-backlog-index-*` files together at `tmp.backlogIndexMaxMb` (2048 MiB), oldest first.
+Sweep logs include counts and bytes freed. Symlinks are never traversed.
+The `disk-space` smell probes available space on the checkout's writable data filesystem:
+warn below `health.diskFreeMinGb` (30 GiB), critical below 10 GiB. It opens immediately,
+notifies in shadow mode, and sends an opening event through the needs-you feed's serialized
+publisher. Host, subject and opening time identify each event, including reopenings within
+the same minute. Fixture state roots and dry runs never publish these events.

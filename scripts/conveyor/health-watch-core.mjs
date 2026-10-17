@@ -45,6 +45,8 @@ export const HOUR = 60 * MINUTE;
 /** Defaults — every number is config (`<stateRoot>/.conveyor/health/config.json` overrides any of them). */
 export const DEFAULT_HEALTH_CONFIG = Object.freeze({
   ...TMP_SWEEP_DEFAULTS,
+  tmp: { reviewSeatTtlMin: 120, backlogIndexMaxMb: 2048 },
+  health: { diskFreeMinGb: 30 },
   ...CLAUDE_JOBS_ARCHIVE_DEFAULTS,
   mode: 'shadow',
   tickBudgetMs: 60_000,
