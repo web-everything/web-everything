@@ -83,6 +83,23 @@ it('headCiVerdict judges required checks only: partial, unknown and missing-stat
   expect(headCiVerdict([run('test', 'COMPLETED', 'SUCCESS'), { __typename: 'StatusContext', context: 'smoke', state: 'ERROR' }], req)).toBe('red');
   expect(readRequiredChecksSafe('o/r', () => { throw new Error('403'); })).toEqual([]);
 });
+it('a held merge-gate (a review or freeze hold, not CI) is never a red verdict under the live required set', async () => {
+  const { headCiVerdict } = await import('../fix-push-ci.mjs');
+  const live = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'];
+  const row = (name, status, conclusion) => ({ __typename: 'CheckRun', name, status, ...(conclusion ? { conclusion } : {}) });
+  const queued = [row('test', 'QUEUED'), row('smoke', 'QUEUED'), row('daemon-soak', 'QUEUED')];
+  expect(headCiVerdict([...queued, row('merge-gate', 'COMPLETED', 'FAILURE'), row('soak-replay-gate', 'COMPLETED', 'FAILURE')], live)).toBe('pending');
+  const green = ['test', 'smoke', 'daemon-soak'].map(n => row(n, 'COMPLETED', 'SUCCESS'));
+  expect(headCiVerdict([...green, row('merge-gate', 'COMPLETED', 'FAILURE')], live)).toBe('green');
+  expect(headCiVerdict([...green.slice(1), row('test', 'COMPLETED', 'FAILURE'), row('merge-gate', 'IN_PROGRESS')], live)).toBe('red');
+});
+it('a finished verdict also clears an earlier hand-off\'s waiting labels', async () => {
+  const { fixPushLabelPlan } = await import('../fix-push-ci.mjs');
+  const present = ['checking', 'status:awaiting-ci', 'ci:failed', 'status:ci-red', 'status:awaiting-review'];
+  expect(fixPushLabelPlan(present, 'green')).toEqual({ handOff: false, remove: ['checking', 'status:awaiting-ci', 'ci:failed', 'status:ci-red'] });
+  expect(fixPushLabelPlan(present, 'red')).toEqual({ handOff: false, remove: ['checking', 'status:awaiting-ci', 'status:awaiting-review'] });
+  expect(fixPushLabelPlan(present, 'pending').handOff).toBe(true);
+});
 it('resolves missing-CI timing per leaf through the cascade', () => {
   const out = resolveHandoffSettings('fix', { tool: { ciMissingAfterPushMin: 12 }, platform: { ciMissingAfterPushMin: 15, sendBackReservedSlots: 2 }, env: {} });
   expect(out.value).toEqual({ ciMissingAfterPushMin: 12, sendBackReservedSlots: 2 });

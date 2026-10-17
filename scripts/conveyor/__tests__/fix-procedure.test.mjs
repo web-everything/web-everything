@@ -639,12 +639,12 @@ describe('fixBegin / fixEnd — the IO shell', () => {
     expect(removed.filter(l => l === 'ci:failed' || l === 'status:ci-red')).toEqual([]);
   });
 
-  it('fix-end on a green pushed head drops the previous head\'s red labels and keeps awaiting-review', async () => {
-    const { result, removed, handedOff } = await endAfterPush({ present: ['ci:failed', 'status:ci-red', 'status:awaiting-review', 'status:fixing'],
-      rollup: [CHECK('test', 'SUCCESS'), CHECK('smoke', 'SKIPPED'), CHECK('merge-gate', 'FAILURE')] });
+  it('fix-end on a green pushed head drops the previous head\'s red labels and the push hand-off\'s wait, keeps awaiting-review', async () => {
+    const { result, removed, handedOff } = await endAfterPush({ present: ['ci:failed', 'status:ci-red', 'checking', 'status:awaiting-ci', 'status:awaiting-review', 'status:fixing'],
+      required: ['test', 'smoke', 'merge-gate'], rollup: [CHECK('test', 'SUCCESS'), CHECK('smoke', 'SKIPPED'), CHECK('merge-gate', 'FAILURE')] });
     expect(result.steps).toContain('ci-green');
     expect(handedOff).toBe(false);
-    expect(removed).toEqual(expect.arrayContaining(['ci:failed', 'status:ci-red', 'status:fixing']));
+    expect(removed).toEqual(expect.arrayContaining(['ci:failed', 'status:ci-red', 'checking', 'status:awaiting-ci', 'status:fixing']));
     expect(removed).not.toContain('status:awaiting-review');
   });
 
