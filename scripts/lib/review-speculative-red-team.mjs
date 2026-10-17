@@ -125,3 +125,14 @@ export function decideSpeculativeOutcome({ accepted, spec }) {
   if (spec.status === 'error') return 'failed';
   return 'sequential';
 }
+
+/** Raw model-call instants survive finish/discard; cancellation has no observed finish. */
+export function speculativeSeatTimings(pass, reserved = null) {
+  const source = pass?.startedAt ? pass : reserved;
+  if (!source?.startedAt) return [];
+  return [{ seat: 'red-team', lens: 'red-team', provider: source.provider ?? null,
+    model: source.evidence?.servedModel ?? source.model ?? null,
+    startedAt: source.startedAt, finishedAt: source.finishedAt ?? null,
+    verdict: pass?.parsed?.['red-team']?.verdict ?? source.verdict ?? null,
+    findingsCount: Array.isArray(pass?.findings) ? pass.findings.length : source.findingsCount ?? null }];
+}

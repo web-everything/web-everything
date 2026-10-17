@@ -58,6 +58,38 @@ const plan = (p, opts = {}) => planReconcile({ prs: [p], agents: [], durableCoun
 const row = (p) => p.dispatch.find((x) => x.prNumber === 7);
 const refusal = (p) => p.refusals.find((x) => x.prNumber === 7 && x.kind !== 'no-findings');
 
+describe('latest mechanical round chronology (#5948)', () => {
+  const cases = [
+    ['mechanical then ordinary', [mechMarker(8), rearm(9)], false],
+    ['ordinary then mechanical', [rearm(7), mechMarker(8)], true],
+    ['equal round timestamps', [mechMarker(8), rearm(8)], false],
+    ['unordered latest ordinary', [rearm(9), mechMarker(8)], false],
+    ['unordered latest mechanical', [mechMarker(8), rearm(7)], true],
+    ['forged later mechanical', [mechMarker(8), rearm(9), { ...mechMarker(10), author: { login: 'outsider' } }], false],
+    ['forged later ordinary', [mechMarker(8), { ...rearm(9), author: { login: 'outsider' } }], true],
+    ...[mechMarker(9), rearm(9), bounceOn(PRIOR, 9)].flatMap((event, i) =>
+      [undefined, 'invalid'].map(createdAt => [`incomplete trusted event ${i}: ${createdAt}`, [mechMarker(8), { ...event, createdAt }], false])),
+    ['verdict tied with marker', [mechMarker(8), bounceOn(PRIOR, 8)], false],
+  ];
+  it.each(cases)('%s', (_name, events, eligible) => {
+    const p = pr([...spent, ...events]);
+    expect(hasPendingMechanicalRound(p)).toBe(eligible);
+    expect(mechanicalRoundGrant({ pr: p }).ok).toBe(eligible);
+  });
+
+  it('the real planner refuses the stale grant and grants a later mechanical round', () => {
+    expect(row(plan(pr([...spent, mechMarker(8), rearm(9)])))).toBeUndefined();
+    expect(row(plan(pr([...spent, rearm(7), mechMarker(8)])))).toMatchObject({ kind: 'review', mechanicalRound: { ok: true } });
+  });
+
+  it('rejects an untrusted author before accessing the body', () => {
+    expect(isReviewVerdictComment({ author: { login: 'outsider' },
+      get body() { throw new Error('untrusted body accessed'); } })).toBe(false);
+    expect(isReviewVerdictComment(bounceOn(PRIOR, 6))).toBe(true);
+    expect(isReviewVerdictComment(conflictBounce(6))).toBe(false);
+  });
+});
+
 describe('review.mechanicalRoundsCountTowardCap cascade', () => {
   const none = () => null;
   it('standard default false, then platform, then repo override, then env — each with its source', () => {

@@ -47,14 +47,25 @@
  * only a PR's `labels` and is fully unit-testable with no `gh`; {@link sweepReviewHoldLabels} is the IO shell,
  * with the PR list and the label provider injectable so the whole pass is testable without a real `gh` call too.
  *
- * WHAT IT NEVER DOES: add a label (each healed pair already carries its operative hold), or touch anything but
- * the removals named above. It never removes `review:human` itself (that is `clear-human`'s job, a deliberate
+ * The one label-add exception: a numbering-only head move proven by scripts/lib/numbering-carry.mjs carries
+ * the existing acceptance, adding review:accepted and removing review:pending before the stale-accept heal.
+ * The one comment edit: a numbering re-stamp record written over a hold before it is edited into an inert withdrawal
+ * notice (on any PR, whatever its labels), so no acceptance reader honours it.
+ * WHAT IT NEVER DOES: add any other label, or touch anything but the removals named above.
+ * It never removes `review:human` itself (that is `clear-human`'s job, a deliberate
  * human/independent-agent act, never a sweep's), and it never adds `review:pending`/`review:changes` — a stray
  * label is dropped, never replaced with a guess at what it should have said instead.
  */
+import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import {
+  NUMBERING_RESTAMP_MARKER, listedNumberingRecords, numberingRestampSettled, numberingWithdrawalOwed, restampAfterNumbering,
+  strandedNumberingRecords,
+} from '../lib/numbering-carry.mjs';
+import { readNetDiffAtHead } from '../merge-ai-prs.mjs';
+import { assertMandatoryReferralsCleared } from '../review-set-label.mjs';
 import { latestAcceptRecord } from '../lib/accept-carry-forward.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import {
@@ -63,12 +74,12 @@ import {
 } from '../lib/review-escalation.mjs';
 import { ADVISORY_LABELS } from '../lib/advisory-labels.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
-import { defaultListPrs, defaultReadPr } from './advisory-label-sweep.mjs';
+import { LIST_COMMENTS_CAP, defaultListPrs, defaultReadPr } from './advisory-label-sweep.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 import { sweepRulingNeededLabels } from './ruling-needed-sweep.mjs';
 import { sweepAutoBlock } from './referral-auto-block.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
-import { sweepAcceptCarry } from './accept-carry-sweep.mjs';
+import { sweepAcceptCarry, defaultCloneDirFor } from './accept-carry-sweep.mjs';
 
 /** Plain label names off a `gh --json labels` array (`[{name}]`) or a bare-string array. Pure. */
 function labelNames(labels) {
@@ -136,11 +147,25 @@ export function needsReviewHoldCleanup(pr) {
  *   flagged?: string[], flagReason?: string, error?: string, skipped?: string}>} one entry per PR that
  *   needed (or would need) a change, was healed, or carries a contradiction this sweep could not resolve.
  */
+/**
+ * Listing views whose live read found no stranded numbering re-stamp record, each with the time it may be read again
+ * (bounds the live reads). The bound is a time, not "forever": the listing shows neither the formal reviews nor a
+ * capped thread's later pages, and either can change (an approval, a dismissal, a record posted past the first page)
+ * with nothing the listing shows changing — so a clean check expires, and an unreadable one backs off briefly.
+ */
+const strandedChecked = new Map();
+export const STRANDED_RECHECK_MS = 30 * 60_000;
+export const STRANDED_BACKOFF_MS = 5 * 60_000;
+export function _resetStrandedCheckMemo() { strandedChecked.clear(); }
+
 export function sweepReviewHoldLabels({
   repo = null, listPrs = defaultListPrs, provider = createGhProvider(), dryRun = false, settings, runRuling, acceptCarry,
   readComments = readCompletePrComments, readPr = defaultReadPr,
+  numberingRestamp = restampAfterNumbering, exec = execFileSync, now = Date.now,
 } = {}) {
   const prs = listPrs({ repo });
+  const startedAt = now();
+  for (const [k, until] of strandedChecked) if (until <= startedAt) strandedChecked.delete(k);
   const results = [];
   let resolvedRepo = repo;
   const repoOf = () => {
@@ -148,8 +173,102 @@ export function sweepReviewHoldLabels({
     if (typeof resolvedRepo !== 'string' || !resolvedRepo.trim()) throw new Error('missing repository');
     return resolvedRepo;
   };
+  const restamped = new Set();
   for (const pr of Array.isArray(prs) ? prs : []) {
-    if (!needsReviewHoldCleanup(pr)) continue;
+    const names = labelNames(pr.labels);
+    const carryLabels = names.includes(REVIEW_LABELS.pending)
+      && ![REVIEW_LABELS.human, REVIEW_LABELS.changes, REVIEW_LABELS.heldMechanical].some((l) => names.includes(l));
+    // A re-stamp record written over a hold before it is withdrawn whatever the labels or the settled memo say (the
+    // live read below re-checks it, with the formal reviews). A capped listing may hide one past its first page, so it
+    // is read live. The listing carries no formal reviews either, so a listed record the thread alone validates is
+    // read live too. Each listing view (head and listed records) is then left until its check expires
+    // (`strandedChecked`), or at once after a pass on it writes or fails.
+    // An unreadable listing is thrown by `listedState` below, where each path already handles it.
+    let listed = null;
+    let listingError = null;
+    let records = [];
+    try {
+      listed = Array.isArray(pr.comments) ? pr.comments : null;
+      records = listedNumberingRecords(listed);
+    } catch (e) { listingError = e; }
+    const checkKey = `${repo ?? ''}#${pr.number}@${String(pr.headRefOid || '').toLowerCase()}`
+      + (records.length ? `|${records.map((c) => String(c?.id ?? `${c?.createdAt ?? c?.created_at ?? ''}#${listed.indexOf(c)}`)).join(',')}` : '');
+    const listedState = () => {
+      if (listingError) throw listingError;
+      const complete = Boolean(listed) && (pr.commentsComplete === true || listed.length < LIST_COMMENTS_CAP);
+      // A withdrawal an earlier pass started and could not finish (a hold the thread cannot show) is owed whatever the
+      // listing says.
+      const owed = numberingWithdrawalOwed(repo ?? resolvedRepo, pr.number);
+      const shown = complete && strandedNumberingRecords(listed).length > 0;
+      const unchecked = !strandedChecked.has(checkKey);
+      // Off the carry path a PR listed with no comment field at all says nothing either way and is left alone.
+      return { listed, complete, shown,
+        stranded: shown || owed || (records.length > 0 && unchecked)
+          || (!complete && (carryLabels || Boolean(listed)) && unchecked) };
+    };
+    let view;
+    if (carryLabels) view = listedState();
+    else {
+      // Off the carry path, only a possible stranded record earns the live read; an unreadable listing is left to the
+      // later legs, as before.
+      try { view = listedState(); } catch { continue; }
+      if (!view.stranded) continue;
+    }
+    const { complete, stranded } = view;
+    // Cheap pre-filter on the listing so the live re-read is spent only on a possible numbering carry: a complete listed
+    // thread with no accept on another head (or an accept already bound here by something other than a numbering
+    // re-stamp) cannot be one. A capped (possibly truncated) listing is re-read live.
+    if (complete && !stranded) {
+      const rec = latestAcceptRecord(listed);
+      const head = String(pr.headRefOid || '').toLowerCase();
+      if (!rec || (rec.sha === head && !String(listed[rec.index]?.body || '').includes(`<!-- ${NUMBERING_RESTAMP_MARKER}:`))) continue;
+    }
+    try {
+      const slug = repoOf();
+      if (!stranded && numberingRestampSettled(slug, pr.number, pr.headRefOid)) continue;
+      // One validated live read, used for the plan and again right before each write (a hold can arrive mid-proof).
+      const readLiveState = () => {
+        const metadata = provider.readPrState(slug, pr.number);
+        const live = { ...metadata, comments: readComments(pr.number, { repo: slug }) };
+        if (live.state !== 'OPEN') throw new Error('PR is not open');
+        if (!Array.isArray(live.labels) || live.labels.some((l) =>
+          typeof (l?.name ?? l) !== 'string' || !(l?.name ?? l).trim())) throw new Error('unusable labels');
+        if (typeof live.headRefOid !== 'string' || !live.headRefOid.trim()) throw new Error('missing head');
+        if (!Array.isArray(live.comments)) throw new Error('comments read returned no array');
+        if (live.number != null && live.number !== pr.number) throw new Error('PR number mismatch');
+        let liveReviews;
+        try { liveReviews = provider.readPrReviews(slug, pr.number); } catch { liveReviews = null; }
+        return { state: live, reviews: liveReviews };
+      };
+      const { state, reviews } = readLiveState();
+      let origin = '';
+      try { origin = String(exec('git', ['remote', 'get-url', 'origin'], { encoding: 'utf8' })).trim(); } catch { /* other checkout */ }
+      const originSlug = origin.replace(/^.*github\.com[:/]/i, '').replace(/\.git$/i, '').replace(/\/$/, '');
+      const cwd = originSlug.toLowerCase() === slug.toLowerCase() ? undefined : defaultCloneDirFor(slug);
+      // No checkout: no proof can run, but a withdrawal needs none, so the pass still runs with a proof that retries.
+      const noCheckout = cwd === null;
+      const readNetDiff = (sha) => readNetDiffAtHead({
+        exec: (c, a, o) => execFileSync(c, a, { ...o, ...(cwd ? { cwd } : {}) }), headSha: sha, headRef: sha,
+      });
+      const r = numberingRestamp({ repo: slug, pr: pr.number, state, reviews, provider, dryRun, cwd: noCheckout ? undefined : cwd,
+        readNetDiff, readLiveState, exec, guardReferrals: assertMandatoryReferralsCleared,
+        ...(noCheckout ? { prove: () => ({ ok: false, retryable: true, reason: 'no checkout for repository' }) } : {}) });
+      // A pass that withdrew, posted or failed is read again next pass. A clean one settles the check until it expires —
+      // briefly when the formal reviews were unreadable, since without them a record they strand looks like any other.
+      if (r && (r.commentPosted || ['error', 'retry', 'withdrawn', 'would-withdraw'].includes(r.action))) strandedChecked.delete(checkKey);
+      else strandedChecked.set(checkKey, now() + (Array.isArray(reviews) ? STRANDED_RECHECK_MS : STRANDED_BACKOFF_MS));
+      if (r) {
+        results.push({ num: pr.number, numberingRestamp: r.action, detail: r.reason, ...(r.error ? { error: r.error } : {}) });
+        if (r.action === 'restamped' || (dryRun && r.action === 'would-restamp')) restamped.add(pr.number);
+      }
+    } catch (e) {
+      // A failed live read backs off briefly instead of costing a full re-read every pass.
+      strandedChecked.set(checkKey, now() + STRANDED_BACKOFF_MS);
+      results.push({ num: pr.number, numberingRestamp: 'error', detail: String(e?.message ?? e).split('\n')[0] });
+    }
+  }
+  for (const pr of Array.isArray(prs) ? prs : []) {
+    if (restamped.has(pr.number) || !needsReviewHoldCleanup(pr)) continue;
     let state;
     try {
       const metadata = provider.readPrState(repoOf(), pr.number);
@@ -260,6 +379,9 @@ if (IS_CLI) {
         repo, dryRun, ...(prsFile ? { listPrs: () => readPrsFromFile(prsFile) } : {}),
       });
       for (const r of results) {
+        if (r.numberingRestamp) {
+          writeLineSync(2, `  📌 PR #${r.num}: numbering re-stamp ${r.numberingRestamp} — ${r.detail ?? ''}`);
+        }
         if (r.skipped) writeLineSync(2, `  ⚠ PR #${r.num}: ${r.skipped}`);
         if (r.remove?.length) {
           const did = dryRun ? 'would' : r.error ? 'FAILED to' : 'did';

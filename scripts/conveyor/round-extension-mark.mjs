@@ -13,12 +13,20 @@ export const MAX_TOTAL_ROUND_EXTENSIONS = 10;
 
 export function buildRoundExtensionComment({ repo, pr, by, actor, channel, reason, at }) {
   const record = { version: 1, repo, pr, by, actor, channel, reason, at };
-  // Escape markup in the machine record without changing the parsed operator words.
-  const json = JSON.stringify(record).replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
+  // Escape markup in the machine record without changing the parsed operator words. U+2028/U+2029 are escaped too:
+  // the counter's `.`/`^`/`$` treat them as line breaks, so a raw one would stop this grant from counting.
+  const json = JSON.stringify(record).replace(/</g, '\\u003c').replace(/>/g, '\\u003e')
+    .replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+  // Quoted prose is still scanned for trusted review markers. Escape every angle bracket (not strip delimiters) so
+  // no HTML comment of any form (`-->`, `--!>`, nested, partial) can appear; the same rule as operator-action comments.
+  // A one-line field also folds every line break (`^` under /m matches after CR and U+2028/U+2029 too), so no
+  // caller's validation is needed to keep plain-prose readers such as parseAdvisories from seeing a new line.
+  const prose = (value) => String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const oneLine = (value) => prose(value).replace(/\r\n|[\r\n\u2028\u2029]/g, ' ');
   return [
     ROUND_EXTENSION_MARKER, '',
-    `Operator @${actor} granted +${by} auto-repair round(s) via ${channel}`, '',
-    ...String(reason).split(/\r?\n/).map((line) => `> ${line}`), '',
+    `Operator @${oneLine(actor)} granted +${oneLine(by)} auto-repair round(s) via ${oneLine(channel)}`, '',
+    ...prose(reason).split(/\r\n|[\r\n\u2028\u2029]/).map((line) => `> ${line}`), '',
     `<!-- round-extension: ${json} -->`,
   ].join('\n');
 }
@@ -38,7 +46,7 @@ export function roundExtensionGrants(comments, { repo, pr }) {
         || !Number.isInteger(r.by) || r.by < 1 || r.by > 5
         || typeof r.actor !== 'string' || !OPERATOR_LOGINS.includes(r.actor.toLowerCase())
         || typeof r.reason !== 'string' || !r.reason.trim()
-        || typeof r.channel !== 'string' || !r.channel.trim() || /[\r\n]/.test(r.channel)
+        || typeof r.channel !== 'string' || !r.channel.trim() || /[\r\n\u{2028}\u{2029}]/u.test(r.channel)
         || typeof r.at !== 'string' || !r.at.trim()) return [];
       const by = Math.min(r.by, remaining);
       remaining -= by;

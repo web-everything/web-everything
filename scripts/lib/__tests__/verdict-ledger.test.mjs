@@ -9,7 +9,7 @@
  * (`review-escalation.test.mjs`, `jury-ledger.test.mjs`, …). The card's path is corrected rather than followed.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -869,6 +869,7 @@ describe('plan slice B: v2 event types round-trip, and the v1 fold is byte-ident
   const SHA = 'b'.repeat(40);
   const base = { repo: REPO, pr: 7, at: AT, source: 'test', writer: 'h:1:w', declaredActor: 'op', session: 's1', channel: 'c' };
   const payloads = {
+    'review-exempt': { headSha: SHA, basis: 'no review needed' },
     referral: { headSha: SHA, findingKeys: ['f1', 'f2'] },
     ruling: { findingKey: 'f1', ruling: 'block' },
     'review-run': { headSha: SHA, phase: 'completed', posted: false },
@@ -932,9 +933,9 @@ describe('plan slice B: v2 event types round-trip, and the v1 fold is byte-ident
     expect(validateVerdictRecord({ ...v1, type: 'verdict' }).valid).toBe(true);
   });
 
-  it('bears: verdicts, referrals, rulings, holds, releases, approvals, send-backs; not review-run, author, label-input', () => {
+  it('bears: verdicts, review exemptions, referrals, rulings, holds, releases, approvals, send-backs; not review-run, author, label-input', () => {
     const bearing = EVENT_TYPE_VALUES.filter((t) => eventBears(t));
-    expect(bearing).toEqual(['verdict', 'referral', 'ruling', 'hold', 'release', 'approval', 'send-back']);
+    expect(bearing).toEqual(['verdict', 'review-exempt', 'referral', 'ruling', 'hold', 'release', 'approval', 'send-back']);
     expect(EVENT_TYPES.REVIEW_RUN).toBe('review-run');
   });
 
@@ -1327,6 +1328,17 @@ describe('ledger plan follow-up: the git store accepts every v2 event type (dual
     expect(clear).toMatchObject({ ok: false, ledgerWriteMiss: true });
     const block = appendVerdict(ev('ruling', { findingKey: 'f2', ruling: 'block' }), { store: 'dual', board: '/board', gitAppend: miss, warn: () => {} });
     expect(block).toMatchObject({ ok: true, ledgerWriteMiss: true });
+  });
+
+  it('a release or approval that misses git does not clear and leaves no home row (F4); a hold still applies', () => {
+    const miss = () => { throw new Error('push rejected'); };
+    for (const type of ['release', 'approval']) {
+      expect(appendVerdict(ev(type, payloads[type]), { store: 'dual', board: '/board', gitAppend: miss, warn: () => {} }), type)
+        .toMatchObject({ ok: false, ledgerWriteMiss: true });
+    }
+    expect(existsSync(verdictLedgerPath(REPO))).toBe(false);
+    expect(appendVerdict(ev('hold', payloads.hold), { store: 'dual', board: '/board', gitAppend: miss, warn: () => {} }))
+      .toMatchObject({ ok: true, ledgerWriteMiss: true });
   });
 });
 

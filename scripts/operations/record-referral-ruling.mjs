@@ -45,12 +45,13 @@
  * PURE. The reader and the sink live in `./record-referral-ruling-io.mjs`.
  */
 
+import { FALSE_FINDING_CAUSES } from '../lib/false-finding-causes.mjs';
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import {
   activeReferrals, buildOperatorRulingComment, mandatoryReferralState, referralRecordState,
   validateOperatorRuling, OPERATOR_RULING_RESULTS, AUTO_POLICY_ACTOR, operatorRulingId, sameFindingForClearing,
-  readReferralRecords, readOperatorRulings, carriedBackingHolds,
+  readReferralRecords, readOperatorRulings, carriedBackingHolds, sameReferralForPolicy, referralRecheck,
 } from '../lib/jury-core.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 import { ignoredRulings } from '../lib/ruling-ledger.mjs';
@@ -61,12 +62,20 @@ export const OPERATOR_RULING_FOLLOW_UP_EFFECT = 'github.operator-referral-ruling
 /** Mirrors the derived label of PR #3889's ruling-needed sweep. */
 export const RULING_NEEDED_LABEL = 'advisory:ruling-needed';
 
+/** Every `state` an open finding can carry. A new state goes here and into exactly one predicate below. */
+export const OPEN_FINDING_STATES = Object.freeze({ PENDING: 'pending', NEEDS_RECHECK: 'needs-recheck', BLOCKED: 'blocked' });
+const AWAITING_STATES = new Set([OPEN_FINDING_STATES.PENDING, OPEN_FINDING_STATES.NEEDS_RECHECK]);
+/** Still waiting on an answer (operator ruling or reviewer re-check), so a ruling elsewhere must re-arm. PURE. */
+export const isAwaitingRuling = (o) => AWAITING_STATES.has(o?.state);
+/** Held by a standing `block`. PURE. */
+export const isBlockedFinding = (o) => o?.state === OPEN_FINDING_STATES.BLOCKED;
+
 /**
  * The findings still open on `head`: every active referral of a current-head record that the gate leaves
  * pending or blocked. Numbered from 1 in thread order. PURE.
  */
 export function openReferralFindings({ comments, repo, pr, head, body = '', createdAt = '', cardReadable = () => false,
-  unchangedFinding = () => null }) {
+  unchangedFinding = () => null, autoPolicyRespectsNotReal = true }) {
   const context = { repo, pr, head, body, createdAt, cardReadable };
   const state = mandatoryReferralState(comments, context);
   // Unlike the gate's current-head hold, automatic writes require sound historical proof too.
@@ -80,7 +89,10 @@ export function openReferralFindings({ comments, repo, pr, head, body = '', crea
     const s = referralRecordState(record, { ...context, records: state.records, operatorRulings: state.operatorRulings });
     const held = new Set([...s.pending, ...s.blocked]);
     for (const f of activeReferrals(record)) {
-      protection.set(JSON.stringify([record.runId, f.key]), operatorProtection(f, record, state, unchangedFinding));
+      const proof = operatorProtection(f, record, state, unchangedFinding, autoPolicyRespectsNotReal);
+      const recheck = referralRecheck(record, f.key);
+      if (recheck && s.pending.includes(f.key)) proof.protectionUnknown.push('needs re-check on live head');
+      protection.set(JSON.stringify([record.runId, f.key]), proof);
       policyTargets.push({ runId: record.runId, key: f.key, seat: f.seat, file: f.finding?.file ?? '',
         line: Number.isInteger(f.finding?.line) ? f.finding.line : null, summary: f.finding?.summary ?? '' });
       if (!held.has(f.key)) {
@@ -94,7 +106,8 @@ export function openReferralFindings({ comments, repo, pr, head, body = '', crea
         const effective = s.rulings.filter((r) => r.key === f.key).at(-1);
         open.push({ index: open.length + 1, runId: record.runId, key: f.key, seat: f.seat,
           file: f.finding?.file ?? '', line: Number.isInteger(f.finding?.line) ? f.finding.line : null,
-          summary: f.finding?.summary ?? '', state: blocked ? 'blocked' : 'pending',
+          summary: f.finding?.summary ?? '',
+          state: blocked ? OPEN_FINDING_STATES.BLOCKED : recheck ? OPEN_FINDING_STATES.NEEDS_RECHECK : OPEN_FINDING_STATES.PENDING,
           rationale: blocked ? (effective?.rationale ?? effective?.reason ?? '') : '' });
       }
     }
@@ -125,8 +138,8 @@ export function openReferralFindings({ comments, repo, pr, head, body = '', crea
 const view = (f) => ({ file: f?.finding?.file, line: f?.finding?.line, summary: f?.finding?.summary,
   verdict: f?.finding?.verdict, impactIfUnfixed: f?.finding?.impactIfUnfixed });
 
-/** Authenticated, subject-bound operator provenance; broad standing-ruling history is not proof. */
-function operatorProtection(target, record, state, unchangedFinding) {
+/** Authenticated operator provenance and counted reviewer negatives; a policy skip never grants clearance. */
+function operatorProtection(target, record, state, unchangedFinding, autoPolicyRespectsNotReal) {
   const protectingRulings = [], protectionUnknown = [];
   const subject = (x) => x.repo === record.repo && x.pr === record.pr;
   const sourceOf = (o) => state.records.find((r) => subject(r) && r.head === o.head && r.runId === o.runId)
@@ -136,7 +149,8 @@ function operatorProtection(target, record, state, unchangedFinding) {
     const source = sourceOf(o);
     // Without the source we cannot disprove equivalence, even if the serialized keys differ.
     if (!source) { protectionUnknown.push(`missing source ${o.head}/${o.runId}/${o.key}`); continue; }
-    if (source.key !== target.key && !sameFindingForClearing(view(source), view(target))) continue;
+    if (!(autoPolicyRespectsNotReal && o.result === 'not-real' && sameReferralForPolicy(source, target))
+      && source.key !== target.key && !sameFindingForClearing(view(source), view(target))) continue;
     if (o.head !== record.head) {
       let unchanged = null;
       try { unchanged = unchangedFinding({ repo: record.repo, base: o.head, head: record.head,
@@ -149,8 +163,31 @@ function operatorProtection(target, record, state, unchangedFinding) {
     protectingRulings.push({ id: operatorRulingId(o), repo: o.repo, pr: o.pr, head: o.head,
       runId: o.runId, key: o.key, actor: o.actor, result: o.result });
   }
+  if (autoPolicyRespectsNotReal) for (const sourceRecord of state.records) {
+    if (!subject(sourceRecord)) continue;
+    for (const ruling of sourceRecord.rulings) {
+      if (ruling.result !== 'not-real') continue;
+      // Policy remembers any independently authored negative, even if an old auto-block later masked it.
+      // This is write protection only: the gate still resolves the complete ruling history normally.
+      const historical = { ...sourceRecord, carried: undefined,
+        rulings: [{ ...ruling, supersedes: undefined, sameAs: undefined }] };
+      const counted = referralRecordState(historical, { head: sourceRecord.head }).rulings;
+      if (!counted.some(r => r.id === ruling.id)) continue;
+      const source = sourceRecord.referrals.find(f => f.key === ruling.key);
+      if (!source || (!sameReferralForPolicy(source, target) && !sameFindingForClearing(view(source), view(target)))) continue;
+      if (sourceRecord.head !== record.head) {
+        let unchanged = null;
+        try { unchanged = unchangedFinding({ repo: record.repo, base: sourceRecord.head, head: record.head,
+          source: view(source), target: view(target) }); } catch { /* Refuse without proof. */ }
+        if (unchanged === false) continue;
+        if (unchanged !== true) { protectionUnknown.push(`unavailable comparison ${sourceRecord.head}/${sourceRecord.runId}/${source.key}`); continue; }
+      }
+      protectingRulings.push({ id: ruling.id, repo: record.repo, pr: record.pr, head: sourceRecord.head,
+        runId: sourceRecord.runId, key: source.key, actor: 'reviewer', result: 'not-real' });
+    }
+  }
   for (const carry of record.carried ?? []) {
-    if (carry.key !== target.key || carry.from.rulingId !== undefined) continue; // Reviewer carries confer no protection.
+    if (carry.key !== target.key || carry.from.rulingId !== undefined) continue; // Reviewer provenance is checked against the source record above.
     const backing = carriedBackingHolds(carry, { repo: record.repo, pr: record.pr, operatorRulings: state.operatorRulings });
     if (!backing || !sourceOf(backing)) protectionUnknown.push(`unbacked operator carry ${carry.from.runId}/${carry.from.key}`);
     else if (!sameFindingForClearing(view(sourceOf(backing)), view(target))) protectionUnknown.push('operator carry source does not match target');
@@ -242,9 +279,10 @@ export function planRulingFollowUp({ open, selected, ruling, reason, enabled, he
   // Findings still waiting on a ruling after this one. The ruling comment itself wakes the paused review (the hold
   // reads it as a wake), so the review re-runs on this head and posts a fresh advisory; it just cannot clear the
   // label or send anything back yet. Say so, with the exact remaining set, instead of returning nothing.
-  const remaining = open.filter((o) => o.state === 'pending' && !isSelected(o));
+  // A reviewer-owned re-check counts too: it has no answer yet, so the PR is not settled.
+  const remaining = open.filter((o) => isAwaitingRuling(o) && !isSelected(o));
   if (remaining.length) return { action: 'rearm', remaining: remaining.map((o) => ({ seat: o.seat, file: o.file, line: o.line, summary: o.summary })) };
-  const blocked = open.filter((o) => isSelected(o) ? ruling === 'block' : o.state === 'blocked')
+  const blocked = open.filter((o) => isSelected(o) ? ruling === 'block' : isBlockedFinding(o))
     .map((o) => ({ seat: o.seat, file: o.file, line: o.line, summary: o.summary,
       rationale: isSelected(o) ? reason : o.rationale }));
   if (!blocked.length) return { action: 'resume' };
@@ -261,6 +299,7 @@ export function planRulingFollowUp({ open, selected, ruling, reason, enabled, he
 export function planOperatorRuling(read, input) {
   const { repo, pr, finding, ruling, actor, channel, reason } = input;
   if (!OPERATOR_RULING_RESULTS.includes(ruling)) throw new Error(`--ruling must be one of ${OPERATOR_RULING_RESULTS.join('|')}`);
+  if (input.cause !== undefined && (ruling !== 'not-real' || !FALSE_FINDING_CAUSES.includes(input.cause))) throw new Error('--cause requires not-real and a known false-finding cause');
   const byPolicy = String(actor ?? '').toLowerCase() === AUTO_POLICY_ACTOR;
   if (byPolicy && ruling !== 'block') throw new Error(`--actor=${AUTO_POLICY_ACTOR} may only rule \`block\`; card and not-real are the operator's`);
   if (!byPolicy && !OPERATOR_LOGINS.includes(String(actor ?? '').toLowerCase())) {
@@ -323,7 +362,8 @@ export function planOperatorRuling(read, input) {
   }
   const record = {
     version: 1, repo, pr: Number(pr), head: read.head,
-    rulings: selected.map((o) => ({ runId: o.runId, key: o.key, result: ruling, ...(ruling === 'card' ? { card: read.card.ref } : {}),
+    rulings: selected.map((o) => ({ runId: o.runId, key: o.key, result: ruling, ...(ruling === 'not-real' ? { lens: o.seat ?? JSON.parse(o.key)[0] } : {}),
+      ...(input.cause ? { cause: input.cause } : {}), ...(ruling === 'card' ? { card: read.card.ref } : {}),
       ...(supersedesFor(o).length ? { supersedes: supersedesFor(o) } : {}) })),
     actor: String(actor).toLowerCase(), channel: String(channel).trim(), reason: String(reason), at: read.now,
     clearerId: read.clearerId,
@@ -349,6 +389,7 @@ export function recordReferralRulingOperation({ readRulingContext } = {}) {
       ruling: { type: 'string', enum: [...OPERATOR_RULING_RESULTS] },
       card: { type: 'string', required: false },
       supersedes: { type: 'string', required: false },
+      cause: { type: 'string', enum: [...FALSE_FINDING_CAUSES], required: false },
       actor: 'string',
       channel: 'string',
       reason: 'string',
@@ -362,7 +403,7 @@ export function recordReferralRulingOperation({ readRulingContext } = {}) {
     }),
     plan: compute({
       reads: ['input.repo', 'input.pr', 'input.finding', 'input.ruling', 'input.actor', 'input.channel',
-        'input.reason', 'input.sendBack', 'input.supersedes', 'findings.read'],
+        'input.reason', 'input.cause', 'input.sendBack', 'input.supersedes', 'findings.read'],
       fn: (view) => planOperatorRuling(view.findings.read, view.input),
     }),
     write: effectStep({

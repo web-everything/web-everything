@@ -313,7 +313,7 @@ describe('smokeAndAdopt fallback-plain-main (x5wbsbc)', () => {
     expect(runSmoke).toHaveBeenCalledTimes(2); // A (main+overlay, fails) then B (plain main, passes)
   });
 
-  it('main did not move and the clone is already adopted at main: no second smoke needed', async () => {
+  it('main did not move and the clone is already adopted at main: re-smokes before dropping the overlay', async () => {
     const { originDir, cloneDir, env } = makeFixture();
     const mainSha = gitOk(cloneDir, ['rev-parse', 'origin/main']).trim();
 
@@ -339,7 +339,8 @@ describe('smokeAndAdopt fallback-plain-main (x5wbsbc)', () => {
     // overlay is still adopted-away (see finalizeRebuild's own "already-adopted" branch).
     expect(second.moved).toBe(false);
     expect(second.adopted).toBe(true);
-    expect(runSmoke).toHaveBeenCalledTimes(1); // only A — B is skipped (plain main == prevHead == adopted head)
+    expect(runSmoke).toHaveBeenCalledTimes(2); // A fails, then the running plain main passes a fresh comparison.
+    expect(runSmoke.mock.calls[1][0]).toMatchObject({ changedFiles: null, reuseCode: false });
     expect(readOverlays(cloneDir, { env })).toEqual([]);
     expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(mainSha);
   });

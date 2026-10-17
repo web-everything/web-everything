@@ -47,3 +47,4 @@ One line per class: either the handling, or `n/a: <why>`.
 ## Also raised by
 
 - Also raised by web-everything/web-everything#4822 (finding 3: `we:backlog/5785-one-event-stream-and-one-state-manager-for-all-daemons-the-o.md` — Add a deterministic preparation gate requiring each behavioral constraint to reference a repository-qualified planned test, named case, and observable assertion; implementation slices must resolve those references to executable tests.)
+- Also raised by web-everything/web-everything#5432 (finding 1: `we:backlog/5960-pass-daemons-self-sync-onto-adopted-code-like-the-other-daem.md:55` — Add a preparation write-gate requiring each new behavioral constraint to reference a repository-qualified planned test, case name, and observable assertion.) · key `approval-prevention-key:web-everything/web-everything#5432@fb485e23a96fb24c3a113ab661e125b3c2dd22fb`

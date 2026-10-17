@@ -41,6 +41,16 @@ import { unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runGhSync } from './gh-throttle.mjs';
+import { REVIEW_LABELS } from './review-labels.mjs';
+
+/**
+ * Finish the labels after a caller has proven and durably recorded an acceptance carry.
+ * The caller owns the proof, record and retry boundary; the accepted-label write stays in this port.
+ */
+export function finishRecordedAcceptanceLabels({ provider, repo, pr, currentLabels }) {
+  const accepted = currentLabels.some((label) => (typeof label === 'string' ? label : label?.name) === REVIEW_LABELS.accepted);
+  provider.setLabels(repo, pr, { add: accepted ? undefined : REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.pending] });
+}
 
 // GitHub rejects longer label descriptions with HTTP 422:
 // "description is too long (maximum is 100 characters)".
@@ -95,6 +105,11 @@ export const GH_ARGV = Object.freeze({
   // `--body-file`, never `--body`: the verdict body carries newlines and emoji, and shell-quoting them is the
   // kind of thing that works until one comment does not.
   postComment: (repo, pr, bodyFile) => ['pr', 'comment', String(pr), '--repo', repo, '--body-file', bodyFile],
+  // Replace one issue comment's body by its GraphQL node id (the `id` the complete comment reader returns). The body is
+  // read from a file (`-F body=@…`), for the same reason as `postComment`.
+  editComment: (commentId, bodyFile) => ['api', 'graphql',
+    '-f', 'query=mutation($id: ID!, $body: String!) { updateIssueComment(input: {id: $id, body: $body}) { issueComment { id } } }',
+    '-f', `id=${commentId}`, '-F', `body=@${bodyFile}`],
   currentRepo: () => ['repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner'],
   // `--force` makes this CREATE-OR-UPDATE, never an error on an already-existing label — the only shape that
   // is safe to call unconditionally before every `setLabels`. `gh pr edit --add-label` REFUSES a label that
@@ -114,7 +129,7 @@ export const GH_ARGV = Object.freeze({
   // caller (`review-set-label.mjs`) already goes out of its way NOT to pull in transitively (per that same
   // file's documented reason for avoiding `reconcile-core.mjs#assessLiveness` — a heavy load-time import chain
   // is exactly the hazard both sides are keeping out of each other's graph).
-  readPrFiles: (repo, pr) => ['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', `repos/${repo}/pulls/${pr}/files`, '--jq', '.[].filename'],
+  readPrFiles: (repo, pr) => ['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', `repos/${repo}/pulls/${pr}/files`, '--jq', '.[] | .filename, (.previous_filename // empty)'],
   // The PR's formal reviews (PR #4631 round 3): `gh pr view --json comments` never returns them, so a "Request changes"
   // review was invisible to the carry rule. A dedicated paginated read (not a `readPrState` field, which would change
   // that argv for every caller and cannot be shown to page); one JSON object per line so `--paginate` pages
@@ -183,13 +198,25 @@ export function createGhProvider({
       }
     },
 
+    // `repo` names the thread for symmetry with `postComment`; the node id alone addresses the comment.
+    editComment(_repo, commentId, body, { pr = 'comment' } = {}) {
+      if (typeof commentId !== 'string' || !/^IC_[A-Za-z0-9_-]+$/.test(commentId)) throw new Error('invalid comment node id');
+      const path = join(tmpDir, `review-label-${pr}-${process.pid}-edit.md`);
+      try {
+        writeFile(path, body, 'utf8');
+        exec(GH_ARGV.editComment(commentId, path), { maxBuffer: 16 * 1024 * 1024 });
+      } finally {
+        try { removeFile(path); } catch { /* best-effort cleanup */ }
+      }
+    },
+
     /** NOT part of the port proper — it answers "which repo am I in", not "what about this PR". Kept on the
      *  adapter because it is the same `gh` arc, and it fires only when `--repo` was omitted. */
     currentRepo() {
       return exec(GH_ARGV.currentRepo(), { maxBuffer: 4 * 1024 * 1024 }).trim();
     },
 
-    /** The PR's changed files, net versus its base — real pagination applied, no cap. Read-only; see
+    /** The PR's changed files, including both rename paths — real pagination up to GitHub's API cap. Read-only; see
      *  {@link GH_ARGV.readPrFiles} for why `--method GET` cannot be dropped. */
     readPrFiles(repo, pr) {
       const out = exec(GH_ARGV.readPrFiles(repo, pr), { maxBuffer: 64 * 1024 * 1024 });

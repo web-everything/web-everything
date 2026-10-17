@@ -79,7 +79,7 @@ import { isValidRoundBudget } from './review-settings.mjs';
  * `review-loop-cli.mjs` is the only place {@link buildAcceptQueueEntry}'s output is actually appended anywhere.
  */
 
-import { CONFIRM_ACTORS, CONFIRM_OPTIONS, REVIEW_EFFECTS } from '../operations/review-pr.mjs';
+import { CONFIRM_ACTORS, CONFIRM_OPTIONS, REVIEW_EFFECTS } from '../operations/review-pr-constants.mjs';
 import { VERDICTS, hasUncapturedPrevention, normalizeFinding, requiresMandatoryReferral, DEFAULT_ROUND_CAP,
   MANDATORY_LENSES } from './jury-core.mjs';
 import { findingHeldVerdict } from './review-round-rules.mjs';

@@ -32,7 +32,7 @@ export function trialProgress(attemptRows, trialReviews = null) {
 export function buildTrialReport({ rows, model, runRecords = new Map(), prRuns = new Map(), redTeamByPrHead = new Map(), trialReviews = null }) {
   const attempts = rows.filter((row) => row.model === model).slice().sort((a, b) => String(a.at).localeCompare(String(b.at)));
   const report = {
-    model, attempts: attempts.length, quota: { held: 0, rate: null }, failed: 0, voided: 0, ok: 0, fellBack: 0,
+    model, attempts: attempts.length, quota: { held: 0, rate: null }, failed: 0, voided: 0, skipped: 0, ok: 0, fellBack: 0,
     agreement: { compared: 0, verdictAgree: 0, rate: null, meanJaccard: null, byLens: {} },
     findings: { total: 0, matchedByMandatory: 0, agyOnly: 0, confirmedByFix: 0, confirmedByRedTeam: 0, notConfirmed: 0, pending: 0 },
     runs: [],
@@ -43,6 +43,7 @@ export function buildTrialReport({ rows, model, runRecords = new Map(), prRuns =
     if (isQuotaHeldShadow(row)) report.quota.held++;
     else if (row.status === 'failed') report.failed++;
     else if (row.status === 'voided') report.voided++;
+    else if (row.status === 'skipped') report.skipped++;
     else if (row.status === 'ok') report.ok++;
     if (row.fellBackTo != null) report.fellBack++;
     if (row.status === 'ok') {
@@ -112,7 +113,7 @@ export function renderReport(report) {
   return [
     `agy shadow trial — model ${report.model} (${report.attempts} attempts since ${report.runs[0]?.at ?? 'n/a'})`,
     renderTrialLine(report.trial),
-    `  quota skips: ${report.quota.held}/${report.attempts} (${pct(report.quota.rate)}) held (agy quota); other failures ${report.failed}; voided ${report.voided}; ok ${report.ok}; fell back to routing model ${report.fellBack}`,
+    `  quota skips: ${report.quota.held}/${report.attempts} (${pct(report.quota.rate)}) held (agy quota); other failures ${report.failed}; voided ${report.voided}; skipped ${report.skipped}; ok ${report.ok}; fell back to routing model ${report.fellBack}`,
     `  agreement with the mandatory (Claude) seat: ${a.verdictAgree}/${a.compared} (${pct(a.rate)}), mean finding overlap ${pct(a.meanJaccard)}; by seat: ${Object.entries(a.byLens).map(([lens, v]) => `${lens} ${v.agree}/${v.compared}`).join(', ') || 'n/a'}`,
     `  findings: ${f.total} raised, ${f.matchedByMandatory} also raised by the mandatory seat, ${f.agyOnly} agy-only; confirmed by fixer change ${f.confirmedByFix}, by red-team re-check ${f.confirmedByRedTeam}, not confirmed ${f.notConfirmed}, pending ${f.pending}`,
     '  runs:',

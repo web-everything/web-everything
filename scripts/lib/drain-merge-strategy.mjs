@@ -7,9 +7,8 @@
  *     path runs exactly as before. The only visible change is ONE log line per pass naming the strategy and the
  *     layer that set it. No state file exists → the queue follow-up makes no `gh` call.
  *   - `github-merge-queue`: for a PR of the drain's LOCAL repo that passed every drain gate this pass, the drain
- *     (1) stamps a drain enqueue-clearance comment for the judged head (so the `merge-gate` check can pass manifest
- *     couples / blockedBy — those gates fail closed without it), (2) ENQUEUES the PR through GraphQL
- *     `enqueuePullRequest` pinned to that head, and never calls the merge API. GitHub's queue owns freshness, so the
+ *     enqueues through GraphQL `enqueuePullRequest` pinned to the judged head, confirms membership, then
+ *     stamps clearance so `merge-gate` can pass couple-whole / blockedBy. It never calls the merge API. GitHub's queue owns freshness, so the
  *     drain's merge-queue freshness refresh is skipped for it. An enqueue failure THROWS: the drain reports it as a
  *     failed land, loudly, and never falls back to merging directly.
  *     Other repos (impl halves in sibling repos) keep `drain-direct`: the policy's tool layer is this repo's
@@ -31,6 +30,9 @@
  *   operator can preview which PRs `github-merge-queue` would enqueue without flipping the live policy. A live
  *   (non-dry-run) pass ignores the variable and says so.
  */
+import { readDrainRedTeamEvidence } from './drain-red-team-evidence.mjs';
+import { readDrainQueueSafety, postAcceptRedTeamOwed, redTeamEnqueueHold, dequeueSentBack, sendBackReason } from './drain-queue-safety.mjs';
+import { defaultPostConflictFinding } from './conflict-finding.mjs';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -39,7 +41,7 @@ import { mergeActionFor, enqueuePr, planQueueFollowUps, REQUIRED_WORKFLOWS_UNSAT
 import { getRequiredStatusChecks } from './required-status-checks.mjs';
 import { readSettings } from './settings-files.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
-import { createAdaptiveBatching } from './merge-queue-adaptive-batching.mjs';
+import { createAdaptiveBatching, readQueueFacts } from './merge-queue-adaptive-batching.mjs';
 import { cancelObsoleteQueueRuns } from './merge-queue-obsolete-runs.mjs';
 
 export const DRY_RUN_STRATEGY_ENV = 'WE_DRAIN_MERGE_STRATEGY';
@@ -49,6 +51,7 @@ export const MERGE_DELIVERY_SETTINGS_FILE_ENV = 'WE_MERGE_DELIVERY_SETTINGS_FILE
 export const CLEARANCE_MARKER = 'we-drain-enqueue-clearance';
 const CLEARANCE_RE = new RegExp(`<!--\\s*${CLEARANCE_MARKER}\\s+head=([0-9a-f]{7,40})\\s*-->`, 'gi');
 const FOLLOWED_UP_CAP = 500;
+const COMMENTS_MAX_BUFFER = 256 * 1024 * 1024; // = merge-ai-prs PR_COMMENTS_MAX_BUFFER (that CLI imports this module)
 export const FOLLOW_UP_MAX_ATTEMPTS = 5;
 
 export function queueStatePath(env = process.env) { return join(resolveCoordinationRoot({ env }), 'drain-merge-queue-followups.json'); }
@@ -176,14 +179,14 @@ const isEntry = (p) => !!p && typeof p === 'object' && p.num != null;
 export function readQueueState(path, readFile = readFileSync) {
   try {
     const s = JSON.parse(readFile(path, 'utf8'));
-    return { pending: Array.isArray(s?.pending) ? s.pending.filter(isEntry) : [], followedUp: Array.isArray(s?.followedUp) ? s.followedUp.filter((k) => typeof k === 'string') : [], exists: true, unreadable: false };
+    return { pending: Array.isArray(s?.pending) ? s.pending.filter(isEntry) : [], ...(s?.enqueueFailures ? { enqueueFailures: s.enqueueFailures } : {}), ...(s?.redTeamPending ? { redTeamPending: s.redTeamPending } : {}), followedUp: Array.isArray(s?.followedUp) ? s.followedUp.filter((k) => typeof k === 'string') : [], exists: true, unreadable: false };
   } catch (e) { return { pending: [], followedUp: [], exists: false, unreadable: e?.code !== 'ENOENT' }; }
 }
 
 function writeQueueState(path, state) {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify({ pending: state.pending, followedUp: state.followedUp.slice(-FOLLOWED_UP_CAP) }, null, 2)}\n`);
+  writeFileSync(tmp, `${JSON.stringify({ ...(state.enqueueFailures ? { enqueueFailures: state.enqueueFailures } : {}), ...(state.redTeamPending ? { redTeamPending: state.redTeamPending } : {}), pending: state.pending, followedUp: state.followedUp.slice(-FOLLOWED_UP_CAP) }, null, 2)}\n`);
   renameSync(tmp, path);
 }
 
@@ -203,7 +206,9 @@ export function createDrainMergeStrategy({
   dryRun = false, quiet = false, isLocalRepo = () => true, localSlug = null, exec = execFileSync,
   statePath = queueStatePath(), resolved = resolveDrainMergePolicy({ dryRun }), log = process.stderr,
   readFile = readFileSync, writeState = writeQueueState, withLock = (fn) => ({ ran: true, result: fn() }),
+  postConflictFinding = defaultPostConflictFinding, now = () => Date.now(),
   cancelObsoleteRuns = cancelObsoleteQueueRuns, batching,
+  env = process.env, queueSafety, readRedTeamEvidence = readDrainRedTeamEvidence, requestRedTeam = null,
   cwd = process.cwd(), // a clone of the local repo: enqueuePr reads the judged commit's change list from it
 } = {}) {
   const { policy, note } = resolved;
@@ -218,7 +223,7 @@ export function createDrainMergeStrategy({
     const lock = withLock(() => {
       const st = readQueueState(statePath, readFile);
       if (st.unreadable) { unreadable = true; return false; }
-      fn(st); writeState(statePath, { pending: st.pending, followedUp: st.followedUp }); return true;
+      fn(st); writeState(statePath, { pending: st.pending, followedUp: st.followedUp, ...(st.enqueueFailures ? { enqueueFailures: st.enqueueFailures } : {}), ...(st.redTeamPending ? { redTeamPending: st.redTeamPending } : {}) }); return true;
     });
     if (lock?.ran === false) { say(`  ⚠ merge-queue follow-up state lock not acquired — ${what} not recorded this pass; retried next pass`); return false; }
     if (unreadable) { say(`  ⚠ merge-queue follow-up state ${statePath} is unreadable — ${what} not recorded (file left untouched); fix or remove it`); return false; }
@@ -233,6 +238,22 @@ export function createDrainMergeStrategy({
   };
   log.write(`  ${formatMergeDeliverySourcesLine(policy)}${dryRun ? ' [dry run]' : ''}\n`);
   if (note) log.write(`  ⚠ merge-delivery: ${note}\n`);
+  const safety = queueSafety ?? readDrainQueueSafety({ env, log: line => log.write(`  ${line}\n`) });
+  const pendingOutcome = (c, pending) => {
+    const maxMin = safety.value.redTeamPendingMaxMin ?? 45;
+    const healthSmell = now() - pending.firstPendingAt >= maxMin * 60_000;
+    if (healthSmell) log.write(`  health smell: ${slugOf(c.repo)}#${c.num} red-team-pending on ${pending.headSha} for ${Math.floor((now() - pending.firstPendingAt) / 60_000)} min (redTeamPendingMaxMin=${maxMin}, ${safety.sources?.redTeamPendingMaxMin ?? 'standard'})\n`);
+    say(`  merge-queue: defer #${c.num}: ${pending.reason}`);
+    return { enqueued: false, deferred: true, kind: 'red-team-pending', reason: pending.reason, healthSmell };
+  };
+  const readLive = (repo, num) => JSON.parse(exec('gh', ['pr', 'view', String(num), '--repo', slugOf(repo), '--json', 'headRefOid,labels'], { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }));
+  // The complete thread as pages. The drain's own comment reader allows 256 MiB: a long thread must not hit the 1 MiB default.
+  const readThreadPages = (repo, num) => JSON.parse(exec('gh', ['api', '--paginate', '--slurp', `repos/${slugOf(repo)}/issues/${num}/comments`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: COMMENTS_MAX_BUFFER, timeout: 120_000 }));
+  const removeSentBack = (repo, num, labels) => {
+    if (dryRun || !safety.value.dequeueOnSendBack || !Array.isArray(labels)) return;
+    const reason = sendBackReason(labels);
+    if (reason) dequeueSentBack({ repo: slugOf(repo), pr: num, reason, exec, log: say });
+  };
   const enqueueMode = mergeActionFor(policy) === 'enqueue';
   const adaptiveBatching = () => batching ??= createAdaptiveBatching({ repo: localSlug, exec, dryRun, log: say });
   const enqueues = (repo) => enqueueMode && !!isLocalRepo(repo);
@@ -244,6 +265,22 @@ export function createDrainMergeStrategy({
     enqueues,
     /** GitHub's queue re-tests every entry against the queue tip, so the drain's freshness refresh is skipped. */
     queueOwnsFreshness: (repo) => enqueues(repo),
+
+    /** Live open rows are unfiltered by ready-to-merge; also covers entries not in our follow-up file. */
+    dequeueSendBacks(rows = [], repo = null) {
+      if (dryRun || !enqueueMode || !safety.value.dequeueOnSendBack || !isLocalRepo(repo)) return;
+      const candidates = rows.filter(row => Array.isArray(row.labels) && sendBackReason(row.labels));
+      if (!candidates.length) return;
+      // Discover membership once, before any per-PR read. An incomplete discovery retries next pass;
+      // never replace it with an API sweep of every non-ready open PR.
+      const queue = readQueueFacts({ repo: slugOf(repo), exec: (cmd, args, opts) => exec(cmd, args, { ...opts, timeout: 60_000 }) });
+      if (queue.error) { say(`  ⚠ merge-queue discovery failed (${queue.error}) — dequeue sweep retried next pass`); return; }
+      for (const row of candidates) {
+        if (!queue.inQueue.has(Number(row.number))) continue;
+        try { removeSentBack(repo, row.number, readLive(repo, row.number).labels); }
+        catch (e) { say(`  ⚠ merge-queue dequeue #${row.number} failed (${firstLine(e)}) — retried next pass`); }
+      }
+    },
 
     /** Dry run: name exactly what this strategy would do with the ordered ready set. Calls no GitHub API. */
     reportDryRun(ordered = []) {
@@ -266,6 +303,65 @@ export function createDrainMergeStrategy({
       if (!enqueues(c.repo)) throw new Error('enqueue called for a repo outside github-merge-queue');
       if (dryRun) throw new Error('enqueue refused in dry run');
       if (!headSha) throw new Error('github-merge-queue: no pinned head — refusing to enqueue (and NOT merging directly)');
+      // An unreadable state file would be overwritten with just this PR once enqueued, erasing every other pending follow-up.
+      const before = readQueueState(statePath, readFile);
+      if (before.unreadable) throw new Error(`github-merge-queue: follow-up state ${statePath} is unreadable — refusing to enqueue (and NOT merging directly); fix or remove it`);
+      const key = keyOf(c.repo, c.num);
+      const previous = before.enqueueFailures?.[key];
+      if (previous?.headSha === headSha && previous.retryAt > now()) {
+        return { enqueued: false, deferred: true, kind: 'enqueue-backoff', reason: previous.error, healthSmell: !!previous.healthSmell };
+      }
+      const live = readLive(c.repo, c.num);
+      if (live.headRefOid !== headSha || !Array.isArray(live.labels)) return { enqueued: false, deferred: true, kind: 'live-state-unreadable', reason: 'live head or labels do not match the judged state' };
+      const held = sendBackReason(live.labels);
+      if (held) {
+        removeSentBack(c.repo, c.num, live.labels);
+        return { enqueued: false, deferred: true, kind: 'sent-back', reason: held };
+      }
+      if (safety.value.waitForRedTeamBeforeEnqueue) {
+        const evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env });
+        const owed = postAcceptRedTeamOwed(evidence.loopPayload, env);
+        const pending = before.redTeamPending?.[key];
+        const sameHead = pending?.headSha === headSha;
+        const overdue = sameHead && now() - pending.firstPendingAt >= (safety.value.redTeamPendingMaxMin ?? 45) * 60_000;
+        const newComment = Array.isArray(comments) && comments.length > (pending?.commentCount ?? 0);
+        // At the deadline recheck evidence and comments even if the normal retry backoff is longer.
+        if (owed && sameHead && pending.retryAt > now() && !newComment && !overdue) return pendingOutcome(c, pending);
+        const pages = readThreadPages(c.repo, c.num);
+        if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team admission: unreadable complete comments');
+        const reason = redTeamEnqueueHold({ loopPayload: evidence.loopPayload, comments: pages.flat(), pr: c.num, head: headSha, env });
+        if (reason) {
+          before.redTeamPending ??= {};
+          const wait = { headSha, firstPendingAt: sameHead ? pending.firstPendingAt : now(),
+            retryAt: now() + (safety.value.redTeamPendingBackoffSec ?? 300) * 1000,
+            commentCount: pages.flat().length, reason,
+            ...(sameHead && pending.requestedAt != null ? { requestedAt: pending.requestedAt } : {}) };
+          before.redTeamPending[key] = wait;
+          writeState(statePath, before);
+          const outcome = pendingOutcome(c, wait);
+          // Never waive a recorded break or an active/recorded run. Only the scheduling gap has this escape.
+          if (!outcome.healthSmell || evidence.inFlight || evidence.recorded || reason.includes('requiring send-back')) return outcome;
+          let requested = false;
+          if (wait.requestedAt != null && now() - wait.requestedAt < (safety.value.redTeamPendingMaxMin ?? 45) * 60_000) return outcome;
+          if (wait.requestedAt == null && typeof requestRedTeam === 'function') {
+            try { requested = requestRedTeam({ repo: slugOf(c.repo), pr: c.num, head: headSha, loopPayload: evidence.loopPayload })?.requested === true; }
+            catch (e) { log.write(`  red-team request failed #${c.num}: ${firstLine(e)}\n`); }
+          }
+          if (requested) {
+            wait.requestedAt = now();
+            writeState(statePath, before);
+            log.write(`  merge-queue: requested red team for #${c.num} on ${headSha} through review dispatch\n`);
+            return { ...outcome, redTeamRequested: true };
+          }
+          const fallback = safety.value.enqueueWhenRedTeamNeverScheduled ?? true;
+          log.write(`  merge-queue: #${c.num} red team never scheduled — enqueueWhenRedTeamNeverScheduled=${fallback} (${safety.sources?.enqueueWhenRedTeamNeverScheduled ?? 'standard'}); no successful red-team request path\n`);
+          if (!fallback) return outcome;
+        }
+      }
+      if (before.redTeamPending?.[key]) {
+        delete before.redTeamPending[key];
+        writeState(statePath, before);
+      }
       let batchingGroupId;
       try {
         const g = adaptiveBatching().gate(c.num);
@@ -275,18 +371,32 @@ export function createDrainMergeStrategy({
           return { enqueued: false, deferred: true, reason: g.reason };
         }
       } catch (e) { say(`  ⚠ merge-queue batching admission failed (${firstLine(e)}) — continuing enqueue`); }
-      // An unreadable state file would be overwritten with just this PR once enqueued, erasing every other pending follow-up.
-      if (readQueueState(statePath, readFile).unreadable) throw new Error(`github-merge-queue: follow-up state ${statePath} is unreadable — refusing to enqueue (and NOT merging directly); fix or remove it`);
-      // Skip the stamp only for a marker the DRAIN itself posted: a lookup of the drain's identity (made at most once
-      // per pass, and only when some marker for this head exists) that fails or finds no match stamps again.
-      const alreadyStamped = Array.isArray(comments) && anyClearanceMarkerFor(comments, headSha) && (() => { const me = drainLogin(); return !!me && hasClearanceFor(comments, headSha, [me]); })();
-      if (!alreadyStamped) {
-        try { exec('gh', ['pr', 'comment', String(c.num), '--repo', slugOf(c.repo), '--body', buildClearanceComment(headSha)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); }
-        catch (e) { say(`  ⚠ ${keyOf(c.repo, c.num)} enqueue clearance stamp failed (${firstLine(e)}) — merge-gate's couple/blockedBy gates will fail closed for it`); }
-      }
       const r = enqueuePr({ repo: slugOf(c.repo), num: c.num, headSha, cwd, exec });
       if (!r.ok) {
+        log.write(`  enqueue FAILED ${key}: ${r.error}\n`);
+        const conflict = /merge conflicts?|not (?:in )?(?:a )?mergeable state|not mergeable/i.test(r.error);
+        const state = readQueueState(statePath, readFile);
+        if (state.unreadable) throw Object.assign(new Error(`enqueue FAILED: ${r.error}; failure state unreadable`), { githubMessage: r.error });
+        const count = (previous?.headSha === headSha ? previous.count : 0) + 1;
+        const healthSmell = !conflict && count >= policy.enqueueFailureSmellAfter;
+        state.enqueueFailures ??= {};
+        const failure = { headSha, count, error: r.error, smellAfter: policy.enqueueFailureSmellAfter, smellSource: policy.sources?.enqueueFailureSmellAfter || 'standard', kind: conflict ? 'conflict' : r.unconfirmed ? 'unconfirmed' : 'enqueue-error', healthSmell,
+          retryAt: now() + Math.min(3600, policy.enqueueRetrySeconds * 2 ** Math.min(count - 1, 10)) * 1000 };
+        if (conflict && previous?.headSha === headSha && previous.conflictRouted) failure.conflictRouted = true;
+        state.enqueueFailures[key] = failure;
+        try { writeState(statePath, state); }
+        catch (e) { log.write(`  enqueue failure state write failed ${key}: ${firstLine(e)}\n`); }
+        if (healthSmell) log.write(`  health smell: ${key} enqueue failed ${count} times (enqueueFailureSmellAfter=${policy.enqueueFailureSmellAfter}, ${policy.sources?.enqueueFailureSmellAfter || 'standard'})\n`);
+        if (conflict && !failure.conflictRouted) {
+          try {
+            postConflictFinding({ pr: { number: c.num, headRefName: c.headRef }, enqueueRefusal: r.error, repo: slugOf(c.repo), exec });
+            failure.conflictRouted = true;
+            writeState(statePath, state);
+          } catch (e) { log.write(`  conflict handoff failed ${key}: ${firstLine(e)}\n`); }
+        }
         const err = new Error(`github-merge-queue enqueue FAILED (${r.error}) — NOT merged directly; retried next pass`);
+        err.githubMessage = r.error;
+        err.enqueueFailure = failure;
         // required-workflows refusal (ruleset 24930207): carry the exact enqueue pin into the cascade catch.
         if (r.reason === REQUIRED_WORKFLOWS_UNSATISFIED) { err.code = REQUIRED_WORKFLOWS_UNSATISFIED; err.headSha = headSha; }
         throw err;
@@ -296,10 +406,32 @@ export function createDrainMergeStrategy({
       // The file can break between the pre-check above and here. Writing over it would erase every other pending
       // follow-up, so throw instead: the PR is already queued, and the next pass (file fixed) sees `already` and records it.
       if (state.unreadable) throw new Error(`github-merge-queue: ${keyOf(c.repo, c.num)} is ENQUEUED but follow-up state ${statePath} became unreadable — not recorded (file left untouched), retried next pass; fix or remove the file`);
+      if (state.enqueueFailures) delete state.enqueueFailures[key];
+      const savedStamp = state.pending.some(p => keyOf(p.repo, p.num) === key && p.clearanceHead === headSha);
+      // Skip the stamp only for a marker the DRAIN itself posted: a lookup of the drain's identity (made at most once
+      // per pass, and only when some marker for this head exists) that fails or finds no match stamps again.
+      if (!savedStamp) {
+        try {
+          const pages = readThreadPages(c.repo, c.num);
+          if (!Array.isArray(pages) || pages.some(page => !Array.isArray(page))) throw new Error('malformed comments response');
+          comments = [...(comments || []), ...pages.flat()];
+        } catch (e) {
+          say(`  ⚠ ${key} clearance dedupe read failed (${firstLine(e)}) — stamp deferred until next pass`);
+          comments = null;
+        }
+      }
+      const alreadyStamped = savedStamp || Array.isArray(comments) && anyClearanceMarkerFor(comments, headSha) && (() => { const me = drainLogin(); return !!me && hasClearanceFor(comments, headSha, [me]); })();
+      let stamped = alreadyStamped;
+      if (!alreadyStamped && comments !== null) {
+        try { exec('gh', ['pr', 'comment', String(c.num), '--repo', slugOf(c.repo), '--body', buildClearanceComment(headSha)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); stamped = true; }
+        catch (e) { say(`  ⚠ ${keyOf(c.repo, c.num)} enqueue clearance stamp failed (${firstLine(e)}) — merge-gate's couple/blockedBy gates will fail closed for it`); }
+      }
       if (!state.pending.some((p) => keyOf(p.repo, p.num) === keyOf(c.repo, c.num))) {
         state.pending.push({ num: c.num, repo: c.repo ?? null, headSha, item: c.item ?? null, hasManifest: !!c.hasManifest, headRef: c.headRef ?? null, title: c.title ?? null, enqueuedAt: new Date().toISOString() });
-        writeState(statePath, state);
       }
+      const pending = state.pending.find(p => keyOf(p.repo, p.num) === key);
+      Object.assign(pending, { headSha, ...(stamped ? { clearanceHead: headSha } : {}) });
+      writeState(statePath, state);
       say(`  ⇢ ${keyOf(c.repo, c.num)} ${r.already ? 'already in' : 'ENQUEUED on'} GitHub's merge queue at ${String(headSha).slice(0, 9)}${r.entry?.position != null ? ` (position ${r.entry.position})` : ''} — GitHub merges it; the drain follows up after`);
       return { enqueued: true, already: !!r.already };
     },
@@ -329,8 +461,12 @@ export function createDrainMergeStrategy({
       const followedUpKeys = new Set(state.followedUp);
       for (const p of state.pending) {
         let v;
-        try { v = JSON.parse(exec('gh', ['pr', 'view', String(p.num), '--repo', slugOf(p.repo), '--json', 'number,state,mergedAt,mergeCommit'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}'); }
+        try { v = JSON.parse(exec('gh', ['pr', 'view', String(p.num), '--repo', slugOf(p.repo), '--json', 'number,state,mergedAt,mergeCommit,labels'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}'); }
         catch (e) { say(`  ⚠ ${keyOf(p.repo, p.num)} queue follow-up read failed (${firstLine(e)}) — retried next pass`); continue; }
+        if (v?.state === 'OPEN') {
+          try { removeSentBack(p.repo, p.num, v.labels); }
+          catch (e) { say(`  ⚠ ${keyOf(p.repo, p.num)} dequeue failed (${firstLine(e)}) — retried next pass`); }
+        }
         if (v?.state === 'MERGED') { if (followedUpKeys.has(keyOf(p.repo, p.num))) drop.add(keyOf(p.repo, p.num)); else facts.push({ p, v }); }
         else if (v?.state === 'CLOSED') { drop.add(keyOf(p.repo, p.num)); say(`  · ${keyOf(p.repo, p.num)} left the merge queue CLOSED without merging — dropped from the follow-up list`); }
       }

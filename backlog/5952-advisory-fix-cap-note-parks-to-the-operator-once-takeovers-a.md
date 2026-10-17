@@ -5,8 +5,8 @@ size: 1
 status: open
 scope: ["we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/__tests__/reconcile-core.test.mjs", "we:scripts/conveyor/__tests__/reconcile-core-exhaustion-notes.test.mjs", "we:skills-src/conveyor/__tests__/reconcile-fix-dispatch-daemon-notes.test.mjs"]
 dateOpened: "2026-10-12"
-preparedDate: "2026-10-15"
-preparedAgainstSha: "37d55ee65aad06d177e15de929b4115762a3b0bf"
+preparedDate: "2026-10-16"
+preparedAgainstSha: "1ca5edb490fbc03fe55aee05985107d6272c4628"
 tags: []
 ---
 
@@ -16,9 +16,11 @@ Held finding 246: terminal advisory-fix exhaustion should request the same opera
 
 ## Progress
 
-- Rechecked at 37d55ee65. Original premise: only generic fix exhaustion requests parking, so advisory exhaustion never reaches the operator queue; original scope was only `we:scripts/conveyor/reconcile-core.mjs`. The first part remains true at `we:scripts/conveyor/reconcile-core.mjs:2332`; the queue claim was too broad. Advisory repairs commonly already carry review:human, and the consumer explicitly skips relabeling those PRs at `we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs:422`. Parking is an idempotent intent, not a guarantee that every exhausted PR is immediately merge-ready in the operator queue (`we:scripts/operations/operator-queue.mjs:168`).
-- Corrected scope adds the canonical planner suite, its exhaustion suite and the daemon note-consumer suite. The standards gate requires the canonical matching test `we:scripts/conveyor/__tests__/reconcile-core.test.mjs` in scope as well as the focused exhaustion suite. The former explicitly pins the old fix-only behavior at `we:scripts/conveyor/__tests__/reconcile-core-exhaustion-notes.test.mjs:463`; the latter already tests the injected parking port at `we:skills-src/conveyor/__tests__/reconcile-fix-dispatch-daemon-notes.test.mjs:199`. No consumer implementation change is needed.
-- Retain size 1: about 5 source lines, 65 planner-test lines and 30 consumer-test lines. Takeover selection precedes terminal exhaustion at `we:scripts/conveyor/reconcile-core.mjs:2245`; awaiting-review refusal returns before the note at `we:scripts/conveyor/reconcile-core.mjs:2323`. Preserve those boundaries.
+- Revalidated at checkout 1ca5edb490 on 2026-10-16: the fix-only predicate remains; corrected the moved planner citations below. Existing scope and size 1 remain appropriate. This preparation changes no runtime behavior.
+
+- Rechecked at 37d55ee65. Original premise: only generic fix exhaustion requests parking, so advisory exhaustion never reaches the operator queue; original scope was only `we:scripts/conveyor/reconcile-core.mjs`. The first part remains true at `we:scripts/conveyor/reconcile-core.mjs:2250`; the queue claim was too broad. Advisory repairs commonly already carry review:human, and the consumer explicitly skips relabeling those PRs at `we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs:422`. Parking is an idempotent intent, not a guarantee that every exhausted PR is immediately merge-ready in the operator queue (`we:scripts/operations/operator-queue.mjs:168`).
+- Corrected scope adds the canonical planner suite, its exhaustion suite and the daemon note-consumer suite. The standards gate requires the canonical matching test `we:scripts/conveyor/__tests__/reconcile-core.test.mjs` in scope as well as the focused exhaustion suite. The focused exhaustion suite explicitly pins the old fix-only behavior at `we:scripts/conveyor/__tests__/reconcile-core-exhaustion-notes.test.mjs:463`; the daemon suite already tests the injected parking port at `we:skills-src/conveyor/__tests__/reconcile-fix-dispatch-daemon-notes.test.mjs:199`. No consumer implementation change is needed.
+- Retain size 1: about 5 source lines, 65 planner-test lines and 30 consumer-test lines. Takeover selection precedes terminal exhaustion at `we:scripts/conveyor/reconcile-core.mjs:2163`; awaiting-review refusal returns before the note at `we:scripts/conveyor/reconcile-core.mjs:2243`. Preserve those boundaries.
 
 ## Design
 

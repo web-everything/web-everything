@@ -2,9 +2,11 @@
 bornAs: x8rsopp
 kind: story
 size: 2
-status: open
+status: resolved
 scope: ["we:scripts/conveyor/mechanical-round-cap.mjs", "we:scripts/conveyor/reconcile-pass.mjs", "we:scripts/conveyor/__tests__/mechanical-round-cap.test.mjs", "we:scripts/conveyor/__tests__/reconcile-pass.test.mjs"]
 dateOpened: "2026-10-12"
+dateStarted: "2026-10-15"
+dateResolved: "2026-10-15"
 preparedDate: "2026-10-15"
 preparedAgainstSha: "37d55ee65aad06d177e15de929b4115762a3b0bf"
 tags: []
@@ -15,6 +17,10 @@ tags: []
 A trusted mechanical marker must describe the latest round before it can authorize a cap exemption. An older marker currently survives a later ordinary rearm. Reject untrusted verdict comments before scanning their bodies for mechanical attribution, and verify the reconcile IO gate.
 
 ## Progress
+
+- Sanity read confirmed the stale-marker and trust-order defects remain buildable as specified. Synthetic baseline with a judged parent, proven current-head facts, mechanical marker, then ordinary rearm returned `pending: true` and a one-review grant.
+- Implemented a shared latest-mechanical chronology check for prefilter and grant. Trusted round/verdict events with missing or malformed dates refuse permission; ordinary rounds tied with or later than the mechanical marker invalidate it. Authorship now precedes verdict body access. Added chronology/planner regressions and injected reconcile-port coverage; affected suites are queued through host heavy admission.
+- Validation complete: both affected suites passed through host heavy admission (250 tests, including existing git-read, buffer/timeout and ancestry refusals). The same synthetic baseline now returns `pending: false` and `no-marker`; adding a later mechanical marker restores `pending: true` and exactly one review allowance. Reconcile-port replay confirms a newer ordinary round skips mechanical-facts IO and sends no mechanical exemption to planning; the positive replay receives the allowance. The existing repo/setting gate required no source change and is covered for WE false/true and both non-WE repos. No GitHub writes were used.
 
 - Rechecked against 37d55ee65: old premise (stale mechanical markers survive ordinary rounds) remains present in `we:scripts/conveyor/mechanical-round-cap.mjs:270` and `we:scripts/conveyor/mechanical-round-cap.mjs:437`. Corrected the moved enrichment gate citation to `we:scripts/conveyor/reconcile-pass.mjs:1548`. Existing source-plus-test scope and size 2 remain appropriate; no new production surface or policy choice is needed.
 

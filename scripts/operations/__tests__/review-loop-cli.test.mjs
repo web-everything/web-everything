@@ -38,10 +38,25 @@ import { buildPreventionFilingInput, buildRoundCardsFilingInput, roundCardsFindi
 import {
   applyUnattendedActorDefault, buildFileItemArgv, fileItemForPrevention, fileItemForPreventionViaLandingJob,
   findFiledPreventionCard, findFiledRoundCardsCard, findRetainedRoundCardsReceipt, QUEUED_RECEIPT_TTL_MS, retainedRoundCardsReceipt,
-  runReviewLoopOnce, UNATTENDED_REVIEW_ACTOR,
+  runReviewLoopOnce as driveReviewLoopOnceRaw, UNATTENDED_REVIEW_ACTOR,
 } from '../review-loop-cli.mjs';
 import { createReviewPrSinks } from '../review-pr-io.mjs';
 import { spawnPreventionLandingJob } from '../../lib/prevention-landing-job.mjs';
+
+import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey,
+  renderReferralRecord } from '../../lib/jury-core.mjs';
+
+// #5725 — ordinary orchestration cases never enumerate the checkout backlog: the filed-card lookups default to an
+// explicit miss. A case that needs a hit, a structured result, or the REAL lookup passes its own (the spread below
+// lets it win). The real lookup/idempotency tests run against tiny temporary backlogs further down.
+const LOOKUP_MISS = { findFiledPrevention: () => null, findFiledRoundCards: () => null };
+const driveReviewLoopOnce = options => driveReviewLoopOnceRaw({ ...LOOKUP_MISS, ...options });
+
+// Legacy filing tests exercise the explicitly disabled safety policy. New boundary tests below
+// use the production default through driveReviewLoopOnce.
+const runReviewLoopOnce = options => driveReviewLoopOnce({
+  acceptPolicy: { value: { unattendedAcceptRequiresCleanReferrals: false } }, ...options,
+});
 
 // #4493 converge round-1 (4 of 5 jurors, independently): every existing `runReviewLoopOnce` test injects its own
 // `fileItem`, so nothing ever exercised the PRODUCTION DEFAULT wiring — the exact one-line swap
@@ -386,6 +401,21 @@ describe('runReviewLoopOnce — property 4, MECHANIZED (#2749 fix, 2026-09-26 sc
     expect(out.lines.join('\n')).toMatch(/prevention guard\(s\) filed mechanically — backlog\/9001-file-the-guard\.md \(#9001\)/);
     expect(out.lines.join('\n')).toMatch(/no human was asked/);
     expect(out.lines.join('\n')).not.toMatch(/QUEUED for a human/);
+  });
+
+  // The production-default lookup path (the checkout backlog scan) is not observable from here — only that it runs without
+  // breaking the flow; the real lookups' hit/miss/idempotency behavior is pinned against temp backlogs further down.
+  it('#5725 — with NO lookup injected (explicit `undefined` restores the production defaults) the default lookup path runs to completion and the card is filed', async () => {
+    const { declaration, registry } = registryFor({});
+    const fileItemCalls = [];
+    const out = await runReviewLoopOnce({
+      declaration, registry, argv: BASE_ARGV, store: createMemoryRunStore(), sinks: recordingSinks([]),
+      makeJudge: cannedJudge(PREVENTION_ANSWER), mintRunId: () => 'r-prevention-default-lookup',
+      findFiledPrevention: undefined, findFiledRoundCards: undefined,
+      fileItem: async (input) => { fileItemCalls.push(input); return stubFileItem()(); },
+    });
+    expect(out.stopped).toBe('complete');
+    expect(fileItemCalls).toHaveLength(1);
   });
 
   it('carries `preventionFiled` (num + path) in --json, with no `queued`/`resumeCommand`/`outstandingGuards` fields', async () => {
@@ -1148,15 +1178,16 @@ describe('runReviewLoopOnce — cards 5471/5470: a round past the budget files i
     findings: [{ summary: 'drops queued work on retry', file: NET_PATHS[0], line: 3, disposition: 'blocker', impactIfUnfixed: 'broken' }],
   };
   const stubFileItem = (calls) => async (input) => { calls.push(input); return { code: 0, lines: [JSON.stringify({ verdict: { num: 7001, rel: 'backlog/7001-review-follow-ups.md' } })] }; };
-  const run = async ({ answer, round, budget = 3, json = false, fileItem }) => {
+  const run = async ({ answer, round, budget = 3, json = false, fileItem, liveHead = HEAD_A, liveComments = [] }) => {
     const declaration = reviewPrOperation({ readPr: stubReader({ rev: HEAD_A, extra: { roundBudget: budget, reviewRound: round } }) });
     const registry = createRegistry();
     registry.register(declaration);
     const seen = [];
-    const out = await runReviewLoopOnce({
+    // The production default accept policy (clean live referrals required), not the legacy disabled wrapper.
+    const out = await driveReviewLoopOnce({
       declaration, registry, argv: [...BASE_ARGV, ...(json ? ['--json'] : [])], store: createMemoryRunStore(), sinks: recordingSinks(seen),
       makeJudge: cannedJudge(answer), mintRunId: () => `r-budget-${round}`, fileItem,
-      findFiledRoundCards: () => null,
+      findFiledRoundCards: () => null, readAcceptancePr: () => ({ headRefOid: liveHead, comments: liveComments }),
     });
     return { out, seen };
   };
@@ -1174,6 +1205,58 @@ describe('runReviewLoopOnce — cards 5471/5470: a round past the budget files i
     expect(calls[0].title).toBe('Review follow-ups (round-budget, round 4) from web-everything/web-everything#1234');
     expect(calls[0].digest).toMatch(/a retry message could name the PR/);
     expect(out.lines.join('\n')).toMatch(/round-cards: web-everything\/web-everything#1234 round 4 \(round-budget, K=3\): accepted; 2 finding\(s\) carded → backlog\/7001-review-follow-ups\.md/);
+  });
+
+  it('a live head that moved since the review parks the round-cards accept before any card is filed', async () => {
+    const calls = [];
+    const { out, seen } = await run({ answer: DEGRADED_ANSWER, round: 4, fileItem: stubFileItem(calls), liveHead: HEAD_B });
+    expect(out.stopped).toBe('confirm');
+    expect(out.run.findings.confirm).toBeUndefined();
+    expect(calls).toHaveLength(0);
+    expect(seen.some((s) => s.type === REVIEW_EFFECTS.LABEL)).toBe(false);
+    expect(out.lines.join('\n')).toMatch(/Unattended accept parked: live head does not match the reviewed head/);
+  });
+
+  it('a head that moves between filing and the accept reports NOT accepted, never a silent no-op accept', async () => {
+    const calls = [];
+    let reads = 0;
+    const declaration = reviewPrOperation({ readPr: stubReader({ rev: HEAD_A, extra: { roundBudget: 3, reviewRound: 4 } }) });
+    const registry = createRegistry();
+    registry.register(declaration);
+    const seen = [];
+    const out = await driveReviewLoopOnce({
+      declaration, registry, argv: BASE_ARGV, store: createMemoryRunStore(), sinks: recordingSinks(seen),
+      makeJudge: cannedJudge(DEGRADED_ANSWER), mintRunId: () => 'r-budget-moved-late', fileItem: stubFileItem(calls),
+      findFiledRoundCards: () => null, readAcceptancePr: () => ({ headRefOid: reads++ === 0 ? HEAD_A : HEAD_B, comments: [] }),
+    });
+    expect(calls).toHaveLength(1);
+    expect(out.stopped).toBe('confirm');
+    expect(seen.some((s) => s.type === REVIEW_EFFECTS.LABEL)).toBe(false);
+    const text = out.lines.join('\n');
+    expect(text).toMatch(/NOT accepted; 2 finding\(s\) carded/);
+    expect(text).toMatch(/Unattended accept parked after filing: live head does not match the reviewed head/);
+  });
+
+  it('a bare --answer=accept on a parked round-cards run cannot accept before its card is filed', async () => {
+    const declaration = reviewPrOperation({ readPr: stubReader({ rev: HEAD_A, extra: { roundBudget: 3, reviewRound: 4 } }) });
+    const registry = createRegistry();
+    registry.register(declaration);
+    const store = createMemoryRunStore();
+    const readAcceptancePr = () => ({ headRefOid: HEAD_A, comments: [] });
+    const parked = await driveReviewLoopOnce({
+      declaration, registry, argv: BASE_ARGV, store, sinks: recordingSinks([]), makeJudge: cannedJudge(DEGRADED_ANSWER),
+      mintRunId: () => 'r-budget-bare-answer', fileItem: async () => ({ code: 1, lines: ['lane pool exhausted'] }),
+      findFiledRoundCards: () => null, readAcceptancePr,
+    });
+    expect(parked.stopped).toBe('confirm');
+    const seen = [];
+    const out = await driveReviewLoopOnce({
+      declaration, registry, argv: ['--resume=r-budget-bare-answer', '--answer=accept'], store, sinks: recordingSinks(seen),
+      makeJudge: cannedJudge(DEGRADED_ANSWER), mintRunId: () => 'unused', fileItem: async () => ({ code: 1, lines: ['still down'] }),
+      findFiledRoundCards: () => null, readAcceptancePr,
+    });
+    expect(out.run.findings.confirm).toBeUndefined();
+    expect(seen.some((s) => s.type === REVIEW_EFFECTS.LABEL)).toBe(false);
   });
 
   it('--json carries roundCardsFiled', async () => {
@@ -1277,9 +1360,9 @@ describe('runReviewLoopOnce — a retry after a queued round-card filing never f
     const declaration = reviewPrOperation({ readPr: stubReader({ rev: HEAD_A, extra: { roundBudget: 3, reviewRound: 4 } }) });
     const registry = createRegistry();
     registry.register(declaration);
-    return runReviewLoopOnce({
+    return driveReviewLoopOnce({
       declaration, registry, argv, store, sinks, makeJudge: cannedJudge(answer), mintRunId: () => id,
-      fileItem, findFiledRoundCards: () => null,
+      fileItem, findFiledRoundCards: () => null, readAcceptancePr: () => ({ headRefOid: HEAD_A, comments: [] }),
     });
   };
 
@@ -1391,5 +1474,108 @@ describe('runReviewLoopOnce — a retry after a queued round-card filing never f
       expect(findRetainedRoundCardsReceipt({ store: flaky, repo: 'o/r', pr: 9, ...want })).toBeNull();
       expect(findRetainedRoundCardsReceipt({ store: { list: () => { throw new Error('x'); }, read: () => null }, repo: 'o/r', pr: 7, ...want })).toBeNull();
     });
+  });
+});
+
+
+describe('unattended acceptance safety boundary', () => {
+  // Undeclared impact still requires prevention capture, without a `broken` finding.
+  const noBroken = { ...PREVENTION_ANSWER,
+    findings: PREVENTION_ANSWER.findings.map(({ impactIfUnfixed, ...f }) => f) };
+  it('prevention-outstanding with clean referrals and no broken finding files then accepts', async () => {
+    const { declaration, registry } = registryFor({ rev: HEAD_A });
+    const seen = [];
+    const fileItem = vi.fn(async () => {
+      expect(seen.some(s => s.type === REVIEW_EFFECTS.LABEL)).toBe(false);
+      return { code: 0, lines: [] };
+    });
+    const out = await driveReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+      store: createMemoryRunStore(), sinks: recordingSinks(seen),
+      readAcceptancePr: () => ({ headRefOid: HEAD_A, comments: [] }),
+      makeJudge: cannedJudge(noBroken), mintRunId: () => 'safety-prevention-clean', fileItem });
+    expect(out.run.verdict.verdict).toBe('prevention-outstanding');
+    expect(out.stopped).toBe('complete');
+    expect(fileItem).toHaveBeenCalledOnce();
+    expect(seen.some(s => s.type === REVIEW_EFFECTS.LABEL)).toBe(true);
+  });
+  it('prevention-outstanding with an unruled broken finding cannot accept', async () => {
+    const { declaration, registry } = registryFor({ rev: HEAD_A });
+    const seen = [];
+    const fileItem = vi.fn();
+    const out = await driveReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+      store: createMemoryRunStore(), sinks: recordingSinks(seen),
+      readAcceptancePr: () => ({ headRefOid: HEAD_A, comments: [] }),
+      makeJudge: cannedJudge(PREVENTION_ANSWER), mintRunId: () => 'safety-prevention-broken', fileItem });
+    expect(out.run.verdict.verdict).toBe('prevention-outstanding');
+    expect(out.stopped).toBe('confirm');
+    expect(seen.some(s => s.type === REVIEW_EFFECTS.LABEL)).toBe(false);
+    expect(fileItem).not.toHaveBeenCalled();
+    expect(out.lines.join('\n')).toMatch(/broken finding is not ruled/);
+  });
+  it.each([['accept', CLEAN_ANSWER], ['prevention-outstanding', noBroken]])
+  ('%s on a live head that moved since the review cannot accept or file', async (verdict, answer) => {
+    const { declaration, registry } = registryFor({ rev: HEAD_A });
+    const seen = [];
+    const fileItem = vi.fn(async () => ({ code: 0, lines: [] }));
+    const out = await driveReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+      store: createMemoryRunStore(), sinks: recordingSinks(seen),
+      readAcceptancePr: () => ({ headRefOid: HEAD_B, comments: [] }),
+      makeJudge: cannedJudge(answer), mintRunId: () => `safety-moved-${verdict}`, fileItem });
+    expect(out.run.verdict.verdict).toBe(verdict);
+    expect(out.stopped).toBe('confirm');
+    expect(seen.some(s => s.type === REVIEW_EFFECTS.LABEL)).toBe(false);
+    expect(fileItem).not.toHaveBeenCalled();
+    expect(out.lines.join('\n')).toMatch(/Unattended accept parked: live head does not match the reviewed head/);
+  });
+  it('a head that moves between filing and the accept says the accept was held, never that it happened', async () => {
+    const { declaration, registry } = registryFor({ rev: HEAD_A });
+    const seen = [];
+    let reads = 0;
+    const fileItem = vi.fn(async () => ({ code: 0, lines: [] }));
+    const out = await driveReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+      store: createMemoryRunStore(), sinks: recordingSinks(seen),
+      readAcceptancePr: () => ({ headRefOid: reads++ === 0 ? HEAD_A : HEAD_B, comments: [] }),
+      makeJudge: cannedJudge(noBroken), mintRunId: () => 'safety-prevention-moved-late', fileItem });
+    expect(fileItem).toHaveBeenCalledOnce();
+    expect(out.stopped).toBe('confirm');
+    expect(seen.some(s => s.type === REVIEW_EFFECTS.LABEL)).toBe(false);
+    expect(out.lines.join('\n')).toMatch(/Unattended accept parked after filing: live head does not match the reviewed head/);
+  });
+});
+
+
+describe('unattended accept reads the live head', () => {
+  const repo = 'web-everything/web-everything';
+  const original = { file: NET_PATHS[0], line: 7, summary: 'launch guard missing', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+  const seat = 'judge';
+  const key = referralFindingKey(seat, original);
+  const record = { version: 1, repo, pr: 1234, head: HEAD_A, runId: 'referred-run',
+    reviewer: mandatoryReferralReviewer('referred-run'), authorBody: '<!-- authored-by-actor: author -->',
+    attempted: true, referrals: [{ key, seat, original, finding: normalizeFinding(original) }], rulings: [] };
+  const comment = body => ({ body, author: { login: 'web-everything' } });
+  it.each(['accept', 'prevention-outstanding'].flatMap(verdict =>
+    [null, 'auto-policy', 'card', 'not-real'].map(result => [verdict, result])))
+  ('%s with live referral ruling %s gates the actual accept effects', async (verdict, result) => {
+    const comments = [comment(renderReferralRecord(record))];
+    if (result) comments.push(comment(buildOperatorRulingComment({ version: 1, repo, pr: 1234, head: HEAD_A,
+      actor: result === 'auto-policy' ? 'auto-policy' : 'chalbert', channel: 'operator-chat', reason: 'checked the finding', at: '2026-10-15T15:45:00Z', clearerId: 'operator-session',
+      rulings: [{ runId: record.runId, key, result: result === 'auto-policy' ? 'block' : result, ...(result === 'card' ? { card: 'we:backlog/7-follow-up.md' } : {}) }] })));
+    const { declaration, registry } = registryFor({ rev: HEAD_A });
+    const seen = [];
+    const readAcceptancePr = vi.fn(() => ({ headRefOid: HEAD_A, body: record.authorBody, comments }));
+    const fileItem = vi.fn(async () => ({ code: 0, lines: [] }));
+    const answer = verdict === 'accept' ? CLEAN_ANSWER : {
+      ...PREVENTION_ANSWER, findings: PREVENTION_ANSWER.findings.map(({ impactIfUnfixed, ...f }) => f),
+    };
+    const out = await driveReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+      store: createMemoryRunStore(), sinks: recordingSinks(seen), readAcceptancePr, cardReadable: () => true,
+      fileItem, makeJudge: cannedJudge(answer), mintRunId: () => `safety-${verdict}-${result}` });
+    const cleared = ['card', 'not-real'].includes(result);
+    expect(out.run.verdict.verdict).toBe(verdict);
+    expect(readAcceptancePr).toHaveBeenCalled();
+    expect(out.stopped).toBe(cleared ? 'complete' : 'confirm');
+    expect(seen.some(s => s.type === REVIEW_EFFECTS.LABEL)).toBe(cleared);
+    expect(fileItem).toHaveBeenCalledTimes(verdict === 'prevention-outstanding' && cleared ? 1 : 0);
+    if (!cleared) expect(out.lines.join('\n')).toMatch(/mandatory referrals remain open/);
   });
 });

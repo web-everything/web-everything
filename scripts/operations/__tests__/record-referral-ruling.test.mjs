@@ -20,6 +20,8 @@ import { newRunRecord } from '../run-store.mjs';
 import { openReferralFindings, planOperatorRuling, selectFindings, planRulingFollowUp, recordReferralRulingOperation, OPERATOR_RULING_FOLLOW_UP_EFFECT, RULING_NEEDED_LABEL, OPERATOR_RULING_POST_EFFECT } from '../record-referral-ruling.mjs';
 import { createRecordReferralRulingReader, createRecordReferralRulingSinks, resolveCardRef } from '../record-referral-ruling-io.mjs';
 
+import { unattendedAcceptHold, unattendedAcceptPolicy } from '../../lib/unattended-review-accept.mjs';
+
 const repo = 'o/r';
 const head = 'a'.repeat(40);
 const newHead = 'b'.repeat(40);
@@ -122,6 +124,14 @@ describe('#4979 the sanctioned writer', () => {
     card: { requested: 'xvm9vbu', ref: CARD, readable: true }, now: '2026-10-04T14:30:00Z', clearerId: 's', ...over });
   const input = (over = {}) => ({ repo, pr: 7, finding: 'all-open', ruling: 'card', actor: 'chalbert', channel: 'claude-code-chat', reason: 'Accept', ...over });
 
+  it('persists optional not-real cause and finding lens through the marked comment', () => {
+    const plan = planOperatorRuling(read({ card: null }), input({ ruling: 'not-real', cause: 'stale-head-reraise' }));
+    const parsed = parseOperatorRulingComment(gh(plan.body)).record;
+    expect(parsed.rulings[0]).toMatchObject({ cause: 'stale-head-reraise', lens: 'judgeCorrectnessAdvisory' });
+    expect(readOperatorRulings([gh(plan.body)]).rulings[0]).toMatchObject({ cause: 'stale-head-reraise', lens: 'judgeCorrectnessAdvisory' });
+    expect(() => planOperatorRuling(read(), input({ cause: 'test-nit' }))).toThrow(/--cause/);
+    expect(() => planOperatorRuling(read(), input({ ruling: 'not-real', cause: 'invented' }))).toThrow(/--cause/);
+  });
   it('lists the open findings on the live head (blocked and pending), numbered in thread order', () => {
     expect(read().open.map((o) => [o.index, o.state, o.summary])).toEqual([[1, 'blocked', 'first'], [2, 'pending', 'second']]);
     expect(selectFindings(read().open, '2').map((o) => o.summary)).toEqual(['second']);
@@ -395,5 +405,80 @@ describe('operator finding selectors and follow-up', () => {
     await expect(s.run(payload)).rejects.toThrow('send-back refused');
     expect(s.calls).toHaveLength(1);
     expect(existsSync(s.path())).toBe(false);
+  });
+});
+
+
+describe('same-head referral persistence', () => {
+  it('a pending referral remains matchable after a later accepted review comment on the same head', () => {
+    const rec = referral();
+    const comments = [gh(renderReferralRecord(rec)), gh(`✅ review — accepted\nNet basis: \`base..${head}\`\n**Verdict:** 🚩 prevention outstanding`)];
+    const read = openReferralFindings({ ...ctx(), comments });
+    expect(selectFindings(read.open, rec.referrals[0].key)).toHaveLength(1);
+    expect(openReferralFindings({ ...ctx({ head: newHead }), comments }).open).toEqual([]);
+  });
+});
+
+
+describe('unattended live-referral gate', () => {
+  const hold = (comments, verdict = 'accept', over = {}) => unattendedAcceptHold({ ...ctx(), expectedHead: head, comments,
+    verdict: { verdict }, ...over });
+  it.each(['needs-human', 'changes'])('%s cannot accept', verdict => {
+    expect(hold([], verdict)).toMatch(/panel verdict/);
+  });
+  it('a changes verdict the round-cards rule turns into cards may accept on clean live referrals', () => {
+    expect(hold([], 'changes', { roundCards: true })).toBeNull();
+    expect(hold([gh(renderReferralRecord(referral()))], 'changes', { roundCards: true })).toMatch(/referrals remain open/);
+    expect(hold([], 'changes', { roundCards: true, expectedHead: newHead })).toMatch(/head/);
+  });
+  it('round-cards never widens a non-changes verdict', () => {
+    expect(hold([], 'needs-human', { roundCards: true })).toMatch(/panel verdict/);
+  });
+  it.each([undefined, null, ''])('a missing reviewed head (%s) cannot accept', expectedHead => {
+    expect(hold([], 'accept', { expectedHead })).toMatch(/head/);
+    expect(unattendedAcceptHold({ ...ctx(), comments: [], verdict: { verdict: 'accept' } })).toMatch(/head/);
+  });
+  it('prevention-outstanding with clean referrals and no broken finding may file then accept', () => {
+    expect(hold([], 'prevention-outstanding')).toBeNull();
+  });
+  it('an open unruled referral on the head prevents accept', () => {
+    expect(hold([gh(renderReferralRecord(referral()))])).toMatch(/referrals remain open/);
+  });
+  it('an auto-policy block cannot substitute for an operator ruling', () => {
+    const rec = referral();
+    const auto = ruling(rec, { result: 'block', actor: 'auto-policy', channel: 'policy', reason: 'automatic hold' });
+    expect(hold([gh(renderReferralRecord(rec)), gh(buildOperatorRulingComment(auto))])).toMatch(/referrals remain open/);
+  });
+  it.each(['card', 'not-real'])('all referrals operator-ruled %s plus clean accept can accept', result => {
+    const rec = referral();
+    expect(hold([gh(renderReferralRecord(rec)), gh(buildOperatorRulingComment(ruling(rec, { result })))])).toBeNull();
+  });
+  it.each([null, 'card', 'not-real'])('prevention-outstanding broken finding requires a clearing ruling: %s', result => {
+    const rec = referral();
+    const comments = result ? [gh(renderReferralRecord(rec)), gh(buildOperatorRulingComment(ruling(rec, { result })))] : [];
+    const verdict = { verdict: 'prevention-outstanding', findings: [rec.referrals[0].finding] };
+    const reason = unattendedAcceptHold({ ...ctx(), expectedHead: head, comments, verdict });
+    if (result) expect(reason).toBeNull();
+    else expect(reason).toMatch(/broken finding is not ruled/);
+  });
+  it('a clearing ruling for a different finding does not clear a broken finding', () => {
+    const rec = referral();
+    const comments = [gh(renderReferralRecord(rec)), gh(buildOperatorRulingComment(ruling(rec)))];
+    expect(unattendedAcceptHold({ ...ctx(), expectedHead: head, comments, verdict: { verdict: 'prevention-outstanding',
+      findings: [finding('a different broken guard')] } })).toMatch(/broken finding is not ruled/);
+  });
+  it('a changed live head cannot accept the previous verdict', () => {
+    expect(unattendedAcceptHold({ ...ctx(), comments: [], verdict: { verdict: 'accept' }, expectedHead: newHead })).toMatch(/head/);
+  });
+  it('resolves the default and platform, tool, env layers with policy-cascade source logging', () => {
+    const lines = [];
+    const policy = args => unattendedAcceptPolicy({ env: {}, tool: {}, platform: {}, ...args });
+    expect(policy().value.unattendedAcceptRequiresCleanReferrals).toBe(true);
+    expect(policy().sources.unattendedAcceptRequiresCleanReferrals).toBe('standard');
+    expect(policy({ platform: { unattendedAcceptRequiresCleanReferrals: false } }).sources.unattendedAcceptRequiresCleanReferrals).toBe('platform');
+    expect(policy({ tool: { unattendedAcceptRequiresCleanReferrals: false } }).sources.unattendedAcceptRequiresCleanReferrals).toBe('tool');
+    const env = { WE_POLICY_CASCADE_LOG: '1', WE_REVIEW_UNATTENDED_ACCEPT_REQUIRES_CLEAN_REFERRALS: 'false' };
+    expect(policy({ env, log: line => lines.push(line) }).value.unattendedAcceptRequiresCleanReferrals).toBe(false);
+    expect(lines.join('\n')).toMatch(/policy-cascade.*review.*unattendedAcceptRequiresCleanReferrals=false \(env\)/);
   });
 });

@@ -90,7 +90,7 @@
     "prepare-item": {"provider": "codex","model": "astra","effort": {"claude": "low","codex": "low","antigravity": "low","agy-claude": "low","agy-gemini": "low"},"fallback": [{"provider": "claude","model": "sonnet","effort": "low"}]},
     "review-recheck": {"inherit": true,"effort": {"claude": "high","codex": "high","antigravity": "high","agy-claude": "high","agy-gemini": "high"}},
     "build:doc-fix": {"provider": "codex","model": "sol","effort": {"claude": "low","codex": "medium","antigravity": "medium","agy-claude": "medium","agy-gemini": "medium"},"fallback": [{"provider": "claude","model": "sonnet","effort": "low"}]},
-    "build:test-fix": {"provider": "agy-gemini","model": "flash","effort": {"claude": "low","codex": "low","antigravity": "low","agy-claude": "low","agy-gemini": "low"},"fallback": [{"provider": "claude","model": "sonnet","effort": "low"}]},
+    "build:test-fix": {"provider": "codex","model": "sol","effort": {"claude": "low","codex": "low","antigravity": "low","agy-claude": "low","agy-gemini": "low"},"fallback": [{"provider": "claude","model": "sonnet","effort": "low"}]},
     "prevention-card": {"provider": "codex","model": "sol","effort": {"claude": "medium","codex": "medium","antigravity": "medium","agy-claude": "medium","agy-gemini": "medium"},"fallback": [{"provider": "claude","model": "sonnet","effort": "medium"}]},
     "prepare-card": {"provider": "codex","model": "sol","effort": {"claude": "medium","codex": "medium","antigravity": "medium","agy-claude": "medium","agy-gemini": "medium"},"fallback": [{"provider": "claude","model": "sonnet","effort": "medium"}]},
     "doc-fix": {"provider": "codex","model": "sol","effort": {"claude": "low","codex": "medium","antigravity": "medium","agy-claude": "medium","agy-gemini": "medium"},"fallback": [{"provider": "claude","model": "sonnet","effort": "low"}]},
@@ -108,13 +108,13 @@
     "build-new-feature": {"inherit": true},
     "design": {"provider": "codex","model": "astra","effort": {"claude": "high","codex": "high","antigravity": "high","agy-claude": "high","agy-gemini": "high"},"fallback": [{"provider": "claude","model": "sonnet","effort": "high"}]},
     "diagnosis": {"provider": "codex","model": "astra","effort": {"claude": "high","codex": "high","antigravity": "high","agy-claude": "high","agy-gemini": "high"},"fallback": [{"provider": "claude","model": "sonnet","effort": "high"}]},
-    "test-fix": {"provider": "agy-gemini","model": "flash","effort": {"claude": "low","codex": "low","antigravity": "low","agy-claude": "low","agy-gemini": "low"},"fallback": [{"provider": "claude","model": "sonnet","effort": "low"}]}
+    "test-fix": {"provider": "codex","model": "sol","effort": {"claude": "low","codex": "low","antigravity": "low","agy-claude": "low","agy-gemini": "low"},"fallback": [{"provider": "claude","model": "sonnet","effort": "low"}]}
   },
   "smallPrepare": {
     "maxSize": 3,
     "route": {
-      "provider": "agy-gemini",
-      "model": "pro",
+      "provider": "codex",
+      "model": "astra",
       "effort": {
         "claude": "low",
         "codex": "low",

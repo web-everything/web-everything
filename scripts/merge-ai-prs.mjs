@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
 import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, refreshHeldHead, retainApprovedHumanQueueHead } from './lib/approved-human-surface-hold.mjs';
 /**
  * merge-ai-prs.mjs — sweep OPEN pull requests and merge the AI-generated ones that are safe to land.
@@ -200,6 +201,7 @@ import { mapWithConcurrency, runEnqueueCandidates, canParallelEnqueue, createBra
 import { execDrainAsync } from './lib/drain-gh-async.mjs';
 export { mapWithConcurrency } from './lib/drain-concurrency.mjs';
 import { runLedgerShadow, formatShadowLine } from './lib/drain-ledger-shadow.mjs'; // #5444 — ledger gate in SHADOW beside the labels; journals, never decides
+import { drainReviewGateFact, readDrainLedgerSnapshot, recordDrainLedgerFacts } from './lib/drain-ledger-facts.mjs';
 import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overlapRowKey, readyToMergeLabelTimeMs } from './conveyor/land-overlap-yield.mjs'; // + readyToMergeLabelTimeMs: the drain order's ready-at (same cached label read) // #4308 — the land-time overlap-yield planner (see planLabelDrain's own `overlapContext` param)
 import { rankByDeliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES } from './lib/delivery-priority.mjs'; // drain order (2026-10-10): the shared P0-P4 class rule
 import { readDeliveryPrioritySettings } from './conveyor/delivery-priority-shadow.mjs'; // drain order: the shared aging/cap settings (platform preference `deliveryPriority`)
@@ -687,7 +689,7 @@ export function readDrainCarryEvidence({ comments = [], readComments, readReview
  * `review:held-mechanical` (`decideTestGamingPark`), which the carry sweep retries; a decided refusal parks `review:human`.
  * @returns {{humanClearedSha: string|null, carried: boolean, reason: string, retryable: boolean}}
  */
-export function carryHumanClearanceOnIdenticalDiff({ setting, comments, reviews = null, humanClearedSha = null, headSha = null, pinnedHeadSha = null, netDiffText = null, readHeadDiff = null } = {}) {
+export function carryHumanClearanceOnIdenticalDiff({ setting, comments, reviews = null, humanClearedSha = null, headSha = null, pinnedHeadSha = null, netDiffText = null, readHeadDiff = null, applyNumberingCarry = null } = {}) {
   const unchanged = (reason, retryable = false) => ({ humanClearedSha, carried: false, reason, retryable });
   if (!humanClearedSha || !headSha) return unchanged('no human clearance / live head to carry');
   if (humanClearedSha === headSha) return unchanged('the clearance already names the live head');
@@ -710,7 +712,27 @@ export function carryHumanClearanceOnIdenticalDiff({ setting, comments, reviews 
   if (carry.action === 'carry' && carry.human && carry.from === humanClearedSha) {
     return { humanClearedSha: headSha, carried: true, reason: carry.reason, retryable: false };
   }
+  // The strict fingerprint changes when the drain numbers cards. Reuse the durable human carry writer;
+  // its exact git proof and live pre-write guard remain mandatory, and it cannot grant an agent a human clearance.
+  if (typeof applyNumberingCarry === 'function' && setting === 'on') {
+    const humanClearance = latestHumanClearance(comments);
+    if (humanClearance?.sha === humanClearedSha) {
+      const numbered = applyNumberingCarry({ humanClearance, headSha, headDiffSha: headSha, headDiff: netDiffText.text });
+      if (numbered?.carried?.recorded) return { humanClearedSha: headSha, carried: true,
+        reason: numbered.carried.mechanicalReason, retryable: false };
+      if (numbered?.action === 'defer') return unchanged(numbered.reason, true);
+    }
+  }
   return unchanged(carry.reason, carry.retryable === true);
+}
+
+/** The production tamper-park callback, shared with the carry wiring regression tests. */
+export function createTamperParkCarryCallback({ pr, repo, exec, dryRun = false, ...options } = {}) {
+  return evidence => applyHumanClearanceCarry({ ...options, evidence, pr, repo, exec, dryRun,
+    numberingOnly: !!evidence.humanClearance && !evidence.humanClearance.diff && !evidence.humanClearance.contribution,
+    readNumberingLiveEvidence: options.readNumberingLiveEvidence
+      ?? (() => readLiveDrainCarryEvidence({ pr, repo, exec })),
+  });
 }
 
 /**
@@ -808,7 +830,7 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
     }
   }
   const { acceptedSha, acceptedDiff, acceptedContribution } = evidence;
-  const liveDiffReadOwed = !!((acceptedDiff || acceptedContribution) && acceptedSha && moved);
+  const liveDiffReadOwed = !!((acceptedDiff || acceptedContribution || evidence.humanClearance) && acceptedSha && moved);
   if (liveDiffReadOwed && d.headRefName && (local || cwd)) {
     try {
       // PR #4631 round 7 (toctou-head-binding): read AT `headSha`, the head this coverage is judged for (see
@@ -827,6 +849,20 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
   }
   evidence.headReadFailed = liveDiffReadOwed && !evidence.headDiff;
   return evidence;
+}
+
+/** Fresh head, complete thread and formal reviews for the numbering carry's pre-write guard. */
+function readLiveDrainCarryEvidence({ pr, repo, exec = execFileSync, readReviews } = {}) {
+  const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 };
+  const d = JSON.parse(exec('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []),
+    '--json', 'headRefOid'], opts));
+  if (!d?.headRefOid) throw Error('incomplete live head');
+  const comments = readCompletePrComments(pr, { repo, exec });
+  const slug = repo || '{owner}/{repo}';
+  return { headSha: d.headRefOid, ...readDrainCarryEvidence({ comments,
+    readComments: () => readCompletePrComments(pr, { repo, exec }),
+    readReviews: readReviews ?? (() => parseJsonLines(exec('gh', GH_ARGV.readPrReviews(slug, pr), opts))),
+  }) };
 }
 
 /** The skip reason for a PR whose merge state is not landable, naming the ACTUAL state (see the call site). */
@@ -867,19 +903,24 @@ export function decideDrainReviewGate({ labels, ...gateInputs }, readOptions) {
     files = read.files;
     filesComplete = true;
   }
-  const workflow = decideDrainWorkflowEditHold({ files, filesComplete,
+  let workflow = decideDrainWorkflowEditHold({ files, filesComplete,
     headSha: evidence.headSha, humanClearedSha: evidence.humanClearedSha, setting: readOptions?.workflowEditSetting });
   if (workflow.defer) return { action: 'defer', applyLabel: null, reason: workflow.reason };
+  // A workflow clearance may move over proven numbering or exact tree identity here. General refresh equivalence does not
+  // waive the exact-head workflow ceremony. Record the carry before any gate can honour it.
+  const carry = applyHumanClearanceCarry({ evidence, pr: readOptions?.pr, repo: readOptions?.repo,
+    cwd: readOptions?.cwd, exec: readOptions?.exec ?? execFileSync, dryRun: !!readOptions?.dryRun,
+    readNumberingLiveEvidence: () => readLiveDrainCarryEvidence(readOptions), ...readOptions?.carry,
+    numberingOnly: workflow.hold === true || (!!evidence.humanClearance && !evidence.humanClearance.diff && !evidence.humanClearance.contribution) });
+  if (carry?.action === 'defer') return carry;
+  if (carry?.carried) {
+    evidence = { ...evidence, humanClearedSha: evidence.headSha, acceptedSha: evidence.headSha };
+    workflow = decideDrainWorkflowEditHold({ files, filesComplete,
+      headSha: evidence.headSha, humanClearedSha: evidence.humanClearedSha, setting: readOptions?.workflowEditSetting });
+  }
   if (workflow.hold) return { action: 'park', applyLabel: REVIEW_LABELS.human, humanRequired: true,
     workflowEditHold: true, reason: workflow.reason };
-  // The bare/waived rubric pass uses only this additional boundary; its existing backstops still run.
-  if (readOptions?.workflowOnly) return { action: 'merge' };
-  // #xnqxtdy — a recorded human clearance carries across a merge-of-main head move with a byte-identical net diff
-  // (we:scripts/lib/human-clearance-carry.mjs); the durable record is posted before the clearance is honoured.
-  const carry = applyHumanClearanceCarry({ evidence, pr: readOptions?.pr, repo: readOptions?.repo,
-    cwd: readOptions?.cwd, exec: readOptions?.exec ?? execFileSync, dryRun: !!readOptions?.dryRun, ...readOptions?.carry });
-  if (carry?.action === 'defer') return carry;
-  if (carry?.carried) evidence = { ...evidence, humanClearedSha: evidence.headSha };
+  if (readOptions?.workflowOnly) return { action: 'merge', ...(carry?.carried ? { carriedClearance: carry.carried } : {}) };
   const gate = decideReviewGate({ ...gateInputs, labels, ...evidence });
   return carry?.carried ? { ...gate, carriedClearance: carry.carried } : gate;
 }
@@ -3077,22 +3118,30 @@ export function drainHoldReasonCode(reason) {
 
 /**
  * E3 (#3929, plan R8) — append ONE `drain-hold` event when the drain's reason for holding a PR changes. Reads the
- * PR's last drain-hold event from the home ledger; an identical code appends nothing, so a `--watch` loop re-reaching
- * the same state stays silent. FAIL-SOFT and additive: never throws, never touches a label or a decision.
- * `read`/`append` are test seams.
+ * PR's last drain-hold event (the drain passes `readDrainLedgerSnapshot`, the store its writes land in; the default
+ * reads home, which is right only for store=home); an identical code appends nothing, so a `--watch` loop re-reaching the same state stays silent. A hold
+ * that missed the shared store is reported as a failure, and the next pass's shared read retries it.
+ * FAIL-SOFT and additive: never throws, never touches a label or a decision. `read`/`append` are test seams.
  * @param {{repo: string, pr: number|string, reason: string, read?: Function, append?: Function}} o
  * @returns {{ok: boolean, appended: boolean, errors: string[]}}
  */
 export function recordDrainHold({ repo, pr, reason, read, append = appendVerdict } = {}) {
   try {
     const reasonCode = drainHoldReasonCode(reason);
-    const readEvents = read ?? ((r) => { try { return parseLedgerEvents(readFileSync(verdictLedgerPath(r), 'utf8')); } catch { return []; } });
-    const prior = readEvents(repo).filter((e) => e.type === EVENT_TYPES.HOLD && e.holdSource === 'drain' && Number(e.pr) === Number(pr));
-    if (prior.length && prior[prior.length - 1].reasonCode === reasonCode) return { ok: true, appended: false, errors: [] };
+    const readHome = (r) => { try { return parseLedgerEvents(readFileSync(verdictLedgerPath(r), 'utf8')); } catch { return []; } };
+    // An unreadable shared ledger still records the hold, and never dedups it (F4: a hold is never dropped). Home cannot
+    // stand in for the shared store: a release can reach git and then miss home, and another drain can interleave its
+    // own hold and release, so no home row proves git still holds the PR. The cost is one hold row per pass while the
+    // shared read is down; a dropped hold would leave the shared store showing the PR released while the drain holds it.
+    let events;
+    try { events = (read ?? readHome)(repo); } catch { events = []; }
+    const prior = events.filter((e) => (e.type === EVENT_TYPES.HOLD || e.type === EVENT_TYPES.RELEASE) && e.holdSource === 'drain' && Number(e.pr) === Number(pr));
+    if (prior.length && prior[prior.length - 1].type === EVENT_TYPES.HOLD && prior[prior.length - 1].reasonCode === reasonCode) return { ok: true, appended: false, errors: [] };
     const written = append(buildLedgerEvent({
       type: EVENT_TYPES.HOLD, repo, pr, at: new Date().toISOString(), source: 'merge-ai-prs',
       declaredActor: 'drain', reasonCode, holdSource: 'drain',
     }));
+    if (written.ok && written.ledgerWriteMiss) return { ok: false, appended: false, errors: ['ledger-write-miss: the hold missed the shared store; the next pass retries it'] };
     return written.ok ? { ok: true, appended: true, errors: [] } : { ok: false, appended: false, errors: written.errors };
   } catch (e) {
     return { ok: false, appended: false, errors: [String((e && e.message) || e).split('\n')[0]] };
@@ -4244,11 +4293,13 @@ export function basisTouchesEngineTier(score) {
 /**
  * The `gh-error` detail for a failed `gh pr list`: the error's first line PLUS gh's own last stderr line.
  * Also used by the per-PR merge catch to preserve the merge failure's stderr cause.
+ * Enqueue errors carry `githubMessage`: preserve that diagnostic verbatim, including multiple lines.
  * `execFile`'s message is only "Command failed: gh pr list …" — the actual cause (secondary rate limit, 401,
  * a crashing wrapper) lives in stderr and was being dropped (live 2026-09-27 ~04:04Z: every drain pass logged a
  * bare gh-error for 20 minutes and nobody could tell it was a GitHub rate-limit storm).
  */
 export function ghListErrText(e) {
+  if (e?.githubMessage != null) return e.githubMessage;
   const head = String((e && e.message) || e).split('\n')[0];
   const lines = String((e && e.stderr) || '').split('\n').map((l) => l.trim()).filter(Boolean);
   const cause = lines.length ? lines[lines.length - 1].slice(0, 300) : '';
@@ -5029,6 +5080,7 @@ async function runCli() {
   // is always an array here (never undefined): the `listErr` check above already `fail()`-exited on any entry
   // that lacks one (an errored `listOne` returns `{repo, err}`, no `rows`).
   const liveListingsByRepo = buildLiveListingsByRepo(listings);
+  for (const listing of listings) mergeStrategy.dequeueSendBacks(listing.rows, listing.repo);
   // #2421 — the shared open-PR listing + manifest reads + cross-repo item-openness set the reconcile below
   // needs, computed ONCE for this pass (RECONCILE-gated — same cost profile as the reconcile it feeds: free on
   // a bare, unlabelled sweep). #4108 — reuses `liveListingsByRepo` above instead of re-listing every repo in
@@ -5690,6 +5742,7 @@ async function runCli() {
               setting: resolveAcceptCarryForward().value, comments: evidence.comments, reviews: evidence.reviews,
               humanClearedSha, headSha: tamperHeadSha, pinnedHeadSha: v.listedHeadSha || v.headSha || null,
               readHeadDiff: (sha) => (diffExec ? readNetDiffAtHead({ exec: diffExec, headSha: sha, headRef: v.headRef }) : null),
+              applyNumberingCarry: createTamperParkCarryCallback({ pr: v.num, repo: slug, exec: diffExec, dryRun: DRY_RUN }),
             });
             humanClearedSha = carried.humanClearedSha;
             carryRetryable = carried.retryable === true;
@@ -5790,6 +5843,7 @@ async function runCli() {
         process.stderr.write(`  ⏸ ${repoTag(v.repo)}${v.num} ${gate.reason}\n`);
         continue;
       }
+      v.reviewGate = drainReviewGateFact(gate); // ledger facts only (drain-ledger-facts.mjs); never read for a decision
       v.escalated = score.escalate ? 'yes' : 'no';
       // #2365 — gate.humanRequired (not score.humanRequired): decideReviewGate's verdict is the sticky one (#2362
       // makes an already-applied review:human label win even when a rebase narrows the diff back to
@@ -6169,10 +6223,12 @@ async function runCli() {
   // PR the drain owns — never comment on an unrelated human PR).
   if (!DRY_RUN) {
     // E3 (#3929, plan R8) — a held/skipped PR whose drain reason CHANGED gets exactly one `drain-hold` event.
-    // Additive and fail-soft: runs before, and never alters, the stamping below.
+    // Additive and fail-soft: runs before, and never alters, the stamping below. It dedups against one read of the
+    // store its writes land in, taken before it writes, so a shared-store miss is retried next pass.
+    const readDrainLedger = await readDrainLedgerSnapshot(verdicts.map((v) => v.repo || localSlug));
     for (const v of skipped) {
       if (!v.reason || !(v.certifyLabel || v.aiGenerated)) continue;
-      const held = recordDrainHold({ repo: v.repo || localSlug, pr: v.num, reason: v.reason });
+      const held = recordDrainHold({ repo: v.repo || localSlug, pr: v.num, reason: v.reason, read: readDrainLedger });
       if (!held.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger drain-hold append (E3 #3929, non-fatal) — ${held.errors.join('; ')}\n`);
     }
     for (const v of skipped) {
@@ -6194,6 +6250,18 @@ async function runCli() {
   }
 
   const merged = [];
+  // PR #5195 — the drain's ledger facts (review-exempt, carried-acceptance restamp, drain-hold release) can clear a
+  // head, so they are written per candidate only once the cascade below CONFIRMS its merge or enqueue. The
+  // pass-start `decision` is not enough: the fresh re-read, merge-queue freshness, branch preparation, the merge
+  // lock and the merge itself can each still refuse it. The ledger is re-read right before the write, never reused
+  // from pass start: a `changes`/`human` row appended mid-cascade must not be followed by a clearing restamp.
+  // Fail-soft: an unreadable ledger writes nothing, and a failed write never changes the landing.
+  const recordLandedLedgerFacts = async (c, headSha) => {
+    if (DRY_RUN) return;
+    const read = await readDrainLedgerSnapshot([c.repo || localSlug]);
+    const facts = recordDrainLedgerFacts({ verdicts: [{ ...c, decision: 'merge', listedHeadSha: headSha }], localSlug, read });
+    if (!facts.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} verdict-ledger drain facts (non-fatal) — ${facts.errors.slice(0, 3).join('; ')}\n`);
+  };
   const failedMerges = [];
   const enqueueOutcomes = [];
   // #2779-incident — the OTHER currently-open PR numbers for a candidate's own repo, at pass-start, EXCLUDING
@@ -6673,13 +6741,17 @@ async function runCli() {
             if (!AS_JSON) process.stderr.write(`  ✓ ${repoTag(c.repo)}${c.num} already merged (by us, a concurrent lander, or out-of-band, e.g. the GitHub UI) — running its numbering/resolve/regen follow-up now, idempotently (xvzc4v4)\n`);
             continue;
           }
-          if (landLock.result?.enqueued === true) enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'enqueued', already: !!landLock.result.already });
+          if (landLock.result?.enqueued === true) {
+            enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'enqueued', already: !!landLock.result.already });
+            await recordLandedLedgerFacts(c, traceHeadSha); // PR #5195 — only a confirmed enqueue writes the clearing facts
+          }
           if (landLock.result?.enqueued === false) {
-            enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'batching-deferred', reason: landLock.result.reason });
-            if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} not enqueued: batching-deferred: ${landLock.result.reason || 'admission deferred'} — retried next pass\n`);
+            enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: landLock.result.kind || 'batching-deferred', reason: landLock.result.reason, healthSmell: !!landLock.result.healthSmell });
+            if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} not enqueued: ${landLock.result.kind || 'batching-deferred'}: ${landLock.result.reason || 'admission deferred'} — retried next pass\n`);
           }
           if (mergeStrategy.enqueues(c.repo)) { const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; } // xtpxusq — queued, not merged: keeps blocking dependents until GitHub merges it
           merged.push({ num: c.num, repo: c.repo, headSha: c.headSha ?? null }); progressed = true;
+          await recordLandedLedgerFacts(c, traceHeadSha); // PR #5195 — only a confirmed merge writes the clearing facts
           remaining = remaining.filter((x) => !sameCand(x, c)); // merged → item leaves the open set (frees dependents)
           postMergeTrace(); // #xngv3vn — the merge write above is CONFIRMED to have succeeded; safe to claim "landed" now
           // #2393 — a WE-carrier merge (the PR carrying its OWN manifest = the resolve carrier + where `bornAs`
@@ -6691,6 +6763,7 @@ async function runCli() {
           if (!AS_JSON) process.stderr.write(`  ✓ merged ${repoTag(c.repo)}${c.num}${c.item ? ` (#${c.item})` : ''}\n`);
         } catch (e) {
           const detail = ghListErrText(e);
+          if (e.enqueueFailure) enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', ...e.enqueueFailure });
           // #2683 — CONTENDED-FALLBACK idempotency recovery. If the merge write raced past the mutex (the
           // never-hang fallback ran `fn` un-locked) and LOST to a concurrent lander, `gh pr merge` throws here on
           // an already-merged PR. Re-probe: if it is now MERGED, this is the SAME safe idempotent no-op as the

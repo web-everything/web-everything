@@ -203,6 +203,7 @@ export async function checkDaemonEntriesBoot({ root, budgets = {}, runChild = ru
 /** The `SMOKE_CHECKS` row `daemon-live-smoke.mjs` appends. */
 export const DAEMON_BOOT_SMOKE_CHECK = Object.freeze({
   name: 'daemon-entries-boot',
+  kind: 'env',
   run: checkDaemonEntriesBoot,
   mayBeTransient: false,
   codeEntries: DAEMON_ENTRY_MODULES,

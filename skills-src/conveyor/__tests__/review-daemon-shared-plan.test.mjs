@@ -17,9 +17,27 @@ const authGateOverride = () => ({ paused: false, reason: null });
 afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
 describe('review tick plan sharing', () => {
+  it('snapshots the final replacement plan and withholds it when promotion replanning fails, leaving onPlan unchanged', () => {
+    const rawPrs = [{ number: 7, isDraft: true, labels: [] }];
+    const first = { dispatch: [{ kind: 'promote-draft', prNumber: 7 }], refusals: [{ kind: 'stood-down', prNumber: 1 }] };
+    const replacement = { dispatch: [], refusals: [{ kind: 'cap-exhausted', prNumber: 2 }] };
+    const run = (second) => {
+      const onPlan = vi.fn();
+      const out = runReviewTick({ ...reviewOpts, repo, readPrs: () => rawPrs, readAgents: () => [], onPlan, now: () => 3,
+        reconcile: vi.fn().mockReturnValueOnce(first).mockImplementationOnce(second),
+        promoteDrafts: () => ({ rows: [{ pr: 7, action: 'promoted' }] }) });
+      return { out, onPlan };
+    };
+    const ok = run(() => replacement);
+    expect(ok.out.operatorHolds).toEqual({ observedAt: 3, holds: [{ prNumber: 2, kind: 'cap-exhausted' }] });
+    expect(ok.onPlan).toHaveBeenCalledWith({ repo, plan: replacement, rawPrs: [{ ...rawPrs[0], isDraft: false }] });
+    const failed = run(() => { throw Error('replan'); });
+    expect(failed.out.operatorHolds).toBeNull();
+    expect(failed.onPlan).toHaveBeenCalledWith({ repo, plan: first, rawPrs: [{ ...rawPrs[0], isDraft: false }] });
+  });
   it('reports the acted-on plan and raw listing without changing the return shape; callback errors are isolated', () => {
     const plan = empty();
-    const opts = { ...reviewOpts, repo, reconcile: () => plan };
+    const opts = { ...reviewOpts, repo, reconcile: () => plan, now: () => 5 };
     const baseline = runReviewTick(opts);
     const onPlan = vi.fn();
     expect(runReviewTick({ ...opts, onPlan })).toEqual(baseline);

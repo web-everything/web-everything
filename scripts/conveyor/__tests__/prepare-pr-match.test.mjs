@@ -53,11 +53,11 @@ describe('prepare launch refusal', () => {
     expect(refuse({ prs: [pr()], claims: [{ meta: { num: '5028' }, owner: 'codex' }],
       liveRows: [{ num: '5028', runId: 'r1' }] })).toEqual({ reason: 'open prepare PR #91 (lane/5028d-prepare-x)' });
   });
-  it('refuses a merged PR created at or after the last dispatch', () => {
+  it('refuses a recent merged PR regardless of surviving dispatch history', () => {
     expect(refuse({ prs: [pr({ state: 'MERGED' })], lastDispatchAt: pr().createdAt }))
-      .toEqual({ reason: 'merged prepare PR #91 after last dispatch (within 24h guard)' });
-    expect(refuse({ prs: [pr({ state: 'MERGED' })], lastDispatchAt: '2026-10-15' })).toBeNull();
-    expect(refuse({ prs: [pr({ state: 'MERGED' })] })).toBeNull();
+      .toEqual({ reason: 'merged prepare PR #91 (within 24h guard)' });
+    expect(refuse({ prs: [pr({ state: 'MERGED' })], lastDispatchAt: '2026-10-15' })).toEqual({ reason: 'merged prepare PR #91 (within 24h guard)' });
+    expect(refuse({ prs: [pr({ state: 'MERGED' })] })).toEqual({ reason: 'merged prepare PR #91 (within 24h guard)' });
   });
   it.each([
     [12, '2026-10-15T00:00:00Z', true],
@@ -68,7 +68,26 @@ describe('prepare launch refusal', () => {
     const refusal = refuse({ prs: [pr({ state: 'MERGED' })], lastDispatchAt: pr().createdAt,
       now: Date.parse(now), mergedGuardHours });
     expect(refusal).toEqual(blocked
-      ? { reason: `merged prepare PR #91 after last dispatch (within ${mergedGuardHours}h guard)` } : null);
+      ? { reason: `merged prepare PR #91 (within ${mergedGuardHours}h guard)` } : null);
+  });
+  it.each([
+    [{ mergedAt: '2026-10-16T20:32:38Z', closedAt: '2026-10-15T17:18:00Z' }, true],
+    [{ closedAt: '2026-10-16T20:32:38Z' }, true],
+    [{}, false],
+    [{ mergedAt: '2026-10-15T20:53:36Z' }, true],
+    [{ mergedAt: '2026-10-15T20:53:35Z', closedAt: '2026-10-16T20:32:38Z' }, false],
+    [{ mergedAt: '2026-10-16T20:53:37Z' }, false],
+  ])('guards #5399 by merge time with timestamp fallbacks: %j', (timestamps, blocked) => {
+    expect(prepareLaunchRefusal({ num: '5966', now: Date.parse('2026-10-16T20:53:36Z'), prs: [pr({
+      number: 5399, state: 'MERGED', headRefName: 'lane/5966-prepare-stand-down',
+      createdAt: '2026-10-15T17:18:00Z', ...timestamps,
+    })] })).toEqual(blocked ? { reason: 'merged prepare PR #5399 (within 24h guard)' } : null);
+  });
+  it('does not let a newer-created, older-merged PR hide a recent merge', () => {
+    expect(refuse({ prs: [
+      pr({ number: 92, state: 'MERGED', createdAt: '2026-10-13T11:00:00Z', mergedAt: '2026-10-13T12:00:00Z' }),
+      pr({ state: 'MERGED', createdAt: '2026-10-01T12:00:00Z', mergedAt: '2026-10-14T23:39:00Z' }),
+    ] })).toEqual({ reason: 'merged prepare PR #91 (within 24h guard)' });
   });
   it.each(['claude', 'codex'])('refuses a live %s claim', owner => {
     expect(refuse({ claims: [{ meta: { num: '#05028' }, owner }] }))

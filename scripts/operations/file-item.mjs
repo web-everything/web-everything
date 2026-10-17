@@ -56,11 +56,33 @@
  *
  * PURE. No fs, no clock, no process, no network. `./file-item-io.mjs` is the only place it touches the world.
  */
+import { OPERATOR_TASK_INPUT, OPERATOR_TASK_READS } from '../backlog/operator-task.mjs';
 import { op } from './registry.mjs';
 import { DECLARED_HOMES } from './declared-homes.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import { BACKLOG_KINDS } from '../check-standards-rules.mjs';
 import { planScaffold, shapeScaffoldRead, SCAFFOLD_EFFECT } from './scaffold.mjs';
+import { setFrontmatterField } from '../backlog/frontmatter.mjs';
+import { validatePrepareCard } from '../conveyor/prepare-result.mjs';
+
+/** Validate before either filing effect; ordinary scaffold output stays byte-identical. An explicit card
+ *  priority (P0..P4) for operator tasks is card #xqqmw6g, with the authority it needs. */
+export function planFileItem(read, input) {
+  const verdict = planScaffold(read, input);
+  const policy = read.operatorTask;
+  if (!input.operatorTask) return verdict;
+  // The digest supplies the complete authored body, replacing the scaffold's unfinished agreement.
+  verdict.content = verdict.content.slice(0, verdict.content.indexOf('\n# '))
+    + `\n# ${input.title}\n\n${input.digest || ''}\n`;
+  if (!policy) throw new Error('file-item: operatorTask requires the resolved build policy');
+  if (!policy.enabled) return verdict;
+  const ready = validatePrepareCard(verdict.content, { operatorTask: true });
+  if (!ready.ok) throw new Error(`file-item: missing or incomplete sections: ${ready.missing.join(', ')}`);
+  if (!/^[a-f0-9]{40,64}$/.test(read.originMainSha ?? '')) throw new Error('file-item: cannot stamp without origin/main tip');
+  verdict.content = setFrontmatterField(verdict.content, 'preparedDate', JSON.stringify(read.today));
+  verdict.content = setFrontmatterField(verdict.content, 'preparedAgainstSha', JSON.stringify(read.originMainSha));
+  return verdict;
+}
 
 export const FILE_ITEM_OP = 'file-item';
 
@@ -125,6 +147,7 @@ export function fileItemOperation({ readScaffoldContext } = {}) {
   return op(FILE_ITEM_OP, {
     input: {
       title: 'string',
+      ...OPERATOR_TASK_INPUT,
       kind: { type: 'string', required: false, default: '' },
       type: { type: 'string', required: false, default: '' },
       workItem: { type: 'string', required: false, default: '' },
@@ -146,19 +169,23 @@ export function fileItemOperation({ readScaffoldContext } = {}) {
     declaresOver: DECLARED_HOMES['file-item'],
 
     read: compute({
-      reads: [],
-      fn: () => shapeScaffoldRead(readScaffoldContext()),
+      reads: ['input.operatorTask'],
+      fn: (view) => {
+        const raw = readScaffoldContext();
+        return { ...shapeScaffoldRead(raw), operatorTask: raw.operatorTask, sessionRole: raw.sessionRole,
+          originMainSha: view.input.operatorTask ? raw.originMainSha : undefined };
+      },
     }),
 
-    // THE SCAFFOLD VERDICT, unchanged from `scaffold.mjs#planScaffold` — same allocation, same refusals,
+    // THE SCAFFOLD VERDICT, extended only by operator filing admission — same allocation, same refusals,
     // same rendered content. This is the operation's `verdictFrom` target, so a caller reading `run.verdict`
     // sees exactly what a `scaffold` caller would (num/id/rel/abs/kind/status/content/digestFilled).
     plan: compute({
       reads: [
         'input.title', 'input.kind', 'input.type', 'input.workItem', 'input.size', 'input.slug',
-        'input.digest', 'input.parent', 'input.blockedBy', 'input.scope', 'input.session', 'findings.read',
+        ...OPERATOR_TASK_READS, 'input.digest', 'input.parent', 'input.blockedBy', 'input.scope', 'input.session', 'findings.read',
       ],
-      fn: (view) => planScaffold(view.findings.read, view.input),
+      fn: (view) => planFileItem(view.findings.read, view.input),
     }),
 
     // THE QUEUEING DECISION, kept OFF the verdict deliberately: `verdictFrom: 'plan'` means every existing

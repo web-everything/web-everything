@@ -61,4 +61,7 @@ export const NOTIFY_EVEN_IN_SHADOW = new Set([
   // main stays red, so health-watch sends it once per continuous red window (no reminder, no re-alert on a new tip or
   // on an episode reopened within the hour), and not at all while `main-ci-red` is already open.
   'pre-existing-red-on-main',
+  // #5653: an operator-only hold on a PR (cap-exhausted, stood-down, review-referrals-pending, ruling-dispute) sat for
+  // hours with no per-hold alarm; the opening alert fires once the hold has been observed past the age threshold.
+  'operator-hold-aged',
 ]);

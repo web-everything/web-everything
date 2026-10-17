@@ -199,7 +199,20 @@ describe('pollingLoopReason / decide — no polling', () => {
   it('heredocScan keeps the bodies it strips so interpreter-fed ones can be scanned', () => {
     const r = heredocScan("python3 - <<'EOF'\nprint(1)\nEOF\necho done");
     expect(r.text).toBe('python3 - <<\'EOF\'\necho done');
-    expect(r.heredocs).toEqual([{ head: "python3 - <<'EOF'", body: 'print(1)' }]);
+    expect(r.heredocs).toEqual([{ head: "python3 - <<'EOF'", body: 'print(1)', expand: false }]);
+  });
+  it.each([
+    ['EOF', true],
+    ["'EOF'", false],
+    ['"EOF"', false],
+    ['\\EOF', false],
+    ['E"OF"', false],
+    ['E\\OF', false],
+  ])('heredocScan keeps stripped bodies and expansion state for delimiter %s', (delimiter, expand) => {
+    const head = `python3 - <<${delimiter}`;
+    const r = heredocScan(`${head}\nprint(1)\nEOF\necho done`);
+    expect(r.text).toBe(`${head}\necho done`);
+    expect(r.heredocs).toEqual([{ head, body: 'print(1)', expand }]);
   });
 });
 

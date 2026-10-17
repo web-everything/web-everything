@@ -52,6 +52,18 @@ export function defaultQuarantineSafetyNet(mainCiRuns, { now, argv = process.arg
   return run({ mainCiRuns, now, dir, board: REPO_ROOT, live: !replay });
 }
 
+const quarantineTickResults = new WeakMap();
+/** Both smells share the result (including null/errors) on runHealthTick's fresh context. Never cache across ticks. */
+export function quarantineSafetyNetForTick(mainCiRuns, ctx) {
+  const { now, quarantineSafetyNet = defaultQuarantineSafetyNet } = ctx;
+  const cached = quarantineTickResults.get(ctx);
+  if (cached && cached.mainCiRuns === mainCiRuns && cached.now === now && cached.run === quarantineSafetyNet) return cached.result;
+  let result = null;
+  try { result = quarantineSafetyNet?.(mainCiRuns, { now }) ?? null; } catch { /* Both smells report no quarantine result. */ }
+  quarantineTickResults.set(ctx, { mainCiRuns, now, run: quarantineSafetyNet, result });
+  return result;
+}
+
 const fmtMin = (ms) => `${Math.round(ms / MINUTE)} min`;
 
 export default {
@@ -64,11 +76,11 @@ export default {
   severity: 'high',
   action: 'alert',
   recommendationHint: "Main's CI is red; one owner is dispatched per broken commit unless an open PR already fixes it.",
-  evaluate({ mainCiRuns }, { now, config, quarantineSafetyNet = defaultQuarantineSafetyNet }) {
+  evaluate({ mainCiRuns }, ctx) {
+    const { now, config } = ctx;
     const settings = mainCiRedSettings(config);
     const state = mainRedState(mainCiRuns?.runs, { tip: mainCiRuns?.tip });
-    let quarantine = null;
-    try { quarantine = quarantineSafetyNet ? quarantineSafetyNet(mainCiRuns, { now }) : null; } catch { quarantine = null; }
+    const quarantine = quarantineSafetyNetForTick(mainCiRuns, ctx);
     if (state.status !== 'red') return [];
     const sha9 = state.firstRed.sha.slice(0, 9);
     const redFor = now - state.redSinceMs;

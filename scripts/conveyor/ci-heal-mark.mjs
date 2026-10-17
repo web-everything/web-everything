@@ -34,6 +34,7 @@ import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { REVIEW_LABELS, hasReviewLabel } from '../lib/review-escalation.mjs';
 import { isBudgetRefusal, postPrComment, recordOwedWrite, resolveOwedRepo } from './ci-heal-owed.mjs';
+import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
 
 /**
  * we:scripts/conveyor/ci-heal-mark.mjs#CI_HEAL_COMMENT_MARKER — the stable FIRST LINE of the durable CI-heal comment.
@@ -158,6 +159,126 @@ export function countChargeableCiHealComments(comments, { restore = true, onlyRe
     const at = Date.parse(c?.createdAt);
     return !windows.some(({ from, to }) => Date.parse(from) <= at && at <= Date.parse(to));
   }));
+}
+
+/**
+ * we:scripts/conveyor/ci-heal-mark.mjs#CI_HEAL_ROUND_CAP — the durable CI-heal attempt cap `ci-red` binds on
+ * (multi-repo slice 7). Mirrors `we:scripts/conveyor/tick-core.mjs#DEFAULT_CI_HEAL_RETRY_CAP` (3), which stays its own
+ * copy; `tick-core.test.mjs` pins the two equal so a drift fails loud in CI. Owned here (and re-exported by
+ * `reconcile-core.mjs`, which no longer holds a copy) so reconcile, tick and landing read one policy source (#5968).
+ */
+export const CI_HEAL_ROUND_CAP = 3;
+
+/** `ciHeal.attemptCap` / `ciHeal.resetOnFixHead` — the ci-heal budget settings (live PR #4631, 2026-10-10). */
+export const CI_HEAL_ATTEMPT_CAP_ENV = 'WE_CI_HEAL_ATTEMPT_CAP';
+export const CI_HEAL_RESET_ON_FIX_HEAD_ENV = 'WE_CI_HEAL_RESET_ON_FIX_HEAD';
+const asHealCap = (v) => { const s = String(v ?? '').trim(); return /^\d{1,2}$/.test(s) ? Number(s) : null; };
+const asFlag = (v) => {
+  if (typeof v === 'boolean') return v;
+  const s = String(v ?? '').trim().toLowerCase();
+  return ['1', 'true', 'on'].includes(s) ? true : ['0', 'false', 'off'].includes(s) ? false : null;
+};
+
+/**
+ * PURE: the ci-heal budget cascade — standard default → platform preference (`platform.ciHeal`) → tool override
+ * (`repo`, the `ciHeal` settings block) → env. An invalid layer is skipped, never trusted. Each value carries the
+ * layer that set it, and that source rides on every ci-heal row and note, so the log names where the budget came from.
+ * `resetOnFixHead` (standard `true`): a fixer's push (a new non-mechanical head) starts a new heal budget — LIVE PR
+ * #4631 2026-10-10 22:11 ET was refused "exhausted (3/3)" five minutes after the fixer pushed a real fix, on heals
+ * spent against older heads. Still bounded: fix rounds have their own cap, so heal↔fix cannot alternate forever.
+ * @returns {{cap:number, capSource:string, resetOnFixHead:boolean, resetSource:string}}
+ */
+export function resolveCiHealBudget({ env = {}, platform = null, repo = null } = {}) {
+  const out = { cap: CI_HEAL_ROUND_CAP, capSource: 'standard', resetOnFixHead: true, resetSource: 'standard' };
+  for (const [source, layer, capRaw, resetRaw] of [
+    ['platform', platform?.ciHeal, platform?.ciHeal?.attemptCap, platform?.ciHeal?.resetOnFixHead],
+    ['repo', repo, repo?.attemptCap, repo?.resetOnFixHead],
+    ['env', env, env?.[CI_HEAL_ATTEMPT_CAP_ENV], env?.[CI_HEAL_RESET_ON_FIX_HEAD_ENV]],
+  ]) {
+    if (!layer || typeof layer !== 'object') continue;
+    const cap = asHealCap(capRaw);
+    if (cap !== null && cap > 0) Object.assign(out, { cap, capSource: source });
+    const reset = asFlag(resetRaw);
+    if (reset !== null) Object.assign(out, { resetOnFixHead: reset, resetSource: source });
+  }
+  return out;
+}
+
+const FIX_MARKER_SHA_RE = /at `([0-9a-f]{7,40})`/;
+export const FIX_MARKER_WHO_RE = /^\*\*Who:\*\* `([^`]+)`/m;
+const FIX_END_WHO_RE = /^`([^`]+)` released the fix claim/m;
+
+/**
+ * PURE: when this PR last got a new NON-MECHANICAL head — the latest trusted `fix-end` from a fixer (any session
+ * that is not a ci-heal) whose released sha differs from the sha its own `fix-begin` claimed at, i.e. the fixer
+ * pushed. A ci-heal's own push, a fix turn that pushed nothing, a marker with no sha and an untrusted author never
+ * count. Reads only the PR's own comments (no commit list is fetched for a review-labelled PR).
+ * @returns {{at:string, by:string, sha:string}|null}
+ */
+export function ciHealBudgetResetAt(comments) {
+  const trusted = (Array.isArray(comments) ? comments : [])
+    .filter((c) => typeof c?.body === 'string' && isTrustedMarkerAuthor(c) && Number.isFinite(Date.parse(c?.createdAt)));
+  const beginSha = new Map();
+  let latest = null;
+  for (const c of trusted) {
+    const body = c.body.trimStart();
+    if (body.startsWith(FIX_BEGIN_MARKER)) {
+      const who = FIX_MARKER_WHO_RE.exec(body)?.[1];
+      if (who) beginSha.set(who, FIX_MARKER_SHA_RE.exec(body.split('\n').find((l) => l.startsWith('**Branch:**')) ?? '')?.[1] ?? null);
+      continue;
+    }
+    if (!body.startsWith(FIX_END_MARKER)) continue;
+    const who = FIX_END_WHO_RE.exec(body)?.[1];
+    const sha = FIX_MARKER_SHA_RE.exec(body)?.[1];
+    if (!who || !sha || /ci-heal/.test(who)) continue;
+    const from = beginSha.get(who);
+    if (!from || from.slice(0, 7) === sha.slice(0, 7)) continue;
+    if (!latest || Date.parse(c.createdAt) > Date.parse(latest.at)) latest = { at: c.createdAt, by: who, sha };
+  }
+  return latest;
+}
+
+/**
+ * PURE: drop heal markers PROVEN to predate the reset — a finite timestamp at or before a finite cutoff. A heal whose
+ * time cannot be established (missing or invalid) stays in the list and so stays charged: fail closed, never refund
+ * on a guess (#5968). (A bare-string comment has no author, so the counter never counts it either way.) Every
+ * non-heal comment stays, so attributed-window evidence survives.
+ */
+function healCommentsSince(comments, resetAt) {
+  const list = Array.isArray(comments) ? comments : [];
+  const cut = Date.parse(resetAt);
+  if (!Number.isFinite(cut)) return list;
+  return list.filter((c) => {
+    const first = (typeof c === 'string' ? c : c?.body ?? '').trimStart().split('\n')[0];
+    const isHeal = first.startsWith(CI_HEAL_COMMENT_MARKER) || first === CI_HEAL_FAILURE_MARKER;
+    const at = typeof c === 'string' ? NaN : Date.parse(c?.createdAt);
+    return !isHeal || !Number.isFinite(at) || at > cut;
+  });
+}
+
+/**
+ * we:scripts/conveyor/ci-heal-mark.mjs#ciHealBudgetEvidence — the budget calculation reconcile, tick and landing
+ * share (#5968). `exhausted-retry.mjs` still carries its own reset filter until card x3o0ohn lands. Stages, each counted with attempt-id dedupe: the heals (optionally narrowed to
+ * `onlyReason`; an unreadable reason stays charged) → minus those proven before the fix-head reset → minus those
+ * inside an attributed-main window. Refunds are the DIFFERENCES between successive counts, so an attempt covered by
+ * both the reset and a window is refunded once.
+ * @returns {{chargeable:number, reset:{at:string,by:string,sha:string}|null, spentBeforeReset:number, windowRefunded:number, refunded:number}}
+ */
+export function ciHealBudgetEvidence(comments, { resetOnFixHead = true, restore = true, onlyReason = null } = {}) {
+  const list = Array.isArray(comments) ? comments : [];
+  const proven = resetOnFixHead ? ciHealBudgetResetAt(list) : null; // its `at` is always a finite, trusted time
+  const narrowed = onlyReason ? list.filter((c) => {
+    const reason = ciHealCommentReason(typeof c === 'string' ? c : c?.body);
+    return reason === null || reason === onlyReason;
+  }) : list;
+  const afterReset = proven ? healCommentsSince(narrowed, proven.at) : narrowed;
+  const raw = countCiHealComments(narrowed);
+  const sinceReset = countCiHealComments(afterReset);
+  const chargeable = countChargeableCiHealComments(afterReset, { restore });
+  return {
+    chargeable, reset: proven, spentBeforeReset: raw - sinceReset, windowRefunded: sinceReset - chargeable,
+    refunded: raw - chargeable,
+  };
 }
 
 /** Built from code points, not literals, so no invisible character lives in this source (#2866). */

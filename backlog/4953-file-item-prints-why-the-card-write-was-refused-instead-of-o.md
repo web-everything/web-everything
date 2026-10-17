@@ -5,8 +5,8 @@ size: 1
 status: open
 scope: ["we:scripts/operations/run.mjs", "we:scripts/operations/__tests__/run*.test.mjs", "we:scripts/operations/__tests__/file-item-cli.test.mjs"]
 dateOpened: "2026-10-01"
-preparedDate: "2026-10-02"
-preparedAgainstSha: "3f130ea59e0ffd5524322915a70a1866235d32ec"
+preparedDate: "2026-10-16"
+preparedAgainstSha: "1ca5edb490fbc03fe55aee05985107d6272c4628"
 tags: []
 ---
 
@@ -17,6 +17,8 @@ The reported 2026-10-01 filing stopped at the card write after a digest included
 Current code already renders the refusal and exits 1, but sends the human-readable output to stdout. This item fixes that output channel without weakening the writer's checks.
 
 ## Progress
+
+- Revalidated at checkout 1ca5edb490 on 2026-10-16: we:scripts/operations/run.mjs:763 still emits all rendered lines to stdout. we:scripts/operations/cli-adapter.mjs:1322 exposes the stopped discriminator, and we:scripts/operations/cli-adapter.mjs:1524 renders the effect-halted reason. The existing design can select stderr without expanding source scope. Retain size 1: approximately 5 emission lines and 100 test lines in the planned CLI suite, with existing runner tests as compatibility coverage. The dated CLI probe below remains historical evidence, not a new run.
 
 - Original premise/scope: the refusal reason was lost, and the fix belonged in we:scripts/operations/file-item.mjs with we:scripts/operations/__tests__/file-item.test.mjs.
 - Corrected premise/scope: we:scripts/operations/file-item.mjs is a pure declaration. Its write sink is reused by we:scripts/operations/file-item-io.mjs from we:scripts/operations/scaffold-io.mjs. The writer in we:scripts/backlog/guarded-write.mjs already throws a detailed locus-prefix error. we:scripts/operations/effect-executor.mjs preserves that error; we:scripts/operations/cli-adapter.mjs (`driveRun`, `renderOutcome`) returns an effect-halted outcome with the reason and code 1. The final CLI handler in we:scripts/operations/run.mjs unconditionally writes the rendered lines to descriptor 1. Change that emission point and add the planned we:scripts/operations/__tests__/file-item-cli.test.mjs. No writer, declaration, or executor edit is needed.

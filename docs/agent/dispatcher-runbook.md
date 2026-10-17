@@ -206,3 +206,5 @@ and is void for the new diff. An unknown mergeability result keeps the conflict 
 
 Linked from `we:skills-src/conveyor/SKILL.md` §2 ("Start the runner") — that's where an operator running the
 dispatcher will naturally land first.
+
+Manual intervention without a worker: `run.mjs why --pr=N|--item=X` then the op it suggests (see [operator-ops.md](operator-ops.md)).

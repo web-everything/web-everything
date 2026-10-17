@@ -15,7 +15,7 @@
  *
  * GENERATION 2 — {@link createFakeGithub} (#3383, the daemon-scenario-simulator epic, part 2 "Fake GitHub" —
  * see `reports/2026-09-24-daemon-scenario-simulator.md`) — is a STATEFUL fake GitHub: a real `gh` on `PATH`
- * backed by a JSON store file, guarded by an atomic-mkdir lock, written tmp+rename, with branch/merge facts
+ * backed by a JSON store file, guarded by an atomic-rename lock, written tmp+rename, with branch/merge facts
  * derived at READ TIME from a REAL bare origin repo (never canned). It exists because the simulator needs
  * `gh` calls made by DIFFERENT processes (the daemon hosts, pass scripts, fake agent sessions, and the test's
  * own setup code) to see and mutate the SAME PRs/labels/comments — generation 1's per-fixture canned-JSON
@@ -45,11 +45,13 @@
  */
 
 import {
-  mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, renameSync, chmodSync, rmSync,
+  mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, renameSync, chmodSync, rmSync, statSync, readdirSync,
+  unlinkSync, rmdirSync, existsSync,
 } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // ============================================================================================================
@@ -166,11 +168,10 @@ const SHIM_PATH = join(HERE, 'fake-gh-shim.mjs');
 // (which imports these exact functions rather than re-implementing them).
 // ---------------------------------------------------------------------------------------------------------
 
-/** A stale lock (its holder died mid-call) is taken over after this long — long enough that no real call in
- *  this fixture (including a `pr merge` that shells a few `git` subprocesses) should ever legitimately hold
- *  the lock this long, short enough that a genuinely wedged test does not hang the whole suite. */
+/** A dead or incomplete holder can be recovered after this long. A live holder may exceed this age
+ *  under load; its lock must remain exclusive until release or process death. */
 export const LOCK_STALE_MS = 10_000;
-/** How long a caller will retry the mkdir before giving up and throwing — comfortably above the stale window
+/** How long a caller will retry the acquire before giving up and throwing — comfortably above the stale window
  *  so a legitimate stale-takeover always gets a chance to happen before a caller gives up on it. */
 const LOCK_RETRY_TIMEOUT_MS = 20_000;
 
@@ -181,45 +182,166 @@ export function sleepSyncMs(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+// The simulator shifts Date.now in shim processes, but leaves performance untouched.
+const realNowMs = () => performance.timeOrigin + performance.now();
+const lockTokens = new Map();
+const siblingPath = (lockPath, kind) => `${lockPath}.${kind}-${process.pid}-${randomUUID()}`;
+const removeLockDir = (path) => rmSync(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+const holderName = (token) => `holder-${token}.json`;
+const isHolderName = (name) => /^holder-[0-9a-f-]{36}\.json$/.test(name) || name === 'holder.json';
+
+/** Remove only the observed generation's entry. rmdir is an atomic empty-directory check: a
+ * replacement's unique holder makes it fail, even if that owner arrived after our last read.
+ * Never rename or recursively remove the shared path; neither operation can check ownership. */
+function retireStoreLock(lockPath, entry) {
+  if (entry) {
+    try { unlinkSync(join(lockPath, entry)); } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+    }
+  }
+  rmdirSync(lockPath);
+}
+
+function processIsAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (err) { return err.code !== 'ESRCH'; }
+}
+
+/** Recover debris left by a killed acquire/release. One directory scan per acquire, best effort. */
+function sweepLockSiblings(lockPath) {
+  try {
+    const parent = dirname(lockPath);
+    const prefixes = ['tmp', 'dead'].map((kind) => `${basename(lockPath)}.${kind}-`);
+    for (const name of readdirSync(parent)) {
+      if (!prefixes.some((prefix) => name.startsWith(prefix))) continue;
+      try {
+        const path = join(parent, name);
+        // A paused publisher may still rename its candidate. Do not empty that directory while
+        // it is live, which could otherwise publish an empty lock after the sweeper's unlink.
+        const pid = name.slice(`${basename(lockPath)}.tmp-`.length).split('-')[0];
+        if (name.startsWith(`${basename(lockPath)}.tmp-`) && /^\d+$/.test(pid) && processIsAlive(Number(pid))) continue;
+        if (realNowMs() - statSync(path).mtimeMs > LOCK_STALE_MS) removeLockDir(path);
+      } catch { /* a concurrent sweeper may already have removed it */ }
+    }
+  } catch { /* best effort */ }
+}
+
 /**
- * Acquire the store's lock via atomic `mkdir` (EEXIST is the only correctness-relevant failure mode of
- * `mkdir` — two processes racing it never both succeed). Retries with a short randomized backoff; a lock
- * whose holder record is older than {@link LOCK_STALE_MS} is force-taken (the holder crashed mid-call and
- * would otherwise wedge every future caller forever).
+ * Create the lock directory with exclusive mkdir, then move in a complete, uniquely named holder
+ * record. The caller owns the lock only if that record is the directory's sole entry. Retry
+ * contention with a short randomized backoff. Retirement unlinks only one holder filename and
+ * atomically removes the directory only if empty, so it cannot retire a replacement owner.
  *
  * @param {string} storePath
  * @returns {string} the lock directory path — pass to {@link releaseStoreLock} to release it
  */
 export function acquireStoreLock(storePath) {
   const lockPath = `${storePath}.lock`;
-  const holderPath = join(lockPath, 'holder.json');
-  const deadline = Date.now() + LOCK_RETRY_TIMEOUT_MS;
+  const deadline = realNowMs() + LOCK_RETRY_TIMEOUT_MS;
+  sweepLockSiblings(lockPath);
   for (;;) {
-    try {
-      mkdirSync(lockPath);
-      writeFileSync(holderPath, JSON.stringify({ pid: process.pid, at: Date.now() }), 'utf8');
-      return lockPath;
-    } catch (err) {
-      if (err.code !== 'EEXIST') throw err;
-      try {
-        const holder = JSON.parse(readFileSync(holderPath, 'utf8'));
-        if (Date.now() - holder.at > LOCK_STALE_MS) {
-          rmSync(lockPath, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-          continue; // retry the mkdir immediately — no need to sleep first, the slot is free now
-        }
-      } catch {
-        // holder.json missing or mid-write (another process is between mkdir and the holder write) — not
-        // yet provably stale, fall through to the ordinary backoff-and-retry below.
-      }
-      if (Date.now() > deadline) throw new Error(`fake-gh: timed out acquiring lock ${lockPath}`);
-      sleepSyncMs(5 + Math.floor(Math.random() * 15));
+    if (realNowMs() > deadline) throw new Error(`fake-gh: timed out acquiring lock ${lockPath}`);
+    let lockStat;
+    try { lockStat = statSync(lockPath); } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
     }
+    // Never rename onto lockPath: POSIX rename replaces an EMPTY directory, and no prior check
+    // can stop one appearing before the rename. mkdir is exclusive, so it never replaces anything.
+    if (!lockStat) {
+      const staged = siblingPath(lockPath, 'tmp');
+      const token = randomUUID();
+      const entry = holderName(token);
+      try {
+        writeFileSync(staged, JSON.stringify({ pid: process.pid, at: realNowMs(), token }), 'utf8');
+        mkdirSync(lockPath);
+        // A stale-empty takeover may remove our directory before this rename. We then land in a
+        // successor's directory or none; only the sole-entry check below grants ownership.
+        try { renameSync(staged, join(lockPath, entry)); } catch (err) {
+          if (err.code === 'ENOENT') continue;
+          throw err;
+        }
+        if (readdirSync(lockPath).join('/') === entry) {
+          lockTokens.set(lockPath, token);
+          return lockPath;
+        }
+        // Another publisher shares this directory: withdraw our entry. rmdir removes only an
+        // empty directory; a publisher whose directory disappears retries.
+        try { retireStoreLock(lockPath, entry); } catch { /* still held by the other entry */ }
+      } catch (err) {
+        if (!['EEXIST', 'ENOENT', 'ENOTEMPTY', 'EPERM'].includes(err.code) || !existsSync(dirname(lockPath))) throw err;
+      } finally {
+        try { removeLockDir(staged); } catch { /* best effort */ }
+      }
+      continue;
+    }
+    let at = lockStat.mtimeMs;
+    let holderPid;
+    let entry;
+    try {
+      const entries = readdirSync(lockPath);
+      // Unknown contents fail closed rather than removing files we cannot attribute to a holder.
+      if (entries.some((name) => !isHolderName(name))) {
+        sleepSyncMs(5 + Math.floor(Math.random() * 15));
+        continue;
+      }
+      // Two holder entries share a directory only while a publisher withdraws. If both were
+      // killed, unlink each dead one by its unique name so the directory can age out.
+      if (entries.length > 1) {
+        let removed = 0;
+        for (const name of entries) {
+          const path = join(lockPath, name);
+          let stale = realNowMs() - statSync(path).mtimeMs > LOCK_STALE_MS;
+          try {
+            const holder = JSON.parse(readFileSync(path, 'utf8'));
+            if (Number.isFinite(holder?.at)) stale = realNowMs() - holder.at > LOCK_STALE_MS;
+            if (Number.isSafeInteger(holder?.pid) && holder.pid > 0 && processIsAlive(holder.pid)) stale = false;
+          } catch (err) {
+            if (err.code === 'ENOENT') continue;
+          }
+          if (stale) try { unlinkSync(path); removed++; } catch { /* already withdrawn */ }
+        }
+        // Every listed holder was dead: retire the directory now. rmdir fails if anyone arrived.
+        if (removed === entries.length) try { rmdirSync(lockPath); continue; } catch { /* reoccupied */ }
+        sleepSyncMs(5 + Math.floor(Math.random() * 15));
+        continue;
+      }
+      entry = entries[0];
+      // An empty directory's age must come from the generation we just listed, not the earlier stat.
+      if (!entry) at = statSync(lockPath).mtimeMs;
+      if (entry) {
+        const raw = readFileSync(join(lockPath, entry), 'utf8');
+        try {
+          const holder = JSON.parse(raw);
+          if (Number.isFinite(holder?.at)) at = holder.at;
+          if (Number.isSafeInteger(holder?.pid) && holder.pid > 0) holderPid = holder.pid;
+        } catch { /* empty or torn holder: age the directory itself */ }
+      }
+    } catch (err) {
+      if (err.code === 'ENOENT') continue; // the observed generation has already retired
+      throw err;
+    }
+    // Age is not permission to evict a live writer: it can resume and commit its old snapshot
+    // after a successor has updated the store. A publisher paused between mkdir and adding its
+    // entry may lose its empty directory here; its sole-entry check then fails safe. Death is
+    // monotonic for this owner; a replacement's unique entry is still protected by retireStoreLock.
+    if (realNowMs() - at > LOCK_STALE_MS && !(holderPid && processIsAlive(holderPid))) {
+      try {
+        retireStoreLock(lockPath, entry);
+        continue;
+      } catch { /* another waiter may have won the takeover */ }
+    }
+    if (realNowMs() > deadline) throw new Error(`fake-gh: timed out acquiring lock ${lockPath}`);
+    sleepSyncMs(5 + Math.floor(Math.random() * 15));
   }
 }
 
-/** Release a lock acquired by {@link acquireStoreLock}. Best-effort: a missing lock dir is not an error. */
+/** Unlink only our unique holder; a replacement's nonempty directory cannot be removed. */
 export function releaseStoreLock(lockPath) {
-  try { rmSync(lockPath, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* best effort */ }
+  const token = lockTokens.get(lockPath);
+  if (!token) return;
+  lockTokens.delete(lockPath);
+  try {
+    retireStoreLock(lockPath, holderName(token));
+  } catch { /* best effort: a missing lock dir is not an error */ }
 }
 
 /** The empty store shape — every field a caller might read is present so nothing has to null-check it. */
@@ -575,14 +697,21 @@ function mergeBaseOf(originPath, base, head) {
   try { return runGit(['merge-base', base, head], originPath).trim(); } catch { return base; }
 }
 
-/** `--json files` shape: `{path, additions, deletions}` (gh's own GraphQL-backed shape — see this file's
- *  header on why this differs from {@link listChangedFilesRest}'s REST shape). */
-export function listChangedFilesNative(originPath, base, head) {
-  const mb = mergeBaseOf(originPath, base, head);
-  const out = runGit(['diff', '--numstat', mb, head], originPath);
-  return out.split('\n').filter(Boolean).map((line) => {
-    const [add, del, path] = line.split('\t');
-    return { path, additions: add === '-' ? 0 : Number(add), deletions: del === '-' ? 0 : Number(del) };
+/** `--json files` shape: `{path, additions, deletions, changeType}`. Disable rename detection so both
+ *  sides of a move remain visible, including a workflow removed by a rename. */
+export function listChangedFilesNative(originPath, base, head, { run = runGit } = {}) {
+  let mb;
+  try { mb = run(['merge-base', base, head], originPath).trim(); } catch { mb = base; }
+  const statusRows = run(['diff', '--name-status', '--no-renames', '-z', mb, head], originPath).split('\0');
+  const types = new Map();
+  for (let i = 0; i + 1 < statusRows.length; i += 2) {
+    types.set(statusRows[i + 1], { A: 'ADDED', M: 'MODIFIED', D: 'DELETED', T: 'MODIFIED' }[statusRows[i]]);
+  }
+  const out = run(['diff', '--numstat', '--no-renames', '-z', mb, head], originPath);
+  return out.split('\0').filter(Boolean).map((line) => {
+    const [, add, del, path] = line.match(/^([^\t]+)\t([^\t]+)\t([\s\S]*)$/);
+    return { path, additions: add === '-' ? 0 : Number(add), deletions: del === '-' ? 0 : Number(del),
+      changeType: types.get(path) };
   });
 }
 

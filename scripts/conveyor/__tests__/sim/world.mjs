@@ -31,6 +31,7 @@ import { fileURLToPath } from 'node:url';
 import { createFakeGithub } from '../helpers/fake-gh.mjs';
 import { createFakeClaude } from '../../../operations/__tests__/helpers/fake-claude.mjs';
 import { createSimClock } from './clock.mjs';
+import { nodeRuntimeEnv } from './node-runtime-env.mjs';
 import { seedLaneDependencies } from './dependencies.mjs';
 import { writeFixtureNpm } from './npm-shim.mjs';
 import { isolatedProcessEnv, toolPathDirs } from './environment.mjs';
@@ -79,7 +80,10 @@ let templateCache = null;
  *  `package.json`, `package-lock.json` — the daemon import graph's own dependency set (found by running the
  *  daemons against progressively wider copies; nothing outside these needed adding). `git ls-files -co
  *  --exclude-standard` (not a blind full-tree copy) so gitignored junk (`node_modules`, `_site/`, …) never
- *  rides along and so an uncommitted fix in THIS lane is what the simulator actually runs. */
+ *  rides along and so an uncommitted fix in THIS lane is what the simulator actually runs.
+ *  Tests, fixtures and corpora are excluded: per-scenario checkout/clone/teardown cost scales with this
+ *  tree, and that cost under CI load caused A3 to time out. Fake gh/claude helpers and their shims resolve
+ *  from INVOKING_ROOT, not the sim clone, so they do not need to ride along. */
 function buildWeTemplate() {
   const listed = execFileSync(
     'git',
@@ -109,7 +113,10 @@ function buildWeTemplate() {
       'schemas/worker-result.v1.json',
     ],
     { cwd: INVOKING_ROOT, encoding: 'utf8' },
-  ).split('\n').filter(Boolean);
+  ).split('\n').filter(Boolean).filter((path) =>
+    !/(^|\/)__tests__\/|\.(?:test|spec)\.[^/]+$/.test(path)
+    && !/^scripts\/(?:golden-corpus|review-corpus)\//.test(path)
+    && !/^scripts\/(?:.*\/)?fixtures\//.test(path));
 
   const work = mkdtempSync(join(tmpdir(), 'sim-template-we-'));
   for (const rel of listed) {
@@ -269,6 +276,9 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
   writeFixtureNpm(toolsDir);
   const linked = new Set(['claude', 'codex', 'agy', 'npm']);
   for (const dir of toolPathDirs()) {
+    // The operator's GitHub App shim is live credential state, not a tool directory to enumerate.
+    // The world's own fake gh already wins PATH; none of the shim's siblings belong in this world.
+    if (/(^|\/)gh-shim\.d(\/|$)/.test(dir)) continue;
     let names;
     try { names = readdirSync(dir); } catch { continue; }
     for (const name of names) {
@@ -279,6 +289,10 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
   }
   const env = {
     ...isolatedProcessEnv(root),
+    // Every tick launches many Node CLIs over the same large daemon module graph. One disposable cache per
+    // world reduces repeated compilation within the sibling scenario / 50-tick soak budgets, without
+    // sharing module state or skipping any real tick.
+    ...nodeRuntimeEnv(root),
     PATH: [ghBinDir, claudeBinDir, toolsDir].join(':'),
     NODE_OPTIONS: clock.env.NODE_OPTIONS,
     HOME: home,
@@ -295,11 +309,7 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     // vitest.setup.ts supplies a per-file throttle root, which takes precedence over LANE_POOL_ROOT.
     // Worlds have independent clocks: an earlier world's +11m budget window must never make a fresh
     // world wait out the 2m admission timeout on every gh call. Keep admission enabled, scoped per world.
-    // Cleanup owns this root.
-    WE_GH_THROTTLE_LOCK_ROOT: join(root, 'gh-throttle'),
-    // Each world owns a different simulated clock. Sharing the test file's throttle store lets
-    // an earlier world's clock advance leave a future points window (and leases) for the next
-    // world, which can spend the production acquire timeout waiting before the fake gh runs.
+    // All children of one world still share its gate. Cleanup owns this root.
     WE_GH_THROTTLE_LOCK_ROOT: join(root, 'gh-throttle'),
     OPERATION_COMPLETIONS_DIR: completionsDir,
     WE_BACKLOG_DIR: backlogDir,
@@ -405,14 +415,36 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
   }
 
   // ── git helpers ────────────────────────────────────────────────────────────────────────────────────────
-  function withScratchClone(repoKey, fn) {
+  function commitFiles(repoKey, base, files, msg) {
     const repo = repoEntries[repoKey];
     if (!repo) throw new Error(`world.git: unknown repo "${repoKey}"`);
-    const work = mkdtempSync(join(tmpdir(), 'sim-git-'));
+    const work = mkdtempSync(join(tmpdir(), 'sim-git-index-'));
+    const opts = { env: {
+      ...process.env,
+      GIT_INDEX_FILE: join(work, 'index'),
+      GIT_AUTHOR_NAME: 'Sim World', GIT_AUTHOR_EMAIL: 'sim@example.com',
+      GIT_COMMITTER_NAME: 'Sim World', GIT_COMMITTER_EMAIL: 'sim@example.com',
+    } };
     try {
-      git(root, ['clone', '--quiet', repo.originPath, work]);
-      configureRepo(work);
-      return fn(work, repo);
+      git(repo.originPath, ['read-tree', base], opts);
+      // Content writes preserve an existing regular file's executable bit, just like writeFileSync.
+      // Read the seeded index once; NUL records keep whitespace and quoted filenames literal.
+      const executables = new Set(git(repo.originPath, ['ls-files', '--stage', '-z'], opts)
+        .split('\0').filter((entry) => entry.startsWith('100755 '))
+        .map((entry) => entry.slice(entry.indexOf('\t') + 1)));
+      for (const [name, content] of Object.entries(files)) {
+        const blob = git(repo.originPath, ['hash-object', '-w', '--stdin'], {
+          ...opts, input: content, stdio: ['pipe', 'pipe', 'pipe'],
+        }).trim();
+        const mode = executables.has(name) ? '100755' : '100644';
+        git(repo.originPath, ['update-index', '--add', '--cacheinfo', `${mode},${blob},${name}`], opts);
+      }
+      const tree = git(repo.originPath, ['write-tree'], opts).trim();
+      // A normal `git commit` rejects both empty files and writes that change nothing.
+      if (tree === git(repo.originPath, ['rev-parse', `${base}^{tree}`]).trim()) {
+        throw new Error('world.git: nothing to commit (no staged changes)');
+      }
+      return git(repo.originPath, ['commit-tree', tree, '-p', base, '-m', msg], opts).trim();
     } finally {
       rmSync(work, { recursive: true, force: true });
     }
@@ -427,34 +459,33 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
   const worldGit = {
     /** A human (or another lane) pushing straight to `main` mid-scenario. */
     commitToMain(repoKey, files = {}, msg = 'sim: commit to main') {
-      withScratchClone(repoKey, (work) => {
-        git(work, ['checkout', 'main']);
-        for (const [name, content] of Object.entries(files)) {
-          const p = join(work, name);
-          mkdirSync(dirname(p), { recursive: true });
-          writeFileSync(p, content, 'utf8');
-        }
-        git(work, ['add', '-A']);
-        git(work, ['commit', '-q', '-m', msg]);
-        git(work, ['push', 'origin', 'HEAD:main']);
-      });
+      const base = headOf(repoKey, 'main');
+      const head = commitFiles(repoKey, base, files, msg);
+      git(repoEntries[repoKey].originPath, ['update-ref', 'refs/heads/main', head, base]);
       return headOf(repoKey, 'main');
     },
     /** A real PR-worthy branch on the origin — `from` defaults to `main`; `files`, if given, seed one commit. */
     createBranch(repoKey, name, { from = 'main', files = {} } = {}) {
-      withScratchClone(repoKey, (work) => {
-        git(work, ['checkout', '-b', name, `origin/${from}`]);
-        if (Object.keys(files).length) {
-          for (const [fname, content] of Object.entries(files)) {
-            const p = join(work, fname);
-            mkdirSync(dirname(p), { recursive: true });
-            writeFileSync(p, content, 'utf8');
-          }
-          git(work, ['add', '-A']);
-          git(work, ['commit', '-q', '-m', `sim: seed ${name}`]);
+      const base = headOf(repoKey, from);
+      const head = Object.keys(files).length ? commitFiles(repoKey, base, files, `sim: seed ${name}`) : base;
+      const origin = repoEntries[repoKey].originPath;
+      const ref = `refs/heads/${name}`;
+      let current = '0'.repeat(base.length);
+      try {
+        current = git(origin, ['rev-parse', '--verify', '--quiet', ref]).trim();
+      } catch (error) {
+        if (error.status !== 1) throw error;
+      }
+      if (current !== '0'.repeat(base.length)) {
+        try {
+          git(origin, ['merge-base', '--is-ancestor', current, head]);
+        } catch (error) {
+          if (error.status !== 1) throw error;
+          throw new Error(`world.git: rejected non-fast-forward update to ${ref}`);
         }
-        git(work, ['push', 'origin', `HEAD:${name}`]);
-      });
+      }
+      // Match a non-force push, with CAS protecting both creation and advancement.
+      git(origin, ['update-ref', ref, head, current]);
       return headOf(repoKey, name);
     },
     headOf,

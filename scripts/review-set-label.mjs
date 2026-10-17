@@ -2109,7 +2109,9 @@ export function buildVerdictComment({
       buildReviewedContributionMarker(reviewedDiff),
       to === 'clear-human' ? buildClearedHumanMarker(actor)
         : carriesHumanClearance ? buildClearedHumanMarker(humanClearance.actor) : '',
-      buildClearerActorMarker(clearerId),
+      // The shared marker builder refuses only `\n`; a CR or U+2028/9 in the id would still end the marker's line
+      // early, so the id is refused (no marker, like an unusable id) before it reaches that builder.
+      buildClearerActorMarker(/[\r\n\p{Zl}\p{Zp}]/u.test(String(clearerId)) ? '' : clearerId),
     ].filter(Boolean).join('\n')
     : '';
   // #2844 — the independence line. Printed ONLY when the bar was not met, so a clean record stays terse.
@@ -2121,19 +2123,23 @@ export function buildVerdictComment({
   // under the same ⚠️ as an accept whose independence merely could not be checked. Everything else that failed
   // the bar keeps the ⚠️ wording. On `--to=accepted` a proven self-clear never reaches here at all — the CLI
   // refuses it before any write — so that combination only ever renders in the size projection.
+  // A value rendered inside a prose line: every line break (`^` under /m in parseAdvisories also matches after CR and
+  // U+2028/9) would start a new line a plain-prose reader treats as its own, so fold each run into one space and trim,
+  // the same normalization `buildClearedHumanMarker` applies to the actor it stamps.
+  const oneLine = (value) => String(value).replace(/(?:\r\n|[\r\n\u{2028}\u{2029}])+/gu, ' ').trim();
   const humanCeremonyExemption = to === 'clear-human' && independence
     && independence.status === INDEPENDENCE.SELF_CLEAR;
   const independenceNote = !(stampsAcceptance && independence && independence.independent === false)
     ? ''
     : humanCeremonyExemption
       ? '\n\n🧑 Cleared by the HUMAN CEREMONY, not by an established-independent agent (#2844). The clearing '
-        + `actor is this PR's own author (${clearerId}) — a subagent inherits its parent's session id, so the `
+        + `actor is this PR's own author (${oneLine(clearerId)}) — a subagent inherits its parent's session id, so the `
         + 'operator clearing a PR their own session opened reads as a self-clear at the session level. '
         + '`--to=clear-human` is EXEMPT from the self-clear refusal that binds `--to=accepted`, because it '
         + 'carries a stronger signal than a session id: it is refused unless the PR carries `review:human`, and '
         + 'it requires the explicit actor and the quoted reason above. Read this as "a human ceremony cleared '
         + 'it", NOT as "an independent reviewer cleared it".'
-      : `\n\n⚠️ Independence NOT established for this clearance (#2844): ${independence.reason}. `
+      : `\n\n⚠️ Independence NOT established for this clearance (#2844): ${oneLine(independence.reason)}. `
         + 'This record does not show that a party other than the author cleared it.';
   const text = String(typeof body === 'string' ? body : '').trim();
   const heading = to === 'clear-human'
@@ -2156,7 +2162,7 @@ export function buildVerdictComment({
   // gaming gate see "latest accept-shaped comment has no cleared-human marker" and re-park review:human on a
   // PR a human had just cleared minutes earlier.
   const carriedClearanceNote = carriesHumanClearance
-    ? ` The HUMAN clearance ${humanClearance.actor} granted (reviewed-sha ${String(humanClearance.sha).slice(0, 12)}…) `
+    ? ` The HUMAN clearance ${oneLine(humanClearance.actor)} granted (reviewed-sha ${String(humanClearance.sha).slice(0, 12)}…) `
       + (channel === 'ci-heal'
         ? 'is carried forward to this head after the CI-heal coverage proof passed: the '
         : 'is carried forward to this head: the drain\'s own content-preserving rebase moved the tree, and the ')
@@ -2164,14 +2170,15 @@ export function buildVerdictComment({
       + 'ran here — `review:human` stays cleared on the strength of the ORIGINAL clearance, not a fresh one.'
     : '';
   const attribution = to === 'clear-human'
-    ? `Cleared by ${actor} via \`review-set-label.mjs --to=clear-human\` (#2895).\n\n`
-      + `> ${String(reason || '').split('\n').join('\n> ')}\n\n`
+    ? `Cleared by ${oneLine(actor)} via \`review-set-label.mjs --to=clear-human\` (#2895).\n\n`
+      // Every line break starts a new quoted line: `^` under /m (parseAdvisories) also matches after CR and U+2028/9.
+      + `> ${String(reason || '').split(/\r\n|[\r\n\u{2028}\u{2029}]/u).join('\n> ')}\n\n`
       + 'What this record proves: the clearance went through the sanctioned tool, so the label swap, the '
       + '`reviewed-sha` stamp and this comment exist and agree. What it does NOT prove: that a human performed '
       + 'it. The actor name and the reason above are free text and nothing verifies who supplied them — #2895 '
       + 'deferred the unforgeable actor signal (no local construct survives an agent with shell access on the '
       + 'same machine), and #2946 is the durable fix.'
-    : `Recorded by ${actor}${normalizeChannel(channel) ? ` via ${normalizeChannel(channel)}` : ''}.${carriedClearanceNote}`;
+    : `Recorded by ${oneLine(actor)}${normalizeChannel(channel) ? ` via ${normalizeChannel(channel)}` : ''}.${carriedClearanceNote}`;
   // ────────────────────────────────────────────────────────────────────────────────────────────────────────
   // THE RENDER BOUNDARY (PR #1147 review — the structural close of the marker-forgery class).
   //
@@ -2215,7 +2222,7 @@ export function buildVerdictComment({
     heading,
     '',
     attribution + independenceNote,
-    ...(to === 'restamp' && reason ? ['', String(reason)] : []),
+    ...(to === 'restamp' && reason ? ['', oneLine(reason)] : []),
     ...(text ? ['', text] : []),
   ].join('\n'));
   return marker ? `${prose}\n\n${marker}` : prose;

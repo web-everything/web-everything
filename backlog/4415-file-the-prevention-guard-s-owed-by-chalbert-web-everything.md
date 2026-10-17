@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/conveyor/__tests__/lease-reaper.test.mjs"]
 dateOpened: "2026-09-28"
-preparedDate: "2026-10-12"
-preparedAgainstSha: "4b20b067f5e38ab4b6d58828bd1d183f7a68ac25"
+preparedDate: "2026-10-16"
+preparedAgainstSha: "1ca5edb490fbc03fe55aee05985107d6272c4628"
 tags: []
 ---
 
@@ -19,9 +19,11 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2
 
 ## Progress
 
+- Revalidated at checkout 1ca5edb490 on 2026-10-16: the committed-blob assertions are still absent from the fixture; the production merge veto and required-kind regression remain present. Updated moved validator citations below. Retain the existing one-test-file scope and size 1.
+
 - **Old premise/scope:** mechanically filed against we:backlog/4337-lease-reaper-branch-fallback-reject-lanes-with-unlanded-merg.md:24 and we:backlog/4315-a-confirmed-broken-impact-advisory-finding-must-not-be-ignor.md:2, requesting fixture preconditions and a validator requiring `workItem`. Those card citations were provenance, not implementation locations; the second also pointed to the debt in we:backlog/4319-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md.
 - **Corrected premise:** the fixture in we:scripts/conveyor/__tests__/lease-reaper.test.mjs:1294 writes unique content at line 1321 but asserts only patch equivalence and unaccounted merge reachability at lines 1334–1341 before checking containment at line 1345. It does not read and assert the two committed file contents. The production merge veto already exists at we:scripts/conveyor/lease-reaper.mjs:511; this item requires no production change.
-- **Schema evidence:** we:scripts/check-standards-rules.mjs:224 documents replacement of `type`/`workItem` with `kind`; required-field validation at line 375 includes `kind`. The live gate invokes that validator for each backlog item at we:scripts/check-standards.mjs:851, and we:scripts/__tests__/check-standards-frontmatter-parse.test.mjs:23 pins missing-kind rejection. Do not reintroduce a retired field or duplicate this guard. This is source inspection, not a claim that the suite was run during preparation.
+- **Schema evidence:** we:scripts/check-standards-rules.mjs:352 documents replacement of `type`/`workItem` with `kind`; required-field validation at lines 503–505 includes `kind`. The live gate invokes that validator for each backlog item at we:scripts/check-standards.mjs:864, and we:scripts/__tests__/check-standards-frontmatter-parse.test.mjs:23 pins missing-kind rejection. Do not reintroduce a retired field or duplicate this guard. This is source inspection, not a claim that the suite was run during preparation.
 - **Corrected scope and sizing:** replace the two historical card paths with the existing matching test file, we:scripts/conveyor/__tests__/lease-reaper.test.mjs. No source entry requires an additional test path because the entire touch set is this regression suite. Change size **3 → 1**: one file × approximately 8–12 changed lines for two committed-blob reads, exact assertions, and an explanatory comment, grounded in the setup/assertion boundary at lines 1332–1345. Keep `kind: story`; no task-only estimate field.
 - **Preparation boundary:** only this card is edited; implementation, execution proof, and runner-owned checks/stamping remain outstanding.
 

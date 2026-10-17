@@ -172,7 +172,8 @@ describe('tip facts reach the smell and the quarantine safety net', () => {
       const { runs, tip } = replay();
       const net = (mainCiRuns, sub) => {
         const calls = { jobs: 0, logs: 0, writes: 0 };
-        const r = runSafetyNet({ dir: join(dir, sub), settings: resolveQuarantineSettings({ env: {}, file: '/nonexistent', platform: null }),
+        // pins the pre-guardrail rule; the guardrails are tested in scripts/lib/__tests__/red-main-quarantine-guardrails.test.mjs
+        const r = runSafetyNet({ dir: join(dir, sub), settings: resolveQuarantineSettings({ env: {}, file: '/nonexistent', platform: { requireProvenFlake: false } }),
           mode: { value: 'stop', source: 'settings' }, live: false, now: at('19:24:34'), mainCiRuns,
           readJobs: () => { calls.jobs += 1; return { failed: [] }; }, readLog: () => { calls.logs += 1; return { complete: false }; },
           readList: () => ({ ok: true, list: { version: 1, entries: [] } }), write: () => { calls.writes += 1; return { events: [] }; }, log: () => {} });

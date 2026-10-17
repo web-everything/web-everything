@@ -14,6 +14,8 @@ import {
   RED_TEAM_DISCARD_DISPATCH_KIND, redTeamReadFingerprint, recordDiscardedRedTeam, ACTIVE_SEAT_PIDS, killActiveSeats,
 } from '../review-extra-seats.mjs';
 import { validateScorecard } from '../../conveyor/run-scorecard-store.mjs';
+import { redTeamEnqueueHold } from '../../lib/drain-queue-safety.mjs';
+import { renderRedTeamComment } from '../review-extra-seats.mjs';
 
 const REPO = 'web-everything/web-everything';
 const REV = 'a'.repeat(40);
@@ -70,6 +72,35 @@ function jobIo({ verdict = 'accept', setting = { value: 'on', enabled: true, sou
 const kinds = (calls) => calls.filter((c) => c[0] !== 'log').map((c) => c[0]);
 
 describe('runReviewJob under review.speculativeRedTeam', () => {
+  it('the actual carry comment releases queue admission without starting another review or red team', () => {
+    const head = 'b'.repeat(40);
+    const comments = [
+      { author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${REV} -->` },
+      { author: { login: 'web-everything' }, body: renderRedTeamComment({ pr: 10, rev: REV, findings: [], provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'accept' }) },
+    ];
+    const { io, calls } = jobIo({ over: {
+      carryAcrossRebaseSetting: () => ({ value: 'on', source: 'test' }),
+      readCarryEvidence: () => ({ headSha: head, comments }),
+      contributionPatchId: () => 'c'.repeat(40),
+      restampVerdict: () => ({ ok: true }),
+      postCarryComment: ({ body }) => comments.push({ user: { login: 'web-everything[bot]' }, body }),
+    } });
+    expect(runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io).outcome).toBe('carried');
+    expect(kinds(calls)).toEqual([]);
+    expect(redTeamEnqueueHold({ loopPayload: payload('accept'), comments, pr: 10, head, env: {} })).toBeNull();
+  });
+
+  it.each([true, false])('publishes head-bound liveness around the accepted pass (speculative=%s)', enabled => {
+    const events = [];
+    const { io } = jobIo({ setting: { enabled }, over: {
+      redTeamStatus: row => events.push(row),
+      finishSpeculativeRedTeam: () => { expect(events.at(-1)?.status).toBe('running'); return { status: 'ran' }; },
+      runRedTeam: () => { expect(events.at(-1)?.status).toBe('running'); return { status: 'ran' }; },
+    } });
+    runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
+    expect(events.map(row => row.status)).toEqual(['running', 'finished']);
+    expect(events[0]).toMatchObject({ repo: REPO, pr: 10, loopPayload: { findings: { read: { netBasis: { rev: REV } } } } });
+  });
   it('starts the red team BEFORE the loop, hands the loop the read sink, and logs the layer that set the setting', () => {
     const { io, calls } = jobIo();
     runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
@@ -384,4 +415,23 @@ describe('calling a speculative pass off kills real processes', () => {
       expect(stat === '' || stat.startsWith('Z')).toBe(true);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 60_000);
+});
+
+describe('durable run seat timing handoff', () => {
+  it('hands extra seats and the speculative model-call times to the existing run writer', () => {
+    const writes = [];
+    const startedAt = new Date(NOW).toISOString();
+    const finishedAt = new Date(NOW + 120000).toISOString();
+    const spec = { ...PASS, startedAt, finishedAt, parsed: { 'red-team': { verdict: 'accept' } } };
+    const extra = { seat: 'advisory', lens: 'simplicity', provider: 'codex', model: 'test', startedAt, finishedAt, seatVerdict: 'changes', findingsCount: 2 };
+    const { io } = jobIo({ spec, over: {
+      runExtraSeats: () => ({ status: 'ran', seats: [extra] }),
+      recordSeatTimings: (id, rows) => writes.push({ id, rows }),
+    } });
+    runReviewJob({ pr: 5, repo: REPO }, io);
+    const rows = writes.flatMap(w => w.rows);
+    expect(writes.every(w => w.id === 'review-pr-1')).toBe(true);
+    expect(rows).toContainEqual({ seat: 'advisory', lens: 'simplicity', provider: 'codex', model: 'test', startedAt, finishedAt, verdict: 'changes', findingsCount: 2 });
+    expect(rows).toContainEqual({ seat: 'red-team', lens: 'red-team', provider: 'codex', model: null, startedAt, finishedAt, verdict: 'accept', findingsCount: 0 });
+  });
 });

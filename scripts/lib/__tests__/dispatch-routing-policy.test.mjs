@@ -156,13 +156,13 @@ describe('review-round regressions (PR 3209)', () => {
 });
 
 it('adapts effort and provider to bounded prepares, design and mechanical work', () => {
-  expect(resolveOperationRoute({ operation: 'prepare-item', size: 3, wellScoped: true, designQuestion: false })).toMatchObject({ provider: 'agy-gemini', effort: 'low' });
+  expect(resolveOperationRoute({ operation: 'prepare-item', size: 3, wellScoped: true, designQuestion: false })).toMatchObject({ provider: 'codex', model: 'gpt-6-astra', effort: 'low' });
   for (const context of [{ size: 5 }, { size: 2, designQuestion: true }, {}]) {
     expect(resolveOperationRoute({ operation: 'prepare-item', ...context })).toMatchObject({ provider: 'codex', model: 'gpt-6-astra' });
   }
   expect(resolveOperationRoute({ operation: 'prepare-item', size: 5 }).effort).toBe('high');
   expect(resolveOperationRoute({ operation: 'build', taskType: 'doc-fix' }).effort).toBe('medium');
-  expect(resolveOperationRoute({ operation: 'build', taskType: 'test-fix' })).toMatchObject({ provider: 'agy-gemini', model: 'gemini-3.8-flash', effort: 'low' });
+  expect(resolveOperationRoute({ operation: 'build', taskType: 'test-fix' })).toMatchObject({ provider: 'codex', model: 'gpt-6.1-sol', effort: 'low' });
   expect(resolveOperationRoute({ operation: 'ci-heal' })).toBeNull();
   expect(resolveOperationRoute({ operation: 'fix' })).toBeNull();
 });

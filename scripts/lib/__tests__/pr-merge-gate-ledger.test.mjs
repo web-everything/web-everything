@@ -63,6 +63,107 @@ describe('decideLedgerGate table', () => {
   });
 });
 
+// ─── #5303 — fail closed on unverifiable head/coverage and malformed holds ───────────────────────────────────────
+describe('decideLedgerGate unverifiable evidence (#5303)', () => {
+  const AUTHS = ['ledger', 'both'];
+  const run = (over, authority) => decideLedgerGate({ folded: clearFolded, derived: clearDerived, head: sha, labelsClear: true, authority, ...over });
+  const exemptFolded = { clears: false, current: null };
+  const exemptDerived = { clears: true, holds: [], reviewExempt: true };
+
+  it.each(AUTHS)('%s: an omitted/empty/non-string live head defers instead of clearing', (authority) => {
+    for (const head of [undefined, null, '', {}, { sha: '' }, { sha: 42 }, { sha: {} }, 7, ['aaa']]) {
+      const r = run({ head }, authority);
+      expect(r, JSON.stringify(head)).toMatchObject({ clear: false, defer: true });
+      expect(r.reason).toMatch(/ledger-head-unverifiable/);
+    }
+  });
+
+  it.each(AUTHS)('%s: missing/empty/non-string current coverage head defers', (authority) => {
+    for (const coverage of [undefined, null, {}, { headSha: '' }, { headSha: 42 }, { headSha: {} }]) {
+      const r = run({ folded: { clears: true, current: { coverage } } }, authority);
+      expect(r, JSON.stringify(coverage)).toMatchObject({ clear: false, defer: true });
+    }
+    expect(run({ folded: { clears: true, current: {} } }, authority)).toMatchObject({ clear: false, defer: true });
+  });
+
+  it.each(AUTHS)('%s: both head and coverage missing defers; reasons never echo malformed values', (authority) => {
+    const r = run({ head: null, folded: { clears: true, current: {} } }, authority);
+    expect(r).toMatchObject({ clear: false, defer: true });
+    const weird = run({ head: { sha: 'EVIL-\n`rm`' }, folded: { clears: true, current: { coverage: { headSha: 42 } } } }, authority);
+    expect(weird.defer).toBe(true);
+    expect(weird.reason).not.toMatch(/EVIL|rm|42/);
+  });
+
+  it.each(AUTHS)('%s: malformed holds (string/object/number/null) defer without throwing', (authority) => {
+    for (const holds of ['ledger-unreadable', { code: 'x' }, 3, null, true]) {
+      let r;
+      expect(() => { r = run({ derived: { clears: true, holds } }, authority); }, JSON.stringify(holds)).not.toThrow();
+      expect(r).toMatchObject({ clear: false, defer: true });
+      expect(r.reason).toMatch(/ledger-unreadable/);
+    }
+  });
+
+  it.each(AUTHS)('%s: undefined and empty holds with matching evidence still clear; ordinary holds stay non-deferred', (authority) => {
+    expect(run({ derived: { clears: true } }, authority)).toMatchObject({ clear: true, defer: false });
+    expect(run({ derived: { clears: true, holds: [] } }, authority)).toMatchObject({ clear: true, defer: false });
+    expect(run({ derived: { clears: false, holds: [{ code: 'verdict:changes' }] } }, authority)).toMatchObject({ clear: false, defer: false });
+  });
+
+  it('an existing hold stays a hold even when head/coverage are missing (no reclassification)', () => {
+    const r = decideLedgerGate({ folded: { clears: true, current: {} }, derived: { clears: false, holds: [{ code: 'verdict:changes' }] }, head: null, labelsClear: true, authority: 'ledger' });
+    expect(r).toMatchObject({ clear: false, defer: false });
+  });
+
+  it('labels authority returns before inspecting ledger evidence, even when malformed', () => {
+    for (const labelsClear of [true, false]) {
+      const r = decideLedgerGate({ folded: { clears: true, current: {} }, derived: { clears: true, holds: 'junk' }, head: null, labelsClear, authority: 'labels' });
+      expect(r).toMatchObject({ clear: labelsClear, defer: false });
+    }
+    expect(decideLedgerGate({ folded: clearFolded, derived: clearDerived, head: null, labelsClear: false, authority: 'both' }).clear).toBe(false);
+  });
+
+  it('unknown authority is read as both: still defers on missing head, still holds on labels hold', () => {
+    expect(run({ head: null }, 'bogus')).toMatchObject({ clear: false, defer: true });
+    expect(decideLedgerGate({ folded: clearFolded, derived: clearDerived, head: sha, labelsClear: false, authority: 'bogus' })).toMatchObject({ clear: false, defer: false });
+  });
+
+  it('a different head is still a non-deferred mismatch hold (exact string compare, no normalisation)', () => {
+    expect(run({ head: 'bbb' }, 'ledger')).toMatchObject({ clear: false, defer: false });
+    expect(run({ head: 'AAA' }, 'ledger')).toMatchObject({ clear: false, defer: false });
+    expect(run({ head: 'aaa' }, 'ledger')).toMatchObject({ clear: true, defer: false });
+  });
+
+  it('review exemption: clears with a usable head and no current verdict; needs a head; a current verdict cannot use the flag to skip coverage', () => {
+    for (const authority of AUTHS) {
+      expect(run({ folded: exemptFolded, derived: exemptDerived }, authority)).toMatchObject({ clear: true, defer: false });
+      expect(run({ folded: exemptFolded, derived: exemptDerived, head: 'aaa' }, authority)).toMatchObject({ clear: true });
+      for (const head of [undefined, null, '', { sha: '' }, { sha: 7 }]) {
+        expect(run({ folded: exemptFolded, derived: exemptDerived, head }, authority), JSON.stringify(head)).toMatchObject({ clear: false, defer: true });
+      }
+      const bypass = run({ folded: { clears: true, current: {} }, derived: { ...exemptDerived } }, authority);
+      expect(bypass).toMatchObject({ clear: false, defer: true });
+      const bypass2 = run({ folded: { clears: false, current: { coverage: {} } }, derived: { ...exemptDerived } }, authority);
+      expect(bypass2.clear).toBe(false);
+    }
+  });
+
+  it('invariant over a head × coverage grid: clear implies both are non-empty strings and exactly equal; the equal pair clears', () => {
+    const shapes = [undefined, null, '', 'aaa', 'AAA', 'bbb', 42, {}, { sha: '' }, { sha: 'aaa' }, { sha: 'bbb' }, { sha: 9 }, ['aaa']];
+    const covShapes = [undefined, null, '', 'aaa', 'bbb', 42, {}, ['aaa']];
+    let positives = 0;
+    for (const authority of AUTHS) for (const head of shapes) for (const cov of covShapes) {
+      const r = decideLedgerGate({ folded: { clears: true, current: { coverage: { headSha: cov } } }, derived: clearDerived, head, labelsClear: true, authority });
+      if (r.clear) {
+        positives += 1;
+        const h = typeof head === 'string' ? head : head?.sha;
+        expect(typeof h === 'string' && h.length > 0 && typeof cov === 'string' && h === cov, JSON.stringify([head, cov])).toBe(true);
+      }
+      expect(r.clear && r.defer).toBe(false);
+    }
+    expect(positives).toBeGreaterThan(0);
+  });
+});
+
 describe('mergeGate.reviewAuthority setting', () => {
   it('defaults to labels and is one of the declared values', () => {
     expect(DEFAULT_REVIEW_AUTHORITY).toBe('labels');

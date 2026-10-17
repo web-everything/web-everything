@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { describe, it, expect } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -17,20 +18,36 @@ const policyOf = (strategy) => ({ policy: resolveMergeDeliveryPolicy({ tool: str
 
 const DRAIN = 'drain-bot';
 
-function harness({ strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock } = {}) {
+function harness({ strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = process.env, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false }, requestRedTeam } = {}) {
   const calls = [];
   const logs = [];
   let stored = initial;
-  const exec = (cmd, args) => {
+  let mutated = false;
+  let removed = false;
+  const exec = (cmd, args, opts) => {
     calls.push([cmd, ...args]);
+    if (args.includes('--slurp')) {
+      // Exercise Node's real output-buffer limit for the oversized-thread regression.
+      const out = JSON.stringify([liveComments ?? ghView[args[2]]?.comments ?? []]);
+      if (Buffer.byteLength(out) > 1024 * 1024) return execFileSync(process.execPath,
+        ['-e', 'process.stdin.pipe(process.stdout)'], { ...opts, input: out, stdio: ['pipe', 'pipe', 'pipe'] });
+      return out;
+    }
     if (args[0] === 'pr' && args[1] === 'merge') throw new Error('merge API must never be called');
     if (args[0] === 'pr' && args[1] === 'comment') return '';
     if (args[0] === 'api' && args[1] === 'user') { if (selfLogin == null) throw new Error('gh: not logged in'); return `${selfLogin}\n`; }
     if (cmd === 'git') return args[0] === 'diff' ? 'scripts/x.mjs\0' : ''; // the pinned change list of the judged head
-    if (args[0] === 'pr' && args[1] === 'view' && args.includes('id,headRefOid,baseRefName')) return JSON.stringify({ id: 'PR_NODE', headRefOid: HEAD, baseRefName: 'main' });
+    if (args[0] === 'pr' && args[1] === 'view' && args.includes('id,headRefOid,baseRefName')) return JSON.stringify({ id: 'PR_NODE', headRefOid: HEAD, baseRefName: 'main', labels: ['ready-to-merge'] });
     if (args[0] === 'pr' && args[1] === 'view' && viewThrows.includes(Number(args[2]))) throw new Error('gh: HTTP 502');
-    if (args[0] === 'pr' && args[1] === 'view') { onView[args[2]]?.(); return JSON.stringify(ghView[args[2]] ?? { state: 'OPEN' }); }
+    if (args[0] === 'pr' && args[1] === 'view') { onView[args[2]]?.(); return JSON.stringify(ghView[args[2]] ?? { state: 'OPEN', headRefOid: HEAD, labels, id: 'PR_NODE' }); }
     if (args[0] === 'api' && args[1] === 'graphql') {
+      if (args.some(a => a.includes('mergeQueue(branch:'))) return JSON.stringify(queueFacts ?? { data: { repository: { mergeQueue: { entries: {
+        nodes: !removed && queued ? [{ pullRequest: { id: 'PR_NODE', number: 5283 } }] : [], pageInfo: { hasNextPage: false },
+      } } } } });
+      if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: !removed && (queued || mutated) && (inQueue ?? true), headRefOid: HEAD } } } });
+      if (args.some(a => a.includes('dequeuePullRequest'))) { removed = true; return JSON.stringify({ data: { dequeuePullRequest: { clientMutationId: null } } }); }
+      mutated = true;
+      if (mutation) return JSON.stringify(mutation);
       if (enqueueFails) return JSON.stringify({ errors: [{ message: 'Pull request is not mergeable' }] });
       return JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'E', position: 1, state: 'QUEUED' } } } });
     }
@@ -39,9 +56,9 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
   const readFile = () => { if (stored == null) { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; } return JSON.stringify(stored); };
   const writeState = (_p, s) => { stored = JSON.parse(JSON.stringify(s)); };
   const s = createDrainMergeStrategy({
-    dryRun, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
+    dryRun, env, readRedTeamEvidence: () => evidence, requestRedTeam, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
     cancelObsoleteRuns: () => {}, batching: { gate: () => ({ admit: true }), observe: () => ({}) },
-    resolved: policyOf(strategy), log: { write: (l) => logs.push(l) }, readFile, writeState, ...(withLock ? { withLock } : {}),
+    postConflictFinding, ...(now ? { now } : {}), resolved: policyOf(strategy), log: { write: (l) => logs.push(l) }, readFile, writeState, ...(withLock ? { withLock } : {}),
   });
   // `peer` = a second drain process writing the same state file (its own enqueue) at any moment, as `onView` does mid-collect.
   const peerEnqueue = (entry) => { const cur = stored ? JSON.parse(JSON.stringify(stored)) : { pending: [], followedUp: [] }; cur.pending.push(entry); stored = cur; };
@@ -82,14 +99,68 @@ describe('drain merge strategy — github-merge-queue', () => {
     expect(calls.some((c) => c[1] === 'pr' && c[2] === 'merge')).toBe(false);
     const comment = calls.find((c) => c[1] === 'pr' && c[2] === 'comment');
     expect(comment).toContain(buildClearanceComment(HEAD));
-    const gql = calls.find((c) => c[1] === 'api' && c[2] === 'graphql');
+    const gql = calls.find((c) => c.includes('id=PR_NODE'));
     expect(gql).toEqual(expect.arrayContaining(['id=PR_NODE', `sha=${HEAD}`]));
-    expect(calls.findIndex((c) => c[2] === 'comment')).toBeLessThan(calls.findIndex((c) => c[1] === 'api' && c[2] === 'graphql'));
+    expect(calls.findIndex((c) => c[2] === 'comment')).toBeGreaterThan(calls.findIndex((c) => c[1] === 'api' && c[2] === 'graphql'));
     expect(state().pending).toEqual([expect.objectContaining({ num: 42, repo: null, headSha: HEAD, item: 'x1' })]);
   });
 
+  it('routes the exact #5169 refusal to conflict repair without a clearance', () => {
+    const findings = [];
+    const message = 'Pull request has merge conflicts and Pull request not in mergeable state';
+    const h = harness({ strategy: 'github-merge-queue', mutation: { errors: [{ type: 'UNPROCESSABLE', message }], data: { enqueuePullRequest: null } }, postConflictFinding: x => findings.push(x) });
+    expect(() => h.s.enqueue({ num: 5169 }, HEAD)).toThrow(message);
+    expect(h.calls.filter(c => c[2] === 'comment')).toHaveLength(0);
+    expect(findings).toEqual([expect.objectContaining({ pr: expect.objectContaining({ number: 5169 }), repo: LOCAL })]);
+    expect(h.logs.join('')).toContain(message);
+    expect(h.state().enqueueFailures['cwd#5169']).toMatchObject({ error: message, kind: 'conflict' });
+  });
+
+  it('does not stamp a success contradicted by live queue membership', () => {
+    const h = harness({ strategy: 'github-merge-queue', inQueue: false });
+    expect(() => h.s.enqueue({ num: 42 }, HEAD)).toThrow(/unconfirmed/);
+    expect(h.calls.filter(c => c[2] === 'comment')).toHaveLength(0);
+    expect(h.state().pending).toEqual([]);
+  });
+
+  it('dedupes clearance across passes even with stale or unread comments', () => {
+    const h = harness({ strategy: 'github-merge-queue' });
+    h.s.enqueue({ num: 42 }, HEAD, { comments: [] });
+    const next = harness({ strategy: 'github-merge-queue', initial: h.state() });
+    next.s.enqueue({ num: 42 }, HEAD, { comments: [] });
+    expect(h.calls.filter(c => c[2] === 'comment')).toHaveLength(1);
+    expect(next.calls.filter(c => c[2] === 'comment')).toHaveLength(0);
+  });
+
+  it('backs off across restarts, surfaces a health smell at the cascade threshold, and resets on a new head', () => {
+    const mutation = { errors: [{ message: 'GitHub temporarily unavailable\nretry later' }] };
+    const first = harness({ strategy: 'github-merge-queue', mutation, now: () => 0 });
+    expect(() => first.s.enqueue({ num: 42 }, HEAD)).toThrow('GitHub temporarily unavailable');
+    const wait = harness({ strategy: 'github-merge-queue', mutation, initial: first.state(), now: () => 1 });
+    expect(wait.s.enqueue({ num: 42 }, HEAD)).toMatchObject({ enqueued: false, kind: 'enqueue-backoff' });
+    expect(wait.calls).toEqual([]);
+    const second = harness({ strategy: 'github-merge-queue', mutation, initial: wait.state(), now: () => 60_000 });
+    expect(() => second.s.enqueue({ num: 42 }, HEAD)).toThrow();
+    expect(second.state().enqueueFailures['cwd#42'].retryAt).toBe(180_000);
+    const third = harness({ strategy: 'github-merge-queue', mutation, initial: second.state(), now: () => 180_000 });
+    expect(() => third.s.enqueue({ num: 42 }, HEAD)).toThrow();
+    expect(third.state().enqueueFailures['cwd#42']).toMatchObject({ count: 3, healthSmell: true, smellSource: 'standard', error: mutation.errors[0].message });
+    expect(third.logs.join('')).toContain('enqueueFailureSmellAfter=3, standard');
+    const changed = structuredClone(third.state());
+    changed.enqueueFailures['cwd#42'].headSha = 'c'.repeat(40);
+    const next = harness({ strategy: 'github-merge-queue', mutation, initial: changed, now: () => 180_001 });
+    expect(() => next.s.enqueue({ num: 42 }, HEAD)).toThrow();
+    expect(next.state().enqueueFailures['cwd#42'].count).toBe(1);
+  });
+
+  it('uses a live trusted clearance after a crash before the local stamp record', () => {
+    const h = harness({ strategy: 'github-merge-queue', liveComments: stampedBy(DRAIN) });
+    h.s.enqueue({ num: 42 }, HEAD, { comments: [] });
+    expect(h.calls.filter(c => c[2] === 'comment')).toHaveLength(0);
+  });
+
   it('does not re-stamp a clearance already on the PR for this head', () => {
-    const { s, calls } = harness({ strategy: 'github-merge-queue' });
+    const { s, calls } = harness({ strategy: 'github-merge-queue', liveComments: stampedBy(DRAIN) });
     s.enqueue({ num: 42, repo: null }, HEAD, { comments: stampedBy(DRAIN) });
     expect(calls.some((c) => c[2] === 'comment')).toBe(false);
   });
@@ -128,7 +199,8 @@ describe('drain merge strategy — github-merge-queue', () => {
     const { s, calls, state } = harness({ strategy: 'github-merge-queue', enqueueFails: true });
     expect(() => s.enqueue({ num: 42, repo: null }, HEAD, { comments: [] })).toThrow(/enqueue FAILED .*NOT merged directly/);
     expect(calls.some((c) => c[1] === 'pr' && c[2] === 'merge')).toBe(false);
-    expect(state()).toBeNull();
+    expect(state().pending).toEqual([]);
+    expect(calls.filter(c => c[2] === 'comment')).toHaveLength(0);
   });
 
   it('refuses an unpinned head and a sibling-repo PR', () => {
@@ -244,10 +316,13 @@ describe('drain merge strategy — github-merge-queue', () => {
     let broken = false;
     let writes = 0;
     const exec = (cmd, args) => {
+      if (args.includes('--slurp')) return JSON.stringify([[]]);
       if (args[0] === 'pr' && args[1] === 'comment') return '';
       if (cmd === 'git') return args[0] === 'diff' ? 'scripts/x.mjs\0' : '';
-      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ id: 'PR_NODE', headRefOid: HEAD, baseRefName: 'main' });
-      if (args[0] === 'api' && args[1] === 'graphql') { broken = true; return JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'E', position: 1, state: 'QUEUED' } } } }); }
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ id: 'PR_NODE', headRefOid: HEAD, baseRefName: 'main', labels: ['ready-to-merge'] });
+      if (args[0] === 'api' && args[1] === 'graphql') {
+      if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: broken, headRefOid: HEAD } } } });
+      broken = true; return JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'E', position: 1, state: 'QUEUED' } } } }); }
       throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
     };
     const logs = [];
@@ -263,7 +338,7 @@ describe('drain merge strategy — github-merge-queue', () => {
 
     // the file is fixed; the next pass finds the PR already queued and records it, keeping #9
     broken = false;
-    const exec2 = (cmd, args) => (args[0] === 'api' && args[1] === 'graphql' ? JSON.stringify({ errors: [{ message: 'Pull request is already in the merge queue' }] }) : exec(cmd, args));
+    const exec2 = (cmd, args) => (args.some(a => a.includes('isInMergeQueue')) ? JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: true, headRefOid: HEAD } } } }) : exec(cmd, args));
     const s2 = createDrainMergeStrategy({
       isLocalRepo: () => true, localSlug: LOCAL, statePath: '/x/state.json', resolved: policyOf('github-merge-queue'), exec: exec2,
       log: { write: (l) => logs.push(l) }, readFile: () => JSON.stringify(stored),
@@ -494,5 +569,215 @@ describe('merge-ai-prs hook wiring', () => {
     expect(block).toContain('mergeStrategy.enqueues(c.repo) ? { runUnlockedOnContention: false } : {}');
     expect(block).toContain('if (landLock.ran === false)');
     expect(src.slice(src.indexOf('if (landLock.ran === false)'), src.indexOf('if (landLock.contended', at))).toMatch(/decision = 'skip'; continue;/);
+  });
+});
+
+
+describe('post-accept red-team enqueue barrier (#5283)', () => {
+  it.each(['speculative running', 'required but not started'])('does not enqueue or stamp while %s', () => {
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'] });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deferred: true, kind: 'red-team-pending' });
+    expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
+    expect(h.calls.some(c => c[2] === 'comment')).toBe(false);
+  });
+  it.each([{ author: { login: 'web-everything' } }, { user: { login: 'web-everything[bot]' } }])('enqueues after a trusted clean result for the live head (%j)', identity => {
+    const result = { ...identity, body: `<!-- we:red-team-advisory pr=5283 rev=${HEAD} -->\n### Post-accept red team — no break found` };
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], liveComments: [result] });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [result] })).toMatchObject({ enqueued: true });
+  });
+  it('reads a complete comment thread larger than 1 MiB', () => {
+    const result = { user: { login: 'web-everything[bot]' }, body: `<!-- we:red-team-advisory pr=5283 rev=${HEAD} -->\n### Post-accept red team — no break found` };
+    const bulk = Array.from({ length: 24 }, () => ({ user: { login: 'someone' }, body: 'x'.repeat(50_000) }));
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], liveComments: [result, ...bulk] });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [result] })).toMatchObject({ enqueued: true });
+    // The clearance dedupe read is the same complete-thread read: it must not defer the stamp either.
+    expect(h.logs.join('')).not.toContain('clearance dedupe read failed');
+    expect(h.calls.filter(c => c[2] === 'comment')).toHaveLength(1);
+  });
+  it('enqueues on a REST-shaped carried clean result (carryAcrossRebase)', () => {
+    const prior = 'a'.repeat(40);
+    const carried = { user: { login: 'web-everything[bot]' }, body: [
+      `<!-- review-verdict-carried from=${prior} to=${HEAD} patch-id=${'c'.repeat(40)} -->`,
+      'Review verdict carried across an identical contribution.',
+      `<!-- we:red-team-advisory pr=5283 rev=${HEAD} -->`, '### Post-accept red team — no break found'].join('\n') };
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], liveComments: [carried] });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [carried] })).toMatchObject({ enqueued: true });
+  });
+  it('a real round-cap record followed by the clear-human renderer releases admission before retry backoff', async () => {
+    const { applyRedTeamGate } = await import('../../operations/red-team-gate-apply.mjs');
+    const { renderRedTeamComment } = await import('../../operations/review-extra-seats.mjs');
+    const { buildVerdictComment } = await import('../../review-set-label.mjs');
+    const { CONFIRMED_BREAKS_DEFAULTS } = await import('../red-team-gate.mjs');
+    const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
+      pr: 5283, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+      findings: [{ summary: 'known risk', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }],
+    }) }];
+    const labels = ['review:accepted', 'ready-to-merge'];
+    const gate = await applyRedTeamGate({ repo: LOCAL, pr: 5283 }, {
+      readPr: () => ({ headRefOid: HEAD, labels: ['review:human'], comments: thread }),
+      readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }), readRound: () => 5,
+      postComment: ({ body }) => thread.push({ user: { login: 'web-everything[bot]' }, body }),
+    });
+    expect(gate.outcome).toBe('round-cap');
+    const h = harness({ strategy: 'github-merge-queue', labels, liveComments: thread, now: () => 1000 });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: thread })).toMatchObject({ kind: 'red-team-pending' });
+    thread.push({ user: { login: 'web-everything[bot]' }, body: buildVerdictComment({
+      to: 'clear-human', actor: 'operator', headSha: HEAD, reason: 'accept the documented known risk',
+    }) });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: thread })).toMatchObject({ enqueued: true });
+  });
+  it('keeps an untrusted REST clean marker pending without enqueue or clearance', () => {
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'],
+      liveComments: [{ user: { login: 'mallory[bot]' }, body: `<!-- we:red-team-advisory pr=5283 rev=${HEAD} -->\n### Post-accept red team — no break found` }] });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ kind: 'red-team-pending' });
+    expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')) || c[2] === 'comment')).toBe(false);
+  });
+  it('backs off complete comment reads across restarts, then retries at 300 seconds', () => {
+    let clock = 1_000;
+    const options = { strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], now: () => clock };
+    const first = harness(options);
+    first.s.enqueue({ num: 5283 }, HEAD, { comments: [] });
+    const next = harness({ ...options, initial: first.state() });
+    clock += 180_000;
+    expect(next.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ kind: 'red-team-pending', healthSmell: false });
+    expect(next.calls.filter(c => c.includes('--slurp'))).toHaveLength(0);
+    clock += 120_000;
+    next.s.enqueue({ num: 5283 }, HEAD, { comments: [] });
+    expect(next.calls.filter(c => c.includes('--slurp'))).toHaveLength(1);
+    expect(next.state().redTeamPending['cwd#5283'].firstPendingAt).toBe(1_000);
+    expect(next.logs.join('')).toContain('redTeamPendingBackoffSec=300 (standard)');
+  });
+  it('a new observed comment wakes the held head before backoff and clears pending on success', () => {
+    const options = { strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], now: () => 1_000 };
+    const first = harness(options);
+    first.s.enqueue({ num: 5283 }, HEAD, { comments: [] });
+    const result = { user: { login: 'web-everything[bot]' }, body: `<!-- we:red-team-advisory pr=5283 rev=${HEAD} -->\n### Post-accept red team — no break found` };
+    const next = harness({ ...options, initial: first.state(), liveComments: [result] });
+    expect(next.s.enqueue({ num: 5283 }, HEAD, { comments: [result] })).toMatchObject({ enqueued: true });
+    expect(next.state().redTeamPending['cwd#5283']).toBeUndefined();
+  });
+  it('raises a named health smell and enqueues a never-scheduled pass at the maximum, even during backoff', () => {
+    let clock = 1_000;
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], now: () => clock,
+      env: { WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC: '7200', WE_DRAIN_RED_TEAM_PENDING_MAX_MIN: '45' } });
+    h.s.enqueue({ num: 5283 }, HEAD);
+    clock += 45 * 60_000 - 1;
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ healthSmell: false });
+    clock += 1;
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: true });
+    expect(h.logs.join('')).toContain(`health smell: ${LOCAL}#5283 red-team-pending on ${HEAD}`);
+    expect(h.logs.join('')).toContain('redTeamPendingMaxMin=45, env');
+    expect(h.calls.filter(c => c.includes('--slurp'))).toHaveLength(3);
+    expect(h.logs.join('')).toContain('red team never scheduled');
+    expect(h.logs.join('')).toContain('enqueueWhenRedTeamNeverScheduled=true (standard)');
+  });
+  it.each([5439, 5443])('enqueues accepted #%s when the review scheduler owes no pass', num => {
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'],
+      evidence: { loopPayload: null, inFlight: false, recorded: false } });
+    expect(h.s.enqueue({ num }, HEAD)).toMatchObject({ enqueued: true });
+  });
+  it.each(['inFlight', 'recorded'])('continues waiting past the deadline with %s evidence', field => {
+    let clock = 1000;
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], now: () => clock,
+      evidence: { loopPayload: { verdict: { verdict: 'accept' } }, [field]: true } });
+    h.s.enqueue({ num: 5283 }, HEAD);
+    clock += 45 * 60_000;
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, healthSmell: true });
+    expect(h.logs.join('')).not.toContain('red team never scheduled');
+  });
+  it('requests an overdue missing pass through the supplied review dispatch path', () => {
+    let clock = 1000;
+    const requests = [];
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], now: () => clock,
+      requestRedTeam: input => { requests.push(input); return { requested: true }; } });
+    h.s.enqueue({ num: 5283 }, HEAD);
+    expect(requests).toHaveLength(0);
+    clock += 45 * 60_000;
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, healthSmell: true, redTeamRequested: true });
+    expect(requests).toEqual([expect.objectContaining({ repo: LOCAL, pr: 5283, head: HEAD })]);
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false });
+    expect(requests).toHaveLength(1);
+    clock += 45 * 60_000;
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: true });
+    expect(requests).toHaveLength(1);
+  });
+  it('honors the fallback switch and logs its source', () => {
+    let clock = 1000;
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], now: () => clock,
+      env: { WE_DRAIN_ENQUEUE_WHEN_RED_TEAM_NEVER_SCHEDULED: 'off' } });
+    h.s.enqueue({ num: 5283 }, HEAD);
+    clock += 45 * 60_000;
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, healthSmell: true });
+    expect(h.logs.join('')).toContain('enqueueWhenRedTeamNeverScheduled=false (env)');
+  });
+  it('a new live head resets the pending age and backoff', () => {
+    const initial = { pending: [], followedUp: [], redTeamPending: { 'cwd#5283': {
+      headSha: 'a'.repeat(40), firstPendingAt: 0, retryAt: 99_000_000, commentCount: 0, reason: 'pending' } } };
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], initial, now: () => 5_000_000 });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ healthSmell: false });
+    expect(h.calls.filter(c => c.includes('--slurp'))).toHaveLength(1);
+    expect(h.state().redTeamPending['cwd#5283']).toMatchObject({ headSha: HEAD, firstPendingAt: 5_000_000 });
+    h.s.confirmQueueFollowUps([{ num: 999, repo: null }]);
+    expect(h.state().followedUp).toContain('cwd#999');
+    expect(h.state().redTeamPending['cwd#5283'].firstPendingAt).toBe(5_000_000);
+  });
+  it('keeps enqueue unchanged when no accepted panel owes a red team', () => {
+    const h = harness({ strategy: 'github-merge-queue', labels: ['ready-to-merge'], evidence: { loopPayload: null } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: true });
+  });
+  it.each([[[]], [['review:changes']], [['review:human']], [['review:pending']]])('the follow-up backstop dequeues a queued sent-back PR (%j) once', labels => {
+    const h = harness({ strategy: 'github-merge-queue', queued: true, labels, initial: { pending: [{ num: 5283, headSha: HEAD }], followedUp: [] } });
+    h.s.collectQueueMerged({ merged: [], landedThisPass: new Set() });
+    h.s.collectQueueMerged({ merged: [], landedThisPass: new Set() });
+    expect(h.calls.filter(c => c.some(a => String(a).includes('dequeuePullRequest')))).toHaveLength(1);
+    expect(h.calls.filter(c => c[2] === 'comment')).toHaveLength(1);
+  });
+});
+
+
+describe('queue safeguard overrides and untracked queue entries', () => {
+  it.each(['WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE', 'WE_REVIEW_RED_TEAM', 'WE_REVIEW_EXTRA_SEATS'])('%s off preserves enqueue without a red-team result', key => {
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], env: { ...process.env, [key]: '0' } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: true });
+  });
+  it('dequeueOnSendBack off leaves queued send-backs untouched', () => {
+    const h = harness({ strategy: 'github-merge-queue', queued: true, labels: [], initial: { pending: [{ num: 5283, headSha: HEAD }], followedUp: [] }, env: { ...process.env, WE_DRAIN_DEQUEUE_ON_SEND_BACK: 'false' } });
+    h.s.collectQueueMerged({ merged: [], landedThisPass: new Set() });
+    h.s.dequeueSendBacks([{ number: 5283, labels: [] }]);
+    expect(h.calls.some(c => c.some(a => String(a).includes('dequeuePullRequest')))).toBe(false);
+  });
+  it.each([[[]], [['review:changes']], [['review:human']], [['review:pending']]])('bounds API calls for 150 non-queued open rows with labels %j', labels => {
+    const h = harness({ strategy: 'github-merge-queue', labels: [] });
+    h.s.dequeueSendBacks(Array.from({ length: 150 }, (_, i) => ({ number: i + 1, labels })));
+    expect(h.calls.length).toBeLessThanOrEqual(1);
+    expect(h.calls.some(c => c[1] === 'pr')).toBe(false);
+  });
+  it.each([
+    { errors: [{ message: 'rate limited' }] },
+    { data: { repository: { mergeQueue: null } } },
+    { data: { repository: { mergeQueue: { entries: { nodes: [{ pullRequest: { id: 'PR_NODE', number: 5283 } }], pageInfo: { hasNextPage: true } } } } } },
+  ])('does not fall back to per-row reads when queue discovery is incomplete', queueFacts => {
+    const h = harness({ strategy: 'github-merge-queue', labels: [], queued: true, queueFacts });
+    h.s.dequeueSendBacks([{ number: 5283, labels: [] }]);
+    expect(h.calls).toHaveLength(1);
+    expect(h.logs.join('')).toMatch(/queue.*failed/i);
+  });
+  it('revalidates only queued rows even in a large listing', () => {
+    const h = harness({ strategy: 'github-merge-queue', labels: [], queued: true });
+    h.s.dequeueSendBacks([...Array.from({ length: 150 }, (_, i) => ({ number: i + 1, labels: [] })), { number: 5283, labels: [] }]);
+    expect(h.calls.filter(c => c[1] === 'pr' && c[2] === 'view' && c.includes('headRefOid,labels'))).toHaveLength(1);
+    expect(h.calls.filter(c => c.some(a => String(a).includes('dequeuePullRequest')))).toHaveLength(1);
+  });
+  it.each([[[]], [['ready-to-merge', 'review:changes']], [['ready-to-merge', 'review:human']], [['ready-to-merge', 'review:pending']]])('sweeps a manually queued PR without a follow-up record and with labels %j once', labels => {
+    const h = harness({ strategy: 'github-merge-queue', queued: true, labels });
+    h.s.dequeueSendBacks([{ number: 5283, labels }]);
+    h.s.dequeueSendBacks([{ number: 5283, labels }]);
+    expect(h.calls.filter(c => c.some(a => String(a).includes('dequeuePullRequest')))).toHaveLength(1);
+    expect(h.calls.filter(c => c[2] === 'comment')).toHaveLength(1);
+  });
+  it('revalidates labels so an old listing cannot dequeue a newly ready PR', () => {
+    const h = harness({ strategy: 'github-merge-queue', queued: true });
+    h.s.dequeueSendBacks([{ number: 5283, labels: [] }]);
+    expect(h.calls.some(c => c.some(a => String(a).includes('dequeuePullRequest')))).toBe(false);
   });
 });

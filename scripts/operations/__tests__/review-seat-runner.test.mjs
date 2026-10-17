@@ -253,8 +253,8 @@ describe('the agreement report (#76a identity, #76b sameAs through the PR table)
     ];
     const summary = summarizeShadowAgreement(rows);
     expect(summary).toEqual([
-      { lens: 'correctness', runs: 3, compared: 2, voided: 1, failed: 0, held: 0, verdictAgreement: 0.5, meanFindingOverlap: 0.75, prs: 2 },
-      { lens: 'security', runs: 1, compared: 0, voided: 0, failed: 1, held: 0, verdictAgreement: null, meanFindingOverlap: null, prs: 1 },
+      { lens: 'correctness', runs: 3, compared: 2, voided: 1, failed: 0, held: 0, skipped: 0, verdictAgreement: 0.5, meanFindingOverlap: 0.75, prs: 2 },
+      { lens: 'security', runs: 1, compared: 0, voided: 0, failed: 1, held: 0, skipped: 0, verdictAgreement: null, meanFindingOverlap: null, prs: 1 },
     ]);
     expect(renderShadowReport(summary).join('\n')).toContain('correctness: 3 run(s) on 2 PR(s) — 2 compared, 1 voided');
   });

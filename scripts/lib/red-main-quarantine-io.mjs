@@ -87,10 +87,18 @@ export function writeQuarantineChange({ board = process.cwd(), actor, change, me
 /** The safety net's writer name (one of QUARANTINE_WRITERS). */
 export const SAFETY_NET_ACTOR = 'red-main-safety-net';
 /** Env overrides (the cascade's top layer) for the safety-net knobs. */
-export const QUARANTINE_SETTINGS_ENV = Object.freeze({ ttlMin: 'WE_RED_MAIN_QUARANTINE_TTL_MIN', maxTests: 'WE_RED_MAIN_QUARANTINE_MAX_TESTS', unitJobPattern: 'WE_RED_MAIN_QUARANTINE_UNIT_JOB_PATTERN', derivedJobs: 'WE_RED_MAIN_QUARANTINE_DERIVED_JOBS' });
+export const QUARANTINE_SETTINGS_ENV = Object.freeze({
+  ttlMin: 'WE_RED_MAIN_QUARANTINE_TTL_MIN',
+  maxTests: 'WE_RED_MAIN_QUARANTINE_MAX_TESTS',
+  unitJobPattern: 'WE_RED_MAIN_QUARANTINE_UNIT_JOB_PATTERN',
+  derivedJobs: 'WE_RED_MAIN_QUARANTINE_DERIVED_JOBS',
+  requireProvenFlake: 'WE_RED_MAIN_QUARANTINE_REQUIRE_PROVEN_FLAKE',
+  fileCardPerEntry: 'WE_RED_MAIN_QUARANTINE_FILE_CARD_PER_ENTRY',
+});
 const posInt = (v) => Number.isInteger(v) && v > 0;
 const QUARANTINE_SETTINGS_VALID = Object.freeze({
   ttlMin: posInt, maxTests: posInt,
+  requireProvenFlake: (v) => typeof v === 'boolean', fileCardPerEntry: (v) => typeof v === 'boolean',
   unitJobPattern: (v) => { try { return typeof v === 'string' && v !== '' && !!new RegExp(v); } catch { return false; } },
   derivedJobs: (v) => Array.isArray(v) && v.every((x) => typeof x === 'string' && x !== ''),
 });
@@ -106,11 +114,16 @@ export function resolveQuarantineSettings({ env = process.env, file = RED_MAIN_H
   try { tool = JSON.parse(readFileSync(file, 'utf8'))?.redMainQuarantine; } catch { /* standard */ }
   const num = (k) => { const raw = env?.[QUARANTINE_SETTINGS_ENV[k]]; if (raw == null || String(raw).trim() === '') return undefined; const n = Number(raw); return Number.isFinite(n) ? n : raw; };
   const str = (k) => { const raw = env?.[QUARANTINE_SETTINGS_ENV[k]]; return raw == null || String(raw).trim() === '' ? undefined : String(raw); };
+  const bool = (k) => { const raw = str(k); return raw === 'on' ? true : raw === 'off' ? false : raw; };
   const derivedRaw = str('derivedJobs');
   const c = cascadePolicy('redMainQuarantine', tool, {
     env, ...(platform !== undefined ? { platform } : {}),
     standard: { ...QUARANTINE_SAFETY_NET_DEFAULTS, derivedJobs: [...QUARANTINE_SAFETY_NET_DEFAULTS.derivedJobs] },
-    envValues: { ttlMin: num('ttlMin'), maxTests: num('maxTests'), unitJobPattern: str('unitJobPattern'), derivedJobs: derivedRaw === undefined ? undefined : derivedRaw.split(',').map((s) => s.trim()).filter(Boolean) },
+    envValues: {
+      requireProvenFlake: bool('requireProvenFlake'), fileCardPerEntry: bool('fileCardPerEntry'),
+      ttlMin: num('ttlMin'), maxTests: num('maxTests'), unitJobPattern: str('unitJobPattern'),
+      derivedJobs: derivedRaw === undefined ? undefined : derivedRaw.split(',').map((s) => s.trim()).filter(Boolean),
+    },
     valid: QUARANTINE_SETTINGS_VALID,
   });
   // `derivedJobs` is an array leaf; every other knob a scalar leaf — `sources` keys them by name.
@@ -133,10 +146,51 @@ export const STAMP_RECHECK_MS = 15 * 60_000;
 const readJson = (path) => { try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; } };
 
 /** One CI run's failed jobs `{failed:[{id,name}]}` (`gh api …/runs/<id>/jobs`). Throws on an unreadable read. */
-export function readFailedJobs(runId, { exec, repoSlug }) {
-  const page = JSON.parse(String(exec('gh', ['api', `repos/${repoSlug}/actions/runs/${runId}/jobs?per_page=100`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL' }) || 'null'));
-  const jobs = Array.isArray(page?.jobs) ? page.jobs : [];
-  return { failed: jobs.filter((j) => ['failure', 'timed_out'].includes(String(j.conclusion))).map((j) => ({ id: j.id, name: String(j.name) })) };
+export function readFailedJobs(runId, { exec, repoSlug, filter = 'latest' }) {
+  const jobs = [];
+  for (let page = 1; ; page += 1) {
+    const response = JSON.parse(String(exec('gh', ['api', `repos/${repoSlug}/actions/runs/${runId}/jobs?per_page=100&filter=${filter}&page=${page}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL' }) || 'null'));
+    if (!Array.isArray(response?.jobs)) throw new Error('jobs unreadable');
+    jobs.push(...response.jobs);
+    if (response.jobs.length < 100) break;
+  }
+  return { jobs, failed: jobs.filter((j) => ['failure', 'timed_out'].includes(String(j.conclusion))).map((j) => ({ id: j.id, name: String(j.name) })) };
+}
+
+/**
+ * Best effort: only the latest attempt of a job can prove it passed. Only a green re-run on the failing commit
+ * itself proves a flake — another, earlier run of the same sha whose latest attempt of the job passed (a job that
+ * passes on a re-run of the failing run leaves `failedJobs` instead). A green merge group (`failing.groupEvidence`)
+ * is never proof: it tested its queued PR's changes on top of main, and that PR may be the very fix for the
+ * failure (PR #5283 red team).
+ */
+function readFlakeProof(mainCiRuns, { readJobs, now }) {
+  const proof = Object.create(null);
+  const runs = mainCiRuns?.runs ?? [];
+  const failing = runs.find((r) => r.databaseId === mainCiRuns?.failing?.runId);
+  if (!Number.isFinite(now) || typeof failing?.headSha !== 'string' || !/^[0-9a-f]{7,64}$/i.test(failing.headSha)) return proof;
+  const timestamp = (value) => typeof value === 'string' ? Date.parse(value) : NaN;
+  const failingCreatedAt = timestamp(failing.createdAt);
+  for (const run of runs) {
+    const createdAt = timestamp(run.createdAt);
+    const updatedAt = timestamp(run.updatedAt);
+    if (run.headSha !== failing.headSha || (run.attempt !== undefined && !(run.attempt > 1))
+      || !Number.isFinite(failingCreatedAt) || !Number.isFinite(createdAt) || !Number.isFinite(updatedAt)
+      || createdAt > failingCreatedAt || updatedAt < createdAt || updatedAt > now) continue;
+    try {
+      const result = readJobs(run.databaseId, { filter: 'all' });
+      const latest = new Map();
+      for (const job of result?.jobs ?? []) {
+        if (!Number.isInteger(job.run_attempt) || job.run_attempt < 1 || typeof job.name !== 'string') continue;
+        if (!latest.has(job.name) || job.run_attempt > latest.get(job.name).run_attempt) latest.set(job.name, job);
+      }
+      // gh run list omits attempt; jobs carry the run's attempt number.
+      const attempt = run.attempt ?? Math.max(0, ...[...latest.values()].map((j) => j.run_attempt));
+      if (!(attempt > 1)) continue;
+      for (const [name, job] of latest) if (job.conclusion === 'success' && job.run_attempt > 1) proof[name] = { kind: 'rerun-passed', runId: run.databaseId, attempt: job.run_attempt };
+    } catch { /* No readable proof. */ }
+  }
+  return proof;
 }
 
 /** One failed job's vitest failures from its log (`gh api …/jobs/<id>/logs`). Throws on an unreadable log. */
@@ -189,7 +243,7 @@ const composeChanges = (steps) => (cur) => {
 export function runSafetyNet({
   mainCiRuns, now = Date.now(), dir, board = process.cwd(), live = true, repoSlug = CONSTELLATION_REPOS.we.slug,
   mode = resolveRedMainMode(), settings = resolveQuarantineSettings(),
-  exec = execFileSyncThrottled, readJobs = (runId) => readFailedJobs(runId, { exec, repoSlug }),
+  exec = execFileSyncThrottled, readJobs = (runId, options = {}) => readFailedJobs(runId, { exec, repoSlug, ...options }),
   readLog = (jobId) => readJobFailures(jobId, { exec, repoSlug }),
   readList = () => readListOrAbsent({ board }), write = (o) => writeQuarantineChange({ board, ...o }), log = (l) => console.error(l),
 } = {}) {
@@ -202,9 +256,10 @@ export function runSafetyNet({
   ledger.reds ??= {};
   const isLive = mode.value === 'quarantine' && live === true;
   const state = mainRedState(mainCiRuns?.runs, { tip: mainCiRuns?.tip });
-  const out = { mode: mode.value, modeSource: mode.source, shadow: !isLive, settingsSources: settings.sources ?? {}, applied: false };
+  const out = { mode: mode.value, modeSource: mode.source, shadow: !isLive, settingsSources: settings.sources ?? {}, applied: false, liveEntries: [] };
   let sha = null;
   let activeKey = null;
+  let shadowChanged = false;
   try {
     // In `stop`, unless the ledger KNOWS (from a recent read) the list carries no `quarantine` stamp: read the list and
     // withdraw a live stamp, so CI (which reads the mode from the list) stops skipping at once, not at entry expiry.
@@ -273,17 +328,30 @@ export function runSafetyNet({
       if (read.list?.mode === 'quarantine') ledger.publishedMode = 'quarantine';
       else if (ledger.publishedMode !== 'quarantine') { ledger.publishedMode = 'stop'; ledger.publishedModeAt = now; }
     }
+    if (isLive && read.list?.mode === 'quarantine') out.liveEntries = activeEntries(read.list, { now });
+    const flakeProof = settings.value.requireProvenFlake && state.status === 'red' ? readFlakeProof(mainCiRuns, { readJobs, now }) : {};
     const pri = mainCiRuns?.priority;
     const fixPrs = pri ? (Array.isArray(pri.prs) ? pri.prs : [pri.pr]) : null;
     const plan = planSafetyNet({
-      status: state.status, firstRedSha: sha, failedJobs, jobFailures, list: read.list, fixPrs,
+      status: state.status, firstRedSha: sha, failedJobs, jobFailures, flakeProof, list: read.list, fixPrs,
       addedForRed: (isLive ? rec?.added : rec?.shadowAdded) ?? [], now, settings: settings.value,
     });
     out.plan = plan;
     const steps = [];
     const ttlMs = settings.value.ttlMin * 60_000;
     if (plan.action === 'add') {
-      steps.push((cur) => addEntries(cur, { tests: plan.tests, brokenSha: sha, owner: SAFETY_NET_ACTOR, reason: `main CI red since ${sha.slice(0, 9)}: ${plan.names.slice(0, 3).join(' | ')}`.slice(0, 400), actor: SAFETY_NET_ACTOR, now, ttlMs }));
+      steps.push((cur) => {
+        // Recheck the cap against the transport's fresh tip.
+        const liveFiles = activeEntries(cur, { now }).map((e) => e.test.split('::')[0]);
+        if (new Set([...liveFiles, ...plan.tests]).size > settings.value.maxTests) return { ok: false, error: `quarantine cap ${settings.value.maxTests} reached` };
+        const changes = plan.entries.map(({ test, job, proof }) => (list) => addEntries(list, { tests: [test], job, proof, brokenSha: sha, owner: SAFETY_NET_ACTOR, reason: `main CI red since ${sha.slice(0, 9)}: ${plan.names.slice(0, 3).join(' | ')}`.slice(0, 400), actor: SAFETY_NET_ACTOR, now, ttlMs }));
+        const result = composeChanges(changes)(cur);
+        if (result.ok && isLive) {
+          const added = new Set(result.events.filter((e) => e.type === 'quarantine-added').map((e) => e.test));
+          for (const card of plan.cards) if (added.has(card.test)) result.events.push({ type: 'card-owed', at: now, actor: SAFETY_NET_ACTOR, ...card });
+        }
+        return result;
+      });
     }
     if (plan.action === 'prune') steps.push((cur) => ({ ok: true, ...pruneOnGreen(cur, { mainGreen: plan.mainGreen, now, actor: SAFETY_NET_ACTOR }) }));
     if (plan.fixPrs) steps.push((cur) => setFixPrs(cur, { fixPrs: plan.fixPrs, actor: SAFETY_NET_ACTOR, now }));
@@ -312,18 +380,27 @@ export function runSafetyNet({
         return out;
       }
       let r;
+      let writtenList = null;
       try {
-        r = write({ actor: SAFETY_NET_ACTOR, message: `quarantine: ${what} (${plan.why})`, change });
+        r = write({ actor: SAFETY_NET_ACTOR, message: `quarantine: ${what} (${plan.why})`, change: (cur) => {
+          const result = change(cur);
+          if (result.ok) writtenList = result.list;
+          return result;
+        } });
       } catch (e) {
         // Roll the intent back only when the list is READABLE and holds none of these tests (the push really did not
         // land, so the next tick may retry). Landed, or unknown (unreadable): keep it — STOP holds rather than renew.
         if (intended.length) {
           let cur = null;
           try { cur = readList(); } catch { cur = null; }
-          if (cur?.ok && !(cur.list?.entries ?? []).some((en) => intended.includes(en.test))) rec.added = rec.added.filter((t) => !intended.includes(t));
+          if (cur?.ok) {
+            out.liveEntries = cur.list?.mode === 'quarantine' ? activeEntries(cur.list, { now }) : [];
+            if (!(cur.list?.entries ?? []).some((en) => intended.includes(en.test))) rec.added = rec.added.filter((t) => !intended.includes(t));
+          }
         }
         throw e;
       }
+      out.liveEntries = writtenList?.mode === 'quarantine' ? activeEntries(writtenList, { now }) : [];
       out.applied = true;
       out.events = r?.events ?? [];
     } else {
@@ -331,10 +408,7 @@ export function runSafetyNet({
       if (r.ok === false) { out.error = r.error; return out; }
       ledger.shadowList = r.list;
       out.events = r.events;
-      const line = { at: new Date(now).toISOString(), mode: mode.value, modeSource: mode.source, wouldDo: plan.action, tests: plan.tests ?? [], names: plan.names ?? [], fixPrs: plan.fixPrs ?? null, firstRedSha: sha, why: plan.why, settingsSources: settings.sources ?? {} };
-      mkdirSync(dirname(shadowPath), { recursive: true });
-      appendFileSync(shadowPath, JSON.stringify(line) + '\n');
-      log(`red-main-quarantine (shadow, redMainMode=${mode.value} from ${mode.source}): WOULD ${what} — ${plan.why}${plan.names?.length ? ` [${plan.names.slice(0, 3).join(' | ')}]` : ''}`);
+      shadowChanged = true;
     }
     // Live and shadow additions are tracked apart: a shadow "would add" must not block the first real add after a
     // stop → quarantine flip within the same red window.
@@ -347,6 +421,17 @@ export function runSafetyNet({
     out.error = String(e?.message || e).split('\n')[0];
     return out;
   } finally {
+    const rec = ledger.reds[activeKey];
+    if (!isLive && out.plan && (shadowChanged || (state.status === 'red' && rec && rec.shadowWhy !== out.plan.why))) {
+      const plan = out.plan;
+      const line = { at: new Date(now).toISOString(), mode: mode.value, modeSource: mode.source, wouldDo: plan.action, tests: plan.tests ?? [], entries: plan.entries ?? [], cards: plan.cards ?? [], names: plan.names ?? [], fixPrs: plan.fixPrs ?? null, firstRedSha: sha, why: plan.why, settingsSources: settings.sources ?? {} };
+      try {
+        mkdirSync(dirname(shadowPath), { recursive: true });
+        appendFileSync(shadowPath, JSON.stringify(line) + '\n');
+        if (rec) rec.shadowWhy = plan.why;
+        log(`red-main-quarantine (shadow, redMainMode=${mode.value} from ${mode.source}): WOULD ${plan.action}${plan.tests?.length ? ` ${plan.tests.join(', ')}` : ''} — ${plan.why}`);
+      } catch (e) { out.error = String(e?.message || e).split('\n')[0]; }
+    }
     // Forget red windows long over (two days since they were last seen red), so the ledger stays small. The window
     // that is red right now is never forgotten: its record is what keeps an expired entry from being re-added.
     for (const [k, v] of Object.entries(ledger.reds)) if (k !== activeKey && now -(Number(v?.seenAt ?? v?.at) || 0) > LEDGER_RETENTION_MS) delete ledger.reds[k];

@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { tailLines, PROJECTS_DIR } from '../../skills-src/inspect-agent-health/agent-health.mjs';
 import { redactCommandLine, REDACTED } from '../operations/command-redact.mjs';
 import { reduceCheckState } from '../operations/pr-status.mjs';
-import { DECLARED_REQUIRED_STATUS_CHECKS, FALLBACK_REQUIRED_STATUS_CHECKS } from './required-status-checks.mjs';
+import { DECLARED_REQUIRED_STATUS_CHECKS, FALLBACK_REQUIRED_STATUS_CHECKS, getRequiredStatusChecks } from './required-status-checks.mjs';
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 import { readFixDispatchClaim, fixDispatchSessionName } from '../conveyor/fix-claim-store.mjs';
 import { tryReadCompletion, resolveCompletionsDir } from '../operations/completion-store.mjs';
@@ -80,7 +80,7 @@ function repoOf(value) {
   if (!key) throw new Error(`readPrFacts: unknown repo ${JSON.stringify(String(value)).slice(0, 80)}`);
   return { key, slug: CONSTELLATION_REPOS[key].slug };
 }
-/** io may inject run(bin,argv), now(), env, home, root, agents (a shared listing), and repo (a constellation slug or key; default WE). */
+/** io may inject run(bin,argv), now(), env, home, root, agents (a shared listing), readRequiredChecks (default: the shared per-repo cache), and repo (a constellation slug or key; default WE). */
 export function readPrFacts(pr, io = {}) {
   const { key: repoKey, slug: repo } = repoOf(io.repo);
   const exec = io.run ?? run, env = io.env ?? process.env, home = io.home ?? homedir();
@@ -104,9 +104,20 @@ export function readPrFacts(pr, io = {}) {
   const tail = probe('GitHub head/comments', () => gh(['api', 'graphql', '-f', `query=${query}`]).data.repository.pullRequest, {});
   const commit = tail?.commits?.nodes?.[0]?.commit;
   if (commit?.oid && p.headRefOid && commit.oid !== p.headRefOid) errors.push('head changed during probes; rerun');
+  // The shared per-repo cache (rules ∪ classic, with its own declared/fallback degrade chain) — never a direct
+  // `…/protection` read per probe. An empty result is "unknown" below, not "nothing required".
+  const readRequiredChecks = io.readRequiredChecks ?? getRequiredStatusChecks;
   const required = probe('required-check policy (using declared fallback)', () => {
-    const value = gh(['api', `repos/${repo}/branches/main/protection/required_status_checks`]);
-    return [...new Set([...array(value.contexts), ...array(value.checks).map(c => c.context)])];
+    const result = readRequiredChecks({ repo, branch: 'main' });
+    const checks = result?.checks;
+    if (!Array.isArray(checks)) throw new Error('required-check policy unreadable');
+    // The shared reader degrades instead of throwing. A live read that FAILED (fallback, unavailable, or a stale entry
+    // kept past its TTL) must stay as visible as the old direct probe's failure, never a silent substitute; `declared`
+    // is the repo's intended policy after a protection denial, not a failed read.
+    if (['fallback', 'unavailable', 'stale-cache'].includes(result?.source)) {
+      errors.push(`required-check policy (${result.source === 'stale-cache' ? 'stale cache' : 'using declared fallback'}) unavailable`);
+    }
+    return checks.filter(name => typeof name === 'string' && name);
   }, [...(DECLARED_REQUIRED_STATUS_CHECKS[repo] ?? FALLBACK_REQUIRED_STATUS_CHECKS)]); // each repo's own declared policy
   if (!required.length) errors.push('required-check set empty; readiness unknown');
   if (commit?.statusCheckRollup?.contexts?.pageInfo?.hasNextPage) errors.push('check rollup truncated at 100');

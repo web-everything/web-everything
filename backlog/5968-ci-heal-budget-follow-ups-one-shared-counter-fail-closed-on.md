@@ -2,11 +2,13 @@
 bornAs: xwfvby0
 kind: story
 size: 3
-status: open
+status: resolved
 scope: ["we:scripts/conveyor/ci-heal-mark.mjs", "we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/tick-core.mjs", "we:scripts/operations/land-advance-io.mjs", "we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs", "we:scripts/conveyor/__tests__/ci-heal-attempts.test.mjs", "we:scripts/conveyor/__tests__/reconcile-core.test.mjs", "we:scripts/conveyor/__tests__/tick-core.test.mjs", "we:scripts/operations/__tests__/land-advance-io.test.mjs"]
 dateOpened: "2026-10-12"
-preparedDate: "2026-10-14"
-preparedAgainstSha: "6742d1202f2de0350e0a5a6978cebaa385be8b43"
+dateStarted: "2026-10-15"
+dateResolved: "2026-10-15"
+preparedDate: "2026-10-15"
+preparedAgainstSha: "13d85ca44eb6833d6325a9ff31f7438f8f419d9b"
 tags: []
 ---
 
@@ -16,45 +18,56 @@ Apply the existing fix-head reset rule consistently across reconcile, tick and l
 
 ## Progress
 
-- Original premise said tick and landing count every heal. Corrected: all three already use the shared chargeable counter in we:scripts/conveyor/ci-heal-mark.mjs:149, including attributed-main refund windows. Tick calls it at we:scripts/conveyor/tick-core.mjs:2162 and landing at we:scripts/operations/land-advance-io.mjs:152. Only reconcile additionally applies the fix-head reset.
-- The reset helper and filter now live at we:scripts/conveyor/reconcile-core.mjs:521 and :552, used at :1981. The filter drops a heal with missing/invalid `createdAt` because the NaN comparison is false. This is distinct from attributed-window filtering, which already retains such an attempt.
-- Broaden source scope to the existing shared counter module, and add all matching tests. Existing reset/cascade coverage is in we:scripts/conveyor/__tests__/ci-heal-attempts.test.mjs:60 and :128; extend it rather than duplicate it under another name.
-- Size changes from 2 to 3: approximately 90 lines moved/adapted in the shared module, 80 removed/adapted in reconcile, 35 each in tick and landing, plus about 150 regression lines across five test files. Tick's in-memory overlay at we:scripts/conveyor/tick-core.mjs:896 is part of the work: sharing only the durable count would leave old attempts blocking a reset or repeatedly refund them.
+- Earlier premise: tick and landing counted every heal. Current evidence: all three already use `countChargeableCiHealComments` in we:scripts/conveyor/ci-heal-mark.mjs:149, which supports attributed-main refunds and optional reason filtering. Tick calls it at we:scripts/conveyor/tick-core.mjs:2162; landing calls it at we:scripts/operations/land-advance-io.mjs:152. Only reconcile applies a fix-head reset first, at we:scripts/conveyor/reconcile-core.mjs:2034. The goal is still outstanding.
+- Correct stale reset citations: recognition is at we:scripts/conveyor/reconcile-core.mjs:530, filtering at we:scripts/conveyor/reconcile-core.mjs:554, and integration at we:scripts/conveyor/reconcile-core.mjs:2034 (previously cited as lines 521, 552 and 1981). The filter retains a heal only when its timestamp compares greater than the cutoff, so an absent/invalid timestamp is dropped. Attributed-window filtering at we:scripts/conveyor/ci-heal-mark.mjs:157 already retains invalid dates.
+- Correct the earlier overlay premise: we:scripts/conveyor/tick-core.mjs:896 subtracts durable refunds from a gross in-session tally, then we:scripts/conveyor/tick-core.mjs:906 stores the new tally with refunds added back. Existing repeat-refund coverage is we:scripts/conveyor/__tests__/tick-core.test.mjs:2289. A new reset-identity state machine is unnecessary for durable refunds; extend this existing gross-count invariant. Volatile attempts without dated durable evidence remain charged, even across a proven reset.
+- Scope remains four source files plus five existing matching test files. Reset and cascade tests exist at we:scripts/conveyor/__tests__/ci-heal-attempts.test.mjs:59 and we:scripts/conveyor/__tests__/ci-heal-attempts.test.mjs:128; attributed-window tests at we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs:589; landing's injected evidence harness at we:scripts/operations/__tests__/land-advance-io.test.mjs:18. No missing test file needs inventing.
+- Retain current size 3 (the prior preparation raised it from 2). Estimate: shared module ~90 changed lines for moved policy/reset helpers and evidence composition; reconcile ~80 for removal/re-exports and two budget branches (we:scripts/conveyor/reconcile-core.mjs:2777 and we:scripts/conveyor/reconcile-core.mjs:3124); tick ~35 and landing ~35 for evidence wiring; five test files ~30–50 lines each. This is a story, so no `estimatedLoc` is added. These are implementation estimates, not measured edits.
+- Built 2026-10-15: `ciHealBudgetEvidence` (we:scripts/conveyor/ci-heal-mark.mjs) now owns the budget policy, reset recognition and the stage-difference refund count; reconcile re-exports the moved names; tick (via `ciHealFloorFromComments`) and landing read it. The line citations in the earlier bullets above describe the pre-change tree: the reconcile budget branches now sit at about we:scripts/conveyor/reconcile-core.mjs:2694 and :3042 and the reset helpers live in the shared module. A heal with an unreadable time stays charged (the old filter refunded it). Follow-up: we:scripts/conveyor/exhausted-retry.mjs keeps its own copy of the reset filter and still refunds undated heals; it was outside this card's scope.
+- Preparation used source inspection; implementation replays remain required below. Existing preparation stamps are left for the runner to refresh.
 
 ## Design
 
-Move the pure budget-policy resolver, reset recognition and timestamp filtering into we:scripts/conveyor/ci-heal-mark.mjs and expose one budget-evidence calculation returning the filtered chargeable count, reset identity and refund diagnostics. Re-export existing public budget/reset helpers from reconcile for compatibility. Keep policy resolution at callers and pass the resolved reset/restore/reason options; do not import reconcile into the shared module.
+Move the pure policy resolver and reset recognition into we:scripts/conveyor/ci-heal-mark.mjs. Preserve existing exports from we:scripts/conveyor/reconcile-core.mjs through compatibility re-exports, including the cap and setting constants used by the resolver. Import fix marker constants from their existing owner, we:scripts/conveyor/fix-procedure.mjs; do not create a dependency back to reconcile. Preserve the current trusted-author, session-name and changed-SHA recognition rules.
 
-A heal is removed by a fix-head reset only with a valid timestamp at or before a valid trusted reset. Missing/invalid timestamps stay charged; unknown reason remains chargeable under CodeQL filtering. Keep non-heal comments so attributed-window evidence survives. Invalid reset evidence yields no reset.
+Expose one pure budget-evidence calculation taking comments plus resolved reset/restore/reason options. Return the chargeable count, reset evidence (`at`, `by`, `sha`), count removed by reset, and attributed-window refund count. Compute refunds as differences between deduplicated counts at successive stages, not by adding independently overlapping reset/window counts. Retain the existing raw and chargeable counter APIs for compatibility.
 
-Use the same evidence calculation in all three callers. In tick, associate the volatile attempt overlay with the reset identity, consuming a proven reset only once and retaining launches after that reset. Preserve outstanding live-worker guards and the durable floor on restart. An unattributable volatile attempt is retained, not guessed to predate a reset. Preserve existing explicit cap precedence and fix-round refusal paths; this is consistency of the already-enabled reset rule, not a new retry allowance.
+A reset removes only heal markers with a finite timestamp at or before the finite reset cutoff. Missing/invalid dates and bare-string heal markers remain charged. Invalid reset evidence yields no reset. Keep all non-heal comments so attributed-window evidence survives. Apply optional reason filtering with the existing unknown-reason-is-chargeable rule. Preserve attempt-ID deduplication and author checks.
+
+Use this evidence in both reconcile budget branches, tick's durable comment read and landing's repair evidence. Callers resolve policy using the shared resolver and their existing inputs; allow injected resolved policy for deterministic tests. Preserve existing cap precedence (including explicit reconcile cap zero), settings defaults and caller-specific reason selection: CodeQL-only filtering belongs to the CodeQL reconcile branch, while tick and landing retain their aggregate accounting.
+
+In tick, pass the union of proven durable reset/window refunds into the existing gross-tally arithmetic. Keep `ciHealAttempts` gross: effective attempts are the maximum of zero, gross attempts minus proven refunds, and the reset-aware durable count; after launching, store effective attempts plus refunds plus one. Do not clear the tally merely because a reset exists. This preserves unrecorded attempts conservatively and prevents repeated subtraction from a net tally. Preserve live-worker guards, queue-held launch rollback, pause behavior and terminal cleanup in we:scripts/conveyor/tick-core.mjs. Reset identity is diagnostic evidence, not a new persistent store.
 
 ## MVP
 
-Share the reset-aware calculation, integrate the three readers, make timestamp handling conservative, and reconcile the volatile overlay with a proven reset exactly once. Keep existing settings defaults, attempt markers and deduplication.
+Must: share the policy/reset/evidence calculation; integrate all three readers; retain malformed-time attempts; preserve gross overlay arithmetic and existing cap/guard paths; cover the combined histories below. Land as one coherent implementation so readers do not disagree during a partial migration.
+
+Could follow later: richer operator presentation of reset diagnostics. No new retry policy, marker format, persistence layer or dispatch mechanism is needed.
 
 ## Test plan
 
-Extend we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs and we:scripts/conveyor/__tests__/ci-heal-attempts.test.mjs with before/equal/after reset timestamps, absent/invalid timestamps, invalid reset dates, untrusted/unchanged/CI-heal fix markers, duplicate attempt IDs, reset disabled, and attributed windows combined with reset and CodeQL reason filtering.
+- Extend we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs with before/equal/after reset times, missing/invalid timestamps and bare strings, invalid reset dates, duplicate attempt IDs, overlapping attributed windows and reset refunds, restore disabled independently of reset, and reason filtering with unknown reasons retained.
+- Extend we:scripts/conveyor/__tests__/ci-heal-attempts.test.mjs with malformed-time histories through `planReconcile`, reset disabled, trusted/untrusted markers, unchanged SHA, missing begin/end evidence and CI-heal sessions. Keep its existing policy-cascade assertions passing through compatibility re-exports.
+- Extend we:scripts/conveyor/__tests__/reconcile-core.test.mjs with explicit `ciHealCap` precedence including zero, CodeQL-path reset wiring, and alternating fixer/heal histories reaching the existing fix-round cap. Retain newer-success-over-old-failure selection coverage without changing failure-selection policy.
+- Extend we:scripts/conveyor/__tests__/tick-core.test.mjs with identical durable histories and two successive polls after one reset, a launch between polls, an outstanding worker, restart using durable evidence, a missing-time heal, an unrecorded volatile attempt, overlapping refunds, and a queue-held launch whose increment is rolled back. Assert gross stored counts as well as effective exhaustion/spawn results; do not test only the helper in isolation.
+- Extend we:scripts/operations/__tests__/land-advance-io.test.mjs through injected `readPrComments` and resolved policy, checking the actual returned repair evidence for the same histories and reset disabled.
 
-Use we:scripts/conveyor/__tests__/reconcile-core.test.mjs for explicit `ciHealCap` precedence including zero, CodeQL-path reset wiring, fix/heal alternation reaching the existing fix cap, and an older failed check superseded by a newer success. Add matching injected histories in we:scripts/conveyor/__tests__/tick-core.test.mjs and we:scripts/operations/__tests__/land-advance-io.test.mjs. Tick cases must include two consecutive polls after one reset, a new launch between polls, an outstanding worker, and restart with durable evidence; no double refund. Run the five scoped suites through the host heavy-admission queue.
+Run the five scoped suites only through the host heavy-admission queue using we:scripts/readiness/heavy-admission.mjs, then run `npm run check:standards` through that queue. The preparation runner owns stamping and checks; implementation tests are not claimed as executed by this preparation.
 
 ## Proof plan
 
-Replay one identical trusted PR history through the three evidence readers with identical policy options. Record equal chargeable counts and reset identity, then append an undated heal and show every reader charges it. Run a two-tick replay proving the reset is consumed once and a subsequent launch remains spent. Exercise the existing fix cap with alternating heals and real fixer heads; no live dispatch or state writes are required.
+Replay an identical trusted history through the shared calculation, reconcile, tick's evidence-to-planner path and landing's injected evidence reader. With three dated heals before a trusted changed-head fix and one dated heal after it, aggregate chargeable counts must equal one. Append one undated distinct heal: all aggregate readers must report two. Repeat with reset disabled: all report five. For CodeQL, compare using identical reason options separately rather than expecting a reason-specific count to equal an aggregate count.
+
+Run a two-poll tick replay with the same reset evidence: the first new launch raises effective spending by one and the second poll retains that charge. Add a volatile charge with no durable timestamp and prove it is not refunded. Exercise overlapping reset/window evidence to show each attempt is refunded at most once, then repeat after restart with the durable history. Record returned counts, refund diagnostics, gross tally, reset evidence and dispatch/refusal results in test assertions. Exercise the existing fix cap with alternating real fixer heads and heals. Use injected reads/effects; no live dispatch, PR mutation or operational state write is needed.
 
 ## Acceptance
 
-All three paths honor the same proven reset and count malformed-time attempts conservatively. No repeat refund across ticks, no lost post-reset attempt, and no bypass of the fix-round cap or explicit caller cap.
+All three readers honor the same proven reset and charge malformed-time attempts conservatively. No repeated refund across ticks, no lost post-reset or unrecorded volatile attempt, and no bypass of the fix-round cap or explicit caller cap. Existing attributed-main refunds and CodeQL filtering remain intact.
 
 ## Non-goals
 
-No changes to cap values, CodeQL's separate-budget policy, author allowlists, marker formats, or required-check ownership.
-
-## Edge cases
-
-Untrusted markers cannot reset a budget. Missing chronology retains charges. Existing dedupe identity and PR boundaries remain intact. No new shared file is needed; volatile overlay bookkeeping lives in existing tick state. A new head alone is insufficient without the existing trusted fixer evidence. No receive endpoint is introduced.
+No changes to cap values, CodeQL's separate-budget policy, author allowlists, marker formats, required-check ownership or comment-read failure policy. No new head alone resets a budget without existing trusted fixer evidence.
 
 ## Follow-ups
 
-If replay exposes a separate failure-selection or fix-cap defect, isolate it with the failing fixture before expanding scope; do not change cap policy to make the test pass.
+Richer operator diagnostics can consume the returned reset/refund evidence later without changing accounting. If replay reveals a separate failure-selection or fix-cap defect, capture the failing fixture in a separate follow-up; do not expand this change into new cap policy. No prerequisite edge change is proposed.

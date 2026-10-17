@@ -1408,6 +1408,89 @@ describe('quietHours: a red main is wired end to end (real tick, shadow mode →
   });
 });
 
+// Card 5653: the review daemon's structured hold snapshots through the real shell (log read → fold → smell → notify).
+describe('operator-hold-aged: real log, persisted state, shadow-mode delivery', () => {
+  const WE = 'web-everything/web-everything';
+  const start = Date.parse('2026-10-15T14:00:00-04:00'); // daytime ET
+  const minute = 60_000;
+  afterEach(() => { episodeReplay.probes = null; episodeReplay.send.mockReset(); episodeReplay.send.mockImplementation(() => ({ ok: true })); });
+  const rec = (at, holds, repo = WE) => `${new Date(at).toISOString()} review-daemon: operator-holds ${JSON.stringify({ version: 1, repo, observedAt: at, intervalMs: 120_000, holds })}\n`;
+  const setup = () => {
+    const logsDir = join(dir, 'logs');
+    const flags = { 'state-root': join(dir, 'state'), 'logs-dir': logsDir, 'lock-root': join(dir, 'locks'), 'self-sync-dir': join(dir, 'sync'), 'no-gh': true, 'no-diagnose': true };
+    for (const name of ['logs-dir', 'lock-root', 'self-sync-dir']) mkdirSync(flags[name], { recursive: true });
+    const log = join(logsDir, 'review-daemon.log');
+    const hold = [{ prNumber: 4433, kind: 'cap-exhausted' }];
+    // Append the 2-minute snapshots in (from, to], then run one health tick at `to`.
+    const run = (to, holds, from = to - 6) => {
+      let text = '';
+      for (let m = from + 2; m <= to; m += 2) text += rec(start + m * minute, holds);
+      appendFileSync(log, text);
+      return tick({ ...flags, now: new Date(start + to * minute).toISOString() });
+    };
+    const holdCalls = () => episodeReplay.send.mock.calls.map(([n]) => n).filter((n) => /operator-hold-aged/.test(n.title));
+    return { run, hold, log, flags, holdCalls };
+  };
+
+  it('opens once past the threshold in shadow mode with a scrubbed, untagged notification; clears on a confirmed empty snapshot; a return restarts the age', async () => {
+    const { run, hold, holdCalls, flags } = setup();
+    writeFileSync(join(flags['logs-dir'], 'review-daemon.log'), '');
+    await run(0, hold, -4);
+    for (const at of [6, 12, 18, 24]) await run(at, hold);
+    expect(holdCalls()).toHaveLength(0);          // 24 minutes: below the 30-minute default
+    for (const at of [30, 36]) await run(at, hold);
+    expect(holdCalls()).toHaveLength(1);
+    expect(holdCalls()[0].title).toBe(`Health: operator-hold-aged — ${WE}#4433:cap-exhausted`);
+    expect(holdCalls()[0].emergency).toBeUndefined();   // no quiet-hours breakthrough
+    expect(holdCalls()[0].body).toContain('cap-exhausted');
+    for (const at of [42, 48, 54, 60]) await run(at, hold);
+    expect(holdCalls()).toHaveLength(1);          // one alert per episode, no reminder before the interval
+    const cleared = await run(66, [], 60);
+    expect(cleared.transitions.some((t) => t.type === 'closed' && t.key.startsWith('operator-hold-aged'))).toBe(true);
+    await run(78, hold, 66);                      // returned: a fresh age, below threshold
+    expect(holdCalls()).toHaveLength(1);
+    const persisted = JSON.parse(readFileSync(join(healthDir(flags['state-root']), 'state.json'), 'utf8'));
+    expect(persisted.operatorHolds.repos[WE].keys['4433|cap-exhausted']).toBeDefined();
+  });
+
+  it('the opening alert follows the ordinary quiet-hours gate: held at 02:00 ET, delivered at 14:00 ET, never a breakthrough', async () => {
+    const { run, hold, holdCalls, flags } = setup();
+    writeFileSync(join(flags['logs-dir'], 'review-daemon.log'), '');
+    await run(0, hold, -4);
+    for (const at of [6, 12, 18, 24, 30, 36]) await run(at, hold);
+    const call = holdCalls()[0];
+    expect(decideDelivery(call, { now: Date.parse('2026-10-15T02:00:00-04:00'), settings: DEFAULT_QUIET_SETTINGS }).deliver).toBe(false);
+    expect(decideDelivery(call, { now: start, settings: DEFAULT_QUIET_SETTINGS }).deliver).toBe(true);
+  });
+
+  it('holds a half-written final record until its newline arrives and never reads it as an empty set', async () => {
+    const { run, hold, log, holdCalls, flags } = setup();
+    writeFileSync(log, '');
+    await run(0, hold, -4);
+    for (const at of [6, 12, 18, 24, 30, 36]) await run(at, hold);
+    expect(holdCalls()).toHaveLength(1);
+    const full = rec(start + 38 * minute, []);
+    appendFileSync(log, full.slice(0, 60));
+    const partial = await tick({ ...flags, now: new Date(start + 40 * minute).toISOString() });
+    expect(partial.transitions.some((t) => t.type === 'closed')).toBe(false);
+    appendFileSync(log, full.slice(60));
+    const done = await tick({ ...flags, now: new Date(start + 42 * minute).toISOString() });
+    expect(done.transitions.some((t) => t.type === 'closed' && t.key.startsWith('operator-hold-aged'))).toBe(true);
+  });
+
+  it('a missing review log is unknown, not clearance: an open episode survives it', async () => {
+    const { run, hold, log, flags } = setup();
+    writeFileSync(log, '');
+    await run(0, hold, -4);
+    for (const at of [6, 12, 18, 24, 30, 36]) await run(at, hold);
+    rmSync(log);
+    const out = await tick({ ...flags, now: new Date(start + 60 * minute).toISOString() });
+    expect(out.transitions.some((t) => t.type === 'closed')).toBe(false);
+    const persisted = JSON.parse(readFileSync(join(healthDir(flags['state-root']), 'state.json'), 'utf8'));
+    expect(Object.keys(persisted.episodes).some((k) => k.startsWith('operator-hold-aged'))).toBe(true);
+  });
+});
+
 it('attempts needs-you feed supervision through injected deps and contains errors', async () => {
   sealTestRoot.path = dir;
   const ensureNeedsYouFeedJob = vi.fn(() => { throw Error('feed launch failed'); });

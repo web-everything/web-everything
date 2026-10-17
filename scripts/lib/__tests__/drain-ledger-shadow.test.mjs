@@ -80,3 +80,20 @@ describe('live fact comparison', () => {
     expect((await runLedgerShadow({ ...opts, dryRun: true, readiness: () => { throw Error('called'); } })).readiness).toBeUndefined();
   });
 });
+describe('unverifiable head evidence (#5303)', () => {
+  it('an accepted verdict with no live head never agrees or clears (derivation holds it as stale-acceptance), and the input verdict is unchanged', () => {
+    const verdict = { num: 1, decision: 'merge', reason: 'x' };
+    const before = JSON.stringify(verdict);
+    const r = shadowRow({ repo, now: at, events: [accepted()], verdict });
+    expect(r.status).not.toBe('agree');
+    expect(r.ledgerVerdict).not.toBe('clear');
+    expect(JSON.stringify(verdict)).toBe(before);
+  });
+  it('a valid head still agrees; a review-exempt head with no verdict still clears; an existing hold keeps the transient branch', () => {
+    expect(row().status).toBe('agree');
+    const exempt = buildLedgerEvent({ repo, pr: 1, at, source: 'test', declaredActor: 'drain', type: 'review-exempt', headSha: head, basis: 'no review needed' });
+    expect(row({}, [exempt])).toMatchObject({ status: 'agree', ledgerVerdict: 'clear' });
+    expect(row({ testGreen: true }, [accepted(), hold('required check "test" is not green')]).status).toBe('transient');
+    expect(row({}, []).reason).toBe('no ledger row for this PR');
+  });
+});

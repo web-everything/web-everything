@@ -9,11 +9,11 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  decideHumanClearanceCarry, latestHumanClearance, proveMechanicalMove, applyHumanClearanceCarry,
+  proveHumanClearanceCarry, decideHumanClearanceCarry, latestHumanClearance, proveMechanicalMove, applyHumanClearanceCarry,
   resolveHumanClearanceCarrySetting, buildCarryRecordBody, HUMAN_CLEARANCE_CARRIED_MARKER, MAX_MECHANICAL_COMMITS, sanitizeActor,
 } from '../human-clearance-carry.mjs';
 import { normalizeDiffFingerprint, normalizeContributionFingerprint, parseLatestHumanClearedSha, REVIEW_LABELS } from '../review-escalation.mjs';
-import { decideDrainReviewGate, readDrainAcceptance } from '../../merge-ai-prs.mjs';
+import { carryHumanClearanceOnIdenticalDiff, createTamperParkCarryCallback, decideDrainReviewGate, readDrainAcceptance } from '../../merge-ai-prs.mjs';
 
 const DIFF = 'diff --git a/x.mjs b/x.mjs\n--- a/x.mjs\n+++ b/x.mjs\n@@ -1 +1 @@\n-old\n+new\n';
 const FP = normalizeDiffFingerprint(DIFF);
@@ -257,10 +257,14 @@ describe('proveMechanicalMove (real git)', () => {
 /** A recorded commit graph: `parents[sha]`, and `main` = the set of shas reachable from the main ref. */
 const graphExec = ({ parents, main, onComment = () => {}, view = null, tip = view?.headRefOid }) => vi.fn((cmd, args) => {
   if (cmd === 'gh' && args[1] === 'view') return JSON.stringify(view);
-  if (cmd === 'git' && args[0] === 'rev-parse') return `${tip}\n`; // the sha the branch tip (the net diff's rev) resolves to
+  if (cmd === 'git' && args[0] === 'rev-parse') {
+    if (args.at(-1).endsWith('^{tree}')) throw Error('tree not recorded in fixture');
+    return `${tip}\n`;
+  } // the sha the branch tip (the net diff's rev) resolves to
   if (cmd === 'gh' && args[1] === 'comment') { onComment(args[args.indexOf('--body') + 1]); return ''; }
   // PR #4631 round 11: a moved head's coverage reads the PR's formal reviews (`gh api …/reviews`); none stand here.
-  if (cmd === 'gh' && args[0] === 'api') return '';
+  if (cmd === 'gh' && args[0] === 'api') return args.some(a => a.includes('/comments'))
+    ? view.comments.map(c => [c.body.replaceAll('\n', '\\n'), c.createdAt || '', c.author?.login || 'chalbert'].join('\t')).join('\n') : '';
   if (cmd !== 'git') throw new Error(`unexpected ${cmd}`);
   const ancestors = (sha) => { const seen = new Set(); const st = [sha]; while (st.length) { const s = st.pop(); if (seen.has(s)) continue; seen.add(s); st.push(...(parents[s] || [])); } return seen; };
   const mainSet = new Set([...main].flatMap((m) => [...ancestors(m)]));
@@ -555,7 +559,7 @@ describe('the diff the carry reads is pinned to ONE resolved tip sha (a branch t
 });
 
 describe('PR #4715 context movement and manifest-drop replay', () => {
-  it.each(['strict', 'contribution', 'default', 'changed'])('%s policy through the durable carry', (mode) => {
+  it.each(['strict', 'contribution', 'default', 'changed'].flatMap(mode => [true, false].map(netPatch => [mode, netPatch])))('%s policy through the durable carry (net patch: %s)', (mode, netPatch) => {
     const dir = mkdtempSync(join(tmpdir(), 'we-4715-'));
     const g = (...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', ...args], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
     const content = 'one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n';
@@ -581,18 +585,126 @@ describe('PR #4715 context movement and manifest-drop replay', () => {
         expect([cmd, ...args.slice(0, 2)]).toEqual(['gh', 'pr', 'comment']);
         posted.push(args[args.indexOf('--body') + 1]); return '';
       };
-      const result = applyHumanClearanceCarry({ evidence: { humanClearance, headSha, headDiff, headDiffSha: headSha }, pr: 4715, cwd: dir, exec, dryRun: false, mainRef: 'main', setting: ON, log: (s) => logs.push(s), ...(mode === 'default' ? {} : { equivalence: mode === 'changed' ? 'contribution' : mode }) });
-      if (mode === 'strict' || mode === 'changed') {
-        expect(result).toBe(null); expect(posted).toHaveLength(0);
-        expect(logs.join('')).toContain('net diff changed');
-      } else {
-        expect(result.carried).toMatchObject({ recorded: true, tier: 'contribution', mechanicalReason: expect.stringContaining('replay') });
+      const result = applyHumanClearanceCarry({ evidence: { humanClearance, headSha, headDiff, headDiffSha: headSha }, pr: 4715, cwd: dir, exec, dryRun: false, mainRef: 'main', setting: ON, netPatchSetting: { value: netPatch, source: 'test' }, log: (s) => logs.push(s), ...(mode === 'default' ? {} : { equivalence: mode === 'changed' ? 'contribution' : mode }) });
+      if (mode === 'default' || mode === 'contribution') {
+        expect(result).toMatchObject({ carried: { recorded: true, tier: 'contribution', fromSha: cleared, toSha: headSha } });
         expect(posted).toHaveLength(1);
-        expect(posted[0]).toContain(`human-clearance-carried: from=${cleared} to=${headSha}`);
-        expect(posted[0]).toContain("added/removed lines are identical");
-        expect(posted[0]).not.toContain('byte-identical');
-        expect(logs.join('')).toContain('tier contribution');
+      } else {
+        expect(result).toBe(null); expect(posted).toHaveLength(0);
       }
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+});
+
+describe('tamper-park callback through the durable human carry writer', () => {
+  it.each([true, false].flatMap(fingerprint => ['valid', 'mixed change', 'live hold', 'numbering off', 'master off', 'unpinned'].map(shape => [fingerprint, shape])))('numbering callback with fingerprint=%s, %s', (fingerprint, shape) => {
+    const comments = [clearHumanComment(CLEARED, fingerprint ? FP : null)], posted = [];
+    const headDiff = DIFF.replace('+new', '+numbered');
+    const result = carryHumanClearanceOnIdenticalDiff({ setting: 'on', comments, reviews: [],
+      humanClearedSha: CLEARED, headSha: HEAD, pinnedHeadSha: shape === 'unpinned' ? CLEARED : HEAD,
+      readHeadDiff: () => ({ scored: true, text: headDiff, rev: HEAD }),
+      applyNumberingCarry: createTamperParkCarryCallback({ pr: 5463, repo: 'owner/repo',
+        setting: { value: shape !== 'master off', source: 'test' }, numberingSetting: { value: shape !== 'numbering off', source: 'test' }, log: quiet,
+        exec: (cmd, args) => { if (cmd === 'git') throw Error('no general git proof in fixture'); posted.push(args); return ''; },
+        proveNumbering: () => ({ ok: shape !== 'mixed change', reason: shape === 'mixed change' ? 'unrelated byte' : 'exact numbering' }),
+        readNumberingLiveEvidence: () => ({ headSha: HEAD, comments: shape === 'live hold'
+          ? [...comments, { author: { login: 'chalbert' }, body: 'Do not land this.' }] : comments, reviews: [] }),
+      }),
+    });
+    expect(result).toMatchObject({ carried: shape === 'valid', humanClearedSha: shape === 'valid' ? HEAD : CLEARED });
+    expect(posted).toHaveLength(shape === 'valid' ? 1 : 0);
+    if (shape === 'valid') expect(posted[0].at(-1)).toContain(`from=${CLEARED} to=${HEAD}`);
+  });
+});
+
+describe('human clearance numbering tier', () => {
+  const evidence = { humanClearance: { sha: CLEARED, diff: FP, actor: 'chalbert' },
+    headSha: HEAD, headDiffSha: HEAD, headDiff: DIFF.replace('+new', '+numbered') };
+  it.each(['off', 'unread live diff'])('refuses %s before attempting numbering', (kind) => {
+    let calls = 0;
+    const e = { ...evidence, humanClearance: { ...evidence.humanClearance } };
+    if (kind === 'unread live diff') e.headDiff = null;
+    const d = proveHumanClearanceCarry({ evidence: e, enabled: kind !== 'off',
+      proveNumbering: () => { calls++; return { ok: true }; } });
+    expect(d.carry).toBe(false);
+    expect(calls).toBe(0);
+  });
+  it('carries a fingerprint mismatch only with a numbering proof', () => {
+    const d = proveHumanClearanceCarry({ evidence, proveNumbering: () => ({ ok: true, reason: 'verified renames' }) });
+    expect(d).toMatchObject({ carry: true, tier: 'numbering', actor: 'chalbert' });
+    expect(buildCarryRecordBody({ ...d, headDiffText: evidence.headDiff })).toContain('card-numbering');
+  });
+  it('keeps the original refusal when numbering also refuses', () => {
+    const d = proveHumanClearanceCarry({ evidence, proveNumbering: () => ({ ok: false, reason: 'mixed change' }) });
+    expect(d.carry).toBe(false);
+    expect(d.reason).toContain('net diff changed');
+    expect(d.reason).toContain('numbering tier: mixed change');
+  });
+  // Red team #5233 (sibling writer): the slow proof runs between the drain's evidence read and its record write.
+  describe('re-reads the PR before posting the carry record', () => {
+    const objection = { author: { login: 'chalbert' }, body: 'Do not land this. I found a bug and am preparing findings.' };
+    const apply = (over = {}) => {
+      const posted = [];
+      const exec = (cmd, args) => { if (cmd === 'gh') posted.push(args); return ''; };
+      const result = applyHumanClearanceCarry({ evidence, pr: 5233, exec, setting: ON, log: () => {},
+        proveNumbering: () => ({ ok: true, reason: 'verified renames' }), ...over });
+      return { result, posted };
+    };
+    const liveThread = (extra = {}) => () => ({ headSha: HEAD, comments: [clearHumanComment(CLEARED)], reviews: [], ...extra });
+    it('records a numbering carry when nothing changed', () => {
+      const { result, posted } = apply({ readLiveEvidence: liveThread() });
+      expect(result).toMatchObject({ carried: { tier: 'numbering', recorded: true } });
+      expect(posted).toHaveLength(1);
+    });
+    it.each([false, true])('never records a numbering carry without a live re-read (dry run: %s)', (dryRun) => {
+      const { result, posted } = apply({ dryRun });
+      expect(result).toBeNull();
+      expect(posted).toEqual([]);
+    });
+    it.each([
+      ['an operator objection', liveThread({ comments: [clearHumanComment(CLEARED), objection] })],
+      ['a formal changes-requested review', liveThread({ reviews: [{ state: 'CHANGES_REQUESTED', submittedAt: '2026-10-13T00:00:00Z' }] })],
+      ['a head move', liveThread({ headSha: 'f'.repeat(40) })],
+      ['a newer clearance', liveThread({ comments: [clearHumanComment(CLEARED), clearHumanComment(HEAD)] })],
+      ['unreadable reviews', liveThread({ reviews: null })],
+      ['a truncated thread', liveThread({ comments: null })],
+      ['a failed re-read', () => { throw Error('gh offline'); }],
+    ])('defers without a record after %s', (_name, readLiveEvidence) => {
+      const { result, posted } = apply({ readLiveEvidence });
+      expect(result).toMatchObject({ action: 'defer', applyLabel: null });
+      expect(posted).toEqual([]);
+    });
+  });
+});
+
+// Observed #5414 markers: the original clearance had BOTH fingerprints; it was not an agent acceptance.
+it('#5414 recorded heads: carries chalbert and updates acceptance as well as clearance', () => {
+  const old = '4301480ce5fddad5f0621c3933f4335734ec91d7';
+  const head = '21ce5fcd9ecd13cb8e1262fd35108f5bbfbd822a';
+  const before = 'fc7b05325a715a0f5f5dd07bed6223044fd92f2f39475906c5f7c4f4c303cd0a';
+  const after = 'dc5d53c7d39b4f24465cf98f24122e860e479d5b6513b9e2e41471c0c410ad56';
+  const comment = clearHumanComment(old, before);
+  comment.createdAt = '2026-10-15T23:41:24Z';
+  comment.body += '\n<!-- reviewed-contribution: 39a4211c1e0740f32e484ba867419a7ae9eb137b670c574790ce23e1de14ba40 -->';
+  const posted = []; const logs = []; const proofs = [];
+  const exec = (cmd, args) => {
+    if (cmd === 'gh' && args[1] === 'view') return JSON.stringify({ headRefOid: head, headRefName: 'lane/5414', comments: [comment] });
+    if (cmd === 'gh' && args[0] === 'api') return args.some(a => a.includes('/comments'))
+      ? [comment.body.replaceAll('\n', '\\n'), comment.createdAt, 'chalbert'].join('\t') : '';
+    if (cmd === 'gh' && args[1] === 'comment') { posted.push(args[args.indexOf('--body') + 1]); return ''; }
+    throw Error('unexpected command');
+  };
+  const gate = decideDrainReviewGate({ labels: ['review:accepted'], escalate: true, humanRequired: true, permissionChange: true }, {
+    pr: 5414, repo: 'web-everything/web-everything', local: true, exec,
+    files: ['scripts/conveyor/reconcile-core.mjs'], filesComplete: true, listedHeadSha: head,
+    netDiff: () => ({ scored: true, text: after, rev: head, revSha: head }),
+    carry: { setting: ON, numberingSetting: { value: true, source: 'platform' }, log: line => logs.push(line),
+      proveNumbering: o => { proofs.push([o.fromSha, o.toSha]); return { ok: true, reason: 'verified x3o0ohn→#6178' }; } },
+  });
+  expect(gate.action).toBe('merge');
+  expect(proofs).toEqual([[old, head]]);
+  expect(posted).toHaveLength(1);
+  expect(posted[0]).toContain('<!-- cleared-human: chalbert -->');
+  expect(posted[0]).toContain(`from=${old} to=${head}`);
+  expect(logs.join('')).toContain('review.carryHumanClearanceAcrossNumbering=true (platform)');
 });

@@ -1272,3 +1272,64 @@ Two parallel lane sessions can allocate the **same** backlog `NNN` for a *new* i
 - `relatedReport` must exist on disk; `relatedProject` must resolve in `projects.json`; `crossRef` needs both `url` and `label`.
 - `reports/` is **not** in the 11ty build, so `relatedReport` shows as a path label, not a link. Real site links go via `crossRef` / `relatedProject`.
 - `npm run check:standards` validates all of the above — it reads `backlog/*.md` through `src/_data/backlog.js`, the same loader the site uses.
+
+## Complete operator task briefs
+
+File an authored task through `we:scripts/operations/run.mjs file-item` with
+`--operatorTask` and the complete body in `--digest`. The body replaces
+scaffold placeholders and must contain nonempty Design, MVP, Done when (or Acceptance),
+Edge cases, Test plan, and Proof plan sections without TODO/TBD placeholders. Pass a
+nonempty `--scope` of `we:`-qualified paths. Filing uses the prepare pass's shared
+section validator, with these additional operator completeness requirements; refusal
+lists missing sections before any write or queue effect. A passing brief gets
+`operatorTask: true`, an ET `preparedDate`, and the local `origin/main` tip as
+`preparedAgainstSha`. A missing origin/main reference refuses stamping.
+
+Like the pre-PR review bypass, only an interactive session may file an operator task: a dispatched worker
+(`WE_CONVEYOR_WORKER=1`) or an unknown session role is refused, and a bare `scaffold` (which has no session
+role) cannot file one. The filing stamp is an ordinary `preparedDate`/`preparedAgainstSha` stamp: blockedBy,
+scope holds, sizing, clearance, stamp staleness and the queue order all apply as for any card.
+
+**Not in this feature: verified operator authority.** An attributed operator instruction record, gating
+operator-task treatment on it, an explicit `priority: P0..P4` that jumps the build queue, and operator-aware
+prepare/queue/probation admission are card #6168. Until it lands, `operatorTask: true` is card
+frontmatter any card author can write, so it unlocks nothing beyond the filing stamp above and the report step below (which also forces the full
+delivery-agent route).
+
+`we:scripts/settings/operator-task.json` owns `build.operatorTask`:
+`{ enabled: true, postBuild: { edgeLoad: false, liveProof: false, report: true } }`. Valid leaves cascade independently from
+standard defaults to platform build preferences to tool settings; policy logs identify
+each leaf's source. Disabled filing retains the brief and operator marker but adds no
+prepare stamp, and disables post-build steps.
+
+### Operator card post-build steps
+
+`we:scripts/operations/run.mjs file-item` declares `--edgeClone=review|fix|control|drain|health-watch`,
+`--liveProof-command='<shell command>'`, `--liveProof-expect='<substring or /regex/flags>'` (all refused for
+now, see above), and `--report`.
+**Edge-load and live-proof steps are off for every card.** Filing refuses `--edgeClone` and `--liveProof-*`
+(a step that never runs is not recorded), the standards gate still checks the fields on a hand-edited card,
+and `planOperatorPostBuild` never turns them into brief steps, whatever the card, settings or policy leaves say. They run commands named by card frontmatter, which any card
+author can write. Turning them back on waits on verified operator-task
+authority (#6168). Only `--report`
+currently adds a step.
+
+These optional frontmatter fields drive the generated build brief after `open-pr`: load and prove edge
+adoption (off, see above), capture the command's exit status/output and expectation match (off, see above),
+then post a report of at most eight lines with `<!-- operator-task-report -->`. A failed or pending
+adoption/proof is reported honestly.
+The command and expectation are copied verbatim into the brief, so `{{...}}` text is refused: the dispatch
+fill would otherwise rewrite it as a brief placeholder.
+Clone names map to workspace-relative (or `~/`) paths in `we:scripts/settings/operator-task.json`; never put
+an absolute clone path on a card. Each `build.operatorTask.postBuild` boolean resolves independently through
+the standard/platform/tool cascade and is source-logged. Disabling a step suppresses it even when the card
+requests it. The fields alone never add a step: the card must also carry `operatorTask: true` (filing and
+the standards gate refuse these fields without it), and `build.operatorTask.enabled` must be true. The
+dispatcher's route flag for these cards comes from the same card decision, never from searching the prompt text. Cards without enabled post-build steps retain their existing brief
+and provider route.
+
+The shared blocks live in `we:scripts/worker-brief.mjs`. Post-build cards use the existing full delivery-agent
+route: the minimal v2 worker finishes before its wrapper opens the PR and cannot perform these steps.
+`--operatorTask --kind=investigation` remains an investigation routed to the existing investigation brief,
+which writes findings in the card and requires a PR. A no-PR report-file/comment workflow is not supported:
+there is no comment target on such a card. Do not assume that dispatch kind provides that different outcome.

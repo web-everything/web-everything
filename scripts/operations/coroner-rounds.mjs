@@ -28,23 +28,34 @@ export function normalizeComment(c) {
 }
 
 /** Findings from a review / advisory body: `**lens/category** (n)` groups of `- \`file:line\` — claim — …` lines. */
-export function parseFindings(body) {
+export function parseFindings(body, { maxClaimChars = 220, fullClaim = false } = {}) {
   const out = [];
-  const section = String(body).split(/^### Findings[^\n]*$/m)[1];
+  const text = fullClaim ? String(body).replace(/\r\n?|[\u2028\u2029]/g, '\n') : String(body);
+  const heading = /^### Findings[^\n]*$/m.exec(text);
+  const section = heading ? text.slice(heading.index + heading[0].length) : null;
   if (!section) return out;
+  const claimLines = fullClaim ? new Map() : null;
   let lens = null, category = null, current = null;
   for (const line of section.split('\n')) {
     if (/^(?:### |\*\*Advisory outcome:|---\s*$|Net basis:)/.test(line)) break;
     const head = line.match(/^\*\*([^*/]+)\/([^*]+)\*\*\s*\(\d+\)/);
-    if (head) { lens = head[1].trim(); category = head[2].trim(); continue; }
+    if (head) { lens = head[1].trim(); category = head[2].trim(); current = null; continue; }
     const item = line.match(/^- `([^`:]+?)(?::(\d+))?`\s+—\s+(.*)$/);
     if (item && lens) {
-      current = { file: item[1], line: item[2] ? Number(item[2]) : null, lens, category, claim: clip(item[3].split(/\s+—\s+/)[0], 220), confidence: item[3].match(/_\[(CONFIRMED|PLAUSIBLE|SPECULATIVE)\]_/)?.[1] ?? null, impact: item[3].match(/impact if unfixed: (\w+)/)?.[1] ?? null };
+      // The renderer uses the same separator inside summaries and before scenarios.
+      // Identity callers must retain the whole bullet rather than guess that boundary.
+      const claim = fullClaim ? item[3] : item[3].split(/\s+—\s+/)[0];
+      current = { file: item[1], line: item[2] ? Number(item[2]) : null, lens, category, claim: clip(claim, maxClaimChars), confidence: item[3].match(/_\[(CONFIRMED|PLAUSIBLE|SPECULATIVE)\]_/)?.[1] ?? null, impact: item[3].match(/impact if unfixed: (\w+)/)?.[1] ?? null };
+      claimLines?.set(current, [claim]);
       out.push(current); continue;
     }
+    // Summaries/scenarios can contain physical newlines; the renderer preserves them.
+    // Keep their continuation text for identity instead of silently hashing a prefix.
+    if (fullClaim && current && line.trim()) claimLines.get(current).push(line);
     const prevention = line.match(/^\s+- _Prevention[^:]*:_\s*(.*)$/);
     if (prevention && current) current.prevention = clip(prevention[1], 200);
   }
+  for (const [finding, lines] of claimLines ?? []) finding.claim = clip(lines.join('\n'), maxClaimChars);
   return out;
 }
 

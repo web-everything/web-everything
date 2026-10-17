@@ -26,6 +26,8 @@
  *     - `strategy`            'drain-direct' | 'github-merge-queue'. github-merge-queue = the drain ENQUEUES a
  *                             ready PR (GraphQL `enqueuePullRequest`) and GitHub's merge queue re-tests and merges;
  *                             the drain's gates move into the required `merge-gate` CI check.
+ *     - `enqueueFailureSmellAfter` consecutive failures before a health smell (standard 3).
+ *     - `enqueueRetrySeconds` base exponential retry delay, capped at one hour (standard 60).
  *     - `batchSize`           GitHub merge-queue group size (max entries to build per group). Suggestion only
  *                             for the ruleset — GitHub reads it from the ruleset, not from here.
  *     - `maxGroupWaitMinutes` GitHub "wait time to meet minimum group size". Ruleset suggestion, same as above.
@@ -57,6 +59,8 @@ export const GATE_PLACEMENTS = Object.freeze(['merge-gate', 'drain', 'both']);
 /** Ship Evermore's declaration: the safe default for every knob. */
 export const STANDARD_MERGE_DELIVERY = Object.freeze({
   strategy: 'drain-direct',
+  enqueueFailureSmellAfter: 3,
+  enqueueRetrySeconds: 60,
   batchSize: 1,
   maxGroupWaitMinutes: 5,
   mergeMethod: 'merge',
@@ -72,6 +76,8 @@ const intIn = (lo, hi) => (v) => Number.isInteger(v) && v >= lo && v <= hi;
 
 const VALIDATORS = Object.freeze({
   strategy: (v) => MERGE_DELIVERY_STRATEGIES.includes(v),
+  enqueueFailureSmellAfter: intIn(1, 100),
+  enqueueRetrySeconds: intIn(1, 3600),
   batchSize: intIn(1, 100),
   maxGroupWaitMinutes: intIn(0, 360),
   mergeMethod: (v) => MERGE_METHODS.includes(v),
@@ -93,7 +99,7 @@ export function placementKeepsMerger(placement, strategy) {
  */
 export function resolveMergeDeliveryPolicy({ platform, tool, knownGates = null } = {}) {
   const out = { ...STANDARD_MERGE_DELIVERY, gatePlacement: {}, concurrency: { ...STANDARD_MERGE_DELIVERY.concurrency } };
-  const sources = { strategy: 'standard', batchSize: 'standard', maxGroupWaitMinutes: 'standard', mergeMethod: 'standard', redMainFreezeBranch: 'standard' };
+  const sources = { enqueueFailureSmellAfter: 'standard', enqueueRetrySeconds: 'standard', strategy: 'standard', batchSize: 'standard', maxGroupWaitMinutes: 'standard', mergeMethod: 'standard', redMainFreezeBranch: 'standard' };
   const invalid = [];
   for (const key of Object.keys(out.concurrency)) sources[`concurrency.${key}`] = 'standard';
   const layers = [['platform', platform], ['tool', tool]];
@@ -142,7 +148,7 @@ export function placementOf(policy, gateId) {
 
 /** One log line naming every effective value and the layer that set it. */
 export function formatMergeDeliverySourcesLine(policy) {
-  const keys = ['strategy', 'batchSize', 'maxGroupWaitMinutes', 'mergeMethod', 'redMainFreezeBranch'];
+  const keys = ['strategy', 'enqueueFailureSmellAfter', 'enqueueRetrySeconds', 'batchSize', 'maxGroupWaitMinutes', 'mergeMethod', 'redMainFreezeBranch'];
   const parts = keys.map((k) => `${k}=${policy[k]} (${policy.sources?.[k] ?? 'standard'})`);
   for (const [key, value] of Object.entries(policy.concurrency || {})) parts.push(`concurrency.${key}=${value} (${policy.sources?.[`concurrency.${key}`] ?? 'standard'})`);
   for (const [g, p] of Object.entries(policy.gatePlacement || {})) parts.push(`gatePlacement.${g}=${p} (${policy.sources?.[`gatePlacement.${g}`]})`);

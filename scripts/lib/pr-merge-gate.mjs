@@ -346,8 +346,11 @@ export const DEFAULT_REVIEW_AUTHORITY = 'labels';
  *   - `both`:   clears only when the labels AND the ledger clear. Strictly tighter than `labels`.
  *   - `ledger`: the label input is dropped (a loosening; the statute gates moving the setting here).
  *   - any other value is treated as `both` (the stricter reading), never as `ledger`.
- * An unreadable ledger (`folded` / `derived` null, `folded.unreadable`, or a `ledger-unreadable` hold) DEFERS
- * with a reason; unreadable is a hold, never "empty".
+ * An unreadable ledger (`folded` / `derived` null, `folded.unreadable`, a `ledger-unreadable` hold, or `derived.holds`
+ * present but not an array) DEFERS with a reason; unreadable is a hold, never "empty". An otherwise-clearing result also
+ * DEFERS (`ledger-head-unverifiable`) unless the live head is a non-empty string and, for a verdict-backed clearance, the
+ * verdict's coverage head is a non-empty string equal to it. The one exception: a derived review exemption (no current
+ * verdict) needs only the usable live head — `derivePrState` already validated it against that head.
  *
  * @param {object} o
  * @param {object|null} o.folded The PR's folded ledger entry (`foldVerdictLedger(...).get(pr)`), or null/`{unreadable:true}`.
@@ -368,15 +371,24 @@ export function decideLedgerGate({ folded = null, derived = null, head = null, l
   return { clear: ledger.clear, defer: false, authority: mode, reason: ledger.reason };
 }
 
+const nonEmptyString = (v) => typeof v === 'string' && v.length > 0;
+
 function ledgerVerdict({ folded, derived, head }) {
+  // `holds` is evidence: undefined keeps the empty default, any other non-array (null, string, object, number) is unreadable.
+  const holds = derived?.holds === undefined ? [] : derived?.holds;
   const unreadable = !folded || !derived || folded.unreadable === true || derived.unreadable === true
-    || (derived.holds ?? []).some(h => h?.code === 'ledger-unreadable');
+    || !Array.isArray(holds) || holds.some(h => h?.code === 'ledger-unreadable');
   if (unreadable) return { clear: false, defer: true, reason: 'ledger-unreadable: deferring, an unreadable ledger is a hold' };
-  const holds = derived.holds ?? [];
   if (holds.length) return { clear: false, defer: false, reason: `ledger holds: ${holds.map(h => h?.code ?? 'unknown').join(', ')}` };
-  if (folded.clears !== true || derived.clears !== true) return { clear: false, defer: false, reason: 'ledger does not clear' };
+  const exempt = !folded.current && derived.reviewExempt === true;
+  if ((folded.clears !== true && !exempt) || derived.clears !== true) return { clear: false, defer: false, reason: 'ledger does not clear' };
+  // A clearance needs a usable live head; a verdict-backed one also needs the verdict's coverage head. Reasons are fixed
+  // text: a malformed value is never echoed. A valid review exemption has no verdict, so no coverage to require.
   const sha = typeof head === 'string' ? head : head?.sha;
   const covered = folded.current?.coverage?.headSha;
-  if (sha && covered && sha !== covered) return { clear: false, defer: false, reason: `ledger clearance covers ${covered}, head is ${sha}` };
-  return { clear: true, defer: false, reason: 'ledger clears' };
+  if (!nonEmptyString(sha) || (!exempt && !nonEmptyString(covered))) {
+    return { clear: false, defer: true, reason: 'ledger-head-unverifiable: deferring, the live head or the verdict coverage head is missing' };
+  }
+  if (!exempt && sha !== covered) return { clear: false, defer: false, reason: `ledger clearance covers ${covered}, head is ${sha}` };
+  return { clear: true, defer: false, reason: exempt ? 'ledger clears (review-exempt at this head)' : 'ledger clears' };
 }

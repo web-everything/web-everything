@@ -1,0 +1,46 @@
+{
+  "now": "2026-10-14T09:26:00Z",
+  "redWindow": {
+    "from": "2026-10-14T06:09:00Z",
+    "to": "2026-10-14T09:26:00Z"
+  },
+  "mainCiRuns": {
+    "runs": [
+      {
+        "databaseId": 38517676708,
+        "headSha": "62da75ed3",
+        "status": "completed",
+        "conclusion": "failure",
+        "createdAt": "2026-10-14T06:09:00Z",
+        "updatedAt": "2026-10-14T06:20:00Z",
+        "attempt": 1
+      }
+    ],
+    "failing": {
+      "runId": 38517676708,
+      "jobs": [
+        "integration",
+        "test"
+      ],
+      "groupEvidence": {
+        "runId": 38520623968,
+        "baseSha": "28a7885f1",
+        "completedAt": "2026-10-14T06:25:00Z",
+        "coveredJobs": [
+          "integration"
+        ]
+      }
+    }
+  },
+  "failedJobs": [
+    {
+      "id": 1,
+      "name": "integration"
+    },
+    {
+      "id": 2,
+      "name": "test"
+    }
+  ],
+  "log": " FAIL  scripts/conveyor/__tests__/sim-scenario-self-sync-sibling.test.mjs > #3383 daemon scenario simulator > A3: a main move t\nError: Test timed out in 180000ms.\n Test Files  1 failed | 26 passed (27)\n"
+}

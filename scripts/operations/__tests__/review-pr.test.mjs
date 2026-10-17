@@ -279,6 +279,7 @@ it('cannot reduce clean juror answers to accept while an operator send-back rema
 /** Card 84 — both mandatory seats shadowed by agy, plus the advisory agy seat. */
 const AGY_SEAT_SETTINGS = Object.freeze({
   seatProvider: { correctness: 'shadow', security: 'shadow' }, agyModel: 'claude-opus-5-5-high', agyCorrectnessAdvisory: true,
+  shadowPolicy: { shadowEnabled: true, scope: 'high-care', dailyCap: 100 },
 });
 
 // ── PROPERTY 1: THE DIFF ARRIVES ON THE NET BASIS ─────────────────────────────────────────────────────────
@@ -3764,7 +3765,8 @@ describe('#4315 incident-shaped mandatory referral', () => {
     const sinks = createReviewPrSinks({ out: () => {}, mirrorReferral: () => {}, referralJudge: judge,
       labelProvider: {
         readPrState: () => { trace.push('read'); return structuredClone(state); },
-        postComment: (repo, pr, body) => { trace.push('post'); state.comments.push({ body, author: { login: 'web-everything' } }); },
+        postComment: (repo, pr, body) => { trace.push('post'); state.comments.push({ id: `comment-${state.comments.length}`, body, author: { login: 'web-everything' } }); },
+        editComment: (id, body) => { trace.push('edit'); state.comments.find(c => c.id === id).body = body; },
         setLabels: (repo, pr, plan) => { trace.push(plan.add); state.labels = [...new Set([...state.labels.filter(l => !plan.remove.includes(l)), plan.add])]; },
       } });
     ({ run } = await applyPendingEffects(run, { sinks, store: createMemoryRunStore() }));
@@ -3792,7 +3794,8 @@ describe('#4315 operation / I/O restart soak', () => {
       const trace = [], judge = vi.fn(async () => ({ value: { rulings: [] } }));
       const provider = {
         readPrState: () => { trace.push('read'); return structuredClone(state); },
-        postComment: (repo, pr, body) => { trace.push('post'); state.comments.push({ body, author: { login: 'web-everything' } }); },
+        postComment: (repo, pr, body) => { trace.push('post'); state.comments.push({ id: `comment-${state.comments.length}`, body, author: { login: 'web-everything' } }); },
+        editComment: (id, body) => { trace.push('edit'); state.comments.find(c => c.id === id).body = body; },
         setLabels: (repo, pr, plan) => { trace.push(`label:${plan.add}`); state.labels = [...state.labels.filter(l => !plan.remove.includes(l)), plan.add]; },
       };
       for (let restart = 0; restart < 25; restart++) {
@@ -3817,6 +3820,8 @@ describe('#4315 operation / I/O restart soak', () => {
         expect(() => advanceWhileRunning(run, { registry, resume: { value: 'accept' } })).toThrow(/ruling required/);
       }
       expect(judge).toHaveBeenCalledTimes(1);
+      expect(trace.filter(x => x === 'post')).toHaveLength(1);
+      expect(trace).toContain('edit');
       expect(state.labels).toEqual(['review:human']);
       expect(trace.indexOf('post')).toBeLessThan(trace.findIndex(x => x.startsWith('label:')));
       expect(trace).not.toContain('label:review:accepted');
@@ -3825,7 +3830,8 @@ describe('#4315 operation / I/O restart soak', () => {
     const { registry } = registryFor({ netRev: PINNED_HEAD }, { correctnessAdvisory: true });
     const state = { headRefOid: PINNED_HEAD, body: '<!-- authored-by-actor: author -->', comments: [], labels: ['review:pending'] };
     const provider = { readPrState: () => structuredClone(state),
-      postComment: (repo, pr, body) => state.comments.push({ body, author: { login: 'web-everything' } }), setLabels: () => {} };
+      postComment: (repo, pr, body) => state.comments.push({ id: `comment-${state.comments.length}`, body, author: { login: 'web-everything' } }),
+      editComment: (id, body) => { state.comments.find(c => c.id === id).body = body; }, setLabels: () => {} };
     let run = advanceWhileRunning(startRun({ op: REVIEW_PR_OP, id: 'run-ruling', input: { pr: 7, repo: 'o/r' }, registry }), { registry });
     while (run.pending?.kind === 'judge') {
       run = advanceWhileRunning(run, { registry, resume: { value: run.pending.step === 'judgeCorrectnessAdvisory'
@@ -3844,6 +3850,7 @@ describe('#4315 operation / I/O restart soak', () => {
     expect(run.pending).toMatchObject({ kind: 'confirm', of: 'agent' });
     expect(run.verdict.pendingReferrals).toEqual([]);
     expect(run.verdict.findings).toHaveLength(2);
+    expect(state.comments).toHaveLength(1);
     expect(run.verdict.verdict).toBe(result === 'block' ? 'changes' : 'accept');
     if (result === 'block') expect(() => assertMandatoryReferralsCleared(state, { repo: 'o/r', pr: 7, cardReadable: () => true })).toThrow();
     else expect(assertMandatoryReferralsCleared(state, { repo: 'o/r', pr: 7, cardReadable: () => true }).pending).toEqual([]);
@@ -3854,7 +3861,7 @@ describe('xfkqowg historical ruling replay', () => {
   async function drive({ records = [], source, result = 'not-real', human = true, runId = 'ruling-replay', body = '<!-- authored-by-actor: author -->', head = PINNED_HEAD } = {}) {
     const { registry } = registryFor({ labels: [human ? 'review:human' : 'review:pending'], netRev: head, body,
       comments: records.map(r => ({ body: renderReferralRecord(r), author: { login: 'web-everything' } })) }, { antigravityReview: true });
-    const state = { headRefOid: head, body, labels: [human ? 'review:human' : 'review:pending'], comments: records.map(r => ({ body: renderReferralRecord(r), author: { login: 'web-everything' } })) };
+    const state = { headRefOid: head, body, labels: [human ? 'review:human' : 'review:pending'], comments: records.map((r, i) => ({ id: `comment-${i}`, body: renderReferralRecord(r), author: { login: 'web-everything' } })) };
     const trace = [];
     const judge = vi.fn(async request => {
       if (result === 'unavailable') throw new Error('ruling unavailable');
@@ -3864,7 +3871,8 @@ describe('xfkqowg historical ruling replay', () => {
         evidence: ['reviewed diff'], card: result === 'card' ? 'we:backlog/7-filed.md' : '' })) } };
     });
     const provider = { readPrState: () => structuredClone(state), ensureLabel: () => {},
-      postComment: (repo, pr, body) => { trace.push(body.includes('mandatory-referrals-v1') ? 'referral' : 'advisory'); state.comments.push({ body, author: { login: 'web-everything' } }); },
+      postComment: (repo, pr, body) => { trace.push(body.includes('mandatory-referrals-v1') ? 'referral' : 'advisory'); state.comments.push({ id: `comment-${state.comments.length}`, body, author: { login: 'web-everything' } }); },
+      editComment: (id, body) => { trace.push('referral'); state.comments.find(c => c.id === id).body = body; },
       setLabels: (repo, pr, plan) => { trace.push(plan.add); state.labels = [...state.labels.filter(l => !plan.remove.includes(l)), plan.add]; } };
     const sinks = createReviewPrSinks({ labelProvider: provider, postComment: provider.postComment, referralJudge: judge,
       mirrorReferral: () => {}, cardReadable: () => true, out: () => {} });
@@ -4707,5 +4715,49 @@ describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', (
         { antigravityReview: true, codexAdvisory: true }, { judgeAdvisory: { summary: 'x', findings: [claim] } });
       expect(requests[REFERRAL_VERIFIER_STEP].input).toContain('confirmed defect');
     });
+  });
+});
+
+describe('Gemini admission and the Codex roster', () => {
+  it('Gemini admission settings preserve the requested Codex roster', () => {
+    for (const securitySeat of [true, false]) {
+      for (const codexAdvisory of [false, true]) {
+        for (const correctnessAdvisory of [false, true]) {
+          for (const shadowPolicy of [undefined, { shadowEnabled: false, scope: 'high-care', dailyCap: 100 },
+            { shadowEnabled: true, scope: 'sampled', sampleRate: 0.1, dailyCap: 0 }]) {
+            const declaration = reviewPrOperation({ readPr: stubReader(), securitySeat, codexAdvisory,
+              correctnessAdvisory, seatSettings: { shadowPolicy } });
+            expect(declaration.steps.filter(s => ['judge', 'judgeSecurity', 'judgeAdvisory', 'judgeCorrectnessAdvisory']
+              .includes(s.name)).map(s => s.name)).toEqual([
+              'judge', ...(securitySeat ? ['judgeSecurity'] : []), ...(codexAdvisory ? ['judgeAdvisory'] : []),
+              ...(correctnessAdvisory ? ['judgeCorrectnessAdvisory'] : []),
+            ]);
+          }
+        }
+      }
+    }
+  });
+});
+
+describe('disabled agy shadows at the launch boundary', () => {
+  it('runs only Claude for mandatory seats and renders off (setting), without invoking the agy runner', async () => {
+    const seatSettings = loadReviewSeatSettings({ safeguards: { value: { shadowEnabled: false, sampleRate: 0.1 } }, log: () => {} });
+    const declaration = reviewPrOperation({ readPr: stubReader(), seatSettings });
+    const read = shapeReadFinding(stubReader()({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' });
+    const seatRunner = vi.fn(() => { throw new Error('agy must not start'); });
+    const provider = vi.fn(async () => ({ value: CLEAN_ANSWER }));
+    const judge = createDefaultJudge({ provider, seatRunner });
+    for (const name of ['judge', 'judgeSecurity']) {
+      const request = declaration.steps.find(s => s.name === name).step.request({ input: { lens: 'correctness' }, findings: { read } });
+      await judge(request);
+    }
+    expect(seatRunner).not.toHaveBeenCalled();
+    expect(provider).toHaveBeenCalledTimes(2);
+    const verdict = declaration.steps.find(s => s.name === 'reduce').step.fn({ input: { lens: 'correctness' }, findings: {
+      read, judge: CLEAN_ANSWER, judgeSecurity: CLEAN_ANSWER, judgeAdvisory: CLEAN_ANSWER, judgeAgyCorrectness: CLEAN_ANSWER,
+    } });
+    const text = renderVerdictWriteUp({ read, verdict, answer: 'accept', actor: 'operator' });
+    expect(text).toContain('agy shadow off (setting)');
+    expect(text).not.toContain('held (agy quota)');
   });
 });

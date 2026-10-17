@@ -4192,6 +4192,23 @@ generic `changes` answer, bouncing and retrying a PR whose code has nothing wron
 (reusing the file-then-notify shape `buildAcceptQueueEntry` already established), THEN treat the PR as
 accept-worthy — never re-enter the bounce loop over a documentation debt the code itself doesn't have.
 
+**Unattended acceptance boundary (operator, 2026-10-15; live PR #5366):** this refines the
+file-then-accept path above: `prevention-outstanding` still files the named prevention(s), then accepts,
+provided the live head has no open mandatory referrals and no finding in that verdict has impact `broken`
+without a `card` or `not-real` ruling. Open referrals with no operator ruling, including automatic-policy
+blocks, hold acceptance; a later review comment on that head never retires them. `needs-human` still never
+auto-accepts, and `changes` auto-accepts only through the existing round-cards rule (cards 5471/5470): one card
+filed for every held finding first, then the same live-head and live-referral gate. The gate fails closed when
+the reviewed head is unknown, and a filing branch whose accept the gate then holds reports it as not accepted.
+Read referrals with
+`we:scripts/operations/record-referral-ruling.mjs#openReferralFindings`, preserving their run and finding keys
+until a ruling or head change. Cumulative referral snapshots update the original comment, retaining prior
+rulings, instead of repeating the operator ask. The boundary lives in
+`we:scripts/operations/review-loop-cli.mjs` with the pure gate in `we:scripts/lib/unattended-review-accept.mjs`.
+`review.unattendedAcceptRequiresCleanReferrals` defaults to `true` and resolves through the shared
+standard → platform → tool → env cascade with source logging (tool: `we:scripts/settings/review.json`;
+env: `WE_REVIEW_UNATTENDED_ACCEPT_REQUIRES_CLEAN_REFERRALS`).
+
 **A distinct mechanism from the enforce-flip above — not a loosening of it.**
 [#enforce-flip-triple-gated](#enforce-flip-triple-gated) (#2838) gates a *different* code path — the
 **scheduled shadow review runner**'s `landMode` (`we:scripts/lib/auto-land-seam.mjs` /
@@ -5427,6 +5444,14 @@ tree at ratification and the ruling did not change. Full reasoning and the rejec
 [#3056](/backlog/3056-the-judge-spawn-argv-guard-is-a-one-token-denylist-a-flag-sh/).
 
 ### An approval carries across a push only when the drain replays the merge of main itself and gets the pushed tree; a conflict, a non-merge commit, or main touching the PR's files re-parks {#merge-only-push-approval-carry}
+
+**Operator amendment, 2026-10-16 (open-PR time-loss fixes):** the existing sanctioned carry writers may
+also carry a recorded approval across a rebase or merge of main when each head's nonempty net diff against
+its own merge-base with main has the same `git patch-id --stable`, contribution fingerprint, and exact
+added/removed line bytes (including whitespace and the root manifest). A different or unreadable proof does
+not authorize this route and does not invalidate an independent carry proof. `review.carryAcrossIdenticalNetPatch` defaults true, with its resolved source
+logged. Complete-thread, formal-review, pinned-head and pre-write checks still apply; this adds a proof
+route rather than a new approval writer. The historical merge replay rule below remains a separate route.
 
 **Ratified 2026-09-21 by the operator (Nicolas Gilbert), all four forks approved as prepared, with the
 prepared guardrails, no amendment (`#3735`).** The situation: a PR holds a `review:accepted` acceptance

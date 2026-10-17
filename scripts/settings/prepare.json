@@ -1,9 +1,10 @@
 {
-  "$comment": "retryUnstampedOnce: a prepare that ends without stamping the card for an unrecognised reason is re-dispatched once automatically; a second unstamped ending parks the card on the operator queue (needs-you) with both reasons. autoSize: a card held no-size (a task with no estimatedLoc, a story with no size) is routed to the item prepare, which authors the size/estimate from its touch set. runner: codex judges item preparation by the card file it edits; scope judges by the future implementation scope; claude always uses the Claude prepare session. mergedGuardHours: refuse a merged prepare PR created after the last dispatch only while its creation is within this many hours of now; 0 disables this merged refusal. Cascade: standard booleans true, runner codex, mergedGuardHours 24 → platform prepare → this file → env WE_PREPARE_RETRY_UNSTAMPED_ONCE / WE_PREPARE_AUTO_SIZE / WE_PREPARE_RUNNER / WE_PREPARE_MERGED_GUARD_HOURS.",
+  "$comment": "retryUnstampedOnce: a prepare that ends without stamping the card for an unrecognised reason is re-dispatched once automatically; a second unstamped ending parks the card on the operator queue (needs-you) with both reasons. autoSize: a card held no-size (a task with no estimatedLoc, a story with no size) is routed to the item prepare, which authors the size/estimate from its touch set. runner: codex judges item preparation by the card file it edits; scope judges by the future implementation scope; claude always uses the Claude prepare session. mergedGuardHours: refuse a merged prepare PR while its mergedAt (falling back to closedAt, then createdAt) is within this many hours of now, regardless of dispatch history; 0 disables this merged refusal. Cascade: standard booleans true, runner codex, mergedGuardHours 24 → platform prepare → this file → env WE_PREPARE_RETRY_UNSTAMPED_ONCE / WE_PREPARE_AUTO_SIZE / WE_PREPARE_RUNNER / WE_PREPARE_MERGED_GUARD_HOURS. maxPrListingCallsPerTick: hard budget for prepare PR listing commands across settlement, prefetch and launch guards in one tick (standard 128; platform prepare, this file, then WE_PREPARE_MAX_PR_LISTING_CALLS_PER_TICK). Narrow current-id, bornAs and title queries must each be complete; budget exhaustion refuses that card. The cascade logs the value and source.",
   "prepare": {
     "retryUnstampedOnce": true,
     "autoSize": true,
     "runner": "codex",
-    "mergedGuardHours": 24
+    "mergedGuardHours": 24,
+    "maxPrListingCallsPerTick": 128
   }
 }

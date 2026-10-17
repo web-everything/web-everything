@@ -580,6 +580,7 @@ describe('batching IO shell and drain hook', () => {
     const drain = createDrainMergeStrategy({
       resolved: { policy: { strategy: 'github-merge-queue', sources: {} }, note: null },
       localSlug: 'owner/repo', log: { write: () => {} },
+      readRedTeamEvidence: () => ({ loopPayload: null, inFlight: false, recorded: false }),
       readFile: () => JSON.stringify(stored), writeState: (_path, state) => { stored = structuredClone(state); },
       batching: {
         gate: num => { order.push(['gate', num]); return num === 1 ? { admit: true, groupId: 'reservation-1' } : { admit: false, reason: 'group full' }; },
@@ -588,7 +589,9 @@ describe('batching IO shell and drain hook', () => {
       exec: (cmd, args) => {
         if (cmd === 'git') return args[0] === 'diff' ? 'scripts/x.mjs\0' : '';
         if (args[0] === 'pr' && args[1] === 'comment') return '';
-        if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ id: 'pr-1', headRefOid: head, baseRefName: 'main' });
+        if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ id: 'pr-1', headRefOid: head, baseRefName: 'main', labels: ['ready-to-merge'] });
+        if (args.includes('--slurp')) return '[[]]';
+        if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: order.some(o => o[0] === 'enqueue'), headRefOid: head } } } });
         if (args.includes('graphql')) {
           order.push(['enqueue', 1]);
           return JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'entry-1', position: 1, state: 'QUEUED' } } } });
@@ -598,7 +601,7 @@ describe('batching IO shell and drain hook', () => {
     });
     expect(drain.enqueue({ num: 1 }, head)).toEqual({ enqueued: true, already: false });
     expect(order).toEqual([['gate', 1], ['enqueue', 1], ['confirm', 1, 'reservation-1']]);
-    expect(drain.enqueue({ num: 2 }, head)).toMatchObject({ enqueued: false, deferred: true });
+    expect(drain.enqueue({ num: 2 }, head)).toEqual({ enqueued: false, deferred: true, reason: 'group full' });
     expect(order).toEqual([['gate', 1], ['enqueue', 1], ['confirm', 1, 'reservation-1'], ['gate', 2]]);
     expect(stored.pending.map(p => p.num)).toEqual([1]);
   });
@@ -620,10 +623,27 @@ describe('batching IO shell and drain hook', () => {
     expect(h.shell.gate(4).admit).toBe(false);
     expect(h.renames).toHaveLength(1);
     expect(h.renames[0][1]).toBe('test-state.json');
+    const head = 'a'.repeat(40);
     const calls = [];
-    const drain = createDrainMergeStrategy({ resolved: { policy: { strategy: 'github-merge-queue', sources: {} }, note: null }, log: { write: () => {} }, batching: h.shell, exec: (...args) => calls.push(args) });
-    expect(drain.enqueue({ num: 4 }, 'a'.repeat(40))).toMatchObject({ enqueued: false, deferred: true });
-    expect(calls).toEqual([]);
+    const drain = createDrainMergeStrategy({
+      resolved: { policy: { strategy: 'github-merge-queue', sources: {} }, note: null },
+      localSlug: 'owner/repo', log: { write: () => {} }, batching: h.shell,
+      readRedTeamEvidence: () => ({ loopPayload: null, inFlight: false, recorded: false }),
+      readFile: () => JSON.stringify({ pending: [], followedUp: [] }),
+      exec: (cmd, args) => {
+        calls.push([cmd, args]);
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefOid: head, labels: ['ready-to-merge'] });
+        if (cmd === 'gh' && args[0] === 'api' && args.includes('--slurp')) return '[[]]';
+        throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
+      },
+    });
+    expect(drain.enqueue({ num: 4 }, head)).toEqual({ enqueued: false, deferred: true, reason: 'queue holds 1 group(s) (max 1)' });
+    // Live admission reads the complete thread for recorded breaks before batching, even with no owed red team.
+    // Deferral still makes no enqueue or clearance mutation.
+    expect(calls).toEqual([
+      ['gh', ['pr', 'view', '4', '--repo', 'owner/repo', '--json', 'headRefOid,labels']],
+      ['gh', ['api', '--paginate', '--slurp', 'repos/owner/repo/issues/4/comments']],
+    ]);
   });
   it('dry run performs neither state writes, dequeue, nor cancel', () => {
     const h = ioHarness({ dryRun: true, state: { ...empty(), groups: [group({ seen: [1, 2] })] }, queue: [2] });

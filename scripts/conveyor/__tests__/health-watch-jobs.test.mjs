@@ -282,10 +282,20 @@ describe('tick — the gh cadence as a job never blocks the tick', () => {
     writeFileSync(join(hd, 'config.json'), JSON.stringify({ jobs: { ghProbes } }));
     const lockRoot = join(dir, `${name}-locks`); mkdirSync(lockRoot);
     const empty = join(dir, 'empty.json'); writeFileSync(empty, '{}');
+    // Neutral snapshots through the REAL parsers for the four host reads the tick would otherwise make live
+    // (`heavy-admission status`, `ps`, loadavg, the coordination-root builder log). #5725.
+    const heavyStatus = join(dir, 'heavy-status.json');
+    writeFileSync(heavyStatus, JSON.stringify({ cap: 2, fastSlots: 0, heldCount: 0, freeCount: 2, held: [], waiting: [] }));
+    const psFixture = join(dir, 'ps.txt');
+    writeFileSync(psFixture, '  PID  PPID %CPU     ELAPSED COMMAND\n    1     0   0.0  05-01:00:00 /sbin/launchd\n');
+    const loadFixture = join(dir, 'load.json');
+    writeFileSync(loadFixture, JSON.stringify({ load1: 0.5, load5: 0.5, load15: 0.5, cpuCount: 8 }));
+    const builderLogDir = join(dir, 'builder-logs'); mkdirSync(builderLogDir, { recursive: true });
     const flags = {
       'state-root': stateRoot, 'lock-root': lockRoot, 'logs-dir': join(dir, 'logs'), 'self-sync-dir': join(dir, 'sync'),
       'no-diagnose': true, 'no-investigate': true, 'no-file': true, 'no-notify': true,
       'graphql-budget-fixture': empty, 'rest-budget-fixture': empty, 'credential-inventory-fixture': empty,
+      'heavy-status-file': heavyStatus, 'ps-fixture': psFixture, 'machine-load-fixture': loadFixture, 'builder-log-dir': builderLogDir,
     };
     return { flags, hd };
   }

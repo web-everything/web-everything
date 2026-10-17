@@ -50,11 +50,13 @@ const ADDED_2026_10_08 = ['main-ci-red'];
 const ADDED_2026_10_09 = ['pre-existing-red-on-main'];
 // operator yes 2026-10-14 ~08:00 ET, card 302 — a stalled red-main owner escalates through quiet hours
 const ADDED_2026_10_14 = ['main-ci-red-owner-stalled'];
-const APPROVED = [...new Set([...PREVIOUSLY_APPROVED, ...ADDED_2026_09_27, ...ADDED_2026_09_30, ...ADDED_2026_10_01, ...ADDED_2026_10_04, ...ADDED_2026_10_06, ...ADDED_2026_10_07, ...ADDED_2026_10_08, ...ADDED_2026_10_09, ...ADDED_2026_10_14])];
+// Card 5653: an aged operator-only hold on a PR must alert (the opening notification is the requested alarm).
+const ADDED_2026_10_15 = ['operator-hold-aged'];
+const APPROVED = [...new Set([...PREVIOUSLY_APPROVED, ...ADDED_2026_09_27, ...ADDED_2026_09_30, ...ADDED_2026_10_01, ...ADDED_2026_10_04, ...ADDED_2026_10_06, ...ADDED_2026_10_07, ...ADDED_2026_10_08, ...ADDED_2026_10_09, ...ADDED_2026_10_14, ...ADDED_2026_10_15])];
 
 describe('NOTIFY_EVEN_IN_SHADOW', () => {
-  it('is exactly the union of the approved operator decisions — 25 entries', () => {
-    expect(APPROVED).toHaveLength(25);
+  it('is exactly the union of the approved operator decisions — 26 entries', () => {
+    expect(APPROVED).toHaveLength(26);
     expect([...NOTIFY_EVEN_IN_SHADOW].sort()).toEqual([...APPROVED].sort());
   });
 

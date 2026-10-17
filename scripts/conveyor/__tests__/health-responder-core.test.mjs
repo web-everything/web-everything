@@ -26,7 +26,7 @@ describe('health responder closed decision table', () => {
     for (const s of SMELLS) {
       const i = input(); i.episodes[0].smell = s.id; i.episodes[0].key = `${s.id}::${i.episodes[0].subject}`;
       i.config.smells = { [s.id]: true }; i.subjectFacts = {};
-      if (s.id === 'fix-loop-no-push' || s.id === 'load-flake-hold-no-pickup' || s.id === 'main-ci-red' || s.id === 'main-ci-red-owner-stalled' || s.id === 'overlay-dropped' || s.id === 'github-app-config') {
+      if (s.id === 'fix-loop-no-push' || s.id === 'load-flake-hold-no-pickup' || s.id === 'main-ci-red' || s.id === 'main-ci-red-owner-stalled' || s.id === 'overlay-dropped' || s.id === 'github-app-config' || s.id === 'operator-hold-aged') {
         // Alert-only; this smell grants the responder no action authority.
         expect(s.action).toBe('alert');
         expect(Object.hasOwn(CATALOGUE, s.id)).toBe(false);
@@ -50,6 +50,16 @@ describe('health responder closed decision table', () => {
     const i = input();
     const e = i.episodes[0], facts = i.subjectFacts[e.key];
     e.smell = 'pr-no-movement'; e.key = `${e.smell}::${e.subject}`;
+    e.recommendation = 'Grant rounds and re-arm review';
+    facts.episodeKey = e.key;
+    i.subjectFacts = { [e.key]: facts };
+    i.config.smells = { [e.smell]: true };
+    expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false });
+  });
+  it('keeps quarantine repair alerts observation-only even with a permitted action plan', () => {
+    const i = input();
+    const e = i.episodes[0], facts = i.subjectFacts[e.key];
+    e.smell = 'red-main-quarantined-test'; e.key = `${e.smell}::${e.subject}`;
     e.recommendation = 'Grant rounds and re-arm review';
     facts.episodeKey = e.key;
     i.subjectFacts = { [e.key]: facts };

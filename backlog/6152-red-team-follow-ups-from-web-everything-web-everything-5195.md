@@ -38,3 +38,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5195 (finding 3: `we:scripts/lib/ledger-readiness-daily.mjs:89` — edge-case, degraded An overnight quiet toggle suppresses the following evening's check)

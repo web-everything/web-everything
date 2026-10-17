@@ -32,7 +32,13 @@ function runner({ comments, fail = [], agents = '[]', protection = '{"contexts":
       labels: labels.map(name => ({ name })), body: '', createdAt: HEAD_AT });
   };
 }
-const io = (extra = {}) => ({ run: runner(extra), home: scratch, root: scratch,
+/** The shared per-repo required-checks reader, injected: `protection` is the legacy-shaped body it answers with. */
+const sharedReader = ({ fail = [], protection = '{"contexts":["test"]}', source = 'live' } = {}) => ({ repo, branch }) => {
+  if (fail.includes('protection')) throw new Error('protection down');
+  const body = JSON.parse(protection);
+  return { checks: [...(body.contexts ?? [])], source, calledWith: { repo, branch } };
+};
+const io = (extra = {}) => ({ run: runner(extra), readRequiredChecks: sharedReader(extra), home: scratch, root: scratch,
   env: { WE_STATE_DAEMON_ROOT: join(scratch, 'daemon') }, now: () => '2026-10-06T12:00:00Z' });
 const note = (body, login = 'web-everything', createdAt = '2026-10-06T11:00:00Z') => ({ body, createdAt, author: { login } });
 
@@ -90,6 +96,47 @@ describe('readPrFacts probes', () => {
   });
 });
 
+describe('readPrFacts required-check probe goes through the shared reader (xqd4v1o)', () => {
+  it('asks the shared reader for the repo it was given and makes zero direct protection gh calls', () => {
+    const calls = [], gh = [];
+    const inner = runner();
+    const facts = readPrFacts(PR, { ...io(), run: (bin, args) => { gh.push([bin, ...args].join(' ')); return inner(bin, args); },
+      readRequiredChecks: (arg) => { calls.push(arg); return { checks: ['test'], source: 'cache' }; }, repo: 'plateauapp/plateau-app' });
+    expect(calls).toEqual([{ repo: 'plateauapp/plateau-app', branch: 'main' }]);
+    expect(gh.some(c => /protection/.test(c))).toBe(false);
+    expect(facts.requiredChecks.map(c => c.name)).toEqual(['test']);
+  });
+  it('uses the shared reader\'s declared result as-is: the intended policy after a protection denial, not a failed read', () => {
+    const facts = readPrFacts(PR, { ...io(), readRequiredChecks: () => ({ checks: ['test', 'e2e'], source: 'declared' }) });
+    expect(facts.requiredChecks.map(c => c.name)).toEqual(['test', 'e2e']);
+    expect(facts.probeErrors).toEqual([]);
+  });
+  it.each([
+    ['fallback', 'required-check policy (using declared fallback) unavailable'],
+    ['unavailable', 'required-check policy (using declared fallback) unavailable'],
+    ['stale-cache', 'required-check policy (stale cache) unavailable'],
+  ])('a %s result keeps its checks but stays visible as a failed live read (never a silent substitute)', (source, message) => {
+    const facts = readPrFacts(PR, { ...io({ labels: ['ready-to-merge'] }), readRequiredChecks: () => ({ checks: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'], source }) });
+    expect(facts.requiredChecks.map(c => c.name)).toEqual(['test', 'smoke', 'daemon-soak', 'soak-replay-gate']);
+    expect(facts.probeErrors).toContain(message);
+    expect(derivePrState(facts).phase).toBe('NEEDS-OPERATOR');
+  });
+  it.each(['live', 'cache'])('a %s result is silent', (source) => {
+    expect(readPrFacts(PR, { ...io(), readRequiredChecks: () => ({ checks: ['test'], source }) }).probeErrors).toEqual([]);
+  });
+  it('an empty shared result reports "required-check set empty" (readiness unknown)', () => {
+    const facts = readPrFacts(PR, { ...io(), readRequiredChecks: () => ({ checks: [], source: 'unavailable' }) });
+    expect(facts.probeErrors).toContain('required-check set empty; readiness unknown');
+  });
+  it('a throwing or malformed shared reader degrades to the declared policy and is visible', () => {
+    for (const readRequiredChecks of [() => { throw new Error('x'); }, () => ({ source: 'live' })]) {
+      const facts = readPrFacts(PR, { ...io(), readRequiredChecks });
+      expect(facts.probeErrors).toContain('required-check policy (using declared fallback) unavailable');
+      expect(facts.requiredChecks.map(c => c.name)).toEqual(['test', 'smoke', 'daemon-soak', 'soak-replay-gate']);
+    }
+  });
+});
+
 describe('readPrFacts reads the repo it is given (xhetzpl)', () => {
   /** Record every gh argv so the test can assert the slug each probe carried. */
   const recording = () => { const calls = []; const inner = runner(); return { calls, run: (bin, args) => { calls.push([bin, ...args]); return inner(bin, args); } }; };
@@ -99,8 +146,8 @@ describe('readPrFacts reads the repo it is given (xhetzpl)', () => {
     const gh = rec.calls.filter(c => c[0] === 'gh');
     expect(gh.find(c => c.includes('view'))).toEqual(expect.arrayContaining(['--repo', 'plateauapp/plateau-app']));
     expect(gh.find(c => c.includes('graphql')).join(' ')).toContain('owner:"plateauapp",name:"plateau-app"');
-    expect(gh.find(c => c.some(a => /protection/.test(a))).join(' ')).toContain('repos/plateauapp/plateau-app/');
     expect(gh.flat().join(' ')).not.toContain('web-everything/web-everything');
+    expect(gh.some(c => c.some(a => /protection/.test(a)))).toBe(false); // the probe goes through the shared cache, never a direct read
     expect(facts.probeErrors).toEqual([]);
   });
   it('an unreadable protection probe falls back to that repo\'s declared policy, not WE\'s (plateau-app: test + e2e)', () => {

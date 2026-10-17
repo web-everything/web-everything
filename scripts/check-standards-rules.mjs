@@ -13,6 +13,7 @@
  * feed (#095/#196/#197) and the human output are unchanged.
  */
 
+import { validateOperatorTask } from './backlog/operator-task.mjs';
 import { CLOSED_REASONS, isTerminalStatus } from './lib/backlog-status.cjs';
 
 import { createRequire } from 'node:module';
@@ -29,6 +30,130 @@ import { scrubPublish } from './lib/secret-scrub.mjs';
 import { validateDeliveryTarget } from './lib/poc-branches.mjs';
 
 const requireCjs = createRequire(import.meta.url);
+
+/** `file#parser` entries that predate the rule below: each already restricts authors some other way (a delegated
+ * trusted-comment helper, a login allowlist, `isOperatorAuthored`, a gate on the right of `&&`/`||`) or is a documented
+ * residual. Keyed by parser name so a NEW parser in one of these files is still scanned. New parsers must use the helper. */
+const COMMENT_MARKER_PARSERS_REVIEWED = new Set([
+  'scripts/conveyor/exhausted-retry.mjs#retryOutcome', // latestMarker / trustedRetryMarkerComments authenticate before returning comments
+  'scripts/conveyor/exhausted-retry.mjs#exhaustionFacts', // standDownComments / trustedRetryMarkerComments authenticate the parsed comments
+  'scripts/conveyor/fix-takeover.mjs#takeoverLedger',
+  'scripts/conveyor/reconcile-note-comment.mjs#hasPostedNoteComment',
+  'scripts/conveyor/review-hold-reconcile.mjs#sweepReviewHoldLabels', // its one direct body read is of the record latestAcceptRecord returned, which authenticates every author via isTrustedMarkerAuthor
+  'scripts/conveyor/round-extension-mark.mjs#roundExtensionGrants',
+  'scripts/conveyor/stand-down-answer-core.mjs#parseOperatorAnswer',
+  'scripts/conveyor/stand-down.mjs#supersedeHoldsOn',
+  'scripts/conveyor/stand-down.mjs#concurrentAuthorPauses',
+  'scripts/lib/approval-prevention-notice.mjs#hasApprovalPreventionMarkerForHead',
+  'scripts/lib/drain-merge-strategy.mjs#readEnqueueClearance',
+  'scripts/lib/drain-merge-strategy.mjs#anyClearanceMarkerFor', // deliberately any-author: only gates a drain-identity lookup
+  'scripts/lib/jury-core.mjs#parseOperatorRulingComment',
+  'scripts/lib/operator-send-backs.mjs#operatorSendBacks', // isOperatorAuthored rejects every non-operator before reading the body
+  'scripts/lib/red-team-gate.mjs#gateOutcomesForHead',
+  'scripts/lib/review-escalation.mjs#parseOperatorClearance', // residual named in marker-authorship.mjs's header
+  'scripts/lib/review-independence.mjs#parseClearerActorId', // unfiltered today; keep out of this CI repair
+  'scripts/lib/ruling-ledger.mjs#recordSnapshots',
+  'scripts/lib/ruling-ledger.mjs#noticedRungs',
+]);
+
+/** Comment-marker parsers must use the shared authorship boundary, including aliased imports.
+ * Static guard for inline HTML-marker readers; delegated readers inherit their helper's check.
+ */
+export function scanUnauthenticatedCommentMarkerParsers(docs) {
+  const ts = requireCjs('typescript');
+  const findings = [];
+  for (const { file, content } of docs) {
+    if (!/\.(?:mjs|js|ts)$/.test(file) || /__tests__|\.test\./.test(file)) continue;
+    const tree = ts.createSourceFile(file, content, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+    const gates = new Map(), markers = new Set();
+    for (const node of tree.statements) {
+      if (ts.isVariableStatement(node)) for (const declaration of node.declarationList.declarations) {
+        if (declaration.initializer && /<!--/.test(declaration.initializer.getText(tree))) markers.add(declaration.name.getText(tree));
+      }
+      if (!ts.isImportDeclaration(node) || !node.moduleSpecifier.text?.endsWith('/marker-authorship.mjs')) continue;
+      const bindings = node.importClause?.namedBindings;
+      if (bindings && ts.isNamedImports(bindings)) for (const element of bindings.elements) {
+        const imported = (element.propertyName ?? element.name).text;
+        if (['isTrustedMarkerAuthor', 'countTrustedLeadingMarker'].includes(imported)) gates.set(element.name.text, imported);
+      }
+    }
+    const visit = node => {
+      if (ts.isFunctionLike(node) && node.body) {
+        const body = node.body.getText(tree);
+        const readsComments = node.parameters.some(p => /comments|thread/i.test(p.name.getText(tree)))
+          || (node.name && /^(?:parse|count|read)/i.test(node.name.getText(tree)));
+        let referencesMarker = /<!--/.test(body);
+        const findMarker = child => {
+          if (ts.isIdentifier(child) && markers.has(child.text)) referencesMarker = true;
+          ts.forEachChild(child, findMarker);
+        };
+        findMarker(node.body);
+        if (readsComments && referencesMarker && /(?:\.body|bodyOf\()/.test(body)) {
+          let guarded = false;
+          const check = child => {
+            if (ts.isCallExpression(child)) {
+              const callee = child.expression;
+              if (ts.isIdentifier(callee) && gates.has(callee.text)) {
+                let expression = child, parent = child.parent;
+                while (parent && (ts.isParenthesizedExpression(parent) || ts.isPrefixUnaryExpression(parent))) {
+                  expression = parent; parent = parent.parent;
+                }
+                // A rejecting guard must leave the untrusted path before parsing. Merely
+                // testing authorship in an if statement does not filter any comments.
+                const unparen = node => ts.isParenthesizedExpression(node) ? unparen(node.expression) : node;
+                const predicate = unparen(expression);
+                const rejectsUntrusted = ts.isPrefixUnaryExpression(predicate)
+                  && predicate.operator === ts.SyntaxKind.ExclamationToken
+                  && unparen(predicate.operand) === child;
+                // An OR of rejection conditions still exits for every untrusted comment.
+                // Do not cross AND/??: those can allow an untrusted comment to reach parsing.
+                let rejection = expression, rejectionParent = parent;
+                while (rejectionParent && (ts.isParenthesizedExpression(rejectionParent)
+                  || (ts.isBinaryExpression(rejectionParent)
+                    && rejectionParent.operatorToken.kind === ts.SyntaxKind.BarBarToken))) {
+                  rejection = rejectionParent; rejectionParent = rejectionParent.parent;
+                }
+                if (gates.get(callee.text) === 'isTrustedMarkerAuthor' && rejectsUntrusted
+                  && ts.isIfStatement(rejectionParent) && rejectionParent.expression === rejection) {
+                  const branch = rejectionParent.thenStatement;
+                  const exit = ts.isBlock(branch) ? branch.statements.at(-1) : branch;
+                  if (exit && (ts.isContinueStatement(exit) || ts.isReturnStatement(exit) || ts.isThrowStatement(exit))
+                    && !/<!--|\.body|bodyOf\(/.test(branch.getText(tree))) guarded = true;
+                }
+                if (gates.get(callee.text) === 'isTrustedMarkerAuthor' && !rejectsUntrusted
+                  && ((ts.isConditionalExpression(parent) && parent.condition === expression
+                    && /<!--|\.body|bodyOf\(/.test(parent.whenTrue.getText(tree)))
+                  || (ts.isBinaryExpression(parent) && parent.left === expression
+                    && parent.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken
+                    && /<!--|\.body|bodyOf\(/.test(parent.right.getText(tree))))) guarded = true;
+                if (gates.get(callee.text) === 'isTrustedMarkerAuthor' && predicate === child
+                  && ts.isArrowFunction(parent) && parent.body === expression) {
+                  const filter = parent.parent;
+                  if (ts.isCallExpression(filter) && ts.isPropertyAccessExpression(filter.expression)
+                    && filter.expression.name.text === 'filter' && filter.arguments.includes(parent)) guarded = true;
+                }
+                if (gates.get(callee.text) === 'countTrustedLeadingMarker' && ts.isReturnStatement(parent)) guarded = true;
+              }
+              if (ts.isPropertyAccessExpression(callee) && callee.name.text === 'filter'
+                && child.arguments.some(arg => ts.isIdentifier(arg) && gates.get(arg.text) === 'isTrustedMarkerAuthor')) guarded = true;
+            }
+            ts.forEachChild(child, check);
+          };
+          check(node.body);
+          // Name the parser: two flagged parsers in one file must not share one (message, file) pair.
+          const name = node.name?.getText(tree) ?? (ts.isVariableDeclaration(node.parent) ? node.parent.name.getText(tree) : 'anonymous');
+          if (!guarded && !COMMENT_MARKER_PARSERS_REVIEWED.has(`${file}#${name}`)) findings.push({
+            message: `${file}: comment-marker parser ${name} must filter authors through the shared marker-authorship helper`,
+            descriptor: { kind: 'comment-marker-authorship', file, line: tree.getLineAndCharacterOfPosition(node.getStart(tree)).line + 1 } });
+          return;
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(tree);
+  }
+  return findings;
+}
 
 /** #2866: literal invisible characters are forbidden even in Markdown prose and fixtures.
  * Use visible Unicode escapes to document/test them. Offsets use zero-based UTF-16 code units.
@@ -373,6 +498,7 @@ export function validateBacklogItem(item, ctx) {
   const err = (m, descriptor) => errors.push({ message: m, descriptor });
   const warn = (m, descriptor) => warnings.push({ message: m, descriptor });
 
+  for (const message of validateOperatorTask(item)) err(`Backlog item "${item.id}": ${message}`);
   const backlogFile = item.id ? `backlog/${item.id}.md` : undefined;
   for (const f of ['id', 'title', 'kind', 'status', 'summary', 'dateOpened']) {
     if (item[f] === undefined || item[f] === null || item[f] === '')

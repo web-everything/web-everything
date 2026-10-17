@@ -15,6 +15,9 @@
 # their MERGE-BASE (`we:scripts/lib/soak-gate-merge-base-diff.mjs`) — never a plain two-endpoint `base..head`
 # diff, which misattributes anything `main` changed since the PR's branch diverged to the PR itself (backlog
 # #4264 — live misfire on PR #2822, a backlog-only PR that went red on this exact gap).
+# For a main-targeted PR the BASE it hands over is the main tip fetched during THIS execution, not the event's
+# `base.sha` (frozen when the event fired): commits the PR merely inherited that have since reached main would
+# otherwise be attributed to it (#5939). Lane-targeted (stacked) PRs keep the event base.
 #
 # A SEPARATE TOP-LEVEL WORKFLOW, deliberately NOT a step inside `.github/workflows/ci.yml`'s `daemon-soak` job:
 # PR #2770 was open and restructuring that exact job (into `daemon-soak-scope` / `soak-shard` / `daemon-soak`)
@@ -76,6 +79,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
@@ -92,7 +96,30 @@ jobs:
           # and a `git merge-base` can then find the true fork point rather than the two endpoints directly
           # (backlog/4264 — a shallow `--depth=1` head fetch left no shared history for `merge-base` to walk
           # back to, which is exactly why the old two-endpoint diff was the only thing that could run before).
-          git fetch origin "$HEAD_SHA"
+          if ! git fetch origin "$HEAD_SHA"; then
+            echo "::error::Failed to fetch PR head $HEAD_SHA; soak-replay gate cannot evaluate." >&2
+            exit 1
+          fi
+          # FRESH MAIN BASIS (#5939): the event's base.sha is frozen when the event fired. If commits this PR merely
+          # INHERITED (e.g. a daemon fix on another branch that has since reached main) landed after that, a merge-base
+          # against the stale sha still counts them as the PR's own. For a main-targeted PR, replace BASE_SHA with the
+          # main tip fetched NOW (full ancestry, fixed refspec — nothing PR-supplied reaches the ref), frozen for this
+          # execution. Lane-targeted (stacked) PRs keep their event base: their base is an open branch, not main.
+          # A failed fetch or an unresolvable tip exits nonzero — never fall back to the stale sha or an empty list.
+          if [ "$BASE_REF" = "main" ]; then
+            if ! git fetch origin '+refs/heads/main:refs/remotes/origin/main'; then
+              echo "::error::Failed to fetch current main; soak-replay gate cannot evaluate." >&2
+              exit 1
+            fi
+            if ! MAIN_TIP=$(git rev-parse --verify --end-of-options 'refs/remotes/origin/main^{commit}'); then
+              echo "::error::Could not resolve the fetched main tip to a commit; soak-replay gate cannot evaluate." >&2
+              exit 1
+            fi
+            echo "soak-replay-gate: base = fetched main $MAIN_TIP (event base was $BASE_SHA), head = $HEAD_SHA"
+            BASE_SHA=$MAIN_TIP
+          else
+            echo "soak-replay-gate: base = event base $BASE_SHA (target $BASE_REF), head = $HEAD_SHA"
+          fi
           # BOOTSTRAP for the `--base-sha`/`--head-sha` mode itself: the CLI above is main's copy, so until the PR
           # that adds that mode has landed, main's CLI does not know it (exit 3, usage error). Fall back to
           # computing the same merge-base diff inline and handing it over as `--files-status`, which every CLI

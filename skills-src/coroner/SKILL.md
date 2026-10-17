@@ -107,6 +107,17 @@ in the prompt; role from cwd `we-review-seat-*` = review) and agy stream-json tr
 are per session). Never print tokens or secrets: only counts. Use it for card 64 / agy routing; set
 `WE_CORONER_NO_EXECUTORS=1` to skip.
 
+## 2d. False findings
+
+Before step 1 advances the cursor, run:
+
+```bash
+node scripts/operations/coroner-false-findings.mjs --since=<ISO|last> --json > "$SCRATCH/false-findings.json"
+```
+
+Confirm or correct the rule-guessed causes using *docs/agent/testing.md → False-finding coroner pass*.
+Report counts by cause, lens/seat and PR type, with up to 3 examples each. Keep shadow findings apart.
+
 ## 3. Mark NEW vs COVERED
 
 Compare each friction against, in this order:
@@ -134,6 +145,7 @@ Fixes go into the product (daemon/tooling), never a manual step for one instance
 ## 5. Report
 
 The error-rate section first, then the top-5 causes table (cause, minutes, count, NEW/COVERED-BY), then the change-request root-cause tables and the attribute correlation table (step 2b, code and card-only apart), then one short table of the ranked frictions with the status column, the headline numbers, and the item numbers appended.
+Include the step 2d cause table and a daily summary row: false source events, cause/lens/seat/PR-type counts, unmatched shadow count, and read failures/truncation. The same counts flow into `perf-snapshot` from `errorRates.falseFindings`.
 End with a list of what needs the operator's review.
 
 Repo-only: this skill uses nothing from user-level CLAUDE.md, memory or skills. Runtime state under `~/.claude/jobs`

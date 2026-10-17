@@ -64,6 +64,7 @@ import { daemonJobsRoot } from '../operations/run-store.mjs';
 import { SMELLS } from './health-smells/index.mjs';
 import { readRecentSamples, appendSample, summarizeSample, findUngatedHeavyRuns } from './heavy-run-ungated.mjs';
 import { healthDir, healthSectionLines } from './health-watch-section.mjs';
+import { runDailyReadinessCheck, ledgerReadinessHistoryPath } from '../lib/ledger-readiness-daily.mjs';
 import { runInvestigations } from './health-investigate-dispatch.mjs';
 import {
   planFileRequests, recordRequested, readLedgerStrict, writeLedger, spliceFilingSection, withLedgerLock,
@@ -106,6 +107,7 @@ import { readSeatCapUsage } from '../operations/review-extra-seats.mjs';
 import { runSessionWatchdogPass, resolveSessionWatchdogConfig } from './session-watchdog.mjs';
 import { runGhProbeJobs, resolveHealthJobSwitches, GH_GROUP_PROBE_NAMES } from './health-watch-job.mjs';
 import { runPrSweepJob, resolvePrSweepSettings, prSweepTickAllowed } from './pr-sweep-job.mjs';
+import { runNightlyCoronerJob, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed } from './nightly-coroner-job.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const BOOTSTRAP_TAIL_BYTES = 512 * 1024;
@@ -1121,8 +1123,23 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
       return out;
     }) : null;
 
+  const coronerSettings = resolveNightlyCoronerSettings({ config });
+  if (nightlyCoronerTickAllowed(flags, coronerSettings.value)) {
+    await attempt('nightlyCoronerJob', async () => {
+      const out = await (deps.runNightlyCoronerJob ?? runNightlyCoronerJob)({ now, config: coronerSettings.value, settings: coronerSettings, dir });
+      const errors = [...coronerSettings.errors, ...(out.failures ?? [])];
+      if (errors.length) probeErrors.nightlyCoronerJob = scrubText(errors.join('; '));
+      return out;
+    });
+  }
+
   const logs = attempt('daemonLogs', () => probeDaemonLogs(logsDir, prev.cursors || {}));
   if (logs) probes.daemonLogs = logs.samples;
+  // operator-hold-aged — the review daemon's structured hold snapshots ride the same newline-bounded sample. Availability
+  // is explicit every tick: a successful read (even an empty append) is `available`, a missing review log or a failed
+  // log read is not, and the core treats that as unknown — never as an empty hold set.
+  const reviewLog = logs?.samples.find((x) => x.name === 'review-daemon');
+  probes.operatorHolds = reviewLog ? { available: true, text: reviewLog.text, bootstrap: reviewLog.bootstrap } : { available: false };
   // builder-starved — the build-dispatch daemon's JSON tick log lives in the coordination root, not `logsDir`.
   const builderLogs = attempt('builderLog', () => probeDaemonLogs(flags['builder-log-dir'] || defaultBuilderLogDir(), prev.builderCursors || {}, { only: ['build-dispatch-daemon'] }));
   if (builderLogs) probes.builderLog = builderLogs.samples[0] ?? { name: 'build-dispatch-daemon', text: '' };
@@ -1213,6 +1230,12 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // never reads the host's real file, same rule as `appToken` below.
   probes.drainHistory = flags['lock-root'] && !flags['drain-history'] ? null
     : attempt('drainHistory', () => probeDrainHistory({ ...(flags['drain-history'] ? { path: flags['drain-history'] } : {}), nowMs: now }));
+  // Nightly ledger readiness (verdictLedger.promotion.dailyCheck): runs once per ET day at quiet-hours start or when
+  // quiet mode turns on, appends one line to <health dir>/ledger-readiness-history.jsonl, feeds the
+  // `ledger-readiness-regressed` smell. Read-only toward PRs. A fixture tick never reads the host's shadow records.
+  probes.ledgerReadiness = (flags['lock-root'] || flags['state-root'] || flags['logs-dir']) && !flags['ledger-readiness-history'] ? undefined
+    : attempt('ledgerReadiness', () => runDailyReadinessCheck({ now, dryRun: !!flags['dry-run'],
+      historyPath: flags['ledger-readiness-history'] || ledgerReadinessHistoryPath(dir) }));
   // Build/prepare supervision — external (Codex) runs live only in the build daemon's dispatch run records; fs-only,
   // bounded, every tick. A fixture tick (`--lock-root`) never reads the host's real records.
   if (!flags['lock-root']) {

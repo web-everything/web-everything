@@ -85,6 +85,25 @@ describe('#4389 merge failure isolation', () => {
     expect(mergeCatch).toMatch(/const detail = ghListErrText\(e\);/);
   });
 
+  it('preserves the complete GitHub enqueue diagnostic instead of the wrapper error', () => {
+    const githubMessage = `Pull request has merge conflicts\n${'diagnostic detail '.repeat(30)}`;
+    const error = Object.assign(new Error('enqueue FAILED — retried next pass'), {
+      githubMessage, stderr: 'wrapper stderr',
+    });
+    expect(drain.ghListErrText(error)).toBe(githubMessage);
+  });
+
+  it.each([undefined, null])('keeps the merge stderr cause when githubMessage is %s', (githubMessage) => {
+    const error = Object.assign(new Error('Command failed: gh pr merge 2879\nwrapper details'), {
+      githubMessage, stderr: Buffer.from('warning\nGraphQL: Pull request is not mergeable\n'),
+    });
+    expect(drain.ghListErrText(error)).toBe('Command failed: gh pr merge 2879 — gh: GraphQL: Pull request is not mergeable');
+  });
+
+  it('preserves an explicitly empty GitHub diagnostic', () => {
+    expect(drain.ghListErrText(Object.assign(new Error('wrapper error'), { githubMessage: '' }))).toBe('');
+  });
+
   it('continues after the first failure, keeps its cause, and exits successfully', () => {
     const { status, result, attempts } = runCli();
     expect(attempts).toEqual([2879, 2880]);

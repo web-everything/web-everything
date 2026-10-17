@@ -35,6 +35,7 @@ import {
 import { resolveReviewSeatSetting } from '../../lib/review-seat-settings.mjs';
 
 const NET_PATHS = ['scripts/operations/review-pr.mjs'];
+const HEAD = 'd'.repeat(40);
 
 function stubReader(paths = NET_PATHS, diffText = '--- a/x\n+++ b/x\n+one line\n', diffScored = true) {
   return ({ pr, repo }) => ({
@@ -49,7 +50,7 @@ function stubReader(paths = NET_PATHS, diffText = '--- a/x\n+++ b/x\n+one line\n
     },
     headRefName: 'lane/thing',
     body: 'the PR description',
-    net: { paths, base: 'abc123', rev: 'def456', scored: true },
+    net: { paths, base: 'abc123', rev: HEAD, scored: true },
     diff: { text: diffText, scored: diffScored },
   });
 }
@@ -109,6 +110,8 @@ async function loop({ parallel, judge, seatLanes = null, runId, store = createMe
   const out = await runReviewLoopOnce({
     declaration, registry, argv, store, sinks: recordingSinks(), makeJudge: judge.make, mintRunId: () => runId,
     appendLearning: () => ({ path: '/dev/null' }), fileItem: async () => ({ code: 0, lines: ['{}'] }),
+    // Keep the production acceptance gate enabled against this fixture's pinned head.
+    readAcceptancePr: () => ({ headRefOid: HEAD, body: 'the PR description', comments: [] }),
     parallelJudges: parallel, seatLanes,
   });
   return { out, run: store.read(out.run?.id ?? runId), store, declaration, registry };
@@ -133,6 +136,15 @@ describe('review.parallelSeats — concurrency and an identical record', () => {
     expect(lastStart).toBeLessThan(firstEnd);
     const sum = judge.calls.reduce((n, c) => n + (c.end - c.start), 0);
     expect(wall).toBeLessThan(sum * 0.75);
+    expect(run.seatTimings).toHaveLength(4);
+    for (const row of run.seatTimings) {
+      expect(Object.keys(row).sort()).toEqual(['seat', 'lens', 'provider', 'model', 'startedAt', 'finishedAt', 'verdict', 'findingsCount'].sort());
+      const call = judge.calls.find(c => c.lens === row.lens);
+      expect(Math.abs(Date.parse(row.startedAt) - call.start)).toBeLessThan(20);
+      expect(Math.abs(Date.parse(row.finishedAt) - call.end)).toBeLessThan(20);
+      expect(row.verdict).toBe(row.lens === 'security' ? 'changes' : 'accept');
+      expect(row.findingsCount).toBe(row.lens === 'security' ? 1 : 0);
+    }
     // The run record's own step timings show the overlap too.
     const seats = run.stepTimings.filter((t) => t.step.startsWith('judge') && t.step !== 'judgeReferralVerifier');
     expect(seats).toHaveLength(4);

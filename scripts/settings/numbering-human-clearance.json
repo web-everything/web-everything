@@ -1,0 +1,6 @@
+{
+  "$comment": "review.carryHumanClearanceAcrossNumbering (default true): carry a recorded human clearance only when proveNumberingOnlyMove verifies every byte and file mode. Cascade: standard \u2192 platform review preference \u2192 tool \u2192 WE_REVIEW_CARRY_HUMAN_CLEARANCE_ACROSS_NUMBERING. The resolved source is logged. The existing humanClearanceCarryForward switch still applies.",
+  "review": {
+    "carryHumanClearanceAcrossNumbering": true
+  }
+}

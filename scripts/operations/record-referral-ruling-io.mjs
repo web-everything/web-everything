@@ -7,6 +7,7 @@
  *   The post fails unless the gate's own reader sees the ruling it just wrote.
  */
 
+import { resolveReviewSettings, resolveReviewSettingSource } from '../lib/review-settings.mjs';
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -123,34 +124,41 @@ const lazyPrHead = (open) => {
 };
 
 /** Comparison cache lives for this thread read only; the final write check gets fresh evidence. */
-function readProtectionContext(thread, { repo, pr, readJson, cardReadable, changedLines }) {
+function readProtectionContext(thread, { repo, pr, readJson, cardReadable, changedLines, env = process.env, log = () => {} }) {
   const linesFor = changedLines ?? createChangedLinesReader((args) => {
     const data = readJson(args);
     // Protection needs a complete file list, including when the cited file occurs before the cap.
     if (args[1]?.includes('/compare/') && data?.files?.length >= COMPARE_FILE_CAP) return null;
     return data;
   });
-  return openReferralFindings({ comments: thread.comments, repo, pr: Number(pr), head: thread.headRefOid,
+  const { autoPolicyRespectsNotReal } = resolveReviewSettings({ env });
+  log(`review.autoPolicyRespectsNotReal=${autoPolicyRespectsNotReal} (source: ${resolveReviewSettingSource('autoPolicyRespectsNotReal', { env })})`);
+  return openReferralFindings({ autoPolicyRespectsNotReal, comments: thread.comments, repo, pr: Number(pr), head: thread.headRefOid,
     body: typeof thread.body === 'string' ? thread.body : '', createdAt: thread.createdAt, cardReadable,
     unchangedFinding: ({ repo, base, head, source, target }) => {
+      const missing = path => !path || path === '(no file)';
+      // Only the ORIGINAL citation can show the ruled claim unchanged. A new file the target cites says nothing about
+      // where an uncited original pointed, so a missing source path is unknown evidence, never a stand-in.
+      if (missing(source.file)) return null;
       const file = exactCitedPath(source.file);
-      if (!file || file !== exactCitedPath(target.file)) return null;
+      if (!file || (!missing(target.file) && file !== exactCitedPath(target.file))) return null;
       const changed = linesFor(repo, base, head, file);
       if (!(changed instanceof Set) || (changed.size && !(changed.old instanceof Set))) return null;
+      // A target with no path cites no line in this file, so only the original citation is compared here.
       return !changesTouchCitedLines(changed.old ?? changed, [source.line])
-        && !changesTouchCitedLines(changed, [target.line]);
+        && (missing(target.file) || !changesTouchCitedLines(changed, [target.line]));
     } });
 }
 
 export function createRecordReferralRulingReader({ root = REPO_ROOT, readJson = ghJson, now = () => new Date().toISOString(),
-  env = process.env, readable = referralCardReadable, openPrHead = openPrHeadBacklog, changedLines,
+  env = process.env, readable = referralCardReadable, openPrHead = openPrHeadBacklog, changedLines, log = (m) => process.stderr.write(`${m}\n`),
   // Item 113 — the ruling is judged with THIS checkout's code; refuse from a stale one (see `assertOperatorCliFresh`).
   assertFresh = () => assertOperatorCliFresh(REPO_ROOT, { label: 'record-referral-ruling', env }) } = {}) {
   return ({ repo, pr, card }) => {
     assertFresh();
     const thread = readPrThread(repo, pr, { readJson });
     const cardReadable = (ref) => readable(ref, root);
-    const open = readProtectionContext(thread, { repo, pr, readJson, cardReadable, changedLines });
+    const open = readProtectionContext(thread, { repo, pr, readJson, cardReadable, changedLines, env, log });
     return {
       head: thread.headRefOid, ...open,
       card: resolveCardRef(card, { root, readable, pr, prHead: lazyPrHead(() => openPrHead({ repo, pr, head: thread.headRefOid })) }),
@@ -188,7 +196,7 @@ export async function appendLedgerEvents(events, opts = {}) {
   if (misses.length) throw new Error(events.length === 1 ? misses[0] : `${misses.length} of ${events.length} ledger events failed: ${misses.join('; ')}`);
 }
 
-export function createRecordReferralRulingSinks({ readJson = ghJson, changedLines, root = REPO_ROOT, readable = referralCardReadable,
+export function createRecordReferralRulingSinks({ readJson = ghJson, changedLines, env = process.env, root = REPO_ROOT, readable = referralCardReadable,
   appendEvents = appendLedgerEvents,
   warn = (m) => process.stderr.write(`${m}\n`),
   now = () => new Date().toISOString(),
@@ -247,7 +255,7 @@ export function createRecordReferralRulingSinks({ readJson = ghJson, changedLine
       const before = readPrThread(repo, pr, { readJson });
       if (before.headRefOid !== head) throw new Error(`PR #${pr}'s head moved to ${before.headRefOid} since the plan (${head}); nothing posted — re-run against the new head`);
       if (actor === AUTO_POLICY_ACTOR) {
-        const fresh = readProtectionContext(before, { repo, pr, readJson, changedLines, cardReadable: (ref) => readable(ref, root) });
+        const fresh = readProtectionContext(before, { repo, pr, readJson, changedLines, env, log: warn, cardReadable: (ref) => readable(ref, root) });
         if (fresh.malformed || fresh.protectionMalformed) throw new Error('automatic policy refuses malformed referral history before writing');
         const targets = automaticPolicyTargets(fresh);
         // Report requested skips and any newly protected write target through the existing warning channel.

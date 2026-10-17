@@ -23,6 +23,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveCascade, platformPreference, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 
 // ── The comment the producer writes ─────────────────────────────────────────────────────────────────────────────
@@ -32,6 +33,7 @@ export const RED_TEAM_COMMENT_MARKER = '<!-- we:red-team-advisory';
 /** The tag a finding line carries, by re-check outcome (the producer renders with these). */
 export const RED_TEAM_CONFIRMED_TAG = '**confirmed**';
 export const RED_TEAM_UNCONFIRMED_TAG = 'not confirmed';
+export const RED_TEAM_UNVERIFIABLE_TAG = 'unverifiable';
 
 /** The dedup marker line for one reviewed head. PURE. */
 export function redTeamMarker(pr, rev) {
@@ -39,7 +41,7 @@ export function redTeamMarker(pr, rev) {
 }
 
 const MARKER_RE = /^<!-- we:red-team-advisory pr=(\d+) rev=([0-9a-f]{7,64}) -->/i;
-const FINDING_RE = /^(\d+)\. \[(\*\*confirmed\*\*|not confirmed)\] \(([^,()]+), ([^()]+?)\)(?: `([^`]+)`)? — (.*)$/;
+const FINDING_RE = /^(\d+)\. \[(\*\*confirmed\*\*|not confirmed|unverifiable)\] \(([^,()]+), ([^()]+?)\)(?: `([^`]+)`)? — (.*)$/;
 const SUB_RE = /^ {3}- (Scenario|Re-check): (.*)$/;
 
 /**
@@ -59,6 +61,7 @@ export function parseRedTeamComment(body) {
       const [path, ln] = f[5] ? (/^(.*?):(\d+)$/.exec(f[5])?.slice(1) ?? [f[5], null]) : [null, null];
       const impact = f[4].trim();
       findings.push({
+        ...(f[2] === RED_TEAM_UNVERIFIABLE_TAG ? { recheckOutcome: 'unverifiable' } : {}),
         index: Number(f[1]), confirmed: f[2] === RED_TEAM_CONFIRMED_TAG, category: f[3].trim(),
         impact: impact === 'impact?' ? null : impact, file: path, line: ln == null ? null : Number(ln),
         summary: f[6].trim(), scenario: null, recheck: null,
@@ -117,6 +120,31 @@ export function readConfirmedBreaks({ env = process.env, path = RED_TEAM_SETTING
   let file = {};
   try { file = JSON.parse(readFileSync(path, 'utf8')); } catch { file = {}; }
   return resolveConfirmedBreaks({ file, env });
+}
+
+/** Repo-reading and card-only controls share the standard/platform/tool/env cascade. */
+export const RED_TEAM_PROBE_DEFAULTS = Object.freeze({ recheckReadsRepo: true, skipCardOnly: true });
+export const RED_TEAM_PROBE_ENV = Object.freeze({
+  recheckReadsRepo: 'WE_RED_TEAM_RECHECK_READS_REPO', skipCardOnly: 'WE_RED_TEAM_SKIP_CARD_ONLY',
+});
+export function resolveRedTeamProbes({ file = {}, platform, env = {} } = {}) {
+  const envValues = {};
+  for (const [key, name] of Object.entries(RED_TEAM_PROBE_ENV)) {
+    const raw = env[name];
+    if (raw === undefined || raw === '') continue;
+    const v = String(raw).trim().toLowerCase();
+    envValues[key] = ['true', 'on', '1'].includes(v) ? true : ['false', 'off', '0'].includes(v) ? false : raw;
+  }
+  const pick = (o) => Object.fromEntries(Object.keys(RED_TEAM_PROBE_DEFAULTS).filter(k => o?.[k] !== undefined).map(k => [k, o[k]]));
+  return resolveCascade({ standard: RED_TEAM_PROBE_DEFAULTS, platform: pick(platform), tool: pick(file?.redTeam),
+    envValues, valid: v => typeof v === 'boolean' });
+}
+export function readRedTeamProbes({ env = process.env, path = RED_TEAM_SETTINGS_FILE, log = () => {} } = {}) {
+  let file = {};
+  try { file = JSON.parse(readFileSync(path, 'utf8')); } catch { /* defaults */ }
+  const resolved = resolveRedTeamProbes({ file, platform: platformPreference('redTeam', { env }), env });
+  log(formatCascadeSourcesLine('redTeam', resolved));
+  return resolved;
 }
 
 // ── The decision ────────────────────────────────────────────────────────────────────────────────────────────────

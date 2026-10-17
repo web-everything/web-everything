@@ -31,7 +31,8 @@
  *   and are unit-tested in we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs.
  */
 
-import { isLanePreparePrFor, isPreparePrFor, prepareLaunchRefusal } from '../../scripts/conveyor/prepare-pr-match.mjs';
+import { isLanePreparePrFor, isPreparePrFor, prepareLaunchRefusal, recentMergedPrepare } from '../../scripts/conveyor/prepare-pr-match.mjs';
+import { readBuilderPrCapSettings } from '../../scripts/lib/open-pr-cap-scope.mjs';
 import { readPreparePolicy } from '../../scripts/conveyor/prepare-policy-settings.mjs';
 import { readBuildPrioritySettings } from '../../scripts/lib/build-queue.mjs';
 import { readBuildGroupingSettings, formatBuildGroupingLine, planBuildGroups, retireMemberWhy } from '../../scripts/conveyor/build-grouping.mjs';
@@ -45,6 +46,7 @@ import { createPhaseTimer } from '../../scripts/lib/phase-timer.mjs';
 import { resolveOperationRoute, routingPolicyEnv } from '../../scripts/lib/dispatch-routing-policy-io.mjs';
 import { childFailure } from '../../scripts/lib/child-failure.mjs';
 import { execFileSync, execFile } from 'node:child_process';
+import { execFileSyncThrottled } from '../../scripts/lib/gh-throttle.mjs';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, writeFileSync, rmSync, readFileSync, readdirSync, mkdirSync, appendFileSync, renameSync, statSync } from 'node:fs';
 import os, { tmpdir, hostname, homedir } from 'node:os';
@@ -496,7 +498,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         const num = normNum(st.num);
         const isPrepare = st.kind === 'prepare-item';
         launchSettlement.settled.push({ num, kind: st.kind, launched: Boolean(st.outcome?.dispatching), reason: st.outcome?.reason ?? null });
-        if (st.outcome?.dispatching) { if (!isPrepare && live) effects.clearBuildFailure?.({ num }); continue; }
+        if (st.outcome?.dispatching) continue;
         // The claim goes NOW (so this tick's own claim read already sees it freed); the failure record waits for
         // `failPrepare`/`failures`, declared further down.
         if (isPrepare) effects.releasePrepareClaim({ num }); else effects.releaseClaim({ num });
@@ -506,7 +508,55 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   }
   // Card 80 — the just-in-time prepare settings ride to tick-core as config (window) and on to dispatch-plan
   // (max age + scope drift → `prepare-stale`).
-  const out = await effects.planTick(tickBookkeeping, { config: planConfigFrom(policy) });
+  const preparePolicy = effects.preparePolicy?.() ?? readPreparePolicy();
+  let out = await effects.planTick(tickBookkeeping, { config: planConfigFrom(policy) });
+  const planningSkips = [];
+  // The refusal record a planning skip persists (`prepareRefusals`), exactly as the launch guard would write it.
+  const planningSkipDetail = new Map();
+  // Inspect actual picks, then refill skipped slots. Never scan the entire held backlog: each card costs up to
+  // three synchronous listings from the same 128-call budget the final launch guard needs. Eight observations
+  // bound this lookahead (including selected group members below) to 24 calls; picks beyond that window still
+  // pass the ordinary fail-closed launch guard.
+  const inspectedPrepares = new Set();
+  const inspectPrepareCooldown = async candidate => {
+    const num = normNum(candidate.num);
+    if (typeof effects.listPreparePrs !== 'function' || inspectedPrepares.has(num) || inspectedPrepares.size >= 8) return;
+    inspectedPrepares.add(num);
+    try {
+      const bornAs = candidate.bornAs ?? out?.decisions?.admission?.queue?.find(r => normNum(r.num) === num)?.bornAs
+        ?? (await effects.readPreparedStamp?.({ num }))?.bornAs;
+      const prs = await effects.listPreparePrs({ num, bornAs });
+      const now = effects.now?.() ?? Date.now();
+      const merged = recentMergedPrepare({ num, bornAs, prs, now, mergedGuardHours: preparePolicy.mergedGuardHours });
+      if (!merged) return;
+      const reason = `skipped in planning: prepared ${merged.minutesAgo} min ago (#${merged.pr.number})`;
+      // Persist what the launch guard would: its PR precedence (an open prepare PR outranks the merge, so the
+      // refusal probe still reads it) and reason. Claims, runs and parks stay the launch guard's own checks.
+      const refusal = prepareLaunchRefusal({ num, bornAs, prs, now, mergedGuardHours: preparePolicy.mergedGuardHours });
+      const refusingPr = Number(/prepare PR #(\d+)/.exec(refusal?.reason ?? '')?.[1]);
+      const matched = prs.find(pr => pr?.number === refusingPr) ?? merged.pr;
+      // Read the scope-drift hold from the plan that offered this card: a replan with it held may drop the hold.
+      const scopeHold = (out?.decisions?.admission?.held ?? []).find(h => normNum(h.num) === num
+        && h.reason === 'prepare-stale' && h.detail?.startsWith('scope changed since '));
+      const note = matched.state === 'MERGED' && scopeHold
+        ? `scope moved after prepare: ${scopeHold.detail}; build step must reconcile scope` : null;
+      planningSkips.push({ num, reason, ...(note ? { note } : {}) });
+      planningSkipDetail.set(num, { reason: refusal.reason, pr: matched.number, head: matched.headRefName ?? null,
+        ...(note ? { note } : {}), ...(bornAs ? { bornAs } : {}) });
+      console.error(`build-dispatch-daemon: prepare #${num} ${reason}${note ? ` · ${note}` : ''}`);
+    } catch { /* The launch guard still fails closed on an unreadable listing. */ }
+  };
+  while (typeof effects.listPreparePrs === 'function' && inspectedPrepares.size < 8) {
+    const decisions = out?.decisions ?? {};
+    const candidates = (decisions.spawnPrepareItems ?? decisions.itemPrepareSpawns ?? [])
+      .filter(row => !inspectedPrepares.has(normNum(row.num))).slice(0, 8 - inspectedPrepares.size);
+    if (!candidates.length) break;
+    const previousSkips = planningSkips.length;
+    for (const candidate of candidates) await inspectPrepareCooldown(candidate);
+    if (planningSkips.length === previousSkips) break;
+    tickBookkeeping.prepareHeldNums = [...new Set([...(tickBookkeeping.prepareHeldNums ?? []), ...planningSkips.map(r => r.num)])];
+    out = await effects.planTick(tickBookkeeping, { config: planConfigFrom(policy) });
+  }
   // The plan's age is what dispatch-lane's freshness bound must measure, so stamp it here, once, right after
   // planning — never at each (possibly much later) dispatch.
   const tickAt = new Date(effects.now?.() ?? Date.now()).toISOString();
@@ -663,7 +713,10 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
           memberStillQueued: scopeByNum.has(num), groupMemberFailure: groupingSettings.groupMemberFailure })
           : doneWhy(num, { claimedAt: c.meta?.claimedAt || null });
     if (why) {
-      if (live) effects.releaseClaim({ num });
+      if (live) {
+        if (openPrs.some(pr => prDeliversNum(pr, num))) effects.clearBuildFailure?.({ num });
+        effects.releaseClaim({ num });
+      }
       retired.push({ num, why, released: live });
       continue;
     }
@@ -867,6 +920,15 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         groupMembers = [];
       };
       try {
+        if (effects.resolveBuildCard) {
+          try { await effects.resolveBuildCard({ num: pick.num }); }
+          catch (error) {
+            const reason = error.code === 'card-not-found' ? `build card #${pick.num} unavailable on origin/main` : 'build card lookup unavailable';
+            effects.recordBuildFailure?.({ num: pick.num, reason });
+            failures.push({ num: pick.num, stage: 'card', reason });
+            continue;
+          }
+        }
         if (!(await cloneGate('build', pick.num))) continue;
         const gate = loadGateFor('build', pick.num);
         if (!gate.admit) continue;
@@ -894,7 +956,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
           launchedThisTick.push({ num: normNum(pick.num), kind: 'build', scope: [...new Set([...pick.scope, ...groupMembers.flatMap(num => scopeByNum.get(num) || [])])] });
           dispatched.push({ num: pick.num, lane: res.lane ?? pick.lane, sessionSlug: res.sessionSlug ?? null, ...(groupMembers.length ? { groupMembers: [...groupMembers] } : {}) });
           if (groupMembers.length) console.error(`build-dispatch-daemon: grouped build #${pick.num} members ${groupMembers.map(num => `#${num}`).join(',')} (related: ${groupMembers.map(num => `${num}=${group.related[num]}`).join(',')})`);
-          if (!res.pending) effects.clearBuildFailure?.({ num: pick.num });
+          // Launch confirmation is not delivery: retain prior failures until a PR is observed.
         } else {
           claimed = false;
           effects.releaseClaim({ num: pick.num });
@@ -918,7 +980,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   if (live && !preparesFirst) await launchBuilds();
   // Separate durable claims use the existing lease primitive, without occupying build slots.
   // Run-store rows survive restarts; guards cover the interval before a dispatched lane is visible.
-  const prepareSpawns = d.spawnPrepareItems ?? d.itemPrepareSpawns ?? [];
+  const prepareSpawns = (d.spawnPrepareItems ?? d.itemPrepareSpawns ?? []).filter(p => !planningSkips.some(r => r.num === normNum(p.num)));
   const settledPrepares = new Map();
   for (const row of allSettledPrepares) {
     if (failureRecords.some(f => f.num === row.num && f.attempt === row.source && f.retry)
@@ -934,7 +996,6 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     ...row, evidence: row.evidence ?? releases.find(r => r.probationAttempt === `${row.handle}:${row.scoredAt}`)?.failureEvidence,
   }));
   const configuredPrepare = resolveOperationRoute({ operation: 'prepare-item', taskType: 'prepare', policy: routingPolicy });
-  const preparePolicy = effects.preparePolicy?.() ?? readPreparePolicy();
   const runner = preparePolicy.runner;
   const runnerSource = preparePolicy.sources.runner;
   const fallback = runner === 'claude' || (configuredPrepare ? configuredPrepare.provider === 'claude' : prepareRouteFallback(probationRecords, releases));
@@ -942,6 +1003,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // Card x60i0ie — item prepares are LIGHT: with the rule ON they run under the light cap (else today's two workers).
   const prepareCap = lightCapFor('prepare-item', costSettings, 2);
   const prepare = { runner, runnerSource, policyRoute: configuredPrepare, route: fallback ? 'prepare-route-fallback' : 'probation', enabled: prepareEnabled, cap: prepareCap, planned: [], launched: [], refused: [], inFlight: [], failures: [], retired: [], held: [], handled: [], stamping: [] };
+  prepare.skippedInPlanning = planningSkips;
   prepare.launchOrder = preparesFirst ? 'prepare-first' : 'build-first';
   prepare.refusalHeld = freshRefusals.map(r => ({ num: normNum(r.num), reason: r.reason, since: r.at }));
   prepare.routeFailures = probationRecords.filter(r => r.taskType === 'prepare' && !r.pr && r.launchOutcome !== 'opened-pr' && !PREPARE_HANDLED_OUTCOMES.includes(r.launchOutcome))
@@ -1197,36 +1259,36 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // A refused card is recorded, so the next ticks hold it out of tick-core (see `prepareRefusals`).
   const refusePrepareLaunch = async (num, { pickBornAs, cardBornAs, replacesStamp } = {}) => {
     const bornAs = pickBornAs ?? admission.queue?.find(r => normNum(r.num) === num)?.bornAs ?? cardBornAs;
-    const lastDispatchAt = [
-      ...ledgerFailures.filter(f => normNum(f.num) === num).map(f => f.recordedAt),
-      ...prepareClaims.filter(c => normNum(c.meta?.num) === num).map(c => c.meta.claimedAt),
-      ...allSettledPrepares.filter(r => normNum(r.num) === num).map(r => r.startedAt),
-      ...prepareRows.filter(r => normNum(r.num) === num).map(r => r.row?.entry?.startedAt),
-    ].filter(Boolean).sort().at(-1);
     let refusal;
     try {
       if (typeof effects.listPreparePrs !== 'function') throw new Error('prepare PR listing unavailable');
       const prs = await effects.listPreparePrs({ num, bornAs });
       if (!Array.isArray(prs)) throw new Error('prepare PR listing unavailable');
       refusal = prepareLaunchRefusal({ num, bornAs, prs,
-        lastDispatchAt, now: effects.now?.() ?? Date.now(), mergedGuardHours: preparePolicy.mergedGuardHours,
+        now: effects.now?.() ?? Date.now(), mergedGuardHours: preparePolicy.mergedGuardHours,
         claims: prepareClaims, liveRows: prepareRows, ledgerFailures, releases });
       // Keep WHICH prepare PR refused the card, so the refusal probe reads that PR and no other.
       const refusingPr = Number(/prepare PR #(\d+)/.exec(refusal?.reason ?? '')?.[1]);
       const matched = prs.find(pr => pr?.number === refusingPr);
+      const scopeHold = (admission.held ?? []).find(h => normNum(h.num) === num
+        && h.reason === 'prepare-stale' && h.detail?.startsWith('scope changed since '));
+      if (matched?.state === 'MERGED' && scopeHold) {
+        refusal.note = `scope moved after prepare: ${scopeHold.detail}; build step must reconcile scope`;
+      }
       if (refusal && matched) refusalDetail.set(num, { pr: refusingPr, head: matched.headRefName ?? null,
+        ...(refusal.note ? { note: refusal.note } : {}),
         ...(bornAs ? { bornAs } : {}), ...(replacesStamp !== undefined ? { replacesStamp } : {}) });
     } catch {
       refusal = { reason: 'prepare PR listing unavailable' };
     }
     if (!refusal) return null;
     refusedPrepares.add(num);
-    prepare.refused.push({ num, reason: refusal.reason });
-    console.error(`build-dispatch-daemon: prepare launch of #${num} refused: ${refusal.reason}`);
+    prepare.refused.push({ num, ...refusal });
+    console.error(`build-dispatch-daemon: prepare launch of #${num} refused: ${refusal.reason}${refusal.note ? ` · ${refusal.note}` : ''}`);
     return refusal;
   };
   const prepareAvailable = num => !finishedPrepares.has(normNum(num)) && !heldNums.has(normNum(num))
-    && !refusalHeldNums.has(normNum(num))
+    && !refusalHeldNums.has(normNum(num)) && !planningSkips.some(r => r.num === normNum(num))
     && !prepareBusy.has(normNum(num)) && !prepareMembers.has(normNum(num))
     && !protectedMembers.has(normNum(num)) && !inFlight.some(r => normNum(r.num) === normNum(num))
     && !sameTickClash(num, scopeByNum.get(normNum(num)));
@@ -1243,7 +1305,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       } catch { /* An unknown prepare route cannot own grouped members. */ }
     }
   }
-  const prepareGroupPlan = planBuildGroups({
+  const planPrepareGroups = () => planBuildGroups({
     picks: prepareGroupPicks,
     pool: [...groupRowsByNum.values()].filter(r => needsPrepare.has(normNum(r.num))
       && !otherPrepareHolds.has(normNum(r.num)) && prepareAvailable(r.num)),
@@ -1251,6 +1313,18 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     settings: { ...groupingSettings, groupSmallFindings: groupingSettings.groupSmallFindings
       && groupingCardsLoaded && groupingSettings.groupPrepare === 'per-group' }, exclude: groupDropped,
   });
+  let prepareGroupPlan = planPrepareGroups();
+  // Group members are actual launch candidates too. Inspect only selected members, sharing the lead lookahead
+  // budget, and rebuild after skips so a guarded member cannot crowd a clean replacement out of the group.
+  while (typeof effects.listPreparePrs === 'function' && inspectedPrepares.size < 8) {
+    const members = prepareGroupPlan.groups.flatMap(g => g.members)
+      .filter(num => !inspectedPrepares.has(normNum(num))).slice(0, 8 - inspectedPrepares.size);
+    if (!members.length) break;
+    const previousSkips = planningSkips.length;
+    for (const num of members) await inspectPrepareCooldown(groupRowsByNum.get(normNum(num)) ?? { num });
+    if (planningSkips.length === previousSkips) break;
+    prepareGroupPlan = planPrepareGroups();
+  }
   prepare.groups = prepareGroupPlan.groups;
   if (prepareEnabled && !prepare.freezeHeld) {
     for (const pick of prepareSpawns) {
@@ -1410,11 +1484,14 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       groupDropped: [...groupDropped].slice(-200),
       itemPrepareAttempts,
       prepareRefusals: [
-        ...freshRefusals.filter(r => ![...prepare.refused, ...prepare.launched].some(x => normNum(x.num) === normNum(r.num))
+        ...freshRefusals.filter(r => ![...prepare.refused, ...prepare.launched, ...planningSkips].some(x => normNum(x.num) === normNum(r.num))
           && !finishedPrepares.has(normNum(r.num)))
           .map(r => probedRefusals.has(normNum(r.num)) ? { ...r, probed: true } : r),
         ...prepare.refused.map(r => ({ num: r.num, reason: r.reason, at: new Date(tickNowMs).toISOString(),
           ...refusalDetail.get(normNum(r.num)) })),
+        // A planning skip is a merged-prepare refusal decided earlier: persist it (and its scope note) the same way.
+        ...planningSkips.filter(r => !finishedPrepares.has(r.num))
+          .map(r => ({ num: r.num, at: new Date(tickNowMs).toISOString(), ...planningSkipDetail.get(r.num) })),
       ].slice(-200),
       prepareRecoveryPins: [...recoveryPins.values()].filter(p => !completedPrepares.has(normNum(p.num))).slice(-200),
       prepareGuards: (out?.nextState?.prepareGuards ?? []).filter((g) => !finishedPrepares.has(normNum(g.num))),
@@ -2018,25 +2095,31 @@ export async function cliPredictRoute(num, scope, { root = REPO_ROOT, env = proc
 }
 
 const defaultExecAsync = (cmd, args, opts) => new Promise((resolveExec, rejectExec) => {
-  execFile(cmd, args, { ...opts, maxBuffer: opts?.maxBuffer }, (err, out) => err ? rejectExec(err) : resolveExec(out));
+  execFile(cmd === 'gh' ? process.execPath : cmd, cmd === 'gh' ? [join(SCRIPTS, 'lib', 'gh-throttle.mjs'), ...args] : args, { ...opts, maxBuffer: opts?.maxBuffer }, (err, out) => err ? rejectExec(err) : resolveExec(out));
 });
 
 // Content-addressed statuses remain valid across ticks, even when origin/main advances.
 const prepareBlobStatuses = new Map();
 
 /** Tick-scoped main snapshot and prepare PR discovery. Unavailable observations always throw. */
-export function createPrepareStatusReader({ exec = execFileSync, execAsync = null, prefetchConcurrency = 8 } = {}) {
+export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAsync = null, prefetchConcurrency = 8, maxPrListingCalls = 128 } = {}) {
   // maxBuffer is explicit: the default 1 MiB overflows on a large backlog tree / card batch (cf. 21ce5ea4b).
   const opts = { cwd: REPO_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 15_000, maxBuffer: 64 * 1024 * 1024 };
   const ITEM_PR_LIMIT = 100;
-  let tree, treeError, listing, prError, minClaimedAt;
+  let tree, treeError;
+  let listingCalls = 0;
+  const queryResults = new Map();
+  function reserveListingCall() {
+    if (listingCalls >= maxPrListingCalls) throw new Error(`prepare PR listing call budget exhausted (${maxPrListingCalls})`);
+    listingCalls++;
+  }
   const itemListings = new Map();
   function readTree() {
     retryTransientGit(() => exec('git', ['fetch', '-q', 'origin', 'main'], opts));
     const output = exec('git', ['ls-tree', '-r', 'origin/main', '--', 'backlog/'], opts);
     const cards = new Map();
     for (const line of output.trim().split('\n')) {
-      const match = line.match(/^\d+ blob ([0-9a-f]+)\t(backlog\/(\d+)-.*\.md)$/);
+      const match = line.match(/^\d+ blob ([0-9a-f]+)\t(backlog\/(\d+|x[a-z0-9]{6})-.*\.md)$/);
       if (match && !cards.has(normNum(match[3]))) cards.set(normNum(match[3]), { sha: match[1], path: match[2] });
     }
     return cards;
@@ -2069,25 +2152,22 @@ export function createPrepareStatusReader({ exec = execFileSync, execAsync = nul
     for (const [sha, status] of statuses) prepareBlobStatuses.set(sha, status);
   }
   const prListArgs = (search, limit) => ['pr', 'list', '--repo', CONSTELLATION_REPOS.we.slug, '--state', 'all',
-    '--search', search, '--json', 'number,state,title,headRefName,headRefOid,createdAt,isCrossRepository', '--limit', String(limit)];
+    '--search', search, '--json', 'number,state,title,headRefName,headRefOid,createdAt,mergedAt,closedAt,isCrossRepository', '--limit', String(limit)];
   function ghPrList(search, limit) {
-    const list = JSON.parse(exec('gh', prListArgs(search, limit), opts));
-    if (!Array.isArray(list)) throw new Error('prepare PR listing unavailable');
-    return list;
+    if (!queryResults.has(search)) {
+      try {
+        reserveListingCall();
+        const list = JSON.parse(exec('gh', prListArgs(search, limit), opts));
+        if (!Array.isArray(list)) throw new Error('prepare PR listing unavailable');
+        queryResults.set(search, { list });
+      } catch (error) { queryResults.set(search, { error }); }
+    }
+    const result = queryResults.get(search);
+    if (result.error) throw result.error;
+    if (!Array.isArray(result.list)) throw new Error('prepare PR listing unavailable');
+    return result.list;
   }
-  /** The shared listing, with the date floor and limit it was actually fetched with. */
-  function listPrs() {
-    if (prError) throw prError;
-    if (listing) return listing;
-    try {
-      const floor = minClaimedAt?.slice(0, 10);
-      const limit = floor ? 500 : 1000;
-      // Title-only identities can live on ANY branch, not just lane/.
-      const prs = ghPrList(floor ? `created:>=${floor}` : '', limit);
-      return (listing = { prs, floor, complete: prs.length < limit });
-    } catch (error) { prError = error; throw error; }
-  }
-  /** One item's own listing: the fallback when the shared one cannot be trusted. Saturation fails closed. */
+  /** Per-card branch and title searches. Every component must be complete; saturation fails closed. */
   function itemQuery(num, bornAs) {
     const ids = [...new Set([normNum(num), normNum(bornAs)].filter(Boolean))];
     if (!ids.length || ids.some(id => !/^[a-z0-9._-]+$/.test(id))) throw new Error('invalid prepare PR search identity');
@@ -2108,34 +2188,10 @@ export function createPrepareStatusReader({ exec = execFileSync, execAsync = nul
     }
     return itemListings.get(key);
   }
-  /**
-   * The shared listing answers only when it is provably complete for this read: not capped (a truncated listing is
-   * indistinguishable from "no PR"), and dated no later than this read's claim (a read with an earlier or missing
-   * claim date can have its PR outside the date window). Otherwise fall back to the item's own search.
-   */
-  function prsFor(num, claimedAt, bornAs) {
-    const floor = listing ? listing.floor : minClaimedAt?.slice(0, 10);
-    if (!floor || (claimedAt && claimedAt.slice(0, 10) >= floor)) {
-      const shared = listPrs();
-      if (shared.complete) return shared.prs;
-    }
-    return itemPrs(num, bornAs);
-  }
-  /** Would `prsFor` fall back to this item's own listing? Mirrors its completeness test. */
-  function needsItemListing(num, claimedAt, bornAs) {
-    if (itemListings.has(itemQuery(num, bornAs).key)) return false;
-    const floor = listing ? listing.floor : minClaimedAt?.slice(0, 10);
-    if (!floor || (claimedAt && claimedAt.slice(0, 10) >= floor)) {
-      try { if (listPrs().complete) return false; } catch { return false; } // the lazy read rethrows the cached error
-    }
-    return true;
-  }
-  /**
-   * Item 94 — when the shared listing cannot answer (a held card with no claim date leaves the date floor unset, so
-   * the 1000-PR cap saturates it), every read paid one sequential `gh pr list` (~0.5 s). Fetch exactly those same
-   * per-item listings concurrently instead, up front. Same commands, same results, same saturation check; a failed
-   * prefetch is dropped so the lazy read hits (and reports) the same failure it always did.
-   */
+  // Every identity component must be complete; unrelated repository PR volume never enters this read.
+  const prsFor = (num, claimedAt, bornAs) => itemPrs(num, bornAs);
+  const needsItemListing = (num, claimedAt, bornAs) => !itemListings.has(itemQuery(num, bornAs).key);
+  /** Prefetch independent card searches concurrently, sharing the tick's budget and cached failures. */
   async function prefetchItemListings(entries) {
     const todo = [...new Map(entries.flatMap(e => {
       const card = tree?.get(normNum(e.num));
@@ -2155,21 +2211,33 @@ export function createPrepareStatusReader({ exec = execFileSync, execAsync = nul
         try {
           const prs = [];
           for (const search of searches) {
-            const found = JSON.parse(await execAsync('gh', prListArgs(search, ITEM_PR_LIMIT), opts));
+            if (!queryResults.has(search)) {
+              reserveListingCall();
+              try {
+                const list = JSON.parse(await execAsync('gh', prListArgs(search, ITEM_PR_LIMIT), opts));
+                queryResults.set(search, { list });
+              } catch (error) { queryResults.set(search, { error }); }
+            }
+            const result = queryResults.get(search);
+            if (result.error) throw result.error;
+            const found = result.list;
             if (!Array.isArray(found) || found.length >= ITEM_PR_LIMIT) throw new Error('prepare PR listing unavailable or saturated');
             prs.push(...found);
           }
           itemListings.set(key, uniquePrs(prs));
-        } catch { /* the lazy read repeats this call and reports its own failure */ }
+        } catch { /* the lazy read reports the cached component error or exhausted budget */ }
       }
     };
     await Promise.all(Array.from({ length: Math.min(prefetchConcurrency, todo.length) }, worker));
   }
   return {
+    resolveCard({ num }) {
+      const card = loadTree().get(normNum(num));
+      if (!card) throw Object.assign(new Error(`build card #${num} unavailable on origin/main`), { code: 'card-not-found' });
+      return card;
+    },
     prime(items) {
       const entries = items.map(item => typeof item === 'object' ? item : { num: item });
-      minClaimedAt = entries.length && entries.every(item => item.claimedAt)
-        ? entries.map(item => item.claimedAt).sort()[0] : undefined;
       if (entries.length) loadBlobs(entries.map(item => loadTree().get(normNum(item.num))).filter(Boolean));
       return execAsync && entries.length ? prefetchItemListings(entries) : undefined;
     },
@@ -2472,6 +2540,8 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
 /** Real IO adapters; exported for isolated tests against a temporary coordination root. */
 export function cliEffects() {
   let prepareReader;
+  const reader = () => createPrepareStatusReader({ execAsync: defaultExecAsync,
+    maxPrListingCalls: readPreparePolicy().maxPrListingCallsPerTick });
   return {
     loadGroupingCards: async () => (await loadRouteInputs()).loadItems(),
     completePrepareFailures,
@@ -2516,14 +2586,15 @@ export function cliEffects() {
     listPrepareClaims: () => listBuildDispatchClaims({ lockRoot: prepareClaimRoot(), ignoreExpiry: true }),
     listSettledPrepares: () => cliListSettledBuilds({ launchKind: 'prepare-item' }),
     primePrepareStatus: ({ nums, claims }) => {
-      prepareReader = createPrepareStatusReader({ execAsync: defaultExecAsync });
+      prepareReader = reader();
       return prepareReader.prime(nums.map(num => ({ num,
         claimedAt: claims.find(c => normNum(c.meta.num) === normNum(num))?.meta?.claimedAt })));
     },
-    listPreparePrs: args => (prepareReader ??= createPrepareStatusReader()).listPrs(args),
-    readPrepareStatus: args => (prepareReader ??= createPrepareStatusReader()).read(args),
+    listPreparePrs: args => (prepareReader ??= reader()).listPrs(args),
+    readPrepareStatus: args => (prepareReader ??= reader()).read(args),
     // The card's stamp as it stands at spawn, recorded on the claim.
-    readPreparedStamp: args => (prepareReader ??= createPrepareStatusReader()).stamp(args),
+    readPreparedStamp: args => (prepareReader ??= reader()).stamp(args),
+    resolveBuildCard: args => (prepareReader ??= reader()).resolveCard(args),
     readPrepareEvidence: cliPrepareFailureEvidence,
     stampPrepare: cliStampPrepare,
     placePrepareHold: (o) => placeBuildDispatchHold(o),
@@ -2634,6 +2705,7 @@ export function policyFrom(flags, env = process.env) {
   const n = (v, d) => (Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : d);
   return {
     ...BUILD_DISPATCH_POLICY,
+    ...readBuilderPrCapSettings({ env }),
     maxConcurrentBuilds: n(flags['max-concurrent'] ?? env.WE_BUILD_DAEMON_MAX_CONCURRENT, BUILD_DISPATCH_POLICY.maxConcurrentBuilds),
     maxConcurrentExternalBuilds: n(flags['max-concurrent-external'] ?? env.WE_BUILD_DAEMON_MAX_CONCURRENT_EXTERNAL, BUILD_DISPATCH_POLICY.maxConcurrentExternalBuilds),
     maxOpenPrs: n(flags['max-open-prs'], BUILD_DISPATCH_POLICY.maxOpenPrs),
@@ -2767,7 +2839,7 @@ async function dryRun(flags) {
     timings: { ...timer.snapshot(), tickCore: tick.timings.tickCore },
     statusLine: tick.statusLine,
     policy: {
-      maxConcurrentBuilds: policy.maxConcurrentBuilds, maxConcurrentExternalBuilds: policy.maxConcurrentExternalBuilds, maxOpenPrs: policy.maxOpenPrs, maxOpenItems: policy.maxOpenItems,
+      maxConcurrentBuilds: policy.maxConcurrentBuilds, maxConcurrentExternalBuilds: policy.maxConcurrentExternalBuilds, maxOpenPrs: policy.maxOpenPrs, maxOpenPrsCounts: policy.maxOpenPrsCounts, maxOpenPrsCountsSource: policy.maxOpenPrsCountsSource, maxOpenItems: policy.maxOpenItems,
       // #3383 continuation, live incident 2026-09-28 — `globalFreezeLabels` is what actually freezes every
       // candidate now; the three per-PR `*-stalled` labels only hold a scope-overlapping build (`freezeLabels`
       // still lists all four for anything reading the historical shape, kept alongside, not replaced).

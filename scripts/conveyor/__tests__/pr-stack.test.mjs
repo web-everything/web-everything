@@ -12,6 +12,10 @@ const ancestor = (x, y) => x === a.headRefOid && y === b.headRefOid;
 const NOW = 1_800_000_000_000;
 const live = () => detectStacks([a, b], { isAncestor: ancestor, now: () => NOW });
 const settings = PR_STACK_DEFAULTS;
+// #5725 — the newer `readStacksForPass` ports, pinned so a pass never reads live settings, git or the claim store.
+// Policy mode is explicit (off: pairs stay held, which is what these cases assert); the parallel-fix path has its own
+// deterministic case below.
+const HOLD_PORTS = { reviewWhileBaseOpen: () => false, readStackFiles: () => () => [], readClaims: () => [] };
 const scope = ['we:scripts/merge-ai-prs.mjs', 'we:backlog/xx7ckd6-x.md'];
 const entries = [a, b].map(p => ({ pr: p.pr, headRefOid: p.headRefOid, laneRef: p.headRefName, scope }));
 const claim = pr => ({ meta: { repo: 'we', pr, scope } });
@@ -149,7 +153,7 @@ describe('settings and fail-open IO', () => {
   it('combines planned and open heads, remembers pairs and fails open', () => {
     const writeMem = vi.fn(); const readHeads = vi.fn(() => new Map([a, b].map(p => [p.pr, { headRefName: p.headRefName, headRefOid: p.headRefOid, isCrossRepository: false, author: 'app/bot' }])));
     const options = { root: '/repo', repoKey: 'we', planned: [entries[0]], openPrFiles: [{ pr: b.pr }], settings, readRefs: readHeads, isAncestor: ancestor, onMain: () => false, readMem: () => [], writeMem,
-      readLanes: () => new Map([[a.headRefName, a.headRefOid], [b.headRefName, b.headRefOid]]), now: () => NOW };
+      readLanes: () => new Map([[a.headRefName, a.headRefOid], [b.headRefName, b.headRefOid]]), now: () => NOW, ...HOLD_PORTS };
     expect(readStacksForPass(options).pairs[0]).toMatchObject({ top: b.pr, bottom: a.pr });
     expect(readHeads).toHaveBeenCalledWith('/repo', [a.pr, b.pr]);
     expect(writeMem).toHaveBeenCalledWith('/repo', nextRemembered(live()));
@@ -416,13 +420,27 @@ describe('trust boundary and branch names for idle bottoms', () => {
   const base = (over = {}) => ({ root: '/repo', repoKey: 'we', planned: [entryOf(lanes[1])], openPrFiles: [{ pr: 4624 }, { pr: 4631 }], settings,
     readRefs: () => refsOf({}),
     isAncestor: (x, y) => x === 'aaa' && y === 'bbb', onMain: () => false,
-    readMem: () => [], writeMem: vi.fn(), readLanes: () => new Map([['lane/red-main-contain', 'aaa'], ['lane/accept-carry-forward', 'bbb']]), ...over });
+    readMem: () => [], writeMem: vi.fn(), readLanes: () => new Map([['lane/red-main-contain', 'aaa'], ['lane/accept-carry-forward', 'bbb']]), ...HOLD_PORTS, ...over });
   it('resolves the branch name of an initially idle (unplanned) bottom from origin', () => {
     const options = base();
     expect(readStacksForPass(options).pairs[0]).toMatchObject({ top: 4631, bottom: 4624, bottomRef: 'lane/red-main-contain' });
     const stored = options.writeMem.mock.calls[0][1];
     const moved = detectStacks([mk(4624, 'aaa2', 'lane/red-main-contain'), lanes[1]], { remembered: stored, isAncestor: (x, y) => x === 'aaa' && y === 'bbb' });
     expect(applyStackOrder([entryOf(lanes[1])], moved, { settings }).planned[0].restack.onto).toBe('lane/red-main-contain');
+  });
+  it('with review-while-base-open ON, annotates the open-bottom pair from the injected file and claim reads only', () => {
+    const files = { 'aaa...bbb': ['top.mjs'], 'origin/main...aaa': ['bottom.mjs'] };
+    const calls = [];
+    const readStackFiles = () => (a, b) => { calls.push(`${a}...${b}`); return files[`${a}...${b}`] ?? null; };
+    const on = over => base({ reviewWhileBaseOpen: () => true, readStackFiles, readClaims: () => [], ...over });
+    expect(readStacksForPass(on()).pairs[0]).toMatchObject({ bottomOpen: true, stackPolicy: true, parallelFix: true, bottomClaimed: false });
+    expect(calls).toEqual(['aaa...bbb', 'origin/main...aaa']);
+    expect(readStacksForPass(on({ readClaims: () => [{ meta: { pr: 4624 } }] })).pairs[0].bottomClaimed).toBe(true);
+    expect(readStacksForPass(on({ readClaims: () => { throw Error('claims down'); } })).pairs[0].bottomClaimed).toBeNull();
+    // An unknown read keeps the hold; overlapping files are not a parallel fix.
+    expect(readStacksForPass(on({ readStackFiles: () => () => null })).pairs[0].parallelFix).toBe(false);
+    files['aaa...bbb'] = ['bottom.mjs'];
+    expect(readStacksForPass(on()).pairs[0].parallelFix).toBe(false);
   });
   it('takes the branch name from GitHub, never from a sha: a twin at the same tip cannot be picked', () => {
     const twinTips = new Map([['lane/red-main-contain', 'aaa'], ['lane/red-main-contain-alt', 'aaa'], ['lane/accept-carry-forward', 'bbb']]);
@@ -578,7 +596,7 @@ describe('ownership and bounded git work', () => {
       [4631, { headRefName: lanes[1].headRefName, headRefOid: 'bbb', isCrossRepository: false, author }]]);
     const opts = readRefs => ({ root: '/repo', repoKey: 'we', planned: lanes.map(entryOf), openPrFiles: [{ pr: 4624 }, { pr: 4631 }], settings, readRefs,
       isAncestor: (x, y) => x === 'aaa' && y === 'bbb', onMain: () => false, readMem: () => [], writeMem: vi.fn(),
-      readLanes: () => new Map(lanes.map(p => [p.headRefName, p.headRefOid])) });
+      readLanes: () => new Map(lanes.map(p => [p.headRefName, p.headRefOid])), ...HOLD_PORTS });
     expect(readStacksForPass(opts(() => refs('app/bot'))).pairs).toHaveLength(1);
     expect(readStacksForPass(opts(() => refs('someone-else'))).pairs).toEqual([]);
     expect(readStacksForPass(opts(() => refs(null))).pairs).toEqual([]);

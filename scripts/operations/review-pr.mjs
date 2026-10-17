@@ -1,10 +1,12 @@
+import { advisoryLabelOutcome } from '../lib/review-advisory-outcome.mjs';
+export { advisoryLabelOutcome, deriveAdvisoryOutcome } from '../lib/review-advisory-outcome.mjs';
 import { openOperatorSendBacks, renderOperatorSendBackReviewBlock, operatorSendBackVerdict } from '../lib/operator-send-backs.mjs';
 import { requiresMandatoryReferral, classifyReferralsByRound, laterRoundAdvisoryScopeFromEnv, classifyLaterRoundAdvisory, explainPanelOutcome, foldUntrusted,
   referralKeyFinding, referralFindingKey, findingIdentityEntry, bindFindingIds, readReferralRecords, findingIdentityTable, openReferralHeads, readOperatorRulings,
   seatNeedsToolVerification, knownVerifications, verificationCandidates, settleVerification, applyVerification, verificationsToPersist,
   uncorroboratedRetirements, knownVerificationReasons, foldVerifyReason, activeReferrals } from '../lib/jury-core.mjs';
 // Card 84 — the per-seat provider directive (`review.seatProvider.<lens>`). PURE; the settings are read by the caller.
-import { seatProviderDirective } from '../lib/review-seat-provider.mjs';
+import { seatProviderDirective, shadowSeatStatus } from '../lib/review-seat-provider.mjs';
 import { isQuotaHeldShadow } from '../lib/review-shadow-agreement.mjs';
 /**
  * @file scripts/operations/review-pr.mjs
@@ -203,7 +205,7 @@ import { op } from './registry.mjs';
 // Aliased on import so the STEP NAMES below can be the card's own words (`judge`, `confirm`) without shadowing
 // the builders.
 import { compute, confirm as confirmStep, effect as effectStep, judge as judgeStep } from './step-kinds.mjs';
-import { LEDGER_EFFECT_TYPE } from './effect-executor.mjs';
+import { CONFIRM_ACTORS, CONFIRM_OPTIONS, REVIEW_EFFECTS } from './review-pr-constants.mjs';
 import {
   ADVISORY_LENSES,
   IMPACT_LEVELS,
@@ -1034,11 +1036,9 @@ export const JUDGE_EFFORT = 'high';
  */
 export const JUDGE_BUDGET_USD = null;
 
-/** What the `confirm` step records as the actor. `human` on a gate-self PR, `agent` otherwise. */
-export const CONFIRM_ACTORS = Object.freeze({ HUMAN: 'human', AGENT: 'agent' });
-
-/** The closed answer set for the `confirm` step. `abstain` is the non-mutating exit: it declares NO effects. */
-export const CONFIRM_OPTIONS = Object.freeze(['accept', 'changes', 'abstain']);
+// `CONFIRM_ACTORS`, `CONFIRM_OPTIONS` and `REVIEW_EFFECTS` live in `review-pr-constants.mjs` (#5725) so constant-only
+// consumers need not import this whole operation; they are imported above and re-exported here as the SAME objects.
+export { CONFIRM_ACTORS, CONFIRM_OPTIONS, REVIEW_EFFECTS };
 
 /**
  * #3540 — MAP `record-verdict`'s `to` VOCABULARY (`accepted`/`changes`/`clear-human`) TO THIS `confirm` STEP'S
@@ -1059,39 +1059,6 @@ export function confirmAnswerFor(to) {
   if (to === 'changes') return 'changes';
   return null;
 }
-
-/**
- * The effect types this operation declares. `WRITE_UP` belongs to `stageVerdict`; `LABEL`/`LEDGER`/`NOTICE`
- * belong to `record` (#3540 split the write-up out of `record`, ahead of the label swap); `verdict-ledger.append`
- * is #3032's reserved seam for #3007. `ADVISORY_NOTE` (#xlw02hw) belongs to `advise` and is deliberately its OWN
- * type, never `WRITE_UP`/`LABEL` — those two are the real ceremony's write and a caller (or a sink lookup keyed
- * by type) must never be able to confuse the two kinds of comment this operation can post.
- *
- * `AWAITING_ADVISORY_CLEAR` (mechanical-dispatcher lane) also belongs to `advise` — it is the mechanical flip of
- * `review:awaiting-advisory` → cleared, declared as a SECOND effect right after `ADVISORY_NOTE` so the two are
- * applied by the SAME executor, strictly in order: the note posts first, and only once it has genuinely landed
- * does the executor move on to clear the label. It is its own type (never `LABEL`, `record`'s own effect) for
- * the same reason `ADVISORY_NOTE` is not `WRITE_UP` — this is a plain label removal, not a verdict swap, and the
- * two must never be confusable by a sink lookup keyed on type.
- */
-export const REVIEW_EFFECTS = Object.freeze({
-  WRITE_UP: 'review.write-up',
-  LABEL: 'review.label-swap',
-  LEDGER: LEDGER_EFFECT_TYPE,
-  NOTICE: 'review.notice',
-  MANDATORY_REFERRALS: 'review.mandatory-referrals',
-  ADVISORY_NOTE: 'review.advisory-note',
-  // `advise`'s SECOND effect: the `advisory:accepted` / `advisory:changes` label. Its own type for the same reason
-  // as `ADVISORY_NOTE` — never `LABEL`, which is the real ceremony's `review:*` swap.
-  ADVISORY_LABEL: 'review.advisory-label',
-  AWAITING_ADVISORY_CLEAR: 'review.awaiting-advisory-clear',
-  // Ledger plan slice E2: the `referral` and `review-run` ledger events. ADDITIVE ONLY, never a decision.
-  LEDGER_EVENTS: 'review.ledger-events',
-  // Card 5469: the scoped re-review shadow (finding-identity ledger rows + would-block/would-card journal). SHADOW ONLY.
-  SCOPED_REREVIEW_SHADOW: 'review.scoped-rereview-shadow',
-  // Held item 177: an ACCEPT on a stacked top, recorded as a `reviewed-stack` marker instead of `review:accepted`.
-  STACK_HOLD: 'review.stack-hold',
-});
 
 /**
  * The JSON Schema the juror's answer is FORCED to satisfy (`--json-schema`, #3028). Its finding fields are the
@@ -2183,56 +2150,6 @@ export function listRetirementReasons(retirements) {
 }
 
 /**
- * THE ADVISORY'S OWN OUTCOME — `accept` or `changes` — with the human gate FACTORED OUT. PURE.
- *
- * `verdict.verdict` cannot be used: `derivePanelVerdict` returns `needs-human` for EVERY gate-self PR before it
- * looks at a single finding, so it is identical for a clean advisory and a blocked one. This re-runs the SAME
- * reducer over the SAME admitted findings and lens verdicts with `humanRequired` off, i.e. "what would the panel
- * have said if this PR were not human-gated" — the honest answer to "did the advisory find anything blocking".
- * `accept` only when every mandatory lens accepts and no guard is owed; anything else is `changes`.
- *
- * `null` when no outcome can be honestly derived (no mandatory lens seated, a mandatory lens with no verdict) —
- * the caller then posts the note with no outcome line and applies no label, exactly like before this existed.
- *
- * @param {object} verdict the `reduce` step's output.
- * @returns {'accept'|'changes'|null}
- */
-export function deriveAdvisoryOutcome(verdict) {
-  const v = verdict && typeof verdict === 'object' ? verdict : {};
-  if (v.blockedReferrals?.length) return ADVISORY_OUTCOMES.CHANGES;
-  // Unruled mandatory referrals mean the panel is not done: no outcome (so no `advisory:*` label) rather than a
-  // clean `accept`. Not `changes` either: nothing is broken, a ruling is owed, and `changes` would dispatch a fixer.
-  if (v.pendingReferrals?.length) return null;
-  const lensVerdicts = v.lensVerdicts && typeof v.lensVerdicts === 'object' ? v.lensVerdicts : {};
-  const lenses = Array.isArray(v.lenses) && v.lenses.length ? v.lenses : Object.keys(lensVerdicts);
-  try {
-    const reduced = derivePanelVerdict({
-      lensVerdicts,
-      humanRequired: false,
-      mandatoryLenses: MANDATORY_LENSES.filter((l) => lenses.includes(l)),
-      // The ADMITTED set, exactly as `reduce` reduced it — an off-scope (unverifiable) citation must not block
-      // here any more than it did there (#x6t2z6h). Falls back to the published list for a record that predates it.
-      findings: v.admittedFindings ?? v.findings ?? [],
-    });
-    return reduced === VERDICTS.ACCEPT ? ADVISORY_OUTCOMES.ACCEPT : ADVISORY_OUTCOMES.CHANGES;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * THE OUTCOME THE NOTE STATES AND THE LABEL APPLIES — {@link deriveAdvisoryOutcome}, but only when the panel judged
- * a PINNED commit. An unpinned or degraded basis (`netBasis.rev` null) names no head, so there is no head for a
- * label to describe and no `Net basis: <base>..<head>` line a reader could compare against — the note then carries
- * no outcome line and no label is applied, rather than a label nothing can ever verify. PURE.
- * @returns {'accept'|'changes'|null}
- */
-export function advisoryLabelOutcome({ read, verdict } = {}) {
-  if (!read || read.degraded || !read.netBasis?.rev) return null;
-  return operatorSendBackVerdict(deriveAdvisoryOutcome(verdict), read.openOperatorSendBacks);
-}
-
-/**
  * THE PRE-HUMAN-CEREMONY ADVISORY NOTE (#xlw02hw) — the `advise` step's comment body. PURE.
  *
  * DELIBERATELY SHARES NO SHAPE WITH `renderVerdictWriteUp`'s output beyond the findings table itself
@@ -2335,20 +2252,10 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
  * the real one and tests supply a stub. Built per call so nothing leaks between registries.
  *
  * @param {{readPr: (o: {pr: number, repo: string}) => object, codexAdvisory?: boolean, correctnessAdvisory?: boolean, antigravityReview?: boolean}} deps
- * @param {boolean} [deps.codexAdvisory] - #xqa9ttq — OPT-IN THIRD SEAT. `false` by default: the declaration is
- *   BYTE-IDENTICAL to before this card when omitted, which is deliberate (see the rationale below the roster
- *   check at the bottom of this function, and the file header's "THE THIRD SEAT" section). `true` appends
- *   {@link ADVISORY_JUDGE_SEAT} — a tool-free Codex juror on `ADVISORY_JUDGE_LENS` — as a THIRD `judge` step.
- *   The real binding (`we:scripts/operations/run.mjs`) reads this off `REVIEW_PR_CODEX_ADVISORY=1` in the
- *   environment (mirroring `JUDGE_PROVIDER`'s existing env-fallback shape, since a CLI `--flag` cannot reach
- *   here — the step list is fixed at REGISTRATION, before any run's argv is parsed).
- * @param {boolean} [deps.correctnessAdvisory] - #x8n4crp — OPT-IN FOURTH SEAT, INDEPENDENT of `codexAdvisory`.
- *   `false` by default, for the identical reason. `true` appends {@link CORRECTNESS_ADVISORY_SEAT} — a
- *   read-only-shell Codex juror judging under a correctness-flavoured mandate on {@link CORRECTNESS_ADVISORY_LENS}
- *   (never the literal `'correctness'` — see that constant's own docblock for why) — as a further `judge` step,
- *   after `judgeAdvisory` when both are seated. The real binding reads this off
- *   `REVIEW_PR_CODEX_CORRECTNESS_ADVISORY=1` (`correctnessAdvisoryFromEnv`), a SEPARATE env var from the third
- *   seat's own, so the two Codex seats are toggled independently.
+ * @param {boolean} [deps.codexAdvisory] - Opts into the tool-free Codex simplicity advisory seat.
+ *   The live binding reads REVIEW_PR_CODEX_ADVISORY; omitted is false.
+ * @param {boolean} [deps.correctnessAdvisory] - Independently opts into the Codex correctness advisory seat.
+ *   The live binding reads REVIEW_PR_CODEX_CORRECTNESS_ADVISORY; omitted is false.
  * @param {boolean} [deps.antigravityReview] - #3383 — OPT-IN FIFTH SEAT, INDEPENDENT of both Codex seats above.
  *   `false` by default, for the identical reason. `true` appends {@link ANTIGRAVITY_REVIEW_SEAT} — a genuinely
  *   tool-free Antigravity (`agy`) juror judging under a correctness-flavoured mandate on
@@ -2377,7 +2284,7 @@ export function reviewPrOperation({
   if (agyCorrectness && (MANDATORY_LENSES.includes(AGY_CORRECTNESS_LENS) || PANEL_LENSES.includes(AGY_CORRECTNESS_LENS))) {
     throw new Error(`review-pr: \`AGY_CORRECTNESS_LENS\` (${AGY_CORRECTNESS_LENS}) must stay outside MANDATORY_LENSES/PANEL_LENSES — it is advisory only.`);
   }
-  const directiveFor = (lens) => (seatSettings ? seatProviderDirective(seatSettings, lens) : null);
+  const directiveFor = (lens, read) => (seatSettings ? seatProviderDirective(seatSettings, lens, read) : null);
   if (typeof readPr !== 'function') {
     throw new TypeError(
       'review-pr: needs a `readPr({pr, repo})` reader — the io is INJECTED so the declaration stays testable '
@@ -2638,7 +2545,7 @@ export function reviewPrOperation({
         // above: a step that consumes an input without declaring it is reading state the run record does not
         // record it as depending on.
         aim: typeof view.input.aim === 'string' ? view.input.aim : '',
-        seatProvider: directiveFor(view.input.lens),
+        seatProvider: directiveFor(view.input.lens, view.findings.read),
       }),
     }),
 
@@ -2671,7 +2578,7 @@ export function reviewPrOperation({
           read: view.findings.read,
           lens: SECURITY_LENS,
           aim: typeof view.input.aim === 'string' ? view.input.aim : '',
-          seatProvider: directiveFor(SECURITY_LENS),
+          seatProvider: directiveFor(SECURITY_LENS, view.findings.read),
         }),
       }),
     } : {}),
@@ -3014,6 +2921,8 @@ export function reviewPrOperation({
           // Card 84 — a mandatory seat that ran on agy (`review.seatProvider.<lens>: agy`) or had an agy shadow says
           // so in the panel table; a fallback to Claude reads as plain Claude.
           ...seats.filter((s) => !s.provider && s.answer?.seatProvider?.provider === 'agy').map((s) => [s.lens, 'agy']),
+          ...seats.filter((s) => !s.provider && seatSettings?.seatProvider?.[s.lens] === 'shadow'
+            && shadowSeatStatus(seatSettings, read) !== 'sampled').map((s) => [s.lens, `claude; agy shadow ${shadowSeatStatus(seatSettings, read)}`]),
           ...seats.filter((s) => !s.provider && s.answer?.shadow).map((s) => [s.lens, `claude; agy shadow ${isQuotaHeldShadow(s.answer.shadow) ? 'held (agy quota)' : s.answer.shadow.status}`]),
         ]);
         // Card 84 — THE SHADOW RESULTS, recorded beside the verdict and never reduced into it.

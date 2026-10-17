@@ -1,7 +1,7 @@
 // One `status:*` label per PR — what it is waiting on (operator ask 2026-10-10: #4708/#4689/#4631 sat at the
 // round cap and their labels did not show it).
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 vi.mock('../../lib/proc-read.mjs', async (importOriginal) => ({
@@ -15,6 +15,7 @@ vi.mock('node:child_process', async (importOriginal) => ({
 import { readGh } from '../../lib/proc-read.mjs';
 import { spawnSync } from 'node:child_process';
 import { reviewCiGate } from '../../lib/review-ci-gate.mjs';
+import { defaultCachePath } from '../../lib/required-status-checks.mjs';
 import { derivePrStatusLabel, planPrStatusLabel, PR_STATUS_LABEL_RE, PR_STATUS_DESCRIPTIONS, operatorQueueNeedsYou } from '../pr-status-label.mjs';
 import { mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
 import { tagReviewStatus as tagReviewStatusIo, LEGACY_REVIEW_STATUS_DEFAULT } from '../review-status-tag.mjs';
@@ -496,13 +497,13 @@ describe('status tagger resolves required checks and settings at the IO boundary
     ['malformed live cache', { source: 'live', checks: [''], fetchedAtMs: 0 }, 'status:awaiting-ci'],
   ])('does not fetch required checks with %s using the default reader', (_name, entry, expected) => {
     const dir = mkdtempSync(join(tmpdir(), 'status-tagger-cold-cache-'));
-    const cwd = vi.spyOn(process, 'cwd').mockReturnValue(dir);
+    // The shared cache lives under the coordination root (not the cwd): point it at this test's own directory.
+    vi.stubEnv('WE_COORDINATION_ROOT', dir);
     readGh.mockClear();
     spawnSync.mockClear();
     try {
       if (entry) {
-        mkdirSync(join(dir, 'reports'));
-        writeFileSync(join(dir, 'reports', '.required-status-checks-cache.json'),
+        writeFileSync(defaultCachePath(),
           JSON.stringify({ entries: { 'web-everything/web-everything@main': entry } }));
       }
       const result = tagReviewStatusIo({ pr: 5267, repo: 'web-everything/web-everything', agents: [],
@@ -515,7 +516,7 @@ describe('status tagger resolves required checks and settings at the IO boundary
       expect(spawnSync).not.toHaveBeenCalled();
       expect(result.prStatus).toBe(expected);
     } finally {
-      cwd.mockRestore();
+      vi.unstubAllEnvs();
       rmSync(dir, { recursive: true, force: true });
     }
   });

@@ -1,0 +1,20 @@
+{
+  "$comment": "Complete operator briefs filed with --operatorTask are stamped prepared at filing only after the shared prepare section validator plus Done when/Acceptance, Edge cases and we:-qualified scope checks. Cascade: standard enabled=true → platform build.operatorTask → tool build.operatorTask. Each leaf source is logged by policy-cascade. Disabled filing leaves the card unstamped. Post-build steps require operatorTask: true, enabled=true, an enabled policy leaf and the corresponding card field. Edge-load and live-proof steps are off for every card (planOperatorPostBuild never emits them); only the report step is composed. Verified operator-task authority (an operator instruction record, an explicit P0, prepare and queue admission) is card #xqqmw6g. edgeClones maps allowlisted names to workspace-relative or ~/ paths.",
+  "build": {
+    "operatorTask": {
+      "enabled": true,
+      "postBuild": {
+        "edgeLoad": false,
+        "liveProof": false,
+        "report": true
+      },
+      "edgeClones": {
+        "review": "wev-review-daemon",
+        "fix": "wev-fix-daemon",
+        "control": "wev-control",
+        "drain": ".lanes/we-drain-daemon/code",
+        "health-watch": "wev-health-watch"
+      }
+    }
+  }
+}

@@ -15,12 +15,12 @@
  *     - no live entry for the current red ⇒ fall back to STOP (fail closed).
  *
  *   List file (`quarantine.json` on `ops/quarantine`):
- *     `{ version:1, entries:[{ test, brokenSha, owner, reason, addedAt, expiresAt, area? }] }`
+ *     `{ version:1, entries:[{ test, brokenSha, owner, reason, addedAt, expiresAt, area?, job?, proof? }] }`
  *     plus optional `fixPrs:[n,..]` — the main-fix PR numbers CI runs the quarantined tests for (set by a writer only),
  *     and optional `mode:'stop'|'quarantine'` — the red-main mode the safety net resolved when it last wrote
  *     ({@link setMode}). CI reads it from here, as it reads the entries, so CI and the daemon use ONE switch (the
  *     daemon's env/preference cascade is not visible to a CI job). No stamp ⇒ CI falls back to its own cascade.
- *   Audit trail (`events.jsonl`, same commit): one `{type:'quarantine-added'|'quarantine-removed', ...}` per change.
+ *   Audit trail (`events.jsonl`, same commit): quarantine changes and `card-owed` repair obligations.
  */
 
 export const QUARANTINE_BRANCH = 'ops/quarantine';
@@ -45,6 +45,7 @@ export function validateQuarantineList(list) {
     if (!e || typeof e !== 'object') { errors.push(`entry ${i}: not an object`); return; }
     if (!isStr(e.test) || !SAFE_TEST.test(e.test) || e.test.includes('..')) errors.push(`entry ${i}: bad test id`);
     if (!isStr(e.brokenSha) || !/^[0-9a-f]{7,40}$/.test(e.brokenSha)) errors.push(`entry ${i}: bad brokenSha`);
+    if (e.job !== undefined && typeof e.job !== 'string') errors.push(`entry ${i}: job must be a string`);
     if (!isStr(e.owner)) errors.push(`entry ${i}: owner required`);
     if (!isStr(e.reason)) errors.push(`entry ${i}: reason required`);
     if (!Number.isFinite(e.addedAt) || !Number.isFinite(e.expiresAt) || e.expiresAt <= e.addedAt) errors.push(`entry ${i}: bad addedAt/expiresAt`);
@@ -76,14 +77,14 @@ export function testArea(entry) {
  * Add entries (idempotent per test) — returns the new list and the audit events. Refuses an unknown writer. PURE.
  * @returns {{ok:boolean, list?:object, events?:object[], error?:string}}
  */
-export function addEntries(list, { tests = [], brokenSha, owner, reason, actor, now, ttlMs = QUARANTINE_DEFAULT_TTL_MS, area = null }) {
+export function addEntries(list, { tests = [], brokenSha, owner, reason, actor, now, ttlMs = QUARANTINE_DEFAULT_TTL_MS, area = null, job, proof }) {
   if (!canWriteQuarantine(actor)) return { ok: false, error: `writer "${actor}" may not change the quarantine list (allowed: ${QUARANTINE_WRITERS.join(', ')})` };
   const base = list && list.version === 1 ? list : { version: 1, entries: [] };
   const entries = [...base.entries];
   const events = [];
   for (const test of tests) {
     if (entries.some((e) => e.test === test && now < e.expiresAt)) continue;
-    const e = { test, brokenSha, owner, reason, addedAt: now, expiresAt: now + Math.min(Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : QUARANTINE_DEFAULT_TTL_MS, QUARANTINE_MAX_TTL_MS), ...(area ? { area } : {}) };
+    const e = { test, brokenSha, owner, reason, addedAt: now, expiresAt: now + Math.min(Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : QUARANTINE_DEFAULT_TTL_MS, QUARANTINE_MAX_TTL_MS), ...(area ? { area } : {}), ...(job !== undefined ? { job } : {}), ...(proof ? { proof } : {}) };
     entries.push(e);
     events.push({ type: 'quarantine-added', at: now, actor, ...e });
   }
@@ -166,31 +167,40 @@ export function parseVitestFailures(logText) {
 /** Built-in (standard) knobs of the safety net; the IO resolves each through the policy cascade. */
 export const QUARANTINE_SAFETY_NET_DEFAULTS = Object.freeze({
   /** A failed job matching this is a unit-test job: its log must name every failing test file. */
-  unitJobPattern: '^test-shard \\(\\d+\\)$',
+  unitJobPattern: '^(?:test-shard \\(\\d+\\)|integration|soak-shard \\(\\d+\\))$',
   /** Aggregator jobs that fail only because a unit job did (`test` gates on `needs.test-shard`). */
-  derivedJobs: Object.freeze(['test']),
-  /** More failing files than this is not "a known failing test": stay in STOP. */
+  derivedJobs: Object.freeze(['test', 'daemon-soak']),
+  /** Only quarantine failures with a green run proving a flake. */
+  requireProvenFlake: true,
+  /** Owe a repair card for every new entry. */
+  fileCardPerEntry: true,
+  /** Maximum files quarantined at once, across all live entries. */
   maxTests: 5,
   /** Entry lifetime (minutes); capped by QUARANTINE_MAX_TTL_MS. */
   ttlMin: 360,
 });
 
+/** Only a passing re-run of the failing commit proves a flake; a merge group tested other code (PR #5283). */
+const validFlakeProof = (p) => p && (typeof p.runId === 'string' || typeof p.runId === 'number')
+  && /^[1-9]\d*$/.test(String(p.runId))
+  && p.kind === 'rerun-passed' && Number.isInteger(p.attempt) && p.attempt > 1;
+
 /**
  * What the red-main safety net should do with the list this tick. PURE.
  *   - main red, every failed job either a unit job whose log names its failing files completely or a derived
- *     aggregator, and ≤ maxTests files ⇒ `add` the files (whole-file entries — the only kind CI can skip) not
+ *     aggregator, and live files + additions ≤ maxTests ⇒ `add` the files (whole-file entries — the only kind CI can skip) not
  *     already live for this red;
  *   - main green ⇒ `prune` when the list has any entry; expired entries ⇒ `prune` (expired only);
  *   - anything unknown ⇒ `none` (fail closed: STOP keeps holding).
  * `fixPrs` differing from the list's ⇒ `setFixPrs` alongside.
  * @param {{status:'red'|'green'|'unknown', firstRedSha?:string|null, failedJobs?:string[]|null,
  *   jobFailures?:Record<string, ReturnType<typeof parseVitestFailures>|null>, list?:object|null, fixPrs?:number[],
- *   addedForRed?:string[], now:number, settings?:object}} o  `addedForRed` = files already added for this first red
+ *   addedForRed?:string[], now:number, settings?:object, flakeProof?:object}} o  `addedForRed` = files already added for this first red
  *   commit (the safety net's ledger) — never re-added after they expire.
  * @returns {{action:'add'|'prune'|'none', tests?:string[], names?:string[], why:string, mainGreen?:boolean|null,
  *   fixPrs?:number[]|null}}
  */
-export function planSafetyNet({ status, firstRedSha = null, failedJobs = null, jobFailures = {}, list = null, fixPrs = [], addedForRed = [], now, settings = {} }) {
+export function planSafetyNet({ status, firstRedSha = null, failedJobs = null, jobFailures = {}, list = null, fixPrs = [], addedForRed = [], now, settings = {}, flakeProof = {} }) {
   const s = { ...QUARANTINE_SAFETY_NET_DEFAULTS, ...settings };
   const entries = list?.entries ?? [];
   if (status === 'green') return entries.length ? { action: 'prune', mainGreen: true, why: 'main is green' } : { action: 'none', why: 'main is green; list empty' };
@@ -211,23 +221,31 @@ export function planSafetyNet({ status, firstRedSha = null, failedJobs = null, j
   const derived = new Set(s.derivedJobs ?? []);
   const files = [];
   const names = [];
+  const origins = new Map();
   for (const job of failedJobs) {
     if (unitRe.test(job)) {
       const f = jobFailures?.[job];
       if (!f?.complete) return none(`failing tests of ${job} unknown (not a known-failing-test red)`);
+      if (s.requireProvenFlake && !validFlakeProof(flakeProof?.[job])) return none(`not a proven flake: ${job} (no green re-run of the failing commit)`);
+      for (const file of f.files) if (!origins.has(file)) origins.set(file, { job, proof: flakeProof?.[job] });
       files.push(...f.files);
       names.push(...f.tests.map((t) => (t.name ? `${t.file} > ${t.name}` : t.file)));
     } else if (!derived.has(job)) return none(`job ${job} failed outside the unit suite (quarantine cannot skip it)`);
   }
   const uniq = [...new Set(files)];
   if (!uniq.length) return none('no unit job failed');
-  if (uniq.length > s.maxTests) return none(`${uniq.length} failing test files > maxTests ${s.maxTests}`);
   // A file quarantined once for THIS red is never re-added after it expires: the TTL bounds how long one break may be
   // skipped, so a red that outlives it falls back to STOP instead of being quarantined forever (stale-entry guard).
   const done = new Set(addedForRed ?? []);
   const todo = uniq.filter((f) => !live.some((e) => e.test === f) && !done.has(f));
   if (!todo.length) return none(uniq.some((f) => done.has(f) && !live.some((e) => e.test === f)) ? 'quarantine for this red expired — STOP until main is green' : 'failing tests already quarantined');
-  return { action: 'add', tests: todo, names: [...new Set(names)], firstRedSha, why: `main red since ${firstRedSha.slice(0, 9)} on ${todo.length} known failing test file(s)`, fixPrs: fixDelta };
+  if (new Set([...live.map((e) => testFileOf(e.test)), ...todo]).size > s.maxTests) return none(`quarantine cap ${s.maxTests} reached`);
+  const why = `main red since ${firstRedSha.slice(0, 9)} on ${todo.length} known failing test file(s)`;
+  const newEntries = todo.map((test) => ({ test, ...origins.get(test) }));
+  const expiresAt = now + Math.min(s.ttlMin * 60_000, QUARANTINE_MAX_TTL_MS);
+  const expiryET = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(expiresAt);
+  const cards = s.fileCardPerEntry ? newEntries.map(({ test, job }) => ({ test, job, brokenSha: firstRedSha, why, expiresAt, title: `Quarantined flaky test: ${test} (${job}) — fix or delete before ${expiryET} ET` })) : [];
+  return { action: 'add', entries: newEntries, cards, tests: todo, names: [...new Set(names)], firstRedSha, why, fixPrs: fixDelta };
 }
 
 /**
@@ -252,15 +270,20 @@ export function ciJobContext({ eventName, ref, event = null }) {
  * The CI skip decision for one job. Skips nothing when: the mode is not `quarantine`, the list is unreadable, the job
  * context is unknown, it is main, or the PR is a recorded main-fix PR. A PR that CHANGES a quarantined test file
  * also runs that file (it may be the real fix, or it may be hiding a further break in it). Changed files unknown ⇒
- * every quarantined file runs. PURE.
+ * every quarantined file runs. Omitting `job` selects legacy and tagged unit-shard entries, matching CI's
+ * default unit-suite invocation. An explicit job selects only that job (plus legacy entries for unit shards). PURE.
  * @returns {{skip:string[], why:string, unsupported?:string[]}}
  */
-export function decideCiSkip({ mode, read, ctx, changedFiles = null, now }) {
+export function decideCiSkip({ mode, read, ctx, changedFiles = null, now, job = null }) {
   if (mode !== 'quarantine') return { skip: [], why: `redMainMode is ${mode}` };
   if (!read?.ok) return { skip: [], why: `quarantine list unreadable (${read?.error ?? 'unknown'}) — running everything` };
   if (!ctx?.known) return { skip: [], why: 'job context unknown — running everything' };
   const fixPrs = read.list.fixPrs ?? [];
-  const tests = testsToSkip({ list: read.list, now, prNumber: ctx.prNumber, fixPrs, onMain: ctx.onMain });
+  const isUnitShard = (name) => /^test-shard \(\d+\)$/.test(name);
+  const list = { ...read.list, entries: read.list.entries.filter((e) => job === null
+    ? e.job === undefined || isUnitShard(e.job)
+    : e.job === undefined ? isUnitShard(job) : e.job === job) };
+  const tests = testsToSkip({ list, now, prNumber: ctx.prNumber, fixPrs, onMain: ctx.onMain });
   if (!tests.length) return { skip: [], why: ctx.onMain ? 'main runs every test' : fixPrs.includes(ctx.prNumber) ? `PR #${ctx.prNumber} is the main-fix PR — it runs the quarantined tests` : 'no live quarantine entry' };
   if (!Array.isArray(changedFiles)) return { skip: [], why: 'this PR\'s changed files are unknown — running everything' };
   const changed = new Set(changedFiles);
