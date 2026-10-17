@@ -1,11 +1,16 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { recordBuildFailure, clearBuildFailure, listBuildBackoffs } from '../../../scripts/conveyor/build-dispatch-failures.mjs';
 import { runBuildDispatchTick, cliHostLoadGate, cliSettleLaunches, cliLaunchConfirmed, createPrepareStatusReader } from '../build-dispatch-daemon.mjs';
 import { listBuildDispatchClaims, acquireBuildDispatchClaim, releaseBuildDispatchClaim } from '../../../scripts/conveyor/build-dispatch-claim.mjs';
 import { adoptOrphanedBuildClaims } from '../../../scripts/conveyor/build-dispatch-orphan-adopt.mjs';
+import { outcomePayload } from '../../../scripts/operations/cli-adapter.mjs';
+import { readDispatchOutcome } from '../build-dispatch-daemon.mjs';
+import { readBuildUnconfirmedSettings } from '../../../scripts/lib/build-unconfirmed-settings.mjs';
+import { redactSpawnText } from '../../../scripts/lib/describe-spawn-failure.mjs';
+import { startDetachedLaunch } from '../../../scripts/conveyor/pending-launches.mjs';
 import { execFileSyncThrottled } from '../../../scripts/lib/gh-throttle.mjs';
 
 // Pass-through spy, so the default sync exec of prepare discovery can be pinned to the shared throttle (PR #5453).
@@ -41,6 +46,140 @@ describe('non-blocking launch (78b)', () => {
   beforeEach(() => { lockRoot = mkdtempSync(join(tmpdir(), 'bdd-nb-')); });
   afterEach(() => { rmSync(lockRoot, { recursive: true, force: true }); });
 
+  it.each(['failed', 'indeterminate'])('redacts %s dispatch receipts at the public payload and daemon boundaries', async (status) => {
+    // Shared payload guard: CLI JSON and HTTP run routes both use outcomePayload.
+    // Include settings JSON, assignment, bearer and token shapes across line/quote boundaries.
+    const secret = 'ghp_fixtureSecret123456789';
+    const error = `Command failed: worker --settings {"env":{"GH_TOKEN":"${secret}"}}\n\r\u2028\`" -- ../ GH_TOKEN=${secret} Bearer ${secret}`;
+    const effect = { key: 'receipt#0', type: 'conveyor.dispatch-delivery-agent', status,
+      handle: `worker GH_TOKEN=${secret}`, error };
+    const run = { id: 'secret-receipt', op: 'dispatch-lane', effects: [effect], verdict: { dispatching: true } };
+    const envelope = outcomePayload({ run, stopped: 'effect-halted', error: new Error(error) });
+    // Any additional receipt field needs an explicit public-payload/redaction assertion here.
+    expect(Object.keys(envelope.effects[0]).sort()).toEqual(['error', 'handle', 'key', 'status', 'type']);
+    expect(envelope.effects[0].error).toBe(redactSpawnText(error));
+    expect(envelope.effects[0].handle).toBe(redactSpawnText(effect.handle));
+    expect(envelope.error).toBe(redactSpawnText(error));
+    expect(JSON.stringify(envelope)).not.toContain(secret);
+    // Also defend older/raw producers that bypass the serializer entirely.
+    for (const input of [envelope, { run }]) {
+      const outcome = readDispatchOutcome(JSON.stringify(input));
+      expect(outcome).toMatchObject({ dispatching: false, reason: redactSpawnText(error) });
+      const tick = await runBuildDispatchTick({ live: true, effects: effectsFor(lockRoot, {
+        settleLaunches: () => ({ pending: [], settled: [{ num: '3827', kind: 'build', outcome }] }),
+        dispatch: () => outcome,
+      }) });
+      expect(tick.launchSettlement.settled[0].reason).toBe(redactSpawnText(error));
+      expect(tick.failures.length).toBeGreaterThan(0);
+      for (const failure of tick.failures) expect(failure.reason).toBe(redactSpawnText(error));
+      expect(JSON.stringify(tick)).not.toContain(secret);
+    }
+  });
+
+  it.each(['reason', 'why'])('redacts the dispatch verdict %s fallback', (field) => {
+    const reason = 'refused GH_TOKEN=ghp_fixtureSecret123456789';
+    const envelope = outcomePayload({ run: { id: 'refusal', op: 'dispatch-lane', effects: [], verdict: { dispatching: false, [field]: reason } }, stopped: 'complete' });
+    expect(envelope.verdict[field]).toBe(redactSpawnText(reason));
+    expect(readDispatchOutcome(JSON.stringify({ verdict: { dispatching: false, [field]: reason } })).reason)
+      .toBe(redactSpawnText(reason));
+  });
+
+  it.each(['empty', 'invalid', 'failed', 'partial'])('redacts detached %s output before excerpts reach tick reasons', async (kind) => {
+    const secret = 'ghp_fixtureSecret123456789';
+    const opaque = 'opaqueDiagnosticCredential123';
+    const error = `Command failed: GH_TOKEN=${secret} {"env":{"GH_TOKEN":"${opaque}"}}`;
+    const rec = startDetachedLaunch({ root: lockRoot, num: '3827', kind: 'build', argv: [], env: {}, cwd: lockRoot,
+      spawn: () => ({ pid: 9, unref() {} }) });
+    const envelope = JSON.stringify({ verdict: { dispatching: true },
+      effects: [{ type: 'conveyor.dispatch-delivery-agent', status: 'failed', error }] });
+    const text = kind === 'empty' ? '' : kind === 'invalid' ? error : kind === 'partial' ? `${envelope}\nextra diagnostic` : envelope;
+    writeFileSync(rec.outFile, text);
+    // Place a token across the excerpt boundary: redaction must precede slicing.
+    writeFileSync(rec.errFile, `${'x'.repeat(155)} ${error}`);
+    const tick = await runBuildDispatchTick({ live: true, effects: effectsFor(lockRoot, {
+      settleLaunches: () => cliSettleLaunches({ root: lockRoot, isPidAlive: () => false }),
+      dispatch: () => ({ dispatching: false, reason: 'retry declined' }),
+    }) });
+    expect(tick.launchSettlement.settled[0].reason).toContain('<redacted-token>');
+    expect(JSON.stringify(tick)).not.toContain(secret);
+    expect(JSON.stringify(tick)).not.toContain('fixtureSecret');
+    expect(JSON.stringify(tick)).not.toContain(opaque);
+  });
+
+  it('confirms the real CLI dispatch envelope from its persisted receipt, without a later liveness rescue', async () => {
+    const { createFileRunStore } = await import('../../../scripts/operations/run-store.mjs');
+    const { startRun } = await import('../../../scripts/operations/engine.mjs');
+    const { createRegistry } = await import('../../../scripts/operations/registry.mjs');
+    const { dispatchLaneOperation } = await import('../../../scripts/operations/dispatch-lane.mjs');
+    const registry = createRegistry();
+    registry.register(dispatchLaneOperation({ readTick: () => ({}) }));
+    const store = createFileRunStore(lockRoot);
+    const run = startRun({ op: 'dispatch-lane', id: 'receipt-test', input: { num: '4415' }, registry });
+    run.verdict = { dispatching: true, lane: 16 };
+    run.effects = [{ key: 'receipt-test#2#0', stepIndex: 2, step: 'dispatch', index: 0,
+      type: 'conveyor.dispatch-delivery-agent', idempotent: false, payload: {}, status: 'in-flight', handle: 'pid:65420' }];
+    store.write(run);
+    const envelope = outcomePayload({ run: store.read(run.id), stopped: 'effect-in-flight' });
+    expect(readDispatchOutcome(JSON.stringify(envelope))).toMatchObject({ dispatching: true, handle: 'pid:65420', reason: null });
+    // A key with no handle, a declared effect, and a halted sink still fail closed.
+    for (const receipt of [{ ...run.effects[0], handle: null }, { ...run.effects[0], status: 'declared' },
+      { ...run.effects[0], status: 'failed', error: 'worker refused' }]) {
+      expect(readDispatchOutcome(JSON.stringify(outcomePayload({ run: { ...run, effects: [receipt] }, stopped: 'effect-halted' }))).dispatching).toBe(false);
+    }
+  });
+
+  it('unconfirmed twice on the same base cools down #4415 before any third launch, with durable needs-you evidence', async () => {
+    const path = join(lockRoot, 'failures.json');
+    let clock = 0;
+    const settings = { baseMs: 1, maxMs: 1, maxAttempts: 6 };
+    const reason = 'dispatch launch not confirmed (missing effect; no running session) [stdout: { "stopped": "effect-in-flight" }]';
+    const dispatch = vi.fn(() => ({ dispatching: true, pending: true }));
+    let settled = [];
+    const effects = () => effectsFor(lockRoot, {
+      planTick: () => { const t = tickOut(); t.decisions.spawnBuilds[0].num = '4415'; t.decisions.admission.queue[0].num = '4415'; t.decisions.admission.cleared[0].num = '4415'; return t; },
+      dispatch, settleLaunches: () => ({ pending: [], settled }),
+      recordBuildFailure: o => recordBuildFailure(o, { path, now: clock, settings }),
+      listBuildBackoffs: () => listBuildBackoffs({ path, now: clock }),
+    });
+    await runBuildDispatchTick({ live: true, effects: effects() });
+    settled = [{ num: '4415', kind: 'build', base: 'base-a', outcome: { dispatching: false, reason } }];
+    await runBuildDispatchTick({ live: true, effects: effects() });
+    settled = []; clock = 2;
+    await runBuildDispatchTick({ live: true, effects: effects() });
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    settled = [{ num: '4415', kind: 'build', base: 'base-a', outcome: { dispatching: false, reason: `${reason}; last attempt` } }];
+    const cooled = await runBuildDispatchTick({ live: true, effects: effects() });
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(cooled.needsYou).toContainEqual(expect.objectContaining({ num: '4415', step: 'launch-confirmation', reason: expect.stringContaining('last attempt') }));
+    expect(cooled.buildBackoffs).toContainEqual(expect.objectContaining({ num: '4415', unconfirmedCooldown: true, retryAfter: new Date(clock + 120 * 60_000).toISOString() }));
+    settled = []; clock = 60_000;
+    const restarted = await runBuildDispatchTick({ live: true, effects: effects() });
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(restarted.needsYou).toContainEqual(expect.objectContaining({ num: '4415', step: 'launch-confirmation' }));
+    clock = 120 * 60_000 + 3;
+    await runBuildDispatchTick({ live: true, effects: effects() });
+    expect(dispatch).toHaveBeenCalledTimes(3);
+  });
+
+  it('counts unconfirmed launches per base and resolves the cooldown cascade with source logging', () => {
+    const log = vi.fn();
+    const unconfirmed = readBuildUnconfirmedSettings({ platform: { unconfirmedLaunchMax: 3, unconfirmedCooldownMin: 50 },
+      tool: { unconfirmedCooldownMin: 60 }, env: { WE_BUILD_UNCONFIRMED_LAUNCH_MAX: '2', WE_POLICY_CASCADE_LOG: '1' }, log });
+    expect(unconfirmed).toEqual({ unconfirmedLaunchMax: 2, unconfirmedCooldownMin: 60 });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('unconfirmedLaunchMax=2 (env)'));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('unconfirmedCooldownMin=60 (tool)'));
+    expect(readBuildUnconfirmedSettings({ platform: {}, tool: {}, env: {} }))
+      .toEqual({ unconfirmedLaunchMax: 2, unconfirmedCooldownMin: 120 });
+    expect(readBuildUnconfirmedSettings({ platform: { unconfirmedLaunchMax: 4, unconfirmedCooldownMin: 45 },
+      tool: { unconfirmedLaunchMax: -1 }, env: { WE_BUILD_UNCONFIRMED_LAUNCH_MAX: 'oops', WE_BUILD_UNCONFIRMED_COOLDOWN_MIN: '0' } }))
+      .toEqual({ unconfirmedLaunchMax: 4, unconfirmedCooldownMin: 45 });
+    const path = join(lockRoot, 'base-failures.json');
+    const fail = base => recordBuildFailure({ num: '4415', base, reason: 'dispatch launch not confirmed' }, { path, now: 0, unconfirmed });
+    expect(fail('a').unconfirmedLaunches).toBe(1);
+    expect(fail('b').unconfirmedLaunches).toBe(1);
+    expect(fail('b')).toMatchObject({ unconfirmedLaunches: 2, unconfirmedCooldown: true, retryAfter: new Date(60 * 60_000).toISOString() });
+  });
+
   it('a pending launch keeps its claim and is not offered again; a launched settle keeps the claim', async () => {
     const settleLaunches = vi.fn(async () => ({ pending: [], settled: [] }));
     const a = await runBuildDispatchTick({ live: true, effects: effectsFor(lockRoot, { settleLaunches }) });
@@ -72,10 +211,11 @@ describe('non-blocking launch (78b)', () => {
     try {
       const { startDetachedLaunch } = await import('../../../scripts/conveyor/pending-launches.mjs');
       const { writeFileSync } = await import('node:fs');
-      const rec = startDetachedLaunch({ root, num: '4131', kind: 'build', argv: ['x'], env: {}, cwd: root, spawn: () => ({ pid: 9, unref() {} }) });
+      const rec = startDetachedLaunch({ root, num: '4131', kind: 'build', base: 'launch-base', argv: ['x'], env: {}, cwd: root, spawn: () => ({ pid: 9, unref() {} }) });
       writeFileSync(rec.outFile, JSON.stringify({ run: { verdict: { dispatching: true }, effects: [{ type: 'conveyor.dispatch-delivery-agent', status: 'declared' }] } }));
       const yes = await cliSettleLaunches({ root, isPidAlive: () => false, confirmed: async () => true });
       expect(yes.settled[0].outcome.dispatching).toBe(true);
+      expect(yes.settled[0]).toMatchObject({ base: 'launch-base', outcome: { reason: null, confirmedBy: 'live-session' } });
       const rec2 = startDetachedLaunch({ root, num: '4132', kind: 'build', argv: ['x'], env: {}, cwd: root, spawn: () => ({ pid: 9, unref() {} }) });
       writeFileSync(rec2.outFile, JSON.stringify({ run: { verdict: { dispatching: true }, effects: [] } }));
       const no = await cliSettleLaunches({ root, isPidAlive: () => false, confirmed: async () => false });
