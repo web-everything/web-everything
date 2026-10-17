@@ -1,27 +1,28 @@
 ---
+bornAs: xrdwiud
 kind: story
 size: 3
 status: active
 scaffoldedBy: "drain-fastdrain-holds"
 dateScaffolded: "2026-10-17"
-scope: ["we:scripts/lib/enqueue-on-event.mjs", "we:scripts/lib/fast-drain-hold-skip.mjs", "we:scripts/settings/merge-queue.json"]
+scope: ["we:scripts/merge-ai-prs.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Catch-up fast drains skip a PR still held on the same head
+# Drain cascade checks holds (red-team, overlap-yield, numbering owed) before fresh reads and branch prep
 
-Note: build after #5480 lands (we:scripts/lib/enqueue-on-event.mjs and we:scripts/settings/merge-queue.json are occupied).
+Note: build after #5518, #5492, #5480 and #5462 land (we:scripts/merge-ai-prs.mjs is occupied).
 
-Catch-up fast drains (enqueue-on-event) each re-run a full listing and compete for the 6 host gh slots, even for PRs held on red-team-pending, overlap-yield or numbering owed. Skip a PR whose last recorded drain outcome, for the SAME head and within drain.fastDrainHeldSkipMinutes (default 10), is one of those holds. Log the reason and the setting source. Expected 40-80 min/day of gh-slot time.
+The drain cascade finds holds (red-team-pending, overlap-yield, numbering owed) only after the fresh read, sibling reads and branch preparation, so held PRs still pay for them. About 76% of listed PRs are holds. Check holds first and skip the reads and prep for held PRs. Expected 60-100 min/day of pass time.
 
 ## Acceptance
 
-- [A1] **Executable** — vitest run on the new hold-skip test file: same-head held is skipped; head changed runs; red-team comment event runs; stale record runs. Fails before, passes after.
+- [A1] **Executable** — vitest run on a cascade test: a held PR triggers no fresh read and no branch preparation; an unheld PR is unchanged. Fails before, passes after.
 
 ## Non-goals
 
-- [N1] No new store (reuse the per-PR outcome record); no change to the hold itself.
+- [N1] The holds themselves are not weakened or changed.
 
 ## Acceptance
 
