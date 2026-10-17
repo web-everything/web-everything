@@ -42,6 +42,17 @@ verified landed-fix and validation evidence. Agent-facing lessons/proposals use 
 with typed provenance kept separately, never interpolated PR-derived prose. These are implementation obligations
 in the canonical statute and slices 2 A8–A12, 3 A6–A10 and 5 A5, not features delivered by this decision PR.
 
+**Coverage handoff clarification (latest advisory repair, 2026-10-17).** Statute items 8–10 spell out wire
+domains (severity low/medium/high/critical; confidence low/medium/high, exact low token; required four-value
+debtQuadrant), security's severity-partitioned key, ambiguous path/pattern and same-kind rule conflicts
+(block before the cap), read-side cascade value/source/revision logging, repeated staleness baselines and
+repository/class feed aggregation. Expedite starts at ruling time; staleness starts at openedAt and repeats
+45 elapsed days after each successful surfacing. The register retains the quadrant and trusted clock fields.
+Protected base code/policy, PR-job credential isolation and bounded ingress have explicit production test
+owners in slice 2 A15–A16, slice 3 A11, slice 4 A6 and slice 5 A8. Prevention tooling for every newly identified
+gap is owed by xio9qp2 A6–A12; A5/A6 also cover missing/malformed quadrant. These clarify the implementation
+handoff, without changing ratified cell outcomes or claiming implementation delivery.
+
 **Amended table** (order: internal delivery, dogfood, public preview, public release). It replaces the
 "The table" section below for the rows named here; all other rows stand as proposed.
 
@@ -352,8 +363,8 @@ is owned by the still-open epic and slices listed below.
   in [epic xrlwbd7](/backlog/xrlwbd7-we-review-stringency-build-classed-findings-per-level-outcom/). This resolved
   decision delivers the design handoff; it does not claim a shipped settings validator.
 - [A2] **Inspection** — trace `decision-acceptance-owners` maps class validation to slice 1 A1–A3; settings schema,
-  monotonicity and ruling failures to slice 2 A1–A12; debt lifecycle, authority and provenance to slice 3 A1–A10;
-  panel safety to slice 4 A1–A5; advisory recording/lessons to slice 5 A1–A7; live before/after and recount proof
+  monotonicity and ruling failures to slice 2 A1–A16; debt lifecycle, authority and provenance to slice 3 A1–A11;
+  panel safety to slice 4 A1–A6; advisory recording/lessons to slice 5 A1–A8; live before/after and recount proof
   to epic A3–A4. Those cards remain open until their executable tests and evidence are delivered.
 
 ## Risks
@@ -370,6 +381,27 @@ For this decision, inspect the statute and acceptance-owner trace (A1–A2), and
 standards gate. During implementation, each slice adds and runs its named tests, followed by epic A1–A2
 production-path tests, A3 live-PR evidence and A4 recount. The validator originally stated here is owned by
 slice 2 A1 (`settings-table-schema`), A6 (`monotonic-levels`) and A7 (`table-gap-blocks`).
+
+Planned implementation mapping (files below are not delivered by this decision PR). Each named case's
+acceptance line in the owner card supplies its detailed observable assertions; every slice now also has
+Risks and Test plan sections assigning all acceptance cases to its planned file.
+
+| Risk / guarantee | Repository-qualified planned file; named cases | Observable assertion |
+|---|---|---|
+| Closed classes and row selection | `we:scripts/__tests__/review-stringency-classes.test.mjs`; `class-mapping-complete`, `unknown-class-fails-closed` | Pin exact tokens and unique row mappings; invalid input refuses. |
+| Relaxed levels / wrong table cell | `we:scripts/__tests__/review-stringency-ruling.test.mjs`; `monotonic-levels`, `ratified-table-cells`, `override-precedence` | Reject relaxed blocks and conflicting rules; pin every class/severity/level outcome, including both security rows. |
+| Malformed reviewer fields / missing provenance | `we:scripts/__tests__/review-stringency-ruling.test.mjs`; `malformed-finding-blocks`, `unreadable-table-blocks`, `cell-cascade-source-logged` | Missing/invalid quadrant and other fields block; each consumed cell/scalar persists its winning cascade source/revision. |
+| Forged settings authority / trust-root edits / resource abuse | `we:scripts/__tests__/review-stringency-ruling.test.mjs`; `forged-settings-operator`, `allowlist-and-gate-self-protection`, `review-ingress-bounds` | Invalid approval, PR-edited roots, token access and over-limit input cannot authorize a write. |
+| Debt tampering / race / unreadable inventory | `we:scripts/__tests__/review-stringency-debt.test.mjs`; `debt-item-tamper`, `debt-approval-provenance`, `debt-register-unreadable`, `debt-gate-revision-race`, `debt-source-required` | Invalid transitions refuse and debt stays effective; no missing-quadrant admission or stale-writer bypass. |
+| Missed escalation / silent staleness | `we:scripts/__tests__/review-stringency-debt.test.mjs`; `expedite-deadline-escalation`, `debt-staleness-resurface` | N+1 same-class debts aggregate; unpaid debt resurfaces at first and second threshold crossings without expiry. |
+| Panel disclosure / stale or active content / request abuse | `plateau-app:tests/debt-panel.spec.ts`; `debt-panel-untrusted-content`, `debt-panel-unavailable`, `debt-panel-read-only-scope`, `debt-panel-revision-refresh`, `debt-panel-request-bounds` | Inert content, authenticated read-only scope, unavailable indication and bounded same-origin reads. |
+| Stored lesson injection / partial output | `we:scripts/__tests__/review-stringency-lessons.test.mjs`; `lesson-content-template-only`, `lesson-input-unreadable`, `lesson-input-bounds` | PR prose never enters instructions; incomplete/over-limit input publishes nothing and advances no checkpoint. |
+| Production wiring | `we:scripts/__tests__/review-stringency-integration.test.mjs`; `review-stringency-outcomes-e2e`, `review-stringency-level-gate-e2e` | Observe production merge/queue/ledger effects and enforced level gate through actual entry points. |
+| Delivery impact / false blocks | `we:scripts/__tests__/review-stringency-recount.test.mjs`; `review-stringency-override-recount`; epic A3 inspection evidence | Pin deduplication/strongest rulings and missing-data errors; attach dated live PR pre/post effects plus fresh-window denominators. |
+
+Decision A1–A2 are inspection evidence: inspect this ruling against statute items 1–10 and each slice's
+acceptance/test-file trace. No request endpoint is delivered by this document; body-size, rate limit and
+origin requirements are traced to the implementation owners above, with local-job/validator n/a reasons.
 
 ## Non-goals
 

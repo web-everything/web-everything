@@ -44,3 +44,14 @@ Weak fixtures can hide production wiring gaps; A1–A3 require the production pa
 ## Test plan
 
 Run each slice's named tests through its affected-test gate, then the epic's A1–A2 production-path cases and A4 recount test. Keep live evidence A3 and fresh-window output A4 on this epic before resolution; A5 is the completion checklist.
+
+All following paths are planned implementation destinations, not tests shipped by the decision PR. Each slice's Test plan assigns every named acceptance case to a repository-qualified file.
+
+| Risk / acceptance owner | Planned file and named case | Observable assertion |
+|---|---|---|
+| Production wiring (A1) | `we:scripts/__tests__/review-stringency-integration.test.mjs` — `review-stringency-outcomes-e2e` | Persisted ruling changes merge eligibility, queue/debt or ledger through the production path. |
+| Debt/authority bypass (A2) | `we:scripts/__tests__/review-stringency-integration.test.mjs` — `review-stringency-level-gate-e2e` | Tampering/unreadable evidence refuses the level move; verified payment or operator due-level edit permits it. |
+| Relaxed levels (slice 2 A6) | `we:scripts/__tests__/review-stringency-ruling.test.mjs` — `monotonic-levels` | Reject every fixture relaxing a lower-level block. |
+| Delivery impact and false blocks (A3–A4) | `we:scripts/__tests__/review-stringency-recount.test.mjs` — `review-stringency-override-recount`; A3 inspection evidence attached to this epic | Pin duplicate/strongest-ruling counts and errors; attach dated live-PR pre/post effects and the fresh-window output with denominators. |
+
+The epic exposes no separate endpoint: body-size, rate limit and origin checks are owned by slice 2 A16, slice 3 A11 and slice 4 A6; slice 1 and slice 5 document their local-validator/job applicability. Epic A1–A2 exercise those ingress refusals as part of production wiring.

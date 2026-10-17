@@ -37,6 +37,9 @@ evidence of completed prevention.
 - Operator-only identity and debt mutation bypasses: A4 requires authenticated identity plus every mutable field/operation to be declared. The actual protected production write gate and independently verified payment are owed by slice 2 A10 and slice 3 A6–A7, including deletion, rename, kind, status, class, severity, confidence, deadline, due-level, source and forged-receipt cases.
 - Missing/malformed model fields and stored lesson injection: A5 requires field/error cases and an explicit template-only instruction boundary. Runtime fixtures are slice 2 A8–A9 and slice 5 A5.
 - Edge-case test mapping, Risks/Test plan and statute parity: reuse #5590/#5739; A3 requires ratified-rule parity during the handoff inspection. No implementation is claimed delivered by filing this card.
+- Concrete table/enum domains, read-side guarantee traces, precedence pairs and repeated clocks: A6–A9 capture the latest advisory's correctness prevention requests; runtime owners are slice 2 A2/A13–A14 and slice 3 A2–A3.
+- Trust-root self-protection and endpoint hints: A10–A11 capture the outstanding security prevention requests. Runtime owners are slice 2 A15–A16, slice 3 A11, slice 4 A6 and slice 5 A8. A5/A6 include the missing-quadrant fixture.
+- Risk-to-test destinations: A12 captures the repeated security, simplicity and correctness requests, integrating #5739 rather than creating another lint owner.
 
 ## Done when
 
@@ -45,6 +48,13 @@ evidence of completed prevention.
 - [A3] **Inspection** — checklist `handoff-rule-and-owner-trace` requires each ratified invariant and edge case to cite its implementation acceptance owner, and resolved design decisions to point to the open epic/slices carrying executable and live proof. Review the PR #5511 fixtures for monotonicity, careless-debt block, low-confidence second check, overdue expedite, 45-day resurfacing and live recount; each has an owner rather than an assertion of delivered behavior.
 - [A4] **Executable** — test `handoff-authority-contract` refuses operator-only or only-bypass fixtures lacking a named authenticated identity source and complete mutable-field/operation inventory. A self-declared actor, commit author or PR field does not satisfy the structured authority contract; complete protected-CI and payment-evidence declarations pass. This checks the contract's presence, not its runtime enforcement.
 - [A5] **Executable** — test `handoff-model-input-contract` rejects model-consuming fixtures without missing/malformed cases per declared field and agent-facing instruction writers without a concrete template-only or quoted-data boundary plus named test. A mere claim of sanitization does not pass.
+- [A6] **Executable** — test `handoff-concrete-values` rejects a ratified table or enum without concrete-value assertions and valid domains for each input field; include the PR #5511 security severity rows, confidence threshold and debt quadrant as fixtures. Every ratified invariant names its input fields, with missing and malformed cases per field (extend A5).
+- [A7] **Executable** — test `handoff-guarantee-trace` rejects a structured must/always/every guarantee without an acceptance id or named test, including read-side cascade resolution and source logging. Checklist inspection catches prose guarantees omitted from the structured contract; extend A2 beyond refusal wording.
+- [A8] **Inspection** — checklist `handoff-precedence-pairs` enumerates every competing source pair, including two rules of the same kind, and requires a declared winner and fixture per pair.
+- [A9] **Inspection** — checklist `handoff-clock-contract` requires each clock/threshold to declare its baseline and repeat behaviour, with N+1-item and second-threshold-crossing fixtures.
+- [A10] **Executable** — test `handoff-trust-root-contract` extends A4 to refuse authority contracts that do not declare how the allowlist, gate workflow and credentials are protected from the PR under review, plus a named tamper test. Include PR edits to each protected component and PR-job credential access as negative fixtures.
+- [A11] **Executable** — test `handoff-endpoint-bounds` integrates #5590's hint trace: when a write/receive-endpoint hint is present, require an acceptance line or explicit `n/a:` reason for each of body-size, rate limit and origin. Positive and negative fixtures cover omitted limits and read-only surfaces; field bounds and production ingress remain separately traceable.
+- [A12] **Executable** — test `handoff-risk-test-locations` integrates #5739 with structured mappings from each Risk to a repository-qualified planned test path, named case and observable assertion, or explicitly identified inspection evidence. Reject name-only mappings; allow planned files clearly marked as not yet implemented.
 
 ## Non-goals
 
@@ -71,6 +81,9 @@ stringency slices.
 
 ## Test plan
 
-Add A1–A2 and A4–A5 fixtures to the existing content-lint test file and run it through the affected-test gate.
-Include prose quotes, missing sections, non-string fields and positive document-only handoffs. Inspect A3
-against the repaired decision and all five slice cards.
+Planned file `we:scripts/__tests__/check-standards-rules-content-lint.test.mjs` owns the named executable
+A1–A2, A4–A7 and A10–A12 cases with their rejection/pass assertions above. Include prose quotes, missing
+sections, non-string fields and positive document-only handoffs. A3, A8 and A9 are explicitly inspection
+evidence: attach the completed rule/owner, precedence-pair and clock checklists against PR #5511's decision
+and all five slices before resolving this card. The check implementation remains owed; filing this card is
+the prevention deliverable for this advisory repair, not evidence that a new lint already runs.

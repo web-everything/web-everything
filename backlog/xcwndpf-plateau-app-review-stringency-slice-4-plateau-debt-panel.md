@@ -19,6 +19,7 @@ A read-only plateau-app panel over the debt items: class, severity, must-pay-bef
 - [A3] **Executable** — panel integration test `debt-panel-unavailable` supplies an unreadable or incomplete register and shows unavailable with its last successful revision/time, never a zero-debt or paid indication; paginated fixtures render all entries before the view is labelled complete.
 - [A4] **Executable** — panel integration test `debt-panel-read-only-scope` uses the existing authenticated repository access boundary: unauthorized repositories refuse before returning debt, authorized reads remain read-only, and crafted requests expose no payment, level-change or deadline-change action.
 - [A5] **Executable** — panel integration test `debt-panel-revision-refresh` replaces a snapshot during refresh; only one complete revision renders, older responses cannot overwrite newer state, and source/provenance links retain the matching repository and finding.
+- [A6] **Executable** — endpoint test `debt-panel-request-bounds` rejects nonempty request bodies and query/header input above 16 KiB before parsing; enforce 60 reads per rolling minute per authenticated repository/principal, with request 61 refused. Foreign-origin credentialed requests refuse and CORS does not grant foreign origins access. CSRF-token `n/a:` because authenticated reads have no state mutation, refresh/reset/write action or cookie-changing side effect; A4 proves crafted write/reset attempts refuse. Test floods, oversized queries and foreign origins through the production read endpoint, preserving repository access checks.
 
 Ruling and amended table: [we:backlog/xugqjw1](/backlog/xugqjw1-decision-review-stringency-classified-findings-per-level-out/) and the statute `we:docs/agent/platform-decisions.md#review-stringency-classified-outcomes`.
 
@@ -41,3 +42,11 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — repository access is checked before data disclosure (A4); source PR/finding remains attached (A1, A5).
 6. **State over time** — stale responses cannot replace newer state and unavailable data is labelled with its last successful revision/time (A3, A5).
 7. **Who wrote it** — no browser or agent claim authorizes a write through this read-only view (A4).
+
+## Risks
+
+Untrusted debt could execute markup or leak repository data (A2, A4), incomplete/stale state could appear paid (A1, A3, A5), or requests could exhaust the read endpoint (A6).
+
+## Test plan
+
+Planned file `plateau-app:tests/debt-panel.spec.ts` owns all named A1–A6 cases and the observable assertions above. Exercise the real authenticated read endpoint and rendered panel, including body-size, rate limit and origin refusals. This cross-repository file is an implementation destination; no panel tests are delivered by the decision PR.

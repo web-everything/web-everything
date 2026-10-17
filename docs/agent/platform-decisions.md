@@ -6329,6 +6329,38 @@ invariants that already win) and the deterministic-core rule.
    refuses. Commit authors, environment variables, PR text and card fields never establish operator identity.
    CI verifies payment evidence independently. Guard debt lifecycle fields and deletion in the same check;
    this is required implementation, not a claim that an agent-editable field already proves authority.
+8. **Handoff input and resolution contract.** Exact wire tokens: severity `low | medium | high | critical`
+   (security high row = high/critical, lower row = low/medium); confidence `low | medium | high` (only the
+   token low triggers the cap, no numeric coercion); required `debtQuadrant` is `prudent-deliberate |
+   prudent-inadvertent | reckless-deliberate | reckless-inadvertent`. Missing/malformed quadrant blocks;
+   each reckless/inadvertent value blocks regardless of cell/confidence. Only explicit prudent-deliberate
+   may enter debt, and the register retains it. Exact class tokens and their unique row mapping belong to
+   slice 1; security adds the severity partition. Levels are `internal-delivery | dogfood | public-preview |
+   public-release`; outcomes are `block | expedite | debt | advisory`. Reject case/whitespace/Unicode aliases.
+   Multiple matching path/pattern rules of the same class deduplicate; different selected classes block as
+   ambiguous policy before the confidence cap, including same-kind conflicts, independent of iteration order.
+   Every ruling records the effective cascade value, source and revision for each consumed cell/scalar,
+   using one validated snapshot; logging writes alone does not satisfy this guarantee.
+9. **Clock and aggregation contract.** Expedite's deadline starts at persisted ruling time plus initially
+   72 elapsed hours; overdue means strictly past it. Needs-you aggregates by repository/class with all item
+   ids retained, including multiple overdue debts of the same class. Staleness starts at trusted `openedAt`,
+   then repeats every 45 elapsed days from the last successful surfacing (`lastSurfacedAt`). Thus on-time
+   unpaid debt resurfaces at days 45 and 90; a day-50 surfacing makes the next due day 95. Publication and
+   baseline update are atomic; failed publication retries without advancing time, and PR edits cannot reset
+   either timestamp. Paid debt stops resurfacing, unpaid debt never expires.
+10. **Protected roots and bounded ingress.** The authority check executes trusted base code/policy outside
+    the PR job. PR edits to the allowlist, gate workflow or writer cannot authorize that PR's own changes;
+    privileged credentials never enter PR jobs or candidate code. Slice 2 A15 tests each root edit and token
+    access; slice 3 reuses it. Implementation ingress bounds: protected finding/settings/debt writes reject
+    bodies above 1 MiB, enum tokens above 128 UTF-8 bytes and request 61 in a rolling minute per authenticated
+    repository/principal; no PR-controlled reset. Origin/CSRF is n/a for this CI/CLI-only, non-cookie ingress;
+    provenance/authentication checks still apply. The read-only panel rejects nonempty bodies, caps query/
+    headers at 16 KiB, limits reads to 60/minute per repository/principal and refuses foreign-origin
+    credentialed access; CSRF tokens are n/a only because reads cannot mutate/reset state. The local lesson
+    job caps each fetched page/entry at 1 MiB, class tokens at 128 bytes and runtime at 120 seconds; count is
+    a nonnegative safe integer, incomplete runs publish nothing and do not advance a checkpoint. Incoming
+    rate-limit/origin checks are n/a for a scheduled job without an endpoint; single-emission retry guards
+    still apply. These bounds and n/a reasons are acceptance obligations, not delivered infrastructure.
 
 **Proof requirement and ownership.** Decision `#xugqjw1` resolves the design only. Implementation and live proof
 belong to epic `#xrlwbd7`: production-path before/after on a live PR and a fresh-window recount of auto-block
@@ -6338,5 +6370,10 @@ not resolve solely because its children land. Named acceptance coverage: slice 2
 (`always-block-second-check`); slice 3 `#xsnny7x` A2 (`expedite-deadline-escalation`), A3
 (`debt-staleness-resurface`), A6–A10 (tamper, authority, source, unreadable state and revision races); slice 5
 `#xhjuluf` A2–A7 (threshold, disable flag, proposal-only promotion, template safety, scheduling and input failure).
+Additional handoff coverage: slice 2 A2/A13–A16 (all competing rule pairs, literal table cells/domains,
+read-side cascade provenance, protected roots and ingress bounds); slice 3 A2–A3/A8/A11 (N+1 aggregation,
+repeat baselines, quadrant admission and bounds); slice 4 A6 and slice 5 A8 (surface-specific bounds).
+Each slice's Test plan and the decision's risk mapping identify repository-qualified planned test files;
+these are implementation destinations, not assertions that the tests exist today.
 
 **Lineage:** `#xugqjw1` (ruled 2026-10-17). Reference: the operator's review stringency proposal artifact.
