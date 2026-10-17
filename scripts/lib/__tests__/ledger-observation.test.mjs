@@ -60,6 +60,15 @@ describe('open-head ledger observations', () => {
     const afterMove = [baseline, accepted(), moved, headlessAccept];
     expect(foldVerdictLedger(afterMove).get(1)).toMatchObject({ current: moved, clears: false });
     expect(derivePrState(afterMove, facts).clears).toBe(false);
+    // A drain park built from a list snapshot can name a superseded head after the new head was accepted.
+    // The label holds whatever head is live, so the hold applies too, without rewinding the witness.
+    const acceptedNext = buildVerdictRecord({ repo, pr: 1, headSha: next, verdict: 'accepted', source: 'test', at: now });
+    const stalePark = buildVerdictRecord({ repo, pr: 1, headSha: head, verdict: 'pending', source: 'merge-ai-prs', at: now });
+    const staleParked = [baseline, accepted(), moved, acceptedNext, stalePark];
+    expect(foldVerdictLedger(staleParked).get(1)).toMatchObject({ current: stalePark, clears: false, outstandingHolds: [stalePark] });
+    expect(derivePrState(staleParked, facts).clears).toBe(false);
+    expect(plan({ events: staleParked })).toEqual([]);
+    expect(foldVerdictLedger([...staleParked, accepted()]).get(1).current).toBe(stalePark);
     // A headless hold never moves the witness, so the next live transition from that head still applies.
     const movedAfterPark = plan({ events: parked })[0];
     expect(movedAfterPark).toMatchObject({ verdict: 'head-moved', fromHead: head });

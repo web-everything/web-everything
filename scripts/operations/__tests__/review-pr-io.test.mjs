@@ -346,7 +346,17 @@ describe('the ledger and notice sinks', () => {
     });
   });
 
-  it.each([undefined, null, 'origin/lane/review', 'abc123', 'z'.repeat(40)])('skips an unpinned reconcile head %s loudly before appending, including on replay', async headSha => {
+  it.each(['origin/lane/review', 'abc123', 'z'.repeat(40), 42])('refuses a malformed reconcile head %s before appending, including on replay', async headSha => {
+    appendVerdict(buildVerdictRecord({ repo: 'o/n', pr: 7, verdict: 'observed', source: 'first-seen', headSha: HEAD, at: '2026-10-17T12:00:00.000Z' }));
+    const sinks = createReviewPrSinks({ root });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await expect(sinks[REVIEW_EFFECTS.LEDGER]({ pr: 7, repo: 'o/n', to: 'accepted', headSha }, CTX))
+        .rejects.toThrow(/pinned.*head/);
+    }
+    expect(readVerdictLedger('o/n')).toHaveLength(1);
+  });
+
+  it.each([undefined, null])('skips a missing reconcile head %s loudly before appending, including on replay', async headSha => {
     appendVerdict(buildVerdictRecord({ repo: 'o/n', pr: 7, verdict: 'observed', source: 'first-seen', headSha: HEAD, at: '2026-10-17T12:00:00.000Z' }));
     const lines = [];
     const sinks = createReviewPrSinks({ root, out: (l) => lines.push(l) });

@@ -865,8 +865,8 @@ export function parseLedgerEvents(text) {
  *   • "a hold is cleared by a later clearing record, never by deleting anything" → the clearing record is
  *     simply a later row, and there is no delete in this format to begin with.
  * A fresh review witnesses its own head even when an observation append missed or was disabled.
- * A delayed verdict for a previously superseded head remains history. Once a head is witnessed, a headless
- * hold still applies (fail closed) and a headless clear stays history. An explicit live transition
+ * A delayed CLEAR for a previously superseded head, or with no head, remains history; such a HOLD still applies
+ * (fail closed) without moving the witnessed head. An explicit live transition
  * can return to a previous head; a review completion alone cannot rewind to it.
  *
  * LATEST-WINS RUNS OVER THE **BEARING** ROWS ONLY (#3329), AND THIS IS WHERE NON-BEARING IS ENFORCED. An
@@ -913,10 +913,13 @@ function foldWithWitness(records) {
       if (witnessed && r.fromHead !== witnessed) continue;
       if (r.fromHead) superseded.add(r.fromHead);
       superseded.delete(head); // a live transition may deliberately return to an earlier head
-    } else if (witnessed && (head ? superseded.has(head) : r.clears)) continue;
-    // A headless HOLD applies to the witnessed head (the drain's park writers may lack a head). A headless
-    // CLEAR stays history: it cannot say which head it cleared.
-    if (head && (verdictBears(r.verdict) || r.source === 'first-seen')) {
+    }
+    // A headless or superseded-head HOLD still applies (fail closed): the drain's park writers may lack a head or
+    // name a stale snapshot head, and the label they set holds whatever head is live. Such a CLEAR stays history:
+    // it cannot vouch for the witnessed head. Neither moves the witness.
+    const offWitness = !transition && witnessed && (!head || superseded.has(head));
+    if (offWitness && r.clears) continue;
+    if (head && !offWitness && (verdictBears(r.verdict) || r.source === 'first-seen')) {
       if (witnessed && witnessed !== head) superseded.add(witnessed);
       witnessedHeads.set(r.pr, head);
     }
