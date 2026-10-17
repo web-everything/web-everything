@@ -973,6 +973,13 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(lands('(HOME=/h; cd ~/P)')).toContain('/h/P');
     const decoys = Array.from({ length: 20 }, (_, i) => `(HOME=/h${i}; true); `).join('');
     expect(lands(`${decoys}(HOME=/P; cd ~ && git checkout --detach)`)).toContain('/P');
+    // a deeper child shell's HOME has closed before the cd: the enclosing one still counts
+    for (const cmd of [
+      '(HOME=/P; (HOME=/Q; true); cd ~ && git checkout --detach)',
+      '(HOME=/P; true | (HOME=/Q; true); cd ~ && git checkout --detach)',
+      '(HOME=/P; (HOME=/Q); cd ~ && git checkout --detach)',
+      '(HOME=/P\n(HOME=/Q; true)\ncd ~ && git checkout --detach)',
+    ]) expect(lands(cmd), JSON.stringify(cmd)).toContain('/P');
     // the effective cwd still keeps main's reading of an option
     expect(at('cd -P /P && ls')).toBe(`${REPORTED}/-P`);
     // the re-executed-string walk stays bounded however many strings and assignments come before them

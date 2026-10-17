@@ -2902,6 +2902,7 @@ export function resolveCdLandings(command, reportedCwd, resolvePath = resolve, h
 }
 // both in one walk (the hook's call); a fault in the landing walk keeps the effective cwd and no landings
 const NESTED_CWD_BYTES = 1 << 16;
+const CHILD_HOME_DEPTHS = 8;
 export function resolveCwdAndLandings(command, reportedCwd, resolvePath = resolve, home = process.env.HOME ?? null) {
   try {
     const r = analyzeCwd(command, reportedCwd, resolvePath, home, { left: { n: NESTED_NODE_CAP, bytes: NESTED_CWD_BYTES }, depth: 0 });
@@ -2973,14 +2974,18 @@ function analyzeCwd(command, reportedCwd, resolvePath, home, nest) {
   const history = Object.create(null);
   const homeNames = new Set();
   const childVals = Object.create(null);                      // a child shell's expandable assignments
-  const childHomes = [];                                      // { at, home }: a child shell's HOME assignments
-  // the last entry of `list` (ordered by segment) before segment `at`: a binary search, so a cd costs no rescan
-  const lastBefore = (list, at, key) => {
+  // a child shell's HOME assignments, by child-shell depth: depth → [{ at, home }] in segment order
+  const childHomes = new Map();
+  const homeDepths = [];                                      // the depths that have one, ascending
+  // how many entries of the ascending `list` have a key below `at`, and the last of them: binary searches, so a
+  // cd costs no rescan
+  const countBelow = (list, at, key) => {
     let lo = 0;
     let hi = list.length;
     while (lo < hi) { const mid = (lo + hi) >> 1; if (key(list[mid]) < at) lo = mid + 1; else hi = mid; }
-    return list[lo - 1];
+    return lo;
   };
+  const lastBefore = (list, at, key) => list[countBelow(list, at, key) - 1];
   let assignHome = initialHome;
   const record = (name, at, value) => {
     if (value === undefined) delete vars[name];
@@ -3019,7 +3024,14 @@ function analyzeCwd(command, reportedCwd, resolvePath, home, nest) {
     if (ca && depths[at][ca[1].length] > 0) {
       const expanded = expandCdTarget(ca[3].replace(/\)+$/, ''), assignHome);
       if (expanded) childVals[ca[2]] = expanded;
-      if (ca[2] === 'HOME' && usableHome(expanded)) childHomes.push({ at, home: expanded });
+      const depth = depths[at][ca[1].length];
+      if (ca[2] === 'HOME' && usableHome(expanded)) {
+        if (!childHomes.has(depth)) {
+          childHomes.set(depth, []);
+          homeDepths.splice(countBelow(homeDepths, depth, (d) => d), 0, depth);
+        }
+        childHomes.get(depth).push({ at, home: expanded });
+      }
     }
     const m = stmt.trim().match(/^(?:export\s+)?([A-Za-z_]\w*)=(.+)$/);
     if (m && inChild(at)) {
@@ -3127,10 +3139,18 @@ function analyzeCwd(command, reportedCwd, resolvePath, home, nest) {
       if (target) out.push(target);
       const v = raw.split(/\s+/)[0].replace(/^"(.*)"$/, '$1').match(/^\$\{?([A-Za-z_]\w*)\}?$/);
       for (const alt of v ? [vars[v[1]], childVals[v[1]]] : []) if (usable(alt, false)) out.push(absolute(alt));
-      // the HOME the latest child shell before this cd gave itself (a cd in that child reads it)
-      const child = homeSpelled(raw) && lastBefore(childHomes, at + 1, (h) => h.at);
-      const t = child && expandCdTarget(rest, child.home);
-      if (t) out.push(absolute(t));
+      // the HOME a child shell enclosing this cd may have given itself: the latest one before it at each of the
+      // nearest CHILD_HOME_DEPTHS depths up to the cd's own (a deeper child shell has closed before the cd)
+      if (homeSpelled(raw)) {
+        const own = depths[at][segs[at].length - found[1].length];
+        const upTo = countBelow(homeDepths, own + 1, (d) => d);
+        const near = homeDepths.slice(Math.max(0, upTo - CHILD_HOME_DEPTHS), upTo);
+        for (const d of near) {
+          const child = lastBefore(childHomes.get(d), at + 1, (h) => h.at);
+          const t = child && expandCdTarget(rest, child.home);
+          if (t) out.push(absolute(t));
+        }
+      }
     }
     for (const text of nestedCommandStrings(segs[at])) {
       if (nest.left.n <= 0 || nest.depth >= NESTED_DEPTH_CAP || !/(?:cd|pushd)\W/.test(text)) continue;
