@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { recordBuildFailure, clearBuildFailure, listBuildBackoffs } from '../../../scripts/conveyor/build-dispatch-failures.mjs';
-import { runBuildDispatchTick, cliHostLoadGate, cliSettleLaunches, cliLaunchConfirmed } from '../build-dispatch-daemon.mjs';
+import { runBuildDispatchTick, cliHostLoadGate, cliSettleLaunches, cliLaunchConfirmed, createPrepareStatusReader } from '../build-dispatch-daemon.mjs';
 import { listBuildDispatchClaims, acquireBuildDispatchClaim, releaseBuildDispatchClaim } from '../../../scripts/conveyor/build-dispatch-claim.mjs';
 import { adoptOrphanedBuildClaims } from '../../../scripts/conveyor/build-dispatch-orphan-adopt.mjs';
 import { outcomePayload } from '../../../scripts/operations/cli-adapter.mjs';
@@ -11,6 +11,13 @@ import { readDispatchOutcome } from '../build-dispatch-daemon.mjs';
 import { readBuildUnconfirmedSettings } from '../../../scripts/lib/build-unconfirmed-settings.mjs';
 import { redactSpawnText } from '../../../scripts/lib/describe-spawn-failure.mjs';
 import { startDetachedLaunch } from '../../../scripts/conveyor/pending-launches.mjs';
+import { execFileSyncThrottled } from '../../../scripts/lib/gh-throttle.mjs';
+
+// Pass-through spy, so the default sync exec of prepare discovery can be pinned to the shared throttle (PR #5453).
+vi.mock('../../../scripts/lib/gh-throttle.mjs', async (importOriginal) => {
+  const orig = await importOriginal();
+  return { ...orig, execFileSyncThrottled: vi.fn((...args) => orig.execFileSyncThrottled(...args)) };
+});
 
 const scope = ['plateau-app:src/a.ts'];
 const tickOut = () => ({
@@ -329,8 +336,8 @@ it('clears #4413 retry history when orphan adoption observes the dead worker\'s 
         readDelivery: () => ({ outcome: 'pr-open', pr: 9001, reason: 'PR #9001 is open' }), settleDelivered: () => {},
         releaseClaim: ({ num }) => releaseBuildDispatchClaim({ num, lockRoot }), releaseResumeMarker: () => {},
         clearFailure: ({ num }) => clearBuildFailure(num, { path }),
-        recordFailure: () => { throw new Error('delivered claim must not record failure'); },
-        releaseLaneLease: () => { throw new Error('delivered claim must not release a lane'); },
+        recordFailure: () => { throw new Error('delivered claim must not record a failure'); },
+        releaseLaneLease: () => { throw new Error('delivered claim must not release a reserved lane'); },
         spawnResume: () => { throw new Error('delivered claim must not resume'); },
       }),
     }) });
@@ -340,4 +347,13 @@ it('clears #4413 retry history when orphan adoption observes the dead worker\'s 
     // The PR then closes unmerged and the next dispatch fails: a fresh first attempt, not an exhausted card.
     expect(failure()).toMatchObject({ attempts: 1, exhausted: false });
   } finally { rmSync(lockRoot, { recursive: true, force: true }); }
+});
+
+it('prepare discovery reads through the shared throttle by default on the sync path (PR #5453)', () => {
+  const real = execFileSyncThrottled.getMockImplementation();
+  execFileSyncThrottled.mockImplementation(() => { throw new Error('throttled-stub'); });
+  try {
+    expect(() => createPrepareStatusReader().resolveCard({ num: '4413' })).toThrow('throttled-stub');
+    expect(execFileSyncThrottled).toHaveBeenCalledWith('git', ['fetch', '-q', 'origin', 'main'], expect.any(Object));
+  } finally { execFileSyncThrottled.mockImplementation(real); }
 });

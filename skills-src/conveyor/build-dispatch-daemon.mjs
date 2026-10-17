@@ -95,7 +95,7 @@ import { MAX_CONCURRENT_LANES_ENV } from '../../scripts/lib/lane-concurrency.mjs
 import { classifyPrepareFailure, recordPrepareFailure, readFailureState, readPrepareReleases, releasedAttempt, completePrepareFailures, releaseDuePrepareRetries, takePrepareRouteHolds, requeuePrepareRouteHold, rearmFalseHolds, NOT_CONFIRMED_FIX_LANDED_AT } from '../../scripts/conveyor/prepare-failure-policy.mjs';
 import { readLimitState, isBranchAllowedNow, isGlobalOffNow, countOpenPrsForDispatch, decideOpenPr } from '../../scripts/lib/pr-limit.mjs';
 import { CARD_REFUSAL_CODE } from '../../scripts/conveyor/retry-backoff.mjs';
-import { recordBuildFailure, clearBuildFailure, listBuildBackoffs, rearmBuildFailures } from '../../scripts/conveyor/build-dispatch-failures.mjs';
+import { recordBuildFailure, clearBuildFailure, listBuildBackoffs, rearmBuildFailures, dispatchAttemptKey, claimAttemptKeys } from '../../scripts/conveyor/build-dispatch-failures.mjs';
 import { redactSpawnText } from '../../scripts/lib/describe-spawn-failure.mjs';
 
 import { resolveScorecardStorePath } from '../../scripts/conveyor/run-scorecard-store.mjs';
@@ -696,7 +696,15 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       heldNums.add(lead);
       // Do not immediately launch the failed group's released members again in this same tick.
       for (const c of groupClaims) heldNums.add(normNum(c.meta.num));
-      const rec = live ? effects.recordBuildFailure?.({ num: lead, reason: 'group-member-dropped', output: `dropped members: ${settled.groupDropped.join(',')}` }) : null;
+      // Keyed by the settled dispatch: the claims are released below and a throw there re-runs this next tick, and
+      // orphan adoption charging the same dispatch shares the key. A row with no start time keys on its run. The group's
+      // claims (lead and members) are aliases too: orphan adoption keys on them when it could not read the run row. Only
+      // when the row has a start time — the stale-claim guard above then ties these claims to this attempt.
+      const dispatchKey = dispatchAttemptKey(settled.startedAt);
+      const attemptKey = dispatchKey ? [dispatchKey, ...claimAttemptKeys(groupClaims, lead)]
+        : settled.source ? [`group:${settled.source}`] : [];
+      const rec = live ? effects.recordBuildFailure?.({ num: lead, reason: 'group-member-dropped', output: `dropped members: ${settled.groupDropped.join(',')}`,
+        ...(attemptKey.length ? { attemptKey } : {}) }) : null;
       groupFailures.push({ num: lead, stage: 'group', reason: 'group-member-dropped', ...(rec ? { reasonCode: rec.reasonCode, attempts: rec.attempts } : {}) });
     }
   }
@@ -931,7 +939,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         if (effects.resolveBuildCard) {
           try { await effects.resolveBuildCard({ num: pick.num }); }
           catch (error) {
-            const reason = error.code === 'card-not-found' ? `build card #${pick.num} unavailable on origin/main` : 'build card lookup unavailable';
+            // A missing card is a card-level refusal; a failed origin/main read is clone-wide and charges nothing.
+            const reason = error?.code === 'card-not-found' ? `build card #${pick.num} unavailable on origin/main` : 'build card lookup unavailable';
             effects.recordBuildFailure?.({ num: pick.num, reason });
             failures.push({ num: pick.num, stage: 'card', reason });
             continue;
@@ -2110,8 +2119,9 @@ export async function cliPredictRoute(num, scope, { root = REPO_ROOT, env = proc
   }
 }
 
-const defaultExecAsync = (cmd, args, opts) => new Promise((resolveExec, rejectExec) => {
-  execFile(cmd === 'gh' ? process.execPath : cmd, cmd === 'gh' ? [join(SCRIPTS, 'lib', 'gh-throttle.mjs'), ...args] : args, { ...opts, maxBuffer: opts?.maxBuffer }, (err, out) => err ? rejectExec(err) : resolveExec(out));
+/** Async exec for prepare discovery: `gh` always goes through the shared throttle script. `run` is injectable for tests. */
+export const defaultExecAsync = (cmd, args, opts, run = execFile) => new Promise((resolveExec, rejectExec) => {
+  run(cmd === 'gh' ? process.execPath : cmd, cmd === 'gh' ? [join(SCRIPTS, 'lib', 'gh-throttle.mjs'), ...args] : args, { ...opts, maxBuffer: opts?.maxBuffer }, (err, out) => err ? rejectExec(err) : resolveExec(out));
 });
 
 // Content-addressed statuses remain valid across ticks, even when origin/main advances.

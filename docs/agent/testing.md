@@ -1464,7 +1464,17 @@ both, including daemon restarts; clear it only after observing a delivering PR. 
 orphan claim, persist its failure so a failed ledger write keeps the claim. Regress the #4413 shape:
 pending launch → confirmed run → dead worker with no delivery → backed-off retry → exhausted attempts.
 Validate a build card against the fetched WE origin/main backlog before acquiring its claim; missing
-identities are permanent card refusals, while an unavailable Git read remains a retryable observation.
+identities are permanent card refusals, while an unavailable Git read remains a retryable observation:
+the clone-wide `card-lookup-unavailable` code, never charged to the card's retry budget. Because history
+outlives a launch, late-launch (quick-schedule) attempts are counted apart from real failures, and the
+orphan pass keys its failure on the dead claim so a retried release never charges it twice. The ledger
+keeps every key charged to a card, not only the last: orphan and fail-group records interleave every
+tick while a release throws, and each must still dedupe its own attempt. Both key a dispatch on its run
+row's start time (`dispatch:`), so the two paths charging one dead dispatch in one tick charge it once.
+A run row can be unreadable on one pass and back on the next, so orphan adoption passes the claim
+(`orphan:`) and the row as aliases of one attempt: any charged alias dedupes, and the new aliases join it.
+Group member claims (`member:`) are aliases on both paths too: orphan adoption can release the lead claim
+before the fail-group pass looks, but the member claims survive.
 
 Prepare discovery searches each card's current lane identity, bornAs lane identity and title, then
 unions the complete results. Never use an unfiltered repository PR listing as the launch guard's proof

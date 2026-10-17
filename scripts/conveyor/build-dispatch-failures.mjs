@@ -8,12 +8,16 @@
 import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, chmodSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
-import { readBackoffSettings, backoffVerdict, buildEvidenceReasonCode, isCloneWideReasonCode, CARD_REFUSAL_CODE } from './retry-backoff.mjs';
+import { readBackoffSettings, backoffVerdict, buildEvidenceReasonCode, isCloneWideReasonCode, CARD_REFUSAL_CODE, QUICK_RETRY_REASON_CODES } from './retry-backoff.mjs';
 import { redactSpawnText } from '../lib/describe-spawn-failure.mjs';
 import { readBuildUnconfirmedSettings } from '../lib/build-unconfirmed-settings.mjs';
+import { normNum } from './queue-store.mjs';
 
 export const buildFailurePath = () => join(resolveCoordinationRoot(), 'build-dispatch-failures.json');
 const OUTPUT_CAP = 2000;
+// Attempt keys already charged to a card, newest last. Only the newest claim or settled row is ever re-recorded,
+// so evicting the oldest keys never lets a live attempt charge again.
+const ATTEMPT_KEY_CAP = 32;
 
 function read(path) {
   if (!existsSync(path)) return { items: {} };
@@ -29,11 +33,58 @@ function save(state, path) {
   renameSync(temp, path);
 }
 
-/** Record one failed build dispatch. `output` is the captured child output (falls back to `reason`). */
-export function recordBuildFailure({ num, reason, output, base = null }, { path = buildFailurePath(), now = Date.now(), settings = readBackoffSettings(), unconfirmed = readBuildUnconfirmedSettings() } = {}) {
+/**
+ * One dispatch attempt's identity, shared by every path that charges it: the dispatch row's own `startedAt`. Orphan
+ * adoption (keyed on the dead claim) and the fail-group pass (keyed on the settled row) can charge the SAME dispatch
+ * in one tick; one key means one charge. Null when the row carries no start time — each path then falls back to a
+ * key of its own.
+ */
+export const dispatchAttemptKey = (startedAt) => (typeof startedAt === 'string' && startedAt !== '' ? `dispatch:${startedAt}` : null);
+
+/**
+ * The claim aliases of one dispatch of `lead`: its own claim (`orphan:<claimedAt>`) and every group member's claim
+ * (`member:<num>:<claimedAt>`). A dispatch takes all of them once, so each names that attempt. Orphan adoption may
+ * release the lead claim (or see it past expiry) before the fail-group pass looks, while member claims survive: the
+ * member aliases still tie the two passes' charges to one attempt. A claim without a string `claimedAt` adds none.
+ */
+export function claimAttemptKeys(claims, lead) {
+  const n = normNum(lead);
+  return (claims ?? []).flatMap((c) => {
+    const at = c?.meta?.claimedAt;
+    if (typeof at !== 'string' || at === '') return [];
+    if (c.meta.groupLead == null) return normNum(c.meta.num) === n ? [`orphan:${at}`] : [];
+    return normNum(c.meta.groupLead) === n ? [`member:${normNum(c.meta.num)}:${at}`] : [];
+  });
+}
+
+/**
+ * Record one failed build dispatch. `output` is the captured child output (falls back to `reason`). `attemptKey`
+ * names the attempt (e.g. the dead claim): a repeat of any key already charged to the card charges nothing, so a step
+ * that records before a release it may retry never charges one attempt twice — even when another path (orphan
+ * adoption, fail-group) records its own attempt for the same card in between. It may be a list of ALIASES for one
+ * attempt (the dead claim AND its dispatch row, when that row was readable): if any alias was charged, nothing is
+ * charged and the new aliases join the charged set, so an identity seen only on a later pass still links to the
+ * charge. Late-launch (quick-schedule) attempts are counted apart from real failures: the history is retained across a
+ * confirmed launch, and lateness must not spend the card's failure budget (PR #5453).
+ */
+export function recordBuildFailure({ num, reason, output, base = null, attemptKey }, { path = buildFailurePath(), now = Date.now(), settings = readBackoffSettings(), unconfirmed = readBuildUnconfirmedSettings() } = {}) {
   const state = read(path);
   const key = String(num);
-  const attempts = (state.items[key]?.attempts ?? 0) + 1;
+  const prev = state.items[key];
+  // Every key charged so far, not only the last: interleaved paths must not erase each other's evidence. A record
+  // written before the list existed carries one `attemptKey`.
+  const chargedKeys = Array.isArray(prev?.attemptKeys) ? prev.attemptKeys : prev?.attemptKey != null ? [prev.attemptKey] : [];
+  const aliases = [...new Set((Array.isArray(attemptKey) ? attemptKey : [attemptKey]).filter(k => k != null && k !== '').map(String))];
+  const keepKeys = (keys) => [...new Set([...chargedKeys, ...keys])].slice(-ATTEMPT_KEY_CAP);
+  if (aliases.some(k => chargedKeys.includes(k))) {
+    // Already charged: learn the aliases this pass could see, so the other identity of the attempt dedupes too.
+    if (aliases.every(k => chargedKeys.includes(k))) return prev;
+    const linked = { ...prev, attemptKeys: keepKeys(aliases) };
+    delete linked.attemptKey;
+    state.items[key] = linked;
+    save(state, path);
+    return linked;
+  }
   // Redact BEFORE cutting: a cut taken first can slice a credential's recognisable prefix off and leave its tail
   // unredactable. The reason code is read off the raw text — redaction never changes what a code pattern matches.
   const rawText = String(output ?? reason ?? '').trim();
@@ -47,15 +98,22 @@ export function recordBuildFailure({ num, reason, output, base = null }, { path 
   // builder-starved — a clone-wide refusal (the daemon's own clone is behind origin/main) is not the card's
   // failure: nothing is persisted, no attempt is charged, and the card is not withheld.
   if (isCloneWideReasonCode(reasonCode)) {
-    return { num: key, attempts: state.items[key]?.attempts ?? 0, reasonCode, cloneWide: true, reason: redactSpawnText(reason ?? '').slice(0, 400),
+    return { num: key, attempts: prev?.attempts ?? 0, reasonCode, cloneWide: true, reason: redactSpawnText(reason ?? '').slice(0, 400),
       output: text.slice(0, OUTPUT_CAP), recordedAt: new Date(now).toISOString(), retryAfter: null, exhausted: false };
   }
+  // A record written before the split carries one count: it belongs to its own code's schedule.
+  const scheduleOf = (code) => (QUICK_RETRY_REASON_CODES.includes(code) ? 'quick' : 'failure');
+  const counts = prev ? (prev.scheduleAttempts ?? { [scheduleOf(prev.reasonCode)]: prev.attempts ?? 0 }) : {};
+  const schedule = scheduleOf(reasonCode);
+  const attempts = (counts[schedule] ?? 0) + 1;
   // A cooldown may extend a retry window, but must never revive an exhausted card.
   const verdict = reasonCode === CARD_REFUSAL_CODE ? { retryAfter: null, exhausted: true }
     : backoffVerdict({ attempts, now, settings, code: reasonCode });
   const record = {
     num: key, attempts,
     base, unconfirmedLaunches,
+    scheduleAttempts: { ...counts, [schedule]: attempts },
+    ...(aliases.length || chargedKeys.length ? { attemptKeys: keepKeys(aliases) } : {}),
     reasonCode,
     reason: redactSpawnText(reason ?? '').slice(0, 400),
     output: text.slice(0, OUTPUT_CAP),
