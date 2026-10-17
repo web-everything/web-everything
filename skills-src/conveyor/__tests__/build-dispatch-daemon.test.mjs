@@ -2214,6 +2214,27 @@ describe('automatic item preparation', () => {
       }
     } finally { log.mockRestore(); }
   });
+  it('a planning skip with an open duplicate beside the merge persists the open PR, as the launch guard does', async () => {
+    const effects = fixture();
+    effects.now = () => Date.parse('2026-10-16T20:53:36Z');
+    effects.preparePolicy = () => resolvePreparePolicy();
+    effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5966' }], admission: {
+      queue: [{ num: '5966' }], held: [{ num: '5966', reason: 'prepare-stale', detail: 'scope changed since 37d55ee6: a' }],
+    } }, nextState: {} });
+    effects.listPreparePrs = () => [
+      { number: 5399, state: 'MERGED', headRefName: 'lane/5966-prepare-a', createdAt: '2026-10-15T17:18:00Z', mergedAt: '2026-10-16T20:32:38Z' },
+      { number: 5438, state: 'OPEN', headRefName: 'lane/5966-prepare-b', createdAt: '2026-10-16T20:40:00Z' },
+    ];
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(effects.dispatch).not.toHaveBeenCalled();
+      expect(tick.prepare.skippedInPlanning).toEqual([{ num: '5966', reason: expect.stringContaining('(#5399)') }]);
+      // The open PR's record keeps the refusal probe pointed at it; the merge-only scope note does not apply.
+      expect(tick.nextBookkeeping.prepareRefusals).toEqual([{ num: '5966', at: '2026-10-16T20:53:36.000Z',
+        reason: 'open prepare PR #5438 (lane/5966-prepare-b)', pr: 5438, head: 'lane/5966-prepare-b' }]);
+    } finally { log.mockRestore(); }
+  });
   it('retires a merged unstamped PR without recording an unstamped failure', async () => {
     const effects = fixture();
     claimed(effects);

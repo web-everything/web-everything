@@ -526,17 +526,23 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       const bornAs = candidate.bornAs ?? out?.decisions?.admission?.queue?.find(r => normNum(r.num) === num)?.bornAs
         ?? (await effects.readPreparedStamp?.({ num }))?.bornAs;
       const prs = await effects.listPreparePrs({ num, bornAs });
-      const merged = recentMergedPrepare({ num, bornAs, prs,
-        now: effects.now?.() ?? Date.now(), mergedGuardHours: preparePolicy.mergedGuardHours });
+      const now = effects.now?.() ?? Date.now();
+      const merged = recentMergedPrepare({ num, bornAs, prs, now, mergedGuardHours: preparePolicy.mergedGuardHours });
       if (!merged) return;
       const reason = `skipped in planning: prepared ${merged.minutesAgo} min ago (#${merged.pr.number})`;
+      // Persist what the launch guard would: its PR precedence (an open prepare PR outranks the merge, so the
+      // refusal probe still reads it) and reason. Claims, runs and parks stay the launch guard's own checks.
+      const refusal = prepareLaunchRefusal({ num, bornAs, prs, now, mergedGuardHours: preparePolicy.mergedGuardHours });
+      const refusingPr = Number(/prepare PR #(\d+)/.exec(refusal?.reason ?? '')?.[1]);
+      const matched = prs.find(pr => pr?.number === refusingPr) ?? merged.pr;
       // Read the scope-drift hold from the plan that offered this card: a replan with it held may drop the hold.
       const scopeHold = (out?.decisions?.admission?.held ?? []).find(h => normNum(h.num) === num
         && h.reason === 'prepare-stale' && h.detail?.startsWith('scope changed since '));
-      const note = scopeHold ? `scope moved after prepare: ${scopeHold.detail}; build step must reconcile scope` : null;
+      const note = matched.state === 'MERGED' && scopeHold
+        ? `scope moved after prepare: ${scopeHold.detail}; build step must reconcile scope` : null;
       planningSkips.push({ num, reason, ...(note ? { note } : {}) });
-      planningSkipDetail.set(num, { reason: `merged prepare PR #${merged.pr.number} (within ${preparePolicy.mergedGuardHours}h guard)`,
-        pr: merged.pr.number, head: merged.pr.headRefName ?? null, ...(note ? { note } : {}), ...(bornAs ? { bornAs } : {}) });
+      planningSkipDetail.set(num, { reason: refusal.reason, pr: matched.number, head: matched.headRefName ?? null,
+        ...(note ? { note } : {}), ...(bornAs ? { bornAs } : {}) });
       console.error(`build-dispatch-daemon: prepare #${num} ${reason}${note ? ` · ${note}` : ''}`);
     } catch { /* The launch guard still fails closed on an unreadable listing. */ }
   };
