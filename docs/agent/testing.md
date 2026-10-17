@@ -52,6 +52,53 @@ The sequential and speculative paths skip before budget reservation and record t
 `red team skipped: card-only`. Setting `recheckReadsRepo=false` restores a tool-free re-check;
 negative answers without file reads remain unverifiable.
 
+## Drain red-team disposition and retry evidence
+
+The drain owes a live-head red team only after a speculative or sequential pass is scheduled
+(recorded queued/running status or seat evidence). The review job records the pass as queued as
+soon as the loop returns an owed accept, before the added seats. Before that status exists, the
+persisted accepting review run for the live head holds (the loop labels the accept first), while
+the red team is enabled; the job's later status supersedes it, but a finished status older than
+that run (an earlier review of the same head) does not. Labels alone never schedule one.
+Card-only net diffs (including rename/copy sources) never owe a pass. A queued or running status
+is live only while its writer's pid is. A crashed scheduled pass, or an accepting run no job
+picked up, retains the 45-minute never-scheduled recovery path; live passes and recorded breaks
+cannot use it.
+
+`redTeam.statusLabels` defaults true through the same cascade as the probe controls, with
+`WE_RED_TEAM_STATUS_LABELS` as the environment override; effective value and source are logged.
+The existing label provider provisions the known metadata and writes the mutually exclusive
+`red-team:pending`, `red-team:clear`, and `red-team:blocked` labels. They describe scheduling
+and the recorded disposition on the live head, never grant clearance. The conveyor's existing
+label sweep removes stale head labels and repairs missed status writes. Re-arm removes merge
+readiness and stale status labels atomically; missing-only re-arm preserves readiness only
+when a trusted acceptance marker still names the unchanged live head.
+CI-heal missing-only recovery carries `--expect-no-readiness` into the child command. Readiness
+first observed by the child, or at its final pre-write read, supersedes the parent's earlier
+observation of missing routing, even when no acceptance marker accompanies it.
+
+Queue admission and operator escalation share `red-team-gate.mjs#readRedTeamDisposition`.
+Read the live head's recorded per-finding gate actions before consulting current policy:
+a card/advisory record releases that finding, while sent-back and round-cap records retain
+only their unresolved findings. Without a recorded per-finding action, a policy send-back
+candidate still blocks enqueue and derives `red-team:blocked`, even if no run is currently
+owed. A card record for another finding (or a failed card action) cannot release it.
+An action binds to the result it was recorded against: only gate records after that result
+count, so an earlier same-head result's card cannot release a newer result's finding. Action
+lines are read only as whole `buildGateComment` lines right after the gate marker, with indices
+from the action's own `(#N, …)` list; text elsewhere (a carried finding summary, a landing-job
+name) is never an action. A proven identical-contribution carry keeps the actions bound to the
+result it was carried from; the new head's own records win.
+Legacy cap comments omit indices; exclude separately
+recorded card/advisory findings before surfacing the remaining confirmed breaks. Acceptance
+labels alone do not prove an operator ruled on a cap-held break; use the sanctioned
+head-bound clearance ceremony, including proven identical-contribution carries.
+
+Persist red-team backoff independently of whether the scheduler currently owes a pass.
+The observed comments and live reviews wake a pending head when their evidence changes;
+otherwise a recorded break waits until its retry deadline, including after the health-smell
+age. Only missing-result scheduling gaps retain the maximum-age scheduling fallback.
+
 ## Codex usage accounting
 
 Every direct task, Codex delivery/fix worker, wrapped Codex dispatch worker, and Codex review

@@ -1,13 +1,10 @@
 /** Queue admission and removal share this policy and head-bound red-team evidence. */
-import { redTeamEnabled, redTeamOwedFor } from './review-red-team-policy.mjs';
+import { redTeamCardOnly } from './review-red-team-policy.mjs';
 import { execFileSync } from 'node:child_process';
 import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
 import { readMergeQueueState } from './merge-queue-enqueue.mjs';
-import { redTeamForHead, planRedTeamActions, readConfirmedBreaks, parseRedTeamComment, parseRedTeamGateMarker, RED_TEAM_COMMENT_MARKER, GATE_OUTCOMES } from './red-team-gate.mjs';
-import { parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
-import { parseLatestHumanClearedSha } from './review-escalation.mjs';
-import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { readRedTeamDisposition } from './red-team-gate.mjs';
 
 export function readDrainQueueSafety({ env = process.env, tool, platform, log = () => {} } = {}) {
   const booleanEnv = key => env[key] === undefined ? undefined
@@ -30,75 +27,18 @@ export function sendBackReason(labels) {
   return hold ? `state is ${hold}` : !names.includes('ready-to-merge') ? 'ready-to-merge was removed' : null;
 }
 
-/** The review scheduler's decision over its actual head-bound payload, never inferred from labels. */
-export function postAcceptRedTeamOwed(loopPayload, env = process.env) {
-  return redTeamEnabled(env) && redTeamOwedFor(loopPayload);
+/** Only head-bound scheduled work is owed; acceptance and status labels cannot invent a run. */
+export function postAcceptRedTeamOwed(loopPayload, env = process.env, evidence = {}) {
+  if (redTeamCardOnly(loopPayload?.findings?.read)) return false;
+  return !!(evidence.scheduled || evidence.inFlight || evidence.recorded);
 }
 
-const CARRIED_LINE_RE = /^<!-- review-verdict-carried from=[0-9a-f]{40} to=[0-9a-f]{40} patch-id=[0-9a-f]{40} -->$/;
-/** The heading only `review-set-label --to=clear-human` renders, at the very start of its comment (CLEARED_HUMAN_PROSE_RE). */
-const CLEAR_HUMAN_RULING_RE = /^✅ review — `review:human` cleared via the sanctioned path\n\nCleared by .+? via `review-set-label\.mjs --to=clear-human`/;
-
-/**
- * A verdict carry (review-job carryAcrossRebase) posts ONE comment: its gate markers, the carried marker, prose,
- * then the re-keyed red-team body, so the anchored readers see none of it. Split only that exact layout: gate lines
- * are taken only from before the carried line and must name the head carried to (a chain of carries splits at each
- * link). `at` keeps the thread position and `from` names the head the records were carried from. PURE.
- */
-function threadRecords(comments) {
-  // Every reader below counts trusted records only, so untrusted comments are dropped before any parse.
-  return (Array.isArray(comments) ? comments : []).filter(isTrustedMarkerAuthor).flatMap((c, at) => {
-    const body = typeof c === 'string' ? c : c?.body;
-    const lines = typeof body === 'string' ? body.replace(/\r\n/g, '\n').trimStart().split('\n') : [];
-    const k = lines.findIndex(line => CARRIED_LINE_RE.test(line));
-    const carried = k < 0 ? null : parseVerdictCarriedMarker(lines[k]);
-    const advisoryBody = lines.slice(k + 2).join('\n');
-    const advisory = carried && lines[k + 1] === 'Review verdict carried across an identical contribution.'
-      && lines[k + 2]?.startsWith(RED_TEAM_COMMENT_MARKER) ? parseRedTeamComment(advisoryBody) : null;
-    if (!advisory || advisory.rev !== carried.toSha || !lines.slice(0, k).every(line => {
-      const gate = parseRedTeamGateMarker(line);
-      return gate?.rev === carried.toSha && gate.pr === advisory.pr;
-    })) return [{ c, at }];
-    const parts = [...lines.slice(0, k), advisoryBody];
-    return [{ c, at }, ...parts.map(part => ({ c: { ...c, body: part }, at, from: carried.fromSha }))];
-  });
-}
-
-/**
- * Did the operator rule on the head's confirmed breaks? The gate handed them over (`round-cap`), and a trusted
- * clear-human ceremony for that head came after both the round-cap record and the result. Only the ceremony's own
- * comment counts: a restamp repeats the cleared-human marker for a ruling made on another head. A carried result
- * defers to the ruling on the head it was carried from, read from the thread before the carry. PURE.
- */
-function operatorRuled(records, pr, head) {
-  const trusted = records.filter(r => isTrustedMarkerAuthor(r.c));
-  if (parseLatestHumanClearedSha(trusted.filter(r => !r.from).map(r => r.c)) !== head) return false;
-  const lastAt = (rs, test) => rs.reduce((found, r) => (test(r) ? r : found), null);
-  const body = r => (typeof r.c === 'string' ? r.c : r.c?.body);
-  // Each carry removes its own comment and every later record, so even a cyclic head chain terminates.
-  for (let sha = head, rs = trusted; sha && rs.length;) {
-    const result = lastAt(rs, r => { const p = parseRedTeamComment(body(r)); return p?.pr === Number(pr) && p.rev === sha; });
-    const cap = lastAt(rs, r => { const g = parseRedTeamGateMarker(body(r)); return g?.pr === Number(pr) && g.rev === sha && g.outcome === GATE_OUTCOMES.ROUND_CAP; });
-    const cleared = lastAt(rs, r => !r.from && CLEAR_HUMAN_RULING_RE.test(String(body(r) ?? '').replace(/\r\n/g, '\n').trimStart())
-      && parseLatestHumanClearedSha([r.c]) === sha);
-    if (!result) return false;
-    if (cap && cleared && cleared.at > cap.at && cleared.at > result.at) return true;
-    if (!result.from) return false;
-    rs = rs.filter(r => r.at < result.at);
-    sha = result.from;
-  }
-  return false;
-}
-
-export function redTeamEnqueueHold({ loopPayload, comments, pr, head, env = process.env, confirmedBreaks } = {}) {
+export function redTeamEnqueueHold({ loopPayload, comments, pr, head, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false } = {}) {
   // A recorded break still holds even if the scheduler is now disabled or the payload is unavailable.
-  const live = String(head ?? '').toLowerCase();
-  const records = threadRecords(comments);
-  const result = redTeamForHead(records.map(r => r.c), pr, live);
-  if (result && planRedTeamActions(result, confirmedBreaks ?? readConfirmedBreaks({ env }).value).sendBack.length
-    && !operatorRuled(records, pr, live))
+  const disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks });
+  if (disposition.sendBack.length || disposition.held.length)
     return 'post-accept red team confirmed a break requiring send-back';
-  if (!postAcceptRedTeamOwed(loopPayload, env) || result) return null;
+  if (!postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded }) || disposition.result) return null;
   return 'post-accept red team has no recorded result on the live head';
 }
 

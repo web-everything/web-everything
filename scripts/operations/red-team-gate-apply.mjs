@@ -1,3 +1,4 @@
+import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 /**
  * @file scripts/operations/red-team-gate-apply.mjs
  * @description THE IMPURE HALF of the red-team gate (card x1b8hlo). The pure half — the parser, the setting, the
@@ -99,7 +100,7 @@ export function buildGateComment({ pr, head, outcome, plan, round, cardResult = 
   const lines = [redTeamGateMarker(pr, head, outcome), `**Red-team gate** (setting \`redTeam.confirmedBreaks\`, card x1b8hlo) on head \`${String(head).slice(0, 12)}\`:`];
   if (plan.sendBack.length) {
     lines.push(outcome === GATE_OUTCOMES.ROUND_CAP
-      ? `- ${plan.sendBack.length} confirmed break(s) NOT sent back: ${Number.isInteger(round) ? `review round ${round} has reached the round cap (${DEFAULT_ROUND_CAP})` : 'the review round could not be read, which counts as the round cap'}. The operator rules on them.`
+      ? `- ${plan.sendBack.length} confirmed break(s) NOT sent back: ${Number.isInteger(round) ? `review round ${round} has reached the round cap (${DEFAULT_ROUND_CAP})` : 'the review round could not be read, which counts as the round cap'}. The operator rules on them (${plan.sendBack.map(f => `#${f.index}`).join(', ')}).`
       : `- ${plan.sendBack.length} confirmed break(s) sent back to the fixer (${plan.sendBack.map((f) => `#${f.index}`).join(', ')})${sendBackResult?.already ? ' — the PR was already under review:changes' : ''}.`);
   }
   if (plan.card.length) {
@@ -115,7 +116,16 @@ export function buildGateComment({ pr, head, outcome, plan, round, cardResult = 
  * @param {{repo:string, pr:number, dryRun?:boolean, cap?:number}} o
  * @param {ReturnType<typeof createRedTeamGateIo>} io
  */
-export async function applyRedTeamGate({ repo, pr, dryRun = false, cap = DEFAULT_ROUND_CAP } = {}, io = createRedTeamGateIo()) {
+export async function applyRedTeamGate(input = {}, io = createRedTeamGateIo()) {
+  const result = await applyRedTeamGateInner(input, io);
+  if (!input.dryRun) {
+    try { io.syncStatusLabels?.({ ...input, head: result.head }); }
+    catch (e) { io.log?.(`red-team status labels: ${e.message}`); }
+  }
+  return result;
+}
+
+async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_ROUND_CAP } = {}, io = createRedTeamGateIo()) {
   try {
     const view = io.readPr({ repo, pr });
     const head = String(view?.headRefOid ?? '').toLowerCase();
@@ -203,6 +213,8 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
   };
   const safety = readDrainQueueSafety({ env, log: line => process.stderr.write(`${line}\n`) });
   return {
+    syncStatusLabels: ({ repo, pr, head }) => head ? syncRedTeamStatusLabels({ repo, pr, head, env,
+      log: line => process.stderr.write(`${line}\n`) }) : null,
     dequeueSentBack: args => safety.value.dequeueOnSendBack ? dequeueSentBack({ ...args, exec: (cmd, argv, opts) => execFileSync(cmd, argv, { ...opts, env }), log: line => process.stderr.write(`${line}\n`) }) : { dequeued: false },
     // The COMPLETE thread (paginated): a one-page read could miss the red-team comment or the gate's own record.
     readPr: ({ repo, pr }) => ({

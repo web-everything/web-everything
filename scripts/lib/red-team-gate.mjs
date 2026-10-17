@@ -26,6 +26,9 @@ import { fileURLToPath } from 'node:url';
 import { resolveCascade, platformPreference, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 
+import { parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
+import { parseLatestHumanClearedSha } from './review-escalation.mjs';
+
 // ── The comment the producer writes ─────────────────────────────────────────────────────────────────────────────
 
 /** The red-team comment's leading marker (the producer imports it from here). */
@@ -123,9 +126,9 @@ export function readConfirmedBreaks({ env = process.env, path = RED_TEAM_SETTING
 }
 
 /** Repo-reading and card-only controls share the standard/platform/tool/env cascade. */
-export const RED_TEAM_PROBE_DEFAULTS = Object.freeze({ recheckReadsRepo: true, skipCardOnly: true });
+export const RED_TEAM_PROBE_DEFAULTS = Object.freeze({ recheckReadsRepo: true, skipCardOnly: true, statusLabels: true });
 export const RED_TEAM_PROBE_ENV = Object.freeze({
-  recheckReadsRepo: 'WE_RED_TEAM_RECHECK_READS_REPO', skipCardOnly: 'WE_RED_TEAM_SKIP_CARD_ONLY',
+  recheckReadsRepo: 'WE_RED_TEAM_RECHECK_READS_REPO', skipCardOnly: 'WE_RED_TEAM_SKIP_CARD_ONLY', statusLabels: 'WE_RED_TEAM_STATUS_LABELS',
 });
 export function resolveRedTeamProbes({ file = {}, platform, env = {} } = {}) {
   const envValues = {};
@@ -223,11 +226,9 @@ export function gateOutcomeForHead(comments, pr, head) {
  * same head is never held behind an actor that is not there. A new head, or the `round-cap` record, releases it too.
  */
 export function redTeamQueueReason(pr, setting = CONFIRMED_BREAKS_DEFAULTS) {
-  const parsed = redTeamForHead(pr?.comments, pr?.number, pr?.headRefOid);
-  if (!parsed) return null;
-  const { sendBack } = planRedTeamActions(parsed, setting);
-  if (!sendBack.length) return null;
-  if (gateOutcomeForHead(pr.comments, pr.number, pr.headRefOid) !== GATE_OUTCOMES.SENT_BACK) return null;
+  const disposition = readRedTeamDisposition({ comments: pr?.comments, pr: pr?.number, head: pr?.headRefOid, setting });
+  const sendBack = disposition.sendBack;
+  if (!sendBack.length || disposition.outcome !== GATE_OUTCOMES.SENT_BACK) return null;
   const labels = (Array.isArray(pr?.labels) ? pr.labels : []).map((l) => (typeof l === 'string' ? l : l?.name));
   if (!labels.includes('review:changes')) return null;
   return `red team: ${sendBack.length} confirmed break(s) on this head (${sendBack.map((f) => `#${f.index}`).join(', ')}) — the fixer owns them`;
@@ -236,19 +237,138 @@ export function redTeamQueueReason(pr, setting = CONFIRMED_BREAKS_DEFAULTS) {
 
 /** Confirmed send-back findings parked at the round cap on the live head, awaiting an operator ruling. PURE. */
 export function redTeamRulingNeeded(pr, setting = CONFIRMED_BREAKS_DEFAULTS) {
-  const parsed = redTeamForHead(pr?.comments, pr?.number, pr?.headRefOid);
-  if (!parsed) return null;
-  const { sendBack } = planRedTeamActions(parsed, setting);
-  if (!sendBack.length) return null;
-  const head = parsed.rev;
-  if (gateOutcomeForHead(pr.comments, pr.number, head) !== GATE_OUTCOMES.ROUND_CAP) return null;
-  const labels = (Array.isArray(pr?.labels) ? pr.labels : []).map((l) => (typeof l === 'string' ? l : l?.name));
-  if (labels.includes('review:changes') || labels.includes('review:accepted')) return null;
-  const marker = redTeamGateMarker(pr.number, head, GATE_OUTCOMES.ROUND_CAP);
-  const record = pr.comments.find((c) => isTrustedMarkerAuthor(c)
-    && String((typeof c === 'string' ? c : c?.body) ?? '').trimStart().startsWith(marker));
-  return {
-    head, since: record?.createdAt ?? null,
-    findings: sendBack.map(({ index, file, line, summary, category, impact }) => ({ index, file, line, summary, category, impact })),
-  };
+  const disposition = readRedTeamDisposition({ comments: pr?.comments, pr: pr?.number, head: pr?.headRefOid, setting });
+  if (!disposition.held.length) return null;
+  const labels = (pr?.labels ?? []).map(l => typeof l === 'string' ? l : l?.name);
+  if (labels.includes('review:changes')) return null;
+  return { head: disposition.result.rev, since: disposition.since, findings: disposition.held.map(({ index, file, line, summary, category, impact }) => ({ index, file, line, summary, category, impact })) };
+}
+
+const CARRIED_LINE_RE = /^<!-- review-verdict-carried from=[0-9a-f]{40} to=[0-9a-f]{40} patch-id=[0-9a-f]{40} -->$/;
+/** The heading only `review-set-label --to=clear-human` renders, at the very start of its comment (CLEARED_HUMAN_PROSE_RE). */
+const CLEAR_HUMAN_RULING_RE = /^✅ review — `review:human` cleared via the sanctioned path\n\nCleared by .+? via `review-set-label\.mjs --to=clear-human`/;
+
+/**
+ * A verdict carry (review-job carryAcrossRebase) posts ONE comment: its gate markers, the carried marker, prose,
+ * then the re-keyed red-team body, so the anchored readers see none of it. Split only that exact layout: gate lines
+ * are taken only from before the carried line and must name the head carried to (a chain of carries splits at each
+ * link). `at` keeps the thread position and `from` names the head the records were carried from. PURE.
+ */
+function threadRecords(comments) {
+  // Every reader below counts trusted records only, so untrusted comments are dropped before any parse.
+  return (Array.isArray(comments) ? comments : []).filter(isTrustedMarkerAuthor).flatMap((c, at) => {
+    const body = typeof c === 'string' ? c : c?.body;
+    const lines = typeof body === 'string' ? body.replace(/\r\n/g, '\n').trimStart().split('\n') : [];
+    const k = lines.findIndex(line => CARRIED_LINE_RE.test(line));
+    const carried = k < 0 ? null : parseVerdictCarriedMarker(lines[k]);
+    const advisoryBody = lines.slice(k + 2).join('\n');
+    const advisory = carried && lines[k + 1] === 'Review verdict carried across an identical contribution.'
+      && lines[k + 2]?.startsWith(RED_TEAM_COMMENT_MARKER) ? parseRedTeamComment(advisoryBody) : null;
+    if (!advisory || advisory.rev !== carried.toSha || !lines.slice(0, k).every(line => {
+      const gate = parseRedTeamGateMarker(line);
+      return gate?.rev === carried.toSha && gate.pr === advisory.pr;
+    })) return [{ c, at }];
+    const parts = [...lines.slice(0, k), advisoryBody];
+    return [{ c, at }, ...parts.map(part => ({ c: { ...c, body: part }, at, from: carried.fromSha }))];
+  });
+}
+
+/**
+ * Did the operator rule on the head's confirmed breaks? The gate handed them over (`round-cap`), and a trusted
+ * clear-human ceremony for that head came after both the round-cap record and the result. Only the ceremony's own
+ * comment counts: a restamp repeats the cleared-human marker for a ruling made on another head. A carried result
+ * defers to the ruling on the head it was carried from, read from the thread before the carry. PURE.
+ */
+function operatorRuled(records, pr, head) {
+  const trusted = records.filter(r => isTrustedMarkerAuthor(r.c));
+  if (parseLatestHumanClearedSha(trusted.filter(r => !r.from).map(r => r.c)) !== head) return false;
+  const lastAt = (rs, test) => rs.reduce((found, r) => (test(r) ? r : found), null);
+  const body = r => (typeof r.c === 'string' ? r.c : r.c?.body);
+  // Each carry removes its own comment and every later record, so even a cyclic head chain terminates.
+  for (let sha = head, rs = trusted; sha && rs.length;) {
+    const result = lastAt(rs, r => { const p = parseRedTeamComment(body(r)); return p?.pr === Number(pr) && p.rev === sha; });
+    const cap = lastAt(rs, r => { const g = parseRedTeamGateMarker(body(r)); return g?.pr === Number(pr) && g.rev === sha && g.outcome === GATE_OUTCOMES.ROUND_CAP; });
+    const cleared = lastAt(rs, r => !r.from && CLEAR_HUMAN_RULING_RE.test(String(body(r) ?? '').replace(/\r\n/g, '\n').trimStart())
+      && parseLatestHumanClearedSha([r.c]) === sha);
+    if (!result) return false;
+    if (cap && cleared && cleared.at > cap.at && cleared.at > result.at) return true;
+    if (!result.from) return false;
+    rs = rs.filter(r => r.at < result.at);
+    sha = result.from;
+  }
+  return false;
+}
+
+
+/**
+ * buildGateComment's per-finding action lines, each matched as a whole line. Indices come only from the action's own
+ * `(#N, …)` list, never from a landing-job or failure text. A failed card filing matches nothing. A round-cap line
+ * without a list is the older record shape.
+ */
+const INDEX_LIST = '\\((#\\d+(?:, #\\d+)*)\\)';
+const GATE_ACTION_LINES = [
+  ['card', new RegExp(`^- \\d+ finding\\(s\\) filed as a follow-up card ${INDEX_LIST}(?: — landing job [^\\n]*)?\\.$`)],
+  ['advisory', new RegExp(`^- \\d+ finding\\(s\\) left advisory ${INDEX_LIST}\\.$`)],
+  ['send-back', new RegExp(`^- \\d+ confirmed break\\(s\\) sent back to the fixer ${INDEX_LIST}(?: — the PR was already under review:changes)?\\.$`)],
+  ['held', new RegExp(`^- \\d+ confirmed break\\(s\\) NOT sent back: [^\\n]*?(?: ${INDEX_LIST})?\\.$`)],
+];
+
+/** PURE: the action lines of ONE gate record, read only from the block right after its marker (and heading). */
+function gateActionLines(body) {
+  const lines = String(body ?? '').replace(/\r\n/g, '\n').trimStart().split('\n');
+  const found = [];
+  for (let i = lines[1]?.startsWith('**Red-team gate** ') ? 2 : 1; i < lines.length && lines[i].startsWith('- '); i++) {
+    const hit = GATE_ACTION_LINES.map(([action, re]) => [action, re.exec(lines[i])]).find(([, m]) => m);
+    if (hit) found.push({ action: hit[0], indices: hit[1][1] ? hit[1][1].split(', ').map(s => Number(s.slice(1))) : [] });
+  }
+  return found;
+}
+
+/** Shared live-head disposition reader. Recorded per-finding actions override today's policy.
+ * Without a recorded action, policy send-back candidates still block admission while the gate acts.
+ * Older round-cap records omit indices: all remaining send-back candidates belong to the operator.
+ * An action binds to the result it was recorded against: only gate records after that result (redTeamForHead's
+ * order) count, so a record for an earlier same-head result never releases a newer one's finding. A carried result
+ * also keeps the actions bound to the result it was carried from (the same findings, re-keyed); the newer head's
+ * own records win.
+ */
+export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env } = {}) {
+  const live = String(head ?? '').toLowerCase();
+  const records = threadRecords(comments).map((r, i) => ({ ...r, i }));
+  const thread = records.map(r => r.c);
+  const result = redTeamForHead(thread, pr, live);
+  const plan = planRedTeamActions(result, setting ?? readConfirmedBreaks({ env }).value);
+  const bodyOf = r => String(typeof r.c === 'string' ? r.c : r.c?.body ?? '');
+  const order = (a, b) => (Date.parse(a.c?.createdAt) || 0) - (Date.parse(b.c?.createdAt) || 0) || a.i - b.i;
+  const gateFor = (r, sha) => { const m = parseRedTeamGateMarker(bodyOf(r)); return m?.pr === Number(pr) && m.rev === sha ? m : null; };
+  const actions = new Map();
+  let legacyHeld = false;
+  // Each carry removes its own comment and every later record, so even a cyclic head chain terminates.
+  for (let sha = live, rs = records; sha && rs.length;) {
+    const hit = rs.filter(r => { const p = parseRedTeamComment(bodyOf(r)); return p?.pr === Number(pr) && p.rev === sha; }).sort(order).at(-1);
+    if (!hit) break;
+    const own = new Map();
+    for (const r of rs.filter(r => gateFor(r, sha) && order(r, hit) > 0)) {
+      for (const { action, indices } of gateActionLines(bodyOf(r))) {
+        if (action === 'held' && !indices.length) legacyHeld = true;
+        for (const index of indices) own.set(index, action);
+      }
+    }
+    for (const [index, action] of own) if (!actions.has(index)) actions.set(index, action);
+    if (!hit.from) break;
+    rs = rs.filter(r => r.at < hit.at);
+    sha = hit.from;
+  }
+  const capRecord = records.filter(r => gateFor(r, live)?.outcome === GATE_OUTCOMES.ROUND_CAP).at(-1)?.c ?? null;
+  const outcome = gateOutcomeForHead(thread, pr, head);
+  const ruled = operatorRuled(records, pr, live);
+  const sendBack = [], held = [];
+  for (const f of result?.findings ?? []) {
+    const action = actions.get(f.index) ?? (legacyHeld && f.confirmed ? 'held' : null) ?? (plan.sendBack.includes(f)
+      ? outcome === GATE_OUTCOMES.ROUND_CAP ? 'held' : 'send-back' : null);
+    if (ruled) continue;
+    if (action === 'held') held.push(f);
+    if (action === 'send-back') sendBack.push(f);
+  }
+  return { result, sendBack, held, since: capRecord?.createdAt ?? null, outcome };
 }

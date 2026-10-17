@@ -15,6 +15,8 @@ import {
 } from '../review-extra-seats.mjs';
 import { validateScorecard } from '../../conveyor/run-scorecard-store.mjs';
 import { redTeamEnqueueHold } from '../../lib/drain-queue-safety.mjs';
+import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../../lib/drain-red-team-evidence.mjs';
+import { newRunRecord, writeRun } from '../run-store.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 
 const REPO = 'web-everything/web-everything';
@@ -90,16 +92,51 @@ describe('runReviewJob under review.speculativeRedTeam', () => {
     expect(redTeamEnqueueHold({ loopPayload: payload('accept'), comments, pr: 10, head, env: {} })).toBeNull();
   });
 
-  it.each([true, false])('publishes head-bound liveness around the accepted pass (speculative=%s)', enabled => {
+  it.each([true, false])('records the pass as queued before the added seats and the dispatch, then finished (speculative=%s)', enabled => {
     const events = [];
     const { io } = jobIo({ setting: { enabled }, over: {
       redTeamStatus: row => events.push(row),
-      finishSpeculativeRedTeam: () => { expect(events.at(-1)?.status).toBe('running'); return { status: 'ran' }; },
-      runRedTeam: () => { expect(events.at(-1)?.status).toBe('running'); return { status: 'ran' }; },
+      runExtraSeats: () => { expect(events.map(row => row.status)).toEqual(['queued']); return { status: 'ran', seats: [] }; },
+      finishSpeculativeRedTeam: () => { expect(events.map(row => row.status)).toEqual(['queued']); return { status: 'ran' }; },
+      runRedTeam: () => { expect(events.map(row => row.status)).toEqual(['queued']); return { status: 'ran' }; },
     } });
     runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
-    expect(events.map(row => row.status)).toEqual(['running', 'finished']);
+    expect(events.map(row => row.status)).toEqual(['queued', 'finished']);
     expect(events[0]).toMatchObject({ repo: REPO, pr: 10, loopPayload: { findings: { read: { netBasis: { rev: REV } } } } });
+  });
+  it.each([true, false])('holds enqueue at every step from the accept until a result is posted (speculative=%s)', enabled => {
+    const root = mkdtempSync(join(tmpdir(), 'review-job-window-'));
+    try {
+      const runsDir = join(root, 'runs');
+      const env = { WE_SHARED_RUNS_DIR: runsDir };
+      const holds = [];
+      const probe = step => {
+        const evidence = readDrainRedTeamEvidence({ repo: REPO, pr: 10, head: REV, env, runsDir, readScorecards: () => [] });
+        holds.push([step, redTeamEnqueueHold({ ...evidence, comments: [], pr: 10, head: REV, env })]);
+      };
+      const { io } = jobIo({ setting: { enabled }, over: {
+        redTeamStatus: row => recordRedTeamStatus(row, { env }),
+        // The loop persists its accepting run and applies the labels before the job sees its stdout.
+        runLoop: () => {
+          writeRun({ ...newRunRecord({ id: 'review-pr-1', op: 'review-pr', input: { repo: REPO, pr: 10 } }), ...payload('accept') }, runsDir);
+          probe('labels applied');
+          return { status: 0, stdout: JSON.stringify(payload('accept')), stderr: '' };
+        },
+        runExtraSeats: () => { probe('added seats'); return { status: 'ran', seats: [] }; },
+        awaitSpeculativeRedTeam: () => { probe('speculative wait'); return { spec: PASS, waitedMs: 3 }; },
+        finishSpeculativeRedTeam: () => { probe('speculative finish'); return { status: 'ran' }; },
+        runRedTeam: () => { probe('sequential pass'); return { status: 'ran' }; },
+      } });
+      runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
+      expect(holds.length).toBeGreaterThanOrEqual(3);
+      for (const [step, reason] of holds) expect([step, reason]).toEqual([step, expect.stringMatching(/no recorded result/)]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('clears scheduling status when the review rejects and discards speculation', () => {
+    const events = [];
+    const { io } = jobIo({ verdict: 'changes', over: { redTeamStatus: row => events.push(row) } });
+    runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
+    expect(events).toEqual([expect.objectContaining({ status: 'finished', result: 'not-owed' })]);
   });
   it('starts the red team BEFORE the loop, hands the loop the read sink, and logs the layer that set the setting', () => {
     const { io, calls } = jobIo();
