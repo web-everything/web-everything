@@ -538,6 +538,18 @@ export function numberingWithdrawalOwed(repo, pr) {
 export function numberingRestampSettled(repo, pr, head) { return settledRestamps.has(`${repo}#${pr}@${head}`); }
 const errorReason = (e) => String(e?.message ?? e).split('\n')[0];
 
+// Numbering carries missing review evidence from the accepted head, never a live-head
+// referral hold or read failure. Only the guard's specific missing-evidence refusal is
+// satisfied by the proven move and the prior head's independently checked clearance.
+function guardNumberingReferrals({ state, plan, proven, guardReferrals, repo, pr }) {
+  if (!proven) return guardReferrals(state, { repo, pr });
+  guardReferrals({ ...state, headRefOid: plan.from }, { repo, pr });
+  try { return guardReferrals(state, { repo, pr }); }
+  catch (e) {
+    if (!String(e?.message ?? e).startsWith('mandatory referral hold: no-current-head-review-evidence;')) throw e;
+  }
+}
+
 /**
  * IO: re-read the PR and re-plan right before a write, so a hold, head move or label change that arrived while the
  * proof ran wins over the plan it was given. Returns the fresh state, or the result to return without writing.
@@ -567,8 +579,13 @@ function replanBeforeWrite({ readLiveState, expected, guardReferrals, proveRefer
   }
   // A referral hold, or an unreadable referral record, is never proof the acceptance still stands.
   try {
-    const proven = proveReferralMove?.(plan).ok;
-    guardReferrals(proven ? { ...state, headRefOid: plan.from } : state, { repo, pr });
+    const proof = proveReferralMove?.(plan);
+    guardNumberingReferrals({ state, plan, proven: proof?.ok, guardReferrals, repo, pr });
+    // Clearance cannot replace the numbering proof this pass relied on. Abort even
+    // when the live-head guard clears; a later pass can establish a fresh proof.
+    if (proveReferralMove && !proof?.ok) {
+      return { ...seen, hold: true, result: { action: 'retry', reason: `live numbering proof failed: ${proof?.reason ?? 'unreadable proof'}` } };
+    }
   }
   catch (e) { return { ...seen, hold: true, result: { action: 'retry', reason: errorReason(e) } }; }
   return { state };
@@ -655,10 +672,10 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   // An identical-net-patch fallback is not numbering evidence. Only the numbering proof
   // permits checking the accepted prior head; every other path keeps the current-head guard.
   const numberingProof = referralEvidenceSetting.value ? proveMove(plan) : null;
-  try { guardReferrals(numberingProof?.ok ? { ...state, headRefOid: plan.from } : state, { repo, pr }); }
+  try { guardNumberingReferrals({ state, plan, proven: numberingProof?.ok, guardReferrals, repo, pr }); }
   catch (e) { return { action: 'retry', reason: errorReason(e) }; }
   const recheck = (labelsOnly) => replanBeforeWrite({ readLiveState, guardReferrals,
-    proveReferralMove: referralEvidenceSetting.value ? proveMove : undefined, repo, pr,
+    proveReferralMove: numberingProof?.ok ? proveMove : undefined, repo, pr,
     expected: { from: plan.from, to: plan.to, labelsOnly, human: plan.human, actor: plan.actor, source: plan.source } });
   // A check that does not confirm the write withdraws every record the fresh plan finds stranded and — only for the
   // record THIS pass just posted (`own`) — any hold: one that landed between the pre-write check and the post sits

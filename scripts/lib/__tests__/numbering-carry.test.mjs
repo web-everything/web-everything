@@ -791,10 +791,11 @@ describe('numbering acceptance restamp', () => {
     it('re-checks the referral guard on the re-read state', () => {
       const { calls, provider } = recording();
       let reads = 0;
-      const guardReferrals = () => { if (++reads > 1) throw Error('mandatory referral hold: unresolved'); };
+      const guardReferrals = () => { if (++reads > 2) throw Error('mandatory referral hold: unresolved'); };
       expect(run({ provider, guardReferrals, prove: () => ({ ok: true, reason: 'verified' }) }))
         .toMatchObject({ action: 'retry', reason: 'mandatory referral hold: unresolved' });
       expect(calls).toEqual([]);
+      expect(reads).toBe(3);
     });
     it('keeps pending and withdraws our record when the objection lands between the record and the label write', () => {
       const { thread, calls, provider, step } = liveThread();
