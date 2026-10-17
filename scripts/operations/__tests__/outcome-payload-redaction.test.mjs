@@ -2,7 +2,7 @@
 // verdict over CLI --json and HTTP. Credentials whose value has no token shape (an "opaque" secret) must not
 // survive that boundary, whatever form the error text carries them in.
 import { describe, it, expect } from 'vitest';
-import { outcomePayload } from '../cli-adapter.mjs';
+import { outcomePayload, renderOutcome } from '../cli-adapter.mjs';
 
 const OPAQUE = 'opaqueCredValue9081';
 const SHAPES = [
@@ -18,18 +18,50 @@ const SHAPES = [
   ['JSON value with an escaped quote', `{"GH_TOKEN": "x\\"${OPAQUE}"}`],
   ['URL userinfo', `fetch https://user:${OPAQUE}@proxy.example/x failed`],
   ['auth header', `Authorization: Basic ${OPAQUE}`],
+  // Self-review variants of the same class.
+  ['Authorization JSON key', `{"Authorization":"Basic ${OPAQUE}"}`],
+  ['token as URL username', `https://${OPAQUE}@github.com/o/r`],
+  ['space-separated flag', `claude --token ${OPAQUE} --verbose`],
+  ['doubly JSON-encoded key', `\\\\\\"GH_TOKEN\\\\\\":\\\\\\"${OPAQUE}\\\\\\"`],
+  ['env array', `"env":["GH_TOKEN=${OPAQUE}"]`],
+  ['env name/value pair', `{"name":"GH_TOKEN","value":"${OPAQUE}"}`],
+  ['backtick-quoted value', `GH_TOKEN=\`x ${OPAQUE}\``],
+  ['concatenated shell quoting', `GH_TOKEN='it'\\''s ${OPAQUE}'`],
 ];
 
+const runOf = (text) => ({ op: 'dispatch-lane', id: 'r', cursor: 1, status: 'failed',
+  pending: { step: 'dispatch', note: text }, findings: { read: { holdReason: text, inFlightRuns: [{ handle: text }] } },
+  effects: [{ key: 'k', type: 'conveyor.dispatch-delivery-agent', status: 'failed', handle: text, error: text }],
+  verdict: { dispatching: false, reason: text, why: text } });
+
 function receipt(text) {
-  const run = { op: 'dispatch-lane', id: 'r', cursor: 1, pending: [], findings: [], status: 'failed',
-    effects: [{ key: 'k', type: 'conveyor.dispatch-delivery-agent', status: 'failed', handle: text, error: text }],
-    verdict: { dispatching: false, reason: text, why: text } };
-  return JSON.stringify(outcomePayload({ run, stopped: 'failed', error: new Error(text) }));
+  return JSON.stringify(outcomePayload({ run: runOf(text), stopped: 'failed', error: new Error(text) }));
+}
+
+/** Every human (non --json) rendering of the same run that prints the error or a handle. */
+function humanLines(text) {
+  const run = runOf(text);
+  const inFlight = { ...run, effects: [{ ...run.effects[0], status: 'in-flight', handle: `pid:1 ${text}` }] };
+  return [
+    renderOutcome({ outcome: { run, stopped: 'effect-halted', error: new Error(text), applied: [] } }),
+    renderOutcome({ outcome: { run, stopped: 'step-refused', step: 'read', error: new Error(text), applied: [] } }),
+    renderOutcome({ outcome: { run: inFlight, stopped: 'effect-in-flight', applied: [] } }),
+  ].flatMap((r) => r.lines).join('\n');
 }
 
 describe('outcomePayload — dispatch-lane receipt redaction', () => {
   it.each(SHAPES)('never serves an opaque credential carried as %s', (_name, text) => {
     expect(receipt(text)).not.toContain(OPAQUE);
+  });
+
+  it.each(SHAPES)('never prints an opaque credential carried as %s in the human output', (_name, text) => {
+    expect(humanLines(text)).not.toContain(OPAQUE);
+  });
+
+  it('keeps effect keys and telemetry-named fields intact', () => {
+    const out = JSON.parse(receipt('{"key":"dispatch:3794","input_tokens":55}'));
+    expect(out.effects[0].key).toBe('k');
+    expect(out.verdict.reason).toBe('{"key":"dispatch:3794","input_tokens":55}');
   });
 
   it('keeps the diagnostic text a reader needs', () => {

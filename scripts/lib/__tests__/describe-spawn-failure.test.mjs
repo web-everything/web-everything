@@ -73,6 +73,20 @@ describe('redactSpawnText', () => {
   it("redacts the literal value of this process's own credential-named env vars", () => {
     expect(redactSpawnText('child said: s3cretValue!!', { env: { SOME_SECRET: 's3cretValue!!' } })).toBe('child said: <redacted-env>');
   });
+  it('covers the flag, URL-username, deep-escape, env-array and shell-quoting variants', () => {
+    const out = redactSpawnText([
+      '{"Authorization":"Basic opaque1"}', 'AUTHORIZATION=opaque2', '--token opaque3 --verbose', 'https://opaque4@github.com/o/r',
+      '\\\\\\"GH_TOKEN\\\\\\":\\\\\\"opaque5\\\\\\"', '\\"GH_TOKEN\\":\\"x\\\\\\"opaque6\\"', '"env":[{"name":"FOO","value":"opaque7"}]',
+      '{"name":"GH_TOKEN","value":"opaque8"}', 'A_TOKEN=`x opaque9`', "B_TOKEN=$'x opaqueA'", "C_TOKEN='it'\\''s opaqueB'",
+    ].join('\n'), { env: {} });
+    expect(out).not.toMatch(/opaque/);
+    expect(out).toContain('--verbose');
+  });
+  it('keeps the key it redacts, and leaves effect keys and token counts alone', () => {
+    expect(redactSpawnText('{"GH_TOKEN":"opaque1","key":"dispatch:3794","input_tokens":55}', { env: {} }))
+      .toBe('{"GH_TOKEN":"<redacted-env>","key":"dispatch:3794","input_tokens":55}');
+    expect(redactSpawnText('"env":["GH_TOKEN=x"],"next":1', { env: {} })).toBe('"env":"<redacted>","next":1');
+  });
   it('stays linear on long adversarial text', () => {
     const started = Date.now();
     for (const text of ['a.'.repeat(100000), 'a='.repeat(100000), 'a://'.repeat(50000), '"a":'.repeat(50000), '--settings {"'.repeat(20000)]) {
