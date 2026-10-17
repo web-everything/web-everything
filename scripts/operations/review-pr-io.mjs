@@ -1,4 +1,3 @@
-import { observeLedgerHead } from '../lib/ledger-observation.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
@@ -58,7 +57,7 @@ import { createReferralGhProvider } from '../lib/review-comment-edit.mjs';
 // (`planAdvisoryLabels`) lives in the leaf, the writes go through the same provider port as the note above.
 import { ADVISORY_LABEL_META, advisoryCoversHead, labelNames, planAdvisoryLabels } from '../lib/advisory-labels.mjs';
 // #3007 — the real verdict ledger, behind the reserved `verdict-ledger.append` seam. See the LEDGER sink.
-import { EVENT_TYPES, appendVerdict, buildLedgerEvent, buildVerdictRecord, foldRepo, parseLedgerEvents, verdictForLabelTarget, verdictLedgerPath } from '../lib/verdict-ledger.mjs';
+import { EVENT_TYPES, appendVerdict, buildLedgerEvent, buildVerdictRecord, foldRepo, parseLedgerEvents, verdictBears, verdictForLabelTarget, verdictLedgerPath } from '../lib/verdict-ledger.mjs';
 // Card 5469 — the scoped re-review shadow: the declared setting and the pure round rules.
 import { isValidRoundBudget, resolveReviewSettings, resolveReviewSettingSource, SCOPED_REREVIEW_MODES, ROUND_BUDGET_OFF } from '../lib/review-settings.mjs';
 import { acceptanceIds, enclosingSymbol, foldFindingStatuses, lastReviewedHead, reviewRoundOf, reviewScope, shadowRound,
@@ -1427,15 +1426,23 @@ export function createReviewPrSinks({
       // builder refuses, so say so as a refusal rather than recording a guessed disposition.
       const verdict = verdictForLabelTarget(payload.to);
       if (!verdict) throw notApplied(`verdict-ledger: unknown label target ${JSON.stringify(payload.to)}`);
-      observeLedgerHead({ repo: payload.repo, pr, headSha: payload.headSha });
+      if (typeof payload.headSha !== 'string' || !/^[0-9a-f]{40}$/i.test(payload.headSha)) {
+        throw notApplied('verdict-ledger: a pinned 40-hex review head is required');
+      }
+      const headSha = payload.headSha.toLowerCase();
+      // This is the reviewed head, possibly from a delayed effect, not a live lifecycle observation.
+      // The label writer observes the live PR; the reconciliation row witnesses only its own review.
       const folded = foldRepo(payload.repo).get(pr);
-      if (folded && folded.current && folded.current.verdict === verdict && folded.current.coverage?.headSha === (payload.headSha ?? null)) {
+      // A delayed completion can remain historical. Its replay must still find that write rather than
+      // appending a new timestamped row forever. Within a head, compare the latest bearing verdict.
+      const existing = folded?.history.findLast(row => verdictBears(row.verdict) && row.coverage?.headSha === headSha);
+      if (existing?.verdict === verdict) {
         return {
           reconciled: true,
           path: verdictLedgerPath(payload.repo),
-          verdict: folded.current.verdict,
-          at: folded.current.at,
-          source: folded.current.source,
+          verdict: existing.verdict,
+          at: existing.at,
+          source: existing.source,
         };
       }
       const appended = appendVerdict(buildVerdictRecord({
@@ -1448,7 +1455,7 @@ export function createReviewPrSinks({
         session: currentActorId(),
         channel: payload.channel || '',
         source: 'operation-reconcile',
-        headSha: payload.headSha,
+        headSha,
         findingCount: Array.isArray(payload.findings) ? payload.findings.length : null,
       }));
       if (!appended.ok) throw notApplied(`verdict-ledger append refused: ${appended.errors.join('; ')}`);

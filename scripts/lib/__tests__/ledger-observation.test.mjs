@@ -3,7 +3,7 @@ import { mkdirSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { planLedgerObservation, observeLedgerHead, observeLedgerPrEvent, proveLedgerCarry,
+import { planLedgerObservation, observeLedgerHead, observeLedgerPrEvent, observeLiveLedgerHead, proveLedgerCarry,
   resolveLedgerObservationSettings, readObservationLedger } from '../ledger-observation.mjs';
 import { appendVerdict, buildVerdictRecord, buildLedgerEvent, foldVerdictLedger, ledgerObservationApplies, validateVerdictRecord } from '../verdict-ledger.mjs';
 import { derivePrState } from '../pr-state.mjs';
@@ -18,6 +18,35 @@ const plan = (over = {}) => planLedgerObservation({ repo, pr: 1, headSha: next, 
 const facts = { repo, pr: 1, head: { sha: next }, now, state: 'OPEN', requiredChecks: [], sessions: [], handoffs: [], refusals: [] };
 
 describe('open-head ledger observations', () => {
+  for (const firstSeenRows of [false, true]) for (const headMoveInvalidation of [false, true]) {
+    for (const verdict of ['accepted', 'changes']) it(`honors fresh ${verdict} verdicts with observations ${firstSeenRows}/${headMoveInvalidation}`, () => {
+      const flags = { value: { firstSeenRows, headMoveInvalidation } };
+      const baseline = plan({ events: [], headSha: head, settings: flags });
+      const fresh = buildVerdictRecord({ repo, pr: 1, headSha: next, verdict, source: 'test', at: now });
+      // The observer may be disabled or its append may miss. A completed review still witnesses its head.
+      const events = [...baseline, ...(baseline.length ? [] : [accepted()]), fresh];
+      expect(foldVerdictLedger(events).get(1).current).toBe(fresh);
+      expect(derivePrState(events, facts).verdict).toBe(verdict);
+      expect(foldVerdictLedger(events).get(1).clears).toBe(verdict === 'accepted');
+      const delayed = accepted();
+      expect(foldVerdictLedger([...events, delayed]).get(1).current).toBe(fresh);
+      if (verdict === 'changes') expect(foldVerdictLedger([...events, delayed]).get(1).outstandingHolds).toContain(fresh);
+    });
+  }
+  it('retains a fresh review when its missed observation arrives later and permits an explicit return to an old head', () => {
+    const fresh = buildVerdictRecord({ repo, pr: 1, headSha: next, verdict: 'accepted', source: 'test', at: now });
+    const moved = plan()[0];
+    expect(foldVerdictLedger([accepted(), fresh, moved]).get(1).current).toBe(fresh);
+    expect(derivePrState([accepted(), fresh, moved], facts)).toMatchObject({ verdict: 'accepted', clears: true });
+    const back = buildVerdictRecord({ repo, pr: 1, headSha: head, fromHead: next, verdict: 'head-moved', source: 'head-observer', at: now });
+    const replayed = accepted();
+    expect(foldVerdictLedger([accepted(), fresh, back, replayed]).get(1).current).toBe(replayed);
+  });
+  it('does not let a stale transition end approval scope on the current head', () => {
+    const human = buildVerdictRecord({ repo, pr: 1, headSha: next, verdict: 'human', source: 'test', at: now });
+    const approval = buildLedgerEvent({ repo, pr: 1, at: now, source: 'test', type: 'approval', approval: 'clear-human' });
+    expect(derivePrState([accepted(), human, approval, plan()[0]], facts).clears).toBe(true);
+  });
   it('records first sight, imports holds, and does not invent acceptance from labels', () => {
     expect(plan({ events: [], labels: ['review:human'] })[0]).toMatchObject({ source: 'first-seen', verdict: 'human', coverage: { headSha: next } });
     expect(plan({ events: [], labels: ['review:accepted'] })[0]).toMatchObject({ verdict: 'observed', clears: false, state: 'accepted' });
@@ -114,6 +143,17 @@ describe('open-head ledger observations', () => {
     let seen;
     observeLedgerPrEvent({ repo, sha: head }, 1, { readPr: () => ({ state: 'OPEN', headRefOid: next, labels: [] }), observe: f => { seen = f; } });
     expect(seen.headSha).toBe(next);
+  });
+  it('keeps a newer ledger acceptance when a drain snapshot still names an older head', () => {
+    const current = buildVerdictRecord({ repo, pr: 1, headSha: next, verdict: 'accepted', source: 'test', at: now });
+    const append = vi.fn();
+    const readPr = vi.fn(() => ({ state: 'OPEN', headRefOid: next, labels: [] }));
+    const result = observeLiveLedgerHead({ repo, pr: 1, headSha: head, listedHeadSha: head }, {
+      readPr, observe: live => observeLedgerHead(live, { settings, read: () => [current], append }),
+    });
+    expect(readPr).toHaveBeenCalledWith(repo, 1);
+    expect(result).toMatchObject({ ok: true, rows: [] });
+    expect(append).not.toHaveBeenCalled();
   });
   it('uses the existing numbering proof on real git objects', () => {
     const cwd = mkdtempSync(join(tmpdir(), 'ledger-numbering-'));

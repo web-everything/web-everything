@@ -1558,7 +1558,16 @@ requires the previous live acceptance to name the immediately preceding head, pl
 exact root-tree identity, or identical-net-patch proof; `fromHead` and `carryRule` retain the witness.
 Observation preconditions are rechecked inside the home append lock and each transport retry, so a delayed
 baseline cannot overwrite a review or a delayed head observation overwrite a newer one. Feed events re-read
-GitHub's live head because delivered events may describe an older head. Unreadable ledgers are write misses,
+GitHub's live head because delivered events and drain list snapshots may describe an older head. The bare
+event waker defaults to a no-op observer; the production wrapper opts into ledger observation explicitly.
+Completed reviews witness their own pinned head even if observation writes are disabled or missed;
+delayed verdicts for superseded heads remain history and do not clear outstanding holds. A later explicit
+live transition can return to an earlier head. Reconciliation requires a full 40-hex reviewed SHA and
+normalizes case before checking for an existing verdict. Missing or unpinned review bases are refused
+before append; a live head must never be substituted for a missing review witness.
+Regression coverage includes the four observation-setting combinations, late transition/completion order,
+stale drain snapshots, reconciliation replay, and first-seen/head-moved/carried transport retry races.
+Unreadable ledgers are write misses,
 never empty ledgers. These records do not change the authority rollout setting.
 
 ## Review scratch disk retention

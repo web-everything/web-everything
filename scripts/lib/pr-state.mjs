@@ -50,10 +50,11 @@ function scopedEvents(events, scope) {
 export function ledgerView(events, facts) {
   const scope = scopeOf(facts);
   let mine = scope ? scopedEvents(events, scope) : [];
-  // Approvals have legacy implicit head scope. A movement boundary ends that scope.
-  const boundary = mine.findLastIndex(e => e.verdict === 'head-moved');
-  if (boundary >= 0) mine = mine.filter((e, i) => i >= boundary || ![EVENT_TYPES.APPROVAL, EVENT_TYPES.REVIEW_EXEMPT, EVENT_TYPES.VERDICT].includes(e.type));
+  // Fold the complete stream so a delayed transition cannot erase a review that already witnessed its head.
   const folded = scope ? foldVerdictLedger(mine.filter(isVerdictRow)).get(scope.pr) ?? null : null;
+  // Approvals have legacy implicit head scope. A movement boundary ends that scope.
+  const boundary = mine.indexOf(folded?.lastHeadMove);
+  if (boundary >= 0) mine = mine.filter((e, i) => i >= boundary || ![EVENT_TYPES.APPROVAL, EVENT_TYPES.REVIEW_EXEMPT, EVENT_TYPES.VERDICT].includes(e.type));
   const cur = folded?.current ?? null;
   let clears = !!folded?.clears;
   // A human hold is lifted by a LATER valid approval (unexpired delegation, provable clock); an unknown position never lifts.

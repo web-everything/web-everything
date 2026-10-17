@@ -853,16 +853,19 @@ export function parseLedgerEvents(text) {
  *   only place a non-bearing row is visible, and it is where "a review happened" is read back from.
  * @property {VerdictRecord[]} outstandingHolds - BEARING holds appended after the last clearing record. Empty
  *   when the live verdict clears. This is the card's *"no unanswered hold may exist"* in its computed form.
+ * @property {VerdictRecord|null} lastHeadMove - latest applied invalidation; delayed observations do not reset approval scope.
  */
 
 /**
  * THE FOLD (#3007). Replay the append-only stream into the current verdict per PR. PURE + total.
  *
- * THE ONLY RULE IS LATEST-WINS PER PR, and it is deliberately the whole rule:
+ * LATEST-WINS PER PR among bearing rows that have not been superseded by a witnessed head:
  *   • "a newer verdict supersedes an older one" → the last record for a PR is the live one;
  *   • "a hold is cleared by a later clearing record, never by deleting anything" → the clearing record is
  *     simply a later row, and there is no delete in this format to begin with.
- * Nothing is keyed on a content hash, so no rebase can make a row unreachable — see the file header.
+ * A fresh review witnesses its own head even when an observation append missed or was disabled.
+ * A delayed verdict for a previously superseded head remains history. An explicit live transition
+ * can return to a previous head; a review completion alone cannot rewind to it.
  *
  * LATEST-WINS RUNS OVER THE **BEARING** ROWS ONLY (#3329), AND THIS IS WHERE NON-BEARING IS ENFORCED. An
  * `observed` row is pushed to `history` and then skipped: it never becomes `current`, never sets `clears`, and
@@ -879,29 +882,44 @@ export function foldVerdictLedger(records) {
   /** @type {Map<number, FoldedPr>} */
   const byPr = new Map();
   const witnessedHeads = new Map();
+  const supersededHeads = new Map();
+  const bearingByPr = new Map();
   for (const r of Array.isArray(records) ? records : []) {
     if (!r || !Number.isInteger(r.pr)) continue;
     if (r.type !== undefined && r.type !== EVENT_TYPES.VERDICT) continue;
     let entry = byPr.get(r.pr);
     if (!entry) {
-      entry = { pr: r.pr, repo: r.repo, current: null, clears: false, history: [], outstandingHolds: [] };
+      entry = { pr: r.pr, repo: r.repo, current: null, clears: false, history: [], outstandingHolds: [], lastHeadMove: null };
       byPr.set(r.pr, entry);
+      supersededHeads.set(r.pr, new Set());
+      bearingByPr.set(r.pr, []);
     }
     entry.history.push(r);
     entry.repo = r.repo;
-    if (r.source === 'first-seen' || ['head-moved', 'carried'].includes(r.verdict)) {
-      witnessedHeads.set(r.pr, r.coverage?.headSha);
-    }
-    // A delayed completion on the old head remains history, never the current verdict.
     const witnessed = witnessedHeads.get(r.pr);
-    if (witnessed && r.coverage?.headSha !== witnessed) continue;
+    const head = r.coverage?.headSha;
+    const superseded = supersededHeads.get(r.pr);
+    const transition = ['head-moved', 'carried'].includes(r.verdict);
+    if (r.source === 'first-seen' && witnessed) continue;
+    if (transition) {
+      // A review may already have witnessed the destination before this observation arrived.
+      if (witnessed && r.fromHead !== witnessed) continue;
+      if (r.fromHead) superseded.add(r.fromHead);
+      superseded.delete(head); // a live transition may deliberately return to an earlier head
+    } else if (witnessed && (!head || superseded.has(head))) continue;
+    if (head && (verdictBears(r.verdict) || r.source === 'first-seen')) {
+      if (witnessed && witnessed !== head) superseded.add(witnessed);
+      witnessedHeads.set(r.pr, head);
+    }
     // #3329 — the non-bearing skip. `history` above is the ONLY thing an `observed` row touches.
     if (!verdictBears(r.verdict)) continue;
+    if (r.verdict === 'head-moved') entry.lastHeadMove = r;
+    bearingByPr.get(r.pr).push(r);
     entry.current = r;
     entry.clears = r.clears;
   }
   for (const entry of byPr.values()) {
-    const bearing = entry.history.filter((r) => verdictBears(r.verdict));
+    const bearing = bearingByPr.get(entry.pr);
     let lastClearAt = -1;
     bearing.forEach((r, i) => { if (r.clears) lastClearAt = i; });
     entry.outstandingHolds = bearing.slice(lastClearAt + 1).filter((r) => !r.clears);

@@ -98,3 +98,8 @@ export function observeLedgerPrEvent(event, pr, { readPr = (repo, number) => JSO
       labels: (live.labels ?? []).map(l => typeof l === 'string' ? l : l.name) });
   } catch (e) { log(`ledger-write-miss: event observation ${event.repo}#${pr}: ${e.message}`); return { ok: false }; }
 }
+
+/** Drain snapshots are also historical evidence. Use the same live read as the feed consumer. */
+export function observeLiveLedgerHead({ repo, pr }, options = {}) {
+  return observeLedgerPrEvent({ repo }, pr, options);
+}

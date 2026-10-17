@@ -170,7 +170,7 @@ export function createEventWaker(o) {
     healthyIntervalMs = PR_EVENTS_DEFAULTS.healthyIntervalMs, pollEveryMs = PR_EVENTS_DEFAULTS.pollEveryMs,
     staleAfterMs = PR_EVENTS_DEFAULTS.staleAfterMs, minWakeGapMs = PR_EVENTS_DEFAULTS.minWakeGapMs,
     poll = pollEvents, now = () => Date.now(), rawSleep = (ms) => new Promise((r) => { setTimeout(r, ms); }),
-    forward = [], log = console, observeHead = observeLedgerPrEvent,
+    forward = [], log = console, observeHead = () => {},
   } = o;
   const writeStatus = o.writeStatus !== undefined ? o.writeStatus : (stateDir ? (s) => writeStatusFile(stateDir, role, s) : null);
   const st = { cursor: null, lastOkAt: null, lastFailAt: null, lastDeliveryAt: null, lastEventAt: null, lastError: null, initialized: false };
@@ -280,7 +280,7 @@ export function withPrEvents(effects, { role, env = process.env, repos = null, f
     if (cfg.flag) log.error(`pr-events(${role}): ${PR_EVENTS_FLAG_ENV}=1 but not configured (missing ${cfg.missing.join(', ') || cfg.tokenError}) — keeping the plain interval`);
     return effects;
   }
-  const waker = createEventWaker({ role, repos, url: cfg.url, token: cfg.token, stateDir: cfg.stateDir, forward, log, ...overrides });
+  const waker = createEventWaker({ role, repos, url: cfg.url, token: cfg.token, stateDir: cfg.stateDir, forward, log, observeHead: observeLedgerPrEvent, ...overrides });
   log.error(`pr-events(${role}): event-driven wake ON (${cfg.url}); safety-net tick ${overrides.healthyIntervalMs ?? PR_EVENTS_DEFAULTS.healthyIntervalMs}ms while healthy`);
   return { ...effects, sleep: waker.sleep };
 }
