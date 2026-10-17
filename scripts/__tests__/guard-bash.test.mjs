@@ -587,7 +587,7 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('D=~/a; cd "$D" && ls; D=~/b')).toBe(REPORTED);
   });
   it('a home-expanded variable never loses a character bash keeps (CR, NBSP, other Unicode spaces)', () => {
-    for (const ch of ['\r', ' ', ' ', '　', '﻿']) {
+    for (const ch of [0x0d, 0xa0, 0x2028, 0x3000, 0xfeff].map((c) => String.fromCodePoint(c))) {
       expect(at(`D=~/clone${ch}; cd "$D" && ls`), JSON.stringify(ch)).toBe(REPORTED);
       expect(at(`D=~/clone;${ch}cd "$D" && ls`), JSON.stringify(ch)).toBe(REPORTED);
       expect(at(`D=~/clone; cd "$D"${ch} && ls`), JSON.stringify(ch)).toBe(REPORTED);
@@ -596,12 +596,13 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     }
   });
   it('a Unicode space after the home cd word (a later word or a comment) does not unresolve it', () => {
-    expect(at('HOME=/other; cd $HOME # a b\nls')).toBe('/other');
-    expect(at('cd "$HOME"  && ls')).toBe(HOME);
-    expect(at('cd "$HOME/a b" && ls')).toBe(`${HOME}/a b`);
+    const NBSP = String.fromCodePoint(0xa0);
+    expect(at(`HOME=/other; cd $HOME # a${NBSP}b\nls`)).toBe('/other');
+    expect(at(`cd "$HOME" ${NBSP}&& ls`)).toBe(HOME);
+    expect(at(`cd "$HOME/a${NBSP}b" && ls`)).toBe(`${HOME}/a${NBSP}b`);
   });
   it('a home target never loses a character bash keeps in the word (CR, NBSP, other Unicode spaces)', () => {
-    for (const ch of ['\r', ' ', ' ', '　']) {
+    for (const ch of [0x0d, 0xa0, 0x2028, 0x3000].map((c) => String.fromCodePoint(c))) {
       expect(at(`cd ~/clone${ch}x && ls`), JSON.stringify(ch)).toBe(REPORTED);
       expect(at(`cd ~/clone${ch}\nls`), JSON.stringify(ch)).toBe(REPORTED);
       expect(at(`${ch}cd ~/clone && ls`), JSON.stringify(ch)).toBe(REPORTED);

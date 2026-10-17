@@ -2509,7 +2509,7 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   const parsed = parseSegments(cmd);
   if (parsed.unterminated) return reportedCwd;
   // bash splits words on space, tab and newline only; trim() and \s also drop CR, NBSP and other Unicode
-  // spaces, which bash keeps inside the word (` cd` is no cd, `D=~/x\r` keeps the CR).
+  // spaces, which bash keeps inside the word (an NBSP before `cd` makes it no cd, `D=~/x\r` keeps the CR).
   const oddSpace = (s) => /[^\S \t\n]/.test(s);
   // A literal `HOME=…` statement sets the home later spellings expand against (unknown when unexpandable).
   const initialHome = typeof home === 'string' && home.startsWith('/') ? home : null;
