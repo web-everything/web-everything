@@ -87,7 +87,9 @@ function runCli({ env: extraEnv = {} } = {}) {
       '--no-reconcile-labels', '--no-drain-lease', '--no-red-main-freeze', '--json'], {
       cwd: dir, encoding: 'utf8', timeout: 30000,
       env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FU_FIXTURE: fixture, FU_HOME: dir, HOME: dir,
-        WE_DAEMON_JOBS_ROOT: jobsRoot, WE_COORDINATION_ROOT: join(dir, 'coord'), ...extraEnv },
+        WE_DAEMON_JOBS_ROOT: jobsRoot, WE_COORDINATION_ROOT: join(dir, 'coord'),
+        // The ledger is not under test; a dual-store append against the fake git backs off ~1.5s per row.
+        WE_VERDICT_LEDGER_STORE: 'home', ...extraEnv },
     });
     expect(r.error, r.stderr).toBeUndefined();
     const result = JSON.parse(r.stdout.trim().split('\n').at(-1));
