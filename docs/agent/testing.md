@@ -956,7 +956,9 @@ under `prepare.mergedGuardHours` (default 24; 0 disables only the merged refusal
 without surviving dispatch history. Probe the time boundary with an injected clock, including a PR
 created over 24 hours ago but merged 21 minutes ago. Scope drift on a recently merged prepare
 records a "scope moved after prepare" note for the build step in the refusal and its persisted
-bookkeeping; it must never dispatch another prepare within the window.
+bookkeeping; it must never dispatch another prepare within the window. A card the planning pre-scan
+skips for that merge carries the same note and persists the same `prepareRefusals` record as a
+launch refusal; assert both on the planning tick, not only on a merge that appears after planning.
 A needs-you park in the newest ledger record refuses the launch while it is `held` and not `completed`.
 Any one of three things clears it: a stamp on main (it completes the record, so a hand stamp resolves
 the park), explicit `releasedAt`/`releasedBy` metadata, or a reviewed release of that exact attempt in
@@ -1292,6 +1294,48 @@ membership, with trusted live comments plus the shared follow-up state's `cleara
 Failure counts/backoff live in that same state file; preserve them during follow-up writes. Exercise false
 membership, conflicting refusal, transient backoff across restarts, threshold provenance and stamp recovery
 with injected IO, never a live enqueue.
+
+### Builder cap and prepare cooldown
+
+`build.maxOpenPrsCounts` defaults to `builder`; `all` restores the earlier open-PR
+population. The policy cascade logs the effective value and source. Builder provenance
+is an explicit `lane/<card><optional-attempt>-build-*` or `lane/<card><optional-attempt>-prepare-*` ref (including hash identities)
+or the mechanical delivery wrapper's body signature. A generic lane ref, fixer, or
+Codex author does not prove ownership. The REST producer and normalized planner input
+must preserve `body`; the producer-contract test pins that path. Existing card-only
+and accepted exclusions still apply; scope and freeze-label guards inspect every PR.
+
+Before finalizing prepare picks, inspect the actual planned picks using
+`recentMergedPrepare`, shared with `prepareLaunchRefusal`. Add recent merges to the
+planner's prepare exclusions and re-plan the same tick so the next candidate gets the
+slot. Inspect selected group members before finalizing groups, refilling groups after
+cooldown skips. Share the same lookahead budget between leads and members; never scan
+the entire grouping pool. Bound it to eight distinct cards (at most 24 listing calls), leaving
+the shared tick budget available for launch guards. Log the elapsed minutes and PR number.
+Picks outside that window still pass the final launch guard. Replay a merge 20 minutes
+ago with one slot and a clean second candidate; include grouped members, hash aliases,
+guard-off, and older merges in the touched suites. Use the production reader in a tick
+with more than 50 held cards and late-ordered picks; assert the picks launch without
+listing-budget refusals. Also cover consecutive merged picks and group members beyond
+the lookahead limit, with uninspected replacements still passing final launch admission.
+
+### Build dispatch launch lifetime and prepare discovery
+
+Launch admission and launch confirmation do not prove delivery. Retain the build failure ledger across
+both, including daemon restarts; clear it only after observing a delivering PR. Before releasing an
+orphan claim, persist its failure so a failed ledger write keeps the claim. Regress the #4413 shape:
+pending launch → confirmed run → dead worker with no delivery → backed-off retry → exhausted attempts.
+Validate a build card against the fetched WE origin/main backlog before acquiring its claim; missing
+identities are permanent card refusals, while an unavailable Git read remains a retryable observation.
+
+Prepare discovery searches each card's current lane identity, bornAs lane identity and title, then
+unions the complete results. Never use an unfiltered repository PR listing as the launch guard's proof
+of absence. Cache component failures for the tick as well as successes. The prepare policy leaf
+`maxPrListingCallsPerTick` defaults to 128, resolves through standard/platform/tool/env, and logs its
+source; `WE_PREPARE_MAX_PR_LISTING_CALLS_PER_TICK` overrides it. Prefetch and lazy readers share the
+same budget, including failed commands. A component at its result cap or a spent budget refuses only
+that card. Test with over 500 unrelated PRs, all three identity forms, concurrency, repeated reads and
+budget exhaustion. GitHub calls use the shared throttle in both synchronous and asynchronous paths.
 
 ### Nightly coroner health job
 

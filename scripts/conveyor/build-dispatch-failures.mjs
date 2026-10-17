@@ -3,7 +3,7 @@
  *
  * Before: a failing build card was re-dispatched every tick and left only an empty in-memory failure row. Now each
  * failure is persisted with its reason code and the child output, and the card is withheld until `retryAfter`.
- * After `maxAttempts` the card stays withheld (`exhausted`) until re-armed. A dispatched build clears its record.
+ * After `maxAttempts` the card stays withheld (`exhausted`) until re-armed. Only observed delivery clears its record; a launch retains the retry history.
  */
 import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, chmodSync } from 'node:fs';
 import { dirname, join } from 'node:path';
