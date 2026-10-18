@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/xzlh2ts-prevention-require-structured-guarantee-to-test-mappings-thr.md"]
+scope: ["we:backlog/6245-prevention-require-structured-guarantee-to-test-mappings-thr.md"]
 dateOpened: "2026-10-17"
 tags: []
 ---
@@ -12,7 +12,7 @@ tags: []
 # Prevention — Add a check:standards rule: every #NNNN named in a card's "Already tracked on open cards" line mu… (from web-everything/web-everything#5532 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/xzlh2ts-prevention-require-structured-guarantee-to-test-mappings-thr.md:15` — Add a check:standards rule: every `#NNNN` named in a card's "Already tracked on open cards" line must resolve to a backlog card that contains an "Also raised by" line citing the same source PR and finding. Alternatively, make the filer verify the write before it emits the claim.
+1. `we:backlog/6245-prevention-require-structured-guarantee-to-test-mappings-thr.md:15` — Add a check:standards rule: every `#NNNN` named in a card's "Already tracked on open cards" line must resolve to a backlog card that contains an "Also raised by" line citing the same source PR and finding. Alternatively, make the filer verify the write before it emits the claim.
 
 Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 2 → #5659, finding 3 → #5473.
 
