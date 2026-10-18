@@ -6295,8 +6295,10 @@ override"*, then "Ok" to defaults (a), (a), (a). Composes with [config-extends-p
    left to the build card. Daemons read the layer each tick.
 3. **Only the operator writes it.** One operator-only command is the sole writer; the write operation rejects any agent
    caller. Each write records the operator's verbatim instruction (stored as a quoted string, never executed), actor and
-   channel (from the operator-terminal authority check, the operator's own `gh` login, not a flag), time, an optional expiry and a reason. The change log is append-only.
-   An expired override is ignored and logged once.
+   channel (from a protected-CI-verified GitHub review by an allowlisted operator account, never a flag, terminal or
+   local `gh` login, which an agent on the host can forge), time, an optional expiry and a reason. The change log is append-only.
+   An expired override is ignored and logged once, and one that started and expired between two needs-you polls still
+   produces an attention event on the next poll.
 4. **Guard floor: block until confirmed (Fork 3 = a).** Every key declares its safe direction in a table; a key with no
    entry counts as loosening. A loosening write without the confirmation flag is refused. A confirmed one is logged and
    flagged in the needs-you feed. The floor also holds on read: the reader ignores any loosening entry that has no recorded
