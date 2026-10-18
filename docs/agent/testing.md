@@ -996,6 +996,20 @@ npx vitest run --coverage           # coverage report
 
 ## Developing & manually testing in a lane
 
+PR ownership regressions (#5649, #5675, #5647, #5664, #5628) live in
+`scripts/conveyor/__tests__/pr-singleton-owners.test.mjs`. Reconcile (consumed by
+both the review and fix daemons) and the conveyor tick share `ci-heal-rule.mjs`;
+keep live green/pending evidence, the legacy `ci:failed` classifier guard and the
+resolved CI-heal cap intact. A timeout retry without an Actions origin falls
+through to CI-heal, and its diagnostic names that owner only when a heal is planned.
+Withdrawn drafts surface through `needsPersonRow` with an operator release command;
+they never auto-release. Missing review labels use the existing restoration pass.
+Moved agent accepts use that pass's `stale-accept` variant, a live pinned diff read
+and the existing accepted-only re-arm helper. Equal fingerprints, unreadable
+fingerprints and human clearances must never be invalidated by this recovery.
+No new thresholds are introduced: the existing CI-heal budget and
+`WE_REVIEW_LABEL_HEAL` policy remain the controls.
+
 Every edit — including an ad-hoc "just fix this one thing" — happens in an **isolated lane clone**, never the main checkout (#2123; the writer model in [platform-decisions.md#pr-flow-rollout-mechanism](platform-decisions.md#pr-flow-rollout-mechanism)). The lane trigger is *making an edit*, not *running a command*. The main checkout stays the human's — its dev server on `:3000`/`:8080` is theirs; don't build or serve into it.
 
 **1 — Pick or provision a lane** (persistent clone pool under `~/workspace/.lanes/<repo>/lane-N`, git objects shared via `--reference`, own HEAD):
