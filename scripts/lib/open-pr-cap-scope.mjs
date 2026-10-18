@@ -93,6 +93,7 @@ export function readBuilderPrCapSettings({ env = process.env, read = readSetting
 
 /** Positive launch provenance; a generic lane ref or an author identity is insufficient. */
 export function isBuilderPr(pr) {
-  return /^lane\/(?:[0-9]+|x[0-9a-z]{6})[a-z]?-(?:prepare|build)(?:-|$)/i.test(pr.headRefName ?? '')
+  return /^lane\/prepare-batch-(?:[0-9]+|x[0-9a-z]{6})-[1-9][0-9]*$/i.test(pr.headRefName ?? '')
+    || /^lane\/(?:[0-9]+|x[0-9a-z]{6})[a-z]?-(?:prepare|build)(?:-|$)/i.test(pr.headRefName ?? '')
     || /Delivered by the #3627 minimal delivery-agent pipeline/.test(pr.body ?? '');
 }

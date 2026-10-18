@@ -31,3 +31,26 @@ export function verifyPreparePr({ item, source, base, git }) {
   }
   return sha;
 }
+
+/** Batch titles are also the explicit publication scope. No free text or partial parse. */
+export function prepareBatchIds(title) {
+  if (typeof title !== 'string' || !/^prepare: [a-z0-9]+(?:, [a-z0-9]+)*$/.test(title)) return [];
+  const ids = title.slice('prepare: '.length).split(', ');
+  return [...new Set(ids)];
+}
+
+export function verifyPrepareBatchPr({ items, source, base, git }) {
+  if (!items.length || base !== 'main') throw new Error('prepare batch requires cards and base main');
+  retryTransientGit(() => git(['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main']));
+  const sha = git(['rev-parse', '--verify', `${source}^{commit}`]).trim();
+  const tree = git(['ls-tree', '-r', '--name-only', 'origin/main', '--', 'backlog/']).trim().split('\n');
+  const cards = items.map(id => {
+    const paths = tree.filter(p => p.startsWith(`backlog/${id}-`) && p.endsWith('.md'));
+    if (paths.length !== 1) throw new Error(`prepare batch requires exactly one card for #${id}`);
+    return paths[0];
+  });
+  const files = git(['diff', '--name-only', '--no-renames', '-z', `origin/main...${sha}`, '--']).split('\0').filter(Boolean);
+  if (files.length !== cards.length || files.some(p => !cards.includes(p))) throw new Error('prepare batch diff must contain exactly its listed cards');
+  if (git(['rev-list', '--merges', `origin/main..${sha}`]).trim()) throw new Error('prepare batch refuses merge commits');
+  return sha;
+}

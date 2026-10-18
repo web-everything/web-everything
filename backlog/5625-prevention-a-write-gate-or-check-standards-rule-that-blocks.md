@@ -41,3 +41,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5546 (finding 10: `we:backlog/x9qibqz-gradual-ledger-authority-per-fact-type-and-pr-class.md:17` — Add a deterministic guarantee-to-test mapping check requiring explicit setting coverage, named cases, and assertions.)
