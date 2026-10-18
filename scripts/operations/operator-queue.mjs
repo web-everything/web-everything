@@ -53,7 +53,6 @@ import { healthSectionLines } from '../conveyor/health-watch-section.mjs';
 // Card x1b8hlo — the LIGHT red-team gate module (no heavy graph): a confirmed red-team break the setting sends back
 // keeps the PR out of NEEDS YOU while it is unresolved on the live head.
 import { CONFIRMED_BREAKS_DEFAULTS, readConfirmedBreaks, redTeamQueueReason, redTeamRulingNeeded } from '../lib/red-team-gate.mjs';
-import { savedRedTeamFallback } from '../lib/drain-saved-red-team.mjs';
 // Partial CLI copies may lack the verdict reader. Keep their queue runnable, but never excuse a check.
 let humanReviewOnlyHold, parsePrResultTable;
 let mergeGateVerdictImportError;
@@ -68,6 +67,12 @@ catch (error) { sendBackLedgerError = String(error?.message ?? error).split('\n'
 const operatorSendBackHoldReasons = (pr) => sendBackLedger
   ? sendBackLedger.operatorSendBackHoldReasons(pr)
   : [`operator send-back check unavailable: ${sendBackLedgerError}`];
+// Partial copies may also lack the saved red-team reader (and its store graph). The queue still runs, but says that a
+// round-cap break the gate decided on saved evidence could be missing from RULING NEEDED.
+let savedRedTeamFallback = null;
+let savedRedTeamError = null;
+try { ({ savedRedTeamFallback } = await import('../lib/drain-saved-red-team.mjs')); }
+catch (error) { savedRedTeamError = String(error?.message ?? error).split('\n')[0]; }
 // Staged CLI copies may omit this transitive graph. Without the canonical answer reader,
 // keep stand-downs visible as unanswered so the operator can still act on them.
 let standDownAnswers = null;
@@ -632,6 +637,7 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
   };
   if (rulingLedgerError) report.errors.push(`ruling-needed section unavailable: ${rulingLedgerError}`);
   if (sendBackLedgerError) report.errors.push(`operator send-back check unavailable: ${sendBackLedgerError}`);
+  if (savedRedTeamError) report.errors.push(`saved red-team ruling check unavailable: ${savedRedTeamError}`);
   let readFailures = 0;
   const failedRead = (subject, error) => {
     readFailures += 1;
@@ -739,7 +745,7 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
         let redTeamRow = null;
         try {
           redTeamRow = redTeamRulingRow(repo, pr, redTeamSetting,
-            { readSaved: savedRedTeamFallback({ repo, pr: pr.number, head: pr.headRefOid }) });
+            { readSaved: savedRedTeamFallback?.({ repo, pr: pr.number, head: pr.headRefOid }) ?? null });
         } catch (error) { failedRead(`${repo}#${pr.number} red-team ruling`, error); }
         report.rulingNeeded.push(...mergeRulingRows(rulingNeededRow(repo, pr), redTeamRow));
       }
