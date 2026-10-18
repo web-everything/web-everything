@@ -31,7 +31,8 @@ export default {
   ] },
   fixPresent(root) {
     return readFileSync(join(root, 'scripts/operations/review-pr-io.mjs'), 'utf8').includes('mandatory-ruling:')
-      && readFileSync(join(root, 'scripts/lib/pr-state/referrals.mjs'), 'utf8').includes('const earlyRulings = new Map()');
+      && readFileSync(join(root, 'scripts/lib/pr-state/referrals.mjs'), 'utf8').includes('const earlyRulings = new Map()')
+      && readFileSync(join(root, 'scripts/lib/pr-state/referrals.mjs'), 'utf8').includes('REFERRAL_RETIRED_CHANNEL');
   },
   async run() {
     const root = process.env.SOAK_TREE_ROOT || fileURLToPath(new URL('../../../../', import.meta.url));
@@ -103,6 +104,63 @@ export default {
         if (writes.includes('advisory:ruling-needed') || (result !== 'block' && writes.includes('review:human'))) {
           violations.push(`${mode}/${result}: settled finding requested false labels: ${writes.join(', ')}`);
         }
+      }
+    }
+    // Round 3: a disabled seat's retired finding, and an operator block that lands while the sync appends.
+    const { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, renderReferralRecord } = await load('scripts/lib/jury-core.mjs');
+    for (const mode of ['retired', 'operator-race']) {
+      const rows = [], labels = new Set(), writes = [];
+      const state = { headRefOid: head, body: '<!-- authored-by-actor: author -->', comments: [], labels: ['review:pending'] };
+      const seat = mode === 'retired' ? 'judgeAntigravityReview' : 'judgeCorrectnessAdvisory';
+      const referrals = [0, 1].slice(0, mode === 'retired' ? 1 : 2).map(i => {
+        const original = { summary: `finding ${i}`, file: 'x.mjs', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+        return { seat, original, finding: normalizeFinding(original), key: referralFindingKey(seat, original) };
+      });
+      const record = { version: 1, repo, pr, head, runId: 'soak-earlier', reviewer: mandatoryReferralReviewer('soak-earlier'),
+        authorBody: state.body, attempted: true, referrals, rulings: [] };
+      if (mode === 'operator-race') record.rulings = referrals.map((f, i) => ({ id: `r${i + 1}`, key: f.key,
+        reviewerId: record.reviewer.id, lens: record.reviewer.lens, result: 'not-real', rationale: 'checked', evidence: ['diff:x'] }));
+      state.comments.push({ id: 'c-record', body: renderReferralRecord(record), author: { login: 'web-everything' } });
+      let raced = false;
+      const append = row => {
+        if (!rows.some(r => r.id === row.id)) rows.push(row);
+        if (mode === 'operator-race' && row.type === 'ruling' && !raced) {
+          raced = true;
+          state.comments.push({ id: 'c-operator', author: { login: 'chalbert' }, body: buildOperatorRulingComment({
+            version: 1, repo, pr, head, actor: 'chalbert', channel: 'soak', reason: 'still broken', at, clearerId: '',
+            rulings: [{ runId: record.runId, key: referrals[1].key, result: 'block', supersedes: ['r2'] }] }) });
+          rows.push(buildLedgerEvent({ type: 'ruling', repo, pr, at, source: 'record-referral-ruling',
+            findingKey: ledgerFindingKey(referrals[1].key), ruling: 'block' }));
+        }
+        return { ok: true };
+      };
+      const provider = {
+        readPrState: () => structuredClone(state),
+        postComment: (_repo, _pr, body) => state.comments.push({ id: `c-${state.comments.length}`, body, author: { login: 'web-everything' } }),
+        editComment: (id, body) => { state.comments.find(c => c.id === id).body = body; },
+        setLabels: (_repo, _pr, plan) => { state.labels = [...state.labels.filter(l => !(plan.remove ?? []).includes(l)), plan.add]; },
+      };
+      const sinks = createReviewPrSinks({ root, labelProvider: provider, mirrorReferral: () => {},
+        postComment: provider.postComment, readLabels: () => [...state.labels], setLabels: provider.setLabels,
+        readChangedLines: () => new Set(), appendLedgerRow: append, cardReadable: () => true, out: () => {},
+        env: mode === 'retired' ? { REVIEW_PR_ANTIGRAVITY_REVIEW: '0', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' } : {},
+        runNode: () => { throw new Error('unexpected node process in isolated soak'); },
+        referralJudge: async () => { throw new Error('no mandatory reviewer expected'); } });
+      const ledgerPayload = { repo, pr, headSha: head, referralKeys: referrals.map(f => f.key), posted: true, syncMandatoryRulings: true };
+      await sinks[REVIEW_EFFECTS.LEDGER_EVENTS](ledgerPayload, { key: `${mode}/ledger` });
+      await sinks[REVIEW_EFFECTS.MANDATORY_REFERRALS]({ read: { repo, pr, title: 'review', body: state.body,
+        netBasis: { rev: head }, netChangedFiles: ['x.mjs'], diffText: '+ change' }, referrals: [] }, { runId: `soak-${mode}` });
+      rows.push({ type: 'verdict', ...buildVerdictRecord({ repo, pr, at, verdict: 'accepted', headSha: head, source: 'review-set-label', reason: 'same-head accept' }) });
+      const facts = { state: 'OPEN', isDraft: false, headSha: head, head: { sha: head }, labels: [], checks: [],
+        requiredChecks: [{ name: 'test', state: 'green' }], probeErrors: [], sessions: [], handoffs: [], refusals: [] };
+      const out = await runMirrorApply(mirrorFixtureOptions({ repo, pr, rows, facts, labels, writes, append, buildDerivedRows }));
+      if (out.failures.length) violations.push(`${mode}: mirror failed: ${JSON.stringify(out.failures)}`);
+      const derived = deriveReferrals(rows);
+      if (mode === 'retired' && (writes.includes('advisory:ruling-needed') || writes.includes('review:human'))) {
+        violations.push(`retired: a retired finding requested false labels: ${writes.join(', ')}`);
+      }
+      if (mode === 'operator-race' && derived.get(ledgerFindingKey(referrals[1].key))?.state !== 'blocking') {
+        violations.push('operator-race: a stale clearance overtook the operator block in the ledger');
       }
     }
     return { violations };

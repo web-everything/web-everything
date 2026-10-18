@@ -62,7 +62,9 @@ import { createReferralGhProvider } from '../lib/review-comment-edit.mjs';
 import { ADVISORY_LABEL_META, advisoryCoversHead, labelNames, planAdvisoryLabels } from '../lib/advisory-labels.mjs';
 // #3007 — the real verdict ledger, behind the reserved `verdict-ledger.append` seam. See the LEDGER sink.
 import { EVENT_TYPES, appendVerdict, buildLedgerEvent, buildVerdictRecord, foldRepo, parseLedgerEvents, verdictForLabelTarget, verdictLedgerPath } from '../lib/verdict-ledger.mjs';
-import { ledgerFindingKey } from '../lib/pr-state/referrals.mjs';
+import { ledgerFindingKey, REFERRAL_RETIRED_CHANNEL } from '../lib/pr-state/referrals.mjs';
+// Re-read passes the mandatory ruling ledger sync may take before a still-moving thread parks the run.
+const MANDATORY_LEDGER_SYNC_PASSES = 3;
 // Card 5469 — the scoped re-review shadow: the declared setting and the pure round rules.
 import { isValidRoundBudget, resolveReviewSettings, resolveReviewSettingSource, SCOPED_REREVIEW_MODES, ROUND_BUDGET_OFF } from '../lib/review-settings.mjs';
 import { acceptanceIds, enclosingSymbol, foldFindingStatuses, lastReviewedHead, reviewRoundOf, reviewScope, shadowRound,
@@ -1396,35 +1398,58 @@ export function createReviewPrSinks({
         // trusted, read-back thread actually counts (independence, supersession and readable cards
         // included). Reconcile historical completed records too: a crash after posting or a missed
         // ledger append must recover without spending another mandatory-review attempt.
-        const ruled = new Map();
-        for (const record of result.records) {
-          if (record.repo !== read.repo || record.pr !== read.pr || record.head !== state.headRefOid) continue;
-          const effective = referralRecordState(record, { ...context(state), records: result.records,
-            operatorRulings: result.operatorRulings });
-          for (const f of activeReferrals(record)) {
-            const blocked = result.blocked.includes(f.key);
-            if (!blocked && result.pending.includes(f.key)) continue;
-            const backing = effective.rulings.filter(r => r.key === f.key);
-            const ruling = blocked ? 'block' : backing.at(-1)?.result
-              ?? (record.carried ?? []).find(c => c.key === f.key)?.result
-              ?? ((record.superseded ?? []).some(s => s.key === f.key) ? 'not-real' : null);
-            if (!ruling) continue;
-            const row = buildLedgerEvent({ type: EVENT_TYPES.RULING, repo: read.repo, pr: read.pr,
-              at: new Date().toISOString(), source: 'review-pr', session: record.reviewer.id,
-              channel: 'mandatory-referral', findingKey: ledgerFindingKey(f.key), ruling });
-            // Stable identity belongs to the counted ruling, never to wall time or the retrying run.
-            row.id = `mandatory-ruling:${createHash('sha256').update(JSON.stringify([
-              record.repo, record.pr, record.head, record.runId, f.key, ruling,
-              effective.rulings, record.carried, record.superseded,
-            ])).digest('hex')}`;
-            ruled.set(f.key, row);
+        const ledgerRulings = (state, settled) => {
+          const ruled = new Map(), retired = new Map();
+          const rulingRow = (record, key, ruling, channel, id) => ({ ...buildLedgerEvent({ type: EVENT_TYPES.RULING,
+            repo: read.repo, pr: read.pr, at: new Date().toISOString(), source: 'review-pr', session: record.reviewer.id,
+            channel, findingKey: ledgerFindingKey(key), ruling }), id });
+          for (const record of settled.records) {
+            if (record.repo !== read.repo || record.pr !== read.pr || record.head !== state.headRefOid) continue;
+            const effective = referralRecordState(record, { ...context(state), records: settled.records,
+              operatorRulings: settled.operatorRulings });
+            const active = activeReferrals(record);
+            for (const f of active) {
+              const blocked = settled.blocked.includes(f.key);
+              if (!blocked && settled.pending.includes(f.key)) continue;
+              const backing = effective.rulings.filter(r => r.key === f.key);
+              const ruling = blocked ? 'block' : backing.at(-1)?.result
+                ?? (record.carried ?? []).find(c => c.key === f.key)?.result
+                ?? ((record.superseded ?? []).some(s => s.key === f.key) ? 'not-real' : null);
+              if (!ruling) continue;
+              // Stable identity belongs to the counted ruling, never to wall time or the retrying run.
+              ruled.set(f.key, rulingRow(record, f.key, ruling, 'mandatory-referral', `mandatory-ruling:${createHash('sha256').update(JSON.stringify([
+                record.repo, record.pr, record.head, record.runId, f.key, ruling,
+                effective.rulings, record.carried, record.superseded,
+              ])).digest('hex')}`));
+            }
+            // A retired finding no longer counts in the thread, so close its ledger referral too. The retirement
+            // channel keeps it reopenable: the same finding referred again must ask for a ruling again.
+            for (const f of record.referrals) {
+              if (active.some(a => a.key === f.key) || settled.blocked.includes(f.key) || settled.pending.includes(f.key)) continue;
+              retired.set(f.key, rulingRow(record, f.key, 'not-real', REFERRAL_RETIRED_CHANNEL, `mandatory-retire:${createHash('sha256')
+                .update(JSON.stringify([record.repo, record.pr, record.head, record.runId, f.key])).digest('hex')}`));
+            }
           }
-        }
-        for (const row of ruled.values()) {
-          const appended = await appendLedgerRow(row);
-          if (!appended?.ok || appended.ledgerWriteMiss) {
-            throw new Error(`mandatory ruling ledger-write-miss: ${(appended?.errors ?? []).join('; ') || 'append refused'}`);
+          for (const [key, row] of retired) if (!ruled.has(key)) ruled.set(key, row);
+          return ruled;
+        };
+        // An operator ruling can land during these appends. Its holding row follows its readable comment, so a
+        // re-read after the last append sees any ruling a stale row overtook; append the corrected row and settle.
+        const written = new Set();
+        let settled = result;
+        for (let pass = 0; ; pass++) {
+          const due = [...ledgerRulings(state, settled).values()].filter(row => !written.has(row.id));
+          if (!due.length) break;
+          if (pass === MANDATORY_LEDGER_SYNC_PASSES) throw new Error('mandatory ruling ledger sync did not settle: rulings kept changing during the sync');
+          for (const row of due) {
+            const appended = await appendLedgerRow(row);
+            if (!appended?.ok || appended.ledgerWriteMiss) {
+              throw new Error(`mandatory ruling ledger-write-miss: ${(appended?.errors ?? []).join('; ') || 'append refused'}`);
+            }
+            written.add(row.id);
           }
+          state = fresh();
+          settled = mandatoryReferralState(state.comments, context(state));
         }
         return result;
       } catch (error) {

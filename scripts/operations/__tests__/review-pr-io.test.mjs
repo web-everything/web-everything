@@ -36,7 +36,7 @@ import { createRegistry } from '../registry.mjs';
 import { applyPendingEffects } from '../effect-executor.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { classifyReviewLoopOutcome } from '../review-job.mjs';
-import { VERDICTS, appendVerdict, buildVerdictRecord, readVerdictLedger, parseLedgerEvents, verdictLedgerPath } from '../../lib/verdict-ledger.mjs';
+import { VERDICTS, appendVerdict, buildLedgerEvent, buildVerdictRecord, readVerdictLedger, parseLedgerEvents, verdictLedgerPath } from '../../lib/verdict-ledger.mjs';
 import { deriveReferrals, ledgerFindingKey } from '../../lib/pr-state/referrals.mjs';
 import { runMirrorApply } from '../../conveyor/pr-label-mirror.mjs';
 import { buildDerivedRows } from '../../review-ledger-check.mjs';
@@ -1397,6 +1397,72 @@ describe('#4315 durable referral effects', () => {
     }
   });
 
+  it('an operator block recorded while the ledger sync appends never ends under a stale clearance', async () => {
+    let raced = false;
+    const h = harness({ failure: 'judge', appendLedgerRow: row => {
+      if (!h.ledger.some(r => r.id === row.id)) h.ledger.push(row);
+      if (row.type === 'ruling' && !raced) {
+        raced = true;
+        // The operator path posts a block, confirms it readable, then records its ledger row.
+        h.state.comments.push({ author: { login: 'chalbert' }, body: buildOperatorRulingComment({
+          version: 1, repo: 'o/r', pr: 7, head: h.state.headRefOid, actor: 'chalbert', channel: 'test',
+          reason: 'still broken', at: '2026-10-04T12:00:00Z', clearerId: '',
+          rulings: [{ runId: old.runId, key: old.referrals[1].key, result: 'block', supersedes: ['r2'] }] }) });
+        h.ledger.push(buildLedgerEvent({ type: 'ruling', repo: 'o/r', pr: 7, at: '2026-10-04T12:00:01Z',
+          source: 'record-referral-ruling', findingKey: ledgerFindingKey(old.referrals[1].key), ruling: 'block' }));
+      }
+      return { ok: true };
+    } });
+    const old = seedReferrals(h, ['judgeCorrectnessAdvisory', 'judgeCorrectnessAdvisory'], h.state.headRefOid, r => r.referrals.map((f, i) => ({
+      id: `r${i + 1}`, key: f.key, reviewerId: r.reviewer.id, lens: r.reviewer.lens, result: 'not-real',
+      rationale: 'Verified against the pinned diff', evidence: ['diff:x'] })));
+    await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(raced).toBe(true);
+    expect(mandatoryReferralState(h.state.comments, { repo: 'o/r', pr: 7, head: h.state.headRefOid }).blocked)
+      .toEqual([old.referrals[1].key]);
+    const referrals = deriveReferrals([buildLedgerEvent({ type: 'referral', repo: 'o/r', pr: 7, at: '2026-10-04T12:00:02Z',
+      source: 'review-pr', headSha: h.state.headRefOid, findingKeys: old.referrals.map(f => ledgerFindingKey(f.key)) }), ...h.ledger]);
+    expect(referrals.get(ledgerFindingKey(old.referrals[0].key)).state).toBe('ruled');
+    expect(referrals.get(ledgerFindingKey(old.referrals[1].key)).state).toBe('blocking');
+  });
+
+  it('retiring a disabled seat\'s finding closes its ledger referral, and a later referral reopens it', async () => {
+    const h = harness({ failure: 'judge', env: { REVIEW_PR_ANTIGRAVITY_REVIEW: '0', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' } });
+    const old = seedReferrals(h, ['judgeAntigravityReview'], h.state.headRefOid);
+    const key = old.referrals[0].key;
+    const ledgerEvents = id => h.make()[REVIEW_EFFECTS.LEDGER_EVENTS]({ repo: 'o/r', pr: 7, headSha: h.state.headRefOid,
+      posted: true, referralKeys: [key], syncMandatoryRulings: true }, { ...CTX, key: id });
+    await ledgerEvents('before-retire');
+    expect(deriveReferrals(h.ledger).get(ledgerFindingKey(key)).state).toBe('open');
+    const settled = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect([settled.pending, settled.blocked]).toEqual([[], []]);
+    expect(deriveReferrals(h.ledger).get(ledgerFindingKey(key)).state).not.toMatch(/^(open|blocking)$/);
+    // Replay is stable: no second retirement row.
+    const before = h.ledger.length;
+    await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(h.ledger).toHaveLength(before);
+
+    const rows = [...h.ledger, { type: 'verdict', ...buildVerdictRecord({ repo: 'o/r', pr: 7, verdict: 'accepted',
+      at: new Date().toISOString(), headSha: h.state.headRefOid, source: 'review-set-label', reason: 'accepted' }) }];
+    const labels = [];
+    const facts = { state: 'OPEN', isDraft: false, headSha: h.state.headRefOid, head: { sha: h.state.headRefOid }, labels: [],
+      checks: [], requiredChecks: [{ name: 'test', state: 'green' }], probeErrors: [], sessions: [], handoffs: [], refusals: [] };
+    const out = await runMirrorApply({ repo: 'o/r', selfLogin: 'mirror', listPrs: () => [{ number: 7, labels: [] }],
+      readEvents: async () => ({ status: 'ok', rows }), buildRows: o => buildDerivedRows({ ...o, readFacts: () => facts }),
+      readFacts: () => facts, readTimeline: async () => ({ status: 'ok', items: [] }),
+      appendRow: async () => { throw new Error('no label-input expected'); },
+      addLabel: async (_repo, _pr, label) => labels.push(label),
+      setRulingLabel: async (_repo, _pr, wanted) => labels.push(wanted ? 'advisory:ruling-needed' : 'cleared'),
+    });
+    expect(out.failures).toEqual([]);
+    expect(labels).not.toContain('advisory:ruling-needed');
+    expect(labels).not.toContain('review:human');
+
+    // The seat comes back and reports the same finding: the retirement must not hide it.
+    await ledgerEvents('after-reenable');
+    expect(deriveReferrals(h.ledger).get(ledgerFindingKey(key)).state).toBe('open');
+  });
+
   it.each(['throws', 'refused'])('preserves referral and visit rows when a block append %s, with replay-safe recovery', async failure => {
     const rows = [];
     let failFinal = false;
@@ -2346,7 +2412,8 @@ describe('#4315 durable referral effects', () => {
     expect(result.blocked).toEqual([]);
     expect(h.trace.filter(x => x === 'post')).toHaveLength(3);
     expect(h.trace.lastIndexOf('read')).toBeGreaterThan(h.trace.lastIndexOf('post'));
-    expect(h.trace.at(-1)).toBe('mirror:true');
+    // The ledger sync re-reads the thread after its appends, so a concurrent operator ruling is never overtaken.
+    expect(h.trace.slice(-2)).toEqual(['mirror:true', 'read']);
     await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, { ...CTX, runId: 'another-checkout' });
     expect(h.judge).toHaveBeenCalledTimes(1);
   });

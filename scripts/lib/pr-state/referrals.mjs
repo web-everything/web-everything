@@ -1,7 +1,8 @@
 /**
  * @file Referral lifecycle over ledger events (plan 3.3; the #5083 rule). Pure.
  * A finding key is `open` after a referral event names it, `ruled` after a `not-real` or `card` ruling,
- * `blocking` after a `block` ruling (the operator confirmed it; it keeps holding until a fix is observed), and
+ * `blocking` after a `block` ruling (the operator confirmed it; it keeps holding until a fix is observed),
+ * `retired` after a clearing ruling on {@link REFERRAL_RETIRED_CHANNEL} (its seat was disabled; a re-referral reopens it), and
  * `resolved-by-fix` when a LATER clearing verdict on a DIFFERENT head is appended while the key is still `open`
  * or `blocking`. A newer referral naming the key again re-opens it (the finding was reproduced), so a
  * still-reproduced finding keeps holding, except when the earlier ruling was `not-real` or `card` (the operator
@@ -20,6 +21,8 @@ const HASHED_KEY = /^sha256:[0-9a-f]{64}$/;
  */
 export const ledgerFindingKey = k => (HASHED_KEY.test(String(k ?? '')) ? String(k) : `sha256:${createHash('sha256').update(String(k ?? '')).digest('hex')}`);
 
+/** The channel of a clearing ruling row that retires a finding its seat no longer reports (seat disabled by config). */
+export const REFERRAL_RETIRED_CHANNEL = 'mandatory-referral-retired';
 const RULING_STATE = new Map([['block', 'blocking'], ['not-real', 'ruled'], ['card', 'ruled']]); // a Map: a raw name like 'toString' or '__proto__' must never resolve through the prototype chain
 const normSha = v => (typeof v === 'string' ? v.trim().toLowerCase() : '');
 /** A head SHA a rule may act on: 7 to 64 hex characters. Anything else (garbage, a number, 'abc') is an UNKNOWN head, never "a different head". */
@@ -34,7 +37,7 @@ export const verdictHead = row => (row?.coverage ? row.coverage.headSha : row?.h
 
 /**
  * @param {object[]} events One PR's ledger events in append order.
- * @returns {Map<string,{key:string,state:'open'|'ruled'|'blocking'|'resolved-by-fix',head:string|null,ruling:string|null,resolvedAtHead:string|null}>}
+ * @returns {Map<string,{key:string,state:'open'|'ruled'|'blocking'|'resolved-by-fix'|'retired',head:string|null,ruling:string|null,resolvedAtHead:string|null}>}
  */
 export function deriveReferrals(events) {
   const keys = new Map();
@@ -50,17 +53,19 @@ export function deriveReferrals(events) {
         if (keys.get(key)?.state === 'ruled') continue;
         const early = earlyRulings.get(key);
         earlyRulings.delete(key);
-        keys.set(key, { key, state: early ? RULING_STATE.get(early) : 'open', head: e.headSha,
-          ruling: early ?? null, resolvedAtHead: null });
+        keys.set(key, { key, state: early?.state ?? 'open', head: e.headSha,
+          ruling: early?.ruling ?? null, resolvedAtHead: null });
       }
     } else if (e.type === EVENT_TYPES.RULING) {
       // Only a ruling that names the key exactly as the referral does (the hashed form) closes it. A legacy ruling row
       // that names the RAW key closes nothing; `ledger-backfill-rulings --migrate-raw` appends its hashed equivalent.
       const k = keys.get(e.findingKey);
       // Only the closed set of rulings moves a key; an unknown value (a forged or mis-cased row) changes nothing.
-      const state = RULING_STATE.get(e.ruling);
+      // A retirement closes the key without a verdict on it, so a later referral reopens it (never sticky `ruled`).
+      const ruled = RULING_STATE.get(e.ruling);
+      const state = ruled === 'ruled' && e.actor?.channel === REFERRAL_RETIRED_CHANNEL ? 'retired' : ruled;
       if (k && state) keys.set(e.findingKey, { ...k, state, ruling: e.ruling });
-      else if (state) earlyRulings.set(e.findingKey, e.ruling);
+      else if (state) earlyRulings.set(e.findingKey, { state, ruling: e.ruling });
     } else if ((e.type === EVENT_TYPES.VERDICT || e.type === undefined) && verdictClears(e.verdict)) {
       const head = verdictHead(e);
       for (const [key, k] of keys) {
