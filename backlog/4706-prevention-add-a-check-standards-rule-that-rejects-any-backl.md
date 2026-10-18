@@ -28,4 +28,4 @@ Hint: a card that loosens a refusal needs two Must lines — what happens on err
 ## Also raised by
 
 - Also raised by web-everything/web-everything#5490 (finding 1: `we:backlog/6192-build-dispatch-expired-group-member-claim-aliases-must-not-m.md:15` — Have the prepare step, or a check:standards rule on new backlog cards, reject cards whose Acceptance or Non-goals still contain 'TODO:' placeholders. The card could also be prepared Acceptance filled in before it is dispatched.) · key `approval-prevention-key:web-everything/web-everything#5490@e1dbe4bb0d951c9437dca6d4b8696a946ce3ca88`
-- Also raised by web-everything/web-everything#5518 (finding 2: `we:backlog/xrkgjr3-overlap-yield-held.md:14` — A write-gate or check:standards rule that rejects a card with status: active whose body still contains the 'TODO' placeholders.)
+- Also raised by web-everything/web-everything#5518 (finding 2: `we:backlog/6219-overlap-yield-held.md:14` — A write-gate or check:standards rule that rejects a card with status: active whose body still contains the 'TODO' placeholders.)
