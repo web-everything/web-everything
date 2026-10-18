@@ -1,4 +1,7 @@
 import { readTestsFirstPolicy, GUARANTEE_TEST_RULE } from './tests-first-policy.mjs';
+import { cascadePolicy, logCascadeSources, platformPreference } from './policy-cascade.mjs';
+import { readSettings } from './settings-files.mjs';
+import { isUnderTest } from './under-test.mjs';
 /**
  * review-core.mjs — the shared "read a diff, judge it" contract (#2325, under epic #2285).
  *
@@ -1105,12 +1108,12 @@ export const PR_DIFF_ADAPTER = Object.freeze({
  * as this PR's scope creep. Omitting it (or passing `'net'`) leaves the mandate BYTE-FOR-BYTE what it is
  * without it — the golden fixture with no `diffBasis` passed is unaffected.
  * @param {{lens: string, contextIsolation?: string, netChangedFiles?: string[]|null, goal?: string,
- *   round?: number, fenced?: boolean, aim?: string, diffBasis?: string|null}} o
+ *   round?: number, fenced?: boolean, aim?: string, diffBasis?: string|null, reviewLevel?: ReturnType<typeof readReviewLevel>}} o
  * @returns {string}
  */
 export function buildPanelMandate({
   lens, contextIsolation = 'diff-only', netChangedFiles = null, goal = '', round = 1, fenced = false,
-  aim = '', diffBasis = null,
+  aim = '', diffBasis = null, reviewLevel = readReviewLevel(),
 } = {}) {
   if (!PANEL_LENSES.includes(lens)) {
     throw new Error(`buildPanelMandate: unknown lens "${lens}" — must be one of ${PANEL_LENSES.join(', ')}`);
@@ -1177,6 +1180,8 @@ export function buildPanelMandate({
   // either — the PHRASING makes it a natural no-op for a finding that changes no behaviour, which is what a
   // `simplicity` juror is looking at, so no branch has to guess which lens is judging what.
   parts.push(MUTATION_PROBE_RULE);
+  const releaseStanza = reviewLevelStanza(lens, reviewLevel);
+  if (releaseStanza) parts.push(releaseStanza);
   return parts.join(' ');
 }
 
@@ -1908,6 +1913,35 @@ export function isDiffBasisDegraded(diffBasis) {
  *  knob (exported, not a scattered literal): re-floor in one edit + a test. */
 export const JURY_CHARTER_CARE_FLOOR = CARE_LEVELS.ELEVATED;
 
+// Interim release bar; superseded when slice 2's settings table lands. Keep the base
+// expectations unchanged so public-preview retains the original mandate bytes.
+const INTERNAL_DELIVERY_STANZA = "Current release level: internal delivery (single operator, no outside users). Hardening against outside attackers (forged identity, ingress size or rate limits, provenance, tamper detection, races between operators) is DEBT, filed as a card, and NOT a blocking finding. Exceptions that still block: a secret actually exposed, a guard weakened or fail-open, irreversible data loss, delivery instability. Per the review-stringency decision (platform-decisions.md#review-stringency-classified-outcomes); superseded when slice 2's settings table lands.";
+
+/** review.currentLevel: standard → platform → declared review settings → env; source logged. */
+export function readReviewLevel({ env = process.env, read = readSettings, platform, log } = {}) {
+  let tool;
+  try { tool = read()?.review; } catch { /* retain lower layers */ }
+  const select = value => value?.currentLevel === undefined ? {} : { currentLevel: value.currentLevel };
+  const resolved = cascadePolicy('review', select(tool), {
+    standard: { currentLevel: 'internal-delivery' },
+    platform: select(platform ?? platformPreference('review', { env })),
+    envValues: { currentLevel: env.WE_REVIEW_CURRENT_LEVEL },
+    valid: { currentLevel: value => ['internal-delivery', 'public-preview'].includes(value) },
+    env, log,
+  });
+  if (!isUnderTest() && !isUnderTest(env)) logCascadeSources('review', resolved, {
+    env: { ...env, WE_POLICY_CASCADE_LOG: env.WE_POLICY_CASCADE_LOG ?? '1' },
+    ...(log ? { log } : {}),
+  });
+  return resolved;
+}
+
+function reviewLevelStanza(lens, level) {
+  return level.value.currentLevel === 'internal-delivery'
+    && [MANDATE_LENSES.SECURITY, MANDATE_LENSES.CORRECTNESS].includes(lens)
+    ? INTERNAL_DELIVERY_STANZA : '';
+}
+
 /**
  * Each lens's UP-FRONT EXPECTATION (#2638) — the concrete bar that lens commits to hold, pre-registered so the
  * human aligns on it before code and the juror is later held to exactly this (no post-hoc goalpost-moving). One
@@ -1966,9 +2000,12 @@ export function huntBriefForLens(lens) {
 }
 
 /** The pre-registered expectation for one lens (#2638) — its `LENS_EXPECTATIONS` entry, or a neutral fallback for a
- *  lens with no registered bar (so `materializeRoster`'s `charterForLens` never yields an empty string). Pure. */
-export function expectationForLens(lens) {
-  return LENS_EXPECTATIONS[lens] || `hold the "${lens}" bar for this change`;
+ *  lens with no registered bar (so `materializeRoster`'s `charterForLens` never yields an empty string).
+ * The effective release level qualifies the security/correctness bar. */
+export function expectationForLens(lens, reviewLevel = readReviewLevel()) {
+  const base = LENS_EXPECTATIONS[lens] || `hold the "${lens}" bar for this change`;
+  const stanza = reviewLevelStanza(lens, reviewLevel);
+  return stanza ? `${base} ${stanza}` : base;
 }
 
 /**

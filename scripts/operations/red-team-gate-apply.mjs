@@ -1,3 +1,4 @@
+import { signalFixDispatch } from '../lib/fix-handoff.mjs';
 /**
  * @file scripts/operations/red-team-gate-apply.mjs
  * @description THE IMPURE HALF of the red-team gate (card x1b8hlo). The pure half — the parser, the setting, the
@@ -150,7 +151,10 @@ export async function applyRedTeamGate({ repo, pr, dryRun = false, cap = DEFAULT
     };
     if (sendPending) {
       if (outcome === GATE_OUTCOMES.SENT_BACK) {
-        if (labels.includes('review:changes')) sendBackResult = { ok: true, already: true };
+        if (labels.includes('review:changes')) {
+          sendBackResult = { ok: true, already: true };
+          io.signalFix?.({ repo, pr, label: 'review:changes' });
+        }
         else {
           // The writer cannot pin a head for `--to=changes`: re-read it right before the write (see the header).
           const live = String(io.readHead({ repo, pr }) ?? '').toLowerCase();
@@ -203,6 +207,7 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
   };
   const safety = readDrainQueueSafety({ env, log: line => process.stderr.write(`${line}\n`) });
   return {
+    signalFix: signalFixDispatch,
     dequeueSentBack: args => safety.value.dequeueOnSendBack ? dequeueSentBack({ ...args, exec: (cmd, argv, opts) => execFileSync(cmd, argv, { ...opts, env }), log: line => process.stderr.write(`${line}\n`) }) : { dequeued: false },
     // The COMPLETE thread (paginated): a one-page read could miss the red-team comment or the gate's own record.
     readPr: ({ repo, pr }) => ({
