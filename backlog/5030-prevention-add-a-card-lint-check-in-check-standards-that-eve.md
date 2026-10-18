@@ -27,4 +27,4 @@ Hint: a card that loosens a refusal needs two Must lines — what happens on err
 
 ## Also raised by
 
-- Also raised by web-everything/web-everything#5552 (finding 3: `we:backlog/xngrda3-we-ci-artifact-uploads-never-fail-a-merge-group-run.md:22` — Add a card-lint check: a non-goal must not negate an item listed in scope or an Acceptance item. Failing that, add a review-lens note.)
+- Also raised by web-everything/web-everything#5552 (finding 3: `we:backlog/6247-we-ci-artifact-uploads-never-fail-a-merge-group-run.md:22` — Add a card-lint check: a non-goal must not negate an item listed in scope or an Acceptance item. Failing that, add a review-lens note.)
