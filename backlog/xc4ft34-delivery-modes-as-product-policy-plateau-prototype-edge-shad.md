@@ -2,6 +2,8 @@
 kind: epic
 parent: "2465"
 status: parked
+blockedBy: ["3007"]
+childlessReason: blocked
 dateOpened: "2026-10-18"
 tags: []
 ---
