@@ -7,7 +7,7 @@ import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mj
 import { postAcceptRedTeamOwed, redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
 import { applyRedTeamGate } from '../../operations/red-team-gate-apply.mjs';
-import { redTeamGateMarker } from '../red-team-gate.mjs';
+import { redTeamGateMarker, redTeamResultId } from '../red-team-gate.mjs';
 import { buildReviewedShaMarker, buildClearedHumanMarker } from '../review-escalation.mjs';
 import { scrubPublish } from '../secret-scrub.mjs';
 
@@ -23,7 +23,7 @@ function fixture(rows) {
   writeFileSync(path, JSON.stringify({ version: 1, records: rows }));
   return { env, path };
 }
-const hold = (env, over = {}) => redTeamEnqueueHold({ repo, pr, head, comments: [], env,
+const hold = (env, over = {}) => redTeamEnqueueHold({ repo, pr, head, comments: [], env, scheduled: true,
   loopPayload: { verdict: { verdict: 'accept' } }, ...over });
 
 describe('saved red-team admission', () => {
@@ -86,6 +86,7 @@ describe('saved red-team admission', () => {
   async function publishSaved(findings, round = 1) {
     const { env } = fixture([row({ findings, confirmedMissCount: findings.length })]);
     const { readSavedRedTeamResult } = await import('../drain-saved-red-team.mjs');
+    const resultId = redTeamResultId(readSavedRedTeamResult({ repo, pr, head, env }));
     const writes = [];
     const result = await applyRedTeamGate({ repo, pr }, {
       readPr: () => ({ headRefOid: head, comments: [], labels: [] }),
@@ -98,7 +99,10 @@ describe('saved red-team admission', () => {
       fileCard: input => { writes.push(input); return { ok: true }; },
       postComment: input => writes.push(input), log: () => {},
     });
-    return { result, writes };
+    // Main adds a generated digest to gate markers. `result=<hex>` can trip the opaque-token heuristic;
+    // remove only this exact computed metadata field, while checking every finding and composed output.
+    const scrub = text => scrubPublish(text.replaceAll(` result=${resultId} -->`, ' -->'));
+    return { result, writes, scrub };
   }
   const publishableFinding = impactIfUnfixed => ({ confirmedByRecheck: true, impactIfUnfixed,
     category: 'edge-case', file: 'scripts/example.mjs', line: 12,
@@ -118,14 +122,14 @@ describe('saved red-team admission', () => {
     const summary = [...token].map(c => String.fromCharCode(c.charCodeAt(0) + 0xfee0)).join('');
     expect(scrubPublish(summary)).toEqual([]);
     expect(scrubPublish(summary.normalize('NFKC')).length).toBeGreaterThan(0);
-    const { result, writes } = await publishSaved(['broken', 'degraded'].map(publishableFinding).map(f => ({ ...f, summary })));
+    const { result, writes, scrub } = await publishSaved(['broken', 'degraded'].map(publishableFinding).map(f => ({ ...f, summary })));
     expect(result.status).toBe('applied');
     for (const write of writes) {
       for (const text of Object.values(write).filter(v => typeof v === 'string')) {
         expect(text).not.toContain(token);
         expect(text).not.toContain(summary);
         expect(text).not.toContain('scripts/example.mjs');
-        expect(scrubPublish(text)).toEqual([]);
+        expect(scrub(text)).toEqual([]);
       }
     }
   });
@@ -135,7 +139,7 @@ describe('saved red-team admission', () => {
       expect(scrubPublish(secret).length).toBeGreaterThan(0);
       for (const [round, taintedIndex] of [[1, 0], [1, 1], [99, 0], [99, 1]]) {
         const findings = ['broken', 'degraded'].map((impact, i) => ({ ...publishableFinding(impact), ...(i === taintedIndex ? { [field]: secret } : {}) }));
-        const { result, writes } = await publishSaved(findings, round);
+        const { result, writes, scrub } = await publishSaved(findings, round);
         expect(result.status).toBe('applied');
         expect(writes.length).toBeGreaterThan(0);
         const published = JSON.stringify(writes);
@@ -143,7 +147,7 @@ describe('saved red-team admission', () => {
         for (const text of ['two writers race', 'both writers enter', 'demonstrated break', 'scripts/example.mjs', 'edge-case']) {
           expect(published).not.toContain(text);
         }
-        expect(scrubPublish(published)).toEqual([]);
+        expect(scrub(published)).toEqual([]);
         const bothBroken = field === 'impactIfUnfixed' && taintedIndex === 1;
         expect(result.plan.sendBack.length).toBe(bothBroken ? 2 : 1);
         expect(published).toContain('confirmed break(s)');
@@ -170,6 +174,29 @@ describe('saved red-team admission', () => {
     expect(hold(env, { comments: [cap, { ...cleared, author: { login: 'attacker' } }] })).toMatch(/requiring send-back/);
     expect(hold(env, { comments: [{ ...cap, createdAt: undefined }, cleared] })).toMatch(/requiring send-back/);
     expect(hold(env, { comments: [cap, { ...cleared, createdAt: '2026-10-17T09:00:00Z' }] })).toMatch(/requiring send-back/);
+  });
+  it('binds gate dedup and recorded actions to the saved result, including when its text is scrubbed', async () => {
+    const secret = ['ghp_', 'Ab3dEf4hIj5lMn6pQr7tUv8xYz9bCd0fGh1j'].join('');
+    const findings = [{ confirmedByRecheck: true, impactIfUnfixed: 'broken', summary: secret }];
+    const { env } = fixture([row({ findings, confirmedMissCount: 1 })]);
+    const { readSavedRedTeamResult } = await import('../drain-saved-red-team.mjs');
+    const saved = readSavedRedTeamResult({ repo, pr, head, env });
+    const comments = [];
+    const io = {
+      readPr: () => ({ headRefOid: head, comments, labels: [] }), readHead: () => head,
+      readSavedResult: () => saved, readSetting: () => ({ value: { broken: 'card' } }),
+      fileCard: () => ({ ok: true }),
+      postComment: ({ body }) => comments.push({ author: { login: 'web-everything' }, body }), log: () => {},
+    };
+    expect((await applyRedTeamGate({ repo, pr }, io)).status).toBe('applied');
+    expect(comments[0].body).toContain(`result=${redTeamResultId(saved)}`);
+    expect(comments[0].body).not.toContain(secret);
+    expect((await applyRedTeamGate({ repo, pr }, io)).status).toBe('already-acted');
+    // Main's recorded per-finding action wins over today's send-back policy for saved evidence too.
+    expect(hold(env, { comments, confirmedBreaks: { broken: 'send-back' } })).toBeNull();
+    writeFileSync(resolveScorecardStorePath(env), JSON.stringify({ version: 1,
+      records: [row({ findings: [{ ...findings[0], summary: 'a newer break' }], confirmedMissCount: 1 })] }));
+    expect(hold(env, { comments, confirmedBreaks: { broken: 'send-back' } })).toMatch(/requiring send-back/);
   });
 });
 
@@ -230,10 +257,10 @@ describe('card-only red-team obligation', () => {
   const payload = read => ({ verdict: { verdict: 'accept' }, findings: { read } });
   const card = { netChangedFiles: ['backlog/6206-card.md'] };
   it('owes no pass for card-only with skipCardOnly on', () => {
-    expect(postAcceptRedTeamOwed(payload(card), { WE_RED_TEAM_SKIP_CARD_ONLY: 'on' })).toBe(false);
+    expect(postAcceptRedTeamOwed(payload(card), { WE_RED_TEAM_SKIP_CARD_ONLY: 'on' }, { scheduled: true })).toBe(false);
   });
   it('still owes a pass with skipCardOnly off', () => {
-    expect(postAcceptRedTeamOwed(payload(card), { WE_RED_TEAM_SKIP_CARD_ONLY: 'off' })).toBe(true);
+    expect(postAcceptRedTeamOwed(payload(card), { WE_RED_TEAM_SKIP_CARD_ONLY: 'off' }, { scheduled: true })).toBe(true);
   });
   it.each([
     { netChangedFiles: ['scripts/code.mjs'] },
@@ -241,7 +268,7 @@ describe('card-only red-team obligation', () => {
     { ...card, netRenameSources: 'unknown' },
     { netChangedFiles: [] }, {},
   ])('still owes a pass for code or unknown files: %j', read => {
-    expect(postAcceptRedTeamOwed(payload(read), { WE_RED_TEAM_SKIP_CARD_ONLY: 'on' })).toBe(true);
+    expect(postAcceptRedTeamOwed(payload(read), { WE_RED_TEAM_SKIP_CARD_ONLY: 'on' }, { scheduled: true })).toBe(true);
   });
   it('card-only exemption cannot waive a saved confirmed break', () => {
     const findings = [{ confirmedByRecheck: true, impactIfUnfixed: 'broken' }];

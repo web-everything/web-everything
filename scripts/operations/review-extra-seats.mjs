@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import { recordRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
+import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
+import { redTeamCardOnly } from '../lib/review-red-team-policy.mjs';
 import { ownReviewScratch, removeReviewScratch, retainReviewScratch, REVIEW_SCRATCH_PREFIXES } from '../lib/review-scratch.mjs';
 import { openOperatorSendBacks, renderOperatorSendBackReviewBlock } from '../lib/operator-send-backs.mjs';
 import { PROVIDER_CAP_ENV, resolveProviderCap } from './review-seat-policy.mjs';
@@ -76,7 +79,6 @@ import { scrubPublish } from '../lib/secret-scrub.mjs';
 import { parseDelegationMarker } from '../lib/delegation-marker.mjs';
 import { logDelegationTrial } from '../conveyor/log-delegation-trial.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
-import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { RED_TEAM_UNVERIFIABLE_TAG, readRedTeamProbes, RED_TEAM_COMMENT_MARKER, RED_TEAM_CONFIRMED_TAG, RED_TEAM_UNCONFIRMED_TAG, redTeamMarker } from '../lib/red-team-gate.mjs';
 
 const THIS_FILE = fileURLToPath(import.meta.url);
@@ -1420,10 +1422,7 @@ export async function speculateRedTeam({
     // The net path list names only rename/copy destinations. Include sources so
     // moving executable code into backlog/ cannot turn the probe off. Unknown
     // or empty destination lists and malformed source lists must still probe.
-    const cardOnlyFiles = Array.isArray(read.netChangedFiles) && read.netChangedFiles.length
-      && (read.netRenameSources == null || Array.isArray(read.netRenameSources))
-      ? [...read.netChangedFiles, ...(read.netRenameSources ?? [])] : null;
-    if (settings.value.skipCardOnly && isCardOnlyDiff(cardOnlyFiles)) {
+    if (settings.value.skipCardOnly && redTeamCardOnly(read)) {
       io.log('red team skipped: card-only');
       return { status: 'skipped', reason: 'red team skipped: card-only' };
     }
@@ -1476,6 +1475,10 @@ export async function speculateRedTeam({
     const model = configuredRoute?.model ?? defaultModel;
     if (typeof onReserved === 'function') {
       try { onReserved({ callId, provider, model, effort, rev, reservedAt: new Date(io.now()).toISOString() }); } catch { /* best effort */ }
+    }
+    if (record && post) {
+      try { io.redTeamStatus?.({ repo, pr, loopPayload: { findings: { read } }, status: 'running' }); }
+      catch (e) { io.log(`red-team status: ${e.message}`); }
     }
     const timeoutMs = resolveSeatTimeoutMs(env);
 
@@ -1596,6 +1599,10 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
       try { io.append(row); rowsWritten = 1; } catch (e) { io.log(`red team: evidence row (${row.seat}) NOT written — ${e.message}`); }
     }
 
+    if (record && post) {
+      try { io.redTeamStatus?.({ repo, pr, loopPayload, status: 'finished', result: 'ran' }); }
+      catch (e) { io.log(`red-team status: ${e.message}`); }
+    }
     return {
       status: 'ran', provider, model, effort, callId, rev, seat: row, findings, recheckStatus, confirmedMissCount: confirmed.length,
       foldedVerdict, builder, delegationTrial, comment, rowsWritten, callsUsedToday: pass.callsUsedToday, dailyCap: pass.dailyCap,
@@ -1691,6 +1698,12 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
   };
   return {
     ...base,
+    redTeamStatus: input => {
+      recordRedTeamStatus(input, { env });
+      try { syncRedTeamStatusLabels({ repo: input.repo, pr: input.pr, head: input.loopPayload.findings.read.netBasis.rev,
+        evidence: { scheduled: true, inFlight: input.status === 'running', recorded: input.result === 'ran' }, env, log: base.log }); }
+      catch (e) { base.log(`red-team status labels: ${e.message}`); }
+    },
     readHeadMessage: (dir) => {
       const r = spawnSync('git', ['-C', dir, 'log', '-1', '--format=%B'], { encoding: 'utf8', timeout: 20_000 });
       return r.status === 0 ? String(r.stdout ?? '') : '';

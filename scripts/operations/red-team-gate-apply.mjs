@@ -1,3 +1,5 @@
+import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
+import { signalFixDispatch } from '../lib/fix-handoff.mjs';
 /**
  * @file scripts/operations/red-team-gate-apply.mjs
  * @description THE IMPURE HALF of the red-team gate (card x1b8hlo). The pure half — the parser, the setting, the
@@ -17,8 +19,9 @@
  *        `round-cap` and the PR is the operator's;
  *     4. `card` findings: ONE follow-up card through the shared detached landing job (the same seam the review loop's
  *        round cards and prevention cards use — never `file-item` in this checkout, which is a daemon clone);
- *     5. ONE gate marker comment per ACTION per head records what was done (`sent-back` / `round-cap` after the
- *        send-back step, `card-queued` after the landing job was spawned), so a later run never repeats a finished
+ *     5. ONE gate marker comment per ACTION per result records what was done (`sent-back` / `round-cap` after the
+ *        send-back step, `card-queued` after the landing job was spawned) and names the result it decided
+ *        (`result=`, `we:scripts/lib/red-team-gate.mjs#redTeamResultId`), so a later run never repeats a finished
  *        action, an action that FAILED stays retryable (`card-failed`), and the operator queue knows the state. A
  *        record that cannot be posted is a visible status (`send-back-record-failed` / `card-record-failed`, exit 1,
  *        error carried into the review-job summary), never a silent `applied`; the retry records without repeating. Two
@@ -37,7 +40,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  GATE_OUTCOMES, breakClass, gateOutcomeForHead, gateOutcomesForHead, planRedTeamActions, readConfirmedBreaks, redTeamForHead, redTeamGateMarker,
+  GATE_OUTCOMES, breakClass, liveResultGateState, planRedTeamActions, readConfirmedBreaks, redTeamGateMarker, sendBackStepOutcome,
 } from '../lib/red-team-gate.mjs';
 import { scrubPublish } from '../lib/secret-scrub.mjs';
 import { cleanFindingFile, qualifyLocusRefs, sanitizeCardField } from '../lib/review-loop-policy.mjs';
@@ -97,11 +100,11 @@ export function buildSendBackArgv({ repo, pr, bodyPath }) {
 }
 
 /** The gate's own record for ONE action on the head. PURE. */
-export function buildGateComment({ pr, head, outcome, plan, round, cardResult = null, sendBackResult = null }) {
-  const lines = [redTeamGateMarker(pr, head, outcome), `**Red-team gate** (setting \`redTeam.confirmedBreaks\`, card x1b8hlo) on head \`${String(head).slice(0, 12)}\`:`];
+export function buildGateComment({ pr, head, outcome, plan, round, result = null, cardResult = null, sendBackResult = null }) {
+  const lines = [redTeamGateMarker(pr, head, outcome, result),`**Red-team gate** (setting \`redTeam.confirmedBreaks\`, card x1b8hlo) on head \`${String(head).slice(0, 12)}\`:`];
   if (plan.sendBack.length) {
     lines.push(outcome === GATE_OUTCOMES.ROUND_CAP
-      ? `- ${plan.sendBack.length} confirmed break(s) NOT sent back: ${Number.isInteger(round) ? `review round ${round} has reached the round cap (${DEFAULT_ROUND_CAP})` : 'the review round could not be read, which counts as the round cap'}. The operator rules on them.`
+      ? `- ${plan.sendBack.length} confirmed break(s) NOT sent back: ${Number.isInteger(round) ? `review round ${round} has reached the round cap (${DEFAULT_ROUND_CAP})` : 'the review round could not be read, which counts as the round cap'}. The operator rules on them (${plan.sendBack.map(f => `#${f.index}`).join(', ')}).`
       : `- ${plan.sendBack.length} confirmed break(s) sent back to the fixer (${plan.sendBack.map((f) => `#${f.index}`).join(', ')})${sendBackResult?.already ? ' — the PR was already under review:changes' : ''}.`);
   }
   if (plan.card.length) {
@@ -117,16 +120,29 @@ export function buildGateComment({ pr, head, outcome, plan, round, cardResult = 
  * @param {{repo:string, pr:number, dryRun?:boolean, cap?:number}} o
  * @param {ReturnType<typeof createRedTeamGateIo>} io
  */
-export async function applyRedTeamGate({ repo, pr, dryRun = false, cap = DEFAULT_ROUND_CAP } = {}, io = createRedTeamGateIo()) {
+export async function applyRedTeamGate(input = {}, io = createRedTeamGateIo()) {
+  const result = await applyRedTeamGateInner(input, io);
+  if (!input.dryRun) {
+    try { io.syncStatusLabels?.({ ...input, head: result.head }); }
+    catch (e) { io.log?.(`red-team status labels: ${e.message}`); }
+  }
+  return result;
+}
+
+async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_ROUND_CAP } = {}, io = createRedTeamGateIo()) {
   try {
     const view = io.readPr({ repo, pr });
     const head = String(view?.headRefOid ?? '').toLowerCase();
-    const posted = redTeamForHead(view?.comments, pr, head);
-    let parsed = posted ?? (io.readSavedResult ?? readSavedRedTeamResult)({ repo, pr, head });
+    // The live head's latest result, and only the records that decide THAT result (an earlier same-head result's
+    // records never dedup a newer one, PR #5482).
+    const posted = liveResultGateState(view?.comments, pr, head);
+    const saved = posted.result ? null : (io.readSavedResult ?? readSavedRedTeamResult)({ repo, pr, head });
+    const { result, resultId, outcomes: recorded } = saved ? liveResultGateState(view?.comments, pr, head, saved) : posted;
+    let parsed = result;
     if (!parsed) return { status: 'no-red-team-on-head', head };
     // Saved evidence may be precisely the result whose comment failed this scrub. Check raw fields
     // before clipping, plus the composed comment/card (including scope) before any publication.
-    if (!posted && [
+    if (!posted.result && [
       parsed.findings.flatMap(f => Object.values(f)).join('\n'),
       buildSendBackBody({ pr, head, findings: parsed.findings }),
       ...Object.values(buildRedTeamCardInput({ repo, pr, head, findings: parsed.findings })),
@@ -139,9 +155,8 @@ export async function applyRedTeamGate({ repo, pr, dryRun = false, cap = DEFAULT
     const setting = io.readSetting();
     const plan = planRedTeamActions(parsed, setting.value);
     if (!plan.sendBack.length && !plan.card.length) return { status: 'advisory-only', head, plan };
-    // One record per ACTION (see the header): what is already recorded for this head is not repeated, what is not stays pending.
-    const recorded = gateOutcomesForHead(view.comments, pr, head);
-    const priorSend = gateOutcomeForHead(view.comments, pr, head);
+    // One record per ACTION (see the header): what is already recorded for this result is not repeated, what is not stays pending.
+    const priorSend = sendBackStepOutcome(recorded);
     const sendPending = plan.sendBack.length > 0 && !priorSend;
     const cardPending = plan.card.length > 0 && !recorded.has(GATE_OUTCOMES.CARD_QUEUED);
     if (!dryRun && priorSend === GATE_OUTCOMES.SENT_BACK && sendBackReason(view.labels)) io.dequeueSentBack({ repo, pr, reason: 'post-accept red team sent back to review:changes' });
@@ -160,12 +175,15 @@ export async function applyRedTeamGate({ repo, pr, dryRun = false, cap = DEFAULT
     let sendBackResult = null;
     let marker = null;
     const record = (recordOutcome, recordPlan, extra = {}) => {
-      try { io.postComment({ repo, pr, body: buildGateComment({ pr, head, outcome: recordOutcome, plan: recordPlan, round, ...extra }) }); return 'posted'; }
+      try { io.postComment({ repo, pr, body: buildGateComment({ pr, head, outcome: recordOutcome, plan: recordPlan, round, result: resultId, ...extra }) }); return 'posted'; }
       catch (e) { return `error: ${String(e?.message ?? e).slice(0, 200)}`; }
     };
     if (sendPending) {
       if (outcome === GATE_OUTCOMES.SENT_BACK) {
-        if (labels.includes('review:changes')) sendBackResult = { ok: true, already: true };
+        if (labels.includes('review:changes')) {
+          sendBackResult = { ok: true, already: true };
+          io.signalFix?.({ repo, pr, label: 'review:changes' });
+        }
         else {
           // The writer cannot pin a head for `--to=changes`: re-read it right before the write (see the header).
           const live = String(io.readHead({ repo, pr }) ?? '').toLowerCase();
@@ -218,6 +236,9 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
   };
   const safety = readDrainQueueSafety({ env, log: line => process.stderr.write(`${line}\n`) });
   return {
+    syncStatusLabels: ({ repo, pr, head }) => head ? syncRedTeamStatusLabels({ repo, pr, head, env,
+      log: line => process.stderr.write(`${line}\n`) }) : null,
+    signalFix: signalFixDispatch,
     dequeueSentBack: args => safety.value.dequeueOnSendBack ? dequeueSentBack({ ...args, exec: (cmd, argv, opts) => execFileSync(cmd, argv, { ...opts, env }), log: line => process.stderr.write(`${line}\n`) }) : { dequeued: false },
     // The COMPLETE thread (paginated): a one-page read could miss the red-team comment or the gate's own record.
     readPr: ({ repo, pr }) => ({

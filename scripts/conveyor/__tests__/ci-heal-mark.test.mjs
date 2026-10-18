@@ -111,6 +111,14 @@ describe('spawnCiHealRearm — hand a stale review:accepted back through rearm-r
     expect(out.ok).toBe(false);
   });
 
+  it('pins missing-routing recovery to the caller observation without readiness', () => {
+    const { calls, spawn } = spy();
+    const headSha = 'a'.repeat(40);
+    expect(spawnCiHealRearm({ pr: 42, repo: 'o/r', onlyIf: 'missing', headSha, spawn })).toEqual({ ok: true });
+    expect(calls[0].argv).toEqual(expect.arrayContaining(['--only-if=missing', `--expect-head=${headSha}`, '--expect-no-readiness']));
+    expect(calls[0].argv).not.toContain('--only-if=accepted');
+  });
+
   it('a spawn failure never throws — reported as {ok:false, reason}', () => {
     const thrower = () => { throw new Error('spawn ENOENT'); };
     expect(spawnCiHealRearm({ pr: 2811, repo: 'web-everything/web-everything', spawn: thrower })).toEqual({ ok: false, reason: 'spawn ENOENT' });
@@ -345,6 +353,7 @@ describe('CI-heal missing routing label incident replay', () => {
     { name: 'existing prevention merge path', labels: ['ready-to-merge', 'checking'], expected: ['ready-to-merge'] },
     // The final pre-write read is the child's THIRD view (parent observation, child initial read, pre-write read).
     { name: 'verdict arrives at the pre-write read', file: 'source.js', guardCase: true, labels: [], raceAt: 3, race: { labels: [{ name: 'review:human' }] }, expected: ['review:human'] },
+    { name: 'ready-to-merge arrives at the child initial read', file: 'source.js', guardCase: true, labels: [], raceAt: 2, race: { labels: [{ name: 'ready-to-merge' }] }, expected: ['ready-to-merge'] },
     { name: 'ready-to-merge arrives at the pre-write read', file: 'source.js', guardCase: true, labels: [], raceAt: 3, race: { labels: [{ name: 'ready-to-merge' }] }, expected: ['ready-to-merge'] },
     { name: 'draft arrives at the pre-write read', file: 'source.js', guardCase: true, labels: [], raceAt: 3, race: { isDraft: true }, expected: [] },
     { name: 'draft status unknown at the pre-write read', file: 'source.js', guardCase: true, labels: [], raceAt: 3, race: { isDraft: null }, expected: [] },
