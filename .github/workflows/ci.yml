@@ -93,9 +93,58 @@ jobs:
   # coverage-final.json. The `test` job below fans them back in and applies the bar to the COMBINED
   # result, so the split changes only WHERE tests run, never WHETHER coverage gates. Sharding is by test
   # FILE, so every file (incl. the poolMatchGlobs singleFork one) lands in exactly one shard.
+  # Review can start when standards and the first shard are green.
+  standards:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # Same sibling layout as the shards — check:standards shells out to FUI's render CLI.
+      - name: Checkout WE
+        uses: actions/checkout@v4
+        with:
+          path: web-everything
+          fetch-depth: 0 # backlog scope guards compare the PR against origin/main
+      - name: Mint FUI read token (GitHub App)
+        id: fui-app-token
+        if: vars.WE_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.WE_APP_ID }}
+          private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}
+          owner: frontier-ui
+          repositories: frontierui
+          permission-contents: read
+      - name: Checkout FUI (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: frontier-ui/frontierui
+          token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
+          path: frontierui
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            web-everything/package-lock.json
+            frontierui/package-lock.json
+
+      - name: Install + build FUI tools
+        working-directory: frontierui
+        run: |
+          npm ci
+          npm run build:tools
+
+      - name: Install
+        working-directory: web-everything
+        run: npm ci
+
+      - name: Standards
+        working-directory: web-everything
+        run: npm run check:standards
+
   test-shard:
     needs: changes
-    if: ${{ needs.changes.outputs.light != 'true' }}
     # #5027 — Arm-runner experiment switch. The repo is public, so `ubuntu-24.04-arm` is free; paid larger
     # runners were rejected on cost. `vars.WE_SHARD_RUNNER` unset (the default) = x86 `ubuntu-latest`; set it to
     # `ubuntu-24.04-arm` to trial the shards on Arm, unset it to abort — no PR needed either way. ONLY this job
@@ -128,6 +177,10 @@ jobs:
         # with the `/4` divisors in the two unit-suite steps.
         shard: [1, 2, 3, 4, 5]
     steps:
+      # Keep the fast-check name green for an intentionally empty unit-test scope.
+      - name: Card-only unit scope receipt
+        if: ${{ needs.changes.outputs.light == 'true' }}
+        run: echo "Card-only change; no unit tests required by the changes classifier."
       # Sibling layout under $GITHUB_WORKSPACE so WE's `../frontierui` resolves — both the vitest/vite
       # `@frontierui/*` alias (dev/test-time; `we:vitest.config.ts` → `../frontierui/plugs`) AND the pinned
       # component-render CLI the gate/build call. #2165 (single-repo CI has neither the sibling nor a
@@ -135,13 +188,14 @@ jobs:
       #   $GITHUB_WORKSPACE/web-everything  (this repo)
       #   $GITHUB_WORKSPACE/frontierui      (the sibling)
       - name: Checkout WE
+        if: ${{ needs.changes.outputs.light != 'true' }}
         uses: actions/checkout@v4
         with:
           path: web-everything
           fetch-depth: 0 # tests that shell check-standards need origin/main history for the backlog scope guards
       - name: Mint FUI read token (GitHub App)
         id: fui-app-token
-        if: vars.WE_APP_ID != ''
+        if: ${{ needs.changes.outputs.light != 'true' && (vars.WE_APP_ID != '') }}
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ vars.WE_APP_ID }}
@@ -150,6 +204,7 @@ jobs:
           repositories: frontierui
           permission-contents: read
       - name: Checkout FUI (sibling)
+        if: ${{ needs.changes.outputs.light != 'true' }}
         uses: actions/checkout@v4
         with:
           repository: frontier-ui/frontierui
@@ -157,6 +212,7 @@ jobs:
           path: frontierui
 
       - uses: actions/setup-node@v4
+        if: ${{ needs.changes.outputs.light != 'true' }}
         with:
           node-version: 22
           cache: npm
@@ -167,12 +223,14 @@ jobs:
       # FUI first (ratified #1946/#2016 ordering): install its deps (the `@frontierui/*` alias resolves to
       # sibling source that imports them) + build the pinned component-render CLI the gate/build call.
       - name: Install + build FUI tools
+        if: ${{ needs.changes.outputs.light != 'true' }}
         working-directory: frontierui
         run: |
           npm ci
           npm run build:tools
 
       - name: Install
+        if: ${{ needs.changes.outputs.light != 'true' }}
         working-directory: web-everything
         run: npm ci
 
@@ -181,7 +239,7 @@ jobs:
       # Card 12: `--group=covered` is the tests that can reach a coverage-counted file (scripts/ci/coverage-reach.mjs);
       # only those run under --coverage, so the covered files' numbers are unchanged.
       - name: Unit suite shard ${{ matrix.shard }}/4 (coverage, no per-shard bar)
-        if: ${{ matrix.shard != 5 }}
+        if: ${{ needs.changes.outputs.light != 'true' && (matrix.shard != 5) }}
         working-directory: web-everything
         run: |
           # Capture first, then split: reading the list through a process substitution drops the producer's exit status, so a failing
@@ -194,7 +252,7 @@ jobs:
           npm run test:coverage:shard -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}" $(node scripts/ci/quarantine-skip.mjs) # red-main quarantine (xx7ckd6): skip args from ops/quarantine, empty unless redMainMode=quarantine
 
       - name: Unit suite no-coverage group (scripts tests that cannot reach a covered file)
-        if: ${{ matrix.shard == 5 }}
+        if: ${{ needs.changes.outputs.light != 'true' && (matrix.shard == 5) }}
         working-directory: web-everything
         run: |
           # Same capture-then-split shape as the coverage shard step above (see its comment).
@@ -209,7 +267,7 @@ jobs:
       # turns a missing report into a red shard (not a silent under-count) — the merge's --expect guard
       # is the second line of defence. The no-coverage group (shard 5) produces none.
       - name: Upload shard coverage
-        if: ${{ matrix.shard != 5 }}
+        if: ${{ needs.changes.outputs.light != 'true' && (matrix.shard != 5) }}
         uses: actions/upload-artifact@v4
         with:
           name: coverage-shard-${{ matrix.shard }}
@@ -219,7 +277,7 @@ jobs:
       # Per-file durations for refreshing scripts/ci/test-timings.json (`node scripts/ci/shard-assign.mjs
       # --suite=unit --update=<these>`). Evidence only; never gates.
       - name: Upload shard timings
-        if: ${{ always() }}
+        if: ${{ needs.changes.outputs.light != 'true' && (always()) }}
         uses: actions/upload-artifact@v4
         with:
           name: timing-unit-${{ matrix.shard }}

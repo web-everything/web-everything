@@ -1,3 +1,5 @@
+import { ciRedOnHead, fastChecksFor, reviewStartGate } from './review-timing.mjs';
+import { resolveTimingPolicy } from './review-timing-settings.mjs';
 /** Fresh repo-explicit review eligibility, with injectable read-only GitHub IO. */
 import { readGh } from './proc-read.mjs';
 import { getRequiredStatusChecks } from './required-status-checks.mjs';
@@ -34,7 +36,7 @@ export const readReviewChecks = ({ repo, headSha, run = gh }) => [
 export function readReviewCiGate({ repo, pr, readHead, readLabels,
   readHeadAndLabels = readReviewHeadAndLabels,
   readMergeGateVerdict = defaultReadMergeGateVerdict, readFreeze = readSharedFreeze, mergeGateSetting,
-  readChecks = readReviewChecks, readRequired = getRequiredStatusChecks } = {}) {
+  readChecks = readReviewChecks, readRequired = getRequiredStatusChecks, policy = resolveTimingPolicy().review } = {}) {
   let headSha = null;
   let labels;
   // Keep the existing injected SHA reader; absent label evidence can never excuse a failure.
@@ -46,19 +48,33 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
   try {
     if (typeof repo !== 'string' || !/^[^/]+\/[^/]+$/.test(repo)) throw new Error('explicit repo required');
     headSha = head({ repo, pr });
-    if (typeof headSha !== 'string' || !headSha.trim()) return reviewCiGate({ headSha });
-    const required = readRequired({ repo, ttlMs: 0 });
+    if (typeof headSha !== 'string' || !headSha.trim()) return { ...reviewCiGate({ headSha }), startAfter: policy.startAfter };
+    let checks;
+    const fast = policy.startAfter === 'fast-checks' ? fastChecksFor(policy.fastChecks, repo) : null;
+    // A repo whose CI does not publish fast checks waits on its own required set, exactly as ci-green does.
+    const needsRequired = policy.startAfter === 'ci-green' || (policy.startAfter === 'fast-checks' && !fast);
+    let required = { source: 'timing-policy', checks: fast ?? [] };
+    if (needsRequired) required = readRequired({ repo, ttlMs: 0 });
+    else {
+      checks = readChecks({ repo, headSha });
+      // Early review needs branch-protection discovery only to identify an owner for red CI.
+      // Discovery faults retain the fast-check prerequisite, rather than stranding review.
+      if (ciRedOnHead({ headSha, checks })) {
+        try { required = readRequired({ repo, ttlMs: 0 }); } catch { /* Keep timing policy. */ }
+      }
+    }
     const stale = required?.source === 'stale-cache';
     const cacheAgeMs = required?.cacheAgeMs;
     const trustedStale = stale && Number.isFinite(cacheAgeMs) && cacheAgeMs >= 0 && cacheAgeMs <= MAX_STALE_CACHE_AGE_MS;
-    const withSource = result => ({ ...result, source: required?.source,
+    const withSource = result => ({ ...result, startAfter: policy.startAfter, source: required?.source,
       ...(stale ? { cacheAgeMs, reason: `${result.reason} (stale-cache cache-age-ms=${cacheAgeMs ?? 'unknown'})` } : {}),
     });
     // Repo-declared requirements are code-reviewed policy, not the last-resort fallback.
-    if (!['live', 'cache', 'declared'].includes(required?.source) && !trustedStale) {
+    const trustedRequired = ['live', 'cache', 'declared', 'timing-policy'].includes(required?.source) || trustedStale;
+    if (needsRequired && !trustedRequired) {
       return withSource({ allowed: false, headSha, reason: 'untrusted-required-set' });
     }
-    let checks = readChecks({ repo, headSha });
+    checks ??= readChecks({ repo, headSha });
     const currentHead = head({ repo, pr });
     if (currentHead !== headSha) return withSource({ allowed: false, headSha, currentHead, reason: 'head-changed' });
     try {
@@ -70,9 +86,11 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
         }).rows;
       }
     } catch { /* Unreadable excusal evidence preserves the original failed checks. */ }
-    return withSource(reviewCiGate({ headSha, requiredChecks: required.checks, checks }));
+    const requiredChecks = trustedRequired && required.source !== 'timing-policy' ? required.checks : [];
+    // `requiredChecks` rides along so a publish-time void judges only healable reds, as review start does.
+    return withSource({ ...reviewStartGate({ headSha, repo, requiredChecks, checks, policy }), checks, requiredChecks });
   } catch (error) {
-    return { allowed: false, headSha, reason: 'unreadable-ci', error: String(error?.message ?? error) };
+    return { allowed: false, headSha, startAfter: policy.startAfter, reason: 'unreadable-ci', error: String(error?.message ?? error) };
   }
 }
 
