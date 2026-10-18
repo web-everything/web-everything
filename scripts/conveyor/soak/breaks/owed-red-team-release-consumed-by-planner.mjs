@@ -16,9 +16,11 @@ const hold = await load('scripts/conveyor/review-referral-hold.mjs');
 const { defaultReadNotesForRepo } = await load('skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs');
 const { dispatchReviewByMode } = await load('scripts/operations/review-job.mjs');
 const { runRedTeam } = await load('scripts/operations/review-extra-seats.mjs');
+const { CONSTELLATION_REPOS } = await load('scripts/lib/constellation-repos.mjs');
 // Warm the old reader too: the incident is a long-lived notes daemon winning the receipt race.
 await hold.loadRedTeamHoldReaders?.();
-const repo = 'red-team-fixture/example', number = 5461;
+// Exercise dispatch's real constellation validation with the live case's registered repository.
+const repo = CONSTELLATION_REPOS.we.slug, number = 5461;
 const head = '3373a3326ef2b649303f7b26b69efabfdfe179a6';
 const pr = { number, headRefOid: head, comments: [], labels: ['review:accepted'] };
 const row = { repo, pr: number, rev: head, dispatchKind: 'review-seat', seat: 'red-team', status: 'ok',

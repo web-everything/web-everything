@@ -12,6 +12,7 @@ import { dispatchReviewByMode, runReviewJob } from '../../operations/review-job.
 import { runRedTeam } from '../../operations/review-extra-seats.mjs';
 import { redTeamMarker } from '../../lib/red-team-gate.mjs';
 import { resetCascadeLogForTest } from '../../lib/policy-cascade.mjs';
+import { repoKeyForSlug } from '../../lib/constellation-repos.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
 
 // x9jlvy0: replay the saved-result/missing-comment boundary from PR #5461.
@@ -80,7 +81,8 @@ describe('same-head hold when the post-accept red-team comment is owed', () => {
       mergeStateStatus: 'CLEAN', statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
     })], { ...opts, now: 3, readRuns: () => [run()] });
     expect(p.owedRedTeamReview).toEqual({ repo, pr: number, head });
-    const plan = planReconcile({ repo, prs: [p], agents: [], requiredChecks: ['test'], now: 3 });
+    // Match reconcile-pass: evidence uses the GitHub slug; the pure planner uses the internal key.
+    const plan = planReconcile({ repo: repoKeyForSlug(repo), prs: [p], agents: [], requiredChecks: ['test'], now: 3 });
     expect(plan.dispatch).toContainEqual(expect.objectContaining({ kind: 'review', prNumber: number,
       owedRedTeamReview: p.owedRedTeamReview }));
   });
