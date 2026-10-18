@@ -14,7 +14,7 @@ export default {
   id: 'saved-red-team-round-cap-unclearable',
   title: 'saved red-team break held at the round cap has no RULING NEEDED row and no clear-human ruling',
   card: 'PR #5551',
-  fixedBy: { sha: '4e9a2f798', where: 'lane/drain-reads-saved-redteam', paths: SOURCES },
+  fixedBy: { sha: 'dea507fdf,4e9a2f798', where: 'lane/drain-reads-saved-redteam', paths: SOURCES },
   fixPresent(root) {
     return ['scripts/review-set-label.mjs', 'scripts/operations/operator-queue.mjs', 'scripts/operations/operator-why-io.mjs']
       .every(f => readFileSync(join(root, f), 'utf8').includes('savedRedTeamFallback('))
