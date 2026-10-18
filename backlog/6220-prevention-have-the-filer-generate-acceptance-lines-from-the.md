@@ -12,7 +12,7 @@ tags: []
 # Prevention — Have the filer generate Acceptance lines from the guard text. Add a check:standards rule that rej… (from web-everything/web-everything#5524 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/xqu7dxm-prevention-add-a-buildoverlaprows-test-that-sets-module-argv.md:28` — Have the filer generate Acceptance lines from the guard text. Add a `check:standards` rule that rejects a card with an unfilled `TODO` Acceptance. The existing cards #4706 and #5039 already track that rule, so it is a carve-out.
+1. `we:backlog/6217-prevention-add-a-buildoverlaprows-test-that-sets-module-argv.md:28` — Have the filer generate Acceptance lines from the guard text. Add a `check:standards` rule that rejects a card with an unfilled `TODO` Acceptance. The existing cards #4706 and #5039 already track that rule, so it is a carve-out.
 
 Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 2 → #5615, finding 3 → #5473.
 
