@@ -705,7 +705,7 @@ export function formatSessionDispatchResult(result) {
     + (result.unknownTokens.length ? `note: unrecognized brief tokens (reported, not fatal): ${result.unknownTokens.join(', ')}\n` : '');
 }
 
-/** The plain CLI carries no owed-comment token. Revalidate its ordinary review authorization at spawn
+/** The automated CLI carries no owed-comment token. Revalidate its ordinary review authorization at spawn
  * time, without enabling or spending the owed-comment exception. Token-bearing daemons use their own claim.
  */
 export function claimCliReviewDispatch(ci, { repo, pr, env = process.env, now = Date.now(),
@@ -730,11 +730,11 @@ export function claimCliReviewDispatch(ci, { repo, pr, env = process.env, now = 
   } catch { return false; }
 }
 
-/** Shared CLI wiring for job and session mode; neither may drop the ordinary hold check. */
-export function dispatchCliReview(dispatch, opts, holdOpts = {}) {
-  return dispatch({ ...opts, beforeSpawn: ci => claimCliReviewDispatch(ci, {
+/** Automated callers retain the hold in both modes; a plain CLI is the operator's manual override. */
+export function dispatchCliReview(dispatch, { automated = false, ...opts }, holdOpts = {}) {
+  return dispatch({ ...opts, beforeSpawn: automated ? ci => claimCliReviewDispatch(ci, {
     ...holdOpts, repo: opts.repo, pr: opts.pr, env: opts.env,
-  }) });
+  }) : undefined });
 }
 
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
@@ -742,6 +742,7 @@ if (IS_CLI) {
   // xgqz204 — this CLI may fast-forward its own checkout (#3474); re-execute rather than dispatch on old code.
   armSelfReexecOnFastForward();
   const argv = process.argv.slice(2);
+  const automated = argv.includes('--automated');
   const flag = (name) => {
     const hit = argv.find((a) => a.startsWith(`--${name}=`));
     return hit ? hit.slice(name.length + 3) : undefined;
@@ -758,7 +759,7 @@ if (IS_CLI) {
     const mode = flag('mode') === 'session' || flag('mode') === 'job' ? flag('mode') : resolveReviewDispatchMode();
     if (mode === 'job') {
       try {
-        const r = dispatchCliReview(dispatchReviewJob, { pr: flag('pr'), repo: flag('repo') });
+        const r = dispatchCliReview(dispatchReviewJob, { pr: flag('pr'), repo: flag('repo'), automated });
         writeAllSync(1, r.skipped
           ? `dispatch-review: ${r.repo}#${r.pr} not started — ${r.skipped}${r.jobPid ? ` (job pid ${r.jobPid})` : ''}\n`
           : `dispatch-review: started review job pid ${r.jobPid} (slug ${r.sessionSlug}) for ${r.repo}#${r.pr} — no Claude wrapper session\n`
@@ -776,6 +777,7 @@ if (IS_CLI) {
       // applies when the flag is omitted, so `flag('judge-provider')` returning `undefined` here is the ordinary
       // case, not a gap.
       const result = dispatchCliReview(dispatchReview, {
+        automated,
         pr: flag('pr'), repo: flag('repo'), extraArgs: agentArgsFromEnv(), judgeProvider: flag('judge-provider'), careLevel: flag('care-level'),
       });
       writeAllSync(1, formatSessionDispatchResult(result));

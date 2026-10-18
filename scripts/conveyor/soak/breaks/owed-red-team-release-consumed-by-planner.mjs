@@ -48,7 +48,15 @@ const spentByPlanner = existsSync(stateDir);
 const plan = planReconcile({ repo: repoKeyForSlug(repo),
   prs: hold.enrichPrsWithReferralHolds([pr], opts), agents: [], requiredChecks: ['test'], now: 3 });
 const scheduled = plan.dispatch.filter(d => d.kind === 'review' && d.owedRedTeamReview?.head === head);
-let cliFullReviews = 0, cliSkips = [];
+let cliFullReviews = 0, cliSkips = [], manualReviews = 0;
+const cliOptions = mode => ({ mode, repo, pr: number,
+  root: '/daemon', dir: join(dir, 'cli-jobs'), env: {}, checkoutExists: () => true,
+  stackCheck: () => ({ base: null }), checkStaleness: () => ({ fresh: true, behind: 0 }),
+  readCompletion: () => null, resolveSettingsEnv: () => ({}), isAlive: () => false,
+  ciGate: () => ({ allowed: true, headSha: head }), wrapReview: false,
+  readBrief: () => 'Review {{PR}}', mintSessionId: () => 'owed-cli', ensureSessionCwd: p => p,
+  sessionCwdFor: () => join(dir, 'cli-session'), isolateSession: () => ({ worktreeSettings: {} }),
+});
 // Replay the runner's token-dropping CLI consumer before the token-aware daemon gets its turn.
 // Older trees call the dispatcher directly; the guarded CLI now supplies a conservative beforeSpawn.
 const invokeCli = reviewDispatchCli.dispatchCliReview ?? ((dispatch, opts) => dispatch(opts));
@@ -58,13 +66,9 @@ for (const mode of ['job', 'session']) {
     fetchOpenPrs: () => [pr], exec: (_file, argv) => {
       if (argv[0].endsWith('/reconcile-pass.mjs')) return JSON.stringify(plan);
       if (argv[0].endsWith('/review-dispatch.mjs')) {
-        const out = invokeCli(dispatchReviewByMode, { mode, repo: argv[2].slice(7), pr: argv[1].slice(5),
-          root: '/daemon', dir: join(dir, 'cli-jobs'), env: {}, checkoutExists: () => true,
-          stackCheck: () => ({ base: null }), checkStaleness: () => ({ fresh: true, behind: 0 }),
-          readCompletion: () => null, resolveSettingsEnv: () => ({}), isAlive: () => false,
-          ciGate: () => ({ allowed: true, headSha: head }), wrapReview: false,
-          readBrief: () => 'Review {{PR}}', mintSessionId: () => 'owed-cli', ensureSessionCwd: p => p,
-          sessionCwdFor: () => join(dir, 'cli-session'), isolateSession: () => ({ worktreeSettings: {} }),
+        const out = invokeCli(dispatchReviewByMode, { ...cliOptions(mode),
+          repo: argv.find(a => a.startsWith('--repo=')).slice(7), pr: argv[1].slice(5),
+          automated: argv.includes('--automated'),
           spawnJob: () => { cliFullReviews++; return 4241; },
           spawnAgent: () => { cliFullReviews++; return 'backgrounded · cli-worker · review'; },
         }, { readPr: () => pr, readRuns: () => runs, now: 3 });
@@ -73,7 +77,13 @@ for (const mode of ['job', 'session']) {
       return '';
     } });
   for (let tick = 0; tick < 3; tick++) await pass();
+  // The identical head still admits an explicit operator review, without spending the automatic receipt.
+  invokeCli(dispatchReviewByMode, { ...cliOptions(mode),
+    spawnJob: () => { manualReviews++; return 4243; },
+    spawnAgent: () => { manualReviews++; return 'backgrounded · operator · review'; },
+  }, { readPr: () => pr, readRuns: () => runs, now: 3 });
 }
+const spentByCli = existsSync(stateDir);
 const dispatch = allowed => dispatchReviewByMode({ repo, pr: number, mode: 'job', root: '/daemon',
   owedRedTeamReview: scheduled[0]?.owedRedTeamReview,
   env: {}, dir: join(dir, 'jobs'), stackCheck: () => ({ base: null }),
@@ -112,7 +122,7 @@ if (released && scheduled.length === 1) {
       postComment: p => posts.push(p), runSeat: forbidden });
 }
 process.stdout.write(JSON.stringify({ planned, spentByPlanner, spentBySkipped, spawned, modelCalls,
-  cliFullReviews, cliSkips,
+  cliFullReviews, cliSkips, manualReviews, spentByCli,
   scheduled: scheduled.length, accepted: scheduled[0]?.labels.includes('review:accepted'),
   refusals: plan.refusals.map(r => ({ kind: r.kind, why: r.why })),
   posted: posts.length === 1 && posts[0].body.includes('pr=5461 rev=' + head) }));
@@ -120,12 +130,13 @@ process.stdout.write(JSON.stringify({ planned, spentByPlanner, spentBySkipped, s
 
 export default {
   id: 'owed-red-team-release-consumed-by-planner',
-  title: 'owed red-team planning stays read-only and tokenless runner dispatch retains the hold',
+  title: 'owed red-team planning stays read-only, runner dispatch holds, and manual review overrides',
   card: '6273; PR #5461 head 3373a33, review finding on PR #5510',
   fixedBy: { sha: 'working-tree', where: 'lane/redteam-comment-retry', paths: [
     'scripts/conveyor/review-referral-hold.mjs', 'scripts/operations/review-job.mjs',
     'scripts/operations/review-dispatch.mjs', 'skills-src/conveyor/review-daemon.mjs',
     'scripts/conveyor/reconcile-core.mjs', 'scripts/operations/review-extra-seats.mjs',
+    'skills-src/conveyor/runner.mjs',
   ] },
   fixPresent(root) {
     return readFileSync(join(root, 'scripts/conveyor/review-referral-hold.mjs'), 'utf8')
@@ -144,6 +155,7 @@ export default {
         ...(result.spentBySkipped ? ['CI refusal spent the release'] : []),
         ...(result.cliFullReviews || result.cliSkips.length !== 6 || result.cliSkips.some(s => s !== 'same-head-hold')
           ? ['tokenless runner CLI dispatched a full review or failed to retain the hold'] : []),
+        ...(result.manualReviews !== 2 || result.spentByCli ? ['manual CLI override refused or CLI spent the automatic allowance'] : []),
         ...(result.scheduled !== 1 || !result.accepted ? ['accepted PR was not scheduled with acceptance preserved'] : []),
         ...(result.spawned !== 1 ? ['expected exactly one review dispatch'] : []),
         ...(!result.posted || result.modelCalls ? ['saved result did not post without a model call'] : []),

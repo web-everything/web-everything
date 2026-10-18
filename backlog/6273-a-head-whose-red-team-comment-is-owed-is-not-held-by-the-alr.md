@@ -5,7 +5,7 @@ size: 3
 status: active
 scaffoldedBy: "redteam-comment-retry"
 dateScaffolded: "2026-10-17"
-scope: ["we:scripts/conveyor/review-referral-hold.mjs", "we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/__tests__/review-referral-hold-owed.test.mjs", "we:scripts/operations/review-job.mjs", "we:scripts/operations/review-dispatch.mjs", "we:skills-src/conveyor/review-daemon.mjs", "we:scripts/conveyor/soak/breaks/owed-red-team-release-consumed-by-planner.mjs", "we:scripts/conveyor/soak/breaks/owed-red-team-release-consumed-by-planner.soak.test.mjs"]
+scope: ["we:scripts/conveyor/review-referral-hold.mjs", "we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/__tests__/review-referral-hold-owed.test.mjs", "we:scripts/lib/red-team-evidence.mjs", "we:scripts/operations/review-extra-seats.mjs", "we:scripts/operations/review-job.mjs", "we:scripts/operations/review-dispatch.mjs", "we:scripts/operations/__tests__/review-dispatch.test.mjs", "we:skills-src/conveyor/review-daemon.mjs", "we:skills-src/conveyor/runner.mjs", "we:scripts/conveyor/soak/breaks/owed-red-team-release-consumed-by-planner.mjs", "we:scripts/conveyor/soak/breaks/owed-red-team-release-consumed-by-planner.soak.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
@@ -27,7 +27,7 @@ When a post-accept red-team result is saved but its PR comment is missing, the r
 - [A9] **Executable** — `carries the owed-comment exception through the real reconcile planner` in `we:scripts/conveyor/__tests__/review-referral-hold-owed.test.mjs` covers pending and accepted labels, with and without an acceptance marker, and missing fast CI checks. `does not dispatch an accepted PR with an unavailable owed-comment exception` covers absent/spent evidence, posted comments, mismatched identity, holds and drafts. Acceptance remains on the planned row.
 - [A10] **Executable** — the card-only variant of `reposts saved red-team evidence after hold release without invoking the model` and `defers saved card-only effects until acceptance during speculation` in `we:scripts/conveyor/__tests__/review-referral-hold-owed.test.mjs` cover restoring the card-only skip after evidence was saved. Saved effects resume before new-probe skip policy; speculative effects still wait for acceptance.
 - [A11] **Executable** — `dispatches saved-result completion without running a review panel` and `refuses saved-result completion without a fresh model fallback` in `we:scripts/conveyor/__tests__/review-referral-hold-owed.test.mjs` pin job/session dispatch to deterministic replay, with no lane, jury, extra seats or verdict write. Missing/foreign evidence and moved/closed/draft/unreadable live heads refuse. `keeps the allowance unspent while %s is disabled` pins both red-team kill switches.
-- [A12] **Executable** — `the runner refuses tokenless owed-head CLI reviews on every tick` exercises the runner's real review loop in job and session modes against an accepted owed head. Both CLI branches must use `dispatchCliReview`; repeated ticks spawn no full review and leave the allowance for the token-aware daemon. A7 also replays this consumer. `the plain CLI refuses unreadable or mismatched spawn authorization` and `the plain CLI preserves ordinary new-head reviews and explicit trusted re-arms` cover read failures, CI-head movement, and trusted versus untrusted wake events.
+- [A12] **Executable** — `the runner refuses tokenless owed-head CLI reviews on every tick` exercises the runner's real review loop in job and session modes against an accepted owed head. The runner supplies `--automated`; both CLI branches pass that marker to `dispatchCliReview`, retaining ordinary holds and leaving the allowance for the token-aware daemon. `plain review-dispatch --pr preserves the operator override at the same-head limit` pins the unmarked manual invocation in both modes. A7 replays both consumers. `the automated CLI refuses unreadable or mismatched spawn authorization` and `the automated CLI preserves ordinary new-head reviews and explicit trusted re-arms` cover read failures, CI-head movement, and trusted versus untrusted wake events. `manual CLI override still respects CI refusal` pins the independent CI gate in both modes.
 - [A13] **Executable** — `rejects owed-red-team dispatch identity independently of the claim guard` stubs the claim permissive and pins `owed-red-team-identity` for repo, PR, head, malformed head and CI-head mismatches with zero spawns. `retains the hold when capped-thread expansion reveals the posted marker` puts the trusted marker after comment 100 and requires enrichment and claiming both to refuse without reserving.
 
 This is a local dispatcher receipt, with no HTTP receive endpoint or state-reset endpoint. Existing PR/comment and scorecard readers provide the inputs. The one-shot reservation bounds automatic dispatch attempts.
@@ -35,6 +35,11 @@ This is a local dispatcher receipt, with no HTTP receive endpoint or state-reset
 ## Non-goals
 
 - [N1] Does not change the drain red-team hold, or run any new model call.
+- [N2] The in-job post retry and reason logging remain separate, unimplemented follow-up work on #6274. Changes to the extra-seat and job modules here only complete saved evidence without running a new panel.
+
+## Scope boundary
+
+The net diff was reduced from the earlier 92-file list to this saved-result repair and its tests. The original two-file scope is not sufficient for the operator's other required repairs: accepted-head scheduling needs `we:scripts/conveyor/reconcile-core.mjs`, saved card-only replay needs `we:scripts/operations/review-extra-seats.mjs`, and distinguishing runner calls from manual overrides needs `we:skills-src/conveyor/runner.mjs`. The evidence-reader extraction avoids the cold-start import cycle; the job and daemon wiring reserve once at dispatch and complete saved effects without a model. All retained implementation and test paths are declared above. This documents the necessary scope exception; it does not claim the literal two-file send-back is fulfilled.
 
 ## Edge cases this change must handle
 
@@ -47,7 +52,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — filter evidence by repository and compare PR/head; hash repository, numeric PR and exact head into the receipt directory. CI must still name that head before dispatch.
 6. **State over time** — repeated planning never spends an attempt. A reservation survives process restart, while another head has a separate allowance.
 7. **Who wrote it** — trusted PR comment authorship uses the existing marker-authorship reader; only token-bearing review dispatches claim local state. Ledger/no-option decisions never consult the exception; independently authorized ledger reviews receive no claim callback.
-8. **Tokenless consumers** — the runner's plain review-dispatch CLI cannot resume an owed effect. Both CLI modes re-read PR identity, comments and run evidence immediately before spawning and apply ordinary referral/same-head holds without the owed-comment exception. Unreadable inputs refuse; a token-aware daemon still owns completion.
+8. **Tokenless consumers** — the runner's `--automated` review-dispatch CLI cannot resume an owed effect. Both automated CLI modes re-read PR identity, comments and run evidence immediately before spawning and apply ordinary referral/same-head holds without the owed-comment exception. Unreadable inputs refuse; a token-aware daemon still owns completion. An unmarked CLI invocation remains the operator's explicit same-head override and keeps the dispatcher's independent CI, stack and live-job checks. The marker selects scheduling policy; it is not an authentication boundary.
 
 ## Review prevention coverage
 

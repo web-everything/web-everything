@@ -394,7 +394,7 @@ export function makeCliMechanicalPasses({
               const ciHeals = (plan.dispatch ?? []).filter((d) => d?.kind === 'ci-heal');
               const unsupported = [];
               for (const d of reviews) {
-                const dispatched = run('operations/review-dispatch.mjs', [`--pr=${d.prNumber}`], key, slug);
+                const dispatched = run('operations/review-dispatch.mjs', [`--pr=${d.prNumber}`, '--automated'], key, slug);
                 if (!dispatched.ok) {
                   const why = String(dispatched.error.stderr || dispatched.error.message || dispatched.error).trim().replace(/\s+/g, ' ');
                   if (key !== 'we' && why.includes('unsupported-repo')) {

@@ -77,6 +77,17 @@ describe('same-head hold when the post-accept red-team comment is owed', () => {
     expect(mode === 'job' ? spawnJob : spawnAgent).toHaveBeenCalledTimes(1);
     expect(existsSync(opts.redTeam.stateDir)).toBe(false);
   });
+  it.each(['job', 'session'])('manual CLI override still respects CI refusal (%s)', mode => {
+    const spawnJob = vi.fn(), spawnAgent = vi.fn();
+    const out = reviewDispatchCli.dispatchCliReview(dispatch, {
+      mode, repo, pr: number, spawnJob, spawnAgent,
+      ciGate: () => ({ allowed: false, headSha: head, reason: 'ci-red' }),
+    });
+    expect(out.skipped).toBe('review-ci: ci-red');
+    expect(spawnJob).not.toHaveBeenCalled();
+    expect(spawnAgent).not.toHaveBeenCalled();
+    expect(existsSync(opts.redTeam.stateDir)).toBe(false);
+  });
   it.each(['job', 'session'])('the runner refuses tokenless owed-head CLI reviews on every tick (%s)', async mode => {
     const [p] = enrichPrsWithReferralHolds([pr({ labels: [{ name: 'review:accepted' }],
       headRefName: 'lane/redteam-comment-retry', state: 'OPEN', isDraft: false, mergeStateStatus: 'CLEAN',
@@ -93,9 +104,9 @@ describe('same-head hold when the post-accept red-team comment is owed', () => {
         if (argv[0].endsWith('/reconcile-pass.mjs')) return JSON.stringify(plan);
         if (argv[0].endsWith('/review-dispatch.mjs')) {
           // Consume exactly the runner's CLI arguments: it forwards neither token nor callback.
-          expect(argv).toEqual(['/daemon/scripts/operations/review-dispatch.mjs', `--pr=${number}`, `--repo=${repo}`]);
+          expect(argv).toEqual(['/daemon/scripts/operations/review-dispatch.mjs', `--pr=${number}`, '--automated', `--repo=${repo}`]);
           const result = reviewDispatchCli.dispatchCliReview(dispatch, {
-            mode, repo: argv[2].slice(7), pr: argv[1].slice(5),
+            mode, repo: argv[3].slice(7), pr: argv[1].slice(5), automated: argv.includes('--automated'),
             spawnJob, spawnAgent, wrapReview: false, readBrief: () => 'Review {{PR}}',
             mintSessionId: () => 'runner-owed', ensureSessionCwd: p => p,
             sessionCwdFor: () => join(dir, 'session'), isolateSession: () => ({ worktreeSettings: {} }),
@@ -113,9 +124,12 @@ describe('same-head hold when the post-accept red-team comment is owed', () => {
     const cli = source.slice(source.indexOf('if (IS_CLI)'));
     expect(cli).toContain('dispatchCliReview(dispatchReviewJob,');
     expect(cli).toContain('dispatchCliReview(dispatchReview,');
+    expect(cli).toContain("const automated = argv.includes('--automated');");
+    expect(cli).toMatch(/dispatchCliReview\(dispatchReviewJob, \{[^}]*\bautomated\b/);
+    expect(cli).toMatch(/dispatchCliReview\(dispatchReview, \{[^}]*\bautomated\b/);
   });
   it.each(['read-pr', 'read-runs', 'wrong-pr', 'wrong-head', 'missing-labels', 'missing-comments'])
-  ('the plain CLI refuses unreadable or mismatched spawn authorization (%s)', variant => {
+  ('the automated CLI refuses unreadable or mismatched spawn authorization (%s)', variant => {
     const snapshot = pr();
     if (variant === 'wrong-pr') snapshot.number++;
     if (variant === 'wrong-head') snapshot.headRefOid = 'b'.repeat(40);
@@ -126,7 +140,7 @@ describe('same-head hold when the post-accept red-team comment is owed', () => {
       readRuns: () => { if (variant === 'read-runs') throw new Error('unreadable runs'); return []; },
     })).toBe(false);
   });
-  it('the plain CLI preserves ordinary new-head reviews and explicit trusted re-arms', () => {
+  it('the automated CLI preserves ordinary new-head reviews and explicit trusted re-arms', () => {
     const authorize = (p, runs) => reviewDispatchCli.claimCliReviewDispatch({ headSha: head }, {
       repo, pr: number, readPr: () => p, readRuns: () => runs, now: 10,
     });

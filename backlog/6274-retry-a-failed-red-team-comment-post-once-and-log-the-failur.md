@@ -2,9 +2,7 @@
 bornAs: xat490j
 kind: story
 size: 2
-status: active
-scaffoldedBy: "redteam-comment-retry"
-dateScaffolded: "2026-10-17"
+status: open
 scope: ["we:scripts/operations/review-extra-seats.mjs", "we:scripts/operations/review-job.mjs", "we:scripts/operations/__tests__/review-red-team.test.mjs", "we:scripts/operations/__tests__/review-job-red-team.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
@@ -13,6 +11,8 @@ tags: []
 # Retry a failed red-team comment post once and log the failure reason
 
 Follow-up, after #5482 and #5465 land: retry a failed red-team comment post once with a short backoff, and include comment.reason (first line, no secrets) in summarizeRedTeam and the job log line.
+
+This card is separate, unimplemented work. PR #5510 delivers #6273's saved-result completion only; edits there to the shared job and extra-seat modules do not implement this retry or its reason logging.
 
 ## Acceptance
 
