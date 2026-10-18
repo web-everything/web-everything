@@ -67,6 +67,17 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     expect(dead).toMatchObject({ scheduled: true, inFlight: false });
     expect(dead.queued).toBeUndefined();
   });
+  // PR #5482 self-review: the review job and the drain resolve WE_RED_TEAM_SKIP_CARD_ONLY in separate processes.
+  it('carries the writer\'s card-only skip decision to the drain, whatever the drain process resolves', () => {
+    const f = fixture();
+    const cardOnly = { ...payload(f.head), findings: { read: { netBasis: { rev: f.head }, netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] } } };
+    const live = { ...f, isAlive: () => true, readPidStart: () => 'start' };
+    recordRedTeamStatus({ ...f, loopPayload: cardOnly, status: 'queued' }, { ...f, env: { ...f.env, WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, readPidStart: () => 'start' });
+    expect(readDrainRedTeamEvidence(live).skipCardOnly).toBe(false);
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(live), comments: [] })).toMatch(/no recorded result/);
+    recordRedTeamStatus({ ...f, loopPayload: cardOnly, status: 'queued' }, { ...f, env: { ...f.env, WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, readPidStart: () => 'start' });
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(live), env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, comments: [] })).toBeNull();
+  });
   it('does not mistake a reused pid for the original red-team process', () => {
     const f = fixture();
     recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running' }, { ...f, readPidStart: () => 'original-start' });

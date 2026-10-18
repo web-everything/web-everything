@@ -54,10 +54,11 @@ describe('clear-human CLI hold ceremony', () => {
     vi.stubEnv('WE_VERDICT_LEDGER_BOARD', '');
   });
   afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); rmSync(dir, { recursive: true, force: true }); });
-  function run(hold, currentLabels = labels, comments = []) {
+  function run(hold, currentLabels = labels, comments = [], thread = comments) {
     const provider = {
       currentRepo: () => 'o/n', name: 'stub',
       readPrState: () => ({ state: 'OPEN', headRefOid: head, headRefName: 'lane/x', baseRefName: 'release', labels: currentLabels, comments, body: '' }),
+      readComments: () => thread,
       readLabels: () => currentLabels, setLabels: vi.fn(), postComment: vi.fn(),
     };
     const readHumanOnlyHold = vi.fn(() => hold);
@@ -96,8 +97,15 @@ describe('clear-human CLI hold ceremony', () => {
       expect(redTeamRulingNeeded(pr([result, capped, ruling]))).toBeNull();
       expect(readRedTeamDisposition({ comments: [result, capped, ruling], pr: 7, head, setting: CONFIRMED_BREAKS_DEFAULTS }).held).toEqual([]);
     });
-    it('still refuses with no held break, or while the fixer owns it under review:changes', () => {
-      for (const [prLabels, comments] of [[labels, [result]], [labels, [result, { ...capped, author: { login: 'mallory' } }]], [['review:changes'], [result, capped]]]) {
+    it('reads the complete thread when the first page is full (a round-capped thread is long)', () => {
+      const page = Array.from({ length: 100 }, (_, i) => ({ ...bot, body: `round ${i}` }));
+      const r = run(false, labels, page, [...page, result, capped]);
+      expect(r.exitCode).toBe(0);
+      expect(r.provider.postComment).toHaveBeenCalled();
+    });
+    it('still refuses with no held break, under review:changes, or where no acceptance exists to keep', () => {
+      for (const [prLabels, comments] of [[labels, [result]], [labels, [result, { ...capped, author: { login: 'mallory' } }]], [['review:changes'], [result, capped]],
+        [['review:pending'], [result, capped]], [[], [result, capped]]]) {
         vi.restoreAllMocks();
         const r = run(false, prLabels, comments);
         expect(r.exitCode).toBe(1);

@@ -1397,11 +1397,16 @@ export function runReviewLabelCli({
   const humanOnlyHold = to === 'clear-human' && !hasReviewLabel(currentLabels, REVIEW_LABELS.human)
     && !hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical)
     && readHumanOnlyHold({ headSha, baseRefName, comments: prComments }) === true;
-  // PR #5482: RULING NEEDED advertises this ceremony as the not-real ruling on a red-team break held at the round cap,
-  // on any PR the fixer does not own (an accepted one included). The ceremony's comment is that ruling.
-  const redTeamRulingHold = to === 'clear-human' && !hasReviewLabel(currentLabels, REVIEW_LABELS.human)
-    && !hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical)
-    && redTeamRulingNeeded({ number: Number(pr), headRefOid: headSha, labels: currentLabels, comments: prComments }, readConfirmedBreaks().value) !== null;
+  // PR #5482: RULING NEEDED advertises this ceremony as the not-real ruling on a red-team break held at the round cap.
+  // On an accepted PR the ceremony's comment is that ruling. It never manufactures an acceptance: a PR without
+  // `review:accepted` still owes its review first. A round-capped thread is long, so read all of it when the page is full.
+  const fullThread = () => {
+    if (prComments.length < PR_COMMENTS_PAGE_SIZE) return prComments;
+    try { return provider.readComments(repo, pr); } catch (e) { return fail(ghErr(e, 'complete comment thread unreadable'), 1); }
+  };
+  const redTeamRulingHold = to === 'clear-human' && hasReviewLabel(currentLabels, REVIEW_LABELS.accepted)
+    && !hasReviewLabel(currentLabels, REVIEW_LABELS.human) && !hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical)
+    && redTeamRulingNeeded({ number: Number(pr), headRefOid: headSha, labels: currentLabels, comments: fullThread() }, readConfirmedBreaks().value) !== null;
   let decision = decideSetLabel({
     to,
     currentLabels,

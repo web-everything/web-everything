@@ -7,6 +7,7 @@ import { listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operation
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { redTeamEnabled, redTeamOwedFor } from './review-red-team-policy.mjs';
+import { readRedTeamProbes } from './red-team-gate.mjs';
 
 export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDir(env)), 'red-team-status');
 const statusPath = ({ repo, pr, head }, env) => join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
@@ -17,7 +18,9 @@ export function recordRedTeamStatus({ repo, pr, loopPayload, status, result = nu
   if (!/^[a-f0-9]{40}$/i.test(head ?? '')) return;
   const path = statusPath({ repo, pr, head }, env);
   mkdirSync(dirname(path), { recursive: true });
-  writeJsonAtomic(path, { repo, pr, head, loopPayload, status, result, pid: process.pid, host, pidNamespace: namespace, pidStart: readPidStart(process.pid) });
+  // The writer's own card-only skip decision: the drain may resolve a different setting in its own process.
+  writeJsonAtomic(path, { repo, pr, head, loopPayload, status, result, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly,
+    pid: process.pid, host, pidNamespace: namespace, pidStart: readPidStart(process.pid) });
 }
 
 /** Absence of a review payload is not an accept. Labels alone never schedule a post-accept pass. */
@@ -63,7 +66,8 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
         live = !start || !status.pidStart || start === status.pidStart;
       }
     }
-    return { loopPayload: status.loopPayload, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error'].includes(status.result), recorded: recorded || status.result === 'ran' };
+    return { loopPayload: status.loopPayload, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
+      ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error'].includes(status.result), recorded: recorded || status.result === 'ran' };
   }
   const loopPayload = latestRun().run;
   return { loopPayload, inFlight: false, scheduled: recorded || owes(loopPayload), recorded };
