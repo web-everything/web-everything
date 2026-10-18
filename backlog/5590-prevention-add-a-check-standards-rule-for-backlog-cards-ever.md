@@ -47,5 +47,5 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Also raised by
 
-- Also raised by web-everything/web-everything#5525 (finding 2: `we:backlog/xyzpgol-overlap-yield-known-holds.md:43` — Card-lint gate: each Edge case item must map to an Acceptance ID.)
+- Also raised by web-everything/web-everything#5525 (finding 2: `we:backlog/6240-overlap-yield-known-holds.md:43` — Card-lint gate: each Edge case item must map to an Acceptance ID.)
 - Also raised by web-everything/web-everything#5531 (finding 2: `we:backlog/5749-drain-remove-the-unlocked-fallback-on-the-numbering-and-land.md:35` — Same card-lint rule as above: any Acceptance reference to a test must use a named [A<n>] case that appears in the Test plan.)

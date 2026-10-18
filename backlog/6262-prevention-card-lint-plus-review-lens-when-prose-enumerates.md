@@ -1,4 +1,5 @@
 ---
+bornAs: xmokcam
 kind: story
 size: 3
 parent: "4075"
@@ -11,9 +12,9 @@ tags: []
 # Prevention — Card-lint plus review lens: when prose enumerates cases, require a table-driven test naming each… (from web-everything/web-everything#5525 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/xyzpgol-overlap-yield-known-holds.md:13` — Card-lint plus review lens: when prose enumerates cases, require a table-driven test naming each case.
-2. `we:backlog/xyzpgol-overlap-yield-known-holds.md:26` — Card-lint: any card line that permits a schema or ledger change must have an Acceptance test for the old-record case.
-3. `we:backlog/xyzpgol-overlap-yield-known-holds.md:28` — Doc note: live-proof Acceptance items must state a replay or fixture fallback when the live condition may expire.
+1. `we:backlog/6240-overlap-yield-known-holds.md:13` — Card-lint plus review lens: when prose enumerates cases, require a table-driven test naming each case.
+2. `we:backlog/6240-overlap-yield-known-holds.md:26` — Card-lint: any card line that permits a schema or ledger change must have an Acceptance test for the old-record case.
+3. `we:backlog/6240-overlap-yield-known-holds.md:28` — Doc note: live-proof Acceptance items must state a replay or fixture fallback when the live condition may expire.
 
 Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 1 → #6023, finding 2 → #5590.
 
