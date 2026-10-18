@@ -40,3 +40,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5550 (finding 4: `we:scripts/conveyor/pr-label-mirror.mjs` — Add a deterministic regression test supplying an initially unreadable derived row and asserting that apply reports failure and the CLI exits non-zero.)
