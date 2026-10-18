@@ -41,3 +41,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5554 (finding 1: `we:backlog/x9hf8a0-prevention-a-card-lint-requirement-that-a-card-widening-a-pe.md:17` — Add a check:standards rule: when a backlog card says 'Already tracked on open cards … → #N ', the referenced card must contain a line with this card's idempotency-key PR number. Failing that, make the filer assert every dedupe target was appended before it writes the claim.) · key `approval-prevention-key:web-everything/web-everything#5554@d7de7d43dc0c655eb959c9c1899e5580474ab062`
