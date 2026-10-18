@@ -90,6 +90,8 @@ export { PR_VIEW_FIELDS, prViewFileName };
 
 /** The PR head moved while a referral pass was mid-run — a routine push race, never a reason to park for a human. */
 class HeadChangedError extends Error {}
+// A read that failed after durable writes: the idempotent effect is retried, never parked for a human.
+class RetryableReferralError extends Error {}
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 /** The repo root, resolved by SCRIPT LOCATION and never by cwd — same reason `run-store.mjs` does it. */
@@ -971,9 +973,9 @@ export function createReviewPrSinks({
     await assertHead();
   };
   // Both publication steps must derive authority from a complete, pinned thread.
-  const readReferralState = (repo, pr, head) => {
+  const readReferralState = (repo, pr, head, { pinned = true } = {}) => {
     const state = labelProvider.readPrState(repo, pr);
-    if (state.headRefOid !== head) throw new HeadChangedError('mandatory referral: reviewed head changed; hold retained');
+    if (pinned && state.headRefOid !== head) throw new HeadChangedError('mandatory referral: reviewed head changed; hold retained');
     if (state.comments?.length >= PR_COMMENTS_PAGE_SIZE) {
       if (!labelProvider.readComments) throw new Error('mandatory referral: complete comments unavailable; hold retained');
       state.comments = labelProvider.readComments(repo, pr);
@@ -1052,12 +1054,16 @@ export function createReviewPrSinks({
         if (prior.malformed) { park(state); return mandatoryReferralState(state.comments, context(state)); }
         // Retire only persisted findings, before merging this run's fresh referrals. Keep the source bytes
         // and a durable reason so every acceptance reader sees the same decision, including after a restart.
+        const priorOperatorRulings = readOperatorRulings(state.comments, context(state)).rulings;
         for (let i = 0; i < prior.records.length; i++) {
           const record = prior.records[i];
           if (record.repo !== read.repo || record.pr !== read.pr) continue;
-          // Never retire a finding that already has a ruling: it would silently clear a standing `block`.
+          // Never retire a finding that already has a ruling (the reviewer's or the operator's): it would silently
+          // clear a standing `block`.
           const dropped = activeReferrals(record).filter(f => referralSeatDisabled(f.seat, env)
-            && !record.rulings.some(r => r.key === f.key))
+            && !record.rulings.some(r => r.key === f.key)
+            && !priorOperatorRulings.some(o => o.repo === record.repo && o.pr === record.pr
+              && o.head === record.head && o.runId === record.runId && o.key === f.key))
             .map(f => ({ key: f.key, reason: REFERRAL_DROP_REASON }));
           if (!dropped.length) continue;
           const updated = { ...record, dropped: [...(record.dropped ?? []), ...dropped] };
@@ -1398,15 +1404,20 @@ export function createReviewPrSinks({
         // trusted, read-back thread actually counts (independence, supersession and readable cards
         // included). Reconcile historical completed records too: a crash after posting or a missed
         // ledger append must recover without spending another mandatory-review attempt.
-        const ledgerRulings = (state, settled) => {
+        // Every row is for the reviewed head, even when a push lands during the sync: its records stay authoritative.
+        const reviewed = read.netBasis.rev;
+        const ledgerRulings = (live, settled) => {
           const ruled = new Map(), retired = new Map();
           const rulingRow = (record, key, ruling, channel, id) => ({ ...buildLedgerEvent({ type: EVENT_TYPES.RULING,
             repo: read.repo, pr: read.pr, at: new Date().toISOString(), source: 'review-pr', session: record.reviewer.id,
             channel, findingKey: ledgerFindingKey(key), ruling }), id });
           for (const record of settled.records) {
-            if (record.repo !== read.repo || record.pr !== read.pr || record.head !== state.headRefOid) continue;
-            const effective = referralRecordState(record, { ...context(state), records: settled.records,
+            if (record.repo !== read.repo || record.pr !== read.pr || record.head !== reviewed) continue;
+            const effective = referralRecordState(record, { ...context(live), head: reviewed, records: settled.records,
               operatorRulings: settled.operatorRulings });
+            // Operator rulings are part of the identity: re-ruling a finding back to an earlier word is a new row.
+            const operatorOn = key => (settled.operatorRulings ?? []).filter(o => o.repo === record.repo && o.pr === record.pr
+              && o.head === record.head && o.runId === record.runId && o.key === key);
             const active = activeReferrals(record);
             for (const f of active) {
               const blocked = settled.blocked.includes(f.key);
@@ -1419,13 +1430,15 @@ export function createReviewPrSinks({
               // Stable identity belongs to the counted ruling, never to wall time or the retrying run.
               ruled.set(f.key, rulingRow(record, f.key, ruling, 'mandatory-referral', `mandatory-ruling:${createHash('sha256').update(JSON.stringify([
                 record.repo, record.pr, record.head, record.runId, f.key, ruling,
-                effective.rulings, record.carried, record.superseded,
+                effective.rulings, record.carried, record.superseded, operatorOn(f.key),
               ])).digest('hex')}`));
             }
             // A retired finding no longer counts in the thread, so close its ledger referral too. The retirement
-            // channel keeps it reopenable: the same finding referred again must ask for a ruling again.
+            // channel keeps it reopenable: the same finding referred again must ask for a ruling again. A finding
+            // anyone ruled on is never retired here, so a standing operator word is never replaced.
             for (const f of record.referrals) {
-              if (active.some(a => a.key === f.key) || settled.blocked.includes(f.key) || settled.pending.includes(f.key)) continue;
+              if (active.some(a => a.key === f.key) || settled.blocked.includes(f.key) || settled.pending.includes(f.key)
+                || operatorOn(f.key).length) continue;
               retired.set(f.key, rulingRow(record, f.key, 'not-real', REFERRAL_RETIRED_CHANNEL, `mandatory-retire:${createHash('sha256')
                 .update(JSON.stringify([record.repo, record.pr, record.head, record.runId, f.key])).digest('hex')}`));
             }
@@ -1435,27 +1448,33 @@ export function createReviewPrSinks({
         };
         // An operator ruling can land during these appends. Its holding row follows its readable comment, so a
         // re-read after the last append sees any ruling a stale row overtook; append the corrected row and settle.
-        const written = new Set();
-        let settled = result;
+        // A correction is identified by the row it follows, so the ledger's id dedup cannot swallow it.
+        const writtenFor = new Map();
+        let live = state, settled = result;
         for (let pass = 0; ; pass++) {
-          const due = [...ledgerRulings(state, settled).values()].filter(row => !written.has(row.id));
+          const due = [...ledgerRulings(live, settled)].filter(([key, row]) => writtenFor.get(key) !== row.id);
           if (!due.length) break;
           if (pass === MANDATORY_LEDGER_SYNC_PASSES) throw new Error('mandatory ruling ledger sync did not settle: rulings kept changing during the sync');
-          for (const row of due) {
-            const appended = await appendLedgerRow(row);
+          for (const [key, row] of due) {
+            const previous = writtenFor.get(key);
+            const appended = await appendLedgerRow(previous === undefined ? row
+              : { ...row, id: `${row.id}:after:${createHash('sha256').update(previous).digest('hex').slice(0, 16)}` });
             if (!appended?.ok || appended.ledgerWriteMiss) {
               throw new Error(`mandatory ruling ledger-write-miss: ${(appended?.errors ?? []).join('; ') || 'append refused'}`);
             }
-            written.add(row.id);
+            writtenFor.set(key, row.id);
           }
-          state = fresh();
-          settled = mandatoryReferralState(state.comments, context(state));
+          // Unpinned: a push during the sync must not leave a stale row last on the reviewed head. An unreadable
+          // thread is retried (the effect is idempotent), never parked: the appends above already landed.
+          try { live = readReferralState(read.repo, read.pr, reviewed, { pinned: false }); }
+          catch (readError) { throw new RetryableReferralError(`mandatory ruling ledger sync could not re-read the thread: ${readError.message}`); }
+          settled = mandatoryReferralState(live.comments, { ...context(live), head: reviewed });
         }
         return result;
       } catch (error) {
         // A push that lands mid-run is a routine race, not a persistence refusal: rethrow so the hold the earlier
         // pass left stays as-is and the effect is retried against the new head, never parked for a human.
-        if (error instanceof HeadChangedError) throw error;
+        if (error instanceof HeadChangedError || error instanceof RetryableReferralError) throw error;
         // A persistence refusal is terminal for automation, including a failed failure snapshot.
         // Re-read labels without the head guard so the park lands on the PR's live labels.
         let live = state;

@@ -1398,32 +1398,102 @@ describe('#4315 durable referral effects', () => {
   });
 
   it('an operator block recorded while the ledger sync appends never ends under a stale clearance', async () => {
+    // The operator path posts a block, confirms it readable, then records its ledger row, all during our first append.
+    const { h, old, stateOf } = raceHarness();
+    await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(mandatoryReferralState(h.state.comments, { repo: 'o/r', pr: 7, head: h.state.headRefOid }).blocked)
+      .toEqual([old.referrals[1].key]);
+    expect(stateOf(old.referrals[0].key)).toBe('ruled');
+    expect(stateOf(old.referrals[1].key)).toBe('blocking');
+  });
+
+  function raceHarness({ during = () => {} } = {}) {
     let raced = false;
+    const ctx = {};
     const h = harness({ failure: 'judge', appendLedgerRow: row => {
       if (!h.ledger.some(r => r.id === row.id)) h.ledger.push(row);
       if (row.type === 'ruling' && !raced) {
         raced = true;
-        // The operator path posts a block, confirms it readable, then records its ledger row.
         h.state.comments.push({ author: { login: 'chalbert' }, body: buildOperatorRulingComment({
-          version: 1, repo: 'o/r', pr: 7, head: h.state.headRefOid, actor: 'chalbert', channel: 'test',
+          version: 1, repo: 'o/r', pr: 7, head: ctx.old.head, actor: 'chalbert', channel: 'test',
           reason: 'still broken', at: '2026-10-04T12:00:00Z', clearerId: '',
-          rulings: [{ runId: old.runId, key: old.referrals[1].key, result: 'block', supersedes: ['r2'] }] }) });
+          rulings: [{ runId: ctx.old.runId, key: ctx.old.referrals[1].key, result: 'block', supersedes: ['r2'] }] }) });
         h.ledger.push(buildLedgerEvent({ type: 'ruling', repo: 'o/r', pr: 7, at: '2026-10-04T12:00:01Z',
-          source: 'record-referral-ruling', findingKey: ledgerFindingKey(old.referrals[1].key), ruling: 'block' }));
+          source: 'record-referral-ruling', findingKey: ledgerFindingKey(ctx.old.referrals[1].key), ruling: 'block' }));
+        during(h);
       }
       return { ok: true };
     } });
-    const old = seedReferrals(h, ['judgeCorrectnessAdvisory', 'judgeCorrectnessAdvisory'], h.state.headRefOid, r => r.referrals.map((f, i) => ({
+    ctx.old = seedReferrals(h, ['judgeCorrectnessAdvisory', 'judgeCorrectnessAdvisory'], h.state.headRefOid, r => r.referrals.map((f, i) => ({
       id: `r${i + 1}`, key: f.key, reviewerId: r.reviewer.id, lens: r.reviewer.lens, result: 'not-real',
       rationale: 'Verified against the pinned diff', evidence: ['diff:x'] })));
+    const stateOf = key => deriveReferrals([buildLedgerEvent({ type: 'referral', repo: 'o/r', pr: 7, at: '2026-10-04T12:00:02Z',
+      source: 'review-pr', headSha: ctx.old.head, findingKeys: ctx.old.referrals.map(f => ledgerFindingKey(f.key)) }), ...h.ledger])
+      .get(ledgerFindingKey(key)).state;
+    return { h, old: ctx.old, stateOf };
+  }
+
+  it('a push during the ledger sync still corrects the reviewed head\'s stale clearance', async () => {
+    const { h, old, stateOf } = raceHarness({ during: h => { h.state.headRefOid = 'c'.repeat(40); } });
     await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
-    expect(raced).toBe(true);
-    expect(mandatoryReferralState(h.state.comments, { repo: 'o/r', pr: 7, head: h.state.headRefOid }).blocked)
-      .toEqual([old.referrals[1].key]);
-    const referrals = deriveReferrals([buildLedgerEvent({ type: 'referral', repo: 'o/r', pr: 7, at: '2026-10-04T12:00:02Z',
-      source: 'review-pr', headSha: h.state.headRefOid, findingKeys: old.referrals.map(f => ledgerFindingKey(f.key)) }), ...h.ledger]);
-    expect(referrals.get(ledgerFindingKey(old.referrals[0].key)).state).toBe('ruled');
-    expect(referrals.get(ledgerFindingKey(old.referrals[1].key)).state).toBe('blocking');
+    expect(stateOf(old.referrals[1].key)).toBe('blocking');
+  });
+
+  it('an unreadable thread after the ledger appends is retried, never parked', async () => {
+    const { h, old } = raceHarness({ during: h => { h.provider.readPrState = () => { throw new Error('PR offline'); }; } });
+    await expect(h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX)).rejects.toThrow(/could not re-read the thread: PR offline/);
+    expect(h.state.labels).not.toContain('review:human');
+    expect(h.state.comments.some(c => /parked to review:human/.test(c.body))).toBe(false);
+    expect(old.referrals).toHaveLength(2);
+  });
+
+  it('an operator re-ruling back to an earlier word is recorded again, never deduplicated away', async () => {
+    const h = harness({ failure: 'judge' });
+    const old = seedReferrals(h, ['judgeCorrectnessAdvisory'], h.state.headRefOid, r => [{ id: 'r1', key: r.referrals[0].key,
+      reviewerId: r.reviewer.id, lens: r.reviewer.lens, result: 'not-real', rationale: 'Verified', evidence: ['diff:x'] }]);
+    const key = old.referrals[0].key;
+    const operator = (result, at) => h.state.comments.push({ author: { login: 'chalbert' }, body: buildOperatorRulingComment({
+      version: 1, repo: 'o/r', pr: 7, head: old.head, actor: 'chalbert', channel: 'test', reason: `ruled ${result}`, at, clearerId: '',
+      rulings: [{ runId: old.runId, key, result, supersedes: ['r1'] }] }) });
+    const stateAfter = async () => {
+      await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+      return deriveReferrals([buildLedgerEvent({ type: 'referral', repo: 'o/r', pr: 7, at: '2026-10-04T12:00:00Z',
+        source: 'review-pr', headSha: old.head, findingKeys: [ledgerFindingKey(key)] }), ...h.ledger]).get(ledgerFindingKey(key)).state;
+    };
+    operator('block', '2026-10-04T12:00:00Z');
+    expect(await stateAfter()).toBe('blocking');
+    operator('not-real', '2026-10-04T12:01:00Z');
+    expect(await stateAfter()).toBe('ruled');
+    operator('block', '2026-10-04T12:02:00Z');
+    expect(await stateAfter()).toBe('blocking');
+  });
+
+  it('a disabled seat never retires a finding the operator ruled on, in the thread or the ledger', async () => {
+    const h = harness({ failure: 'judge', env: { REVIEW_PR_ANTIGRAVITY_REVIEW: '0', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' } });
+    const old = seedReferrals(h, ['judgeAntigravityReview'], h.state.headRefOid);
+    const key = old.referrals[0].key;
+    h.state.comments.push({ author: { login: 'chalbert' }, body: buildOperatorRulingComment({
+      version: 1, repo: 'o/r', pr: 7, head: old.head, actor: 'chalbert', channel: 'test', reason: 'real defect',
+      at: '2026-10-04T12:00:00Z', clearerId: '', rulings: [{ runId: old.runId, key, result: 'block' }] }) });
+    await h.make()[REVIEW_EFFECTS.LEDGER_EVENTS]({ repo: 'o/r', pr: 7, headSha: old.head, posted: true,
+      referralKeys: [key], syncMandatoryRulings: true }, { ...CTX, key: 'operator-block-ledger' });
+    const settled = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(settled.records.find(r => r.runId === old.runId).dropped).toBeUndefined();
+    expect(settled.blocked).toEqual([key]);
+    expect(h.ledger.some(r => r.actor?.channel === 'mandatory-referral-retired')).toBe(false);
+    expect(deriveReferrals(h.ledger).get(ledgerFindingKey(key)).state).toBe('blocking');
+  });
+
+  it('a retirement row only closes an unruled key, and only when review-pr wrote it', () => {
+    const base = { repo: 'o/r', pr: 7, at: '2026-10-04T12:00:00Z' };
+    const referral = buildLedgerEvent({ ...base, type: 'referral', source: 'review-pr', headSha: 'a'.repeat(40), findingKeys: ['k'] });
+    const row = (ruling, extra = {}) => buildLedgerEvent({ ...base, type: 'ruling', source: 'review-pr', findingKey: 'k', ruling, ...extra });
+    const retire = (source = 'review-pr') => row('not-real', { source, channel: 'mandatory-referral-retired' });
+    expect(deriveReferrals([referral, retire()]).get('k').state).toBe('retired');
+    expect(deriveReferrals([referral, row('block'), retire()]).get('k').state).toBe('blocking');
+    expect(deriveReferrals([referral, row('not-real'), retire()]).get('k').state).toBe('ruled');
+    expect(deriveReferrals([row('block'), retire(), referral]).get('k').state).toBe('blocking');
+    expect(deriveReferrals([referral, retire('record-referral-ruling'), referral]).get('k').state).toBe('ruled');
   });
 
   it('retiring a disabled seat\'s finding closes its ledger referral, and a later referral reopens it', async () => {
