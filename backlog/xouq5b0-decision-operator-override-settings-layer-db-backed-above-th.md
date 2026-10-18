@@ -1,9 +1,12 @@
 ---
 kind: decision
-status: active
+status: resolved
 scaffoldedBy: "decision-settings-override"
 dateScaffolded: "2026-10-17"
 dateOpened: "2026-10-17"
+dateStarted: "2026-10-17"
+dateResolved: "2026-10-17"
+codifiedIn: "docs/agent/platform-decisions.md#operator-override-settings-layer"
 preparedDate: "2026-10-17"
 preparedAgainstSha: "4f1b2c821c11dcbf05e9d866ac7ea03c9fcca39f"
 relatedReport: reports/2026-10-17-operator-override-settings-layer.md
@@ -11,6 +14,18 @@ tags: [settings, cascade, operator, override, decision-prep]
 ---
 
 # Decision: operator-override settings layer (db-backed), above the code cascade
+
+## Ruling
+
+**Ruled 2026-10-17 by the operator (Nicolas Gilbert), in conversation.** Verbatim: *"Ok"*, to "Settings override: (a), (a), (a)?". The rule is codified at
+[we:docs/agent/platform-decisions.md#operator-override-settings-layer](../docs/agent/platform-decisions.md#operator-override-settings-layer).
+The prepared text below is kept as the lineage; where it differs from this section, this section wins.
+
+- **Fork 1 = (a).** A local-first store at one host-wide path, not inside a lane clone; plateau's DB is deferred.
+- **Fork 2 = (a).** Above env: standard < platform < tool < env < operator-override.
+- **Fork 3 = (a).** A loosening write is refused until the operator confirms, then flagged in needs-you; the floor is also enforced on read.
+
+**Build slices:** see the children of this card (`parent` edges). The settings-edit authority decision `xugqjw1` is cited by id (not yet on main).
 
 Operator, 2026-10-17, verbatim: "we should have the option to use a db for settings instead of in code, at least as override".
 Today every setting lives in a repo file, so a tweak needs a PR, and a file held by an open PR cannot be tweaked at all. This card decides the shape of one new top layer, `operator-override`, backed by a store the operator writes through one command. Three forks follow: where the store lives, where the layer sits in the cascade, and what stops an override from loosening a safety guard.

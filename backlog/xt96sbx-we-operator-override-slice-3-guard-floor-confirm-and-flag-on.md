@@ -1,0 +1,39 @@
+---
+kind: story
+size: 5
+parent: "xouq5b0"
+status: open
+scope: ["we:scripts/lib/operator-override-floor.mjs", "we:scripts/lib/operator-override-store.mjs", "we:scripts/lib/__tests__/operator-override-floor.test.mjs"]
+dateOpened: "2026-10-17"
+tags: []
+---
+
+# we: operator override slice 3 - guard floor confirm-and-flag on write and on read
+
+Build the guard floor of decision xouq5b0 (we:docs/agent/platform-decisions.md#operator-override-settings-layer): a safe-direction table per key (no entry means loosening), a loosening write refused until the operator confirms, and the reader ignoring any loosening entry with no recorded confirmation.
+
+## Acceptance
+
+- [A1] **Executable** — `node --test we:scripts/lib/__tests__/operator-override-floor.test.mjs` fails before the module exists and passes after. Named tests, one per guarantee:
+  - `a loosening write without the confirmation flag is refused with a non-zero exit and nothing is written`
+  - `a confirmed loosening write is logged with its confirmation`
+  - `every key declares its safe direction; a key with no entry counts as loosening`
+  - `the reader ignores a loosening entry that has no recorded confirmation (hand-edited snapshot)`
+  - `the hard-coded confirmed-broken always-block cannot be reached by any override`
+  - `an agent caller cannot pass the confirmation flag`
+
+## Non-goals
+
+- [N1] Does not add the needs-you display (slice 4) and does not change the store format (slice 1).
+
+## Edge cases this change must handle
+
+One line per class: either the handling, or `n/a: <why>`.
+
+1. **Untrusted text** — the key name and value are matched against the table, never evaluated.
+2. **Truncated reads** — a snapshot that cannot be checked against the table is ignored whole.
+3. **Shared state files** — the confirmation is recorded in the append-only log; the snapshot never overrides it.
+4. **Fail closed** — unknown guard direction or unreadable table is treated as loosening.
+5. **Identity scoping** — the confirmation counts only when recorded by the operator-only command authority check.
+6. **State over time** — a confirmation applies to the entry it was recorded with, and an expired entry stops applying.
+7. **Who wrote it** — each confirmation entry carries actor, channel, time and the operator instruction.

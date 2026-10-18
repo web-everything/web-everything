@@ -6274,3 +6274,32 @@ Codex-authored PRs get an Opus judge, same fallback dimension). Declared in `we:
 `we:config/platformDefaults.ts`; the daemon that consumes it is card 4880.
 
 **Lineage:** 4772 (ruled 2026-10-03). Instance of [config-extends-platform-default](#config-extends-platform-default).
+
+### Operator overrides are a local-first store above the code cascade; a loosening write needs the operator's confirmation {#operator-override-settings-layer}
+
+**Ratified 2026-10-17 by the operator (Nicolas Gilbert), in conversation, all three forks at the card's default
+(`#xouq5b0`).** The operator's words: *"we should have the option to use a db for settings instead of in code, at least as
+override"*, then "Ok" to defaults (a), (a), (a). Composes with [config-extends-platform-default](#config-extends-platform-default)
+(the new layer is one more cascade layer, each value with its source logged) and the settings-edit authority decision
+`#xugqjw1` (cited by id).
+
+**The rule:**
+1. **One new top layer, `operator-override`.** Order: standard < platform < tool < env < operator-override (Fork 2 = a).
+   The layer wins over env, so a stale shell variable never beats a recorded operator instruction. Both resolvers read it:
+   `resolveCascade` and `resolveReviewSettings`. Each value taken from it logs `source: operator-db`.
+2. **Local first store at one host-wide path (Fork 1 = a).** The source of truth is a machine-local store at a single
+   host-wide path, never inside a lane clone, so every daemon on the host reads the same answer. Plateau's DB is deferred
+   and may replace the store later behind the same single read interface (`readOperatorOverrides`). The storage format is
+   left to the build card. Daemons read the layer each tick.
+3. **Only the operator writes it.** One operator-only command is the sole writer; the write operation rejects any agent
+   caller. Each write records the operator's verbatim instruction (stored as a quoted string, never executed), actor and
+   channel (from the authority check, not a flag), time, an optional expiry and a reason. The change log is append-only.
+   An expired override is ignored and logged once.
+4. **Guard floor: block until confirmed (Fork 3 = a).** Every key declares its safe direction in a table; a key with no
+   entry counts as loosening. A loosening write without the confirmation flag is refused. A confirmed one is logged and
+   flagged in the needs-you feed. The floor also holds on read: the reader ignores any loosening entry that has no recorded
+   confirmation, so a hand-edited snapshot cannot bypass it. The hard-coded confirmed-broken always-block is outside this
+   layer.
+5. **Fail closed.** An unreadable or unparsable layer is skipped whole and logged, never half-applied.
+
+**Lineage:** `#xouq5b0` (ruled 2026-10-17). Instance of [config-extends-platform-default](#config-extends-platform-default).
