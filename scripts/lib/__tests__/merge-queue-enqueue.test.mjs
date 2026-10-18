@@ -10,9 +10,9 @@ const HEAD = 'a'.repeat(40);
 
 // A fake `gh` + `git`: the PR read (live head), the pinned git diff of HEAD (NUL-separated paths), the mutation.
 // `--no-renames` means a rename arrives as two paths (old + new), so the fakes list both.
-const execFor = ({ files, liveHead = HEAD, mutation = '{}', calls = [], filesError }) => (cmd, args) => {
+const execFor = ({ files, liveHead = HEAD, liveBase = 'main', mutation = '{}', calls = [], filesError }) => (cmd, args) => {
   calls.push([cmd, args]);
-  if (cmd === 'gh' && args[0] === 'pr') return JSON.stringify({ id: 'PR_1', headRefOid: liveHead, baseRefName: 'main' });
+  if (cmd === 'gh' && args[0] === 'pr') return JSON.stringify({ id: 'PR_1', headRefOid: liveHead, baseRefName: liveBase });
   if (cmd === 'git') {
     if (args[0] === 'diff') {
       if (filesError) throw new Error(filesError);
@@ -185,6 +185,37 @@ describe('a PR that touches a workflow file is never enqueued (human-only hold)'
     const { result, mutated } = held(files, { mutation: JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'E' } } } }) });
     expect(result).toMatchObject({ ok: true });
     expect(mutated).toBe(true);
+  });
+
+  // PR #5480 red-team finding: a file list prepared against one base was reused after the PR was retargeted,
+  // so a workflow edit visible only against the new base was enqueued. The list is bound to its base.
+  describe('a prepared file list is reused only against the base it was read against', () => {
+    const ENQUEUED = JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'E' } } } });
+    const run = (preparedSurface, liveBase) => {
+      const calls = [];
+      const result = enqueuePr({ repo: 'o/r', num: 7, headSha: HEAD, cwd: CWD, preparedSurface, exec: execFor({ files: [['README.md', ''], ['.github/workflows/ci.yml', '']], liveBase, mutation: ENQUEUED, calls }) });
+      return { result, calls, mutated: calls.some(([, a]) => a.includes(`query=${ENQUEUE_MUTATION}`)) };
+    };
+
+    it.each([
+      ['retargeted to another branch', { headSha: HEAD, base: 'main', files: ['README.md'] }, 'release'],
+      ['retargeted away and the base differs only by case', { headSha: HEAD, base: 'Release', files: ['README.md'] }, 'release'],
+      ['prepared without a recorded base', { headSha: HEAD, files: ['README.md'] }, 'main'],
+      ['prepared with a non-string base', { headSha: HEAD, base: ['main'], files: ['README.md'] }, 'main'],
+      ['the live base is unreadable', { headSha: HEAD, base: 'main', files: ['README.md'] }, undefined],
+    ])('re-reads the pinned diff and holds the workflow edit when %s', (_name, surface, liveBase) => {
+      const { result, calls, mutated } = run(surface, liveBase);
+      expect(result).toMatchObject({ ok: false, held: true, humanOnly: true, reason: 'workflow-edit', paths: ['.github/workflows/ci.yml'] });
+      expect(calls.some(([c, a]) => c === 'git' && a[0] === 'diff')).toBe(true);
+      expect(mutated).toBe(false);
+    });
+
+    it('reuses the prepared list without a git read when head and base both still match', () => {
+      const { result, calls, mutated } = run({ headSha: HEAD, base: 'release', files: ['README.md'] }, 'release');
+      expect(result).toMatchObject({ ok: true });
+      expect(calls.some(([c]) => c === 'git')).toBe(false);
+      expect(mutated).toBe(true);
+    });
   });
 
   it('a workflow-edit hold is human-only and not retryable', () => {

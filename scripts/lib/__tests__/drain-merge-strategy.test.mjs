@@ -914,6 +914,17 @@ describe('drain pre-stage queue admission', () => {
     expect(calls.filter(call => call.includes('--slurp'))).toHaveLength(2);
     expect(calls.some(call => call[0] === 'git')).toBe(false);
   });
+  // PR #5480 red-team finding: the prepared file list is bound to the base it was read against, so a PR
+  // retargeted between pre-stage and enqueue has its workflow-edit surface re-read against the live base.
+  it('binds the prepared file list to its base and re-reads the diff when the live base differs', () => {
+    const { s, calls } = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], evidence: { loopPayload: null } });
+    const c = { num: 42, repo: null, headRef: 'lane/a', baseRefName: 'release' };
+    const prepared = s.prestage(c, HEAD);
+    expect(prepared).toMatchObject({ allowed: true, preparedSurface: { headSha: HEAD, base: 'release', files: ['scripts/x.mjs'] } });
+    calls.length = 0;
+    expect(s.enqueue(c, HEAD, { prepared, comments: prepared.comments })).toMatchObject({ enqueued: true });
+    expect(calls.some(call => call[0] === 'git' && call[1] === 'diff' && call.some(a => String(a).startsWith('refs/remotes/origin/main...')))).toBe(true);
+  });
   it('keeps held red-team dispositions ineligible', () => {
     const { s } = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'],
       evidence: { loopPayload: { verdict: { verdict: 'accept' } }, inFlight: true } });

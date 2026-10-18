@@ -310,10 +310,12 @@ export function createDrainMergeStrategy({
         if (live.headRefOid !== headSha || !Array.isArray(live.labels)) return { allowed: false, reason: 'live state unreadable' };
         const held = sendBackReason(live.labels);
         if (held) return { allowed: false, reason: held };
-        const pinned = readPinnedChangedFiles({ headSha, base: c.baseRefName || 'main', cwd, exec });
+        const base = c.baseRefName || 'main';
+        const pinned = readPinnedChangedFiles({ headSha, base, cwd, exec });
         const surface = workflowEditHold({ files: pinned.files, expectedCount: pinned.files?.length });
         if (surface.hold) return { allowed: false, reason: surface.reason, humanOnlySurface: surface };
-        const preparedSurface = { headSha, files: pinned.files };
+        // Bound to the base it was read against: enqueuePr re-reads the diff if the live base differs.
+        const preparedSurface = { headSha, base, files: pinned.files };
         const pages = readThreadPages(c.repo, c.num);
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) return { allowed: false, reason: 'red-team comments unreadable' };
         const comments = pages.flat();
