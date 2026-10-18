@@ -38,13 +38,20 @@ export const verdictHead = row => (row?.coverage ? row.coverage.headSha : row?.h
  */
 export function deriveReferrals(events) {
   const keys = new Map();
+  // A public referral can be ruled on while review-pr is parked before its final ledger step.
+  // Retain the latest valid ruling until the FIRST referral supplies the finding's head. Do not
+  // create a referral from a ruling alone, or replay this buffer over later reproduced findings.
+  const earlyRulings = new Map();
   for (const e of events ?? []) {
     if (e.type === EVENT_TYPES.REFERRAL) {
       for (const key of e.findingKeys) {
         // An overruled finding (not-real, card) coming back is not new news (live plateau-app #202); a `block` that
         // comes back, or a fix that did not hold, re-opens the key.
         if (keys.get(key)?.state === 'ruled') continue;
-        keys.set(key, { key, state: 'open', head: e.headSha, ruling: null, resolvedAtHead: null });
+        const early = earlyRulings.get(key);
+        earlyRulings.delete(key);
+        keys.set(key, { key, state: early ? RULING_STATE.get(early) : 'open', head: e.headSha,
+          ruling: early ?? null, resolvedAtHead: null });
       }
     } else if (e.type === EVENT_TYPES.RULING) {
       // Only a ruling that names the key exactly as the referral does (the hashed form) closes it. A legacy ruling row
@@ -53,6 +60,7 @@ export function deriveReferrals(events) {
       // Only the closed set of rulings moves a key; an unknown value (a forged or mis-cased row) changes nothing.
       const state = RULING_STATE.get(e.ruling);
       if (k && state) keys.set(e.findingKey, { ...k, state, ruling: e.ruling });
+      else if (state) earlyRulings.set(e.findingKey, e.ruling);
     } else if ((e.type === EVENT_TYPES.VERDICT || e.type === undefined) && verdictClears(e.verdict)) {
       const head = verdictHead(e);
       for (const [key, k] of keys) {

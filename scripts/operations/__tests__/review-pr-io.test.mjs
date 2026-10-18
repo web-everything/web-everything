@@ -37,6 +37,9 @@ import { applyPendingEffects } from '../effect-executor.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { classifyReviewLoopOutcome } from '../review-job.mjs';
 import { VERDICTS, appendVerdict, buildVerdictRecord, readVerdictLedger, parseLedgerEvents, verdictLedgerPath } from '../../lib/verdict-ledger.mjs';
+import { deriveReferrals, ledgerFindingKey } from '../../lib/pr-state/referrals.mjs';
+import { runMirrorApply } from '../../conveyor/pr-label-mirror.mjs';
+import { buildDerivedRows } from '../../review-ledger-check.mjs';
 // #xu2pp2m — the `--cwd`-reaches-the-reader wiring, asserted through the REAL operation table rather than a
 // re-created copy of it (the same reason `createCliJudgeFactory` is exported and driven directly, #3151).
 import { cwdFlagValue } from '../cli-adapter.mjs';
@@ -311,9 +314,11 @@ describe('the ledger and notice sinks', () => {
       const [effect] = step.effects(projectReads(run, step.reads));
       const expectedKey = referralFindingKey('judgeAdvisory', original);
       expect(effect.type).toBe(REVIEW_EFFECTS.LEDGER_EVENTS);
-      expect(effect.payload).toMatchObject({ headSha: HEAD, referralKeys: [expectedKey] });
+      expect(effect.payload).toMatchObject({ headSha: HEAD, referralKeys: [expectedKey], syncMandatoryRulings: true });
 
-      const result = await createReviewPrSinks({ root })[REVIEW_EFFECTS.LEDGER_EVENTS](effect.payload, CTX);
+      const result = await createReviewPrSinks({ root,
+        labelProvider: { readPrState: () => ({ headRefOid: HEAD, comments: [], body: '' }) },
+      })[REVIEW_EFFECTS.LEDGER_EVENTS](effect.payload, CTX);
       expect(result.written).toEqual(['referral', 'review-run']);
       const referral = readEvents().find((r) => r.type === 'referral');
       expect(referral).toMatchObject({ pr: 7, headSha: HEAD });
@@ -1260,8 +1265,8 @@ describe('operator-ruling carry: default changed-lines reader', () => {
 });
 
 describe('#4315 durable referral effects', () => {
-  function harness({ result = 'not-real', failure, env = {}, readChangedLines = () => new Set() } = {}) {
-    const head = 'a'.repeat(40), trace = [], lines = [];
+  function harness({ result = 'not-real', failure, env = {}, readChangedLines = () => new Set(), appendLedgerRow } = {}) {
+    const head = 'a'.repeat(40), trace = [], lines = [], ledger = [];
     let posts = 0;
     const state = { headRefOid: head, body: '<!-- authored-by-actor: author -->', comments: [], labels: ['review:pending'] };
     const payload = { read: { repo: 'o/r', pr: 7, title: 'review', body: state.body, netBasis: { rev: head },
@@ -1297,9 +1302,116 @@ describe('#4315 durable referral effects', () => {
         })) } };
     });
     const make = () => createReviewPrSinks({ root, env, readChangedLines, labelProvider: provider, referralJudge: judge,
+      appendLedgerRow: appendLedgerRow ?? (row => { if (!ledger.some(r => r.id === row.id)) ledger.push(row); return { ok: true }; }),
       mirrorReferral: record => trace.push(`mirror:${record.attempted}`), out: line => lines.push(line), cardReadable: () => failure !== 'card' });
-    return { state, trace, lines, payload, judge, make, provider };
+    return { state, trace, lines, payload, judge, make, provider, ledger };
   }
+
+  it.each(['not-real', 'card', 'block'])('publishes a counted mandatory %s ruling to the ledger before the delayed referral, including replay', async result => {
+    const h = harness({ result });
+    const sinks = h.make();
+    const settled = await sinks[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(settled.pending).toEqual([]);
+    const key = referralFindingKey(h.payload.referrals[0].seat, h.payload.referrals[0].original);
+    expect(h.ledger).toEqual([expect.objectContaining({ type: 'ruling', findingKey: ledgerFindingKey(key), ruling: result })]);
+    await sinks[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(h.ledger).toHaveLength(1);
+    await sinks[REVIEW_EFFECTS.LEDGER_EVENTS]({ repo: 'o/r', pr: 7, headSha: h.state.headRefOid,
+      posted: true, referralKeys: [key], syncMandatoryRulings: true }, { ...CTX, key: 'run-1#ledger-events' });
+    await sinks[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, { ...CTX, runId: 'run-2' });
+    await sinks[REVIEW_EFFECTS.LEDGER_EVENTS]({ repo: 'o/r', pr: 7, headSha: h.state.headRefOid,
+      posted: true, referralKeys: [key], syncMandatoryRulings: true }, { ...CTX, key: 'run-2#ledger-events' });
+    expect(deriveReferrals(h.ledger).get(ledgerFindingKey(key)).state).toBe(result === 'block' ? 'blocking' : 'ruled');
+
+    // Same-head acceptance must not resurrect an already adjudicated finding in the real mirror.
+    h.ledger.push({ type: 'verdict', ...buildVerdictRecord({ repo: 'o/r', pr: 7, verdict: 'accepted',
+      at: new Date().toISOString(), headSha: h.state.headRefOid, source: 'review-set-label', reason: 'accepted' }) });
+    const labels = [];
+    const facts = { state: 'OPEN', isDraft: false, headSha: h.state.headRefOid, head: { sha: h.state.headRefOid }, labels: [],
+      checks: [], requiredChecks: [{ name: 'test', state: 'green' }], probeErrors: [], sessions: [], handoffs: [], refusals: [] };
+    const out = await runMirrorApply({ repo: 'o/r', selfLogin: 'mirror',
+      listPrs: () => [{ number: 7, labels: [] }],
+      readEvents: async () => ({ status: 'ok', rows: [...h.ledger] }),
+      buildRows: o => buildDerivedRows({ ...o, readFacts: () => facts }), readFacts: () => facts,
+      readTimeline: async () => ({ status: 'ok', items: [] }),
+      appendRow: async () => { throw new Error('no label-input expected'); },
+      addLabel: async (_repo, _pr, label) => labels.push(label),
+      provider: { ensureLabel: () => {}, setLabels: (_repo, _pr, plan) => labels.push(plan.add) },
+    });
+    expect(out.failures).toEqual([]);
+    expect(labels).not.toContain('advisory:ruling-needed');
+    if (result !== 'block') expect(labels).not.toContain('review:human');
+  });
+
+  it.each(['card', 'identity', 'omitted', 'completion'])('does not publish an uncounted or unpersisted mandatory ruling (%s)', async failure => {
+    const h = harness({ result: failure === 'card' ? 'card' : 'not-real', failure });
+    await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(h.ledger).toEqual([]);
+  });
+
+  it.each(['refused', 'write-miss', 'throws'])('parks a failed mandatory ruling append (%s) and repairs it from the posted record without re-asking', async failure => {
+    let writable = false;
+    const rows = [];
+    const h = harness({ appendLedgerRow: row => {
+      if (!writable) {
+        if (failure === 'throws') throw new Error('store offline');
+        return { ok: failure === 'write-miss', ledgerWriteMiss: true, errors: ['store offline'] };
+      }
+      rows.push(row); return { ok: true };
+    } });
+    expect((await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX)).pending).toContain('referral-persistence-failed');
+    expect(h.state.labels).toContain('review:human');
+    writable = true;
+    expect((await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX)).pending).toEqual([]);
+    expect(h.judge).toHaveBeenCalledTimes(1);
+    expect(rows).toEqual([expect.objectContaining({ type: 'ruling', ruling: 'not-real' })]);
+  });
+
+  it.each(['complete', 'missing-reader', 'throws', 'not-array', 'head-moved'])('final ledger publication refreshes full-thread authority (%s)', async mode => {
+    const h = harness({ result: 'block' });
+    await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    const before = h.ledger.length;
+    const key = h.state.comments.flatMap(c => readReferralRecords([c]).records)[0].referrals[0].key;
+    const read = h.provider.readPrState;
+    h.provider.readPrState = () => ({ ...read(), headRefOid: mode === 'head-moved' ? 'b'.repeat(40) : h.state.headRefOid,
+      comments: Array.from({ length: 100 }, () => ({ body: 'unrelated comment' })) });
+    if (mode !== 'missing-reader') h.provider.readComments = () => {
+      if (mode === 'throws') throw new Error('comments offline');
+      return mode === 'not-array' ? null : structuredClone(h.state.comments);
+    };
+    const run = h.make()[REVIEW_EFFECTS.LEDGER_EVENTS]({ repo: 'o/r', pr: 7, headSha: h.state.headRefOid,
+      referralKeys: [key], syncMandatoryRulings: true }, { ...CTX, key: `full-thread-${mode}` });
+    if (mode === 'complete') {
+      expect((await run).written).toEqual(['referral', 'ruling', 'review-run']);
+      expect(deriveReferrals(h.ledger).get(ledgerFindingKey(key)).state).toBe('blocking');
+    } else {
+      await expect(run).rejects.toThrow(/head changed|comments/);
+      expect(h.ledger).toHaveLength(before);
+    }
+  });
+
+  it.each(['throws', 'refused'])('retries a partial final event batch when its required block append %s', async failure => {
+    const rows = [];
+    let failFinal = false;
+    const h = harness({ result: 'block', appendLedgerRow: row => {
+      if (failFinal && row.type === 'ruling') {
+        if (failure === 'throws') throw new Error('store offline');
+        return { ok: false, errors: ['store offline'] };
+      }
+      if (!rows.some(r => r.id === row.id)) rows.push(row);
+      return { ok: true };
+    } });
+    await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    const key = referralFindingKey(h.payload.referrals[0].seat, h.payload.referrals[0].original);
+    const payload = { repo: 'o/r', pr: 7, headSha: h.state.headRefOid, referralKeys: [key], syncMandatoryRulings: true };
+    const ctx = { ...CTX, key: 'partial-final-ledger' };
+    failFinal = true;
+    await expect(h.make()[REVIEW_EFFECTS.LEDGER_EVENTS](payload, ctx)).rejects.toThrow(/retry review events/);
+    failFinal = false;
+    await h.make()[REVIEW_EFFECTS.LEDGER_EVENTS](payload, ctx);
+    expect(rows.filter(r => r.type === 'referral')).toHaveLength(1);
+    expect(deriveReferrals(rows).get(ledgerFindingKey(key)).state).toBe('blocking');
+  });
 
   it.each(['unchanged', 'changed', 'old-line-changed', 'unknown', 'disabled'])('carries an earlier operator ruling only with unchanged lines: %s', async mode => {
     const h = harness({ failure: 'omitted', env: mode === 'disabled' ? { WE_REFERRAL_CARRY_OPERATOR_RULINGS: '0' } : {},

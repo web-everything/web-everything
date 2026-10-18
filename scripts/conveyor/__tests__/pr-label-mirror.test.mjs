@@ -7,6 +7,7 @@ import { planMirror, renderPlan, runMirrorReport, runMirrorApply, planLabelInput
 import { buildDerivedRows } from '../../review-ledger-check.mjs';
 import { buildVerdictRecord, buildLedgerEvent } from '../../lib/verdict-ledger.mjs';
 import { derivePrState } from '../../lib/pr-state.mjs';
+import { deriveReferrals, ledgerFindingKey } from '../../lib/pr-state/referrals.mjs';
 
 const fam = (family, missing = [], extra = []) => ({ family, missing, extra, agree: !missing.length && !extra.length });
 const row = (pr, families, status = 'mismatch', lifecycleState = 'X') => ({ pr, status, lifecycleState, families });
@@ -477,6 +478,30 @@ describe('#5647 single ruling-needed writer', () => {
     await runMirrorApply(w.opts);
     expect(w.log).toEqual([]);
     expect(w.labels).not.toContain(label);
+  });
+  it.each(['not-real', 'card', 'block'])('a %s ruling before the first referral survives delayed publication and mirror retries', async result => {
+    const w = replay({ rows: [event('ruling', { findingKey: 'finding-1', ruling: result }), referral()] });
+    w.opts.addLabel = async (_repo, _pr, name) => { w.log.push(name); };
+    for (let pass = 0; pass < 2; pass++) {
+      expect((await runMirrorApply(w.opts)).failures).toEqual([]);
+      expect(w.labels).not.toContain(label);
+    }
+    expect(w.log).toEqual(result === 'block' ? ['review:human', 'review:human'] : []);
+    expect(deriveReferrals(w.rows).get('finding-1'))
+      .toMatchObject({ state: result === 'block' ? 'blocking' : 'ruled', ruling: result, head: HEAD });
+  });
+  it('buffers only exact keys and valid rulings, without creating phantom referrals or retaining a consumed early block', () => {
+    const key = ledgerFindingKey('full raw key');
+    const rule = (findingKey, ruling) => event('ruling', { findingKey, ruling });
+    const first = event('referral', { headSha: HEAD, findingKeys: [key] });
+    const next = event('referral', { headSha: 'b'.repeat(40), findingKeys: [key] });
+    expect(deriveReferrals([rule(key, 'not-real')]).size).toBe(0);
+    expect(deriveReferrals([rule('full raw key', 'not-real'), first]).get(key).state).toBe('open');
+    expect(deriveReferrals([rule(key, 'not-real'), rule(key, 'block'), first]).get(key).state).toBe('blocking');
+    expect(deriveReferrals([rule(key, 'block'), rule(key, 'card'), first]).get(key).state).toBe('ruled');
+    expect(deriveReferrals([rule(key, 'block'), first, next]).get(key)).toMatchObject({ state: 'open', head: 'b'.repeat(40) });
+    const unknown = { ...rule(key, 'block'), ruling: '__proto__' };
+    expect(deriveReferrals([rule(key, 'not-real'), unknown, first]).get(key).state).toBe('ruled');
   });
   it('an open referral raises, then a recorded ruling clears in one mirror pass and stays cleared', async () => {
     const w = replay({ rows: [referral()] });

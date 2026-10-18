@@ -62,6 +62,7 @@ import { createReferralGhProvider } from '../lib/review-comment-edit.mjs';
 import { ADVISORY_LABEL_META, advisoryCoversHead, labelNames, planAdvisoryLabels } from '../lib/advisory-labels.mjs';
 // #3007 — the real verdict ledger, behind the reserved `verdict-ledger.append` seam. See the LEDGER sink.
 import { EVENT_TYPES, appendVerdict, buildLedgerEvent, buildVerdictRecord, foldRepo, parseLedgerEvents, verdictForLabelTarget, verdictLedgerPath } from '../lib/verdict-ledger.mjs';
+import { ledgerFindingKey } from '../lib/pr-state/referrals.mjs';
 // Card 5469 — the scoped re-review shadow: the declared setting and the pure round rules.
 import { isValidRoundBudget, resolveReviewSettings, resolveReviewSettingSource, SCOPED_REREVIEW_MODES, ROUND_BUDGET_OFF } from '../lib/review-settings.mjs';
 import { acceptanceIds, enclosingSymbol, foldFindingStatuses, lastReviewedHead, reviewRoundOf, reviewScope, shadowRound,
@@ -967,6 +968,17 @@ export function createReviewPrSinks({
       throw notApplied('review void: head moved or CI became red');
     await assertHead();
   };
+  // Both publication steps must derive authority from a complete, pinned thread.
+  const readReferralState = (repo, pr, head) => {
+    const state = labelProvider.readPrState(repo, pr);
+    if (state.headRefOid !== head) throw new HeadChangedError('mandatory referral: reviewed head changed; hold retained');
+    if (state.comments?.length >= PR_COMMENTS_PAGE_SIZE) {
+      if (!labelProvider.readComments) throw new Error('mandatory referral: complete comments unavailable; hold retained');
+      state.comments = labelProvider.readComments(repo, pr);
+    }
+    if (!Array.isArray(state.comments)) throw new Error('mandatory referral: comments unavailable; hold retained');
+    return state;
+  };
   return {
     [REVIEW_EFFECTS.MANDATORY_REFERRALS]: async (payload, ctx) => {
       const { read } = payload;
@@ -983,15 +995,7 @@ export function createReviewPrSinks({
         return comparisons.get(key);
       };
       const commentBudget = 60_000;
-      const fresh = () => {
-        const state = labelProvider.readPrState(read.repo, read.pr);
-        if (state.headRefOid !== read.netBasis.rev) throw new HeadChangedError('mandatory referral: reviewed head changed; hold retained');
-        if (state.comments?.length >= PR_COMMENTS_PAGE_SIZE && labelProvider.readComments) {
-          state.comments = labelProvider.readComments(read.repo, read.pr);
-        }
-        if (!Array.isArray(state.comments)) throw new Error('mandatory referral: comments unavailable; hold retained');
-        return state;
-      };
+      const fresh = () => readReferralState(read.repo, read.pr, read.netBasis.rev);
       const context = (state) => ({ repo: read.repo, pr: read.pr, head: state.headRefOid,
         body: typeof state.body === 'string' ? state.body : '', createdAt: state.createdAt, cardReadable });
       const park = (state) => {
@@ -1388,6 +1392,40 @@ export function createReviewPrSinks({
         }
         if (result.pending.length) park(state);
         for (const record of result.records) mirrorReferral(record);
+        // The label mirror reads the verdict ledger, not jury snapshots. Publish only rulings the
+        // trusted, read-back thread actually counts (independence, supersession and readable cards
+        // included). Reconcile historical completed records too: a crash after posting or a missed
+        // ledger append must recover without spending another mandatory-review attempt.
+        const ruled = new Map();
+        for (const record of result.records) {
+          if (record.repo !== read.repo || record.pr !== read.pr || record.head !== state.headRefOid) continue;
+          const effective = referralRecordState(record, { ...context(state), records: result.records,
+            operatorRulings: result.operatorRulings });
+          for (const f of activeReferrals(record)) {
+            const blocked = result.blocked.includes(f.key);
+            if (!blocked && result.pending.includes(f.key)) continue;
+            const backing = effective.rulings.filter(r => r.key === f.key);
+            const ruling = blocked ? 'block' : backing.at(-1)?.result
+              ?? (record.carried ?? []).find(c => c.key === f.key)?.result
+              ?? ((record.superseded ?? []).some(s => s.key === f.key) ? 'not-real' : null);
+            if (!ruling) continue;
+            const row = buildLedgerEvent({ type: EVENT_TYPES.RULING, repo: read.repo, pr: read.pr,
+              at: new Date().toISOString(), source: 'review-pr', session: record.reviewer.id,
+              channel: 'mandatory-referral', findingKey: ledgerFindingKey(f.key), ruling });
+            // Stable identity belongs to the counted ruling, never to wall time or the retrying run.
+            row.id = `mandatory-ruling:${createHash('sha256').update(JSON.stringify([
+              record.repo, record.pr, record.head, record.runId, f.key, ruling,
+              effective.rulings, record.carried, record.superseded,
+            ])).digest('hex')}`;
+            ruled.set(f.key, row);
+          }
+        }
+        for (const row of ruled.values()) {
+          const appended = await appendLedgerRow(row);
+          if (!appended?.ok || appended.ledgerWriteMiss) {
+            throw new Error(`mandatory ruling ledger-write-miss: ${(appended?.errors ?? []).join('; ') || 'append refused'}`);
+          }
+        }
         return result;
       } catch (error) {
         // A push that lands mid-run is a routine race, not a persistence refusal: rethrow so the hold the earlier
@@ -1547,6 +1585,10 @@ export function createReviewPrSinks({
     // ADDITIVE: it changes no comment, label or decision. Both events are NON-CLEARING (holding), so the
     // statute write-miss posture (#verdict-ledger-pr-state-store rule 4) is: a failed append never blocks or
     // throws; it prints a loud `ledger-write-miss` line and the run goes on with its label hold unchanged.
+    // The required block-sync rows are different: after a referral lands they must be retried if
+    // their append fails. This effect is idempotent, so the executor safely resumes a partial batch.
+    // Authority refresh faults refuse the batch before any append, so a partial or stale thread cannot
+    // reopen a settled block or override an intervening operator ruling.
     [REVIEW_EFFECTS.LEDGER_EVENTS]: async (payload, ctx) => {
       // #xrw21vx — each row's identity is THIS EFFECT (ctx.key) plus the row type, never the row's own bytes.
       // `ledgerEventId` otherwise hashes the whole row, `at` included: two distinct runs in one millisecond then
@@ -1561,6 +1603,18 @@ export function createReviewPrSinks({
       if (payload.headSha && keys.length) {
         rows.push({ type: EVENT_TYPES.REFERRAL, headSha: payload.headSha, findingKeys: keys.map((k) => `sha256:${referralHash(String(k))}`) });
       }
+      // A later review visit has a new referral event identity but reuses the mandatory record.
+      // Its counted block must follow that referral too; otherwise the stable ruling row dedupes
+      // and the new referral reopens it. Re-read authority here so an intervening operator ruling
+      // wins. Clearing rulings are already sticky across referrals in deriveReferrals.
+      if (payload.syncMandatoryRulings && payload.headSha && keys.length) {
+        const live = readReferralState(payload.repo, payload.pr, payload.headSha);
+        const settled = mandatoryReferralState(live.comments, { repo: payload.repo, pr: payload.pr,
+          head: live.headRefOid, body: live.body ?? '', createdAt: live.createdAt, cardReadable });
+        for (const key of settled.blocked) {
+          if (keys.includes(key)) rows.push({ type: EVENT_TYPES.RULING, findingKey: ledgerFindingKey(key), ruling: 'block' });
+        }
+      }
       if (payload.headSha) rows.push({ type: EVENT_TYPES.REVIEW_RUN, headSha: payload.headSha, phase: 'completed', posted: payload.posted === true });
       // An unpinned or degraded read names no head, so there is nothing to key a row on. That is a skipped write,
       // not a quiet success: say so loudly, the same way a write miss does, so the undercount is never silent.
@@ -1568,9 +1622,14 @@ export function createReviewPrSinks({
       const written = []; const missed = [];
       for (const row of rows) {
         try {
-          const res = appendVerdict({ ...buildLedgerEvent({ ...base, ...row, at: new Date().toISOString() }), id: rowId(row.type) });
-          if (res.ok && !res.ledgerWriteMiss) written.push(row.type); else missed.push(`${row.type}: ${(res.errors ?? []).join('; ') || 'git write miss'}`);
-        } catch (e) { missed.push(`${row.type}: ${String(e?.message ?? e).split('\n')[0]}`); }
+          const res = await appendLedgerRow({ ...buildLedgerEvent({ ...base, ...row, at: new Date().toISOString() }),
+            id: rowId(row.type === EVENT_TYPES.RULING ? `${row.type}:${row.findingKey}` : row.type) });
+          if (!res?.ok || res.ledgerWriteMiss) throw new Error((res?.errors ?? []).join('; ') || 'git write miss');
+          written.push(row.type);
+        } catch (e) {
+          if (row.type === EVENT_TYPES.RULING) throw new Error(`mandatory block ledger-write-miss; retry review events: ${String(e?.message ?? e).split('\n')[0]}`);
+          missed.push(`${row.type}: ${String(e?.message ?? e).split('\n')[0]}`);
+        }
       }
       if (missed.length) out(`ledger-write-miss: ${payload.repo}#${payload.pr} review events not fully recorded (${missed.join(' | ')}); comments, labels and decisions are unaffected`);
       return { written, missed };
