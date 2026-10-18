@@ -227,7 +227,7 @@ export const HEALTH_PR_SWEEP_KIND = defineJobKind({
 /** One durable extraction per ET night; judgment belongs to the operator. */
 export const HEALTH_NIGHTLY_CORONER_KIND = defineJobKind({
   kind: 'nightly-coroner', entry: 'scripts/conveyor/nightly-coroner-job.mjs', codeMode: 'readonly-tree', serial: true,
-  nodeModules: true, maxAttempts: 1,
+  nodeModules: true, resumable: false, maxAttempts: 3,
 });
 export const HEALTH_WATCH_JOB_KINDS = kindRegistry([HEALTH_GH_PROBE_KIND, HEALTH_PR_SWEEP_KIND, HEALTH_NIGHTLY_CORONER_KIND]);
 export const HEALTH_WATCH_JOB_SWITCHES = Object.freeze({ ghProbes: false });

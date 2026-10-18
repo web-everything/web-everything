@@ -12,7 +12,9 @@
  *   it enqueue-eligible (a check suite finished green, or `review:accepted` / `ready-to-merge` was added), this runs
  *   the drain's EXISTING single-PR fast drain for that PR — `merge-ai-prs.mjs --only=<n> --label=ready-to-merge` —
  *   after a short debounce. That is the same per-PR path `/pr` and `/finish` use: every drain gate (AI authorship,
- *   required checks, review labels, blockedBy, couples, red-main holds, the enqueue clearance) runs on live state.
+ *   required checks, review labels, blockedBy, couples, red-main holds, the enqueue clearance) runs in the drain.
+ *   A staged green event skips debounce and catch-up listing; --from-green-event asks the drain to consume its
+ *   head-bound preparation. Missing/expired/changed preparation runs the ordinary full fast drain.
  *   Nothing here decides eligibility or enqueues; an event is only a wake for ONE PR (statute
  *   `#event-driven-land-is-wake-only`). A PR that is not ready is skipped by the drain exactly as a pass would.
  *
@@ -55,6 +57,7 @@
  * SCOPE. Only PRs of the local repo (the clone's origin): that is the repo whose ready PRs the drain enqueues on
  *   GitHub's merge queue. A mark with no PR number (`repo#?`) or a full-sweep mark (`*`) is left to the full pass.
  */
+import { createPrestageCache, resolvePrestageSettings } from './drain-prestage.mjs';
 import { createHash } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import { join } from 'node:path';
@@ -485,8 +488,14 @@ export function createEnqueueOnEvent({
   readPriorities = () => ({ priority: readBuildQueuePrioritySettings({ env }), buildPriority: readBuildPrioritySettings({ env }).ids, mainFix: readMainRedPriority({ env }) }),
   readQueueDepth = ({ repo }) => readCatchUpQueueDepth({ repo, env }),
   readMembership = ({ repo, num }) => readMergeQueueMembership({ repo, num, env }),
+  prestageCache = createPrestageCache({ env }),
   timeoutMs, readPr = ({ repo, num }) => readPrForWake({ repo, num, env }),
 } = {}) {
+  const staged = p => {
+    const s = resolvePrestageSettings({ env });
+    return s.value.prestageWhileCiRuns && prestageCache.get(p.repo, p.num, s.value.prestageTtlMin)?.eligible;
+  };
+  const greenEvent = p => p.causes.some(c => /^check_(suite|run)\.completed=success$/.test(c));
   const misses = new Map();
   const backoff = new Map();
   let catchUpRound = 0; // successful listings, never ticks
@@ -560,7 +569,7 @@ export function createEnqueueOnEvent({
         for (const num of catchUpLater) { if (queueCatchUp(num)) break; }
       }
     };
-    if (catchUpDue(s, now()) && allowed()) {
+    if (catchUpDue(s, now()) && allowed() && ![...pending.values()].some(p => greenEvent(p) && staged(p))) {
       lastCatchUpAt = now();
       nextCatchUpAt = now() + s.catchUp.intervalMinutes * 60_000;
       catchUpRoom = 0; // an unreadable queue cannot authorize retained work
@@ -591,7 +600,8 @@ export function createEnqueueOnEvent({
         if (!await honourSetting(s)) break;
         if (!s.catchUp?.enabled) catchUpLater = [].values();
       }
-      const [p] = duePending(pending, { now: now(), debounceSeconds: s.debounceSeconds })
+      const immediate = [...pending.values()].filter(p => greenEvent(p) && staged(p));
+      const [p] = [...immediate, ...duePending(pending, { now: now(), debounceSeconds: s.debounceSeconds })]
         .filter((p) => !activeNums.has(p.num) && !attempted.has(p.num) && (!catchUpOnly || p.catchUp) && (!p.catchUp || !batchingDeferred && catchUpRoom > 0));
       if (!p) { if (active.size) { await Promise.race(active.values()); continue; } break; }
       if (!p.catchUp && active.size) { await Promise.race(active.values()); continue; }
@@ -609,7 +619,9 @@ export function createEnqueueOnEvent({
       const backoffRounds = held?.reason === 'timeout' ? timeoutRounds : blockedRounds;
       if (held && (!backoffRounds || !signature || signature !== held.signature || catchUpRound > held.untilRound)) backoff.delete(p.num);
       if (pr && (pr.state && pr.state !== 'OPEN' || !pr.labels?.some(l => l?.name === READY_LABEL))) backoff.delete(p.num);
-      const w = wakeWorthy(pr);
+      const stagedGreen = greenEvent(p) && staged(p);
+      const w = stagedGreen && pr?.state === 'OPEN' && !pr.isDraft
+        && pr.labels?.some(l => l?.name === READY_LABEL) ? { wake: true } : wakeWorthy(pr);
       if (!w.wake) {
         log(`${prefix} ${taken.causes.join(', ')} — not woken: ${w.reason}`);
         ran.push({ ...metadata, num: p.num, code: null, what: `not woken: ${w.reason}`, outcome: 'skipped' });
@@ -647,6 +659,7 @@ export function createEnqueueOnEvent({
       activeNums.add(p.num);
       const startedAt = now();
       const args = fastDrainArgs({ scriptRoot: scriptRoot(), num: p.num });
+      if (greenEvent(p)) args.push('--from-green-event');
       if (p.catchUp) catchUpRoom--; // keep the bound across ticks and window closures; unknown results consume room
       log(`${prefix} ${taken.causes.join(', ')} — running the drain's single-PR fast drain ${Math.round((startedAt - taken.lastAt) / 1000)}s after the last event`);
       const finish = async () => {
@@ -676,6 +689,8 @@ export function createEnqueueOnEvent({
             verified = true;
             completed.add(p.num);
             misses.delete(p.num);
+            // A wake that arrived during this run is satisfied: the PR is in the queue.
+            if (pending.has(key)) { pending = new Map(pending); pending.delete(key); }
             what += ` (verified: isInMergeQueue=true${membership.entry?.position != null ? `, position ${membership.entry.position}` : ''}${membership.entry?.state ? `, state ${membership.entry.state}` : ''})`;
           } else {
             verified = false;
@@ -747,7 +762,13 @@ export function createEnqueueOnEvent({
 
   return {
     /** Fold one `consumer.pollOnce()` result in. */
-    notePoll(r) { if (r?.ok !== false && Array.isArray(r?.marked) && r.marked.length) pending = notePending(pending, r.marked.filter(m => !activeNums.has(parseMarkKey(m.key)?.num)), { localSlug, now: now() }); },
+    notePoll(r) {
+      // Marks carry neither required-context identity nor head SHA. An optional or stale
+      // failure cannot withdraw a green wake; the drain re-reads current required checks.
+      // A wake for a PR whose fast drain is running stays pending: the run loop never starts a second
+      // drain for an active PR, and the next tick re-wakes it unless that run verified the enqueue.
+      if (r?.ok !== false && Array.isArray(r?.marked) && r.marked.length) pending = notePending(pending, r.marked, { localSlug, now: now() });
+    },
     /** Run due PRs now (bounded catch-up concurrency; serial events) if enabled and allowed; a no-op while a tick is already running. */
     tick() { return running && !runningCatchUpOnly ? running : startRun({}, running); },
     /** Serialize a catch-up-only opportunity after any in-flight run. */
