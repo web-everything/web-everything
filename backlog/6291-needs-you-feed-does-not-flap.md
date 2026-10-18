@@ -1,19 +1,20 @@
 ---
+bornAs: xbn8igv
 kind: story
-size: 2
+size: 3
 status: open
-scope: ["we:scripts/conveyor/nightly-coroner-job.mjs", "we:scripts/operations/coroner-false-findings.mjs", "we:scripts/conveyor/__tests__/nightly-coroner-job.test.mjs"]
+scope: ["we:scripts/operations/needs-you-feed.mjs", "we:scripts/operations/operator-queue.mjs"]
 dateOpened: "2026-10-18"
 tags: []
 ---
 
-# Nightly coroner calls coroner-false-findings with options it accepts
+# needs-you feed does not flap
 
-Live: the 2026-10-17 nightly coroner failed 3/3 with "coroner-false-findings: Unknown option" for `--since/--until`. we:scripts/conveyor/nightly-coroner-job.mjs passes `--since --until --json` but we:scripts/operations/coroner-false-findings.mjs parseArgs accepts only `since` and `json`. Align the job args with the script CLI. [A1] Executable: a test that the argv the job builds parses cleanly through the script parseArgs.
+Live 2026-10-18 02:00-11:00Z: PR #5549, #5480, #5472 and #5510 were cleared and re-raised in the needs-you feed every ~2 min, sometimes with an empty head. Fix: debounce clear/re-raise plus a stable head key (never an empty head), in we:scripts/operations/needs-you-feed.mjs. [A1] Executable: a test that a flapping input yields one raise and no clear/re-raise cycle, and that an empty head keeps the prior key.
 
 ## Acceptance
 
-- [A1] **Executable** — `npx vitest run we:scripts/conveyor/__tests__/nightly-coroner-job.test.mjs` fails before (argv with --until does not parse via parseArgs) and passes after.
+- [A1] **Executable** — `npx vitest run we:scripts/operations/__tests__/needs-you-feed.test.mjs` fails before the fix (flapping input produces clear + re-raise) and passes after.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -21,7 +22,7 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] Does not change the coroner report format.
+- [N1] Does not change which PRs need a person; only how the feed reports them.
 
 ## Edge cases this change must handle
 
