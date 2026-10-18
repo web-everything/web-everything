@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { claimReviewDispatch, decideSameHeadHold, enrichPrsWithReferralHolds } from '../review-referral-hold.mjs';
@@ -19,6 +20,7 @@ import * as reviewDispatchCli from '../../operations/review-dispatch.mjs';
 import { makeCliMechanicalPasses, MECHANICAL_PASS_NAMES } from '../../../skills-src/conveyor/runner.mjs';
 
 // x9jlvy0: replay the saved-result/missing-comment boundary from PR #5461.
+const TEST_DIR = dirname(fileURLToPath(import.meta.url));
 const repo = 'web-everything/web-everything';
 const identityChangeTypes = [
   { kind: 'source', file: 'src/example.mjs' },
@@ -94,7 +96,7 @@ describe('same-head hold when the post-accept red-team comment is owed', () => {
     expect(spawnJob).not.toHaveBeenCalled();
     expect(spawnAgent).not.toHaveBeenCalled();
     expect(existsSync(opts.redTeam.stateDir)).toBe(false);
-    const source = readFileSync(new URL('../../operations/review-dispatch.mjs', import.meta.url), 'utf8');
+    const source = readFileSync(join(TEST_DIR, '../../operations/review-dispatch.mjs'), 'utf8');
     const cli = source.slice(source.indexOf('if (IS_CLI)'));
     expect(cli).toContain('dispatchCliReview(dispatchReviewJob,');
     expect(cli).toContain('dispatchCliReview(dispatchReview,');
@@ -136,7 +138,7 @@ describe('same-head hold when the post-accept red-team comment is owed', () => {
     expect(spawnJob).not.toHaveBeenCalled();
   });
   it('keeps the A3 acceptance-to-test manifest aligned with its named cases and required variants', () => {
-    const card = readFileSync(new URL('../../../backlog/6273-a-head-whose-red-team-comment-is-owed-is-not-held-by-the-alr.md', import.meta.url), 'utf8');
+    const card = readFileSync(join(TEST_DIR, '../../../backlog/6273-a-head-whose-red-team-comment-is-owed-is-not-held-by-the-alr.md'), 'utf8');
     const manifest = JSON.parse(card.match(/```acceptance-tests\n([\s\S]*?)\n```/)[1]);
     expect(manifest.A3).toEqual({ test: identityTestName, variants: identityChangeTypes });
     expect(identityChangeTypes.map(c => c.kind)).toEqual(['source', 'documentation', 'configuration', 'data']);

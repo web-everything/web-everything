@@ -3,6 +3,7 @@ import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { decideSameHeadHold, evaluateReferralHold, readReviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
+import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 /**
  * @file scripts/operations/review-dispatch.mjs
  * @description `#3279` — DISPATCH AN INDEPENDENT REVIEW OF A PR TO A FRESH SESSION.
@@ -709,9 +710,13 @@ export function formatSessionDispatchResult(result) {
  */
 export function claimCliReviewDispatch(ci, { repo, pr, env = process.env, now = Date.now(),
   readRuns = readReviewRunEvidence,
-  readPr = ({ repo, pr }) => JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), '--repo', repo,
-    '--json', 'number,headRefOid,labels,comments,body,createdAt'],
-  { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 32 * 1024 * 1024 })),
+  exec = execFileSyncThrottled,
+  readPr = ({ repo, pr }) => {
+    const snapshot = JSON.parse(exec('gh', ['pr', 'view', String(pr), '--repo', repo,
+      '--json', 'number,headRefOid,labels,body,createdAt'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 32 * 1024 * 1024 }));
+    return { ...snapshot, comments: readCompletePrComments(pr, { repo, exec }) };
+  },
 } = {}) {
   try {
     // Match the dispatcher's repository/PR resolution.

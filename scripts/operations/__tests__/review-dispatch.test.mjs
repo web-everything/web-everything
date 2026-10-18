@@ -18,7 +18,7 @@ import { afterEach, describe, it, expect, vi } from 'vitest';
 
 import { runReconcileFixDispatch } from '../../conveyor/reconcile-fix-dispatch.mjs';
 import {
-  assertMainNotStale, canonicalReviewPlaceholder, dispatchReview, fillReviewBrief, formatSessionDispatchResult, isReviewCodePath, planReviewDispatch,
+  assertMainNotStale, canonicalReviewPlaceholder, claimCliReviewDispatch, dispatchReview, fillReviewBrief, formatSessionDispatchResult, isReviewCodePath, planReviewDispatch,
   reviewDispatchDisallowedToolsArgs, reviewSessionSlug, REVIEW_BRIEF_PLACEHOLDERS,
   REVIEW_DISPATCH_DISALLOWED_TOOLS, REVIEW_DISPATCH_SYSTEM_PROMPT_FILE,
   REVIEW_SANDBOX_ROOTS, TOOL_FREE_ONLY_JUDGE_PROVIDERS,
@@ -47,6 +47,34 @@ const REAL_TEMPLATE_STUB = [
   'acquire: node scripts/lane-pool.mjs acquire --session={{SESSION_SLUG}}',
   'this brief documents {{LIKE_THIS}} as an example convention, not a real token',
 ].join('\n');
+
+describe('CLI review authorization with a complete comment thread', () => {
+  it.each(['trusted-rearm', 'untrusted-rearm', 'no-rearm', 'comments-unreadable', 'metadata-unreadable'])
+  ('reads a re-arm beyond the first page and fails closed (%s)', variant => {
+    const repo = 'web-everything/web-everything', pr = 5461, head = 'a'.repeat(40);
+    const calls = [];
+    const exec = (file, args) => {
+      calls.push([file, args]);
+      if (args[0] === 'pr') {
+        expect(args).toEqual(['pr', 'view', String(pr), '--repo', repo,
+          '--json', 'number,headRefOid,labels,body,createdAt']);
+        if (variant === 'metadata-unreadable') throw new Error('metadata read failed');
+        return JSON.stringify({ number: pr, headRefOid: head, labels: ['review:accepted'], body: '' });
+      }
+      expect(args).toContain('--paginate');
+      expect(args).toContain(`repos/${repo}/issues/${pr}/comments`);
+      if (variant === 'comments-unreadable') throw new Error('later comment page failed');
+      const comments = Array.from({ length: 100 }, () => `old comment\t${new Date(0).toISOString()}\tchalbert`);
+      if (variant.endsWith('-rearm') && variant !== 'no-rearm') comments.push(
+        `🔁 review — changes requested\t${new Date(5).toISOString()}\t${variant === 'trusted-rearm' ? 'chalbert' : 'stranger'}`);
+      return comments.join('\n');
+    };
+    expect(claimCliReviewDispatch({ headSha: head }, { repo, pr, exec, now: 10, env: {},
+      readRuns: () => [{ repo, pr, head, startedAt: 1, completedAt: 2, parked: false, persistenceFailed: false }],
+    })).toBe(variant === 'trusted-rearm');
+    expect(calls).toHaveLength(variant === 'metadata-unreadable' ? 1 : 2);
+  });
+});
 
 describe('planReviewDispatch', () => {
   it('derives a distinct, review-only session slug', () => {
