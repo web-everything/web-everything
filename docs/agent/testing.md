@@ -2033,3 +2033,16 @@ Keep nested author windows bounded: 100 PRs × 100 commits × 100 authors exceed
 GitHub's node ceiling before a query runs. Overflow must use the original reader,
 never truncate evidence. The focused regression is `scripts/lib/__tests__/drain-pr-state.test.mjs`;
 run it through heavy admission.
+
+## Drain throughput scheduling
+
+`scripts/settings/drain-throughput.json` owns the default-on `drain.holdFirst`,
+`drain.catchUpSkipUnchangedHolds` and `drain.carryOverReadyFirst` switches; their resolver
+logs the source of each value. Early checks remember only refusals per repo/PR/head for
+the cascade. A cleared early check never authorizes a write: live admission still runs.
+Catch-up remembers PR holds until the live head/labels/update time or local red-team
+evidence changes, and shares discovery through the existing host PR snapshot with a
+live target read. Transient merge-lock contention retains normal retries. Carry-over
+stores only `ready-not-reached` rows beside drain queue state, never enqueued PRs or
+known holds; it orders the next full pass before couple grouping and main-fix priority.
+The focused injected-process and pure checks are in `drain-throughput.test.mjs`.

@@ -62,6 +62,10 @@ import { createHash } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveDrainThroughput, holdSignature, unchangedHold, HOLD_KINDS } from './drain-throughput.mjs';
+import { classifySkipReason } from './drain-skip-reasons.mjs';
+import { readSavedRedTeamResult } from './drain-saved-red-team.mjs';
+import { readDrainRedTeamEvidence } from './drain-red-team-evidence.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { readBuildPrioritySettings, readBuildQueuePrioritySettings } from './build-queue.mjs';
@@ -283,7 +287,7 @@ export function prHeadSignature(pr) {
 /** Default PR read for {@link wakeWorthy}: one `gh pr view`. Resolves null on any failure. */
 export function readPrForWake({ repo, num, env = process.env, execFileImpl = execFile }) {
   return new Promise((res) => {
-    execFileImpl('gh', ['pr', 'view', String(num), '--repo', repo, '--json', 'state,isDraft,labels,statusCheckRollup,headRefOid'], { env, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 60_000 }, (err, stdout) => {
+    execFileImpl('gh', ['pr', 'view', String(num), '--repo', repo, '--json', 'state,isDraft,labels,statusCheckRollup,headRefOid,updatedAt'], { env, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 60_000 }, (err, stdout) => {
       if (err) { res(null); return; }
       try { res(JSON.parse(String(stdout || 'null'))); } catch { res(null); }
     });
@@ -489,6 +493,11 @@ export function createEnqueueOnEvent({
   readQueueDepth = ({ repo }) => readCatchUpQueueDepth({ repo, env }),
   readMembership = ({ repo, num }) => readMergeQueueMembership({ repo, num, env }),
   prestageCache = createPrestageCache({ env }),
+  readHoldEvidence = ({ repo, num, head }) => ({
+    ...readDrainRedTeamEvidence({ repo, pr: num, head, env }),
+    saved: readSavedRedTeamResult({ repo, pr: num, head, env }),
+  }),
+  resolveThroughput = () => resolveDrainThroughput({ env, log }),
   timeoutMs, readPr = ({ repo, num }) => readPrForWake({ repo, num, env }),
 } = {}) {
   const staged = p => {
@@ -498,6 +507,7 @@ export function createEnqueueOnEvent({
   const greenEvent = p => p.causes.some(c => /^check_(suite|run)\.completed=success$/.test(c));
   const misses = new Map();
   const backoff = new Map();
+  const lastHolds = new Map();
   let catchUpRound = 0; // successful listings, never ticks
   let pending = new Map();
   let running = null; // the serialized tick/catch-up promise
@@ -544,6 +554,7 @@ export function createEnqueueOnEvent({
   }
 
   async function runDue({ catchUpOnly = false } = {}) {
+    const throughput = resolveThroughput().value;
     let s = readSetting();
     if (!await honourSetting(s)) return [];
     let catchUpLater = [].values();
@@ -580,6 +591,7 @@ export function createEnqueueOnEvent({
         listedPrs = result.prs;
         const listed = new Set(result.prs.filter(p => !p.inQueue).map(p => p.num));
         for (const num of backoff.keys()) if (!listed.has(num)) backoff.delete(num);
+        for (const num of lastHolds.keys()) if (!listed.has(num)) lastHolds.delete(num);
         const { capacity, source } = await readCapacity(s);
         catchUpRoom = Math.max(0, capacity - result.queued);
         catchUpCapacity = capacity;
@@ -612,6 +624,19 @@ export function createEnqueueOnEvent({
       pending = new Map(pending); pending.delete(key);
       let pr = null;
       try { pr = await readPr({ repo: p.repo, num: p.num }); } catch { pr = null; }
+      let holdEvidence;
+      if (p.catchUp && throughput.catchUpSkipUnchangedHolds && pr?.headRefOid) {
+        try { holdEvidence = await readHoldEvidence({ repo: p.repo, num: p.num, head: pr.headRefOid }); }
+        catch { lastHolds.delete(p.num); }
+        if (taken.causes.every(c => c === 'catch-up') && holdEvidence !== undefined && unchangedHold(lastHolds.get(p.num), pr, holdEvidence)) {
+          const what = `unchanged hold: ${lastHolds.get(p.num).kind}`;
+          log(`${prefix} — ${what}`);
+          ran.push({ ...metadata, num: p.num, code: null, what, outcome: 'skipped' });
+          refillCatchUp();
+          continue;
+        }
+        lastHolds.delete(p.num);
+      }
       const signature = prHeadSignature(pr);
       const blockedRounds = s.catchUp?.blockedBackoffRounds ?? ENQUEUE_ON_EVENT_DEFAULTS.catchUp.blockedBackoffRounds;
       const timeoutRounds = s.catchUp?.timeoutBackoffRounds ?? ENQUEUE_ON_EVENT_DEFAULTS.catchUp.timeoutBackoffRounds;
@@ -665,9 +690,16 @@ export function createEnqueueOnEvent({
       const finish = async () => {
         let ownChild;
         const childTimeoutMs = timeoutMs ?? (s.timeoutSeconds ?? ENQUEUE_ON_EVENT_DEFAULTS.timeoutSeconds) * 1000;
-        const r = await runChild({ args, cwd, env, spawnImpl, timeoutMs: childTimeoutMs, onChild: (c) => { ownChild = c; children.add(c); } });
+        const r = await runChild({ args, cwd, env: p.catchUp && throughput.catchUpSkipUnchangedHolds ? { ...env, WE_DRAIN_CATCH_UP_SNAPSHOT: '1' } : env, spawnImpl, timeoutMs: childTimeoutMs, onChild: (c) => { ownChild = c; children.add(c); } });
         children.delete(ownChild);
         const json = lastJsonLine(r.stdout);
+        if (p.catchUp && throughput.catchUpSkipUnchangedHolds && !r.error && !r.timedOut && holdEvidence !== undefined) {
+          const hit = rows => rows?.find(x => Number(x.num) === p.num);
+          const outcome = hit(json?.enqueueOutcomes) || hit(json?.skipReasons) || hit(json?.skipped);
+          const kind = outcome?.kind === 'branch-preparation' ? classifySkipReason(outcome.reason)
+            : outcome?.kind || classifySkipReason(outcome?.reason);
+          if (HOLD_KINDS.has(kind)) lastHolds.set(p.num, { kind, signature: holdSignature(pr, holdEvidence) });
+        }
         let what = r.timedOut ? `timed out after ${childTimeoutMs / 1000}s with no JSON result` : r.error ? `could not run (${r.error})` : summarizeFastDrain(json, p.num);
         const summary = what;
         if (!r.error && (summary.startsWith('passed every drain gate — enqueued') || summary.startsWith('not listed'))) backoff.delete(p.num);
@@ -741,7 +773,11 @@ export function createEnqueueOnEvent({
             let pr;
             try { pr = await readPr({ repo: localSlug, num: p.num }); } catch { continue; }
             const held = backoff.get(p.num);
-            if (pr && wakeWorthy(pr).wake && !(held && catchUpRound <= held.untilRound && held.signature === prHeadSignature(pr))) { busy = true; break; }
+            let unchanged = false;
+            if (throughput.catchUpSkipUnchangedHolds && lastHolds.has(p.num) && pr?.headRefOid) {
+              try { unchanged = unchangedHold(lastHolds.get(p.num), pr, await readHoldEvidence({ repo: localSlug, num: p.num, head: pr.headRefOid })); } catch { /* retry */ }
+            }
+            if (!unchanged && pr && wakeWorthy(pr).wake && !(held && catchUpRound <= held.untilRound && held.signature === prHeadSignature(pr))) { busy = true; break; }
           }
         }
       }

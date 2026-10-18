@@ -368,7 +368,15 @@ export function createDrainMergeStrategy({
         return { allowed: !reason, reason, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
       } catch { return { allowed: false, reason: 'red-team evidence unreadable' }; }
     },
-    enqueue(c, headSha, { comments = null, prepared = null } = {}) {
+    /** Reuse admission's hold evaluation early, only for a recorded wait on this exact head.
+     * A clear result is NOT authorization; enqueue still runs every live gate later. */
+    recordedHold(c, headSha) {
+      if (!enqueues(c.repo) || !headSha) return null;
+      const state = readQueueState(statePath, readFile);
+      if (state.redTeamPending?.[keyOf(c.repo, c.num)]?.headSha !== headSha) return null;
+      return this.enqueue(c, headSha, { holdOnly: true });
+    },
+    enqueue(c, headSha, { comments = null, prepared = null, holdOnly = false } = {}) {
       if (!enqueues(c.repo)) throw new Error('enqueue called for a repo outside github-merge-queue');
       if (dryRun) throw new Error('enqueue refused in dry run');
       if (!headSha) throw new Error('github-merge-queue: no pinned head — refusing to enqueue (and NOT merging directly)');
@@ -465,6 +473,7 @@ export function createDrainMergeStrategy({
         delete before.redTeamPending[key];
         writeState(statePath, before);
       }
+      if (holdOnly) return null; // all writes below remain on the ordinary enqueue path
       let batchingGroupId;
       try {
         const g = adaptiveBatching().gate(c.num);

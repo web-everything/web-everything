@@ -200,6 +200,9 @@ import { ensureFreshGithubAppEnv } from './lib/github-app-auth-env.mjs';
 // x2e120n — per-step pass timing ("why so slow", the resident drain daemon's history.jsonl carried only a
 // pass's TOTAL ms, no breakdown). See pass-timings.mjs's own header for the full shape/rationale.
 import { buildSkipReasons, formatSkipSummary, formatSkipReasonsLine } from './lib/drain-skip-reasons.mjs';
+import { resolveDrainThroughput, createHoldMemo, carryReady, readCarry, writeCarry, orderCarry } from './lib/drain-throughput.mjs';
+import { numberingWithdrawalOwed } from './lib/numbering-carry.mjs';
+import { queueStatePath } from './lib/drain-merge-strategy.mjs';
 import { createStepTimer, formatTimingsSummary, PASS_STEP_ORDER } from './lib/pass-timings.mjs';
 import { mapWithConcurrency, runEnqueueCandidates, canParallelEnqueue, createBranchPreparationRequired, formatConcurrencySources } from './lib/drain-concurrency.mjs';
 import { execDrainAsync } from './lib/drain-gh-async.mjs';
@@ -5091,6 +5094,9 @@ async function runCli() {
     }
     process.stderr.write('drain-prestage: cache miss/stale — full fast drain\n');
   }
+  const throughput = resolveDrainThroughput();
+  const carryPath = join(dirname(queueStatePath()), 'drain-ready-carry.json');
+  const carry = throughput.value.carryOverReadyFirst && onlyPr == null ? readCarry(carryPath) : [];
   const prStateSetting = resolveDrainPrState();
   process.stderr.write(`policy · drain.prState.batched=${prStateSetting.value.batched} (${prStateSetting.sources.batched})\n`);
   passPrState = prStateSetting.value.batched
@@ -5151,9 +5157,9 @@ async function runCli() {
       const slug = repo || localSlug;
       let listed;
       let snapshotSeed;
-      // Snapshot rows seed heavy fields only. The open set must still be listed live:
-      // refreshing only the target can miss a newly opened blockedBy/stack/couple sibling.
-      if (slug && onlyPr != null && fastDrainListing.listing === 'snapshot' && isFastDrainTarget(repo, { number: onlyPr })) {
+      // Catch-up children share discovery through the existing host snapshot, with a live target.
+      // Ordinary drains retain live open-set discovery; snapshot misses retain that same fallback.
+      if (slug && onlyPr != null && (fastDrainListing.listing === 'snapshot' || process.env.WE_DRAIN_CATCH_UP_SNAPSHOT === '1') && isFastDrainTarget(repo, { number: onlyPr })) {
         const fields = RECONCILE ? SWEEP_LIST_FIELDS
           : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '');
         try {
@@ -5172,7 +5178,9 @@ async function runCli() {
           process.stderr.write('fast-drain: listing fell back to live (snapshot or live target read failed)\n');
         }
       }
-      if (slug) {
+      if (snapshotSeed && process.env.WE_DRAIN_CATCH_UP_SNAPSHOT === '1' && throughput.value.catchUpSkipUnchangedHolds) {
+        listed = { rows: snapshotSeed, truncated: false };
+      } else if (slug) {
         const paging = resolvePrListPaging();
         const heavyFields = ['body', ...((RECONCILE || workflowEditSetting.value !== 'off') ? ['files'] : [])];
         // Seed body/files from the host-shared snapshot (its heavy copies persist across drain processes); a seed
@@ -6556,6 +6564,29 @@ async function runCli() {
     // dependents next pass (mirrors the lane-drain cascade). A merge FAILURE (red/behind) marks the PR `skip`
     // so it keeps blocking its dependents — never land past a broken blocker.
     let remaining = verdicts.map((v) => ({ ...v }));
+    const memoHold = createHoldMemo(throughput.value.holdFirst);
+    const earlyHold = c => memoHold(c, async () => {
+      const overlap = preparedPass.plan.deferred.find(d => d.num === c.num && d.repo === c.repo
+        && (d.overlapYield || d.waitOn?.some(w => String(w).startsWith('overlap-yield:'))));
+      if (overlap) return { kind: 'overlap-yield', reason: overlap.waitOn.join(', ') };
+      // Reuse the review hold rule, including the existing explicit relief for pending.
+      const allowPending = (escalationRelief.prs || []).includes(Number(c.num)) || (!!escalationRelief.passWide && !!label);
+      if (hasUnclearedReviewLabel(c.prLabels || [], { allowPending }))
+        return { kind: 'review-hold', reason: 'unsatisfied review hold (review:pending/review:human/review:changes)' };
+      if (numberingWithdrawalOwed(c.repo || localSlug, c.num))
+        return { kind: 'numbering', reason: 'numbering re-stamp withdrawal owed' };
+      return mergeStrategy.recordedHold(c, c.listedHeadSha || c.headSha);
+    });
+    if (throughput.value.holdFirst) {
+      for (const c of remaining.filter(v => v.decision === 'merge')) {
+        let hold;
+        try { hold = await earlyHold(c); }
+        catch (e) { hold = { kind: 'stale-read', reason: `could not re-read the PR fresh for early hold: ${ghListErrText(e)}` }; }
+        if (!hold) continue;
+        c.decision = 'skip'; c.reason = hold.reason;
+        enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', ...hold });
+      }
+    }
     // #2257 — an item is unique per (repo, PR#): match/remove candidates on both so a WE #10 and a FUI #10 never
     // collide in the cascade bookkeeping.
     const sameCand = (a, b) => a.num === b.num && a.repo === b.repo;
@@ -6577,7 +6608,7 @@ async function runCli() {
       // plateau-app#185 (impl), then web-everything#2746 (unrelated, moved WE main), and #2751 (#185's carrier)
       // then read BEHIND and was refused — the impl landed alone.
       const mergedKeysNow = new Set(merged.map((m) => candKey(m)));
-      const coupleStep = planCoupleCascadeStep(plan.ready, {
+      const coupleStep = planCoupleCascadeStep(orderCarry(plan.ready, carry, throughput.value.carryOverReadyFirst), {
         candidates: remaining,
         mergedKeys: mergedKeysNow,
         openSiblingRefs: openSiblingRefSet(openPrContext.prsByRepo, mergedKeysNow, repoKeyOfSlug),
@@ -6771,6 +6802,7 @@ async function runCli() {
           if (!(await mergeQueueGate(c, revalidated.headSha))) {
             const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; // re-judged next pass
             noteSplit('merge-queue: not merge-fresh');
+            revalidationAborted.push({ num: c.num, repo: c.repo, reason: 'merge-queue: not merge-fresh' });
             continue;
           }
           // xnsk54v follow-up (land-path tamper-evidence) — the park/skip comment paths only fire when the drain
@@ -7260,11 +7292,15 @@ async function runCli() {
   // record. Never throws, never mutates a verdict; it runs after every merge decision of this pass is final.
   const ledgerShadow = await runLedgerShadow({ verdicts, localSlug, dryRun: DRY_RUN });
   process.stderr.write(`${formatShadowLine(ledgerShadow)}\n`);
-  const skipReasons = buildSkipReasons({ verdicts, merged, failedMerges, revalidationAborted, pendingRebased, coupleHeld, deferred, parked });
+  const skipReasons = buildSkipReasons({ verdicts, merged, failedMerges, revalidationAborted, pendingRebased, coupleHeld, deferred, parked, enqueueOutcomes, passEnded: !DRY_RUN });
   process.stderr.write(`merge-ai-prs · pass timings: ${formatTimingsSummary(timingSteps, { total: passTotalMs, order: PASS_STEP_ORDER })} (considered ${verdicts.length}, merged ${merged.length}, ${formatSkipSummary(skipReasons)}; ${formatConcurrencySources(resolvedMergePolicy.policy)})\n`);
   // Card 122 slice 1 — logging only: the machine-readable twin of the summary above (coroner / perf-snapshot read it).
   process.stderr.write(`${formatSkipReasonsLine(skipReasons)}\n`);
   const result = { ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, skipReasons, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text, retryable: !!l.err.retryable })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
+  if (!DRY_RUN && onlyPr == null && throughput.value.carryOverReadyFirst) {
+    try { writeCarry(carryPath, carryReady(skipReasons)); }
+    catch (e) { process.stderr.write(`drain: carry-over write failed: ${e.message}\n`); }
+  }
   if (enqueueOutcomes.length) result.enqueueOutcomes = enqueueOutcomes;
   if (followup.mode === 'job' || followup.job) result.followupJob = { handedOff: followup.handedOff, job: followup.job ?? null, actions: followup.actions ?? [], ...(followup.handedOff ? {} : { reason: followup.reason }) }; // x4y74wj — a launch-failed job rides along (handedOff:false) so the fallback to inline is visible
   return { result, merged, failedMerges, pendingRebased: pendingAll, deferred, duplicateIdsOnMain };
