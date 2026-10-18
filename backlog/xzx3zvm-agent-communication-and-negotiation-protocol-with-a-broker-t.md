@@ -1,6 +1,7 @@
 ---
 kind: epic
 status: parked
+blockedBy: ["3007"]
 dateOpened: "2026-10-18"
 tags: []
 ---
