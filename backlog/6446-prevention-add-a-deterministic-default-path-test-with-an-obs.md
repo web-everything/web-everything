@@ -1,20 +1,21 @@
 ---
+bornAs: x4b0690
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/health-smells/red-main-quarantined-test.mjs", "we:scripts/conveyor/health-smells/__tests__/red-main-quarantined-test.test.mjs"]
+scope: ["we:scripts/operations/__tests__/review-loop-cli.test.mjs"]
 dateOpened: "2026-10-16"
 tags: []
 ---
 
-# Prevention — Return an explicit 'unknown' marker so the smell can skip the tick without closing episodes. Also… (from web-everything/web-everything#5283 review)
+# Prevention — Add a deterministic default-path test with an observable lookup assertion, or a controlled matchi… (from web-everything/web-everything#5447 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/health-smells/red-main-quarantined-test.mjs:16` — Return an explicit 'unknown' marker so the smell can skip the tick without closing episodes. Also add a test with a persistent episode state that drives a failed-read tick between two good ticks and asserts no reopen.
+1. `we:scripts/operations/__tests__/review-loop-cli.test.mjs:408` — Add a deterministic default-path test with an observable lookup assertion, or a controlled matching card that suppresses filing, so replacing the default lookup with a constant miss fails the test.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5283@5300b9ec377a9cd32536bad0d2dc3390ab314d8a
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5447@ed8c3e5d450de3ec68f579569564c307e388d9b8
 
 ## Acceptance
 
