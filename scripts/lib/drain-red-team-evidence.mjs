@@ -52,7 +52,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     // of an unchanged head labels its accept before its job writes `queued`).
     if (!['queued', 'running'].includes(status.status)) {
       const latest = latestRun();
-      if (latest.at > statusAt && owes(latest.run)) return { loopPayload: latest.run, inFlight: false, scheduled: true, recorded };
+      if (latest.at > statusAt && owes(latest.run)) return { loopPayload: latest.run, inFlight: false, scheduled: true, recorded, skipCardOnly: false };
     }
     // A local pid probe says nothing about another host or namespace: keep that pass held for its result.
     // For local records, a changed birth time proves pid reuse. An unavailable birth time is unknown,
@@ -70,5 +70,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
       ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error'].includes(status.result), recorded: recorded || status.result === 'ran' };
   }
   const loopPayload = latestRun().run;
-  return { loopPayload, inFlight: false, scheduled: recorded || owes(loopPayload), recorded };
+  // An owing run with no job status yet: only the job's process knows its card-only skip decision, so hold the head
+  // (skip off) until that status records it. The never-scheduled deadline still applies if no job ever writes one.
+  return { loopPayload, inFlight: false, scheduled: recorded || owes(loopPayload), recorded, ...(owes(loopPayload) ? { skipCardOnly: false } : {}) };
 }
