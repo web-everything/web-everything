@@ -20,7 +20,7 @@ tags: [settings, cascade, operator, override, decision-prep]
 
 **Ruled 2026-10-17 by the operator (Nicolas Gilbert), in conversation.** Verbatim: *"Ok"*, to "Settings override: (a), (a), (a)?". The rule is codified at
 [we:docs/agent/platform-decisions.md#operator-override-settings-layer](../docs/agent/platform-decisions.md#operator-override-settings-layer).
-The prepared text below is kept as the lineage; where it differs from this section, this section wins.
+The preparation below explains the forks; its example is updated to the build cards' read interface. Where it differs from this ruling, this section wins.
 
 - **Fork 1 = (a).** A local-first store at one host-wide path, not inside a lane clone; plateau's DB is deferred.
 - **Fork 2 = (a).** Above env: standard < platform < tool < env < operator-override.
@@ -73,11 +73,15 @@ Fork-existence: both branches are coherent, but they cannot both be the single s
 - (b) Plateau's DB from day one. Gives sharing and a dashboard at once, but daemons then depend on a service being up, and it needs plateau to ship first.
 
 ```js
-// Fork 1 (a): read in the cascade, each tick
-const op = readOperatorOverrides();   // snapshot under the operations directory
-const r = resolveCascade({ standard, platform, tool, envValues, operatorOverride: op.value, valid });
+// Fork 1 (a): read the host-wide store each tick (slice 1's effective view, floored by slice 3).
+const op = readOperatorOverrides();   // { readable, entries }, not a .value property
+// Slice 2 projects each effective entry's key/value into this policy's layer shape.
+const operatorOverride = op.readable ? projectPolicyEntries(policy, op.entries) : undefined;
+const r = resolveCascade({ standard, platform, tool, envValues, operatorOverride, valid });
 // r.sources['<cascade key>'] === 'operator-db'; merge-queue switches read the same layer in resolveRefreshSetting
 ```
+
+`projectPolicyEntries` above is pseudocode for slice 2's per-policy projection, not an existing exported helper. Resolver activation waits for the store, guard floor and needs-you producer (6264's blockers); preparation is complete and this decision is ratified, as the ruling and frontmatter record.
 
 Recommended: (a). It needs no service, works offline, and matches how other machine-local state already lives (`we:.gitignore:186`). Downside: it is per machine.
 Skeptic: SURVIVES-WITH-AMENDMENT. A repo-relative operations directory gives each lane clone its own copy, so an override could miss the daemon that needs it. Folded in: the store sits at one host-wide path, not inside a clone, and the per-host scope is shown on the dashboard.

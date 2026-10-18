@@ -4,7 +4,7 @@ kind: story
 size: 5
 parent: "6268"
 status: open
-blockedBy: ["6266"]
+blockedBy: ["6266", "6269", "6265"]
 scope: ["we:scripts/lib/policy-cascade.mjs", "we:scripts/lib/review-settings.mjs", "we:scripts/lib/merge-queue-enqueue.mjs", "we:scripts/lib/__tests__/policy-cascade.test.mjs", "we:scripts/lib/__tests__/review-settings.test.mjs", "we:scripts/lib/__tests__/merge-queue-enqueue.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
@@ -13,6 +13,8 @@ tags: []
 # we: operator override slice 2 - cascade layer above env with source logging
 
 Add the operator-override layer to the resolvers that read the settable keys, per decision 6268 (we:docs/agent/platform-decisions.md#operator-override-settings-layer): order standard < platform < tool < env < operator-override, every value from it logs source operator-db.
+
+Activation waits for both the guard floor (6269) and the needs-you producer (6265), so the first effective loosening override already requires confirmation and has a visible feed path. The dependency order is store → floor → feed → resolver activation; the slice numbers are labels, not shipping order.
 
 The settable keys and the resolver that reads each one:
 
@@ -34,7 +36,10 @@ A key resolved anywhere else (a `.layered` reader, a direct `resolveCascade` cal
   - `no settable key is read through .layered by a reader that applies env itself`
   - `no operator layer present leaves every existing resolution unchanged`
   - `an unreadable layer is skipped and the lower layers still resolve`
+  - `an invalid operator override is rejected by valid and lower layers still resolve` (numeric, enum, scalar and nested values; assert effective value and source in the cascade, referral-safety and merge-queue readers)
+  - `a partial layer error applies no override, while an invalid value in a readable layer falls back only for that key`
   - `the layer is read each call, not cached across ticks`
+  - `an expired or superseded override stops applying on the next resolve without reviving an older value`
 
 ## Non-goals
 

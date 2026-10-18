@@ -21,6 +21,10 @@ The store module, the operation module and the store test are new files. The ope
 
 **Read interface.** `readOperatorOverrides()` returns `{ readable, entries }`. `readable` is false when the store or snapshot cannot be read or parsed, so a caller can tell "unreadable" from "no overrides". Each entry carries `key`, `value`, `entryId` (the log line it came from), `actor`, `channel`, `at`, `instruction`, `reason`, `expiresAt` and the recorded confirmation, if any. Slices 2, 3 and 4 build on exactly this shape.
 
+**Current view and identity.** `entries` contains at most one effective entry per key. Append order, not a caller-supplied timestamp, decides the latest write. Select the latest write before checking expiry or the slice 3 floor: an expired, invalid or unconfirmed latest write never revives an older entry. Re-setting to a safe value supersedes a loosening value; expiry removes the override from the current view and lower code/env layers resume. The historical log keeps every write. Generate a fresh, unique `entryId` matching `^[A-Za-z0-9-]{1,128}$` for every write, including a re-set with the same value; the snapshot cannot rebind an id to a different key, value or expiry.
+
+**Write consistency.** Hold one lock across re-reading current state, appending the complete JSON log record and atomically replacing the snapshot. Readers verify the snapshot against the authoritative log; a crash between append and rename must recover the newest committed log view or return `{ readable: false, entries: [] }`, never a stale snapshot. An unreadable or partial log/snapshot invalidates the whole read, with no partial entries applied.
+
 ## Acceptance
 
 - [A1] **Executable** — `npm run test:unit --` (vitest) on we:scripts/lib/__tests__/operator-override-store.test.mjs (a new file), we:scripts/operations/__tests__/http-adapter.test.mjs, we:scripts/operations/__tests__/effect-executor.test.mjs and we:scripts/__tests__/guard-bash.test.mjs. The store test fails before the module exists and passes after. Named tests, one per guarantee:
@@ -32,10 +36,20 @@ The store module, the operation module and the store test are new files. The ope
   - `the actor comes from the operator's gh login, and an --actor flag is refused`
   - `each write records instruction, actor, channel, time, reason and optional expiry`
   - `readOperatorOverrides returns each entry with entryId, actor, at, instruction, expiresAt and confirmation`
+  - `a later write for the same key supersedes the earlier entry on read`
+  - `expiry of the latest entry removes the override without reviving an older write`
+  - `generated entryIds match [A-Za-z0-9-]{1,128} and remain unique across writes and re-sets`
+  - `a hostile instruction round-trips verbatim as a quoted JSON string and is never executed` (newline, CR, U+2028, quotes, backticks and command substitution)
+  - `a key outside SETTABLE_OVERRIDE_KEYS is refused and nothing is written`
+  - `an agent shell write to the operator-override store is denied` (in we:scripts/__tests__/guard-bash.test.mjs)
   - `an unreadable store returns readable false, which differs from an empty store`
   - `the change log is append-only and a write never edits earlier lines`
+  - `two writers serialize under the log lock and re-read state after acquiring it without losing either write`
+  - `snapshot replacement is atomic and a crash after log append recovers the latest entry or reports the whole layer unreadable`
+  - `a stale lock is recovered without allowing an expired holder to append or replace the snapshot`
   - `an expired override is ignored on read and logged once; the log keeps it`
   - `a snapshot that fails to parse is skipped whole and logged`
+  - `a truncated log line makes the whole layer unreadable and returns no partial entries`
   - `the module map covers every operation the repo declares` (the existing http-adapter test, green with the new entry)
 
 ## Non-goals
@@ -48,10 +62,10 @@ The store module, the operation module and the store test are new files. The ope
 One line per class: either the handling, or `n/a: <why>`.
 
 1. **Untrusted text** — the verbatim instruction is stored as a quoted JSON string, never executed or interpolated.
-2. **Truncated reads** — a snapshot or log line that fails to parse is skipped whole and logged, never half-applied, and the read reports `readable: false`.
+2. **Truncated reads** — a snapshot or log line that fails to parse invalidates the whole layer and is logged, never half-applied, and the read reports `{ readable: false, entries: [] }`.
 3. **Shared state files** — the log is append-only under a lock; the snapshot is replaced atomically.
 4. **Fail closed** — an unreadable store or an agent caller means no write and no applied override.
 5. **Identity scoping** — actor and channel come from `operatorTerminalPresent` and `resolveOperatorCredential`, not from a flag.
-6. **State over time** — expired entries are ignored on read and the log keeps them.
+6. **State over time** — latest write per key wins before filtering; supersession and expiry remove earlier values from the derived view without deleting history or reviving an older override.
 7. **Who wrote it** — every entry carries actor, channel, time, instruction and reason.
 8. **Trust boundary** — the store sits outside any lane clone, so a lane's Edit/Write grant does not cover it. we:scripts/guard-bash.mjs denies agent shell writes to the store path, tested in we:scripts/__tests__/guard-bash.test.mjs as `an agent shell write to the operator-override store is denied`. Any write that still gets past this is caught by the reader floor (slice 3) and shown in the needs-you feed (slice 4).

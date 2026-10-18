@@ -16,6 +16,8 @@ Build the guard floor of decision 6268 (we:docs/agent/platform-decisions.md#oper
 
 The floor module is new and exports the safe-direction table and one classifier, `isLooseningOverride(key, value)`, which the write operation (we:scripts/operations/operator-override.mjs, from slice 1) and the needs-you feed (slice 4) both call. The "refused with a non-zero exit" and "agent caller" tests below drive that write operation.
 
+Bind each confirmation to the exact log entry: entryId, key, value and expiry, with the operator authority recorded on that write. Neither an older confirmation for the same key nor a snapshot that reuses an id with altered contents authorizes a later write. Apply this check to slice 1's latest-entry-per-key view before returning effective entries; rejected latest entries fall back to lower layers without reviving history.
+
 ## Acceptance
 
 - [A1] **Executable** — `npm run test:unit --` (vitest) on we:scripts/lib/__tests__/operator-override-floor.test.mjs (a new file) fails before the module exists and passes after. Named tests, one per guarantee:
@@ -29,6 +31,12 @@ The floor module is new and exports the safe-direction table and one classifier,
   - `the reader ignores the whole snapshot when it cannot be checked against the safe-direction table`
   - `an expired confirmation cannot authorize a loosening entry even if the entry has not expired`
   - `a snapshot cannot create, replace or extend the append-only log confirmation for a loosening entry`
+  - `a confirmation recorded for one entry does not authorize a different loosening entry for the same key`
+  - `reusing a confirmed entryId with a different key, value or expiry in the snapshot does not authorize it`
+  - `an expired entry stops applying and never revives a superseded confirmation`
+  - `an invalid or unconfirmed latest entry never revives a superseded override`
+  - `confirmation authority, actor, channel, time and instruction come from the operator-only log write, not snapshot fields`
+  - `hostile key and value text is treated as data by the safe-direction classifier and never executed`
 
 ## Non-goals
 
