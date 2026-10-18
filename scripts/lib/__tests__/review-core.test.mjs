@@ -731,9 +731,10 @@ describe('buildPanelMandate (#2310)', () => {
       `the full panel: ${PANEL_LENSES.join(', ')})`,
     );
 
-    it('adds the mutation probe and NOTHING else when `aim` is omitted', () => {
+    it('adds the mutation probe and tests-first guarantee mapping when `aim` is omitted', () => {
       expect(buildPanelMandate({ lens: MANDATE_LENSES.CORRECTNESS }))
-        .toBe(`${withCurrentPanel(FIXTURE)} ${MUTATION_PROBE_RULE}`);
+        .toBe(`${withCurrentPanel(FIXTURE).replace('Work from the diff text alone',
+          "each stated guarantee in the card's Acceptance has a named test; list any guarantee without one as a finding Work from the diff text alone")} ${MUTATION_PROBE_RULE}`);
     });
 
     // WHY THIS TEST WAS REWRITTEN (#3035 r2). The version that shipped here asserted

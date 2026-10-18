@@ -1,3 +1,4 @@
+import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 /**
  * reconcile-pass.mjs — the thin IO shell around `we:scripts/conveyor/reconcile-core.mjs` (#3296): read the four
  * facts the pure pass needs, run it, and REPORT every dispatch and every refusal.
@@ -1555,7 +1556,9 @@ export function runReconcilePass({
   console.error(`fix.staleCiRerun=${staleCiRerunSetting.value} (${staleCiRerunSetting.source})`);
   const standDownHoldsAcrossHeads = loadStandDownHoldsAcrossHeads({ env });
   console.error(`fix.standDownHoldsAcrossHeads=${standDownHoldsAcrossHeads.value} (source: ${standDownHoldsAcrossHeads.source})`);
+  const timing = resolveTimingPolicy({ env });
   const plan = planReconcile({
+    reviewTiming: timing.review, fixTiming: timing.fix,
     standDownHoldsAcrossHeads,
     owedCiRerun: owedCiRerunSetting.value,
     staleCiRerun: staleCiRerunSetting.value,

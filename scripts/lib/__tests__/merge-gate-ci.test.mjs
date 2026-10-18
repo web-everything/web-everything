@@ -12,6 +12,7 @@ import { scoreEscalation } from '../review-escalation.mjs';
 import { MANIFEST_BODY_BEGIN, MANIFEST_BODY_END, extractManifestFromBody } from '../../readiness/lane-manifest.mjs';
 import { gatherPrFacts, readGroupPrs, readLedgerConfig, mergeEventOfFlags, pinnedHeadOf, bodyHistoryOf, groupHeadsOf, verifyRunningWorkflow } from '../../merge-gate-check.mjs';
 import { findDuplicateIds } from '../duplicate-id-tripwire.mjs';
+import { buildVerdictRecord, buildLedgerEvent } from '../verdict-ledger.mjs';
 
 const HEAD = 'a'.repeat(40);
 const base = () => ({
@@ -395,6 +396,68 @@ describe('ledger gate fails closed on unverifiable head/coverage (#5303)', () =>
     const f = facts({ ledger: { authority: 'both', folded: { clears: true, current: { coverage: { headSha: HEAD } } }, derived: { clears: true, holds: 'ledger-unreadable' } } });
     expect(() => evaluatePrGates(f)).not.toThrow();
     expect(evaluated(f, 'ledger')).toMatchObject({ status: 'fail-closed' });
+  });
+});
+
+describe('gatherPrFacts reads the shared verdict ledger (#5802)', () => {
+  const record = (over = {}) => buildVerdictRecord({ repo: 'o/r', pr: 7, verdict: 'accepted',
+    headSha: HEAD, at: '2026-10-01T00:00:00Z', source: 'test', ...over });
+  const read = (authority, text, { size = Buffer.byteLength(text), blobError = null, labels } = {}) => {
+    const exec = fakeExec([
+      [/^git fetch --quiet origin .*ops\/review-requests/, ''],
+      [/^git ls-tree --name-only origin\/ops\/review-requests -- verdict-ledger\/o-r.jsonl$/, 'verdict-ledger/o-r.jsonl\n'],
+      [/^git rev-parse --verify --quiet origin\/ops\/review-requests:verdict-ledger\/o-r.jsonl$/, 'b'.repeat(40)],
+      [/^git cat-file -s b{40}$/, String(size)],
+      [/^git cat-file blob b{40}$/, blobError ?? text],
+      [/pr view 7 .*--json number,title/, () => prJson(labels ? { labels } : {})],
+      GH_MANIFEST_404, GH_HISTORY(0, []),
+    ]);
+    const f = gather([], { exec, ledgerConfig: { authority } });
+    return { f, exec, result: evaluated(f, 'ledger') };
+  };
+  const log = (...rows) => rows.map(r => JSON.stringify(r)).join('\n') + '\n';
+
+  it.each(['ledger', 'both'])('%s passes a current clearance and holds a non-clearing verdict', authority => {
+    const clear = read(authority, log(record()));
+    expect(clear.f.ledger.folded).toMatchObject({ pr: 7, clears: true });
+    expect(clear.f.ledger.derived).toMatchObject({ clears: true, holds: [] });
+    expect(clear.result.status).toBe('pass');
+    expect(clear.exec.calls).toContain('git cat-file blob ' + 'b'.repeat(40));
+    expect(clear.exec.calls.some(c => /push|worktree|checkout|commit/.test(c) && /ops\/review-requests/.test(c))).toBe(false);
+    expect(read(authority, log(record({ verdict: 'changes' }))).result.status).toBe('hold');
+  });
+
+  it.each(['ledger', 'both'])('%s scopes clearance to repo, PR and current head', authority => {
+    for (const over of [{ repo: 'other/repo' }, { pr: 8 }, { headSha: 'c'.repeat(40) }]) {
+      expect(read(authority, log(record(over))).result.status, JSON.stringify(over)).toBe('hold');
+    }
+    expect(read(authority, '').result.status).toBe('hold');
+  });
+
+  it.each(['ledger', 'both'])('%s derives event holds as well as folding verdicts', authority => {
+    const hold = buildLedgerEvent({ repo: 'o/r', pr: 7, type: 'hold', at: '2026-10-02T00:00:00Z',
+      source: 'test', reasonCode: 'ci-red', holdSource: 'drain', reason: 'CI red' });
+    const out = read(authority, log(record(), hold));
+    expect(out.f.ledger.folded.clears).toBe(true);
+    expect(out.f.ledger.derived.clears).toBe(false);
+    expect(out.result.status).toBe('hold');
+  });
+
+  it.each(['ledger', 'both'])('%s fails closed on malformed, truncated or failed reads', authority => {
+    const good = log(record());
+    for (const text of [good + '{bad json}\n', good + '{}\n']) {
+      expect(read(authority, text).result.status).toBe('fail-closed');
+    }
+    // Even truncation exactly at a valid row boundary must not silently hide a later hold.
+    expect(read(authority, good, { size: Buffer.byteLength(good) + 100 }).result.status).toBe('fail-closed');
+    expect(read(authority, good, { blobError: failure('spawnSync git ENOBUFS') }).result.status).toBe('fail-closed');
+  });
+
+  it('both still respects uncleared labels and labels authority avoids ledger IO', () => {
+    expect(read('both', log(record()), { labels: [{ name: 'review:human' }] }).result.status).toBe('hold');
+    const labels = read('labels', '{malformed}');
+    expect(labels.result.status).toBe('pass');
+    expect(labels.exec.calls.some(c => c.includes('ops/review-requests'))).toBe(false);
   });
 });
 

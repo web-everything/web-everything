@@ -328,6 +328,11 @@ future-dated exhausted budget can otherwise make a fresh world wait for the prod
 Use the clone's routing policy rather than an inherited daemon snapshot, and exclude generated
 GitHub App shim directories before scanning the host's tool PATH.
 
+General simulator and soak fixtures model the full required-check set and pin `WE_REVIEW_START_AFTER=ci-green`
+in the shared world environment. Keep the planner and dispatch-time gate on the same fixture policy across
+daemon restarts. Production fast-check eligibility is covered by `review-timing-dispatch.test.mjs` and
+`review-ci-gate-io.test.mjs`; scenarios exercising that timing must explicitly set their world policy and checks.
+
 Fake-`gh` CLI fixtures that exercise throttling must set `WE_GH_THROTTLE_LOCK_ROOT` to a temporary
 directory per invocation and route the binary to their fake. An intentional rate-limit response writes
 cooldown state; sharing that state with another test or the host delays unrelated reads.
@@ -1492,7 +1497,17 @@ both, including daemon restarts; clear it only after observing a delivering PR. 
 orphan claim, persist its failure so a failed ledger write keeps the claim. Regress the #4413 shape:
 pending launch → confirmed run → dead worker with no delivery → backed-off retry → exhausted attempts.
 Validate a build card against the fetched WE origin/main backlog before acquiring its claim; missing
-identities are permanent card refusals, while an unavailable Git read remains a retryable observation.
+identities are permanent card refusals, while an unavailable Git read remains a retryable observation:
+the clone-wide `card-lookup-unavailable` code, never charged to the card's retry budget. Because history
+outlives a launch, late-launch (quick-schedule) attempts are counted apart from real failures, and the
+orphan pass keys its failure on the dead claim so a retried release never charges it twice. The ledger
+keeps every key charged to a card, not only the last: orphan and fail-group records interleave every
+tick while a release throws, and each must still dedupe its own attempt. Both key a dispatch on its run
+row's start time (`dispatch:`), so the two paths charging one dead dispatch in one tick charge it once.
+A run row can be unreadable on one pass and back on the next, so orphan adoption passes the claim
+(`orphan:`) and the row as aliases of one attempt: any charged alias dedupes, and the new aliases join it.
+Group member claims (`member:`) are aliases on both paths too: orphan adoption can release the lead claim
+before the fail-group pass looks, but the member claims survive.
 
 Prepare discovery searches each card's current lane identity, bornAs lane identity and title, then
 unions the complete results. The title is searched under both ids: a batch published before numbering
@@ -1585,3 +1600,93 @@ reads the existing runs folder without migration or writes; `OPERATION_RUNS_DIR`
 it. `--since=<iso>` selects runs by earliest seat start. Incomplete runs are shown but
 excluded from median, nearest-rank p90 and the >5-minute early-change share denominator.
 Legacy runs without seat observations are omitted; absent times are never reconstructed.
+
+### Scope-only prepare re-validation
+
+The builder may send an individually dispatched `prepare-stale` card through a light
+re-validation before full preparation, only when the hold says scope changed (age
+holds still require full preparation). `prepare.lightRevalidate` defaults to true;
+`prepare.lightRevalidateMaxDiffLines` defaults to 400. Both use the prepare policy
+cascade and source logger, with `WE_PREPARE_LIGHT_REVALIDATE` and
+`WE_PREPARE_LIGHT_REVALIDATE_MAX_DIFF_LINES` environment overrides.
+
+The prepare runner supplies the existing card sections and the scope diff from
+`preparedAgainstSha` to the pinned main base to Codex sol at low effort. The worker
+must return JSON `{ "verdict": "still-valid" | "needs-reprepare", "reason": "one line" }`
+and leave the checkout unchanged. Only `still-valid` allows the runner to append
+`revalidated: <reason>` and refresh the sanctioned stamp. Missing evidence, invalid
+answers, disabled policy, and diffs above the cap use full preparation. A worker
+that changes files, HEAD, or hooks is refused. The worker runs in Codex's `--review`
+read-only sandbox with no network; that sandbox is the guard for edits deep inside
+collapsed ignored directories such as node_modules. As a second check, a fingerprint of
+the gitignored entries git lists (content for files up to 1 MiB, mode/size/mtime for
+collapsed directories, so only adding or removing a direct child shows there) is
+compared after the run. A change escalates for a human because a discard does not
+restore ignored files.
+Re-stamps use the existing verified
+card-only prepare PR lane; the builder waits for the stamp to land on main before
+building. Light candidates are excluded from grouped prepares so each verdict
+covers exactly the card and diff inspected. No direct write to main is permitted.
+
+Regression coverage must pair dispatch eligibility with age-stale and policy-disabled
+false cases, and exercise light candidates in both group-lead and group-member positions.
+Drive each read-only refusal guard independently (card text, HEAD, hooks, ignored files, and numstat),
+asserting discard and no stamp, commit, or PR. A failed stamp after `still-valid` must
+retry full preparation with the original dispatched provider, model, and effort; the
+result's scorecard and PR attribution follow whichever worker completed preparation.
+The light worker bypasses the router, so it applies the router's admission itself: a
+critical miss on its exact provider/model/prepare triple, an active provider quota hold,
+or an unreadable trial history skips it for full preparation by the dispatched worker.
+Prompt evidence uses the shared `fenceUntrusted` helper and `FENCED_DATA_RULE`; test
+closing-tag injection in both the card and diff, including mixed case and whitespace.
+
+## Review scratch disk retention
+
+Review seats use independent shallow pinned checkouts: a released lane's objects cannot be
+borrowed safely across reset/GC. Own the scratch immediately after allocation, clean failed
+setup as well as the run's `finally`, and register catchable signal/exit cleanup. SIGKILL and
+host crashes require the health-watch backstop. Ephemeral review paths bypass the persistent
+backlog index to avoid a full snapshot for every seat.
+
+Signal cleanup stops seats before deleting their checkouts. Direct-task wrappers receive
+SIGTERM so their handlers can kill the models' separate detached process groups; cleanup
+waits for wrapper close. After ten seconds, a stuck wrapper and its observed descendants
+(including detached model groups) receive SIGKILL, with one further second to observe close.
+Unknown descendant observation or failure to close retains scratch for recovery. The outer
+timeout follows the same stop path. Re-check jurors are tracked too. Repeated signals cannot
+interrupt that wait or start another seat. Speculative cancellation holds new seats only
+until the cancellation finishes; process termination permanently stops further launches.
+A synchronous process exit requests shutdown and retains any checkout whose stop cannot
+be awaited. Retention survives callers' `finally` blocks for the health-watch sweeper.
+Ownership metadata lives at the sibling `<scratch>.owner.json`, outside the pinned worktree,
+so a tracked `.we-review-owner.json` cannot block checkout or forge the owner PID. Normal
+cleanup and the sweeper remove the sibling metadata together with its checkout.
+
+Each health-watch tick sweeps `we-review-seat-*`, `we-red-team-recheck-*`, and
+`we-overlay-dispatch-smoke-*` older than
+`config.json`'s `tmp.reviewSeatTtlMin` (120 minutes), preserving live owner PIDs and process
+working directories. Allocation and recovery share the review prefix constants. Busy cwd
+observation runs once only when an expired candidate needs it; unknown observation preserves
+checkouts. It also caps all
+`we-backlog-index-*` files together at `tmp.backlogIndexMaxMb` (2048 MiB), oldest first.
+Sweep logs include counts and bytes freed. Symlinks are never traversed.
+The `disk-space` smell probes available space on the checkout's writable data filesystem:
+warn below `health.diskFreeMinGb` (30 GiB), critical below 10 GiB. It opens immediately,
+notifies in shadow mode, and sends an opening event through the needs-you feed's serialized
+publisher. Host, subject and opening time identify each event, including reopenings within
+the same minute. Fixture state roots and dry runs never publish these events.
+
+### Tests-first delivery settings
+
+Prepared open cards must replace the Acceptance scaffold's `TODO: a command` with executable
+acceptance, one `[A<n>] Executable` line per guarantee. Unprepared cards remain exempt. Builders
+run and record failing acceptance tests before implementation, make their first commit contain
+only those new or updated tests, and report the named tests' red-then-green results. Reviewers
+map every stated Acceptance guarantee to a named test and report missing mappings as findings.
+
+`build.requireExecutableAcceptance`, `build.redFirst`, and `build.guaranteesMapToTests` default
+ON. They resolve through the shared policy cascade: standard → platform → repository
+(`scripts/settings/tests-first.json`) → environment (the `WE_BUILD_*` names documented there),
+with each source logged. Dispatch strips disabled brief sections. The verify step's first-commit
+check applies to build lane branches and delivery leases on local `main`, and warns if no test was added or updated; this advisory
+cannot prove a red run. Git-read errors are reported as unknown rather than evidence of compliance.

@@ -125,7 +125,7 @@ describe('buildOverlapRows — #4308 row-shape wiring (2026-09-29 review finding
   it('unions body deps with verdict deps (verdict never replaced) and tolerates a missing/invalid manifest', () => {
     const body = embedManifestInBody('', { item: 200, blockedBy: [100] });
     const openPrContext = { prsByRepo: new Map([['we', [{ ...rawPr(20), body }, { ...rawPr(21), body: 'no manifest here' }, rawPr(22)]]]) };
-    const verdicts = [{ num: 20, repo: 'we', decision: 'skip', item: 200, blockedBy: [7], stackParents: [] }];
+    const verdicts = [{ num: 20, repo: 'we', decision: 'merge', item: 200, blockedBy: [7], stackParents: [] }];
     const { openPrRows } = buildOverlapRows({ candidates: [], verdicts, openPrContext });
     const byNum = (n) => openPrRows.find((r) => r.number === n);
     expect([...byNum(20).dependsOn].sort((a, b) => a - b)).toEqual([7, 100]);

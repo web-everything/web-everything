@@ -1,0 +1,4 @@
+{
+  "$description": "Tests-first delivery. All three build leaves default to true in scripts/lib/tests-first-policy.mjs. Cascade: standard → platform build → repository build → WE_BUILD_REQUIRE_EXECUTABLE_ACCEPTANCE / WE_BUILD_RED_FIRST / WE_BUILD_GUARANTEES_MAP_TO_TESTS (true/false or 1/0). Each source is logged. Set a build leaf here only to override the platform preference. redFirst's commit inspection is advisory; it cannot prove the tests were run red.",
+  "build": {}
+}

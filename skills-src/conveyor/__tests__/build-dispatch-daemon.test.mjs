@@ -54,8 +54,10 @@ import {
   EVIDENCE_CACHE_MAX_ENTRIES, prepareEvidenceCacheSizes,
   // ruled-hold-release — the card-change reader and the clone-stale launch gate
   cliCardChangedSince, cliDispatcherFresh,
+  defaultExecAsync,
 } from '../build-dispatch-daemon.mjs';
 import { listHoldFindings } from '../../../scripts/conveyor/build-dispatch-hold-router.mjs';
+import { recordBuildFailure as recordBuildFailureAt, listBuildBackoffs, dispatchAttemptKey, claimAttemptKeys } from '../../../scripts/conveyor/build-dispatch-failures.mjs';
 import { MAX_CONCURRENT_LANES_ENV } from '../../../scripts/lib/lane-concurrency.mjs';
 import {
   acquireBuildDispatchClaim, releaseBuildDispatchClaim, listBuildDispatchClaims,
@@ -2206,6 +2208,7 @@ describe('automatic item preparation', () => {
       expect(effects.dispatch).toHaveBeenCalledTimes(launches ? 1 : 0);
       expect(effects.listPrepareClaims()).toHaveLength(launches ? 1 : 0);
       if (launches) {
+        expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({ lightRevalidate: true, launchKind: 'prepare-item' }));
         expect(tick.prepare.refused).toEqual([]);
       } else {
         // The planning skip carries the same reconciliation note and persisted refusal the launch guard writes.
@@ -2217,6 +2220,23 @@ describe('automatic item preparation', () => {
         expect(log).toHaveBeenCalledWith(expect.stringContaining(note));
       }
     } finally { log.mockRestore(); }
+  });
+  it.each([undefined, true, false].flatMap(enabled => [
+    ['scope changed since aaaa1111: scripts/a.mjs', enabled, enabled !== false],
+    ['prepared 2026-10-01 16d ago', enabled, false],
+  ]))('dispatches scope/age hold %s with light policy %s as light=%s', async (detail, enabled, lightRevalidate) => {
+    const effects = fixture();
+    effects.preparePolicy = () => resolvePreparePolicy({ tool: enabled === undefined ? {} : { lightRevalidate: enabled } });
+    effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5966' }], admission: {
+      queue: [{ num: '5966', preparedDate: '2026-10-01', preparedAgainstSha: 'aaaa1111' }],
+      held: [{ num: '5966', reason: 'prepare-stale', detail }],
+    } }, nextState: {} });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.launched.map(r => r.num)).toEqual(['5966']);
+    expect(effects.dispatch).toHaveBeenCalledTimes(1);
+    expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({
+      num: '5966', launchKind: 'prepare-item', lightRevalidate,
+    }));
   });
   it('a planning skip with an open duplicate beside the merge persists the open PR, as the launch guard does', async () => {
     const effects = fixture();
@@ -3398,6 +3418,24 @@ describe('probation prepare route circuit breaker', () => {
     expect(prepareRouteFallback([failed[0], row('24', 'opened-pr', 99), failed[1]])).toBe(true);
     expect(prepareRouteFallback([...failed, row('26', 'opened-pr', 99)])).toBe(true);
   });
+  it('hands the scope-only candidate to the detached prepare runner through its environment', async () => {
+    const exec = vi.fn(() => '{}');
+    cliDispatch({ num: '4327', launchKind: 'prepare-item', lightRevalidate: true }, { exec });
+    const env = exec.mock.calls[0][2].env;
+    expect(env.WE_PREPARE_LIGHT_REVALIDATE_ITEM).toBe('4327');
+    const { parseArgs } = await import('../../../scripts/operations/probation-build-run.mjs');
+    const previous = process.env.WE_PREPARE_LIGHT_REVALIDATE_ITEM;
+    try {
+      process.env.WE_PREPARE_LIGHT_REVALIDATE_ITEM = env.WE_PREPARE_LIGHT_REVALIDATE_ITEM;
+      expect(parseArgs(['--num=4327', '--taskType=prepare']).lightRevalidate).toBe(true);
+      expect(parseArgs(['--num=4328', '--taskType=prepare']).lightRevalidate).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.WE_PREPARE_LIGHT_REVALIDATE_ITEM;
+      else process.env.WE_PREPARE_LIGHT_REVALIDATE_ITEM = previous;
+    }
+    cliDispatch({ num: '4328', launchKind: 'prepare-item' }, { exec });
+    expect(exec.mock.calls.at(-1)[2].env.WE_PREPARE_LIGHT_REVALIDATE_ITEM).toBe('');
+  });
   it('disables probation only for fallback prepares without overriding the policy model', () => {
     for (const launchKind of ['prepare-item', 'build']) {
       const exec = vi.fn(() => '{}');
@@ -4071,6 +4109,92 @@ describe('grouped BUILD daemon ticks', () => {
     expect(result.dispatched.some(r => r.num === '7101')).toBe(false);
   });
 
+  it('fail-group charges one dropped-member attempt once while its claims fail to release (PR #5453)', async () => {
+    vi.stubEnv('WE_BUILD_GROUP_MEMBER_FAILURE', 'fail-group');
+    const dir = mkdtempSync(join(tmpdir(), 'group-charge-once-'));
+    const path = join(dir, 'failures.json');
+    try {
+      const effects = fixture({ claims: rows.map((r, i) => ({ ...r, ...(i ? { groupLead: '7101' } : {}) })),
+        settled: [{ num: '7101', runId: 'run-7101', startedAt: '2099-01-01T00:00:00Z', outcome: 'pr-opened', groupDropped: ['7102'] }] });
+      effects.recordBuildFailure = o => recordBuildFailureAt(o, { path, now: 0 });
+      effects.releaseClaim = () => { throw new Error('lock store unavailable'); };
+      for (let i = 0; i < 4; i++) await runBuildDispatchTick({ live: true, policy, effects }).catch(() => {});
+      expect(JSON.parse(readFileSync(path, 'utf8')).items['7101']).toMatchObject({ reasonCode: 'dispatch-failed', attempts: 1 });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('fail-group and orphan adoption charge one dead dispatch once, in the same tick and every tick after (PR #5453)', async () => {
+    vi.stubEnv('WE_BUILD_GROUP_MEMBER_FAILURE', 'fail-group');
+    const dir = mkdtempSync(join(tmpdir(), 'group-orphan-charge-once-'));
+    const path = join(dir, 'failures.json');
+    try {
+      const effects = fixture({ claims: rows.map((r, i) => ({ ...r, ...(i ? { groupLead: '7101' } : {}) })),
+        settled: [{ num: '7101', runId: 'run-7101', startedAt: '2099-01-01T00:00:00Z', outcome: 'pr-opened', groupDropped: ['7102'] }] });
+      const settings = { baseMs: 1000, maxMs: 5000, maxAttempts: 3 };
+      effects.recordBuildFailure = o => recordBuildFailureAt(o, { path, now: 0, settings });
+      // The orphan pass runs first each tick and records the dead lead dispatch (the same run row the fail-group
+      // pass reads settled) before its (throwing) release; the orphan-adopt suite pins that it keys it this way.
+      effects.adoptOrphans = () => [recordBuildFailureAt({ num: '7101', reason: 'build-not-started: orphan-released',
+        attemptKey: dispatchAttemptKey('2099-01-01T00:00:00Z') }, { path, now: 0, settings })];
+      effects.releaseClaim = () => { throw new Error('lock store unavailable'); };
+      for (let i = 0; i < 3; i++) await runBuildDispatchTick({ live: true, policy, effects }).catch(() => {});
+      expect(JSON.parse(readFileSync(path, 'utf8')).items['7101']).toMatchObject({ attempts: 1, exhausted: false });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('fail-group never re-charges a dispatch orphan adoption charged by its claim while the run row was unreadable (PR #5453)', async () => {
+    vi.stubEnv('WE_BUILD_GROUP_MEMBER_FAILURE', 'fail-group');
+    const dir = mkdtempSync(join(tmpdir(), 'group-orphan-claim-alias-'));
+    const path = join(dir, 'failures.json');
+    try {
+      const effects = fixture({ claims: rows.map((r, i) => ({ ...r, ...(i ? { groupLead: '7101' } : {}) })),
+        settled: [{ num: '7101', source: 'run dispatch-lane-7101', startedAt: '2099-01-01T00:00:00Z', outcome: 'pr-opened', groupDropped: ['7102'] }] });
+      const settings = { baseMs: 1000, maxMs: 5000, maxAttempts: 2 };
+      const leadClaimedAt = effects.listClaims().find(c => c.meta.num === '7101').meta.claimedAt;
+      // The orphan pass saw no run row: it could key the dead dispatch on its claim alone.
+      recordBuildFailureAt({ num: '7101', reason: 'build-not-started: orphan-released', attemptKey: [`orphan:${leadClaimedAt}`] }, { path, now: 0, settings });
+      effects.recordBuildFailure = o => recordBuildFailureAt(o, { path, now: 0, settings });
+      effects.releaseClaim = () => { throw new Error('lock store unavailable'); };
+      for (let i = 0; i < 2; i++) await runBuildDispatchTick({ live: true, policy, effects }).catch(() => {});
+      expect(JSON.parse(readFileSync(path, 'utf8')).items['7101']).toMatchObject({ attempts: 1, exhausted: false });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('fail-group never re-charges a dispatch orphan adoption charged and released while its row was unreadable (PR #5453)', async () => {
+    vi.stubEnv('WE_BUILD_GROUP_MEMBER_FAILURE', 'fail-group');
+    const dir = mkdtempSync(join(tmpdir(), 'group-orphan-member-alias-'));
+    const path = join(dir, 'failures.json');
+    try {
+      const effects = fixture({ claims: rows.map((r, i) => ({ ...r, ...(i ? { groupLead: '7101' } : {}) })),
+        settled: [{ num: '7101', source: 'run dispatch-lane-7101', startedAt: '2099-01-01T00:00:00Z', outcome: 'pr-opened', groupDropped: ['7102'] }] });
+      const settings = { baseMs: 1000, maxMs: 5000, maxAttempts: 2 };
+      // The orphan pass saw no run row: it keyed the dead dispatch on the group's claims, then released the lead claim.
+      recordBuildFailureAt({ num: '7101', reason: 'build-not-started: orphan-released', attemptKey: claimAttemptKeys(effects.listClaims(), '7101') }, { path, now: 0, settings });
+      effects.releaseClaim({ num: '7101' });
+      expect(effects.listClaims().some(c => c.meta.num === '7101')).toBe(false);
+      effects.recordBuildFailure = o => recordBuildFailureAt(o, { path, now: 0, settings });
+      effects.releaseClaim = () => { throw new Error('lock store unavailable'); };
+      for (let i = 0; i < 2; i++) await runBuildDispatchTick({ live: true, policy, effects }).catch(() => {});
+      expect(JSON.parse(readFileSync(path, 'utf8')).items['7101']).toMatchObject({ attempts: 1, exhausted: false });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('fail-group keys a settled row with no start time on its run, never on an empty key (PR #5453)', async () => {
+    vi.stubEnv('WE_BUILD_GROUP_MEMBER_FAILURE', 'fail-group');
+    const effects = fixture({ claims: rows.map((r, i) => ({ ...r, ...(i ? { groupLead: '7101' } : {}) })),
+      settled: [{ num: '7101', source: 'run dispatch-lane-7101', startedAt: '', outcome: 'pr-opened', groupDropped: ['7102'] }] });
+    await runBuildDispatchTick({ live: true, policy, effects });
+    expect(effects.recordBuildFailure).toHaveBeenCalledWith(expect.objectContaining({ num: '7101', attemptKey: ['group:run dispatch-lane-7101'] }));
+  });
+
+  it('fail-group keys a settled row with a start time on the shared dispatch key (PR #5453)', async () => {
+    vi.stubEnv('WE_BUILD_GROUP_MEMBER_FAILURE', 'fail-group');
+    const effects = fixture({ claims: rows.map((r, i) => ({ ...r, ...(i ? { groupLead: '7101' } : {}) })),
+      settled: [{ num: '7101', source: 'run dispatch-lane-7101', startedAt: '2099-01-01T00:00:00Z', outcome: 'pr-opened', groupDropped: ['7102'] }] });
+    await runBuildDispatchTick({ live: true, policy, effects });
+    expect(effects.recordBuildFailure).toHaveBeenCalledWith(expect.objectContaining({ num: '7101', attemptKey: expect.arrayContaining(['dispatch:2099-01-01T00:00:00Z']) }));
+  });
+
   it('ignores stale drop results from an older lead attempt', async () => {
     const effects = fixture({ claims: rows.map((r, i) => ({ ...r, ...(i ? { groupLead: '7101' } : {}) })),
       settled: [{ num: '7101', startedAt: '2000-01-01T00:00:00Z', outcome: 'pr-opened', groupDropped: ['7102'] }] });
@@ -4128,6 +4252,26 @@ describe('grouped PREPARE daemon ticks', () => {
   }
   beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'bdd-group-prepare-')); });
   afterEach(() => { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); });
+
+  it.each(['lead', 'member'])('excludes a scope-stale light candidate from grouped prepare as %s', async position => {
+    const effects = fixture();
+    const stale = position === 'lead' ? rows[0] : rows[1];
+    const spawns = position === 'lead' ? [stale, rows[1]] : [rows[0], stale];
+    effects.preparePolicy = () => resolvePreparePolicy();
+    effects.loadGroupingCards = vi.fn(async () => rows.map(r => ({ ...r, kind: 'story', size: 1 })));
+    effects.planTick = () => ({ decisions: { spawnPrepareItems: spawns, admission: { queue: rows, held: rows.map(r => ({
+      num: r.num, reason: r === stale ? 'prepare-stale' : 'needs-prepare',
+      ...(r === stale ? { detail: 'scope changed since aaaa1111: scripts/a.mjs' } : {}),
+    })) } }, nextState: {} });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.groups).toHaveLength(1);
+    expect(tick.prepare.groups[0].lead).not.toBe(stale.num);
+    expect(tick.prepare.groups[0].members).not.toContain(stale.num);
+    const launches = effects.dispatch.mock.calls.map(([request]) => request);
+    expect(launches.find(r => r.num === stale.num)).toMatchObject({ launchKind: 'prepare-item', lightRevalidate: true });
+    expect(launches.find(r => r.num === stale.num).groupMembers).toBeUndefined();
+    expect(launches.find(r => r.num !== stale.num).groupMembers).toHaveLength(3);
+  });
 
   it('uses enriched minimal queue rows for the per-group prepare pool', async () => {
     const queue = rows.slice(0, 4).map(({ num, scope }) => ({ num, scope, preparedDate: null }));
@@ -4529,5 +4673,42 @@ describe('prepare discovery under repository PR volume', () => {
     expect(acquireClaim).not.toHaveBeenCalled();
     expect(dispatch).not.toHaveBeenCalled();
     expect(recordBuildFailure).toHaveBeenCalledWith({ num: '99999', reason: 'build card #99999 unavailable on origin/main' });
+  });
+
+  it('routes async prepare discovery gh calls through the shared throttle', async () => {
+    const run = vi.fn((file, args, opts, done) => done(null, '[]'));
+    await expect(defaultExecAsync('gh', ['pr', 'list'], { cwd: '/x', maxBuffer: 9 }, run)).resolves.toBe('[]');
+    expect(run).toHaveBeenCalledWith(process.execPath, [expect.stringMatching(/[/\\]scripts[/\\]lib[/\\]gh-throttle\.mjs$/), 'pr', 'list'],
+      expect.objectContaining({ cwd: '/x', maxBuffer: 9 }), expect.any(Function));
+    await defaultExecAsync('git', ['ls-tree'], {}, run);
+    expect(run).toHaveBeenLastCalledWith('git', ['ls-tree'], expect.any(Object), expect.any(Function));
+  });
+
+  it('never charges a card for an origin/main read outage before its claim', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'build-card-outage-'));
+    const path = join(dir, 'failures.json');
+    try {
+      const exec = vi.fn((cmd) => { if (cmd === 'git') throw new Error('fatal: unable to access origin'); throw new Error(`unexpected ${cmd}`); });
+      const acquireClaim = vi.fn();
+      const dispatch = vi.fn();
+      const tick = () => {
+        const reader = createPrepareStatusReader({ exec });
+        return runBuildDispatchTick({ live: true, effects: {
+          planTick: () => ({ decisions: { spawnBuilds: [{ num: '4413', lane: 1 }], admission: {
+            queue: [{ num: '4413', scope: ['we:scripts/a.mjs'] }], cleared: [{ num: '4413', ready: true }],
+          } }, nextState: {} }),
+          fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [],
+          killSwitch: () => ({ engaged: false }), resolveBuildCard: args => reader.resolveCard(args),
+          dispatch, acquireClaim, recordBuildFailure: o => recordBuildFailureAt(o, { path }),
+        } });
+      };
+      for (let i = 0; i < 8; i++) {
+        expect((await tick()).failures).toContainEqual(expect.objectContaining({ num: '4413', stage: 'card', reason: 'build card lookup unavailable' }));
+      }
+      expect(acquireClaim).not.toHaveBeenCalled();
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')).items?.['4413'] : undefined).toBeUndefined();
+      expect(listBuildBackoffs({ path })).toEqual([]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

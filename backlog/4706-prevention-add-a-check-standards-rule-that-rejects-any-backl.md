@@ -24,3 +24,7 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#3
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5490 (finding 1: `we:backlog/6192-build-dispatch-expired-group-member-claim-aliases-must-not-m.md:15` — Have the prepare step, or a check:standards rule on new backlog cards, reject cards whose Acceptance or Non-goals still contain 'TODO:' placeholders. The card could also be prepared Acceptance filled in before it is dispatched.) · key `approval-prevention-key:web-everything/web-everything#5490@e1dbe4bb0d951c9437dca6d4b8696a946ce3ca88`

@@ -35,6 +35,7 @@ import { fileURLToPath } from 'node:url';
 
 import { compareCarryFingerprints, resolveCarryEquivalenceSetting } from './carry-equivalence.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { MARKER_RE, JOB_RE } from './approval-prevention-notice.mjs';
 
 export const ACCEPT_CARRY_FORWARD_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'accept-carry-forward.json');
 
@@ -125,16 +126,37 @@ const ADVISORY_NOTE_RE = /^\s*\**\s*⚠️ THIS IS AN ADVISORY REVIEW, NOT A REC
 const ADVISORY_CHANGES_RE = /\*\*Advisory outcome:\*\*\s*`?changes`?/i;
 
 /**
- * Pure: is this comment body (any author) a recognised machine shape that cannot be a hold? An empty body says nothing.
+ * Exactly the notice runApprovalPreventionFiling writes, including its bounded variable fields.
+ * Reuse the filer's marker parsers; a marker embedded in prose never exempts that prose from a hold.
+ * Body-only consumers (numbering / live carry) cannot authenticate authors without changing their interfaces.
+ */
+function isApprovalPreventionNotice(text, comment) {
+  if (comment !== undefined && !isTrustedMarkerAuthor(comment)) return false;
+  const marker = text.matchAll(MARKER_RE).next().value;
+  if (!marker || marker.index !== 0) return false;
+  let rest = text.slice(marker[0].length);
+  if (rest.startsWith(' ')) {
+    const job = JOB_RE.exec(rest);
+    if (!job || job.index !== 1) return false;
+    rest = rest.slice(1 + job[0].length);
+  }
+  // Both filer outcomes: an existing backlog card, or a detached landing job's tracking handle.
+  const fixedText = /^\nFiled the prevention guard\(s\) owed by [A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#[1-9][0-9]*'s independent review, mechanically, on approval \(operator rule, 2026-09-27\) — (?:backlog\/[A-Za-z0-9._-]+\.md \(#(?:[1-9][0-9]*|\?)\)|queued for landing via a lane \(tracking (?:pid:[1-9][0-9]*|an untracked job)\))\./;
+  return fixedText.exec(rest)?.[0] === rest;
+}
+
+/**
+ * Pure: is this comment body a recognised machine shape that cannot be a hold?
+ * Approval-prevention notices require a trusted author when the caller supplies comment metadata. An empty body says nothing.
  * Verdicts, re-arms, stand-downs and non-mechanical drain parks are NOT machine shapes (they supersede the accept).
  */
-export function isKnownMachineBody(body) {
+export function isKnownMachineBody(body, comment = undefined) {
   const text = typeof body === 'string' ? body : '';
   if (!text.trim()) return true;
   if (isLaterVerdictBody(text)) return false;
   if (MECHANICAL_PARK_RE.test(text)) return true;
   if (ADVISORY_NOTE_RE.test(text)) return !ADVISORY_CHANGES_RE.test(text);
-  return KNOWN_MACHINE_SHAPE_RES.some((re) => re.test(text));
+  return isApprovalPreventionNotice(text, comment) || KNOWN_MACHINE_SHAPE_RES.some((re) => re.test(text));
 }
 
 /**
@@ -209,7 +231,7 @@ export function latestAcceptRecord(comments, reviews = undefined) {
     .some((c) => BODY_DERIVED_HOLD_RE.test(typeof c?.body === 'string' ? c.body : ''));
   // ANY author: an unrecognised comment is a possible hold (see the file's "inverted rule" note), a recognised verdict
   // shape is one. A formal review that stands against the accept is the other channel.
-  const laterVerdict = later.some((c) => !isKnownMachineBody(c?.body)) || (Array.isArray(reviews) && laterReviewHold(reviews, rec.at));
+  const laterVerdict = later.some((c) => !isKnownMachineBody(c?.body, c)) || (Array.isArray(reviews) && laterReviewHold(reviews, rec.at));
   return { ...rec, laterBodyDerivedHold, laterVerdict, reviewsUnreadable: reviews === null };
 }
 

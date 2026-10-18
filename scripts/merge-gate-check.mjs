@@ -46,6 +46,9 @@ import { loadMergeDeliveryPolicy, formatMergeDeliverySourcesLine } from './lib/m
 import { readSettings, readDeclaredSettings } from './lib/settings-files.mjs';
 import { GATE_IDS } from './lib/merge-gate-inventory.mjs';
 import { REVIEW_AUTHORITIES } from './lib/pr-merge-gate.mjs';
+import { readLedgerFromGit } from './lib/verdict-ledger-io.mjs';
+import { foldVerdictLedger, validateLedgerEvent } from './lib/verdict-ledger.mjs';
+import { derivePrState } from './lib/pr-state.mjs';
 import { rulesetSuggestion, readPinnedChangedFiles } from './lib/merge-queue-enqueue.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { readSharedFreeze, flatText } from './lib/red-main-freeze-shared.mjs';
@@ -160,8 +163,8 @@ export function readLedgerConfig(read = readDeclaredSettings) {
 export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds = null, ledgerConfig = null, redMain = null, mainCi = null, expectedHeadSha = null, requireExpectedHead = false, exec = execFileSync }) {
   const facts = { repo, num };
   // Ledger authority: gathered FIRST, so even a PR-read failure below carries the configured authority. A caller
-  // that supplies no `ledgerConfig` gets an error (fail closed), never a silent `labels`. The ledger evidence
-  // itself (folded/derived) is not wired yet → null, which `ledger`/`both` defer (fail closed).
+  // that supplies no `ledgerConfig` gets an error (fail closed), never a silent `labels`. Ledger evidence
+  // is read below once the PR's judged head is pinned; labels authority needs no ledger IO.
   facts.ledger = ledgerConfig ? { ...ledgerConfig, folded: null, derived: null } : { error: 'ledgerConfig not supplied', folded: null, derived: null };
   try { facts.pr = ghJson(['pr', 'view', String(num), '--repo', repo, '--json', PR_FIELDS], exec); }
   catch (e) { facts.prReadError = firstLine(e); return facts; }
@@ -172,6 +175,37 @@ export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds
   // THE JUDGED COMMIT: every git read below is pinned to this exact sha, never to pr.headRefName.
   const pin = pinnedHeadOf(pr, { expected: expectedHeadSha, requireExpected: requireExpectedHead });
   facts.pinnedHead = pin;
+
+  if (!facts.ledger.error && ['ledger', 'both'].includes(facts.ledger.authority)) {
+    try {
+      if (pin.error) throw new Error(`head not pinned: ${pin.error}`);
+      let blobSize;
+      const read = readLedgerFromGit({ board: cwd, repo, exec: (args, opts) => {
+        const output = exec('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+        if (args[0] === 'cat-file' && args[1] === '-s') blobSize = Number(String(output).trim());
+        if (args[0] === 'cat-file' && args[1] === 'blob' && Buffer.byteLength(output) !== blobSize) {
+          throw new Error('ledger blob read truncated: byte count differs from declared size');
+        }
+        return output;
+      } });
+      if (read.status !== 'ok') throw new Error(`${read.reason}: ${read.error}`);
+      // The shared parser is tolerant. A gate must instead reject every malformed nonblank row:
+      // silently skipping a corrupt hold could expose an earlier clearance.
+      const events = read.text.split('\n').filter(line => line.trim()).map(line => {
+        const checked = validateLedgerEvent(JSON.parse(line));
+        if (!checked.valid) throw new Error('malformed ledger entry');
+        return checked.record;
+      });
+      const mine = events.filter(e => e.pr === Number(num) && e.repo.trim().toLowerCase() === repo.trim().toLowerCase());
+      facts.ledger.folded = foldVerdictLedger(mine.filter(e => e.type === 'verdict' || e.type === undefined)).get(Number(num))
+        ?? { pr: Number(num), repo, current: null, clears: false, history: [], outstandingHolds: [] };
+      facts.ledger.derived = derivePrState(mine, { repo, pr: Number(num), head: { sha: pin.sha },
+        now: new Date().toISOString(), state: 'OPEN', requiredChecks: [], sessions: [], handoffs: [], refusals: [] });
+    } catch (e) {
+      facts.ledger.folded = { unreadable: true, reason: firstLine(e) };
+      facts.ledger.derived = null;
+    }
+  }
 
   // Manifest: the PR body first, the legacy tree file (at the pinned sha) second (the drain's readPrManifest order).
   const fromBody = extractManifestFromBody(pr.body);

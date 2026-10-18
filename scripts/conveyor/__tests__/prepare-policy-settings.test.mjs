@@ -4,8 +4,8 @@ import { resolvePreparePolicy, readPreparePolicy } from '../prepare-policy-setti
 
 describe('prepare policy cascade', () => {
   it('defaults booleans to true and runner to codex', () => {
-    expect(resolvePreparePolicy()).toEqual({ batchParallel: true, batchMaxParallel: 3, batchSize: 6, aheadCount: 20, retryUnstampedOnce: true, autoSize: true, runner: 'codex', mergedGuardHours: 24, maxPrListingCallsPerTick: 128,
-      sources: { batchParallel: 'standard', batchMaxParallel: 'standard', batchSize: 'standard', aheadCount: 'standard', retryUnstampedOnce: 'standard', autoSize: 'standard', runner: 'standard', mergedGuardHours: 'standard', maxPrListingCallsPerTick: 'standard' } });
+    expect(resolvePreparePolicy()).toEqual({ batchParallel: true, batchMaxParallel: 3, batchSize: 6, aheadCount: 20, lightRevalidate: true, lightRevalidateMaxDiffLines: 400, retryUnstampedOnce: true, autoSize: true, runner: 'codex', mergedGuardHours: 24, maxPrListingCallsPerTick: 128,
+      sources: { batchParallel: 'standard', batchMaxParallel: 'standard', batchSize: 'standard', aheadCount: 'standard', lightRevalidate: 'standard', lightRevalidateMaxDiffLines: 'standard', retryUnstampedOnce: 'standard', autoSize: 'standard', runner: 'standard', mergedGuardHours: 'standard', maxPrListingCallsPerTick: 'standard' } });
   });
   it('cascades mergedGuardHours with numeric validation and sources', () => {
     const env = { WE_PLATFORM_PREFERENCES_FILE: '/nonexistent/prepare-test.json' };
@@ -45,14 +45,14 @@ describe('prepare policy cascade', () => {
   it('layers each boolean independently', () => {
     expect(resolvePreparePolicy({ platform: { autoSize: false, retryUnstampedOnce: false },
       tool: { autoSize: true }, env: { WE_PREPARE_RETRY_UNSTAMPED_ONCE: '1', WE_PREPARE_AUTO_SIZE: '0' } }))
-      .toEqual({ batchParallel: true, batchMaxParallel: 3, batchSize: 6, aheadCount: 20, autoSize: false, retryUnstampedOnce: true, runner: 'codex', mergedGuardHours: 24, maxPrListingCallsPerTick: 128, sources: { batchParallel: 'standard', batchMaxParallel: 'standard', batchSize: 'standard', aheadCount: 'standard', autoSize: 'env', retryUnstampedOnce: 'env', runner: 'standard', mergedGuardHours: 'standard', maxPrListingCallsPerTick: 'standard' } });
+      .toEqual({ batchParallel: true, batchMaxParallel: 3, batchSize: 6, aheadCount: 20, lightRevalidate: true, lightRevalidateMaxDiffLines: 400, autoSize: false, retryUnstampedOnce: true, runner: 'codex', mergedGuardHours: 24, maxPrListingCallsPerTick: 128, sources: { batchParallel: 'standard', batchMaxParallel: 'standard', batchSize: 'standard', aheadCount: 'standard', lightRevalidate: 'standard', lightRevalidateMaxDiffLines: 'standard', autoSize: 'env', retryUnstampedOnce: 'env', runner: 'standard', mergedGuardHours: 'standard', maxPrListingCallsPerTick: 'standard' } });
     expect(resolvePreparePolicy({ platform: { autoSize: false }, tool: { retryUnstampedOnce: false } }).sources)
-      .toEqual({ batchParallel: 'standard', batchMaxParallel: 'standard', batchSize: 'standard', aheadCount: 'standard', autoSize: 'platform', retryUnstampedOnce: 'tool', runner: 'standard', mergedGuardHours: 'standard', maxPrListingCallsPerTick: 'standard' });
+      .toEqual({ batchParallel: 'standard', batchMaxParallel: 'standard', batchSize: 'standard', aheadCount: 'standard', lightRevalidate: 'standard', lightRevalidateMaxDiffLines: 'standard', autoSize: 'platform', retryUnstampedOnce: 'tool', runner: 'standard', mergedGuardHours: 'standard', maxPrListingCallsPerTick: 'standard' });
   });
   it('ignores invalid values at their layer', () => {
     expect(resolvePreparePolicy({ platform: { autoSize: false, retryUnstampedOnce: 'false' },
       tool: { autoSize: 'true', retryUnstampedOnce: 0 }, env: { WE_PREPARE_AUTO_SIZE: 'oops' } }))
-      .toEqual({ batchParallel: true, batchMaxParallel: 3, batchSize: 6, aheadCount: 20, autoSize: false, retryUnstampedOnce: true, runner: 'codex', mergedGuardHours: 24, maxPrListingCallsPerTick: 128, sources: { batchParallel: 'standard', batchMaxParallel: 'standard', batchSize: 'standard', aheadCount: 'standard', autoSize: 'platform', retryUnstampedOnce: 'standard', runner: 'standard', mergedGuardHours: 'standard', maxPrListingCallsPerTick: 'standard' } });
+      .toEqual({ batchParallel: true, batchMaxParallel: 3, batchSize: 6, aheadCount: 20, lightRevalidate: true, lightRevalidateMaxDiffLines: 400, autoSize: false, retryUnstampedOnce: true, runner: 'codex', mergedGuardHours: 24, maxPrListingCallsPerTick: 128, sources: { batchParallel: 'standard', batchMaxParallel: 'standard', batchSize: 'standard', aheadCount: 'standard', lightRevalidate: 'standard', lightRevalidateMaxDiffLines: 'standard', autoSize: 'platform', retryUnstampedOnce: 'standard', runner: 'standard', mergedGuardHours: 'standard', maxPrListingCallsPerTick: 'standard' } });
     expect(resolvePreparePolicy({ env: { WE_PREPARE_AUTO_SIZE: 'false', WE_PREPARE_RETRY_UNSTAMPED_ONCE: 'true' } }).autoSize).toBe(false);
   });
   it('uses the cascade source logger', () => {
@@ -61,7 +61,7 @@ describe('prepare policy cascade', () => {
     try {
       readPreparePolicy({ env: { WE_PLATFORM_PREFERENCES_FILE: '/nonexistent/prepare-test.json',
         WE_POLICY_CASCADE_LOG: '1', WE_PREPARE_AUTO_SIZE: 'false' }, read: () => ({ prepare: { retryUnstampedOnce: false } }) });
-      expect(log).toHaveBeenCalledWith('policy-cascade · prepare: batchParallel=true (standard), batchMaxParallel=3 (standard), batchSize=6 (standard), aheadCount=20 (standard), retryUnstampedOnce=false (tool), runner="codex" (standard), mergedGuardHours=24 (standard), maxPrListingCallsPerTick=128 (standard), autoSize=false (env)');
+      expect(log).toHaveBeenCalledWith('policy-cascade · prepare: batchParallel=true (standard), batchMaxParallel=3 (standard), batchSize=6 (standard), aheadCount=20 (standard), lightRevalidate=true (standard), lightRevalidateMaxDiffLines=400 (standard), retryUnstampedOnce=false (tool), runner="codex" (standard), mergedGuardHours=24 (standard), maxPrListingCallsPerTick=128 (standard), autoSize=false (env)');
     } finally { log.mockRestore(); resetCascadeLogForTest(); }
   });
   it('reads the feature block and tolerates unreadable settings', () => {
@@ -108,4 +108,21 @@ it('cascades isolated batch settings and logs their sources', () => {
   expect(log.mock.calls.flat().join(' ')).toMatch(/batchParallel=false.*tool/);
   expect(log.mock.calls.flat().join(' ')).toMatch(/batchMaxParallel=3.*standard/);
   log.mockRestore();
+});
+
+it('cascades light revalidation switches and validates the diff cap with sources', () => {
+  expect(resolvePreparePolicy()).toMatchObject({ lightRevalidate: true, lightRevalidateMaxDiffLines: 400,
+    sources: { lightRevalidate: 'standard', lightRevalidateMaxDiffLines: 'standard' } });
+  expect(resolvePreparePolicy({ platform: { lightRevalidate: false, lightRevalidateMaxDiffLines: 200 } }))
+    .toMatchObject({ lightRevalidate: false, lightRevalidateMaxDiffLines: 200,
+      sources: { lightRevalidate: 'platform', lightRevalidateMaxDiffLines: 'platform' } });
+  expect(resolvePreparePolicy({ tool: { lightRevalidate: false, lightRevalidateMaxDiffLines: 100 } }))
+    .toMatchObject({ sources: { lightRevalidate: 'tool', lightRevalidateMaxDiffLines: 'tool' } });
+  expect(resolvePreparePolicy({ tool: { lightRevalidate: false, lightRevalidateMaxDiffLines: 100 },
+    env: { WE_PREPARE_LIGHT_REVALIDATE: 'true', WE_PREPARE_LIGHT_REVALIDATE_MAX_DIFF_LINES: '0' } }))
+    .toMatchObject({ lightRevalidate: true, lightRevalidateMaxDiffLines: 0,
+      sources: { lightRevalidate: 'env', lightRevalidateMaxDiffLines: 'env' } });
+  for (const cap of [-1, 1.5, Infinity, '400', null]) {
+    expect(resolvePreparePolicy({ tool: { lightRevalidateMaxDiffLines: cap } }).lightRevalidateMaxDiffLines).toBe(400);
+  }
 });

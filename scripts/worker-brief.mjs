@@ -1,8 +1,9 @@
+import { testsFirstWorkerRule } from './lib/tests-first-policy.mjs';
 /**
  * @file worker-brief.mjs
  * @description Render the standard worker-brief block so dispatchers do not retype
  * drifting rules. Encodes operator handoff rules 20, 21, 23, 26 and "no pkill".
- * The pure renderer is shared by the injectable CLI and in-process callers.
+ * The renderer resolves the shared tests-first policy for the CLI and in-process callers.
  */
 import { writeFile as defaultWriteFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
@@ -23,7 +24,7 @@ const USAGE = `Usage: node scripts/worker-brief.mjs --purpose=<slug> --files=a,b
 `;
 
 /**
- * Render one standard block without IO or mutation of the caller's parameters.
+ * Render one standard block, resolving the shared delivery settings without mutating the caller's parameters.
  * @param {object} params
  * @param {string} params.purpose
  * @param {string[]|string} params.files Allowed paths, or a comma-separated list.
@@ -85,6 +86,7 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    It is SYNCHRONOUS: run it in the foreground, never backgrounded, never wrapped in a wait. Review the diff before
    you commit. You keep root cause, design, edge adoption and live proof.
 5. **Red-green tests through the heavy queue.** Write the failing test first, then the fix.
+   ${testsFirstWorkerRule()}
    Run tests with \`npm run test:unit -- <test files>\`. Running vitest directly is denied.
 6. **One PR.** Commit with a tight pathspec (your files only), verify with
    \`node scripts/operations/run.mjs verify --checkout=<lane>\`, then open exactly one PR:
