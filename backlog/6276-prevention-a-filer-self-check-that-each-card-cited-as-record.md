@@ -12,7 +12,7 @@ tags: []
 # Prevention — A filer self-check that each card cited as 'recorded there' contains the idempotency key or PR re… (from web-everything/web-everything#5554 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/x9hf8a0-prevention-a-card-lint-requirement-that-a-card-widening-a-pe.md:19` — A filer self-check that each card cited as 'recorded there' contains the idempotency key or PR reference, run before the PR is opened. That would also catch a scope that points at the cited source cards.
+1. `we:backlog/6279-prevention-a-card-lint-requirement-that-a-card-widening-a-pe.md:19` — A filer self-check that each card cited as 'recorded there' contains the idempotency key or PR reference, run before the PR is opened. That would also catch a scope that points at the cited source cards.
 
 Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 2 → #5610, finding 3 → #5360.
 
