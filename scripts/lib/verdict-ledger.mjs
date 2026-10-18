@@ -110,7 +110,7 @@ import { reserve, releaseLockDir } from '../readiness/file-locks.mjs';
 import { writeAllSync } from './write-all-sync.mjs';
 import { createGitLedgerStore, appendGitRowsSync } from './verdict-ledger-io.mjs';
 import { registerLedgerStore, getLedgerStore, describeLedgerStore } from './verdict-ledger-store.mjs';
-import { isSha, sameHead, deriveReferrals, openReferralKeys, blockedReferralKeys } from './pr-state/referrals.mjs';
+import { isSha, sameHead, appliedVerdictRows, deriveReferrals, openReferralKeys, blockedReferralKeys } from './pr-state/referrals.mjs';
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 // SCHEMA
@@ -804,7 +804,7 @@ export function eventsSinceHeadMove(events, folded) {
 /** A finding still awaiting a ruling, or ruled `block` and not yet fixed, read through the pr-state view's boundary.
  *  A carry or restamp re-witnesses the same content, so it is never the fix such a finding waits for. */
 export function ledgerReferralsOutstanding(events) {
-  const referrals = deriveReferrals(eventsSinceHeadMove(events, foldVerdictLedger(events).get(events.at(-1)?.pr)));
+  const referrals = deriveReferrals(eventsSinceHeadMove(events, foldVerdictLedger(events).get(events.at(-1)?.pr)), { applied: appliedVerdictRows(events) });
   return openReferralKeys(referrals).length > 0 || blockedReferralKeys(referrals).length > 0;
 }
 
@@ -1342,7 +1342,7 @@ export function appendVerdict(record, opts = {}) {
       try { result = (opts.homeAppend ?? appendVerdictHome)(op.record); }
       catch (e) { result = homeWriteFailure(e); }
     } else if (op.name === 'git') {
-      result = op.board ? appendGitRowsSync([op.record], { board: op.board, repo: op.record.repo },
+      result = op.board ? appendGitRowsSync([op.record], { board: op.board, repo: op.record.repo, ...(opts.deadline != null ? { deadline: opts.deadline } : {}) },
         opts.gitAppend ? { appendRows: opts.gitAppend } : undefined) : noBoardWriteMiss();
     } else {
       result = { ok: false, appended: 0, error: `plugged store ${op.name} is async; use appendVerdictAsync` };

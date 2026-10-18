@@ -13,9 +13,12 @@ import { proveIdenticalNetPatch, resolveIdenticalNetPatchSetting } from './ident
 import { resolveAcceptCarryForward } from './accept-carry-forward.mjs';
 import { sameHead } from './pr-state/referrals.mjs';
 
+const flag = v => typeof v === 'boolean';
+const positive = v => Number.isInteger(v) && v > 0;
+/** `drainObserveMaxPerPass` / `drainObserveBudgetMs` cap the drain's live observations per pass (count and wall time). */
 export function resolveLedgerObservationSettings({ tool = readSettings().ledger, platform, env = process.env } = {}) {
-  return cascadePolicy('ledger', tool, { standard: { firstSeenRows: true, headMoveInvalidation: true }, platform, env,
-    valid: v => typeof v === 'boolean' });
+  return cascadePolicy('ledger', tool, { standard: { firstSeenRows: true, headMoveInvalidation: true, drainObserveMaxPerPass: 20, drainObserveBudgetMs: 15_000 },
+    platform, env, valid: { firstSeenRows: flag, headMoveInvalidation: flag, drainObserveMaxPerPass: positive, drainObserveBudgetMs: positive } });
 }
 const logged = new Set();
 export function logLedgerObservationSettings(settings, log = s => process.stderr.write(`${s}\n`)) {
@@ -77,13 +80,15 @@ export function planLedgerObservation({ repo, pr, headSha, state = 'OPEN', label
 
 /** Writes through appendVerdict and its store locks. Unreadable data is a loud miss, never an empty ledger. */
 export function observeLedgerHead(facts, { read = readObservationLedger, append = appendVerdict,
-  settings = resolveLedgerObservationSettings(), log = s => process.stderr.write(`${s}\n`), ...options } = {}) {
+  settings = resolveLedgerObservationSettings(), log = s => process.stderr.write(`${s}\n`), deadline = null, clock = Date.now, ...options } = {}) {
   if (!/^[0-9a-f]{40}$/i.test(facts.headSha ?? '') || String(facts.state ?? 'OPEN').toUpperCase() !== 'OPEN') return { ok: true, rows: [] };
   logLedgerObservationSettings(settings, log);
   try {
     const rows = planLedgerObservation({ ...facts, events: read(facts.repo), settings, ...options });
     for (const row of rows) {
-      const result = append(row);
+      // A caller's budget (the drain pass) bounds the write too: no append starts past it, and the git leg stops retrying at it.
+      if (deadline != null && clock() >= deadline) throw Error('observation budget spent before the append');
+      const result = deadline != null ? append(row, { deadline }) : append(row);
       if (!result?.ok || result.ledgerWriteMiss) throw Error(result?.errors?.join('; ') || 'append failed');
     }
     return { ok: true, rows };
@@ -91,13 +96,17 @@ export function observeLedgerHead(facts, { read = readObservationLedger, append 
 }
 
 /** Feed records can arrive late. Re-read the live PR before observing; never rewind to an event's old SHA. */
-export function observeLedgerPrEvent(event, pr, { readPr = (repo, number) => JSON.parse(String(execFileSyncThrottled('gh',
-  ['pr', 'view', String(number), '--repo', repo, '--json', 'state,headRefOid,labels'], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 }))),
-  observe = observeLedgerHead, log = s => process.stderr.write(`${s}\n`) } = {}) {
+export function observeLedgerPrEvent(event, pr, { readPr = (repo, number, { timeout } = {}) => JSON.parse(String(execFileSyncThrottled('gh',
+  ['pr', 'view', String(number), '--repo', repo, '--json', 'state,headRefOid,labels'], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, ...(timeout ? { timeout } : {}) }))),
+  observe = observeLedgerHead, log = s => process.stderr.write(`${s}\n`), deadline = null, clock = Date.now } = {}) {
   try {
-    const live = readPr(event.repo, pr);
-    return observe({ repo: event.repo, pr, headSha: live.headRefOid, state: live.state,
-      labels: (live.labels ?? []).map(l => typeof l === 'string' ? l : l.name) });
+    // A deadline also bounds the live read; never start one past it.
+    const left = deadline == null ? null : deadline - clock();
+    if (left != null && left <= 0) throw Error('observation budget spent before the live read');
+    const live = left == null ? readPr(event.repo, pr) : readPr(event.repo, pr, { timeout: left });
+    const facts = { repo: event.repo, pr, headSha: live.headRefOid, state: live.state,
+      labels: (live.labels ?? []).map(l => typeof l === 'string' ? l : l.name) };
+    return deadline == null ? observe(facts) : observe(facts, { deadline, clock });
   } catch (e) { log(`ledger-write-miss: event observation ${event.repo}#${pr}: ${e.message}`); return { ok: false }; }
 }
 
@@ -106,12 +115,50 @@ export function observeLedgerPrEvent(event, pr, { readPr = (repo, number) => JSO
  *  head, the live read is skipped: nothing has moved, and a per-PR `gh pr view` every pass would burn the shared
  *  API budget. A head that moved shows up as a listed/witnessed mismatch on this or the next pass. */
 export function observeLiveLedgerHead({ repo, pr, listedHeadSha = null }, options = {}) {
-  const listed = /^[0-9a-f]{40}$/i.test(listedHeadSha ?? '') ? listedHeadSha.toLowerCase() : null;
-  if (listed && typeof options.read === 'function') {
-    try {
-      const mine = options.read(repo).filter(e => e.repo.toLowerCase() === repo.toLowerCase() && e.pr === Number(pr));
-      if (mine.length && sameHead(observedLedgerHead(mine), listed)) return { ok: true, rows: [], skipped: 'head-unchanged' };
-    } catch { /* an unreadable snapshot never skips: the live read below decides, and logs its own miss */ }
-  }
+  if (ledgerHeadUnchanged({ repo, pr, listedHeadSha }, options.read)) return { ok: true, rows: [], skipped: 'head-unchanged' };
   return observeLedgerPrEvent({ repo }, pr, options);
+}
+
+/** True only when the snapshot's witnessed head equals a full listed head. An unreadable snapshot never skips. */
+export function ledgerHeadUnchanged({ repo, pr, listedHeadSha = null }, read) {
+  const listed = /^[0-9a-f]{40}$/i.test(listedHeadSha ?? '') ? listedHeadSha.toLowerCase() : null;
+  if (!listed || typeof read !== 'function') return false;
+  try {
+    const mine = read(repo).filter(e => e.repo.toLowerCase() === repo.toLowerCase() && e.pr === Number(pr));
+    return mine.length > 0 && sameHead(observedLedgerHead(mine), listed);
+  } catch { return false; /* the live read decides, and logs its own miss */ }
+}
+
+/**
+ * The drain pass's observations, capped per pass by `ledger.drainObserveMaxPerPass` live reads and
+ * `ledger.drainObserveBudgetMs` of wall time (each logged with its source). The budget is also the deadline of
+ * every live read and append, so a slow `gh` read or git leg ends the pass's observing instead of stalling the
+ * pass. Unchanged heads cost no live read and are never capped. Anything skipped or failed is one logged
+ * `ledger-write-miss` line; the next pass sees the same listed/witnessed mismatch and retries it. Never throws.
+ */
+export function observeDrainLedgerHeads(targets, { read, settings = resolveLedgerObservationSettings(), clock = Date.now,
+  log = s => process.stderr.write(`${s}\n`), readPr, append, // test seams: the live `gh` read and the ledger writer
+  observe = (target, deadline) => observeLedgerPrEvent({ repo: target.repo }, target.pr, { deadline, clock, log, ...(readPr ? { readPr } : {}),
+    observe: facts => observeLedgerHead(facts, { read, settings, deadline, clock, log, ...(append ? { append } : {}) }) }) } = {}) {
+  const out = { observed: 0, unchanged: 0, missed: [], capped: [] };
+  try {
+    logLedgerObservationSettings(settings, log);
+    const { drainObserveMaxPerPass: max = 20, drainObserveBudgetMs: budget = 15_000 } = settings.value;
+    const deadline = clock() + budget;
+    let reason = null;
+    for (const target of targets) {
+      if (ledgerHeadUnchanged(target, read)) { out.unchanged += 1; continue; }
+      reason ??= out.observed >= max ? `count cap ledger.drainObserveMaxPerPass=${max}`
+        : clock() >= deadline ? `time budget ledger.drainObserveBudgetMs=${budget}` : null;
+      if (reason) { out.capped.push(target); continue; }
+      out.observed += 1;
+      let result;
+      try { result = observe(target, deadline); } catch (e) { result = { ok: false, error: e?.message }; }
+      if (!result?.ok) out.missed.push(target);
+    }
+    const prs = list => list.map(t => `${t.repo}#${t.pr}`).join(', ');
+    if (out.capped.length) log(`ledger-write-miss: drain observation skipped ${out.capped.length} PR(s) this pass (${reason}): ${prs(out.capped)}; retried next pass`);
+    if (out.missed.length) log(`ledger-write-miss: drain observation failed for ${out.missed.length} PR(s): ${prs(out.missed)}; retried next pass`);
+  } catch (e) { log(`ledger-write-miss: drain observation pass: ${e?.message}`); }
+  return out;
 }

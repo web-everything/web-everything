@@ -12,7 +12,7 @@
  */
 import { derivePrState as derivePrPhase } from './pr-state-core.mjs';
 import { EVENT_TYPES, eventsSinceHeadMove, foldVerdictLedger, verdictLabel, validateLedgerEvent } from './verdict-ledger.mjs';
-import { deriveReferrals, openReferralKeys } from './pr-state/referrals.mjs';
+import { appliedVerdictRows, deriveReferrals, openReferralKeys } from './pr-state/referrals.mjs';
 import { evaluateHolds } from './pr-state/holds/index.mjs';
 import { approvalLiftsAfter } from './pr-state/holds/verdict.mjs';
 import { HUMAN_HOLD_CI_RED, lifecycleRow, renderLabels } from '../conveyor/pr-lifecycle.mjs';
@@ -65,7 +65,8 @@ export function ledgerView(events, facts) {
   const reviewExempt = (!cur || (cur.verdict === 'head-moved' && mine.indexOf(lastExempt) > mine.indexOf(cur))) && fullSha(lastExempt?.headSha) && fullSha(facts?.head?.sha)
     && lastExempt.headSha.toLowerCase() === facts.head.sha.toLowerCase();
   clears = clears || reviewExempt;
-  return { events: mine, history, folded, clears, reviewExempt, referrals: deriveReferrals(mine) };
+  // Only a clear the fold applied over the complete stream can be a fix: a delayed old-head accept never counts.
+  return { events: mine, history, folded, clears, reviewExempt, referrals: deriveReferrals(mine, { applied: appliedVerdictRows(history) }) };
 }
 
 /** Map a core phase plus the hold picture to a lifecycle state. The core's phase is kept except for two restrictions. */

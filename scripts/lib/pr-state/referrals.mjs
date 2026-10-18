@@ -7,10 +7,11 @@
  * or `blocking`. A newer referral naming the key again re-opens it (the finding was reproduced), so a
  * still-reproduced finding keeps holding, except when the earlier ruling was `not-real` or `card` (the operator
  * already overruled it; plateau-app #202). A non-clearing verdict, or an accept on the same head, never closes a
- * referral.
+ * referral. Nor does a clear the verdict fold left as history (a delayed accept of a superseded head): it never
+ * counted for the current head, so it cannot be the fix.
  */
 import { createHash } from 'node:crypto';
-import { EVENT_TYPES, verdictClears } from '../verdict-ledger.mjs';
+import { EVENT_TYPES, verdictClears, appliedVerdictHistory } from '../verdict-ledger.mjs';
 
 const HASHED_KEY = /^sha256:[0-9a-f]{64}$/;
 /**
@@ -35,11 +36,16 @@ export const sameHead = (a, b) => {
 /** The head a verdict row was witnessed at (v1 rows keep it under `coverage`). */
 export const verdictHead = row => (row?.coverage ? row.coverage.headSha : row?.headSha) ?? null; // a coverage object that names no head is not rescued by a top-level headSha
 
+/** The verdict rows the fold applied, for every PR in `events` (complete streams: a filtered one can forget a superseded head). */
+export const appliedVerdictRows = events => new Set([...new Set((events ?? []).map(e => e?.pr))].flatMap(pr => appliedVerdictHistory(events, pr)));
+
 /**
  * @param {object[]} events One PR's ledger events in append order.
+ * @param {{applied?: Set<object>}} [options] `applied`: {@link appliedVerdictRows} of the COMPLETE stream when
+ *   `events` is a filtered view of it; defaults to the rows applied within `events` itself.
  * @returns {Map<string,{key:string,state:'open'|'ruled'|'blocking'|'resolved-by-fix'|'retired',head:string|null,ruling:string|null,resolvedAtHead:string|null}>}
  */
-export function deriveReferrals(events) {
+export function deriveReferrals(events, { applied = appliedVerdictRows(events) } = {}) {
   const keys = new Map();
   // A public referral can be ruled on while review-pr is parked before its final ledger step.
   // Retain the latest valid ruling until the FIRST referral supplies the finding's head. Do not
@@ -70,7 +76,7 @@ export function deriveReferrals(events) {
       if (retire && k?.state !== 'open') continue;
       if (k && state) keys.set(e.findingKey, { ...k, state, ruling: e.ruling });
       else if (state) earlyRulings.set(e.findingKey, { state, ruling: e.ruling });
-    } else if ((e.type === EVENT_TYPES.VERDICT || e.type === undefined) && verdictClears(e.verdict)) {
+    } else if ((e.type === EVENT_TYPES.VERDICT || e.type === undefined) && verdictClears(e.verdict) && applied.has(e)) {
       const head = verdictHead(e);
       for (const [key, k] of keys) {
         if ((k.state === 'open' || k.state === 'blocking') && isSha(head) && isSha(k.head) && !sameHead(head, k.head)) keys.set(key, { ...k, state: 'resolved-by-fix', resolvedAtHead: head });

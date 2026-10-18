@@ -3,10 +3,10 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { buildLedgerEvent, buildVerdictRecord, ledgerEventId, ledgerObservationApplies, observedLedgerHead } from '../verdict-ledger.mjs';
+import { buildLedgerEvent, buildVerdictRecord, ledgerEventId, ledgerObservationApplies, ledgerReferralsOutstanding, observedLedgerHead } from '../verdict-ledger.mjs';
 import { planLedgerObservation, observeLedgerHead, observeLiveLedgerHead, proveLedgerCarry } from '../ledger-observation.mjs';
 import { planDrainLedgerFacts } from '../drain-ledger-facts.mjs';
-import { derivePrState } from '../pr-state.mjs';
+import { derivePrState, ledgerView } from '../pr-state.mjs';
 
 const repo = 'example/repo', pr = 1;
 const head = 'a'.repeat(40), next = 'b'.repeat(40), third = 'c'.repeat(40);
@@ -278,5 +278,48 @@ describe('ledger head lifecycle red-team regressions', () => {
     expect(derivePrState([...missed, verdict('clear-human', next)], facts(next)).clears).toBe(true);
     // An equivalent carry or drain restamp is not a substantive push: it keeps the human answer.
     expect(derivePrState([...events, verdict('restamped', next)], facts(next)).clears).toBe(true);
+  });
+
+  describe('operator send-back item 4: a delayed old-head acceptance never counts for the current head', () => {
+    const key = `sha256:${'d'.repeat(64)}`;
+    const findings = (ruled = 'block') => [event('referral', { headSha: next, findingKeys: [key] }),
+      ...(ruled ? [event('ruling', { findingKey: key, ruling: ruled })] : [])];
+    const expectHeld = (events, live, code = 'referral-blocked') => {
+      const state = derivePrState(events, facts(live));
+      expect(state.clears).toBe(false);
+      expect(state.holds.map(h => h.code)).toContain(code);
+      expect(ledgerReferralsOutstanding(events)).toBe(true);
+      expect(ledgerView(events, facts(live)).referrals.get(key).state).toBe(code === 'referral-blocked' ? 'blocking' : 'open');
+    };
+    it('red-team replay: accepted(A), head-moved(A→B), accepted(B), referral(B,K), ruling(K,block), late accepted(A)', () => {
+      const events = [verdict('accepted'), verdict('head-moved', next, { fromHead: head, source: 'head-observer' }),
+        verdict('accepted', next), ...findings(), verdict('accepted', head)];
+      expectHeld(events, next);
+      // The at-tip recheck refuses a drain restamp over the still-blocking finding.
+      expect(ledgerObservationApplies(verdict('restamped', next), events)).toBe(false);
+      // A real fix on a new head still resolves it.
+      const fixed = [...events, verdict('head-moved', third, { fromHead: next, source: 'head-observer' }), verdict('accepted', third)];
+      expect(ledgerView(fixed, facts(third)).referrals.get(key).state).toBe('resolved-by-fix');
+      expect(derivePrState(fixed, facts(third)).clears).toBe(true);
+    });
+    it('the same late accept leaves an unruled referral open', () => {
+      const events = [verdict('accepted'), verdict('head-moved', next, { fromHead: head, source: 'head-observer' }),
+        verdict('accepted', next), ...findings(null), verdict('accepted', head)];
+      expectHeld(events, next, 'referral-unruled');
+    });
+    it('variant: the move was witnessed by a fresh review (head-moved row missed)', () => {
+      expectHeld([verdict('accepted'), verdict('accepted', next), ...findings(), verdict('accepted', head)], next);
+    });
+    it('variant: a carried transition, then a late accept of the carried-from head', () => {
+      expectHeld([verdict('accepted'), verdict('carried', next, { fromHead: head, carryRule: 'tree-identical', source: 'head-observer' }),
+        ...findings(), verdict('accepted', head)], next);
+    });
+    it('variant: a chain A→B→C with late accepts of both superseded heads', () => {
+      const key3 = [event('referral', { headSha: third, findingKeys: [key] }), event('ruling', { findingKey: key, ruling: 'block' })];
+      const events = [verdict('accepted'), verdict('head-moved', next, { fromHead: head, source: 'head-observer' }),
+        verdict('head-moved', third, { fromHead: next, source: 'head-observer' }), verdict('accepted', third), ...key3,
+        verdict('accepted', next), verdict('clear-human', head)];
+      expectHeld(events, third);
+    });
   });
 });

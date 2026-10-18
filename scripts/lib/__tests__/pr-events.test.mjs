@@ -27,7 +27,7 @@ it('keeps a bare event waker free of ledger IO while the production wrapper opts
   const effects = withPrEvents({}, { role: 'review', repos: ['a/b'], poll, log: quiet, minWakeGapMs: 0,
     env: { WE_PR_EVENTS: '1', WE_PR_EVENTS_URL: 'https://example.invalid', WE_PR_EVENTS_TOKEN: 'test', WE_PR_EVENTS_STATE_DIR: mkdtempSync(join(tmpdir(), 'pr-events-observe-')) } });
   await effects.sleep(1);
-  expect(observeLedgerPrEvent).toHaveBeenCalledWith(event, 1);
+  expect(observeLedgerPrEvent).toHaveBeenCalledWith(event, 1, { deadline: expect.any(Number) });
 });
 
 describe('bounded head observation inside the poll loop', () => {
@@ -53,6 +53,17 @@ describe('bounded head observation inside the poll loop', () => {
       observeHead: (_e, pr) => seen.push(pr), log: { error: (s) => errors.push(s) } }).pollOnce();
     expect(seen).toEqual(prs.slice(0, PR_EVENTS_DEFAULTS.maxObservationsPerPoll));
     expect(errors.join('\n')).toContain('skipped 5 head observation(s) past the per-poll cap');
+  });
+
+  it('a slow observation ends the poll\'s observing at the time budget, and each one gets that deadline', async () => {
+    let t = 0;
+    const seen = [];
+    const errors = [];
+    const observeHead = (_e, pr, opts) => { seen.push([pr, opts.deadline]); t += 9_000; };
+    const r = await waker([open('a/b', [1, 2, 3, 4])], { now: () => t, observeHead, log: { error: (s) => errors.push(s) } }).pollOnce();
+    expect(seen).toEqual([[1, PR_EVENTS_DEFAULTS.maxObservationMsPerPoll], [2, PR_EVENTS_DEFAULTS.maxObservationMsPerPoll]]);
+    expect(r.wake).toBe(true);
+    expect(errors.join('\n')).toContain(`skipped 2 head observation(s) past the per-poll cap of ${PR_EVENTS_DEFAULTS.maxObservationsPerPoll} / ${PR_EVENTS_DEFAULTS.maxObservationMsPerPoll}ms`);
   });
 
   it('observes nothing without a repo allowlist, and nothing outside it', async () => {

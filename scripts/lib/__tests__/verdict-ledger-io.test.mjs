@@ -91,6 +91,21 @@ describe('appendLedgerRows: bounded retry, loud on exhaustion', () => {
     expect(staged).toBe(tip);
   });
 
+  it('a deadline ends a slow failing git leg: no attempt or retry sleep starts past it, and the throw stays loud', () => {
+    let now = 0, sleeps = 0, pushes = 0;
+    const run = (args) => { now += 1_000; if (args[0] === 'push') { pushes += 1; throw new Error('! [rejected] slow'); } return args[0] === 'diff' ? 'verdict-ledger/x.jsonl' : ''; };
+    const err = (() => { try { appendLedgerRows(base({ run, clock: () => now, deadline: 1, sleep: () => { sleeps += 1; } })); } catch (e) { return e; } })();
+    expect(err).toBeInstanceOf(LedgerAppendExhaustedError);
+    expect([err.attempts, pushes, sleeps]).toEqual([1, 1, 0]);
+    expect(err.message).toContain('deadline passed before attempt 2');
+    // Already past it: nothing runs at all.
+    let calls = 0;
+    expect(() => appendLedgerRows(base({ run: () => { calls += 1; return ''; }, clock: () => 5, deadline: 5 }))).toThrow(/deadline passed before attempt 1/);
+    expect(calls).toBe(0);
+    // Without a deadline the bounded retries are unchanged.
+    expect(appendLedgerRows(base({ run: failing(2).run, clock: () => 99, deadline: null }))).toMatchObject({ attempts: 3 });
+  });
+
   it('THROWS LedgerAppendExhaustedError when every attempt fails (never a quiet value)', () => {
     const f = failing(99);
     expect(() => appendLedgerRows(base({ run: f.run, attempts: 3 }))).toThrow(LedgerAppendExhaustedError);

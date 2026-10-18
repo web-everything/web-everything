@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { observeLedgerHead, observeLiveLedgerHead } from './lib/ledger-observation.mjs';
+import { observeDrainLedgerHeads } from './lib/ledger-observation.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
@@ -6272,11 +6272,9 @@ async function runCli() {
     // Additive and fail-soft: runs before, and never alters, the stamping below. It dedups against one read of the
     // store its writes land in, taken before it writes, so a shared-store miss is retried next pass.
     const readDrainLedger = await readDrainLedgerSnapshot(verdicts.map((v) => v.repo || localSlug));
-    for (const v of verdicts) {
-      observeLiveLedgerHead({ repo: v.repo || localSlug, pr: v.num, listedHeadSha: v.listedHeadSha || v.headSha }, {
-        read: readDrainLedger, observe: facts => observeLedgerHead(facts, { read: readDrainLedger }),
-      });
-    }
+    // Capped per pass (count + time budget, `ledger.drainObserve*`): a slow or failing observation is a logged miss, never a stalled pass.
+    observeDrainLedgerHeads(verdicts.map((v) => ({ repo: v.repo || localSlug, pr: v.num, listedHeadSha: v.listedHeadSha || v.headSha })),
+      { read: readDrainLedger });
     for (const v of skipped) {
       if (!v.reason || !(v.certifyLabel || v.aiGenerated)) continue;
       const held = recordDrainHold({ repo: v.repo || localSlug, pr: v.num, reason: v.reason, read: readDrainLedger });

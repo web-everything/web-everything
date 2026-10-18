@@ -169,6 +169,8 @@ export function appendLedgerRows({
   message = `verdict-ledger: append ${repo}`,
   sleep = defaultSleep,
   onRetry = null,
+  deadline = null, // epoch ms: no attempt (and no retry sleep) starts at or past it; a caller's pass budget
+  clock = Date.now,
   ...seams // run / mkdir / write / read / rm / now, passed through to the transport
 } = {}) {
   if (!Array.isArray(records) || !records.length) throw new TypeError('verdict-ledger-io: `records` must be a non-empty array');
@@ -178,7 +180,9 @@ export function appendLedgerRows({
   const { lines, ids } = check;
   const path = ledgerGitPath(repo);
   const errors = [];
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+  let attempt = 1;
+  for (; attempt <= attempts; attempt += 1) {
+    if (deadline != null && clock() >= deadline) { errors.push(new Error(`deadline passed before attempt ${attempt}`)); break; }
     try {
       let written = 0;
       let duplicates = 0;
@@ -211,13 +215,13 @@ export function appendLedgerRows({
       return { status: 'appended', attempts: attempt, rows: written, duplicates };
     } catch (e) {
       errors.push(e);
-      if (attempt < attempts) {
+      if (attempt < attempts && !(deadline != null && clock() >= deadline)) {
         if (onRetry) onRetry({ attempt, error: e });
         sleep(Math.min(100 * 2 ** (attempt - 1), 1600) + Math.floor(Math.random() * 50));
       }
     }
   }
-  throw new LedgerAppendExhaustedError({ repo, attempts, errors });
+  throw new LedgerAppendExhaustedError({ repo, attempts: attempt - 1, errors });
 }
 
 /**

@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { planLedgerObservation, observeLedgerHead, observeLedgerPrEvent, observeLiveLedgerHead, proveLedgerCarry,
-  resolveLedgerObservationSettings, readObservationLedger } from '../ledger-observation.mjs';
+  resolveLedgerObservationSettings, readObservationLedger, observeDrainLedgerHeads } from '../ledger-observation.mjs';
+import { appendGitRowsSync, appendLedgerRows } from '../verdict-ledger-io.mjs';
 import { appendVerdict, buildVerdictRecord, buildLedgerEvent, foldVerdictLedger, ledgerObservationApplies, validateVerdictRecord } from '../verdict-ledger.mjs';
 import { derivePrState } from '../pr-state.mjs';
 import { planDrainLedgerFacts } from '../drain-ledger-facts.mjs';
@@ -243,13 +244,118 @@ describe('open-head ledger observations', () => {
       expect(readObservationLedger(repo)).toHaveLength(1);
     } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
   });
+  describe('drain observation cap per pass (operator send-back item 1)', () => {
+    const sha = n => String(n).repeat(40).slice(0, 40);
+    const targets = n => Array.from({ length: n }, (_, i) => ({ repo, pr: i + 1, listedHeadSha: sha(i + 1) }));
+    const capped = (max, budget) => ({ value: { firstSeenRows: true, headMoveInvalidation: true, drainObserveMaxPerPass: max, drainObserveBudgetMs: budget },
+      sources: { firstSeenRows: 'standard', headMoveInvalidation: 'standard', drainObserveMaxPerPass: 'tool', drainObserveBudgetMs: 'tool' } });
+    const run = ({ n = 5, max = 2, budget = 15_000, read = () => [], readPr, append, cost = 0 } = {}) => {
+      let now = 1_000; const logs = [], reads = [], appended = [];
+      const out = observeDrainLedgerHeads(targets(n), { read, settings: capped(max, budget), clock: () => now, log: s => logs.push(s),
+        readPr: readPr ?? ((r, pr, opts) => { reads.push([pr, opts]); now += cost; return { state: 'OPEN', headRefOid: sha(pr), labels: [] }; }),
+        append: append ?? (row => { appended.push(row.pr); return { ok: true }; }) });
+      return { out, logs, reads, appended, clock: () => now, tick: ms => { now += ms; } };
+    };
+    it('resolves both caps through the ledger cascade with standard defaults', () => {
+      expect(resolveLedgerObservationSettings({ tool: {}, platform: null }).value).toMatchObject({ drainObserveMaxPerPass: 20, drainObserveBudgetMs: 15_000 });
+      const r = resolveLedgerObservationSettings({ tool: { drainObserveMaxPerPass: 3, drainObserveBudgetMs: 'x' }, platform: null });
+      expect(r.value).toMatchObject({ drainObserveMaxPerPass: 3, drainObserveBudgetMs: 15_000 });
+      expect(r.sources).toMatchObject({ drainObserveMaxPerPass: 'tool', drainObserveBudgetMs: 'standard' });
+      expect(r.invalid).toEqual(['tool.drainObserveBudgetMs="x"']);
+    });
+    it('count cap: live reads stop at ledger.drainObserveMaxPerPass and the rest are one logged miss', () => {
+      const { out, logs, reads, appended } = run({ n: 5, max: 2 });
+      expect(reads.map(r => r[0])).toEqual([1, 2]);
+      expect(appended).toEqual([1, 2]);
+      expect(out).toMatchObject({ observed: 2, capped: [{ pr: 3 }, { pr: 4 }, { pr: 5 }] });
+      expect(logs.join('\n')).toContain('ledger.drainObserveMaxPerPass=2 (tool)');
+      expect(logs.join('\n')).toContain(`ledger-write-miss: drain observation skipped 3 PR(s) this pass (count cap ledger.drainObserveMaxPerPass=2): ${repo}#3, ${repo}#4, ${repo}#5`);
+    });
+    it('unchanged heads cost no live read and are never capped', () => {
+      const witnessed = pr => buildVerdictRecord({ repo, pr, headSha: sha(pr), verdict: 'accepted', source: 'test', at: now });
+      const { out, reads } = run({ n: 4, max: 1, read: () => [witnessed(1), witnessed(2), witnessed(4)] });
+      expect(reads.map(r => r[0])).toEqual([3]);
+      expect(out).toMatchObject({ observed: 1, unchanged: 3, capped: [] });
+    });
+    it('time budget: a slow gh read ends the pass\'s observing; each read gets the remaining budget as its timeout', () => {
+      const { out, logs, reads } = run({ n: 4, max: 20, budget: 10_000, cost: 6_000 });
+      expect(reads.map(([pr, opts]) => [pr, opts.timeout])).toEqual([[1, 10_000], [2, 4_000]]);
+      expect(out.capped.map(t => t.pr)).toEqual([3, 4]);
+      expect(logs.join('\n')).toContain('(time budget ledger.drainObserveBudgetMs=10000)');
+    });
+    it('slow git leg: a failing, slow dual-store git append stops at the pass deadline and skips the rest with a logged miss', () => {
+      let gitCalls = 0, pushes = 0, sleeps = 0, clockRef;
+      // Each git command takes 4s and every push is rejected: without the deadline, 5 attempts x ~6 commands each.
+      const slowRun = args => { gitCalls += 1; clockRef.tick(4_000); if (args[0] === 'push') { pushes += 1; throw Error('! [rejected] slow remote'); }
+        return args[0] === 'diff' ? 'verdict-ledger/x.jsonl' : ''; };
+      const gitLeg = (row, opts) => appendGitRowsSync([row], { board: '/board', repo, ...opts }, { appendRows: args => appendLedgerRows({ ...args,
+        run: slowRun, sleep: () => { sleeps += 1; }, clock: clockRef.clock, mkdir: () => {}, write: () => {}, rm: () => {}, read: () => null, now: () => 1 }) });
+      const append = (row, opts) => { const g = gitLeg(row, opts); return g.ok ? { ok: true } : { ok: true, ledgerWriteMiss: true, errors: [g.error] }; };
+      let now = 1_000; const logs = [];
+      clockRef = { clock: () => now, tick: ms => { now += ms; } };
+      const started = now;
+      const out = observeDrainLedgerHeads(targets(4), { read: () => [], settings: capped(20, 15_000), clock: clockRef.clock, log: s => logs.push(s),
+        readPr: (r, pr) => ({ state: 'OPEN', headRefOid: sha(pr), labels: [] }), append });
+      // One attempt for PR 1 crossed the 15s budget: no retry, no sleep, and PRs 2–4 never start a write.
+      expect(pushes).toBe(1);
+      expect(sleeps).toBe(0);
+      expect(now - started).toBe(4_000 * gitCalls);
+      expect(out).toMatchObject({ observed: 1, missed: [{ pr: 1 }], capped: [{ pr: 2 }, { pr: 3 }, { pr: 4 }] });
+      expect(logs.join('\n')).toMatch(/ledger-write-miss: observation example\/repo#1: .*deadline passed before attempt 2/);
+      expect(logs.join('\n')).toContain('drain observation skipped 3 PR(s) this pass (time budget ledger.drainObserveBudgetMs=15000)');
+      expect(logs.join('\n')).toContain(`drain observation failed for 1 PR(s): ${repo}#1`);
+    });
+    it('a throwing observer or unreadable snapshot never throws out of the pass', () => {
+      const logs = [];
+      const out = observeDrainLedgerHeads(targets(2), { read: () => { throw Error('unreadable'); }, settings: capped(5, 1_000), log: s => logs.push(s),
+        observe: () => { throw Error('boom'); } });
+      expect(out).toMatchObject({ observed: 2, missed: [{ pr: 1 }, { pr: 2 }] });
+      expect(logs.join('\n')).toContain('drain observation failed for 2 PR(s)');
+    });
+  });
+  describe('home writer guard (appendVerdictHome → ledgerObservationApplies at the locked tip)', () => {
+    const third = 'c'.repeat(40), key = `sha256:${'9'.repeat(64)}`;
+    const withHome = fn => {
+      const dir = mkdtempSync(join(tmpdir(), 'ledger-home-guard-'));
+      vi.stubEnv('WE_VERDICT_LEDGER_DIR', join(dir, 'rows'));
+      vi.stubEnv('WE_VERDICT_LEDGER_STORE', 'home');
+      try { fn(row => appendVerdict(row, { store: 'home' })); } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+    };
+    const moved = (verdict, to = next, from = head) => buildVerdictRecord({ repo, pr: 1, headSha: to, fromHead: from, verdict,
+      source: 'head-observer', at: now, ...(verdict === 'carried' ? { carryRule: 'tree-identical', state: 'accepted' } : {}) });
+    it('head-moved: writes at a matching tip, refuses a stale from-head and an already-witnessed destination', () => withHome(append => {
+      expect(append(accepted())).toMatchObject({ ok: true });
+      const row = moved('head-moved');
+      // Planned from a snapshot; a fresh review of B lands first, so B is already witnessed at the tip.
+      expect(append(buildVerdictRecord({ repo, pr: 1, headSha: next, verdict: 'accepted', source: 'test', at: now }))).toMatchObject({ ok: true });
+      expect(append(row)).toMatchObject({ ok: true, duplicate: true });
+      // A move whose from-head is no longer the witness (a delayed A→C after the tip moved to B) is refused too.
+      expect(append(moved('head-moved', third, head))).toMatchObject({ ok: true, duplicate: true });
+      expect(readObservationLedger(repo).map(r => r.verdict)).toEqual(['accepted', 'accepted']);
+      // The live move B→C applies and is written.
+      expect(append(moved('head-moved', third, next))).toMatchObject({ ok: true });
+      expect(append(moved('head-moved', third, next))).toMatchObject({ ok: true, duplicate: true });
+      expect(readObservationLedger(repo).map(r => r.verdict)).toEqual(['accepted', 'accepted', 'head-moved']);
+    }));
+    it('carried: writes only while the carry is allowed at the tip; an outstanding referral refuses it', () => withHome(append => {
+      expect(append(accepted())).toMatchObject({ ok: true });
+      append(buildLedgerEvent({ repo, pr: 1, type: 'referral', headSha: head, findingKeys: [key], at: now, source: 'test' }));
+      expect(append(moved('carried'))).toMatchObject({ ok: true, duplicate: true });
+      append(buildLedgerEvent({ repo, pr: 1, type: 'ruling', findingKey: key, ruling: 'not-real', at: now, source: 'test' }));
+      expect(append(moved('carried'))).toMatchObject({ ok: true });
+      expect(readObservationLedger(repo).filter(r => r.verdict === 'carried')).toHaveLength(1);
+      // A stale carry from the old head after the tip moved on is refused.
+      expect(append(moved('carried', third, head))).toMatchObject({ ok: true, duplicate: true });
+      expect(readObservationLedger(repo).filter(r => r.verdict === 'carried')).toHaveLength(1);
+    }));
+  });
   it('feeds open PR sightings to the observer and ignores historical check SHAs', async () => {
     const seen = [];
     const event = { type: 'pull_request', repo, prs: [1], sha: next, state: 'open', action: 'synchronize' };
     const waker = createEventWaker({ role: 'review', repos: [repo], observeHead: (...args) => seen.push(args),
       poll: async () => ({ ok: true, cursor: 1, events: [event, { ...event, type: 'check_run' }, { ...event, state: 'closed' }], more: false }) });
     await waker.pollOnce();
-    expect(seen).toEqual([[event, 1]]);
+    expect(seen).toEqual([[event, 1, { deadline: expect.any(Number) }]]);
   });
   it('holds on unreadable input and logs settings sources', () => {
     const logs = [];
