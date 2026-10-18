@@ -13,7 +13,7 @@ Review of PR #5612 requested a convention that every invalid-evidence rejection 
 
 ## Acceptance
 
-- [A1] **Executable** — Add planned cases `recovery evidence guards require named refusal coverage` and `complete recovery refusal mapping passes` in `we:scripts/__tests__/check-standards-rules-content-lint.test.mjs`. Run `npm run test:unit -- scripts/__tests__/check-standards-rules-content-lint.test.mjs`. A fixture adding an unmapped invalid-evidence rejection to `respoolClosed` must report a standards error; the same fixture with a named refusal case must pass.
+- [A1] **Executable** — Add planned cases `recovery evidence guards require named refusal coverage` and `complete recovery refusal mapping passes` in `we:scripts/__tests__/check-standards-rules-content-lint.test.mjs`. From the WE checkout, run `npm run test:unit -- <test-file>` with that test file. A fixture adding an unmapped invalid-evidence rejection to `respoolClosed` must report a standards error; the same fixture with a named refusal case must pass.
 - [A2] Map each current invalid member identity, marker/evidence, change, mode, and encoding rejection in `we:scripts/operations/card-batch-io.mjs` to a named table-driven case in `we:scripts/operations/__tests__/card-batch-io.test.mjs`. Planned case `recovery refusal mapping is complete` must reject both a missing guard mapping and a mapping naming a nonexistent case.
 
 ## Non-goals
