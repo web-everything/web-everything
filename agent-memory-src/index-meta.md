@@ -99,3 +99,4 @@ Agent Meta · Memory · Model Routing cluster — open a leaf with `node scripts
 - [Improve the fixer, don't bypass it](feedback-improve-fixer-not-bypass.md) — no direct Codex passes on conveyor PRs; operator decisions/scope baseline/main-regression become binding fixer input
 - [Prefer Codex workers, keep one Claude review](prefer-codex-keep-one-claude-review.md) — Claude quota is binding: unblock via Codex workers (codex-direct-task), Codex-first routing for fixers/builders; reviews keep ≥1 Claude seat
 - [AI subscription plans](reference-ai-subscription-plans.md) — 2× Claude 20x, 1× Google Ultra 20x, 1× Codex 500; Gemini only where it adds most value (high-care PRs, long context), daily cap
+- [Load fixes after review accepts](feedback-edge-load-after-review-accept.md) — load a guard/fixer/drain fix on its daemon once its review ACCEPTS, not before and not after the merge; prove it on the live case
