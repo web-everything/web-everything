@@ -134,6 +134,83 @@ it('host wait defaults to 15 minutes and resolves validated per-leaf overrides w
     expect(() => resolveHostOverloadSettings({ env: { WE_HOST_MAX_WAIT_MS: value }, log })).toThrow('invalid policy');
   }
 });
+// These regressions run without lane-pool commands or Git metadata writes.
+function hostPolicyFiles(legacy, canonical = {}, tool = {}) {
+  const root = temp();
+  const legacyPath = join(root, 'legacy.json');
+  const canonicalPath = join(root, 'canonical.json');
+  const toolPath = join(root, 'tool.json');
+  for (const [path, value] of [[legacyPath, legacy], [canonicalPath, canonical], [toolPath, tool]]) {
+    writeFileSync(path, JSON.stringify(value));
+  }
+  return { env: { WE_PLATFORM_PREFERENCES: legacyPath, WE_PLATFORM_PREFERENCES_FILE: canonicalPath },
+    toolPath, log: () => {} };
+}
+
+it.each(['platform', 'tool'])('host policy regression: rejects malformed whole leaves in %s before overrides', async (layer) => {
+  const { resolveHostOverloadSettings } = await import('../lib/host-overload-settings.mjs');
+  const cases = [
+    ['host.maxLoadPerCore', (v) => ({ host: { maxLoadPerCore: v } }), 1],
+    ['host.maxWaitMs', (v) => ({ host: { maxWaitMs: v } }), 250],
+    ['lanes.transcripts.explicitScan', (v) => ({ lanes: { transcripts: { explicitScan: v } } }), false],
+    ['lanes.gc.schedule', (v) => ({ lanes: { gc: { schedule: v } } }), 60000],
+  ];
+  for (const [key, policy, valid] of cases) {
+    for (const value of [{}, { enabled: valid }, [], [valid], null, 'invalid']) {
+      expect(() => resolveHostOverloadSettings({ [layer]: policy(value), env: {
+        WE_HOST_MAX_LOAD_PER_CORE: '2', WE_HOST_MAX_WAIT_MS: '250',
+        WE_LANE_TRANSCRIPT_EXPLICIT_SCAN: 'true', WE_LANES_GC_SCHEDULE_MS: '60000',
+      }, log: () => {} }), `${layer}.${key}=${JSON.stringify(value)}`).toThrow('invalid policy');
+    }
+  }
+});
+
+it.each(['platform', 'tool'])('host policy regression: rejects malformed parent blocks in %s', async (layer) => {
+  const { resolveHostOverloadSettings } = await import('../lib/host-overload-settings.mjs');
+  for (const value of [null, [], false, 1, 'invalid']) {
+    for (const policy of [value, { host: value }, { lanes: value },
+      { lanes: { transcripts: value } }, { lanes: { gc: value } }]) {
+      expect(() => resolveHostOverloadSettings({ [layer]: policy, env: {}, log: () => {} })).toThrow('invalid policy');
+    }
+  }
+});
+
+it.each(['legacy', 'canonical'])('host policy regression: malformed %s file refuses admission, gc and scans', async (layer) => {
+  const { hostLoadAdmission, scheduledLaneGc } = await import('../lib/host-load.mjs');
+  const { cachedTranscriptAttribution } = await import('../lib/lane-transcript-backfill.mjs');
+  for (const bad of [{ lanes: { transcripts: { explicitScan: { enabled: false } } } },
+    { host: { maxLoadPerCore: {} } }, { host: null }]) {
+    const { env, log } = hostPolicyFiles(layer === 'legacy' ? bad : {}, layer === 'canonical' ? bad : {});
+    const stateRoot = temp(); const scan = vi.fn(() => new Map([['1', []]])); const exec = vi.fn();
+    expect(hostLoadAdmission({ env, log, interactive: false, load: () => [0], cores: () => 1 }).admitted).toBe(false);
+    expect(scheduledLaneGc(['/lane'], { env, log, stateRoot, exec }).ran).toBe(false);
+    expect(exec).not.toHaveBeenCalled();
+    expect(() => cachedTranscriptAttribution('/root', { 1: '/lane' }, { env, log, stateRoot, scan })).toThrow('invalid policy');
+    expect(scan).not.toHaveBeenCalled();
+  }
+});
+
+it('host policy regression: preference files merge per leaf and canonical conflicts win', async () => {
+  const { loadHostOverloadSettings } = await import('../lib/host-overload-settings.mjs');
+  const { hostLoadAdmission } = await import('../lib/host-load.mjs');
+  const opts = hostPolicyFiles({ host: { maxLoadPerCore: 0.5, maxWaitMs: 100 },
+    lanes: { transcripts: { explicitScan: false }, gc: { schedule: 60000 } } },
+  { host: { maxWaitMs: 250 }, lanes: { gc: { schedule: 120000 } } });
+  const policy = loadHostOverloadSettings(opts);
+  expect(policy.settings).toEqual({ host: { maxLoadPerCore: 0.5, maxWaitMs: 250 },
+    lanes: { transcripts: { explicitScan: false }, gc: { schedule: 120000 } } });
+  expect(Object.values(policy.sources)).toEqual(['platform', 'platform', 'platform', 'platform']);
+  expect(hostLoadAdmission({ ...opts, interactive: false, load: () => [1], cores: () => 1 }).admitted).toBe(false);
+});
+
+it('host policy regression: invalid legacy values cannot be hidden by canonical overrides', async () => {
+  const { loadHostOverloadSettings } = await import('../lib/host-overload-settings.mjs');
+  for (const legacy of [{ host: { maxLoadPerCore: {} } }, { host: null }, null, []]) {
+    const opts = hostPolicyFiles(legacy, { host: { maxLoadPerCore: 0.5 } });
+    expect(() => loadHostOverloadSettings(opts)).toThrow('invalid policy');
+  }
+});
+
 it('test load readings are deterministic, validated, and ignored outside Vitest', async () => {
   const { readHostLoad, hostLoadAdmission } = await import('../lib/host-load.mjs');
   const load = vi.fn(() => [100]);
