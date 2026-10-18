@@ -325,7 +325,8 @@ describe('numbering carry referral evidence', () => {
       expect(tryReadRun(LIVE_RUN, dir)).toEqual(before);
       // An unreadable record under that id is not proof the id is free.
       const store = { read: () => { throw Error('corrupt'); } };
-      expect(chosenRunIdRecord({ id: LIVE_RUN }, store)).toHaveProperty('error');
+      expect(chosenRunIdRecord({ id: LIVE_RUN, op: 'review-pr' }, store))
+        .toEqual({ error: expect.stringContaining('names an existing review run record') });
     });
     it('two starts under the same chosen run ID at once never let the second replace the first', async () => {
       dir = mkdtempSync(join(tmpdir(), 'numbering-custom-id-'));
@@ -361,6 +362,19 @@ describe('numbering carry referral evidence', () => {
       const other = createMemoryRunStore();
       expect(saveChosenRun(newRunRecord({ id: 'custom-run', op: 'file-item' }), other).run.idChosen).toBeUndefined();
       expect(other.read('custom-run')).not.toBeNull();
+    });
+    it('a chosen run ID that differs from a review run only in case never replaces it', () => {
+      dir = mkdtempSync(join(tmpdir(), 'numbering-custom-id-'));
+      persist(LIVE_RUN, TO, live['persistence-failed'], false);
+      const before = tryReadRun(LIVE_RUN, dir);
+      const store = createFileRunStore(dir);
+      const folded = LIVE_RUN.toUpperCase();
+      // Another operation under the case-folded id, and a review run that misspells the prefix, are both refused.
+      expect(saveChosenRun(newRunRecord({ id: folded, op: 'file-item' }), store)).toHaveProperty('error');
+      expect(saveChosenRun(newRunRecord({ id: `REVIEW-PR-${'b'.repeat(8)}`, op: 'review-pr' }), store)).toHaveProperty('error');
+      // The store refuses the same write when it does not come through a chosen id.
+      expect(() => writeRun(newRunRecord({ id: folded, op: 'file-item' }), dir)).toThrow(/review-pr run's id/);
+      expect(tryReadRun(LIVE_RUN, dir)).toEqual(before);
     });
     it('both readers tag a run under a chosen id custom, and only the id newRunId mints untagged', () => {
       dir = mkdtempSync(join(tmpdir(), 'numbering-custom-id-'));

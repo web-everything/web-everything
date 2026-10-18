@@ -99,7 +99,11 @@ export const REVIEW_RUN_ID_PREFIX = 'review-pr-';
  */
 export function chosenRunIdRecord(run, store) {
   // Only review runs gate a merge on their provenance; every other operation's record is left exactly as it was.
-  if (!run.id.startsWith(REVIEW_RUN_ID_PREFIX)) return { run };
+  // The prefix is matched in any case: on a case-insensitive disk `REVIEW-PR-<uuid>` is the same file as a review run.
+  if (!run.id.toLowerCase().startsWith(REVIEW_RUN_ID_PREFIX)) return { run };
+  if (run.op !== 'review-pr' || !run.id.startsWith(REVIEW_RUN_ID_PREFIX)) {
+    return { error: `--run-id=${run.id} is in the review run namespace; only a review-pr run uses it, spelled \`${REVIEW_RUN_ID_PREFIX}\`` };
+  }
   let existing;
   try { existing = store.read(run.id); } catch { existing = true; } // unreadable is not proof it is free
   if (existing) return { error: chosenRunIdTakenError(run.id) };

@@ -159,7 +159,9 @@ export function daemonJobsDir(daemon, env = process.env) {
  * `review-pr-` id, and no other operation may write one there (which would hide or replace a review run).
  */
 function assertReviewRunNamespace(record) {
-  if ((record.op === 'review-pr') !== record.id.startsWith(REVIEW_RUN_ID_PREFIX)) {
+  // Any case of the prefix is the namespace (a case-insensitive disk folds the names together); a review run spells it exactly.
+  const inNamespace = record.id.toLowerCase().startsWith(REVIEW_RUN_ID_PREFIX);
+  if (record.op === 'review-pr' ? !record.id.startsWith(REVIEW_RUN_ID_PREFIX) : inNamespace) {
     throw new TypeError(`operations: run id ${JSON.stringify(record.id)} does not match operation \`${record.op}\` — `
       + `a review-pr run's id starts \`${REVIEW_RUN_ID_PREFIX}\`, and no other operation's does`);
   }
