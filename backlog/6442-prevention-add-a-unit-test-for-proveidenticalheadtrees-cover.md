@@ -1,20 +1,21 @@
 ---
+bornAs: xfwqpnh
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/xyu47dk-card-number-ledger-switch-rollback-materialization-must-reco.md"]
-dateOpened: "2026-10-14"
+scope: ["we:scripts/lib/human-clearance-carry.mjs", "we:scripts/lib/__tests__/human-clearance-carry.test.mjs"]
+dateOpened: "2026-10-18"
 tags: []
 ---
 
-# Prevention — Add a prepare-time gate that refuses to start a slice that cites a card whose acceptance still co… (from web-everything/web-everything#5340 review)
+# Prevention — Add a unit test for proveIdenticalHeadTrees covering different trees, short SHAs, non-hex SHAs, e… (from web-everything/web-everything#5492 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/xyu47dk-card-number-ledger-switch-rollback-materialization-must-reco.md:22` — Add a prepare-time gate that refuses to start a slice that cites a card whose acceptance still contains `TODO: a command`.
+1. `we:scripts/lib/human-clearance-carry.mjs:199` — Add a unit test for `proveIdenticalHeadTrees` covering different trees, short SHAs, non-hex SHAs, exec failure and empty output. A lint rule that every exported `prove*` function has a test file naming it would catch the class.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5340@de1aaac33f29fa5134180251da1fd665e1f50e62
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5492@3d6d6345f31ed4e527b5a9bbf8d25c540c5c5e5b
 
 ## Acceptance
 

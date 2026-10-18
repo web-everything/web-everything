@@ -1,21 +1,21 @@
 ---
+bornAs: xeawrn2
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/health-watch-core.mjs", "we:scripts/conveyor/health-smells/operator-hold-aged.mjs", "we:scripts/conveyor/__tests__/health-watch-core.test.mjs", "we:scripts/conveyor/health-smells/__tests__/operator-hold-aged.test.mjs"]
-dateOpened: "2026-10-15"
+scope: ["we:backlog/xyu47dk-card-number-ledger-switch-rollback-materialization-must-reco.md"]
+dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — Add a core test where a record's observedAt is a few seconds after the tick now and assert it sti… (from web-everything/web-everything#5424 review)
+# Prevention — Add a prepare-time gate that refuses to start a slice that cites a card whose acceptance still co… (from web-everything/web-everything#5340 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/health-watch-core.mjs:432` — Add a core test where a record's observedAt is a few seconds after the tick `now` and assert it still extends continuity. More generally, compare externally produced timestamps against read time, or allow a skew tolerance.
-2. `we:scripts/conveyor/health-smells/operator-hold-aged.mjs:43` — Add a deterministic regression test covering removal and return within one sample on both sides of the age threshold, asserting that confirmed removal ends the previous episode.
+1. `we:backlog/6138-card-number-ledger-switch-rollback-materialization-must-reco.md:22` — Add a prepare-time gate that refuses to start a slice that cites a card whose acceptance still contains `TODO: a command`.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5424@d177ff48e438a3e18a3ad190bdfbea06be873644
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5340@de1aaac33f29fa5134180251da1fd665e1f50e62
 
 ## Acceptance
 

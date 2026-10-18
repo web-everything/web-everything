@@ -1,21 +1,22 @@
 ---
+bornAs: xekiijf
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/agy-shadow-trial-report.mjs", "we:scripts/lib/__tests__/review-shadow-budget.test.mjs", "we:scripts/lib/__tests__/agy-shadow-trial-report.test.mjs"]
-dateOpened: "2026-10-16"
+scope: ["we:scripts/conveyor/health-watch-core.mjs", "we:scripts/conveyor/health-smells/operator-hold-aged.mjs", "we:scripts/conveyor/__tests__/health-watch-core.test.mjs", "we:scripts/conveyor/health-smells/__tests__/operator-hold-aged.test.mjs"]
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Add a trial-report test with mixed ok, held and skipped rows that asserts quota.rate = held / (at… (from web-everything/web-everything#5444 review)
+# Prevention — Add a core test where a record's observedAt is a few seconds after the tick now and assert it sti… (from web-everything/web-everything#5424 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/agy-shadow-trial-report.mjs:98` — Add a trial-report test with mixed ok, held and skipped rows that asserts quota.rate = held / (attempts − skipped), so a new non-launch status cannot silently join the denominator.
-2. `we:scripts/lib/__tests__/review-shadow-budget.test.mjs` — Add a required concurrency regression test using a temporary shared store and synchronized worker processes; assert exactly dailyCap admissions and refusal of all remaining attempts.
+1. `we:scripts/conveyor/health-watch-core.mjs:432` — Add a core test where a record's observedAt is a few seconds after the tick `now` and assert it still extends continuity. More generally, compare externally produced timestamps against read time, or allow a skew tolerance.
+2. `we:scripts/conveyor/health-smells/operator-hold-aged.mjs:43` — Add a deterministic regression test covering removal and return within one sample on both sides of the age threshold, asserting that confirmed removal ends the previous episode.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5444@2762ba577a93c3d78edc1bd9641e817684f450dd
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5424@d177ff48e438a3e18a3ad190bdfbea06be873644
 
 ## Acceptance
 

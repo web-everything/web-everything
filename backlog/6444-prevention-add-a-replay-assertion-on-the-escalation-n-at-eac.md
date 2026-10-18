@@ -1,20 +1,21 @@
 ---
+bornAs: xg457qw
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/ci/shard-assign.mjs", "we:scripts/ci/__tests__/shard-assign.test.mjs"]
-dateOpened: "2026-10-14"
+scope: ["we:scripts/conveyor/main-ci-red-core.mjs", "we:scripts/conveyor/__tests__/main-ci-red-core.test.mjs"]
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Add a test that spawns node we:scripts/ci/shard-assign.mjs --suite=soak --shard=1/N and asserts i… (from web-everything/web-everything#5260 review)
+# Prevention — Add a replay assertion on the escalation n at each 30-minute tick, so the alert cadence is pinned… (from web-everything/web-everything#5281 review)
 
-Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this PR's latest advisory review named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/ci/shard-assign.mjs:146` — Add a test that spawns `node we:scripts/ci/shard-assign.mjs --suite=soak --shard=1/N` and asserts its output equals `shardFiles({shard, total})` for every shard.
+1. `we:scripts/conveyor/main-ci-red-core.mjs:824` — Add a replay assertion on the escalation n at each 30-minute tick, so the alert cadence is pinned by a test rather than prose.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5260@ad39c5bc1adfc398e5ff73651a853087f09316c8
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5281@414d0d191b525700a3118f3b77e1577642810e32
 
 ## Acceptance
 

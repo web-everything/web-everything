@@ -1,20 +1,22 @@
 ---
+bornAs: x33bqia
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/main-ci-red-core.mjs", "we:scripts/conveyor/__tests__/main-ci-red-core.test.mjs"]
-dateOpened: "2026-10-15"
+scope: ["we:scripts/lib/agy-shadow-trial-report.mjs", "we:scripts/lib/__tests__/review-shadow-budget.test.mjs", "we:scripts/lib/__tests__/agy-shadow-trial-report.test.mjs"]
+dateOpened: "2026-10-16"
 tags: []
 ---
 
-# Prevention — Add a replay assertion on the escalation n at each 30-minute tick, so the alert cadence is pinned… (from web-everything/web-everything#5281 review)
+# Prevention — Add a trial-report test with mixed ok, held and skipped rows that asserts quota.rate = held / (at… (from web-everything/web-everything#5444 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/main-ci-red-core.mjs:824` — Add a replay assertion on the escalation n at each 30-minute tick, so the alert cadence is pinned by a test rather than prose.
+1. `we:scripts/lib/agy-shadow-trial-report.mjs:98` — Add a trial-report test with mixed ok, held and skipped rows that asserts quota.rate = held / (attempts − skipped), so a new non-launch status cannot silently join the denominator.
+2. `we:scripts/lib/__tests__/review-shadow-budget.test.mjs` — Add a required concurrency regression test using a temporary shared store and synchronized worker processes; assert exactly dailyCap admissions and refusal of all remaining attempts.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5281@414d0d191b525700a3118f3b77e1577642810e32
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5444@2762ba577a93c3d78edc1bd9641e817684f450dd
 
 ## Acceptance
 
