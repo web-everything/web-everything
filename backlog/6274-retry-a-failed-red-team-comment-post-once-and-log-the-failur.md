@@ -1,4 +1,5 @@
 ---
+bornAs: xat490j
 kind: story
 size: 2
 status: active

@@ -67,7 +67,7 @@ process.stdout.write(JSON.stringify({ planned, spentByPlanner, spentBySkipped, s
 export default {
   id: 'owed-red-team-release-consumed-by-planner',
   title: 'notes-only planning consumes the only release for a saved red-team result whose comment is missing',
-  card: 'x9jlvy0; PR #5461 head 3373a33, review finding on PR #5510',
+  card: '6273; PR #5461 head 3373a33, review finding on PR #5510',
   fixedBy: { sha: 'working-tree', where: 'lane/redteam-comment-retry', paths: [
     'scripts/conveyor/review-referral-hold.mjs', 'scripts/operations/review-job.mjs',
     'scripts/operations/review-dispatch.mjs', 'skills-src/conveyor/review-daemon.mjs',
