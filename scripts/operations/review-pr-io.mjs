@@ -43,7 +43,6 @@ export { referralSeatDisabled } from './review-seat-policy.mjs';
  */
 
 import { execFileSync } from 'node:child_process';
-import { reviewExecFileSync } from '../lib/review-fetch.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -148,7 +147,7 @@ export function reviewBodyPath({ root = REPO_ROOT, runId, bodyFile } = {}) {
  * throws inside a swallowed `try`, which surfaces as an unscored basis rather than as the caller bug it is
  * (#2952). `shapeReadFinding` REFUSES that case rather than falling back; this is the shape that avoids it.
  */
-const execFileIn = (cwd) => (cmd, args, opts) => reviewExecFileSync(cmd, args, { ...opts, cwd });
+const execFileIn = (cwd) => (cmd, args, opts) => execFileSync(cmd, args, { ...opts, cwd });
 
 /**
  * The default PR-view transport: ONE `gh pr view`, exactly as before.

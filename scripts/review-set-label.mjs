@@ -63,7 +63,7 @@ import { readReviewRunEvidence, readReviewRunHeads, REVIEW_RUN_STORE_MISSING } f
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { reviewExecFileSync as execFileSync } from './lib/review-fetch.mjs';
+import { execFileSync } from 'node:child_process';
 import { readPinnedChangedFiles, workflowEditHold } from './lib/merge-queue-enqueue.mjs';
 // Rebase resolution (2026-08-08): the UNION of both sides. `buildReviewedDiffMarker` is #2979's accept
 // fingerprint, `READY_TO_MERGE_LABEL` is #2832's hold invariant, `buildReviewedContributionMarker` is
@@ -156,9 +156,7 @@ import { writeAllSync } from './lib/write-all-sync.mjs';
 // closure (or a copy-paste of it elsewhere) inherits the throttle for free instead of re-introducing the bare
 // call. See `we:backlog/3631-migrate-remaining-gh-cli-call-sites-to-the-gh-throttle-wrapp.md` for the tracked
 // item this is one slice of.
-import { execFileSyncThrottled as throttledExec } from './lib/gh-throttle.mjs';
-import { reviewFetchExec } from './lib/review-fetch.mjs';
-const execFileSyncThrottled = reviewFetchExec(throttledExec);
+import { execFileSyncThrottled } from './lib/gh-throttle.mjs';
 // #4317 — the approval-time prevention filer no longer shells `file-item` INLINE (in whatever checkout is
 // reviewing the PR, routinely a read-only daemon clone that never commits or pushes — see
 // `fileApprovalPreventionCard`'s own doc below for the incident). It hands the composed card off to a DETACHED

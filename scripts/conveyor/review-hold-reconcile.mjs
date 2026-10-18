@@ -56,7 +56,7 @@
  * human/independent-agent act, never a sweep's), and it never adds `review:pending`/`review:changes` — a stray
  * label is dropped, never replaced with a guess at what it should have said instead.
  */
-import { reviewExecFileSync as execFileSync } from '../lib/review-fetch.mjs';
+import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 

@@ -32,7 +32,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { reviewExecFileSync as execFileSync } from '../lib/review-fetch.mjs';
+import { execFileSync } from 'node:child_process';
 import { CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
 import { ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
 import { REVIEWED_SHA_MARKER, CONVERTED_ADVISORY_NOTE_MARKER, REVIEW_PR_CHANNEL, normalizeDiffFingerprint } from '../lib/review-escalation.mjs';
@@ -345,8 +345,6 @@ export function readMechanicalRoundFacts({ pr, defaultBranch = 'main', remote = 
   try {
     git(['fetch', '--quiet', '--no-tags', '--end-of-options', remote, `+${base}:refs/remotes/${remote}/${base}`,
       ...(headRef ? [`+${headRef}:refs/remotes/${remote}/${headRef}`] : [])]);
-  } catch { /* a failed fetch degrades to what is cached; the reads below are the real probe */ }
-  try {
     const parents = git(['rev-list', '--parents', '-n', '1', '--end-of-options', head]).trim().split(/\s+/);
     if (parents.length !== 3) return fail('not-a-merge');
     const [, priorHead, merged] = parents;
