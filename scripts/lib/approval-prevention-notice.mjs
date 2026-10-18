@@ -161,11 +161,11 @@ export function buildApprovalPreventionMarker({ headSha } = {}) {
   return `<!-- approval-prevention-filed:${String(headSha ?? '').toLowerCase()} -->`;
 }
 
-const MARKER_RE = /<!-- approval-prevention-filed:([0-9a-f]{7,40}) -->/gi;
+export const MARKER_RE = /<!-- approval-prevention-filed:([0-9a-f]{7,40}) -->/gi;
 
 /** A detached landing job's own session slug — the only shape the job/retraction markers below accept. */
 const SESSION_RE = /^[A-Za-z0-9._-]{1,120}$/;
-const JOB_RE = /<!-- approval-prevention-job:([A-Za-z0-9._-]{1,120}) -->/i;
+export const JOB_RE = /<!-- approval-prevention-job:([A-Za-z0-9._-]{1,120}) -->/i;
 const RETRACTED_RE = /<!-- approval-prevention-retracted:([0-9a-f]{7,40}):([A-Za-z0-9._-]{1,120}) -->/gi;
 
 /**

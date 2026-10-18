@@ -60,6 +60,7 @@
  * accepted; 2 = red (suites failed — marker recorded red) / `check` verdict not-ok; 3 = usage / git error (no
  * marker written) / `request` refused because no verify daemon is alive / `reset` refused because a FOREIGN lease is live (own live lease no longer refuses, #3378).
  */
+import { redFirstWarning } from './lib/tests-first-policy.mjs';
 import { RUNNER_LOCK_ROOT, runnerLeaseStatus, probeRunnerLeaseLiveness } from '../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY } from '../skills-src/conveyor/verify-daemon.mjs';
 import { readLockEntry } from './readiness/file-locks.mjs';
@@ -479,6 +480,12 @@ if (cacheHit) {
   // Bare `verify`: report the cached terminal result directly — never touch the marker, never exec the gate.
   emit({ sha: headSha, status: 'green', reason: 'cached', exitCode: preStart.exitCode ?? null, ...cachedRetry, ...cachedPhases, detail: cachedDetail }, 0);
 }
+
+// Builders stay on local main until publication; the lease identifies that pre-publication build.
+let testsFirstLease = null;
+try { testsFirstLease = JSON.parse(readFileSync(join(GIT_DIR, LEASE_FILENAME), 'utf8')); } catch { /* branch fallback */ }
+const testsFirstAdvisory = redFirstWarning({ git, lease: testsFirstLease });
+if (testsFirstAdvisory) process.stderr.write(`⚠ ${testsFirstAdvisory}\n`);
 
 // Card-only diff (skipLocalForCardOnly): nothing local to run. Record a green marker for HEAD saying the gate was
 // skipped, so every existing reader (check, pr-land finish-guard, open-pr) sees an ordinary green. Handled before the

@@ -1,3 +1,4 @@
+import { readTestsFirstPolicy } from './lib/tests-first-policy.mjs';
 /**
  * check-standards-rules.mjs — pure, individually-testable rule bodies for the validator.
  *
@@ -1344,7 +1345,7 @@ export function findDanglingBacklogRefs(body, knownIds) {
 const UNFINISHED_ACCEPTANCE_RE = /TODO:\s*a command/i;
 const MUTATION_PROOF_CLAIM_RE = /mutation[- ]proof/i;
 
-function hasUnfinishedAcceptanceBesideProofClaim(body) {
+function hasUnfinishedAcceptanceBesideProofClaim(body, requireClaim = true) {
   let fenceChar = null, fenceLen = 0;
   let inDoneWhen = false, placeholder = false, claim = false;
   for (const line of String(body ?? '').split(/\r?\n/)) {
@@ -1361,7 +1362,7 @@ function hasUnfinishedAcceptanceBesideProofClaim(body) {
     if (inDoneWhen && UNFINISHED_ACCEPTANCE_RE.test(prose)) placeholder = true;
     if (MUTATION_PROOF_CLAIM_RE.test(prose)) claim = true;
   }
-  return placeholder && claim;
+  return placeholder && (!requireClaim || claim);
 }
 
 // ── Per-item backlog RENDERING lint (#845) ────────────────────────────────────
@@ -1437,6 +1438,11 @@ export function lintBacklogItemRendering({ item, body, pocRegistry = null, known
         `grep the other scripts/conveyor/health-smells/*.mjs for the same signal (probe name / threshold) and ` +
         `record the result on a line containing "sibling smells".`);
     }
+  }
+
+  if (item.status === 'open' && item.preparedDate && hasUnfinishedAcceptanceBesideProofClaim(body, false)
+      && readTestsFirstPolicy().value.requireExecutableAcceptance) {
+    errors.push(`Backlog item "${id}" violates build.requireExecutableAcceptance: prepared Acceptance still contains TODO: a command; name a command/test that fails before the build and passes after.`);
   }
 
   // Unfinished executable acceptance beside a mutation-proof claim (#4738) — ERROR, exactly-open cards only.

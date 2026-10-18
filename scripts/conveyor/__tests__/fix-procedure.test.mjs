@@ -23,7 +23,7 @@ import {
   fixBegin, fixEnd, withAltBranchHint, repoKeyFromRemoteUrl, repoKeyForCheckout, DEFAULT_FIX_CLAIM_TTL_MINUTES,
   FIX_BEGIN_MARKER, FIX_END_MARKER, FIXING_LABEL, STOOD_DOWN_LABEL, parseGitPush, resolvePushDestination,
   fixBeginRefusalMessage, refuseHeldPush, parseGitPushes, resolvePushDestinations, pushTargetUnreliable,
-  isInfraStallCompletion,
+  isInfraStallCompletion, handClaimedPushToCi,
 } from '../fix-procedure.mjs';
 import { FIX_END_INFRA_STALL_PREFIX } from '../../lib/ruling-ledger.mjs';
 import { acquireFixDispatchClaim, refreshLiveFixDispatchClaims, releaseSessionFixDispatchClaims, readFixDispatchClaim } from '../fix-dispatch-claim.mjs';
@@ -599,6 +599,81 @@ describe('fixBegin / fixEnd — the IO shell', () => {
       postComment: (repo, pr, body) => log.push(['comment', body.split('\n')[0]]),
     };
   };
+
+  it('fix-end hands a raw fixer push to CI when the claimed head changed', async () => {
+    const oldHead = 'a'.repeat(40), newHead = 'b'.repeat(40);
+    const claim = acquireFixClaim({ repo: 'we', pr: 2811, who: 'fix-2811', sessionId: 'push-session',
+      branch: BRANCH, headSha: oldHead, lockRoot: root });
+    expect(claim.ok).toBe(true);
+    const labels = fakeLabels();
+    const pushes = [];
+    const result = await fixEnd({ repo: 'we', pr: 2811, who: 'fix-2811', sessionId: 'push-session', lockRoot: root,
+      gh: async () => JSON.stringify({ headRefOid: newHead, labels: [{ name: 'ci:failed' }, { name: 'status:ci-red' }] }),
+      labels, readCompletion: async () => null, recordPush: push => pushes.push(push) });
+    expect(result.steps).toContain('awaiting-ci');
+    expect(pushes).toEqual([{ repo: 'web-everything/web-everything', pr: 2811, head: newHead }]);
+    expect(labels.log).toContainEqual(['set', { add: 'checking', remove: ['ci:failed'] }]);
+    expect(labels.log).toContainEqual(['set', { add: 'status:awaiting-ci', remove: ['status:ci-red'] }]);
+  });
+
+  const CHECK = (name, conclusion, status = 'COMPLETED') => ({ __typename: 'CheckRun', name, status, ...(conclusion ? { conclusion } : {}) });
+  const endAfterPush = async ({ present, rollup, required = ['test', 'smoke'] }) => {
+    const oldHead = 'a'.repeat(40), newHead = 'b'.repeat(40);
+    expect(acquireFixClaim({ repo: 'we', pr: 2811, who: 'fix-2811', sessionId: 'push-session', branch: BRANCH, headSha: oldHead, lockRoot: root }).ok).toBe(true);
+    const labels = fakeLabels();
+    const pushes = [];
+    const result = await fixEnd({ repo: 'we', pr: 2811, who: 'fix-2811', sessionId: 'push-session', lockRoot: root,
+      gh: async () => JSON.stringify({ headRefOid: newHead, labels: present.map(name => ({ name })), statusCheckRollup: rollup }),
+      labels, readCompletion: async () => null, recordPush: push => pushes.push(push), readRequiredChecks: () => required });
+    const sets = labels.log.filter(([k]) => k === 'set').map(([, spec]) => spec);
+    return { result, pushes, sets, removed: sets.flatMap(s => s.remove ?? []), handedOff: sets.some(s => s.add === 'checking' || s.add === 'status:awaiting-ci') };
+  };
+
+  it('fix-end preserves a red CI verdict on the pushed head, even while another check still runs', async () => {
+    const { result, pushes, removed, handedOff } = await endAfterPush({ present: ['ci:failed', 'status:ci-red', 'status:awaiting-review', 'status:fixing'],
+      rollup: [CHECK('test', 'FAILURE'), CHECK('smoke', null, 'IN_PROGRESS'), CHECK('review-gate', null, 'QUEUED')] });
+    expect(result.steps).toContain('ci-red');
+    expect(pushes).toHaveLength(1);
+    expect(handedOff).toBe(false);
+    expect(removed).toEqual(expect.arrayContaining(['status:fixing', 'status:awaiting-review']));
+    expect(removed.filter(l => l === 'ci:failed' || l === 'status:ci-red')).toEqual([]);
+  });
+
+  it('fix-end on a green pushed head drops the previous head\'s red labels and the push hand-off\'s wait, keeps awaiting-review', async () => {
+    const { result, removed, handedOff } = await endAfterPush({ present: ['ci:failed', 'status:ci-red', 'checking', 'status:awaiting-ci', 'status:awaiting-review', 'status:fixing'],
+      required: ['test', 'smoke', 'merge-gate'], rollup: [CHECK('test', 'SUCCESS'), CHECK('smoke', 'SKIPPED'), CHECK('merge-gate', 'SUCCESS')] });
+    expect(result.steps).toContain('ci-green');
+    expect(handedOff).toBe(false);
+    expect(removed).toEqual(expect.arrayContaining(['ci:failed', 'status:ci-red', 'checking', 'status:awaiting-ci', 'status:fixing']));
+    expect(removed).not.toContain('status:awaiting-review');
+  });
+
+  it('fix-end hands off when a required check has not reported yet (a partial rollup is no verdict)', async () => {
+    const { result, sets } = await endAfterPush({ present: ['ci:failed', 'status:ci-red'], rollup: [CHECK('review-gate', 'SUCCESS'), CHECK('test', 'SUCCESS')] });
+    expect(result.steps).toContain('awaiting-ci');
+    expect(sets).toContainEqual({ add: 'checking', remove: ['ci:failed'] });
+    expect(sets).toContainEqual({ add: 'status:awaiting-ci', remove: ['status:ci-red'] });
+  });
+
+  it('fix-end hands off when the required set is unknown', async () => {
+    const { result } = await endAfterPush({ present: ['status:ci-red'], rollup: [CHECK('test', 'FAILURE')], required: [] });
+    expect(result.steps).toContain('awaiting-ci');
+  });
+
+  it('push hands the claimed head to CI best-effort: a gh failure after the push is reported, never thrown', () => {
+    const claim = { meta: { branch: 'lane/x', pr: 41 } };
+    const logs = [];
+    const marked = [];
+    const ok = handClaimedPushToCi({ repoKey: 'we', branch: 'lane/x', src: 'HEAD' },
+      { listClaims: () => [claim], revParse: () => 'c'.repeat(40), mark: p => { marked.push(p); return true; } });
+    expect(ok).toBe('awaiting-ci');
+    expect(marked).toEqual([{ repo: 'web-everything/web-everything', pr: 41, head: 'c'.repeat(40) }]);
+    expect(handClaimedPushToCi({ repoKey: 'we', branch: 'lane/x' },
+      { listClaims: () => [claim], revParse: () => 'c'.repeat(40), mark: () => { throw new Error('gh label create: HTTP 502'); }, log: l => logs.push(l) })).toBe('failed');
+    expect(logs).toEqual([expect.stringContaining('CI hand-off failed (the CI-lifecycle label pass relabels it): gh label create: HTTP 502')]);
+    expect(handClaimedPushToCi({ repoKey: 'we', branch: 'lane/x' }, { listClaims: () => { throw new Error('lock root unreadable'); }, log: l => logs.push(l) })).toBe('failed');
+    expect(handClaimedPushToCi({ repoKey: 'we', branch: 'lane/other' }, { listClaims: () => [claim] })).toBe('no-claim');
+  });
 
   it('fix-begin DEFAULT (operator ruling 2026-09-27, draft-only-on-withdrawal): claim → NO draft → fixing label (stood-down removed) → marker; token-bound for a session-less caller; fix-end never relies on draft-first promotion', async () => {
     const { gh, calls } = fakeGh({ headRefName: BRANCH, headRefOid: 'a'.repeat(40), isDraft: false, state: 'OPEN', labels: [{ name: STOOD_DOWN_LABEL }] });

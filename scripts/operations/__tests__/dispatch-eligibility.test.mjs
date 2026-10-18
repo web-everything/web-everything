@@ -15,6 +15,17 @@ import { runOperationCli } from '../cli-adapter.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { resolveOperation } from '../run.mjs';
 
+// These admission regressions exercise the inherited evidence/probation router.
+// Pin its policy so changing production provider defaults cannot change the corpus.
+vi.mock('../../lib/dispatch-routing-policy-io.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  const { inheritedRoutingPolicy } = await import('../../lib/__tests__/inherited-routing-policy.mjs');
+  return {
+    ...actual,
+    resolveDispatchRoute: (dispatch, options) => actual.resolveDispatchRoute(dispatch, { ...options, routingPolicy: inheritedRoutingPolicy }),
+  };
+});
+
 // The older dispatch-lane harness has one local, assumed launch row, not a reusable
 // queue. This corpus exercises the real build planner as well as the dispatch predicate.
 const queue = [

@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
+import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
 import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, refreshHeldHead, retainApprovedHumanQueueHead } from './lib/approved-human-surface-hold.mjs';
 /**
@@ -203,6 +205,7 @@ export { mapWithConcurrency } from './lib/drain-concurrency.mjs';
 import { runLedgerShadow, formatShadowLine } from './lib/drain-ledger-shadow.mjs'; // #5444 — ledger gate in SHADOW beside the labels; journals, never decides
 import { drainReviewGateFact, readDrainLedgerSnapshot, recordDrainLedgerFacts } from './lib/drain-ledger-facts.mjs';
 import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overlapRowKey, readyToMergeLabelTimeMs } from './conveyor/land-overlap-yield.mjs'; // + readyToMergeLabelTimeMs: the drain order's ready-at (same cached label read) // #4308 — the land-time overlap-yield planner (see planLabelDrain's own `overlapContext` param)
+import { filterEnqueueableOverlapRows, resolveOverlapYieldOnlyToEnqueueableSetting, formatOverlapYieldOnlyToEnqueueableSetting } from './conveyor/overlap-yield-enqueueable.mjs';
 import { rankByDeliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES } from './lib/delivery-priority.mjs'; // drain order (2026-10-10): the shared P0-P4 class rule
 import { readDeliveryPrioritySettings } from './conveyor/delivery-priority-shadow.mjs'; // drain order: the shared aging/cap settings (platform preference `deliveryPriority`)
 import { execFileSyncThrottled } from './lib/gh-throttle.mjs'; // drain order: the operator-override labeler read
@@ -1146,15 +1149,17 @@ export function isTransientUnknownMergeability(verdict) {
   return !!verdict && verdict.decision !== 'merge' && /^not mergeable \(mergeable=UNKNOWN\)/.test(String(verdict.reason || ''));
 }
 
-/** Setting: how many extra re-reads a transient UNKNOWN gets, and the wait before each (bounded: ≤ 4 × 3 s). */
-export const UNKNOWN_MERGEABILITY_RETRY = Object.freeze({ retries: 4, delayMs: 3000 });
-/** Env knob: an integer 0–10 overrides `retries` (0 = the old single read). Anything else keeps the default. */
+/** Setting: how many extra re-reads a transient UNKNOWN gets, and the wait before each (bounded: ≤ 3 × 20 s by default). */
+export const UNKNOWN_MERGEABILITY_RETRY = Object.freeze({ retries: 3, delayMs: 20000 });
+/** Env knob: an integer 0–3 overrides `retries` (0 = the old single read). Anything else keeps the default. */
 export const UNKNOWN_MERGEABILITY_RETRY_ENV = 'WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES';
-export function resolveUnknownMergeabilityRetry(env = {}) {
+export function resolveUnknownMergeabilityRetry(env = {}, layers = {}) {
+  // `layers` ({ tool, platform }) pins the cascade's file layers for a test; production reads the settings files.
+  const setting = { ...UNKNOWN_MERGEABILITY_RETRY, delayMs: resolveHandoffSettings('drain', { env, ...layers }).value.mergeableUnknownRepollSec * 1000 };
   const raw = env?.[UNKNOWN_MERGEABILITY_RETRY_ENV];
-  if (typeof raw !== 'string' || !/^\d+$/.test(raw.trim())) return UNKNOWN_MERGEABILITY_RETRY;
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw.trim())) return setting;
   const n = Number(raw.trim());
-  return n <= 10 ? { ...UNKNOWN_MERGEABILITY_RETRY, retries: n } : UNKNOWN_MERGEABILITY_RETRY;
+  return n <= 3 ? { ...setting, retries: n } : setting;
 }
 
 /**
@@ -1165,10 +1170,47 @@ export function resolveUnknownMergeabilityRetry(env = {}) {
 export async function revalidateWithUnknownRetry({ read, opts, setting = UNKNOWN_MERGEABILITY_RETRY, sleep }) {
   let verdict = revalidateForMerge(await read(), opts);
   for (let attempt = 0; attempt < setting.retries && isTransientUnknownMergeability(verdict); attempt += 1) {
-    sleep(setting.delayMs);
+    await sleep(setting.delayMs);
     verdict = revalidateForMerge(await read(), opts);
   }
   return verdict;
+}
+
+/** The pass's ordering: UNKNOWN listings are re-polled BEFORE the head-bound open-PR context is collected. */
+export async function repollThenCollectContext({ repoll, collect }) {
+  await repoll();
+  return collect();
+}
+
+/**
+ * Apply one PR's ci-lifecycle label plan: removals, then additions. Each addition goes through
+ * `writeLabelWithHandoff`, so a `ci:failed` written here wakes the fix daemon right after the write lands.
+ * Best effort: a failed write is skipped (the next pass retries). Returns whether every write landed.
+ */
+export function applyCiLifecycleLabelPlan({ plan, pr, repo = null, slug = repo, exec = execFileSync, signal = signalFixDispatch }) {
+  const flag = repo ? ['--repo', repo] : [];
+  let ok = true;
+  for (const rm of plan.toRemove) { try { exec('gh', ['pr', 'edit', String(pr), ...flag, '--remove-label', rm], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { ok = false; } }
+  for (const add of plan.toAdd) {
+    try { writeLabelWithHandoff({ repo: slug, pr, label: add, write: () => exec('gh', ['pr', 'edit', String(pr), ...flag, '--add-label', add], { stdio: ['ignore', 'ignore', 'pipe'] }) }, signal); } catch { ok = false; }
+  }
+  return ok;
+}
+
+/** Refresh UNKNOWN listing facts before reading head-bound manifests/commits or classifying the pass. */
+export async function repollUnknownListings({ prsByRepo, read, sleep, setting = UNKNOWN_MERGEABILITY_RETRY, concurrency = 4 }) {
+  const unknown = pr => String(pr.mergeable ?? '').toUpperCase() === 'UNKNOWN';
+  let pending = [...prsByRepo].flatMap(([repo, prs]) => prs.filter(unknown).map(pr => ({ repo, pr })));
+  for (let attempt = 0; pending.length && attempt < Math.min(3, setting.retries); attempt++) {
+    await sleep(setting.delayMs);
+    const unresolved = await mapWithConcurrency(pending, concurrency, async ({ repo, pr }) => {
+      const fresh = await read(repo, pr.number);
+      if (!fresh || fresh.number !== pr.number) return null;
+      Object.assign(pr, fresh);
+      return unknown(pr) ? { repo, pr } : null;
+    });
+    pending = unresolved.filter(Boolean);
+  }
 }
 
 /**
@@ -2318,7 +2360,7 @@ export function buildOverlapRows({ candidates, verdicts, openPrContext, mergedPr
     if (!base) continue; // no raw listing row — should not happen for a candidate drawn from this same listing
     candidateRows.push({ ...base, exempt: isExemptItem(c.item) });
   }
-  return { candidateRows, openPrRows };
+  return { candidateRows, openPrRows: filterEnqueueableOverlapRows({ openPrRows, verdicts, localSlug, enabled: resolveOverlapYieldOnlyToEnqueueableSetting({ argv, env: process.env }).value }) };
 }
 
 /**
@@ -4384,6 +4426,7 @@ async function runCli() {
   // value) throws here and is caught by this file's own top-level `runCli().catch(...)` — an ordinary CLI
   // usage-error exit, not a drain failure.
   const overlapYieldOverrides = parseOverlapYieldOverrides({ argv, env: process.env });
+  process.stderr.write(`${formatOverlapYieldOnlyToEnqueueableSetting(resolveOverlapYieldOnlyToEnqueueableSetting({ argv, env: process.env }))}\n`);
   const AS_JSON = !!flags.json;
   const DRY_RUN = !!flags['dry-run'];
   const REQUIRED = typeof flags.check === 'string' ? flags.check : 'test';
@@ -4890,9 +4933,8 @@ async function runCli() {
             touched = true;
             if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} would reconcile ci-lifecycle → "${desired}"${plan.toRemove.length ? ` (drop ${plan.toRemove.join(', ')})` : ''}\n`);
           } else {
-            let ok = true;
-            for (const rm of plan.toRemove) { try { execFileSync('gh', ['pr', 'edit', String(p.number), ...repoFlag(repo), '--remove-label', rm], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { ok = false; /* best-effort — the next pass retries */ } }
-            for (const add of plan.toAdd) { try { execFileSync('gh', ['pr', 'edit', String(p.number), ...repoFlag(repo), '--add-label', add], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { ok = false; /* a label race/permission miss is non-fatal — the next pass retries */ } }
+            // Best effort — a label race/permission miss is non-fatal; the next pass retries.
+            const ok = applyCiLifecycleLabelPlan({ plan, pr: p.number, repo, slug: repo || localSlug });
             if (ok) { touched = true; if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} ci-lifecycle → "${desired}" (reconcile)\n`); }
           }
         }
@@ -5088,7 +5130,11 @@ async function runCli() {
   // #xc7p3q9 (B3) — when the blind context is NEVER collected (`RECONCILE` false: a bare `/merge` sweep or
   // `--no-reconcile-labels`), it is INCOMPLETE by construction — `contextComplete:false` — so the couple gate
   // fails closed (a coupled impl defers rather than orphan-landing past a carrier the gate cannot see).
-  const openPrContext = RECONCILE ? await __t.timeAsync('listing', () => __t.timeAsync('listing.context', () => collectContext(liveListingsByRepo))) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false });
+  const prsByRepo = narrowPrsByRepo(listings, { onlyPr, onlyRepo, repos: REPOS, isLocalRepo });
+  const openPrContext = await repollThenCollectContext({
+    repoll: () => repollUnknownListings({ prsByRepo, read: fetchFreshPrForRevalidation, setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) }),
+    collect: () => (RECONCILE ? __t.timeAsync('listing', () => __t.timeAsync('listing.context', () => collectContext(liveListingsByRepo))) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false })),
+  });
   // #xc7p3q9 (R2) — the operator escape hatch symmetric to `--no-review-escalation`: `--assume-complete-context`
   // FORCES the context complete so a genuinely-stuck couple (e.g. a persistent read-noise fail-closed) can land
   // short of editing the script. Prints a LOUD one-line waiver. Off by default; the fail-closed gate stays live.
@@ -5103,7 +5149,6 @@ async function runCli() {
   // the cross-repo ordering context below.
   // #xc7p3q9 (Fix 4) — the REAL `--only`/`--repos` narrowing is now `narrowPrsByRepo` (shared with the
   // test suite so tests drive the same wiring runCli does).
-  const prsByRepo = narrowPrsByRepo(listings, { onlyPr, onlyRepo, repos: REPOS, isLocalRepo });
   // #2417 — fan out the per-PR commits + manifest reads across EVERY candidate PR at once (bounded pool),
   // cached across `--watch` passes on unchanged head SHA + body — was one serial `gh pr view --json commits` + one
   // serial manifest probe per PR, one repo at a time (~2×N serial `gh` round-trips a pass). The merge cascade

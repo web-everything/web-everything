@@ -1170,6 +1170,24 @@ function pinnedSha(value) {
 }
 
 /**
+ * The head of the last FULL review, written at the end of the producer's `Net basis` line: a delta review's cumulative
+ * cap is measured from it. It rides on that line because only the line at the fixed footer slot is producer text
+ * (we:scripts/conveyor/mechanical-round-cap.mjs#basisLineOf); a line of its own could be written by a juror.
+ */
+export const FULL_REVIEW_ANCHOR = / Full-review anchor: `([0-9a-f]{40})`\.$/;
+/** A full review anchors on its own head; a delta review carries its chain's anchor forward. Unpinned: nothing. */
+export function renderFullReviewAnchor(read) {
+  const sha = read?.deltaReview ? pinnedSha(read.deltaReview.anchor) : pinnedSha(read?.netBasis?.rev);
+  return sha ? ` Full-review anchor: \`${sha}\`.` : '';
+}
+/** The producer's `Net basis` footer line, shared by the verdict write-up and the advisory note. */
+export function renderNetBasisLine(read) {
+  return `Net basis: \`${read.netBasis.base ?? '?'}..${read.netBasis.rev ?? '?'}\`${renderRevProvenance(read.netBasis)} — `
+    + `${read.netChangedFiles.length} net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.`
+    + renderFullReviewAnchor(read);
+}
+
+/**
  * SHAPE-CHECK one `readPr` result and turn it into the `read` finding. PURE — separated from the injected read
  * so the refusal below is testable without touching `gh` or `git`.
  *
@@ -1426,6 +1444,7 @@ export function shapeReadFinding(raw, { pr, repo, careLevel } = {}) {
       scored: net.scored === true,
     },
     diffText: String(diff.text || ''),
+    deltaReview: raw.deltaReview ?? null,
     diffScored: diff.scored === true,
     // Held item 177 — set only when this PR is a stacked top and the diff above was taken from the stack base (the
     // bottom PR's head merged into this PR's merge-base with main) instead of main. `null` = the main basis.
@@ -1482,7 +1501,11 @@ export function renderJudgeInput(read) {
         '',
       ]
       : ['## Net diff vs current main', '']),
-    read.diffText?.trim() || '_(the net diff could not be resolved — see the degraded note)_',
+    ...(read.deltaReview ? [
+      `## Delta review: ${read.deltaReview.priorHead}..${read.deltaReview.head}`,
+      'Judge only this delta and whether it resolves the prior findings below. Use surrounding code as context; do not reopen unrelated code.',
+      read.deltaReview.text, '## Prior findings to verify', read.deltaReview.priorFindings,
+    ] : [read.diffText?.trim() || '_(the net diff could not be resolved — see the degraded note)_']),
   ];
   return lines.join('\n');
 }
@@ -1952,8 +1975,7 @@ export function renderVerdictWriteUp({ read, verdict, answer, actor, reason = ''
   const basis = read.degraded
     ? `⚠️ DEGRADED BASIS (\`${read.degradedReason}\`) — the net diff vs current main could not be resolved, so the `
       + 'file list below may be inflated by sibling-lane content this PR does not touch (#2450).'
-    : `Net basis: \`${read.netBasis.base ?? '?'}..${read.netBasis.rev ?? '?'}\`${renderRevProvenance(read.netBasis)} — `
-      + `${read.netChangedFiles.length} net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.`;
+    : renderNetBasisLine(read);
   return [
     body,
     ...(verdict.nonClaudeSeatShortfall ? ['', verdict.nonClaudeSeatShortfall] : []),
@@ -2183,6 +2205,8 @@ function renderRevProvenance(netBasis) {
 
 /** The stated outcome of a note posted while mandatory referrals are unruled: neither `accept` nor `changes`. */
 const ADVISORY_PENDING_REFERRAL_OUTCOME = 'pending-referral';
+/** The stated outcome of a note whose outcome could not be derived: neither `accept` nor `changes`. */
+const ADVISORY_NO_OUTCOME = 'none';
 
 /** PR #5025 — at most this many lone-answer retirement reasons are listed to the human; the rest are counted. */
 const RETIREMENT_REASONS_SHOWN = 5;
@@ -2253,8 +2277,7 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
   const basis = read.degraded
     ? `⚠️ DEGRADED BASIS (\`${read.degradedReason}\`) — the net diff vs current main could not be resolved, so `
       + 'the file list above may be inflated by sibling-lane content this PR does not touch (#2450).'
-    : `Net basis: \`${read.netBasis.base ?? '?'}..${read.netBasis.rev ?? '?'}\`${renderRevProvenance(read.netBasis)} — `
-      + `${read.netChangedFiles.length} net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.`;
+    : renderNetBasisLine(read);
   return [
     `${ADVISORY_NOTE_MARKER} ${reasonLine}`,
     'This PR carries `review:human`. The independent',
@@ -2277,10 +2300,12 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
       ? ['', `**Advisory outcome:** \`${outcome}\` — ${outcome === ADVISORY_OUTCOMES.ACCEPT
         ? 'no blocking findings on this head; `advisory:accepted` is applied'
         : 'blocking findings on this head; `advisory:changes` is applied'}.`]
-      // No outcome line parses back as `accept` (`parseAdvisories`), so unruled referrals state a non-accept word.
+      // No outcome line parses back as `accept` (`parseAdvisories`), so unruled referrals state a non-accept word. The
+      // line is ALWAYS written: it holds the fixed slot above `---` (reconcile-core `advisoryOutcomeAtSlot`), so a
+      // juror's last finding line can never sit where the producer's outcome belongs.
       : v.pendingReferrals?.length
         ? ['', `**Advisory outcome:** \`${ADVISORY_PENDING_REFERRAL_OUTCOME}\` — mandatory referrals still need a ruling; no \`advisory:*\` label is applied`]
-        : []),
+        : ['', `**Advisory outcome:** \`${ADVISORY_NO_OUTCOME}\` — no outcome could be derived; no \`advisory:*\` label is applied`]),
     '',
     '---',
     '',
@@ -3160,6 +3185,7 @@ export function reviewPrOperation({
             pr: view.input.pr,
             repo: view.input.repo,
             body: renderAdvisoryNote({ read, verdict: view.verdict }),
+            reviewedHead: read.netBasis?.rev,
           },
           // IDEMPOTENT: FALSE. It posts a real, durable `gh pr comment` — replaying it on an unknown outcome
           // would risk a second one, exactly the reason `record`'s own LABEL effect is `false` (see there).
@@ -3296,7 +3322,7 @@ export function reviewPrOperation({
         if (plan.stackHold) {
           return [{
             type: REVIEW_EFFECTS.STACK_HOLD,
-            payload: { pr, repo, bodyFile, marker: plan.stackHold.marker, note: plan.stackHold.note },
+            payload: { pr, repo, bodyFile, reviewedHead: read.netBasis?.rev, marker: plan.stackHold.marker, note: plan.stackHold.note },
             idempotent: false,
           }];
         }
@@ -3322,6 +3348,7 @@ export function reviewPrOperation({
               // #2898 — the single home renders WHAT IT IS GIVEN. Told, not guessed: this operation is the
               // only thing that knows a run came through it, and the comment's own footer already says so.
               channel: REVIEW_PR_CHANNEL,
+              reviewedHead: read.netBasis?.rev,
               bodyFile,
               addLabel: decision.addLabel,
               removeLabels: presentRemoveLabels(decision.removeLabels, read.labels),
