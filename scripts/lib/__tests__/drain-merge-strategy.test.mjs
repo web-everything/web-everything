@@ -15,12 +15,13 @@ import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mj
 import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
 
 const HEAD = 'b'.repeat(40);
+const BASE_TIP = 'e'.repeat(40);
 const LOCAL = 'web-everything/web-everything';
 const policyOf = (strategy) => ({ policy: resolveMergeDeliveryPolicy({ tool: strategy ? { strategy } : undefined }), note: null });
 
 const DRAIN = 'drain-bot';
 
-function harness({ strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = process.env, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam } = {}) {
+function harness({ strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = process.env, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, baseTip = () => BASE_TIP } = {}) {
   const calls = [];
   const logs = [];
   let stored = initial;
@@ -39,6 +40,8 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
     if (args[0] === 'pr' && ['comment', 'edit'].includes(args[1])) return '';
     if (args[0] === 'label' && args[1] === 'create') return '';
     if (args[0] === 'api' && args[1] === 'user') { if (selfLogin == null) throw new Error('gh: not logged in'); return `${selfLogin}\n`; }
+    if (cmd === 'git' && args[0] === 'rev-parse') return `${baseTip()}\n`; // the base tip the pinned diff used
+    if (cmd === 'git' && args[0] === 'ls-remote') return `${baseTip()}\t${args.at(-1)}\n`; // the live base tip
     if (cmd === 'git') return args[0] === 'diff' ? 'scripts/x.mjs\0' : ''; // the pinned change list of the judged head
     if (args[0] === 'pr' && args[1] === 'view' && args.includes('id,headRefOid,baseRefName')) return JSON.stringify({ id: 'PR_NODE', headRefOid: HEAD, baseRefName: 'main', labels: ['ready-to-merge'] });
     if (args[0] === 'pr' && args[1] === 'view' && viewThrows.includes(Number(args[2]))) throw new Error('gh: HTTP 502');
@@ -49,17 +52,19 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
       } } } } });
       if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: !removed && (queued || mutated) && (inQueue ?? true), headRefOid: HEAD } } } });
       if (args.some(a => a.includes('dequeuePullRequest'))) { removed = true; return JSON.stringify({ data: { dequeuePullRequest: { clientMutationId: null } } }); }
-      mutated = true;
-      if (mutation) return JSON.stringify(mutation);
-      if (enqueueFails) return JSON.stringify({ errors: [{ message: 'Pull request is not mergeable' }] });
-      return JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'E', position: 1, state: 'QUEUED' } } } });
+      const response = mutation ?? (enqueueFails
+        ? { errors: [{ message: 'Pull request is not mergeable' }] }
+        : { data: { enqueuePullRequest: { mergeQueueEntry: { id: 'E', position: 1, state: 'QUEUED' } } } });
+      // A refused mutation must not make the recovery attempt observe a queued PR.
+      if (!response.errors?.length && response.data?.enqueuePullRequest?.mergeQueueEntry?.id) mutated = true;
+      return JSON.stringify(response);
     }
     throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
   };
   const readFile = () => { if (stored == null) { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; } return JSON.stringify(stored); };
   const writeState = (_p, s) => { stored = JSON.parse(JSON.stringify(s)); };
   const s = createDrainMergeStrategy({
-    dryRun, env, readRedTeamEvidence: () => evidence, requestRedTeam, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
+    dryRun, env, readRedTeamEvidence: () => { if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }, requestRedTeam, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
     cancelObsoleteRuns: () => {}, batching: { gate: () => ({ admit: true }), observe: () => ({}) },
     postConflictFinding, ...(now ? { now } : {}), resolved: policyOf(strategy), log: { write: (l) => logs.push(l) }, readFile, writeState, ...(withLock ? { withLock } : {}),
   });
@@ -962,5 +967,104 @@ describe('queue safeguard overrides and untracked queue entries', () => {
     const h = harness({ strategy: 'github-merge-queue', queued: true });
     h.s.dequeueSendBacks([{ number: 5283, labels: [] }]);
     expect(h.calls.some(c => c.some(a => String(a).includes('dequeuePullRequest')))).toBe(false);
+  });
+});
+
+
+describe('drain pre-stage queue admission', () => {
+  it('changed safety policy falls back before mutation or failure backoff', () => {
+    const { s, calls, state } = harness({ strategy:'github-merge-queue', enqueueFails:true });
+    const c = { num:42, repo:null };
+    const prepared = s.prestage(c, HEAD);
+    expect(prepared.allowed).toBe(true);
+    prepared.safety = { ...prepared.safety, redTeamPendingMaxMin:999 };
+    calls.length = 0;
+    expect(s.enqueue(c, HEAD, { prepared })).toEqual({ fallback:true });
+    expect(calls).toEqual([]);
+    expect(state()).toBeNull();
+  });
+  it('a throwing prepared enqueue leaves the ordinary recovery attempt unthrottled', () => {
+    const { s, calls, state } = harness({ strategy:'github-merge-queue', enqueueFails:true });
+    const c = { num:42, repo:null };
+    const prepared = s.prestage(c, HEAD);
+    expect(prepared.allowed).toBe(true);
+    expect(() => s.enqueue(c, HEAD, { prepared })).toThrow('prepared enqueue FAILED');
+    expect(state()).toBeNull();
+    expect(() => s.enqueue(c, HEAD)).toThrow('enqueue FAILED');
+    expect(calls.filter(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toHaveLength(2);
+    expect(state().enqueueFailures['cwd#42']).toMatchObject({ headSha: HEAD, count: 1 });
+    expect(state().pending).toEqual([]);
+  });
+  it('prepares without writes and rechecks red-team disposition at enqueue', () => {
+    const { s, calls, state } = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], evidence: { loopPayload: null } });
+    const c = { num: 42, repo: null, headRef: 'lane/a' };
+    const prepared = s.prestage(c, HEAD);
+    expect(prepared.allowed).toBe(true);
+    expect(state()).toBeNull();
+    expect(calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+    calls.length = 0;
+    expect(s.enqueue(c, HEAD, { prepared, comments: prepared.comments })).toMatchObject({ enqueued: true });
+    // Both admission and the post-enqueue clearance dedupe read the live thread.
+    expect(calls.filter(call => call.includes('--slurp'))).toHaveLength(2);
+    expect(calls.some(call => call[0] === 'git' && ['fetch', 'diff'].includes(call[1]))).toBe(false);
+  });
+  // PR #5480 red-team finding: the prepared file list is bound to the base branch and tip it was read against,
+  // so a PR retargeted (or whose base moved) between pre-stage and enqueue is re-read against the live base.
+  const diffAgainst = (calls, base) => calls.some(call => call[0] === 'git' && call[1] === 'rev-parse' && call.includes(`refs/remotes/origin/${base}^{commit}`))
+    && calls.some(call => call[0] === 'git' && call[1] === 'diff' && call.some(a => String(a).endsWith(`...${HEAD}`)));
+  it('binds the prepared file list to its base and re-reads the diff when the live base differs', () => {
+    const { s, calls } = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], evidence: { loopPayload: null } });
+    const c = { num: 42, repo: null, headRef: 'lane/a', baseRefName: 'release' };
+    const prepared = s.prestage(c, HEAD);
+    expect(prepared).toMatchObject({ allowed: true, preparedSurface: { headSha: HEAD, base: 'release', baseSha: BASE_TIP, files: ['scripts/x.mjs'] } });
+    calls.length = 0;
+    expect(s.enqueue(c, HEAD, { prepared, comments: prepared.comments })).toMatchObject({ enqueued: true });
+    expect(diffAgainst(calls, 'main')).toBe(true);
+  });
+  it('re-reads the diff when the base branch moved under the same name between pre-stage and enqueue', () => {
+    let tip = BASE_TIP;
+    const { s, calls } = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], evidence: { loopPayload: null }, baseTip: () => tip });
+    const c = { num: 42, repo: null, headRef: 'lane/a' };
+    const prepared = s.prestage(c, HEAD);
+    expect(prepared.preparedSurface).toMatchObject({ base: 'main', baseSha: BASE_TIP });
+    tip = 'f'.repeat(40);
+    calls.length = 0;
+    expect(s.enqueue(c, HEAD, { prepared, comments: prepared.comments })).toMatchObject({ enqueued: true });
+    expect(diffAgainst(calls, 'main')).toBe(true);
+  });
+  it('keeps held red-team dispositions ineligible', () => {
+    const { s } = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'],
+      evidence: { loopPayload: { verdict: { verdict: 'accept' } }, inFlight: true } });
+    expect(s.prestage({ num: 42, repo: null }, HEAD).allowed).toBe(false);
+  });
+  it.each([{ labels:['review:accepted'] }, { labels:['review:accepted', 'checking'] }])('requires explicit ready-to-merge authorization: $labels', ({ labels }) => {
+    const { s, calls } = harness({ strategy: 'github-merge-queue', labels, evidence: { loopPayload: null } });
+    const c = { num: 42, repo: null };
+    expect(s.prestage(c, HEAD)).toMatchObject({ allowed: false, reason: 'ready-to-merge was removed' });
+    const authorized = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], evidence: { loopPayload: null } }).s.prestage(c, HEAD);
+    expect(authorized.allowed).toBe(true);
+    expect(s.enqueue(c, HEAD, { prepared: { ...authorized, labels: JSON.stringify([...labels].sort()) } })).toMatchObject({ enqueued: false, kind: 'sent-back' });
+    expect(calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+  });
+  it.each(['break', 'in-flight', 'unreadable'])('revalidates %s evidence that arrives after preparation', async variant => {
+    const evidence = { loopPayload: null, inFlight: false, recorded: false };
+    const comments = [];
+    const { s, calls } = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], evidence, liveComments: comments });
+    const c = { num: 5283, repo: null };
+    const prepared = s.prestage(c, HEAD);
+    expect(prepared.allowed).toBe(true);
+    if (variant === 'break') {
+      const { renderRedTeamComment } = await import('../../operations/review-extra-seats.mjs');
+      comments.push({ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
+        pr: 5283, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+        findings: [{ summary: 'new break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }],
+      }) });
+    } else if (variant === 'in-flight') {
+      evidence.loopPayload = { verdict: { verdict: 'accept' } };
+      evidence.inFlight = true;
+    } else evidence.readError = true;
+    if (variant === 'unreadable') expect(() => s.enqueue(c, HEAD, { prepared, comments: prepared.comments })).toThrow('evidence unreadable');
+    else expect(s.enqueue(c, HEAD, { prepared, comments: prepared.comments })).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
   });
 });
