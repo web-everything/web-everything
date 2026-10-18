@@ -2,7 +2,7 @@
 /** #6212: effects are injected; no model, process, Git or GitHub invocation. */
 import { describe, expect, it } from 'vitest';
 import { runReviewJob } from '../review-job.mjs';
-import { finishSpeculativeRedTeam, speculateRedTeam, reserveSeatCalls } from '../review-extra-seats.mjs';
+import { finishSpeculativeRedTeam, speculateRedTeam, runRedTeam, reserveSeatCalls } from '../review-extra-seats.mjs';
 import { planRedTeamActions, parseRedTeamComment } from '../../lib/red-team-gate.mjs';
 
 const REPO = 'web-everything/web-everything', HEAD = 'a'.repeat(40);
@@ -55,15 +55,21 @@ function job({ timing = 'panel-seat', verdict = 'accept', speculative = true, fi
 }
 
 describe('red team as an adversarial panel seat', () => {
-  it.each(['accept', 'changes', 'needs-human'])('starts beside jurors and saves the same head even when panel says %s', verdict => {
+  it.each(['accept', 'changes', 'needs-human'])('starts beside jurors and retains main acceptance gate for %s', verdict => {
     const h = job({ verdict });
     const out = runReviewJob({ pr: 6212, repo: REPO, pid: 1 }, h.io);
     expect(h.events.indexOf('start-seat')).toBeLessThan(h.events.findIndex(e => Array.isArray(e) && e[0] === 'jurors'));
     expect(h.events).toContainEqual(['jurors', '/jobs/read.json']);
-    expect(h.events).toContainEqual(['save-seat', HEAD]);
-    expect(h.events).not.toContain('discard');
-    expect(h.events).not.toContain('cancel');
-    expect(out.redTeam).toMatchObject({ status: 'ran' });
+    if (verdict === 'accept') {
+      expect(h.events).toContainEqual(['save-seat', HEAD]);
+      expect(h.events).not.toContain('discard');
+      expect(h.events).not.toContain('cancel');
+      expect(out.redTeam).toMatchObject({ status: 'ran' });
+    } else {
+      expect(h.events).toContain('cancel');
+      expect(h.events).toContain('discard');
+      expect(h.events).not.toContainEqual(['save-seat', HEAD]);
+    }
     if (verdict === 'accept') expect(h.statuses).toContainEqual(expect.objectContaining({ status: 'finished',
       loopPayload: expect.objectContaining({ findings: expect.objectContaining({ read: expect.objectContaining({ netBasis: expect.objectContaining({ rev: HEAD }) }) }) }),
       result: expect.objectContaining({ status: 'ran' }) }));
@@ -127,7 +133,7 @@ describe('red team as an adversarial panel seat', () => {
 });
 
 describe('panel seat persists through the real speculative completion path', () => {
-  it.each(['accept', 'changes'])('writes evidence for %s but requires acceptance for effects', async verdict => {
+  it.each(['accept', 'changes', 'needs-human'])('requires an owed review before finishing %s', async verdict => {
     const rows = [], comments = [], statuses = [];
     let n = 0, ledger;
     const io = {
@@ -143,9 +149,25 @@ describe('panel seat persists through the real speculative completion path', () 
       listComments: () => [], postComment: row => comments.push(row), redTeamStatus: row => statuses.push(row),
     };
     const env = { WE_RED_TEAM_TIMING: 'panel-seat' };
+    if (verdict === 'accept') {
+      const baseRunSeat = io.runSeat;
+      io.runSeat = async (...args) => {
+        expect(statuses).toContainEqual({ repo: REPO, pr: 6212, loopPayload: { findings: { read: read() } }, status: 'running' });
+        return baseRunSeat(...args);
+      };
+      expect((await runRedTeam({ pr: 6212, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env }, io)).status).toBe('ran');
+      rows.length = 0; comments.length = 0; statuses.length = 0;
+      io.runSeat = baseRunSeat;
+    }
     const pass = await speculateRedTeam({ pr: 6212, repo: REPO, lanePath: '/lane', read: read(), env, resume: false }, io);
     expect(pass.status).toBe('speculated');
+    const statusesBeforeFinish = statuses.slice();
     const out = await finishSpeculativeRedTeam({ pr: 6212, repo: REPO, loopPayload: payload(verdict), pass, env }, io);
+    if (verdict !== 'accept') {
+      expect(out.status).toBe('not-owed');
+      expect(rows).toEqual([]); expect(comments).toEqual([]); expect(statuses).toEqual(statusesBeforeFinish);
+      return;
+    }
     expect(out.status).toBe('ran');
     expect(rows).toContainEqual(expect.objectContaining({ dispatchKind: 'review-seat', seat: 'red-team', repo: REPO, pr: 6212, rev: HEAD, status: 'ok', findings: [] }));
     if (verdict === 'accept') {
@@ -162,7 +184,8 @@ describe('panel seat persists through the real speculative completion path', () 
 it.each(['changes', 'needs-human'])('a %s panel result cannot route a red-team send-back', verdict => {
   const h = job({ verdict, findings: [{ summary: 'confirmed break', confirmedByRecheck: true, impactIfUnfixed: 'broken' }] });
   const out = runReviewJob({ pr: 6212, repo: REPO, pid: 1 }, h.io);
-  expect(h.events).toContainEqual(['save-seat', HEAD]);
+  expect(h.events).not.toContainEqual(['save-seat', HEAD]);
+  expect(h.events).toContain('cancel');
   expect(h.events).not.toContain('gate');
   expect(h.statuses).toEqual([]);
   expect(out.verdict).toBe(verdict);

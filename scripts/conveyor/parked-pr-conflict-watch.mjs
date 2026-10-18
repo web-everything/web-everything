@@ -122,6 +122,7 @@ import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { unlinkSync } from 'node:fs';
 import { gitRun } from '../lib/git-run.mjs';
+import { recoveryPushContext } from './missing-run-push.mjs';
 import { repoKeyFromRemoteUrl } from './fix-procedure.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { loadCardConflictSettings } from '../lib/card-conflict-resolve.mjs';
@@ -427,7 +428,7 @@ export function attemptMissingCheckBaseRepair(d, { repo, pr, cwd = REPO_ROOT,
     if (paths.some(p => typeof p !== 'string' || !p)) return defer('unknown-files');
     if (isCardOnlyDiff(paths)) {
       const result = attemptCardRebase({ pr, repo, cwd });
-      return { ...result, ok: result?.action === 'rebased', deferred: result?.action !== 'rebased',
+      return { ...result, ok: result?.action === 'rebased', deferred: result?.ok === false && result?.error ? false : result?.action !== 'rebased',
         owner: 'card-conflict-resolver' };
     }
     postFinding({ pr, repo, baseRepair: { check: d.check, workflow: d.workflow, headSha: d.headSha } });
@@ -436,7 +437,9 @@ export function attemptMissingCheckBaseRepair(d, { repo, pr, cwd = REPO_ROOT,
 }
 
 /** Same trusted fast-forward plumbing, with a fresh main and a private index for the card path. */
-export function defaultAttemptCardConflictRebase({ pr, repo, cwd = REPO_ROOT, run = gitRun, cardConflictSettings } = {}) {
+export function defaultAttemptCardConflictRebase({ pr, repo, cwd = REPO_ROOT, run = gitRun, cardConflictSettings,
+  env = process.env, readCache, now = Date.now(),
+} = {}) {
   // Establish clone ownership before eligibility checks or any fetch/ref work.
   if (repo) {
     const remote = run('git', ['remote', 'get-url', 'origin'], { cwd });
@@ -451,9 +454,27 @@ export function defaultAttemptCardConflictRebase({ pr, repo, cwd = REPO_ROOT, ru
   const head = headFetch.status === 0 ? run('git', ['rev-parse', 'FETCH_HEAD'], { cwd }) : null;
   if (head?.status !== 0 || String(head.stdout).trim() !== pr.headRefOid)
     return { action: 'skip', deferred: true, reason: 'branch moved before recovery' };
+  let auth;
+  try {
+    auth = recoveryPushContext(repo, { env, readCache, now, exec: (cmd, args, opts) => {
+      const result = run(cmd, args, opts);
+      if (result.status !== 0) throw new Error('credential unavailable');
+      return result.stdout;
+    } });
+  } catch { return { ok: false, action: 'error', error: 'card recovery credential unavailable' }; }
+  if (!auth.ok) return { ok: false, action: 'error', error: auth.error };
+  // Only the recovery push uses this credential. Preserve the resolver's private index and
+  // claim checks, but never let the Git runner merge inherited GIT_* values back into push.
+  const recoveryRun = (cmd, args, opts) => {
+    if (cmd !== 'git' || args[0] !== 'push') return run(cmd, args, opts);
+    try {
+      const result = run(cmd, [...auth.args, ...args], { ...opts, env: auth.env, inheritEnv: false });
+      return result.status === 0 ? result : { status: 1, stderr: 'recovery push failed' };
+    } catch { return { status: 1, stderr: 'recovery push failed' }; }
+  };
   const tmpIndex = join(cwd, '.git', `card-conflict-index-${process.pid}-${randomUUID()}`);
   try {
-    return rebaseDropManifest({ laneRef: pr.headRefName, readRef: pr.headRefOid, base: 'origin/main', cwd, run, fetch: false, tmpIndex, cardConflictSettings });
+    return rebaseDropManifest({ laneRef: pr.headRefName, readRef: pr.headRefOid, base: 'origin/main', cwd, run: recoveryRun, fetch: false, tmpIndex, cardConflictSettings });
   } finally {
     try { unlinkSync(tmpIndex); } catch { /* private index may not have been created */ }
   }
@@ -1514,7 +1535,9 @@ export function watchParkedPrConflicts({
             results.push(cardEntry);
             continue;
           }
-          if (cardAttempt?.action === 'error') provider.postComment(resolvedRepo, pr.number, UNOWNED_REBASE_ATTEMPT_MARKER);
+          // Every unsuccessful attempt spends the cap, including a skipped content conflict.
+          try { provider.postComment(resolvedRepo, pr.number, UNOWNED_REBASE_ATTEMPT_MARKER); }
+          catch { /* same best-effort counter as the existing unowned owner */ }
         }
       } catch {
         cardAttempt = { action: 'error', reason: 'card rebase unavailable; normal conflict owner required' };

@@ -1486,6 +1486,10 @@ export async function speculateRedTeam({
       try { onReserved({ callId, provider, model, effort, rev, reservedAt: new Date(io.now()).toISOString() }); } catch { /* best effort */ }
     }
 
+    if (record && post) {
+      try { io.redTeamStatus?.({ repo, pr, loopPayload: { findings: { read } }, status: 'running' }); }
+      catch (e) { io.log(`red-team status: ${e.message}`); }
+    }
     const timeoutMs = resolveSeatTimeoutMs(env);
 
     let scratch = null;
@@ -1628,7 +1632,7 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
 export async function finishSpeculativeRedTeam({ pr, repo, loopPayload, pass, env = process.env, post = true } = {}, io = createRedTeamIo({ env })) {
   try {
     if (!redTeamEnabled(env)) return { status: 'disabled', reason: `${RED_TEAM_ENV}=${env?.[RED_TEAM_ENV] ?? ''} ${EXTRA_SEATS_ENV}=${env?.[EXTRA_SEATS_ENV] ?? ''}`.trim() };
-    if (!redTeamPanelSeatOwed(loopPayload, env) && !redTeamOwedFor(loopPayload)) return { status: 'not-owed', reason: notOwedReason(loopPayload) };
+    if (!redTeamOwedFor(loopPayload)) return { status: 'not-owed', reason: notOwedReason(loopPayload) };
     if (redTeamPanelSeatOwed(loopPayload, env) && pass?.status === 'prior-row'
       && pass.readFingerprint === redTeamReadFingerprint(loopPayload?.findings?.read)) {
       const records = io.readRecords();

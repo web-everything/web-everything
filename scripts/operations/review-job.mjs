@@ -563,7 +563,7 @@ export function settleSpeculativeRedTeam({ spec, accepted, out, input, panelSeat
   });
   const log = (line) => { try { io.log(`review-job ${out.sessionSlug}: red team (speculative) — ${line}`); } catch { /* best effort */ } };
   try {
-    if (!accepted && !panelSeat) {
+    if (!accepted) {
       const { spec: pass, reserved } = io.cancelSpeculativeRedTeam(spec);
       const reason = `review ${out.outcome} with verdict ${out.verdict ?? 'none'} — not accept`;
       const spend = io.recordDiscardedRedTeam({ pr: out.pr, repo: out.repo, pass, reserved, reason });

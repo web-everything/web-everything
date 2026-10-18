@@ -85,9 +85,10 @@ label reader through Vitest as well as a fresh Node dispatch import.
 `redTeam.timing` defaults to `panel-seat`; `WE_RED_TEAM_TIMING=post-accept` exercises
 the rollback path. Legacy tests of accept-only scheduling must select that timing in
 their IO/environment fixture. The panel reuses the speculative call's pinned read and
-finishes before the job reports done, even when the jurors reject or refer to a human.
-Non-accepted panels persist seat evidence only: comments, status labels, delegation
-trials and send-back effects still require the existing acceptance predicate.
+finishes before the job reports done for accepted, owed heads. Non-accepted reviews
+cancel and discard the speculative pass in every timing mode. Panel timing never
+bypasses `redTeamOwedFor` at completion; comments, status labels, delegation trials
+and send-back effects retain the existing acceptance predicate.
 Missing/unrun seat evidence on a reviewed head stays held in drain beyond the pending
 deadline; it cannot use the never-scheduled escape or trigger a second post-accept pass.
 The focused timing, review-seat and drain-seat suites cover this boundary.
@@ -2162,3 +2163,13 @@ a definitive red rollup; a red label alone cannot authorize dispatch, and tick
 retains its green-at-open provenance. Round-history metadata retries a head mismatch
 at most three times and preserves comments already read even if metadata remains
 unavailable. The focused regression suite is `guard-audit-regressions.test.mjs`.
+
+Recovery base repairs and the Also-raised-by card resolver use `recoveryPushContext`
+from `missing-run-push.mjs`: the owner installation token or a validated recovery
+credential is required. Pushes pin `WE_CI_PUSH_TOKEN` and clear inherited `GIT_*`
+configuration; `gitRun` must use `inheritEnv: false` for that exact environment,
+otherwise its normal merge with `process.env` restores the rejected configuration.
+Standalone red-team producers write `running` before the model call (best effort)
+when recording and posting are enabled. Card rebase skips, errors and throws all
+spend the existing unowned rebase cap. Nightly failure scans retain failed records
+of every kind alongside the nightly-only deadline check.

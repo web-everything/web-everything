@@ -319,3 +319,18 @@ it('clamps a persisted job retry allowance before reattaching without resetting 
   await runNightlyCoronerJob({ ...opts, now, reattach });
   expect(reattach).toHaveBeenCalledOnce();
 });
+
+it('keeps failed records of other kinds alongside earlier nights and nightly deadlines', async () => {
+  const opts = jobOptions(temp());
+  const records = [
+    { id: 'other-failed', input: {}, job: { kind: 'other', status: 'failed', error: 'other failure' } },
+    { id: 'other-running', input: {}, job: { kind: 'other', status: 'running' } },
+    { id: 'old-night', input: { night: '2026-10-14' }, job: { kind: 'nightly-coroner', status: 'failed', error: 'old failure' } },
+    { id: 'late-night', input: { night: '2026-10-15' }, job: { kind: 'nightly-coroner', status: 'running' } },
+    { id: 'done-night', input: { night: '2026-10-16' }, job: { kind: 'nightly-coroner', status: 'succeeded' } },
+  ];
+  opts.store.list = () => ({ records, corrupt: [] });
+  const out = await runNightlyCoronerJob({ ...opts, now: Date.parse('2026-10-17T12:00:00Z') });
+  expect(out.failures).toHaveLength(3);
+  for (const id of ['other-failed', 'old-night', 'late-night']) expect(out.failures.some(f => f.startsWith(id + ':'))).toBe(true);
+});

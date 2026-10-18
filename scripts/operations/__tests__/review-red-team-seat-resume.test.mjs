@@ -13,7 +13,7 @@ import { finishSpeculativeRedTeam, redTeamReadFingerprint } from '../review-extr
 const repo = 'web-everything/web-everything', rev = 'a'.repeat(40), pr = 6212;
 const read = { title: 'guard', body: 'Claims: guard', diffText: '+guard',
   netChangedFiles: ['x.mjs'], netBasis: { base: 'b'.repeat(40), rev } };
-const loopPayload = { verdict: { verdict: 'changes' }, findings: { read,
+const loopPayload = { verdict: { verdict: 'accept' }, findings: { read,
   judge: { findings: [{ summary: 'juror also found a problem' }] } } };
 const env = { WE_RED_TEAM_TIMING: 'panel-seat' };
 const prior = { dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev, status: 'ok',
@@ -21,6 +21,14 @@ const prior = { dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev, st
   foldedVerdict: 'accept', confirmedMissCount: 0, changedFiles: ['x.mjs'] };
 
 describe('panel seat reuses live-head evidence', () => {
+  it.each(['changes', 'needs-human'])('a saved panel seat cannot bypass a not-owed %s review', async verdict => {
+    const readRecords = vi.fn(() => [prior]);
+    const out = await finishSpeculativeRedTeam({ pr, repo, env,
+      loopPayload: { ...loopPayload, verdict: { verdict } },
+      pass: { status: 'prior-row', rev, readFingerprint: redTeamReadFingerprint(read) } }, { readRecords });
+    expect(out.status).toBe('not-owed');
+    expect(readRecords).not.toHaveBeenCalled();
+  });
   it('returns saved findings and re-check status when resuming a completed pass', async () => {
     const root = mkdtempSync(join(tmpdir(), 'red-team-seat-resume-'));
     roots.push(root);
