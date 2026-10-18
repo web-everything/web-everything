@@ -41,3 +41,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5525 (finding 1: `we:backlog/xyzpgol-overlap-yield-known-holds.md:38` — Add a card-lint rule in check:standards: every numbered 'Edge cases' item must be referenced by an Acceptance ID or marked n/a.)
