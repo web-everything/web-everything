@@ -92,7 +92,7 @@ export function declaredScopePaths(scope = [], repo) {
 
 /**
  * `additions` (lines) wins over `patch` when the caller already attributed the added lines. `directories` names the
- * extensionless scope paths that are directories at the PR head; any other extensionless entry stays one exact file.
+ * extensionless scope paths that were directories at the PR's GitHub-reported fork commit; any other extensionless entry stays one exact file.
  */
 export function scopeFenceDecision({ scope = [], repo, paths = [], patch = '', additions = addedLines(patch), removed = [], directories = [], policy }) {
   if (policy?.enabled === false) return { action: 'push', violations: [] };
