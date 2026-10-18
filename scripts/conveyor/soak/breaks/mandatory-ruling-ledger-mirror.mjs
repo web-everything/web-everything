@@ -6,6 +6,22 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+// Shared by the settled-ruling replay and the forced-drift isolation probe.
+export function mirrorFixtureOptions({ repo, pr, rows, facts, labels, writes, append, buildDerivedRows }) {
+  return { repo, selfLogin: 'mirror',
+    listPrs: () => [{ number: pr, labels: [...labels].map(name => ({ name })) }],
+    readEvents: async () => ({ status: 'ok', rows: [...rows] }),
+    buildRows: o => buildDerivedRows({ ...o, readFacts: () => facts }), readFacts: () => facts,
+    readTimeline: async () => ({ status: 'ok', items: [] }), appendRow: async row => append(row),
+    addLabel: async (_repo, _pr, name) => { labels.add(name); writes.push(name); },
+    setRulingLabel: async (_repo, _pr, wanted) => {
+      const name = 'advisory:ruling-needed';
+      if (wanted) { labels.add(name); writes.push(name); }
+      else labels.delete(name);
+    },
+  };
+}
+
 export default {
   id: 'mandatory-ruling-ledger-mirror',
   title: 'settled mandatory rulings survive the delayed referral and repeated label-mirror passes',
@@ -46,6 +62,9 @@ export default {
           setLabels: (_repo, _pr, plan) => { state.labels = [...state.labels.filter(l => !(plan.remove ?? []).includes(l)), plan.add]; },
         };
         const sinks = createReviewPrSinks({ root, labelProvider: provider, mirrorReferral: () => {},
+          postComment: provider.postComment, readLabels: () => [...state.labels], setLabels: provider.setLabels,
+          readChangedLines: () => new Set(),
+          runNode: () => { throw new Error('unexpected node process in isolated soak'); },
           appendLedgerRow: append, cardReadable: () => true, out: () => {},
           referralJudge: async request => ({ sessionId: request.sessionId, value: { rulings: [{
             key, result, rationale: 'checked pinned diff', evidence: ['diff:x'], card: result === 'card' ? 'we:backlog/7-filed.md' : '',
@@ -78,17 +97,7 @@ export default {
         const facts = { state: 'OPEN', isDraft: false, headSha: head, head: { sha: head }, labels: [], checks: [],
           requiredChecks: [{ name: 'test', state: 'green' }], probeErrors: [], sessions: [], handoffs: [], refusals: [] };
         for (let pass = 0; pass < 2; pass++) {
-          const out = await runMirrorApply({ repo, selfLogin: 'mirror',
-            listPrs: () => [{ number: pr, labels: [...labels].map(name => ({ name })) }],
-            readEvents: async () => ({ status: 'ok', rows: [...rows] }),
-            buildRows: o => buildDerivedRows({ ...o, readFacts: () => facts }), readFacts: () => facts,
-            readTimeline: async () => ({ status: 'ok', items: [] }), appendRow: async row => append(row),
-            addLabel: async (_repo, _pr, name) => { labels.add(name); writes.push(name); },
-            provider: { ensureLabel: () => {}, setLabels: (_repo, _pr, plan) => {
-              for (const name of plan.remove ?? []) labels.delete(name);
-              if (plan.add) { labels.add(plan.add); writes.push(plan.add); }
-            } },
-          });
+          const out = await runMirrorApply(mirrorFixtureOptions({ repo, pr, rows, facts, labels, writes, append, buildDerivedRows }));
           if (out.failures.length) violations.push(`${mode}/${result}: mirror failed: ${JSON.stringify(out.failures)}`);
         }
         if (writes.includes('advisory:ruling-needed') || (result !== 'block' && writes.includes('review:human'))) {

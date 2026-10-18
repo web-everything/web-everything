@@ -6,7 +6,7 @@
  *   REPORT MODE (the default, G1) WRITES NOTHING: no label, no comment, no ledger row, no run record.
  *   `--apply` (slice K, #5649) is the only write path: it records hand-moved hold labels as `label-input` rows
  *   (only an `added` row can hold; a hand removal is audit-only) and re-adds a derived-but-missing `review:human`.
- *   G2 also adds/removes `advisory:ruling-needed` from ledger-derived state; this is its sole writer.
+ *   G2 adds/removes `advisory:ruling-needed` from ledger-derived state. Verdict swaps retain removal.
  *   All other families remain report-only.
  *
  * The compare is slice F's (`review-ledger-check.mjs#buildDerivedRows`), reused as is, so the checker and the
@@ -18,7 +18,7 @@
 import { pathToFileURL } from 'node:url';
 import { DEFAULT_REPO, readOpenPrs, buildDerivedRows } from '../review-ledger-check.mjs';
 import { readLedgerEventsFromStore, appendVerdictAsync, buildLedgerEvent, EVENT_TYPES, verdictClears, ledgerEventId } from '../lib/verdict-ledger.mjs';
-import { RULING_NEEDED_LABEL } from '../lib/ruling-ledger.mjs';
+import { RULING_NEEDED_LABEL, RULING_NEEDED_LABEL_META } from '../lib/ruling-ledger.mjs';
 import { HOLD_LABELS } from '../lib/pr-state/holds/label-input.mjs';
 import { approvalValid, acceptanceCovers } from '../lib/pr-state/holds/verdict.mjs';
 import { derivePrState } from '../lib/pr-state.mjs';
@@ -191,12 +191,14 @@ export async function addApplyLabel(repo, pr, label, { provider } = {}) {
   gh.setLabels(repo, pr, { add: label, remove: [] });
 }
 
-/** G2's sole production writer. The closed family prevents changes to any other label. */
+/** G2's derived-state writer (verdict swaps retain removal). The closed family limits label changes. */
 export async function setRulingNeededLabel(repo, pr, wanted, { provider } = {}) {
   if (typeof wanted !== 'boolean') throw new Error('pr-label-mirror: ruling-needed requires a boolean');
   const gh = provider ?? (await import('../lib/review-label-provider.mjs')).createGhProvider();
-  if (wanted) gh.setLabels(repo, pr, { add: RULING_NEEDED_LABEL, remove: [] });
-  else gh.setLabels(repo, pr, { remove: [RULING_NEEDED_LABEL] });
+  if (wanted) {
+    gh.ensureLabel(repo, RULING_NEEDED_LABEL, RULING_NEEDED_LABEL_META);
+    gh.setLabels(repo, pr, { add: RULING_NEEDED_LABEL, remove: [] });
+  } else gh.setLabels(repo, pr, { remove: [RULING_NEEDED_LABEL] });
 }
 
 /**

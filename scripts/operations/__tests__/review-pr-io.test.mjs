@@ -1336,7 +1336,7 @@ describe('#4315 durable referral effects', () => {
       readTimeline: async () => ({ status: 'ok', items: [] }),
       appendRow: async () => { throw new Error('no label-input expected'); },
       addLabel: async (_repo, _pr, label) => labels.push(label),
-      provider: { ensureLabel: () => {}, setLabels: (_repo, _pr, plan) => labels.push(plan.add) },
+      setRulingLabel: async (_repo, _pr, wanted) => labels.push(wanted ? 'advisory:ruling-needed' : 'cleared'),
     });
     expect(out.failures).toEqual([]);
     expect(labels).not.toContain('advisory:ruling-needed');
@@ -1367,30 +1367,37 @@ describe('#4315 durable referral effects', () => {
     expect(rows).toEqual([expect.objectContaining({ type: 'ruling', ruling: 'not-real' })]);
   });
 
-  it.each(['complete', 'missing-reader', 'throws', 'not-array', 'head-moved'])('final ledger publication refreshes full-thread authority (%s)', async mode => {
+  it.each(['complete', 'missing-reader', 'throws', 'not-array', 'head-moved', 'state-throws'])('final ledger publication refreshes full-thread authority (%s)', async mode => {
     const h = harness({ result: 'block' });
     await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
     const before = h.ledger.length;
     const key = h.state.comments.flatMap(c => readReferralRecords([c]).records)[0].referrals[0].key;
     const read = h.provider.readPrState;
-    h.provider.readPrState = () => ({ ...read(), headRefOid: mode === 'head-moved' ? 'b'.repeat(40) : h.state.headRefOid,
-      comments: Array.from({ length: 100 }, () => ({ body: 'unrelated comment' })) });
+    h.provider.readPrState = () => {
+      if (mode === 'state-throws') throw new Error('PR offline');
+      return { ...read(), headRefOid: mode === 'head-moved' ? 'b'.repeat(40) : h.state.headRefOid,
+        comments: Array.from({ length: 100 }, () => ({ body: 'unrelated comment' })) };
+    };
     if (mode !== 'missing-reader') h.provider.readComments = () => {
       if (mode === 'throws') throw new Error('comments offline');
       return mode === 'not-array' ? null : structuredClone(h.state.comments);
     };
     const run = h.make()[REVIEW_EFFECTS.LEDGER_EVENTS]({ repo: 'o/r', pr: 7, headSha: h.state.headRefOid,
-      referralKeys: [key], syncMandatoryRulings: true }, { ...CTX, key: `full-thread-${mode}` });
+      referralKeys: [key], posted: true, syncMandatoryRulings: true }, { ...CTX, key: `full-thread-${mode}` });
     if (mode === 'complete') {
       expect((await run).written).toEqual(['referral', 'ruling', 'review-run']);
       expect(deriveReferrals(h.ledger).get(ledgerFindingKey(key)).state).toBe('blocking');
     } else {
-      await expect(run).rejects.toThrow(/head changed|comments/);
-      expect(h.ledger).toHaveLength(before);
+      expect((await run).written).toEqual(['referral', 'review-run']);
+      expect(h.ledger.slice(before)).toEqual([
+        expect.objectContaining({ type: 'referral' }),
+        expect.objectContaining({ type: 'review-run', posted: true }),
+      ]);
+      expect(h.lines.join('\n')).toMatch(/ledger-write-skip:.*block-sync/);
     }
   });
 
-  it.each(['throws', 'refused'])('retries a partial final event batch when its required block append %s', async failure => {
+  it.each(['throws', 'refused'])('preserves referral and visit rows when a block append %s, with replay-safe recovery', async failure => {
     const rows = [];
     let failFinal = false;
     const h = harness({ result: 'block', appendLedgerRow: row => {
@@ -1406,7 +1413,10 @@ describe('#4315 durable referral effects', () => {
     const payload = { repo: 'o/r', pr: 7, headSha: h.state.headRefOid, referralKeys: [key], syncMandatoryRulings: true };
     const ctx = { ...CTX, key: 'partial-final-ledger' };
     failFinal = true;
-    await expect(h.make()[REVIEW_EFFECTS.LEDGER_EVENTS](payload, ctx)).rejects.toThrow(/retry review events/);
+    const missed = await h.make()[REVIEW_EFFECTS.LEDGER_EVENTS](payload, ctx);
+    expect(missed.written).toEqual(['referral', 'review-run']);
+    expect(missed.missed).toEqual([expect.stringContaining('ruling: store offline')]);
+    expect(rows.filter(r => r.type === 'review-run')).toHaveLength(1);
     failFinal = false;
     await h.make()[REVIEW_EFFECTS.LEDGER_EVENTS](payload, ctx);
     expect(rows.filter(r => r.type === 'referral')).toHaveLength(1);

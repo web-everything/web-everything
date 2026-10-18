@@ -45,8 +45,8 @@ export const REPO_SCAN_TESTS = Object.freeze([
   {
     test: 'scripts/conveyor/__tests__/pr-label-mirror.test.mjs',
     scope: 'full',
-    why: 'enforces that pr-label-mirror is the sole ruling-needed label writer across scripts',
-    matches: (f) => f.endsWith('.mjs') && !f.includes('__tests__') && inTree(f, ['scripts']),
+    why: 'enforces the ruling-needed reference allowlist: mirror reconciliation, verdict-swap removal, and readers',
+    matches: (f) => /\.(?:[cm]?[jt]s|sh|bash|py)$/.test(f) && !f.includes('__tests__') && inTree(f, ['scripts']),
     inputs: ['scripts/conveyor/__tests__/pr-label-mirror.test.mjs'],
   },
   {

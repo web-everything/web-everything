@@ -1585,10 +1585,9 @@ export function createReviewPrSinks({
     // ADDITIVE: it changes no comment, label or decision. Both events are NON-CLEARING (holding), so the
     // statute write-miss posture (#verdict-ledger-pr-state-store rule 4) is: a failed append never blocks or
     // throws; it prints a loud `ledger-write-miss` line and the run goes on with its label hold unchanged.
-    // The required block-sync rows are different: after a referral lands they must be retried if
-    // their append fails. This effect is idempotent, so the executor safely resumes a partial batch.
-    // Authority refresh faults refuse the batch before any append, so a partial or stale thread cannot
-    // reopen a settled block or override an intervening operator ruling.
+    // Block-sync is best effort under the same additive contract. A stale/unreadable authority skips
+    // only those rows; an append miss never suppresses the referral or visit counter. No clearing row
+    // is synthesized from a partial thread. Stable row identities keep explicit retries safe.
     [REVIEW_EFFECTS.LEDGER_EVENTS]: async (payload, ctx) => {
       // #xrw21vx — each row's identity is THIS EFFECT (ctx.key) plus the row type, never the row's own bytes.
       // `ledgerEventId` otherwise hashes the whole row, `at` included: two distinct runs in one millisecond then
@@ -1599,6 +1598,7 @@ export function createReviewPrSinks({
         : `review-pr:rand:${randomUUID()}`);
       const base = { repo: payload.repo, pr: payload.pr, source: 'review-pr', session: currentActorId(), channel: 'review-pr' };
       const rows = [];
+      const written = []; const missed = [];
       const keys = Array.isArray(payload.referralKeys) ? payload.referralKeys : [];
       if (payload.headSha && keys.length) {
         rows.push({ type: EVENT_TYPES.REFERRAL, headSha: payload.headSha, findingKeys: keys.map((k) => `sha256:${referralHash(String(k))}`) });
@@ -1608,18 +1608,23 @@ export function createReviewPrSinks({
       // and the new referral reopens it. Re-read authority here so an intervening operator ruling
       // wins. Clearing rulings are already sticky across referrals in deriveReferrals.
       if (payload.syncMandatoryRulings && payload.headSha && keys.length) {
-        const live = readReferralState(payload.repo, payload.pr, payload.headSha);
-        const settled = mandatoryReferralState(live.comments, { repo: payload.repo, pr: payload.pr,
-          head: live.headRefOid, body: live.body ?? '', createdAt: live.createdAt, cardReadable });
-        for (const key of settled.blocked) {
-          if (keys.includes(key)) rows.push({ type: EVENT_TYPES.RULING, findingKey: ledgerFindingKey(key), ruling: 'block' });
+        try {
+          const live = readReferralState(payload.repo, payload.pr, payload.headSha);
+          const settled = mandatoryReferralState(live.comments, { repo: payload.repo, pr: payload.pr,
+            head: live.headRefOid, body: live.body ?? '', createdAt: live.createdAt, cardReadable });
+          for (const key of settled.blocked) {
+            if (keys.includes(key)) rows.push({ type: EVENT_TYPES.RULING, findingKey: ledgerFindingKey(key), ruling: 'block' });
+          }
+        } catch (e) {
+          const reason = String(e?.message ?? e).split('\n')[0];
+          missed.push(`block-sync: ${reason}`);
+          out(`ledger-write-skip: ${payload.repo}#${payload.pr} block-sync skipped (${reason}); referral and review-run rows will still be recorded`);
         }
       }
       if (payload.headSha) rows.push({ type: EVENT_TYPES.REVIEW_RUN, headSha: payload.headSha, phase: 'completed', posted: payload.posted === true });
       // An unpinned or degraded read names no head, so there is nothing to key a row on. That is a skipped write,
       // not a quiet success: say so loudly, the same way a write miss does, so the undercount is never silent.
       if (!payload.headSha) out(`ledger-write-skip: ${payload.repo}#${payload.pr} no pinned head, so no review-run row was recorded for this run (it will not count toward the visit cap); comments, labels and decisions are unaffected`);
-      const written = []; const missed = [];
       for (const row of rows) {
         try {
           const res = await appendLedgerRow({ ...buildLedgerEvent({ ...base, ...row, at: new Date().toISOString() }),
@@ -1627,7 +1632,6 @@ export function createReviewPrSinks({
           if (!res?.ok || res.ledgerWriteMiss) throw new Error((res?.errors ?? []).join('; ') || 'git write miss');
           written.push(row.type);
         } catch (e) {
-          if (row.type === EVENT_TYPES.RULING) throw new Error(`mandatory block ledger-write-miss; retry review events: ${String(e?.message ?? e).split('\n')[0]}`);
           missed.push(`${row.type}: ${String(e?.message ?? e).split('\n')[0]}`);
         }
       }

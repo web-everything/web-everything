@@ -8,6 +8,14 @@ import { buildDerivedRows } from '../../review-ledger-check.mjs';
 import { buildVerdictRecord, buildLedgerEvent } from '../../lib/verdict-ledger.mjs';
 import { derivePrState } from '../../lib/pr-state.mjs';
 import { deriveReferrals, ledgerFindingKey } from '../../lib/pr-state/referrals.mjs';
+import { RULING_NEEDED_LABEL_META } from '../../lib/ruling-ledger.mjs';
+
+function rulingLabelUsers(sources) {
+  // Scan references, not call syntax: variables, removeLabels arrays, and direct gh argv all
+  // retain either the constant or the literal. New readers require an explicit exemption too.
+  return Object.entries(sources).filter(([, source]) => /RULING_NEEDED_LABEL|advisory:ruling-needed/.test(source))
+    .map(([path]) => path).sort();
+}
 
 const fam = (family, missing = [], extra = []) => ({ family, missing, extra, agree: !missing.length && !extra.length });
 const row = (pr, families, status = 'mismatch', lifecycleState = 'X') => ({ pr, status, lifecycleState, families });
@@ -55,7 +63,7 @@ describe('report only', () => {
     for (const bad of ['setLabels', 'ensureLabel', 'createGhProvider', '--add-label', '--remove-label', 'pr edit', 'pr comment', 'writeRun', 'execFileSync', 'addLabel']) {
       expect(reportPart).not.toContain(bad);
     }
-    for (const bad of ['--remove-label', 'pr comment', 'ensureLabel', 'writeRun', 'execFileSync']) expect(src).not.toContain(bad);
+    for (const bad of ['--remove-label', 'pr comment', 'writeRun', 'execFileSync']) expect(src).not.toContain(bad);
     expect(src.match(/remove:\s*\[[^\]]+\]/g)).toEqual(['remove: [RULING_NEEDED_LABEL]']); // G2 removes only its own family
   });
 });
@@ -457,6 +465,38 @@ describe('#5647 single ruling-needed writer', () => {
     at: '2026-10-17T19:00:00Z', source: 'mandatory-reviewer', ...payload });
   const referral = (headSha = HEAD, repo, pr) => event('referral', { headSha, findingKeys: ['finding-1'] }, repo, pr);
   const ruling = (repo, pr) => event('ruling', { findingKey: 'finding-1', ruling: 'not-real' }, repo, pr);
+  it('bootstraps the ruling label before adding it, and removes without bootstrapping', async () => {
+    const { setRulingNeededLabel } = await import('../pr-label-mirror.mjs');
+    const calls = [];
+    let exists = false;
+    const provider = {
+      ensureLabel: (...args) => { calls.push(['ensure', ...args]); exists = true; },
+      setLabels: (...args) => {
+        if (args[2].add && !exists) throw new Error('label does not exist');
+        calls.push(['set', ...args]);
+      },
+    };
+    await setRulingNeededLabel(REPO, 7, true, { provider });
+    await setRulingNeededLabel(REPO, 7, false, { provider });
+    expect(calls).toEqual([
+      ['ensure', REPO, label, RULING_NEEDED_LABEL_META],
+      ['set', REPO, 7, { add: label, remove: [] }],
+      ['set', REPO, 7, { remove: [label] }],
+    ]);
+  });
+  it.each([
+    'provider.setLabels(repo, pr, { add: RULING_NEEDED_LABEL });',
+    'const spec = { add: RULING_NEEDED_LABEL }; provider.setLabels(repo, pr, spec);',
+    'const removeLabels = [RULING_NEEDED_LABEL]; swap({ removeLabels });',
+    "execFileSync('gh', ['pr', 'edit', '7', '--add-label', 'advisory:ruling-needed']);",
+    "execFileSync('gh', ['pr', 'edit', '7', '--remove-label', 'advisory:ruling-needed']);",
+    "const name = 'advisory:ruling-needed'; const args = ['--remove-label', name]; gh(args);",
+    "gh(['pr', 'edit', '7', '--add-label', RULING_NEEDED_LABEL]);",
+    'gh pr edit "$PR" --add-label advisory:ruling-needed',
+    "subprocess.run(['gh', 'pr', 'edit', '7', '--remove-label', 'advisory:ruling-needed'])",
+  ])('writer scan rejects an unapproved module regardless of write syntax: %s', source => {
+    expect(rulingLabelUsers({ 'new-writer.mjs': source })).toEqual(['new-writer.mjs']);
+  });
   function replay({ repo = REPO, pr = 7, rows = [], labels = [] } = {}) {
     const w = world({ verdict: null, labels });
     w.rows = rows;
@@ -465,7 +505,7 @@ describe('#5647 single ruling-needed writer', () => {
     w.opts.listPrs = () => [{ number: pr, labels: [...w.labels] }];
     w.opts.setRulingLabel = async (r, n, wanted) => {
       const mod = await import('../pr-label-mirror.mjs');
-      await mod.setRulingNeededLabel(r, n, wanted, { provider: { setLabels: (target, number, spec) => {
+      await mod.setRulingNeededLabel(r, n, wanted, { provider: { ensureLabel: () => {}, setLabels: (target, number, spec) => {
         expect([target, number]).toEqual([repo, pr]);
         w.log.push(spec);
         w.labels = wanted ? [...w.labels, label] : w.labels.filter(l => l !== label);
@@ -563,10 +603,25 @@ describe('#5647 single ruling-needed writer', () => {
     expect(await follow({ repo: REPO, pr: 7, head: HEAD, action: 'resume' })).toMatchObject({ labelCleared: false });
     expect(writes).toEqual([]);
   });
-  it('grep guard: only the mirror passes RULING_NEEDED_LABEL to setLabels or gh label edits', () => {
+  it('repo guard: ruling-needed references require an explicit writer or reader exemption', () => {
     const root = join(dirname(fileURLToPath(import.meta.url)), '../..');
-    const writers = readdirSync(root, { recursive: true }).filter(p => p.endsWith('.mjs') && !p.includes('__tests__'))
-      .filter(p => /setLabels\([^;]*RULING_NEEDED_LABEL/.test(readFileSync(join(root, p), 'utf8')));
-    expect(writers.sort()).toEqual(['conveyor/pr-label-mirror.mjs']);
+    const allowed = {
+      'conveyor/pr-label-mirror.mjs': 'sole reconciler that adds/removes from derived state',
+      'review-set-label.mjs': 'existing accepted/clear-human swap removes only; explicit writer exception',
+      'lib/ruling-ledger.mjs': 'label constants and ruling authority reader',
+      'operations/record-referral-ruling.mjs': 'legacy exported constant and operation documentation',
+      'conveyor/ruling-needed-sweep.mjs': 'read-only drift planner',
+      'review-ledger-check.mjs': 'read-only label family comparison',
+      'conveyor/pr-lifecycle.mjs': 'lifecycle render vocabulary',
+      'lib/pr-state/holds/label-input.mjs': 'hold vocabulary',
+      'conveyor/review-hold-reconcile.mjs': 'read-only sweep diagnostics',
+      'conveyor/referral-auto-block.mjs': 'documentation of the ruling signal',
+      'conveyor/review-hold-ledger-shadow.mjs': 'documentation of the shadow input',
+      'conveyor/review-referral-hold.mjs': 'documentation of the referral hold',
+    };
+    const paths = readdirSync(root, { recursive: true }).filter(p => /\.(?:[cm]?[jt]s|sh|bash|py)$/.test(p)
+      && !p.includes('__tests__') && !p.includes('soak/') && !/\.(test|spec)\./.test(p));
+    const users = rulingLabelUsers(Object.fromEntries(paths.map(p => [p, readFileSync(join(root, p), 'utf8')])));
+    expect(users.filter(p => !Object.hasOwn(allowed, p))).toEqual([]);
   });
 });

@@ -21,6 +21,10 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const MULTI = 'scripts/__tests__/multi-repo-checks.test.mjs';
 
 describe('selectScanTests', () => {
+  it.each(['mjs', 'cjs', 'js', 'mts', 'cts', 'ts', 'sh', 'bash', 'py'])('ruling-label reference guard covers new production .%s scripts', ext => {
+    const { full } = selectScanTests({ changedFiles: [`scripts/new-writer.${ext}`] });
+    expect(full.map(e => e.test)).toContain('scripts/conveyor/__tests__/pr-label-mirror.test.mjs');
+  });
   it('a changed file inside a scanner reach selects it, scoped to that file', () => {
     const { scoped, full, scopedFiles } = selectScanTests({ changedFiles: ['scripts/lib/new-thing.mjs'] });
     expect(scoped.map((e) => e.test)).toContain(MULTI);
