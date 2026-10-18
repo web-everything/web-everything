@@ -140,6 +140,8 @@ import { createHash } from 'node:crypto';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { shadowAdmission, readSnapshot } from '../lib/resource-admission.mjs';
+import { hostLoadAdmission } from '../lib/host-load.mjs';
+import { DEFAULT_HOST_MAX_WAIT_MS, loadHostOverloadSettings } from '../lib/host-overload-settings.mjs';
 import { LEGACY_SETTINGS_PATH, readDeclaredSettings } from '../lib/settings-files.mjs';
 import { cutoverDecision, loadResourceGateSettings } from '../lib/resource-gate.mjs';
 import { LEASE_FILENAME, isLeaseStale } from '../lib/lane-lease.mjs';
@@ -1102,6 +1104,9 @@ let admissionPolicyLogged = false;
  * STILL_WAITING_LOG_MS} — plain observability, not a give-up signal. Only `ceilingMs` (default {@link
  * DEFAULT_ADMISSION_CEILING_MS}) defers callers that support re-queuing; others keep waiting. Explicit
  * onTimeout=run permits an unslotted run. FCFS ranking still applies at the ceiling.
+ * Host overload defers re-queueable callers immediately. Mandatory callers poll until load drops or
+ * host.maxWaitMs elapses (default 15 minutes), then proceed through normal slot admission. Interactive
+ * operators bypass the host-load check. The host wait never permits bypassing occupied slots.
  * WE_HEAVY_ADMISSION=off is checked before touching the lock root and returns a disabled pass-through.
  * @param {object} opts
  * @param {string} opts.lockRoot
@@ -1124,7 +1129,10 @@ export async function acquireSlotBlocking({
   stillWaitingLogMs = STILL_WAITING_LOG_MS,
   pid = process.pid, now = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   log = (m) => process.stderr.write(m), env = process.env,
-  policy = loadAdmissionPolicy({ env }), canDefer = false, readResourceSnapshot = readSnapshot, ...seams
+  policy = loadAdmissionPolicy({ env }), canDefer = false, readResourceSnapshot = readSnapshot,
+  hostAdmission = (o) => process.env[ADMISSION_HELD_ENV] === '1'
+    ? { admitted: true, reason: 'host admission already held' } : hostLoadAdmission(o),
+  interactive = !!process.stdin.isTTY, ...seams
 }) {
   if (isAdmissionOff(env)) return { ok: false, slot: null, timedOut: false, disabled: true, waitedMs: 0 };
 
@@ -1165,9 +1173,44 @@ export async function acquireSlotBlocking({
   let lastLoggedAt = startedAt;
   let ceilingChecked = false;
   let yieldLogged = false;
+  let hostPolicyLogged = false;
+  let hostWaitStartedAt = null;
+  let hostMaxWaitMs = DEFAULT_HOST_MAX_WAIT_MS;
+  let hostWaitSource = 'standard';
+  let hostLoadBypassed = false;
   try {
     for (;;) {
       const attempt = now();
+      const host = hostLoadBypassed ? { admitted: true } : hostAdmission({ env, interactive, log: (m) => {
+        if (!hostPolicyLogged) { log(`${m}\n`); hostPolicyLogged = true; }
+      } });
+      if (!host.admitted) {
+        if (canDefer) {
+          log(`heavy-command admission deferred: ${host.reason}\n`);
+          return { ok: false, slot: null, timedOut: false, deferred: true, waitedMs: attempt - startedAt, reason: host.reason };
+        }
+        if (hostWaitStartedAt === null) {
+          hostWaitStartedAt = attempt;
+          try {
+            const hostPolicy = loadHostOverloadSettings({ env, log: (m) => log(`${m}\n`) });
+            hostMaxWaitMs = hostPolicy.settings.host.maxWaitMs;
+            hostWaitSource = hostPolicy.sources['host.maxWaitMs'];
+          } catch (e) {
+            // A broken policy must not turn a mandatory gate into a crash or an unbounded wait.
+            hostWaitSource = 'standard fallback';
+            log(`heavy-command admission: host wait policy unavailable (${e.message}); using default\n`);
+          }
+          log(`heavy-command admission: host.maxWaitMs=${hostMaxWaitMs} (${hostWaitSource})\n`);
+        }
+        const remaining = hostMaxWaitMs - (attempt - hostWaitStartedAt);
+        if (remaining > 0) {
+          log(`heavy-command admission: waiting for host load: ${host.reason}; ${remaining}ms remaining [host.maxWaitMs=${hostMaxWaitMs} (${hostWaitSource})]\n`);
+          await sleep(Math.min(pollMs, remaining));
+          continue;
+        }
+        hostLoadBypassed = true;
+        log(`heavy-command admission: proceeding despite host load: ${host.reason}; mandatory caller reached host.maxWaitMs=${hostMaxWaitMs} (${hostWaitSource}); still requires a free slot\n`);
+      }
       reapStaleWaiters({ lockRoot, nowMs: attempt, apply: true, ...seams });
       let snapshot = null;
       if (policy.settings.fastScale?.maxSlots > policy.settings.fastSlots) {

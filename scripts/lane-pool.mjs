@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { scheduledLaneGc } from './lib/host-load.mjs';
+import { loadHostOverloadSettings } from './lib/host-overload-settings.mjs';
 import { isTerminalStatus } from './lib/backlog-status.cjs';
 /**
  * lane-pool.mjs — provision & refresh the persistent lane-clone pool for the #1933 clone-based
@@ -514,7 +516,8 @@ function ensureOneSibling(repo, name, { force = false } = {}) {
     const ref = cloneReferenceArgs(primary);
     log(`  clone ${name} sibling ← ${originUrl} ${ref.length ? `(--reference ${primary})` : '(no --reference: shallow)'} …`);
     try {
-      gitQuiet(['clone', '--quiet', ...ref, originUrl, dest]);
+      gitQuiet(['clone', '--quiet', '-c', 'gc.auto=0', ...ref, originUrl, dest]);
+      gitQuiet(['config', '--local', 'gc.auto', '0'], dest);
     } catch (e) {
       // Unlike the old symlink (pure filesystem, no network), this is a real `git clone` of `originUrl` —
       // best-effort: a network blip / auth failure / moved remote must WARN and move on, not crash the
@@ -839,7 +842,8 @@ function cloneLane(repo, n) {
   }
   const ref = cloneReferenceArgs(repo.referencePath);
   log(`  clone lane-${n} ← ${repo.originUrl} ${ref.length ? `(--reference ${repo.referencePath})` : '(no --reference: shallow)'} …`);
-  gitQuiet(['clone', '--quiet', ...ref, repo.originUrl, dest]);
+  gitQuiet(['clone', '--quiet', '-c', 'gc.auto=0', ...ref, repo.originUrl, dest]);
+  gitQuiet(['config', '--local', 'gc.auto', '0'], dest);
   // Pin a stable local default branch so refresh's hard-reset target is unambiguous.
   tryGit(['checkout', '--quiet', '-B', repo.branch, `origin/${repo.branch}`], dest);
 }
@@ -1181,6 +1185,7 @@ function localRemoteShas(dir) {
 // (safe to unmap its stale item mapping, #2139) from a skipped one (still serving its in-flight item).
 function refreshLane(repo, n, { force = false } = {}) {
   const dir = laneDir(repo, n);
+  gitQuiet(['config', '--local', 'gc.auto', '0'], dir);
   // xj1vryw — self-healing fetch; may quarantine + re-clone a corrupt lane ONLY when no live lease holds it.
   fetchOriginHealing(repo, n, { allowReclone: !liveLease(dir, Date.now(), ttlMsFromFlags()) });
   // #2337(b) — a LIVE lease is an ownership hold (a process is presumed alive within TTL), distinct from the
@@ -4423,10 +4428,29 @@ const KNOWN_FLAGS = new Set([
   'leased-only',
   // Host churn cut (2026-10-04) — status's opt-in reuse window for a signature-matched cached probe.
   'max-age-ms',
+  'watch', // gc --watch: recurring serialized maintenance, lanes.gc.schedule between passes
 ]);
+
+// Maintenance may run under an external scheduler (`gc`) or as one recurring process (`gc --watch`).
+// Every pass re-resolves policy, checks host load, and takes the same host lock across all lane pools.
+function cmdGc(repo) {
+  const pass = () => scheduledLaneGc(existingLanes(repo).map((n) => laneDir(repo, n)), { log, interactive: !flags.watch && !!process.stdin.isTTY });
+  if (!flags.watch) { const result = pass(); log(`gc: ${result.ran ? 'pass completed' : result.reason}`); return; }
+  const tick = () => {
+    let interval = 60000; // unreadable policy refuses the pass, then retries policy later
+    try {
+      interval = loadHostOverloadSettings({ log }).settings.lanes.gc.schedule;
+      pass();
+    } catch (e) { log(`gc skipped: ${e.message}`); }
+    setTimeout(tick, Math.min(interval, 2147483647));
+  };
+  tick();
+}
 
 // ── dispatch ──────────────────────────────────────────────────────────────────────────────────────
 const COMMANDS = {
+  // Scheduler entrypoint: safe to invoke every tick; interval + host mutex suppress duplicate passes.
+  gc: cmdGc,
   provision: cmdProvision,
   refresh: cmdRefresh,
   status: printStatus,
@@ -4446,10 +4470,11 @@ const COMMANDS = {
 if (!cmd || cmd === 'help' || cmd === '--help' || !COMMANDS[cmd]) {
   if (cmd && cmd !== 'help' && cmd !== '--help') process.stderr.write(`unknown command: ${cmd}\n`);
   process.stderr.write(
-    'usage: lane-pool.mjs <provision|refresh|status|list|path|acquire|adopt|release|remove|trim|reclaim|keep|map|unmap> [--count=N] [--lane=N] [--all] [--all-pools] [--acquirable] [--max-new=N] ' +
+    'usage: lane-pool.mjs <gc|provision|refresh|status|list|path|acquire|adopt|release|remove|trim|reclaim|keep|map|unmap> [--count=N] [--lane=N] [--all] [--all-pools] [--acquirable] [--max-new=N] ' +
       '[--item=NNN[,NNN…]] [--purpose=<slug>] [--session=<slug>] [--adopt] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--release-reserved] [--ttl-minutes=N] [--no-reset] [--no-reap] [--limit=N] [--no-cache] [--cache-ttl-ms=N] [--scan-timeout-ms=N] [--repo=<path>] [--pool=<name>] [--origin=<url>] ' +
       '[--reference=<path>] [--name=<slug>] [--branch=<ref>] [--no-install] [--force] [--json] [--max=N] [--dry-run] [--override] [--reason=<text>] ' +
       '[--no-free-list] [--free-list-max-age-ms=N] [--leased-only]  # trim: shrink a pool to --max lanes (default per-repo cap; env LANE_POOL_TRIM_MAX)\n' +
+      '  # gc [--watch]: serialized maintenance; --watch repeats at lanes.gc.schedule (default 24h), host load may defer a pass\n' +
       '  # status --leased-only (#4345): skip git for every unleased lane, keep the full probe only for leased ones\n' +
       '  # acquire (auto-pick, no --lane): on a full pool, grows it by up to --growth-max-new=N new lanes (default 4, env ' +
       'LANE_POOL_ACQUIRE_GROWTH_MAX_NEW) up to a --hard-max=N ceiling (default 90 for web-everything/30 for siblings, env LANE_POOL_HARD_MAX) ' +
