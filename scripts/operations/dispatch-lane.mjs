@@ -1159,7 +1159,7 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes, groupMember
       SCOPE: scope.join(','),
       ATTEMPT_TAG: attempt,
       GROUP_MEMBERS: groupMembers.length
-        ? `GROUPED PREPARE — this prepare covers cards ${groupMembers.map((n) => `#${n}`).join(', ')} in addition to #${resolvedNum}. Prepare each listed card in this SAME lane and stamp each one's preparedDate; one prepare PR covers the group. A card you cannot prepare: leave it untouched and name it in the PR body under 'Not prepared'.`
+        ? `GROUPED PREPARE — this prepare covers cards ${groupMembers.map((n) => `#${n}`).join(', ')} in addition to #${resolvedNum}. The mechanical coordinator launches a fresh worker per card with only that card and scope. Parallel workers lease separate lanes and retain lane/prep-<card> commits; an assembler cherry-picks in priority order into one prepare PR. Never prepare multiple cards in one worker session. A card you cannot prepare: leave it untouched and name it in the PR body under 'Not prepared'.`
         : '',
       // #3637 — `main` unless the item declares a registered POC branch. Resolved here (the pure side) so the
       // run record freezes the branch this dispatch was actually aimed at, exactly as it freezes the brief.

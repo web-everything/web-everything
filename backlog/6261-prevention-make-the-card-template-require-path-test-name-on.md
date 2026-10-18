@@ -12,8 +12,8 @@ tags: []
 # Prevention — Make the card template require path::test name on Executable acceptance items, and have the lint… (from web-everything/web-everything#5552 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/xngrda3-we-ci-artifact-uploads-never-fail-a-merge-group-run.md:16` — Make the card template require `<path>::<test name>` on Executable acceptance items, and have the lint assert it matched at least one step so it cannot pass vacuously.
-2. `we:backlog/xngrda3-we-ci-artifact-uploads-never-fail-a-merge-group-run.md:16` — Make retry-exhaustion fault injection a required executable gate for the eventual workflow change, asserting that upload failure cannot propagate to the job result.
+1. `we:backlog/6247-we-ci-artifact-uploads-never-fail-a-merge-group-run.md:16` — Make the card template require `<path>::<test name>` on Executable acceptance items, and have the lint assert it matched at least one step so it cannot pass vacuously.
+2. `we:backlog/6247-we-ci-artifact-uploads-never-fail-a-merge-group-run.md:16` — Make retry-exhaustion fault injection a required executable gate for the eventual workflow change, asserting that upload failure cannot propagate to the job result.
 
 Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 1 → #6035, finding 3 → #5030, finding 4 → #5360, finding 5 → #5360.
 

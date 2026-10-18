@@ -4,7 +4,8 @@
  * @description THE `advisory:ruling-needed` LABEL — a derived view, never a source of truth. A PR carries it
  *   exactly while its CURRENT head has an attempted mandatory-referral record with confirmed findings that still
  *   await a block/card/not-real ruling (`we:scripts/lib/ruling-ledger.mjs#rulingNeeded`). It goes on when the
- *   review parks and comes off on a ruling or a new head, because it is recomputed from the PR thread each tick.
+ *   review parks and comes off on a ruling or a new head. This legacy thread-based command now reports only;
+ *   pr-label-mirror --apply alone writes the label from the verdict ledger (G2).
  *
  * WHY: live 2026-10-04, PR #3794 sat parked about 8 hours ("review paused: N referrals need a ruling") with
  * nothing on the PR that said so; the label is the at-a-glance half of the fix (the NEEDS-YOU row, push and
@@ -20,7 +21,7 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { labelNames } from '../lib/advisory-labels.mjs';
-import { RULING_NEEDED_LABEL, RULING_NEEDED_LABEL_META, rulingNeeded } from '../lib/ruling-ledger.mjs';
+import { RULING_NEEDED_LABEL, rulingNeeded } from '../lib/ruling-ledger.mjs';
 import { loadFixerLadder } from './fixer-ladder.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
@@ -50,7 +51,7 @@ export function defaultListPrs({ exec = execFileSyncThrottled, repo = null } = {
 }
 
 /**
- * Add/remove the label on every open PR whose derived state disagrees with it.
+ * Report legacy thread-derived drift only. Never writes labels, even without dryRun.
  * @returns {Array<{num:number, action:'add'|'remove'|'skipped', error?:string}>}
  */
 export function sweepRulingNeededLabels({ repo = null, listPrs = defaultListPrs, provider = createGhProvider(), readPr = defaultReadPr, dryRun = false } = {}) {
@@ -80,14 +81,7 @@ export function sweepRulingNeededLabels({ repo = null, listPrs = defaultListPrs,
     const plan = planRulingNeededLabel(live, { cardReadable: gateCardReadable, ...(humanAt === undefined ? {} : { humanAt }) });
     if (plan.action === 'none') continue;
     const entry = { num: pr.number, action: plan.action };
-    if (!dryRun) {
-      try {
-        if (plan.action === 'add') {
-          provider.ensureLabel(resolvedRepo, RULING_NEEDED_LABEL, RULING_NEEDED_LABEL_META);
-          provider.setLabels(resolvedRepo, pr.number, { add: RULING_NEEDED_LABEL });
-        } else provider.setLabels(resolvedRepo, pr.number, { remove: [RULING_NEEDED_LABEL] });
-      } catch (e) { entry.error = String((e && e.message) || e).split('\n')[0]; }
-    }
+    // Compatibility report only: pr-label-mirror --apply is the sole writer (G2).
     results.push(entry);
   }
   return results;
@@ -100,7 +94,7 @@ if (IS_CLI) {
   try {
     const dryRun = argv.includes('--dry-run');
     const results = sweepRulingNeededLabels({ repo: flag('repo') || null, dryRun });
-    for (const r of results) writeLineSync(2, `  PR #${r.num}: ${dryRun ? 'would ' : r.error ? 'FAILED to ' : ''}${r.action} ${RULING_NEEDED_LABEL}${r.error ? ` (${r.error})` : ''}`);
+    for (const r of results) writeLineSync(2, `  PR #${r.num}: ${r.error ? 'FAILED to plan ' : 'would '}${r.action} ${RULING_NEEDED_LABEL}${r.error ? ` (${r.error})` : ''}`);
     writeAllSync(1, `${JSON.stringify({ checked: true, changed: results.length, results })}\n`);
   } catch (e) { writeLineSync(2, `error: ${String(e?.message ?? e)}`); process.exitCode = 1; }
 }

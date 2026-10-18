@@ -52,9 +52,9 @@ export const BUILD_DISPATCH_POLICY = Object.freeze({
   // starting point per the operator's own framing — see `planBuildDispatch`'s `wip-cap` rule below.
   maxOpenItems: 7,
   // Card 80 — prepare just in time (operator OK 2026-10-06). Only the next `prepareAheadWindow` cards to build
-  // (pinned first) get a prepare; a stamp older than `preparedMaxAgeDays`, or one whose scope files changed since
+  // (build.priority, then queue order) get a prepare; a stamp older than `preparedMaxAgeDays`, or one whose scope files changed since
   // its `preparedAgainstSha`, is re-prepared before it builds (`prepare-stale`). Flags/env override both.
-  prepareAheadWindow: 4,
+  prepareAheadWindow: 20,
   preparedMaxAgeDays: 3,
   // Live incident 2026-09-28 (we#2852): ONE PR mislabelled `review-status:ci-heal-stalled` (a ci-heal session
   // that had actually finished — see we:scripts/conveyor/review-status-tag.mjs's own fix for that bug) froze
@@ -92,7 +92,7 @@ export const BUILD_DISPATCH_POLICY = Object.freeze({
     // this row is DOCUMENTATION PARITY (every operator rule visible here, per this file's own header) — no
     // logic in this planner changes for it.
     { id: 'needs-prepare', text: 'a candidate carrying no truthful preparedDate is held for prepare; complete operatorTask briefs may be validated and stamped at filing under build.operatorTask.enabled, without bypassing readiness holds', enforcedBy: 'readiness/dispatch-plan.mjs' },
-    { id: 'prepare-ahead-window', text: 'only the next prepareAheadWindow cards to build (highest delivery class first, preserving classified queue order) are prepared', enforcedBy: 'conveyor/tick-core.mjs (prepareAheadNums)' },
+    { id: 'prepare-ahead-window', text: 'only the next prepareAheadWindow cards to build (build.priority first, then ready-queue order) are prepared', enforcedBy: 'conveyor/tick-core.mjs (prepareAheadNums)' },
     { id: 'prepare-stale', text: 'a stamp older than preparedMaxAgeDays, or whose scope files changed since preparedAgainstSha, is re-prepared before build', enforcedBy: 'readiness/dispatch-plan.mjs' },
   ]),
 });
@@ -383,10 +383,9 @@ export function prepareAheadNums({ queue = [], launch = [], held = [], window = 
   const reasonOf = new Map((Array.isArray(held) ? held : []).map((h) => [normNum(h?.num), h?.reason]));
   const rows = (Array.isArray(queue) ? queue : []).filter((r) => r && r.num != null)
     .map((r, i) => {
-      const classIndex = ['P0', 'P1', 'P2', 'P3', 'P4'].indexOf(r.priorityClass);
-      return { buildPriority: Number.isFinite(r.buildPriority) ? r.buildPriority : Infinity, num: normNum(r.num), priority: classIndex < 0 ? 3 : classIndex, hasClass: !!r.priorityClass, pinned: r.tier === 'pinned', i };
+      return { buildPriority: Number.isFinite(r.buildPriority) ? r.buildPriority : Infinity, num: normNum(r.num), i };
     })
-    .sort((a, b) => Number(b.priority === 0) - Number(a.priority === 0) || (a.buildPriority - b.buildPriority) || (a.priority - b.priority) || ((!a.hasClass || !b.hasClass) ? b.pinned - a.pinned : 0) || (a.i - b.i));
+    .sort((a, b) => (a.buildPriority - b.buildPriority) || (a.i - b.i));
   const out = new Set();
   for (const r of rows) {
     if (out.size >= window) break;
@@ -459,4 +458,33 @@ export function collectBuildHolds({ queue = [], planHeld = [], suppressed = [], 
   for (const h of Array.isArray(planHeld) ? planHeld : []) put(h.num, { stage: 'plan', reason: h.reason, ...(h.detail ? { detail: h.detail } : {}) });
   const order = new Map((Array.isArray(queue) ? queue : []).map((r, i) => [normNum(r?.num), i]));
   return [...out.values()].sort((a, b) => (order.get(a.num) ?? Infinity) - (order.get(b.num) ?? Infinity));
+}
+
+/** Priority-ordered prepare batches. Overlaps wait for a subsequent batch, never widen a lane's scope. */
+export function planPrepareBatches({ picks = [], pool = [], batchSize = 6 } = {}) {
+  const rows = new Map(pool.map(row => [normNum(row.num), row]));
+  const used = new Set(), absorbed = new Set(), groups = [];
+  const repo = row => {
+    const scopes = (row?.scope ?? []).map(parseScopeEntry);
+    if (!scopes.length || scopes.some(s => !s)) return null;
+    const repos = new Set(scopes.map(s => s.repo));
+    return repos.size === 1 ? [...repos][0] : null;
+  };
+  const order = new Map(pool.map((row, i) => [normNum(row.num), i]));
+  for (const pick of [...picks].sort((a, b) => (order.get(normNum(a.num)) ?? Infinity) - (order.get(normNum(b.num)) ?? Infinity))) {
+    const lead = normNum(pick.num), row = rows.get(lead);
+    if (used.has(lead)) continue;
+    used.add(lead);
+    const members = [], selected = [row];
+    if (repo(row)) for (const candidate of pool) {
+      const num = normNum(candidate.num);
+      if (members.length + 1 >= batchSize) break;
+      if (`prepare: ${[lead, ...members, num].join(', ')}`.length > 256) continue;
+      if (used.has(num) || repo(candidate) !== repo(row)
+        || selected.some(card => firstScopeOverlap(card.scope, candidate.scope))) continue;
+      used.add(num); absorbed.add(num); members.push(num); selected.push(candidate);
+    }
+    if (members.length) groups.push({ lead, members });
+  }
+  return { groups, absorbed };
 }

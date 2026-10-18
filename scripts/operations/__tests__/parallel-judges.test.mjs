@@ -399,7 +399,7 @@ describe('review.seatsByTouchSet — the seat list comes from the touch-set, bef
   it('chooseSecuritySeat fails closed and reads a resume off the saved run', () => {
     const prose = () => ['backlog/x.md'];
     expect(chooseSecuritySeat(['--pr=5'], { readChangedFiles: prose }).securitySeat).toBe(false);
-    expect(chooseSecuritySeat(['--pr=5'], { enabled: false, readChangedFiles: prose }).securitySeat).toBe(true);
+    expect(chooseSecuritySeat(['--pr=5'], { enabled: false, cardOnly: { lightLane: false }, readChangedFiles: prose }).securitySeat).toBe(true);
     expect(chooseSecuritySeat(['--pr=5'], { readChangedFiles: () => { throw new Error('gh down'); } }).securitySeat).toBe(true);
     expect(chooseSecuritySeat(['--pr=5'], { readChangedFiles: () => Array.from({ length: TOUCH_SET_FILE_CAP }, (_, i) => `backlog/${i}.md`) }).securitySeat).toBe(true);
     expect(chooseSecuritySeat([], { readChangedFiles: prose }).securitySeat).toBe(true);
@@ -664,4 +664,16 @@ describe('createDefaultJudge — a retried seat says so on its telemetry (held i
     const { telemetry } = unwrapJudgeOutcome(await judge({ mandate: 'm', input: 'i', shape: { type: 'object' }, lens: 'x', effort: 'low', budget: null }));
     expect(telemetry.attempts).toBe(2);
   });
+});
+
+it('selects the card-only light lane independently of prose-seat settings', () => {
+  const choose = (files, cardOnly = { lightLane: true, claudeSeat: false }) => chooseSecuritySeat(['--pr=5'], { enabled: false, cardOnly, readChangedFiles: () => files });
+  expect(choose(['backlog/1-card.md'])).toMatchObject({ cardOnlyLight: true, securitySeat: false });
+  expect(choose(['backlog/1-card.md'], { lightLane: true, claudeSeat: true })).toMatchObject({ cardOnlyLight: true, securitySeat: true });
+  for (const files of [[], ['backlog/x.mjs'], ['backlog/nested/x.md'], ['backlog/x.md', 'scripts/a.mjs']]) {
+    expect(choose(files).cardOnlyLight).not.toBe(true);
+  }
+  const saved = { findings: { read: { cardOnlyLight: true, securitySeat: false } } };
+  expect(chooseSecuritySeat(['--resume=saved'], { store: { read: () => saved }, cardOnly: { lightLane: false } }))
+    .toMatchObject({ cardOnlyLight: true, securitySeat: false });
 });

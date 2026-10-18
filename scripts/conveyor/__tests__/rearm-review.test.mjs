@@ -9,6 +9,7 @@
 import { describe, it, expect } from 'vitest';
 import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../../lib/review-escalation.mjs';
+import { RED_TEAM_STATUS_LABELS } from '../../lib/red-team-status-label-meta.mjs';
 
 const lbl = (...names) => names.map((name) => ({ name }));
 
@@ -21,7 +22,7 @@ describe('decideRearm — the pure re-arm swap (#2630)', () => {
     // actually-present labels at the CLI via presentRemoveLabels). #2811 — `accepted` is now unconditionally in
     // this list too (widened so the SAME target also re-arms a stale acceptance, see the describe block below);
     // `presentRemoveLabels` narrows it away here since this PR carries no `review:accepted`.
-    expect(d.removeLabels).toEqual([REVIEW_LABELS.changes, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL]);
+    expect(d.removeLabels).toEqual([REVIEW_LABELS.changes, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL, ...RED_TEAM_STATUS_LABELS]);
     expect(d.keepsHuman).toBe(false);
   });
 
@@ -40,7 +41,7 @@ describe('decideRearm — the pure re-arm swap (#2630)', () => {
     expect(d.allowed).toBe(true);
     expect(d.addLabel).toBe('');
     expect(d.addLabel).not.toBe(REVIEW_LABELS.pending);
-    expect(d.removeLabels).toEqual([REVIEW_LABELS.changes, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL]); // review:human is NOT in the removals; #2832 strips ready-to-merge
+    expect(d.removeLabels).toEqual([REVIEW_LABELS.changes, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL, ...RED_TEAM_STATUS_LABELS]); // review:human is NOT in the removals; #2832 strips ready-to-merge
     expect(d.removeLabels).not.toContain(REVIEW_LABELS.human);
     expect(d.keepsHuman).toBe(true);
   });
