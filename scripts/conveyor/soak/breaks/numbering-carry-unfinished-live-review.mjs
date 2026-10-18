@@ -19,7 +19,8 @@ export default {
   fixedBy: { sha: 'HEAD', where: 'lane/numbering-restamp-referral', paths: PATHS },
   fixPresent(root) {
     return readFileSync(join(root, PATHS[0]), 'utf8').includes("e?.code !== 'MANDATORY_REFERRAL_NO_REVIEW_RUN'")
-      && readFileSync(join(root, PATHS[1]), 'utf8').includes('readRunHeads().some(mine)');
+      && readFileSync(join(root, PATHS[1]), 'utf8').includes('readRunHeads().some(mine)')
+      && readFileSync(join(root, PATHS[2]), 'utf8').includes('function customReviewRunNames(');
   },
   async run({ sourceRoot = ROOT, log } = {}) {
     const load = rel => import(pathToFileURL(join(sourceRoot, rel)).href);
@@ -45,14 +46,16 @@ export default {
     try {
       // `unfinished` (PR #5520 red team): the live run failed to persist its referrals and never finished `advise`,
       // so the run-evidence projection drops it; it still reviewed the live head.
+      // `custom-id` (PR #5520 operator send-back): the same unfinished live run, started under a custom `--run-id`, so
+      // its record file is not named `review-pr-*`; only the record's own `op` says it is a review.
       for (const [status, arriveAt] of [['none', 0], ['parked', 0], ['pending', 0], ['parked', 1], ['pending', 2],
-        ['unfinished', 0], ['unfinished', 1], ['unfinished', 2]]) {
+        ['unfinished', 0], ['unfinished', 1], ['unfinished', 2], ['custom-id', 0], ['custom-id', 1], ['custom-id', 2]]) {
         carry._resetNumberingRestampMemo();
         const dir = join(root, `${status}-${arriveAt}`);
         mkdirSync(dir);
         const persistRun = (head, live = false) => {
-          const id = live ? 'review-pr-live' : 'review-pr-prior';
-          const unfinished = live && status === 'unfinished';
+          const id = live ? (status === 'custom-id' ? 'live' : 'review-pr-live') : 'review-pr-prior';
+          const unfinished = live && (status === 'unfinished' || status === 'custom-id');
           writeRun({ ...newRunRecord({ id, op: 'review-pr' }),
             findings: { read: { repo, pr, netBasis: { rev: head } } },
             verdict: { verdict: live && status !== 'pending' ? 'needs-human' : 'accept',
@@ -75,7 +78,7 @@ export default {
           numberingSetting: setting, referralEvidenceSetting: setting, netPatchSetting: { value: false, source: 'soak' },
           prove: () => ({ ok: true, reason: 'numbering-only move already proven' }),
           guardReferrals: (s, context) => assertMandatoryReferralsCleared(s, { ...context, env: {}, cardReadable: () => true,
-            readRuns: () => readReviewRunEvidence({ dir }),
+            readRuns: opts => readReviewRunEvidence({ dir, ...opts }),
             ...(readReviewRunHeads ? { readRunHeads: () => readReviewRunHeads({ dir }) } : {}),
             readNetDiff: sha => ({ scored: true, text: `diff at ${sha}` }) }),
           readLiveState: () => {

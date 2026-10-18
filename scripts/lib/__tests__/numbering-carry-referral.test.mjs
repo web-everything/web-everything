@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as carry from '../numbering-carry.mjs';
 import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
 import { mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readReviewRunEvidence, readReviewRunHeads } from '../../conveyor/review-referral-hold.mjs';
@@ -221,6 +221,69 @@ describe('numbering carry referral evidence', () => {
       expect(evidence).toEqual([]);
       expect(readdirSync(dir).filter(n => n.endsWith('.cache')).sort())
         .toEqual(['.review-run-evidence.cache', '.review-run-heads.cache']);
+    });
+    // PR #5520 operator send-back (red team, review-referral-hold.mjs:114): `--run-id` names a review-pr run
+    // anything, so its file name proves nothing. A run is a review because its record's `op` says so.
+    const CUSTOM_IDS = ['custom-live', 'heavy-queue-0001fe94-2f78-4924-b3f2-0de22166a2ef', 'live'];
+    const defaultGuard = (readNetDiff = () => ({ scored: true, text: 'same diff' })) => {
+      vi.stubEnv('OPERATION_RUNS_DIR', dir);
+      try { return assertMandatoryReferralsCleared(guardState, { repo, pr, env: {}, cardReadable: () => true, readNetDiff }); }
+      catch (e) { return e; }
+    };
+    it.each(CUSTOM_IDS.flatMap(id => Object.keys(live).map(kind => [id, kind])))(
+      'custom run IDs never bypass the unfinished live-head review guard (%s, %s)', (id, kind) => {
+        dir = mkdtempSync(join(tmpdir(), 'numbering-custom-id-'));
+        persist('review-pr-prior', FROM, { verdict: 'accept', pendingReferrals: [] }, true);
+        writeRun({ ...newRunRecord({ id: 'heavy-queue-unrelated', op: 'heavy-queue' }) }, dir);
+        persist(id, TO, live[kind], false);
+        const readNetDiff = vi.fn(() => ({ scored: true, text: 'same diff' }));
+        expect(defaultGuard(readNetDiff)).toMatchObject({ code: 'MANDATORY_REFERRAL_UNFINISHED_REVIEW_RUN' });
+        expect(readNetDiff).not.toHaveBeenCalled();
+        const { result, writes } = replay({ readRuns: () => readReviewRunEvidence({ dir, memo: new Map(), persist: false }),
+          readRunHeads: () => readReviewRunHeads({ dir, memo: new Map(), persist: false }) });
+        expect(result.action).toBe('retry');
+        expect(writes).toEqual([]);
+      });
+    it.each(CUSTOM_IDS)('a completed clean review under custom run ID %s never satisfies the guard', id => {
+      dir = mkdtempSync(join(tmpdir(), 'numbering-custom-id-'));
+      persist('review-pr-prior', FROM, { verdict: 'accept', pendingReferrals: [] }, true);
+      persist(id, TO, { verdict: 'accept', pendingReferrals: [] }, true);
+      expect(defaultGuard()).toMatchObject({ code: 'MANDATORY_REFERRAL_UNFINISHED_REVIEW_RUN' });
+      // Nor as the accepted prior head's evidence for the numbering carry.
+      rmSync(dir, { recursive: true, force: true });
+      dir = mkdtempSync(join(tmpdir(), 'numbering-custom-id-'));
+      persist(id, FROM, { verdict: 'accept', pendingReferrals: [] }, true);
+      const { result, writes } = replay({ readRuns: opts => readReviewRunEvidence({ dir, memo: new Map(), persist: false, ...opts }),
+        readRunHeads: () => readReviewRunHeads({ dir, memo: new Map(), persist: false }) });
+      expect(result.action).toBe('retry');
+      expect(writes).toEqual([]);
+    });
+    it.each(CUSTOM_IDS)('a newer review under custom run ID %s that lost its referrals is never hidden by an older clean run', id => {
+      dir = mkdtempSync(join(tmpdir(), 'numbering-custom-id-'));
+      persist('review-pr-clean', TO, { verdict: 'accept', pendingReferrals: [] }, true);
+      writeRun({ ...newRunRecord({ id, op: 'review-pr' }), findings: { read: { repo, pr, netBasis: { rev: TO } } },
+        verdict: { verdict: 'needs-human', pendingReferrals: ['referral-persistence-failed'] },
+        stepTimings: [{ step: 'read', stepIndex: 0, startedAt: '2026-10-17T13:00:00Z' },
+          { step: 'advise', stepIndex: 1, startedAt: '2026-10-17T13:00:30Z', finishedAt: '2026-10-17T13:01:00Z', durationMs: 30000 }] }, dir);
+      expect(defaultGuard()).toMatchObject({ message: expect.stringContaining('referral-persistence-failed') });
+    });
+    it('an unreadable record of unknown operation refuses rather than reading as no review run', () => {
+      dir = mkdtempSync(join(tmpdir(), 'numbering-custom-id-'));
+      persist('review-pr-prior', FROM, { verdict: 'accept', pendingReferrals: [] }, true);
+      writeFileSync(join(dir, 'custom-live.json'), '{"v":1,"id":"custom-live","op":"review-pr", torn');
+      const outcome = defaultGuard();
+      expect(outcome).toBeInstanceOf(Error);
+      expect(outcome.code).not.toBe('MANDATORY_REFERRAL_NO_REVIEW_RUN');
+      expect(outcome).not.toHaveProperty('carry');
+    });
+    it('classifies another operation\'s record once, then keeps finding a custom-ID review on a warm read', () => {
+      dir = mkdtempSync(join(tmpdir(), 'numbering-custom-id-'));
+      writeRun({ ...newRunRecord({ id: 'heavy-queue-unrelated', op: 'heavy-queue' }) }, dir);
+      persist('custom-live', TO, live['persistence-failed'], false);
+      const cold = readReviewRunHeads({ dir, memo: new Map() });
+      expect(cold).toEqual([{ id: 'custom-live', repo, pr, head: TO, custom: true }]);
+      const warm = readReviewRunHeads({ dir, memo: new Map(), readRun: () => { throw Error('cache miss'); } });
+      expect(warm).toEqual(cold);
     });
     it('still carries numbering evidence when no run reviewed the live head', () => {
       dir = mkdtempSync(join(tmpdir(), 'numbering-unfinished-'));

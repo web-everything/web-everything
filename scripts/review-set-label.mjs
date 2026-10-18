@@ -2510,7 +2510,10 @@ export function assertMandatoryReferralsCleared(state, { repo, pr, cardReadable 
   const head = state.headRefOid;
   const mine = r => r.repo === repo && r.pr === Number(pr) && r.head === head;
   const current = repo && pr ? result.records.filter(mine) : [];
-  const last = repo && pr ? readRuns().filter(r => r.repo === repo && r.pr === Number(pr) && r.head === head)
+  // PR #5520 operator send-back — `custom` adds review runs started under a custom `--run-id`. Such a run is still
+  // this head's newest review when it is newest, so a lost referral check below applies to it, but it never counts
+  // as the completed clean review that clears the hold.
+  const last = repo && pr ? readRuns({ custom: true }).filter(r => r.repo === repo && r.pr === Number(pr) && r.head === head)
     .sort((a, b) => b.completedAt - a.completedAt)[0] : undefined;
   // The newest review of this head failed to persist its referrals: only a record written at or after that
   // review started can speak for it. An earlier record of the same head (or an undated one) proves nothing
@@ -2530,7 +2533,7 @@ export function assertMandatoryReferralsCleared(state, { repo, pr, cardReadable 
   // Old heads' holds are not carried onto a new head — but only because that head's own review took their place.
   // With no record for this head, that review must be PROVEN complete and clean by a run record; the absence of a
   // failure marker is not evidence (the run store is local and can be missing, pruned or on another machine).
-  if (!current.length && !(last && !last.persistenceFailed && !last.parked && !last.pending.length)) {
+  if (!current.length && !(last && !last.custom && !last.persistenceFailed && !last.parked && !last.pending.length)) {
     const older = result.records.filter(r => r.head !== head && (!repo || !pr || (r.repo === repo && r.pr === Number(pr))));
     const held = older.flatMap(r => { const s = referralRecordState(r, { ...context, head: r.head, records: result.records, operatorRulings: result.operatorRulings }); return [...s.pending, ...s.blocked]; });
     if (held.length) {
