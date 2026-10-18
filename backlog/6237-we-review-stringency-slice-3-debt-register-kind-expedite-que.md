@@ -1,16 +1,17 @@
 ---
+bornAs: xsnny7x
 kind: story
 size: 8
-parent: "xrlwbd7"
+parent: "6236"
 status: open
-blockedBy: ["x77cl1h"]
+blockedBy: ["6233"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
 # we: review stringency slice 3 — debt register (kind, expedite queue position, level gate)
 
-Add backlog kind debt with its size and buildable rules and every kind-set reference in the same slice, the expedite queue position and deadline, and the level gate that blocks a move while due debt is open. Ruled in xugqjw1.
+Add backlog kind debt with its size and buildable rules and every kind-set reference in the same slice, the expedite queue position and deadline, and the level gate that blocks a move while due debt is open. Ruled in 6239.
 
 ## Acceptance
 
@@ -26,7 +27,7 @@ Add backlog kind debt with its size and buildable rules and every kind-set refer
 - [A10] **Executable** — integration test `debt-gate-revision-race` races a payment, operator due-level edit and level move; the move re-reads validated debt and settings under a revision lock and retries on change. A crash before atomic persistence keeps the prior debt effective; an expired writer cannot overwrite a newer revision.
 - [A11] **Executable** — integration test `debt-ingress-bounds` applies slice 2 A16's 1 MiB body-size, 128-byte enum-field and 60 requests/minute repository/principal rate limit to register/payment/level writes through the protected writer; over-limit requests cannot create, settle or hide debt. Origin/CSRF `n/a:` for this CI/CLI-only surface without browser cookies, using the A10/A15 protected trust root; no new browser endpoint or state-reset trigger is exposed.
 
-Ruling and amended table: [we:backlog/xugqjw1](/backlog/xugqjw1-decision-review-stringency-classified-findings-per-level-out/) and the statute `we:docs/agent/platform-decisions.md#review-stringency-classified-outcomes`.
+Ruling and amended table: [we:backlog/6239](/backlog/6239-decision-review-stringency-classified-findings-per-level-out/) and the statute `we:docs/agent/platform-decisions.md#review-stringency-classified-outcomes`.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

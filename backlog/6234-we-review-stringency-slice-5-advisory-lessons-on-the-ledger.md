@@ -1,9 +1,10 @@
 ---
+bornAs: xhjuluf
 kind: story
 size: 5
-parent: "xrlwbd7"
+parent: "6236"
 status: open
-blockedBy: ["x77cl1h"]
+blockedBy: ["6233"]
 dateOpened: "2026-10-17"
 tags: []
 ---
@@ -23,7 +24,7 @@ Advisory findings are recorded in the ledger and never fixed per PR. A weekly jo
 - [A7] **Executable** — job integration test `lesson-input-unreadable` supplies incomplete pagination, truncated/unreadable ledger, invalid class/count and malformed settings; the job reports failure without publishing a partial lesson/proposal or advancing its checkpoint.
 - [A8] **Executable** — job test `lesson-input-bounds` rejects a ledger entry or fetched page above 1 MiB and class tokens above 128 UTF-8 bytes; count is a nonnegative safe integer. Stream complete pagination with a 120-second run budget; exceeding the budget fails without publication or checkpoint advancement, never treating a partial read as complete. Body-size is enforced on fetched data, not an HTTP listener. Rate limit `n/a:` for incoming requests and CSRF/origin `n/a:` because this is a scheduled local job with no receive endpoint or browser credentials; A6 enforces one active emission per class/week, and a failed or repeated trigger cannot reset state or multiply output. Ledger ingestion uses slice 2 A16's protected ingress bounds.
 
-Ruling and amended table: [we:backlog/xugqjw1](/backlog/xugqjw1-decision-review-stringency-classified-findings-per-level-out/) and the statute `we:docs/agent/platform-decisions.md#review-stringency-classified-outcomes`.
+Ruling and amended table: [we:backlog/6239](/backlog/6239-decision-review-stringency-classified-findings-per-level-out/) and the statute `we:docs/agent/platform-decisions.md#review-stringency-classified-outcomes`.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

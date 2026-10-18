@@ -1,4 +1,5 @@
 ---
+bornAs: xio9qp2
 kind: story
 size: 5
 status: open
@@ -9,7 +10,7 @@ tags: []
 
 # Prevention: require test and authority contracts in decision handoffs
 
-PR #5511 advisory review (2026-10-17) found unnamed refusal tests, unfinished epic acceptance, unspecified operator identity, mutable-debt bypasses and PR-derived standing lessons. Add a focused decision-handoff check for these contracts; reuse the general edge-case trace work in #5590 and structural headings work in #5739 rather than duplicating them. This card tracks prevention tooling; the stringency implementation obligations remain in epic xrlwbd7.
+PR #5511 advisory review (2026-10-17) found unnamed refusal tests, unfinished epic acceptance, unspecified operator identity, mutable-debt bypasses and PR-derived standing lessons. Add a focused decision-handoff check for these contracts; reuse the general edge-case trace work in #5590 and structural headings work in #5739 rather than duplicating them. This card tracks prevention tooling; the stringency implementation obligations remain in epic 6236.
 
 ## Design
 

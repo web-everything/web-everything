@@ -1,4 +1,5 @@
 ---
+bornAs: xrlwbd7
 kind: epic
 status: open
 dateOpened: "2026-10-17"
@@ -7,7 +8,7 @@ tags: []
 
 # we: review stringency build — classed findings, per-level outcomes, debt register
 
-Build the ruling of decision xugqjw1: a closed finding-class list, a settings table that picks block, expedite, debt or advisory per class and level, a debt register that gates level moves, a plateau debt panel, and advisory lessons. Five slices, in order.
+Build the ruling of decision 6239: a closed finding-class list, a settings table that picks block, expedite, debt or advisory per class and level, a debt register that gates level moves, a plateau debt panel, and advisory lessons. Five slices, in order.
 
 ## Acceptance
 
@@ -15,7 +16,7 @@ Build the ruling of decision xugqjw1: a closed finding-class list, a settings ta
 - [A2] **Executable** — end-to-end test `review-stringency-level-gate-e2e` uses the production debt writer and level-move entry point: unpaid due debt and overdue expedite block, verified payment or an authenticated operator due-level edit permits the move, and forged authority, card tampering or unreadable state cannot clear the gate. Covers both debt-kind and task-plus-fields representations.
 - [A3] **Inspection** — attach before/after evidence on a live PR to the epic before resolution: repository, PR number, exact pre/post heads, active level, settings revision and source, finding id/class/confidence, expected outcome and observed ruling/queue/ledger effects. A green fixture suite alone does not satisfy this criterion.
 - [A4] **Executable** — test `review-stringency-override-recount` pins the recount's handling of duplicate findings and strongest rulings; publish its real-data output for a fresh, explicitly dated post-build 14-day window beside the original window (134 auto-blocks, 126 over reviewer not-real). Include denominators and unavailable-data errors; no invented improvement target. The epic stays open until this evidence exists.
-- [A5] **Inspection** — acceptance trace `review-stringency-handoff` confirms all five slices below are delivered and their named tests/evidence are linked, rather than resolving this epic solely because children are resolved: xdstsoh (classes), x77cl1h (settings/ruling), xsnny7x (register/gate), xcwndpf (panel), xhjuluf (lessons). The canonical statute is `we:docs/agent/platform-decisions.md#review-stringency-classified-outcomes`.
+- [A5] **Inspection** — acceptance trace `review-stringency-handoff` confirms all five slices below are delivered and their named tests/evidence are linked, rather than resolving this epic solely because children are resolved: 6232 (classes), 6233 (settings/ruling), 6237 (register/gate), 6238 (panel), 6234 (lessons). The canonical statute is `we:docs/agent/platform-decisions.md#review-stringency-classified-outcomes`.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

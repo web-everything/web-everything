@@ -1,16 +1,17 @@
 ---
+bornAs: xcwndpf
 kind: story
 size: 5
-parent: "xrlwbd7"
+parent: "6236"
 status: open
-blockedBy: ["xsnny7x"]
+blockedBy: ["6237"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
 # plateau-app: review stringency slice 4 — plateau debt panel
 
-A read-only plateau-app panel over the debt items: class, severity, must-pay-before level, deadline, source PR. Built last, after the debt register exists. Ruled in xugqjw1.
+A read-only plateau-app panel over the debt items: class, severity, must-pay-before level, deadline, source PR. Built last, after the debt register exists. Ruled in 6239.
 
 ## Acceptance
 
@@ -21,7 +22,7 @@ A read-only plateau-app panel over the debt items: class, severity, must-pay-bef
 - [A5] **Executable** — panel integration test `debt-panel-revision-refresh` replaces a snapshot during refresh; only one complete revision renders, older responses cannot overwrite newer state, and source/provenance links retain the matching repository and finding.
 - [A6] **Executable** — endpoint test `debt-panel-request-bounds` rejects nonempty request bodies and query/header input above 16 KiB before parsing; enforce 60 reads per rolling minute per authenticated repository/principal, with request 61 refused. Foreign-origin credentialed requests refuse and CORS does not grant foreign origins access. CSRF-token `n/a:` because authenticated reads have no state mutation, refresh/reset/write action or cookie-changing side effect; A4 proves crafted write/reset attempts refuse. Test floods, oversized queries and foreign origins through the production read endpoint, preserving repository access checks.
 
-Ruling and amended table: [we:backlog/xugqjw1](/backlog/xugqjw1-decision-review-stringency-classified-findings-per-level-out/) and the statute `we:docs/agent/platform-decisions.md#review-stringency-classified-outcomes`.
+Ruling and amended table: [we:backlog/6239](/backlog/6239-decision-review-stringency-classified-findings-per-level-out/) and the statute `we:docs/agent/platform-decisions.md#review-stringency-classified-outcomes`.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

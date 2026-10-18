@@ -1,9 +1,10 @@
 ---
+bornAs: x77cl1h
 kind: story
 size: 5
-parent: "xrlwbd7"
+parent: "6236"
 status: open
-blockedBy: ["xdstsoh"]
+blockedBy: ["6232"]
 dateOpened: "2026-10-17"
 tags: []
 ---
@@ -37,7 +38,7 @@ Matching path/pattern rules outrank the reviewer tag. Multiple matches selecting
 - [A15] **Executable** — protected-gate integration test `allowlist-and-gate-self-protection` proposes PR edits to the operator allowlist, gate workflow and writer, separately and together with settings/debt edits. The gate executes trusted base code and policy outside the PR job; none of these PR edits can authorize its own transition. PR jobs receive no privileged token/secret and cannot trigger a privileged run of candidate code. A fixture PR attempts token access and forged approval; both refuse without credential disclosure. A separately authorized protected-root update cannot grant authority to the PR that proposed it. Slice 3 A7 reuses this root test.
 - [A16] **Executable** — production ingress test `review-ingress-bounds` rejects finding/settings bodies above 1 MiB before parsing, token fields above 128 UTF-8 bytes, and request 61 within a rolling minute per authenticated repository/principal (60 allowed); failure never becomes advisory or an effective write. Rate-limit state cannot be reset by PR fields or retries. Browser writes are not exposed: CSRF/origin `n/a:` for the protected CI event/CLI ingress, which has no cookie authentication; forged event/repository/revision provenance still refuses under A10/A15. If a browser writer is introduced, same-origin and CSRF rejection tests are required before exposing it.
 
-Ruling and amended table: [we:backlog/xugqjw1](/backlog/xugqjw1-decision-review-stringency-classified-findings-per-level-out/) and the statute `we:docs/agent/platform-decisions.md#review-stringency-classified-outcomes`.
+Ruling and amended table: [we:backlog/6239](/backlog/6239-decision-review-stringency-classified-findings-per-level-out/) and the statute `we:docs/agent/platform-decisions.md#review-stringency-classified-outcomes`.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

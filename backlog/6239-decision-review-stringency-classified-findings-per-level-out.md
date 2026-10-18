@@ -1,4 +1,5 @@
 ---
+bornAs: xugqjw1
 kind: decision
 status: resolved
 dateOpened: "2026-10-17"
@@ -50,7 +51,7 @@ repository/class feed aggregation. Expedite starts at ruling time; staleness sta
 45 elapsed days after each successful surfacing. The register retains the quadrant and trusted clock fields.
 Protected base code/policy, PR-job credential isolation and bounded ingress have explicit production test
 owners in slice 2 A15–A16, slice 3 A11, slice 4 A6 and slice 5 A8. Prevention tooling for every newly identified
-gap is owed by xio9qp2 A6–A12; A5/A6 also cover missing/malformed quadrant. These clarify the implementation
+gap is owed by 6235 A6–A12; A5/A6 also cover missing/malformed quadrant. These clarify the implementation
 handoff, without changing ratified cell outcomes or claiming implementation delivery.
 
 **Amended table** (order: internal delivery, dogfood, public preview, public release). It replaces the
@@ -360,7 +361,7 @@ is owned by the still-open epic and slices listed below.
 
 - [A1] **Inspection** — trace `decision-design-handoff` confirms the ruled choices and inherited invariants are
   codified at `we:docs/agent/platform-decisions.md#review-stringency-classified-outcomes`, with build ownership
-  in [epic xrlwbd7](/backlog/xrlwbd7-we-review-stringency-build-classed-findings-per-level-outcom/). This resolved
+  in [epic 6236](/backlog/6236-we-review-stringency-build-classed-findings-per-level-outcom/). This resolved
   decision delivers the design handoff; it does not claim a shipped settings validator.
 - [A2] **Inspection** — trace `decision-acceptance-owners` maps class validation to slice 1 A1–A3; settings schema,
   monotonicity and ruling failures to slice 2 A1–A16; debt lifecycle, authority and provenance to slice 3 A1–A11;

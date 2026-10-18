@@ -1,7 +1,8 @@
 ---
+bornAs: xdstsoh
 kind: story
 size: 3
-parent: "xrlwbd7"
+parent: "6236"
 status: open
 dateOpened: "2026-10-17"
 tags: []
@@ -9,7 +10,7 @@ tags: []
 
 # we: review stringency slice 1 — closed finding-class list
 
-Define the closed list of finding classes and map each onto the existing impact levels and dispositions, with a validator. Unknown class fails closed. Ruled in decision xugqjw1.
+Define the closed list of finding classes and map each onto the existing impact levels and dispositions, with a validator. Unknown class fails closed. Ruled in decision 6239.
 
 ## Acceptance
 
@@ -17,7 +18,7 @@ Define the closed list of finding classes and map each onto the existing impact 
 - [A2] **Executable** — validator test `unknown-class-fails-closed` rejects unknown, missing, null, non-string and instruction-bearing class values, including case, whitespace, invisible-character and Unicode-lookalike variants of valid tokens; the ruling integration observes block for rejected values (slice 2 A8).
 - [A3] **Executable** — validator test `class-list-unreadable` rejects missing, truncated, malformed and unreadable class-list input, with no default empty list or permissive mapping.
 
-Ruling and amended table: [we:backlog/xugqjw1](/backlog/xugqjw1-decision-review-stringency-classified-findings-per-level-out/) and the statute `we:docs/agent/platform-decisions.md#review-stringency-classified-outcomes`.
+Ruling and amended table: [we:backlog/6239](/backlog/6239-decision-review-stringency-classified-findings-per-level-out/) and the statute `we:docs/agent/platform-decisions.md#review-stringency-classified-outcomes`.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

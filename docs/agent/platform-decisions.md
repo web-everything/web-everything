@@ -6278,7 +6278,7 @@ Codex-authored PRs get an Opus judge, same fallback dimension). Declared in `we:
 ### Review findings are classed from a closed list; the class and level pick one of four outcomes; debt gates the level move {#review-stringency-classified-outcomes}
 
 **Ratified 2026-10-17 by the operator (Nicolas Gilbert), in conversation, all three forks at the card's default
-(`#xugqjw1`).** The operator's words: *"Ok for your picks"*. Composes with, and does not replace,
+(`#6239`).** The operator's words: *"Ok for your picks"*. Composes with, and does not replace,
 [claim-accuracy-advisory-blocks-on-impact](#claim-accuracy-advisory-blocks-on-impact),
 [delivery-decider-under-fixed-settings](#delivery-decider-under-fixed-settings) (the always-block rows are the
 invariants that already win) and the deterministic-core rule.
@@ -6362,18 +6362,18 @@ invariants that already win) and the deterministic-core rule.
     rate-limit/origin checks are n/a for a scheduled job without an endpoint; single-emission retry guards
     still apply. These bounds and n/a reasons are acceptance obligations, not delivered infrastructure.
 
-**Proof requirement and ownership.** Decision `#xugqjw1` resolves the design only. Implementation and live proof
-belong to epic `#xrlwbd7`: production-path before/after on a live PR and a fresh-window recount of auto-block
+**Proof requirement and ownership.** Decision `#6239` resolves the design only. Implementation and live proof
+belong to epic `#6236`: production-path before/after on a live PR and a fresh-window recount of auto-block
 overrides and reviewer not-real rulings, with dated windows, denominators and settings revisions. The epic may
-not resolve solely because its children land. Named acceptance coverage: slice 2 `#x77cl1h` A5
+not resolve solely because its children land. Named acceptance coverage: slice 2 `#6233` A5
 (`careless-debt-block`), A6 (`monotonic-levels`), A8–A10 (malformed/unreadable input and forged authority), A12
-(`always-block-second-check`); slice 3 `#xsnny7x` A2 (`expedite-deadline-escalation`), A3
+(`always-block-second-check`); slice 3 `#6237` A2 (`expedite-deadline-escalation`), A3
 (`debt-staleness-resurface`), A6–A10 (tamper, authority, source, unreadable state and revision races); slice 5
-`#xhjuluf` A2–A7 (threshold, disable flag, proposal-only promotion, template safety, scheduling and input failure).
+`#6234` A2–A7 (threshold, disable flag, proposal-only promotion, template safety, scheduling and input failure).
 Additional handoff coverage: slice 2 A2/A13–A16 (all competing rule pairs, literal table cells/domains,
 read-side cascade provenance, protected roots and ingress bounds); slice 3 A2–A3/A8/A11 (N+1 aggregation,
 repeat baselines, quadrant admission and bounds); slice 4 A6 and slice 5 A8 (surface-specific bounds).
 Each slice's Test plan and the decision's risk mapping identify repository-qualified planned test files
 as implementation destinations.
 
-**Lineage:** `#xugqjw1` (ruled 2026-10-17). Reference: the operator's review stringency proposal artifact.
+**Lineage:** `#6239` (ruled 2026-10-17). Reference: the operator's review stringency proposal artifact.
