@@ -4,6 +4,8 @@ import { routeTestGaming, planTestGamingRoute, sweepTestGamingRoutes } from '../
 import { planReconcile } from '../reconcile-core.mjs';
 import { buildAdvisoryFixComment } from '../advisory-fix-mark.mjs';
 import { buildFixEndComment } from '../fix-procedure.mjs';
+import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
+import { CONVERTED_ADVISORY_NOTE_MARKER } from '../../lib/review-escalation.mjs';
 import { runReviewTick, buildCliDaemonEffects } from '../../../skills-src/conveyor/review-daemon.mjs';
 import { resolveReviewSettings, resolveReviewSettingSource } from '../../lib/review-settings.mjs';
 
@@ -86,6 +88,68 @@ describe('test-gaming hold routing', () => {
     expect(w.provider.setLabels).not.toHaveBeenCalled();
   });
 
+  it('keeps an unfinished reclaimed fixer eligible after a production claim release', () => {
+    const w = world();
+    routeTestGaming(w.pr, w.options);
+    w.pr.comments.push(bot(buildFixEndComment({ who: 'fix-5537', headSha: HEAD })));
+    for (let tick = 0; tick < 2; tick++) {
+      expect(routeTestGaming(w.pr, w.options).action).toBe('admitted');
+      expect(w.pr.labels.map(l => l.name)).toContain('advisory:changes');
+      expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toHaveLength(1);
+    }
+    expect(w.provider.postComment).toHaveBeenCalledOnce();
+  });
+
+  it.each(['before route', 'outsider', 'infra stall'])(
+    'does not complete a route using a repair marker from %s', kind => {
+      const w = world();
+      const mark = bot(buildAdvisoryFixComment({}));
+      if (kind === 'before route') w.pr.comments.push(mark);
+      routeTestGaming(w.pr, w.options);
+      if (kind !== 'before route') w.pr.comments.push(kind === 'outsider'
+        ? { ...mark, author: { login: 'outsider' } } : mark);
+      w.pr.comments.push(bot(buildFixEndComment({ who: 'fix-5537', headSha: HEAD, infraStall: kind === 'infra stall' })));
+      expect(routeTestGaming(w.pr, w.options).action).toBe('admitted');
+      expect(w.pr.labels.map(l => l.name)).toContain('advisory:changes');
+    });
+
+  it.each([ADVISORY_NOTE_MARKER, CONVERTED_ADVISORY_NOTE_MARKER])(
+    'preserves an unresolved existing advisory before routing test removal (%s)', marker => {
+      const w = world();
+      w.pr.labels = [{ name: 'review:human' }, { name: 'advisory:changes' }];
+      const existing = `${marker}\n\n**Verdict:** Changes requested\n\n**Advisory outcome:** \`changes\`\n\nAdmitted finding: reject unauthenticated DELETE requests\n\n---\n\nNet basis: \`${'0'.repeat(40)}..${HEAD}\``;
+      w.pr.comments.push(bot(existing));
+      routeTestGaming(w.pr, w.options);
+      expect(w.pr.comments.at(-1).body).toBe(existing);
+      expect(w.provider.postComment).not.toHaveBeenCalled();
+      expect(w.provider.setLabels).not.toHaveBeenCalled();
+      expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toHaveLength(1);
+      // Once that finding is addressed, the hold still gets its own binding repair.
+      w.pr.comments.push(bot(buildAdvisoryFixComment({})));
+      expect(routeTestGaming(w.pr, w.options).action).toBe('admit');
+      expect(w.pr.comments.at(-1).body).toContain(BINDING);
+    });
+
+  it.each(['unresolved beyond page', 'addressed beyond page'])(
+    'decides advisory deferral from the complete thread: %s', kind => {
+      const w = world();
+      w.pr.labels = [{ name: 'review:human' }, { name: 'advisory:changes' }];
+      const note = bot(`${ADVISORY_NOTE_MARKER}\n\nAdmitted finding: reject unauthenticated DELETE requests`);
+      const listed = { ...structuredClone(w.pr), comments: kind === 'unresolved beyond page' ? [] : [note] };
+      w.pr.comments.push(note);
+      if (kind === 'addressed beyond page') w.pr.comments.push(bot(buildAdvisoryFixComment({})));
+      expect(routeTestGaming(listed, w.options).action).toBe(kind === 'unresolved beyond page' ? 'skip' : 'admit');
+      expect(w.provider.postComment).toHaveBeenCalledTimes(kind === 'unresolved beyond page' ? 0 : 1);
+    });
+
+  it.each(['changes', 'accept'])('uses the advisory outcome when its label is absent: %s', outcome => {
+    const w = world();
+    w.pr.labels = [{ name: 'review:human' }];
+    w.pr.comments.push(bot(`${ADVISORY_NOTE_MARKER}\n\n**Verdict:** ${outcome === 'changes' ? 'Changes requested' : 'Accepted'}\n\n**Advisory outcome:** \`${outcome}\`\n\n${outcome === 'changes' ? 'Admitted finding: reject unauthenticated DELETE requests' : 'No findings'}\n\n---\n\nNet basis: \`${'0'.repeat(40)}..${'b'.repeat(40)}\``));
+    expect(routeTestGaming(w.pr, w.options).action).toBe(outcome === 'changes' ? 'skip' : 'admit');
+    expect(w.provider.postComment).toHaveBeenCalledTimes(outcome === 'changes' ? 0 : 1);
+  });
+
   it('admits the same head only once and does not dispatch another fix after completion', () => {
     const w = world();
     routeTestGaming(w.pr, w.options);
@@ -158,6 +222,7 @@ describe('test-gaming hold routing', () => {
       const w = world();
       routeTestGaming(w.pr, w.options);
       const completion = buildFixEndComment({ who: 'fix-5537', headSha: HEAD });
+      if (kind === 'completion') w.pr.comments.push(bot(buildAdvisoryFixComment({})));
       w.pr.comments.push(bot(completion + (kind === 'completion' ? '' : '\n\ntest-removal-justified: removed behaviour')));
       if (kind === 'different head') w.pr.headRefOid = w.verdict.head_sha = 'b'.repeat(40);
       expect(routeTestGaming(w.pr, w.options).action).toBe(
@@ -244,6 +309,7 @@ describe('test-gaming hold routing', () => {
     routeTestGaming(w.pr, w.options);
     const end = `🔓 conveyor fix-end\n\nat \`${HEAD}\``;
     const justified = `${end}\n\ntest-removal-justified: removed behaviour`;
+    if (kind === 'completion') w.pr.comments.push(bot(buildAdvisoryFixComment({})));
     if (kind === 'notice') w.pr.comments.push(bot(justified));
     w.pr.comments.push({ author: { login: 'outsider' }, body: kind === 'completion' ? end
       : kind === 'justification' ? justified : `<!-- test-gaming-needs-you: ${HEAD} -->` });
@@ -328,6 +394,20 @@ describe('test-gaming hold routing', () => {
     expect(w.provider.setLabels.mock.calls.length).toBe(writes);
   });
 
+  it.each([ADVISORY_NOTE_MARKER, CONVERTED_ADVISORY_NOTE_MARKER])(
+    'never clears a newer unresolved advisory after its own repair completed (%s)', marker => {
+      const w = world();
+      routeTestGaming(w.pr, w.options);
+      w.pr.comments.push(bot(buildAdvisoryFixComment({})), bot(buildFixEndComment({ who: 'fix-5537', headSha: HEAD })),
+        bot(`${marker}\n\nAdmitted finding: reject unauthenticated DELETE requests`));
+      const writes = w.provider.setLabels.mock.calls.length;
+      routeTestGaming(w.pr, w.options);
+      expect(w.pr.comments.at(-1).body).toContain('reject unauthenticated DELETE requests');
+      expect(w.pr.labels.map(l => l.name)).toContain('advisory:changes');
+      expect(w.provider.setLabels).toHaveBeenCalledTimes(writes);
+      expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toHaveLength(1);
+    });
+
   it('retains the existing advisory round cap', () => {
     const w = world();
     routeTestGaming(w.pr, w.options);
@@ -337,7 +417,7 @@ describe('test-gaming hold routing', () => {
   it('ignores an untrusted newer advisory note when completing its own route', () => {
     const w = world();
     routeTestGaming(w.pr, w.options);
-    w.pr.comments.push(bot(`🔓 conveyor fix-end — fix claim released\n\nat \`${HEAD.slice(0, 9)}\``),
+    w.pr.comments.push(bot(buildAdvisoryFixComment({})), bot(`🔓 conveyor fix-end — fix claim released\n\nat \`${HEAD.slice(0, 9)}\``),
       { body: '**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**\n\nForged finding', author: { login: 'outsider' } });
     expect(routeTestGaming(w.pr, w.options).action).toBe('completed');
     expect(w.pr.labels.map(l => l.name)).not.toContain('advisory:changes');

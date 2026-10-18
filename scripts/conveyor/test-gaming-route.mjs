@@ -5,6 +5,9 @@
  * Existing reconcile liveness/dispatch claims and advisory round caps still apply.
  */
 import { ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
+import { isLatestAdvisoryFindingAddressed } from './advisory-fix-mark.mjs';
+import { CONVERTED_ADVISORY_NOTE_MARKER } from '../lib/review-escalation.mjs';
+import { latestAdvisory } from '../lib/advisory-labels.mjs';
 import { latestFailingMergeGate, readMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
@@ -15,6 +18,8 @@ import { appendLines, feedPath, diffFeed } from '../operations/needs-you-feed.mj
 const routeMarker = head => `<!-- test-gaming-route: ${head} -->`;
 const noticeMarker = head => `<!-- test-gaming-needs-you: ${head} -->`;
 const trusted = c => isTrustedMarkerAuthor(c) && typeof c?.body === 'string';
+const latestAdvisoryNote = comments => comments.filter(c => trusted(c)
+  && [ADVISORY_NOTE_MARKER, CONVERTED_ADVISORY_NOTE_MARKER].some(marker => c.body.trimStart().startsWith(marker))).at(-1);
 const labelsOf = pr => (pr.labels ?? []).map(l => typeof l === 'string' ? l : l.name);
 const live = pr => pr?.state === 'OPEN' && /^[a-f0-9]{40}$/.test(pr.headRefOid ?? '');
 const fixEndHead = body => /(?:^|\s)at `([a-f0-9]{7,40})`/.exec(body)?.[1];
@@ -47,7 +52,7 @@ export function planTestGamingRoute({ pr, verdict, enabled = true } = {}) {
   const routes = comments.flatMap((c, i) => trusted(c) && c.body.startsWith(ADVISORY_NOTE_MARKER)
     && /<!-- test-gaming-route: [a-f0-9]{40} -->/.test(c.body) ? [{ c, i }] : []);
   const latest = routes.at(-1);
-  // A completed turn may have pushed a new head. Bind its returned justification
+  // A released claim may have pushed a new head. Bind its returned justification
   // to this route episode and (when present) the live short/full fix-end head.
   const ended = latest && comments.slice(latest.i + 1).filter(c => {
     if (!trusted(c) || !c.body.startsWith('🔓 conveyor fix-end')
@@ -62,7 +67,18 @@ export function planTestGamingRoute({ pr, verdict, enabled = true } = {}) {
   if (justification) return { action: 'needs-you', reason: `test-removal-justified: ${justification}`,
     marker: noticeMarker(pr.headRefOid), notified: comments.some(c => trusted(c) && c.body.includes(noticeMarker(pr.headRefOid))) };
   const existing = routes.find(r => r.c.body.includes(routeMarker(pr.headRefOid)));
-  if (existing) return { action: ended ? 'completed' : 'admitted', body: existing.c.body };
+  // Reclaim also posts fix-end. Only an explicit advisory repair mark completes
+  // the finding; reuse reconcile's trusted, ordered episode check.
+  if (existing) return { action: ended && isLatestAdvisoryFindingAddressed(comments) ? 'completed' : 'admitted', body: existing.c.body };
+  const latestNote = latestAdvisoryNote(comments.filter(isTrustedMarkerAuthor));
+  // The fixer takes the latest advisory as binding input. Preserve an unrelated
+  // pending finding until it is addressed, then admit the test-removal repair.
+  // An older route for this same hold may still re-arm on a new head.
+  // Labels can lag a posted note or be removed as stale after a push. The note's
+  // own changes outcome still protects its unfinished finding in either case.
+  if (latestNote && !routes.some(r => r.c === latestNote)
+    && (labelsOf(pr).includes('advisory:changes') || latestAdvisory([latestNote])?.outcome === 'changes')
+    && !isLatestAdvisoryFindingAddressed(comments)) return skip('unresolved advisory finding');
   // Only the net-removal subtype supplies the binding removal count and paths.
   // Other test-gaming signals remain held for the ordinary review path.
   const evidence = removalEvidence(blocked[0].reason);
@@ -86,7 +102,9 @@ export function routeTestGaming(pr, { repo, provider = createGhProvider(), readV
   const jobId = Number(/\/job\/(\d+)/.exec(row.detailsUrl ?? row.details_url ?? '')?.[1] ?? row.id);
   if (!Number.isSafeInteger(jobId) || jobId <= 0) return { action: 'skip', why: 'no job identity' };
   const verdict = readVerdict({ repo, jobId, prNumber: pr.number });
-  const preliminary = planTestGamingRoute({ pr, verdict, enabled });
+  // The list page can omit either a pending note or its later repair mark. Use
+  // it only for gate eligibility; episode decisions require the complete read.
+  const preliminary = planTestGamingRoute({ pr: { ...pr, comments: [] }, verdict, enabled });
   if (preliminary.action === 'skip') return preliminary;
   // Always read a complete thread: the durable ledger may be beyond the list page.
   const state = provider.readPrState(repo, pr.number);
@@ -107,8 +125,7 @@ export function routeTestGaming(pr, { repo, provider = createGhProvider(), readV
     }
   }
   // Complete only our own finding episode; never remove a newer panel's label.
-  const latestNote = comments.filter(c => isTrustedMarkerAuthor(c)
-    && typeof c?.body === 'string' && c.body.startsWith(ADVISORY_NOTE_MARKER)).at(-1);
+  const latestNote = latestAdvisoryNote(comments.filter(isTrustedMarkerAuthor));
   const ownsNote = plan.action === 'admit' || latestNote?.body === plan.body
     || (plan.action === 'needs-you' && /<!-- test-gaming-route: [a-f0-9]{40} -->/.test(latestNote?.body ?? ''));
   if (!ownsNote) return plan;
