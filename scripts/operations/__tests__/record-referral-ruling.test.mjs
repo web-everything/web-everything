@@ -377,19 +377,19 @@ describe('operator finding selectors and follow-up', () => {
     })[OPERATOR_RULING_FOLLOW_UP_EFFECT];
     return { run, calls, path: () => bodyPath };
   }
-  it('runs the send-back CLI then clears the advisory label and cleans its body file', async () => {
+  it('runs the send-back CLI, leaves the advisory label to the mirror, and cleans its body file', async () => {
     const s = sink();
-    await expect(s.run(payload)).resolves.toEqual({ action: 'send-back', sentBack: true, labelCleared: true });
+    await expect(s.run(payload)).resolves.toEqual({ action: 'send-back', sentBack: true, labelCleared: false });
     expect(s.calls[0]).toMatchObject({ exe: process.execPath, body: payload.body, options: { encoding: 'utf8', timeout: 120_000 } });
     expect(s.calls[0].args).toEqual([expect.stringMatching(/scripts\/review-set-label.mjs$/), '7', '--repo=o/r', '--to=changes', expect.stringMatching(/^--body-file=/), '--actor=chalbert', '--channel=chat']);
-    expect(s.calls[1]).toEqual(['pr', 'edit', '7', '--repo', repo, '--remove-label', RULING_NEEDED_LABEL]);
+    expect(s.calls).toHaveLength(1);
     expect(existsSync(s.path())).toBe(false);
   });
   it('skips an already sent-back PR and resumes without changing review labels', async () => {
     for (const action of ['send-back', 'resume']) {
       const s = sink({ labels: ['review:changes', RULING_NEEDED_LABEL] });
-      await expect(s.run({ ...payload, action })).resolves.toEqual({ action, sentBack: false, labelCleared: true });
-      expect(s.calls).toHaveLength(1);
+      await expect(s.run({ ...payload, action })).resolves.toEqual({ action, sentBack: false, labelCleared: false });
+      expect(s.calls).toEqual([]);
     }
     const s = sink({ labels: [] });
     await expect(s.run({ ...payload, action: 'resume' })).resolves.toMatchObject({ labelCleared: false });

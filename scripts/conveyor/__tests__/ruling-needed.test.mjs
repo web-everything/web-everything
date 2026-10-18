@@ -31,15 +31,14 @@ describe('advisory:ruling-needed label', () => {
   it('a PR that never parked is left alone', () => {
     expect(planRulingNeededLabel({ number: 1, headRefOid: H1, labels: [], comments: [] }).action).toBe('none');
   });
-  it('sweep creates the label, adds it, never touches review labels, and survives a failing PR', () => {
+  it('sweep reports drift for every PR without invoking label writers, even a throwing writer', () => {
     const calls = [];
     const provider = { currentRepo: () => repo,
       ensureLabel: (r, name) => calls.push(['ensure', name]),
       setLabels: (r, num, spec) => { calls.push(['set', num, spec]); if (num === 2) throw new Error('boom'); } };
     const out = sweepRulingNeededLabels({ repo, provider, readPr: ({ number }) => parked({ number }), listPrs: () => [parked(), parked({ number: 2 })] });
-    expect(calls[0]).toEqual(['ensure', RULING_NEEDED_LABEL]);
-    expect(calls[1]).toEqual(['set', 3794, { add: RULING_NEEDED_LABEL }]);
-    expect(out.map(r => [r.num, r.action, !!r.error])).toEqual([[3794, 'add', false], [2, 'add', true]]);
+    expect(calls).toEqual([]);
+    expect(out.map(r => [r.num, r.action, !!r.error])).toEqual([[3794, 'add', false], [2, 'add', false]]);
     expect(JSON.stringify(calls)).not.toMatch(/review:/);
   });
   it('dry-run writes nothing', () => {
