@@ -15,9 +15,18 @@ import { redTeamMarker } from '../../lib/red-team-gate.mjs';
 import { resetCascadeLogForTest } from '../../lib/policy-cascade.mjs';
 import { repoKeyForSlug } from '../../lib/constellation-repos.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
+import * as reviewDispatchCli from '../../operations/review-dispatch.mjs';
+import { makeCliMechanicalPasses, MECHANICAL_PASS_NAMES } from '../../../skills-src/conveyor/runner.mjs';
 
 // x9jlvy0: replay the saved-result/missing-comment boundary from PR #5461.
 const repo = 'web-everything/web-everything';
+const identityChangeTypes = [
+  { kind: 'source', file: 'src/example.mjs' },
+  { kind: 'documentation', file: 'docs/example.md' },
+  { kind: 'configuration', file: 'scripts/settings/example.json' },
+  { kind: 'data', file: 'src/_data/example.json' },
+];
+const identityTestName = 'applies owed-comment identity checks across file types';
 const head = '3373a3326ef2b649303f7b26b69efabfdfe179a6';
 const number = 5461;
 const pr = (over = {}) => ({ number, headRefOid: head, comments: [], labels: ['review:accepted'], ...over });
@@ -53,6 +62,111 @@ beforeEach(() => {
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 describe('same-head hold when the post-accept red-team comment is owed', () => {
+  it.each(['job', 'session'])('the runner refuses tokenless owed-head CLI reviews on every tick (%s)', async mode => {
+    const [p] = enrichPrsWithReferralHolds([pr({ labels: [{ name: 'review:accepted' }],
+      headRefName: 'lane/redteam-comment-retry', state: 'OPEN', isDraft: false, mergeStateStatus: 'CLEAN',
+      statusCheckRollup: ['test', 'standards', 'test-shard (1)']
+        .map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })),
+    })], { ...opts, now: 3, readRuns: () => [run()] });
+    const plan = planReconcile({ repo: repoKeyForSlug(repo), prs: [p], agents: [], requiredChecks: ['test'], now: 3 });
+    expect(plan.dispatch).toContainEqual(expect.objectContaining({ kind: 'review', owedRedTeamReview: { repo, pr: number, head } }));
+    const spawnJob = vi.fn(() => 4242), spawnAgent = vi.fn();
+    const skips = [];
+    const pass = makeCliMechanicalPasses({ scriptsDir: '/daemon/scripts', repo,
+      skipPasses: new Set(MECHANICAL_PASS_NAMES.filter(name => name !== 'reconcile-pass')),
+      fetchOpenPrs: () => [p], exec: (_file, argv) => {
+        if (argv[0].endsWith('/reconcile-pass.mjs')) return JSON.stringify(plan);
+        if (argv[0].endsWith('/review-dispatch.mjs')) {
+          // Consume exactly the runner's CLI arguments: it forwards neither token nor callback.
+          expect(argv).toEqual(['/daemon/scripts/operations/review-dispatch.mjs', `--pr=${number}`, `--repo=${repo}`]);
+          const result = reviewDispatchCli.dispatchCliReview(dispatch, {
+            mode, repo: argv[2].slice(7), pr: argv[1].slice(5),
+            spawnJob, spawnAgent, wrapReview: false, readBrief: () => 'Review {{PR}}',
+            mintSessionId: () => 'runner-owed', ensureSessionCwd: p => p,
+            sessionCwdFor: () => join(dir, 'session'), isolateSession: () => ({ worktreeSettings: {} }),
+          }, { ...opts, readPr: () => pr(), readRuns: () => [run()] });
+          skips.push(result.skipped);
+        }
+        return '';
+      } });
+    for (let tick = 0; tick < 3; tick++) await pass();
+    expect(skips).toEqual(['same-head-hold', 'same-head-hold', 'same-head-hold']);
+    expect(spawnJob).not.toHaveBeenCalled();
+    expect(spawnAgent).not.toHaveBeenCalled();
+    expect(existsSync(opts.redTeam.stateDir)).toBe(false);
+    const source = readFileSync(new URL('../../operations/review-dispatch.mjs', import.meta.url), 'utf8');
+    const cli = source.slice(source.indexOf('if (IS_CLI)'));
+    expect(cli).toContain('dispatchCliReview(dispatchReviewJob,');
+    expect(cli).toContain('dispatchCliReview(dispatchReview,');
+  });
+  it.each(['read-pr', 'read-runs', 'wrong-pr', 'wrong-head', 'missing-labels', 'missing-comments'])
+  ('the plain CLI refuses unreadable or mismatched spawn authorization (%s)', variant => {
+    const snapshot = pr();
+    if (variant === 'wrong-pr') snapshot.number++;
+    if (variant === 'wrong-head') snapshot.headRefOid = 'b'.repeat(40);
+    if (variant === 'missing-labels') delete snapshot.labels;
+    if (variant === 'missing-comments') delete snapshot.comments;
+    expect(reviewDispatchCli.claimCliReviewDispatch({ headSha: head }, { repo, pr: number,
+      readPr: () => { if (variant === 'read-pr') throw new Error('unreadable PR'); return snapshot; },
+      readRuns: () => { if (variant === 'read-runs') throw new Error('unreadable runs'); return []; },
+    })).toBe(false);
+  });
+  it('the plain CLI preserves ordinary new-head reviews and explicit trusted re-arms', () => {
+    const authorize = (p, runs) => reviewDispatchCli.claimCliReviewDispatch({ headSha: head }, {
+      repo, pr: number, readPr: () => p, readRuns: () => runs, now: 10,
+    });
+    expect(authorize(pr(), [])).toBe(true);
+    const rearm = { author: { login: 'chalbert' }, createdAt: new Date(5).toISOString(),
+      body: '🔁 review — changes requested' };
+    expect(authorize(pr({ comments: [rearm] }), [run()])).toBe(true);
+    expect(authorize(pr({ comments: [{ ...rearm, author: { login: 'stranger' } }] }), [run()])).toBe(false);
+  });
+  it.each(['repo', 'pr', 'head', 'ci-head', 'malformed-head'])
+  ('rejects owed-red-team dispatch identity independently of the claim guard (%s)', field => {
+    const token = { repo, pr: number, head };
+    if (field === 'repo') token.repo = 'other/repo';
+    if (field === 'pr') token.pr++;
+    if (field === 'head') token.head = 'b'.repeat(40);
+    if (field === 'malformed-head') token.head = 'bad';
+    const spawnJob = vi.fn(), beforeSpawn = vi.fn(() => true);
+    expect(dispatch({ owedRedTeamReview: token, beforeSpawn, spawnJob,
+      ciGate: () => ({ allowed: true, headSha: field === 'ci-head' ? 'c'.repeat(40) : head }),
+    }).skipped).toBe('owed-red-team-identity');
+    expect(beforeSpawn).not.toHaveBeenCalled();
+    expect(spawnJob).not.toHaveBeenCalled();
+  });
+  it('keeps the A3 acceptance-to-test manifest aligned with its named cases and required variants', () => {
+    const card = readFileSync(new URL('../../../backlog/6273-a-head-whose-red-team-comment-is-owed-is-not-held-by-the-alr.md', import.meta.url), 'utf8');
+    const manifest = JSON.parse(card.match(/```acceptance-tests\n([\s\S]*?)\n```/)[1]);
+    expect(manifest.A3).toEqual({ test: identityTestName, variants: identityChangeTypes });
+    expect(identityChangeTypes.map(c => c.kind)).toEqual(['source', 'documentation', 'configuration', 'data']);
+  });
+  it.each(identityChangeTypes)
+  (`${identityTestName} ($kind)`, ({ file }) => {
+    for (const variant of ['owed', 'posted', 'untrusted-author', 'wrong-repo', 'wrong-pr', 'wrong-head', 'marker-pr', 'marker-head']) {
+      save([row({ netChangedFiles: [file], ...(variant === 'wrong-repo' ? { repo: 'other/repo' } : {}),
+        ...(variant === 'wrong-pr' ? { pr: number + 1 } : {}), ...(variant === 'wrong-head' ? { rev: 'b'.repeat(40) } : {}) })]);
+      const p = pr({ files: [{ path: file }], comments: ['posted', 'untrusted-author', 'marker-pr', 'marker-head'].includes(variant)
+        ? [{ author: { login: variant === 'untrusted-author' ? 'stranger' : 'chalbert' },
+          body: redTeamMarker(variant === 'marker-pr' ? number + 1 : number, variant === 'marker-head' ? 'b'.repeat(40) : head) }] : [] });
+      const eligible = ['owed', 'untrusted-author', 'marker-pr', 'marker-head'].includes(variant);
+      const [enriched] = enrichPrsWithReferralHolds([p], { ...opts, readRuns: () => [run()] });
+      expect(enriched.owedRedTeamReview, variant).toEqual(eligible ? { repo, pr: number, head } : undefined);
+      expect(claimReviewDispatch(p, opts), variant).toBe(eligible);
+      rmSync(opts.redTeam.stateDir, { recursive: true, force: true });
+    }
+  });
+  it('retains the hold when capped-thread expansion reveals the posted marker', () => {
+    const snapshot = Array.from({ length: 100 }, () => ({ body: 'old comment' }));
+    const readComments = vi.fn(() => [...snapshot, { author: { login: 'chalbert' }, body: redTeamMarker(number, head) }]);
+    const p = pr({ comments: snapshot });
+    const [enriched] = enrichPrsWithReferralHolds([p], { ...opts, readRuns: () => [run()], readComments });
+    expect(enriched.referralHold).toMatchObject({ kind: 'same-head' });
+    expect(enriched.owedRedTeamReview).toBeUndefined();
+    expect(claimReviewDispatch(p, { ...opts, readComments })).toBe(false);
+    expect(readComments).toHaveBeenCalledTimes(2);
+    expect(existsSync(opts.redTeam.stateDir)).toBe(false);
+  });
   it('does not spend the release during non-review reconcile planning or ledger decisions', () => {
     const enrich = () => enrichPrsWithReferralHolds([pr()], { ...opts, readRuns: () => [run()] })[0];
     expect(enrich().referralHold).toBeNull();

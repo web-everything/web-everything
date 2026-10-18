@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.mjs';
+import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { decideSameHeadHold, evaluateReferralHold, readReviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
 /**
  * @file scripts/operations/review-dispatch.mjs
  * @description `#3279` — DISPATCH AN INDEPENDENT REVIEW OF A PR TO A FRESH SESSION.
@@ -702,6 +704,34 @@ export function formatSessionDispatchResult(result) {
     + (result.unknownTokens.length ? `note: unrecognized brief tokens (reported, not fatal): ${result.unknownTokens.join(', ')}\n` : '');
 }
 
+/** The plain CLI carries no owed-comment token. Revalidate its ordinary review authorization at spawn
+ * time, without enabling or spending the owed-comment exception. Token-bearing daemons use their own claim.
+ */
+export function claimCliReviewDispatch(ci, { repo, pr, env = process.env, now = Date.now(),
+  readRuns = readReviewRunEvidence,
+  readPr = ({ repo, pr }) => JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), '--repo', repo,
+    '--json', 'number,headRefOid,labels,comments,body,createdAt'],
+  { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 32 * 1024 * 1024 })),
+} = {}) {
+  try {
+    // Match the dispatcher's repository/PR resolution.
+    const planned = planReviewDispatch({ repo, pr });
+    const snapshot = readPr({ repo: planned.repo, pr: planned.pr });
+    if (snapshot?.number !== planned.pr || !/^[0-9a-f]{40}$/.test(snapshot.headRefOid)
+      || snapshot.headRefOid !== ci?.headSha || !Array.isArray(snapshot.labels) || !Array.isArray(snapshot.comments)) return false;
+    const runs = readRuns();
+    const { hold, released } = evaluateReferralHold(snapshot, runs, { repo: planned.repo, now, env });
+    return !hold && (Boolean(released) || !decideSameHeadHold(snapshot, runs, { repo: planned.repo, env, now }));
+  } catch { return false; }
+}
+
+/** Shared CLI wiring for job and session mode; neither may drop the ordinary hold check. */
+export function dispatchCliReview(dispatch, opts, holdOpts = {}) {
+  return dispatch({ ...opts, beforeSpawn: ci => claimCliReviewDispatch(ci, {
+    ...holdOpts, repo: opts.repo, pr: opts.pr, env: opts.env,
+  }) });
+}
+
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 if (IS_CLI) {
   // xgqz204 — this CLI may fast-forward its own checkout (#3474); re-execute rather than dispatch on old code.
@@ -723,7 +753,7 @@ if (IS_CLI) {
     const mode = flag('mode') === 'session' || flag('mode') === 'job' ? flag('mode') : resolveReviewDispatchMode();
     if (mode === 'job') {
       try {
-        const r = dispatchReviewJob({ pr: flag('pr'), repo: flag('repo') });
+        const r = dispatchCliReview(dispatchReviewJob, { pr: flag('pr'), repo: flag('repo') });
         writeAllSync(1, r.skipped
           ? `dispatch-review: ${r.repo}#${r.pr} not started — ${r.skipped}${r.jobPid ? ` (job pid ${r.jobPid})` : ''}\n`
           : `dispatch-review: started review job pid ${r.jobPid} (slug ${r.sessionSlug}) for ${r.repo}#${r.pr} — no Claude wrapper session\n`
@@ -740,7 +770,7 @@ if (IS_CLI) {
       // #xqa9ttq — `--judge-provider` is OPTIONAL; `dispatchReview`'s own `judgeProvider = 'claude'` default
       // applies when the flag is omitted, so `flag('judge-provider')` returning `undefined` here is the ordinary
       // case, not a gap.
-      const result = dispatchReview({
+      const result = dispatchCliReview(dispatchReview, {
         pr: flag('pr'), repo: flag('repo'), extraArgs: agentArgsFromEnv(), judgeProvider: flag('judge-provider'), careLevel: flag('care-level'),
       });
       writeAllSync(1, formatSessionDispatchResult(result));

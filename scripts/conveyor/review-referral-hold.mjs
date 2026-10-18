@@ -174,7 +174,7 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 /** The referral hold's decision, tagged: `released` names a DELIBERATE release (a ruling, wake event or retry), which
  * the same-head guard must not override; `released: null` with no hold just means no parked run to hold on.
  */
-function evaluateReferralHold(pr, runs, { repo, now = Date.now(), env = process.env,
+export function evaluateReferralHold(pr, runs, { repo, now = Date.now(), env = process.env,
   // The SAME reader the review gate uses, so a `card` ruling naming a card that does not exist yet keeps the hold.
   cardReadable = ref => referralCardReadable(ref, REPO_ROOT) } = {}) {
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number))
