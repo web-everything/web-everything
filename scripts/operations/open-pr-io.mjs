@@ -61,7 +61,7 @@ export function resolveGhCredentialEnv({ env = process.env, exists = existsSync,
   return env;
 }
 import { checkPrePrReview, loadPrePrSettings, renderBypassNote, codeSpan } from '../lib/pre-pr-review.mjs';
-import { prepareItemFromRef, preparePrTitle, verifyPreparePr } from './prepare-pr.mjs';
+import { prepareItemFromRef, preparePrTitle, verifyPreparePr, prepareBatchIds, verifyPrepareBatchPr } from './prepare-pr.mjs';
 
 /** The single home. Resolved from THIS file's location, never cwd — the lane being opened is not this repo. */
 export const PR_LAND_CLI = join(dirname(fileURLToPath(import.meta.url)), '..', 'pr-land.mjs');
@@ -148,11 +148,12 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
     }
     let item;
     try { item = prepareItemFromRef(arg('ref')); } catch (e) { cleanupBody(); throw e; }
-    if (item) {
+    const batchIds = prepareBatchIds(arg('title'));
+    if (item || batchIds.length) {
       try {
-        const sha = verifyPreparePr({ item, source: arg('sha') || 'HEAD', base: arg('base') || 'main', git });
+        const sha = batchIds.length ? verifyPrepareBatchPr({ items: batchIds, source: arg('sha') || 'HEAD', base: arg('base') || 'main', git }) : verifyPreparePr({ item, source: arg('sha') || 'HEAD', base: arg('base') || 'main', git });
         argv = argv.filter((a) => !a.startsWith('--title=') && !a.startsWith('--sha='));
-        argv.push(`--title=${assertMachineTitle(preparePrTitle(item, readMainCard(item, git)))}`, `--sha=${sha}`);
+        argv.push(`--title=${assertMachineTitle(batchIds.length ? `prepare: ${batchIds.join(', ')}` : preparePrTitle(item, readMainCard(item, git)))}`, `--sha=${sha}`);
       } catch (e) {
         cleanupBody();
         return { outcome: 'refused', reason: String(e.message || e) };

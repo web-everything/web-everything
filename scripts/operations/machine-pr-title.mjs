@@ -64,6 +64,10 @@ export function assertMachineTitle(title) {
     throw new Error('PR title requires a specific change subject');
   }
   if (/^[A-Z]+ #[a-z0-9]+: [\w-]+ —\s*$/i.test(value)) throw new Error('PR title requires a subject');
+  if (/^prepare: [a-z0-9]+(?:, [a-z0-9]+)*$/.test(value)) {
+    if (value.length > 256) throw new Error('prepare batch title exceeds 256 characters');
+    return value; // Every id is publication scope; truncation would silently drop members.
+  }
   return boundedTitle('', value);
 }
 
