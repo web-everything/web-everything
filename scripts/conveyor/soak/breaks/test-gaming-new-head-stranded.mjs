@@ -17,7 +17,7 @@ export default {
     const { runReviewTick } = await import(pathToFileURL(join(root, 'skills-src/conveyor/review-daemon.mjs')).href);
     const { planReconcile } = await import(pathToFileURL(join(root, 'scripts/conveyor/reconcile-core.mjs')).href);
     const fx = JSON.parse(readFileSync(join(root, 'scripts/conveyor/__tests__/fixtures/pr-ownership/pr-5157-before-ci-heal.json'), 'utf8'));
-    const pr = fx.pr, repo = 'web-everything/web-everything', old = 'a'.repeat(40), head = 'b'.repeat(40);
+    const pr = fx.pr, repo = 'test-gaming-fixture/example', old = 'a'.repeat(40), head = 'b'.repeat(40);
     pr.number = 5487;
     pr.headRefOid = old;
     pr.labels = [{ name: 'review:pending' }];
