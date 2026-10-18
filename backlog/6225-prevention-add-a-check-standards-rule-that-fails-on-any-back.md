@@ -13,7 +13,7 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 1. `we:scripts/merge-ai-prs.mjs:4388` — Add a check:standards rule that fails on any backlog card with `status: active` that still contains `TODO` placeholders, plus a convention that each CLI-setting-log claim has a spawn-based smoke test.
-2. `we:backlog/xyzpgol-overlap-yield-known-holds.md:28` — Add a write-gate in check:standards that requires each Acceptance line of an active card to reference a test file path and a test name. Add the same check to the card scaffolder's template.
+2. `we:backlog/6240-overlap-yield-known-holds.md:28` — Add a write-gate in check:standards that requires each Acceptance line of an active card to reference a test file path and a test name. Add the same check to the card scaffolder's template.
 3. `we:scripts/conveyor/__tests__/overlap-yield-enqueueable.test.mjs:7` — Add a test-review lens for settings with a default: require one test per call site that runs with the setting unset. Where possible, add a lint that flags tests that stub an env var in every case of a suite.
 4. `we:scripts/conveyor/overlap-yield-enqueueable.mjs:32` — Add the named drain-level logging regression test to the required test gate, asserting both emission count and provenance content.
 5. `we:scripts/conveyor/overlap-yield-enqueueable.mjs:32` — Add a deterministic drain-entry integration test asserting exactly one policy log with the resolved value and source per invocation.
