@@ -290,3 +290,7 @@ gate-red | could-not-prepare)`, or, for the `already-done` exit (*The method*, s
 - **Never stamp a half-prepared item** — a thin or generic Design/MVP/Test-plan/Proof-plan, or a Follow-ups
   section that quietly hides a Must, is un-prepared; shape it or escalate `could-not-prepare`.
 
+
+<!-- tests-first:requireExecutableAcceptance -->
+Require at least one [A<n>] Executable line per stated guarantee in Acceptance, each naming a command or test that fails before the build and passes after. Replace the scaffold TODO before stamping preparedDate. Include changed defaults, callers, and fail-closed paths among the guarantees.
+<!-- /tests-first -->

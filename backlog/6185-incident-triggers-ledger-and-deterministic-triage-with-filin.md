@@ -4,7 +4,7 @@ kind: story
 size: 8
 parent: "6188"
 status: open
-scope: ["we:scripts/conveyor/incident-coroner-job.mjs", "we:scripts/operations/incident-triage.mjs", "we:scripts/operations/incident-ledger.mjs", "we:scripts/settings/incident-coroner.json", "we:skills-src/conveyor/daemon-manifest.mjs", "we:scripts/conveyor/health-smells-notify-list.mjs"]
+
 dateOpened: "2026-10-17"
 tags: []
 ---
@@ -36,3 +36,12 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Findings (standalone worker, 2026-10-17)
+
+The build-dispatch daemon held #6185 with:
+
+> worker-declined: Not prepared: #6185 — could-not-prepare. The card defines an impact score but leaves its urgent/later/escalate thresholds unspecified. The unresolved choice is whether score alone can authorize P0, or existing P0 eligibility remains controlling ('we:scripts/lib/delivery-priority.mjs:105'). Choosing that would invent policy. Also found existing episode-to-filing machinery at 'we:scripts/conveyor/health-file-request.mjs:133', which preparation must account for. No files changed or stamped; no tests run.
+
+`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
+a prepare pass re-scopes it against the finding.

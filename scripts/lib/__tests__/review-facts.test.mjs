@@ -26,7 +26,7 @@ describe('review facts: facts first', () => {
   it('gate: store hit with green required checks = 1 live head read, no check reads', () => {
     const liveHead = vi.fn(() => 'abc');
     const live = vi.fn();
-    const r = readReviewCiGateFactsFirst({ repo: 'o/r', pr: 7, lookup: hit(facts()), live, liveHead, readRequired: required() });
+    const r = readReviewCiGateFactsFirst({ policy: { startAfter: 'ci-green' }, repo: 'o/r', pr: 7, lookup: hit(facts()), live, liveHead, readRequired: required() });
     expect(r).toMatchObject({ allowed: true, headSha: 'abc', factsSource: 'store' });
     expect(liveHead).toHaveBeenCalledTimes(1);
     expect(live).not.toHaveBeenCalled();
@@ -37,22 +37,22 @@ describe('review facts: facts first', () => {
     let calls = 0;
     const readHead = () => { calls += 1; return 'abc'; };
     const readChecks = () => { calls += 2; return [{ name: 'test', status: 'completed', conclusion: 'success', head_sha: 'abc' }]; }; // check-runs + status
-    for (let pr = 1; pr <= 10; pr += 1) readReviewCiGate({ repo: 'o/r', pr, readHead, readChecks, readRequired: required() });
+    for (let pr = 1; pr <= 10; pr += 1) readReviewCiGate({ policy: { startAfter: 'ci-green' }, repo: 'o/r', pr, readHead, readChecks, readRequired: required() });
     const before = calls;
     calls = 0;
-    for (let pr = 1; pr <= 10; pr += 1) readReviewCiGateFactsFirst({ repo: 'o/r', pr, lookup: hit(facts()), liveHead: readHead, readRequired: required() });
+    for (let pr = 1; pr <= 10; pr += 1) readReviewCiGateFactsFirst({ policy: { startAfter: 'ci-green' }, repo: 'o/r', pr, lookup: hit(facts()), liveHead: readHead, readRequired: required() });
     expect({ before, after: calls }).toEqual({ before: 40, after: 10 });
   });
 
   it('gate: stale store (null) falls back to the live gate unchanged', () => {
     const live = vi.fn(() => ({ allowed: false, reason: 'live' }));
-    expect(readReviewCiGateFactsFirst({ repo: 'o/r', pr: 7, lookup: hit(null), live })).toEqual({ allowed: false, reason: 'live' });
+    expect(readReviewCiGateFactsFirst({ policy: { startAfter: 'ci-green' }, repo: 'o/r', pr: 7, lookup: hit(null), live })).toEqual({ allowed: false, reason: 'live' });
     expect(live).toHaveBeenCalledTimes(1);
   });
 
   it('gate: a required check missing from the store (partial) re-reads GitHub, never refuses from the store', () => {
     const live = vi.fn(() => ({ allowed: true, reason: 'live-ok' }));
-    const r = readReviewCiGateFactsFirst({ repo: 'o/r', pr: 7, lookup: hit(facts()), live, liveHead: () => 'abc', readRequired: required(['test', 'legacy-status']) });
+    const r = readReviewCiGateFactsFirst({ policy: { startAfter: 'ci-green' }, repo: 'o/r', pr: 7, lookup: hit(facts()), live, liveHead: () => 'abc', readRequired: required(['test', 'legacy-status']) });
     expect(live).toHaveBeenCalledTimes(1);
     expect(r.reason).toBe('live-ok');
   });
@@ -60,14 +60,14 @@ describe('review facts: facts first', () => {
   it('gate: a completed failure is trusted from the store (no gh)', () => {
     const live = vi.fn();
     const f = facts({ checks: [{ name: 'test', app: 'gha', conclusion: 'failure' }] });
-    const r = readReviewCiGateFactsFirst({ repo: 'o/r', pr: 7, lookup: hit(f), live, liveHead: () => 'abc', readRequired: required() });
+    const r = readReviewCiGateFactsFirst({ policy: { startAfter: 'ci-green' }, repo: 'o/r', pr: 7, lookup: hit(f), live, liveHead: () => 'abc', readRequired: required() });
     expect(r).toMatchObject({ allowed: false, reason: 'required-checks-not-successful', factsSource: 'store' });
     expect(live).not.toHaveBeenCalled();
   });
 
   it('gate: head moved since the store was folded is not a trusted store refusal', () => {
     const live = vi.fn(() => ({ allowed: false, reason: 'live' }));
-    readReviewCiGateFactsFirst({ repo: 'o/r', pr: 7, lookup: hit(facts()), live, liveHead: () => 'zzz', readRequired: required() });
+    readReviewCiGateFactsFirst({ policy: { startAfter: 'ci-green' }, repo: 'o/r', pr: 7, lookup: hit(facts()), live, liveHead: () => 'zzz', readRequired: required() });
     expect(live).toHaveBeenCalledTimes(1);
   });
 

@@ -950,6 +950,15 @@ describe('ci-red-recovery-watch — sweepMissingRunRecovery (PR #2729 fixture: z
   };
   const NOW = Date.parse('2026-09-26T17:23:00Z');
 
+  it('uses the fixer push time instead of an old commit date for the missing-run deadline', () => {
+    const options = { mainRuns: [], readOpenPrs: () => [PR_2729], readRequiredContexts: () => ['test'],
+      readHeadCommittedAt: () => '2026-09-26T14:20:26Z', readComments: () => [], now: NOW,
+      readPush: () => ({ pushedAt: new Date(NOW - 9 * 60_000).toISOString() }) };
+    expect(sweepMissingRunRecovery(options).dispatch).toEqual([]);
+    expect(sweepMissingRunRecovery({ ...options, now: NOW + 60_000 }).dispatch)
+      .toEqual([expect.objectContaining({ prNumber: 2729, kind: 'trigger-ci' })]);
+  });
+
   it('RED before the fix existed: sweepHungCiRecovery (the pre-existing pass) sees nothing to do for #2729 — buildHungCandidates skips a PR with zero CI-workflow rollup entries', () => {
     const result = sweepHungCiRecovery({ readOpenPrs: () => [PR_2729], readComments: () => [], now: NOW });
     expect(result.dispatch).toEqual([]);

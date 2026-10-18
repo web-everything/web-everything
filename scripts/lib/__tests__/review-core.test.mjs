@@ -9,7 +9,9 @@
  *   Also proves #2438's plan-handshake primitives (slice A of epic #2410): the proposer/critic mandate
  *   builders and the round-cap outcome derivation (continue / agreed / escalate) that runs BEFORE any diff.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { createHash } from 'node:crypto';
+import * as reviewCore from '../review-core.mjs';
 import {
   VERDICTS,
   DEFAULT_MANDATE,
@@ -579,6 +581,54 @@ describe('MANDATE_LENSES / MANDATORY_LENSES / ADVISORY_LENSES / PANEL_LENSES (#2
   });
 });
 
+const INTERNAL_DELIVERY_STANZA = "Current release level: internal delivery (single operator, no outside users). Hardening against outside attackers (forged identity, ingress size or rate limits, provenance, tamper detection, races between operators) is DEBT, filed as a card, and NOT a blocking finding. Exceptions that still block: a secret actually exposed, a guard weakened or fail-open, irreversible data loss, delivery instability. Per the review-stringency decision (platform-decisions.md#review-stringency-classified-outcomes); superseded when slice 2's settings table lands.";
+
+describe('review.currentLevel interim mandates', () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it('renders the exact internal-delivery stanza in security and correctness by default', () => {
+    vi.stubEnv('WE_REVIEW_CURRENT_LEVEL', undefined);
+    for (const lens of ['security', 'correctness']) {
+      expect(buildPanelMandate({ lens })).toContain(INTERNAL_DELIVERY_STANZA);
+      expect(expectationForLens(lens)).toBe(`${LENS_EXPECTATIONS[lens]} ${INTERNAL_DELIVERY_STANZA}`);
+    }
+    expect(buildPanelMandate({ lens: 'simplicity' })).not.toContain(INTERNAL_DELIVERY_STANZA);
+  });
+
+  it('public-preview omits the stanza and preserves both original mandates byte for byte', () => {
+    vi.stubEnv('WE_REVIEW_CURRENT_LEVEL', 'public-preview');
+    const originalHashes = {
+      security: '0ac63f1577617fa0370090c396d257fbb24e25e86b1d862369cdacd2a5729a9a',
+      correctness: '402e28a43189148deb9b1d7ae76f960e7cc30b6c0a97d3e169a908b0a25765d8',
+    };
+    for (const [lens, hash] of Object.entries(originalHashes)) {
+      const mandate = buildPanelMandate({ lens });
+      expect(mandate).not.toContain(INTERNAL_DELIVERY_STANZA);
+      expect(createHash('sha256').update(mandate).digest('hex')).toBe(hash);
+      expect(expectationForLens(lens)).toBe(LENS_EXPECTATIONS[lens]);
+    }
+  });
+
+  it('resolves the default, declared setting, platform and env with source logging', () => {
+    const read = () => ({ review: { currentLevel: 'public-preview' } });
+    const log = vi.fn();
+    const defaults = reviewCore.readReviewLevel({ read: () => ({}), platform: {}, env: { WE_POLICY_CASCADE_LOG: '1' }, log });
+    expect(defaults.value.currentLevel).toBe('internal-delivery');
+    expect(defaults.sources.currentLevel).toBe('standard');
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('currentLevel="internal-delivery" (standard)'));
+    const tool = reviewCore.readReviewLevel({ read, platform: {}, env: { WE_POLICY_CASCADE_LOG: '1' }, log });
+    expect(tool.value.currentLevel).toBe('public-preview');
+    expect(tool.sources.currentLevel).toBe('tool');
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('currentLevel="public-preview" (tool)'));
+    expect(buildPanelMandate({ lens: 'security', reviewLevel: tool })).not.toContain(INTERNAL_DELIVERY_STANZA);
+    const platform = reviewCore.readReviewLevel({ read: () => ({}), platform: { currentLevel: 'public-preview' }, env: {} });
+    expect(platform.sources.currentLevel).toBe('platform');
+    const env = reviewCore.readReviewLevel({ read, platform: {}, env: { WE_REVIEW_CURRENT_LEVEL: 'internal-delivery' } });
+    expect(env.sources.currentLevel).toBe('env');
+    expect(env.value.currentLevel).toBe('internal-delivery');
+  });
+});
+
 describe('buildPanelMandate (#2310)', () => {
   it('renders the lens into the base buildMandate text', () => {
     const text = buildPanelMandate({ lens: MANDATE_LENSES.SECURITY });
@@ -731,9 +781,10 @@ describe('buildPanelMandate (#2310)', () => {
       `the full panel: ${PANEL_LENSES.join(', ')})`,
     );
 
-    it('adds the mutation probe and NOTHING else when `aim` is omitted', () => {
+    it('adds the mutation probe and tests-first guarantee mapping when `aim` is omitted', () => {
       expect(buildPanelMandate({ lens: MANDATE_LENSES.CORRECTNESS }))
-        .toBe(`${withCurrentPanel(FIXTURE)} ${MUTATION_PROBE_RULE}`);
+        .toBe(`${withCurrentPanel(FIXTURE).replace('Work from the diff text alone',
+          "each stated guarantee in the card's Acceptance has a named test; list any guarantee without one as a finding Work from the diff text alone")} ${MUTATION_PROBE_RULE} ${INTERNAL_DELIVERY_STANZA}`);
     });
 
     // WHY THIS TEST WAS REWRITTEN (#3035 r2). The version that shipped here asserted
@@ -1769,7 +1820,8 @@ describe('LENS_EXPECTATIONS / expectationForLens — the pre-registered bar per 
     for (const lens of [...PANEL_LENSES, ...Object.values(PERSPECTIVE_LENSES)]) {
       expect(typeof LENS_EXPECTATIONS[lens]).toBe('string');
       expect(LENS_EXPECTATIONS[lens].length).toBeGreaterThan(0);
-      expect(expectationForLens(lens)).toBe(LENS_EXPECTATIONS[lens]);
+      expect(expectationForLens(lens)).toBe(['security', 'correctness'].includes(lens)
+        ? `${LENS_EXPECTATIONS[lens]} ${INTERNAL_DELIVERY_STANZA}` : LENS_EXPECTATIONS[lens]);
     }
   });
   it('falls back to a neutral bar for an unregistered lens (never an empty string)', () => {
@@ -1856,7 +1908,8 @@ describe('buildJuryCharter — the provisional prepare-time jury (#2638)', () =>
     const lenses = charter.jurors.map((j) => j.lens);
     expect(lenses).toEqual([...PANEL_LENSES]);
     for (const juror of charter.jurors) {
-      expect(juror.expectation).toBe(LENS_EXPECTATIONS[juror.lens]);
+      expect(juror.expectation).toBe(['security', 'correctness'].includes(juror.lens)
+        ? `${LENS_EXPECTATIONS[juror.lens]} ${INTERNAL_DELIVERY_STANZA}` : LENS_EXPECTATIONS[juror.lens]);
       expect(juror.charter).toBeUndefined(); // surfaced under the item's own `expectation` vocabulary
       expect(juror.id).toBe(`${juror.lens}#1`);
     }
