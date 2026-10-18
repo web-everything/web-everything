@@ -23,7 +23,7 @@ const policyOf = (strategy) => ({ policy: resolveMergeDeliveryPolicy({ tool: str
 
 const DRAIN = 'drain-bot';
 
-function harness({ strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = { ...process.env, WE_RED_TEAM_TIMING: 'post-accept' }, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, baseTip = () => BASE_TIP } = {}) {
+function harness({ strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = { ...process.env, WE_RED_TEAM_TIMING: 'post-accept' }, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, readReviewAgents = () => [], baseTip = () => BASE_TIP } = {}) {
   const calls = [];
   const logs = [];
   let stored = initial;
@@ -66,7 +66,7 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
   const readFile = () => { if (stored == null) { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; } return JSON.stringify(stored); };
   const writeState = (_p, s) => { stored = JSON.parse(JSON.stringify(s)); };
   const s = createDrainMergeStrategy({
-    dryRun, env, readRedTeamEvidence: () => { if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }, requestRedTeam, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
+    dryRun, env, readReviewAgents, readRedTeamEvidence: () => { if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }, requestRedTeam, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
     cancelObsoleteRuns: () => {}, batching: { gate: () => ({ admit: true }), observe: () => ({}) },
     postConflictFinding, ...(now ? { now } : {}), resolved: policyOf(strategy), log: { write: (l) => logs.push(l) }, readFile, writeState, ...(withLock ? { withLock } : {}),
   });
@@ -1182,5 +1182,67 @@ describe('drain pre-stage queue admission', () => {
     if (variant === 'unreadable') expect(() => s.enqueue(c, HEAD, { prepared, comments: prepared.comments })).toThrow('evidence unreadable');
     else expect(s.enqueue(c, HEAD, { prepared, comments: prepared.comments })).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
     expect(calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+  });
+});
+
+
+describe('orphaned accepted panel-seat recovery', () => {
+  const panel = { verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: HEAD }, netChangedFiles: ['scripts/x.mjs'] } } };
+  const evidence = { scheduled: true, recorded: false, attempted: false, inFlight: false, loopPayload: panel };
+  function setup(extra = {}) {
+    const requests = [];
+    let clock = 1000;
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'],
+      env: { WE_RED_TEAM_TIMING: 'panel-seat', WE_DRAIN_RED_TEAM_REQUEST_COOLDOWN_MIN: '2' }, evidence,
+      requestRedTeam: input => { requests.push(input); return { requested: false }; }, now: () => clock, ...extra });
+    return { ...h, requests, advance: ms => { clock += ms; } };
+  }
+  it('requests an unseated accepted head promptly, retries on cooldown, and holds until a usable result', () => {
+    const h = setup();
+    expect(h.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(h.requests).toHaveLength(1);
+    h.advance(60_000);
+    h.s.enqueue({ num: 5485 }, HEAD);
+    expect(h.requests).toHaveLength(1);
+    h.advance(60_000);
+    h.s.enqueue({ num: 5485 }, HEAD);
+    expect(h.requests).toHaveLength(2);
+    expect(h.logs.join('')).toContain('requesting red team for #5485');
+    expect(h.logs.join('')).not.toContain('red team never scheduled');
+    expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
+  });
+  it.each([
+    { evidence: { ...evidence, inFlight: true } }, { evidence: { ...evidence, queued: true } },
+    { evidence: { ...evidence, attempted: true } }, { evidence: { ...evidence, recorded: true } },
+    { readReviewAgents: () => [{ name: 'review-pr-5485-we', state: 'working', repo: LOCAL, pr: 5485, kind: 'review-job' }] },
+    { readReviewAgents: () => { throw Error('unreadable jobs'); } },
+    { labels: ['ready-to-merge'] },
+    { evidence: { ...evidence, loopPayload: { ...panel, verdict: { verdict: 'needs-human' } } } },
+    { readReviewAgents: () => [{ name: 'review-5485', state: 'queued' }] },
+    { evidence: { ...evidence, scheduled: false }, readReviewAgents: () => [{ name: 'review-5485', state: 'queued' }] },
+    { evidence: { ...evidence, loopPayload: { ...panel, findings: { read: { netBasis: { rev: 'c'.repeat(40) } } } } } },
+    { readReviewAgents: () => Object.defineProperty([], 'incomplete', { value: [{ session: 'review-5485' }] }) },
+    { requestRedTeam: undefined },
+    { evidence: { ...evidence, loopPayload: { ...panel, findings: { read: { netBasis: { rev: HEAD }, netChangedFiles: ['backlog/123-card.md'] } } } } },
+    { env: { WE_RED_TEAM_TIMING: 'panel-seat', WE_REVIEW_RED_TEAM: 'off' } },
+    { env: { WE_RED_TEAM_TIMING: 'panel-seat', WE_REVIEW_EXTRA_SEATS: 'off' } },
+  ])('does not request when work, exemption, or refusal prevents recovery (%j)', extra => {
+    const h = setup(extra);
+    h.s.enqueue({ num: 5485 }, HEAD);
+    h.advance(60 * 60_000);
+    h.s.enqueue({ num: 5485 }, HEAD);
+    expect(h.requests).toHaveLength(0);
+  });
+  it('records a successful request once, keeps holding, then admits a usable head result', () => {
+    const requests = [];
+    const thread = [];
+    const h = setup({ liveComments: thread, requestRedTeam: input => { requests.push(input); return { requested: true }; } });
+    expect(h.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, redTeamRequested: true });
+    h.advance(60 * 60_000);
+    expect(h.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false });
+    expect(requests).toHaveLength(1);
+    expect(h.logs.join('')).toContain('requested red team for #5485');
+    thread.push({ user: { login: 'web-everything[bot]' }, body: `<!-- we:red-team-advisory pr=5485 rev=${HEAD} -->\n### Post-accept red team — no break found` });
+    expect(h.s.enqueue({ num: 5485 }, HEAD, { comments: thread })).toMatchObject({ enqueued: true });
   });
 });

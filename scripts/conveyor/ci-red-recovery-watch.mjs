@@ -1334,14 +1334,15 @@ export function sweepMissingRunRecovery({
 
   const applied = [];
   // The targeted path has its OWN per-(repo, PR, head, check) durable budget,
-  // independent of legacy empty-push refusals and ruleset-only PR caps.
+  // independent of legacy empty-push refusals and ruleset-only PR caps. The helper
+  // reads the pinned workflow: absent jobs go to the conflict/base owner, not a rerun.
   for (const c of rerequestCandidates) {
     const date = readPush({ repo: repoSlug(repo), pr: c.prNumber, head: c.headSha })?.pushedAt
       ?? readHeadCommittedAt(c.headSha, { repo });
     const overdue = planMissingRunRecoveries({ candidates: [{ ...c, headCommittedAt: date }], now, thresholdMs });
     plan.refusals.push(...overdue.refusals);
     if (!overdue.dispatch.length) continue;
-    const d = { ...c, kind: 'rerequest-missing-check', why: `required check ${c.check} is absent on the stale live head` };
+    const d = { ...c, kind: 'recover-missing-check', why: `required check ${c.check} is absent on the stale live head` };
     if (apply) {
       const result = rerequest(d, { repo: repoSlug(repo), now, policy: rerequestPolicy });
       applied.push({ ...d, labelCleared: false, ...result });
@@ -1349,7 +1350,7 @@ export function sweepMissingRunRecovery({
     plan.dispatch.push(d);
   }
   if (apply) {
-    for (const d of plan.dispatch.filter(d => d.kind !== 'rerequest-missing-check')) {
+    for (const d of plan.dispatch.filter(d => d.kind !== 'recover-missing-check')) {
       // 2026-10-10 live (#4759…#4797): a stacked PR gets no run because its merge commit's ci.yml predates the
       // `lane/**` trigger — an empty push cannot fix that; restacking the chain onto main can.
       const stacked = d.baseRefName && d.baseRefName !== defaultBranch;

@@ -411,6 +411,30 @@ export function defaultAttemptUnownedConflictRebase({ pr, cwd = REPO_ROOT, run }
   return rebaseDropManifest({ laneRef: pr?.headRefName, base: 'origin/main', cwd, ...(run ? { run } : {}) });
 }
 
+/** Missing jobs on an old head belong to this rebase owner even when GitHub says MERGEABLE.
+ * Card/decision diffs use the same resolver as conflicts; code goes to the existing fix bounce.
+ * The caller pins the live head and reserves a durable per-head attempt before invoking this owner.
+ */
+export function attemptMissingCheckBaseRepair(d, { repo, pr, cwd = REPO_ROOT,
+  listPrFiles = defaultListPrFiles, attemptCardRebase = defaultAttemptCardConflictRebase,
+  postFinding = defaultPostConflictFinding,
+} = {}) {
+  const defer = reason => ({ ok: false, deferred: true, reason });
+  try {
+    const files = listPrFiles({ number: pr.number, repo });
+    if (!Array.isArray(files) || !files.length) return defer('unknown-files');
+    const paths = files.map(f => typeof f === 'string' ? f : f.path);
+    if (paths.some(p => typeof p !== 'string' || !p)) return defer('unknown-files');
+    if (isCardOnlyDiff(paths)) {
+      const result = attemptCardRebase({ pr, repo, cwd });
+      return { ...result, ok: result?.action === 'rebased', deferred: result?.action !== 'rebased',
+        owner: 'card-conflict-resolver' };
+    }
+    postFinding({ pr, repo, baseRepair: { check: d.check, workflow: d.workflow, headSha: d.headSha } });
+    return { ok: true, owner: 'fixer' };
+  } catch { return defer('base-repair-owner-unavailable'); }
+}
+
 /** Same trusted fast-forward plumbing, with a fresh main and a private index for the card path. */
 export function defaultAttemptCardConflictRebase({ pr, repo, cwd = REPO_ROOT, run = gitRun, cardConflictSettings } = {}) {
   if (!pr?.headRefName || (pr.baseRefName && pr.baseRefName !== 'main')) return { action: 'skip', reason: 'not a main-base PR' };

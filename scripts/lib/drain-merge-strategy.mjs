@@ -1,4 +1,8 @@
-import { redTeamPanelSeatOwed } from './review-red-team-policy.mjs';
+import { listAgentsWithReviewJobs } from '../operations/review-job-store.mjs';
+import { mintSessionSlug } from '../conveyor/session-slug.mjs';
+import { repoKeyForSlug } from './constellation-repos.mjs';
+import { readRedTeamProbes } from './red-team-gate.mjs';
+import { redTeamPanelSeatOwed, redTeamOwedOnHead, redTeamOwedFor } from './review-red-team-policy.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 /**
@@ -255,7 +259,7 @@ export function createDrainMergeStrategy({
   readFile = readFileSync, writeState = writeQueueState, withLock = (fn) => ({ ran: true, result: fn() }),
   postConflictFinding = defaultPostConflictFinding, now = () => Date.now(),
   cancelObsoleteRuns = cancelObsoleteQueueRuns, batching,
-  env = process.env, queueSafety, labelProvider, readRedTeamEvidence = readDrainRedTeamEvidence, requestRedTeam = null,
+  env = process.env, queueSafety, labelProvider, readRedTeamEvidence = readDrainRedTeamEvidence, requestRedTeam = null, readReviewAgents = listAgentsWithReviewJobs,
   cwd = process.cwd(), // a clone of the local repo: enqueuePr reads the judged commit's change list from it
 } = {}) {
   const { policy, note } = resolved;
@@ -397,7 +401,26 @@ export function createDrainMergeStrategy({
         const sameHead = pending?.headSha === headSha;
         // No scheduler artifact exists on this head. Ask the ordinary review dispatcher promptly;
         // preserve card-only exemptions and the scheduler kill switches.
-        const neverScheduled = evidence.scheduled === false && !evidence.recorded && !evidence.attempted
+        const panelSeat = redTeamPanelSeatOwed(evidence.loopPayload, env);
+        let orphanedPanelSeat = false;
+        if (panelSeat && redTeamOwedFor(evidence.loopPayload) && redTeamEnabled(env) && !evidence.recorded && !evidence.attempted
+          && !evidence.inFlight && !evidence.queued && !evidence.untrustedSavedResult
+          && evidence.loopPayload?.findings?.read?.netBasis?.rev?.toLowerCase() === headSha.toLowerCase()
+          && live.labels.some(l => (typeof l === 'string' ? l : l.name) === 'review:accepted')
+          && redTeamOwedOnHead({ read: evidence.loopPayload?.findings?.read,
+            evidence: { ...evidence, scheduled: true }, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly })) {
+          // Owed is policy, not a queue entry. An older accepted head has no job left to seat it.
+          // Unknown job discovery stays held; the consumer repeats the ordinary dispatch guards.
+          try {
+            const repoKey = repoKeyForSlug(slugOf(c.repo));
+            const name = repoKey && mintSessionSlug({ kind: 'review', id: c.num, repo: repoKey });
+            const agents = readReviewAgents();
+            orphanedPanelSeat = !!name && Array.isArray(agents) && !agents.incomplete?.length
+              && !agents.some(a => !['stopped', 'completed', 'failed'].includes(a.state)
+                && (a.name === name || (Number(a.pr) === c.num && a.repo?.toLowerCase() === slugOf(c.repo).toLowerCase())));
+          } catch { /* cannot prove no review work will seat this head */ }
+        }
+        const neverScheduled = (panelSeat ? orphanedPanelSeat : evidence.scheduled === false) && !evidence.recorded && !evidence.attempted
           && !evidence.inFlight && !evidence.queued && redTeamEnabled(env)
           && live.labels.some(l => (typeof l === 'string' ? l : l.name) === 'review:accepted')
           && postAcceptRedTeamOwed(evidence.loopPayload, env, { scheduled: true, skipCardOnly: evidence.skipCardOnly })
@@ -437,7 +460,7 @@ export function createDrainMergeStrategy({
           const outcome = pendingOutcome(c, wait);
           // Never waive a recorded break or an active/recorded run. Only the scheduling gap has this escape: a run that
           // errored or left no usable result stays held until a usable result exists.
-          if (evidence.untrustedSavedResult || redTeamPanelSeatOwed(evidence.loopPayload, env) || (!neverScheduled && !outcome.healthSmell) || evidence.inFlight || evidence.queued || reason.includes('requiring send-back')
+          if (evidence.untrustedSavedResult || (panelSeat && !neverScheduled) || (!neverScheduled && !outcome.healthSmell) || evidence.inFlight || evidence.queued || reason.includes('requiring send-back')
             || reason.includes('saved red-team re-check incomplete')) return outcome;
           let requested = false;
           if (wait.requestedAt != null) return outcome;

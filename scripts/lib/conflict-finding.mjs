@@ -9,7 +9,15 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveChildTimeoutMs } from './bounded-child.mjs';
 
-export function buildConflictFindingBody(pr, { appendOnlyStatute = false, reviewHumanFixable = false, resync = false, sameLineConflict = false, enqueueRefusal = null } = {}) {
+export function buildConflictFindingBody(pr, { appendOnlyStatute = false, reviewHumanFixable = false, resync = false, sameLineConflict = false, enqueueRefusal = null, baseRepair = null } = {}) {
+  if (baseRepair) return [
+    `PR #${pr?.num ?? pr?.number ?? '?'} needs a base fix: required check \`${baseRepair.check}\` is absent, ` +
+      `and \`.github/workflows/${baseRepair.workflow}\` at head \`${baseRepair.headSha}\` has no job producing it.`,
+    '',
+    '**Resolve the base drift.** Merge current `origin/main` into this branch, resolving any conflicts, ' +
+      'and push a fast-forward update. Use no force push and make no unrelated edits. ' +
+      'A rerun cannot add the missing job. Leave review labels to the normal independent review flow.',
+  ].join('\n');
   const ref = pr?.headRefName ? ` (\`${pr.headRefName}\`)` : '';
   // #3383-append-only-statute — an EXPLICIT, narrower instruction for the one case this file's classifier proves
   // mechanical: both sides only ADDED a new `### ` section at the same spot in a statute doc. Stated as its own
@@ -78,9 +86,9 @@ export function buildConflictFindingBody(pr, { appendOnlyStatute = false, review
   ].join('\n');
 }
 
-export function defaultPostConflictFinding({ pr, repo, exec = execFileSync, appendOnlyStatute = false, reviewHumanFixable = false, resync = false, sameLineConflict = false, enqueueRefusal = null }) {
+export function defaultPostConflictFinding({ pr, repo, exec = execFileSync, appendOnlyStatute = false, reviewHumanFixable = false, resync = false, sameLineConflict = false, enqueueRefusal = null, baseRepair = null }) {
   const bodyPath = join(tmpdir(), `reconcile-finding-conflict-${pr?.number}-${randomUUID()}.md`);
-  writeFileSync(bodyPath, buildConflictFindingBody({ num: pr?.number, headRefName: pr?.headRefName }, { appendOnlyStatute, reviewHumanFixable, resync, sameLineConflict, enqueueRefusal }), 'utf8');
+  writeFileSync(bodyPath, buildConflictFindingBody({ num: pr?.number, headRefName: pr?.headRefName }, { appendOnlyStatute, reviewHumanFixable, resync, sameLineConflict, enqueueRefusal, baseRepair }), 'utf8');
   try {
     const argv = [
       join(dirname(fileURLToPath(import.meta.url)), '..', 'conveyor', 'reconcile-finding.mjs'), String(pr?.number),

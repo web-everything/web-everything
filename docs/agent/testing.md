@@ -23,7 +23,16 @@ the cap. Missing thread evidence or a failed reservation prevents submission.
 Settings live in `scripts/settings/missing-run-rerequest.json`, with env overrides
 and source logging through `policy-cascade`; defaults are on, 15 minutes, 2 attempts.
 
-This helper deliberately uses no dispatch: `missing-run-push.mjs` retains its
+Before requesting a rerun, the helper reads `.github/workflows/<workflow>` at the
+exact examined head SHA. A proven absent job goes to
+`parked-pr-conflict-watch.mjs#attemptMissingCheckBaseRepair`: card/decision-only
+PRs use the existing card resolver and its no-checkout fast-forward plumbing;
+code PRs receive a base-fix finding through the ordinary fix bounce. This route
+reserves a trusted `missing-check-base-repair` PR comment before invoking the
+owner and uses the same configured cooldown and per-head cap, independently of
+old rerun attempts. Unknown YAML/job names, files, or owner outcomes defer.
+
+The rerun branch deliberately uses no workflow dispatch: `missing-run-push.mjs` retains its
 #3209 synchronize-only rule. A rerun repeats that head's existing workflow definition;
 it cannot introduce a missing job into an old definition. Reaching the cap requires
 workflow/base repair rather than repeatedly nudging a recovery-marked tip. The
@@ -2092,3 +2101,22 @@ Keep nested author windows bounded: 100 PRs × 100 commits × 100 authors exceed
 GitHub's node ceiling before a query runs. Overflow must use the original reader,
 never truncate evidence. The focused regression is `scripts/lib/__tests__/drain-pr-state.test.mjs`;
 run it through heavy admission.
+
+### Drain recovery across review timing and clone selection
+
+A panel seat being owed is policy evidence, not proof of queued work. For an already
+accepted pinned head with no red-team attempt/result, the drain may request the ordinary
+review dispatcher only after proving no review job is active or queued. Unknown job
+reads keep the hold. Card-only producer settings and both seat kill switches still
+apply; request failures use `redTeamRequestCooldownMin`, and a successful request never
+substitutes for a usable result. The existing review-daemon consumer pins the request
+head and retains its dispatch refusals.
+
+Do not assume the drain's DATA clone is fresh: on 2026-10-18 the log selected
+`lane-1 (no-overlays)` while that checkout was 367 commits behind and its sibling CODE
+clone was current. The operator CLI fallback refuses when cwd resolves to that same
+stale checkout. Acceptance restamps select `DRAIN_DAEMON_WE_CODE_CLONE` (default:
+`code` beside `DRAIN_DAEMON_WE_CLONE`) when present, preserve the target repository cwd,
+and still run the CLI's freshness refusal. Regression homes are
+`drain-merge-strategy.test.mjs`, `merge-ai-prs-restamp-local-repo.test.mjs`, and the
+existing review-daemon request and operator-fallback suites.
