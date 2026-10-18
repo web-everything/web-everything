@@ -875,6 +875,7 @@ function runReviewArc({
  */
 export function dispatchReviewJob({
   ciGate = readReviewCiGate, advisoryCiWaiver = null,
+  beforeSpawn = () => true,
   pr, repo, preferLane = null, root = REPO_ROOT, env = process.env, now = Date.now(), checkStaleness,
   dir = reviewJobsDir(env, root),
   spawnJob = defaultSpawnJob,
@@ -915,6 +916,7 @@ export function dispatchReviewJob({
   // job mints its own per round.
   delete childEnv[ACTOR_ENV];
   mkdirSync(dir, { recursive: true });
+  if (!beforeSpawn(ci)) return { ...base, jobPid: null, skipped: 'same-head-hold' };
   const jobPid = spawnJob({
     argv: [THIS_FILE, 'run', `--pr=${planned.pr}`, `--repo=${planned.repo}`,
       ...(Number.isInteger(preferLane) && preferLane > 0 ? [`--prefer-lane=${preferLane}`] : [])], cwd: root, env: childEnv, logPath,
