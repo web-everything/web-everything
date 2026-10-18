@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { planLedgerObservation, observeLedgerHead, observeLedgerPrEvent, observeLiveLedgerHead, proveLedgerCarry,
-  resolveLedgerObservationSettings, readObservationLedger, observeDrainLedgerHeads } from '../ledger-observation.mjs';
+  resolveLedgerObservationSettings, readObservationLedger, observeDrainLedgerHeads, ghBudget } from '../ledger-observation.mjs';
 import { appendGitRowsSync, appendLedgerRows } from '../verdict-ledger-io.mjs';
 import { appendVerdict, buildVerdictRecord, buildLedgerEvent, foldVerdictLedger, ledgerObservationApplies, validateVerdictRecord } from '../verdict-ledger.mjs';
 import { derivePrState } from '../pr-state.mjs';
@@ -284,9 +284,11 @@ describe('open-head ledger observations', () => {
       expect(logs.join('\n')).toContain('(time budget ledger.drainObserveBudgetMs=10000)');
     });
     it('slow git leg: a failing, slow dual-store git append stops at the pass deadline and skips the rest with a logged miss', () => {
-      let gitCalls = 0, pushes = 0, sleeps = 0, clockRef;
+      let pushes = 0, sleeps = 0, clockRef;
+      const calls = [];
       // Each git command takes 4s and every push is rejected: without the deadline, 5 attempts x ~6 commands each.
-      const slowRun = args => { gitCalls += 1; clockRef.tick(4_000); if (args[0] === 'push') { pushes += 1; throw Error('! [rejected] slow remote'); }
+      const slowRun = (args, opts) => { calls.push({ cmd: args[0], at: clockRef.clock(), timeout: opts?.timeout }); clockRef.tick(4_000);
+        if (args[0] === 'push') { pushes += 1; throw Error('! [rejected] slow remote'); }
         return args[0] === 'diff' ? 'verdict-ledger/x.jsonl' : ''; };
       const gitLeg = (row, opts) => appendGitRowsSync([row], { board: '/board', repo, ...opts }, { appendRows: args => appendLedgerRows({ ...args,
         run: slowRun, sleep: () => { sleeps += 1; }, clock: clockRef.clock, mkdir: () => {}, write: () => {}, rm: () => {}, read: () => null, now: () => 1 }) });
@@ -296,14 +298,28 @@ describe('open-head ledger observations', () => {
       const started = now;
       const out = observeDrainLedgerHeads(targets(4), { read: () => [], settings: capped(20, 15_000), clock: clockRef.clock, log: s => logs.push(s),
         readPr: (r, pr) => ({ state: 'OPEN', headRefOid: sha(pr), labels: [] }), append });
-      // One attempt for PR 1 crossed the 15s budget: no retry, no sleep, and PRs 2–4 never start a write.
-      expect(pushes).toBe(1);
+      // PR 1's git leg is bounded by the 15s budget: every command carries the time left as its timeout, no network
+      // command starts past it, there is no retry or sleep, and PRs 2–4 never start a write.
+      const deadline = started + 15_000;
+      expect(calls.length).toBeGreaterThan(1);
+      for (const c of calls) expect(c.timeout).toBe(Math.max(deadline - c.at, 2_000));
+      expect(calls.filter(c => ['fetch', 'push', 'ls-remote'].includes(c.cmd) && c.at >= deadline)).toEqual([]);
+      expect(pushes).toBeLessThanOrEqual(1);
       expect(sleeps).toBe(0);
-      expect(now - started).toBe(4_000 * gitCalls);
       expect(out).toMatchObject({ observed: 1, missed: [{ pr: 1 }], capped: [{ pr: 2 }, { pr: 3 }, { pr: 4 }] });
-      expect(logs.join('\n')).toMatch(/ledger-write-miss: observation example\/repo#1: .*deadline passed before attempt 2/);
+      expect(logs.join('\n')).toMatch(/ledger-write-miss: observation example\/repo#1: .*deadline passed before/);
       expect(logs.join('\n')).toContain('drain observation skipped 3 PR(s) this pass (time budget ledger.drainObserveBudgetMs=15000)');
       expect(logs.join('\n')).toContain(`drain observation failed for 1 PR(s): ${repo}#1`);
+    });
+    it('the live gh read stays inside its budget: the throttle wait and the child split it, and a rate-limited read is not retried', () => {
+      expect(ghBudget(10_000)).toEqual({ timeout: 5_000, throttle: { acquireTimeoutMs: 5_000, maxAttempts: 1 } });
+      expect(ghBudget(1)).toEqual({ timeout: 1, throttle: { acquireTimeoutMs: 1, maxAttempts: 1 } });
+      const logs = [];
+      // Already past the deadline: the read never starts.
+      const readPr = vi.fn();
+      expect(observeLedgerPrEvent({ repo }, 1, { readPr, deadline: 5, clock: () => 5, log: s => logs.push(s) })).toEqual({ ok: false });
+      expect(readPr).not.toHaveBeenCalled();
+      expect(logs.join('\n')).toContain('observation budget spent before the live read');
     });
     it('a throwing observer or unreadable snapshot never throws out of the pass', () => {
       const logs = [];

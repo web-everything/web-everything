@@ -39,13 +39,25 @@ export const verdictHead = row => (row?.coverage ? row.coverage.headSha : row?.h
 /** The verdict rows the fold applied, for every PR in `events` (complete streams: a filtered one can forget a superseded head). */
 export const appliedVerdictRows = events => new Set([...new Set((events ?? []).map(e => e?.pr))].flatMap(pr => appliedVerdictHistory(events, pr)));
 
+/** Every head SHA a row names (its verdict head, a transition's from-head, an event's head). */
+const rowHeads = e => [verdictHead(e), e?.fromHead, e?.headSha].filter(isSha);
+
 /**
  * @param {object[]} events One PR's ledger events in append order.
- * @param {{applied?: Set<object>}} [options] `applied`: {@link appliedVerdictRows} of the COMPLETE stream when
- *   `events` is a filtered view of it; defaults to the rows applied within `events` itself.
+ * @param {{applied?: Set<object>, history?: object[], liveHead?: string|null}} [options]
+ *   `applied`: {@link appliedVerdictRows} of the COMPLETE stream when `events` is a filtered view of it; defaults to
+ *   the rows applied within `events` itself. `history`: that complete stream (default `events`). A clear resolves a
+ *   finding only at a head no row named before the referral: an older head is not a fix, even when the move away from
+ *   it was never recorded. `liveHead`: when given, a resolving head must be the live head or lead to it through
+ *   recorded transitions; a late accept of a head that is not the PR's code holds the finding as it was.
  * @returns {Map<string,{key:string,state:'open'|'ruled'|'blocking'|'resolved-by-fix'|'retired',head:string|null,ruling:string|null,resolvedAtHead:string|null}>}
  */
-export function deriveReferrals(events, { applied = appliedVerdictRows(events) } = {}) {
+export function deriveReferrals(events, { applied = appliedVerdictRows(events), history = events, liveHead = null } = {}) {
+  const position = new Map((history ?? []).map((e, i) => [e, i]));
+  const sightings = (history ?? []).flatMap((e, i) => rowHeads(e).map(h => [i, h]));
+  const referralRow = new Map(); // key → the referral row that last (re)opened it
+  const resolvedFrom = new Map(); // key → { state before a fix resolved it, every head that qualified as the fix }
+  const seenBefore = (head, row) => { const at = position.get(row) ?? -1; return sightings.some(([i, h]) => i < at && sameHead(h, head)); };
   const keys = new Map();
   // A public referral can be ruled on while review-pr is parked before its final ledger step.
   // Retain the latest valid ruling until the FIRST referral supplies the finding's head. Do not
@@ -61,6 +73,8 @@ export function deriveReferrals(events, { applied = appliedVerdictRows(events) }
         earlyRulings.delete(key);
         keys.set(key, { key, state: early?.state ?? 'open', head: e.headSha,
           ruling: early?.ruling ?? null, resolvedAtHead: null });
+        referralRow.set(key, e);
+        resolvedFrom.delete(key);
       }
     } else if (e.type === EVENT_TYPES.RULING) {
       // Only a ruling that names the key exactly as the referral does (the hashed form) closes it. A legacy ruling row
@@ -74,16 +88,40 @@ export function deriveReferrals(events, { applied = appliedVerdictRows(events) }
       const retire = ruled === 'ruled' && e.source === 'review-pr' && e.actor?.channel === REFERRAL_RETIRED_CHANNEL;
       const state = retire ? 'retired' : ruled;
       if (retire && k?.state !== 'open') continue;
-      if (k && state) keys.set(e.findingKey, { ...k, state, ruling: e.ruling });
+      if (k && state) { keys.set(e.findingKey, { ...k, state, ruling: e.ruling }); resolvedFrom.delete(e.findingKey); }
       else if (state) earlyRulings.set(e.findingKey, { state, ruling: e.ruling });
     } else if ((e.type === EVENT_TYPES.VERDICT || e.type === undefined) && verdictClears(e.verdict) && applied.has(e)) {
       const head = verdictHead(e);
       for (const [key, k] of keys) {
-        if ((k.state === 'open' || k.state === 'blocking') && isSha(head) && isSha(k.head) && !sameHead(head, k.head)) keys.set(key, { ...k, state: 'resolved-by-fix', resolvedAtHead: head });
+        if (!(isSha(head) && isSha(k.head) && !sameHead(head, k.head) && !seenBefore(head, referralRow.get(key)))) continue;
+        if (k.state === 'open' || k.state === 'blocking') {
+          resolvedFrom.set(key, { state: k.state, heads: [head] });
+          keys.set(key, { ...k, state: 'resolved-by-fix', resolvedAtHead: head });
+        } else if (k.state === 'resolved-by-fix') resolvedFrom.get(key)?.heads.push(head);
       }
     }
   }
+  if (isSha(liveHead)) {
+    for (const [key, { state, heads }] of resolvedFrom) {
+      const k = keys.get(key);
+      if (k?.state !== 'resolved-by-fix') continue;
+      const fix = heads.find(h => leadsTo(history ?? [], h, liveHead));
+      keys.set(key, fix ? { ...k, resolvedAtHead: fix } : { ...k, state, resolvedAtHead: null });
+    }
+  }
   return keys;
+}
+
+/** `from` is `to`, or recorded transitions (head-moved / carried rows) lead from it to `to`. */
+function leadsTo(history, from, to) {
+  const seen = [];
+  for (let cur = from; isSha(cur) && !seen.some(h => sameHead(h, cur)); ) {
+    if (sameHead(cur, to)) return true;
+    seen.push(cur);
+    cur = verdictHead(history.find(e => ['head-moved', 'carried'].includes(e?.verdict) && sameHead(e.fromHead, cur)
+      && !seen.some(h => sameHead(h, verdictHead(e)))));
+  }
+  return false;
 }
 
 const keysIn = (referrals, state) => [...referrals.values()].filter(k => k.state === state).map(k => k.key);

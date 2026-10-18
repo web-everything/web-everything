@@ -314,6 +314,24 @@ describe('ledger head lifecycle red-team regressions', () => {
       expectHeld([verdict('accepted'), verdict('carried', next, { fromHead: head, carryRule: 'tree-identical', source: 'head-observer' }),
         ...findings(), verdict('accepted', head)], next);
     });
+    it('variant: the move to B was never recorded; a late accept of A (seen before the referral) is not a fix', () => {
+      const events = [verdict('accepted'), ...findings(), verdict('accepted', head)];
+      expectHeld(events, next);
+      // Nor can it open the way for a carry or restamp over the blocked finding.
+      expect(ledgerObservationApplies(verdict('carried', next, { fromHead: head, carryRule: 'tree-identical', source: 'head-observer' }), events)).toBe(false);
+      expect(ledgerObservationApplies(verdict('restamped', next), events)).toBe(false);
+    });
+    it('variant: a late accept of a never-witnessed middle head is not the live code, so it fixes nothing', () => {
+      const middle = 'e'.repeat(40);
+      const events = [verdict('accepted'), ...findings(), verdict('accepted', middle)];
+      const state = derivePrState(events, facts(next));
+      expect(state.clears).toBe(false);
+      expect(state.holds.map(h => h.code)).toContain('referral-blocked');
+      expect(ledgerView(events, facts(next)).referrals.get(key)).toMatchObject({ state: 'blocking', resolvedAtHead: null });
+      // A real fix at a new head that the live head is carried from still counts.
+      const carried = [...events, verdict('accepted', third), verdict('carried', 'f'.repeat(40), { fromHead: third, carryRule: 'tree-identical', source: 'head-observer' })];
+      expect(ledgerView(carried, facts('f'.repeat(40))).referrals.get(key)).toMatchObject({ state: 'resolved-by-fix', resolvedAtHead: third });
+    });
     it('variant: a chain A→B→C with late accepts of both superseded heads', () => {
       const key3 = [event('referral', { headSha: third, findingKeys: [key] }), event('ruling', { findingKey: key, ruling: 'block' })];
       const events = [verdict('accepted'), verdict('head-moved', next, { fromHead: head, source: 'head-observer' }),

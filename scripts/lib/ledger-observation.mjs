@@ -95,9 +95,17 @@ export function observeLedgerHead(facts, { read = readObservationLedger, append 
   } catch (e) { log(`ledger-write-miss: observation ${facts.repo}#${facts.pr}: ${e.message}`); return { ok: false, rows: [], error: e.message }; }
 }
 
+/** Split a remaining budget between the gh throttle's wait and the child, so the whole read stays inside it. */
+export const ghBudget = ms => {
+  const wait = Math.max(1, Math.floor(ms / 2));
+  return { timeout: Math.max(1, ms - wait), throttle: { acquireTimeoutMs: wait, maxAttempts: 1 } };
+};
+
 /** Feed records can arrive late. Re-read the live PR before observing; never rewind to an event's old SHA. */
 export function observeLedgerPrEvent(event, pr, { readPr = (repo, number, { timeout } = {}) => JSON.parse(String(execFileSyncThrottled('gh',
-  ['pr', 'view', String(number), '--repo', repo, '--json', 'state,headRefOid,labels'], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, ...(timeout ? { timeout } : {}) }))),
+  // With a budget, the throttle's slot/points wait is bounded by it and a rate-limited read is not retried: one try, then a logged miss.
+  ['pr', 'view', String(number), '--repo', repo, '--json', 'state,headRefOid,labels'], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024,
+    ...(timeout ? ghBudget(timeout) : {}) }))),
   observe = observeLedgerHead, log = s => process.stderr.write(`${s}\n`), deadline = null, clock = Date.now } = {}) {
   try {
     // A deadline also bounds the live read; never start one past it.
@@ -129,6 +137,13 @@ export function ledgerHeadUnchanged({ repo, pr, listedHeadSha = null }, read) {
   } catch { return false; /* the live read decides, and logs its own miss */ }
 }
 
+/** One drain-pass ledger budget: `ledger.drainObserveMaxPerPass` writes within `ledger.drainObserveBudgetMs` (sources logged). */
+export function drainLedgerBudget({ settings = resolveLedgerObservationSettings(), clock = Date.now, log = s => process.stderr.write(`${s}\n`) } = {}) {
+  logLedgerObservationSettings(settings, log);
+  const { drainObserveMaxPerPass: max = 20, drainObserveBudgetMs: budget = 15_000 } = settings.value;
+  return { max, budget, deadline: clock() + budget };
+}
+
 /**
  * The drain pass's observations, capped per pass by `ledger.drainObserveMaxPerPass` live reads and
  * `ledger.drainObserveBudgetMs` of wall time (each logged with its source). The budget is also the deadline of
@@ -142,9 +157,7 @@ export function observeDrainLedgerHeads(targets, { read, settings = resolveLedge
     observe: facts => observeLedgerHead(facts, { read, settings, deadline, clock, log, ...(append ? { append } : {}) }) }) } = {}) {
   const out = { observed: 0, unchanged: 0, missed: [], capped: [] };
   try {
-    logLedgerObservationSettings(settings, log);
-    const { drainObserveMaxPerPass: max = 20, drainObserveBudgetMs: budget = 15_000 } = settings.value;
-    const deadline = clock() + budget;
+    const { max, budget, deadline } = drainLedgerBudget({ settings, clock, log });
     let reason = null;
     for (const target of targets) {
       if (ledgerHeadUnchanged(target, read)) { out.unchanged += 1; continue; }

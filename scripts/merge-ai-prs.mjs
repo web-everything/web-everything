@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { observeDrainLedgerHeads } from './lib/ledger-observation.mjs';
+import { drainLedgerBudget, observeDrainLedgerHeads } from './lib/ledger-observation.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
@@ -3168,7 +3168,7 @@ export function drainHoldReasonCode(reason) {
  * @param {{repo: string, pr: number|string, reason: string, read?: Function, append?: Function}} o
  * @returns {{ok: boolean, appended: boolean, errors: string[]}}
  */
-export function recordDrainHold({ repo, pr, reason, read, append = appendVerdict } = {}) {
+export function recordDrainHold({ repo, pr, reason, read, append = appendVerdict, deadline = null, clock = Date.now } = {}) {
   try {
     const reasonCode = drainHoldReasonCode(reason);
     const readHome = (r) => { try { return parseLedgerEvents(readFileSync(verdictLedgerPath(r), 'utf8')); } catch { return []; } };
@@ -3180,10 +3180,13 @@ export function recordDrainHold({ repo, pr, reason, read, append = appendVerdict
     try { events = (read ?? readHome)(repo); } catch { events = []; }
     const prior = events.filter((e) => (e.type === EVENT_TYPES.HOLD || e.type === EVENT_TYPES.RELEASE) && e.holdSource === 'drain' && Number(e.pr) === Number(pr));
     if (prior.length && prior[prior.length - 1].type === EVENT_TYPES.HOLD && prior[prior.length - 1].reasonCode === reasonCode) return { ok: true, appended: false, errors: [] };
-    const written = append(buildLedgerEvent({
+    // A pass budget bounds the write: none starts past it (a logged miss the next pass retries), and the git leg stops at it.
+    if (deadline != null && clock() >= deadline) return { ok: false, appended: false, errors: ['ledger-write-miss: the pass ledger budget was spent; the next pass retries the hold'] };
+    const row = buildLedgerEvent({
       type: EVENT_TYPES.HOLD, repo, pr, at: new Date().toISOString(), source: 'merge-ai-prs',
       declaredActor: 'drain', reasonCode, holdSource: 'drain',
-    }));
+    });
+    const written = deadline != null ? append(row, { deadline }) : append(row);
     if (written.ok && written.ledgerWriteMiss) return { ok: false, appended: false, errors: ['ledger-write-miss: the hold missed the shared store; the next pass retries it'] };
     return written.ok ? { ok: true, appended: true, errors: [] } : { ok: false, appended: false, errors: written.errors };
   } catch (e) {
@@ -6275,11 +6278,18 @@ async function runCli() {
     // Capped per pass (count + time budget, `ledger.drainObserve*`): a slow or failing observation is a logged miss, never a stalled pass.
     observeDrainLedgerHeads(verdicts.map((v) => ({ repo: v.repo || localSlug, pr: v.num, listedHeadSha: v.listedHeadSha || v.headSha })),
       { read: readDrainLedger });
+    // The drain-hold writes get the same per-pass cap (their own budget): a slow or failing store never stalls the pass.
+    const holdBudget = drainLedgerBudget();
+    const holdCapped = [];
+    let holdWrites = 0;
     for (const v of skipped) {
       if (!v.reason || !(v.certifyLabel || v.aiGenerated)) continue;
-      const held = recordDrainHold({ repo: v.repo || localSlug, pr: v.num, reason: v.reason, read: readDrainLedger });
+      if (holdWrites >= holdBudget.max) { holdCapped.push(`${repoTag(v.repo)}${v.num}`); continue; }
+      const held = recordDrainHold({ repo: v.repo || localSlug, pr: v.num, reason: v.reason, read: readDrainLedger, deadline: holdBudget.deadline });
+      if (held.appended || !held.ok) holdWrites += 1; // a deduped hold costs no write
       if (!held.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger drain-hold append (E3 #3929, non-fatal) — ${held.errors.join('; ')}\n`);
     }
+    if (holdCapped.length) process.stderr.write(`ledger-write-miss: drain-hold skipped ${holdCapped.length} PR(s) this pass (count cap ledger.drainObserveMaxPerPass=${holdBudget.max}): ${holdCapped.join(', ')}; retried next pass\n`);
     for (const v of skipped) {
       // red-main-hold: a transient, pass-level hold recorded in the skip-reasons line + the drain-hold ledger; no PR
       // comment (one `gh pr view` per held PR per pass would burn the shared API budget for the whole red window).

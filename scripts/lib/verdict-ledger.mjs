@@ -804,7 +804,7 @@ export function eventsSinceHeadMove(events, folded) {
 /** A finding still awaiting a ruling, or ruled `block` and not yet fixed, read through the pr-state view's boundary.
  *  A carry or restamp re-witnesses the same content, so it is never the fix such a finding waits for. */
 export function ledgerReferralsOutstanding(events) {
-  const referrals = deriveReferrals(eventsSinceHeadMove(events, foldVerdictLedger(events).get(events.at(-1)?.pr)), { applied: appliedVerdictRows(events) });
+  const referrals = deriveReferrals(eventsSinceHeadMove(events, foldVerdictLedger(events).get(events.at(-1)?.pr)), { applied: appliedVerdictRows(events), history: events });
   return openReferralKeys(referrals).length > 0 || blockedReferralKeys(referrals).length > 0;
 }
 

@@ -66,7 +66,7 @@ export function ledgerView(events, facts) {
     && lastExempt.headSha.toLowerCase() === facts.head.sha.toLowerCase();
   clears = clears || reviewExempt;
   // Only a clear the fold applied over the complete stream can be a fix: a delayed old-head accept never counts.
-  return { events: mine, history, folded, clears, reviewExempt, referrals: deriveReferrals(mine, { applied: appliedVerdictRows(history) }) };
+  return { events: mine, history, folded, clears, reviewExempt, referrals: deriveReferrals(mine, { applied: appliedVerdictRows(history), history, liveHead: facts?.head?.sha ?? null }) };
 }
 
 /** Map a core phase plus the hold picture to a lifecycle state. The core's phase is kept except for two restrictions. */

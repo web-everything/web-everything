@@ -96,12 +96,22 @@ describe('appendLedgerRows: bounded retry, loud on exhaustion', () => {
     const run = (args) => { now += 1_000; if (args[0] === 'push') { pushes += 1; throw new Error('! [rejected] slow'); } return args[0] === 'diff' ? 'verdict-ledger/x.jsonl' : ''; };
     const err = (() => { try { appendLedgerRows(base({ run, clock: () => now, deadline: 1, sleep: () => { sleeps += 1; } })); } catch (e) { return e; } })();
     expect(err).toBeInstanceOf(LedgerAppendExhaustedError);
-    expect([err.attempts, pushes, sleeps]).toEqual([1, 1, 0]);
+    // The attempt's local steps ran with the short floor; its push would start past the deadline, so it never runs.
+    expect([err.attempts, pushes, sleeps]).toEqual([1, 0, 0]);
+    expect(err.errors[0].message).toContain('deadline passed before git');
     expect(err.message).toContain('deadline passed before attempt 2');
     // Already past it: nothing runs at all.
     let calls = 0;
     expect(() => appendLedgerRows(base({ run: () => { calls += 1; return ''; }, clock: () => 5, deadline: 5 }))).toThrow(/deadline passed before attempt 1/);
     expect(calls).toBe(0);
+    // Every git command inside one attempt carries the remaining time as its timeout; no network command starts past it.
+    const seen = [];
+    let t = 0;
+    const timed = (args, opts) => { seen.push({ cmd: args[0], timeout: opts?.timeout, at: t }); t += 3_000; if (args[0] === 'push') throw new Error('! [rejected] hung'); return args[0] === 'diff' ? 'verdict-ledger/x.jsonl' : ''; };
+    expect(() => appendLedgerRows(base({ run: timed, clock: () => t, deadline: 7_000 }))).toThrow(LedgerAppendExhaustedError);
+    expect(seen.length).toBeGreaterThan(1);
+    for (const c of seen) expect(c.timeout).toBe(Math.max(7_000 - c.at, 2_000));
+    expect(seen.filter(c => ['fetch', 'push', 'ls-remote'].includes(c.cmd) && c.at >= 7_000)).toEqual([]);
     // Without a deadline the bounded retries are unchanged.
     expect(appendLedgerRows(base({ run: failing(2).run, clock: () => 99, deadline: null }))).toMatchObject({ attempts: 3 });
   });

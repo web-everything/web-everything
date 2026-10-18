@@ -78,6 +78,13 @@ export function formatLedgerReadSettings(s) {
   return `verdict-ledger-io: read cap verdictLedger.readMaxBytes=${s.maxBytes} (${s.sources?.maxBytes ?? 'standard'})${tail}`;
 }
 
+const NETWORK_GIT = new Set(['fetch', 'push', 'ls-remote']);
+const LOCAL_GIT_FLOOR_MS = 2_000;
+/** The transport's own default runner, restated so a deadline can wrap it (same options as git-transport-branch). */
+function defaultTransportGit(args, opts) {
+  return execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+}
+
 function defaultExec(args, opts = {}) {
   return execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024, ...opts });
 }
@@ -180,6 +187,16 @@ export function appendLedgerRows({
   const { lines, ids } = check;
   const path = ledgerGitPath(repo);
   const errors = [];
+  // A deadline bounds every git command, not only the attempts: each gets the remaining time as its timeout, and a
+  // network command (fetch, push, ls-remote) never starts past it. Local cleanup keeps a short floor so it can finish.
+  if (deadline != null) {
+    const run = seams.run ?? defaultTransportGit;
+    seams = { ...seams, run: (args, opts = {}) => {
+      const left = deadline - clock();
+      if (left <= 0 && NETWORK_GIT.has(args[0])) throw new Error(`deadline passed before git ${args[0]}`);
+      return run(args, { ...opts, timeout: Math.min(opts.timeout ?? Infinity, Math.max(left, LOCAL_GIT_FLOOR_MS)) });
+    } };
+  }
   let attempt = 1;
   for (; attempt <= attempts; attempt += 1) {
     if (deadline != null && clock() >= deadline) { errors.push(new Error(`deadline passed before attempt ${attempt}`)); break; }

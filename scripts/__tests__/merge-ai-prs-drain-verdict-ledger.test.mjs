@@ -159,6 +159,11 @@ describe('merge-ai-prs — #3215 wiring: the park site writes the ledger BEFORE 
     expect(observation).toContain('observeDrainLedgerHeads(verdicts.map((v) => ({ repo: v.repo || localSlug, pr: v.num, listedHeadSha: v.listedHeadSha || v.headSha }))');
     expect(observation).toContain('{ read: readDrainLedger }');
     expect(observation).not.toMatch(/observeLedgerHead\(|observeLiveLedgerHead\(/);
+    // The drain-hold loop right after it shares the cap: its own pass budget, a count cap, and the deadline per write.
+    const holds = src.slice(start, src.indexOf("postDrainReasonComment(v.repo, v.num, 'skip'", start));
+    expect(holds).toContain('const holdBudget = drainLedgerBudget();');
+    expect(holds).toContain('if (holdWrites >= holdBudget.max)');
+    expect(holds).toContain('deadline: holdBudget.deadline');
   });
 
   it('recordDrainVerdict is called at the ordinary park site plus (E3 #3929) the manifest-tamper and test-gaming re-parks', () => {
@@ -241,6 +246,20 @@ describe('E3 #3929 — re-park rows, producer rows and drain-hold events', () =>
     expect(recordDrainHold({ repo: 'o/n', pr: 701, reason: 'merge conflict with main' }).appended).toBe(true);
   });
 
+  it('drain-hold: a pass deadline bounds the write (no append past it, the deadline reaches the git leg), dedup still free', () => {
+    const calls = [];
+    const append = (row, opts) => { calls.push(opts); return { ok: true }; };
+    expect(recordDrainHold({ repo: 'o/n', pr: 710, reason: 'blocked', append, deadline: 50, clock: () => 10 })).toMatchObject({ ok: true, appended: true });
+    expect(calls).toEqual([{ deadline: 50 }]);
+    const late = recordDrainHold({ repo: 'o/n', pr: 711, reason: 'blocked', append, deadline: 50, clock: () => 50 });
+    expect(late).toMatchObject({ ok: false, appended: false });
+    expect(late.errors[0]).toContain('ledger-write-miss');
+    expect(calls).toHaveLength(1);
+    // An already-recorded hold dedups before the budget is consulted: no false miss.
+    recordDrainHold({ repo: 'o/n', pr: 712, reason: 'blocked' });
+    expect(recordDrainHold({ repo: 'o/n', pr: 712, reason: 'blocked', append, deadline: 1, clock: () => 9 })).toMatchObject({ ok: true, appended: false });
+  });
+
   it('drain-hold never touches the verdict fold, and never throws on a failing append', () => {
     recordDrainHold({ repo: 'o/n', pr: 702, reason: 'blocked' });
     expect(foldRepo('o/n').get(702)).toBeUndefined();
@@ -271,7 +290,7 @@ describe('E3 #3929 — re-park rows, producer rows and drain-hold events', () =>
   it('wiring: drain-hold runs only on a live (non-dry-run) pass, for drain-owned skips, before the skip stamping', () => {
     const dry = src.indexOf('E3 (#3929, plan R8) — a held/skipped PR');
     expect(dry).toBeGreaterThan(src.lastIndexOf('if (!DRY_RUN) {', dry) - 1);
-    expect(src.slice(dry, dry + 900)).toContain('v.certifyLabel || v.aiGenerated');
+    expect(src.slice(dry, dry + 1500)).toContain('v.certifyLabel || v.aiGenerated');
     expect(src.indexOf('recordDrainHold({ repo:', dry)).toBeLessThan(src.indexOf("postDrainReasonComment(v.repo, v.num, 'skip'", dry));
   });
 });
