@@ -1,20 +1,21 @@
 ---
+bornAs: x8e08sy
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5694-prevention-add-a-check-standards-rule-that-every-assertmainn.md"]
-dateOpened: "2026-10-14"
+scope: ["we:scripts/operations/needs-you-feed.mjs", "we:scripts/operations/__tests__/needs-you-feed.test.mjs"]
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Add a deterministic gate-wiring test that simulates parser-loading failure and asserts that enfor… (from web-everything/web-everything#5320 review)
+# Prevention — Add a unit test or lint that fails when any queue-derived free-text field is interpolated into th… (from web-everything/web-everything#5374 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/5694-prevention-add-a-check-standards-rule-that-every-assertmainn.md` — Add a deterministic gate-wiring test that simulates parser-loading failure and asserts that enforcement cannot silently succeed.
+1. `we:scripts/operations/needs-you-feed.mjs:127` — Add a unit test or lint that fails when any queue-derived free-text field is interpolated into the human feed line without JSON quoting or an untrusted label. Alternatively, emit only the JSON event and a fixed prefix.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5320@dafdc0fa96e123191353ee9f6e478c563cf47ced
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5374@080940bf6d55457228c3b0547ab3bb24da05062d
 
 ## Acceptance
 

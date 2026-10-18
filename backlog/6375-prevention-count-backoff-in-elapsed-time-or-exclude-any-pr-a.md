@@ -1,21 +1,24 @@
 ---
+bornAs: xcmm1za
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/reconcile-core.mjs", "we:scripts/operations/operator-queue.mjs", "we:scripts/conveyor/__tests__/reconcile-core.test.mjs", "we:scripts/operations/__tests__/operator-queue.test.mjs"]
+scope: ["we:scripts/lib/enqueue-on-event.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/lib/__tests__/enqueue-on-event.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs"]
 dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Add a branch-coverage or mutation gate on we:scripts/conveyor/reconcile-core.mjs so every conjunc… (from web-everything/web-everything#5363 review)
+# Prevention — Count backoff in elapsed time, or exclude any PR attempted this round from the busy check. Add a… (from web-everything/web-everything#5316 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/reconcile-core.mjs:1566` — Add a branch-coverage or mutation gate on `we:scripts/conveyor/reconcile-core.mjs` so every conjunct of a new refusal-bypass condition needs a test that flips it.
-2. `we:scripts/operations/operator-queue.mjs:653` — Add a queue-level test asserting each PR number appears in at most one primary section across a fixture matrix.
+1. `we:scripts/lib/enqueue-on-event.mjs:660` — Count backoff in elapsed time, or exclude any PR attempted this round from the busy check. Add a scheduler test that pairs the busy interval with a PR that is skipped each round.
+2. `we:scripts/merge-ai-prs.mjs:2459` — Add a planner-level test matrix over RECONCILE on/off crossed with numeric and hash blockers. Have the production proof builder also look up numeric ids on main.
+3. `we:scripts/lib/enqueue-on-event.mjs:455` — Add a lint or standards rule that flags string accumulation from a child stream (`+= d` on a `child.stderr` or `child.stdout` data handler) without a cap. Alternatively, add a test that pushes several MB of stderr through `runChild` and asserts the retained buffer stays under a bound.
+4. `we:scripts/lib/enqueue-on-event.mjs:652` — Add a deterministic deferred-read regression test and check stopped immediately before spawning for both event and catch-up work.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5363@5d2a48c15fea1f61b13018e297a713a385c8c94e
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5316@5c4219a70694993bdd0983713dce9e087bae6ffe
 
 ## Acceptance
 

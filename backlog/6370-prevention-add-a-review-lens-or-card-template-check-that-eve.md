@@ -1,4 +1,5 @@
 ---
+bornAs: x80sbu4
 kind: story
 size: 3
 parent: "4075"
