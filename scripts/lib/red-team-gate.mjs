@@ -29,6 +29,7 @@ import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 
 import { parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
 import { parseLatestHumanClearedSha } from './review-escalation.mjs';
+import { scrubPublish } from './secret-scrub.mjs';
 
 // ── The comment the producer writes ─────────────────────────────────────────────────────────────────────────────
 
@@ -253,13 +254,33 @@ export function redTeamQueueReason(pr, setting = CONFIRMED_BREAKS_DEFAULTS) {
 }
 
 
-/** Confirmed send-back findings parked at the round cap on the live head, awaiting an operator ruling. PURE. */
-export function redTeamRulingNeeded(pr, setting = CONFIRMED_BREAKS_DEFAULTS) {
-  const disposition = readRedTeamDisposition({ comments: pr?.comments, pr: pr?.number, head: pr?.headRefOid, setting });
-  if (!disposition.held.length) return null;
+/**
+ * Saved (never-posted) findings publish only if every raw field, the extra composed outputs, and their NFKC forms pass
+ * the secret scrub; otherwise ALL their text is withheld, keeping index, confirmation and class. PURE.
+ */
+export const WITHHELD_FINDING_SUMMARY = '[finding text withheld: failed the secret scrub]';
+export function withholdUnpublishableFindings(findings, composed = []) {
+  const texts = [findings.flatMap(f => Object.values(f)).join('\n'), ...composed].map(String);
+  if (!texts.some(t => scrubPublish(t).length || scrubPublish(t.normalize('NFKC')).length)) return findings;
+  return findings.map(f => ({ index: f.index, confirmed: f.confirmed, impact: breakClass(f), category: 'withheld',
+    file: null, line: null, summary: WITHHELD_FINDING_SUMMARY }));
+}
+
+/**
+ * Confirmed send-back findings parked at the round cap on the live head, awaiting an operator ruling. PURE apart from
+ * `readSaved`: when the thread holds no live-head result, the gate may have decided on saved evidence (its comment was
+ * withheld), so the caller's lazy saved-result reader is asked, exactly as the gate and the drain hold ask it.
+ */
+export function redTeamRulingNeeded(pr, setting = CONFIRMED_BREAKS_DEFAULTS, { readSaved = null } = {}) {
   const labels = (pr?.labels ?? []).map(l => typeof l === 'string' ? l : l?.name);
   if (labels.includes('review:changes')) return null;
-  return { head: disposition.result.rev, since: disposition.since, findings: disposition.held.map(({ index, file, line, summary, category, impact }) => ({ index, file, line, summary, category, impact })) };
+  const read = savedResult => readRedTeamDisposition({ comments: pr?.comments, pr: pr?.number, head: pr?.headRefOid, setting, savedResult });
+  let disposition = read(null);
+  const savedResult = !disposition.result && readSaved ? readSaved() : null;
+  if (savedResult) disposition = read(savedResult);
+  if (!disposition.held.length) return null;
+  const held = savedResult ? withholdUnpublishableFindings(disposition.held) : disposition.held;
+  return { head: disposition.result.rev, since: disposition.since, findings: held.map(({ index, file, line, summary, category, impact }) => ({ index, file, line, summary, category, impact })) };
 }
 
 const CARRIED_LINE_RE = /^<!-- review-verdict-carried from=[0-9a-f]{40} to=[0-9a-f]{40} patch-id=[0-9a-f]{40} -->$/;

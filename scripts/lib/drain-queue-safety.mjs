@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
 import { readMergeQueueState } from './merge-queue-enqueue.mjs';
-import { readSavedRedTeamResult } from './drain-saved-red-team.mjs';
+import { savedRedTeamFallback } from './drain-saved-red-team.mjs';
 import { readRedTeamDisposition, readRedTeamProbes } from './red-team-gate.mjs';
 
 export function readDrainQueueSafety({ env = process.env, tool, platform, log = () => {} } = {}) {
@@ -37,7 +37,7 @@ export function redTeamEnqueueHold({ loopPayload, comments, repo, pr, head, env 
   // A recorded break still holds even if the scheduler is now disabled or the payload is unavailable.
   let disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks });
   if (!disposition.result) {
-    const savedResult = readSavedRedTeamResult({ repo, pr, head: String(head ?? '').toLowerCase(), env });
+    const savedResult = savedRedTeamFallback({ repo, pr, head, env })();
     if (savedResult) disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks, savedResult });
   }
   if (disposition.sendBack.length || disposition.held.length)

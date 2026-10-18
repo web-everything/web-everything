@@ -18,6 +18,18 @@ export function readSavedRedTeamSetting({ env = process.env, tool, platform, log
   return r;
 }
 
+// GitHub slugs are case-insensitive: an operator's `--repo=` and the review job's slug name the same repo.
+const sameRepo = (a, b) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
+
+/**
+ * The lazy saved-result fallback every comment-only reader of the gate's decision shares (the drain hold, RULING
+ * NEEDED, `operator-why`, the clear-human ruling): asked only when the thread has no live-head result. Throws on
+ * unreadable evidence; each caller decides how to surface that.
+ */
+export function savedRedTeamFallback({ repo, pr, head, env = process.env } = {}) {
+  return () => readSavedRedTeamResult({ repo, pr, head: String(head ?? '').toLowerCase(), env });
+}
+
 export function readSavedRedTeamResult({ repo, pr, head, env = process.env } = {}) {
   if (!repo || !Number.isSafeInteger(Number(pr)) || Number(pr) <= 0 || !/^[a-f0-9]{40}$/.test(head ?? '')) return null;
   if (!readSavedRedTeamSetting({ env }).value.drainReadsSavedResult) return null;
@@ -33,7 +45,7 @@ export function readSavedRedTeamResult({ repo, pr, head, env = process.env } = {
   const records = readStore({ path, read: () => text, exists: () => true }).records;
   // Same completed-seat selection as speculateRedTeam/resumeRedTeam, additionally bound to the repo.
   const row = records.filter(r => r?.dispatchKind === 'review-seat' && r.seat === 'red-team'
-    && r.repo === repo && r.pr === Number(pr) && r.rev === head && r.status === 'ok').at(-1);
+    && sameRepo(r.repo, repo) && r.pr === Number(pr) && r.rev === head && r.status === 'ok').at(-1);
   if (!row) return null;
   if (!Array.isArray(row.findings) || row.findings.some(f => !f || typeof f.confirmedByRecheck !== 'boolean')
     || (row.confirmedMissCount !== undefined && row.confirmedMissCount !== row.findings.filter(f => f.confirmedByRecheck).length))
@@ -70,6 +82,6 @@ export function skipCardOnlyRedTeam(loopPayload, env = process.env) {
 /** A dispatch attempt is not a result. Only posted evidence or a saved parsed live-head verdict counts. */
 export function recordedRedTeamResult(rows, { repo, pr, head }, result) {
   return result?.comment === 'posted' || rows.some(row => row?.dispatchKind === 'review-seat'
-    && row.seat === 'red-team' && row.repo === repo && Number(row.pr) === Number(pr) && row.rev === head
+    && row.seat === 'red-team' && sameRepo(row.repo, repo) && Number(row.pr) === Number(pr) && row.rev === head
     && row.status === 'ok' && ['accept', 'changes'].includes(row.seatVerdict));
 }

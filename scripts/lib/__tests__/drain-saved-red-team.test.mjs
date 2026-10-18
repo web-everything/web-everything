@@ -276,3 +276,83 @@ describe('card-only red-team obligation', () => {
     expect(hold({ ...env, WE_RED_TEAM_SKIP_CARD_ONLY: 'on' }, { loopPayload: payload(card) })).toMatch(/requiring send-back/);
   });
 });
+
+describe('saved round-cap break: RULING NEEDED and the clear-human ruling (PR #5551 red team)', () => {
+  const setting = { broken: 'send-back', degraded: 'card', unconfirmed: 'advisory' };
+  const broken = { confirmedByRecheck: true, impactIfUnfixed: 'broken', category: 'edge-case',
+    file: 'scripts/example.mjs', line: 3, summary: 'two writers race' };
+  const cleared = at => ({ author: { login: 'web-everything' }, createdAt: at, body: [
+    '✅ review — `review:human` cleared via the sanctioned path', '',
+    'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '',
+    buildReviewedShaMarker(head), buildClearedHumanMarker('operator'),
+  ].join('\n') });
+  async function roundCapped(findings = [broken]) {
+    const { env } = fixture([row({ findings, confirmedMissCount: findings.length, scoredAt: '2026-10-17T10:00:00Z' })]);
+    const { readSavedRedTeamResult } = await import('../drain-saved-red-team.mjs');
+    const comments = [];
+    const result = await applyRedTeamGate({ repo, pr }, {
+      readPr: () => ({ headRefOid: head, comments, labels: ['review:accepted'] }), readHead: () => head,
+      readSavedResult: args => readSavedRedTeamResult({ ...args, env }), readSetting: () => ({ value: setting }),
+      readRound: () => 99, log: () => {},
+      postComment: ({ body }) => comments.push({ author: { login: 'web-everything' }, createdAt: '2026-10-17T10:01:00Z', body }),
+    });
+    expect(result.outcome).toBe('round-cap');
+    const subject = { number: pr, title: 't', headRefOid: head, labels: ['review:accepted'], comments };
+    return { env, comments, subject, readSaved: () => readSavedRedTeamResult({ repo, pr, head, env }) };
+  }
+  it('lists the saved held break as RULING NEEDED and lets clear-human record the not-real ruling', async () => {
+    const { env, comments, subject, readSaved } = await roundCapped();
+    const { redTeamRulingRow } = await import('../../operations/operator-queue.mjs');
+    const { decideSetLabel } = await import('../../review-set-label.mjs');
+    const { redTeamRulingNeeded } = await import('../red-team-gate.mjs');
+    const ruling = redTeamRulingRow(repo, subject, setting, { readSaved });
+    expect(ruling?.findings).toEqual([{ file: 'scripts/example.mjs', line: 3, summary: 'two writers race', reason: 'red-team-round-cap' }]);
+    expect(ruling.commands.notReal).toContain('--to=clear-human');
+    expect(decideSetLabel({ to: 'clear-human', currentLabels: ['review:accepted'], redTeamRulingHold: ruling !== null }))
+      .toMatchObject({ allowed: true });
+    comments.push(cleared('2026-10-17T10:02:00Z'));
+    expect(redTeamRulingNeeded(subject, setting, { readSaved })).toBeNull();
+    expect(hold(env, { comments, confirmedBreaks: setting })).toBeNull();
+  });
+  it('shares one fallback across callers, matching the repo slug case-insensitively', async () => {
+    const { env, subject } = await roundCapped();
+    const { savedRedTeamFallback } = await import('../drain-saved-red-team.mjs');
+    const { redTeamRulingNeeded } = await import('../red-team-gate.mjs');
+    for (const slug of [repo, repo.toLowerCase(), repo.toUpperCase()]) {
+      const readSaved = savedRedTeamFallback({ repo: slug, pr, head: head.toUpperCase(), env });
+      expect(redTeamRulingNeeded(subject, setting, { readSaved })?.findings).toHaveLength(1);
+    }
+    expect(redTeamRulingNeeded(subject, setting, { readSaved: savedRedTeamFallback({ repo: 'other/repo', pr, head, env }) })).toBeNull();
+    // Comment-only callers keep their old behaviour.
+    expect(redTeamRulingNeeded(subject, setting)).toBeNull();
+  });
+  it('keeps the saved hold against an untrusted, early or mistimed clearance, and while the fixer owns it', async () => {
+    const { env, comments, subject, readSaved } = await roundCapped();
+    const { redTeamRulingNeeded } = await import('../red-team-gate.mjs');
+    for (const bad of [{ ...cleared('2026-10-17T10:02:00Z'), author: { login: 'attacker' } }, cleared('2026-10-17T09:00:00Z')]) {
+      const thread = [...comments, bad];
+      expect(redTeamRulingNeeded({ ...subject, comments: thread }, setting, { readSaved })?.findings).toHaveLength(1);
+      expect(hold(env, { comments: thread, confirmedBreaks: setting })).toMatch(/requiring send-back/);
+    }
+    expect(redTeamRulingNeeded({ ...subject, labels: ['review:changes'] }, setting, { readSaved })).toBeNull();
+  });
+  it('withholds saved held finding text that fails the secret scrub from the RULING NEEDED row', async () => {
+    const secret = ['ghp_', 'Ab3dEf4hIj5lMn6pQr7tUv8xYz9bCd0fGh1j'].join('');
+    const wide = [...secret].map(c => String.fromCharCode(c.charCodeAt(0) + 0xfee0)).join('');
+    for (const tainted of [{ summary: secret }, { file: secret }, { failure_scenario: secret }, { summary: wide }]) {
+      const { subject, readSaved } = await roundCapped([{ ...broken, ...tainted }]);
+      const { redTeamRulingRow } = await import('../../operations/operator-queue.mjs');
+      const ruling = redTeamRulingRow(repo, subject, setting, { readSaved });
+      expect(ruling.findings).toEqual([{ file: null, line: null, summary: '[finding text withheld: failed the secret scrub]', reason: 'red-team-round-cap' }]);
+      expect(JSON.stringify(ruling)).not.toContain(secret);
+      expect(JSON.stringify(ruling)).not.toContain(wide);
+    }
+  });
+  it('surfaces unreadable saved evidence to the caller instead of reporting no ruling', async () => {
+    const { subject, env } = await roundCapped();
+    writeFileSync(resolveScorecardStorePath(env), '{truncated');
+    const { savedRedTeamFallback } = await import('../drain-saved-red-team.mjs');
+    const { redTeamRulingNeeded } = await import('../red-team-gate.mjs');
+    expect(() => redTeamRulingNeeded(subject, setting, { readSaved: savedRedTeamFallback({ repo, pr, head, env }) })).toThrow(/malformed/);
+  });
+});

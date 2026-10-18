@@ -53,6 +53,7 @@ import { healthSectionLines } from '../conveyor/health-watch-section.mjs';
 // Card x1b8hlo — the LIGHT red-team gate module (no heavy graph): a confirmed red-team break the setting sends back
 // keeps the PR out of NEEDS YOU while it is unresolved on the live head.
 import { CONFIRMED_BREAKS_DEFAULTS, readConfirmedBreaks, redTeamQueueReason, redTeamRulingNeeded } from '../lib/red-team-gate.mjs';
+import { savedRedTeamFallback } from '../lib/drain-saved-red-team.mjs';
 // Partial CLI copies may lack the verdict reader. Keep their queue runnable, but never excuse a check.
 let humanReviewOnlyHold, parsePrResultTable;
 let mergeGateVerdictImportError;
@@ -123,8 +124,8 @@ export function rulingNeededRow(repo, pr) {
 }
 
 /** A red-team round-cap ruling and its read-only operator command suggestions. PURE. */
-export function redTeamRulingRow(repo, pr, setting = CONFIRMED_BREAKS_DEFAULTS) {
-  const need = redTeamRulingNeeded(pr, setting);
+export function redTeamRulingRow(repo, pr, setting = CONFIRMED_BREAKS_DEFAULTS, { readSaved = null } = {}) {
+  const need = redTeamRulingNeeded(pr, setting, { readSaved });
   if (!need) return null;
   const command = `node scripts/review-set-label.mjs ${pr.number} --repo=${repo}`;
   return {
@@ -734,9 +735,13 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
         readyNumbersThisRepo.add(pr.number);
       }
       for (const pr of prs) {
-        report.rulingNeeded.push(...mergeRulingRows(
-          rulingNeededRow(repo, pr), redTeamRulingRow(repo, pr, redTeamSetting),
-        ));
+        // The gate can hold a break decided on saved evidence (its comment withheld); unreadable evidence is a visible error.
+        let redTeamRow = null;
+        try {
+          redTeamRow = redTeamRulingRow(repo, pr, redTeamSetting,
+            { readSaved: savedRedTeamFallback({ repo, pr: pr.number, head: pr.headRefOid }) });
+        } catch (error) { failedRead(`${repo}#${pr.number} red-team ruling`, error); }
+        report.rulingNeeded.push(...mergeRulingRows(rulingNeededRow(repo, pr), redTeamRow));
       }
       for (const pr of prs) {
         if (readyNumbersThisRepo.has(pr.number)) continue;

@@ -40,9 +40,9 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  GATE_OUTCOMES, breakClass, liveResultGateState, planRedTeamActions, readConfirmedBreaks, redTeamGateMarker, sendBackStepOutcome,
+  GATE_OUTCOMES, liveResultGateState, planRedTeamActions, readConfirmedBreaks, redTeamGateMarker, sendBackStepOutcome,
+  withholdUnpublishableFindings,
 } from '../lib/red-team-gate.mjs';
-import { scrubPublish } from '../lib/secret-scrub.mjs';
 import { cleanFindingFile, qualifyLocusRefs, sanitizeCardField } from '../lib/review-loop-policy.mjs';
 import { IN_REPO_LOCUS } from '../lib/citation-check.mjs';
 import { DEFAULT_ROUND_CAP } from '../lib/jury-core.mjs';
@@ -142,15 +142,11 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
     if (!parsed) return { status: 'no-red-team-on-head', head };
     // Saved evidence may be precisely the result whose comment failed this scrub. Check raw fields
     // before clipping, plus the composed comment/card (including scope) before any publication.
-    if (!posted.result && [
-      parsed.findings.flatMap(f => Object.values(f)).join('\n'),
-      buildSendBackBody({ pr, head, findings: parsed.findings }),
-      ...Object.values(buildRedTeamCardInput({ repo, pr, head, findings: parsed.findings })),
-    ].some(text => scrubPublish(String(text)).length)) {
-      parsed = { ...parsed, findings: parsed.findings.map(f => ({
-        index: f.index, confirmed: f.confirmed, impact: breakClass(f), category: 'withheld',
-        summary: '[finding text withheld: failed the secret scrub]',
-      })) };
+    if (!posted.result) {
+      parsed = { ...parsed, findings: withholdUnpublishableFindings(parsed.findings, [
+        buildSendBackBody({ pr, head, findings: parsed.findings }),
+        ...Object.values(buildRedTeamCardInput({ repo, pr, head, findings: parsed.findings })),
+      ]) };
     }
     const setting = io.readSetting();
     const plan = planRedTeamActions(parsed, setting.value);
