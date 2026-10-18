@@ -1,7 +1,7 @@
 import { signalFixDispatch } from './lib/fix-handoff.mjs';
 import { mandatoryReferralState, readReferralRecords, referralRecordState } from './lib/jury-core.mjs';
 import { referralSeatDisabled } from './operations/review-seat-policy.mjs';
-import { readReviewRunEvidence } from './conveyor/review-referral-hold.mjs';
+import { readReviewRunEvidence, readReviewRunHeads } from './conveyor/review-referral-hold.mjs';
 /**
  * review-set-label.mjs — swap a PR's review label, INVARIANT-2 guarded (#2470, increment 2 of 2). Also the
  * SINGLE HOME of the shared review-label CLI harness (#2644): a PURE `decideSetLabel` decides the swap for a
@@ -2500,7 +2500,10 @@ export function renderReferralCarryRecord(carry) {
 }
 
 export function assertMandatoryReferralsCleared(state, { repo, pr, cardReadable = referralCardReadable,
-  env = process.env, readRuns = readReviewRunEvidence, readNetDiff = readNetDiffAtSha, carry = true } = {}) {
+  env = process.env, readRuns = readReviewRunEvidence,
+  // An injected `readRuns` is its own run store: its runs carry `head` too, so it answers this read as well.
+  readRunHeads = readRuns === readReviewRunEvidence ? readReviewRunHeads : readRuns,
+  readNetDiff = readNetDiffAtSha, carry = true } = {}) {
   const context = referralLiveContext(state, { repo, pr, cardReadable,
     seatDisabled: seat => referralSeatDisabled(seat, env) });
   const result = mandatoryReferralState(state.comments, context);
@@ -2540,18 +2543,21 @@ export function assertMandatoryReferralsCleared(state, { repo, pr, cardReadable 
       // #4708 — a head move that changed nothing (the drain's rebase; strict net diff byte-identical) carries the
       // latest earlier head's completed CLEAN review as this head's evidence. Not a pass: that head's own verdict is
       // re-evaluated live (its records, rulings and persistence check), so a hold standing on it still refuses.
-      const carryRuns = carry ? readRuns() : [];
-      const carried = carry ? referralEvidenceCarry({ runs: carryRuns, repo, pr, head, readNetDiff }) : null;
+      // PR #5520 — `readRuns` holds only runs that finished `advise`. A run that reviewed this head and never finished
+      // (a failed publication effect, a crash) still reviewed it, so no carry may stand in for it.
+      const reviewed = Boolean(last) || readRunHeads().some(mine);
+      const carryRuns = carry && !reviewed ? readRuns() : [];
+      const carried = carry && !reviewed ? referralEvidenceCarry({ runs: carryRuns, repo, pr, head, readNetDiff }) : null;
       if (carried) {
         const verdict = assertMandatoryReferralsCleared({ ...state, headRefOid: carried.fromHead },
-          { repo, pr, cardReadable, env, readRuns, readNetDiff, carry: false });
+          { repo, pr, cardReadable, env, readRuns, readRunHeads, readNetDiff, carry: false });
         return { ...verdict, carry: carried };
       }
-      // Numbering may supply evidence only for a head nobody reviewed. A parked or
-      // pending run shares this message, but must never be overridden by that carry.
+      // Numbering may supply evidence only for a head nobody reviewed. A parked, pending or
+      // unfinished run shares this message, but must never be overridden by that carry.
       throw Object.assign(new Error(`mandatory referral hold: no-current-head-review-evidence; no readable referral record or completed clean review for current head ${head}, and earlier heads still hold ${[...new Set(held)].join(', ')}; review the current head before acceptance`), {
         // A run may have appeared on the carry's fresh read after `last` was read.
-        code: last || carryRuns.some(mine) ? 'MANDATORY_REFERRAL_UNFINISHED_REVIEW_RUN' : 'MANDATORY_REFERRAL_NO_REVIEW_RUN',
+        code: reviewed || carryRuns.some(mine) ? 'MANDATORY_REFERRAL_UNFINISHED_REVIEW_RUN' : 'MANDATORY_REFERRAL_NO_REVIEW_RUN',
       });
     }
   }

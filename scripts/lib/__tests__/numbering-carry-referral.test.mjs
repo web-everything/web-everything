@@ -2,6 +2,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as carry from '../numbering-carry.mjs';
 import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
 import { mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { readReviewRunEvidence, readReviewRunHeads } from '../../conveyor/review-referral-hold.mjs';
+import { newRunRecord } from '../../operations/run-record.mjs';
+import { writeRun } from '../../operations/run-store.mjs';
 
 const repo = 'web-everything/web-everything', pr = 5505;
 const FROM = '7ae496bef00d2096959b5f6d20cfd0394b976898';
@@ -21,7 +27,7 @@ const acceptance = { id: 'accepted-prior', author: { login: 'chalbert' }, create
 const cleanRun = { repo, pr, head: FROM, startedAt: 1, completedAt: 2, pending: [], parked: false, persistenceFailed: false };
 function replay({ held = false, liveHeld = false, runs = [cleanRun], prove = vi.fn(() => ({ ok: true, reason: 'verified numbering' })), setting,
   onRead = () => {}, guardOverride, labelsOnly = false, numberingSetting = on, netPatchSetting = off,
-  human = false, exec, readRuns = () => runs } = {}) {
+  human = false, exec, readRuns = () => runs, readRunHeads } = {}) {
   const state = { state: 'OPEN', body: authorBody, labels: ['review:pending'], headRefOid: TO,
     comments: [record(held ? FROM : OLD), human ? { ...acceptance,
       body: `${acceptance.body}\n<!-- cleared-human: chalbert -->` } : acceptance] };
@@ -32,7 +38,7 @@ function replay({ held = false, liveHeld = false, runs = [cleanRun], prove = vi.
   const guard = vi.fn((s, context) => {
     checked.push(s.headRefOid);
     return assertMandatoryReferralsCleared(s, { ...context, env: {}, cardReadable: () => true,
-      readRuns, readNetDiff: sha => ({ scored: true, text: `diff at ${sha}` }) });
+      readRuns, ...(readRunHeads ? { readRunHeads } : {}), readNetDiff: sha => ({ scored: true, text: `diff at ${sha}` }) });
   });
   const result = carry.restampAfterNumbering({ repo, pr, state, reviews: [], enabled: true, acceptCarry: 'on',
     numberingSetting, netPatchSetting, ...(setting ? { referralEvidenceSetting: setting } : {}), prove, exec,
@@ -114,6 +120,44 @@ describe('numbering carry referral evidence', () => {
     const { result, writes } = replay({ runs, labelsOnly: true, onRead: () => runs.push(liveRun) });
     expect(result.action).toBe('retry');
     expect(writes).toEqual([]);
+  });
+  // PR #5520 red team: a run whose `advise` never finished has no review evidence, but it
+  // did review the live head. The real run store and readers must still see it.
+  describe('persisted live-head run that never finished advise', () => {
+    let dir;
+    afterEach(() => rmSync(dir, { recursive: true, force: true }));
+    const persist = (id, head, verdict, adviseFinished) => writeRun({ ...newRunRecord({ id, op: 'review-pr' }),
+      findings: { read: { repo, pr, netBasis: { rev: head } } }, verdict,
+      stepTimings: [{ step: 'read', stepIndex: 0, startedAt: '2026-10-17T12:00:00Z', finishedAt: '2026-10-17T12:00:30Z', durationMs: 30000 },
+        { step: 'advise', stepIndex: 1, startedAt: '2026-10-17T12:00:30Z',
+          ...(adviseFinished ? { finishedAt: '2026-10-17T12:01:00Z', durationMs: 30000 } : {}) }] }, dir);
+    const live = {
+      'persistence-failed': { verdict: 'needs-human', pendingReferrals: ['referral-persistence-failed'] },
+      'no verdict yet': undefined,
+    };
+    it.each(Object.keys(live).flatMap(kind => [0, 1, 2].map(arriveAt => [kind, arriveAt])))(
+      'refuses a %s live-head run (arrives on read %s)', (kind, arriveAt) => {
+        dir = mkdtempSync(join(tmpdir(), 'numbering-unfinished-'));
+        persist('review-pr-prior', FROM, { verdict: 'accept', pendingReferrals: [] }, true);
+        const arrive = () => persist('review-pr-live', TO, live[kind], false);
+        if (!arriveAt) arrive();
+        let reads = 0;
+        const { result, writes, guard } = replay({ readRuns: () => readReviewRunEvidence({ dir, memo: new Map(), persist: false }),
+          readRunHeads: () => readReviewRunHeads({ dir, memo: new Map(), persist: false }),
+          onRead: () => { if (++reads === arriveAt) arrive(); } });
+        expect(result.action).toBe('retry');
+        expect(writes).toEqual(arriveAt === 2 ? ['comment', 'withdraw'] : []);
+        expect(guard.mock.results.findLast(r => r.type === 'throw').value)
+          .toMatchObject({ code: 'MANDATORY_REFERRAL_UNFINISHED_REVIEW_RUN' });
+      });
+    it('still carries numbering evidence when no run reviewed the live head', () => {
+      dir = mkdtempSync(join(tmpdir(), 'numbering-unfinished-'));
+      persist('review-pr-prior', FROM, { verdict: 'accept', pendingReferrals: [] }, true);
+      const { result, writes } = replay({ readRuns: () => readReviewRunEvidence({ dir, memo: new Map(), persist: false }),
+        readRunHeads: () => readReviewRunHeads({ dir, memo: new Map(), persist: false }) });
+      expect(result.action).toBe('restamped');
+      expect(writes).toEqual(['comment', 'labels']);
+    });
   });
   it('does not treat a matching error message as proof that no live-head review ran', () => {
     const { result, writes } = replay({ guardOverride: state => {

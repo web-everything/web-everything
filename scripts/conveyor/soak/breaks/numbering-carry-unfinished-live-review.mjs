@@ -10,7 +10,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
-const PATHS = ['scripts/lib/numbering-carry.mjs', 'scripts/review-set-label.mjs'];
+const PATHS = ['scripts/lib/numbering-carry.mjs', 'scripts/review-set-label.mjs', 'scripts/conveyor/review-referral-hold.mjs'];
 
 export default {
   id: 'numbering-carry-unfinished-live-review',
@@ -18,13 +18,15 @@ export default {
   card: '6271; PR #5520 review of the #5505 numbering re-stamp',
   fixedBy: { sha: 'HEAD', where: 'lane/numbering-restamp-referral', paths: PATHS },
   fixPresent(root) {
-    return readFileSync(join(root, PATHS[0]), 'utf8').includes("e?.code !== 'MANDATORY_REFERRAL_NO_REVIEW_RUN'");
+    return readFileSync(join(root, PATHS[0]), 'utf8').includes("e?.code !== 'MANDATORY_REFERRAL_NO_REVIEW_RUN'")
+      && readFileSync(join(root, PATHS[1]), 'utf8').includes('readRunHeads().some(mine)');
   },
   async run({ sourceRoot = ROOT, log } = {}) {
     const load = rel => import(pathToFileURL(join(sourceRoot, rel)).href);
     const carry = await load(PATHS[0]);
     const { assertMandatoryReferralsCleared } = await load(PATHS[1]);
-    const { readReviewRunEvidence } = await load('scripts/conveyor/review-referral-hold.mjs');
+    // `readReviewRunHeads` is absent before the PR #5520 red-team fix; the guard then falls back to its default.
+    const { readReviewRunEvidence, readReviewRunHeads } = await load(PATHS[2]);
     const { newRunRecord } = await load('scripts/operations/run-record.mjs');
     const { writeRun } = await load('scripts/operations/run-store.mjs');
     const jury = await load('scripts/lib/jury-core.mjs');
@@ -41,20 +43,24 @@ export default {
       referrals: [{ seat, original, finding: jury.normalizeFinding(original), key: jury.referralFindingKey(seat, original) }] });
     const setting = { value: true, source: 'soak' };
     try {
-      for (const [status, arriveAt] of [['none', 0], ['parked', 0], ['pending', 0], ['parked', 1], ['pending', 2]]) {
+      // `unfinished` (PR #5520 red team): the live run failed to persist its referrals and never finished `advise`,
+      // so the run-evidence projection drops it; it still reviewed the live head.
+      for (const [status, arriveAt] of [['none', 0], ['parked', 0], ['pending', 0], ['parked', 1], ['pending', 2],
+        ['unfinished', 0], ['unfinished', 1], ['unfinished', 2]]) {
         carry._resetNumberingRestampMemo();
         const dir = join(root, `${status}-${arriveAt}`);
         mkdirSync(dir);
         const persistRun = (head, live = false) => {
           const id = live ? 'review-pr-live' : 'review-pr-prior';
+          const unfinished = live && status === 'unfinished';
           writeRun({ ...newRunRecord({ id, op: 'review-pr' }),
             findings: { read: { repo, pr, netBasis: { rev: head } } },
-            verdict: { verdict: live && status === 'parked' ? 'needs-human' : 'accept',
-              pendingReferrals: live ? ['finding'] : [] },
+            verdict: { verdict: live && status !== 'pending' ? 'needs-human' : 'accept',
+              pendingReferrals: unfinished ? ['referral-persistence-failed'] : live ? ['finding'] : [] },
             stepTimings: [
               { step: 'read', stepIndex: 0, startedAt: '2026-10-17T12:00:00Z' },
               { step: 'advise', stepIndex: 1, startedAt: '2026-10-17T12:00:00Z',
-                finishedAt: '2026-10-17T12:01:00Z', durationMs: 60000 },
+                ...(unfinished ? {} : { finishedAt: '2026-10-17T12:01:00Z', durationMs: 60000 }) },
             ] }, dir);
         };
         persistRun(from);
@@ -69,7 +75,9 @@ export default {
           numberingSetting: setting, referralEvidenceSetting: setting, netPatchSetting: { value: false, source: 'soak' },
           prove: () => ({ ok: true, reason: 'numbering-only move already proven' }),
           guardReferrals: (s, context) => assertMandatoryReferralsCleared(s, { ...context, env: {}, cardReadable: () => true,
-            readRuns: () => readReviewRunEvidence({ dir }), readNetDiff: sha => ({ scored: true, text: `diff at ${sha}` }) }),
+            readRuns: () => readReviewRunEvidence({ dir }),
+            ...(readReviewRunHeads ? { readRunHeads: () => readReviewRunHeads({ dir }) } : {}),
+            readNetDiff: sha => ({ scored: true, text: `diff at ${sha}` }) }),
           readLiveState: () => {
             if (++reads === arriveAt) persistRun(to, true);
             return { state, reviews: [] };
