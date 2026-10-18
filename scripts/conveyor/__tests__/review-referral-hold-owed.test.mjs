@@ -64,6 +64,19 @@ beforeEach(() => {
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 describe('same-head hold when the post-accept red-team comment is owed', () => {
+  it.each(['job', 'session'])('plain review-dispatch --pr preserves the operator override at the same-head limit (%s)', mode => {
+    expect(decideSameHeadHold(pr(), [run()], { repo, env: opts.env })).toMatchObject({ kind: 'same-head' });
+    const spawnJob = vi.fn(() => 4242), spawnAgent = vi.fn(() => 'backgrounded · operator · review');
+    const out = reviewDispatchCli.dispatchCliReview(dispatch, {
+      mode, repo, pr: number, env: opts.env, spawnJob, spawnAgent, wrapReview: false,
+      readBrief: () => 'Review {{PR}}', mintSessionId: () => 'operator-override',
+      ensureSessionCwd: p => p, sessionCwdFor: () => join(dir, 'session'),
+      isolateSession: () => ({ worktreeSettings: {} }),
+    }, { readPr: () => pr(), readRuns: () => [run()] });
+    expect(out.skipped).toBeUndefined();
+    expect(mode === 'job' ? spawnJob : spawnAgent).toHaveBeenCalledTimes(1);
+    expect(existsSync(opts.redTeam.stateDir)).toBe(false);
+  });
   it.each(['job', 'session'])('the runner refuses tokenless owed-head CLI reviews on every tick (%s)', async mode => {
     const [p] = enrichPrsWithReferralHolds([pr({ labels: [{ name: 'review:accepted' }],
       headRefName: 'lane/redteam-comment-retry', state: 'OPEN', isDraft: false, mergeStateStatus: 'CLEAN',
