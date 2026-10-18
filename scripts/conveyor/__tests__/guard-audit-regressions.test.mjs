@@ -2,7 +2,6 @@ import { describe, it, expect, vi } from 'vitest';
 import { ciHealOwed } from '../ci-heal-rule.mjs';
 import { readRoundHistoryInputs } from '../fix-round-history.mjs';
 import { resolveNightlyCoronerSettings } from '../nightly-coroner-job.mjs';
-import { rerequestMissingCheck, MISSING_CHECK_BASE_REPAIR_MARKER } from '../missing-run-rerequest.mjs';
 import { defaultAttemptCardConflictRebase } from '../parked-pr-conflict-watch.mjs';
 
 const head = 'a'.repeat(40);
@@ -27,17 +26,7 @@ describe('audit guard regressions', () => {
     expect(readRoundHistoryInputs({ pr: 1, repoSlug: 'o/r', readComments: () => comments,
       exec: () => { throw new Error('offline'); } })?.comments).toEqual(comments);
   });
-  it('shares the targeted rerun and base repair marker cap', () => {
-    const record = { repo: 'o/r', pr: 1, head, check: 'standards', at: 0 };
-    const exec = vi.fn(() => JSON.stringify({ encoding: 'base64', content: Buffer.from('jobs:\n  standards: {}\n').toString('base64') }));
-    const result = rerequestMissingCheck({ prNumber: 1, headSha: head, headRefName: 'lane/example', check: 'standards', workflow: 'ci.yml' }, {
-      repo: 'o/r', exec, readComments: () => [1, 2].map(() => ({ author: { login: 'chalbert' },
-        body: `${MISSING_CHECK_BASE_REPAIR_MARKER}\n${JSON.stringify(record)}` })),
-      policy: { enabled: 'on', maxAttemptsPerHead: 2, cooldownMinutes: 15 },
-    });
-    expect(result).toMatchObject({ deferred: true, reason: 'attempt-cap' });
-  });
-  it('refuses base repair when the fetched branch moved', () => {
+  it('refuses card recovery when the fetched branch moved', () => {
     const run = vi.fn((_cmd, args) => ({ status: 0, stdout: args[0] === 'rev-parse' ? 'b'.repeat(40) : '' }));
     expect(defaultAttemptCardConflictRebase({ pr: { headRefName: 'lane/example', baseRefName: 'main', headRefOid: head }, run }))
       .toMatchObject({ reason: 'branch moved before recovery' });

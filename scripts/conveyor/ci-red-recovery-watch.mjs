@@ -1298,7 +1298,7 @@ export function sweepMissingRunRecovery({
     requiredContexts: requiredContexts ?? null,
     stalledPartialContexts: pr?.baseRefName === defaultBranch ? defaultBasePartialContexts : stalledPartialContexts,
   }));
-  if ((rawCandidates.length || rerequestCandidates.length) && mainRuns === null) {
+  if (rawCandidates.length && mainRuns === null) {
     try { mainRuns = readMainRuns({ repo, branch: defaultBranch, workflowName: DEFAULT_MAIN_WORKFLOW_NAME }); }
     catch { mainRuns = []; }
   }
@@ -1333,34 +1333,23 @@ export function sweepMissingRunRecovery({
   });
 
   const applied = [];
-  // Targeted recovery adds its per-head marker guard to the existing shared attempt caps.
+  // The targeted path has its OWN per-(repo, PR, head, check) durable budget,
+  // independent of legacy empty-push refusals and ruleset-only PR caps.
   for (const c of rerequestCandidates) {
     const date = readPush({ repo: repoSlug(repo), pr: c.prNumber, head: c.headSha })?.pushedAt
       ?? readHeadCommittedAt(c.headSha, { repo });
-    const comments = readComments(c.prNumber, { repo });
-    if (!Array.isArray(comments)) {
-      plan.refusals.push({ ...c, kind: 'unknown-thread', why: 'missing-run recovery requires a complete thread' });
-      continue;
-    }
-    const triggerAttemptsForSha = countMissingRunComments(comments, c.headSha, { baseRefName: c.baseRefName, mainRedWindows, mainGreen, defaultBranch });
-    const attempts = countMissingRunComments(comments, null, { defaultBranch });
-    const overdue = planMissingRunRecoveries({ candidates: [{ ...c, headCommittedAt: date, triggerAttemptsForSha }], now, thresholdMs, maxRetriesPerSha });
-    if (attempts >= maxRetriesPerPr) {
-      plan.refusals.push({ ...c, kind: 'missing-run-pr-cap-exhausted', attempts,
-        why: `PR #${c.prNumber} exhausted its shared missing-run recovery cap (${maxRetriesPerPr})` });
-      continue;
-    }
+    const overdue = planMissingRunRecoveries({ candidates: [{ ...c, headCommittedAt: date }], now, thresholdMs });
     plan.refusals.push(...overdue.refusals);
     if (!overdue.dispatch.length) continue;
-    const d = { ...c, kind: 'recover-missing-check', why: `required check ${c.check} is absent on the stale live head` };
+    const d = { ...c, kind: 'rerequest-missing-check', why: `required check ${c.check} is absent on the stale live head` };
     if (apply) {
-      const result = rerequest(d, { repo: repoSlug(repo), now, policy: rerequestPolicy, maxRetriesPerSha, maxRetriesPerPr });
+      const result = rerequest(d, { repo: repoSlug(repo), now, policy: rerequestPolicy });
       applied.push({ ...d, labelCleared: false, ...result });
     }
     plan.dispatch.push(d);
   }
   if (apply) {
-    for (const d of plan.dispatch.filter(d => d.kind !== 'recover-missing-check')) {
+    for (const d of plan.dispatch.filter(d => d.kind !== 'rerequest-missing-check')) {
       // 2026-10-10 live (#4759…#4797): a stacked PR gets no run because its merge commit's ci.yml predates the
       // `lane/**` trigger — an empty push cannot fix that; restacking the chain onto main can.
       const stacked = d.baseRefName && d.baseRefName !== defaultBranch;

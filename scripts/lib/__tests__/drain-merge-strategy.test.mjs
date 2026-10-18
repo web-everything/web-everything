@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -907,7 +907,7 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
     expect(requests).toHaveLength(1);
   });
-  it('replays #5485: unparseable attempt requests once, holds across restart and deadline, then accepts a usable result', () => {
+  it('replays #5485: unparseable attempt holds without another request across restart and deadline, then accepts a usable result', () => {
     let clock = 1000;
     const requests = [];
     const thread = [];
@@ -918,11 +918,11 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     const first = harness(options);
     expect(first.s.enqueue({ num: 5485 }, HEAD, { comments: thread })).toMatchObject({ enqueued: false });
     clock += 2 * 60_000;
-    expect(first.s.enqueue({ num: 5485 }, HEAD, { comments: thread })).toMatchObject({ enqueued: false, redTeamRequested: true });
+    expect(first.s.enqueue({ num: 5485 }, HEAD, { comments: thread })).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
     const restarted = harness({ ...options, initial: first.state() });
     clock += 60 * 60_000;
     expect(restarted.s.enqueue({ num: 5485 }, HEAD, { comments: thread })).toMatchObject({ enqueued: false });
-    expect(requests).toHaveLength(1);
+    expect(requests).toHaveLength(0);
     expect(restarted.logs.join('')).not.toContain('red team never scheduled');
     expect(first.logs.join('')).toContain('redTeamPendingMaxMin=2, env');
     thread.push({ user: { login: 'web-everything[bot]' }, body: `<!-- we:red-team-advisory pr=5485 rev=${HEAD} -->\n### Post-accept red team — no break found` });
@@ -968,7 +968,7 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     expect(second).toMatchObject({ enqueued: false, kind: 'red-team-pending', healthSmell: true });
     expect(h.logs.join('')).not.toContain('red team never scheduled');
     expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
-    expect(requests).toHaveLength(1);
+    expect(requests).toHaveLength(0);
   });
   it('keeps an errored card-only run held even without a seat row', () => {
     const { first, second, requests } = erroredRunAfterDeadline({
@@ -977,7 +977,7 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     });
     expect(first).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
     expect(second).toMatchObject({ enqueued: false, kind: 'red-team-pending', healthSmell: true });
-    expect(requests).toHaveLength(1);
+    expect(requests).toHaveLength(0);
   });
   it('honors the fallback switch and logs its source', () => {
     let clock = 1000;
@@ -1232,6 +1232,23 @@ describe('orphaned accepted panel-seat recovery', () => {
     h.advance(60 * 60_000);
     h.s.enqueue({ num: 5485 }, HEAD);
     expect(h.requests).toHaveLength(0);
+  });
+  it.each([
+    ['panel-seat', 'recorded'], ['panel-seat', 'attempted'],
+    ['post-accept', 'recorded'], ['post-accept', 'attempted'],
+  ])('%s holds %s evidence without requesting again, until a usable result exists', (timing, field) => {
+    const thread = [];
+    const requestRedTeam = vi.fn(() => ({ requested: true }));
+    const h = setup({ liveComments: thread, requestRedTeam,
+      env: { WE_RED_TEAM_TIMING: timing }, evidence: { ...evidence, [field]: true } });
+    expect(h.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    h.advance(60 * 60_000);
+    expect(h.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending', healthSmell: true });
+    expect(requestRedTeam).not.toHaveBeenCalled();
+    expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
+    thread.push({ user: { login: 'web-everything[bot]' }, body: `<!-- we:red-team-advisory pr=5485 rev=${HEAD} -->\n### Post-accept red team — no break found` });
+    expect(h.s.enqueue({ num: 5485 }, HEAD, { comments: thread })).toMatchObject({ enqueued: true });
+    expect(requestRedTeam).not.toHaveBeenCalled();
   });
   it('records a successful request once, keeps holding, then admits a usable head result', () => {
     const requests = [];

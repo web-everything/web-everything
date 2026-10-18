@@ -1420,17 +1420,8 @@ export function countMissingRunComments(comments, headSha = null, { baseRefName 
   let n = 0;
   for (const c of comments) {
     const body = typeof c === 'string' ? c : c?.body;
-    if (typeof body !== 'string' || !isTrustedMarkerAuthor(c)) continue;
-    // Targeted reruns and base repairs spend the same durable recovery budget as pushes.
-    if (['<!-- conveyor missing-check-rerequest -->', '<!-- conveyor missing-check-base-repair -->']
-      .some(marker => body.startsWith(marker + '\n'))) {
-      try {
-        const attempt = JSON.parse(body.split('\n')[1]);
-        if (/^[a-f0-9]{40}$/.test(attempt.head ?? '') && (!headSha || attempt.head === headSha)) n += 1;
-      } catch { /* Not a valid reservation. */ }
-      continue;
-    }
-    if (!body.trimStart().startsWith(MISSING_RUN_COMMENT_MARKER)) continue;
+    if (typeof body !== 'string' || !body.trimStart().startsWith(MISSING_RUN_COMMENT_MARKER)) continue;
+    if (!isTrustedMarkerAuthor(c)) continue;
     // A stacked refusal never pushed anything (stacks now restack instead); a fork-on-default-branch refusal still counts.
     // The refusal text only counts at the start of a line or right after the builder's own `FAILED: ` (free text
     // is one line and cannot carry that anchor), so a failure that merely quotes it is still counted.

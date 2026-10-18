@@ -110,7 +110,7 @@ describe('conflicts always have an owner, outside the fixer scope queue for mech
   });
 });
 
-// Both the base-repair owner and Also-raised-by watch use this entry point.
+// The Also-raised-by watch uses this entry point.
 describe('card recovery push credentials', () => {
   const pr = { headRefName: 'lane/cards', baseRefName: 'main', headRefOid: 'a'.repeat(40) };
   function runner() {

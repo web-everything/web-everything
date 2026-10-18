@@ -16,28 +16,17 @@ existing completed PR workflow run pinned to the examined head. Discovery uses
 the paginated repository runs endpoint and matches the exact workflow path: the
 current filename endpoint can resolve a different workflow ID from historical runs. All-absent heads,
 other missing protected checks, and stacks retain the existing recovery path.
-It rereads the PR head, lane branch, main base, mergeability and live push claim before reserving and again before submission. A trusted,
+It rereads the open PR head and repository before reserving and again before submission. A trusted,
 complete PR thread supplies the per-(repo, PR, head, check) attempt count and
 cooldown; a reservation is posted before each submission so failures also consume
 the cap. Missing thread evidence or a failed reservation prevents submission.
 Settings live in `scripts/settings/missing-run-rerequest.json`, with env overrides
 and source logging through `policy-cascade`; defaults are on, 15 minutes, 2 attempts.
 
-Before requesting a rerun, the helper reads `.github/workflows/<workflow>` at the
-exact examined head SHA. A proven absent job goes to
-`parked-pr-conflict-watch.mjs#attemptMissingCheckBaseRepair`: card/decision-only
-PRs use the existing card resolver and its no-checkout fast-forward plumbing;
-code PRs receive a base-fix finding through the ordinary fix bounce. This route
-reserves a trusted `missing-check-base-repair` PR comment before invoking the
-owner and shares its configured cooldown and per-head cap with rerun attempts.
-Both paths also spend the existing missing-run per-SHA and per-PR budgets; legacy
-push attempts and targeted reservations count together. The card resolver pins the
-fetched branch to the examined PR head before rebasing. Unknown YAML/job names, files, or owner outcomes defer.
-
 The rerun branch deliberately uses no workflow dispatch: `missing-run-push.mjs` retains its
 #3209 synchronize-only rule. A rerun repeats that head's existing workflow definition;
 it cannot introduce a missing job into an old definition. Reaching the cap requires
-workflow/base repair rather than repeatedly nudging a recovery-marked tip. The
+operator investigation rather than repeatedly nudging a recovery-marked tip. The
 review gate stays closed until a real successful check reports. Unit probes live
 in `scripts/conveyor/__tests__/missing-run-rerequest.test.mjs`; live verification
 of planning should use `apply: false` and must not submit reruns during diff review.
@@ -2177,7 +2166,7 @@ retains its green-at-open provenance. Round-history metadata retries a head mism
 at most three times and preserves comments already read even if metadata remains
 unavailable. The focused regression suite is `guard-audit-regressions.test.mjs`.
 
-Recovery base repairs and the Also-raised-by card resolver use `recoveryPushContext`
+The Also-raised-by card resolver uses `recoveryPushContext`
 from `missing-run-push.mjs`: the owner installation token or a validated recovery
 credential is required. Pushes pin `WE_CI_PUSH_TOKEN` and clear inherited `GIT_*`
 configuration; `gitRun` must use `inheritEnv: false` for that exact environment,

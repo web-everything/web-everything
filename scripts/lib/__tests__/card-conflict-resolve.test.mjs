@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { resolveRaisedByConflict, loadCardConflictSettings } from '../card-conflict-resolve.mjs';
-import { defaultAttemptCardConflictRebase, attemptMissingCheckBaseRepair } from '../../conveyor/parked-pr-conflict-watch.mjs';
+import { defaultAttemptCardConflictRebase } from '../../conveyor/parked-pr-conflict-watch.mjs';
 import { MISSING_RUN_CREDENTIAL_REFUSAL } from '../../conveyor/main-red-recovery.mjs';
 import { rebaseDropManifest } from '../rebase-drop-manifest.mjs';
 
@@ -125,7 +125,7 @@ describe('trusted no-checkout rebase path with real local Git', () => {
   });
 });
 
-it('base repair and the card owner share credential refusal and a pinned Also-raised-by push', () => {
+it('the card owner enforces credential refusal and a pinned Also-raised-by push', () => {
   const f = fixture();
   f.git('push', 'origin', 'refs/remotes/origin/main:refs/heads/main');
   const pr = { number: 42, headRefName: 'lane/cards', baseRefName: 'main', headRefOid: f.head };
@@ -135,15 +135,13 @@ it('base repair and the card owner share credential refusal and a pinned Also-ra
     if (args.includes('push')) pushes.push({ args, opts });
     return f.run(cmd, args, opts);
   };
-  const attempt = env => input => defaultAttemptCardConflictRebase({ ...input, cwd: f.cwd, run, env, readCache: () => null });
-  const refused = attemptMissingCheckBaseRepair({ check: 'standards' }, { pr, repo: 'web-everything/web-everything',
-    listPrFiles: () => [path], attemptCardRebase: attempt({ GH_TOKEN: 'ghs_untrusted' }) });
-  expect(refused).toMatchObject({ ok: false, deferred: false, error: MISSING_RUN_CREDENTIAL_REFUSAL });
+  const attempt = env => defaultAttemptCardConflictRebase({ pr, repo: 'web-everything/web-everything', cwd: f.cwd, run, env, readCache: () => null });
+  const refused = attempt({ GH_TOKEN: 'ghs_untrusted' });
+  expect(refused).toMatchObject({ ok: false, action: 'error', error: MISSING_RUN_CREDENTIAL_REFUSAL });
   expect(pushes).toEqual([]);
   expect(f.git('ls-remote', 'origin', 'refs/heads/lane/cards')).toContain(f.head);
-  const result = attemptMissingCheckBaseRepair({ check: 'standards' }, { pr, repo: 'web-everything/web-everything',
-    listPrFiles: () => [path], attemptCardRebase: attempt({ GH_TOKEN: 'ghp_test' }) });
-  expect(result).toMatchObject({ ok: true, action: 'rebased', resolvedRaisedBy: [path] });
+  const result = attempt({ GH_TOKEN: 'ghp_test' });
+  expect(result).toMatchObject({ action: 'rebased', resolvedRaisedBy: [path] });
   expect(pushes).toHaveLength(1);
   expect(pushes[0].opts).toMatchObject({ inheritEnv: false, env: { WE_CI_PUSH_TOKEN: 'ghp_test', GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' } });
   expect(f.git('show', `${result.newCommit}:${path}`)).toContain(entry(2).replace('xabc123', '6000'));
