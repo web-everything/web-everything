@@ -46,6 +46,7 @@ import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
  */
 
 import { resolveOperationRoute } from '../lib/dispatch-routing-policy-io.mjs';
+import { redactSpawnText } from '../lib/describe-spawn-failure.mjs';
 import { pickAgyEvidence } from '../lib/antigravity-run-evidence.mjs';
 import { describeSubmit, extractSubmitResult } from './open-pr.mjs';
 import { advance, runStatus, startRun } from './engine.mjs';
@@ -1384,6 +1385,16 @@ export function renderSpendLines(run) {
   ];
 }
 
+/** A copy of `value` with every string inside it passed through `redactSpawnText`. PURE but for its env read. */
+function redactStrings(value) {
+  if (typeof value === 'string') return redactSpawnText(value);
+  if (Array.isArray(value)) return value.map(redactStrings);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, redactStrings(v)]));
+  }
+  return value;
+}
+
 /**
  * THE MACHINE-READABLE OUTCOME of a run, as one object. PURE.
  *
@@ -1421,10 +1432,23 @@ export function outcomePayload({ run, stopped, error = null, applied = [], owned
     // no `effects` either, there was no way to recover a parked run's handle over HTTP at all. Reading the
     // record answers the same on every route.
     inFlight: run.effects.filter((e) => e.status === 'in-flight').map((e) => e.key),
-    pending: run.pending, verdict: run.verdict, findings: run.findings,
+    // Dispatch callers need the persisted receipt, including its handle, to confirm a launch.
+    // Keys alone prove neither a successful spawn nor which process owns the work.
+    // Sink errors can embed argv/settings credentials. This boundary serves CLI and HTTP alike.
+    ...(run.op === 'dispatch-lane' ? { effects: run.effects.map(({ key, type, status, handle, error }) =>
+      ({ key, type, status, handle: typeof handle === 'string' ? redactSpawnText(handle) : null,
+        ...(error ? { error: redactSpawnText(error) } : {}) })) } : {}),
+    // `findings` and `pending` carry the same sink text (hold reasons, sibling runs' handles), so they are
+    // scrubbed too — every string in them, not only the fields known today.
+    pending: run.op === 'dispatch-lane' ? redactStrings(run.pending) : run.pending,
+    verdict: run.op === 'dispatch-lane' && run.verdict ? { ...run.verdict,
+      ...(run.verdict.reason != null ? { reason: redactSpawnText(run.verdict.reason) } : {}),
+      ...(run.verdict.why != null ? { why: redactSpawnText(run.verdict.why) } : {}),
+    } : run.verdict,
+    findings: run.op === 'dispatch-lane' ? redactStrings(run.findings) : run.findings,
     // The meter, and its total pre-summed — a consumer must not have to re-derive "what did this cost".
     telemetry: run.telemetry ?? [], spend: totalJudgeSpend(run),
-    ...(error ? { error: String(error.message ?? error) } : {}),
+    ...(error ? { error: redactSpawnText(error.message ?? error) } : {}),
   };
 }
 
@@ -1535,7 +1559,7 @@ export function renderOutcome({ outcome, json = false, declaration = null }) {
   // running" and "probably dead" need opposite responses.
   if (stopped === 'effect-in-flight') {
     const { running, overdue, unknown } = inFlightEntries(run);
-    const describe = (e) => `  ${e.key} (${e.type}) — handle ${e.handle ?? '(none)'}`
+    const describe = (e) => `  ${e.key} (${e.type}) — handle ${e.handle == null ? '(none)' : redactSpawnText(e.handle)}`
       + `${e.expectedBy ? `, expected by ${e.expectedBy}` : ', no deadline'}`;
     return {
       code: 0,
@@ -1559,7 +1583,8 @@ export function renderOutcome({ outcome, json = false, declaration = null }) {
     return {
       code: 1,
       lines: [
-        `run ${run.id} — HALTED applying \`${run.pending?.step}\`: ${String(error?.message ?? error)}`,
+        // Redacted like the --json payload's `error`: a sink error can embed argv/settings credentials.
+        `run ${run.id} — HALTED applying \`${run.pending?.step}\`: ${redactSpawnText(error?.message ?? error)}`,
         `${applied.length} effect(s) landed and are recorded as applied; a --resume=${run.id} continues from there `
         + 'and never re-applies them.',
         ...spend,
@@ -1577,7 +1602,7 @@ export function renderOutcome({ outcome, json = false, declaration = null }) {
     return {
       code: 1,
       lines: [
-        `run ${run.id} — REFUSED at \`${outcome.step}\`: ${String(error?.message ?? error)}`,
+        `run ${run.id} — REFUSED at \`${outcome.step}\`: ${redactSpawnText(error?.message ?? error)}`,
         ...(priorConfirm ? [
           `the answer recorded at \`${priorConfirm.step}\` is \`${priorConfirm.value}\`; it is committed, and a `
           + '--resume replays this same step with it.',

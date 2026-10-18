@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/xzlh2ts-prevention-require-structured-guarantee-to-test-mappings-thr.md"]
+scope: ["we:backlog/6245-prevention-require-structured-guarantee-to-test-mappings-thr.md"]
 dateOpened: "2026-10-17"
 tags: []
 ---
@@ -44,4 +44,6 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Also raised by
 
+- Also raised by web-everything/web-everything#5554 (finding 1: `we:backlog/6279-prevention-a-card-lint-requirement-that-a-card-widening-a-pe.md:17` — Add a check:standards rule: when a backlog card says 'Already tracked on open cards … → #N ', the referenced card must contain a line with this card's idempotency-key PR number. Failing that, make the filer assert every dedupe target was appended before it writes the claim.) · key `approval-prevention-key:web-everything/web-everything#5554@d7de7d43dc0c655eb959c9c1899e5580474ab062`
 - Also raised by web-everything/web-everything#5555 (finding 1: `we:backlog/6261-prevention-make-the-card-template-require-path-test-name-on.md:16` — Make the filer emit the 'Already tracked' line only for cards whose 'Also raised by' edit is staged in the same change. Add a check:standards rule that fails a card citing '#N → recorded as Also raised by' when card N lacks the idempotency key.)
+- Also raised by web-everything/web-everything#5554 (finding 1: `we:backlog/6279-prevention-a-card-lint-requirement-that-a-card-widening-a-pe.md:22` — A check:standards or filer-side assertion that every card named in an 'Already tracked … recorded there' line contains the idempotency key or PR reference of this filing.) · key `approval-prevention-key:web-everything/web-everything#5554@9ba29c3bc1fee7b781e5cd0318bede78a60b401b`

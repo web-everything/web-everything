@@ -56,6 +56,7 @@
  * nothing here decides, it only wires and reports.
  */
 
+import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -85,7 +86,7 @@ import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { DEFAULT_LENS, SECURITY_SEAT_STEP, seatSecurityForTouchSet, securitySeatFromRun } from './review-pr.mjs';
-import { parallelSeatsEnabled, seatsByTouchSetEnabled } from '../lib/review-seat-settings.mjs';
+import { parallelSeatsEnabled, seatsByTouchSetEnabled, resolveCardOnlyReviewSettings } from '../lib/review-seat-settings.mjs';
 import { planReviewDispatch } from './review-dispatch.mjs';
 import { READ_SINK_ENV, withReadSink } from '../lib/review-speculative-red-team.mjs';
 // #4493 — this file's own mechanized prevention filing had the SAME orphaned-card bug `we:scripts/review-set-
@@ -431,14 +432,13 @@ export const TOUCH_SET_FILE_CAP = 100;
  * @param {{enabled?: boolean, store?: {read: Function}, readChangedFiles?: (o: {pr: number, repo: string}) => string[]}} [o]
  * @returns {{securitySeat: boolean, reason: string}}
  */
-export function chooseSecuritySeat(argv, { enabled = true, store = null, readChangedFiles = defaultReadChangedFiles } = {}) {
+export function chooseSecuritySeat(argv, { enabled = true, store = null, readChangedFiles = defaultReadChangedFiles, cardOnly = resolveCardOnlyReviewSettings().value } = {}) {
   const resumeId = argvFlag(argv, 'resume');
   if (resumeId) {
-    try { return { securitySeat: securitySeatFromRun(store?.read(resumeId)), reason: `--resume ${resumeId}: roster read off the saved run` }; } catch {
+    try { const saved = store?.read(resumeId); return { securitySeat: securitySeatFromRun(saved), cardOnlyLight: saved?.findings?.read?.cardOnlyLight === true, reason: `--resume ${resumeId}: roster read off the saved run` }; } catch {
       return { securitySeat: true, reason: `--resume ${resumeId}: saved run unreadable — full roster` };
     }
   }
-  if (!enabled) return { securitySeat: true, reason: 'review.seatsByTouchSet is off — full roster' };
   const pr = Number(argvFlag(argv, 'pr'));
   const repo = argvFlag(argv, 'repo');
   if (!Number.isInteger(pr) || pr <= 0) return { securitySeat: true, reason: 'no --pr — full roster' };
@@ -449,6 +449,10 @@ export function chooseSecuritySeat(argv, { enabled = true, store = null, readCha
   if (!Array.isArray(files) || files.length >= TOUCH_SET_FILE_CAP) {
     return { securitySeat: true, reason: `touch-set ${Array.isArray(files) ? `has ${files.length} file(s), may be truncated` : 'unreadable'} — full roster` };
   }
+  if (cardOnly.lightLane && isCardOnlyDiff(files) && (argvFlag(argv, 'lens') || DEFAULT_LENS) === 'correctness') {
+    return { securitySeat: cardOnly.claudeSeat, cardOnlyLight: true, reason: 'card-only light lane: Codex correctness' };
+  }
+  if (!enabled) return { securitySeat: true, reason: 'review.seatsByTouchSet is off — full roster' };
   const plan = seatSecurityForTouchSet({ changedFiles: files, lens: argvFlag(argv, 'lens') || DEFAULT_LENS });
   return { securitySeat: plan.securitySeat, reason: plan.reason };
 }
@@ -634,7 +638,8 @@ export async function runReviewLoopOnce({
       // `review.seatsByTouchSet` — a parked run is resumed only under the roster it was judged with; a declaration that
       // seats the security juror differently would reason about a run shape that no longer exists, so that case
       // starts a fresh review instead (same fallback as any other doubt here).
-      const rosterMatches = !parked || securitySeatFromRun(parked) === declaresSecuritySeat(declaration);
+      const rosterMatches = !parked || securitySeatFromRun(parked) === declaresSecuritySeat(declaration)
+        && Boolean(parked?.findings?.read?.cardOnlyLight) === Boolean(declaration.cardOnlyLight);
       if (parked && parked.op === declaration.name && attempts < RESUME_MAX_ATTEMPTS && rosterMatches
         && (parked.pending?.kind === 'confirm' || unfinishedResume)) {
         rewound = rewindRunToStep(parked, { registry, step: RESUME_STEP, at: now() });
@@ -1041,7 +1046,7 @@ if (IS_CLI) {
   const seating = chooseSecuritySeat(argv, { enabled: seatsByTouchSetEnabled(), store });
   try { process.stderr.write(`review seats: security juror ${seating.securitySeat ? 'seated' : 'NOT seated'} — ${seating.reason}\n`); } catch { /* best effort */ }
   const { declaration, registry, sinks } = resolveOperation(
-    REVIEW_LOOP_OP, { json: hasJsonFlag(argv), cwd: cwdFlagValue(argv), securitySeat: seating.securitySeat },
+    REVIEW_LOOP_OP, { json: hasJsonFlag(argv), cwd: cwdFlagValue(argv), securitySeat: seating.securitySeat, cardOnlyLight: seating.cardOnlyLight, resumeId: argvFlag(argv, 'resume') },
   );
   const prFlag = Number(argvFlag(argv, 'pr'));
   runReviewLoopOnce({

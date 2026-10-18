@@ -154,3 +154,18 @@ describe('the gh adapter', () => {
     expect(GH_ARGV.requiredChecks(7)).not.toContain('--repo');
   });
 });
+
+describe('producer review holds remove stale readiness atomically', () => {
+  it.each(['review:pending', 'review:human', 'review:changes'])('%s strips old-head readiness in the hold write', label => {
+    const calls = [];
+    const provider = createGhLandProvider({ exec: args => {
+      calls.push(args);
+      return args[1] === 'view' ? JSON.stringify({ labels: [{ name: 'ready-to-merge' }] }) : '';
+    } });
+    provider.addLabel(60, label);
+    expect(calls).toEqual([
+      ['pr', 'view', '60', '--json', 'labels'],
+      ['pr', 'edit', '60', '--add-label', label, '--remove-label', 'ready-to-merge'],
+    ]);
+  });
+});

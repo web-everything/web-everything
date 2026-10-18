@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { RED_TEAM_STATUS_LABELS, syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
+import { readDrainRedTeamEvidence } from '../lib/drain-red-team-evidence.mjs';
 /**
  * @file scripts/conveyor/advisory-label-sweep.mjs
  * @description THE `advisory:*` STALENESS SWEEP — drops `advisory:accepted` / `advisory:changes` from any open PR
@@ -136,7 +138,8 @@ export function planForPr(pr) {
  *   PR that needed (or would need) a change, or whose live re-read failed.
  */
 export function sweepAdvisoryLabels({
-  repo = null, listPrs = defaultListPrs, readPr = defaultReadPr, provider = createGhProvider(), dryRun = false,
+  repo = null, listPrs = defaultListPrs, readPr = defaultReadPr, provider = createGhProvider(), dryRun = false, readStatusEvidence = readDrainRedTeamEvidence,
+  log = line => process.stderr.write(`${line}\n`),
 } = {}) {
   const prs = listPrs({ repo });
   const results = [];
@@ -144,6 +147,17 @@ export function sweepAdvisoryLabels({
   // `--repo` into its argv unconditionally, so a null repo must never reach it (the #xoh8fkw bug the conflict
   // watch documents).
   let resolvedRepo = repo;
+  for (const pr of (Array.isArray(prs) ? prs : []).filter(p => labelNames(p.labels).some(l => RED_TEAM_STATUS_LABELS.includes(l)))) {
+    try {
+      resolvedRepo ??= provider.currentRepo();
+      const live = readPr({ repo: resolvedRepo, number: pr.number });
+      if (!live || (live.state && live.state !== 'OPEN')) continue;
+      const evidence = readStatusEvidence({ repo: resolvedRepo, pr: pr.number, head: live.headRefOid });
+      const plan = syncRedTeamStatusLabels({ repo: resolvedRepo, pr: pr.number, head: live.headRefOid,
+        evidence, live, comments: live.comments, provider, dryRun, log });
+      if (plan.add || plan.remove.length) results.push({ num: pr.number, ...plan });
+    } catch (e) { results.push({ num: pr.number, skipped: `red-team status: ${e.message}` }); }
+  }
   for (const pr of (Array.isArray(prs) ? prs : []).filter((p) => carriesAdvisoryLabel(p) || isHumanGated(p))) {
     const nominated = planForPr(pr);
     if (!nominated.add && nominated.remove.length === 0 && !commentsMayBeTruncated(pr)) continue;

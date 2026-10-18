@@ -94,12 +94,20 @@ describe('operator-queue: round-cap ruling needed', () => {
       [redTeam(HEAD, 'degraded'), capped],
     ]) expect(redTeamRulingRow(repo, candidate(comments))).toBeNull();
   });
-  it.each(['review:changes', 'review:accepted'])('suppresses %s in either label shape', (label) => {
+  it.each(['review:changes'])('suppresses %s in either label shape', (label) => {
     for (const labels of [[label], [{ name: label }]]) {
       expect(redTeamRulingRow(repo, candidate(undefined, HEAD, labels))).toBeNull();
     }
   });
-  it('honors the configured send-back policy', () => {
+  it('surfaces #5453 even while review:accepted remains and publishes through needs-you', async () => {
+    const { itemsFromReport } = await import('../needs-you-feed.mjs');
+    const row = redTeamRulingRow(repo, candidate(undefined, HEAD, ['review:accepted', 'ready-to-merge']));
+    expect(row.findings[0].summary).toBe('two writers');
+    expect(itemsFromReport({ rulingNeeded: [row] })).toEqual(expect.arrayContaining([
+      expect.objectContaining({ pr: 4722, reason: expect.stringContaining('two writers') }),
+    ]));
+  });
+  it('honors the configured send-back policy' , () => {
     expect(redTeamRulingRow(repo, candidate(), { ...CONFIRMED_BREAKS_DEFAULTS, broken: 'card' })).toBeNull();
   });
   it('merges into the ledger row under rulingNeeded without mutating either source', () => {
