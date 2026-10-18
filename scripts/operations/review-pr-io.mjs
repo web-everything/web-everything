@@ -1748,7 +1748,7 @@ export function createReviewPrSinks({
       const plan = planAdvisoryLabels({ outcome: payload.outcome, currentLabels: labels });
       if (plan.reason) return { applied: false, reason: plan.reason };
       if (!plan.add && plan.remove.length === 0) return { applied: false, reason: 'already-current' };
-      // `gh pr edit --add-label` refuses a label the repo has never had; ensure is create-or-update (`--force`).
+      // `gh pr edit --add-label` refuses a label the repo has never had; ensure provisions missing labels through the shared cache.
       if (plan.add) labelProvider.ensureLabel(payload.repo, plan.add, ADVISORY_LABEL_META[plan.add]);
       labelProvider.setLabels(payload.repo, payload.pr, { add: plan.add ?? undefined, remove: plan.remove });
       return { applied: true, added: plan.add, removed: plan.remove };

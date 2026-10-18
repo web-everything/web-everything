@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { ensureLabelCached } from './lib/label-cache.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
@@ -4545,11 +4546,6 @@ async function runCli() {
   const isFastDrainTarget = (repo, p) => REPOS.includes(repo) && matchesOnlyTarget({ prNumber: p.number, onlyPr, repo, onlyRepo, isLocal: isLocalRepo(repo), repoCount: REPOS.length });
   const fastDrainPrs = (repo, prs) => filterToFastDrainTarget(prs, { onlyPr, scope: fastDrain.scope, isTarget: (p) => isFastDrainTarget(repo, p) });
   const repoTag = (repo) => (repo && repo !== localSlug ? `${repo.split('/').pop()}#` : '#'); // display prefix per PR
-  // #2262 — under `--watch`, `sweepOnce()` (below) runs every `--interval`s FOREVER; memoize which (repo, label)
-  // pairs this process has already ensured exist so a long-lived watch doesn't `gh label create` the same
-  // review:* labels every single pass (wasted round-trips on an idempotent one-time mint).
-  const ensuredLabels = new Set();
-
   // #2263 — a SIBLING clone of a non-local constellation repo (`../frontierui`, `../plateau-app` next to this
   // WE clone) lets the rebase-drop plumbing rebuild THAT repo's lane tip too, instead of leaving every
   // CONFLICTING/BEHIND frontierui/plateau-app PR for its author. Best-effort + read-only-check: a repo whose
@@ -4857,16 +4853,11 @@ async function runCli() {
   const reconcileCiLifecycleLabels = (repo, ctx) => {
     if (!RECONCILE) return [];
     const open = fastDrainPrs(repo, ctx.prsByRepo.get(repo) || []);
-    // Mint the two NEW labels once per (repo, process) — `ready-to-merge` is minted by pr-land.mjs (the first
-    // applier); never re-minted here so its color/description keeps ONE single source. Mirrors the review-label
-    // mint below: the WHOLE ensure-loop (including the `ensuredLabels` memoization) is skipped under DRY_RUN, so
-    // a dry-run process never marks a label "ensured" without having actually minted it.
+    // Ensure lifecycle labels through the shared TTL cache. `ready-to-merge` is owned by pr-land.
+    // Dry runs skip provisioning entirely.
     if (!DRY_RUN) {
       for (const [name, meta] of Object.entries(CI_LIFECYCLE_LABEL_META)) {
-        const ensureKey = `${repo || 'cwd'}::${name}`;
-        if (ensuredLabels.has(ensureKey)) continue;
-        ensuredLabels.add(ensureKey);
-        try { execFileSync('gh', ['label', 'create', name, '--color', meta.color, '--description', meta.description, ...repoFlag(repo)], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* already exists — fine */ }
+        try { ensureLabelCached(['label', 'create', name, '--color', meta.color, '--description', meta.description, ...repoFlag(repo)], { exec: args => execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) }); } catch { /* already exists — fine */ }
       }
     }
     const reconciled = [];
@@ -5569,10 +5560,7 @@ async function runCli() {
       const escalationRepos = new Set(verdicts.filter((v) => v.decision === 'merge' || v.reviewHeld).map((v) => v.repo || null));
       for (const repo of escalationRepos) {
         for (const [name, meta] of Object.entries(REVIEW_LABEL_META)) {
-          const ensureKey = `${repo || 'cwd'}::${name}`;
-          if (ensuredLabels.has(ensureKey)) continue;
-          ensuredLabels.add(ensureKey);
-          try { execFileSync('gh', ['label', 'create', name, '--color', meta.color, '--description', meta.description, ...repoFlag(repo)], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* already exists — fine */ }
+          try { ensureLabelCached(['label', 'create', name, '--color', meta.color, '--description', meta.description, ...repoFlag(repo)], { exec: args => execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) }); } catch { /* already exists — fine */ }
         }
       }
     }

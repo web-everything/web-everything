@@ -1,5 +1,18 @@
 # Testing — Three-Tier Strategy
 
+## Label provisioning cache
+
+All label provisioning uses `scripts/lib/label-cache.mjs`, including the review/land providers,
+drain, CI hand-off, and stand-down paths. Per-repo label names live in atomic JSON files under
+`.conveyor/label-cache` in the running WE checkout, shared by its processes. PR state and merge
+admission are never cached here. `labels.cache.ttlMs` defaults to 3600000; 0 disables caching.
+The source-logged cascade reads the platform `labels` block, then the `labels` block in
+`scripts/settings/labels.json`, then `WE_LABELS_CACHE_TTL_MS` (nonnegative integer milliseconds).
+A cached miss refreshes once before creation; creation adds the name without extending the
+list timestamp. Failed list/cache IO falls back to provisioning; failed creation is excused
+only if a fresh list confirms another process created the label. Focused coverage lives in
+`scripts/lib/__tests__/label-cache.test.mjs`; adapter argv tests disable caching explicitly.
+
 ## Review fetch sharing
 
 The review daemon scopes `review.fetch.sharedPerTick` (default `true`) to one tick through
