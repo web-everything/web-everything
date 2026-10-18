@@ -335,6 +335,12 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     // review as a fake `claude --bg` session's actions. Pin the opt-in session path until the simulator models
     // the job (filed as its own follow-up) — this keeps the fix/lane/label scenarios exercising what they did.
     WE_REVIEW_DISPATCH_MODE: 'session',
+    // Scenario and soak fixtures model the full required-check set, not the production fast-check jobs.
+    // Keep both planner and dispatch-time gates on that contract; review-timing-dispatch.test.mjs and
+    // review-ci-gate-io.test.mjs cover fast-check eligibility without changing these scenarios' assertions.
+    WE_REVIEW_START_AFTER: 'ci-green',
+    // Same contract for the fix side: these scenarios script CI repair serially, not joined with a pending review.
+    WE_FIX_JOIN_CI_AND_REVIEW: 'false',
     // #4126 — the opted-in daemons' ticks now start/adopt a detached rebuild JOB (`rebuild-job.mjs`) instead of
     // smoking inline, but every scenario here scripts the inline rebuild moving the clone within the tick. Pin the
     // inline path; rebuild-job tests own the job mode.

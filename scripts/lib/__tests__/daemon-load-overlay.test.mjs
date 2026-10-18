@@ -20,7 +20,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
-  mkdtempSync, mkdirSync, readdirSync, writeFileSync, rmSync, existsSync,
+  mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync, rmSync, existsSync, readSync, statSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -305,7 +305,7 @@ describe('mergeOverlayRef / dryRunOverlay — REAL git (temp repos), proving the
 // command and the child env through the REAL completion-cli against a real store dir and asserts it stays empty.
 import {
   overlaySafetySettings, matchDispatchPaths, overlayDispatchFiles, judgeDispatchSmoke, withDispatchSmoke, runRealDispatchSmoke,
-  rollbackVersionIfCurrent, DISPATCH_PATH_DEFAULTS,
+  rollbackVersionIfCurrent, DISPATCH_PATH_DEFAULTS, readFileTail,
 } from '../daemon-load-overlay.mjs';
 
 const quietLog = { error: () => {}, log: () => {} };
@@ -415,6 +415,13 @@ describe('judgeDispatchSmoke — the pass/fail rule for one real worker', () => 
     const r = judgeDispatchSmoke({ nonce: 'n1', marker: null, record, denials: ['This command requires approval'] });
     expect(r.ok).toBe(false);
     expect(r.reason).toBe('commands-denied');
+    expect(r.detail).toBe('1 denied tool call(s) in the transcript');
+  });
+
+  it('a worker-written blocker kind reaches the detail only as a plain token', () => {
+    const record = (kind) => ({ status: 'done', result: { blocker: { kind } } });
+    expect(judgeDispatchSmoke({ nonce: 'n1', marker: 'n1', record: record('permission-wall'), denials: [] }).detail).toBe('blocker=permission-wall');
+    expect(judgeDispatchSmoke({ nonce: 'n1', marker: 'n1', record: record('permission "mikeword13x"'), denials: [] }).detail).toBe('blocker=unrecognised');
   });
 
   it('a done record without the marker fails even with no transcript to read', () => {
@@ -543,6 +550,34 @@ describe('runDaemonLoadOverlay — dispatch smoke wiring, rollback of ONLY this 
     expect(appendEventFn).toHaveBeenCalledWith('/c', expect.objectContaining({ kind: 'removed', ref: 'lane/x' }), expect.anything());
     expect(rebuild).toHaveBeenCalledTimes(2);
     expect(r).toMatchObject({ adopted: false, rolledBack: true, reason: 'dispatch-smoke-failed', dispatchSmoke: { phase: 'candidate', result: { reason: 'commands-denied' } } });
+  });
+
+  // The real smoke builds `detail` from an allow-listed summary (the runRealDispatchSmoke tests below); this sink only
+  // bounds whatever detail an injected smoke returns and redacts token shapes.
+  it('the rollback path bounds a smoke-supplied detail before the event log, the thrown error and the log', async () => {
+    const secrets = ['ghp_secretAAAA', 'github_pat_secretBBBB'];
+    const appendEventFn = vi.fn();
+    const log = { error: vi.fn(), log: () => {} };
+    const thrown = [];
+    let calls = 0;
+    const rebuild = vi.fn(async ({ runSmoke }) => {
+      calls += 1;
+      if (calls === 1) {
+        try { await runSmoke({ root: '/cand', env: {} }); } catch (e) { thrown.push(String(e.message)); return { moved: false, reason: 'smoke-threw', alerts: [] }; }
+      }
+      return { moved: false, reason: 'up-to-date' };
+    });
+    await runDaemonLoadOverlay({
+      clone: '/c', ref: 'lane/x', installed: () => ({ inHead: true, tip: 'abc', head: 'deadbeef', reason: 'in-head' }), pr: 1, addOverlayFn: vi.fn(), rebuild, removeOverlayFn: vi.fn(() => ({ removed: true, list: [] })), appendEventFn, settings: settingsOn, log,
+      baseSmoke: async () => ({ verdict: 'pass' }),
+      inspect: () => ({ inTree: true, required: true, matched: ['scripts/operations/worker-wrapper-launch.mjs'] }),
+      dispatchSmoke: async () => ({ ok: false, reason: 'commands-denied', detail: `${secrets.join(' ')} ${'w'.repeat(20_000)}` }),
+    });
+    const reason = appendEventFn.mock.calls[0][1].reason;
+    // The dispatch detail is an allow-listed summary, bounded at 4,000 so its trailing file path is never cut off.
+    expect(reason.length).toBeLessThanOrEqual(4_000);
+    const sinks = [reason, thrown.join('\n'), log.error.mock.calls.map((c) => c.join(' ')).join('\n')];
+    for (const s of ['secretAAAA', 'secretBBBB']) for (const sink of sinks) expect(sink).not.toContain(s);
   });
 
   it('a candidate worker launch that THROWS removes ONLY this overlay and rebuilds without it — it is not left registered with a not-in-tree warning', async () => {
@@ -896,6 +931,177 @@ describe('runRealDispatchSmoke — the smoke worker\'s completion record goes to
   beforeEach(() => { work = mkdtempSync(join(tmpdir(), 'dlo-scratch-test-')); });
   afterEach(() => { rmSync(work, { recursive: true, force: true }); });
 
+  function launchFixture(action = () => {}) {
+    return vi.fn((_node, args, opts) => {
+      const [, , slug, , , sessionId, prompt, , scratch] = args;
+      const [, marker, nonce] = prompt.match(/process\.argv\[2\]\)" '([^']+)' '([^']+)'/);
+      action({ slug, sessionId, marker, nonce, store: opts.env.OPERATION_COMPLETIONS_DIR, scratch });
+      return { status: 0, stdout: JSON.stringify({ handle: 'pid:12345', wrapperPid: 12345 }), stderr: '' };
+    });
+  }
+  const fastSettings = () => ({ ...overlaySafetySettings({}, { readSettings: () => null }), smokeTimeoutMs: 0 });
+  const finish = ({ marker, nonce, store, slug }) => {
+    writeFileSync(marker, nonce);
+    writeFileSync(join(store, `${slug}.json`), JSON.stringify({ status: 'done' }));
+  };
+  const smoke = (spawn, extra = {}) => runRealDispatchSmoke({
+    tree: '.', env: {}, settings: fastSettings(), spawn, home: join(work, 'home'), log: quietLog, probeAlive: () => false,
+    diagnosticsDir: join(work, 'diag'), ...extra,
+  });
+
+  it('retries a launch timeout once with fresh evidence, then accepts the passing worker', async () => {
+    const spawn = launchFixture((a) => { if (spawn.mock.calls.length === 2) finish(a); });
+    const r = await smoke(spawn);
+    expect(r).toMatchObject({ ok: true, note: 'retried after launch timeout' });
+    expect(spawn).toHaveBeenCalledTimes(2);
+    expect(spawn.mock.calls[0][1][5]).not.toBe(spawn.mock.calls[1][1][5]);
+    expect(spawn.mock.calls[0][2].env.OPERATION_COMPLETIONS_DIR).not.toBe(spawn.mock.calls[1][2].env.OPERATION_COMPLETIONS_DIR);
+  });
+
+  it('rejects two launch timeouts with both attempts diagnostics and stops live wrappers', async () => {
+    const spawn = launchFixture(({ scratch }) => {
+      writeFileSync(join(scratch, 'wrapper.stderr'), Array.from({ length: 40 }, (_, n) => `line ${n}`).join('\n'));
+      writeFileSync(join(scratch, 'first-output.json'), JSON.stringify({ ms: 17 }));
+    });
+    const stopWrapper = vi.fn();
+    const r = await smoke(spawn, { probeAlive: () => true, stopWrapper });
+    expect(spawn).toHaveBeenCalledTimes(2);
+    expect(stopWrapper).toHaveBeenCalledTimes(2);
+    expect(r).toMatchObject({ ok: false, reason: 'timeout', diagnostics: { wrapperPid: 12345, wrapperAliveAtTimeout: true, sessionAppeared: false, transcriptAppeared: false, firstOutputMs: 17 } });
+    // The retry note comes first: the summary's last field is the error class (child text), which cannot pose as it.
+    expect(r.detail).toMatch(/^retried after launch timeout; attempts=timeout,timeout; /);
+    expect(r.diagnostics.launchStartedAt).toMatch(/^\d{4}-/);
+    expect(r.diagnostics).not.toHaveProperty('stderrTail');
+    // Each attempt's last 30 stderr lines are in its own 0600 file under the diagnostics dir; the capture is gone.
+    expect(r.attempts).toHaveLength(2);
+    for (const a of r.attempts) {
+      const file = a.diagnostics.stderrFile;
+      expect(file.startsWith(join(work, 'diag'))).toBe(true);
+      expect(statSync(file).mode & 0o777).toBe(0o600);
+      expect(readFileSync(file, 'utf8').trimEnd().split('\n')).toEqual(Array.from({ length: 30 }, (_, n) => `line ${n + 10}`));
+    }
+    expect(r.detail).toContain(`stderrFile=${r.diagnostics.stderrFile}`);
+    for (const call of spawn.mock.calls) expect(existsSync(join(call[1][8], 'wrapper.stderr'))).toBe(false);
+  });
+
+  it('never carries wrapper stderr text beyond its error class in detail, diagnostics, attempts or logs', async () => {
+    // Not secret-shaped: only the design (the allow-listed summary), never a redactor, keeps these out.
+    const lines = ['booting alphaword1x', 'TypeError: cannot read "password: bravoword2x', 'charlieword3x deltaword4x"',
+      'API_KEY="echoword5x', 'foxtrotword6x"', 'progress\rgolfword7x', 'y'.repeat(20_000)];
+    const spawn = launchFixture(({ scratch }) => writeFileSync(join(scratch, 'wrapper.stderr'), lines.join('\n')));
+    const log = { error: vi.fn() };
+    const r = await smoke(spawn, { log });
+    expect(r).toMatchObject({ ok: false, reason: 'timeout' });
+    expect(r.diagnostics.errorClass).toBe('TypeError: cannot read <…>');
+    const sinks = [JSON.stringify(r), log.error.mock.calls.map((c) => c.join(' ')).join('\n')];
+    for (const w of ['alphaword1x', 'bravoword2x', 'charlieword3x', 'deltaword4x', 'echoword5x', 'foxtrotword6x', 'golfword7x', 'yyyyyyyy']) {
+      for (const sink of sinks) expect(sink).not.toContain(w);
+    }
+    expect(readFileSync(r.diagnostics.stderrFile, 'utf8')).toContain('golfword7x');
+  });
+
+  it('a launch-harness failure carries its signal, exit code and class, with its stderr only in the 0600 file', async () => {
+    const spawn = vi.fn(() => ({ status: 3, signal: null, stderr: 'loading hotelword8x\nSyntaxError: Unexpected token "indiaword9x"\n    at julietword10x\n' }));
+    const r = await smoke(spawn);
+    expect(r).toMatchObject({ ok: false, reason: 'launch-failed', diagnostics: { exitCode: 3, signal: null, errorClass: 'SyntaxError: Unexpected token <…>' } });
+    for (const w of ['hotelword8x', 'indiaword9x', 'julietword10x']) expect(JSON.stringify(r)).not.toContain(w);
+    expect(statSync(r.diagnostics.stderrFile).mode & 0o777).toBe(0o600);
+    expect(readFileSync(r.diagnostics.stderrFile, 'utf8')).toContain('julietword10x');
+  });
+
+  it('retries a launch timeout whose only record is the wrapper\'s own started record', async () => {
+    const spawn = launchFixture((a) => {
+      if (spawn.mock.calls.length === 2) finish(a);
+      else writeFileSync(join(a.store, `${a.slug}.json`), JSON.stringify({ status: 'started', pid: 12345 }));
+    });
+    const r = await smoke(spawn);
+    expect(spawn).toHaveBeenCalledTimes(2);
+    expect(r).toMatchObject({ ok: true, note: 'retried after launch timeout' });
+  });
+
+  it('reads at most the final 64 KiB of wrapper stderr', () => {
+    const file = join(work, 'wrapper.stderr');
+    const text = Array.from({ length: 4_000 }, (_, n) => `line ${String(n).padStart(4, '0')} ${'s'.repeat(40)}`).join('\n');
+    writeFileSync(file, text);
+    const size = Buffer.byteLength(text);
+    const reads = [];
+    const tail = readFileTail(file, 64 * 1024, (fd, buf, off, len, pos) => { reads.push({ len, pos }); return readSync(fd, buf, off, len, pos); });
+    expect(reads.length).toBeGreaterThan(0);
+    for (const r of reads) {
+      expect(r.len).toBeLessThanOrEqual(65_536);
+      expect(r.pos).toBe(size - 65_536);
+    }
+    expect(tail).not.toContain('line 0000');
+    expect(tail.endsWith(text.split('\n').pop())).toBe(true);
+    // A mid-file read holds whole lines only.
+    expect(tail.startsWith('line ')).toBe(true);
+    expect(text.endsWith(tail)).toBe(true);
+  });
+
+  it('never returns a mid-line window: drops to the first break of any kind, and a window with none is empty', () => {
+    const cr = join(work, 'cr.stderr');
+    writeFileSync(cr, 'progress 50%\r'.repeat(6_000));
+    expect(readFileTail(cr).startsWith('progress 50%')).toBe(true);
+    const oneLine = join(work, 'one-line.stderr');
+    writeFileSync(oneLine, `export DB_PASSWORD="${'secretword '.repeat(8_000)}" FATAL`);
+    expect(readFileTail(oneLine)).toBe('');
+  });
+
+  it('a transcript denial is counted, never quoted, in the detail', async () => {
+    const body = 'This command requires approval: deploy --password "kiloword11x limaword12x"';
+    const spawn = launchFixture(({ sessionId }) => {
+      const dir = join(work, 'home', '.claude', 'projects', 'test');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, `${sessionId}.jsonl`), JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', is_error: true, content: body }] } }));
+    });
+    const r = await smoke(spawn);
+    expect(r).toMatchObject({ ok: false, reason: 'commands-denied' });
+    expect(r.detail).toMatch(/^1 denied tool call\(s\) in the transcript; /);
+    for (const w of ['requires approval', 'deploy', 'kiloword11x', 'limaword12x']) expect(JSON.stringify(r)).not.toContain(w);
+  });
+
+  it.skipIf(process.platform === 'win32')('never blocks on a FIFO left at the wrapper stderr path', () => {
+    const fifo = join(work, 'fifo.stderr');
+    execFileSync('mkfifo', [fifo]);
+    expect(readFileTail(fifo)).toBe('');
+  });
+
+  it('does not retry a worker that finishes without its commands', async () => {
+    const spawn = launchFixture(({ store, slug }) => writeFileSync(join(store, `${slug}.json`), JSON.stringify({ status: 'done' })));
+    expect(await smoke(spawn)).toMatchObject({ ok: false, reason: 'no-commands-ran' });
+    expect(spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['marker', 'session', 'transcript'])('does not retry a timeout with %s evidence', async (evidence) => {
+    const spawn = launchFixture(({ marker, nonce, sessionId }) => {
+      if (evidence === 'marker') writeFileSync(marker, nonce);
+      else {
+        const dir = join(work, 'home', '.claude', evidence === 'session' ? 'sessions' : 'projects/test');
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, evidence === 'session' ? '123.json' : `${sessionId}.jsonl`), JSON.stringify({ sessionId }));
+      }
+    });
+    expect(await smoke(spawn)).toMatchObject({ ok: false, reason: 'timeout' });
+    expect(spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it('resolves the retry limit and source, allowing disable but never more than one retry', async () => {
+    expect(fastSettings()).toMatchObject({ dispatchLaunchRetries: 1, dispatchLaunchRetriesSource: 'standard' });
+    const readSettings = () => ({ overlaySmoke: { dispatchLaunchRetries: 0 } });
+    expect(overlaySafetySettings({}, { readSettings })).toMatchObject({ dispatchLaunchRetries: 0, dispatchLaunchRetriesSource: 'tool' });
+    expect(overlaySafetySettings({ WE_OVERLAY_DISPATCH_LAUNCH_RETRIES: '1' }, { readSettings })).toMatchObject({ dispatchLaunchRetries: 1, dispatchLaunchRetriesSource: 'env' });
+    expect(overlaySafetySettings({ WE_OVERLAY_DISPATCH_LAUNCH_RETRIES: '2' }, { readSettings }).dispatchLaunchRetries).toBe(0);
+    for (const blank of ['', '  ', ' 0 ', '0x0', '-0']) {
+      expect(overlaySafetySettings({ WE_OVERLAY_DISPATCH_LAUNCH_RETRIES: blank }, { readSettings: () => null }))
+        .toMatchObject({ dispatchLaunchRetries: 1, dispatchLaunchRetriesSource: 'standard' });
+    }
+    const spawn = launchFixture();
+    const log = { error: vi.fn() };
+    await smoke(spawn, { settings: { ...fastSettings(), dispatchLaunchRetries: 0, dispatchLaunchRetriesSource: 'tool' }, log });
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('dispatchLaunchRetries=0 (source tool)'));
+  });
+
   it('pins OPERATION_COMPLETIONS_DIR to a fresh scratch dir in the child env AND in the prompt\'s own report command, and leaves a real store untouched', async () => {
     const realStore = join(work, 'REAL-completions');
     mkdirSync(realStore, { recursive: true });
@@ -959,9 +1165,11 @@ describe('runRealDispatchSmoke — the smoke worker\'s completion record goes to
 
   it('a launch that exits non-zero fails the smoke with launch-failed, without waiting for a record', async () => {
     const settings = { ...overlaySafetySettings({}, { readSettings: () => null }), smokeTimeoutMs: 5_000 };
-    const spawn = vi.fn(() => ({ status: 1, stdout: '', stderr: 'boom\n' }));
-    const r = await runRealDispatchSmoke({ tree: '/tree', env: {}, settings, spawn, pollMs: 1, home: join(work, 'home'), log: quietLog });
-    expect(r).toMatchObject({ ok: false, reason: 'launch-failed', detail: 'boom' });
+    const spawn = vi.fn(() => ({ status: 1, stdout: '', stderr: 'boomword\n' }));
+    const r = await runRealDispatchSmoke({ tree: '/tree', env: {}, settings, spawn, pollMs: 1, home: join(work, 'home'), log: quietLog, diagnosticsDir: join(work, 'diag') });
+    expect(r).toMatchObject({ ok: false, reason: 'launch-failed' });
+    expect(r.detail).toMatch(/^the launch harness failed; .*exitCode=1/);
+    expect(JSON.stringify(r)).not.toContain('boomword');
   });
 });
 

@@ -21,6 +21,7 @@ import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../conve
  * step that needs the network or the lane pool — acquire the lane at the PR's head ref, push, re-arm, release — and
  * the agent only edits files in the lane. A preamble on the brief says so. Antigravity runs Gemini in the existing lane; the launcher owns commits and pushes.
  */
+import { markFixPushAwaitingCi } from '../conveyor/fix-push-ci.mjs';
 import { execFileSync } from 'node:child_process';
 import * as nodeFs from 'node:fs';
 import { mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync, realpathSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -498,6 +499,7 @@ export async function resolveFixProvider(name) {
  */
 export async function runFixCli(argv = [], {
   run = sh,
+  recordPush = undefined,
   readPrompt = (p) => readFileSync(p, 'utf8'),
   removePrompt = removePromptFile,
   pendingRearm = defaultPendingRearm(),
@@ -623,7 +625,10 @@ export async function runFixCli(argv = [], {
     const configBefore = laneConfig();
     const risky = riskyLaneConfig(configBefore);
     if (risky.length) throw new LauncherError(`lane git config defines command/credential/remote-rewrite keys (${risky.join(', ')}); refusing to run in it`);
-    const rearm = () => {
+    const rearm = head => {
+      // Best effort: the push already landed, and a label hiccup must never stop the re-arm (the CI-lifecycle label pass relabels it).
+      try { markFixPushAwaitingCi({ repo: launch.repo, pr, head }, { run: (cmd, args) => run(cmd, args, { cwd: weRoot }), recordPush }); }
+      catch (e) { writeErr(`fix-run: PR #${pr} CI hand-off failed, re-arming anyway: ${String(e?.message ?? e).split('\n')[0]}\n`); }
       try {
         return run('node', [resolve(weRoot, 'scripts', 'conveyor', 'rearm-review.mjs'), pr, ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot });
       } catch (e) {
@@ -638,7 +643,7 @@ export async function runFixCli(argv = [], {
     // A prior run pushed this exact tip and then failed to re-arm (this lane opened AT that tip): finish the hand-back
     // now, before spending a whole agent run on it.
     if (pendingRearm.read(launch.repo, pr)?.sha === before) {
-      rearm();
+      rearm(before);
       pendingRearm.clear(launch.repo, pr);
       const result = `PR #${pr} (already pushed ${before.slice(0, 9)}; re-armed review:pending after a failed earlier re-arm)`;
       outcome = 'pushed'; reason = 'finished an earlier push';
@@ -859,7 +864,7 @@ export async function runFixCli(argv = [], {
       // Record the owed re-arm BEFORE the push (best effort): a crash anywhere after the push must not lose it.
       try { pendingRearm.write(launch.repo, pr, after); } catch (e) { writeErr(`fix-run: could not record the pending re-arm: ${String(e?.message ?? e)}\n`); }
       run('git', [...HARDENED_GIT_ARGS, 'push', '--no-verify', 'origin', `HEAD:refs/heads/${ref}`], { cwd: lanePath, env: gitEnv }); // never --force
-      rearm();
+      rearm(after);
       pendingRearm.clear(launch.repo, pr);
       result = `PR #${pr} (pushed ${after.slice(0, 9)}, re-armed review:pending)`;
       outcome = 'pushed'; reason = finalMessage || `pushed ${after.slice(0, 9)}`;

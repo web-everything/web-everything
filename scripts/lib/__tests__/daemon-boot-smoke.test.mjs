@@ -7,15 +7,16 @@
  * `we:scripts/conveyor/soak/breaks/daemon-entry-boot-crash.mjs` — it exercises the SAME fixture entry via the
  * SAME override this file uses, not the real production entry list (only this file's own last test does that).
  */
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   buildEntryBootScript, checkDaemonEntriesBoot, DAEMON_BOOT_SMOKE_CHECK, DAEMON_ENTRIES_ENV, DAEMON_ENTRY_MODULES,
-  isSafeRelativeEntry, resolveDaemonEntries,
+  isSafeRelativeEntry, pickSmokeDiagnostics, resolveDaemonEntries, resolveBootSettings, smokeErrorClass, writeStderrTail,
 } from '../daemon-boot-smoke.mjs';
+import { redactDetail } from '../daemon-rebuild/smoke-classify/redact-detail.mjs';
 
 describe('resolveDaemonEntries', () => {
   it('uses the real list when no override is set', () => {
@@ -77,7 +78,11 @@ describe('checkDaemonEntriesBoot — injected runChild (no real subprocess)', ()
     const m = /new URL\("([^"]+)"/.exec(String(args?.[2] || ''));
     return m ? m[1] : null;
   };
-  const ctx = (runChild) => ({ root: '/candidate', budgets: { daemonBootMs: 1000 }, runChild, env: {} });
+  // Raw child stderr tails go to owner-only files here, never into the user's real daemon state dir.
+  let diagnosticsDir;
+  beforeEach(() => { diagnosticsDir = mkdtempSync(join(tmpdir(), 'we-boot-diag-')); });
+  afterEach(() => rmSync(diagnosticsDir, { recursive: true, force: true }));
+  const ctx = (runChild) => ({ root: '/candidate', budgets: { daemonBootMs: 1000 }, runChild, env: {}, diagnosticsDir });
 
   it('passes when every entry reports ok', async () => {
     const r = await checkDaemonEntriesBoot(ctx(async () => '{"ok":true}'));
@@ -106,6 +111,103 @@ describe('checkDaemonEntriesBoot — injected runChild (no real subprocess)', ()
     expect(r.detail).toContain(DAEMON_ENTRY_MODULES[1]);
   });
 
+  it.each(['SIGTRAP', 'SIGSEGV', 'SIGABRT', 'SIGBUS', 'SIGILL'])('retries %s once after initial boots drain', async (signal) => {
+    const calls = [];
+    const broken = DAEMON_ENTRY_MODULES[0];
+    const r = await checkDaemonEntriesBoot(ctx(async (cmd, args) => {
+      const entry = scriptedEntry(args);
+      calls.push(entry);
+      if (entry === broken && calls.length === 1) {
+        throw Object.assign(new Error('native abort'), { signal, status: null, stderr: 'native stack' });
+      }
+      return '{"ok":true}';
+    }));
+    expect(r.ok).toBe(true);
+    expect(calls).toEqual([...DAEMON_ENTRY_MODULES, broken]);
+    expect(r.detail).toContain(`retried after ${signal}`);
+    expect(r.entries[0].attempts[0]).toMatchObject({ signal, exitCode: null, stderrFile: expect.any(String) });
+    expect(readFileSync(r.entries[0].attempts[0].stderrFile, 'utf8')).toBe('native stack\n');
+  });
+
+  it('rejects a second signal death and keeps the last 30 stderr lines in a 0600 file only', async () => {
+    let calls = 0;
+    const r = await checkDaemonEntriesBoot({ ...ctx(async () => {
+      calls++;
+      throw Object.assign(new Error('native abort'), { signal: 'SIGTRAP', status: null,
+        stderr: Array.from({ length: 40 }, (_, i) => `stack line ${i}`).join('\n') + '\n' });
+    }), env: { [DAEMON_ENTRIES_ENV]: 'fixture.mjs' } });
+    expect(calls).toBe(2);
+    expect(r.ok).toBe(false);
+    expect(r.detail).toContain('signal=SIGTRAP, exitCode=null, attempts=2');
+    expect(r.detail).not.toContain('stack line');
+    const file = r.entries[0].stderrFile;
+    expect(r.detail).toContain(`stderr=${file}`);
+    expect(file.startsWith(diagnosticsDir)).toBe(true);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    const lines = readFileSync(file, 'utf8').trimEnd().split('\n');
+    expect(lines).toHaveLength(30);
+    expect(lines[0]).toBe('stack line 10');
+    expect(lines[29]).toBe('stack line 39');
+  });
+
+  it.each([
+    Object.assign(new Error('exit failure'), { status: 1, signal: null, stderr: 'real failure' }),
+    Object.assign(new Error('timeout'), { status: null, signal: 'SIGKILL' }),
+    '{"ok":false,"error":"bad import"}',
+  ])('does not retry non-native failures', async (failure) => {
+    let calls = 0;
+    const r = await checkDaemonEntriesBoot({ ...ctx(async () => {
+      calls++;
+      if (failure instanceof Error) throw failure;
+      return failure;
+    }), env: { [DAEMON_ENTRIES_ENV]: 'fixture.mjs' } });
+    expect(r.ok).toBe(false);
+    expect(calls).toBe(1);
+    if (failure.status === 1) expect(r.detail).toContain('exitCode=1');
+  });
+
+  it('bounds initial concurrency and retries failed entries serially', async () => {
+    const pending = [];
+    const calls = [];
+    const promise = checkDaemonEntriesBoot(ctx((cmd, args) => new Promise((resolve, reject) => {
+      calls.push(scriptedEntry(args));
+      pending.push({ resolve, reject });
+    })));
+    expect(calls).toHaveLength(3);
+    pending[0].reject(Object.assign(new Error('native abort'), { signal: 'SIGTRAP' }));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(calls).toHaveLength(4);
+    pending[1].reject(Object.assign(new Error('native abort'), { signal: 'SIGABRT' }));
+    pending[2].resolve('{"ok":true}');
+    await new Promise(resolve => setImmediate(resolve));
+    expect(calls).toHaveLength(6);
+    for (const child of pending.slice(3)) child.resolve('{"ok":true}');
+    await new Promise(resolve => setImmediate(resolve));
+    expect(calls).toHaveLength(7);
+    pending[6].resolve('{"ok":true}');
+    await new Promise(resolve => setImmediate(resolve));
+    expect(calls).toHaveLength(8);
+    pending[7].resolve('{"ok":true}');
+    expect((await promise).ok).toBe(true);
+  });
+
+  it('resolves settings with provenance, supports disabling retries, and logs sources', async () => {
+    const env = { WE_SMOKE_BOOT_SIGNAL_RETRIES: '0', WE_SMOKE_BOOT_CONCURRENCY: '1', [DAEMON_ENTRIES_ENV]: 'fixture.mjs' };
+    expect(resolveBootSettings(env)).toMatchObject({ bootSignalRetries: 0, bootConcurrency: 1,
+      sources: { bootSignalRetries: 'env', bootConcurrency: 'env' } });
+    expect(resolveBootSettings({ WE_SMOKE_BOOT_CONCURRENCY: '0', WE_SMOKE_BOOT_SIGNAL_RETRIES: '-1' }))
+      .toMatchObject({ bootSignalRetries: 1, bootConcurrency: 3 });
+    const lines = [];
+    let calls = 0;
+    const r = await checkDaemonEntriesBoot({ ...ctx(async () => {
+      calls++;
+      throw Object.assign(new Error('abort'), { signal: 'SIGTRAP' });
+    }), env, log: { error: line => lines.push(line) } });
+    expect(r.ok).toBe(false);
+    expect(calls).toBe(1);
+    expect(lines[0]).toContain('"bootSignalRetries":"env"');
+  });
+
   it('fails when ONE entry\'s own child throws (killed / crashed before it could report) — the other entries still get judged', async () => {
     const brokenChild = DAEMON_ENTRY_MODULES[3];
     const runChild = async (cmd, args) => {
@@ -119,10 +221,27 @@ describe('checkDaemonEntriesBoot — injected runChild (no real subprocess)', ()
     expect(r.detail).toContain('1/'); // only the one broken entry, not every entry
   });
 
+  it('carries only the first 80 chars of a long child error line as its class', async () => {
+    const error = `ReferenceError: boom ${'e'.repeat(60)} tailword ${'e'.repeat(9_000)}`;
+    const r = await checkDaemonEntriesBoot(ctx(async () => JSON.stringify({ ok: false, error })));
+    expect(r.ok).toBe(false);
+    expect(r.detail).toContain(`class=${error.slice(0, 80)}`);
+    expect(r.detail).not.toContain('tailword');
+  });
+
   it('fails on unparsable child output rather than silently passing', async () => {
     const r = await checkDaemonEntriesBoot(ctx(async () => 'not json'));
     expect(r.ok).toBe(false);
     expect(r.detail).toContain('unparsable');
+  });
+
+  it('never carries the unparsable output itself: V8 quotes it, the class masks the quote', async () => {
+    const r = await checkDaemonEntriesBoot(ctx(async () => 'xq unparsablesentinel'));
+    expect(r.ok).toBe(false);
+    expect(r.entries[0].kind).toBe('unparsable child output');
+    expect(r.entries[0].errorClass).toMatch(/^SyntaxError: /);
+    expect(JSON.stringify(r)).not.toContain('unparsablesentinel');
+    expect(readFileSync(r.entries[0].stderrFile, 'utf8')).toContain('unparsablesentinel');
   });
 
   it('refuses an unsafe override entry BEFORE spawning anything (#4468 review — traversal/absolute/scheme)', async () => {
@@ -183,6 +302,7 @@ describe('checkDaemonEntriesBoot — real subprocess, real dynamic import (no fa
     writeFileSync(join(dir, 'tdz-entry.mjs'), "import './tdz-a.mjs';\n");
     const r = await checkDaemonEntriesBoot({
       root: dir, budgets: { daemonBootMs: 15_000 }, env: { ...process.env, [DAEMON_ENTRIES_ENV]: 'tdz-entry.mjs' },
+      diagnosticsDir: join(dir, 'diag'),
     });
     expect(r.ok).toBe(false);
     expect(r.detail).toContain('tdz-entry.mjs');
@@ -199,6 +319,7 @@ describe('checkDaemonEntriesBoot — real subprocess, real dynamic import (no fa
     const r = await checkDaemonEntriesBoot({
       root: dir, budgets: { daemonBootMs: 15_000 },
       env: { ...process.env, [DAEMON_ENTRIES_ENV]: 'clean-a.mjs,tdz-entry.mjs,clean-c.mjs' },
+      diagnosticsDir: join(dir, 'diag'),
     });
     expect(r.ok).toBe(false);
     expect(r.detail).toContain('1/3');
@@ -212,4 +333,153 @@ describe('checkDaemonEntriesBoot — real subprocess, real dynamic import (no fa
     expect(r.ok).toBe(true);
     for (const entry of DAEMON_ENTRY_MODULES) expect(r.detail).toContain(entry);
   }, 60_000);
+});
+
+describe('smoke diagnostics carry an allow-listed summary, never raw child text (operator send-back 2026-10-17)', () => {
+  let dir;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'we-boot-diag-summary-')); });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  // Words that are not secret-shaped, so only the design (not a redactor) can keep them out.
+  const words = (tag, n) => Array.from({ length: n }, (_, i) => `${tag}word${i}x`);
+  // Every word of the raw stderr that is not part of the error class must be absent from the summary.
+  const assertOnlyClass = (summary, stderr, errorClass) => {
+    for (const w of stderr.match(/[A-Za-z0-9]{6,}/g)) if (!String(errorClass).includes(w)) expect(summary).not.toContain(w);
+  };
+
+  it.each([
+    ['a quoted multi-line credential opening on the class line', [
+      ...words('frame', 40),
+      'TypeError: config load failed for "password: alphacred1x',
+      'bravocred2x charliecred3x"',
+      'DB_PASSWORD="deltacred4x',
+      'echocred5x"',
+    ], 'TypeError: config load failed for <…>'],
+    ['a CR-joined line after the class', ['RangeError: size limit\rfoxtrotcred6x', ...words('after', 5)], 'RangeError: size limit'],
+    ['text past 80 chars on the class line', [`RangeError: ${'a'.repeat(68)}golfcred7x`, 'hotelcred8x'], `RangeError: ${'a'.repeat(68)}`],
+    ['an escaped quote inside a quoted string', ['SyntaxError: bad "indiacred9x\\"julietcred10x" token', 'kilocred11x'], 'SyntaxError: bad <…> token'],
+  ])('%s: the alert-bound summary holds the error class only', async (_name, lines, errorClass) => {
+    const stderr = `${lines.join('\n')}\n`;
+    const r = await checkDaemonEntriesBoot({
+      root: '/candidate', budgets: { daemonBootMs: 1000 }, env: { [DAEMON_ENTRIES_ENV]: 'fixture.mjs' }, diagnosticsDir: dir,
+      // The bounded-child failure shape: its message carries the first stderr line.
+      runChild: async () => { throw Object.assign(new Error(`exited 1: ${lines[0]}`), { status: 1, signal: null, stderr }); },
+    });
+    expect(r.ok).toBe(false);
+    expect(r.entries[0].errorClass).toBe(errorClass);
+    const summary = JSON.stringify(r);
+    assertOnlyClass(summary, stderr, errorClass);
+    // The raw tail is in the local owner-only file the summary names, and only there.
+    const file = r.entries[0].stderrFile;
+    expect(r.detail).toContain(file);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    expect(readFileSync(file, 'utf8')).toBe(`${stderr.trimEnd().split(/\r\n|[\n\r]/).slice(-30).join('\n')}\n`);
+  });
+
+  it('an import failure keeps its stack frames in the file, never in the summary', async () => {
+    const error = 'ReferenceError: Cannot access \'secretname\' before initialization | at file:///x/limaframe.mjs:3 | at file:///x/mikeframe.mjs:9';
+    const r = await checkDaemonEntriesBoot({
+      root: '/candidate', budgets: { daemonBootMs: 1000 }, env: { [DAEMON_ENTRIES_ENV]: 'fixture.mjs' }, diagnosticsDir: dir,
+      runChild: async () => JSON.stringify({ ok: false, error }),
+    });
+    expect(r.entries[0].errorClass).toBe('ReferenceError: Cannot access <…> before initialization');
+    for (const w of ['secretname', 'limaframe', 'mikeframe']) expect(JSON.stringify(r)).not.toContain(w);
+    expect(readFileSync(r.entries[0].stderrFile, 'utf8')).toContain('mikeframe');
+  });
+
+  it('a summary field that is not its allow-listed type never carries text', async () => {
+    const r = await checkDaemonEntriesBoot({
+      root: '/candidate', budgets: { daemonBootMs: 1000 }, env: { [DAEMON_ENTRIES_ENV]: 'fixture.mjs' }, diagnosticsDir: dir,
+      runChild: async () => { throw Object.assign(new Error('x'), { status: 'novembercred12x', signal: 'oscarcred13x', stderr: '' }); },
+    });
+    expect(r.entries[0]).toMatchObject({ signal: null, exitCode: null, errorClass: null });
+    expect(JSON.stringify(r)).not.toMatch(/novembercred|oscarcred/);
+    expect(pickSmokeDiagnostics({ errorClass: 'not a class papacred14x', stderrFile: 'a\nquebeccred15x', launchStartedAt: 'romeocred16x' }))
+      .toMatchObject({ errorClass: null, stderrFile: null, launchStartedAt: null });
+  });
+
+  it('smokeErrorClass: first matching line, 80 chars, quotes masked; null when no line matches', () => {
+    expect(smokeErrorClass('warning\nTypeError: x is not a function\nError: second')).toBe('TypeError: x is not a function');
+    // The operator's pattern as written: a bare `Error:` or a coded `Error [ERR_X]:` line is not a class line.
+    expect(smokeErrorClass('Error: plain')).toBeNull();
+    expect(smokeErrorClass("Error [ERR_MODULE_NOT_FOUND]: Cannot find 'x'")).toBeNull();
+    expect(smokeErrorClass('  TypeError: indented')).toBeNull();
+    expect(smokeErrorClass("TypeError: can't open `sierra` file")).toBe('TypeError: can<…>');
+    expect(smokeErrorClass(`TypeError: x${String.fromCharCode(0x2028)}tangocred17x`)).toBe('TypeError: x');
+    expect(smokeErrorClass('')).toBeNull();
+    // Typographic, guillemet and fullwidth quotes are masked; bidi/zero-width characters dropped; token shapes redacted.
+    const q = (o, c) => `TypeError: bad ${String.fromCharCode(o)}uniformword1x${String.fromCharCode(c)} end`;
+    for (const [o, c] of [[0x201c, 0x201d], [0x2018, 0x2019], [0xab, 0xbb], [0xff02, 0xff02]]) expect(smokeErrorClass(q(o, c))).toBe('TypeError: bad <…> end');
+    expect(smokeErrorClass(`TypeError: a${String.fromCharCode(0x202e)}b${String.fromCharCode(0x200b)}c`)).toBe('TypeError: abc');
+    expect(smokeErrorClass('FetchError: to https://x:ghp_victorword2xAAAA@h failed')).not.toContain('victorword2x');
+  });
+
+  it('writeStderrTail: a fresh 0600 file under a 0700 dir; nothing to write or a failed write yields null', () => {
+    const sub = join(dir, 'diag');
+    const file = writeStderrTail(Array.from({ length: 50 }, (_, i) => `line ${i}`).join('\n'), { dir: sub, label: 'boot-scripts/x.mjs' });
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    expect(statSync(sub).mode & 0o777).toBe(0o700);
+    expect(readFileSync(file, 'utf8').trimEnd().split('\n')).toEqual(Array.from({ length: 30 }, (_, i) => `line ${i + 20}`));
+    expect(writeStderrTail('', { dir: sub })).toBeNull();
+    writeFileSync(join(dir, 'not-a-dir'), '');
+    expect(writeStderrTail('x', { dir: join(dir, 'not-a-dir') })).toBeNull();
+  });
+
+  // V8 copies raw input into a JSON parse message without escaping its quotes, so pairing quotes leaves the text
+  // between them raw (self-review, PR 5460): only one cleanly bounded string may be masked in place.
+  const v8JsonError = (input) => { try { JSON.parse(input); } catch (e) { return String(e); } throw new Error('parsed'); };
+  const ctx = (runChild) => ({ root: '/candidate', budgets: { daemonBootMs: 1000 }, env: { [DAEMON_ENTRIES_ENV]: 'fixture.mjs' }, diagnosticsDir: dir, runChild });
+
+  it('an import failure parsing malformed JSON never carries the copied input in its class', async () => {
+    // V8 copies about 10 chars of the input around the bad token: `…"{"pw": hotel"... is not valid JSON`.
+    const error = v8JsonError('{"pw": hotel, "b": "india"}');
+    const r = await checkDaemonEntriesBoot(ctx(async () => JSON.stringify({ ok: false, error })));
+    expect(error).toContain('hotel');
+    expect(r.entries[0].errorClass).toMatch(/^SyntaxError: [^"']*<…>$/);
+    expect(JSON.stringify(r)).not.toContain('hotel');
+    expect(readFileSync(r.entries[0].stderrFile, 'utf8')).toContain('hotel');
+  });
+
+  it.each(['x"julietcred3x"', "'kilocred4x", 'a", limacred5x, "b'])('unparsable output %s: a fixed class, the output only in the file', async (out) => {
+    const r = await checkDaemonEntriesBoot(ctx(async () => out));
+    expect(r.entries[0]).toMatchObject({ kind: 'unparsable child output', errorClass: 'SyntaxError: unparsable child output' });
+    expect(JSON.stringify(r)).not.toMatch(/julietcred|kilocred|limacred/);
+  });
+
+  it('smokeErrorClass: several quotes, an unclean quote or a quote after the first hide everything from the first', () => {
+    expect(smokeErrorClass('TypeError: a "x", mikecred6x, "y"')).toBe('TypeError: a <…>');
+    expect(smokeErrorClass('TypeError: bad ..."novembercred7x" here')).toBe('TypeError: bad ...<…>');
+    expect(smokeErrorClass('TypeError: bad "x"oscarcred8x')).toBe('TypeError: bad <…>');
+    expect(smokeErrorClass(`TypeError: bad ${String.fromCharCode(0x201c)}x${String.fromCharCode(0x201d)} papacred9x ${String.fromCharCode(0x2019)}`)).toBe('TypeError: bad <…>');
+    expect(smokeErrorClass(v8JsonError('{"pw": quebeccred10x}'))).not.toContain('quebeccred10x');
+  });
+
+  it('smokeErrorClass: a class-shaped line inside a quote opened on an earlier line is never the class', () => {
+    expect(smokeErrorClass('Error: cfg "pw: a\nTypeError: romeocred11x"\n')).toBeNull();
+    expect(smokeErrorClass('Error: cfg "pw: a\nTypeError: sierracred12x"\nRangeError: real one')).toBe('RangeError: real one');
+    // A contraction is not an opening quote.
+    expect(smokeErrorClass("warning: can't load x\nTypeError: y is not a function")).toBe('TypeError: y is not a function');
+  });
+
+  it('a bounded-child timeout still reads as one; its stderr stays in the file', async () => {
+    const r = await checkDaemonEntriesBoot(ctx(async () => {
+      throw Object.assign(new Error('timed out after 1000ms (process group killed)'), { status: null, signal: 'SIGKILL', stderr: 'tangocred13x\n' });
+    }));
+    expect(r.entries[0].kind).toBe('child failed: timed out after 1000ms (process group killed)');
+    expect(r.detail).toContain('child failed: timed out after 1000ms');
+    expect(JSON.stringify(r)).not.toContain('tangocred13x');
+  });
+
+  it('redactDetail keeps a whole boot or dispatch summary (its file path is near the end), other details at 500', () => {
+    const summary = `timeout; ${'x'.repeat(600)}; stderrFile=/state/smoke-diagnostics/a.log`;
+    expect(redactDetail(summary, 'dispatch-smoke')).toBe(summary);
+    expect(redactDetail(summary, 'daemon-entries-boot')).toBe(summary);
+    expect(redactDetail(summary)).toHaveLength(500);
+  });
+
+  it('a bad injected clock never makes the check throw', async () => {
+    const r = await checkDaemonEntriesBoot({ ...ctx(async () => 'not json'), now: () => Number.NaN });
+    expect(r.ok).toBe(false);
+    expect(r.entries[0].startedAt).toBeNull();
+  });
 });

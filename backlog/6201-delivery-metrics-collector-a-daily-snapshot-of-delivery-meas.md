@@ -2,11 +2,12 @@
 bornAs: xpdw3em
 kind: story
 size: 5
-status: active
+status: resolved
 scaffoldedBy: "delivery-metrics-cards"
 dateScaffolded: "2026-10-17"
 scope: ["we:scripts/operations/delivery-metrics.mjs", "we:scripts/operations/__tests__/delivery-metrics.test.mjs", "we:scripts/settings/delivery-metrics.json"]
 dateOpened: "2026-10-17"
+dateResolved: "2026-10-17"
 tags: []
 ---
 

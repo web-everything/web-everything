@@ -1,5 +1,33 @@
 # Testing — Three-Tier Strategy
 
+## Daemon entry boot smoke
+
+Boot each entry in a fresh child to preserve cold import graphs. `rebuildSmoke.bootConcurrency`
+(default 3) bounds initial boots; after those children drain, `rebuildSmoke.bootSignalRetries`
+(default 1; zero disables) retries only SIGTRAP/SIGSEGV/SIGABRT/SIGBUS/SIGILL deaths, serially.
+Exit failures and `ok:false` never receive this retry. Both settings use the policy cascade via
+`scripts/settings/rebuild-smoke.json`, with env overrides `WE_SMOKE_BOOT_CONCURRENCY` and
+`WE_SMOKE_BOOT_SIGNAL_RETRIES`; log effective values and sources. Env integers are strict
+digits; empty is unset.
+
+Smoke diagnostics never carry raw child stderr or stdout (operator decision, PR 5460). A boot or
+dispatch smoke failure detail, held state, self-sync alert and PR comment carry only an
+allow-listed summary (`daemon-boot-smoke.mjs#pickSmokeDiagnostics`): entry name, signal, exit
+code, attempts, launch start time, session/transcript presence, and an error class. The class is
+the first line matching `^[A-Z][A-Za-z]*Error:` that is not inside a quote opened on an earlier
+line, cut to 80 chars, with its quoted text (ASCII, typographic, guillemet and fullwidth) replaced
+by `<…>`: one cleanly bounded string in place, any other shape (several quotes, an unterminated
+or glued-on one) from the first quote to the end, because V8's JSON parse messages copy input
+with unescaped quotes. Control/format characters are dropped and token shapes redacted; a bare
+`Error:` line has none, and unparsable child output gets a fixed class. The raw output's last 30 lines go only to a new owner-only (0600) file under
+`<daemon state dir>/smoke-diagnostics` (0700, newest 500 kept), and the summary names its path.
+Culprit attribution reads typed repo-relative `files` the boot check extracts from the raw text
+in-process (`sourceFilesIn`), never the text itself.
+A transcript denial is counted, never quoted. Test with sentinel words that are not
+secret-shaped, so only the design can keep them out of every sink.
+Cover retry recovery, exhausted retries, non-signal refusal and concurrency with injected children;
+exercise diagnostic propagation through a real-git rebuild fixture. Run these suites through heavy admission.
+
 ## Red-team re-check evidence
 
 The post-accept re-check reads a separate, self-contained checkout pinned to `read.netBasis.rev`,
@@ -276,6 +304,11 @@ and `WE_COORDINATION_ROOT`, even when Vitest already supplies per-file roots. A 
 future-dated exhausted budget can otherwise make a fresh world wait for the production timeout.
 Use the clone's routing policy rather than an inherited daemon snapshot, and exclude generated
 GitHub App shim directories before scanning the host's tool PATH.
+
+General simulator and soak fixtures model the full required-check set and pin `WE_REVIEW_START_AFTER=ci-green`
+in the shared world environment. Keep the planner and dispatch-time gate on the same fixture policy across
+daemon restarts. Production fast-check eligibility is covered by `review-timing-dispatch.test.mjs` and
+`review-ci-gate-io.test.mjs`; scenarios exercising that timing must explicitly set their world policy and checks.
 
 Fake-`gh` CLI fixtures that exercise throttling must set `WE_GH_THROTTLE_LOCK_ROOT` to a temporary
 directory per invocation and route the binary to their fake. An intentional rate-limit response writes
@@ -1494,6 +1527,49 @@ Run `nightly-coroner-*.test.mjs` under `scripts/conveyor/__tests__/` through hea
 Cover ET boundaries and DST, persisted job adoption/catch-up, source logging, cursor continuity,
 publication deduplication, real isolated extraction, and release without cursor advance on failure.
 
+## Automated repair hand-offs
+
+`review-set-label` and the red-team gate signal the local fix daemon after a successful
+send-back. CI lifecycle/status writers use the same `scripts/lib/fix-handoff.mjs` wake
+path after their existing classification; they do not classify failures a second time.
+The mailbox survives signals during a tick; one-second file polling interrupts the plain
+sleep without consuming native filesystem watchers, and the optional webhook sleep also checks the mailbox. `WE_FIX_HANDOFF_DIR`
+provides an isolated mailbox for tests. A wake only schedules a normal pass; claims,
+scope, host admission and attempt budgets remain authoritative.
+
+The shared policy cascade resolves `fix.sendBackReservedSlots` (standard 1),
+`fix.ciMissingAfterPushMin` (standard 10), and `drain.mergeableUnknownRepollSec`
+(standard 20), independently through platform preferences, declared tool settings and
+`WE_FIX_SEND_BACK_RESERVED_SLOTS`, `WE_FIX_CI_MISSING_AFTER_PUSH_MIN`, and
+`WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC`. The cascade logs the value and source in
+daemons. Ordinary repairs cannot consume reserved slots, even after memory pressure
+reduces the effective cap; a send-back still needs host admission.
+
+The fixer pusher ensures `checking` and `status:awaiting-ci` exist before marking its new
+head with them. Test an initially empty repository label catalog and a same-head retry;
+`gh pr edit --add-label` refuses labels that have not been created. The existing
+`ci-red-recovery-watch` missing-run pass re-requests absent CI after the configured
+age (using a recorded fixer push time when available), retaining its conflict, claim, head and retry-budget guards. The drain re-reads
+UNKNOWN listings before collecting head-bound context and also revalidates before
+merging, waiting for the configured delay at most three times per read stage.
+
+### Overlay dispatch launch timeouts
+
+The real overlay dispatch smoke keeps its five-minute budget per attempt. Resolve
+`overlaySmoke.dispatchLaunchRetries` through the policy cascade (default 1, allowed 0–1;
+`WE_OVERLAY_DISPATCH_LAUNCH_RETRIES` overrides it) and log its source. Retry only a timeout
+with no marker file, completion record, Claude session file, or transcript. Use a fresh
+scratch store and session ID, retain both attempts' diagnostics, and report
+“retried after launch timeout” on recovery. Assertion failures never retry.
+The smoke opts into wrapper stderr capture and first-byte timing; missing output is
+represented by `firstOutputMs: null`, not zero. Failure alerts retain the wrapper PID,
+liveness at timeout, launch time, session/transcript presence, the error class and the path of
+the 0600 file holding the last 30 stderr lines; the wrapper's raw capture is removed after each
+attempt (see *Daemon entry boot smoke* above).
+Exercise the launch with injected processes and isolated homes; wrapper output capture
+also has a real Node-child probe in `worker-wrapper.test.mjs`. Run these suites through
+`node scripts/readiness/heavy-admission.mjs run -- npx vitest run <files>`.
+
 ## Referral re-checks on the live head
 
 `review.recheckCarriedReferrals` and `review.autoPolicyRespectsNotReal` default true in
@@ -1543,6 +1619,45 @@ reads the existing runs folder without migration or writes; `OPERATION_RUNS_DIR`
 it. `--since=<iso>` selects runs by earliest seat start. Incomplete runs are shown but
 excluded from median, nearest-rank p90 and the >5-minute early-change share denominator.
 Legacy runs without seat observations are omitted; absent times are never reconstructed.
+
+### Scope-only prepare re-validation
+
+The builder may send an individually dispatched `prepare-stale` card through a light
+re-validation before full preparation, only when the hold says scope changed (age
+holds still require full preparation). `prepare.lightRevalidate` defaults to true;
+`prepare.lightRevalidateMaxDiffLines` defaults to 400. Both use the prepare policy
+cascade and source logger, with `WE_PREPARE_LIGHT_REVALIDATE` and
+`WE_PREPARE_LIGHT_REVALIDATE_MAX_DIFF_LINES` environment overrides.
+
+The prepare runner supplies the existing card sections and the scope diff from
+`preparedAgainstSha` to the pinned main base to Codex sol at low effort. The worker
+must return JSON `{ "verdict": "still-valid" | "needs-reprepare", "reason": "one line" }`
+and leave the checkout unchanged. Only `still-valid` allows the runner to append
+`revalidated: <reason>` and refresh the sanctioned stamp. Missing evidence, invalid
+answers, disabled policy, and diffs above the cap use full preparation. A worker
+that changes files, HEAD, or hooks is refused. The worker runs in Codex's `--review`
+read-only sandbox with no network; that sandbox is the guard for edits deep inside
+collapsed ignored directories such as node_modules. As a second check, a fingerprint of
+the gitignored entries git lists (content for files up to 1 MiB, mode/size/mtime for
+collapsed directories, so only adding or removing a direct child shows there) is
+compared after the run. A change escalates for a human because a discard does not
+restore ignored files.
+Re-stamps use the existing verified
+card-only prepare PR lane; the builder waits for the stamp to land on main before
+building. Light candidates are excluded from grouped prepares so each verdict
+covers exactly the card and diff inspected. No direct write to main is permitted.
+
+Regression coverage must pair dispatch eligibility with age-stale and policy-disabled
+false cases, and exercise light candidates in both group-lead and group-member positions.
+Drive each read-only refusal guard independently (card text, HEAD, hooks, ignored files, and numstat),
+asserting discard and no stamp, commit, or PR. A failed stamp after `still-valid` must
+retry full preparation with the original dispatched provider, model, and effort; the
+result's scorecard and PR attribution follow whichever worker completed preparation.
+The light worker bypasses the router, so it applies the router's admission itself: a
+critical miss on its exact provider/model/prepare triple, an active provider quota hold,
+or an unreadable trial history skips it for full preparation by the dispatched worker.
+Prompt evidence uses the shared `fenceUntrusted` helper and `FENCED_DATA_RULE`; test
+closing-tag injection in both the card and diff, including mixed case and whitespace.
 
 ## Review scratch disk retention
 

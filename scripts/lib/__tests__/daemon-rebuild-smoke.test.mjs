@@ -1,13 +1,16 @@
 /** @file xhiqxz3 — the daemon's TICK rebuild runs the real dispatch smoke (#4481's) inside its candidate smoke, so
  * an overlay that breaks the worker launch is never adopted. Real-git fixtures; the worker launch is injected. */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { rebuildClone, readRebuildState } from '../daemon-rebuild.mjs';
 import { addOverlay, readOverlayState } from '../daemon-overlays.mjs';
-import { dispatchSmokeSuspects } from '../daemon-rebuild/smoke.mjs';
+import { dispatchSmokeSuspects, smokeFailureFiles } from '../daemon-rebuild/smoke.mjs';
+import { checkDaemonEntriesBoot, DAEMON_ENTRIES_ENV } from '../daemon-boot-smoke.mjs';
+import { runRealDispatchSmoke } from '../daemon-load-overlay.mjs';
+import { alertsFilePath } from '../daemon-rebuild/state.mjs';
 
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
@@ -91,6 +94,149 @@ afterEach(() => {
 });
 
 describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
+  // Operator decision (PR 5460, 2026-10-17): smoke failure details, held state and self-sync alerts carry an
+  // allow-listed summary (typed fields, the error class, the 0600 stderr file's path), never raw child text. The
+  // sentinel words below are not secret-shaped, so only the design (never a redactor) can keep them out.
+  const sinksOf = (f, result) => {
+    const dir = f.env.WE_DAEMON_OVERLAY_DIR;
+    const events = readdirSync(dir).filter((n) => n.endsWith('.events.jsonl')).map((n) => readFileSync(join(dir, n), 'utf8'));
+    return [JSON.stringify(result.alerts), JSON.stringify(readRebuildState(f.cloneDir, f.env)),
+      readFileSync(alertsFilePath(f.cloneDir, f.env), 'utf8'), ...events];
+  };
+  const expectAbsent = (sinks, words) => { for (const w of words) for (const s of sinks) expect(s).not.toContain(w); };
+
+  it('a boot failure reaches held state and self-sync alerts as its summary only; the tail is a 0600 file under the state dir', async () => {
+    const f = makeFixture();
+    addDispatchOverlay(f);
+    const frames = Array.from({ length: 30 }, (_, i) => `native stack frame${i}x`);
+    const stderr = ['warning alphaword1x', 'TypeError: load failed for "password: bravoword2x', 'charlieword3x"', ...frames].join('\n');
+    const boot = await checkDaemonEntriesBoot({ root: f.cloneDir, log: { error() {} },
+      // No diagnosticsDir: the default, `<WE_DAEMON_STATE_DIR>/smoke-diagnostics`.
+      env: { [DAEMON_ENTRIES_ENV]: 'fixture.mjs', WE_DAEMON_STATE_DIR: f.env.WE_DAEMON_STATE_DIR },
+      runChild: async () => { throw Object.assign(new Error('exited null: warning alphaword1x'), { signal: 'SIGTRAP', status: null, stderr }); },
+    });
+    const result = await rebuildClone({ root: f.cloneDir,
+      env: { ...f.env, WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' },
+      prState: async () => null, lockOpts: LOCK_OPTS, log: { error() {} },
+      runSmoke: async () => ({ verdict: 'code', smoke: { results: [{ name: 'daemon-entries-boot', ...boot }] } }),
+    });
+    expect(result.adopted).toBeFalsy();
+    const held = readRebuildState(f.cloneDir, f.env).held;
+    expect(held.details[0].detail).toContain('fixture.mjs: child failed (signal=SIGTRAP, exitCode=null, attempts=2');
+    expect(held.details[0].detail).toContain('class=TypeError: load failed for <…>');
+    const file = boot.entries[0].stderrFile;
+    expect(dirname(file)).toBe(join(f.env.WE_DAEMON_STATE_DIR, 'smoke-diagnostics'));
+    expect(held.details[0].detail).toContain(`stderr=${file}`);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    expect(readFileSync(file, 'utf8')).toBe(`${stderr.split('\n').slice(-30).join('\n')}\n`);
+    const alert = result.alerts.find((a) => a.kind === 'daemon-held-on-last-good');
+    expect(alert.detail.details).toEqual(held.details);
+    const stale = result.alerts.find((a) => a.kind === 'clone-held-stale');
+    expect(stale.detail.broken.details).toEqual(held.details);
+    expectAbsent(sinksOf(f, result), ['alphaword1x', 'bravoword2x', 'charlieword3x', 'native stack', 'frame29x']);
+  });
+
+  it('six failed boot entries each keep name, signal, exit code and class within the boot detail cap', async () => {
+    const f = makeFixture();
+    addDispatchOverlay(f);
+    const entries = ['a', 'b', 'c', 'd', 'e', 'f'].map((x) => `skills-src/conveyor/some-long-daemon-entry-name-${x}.mjs`);
+    const boot = await checkDaemonEntriesBoot({ root: f.cloneDir, log: { error() {} },
+      env: { [DAEMON_ENTRIES_ENV]: entries.join(','), WE_DAEMON_STATE_DIR: f.env.WE_DAEMON_STATE_DIR },
+      runChild: async () => { throw Object.assign(new Error(`exited 1: ${'m'.repeat(900)}`), {
+        signal: null, status: 1, stderr: `RangeError: ${'q'.repeat(200)}\n${'cr\r'.repeat(5_000)}\nkiloword4x`,
+      }); },
+    });
+    const result = await rebuildClone({ root: f.cloneDir,
+      env: { ...f.env, WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' },
+      prState: async () => null, lockOpts: LOCK_OPTS, log: { error() {} },
+      runSmoke: async () => ({ verdict: 'code', smoke: { results: [{ name: 'daemon-entries-boot', ...boot }] } }),
+    });
+    const text = readRebuildState(f.cloneDir, f.env).held.details[0].detail;
+    for (const entry of entries) expect(text).toContain(`${entry}: child failed (signal=null, exitCode=1, attempts=1`);
+    expect(text.match(/ stderr=\S+ class=RangeError: q{68}$/gm)).toHaveLength(6);
+    expect(text.length).toBeLessThanOrEqual(4_000);
+    expectAbsent(sinksOf(f, result), ['kiloword4x', 'mmmmmmmm', 'q'.repeat(69)]);
+  });
+
+  it('a boot failure still names its culprit files: typed paths read from the raw text in-process, not from the summary', async () => {
+    const root = '/tmp/work';
+    const stderr = [
+      'file:///tmp/work/scripts/conveyor/review.mjs:20',
+      "SyntaxError: The requested module '../takeover-budget.mjs' does not provide an export named 'x'",
+      'file:///etc/outside.mjs:1',
+    ].join('\n');
+    const boot = await checkDaemonEntriesBoot({ root, log: { error() {} }, diagnosticsDir: mktemp('we-rebuild-dsmoke-diag-'),
+      env: { [DAEMON_ENTRIES_ENV]: 'fixture.mjs', WE_SMOKE_BOOT_SIGNAL_RETRIES: '0' },
+      runChild: async () => { throw Object.assign(new Error('exited 1'), { status: 1, signal: null, stderr }); },
+    });
+    expect(boot.detail).not.toContain('review.mjs');
+    expect(boot.entries[0].files).toEqual(['scripts/conveyor/review.mjs', 'scripts/takeover-budget.mjs']);
+    expect(smokeFailureFiles([{ name: 'daemon-entries-boot', ...boot }], { candidatePath: root }))
+      .toEqual(['scripts/conveyor/review.mjs', 'scripts/takeover-budget.mjs']);
+    // A typed path outside the plain repo-relative shape is ignored.
+    expect(smokeFailureFiles([{ detail: '', entries: [{ files: ['../x.mjs', 'a b.mjs', 'ok/y.mjs'] }] }], { candidatePath: root })).toEqual(['ok/y.mjs']);
+  });
+
+  /** The real dispatch smoke, its worker launch injected: `onLaunch` plays the launched worker. */
+  const realDispatch = (f, onLaunch) => (args) => runRealDispatchSmoke({
+    ...args, settings: { ...args.settings, smokeTimeoutMs: 0 }, pollMs: 1, probeAlive: () => false, home: join(f.env.WE_DAEMON_STATE_DIR, 'home'),
+    log: { error() {} },
+    spawn: (_node, argv) => {
+      const [, , , , , sessionId, , , scratch] = argv;
+      onLaunch({ sessionId, scratch });
+      return { status: 0, stdout: JSON.stringify({ handle: 'pid:12345', wrapperPid: 12345 }), stderr: '' };
+    },
+  });
+
+  it('a dispatch-smoke timeout alert carries the allow-listed diagnostics only; each attempt\'s tail is a 0600 file', async () => {
+    const f = makeFixture();
+    addDispatchOverlay(f);
+    const stderr = ['booting limaword5x', 'SyntaxError: bad config "API_KEY=mikeword6x', 'novemberword7x"', 'progress\roscarword8x'].join('\n');
+    const r = await rebuild(f, realDispatch(f, ({ scratch }) => writeFileSync(join(scratch, 'wrapper.stderr'), stderr)));
+    expect(r.adopted).toBeFalsy();
+    const alert = r.alerts.find((a) => a.kind === 'dispatch-smoke-failed').detail;
+    expect(alert).toMatchObject({ reason: 'timeout', action: 'retry-with-backoff' });
+    expect(Object.keys(alert.diagnostics).sort()).toEqual(['attempts', 'errorClass', 'exitCode', 'firstOutputMs', 'launchStartedAt', 'sessionAppeared',
+      'signal', 'stderrFile', 'transcriptAppeared', 'wrapperAliveAtTimeout', 'wrapperPid']);
+    expect(alert.diagnostics).toMatchObject({ errorClass: 'SyntaxError: bad config <…>', wrapperPid: 12345, sessionAppeared: false });
+    expect(alert.attempts).toHaveLength(2);
+    for (const a of alert.attempts) {
+      expect(statSync(a.diagnostics.stderrFile).mode & 0o777).toBe(0o600);
+      expect(dirname(a.diagnostics.stderrFile)).toBe(join(f.env.WE_DAEMON_STATE_DIR, 'smoke-diagnostics'));
+      expect(readFileSync(a.diagnostics.stderrFile, 'utf8')).toContain('oscarword8x');
+    }
+    expectAbsent(sinksOf(f, r), ['limaword5x', 'mikeword6x', 'novemberword7x', 'oscarword8x', 'booting']);
+  });
+
+  it('a definite dispatch-smoke failure (a transcript denial) drops the overlay with no worker text in any sink', async () => {
+    const f = makeFixture();
+    addDispatchOverlay(f);
+    const body = 'This command requires approval: deploy --password "papaword9x\nquebecword10x"';
+    const r = await rebuild(f, realDispatch(f, ({ sessionId }) => {
+      const dir = join(f.env.WE_DAEMON_STATE_DIR, 'home', '.claude', 'projects', 'test');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, `${sessionId}.jsonl`), JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', is_error: true, content: body }] } }));
+    }));
+    expect(r.adopted).toBeFalsy();
+    expect(refs(f)).toEqual([]);
+    const alert = r.alerts.find((a) => a.kind === 'dispatch-smoke-failed').detail;
+    expect(alert).toMatchObject({ reason: 'commands-denied', action: 'dropped-suspects' });
+    expect(alert.detail).toMatch(/^1 denied tool call\(s\) in the transcript; /);
+    expectAbsent(sinksOf(f, r), ['requires approval', 'deploy', 'papaword9x', 'quebecword10x']);
+  });
+
+  it('an injected result cannot push free text through the alert diagnostics', async () => {
+    const f = makeFixture();
+    addDispatchOverlay(f);
+    const diagnostics = { stderrTail: 'romeoword11x', errorClass: 'TypeError: x\nsierraword12x', launchStartedAt: 'tangoword13x', wrapperPid: 42 };
+    const r = await rebuild(f, async () => ({ ok: false, reason: 'timeout', detail: 'no command ran and no completion record', diagnostics, attempts: [{ reason: 'timeout', diagnostics, extra: 'uniformword14x' }] }));
+    const alert = r.alerts.find((a) => a.kind === 'dispatch-smoke-failed').detail;
+    expect(alert.diagnostics).toMatchObject({ wrapperPid: 42, errorClass: null, launchStartedAt: null });
+    expect(alert.diagnostics).not.toHaveProperty('stderrTail');
+    expect(alert.attempts).toEqual([{ reason: 'timeout', diagnostics: alert.diagnostics }]);
+    expectAbsent(sinksOf(f, r), ['romeoword11x', 'sierraword12x', 'tangoword13x', 'uniformword14x']);
+  });
+
   it('a candidate whose new overlay fails the dispatch smoke is never adopted; the clone stays on last-good', async () => {
     const f = makeFixture();
     const lastGood = head(f);

@@ -6,6 +6,7 @@ import {
   SMOKE_ENVIRONMENT_VERDICTS, loadDifferentialEnabled, envLoadRetryDelayMs, isLoadShapedRow, busyPoolSkippedChecks,
   redactDetail,
 } from './smoke-classify/index.mjs';
+import { isRepoFile, pickSmokeDiagnostics, sourceFilesIn } from '../daemon-boot-smoke.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidate } from './state.mjs';
 import { releaseBuildLease } from './lease.mjs';
@@ -78,34 +79,14 @@ export function smokePassIdentity(git, sha, cloneKind = 'daemon') {
 
 // ── smoke-rejection helpers ────────────────────────────────────────────────────────────────────────────────
 
-/** PURE: repository files named by complete source locations in raw smoke failure details. */
+/** PURE: repository files named by complete source locations in raw smoke failure details, plus the typed `files`
+ *  a boot check's entries carry (its detail is a summary: the locations were read from the raw child text in-process). */
 export function smokeFailureFiles(failedRows, { candidatePath }) {
   const files = new Set();
-  const prefix = candidatePath ? candidatePath.replace(/\/$/, '') + '/' : null;
-  const add = (path) => {
-    const normalized = posix.normalize(path);
-    if (normalized !== '.' && normalized !== '..' && !normalized.startsWith('../') && !posix.isAbsolute(normalized)) {
-      files.add(normalized);
-      return normalized;
-    }
-    return null;
-  };
   for (const row of failedRows || []) {
-    const detail = String(row?.detail ?? '');
-    const importers = [];
-    for (const match of detail.matchAll(/(?:file:\/\/(\/[^\s"'<>():]+)|(\/[^\s"'<>():]+\.(?:mjs|js|cjs|json|ts))):\d+/g)) {
-      const absolute = match[1] ?? match[2];
-      const relative = prefix && absolute.startsWith(prefix)
-        ? absolute.slice(prefix.length)
-        : absolute.match(/\/[^/]+\.candidate-[^/]+\/(.+)$/)?.[1];
-      if (relative) {
-        const importer = add(relative);
-        if (importer) importers.push(importer);
-      }
-    }
-    for (const match of detail.matchAll(/The requested module '([^']+)'/g)) {
-      if (!match[1].startsWith('./') && !match[1].startsWith('../')) continue;
-      for (const importer of importers) add(posix.join(posix.dirname(importer), match[1]));
+    for (const file of sourceFilesIn(row?.detail, candidatePath)) files.add(file);
+    for (const entry of Array.isArray(row?.entries) ? row.entries : []) {
+      for (const file of Array.isArray(entry?.files) ? entry.files : []) if (isRepoFile(file)) files.add(file);
     }
   }
   return [...files].sort();
@@ -511,6 +492,7 @@ export async function smokeAndAdopt({
   /** xhiqxz3 — a passed dispatch smoke: say so (the proof line the live daemon's log carries). */
   const dispatchPassedAlert = (d) => alert('dispatch-smoke-passed', {
     suspects: d.suspects.map((s) => ({ ref: s.ref, pr: s.pr, matched: s.matched })),
+    note: d.result.note ?? null,
     ms: d.result.ms ?? null, sessionId: d.result.sessionId ?? null,
   });
   /** xhiqxz3 — a FAILED dispatch smoke: never adopt; hold on last-good. A definite failure drops just the suspect
@@ -518,9 +500,14 @@ export async function smokeAndAdopt({
   const dispatchFailed = async (d) => {
     const { result, suspects } = d;
     const definite = DISPATCH_SMOKE_DEFINITE.has(result.reason);
-    const why = `dispatch-smoke-failed: ${result.reason}${result.detail ? ` — ${result.detail}` : ''}`;
+    // Redacted and bounded once here: `why` reaches held state, the overlay list and the overlay event log.
+    const why = redactDetail(`dispatch-smoke-failed: ${result.reason}${result.detail ? ` — ${result.detail}` : ''}`, 'dispatch-smoke');
     alert('dispatch-smoke-failed', {
-      reason: result.reason, detail: redactDetail(result.detail ?? ''),
+      reason: result.reason, detail: redactDetail(result.detail ?? '', 'dispatch-smoke'),
+      // The allow-listed summary only (typed fields, the error class, the 0600 stderr file's path) — never child text.
+      diagnostics: pickSmokeDiagnostics(result.diagnostics),
+      attempts: Array.isArray(result.attempts)
+        ? result.attempts.map((a) => ({ reason: typeof a?.reason === 'string' ? a.reason : null, diagnostics: pickSmokeDiagnostics(a?.diagnostics) })) : [],
       suspects: suspects.map((s) => ({ ref: s.ref, pr: s.pr, matched: s.matched })),
       evidence: result.scratch ?? null, transcript: result.transcript ?? null,
       action: definite ? 'dropped-suspects' : 'retry-with-backoff',
@@ -620,7 +607,7 @@ export async function smokeAndAdopt({
         since,
         reason,
         failed: failed.map((r) => r.name).join(','),
-        details: failed.map((r) => ({ name: r.name, detail: redactDetail(r.detail) })).slice(0, 10),
+        details: failed.map((r) => ({ name: r.name, detail: redactDetail(r.detail, r.name) })).slice(0, 10),
         lastGood: prevHead,
         target: plan.finalSha,
         mainSha: plan.mainSha,
@@ -629,6 +616,7 @@ export async function smokeAndAdopt({
       };
     }, { release: true })) ?? readRebuildState(root, stEnv);
     alert('daemon-held-on-last-good', {
+      details: failed.map((r) => ({ name: r.name, detail: redactDetail(r.detail, r.name) })),
       reason, failed: failed.map((r) => r.name).join(','), since: since ?? state.held?.since ?? null, lastGood: prevHead, target: plan.finalSha,
       message: 'the new build failed its live smoke — staying on the last working build and still dispatching from it (x5wbsbc)',
     });
@@ -650,7 +638,7 @@ export async function smokeAndAdopt({
   if (a.threw) {
     // `daemon-live-smoke.mjs` documents itself as never throwing — this is defense-in-depth only. Root was
     // never touched, so nothing to roll back; hold on last-good and let the next tick retry fresh.
-    alert('smoke-threw', String(a.threw?.message || a.threw));
+    alert('smoke-threw', redactDetail(String(a.threw?.message || a.threw)));
     await hold('smoke-threw', []);
     return { moved: false, reason: 'smoke-threw', plan, alerts: [...prepAlerts, ...alertsList] };
   }
@@ -689,7 +677,7 @@ export async function smokeAndAdopt({
     });
     alert('smoke-rejected', {
       failed: failedNames,
-      details: failedA.map((r) => ({ name: r.name, detail: redactDetail(r.detail) })),
+      details: failedA.map((r) => ({ name: r.name, detail: redactDetail(r.detail, r.name) })),
       ...(rejected?.retryAt ? { retryAt: rejected.retryAt, attempts: rejected.attempts } : {}),
       ...(rejected ? {} : { recorded: false }),
     });
@@ -720,7 +708,7 @@ export async function smokeAndAdopt({
   };
   const envLoadAlert = (extra) => alert('smoke-env-load', {
     failed: failedA.map((r) => r.name).join(','),
-    details: failedA.map((r) => ({ name: r.name, ms: r.ms, detail: redactDetail(r.detail) })),
+    details: failedA.map((r) => ({ name: r.name, ms: r.ms, detail: redactDetail(r.detail, r.name) })),
     suspects: suspects.map((ap) => ({ ref: ap.ref, pr: ap.pr })),
     ...extra,
     message: 'every failed check is load-shaped (timeout / lock contention) and no same-run differential pinned it on an overlay — environment, not the candidate; overlays kept, retrying with backoff',
@@ -876,7 +864,7 @@ export async function smokeAndAdopt({
     const retryAt = new Date(now() + rejectRetryDelayMs(env, attempts)).toISOString();
     alert('smoke-harness-broken', {
       failed: failedA.map((r) => r.name).join(','),
-      details: cFailed.map((r) => ({ name: r.name, detail: redactDetail(r.detail) })),
+      details: cFailed.map((r) => ({ name: r.name, detail: redactDetail(r.detail, r.name) })),
       alsoFailedOn: bFailed ? ['plain-main', 'last-good'] : ['last-good'],
       retryAt,
       attempts,
