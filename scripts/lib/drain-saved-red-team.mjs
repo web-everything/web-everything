@@ -19,7 +19,7 @@ export function readSavedRedTeamSetting({ env = process.env, tool, platform, log
 }
 
 // GitHub slugs are case-insensitive: an operator's `--repo=` and the review job's slug name the same repo.
-const sameRepo = (a, b) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
+export const sameRepo = (a, b) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
 
 /**
  * The lazy saved-result fallback every comment-only reader of the gate's decision shares (the drain hold, RULING

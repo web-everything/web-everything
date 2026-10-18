@@ -839,35 +839,50 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
   });
   // Operator ruling (PR #5551): a run that ran but left no usable result is not "never scheduled". The head stays
   // held until a usable result exists; the re-run path is a separate card.
-  it.each([
-    ['errored', { status: 'error' }, 'error'],
-    ['unparseable', { status: 'ran', comment: 'posted-failed' }, 'unparseable'],
-    ['not-posted', { status: 'ran', comment: 'not-posted' }, 'not-posted'],
-    ['errored, no job status', null, 'error'],
-  ])('an %s red-team run plus 45 min elapsed is still held', (_name, result, rowStatus) => {
+  function erroredRunAfterDeadline({ status, row, writer = LOCAL, rev = HEAD, read = {} }) {
     const root = mkdtempSync(join(tmpdir(), 'drain-errored-red-team-'));
     try {
       const env = { CONVEYOR_STATE_ROOT: root, WE_SHARED_RUNS_DIR: join(root, 'runs') };
-      const rows = [{ dispatchKind: 'review-seat', seat: 'red-team', repo: LOCAL, pr: 5283, rev: HEAD, status: rowStatus, seatVerdict: null }];
+      const rows = row ? [{ dispatchKind: 'review-seat', seat: 'red-team', repo: LOCAL, pr: 5283, rev: HEAD, status: row, seatVerdict: null }] : [];
       const path = resolveScorecardStorePath(env);
       mkdirSync(dirname(path), { recursive: true });
       writeFileSync(path, JSON.stringify({ version: 1, records: rows }));
-      if (result) recordRedTeamStatus({ repo: LOCAL, pr: 5283, status: 'finished', result,
-        loopPayload: { verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: HEAD } } } } }, { env });
-      const evidence = readDrainRedTeamEvidence({ repo: LOCAL, pr: 5283, head: HEAD, env, readScorecards: () => rows });
-      expect(evidence.recorded).toBe(false);
+      if (status) recordRedTeamStatus({ repo: writer, pr: 5283, ...status,
+        loopPayload: { verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev }, ...read } } } }, { env });
+      // The job that wrote the status is gone: a dead pid is not a live pass.
+      const evidence = readDrainRedTeamEvidence({ repo: LOCAL, pr: 5283, head: HEAD, env, readScorecards: () => rows, isAlive: () => false });
+      expect(evidence).toMatchObject({ recorded: false, inFlight: false });
       let clock = 1000;
       const requests = [];
       const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], now: () => clock, env,
         evidence: { ...evidence, loopPayload: evidence.loopPayload ?? { verdict: { verdict: 'accept' } } },
         requestRedTeam: input => { requests.push(input); return { requested: true }; } });
-      expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+      const first = h.s.enqueue({ num: 5283 }, HEAD, { comments: [] });
       clock += 45 * 60_000;
-      expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, kind: 'red-team-pending', healthSmell: true });
-      expect(h.logs.join('')).not.toContain('red team never scheduled');
-      expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
-      expect(requests).toHaveLength(0);
+      return { first, second: h.s.enqueue({ num: 5283 }, HEAD, { comments: [] }), h, requests };
     } finally { rmSync(root, { recursive: true, force: true }); }
+  }
+  it.each([
+    ['errored', { status: { status: 'finished', result: { status: 'error' } }, row: 'error' }],
+    ['errored with no seat row', { status: { status: 'finished', result: { status: 'error' } } }],
+    ['unparseable', { status: { status: 'finished', result: { status: 'ran', comment: 'posted-failed' } }, row: 'unparseable' }],
+    ['not-posted', { status: { status: 'finished', result: { status: 'ran', comment: 'not-posted' } }, row: 'not-posted' }],
+    ['errored, no job status', { row: 'error' }],
+    ['crashed while running', { status: { status: 'running' } }],
+    ['errored, status written under another repo and head case',
+      { status: { status: 'finished', result: { status: 'error' } }, writer: 'Web-Everything/Web-Everything', rev: HEAD.toUpperCase() }],
+  ])('an %s red-team run plus 45 min elapsed is still held', (_name, run) => {
+    const { first, second, h, requests } = erroredRunAfterDeadline(run);
+    expect(first).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(second).toMatchObject({ enqueued: false, kind: 'red-team-pending', healthSmell: true });
+    expect(h.logs.join('')).not.toContain('red team never scheduled');
+    expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
+    expect(requests).toHaveLength(0);
+  });
+  it('a card-only head with an errored red-team run is still not owed a pass', () => {
+    const { first } = erroredRunAfterDeadline({ status: { status: 'finished', result: { status: 'error' } }, row: 'error',
+      read: { netChangedFiles: ['backlog/123-card.md'] } });
+    expect(first).toMatchObject({ enqueued: true });
   });
   it('honors the fallback switch and logs its source', () => {
     let clock = 1000;
