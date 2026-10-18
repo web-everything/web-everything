@@ -1,4 +1,5 @@
 ---
+bornAs: x6lgglx
 kind: story
 size: 2
 status: open
