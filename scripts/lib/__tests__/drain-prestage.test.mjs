@@ -39,6 +39,13 @@ describe('CI pre-stage', () => {
     expect(f.enqueue).not.toHaveBeenCalled();
     expect(f.cache.get(repo, 42, 30)).toBeNull();
   });
+  it('keeps the preparation when the live read refuses (an out-of-scope PR is not stale)', async () => {
+    const f = fixture();
+    f.readPr.mockRejectedValue(new Error('PR outside this run\'s --label/--base selection'));
+    await expect(f.run()).resolves.toEqual({ fallback: true });
+    expect(f.enqueue).not.toHaveBeenCalled();
+    expect(f.cache.get(repo, 42, 30)).not.toBeNull();
+  });
   it.each(['REQUIRED_WORKFLOWS_UNSATISFIED', 'CONFLICT', 'UNREADABLE'])('drops cached admission and falls back when enqueue throws %s', async code => {
     const f = fixture();
     f.pr.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: head };

@@ -5021,7 +5021,8 @@ async function runCli() {
   // The entry stores labels as their sorted-name signature; a missing entry falls through to the miss path.
   const prepared = !DRY_RUN && flags['from-green-event'] && onlyPr != null ? prestageCache.get(localSlug, Number(onlyPr), prestageSetting.value.prestageTtlMin) : null;
   const preparedLabels = (() => { try { return JSON.parse(prepared?.labels ?? 'null'); } catch { return null; } })();
-  if (!DRY_RUN && flags['from-green-event'] && onlyPr != null && !onlyRepo && REPOS.some(isLocalRepo) && mergeStrategy.enqueues(null)
+  // `--only` matches the listing's string comparison (`matchesOnlyTarget`): `--only=042` selects no PR there.
+  if (!DRY_RUN && flags['from-green-event'] && onlyPr != null && String(Number(onlyPr)) === String(onlyPr) && !onlyRepo && REPOS.some(isLocalRepo) && mergeStrategy.enqueues(null)
       && (!prepared || operatorSelects({ ...prepared, labels: preparedLabels }))) {
     // The global stop-the-line signal can change independently of any PR head/label.
     const freeze = redMainBypass ? null : await readDrainFreezePass();
@@ -5032,7 +5033,9 @@ async function runCli() {
         const { stdout } = await execFileP('gh', ['pr', 'view', String(onlyPr), ...repoFlag(null), '--json',
           'number,headRefOid,labels,statusCheckRollup,state,isDraft,body,baseRefName,reviewDecision,mergeable,mergeStateStatus'], { encoding: 'utf8' });
         const pr = JSON.parse(stdout);
-        if (!operatorSelects(pr)) return null;
+        // The cache is re-read inside enqueuePrestage, so a concurrently written entry may be unchecked here. Out of
+        // scope is not stale: throwing falls back without dropping it (a null read would invalidate it).
+        if (!operatorSelects(pr)) throw new Error('PR outside this run\'s --label/--base selection');
         // The same full `--check` read the listing and the pre-merge re-read use: gh caps the rollup at 100 contexts.
         return attachLiveFixClaim(await resolveChecks(null, pr), { claimKey: repoKeyForSlug(localSlug), readClaim: readLiveFixClaim });
       },

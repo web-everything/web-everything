@@ -1581,7 +1581,7 @@ describe('pre-staged green events', () => {
     ['an eligibility label', mark(42, 'pull_request.labeled(ready-to-merge)@13')],
   ])('re-wakes a PR when %s arrives during its own run', async (_, late) => {
     const prestageCache = { get: () => ({ eligible: true }), drop: vi.fn() };
-    const { handle, calls, children } = setup({ prestageCache, manualFinish: true, drainJson: pendingChecks });
+    const { handle, calls, children, advance } = setup({ prestageCache, manualFinish: true, drainJson: pendingChecks });
     handle.notePoll({ ok: true, marked: [mark()] });
     const first = handle.tick();
     await flush();
@@ -1591,6 +1591,7 @@ describe('pre-staged green events', () => {
     expect(calls).toHaveLength(1);
     children[0].finish();
     await first;
+    advance(15_000); // a label wake is not a staged green event: it keeps the ordinary debounce
     const second = handle.tick();
     await flush();
     expect(calls).toHaveLength(2);
