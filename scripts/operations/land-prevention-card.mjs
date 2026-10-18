@@ -82,6 +82,7 @@
  *   node scripts/operations/land-prevention-card.mjs --drain-pending
  *   node scripts/operations/land-prevention-card.mjs --fold-open-singles [--json]
  */
+import { owePreventionFiling, fileOwedPrevention } from '../lib/prevention-filing-owed.mjs';
 import { machinePrTitle, preventionCardTitle } from './machine-pr-title.mjs';
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync, readdirSync, renameSync } from 'node:fs';
@@ -237,6 +238,7 @@ export function parseLandPreventionCardArgv(argv = []) {
     parent: String(flags.parent ?? ''),
     queue: String(flags.queue),
     session: String(flags.session),
+    ...(flags['owed-key'] ? { owedKey: flags['owed-key'] } : {}),
     retract: retractFlags.every(Boolean)
       ? { repo: retractFlags[0], pr: retractFlags[1], headSha: retractFlags[2] }
       : null,
@@ -464,7 +466,16 @@ export async function foldOpenSingles({ lane }, {
  * @returns {Promise<{ok:boolean, step:string, num:(number|string|null), rel:(string|null), pr:(number|null),
  *   url:(string|null), reason:(string|null)}>}
  */
-export async function landPreventionCard(input, {
+export async function landPreventionCard(input, options = {}) {
+  try {
+    const loadFilingSettings = options.loadFilingSettings ?? loadPreventionBatchSettings;
+    if (loadFilingSettings().filingEnabled === false) return await landPreventionCardImpl(input, options);
+    if (options.owedClaimed) return await landPreventionCardImpl(boundLandPreventionCardInput(input), options);
+    return await fileOwedPrevention(input, filing => landPreventionCardImpl(filing.owedKey ? boundLandPreventionCardInput(filing) : filing, options));
+  } catch (e) { return { ok: false, step: 'owed', reason: e.message, pr: null, url: null }; }
+}
+
+async function landPreventionCardImpl(input, {
   exec = defaultExec,
   pendingDir = pendingPreventionDir(),
   write = (line) => process.stdout.write(line),
@@ -482,6 +493,7 @@ export async function landPreventionCard(input, {
   write(`${formatPreventionBatchSettings(filing)}\n`);
   if (filing.filingEnabled === false) {
     const reason = 'prevention filing paused by prevention.filingEnabled';
+    if (input.title) owePreventionFiling(input);
     write(`${reason}\n`);
     return { ok: false, skipped: true, step: 'paused', reason, num: null, rel: null, pr: null, url: null };
   }

@@ -94,6 +94,19 @@ deadline; it cannot use the never-scheduled escape or trigger a second post-acce
 The focused timing, review-seat and drain-seat suites cover this boundary.
 
 
+## Paused prevention filing obligations
+
+A `prevention.filingEnabled=false` result remains a failed/paused filing. Both the spawn
+seam and detached filer persist the card input under the shared card-batch state's
+`owed-prevention/` directory. The obligation key excludes session/transport flags and includes
+source repo/PR plus the card input. Exclusive publication preserves the first record;
+completed records remain as dedupe tombstones. A subsequent landing call or the periodic
+card-batch reconcile tick uses the existing filer under an obligation lease. Only a successful
+filing (including a durable pending-card spool) marks it done; refused or failed filings stay owed.
+A detached spawn alone never completes the obligation. Replay carries the original obligation
+key across the CLI's text bounding so truncation cannot create another obligation identity.
+Use temporary `WE_CARD_BATCH_STATE_DIR` roots when testing pause/replay.
+
 ## Periodic card batch recovery
 
 `card-batch-reconcile.mjs` shares admission's terminal-PR retirement and per-state lease.

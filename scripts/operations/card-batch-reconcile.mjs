@@ -1,4 +1,6 @@
 /** Periodic terminal-PR recovery, pending-card drain and due-batch flush. */
+import { reconcileOwedPrevention } from '../lib/prevention-filing-owed.mjs';
+import { loadPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
 import { readFileSync, readdirSync, rmSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -23,7 +25,7 @@ export async function reconcileCardBatches({
   log = line => process.stderr.write(`${line}\n`), remote = 'origin', laneDir,
   leaseMs = 60_000, owner = `reconcile:${process.pid}:${randomUUID()}`,
   seal = sealDueBatches, drain = landPreventionCard, batch = fileIntoBatch,
-  dryRun = false,
+  dryRun = false, fileOwed = landPreventionCard, loadFilingSettings = loadPreventionBatchSettings,
 } = {}) {
   if (!Number.isFinite(leaseMs) || leaseMs <= 0) throw new TypeError('leaseMs must be positive');
   // `now` is the cadence/flush sample; lease expiry must follow elapsed wall time during GitHub/Git IO.
@@ -76,6 +78,15 @@ export async function reconcileCardBatches({
     } catch (error) {
       if (error.code !== 'ENOENT') results.push({ action: 'error', step: 'drain', reason: error.message });
     }
+  }
+  if (!dryRun && loadFilingSettings().filingEnabled !== false) {
+    try {
+      const owed = await reconcileOwedPrevention({ stateDir,
+        file: input => fileOwed(input, { owedClaimed: true, loadFilingSettings, pendingDir,
+          batch: (card, options) => batch(card, { ...options, stateDir }), write: line => log(line.trimEnd()) }),
+      });
+      for (const result of owed) if (!result.ok) results.push({ action: 'error', step: 'owed', reason: result.reason });
+    } catch (error) { results.push({ action: 'error', step: 'owed', reason: error.message }); }
   }
   if (!dryRun) {
     try { await seal({ stateDir, now }); }

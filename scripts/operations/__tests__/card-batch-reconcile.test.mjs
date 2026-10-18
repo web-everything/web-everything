@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { retireBatch } from '../card-batch-io.mjs';
 import { reconcileCardBatches, resolveReconcileIntervalMin, main } from '../card-batch-reconcile.mjs';
 
 const roots = [];
@@ -17,11 +18,14 @@ function fixture() {
 }
 
 describe('reconcileCardBatches', () => {
-  it.each(['OPEN', 'unreadable', 'unknown'])('keeps %s state untouched', async status => {
-    const f = fixture(); const before = readFileSync(f.path, 'utf8');
+  it.each(['OPEN', 'unreadable', 'unknown', null, undefined, '', 'merged', 'wrong-pr', 'wrong-branch'])('keeps %s state untouched', async status => {
+    const f = fixture(); f.state.terminalPrState = 'MERGED'; writeFileSync(f.path, JSON.stringify(f.state));
+    const before = readFileSync(f.path, 'utf8');
     const results = await reconcileCardBatches({ ...f, gh: async () => {
       if (status === 'unreadable') throw Error('offline');
-      return JSON.stringify({ number: 272, headRefName: 'lane/card-batch-prevention-9', state: status });
+      return JSON.stringify({ number: status === 'wrong-pr' ? 999 : 272,
+        headRefName: status === 'wrong-branch' ? 'other' : 'lane/card-batch-prevention-9',
+        state: ['wrong-pr', 'wrong-branch'].includes(status) ? 'MERGED' : status });
     } });
     expect(results[0]).toMatchObject({ action: 'refuse', reason: 'batch-sealed' });
     expect(readFileSync(f.path, 'utf8')).toBe(before);
@@ -94,3 +98,12 @@ it('reports drain and seal failures independently', async () => {
 it('defaults the interval when settings cannot be read', () => {
   expect(resolveReconcileIntervalMin({ read: () => { throw Error('unreadable'); } })).toBe(5);
 });
+
+it.each(['OPEN', 'MERGED', 'CLOSED', null, undefined, 'UNKNOWN'])(
+  'the archive writer refuses an unverified terminalPrState hint %s', terminalPrState => {
+    const f = fixture(); const before = readFileSync(f.path, 'utf8');
+    expect(() => retireBatch(f.path, f.state, { repo: 'org/repo', kind: 'prevention', held: () => true, terminalPrState }))
+      .toThrow('batch-sealed');
+    expect(readFileSync(f.path, 'utf8')).toBe(before);
+    expect(existsSync(join(f.stateDir, 'sealed'))).toBe(false);
+  });

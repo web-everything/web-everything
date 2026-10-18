@@ -68,11 +68,14 @@ export async function publishBatch(input, opts = {}) {
     if (['MERGED', 'CLOSED'].includes(state.terminalPrState)) {
       // An archive hint cannot bypass seal checks or authorize a stale terminal state.
       if (state.seal?.step !== 'label-on-green') return refuse('batch-sealed');
-      const view = JSON.parse(await gh(['pr', 'view', String(state.pr), '--repo', repo, '--json', 'number,state,headRefName']));
+      let view;
+      try { view = JSON.parse(await gh(['pr', 'view', String(state.pr), '--repo', repo, '--json', 'number,state,headRefName'])); }
+      catch { return refuse('batch-sealed'); }
       if (!held()) return refuse('lease-held');
-      if (Number(view.number) !== Number(state.pr) || view.headRefName !== state.batchRef
+      if (Number(view?.number) !== Number(state.pr) || view?.headRefName !== state.batchRef
         || !['MERGED', 'CLOSED'].includes(view.state)) return refuse('batch-sealed');
-      return { action: 'sealed', state };
+      if (basename(dirname(statePath)) === 'sealed' || readState(statePath).lastSealedState) return { action: 'sealed', state };
+      // Active slots retire through the common fresh-read path below.
     }
     const check = async () => {
       if (!held()) return 'lease-held';

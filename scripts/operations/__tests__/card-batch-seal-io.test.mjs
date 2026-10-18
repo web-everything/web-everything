@@ -452,3 +452,30 @@ it.each(['OPEN', 'wrong-pr', 'incomplete'])('a terminal archive hint still requi
   expect(f.exec).not.toHaveBeenCalled();
   expect(gh).toHaveBeenCalledTimes(scenario === 'incomplete' ? 0 : 1);
 });
+
+it.each(['OPEN', 'UNKNOWN', null, undefined, 'unreadable', 'wrong-pr', 'wrong-branch'])(
+  'never retires a sealed active batch on fresh %s evidence despite a cached terminal hint', async scenario => {
+    const f = fixture();
+    const state = { ...f.state, pr: 272, sealedAt: '2026-10-18', terminalPrState: 'MERGED', seal: { step: 'label-on-green' } };
+    writeFileSync(f.statePath, JSON.stringify(state));
+    const before = readFileSync(f.statePath, 'utf8');
+    const gh = vi.fn(async () => {
+      if (scenario === 'unreadable') throw Error('offline');
+      return JSON.stringify({ number: scenario === 'wrong-pr' ? 999 : 272,
+        headRefName: scenario === 'wrong-branch' ? 'other' : state.batchRef,
+        state: ['wrong-pr', 'wrong-branch'].includes(scenario) ? 'MERGED' : scenario });
+    });
+    expect(await publishBatch(f.input, { ...f.opts, gh })).toMatchObject({ action: 'refuse', reason: 'batch-sealed' });
+    expect(readFileSync(f.statePath, 'utf8')).toBe(before);
+    expect(gh).toHaveBeenCalledOnce();
+  });
+
+it('retires an active cached terminal hint only after a fresh exact PR read, retaining archive and narration', async () => {
+  const f = fixture();
+  writeFileSync(f.statePath, JSON.stringify({ ...f.state, pr: 272, sealedAt: '2026-10-18', terminalPrState: 'MERGED', seal: { step: 'label-on-green' } }));
+  const gh = vi.fn(async () => JSON.stringify({ number: 272, headRefName: f.state.batchRef, state: 'MERGED' }));
+  const log = vi.fn();
+  expect((await publishBatch(f.input, { ...f.opts, gh, log })).action).toBe('sealed');
+  expect(JSON.parse(readFileSync(f.statePath))).toMatchObject({ seq: 1, lastSealedState: expect.any(String) });
+  expect(log).toHaveBeenCalledWith(expect.stringContaining('GitHub MERGED: retired'));
+});

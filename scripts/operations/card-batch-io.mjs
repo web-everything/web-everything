@@ -107,9 +107,15 @@ export function atomicRecord(path, state) {
   } finally { rmSync(temporary, { force: true }); }
 }
 
+// Only this module's fresh GitHub read can authorize a completed seal's retirement.
+const terminalRetirement = Symbol('fresh terminal PR');
+
 /** Archive before replacing the active slot; caller must own and recheck the existing lease. */
-export function retireBatch(statePath, state, { repo, kind, held, terminalPrState }) {
+export function retireBatch(statePath, state, { repo, kind, held, terminalPrState, authorization }) {
   if (basename(dirname(statePath)) === 'sealed') return state;
+  if (!state.sealFailure && (authorization !== terminalRetirement || !['MERGED', 'CLOSED'].includes(terminalPrState))) {
+    throw new Error('batch-sealed');
+  }
   if (!held()) throw new Error('lease-held');
   const archiveDir = join(dirname(statePath), 'sealed');
   mkdirSync(archiveDir, { recursive: true });
@@ -173,7 +179,8 @@ function respoolClosed(state, input, stateDir, remote, held) {
   }
 }
 
-/** Retire a terminal sealed generation under the caller's admission lease; unreadable evidence stays held. */
+/** A sealed card batch may be retired and replaced only when a fresh GitHub read confirms its PR is MERGED or CLOSED.
+ * Retire a terminal sealed generation under the caller's admission lease; unreadable evidence stays held. */
 export async function retireTerminalBatch(recorded, input, {
   statePath, stateDir = dirname(statePath), remote = 'origin', gh = defaultGh,
   held: stillHeld, log = line => process.stderr.write(`${line}\n`),
@@ -195,7 +202,7 @@ export async function retireTerminalBatch(recorded, input, {
     if (status === 'CLOSED') respoolClosed(recorded, input, stateDir, remote, stillHeld);
     if (status === 'MERGED' || status === 'CLOSED') {
       const retired = recorded;
-      recorded = retireBatch(statePath, recorded, { repo: input.source.repo, kind: input.kind, held: stillHeld, terminalPrState: status });
+      recorded = retireBatch(statePath, recorded, { repo: input.source.repo, kind: input.kind, held: stillHeld, terminalPrState: status, authorization: terminalRetirement });
       log(`card-batch ${retired.batchRef} PR ${retired.pr} GitHub ${status}: retired${status === 'CLOSED' ? ' and re-spooled' : ''}`);
     } else {
       log(`card-batch ${recorded.batchRef} PR ${recorded.pr} GitHub ${status}: kept sealed and held`);
