@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "3007"
 status: open
-scope: ["we:scripts/conveyor/ledger-readiness-daily.mjs", "we:scripts/conveyor/drain-ledger-shadow.mjs"]
+scope: ["we:scripts/lib/ledger-readiness-daily.mjs", "we:scripts/lib/drain-ledger-shadow.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
@@ -15,7 +15,7 @@ TOP PRIORITY (operator 2026-10-17): land this first. Plan slice 1: the shadow co
 
 ## Acceptance
 
-- [A1] **Executable** — npx vitest run we:scripts/conveyor/__tests__/ledger-readiness-daily.test.mjs we:scripts/conveyor/__tests__/drain-ledger-shadow.test.mjs (tests: 'label view includes hold:drain facts', 'unruled referral stays a disagreement under replay', 'daily run keyed by slot', 'latest-head exemption deduped') fails before and passes after.
+- [A1] **Executable** — npx vitest run we:scripts/lib/__tests__/ledger-readiness-daily.test.mjs we:scripts/lib/__tests__/drain-ledger-shadow.test.mjs (tests: 'label view includes hold:drain facts', 'unruled referral stays a disagreement under replay', 'daily run keyed by slot', 'latest-head exemption deduped') fails before and passes after.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

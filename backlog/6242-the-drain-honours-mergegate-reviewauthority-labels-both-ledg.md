@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "3007"
 status: open
-scope: ["we:scripts/conveyor/merge-ai-prs.mjs", "we:scripts/lib/pr-merge-gate.mjs"]
+scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/pr-merge-gate.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---

@@ -4,7 +4,8 @@ kind: story
 size: 5
 parent: "3007"
 status: open
-scope: ["we:scripts/lib/pr-merge-gate.mjs", "we:scripts/conveyor/merge-ai-prs.mjs", "we:settings/ledger.json"]
+scope: ["we:scripts/lib/pr-merge-gate.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/settings/ledger.json"]
+scopeRationale: "Creates we:scripts/settings/ledger.json for the per-fact ledger authority cascade settings."
 dateOpened: "2026-10-17"
 tags: []
 ---
