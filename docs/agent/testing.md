@@ -1,5 +1,19 @@
 # Testing — Three-Tier Strategy
 
+## Paused review recovery
+
+The ruling ledger omits unattempted referrals and suppresses findings after an operator verdict.
+A same-head pause can therefore need a separate report source: `pausedReviewRulingNeeded`
+reads `liveReferralState` with the gate's PR body, creation time and readable-card rule, then
+uses review-run evidence to prove the pause. Its findings flow through the existing operator
+queue and needs-you feed. Partly ruled heads list only pending findings.
+The review daemon's pause notifier posts a fresh wake using `REARM_COMMENT_MARKER` plus
+`paused-review-auto-rearm: <full head SHA>` after a complete thread read and head revalidation.
+A trusted head marker spends that head's single automatic re-arm; a subsequent pause raises
+instead, including when the old live-release path would otherwise release it. No labels change.
+Focused tests cover hold/feed/daemon integration, a different receipt directory after re-arm,
+forged markers, reason-token holds and head movement. No live GitHub writes are needed.
+
 ## Red-team panel timing
 
 `redTeam.timing` defaults to `panel-seat`; `WE_RED_TEAM_TIMING=post-accept` exercises
