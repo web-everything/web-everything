@@ -1567,6 +1567,29 @@ the lookahead limit, with uninspected replacements still passing final launch ad
 
 ### Build dispatch launch lifetime and prepare discovery
 
+Dispatch confirmation consumes the real `run.mjs --json` envelope, not a synthetic full run. The
+dispatch-lane envelope includes persisted effect receipts (`key`, `type`, `status`, `handle`, `error`);
+an in-flight key alone does not prove a launch. Keep the serializer → daemon parser regression in
+`build-dispatch-non-blocking-launch.test.mjs`. Live 2026-10-17, #4413/#4415 workers had PID receipts,
+but the CLI omitted effects, making the primary confirmation falsely fail before live-session rescue.
+The launch timeout was not involved. Both cards were real WE prevention stories scoped to lease-reaper tests.
+
+Persist detached build launch failures before planning another launch in the same tick. Count unconfirmed
+launches by card and launch base (the dispatch checkout HEAD, carried in the pending record); unknown
+bases share a conservative bucket. At `build.unconfirmedLaunchMax` (2), hold for
+`build.unconfirmedCooldownMin` (120) and expose a durable needs-you row with the card, base and last
+redacted evidence. Both leaves use standard → platform `build` → tool `build` → environment
+(`WE_BUILD_UNCONFIRMED_LAUNCH_MAX`, `WE_BUILD_UNCONFIRMED_COOLDOWN_MIN`), with source logging.
+Replay two unconfirmed launches through detached settlement, restart, cooldown expiry and changed bases.
+Attempt exhaustion takes precedence over the unconfirmed cooldown: replay mixed failures with the last
+unconfirmed launch reaching the attempt cap, then verify the hold survives cooldown expiry until re-arm.
+Guard the shared CLI/HTTP `outcomePayload` with secret-bearing dispatch error and handle fixtures;
+new receipt fields require explicit payload assertions. Exercise raw producer envelopes too, since the
+daemon parser must scrub effect errors and verdict reasons independently. Detached settlement must
+redact stdout/stderr before truncating excerpts and attaching them to tick failure reasons. Decode
+JSON string values before scrubbing; omit undecodable structured excerpts so escaped credentials
+cannot return through the parse-error fallback.
+
 Launch admission and launch confirmation do not prove delivery. Retain the build failure ledger across
 both, including daemon restarts; clear it only after observing a delivering PR. Before releasing an
 orphan claim, persist its failure so a failed ledger write keeps the claim. Regress the #4413 shape:
