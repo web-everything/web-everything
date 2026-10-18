@@ -110,7 +110,7 @@ import { reserve, releaseLockDir } from '../readiness/file-locks.mjs';
 import { writeAllSync } from './write-all-sync.mjs';
 import { createGitLedgerStore, appendGitRowsSync } from './verdict-ledger-io.mjs';
 import { registerLedgerStore, getLedgerStore, describeLedgerStore } from './verdict-ledger-store.mjs';
-import { isSha, sameHead } from './pr-state/referrals.mjs';
+import { isSha, sameHead, deriveReferrals, openReferralKeys, blockedReferralKeys } from './pr-state/referrals.mjs';
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 // SCHEMA
@@ -792,7 +792,8 @@ export function observedLedgerHead(events, { includeEventHeads = false } = {}) {
 }
 
 /** One PR's events with what a head move ended removed: approvals, exemptions and verdicts before the PR's latest
- *  applied `head-moved` row (`folded.lastHeadMove`). The ONE boundary rule, shared by the pr-state view and the
+ *  applied invalidation (`folded.lastHeadMove`: a `head-moved` row, or a fresh verdict that moved the witness when
+ *  that row was never appended). The ONE boundary rule, shared by the pr-state view and the
  *  drain's exemption dedup, so the two cannot disagree about whether an exemption still stands. */
 export function eventsSinceHeadMove(events, folded) {
   const boundary = events.indexOf(folded?.lastHeadMove);
@@ -800,11 +801,19 @@ export function eventsSinceHeadMove(events, folded) {
   return events.filter((e, i) => i >= boundary || ![EVENT_TYPES.APPROVAL, EVENT_TYPES.REVIEW_EXEMPT, EVENT_TYPES.VERDICT].includes(e.type));
 }
 
+/** A finding still awaiting a ruling, or ruled `block` and not yet fixed, read through the pr-state view's boundary.
+ *  A carry or restamp re-witnesses the same content, so it is never the fix such a finding waits for. */
+export function ledgerReferralsOutstanding(events) {
+  const referrals = deriveReferrals(eventsSinceHeadMove(events, foldVerdictLedger(events).get(events.at(-1)?.pr)));
+  return openReferralKeys(referrals).length > 0 || blockedReferralKeys(referrals).length > 0;
+}
+
 /** A carry may bring an acceptance only to a head no bearing verdict has judged yet. A destination that already has
- *  one (for example a delayed review of an older head that rewound the witness) is re-reviewed, never carried over. */
+ *  one (for example a delayed review of an older head that rewound the witness) is re-reviewed, never carried over.
+ *  An outstanding referral is a hold, so its acceptance is re-reviewed too: a carry would read as its fix. */
 export function ledgerCarryAllowed(events, fromHead, toHead) {
   const current = foldVerdictLedger(events).get(events.at(-1)?.pr)?.current;
-  return current?.clears === true && sameHead(current.coverage?.headSha, fromHead)
+  return current?.clears === true && sameHead(current.coverage?.headSha, fromHead) && !ledgerReferralsOutstanding(events)
     && !events.some(e => (e.type === undefined || e.type === EVENT_TYPES.VERDICT) && verdictBears(e.verdict)
       && sameHead(e.coverage?.headSha, toHead));
 }
@@ -882,7 +891,7 @@ export function parseLedgerEvents(text) {
  *   only place a non-bearing row is visible, and it is where "a review happened" is read back from.
  * @property {VerdictRecord[]} outstandingHolds - BEARING holds appended after the last clearing record. Empty
  *   when the live verdict clears. This is the card's *"no unanswered hold may exist"* in its computed form.
- * @property {VerdictRecord} [lastHeadMove] - latest applied invalidation; absent until a head move applies, preserving legacy fold output.
+ * @property {VerdictRecord} [lastHeadMove] - latest applied invalidation: a `head-moved` row, or a fresh bearing verdict that moved the witness without one; absent until either applies.
  */
 
 /**
@@ -956,7 +965,12 @@ function foldWithWitness(records) {
     const offWitness = lateFirstSeen || (!transition && witnessed && (!head || [...superseded].some(old => sameHead(old, head))));
     if (offWitness && r.clears) continue;
     if (head && !offWitness && (verdictBears(r.verdict) || r.source === 'first-seen')) {
-      if (witnessed && !sameHead(witnessed, head)) superseded.add(witnessed);
+      if (witnessed && !sameHead(witnessed, head)) {
+        superseded.add(witnessed);
+        // A fresh verdict that moves the witness with no transition row (the observer's append missed) is itself the
+        // invalidation boundary. A restamp re-witnesses the same content, so it ends nothing.
+        if (!transition && r.verdict !== VERDICTS.RESTAMPED && verdictBears(r.verdict)) entry.lastHeadMove = r;
+      }
       // A restamp may abbreviate the current SHA. Keep the fullest witness already known for that commit.
       witnessedHeads.set(r.pr, sameHead(witnessed, head) && witnessed.length > head.length ? witnessed : head);
       witnessRows.set(r.pr, r);

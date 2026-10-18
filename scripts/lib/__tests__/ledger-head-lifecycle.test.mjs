@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { buildLedgerEvent, buildVerdictRecord, ledgerEventId, ledgerObservationApplies, observedLedgerHead } from '../verdict-ledger.mjs';
-import { planLedgerObservation, observeLiveLedgerHead, proveLedgerCarry } from '../ledger-observation.mjs';
+import { planLedgerObservation, observeLedgerHead, observeLiveLedgerHead, proveLedgerCarry } from '../ledger-observation.mjs';
+import { planDrainLedgerFacts } from '../drain-ledger-facts.mjs';
 import { derivePrState } from '../pr-state.mjs';
 
 const repo = 'example/repo', pr = 1;
@@ -198,5 +199,70 @@ describe('ledger head lifecycle red-team regressions', () => {
     // A legacy stream with only an abbreviated witness also compares equal to its full head.
     expect(plan([restamp], head)).toEqual([]);
     expect(plan([restamp], next)[0]).toMatchObject({ verdict: 'head-moved', fromHead: head.slice(0, size) });
+  });
+
+  for (const ruled of [null, 'block']) it(`operator send-back F1: a tree-identical carry never resolves ${ruled ? 'a block-ruled' : 'an unruled'} referral`, () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'ledger-carry-referral-'));
+    const git = args => String(execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).trim();
+    try {
+      git(['init', '-b', 'main']); git(['config', 'user.email', 'test@example.com']); git(['config', 'user.name', 'Test']);
+      writeFileSync(join(cwd, 'file.txt'), 'content\n');
+      git(['add', '.']); git(['commit', '-m', 'base']);
+      const fromSha = git(['rev-parse', 'HEAD']);
+      git(['commit', '--allow-empty', '-m', 'identical tree']);
+      const toSha = git(['rev-parse', 'HEAD']);
+      // Exact red-team stream: accepted(A), referral(A, [K]), optionally ruling(K, block); then observe B, same tree.
+      const key = `sha256:${'f'.repeat(64)}`;
+      const events = [verdict('accepted', fromSha), event('referral', { headSha: fromSha, findingKeys: [key] }),
+        ...(ruled ? [event('ruling', { findingKey: key, ruling: ruled })] : [])];
+      const hold = ruled ? 'referral-blocked' : 'referral-unruled';
+      expect(derivePrState(events, facts(fromSha)).holds.map(h => h.code)).toContain(hold);
+      const proveCarry = args => proveLedgerCarry({ ...args, cwd });
+      expect(proveCarry({ repo, fromSha, toSha })).toBe('tree-identical');
+      const rows = planLedgerObservation({ repo, pr, headSha: toSha, events, now: at, settings, proveCarry });
+      expect(rows).toEqual([expect.objectContaining({ verdict: 'head-moved', fromHead: fromSha })]);
+      const after = derivePrState([...events, ...rows], facts(toSha));
+      expect(after.clears).toBe(false);
+      expect(after.holds.map(h => h.code)).toContain(hold);
+      // The at-tip recheck refuses a forged or racing carry over the same outstanding finding.
+      const forged = verdict('carried', toSha, { fromHead: fromSha, carryRule: 'tree-identical', source: 'head-observer' });
+      expect(ledgerObservationApplies(forged, events)).toBe(false);
+      // Sibling path: the drain's restamp re-witnesses the same content, so it never records over the finding either.
+      const drain = planDrainLedgerFacts({ verdicts: [{ decision: 'merge', num: pr, repo, headSha: toSha, reviewGate: { acceptedMerge: true } }],
+        repo, events, now: at });
+      expect(drain.filter(r => r.verdict === 'restamped')).toEqual([]);
+      // Once the finding is ruled not-real, the same carry is allowed again.
+      const overruled = [...events, event('ruling', { findingKey: key, ruling: 'not-real' })];
+      if (!ruled) expect(planLedgerObservation({ repo, pr, headSha: toSha, events: overruled, now: at, settings, proveCarry }))
+        .toEqual([expect.objectContaining({ verdict: 'carried', carryRule: 'tree-identical' })]);
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  it('operator send-back F2: a missed head-move observation still ends the old head\'s human approval', () => {
+    // Exact red-team stream: accepted(A), manual review:human, clear-human(A) and its approval, then a substantive push to B.
+    const events = [verdict('accepted'), event('label-input', { label: 'review:human', change: 'added', sender: 'operator' }),
+      verdict('clear-human'), event('approval', { approval: 'clear-human' })];
+    expect(derivePrState(events, facts(head)).clears).toBe(true);
+    const store = [...events];
+    let fail = true;
+    const append = row => { if (fail) { fail = false; return { ok: false, errors: ['injected miss'] }; } store.push(row); return { ok: true }; };
+    const observe = () => observeLedgerHead({ repo, pr, headSha: next }, { read: () => [...store], append, settings: { ...settings, sources: { firstSeenRows: 'test', headMoveInvalidation: 'test' } },
+      log: () => {}, proveCarry: () => null });
+    expect(observe()).toMatchObject({ ok: false });
+    // The fresh review of B lands before any observer retries; the retry then sees B already witnessed.
+    expect(append(verdict('accepted', next))).toMatchObject({ ok: true });
+    expect(observe()).toEqual({ ok: true, rows: [] });
+    const missed = [...store];
+    const reference = [...events, ...plan(events), verdict('accepted', next)];
+    for (const stream of [missed, reference]) {
+      const state = derivePrState(stream, facts(next));
+      expect(state.clears).toBe(false);
+      expect(state.holds.map(h => h.code)).toContain('label-input:review:human');
+    }
+    // Every later observation of B is a no-op, and the hold still stands; only a human answer at B lifts it.
+    expect(plan(missed)).toEqual([]);
+    expect(derivePrState([...missed, verdict('clear-human', next)], facts(next)).clears).toBe(true);
+    // An equivalent carry or drain restamp is not a substantive push: it keeps the human answer.
+    expect(derivePrState([...events, verdict('restamped', next)], facts(next)).clears).toBe(true);
   });
 });

@@ -7,7 +7,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { appendVerdict, buildLedgerEvent, buildVerdictRecord, EVENT_TYPES, eventsSinceHeadMove, foldVerdictLedger,
-  parseLedgerEvents, readLedgerEventsFromStore, resolveLedgerBoardDetail, resolveLedgerStoreChoice, validateLedgerEvent,
+  ledgerReferralsOutstanding, parseLedgerEvents, readLedgerEventsFromStore, resolveLedgerBoardDetail, resolveLedgerStoreChoice, validateLedgerEvent,
   VERDICT_LEDGER_STORES, verdictLedgerPath } from './verdict-ledger.mjs';
 
 export const DRAIN_FACTS_SOURCE = 'merge-ai-prs';
@@ -51,7 +51,8 @@ function planRows({ verdicts, repo, events, now }, emit) {
     }
     const old = folded?.current?.coverage?.headSha;
     const coversHead = typeof old === 'string' && old.length >= 7 && head.startsWith(old.toLowerCase());
-    if (v.reviewGate?.acceptedMerge === true && folded?.current && folded.clears === true && !coversHead) {
+    // A restamp is no fix: over an outstanding referral it would read as one and resolve the finding.
+    if (v.reviewGate?.acceptedMerge === true && folded?.current && folded.clears === true && !coversHead && !ledgerReferralsOutstanding(mine)) {
       emit('restamped', buildVerdictRecord, { ...common, verdict: 'restamped', headSha: head,
         reason: `drain carried the acceptance from ${old ? old.slice(0, 8) : 'no head'} to ${head.slice(0, 8)}: its review gate verified the accepted content still covers this head (no new review)` });
     }
