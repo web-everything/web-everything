@@ -44,3 +44,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5531 (finding 2: `we:backlog/5749-drain-remove-the-unlocked-fallback-on-the-numbering-and-land.md:35` — Same card-lint rule as above: any Acceptance reference to a test must use a named [A<n>] case that appears in the Test plan.)

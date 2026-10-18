@@ -1,3 +1,4 @@
+import { resolveHandoffSettings } from './handoff-settings.mjs';
 /**
  * @file we:scripts/lib/resource-gate.mjs
  * @description Card x6nuodj (epic x6woyws, slice 3) — the launch gates' cut-over onto the shared resource decision
@@ -273,10 +274,12 @@ export function readLiveHeavyWaitMinutes({ env = process.env } = {}) {
  * In `shadow` mode the cap is the legacy static cap; the computed one is still logged.
  */
 export function createResourceFixThrottle({
+  sendBackReservedSlots,
   listClaims = () => [], env = process.env, alive = isPidAlive, queueLength = null, settings, root, nowMs = () => Date.now(),
   readSnap = () => readSnapshot(root ? { root } : {}), readHeavyWait = () => readLiveHeavyWaitMinutes({ env }), gate, log = (line) => process.stderr.write(line),
   sample, loadavg, cpuCount, // forwarded to the legacy gate (the logged comparison)
 } = {}) {
+  sendBackReservedSlots ??= resolveHandoffSettings('fix', { env }).value.sendBackReservedSlots;
   const resolved = settings ? { settings, sources: {}, invalid: [] } : loadResourceGateSettings({ env });
   const gateFor = gate ?? ((kind) => gateLaunch({ kind, gate: `fix-throttle.${kind}`, env, settings: resolved.settings, root, log,
     ...(sample ? { sample } : {}), ...(loadavg ? { loadavg } : {}), ...(cpuCount ? { cpuCount } : {}) }));
@@ -304,9 +307,16 @@ export function createResourceFixThrottle({
   };
   return {
     capDecision: () => capDecision,
-    tryAdmit(kind = 'fix') {
+    tryAdmit(kind = 'fix', { sendBack = false } = {}) {
       if (live === null) { try { live = countLiveFixSessions(listClaims(), { alive }); } catch { live = 0; } }
       const c = currentCap();
+      // The reserve never takes the last slot: a cap of 1 still runs ordinary repairs. Its refusal IS a fixer-cap
+      // refusal (`kind: 'fix-cap'`), so every reader of that kind — the red-main past-the-cap bypass, the builder-slot
+      // borrow, the ci-heal reserve, the main-CI-red owner priority — treats a reserved slot like a full cap.
+      const reserved = Math.min(sendBackReservedSlots, Math.max(0, c.effective - 1));
+      if (!sendBack && live >= c.effective - reserved && live < c.effective) {
+        return { admit: false, kind: 'fix-cap', reserved: 'send-back', why: `${live} live fix/ci-heal session(s) >= ${c.effective - reserved} ordinary slot(s): ${reserved} of cap ${c.effective} reserved for send-backs; ${kind} deferred, no claim taken` };
+      }
       if (live >= c.effective) {
         return { admit: false, kind: 'fix-cap', why: `${live} live fix/ci-heal session(s) >= cap ${c.effective} (dynamic fixer cap: floor ${c.floor}, ceiling ${c.ceiling}; ${c.reason}); ${kind} deferred, no claim taken` };
       }

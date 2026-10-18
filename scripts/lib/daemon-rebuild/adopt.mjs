@@ -158,7 +158,10 @@ export function staleAlertDetail(result, state) {
     attempts: state.rejected?.attempts ?? null,
     ...(state.held ? { broken: {
       failed: state.held.failed,
-      detail: (state.held.details?.[0]?.detail ?? '').slice(0, 300),
+      detail: state.held.details?.[0]?.name === 'daemon-entries-boot'
+        ? state.held.details[0].detail : (state.held.details?.[0]?.detail ?? '').slice(0, 300),
+      ...(state.held.details?.some(row => row.name === 'daemon-entries-boot')
+        ? { details: state.held.details.filter(row => row.name === 'daemon-entries-boot') } : {}),
     } } : {}),
     // x5wbsbc: a held clone keeps dispatching from its last-good build (`main-staleness.mjs#assertMainNotStale`).
     message: 'the rebuild is holding this clone off origin/main — it keeps dispatching from its last-good build (x5wbsbc) until this clears',
