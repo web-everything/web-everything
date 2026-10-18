@@ -5,8 +5,8 @@ size: 2
 status: open
 scope: ["we:scripts/conveyor/__tests__/ruling-not-addressed.test.mjs", "we:scripts/conveyor/__tests__/fix-takeover.test.mjs", "we:scripts/conveyor/__tests__/mechanical-rebase-rounds.test.mjs"]
 dateOpened: "2026-10-12"
-preparedDate: "2026-10-15"
-preparedAgainstSha: "37d55ee65aad06d177e15de929b4115762a3b0bf"
+preparedDate: "2026-10-18"
+preparedAgainstSha: "13aeeba0dcceb3bb339ac0d408cd672c797d3ec7"
 tags: []
 ---
 
@@ -65,3 +65,5 @@ Forged markers/rulings remain untrusted. Truncated threads and shallow Git histo
 ## Follow-ups
 
 If a new negative fails on current production code, retain its reproducer and review the narrow production fix rather than weakening the expectation. Further launcher families should reuse the outcome matrix when introduced; mechanical-round policy changes remain separate.
+
+revalidated: The diff only pins two historical planner fixtures to serial timing; takeover authorization, launcher outcome coverage, and mechanical-round preservation premises and proof plans remain unchanged.
