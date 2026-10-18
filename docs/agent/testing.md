@@ -1831,3 +1831,20 @@ ON. They resolve through the shared policy cascade: standard → platform → re
 with each source logged. Dispatch strips disabled brief sections. The verify step's first-commit
 check applies to build lane branches and delivery leases on local `main`, and warns if no test was added or updated; this advisory
 cannot prove a red run. Git-read errors are reported as unknown rather than evidence of compliance.
+
+### Drain pass-start PR batching
+
+`drain.prState.batched` defaults true in `scripts/settings/drain-pr-state.json` and
+resolves through standard → platform `drain.prState` → tool → environment
+(`WE_DRAIN_PR_STATE_BATCHED`). The drain logs the effective value and source each pass.
+A single aliased GraphQL query (with open-set pagination when necessary) supplies
+body, files and commits; existing live listing pages already batch the light state.
+Batch heavy fields must match the live listing's head and update stamps. Failed
+batches, missing PRs and nested connection overflow retain the original per-PR
+reads. Pre-merge and pre-label-write reads stay live. PR-events remains wake-only;
+its facts companion's existing freshness rules are unchanged.
+
+Keep nested author windows bounded: 100 PRs × 100 commits × 100 authors exceeds
+GitHub's node ceiling before a query runs. Overflow must use the original reader,
+never truncate evidence. The focused regression is `scripts/lib/__tests__/drain-pr-state.test.mjs`;
+run it through heavy admission.

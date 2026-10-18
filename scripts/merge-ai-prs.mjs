@@ -201,6 +201,7 @@ import { buildSkipReasons, formatSkipSummary, formatSkipReasonsLine } from './li
 import { createStepTimer, formatTimingsSummary, PASS_STEP_ORDER } from './lib/pass-timings.mjs';
 import { mapWithConcurrency, runEnqueueCandidates, canParallelEnqueue, createBranchPreparationRequired, formatConcurrencySources } from './lib/drain-concurrency.mjs';
 import { execDrainAsync } from './lib/drain-gh-async.mjs';
+import { resolveDrainPrState, readDrainPrStateBatch, batchedDrainPr } from './lib/drain-pr-state.mjs';
 export { mapWithConcurrency } from './lib/drain-concurrency.mjs';
 import { runLedgerShadow, formatShadowLine } from './lib/drain-ledger-shadow.mjs'; // #5444 — ledger gate in SHADOW beside the labels; journals, never decides
 import { drainReviewGateFact, readDrainLedgerSnapshot, recordDrainLedgerFacts } from './lib/drain-ledger-facts.mjs';
@@ -4728,15 +4729,20 @@ async function runCli() {
   // it and re-fetches next `--watch` pass rather than latching an empty read for the head-SHA lifetime. Behaviour
   // THIS pass is unchanged — the caller still sees `[]` (⇒ isAiGeneratedPr → false → skipped, never merged on
   // missing data); a genuinely-empty successful read returns `{ commits: [], degraded: false }` and DOES cache.
-  const fetchPrCommits = async (repo, num, headSha = null) => {
+  let passPrState = new Map();
+  const fetchPrCommits = async (repo, num, headSha = null, listedRow = null) => {
     // #gh-graphql-budget — a PR's commit list is fixed by its head SHA, and the resident daemon starts a FRESH
     // process every pass (so the in-process `ctxReadCache`/`sweepReadCache` below start empty each time and
     // re-read every open PR's commits every 60s). Persist a successful read on disk keyed by (repo, PR, head SHA).
     const cached = readShaCache({ repo: shaCacheRepo(repo, localSlug), num, sha: headSha, kind: 'commits' });
     if (Array.isArray(cached)) return { commits: cached, degraded: false };
     try {
-      const { stdout } = await execFileP('gh', ['pr', 'view', String(num), ...repoFlag(repo), '--json', 'commits'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-      const commits = JSON.parse(stdout.trim() || '{}').commits || [];
+      const batched = listedRow && batchedDrainPr(passPrState, repo || localSlug, listedRow);
+      let commits = batched?.commits;
+      if (!commits) {
+        const { stdout } = await execFileP('gh', ['pr', 'view', String(num), ...repoFlag(repo), '--json', 'commits'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+        commits = JSON.parse(stdout.trim() || '{}').commits || [];
+      }
       writeShaCache({ repo: shaCacheRepo(repo, localSlug), num, sha: headSha, kind: 'commits', value: commits });
       return { commits, degraded: false };
     } catch { return { commits: [], degraded: true }; } // gh threw → degraded → re-fetch next pass
@@ -4794,7 +4800,7 @@ async function runCli() {
         let seed = [];
         try { seed = readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' }) || []; } catch { /* live read below remains authoritative */ }
         const listed = listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging: resolvePrListPaging(),
-          heavyFields: ['body', 'files'], cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
+          heavyFields: ['body', 'files'], cache: drainHeavyCacheByRepo.get(repo) || {}, seed: [...(passPrState.get(slug) || []), ...seed],
           maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain context page)' } } });
         drainHeavyCacheByRepo.set(repo, listed.cache);
         return resolveListedChecks(repo, listed.rows);
@@ -4812,7 +4818,7 @@ async function runCli() {
         isDegraded: (v) => !!v?.degraded || !!v?.transient, // #2417 review — an error-path or non-head read is NOT cached
         fetchOne: async ({ repo, p }) => {
           const readCommits = shouldReadContextCommits({ onlyPr, scope: fastDrain.scope, isTarget: isFastDrainTarget(repo, p) });
-          const [manifestRes, commitsRes] = await Promise.all([readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p)), readCommits ? fetchPrCommits(repo, p.number, prHeadSha(p)) : { degraded: false }]);
+          const [manifestRes, commitsRes] = await Promise.all([readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p)), readCommits ? fetchPrCommits(repo, p.number, prHeadSha(p), p) : { degraded: false }]);
           return { manifest: manifestRes.manifest, ...(readCommits ? { commits: commitsRes.commits } : {}), degraded: manifestRes.degraded || commitsRes.degraded, transient: !!manifestRes.transient };
         },
       });
@@ -4993,6 +4999,11 @@ async function runCli() {
   // emit/exit), so the watch loop can call it repeatedly. A gh-list failure still hard-fails (bad env).
   const drainHeavyCacheByRepo = new Map(); // Reuse heavy fields across --watch passes.
   const sweepOnce = async () => {
+  const prStateSetting = resolveDrainPrState();
+  process.stderr.write(`policy · drain.prState.batched=${prStateSetting.value.batched} (${prStateSetting.sources.batched})\n`);
+  passPrState = prStateSetting.value.batched
+    ? await readDrainPrStateBatch({ repos: (RECONCILE ? CONTEXT_REPOS : REPOS).map(repo => repo || localSlug), exec: execFileP })
+    : new Map();
   // Keep listing, bare-loop and review-escalation policy on one fresh snapshot per pass.
   const workflowEditSetting = resolveDrainWorkflowEditHuman();
   process.stderr.write(`policy · drainWorkflowEditHuman=${workflowEditSetting.value} (${workflowEditSetting.source})\n`);
@@ -5080,7 +5091,7 @@ async function runCli() {
           try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' })) || []; } catch { seed = []; }
         }
         listed = __t.time('listing.pages', () => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging,
-          heavyFields, needsHeavy: RECONCILE ? () => true : wanted, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
+          heavyFields, needsHeavy: RECONCILE ? () => true : wanted, cache: drainHeavyCacheByRepo.get(repo) || {}, seed: [...(passPrState.get(slug) || []), ...seed],
           maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain page)' } } }));
         drainHeavyCacheByRepo.set(repo, listed.cache);
       } else if (!slug) {
@@ -5162,7 +5173,7 @@ async function runCli() {
     shaOf: ({ p }) => prReadCacheIdentity(p),
     isDegraded: (v) => !!v?.degraded || !!v?.transient, // #2417 review — an error-path or non-head read is NOT cached
     fetchOne: async ({ repo, p }) => {
-      const [commitsRes, manifestRes] = await Promise.all([fetchPrCommits(repo, p.number, prHeadSha(p)), readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p))]);
+      const [commitsRes, manifestRes] = await Promise.all([fetchPrCommits(repo, p.number, prHeadSha(p), p), readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p))]);
       return { commits: commitsRes.commits, manifest: manifestRes.manifest, degraded: commitsRes.degraded || manifestRes.degraded, transient: !!manifestRes.transient };
     },
   }));
