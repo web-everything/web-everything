@@ -209,7 +209,7 @@ describe('createEnqueueOnEvent', () => {
     advance(15_000);
     await handle.tick();
     expect(calls).toEqual([{
-      command: process.execPath, args: fastDrainArgs({ scriptRoot: '/code', num: 42 }),
+      command: process.execPath, args: [...fastDrainArgs({ scriptRoot: '/code', num: 42 }), '--from-green-event'],
       options: { cwd: '/clone', env: {}, stdio: ['ignore', 'pipe', 'pipe'] },
     }]);
     expect(handle.pending()).toEqual([]);
@@ -1544,5 +1544,82 @@ describe('child pass timings', () => {
     child.emit(event, event === 'close' ? 0 : new Error('fake child error'));
     await tick;
     expect(lines.find((line) => line.includes('fast drain exit'))).toContain(` · phases: ${phases}`);
+  });
+});
+
+
+describe('pre-staged green events', () => {
+  it('runs immediately before catch-up listing, even with optional checks pending', async () => {
+    const readCandidates = vi.fn();
+    const prestageCache = { get: () => ({ eligible: true }), drop: vi.fn() };
+    const { handle, calls } = setup({ prestageCache, readCandidates,
+      readPr: async () => ({ ...READY_PR, labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }],
+        statusCheckRollup: [{ name: 'optional', status: 'IN_PROGRESS' }] }),
+      resolveSetting: () => ({ enabled: true, debounceSeconds: 15, catchUp: { enabled: true, intervalMinutes: 10 } }),
+    });
+    handle.notePoll({ ok: true, marked: [mark()] });
+    await handle.tick();
+    expect(readCandidates).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].args).toContain('--from-green-event');
+  });
+  it.each([[], ['checking']])('does not wake a cached PR without ready-to-merge (%j)', async (...labels) => {
+    const prestageCache = { get: () => ({ eligible: true }), drop: vi.fn() };
+    const { handle, calls } = setup({ prestageCache,
+      readPr: async () => ({ ...READY_PR, labels: [{ name: 'review:accepted' }, ...labels.map(name => ({ name }))] }),
+    });
+    handle.notePoll({ ok: true, marked: [mark()] });
+    await handle.tick();
+    expect(calls).toHaveLength(0);
+    expect(handle.pending()).toHaveLength(0);
+  });
+  const flush = async () => { for (let i = 0; i < 60; i++) await Promise.resolve(); };
+  const pendingChecks = { ok: true, prestaged: true, considered: 1, merged: [], failed: [],
+    enqueueOutcomes: [{ num: 42, outcome: 'not-enqueued', kind: 'prestage', reason: 'required checks pending' }] };
+  it.each([
+    ['a green check', mark(42, 'check_suite.completed=success@13')],
+    ['an eligibility label', mark(42, 'pull_request.labeled(ready-to-merge)@13')],
+  ])('re-wakes a PR when %s arrives during its own run', async (_, late) => {
+    const prestageCache = { get: () => ({ eligible: true }), drop: vi.fn() };
+    const { handle, calls, children, advance } = setup({ prestageCache, manualFinish: true, drainJson: pendingChecks });
+    handle.notePoll({ ok: true, marked: [mark()] });
+    const first = handle.tick();
+    await flush();
+    expect(calls).toHaveLength(1);
+    handle.notePoll({ ok: true, marked: [late] });
+    await flush();
+    expect(calls).toHaveLength(1);
+    children[0].finish();
+    await first;
+    advance(15_000); // a label wake is not a staged green event: it keeps the ordinary debounce
+    const second = handle.tick();
+    await flush();
+    expect(calls).toHaveLength(2);
+    children[1].finish();
+    await second;
+    expect(handle.pending()).toHaveLength(0);
+  });
+  it('drops a wake that arrived during a run which verified the enqueue', async () => {
+    const prestageCache = { get: () => ({ eligible: true }), drop: vi.fn() };
+    const { handle, calls, children } = setup({ prestageCache, manualFinish: true });
+    handle.notePoll({ ok: true, marked: [mark()] });
+    const first = handle.tick();
+    await flush();
+    handle.notePoll({ ok: true, marked: [mark(42, 'check_suite.completed=success@13')] });
+    children[0].finish();
+    await first;
+    expect(handle.pending()).toHaveLength(0);
+    await handle.tick();
+    expect(calls).toHaveLength(1);
+  });
+  it.each(['success', 'skipped', 'neutral', 'cancelled', 'failure', 'timed_out', 'action_required', 'stale', 'startup_failure', null])('keeps the green wake after an unattributed %s event', async conclusion => {
+    const prestageCache = { get: () => ({ eligible: true }), drop: vi.fn() };
+    const { handle, calls } = setup({ prestageCache });
+    handle.notePoll({ ok: true, marked: [mark()] });
+    handle.notePoll({ ok: true, marked: [mark(42, `check_run.completed${conclusion ? `=${conclusion}` : ''}@13`)] });
+    await handle.tick();
+    expect(prestageCache.drop).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(1);
+    expect(handle.pending()).toHaveLength(0);
   });
 });
