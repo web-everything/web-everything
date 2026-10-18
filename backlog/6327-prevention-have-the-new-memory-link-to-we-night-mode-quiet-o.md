@@ -1,20 +1,21 @@
 ---
+bornAs: x0hm5vz
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/fix-executor-chain.mjs", "we:scripts/lib/__tests__/fix-executor-chain.test.mjs"]
-dateOpened: "2026-10-14"
+scope: ["we:agent-memory-src/operator-session-portable.md"]
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Either make valid() require the first rung to be codex, or make the critical gate key on the rung… (from web-everything/web-everything#5332 review)
+# Prevention — Have the new memory link to we:night-mode-quiet-orchestration.md as the single source for quiet r… (from web-everything/web-everything#5368 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/fix-executor-chain.mjs:46` — Either make `valid()` require the first rung to be `codex`, or make the critical gate key on the rung id (`!== 'codex'`) instead of `index > 0`. Add a chain-validation test for it.
+1. `we:agent-memory-src/operator-session-portable.md:8` — Have the new memory link to we:night-mode-quiet-orchestration.md as the single source for quiet rules, instead of restating the hours. A check:standards rule could flag memory files that repeat a time-window literal already defined in another memory file.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5332@6022d7aba5ca924ffb379dde4da79131d851e6fc
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5368@cabe449d19c8d75e264754205d7c38e7e51d9a3c
 
 ## Acceptance
 

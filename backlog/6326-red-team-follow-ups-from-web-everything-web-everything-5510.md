@@ -1,18 +1,19 @@
 ---
+bornAs: x00sq77
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/lib/drain-prestage.mjs"]
-dateOpened: "2026-10-17"
+scope: ["we:scripts/conveyor/review-referral-hold.mjs"]
+dateOpened: "2026-10-18"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5480 (head cc896d30e)
+# Red-team follow-ups from web-everything/web-everything#5510 (head e1cd74d05)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5480 (reviewed head `cc896d30e430f156f88eef0251d358fe14f88fd6`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5510 (reviewed head `e1cd74d057b14538be763a4a6635b692a5f650be`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/lib/drain-prestage.mjs:95` — (edge-case, degraded) Cached admission survives changes to the acceptance evidence
-   - Scenario: Pre-stage accepted head A while CI is pending. Before CI completes, the trusted reviewer edits the acceptance comment's reviewed-sha from A to B, leaving the head, labels, body and base unchanged. When CI becomes green, enqueuePrestage still enqueues A. A read-only probe using the real review gate and merge strategy reproduced one enqueue mutation, while decideDrainReviewGate on the updated comments returned park with staleAcceptance=true. The shortcut should revalidate acceptance coverage or invalidate preparation when that evidence changes. A later merge-group gate may reject it, but enqueue
+1. `we:scripts/conveyor/review-referral-hold.mjs:264` — (edge-case, degraded) The missing-comment exception races an original pass that is still posting
+   - Scenario: The original red-team worker saves its clean seat row, reads an empty comment thread, and starts a slow comment POST. Its review job slot has already been dropped before the added seats run. A daemon tick now sees saved evidence and no posted marker, grants and claims the new exception, and starts a retry while the original POST remains pending. Both workers can read no marker and post. A controlled interleaving of completeRedTeam, the real enrichment/claim functions, and resumeSavedRedTeam produced two identical advisory comments; both calls reported 'posted'. The reservation serializes retry
    - Claude's re-check: demonstrated break
 
 ## Acceptance

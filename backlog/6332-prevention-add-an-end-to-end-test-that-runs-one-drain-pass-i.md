@@ -1,20 +1,21 @@
 ---
+bornAs: x11x5ln
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/x9hf8a0-prevention-a-card-lint-requirement-that-a-card-widening-a-pe.md"]
-dateOpened: "2026-10-18"
+scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs"]
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Add a check:standards rule to the prevention filer: for every "Already tracked ... → #N" claim, r… (from web-everything/web-everything#5554 review)
+# Prevention — Add an end-to-end test that runs one drain pass in shadow mode with a review-exempt PR and assert… (from web-everything/web-everything#5195 review)
 
-Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this PR's latest advisory review named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/x9hf8a0-prevention-a-card-lint-requirement-that-a-card-widening-a-pe.md:15` — Add a check:standards rule to the prevention filer: for every "Already tracked ... → #N" claim, require the target card to contain the idempotency key or PR reference.
+1. `we:scripts/merge-ai-prs.mjs:6208` — Add an end-to-end test that runs one drain pass in shadow mode with a review-exempt PR and asserts the shadow row agrees at the decision-time ledger state. File it as a backlog item.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5554@3f3a78fa2ed33fc4f18271ddd85789adc8c80855
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5195@ae3a9f0f60cb9fe6b5b6312ff0cab257a6003799
 
 ## Acceptance
 

@@ -1,20 +1,21 @@
 ---
+bornAs: x0wil2n
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5360-prevention-add-a-check-standards-rule-that-fails-a-card-movi.md"]
-dateOpened: "2026-10-17"
+scope: ["we:scripts/lib/fix-executor-chain.mjs", "we:scripts/lib/__tests__/fix-executor-chain.test.mjs"]
+dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — Add a check in the approval-prevention filer, or in check:standards, that every numbered finding… (from web-everything/web-everything#5540 review)
+# Prevention — Either make valid() require the first rung to be codex, or make the critical gate key on the rung… (from web-everything/web-everything#5332 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/5360-prevention-add-a-check-standards-rule-that-fails-a-card-movi.md:55` — Add a check in the approval-prevention filer, or in check:standards, that every numbered finding in a PR's filed-prevention list has a matching 'Also raised by … (finding N' line on some card, or an explicit 'merged into finding M' note.
+1. `we:scripts/lib/fix-executor-chain.mjs:46` — Either make `valid()` require the first rung to be `codex`, or make the critical gate key on the rung id (`!== 'codex'`) instead of `index > 0`. Add a chain-validation test for it.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5540@4875d860f49d8093ee3f59e8d73407f1870242af
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5332@6022d7aba5ca924ffb379dde4da79131d851e6fc
 
 ## Acceptance
 

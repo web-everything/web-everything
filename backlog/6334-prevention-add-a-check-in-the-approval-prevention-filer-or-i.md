@@ -1,20 +1,21 @@
 ---
+bornAs: x18zrc4
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:agent-memory-src/operator-session-portable.md"]
-dateOpened: "2026-10-15"
+scope: ["we:backlog/5360-prevention-add-a-check-standards-rule-that-fails-a-card-movi.md"]
+dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Prevention — Have the new memory link to we:night-mode-quiet-orchestration.md as the single source for quiet r… (from web-everything/web-everything#5368 review)
+# Prevention — Add a check in the approval-prevention filer, or in check:standards, that every numbered finding… (from web-everything/web-everything#5540 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:agent-memory-src/operator-session-portable.md:8` — Have the new memory link to we:night-mode-quiet-orchestration.md as the single source for quiet rules, instead of restating the hours. A check:standards rule could flag memory files that repeat a time-window literal already defined in another memory file.
+1. `we:backlog/5360-prevention-add-a-check-standards-rule-that-fails-a-card-movi.md:55` — Add a check in the approval-prevention filer, or in check:standards, that every numbered finding in a PR's filed-prevention list has a matching 'Also raised by … (finding N' line on some card, or an explicit 'merged into finding M' note.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5368@cabe449d19c8d75e264754205d7c38e7e51d9a3c
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5540@4875d860f49d8093ee3f59e8d73407f1870242af
 
 ## Acceptance
 
