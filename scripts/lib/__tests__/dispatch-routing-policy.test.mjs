@@ -1,9 +1,10 @@
 import { execFileSync } from 'node:child_process';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync, copyFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, copyFileSync, readFileSync } from 'node:fs';
+import matter from 'gray-matter';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { validateRoutingPolicy, resolveOperationRoute } from '../dispatch-routing-policy.mjs';
 import { readRoutingPolicy, createRoutingPolicyReader } from '../dispatch-routing-policy-io.mjs';
 import { decideDispatchRoute } from '../dispatch-contracts.mjs';
@@ -64,7 +65,7 @@ describe('operation routing policy', () => {
     expect(resolveOperationRoute({ operation: 'review-seat', taskType: 'security', policy })).toMatchObject({ provider: 'agy-claude', model: 'claude-opus-4-6-thinking' });
   });
   it('keeps the critical gate ahead of an explicit provider override, even if the policy omits the operation kind', () => {
-    const policy = copy(); policy.operations.build = { provider: 'codex', model: 'default', fallback: [{ provider: 'claude', model: 'opus' }] };
+    const policy = copy(); policy.operations['build:build-new-feature'] = { provider: 'codex', model: 'default', fallback: [{ provider: 'claude', model: 'opus' }] };
     const dispatch = { kind: 'build', scopePaths: ['we:scripts/lib/critical-work.mjs'], size: 1, risk: 'high' };
     expect(decideDispatchRoute(dispatch, { routingPolicy: policy }).policyRoute).toMatchObject({ provider: 'claude', model: 'claude-opus-5-5' });
     policy.criticalWorkGate.kinds = [];
@@ -112,7 +113,7 @@ it('a critical-miss veto removes the exact model from the whole fallback chain',
 
 
 it('treats an edit to the routing policy itself as critical work', () => {
-  const policy = copy(); policy.operations.build = { provider: 'codex', model: 'default', fallback: [{ provider: 'claude', model: 'opus' }] };
+  const policy = copy(); policy.operations['build:build-new-feature'] = { provider: 'codex', model: 'default', fallback: [{ provider: 'claude', model: 'opus' }] };
   const route = decideDispatchRoute({ kind: 'build', scopePaths: ['we:scripts/lib/dispatch-routing-policy.json'], risk: 'low', size: 1 }, { routingPolicy: policy });
   expect(route.policyRoute).toMatchObject({ provider: 'claude', model: 'claude-opus-5-5' });
 });
@@ -296,6 +297,18 @@ it('inherits feature probation by default and preserves explicit operator pins a
   expect(resolveOperationRoute({ operation: 'build', taskType: 'build-new-feature', available: ['claude'], policy })).toMatchObject({
     provider: 'claude', model: 'claude-sonnet-5-5', effort: 'medium', fallback: [],
   });
+});
+
+it('routes only card 5209 to Codex through its per-card override', () => {
+  const { data: card } = matter(readFileSync(join(dirname(fileURLToPath(import.meta.url)),
+    '../../../backlog/5209-prevention-delete-the-receipt-after-a-successful-apply-or-re.md'), 'utf8'));
+  expect(card.deliveryAgent).toBe('codex');
+  const route = decideDispatchRoute({ kind: 'build', size: card.size, scopePaths: card.scope,
+    deliveryAgent: card.deliveryAgent, deliveryAgentReason: card.deliveryAgentReason,
+  }, { routingPolicy: copy(), scorecards: [] });
+  expect(route).toMatchObject({ outcome: 'routed', taskType: 'build-new-feature', executed: 'codex',
+    override: { requestedVendor: 'codex' }, probationWorker: null });
+  expect(route.policyRoute).toBeUndefined();
 });
 
 it('preserves operator-protected Astra and ruling escalation routes', () => {

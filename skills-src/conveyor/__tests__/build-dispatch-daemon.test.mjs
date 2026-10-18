@@ -2204,6 +2204,7 @@ describe('automatic item preparation', () => {
       expect(effects.dispatch).toHaveBeenCalledTimes(launches ? 1 : 0);
       expect(effects.listPrepareClaims()).toHaveLength(launches ? 1 : 0);
       if (launches) {
+        expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({ lightRevalidate: true, launchKind: 'prepare-item' }));
         expect(tick.prepare.refused).toEqual([]);
       } else {
         // The planning skip carries the same reconciliation note and persisted refusal the launch guard writes.
@@ -2215,6 +2216,23 @@ describe('automatic item preparation', () => {
         expect(log).toHaveBeenCalledWith(expect.stringContaining(note));
       }
     } finally { log.mockRestore(); }
+  });
+  it.each([undefined, true, false].flatMap(enabled => [
+    ['scope changed since aaaa1111: scripts/a.mjs', enabled, enabled !== false],
+    ['prepared 2026-10-01 16d ago', enabled, false],
+  ]))('dispatches scope/age hold %s with light policy %s as light=%s', async (detail, enabled, lightRevalidate) => {
+    const effects = fixture();
+    effects.preparePolicy = () => resolvePreparePolicy({ tool: enabled === undefined ? {} : { lightRevalidate: enabled } });
+    effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5966' }], admission: {
+      queue: [{ num: '5966', preparedDate: '2026-10-01', preparedAgainstSha: 'aaaa1111' }],
+      held: [{ num: '5966', reason: 'prepare-stale', detail }],
+    } }, nextState: {} });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.launched.map(r => r.num)).toEqual(['5966']);
+    expect(effects.dispatch).toHaveBeenCalledTimes(1);
+    expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({
+      num: '5966', launchKind: 'prepare-item', lightRevalidate,
+    }));
   });
   it('a planning skip with an open duplicate beside the merge persists the open PR, as the launch guard does', async () => {
     const effects = fixture();
@@ -3396,6 +3414,24 @@ describe('probation prepare route circuit breaker', () => {
     expect(prepareRouteFallback([failed[0], row('24', 'opened-pr', 99), failed[1]])).toBe(true);
     expect(prepareRouteFallback([...failed, row('26', 'opened-pr', 99)])).toBe(true);
   });
+  it('hands the scope-only candidate to the detached prepare runner through its environment', async () => {
+    const exec = vi.fn(() => '{}');
+    cliDispatch({ num: '4327', launchKind: 'prepare-item', lightRevalidate: true }, { exec });
+    const env = exec.mock.calls[0][2].env;
+    expect(env.WE_PREPARE_LIGHT_REVALIDATE_ITEM).toBe('4327');
+    const { parseArgs } = await import('../../../scripts/operations/probation-build-run.mjs');
+    const previous = process.env.WE_PREPARE_LIGHT_REVALIDATE_ITEM;
+    try {
+      process.env.WE_PREPARE_LIGHT_REVALIDATE_ITEM = env.WE_PREPARE_LIGHT_REVALIDATE_ITEM;
+      expect(parseArgs(['--num=4327', '--taskType=prepare']).lightRevalidate).toBe(true);
+      expect(parseArgs(['--num=4328', '--taskType=prepare']).lightRevalidate).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.WE_PREPARE_LIGHT_REVALIDATE_ITEM;
+      else process.env.WE_PREPARE_LIGHT_REVALIDATE_ITEM = previous;
+    }
+    cliDispatch({ num: '4328', launchKind: 'prepare-item' }, { exec });
+    expect(exec.mock.calls.at(-1)[2].env.WE_PREPARE_LIGHT_REVALIDATE_ITEM).toBe('');
+  });
   it('disables probation only for fallback prepares without overriding the policy model', () => {
     for (const launchKind of ['prepare-item', 'build']) {
       const exec = vi.fn(() => '{}');
@@ -4211,6 +4247,26 @@ describe('grouped PREPARE daemon ticks', () => {
   }
   beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'bdd-group-prepare-')); });
   afterEach(() => { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); });
+
+  it.each(['lead', 'member'])('excludes a scope-stale light candidate from grouped prepare as %s', async position => {
+    const effects = fixture();
+    const stale = position === 'lead' ? rows[0] : rows[1];
+    const spawns = position === 'lead' ? [stale, rows[1]] : [rows[0], stale];
+    effects.preparePolicy = () => resolvePreparePolicy();
+    effects.loadGroupingCards = vi.fn(async () => rows.map(r => ({ ...r, kind: 'story', size: 1 })));
+    effects.planTick = () => ({ decisions: { spawnPrepareItems: spawns, admission: { queue: rows, held: rows.map(r => ({
+      num: r.num, reason: r === stale ? 'prepare-stale' : 'needs-prepare',
+      ...(r === stale ? { detail: 'scope changed since aaaa1111: scripts/a.mjs' } : {}),
+    })) } }, nextState: {} });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.groups).toHaveLength(1);
+    expect(tick.prepare.groups[0].lead).not.toBe(stale.num);
+    expect(tick.prepare.groups[0].members).not.toContain(stale.num);
+    const launches = effects.dispatch.mock.calls.map(([request]) => request);
+    expect(launches.find(r => r.num === stale.num)).toMatchObject({ launchKind: 'prepare-item', lightRevalidate: true });
+    expect(launches.find(r => r.num === stale.num).groupMembers).toBeUndefined();
+    expect(launches.find(r => r.num !== stale.num).groupMembers).toHaveLength(3);
+  });
 
   it('uses enriched minimal queue rows for the per-group prepare pool', async () => {
     const queue = rows.slice(0, 4).map(({ num, scope }) => ({ num, scope, preparedDate: null }));

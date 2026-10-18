@@ -376,3 +376,81 @@ Settings cascade env > `scripts/settings/needs-you-feed.json` > defaults (`enabl
 Disabling the feed retires queued and running jobs on the next health-watch tick, revoking ownership before
 signalling the producer. Failed signal attempts retain the handle for retirement on a later tick.
 Daemon seam: a future daemon may consume the same `bootstrapPlan()` object instead of a chat session.
+
+## Review timing and joined fixes
+
+Operator policy (2026-10-16): review overlaps CI. `review.startAfter` defaults to
+`fast-checks`; `review.fastChecks` is keyed by repo and defaults to `standards`
+and `test-shard (1)` for WE only. Only WE's CI publishes those names, so a repo
+without an entry (FrontierUI, Plateau App) waits on its own required checks, as
+`ci-green` does. A plain list instead applies to every repo, so use it only for
+names every repo's CI publishes. Each layer is normalized to a repo-key map (slugs
+become keys) and the layers merge per repo, so a lower-layer list never overrides
+a higher layer's entry for one repo.
+The independent standards CI job lets these finish before the aggregate gate.
+Card-only changes publish a green shard receipt for their intentionally empty unit
+scope, so skipped tests cannot strand review.
+`ci-green` restores the complete required-check prerequisite; `push` starts at the
+head. A missing, pending or wrong-head fast check cannot release review. With
+`review.cancelOnCiRed` (default off; operator 2026-10-16: keep the option, don't use it yet),
+the publication sink voids a running review's verdict when CI turns red; a changed pinned head always voids it. The merge
+requirements remain enforced by the merge gate.
+
+Outside the configured fast-check prerequisite, only required CI failures block
+early review; optional failures have no CI-heal
+owner and must not strand a pending review. Every new review refusal needs an
+identified dispatcher or external event that clears it. Review-dependent gates
+never count as healable red, even when required: `review-gate` always, and
+`merge-gate` when its red is a review hold (the CI heal's rule since #5463). A plain
+required `merge-gate` failure is healable. For a pinned basis, publication requires an
+unchanged head even when CI is unreadable; CI reads are skipped with cancellation
+off, and CI read faults alone do not discard a completed verdict. An explicitly
+unpinned basis (`netBasis.rev === null`) still publishes its non-accepting result:
+head/CI cancellation cannot compare it to a reviewed commit. It carries no pinned
+head attestation; the write-up marks it `UNPINNED` or `DEGRADED BASIS`. A degraded
+basis cannot reduce to acceptance. An unpinned acceptance or an omitted reviewed-head
+field remains refused.
+
+A changed head gets a delta review when additions plus deletions are at most
+`review.deltaMaxLines` (50) across at most `review.deltaMaxFiles` (3), both for
+this fix and for the total change since the last FULL review. Each review-pr
+verdict's `Net basis` footer line ends with that full review's head
+(`Full-review anchor:`); a full review anchors on its own head. The anchor is read
+only from that producer line. A prior verdict with no anchor (older verdicts, a
+degraded basis, restamp or carry records) or with two different anchors forces a
+full review. Binary or
+unreadable deltas get full review. So does a head with a verdict newer than the
+prior head's review (a post-accept red-team bounce carries no reviewed-head
+marker, so a delta would drop its findings), and a thread at the 100-comment read
+cap, where that verdict may be cut off. Jurors judge the delta and its prior findings;
+the full contribution basis remains pinned for acceptance and roster checks.
+`review.skipDrainMechanical` (default true) lets a re-review skip a proven
+drain-mechanical commit; it never turns a carry writer on or off. Commit subjects alone never prove a carry:
+JIT numbering needs the existing exact rewrite proof, a drain rebase needs the
+same contribution, and an empty recovery commit preserves that contribution.
+A refused carry falls back to review, preserving existing human/referral holds.
+Each carry has exactly one control, read by its own resolver and logged with its
+source: `WE_ACCEPT_CARRY_FORWARD` / `scripts/settings/accept-carry-forward.json`
+(`resolveAcceptCarryForward()`) for accept and numbering carry, including the
+review-hold sweep; `WE_REVIEW_CARRY_ACROSS_REBASE` / `scripts/settings/review.json`'s
+`carryAcrossRebase` (`resolveCarryAcrossRebase()`) for rebase carry.
+`skipDrainMechanical` governs neither.
+
+`fix.joinCiAndReview` defaults true. When CI failures and head-local review
+findings are both ready, one existing fix worker gets both inputs. When the
+counterpart is pending, `fix.joinWaitMaxMin` (15) caps the wait from the first
+result timestamp. Polls never reset it; missing timestamps do not create an
+unbounded wait. The same policy applies with CI or review finishing first.
+A pending label alone is not a running review. When red CI prevents review from
+dispatching and no reviewer is live, CI healing starts immediately.
+
+Timing settings resolve per leaf through standard defaults, platform `review` /
+`fix` preferences, tool settings (`scripts/review-settings.json` and the `fix`
+block in `scripts/settings/fix.json`), then environment. Environment names are
+`WE_REVIEW_START_AFTER`, `WE_REVIEW_FAST_CHECKS` (JSON object keyed by repo, e.g.
+`{"we":["standards"]}`, replacing the whole map; a JSON array applies to every repo),
+`WE_REVIEW_CANCEL_ON_CI_RED`, `WE_REVIEW_DELTA_MAX_LINES`,
+`WE_REVIEW_DELTA_MAX_FILES`, `WE_REVIEW_SKIP_DRAIN_MECHANICAL`,
+`WE_FIX_JOIN_CI_AND_REVIEW`, and `WE_FIX_JOIN_WAIT_MAX_MIN`. Invalid values leave
+the lower layer effective. The shared cascade logs effective values and sources
+in the daemon log.

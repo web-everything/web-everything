@@ -1,0 +1,29 @@
+{
+  "$comment": "Collector only; health-watch wiring and digest implementation are follow-ups. Prefix classification: delivery only when every touched path matches; mixed changes are product. Evidence entries count declared rules and fixture files, never lines of code. Optional journals are coordination-root-relative JSONL with ISO at; restart rows also need kind=restart|crash, decision rows protocol=<id>|null. Cumulative health state is not a daily event source.",
+  "delivery": {
+    "metrics": {
+      "enabled": true,
+      "schedule": { "frequency": "daily", "time": "00:15", "timezone": "America/New_York" },
+      "deliveryPaths": ["scripts/conveyor/", "scripts/operations/", "scripts/readiness/", "scripts/review", "scripts/drain", "scripts/merge-ai-prs", "scripts/lib/review", "scripts/lib/verdict-ledger", "skills-src/conveyor/", "scripts/settings/"],
+      "sources": { "incidents": "incidents.jsonl", "restarts": null, "decisions": null },
+      "protocols": [
+        {
+          "id": "review-fix-policy", "card": "5468",
+          "rules": [
+            { "path": "scripts/lib/review-round-rules.mjs", "contains": "export function findingIdentity(" },
+            { "path": "scripts/lib/review-round-rules.mjs", "contains": "export function enclosingSymbol(" },
+            { "path": "scripts/lib/review-round-rules.mjs", "contains": "export function lastReviewedHead(" },
+            { "path": "scripts/lib/review-round-rules.mjs", "contains": "export function reviewScope(" },
+            { "path": "scripts/lib/review-round-rules.mjs", "contains": "export function roundFindingStatus(" },
+            { "path": "scripts/lib/review-round-rules.mjs", "contains": "export function bindingRoundDecision(" },
+            { "path": "scripts/lib/review-round-rules.mjs", "contains": "export function shadowRound(" }
+          ],
+          "fixtureDirectory": "scripts/lib/__tests__/fixtures/review-rounds",
+          "callers": [{ "path": "scripts/operations/review-pr-io.mjs", "contains": "shadowRound(" }]
+        },
+        { "id": "decision-api", "card": "5461", "rules": [], "fixtures": [], "callers": [] }
+      ]
+    },
+    "digest": { "schedule": { "frequency": "weekly", "day": "Sunday", "time": "20:00", "timezone": "America/New_York" } }
+  }
+}

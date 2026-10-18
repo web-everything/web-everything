@@ -1305,9 +1305,13 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     .filter(h => ['needs-prepare', 'prepare-stale'].includes(h.reason)).map(h => normNum(h.num)));
   const otherPrepareHolds = new Set((admission.held ?? [])
     .filter(h => !['needs-prepare', 'prepare-stale'].includes(h.reason)).map(h => normNum(h.num)));
+  // Scope-only stale cards run individually so a light verdict never stamps unchecked group members.
+  const lightRevalidateCandidate = num => preparePolicy.lightRevalidate !== false && (admission.held ?? [])
+    .some(h => normNum(h.num) === normNum(num) && h.reason === 'prepare-stale'
+      && h.detail?.startsWith('scope changed since '));
   const prepareGroupPicks = [];
   if (!fallback && groupingSettings.groupSmallFindings && groupingCardsLoaded && groupingSettings.groupPrepare === 'per-group') {
-    for (const pick of prepareSpawns.filter(p => prepareAvailable(p.num) && !otherPrepareHolds.has(normNum(p.num)))) {
+    for (const pick of prepareSpawns.filter(p => prepareAvailable(p.num) && !lightRevalidateCandidate(p.num) && !otherPrepareHolds.has(normNum(p.num)))) {
       try {
         const route = await effects.predictRoute?.(normNum(pick.num), scopeByNum.get(normNum(pick.num)) ?? [], 'prepare-item');
         if (!effects.predictRoute || (!route?.error && route?.groupCapable === true)) prepareGroupPicks.push(pick);
@@ -1316,7 +1320,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   }
   const planPrepareGroups = () => planBuildGroups({
     picks: prepareGroupPicks,
-    pool: [...groupRowsByNum.values()].filter(r => needsPrepare.has(normNum(r.num))
+    pool: [...groupRowsByNum.values()].filter(r => needsPrepare.has(normNum(r.num)) && !lightRevalidateCandidate(r.num)
       && !otherPrepareHolds.has(normNum(r.num)) && prepareAvailable(r.num)),
     rowsByNum: groupRowsByNum,
     settings: { ...groupingSettings, groupSmallFindings: groupingSettings.groupSmallFindings
@@ -1398,7 +1402,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         }
         if (groupMembers.length && groupMembers.length + 1 < groupingSettings.groupMin) releasePrepareMembers();
         let res;
-        try { res = await effects.dispatch({ num, ...(groupMembers.length ? { groupMembers } : {}), bookkeeping, launchKind: 'prepare-item', prepareFallback: fallback, tick: out, tickBookkeeping, tickAt }); }
+        try { res = await effects.dispatch({ num, ...(groupMembers.length ? { groupMembers } : {}), bookkeeping, launchKind: 'prepare-item', lightRevalidate: lightRevalidateCandidate(num), prepareFallback: fallback, tick: out, tickBookkeeping, tickAt }); }
         catch (e) { res = { dispatching: false, reason: String(e?.message || e) }; }
         if (res?.pending) startedThisTick += 1;
         prepareClaimed = false;
@@ -1834,7 +1838,7 @@ export function cliListHolds() {
 }
 
 /** The dispatch-lane argv + env for one launch, with its bookkeeping/tick handoff files written under `dir`. */
-function prepareDispatchLaunch({ num, bookkeeping, launchKind = 'build', prepareFallback = false, groupMembers, tick, tickBookkeeping, tickAt }, dir) {
+function prepareDispatchLaunch({ num, bookkeeping, launchKind = 'build', prepareFallback = false, lightRevalidate = false, groupMembers, tick, tickBookkeeping, tickAt }, dir) {
   const file = join(dir, 'bookkeeping.json');
   // dispatch-lane reuses the supplied tick, falling back to a re-read if the handoff is invalid.
   // Keep that re-read under the same lane-cap policy as cliPlanTick; otherwise a planned
@@ -1854,7 +1858,7 @@ function prepareDispatchLaunch({ num, bookkeeping, launchKind = 'build', prepare
     }), { mode: 0o600 });
     argv.push(`--tickFile=${tickFile}`);
   }
-  const env = { ...process.env, ...routingPolicyEnv(), ...(launchKind === 'prepare-item' && prepareFallback ? { WE_PROBATION_LAUNCH: 'off' } : {}), [MAX_CONCURRENT_LANES_ENV]: BUILD_DAEMON_LANE_CAP_EXEMPT_VALUE, WE_DISPATCH_RESERVE_LANE: '1' /* x87v3ed: lease the lane before the session launches */, WE_BUILD_DISPATCH_MODE: process.env.WE_BUILD_DISPATCH_MODE || 'mechanical' };
+  const env = { ...process.env, ...routingPolicyEnv(), WE_PREPARE_LIGHT_REVALIDATE_ITEM: lightRevalidate ? String(num) : '', ...(launchKind === 'prepare-item' && prepareFallback ? { WE_PROBATION_LAUNCH: 'off' } : {}), [MAX_CONCURRENT_LANES_ENV]: BUILD_DAEMON_LANE_CAP_EXEMPT_VALUE, WE_DISPATCH_RESERVE_LANE: '1' /* x87v3ed: lease the lane before the session launches */, WE_BUILD_DISPATCH_MODE: process.env.WE_BUILD_DISPATCH_MODE || 'mechanical' };
   return { argv, env };
 }
 
