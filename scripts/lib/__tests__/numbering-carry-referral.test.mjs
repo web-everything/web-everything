@@ -6,8 +6,11 @@ import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isMintedReviewRunId, readReviewRunEvidence, readReviewRunHeads } from '../../conveyor/review-referral-hold.mjs';
-import { newRunRecord } from '../../operations/run-record.mjs';
-import { newRunId, resolveRunsDir, writeRun } from '../../operations/run-store.mjs';
+import { chosenRunIdRecord, newRunRecord } from '../../operations/run-record.mjs';
+import { createFileRunStore, newRunId, resolveRunsDir, tryReadRun, writeRun } from '../../operations/run-store.mjs';
+import { createRegistry, op } from '../../operations/registry.mjs';
+import { compute } from '../../operations/step-kinds.mjs';
+import { runOperationCli } from '../../operations/cli-adapter.mjs';
 
 const repo = 'web-everything/web-everything', pr = 5505;
 // Ids shaped as `newRunId('review-pr')` mints them: only those count as a completed clean review.
@@ -286,6 +289,43 @@ describe('numbering carry referral evidence', () => {
         stepTimings: [{ step: 'read', stepIndex: 0, startedAt: '2026-10-17T13:00:00Z' },
           { step: 'advise', stepIndex: 1, startedAt: '2026-10-17T13:00:30Z', finishedAt: '2026-10-17T13:01:00Z', durationMs: 30000 }] }, dir);
       expect(defaultGuard()).toMatchObject({ message: expect.stringContaining('referral-persistence-failed') });
+    });
+    // The id's shape cannot prove it was minted: `--run-id=review-pr-<uuid v4>` looks exactly like `newRunId`'s.
+    const CHOSEN_MINTED_SHAPE = 'review-pr-0001fe94-2f78-4924-b3f2-0de22166a2ef';
+    const reviewFixtureCli = (argv, store) => {
+      const declaration = op('review-pr', { input: {}, verdictFrom: 'lookup', lookup: compute({ reads: [], fn: () => ({ ok: true }) }) });
+      const registry = createRegistry();
+      registry.register(declaration);
+      return runOperationCli({ declaration, argv, registry, store, sinks: {}, newRunId: () => newRunId('review-pr') });
+    };
+    it('a chosen run ID shaped like a minted one is recorded as chosen and never satisfies the guard', async () => {
+      dir = mkdtempSync(join(tmpdir(), 'numbering-custom-id-'));
+      const result = await reviewFixtureCli([`--run-id=${CHOSEN_MINTED_SHAPE}`], createFileRunStore(dir));
+      expect(result.code).toBe(0);
+      const written = tryReadRun(CHOSEN_MINTED_SHAPE, dir);
+      expect(written).toMatchObject({ id: CHOSEN_MINTED_SHAPE, idChosen: true });
+      expect(isMintedReviewRunId(CHOSEN_MINTED_SHAPE)).toBe(true);
+      // The same record, completed clean on the live head: still never the clean review.
+      writeRun({ ...written, findings: { read: { repo, pr, netBasis: { rev: TO } } },
+        verdict: { verdict: 'accept', pendingReferrals: [] },
+        stepTimings: [{ step: 'read', stepIndex: 0, startedAt: '2026-10-17T12:00:00Z' },
+          { step: 'advise', stepIndex: 1, startedAt: '2026-10-17T12:00:30Z', finishedAt: '2026-10-17T12:01:00Z', durationMs: 30000 }] }, dir);
+      persist(PRIOR_RUN, FROM, { verdict: 'accept', pendingReferrals: [] }, true);
+      expect(readReviewRunEvidence({ dir, memo: new Map(), persist: false }).find(r => r.id === CHOSEN_MINTED_SHAPE))
+        .toMatchObject({ custom: true });
+      expect(defaultGuard()).toMatchObject({ code: 'MANDATORY_REFERRAL_UNFINISHED_REVIEW_RUN' });
+    });
+    it('a chosen run ID never replaces an existing review run, so a parked review never vanishes', async () => {
+      dir = mkdtempSync(join(tmpdir(), 'numbering-custom-id-'));
+      persist(LIVE_RUN, TO, live['persistence-failed'], false);
+      const before = tryReadRun(LIVE_RUN, dir);
+      const result = await reviewFixtureCli([`--run-id=${LIVE_RUN}`], createFileRunStore(dir));
+      expect(result).toMatchObject({ code: 2, stopped: 'refused' });
+      expect(result.lines.join('\n')).toContain('names an existing review run record');
+      expect(tryReadRun(LIVE_RUN, dir)).toEqual(before);
+      // An unreadable record under that id is not proof the id is free.
+      const store = { read: () => { throw Error('corrupt'); } };
+      expect(chosenRunIdRecord({ id: LIVE_RUN }, store)).toHaveProperty('error');
     });
     it('both readers tag a run under a chosen id custom, and only the id newRunId mints untagged', () => {
       dir = mkdtempSync(join(tmpdir(), 'numbering-custom-id-'));

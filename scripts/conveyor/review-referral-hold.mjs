@@ -50,7 +50,10 @@ export function reviewRunEvidence(run) {
   const attempted = new Set((state?.records ?? [])
     .filter(r => r.repo === read.repo && r.pr === Number(read.pr) && r.head === head && r.attempted)
     .flatMap(r => r.referrals.map(f => f.key)));
+  // PR #5520 — a run started under a chosen `--run-id` says so in its record (`run-record.mjs#chosenRunIdRecord`).
+  // Inline, not a helper: the disk cache is keyed by this function's source.
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
+    ...(run.idChosen === true ? { custom: true } : {}),
     parked: verdict?.verdict === 'needs-human' && pending.length > 0,
     // A list of only reason tokens names no referral, so it was never "attempted" (not vacuously true).
     pending, attempted: findingKeys.length > 0 && findingKeys.every(key => attempted.has(key)),
@@ -67,7 +70,8 @@ export function reviewRunHead(run) {
   if (run?.op !== 'review-pr') return null;
   const read = run.findings?.read;
   const head = read?.netBasis?.rev;
-  return sha(head) ? { id: run.id, repo: read.repo, pr: Number(read.pr), head } : null;
+  return sha(head) ? { id: run.id, repo: read.repo, pr: Number(read.pr), head,
+    ...(run.idChosen === true ? { custom: true } : {}) } : null;
 }
 
 // Cache only small projections, never full diffs/seat transcripts. A changed file is parsed again.
@@ -87,12 +91,9 @@ function readEvidenceDiskCache(file, code) {
   } catch { return {}; }
 }
 function writeEvidenceDiskCache(file, code, entries) {
-  writeAtomic(file, JSON.stringify({ v: 1, code, entries }));
-}
-function writeAtomic(file, text) {
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   try {
-    writeFileSync(tmp, text);
+    writeFileSync(tmp, JSON.stringify({ v: 1, code, entries }));
     renameSync(tmp, file);
   } catch { try { unlinkSync(tmp); } catch { /* best effort: the cache is only a speed-up */ } }
 }
@@ -109,8 +110,9 @@ export function readReviewRunHeads({ dir = resolveRunsDir(), readRun = tryReadRu
 
 /** PR #5520 operator send-back — the readers find review runs by name, so the name must be true: `writeRun` writes a
  *  `review-pr` record only under a `review-pr-` id, and no other operation's ({@link REVIEW_RUN_ID_PREFIX}). Inside
- *  that namespace a chosen `--run-id` is still possible, so only the id `newRunId('review-pr')` mints is trusted: any
- *  other is tagged `custom`. A custom run still counts as a review of its head; it never counts as a clean one. */
+ *  that namespace a chosen `--run-id` is still possible: such a record carries `idChosen`, and an id not shaped as
+ *  `newRunId('review-pr')` mints it (a record written before `idChosen`) is not trusted either. Both are tagged
+ *  `custom`. A custom run still counts as a review of its head; it never counts as a clean one. */
 const MINTED_REVIEW_RUN_ID_RE = /^review-pr-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 export const isMintedReviewRunId = id => MINTED_REVIEW_RUN_ID_RE.test(String(id));
 

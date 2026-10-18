@@ -30,7 +30,9 @@ import { dirname, join, resolve } from 'node:path';
 
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
-import { assertRunRecord, isValidRunId, parseRunRecord, serializeRunRecord } from './run-record.mjs';
+import { assertRunRecord, isValidRunId, parseRunRecord, REVIEW_RUN_ID_PREFIX, serializeRunRecord } from './run-record.mjs';
+
+export { REVIEW_RUN_ID_PREFIX };
 
 export {
   EFFECT_STATUSES,
@@ -153,7 +155,6 @@ export function daemonJobsDir(daemon, env = process.env) {
  * run". So the name is made true here, the one writer: a `review-pr` record is written only under a
  * `review-pr-` id, and no other operation may write one there (which would hide or replace a review run).
  */
-export const REVIEW_RUN_ID_PREFIX = 'review-pr-';
 function assertReviewRunNamespace(record) {
   if ((record.op === 'review-pr') !== record.id.startsWith(REVIEW_RUN_ID_PREFIX)) {
     throw new TypeError(`operations: run id ${JSON.stringify(record.id)} does not match operation \`${record.op}\` — `

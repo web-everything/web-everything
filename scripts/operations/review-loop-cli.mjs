@@ -65,6 +65,7 @@ import {
 } from './cli-adapter.mjs';
 import { startRun, runStatus, rewindRunToStep } from './engine.mjs';
 import { createFileRunStore, newRunId } from './run-store.mjs';
+import { chosenRunIdRecord } from './run-record.mjs';
 import { REPO_ROOT as SCAFFOLD_ROOT } from './scaffold-io.mjs';
 import { resolveOperation, createCliJudgeFactory } from './run.mjs';
 import { appendEntry } from '../conveyor/learnings-drop.mjs';
@@ -659,6 +660,11 @@ export async function runReviewLoopOnce({
         input: applyUnattendedActorDefault(parsed.input, argv),
         registry,
       });
+      if (parsed.control.runId) {
+        const chosen = chosenRunIdRecord(run, store);
+        if (chosen.error) return { code: 2, lines: [`error: ${chosen.error}`], run: null, stopped: 'refused' };
+        run = chosen.run;
+      }
       store.write(run);
     }
   }
