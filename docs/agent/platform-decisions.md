@@ -6285,15 +6285,17 @@ override"*, then "Ok" to defaults (a), (a), (a). Composes with [config-extends-p
 
 **The rule:**
 1. **One new top layer, `operator-override`.** Order: standard < platform < tool < env < operator-override (Fork 2 = a).
-   The layer wins over env, so a stale shell variable never beats a recorded operator instruction. Both resolvers read it:
-   `resolveCascade` and `resolveReviewSettings`. Each value taken from it logs `source: operator-db`.
+   The layer wins over env, so a stale shell variable never beats a recorded operator instruction. Every resolver of a
+   settable key reads it: the cascade (`resolveCascade`, fed each call by `cascadePolicy`), the referral safety keys
+   (`resolveReferralSafetySettings`) and the merge-queue switches (`resolveRefreshSetting`). A key no such resolver reads
+   cannot be set. Each value taken from it logs `source: operator-db`.
 2. **Local first store at one host-wide path (Fork 1 = a).** The source of truth is a machine-local store at a single
    host-wide path, never inside a lane clone, so every daemon on the host reads the same answer. Plateau's DB is deferred
    and may replace the store later behind the same single read interface (`readOperatorOverrides`). The storage format is
    left to the build card. Daemons read the layer each tick.
 3. **Only the operator writes it.** One operator-only command is the sole writer; the write operation rejects any agent
    caller. Each write records the operator's verbatim instruction (stored as a quoted string, never executed), actor and
-   channel (from the authority check, not a flag), time, an optional expiry and a reason. The change log is append-only.
+   channel (from the operator-terminal authority check, the operator's own `gh` login, not a flag), time, an optional expiry and a reason. The change log is append-only.
    An expired override is ignored and logged once.
 4. **Guard floor: block until confirmed (Fork 3 = a).** Every key declares its safe direction in a table; a key with no
    entry counts as loosening. A loosening write without the confirmation flag is refused. A confirmed one is logged and

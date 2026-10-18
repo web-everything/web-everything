@@ -43,7 +43,8 @@ Today every setting lives in a repo file, so a tweak needs a PR, and a file held
 - Source log line per leaf, e.g. `leaf=value (platform)`: `we:scripts/lib/policy-cascade.mjs:132` and `we:scripts/lib/policy-cascade.mjs:153`. The new layer adds `operator-db` here.
 - Call-site helper: `cascadePolicy` at `we:scripts/lib/policy-cascade.mjs:176`.
 - File settings merge: `we:scripts/lib/settings-files.mjs:105` and `we:scripts/lib/settings-files.mjs:132`.
-- Review settings resolver and source: `we:scripts/lib/review-settings.mjs:107` and `we:scripts/lib/review-settings.mjs:117` (a second resolver that must also read the new layer).
+- Review settings: the referral safety keys resolve through `resolveReferralSafetySettings` (`we:scripts/lib/review-settings.mjs:96`), and `resolveReviewSettingSource` (`we:scripts/lib/review-settings.mjs:117`) reports the source. `resolveReviewSettings` (`:107`) logs nothing. These must also read the new layer.
+- Merge-queue switches such as `mergeQueue.refreshOnStaleMergeGate` resolve outside the cascade, through `resolveRefreshSetting` (`we:scripts/lib/merge-queue-enqueue.mjs:42`), a third resolver that must read the layer.
 - The wording "standard < platform < tool": `we:scripts/settings/merge-queue.json:2`.
 - Guard keys an override could loosen: `REFERRAL_SAFETY_KEYS` at `we:scripts/lib/review-settings.mjs:94`, plus the merge-queue switches. The confirmed-broken always-block (`we:scripts/lib/review-round-rules.mjs:268`) is hard-coded and stays out of reach.
 - Machine-local, gitignored state directory: `we:.gitignore:186`.
@@ -75,7 +76,7 @@ Fork-existence: both branches are coherent, but they cannot both be the single s
 // Fork 1 (a): read in the cascade, each tick
 const op = readOperatorOverrides();   // snapshot under the operations directory
 const r = resolveCascade({ standard, platform, tool, envValues, operatorOverride: op.value, valid });
-// r.sources['mergeQueue.refreshOnStaleMergeGate'] === 'operator-db'
+// r.sources['<cascade key>'] === 'operator-db'; merge-queue switches read the same layer in resolveRefreshSetting
 ```
 
 Recommended: (a). It needs no service, works offline, and matches how other machine-local state already lives (`we:.gitignore:186`). Downside: it is per machine.
@@ -90,7 +91,7 @@ Fork-existence: env and the new layer both claim to be the last word; only one o
 - (b) Between tool and env. Keeps the launch-time env flag as the last word, but then a stale shell variable silently beats a recorded operator instruction, which is the opposite of the goal.
 
 Recommended: (a). Env stays useful for one-off process launches that carry no override.
-Skeptic: SURVIVES. It composes with the existing rule that an env var may sit on top of the settings file for a one-off run (`we:docs/agent/platform-decisions.md:3838`); the new layer goes above that. Build note: `resolveReviewSettings` has its own env path separate from the cascade, so the build card must cover both resolvers.
+Skeptic: SURVIVES. It composes with the existing rule that an env var may sit on top of the settings file for a one-off run (`we:docs/agent/platform-decisions.md:3838`); the new layer goes above that. Build note: the review settings and the merge-queue switches each have their own env path separate from the cascade, so the build card must cover all three resolvers (slice 2, `#6264`).
 Screen: clear
 
 ## Fork 3 — Guard floor: what stops an override from loosening a safety guard
@@ -104,7 +105,7 @@ Settled alongside (not part of the fork): the floor also holds on read. The read
 
 ```sh
 # Fork 3 (a): the one operator-only command (declared operation, run.mjs)
-operator-override set mergeQueue.refreshOnStaleMergeGate off \
+node scripts/operations/run.mjs operator-override --key=mergeQueue.refreshOnStaleMergeGate --value=off \
   --instruction="<operator words, verbatim>" --reason="..." --expires=2026-10-18T09:00-04:00 \
   --confirm-loosen
 ```

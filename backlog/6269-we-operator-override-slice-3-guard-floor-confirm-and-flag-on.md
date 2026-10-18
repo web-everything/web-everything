@@ -4,7 +4,8 @@ kind: story
 size: 5
 parent: "6268"
 status: open
-scope: ["we:scripts/lib/operator-override-floor.mjs", "we:scripts/lib/operator-override-store.mjs", "we:scripts/lib/__tests__/operator-override-floor.test.mjs"]
+blockedBy: ["6266"]
+scope: ["we:scripts/lib/operator-override-floor.mjs", "we:scripts/lib/operator-override-store.mjs", "we:scripts/operations/operator-override.mjs", "we:scripts/lib/__tests__/operator-override-floor.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
@@ -12,6 +13,8 @@ tags: []
 # we: operator override slice 3 - guard floor confirm-and-flag on write and on read
 
 Build the guard floor of decision 6268 (we:docs/agent/platform-decisions.md#operator-override-settings-layer): a safe-direction table per key (no entry means loosening), a loosening write refused until the operator confirms, and the reader ignoring any loosening entry with no recorded confirmation.
+
+The floor module is new and exports the safe-direction table and one classifier, `isLooseningOverride(key, value)`, which the write operation (we:scripts/operations/operator-override.mjs, from slice 1) and the needs-you feed (slice 4) both call. The "refused with a non-zero exit" and "agent caller" tests below drive that write operation.
 
 ## Acceptance
 

@@ -4,6 +4,7 @@ kind: story
 size: 3
 parent: "6268"
 status: open
+blockedBy: ["6266", "6269"]
 scope: ["we:scripts/operations/needs-you-feed.mjs", "we:scripts/operations/__tests__/needs-you-feed.test.mjs", "we:scripts/operations/delivery-metrics.mjs", "we:scripts/operations/__tests__/delivery-metrics.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
@@ -13,7 +14,9 @@ tags: []
 
 Show every confirmed loosening operator override in the needs-you feed, per decision 6268 (we:docs/agent/platform-decisions.md#operator-override-settings-layer), so a guard is never off without the operator seeing it.
 
-The live producer is `runOnce` in we:scripts/operations/needs-you-feed.mjs, run by we:scripts/conveyor/needs-you-feed-job.mjs. Today it reads only the operator-queue report. This slice makes `runOnce` also read the override layer directly, through slice 1's `readOperatorOverrides` and slice 3's safe-direction table, and add one item per confirmed loosening override to the same `diffFeed` call. The operator-queue report is not changed.
+The live producer is `runOnce` in we:scripts/operations/needs-you-feed.mjs, run by we:scripts/conveyor/needs-you-feed-job.mjs. Today it reads only the operator-queue report. This slice makes `runOnce` also read the override layer directly and add one item per confirmed loosening override to the same `diffFeed` call. It uses slice 1's `readOperatorOverrides` (its `readable` flag and each entry's `entryId`, actor, time, instruction and expiry) and slice 3's `isLooseningOverride`. The operator-queue report is not changed.
+
+**Key shape.** An override item uses `repo: "operator-override"`, `pr: 0` and `head: <entryId>`, so its state key is `operator-override#0@<entryId>:<kind>`. That key already parses with the current `fromKey`, so an older producer reading the same state file during a revert never throws. A new value or expiry is a new log entry with a new `entryId`, so it publishes a new line.
 
 ## Acceptance
 
@@ -21,10 +24,13 @@ The live producer is `runOnce` in we:scripts/operations/needs-you-feed.mjs, run 
   - `runOnce publishes a confirmed loosening override to the feed file with its key, expiry, actor, time and instruction`
   - `runOnce does not publish a non-loosening override or an unconfirmed loosening entry`
   - `an expired override emits NEEDS-YOU-CLEARED on the next run, and the PR items in the same run still publish`
-  - `an override feed key round-trips through the state file, so a later clear never throws`
-  - `an unreadable override layer marks the run incomplete: earlier override entries stay open, no clear is emitted, and PR items still publish`
+  - `an override feed key parses with the existing fromKey, so a later clear never throws`
+  - `re-setting an override with a new value or expiry publishes a new line`
+  - `an unreadable override layer publishes one layer-unreadable item, keeps earlier override entries open and emits no override clear`
+  - `an unreadable override layer does not stop PR items from clearing, and an incomplete queue report does not stop override clears`
+  - `two override entries stay distinct in unacknowledged and the session bootstrap`
   - `parseFeedLine reads an override line and an override cleared line`
-  - `delivery-metrics counts override entries apart from PR needs-you episodes`
+  - `delivery-metrics counts override entries apart from PR needs-you episodes and waits`
 
 ## Non-goals
 
@@ -36,10 +42,10 @@ The live producer is `runOnce` in we:scripts/operations/needs-you-feed.mjs, run 
 One line per class: either the handling, or `n/a: <why>`.
 
 1. **Untrusted text** — the operator instruction goes through `sanitizeForFeed` and is shown in the same `(untrusted)` JSON-quoted field as a PR title, never in the 100-character `reason` field and never rendered as markup.
-2. **Truncated reads** — an unreadable or unparseable layer logs a note and marks the run incomplete. As with an incomplete queue report today, earlier open keys are kept, so no false clear tells the operator a guard is back on.
-3. **Shared state files** — override keys live in the same feed state file, written under the existing feed lock. The key has its own shape (no PR number), and the state-key parser accepts it, so one bad key can never make every later run throw inside the lock.
-4. **Fail closed** — a failure to read the layer never hides other entries: PR items from the queue report still publish in the same run, and earlier override entries stay open.
+2. **Truncated reads** — when `readable` is false, the run publishes one `operator-override#0@layer:layer-unreadable` item, which the operator sees even though the live job runs with a silent log. Earlier override keys stay open, so no false clear says a guard is back on. The item clears once the layer reads again.
+3. **Shared state files** — override keys live in the same feed state file, under the existing feed lock. Incompleteness is kept per source: an unreadable layer holds only override keys open, and an incomplete queue report holds only PR keys open.
+4. **Fail closed** — a failure to read the layer never hides other entries: PR items still publish and clear in the same run, and earlier override entries stay open.
 5. **Identity scoping** — n/a: no identity decision is made here.
-6. **State over time** — an override that expires is cleared on the next complete run, with a `NEEDS-YOU-CLEARED` line.
+6. **State over time** — an override that expires is cleared on the next run in which the layer is readable, with a `NEEDS-YOU-CLEARED` line.
 7. **Who wrote it** — each feed line names the actor and time from the store's log entry.
-8. **Downstream readers** — `parseFeedLine`, we:scripts/operations/delivery-metrics.mjs, we:scripts/conveyor/health-watch.mjs and the session bootstrap read feed lines. An override line must parse in all of them. Delivery metrics must not count it as a PR needs-you episode or a PR wait.
+8. **Downstream readers** — the feed lines are read by `parseFeedLine`, by `unacknowledged()` (which the session bootstrap in we:scripts/operations/operator-session-bootstrap-io.mjs uses, keyed by `keyOf`) and by we:scripts/operations/delivery-metrics.mjs. we:scripts/conveyor/health-watch.mjs only publishes through `publishAttention` and is unaffected. Delivery metrics leave out `repo: "operator-override"` entries from PR episodes and waits.
