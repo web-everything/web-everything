@@ -232,7 +232,7 @@ describe('projectAvoidedRounds', () => {
 describe('resolveReviewSettings', () => {
   it('preserves the built-in defaults and allows file shadow mode', () => {
     expect(resolveReviewSettings({ fileConfig: null, env: {} }))
-      .toEqual({ recheckCarriedReferrals: true, autoPolicyRespectsNotReal: true, scopedRereview: 'off', referralDefault: 'operator', roundBudget: 'off', takeoverReviewAttempts: 1,
+      .toEqual({ routeTestGamingToFixer: true, recheckCarriedReferrals: true, autoPolicyRespectsNotReal: true, scopedRereview: 'off', referralDefault: 'operator', roundBudget: 'off', takeoverReviewAttempts: 1,
         rulingResolvesStandDown: 'on', standDownQueueSection: 'needs-you' });
     expect(resolveReviewSettings({ fileConfig: { scopedRereview: 'shadow' }, env: {} }).scopedRereview).toBe('shadow');
   });

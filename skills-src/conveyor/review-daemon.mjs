@@ -77,6 +77,7 @@ import { cascadePolicy } from '../../scripts/lib/policy-cascade.mjs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { hostname } from 'node:os';
+import { sweepTestGamingRoutes } from '../../scripts/conveyor/test-gaming-route.mjs';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents } from '../../scripts/conveyor/reconcile-pass.mjs';
 import { promoteDraftsThenReplan, promoteDraftsGuarded } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
 import { notifyReferralHold } from '../../scripts/conveyor/review-referral-hold.mjs';
@@ -376,6 +377,7 @@ export function runReviewTick({
   promoteDrafts = null,
   notePromotions = null,
   onPlan = null,
+  routeTestGaming = null,
   // Clock for the operator-hold snapshot's `observedAt` (injectable so tests stay deterministic).
   now = Date.now,
 } = {}) {
@@ -389,6 +391,15 @@ export function runReviewTick({
   let rawPrsFailed = false;
   if (sharedReads) {
     try { rawPrs = readPrs({ repo }); } catch (e) { rawPrsError = e; rawPrsFailed = true; }
+  }
+  // Admit binding repairs before planning; fix-dispatch consumes the durable advisory.
+  if (sharedReads && !rawPrsFailed && typeof routeTestGaming === 'function') {
+    try {
+      const routed = routeTestGaming({ repo, prs: rawPrs }) ?? [];
+      const snapshots = new Map(routed.filter(r => r.snapshot).map(r => [r.pr, r.snapshot]));
+      if (Array.isArray(rawPrs)) rawPrs = rawPrs.map(pr => snapshots.get(pr.number) ?? pr);
+    }
+    catch (e) { console.error(`test-gaming-route: ${String(e.message ?? e).split('\n')[0]}`); }
   }
   let holdReconcileResults = [];
   let holdReconcileError = null;
@@ -1017,6 +1028,7 @@ export function priorityNamesForLiveProcessPrs(liveProcessPrs) {
 export function buildCliDaemonEffects({
   owner, intervalMs = DEFAULT_INTERVAL_MS, log = console,
   reapSessions = defaultReapSessions,
+  reviewTickAllRepos = runReviewTickAllRepos,
   // #3383 bug 3 — the real daemon wires the real `acquirableLanes` effect through by default, so production
   // dispatch is bounded by lane reality; `runReviewTick`'s OWN default stays unbounded (`() => Infinity`) so
   // every pre-existing test of it (which fakes reconcile/dispatch directly, never this) is unaffected.
@@ -1028,9 +1040,10 @@ export function buildCliDaemonEffects({
   // store is stale or partial; label READS try the store, label WRITES and the drain/merge path never do.
   runReview = (opts) => {
     const factsProvider = withFactsLabels(createGhProvider());
-    return runReviewTickAllRepos({
+    return reviewTickAllRepos({
       acquirableLanes: defaultAcquirableLaneNumbers, readPrs: defaultReadPrs, readAgents: defaultReadAgents,
       poolExhaustion: DAEMON_POOL_EXHAUSTION,
+      routeTestGaming: sweepTestGamingRoutes,
       refreshScopeBloat: refreshScopeBloatedPr,
       postRefreshMarker: defaultPostRebaseComment,
       promoteDrafts: promoteDraftsGuarded,

@@ -45,9 +45,12 @@ export const TAKEOVER_REVIEW_ATTEMPTS_MAX = 5;
  * `review.standDownQueueSection` — `needs-you` (built-in) surfaces unresolved needs-judgment questions
  * under NEEDS YOU. `stood-down` keeps the legacy section. Env: WE_REVIEW_STAND_DOWN_QUEUE_SECTION.
  */
-export const BUILT_IN_REVIEW_SETTINGS = Object.freeze({ referralDefault: 'operator', recheckCarriedReferrals: true, autoPolicyRespectsNotReal: true, scopedRereview: 'off', roundBudget: ROUND_BUDGET_OFF,
+/** review.routeTestGamingToFixer: admit a test-removal-only gate hold to the advisory fixer.
+ * Default true; standard → platform → tool → WE_REVIEW_ROUTE_TEST_GAMING_TO_FIXER.
+ * Never clears the merge gate; justified removals still require the operator. */
+export const BUILT_IN_REVIEW_SETTINGS = Object.freeze({ referralDefault: 'operator', routeTestGamingToFixer: true, recheckCarriedReferrals: true, autoPolicyRespectsNotReal: true, scopedRereview: 'off', roundBudget: ROUND_BUDGET_OFF,
   takeoverReviewAttempts: 1, rulingResolvesStandDown: 'on', standDownQueueSection: 'needs-you' });
-export const REVIEW_SETTINGS_ENV = Object.freeze({ referralDefault: 'WE_REVIEW_REFERRAL_DEFAULT', recheckCarriedReferrals: 'WE_REVIEW_RECHECK_CARRIED_REFERRALS',
+export const REVIEW_SETTINGS_ENV = Object.freeze({ referralDefault: 'WE_REVIEW_REFERRAL_DEFAULT', routeTestGamingToFixer: 'WE_REVIEW_ROUTE_TEST_GAMING_TO_FIXER', recheckCarriedReferrals: 'WE_REVIEW_RECHECK_CARRIED_REFERRALS',
   autoPolicyRespectsNotReal: 'WE_REVIEW_AUTO_POLICY_RESPECTS_NOT_REAL', scopedRereview: 'WE_REVIEW_SCOPED_REREVIEW',
   roundBudget: 'WE_REVIEW_ROUND_BUDGET', takeoverReviewAttempts: 'WE_REVIEW_TAKEOVER_REVIEW_ATTEMPTS',
   rulingResolvesStandDown: 'WE_REVIEW_RULING_RESOLVES_STAND_DOWN', standDownQueueSection: 'WE_REVIEW_STAND_DOWN_QUEUE_SECTION' });
@@ -58,7 +61,7 @@ const parseBoolean = (v, { fromEnv = false } = {}) => fromEnv
   ? (v === 'true' ? true : v === 'false' ? false : undefined)
   : (typeof v === 'boolean' ? v : undefined);
 const PARSERS = Object.freeze({
-  recheckCarriedReferrals: parseBoolean, autoPolicyRespectsNotReal: parseBoolean,
+  routeTestGamingToFixer: parseBoolean, recheckCarriedReferrals: parseBoolean, autoPolicyRespectsNotReal: parseBoolean,
   ...Object.fromEntries(Object.entries(ALLOWED).map(([key, allowed]) => [key, (v) => (allowed.includes(v) ? v : undefined)])),
   roundBudget: (v, { fromEnv = false } = {}) => {
     if (v === ROUND_BUDGET_OFF) return v;
@@ -91,12 +94,12 @@ export function loadReviewSettingsFile(path = defaultReviewSettingsPath()) {
 }
 
 const rawReviewSettings = () => { try { return JSON.parse(readFileSync(defaultReviewSettingsPath(), 'utf8')); } catch { return null; } };
-const REFERRAL_SAFETY_KEYS = ['recheckCarriedReferrals', 'autoPolicyRespectsNotReal'];
+const REFERRAL_SAFETY_KEYS = ['routeTestGamingToFixer', 'recheckCarriedReferrals', 'autoPolicyRespectsNotReal'];
 /** New referral safeguards use the shared standard → platform → tool → env cascade, with provenance. */
 export function resolveReferralSafetySettings({ fileConfig = rawReviewSettings(), platform, env = process.env, log } = {}) {
   const pick = value => Object.fromEntries(REFERRAL_SAFETY_KEYS.filter(key => value?.[key] !== undefined).map(key => [key, value[key]]));
   return cascadePolicy('review', pick(fileConfig), {
-    standard: { recheckCarriedReferrals: true, autoPolicyRespectsNotReal: true },
+    standard: { routeTestGamingToFixer: true, recheckCarriedReferrals: true, autoPolicyRespectsNotReal: true },
     platform: pick(platform === undefined ? platformPreference('review', { env }) : platform), env, log,
     valid: Object.fromEntries(REFERRAL_SAFETY_KEYS.map(key => [key, value => typeof value === 'boolean'])),
     envValues: Object.fromEntries(REFERRAL_SAFETY_KEYS.map(key => [key, parseBoolean(env?.[REVIEW_SETTINGS_ENV[key]], { fromEnv: true })])),
