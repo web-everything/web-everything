@@ -18,6 +18,8 @@ The floor module is new and exports the safe-direction table and one classifier,
 
 The confirmation is the `confirmLoosen` field of the request file that the operator's review approved, so it is covered by slice 1's protected-CI attestation (the `#6246` slice 2 A10 trust root). A `--confirm-loosen` flag, terminal, local `gh` login or any other local signal is never a confirmation on its own. Bind each confirmation to the exact log entry: entryId, key, value and expiry, with that attestation recorded on the write. Neither an older confirmation for the same key nor a snapshot that reuses an id with altered contents authorizes a later write. Apply this check to slice 1's latest-entry-per-key view before returning effective entries; rejected latest entries fall back to lower layers without reviving history.
 
+**This slice lands only through a human.** Slice 1 adds the floor module, its test, the store module and the operation module to the drain's human-only path list (`GATE_PATH_PREFIXES`), so this slice's own PR is held for the operator, not landed by the drain.
+
 ## Acceptance
 
 - [A1] **Executable** — `npm run test:unit --` (vitest) on we:scripts/lib/__tests__/operator-override-floor.test.mjs (a new file) fails before the module exists and passes after. Named tests, one per guarantee:
