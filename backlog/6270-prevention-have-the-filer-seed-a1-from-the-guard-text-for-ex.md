@@ -12,7 +12,7 @@ tags: []
 # Prevention — Have the filer seed [A1] from the guard text, for example 'check:standards fixture test fails a c… (from web-everything/web-everything#5555 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/xwr4bos-prevention-make-the-card-template-require-path-test-name-on.md:26` — Have the filer seed [A1] from the guard text, for example 'check:standards fixture test fails a card whose Executable item lacks path::test'. Alternatively, a check:standards rule can refuse to move a card from open to in-progress while any TODO placeholder remains. #5030 and #5360 already cover the related lint.
+1. `we:backlog/6261-prevention-make-the-card-template-require-path-test-name-on.md:26` — Have the filer seed [A1] from the guard text, for example 'check:standards fixture test fails a card whose Executable item lacks path::test'. Alternatively, a check:standards rule can refuse to move a card from open to in-progress while any TODO placeholder remains. #5030 and #5360 already cover the related lint.
 
 Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 1 → #6227, finding 3 → #5360.
 
