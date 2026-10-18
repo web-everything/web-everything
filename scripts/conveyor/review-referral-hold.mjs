@@ -8,7 +8,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { liveReferralState } from '../lib/referral-live-context.mjs';
-import { resolveRunsDir, REVIEW_RUN_ID_PREFIX, tryReadRun } from '../operations/run-store.mjs';
+import { legacyReviewRunNames, resolveRunsDir, REVIEW_RUN_ID_PREFIX, tryReadRun } from '../operations/run-store.mjs';
 import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
@@ -124,7 +124,9 @@ function readRunProjections({ dir, readRun, memo, persist, project, cacheFile, m
   let disk = null;
   let dirty = false;
   const kept = {};
-  const out = names.filter(n => n.startsWith(REVIEW_RUN_ID_PREFIX) && n.endsWith('.json')).flatMap(name => {
+  // PR #5520 red team — plus the review runs written under other names before the namespace rule (one kept scan).
+  const legacy = new Set(legacyReviewRunNames(dir, names, { persist }));
+  const out = names.filter(n => (n.startsWith(REVIEW_RUN_ID_PREFIX) || legacy.has(n)) && n.endsWith('.json')).flatMap(name => {
     const path = join(dir, name);
     const stat = statSync(path);
     const key = `${stat.mtimeMs}:${stat.size}`;

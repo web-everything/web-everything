@@ -2,12 +2,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as carry from '../numbering-carry.mjs';
 import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
 import { mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isMintedReviewRunId, readReviewRunEvidence, readReviewRunHeads } from '../../conveyor/review-referral-hold.mjs';
-import { chosenRunIdRecord, newRunRecord, saveChosenRun } from '../../operations/run-record.mjs';
-import { createFileRunStore, createMemoryRunStore, newRunId, resolveRunsDir, tryReadRun, writeRun } from '../../operations/run-store.mjs';
+import { chosenRunIdRecord, newRunRecord, saveChosenRun, serializeRunRecord } from '../../operations/run-record.mjs';
+import { createFileRunStore, createMemoryRunStore, migrateLegacyRuns, newRunId, resolveRunsDir, tryReadRun, writeRun } from '../../operations/run-store.mjs';
 import { createRegistry, op } from '../../operations/registry.mjs';
 import { compute } from '../../operations/step-kinds.mjs';
 import { runOperationCli } from '../../operations/cli-adapter.mjs';
@@ -246,6 +246,47 @@ describe('numbering carry referral evidence', () => {
       // Nor may another operation write into the namespace, where it would replace or hide a review run.
       expect(() => writeRun(newRunRecord({ id: `review-pr-${id}`, op: 'heavy-queue' }), dir)).toThrow(/does not match operation/);
       expect(readdirSync(dir).filter(n => n.endsWith('.json'))).toEqual([]);
+    });
+    // PR #5520 red team (review-referral-hold.mjs:127): a review run written under a custom name BEFORE the namespace
+    // rule existed is still on disk. Both readers must see it, so it blocks the carry like any unfinished live run.
+    const legacy = (id, head, verdict, adviseFinished, into = dir) => {
+      const record = { ...newRunRecord({ id, op: 'review-pr' }), findings: { read: { repo, pr, netBasis: { rev: head } } }, verdict,
+        stepTimings: [{ step: 'read', stepIndex: 0, startedAt: '2026-10-17T12:00:00Z', finishedAt: '2026-10-17T12:00:30Z', durationMs: 30000 },
+          { step: 'advise', stepIndex: 1, startedAt: '2026-10-17T12:00:30Z',
+            ...(adviseFinished ? { finishedAt: '2026-10-17T12:01:00Z', durationMs: 30000 } : {}) }] };
+      writeFileSync(join(into, `${id}.json`), serializeRunRecord(record)); // as written before `writeRun` refused it
+    };
+    it('a legacy review run under a custom-live name blocks the carry onto the live head', () => {
+      dir = mkdtempSync(join(tmpdir(), 'numbering-legacy-'));
+      persist(PRIOR_RUN, FROM, { verdict: 'accept', pendingReferrals: [] }, true);
+      legacy('custom-live', TO, live['persistence-failed'], false);
+      expect(readReviewRunHeads({ dir, memo: new Map(), persist: false }).find(r => r.id === 'custom-live'))
+        .toMatchObject({ head: TO, custom: true });
+      const readNetDiff = vi.fn(() => ({ scored: true, text: 'same diff' }));
+      expect(defaultGuard(readNetDiff)).toMatchObject({ code: 'MANDATORY_REFERRAL_UNFINISHED_REVIEW_RUN' });
+      expect(readNetDiff).not.toHaveBeenCalled();
+      const { result, writes } = replay({ readRuns: () => readReviewRunEvidence({ dir, memo: new Map(), persist: false }),
+        readRunHeads: () => readReviewRunHeads({ dir, memo: new Map(), persist: false }) });
+      expect(result.action).toBe('retry');
+      expect(writes).toEqual([]);
+    });
+    it('a finished legacy review run under a custom name is read as a custom review, never a clean one', () => {
+      dir = mkdtempSync(join(tmpdir(), 'numbering-legacy-'));
+      legacy('custom-prior', FROM, { verdict: 'accept', pendingReferrals: [] }, true);
+      writeRun(newRunRecord({ id: 'heavy-queue-1', op: 'heavy-queue' }), dir);
+      expect(readReviewRunEvidence({ dir, memo: new Map(), persist: false }).map(r => [r.id, r.custom]))
+        .toEqual([['custom-prior', true]]);
+    });
+    it('a legacy review run migrated in after the namespace scan is still read', () => {
+      dir = mkdtempSync(join(tmpdir(), 'numbering-legacy-'));
+      const old = mkdtempSync(join(tmpdir(), 'numbering-legacy-clone-'));
+      try {
+        writeRun(newRunRecord({ id: 'heavy-queue-1', op: 'heavy-queue' }), dir);
+        expect(readReviewRunHeads({ dir, memo: new Map() })).toEqual([]); // scanned; the scan result is kept on disk
+        legacy('custom-live', TO, live['persistence-failed'], false, old);
+        expect(migrateLegacyRuns(old, dir).moved).toEqual(['custom-live']);
+        expect(readReviewRunHeads({ dir, memo: new Map() }).map(r => r.id)).toEqual(['custom-live']);
+      } finally { rmSync(old, { recursive: true, force: true }); }
     });
     it.each(CUSTOM_IDS.flatMap(id => Object.keys(live).map(kind => [id, kind])))(
       'custom run IDs never bypass the unfinished live-head review guard (%s, %s)', (id, kind) => {

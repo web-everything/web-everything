@@ -146,7 +146,7 @@ describe('attempted mandatory referrals', () => {
   it('a corrupt or foreign on-disk projection is ignored, never trusted', () => {
     const dir = temp(); writeRun(run(), dir);
     readReviewRunEvidence({ dir, memo: new Map() });
-    const cache = readdirSync(dir).find(n => !n.endsWith('.json'));
+    const cache = readdirSync(dir).find(n => n.endsWith('.cache')); // not the legacy review scan beside it
     expect(cache).toBeTruthy();
     for (const junk of ['{not json', JSON.stringify({ v: 1, code: 'some-older-projection', entries: { 'review-pr-parked.json': { key: 'x', evidence: null } } })]) {
       writeFileSync(join(dir, cache), junk);
