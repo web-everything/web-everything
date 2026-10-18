@@ -6,12 +6,12 @@ import { cascadePolicy, platformPreference, formatCascadeSourcesLine } from './p
 import { readDeclaredSettings } from './settings-files.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 
-const defaults = { holdFirst: true, catchUpSkipUnchangedHolds: true, carryOverReadyFirst: true };
+const defaults = { holdFirst: true, catchUpSkipUnchangedHolds: true, carryOverReadyFirst: true, catchUpSkipMaxMin: 15 };
 export function resolveDrainThroughput({ env = process.env, file, platform, log = line => process.stderr.write(`${line}\n`) } = {}) {
   const pick = v => Object.fromEntries(Object.keys(defaults).filter(k => v?.[k] !== undefined).map(k => [k, v[k]]));
   const out = cascadePolicy('drain', pick((file ?? readDeclaredSettings().settings)?.drain), {
     standard: defaults, platform: pick(platform ?? platformPreference('drain', { env })), env,
-    valid: Object.fromEntries(Object.keys(defaults).map(k => [k, v => typeof v === 'boolean'])),
+    valid: Object.fromEntries(Object.keys(defaults).map(k => [k, k === 'catchUpSkipMaxMin' ? v => Number.isFinite(v) && v >= 0 : v => typeof v === 'boolean'])),
   });
   log(formatCascadeSourcesLine('drain', out));
   return out;
@@ -34,7 +34,11 @@ export function holdSignature(pr, evidence) {
     labels: pr.labels.map(l => typeof l === 'string' ? l : l.name).sort(),
     updatedAt: pr.updatedAt, comments: pr.comments, reviews: pr.reviews, evidence })).digest('hex');
 }
-export function unchangedHold(previous, pr, evidence) {
+export function unchangedHold(previous, pr, evidence, { now = Date.now(), maxMin = 15 } = {}) {
+  if (!Number.isFinite(previous?.recordedAt) || now < previous.recordedAt || now - previous.recordedAt >= maxMin * 60_000) return false;
+  if (previous.kind === 'overlap-yield' && (!Number.isFinite(evidence?.overlap?.untilMs)
+    || now >= evidence.overlap.untilMs || evidence.overlap.state !== 'OPEN' || !evidence.overlap.head)) return false;
+  if (previous.kind === 'numbering' && evidence?.numberingOwed !== true) return false;
   const signature = holdSignature(pr, evidence);
   return !!signature && HOLD_KINDS.has(previous?.kind) && previous.signature === signature;
 }

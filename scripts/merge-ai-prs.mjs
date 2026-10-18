@@ -5157,8 +5157,8 @@ async function runCli() {
       const slug = repo || localSlug;
       let listed;
       let snapshotSeed;
-      // Catch-up children share discovery through the existing host snapshot, with a live target.
-      // Ordinary drains retain live open-set discovery; snapshot misses retain that same fallback.
+      // Snapshots seed target/heavy-field hydration only. Every drain lists the live open set
+      // so overlap, blocker and couple decisions see siblings opened since the snapshot.
       if (slug && onlyPr != null && (fastDrainListing.listing === 'snapshot' || process.env.WE_DRAIN_CATCH_UP_SNAPSHOT === '1') && isFastDrainTarget(repo, { number: onlyPr })) {
         const fields = RECONCILE ? SWEEP_LIST_FIELDS
           : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '');
@@ -5178,9 +5178,7 @@ async function runCli() {
           process.stderr.write('fast-drain: listing fell back to live (snapshot or live target read failed)\n');
         }
       }
-      if (snapshotSeed && process.env.WE_DRAIN_CATCH_UP_SNAPSHOT === '1' && throughput.value.catchUpSkipUnchangedHolds) {
-        listed = { rows: snapshotSeed, truncated: false };
-      } else if (slug) {
+      if (slug) {
         const paging = resolvePrListPaging();
         const heavyFields = ['body', ...((RECONCILE || workflowEditSetting.value !== 'off') ? ['files'] : [])];
         // Seed body/files from the host-shared snapshot (its heavy copies persist across drain processes); a seed
@@ -6568,7 +6566,7 @@ async function runCli() {
     const earlyHold = c => memoHold(c, async () => {
       const overlap = preparedPass.plan.deferred.find(d => d.num === c.num && d.repo === c.repo
         && (d.overlapYield || d.waitOn?.some(w => String(w).startsWith('overlap-yield:'))));
-      if (overlap) return { kind: 'overlap-yield', reason: overlap.waitOn.join(', ') };
+      if (overlap) return { kind: 'overlap-yield', reason: overlap.waitOn.join(', '), overlapYield: overlap.overlapYield };
       // Reuse the review hold rule, including the existing explicit relief for pending.
       const allowPending = (escalationRelief.prs || []).includes(Number(c.num)) || (!!escalationRelief.passWide && !!label);
       if (hasUnclearedReviewLabel(c.prLabels || [], { allowPending }))

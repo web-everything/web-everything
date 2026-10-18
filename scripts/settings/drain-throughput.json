@@ -1,4 +1,4 @@
 {
-  "$comment": "Scheduling only: holds move earlier; carry-over never bypasses a gate. Set any leaf false to roll it back.",
-  "drain": { "holdFirst": true, "catchUpSkipUnchangedHolds": true, "carryOverReadyFirst": true }
+  "$comment": "Scheduling only: holds move earlier; carry-over never bypasses a gate. Set boolean leaves false to roll them back; catchUpSkipMaxMin bounds hold skips.",
+  "drain": { "holdFirst": true, "catchUpSkipUnchangedHolds": true, "carryOverReadyFirst": true, "catchUpSkipMaxMin": 15 }
 }

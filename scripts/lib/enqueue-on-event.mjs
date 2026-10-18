@@ -497,9 +497,27 @@ export function createEnqueueOnEvent({
     ...readDrainRedTeamEvidence({ repo, pr: num, head, env }),
     saved: readSavedRedTeamResult({ repo, pr: num, head, env }),
   }),
+  // Withdrawal debt lives in the drain child, not this daemon. Unknown debt must run
+  // that child again; never mistake this process's empty numbering memo for clearance.
+  readNumberingOwed = () => undefined,
   resolveThroughput = () => resolveDrainThroughput({ env, log }),
   timeoutMs, readPr = ({ repo, num }) => readPrForWake({ repo, num, env }),
 } = {}) {
+  const readDependencies = async ({ repo, num, overlapYield }) => {
+    const numberingOwed = await readNumberingOwed({ repo, num });
+    let overlap = null;
+    if (overlapYield) {
+      const sibling = await readPr({ repo: overlapYield.repo || repo, num: overlapYield.pr });
+      if (!sibling?.state || !sibling?.headRefOid) throw Error('overlap sibling state unavailable');
+      overlap = { ...overlapYield, state: sibling.state, head: sibling.headRefOid };
+    }
+    return { numberingOwed: numberingOwed ?? null, overlap };
+  };
+  const readMemoEvidence = async ({ repo, num, head, overlapYield }) => {
+    const evidence = await readHoldEvidence({ repo, num, head });
+    if (!isObj(evidence)) throw Error('hold evidence unavailable');
+    return { ...evidence, ...await readDependencies({ repo, num, overlapYield }) };
+  };
   const staged = p => {
     const s = resolvePrestageSettings({ env });
     return s.value.prestageWhileCiRuns && prestageCache.get(p.repo, p.num, s.value.prestageTtlMin)?.eligible;
@@ -626,9 +644,9 @@ export function createEnqueueOnEvent({
       try { pr = await readPr({ repo: p.repo, num: p.num }); } catch { pr = null; }
       let holdEvidence;
       if (p.catchUp && throughput.catchUpSkipUnchangedHolds && pr?.headRefOid) {
-        try { holdEvidence = await readHoldEvidence({ repo: p.repo, num: p.num, head: pr.headRefOid }); }
+        try { holdEvidence = await readMemoEvidence({ repo: p.repo, num: p.num, head: pr.headRefOid, overlapYield: lastHolds.get(p.num)?.overlapYield }); }
         catch { lastHolds.delete(p.num); }
-        if (taken.causes.every(c => c === 'catch-up') && holdEvidence !== undefined && unchangedHold(lastHolds.get(p.num), pr, holdEvidence)) {
+        if (taken.causes.every(c => c === 'catch-up') && holdEvidence !== undefined && unchangedHold(lastHolds.get(p.num), pr, holdEvidence, { now: now(), maxMin: throughput.catchUpSkipMaxMin ?? 15 })) {
           const what = `unchanged hold: ${lastHolds.get(p.num).kind}`;
           log(`${prefix} — ${what}`);
           ran.push({ ...metadata, num: p.num, code: null, what, outcome: 'skipped' });
@@ -698,7 +716,13 @@ export function createEnqueueOnEvent({
           const outcome = hit(json?.enqueueOutcomes) || hit(json?.skipReasons) || hit(json?.skipped);
           const kind = outcome?.kind === 'branch-preparation' ? classifySkipReason(outcome.reason)
             : outcome?.kind || classifySkipReason(outcome?.reason);
-          if (HOLD_KINDS.has(kind)) lastHolds.set(p.num, { kind, signature: holdSignature(pr, holdEvidence) });
+          if (HOLD_KINDS.has(kind)) {
+            const overlapYield = outcome?.overlapYield || hit(json?.deferred)?.overlapYield;
+            try {
+              const evidence = { ...holdEvidence, ...await readDependencies({ repo: p.repo, num: p.num, overlapYield }) };
+              lastHolds.set(p.num, { kind, overlapYield, recordedAt: startedAt, signature: holdSignature(pr, evidence) });
+            } catch { lastHolds.delete(p.num); } // uncertain dependencies retry the drain
+          }
         }
         let what = r.timedOut ? `timed out after ${childTimeoutMs / 1000}s with no JSON result` : r.error ? `could not run (${r.error})` : summarizeFastDrain(json, p.num);
         const summary = what;
@@ -775,7 +799,7 @@ export function createEnqueueOnEvent({
             const held = backoff.get(p.num);
             let unchanged = false;
             if (throughput.catchUpSkipUnchangedHolds && lastHolds.has(p.num) && pr?.headRefOid) {
-              try { unchanged = unchangedHold(lastHolds.get(p.num), pr, await readHoldEvidence({ repo: localSlug, num: p.num, head: pr.headRefOid })); } catch { /* retry */ }
+              try { unchanged = unchangedHold(lastHolds.get(p.num), pr, await readMemoEvidence({ repo: localSlug, num: p.num, head: pr.headRefOid, overlapYield: lastHolds.get(p.num)?.overlapYield }), { now: now(), maxMin: throughput.catchUpSkipMaxMin ?? 15 }); } catch { /* retry */ }
             }
             if (!unchanged && pr && wakeWorthy(pr).wake && !(held && catchUpRound <= held.untilRound && held.signature === prHeadSignature(pr))) { busy = true; break; }
           }

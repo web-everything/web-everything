@@ -2040,9 +2040,16 @@ run it through heavy admission.
 `drain.catchUpSkipUnchangedHolds` and `drain.carryOverReadyFirst` switches; their resolver
 logs the source of each value. Early checks remember only refusals per repo/PR/head for
 the cascade. A cleared early check never authorizes a write: live admission still runs.
-Catch-up remembers PR holds until the live head/labels/update time or local red-team
-evidence changes, and shares discovery through the existing host PR snapshot with a
-live target read. Transient merge-lock contention retains normal retries. Carry-over
+Catch-up remembers PR holds until the live head/labels/update time, local red-team
+evidence, overlap deadline, yielded-to PR state/head, or numbering withdrawal debt
+changes. `drain.catchUpSkipMaxMin` (default 15, nonnegative minutes, source logged)
+bounds every remembered hold from the child's start time; zero disables skips.
+An expired overlap window or unknown/unreadable dependency always reruns the drain.
+Numbering withdrawal debt is process-local to the drain child: the daemon cannot
+infer clearance from its own empty memo, so numbering holds rerun unless a reader
+can supply live debt. Snapshots may seed hydration, but every catch-up child lists
+the live open set for overlap, blocker and couple decisions. Transient merge-lock
+contention retains normal retries. Carry-over
 stores only `ready-not-reached` rows beside drain queue state, never enqueued PRs or
 known holds; it orders the next full pass before couple grouping and main-fix priority.
 The focused injected-process and pure checks are in `drain-throughput.test.mjs`.
