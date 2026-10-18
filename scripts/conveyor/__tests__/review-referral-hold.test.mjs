@@ -9,11 +9,17 @@ import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { runReconcilePass as runReconcilePassWithTiming } from '../reconcile-pass.mjs';
 const runReconcilePass = (options = {}) => runReconcilePassWithTiming({ ...options, env: { WE_REVIEW_START_AFTER: 'ci-green', WE_FIX_JOIN_CI_AND_REVIEW: 'false', ...options.env } });
 import { countFindings } from '../reconcile-core.mjs';
+import { ADVISORY_REARM_COMMENT_MARKER } from '../advisory-fix-mark.mjs';
 import {
   classifyPausedReview, reviewRunEvidence, readReviewRunEvidence, decideReferralHold, enrichPrsWithReferralHolds,
   notifyReferralHold, REFERRAL_RETRY_MS, decideSameHeadHold, resolveSameHeadMaxReviews, PENDING_REASON_TOKENS,
-  GH_LIST_COMMENT_CAP, findResumableParkedRun, blockRuledReferralsFor, filterFixerReferrals,
+  GH_LIST_COMMENT_CAP, findResumableParkedRun, blockRuledReferralsFor, filterFixerReferrals, REFERRAL_REARM_COMMENT_MARKER,
 } from '../review-referral-hold.mjs';
+
+it('keeps the cycle-free referral matcher equal to the canonical re-arm marker', () => {
+  expect(REFERRAL_REARM_COMMENT_MARKER).toBe(REARM_COMMENT_MARKER);
+  expect(ADVISORY_REARM_COMMENT_MARKER).toBe(REARM_COMMENT_MARKER);
+});
 
 const repo = 'web-everything/web-everything';
 const head = 'a'.repeat(40);

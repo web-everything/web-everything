@@ -11,12 +11,14 @@ import { liveReferralState } from '../lib/referral-live-context.mjs';
 import { resolveRunsDir, REVIEW_RUN_ID_PREFIX, tryReadRun } from '../operations/run-store.mjs';
 import { sameRepo, parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
-import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
 import { resolveReferralSafetySettings } from '../lib/review-settings.mjs';
 import { parseLatestHumanClearedSha, parseReviewedSha } from '../lib/review-escalation.mjs';
 
+// Match we:scripts/conveyor/rearm-review.mjs#REARM_COMMENT_MARKER locally: importing it closes a daemon boot cycle.
+// The equality test keeps this first-line matcher tied to the canonical marker.
+export const REFERRAL_REARM_COMMENT_MARKER = '🔧 conveyor fix — re-armed for re-review';
 export const REFERRAL_HOLD_MARKER = 'review paused:';
 export const GH_LIST_COMMENT_CAP = 100;
 export const PENDING_REASON_TOKENS = Object.freeze(new Set(['author-stamp-missing']));
@@ -176,7 +178,7 @@ function wakeEvents(pr, run) {
       return r && sameRepo(r.repo, run.repo) && r.pr === run.pr && r.head === run.head ? [{ at, kind: 'ruling' }] : [];
     }
     if (body.includes('<!-- paused-review-auto-rearm:')) return [];
-    if (body.startsWith(REARM_COMMENT_MARKER) || body.startsWith('🔁 review — changes requested')) return [{ at, kind: 'fresh' }];
+    if (body.startsWith(REFERRAL_REARM_COMMENT_MARKER) || body.startsWith('🔁 review — changes requested')) return [{ at, kind: 'fresh' }];
     // An operator reply is a request to reconsider, never authority to clear the human gate.
     return isOperatorAuthored(c) ? [{ at, kind: 'fresh' }] : [];
   });

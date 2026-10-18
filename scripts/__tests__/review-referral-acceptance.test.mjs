@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { assertMandatoryReferralsCleared, runReviewLabelCli } from '../review-set-label.mjs';
 import { mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../lib/jury-core.mjs';
 import { newRunRecord, writeRun } from '../operations/run-store.mjs';
+import { DAEMON_ENTRY_MODULES } from '../lib/daemon-boot-smoke.mjs';
 
 const repo = 'o/r', pr = 3481, head = '8dad651' + 'a'.repeat(33);
 const authorBody = '<!-- authored-by-actor: author -->';
@@ -35,8 +36,8 @@ describe('current-head mandatory referral acceptance', () => {
   });
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
 
-  it('loads review dispatch in a fresh process without a seat-policy initialization cycle', () => {
-    const result = spawnSync(process.execPath, ['--input-type=module', '-e', "await import('./scripts/operations/review-dispatch.mjs')"],
+  it.each(['scripts/operations/review-dispatch.mjs', ...DAEMON_ENTRY_MODULES])('loads %s in a fresh process without an initialization cycle', entry => {
+    const result = spawnSync(process.execPath, ['-e', `import(${JSON.stringify(`./${entry}`)})`],
       { cwd: resolve(dirname(fileURLToPath(import.meta.url)), '../..'), encoding: 'utf8', timeout: 10000 });
     expect(result.status, result.stderr).toBe(0);
   });
