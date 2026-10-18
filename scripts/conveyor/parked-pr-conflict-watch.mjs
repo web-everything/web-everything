@@ -437,13 +437,14 @@ export function attemptMissingCheckBaseRepair(d, { repo, pr, cwd = REPO_ROOT,
 
 /** Same trusted fast-forward plumbing, with a fresh main and a private index for the card path. */
 export function defaultAttemptCardConflictRebase({ pr, repo, cwd = REPO_ROOT, run = gitRun, cardConflictSettings } = {}) {
-  if (!pr?.headRefName?.startsWith('lane/') || pr.baseRefName !== 'main' || !/^[a-f0-9]{40}$/.test(pr.headRefOid ?? '')) return { action: 'skip', reason: 'not a main-base PR' };
+  // Establish clone ownership before eligibility checks or any fetch/ref work.
   if (repo) {
     const remote = run('git', ['remote', 'get-url', 'origin'], { cwd });
     const expected = repoKeyForSlug(repo);
     if (remote.status !== 0 || !expected || repoKeyFromRemoteUrl(remote.stdout) !== expected)
       return { action: 'skip', reason: 'card conflict clone does not match PR repository' };
   }
+  if (!pr?.headRefName?.startsWith('lane/') || pr.baseRefName !== 'main' || !/^[a-f0-9]{40}$/.test(pr.headRefOid ?? '')) return { action: 'skip', reason: 'not a main-base PR' };
   const fetched = run('git', ['fetch', 'origin', 'main', pr.headRefName], { cwd });
   if (fetched.status !== 0) return { action: 'error', reason: 'card conflict fetch failed' };
   const headFetch = run('git', ['fetch', '--no-tags', 'origin', `refs/heads/${pr.headRefName}`], { cwd });

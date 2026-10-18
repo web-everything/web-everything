@@ -82,11 +82,15 @@ describe('conflicts always have an owner, outside the fixer scope queue for mech
     expect(s.provider.postComment).toHaveBeenCalledWith('o/r', 42, UNOWNED_REBASE_ATTEMPT_MARKER);
     expect(s.postFinding).toHaveBeenCalledOnce();
   });
-  it('refuses the wrong constellation clone before fetching or touching its refs', () => {
+  it.each([
+    { headRefName: 'lane/cards' },
+    { headRefName: 'lane/cards', baseRefName: 'main', headRefOid: 'a'.repeat(40) },
+  ])('refuses the wrong constellation clone before fetching or touching its refs', (pr) => {
     const run = vi.fn(() => ({ status: 0, stdout: 'https://github.com/frontier-ui/frontierui.git\n' }));
-    const r = defaultAttemptCardConflictRebase({ pr: { headRefName: 'lane/cards' }, repo: 'web-everything/web-everything', run });
+    const r = defaultAttemptCardConflictRebase({ pr, repo: 'web-everything/web-everything', run });
     expect(r).toMatchObject({ action: 'skip', reason: expect.stringMatching(/clone/) });
-    expect(run.mock.calls.some(([, args]) => args[0] === 'fetch')).toBe(false);
+    expect(run).toHaveBeenCalledOnce();
+    expect(run).toHaveBeenCalledWith('git', ['remote', 'get-url', 'origin'], { cwd: expect.any(String) });
   });
   it('retries rearm after a resolver push and a failed review write', () => {
     const postRearm = vi.fn(() => { throw new Error('write unavailable'); });
