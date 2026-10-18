@@ -1,4 +1,5 @@
 ---
+bornAs: xzlh2ts
 kind: story
 size: 3
 parent: "4075"
@@ -11,7 +12,7 @@ tags: []
 # Prevention — Require structured guarantee-to-test mappings through a deterministic card-validation gate, inclu… (from web-everything/web-everything#5528 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/xrdwiud-drain-cascade-checks-holds-red-team-overlap-yield-numbering.md:20` — Require structured guarantee-to-test mappings through a deterministic card-validation gate, including repository-qualified files, named cases, and observable assertions; explicitly map all three hold categories and operation spies.
+1. `we:backlog/6223-drain-cascade-checks-holds-red-team-overlap-yield-numbering.md:20` — Require structured guarantee-to-test mappings through a deterministic card-validation gate, including repository-qualified files, named cases, and observable assertions; explicitly map all three hold categories and operation spies.
 
 Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 1 → #5605, finding 2 → #5039, finding 3 → #6035, finding 4 → #5360, finding 7 → #5360, finding 6 → #5668, finding 9 → #5668, finding 8 → #5473.
 
