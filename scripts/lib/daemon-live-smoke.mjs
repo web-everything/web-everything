@@ -220,25 +220,6 @@ export function resolveSmokeBudgets(env = process.env, { load = () => loadavg()[
   return budgets;
 }
 
-/** The real dispatch probe uses the same authoritative rebuild-smoke admission and I/O load
- * factor as dispatch-dry-run. The base overlay safety timeout remains a budget, never a verdict. */
-export function resolveDispatchSmokeBudget(env, baseMs, {
-  load = () => loadavg()[0], cores = () => cpus().length, shadow = shadowAdmission, admit = admitResource,
-} = {}) {
-  let load1, coreCount;
-  const host = { load: () => load1 ??= load(), cores: () => coreCount ??= cores() };
-  const legacy = smokeLoadFactor(env, host);
-  const admission = rebuildSmokeAdmission({ shadow, admit, env, shadowArgs: {
-    gate: 'rebuild-smoke.loadScaledBudgets', kind: 'rebuild-smoke', env,
-    oldVerdict: legacy > 1 ? 'hold' : 'admit', oldReason: `real dispatch timeout scaled ×${legacy}`,
-  } });
-  const io = resolveIoBoundLoadScale(env);
-  const admitted = isDecision(admission) ? admissionLoadFactor(env, admission) : legacy;
-  const factor = isDecision(admission) && io.enabled ? Math.max(admitted, legacy) : admitted;
-  return { timeoutMs: Math.round(baseMs * factor), factor,
-    source: `smokeIoBoundLoadScale.enabled:${io.source}; ${isDecision(admission) ? 'rebuild-smoke admission' : 'host load fallback'}; WE_SMOKE_LOAD_SCALE:${env[SMOKE_LOAD_SCALE_ENV] === undefined ? 'standard' : 'env'}; WE_SMOKE_LOAD_SCALE_MAX:${env[SMOKE_LOAD_SCALE_MAX_ENV] === undefined ? 'standard' : 'env'}` };
-}
-
 // Live 2026-10-10 (wev-fix-daemon): with x9xkupj's admission, `admit` (CPU 16–28% idle) left reconcile/dispatch at
 // 120s/180s at load 30–46 on 12 cores. Both wait on gh/git children, so CPU idle says nothing about them: they were
 // killed, and plain main and last-good failed identically. These two keep the load factor through the cascade.

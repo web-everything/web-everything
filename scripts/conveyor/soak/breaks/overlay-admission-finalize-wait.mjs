@@ -1,4 +1,4 @@
-/** #5938: a bounded explicit load must keep its passed candidate for adoption at the reader boundary. */
+/** #5938 / PR #5381: a late explicit load must not discard a passed smoke while readers drain. */
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 
 export default {
   id: 'overlay-admission-finalize-wait',
-  title: 'an explicit overlay load keeps a passed candidate when its reader wait expires',
+  title: 'an explicit overlay load preserves the finalize wait after its admission budget shrinks',
   card: 'we:backlog/5938 / PR #5381',
   fixedBy: { sha: 'PR #5381 repair', where: 'lane/5938', paths: ['scripts/lib/daemon-load-overlay.mjs', 'scripts/lib/daemon-rebuild/rebuild.mjs'] },
   fixPresent(root) {
@@ -20,7 +20,7 @@ export default {
     // evaluating before importing its dependencies separately: concurrent roots can deadlock Vitest
     // on a cold soak worker (the unit suite has already imported the loader before running this).
     const { runDaemonLoadOverlay } = await load('daemon-load-overlay.mjs');
-    const { rebuildClone, readReadyCandidate } = await load('daemon-rebuild.mjs');
+    const { rebuildClone } = await load('daemon-rebuild.mjs');
     const lock = await load('daemon-clone-lock.mjs');
     const { writeRebuildStarvation } = await load('daemon-rebuild/lease.mjs');
     const violations = [];
@@ -60,7 +60,6 @@ export default {
         const startReader = () => {
           if (!lock.acquireRead(root, { ...reader, nowMs: time }).ok) throw new Error('reader fixture refused');
         };
-        const initialHead = git(root, 'rev-parse', 'HEAD').trim();
         const waits = [];
         let attempts = 0;
         let smokes = 0;
@@ -93,25 +92,10 @@ export default {
           // Skip the smoke memoization write so the next lock is specifically finalize, not cache bookkeeping.
           baseSmoke: async () => ({ verdict: 'pass', cached: true, attempts: 1, smoke: { results: [] } }),
         });
-        const bound = 600 - variant.busy * 250;
-        const expected = [bound, bound];
-        const ready = readReadyCandidate(root, env);
-        if (result.adopted || !result.pending || result.reason !== 'tick-boundary-scheduled'
-          || smokes !== 1 || !ready || git(root, 'rev-parse', 'HEAD').trim() !== initialHead
-          || JSON.stringify(waits) !== JSON.stringify(expected)) {
-          violations.push(`${variant.name}: pending=${result.pending}, adopted=${result.adopted}, ready=${!!ready}, smokes=${smokes}, waits=${JSON.stringify(waits)}, expected=${JSON.stringify(expected)}, reason=${result.reason}`);
+        const expected = [600 - variant.busy * 250, variant.finalize];
+        if (!result.adopted || smokes !== 1 || JSON.stringify(waits) !== JSON.stringify(expected)) {
+          violations.push(`${variant.name}: adopted=${result.adopted}, smokes=${smokes}, waits=${JSON.stringify(waits)}, expected=${JSON.stringify(expected)}, reason=${result.reason}`);
         }
-        // The reader's next boundary adopts the exact passed tree, with no second smoke and no live move mid-tick.
-        lock.releaseRead(root, reader);
-        const tick = await rebuildClone({ root, env, versions: null, asJob: false, skipCheck: null,
-          prState: async () => null, now: () => time, log: { error() {} },
-          runSmoke: async () => { smokes++; throw new Error('passed candidate must not be smoked again'); },
-        });
-        git(root, 'merge-base', '--is-ancestor', 'origin/lane/overlay', 'HEAD');
-        if (!tick.adopted || smokes !== 1 || git(root, 'rev-parse', 'HEAD^{tree}').trim() !== ready?.tree) {
-          violations.push(`${variant.name}: next boundary adopted=${tick.adopted}, smokes=${smokes}, reason=${tick.reason}`);
-        }
-
       } finally { rmSync(dir, { recursive: true, force: true }); }
     }
     return { violations };

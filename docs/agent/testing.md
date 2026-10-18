@@ -2033,25 +2033,3 @@ Keep nested author windows bounded: 100 PRs × 100 commits × 100 authors exceed
 GitHub's node ceiling before a query runs. Overflow must use the original reader,
 never truncate evidence. The focused regression is `scripts/lib/__tests__/drain-pr-state.test.mjs`;
 run it through heavy admission.
-
-## Overlay load admission and dispatch smoke pressure
-
-Explicit overlay loads wait on clone reader lease-directory events, with a bounded timer
-fallback. Signals only trigger the existing liveness/fairness checks; they never grant a
-write slot. `overlaySmoke.tickWaitMs` (default 60000) bounds admission, including ready
-candidates. Its env override is `WE_OVERLAY_TICK_WAIT_MS`; the existing
-`WE_DAEMON_REBUILD_LOCK_WAIT_MS` remains a compatibility override. On expiry the durable
-registered overlay remains pending for the reader's next tick-start gated rebuild. A pending
-load is never reported adopted. A candidate already proved by smoke remains ready.
-
-The real dispatch smoke uses the same `rebuild-smoke.loadScaledBudgets` resource decision
-and `smokeIoBoundLoadScale` cascade as the dispatch dry run. Log its effective timeout,
-scale factor and sources. `overlaySmoke.dispatchLaunchRetries` bounds startup/overload
-retries to one in total. An evidence-free startup timeout can retry once; an overload-only
-timeout must wait for a quiet host (`hostLooksBusy`) first. `overlaySmoke.quietWaitMs`
-(default 60000, env `WE_OVERLAY_SMOKE_QUIET_WAIT_MS`) bounds that wait; expiry holds the
-candidate pending instead of removing its overlay. Both new bounds use standard → platform
-→ `overlaySmoke` in `scripts/lib/daemon-rebuild-settings.json` → env, with logged sources.
-Denials, failed commands, malformed/unreadable evidence and failed launches remain failures;
-none can be passed or excused by host load. Tests inject worker launches and host probes and
-use temporary lease directories; never run a real worker or load a daemon to test pressure.

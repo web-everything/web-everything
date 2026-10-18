@@ -37,7 +37,7 @@
  */
 
 import { hostname, homedir } from 'node:os';
-import { readdirSync, readFileSync, writeFileSync, renameSync, mkdirSync, rmSync, watch } from 'node:fs';
+import { readdirSync, readFileSync, writeFileSync, renameSync, mkdirSync, rmSync } from 'node:fs';
 import { join, resolve as resolvePath } from 'node:path';
 import { canonicalCloneRoot } from './daemon-clone-layout.mjs';
 import { fileURLToPath } from 'node:url';
@@ -447,40 +447,13 @@ export function releaseRead(root, opts = {}) {
 
 const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** Watch the reader namespace AND each lease directory (heartbeat replaces lock.json atomically).
- * Install before the next liveness scan to close the scan/subscribe race. Events only wake the scan;
- * they never grant the lock. The timer covers lost events, expired leases and unavailable watches. */
-function readerWake(readersRoot, fallbackMs) {
-  const watchers = [];
-  let timer;
-  let resolve;
-  let settled = false;
-  const promise = new Promise(r => { resolve = r; });
-  const close = () => {
-    clearTimeout(timer);
-    for (const watcher of watchers) watcher.close();
-  };
-  const wake = () => { if (!settled) { settled = true; close(); resolve(); } };
-  const subscribe = path => {
-    try {
-      const watcher = watch(path, wake);
-      watcher.on('error', wake);
-      watchers.push(watcher);
-    } catch { /* fallback timer still rechecks leases */ }
-  };
-  subscribe(readersRoot);
-  try { for (const name of readdirSync(readersRoot)) subscribe(join(readersRoot, name)); } catch { /* timer */ }
-  timer = setTimeout(wake, Math.max(0, fallbackMs));
-  return { promise, close };
-}
-
 /**
  * Acquire the WRITE slot on `root`'s clone lock. Exactly one writer at a time; once reserved, NEW readers are
  * refused (their own `acquireRead` re-check step (3) above), and this call then waits for every already-live
  * reader other than itself to drain (or its lease to lapse) before returning ok.
  *   (1) reserve the writer key — a LIVE writer owned by someone else ⇒ `concurrent-mover` (never ours to take);
  *       a dead/expired one is reclaimed by {@link reserve} itself, same as any other stale key.
- *   (2) watch reader lease/release signals (with a timer fallback), scanning `readers/` until no LIVE entry other than `owner` remains, or `waitMs` elapses. Any dead/expired
+ *   (2) poll `readers/` until no LIVE entry other than `owner` remains, or `waitMs` elapses. Any dead/expired
  *       reader entry seen along the way is removed on sight (reclaim) rather than left to rot.
  *       Timeout ⇒ release the writer key we took and report `tick-in-progress` (a live tick is still running).
  * @param {string} root
@@ -548,50 +521,45 @@ export async function acquireWrite(root, opts = {}) {
       heartbeat(writerRoot, WRITER_KEY, owner, new Date(nowMsN).toISOString(), pid);
       lastHeartbeatMs = nowMsN;
     }
-    const signal = sleep === defaultSleep
-      ? readerWake(readersRoot, Math.min(pollMs, Math.max(0, deadline - nowMsN))) : null;
-    try {
-      const blockers = [];
-      for (const entry of listReaderEntries(readersRoot)) {
-        if (entry.owner === owner) continue;
-        if (entryIsLive(entry, nowMsN, leaseMinutes, probe)) {
-          blockers.push(entry.owner);
-        } else {
-          releaseLockDir(readersRoot, entry.owner); // dead/expired reader — reclaim its slot now
-        }
+    const blockers = [];
+    for (const entry of listReaderEntries(readersRoot)) {
+      if (entry.owner === owner) continue;
+      if (entryIsLive(entry, nowMsN, leaseMinutes, probe)) {
+        blockers.push(entry.owner);
+      } else {
+        releaseLockDir(readersRoot, entry.owner); // dead/expired reader — reclaim its slot now
       }
-      lastBlockers = blockers;
-      // Still draining — nothing moved yet — so backing off to a starved reader is always safe.
-      const starvedReader = priorityFor(nowMsN);
-      if (starvedReader) {
-        releaseLockDir(writerRoot, WRITER_KEY);
-        return { ok: false, reason: 'reader-priority', heldBy: starvedReader.owner, starved: starvedReader.count };
-      }
-      if (blockers.length === 0) {
-        clearWriterClaim(starvedRoot); // the clone is ours to move — any writer claim has done its job
-        return { ok: true };
-      }
-      // #4044: a wait that blocks this process's own ticks is never silent — report it once, with who and how long.
-      if (typeof onBlocked === 'function' && !reportedBlocked) {
-        reportedBlocked = true;
-        try { onBlocked({ blockers, waitMs }); } catch { /* reporting never breaks the lock */ }
-      }
-      if (nowMsN >= deadline) {
-        releaseLockDir(writerRoot, WRITER_KEY);
-        // Writer fairness: leave (or bump) a claim so NEW reads yield until a writer gets the clone.
-        const claim = writerPriorityAfter > 0
-          ? noteWriterGaveUp(starvedRoot, {
-            owner, pid, nowMs: nowMsN, heldBy: lastBlockers[0] || null, ttlMs: writerClaimTtlMs, probe,
-          })
-          : null;
-        return {
-          ok: false, reason: 'tick-in-progress', heldBy: lastBlockers[0] || null,
-          ...(claim && claim.owner === owner ? { writerStarved: claim.count } : {}),
-        };
-      }
-      if (signal) await signal.promise;
-      else await sleep(Math.min(pollMs, Math.max(0, deadline - now())));
-    } finally { signal?.close(); }
+    }
+    lastBlockers = blockers;
+    // Still draining — nothing moved yet — so backing off to a starved reader is always safe.
+    const starvedReader = priorityFor(nowMsN);
+    if (starvedReader) {
+      releaseLockDir(writerRoot, WRITER_KEY);
+      return { ok: false, reason: 'reader-priority', heldBy: starvedReader.owner, starved: starvedReader.count };
+    }
+    if (blockers.length === 0) {
+      clearWriterClaim(starvedRoot); // the clone is ours to move — any writer claim has done its job
+      return { ok: true };
+    }
+    // #4044: a wait that blocks this process's own ticks is never silent — report it once, with who and how long.
+    if (typeof onBlocked === 'function' && !reportedBlocked) {
+      reportedBlocked = true;
+      try { onBlocked({ blockers, waitMs }); } catch { /* reporting never breaks the lock */ }
+    }
+    if (nowMsN >= deadline) {
+      releaseLockDir(writerRoot, WRITER_KEY);
+      // Writer fairness: leave (or bump) a claim so NEW reads yield until a writer gets the clone.
+      const claim = writerPriorityAfter > 0
+        ? noteWriterGaveUp(starvedRoot, {
+          owner, pid, nowMs: nowMsN, heldBy: lastBlockers[0] || null, ttlMs: writerClaimTtlMs, probe,
+        })
+        : null;
+      return {
+        ok: false, reason: 'tick-in-progress', heldBy: lastBlockers[0] || null,
+        ...(claim && claim.owner === owner ? { writerStarved: claim.count } : {}),
+      };
+    }
+    await sleep(pollMs);
   }
 }
 

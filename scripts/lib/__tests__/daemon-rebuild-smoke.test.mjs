@@ -179,7 +179,7 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
 
   /** The real dispatch smoke, its worker launch injected: `onLaunch` plays the launched worker. */
   const realDispatch = (f, onLaunch) => (args) => runRealDispatchSmoke({
-    ...args, settings: { ...args.settings, smokeTimeoutMs: 0 }, pollMs: 1, probeAlive: () => false, hostBusy: () => false, home: join(f.env.WE_DAEMON_STATE_DIR, 'home'),
+    ...args, settings: { ...args.settings, smokeTimeoutMs: 0 }, pollMs: 1, probeAlive: () => false, home: join(f.env.WE_DAEMON_STATE_DIR, 'home'),
     log: { error() {} },
     spawn: (_node, argv) => {
       const [, , , , , sessionId, , , scratch] = argv;
@@ -324,19 +324,6 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
     const r2 = await rebuild(f, run);
     expect(r2.adopted).toBe(true);
     expect(run).toHaveBeenCalledTimes(1);
-  });
-
-  it.each(['command-failed', 'smoke-unreadable'])('a definite %s keeps last-good and drops the suspect overlay', async reason => {
-    const f = makeFixture();
-    const lastGood = head(f);
-    addDispatchOverlay(f);
-    const run = vi.fn(async () => ({ ok: false, reason }));
-    const result = await rebuild(f, run);
-    expect(result.adopted).toBeFalsy();
-    expect(head(f)).toBe(lastGood);
-    expect(refs(f)).toEqual([]);
-    expect(run).toHaveBeenCalledTimes(1);
-    expect(result.alerts.find(a => a.kind === 'dispatch-smoke-failed').detail.action).toBe('dropped-suspects');
   });
 
   it('a timeout holds on last-good, keeps the overlay, and retries with backoff', async () => {

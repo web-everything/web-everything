@@ -29,7 +29,7 @@ import { execFileSync } from 'node:child_process';
 import { runDaemonLoadOverlay, mergeOverlayRef, dryRunOverlay, overlayInstalled } from '../daemon-load-overlay.mjs';
 import finalizeWaitBreak from '../../conveyor/soak/breaks/overlay-admission-finalize-wait.mjs';
 
-it('keeps a passed candidate pending and adopts at the reader boundary on first admission, late retries, and starvation', async () => {
+it('preserves the real rebuild finalize wait on first admission, late retries, and starvation', async () => {
   const report = await finalizeWaitBreak.run();
   expect(finalizeWaitBreak.judge(report)).toEqual([]);
 }, 60_000);
@@ -682,35 +682,6 @@ describe('runDaemonLoadOverlay — dispatch smoke wiring, rollback of ONLY this 
     expect(r).toMatchObject({ rolledBack: true, reason: 'dispatch-smoke-failed', head: 'h0', dispatchSmoke: { phase: 'post-adopt' } });
   });
 
-  it.each(['candidate', 'post-adopt'])('retryable timeout at %s defers only before adoption', async phase => {
-    const removeOverlayFn = vi.fn();
-    const rebuild = vi.fn(async ({ runSmoke }) => {
-      if (phase === 'candidate' && rebuild.mock.calls.length === 1) {
-        try { await runSmoke({ root: '/cand', env: {} }); } catch { /* candidate rejected */ }
-        return { moved: false, adopted: false, reason: 'smoke-rejected' };
-      }
-      return { moved: true, adopted: true, head: 'h0' };
-    });
-    const result = await runDaemonLoadOverlay({
-      clone: '/c', ref: 'lane/x', pr: 1, versions: null,
-      installed: () => ({ inHead: true, tip: 'abc', head: 'h0', reason: 'in-head' }),
-      addOverlayFn: vi.fn(), rebuild, removeOverlayFn, appendEventFn: vi.fn(),
-      settings: settingsOn, log: quietLog, baseSmoke: async () => ({ verdict: 'pass' }),
-      inspect: () => ({ inTree: true, required: true, matched: ['x'] }),
-      dispatchSmoke: async () => ({ ok: false, reason: 'timeout', retryable: true }),
-    });
-    expect(result.dispatchSmoke.phase).toBe(phase);
-    if (phase === 'candidate') {
-      expect(result).toMatchObject({ registered: true, adopted: false, pending: true, reason: 'dispatch-smoke-deferred' });
-      expect(removeOverlayFn).not.toHaveBeenCalled();
-      expect(rebuild).toHaveBeenCalledTimes(1);
-    } else {
-      expect(result).toMatchObject({ registered: false, adopted: false, rolledBack: true, reason: 'dispatch-smoke-failed' });
-      expect(removeOverlayFn).toHaveBeenCalledTimes(1);
-      expect(rebuild).toHaveBeenCalledTimes(2);
-    }
-  });
-
   it('a passing dispatch smoke keeps the overlay and reports the pass', async () => {
     const removeOverlayFn = vi.fn();
     const rebuild = vi.fn(async ({ runSmoke }) => { await runSmoke({ root: '/cand', env: {} }); return { moved: true, adopted: true, head: 'h1' }; });
@@ -975,7 +946,7 @@ describe('runRealDispatchSmoke — the smoke worker\'s completion record goes to
   };
   const smoke = (spawn, extra = {}) => runRealDispatchSmoke({
     tree: '.', env: {}, settings: fastSettings(), spawn, home: join(work, 'home'), log: quietLog, probeAlive: () => false,
-    diagnosticsDir: join(work, 'diag'), hostBusy: () => false, ...extra,
+    diagnosticsDir: join(work, 'diag'), ...extra,
   });
 
   it('retries a launch timeout once with fresh evidence, then accepts the passing worker', async () => {
@@ -1376,7 +1347,7 @@ describe('legacy explicit load — bounded busy wait', () => {
     expect(result).toMatchObject({ adopted: true, overlayInHead: true, installedCheck: present, waitedMs: 500 });
     expect(sleep.mock.calls).toEqual([[250], [250]]);
     expect(rebuild.mock.calls.map(([o]) => o.admissionWaitMs)).toEqual([600, 350, 100]);
-    expect(log.error).toHaveBeenCalledTimes(3);
+    expect(log.error).toHaveBeenCalledTimes(2);
   });
 
   it('bounds perpetual busy attempts and clips the last sleep to the deadline', async () => {
