@@ -151,10 +151,16 @@ export function createScopeFencedPush({ root, exec = execFileSync, env = process
       const added = (from, to, pathspec = []) => removed.length ? addedLines(git([...FENCE_DIFF, '-U0', from, to, '--', ...pathspec])) : [];
       const merged = mergedBase({ git, gh: budgetGh, repo, head, sha, base });
       const paths = mergeScopePaths({ git, names, head, sha, merged });
-      // An extensionless scope entry covers a subtree only where the PR head already has a directory; a file stays exact.
-      const directories = declaredScopePaths(context.scope, context.repo).filter(s => isSubtreeEntry(s) && !/\/$|[*?]/.test(s))
-        .filter(s => git(['ls-tree', '-z', head, '--', `:(top,literal)${s}`]).split('\0')
-          .some(r => r.slice(r.indexOf('\t') + 1) === s && r.split(' ')[1] === 'tree'));
+      // An extensionless scope entry covers a subtree only where the PR head has a directory that was not a file where the
+      // PR forked from its base: agents wrote the head, so a file the PR itself replaced stays exact. No fork point → exact.
+      let fork = null;
+      if (OID.test(String(base ?? ''))) {
+        try { fork = git(['merge-base', head, base]).trim(); } catch (e) { if (e.status !== 1 && e.status !== 128) throw e; }
+      }
+      const entryType = (rev, s) => git(['ls-tree', '--full-name', '-z', rev, '--', `:(top,literal)${s}`]).split('\0')
+        .find(r => r.slice(r.indexOf('\t') + 1) === s)?.split(' ')[1];
+      const directories = !fork ? [] : declaredScopePaths(context.scope, context.repo).filter(s => isSubtreeEntry(s) && !/\/$|[*?]/.test(s))
+        .filter(s => entryType(head, s) === 'tree' && entryType(fork, s) !== 'blob');
       if (!merged) return { paths, additions: added(head, sha), directories };
       // Identifier exclusions also guard conflict resolutions that restore an operator removal. This is separate from
       // file scope. Never replay a merge using the lane's fixer-writable config and attributes.

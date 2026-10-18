@@ -358,9 +358,23 @@ describe('the live scope fence adapter over a real repository', () => {
     try {
       mkdirSync(join(r.dir, 'lib')); r.write('lib/a.mjs', 'a();\n'); const head = r.commit('initial');
       r.write('lib/b.mjs', 'b();\n'); const sha = r.commit('fixer adds a file under the declared directory');
-      const { result, push } = liveFence(r, { head, sha, scoped: 'lib' });
+      const { result, push } = liveFence(r, { head, sha, base: head, scoped: 'lib' });
       expect(result.ok).toBe(true);
       expect(push).toHaveBeenCalledOnce();
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+  it('keeps an extensionless file scope exact when the PR head already replaced that base file with a directory', () => {
+    const r = realRepo();
+    try {
+      r.write('guard.mjs', 'safe();\n'); r.write('tool', '#!/bin/sh\n'); const base = r.commit('base');
+      r.git(['rm', '-q', 'tool']); mkdirSync(join(r.dir, 'tool')); r.write('tool/a.mjs', 'a();\n'); const head = r.commit('build replaced the file');
+      r.write('tool/payload.mjs', 'payload();\n'); const sha = r.commit('fixer grows the undeclared subtree');
+      for (const known of [base, null]) {
+        const { result, push } = liveFence(r, { head, sha, base: known, scoped: 'tool' });
+        expect(result).toMatchObject({ ok: false, scopeFence: true, terminal: true });
+        expect(result.reason).toContain('outside declared scope: tool/payload.mjs');
+        expect(push).not.toHaveBeenCalled();
+      }
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
   });
 
