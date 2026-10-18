@@ -25,4 +25,4 @@ Hint: a card that loosens a refusal needs two Must lines — what happens on err
 
 ## Also raised by
 
-- Also raised by web-everything/web-everything#5518 (finding 3: `we:backlog/xrkgjr3-overlap-yield-held.md:1` — Add a check:standards rule that refuses an active card whose Acceptance or edge-case lines still contain the literal 'TODO'.)
+- Also raised by web-everything/web-everything#5518 (finding 3: `we:backlog/6219-overlap-yield-held.md:1` — Add a check:standards rule that refuses an active card whose Acceptance or edge-case lines still contain the literal 'TODO'.)
