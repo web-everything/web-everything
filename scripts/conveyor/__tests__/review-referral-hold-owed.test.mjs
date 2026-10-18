@@ -75,16 +75,25 @@ describe('same-head hold when the post-accept red-team comment is owed', () => {
       .toMatchObject({ kind: 'same-head' });
     expect(existsSync(opts.redTeam.stateDir)).toBe(false);
   });
-  it('carries the owed-comment exception through the real reconcile planner', () => {
+  it.each([null, 'standards', 'test-shard (1)'])('carries the owed-comment exception through the real reconcile planner (missing check: %s)', missing => {
     const [p] = enrichPrsWithReferralHolds([pr({ labels: [{ name: 'review:pending' }],
       headRefName: 'lane/redteam-comment-retry', state: 'OPEN', isDraft: false,
-      mergeStateStatus: 'CLEAN', statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+      // The default WE review policy waits for these fast checks as well as refusing required CI failures.
+      mergeStateStatus: 'CLEAN', statusCheckRollup: ['test', 'standards', 'test-shard (1)']
+        .filter(name => name !== missing).map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })),
     })], { ...opts, now: 3, readRuns: () => [run()] });
     expect(p.owedRedTeamReview).toEqual({ repo, pr: number, head });
     // Match reconcile-pass: evidence uses the GitHub slug; the pure planner uses the internal key.
     const plan = planReconcile({ repo: repoKeyForSlug(repo), prs: [p], agents: [], requiredChecks: ['test'], now: 3 });
-    expect(plan.dispatch).toContainEqual(expect.objectContaining({ kind: 'review', prNumber: number,
-      owedRedTeamReview: p.owedRedTeamReview }));
+    if (missing) {
+      expect(plan.dispatch).toEqual([]);
+      expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci',
+        ci: expect.objectContaining({ affected: [{ name: missing, reason: 'missing' }] }) }));
+    } else {
+      expect(plan.dispatch).toContainEqual(expect.objectContaining({ kind: 'review', prNumber: number,
+        owedRedTeamReview: p.owedRedTeamReview }));
+    }
+    expect(existsSync(opts.redTeam.stateDir)).toBe(false);
   });
   it('releases on the first decision in a real Node process without asynchronous reader warmup', () => {
     const source = `

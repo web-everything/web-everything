@@ -4,7 +4,7 @@ size: 2
 status: active
 scaffoldedBy: "redteam-comment-retry"
 dateScaffolded: "2026-10-17"
-scope: ["we:scripts/operations/review-extra-seats.mjs", "we:scripts/operations/review-job.mjs"]
+scope: ["we:scripts/operations/review-extra-seats.mjs", "we:scripts/operations/review-job.mjs", "we:scripts/operations/__tests__/review-red-team.test.mjs", "we:scripts/operations/__tests__/review-job-red-team.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
