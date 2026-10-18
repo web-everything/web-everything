@@ -95,10 +95,11 @@ export function observeLedgerHead(facts, { read = readObservationLedger, append 
   } catch (e) { log(`ledger-write-miss: observation ${facts.repo}#${facts.pr}: ${e.message}`); return { ok: false, rows: [], error: e.message }; }
 }
 
-/** Split a remaining budget between the gh throttle's wait and the child, so the whole read stays inside it. */
-export const ghBudget = ms => {
-  const wait = Math.max(1, Math.floor(ms / 2));
-  return { timeout: Math.max(1, ms - wait), throttle: { acquireTimeoutMs: wait, maxAttempts: 1 } };
+/** Split a remaining budget three ways: the throttle's points wait, its slot wait (each bounded by `acquireTimeoutMs`)
+ *  and the child. No retry of either kind (rate limit, cut-off JSON), so the whole read stays inside the budget. */
+export const ghBudget = (ms, env = process.env) => {
+  const wait = Math.max(1, Math.floor(ms / 3));
+  return { timeout: Math.max(1, ms - 2 * wait), throttle: { acquireTimeoutMs: wait, maxAttempts: 1, env: { ...env, WE_GH_JSON_RETRIES: '0' } } };
 };
 
 /** Feed records can arrive late. Re-read the live PR before observing; never rewind to an event's old SHA. */

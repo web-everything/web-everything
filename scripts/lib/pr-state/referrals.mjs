@@ -105,17 +105,21 @@ export function deriveReferrals(events, { applied = appliedVerdictRows(events), 
     for (const [key, { state, heads }] of resolvedFrom) {
       const k = keys.get(key);
       if (k?.state !== 'resolved-by-fix') continue;
-      const fix = heads.find(h => leadsTo(history ?? [], h, liveHead));
+      // A path back through the finding's own head, or any head named before the referral, proves no fix: a carry
+      // there is the same content the finding was raised on.
+      const stale = h => sameHead(h, k.head) || seenBefore(h, referralRow.get(key));
+      const fix = heads.find(h => leadsTo(history ?? [], h, liveHead, stale));
       keys.set(key, fix ? { ...k, resolvedAtHead: fix } : { ...k, state, resolvedAtHead: null });
     }
   }
   return keys;
 }
 
-/** `from` is `to`, or recorded transitions (head-moved / carried rows) lead from it to `to`. */
-function leadsTo(history, from, to) {
+/** `from` is `to`, or recorded transitions (head-moved / carried rows) lead from it to `to` through no `stale` head. */
+function leadsTo(history, from, to, stale = () => false) {
   const seen = [];
   for (let cur = from; isSha(cur) && !seen.some(h => sameHead(h, cur)); ) {
+    if (stale(cur)) return false;
     if (sameHead(cur, to)) return true;
     seen.push(cur);
     cur = verdictHead(history.find(e => ['head-moved', 'carried'].includes(e?.verdict) && sameHead(e.fromHead, cur)

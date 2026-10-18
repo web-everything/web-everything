@@ -802,9 +802,14 @@ export function eventsSinceHeadMove(events, folded) {
 }
 
 /** A finding still awaiting a ruling, or ruled `block` and not yet fixed, read through the pr-state view's boundary.
- *  A carry or restamp re-witnesses the same content, so it is never the fix such a finding waits for. */
-export function ledgerReferralsOutstanding(events) {
-  const referrals = deriveReferrals(eventsSinceHeadMove(events, foldVerdictLedger(events).get(events.at(-1)?.pr)), { applied: appliedVerdictRows(events), history: events });
+ *  A carry or restamp re-witnesses the same content, so it is never the fix such a finding waits for. With `toHead` (the
+ *  head a carry or restamp would vouch for, re-witnessing `fromHead`'s content), a fix must lead to it through that
+ *  move: a late accept of a head that is not the code being vouched for, or a path back to the finding's head, is none.
+ *  Without it, the fix must lead to the ledger's witnessed head. */
+export function ledgerReferralsOutstanding(events, { fromHead = null, toHead = null } = {}) {
+  const move = isSha(fromHead) && isSha(toHead) ? [{ verdict: 'carried', fromHead, coverage: { headSha: toHead } }] : [];
+  const referrals = deriveReferrals(eventsSinceHeadMove(events, foldVerdictLedger(events).get(events.at(-1)?.pr)),
+    { applied: appliedVerdictRows(events), history: [...events, ...move], liveHead: isSha(toHead) ? toHead : observedLedgerHead(events) ?? null });
   return openReferralKeys(referrals).length > 0 || blockedReferralKeys(referrals).length > 0;
 }
 
@@ -813,7 +818,7 @@ export function ledgerReferralsOutstanding(events) {
  *  An outstanding referral is a hold, so its acceptance is re-reviewed too: a carry would read as its fix. */
 export function ledgerCarryAllowed(events, fromHead, toHead) {
   const current = foldVerdictLedger(events).get(events.at(-1)?.pr)?.current;
-  return current?.clears === true && sameHead(current.coverage?.headSha, fromHead) && !ledgerReferralsOutstanding(events)
+  return current?.clears === true && sameHead(current.coverage?.headSha, fromHead) && !ledgerReferralsOutstanding(events, { fromHead, toHead })
     && !events.some(e => (e.type === undefined || e.type === EVENT_TYPES.VERDICT) && verdictBears(e.verdict)
       && sameHead(e.coverage?.headSha, toHead));
 }
@@ -829,7 +834,7 @@ export function ledgerObservationApplies(row, existing) {
     return true;
   }
   // A restamp re-witnesses the same content: at the tip, a referral appended after the writer's snapshot still refuses it.
-  if (row.verdict === VERDICTS.RESTAMPED) return !ledgerReferralsOutstanding(mine);
+  if (row.verdict === VERDICTS.RESTAMPED) return !ledgerReferralsOutstanding(mine, { fromHead: observedLedgerHead(mine), toHead: row.coverage?.headSha });
   return true;
 }
 

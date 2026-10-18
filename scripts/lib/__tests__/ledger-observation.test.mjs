@@ -311,9 +311,13 @@ describe('open-head ledger observations', () => {
       expect(logs.join('\n')).toContain('drain observation skipped 3 PR(s) this pass (time budget ledger.drainObserveBudgetMs=15000)');
       expect(logs.join('\n')).toContain(`drain observation failed for 1 PR(s): ${repo}#1`);
     });
-    it('the live gh read stays inside its budget: the throttle wait and the child split it, and a rate-limited read is not retried', () => {
-      expect(ghBudget(10_000)).toEqual({ timeout: 5_000, throttle: { acquireTimeoutMs: 5_000, maxAttempts: 1 } });
-      expect(ghBudget(1)).toEqual({ timeout: 1, throttle: { acquireTimeoutMs: 1, maxAttempts: 1 } });
+    it('the live gh read stays inside its budget: the throttle waits and the child split it, and nothing is retried', () => {
+      // Points wait + slot wait (each acquireTimeoutMs) + the child: never more than the budget; no rate-limit or cut-off-JSON retry.
+      for (const ms of [9_000, 10_000, 15_000]) {
+        const b = ghBudget(ms, { X: '1' });
+        expect(2 * b.throttle.acquireTimeoutMs + b.timeout).toBe(ms);
+        expect(b.throttle).toMatchObject({ maxAttempts: 1, env: { X: '1', WE_GH_JSON_RETRIES: '0' } });
+      }
       const logs = [];
       // Already past the deadline: the read never starts.
       const readPr = vi.fn();
