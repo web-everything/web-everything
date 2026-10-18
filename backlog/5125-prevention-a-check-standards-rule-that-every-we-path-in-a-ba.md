@@ -24,3 +24,7 @@ Idempotency key (do not edit): approval-prevention-key:web-everything/web-everyt
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5532 (finding 1: `we:backlog/6245-prevention-require-structured-guarantee-to-test-mappings-thr.md:7` — Add a check:standards rule that every path in a card's scope: exists in the tree.) · key `approval-prevention-key:web-everything/web-everything#5532@ebf13351b87ac7e69d64644516e95627843ba099`
