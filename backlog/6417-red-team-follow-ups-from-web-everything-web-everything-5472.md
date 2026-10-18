@@ -1,18 +1,19 @@
 ---
+bornAs: xbxpydu
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/lib/drain-saved-red-team.mjs"]
-dateOpened: "2026-10-18"
+scope: ["we:scripts/lib/build-unconfirmed-settings.mjs"]
+dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5551 (head 76ad28617)
+# Red-team follow-ups from web-everything/web-everything#5472 (head e3fbe6142)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5551 (reviewed head `76ad28617c559e24f83aa781d66b43f9ca5a9935`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5472 (reviewed head `e3fbe6142e86717efd75c1bbaf76c96a173e020d`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/lib/drain-saved-red-team.mjs:58` — (edge-case, degraded) Saved and posted representations assign different IDs to the same finding, duplicating completed actions.
-   - Scenario: Save a completed, confirmed degraded finding whose summary contains 'two writers', a newline, then 'race'. Let its advisory comment initially fail to post. Apply the gate: it files one follow-up card. Then successfully post that same finding through renderRedTeamComment and apply the gate again. The renderer collapses the newline, while the saved reader preserves it, producing different redTeamResultId values. A Node probe observed cards increase from 1 to 2, with both gate calls returning applied. Both representations should retain the same result identity and reuse the completed card action.
+1. `we:scripts/lib/build-unconfirmed-settings.mjs:14` — (failing-input, degraded) Object-valued launch thresholds bypass numeric validation and disable cooldown
+   - Scenario: Configure '{"build":{"unconfirmedLaunchMax":{"value":1}}}' with no environment override. resolveCascade validates the nested numeric leaf rather than the configured threshold, so readBuildUnconfirmedSettings returns an object as unconfirmedLaunchMax. Comparing the launch count against that object always returns false. Read-only probes of the reader and ledger functions with in-memory filesystem operations confirmed that successive same-base unconfirmed failures never activate cooldown; only ordinary attempt exhaustion eventually stops retries. The invalid object should be rejected and the vali
    - Claude's re-check: demonstrated break
 
 ## Acceptance

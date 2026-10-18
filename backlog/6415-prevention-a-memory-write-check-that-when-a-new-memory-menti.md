@@ -1,22 +1,21 @@
 ---
+bornAs: xbg9rmm
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/codex-usage-ledger.mjs", "we:scripts/operations/worker-wrapper.mjs", "we:scripts/lib/__tests__/codex-usage-ledger.test.mjs", "we:scripts/operations/__tests__/worker-wrapper.test.mjs"]
-dateOpened: "2026-10-14"
+scope: ["we:agent-memory-src/feedback-orchestrator-responsive-light-agents.md"]
+dateOpened: "2026-10-16"
 tags: []
 ---
 
-# Prevention — Have readCodexQuota return the source path and mtime, and have withCodexUsage record a delta only… (from web-everything/web-everything#5254 review)
+# Prevention — A memory-write check that, when a new memory mentions codex-direct-task, requires a link or cross… (from web-everything/web-everything#5440 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/codex-usage-ledger.mjs:47` — Have readCodexQuota return the source path and mtime, and have withCodexUsage record a delta only if the after-sample's source is newer than the run start. Add a test with a static quota stub.
-2. `we:scripts/operations/worker-wrapper.mjs:335` — Add a wrapper-level test that runs withCodexUsage over a real spawnToCompletion success and a timeout. Alternatively, normalize the launch result at each call site: success gives code 0, and `killed` gives timedOut.
-3. `we:scripts/lib/__tests__/codex-usage-ledger.test.mjs:177` — Add deterministic parameterized tests for the tracked-entry boundary and unsupported index entry modes, asserting unknown file-change outcomes; include them in the existing test gate.
+1. `we:agent-memory-src/feedback-orchestrator-responsive-light-agents.md:10` — A memory-write check that, when a new memory mentions codex-direct-task, requires a link or cross-reference to model-tier-for-codex-gemini-wrapper and prefer-codex-keep-one-claude-review.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5254@244c3d0e8142d83985390eb19e3ccef700fbea16
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5440@86ec31ec85be46c5c706dad31b571ad7773b6a34
 
 ## Acceptance
 
