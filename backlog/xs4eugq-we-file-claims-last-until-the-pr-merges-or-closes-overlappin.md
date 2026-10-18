@@ -1,7 +1,7 @@
 ---
 kind: story
 size: 3
-parent: "xejcrh1"
+# Intended parent: xejcrh1; set parent when that epic exists in the backlog.
 status: open
 dateOpened: "2026-10-18"
 tags: []
