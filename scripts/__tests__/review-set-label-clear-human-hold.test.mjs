@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { saveProvenanceFixtures } from '../lib/__tests__/fixtures/saved-red-team-provenance.mjs';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -113,9 +114,12 @@ describe('clear-human CLI hold ceremony', () => {
         findings: [{ summary: 'two writers', category: 'edge-case', impactIfUnfixed: 'broken', file: 'a.mjs', line: 1, confirmedByRecheck: true }] };
       function savedCap(store = JSON.stringify({ version: 1, records: [savedRow] })) {
         vi.stubEnv('CONVEYOR_STATE_ROOT', join(dir, 'state'));
+        vi.stubEnv('OPERATION_RUNS_DIR', join(dir, 'runs'));
+        vi.stubEnv('WE_SHARED_RUNS_DIR', join(dir, 'runs'));
         const path = resolveScorecardStorePath(process.env);
         mkdirSync(dirname(path), { recursive: true });
         writeFileSync(path, JSON.stringify({ version: 1, records: [savedRow] }));
+        saveProvenanceFixtures(process.env);
         const id = redTeamResultId(readSavedRedTeamResult({ repo: 'o/n', pr: 7, head }));
         writeFileSync(path, store);
         return { ...bot, createdAt: '2026-10-18T02:00:00Z', body: redTeamGateMarker(7, head, 'round-cap', id) };

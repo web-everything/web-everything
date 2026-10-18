@@ -28,6 +28,7 @@ export default {
     const { decideSetLabel } = await load('scripts/review-set-label.mjs');
     const { redTeamEnqueueHold } = await load('scripts/lib/drain-queue-safety.mjs');
     const saved = await load('scripts/lib/drain-saved-red-team.mjs');
+    const { saveProvenanceFixtures } = await load('scripts/lib/__tests__/fixtures/saved-red-team-provenance.mjs');
     const { resolveScorecardStorePath } = await load('scripts/conveyor/run-scorecard-store.mjs');
     const { buildClearedHumanMarker, buildReviewedShaMarker } = await load('scripts/lib/review-escalation.mjs');
     const head = 'a'.repeat(40), repo = 'o/n', pr = 5551;
@@ -35,12 +36,13 @@ export default {
     const dir = mkdtempSync(join(tmpdir(), 'soak-saved-red-team-'));
     const violations = [];
     try {
-      const env = { CONVEYOR_STATE_ROOT: dir };
+      const env = { CONVEYOR_STATE_ROOT: dir, OPERATION_RUNS_DIR: join(dir, 'runs') };
       const path = resolveScorecardStorePath(env);
       mkdirSync(dirname(path), { recursive: true });
       writeFileSync(path, JSON.stringify({ version: 1, records: [{ dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head,
         status: 'ok', recheckStatus: 'ok', scoredAt: '2026-10-18T09:00:00Z', confirmedMissCount: 1,
         findings: [{ confirmedByRecheck: true, impactIfUnfixed: 'broken', category: 'edge-case', file: 'a.mjs', line: 1, summary: 'two writers race' }] }] }));
+      saveProvenanceFixtures(env);
       const readSaved = saved.savedRedTeamFallback
         ? saved.savedRedTeamFallback({ repo, pr, head, env })
         : () => saved.readSavedRedTeamResult({ repo, pr, head, env });

@@ -1,5 +1,13 @@
 // @vitest-environment node
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { provenanceRun } from '../../lib/__tests__/fixtures/saved-red-team-provenance.mjs';
+import { writeRun } from '../run-store.mjs';
+
+const roots = [];
+afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 import { finishSpeculativeRedTeam, redTeamReadFingerprint } from '../review-extra-seats.mjs';
 
 const repo = 'web-everything/web-everything', rev = 'a'.repeat(40), pr = 6212;
@@ -14,8 +22,12 @@ const prior = { dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev, st
 
 describe('panel seat reuses live-head evidence', () => {
   it('returns saved findings and re-check status when resuming a completed pass', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'red-team-seat-resume-'));
+    roots.push(root);
+    const provenEnv = { ...env, OPERATION_RUNS_DIR: join(root, 'runs'), CONVEYOR_STATE_ROOT: root };
+    writeRun(provenanceRun({ env: provenEnv, rows: [prior] }), provenEnv.OPERATION_RUNS_DIR);
     const postComment = vi.fn(), runSeat = vi.fn();
-    const out = await finishSpeculativeRedTeam({ pr, repo, env, loopPayload,
+    const out = await finishSpeculativeRedTeam({ pr, repo, env: provenEnv, loopPayload,
       pass: { status: 'prior-row', rev, readFingerprint: redTeamReadFingerprint(read) } }, {
       readRecords: () => [prior], now: () => Date.now(), log: () => {}, append: vi.fn(),
       listComments: () => [], postComment, runSeat,
