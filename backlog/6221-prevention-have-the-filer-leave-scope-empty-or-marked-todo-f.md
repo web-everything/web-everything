@@ -12,7 +12,7 @@ tags: []
 # Prevention — Have the filer leave scope empty or marked TODO for prevention cards, and have a check:standards… (from web-everything/web-everything#5523 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/x7xiyav-prevention-have-the-filer-qualify-the-reference-pr-finding-9.md:5` — Have the filer leave scope empty or marked TODO for prevention cards, and have a check:standards rule flag a prevention card whose scope contains only backlog/ paths. File this as a backlog item.
+1. `we:backlog/6218-prevention-have-the-filer-qualify-the-reference-pr-finding-9.md:5` — Have the filer leave scope empty or marked TODO for prevention cards, and have a check:standards rule flag a prevention card whose scope contains only backlog/ paths. File this as a backlog item.
 
 Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 2 → #5360.
 
@@ -41,3 +41,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5543 (finding 2: `we:backlog/6262-prevention-card-lint-plus-review-lens-when-prose-enumerates.md:6` — Make the filer leave scope empty or TODO for the implementer to set. Alternatively, a card-lint rule that rejects a prevention card whose scope contains only the card it was filed from.)

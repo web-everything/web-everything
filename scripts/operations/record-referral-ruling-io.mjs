@@ -3,7 +3,7 @@
  * @description The io binding of `record-referral-ruling` (#4979): reads the PR thread through `gh`, resolves the
  *   `--card` reference in THIS checkout's backlog, and posts the one operator-ruling comment. The post re-reads the
  *   thread before and after: it never double-posts a byte-identical ruling, refuses when the head moved since the
- *   plan. Follow-up re-checks the head, delegates send-back to review-set-label, and clears the ruling-needed label.
+ *   plan. Follow-up re-checks the head, delegates send-back to review-set-label, and leaves derived labels to pr-label-mirror.
  *   The post fails unless the gate's own reader sees the ruling it just wrote.
  */
 
@@ -26,7 +26,7 @@ import { ledgerFindingKey } from '../lib/pr-state/referrals.mjs';
 import { assertOperatorCliFresh } from '../lib/main-staleness.mjs';
 import { idFromName, normalizeId } from '../backlog/id.mjs';
 import { openReferralFindings, automaticPolicyTargets, describePolicySkip, policyProtectionSnapshot,
-  OPERATOR_RULING_POST_EFFECT, OPERATOR_RULING_FOLLOW_UP_EFFECT, RULING_NEEDED_LABEL } from './record-referral-ruling.mjs';
+  OPERATOR_RULING_POST_EFFECT, OPERATOR_RULING_FOLLOW_UP_EFFECT } from './record-referral-ruling.mjs';
 import { createChangedLinesReader, changesTouchCitedLines, COMPARE_FILE_CAP } from './review-pr-io.mjs';
 
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -202,8 +202,6 @@ export function createRecordReferralRulingSinks({ readJson = ghJson, changedLine
   now = () => new Date().toISOString(),
   readPr = (repo, pr) => readJson(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,labels']),
   runSetLabel = execFileSync,
-  setLabels = (...args) => execFileSyncThrottled('gh', args,
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 }),
   post = (repo, pr, body) => execFileSyncThrottled('gh',
   ['pr', 'comment', String(pr), '--repo', repo, '--body', body], { encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 }) } = {}) {
@@ -236,8 +234,7 @@ export function createRecordReferralRulingSinks({ readJson = ghJson, changedLine
           sentBack = true;
         } finally { rmSync(dir, { recursive: true, force: true }); }
       }
-      const labelCleared = labels.includes(RULING_NEEDED_LABEL);
-      if (labelCleared) await setLabels('pr', 'edit', String(pr), '--repo', repo, '--remove-label', RULING_NEEDED_LABEL);
+      const labelCleared = false; // The next mirror pass renders the recorded ruling.
       let ledgerWriteMiss = false;
       if (sentBack) {
         // A send-back is a HOLDING event: its label hold already applied, so a miss only raises the smell.

@@ -3435,7 +3435,7 @@ export function reviewPrOperation({
         }
         return [{
           type: REVIEW_EFFECTS.LEDGER_EVENTS,
-          payload: { pr: view.input.pr, repo: view.input.repo, headSha: read?.netBasis?.rev ?? null, posted, referralKeys },
+          payload: { pr: view.input.pr, repo: view.input.repo, headSha: read?.netBasis?.rev ?? null, posted, referralKeys, syncMandatoryRulings: true },
           idempotent: true,
         }];
       },

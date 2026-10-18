@@ -288,3 +288,14 @@ describe('PR #4708 — a cut-off comment list never removes a label, and the liv
     expect(() => defaultReadPr({ repo: 'o/n', number: 1, exec, readComments: () => { throw new Error('502'); } })).toThrow('502');
   });
 });
+
+  it('removes stale red-team status after a head change through the existing sweep writer', () => {
+    const writes = [];
+    const listed = pr(42, ['red-team:clear'], HEAD, []);
+    const live = pr(42, ['red-team:clear'], NEW_HEAD, []);
+    const out = rawSweep({ repo: 'o/n', listPrs: () => [listed], readPr: () => live,
+      readStatusEvidence: () => ({ scheduled: false, recorded: false, inFlight: false }), log: () => {},
+      provider: { setLabels: (...args) => writes.push(args) } });
+    expect(out).toEqual([{ num: 42, add: null, remove: ['red-team:clear'] }]);
+    expect(writes).toEqual([['o/n', 42, { add: null, remove: ['red-team:clear'] }]]);
+  });

@@ -12,13 +12,14 @@ const live = (extra = {}) => ({ number: 3794, state: 'OPEN', labels: [], headRef
 const provider = () => ({ currentRepo: vi.fn(() => repo), ensureLabel: vi.fn(), setLabels: vi.fn() });
 
 describe('fresh complete ruling-label decisions', () => {
-  it('discovers a referral at comment 120 even when the snapshot has no marker', () => {
+  it('reports a referral at comment 120 without writing the mirror-owned label', () => {
     const p = provider();
     const thread = [...Array.from({ length: 119 }, filler), pending];
     const out = sweepRulingNeededLabels({ repo, provider: p, listPrs: () => [live({ comments: thread.slice(0, 100) })],
       readPr: () => live({ comments: thread }) });
     expect(out).toEqual([{ num: 3794, action: 'add' }]);
-    expect(p.setLabels).toHaveBeenCalledWith(repo, 3794, { add: RULING_NEEDED_LABEL });
+    expect(p.ensureLabel).not.toHaveBeenCalled();
+    expect(p.setLabels).not.toHaveBeenCalled();
   });
   it('a late ruling cancels an obsolete label addition', () => {
     const p = provider();
@@ -47,7 +48,7 @@ describe('fresh complete ruling-label decisions', () => {
     expect(p.ensureLabel).not.toHaveBeenCalled();
     expect(p.setLabels).not.toHaveBeenCalled();
   });
-  it('uses the metadata-plus-paginated-thread reader before ensuring or changing a label', () => {
+  it('uses the metadata-plus-paginated-thread reader to report drift without label writes', () => {
     const trace = [];
     const p = { currentRepo: () => { trace.push('repo'); return repo; },
       ensureLabel: () => trace.push('ensure'), setLabels: () => trace.push('set') };
@@ -63,7 +64,7 @@ describe('fresh complete ruling-label decisions', () => {
     });
     const out = sweepRulingNeededLabels({ provider: p, readPr, listPrs: () => [live()] });
     expect(out).toEqual([{ num: 3794, action: 'add' }]);
-    expect(trace).toEqual(['repo', 'state', 'thread', 'ensure', 'set']);
+    expect(trace).toEqual(['repo', 'state', 'thread']);
   });
   it('isolates failed reads and retries next tick; dry-run uses the same fresh plan', () => {
     const p = provider();
@@ -78,6 +79,8 @@ describe('fresh complete ruling-label decisions', () => {
     fail = false;
     expect(sweepRulingNeededLabels({ repo, provider: p, readPr, listPrs }).every((r) => !r.error)).toBe(true);
     expect(readPr).toHaveBeenCalledTimes(6);
+    expect(p.ensureLabel).not.toHaveBeenCalled();
+    expect(p.setLabels).not.toHaveBeenCalled();
   });
 
 });
