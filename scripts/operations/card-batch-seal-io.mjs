@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'nod
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { acquireLease, atomicRecord, cardBatchStateDir, tokenOf } from './card-batch-io.mjs';
+import { acquireLease, atomicRecord, cardBatchStateDir, retireBatch, tokenOf } from './card-batch-io.mjs';
 import { planPublish, planSeal, renderBatchBody } from './card-batch-seal.mjs';
 import { CARD_BATCH_KINDS } from '../lib/card-batch-policy.mjs';
 import { effectiveCardBatchPolicy } from '../lib/card-batch-settings.mjs';
@@ -75,15 +75,7 @@ export async function publishBatch(input, opts = {}) {
       state.lease = { owner: lease.owner, expiresAt: lease.expiresAt };
       atomicRecord(statePath, state);
     };
-    const retire = () => {
-      if (basename(dirname(statePath)) === 'sealed') return;
-      if (!held()) throw new Error('lease-held');
-      const archiveDir = join(dirname(statePath), 'sealed');
-      mkdirSync(archiveDir, { recursive: true });
-      const archivePath = join(archiveDir, `${repo.replaceAll('/', '-')}-${state.seq}-${kind}.json`);
-      atomicRecord(archivePath, { ...state, kind, repo });
-      atomicRecord(statePath, { seq: state.seq, lastSealedState: archivePath });
-    };
+    const retire = () => retireBatch(statePath, state, { repo, kind, held });
     if (state.sealFailure) { retire(); return { action: 'held', state }; }
     if (state.seal?.step === 'label-on-green') { retire(); return { action: 'sealed', state }; }
     const restoreProtection = async () => {

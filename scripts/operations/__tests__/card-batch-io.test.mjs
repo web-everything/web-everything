@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { setTimeout } from 'node:timers/promises';
 import { loadCardBatchPolicy } from '../../lib/card-batch-policy.mjs';
 import { admitCard, gitIn } from '../card-batch-io.mjs';
+import { drainPendingPrevention } from '../land-prevention-card.mjs';
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -77,6 +78,107 @@ function assertRecorded(f, inputs) {
 }
 
 describe('durable card batch IO', () => {
+  it.each(['MERGED', 'CLOSED'])('retires a sealed %s PR on admission and retries idempotently', async status => {
+    const f = fixture();
+    const first = f.card();
+    await admitCard(first, f.options);
+    const sealed = { ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272, seal: { step: 'ready' } };
+    writeFileSync(f.statePath, JSON.stringify(sealed));
+    const calls = [];
+    const options = { ...f.options, gh: async args => { calls.push(args); return JSON.stringify({ state: status }); }, log: () => {} };
+    const next = f.card('5193');
+    expect(await admitCard(next, options)).toMatchObject({ action: 'admit', batchRef: 'lane/card-batch-prevention-2' });
+    expect(calls).toEqual([['pr', 'view', '5272', '--repo', 'org/repo', '--json', 'state']]);
+    expect(JSON.parse(readFileSync(join(f.stateDir, 'sealed/org-repo-1-prevention.json')))).toMatchObject(sealed);
+    if (status === 'CLOSED') {
+      expect(JSON.parse(readFileSync(join(f.stateDir, 'pending-prevention/5192.json')))).toMatchObject({
+        cardId: first.cardId, rel: first.cardPath, content: readFileSync(join(f.laneDir, first.cardPath), 'utf8'),
+        idemKey: first.idemKey, source: first.source,
+      });
+    } else expect(existsSync(join(f.stateDir, 'pending-prevention'))).toBe(false);
+    const before = readFileSync(f.statePath);
+    expect((await admitCard(next, options)).action).toBe('dedupe');
+    expect(readFileSync(f.statePath)).toEqual(before);
+    expect(calls).toHaveLength(1);
+  });
+
+  it.each(['OPEN', 'error', 'truncated', 'unknown'])('keeps a sealed %s PR held without changing state', async status => {
+    const f = fixture();
+    await admitCard(f.card(), f.options);
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    const before = readFileSync(f.statePath);
+    const gh = async () => {
+      if (status === 'error') throw new Error('unreadable');
+      return status === 'truncated' ? '{' : JSON.stringify({ state: status });
+    };
+    expect(await admitCard(f.card('5193'), { ...f.options, gh, log: () => {} })).toEqual({ action: 'refuse', reason: 'batch-sealed' });
+    expect(readFileSync(f.statePath)).toEqual(before);
+    expect(readdirSync(f.stateDir)).toEqual(['org-repo-prevention.json']);
+  });
+
+  it.each(['landed', 'missing-member', 'conflict', 'lease-lost'])('closed recovery handles %s without losing cards', async scenario => {
+    const f = fixture();
+    const first = f.card();
+    await admitCard(first, f.options);
+    const sealed = { ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 };
+    if (scenario === 'landed') git(f.remote, ['update-ref', 'refs/heads/main', sealed.headSha]);
+    if (scenario === 'missing-member') sealed.members[0].commitSha = 'a'.repeat(40);
+    const pending = join(f.stateDir, 'pending-prevention');
+    if (scenario === 'conflict') {
+      mkdirSync(pending);
+      writeFileSync(join(pending, '5192.json'), '{"content":"other producer"}');
+    }
+    writeFileSync(f.statePath, JSON.stringify(sealed));
+    const before = readFileSync(f.statePath);
+    const result = await admitCard(f.card('5193'), { ...f.options, log: () => {}, gh: async () => {
+      if (scenario === 'lease-lost') writeFileSync(`${f.statePath}.lock`, JSON.stringify({ token: 'successor', expiresAt: f.now() + 60000 }));
+      return '{"state":"CLOSED"}';
+    } });
+    if (scenario === 'landed') {
+      expect(result.action).toBe('admit');
+      expect(readdirSync(pending)).toEqual([]);
+    } else {
+      expect(result.action).toBe('refuse');
+      expect(readFileSync(f.statePath)).toEqual(before);
+      if (scenario === 'conflict') expect(readFileSync(join(pending, '5192.json'), 'utf8')).toBe('{"content":"other producer"}');
+    }
+  });
+
+  it('drains 327 spooled cards through admission into batches of ten and an idempotent tail', async () => {
+    const f = fixture();
+    await admitCard(f.card('old'), f.options);
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    const pendingDir = join(f.stateDir, 'pending-prevention');
+    mkdirSync(pendingDir);
+    for (let i = 0; i < 327; i++) {
+      const input = f.card(`x${String(i).padStart(6, '0')}`);
+      writeFileSync(join(pendingDir, `${input.cardId}.json`), JSON.stringify({ cardId: input.cardId, rel: input.cardPath,
+        content: readFileSync(join(f.laneDir, input.cardPath), 'utf8'), idemKey: input.idemKey, source: input.source }));
+    }
+    const sizes = [];
+    const batch = async input => {
+      const cardId = input.cardPath.split('/')[1].split('-')[0];
+      const result = await admitCard({ ...input, cardId, baseSha: f.baseSha }, { ...f.options,
+        gh: async () => '{"state":"MERGED"}', log: () => {} });
+      if (result.action !== 'admit') return { batched: false };
+      if (result.state.members.length === 10) {
+        sizes.push(10);
+        // Inject the seal worker's terminal state; no PR publication in this fixture.
+        writeFileSync(f.statePath, JSON.stringify({ ...result.state, sealedAt: new Date(f.now()).toISOString(), pr: 5272 + result.state.seq }));
+      }
+      return { batched: true, batchRef: result.batchRef };
+    };
+    const options = { pendingDir, batch, write: () => {}, exec: (command, args) => execFileSync(command, args, { encoding: 'utf8' }) };
+    await drainPendingPrevention({ lane: f.laneDir }, options);
+    expect(readdirSync(pendingDir)).toEqual([]);
+    expect(sizes).toEqual(Array(32).fill(10));
+    expect(f.state()).toMatchObject({ seq: 34, members: expect.any(Array) });
+    expect(f.state().members).toHaveLength(7);
+    const before = readFileSync(f.statePath);
+    await drainPendingPrevention({ lane: f.laneDir }, options);
+    expect(readFileSync(f.statePath)).toEqual(before);
+  }, 240000);
+
   it('admits two concurrent producers with exactly one byte-identical commit each', async () => {
     const f = fixture();
     const first = f.card();
