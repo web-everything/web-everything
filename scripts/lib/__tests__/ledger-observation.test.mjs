@@ -10,7 +10,7 @@ import { derivePrState } from '../pr-state.mjs';
 import { planDrainLedgerFacts } from '../drain-ledger-facts.mjs';
 import { shadowRow } from '../drain-ledger-shadow.mjs';
 import { createEventWaker } from '../pr-events.mjs';
-import { backfillLedger } from '../../operations/ledger-backfill.mjs';
+import { backfillLedger, main } from '../../operations/ledger-backfill.mjs';
 const repo = 'example/repo', head = 'a'.repeat(40), next = 'b'.repeat(40), now = '2026-10-17T12:00:00.000Z';
 const settings = { value: { firstSeenRows: true, headMoveInvalidation: true }, sources: { firstSeenRows: 'standard', headMoveInvalidation: 'standard' } };
 const accepted = () => buildVerdictRecord({ repo, pr: 1, headSha: head, verdict: 'accepted', source: 'test', at: now });
@@ -191,6 +191,43 @@ describe('open-head ledger observations', () => {
     expect(await backfillLedger({ repo, prs, events, append, settings, now })).toMatchObject({ missing: 0, written: 0 });
     expect(shadowRow({ repo, verdict: { num: 1, headSha: next, decision: 'merge' }, events }).ledgerHolds).not.toContain('no-ledger-row');
   });
+  describe('backfill command main()', () => {
+    const pr = n => ({ number: n, head: { sha: String(n).repeat(40).slice(0, 40) }, state: 'open', labels: [] });
+    // Own sources so the once-per-line settings log is not consumed for the other tests in this file.
+    const cli = { ...settings, sources: { firstSeenRows: 'cli-test', headMoveInvalidation: 'cli-test' } };
+    const run = async (argv, { pages = [[pr(1)], [pr(2)]], ledger = { status: 'ok', rows: [] } } = {}) => {
+      const calls = [], appended = [], printed = [];
+      const exec = (cmd, args) => { calls.push(args); return JSON.stringify(args[0] === 'repo' ? { nameWithOwner: repo } : pages); };
+      const result = await main(argv, { exec, readLedger: () => ledger, settings: cli, out: s => printed.push(s), log: () => {},
+        append: row => { appended.push(row); return { ok: true }; } });
+      return { result, calls, appended, printed };
+    };
+    it('flattens every --slurp page into the dry-run count and writes nothing', async () => {
+      const { result, calls, appended, printed } = await run(['--dry-run', `--repo=${repo}`]);
+      expect(calls).toEqual([['api', `repos/${repo}/pulls?state=open&per_page=100`, '--paginate', '--slurp']]);
+      expect(result).toMatchObject({ dryRun: true, open: 2, missing: 2, planned: 2, written: 0 });
+      expect(appended).toEqual([]);
+      expect(JSON.parse(printed.join(''))).toEqual(result);
+    });
+    it('appends through the injected writer without --dry-run and resolves the repo from gh', async () => {
+      const { result, appended } = await run([]);
+      expect(result).toMatchObject({ repo, dryRun: false, open: 2, written: 2 });
+      expect(appended.map(r => r.source)).toEqual(['first-seen', 'first-seen']);
+    });
+    it('refuses an unknown flag or a malformed repo before reading GitHub', async () => {
+      for (const argv of [['--force'], ['--repo=../x'], ['--repo=owner/..'], ['--repo=./.'], ['--repo=owner/name;rm'], ['--repo=a/b/c']]) {
+        const calls = [];
+        await expect(main(argv, { exec: (c, a) => { calls.push(a); return '[]'; }, readLedger: () => ({ status: 'ok', rows: [] }), settings: cli, log: () => {} }))
+          .rejects.toThrow(/usage|invalid repository/);
+        expect(calls).toEqual([]);
+      }
+    });
+    it('refuses a non-page --slurp shape and an unreadable ledger', async () => {
+      await expect(run([`--repo=${repo}`], { pages: [pr(1)] })).rejects.toThrow(/array of pages/);
+      await expect(run([`--repo=${repo}`], { ledger: { status: 'unreadable', reason: 'lock' } })).rejects.toThrow('ledger unreadable: lock');
+      await expect(run([`--repo=${repo}`], { ledger: null })).rejects.toThrow('ledger unreadable');
+    });
+  });
   it('backfills through the real locked home writer and skips a late baseline', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ledger-backfill-'));
     vi.stubEnv('WE_VERDICT_LEDGER_DIR', join(dir, 'rows'));
@@ -222,6 +259,11 @@ describe('open-head ledger observations', () => {
     expect(plan({ events: [], settings: { value: { firstSeenRows: false } } })).toEqual([]);
     expect(plan({ settings: { value: { headMoveInvalidation: false } } })).toEqual([]);
     expect(resolveLedgerObservationSettings({ tool: { firstSeenRows: false }, platform: {}, env: {} })).toMatchObject({ value: { firstSeenRows: false, headMoveInvalidation: true }, sources: { firstSeenRows: 'tool' } });
+  });
+  it('resolves both observation defaults to true with all override layers empty', () => {
+    expect(resolveLedgerObservationSettings({ tool: {}, platform: {}, env: {} })).toMatchObject({
+      value: { firstSeenRows: true, headMoveInvalidation: true },
+      sources: { firstSeenRows: 'standard', headMoveInvalidation: 'standard' } });
   });
   it('reads the current PR instead of rewinding to a delayed feed SHA', () => {
     let seen;

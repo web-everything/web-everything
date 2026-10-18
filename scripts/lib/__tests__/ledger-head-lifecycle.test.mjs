@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { buildLedgerEvent, buildVerdictRecord, ledgerEventId, ledgerObservationApplies, observedLedgerHead } from '../verdict-ledger.mjs';
-import { planLedgerObservation, observeLiveLedgerHead } from '../ledger-observation.mjs';
+import { planLedgerObservation, observeLiveLedgerHead, proveLedgerCarry } from '../ledger-observation.mjs';
 import { derivePrState } from '../pr-state.mjs';
 
 const repo = 'example/repo', pr = 1;
@@ -33,6 +37,74 @@ describe('ledger head lifecycle red-team regressions', () => {
       expect(derivePrState([...events, approval], facts(next)).clears).toBe(true);
     });
   }
+
+  it('operator send-back: a planner carry on real git objects never clears a later mirrored manual human hold', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'ledger-carry-hold-'));
+    const git = args => String(execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).trim();
+    try {
+      git(['init', '-b', 'main']); git(['config', 'user.email', 'test@example.com']); git(['config', 'user.name', 'Test']);
+      writeFileSync(join(cwd, 'file.txt'), 'content\n');
+      git(['add', '.']); git(['commit', '-m', 'base']);
+      const fromSha = git(['rev-parse', 'HEAD']);
+      git(['commit', '--allow-empty', '-m', 'identical tree']);
+      const toSha = git(['rev-parse', 'HEAD']);
+      // The exact red-team stream: accepted(A), then a mirrored review:human hold whose baseline names that acceptance.
+      const accepted = verdict('accepted', fromSha);
+      const hold = event('label-input', { label: 'review:human', change: 'added', sender: 'operator', clearanceBaseline: [ledgerEventId(accepted)] });
+      const events = [accepted, hold];
+      expect(derivePrState(events, facts(fromSha))).toMatchObject({ clears: false });
+      const rows = planLedgerObservation({ repo, pr, headSha: toSha, labels: ['review:human'], events, now: at, settings,
+        proveCarry: args => proveLedgerCarry({ ...args, cwd }) });
+      expect(rows).toEqual([expect.objectContaining({ verdict: 'carried', carryRule: 'tree-identical' })]);
+      expect(ledgerObservationApplies(rows[0], events)).toBe(true);
+      const after = derivePrState([...events, ...rows], facts(toSha));
+      expect(after.clears).toBe(false);
+      expect(after.holds.map(h => h.code)).toContain('label-input:review:human');
+      // Only a human answer lifts it.
+      expect(derivePrState([...events, ...rows, verdict('accepted', toSha)], facts(toSha)).holds.map(h => h.code)).toContain('label-input:review:human');
+      expect(derivePrState([...events, ...rows, verdict('clear-human', toSha)], facts(toSha)).holds.map(h => h.code)).not.toContain('label-input:review:human');
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  it('operator send-back: a send-back of a bounced head is released by a head move and a fresh acceptance', () => {
+    // Exact red-team stream: changes(A), send-back, head-moved(A→B), accepted(B), live head B.
+    const sentBack = [verdict('changes'), event('send-back', { cause: 'changes' })];
+    expect(codes(sentBack, head)).toContain('send-back');
+    const moved = [...sentBack, ...plan(sentBack)];
+    expect(moved.at(-1)).toMatchObject({ verdict: 'head-moved', fromHead: head });
+    const released = derivePrState([...moved, verdict('accepted', next)], facts(next));
+    expect(released.holds.map(h => h.code)).not.toContain('send-back');
+    expect(released.clears).toBe(true);
+  });
+
+  it('a manual human hold survives a substantive head move after its human answer, but not an equivalent carry', () => {
+    // Decision (docs/agent/testing.md): a substantive move expires every human answer to a manual hold; the
+    // hold stands again until a fresh human answer at the new head. An equivalent carry keeps the answer.
+    const accepted = verdict('accepted');
+    const hold = event('label-input', { label: 'review:human', change: 'added', sender: 'operator' });
+    for (const answer of [verdict('clear-human'), event('approval', { approval: 'clear-human' })]) {
+      const answered = [accepted, hold, answer];
+      expect(codes(answered, head)).not.toContain('label-input:review:human');
+      expect(derivePrState([...answered, ...plan(answered, next, () => 'tree-identical')], facts(next)).clears).toBe(true);
+      const moved = [...answered, ...plan(answered)];
+      expect(moved.at(-1)).toMatchObject({ verdict: 'head-moved' });
+      expect(codes([...moved, verdict('accepted', next)])).toContain('label-input:review:human');
+      expect(codes([...moved, verdict('accepted', next), verdict('clear-human', next)])).not.toContain('label-input:review:human');
+      expect(codes([...moved, verdict('accepted', next), event('approval', { approval: 'clear-human' })])).not.toContain('label-input:review:human');
+    }
+  });
+
+  it('a delayed acceptance for a never-witnessed intermediate head never clears the live head', () => {
+    // accepted(A), changes(C), then a slow review of B lands. B was never witnessed, so the fold takes it as the
+    // witness (a fresh review must witness its head when an observation was missed). The observer then sees B !== C
+    // and invalidates: the outcome is a re-review, never a stale acceptance standing for C.
+    const middle = 'e'.repeat(40);
+    const events = [verdict('accepted'), verdict('changes', third), verdict('accepted', middle)];
+    expect(observedLedgerHead(events)).toBe(middle);
+    const observed = [...events, ...plan(events, third)];
+    expect(observed.at(-1)).toMatchObject({ verdict: 'head-moved', fromHead: middle });
+    expect(derivePrState(observed, facts(third)).clears).toBe(false);
+  });
 
   it('a restamp cannot answer any kind of manual hold', () => {
     for (const label of ['review:human', 'review:changes', 'review:pending', 'advisory:ruling-needed']) {

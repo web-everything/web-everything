@@ -30,18 +30,22 @@ export async function backfillLedger({ repo, prs, events, dryRun = false, append
   return result;
 }
 
-export async function main(argv = process.argv.slice(2), { exec = execFileSync } = {}) {
+export async function main(argv = process.argv.slice(2), { exec = execFileSync,
+  readLedger = repo => readLedgerEventsFromStore(repo, { store: drainLedgerReadStore(repo) }), append = appendVerdict,
+  settings = resolveLedgerObservationSettings(), out = s => process.stdout.write(s), log } = {}) {
   if (argv.some(a => a !== '--dry-run' && !a.startsWith('--repo='))) throw Error('usage: ledger-backfill.mjs [--dry-run] [--repo=owner/name]');
   const gh = args => JSON.parse(String(exec('gh', args, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })));
   const repo = argv.find(a => a.startsWith('--repo='))?.slice(7) || gh(['repo', 'view', '--json', 'nameWithOwner']).nameWithOwner;
-  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) throw Error('invalid repository');
-  const prs = gh(['api', `repos/${repo}/pulls?state=open&per_page=100`, '--paginate', '--slurp']).flat();
-  const ledger = await readLedgerEventsFromStore(repo, { store: drainLedgerReadStore(repo) });
-  if (ledger.status !== 'ok') throw Error(`ledger unreadable: ${ledger.reason}`);
-  const settings = resolveLedgerObservationSettings();
-  logLedgerObservationSettings(settings);
-  const result = await backfillLedger({ repo, prs, events: ledger.rows, dryRun: argv.includes('--dry-run'), settings });
-  process.stdout.write(`${JSON.stringify(result)}\n`);
+  // The slug becomes an API path: a dot-only segment would traverse it.
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo) || repo.split('/').some(s => /^\.+$/.test(s))) throw Error('invalid repository');
+  const pages = gh(['api', `repos/${repo}/pulls?state=open&per_page=100`, '--paginate', '--slurp']);
+  if (!Array.isArray(pages) || !pages.every(Array.isArray)) throw Error('expected --slurp output to be an array of pages');
+  const prs = pages.flat();
+  const ledger = await readLedger(repo);
+  if (ledger?.status !== 'ok') throw Error(`ledger unreadable: ${ledger?.reason}`);
+  logLedgerObservationSettings(settings, log);
+  const result = await backfillLedger({ repo, prs, events: ledger.rows, dryRun: argv.includes('--dry-run'), append, settings });
+  out(`${JSON.stringify(result)}\n`);
   return result;
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
