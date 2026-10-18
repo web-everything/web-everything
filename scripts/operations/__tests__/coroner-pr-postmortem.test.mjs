@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
-import { syncBuiltinESMExports } from 'node:module';
-import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { buildPostmortem, shouldPostmortem, publishPostmortem, resolvePostmortemSettings, collectPrTimeline, withCoronerLock } from '../coroner-pr-postmortem.mjs';
 import { runPostmortemPass, listMergedSince } from '../../conveyor/pass-daemons/pr-postmortem-pass.mjs';
 import { hostname } from 'node:os';
@@ -128,16 +129,32 @@ describe('per PR postmortem', () => {
     const dir = temp(); const file = join(dir,'ledger.jsonl'); const cap = 1024*1024;
     try {
       fs.writeFileSync(file,' '.repeat(cap*2)+'\n'+JSON.stringify({v:1,repo:'example/repo',pr:1,kind:'fix',head:'a'.repeat(40),at:at(20)})+'\n');
-      const size = fs.statSync(file).size; const reads = []; const original = fs.readSync;
-      const spy = vi.spyOn(fs,'readSync').mockImplementation((fd,buffer,offset,length,position) => {
-        reads.push({length,position}); return original(fd,buffer,offset,length,position);
-      });
-      // The shared ledger reader uses named builtin imports, including when it
-      // was cached by setup before this test module loaded. Update those bindings.
-      syncBuiltinESMExports();
-      let raw;
-      try { raw = collectPrTimeline('example/repo',1,{gh:collectorGh(),comments:() => [],env:{WE_FIX_LOOP_LEDGER:file}}); }
-      finally { spy.mockRestore(); syncBuiltinESMExports(); }
+      const size = fs.statSync(file).size;
+      // Vitest can snapshot named builtin imports before a default-export spy is
+      // installed. Native ESM keeps syncBuiltinESMExports effective for the reader.
+      const { raw, reads } = JSON.parse(execFileSync(process.execPath,['--input-type=module','-e',`
+        import fs from 'node:fs';
+        import { syncBuiltinESMExports } from 'node:module';
+        import { collectPrTimeline } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)),'../coroner-pr-postmortem.mjs')).href)};
+        const { file, snapshot } = JSON.parse(fs.readFileSync(0,'utf8'));
+        const gh = args => {
+          const path = args.at(-1);
+          if (path.endsWith('/pulls/1')) return { created_at:snapshot.openedAt, merged_at:snapshot.mergedAt, head:{ref:'lane/no-card'}, base:{sha:'z'} };
+          if (path.includes('/commits?')) return [snapshot.commits];
+          if (path.includes('/check-runs?')) return [{check_runs:snapshot.checks}];
+          if (path.includes('/contents/')) throw Error('optional data unavailable');
+          return [[]];
+        };
+        const reads = [], original = fs.readSync;
+        fs.readSync = (fd,buffer,offset,length,position) => {
+          reads.push({length,position}); return original(fd,buffer,offset,length,position);
+        };
+        syncBuiltinESMExports();
+        let raw;
+        try { raw = collectPrTimeline('example/repo',1,{gh,comments:() => [],env:{WE_FIX_LOOP_LEDGER:file}}); }
+        finally { fs.readSync = original; syncBuiltinESMExports(); }
+        process.stdout.write(JSON.stringify({raw,reads}));
+      `],{input:JSON.stringify({file,snapshot:fixture()}),encoding:'utf8',timeout:30000}));
       expect(raw.fixLoop).toHaveLength(1);
       expect(reads.length).toBeGreaterThan(0);
       expect(reads.reduce((sum,r) => sum+r.length,0)).toBeLessThanOrEqual(cap);
