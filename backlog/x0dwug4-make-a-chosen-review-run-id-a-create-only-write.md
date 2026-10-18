@@ -9,7 +9,7 @@ tags: []
 
 # Make a chosen review run id a create-only write
 
-PR #5520 closes custom review run ids at the two CLI start sites: a chosen id is recorded idChosen and refused when it names an existing record. That check is read-then-write, so two starts with the same chosen id at the same moment can both pass and the second replaces the first; writeRun itself still overwrites, the memory store and migrateLegacyRuns skip the review-run namespace check, a parked chosen-id run is still picked for resume, and a clean chosen-id run is refused under the unfinished-run code. Make the first write of a chosen review run id an atomic create (fail if the file exists), give the memory store and migration the same namespace check, skip custom runs in the resume picker, and give the refusal its own code. No producer passes --run-id for a review run today, so this is hardening.
+PR #5520 closes custom review run ids at the two CLI start sites: a chosen id is recorded idChosen, and its first record is saved create-only (the run store's createRun links a temp file into place, so of two starts with the same chosen id only one gets it; migrateLegacyRuns links the same way). What remains: the memory store and migrateLegacyRuns skip the review-run namespace check, a parked chosen-id run is still picked for resume, and a clean chosen-id run is refused under the unfinished-run code. Give the memory store and migration the same namespace check, skip custom runs in the resume picker, and give the refusal its own code. No producer passes --run-id for a review run today, so this is hardening.
 
 ## Acceptance
 

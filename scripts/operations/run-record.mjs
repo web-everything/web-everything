@@ -102,8 +102,31 @@ export function chosenRunIdRecord(run, store) {
   if (!run.id.startsWith(REVIEW_RUN_ID_PREFIX)) return { run };
   let existing;
   try { existing = store.read(run.id); } catch { existing = true; } // unreadable is not proof it is free
-  if (existing) return { error: `--run-id=${run.id} names an existing review run record; a chosen id never replaces one` };
+  if (existing) return { error: chosenRunIdTakenError(run.id) };
   return { run: { ...run, idChosen: true } };
+}
+
+const chosenRunIdTakenError = (id) => `--run-id=${id} names an existing review run record; a chosen id never replaces one`;
+
+/**
+ * PR #5520 — SAVE the first record of a run started under a chosen `--run-id`. The read in {@link chosenRunIdRecord}
+ * cannot stop two starts with the same id at once (both read "free", the second write replaces the first), so a
+ * chosen review run id is saved with the store's create-only `create`, never `write`: only one start gets the id.
+ * A store with no `create` is refused rather than written to, which would reopen that race.
+ * @param {object} run - the fresh record `startRun` returned.
+ * @param {{read(id: string): (object|null), write(record: object): object, create?(record: object): object}} store
+ * @returns {{run: object} | {error: string}}
+ */
+export function saveChosenRun(run, store) {
+  const chosen = chosenRunIdRecord(run, store);
+  if (chosen.error) return chosen;
+  if (!chosen.run.idChosen) { store.write(chosen.run); return chosen; }
+  if (typeof store.create !== 'function') return { error: `--run-id=${run.id}: this run store cannot create a record only if it is absent` };
+  try { store.create(chosen.run); } catch (e) {
+    if (e?.code === 'EEXIST') return { error: chosenRunIdTakenError(run.id) };
+    throw e;
+  }
+  return chosen;
 }
 
 export function newRunRecord({ id, op, input = {} } = {}) {

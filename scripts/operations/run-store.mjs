@@ -22,7 +22,7 @@
  * nothing above the seam changes.
  */
 
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs';
+import { copyFileSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -94,9 +94,12 @@ export function migrateLegacyRuns(legacyDir, sharedDir) {
     try {
       if (!existsSync(dest)) {
         const tmp = `${dest}.${process.pid}.${randomUUID()}.tmp`;
-        copyFileSync(src, tmp);
-        renameSync(tmp, dest);
-        moved.push(f.slice(0, -5));
+        // PR #5520 — a link, never a rename: a record another process wrote to `dest` since the check above wins.
+        try {
+          copyFileSync(src, tmp);
+          linkSync(tmp, dest);
+          moved.push(f.slice(0, -5));
+        } catch (e) { if (e?.code !== 'EEXIST') throw e; } finally { rmSync(tmp, { force: true }); }
       }
       rmSync(src, { force: true });
     } catch { skipped.push(f.slice(0, -5)); }
@@ -212,6 +215,25 @@ export function writeRun(record, dir = resolveRunsDir()) {
   return path;
 }
 
+/**
+ * PR #5520 — CREATE a run that must not exist yet: {@link writeRun}, but it never replaces a record. The full record
+ * is written to a temp file and LINKED into place, which fails with `EEXIST` (an error carrying that `code`) when any
+ * record already holds the id — so of two processes creating the same id at once, exactly one succeeds. A reader
+ * never sees a partial file, as with the rename `writeRun` uses.
+ */
+export function createRun(record, dir = resolveRunsDir()) {
+  assertRunRecord(record, 'run record being created');
+  assertReviewRunNamespace(record);
+  const path = runPath(record.id, dir);
+  mkdirSync(dir, { recursive: true });
+  const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(tmp, serializeRunRecord(record), { flag: 'wx' });
+    linkSync(tmp, path);
+  } finally { rmSync(tmp, { force: true }); }
+  return path;
+}
+
 /** Every run id currently on disk (sorted). Temp files and stray names are ignored. */
 export function listRunIds(dir = resolveRunsDir()) {
   if (!existsSync(dir)) return [];
@@ -308,12 +330,15 @@ export function pruneTerminalRuns({ dir = resolveRunsDir(), maxAgeMs, now = Date
  * changes.
  *
  * @param {string} [dir]
- * @returns {{read(id: string): (object|null), write(record: object): object, delete(id: string): void, list(): string[]}}
+ * `create` ({@link createRun}) is the create-only write a chosen review run id starts with (PR #5520).
+ *
+ * @returns {{read(id: string): (object|null), write(record: object): object, create(record: object): object, delete(id: string): void, list(): string[]}}
  */
 export function createFileRunStore(dir = resolveRunsDir()) {
   return {
     read: (id) => tryReadRun(id, dir),
     write: (record) => { writeRun(record, dir); return record; },
+    create: (record) => { createRun(record, dir); return record; },
     delete: (id) => deleteRun(id, dir),
     list: () => listRunIds(dir),
   };
@@ -335,6 +360,12 @@ export function createMemoryRunStore() {
       return parsed.record;
     },
     write: (record) => { assertRunRecord(record); map.set(record.id, serializeRunRecord(record)); return record; },
+    create: (record) => {
+      assertRunRecord(record);
+      if (map.has(record.id)) throw Object.assign(new Error(`operations: run ${record.id} already exists`), { code: 'EEXIST' });
+      map.set(record.id, serializeRunRecord(record));
+      return record;
+    },
     delete: (id) => { map.delete(id); },
     list: () => [...map.keys()].sort(),
   };

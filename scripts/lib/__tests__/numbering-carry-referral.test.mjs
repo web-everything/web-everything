@@ -6,8 +6,8 @@ import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isMintedReviewRunId, readReviewRunEvidence, readReviewRunHeads } from '../../conveyor/review-referral-hold.mjs';
-import { chosenRunIdRecord, newRunRecord } from '../../operations/run-record.mjs';
-import { createFileRunStore, newRunId, resolveRunsDir, tryReadRun, writeRun } from '../../operations/run-store.mjs';
+import { chosenRunIdRecord, newRunRecord, saveChosenRun } from '../../operations/run-record.mjs';
+import { createFileRunStore, createMemoryRunStore, newRunId, resolveRunsDir, tryReadRun, writeRun } from '../../operations/run-store.mjs';
 import { createRegistry, op } from '../../operations/registry.mjs';
 import { compute } from '../../operations/step-kinds.mjs';
 import { runOperationCli } from '../../operations/cli-adapter.mjs';
@@ -326,6 +326,41 @@ describe('numbering carry referral evidence', () => {
       // An unreadable record under that id is not proof the id is free.
       const store = { read: () => { throw Error('corrupt'); } };
       expect(chosenRunIdRecord({ id: LIVE_RUN }, store)).toHaveProperty('error');
+    });
+    it('two starts under the same chosen run ID at once never let the second replace the first', async () => {
+      dir = mkdtempSync(join(tmpdir(), 'numbering-custom-id-'));
+      const base = createFileRunStore(dir);
+      // The other start writes its record right after this start's free-id check: the check alone saw no record.
+      const store = { ...base, read: (id) => {
+        const seen = base.read(id);
+        persist(LIVE_RUN, TO, live['persistence-failed'], false);
+        return seen;
+      } };
+      const result = await reviewFixtureCli([`--run-id=${LIVE_RUN}`], store);
+      expect(result).toMatchObject({ code: 2, stopped: 'refused' });
+      expect(result.lines.join('\n')).toContain('names an existing review run record');
+      expect(tryReadRun(LIVE_RUN, dir)).toMatchObject({ verdict: live['persistence-failed'] });
+      expect(tryReadRun(LIVE_RUN, dir).idChosen).toBeUndefined();
+      expect(readdirSync(dir).filter(f => f.endsWith('.tmp'))).toEqual([]);
+    });
+    it('a chosen review run ID is saved create-only in every store, and a store that cannot is refused', () => {
+      const fresh = () => newRunRecord({ id: LIVE_RUN, op: 'review-pr' });
+      // The memory store (the preview path) refuses a second create like the file store.
+      const memory = createMemoryRunStore();
+      expect(saveChosenRun(fresh(), memory)).toMatchObject({ run: { idChosen: true } });
+      const racing = { ...memory, read: () => null };
+      expect(saveChosenRun(fresh(), racing)).toEqual({ error: expect.stringContaining('names an existing review run record') });
+      // A store with only `write` would reopen the race, so it is never written to.
+      const write = vi.fn();
+      expect(saveChosenRun(fresh(), { read: () => null, write })).toHaveProperty('error');
+      expect(write).not.toHaveBeenCalled();
+      // A failure other than "already exists" is not mistaken for a taken id.
+      expect(() => saveChosenRun(fresh(), { read: () => null, create: () => { throw Object.assign(Error('disk'), { code: 'EIO' }); } }))
+        .toThrow('disk');
+      // A chosen id for any other operation keeps the ordinary write.
+      const other = createMemoryRunStore();
+      expect(saveChosenRun(newRunRecord({ id: 'custom-run', op: 'file-item' }), other).run.idChosen).toBeUndefined();
+      expect(other.read('custom-run')).not.toBeNull();
     });
     it('both readers tag a run under a chosen id custom, and only the id newRunId mints untagged', () => {
       dir = mkdtempSync(join(tmpdir(), 'numbering-custom-id-'));
