@@ -1439,33 +1439,38 @@ describe('#4315 durable referral effects', () => {
     expect(stateOf(old.referrals[1].key)).toBe('blocking');
   });
 
-  it('an unreadable thread after the ledger appends is retried, never parked', async () => {
-    const { h, old } = raceHarness({ during: h => { h.provider.readPrState = () => { throw new Error('PR offline'); }; } });
+  it('an unreadable thread after the ledger appends is left pending, never parked', async () => {
+    const { h } = raceHarness({ during: h => { h.provider.readPrState = () => { throw new Error('PR offline'); }; } });
     await expect(h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX)).rejects.toThrow(/could not re-read the thread: PR offline/);
     expect(h.state.labels).not.toContain('review:human');
     expect(h.state.comments.some(c => /parked to review:human/.test(c.body))).toBe(false);
-    expect(old.referrals).toHaveLength(2);
   });
 
-  it('an operator re-ruling back to an earlier word is recorded again, never deduplicated away', async () => {
+  it('a finding whose linked block is overruled is recorded clear again, never deduplicated away', async () => {
     const h = harness({ failure: 'judge' });
     const old = seedReferrals(h, ['judgeCorrectnessAdvisory'], h.state.headRefOid, r => [{ id: 'r1', key: r.referrals[0].key,
       reviewerId: r.reviewer.id, lens: r.reviewer.lens, result: 'not-real', rationale: 'Verified', evidence: ['diff:x'] }]);
     const key = old.referrals[0].key;
-    const operator = (result, at) => h.state.comments.push({ author: { login: 'chalbert' }, body: buildOperatorRulingComment({
-      version: 1, repo: 'o/r', pr: 7, head: old.head, actor: 'chalbert', channel: 'test', reason: `ruled ${result}`, at, clearerId: '',
-      rulings: [{ runId: old.runId, key, result, supersedes: ['r1'] }] }) });
     const stateAfter = async () => {
       await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
       return deriveReferrals([buildLedgerEvent({ type: 'referral', repo: 'o/r', pr: 7, at: '2026-10-04T12:00:00Z',
         source: 'review-pr', headSha: old.head, findingKeys: [ledgerFindingKey(key)] }), ...h.ledger]).get(ledgerFindingKey(key)).state;
     };
-    operator('block', '2026-10-04T12:00:00Z');
-    expect(await stateAfter()).toBe('blocking');
-    operator('not-real', '2026-10-04T12:01:00Z');
     expect(await stateAfter()).toBe('ruled');
-    operator('block', '2026-10-04T12:02:00Z');
+    // Another seat reports the same finding on this head and it is ruled block: the link blocks this key too.
+    const original = old.referrals[0].original;
+    const linked = { ...old, runId: 'later-run', reviewer: mandatoryReferralReviewer('later-run'),
+      referrals: [{ seat: 'judge', original, finding: normalizeFinding(original), key: referralFindingKey('judge', original) }] };
+    linked.rulings = [{ id: 'later-run:0', key: linked.referrals[0].key, reviewerId: linked.reviewer.id, lens: linked.reviewer.lens,
+      result: 'block', rationale: 'Reproduced', evidence: ['diff:x'] }];
+    h.state.comments.push({ body: renderReferralRecord(linked), author: { login: 'web-everything' } });
     expect(await stateAfter()).toBe('blocking');
+    // The operator overrules that block: this key's own word is the earlier not-real again.
+    h.state.comments.push({ author: { login: 'chalbert' }, body: buildOperatorRulingComment({
+      version: 1, repo: 'o/r', pr: 7, head: old.head, actor: 'chalbert', channel: 'test', reason: 'not a defect',
+      at: '2026-10-04T12:01:00Z', clearerId: '', rulings: [{ runId: 'later-run', key: linked.referrals[0].key, result: 'not-real', supersedes: ['later-run:0'] }] }) });
+    expect(mandatoryReferralState(h.state.comments, { repo: 'o/r', pr: 7, head: old.head }).blocked).toEqual([]);
+    expect(await stateAfter()).toBe('ruled');
   });
 
   it('a disabled seat never retires a finding the operator ruled on, in the thread or the ledger', async () => {
@@ -1493,6 +1498,7 @@ describe('#4315 durable referral effects', () => {
     expect(deriveReferrals([referral, row('block'), retire()]).get('k').state).toBe('blocking');
     expect(deriveReferrals([referral, row('not-real'), retire()]).get('k').state).toBe('ruled');
     expect(deriveReferrals([row('block'), retire(), referral]).get('k').state).toBe('blocking');
+    expect(deriveReferrals([retire(), referral]).get('k').state).toBe('open');
     expect(deriveReferrals([referral, retire('record-referral-ruling'), referral]).get('k').state).toBe('ruled');
   });
 

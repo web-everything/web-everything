@@ -62,11 +62,12 @@ export function deriveReferrals(events) {
       const k = keys.get(e.findingKey);
       // Only the closed set of rulings moves a key; an unknown value (a forged or mis-cased row) changes nothing.
       // A retirement closes the key without a verdict on it, so a later referral reopens it (never sticky `ruled`).
-      // It only closes a key nobody ruled on: it never replaces a recorded ruling, early or not.
+      // It only closes an open key: it never replaces a recorded ruling, and never pre-closes a referral that a
+      // re-enabled seat has yet to make.
       const ruled = RULING_STATE.get(e.ruling);
       const retire = ruled === 'ruled' && e.source === 'review-pr' && e.actor?.channel === REFERRAL_RETIRED_CHANNEL;
       const state = retire ? 'retired' : ruled;
-      if (retire && (k ? k.state !== 'open' : earlyRulings.has(e.findingKey))) continue;
+      if (retire && k?.state !== 'open') continue;
       if (k && state) keys.set(e.findingKey, { ...k, state, ruling: e.ruling });
       else if (state) earlyRulings.set(e.findingKey, { state, ruling: e.ruling });
     } else if ((e.type === EVENT_TYPES.VERDICT || e.type === undefined) && verdictClears(e.verdict)) {
