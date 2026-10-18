@@ -44,4 +44,5 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Also raised by
 
+- Also raised by web-everything/web-everything#5554 (finding 1: `we:backlog/x9hf8a0-prevention-a-card-lint-requirement-that-a-card-widening-a-pe.md:17` — Add a check:standards rule: when a backlog card says 'Already tracked on open cards … → #N ', the referenced card must contain a line with this card's idempotency-key PR number. Failing that, make the filer assert every dedupe target was appended before it writes the claim.) · key `approval-prevention-key:web-everything/web-everything#5554@d7de7d43dc0c655eb959c9c1899e5580474ab062`
 - Also raised by web-everything/web-everything#5555 (finding 1: `we:backlog/xwr4bos-prevention-make-the-card-template-require-path-test-name-on.md:16` — Make the filer emit the 'Already tracked' line only for cards whose 'Also raised by' edit is staged in the same change. Add a check:standards rule that fails a card citing '#N → recorded as Also raised by' when card N lacks the idempotency key.)
