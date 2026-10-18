@@ -828,6 +828,8 @@ export function ledgerObservationApplies(row, existing) {
     if (row.verdict === 'carried') return ledgerCarryAllowed(mine, row.fromHead, row.coverage?.headSha);
     return true;
   }
+  // A restamp re-witnesses the same content: at the tip, a referral appended after the writer's snapshot still refuses it.
+  if (row.verdict === VERDICTS.RESTAMPED) return !ledgerReferralsOutstanding(mine);
   return true;
 }
 

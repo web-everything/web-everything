@@ -238,6 +238,20 @@ describe('ledger head lifecycle red-team regressions', () => {
     } finally { rmSync(cwd, { recursive: true, force: true }); }
   });
 
+  it('operator send-back F1 race: a restamp planned before a referral landed is refused at the tip', () => {
+    const key = `sha256:${'e'.repeat(64)}`;
+    const snapshot = [verdict('accepted')];
+    const [restamp] = planDrainLedgerFacts({ verdicts: [{ decision: 'merge', num: pr, repo, headSha: next, reviewGate: { acceptedMerge: true } }],
+      repo, events: snapshot, now: at });
+    expect(restamp).toMatchObject({ verdict: 'restamped' });
+    expect(ledgerObservationApplies(restamp, snapshot)).toBe(true);
+    const tip = [...snapshot, event('referral', { headSha: head, findingKeys: [key] })];
+    expect(ledgerObservationApplies(restamp, tip)).toBe(false);
+    expect(ledgerObservationApplies(restamp, [...tip, event('ruling', { findingKey: key, ruling: 'block' })])).toBe(false);
+    expect(ledgerObservationApplies(restamp, [...tip, event('ruling', { findingKey: key, ruling: 'not-real' })])).toBe(true);
+    expect(codes(tip, next)).toContain('referral-unruled');
+  });
+
   it('operator send-back F2: a missed head-move observation still ends the old head\'s human approval', () => {
     // Exact red-team stream: accepted(A), manual review:human, clear-human(A) and its approval, then a substantive push to B.
     const events = [verdict('accepted'), event('label-input', { label: 'review:human', change: 'added', sender: 'operator' }),
