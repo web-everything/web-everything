@@ -422,3 +422,17 @@ it.each(['--add-label', '--undo'])('recovers a failed %s before refusing subsequ
   expect(f.read().restoreProtection).toBeUndefined();
   expect(f.read().holdApplied).toBe(true);
 });
+
+
+it.each(['MERGED', 'CLOSED'])('does not relaunch or publish an archived terminal %s PR', async terminalPrState => {
+  const f = fixture();
+  const archiveDir = join(f.dir, 'sealed'); mkdirSync(archiveDir);
+  const archived = join(archiveDir, 'org-repo-1-prevention.json');
+  writeFileSync(archived, JSON.stringify({ ...f.state, sealedAt: '2026-10-18', pr: 272, terminalPrState }));
+  writeFileSync(f.statePath, JSON.stringify({ seq: 1, lastSealedState: archived }));
+  const spawn = vi.fn(fakeChild);
+  expect(await sealDueBatches({ now: 60000, stateDir: f.dir, policy: f.opts.policy, spawn })).toEqual([]);
+  expect(spawn).not.toHaveBeenCalled();
+  expect((await publishBatch({ statePath: archived }, f.opts)).action).toBe('sealed');
+  expect(f.exec).not.toHaveBeenCalled();
+});

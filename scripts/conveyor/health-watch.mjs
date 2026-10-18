@@ -46,6 +46,7 @@ import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { superviseNeedsYouFeed } from './needs-you-feed-job.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { sealDueBatches } from '../operations/card-batch-seal-io.mjs';
+import { reconcileCardBatches, resolveReconcileIntervalMin } from '../operations/card-batch-reconcile.mjs';
 import { readFixLoopRows } from './fix-loop-ledger.mjs';
 import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 import { archiveClaudeJobs, formatClaudeJobsArchiveLine } from './claude-jobs-archive.mjs';
@@ -1110,6 +1111,15 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
 
   if (sweepAllowed && config.tmpSweepEnabled) attempt('reviewTmp', () => sweepReviewTmp({ tmpRoot: flags['tmp-sweep-root'] || tmpdir(), config, now, dryRun: !!flags['dry-run'] }));
 
+  const cardBatchReconcile = !flags['state-root'] && !flags['dry-run']
+    && cadenceDue(prev.cardBatchReconcile?.completedAt, now, resolveReconcileIntervalMin() * 60_000)
+    ? await attempt('cardBatchReconcile', async () => {
+      const results = await reconcileCardBatches({ now });
+      const failures = results.filter(result => result.action === 'error');
+      if (failures.length) throw new Error(failures.map(result => result.reason).join('; '));
+      return { completedAt: now };
+    }) : null;
+
   if (!flags['state-root'] && !flags['dry-run']) await attempt('cardBatchSeal', () => sealDueBatches({ now }));
 
   const archiveAllowed = flags['claude-jobs-root'] || (!flags['state-root'] && !flags['dry-run']);
@@ -1366,6 +1376,8 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
       }, { now }));
     }
   }
+  if (cardBatchReconcile) state.cardBatchReconcile = cardBatchReconcile;
+  else if (prev.cardBatchReconcile) state.cardBatchReconcile = prev.cardBatchReconcile;
   if (tmpSweep) state.tmpSweep = { at: now, ...(tmpSweep.complete ? { completedAt: now } : {}), ...tmpSweep };
   else if (prev.tmpSweep) state.tmpSweep = prev.tmpSweep;
   state.notifiedSilences = (result.state.silences || []).filter((x) => x.expiredNotified).map(silenceSig);

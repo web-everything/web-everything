@@ -1,5 +1,17 @@
 # Testing — Three-Tier Strategy
 
+## Periodic card batch recovery
+
+`card-batch-reconcile.mjs` shares admission's terminal-PR retirement and per-state lease.
+Health-watch samples `cardBatch.reconcileIntervalMin` through `readSettings` (positive integer,
+default 5), persists `cardBatchReconcile.completedAt`, and skips fixture-root/dry-run ticks.
+Reconciliation drains `pending-prevention` through the same lane-acquiring recovery path as
+`land-prevention-card --drain-pending` after retirement or for open slots, releasing the state
+lease before draining so admission can open sequence + 1. Terminal PR archives carry
+`terminalPrState` so the archive seal-retry scan cannot relaunch them. Its CLI dry-run only reads states.
+Use temporary state directories, fake GitHub and local bare Git origins for these probes;
+never run a recovery test against the automation state home.
+
 ## Label provisioning cache
 
 All label provisioning uses `scripts/lib/label-cache.mjs`, including the review/land providers,

@@ -10,6 +10,7 @@ import { setTimeout } from 'node:timers/promises';
 import { loadCardBatchPolicy } from '../../lib/card-batch-policy.mjs';
 import { admitCard, gitIn } from '../card-batch-io.mjs';
 import * as batchIO from '../card-batch-io.mjs';
+import { reconcileCardBatches } from '../card-batch-reconcile.mjs';
 import { drainPendingPrevention } from '../land-prevention-card.mjs';
 
 const roots = [];
@@ -380,8 +381,8 @@ describe('durable card batch IO', () => {
     const f = fixture();
     await admitCard(f.card(), f.options);
     writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
-    const target = ['MERGED', 'CLOSED'].includes(status) ? '\n          log(`card-batch ${retired.batchRef}'
-      : status === 'OPEN' ? '\n          log(`card-batch ${recorded.batchRef}' : '\n        log(`card-batch ${recorded.batchRef}';
+    const target = ['MERGED', 'CLOSED'].includes(status) ? '\n      log(`card-batch ${retired.batchRef}'
+      : status === 'OPEN' ? '\n      log(`card-batch ${recorded.batchRef}' : '\n    log(`card-batch ${recorded.batchRef}';
     const probe = mutantProbe(f, [[target, target.replace('log(', 'void(')]],
       mutantAdmission(f).replace("gh: async () => '{\"state\":\"CLOSED\"}'",
         status === 'unreadable' ? "gh: async () => { throw new Error('unreadable'); }"
@@ -714,5 +715,47 @@ describe('durable card batch IO', () => {
 
   it('has no force-push option anywhere in its source', () => {
     expect(readFileSync(new URL('../card-batch-io.mjs', import.meta.url), 'utf8')).not.toContain('--force');
+  });
+});
+
+
+describe('periodic terminal batch recovery with real Git', () => {
+  it.each(['MERGED', 'CLOSED'])('retires %s without admission, then drains pending into seq+1', async status => {
+    const f = fixture();
+    const first = f.card();
+    await admitCard(first, f.options);
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    if (status === 'MERGED') {
+      const pending = join(f.stateDir, 'pending-prevention'); mkdirSync(pending);
+      writeFileSync(join(pending, '5193.json'), JSON.stringify({ cardId: '5193', rel: 'backlog/5193-card.md',
+        content: '# Pending card', idemKey: 'key-5193', source: first.source }));
+    }
+    let drained = 0;
+    let flushed = false;
+    const results = await reconcileCardBatches({ ...f.options, laneDir: f.laneDir, now: f.now(),
+      gh: async () => JSON.stringify({ state: status }), log: () => {},
+      drain: async (input, options) => {
+        expect(input.drainPending).toBe(true);
+        expect(f.state()).toMatchObject({ seq: 1, lastSealedState: expect.any(String) });
+        expect(f.state().batchRef).toBeUndefined();
+        await drainPendingPrevention({ lane: f.laneDir }, { ...options,
+          exec: (cmd, args) => execFileSync(cmd, args, { encoding: 'utf8' }),
+          batch: async card => {
+            const result = await admitCard({ ...card, cardId: card.cardPath.split('/')[1].split('-')[0], baseSha: f.baseSha }, f.options);
+            expect(result.action).toBe('admit'); drained++;
+            expect(result.state.seq).toBe(2);
+            return { batched: true, batchRef: result.batchRef };
+          },
+        });
+        return { ok: true };
+      },
+      seal: async () => { expect(drained).toBe(1); flushed = true; },
+    });
+    expect(results[0].action).toBe('retired');
+    expect(JSON.parse(readFileSync(join(f.stateDir, 'sealed/org-repo-1-prevention.json'))).terminalPrState).toBe(status);
+    expect(f.state().seq).toBe(2);
+    expect(readdirSync(join(f.stateDir, 'pending-prevention'))).toEqual([]);
+    expect(flushed).toBe(true);
+    expect(existsSync(`${f.statePath}.lock`)).toBe(false);
   });
 });

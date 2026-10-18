@@ -63,6 +63,7 @@ export async function publishBatch(input, opts = {}) {
       state = readState(state.lastSealedState);
       return { action: state.sealFailure ? 'held' : 'sealed', state };
     }
+    if (['MERGED', 'CLOSED'].includes(state.terminalPrState)) return { action: 'sealed', state };
     const kind = input.kind ?? kindOf(state, statePath);
     const repo = state.repo ?? state.members[0]?.source.repo;
     const check = async () => {
@@ -271,7 +272,8 @@ export async function sealDueBatches({ now = Date.now(), stateDir = CARD_BATCH_S
       const path = resolve(stateDir, file);
       const state = readState(path);
       if (!state.batchRef) continue;
-      if (basename(stateDir) === 'sealed' && (state.sealFailure || state.seal?.step === 'label-on-green')) continue;
+      if (basename(stateDir) === 'sealed' && (state.sealFailure || state.seal?.step === 'label-on-green'
+        || ['MERGED', 'CLOSED'].includes(state.terminalPrState))) continue;
       const kind = kindOf(state, path);
       // Any seal reason launches (count beats age in shouldSeal); the lease serialises the worker against inline sealing.
       // A PR whose hold was never confirmed relaunches too, so the unheld-draft window closes without waiting for a seal.

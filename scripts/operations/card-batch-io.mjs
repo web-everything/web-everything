@@ -108,13 +108,13 @@ export function atomicRecord(path, state) {
 }
 
 /** Archive before replacing the active slot; caller must own and recheck the existing lease. */
-export function retireBatch(statePath, state, { repo, kind, held }) {
+export function retireBatch(statePath, state, { repo, kind, held, terminalPrState }) {
   if (basename(dirname(statePath)) === 'sealed') return state;
   if (!held()) throw new Error('lease-held');
   const archiveDir = join(dirname(statePath), 'sealed');
   mkdirSync(archiveDir, { recursive: true });
   const archivePath = join(archiveDir, `${repo.replaceAll('/', '-')}-${state.seq}-${kind}.json`);
-  atomicRecord(archivePath, { ...state, kind, repo });
+  atomicRecord(archivePath, { ...state, kind, repo, ...(terminalPrState ? { terminalPrState } : {}) });
   if (!held()) throw new Error('lease-held');
   const successor = { seq: state.seq, lastSealedState: archivePath };
   atomicRecord(statePath, successor);
@@ -173,6 +173,39 @@ function respoolClosed(state, input, stateDir, remote, held) {
   }
 }
 
+/** Retire a terminal sealed generation under the caller's admission lease; unreadable evidence stays held. */
+export async function retireTerminalBatch(recorded, input, {
+  statePath, stateDir = dirname(statePath), remote = 'origin', gh = defaultGh,
+  held: stillHeld, log = line => process.stderr.write(`${line}\n`),
+}) {
+  if (!recorded?.batchRef || !recorded.sealedAt || !recorded.pr
+    || basename(dirname(statePath)) === 'sealed') return refuse('batch-sealed');
+  let status = 'UNREADABLE';
+  try {
+    if (!Number.isSafeInteger(recorded.seq) || recorded.seq < 1 || !COMMIT_ID.test(String(recorded.headSha))
+      || !Number.isSafeInteger(Number(recorded.pr)) || Number(recorded.pr) <= 0
+      || recorded.repo && recorded.repo !== input.source.repo
+      || recorded.kind && recorded.kind !== input.kind
+      || recorded.batchRef !== `lane/card-batch-${input.kind}-${recorded.seq}`) throw new Error('invalid batch identity');
+    const view = JSON.parse(await gh(['pr', 'view', String(recorded.pr), '--repo', input.source.repo, '--json', 'state']));
+    if (['OPEN', 'CLOSED', 'MERGED'].includes(view?.state)) status = view.state;
+    if (!stillHeld()) return refuse('lease-held');
+    if (status === 'CLOSED') respoolClosed(recorded, input, stateDir, remote, stillHeld);
+    if (status === 'MERGED' || status === 'CLOSED') {
+      const retired = recorded;
+      recorded = retireBatch(statePath, recorded, { repo: input.source.repo, kind: input.kind, held: stillHeld, terminalPrState: status });
+      log(`card-batch ${retired.batchRef} PR ${retired.pr} GitHub ${status}: retired${status === 'CLOSED' ? ' and re-spooled' : ''}`);
+    } else {
+      log(`card-batch ${recorded.batchRef} PR ${recorded.pr} GitHub ${status}: kept sealed and held`);
+      return refuse('batch-sealed');
+    }
+  } catch {
+    log(`card-batch ${recorded.batchRef} PR ${recorded.pr} GitHub ${status}: recovery unreadable; kept sealed and held`);
+    return refuse('batch-sealed');
+  }
+  return { action: 'retired', state: recorded };
+}
+
 /** Returns admission/dedupe/refusal; injected crashes throw CARD_BATCH_CRASH at the named boundary. */
 export async function admitCard(input, {
   stateDir = cardBatchStateDir(), remote = 'origin', clock = Date.now,
@@ -219,29 +252,11 @@ export async function admitCard(input, {
     // validation path below; the lockfile, rather than the previous writer's audit lease, is authoritative.
     let plan = planAdmit({ state: recorded && { ...recorded, lease: auditLease }, input, policy, now: now(), owner });
     if (plan.action !== 'dedupe' && recorded?.batchRef && recorded.sealedAt && recorded.pr) {
-      let status = 'UNREADABLE';
-      try {
-        if (!Number.isSafeInteger(recorded.seq) || recorded.seq < 1 || !COMMIT_ID.test(String(recorded.headSha))
-          || !Number.isSafeInteger(Number(recorded.pr)) || Number(recorded.pr) <= 0
-          || recorded.repo && recorded.repo !== input.source.repo
-          || recorded.kind && recorded.kind !== input.kind
-          || recorded.batchRef !== `lane/card-batch-${input.kind}-${recorded.seq}`) throw new Error('invalid batch identity');
-        const view = JSON.parse(await gh(['pr', 'view', String(recorded.pr), '--repo', input.source.repo, '--json', 'state']));
-        if (['OPEN', 'CLOSED', 'MERGED'].includes(view?.state)) status = view.state;
-        if (!stillHeld()) return refuse('lease-held');
-        if (status === 'CLOSED') respoolClosed(recorded, input, stateDir, remote, stillHeld);
-        if (status === 'MERGED' || status === 'CLOSED') {
-          const retired = recorded;
-          recorded = retireBatch(statePath, recorded, { repo: input.source.repo, kind: input.kind, held: stillHeld });
-          log(`card-batch ${retired.batchRef} PR ${retired.pr} GitHub ${status}: retired${status === 'CLOSED' ? ' and re-spooled' : ''}`);
-        } else {
-          log(`card-batch ${recorded.batchRef} PR ${recorded.pr} GitHub ${status}: kept sealed and held`);
-          return refuse('batch-sealed');
-        }
-      } catch {
-        log(`card-batch ${recorded.batchRef} PR ${recorded.pr} GitHub ${status}: recovery unreadable; kept sealed and held`);
-        return refuse('batch-sealed');
-      }
+      const result = await retireTerminalBatch(recorded, input, {
+        statePath, stateDir, remote, gh, held: stillHeld, log,
+      });
+      if (result.action !== 'retired') return result;
+      recorded = result.state;
     }
     plan = planAdmit({ state: recorded && { ...recorded, lease: auditLease }, input, policy, now: now(), owner });
     if (plan.action === 'refuse') return plan;
