@@ -23,6 +23,8 @@ describe('ci-card-only detection', () => {
     expect(isCardPath('backlog-tools/x.mjs')).toBe(false);
     expect(isCardPath('backlog/../scripts/x.mjs')).toBe(false);
     expect(isCardPath('backlog/')).toBe(false);
+    expect(isCardPath('backlog/tool.mjs')).toBe(false);
+    expect(isCardPath('backlog/nested/card.md')).toBe(false);
   });
 });
 
