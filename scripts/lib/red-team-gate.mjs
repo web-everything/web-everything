@@ -397,7 +397,9 @@ function operatorRuled(records, pr, head) {
     const cap = gateRecordsFor(rs, pr, sha, result).filter(r => r.gate.outcome === GATE_OUTCOMES.ROUND_CAP).sort(threadOrder).at(-1);
     const cleared = lastAt(rs, r => !r.from && CLEAR_HUMAN_RULING_RE.test(recordBody(r).replace(/\r\n/g, '\n').trimStart())
       && parseLatestHumanClearedSha([r.c]) === sha);
-    if (cap && cleared && cleared.at > cap.at && cleared.at > result.at) return true;
+    // A cap that names this result id already decided it: posting an identical copy later (a saved result's comment)
+    // keeps the ruling. A legacy cap without a name needs the ruling after the result itself.
+    if (cap && cleared && cleared.at > cap.at && (cleared.at > result.at || cap.gate.result === want)) return true;
     if (!result.from) return false;
     rs = rs.filter(r => r.at < result.at);
     sha = result.from;

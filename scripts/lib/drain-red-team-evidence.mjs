@@ -5,7 +5,7 @@ import { hostname } from 'node:os';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operations/run-store.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
-import { recordedRedTeamResult } from './drain-saved-red-team.mjs';
+import { attemptedRedTeamRun, recordedRedTeamResult } from './drain-saved-red-team.mjs';
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { redTeamEnabled, redTeamOwedFor } from './review-red-team-policy.mjs';
 import { readRedTeamProbes } from './red-team-gate.mjs';
@@ -30,6 +30,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   readScorecards = () => readStore({ path: resolveScorecardStorePath(env) }).records } = {}) {
   const rows = readScorecards();
   const recorded = recordedRedTeamResult(rows, { repo, pr, head });
+  const attempted = attemptedRedTeamRun(rows, { repo, pr, head });
   // Runs are immutable in identity but updated in place: choose the latest read of this exact repo/PR/head.
   const latestRun = () => {
     const hits = list(runsDir).filter(id => id.startsWith('review-pr-')).map(id => ({ id, run: read(id, runsDir) }))
@@ -53,7 +54,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     // of an unchanged head labels its accept before its job writes `queued`).
     if (!['queued', 'running'].includes(status.status)) {
       const latest = latestRun();
-      if (latest.at > statusAt && owes(latest.run)) return { loopPayload: latest.run, inFlight: false, scheduled: true, recorded, skipCardOnly: false };
+      if (latest.at > statusAt && owes(latest.run)) return { loopPayload: latest.run, inFlight: false, scheduled: true, recorded, attempted, skipCardOnly: false };
     }
     // A local pid probe says nothing about another host or namespace: keep that pass held for its result.
     // For local records, a changed birth time proves pid reuse. An unavailable birth time is unknown,
@@ -70,11 +71,13 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     const resultStatus = typeof status.result === 'string' ? status.result : status.result?.status;
     return { loopPayload: status.loopPayload, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
       ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error'].includes(resultStatus),
-      recorded: recordedRedTeamResult(rows, { repo, pr, head }, status.result) };
+      recorded: recordedRedTeamResult(rows, { repo, pr, head }, status.result), attempted: attemptedRedTeamRun(rows, { repo, pr, head }, status.result) };
   }
   const loopPayload = latestRun().run;
   // An owing run with no job status yet: only the job's process knows its card-only skip decision, so hold the head
   // (skip off) until that status records it. The never-scheduled deadline still applies if no job ever writes one.
-  return { loopPayload, inFlight: false, scheduled: recorded || owes(loopPayload),
-    recorded: recorded || recordedRedTeamResult([], { repo, pr, head }, loopPayload?.redTeam), ...(owes(loopPayload) ? { skipCardOnly: false } : {}) };
+  // A pass that already ran (even unusably) is scheduled, never "never scheduled".
+  const ran = attempted || attemptedRedTeamRun([], { repo, pr, head }, loopPayload?.redTeam);
+  return { loopPayload, inFlight: false, scheduled: recorded || ran || owes(loopPayload),
+    recorded: recorded || recordedRedTeamResult([], { repo, pr, head }, loopPayload?.redTeam), attempted: ran, ...(owes(loopPayload) ? { skipCardOnly: false } : {}) };
 }

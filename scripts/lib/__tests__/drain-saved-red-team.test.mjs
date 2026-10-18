@@ -314,6 +314,23 @@ describe('saved round-cap break: RULING NEEDED and the clear-human ruling (PR #5
     expect(redTeamRulingNeeded(subject, setting, { readSaved })).toBeNull();
     expect(hold(env, { comments, confirmedBreaks: setting })).toBeNull();
   });
+  it('posting an already-ruled saved result with an identical result id does not reinstate the operator hold', async () => {
+    const { env, comments, subject, readSaved } = await roundCapped();
+    const { redTeamRulingNeeded, redTeamMarker, parseRedTeamComment } = await import('../red-team-gate.mjs');
+    const posted = summary => ({ author: { login: 'web-everything' }, createdAt: '2026-10-17T10:05:00Z', body: [
+      redTeamMarker(pr, head), '', `1. [**confirmed**] (edge-case, broken) \`scripts/example.mjs:3\` — ${summary}`,
+    ].join('\n') });
+    expect(redTeamResultId(parseRedTeamComment(posted('two writers race').body))).toBe(redTeamResultId(readSaved()));
+    comments.push(cleared('2026-10-17T10:02:00Z'));
+    for (const shape of [c => c, c => ({ user: { login: c.author.login }, created_at: c.createdAt, body: c.body })]) {
+      const thread = [...comments, posted('two writers race')].map(shape);
+      expect(redTeamRulingNeeded({ ...subject, comments: thread }, setting, { readSaved })).toBeNull();
+      expect(hold(env, { comments: thread, confirmedBreaks: setting })).toBeNull();
+      // A different result posted after the ruling is a new decision: it is not covered by the ruling.
+      const other = [...comments, posted('a different break')].map(shape);
+      expect(hold(env, { comments: other, confirmedBreaks: setting })).toMatch(/requiring send-back/);
+    }
+  });
   it('releases on the drain\'s REST thread shape (user.login, created_at) exactly as on the GraphQL shape', async () => {
     const { env, comments, subject, readSaved } = await roundCapped();
     const { redTeamRulingNeeded } = await import('../red-team-gate.mjs');

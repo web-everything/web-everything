@@ -75,3 +75,13 @@ export function recordedRedTeamResult(rows, { repo, pr, head }, result) {
     && row.seat === 'red-team' && sameRepo(row.repo, repo) && Number(row.pr) === Number(pr) && row.rev === head
     && row.status === 'ok' && ['accept', 'changes'].includes(row.seatVerdict));
 }
+
+/**
+ * A pass that ran on this head, usable or not (errored, unparseable, not posted). Not a result, but never a
+ * "never scheduled" head either: it stays held until a usable result exists.
+ */
+export function attemptedRedTeamRun(rows, { repo, pr, head }, result) {
+  const status = typeof result === 'string' ? result : result?.status;
+  return ['ran', 'error'].includes(status) || rows.some(row => row?.dispatchKind === 'review-seat'
+    && row.seat === 'red-team' && sameRepo(row.repo, repo) && Number(row.pr) === Number(pr) && row.rev === head);
+}
