@@ -38,8 +38,8 @@ describe.each([
   delete env.GIT_CONFIG_COUNT;
   const io = realIo({ session: 'sess-1', env });
 
-  it('the worker keeps the repo\'s own hooks (e.g. the pre-push main guard): no hooks-disabled override reaches it', () => {
-    const r = io.runWorker(['-e', PRINT_ENV]);
+  it('the worker keeps the repo\'s own hooks (e.g. the pre-push main guard): no hooks-disabled override reaches it', async () => {
+    const r = await io.runWorker(['-e', PRINT_ENV]);
     expect(r.ok).toBe(true);
     expect(JSON.parse(r.out).lastMessage).toBe('none|sess-1');
   });
@@ -134,7 +134,7 @@ describe.each([
 });
 
 describe('probation-heal-run realIo — the checker is a worker too', () => {
-  it('the checker keeps the repo\'s own hooks: no hooks-disabled override reaches it', () => {
+  it('the checker keeps the repo\'s own hooks: no hooks-disabled override reaches it', async () => {
     const env = { ...process.env };
     delete env.GIT_CONFIG_COUNT;
     expect(healRealIo({ session: 'sess-1', env }).runChecker(['-e', PRINT_ENV])).toBe('none|sess-1');

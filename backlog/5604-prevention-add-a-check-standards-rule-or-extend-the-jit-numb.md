@@ -40,3 +40,8 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5561 (finding 1: `we:backlog/6278-prevention-add-a-deterministic-filer-validation-that-flags-s.md:8` — Add a check:standards or filer rule that every scope entry must resolve to an existing file or a path the PR creates. For we:backlog/<slug> entries it should also try the JIT-renumbered name.) · key `approval-prevention-key:web-everything/web-everything#5561@fc1931a229f23ab2b412354950693786aaef5cff`
+- Also raised by web-everything/web-everything#5532 (finding 1: `we:backlog/6245-prevention-require-structured-guarantee-to-test-mappings-thr.md:7` — Add a check:standards rule that every scope entry must resolve to an existing backlog file, or make the JIT-renumber step rewrite scope frontmatter as well as body text.) · key `approval-prevention-key:web-everything/web-everything#5532@3402fc5ad48952eeb8fa630eaa5a74a54b14d259`

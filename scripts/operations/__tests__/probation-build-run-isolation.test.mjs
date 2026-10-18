@@ -81,7 +81,7 @@ function launch(f, extraEnv = {}, setup = '', flags = []) {
 }
 
 describe('probation build checkout isolation', () => {
-  it.each([false, true])('commits grouped preparation once in the lane (member declined=%s)', declined => {
+  it.each([false, true])('assembles isolated per-card commits in one lane (member declined=%s)', declined => {
     const f = fixture();
     try {
       const git = argv => execFileSync('git', ['-C', f.lane, ...argv], { encoding: 'utf8', stdio: 'pipe' }).trim();
@@ -92,32 +92,42 @@ describe('probation build checkout isolation', () => {
       git(['add', '.']);
       git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', '-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'group fixture']);
       const base = git(['rev-parse', 'HEAD']);
+      const memberLane = join(f.root, '.lanes/web-everything/lane-2');
+      execFileSync('git', ['clone', '-q', f.lane, memberLane], { stdio: 'pipe' });
+      for (const card of ['backlog/4291-probe.md', memberPath]) put(join(f.repo, card), readFileSync(join(f.lane, card), 'utf8'));
+      put(join(f.repo, 'scripts/lane-pool.mjs'), `console.log(process.argv.some(a => a.endsWith('card-4292')) ? ${JSON.stringify(memberLane)} : ${JSON.stringify(f.lane)});`);
       const before = snapshot(f.repo);
       const sections = '\n## Design\nConcrete.\n## MVP\nBounded.\n## Test plan\nReplay.\n## Proof plan\nProbe.\n';
       const result = launch(f, {}, `
         const fs = await import('node:fs');
         io.preparePolicy = { autoSize: false };
-        io.runWorker = () => {
-          for (const path of ['backlog/4291-probe.md', '${memberPath}']) {
-            fs.appendFileSync(${JSON.stringify(f.lane)} + '/' + path, ${JSON.stringify(sections)});
-          }
-          return { ok: true, lastMessage: ${JSON.stringify(declined ? 'Not prepared: #4292 — unresolved choice' : '')} };
-        };
-        io.stampPrepare = (n, dir) => {
-          const card = io.findItem(n, dir);
-          fs.writeFileSync(dir + '/' + card.path, card.raw.replace('---\\n', '---\\npreparedDate: "2026-10-13"\\npreparedAgainstSha: "${base}"\\n'));
-          return { ok: true };
+        io.forPrepareCard = ({ session }) => {
+          const child = realIo({ repoRoot: ${JSON.stringify(f.repo)}, session });
+          const id = session.split('-').at(-1);
+          child.appendScorecard = () => {};
+          child.runWorker = (_argv, dir) => {
+            if (${JSON.stringify(declined)} && id === '4292') return { ok: false, out: 'unresolved choice' };
+            const card = child.findItem(id, dir);
+            fs.appendFileSync(dir + '/' + card.path, ${JSON.stringify(sections)});
+            return { ok: true, lastMessage: '' };
+          };
+          child.stampPrepare = (n, dir) => {
+            const card = child.findItem(n, dir);
+            fs.writeFileSync(dir + '/' + card.path, card.raw.replace('---\\n', '---\\npreparedDate: "2026-10-13"\\npreparedAgainstSha: "${base}"\\n'));
+            return { ok: true };
+          };
+          return child;
         };
       `, ['--taskType=prepare', '--group-members=4292']);
       expect(result).toMatchObject({ outcome: 'opened-pr', groupMembers: ['4292'], groupDropped: declined ? ['4292'] : [] });
-      expect(git(['rev-list', '--count', base + '..HEAD'])).toBe('1');
-      expect(git(['diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD']).split('\n')).toEqual(declined
+      expect(git(['rev-list', '--count', base + '..HEAD'])).toBe(declined ? '1' : '2');
+      expect(git(['diff', '--name-only', base, 'HEAD']).split('\n')).toEqual(declined
         ? ['backlog/4291-probe.md'] : ['backlog/4291-probe.md', memberPath]);
       expect(git(['show', 'HEAD:backlog/4291-probe.md'])).toContain(`preparedAgainstSha: "${base}"`);
       if (declined) expect(readFileSync(join(f.lane, memberPath), 'utf8')).toBe(memberRaw);
       else expect(git(['show', 'HEAD:' + memberPath])).toContain(`preparedAgainstSha: "${base}"`);
       const body = readFileSync(join(f.lane, '.pr-body.md'), 'utf8');
-      expect(body).toContain(declined ? 'Not prepared: #4292 — unresolved choice' : 'Grouped prepare: #4291, #4292');
+      expect(body).toContain(declined ? 'Not prepared: #4292' : 'Grouped prepare: #4291, #4292');
       expect(snapshot(f.repo)).toEqual(before);
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   });

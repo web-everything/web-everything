@@ -1,3 +1,4 @@
+import { isCardOnlyDiff } from '../ci-card-only.mjs';
 /** Shared scheduling policy; importing it never loads a review dispatcher or CLI. */
 import { redTeamRequired, VERDICTS } from './jury-core.mjs';
 import { ADVISORY_OUTCOMES } from './advisory-labels.mjs';
@@ -41,3 +42,23 @@ export function redTeamOwedFor(loopPayload) {
   return advisoryLabelOutcome({ read: loopPayload?.findings?.read, verdict }) === ADVISORY_OUTCOMES.ACCEPT;
 }
 
+
+/** Net diff includes rename/copy sources; unknown paths cannot justify skipping. */
+export function redTeamCardOnly(read) {
+  const paths = Array.isArray(read?.netChangedFiles) && read.netChangedFiles.length
+    && (read.netRenameSources == null || Array.isArray(read.netRenameSources))
+    ? [...read.netChangedFiles, ...(read.netRenameSources ?? [])] : null;
+  return isCardOnlyDiff(paths);
+}
+
+/**
+ * Is a red-team result owed on this head? A pass that started or finished is always owed its result. A card-only
+ * head is exempt only while the producer skips it: the skip decision the producer's process recorded with the
+ * head's status (`evidence.skipCardOnly`) wins over `skipCardOnly`, the caller's own resolved setting.
+ */
+export function redTeamOwedOnHead({ read, evidence = {}, skipCardOnly = true } = {}) {
+  if (evidence.inFlight || evidence.recorded) return true;
+  const skip = typeof evidence.skipCardOnly === 'boolean' ? evidence.skipCardOnly : skipCardOnly;
+  if (skip && redTeamCardOnly(read)) return false;
+  return !!evidence.scheduled;
+}

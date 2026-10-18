@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   BUILD_DISPATCH_POLICY as DEFAULT_POLICY, parseScopeEntry, pathsOverlap, firstScopeOverlap, branchRefPolicy, plannedBuildRef,
   prDeliversNum, normalizeOpenPrs, planBuildDispatch, reportOpenItems,
-  prepareAheadNums, daysBetween, stampCoversClaim, collectBuildHolds,
+  planPrepareBatches, prepareAheadNums, daysBetween, stampCoversClaim, collectBuildHolds,
 } from '../build-dispatch-policy.mjs';
 import { formatOpenPrCap } from '../../lib/open-pr-cap-scope.mjs';
 
@@ -441,11 +441,11 @@ describe('executor concurrency caps (#4531)', () => {
 
 describe('card 80 — prepare just in time', () => {
   it('declares the two settings with safe defaults', () => {
-    expect(BUILD_DISPATCH_POLICY.prepareAheadWindow).toBe(4);
+    expect(BUILD_DISPATCH_POLICY.prepareAheadWindow).toBe(20);
     expect(BUILD_DISPATCH_POLICY.preparedMaxAgeDays).toBe(3);
   });
 
-  it('prepareAheadNums keeps only the next N build-bound cards, pinned first', () => {
+  it('prepareAheadNums keeps only the next N build-bound cards in queue order', () => {
     const queue = [{ num: '1' }, { num: '2' }, { num: '3' }, { num: '4' }, { num: '5' }, { num: '6' }, { num: '7', tier: 'pinned' }];
     const launch = [{ num: '1' }];
     const held = [
@@ -456,15 +456,15 @@ describe('card 80 — prepare just in time', () => {
       { num: '6', reason: 'needs-prepare' },
       { num: '7', reason: 'needs-prepare' },
     ];
-    expect([...prepareAheadNums({ queue, launch, held, window: 4 })]).toEqual(['7', '1', '3', '4']);
+    expect([...prepareAheadNums({ queue, launch, held, window: 4 })]).toEqual(['1', '3', '4', '5']);
     expect(prepareAheadNums({ queue, launch, held, window: 4 }).has('6')).toBe(false);
   });
 
-  it('prepareAheadNums puts delivery class before pinned cards', () => {
+  it('prepareAheadNums keeps ready order when build priorities are absent', () => {
     const queue = [{ num: '7', tier: 'pinned', priorityClass: 'P3' }, { num: '1', priorityClass: 'P3' }, { num: '9', priorityClass: 'P1' }];
     const held = queue.map(({ num }) => ({ num, reason: 'needs-prepare' }));
-    expect([...prepareAheadNums({ queue, held, window: 1 })]).toEqual(['9']);
-    expect([...prepareAheadNums({ queue, held, window: 2 })]).toEqual(['9', '7']);
+    expect([...prepareAheadNums({ queue, held, window: 1 })]).toEqual(['7']);
+    expect([...prepareAheadNums({ queue, held, window: 2 })]).toEqual(['7', '1']);
   });
 
   it.each([
@@ -475,7 +475,7 @@ describe('card 80 — prepare just in time', () => {
     expect([...prepareAheadNums({ queue, held, window: 1 })]).toEqual([first]);
   });
 
-  it('prepareAheadNums treats missing and unknown classes as P3 and orders all classes', () => {
+  it('prepareAheadNums preserves the supplied queue across priority classes', () => {
     const queue = [
       { num: '4', priorityClass: 'P4', tier: 'pinned' },
       { num: '3', priorityClass: 'unknown', tier: 'pinned' },
@@ -486,7 +486,7 @@ describe('card 80 — prepare just in time', () => {
       { num: '0', priorityClass: 'P0' },
     ];
     const held = queue.map(({ num }) => ({ num, reason: 'needs-prepare' }));
-    expect([...prepareAheadNums({ queue, held, window: 7 })]).toEqual(['0', '1', '2', '3', '8', '7', '4']);
+    expect([...prepareAheadNums({ queue, held, window: 7 })]).toEqual(['4', '3', '8', '7', '2', '1', '0']);
   });
 
   it('prepareAheadNums is off (null) for a non-finite or negative window', () => {
@@ -581,11 +581,11 @@ describe('main-red freeze', () => {
   });
 });
 
-it('prepareAheadNums prioritizes P0 then the operator list before class', () => {
+it('prepareAheadNums prioritizes the operator list then ready order', () => {
   const queue = [{ num: '1', priorityClass: 'P2' }, { num: '2', priorityClass: 'P3', buildPriority: 1 },
     { num: '3', priorityClass: 'P0' }, { num: '4', priorityClass: 'P3', buildPriority: 0 }];
   const launch = queue.map(({ num }) => ({ num }));
-  expect([...prepareAheadNums({ queue, launch, window: 3 })]).toEqual(['3', '4', '2']);
+  expect([...prepareAheadNums({ queue, launch, window: 3 })]).toEqual(['4', '2', '1']);
 });
 
 describe('builder PR cap ownership', () => {
@@ -606,5 +606,28 @@ describe('builder PR cap ownership', () => {
     if (mode === 'builder') {
       expect(formatOpenPrCap(c)).toBe('3 of 16 open PRs counted (not counted: 13 non-builder, 0 card-only, 0 review:accepted) — counted: #1 #2 #3');
     }
+  });
+});
+
+describe('prepare throughput batches', () => {
+  const rows = Array.from({ length: 8 }, (_, i) => ({ num: String(i + 1), scope: [`we:scripts/card-${i}.mjs`] }));
+  it('packs six disjoint cards into one launch', () => {
+    expect(planPrepareBatches({ picks: [rows[0]], pool: rows }).groups).toEqual([{ lead: '1', members: ['2', '3', '4', '5', '6'] }]);
+  });
+  it('leaves overlaps for the next batch and excludes other repositories', () => {
+    const pool = rows.slice(0, 4).map(r => ({ ...r }));
+    pool[1].scope = pool[0].scope;
+    pool[3].scope = ['fui:scripts/other.mjs'];
+    const plan = planPrepareBatches({ picks: pool, pool });
+    expect(plan.groups).toEqual([{ lead: '1', members: ['3'] }]);
+    expect(plan.absorbed.has('2')).toBe(false);
+    expect(plan.absorbed.has('4')).toBe(false);
+  });
+  it('only selects stale cards when they enter the twenty-card window', () => {
+    const queue = Array.from({ length: 25 }, (_, i) => ({ num: String(i), buildPriority: i === 24 ? 0 : 1 }));
+    const held = queue.map(r => ({ num: r.num, reason: 'prepare-stale' }));
+    const window = prepareAheadNums({ queue, held, window: 20 });
+    expect([...window]).toEqual(['24', ...Array.from({ length: 19 }, (_, i) => String(i))]);
+    expect(window.has('20')).toBe(false);
   });
 });

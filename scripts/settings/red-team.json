@@ -1,5 +1,6 @@
 {
   "redTeam": {
+    "$comment": "statusLabels defaults true (WE_RED_TEAM_STATUS_LABELS override); head-bound derived status only, recorded results remain authoritative. skipCardOnly defaults true; card-only net diffs never schedule a pass.",
     "confirmedBreaks": {
       "broken": "send-back",
       "degraded": "card",

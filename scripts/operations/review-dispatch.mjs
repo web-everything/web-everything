@@ -439,8 +439,10 @@ const REVIEW_CODE_PATH_FILES = new Set([
   'scripts/operations/engine.mjs', 'scripts/operations/effect-executor.mjs', 'scripts/operations/registry.mjs',
   'scripts/operations/run-record.mjs', 'scripts/operations/run-store.mjs', 'scripts/operations/run.mjs',
   'scripts/operations/scaffold-io.mjs', 'scripts/operations/step-kinds.mjs',
-  // cli-adapter's submit outcome summary helpers
-  'scripts/operations/open-pr.mjs',
+  // cli-adapter's submit outcome summary and spawn diagnostic redaction helpers
+  'scripts/operations/open-pr.mjs', 'scripts/lib/describe-spawn-failure.mjs',
+  // Shared card-only classification is a direct dependency of the review entry points.
+  'scripts/ci-card-only.mjs',
   // review-pr's remaining direct imports
   'scripts/codex-direct-task.mjs', 'scripts/review-core-cli.mjs', 'scripts/review-set-label.mjs',
   'scripts/lib/advisory-labels.mjs', 'scripts/lib/model-probation.mjs', 'scripts/lib/pr-liveness.mjs',
@@ -460,6 +462,7 @@ const REVIEW_CODE_PATH_FILES = new Set([
   'scripts/conveyor/run-rating.mjs', 'scripts/operations/telemetry-store.mjs', 'scripts/conveyor/reconcile-core.mjs',
   // Verdict carry and red-team marker helpers are direct dependencies of review-job's acceptance path.
   'scripts/lib/rebase-verdict-carry.mjs', 'scripts/lib/red-team-gate.mjs', 'scripts/lib/drain-red-team-evidence.mjs',
+  'scripts/lib/red-team-status-labels.mjs',
   // 117 S3b — the review session and the review job now launch / record through the unified worker wrapper.
   'scripts/operations/worker-wrapper-launch.mjs', 'scripts/operations/worker-wrapper.mjs',
 ]);

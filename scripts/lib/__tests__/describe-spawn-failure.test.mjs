@@ -46,4 +46,129 @@ describe('describeDispatchFailure', () => {
 
 describe('redactSpawnText', () => {
   it('is a no-op on clean text', () => { expect(redactSpawnText('nothing secret')).toBe('nothing secret'); });
+
+  // PR #5472 red team: opaque credential values (no token shape) are redacted by position and by name.
+  it('redacts a whole --settings object however it is nested or quoted', () => {
+    for (const s of [`--settings {"worktree":{"a":"b"},"env":{"X":"opaque1"}} tail`, `--settings '{"env":{"X":"opaque1"}}' tail`,
+      `--settings={"env":{"S":"{\\"a\\":{}}","X":"opaque1"}} tail`]) {
+      expect(redactSpawnText(s, { env: {} })).toBe('--settings <redacted> tail');
+    }
+  });
+  it('redacts every value of an env object, whatever the key is called', () => {
+    expect(redactSpawnText('{"env":{"WHATEVER":"opaque1"},"ok":1}', { env: {} })).toBe('{"env":"<redacted>","ok":1}');
+  });
+  it('keeps JSON-encoded text parseable when it redacts inside it', () => {
+    const text = JSON.stringify({ error: 'x --settings {"env":{"A":"opaque1"}} y', inner: 'z {"env":{"A":"opaque1"}}' });
+    const out = redactSpawnText(text, { env: {} });
+    expect(out).not.toContain('opaque1');
+    expect(() => JSON.parse(out)).not.toThrow();
+  });
+  it('redacts credential-named values in shell, JSON, header and URL forms', () => {
+    const out = redactSpawnText([
+      'GH_TOKEN=opaque1', 'export ANTHROPIC_API_KEY=opaque2', '{"api_key":"opa\\"que3"}', 'Authorization: Basic opaque4',
+      'https://u:opaque5@host/x', 'password: opaque6', 'KEY_ID=opaque7',
+    ].join(' '), { env: {} });
+    expect(out).not.toMatch(/opaque|que3/);
+  });
+  it("redacts the literal value of this process's own credential-named env vars", () => {
+    expect(redactSpawnText('child said: s3cretValue!!', { env: { SOME_SECRET: 's3cretValue!!' } })).toBe('child said: <redacted-env>');
+  });
+  it('covers the flag, URL-username, deep-escape, env-array and shell-quoting variants', () => {
+    const out = redactSpawnText([
+      '{"Authorization":"Basic opaque1"}', 'AUTHORIZATION=opaque2', '--token opaque3 --verbose', 'https://opaque4@github.com/o/r',
+      '\\\\\\"GH_TOKEN\\\\\\":\\\\\\"opaque5\\\\\\"', '\\"GH_TOKEN\\":\\"x\\\\\\"opaque6\\"', '"env":[{"name":"FOO","value":"opaque7"}]',
+      '{"name":"GH_TOKEN","value":"opaque8"}', 'A_TOKEN=`x opaque9`', "B_TOKEN=$'x opaqueA'", "C_TOKEN='it'\\''s opaqueB'",
+    ].join('\n'), { env: {} });
+    expect(out).not.toMatch(/opaque/);
+    expect(out).toContain('--verbose');
+  });
+  it('redacts a whole credential header value, every cookie included, without eating a JSON string close', () => {
+    expect(redactSpawnText('request failed; Cookie: theme=light; session=opaque1', { env: {} })).toBe('request failed; Cookie: <redacted>');
+    expect(redactSpawnText("curl -H 'Set-Cookie: sid=opaque2; Path=/' https://h", { env: {} })).toBe("curl -H 'Set-Cookie: <redacted>' https://h");
+    const json = JSON.stringify({ error: 'x Cookie: a=1; s=opaque3\nnext', ok: 1 });
+    const out = redactSpawnText(json, { env: {} });
+    expect(out).not.toContain('opaque3');
+    expect(JSON.parse(out)).toEqual({ error: 'x Cookie: <redacted>\nnext', ok: 1 });
+  });
+  it('redacts every cookie-list form: quoted values, flags, env, curl -b, folding, arrays, escapes, URL encoding', () => {
+    const q = "'";
+    const inputs = ['Cookie: a="1"; s=opaque1', JSON.stringify({ e: 'Cookie: a="1"; s=opaque2', ok: 1 }), 'curl --cookie a=1;s=opaque3 https://h',
+      'COOKIE=a=1;s=opaque4 next', `curl -sS -b ${q}a=1; s=opaque5${q} https://h`, `${q}Cookie: a=1; it${q}\\${q}${q}s=opaque6${q}`,
+      'Cookie: a=1;\r\n  s=opaque7\r\nnext: ok', JSON.stringify([['Cookie', 'a=1; s=opaque8']]), JSON.stringify({ e: 'Cookie: a=1\\; s=opaque9' }),
+      'GET /x?h=Cookie%3Aa%3D1%3B%20s%3DopaqueA&z=1', JSON.stringify(['claude', '--token', 'opaqueB', '--model', 'x'])];
+    for (const text of inputs) {
+      const out = redactSpawnText(text, { env: {} });
+      expect(out).not.toContain('opaque');
+      if (/^[[{]/.test(text)) expect(() => JSON.parse(out)).not.toThrow();
+    }
+    for (const text of ['COOKIE=a=1; s=opaqueC next', `curl -b${q}a=1; s=opaqueD${q} https://h`, 'x-api-key: "opaqueE"',
+      JSON.stringify({ e: 'x-api-key: "opaqueF"', ok: 1 }), 'Authorization: Bearer "opaqueG" x']) {
+      const out = redactSpawnText(text, { env: {} });
+      expect(out).not.toContain('opaque');
+      if (/^[[{]/.test(text)) expect(() => JSON.parse(out)).not.toThrow();
+    }
+    // A header value ending in a space never reads its JSON string's closing quote as an opening one.
+    expect(redactSpawnText('{"e":"Cookie: a ","ok":1}', { env: {} })).toBe('{"e":"Cookie: <redacted>","ok":1}');
+    expect(redactSpawnText('the cookie consent banner', { env: {} })).toBe('the cookie consent banner');
+    expect(redactSpawnText('["gh","auth","login"]', { env: {} })).toBe('["gh","auth","login"]');
+    expect(redactSpawnText('git checkout -b lane/x failed', { env: {} })).toBe('git checkout -b lane/x failed');
+    expect(redactSpawnText(JSON.stringify({ e: 'x', ok: 1, list: ['a', 'b'] }), { env: {} })).toBe('{"e":"x","ok":1,"list":["a","b"]}');
+  });
+  it('never ends a value early at a length bound, a quoted part or a container (PR #5472 round 5)', () => {
+    const inputs = [`Cookie: sid="${'opaque1'.padEnd(257, 'x')}"`, JSON.stringify({ e: `Cookie: sid="${'opaque2'.padEnd(300, 'x')}"`, ok: 1 }),
+      'Authorization: Digest username="bob", qop="auth,auth-int", response="opaque3"', 'Cookie: sid="a,opaque4"',
+      '{"Authorization":["Basic opaque5"],"ok":1}', '{"GH_TOKEN":{"v":"opaque6"},"ok":1}', JSON.stringify({ e: '{"GH_TOKEN":["opaque7"]}', ok: 1 }),
+      '{"name":"GH_TOKEN","value":["opaque8"]}', '["--token",["opaque9"]]', `GH_TOKEN=''"opaqueA" node x`, 'GH_TOKEN=a"opaqueB" node x',
+      'GH_TOKEN="a""opaqueC" node x', 'GH_TOKEN=$"opaqueD" node x', `--token ''"opaqueE" x`, JSON.stringify({ e: 'GH_TOKEN="opaqueF" node', ok: 1 })];
+    for (const text of inputs) {
+      const out = redactSpawnText(text, { env: {} });
+      expect(out).not.toContain('opaque');
+      if (/^[[{]/.test(text)) expect(() => JSON.parse(out)).not.toThrow();
+    }
+    expect(redactSpawnText(`GH_TOKEN=''"opaque1" node x`, { env: {} })).toBe('GH_TOKEN=<redacted> node x');
+    expect(redactSpawnText('{"Authorization":["Basic opaque1"],"ok":1}', { env: {} })).toBe('{"Authorization":"<redacted-env>","ok":1}');
+    // Self-review siblings: single-quoted headers, the other length bounds, a mid-value quote, more key forms.
+    for (const text of ["headers: { authorization: 'Basic opaque1' }", "{ Authorization: [ 'Basic opaque2' ] }", "Cookie: sid='opaque3'",
+      `COOKIE=${'a'.repeat(4100)}opaque4`, `--cookie ${'a'.repeat(4100)}opaque5`, `Cookie%3A${'a'.repeat(4100)}opaque6`,
+      `https://${'S'.repeat(257)}opaque7@github.com/x`, `curl ${'x'.repeat(300)} -b sid=opaque8`, 'Cookie: sid=ab"opaque9 rest',
+      "{'GH_TOKEN': 'opaqueA'}", '[["Api-Key","opaqueB"]]', '[["PRIVATE-TOKEN","opaqueC"]]', "{ GH_TOKEN: [ 'opaqueD' ] }",
+      JSON.stringify({ e: 'COOKIE=a="opaqueE"', ok: 1 })]) {
+      expect(redactSpawnText(text, { env: {} })).not.toContain('opaque');
+    }
+    // A quote that does not open a value part never swallows the next line, or a JSON string's own close.
+    for (const text of ['time=1 msg="login failed token=abc" err=401\nWorkspace not trusted', 'error: password=abc" rejected\nWorkspace not trusted',
+      'Error: "--token abc" invalid\nWorkspace not trusted']) {
+      expect(redactSpawnText(text, { env: {} })).toMatch(/<redacted>.*\nWorkspace not trusted$/);
+    }
+    for (const text of ['{"error":"token=abc\\" is bad","code":1}', '{"e":"Cookie: a=\\"x","ok":"Workspace not trusted"}',
+      '[{"e":"Authorization: x \\"y"},{"ok":"Workspace not trusted"}]']) {
+      expect(() => JSON.parse(redactSpawnText(text, { env: {} }))).not.toThrow();
+    }
+    // A quote that closes the surrounding JSON string still ends the value.
+    expect(redactSpawnText('{"e":"GH_TOKEN=abc","ok":"1 2"}', { env: {} })).toBe('{"e":"GH_TOKEN=<redacted>","ok":"1 2"}');
+    expect(redactSpawnText('{"e":"Cookie: a=1","ok":"x y"}', { env: {} })).toBe('{"e":"Cookie: <redacted>","ok":"x y"}');
+  });
+  it('keeps the key it redacts, and leaves effect keys and token counts alone', () => {
+    expect(redactSpawnText('{"GH_TOKEN":"opaque1","key":"dispatch:3794","input_tokens":55}', { env: {} }))
+      .toBe('{"GH_TOKEN":"<redacted-env>","key":"dispatch:3794","input_tokens":55}');
+    expect(redactSpawnText('"env":["GH_TOKEN=x"],"next":1', { env: {} })).toBe('"env":"<redacted>","next":1');
+  });
+  it('stays linear on long adversarial text', () => {
+    const started = Date.now();
+    for (const text of ['a.'.repeat(100000), 'a='.repeat(100000), 'a://'.repeat(50000), '"a":'.repeat(50000), '--settings {"'.repeat(20000),
+      ' '.repeat(300000), ' -b'.repeat(100000), 'cookie '.repeat(45000), 'Cookie: ="'.repeat(30000), 'Cookie: =\\\\"'.repeat(30000),
+      `Cookie: ${'a=" '.repeat(30000)}`, `GH_TOKEN=${'\\\\"x '.repeat(30000)}`, `GH_TOKEN=${'a"'.repeat(50000)}`, `${'x Cookie: '.repeat(20000)}"`,
+      `{"GH_TOKEN":${'['.repeat(50000)}`, `GH_TOKEN=${'\\'.repeat(200000)}`, `--token ${'\\'.repeat(200000)}`, `Cookie: ${'\\'.repeat(200000)}"`,
+      `COOKIE=${'\\'.repeat(200000)}"x`, `curl -b${' -b'.repeat(100000)}`, `Cookie: ${'a"'.repeat(100000)}`]) {
+      redactSpawnText(text, { env: {} });
+    }
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+  it('still reaches a credential that follows a non-credential name', () => {
+    expect(redactSpawnText('Command failed: GH_TOKEN=opaque1 claude', { env: {} })).toBe('Command failed: GH_TOKEN=<redacted> claude');
+  });
+  it('leaves ordinary words alone', () => {
+    const text = 'author: me, keyboard monkey; session name "fix-3794" is already in use';
+    expect(redactSpawnText(text, { env: {} })).toBe(text);
+  });
 });
