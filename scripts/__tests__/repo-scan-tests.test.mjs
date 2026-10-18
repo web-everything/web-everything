@@ -21,13 +21,20 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const MULTI = 'scripts/__tests__/multi-repo-checks.test.mjs';
 
 describe('selectScanTests', () => {
+  it.each(['mjs', 'cjs', 'js', 'mts', 'cts', 'ts', 'sh', 'bash', 'py'])('ruling-label reference guard covers new production .%s scripts', ext => {
+    const { full } = selectScanTests({ changedFiles: [`scripts/new-writer.${ext}`] });
+    expect(full.map(e => e.test)).toContain('scripts/conveyor/__tests__/pr-label-mirror.test.mjs');
+  });
   it('a changed file inside a scanner reach selects it, scoped to that file', () => {
     const { scoped, full, scopedFiles } = selectScanTests({ changedFiles: ['scripts/lib/new-thing.mjs'] });
     expect(scoped.map((e) => e.test)).toContain(MULTI);
     expect(scopedFiles).toEqual(['scripts/lib/new-thing.mjs']);
-    // review-policy.conformance and the permission-change sandbox-list pin cannot be scoped: they run FULL, but only
-    // because a source file changed.
-    expect(full.map((e) => e.scope)).toEqual(['full', 'full']);
+    // The sole-writer, review-policy, and sandbox-list guards derive whole-tree facts.
+    expect(full.map((e) => [e.test, e.scope])).toEqual([
+      ['scripts/conveyor/__tests__/pr-label-mirror.test.mjs', 'full'],
+      ['scripts/lib/__tests__/review-policy.conformance.test.mjs', 'full'],
+      ['scripts/lib/__tests__/permission-change.test.mjs', 'full'],
+    ]);
   });
 
   it('a docs-only or backlog-only change runs no scanner (cost stays zero)', () => {
