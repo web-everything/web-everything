@@ -12,7 +12,7 @@ tags: []
 # Prevention — Add a deterministic filer validation that flags scope copied solely from a source-card citation a… (from web-everything/web-everything#5556 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/xrv2a0x-prevention-a-filer-self-check-that-each-card-cited-as-record.md:6` — Add a deterministic filer validation that flags scope copied solely from a source-card citation and requires an explicit implementation target or an unresolved-scope marker before preparation.
+1. `we:backlog/6276-prevention-a-filer-self-check-that-each-card-cited-as-record.md:6` — Add a deterministic filer validation that flags scope copied solely from a source-card citation and requires an explicit implementation target or an unresolved-scope marker before preparation.
 
 Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 1 → #5360.
 
