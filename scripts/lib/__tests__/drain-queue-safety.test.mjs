@@ -86,6 +86,21 @@ describe('operator ruling at the round cap', () => {
     expect(hold({ comments: [old, newer, named, accept(head, true)] })).toMatch(/requiring send-back/);
     expect(hold({ comments: [old, newer, { ...named, body: redTeamGateMarker(5283, head, 'round-cap', redTeamResultId(parseRedTeamComment(newer.body))) }, accept(head, true)] })).toBeNull();
   });
+  it('two raced gate runs (sent-back and round-cap on one result): the cap wins and the ruling releases it', () => {
+    const result = clean(head, 'web-everything', broken);
+    const sent = { ...bot, body: `${redTeamGateMarker(5283, head, 'sent-back')}\n- 1 confirmed break(s) sent back to the fixer (#1).` };
+    expect(hold({ comments: [result, gate(head, 'round-cap'), sent] })).toMatch(/requiring send-back/);
+    expect(hold({ comments: [result, gate(head, 'round-cap'), sent, accept(head, true)] })).toBeNull();
+  });
+  it('a carry hop applies prior-head decisions only when the prior result is the one carried', () => {
+    const findings = [{ ...broken[0], impactIfUnfixed: 'degraded' }, { ...broken[0], summary: 'carried break' }];
+    const priorOther = clean(prior, 'web-everything', [broken[0], { ...broken[0], summary: 'another break' }]);
+    const advisory = { ...bot, body: `${redTeamGateMarker(5283, prior, 'card-queued')}\n- 2 finding(s) left advisory (#1, #2).` };
+    expect(hold({ comments: [clean(prior, 'web-everything', findings), advisory, restamp(head), carry({ findings, gates: ['card-queued'] })] })).toBeNull();
+    expect(hold({ comments: [priorOther, advisory, restamp(head), carry({ findings, gates: ['card-queued'] })] })).toMatch(/requiring send-back/);
+    const ruled = [priorOther, gate(prior, 'round-cap'), accept(prior, true), restamp(head), carry({ findings, gates: ['round-cap'] })];
+    expect(hold({ comments: ruled })).toMatch(/requiring send-back/);
+  });
   it('a ruling on the prior head survives a proven carry (restamped clearance, carried round-cap and result)', () => {
     const ruledOnPrior = [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true)];
     expect(hold({ comments: [...ruledOnPrior, restamp(head), carry({ findings: broken, gates: ['round-cap'] })] })).toBeNull();

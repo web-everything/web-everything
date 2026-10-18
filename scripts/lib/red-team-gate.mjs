@@ -80,10 +80,14 @@ export function parseRedTeamComment(body) {
 
 /**
  * The id a gate record names its result by: a digest of the parsed findings, not of the head, so a result carried
- * across an identical contribution keeps its id. Two results with identical findings share one decision. PURE.
+ * across an identical contribution keeps its id. Two results with identical findings share one decision. It hashes a
+ * fixed, versioned list of fields, so adding a parser field never silently re-keys every recorded decision. PURE.
  */
+const RESULT_ID_FIELDS = ['index', 'confirmed', 'recheckOutcome', 'category', 'impact', 'file', 'line', 'summary', 'scenario', 'recheck'];
 export function redTeamResultId(parsed) {
-  return parsed ? createHash('sha256').update(JSON.stringify(parsed.findings ?? [])).digest('hex').slice(0, 16) : null;
+  if (!parsed) return null;
+  const findings = (parsed.findings ?? []).map(f => RESULT_ID_FIELDS.map(k => f?.[k] ?? null));
+  return createHash('sha256').update(JSON.stringify(['v1', findings])).digest('hex').slice(0, 16);
 }
 
 /**
@@ -288,12 +292,17 @@ function threadRecords(comments) {
 }
 
 const recordBody = r => String((typeof r.c === 'string' ? r.c : r.c?.body) ?? '');
-/** Thread order: creation time when both records carry one, else thread position. PURE. */
-const threadOrder = (a, b) => {
-  const ta = Date.parse(a.c?.createdAt), tb = Date.parse(b.c?.createdAt);
-  return (Number.isFinite(ta) && Number.isFinite(tb) ? ta - tb : 0) || a.i - b.i;
+/** Thread order: creation time, then thread position. A record without a time takes the time of the record before it,
+ * so the key is total (a sort never meets a contradiction). PURE. */
+const threadOrder = (a, b) => a.ts - b.ts || a.i - b.i;
+const indexedRecords = comments => {
+  let ts = 0;
+  return threadRecords(comments).map((r, i) => {
+    const t = Date.parse(r.c?.createdAt);
+    if (Number.isFinite(t)) ts = t;
+    return { ...r, i, ts };
+  });
 };
-const indexedRecords = comments => threadRecords(comments).map((r, i) => ({ ...r, i }));
 
 /** The newest trusted red-team result for this PR and head among the records, or null. PURE. */
 function latestResult(records, pr, sha) {
@@ -343,9 +352,11 @@ function operatorRuled(records, pr, head) {
   if (parseLatestHumanClearedSha(trusted.filter(r => !r.from).map(r => r.c)) !== head) return false;
   const lastAt = (rs, test) => rs.reduce((found, r) => (test(r) ? r : found), null);
   // Each carry removes its own comment and every later record, so even a cyclic head chain terminates.
-  for (let sha = head, rs = trusted; sha && rs.length;) {
+  for (let sha = head, rs = trusted, want = null; sha && rs.length;) {
     const result = latestResult(rs, pr, sha);
-    if (!result) return false;
+    // A carry hop counts only when the prior head's result is the one that was carried (same id).
+    if (!result || (want && redTeamResultId(result.parsed) !== want)) return false;
+    want = redTeamResultId(result.parsed);
     const cap = gateRecordsFor(rs, pr, sha, result).filter(r => r.gate.outcome === GATE_OUTCOMES.ROUND_CAP).sort(threadOrder).at(-1);
     const cleared = lastAt(rs, r => !r.from && CLEAR_HUMAN_RULING_RE.test(recordBody(r).replace(/\r\n/g, '\n').trimStart())
       && parseLatestHumanClearedSha([r.c]) === sha);
@@ -398,9 +409,11 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
   const actions = new Map();
   let legacyHeld = false, liveGates = [];
   // Each carry removes its own comment and every later record, so even a cyclic head chain terminates.
-  for (let sha = live, rs = records, first = true; sha && rs.length; first = false) {
+  for (let sha = live, rs = records, first = true, want = null; sha && rs.length; first = false) {
     const hit = latestResult(rs, pr, sha);
-    if (!hit) break;
+    // A carry hop counts only when the prior head's result is the one that was carried (same id).
+    if (!hit || (want && redTeamResultId(hit.parsed) !== want)) break;
+    want = redTeamResultId(hit.parsed);
     const gates = gateRecordsFor(rs, pr, sha, hit);
     if (first) liveGates = gates;
     const own = new Map();
@@ -420,8 +433,11 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
   const ruled = operatorRuled(records, pr, live);
   const sendBack = [], held = [];
   for (const f of result?.findings ?? []) {
-    const action = actions.get(f.index) ?? (legacyHeld && f.confirmed ? 'held' : null) ?? (plan.sendBack.includes(f)
-      ? outcome === GATE_OUTCOMES.ROUND_CAP ? 'held' : 'send-back' : null);
+    const recorded = actions.get(f.index);
+    // Two raced gate runs can record both send-back and round-cap for one result; the cap wins (sendBackStepOutcome).
+    const action = (recorded === 'send-back' && outcome === GATE_OUTCOMES.ROUND_CAP ? 'held' : recorded)
+      ?? (legacyHeld && f.confirmed ? 'held' : null) ?? (plan.sendBack.includes(f)
+        ? outcome === GATE_OUTCOMES.ROUND_CAP ? 'held' : 'send-back' : null);
     if (action === 'held' && !ruled) held.push(f);
     if (action === 'send-back') sendBack.push(f);
   }
