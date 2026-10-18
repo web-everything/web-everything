@@ -41,3 +41,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5549 (finding 2: `we:backlog/xt96sbx-we-operator-override-slice-3-guard-floor-confirm-and-flag-on.md:15` — Card-lint: each numbered edge-case line that claims handling not 'n/a' must map to a test name in A1.)
