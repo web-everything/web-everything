@@ -226,7 +226,7 @@ describe('dynamic fixer cap', () => {
   it('the throttle admits a fixer above the old static cap when raised, then refuses at the computed cap', () => {
     const claims = Array.from({ length: 8 }, (_, i) => ({ meta: { kind: 'fix', repo: 'we', pr: i + 1 } }));
     const lines = [];
-    const t = createResourceFixThrottle({ listClaims: () => claims, alive: () => true, queueLength: () => 7, readSnap: () => snap({ idle: 45 }), readHeavyWait: () => 5,
+    const t = createResourceFixThrottle({ sendBackReservedSlots: 0, listClaims: () => claims, alive: () => true, queueLength: () => 7, readSnap: () => snap({ idle: 45 }), readHeavyWait: () => 5,
       nowMs: () => NOW, settings: { cutover: 'enforce', fixCap }, gate: () => ({ admit: true, note: 'admit() admitted' }),
       env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '8' }, log: (l) => lines.push(l) });
     expect(t.tryAdmit('fix')).toMatchObject({ admit: true, aboveStaticCap: true });
@@ -242,7 +242,7 @@ describe('dynamic fixer cap', () => {
   it('shadow: the static cap decides; the computed cap is only logged', () => {
     const claims = Array.from({ length: 8 }, (_, i) => ({ meta: { kind: 'fix', repo: 'we', pr: i + 1 } }));
     const lines = [];
-    const t = createResourceFixThrottle({ listClaims: () => claims, alive: () => true, queueLength: 7, readSnap: () => snap({ idle: 45 }), readHeavyWait: () => 5,
+    const t = createResourceFixThrottle({ sendBackReservedSlots: 0, listClaims: () => claims, alive: () => true, queueLength: 7, readSnap: () => snap({ idle: 45 }), readHeavyWait: () => 5,
       nowMs: () => NOW, settings: { cutover: 'shadow', fixCap }, gate: () => ({ admit: true }), env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '8' }, log: (l) => lines.push(l) });
     expect(t.tryAdmit('fix')).toMatchObject({ admit: false, kind: 'fix-cap' });
     expect(lines[0]).toContain('new: cap 10');
@@ -250,7 +250,7 @@ describe('dynamic fixer cap', () => {
   });
   it('a held host gate refuses without counting a slot', () => {
     let calls = 0;
-    const t = createResourceFixThrottle({ listClaims: () => [], queueLength: 0, readSnap: () => snap(), nowMs: () => NOW,
+    const t = createResourceFixThrottle({ sendBackReservedSlots: 0, listClaims: () => [], queueLength: 0, readSnap: () => snap(), nowMs: () => NOW,
       settings: { cutover: 'enforce', fixCap: { ...fixCap, floor: 1, ceiling: 1 } }, log: quiet,
       gate: () => (calls++ === 0 ? { admit: false, kind: 'host-load', why: 'held' } : { admit: true }) });
     expect(t.tryAdmit('fix')).toMatchObject({ admit: false, kind: 'host-load' });

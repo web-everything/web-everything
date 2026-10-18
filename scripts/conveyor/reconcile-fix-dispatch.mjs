@@ -1967,7 +1967,7 @@ export function runReconcileFixDispatch({
   const dispatched = [];
   for (const entry of planned) {
     // fix-cap / host-load — defer BEFORE any claim, resume or lane pop; the PR simply waits for a later pass.
-    const t = dispatchThrottle ? dispatchThrottle.tryAdmit('fix') : { admit: true };
+    const t = dispatchThrottle ? dispatchThrottle.tryAdmit('fix', { sendBack: entry.labels?.includes('review:changes') === true }) : { admit: true };
     if (t.admit && t.note) console.error(`reconcile-fix-dispatch: PR #${entry.pr} fix launch admitted: ${t.note}`);
     // Card 87 — ONLY the fixer cap may be borrowed past (never host-load, never a scope wait: those never get here).
     let borrowed = null;
@@ -1978,7 +1978,9 @@ export function runReconcileFixDispatch({
       console.error(`reconcile-fix-dispatch: PR #${entry.pr} red-main fix admitted past the fixer cap (${t.why}) — mainFixCapacity.pastFixCap=true (source ${mainFixCapacity.source})`);
     }
     if (!t.admit && !pastFixCap) {
-      const b = t.kind === 'fix-cap' && borrowGate ? borrowGate.consider({ repo: repoKey, pr: entry.pr }) : null;
+      // A refusal held only by the send-back reservation never borrows: a borrowed fix claim counts toward the cap, so
+      // it would fill the very slot the reservation keeps free.
+      const b = t.kind === 'fix-cap' && t.reserved !== 'send-back' && borrowGate ? borrowGate.consider({ repo: repoKey, pr: entry.pr }) : null;
       if (!b?.borrow) { refusals.push({ pr: entry.pr, kind: t.kind, why: b?.why && b.why !== 'borrow-off' ? `${t.why}; not borrowing a builder slot: ${b.why}` : t.why }); continue; }
       // A borrowed non-Claude launch skips the router, so any entry the router keeps on Claude (ruling send-back,
       // takeover, red-main fix, round escalation, round 3+) keeps waiting for the fixer cap instead.
