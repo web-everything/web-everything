@@ -41,3 +41,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5528 (finding 3: `we:backlog/xrdwiud-drain-cascade-checks-holds-red-team-overlap-yield-numbering.md:22` — Add a card-lint rule that every Acceptance line must name a repo-qualified test file. Add a review-lens check that each Non-goal 'no change to X' has a regression assertion.)
