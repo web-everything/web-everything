@@ -12,7 +12,7 @@ tags: []
 # Prevention — Add a check:standards or filer post-condition that, for each 'finding N - #M' in a filed card, as… (from web-everything/web-everything#5582 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/xpjqial-prevention-have-the-prevention-filer-pre-fill-a1-with-each-o.md:14` — Add a check:standards or filer post-condition that, for each 'finding N -> #M' in a filed card, asserts card #M's file contains an 'Also raised by <source PR>' line.
+1. `we:backlog/6290-prevention-have-the-prevention-filer-pre-fill-a1-with-each-o.md:14` — Add a check:standards or filer post-condition that, for each 'finding N -> #M' in a filed card, asserts card #M's file contains an 'Also raised by <source PR>' line.
 
 Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 2 → #4763, finding 3 → #5473.
 
