@@ -1,15 +1,16 @@
 ---
+bornAs: x9kvmnd
 kind: story
-size: 3
+size: 2
 status: open
-scope: ["we:scripts/lib/drain-queue-safety.mjs"]
+scope: ["we:scripts/lib/reconcile-core.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Operator ruling channel for red-team round-cap breaks on PRs without review:human
+# Advisory review still runs for an escalated PR with required CI red under startAfter=fast-checks
 
-[A1] Executable. Live case: #5461. clear-human was refused ("no review:human label") so a "card" ruling could not be recorded, and the gate holds forever. Fix: a trusted recorded operator ruling per break (card / not-real / block), which operatorRuled (we:scripts/lib/drain-queue-safety.mjs) accepts beside the clear-human ceremony, plus a new ruling operation. Note: files may be held by #5482; build after.
+[A1] Executable. Priority: expedite. An escalated CI-red PR gets no advisory review under startAfter=fast-checks (we:scripts/lib/reconcile-core.mjs:1536). Scope: we:scripts/lib/reconcile-core.mjs (dispatchReviewRow/dispatchReview/dispatchReviewJob, reviewStartGate) and its tests. Note: build after #5465 lands.
 
 ## Acceptance
 
