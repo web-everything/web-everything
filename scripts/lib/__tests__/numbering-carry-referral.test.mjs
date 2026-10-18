@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readReviewRunEvidence, readReviewRunHeads } from '../../conveyor/review-referral-hold.mjs';
 import { newRunRecord } from '../../operations/run-record.mjs';
-import { writeRun } from '../../operations/run-store.mjs';
+import { resolveRunsDir, writeRun } from '../../operations/run-store.mjs';
 
 const repo = 'web-everything/web-everything', pr = 5505;
 const FROM = '7ae496bef00d2096959b5f6d20cfd0394b976898';
@@ -49,7 +49,7 @@ function replay({ held = false, liveHeld = false, runs = [cleanRun], prove = vi.
     }, setLabels: () => writes.push('labels'), editComment: () => writes.push('withdraw') } });
   return { result, checked, writes, state, prove, guard };
 }
-afterEach(() => { carry._resetNumberingRestampMemo(); vi.restoreAllMocks(); });
+afterEach(() => { carry._resetNumberingRestampMemo(); vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 
 // Keep the real identical-net-patch proof in the replay; only its read-only Git IO is fake.
 function identicalNetPatchReader() {
@@ -152,6 +152,29 @@ describe('numbering carry referral evidence', () => {
       });
     // The shared guard itself, without the re-stamp writer: the typed codes and the #4708 identical-diff carry.
     const guardState = { state: 'OPEN', body: authorBody, labels: ['review:pending'], headRefOid: TO, comments: [record(OLD)] };
+    it.each(Object.keys(live))('default run readers refuse an unfinished %s live-head review through resolveRunsDir', kind => {
+      dir = mkdtempSync(join(tmpdir(), 'numbering-default-readers-'));
+      vi.stubEnv('OPERATION_RUNS_DIR', dir);
+      expect(resolveRunsDir()).toBe(dir);
+      persist('review-pr-prior', FROM, { verdict: 'accept', pendingReferrals: [] }, true);
+      persist('review-pr-live', TO, live[kind], false);
+      // Use both production reader defaults. Identical diffs would otherwise allow carry
+      // from the clean prior review because the evidence projection omits this live run.
+      const readNetDiff = vi.fn(() => ({ scored: true, text: 'same diff' }));
+      expect(() => assertMandatoryReferralsCleared(guardState, {
+        repo, pr, env: {}, cardReadable: () => true, readNetDiff,
+      })).toThrow(expect.objectContaining({ code: 'MANDATORY_REFERRAL_UNFINISHED_REVIEW_RUN' }));
+      expect(readNetDiff).not.toHaveBeenCalled();
+    });
+    it('default run readers carry clean prior evidence when no run reviewed the live head', () => {
+      dir = mkdtempSync(join(tmpdir(), 'numbering-default-readers-'));
+      vi.stubEnv('OPERATION_RUNS_DIR', dir);
+      persist('review-pr-prior', FROM, { verdict: 'accept', pendingReferrals: [] }, true);
+      expect(assertMandatoryReferralsCleared(guardState, {
+        repo, pr, env: {}, cardReadable: () => true,
+        readNetDiff: () => ({ scored: true, text: 'same diff' }),
+      })).toMatchObject({ carry: { fromHead: FROM, toHead: TO, runId: 'review-pr-prior' } });
+    });
     const guardDirect = (readRunHeads, readNetDiff = sha => ({ scored: true, text: 'same diff' })) => {
       try {
         return assertMandatoryReferralsCleared(guardState, { repo, pr, env: {}, cardReadable: () => true, readNetDiff,
@@ -314,10 +337,14 @@ describe('numbering carry referral evidence', () => {
     expect(result).toMatchObject({ action: 'retry', reason: expect.stringContaining('unreadable label recheck'), withdrawn: 1 });
     expect(writes).toEqual(['comment', 'withdraw']);
   });
-  it('accepts clean current-head evidence while still checking the accepted prior head', () => {
-    const { result, checked } = replay({ runs: [cleanRun, { ...cleanRun, head: TO }] });
+  it.each([
+    ['enabled', on, [FROM, TO, FROM, TO, FROM, TO]],
+    ['disabled', off, [TO, TO, TO]],
+  ])('referral evidence %s guards the live head before every write', (_name, setting, expectedHeads) => {
+    const { result, checked, writes } = replay({ setting, runs: [cleanRun, { ...cleanRun, head: TO }] });
     expect(result.action).toBe('restamped');
-    expect(checked).toEqual([FROM, TO, FROM, TO, FROM, TO]);
+    expect(checked).toEqual(expectedHeads);
+    expect(writes).toEqual(['comment', 'labels']);
   });
   it('scopes proof and both referral heads to the planned accepted-head to live-head pair and PR', () => {
     const { result, prove, guard } = replay();
