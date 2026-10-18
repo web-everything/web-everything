@@ -316,9 +316,13 @@ describe('drain ledger facts — wiring: written only after the cascade confirms
   it('is never recorded on the pass-start decision, only inside the land cascade', () => {
     expect(src.match(/recordDrainLedgerFacts\(/g)).toHaveLength(1);
     const helper = src.indexOf('const recordLandedLedgerFacts = async (c, headSha) => {');
-    expect(helper).toBeGreaterThan(src.indexOf('const merged = [];'));
+    expect(helper).toBeGreaterThan(-1);
     expect(src.indexOf('recordDrainLedgerFacts(')).toBeGreaterThan(helper);
+    // The only callers: the cascade's two confirmed-land sites, and the pre-stage shortcut's post-enqueue hook
+    // (`enqueuePrestage` calls `recordLanded` only after `enqueued: true`; drain-prestage.test.mjs pins that).
     expect(src.match(/await recordLandedLedgerFacts\(c, traceHeadSha\)/g)).toHaveLength(2);
+    expect(src.match(/recordLanded: recordLandedLedgerFacts,/g)).toHaveLength(1);
+    expect(src.match(/\brecordLandedLedgerFacts\b/g)).toHaveLength(4);
   });
   it('re-reads the ledger at write time, so a verdict appended mid-cascade is seen before a restamp', () => {
     const helper = src.indexOf('const recordLandedLedgerFacts = async (c, headSha) => {');
