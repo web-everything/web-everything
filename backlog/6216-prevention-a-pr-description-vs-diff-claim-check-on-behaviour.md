@@ -49,3 +49,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5510 (finding 2: `we:backlog/x9jlvy0-a-head-whose-red-team-comment-is-owed-is-not-held-by-the-alr.md:24` — A check:standards rule that fails a card whose Acceptance Must line has no backtick-quoted test name or file reference. File this as a backlog item.)
