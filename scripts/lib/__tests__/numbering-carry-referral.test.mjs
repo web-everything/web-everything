@@ -1,0 +1,323 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import * as carry from '../numbering-carry.mjs';
+import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
+import { mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
+
+const repo = 'web-everything/web-everything', pr = 5505;
+const FROM = '7ae496bef00d2096959b5f6d20cfd0394b976898';
+const TO = '440cd1c4c18c773d1669189862322e9d0153b7b7';
+const OLD = 'a'.repeat(40);
+const authorBody = '<!-- authored-by-actor: author -->';
+const on = { value: true, source: 'test' }, off = { value: false, source: 'test' };
+function record(head) {
+  const original = { summary: 'Earlier finding requires a ruling', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+  const seat = 'judgeCorrectnessAdvisory', runId = `review-pr-${head}`;
+  return { author: { login: 'web-everything' }, body: renderReferralRecord({ version: 1, repo, pr, head, runId,
+    authorBody, reviewer: mandatoryReferralReviewer(runId), attempted: true, rulings: [],
+    referrals: [{ seat, original, finding: normalizeFinding(original), key: referralFindingKey(seat, original) }] }) };
+}
+const acceptance = { id: 'accepted-prior', author: { login: 'chalbert' }, createdAt: '2026-10-17T12:00:00Z',
+  body: `✅ review — accepted\n<!-- reviewed-sha: ${FROM} -->` };
+const cleanRun = { repo, pr, head: FROM, startedAt: 1, completedAt: 2, pending: [], parked: false, persistenceFailed: false };
+function replay({ held = false, liveHeld = false, runs = [cleanRun], prove = vi.fn(() => ({ ok: true, reason: 'verified numbering' })), setting,
+  onRead = () => {}, guardOverride, labelsOnly = false, numberingSetting = on, netPatchSetting = off,
+  human = false, exec, readRuns = () => runs } = {}) {
+  const state = { state: 'OPEN', body: authorBody, labels: ['review:pending'], headRefOid: TO,
+    comments: [record(held ? FROM : OLD), human ? { ...acceptance,
+      body: `${acceptance.body}\n<!-- cleared-human: chalbert -->` } : acceptance] };
+  if (liveHeld) state.comments.unshift(record(TO));
+  if (labelsOnly) state.comments.push({ author: { login: 'chalbert' },
+    body: carry.buildNumberingRestampBody({ fromSha: FROM, toSha: TO, human: false, writer: 'review-daemon' }) });
+  const checked = [], writes = [];
+  const guard = vi.fn((s, context) => {
+    checked.push(s.headRefOid);
+    return assertMandatoryReferralsCleared(s, { ...context, env: {}, cardReadable: () => true,
+      readRuns, readNetDiff: sha => ({ scored: true, text: `diff at ${sha}` }) });
+  });
+  const result = carry.restampAfterNumbering({ repo, pr, state, reviews: [], enabled: true, acceptCarry: 'on',
+    numberingSetting, netPatchSetting, ...(setting ? { referralEvidenceSetting: setting } : {}), prove, exec,
+    guardReferrals: guardOverride ?? guard,
+    readLiveState: () => { onRead(state); return { state, reviews: [] }; },
+    provider: { postComment: (_r, _p, body) => {
+      writes.push('comment'); state.comments.push({ id: 'new', author: { login: 'chalbert' }, body });
+    }, setLabels: () => writes.push('labels'), editComment: () => writes.push('withdraw') } });
+  return { result, checked, writes, state, prove, guard };
+}
+afterEach(() => { carry._resetNumberingRestampMemo(); vi.restoreAllMocks(); });
+
+// Keep the real identical-net-patch proof in the replay; only its read-only Git IO is fake.
+function identicalNetPatchReader() {
+  const patch = 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n';
+  return vi.fn((_cmd, args) => {
+    if (args[0] === 'merge-base') return Buffer.from(OLD);
+    if (args[0] === 'diff') return Buffer.from(patch);
+    if (args[0] === 'patch-id') return Buffer.from(`${'b'.repeat(40)} ${'0'.repeat(40)}\n`);
+    throw Error(`Unexpected git read: ${args.join(' ')}`);
+  });
+}
+
+// Raw git plumbing for the five renamed/re-id'd cards in #5505. Exercise the real proof,
+// including bornAs stamps, rather than trusting a numbering subject or a mocked verdict.
+function cardsOnlyReader() {
+  const pairs = [['xh2rf6g', '6200'], ['xpdw3em', '6201'], ['xeluwak', '6202'], ['xxvode8', '6203'], ['x4pfhf5', '6204']];
+  const blobs = new Map();
+  const zero = '0'.repeat(40);
+  let raw = '';
+  for (const [i, [hash, number]] of pairs.entries()) {
+    const beforeOid = (i * 2 + 1).toString(16).padStart(40, '0');
+    const afterOid = (i * 2 + 2).toString(16).padStart(40, '0');
+    blobs.set(beforeOid, `---\nid: ${hash}\n---\nSee #${hash}.\n`);
+    blobs.set(afterOid, `---\nbornAs: ${hash}\nid: ${number}\n---\nSee #${number}.\n`);
+    raw += `:100644 000000 ${beforeOid} ${zero} D\0backlog/${hash}-card.md\0`;
+    raw += `:000000 100644 ${zero} ${afterOid} A\0backlog/${number}-card.md\0`;
+  }
+  return (_cmd, args) => {
+    let out;
+    if (args[0] === 'cat-file') out = args[1] === 'blob' ? blobs.get(args[2])
+      : args[1] === '-t' ? 'blob' : args[1] === '-s' ? String(Buffer.byteLength(blobs.get(args[2]))) : '';
+    else if (args[0] === 'rev-parse' && args[1] === '--verify' && args[2] === `${FROM}^{commit}`) out = FROM;
+    else if (args[0] === 'rev-list') out = `${TO} ${FROM}\n`;
+    else if (args[0] === 'log') out = `drain: JIT-number ${pairs.map(([h, n]) => `${h}→#${n}`).join(', ')} at land (#2288)\n`;
+    else if (args[0] === 'ls-tree' || args[0] === 'grep') out = '';
+    else if (args[0] === 'diff-tree') out = raw;
+    else throw Error(`Unexpected git read: ${args.join(' ')}`);
+    if (out === undefined) throw Error('Missing blob');
+    return Buffer.from(out);
+  };
+}
+
+describe('numbering carry referral evidence', () => {
+  it.each(['parked', 'pending'])('refuses a %s live-head run without a referral record even when the prior head is clean', status => {
+    const liveRun = { ...cleanRun, head: TO, parked: status === 'parked', pending: status === 'pending' ? ['finding'] : [] };
+    const { result, writes } = replay({ runs: [cleanRun, liveRun] });
+    expect(result).toMatchObject({ action: 'retry', reason: expect.stringContaining('no-current-head-review-evidence') });
+    expect(writes).toEqual([]);
+  });
+  it.each(['parked', 'pending'])('rechecks a %s live-head run that arrives before writing', status => {
+    const runs = [cleanRun];
+    const { result, writes } = replay({ runs, onRead: () => runs.push({ ...cleanRun, head: TO,
+      parked: status === 'parked', pending: status === 'pending' ? ['finding'] : [] }) });
+    expect(result).toMatchObject({ action: 'retry', reason: expect.stringContaining('no-current-head-review-evidence') });
+    expect(writes).toEqual([]);
+  });
+  it.each(['parked', 'pending'])('withdraws the new record if a %s live-head run arrives before labels', status => {
+    const runs = [cleanRun];
+    let reads = 0;
+    const { result, writes } = replay({ runs, onRead: () => { if (++reads === 2) runs.push({ ...cleanRun, head: TO,
+      parked: status === 'parked', pending: status === 'pending' ? ['finding'] : [] }); } });
+    expect(result).toMatchObject({ action: 'retry', withdrawn: 1 });
+    expect(writes).toEqual(['comment', 'withdraw']);
+  });
+  it.each([false, true])('label-only recovery refuses an unfinished live-head run (arrives on recheck: %s)', late => {
+    const liveRun = { ...cleanRun, head: TO, parked: true };
+    const runs = late ? [cleanRun] : [cleanRun, liveRun];
+    const { result, writes } = replay({ runs, labelsOnly: true, onRead: () => runs.push(liveRun) });
+    expect(result.action).toBe('retry');
+    expect(writes).toEqual([]);
+  });
+  it('does not treat a matching error message as proof that no live-head review ran', () => {
+    const { result, writes } = replay({ guardOverride: state => {
+      if (state.headRefOid === TO) throw Error('mandatory referral hold: no-current-head-review-evidence; unrelated refusal');
+    } });
+    expect(result.action).toBe('retry');
+    expect(writes).toEqual([]);
+  });
+  it.each(['parked', 'pending', 'persistenceFailed', 'clean'])('refuses a %s live-head run first observed by the carry evidence read', status => {
+    let reads = 0;
+    const liveRun = { ...cleanRun, head: TO, parked: status === 'parked',
+      pending: status === 'pending' ? ['finding'] : [], persistenceFailed: status === 'persistenceFailed' };
+    // Read 1 checks FROM, read 2 checks TO, read 3 checks whether TO can carry evidence.
+    const { result, checked, writes, guard } = replay({ readRuns: () => ++reads >= 3 ? [cleanRun, liveRun] : [cleanRun] });
+    expect(result.action).toBe('retry');
+    expect(checked).toEqual([FROM, TO]);
+    expect(guard.mock.results.at(-1).value).toMatchObject({ code: 'MANDATORY_REFERRAL_UNFINISHED_REVIEW_RUN' });
+    expect(writes).toEqual([]);
+  });
+  it.each(['unproven', 'disabled'])('identical-net-patch fallback guards only the live head before every write (numbering: %s)', mode => {
+    const exec = identicalNetPatchReader();
+    const prove = vi.fn(() => ({ ok: false, reason: 'not numbering' }));
+    const { result, checked, writes } = replay({ exec, prove, netPatchSetting: on,
+      numberingSetting: mode === 'disabled' ? off : on, human: mode === 'disabled',
+      runs: [cleanRun, { ...cleanRun, head: TO }] });
+    expect(result).toMatchObject({ action: 'restamped', reason: expect.stringContaining('identical git patch-id') });
+    expect(checked).toEqual([TO, TO, TO]);
+    expect(writes).toEqual(['comment', 'labels']);
+    expect(exec.mock.calls.some(([, args]) => args[0] === 'patch-id')).toBe(true);
+    if (mode === 'disabled') expect(prove).not.toHaveBeenCalled();
+  });
+  it.each(['unproven', 'disabled'])('identical-net-patch fallback refuses missing live-head evidence without writes (numbering: %s)', mode => {
+    const { result, checked, writes } = replay({ exec: identicalNetPatchReader(),
+      prove: () => ({ ok: false }), netPatchSetting: on,
+      numberingSetting: mode === 'disabled' ? off : on, human: mode === 'disabled' });
+    expect(result).toMatchObject({ action: 'retry', reason: expect.stringContaining('no-current-head-review-evidence') });
+    expect(checked).toEqual([TO]);
+    expect(writes).toEqual([]);
+  });
+  it.each([1, 2])('identical-net-patch fallback refuses a live-head hold before write %s', holdAt => {
+    let reads = 0;
+    const { result, checked, writes } = replay({ exec: identicalNetPatchReader(),
+      prove: () => ({ ok: false }), netPatchSetting: on, runs: [cleanRun, { ...cleanRun, head: TO }],
+      onRead: state => { if (++reads === holdAt) state.comments.unshift(record(TO)); } });
+    expect(result.action).toBe('retry');
+    expect(checked).toEqual(Array(holdAt + 1).fill(TO));
+    expect(writes).toEqual(holdAt === 1 ? [] : ['comment', 'withdraw']);
+  });
+  it.each([false, true])('refuses a held referral recorded on the new head even when the prior head is clean (labelsOnly: %s)', labelsOnly => {
+    const { result, writes } = replay({ liveHeld: true, labelsOnly });
+    expect(result).toMatchObject({ action: 'retry', reason: expect.stringContaining('mandatory referral hold') });
+    expect(writes).toEqual([]);
+  });
+  it.each([false, true])('rechecks a live-head hold that arrives before writing (labelsOnly: %s)', labelsOnly => {
+    const { result, writes } = replay({ labelsOnly, onRead: state => state.comments.unshift(record(TO)) });
+    expect(result).toMatchObject({ action: 'retry', reason: expect.stringContaining('mandatory referral hold') });
+    expect(writes).toEqual([]);
+  });
+  it('withdraws the new record when a live-head hold arrives before labels', () => {
+    let reads = 0;
+    const { result, writes } = replay({ onRead: state => { if (++reads === 2) state.comments.unshift(record(TO)); } });
+    expect(result).toMatchObject({ action: 'retry', withdrawn: 1 });
+    expect(writes).toEqual(['comment', 'withdraw']);
+  });
+  it('refuses a live-head referral persistence failure', () => {
+    const { result, writes } = replay({ runs: [cleanRun, { ...cleanRun, head: TO, persistenceFailed: true }] });
+    expect(result).toMatchObject({ action: 'retry', reason: expect.stringContaining('referral-persistence-failed') });
+    expect(writes).toEqual([]);
+  });
+  it('rechecks a live-head persistence failure before writing', () => {
+    const runs = [cleanRun];
+    const { result, writes } = replay({ runs, onRead: () => runs.push({ ...cleanRun, head: TO, persistenceFailed: true }) });
+    expect(result).toMatchObject({ action: 'retry', reason: expect.stringContaining('referral-persistence-failed') });
+    expect(writes).toEqual([]);
+  });
+  it.each([1, 2])('does not tolerate live-head guard read failures (live check: %s)', failAt => {
+    let liveChecks = 0;
+    const { result, writes } = replay({ guardOverride: state => {
+      if (state.headRefOid === TO && ++liveChecks === failAt) throw Error('referral evidence unreadable');
+    } });
+    expect(result).toMatchObject({ action: 'retry', reason: 'referral evidence unreadable' });
+    expect(writes).toEqual([]);
+  });
+  it.each([false, true])('refuses an unreadable write-time proof even when current-head referrals clear (labelsOnly: %s)', labelsOnly => {
+    const prove = vi.fn().mockReturnValueOnce({ ok: true, reason: 'numbering' })
+      .mockReturnValue({ ok: false, retryable: true, reason: 'unreadable recheck' });
+    const { result, writes } = replay({ prove, labelsOnly, guardOverride: () => {} });
+    expect(result).toMatchObject({ action: 'retry', reason: expect.stringContaining('unreadable recheck') });
+    expect(writes).toEqual([]);
+  });
+  it.each(['refused', 'thrown'])('refuses a %s write-time proof independently of a clearing referral guard', failure => {
+    const prove = vi.fn().mockReturnValueOnce({ ok: true, reason: 'numbering' }).mockImplementation(() => {
+      if (failure === 'thrown') throw Error('unreadable recheck');
+      return { ok: false, reason: 'numbering no longer proven' };
+    });
+    const { result, writes } = replay({ prove, guardOverride: () => {} });
+    expect(result.action).toBe('retry');
+    expect(writes).toEqual([]);
+  });
+  it('withdraws the new record if the proof becomes unreadable before labels even when referrals clear', () => {
+    const prove = vi.fn().mockReturnValueOnce({ ok: true, reason: 'numbering' })
+      .mockReturnValueOnce({ ok: true, reason: 'numbering' })
+      .mockReturnValue({ ok: false, retryable: true, reason: 'unreadable label recheck' });
+    const { result, writes } = replay({ prove, guardOverride: () => {} });
+    expect(result).toMatchObject({ action: 'retry', reason: expect.stringContaining('unreadable label recheck'), withdrawn: 1 });
+    expect(writes).toEqual(['comment', 'withdraw']);
+  });
+  it('accepts clean current-head evidence while still checking the accepted prior head', () => {
+    const { result, checked } = replay({ runs: [cleanRun, { ...cleanRun, head: TO }] });
+    expect(result.action).toBe('restamped');
+    expect(checked).toEqual([FROM, TO, FROM, TO, FROM, TO]);
+  });
+  it('scopes proof and both referral heads to the planned accepted-head to live-head pair and PR', () => {
+    const { result, prove, guard } = replay();
+    expect(result.action).toBe('restamped');
+    expect(prove).toHaveBeenCalledTimes(3);
+    for (const [options] of prove.mock.calls) {
+      expect(options).toEqual({ fromSha: FROM, toSha: TO, exec: expect.any(Function), cwd: undefined });
+    }
+    expect(guard.mock.calls.map(([state, context]) => [state.headRefOid, context]))
+      .toEqual([FROM, TO, FROM, TO, FROM, TO].map(head => [head, { repo, pr }]));
+  });
+  it('re-stamps a proven numbering move using the clean accepted prior head at every write', () => {
+    const { result, checked, writes, state } = replay();
+    expect(result.action).toBe('restamped');
+    expect(checked).toEqual([FROM, TO, FROM, TO, FROM, TO]);
+    expect(writes).toEqual(['comment', 'labels']);
+    expect(state.headRefOid).toBe(TO);
+  });
+  it('still refuses a held referral on the accepted prior head', () => {
+    const { result, checked, writes } = replay({ held: true });
+    expect(result).toMatchObject({ action: 'retry', reason: expect.stringContaining('mandatory referral hold') });
+    expect(checked).toEqual([FROM]);
+    expect(writes).toEqual([]);
+  });
+  it('an unproven move retains the current-head refusal', () => {
+    const { result, checked, writes } = replay({ prove: () => ({ ok: false, reason: 'author edit' }) });
+    expect(result).toMatchObject({ action: 'retry', reason: expect.stringContaining('no-current-head-review-evidence') });
+    expect(checked).toEqual([TO]);
+    expect(writes).toEqual([]);
+  });
+  it('proves and re-stamps the #5505 cards-only rename and re-id shape', () => {
+    const prove = options => carry.proveNumberingOnlyMove({ ...options, exec: cardsOnlyReader() });
+    expect(prove({ fromSha: FROM, toSha: TO })).toMatchObject({ ok: true, pairs: expect.arrayContaining([['xh2rf6g', '6200']]) });
+    expect(replay({ prove }).result.action).toBe('restamped');
+  });
+  it('setting off restores the old current-head refusal', () => {
+    const prove = vi.fn(() => ({ ok: true }));
+    const { result, checked, writes } = replay({ prove, setting: off });
+    expect(result.reason).toContain('no-current-head-review-evidence');
+    expect(checked).toEqual([TO]);
+    expect(prove).not.toHaveBeenCalled();
+    expect(writes).toEqual([]);
+  });
+  it('rechecks a referral that becomes held before writing', () => {
+    const { result, checked, writes } = replay({ onRead: state => state.comments.unshift(record(FROM)) });
+    expect(result).toMatchObject({ action: 'retry', reason: expect.stringContaining('mandatory referral hold') });
+    expect(checked).toEqual([FROM, TO, FROM]);
+    expect(writes).toEqual([]);
+  });
+  it('re-proves the move before writing and falls back to the live-head guard on a read failure', () => {
+    const prove = vi.fn().mockReturnValueOnce({ ok: true, reason: 'numbering' })
+      .mockReturnValue({ ok: false, retryable: true, reason: 'unreadable recheck' });
+    const { result, checked, writes } = replay({ prove });
+    expect(result.reason).toContain('no-current-head-review-evidence');
+    expect(checked).toEqual([FROM, TO, TO]);
+    expect(writes).toEqual([]);
+  });
+  it('still returns the original proof refusal if the live-head referral guard clears an unproven move', () => {
+    const checked = [];
+    const { result, writes } = replay({ prove: () => ({ ok: false, reason: 'non-numbering edit' }),
+      guardOverride: state => checked.push(state.headRefOid) });
+    expect(result).toEqual({ action: 'refused', reason: 'non-numbering edit' });
+    expect(checked).toEqual([TO]);
+    expect(writes).toEqual([]);
+  });
+  it('label-only recovery proves numbering and checks the accepted prior head', () => {
+    const { result, checked, writes } = replay({ labelsOnly: true });
+    expect(result).toMatchObject({ action: 'restamped', labelsOnly: true });
+    expect(checked).toEqual([FROM, TO, FROM, TO]);
+    expect(writes).toEqual(['labels']);
+  });
+  it('fails closed if the proof is unreadable', () => {
+    const { result, checked, writes } = replay({ prove: () => ({ ok: false, retryable: true, reason: 'unreadable' }) });
+    expect(result.reason).toContain('no-current-head-review-evidence');
+    expect(checked).toEqual([TO]);
+    expect(writes).toEqual([]);
+  });
+  it('defaults on and resolves platform, tool and environment provenance', () => {
+    const resolve = carry.resolveNumberingCarryReferralEvidenceSetting;
+    expect(resolve({ env: {}, platform: {}, tool: {} })).toEqual({ value: true, source: 'standard' });
+    expect(resolve({ env: {}, platform: { numberingCarryReferralEvidence: false }, tool: {} }))
+      .toEqual({ value: false, source: 'platform' });
+    expect(resolve({ env: {}, platform: {}, tool: { numberingCarryReferralEvidence: false } }))
+      .toEqual({ value: false, source: 'tool' });
+    expect(resolve({ env: { WE_REVIEW_NUMBERING_CARRY_REFERRAL_EVIDENCE: 'off' }, platform: {}, tool: {} }))
+      .toEqual({ value: false, source: 'env' });
+    expect(resolve({ env: { WE_REVIEW_NUMBERING_CARRY_REFERRAL_EVIDENCE: 'invalid' },
+      platform: {}, tool: { numberingCarryReferralEvidence: false } }))
+      .toEqual({ value: false, source: 'tool' });
+  });
+  it('logs the setting and its source', () => {
+    const log = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    replay({ setting: { value: true, source: 'provenance-test' } });
+    expect(log.mock.calls.flat().join('')).toContain('review.numberingCarryReferralEvidence=true (provenance-test)');
+  });
+});

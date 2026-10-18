@@ -2536,13 +2536,19 @@ export function assertMandatoryReferralsCleared(state, { repo, pr, cardReadable 
       // #4708 — a head move that changed nothing (the drain's rebase; strict net diff byte-identical) carries the
       // latest earlier head's completed CLEAN review as this head's evidence. Not a pass: that head's own verdict is
       // re-evaluated live (its records, rulings and persistence check), so a hold standing on it still refuses.
-      const carried = carry ? referralEvidenceCarry({ runs: readRuns(), repo, pr, head, readNetDiff }) : null;
+      const carryRuns = carry ? readRuns() : [];
+      const carried = carry ? referralEvidenceCarry({ runs: carryRuns, repo, pr, head, readNetDiff }) : null;
       if (carried) {
         const verdict = assertMandatoryReferralsCleared({ ...state, headRefOid: carried.fromHead },
           { repo, pr, cardReadable, env, readRuns, readNetDiff, carry: false });
         return { ...verdict, carry: carried };
       }
-      throw new Error(`mandatory referral hold: no-current-head-review-evidence; no readable referral record or completed clean review for current head ${head}, and earlier heads still hold ${[...new Set(held)].join(', ')}; review the current head before acceptance`);
+      // Numbering may supply evidence only for a head nobody reviewed. A parked or
+      // pending run shares this message, but must never be overridden by that carry.
+      throw Object.assign(new Error(`mandatory referral hold: no-current-head-review-evidence; no readable referral record or completed clean review for current head ${head}, and earlier heads still hold ${[...new Set(held)].join(', ')}; review the current head before acceptance`), {
+        // A run may have appeared on the carry's fresh read after `last` was read.
+        code: last || carryRuns.some(mine) ? 'MANDATORY_REFERRAL_UNFINISHED_REVIEW_RUN' : 'MANDATORY_REFERRAL_NO_REVIEW_RUN',
+      });
     }
   }
   if (result.pending.length || result.blocked.length) {
