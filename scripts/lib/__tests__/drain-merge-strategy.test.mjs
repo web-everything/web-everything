@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,6 +11,7 @@ import {
 } from '../drain-merge-strategy.mjs';
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 import { rulesetSuggestion } from '../merge-queue-enqueue.mjs';
+import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mjs';
 
 const HEAD = 'b'.repeat(40);
 const LOCAL = 'web-everything/web-everything';
@@ -576,6 +577,48 @@ describe('merge-ai-prs hook wiring', () => {
 
 
 describe('post-accept red-team enqueue barrier (#5283)', () => {
+  it.each([null, LOCAL])('enqueues a saved clean live-head result without comments (repo=%s)', repo => {
+    const root = mkdtempSync(join(tmpdir(), 'drain-saved-wiring-'));
+    try {
+      const env = { CONVEYOR_STATE_ROOT: root, WE_RED_TEAM_DRAIN_READS_SAVED_RESULT: 'on' };
+      const path = resolveScorecardStorePath(env);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, JSON.stringify({ version: 1, records: [{ dispatchKind: 'review-seat', seat: 'red-team',
+        repo: LOCAL, pr: 5283, rev: HEAD, status: 'ok', seatVerdict: 'accept',
+        recheckStatus: 'ok', confirmedMissCount: 0, findings: [] }] }));
+      const h = harness({ strategy: 'github-merge-queue', env, labels: ['review:accepted', 'ready-to-merge'], liveComments: [] });
+      expect(h.s.enqueue({ num: 5283, repo }, HEAD, { comments: [] })).toMatchObject({ enqueued: true });
+      expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(true);
+      expect(h.state().redTeamPending?.[`${repo ?? 'cwd'}#5283`]).toBeUndefined();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it.each(['pending', 'error', undefined])('persists incomplete saved rechecks and never waives them as unscheduled: %s', recheckStatus => {
+    const root = mkdtempSync(join(tmpdir(), 'drain-incomplete-wiring-'));
+    try {
+      const env = { CONVEYOR_STATE_ROOT: root, WE_RED_TEAM_DRAIN_READS_SAVED_RESULT: 'on' };
+      const path = resolveScorecardStorePath(env);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, JSON.stringify({ version: 1, records: [{ dispatchKind: 'review-seat', seat: 'red-team',
+        repo: LOCAL, pr: 5283, rev: HEAD, status: 'ok', recheckStatus, confirmedMissCount: 1,
+        findings: [{ confirmedByRecheck: true, impactIfUnfixed: 'degraded' }, { confirmedByRecheck: false }] }] }));
+      let clock = 0;
+      const h = harness({ strategy: 'github-merge-queue', env, now: () => clock,
+        labels: ['review:accepted', 'ready-to-merge'], liveComments: [] });
+      expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ kind: 'red-team-pending', healthSmell: false });
+      expect(h.state().redTeamPending['cwd#5283'].reason).toContain('saved red-team re-check incomplete');
+      clock = 46 * 60_000;
+      const next = harness({ strategy: 'github-merge-queue', env, now: () => clock, initial: h.state(),
+        labels: ['review:accepted', 'ready-to-merge'], liveComments: [] });
+      expect(next.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ kind: 'red-team-pending', healthSmell: true });
+      expect(next.logs.join('')).toContain('health smell:');
+      expect(next.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')) || c[2] === 'comment')).toBe(false);
+      // A completed retry on the same head releases the persisted hold at the next allowed probe.
+      writeFileSync(path, JSON.stringify({ version: 1, records: [{ dispatchKind: 'review-seat', seat: 'red-team',
+        repo: LOCAL, pr: 5283, rev: HEAD, status: 'ok', recheckStatus: 'ok', findings: [], confirmedMissCount: 0 }] }));
+      clock = next.state().redTeamPending['cwd#5283'].retryAt;
+      expect(next.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: true });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   it.each([['card-only', { scheduled: true, inFlight: false, recorded: false,
     loopPayload: { findings: { read: { netChangedFiles: ['backlog/123-card.md'] } } } }],
     ['not scheduled', { scheduled: false, inFlight: false, recorded: false, loopPayload: { verdict: { verdict: 'accept' } } }]])('%s enqueues without an owed pass', (_name, evidence) => {

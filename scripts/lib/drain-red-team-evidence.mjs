@@ -5,6 +5,7 @@ import { hostname } from 'node:os';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operations/run-store.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
+import { recordedRedTeamResult } from './drain-saved-red-team.mjs';
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { redTeamEnabled, redTeamOwedFor } from './review-red-team-policy.mjs';
 import { readRedTeamProbes } from './red-team-gate.mjs';
@@ -27,8 +28,8 @@ export function recordRedTeamStatus({ repo, pr, loopPayload, status, result = nu
 export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   runsDir = resolveRunsDir(), list = listRunIds, read = readRun, isAlive = pidAlive, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
   readScorecards = () => readStore({ path: resolveScorecardStorePath(env) }).records } = {}) {
-  const recorded = readScorecards().some(row => row.dispatchKind === 'review-seat' && row.seat === 'red-team'
-    && row.repo === repo && Number(row.pr) === Number(pr) && row.rev === head);
+  const rows = readScorecards();
+  const recorded = recordedRedTeamResult(rows, { repo, pr, head });
   // Runs are immutable in identity but updated in place: choose the latest read of this exact repo/PR/head.
   const latestRun = () => {
     const hits = list(runsDir).filter(id => id.startsWith('review-pr-')).map(id => ({ id, run: read(id, runsDir) }))
@@ -66,11 +67,14 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
         live = !start || !status.pidStart || start === status.pidStart;
       }
     }
+    const resultStatus = typeof status.result === 'string' ? status.result : status.result?.status;
     return { loopPayload: status.loopPayload, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
-      ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error'].includes(status.result), recorded: recorded || status.result === 'ran' };
+      ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error'].includes(resultStatus),
+      recorded: recordedRedTeamResult(rows, { repo, pr, head }, status.result) };
   }
   const loopPayload = latestRun().run;
   // An owing run with no job status yet: only the job's process knows its card-only skip decision, so hold the head
   // (skip off) until that status records it. The never-scheduled deadline still applies if no job ever writes one.
-  return { loopPayload, inFlight: false, scheduled: recorded || owes(loopPayload), recorded, ...(owes(loopPayload) ? { skipCardOnly: false } : {}) };
+  return { loopPayload, inFlight: false, scheduled: recorded || owes(loopPayload),
+    recorded: recorded || recordedRedTeamResult([], { repo, pr, head }, loopPayload?.redTeam), ...(owes(loopPayload) ? { skipCardOnly: false } : {}) };
 }

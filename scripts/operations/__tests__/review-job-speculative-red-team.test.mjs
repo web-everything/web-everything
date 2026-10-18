@@ -120,12 +120,13 @@ describe('runReviewJob under review.speculativeRedTeam', () => {
     const { io } = jobIo({ setting: { enabled }, over: {
       redTeamStatus: row => events.push(row),
       runExtraSeats: () => { expect(events.map(row => row.status)).toEqual(['queued']); return { status: 'ran', seats: [] }; },
-      finishSpeculativeRedTeam: () => { expect(events.map(row => row.status)).toEqual(['queued']); return { status: 'ran' }; },
-      runRedTeam: () => { expect(events.map(row => row.status)).toEqual(['queued']); return { status: 'ran' }; },
+      finishSpeculativeRedTeam: () => { expect(events.map(row => row.status)).toEqual(['queued']); return { status: 'ran', comment: { status: 'posted' } }; },
+      runRedTeam: () => { expect(events.map(row => row.status)).toEqual(['queued']); return { status: 'ran', comment: { status: 'posted' } }; },
     } });
     runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
     expect(events.map(row => row.status)).toEqual(['queued', 'finished']);
     expect(events[0]).toMatchObject({ repo: REPO, pr: 10, loopPayload: { findings: { read: { netBasis: { rev: REV } } } } });
+    expect(events[1]).toMatchObject({ repo: REPO, pr: 10, result: { status: 'ran', comment: 'posted' } });
   });
   it.each([true, false])('holds enqueue at every step from the accept until a result is posted (speculative=%s)', enabled => {
     const root = mkdtempSync(join(tmpdir(), 'review-job-window-'));

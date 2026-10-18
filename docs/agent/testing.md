@@ -72,6 +72,26 @@ Effective values and sources are logged before probes. Card-only detection reuse
 `ci-card-only.mjs#isCardOnlyDiff` on the net changed-file list plus `netRenameSources` (both
 rename and copy sources); unknown/empty destination lists or malformed source lists do not skip.
 Moves into or out of `backlog/` probe whenever either side is code; card-to-card moves still skip.
+The drain uses the same card-only setting and net path rules when deciding whether a pass is owed.
+Scheduler evidence counts as recorded only for a posted result or a saved live-head seat with
+`status: ok` and a parsed `seatVerdict`; `ran` alone and unparseable rows cannot suppress the overdue fallback.
+Confirmed breaks still hold, including on card-only diffs. Regression coverage lives in
+`drain-saved-red-team.test.mjs`.
+Saved findings pass the posted-comment `scrubPublish` detector before the gate publishes a
+send-back comment or follow-up card, checking raw fields and composed output. A refusal
+withholds all finding text and file scope, retaining verdict, break count and routing class.
+Regression coverage: **publishes saved findings that pass the posted-comment secret scrub to
+comments and cards**, **withholds all saved finding text when the secret scrub refuses**,
+and **incomplete saved re-check refuses admission** (pending, error or missing status).
+An incomplete saved re-check is a persisted `red-team-pending` hold, including when its
+confirmed findings only route to cards or advisories. It emits the pending-age health smell
+at the configured deadline and cannot use the never-scheduled fallback. To release it, retry
+the re-check for the same head to completion or publish a usable trusted result on that head;
+a new head requires its own evidence. Confirmed send-back findings still route through the gate.
+The merge-strategy integration tests cover saved clean admission without comments and recovery
+from incomplete evidence. The review-job tests assert that finished status events retain the
+full posted-result summary in both sequential and speculative modes. When threading a new
+argument into an existing call, add an integration test through the caller that depends on it.
 Regression coverage: **includes rename sources before deciding to skip probes**, covering both
 sequential and speculative paths. The speculative fingerprint also includes rename sources.
 Replay derives rename/copy sources from diff headers using the review reader's existing parser;

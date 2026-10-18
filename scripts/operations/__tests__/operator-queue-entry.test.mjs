@@ -129,6 +129,8 @@ describe('operator-queue CLI entry guard', () => {
     expect(result.status, result.stderr).toBe(0);
     const report = JSON.parse(result.stdout);
     expect(report.errors).toContainEqual(expect.stringMatching(/operator send-back check unavailable:.*operator-send-backs\.mjs/));
+    // PR #5551: a missing saved red-team reader is reported, never a silent gap in RULING NEEDED.
+    expect(report.errors).toContainEqual(expect.stringMatching(/saved red-team ruling check unavailable:.*drain-saved-red-team\.mjs/));
     expect(report.ready).toEqual([]);
     expect(report.notReady.map(row => row.number)).toEqual([1, 2]);
     for (const row of report.notReady) {
