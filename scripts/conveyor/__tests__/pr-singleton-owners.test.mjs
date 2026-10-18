@@ -27,12 +27,11 @@ const promote = (p, overrides = {}) => runReconcilePromoteDraftDispatch({ repo,
   provider: { ready: () => { throw new Error('must stay draft'); } }, ...overrides });
 
 describe('PR sweep: named singleton owners', () => {
-  it('#5649: CLEAN + status:ci-red + 0/3 heals gives both planners one CI-heal owner', () => {
+  it('#5649: a red label with no rollup failure cannot dispatch either healer', () => {
     const p = pr(5649, { labels: labels('status:ci-red') });
-    expect(plan(p).dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', prNumber: 5649, attempts: 0 })]);
-    const tick = planCiHealSpawns({ prs: [{ ...p, prNumber: p.number, num: 'cards', ci: 'none' }],
-      launchedNums: ['cards'], retryCap: 3, availableLanes: [27] });
-    expect(tick.spawns).toEqual([expect.objectContaining({ pr: 5649, reason: 'red-ci' })]);
+    expect(plan(p).dispatch.filter(d => d.kind === 'ci-heal')).toEqual([]);
+    expect(planCiHealSpawns({ prs: [{ ...p, prNumber: p.number, num: 'cards', ci: 'none' }],
+      launchedNums: ['cards'], retryCap: 3, availableLanes: [27] }).spawns).toEqual([]);
   });
 
   it.each(['green', 'pending'])('#5649: live %s checks override the old red label in both planners', state => {
@@ -44,8 +43,8 @@ describe('PR sweep: named singleton owners', () => {
   });
 
   it('CI-heal is not owed with 3/3 attempts spent or without red CI', () => {
-    const p = pr(5649, { labels: labels('status:ci-red') });
-    const capped = planCiHealSpawns({ prs: [{ ...p, prNumber: 5649, num: 'cards', ci: 'none' }],
+    const p = pr(5649, { labels: labels('status:ci-red', 'review:human'), statusCheckRollup: [check('FAILURE')] });
+    const capped = planCiHealSpawns({ prs: [{ ...p, prNumber: 5649, num: 'cards', ci: 'fail' }],
       launchedNums: ['cards'], ciHealAttempts: { 5649: 3 }, retryCap: 3, availableLanes: [27] });
     expect(capped.spawns).toEqual([]);
     expect(capped.notes).toEqual([expect.objectContaining({ kind: 'ci-heal-exhausted', attempts: 3 })]);
@@ -55,7 +54,7 @@ describe('PR sweep: named singleton owners', () => {
     expect(exhausted.dispatch).toEqual([]);
     expect(exhausted.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', attempts: 3, cap: 3 }));
     expect(plan(pr(5649)).dispatch).toEqual([]);
-    expect(ciHealOwed({ labels: p.labels, ci: 'unchecked', attempts: 0, cap: 3 })).toBe(true);
+    expect(ciHealOwed({ labels: p.labels, ci: 'unchecked', attempts: 0, cap: 3 })).toBe(false);
     expect(ciHealOwed({ labels: p.labels, ci: 'unchecked', attempts: 3, cap: 3 })).toBe(false);
     expect(ciHealOwed({ labels: [], ci: 'unchecked', attempts: 0, cap: 3 })).toBe(false);
   });

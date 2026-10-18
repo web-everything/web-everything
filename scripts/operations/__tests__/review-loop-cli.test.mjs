@@ -380,7 +380,7 @@ describe('runReviewLoopOnce — property 4, MECHANIZED (#2749 fix, 2026-09-26 sc
     lines: [JSON.stringify({ verdict: { num, rel, kind: 'story', status: 'open' } })],
   });
 
-  it('a paused prevention filer holds the run without an error, acceptance, or false filing receipt', async () => {
+  it('a paused prevention filer holds the run with a non-success exit and no acceptance or false filing receipt', async () => {
     const { declaration, registry } = registryFor({});
     const seen = [];
     const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV, store: createMemoryRunStore(),
@@ -388,7 +388,7 @@ describe('runReviewLoopOnce — property 4, MECHANIZED (#2749 fix, 2026-09-26 sc
       findFiledPrevention: () => null,
       fileItem: async () => ({ code: 0, lines: [JSON.stringify({ skipped: true, reason: 'filing paused' })] }),
     });
-    expect(out.code).toBe(0);
+    expect(out.code).toBe(1);
     expect(out.stopped).toBe('confirm');
     expect(out.run.findings.confirm).not.toBe('accept');
     expect(seen.map(s => s.type)).not.toContain(REVIEW_EFFECTS.LABEL);

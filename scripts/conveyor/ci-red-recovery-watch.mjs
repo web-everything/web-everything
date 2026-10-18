@@ -1298,7 +1298,7 @@ export function sweepMissingRunRecovery({
     requiredContexts: requiredContexts ?? null,
     stalledPartialContexts: pr?.baseRefName === defaultBranch ? defaultBasePartialContexts : stalledPartialContexts,
   }));
-  if (rawCandidates.length && mainRuns === null) {
+  if ((rawCandidates.length || rerequestCandidates.length) && mainRuns === null) {
     try { mainRuns = readMainRuns({ repo, branch: defaultBranch, workflowName: DEFAULT_MAIN_WORKFLOW_NAME }); }
     catch { mainRuns = []; }
   }
@@ -1333,18 +1333,28 @@ export function sweepMissingRunRecovery({
   });
 
   const applied = [];
-  // The targeted path has its OWN per-(repo, PR, head, check) durable budget,
-  // independent of legacy empty-push refusals and ruleset-only PR caps. The helper
-  // reads the pinned workflow: absent jobs go to the conflict/base owner, not a rerun.
+  // Targeted recovery adds its per-head marker guard to the existing shared attempt caps.
   for (const c of rerequestCandidates) {
     const date = readPush({ repo: repoSlug(repo), pr: c.prNumber, head: c.headSha })?.pushedAt
       ?? readHeadCommittedAt(c.headSha, { repo });
-    const overdue = planMissingRunRecoveries({ candidates: [{ ...c, headCommittedAt: date }], now, thresholdMs });
+    const comments = readComments(c.prNumber, { repo });
+    if (!Array.isArray(comments)) {
+      plan.refusals.push({ ...c, kind: 'unknown-thread', why: 'missing-run recovery requires a complete thread' });
+      continue;
+    }
+    const triggerAttemptsForSha = countMissingRunComments(comments, c.headSha, { baseRefName: c.baseRefName, mainRedWindows, mainGreen, defaultBranch });
+    const attempts = countMissingRunComments(comments, null, { defaultBranch });
+    const overdue = planMissingRunRecoveries({ candidates: [{ ...c, headCommittedAt: date, triggerAttemptsForSha }], now, thresholdMs, maxRetriesPerSha });
+    if (attempts >= maxRetriesPerPr) {
+      plan.refusals.push({ ...c, kind: 'missing-run-pr-cap-exhausted', attempts,
+        why: `PR #${c.prNumber} exhausted its shared missing-run recovery cap (${maxRetriesPerPr})` });
+      continue;
+    }
     plan.refusals.push(...overdue.refusals);
     if (!overdue.dispatch.length) continue;
     const d = { ...c, kind: 'recover-missing-check', why: `required check ${c.check} is absent on the stale live head` };
     if (apply) {
-      const result = rerequest(d, { repo: repoSlug(repo), now, policy: rerequestPolicy });
+      const result = rerequest(d, { repo: repoSlug(repo), now, policy: rerequestPolicy, maxRetriesPerSha, maxRetriesPerPr });
       applied.push({ ...d, labelCleared: false, ...result });
     }
     plan.dispatch.push(d);

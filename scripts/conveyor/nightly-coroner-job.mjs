@@ -21,7 +21,7 @@ const SELF = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(SELF), '../..');
 const clocks = new Map();
 const exec = promisify(execFile);
-export const NIGHTLY_DEFAULTS = Object.freeze({ enabled: true, at: '22:17', laneWaitMs: 600000, attempts: 3, retryBackoffMin: 10, deadlineEt: '03:30', alertAfterProbeFailures: 3 });
+export const NIGHTLY_DEFAULTS = Object.freeze({ enabled: true, at: '22:17', laneWaitMs: 600000, attempts: 1, retryBackoffMin: 10, deadlineEt: '03:30', alertAfterProbeFailures: 3 });
 const positiveInt = (v) => Number.isSafeInteger(v) && v > 0;
 const validTime = (v) => typeof v === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(v);
 export function resolveNightlyCoronerSettings({ config = {}, env = process.env, read = readFileSync, log = console.error } = {}) {
@@ -35,7 +35,7 @@ export function resolveNightlyCoronerSettings({ config = {}, env = process.env, 
   if (enabled !== undefined) envValues.enabled = ['1', 'true'].includes(enabled) ? true : ['0', 'false'].includes(enabled) ? false : enabled;
   const out = cascadePolicy('coroner.nightly', { ...tool, ...config.coroner?.nightly }, {
     standard: NIGHTLY_DEFAULTS, platform: platform.prefs.coroner?.nightly ?? {}, envValues,
-    valid: { enabled: (v) => typeof v === 'boolean', at: validTime, laneWaitMs: positiveInt, attempts: positiveInt, retryBackoffMin: positiveInt, deadlineEt: validTime, alertAfterProbeFailures: positiveInt }, env,
+    valid: { enabled: (v) => typeof v === 'boolean', at: validTime, laneWaitMs: positiveInt, attempts: v => positiveInt(v) && v <= NIGHTLY_DEFAULTS.attempts, retryBackoffMin: positiveInt, deadlineEt: validTime, alertAfterProbeFailures: positiveInt }, env,
   });
   log(formatCascadeSourcesLine('coroner.nightly', out));
   return { ...out, errors: [...errors, ...platform.errors, ...out.invalid] };
@@ -103,10 +103,17 @@ export async function runNightlyCoronerJob({ now, config, settings, dir, env = p
   store = createJobStore(daemonJobsDir('nightly-coroner', env)), enqueue = enqueueJob, reattach = reattachTick,
   evict = evictToTrash, codeSha, snapshot, log = console.error, warmGate = {}, statusFeed = feedPath() } = {}) {
   config = { ...NIGHTLY_DEFAULTS, ...config };
+  if (!positiveInt(config.attempts) || config.attempts > NIGHTLY_DEFAULTS.attempts) config.attempts = NIGHTLY_DEFAULTS.attempts;
   mkdirSync(store.dir, { recursive: true });
   const { records, corrupt = [] } = store.list();
   if (corrupt.length) throw new Error(`nightly-coroner: corrupt job records: ${corrupt.join(', ')}`);
   const mine = records.filter((r) => r.job.kind === HEALTH_NIGHTLY_CORONER_KIND.kind);
+  // Persisted jobs from an earlier configuration must not retain a larger retry allowance.
+  for (const record of mine) {
+    if (record.job.maxAttempts !== NIGHTLY_DEFAULTS.attempts) store.update(record.id, current => ({
+      ...current, job: { ...current.job, maxAttempts: NIGHTLY_DEFAULTS.attempts },
+    }));
+  }
   const night = coronerNightDue(now, config);
   const id = night && `nightly-coroner-${night}`;
   let enqueued = null;
@@ -126,9 +133,8 @@ export async function runNightlyCoronerJob({ now, config, settings, dir, env = p
   const current = store.list().records;
   try { evict({ jobsDir: store.dir, referenced: current.filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status)).flatMap((r) => r.job.snapshotKeys ?? []) }); }
   catch (e) { log(`nightly-coroner eviction: ${e.message}`); }
-  // Daily records are a permanent ledger. Only the currently due night owns an active alert;
-  // advancing to the next night closes the previous health episode without deleting its record or feed event.
-  const failures = current.filter((r) => r.job.kind === HEALTH_NIGHTLY_CORONER_KIND.kind && r.input.night === night &&
+  // Unresolved earlier nights remain failures until their records actually succeed.
+  const failures = current.filter((r) => r.job.kind === HEALTH_NIGHTLY_CORONER_KIND.kind &&
     r.job.status !== 'succeeded' && (r.job.status === 'failed' || now >= coronerDeadline(r.input.night, r.input.nightly?.deadlineEt ?? config.deadlineEt)))
     .map((r) => ({ id: r.id, error: r.job.error ?? 'not completed', attempts: r.job.attempts, maxAttempts: r.job.maxAttempts,
       reason: r.job.status === 'failed' ? 'attempts exhausted or launch failed' : 'ET deadline missed' }));

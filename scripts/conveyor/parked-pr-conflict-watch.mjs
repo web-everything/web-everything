@@ -437,7 +437,7 @@ export function attemptMissingCheckBaseRepair(d, { repo, pr, cwd = REPO_ROOT,
 
 /** Same trusted fast-forward plumbing, with a fresh main and a private index for the card path. */
 export function defaultAttemptCardConflictRebase({ pr, repo, cwd = REPO_ROOT, run = gitRun, cardConflictSettings } = {}) {
-  if (!pr?.headRefName || (pr.baseRefName && pr.baseRefName !== 'main')) return { action: 'skip', reason: 'not a main-base PR' };
+  if (!pr?.headRefName?.startsWith('lane/') || pr.baseRefName !== 'main' || !/^[a-f0-9]{40}$/.test(pr.headRefOid ?? '')) return { action: 'skip', reason: 'not a main-base PR' };
   if (repo) {
     const remote = run('git', ['remote', 'get-url', 'origin'], { cwd });
     const expected = repoKeyForSlug(repo);
@@ -446,9 +446,13 @@ export function defaultAttemptCardConflictRebase({ pr, repo, cwd = REPO_ROOT, ru
   }
   const fetched = run('git', ['fetch', 'origin', 'main', pr.headRefName], { cwd });
   if (fetched.status !== 0) return { action: 'error', reason: 'card conflict fetch failed' };
+  const headFetch = run('git', ['fetch', '--no-tags', 'origin', `refs/heads/${pr.headRefName}`], { cwd });
+  const head = headFetch.status === 0 ? run('git', ['rev-parse', 'FETCH_HEAD'], { cwd }) : null;
+  if (head?.status !== 0 || String(head.stdout).trim() !== pr.headRefOid)
+    return { action: 'skip', deferred: true, reason: 'branch moved before recovery' };
   const tmpIndex = join(cwd, '.git', `card-conflict-index-${process.pid}-${randomUUID()}`);
   try {
-    return rebaseDropManifest({ laneRef: pr.headRefName, base: 'origin/main', cwd, run, fetch: false, tmpIndex, cardConflictSettings });
+    return rebaseDropManifest({ laneRef: pr.headRefName, readRef: pr.headRefOid, base: 'origin/main', cwd, run, fetch: false, tmpIndex, cardConflictSettings });
   } finally {
     try { unlinkSync(tmpIndex); } catch { /* private index may not have been created */ }
   }

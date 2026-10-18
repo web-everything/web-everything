@@ -919,11 +919,12 @@ function runReviewArc({
     if (parsed && !loop.timedOut) seatsBox.input = { pr: planned.pr, repo: planned.repo, lanePath, loopPayload: parsed, slug };
     if (seatsBox.panelSeat && seatsBox.input) {
       const seatOut = result({ ...classified, lanePath });
-      io.redTeamStatus?.({ ...seatsBox.input, status: 'running' });
+      const panelAccepted = redTeamOwedFor(seatsBox.input.loopPayload);
+      if (panelAccepted) io.redTeamStatus?.({ ...seatsBox.input, status: 'running' });
       let settled;
       try {
         settled = seatsBox.speculative
-          ? settleSpeculativeRedTeam({ spec: seatsBox.speculative, accepted: true, panelSeat: true,
+          ? settleSpeculativeRedTeam({ spec: seatsBox.speculative, accepted: panelAccepted, panelSeat: true,
               out: seatOut, input: seatsBox.input }, io)
           : { result: { status: 'error', reason: 'panel red-team seat did not start' } };
       } catch (e) { settled = { result: { status: 'error', reason: tail(e?.message ?? e, 300) } }; }
@@ -934,16 +935,16 @@ function runReviewArc({
       const plan = planRedTeamActions({ findings: (redTeam.findings ?? []).map((f, i) => ({
         index: i + 1, confirmed: f.confirmedByRecheck === true, impact: f.impactIfUnfixed,
       })) }, io.confirmedBreaksSetting?.() ?? readConfirmedBreaks().value);
-      if (redTeam.status === 'ran' && typeof io.runRedTeamGate === 'function') {
+      if (panelAccepted && redTeam.status === 'ran' && typeof io.runRedTeamGate === 'function') {
         try { seatsBox.panelResult.redTeamGate = summarizeRedTeamGate(io.runRedTeamGate({ pr: planned.pr, repo: planned.repo })); }
         catch (e) { seatsBox.panelResult.redTeamGate = { status: 'error', reason: tail(e?.message ?? e, 300) }; }
       }
-      if (plan.sendBack.length || seatsBox.panelResult.redTeamGate?.sendBack) {
+      if (panelAccepted && (plan.sendBack.length || seatsBox.panelResult.redTeamGate?.sendBack)) {
         classified = { ...classified, verdict: 'changes', outcome: 'bounced' };
-      } else if (redTeam.status !== 'ran' || !['ok', 'not-needed'].includes(redTeam.recheckStatus)) {
+      } else if (panelAccepted && (redTeam.status !== 'ran' || !['ok', 'not-needed'].includes(redTeam.recheckStatus))) {
         classified = { ...classified, verdict: null, outcome: BLOCKED_ON_INFRA, label: 'panel red-team seat has no complete result' };
       }
-      io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: seatsBox.panelResult.redTeam });
+      if (panelAccepted) io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: seatsBox.panelResult.redTeam });
     }
     return result({ ...classified, lanePath });
   } catch (e) {

@@ -483,7 +483,7 @@ export async function landPreventionCard(input, {
   if (filing.filingEnabled === false) {
     const reason = 'prevention filing paused by prevention.filingEnabled';
     write(`${reason}\n`);
-    return { ok: true, skipped: true, step: 'paused', reason, num: null, rel: null, pr: null, url: null };
+    return { ok: false, skipped: true, step: 'paused', reason, num: null, rel: null, pr: null, url: null };
   }
   // ONE scratch dir per run, created lazily and removed on every exit path (#4317 advisory review, 2026-09-29 —
   // the first cut made a fresh `mkdtempSync` dir for each file and never removed either, leaking two per filing).

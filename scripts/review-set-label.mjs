@@ -953,11 +953,10 @@ export function runApprovalPreventionFiling({
       // Where a landing job that fails after spawning posts its retraction (`fileApprovalPreventionCard`).
       retractTo: { repo, pr, headSha },
     });
-  if (filed.skipped) return; // a deliberate pause is not a filed card or a failed approval
-  if (!filed.ok) {
+  if (filed.skipped || !filed.ok) {
     process.stderr.write(
       `review-set-label: approval-time prevention filing for ${subject} FAILED (the approval above already `
-      + `landed and is UNAFFECTED) — ${filed.error}\n`,
+      + `landed and is UNAFFECTED) — ${filed.error ?? filed.reason}\n`,
     );
     return;
   }

@@ -64,9 +64,10 @@ describe('red team as an adversarial panel seat', () => {
     expect(h.events).not.toContain('discard');
     expect(h.events).not.toContain('cancel');
     expect(out.redTeam).toMatchObject({ status: 'ran' });
-    expect(h.statuses).toContainEqual(expect.objectContaining({ status: 'finished',
+    if (verdict === 'accept') expect(h.statuses).toContainEqual(expect.objectContaining({ status: 'finished',
       loopPayload: expect.objectContaining({ findings: expect.objectContaining({ read: expect.objectContaining({ netBasis: expect.objectContaining({ rev: HEAD }) }) }) }),
       result: expect.objectContaining({ status: 'ran' }) }));
+    else { expect(h.statuses).toEqual([]); expect(h.events).not.toContain('gate'); }
   });
 
   it('panel-seat still starts alongside jurors when the old speculative optimization is off', () => {
@@ -126,7 +127,7 @@ describe('red team as an adversarial panel seat', () => {
 });
 
 describe('panel seat persists through the real speculative completion path', () => {
-  it.each(['accept', 'changes'])('writes scorecard evidence, status and comment marker for a %s review', async verdict => {
+  it.each(['accept', 'changes'])('writes evidence for %s but requires acceptance for effects', async verdict => {
     const rows = [], comments = [], statuses = [];
     let n = 0, ledger;
     const io = {
@@ -147,8 +148,22 @@ describe('panel seat persists through the real speculative completion path', () 
     const out = await finishSpeculativeRedTeam({ pr: 6212, repo: REPO, loopPayload: payload(verdict), pass, env }, io);
     expect(out.status).toBe('ran');
     expect(rows).toContainEqual(expect.objectContaining({ dispatchKind: 'review-seat', seat: 'red-team', repo: REPO, pr: 6212, rev: HEAD, status: 'ok', findings: [] }));
-    expect(statuses).toContainEqual(expect.objectContaining({ status: 'finished', result: 'ran' }));
-    expect(comments).toHaveLength(1);
-    expect(parseRedTeamComment(comments[0].body)).toMatchObject({ pr: 6212, rev: HEAD, findings: [] });
+    if (verdict === 'accept') {
+      expect(statuses).toContainEqual(expect.objectContaining({ status: 'finished', result: 'ran' }));
+      expect(comments).toHaveLength(1);
+      expect(parseRedTeamComment(comments[0].body)).toMatchObject({ pr: 6212, rev: HEAD, findings: [] });
+    } else {
+      expect(statuses).toEqual([]);
+      expect(comments).toEqual([]);
+    }
   });
+});
+
+it.each(['changes', 'needs-human'])('a %s panel result cannot route a red-team send-back', verdict => {
+  const h = job({ verdict, findings: [{ summary: 'confirmed break', confirmedByRecheck: true, impactIfUnfixed: 'broken' }] });
+  const out = runReviewJob({ pr: 6212, repo: REPO, pid: 1 }, h.io);
+  expect(h.events).toContainEqual(['save-seat', HEAD]);
+  expect(h.events).not.toContain('gate');
+  expect(h.statuses).toEqual([]);
+  expect(out.verdict).toBe(verdict);
 });

@@ -1791,7 +1791,7 @@ it.each([
 });
 
 
-it('passes live PR context to paused-review recovery and posts one head-bound re-arm', async () => {
+it('passes live PR context to paused-review recovery and raises without re-arming', async () => {
   const { notifyReferralHold, pausedReviewRearmMarker } = await import('../../../scripts/conveyor/review-referral-hold.mjs');
   const { record, recordComment, H1, repo, BLOCK } = await import('../../../scripts/conveyor/__tests__/ruling-fixtures.mjs');
   const { mkdtempSync, rmSync } = await import('node:fs');
@@ -1809,7 +1809,8 @@ it('passes live PR context to paused-review recovery and posts one head-bound re
       tagRound: vi.fn(), tagStatus: vi.fn(), dispatch: vi.fn(),
       notifyReferral: args => notifyReferralHold({ ...args, dir, post, log: vi.fn(), readPr: () => subject }),
     });
-    expect(post.mock.calls.filter(([body]) => body.includes(pausedReviewRearmMarker(H1)))).toHaveLength(1);
+    expect(post.mock.calls.filter(([body]) => body.includes(pausedReviewRearmMarker(H1)))).toHaveLength(0);
+    expect(post.mock.calls.filter(([body]) => body.includes('Waiting on your ruling'))).toHaveLength(1);
     expect(subject.labels).toEqual([{ name: 'review:human' }]);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

@@ -12,7 +12,6 @@ import { resolveRunsDir, REVIEW_RUN_ID_PREFIX, tryReadRun } from '../operations/
 import { sameRepo, parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
-import { defaultListPrComments } from './pr-comments-list.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
 import { resolveReferralSafetySettings } from '../lib/review-settings.mjs';
@@ -176,6 +175,7 @@ function wakeEvents(pr, run) {
       const r = operatorRuling.record;
       return r && sameRepo(r.repo, run.repo) && r.pr === run.pr && r.head === run.head ? [{ at, kind: 'ruling' }] : [];
     }
+    if (body.includes('<!-- paused-review-auto-rearm:')) return [];
     if (body.startsWith(REARM_COMMENT_MARKER) || body.startsWith('🔁 review — changes requested')) return [{ at, kind: 'fresh' }];
     // An operator reply is a request to reconsider, never authority to clear the human gate.
     return isOperatorAuthored(c) ? [{ at, kind: 'fresh' }] : [];
@@ -230,7 +230,7 @@ function evaluateReferralHold(pr, runs, { repo, now = Date.now(), env = process.
     // Read exactly as the gate reads it (readable-card rule, author stamp, PR body/createdAt): a release the
     // gate would immediately re-park loops the review on every tick, which this hold exists to prevent.
     const live = liveReferralState(pr, { repo, pr: Number(pr.number), cardReadable });
-    if (!live.pending.length && classifyPausedReview(pr, live).action !== 'raise'
+    if (!live.pending.length
       && live.records.some(r => r.head === pr.headRefOid
       && r.repo === repo && r.pr === Number(pr.number))) return { hold: null, released: 'live-release' };
   }
@@ -293,11 +293,11 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
     why, retryAt: null, persistenceFailed: false, exhausted: false };
 }
 
-/** A re-arm request is a fresh wake, never a ruling or clearance. The head-bound receipt lives on the PR. */
+/** Historical auto-rearm receipt, retained for readers; it no longer creates a wake. */
 export const pausedReviewRearmMarker = head => `<!-- paused-review-auto-rearm: ${head} -->`;
 
 /** Pure classification of a paused PR using the gate's live state, including unattempted records and reason holds.
- * A second pause after our one re-arm needs a person even if all finding rulings are already recorded.
+ * Same-head pauses need a person even if all finding rulings are already recorded.
  */
 export function classifyPausedReview(pr, live) {
   if (!sha(pr?.headRefOid)) return { action: 'none', findings: [] };
@@ -311,10 +311,8 @@ export function classifyPausedReview(pr, live) {
   }])).values()];
   if (live.pending.length) return { action: 'raise', findings: pending.length ? pending : all, reasons: live.pendingReasons };
   if (!records.length || !all.length) return { action: 'none', findings: [] };
-  const spent = (pr.comments ?? []).some(c => isTrustedMarkerAuthor(c)
-    && c.body?.trimStart().startsWith(REARM_COMMENT_MARKER)
-    && c.body.includes(pausedReviewRearmMarker(pr.headRefOid)));
-  return { action: spent ? 'raise' : 'rearm', findings: all };
+  // Ruled findings need an explicit operator re-arm; never spend a new same-head window.
+  return { action: 'raise', findings: all };
 }
 
 /** Shared paused-referral report source. The ordinary ledger deliberately filters unattempted records and
@@ -331,15 +329,6 @@ export function pausedReviewRulingNeeded(pr, { repo, readRuns = readReviewRunEvi
     || decideSameHeadHold(pr, runs, { repo }))) return null;
   return { head: pr.headRefOid, since: null,
     findings: decision.findings.map(f => ({ ...f, reason: 'paused-referral' })) };
-}
-
-function readPausedPr({ repo, number }) {
-  // Read the complete thread BEFORE revalidating the head. A failed read never spends or repeats a re-arm.
-  const comments = defaultListPrComments({ repo, number });
-  const state = JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(number), '--repo', repo,
-    '--json', 'number,headRefOid,body,createdAt,labels,state'],
-  { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }));
-  return { ...state, comments };
 }
 
 /** Block-ruled referrals on the PR's CURRENT head, once EVERY referral on it is ruled (none pending): the PR is owed a
@@ -426,7 +415,7 @@ export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), readRu
 /** Reserve before sending: an ambiguous transport failure must not create duplicate comments on every tick.
  * Known pre-send rate-limit failures can retry with bounded backoff; all other failures remain visible locally.
  */
-export function notifyReferralHold({ repo, prNumber, hold, comments = [], pr, readPr = readPausedPr,
+export function notifyReferralHold({ repo, prNumber, hold, comments = [], pr,
   dir = join(dirname(resolveRunsDir()), 'review-referral-notices'), now = Date.now(),
   log = line => console.error(line),
   post = body => execFileSyncThrottled('gh', ['pr', 'comment', String(prNumber), '--repo', repo, '--body', body],
@@ -436,22 +425,6 @@ export function notifyReferralHold({ repo, prNumber, hold, comments = [], pr, re
   if (pr?.headRefOid === hold.head) {
     paused = classifyPausedReview(pr, liveReferralState(pr, { repo, pr: Number(prNumber),
       cardReadable: ref => referralCardReadable(ref, REPO_ROOT) }));
-    if (paused.action === 'rearm') {
-      const fresh = readPr({ repo, number: prNumber });
-      if (fresh.headRefOid !== hold.head || fresh.state === 'CLOSED' || fresh.state === 'MERGED') return;
-      comments = fresh.comments;
-      paused = classifyPausedReview(fresh, liveReferralState(fresh, { repo, pr: Number(prNumber),
-        cardReadable: ref => referralCardReadable(ref, REPO_ROOT) }));
-      if (paused.action === 'rearm') {
-        // The complete PR thread is the sole re-arm receipt. After an ambiguous transport failure, the
-        // next evaluation re-reads it before sending, so a posted marker survives local state loss.
-        post(`${REARM_COMMENT_MARKER}\n\nAll referrals on head ${hold.head} have recorded rulings; requesting one independent review.\n`
-          + '`review:human` is retained; this request does not accept the review.\n\n'
-          + pausedReviewRearmMarker(hold.head));
-        log(`${repo}#${prNumber} paused review auto re-arm head=${hold.head}`);
-        return;
-      }
-    }
   }
   if (hold.kind === 'same-head' && (!paused || paused.action === 'none')) return;
   const marker = `<!-- review-referral-hold: ${hold.episode} -->`;

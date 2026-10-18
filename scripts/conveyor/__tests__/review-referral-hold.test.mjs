@@ -724,34 +724,20 @@ describe('paused review ruling recovery', () => {
       .toMatchObject({ action: 'raise', findings: [{ key, summary: 'broken case' }] });
     expect(decideSameHeadHold(p, [evidence({ attempted: false })], { repo })).not.toBeNull();
   });
-  it('posts exactly one durable re-arm per head, releases the hold, then raises on a second pause', () => {
+  it('all-ruled same-head pauses raise a ruling item without a fresh wake', () => {
     const p = subject(true), post = vi.fn(body => p.comments.push(comment(body, at + 1)));
     const args = { repo, prNumber: p.number, hold: { ...hold(), kind: 'same-head' },
-      pr: p, comments: p.comments, readPr: () => p, dir: temp(), post, log: vi.fn() };
+      pr: p, comments: p.comments, dir: temp(), post, log: vi.fn() };
     notifyReferralHold(args);
     expect(post).toHaveBeenCalledTimes(1);
-    expect(post.mock.calls[0][0]).toContain(REARM_COMMENT_MARKER);
-    expect(post.mock.calls[0][0]).toContain(head);
-    expect(enrichPrsWithReferralHolds([p], { repo, readRuns: () => [evidence()] })[0].referralHold).toBeNull();
-    expect(p.labels).toEqual([{ name: 'review:human' }]);
-    const secondHold = decideSameHeadHold(p, [evidence({ time: at + 120_000 })], { repo });
-    expect(secondHold).not.toBeNull();
-    expect(enrichPrsWithReferralHolds([p], { repo, readRuns: () => [evidence({ time: at + 120_000 })] })[0].referralHold).not.toBeNull();
-    notifyReferralHold({ ...args, hold: secondHold, dir: temp() });
-    expect(post.mock.calls.filter(([body]) => body.startsWith(REARM_COMMENT_MARKER))).toHaveLength(1);
-    expect(classifyPausedReview(p, mandatoryReferralState(p.comments, { repo, pr: p.number, head, body: p.body })))
-      .toMatchObject({ action: 'raise', findings: [{ key }] });
-  });
-  it('fails closed on gate reason tokens, forged markers, and a changed head at the fresh read', () => {
-    const p = subject(true);
-    const live = mandatoryReferralState(p.comments, { repo, pr: p.number, head, body: p.body });
-    expect(classifyPausedReview(p, { ...live, pending: ['author-stamp-missing'], pendingReasons: ['author-stamp-missing'] }).action).toBe('raise');
-    p.comments.push(comment(`${REARM_COMMENT_MARKER}\n<!-- paused-review-auto-rearm: ${head} -->`, at + 1, 'stranger'));
-    expect(classifyPausedReview(p, live).action).toBe('rearm');
-    const post = vi.fn();
-    notifyReferralHold({ repo, prNumber: p.number, pr: p, comments: p.comments, hold: { ...hold(), kind: 'same-head' },
-      readPr: () => ({ ...p, headRefOid: 'b'.repeat(40) }), dir: temp(), post, log: vi.fn() });
-    expect(post).not.toHaveBeenCalled();
+    expect(post.mock.calls[0][0]).not.toContain(REARM_COMMENT_MARKER);
+    expect(post.mock.calls[0][0]).toContain('Waiting on your ruling');
+    expect(decideSameHeadHold(p, [evidence()], { repo })).not.toBeNull();
+    expect(classifyPausedReview(p, mandatoryReferralState(p.comments, { repo, pr: p.number, head, body: p.body })).action).toBe('raise');
+    p.comments.push(comment(`${REARM_COMMENT_MARKER}\n<!-- paused-review-auto-rearm: ${head} -->`, at + 2));
+    expect(decideSameHeadHold(p, [evidence()], { repo })).not.toBeNull();
+    notifyReferralHold({ ...args, dir: temp() });
+    expect(post).toHaveBeenCalledTimes(1);
   });
   it('partly ruled stays paused and raises only the unruled referral', () => {
     const p = subject(true), r = record();

@@ -2679,7 +2679,7 @@ export function planReconcile({
             ? 'ci-heal handed this head to a human, so one advisory AI review runs so the human gets its verdict; it never accepts a review:human PR'
             : 'review holds handed this head to review, so one advisory AI review supplies its verdict; it never accepts a review:human PR' } });
     };
-    const ciRepairOwed = (phase !== 'needs-human' || check.state === 'red')
+    const ciRepairOwed = ['ci-red', 'needs-human'].includes(phase)
       && ciHealOwed({ state: pr.state, labels: pr.labels, ci: check.state, phase });
     if (!(advisoryReviewOnHumanHandoff === 'on' && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) && ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
         && reviewCi.affected.every(row => row.name === 'review-gate')) {

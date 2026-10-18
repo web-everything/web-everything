@@ -88,7 +88,7 @@ export function spawnPreventionLandingJob(input, {
   if (filing.filingEnabled === false) {
     const reason = 'prevention filing paused by prevention.filingEnabled';
     write(`${reason}\n`);
-    return { ok: true, skipped: true, reason, num: null, rel: null, error: null };
+    return { ok: false, skipped: true, reason, num: null, rel: null, error: reason };
   }
   // Resolver failure → `null` (the spawn still goes out, as it did before), never a thrown filing.
   let settingsEnv = null;

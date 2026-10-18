@@ -28,23 +28,23 @@ describe('independent prevention filing pause', () => {
     expect(loadPreventionBatchSettings({ env: {}, read: () => '{}' }))
       .toMatchObject({ filingEnabled: false, sources: { filingEnabled: 'repo' } });
   });
-  it('paused spawn is a non-error no-op, without even resolving credentials', () => {
+  it('paused spawn reports an unmet obligation, without even resolving credentials', () => {
     const spawnDetached = vi.fn(); const resolveSettingsEnv = vi.fn(); const write = vi.fn();
     const result = spawnPreventionLandingJob(input, { spawnDetached, resolveSettingsEnv, loadFilingSettings: paused, write });
-    expect(result).toMatchObject({ ok: true, skipped: true, reason: expect.stringMatching(/paused/) });
+    expect(result).toMatchObject({ ok: false, skipped: true, reason: expect.stringMatching(/paused/) });
     expect(spawnDetached).not.toHaveBeenCalled(); expect(resolveSettingsEnv).not.toHaveBeenCalled();
     expect(write.mock.calls.flat().join('')).toContain('prevention.filingEnabled=false (repo)');
   });
   it('paused detached filer acquires no lane and writes no card/spool/files', async () => {
     const exec = vi.fn(); const writeFile = vi.fn(); const batch = vi.fn(); const write = vi.fn();
     expect(await landPreventionCard(input, { exec, writeFile, batch, write, loadFilingSettings: paused }))
-      .toMatchObject({ ok: true, skipped: true, step: 'paused' });
+      .toMatchObject({ ok: false, skipped: true, step: 'paused' });
     expect(exec).not.toHaveBeenCalled(); expect(writeFile).not.toHaveBeenCalled(); expect(batch).not.toHaveBeenCalled();
     expect(write.mock.calls.flat().join('')).toContain('prevention.filingEnabled=false (repo)');
   });
   it('review-loop adapter preserves skipped state and never claims the card queued', async () => {
-    const result = await fileItemForPreventionViaLandingJob(input, { spawnJob: () => ({ ok: true, skipped: true, reason: 'filing paused' }) });
-    expect(result.code).toBe(0);
+    const result = await fileItemForPreventionViaLandingJob(input, { spawnJob: () => ({ ok: false, skipped: true, reason: 'filing paused' }) });
+    expect(result.code).toBe(1);
     expect(JSON.parse(result.lines[0])).toMatchObject({ skipped: true, reason: 'filing paused' });
     expect(JSON.parse(result.lines[0]).queued).not.toBe(true);
   });
@@ -53,7 +53,7 @@ describe('independent prevention filing pause', () => {
     runApprovalPreventionFiling({ to: 'accepted', repo: 'o/r', pr: 42, headSha: 'a'.repeat(40),
       commentBody: '**Verdict:** ✅ pass — no blocking findings\n- `scripts/a.mjs:1` — an issue\n  - _Prevention (OWED — file it):_ add a guard',
       prComments: [], provider: { postComment }, findFiledApprovalPrevention: () => null,
-      fileApprovalPrevention: () => ({ ok: true, skipped: true, reason: 'filing paused' }) });
+      fileApprovalPrevention: () => ({ ok: false, skipped: true, reason: 'filing paused' }) });
     expect(postComment).not.toHaveBeenCalled();
   });
 });

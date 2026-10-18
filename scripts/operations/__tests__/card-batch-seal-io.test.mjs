@@ -112,7 +112,7 @@ it('adopts a descendant remote head, journals it and verifies the new head befor
     ]);
     expect(exec.mock.calls.slice(0, 6).every(([, , options]) => options.cwd === f.dir)).toBe(true);
     expect(f.calls.findIndex(call => call.includes('verify'))).toBeLessThan(f.calls.findIndex(call => call.includes('ready')));
-    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls.filter(([line]) => line.includes('adopted head'))).toHaveLength(1);
     expect(log).toHaveBeenCalledWith(expect.stringContaining(`${f.state.batchRef}: ${from}→${f.state.headSha}`));
   } finally { log.mockRestore(); }
 });
@@ -337,10 +337,12 @@ it('tick relaunches a batch whose PR exists but whose hold was never confirmed, 
 });
 it('keeps the sealed archive terminal when its job is explicitly retried', async () => {
   const f = fixture({ maxCards: 1 });
-  await publishBatch(f.input, f.opts);
+  const opts = { ...f.opts, gh: async args => args.at(-1) === 'number,state,headRefName'
+    ? JSON.stringify({ number: 9, headRefName: f.state.batchRef, state: 'MERGED' }) : f.exec('gh', args) };
+  await publishBatch(f.input, opts);
   const active = JSON.parse(readFileSync(f.statePath, 'utf8'));
   const archived = readFileSync(active.lastSealedState, 'utf8');
-  expect((await publishBatch({ statePath: active.lastSealedState }, f.opts)).action).toBe('sealed');
+  expect((await publishBatch({ statePath: active.lastSealedState }, opts)).action).toBe('sealed');
   expect(readFileSync(active.lastSealedState, 'utf8')).toBe(archived);
 });
 
@@ -428,11 +430,25 @@ it.each(['MERGED', 'CLOSED'])('does not relaunch or publish an archived terminal
   const f = fixture();
   const archiveDir = join(f.dir, 'sealed'); mkdirSync(archiveDir);
   const archived = join(archiveDir, 'org-repo-1-prevention.json');
-  writeFileSync(archived, JSON.stringify({ ...f.state, sealedAt: '2026-10-18', pr: 272, terminalPrState }));
+  writeFileSync(archived, JSON.stringify({ ...f.state, sealedAt: '2026-10-18', pr: 272, terminalPrState, seal: { step: 'label-on-green' } }));
   writeFileSync(f.statePath, JSON.stringify({ seq: 1, lastSealedState: archived }));
   const spawn = vi.fn(fakeChild);
   expect(await sealDueBatches({ now: 60000, stateDir: f.dir, policy: f.opts.policy, spawn })).toEqual([]);
   expect(spawn).not.toHaveBeenCalled();
-  expect((await publishBatch({ statePath: archived }, f.opts)).action).toBe('sealed');
+  expect((await publishBatch({ statePath: archived }, { ...f.opts, gh: async () => JSON.stringify({
+    number: 272, headRefName: f.state.batchRef, state: terminalPrState,
+  }) })).action).toBe('sealed');
   expect(f.exec).not.toHaveBeenCalled();
+});
+
+it.each(['OPEN', 'wrong-pr', 'incomplete'])('a terminal archive hint still requires a complete seal and a fresh exact terminal PR: %s', async scenario => {
+  const f = fixture();
+  const state = { ...f.state, pr: 272, sealedAt: '2026-10-18', terminalPrState: 'MERGED',
+    seal: { step: scenario === 'incomplete' ? 'ready' : 'label-on-green' } };
+  writeFileSync(f.statePath, JSON.stringify(state));
+  const gh = vi.fn(async () => JSON.stringify({ number: scenario === 'wrong-pr' ? 999 : 272,
+    headRefName: state.batchRef, state: scenario === 'OPEN' ? 'OPEN' : 'MERGED' }));
+  expect(await publishBatch(f.input, { ...f.opts, gh })).toEqual({ action: 'refuse', reason: 'batch-sealed' });
+  expect(f.exec).not.toHaveBeenCalled();
+  expect(gh).toHaveBeenCalledTimes(scenario === 'incomplete' ? 0 : 1);
 });

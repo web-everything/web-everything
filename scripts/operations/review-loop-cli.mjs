@@ -194,10 +194,10 @@ export async function fileItemForPrevention(input, {
  */
 export async function fileItemForPreventionViaLandingJob(input, { spawnJob = spawnPreventionLandingJob } = {}) {
   const filed = spawnJob(input, { sessionPrefix: 'review-loop-prevention' });
+  if (filed.skipped) return { code: 1, lines: [JSON.stringify({ skipped: true, reason: filed.reason })] };
   if (!filed.ok) {
     return { code: 1, lines: [filed.error ?? 'land-prevention-card: unknown spawn failure'] };
   }
-  if (filed.skipped) return { code: 0, lines: [JSON.stringify({ skipped: true, reason: filed.reason })] };
   return {
     code: 0,
     lines: [JSON.stringify({
@@ -773,7 +773,7 @@ export async function runReviewLoopOnce({
 
     if (filedPayload?.skipped) {
       const rendered = renderOutcome({ outcome, json: parsed.control.json, declaration });
-      return { ...rendered, code: 0, lines: parsed.control.json
+      return { ...rendered, code: 1, lines: parsed.control.json
         ? [JSON.stringify({ ...JSON.parse(rendered.lines[0]), preventionFilingPaused: filedPayload.reason })]
         : [...rendered.lines, filedPayload.reason], run: outcome.run, stopped: outcome.stopped };
     }
@@ -870,7 +870,7 @@ export async function runReviewLoopOnce({
     }
     if (filedPayload?.skipped) {
       const rendered = renderOutcome({ outcome, json: parsed.control.json, declaration });
-      return { ...rendered, code: 0, lines: parsed.control.json
+      return { ...rendered, code: 1, lines: parsed.control.json
         ? [JSON.stringify({ ...JSON.parse(rendered.lines[0]), preventionFilingPaused: filedPayload.reason })]
         : [...rendered.lines, filedPayload.reason], run: outcome.run, stopped: outcome.stopped };
     }

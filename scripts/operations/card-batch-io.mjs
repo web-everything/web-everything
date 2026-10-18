@@ -178,7 +178,8 @@ export async function retireTerminalBatch(recorded, input, {
   statePath, stateDir = dirname(statePath), remote = 'origin', gh = defaultGh,
   held: stillHeld, log = line => process.stderr.write(`${line}\n`),
 }) {
-  if (!recorded?.batchRef || !recorded.sealedAt || !recorded.pr
+  if ((!recorded?.sealFailure && recorded?.seal?.step !== 'label-on-green')
+    || !recorded?.batchRef || !recorded.sealedAt || !recorded.pr
     || basename(dirname(statePath)) === 'sealed') return refuse('batch-sealed');
   let status = 'UNREADABLE';
   try {
@@ -187,8 +188,9 @@ export async function retireTerminalBatch(recorded, input, {
       || recorded.repo && recorded.repo !== input.source.repo
       || recorded.kind && recorded.kind !== input.kind
       || recorded.batchRef !== `lane/card-batch-${input.kind}-${recorded.seq}`) throw new Error('invalid batch identity');
-    const view = JSON.parse(await gh(['pr', 'view', String(recorded.pr), '--repo', input.source.repo, '--json', 'state']));
-    if (['OPEN', 'CLOSED', 'MERGED'].includes(view?.state)) status = view.state;
+    const view = JSON.parse(await gh(['pr', 'view', String(recorded.pr), '--repo', input.source.repo, '--json', 'number,state,headRefName']));
+    if (Number(view?.number) === Number(recorded.pr) && view.headRefName === recorded.batchRef
+      && ['OPEN', 'CLOSED', 'MERGED'].includes(view.state)) status = view.state;
     if (!stillHeld()) return refuse('lease-held');
     if (status === 'CLOSED') respoolClosed(recorded, input, stateDir, remote, stillHeld);
     if (status === 'MERGED' || status === 'CLOSED') {

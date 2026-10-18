@@ -9,7 +9,7 @@ import { reviewCiGate } from '../../lib/review-ci-gate.mjs';
 const repo = 'web-everything/web-everything';
 const sha = 'a'.repeat(40);
 const now = Date.parse('2026-10-18T12:00:00Z');
-const d = { prNumber: 5514, headSha: sha, check: 'standards', workflow: 'ci.yml' };
+const d = { headRefName: 'lane/example', prNumber: 5514, headSha: sha, check: 'standards', workflow: 'ci.yml' };
 function fixture() {
   const comments = [];
   let head = sha;
@@ -19,13 +19,13 @@ function fixture() {
     if (args[0] === 'api' && args[1].endsWith('/runs?head_sha=' + sha + '&per_page=100'))
       return JSON.stringify([{ workflow_runs: [{ id: 123, head_sha: sha, path: '.github/workflows/ci.yml', status: 'completed', event: 'pull_request' }] }]);
     if (args[0] === 'api' && args[1].endsWith('/pulls/5514'))
-      return JSON.stringify({ state: 'open', head: { sha: head, ref: 'lane/example', repo: { full_name: repo } }, base: { ref: 'main' } });
+      return JSON.stringify({ state: 'open', mergeable: true, head: { sha: head, ref: 'lane/example', repo: { full_name: repo } }, base: { ref: 'main' } });
     if (args[0] === 'run' && args[1] === 'rerun') return '';
     throw new Error('unexpected request');
   });
   const post = vi.fn((_pr, body) => { comments.push({ body, author: { login: 'chalbert' } }); return true; });
   return { comments, exec, post, move: () => { head = 'b'.repeat(40); },
-    options: { repo, now, exec, readComments: () => comments, postComment: post } };
+    options: { repo, now, exec, checkClaim: () => null, readComments: () => comments, postComment: post } };
 }
 describe('missing required check re-request', () => {
   it('reruns only the matching workflow on the live head, reserving an attempt first; never passes the check', () => {
@@ -197,7 +197,7 @@ describe('missing required check re-request', () => {
     expect(rerequestMissingCheck(d, { ...f.options, policy: { enabled: 'off' } }).reason).toBe('disabled');
     expect(f.exec).not.toHaveBeenCalled(); expect(f.post).not.toHaveBeenCalled();
   });
-  it('budgets are isolated by repo, PR, head and check, and ignore untrusted markers', () => {
+  it('shared recovery counts other checks and ignores untrusted markers', () => {
     const f = fixture();
     rerequestMissingCheck(d, f.options);
     const reservation = f.comments[0];
@@ -207,7 +207,7 @@ describe('missing required check re-request', () => {
       f.comments.push({ ...reservation, body: reservation.body.split('\n')[0] + '\n' + JSON.stringify({ ...record, [key]: value }) });
     }
     f.comments.push({ ...reservation, author: { login: 'untrusted-user' } });
-    expect(rerequestMissingCheck(d, f.options).ok).toBe(true);
+    expect(rerequestMissingCheck(d, f.options)).toMatchObject({ deferred: true, reason: 'attempt-cap' });
   });
   it('the real comment writer reserves through the PR thread before rerunning', () => {
     const f = fixture();
@@ -222,5 +222,45 @@ describe('missing required check re-request', () => {
     expect(resolveMissingRunRerequestSettings({ env: {}, settings: {} })).toMatchObject({ value: { enabled: 'on', cooldownMinutes: 15, maxAttemptsPerHead: 2 }, sources: { enabled: 'standard' } });
     expect(resolveMissingRunRerequestSettings({ env: { WE_MISSING_RUN_REREQUEST: 'off', WE_MISSING_RUN_COOLDOWN_MINUTES: '20' }, settings: { missingRunRerequest: { enabled: 'on', cooldownMinutes: 30 } } }))
       .toMatchObject({ value: { enabled: 'off', cooldownMinutes: 20 }, sources: { enabled: 'env', cooldownMinutes: 'env' } });
+  });
+});
+
+describe('missing-check recovery retains main eligibility and shared budgets', () => {
+  it.each([true, false])('refuses live ineligible PRs before reservation or %s-path mutation', produces => {
+    for (const patch of [p => { p.mergeable = null; }, p => { p.mergeable = false; },
+      p => { p.head.ref = 'feature/example'; }, p => { p.base.ref = 'stack'; }]) {
+      const f = fixture(), repairBase = vi.fn();
+      const exec = (cmd, args, opts) => {
+        if (!produces && args[1]?.includes('/contents/')) return JSON.stringify({ encoding: 'base64', content: Buffer.from('jobs:\n  test: {}\n').toString('base64') });
+        const raw = f.exec(cmd, args, opts);
+        if (!args[1]?.endsWith('/pulls/5514')) return raw;
+        const pr = JSON.parse(raw); patch(pr); return JSON.stringify(pr);
+      };
+      expect(rerequestMissingCheck(d, { ...f.options, exec, repairBase })).toMatchObject({ deferred: true });
+      expect(f.post).not.toHaveBeenCalled(); expect(repairBase).not.toHaveBeenCalled();
+      expect(f.exec.mock.calls.some(([, a]) => a[0] === 'run')).toBe(false);
+    }
+  });
+  it.each([1, 2])('checks live claims at preflight %s', heldOn => {
+    const f = fixture(); let calls = 0;
+    expect(rerequestMissingCheck(d, { ...f.options, checkClaim: () => ++calls >= heldOn ? { message: 'claimed' } : null }))
+      .toMatchObject({ deferred: true });
+    expect(f.exec.mock.calls.some(([, a]) => a[0] === 'run')).toBe(false);
+    expect(f.post).toHaveBeenCalledTimes(heldOn - 1);
+  });
+  it('an exhausted legacy SHA budget prevents targeted recovery before any IO', async () => {
+    const { buildMissingRunComment } = await import('../main-red-recovery.mjs');
+    const f = fixture();
+    f.comments.push(...Array.from({ length: 2 }, () => ({ author: { login: 'chalbert' },
+      body: buildMissingRunComment({ headSha: sha, headRefName: d.headRefName }) })));
+    expect(rerequestMissingCheck(d, { ...f.options, maxRetriesPerSha: 2 })).toMatchObject({ reason: 'attempt-cap' });
+    expect(f.exec).not.toHaveBeenCalled(); expect(f.post).not.toHaveBeenCalled();
+  });
+  it('the PR cap includes legacy attempts on earlier heads', async () => {
+    const { buildMissingRunComment } = await import('../main-red-recovery.mjs');
+    const f = fixture();
+    f.comments.push({ author: { login: 'chalbert' }, body: buildMissingRunComment({ headSha: 'b'.repeat(40) }) });
+    expect(rerequestMissingCheck(d, { ...f.options, maxRetriesPerPr: 1 })).toMatchObject({ reason: 'attempt-cap' });
+    expect(f.exec).not.toHaveBeenCalled();
   });
 });

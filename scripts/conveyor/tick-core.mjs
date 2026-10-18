@@ -409,7 +409,7 @@ function labelSet(labels) {
   );
 }
 
-/** Shared red-CI decision, including the durable status:ci-red fallback when checks are unknown. */
+/** Shared red-CI decision, requiring definitive rollup failure. */
 function isRedCi(prRow) {
   return ciHealOwed({ labels: prRow?.labels, ci: String(prRow?.ci || '').toLowerCase() });
 }
@@ -449,7 +449,7 @@ function isCiHealTarget(prRow) {
   if (!prRow || !isOpenPr(prRow)) return false;
   const labels = prRow.labels;
   if (hasReviewChanges(prRow)) return false; // owned by the review:changes fix loop (§3c) — it already rebases
-  if (isRedCi(prRow) && (wasGreenAtOpen(labels) || labelSet(labels).has('status:ci-red'))) return true;
+  if (isRedCi(prRow) && wasGreenAtOpen(labels)) return true;
   if (isBehind(prRow) && isReviewParked(labels)) return true; // not-landable BEHIND — the case #2183 leaves unhealed
   return false;
 }
