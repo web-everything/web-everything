@@ -1307,7 +1307,7 @@ export function createReviewPrSinks({
           // Hold before dispatch too: an exhausted or interrupted worker must leave a visible owner.
           if (!labelNames(state.labels).includes('review:human')) {
             labelProvider.setLabels(read.repo, read.pr, { add: 'review:pending',
-              remove: ['review:accepted', 'review:changes'].filter(l => labelNames(state.labels).includes(l)) });
+              remove: ['review:accepted', 'review:changes', 'ready-to-merge'].filter(l => labelNames(state.labels).includes(l)) });
           }
           try {
             const request = buildReviewJudgeRequest({ read, lens: 'correctness' });
