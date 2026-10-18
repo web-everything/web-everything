@@ -1,5 +1,33 @@
 # Testing — Three-Tier Strategy
 
+## Daemon entry boot smoke
+
+Boot each entry in a fresh child to preserve cold import graphs. `rebuildSmoke.bootConcurrency`
+(default 3) bounds initial boots; after those children drain, `rebuildSmoke.bootSignalRetries`
+(default 1; zero disables) retries only SIGTRAP/SIGSEGV/SIGABRT/SIGBUS/SIGILL deaths, serially.
+Exit failures and `ok:false` never receive this retry. Both settings use the policy cascade via
+`scripts/settings/rebuild-smoke.json`, with env overrides `WE_SMOKE_BOOT_CONCURRENCY` and
+`WE_SMOKE_BOOT_SIGNAL_RETRIES`; log effective values and sources. Env integers are strict
+digits; empty is unset.
+
+Smoke diagnostics never carry raw child stderr or stdout (operator decision, PR 5460). A boot or
+dispatch smoke failure detail, held state, self-sync alert and PR comment carry only an
+allow-listed summary (`daemon-boot-smoke.mjs#pickSmokeDiagnostics`): entry name, signal, exit
+code, attempts, launch start time, session/transcript presence, and an error class. The class is
+the first line matching `^[A-Z][A-Za-z]*Error:` that is not inside a quote opened on an earlier
+line, cut to 80 chars, with its quoted text (ASCII, typographic, guillemet and fullwidth) replaced
+by `<…>`: one cleanly bounded string in place, any other shape (several quotes, an unterminated
+or glued-on one) from the first quote to the end, because V8's JSON parse messages copy input
+with unescaped quotes. Control/format characters are dropped and token shapes redacted; a bare
+`Error:` line has none, and unparsable child output gets a fixed class. The raw output's last 30 lines go only to a new owner-only (0600) file under
+`<daemon state dir>/smoke-diagnostics` (0700, newest 500 kept), and the summary names its path.
+Culprit attribution reads typed repo-relative `files` the boot check extracts from the raw text
+in-process (`sourceFilesIn`), never the text itself.
+A transcript denial is counted, never quoted. Test with sentinel words that are not
+secret-shaped, so only the design can keep them out of every sink.
+Cover retry recovery, exhausted retries, non-signal refusal and concurrency with injected children;
+exercise diagnostic propagation through a real-git rebuild fixture. Run these suites through heavy admission.
+
 ## Red-team re-check evidence
 
 The post-accept re-check reads a separate, self-contained checkout pinned to `read.netBasis.rev`,
@@ -51,6 +79,53 @@ Replay derives rename/copy sources from diff headers using the review reader's e
 The sequential and speculative paths skip before budget reservation and record the reason
 `red team skipped: card-only`. Setting `recheckReadsRepo=false` restores a tool-free re-check;
 negative answers without file reads remain unverifiable.
+
+## Drain red-team disposition and retry evidence
+
+The drain owes a live-head red team only after a speculative or sequential pass is scheduled
+(recorded queued/running status or seat evidence). The review job records the pass as queued as
+soon as the loop returns an owed accept, before the added seats. Before that status exists, the
+persisted accepting review run for the live head holds (the loop labels the accept first), while
+the red team is enabled; the job's later status supersedes it, but a finished status older than
+that run (an earlier review of the same head) does not. Labels alone never schedule one.
+Card-only net diffs (including rename/copy sources) never owe a pass. A queued or running status
+is live only while its writer's pid is. A crashed scheduled pass, or an accepting run no job
+picked up, retains the 45-minute never-scheduled recovery path; live passes and recorded breaks
+cannot use it.
+
+`redTeam.statusLabels` defaults true through the same cascade as the probe controls, with
+`WE_RED_TEAM_STATUS_LABELS` as the environment override; effective value and source are logged.
+The existing label provider provisions the known metadata and writes the mutually exclusive
+`red-team:pending`, `red-team:clear`, and `red-team:blocked` labels. They describe scheduling
+and the recorded disposition on the live head, never grant clearance. The conveyor's existing
+label sweep removes stale head labels and repairs missed status writes. Re-arm removes merge
+readiness and stale status labels atomically; missing-only re-arm preserves readiness only
+when a trusted acceptance marker still names the unchanged live head.
+CI-heal missing-only recovery carries `--expect-no-readiness` into the child command. Readiness
+first observed by the child, or at its final pre-write read, supersedes the parent's earlier
+observation of missing routing, even when no acceptance marker accompanies it.
+
+Queue admission and operator escalation share `red-team-gate.mjs#readRedTeamDisposition`.
+Read the live head's recorded per-finding gate actions before consulting current policy:
+a card/advisory record releases that finding, while sent-back and round-cap records retain
+only their unresolved findings. Without a recorded per-finding action, a policy send-back
+candidate still blocks enqueue and derives `red-team:blocked`, even if no run is currently
+owed. A card record for another finding (or a failed card action) cannot release it.
+An action binds to the result it was recorded against: only gate records after that result
+count, so an earlier same-head result's card cannot release a newer result's finding. Action
+lines are read only as whole `buildGateComment` lines right after the gate marker, with indices
+from the action's own `(#N, …)` list; text elsewhere (a carried finding summary, a landing-job
+name) is never an action. A proven identical-contribution carry keeps the actions bound to the
+result it was carried from; the new head's own records win.
+Legacy cap comments omit indices; exclude separately
+recorded card/advisory findings before surfacing the remaining confirmed breaks. Acceptance
+labels alone do not prove an operator ruled on a cap-held break; use the sanctioned
+head-bound clearance ceremony, including proven identical-contribution carries.
+
+Persist red-team backoff independently of whether the scheduler currently owes a pass.
+The observed comments and live reviews wake a pending head when their evidence changes;
+otherwise a recorded break waits until its retry deadline, including after the health-smell
+age. Only missing-result scheduling gaps retain the maximum-age scheduling fallback.
 
 ## Codex usage accounting
 
@@ -1524,6 +1599,23 @@ head with them. Test an initially empty repository label catalog and a same-head
 age (using a recorded fixer push time when available), retaining its conflict, claim, head and retry-budget guards. The drain re-reads
 UNKNOWN listings before collecting head-bound context and also revalidates before
 merging, waiting for the configured delay at most three times per read stage.
+
+### Overlay dispatch launch timeouts
+
+The real overlay dispatch smoke keeps its five-minute budget per attempt. Resolve
+`overlaySmoke.dispatchLaunchRetries` through the policy cascade (default 1, allowed 0–1;
+`WE_OVERLAY_DISPATCH_LAUNCH_RETRIES` overrides it) and log its source. Retry only a timeout
+with no marker file, completion record, Claude session file, or transcript. Use a fresh
+scratch store and session ID, retain both attempts' diagnostics, and report
+“retried after launch timeout” on recovery. Assertion failures never retry.
+The smoke opts into wrapper stderr capture and first-byte timing; missing output is
+represented by `firstOutputMs: null`, not zero. Failure alerts retain the wrapper PID,
+liveness at timeout, launch time, session/transcript presence, the error class and the path of
+the 0600 file holding the last 30 stderr lines; the wrapper's raw capture is removed after each
+attempt (see *Daemon entry boot smoke* above).
+Exercise the launch with injected processes and isolated homes; wrapper output capture
+also has a real Node-child probe in `worker-wrapper.test.mjs`. Run these suites through
+`node scripts/readiness/heavy-admission.mjs run -- npx vitest run <files>`.
 
 ## Referral re-checks on the live head
 

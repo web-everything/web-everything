@@ -40,6 +40,79 @@ function spec(over = {}, dir = tmp()) {
 const read = (s) => tryReadCompletion(s.session, s.completionsDir);
 
 describe('runWorker: the job record and the result channels', () => {
+  it('captures opt-in smoke stderr and first output from a real child', async () => {
+    const diagnosticsDir = tmp();
+    const s = spec({ diagnosticsDir, argv: ['-e', `process.stderr.write('launch diagnostic\\n'); process.stdout.write(${JSON.stringify(claudeStdout(DONE))})`] });
+    await runWorker(s);
+    expect(readFileSync(join(diagnosticsDir, 'wrapper.stderr'), 'utf8')).toBe('launch diagnostic\n');
+    // Raw worker text: owner-only on disk.
+    expect(statSync(join(diagnosticsDir, 'wrapper.stderr')).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(readFileSync(join(diagnosticsDir, 'first-output.json'), 'utf8')).ms).toBeGreaterThanOrEqual(0);
+  });
+
+  it('a capture the smoke has removed is never recreated by later stderr', async () => {
+    const diagnosticsDir = tmp();
+    const file = join(diagnosticsDir, 'wrapper.stderr');
+    const s = spec({ diagnosticsDir, argv: ['-e', `process.stderr.write('first\\n'); setTimeout(() => { process.stderr.write('late\\n'); process.stdout.write(${JSON.stringify(claudeStdout(DONE))}); }, 600)`] });
+    const run = runWorker(s);
+    for (let i = 0; i < 100 && !existsSync(file); i++) await new Promise((r) => setTimeout(r, 20));
+    rmSync(file);
+    await run;
+    expect(existsSync(file)).toBe(false);
+  });
+
+  it('a capture removed before the worker wrote any stderr is never recreated either', async () => {
+    const diagnosticsDir = tmp();
+    const file = join(diagnosticsDir, 'wrapper.stderr');
+    // `launchDetached` creates the capture before the worker starts.
+    writeFileSync(file, '', { mode: 0o600 });
+    const s = spec({ diagnosticsDir, argv: ['-e', `setTimeout(() => { process.stderr.write('late\\n'); process.stdout.write(${JSON.stringify(claudeStdout(DONE))}); }, 600)`] });
+    const run = runWorker(s);
+    // The `started` record is written the moment the child has a pid: the capture is removed after that, before any stderr.
+    for (let i = 0; i < 100 && !read(s); i++) await new Promise((r) => setTimeout(r, 20));
+    rmSync(file);
+    await run;
+    expect(existsSync(file)).toBe(false);
+  });
+
+  it('bounds the captured smoke stderr on disk and keeps its newest bytes', async () => {
+    const diagnosticsDir = tmp();
+    const s = spec({ diagnosticsDir, argv: ['-e', `for (let i = 0; i < 40; i++) process.stderr.write('x'.repeat(64 * 1024) + '\\n'); process.stderr.write('newest line\\n'); process.stdout.write(${JSON.stringify(claudeStdout(DONE))})`] });
+    await runWorker(s);
+    const captured = readFileSync(join(diagnosticsDir, 'wrapper.stderr'), 'utf8');
+    expect(captured.length).toBeLessThanOrEqual(1024 * 1024 + 128 * 1024);
+    expect(captured.endsWith('newest line\n')).toBe(true);
+  });
+
+  it('discards continuation chunks until a line break after compaction', async () => {
+    const diagnosticsDir = tmp();
+    // One quoted secret line over 1 MiB, streamed in 32 KiB pieces, so compaction fires in the middle of it.
+    const script = [
+      "process.stderr.write('before\\n');",
+      "process.stderr.write('export DB_PASSWORD=\"');",
+      "const piece = 'secretword '.repeat(3_000);",
+      'for (let i = 0; i < 120; i++) process.stderr.write(piece);',
+      "process.stderr.write('\" tail\\nafter line\\n');",
+      `process.stdout.write(${JSON.stringify(claudeStdout(DONE))});`,
+    ].join('\n');
+    await runWorker(spec({ diagnosticsDir, argv: ['-e', script] }));
+    const captured = readFileSync(join(diagnosticsDir, 'wrapper.stderr'), 'utf8');
+    expect(captured).not.toContain('secretword');
+    expect(captured).toContain('after line\n');
+  }, 30_000);
+
+  it('compacts the captured smoke stderr at a line break, never mid-line', async () => {
+    const diagnosticsDir = tmp();
+    // 1,000-char lines that each start with `L`: a byte cut would leave the kept file starting inside a line.
+    const s = spec({ diagnosticsDir, argv: ['-e', `for (let i = 0; i < 1_200; i++) process.stderr.write('L' + 'y'.repeat(999) + '\\n'); process.stdout.write(${JSON.stringify(claudeStdout(DONE))})`] });
+    await runWorker(s);
+    const captured = readFileSync(join(diagnosticsDir, 'wrapper.stderr'), 'utf8');
+    expect(captured.length).toBeLessThan(1_200 * 1_000);
+    // A compacted file holds whole lines only.
+    expect(captured.split('\n').filter(Boolean).every((l) => l.startsWith('L'))).toBe(true);
+    expect(statSync(join(diagnosticsDir, 'wrapper.stderr')).mode & 0o777).toBe(0o600);
+  });
+
   it('writes a started record with pid, timeout and deadline BEFORE the child exits, then a done envelope', async () => {
     const writes = [];
     const s = spec({ argv: ['-e', `setTimeout(()=>process.stdout.write(${JSON.stringify(claudeStdout(DONE))}), 150)`] });

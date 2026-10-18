@@ -76,7 +76,6 @@ import { ADVISORY_LABELS } from '../lib/advisory-labels.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { LIST_COMMENTS_CAP, defaultListPrs, defaultReadPr } from './advisory-label-sweep.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
-import { sweepRulingNeededLabels } from './ruling-needed-sweep.mjs';
 import { sweepAutoBlock } from './referral-auto-block.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { sweepAcceptCarry, defaultCloneDirFor } from './accept-carry-sweep.mjs';
@@ -362,13 +361,7 @@ export function sweepReviewHoldLabels({
   } catch (e) {
     results.push({ num: 0, autoBlock: 'sweep-failed', error: String((e && e.message) || e).split('\n')[0] });
   }
-  try {
-    for (const r of sweepRulingNeededLabels({ repo: resolvedRepo, listPrs: () => prs, readPr, provider, dryRun })) {
-      results.push({ num: r.num, ruling: r.action, ...(r.error ? { error: r.error } : {}) });
-    }
-  } catch (e) {
-    results.push({ num: 0, ruling: 'sweep-failed', error: String((e && e.message) || e).split('\n')[0] });
-  }
+  // advisory:ruling-needed is reconciled only by pr-label-mirror --apply (G2).
   return results;
 }
 

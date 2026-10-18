@@ -791,3 +791,25 @@ describe('repo-grounded red-team re-check and card-only skips', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
+
+describe('red-team scheduling status', () => {
+  it('records scheduling only after reserving a real pass, before the probe', async () => {
+    const redTeamStatus = vi.fn();
+    const { io } = fakeIo({ redTeamStatus, runSeat: async ({ provider }) => {
+      expect(redTeamStatus).toHaveBeenCalledWith(expect.objectContaining({ status: 'running' }));
+      return { report: report(provider, answer([])) };
+    } });
+    const p = payload('accept');
+    await runRedTeam({ pr: 5, repo: REPO, loopPayload: p, env: {} }, io);
+    expect(redTeamStatus).toHaveBeenCalledWith(expect.objectContaining({ status: 'finished', result: 'ran' }));
+  });
+  it('a card-only skip never schedules or publishes a pending status', async () => {
+    const redTeamStatus = vi.fn();
+    const { io } = fakeIo({ redTeamStatus });
+    const p = payload('accept');
+    p.findings.read.netChangedFiles = ['backlog/123-card.md'];
+    const out = await runRedTeam({ pr: 5, repo: REPO, loopPayload: p, env: {} }, io);
+    expect(out).toMatchObject({ status: 'skipped', reason: 'red team skipped: card-only' });
+    expect(redTeamStatus).not.toHaveBeenCalled();
+  });
+});
