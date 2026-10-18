@@ -368,8 +368,9 @@ export function createDrainMergeStrategy({
         return { allowed: !reason, reason, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
       } catch { return { allowed: false, reason: 'red-team evidence unreadable' }; }
     },
-    /** Reuse admission's hold evaluation early, only for a recorded wait on this exact head.
-     * A clear result is NOT authorization; enqueue still runs every live gate later. */
+    /** Read-only pre-check outside the land mutex, only for a recorded wait on this exact head.
+     * A clear result is NOT authorization; enqueue re-reads state and runs every live gate under the mutex.
+     * A hold needing refresh or any side effect falls through to that ordinary enqueue path. */
     recordedHold(c, headSha) {
       if (!enqueues(c.repo) || !headSha) return null;
       const state = readQueueState(statePath, readFile);
@@ -395,7 +396,8 @@ export function createDrainMergeStrategy({
       if (preparedAdmission && prepared.labels !== labelSignature(live.labels)) return { fallback: true };
       const held = sendBackReason(live.labels);
       if (held) {
-        removeSentBack(c.repo, c.num, live.labels);
+        if (holdOnly && safety.value.dequeueOnSendBack) return null; // dequeue belongs to locked enqueue too
+        if (!holdOnly) removeSentBack(c.repo, c.num, live.labels);
         return { enqueued: false, deferred: true, kind: 'sent-back', reason: held };
       }
       // Head-bound file preparation is reusable; authorization evidence is always live.
@@ -427,6 +429,9 @@ export function createDrainMergeStrategy({
           log.write(`  merge-queue: #${c.num} red-team-pending backoff until ${new Date(pending.retryAt).toISOString()} (head and review/comment evidence unchanged)\n`);
           return pendingOutcome(c, pending, true);
         }
+        // Refreshing the hold can update labels, dispatch work, or write shared state. Leave all of that
+        // to ordinary enqueue under withLandWriteLock, including its fresh state/head reads.
+        if (holdOnly) return null;
         const pages = readThreadPages(c.repo, c.num);
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team admission: unreadable complete comments');
         const reason = redTeamEnqueueHold({ ...evidence, requestPending: neverScheduled || (sameHead && pending.requestedAt != null), comments: pages.flat(), repo: slugOf(c.repo), pr: c.num, head: headSha, env });
@@ -469,11 +474,11 @@ export function createDrainMergeStrategy({
           if (!fallback) return outcome;
         }
       }
+      if (holdOnly) return null;
       if (before.redTeamPending?.[key]) {
         delete before.redTeamPending[key];
         writeState(statePath, before);
       }
-      if (holdOnly) return null; // all writes below remain on the ordinary enqueue path
       let batchingGroupId;
       try {
         const g = adaptiveBatching().gate(c.num);
