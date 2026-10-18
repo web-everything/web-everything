@@ -15,7 +15,7 @@ Add the operator-override layer to resolveCascade and resolveReviewSettings per 
 
 ## Acceptance
 
-- [A1] **Executable** — `node --test` on we:scripts/lib/__tests__/policy-cascade.test.mjs and we:scripts/lib/__tests__/review-settings.test.mjs. Named tests, one per guarantee:
+- [A1] **Executable** — `npm run test:unit --` (vitest) on we:scripts/lib/__tests__/policy-cascade.test.mjs and we:scripts/lib/__tests__/review-settings.test.mjs. Named tests, one per guarantee:
   - `operator-override wins over env: order is standard < platform < tool < env < operator-override`
   - `a value taken from the layer logs source operator-db in the source line`
   - `resolveReviewSettings reads the layer and logs operator-db, separately from its own env path`

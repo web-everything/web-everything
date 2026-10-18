@@ -4,7 +4,7 @@ kind: story
 size: 5
 parent: "6268"
 status: open
-scope: ["we:scripts/lib/operator-override-store.mjs", "we:scripts/operations/operator-override.mjs", "we:scripts/lib/__tests__/operator-override-store.test.mjs"]
+scope: ["we:scripts/lib/operator-override-store.mjs", "we:scripts/operations/operator-override.mjs", "we:scripts/lib/__tests__/operator-override-store.test.mjs", "we:scripts/operations/run.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
@@ -13,9 +13,11 @@ tags: []
 
 Build the store of decision 6268 (we:docs/agent/platform-decisions.md#operator-override-settings-layer): a host-wide path outside any lane clone, one readOperatorOverrides read interface, and an operator-only operator-override set operation that rejects agent callers, appends a change log and supports expiry.
 
+The store module, the operation module and the store test are new files. The operation is registered in we:scripts/operations/run.mjs, the way existing operations are, so `node we:scripts/operations/run.mjs operator-override set …` reaches it.
+
 ## Acceptance
 
-- [A1] **Executable** — `node --test we:scripts/lib/__tests__/operator-override-store.test.mjs` fails before the module exists and passes after. Named tests, one per guarantee:
+- [A1] **Executable** — `npm run test:unit --` (vitest) on we:scripts/lib/__tests__/operator-override-store.test.mjs (a new file) fails before the module exists and passes after. Named tests, one per guarantee:
   - `set then readOperatorOverrides returns the value with source operator-db`
   - `the store path is host-wide and never inside a lane clone`
   - `an agent caller is rejected by the write operation and nothing is written`

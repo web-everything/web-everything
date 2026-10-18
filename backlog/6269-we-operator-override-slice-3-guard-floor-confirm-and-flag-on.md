@@ -15,7 +15,7 @@ Build the guard floor of decision 6268 (we:docs/agent/platform-decisions.md#oper
 
 ## Acceptance
 
-- [A1] **Executable** — `node --test we:scripts/lib/__tests__/operator-override-floor.test.mjs` fails before the module exists and passes after. Named tests, one per guarantee:
+- [A1] **Executable** — `npm run test:unit --` (vitest) on we:scripts/lib/__tests__/operator-override-floor.test.mjs (a new file) fails before the module exists and passes after. Named tests, one per guarantee:
   - `a loosening write without the confirmation flag is refused with a non-zero exit and nothing is written`
   - `a confirmed loosening write is logged with its confirmation`
   - `every key declares its safe direction; a key with no entry counts as loosening`
