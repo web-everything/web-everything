@@ -13,9 +13,9 @@ export function readDrainQueueSafety({ env = process.env, tool, platform, log = 
   const numberEnv = key => env[key] === undefined ? undefined : Number(env[key]);
   const positive = v => typeof v === 'number' && Number.isFinite(v) && v > 0;
   const r = cascadePolicy('drain', tool ?? (env.VITEST || env.WE_UNDER_TEST ? {} : readSettings().drain), {
-    env, platform, standard: { waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true, redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45, enqueueWhenRedTeamNeverScheduled: true },
-    valid: { enqueueWhenRedTeamNeverScheduled: v => typeof v === 'boolean', waitForRedTeamBeforeEnqueue: v => typeof v === 'boolean', dequeueOnSendBack: v => typeof v === 'boolean', redTeamPendingBackoffSec: positive, redTeamPendingMaxMin: positive },
-    envValues: { enqueueWhenRedTeamNeverScheduled: booleanEnv('WE_DRAIN_ENQUEUE_WHEN_RED_TEAM_NEVER_SCHEDULED'), waitForRedTeamBeforeEnqueue: booleanEnv('WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE'), dequeueOnSendBack: booleanEnv('WE_DRAIN_DEQUEUE_ON_SEND_BACK'), redTeamPendingBackoffSec: numberEnv('WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC'), redTeamPendingMaxMin: numberEnv('WE_DRAIN_RED_TEAM_PENDING_MAX_MIN') },
+    env, platform, standard: { waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true, redTeamRequestCooldownMin: 5, redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45, enqueueWhenRedTeamNeverScheduled: true },
+    valid: { enqueueWhenRedTeamNeverScheduled: v => typeof v === 'boolean', waitForRedTeamBeforeEnqueue: v => typeof v === 'boolean', dequeueOnSendBack: v => typeof v === 'boolean', redTeamRequestCooldownMin: positive, redTeamPendingBackoffSec: positive, redTeamPendingMaxMin: positive },
+    envValues: { enqueueWhenRedTeamNeverScheduled: booleanEnv('WE_DRAIN_ENQUEUE_WHEN_RED_TEAM_NEVER_SCHEDULED'), waitForRedTeamBeforeEnqueue: booleanEnv('WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE'), dequeueOnSendBack: booleanEnv('WE_DRAIN_DEQUEUE_ON_SEND_BACK'), redTeamRequestCooldownMin: numberEnv('WE_DRAIN_RED_TEAM_REQUEST_COOLDOWN_MIN'), redTeamPendingBackoffSec: numberEnv('WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC'), redTeamPendingMaxMin: numberEnv('WE_DRAIN_RED_TEAM_PENDING_MAX_MIN') },
   });
   log(formatCascadeSourcesLine('drain', r));
   return r;
@@ -33,7 +33,7 @@ export function postAcceptRedTeamOwed(loopPayload, env = process.env, evidence =
   return redTeamOwedOnHead({ read: loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly });
 }
 
-export function redTeamEnqueueHold({ loopPayload, comments, repo, pr, head, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false, attempted = false, skipCardOnly } = {}) {
+export function redTeamEnqueueHold({ loopPayload, comments, repo, pr, head, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false, attempted = false, requestPending = false, skipCardOnly } = {}) {
   // A recorded break still holds even if the scheduler is now disabled or the payload is unavailable.
   let disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks });
   if (!disposition.result) {
@@ -43,7 +43,8 @@ export function redTeamEnqueueHold({ loopPayload, comments, repo, pr, head, env 
   if (disposition.sendBack.length || disposition.held.length)
     return 'post-accept red team confirmed a break requiring send-back';
   if (disposition.result?.recheckIncomplete) return 'post-accept red team pending: saved red-team re-check incomplete';
-  if (!postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded: recorded || attempted, skipCardOnly }) || disposition.result) return null;
+  if (disposition.result) return null;
+  if (!requestPending && !postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded: recorded || attempted, skipCardOnly })) return null;
   return 'post-accept red team has no recorded result on the live head';
 }
 

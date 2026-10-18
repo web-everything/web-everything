@@ -1766,3 +1766,22 @@ it('pins a requested review to the head from its durable request at the live dis
   expect(headBoundRedTeamCiGate(gate, 'c'.repeat(40))({ pr: 5485 })).toMatchObject({ allowed: true });
   expect(headBoundRedTeamCiGate(() => ({ allowed: false, headSha: 'c'.repeat(40) }), 'c'.repeat(40))({})).toMatchObject({ allowed: false });
 });
+
+it.each([
+  [5461, 'ff45ed96c40644e5537370df84b6b30328b1a73e', 'review-round:11'],
+  [5485, 'e57c222ec2d3b998f3b007202b6155f4c9aa1534', 'review-round:5'],
+  [5487, '1cbf326956bd56f0480ff93918b949b545fff4c8', 'review-round:3'],
+])('dispatches the never-scheduled live PR #%s shape including red-team:pending', (pr, head, round) => {
+  const request = { repo: 'web-everything/web-everything', pr, head };
+  const dispatch = vi.fn(() => ({ mode: 'job', jobPid: 123 }));
+  const finish = vi.fn();
+  runReviewTick({ repo: request.repo, reconcile: () => ({ dispatch: [], refusals: [] }),
+    readPrs: () => [{ number: pr, headRefOid: head, isDraft: false, labels:
+      ['review:accepted', 'ready-to-merge', 'status:ready-to-merge', 'red-team:pending', round].map(name => ({ name })) }],
+    readAgents: () => [], acquirableLanes: () => 1, readRedTeamRequests: () => [request], finishRedTeamRequest: finish,
+    dispatch, tagRound: () => {}, tagStatus: () => {},
+  });
+  expect(dispatch).toHaveBeenCalledTimes(1);
+  expect(dispatch.mock.calls[0][0].expectedRedTeamHead).toBe(head);
+  expect(finish).toHaveBeenCalledTimes(1);
+});

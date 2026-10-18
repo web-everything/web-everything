@@ -10,6 +10,7 @@ import {
   requestDrainRedTeam, readDrainRedTeamRequests, finishDrainRedTeamRequest, readQueueState, FOLLOW_UP_MAX_ATTEMPTS, readMergeDeliveryToolSettings, MERGE_DELIVERY_SETTINGS_FILE_ENV,
 } from '../drain-merge-strategy.mjs';
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
+import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { rulesetSuggestion } from '../merge-queue-enqueue.mjs';
 import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mjs';
 import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
@@ -40,14 +41,14 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
     if (args[0] === 'label' && args[1] === 'create') return '';
     if (args[0] === 'api' && args[1] === 'user') { if (selfLogin == null) throw new Error('gh: not logged in'); return `${selfLogin}\n`; }
     if (cmd === 'git') return args[0] === 'diff' ? 'scripts/x.mjs\0' : ''; // the pinned change list of the judged head
-    if (args[0] === 'pr' && args[1] === 'view' && args.includes('id,headRefOid,baseRefName')) return JSON.stringify({ id: 'PR_NODE', headRefOid: HEAD, baseRefName: 'main', labels: ['ready-to-merge'] });
+    if (args[0] === 'pr' && args[1] === 'view' && args.includes('id,headRefOid,baseRefName')) return JSON.stringify({ id: 'PR_NODE', headRefOid: ghView[args[2]]?.headRefOid ?? HEAD, baseRefName: 'main', labels: ['ready-to-merge'] });
     if (args[0] === 'pr' && args[1] === 'view' && viewThrows.includes(Number(args[2]))) throw new Error('gh: HTTP 502');
     if (args[0] === 'pr' && args[1] === 'view') { onView[args[2]]?.(); return JSON.stringify(ghView[args[2]] ?? { state: 'OPEN', headRefOid: HEAD, labels, id: 'PR_NODE' }); }
     if (args[0] === 'api' && args[1] === 'graphql') {
       if (args.some(a => a.includes('mergeQueue(branch:'))) return JSON.stringify(queueFacts ?? { data: { repository: { mergeQueue: { entries: {
         nodes: !removed && queued ? [{ pullRequest: { id: 'PR_NODE', number: 5283 } }] : [], pageInfo: { hasNextPage: false },
       } } } } });
-      if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: !removed && (queued || mutated) && (inQueue ?? true), headRefOid: HEAD } } } });
+      if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: !removed && (queued || mutated) && (inQueue ?? true), headRefOid: Object.values(ghView)[0]?.headRefOid ?? HEAD } } } });
       if (args.some(a => a.includes('dequeuePullRequest'))) { removed = true; return JSON.stringify({ data: { dequeuePullRequest: { clientMutationId: null } } }); }
       mutated = true;
       if (mutation) return JSON.stringify(mutation);
@@ -578,6 +579,52 @@ describe('merge-ai-prs hook wiring', () => {
 
 
 describe('post-accept red-team enqueue barrier (#5283)', () => {
+  it('a head with no red team ever scheduled gets one request, once, with a cooldown', () => {
+    let clock = 1000;
+    const requests = [];
+    let available = false;
+    const options = { strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], now: () => clock,
+      env: { WE_DRAIN_RED_TEAM_REQUEST_COOLDOWN_MIN: '2', WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC: '7200' },
+      evidence: { scheduled: false, recorded: false, attempted: false, inFlight: false, loopPayload: null },
+      requestRedTeam: input => { requests.push(input); return { requested: available }; } };
+    const first = harness(options);
+    expect(first.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(requests).toHaveLength(1);
+    const next = harness({ ...options, initial: first.state() });
+    clock += 120_000 - 1;
+    expect(next.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false });
+    expect(requests).toHaveLength(1);
+    available = true;
+    clock += 1;
+    expect(next.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, redTeamRequested: true });
+    expect(requests).toHaveLength(2);
+    expect(next.logs.join('')).toContain('redTeamRequestCooldownMin=2 (env)');
+    clock += 200 * 60_000;
+    const restarted = harness({ ...options, initial: next.state() });
+    expect(restarted.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(requests).toHaveLength(2);
+    const newHead = 'c'.repeat(40);
+    const moved = harness({ ...options, initial: restarted.state(), ghView: { 5485: { headRefOid: newHead, labels: options.labels } } });
+    expect(moved.s.enqueue({ num: 5485 }, newHead)).toMatchObject({ enqueued: false, redTeamRequested: true });
+    expect(requests.at(-1).head).toBe(newHead);
+  });
+  it('replays #5461: old-head break, live head with no scheduled work requests and stays pending', () => {
+    const liveHead = 'ff45ed96c40644e5537370df84b6b30328b1a73e';
+    const oldHead = '4752c275333c66228ea55c4b6d65f4038c760d38';
+    const requests = [];
+    const comment = { user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({ pr: 5461, rev: oldHead,
+      findings: [{ summary: 'old break', category: 'security', impactIfUnfixed: 'broken', confirmedByRecheck: true }], recheckStatus: 'ok' }) };
+    const labels = ['review:accepted', 'ready-to-merge', 'status:ready-to-merge', 'review-round:11', 'red-team:pending'];
+    const h = harness({ strategy: 'github-merge-queue', labels, ghView: { 5461: { headRefOid: liveHead, labels, isDraft: false } },
+      liveComments: [comment], evidence: { scheduled: false, attempted: false, recorded: false, inFlight: false },
+      requestRedTeam: input => { requests.push(input); return { requested: true }; } });
+    const outcome = h.s.enqueue({ num: 5461 }, liveHead);
+    expect(outcome).toMatchObject({ enqueued: false, kind: 'red-team-pending', redTeamRequested: true });
+    expect(outcome.reason).toContain('no recorded result on the live head');
+    expect(outcome.reason).not.toContain('requiring send-back');
+    expect(requests).toEqual([expect.objectContaining({ pr: 5461, head: liveHead })]);
+  });
+
   it.each([null, LOCAL])('enqueues a saved clean live-head result without comments (repo=%s)', repo => {
     const root = mkdtempSync(join(tmpdir(), 'drain-saved-wiring-'));
     try {

@@ -1,8 +1,10 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, renameSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mjs';
+import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
+import { dirname, join } from 'node:path';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
 import { readDrainRedTeamEvidence, recordRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
@@ -183,4 +185,21 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'ran' }, f);
     expect(readDrainRedTeamEvidence({ ...f, isAlive: () => true })).toMatchObject({ recorded: true, inFlight: false });
   });
+});
+
+it('replays #5461 saved and posted old-head breaks without treating them as live-head work', () => {
+  const f = { ...fixture(), pr: 5461, head: 'ff45ed96c40644e5537370df84b6b30328b1a73e' };
+  const oldHead = '4752c275333c66228ea55c4b6d65f4038c760d38';
+  const findings = [{ summary: 'old break', confirmedByRecheck: true, impactIfUnfixed: 'broken', category: 'security' }];
+  const row = { dispatchKind: 'review-seat', seat: 'red-team', repo: f.repo, pr: f.pr, rev: oldHead,
+    status: 'ok', recheckStatus: 'ok', confirmedMissCount: 1, findings };
+  const path = resolveScorecardStorePath(f.env);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify({ version: 1, records: [row] }));
+  recordRedTeamStatus({ ...f, loopPayload: payload(oldHead), status: 'finished', result: { status: 'ran' } }, f);
+  const evidence = readDrainRedTeamEvidence({ ...f, readScorecards: () => [row] });
+  expect(evidence).toMatchObject({ loopPayload: null, scheduled: false, attempted: false, recorded: false, inFlight: false });
+  const comments = [{ author: { login: 'web-everything' }, body: renderRedTeamComment({ pr: f.pr, rev: oldHead, findings, recheckStatus: 'ok' }) }];
+  expect(redTeamEnqueueHold({ ...f, ...evidence, comments, requestPending: true })).toBe('post-accept red team has no recorded result on the live head');
+  expect(redTeamEnqueueHold({ ...f, ...evidence, comments, head: oldHead })).toContain('requiring send-back');
 });
