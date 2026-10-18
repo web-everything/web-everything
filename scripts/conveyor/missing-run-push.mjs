@@ -36,22 +36,6 @@ export function ownerInstallationToken(repo, { env = process.env, readCache = de
   return typeof cached.token === 'string' && cached.token.startsWith('ghs_') ? cached.token : null;
 }
 
-/** Shared recovery credential refusal and isolated Git invocation for every recovery push. */
-export function recoveryPushContext(repo, {
-  env = process.env, exec = execFileSyncThrottled, readCache = defaultReadCache, now = Date.now(),
-} = {}) {
-  const ownerToken = ownerInstallationToken(repo, { env, readCache, now });
-  const token = String(ownerToken || env.GH_TOKEN || env.GITHUB_TOKEN || exec('gh', ['auth', 'token', '--hostname', 'github.com'], {
-    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000, killSignal: 'SIGKILL', env,
-  })).trim();
-  if (!ownerToken && !recoveryPushCredential(token, env)) return { ok: false, error: MISSING_RUN_CREDENTIAL_REFUSAL };
-  const gitEnv = Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith('GIT_')));
-  return { ok: true, env: { ...gitEnv, WE_CI_PUSH_TOKEN: token,
-    GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
-    args: ['-c', 'http.extraHeader=', '-c', 'credential.helper=',
-      '-c', 'credential.helper=!f() { echo username=x-access-token; printf "password=%s\\n" "$WE_CI_PUSH_TOKEN"; }; f'] };
-}
-
 export function pushMissingRunCommit(d, {
   repo, defaultBranch = 'main', exec = execFileSyncThrottled, env = process.env,
   checkClaim = pushRefusal, readCache = defaultReadCache, now = Date.now(),
@@ -81,11 +65,21 @@ export function pushMissingRunCommit(d, {
     const held = claim();
     if (held) return defer(held.message);
     stage = 'credential';
-    const auth = recoveryPushContext(repo, { env, exec, readCache, now });
-    if (!auth.ok) return { ok: false, action, error: auth.error };
+    // Prefer the repo OWNER's own installation token (xgq539z) so a plateauapp/frontier-ui PR is pushed with
+    // an identity that can write to it, even when the daemon's env token belongs to another org.
+    const ownerToken = ownerInstallationToken(repo, { env, readCache, now });
+    const token = String(ownerToken || env.GH_TOKEN || env.GITHUB_TOKEN || exec('gh', ['auth', 'token', '--hostname', 'github.com'], opts)).trim();
+    // An ineligible credential is structural (config, not a race): count it so the per-sha cap hands the PR
+    // off instead of re-planning it every tick forever.
+    if (!ownerToken && !recoveryPushCredential(token, env)) return { ok: false, action, error: MISSING_RUN_CREDENTIAL_REFUSAL };
     scratch = mkdtempSync(join(tmpdir(), 'we-missing-run-'));
-    const gitOpts = { ...opts, cwd: scratch, env: auth.env };
-    const git = (...args) => String(exec('git', [...auth.args, ...args], gitOpts)).trim();
+    // Pin git to the credential just validated, overriding stored helpers and auth
+    // headers. The secret is only in the child environment, never argv or logs.
+    const gitEnv = Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith('GIT_')));
+    const gitOpts = { ...opts, cwd: scratch, env: { ...gitEnv, WE_CI_PUSH_TOKEN: token,
+      GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' } };
+    const git = (...args) => String(exec('git', ['-c', 'http.extraHeader=', '-c', 'credential.helper=',
+      '-c', 'credential.helper=!f() { echo username=x-access-token; printf "password=%s\\n" "$WE_CI_PUSH_TOKEN"; }; f', ...args], gitOpts)).trim();
     stage = 'fetch';
     git('init', '--bare', '.');
     const remote = `https://github.com/${repo}.git`;

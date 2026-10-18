@@ -122,7 +122,8 @@ import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { unlinkSync } from 'node:fs';
 import { gitRun } from '../lib/git-run.mjs';
-import { recoveryPushContext } from './missing-run-push.mjs';
+import { ownerInstallationToken, recoveryPushCredential } from './missing-run-push.mjs';
+import { MISSING_RUN_CREDENTIAL_REFUSAL } from './main-red-recovery.mjs';
 import { repoKeyFromRemoteUrl } from './fix-procedure.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { loadCardConflictSettings } from '../lib/card-conflict-resolve.mjs';
@@ -410,6 +411,22 @@ export function defaultConflictingFilePaths({ pr, cwd = REPO_ROOT, exec = execFi
  */
 export function defaultAttemptUnownedConflictRebase({ pr, cwd = REPO_ROOT, run } = {}) {
   return rebaseDropManifest({ laneRef: pr?.headRefName, base: 'origin/main', cwd, ...(run ? { run } : {}) });
+}
+
+/** Pin the card resolver push to a validated credential and an isolated Git environment. */
+function recoveryPushContext(repo, {
+  env = process.env, exec = execFileSyncThrottled, readCache, now = Date.now(),
+} = {}) {
+  const ownerToken = ownerInstallationToken(repo, { env, readCache, now });
+  const token = String(ownerToken || env.GH_TOKEN || env.GITHUB_TOKEN || exec('gh', ['auth', 'token', '--hostname', 'github.com'], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000, killSignal: 'SIGKILL', env,
+  })).trim();
+  if (!ownerToken && !recoveryPushCredential(token, env)) return { ok: false, error: MISSING_RUN_CREDENTIAL_REFUSAL };
+  const gitEnv = Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith('GIT_')));
+  return { ok: true, env: { ...gitEnv, WE_CI_PUSH_TOKEN: token,
+    GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
+    args: ['-c', 'http.extraHeader=', '-c', 'credential.helper=',
+      '-c', 'credential.helper=!f() { echo username=x-access-token; printf "password=%s\\n" "$WE_CI_PUSH_TOKEN"; }; f'] };
 }
 
 /** Same trusted fast-forward plumbing, with a fresh main and a private index for the card path. */
