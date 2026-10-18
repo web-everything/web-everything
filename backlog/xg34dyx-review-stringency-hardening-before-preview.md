@@ -1,7 +1,6 @@
 ---
 kind: story
 size: 5
-parent: "xrlwbd7"
 status: open
 dateOpened: "2026-10-17"
 tags: []
@@ -10,6 +9,8 @@ tags: []
 # Review stringency hardening — before public preview
 
 Operator 2026-10-17: protection is wanted eventually, but not before there is a real app and real users. Moved here from slice 2 (x77cl1h: A10–A16) and slice 3 (xsnny7x: A6, A7, A9–A11): forged-operator and provenance checks, settings/debt write races, ingress size and rate limits, tamper detection, unreadable-register fail-closed integration. mustPayBefore: public-preview.
+
+Intended parent epic: xrlwbd7 from #5511. Set the parent link after that epic lands; it is not yet present on this branch's base.
 
 ## Acceptance
 
