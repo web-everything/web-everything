@@ -1,12 +1,10 @@
-import { EVENT_TYPES } from '../../verdict-ledger.mjs';
-import { verdictHead, sameHead, isSha } from '../referrals.mjs';
-
-/** The head an event witnessed, if it names one (a verdict row, a referral, a review run). */
-const headOf = e => (e.type === EVENT_TYPES.VERDICT || e.type === undefined ? verdictHead(e) : e.headSha) ?? null;
+import { EVENT_TYPES, observedLedgerHead } from '../../verdict-ledger.mjs';
+import { sameHead, isSha } from '../referrals.mjs';
 
 /**
  * A send-back holds the PR until the head SHA differs from the head that was sent back. That head is the latest
- * one a ledger event witnessed before the send-back. A commit timestamp never releases it (the pusher sets it); a
+ * applied witness before the send-back; a delayed row cannot rewind it. Fresh event heads still count when a
+ * lifecycle append missed. A commit timestamp never releases it (the pusher sets it); a
  * send-back with no recorded head (a later event on the current head proves nothing), or a PR whose current head
  * is unknown, stays held.
  */
@@ -18,7 +16,8 @@ export default {
     const at = events.map(e => e.type).lastIndexOf(EVENT_TYPES.SEND_BACK);
     if (at < 0) return null;
     const sb = events[at];
-    const sentHead = events.slice(0, at).reverse().map(headOf).find(isSha) ?? null;
+    const witnessed = observedLedgerHead(events.slice(0, at), { includeEventHeads: true });
+    const sentHead = isSha(witnessed) ? witnessed : null;
     const head = facts?.head?.sha ?? null;
     if (sentHead && isSha(head) && !sameHead(head, sentHead)) return null; // only two real SHAs can differ; a garbage or short head is an unknown head
     // No head was recorded before the send-back: the ledger cannot say which head was sent back. A later event that

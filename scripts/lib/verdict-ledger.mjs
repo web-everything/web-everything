@@ -110,7 +110,7 @@ import { reserve, releaseLockDir } from '../readiness/file-locks.mjs';
 import { writeAllSync } from './write-all-sync.mjs';
 import { createGitLedgerStore, appendGitRowsSync } from './verdict-ledger-io.mjs';
 import { registerLedgerStore, getLedgerStore, describeLedgerStore } from './verdict-ledger-store.mjs';
-import { sameHead } from './pr-state/referrals.mjs';
+import { isSha, sameHead } from './pr-state/referrals.mjs';
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 // SCHEMA
@@ -769,10 +769,22 @@ export function ledgerEventId(row) {
   return `sha256:${createHash('sha256').update(JSON.stringify(canonical(record))).digest('hex')}`;
 }
 
-/** Latest witnessed head; late review-run/referral events do not rewind a lifecycle boundary. */
-export function observedLedgerHead(events) {
+/** Latest lifecycle head. Send-backs may also bind to a later event head when its observation append missed;
+ * known superseded heads never rewind that witness. Other callers require lifecycle evidence only. */
+export function observedLedgerHead(events, { includeEventHeads = false } = {}) {
   const pr = events.at(-1)?.pr;
-  const { byPr, witnessedHeads } = foldWithWitness(events);
+  const { byPr, witnessedHeads, witnessRows, supersededHeads } = foldWithWitness(events);
+  if (includeEventHeads) {
+    const boundary = events.lastIndexOf(witnessRows.get(pr));
+    const superseded = [...(supersededHeads.get(pr) ?? [])];
+    for (let i = events.length - 1; i > boundary; i--) {
+      const e = events[i];
+      if (e.pr !== pr || e.type === undefined || e.type === EVENT_TYPES.VERDICT || !isSha(e.headSha)) continue;
+      if (superseded.some(old => sameHead(old, e.headSha))) continue;
+      const witnessed = witnessedHeads.get(pr);
+      return sameHead(witnessed, e.headSha) && witnessed.length > e.headSha.length ? witnessed : e.headSha;
+    }
+  }
   return witnessedHeads.get(pr) || byPr.get(pr)?.current?.coverage?.headSha
     || events.filter(e => e.source === 'first-seen').at(-1)?.coverage?.headSha
     || events.filter(e => e.type === EVENT_TYPES.REVIEW_EXEMPT).at(-1)?.headSha
@@ -904,6 +916,7 @@ function foldWithWitness(records) {
   /** @type {Map<number, FoldedPr>} */
   const byPr = new Map();
   const witnessedHeads = new Map();
+  const witnessRows = new Map();
   const supersededHeads = new Map();
   const bearingByPr = new Map();
   for (const r of Array.isArray(records) ? records : []) {
@@ -940,6 +953,7 @@ function foldWithWitness(records) {
       if (witnessed && !sameHead(witnessed, head)) superseded.add(witnessed);
       // A restamp may abbreviate the current SHA. Keep the fullest witness already known for that commit.
       witnessedHeads.set(r.pr, sameHead(witnessed, head) && witnessed.length > head.length ? witnessed : head);
+      witnessRows.set(r.pr, r);
     }
     // #3329 — the non-bearing skip. `history` above is the ONLY thing an `observed` row touches.
     if (!verdictBears(r.verdict)) continue;
@@ -954,7 +968,7 @@ function foldWithWitness(records) {
     bearing.forEach((r, i) => { if (r.clears) lastClearAt = i; });
     entry.outstandingHolds = bearing.slice(lastClearAt + 1).filter((r) => !r.clears);
   }
-  return { byPr, witnessedHeads, bearingByPr };
+  return { byPr, witnessedHeads, bearingByPr, witnessRows, supersededHeads };
 }
 
 /**

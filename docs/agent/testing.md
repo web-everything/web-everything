@@ -1591,7 +1591,13 @@ exact root-tree identity, or identical-net-patch proof; `fromHead` and `carryRul
 Carries and restamps cannot answer a later manual hold, including mirrored inputs with a clearance baseline.
 An explicit valid approval or a fresh `clear-human` verdict covering the head must answer a manual human
 hold; an ordinary acceptance cannot. Send-back checks bind to the full scoped history so they still know
-the head rejected even after movement pruning expires a verdict or exemption's authority. Abbreviated restamp SHAs use
+the head rejected even after movement pruning expires a verdict or exemption's authority. Binding a send-back
+uses the applied head witness at its append boundary, so delayed old-head clearances, stale/headless parks,
+and delayed transitions cannot release a new send-back immediately. `ledger-send-back-head.test.mjs` covers
+these cases through PR-state derivation, a real subsequent head move, and a second send-back.
+Fresh review-run, referral and exemption heads still bind send-backs when lifecycle appends were missed;
+known superseded event heads do not. `ledger-send-back-event-head.test.mjs` covers that recovery path.
+Abbreviated restamp SHAs use
 the existing same-head comparison and never shorten a fuller witness or manufacture an invalidation.
 `ledger-head-lifecycle.test.mjs` replays all three carry rules against manual human holds, send-back releases
 across multiple moves, and abbreviated restamps through the planner, fold, append guard and drain observer.
