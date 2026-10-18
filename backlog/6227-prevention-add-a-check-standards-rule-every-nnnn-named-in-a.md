@@ -41,3 +41,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5555 (finding 1: `we:backlog/xwr4bos-prevention-make-the-card-template-require-path-test-name-on.md:16` — Make the filer emit the 'Already tracked' line only for cards whose 'Also raised by' edit is staged in the same change. Add a check:standards rule that fails a card citing '#N → recorded as Also raised by' when card N lacks the idempotency key.)
