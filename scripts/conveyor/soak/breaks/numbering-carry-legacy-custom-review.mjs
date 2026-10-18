@@ -51,9 +51,10 @@ export default {
           ...(unfinished ? {} : { finishedAt: '2026-10-17T12:01:00Z', durationMs: 60000 }) },
       ] });
     try {
-      // `on-disk`: the legacy record sits in the store. `migrated`: a reader scanned the store first, then a clone's old
-      // run folder is migrated in carrying the legacy record.
-      for (const shape of ['on-disk', 'migrated']) {
+      // `on-disk`: the legacy record sits in the store. `migrated`: a reader checked the store first, then a clone's old
+      // run folder is migrated in carrying the legacy record. `late`: the readers checked the store first, then a process
+      // still on code from before the namespace writes the legacy record straight into it.
+      for (const shape of ['on-disk', 'migrated', 'late']) {
         carry._resetNumberingRestampMemo();
         const dir = join(root, shape);
         const clone = join(root, `${shape}-clone`);
@@ -61,13 +62,14 @@ export default {
         mkdirSync(clone);
         writeRun(review('review-pr-7d7c3c1e-0b1f-4c39-9a51-000000000001', from, false), dir);
         // Written as the store wrote it before `writeRun` refused a review run outside `review-pr-`.
-        const legacy = text => writeFileSync(join(shape === 'on-disk' ? dir : clone, 'custom-live.json'), text);
-        legacy(serializeRunRecord(review('custom-live', to, true)));
-        if (shape === 'migrated') {
+        const legacy = () => writeFileSync(join(shape === 'migrated' ? clone : dir, 'custom-live.json'),
+          serializeRunRecord(review('custom-live', to, true)));
+        if (shape !== 'on-disk') {
           readReviewRunHeads({ dir });
           readReviewRunEvidence({ dir });
-          migrateLegacyRuns(clone, dir);
         }
+        legacy();
+        if (shape === 'migrated') migrateLegacyRuns(clone, dir);
         const state = { state: 'OPEN', body, labels: ['review:pending'], headRefOid: to, comments: [
           { author: { login: 'web-everything' }, body: older },
           { id: 'accepted', author: { login: 'chalbert' }, body: `✅ review — accepted\n<!-- reviewed-sha: ${from} -->` },

@@ -536,6 +536,24 @@ describe('runReviewLoopOnce — a ruling on an unchanged head resumes the paused
     expect(out.run.id).toBe('r-fresh');
   });
 
+  // PR #5520 — the readers now see a review run stored under a pre-namespace name, so the hold can name one to resume.
+  // The store will not save it again under that name; the round starts fresh instead of failing every tick.
+  it('a parked run under a pre-namespace name the store will not save again falls back to a fresh review', async () => {
+    const { declaration, registry } = setup();
+    const dir = mkdtempSync(join(tmpdir(), 'review-resume-legacy-'));
+    try {
+      const store = createFileRunStore(dir);
+      const sinks = () => sinksWith({ seen: [], ruled: { value: false } });
+      const makeJudge = () => async () => judgeOutcome(REFERRAL_ANSWER, {});
+      await runReviewLoopOnce({ declaration, registry, argv, store, sinks: sinks(), makeJudge, mintRunId: () => 'review-pr-1' });
+      writeFileSync(join(dir, 'custom-live.json'), `${JSON.stringify({ ...store.read('review-pr-1'), id: 'custom-live' }, null, 2)}\n`);
+      const out = await runReviewLoopOnce({ declaration, registry, argv, store, sinks: sinks(), makeJudge,
+        mintRunId: () => 'review-pr-2', findResumableRun: () => 'custom-live' });
+      expect(out.run.id).toBe('review-pr-2');
+      expect(store.read('custom-live').resumeOf).toBeUndefined();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('WE_REVIEW_RESUME_PARKED=0 starts a fresh review even when a parked run is resumable', async () => {
     const { declaration, registry } = setup();
     const store = createMemoryRunStore();

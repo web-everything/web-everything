@@ -648,9 +648,13 @@ export async function runReviewLoopOnce({
             adviseFinishedAt: parked.stepTimings?.find((t) => t.step === 'advise')?.finishedAt ?? null, attempts: 1 } };
       }
     } catch { rewound = null; }
+    // PR #5520 — a rewound run the store refuses to save (a review run stored under a pre-namespace name, which
+    // `writeRun` keeps out of `review-pr-` ids) is a doubt like any other: the round starts fresh instead of failing.
+    if (rewound) {
+      try { store.write(rewound); } catch { rewound = null; }
+    }
     if (rewound) {
       run = rewound;
-      store.write(run);
     } else {
       run = startRun({
         op: declaration.name,

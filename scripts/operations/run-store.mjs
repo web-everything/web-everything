@@ -23,7 +23,7 @@
  */
 
 import {
-  closeSync, copyFileSync, existsSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync,
+  appendFileSync, closeSync, copyFileSync, existsSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync,
   statSync, writeFileSync,
 } from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -91,16 +91,6 @@ export function migrateLegacyRuns(legacyDir, sharedDir) {
   try { names = readdirSync(legacyDir).filter((f) => f.endsWith('.json') && isValidRunId(f.slice(0, -5))); } catch { return { moved, skipped }; }
   if (!names.length) return { moved, skipped };
   try { mkdirSync(sharedDir, { recursive: true }); } catch { return { moved, skipped: names }; }
-  try { return moveLegacyRuns(legacyDir, sharedDir, names, moved, skipped); } finally {
-    // PR #5520 — a review run moved in under a name outside the review namespace is one the last
-    // {@link legacyReviewRunNames} scan never saw: retire that scan so the next reader looks again.
-    if (moved.some((id) => !id.startsWith(REVIEW_RUN_ID_PREFIX) && movedReviewRecord(join(sharedDir, `${id}.json`)))) {
-      retireLegacyReviewScan(sharedDir);
-    }
-  }
-}
-
-function moveLegacyRuns(legacyDir, sharedDir, names, moved, skipped) {
   for (const f of names) {
     const src = join(legacyDir, f);
     const dest = join(sharedDir, f);
@@ -184,37 +174,20 @@ function assertReviewRunNamespace(record) {
  * PR #5520 red team — REVIEW RUNS FROM BEFORE THE NAMESPACE. {@link assertReviewRunNamespace} only stops NEW writes: a
  * `review-pr` record written earlier under a chosen name (`custom-live.json`) is still on disk, and a reader that finds
  * review runs by name would never see it. Opening every other record on each read is too slow (live 2026-10-18: 133k
- * records, 27.6 s), so the store is scanned ONCE and the names of such records are kept in {@link
- * LEGACY_REVIEW_SCAN_FILE}. No new one can appear afterwards except through {@link migrateLegacyRuns}, which bumps
- * {@link LEGACY_REVIEW_EPOCH_FILE}; a scan that read an older epoch is not trusted and the store is scanned again.
- * Neither file ends in `.json`, `.tmp` or `.cache`, so no listing or cache sweep reads it as anything else.
+ * records, 27.6 s), so each record is checked ONCE, by name: {@link LEGACY_REVIEW_SCAN_FILE} is an append-only log of
+ * every name already checked, `R <name>` for a review run (or a record whose op cannot be read) and `- <name>` for any
+ * other. A name not in the log — a record that arrived since, by any route — is checked on the read that first lists
+ * it. A torn line names no `.json` file, so its record is simply checked again. The log does not end in `.json`,
+ * `.tmp` or `.cache`, so no listing or cache sweep reads it as anything else.
  */
 export const LEGACY_REVIEW_SCAN_FILE = '.review-run-legacy-scan';
-export const LEGACY_REVIEW_EPOCH_FILE = '.review-run-legacy-epoch';
 // Every writer serializes `v`, `id`, `op` first, so the op of nearly every record is in its first bytes.
 const RECORD_HEAD_RE = /^\{\s*"v":\s*\d+,\s*"id":\s*"(?:[^"\\]|\\.)*",\s*"op":\s*"((?:[^"\\]|\\.)*)"/;
+const LOG_BATCH = 1000;
 
-function readLegacyEpoch(dir) {
-  try { return readFileSync(join(dir, LEGACY_REVIEW_EPOCH_FILE), 'utf8'); } catch (e) { if (e.code === 'ENOENT') return ''; throw e; }
-}
-
-function movedReviewRecord(path) {
-  try { return isReviewRecordFile(path); } catch (e) { return e.code !== 'ENOENT'; } // unreadable: assume it may be one
-}
-
-function retireLegacyReviewScan(dir) {
-  const tmp = join(dir, `${LEGACY_REVIEW_EPOCH_FILE}.${process.pid}.${randomUUID()}.tmp`);
-  try {
-    writeFileSync(tmp, randomUUID());
-    renameSync(tmp, join(dir, LEGACY_REVIEW_EPOCH_FILE));
-  } catch {
-    rmSync(tmp, { force: true });
-    rmSync(join(dir, LEGACY_REVIEW_SCAN_FILE), { force: true }); // no epoch bump: drop the scan instead
-  }
-}
-
-/** Is the record at `path` a `review-pr` run? A record whose op cannot be read is answered `true` (fail closed: the
- *  reader then refuses it as corrupt, exactly as it refuses a corrupt `review-pr-` record). */
+/** Is the record at `path` a `review-pr` run? Decided by its `op`, even when the record fails validation; a file that
+ *  is not JSON at all is answered `true` (fail closed: the reader then refuses it as corrupt, as it refuses a corrupt
+ *  `review-pr-` record). */
 function isReviewRecordFile(path) {
   const head = Buffer.alloc(4096);
   const fd = openSync(path, 'r');
@@ -222,43 +195,58 @@ function isReviewRecordFile(path) {
   try { length = readSync(fd, head, 0, head.length, 0); } finally { closeSync(fd); }
   const match = RECORD_HEAD_RE.exec(head.toString('utf8', 0, length));
   if (match) return JSON.parse(`"${match[1]}"`) === 'review-pr';
-  const parsed = parseRunRecord(readFileSync(path, 'utf8'));
-  return !parsed.ok || parsed.record.op === 'review-pr';
+  let record;
+  try { record = JSON.parse(readFileSync(path, 'utf8')); } catch (e) { if (e.code === 'ENOENT') throw e; return true; }
+  return record?.op === 'review-pr';
 }
 
 /**
  * The file names among `names` (a listing of `dir`) that hold a `review-pr` run outside the `review-pr-` names.
- * Reads the kept scan when its epoch is current; otherwise scans every other record once and (with `persist`) keeps
- * the result. Throws when the epoch cannot be read: an unknown epoch proves nothing about which records were seen.
+ * Checks each listed name the log does not know yet and (with `persist`) appends what it found, in batches, so a long
+ * first pass that dies part-way still keeps its progress. The log is compacted to the listed names once it is twice
+ * their size.
  * @param {string} dir
  * @param {string[]} names
  * @param {{persist?: boolean}} [o]
  * @returns {string[]}
  */
 export function legacyReviewRunNames(dir, names, { persist = true } = {}) {
-  const epoch = readLegacyEpoch(dir); // read BEFORE the listing, so a migration after it retires this scan
   const file = join(dir, LEGACY_REVIEW_SCAN_FILE);
-  let found = null;
-  try {
-    const scan = JSON.parse(readFileSync(file, 'utf8'));
-    if (scan?.v === 1 && scan.epoch === epoch && Array.isArray(scan.names)) found = scan.names;
-  } catch { /* missing, torn or from another shape: scan again */ }
-  if (!found) {
-    found = readdirSync(dir).filter((n) => n.endsWith('.json') && !n.startsWith(REVIEW_RUN_ID_PREFIX)
-      && isValidRunId(n.slice(0, -'.json'.length))).filter((n) => {
-      try { return isReviewRecordFile(join(dir, n)); } catch (e) { if (e.code === 'ENOENT') return false; throw e; }
-    });
-    if (persist) {
-      const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
-      try {
-        writeFileSync(tmp, JSON.stringify({ v: 1, epoch, names: found }));
-        renameSync(tmp, file);
-      } catch { rmSync(tmp, { force: true }); } // the kept scan is only a speed-up
-    }
+  let lines = [];
+  try { lines = readFileSync(file, 'utf8').split('\n'); } catch { /* missing or unreadable: every name is checked */ }
+  const known = new Map();
+  for (const line of lines) {
+    const name = line.slice(2);
+    if (line.startsWith('R ')) known.set(name, true);
+    else if (line.startsWith('- ') && !known.has(name)) known.set(name, false);
   }
-  if (!found.length) return [];
-  const present = new Set(names);
-  return found.filter((n) => present.has(n));
+  const found = [];
+  let batch = [];
+  const flush = () => {
+    if (persist && batch.length) { try { appendFileSync(file, batch.join('')); } catch { /* the log is only a speed-up */ } }
+    batch = [];
+  };
+  for (const name of names) {
+    if (!name.endsWith('.json') || name.startsWith(REVIEW_RUN_ID_PREFIX) || !isValidRunId(name.slice(0, -'.json'.length))) continue;
+    let review = known.get(name);
+    if (review === undefined) {
+      try { review = isReviewRecordFile(join(dir, name)); } catch (e) { if (e.code === 'ENOENT') continue; throw e; }
+      known.set(name, review);
+      batch.push(`${review ? 'R' : '-'} ${name}\n`);
+      if (batch.length >= LOG_BATCH) flush();
+    }
+    if (review) found.push(name);
+  }
+  flush();
+  if (persist && lines.length > 2 * names.length + LOG_BATCH) {
+    const listed = new Set(names);
+    const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(tmp, [...known].filter(([n]) => listed.has(n)).map(([n, r]) => `${r ? 'R' : '-'} ${n}\n`).join(''));
+      renameSync(tmp, file); // a line another reader appended meanwhile is lost: its record is only checked again
+    } catch { rmSync(tmp, { force: true }); }
+  }
+  return found;
 }
 
 /** The on-disk path of one run. Refuses an id that is not filename-safe. */

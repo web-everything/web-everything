@@ -277,6 +277,23 @@ describe('numbering carry referral evidence', () => {
       expect(readReviewRunEvidence({ dir, memo: new Map(), persist: false }).map(r => [r.id, r.custom]))
         .toEqual([['custom-prior', true]]);
     });
+    it('a legacy review run that lands after the store was checked (old code, a restore) is still read', () => {
+      dir = mkdtempSync(join(tmpdir(), 'numbering-legacy-'));
+      writeRun(newRunRecord({ id: 'heavy-queue-1', op: 'heavy-queue' }), dir);
+      expect(readReviewRunHeads({ dir, memo: new Map() })).toEqual([]);
+      legacy('custom-live', TO, live['persistence-failed'], false);
+      expect(readReviewRunHeads({ dir, memo: new Map() }).map(r => r.id)).toEqual(['custom-live']);
+      expect(readReviewRunEvidence({ dir, memo: new Map() })).toEqual([]); // unfinished: a head, not evidence
+    });
+    it('only a file that is not JSON is read as a possible review run; another operation\'s record never is', () => {
+      dir = mkdtempSync(join(tmpdir(), 'numbering-legacy-'));
+      // Fails validation, but its op is plain: not a review run, so it never makes the readers refuse.
+      writeFileSync(join(dir, 'runner-activity-x.json'), JSON.stringify({ id: 'runner-activity-x', op: 'runner-activity' }));
+      expect(readReviewRunHeads({ dir, memo: new Map() })).toEqual([]);
+      // Unreadable as JSON: it may be a review run, so the readers refuse it as they refuse a corrupt review-pr- record.
+      writeFileSync(join(dir, 'torn.json'), '{"v": 1, "id": "torn"');
+      expect(() => readReviewRunHeads({ dir, memo: new Map() })).toThrow(/refusing to read run torn/);
+    });
     it('a legacy review run migrated in after the namespace scan is still read', () => {
       dir = mkdtempSync(join(tmpdir(), 'numbering-legacy-'));
       const old = mkdtempSync(join(tmpdir(), 'numbering-legacy-clone-'));
