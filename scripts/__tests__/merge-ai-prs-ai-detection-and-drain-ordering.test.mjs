@@ -659,7 +659,8 @@ describe('merge-ai-prs — #984 F2: the park strip is keyed on OBSERVED holds, n
   });
 
   it('the strip does NOT live inside the `gate.applyLabel` guard (the review:changes hole)', () => {
-    const start = src.indexOf('if (gate.applyLabel && !DRY_RUN) {');
+    expect(src).toMatch(/const candidateDryRun = DRY_RUN \|\| v\.prestagePendingCi;/);
+    const start = src.indexOf('if (gate.applyLabel && !candidateDryRun) {');
     expect(start).toBeGreaterThan(-1);
     // The block's closing anchor moved with #x9xqexm: what used to follow this guard was #2409's
     // `--remove-label review:accepted`; a re-score no longer removes it, and the comment block explaining that
