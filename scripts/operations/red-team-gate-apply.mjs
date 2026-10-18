@@ -37,8 +37,9 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  GATE_OUTCOMES, gateOutcomeForHead, gateOutcomesForHead, planRedTeamActions, readConfirmedBreaks, redTeamForHead, redTeamGateMarker,
+  GATE_OUTCOMES, breakClass, gateOutcomeForHead, gateOutcomesForHead, planRedTeamActions, readConfirmedBreaks, redTeamForHead, redTeamGateMarker,
 } from '../lib/red-team-gate.mjs';
+import { scrubPublish } from '../lib/secret-scrub.mjs';
 import { cleanFindingFile, qualifyLocusRefs, sanitizeCardField } from '../lib/review-loop-policy.mjs';
 import { IN_REPO_LOCUS } from '../lib/citation-check.mjs';
 import { DEFAULT_ROUND_CAP } from '../lib/jury-core.mjs';
@@ -120,8 +121,21 @@ export async function applyRedTeamGate({ repo, pr, dryRun = false, cap = DEFAULT
   try {
     const view = io.readPr({ repo, pr });
     const head = String(view?.headRefOid ?? '').toLowerCase();
-    const parsed = redTeamForHead(view?.comments, pr, head) ?? (io.readSavedResult ?? readSavedRedTeamResult)({ repo, pr, head });
+    const posted = redTeamForHead(view?.comments, pr, head);
+    let parsed = posted ?? (io.readSavedResult ?? readSavedRedTeamResult)({ repo, pr, head });
     if (!parsed) return { status: 'no-red-team-on-head', head };
+    // Saved evidence may be precisely the result whose comment failed this scrub. Check raw fields
+    // before clipping, plus the composed comment/card (including scope) before any publication.
+    if (!posted && [
+      parsed.findings.flatMap(f => Object.values(f)).join('\n'),
+      buildSendBackBody({ pr, head, findings: parsed.findings }),
+      ...Object.values(buildRedTeamCardInput({ repo, pr, head, findings: parsed.findings })),
+    ].some(text => scrubPublish(String(text)).length)) {
+      parsed = { ...parsed, findings: parsed.findings.map(f => ({
+        index: f.index, confirmed: f.confirmed, impact: breakClass(f), category: 'withheld',
+        summary: '[finding text withheld: failed the secret scrub]',
+      })) };
+    }
     const setting = io.readSetting();
     const plan = planRedTeamActions(parsed, setting.value);
     if (!plan.sendBack.length && !plan.card.length) return { status: 'advisory-only', head, plan };

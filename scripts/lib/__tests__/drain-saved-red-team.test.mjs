@@ -9,6 +9,7 @@ import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../drain-red-team
 import { applyRedTeamGate } from '../../operations/red-team-gate-apply.mjs';
 import { redTeamGateMarker } from '../red-team-gate.mjs';
 import { buildReviewedShaMarker, buildClearedHumanMarker } from '../review-escalation.mjs';
+import { scrubPublish } from '../secret-scrub.mjs';
 
 const head = 'a'.repeat(40), repo = 'Web-Everything/web-everything', pr = 5486;
 const row = (over = {}) => ({ dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head,
@@ -34,6 +35,16 @@ describe('saved red-team admission', () => {
     expect(hold(fixture([row({ findings, confirmedMissCount: 1 })]).env)).toMatch(/requiring send-back/);
   });
   it('no saved result keeps the hold', () => expect(hold(fixture([]).env)).toMatch(/no recorded result/));
+  it.each(['pending', 'error', undefined])('incomplete saved re-check refuses admission: %s', recheckStatus => {
+    for (const findings of [[], [{ confirmedByRecheck: false, summary: 'unverified' }]]) {
+      const { env } = fixture([row({ recheckStatus, findings })]);
+      expect(() => hold(env)).toThrow('saved red-team re-check incomplete');
+    }
+  });
+  it('incomplete saved re-check with a confirmed break still refuses admission', () => {
+    const findings = [{ confirmedByRecheck: true, impactIfUnfixed: 'broken' }, { confirmedByRecheck: false }];
+    expect(hold(fixture([row({ recheckStatus: 'pending', findings, confirmedMissCount: 1 })]).env)).toMatch(/requiring send-back/);
+  });
   it.each([{ rev: 'b'.repeat(40) }, { repo: 'other/repo' }, { pr: 999 }, { status: 'error' }, { seat: 'skeptic' }])(
     'ignores another identity or incomplete run: %j', over => {
       expect(hold(fixture([row(over)]).env)).toMatch(/no recorded result/);
@@ -63,6 +74,79 @@ describe('saved red-team admission', () => {
     expect(result.status).toBe('dry-run');
     expect(result.outcome).toBe(round === 1 ? 'sent-back' : 'round-cap');
   });
+  async function publishSaved(findings, round = 1) {
+    const { env } = fixture([row({ findings, confirmedMissCount: findings.length })]);
+    const { readSavedRedTeamResult } = await import('../drain-saved-red-team.mjs');
+    const writes = [];
+    const result = await applyRedTeamGate({ repo, pr }, {
+      readPr: () => ({ headRefOid: head, comments: [], labels: [] }),
+      readHead: () => head,
+      readSavedResult: args => readSavedRedTeamResult({ ...args, env }),
+      readSetting: () => ({ value: { broken: 'send-back', degraded: 'card', unconfirmed: 'advisory' } }),
+      readRound: () => round,
+      sendBack: input => { writes.push(input); return { ok: true }; },
+      appendSendBackEvent: () => {}, dequeueSentBack: () => {},
+      fileCard: input => { writes.push(input); return { ok: true }; },
+      postComment: input => writes.push(input), log: () => {},
+    });
+    return { result, writes };
+  }
+  const publishableFinding = impactIfUnfixed => ({ confirmedByRecheck: true, impactIfUnfixed,
+    category: 'edge-case', file: 'scripts/example.mjs', line: 12,
+    summary: 'two writers race', failure_scenario: 'both writers enter', recheckReason: 'demonstrated break' });
+  it('publishes saved findings that pass the posted-comment secret scrub to comments and cards', async () => {
+    const { result, writes } = await publishSaved(['broken', 'degraded'].map(publishableFinding));
+    expect(result.status).toBe('applied');
+    for (const text of [writes.find(w => w.body?.includes('sent back to the fixer.**')).body, writes.find(w => w.digest).digest]) {
+      expect(text).toContain('two writers race');
+      expect(text).toContain('both writers enter');
+      expect(text).toContain('demonstrated break');
+      expect(scrubPublish(text)).toEqual([]);
+    }
+  });
+  it('scrubs saved finding text after NFKC normalization composes a secret in publication output', async () => {
+    const token = ['ghp_', 'Ab3dEf4hIj5lMn6pQr7tUv8xYz9bCd0fGh1j'].join('');
+    const summary = [...token].map(c => String.fromCharCode(c.charCodeAt(0) + 0xfee0)).join('');
+    expect(scrubPublish(summary)).toEqual([]);
+    expect(scrubPublish(summary.normalize('NFKC')).length).toBeGreaterThan(0);
+    const { result, writes } = await publishSaved(['broken', 'degraded'].map(publishableFinding).map(f => ({ ...f, summary })));
+    expect(result.status).toBe('applied');
+    for (const write of writes) {
+      for (const text of Object.values(write).filter(v => typeof v === 'string')) {
+        expect(text).not.toContain(token);
+        expect(text).not.toContain(summary);
+        expect(text).not.toContain('scripts/example.mjs');
+        expect(scrubPublish(text)).toEqual([]);
+      }
+    }
+  });
+  it.each(['summary', 'failure_scenario', 'recheckReason', 'file', 'category', 'line', 'impactIfUnfixed'])(
+    'withholds all saved finding text when the secret scrub refuses %s, preserving verdict, count and class', async field => {
+      const secret = ['ghp_', 'Ab3dEf4hIj5lMn6pQr7tUv8xYz9bCd0fGh1j'].join('');
+      expect(scrubPublish(secret).length).toBeGreaterThan(0);
+      for (const [round, taintedIndex] of [[1, 0], [1, 1], [99, 0], [99, 1]]) {
+        const findings = ['broken', 'degraded'].map((impact, i) => ({ ...publishableFinding(impact), ...(i === taintedIndex ? { [field]: secret } : {}) }));
+        const { result, writes } = await publishSaved(findings, round);
+        expect(result.status).toBe('applied');
+        expect(writes.length).toBeGreaterThan(0);
+        const published = JSON.stringify(writes);
+        expect(published).not.toContain(secret);
+        for (const text of ['two writers race', 'both writers enter', 'demonstrated break', 'scripts/example.mjs', 'edge-case']) {
+          expect(published).not.toContain(text);
+        }
+        expect(scrubPublish(published)).toEqual([]);
+        const bothBroken = field === 'impactIfUnfixed' && taintedIndex === 1;
+        expect(result.plan.sendBack.length).toBe(bothBroken ? 2 : 1);
+        expect(published).toContain('confirmed break(s)');
+        // An unknown impact remains broken (fail closed), even when its text is withheld.
+        if (round === 1) expect(writes.find(w => w.body?.includes('sent back to the fixer.**')).body).toContain('broken');
+        const card = writes.find(w => w.digest);
+        if (!bothBroken) {
+          expect(card.digest).toContain('degraded');
+          expect(card.scope).toBe('');
+        }
+      }
+    });
   it('honors a trusted operator ruling after a saved break and round cap', () => {
     const findings = [{ confirmedByRecheck: true, impactIfUnfixed: 'broken' }];
     const { env } = fixture([row({ findings, confirmedMissCount: 1, scoredAt: '2026-10-17T10:00:00Z' })]);

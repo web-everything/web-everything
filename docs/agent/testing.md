@@ -49,6 +49,12 @@ Scheduler evidence counts as recorded only for a posted result or a saved live-h
 `status: ok` and a parsed `seatVerdict`; `ran` alone and unparseable rows cannot suppress the overdue fallback.
 Confirmed breaks still hold, including on card-only diffs. Regression coverage lives in
 `drain-saved-red-team.test.mjs`.
+Saved findings pass the posted-comment `scrubPublish` detector before the gate publishes a
+send-back comment or follow-up card, checking raw fields and composed output. A refusal
+withholds all finding text and file scope, retaining verdict, break count and routing class.
+Regression coverage: **publishes saved findings that pass the posted-comment secret scrub to
+comments and cards**, **withholds all saved finding text when the secret scrub refuses**,
+and **incomplete saved re-check refuses admission** (pending, error or missing status).
 Regression coverage: **includes rename sources before deciding to skip probes**, covering both
 sequential and speculative paths. The speculative fingerprint also includes rename sources.
 Replay derives rename/copy sources from diff headers using the review reader's existing parser;

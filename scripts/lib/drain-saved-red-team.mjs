@@ -1,4 +1,4 @@
-/** Completed evidence survives a withheld/failed comment. Read only; never publish saved text. */
+/** Completed evidence survives a withheld/failed comment. Readers must scrub saved text before publication. */
 import { readFileSync } from 'node:fs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { cascadePolicy, formatCascadeSourcesLine, platformPreference } from './policy-cascade.mjs';
