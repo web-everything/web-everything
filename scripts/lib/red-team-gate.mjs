@@ -101,7 +101,7 @@ export function redTeamForHead(comments, pr, head) {
   const hits = (Array.isArray(comments) ? comments : [])
     .map((c, i) => ({ c, i, parsed: isTrustedMarkerAuthor(c) ? parseRedTeamComment(typeof c === 'string' ? c : c?.body) : null }))
     .filter((x) => x.parsed && x.parsed.pr === Number(pr) && x.parsed.rev === live)
-    .sort((a, b) => (Date.parse(a.c?.createdAt) || 0) - (Date.parse(b.c?.createdAt) || 0) || a.i - b.i);
+    .sort((a, b) => (commentTime(a.c) || 0) - (commentTime(b.c) || 0) || a.i - b.i);
   return hits.at(-1)?.parsed ?? null;
 }
 
@@ -276,10 +276,14 @@ export function redTeamRulingNeeded(pr, setting = CONFIRMED_BREAKS_DEFAULTS, { r
   if (labels.includes('review:changes')) return null;
   const read = savedResult => readRedTeamDisposition({ comments: pr?.comments, pr: pr?.number, head: pr?.headRefOid, setting, savedResult });
   let disposition = read(null);
-  const savedResult = !disposition.result && readSaved ? readSaved() : null;
+  // A held break needs a trusted gate record on this head, so a thread without one never pays for the store read.
+  const savedResult = !disposition.result && readSaved && gateOutcomesForHead(pr?.comments, pr?.number, pr?.headRefOid).size
+    ? readSaved() : null;
   if (savedResult) disposition = read(savedResult);
   if (!disposition.held.length) return null;
-  const held = savedResult ? withholdUnpublishableFindings(disposition.held) : disposition.held;
+  // Same rule as the gate: one unpublishable finding withholds every finding's text.
+  const held = savedResult ? withholdUnpublishableFindings(disposition.held,
+    [disposition.result.findings.flatMap(f => Object.values(f)).join('\n')]) : disposition.held;
   return { head: disposition.result.rev, since: disposition.since, findings: held.map(({ index, file, line, summary, category, impact }) => ({ index, file, line, summary, category, impact })) };
 }
 
@@ -316,16 +320,18 @@ const recordBody = r => String((typeof r.c === 'string' ? r.c : r.c?.body) ?? ''
 /** Thread order: creation time, then thread position. A record without a time takes the time of the record before it,
  * so the key is total (a sort never meets a contradiction). PURE. */
 const threadOrder = (a, b) => a.ts - b.ts || a.i - b.i;
+/** A comment's creation time in either read shape: GraphQL/`gh pr view` (`createdAt`) or the REST thread the drain reads (`created_at`). */
+export const commentTime = c => Date.parse(c?.createdAt ?? c?.created_at);
 const indexedRecords = (comments, savedResult = null) => {
   let ts = 0;
   const records = threadRecords(comments).map((r, i) => {
-    const t = Date.parse(r.c?.createdAt);
+    const t = commentTime(r.c);
     if (Number.isFinite(t)) ts = t;
     return { ...r, i, ts };
   });
   if (savedResult) {
     const savedAt = Date.parse(savedResult.scoredAt);
-    const times = records.map(r => Date.parse(r.c?.createdAt));
+    const times = records.map(r => commentTime(r.c));
     const ordered = Number.isFinite(savedAt) && times.every((t, i) => Number.isFinite(t) && (!i || t >= times[i - 1]));
     // Internal evidence is not a posted comment. Unknown chronology cannot establish a later operator ruling
     // or bind a legacy marker; an explicit result id can still dedup the gate's own action.
@@ -472,5 +478,5 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     if (action === 'held' && !ruled) held.push(f);
     if (action === 'send-back') sendBack.push(f);
   }
-  return { result, sendBack, held, since: capRecord?.createdAt ?? null, outcome };
+  return { result, sendBack, held, since: capRecord?.createdAt ?? capRecord?.created_at ?? null, outcome };
 }

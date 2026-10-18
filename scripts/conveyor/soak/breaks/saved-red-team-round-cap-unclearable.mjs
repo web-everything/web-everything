@@ -1,5 +1,6 @@
 /** PR #5551 red team: a break the gate held at the round cap on SAVED evidence (no posted red-team comment) never
- * reached RULING NEEDED, and the advertised clear-human ruling refused it ("nothing to clear"). */
+ * reached RULING NEEDED, the advertised clear-human ruling refused it ("nothing to clear"), and on the drain's REST
+ * thread a ruling could never release it. */
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -16,7 +17,8 @@ export default {
   fixedBy: { sha: '4e9a2f798', where: 'lane/drain-reads-saved-redteam', paths: SOURCES },
   fixPresent(root) {
     return ['scripts/review-set-label.mjs', 'scripts/operations/operator-queue.mjs', 'scripts/operations/operator-why-io.mjs']
-      .every(f => readFileSync(join(root, f), 'utf8').includes('savedRedTeamFallback('));
+      .every(f => readFileSync(join(root, f), 'utf8').includes('savedRedTeamFallback('))
+      && readFileSync(join(root, 'scripts/lib/red-team-gate.mjs'), 'utf8').includes('c?.created_at');
   },
   async run({ sourceRoot } = {}) {
     const root = sourceRoot ?? resolve(fileURLToPath(import.meta.url), '../../../../..');
@@ -60,9 +62,13 @@ export default {
         'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '',
         buildReviewedShaMarker(head), buildClearedHumanMarker('operator')].join('\n') });
       if (redTeamRulingRow(repo, subject, setting, { readSaved })) violations.push('the ruling did not clear RULING NEEDED');
-      const hold = redTeamEnqueueHold({ repo, pr, head, comments, env, scheduled: true, confirmedBreaks: setting,
-        loopPayload: { verdict: { verdict: 'accept' } } });
-      if (hold) violations.push(`the ruling did not release the drain hold: ${hold}`);
+      // The drain reads the REST thread (`user.login`, `created_at`), not the GraphQL shape the queue reads.
+      const rest = comments.map(c => ({ user: { login: c.author.login }, created_at: c.createdAt, body: c.body }));
+      for (const [shape, thread] of [['GraphQL', comments], ['REST', rest]]) {
+        const hold = redTeamEnqueueHold({ repo, pr, head, comments: thread, env, scheduled: true, confirmedBreaks: setting,
+          loopPayload: { verdict: { verdict: 'accept' } } });
+        if (hold) violations.push(`the ruling did not release the drain hold on the ${shape} thread: ${hold}`);
+      }
     } finally { rmSync(dir, { recursive: true, force: true }); }
     return { violations };
   },

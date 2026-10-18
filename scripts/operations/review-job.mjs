@@ -84,6 +84,7 @@ import { execRead } from '../lib/proc-read.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
 import { liveResultGateState, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
+import { savedRedTeamFallback } from '../lib/drain-saved-red-team.mjs';
 
 import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -295,6 +296,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       const comments = readCompletePrComments(pr, { repo, exec: (f, a, o) => execRead(f, a, { ...o, cwd: root, env }) });
       return { headSha: view.headRefOid, comments };
     },
+    readSavedResult: ({ pr, repo, head }) => savedRedTeamFallback({ repo, pr, head, env })(),
     contributionPatchId: ({ sha, repo }) => contributionPatchId({ sha,
       exec: (f, a, o) => execRead(f, a, { ...o, cwd: planReviewDispatch({ pr: 1, repo }).laneRepo, env }) }),
     restampVerdict: ({ pr, repo, newHead, reason }) => {
@@ -745,6 +747,12 @@ function runReviewArc({
           const evidence = io.readCarryEvidence({ pr: planned.pr, repo: planned.repo });
           if (!/^[0-9a-f]{40}$/.test(evidence?.headSha ?? '') || !Array.isArray(evidence?.comments)) throw Error('carry evidence unreadable');
           const prior = findCarriableVerdict({ ...evidence, pr: planned.pr });
+          // A gate decision made on SAVED evidence has no posted result to re-key onto the new head, so carrying its
+          // bare markers would drop a held break (PR #5551 red team). Such a head is reviewed afresh; unreadable evidence too.
+          if (prior && !prior.advisory && prior.gateOutcomes.length
+            && (!io.readSavedResult || io.readSavedResult({ pr: planned.pr, repo: planned.repo, head: prior.sha }))) {
+            throw Error('the carried head\'s red-team result is saved, not posted');
+          }
           if (prior) {
             const priorPatchId = io.contributionPatchId({ sha: prior.sha, repo: planned.repo });
             const headPatchId = io.contributionPatchId({ sha: evidence.headSha, repo: planned.repo });

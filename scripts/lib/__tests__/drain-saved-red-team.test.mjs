@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -313,6 +313,26 @@ describe('saved round-cap break: RULING NEEDED and the clear-human ruling (PR #5
     comments.push(cleared('2026-10-17T10:02:00Z'));
     expect(redTeamRulingNeeded(subject, setting, { readSaved })).toBeNull();
     expect(hold(env, { comments, confirmedBreaks: setting })).toBeNull();
+  });
+  it('releases on the drain\'s REST thread shape (user.login, created_at) exactly as on the GraphQL shape', async () => {
+    const { env, comments, subject, readSaved } = await roundCapped();
+    const { redTeamRulingNeeded } = await import('../red-team-gate.mjs');
+    const rest = c => ({ user: { login: c.author.login }, created_at: c.createdAt, body: c.body });
+    const restSubject = { ...subject, comments: comments.map(rest) };
+    expect(redTeamRulingNeeded(restSubject, setting, { readSaved })?.since).toBe('2026-10-17T10:01:00Z');
+    expect(hold(env, { comments: restSubject.comments, confirmedBreaks: setting })).toMatch(/requiring send-back/);
+    const thread = [...comments, cleared('2026-10-17T10:02:00Z')].map(rest);
+    expect(redTeamRulingNeeded({ ...subject, comments: thread }, setting, { readSaved })).toBeNull();
+    expect(hold(env, { comments: thread, confirmedBreaks: setting })).toBeNull();
+    // An early ruling still does not release it in REST shape.
+    const early = [...comments, cleared('2026-10-17T09:00:00Z')].map(rest);
+    expect(hold(env, { comments: early, confirmedBreaks: setting })).toMatch(/requiring send-back/);
+  });
+  it('reads no saved evidence for a thread with no gate record on the live head', async () => {
+    const { redTeamRulingNeeded } = await import('../red-team-gate.mjs');
+    const readSaved = vi.fn(() => { throw new Error('must not be read'); });
+    expect(redTeamRulingNeeded({ number: pr, headRefOid: head, labels: ['review:accepted'], comments: [] }, setting, { readSaved })).toBeNull();
+    expect(readSaved).not.toHaveBeenCalled();
   });
   it('shares one fallback across callers, matching the repo slug case-insensitively', async () => {
     const { env, subject } = await roundCapped();

@@ -59,16 +59,6 @@ export function readSavedRedTeamResult({ repo, pr, head, env = process.env } = {
   })) };
 }
 
-/** Locate the saved result in the trusted thread without inventing a posted comment or an author.
- * Unknown or inconsistent chronology cannot establish a later operator ruling. */
-export function savedRedTeamPosition(result, pr, head, records) {
-  const savedAt = Date.parse(result?.scoredAt);
-  if (result?.pr !== Number(pr) || result.rev !== head || !Number.isFinite(savedAt)) return null;
-  const times = records.map(r => Date.parse(r.c?.createdAt));
-  if (times.some((t, i) => !Number.isFinite(t) || (i > 0 && t < times[i - 1]))) return null;
-  return { at: records.reduce((at, r, i) => times[i] <= savedAt ? r.at : at, -1) + 0.5 };
-}
-
 
 /** Match the scheduler's net paths, including rename/copy sources; unknown evidence still owes a pass. */
 export function skipCardOnlyRedTeam(loopPayload, env = process.env) {
