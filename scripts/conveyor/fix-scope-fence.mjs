@@ -4,6 +4,7 @@ import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { isOperatorAuthored } from '../lib/marker-authorship.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
+import { CHANGES_RE } from './fix-context-pack.mjs';
 
 export function resolveScopeFence({ env = process.env, tool = readSettings().fix, platform } = {}) {
   const bool = v => v === undefined ? undefined : /^(true|on|1)$/i.test(v) ? true : /^(false|off|0)$/i.test(v) ? false : v;
@@ -38,7 +39,7 @@ export function removalMarkers(text) {
 export function operatorScope(comments = []) {
   const notes = [], removed = [], incomplete = [];
   for (const c of comments) {
-    if (!isOperatorAuthored(c) || !/^🔁 review — changes requested/.test(c.body ?? '')) continue;
+    if (!isOperatorAuthored(c) || !CHANGES_RE.test(c.body ?? '')) continue;
     try { removed.push(...removalMarkers(c.body)); } catch (e) {
       if (!(e instanceof RangeError)) throw e;
       incomplete.push(e.message);

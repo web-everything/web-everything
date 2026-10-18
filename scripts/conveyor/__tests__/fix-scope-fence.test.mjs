@@ -73,6 +73,15 @@ describe('fix scope fence', () => {
     expect(operatorScope([{ ...comment, author: { login: 'stranger' } }]).removed).toEqual([]);
     expect(operatorScope([{ ...comment, body: 'a casual comment\nscope-removed: cdLandings' }]).removed).toEqual([]);
   });
+  it('enforces scope-removed markers in a human-review send-back (card xtbxcp8)', () => {
+    const human = { ...comment, body: '🔁 human review — changes requested\nOut of scope: every cd landing\nscope-removed: cdLandings, LANDING_BASES' };
+    const scope = operatorScope([human]);
+    expect(scope.removed).toEqual(['cdLandings', 'LANDING_BASES']);
+    expect(scope.notes).toEqual(['Out of scope: every cd landing']);
+    const decision = scopeFenceDecision({ scope: ['we:guard.mjs'], repo: 'we', ...scope, paths: ['guard.mjs'], patch: '+function cdLandings() {}', policy });
+    expect(decision).toMatchObject({ action: 'stand-down', identifiers: ['cdLandings'] });
+    expect(operatorScope([{ ...human, author: { login: 'stranger' } }]).removed).toEqual([]);
+  });
   it('blocks the #5403 reintroduction before calling the push sink', () => {
     const r = run({ readDiff: () => ({ paths: ['guard.mjs'], patch: '+function cdLandings() {}' }) });
     expect(r.result).toMatchObject({ ok: false, scopeFence: true });
