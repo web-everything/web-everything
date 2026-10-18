@@ -69,7 +69,7 @@ import { repairCloneRefs } from './lane-repair.mjs';
 import { addOverlay, removeOverlay, appendOverlayEvent } from './daemon-overlays.mjs';
 import { rebuildClone, dryRunRebuild } from './daemon-rebuild.mjs';
 import { DEFAULT_REBUILD_LOCK_WAIT_MS, REBUILD_LOCK_WAIT_ENV } from './daemon-rebuild/lease.mjs';
-import { runLiveSmokeWithRetry } from './daemon-live-smoke.mjs';
+import { runLiveSmokeWithRetry, resolveDispatchSmokeBudget, hostLooksBusy } from './daemon-live-smoke.mjs';
 import { resolveVersionedContext, submitRequest, waitForResult } from './daemon-version-runtime.mjs';
 import { switchCurrent as switchCurrentVersion, status as versionStatus } from './daemon-version-switch.mjs';
 
@@ -213,9 +213,17 @@ export function overlaySafetySettings(env = process.env, { readSettings = readSe
   const declared = readSettings() || {};
   const file = declared.overlaySafety || {};
   const retries = cascadePolicy('overlaySmoke', declared.overlaySmoke, {
-    standard: { dispatchLaunchRetries: 1 }, env,
-    envValues: { dispatchLaunchRetries: strictEnvInteger(env.WE_OVERLAY_DISPATCH_LAUNCH_RETRIES) },
-    valid: { dispatchLaunchRetries: (v) => Number.isInteger(v) && v >= 0 && v <= 1 },
+    standard: { dispatchLaunchRetries: 1, tickWaitMs: DEFAULT_REBUILD_LOCK_WAIT_MS, quietWaitMs: 60_000 }, env,
+    envValues: {
+      dispatchLaunchRetries: strictEnvInteger(env.WE_OVERLAY_DISPATCH_LAUNCH_RETRIES),
+      tickWaitMs: strictEnvInteger(env.WE_OVERLAY_TICK_WAIT_MS ?? env[REBUILD_LOCK_WAIT_ENV]),
+      quietWaitMs: strictEnvInteger(env.WE_OVERLAY_SMOKE_QUIET_WAIT_MS),
+    },
+    valid: {
+      dispatchLaunchRetries: (v) => Number.isInteger(v) && v >= 0 && v <= 1,
+      tickWaitMs: (v) => Number.isInteger(v) && v > 0,
+      quietWaitMs: (v) => Number.isInteger(v) && v >= 0,
+    },
   });
   const pick = (envVal, fileVal, allowed, dflt) => {
     for (const v of [envVal, fileVal]) {
@@ -231,10 +239,14 @@ export function overlaySafetySettings(env = process.env, { readSettings = readSe
   return {
     dispatchLaunchRetries: retries.value.dispatchLaunchRetries,
     dispatchLaunchRetriesSource: retries.sources.dispatchLaunchRetries,
+    tickWaitMs: retries.value.tickWaitMs, tickWaitMsSource: retries.sources.tickWaitMs,
+    quietWaitMs: retries.value.quietWaitMs, quietWaitMsSource: retries.sources.quietWaitMs,
     dispatchSmoke: pick(env?.WE_OVERLAY_DISPATCH_SMOKE, file.dispatchSmoke, ['on', 'off'], 'on'),
     dispatchPaths: envPaths || filePaths || [...DISPATCH_PATH_DEFAULTS],
     noPr: pick(env?.WE_OVERLAY_NO_PR, file.noPr, ['warn', 'refuse'], 'warn'),
     smokeTimeoutMs: Number.isFinite(timeout) && timeout >= 60_000 ? timeout : DEFAULT_SMOKE_TIMEOUT_MS,
+    smokeTimeoutMsSource: Number.isFinite(timeout) && timeout >= 60_000
+      ? (env.WE_OVERLAY_DISPATCH_SMOKE_TIMEOUT_MS != null ? 'env' : 'tool') : 'standard',
     smokeKind: pick(env?.WE_OVERLAY_DISPATCH_SMOKE_KIND, file.smokeKind, ['ci-heal', 'fix'], 'ci-heal'),
   };
 }
@@ -309,7 +321,7 @@ const PERMISSION_BLOCKER = /permission/i;
  * proof a command actually ran), `record` its completion record, `denials` the denied-command lines found in its
  * transcript. `pending:true` = keep waiting (no verdict yet).
  */
-export function judgeDispatchSmoke({ nonce, marker, record, denials = [], timedOut = false }) {
+export function judgeDispatchSmoke({ nonce, marker, record, denials = [], commandFailed = false, timedOut = false }) {
   const blocker = record?.result?.blocker ?? null;
   const blockerKind = typeof blocker === 'string' ? blocker : blocker?.kind;
   if (denials.length || (blockerKind && PERMISSION_BLOCKER.test(String(blockerKind))) || record?.denied) {
@@ -319,6 +331,12 @@ export function judgeDispatchSmoke({ nonce, marker, record, denials = [], timedO
         : 'the completion record is marked denied';
     return { ok: false, reason: 'commands-denied', detail };
   }
+  if (commandFailed || (record && !['started', 'done'].includes(record.status))) {
+    return { ok: false, reason: 'command-failed', detail: 'the worker completion reports failure or an unknown status' };
+  }
+  if (record?.status === 'done' && (record.exitCode > 0 || record.result?.blocker || ['failed', 'error'].includes(record.outcome))) {
+    return { ok: false, reason: 'command-failed', detail: 'the worker completion reports a failed command' };
+  }
   if (record?.status === 'done') {
     return marker === nonce ? { ok: true, reason: 'passed' } : { ok: false, reason: 'no-commands-ran', detail: 'the worker finished without running its smoke commands' };
   }
@@ -326,22 +344,23 @@ export function judgeDispatchSmoke({ nonce, marker, record, denials = [], timedO
   return { ok: false, pending: true, reason: 'pending' };
 }
 
-/** The denied-command lines in a Claude transcript (tool results marked as errors that name an approval/permission). */
-function transcriptDenials(file) {
-  let text;
-  try { text = readFileSync(file, 'utf8'); } catch { return []; }
-  const out = [];
+/** A readable tool error is evidence of failure even when it is not a permission denial. */
+function transcriptFailures(file) {
+  const text = readFileSync(file, 'utf8');
+  const denials = [];
+  let commandFailed = false;
   for (const line of text.split('\n')) {
     if (!line.includes('tool_result') || !line.includes('is_error')) continue;
     let row;
-    try { row = JSON.parse(line); } catch { continue; }
+    row = JSON.parse(line);
     for (const item of Array.isArray(row?.message?.content) ? row.message.content : []) {
       if (item?.type !== 'tool_result' || !item.is_error) continue;
       const body = typeof item.content === 'string' ? item.content : JSON.stringify(item.content ?? '');
-      if (/requires approval|permission/i.test(body)) out.push(body);
+      if (/requires approval|permission/i.test(body)) denials.push(body);
+      else commandFailed = true;
     }
   }
-  return out;
+  return { denials, commandFailed };
 }
 
 function findTranscript(ids, home = homedir()) {
@@ -427,9 +446,9 @@ export function dispatchSmokePrompt({ tree, store, marker, nonce, slug, kind, pr
 async function runRealDispatchSmokeAttempt({
   tree, env = process.env, settings = overlaySafetySettings(env), spawn = spawnSync, pollMs = 2_000, home = homedir(), log = console,
   routingPolicy = readRoutingPolicy(), probeAlive = isAlive, stopWrapper = (pid) => process.kill(pid, 'SIGTERM'),
-  diagnosticsDir = smokeDiagnosticsDir(env),
+  diagnosticsDir = smokeDiagnosticsDir(env), clock = Date.now, sleep = sleepAsync,
 }) {
-  const t0 = Date.now();
+  const t0 = clock();
   const launchStartedAt = new Date(t0).toISOString();
   const scratch = mkdtempSync(join(tmpdir(), 'we-overlay-dispatch-smoke-'));
   const store = join(scratch, 'completions');
@@ -442,7 +461,7 @@ async function runRealDispatchSmokeAttempt({
   const sessionId = randomUUID();
   const prompt = dispatchSmokePrompt({ tree, store, marker, nonce, slug, kind, pr });
   const childEnv = { ...env, OPERATION_COMPLETIONS_DIR: store, WE_POSTMORTEM_MODE: 'off', WE_SMOKE_ALLOW_REAL_WORKER: '1' }; // Deliberate real-worker sentinel smoke.
-  const base = { sessionId, scratch };
+  const base = { sessionId, scratch, timeoutMs: settings.smokeTimeoutMs };
   const model = resolvePolicyModel('claude', routingPolicy.aliases.claude.haiku ? 'haiku' : 'sonnet', routingPolicy);
   log.error?.(`daemon-load-overlay: dispatch smoke — launching one real ${kind} worker model=${model} (source routing-policy cheapest Claude alias) from ${tree} (scratch store ${store})`);
   const launch = spawn(process.execPath, [LAUNCH_HARNESS_FILE, tree, slug, kind, pr, sessionId, prompt, model, scratch, String(t0)], {
@@ -455,7 +474,7 @@ async function runRealDispatchSmokeAttempt({
       errorClass: smokeErrorClass(stderr) ?? smokeErrorClass(String(launch.error ?? '')),
       stderrFile: writeStderrTail(stderr, { dir: diagnosticsDir, label: `dispatch-${sessionId}-launch` }),
     };
-    return { ...base, ok: false, reason: 'launch-failed', detail: dispatchSummary('the launch harness failed', diagnostics), diagnostics, ms: Date.now() - t0 };
+    return { ...base, ok: false, reason: 'launch-failed', detail: dispatchSummary('the launch harness failed', diagnostics), diagnostics, ms: clock() - t0 };
   }
   let launched = {};
   try { launched = JSON.parse(String(launch.stdout).trim().split('\n').pop()); } catch { /* keep {} */ }
@@ -479,25 +498,39 @@ async function runRealDispatchSmokeAttempt({
       session ||= readdirSync(jobsDir).map((n) => join(jobsDir, n, 'state.json')).find((f) => ids.filter(Boolean).includes(readJson(f)?.sessionId)) || null;
     } catch { /* no background job file yet */ }
     markerAppeared ||= existsSync(marker);
-    const record = readJson(join(store, `${slug}.json`));
+    const recordFile = join(store, `${slug}.json`);
+    let record = null;
+    try {
+      record = JSON.parse(readFileSync(recordFile, 'utf8'));
+      if (!record || typeof record !== 'object' || Array.isArray(record)) {
+        return { ok: false, reason: 'smoke-unreadable', detail: 'completion record is not an object' };
+      }
+    }
+    catch (e) {
+      if (e.code !== 'ENOENT') return { ok: false, reason: 'smoke-unreadable', detail: 'completion record unreadable' };
+    }
     // The wrapper writes its own `started` record when it spawns the child; only a later record shows the task ran.
     recordAppeared ||= !!record && record.status !== 'started';
     const markerText = existsSync(marker) ? readFileSync(marker, 'utf8').trim() : null;
     return judgeDispatchSmoke({
-      nonce, marker: markerText, record, denials: transcript ? transcriptDenials(transcript) : [], timedOut,
+      nonce, marker: markerText, record, ...(transcript ? transcriptFailures(transcript) : {}), timedOut,
     });
   };
+  const observeClosed = timedOut => {
+    try { return observe(timedOut); }
+    catch { return { ok: false, reason: 'smoke-unreadable', detail: 'smoke evidence unreadable' }; }
+  };
   for (;;) {
-    verdict = observe(Date.now() >= deadline);
+    verdict = observeClosed(clock() >= deadline);
     if (!verdict.pending) break;
     await sleep(pollMs);
   }
   // A wrapped worker writes its own final record when `claude -p` exits — wait for it (bounded) and judge that too.
   if (verdict.ok && wrapperPid) {
-    const until = Math.min(deadline, Date.now() + 90_000);
-    while (probeAlive(wrapperPid) && Date.now() < until) await sleep(pollMs);
-    verdict = observe(false);
-    if (verdict.pending) verdict = { ok: true, reason: 'passed' };
+    const until = Math.min(deadline, clock() + 90_000);
+    while (probeAlive(wrapperPid) && clock() < until) await sleep(pollMs);
+    verdict = observeClosed(true);
+    // Once a proof disappears, an earlier observation cannot turn an incomplete final record into a pass.
   }
   const wrapperAliveAtTimeout = verdict.reason === 'timeout' ? probeAlive(wrapperPid) : null;
   if (!verdict.ok && verdict.reason === 'timeout' && wrapperAliveAtTimeout) {
@@ -518,30 +551,53 @@ async function runRealDispatchSmokeAttempt({
   const launchTimeout = verdict.reason === 'timeout' && !markerAppeared && !recordAppeared && !session && !transcript;
   if (!verdict.ok) verdict.detail = dispatchSummary(verdict.detail || verdict.reason, diagnostics);
   return {
-    ...base, ...verdict, handle, wrapperPid, transcript, diagnostics, launchTimeout, ms: Date.now() - t0,
+    ...base, ...verdict, handle, wrapperPid, transcript, diagnostics, launchTimeout, ms: clock() - t0,
   };
 }
 
-/** Retry only a launch timeout with no evidence that the worker started its task. Each attempt has its own store and session. */
+/** Retry startup noise or an overload-only timeout once; overload retries wait for a quiet host.
+ * Each attempt has its own scratch store and session. Definite failures never enter either retry path. */
 export async function runRealDispatchSmoke(args) {
-  const settings = args.settings ?? overlaySafetySettings(args.env ?? process.env);
+  const env = args.env ?? process.env;
+  const settings = args.settings ?? overlaySafetySettings(env);
   const retries = settings.dispatchLaunchRetries === 0 ? 0 : 1;
   const log = args.log ?? console;
+  const clock = args.clock ?? Date.now;
+  const sleep = args.sleep ?? sleepAsync;
+  const busy = args.hostBusy ?? (() => hostLooksBusy(env));
+  const budget = resolveDispatchSmokeBudget(env, settings.smokeTimeoutMs, args);
+  log.error?.(`daemon-load-overlay: rebuild-smoke.loadScaledBudgets timeoutMs=${budget.timeoutMs} factor=${budget.factor} (source ${budget.source}; base timeout:${settings.smokeTimeoutMsSource ?? 'standard'})`);
   log.error?.(`daemon-load-overlay: overlaySmoke.dispatchLaunchRetries=${retries} (source ${settings.dispatchLaunchRetriesSource ?? 'standard'})`);
   const attempts = [];
+  let retryNote = null;
   for (let attempt = 0; ; attempt++) {
-    const result = await runRealDispatchSmokeAttempt({ ...args, settings });
+    const result = await runRealDispatchSmokeAttempt({ ...args, settings: { ...settings, smokeTimeoutMs: budget.timeoutMs } });
     attempts.push(result);
-    if (!result.launchTimeout || attempt >= retries) {
-      if (attempt > 0) {
-        result.note = 'retried after launch timeout';
-        // The note first: the summary ends with its error class (child text), which must not pose as a later field.
-        result.detail = `${result.note}; attempts=${attempts.map((r) => r.reason).join(',')}; ${result.detail ?? result.reason}`;
-        log.error?.(`daemon-load-overlay: dispatch smoke ${result.reason} — ${result.note}`);
-      }
-      return { ...result, attempts: attempts.map((r) => ({ reason: r.reason, diagnostics: pickSmokeDiagnostics(r.diagnostics) })), ms: attempts.reduce((n, r) => n + r.ms, 0) };
+    // Only a pure timeout can be host noise. Denials, failed commands and unreadable evidence never retry.
+    const overload = result.reason === 'timeout' && busy();
+    if (overload) result.retryable = true;
+    if (result.reason === 'timeout' && (result.launchTimeout || overload) && attempt < retries) {
+      if (overload) {
+        const quietWaitMs = settings.quietWaitMs ?? 60_000;
+        log.error?.(`daemon-load-overlay: overlaySmoke.quietWaitMs=${quietWaitMs} (source ${settings.quietWaitMsSource ?? 'standard'}) — waiting for a quiet host`);
+        const until = clock() + quietWaitMs;
+        while (busy() && clock() < until) await sleep(Math.min(1000, until - clock()));
+        if (busy()) return finish(result);
+        retryNote = 'retried after host overload';
+      } else retryNote = 'retried after launch timeout';
+      log.error?.(`daemon-load-overlay: retrying dispatch smoke — ${retryNote}`);
+      continue;
     }
-    log.error?.(`daemon-load-overlay: retrying dispatch smoke after launch timeout — ${result.detail}`);
+    return finish(result);
+  }
+  function finish(result) {
+    if (attempts.length > 1) {
+      result.note = retryNote;
+      result.detail = `${result.note}; attempts=${attempts.map(r => r.reason).join(',')}; ${result.detail ?? result.reason}`;
+      log.error?.(`daemon-load-overlay: dispatch smoke ${result.reason} — ${result.note}`);
+    }
+    return { ...result, attempts: attempts.map(r => ({ reason: r.reason, diagnostics: pickSmokeDiagnostics(r.diagnostics) })),
+      ms: attempts.reduce((n, r) => n + r.ms, 0) };
   }
 }
 
@@ -675,6 +731,10 @@ export async function runDaemonLoadOverlay({
 
   // ROLLBACK — remove ONLY this overlay, then recover through `rebuildWithout`: main + every other overlay, unchanged.
   const rollBack = async (out, ctl, rebuildWithout) => {
+    if (ctl.result.reason === 'timeout' && ctl.result.retryable === true) {
+      log.error?.(`daemon-load-overlay: dispatch smoke deferred by host overload; ${ref} remains registered for a gated retry at the next tick boundary`);
+      return { ...out, adopted: false, pending: true, reason: 'dispatch-smoke-deferred' };
+    }
     const why = redactDetail(`dispatch-smoke-failed: ${ctl.result.reason}${ctl.result.detail ? ` — ${ctl.result.detail}` : ''}`, 'dispatch-smoke');
     log.error?.(`daemon-load-overlay: ${ref} FAILED the dispatch smoke (${ctl.phase}): ${why}. Removing it and recovering without it (other overlays untouched). Evidence: ${ctl.result.scratch ?? 'n/a'}${ctl.result.transcript ? `, transcript ${ctl.result.transcript}` : ''}`);
     try { removeOverlayFn(root, ref, { env, why }); } catch (e) {
@@ -759,9 +819,10 @@ export async function runDaemonLoadOverlay({
   }) : baseSmoke;
   // One monotonic deadline bounds retry admission, including stale-adoption follow-ups.
   // An admitted rebuild still completes its own smoke/finalization safety protocol.
-  const configuredBudget = Number(env?.[REBUILD_LOCK_WAIT_ENV]);
-  const budgetMs = Number.isFinite(configuredBudget) && configuredBudget > 0
-    ? configuredBudget : DEFAULT_REBUILD_LOCK_WAIT_MS;
+  const envWait = strictEnvInteger(env.WE_OVERLAY_TICK_WAIT_MS ?? env[REBUILD_LOCK_WAIT_ENV]);
+  const budgetMs = envWait > 0 ? envWait : (safety.tickWaitMs ?? overlaySafetySettings(env).tickWaitMs);
+  const budgetSource = envWait > 0 ? 'env' : (safety.tickWaitMsSource ?? 'standard');
+  log.error?.(`daemon-load-overlay: overlaySmoke.tickWaitMs=${budgetMs} (source ${budgetSource})`);
   const started = clock();
   const deadline = started + budgetMs;
   const remaining = () => Math.max(0, deadline - clock());
@@ -779,7 +840,7 @@ export async function runDaemonLoadOverlay({
       if (result.reason !== 'rebuild-in-progress') return result;
       if (!waited) {
         waited = true;
-        log.error?.(`daemon-load-overlay: waiting for a running rebuild before loading ${ref} (budget ${budgetMs}ms)`);
+        log.error?.(`daemon-load-overlay: waiting for a running rebuild before loading ${ref} (budget ${budgetMs}ms, source ${budgetSource})`);
       }
       const delay = Math.min(250, remaining());
       if (delay <= 0) break;
@@ -799,6 +860,15 @@ export async function runDaemonLoadOverlay({
       throw e;
     }
     rebuildResult = { moved: false, adopted: false, reason: `rebuild-threw: ${String((e && e.message) || e).split('\n')[0]}` };
+  }
+
+  if (rebuildResult.reason === 'tick-in-progress' && (!ctl.ran || ctl.result?.ok)) {
+    log.error?.(`daemon-load-overlay: overlaySmoke.tickWaitMs=${budgetMs} (source ${budgetSource}) — reader ${rebuildResult.heldBy ?? '?'} still active; registered overlay scheduled for its next tick boundary`);
+    // addOverlay above is the durable input consumed by the reader's own tick-start rebuild.
+    // No detached task, forced lease release, smoke bypass or claim of adoption.
+    return finishWait({ root, ref, homeBranch: base, registered: true, adopted: false, mergedAnything: false,
+      pending: true, reason: 'tick-boundary-scheduled', heldBy: rebuildResult.heldBy ?? null, warnings,
+      ...(ctl.ran ? { dispatchSmoke: { ...ctl } } : {}) });
   }
 
   let check = installedClosed(installed, { root, ref });

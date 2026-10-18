@@ -2595,3 +2595,25 @@ describe('starved rebuild wait is bounded (live 2026-10-07: 900s waits starved t
     expect(starvationLockWaitMs(60_000, 5, {})).toBeLessThanOrEqual(180_000);
   });
 });
+
+
+describe('explicit load admission of a ready candidate', () => {
+  it('honours the caller wait bound even when a passed candidate earns the long finalize wait', async () => {
+    const { cloneDir, env, lockDir } = makeFixture();
+    const { writeReadyCandidate, readReadyCandidate } = await import('../daemon-rebuild/state.mjs');
+    const before = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
+    writeReadyCandidate(cloneDir, { prevHead: before, adopt: { finalSha: before } }, env);
+    acquireRead(cloneDir, { owner: 'busy-reader', lockRoot: lockDir });
+    let time = Date.now();
+    const start = time;
+    const result = await rebuildClone({ root: cloneDir, env, asJob: false, admissionWaitMs: 25,
+      now: () => time, sleep: async ms => { time += ms; }, log: { error: vi.fn() },
+      lockOpts: { pollMs: 10 }, runSmoke: passSmoke(),
+    });
+    expect(result).toMatchObject({ moved: false, reason: 'tick-in-progress' });
+    expect(time - start).toBe(25);
+    expect(readReadyCandidate(cloneDir, env)).not.toBeNull();
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(before);
+    releaseRead(cloneDir, { owner: 'busy-reader', lockRoot: lockDir });
+  });
+});

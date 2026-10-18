@@ -29,7 +29,7 @@ import { execFileSync } from 'node:child_process';
 import { runDaemonLoadOverlay, mergeOverlayRef, dryRunOverlay, overlayInstalled } from '../daemon-load-overlay.mjs';
 import finalizeWaitBreak from '../../conveyor/soak/breaks/overlay-admission-finalize-wait.mjs';
 
-it('preserves the real rebuild finalize wait on first admission, late retries, and starvation', async () => {
+it('keeps a passed candidate pending and adopts at the reader boundary on first admission, late retries, and starvation', async () => {
   const report = await finalizeWaitBreak.run();
   expect(finalizeWaitBreak.judge(report)).toEqual([]);
 }, 60_000);
@@ -946,7 +946,7 @@ describe('runRealDispatchSmoke — the smoke worker\'s completion record goes to
   };
   const smoke = (spawn, extra = {}) => runRealDispatchSmoke({
     tree: '.', env: {}, settings: fastSettings(), spawn, home: join(work, 'home'), log: quietLog, probeAlive: () => false,
-    diagnosticsDir: join(work, 'diag'), ...extra,
+    diagnosticsDir: join(work, 'diag'), hostBusy: () => false, ...extra,
   });
 
   it('retries a launch timeout once with fresh evidence, then accepts the passing worker', async () => {
@@ -1347,7 +1347,7 @@ describe('legacy explicit load — bounded busy wait', () => {
     expect(result).toMatchObject({ adopted: true, overlayInHead: true, installedCheck: present, waitedMs: 500 });
     expect(sleep.mock.calls).toEqual([[250], [250]]);
     expect(rebuild.mock.calls.map(([o]) => o.admissionWaitMs)).toEqual([600, 350, 100]);
-    expect(log.error).toHaveBeenCalledTimes(2);
+    expect(log.error).toHaveBeenCalledTimes(3);
   });
 
   it('bounds perpetual busy attempts and clips the last sleep to the deadline', async () => {

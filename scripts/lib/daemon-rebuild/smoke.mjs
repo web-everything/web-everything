@@ -247,7 +247,7 @@ export function budgetedRunChild({ runChild = runBounded, deadline, now = Date.n
 // with backoff (it may be the environment, not the code).
 
 /** Dispatch-smoke failures that prove the overlay's launch path is broken (vs a timeout, which may be env). */
-const DISPATCH_SMOKE_DEFINITE = new Set(['commands-denied', 'no-commands-ran', 'launch-failed']);
+const DISPATCH_SMOKE_DEFINITE = new Set(['commands-denied', 'no-commands-ran', 'command-failed', 'launch-failed', 'smoke-unreadable']);
 
 /**
  * PURE given `git`: the overlays in `applied` that need the real dispatch smoke — every one NOT already in the

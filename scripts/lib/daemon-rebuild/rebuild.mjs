@@ -27,8 +27,8 @@ import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
  * full three-step design — {@link prepareRebuild} (locked, fast) → build + smoke a disposable candidate
  * (UNLOCKED — the live smoke never runs against `root` and never holds its write lock) →
  * {@link finalizeRebuild} (locked, fast, reached only after a passing smoke). A lock refusal at either locked
- * step is reported, never treated as an error. `admissionWaitMs` overrides only the initial prepare wait;
- * a smoke-passed candidate (including one already waiting on this head) retains the finalize wait.
+ * step is reported, never treated as an error. `admissionWaitMs` bounds reader waits for an explicit load,
+ * including ready adoption and finalization. Smoke still completes its safety protocol; an unadopted passed candidate stays ready.
  * @param {{root:string, env?:NodeJS.ProcessEnv, log?:Console, run?:typeof gitRun, runSmoke?:typeof runLiveSmokeWithRetry,
  *   prState?:(pr:number)=>(Promise<string|null>|string|null), lockOpts?:object, stateOpts?:{env?:NodeJS.ProcessEnv},
  *   mainOnly?:boolean, admissionWaitMs?:number, now?:()=>number, sleep?:(ms:number)=>Promise<void>,
@@ -79,7 +79,7 @@ export async function rebuildClone({
   const finalLockOpts = {
     ...(lockRootFromEnv ? { lockRoot: lockRootFromEnv } : {}),
     now,
-    waitMs,
+    waitMs: admissionWaitMs ?? waitMs,
     onBlocked: ({ blockers, waitMs: w }) => log.error?.(
       `daemon-rebuild: waiting up to ${Math.round(w / 1000)}s for live reader(s) ${blockers.join(', ')} to finish their tick before moving the clone (#4044)`,
     ),
@@ -87,24 +87,26 @@ export async function rebuildClone({
     ...lockOpts,
   };
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
-  // fix-rebuild-finalize: once a candidate has passed, the wait for readers is the longer finalize wait — the
-  // writer reservation refuses every NEW read slot meanwhile, so this only outlasts ticks already in flight.
+  // Daemon ticks retain the longer finalize wait after a pass. Explicit loads use their bounded wait;
+  // expiry keeps the passed candidate ready. Writer reservations still refuse every NEW read slot.
   const finalizeWaitMs = Number(env?.[FINALIZE_LOCK_WAIT_ENV]) > 0 ? Number(env[FINALIZE_LOCK_WAIT_ENV]) : DEFAULT_FINALIZE_LOCK_WAIT_MS;
-  const finalizeLockOpts = { ...finalLockOpts, waitMs: lockOpts.waitMs ?? Math.max(waitMs, finalizeWaitMs) };
-  // Explicit loads bound admission, while a passed smoke still earns the full finalize/starvation wait.
+  const finalizeLockOpts = { ...finalLockOpts,
+    waitMs: admissionWaitMs ?? lockOpts.waitMs ?? Math.max(waitMs, finalizeWaitMs),
+  };
+  // Explicit loads keep the reader-wait bound even when a passed candidate is already ready.
   // Keep lockOpts.waitMs as the existing all-phase override for other callers.
   const admissionLockOpts = { ...finalLockOpts, waitMs: admissionWaitMs ?? finalLockOpts.waitMs };
 
   // ── Phase 1 (locked, fast) ───────────────────────────────────────────────────────────────────────────────
   // A passed candidate waiting on THIS head (an unlocked peek — prepareRebuild re-checks it under the lock) is
-  // adopted by this phase, so it earns the finalize wait: this is the tick boundary the sibling yields at.
+  // adopted by this phase. Daemon ticks earn the finalize wait; an explicit load retains its bound.
   const pendingReady = readReadyCandidate(root, stEnv);
   const readyOnHead = !!pendingReady
     && pendingReady.prevHead === verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
   const startedMs = now();
   const prep = await withWriteLock(root, () => prepareRebuild({
     root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider,
-  }), readyOnHead ? finalizeLockOpts : admissionLockOpts);
+  }), readyOnHead && admissionWaitMs == null ? finalizeLockOpts : admissionLockOpts);
 
   if (prep.ok) {
     // live 2026-10-11 rebuild-job livelock: an adopt-only needs-build did not make progress.
