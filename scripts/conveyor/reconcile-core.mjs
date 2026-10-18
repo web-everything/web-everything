@@ -105,7 +105,7 @@ import { roundExtensionGrants } from './round-extension-mark.mjs';
 import { isAiGeneratedPr } from '../lib/ai-pr-authorship.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
-import { rulingDisputeText, noticedRungs } from '../lib/ruling-ledger.mjs';
+import { rulingDisputeText, rulingAuthority, noticedRungs } from '../lib/ruling-ledger.mjs';
 import { openOperatorSendBacks, operatorSendBackRuling } from '../lib/operator-send-backs.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
 import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
@@ -3156,7 +3156,7 @@ export function planReconcile({
         const trail = fixerLadder.policy.rungs.filter((r) => r.action === 'dispatch' && r.at < (ig.effectiveMisses ?? ig.misses)).map((r) => r.id).join(' > ');
         refuse('ruling-dispute', {
           ...withPhase, rulingNotAddressed: ig,
-          why: `${ig.matches.length} confirmed finding(s) the operator ruled block came back after ${ig.misses} miss(es)`
+          why: `${ig.matches.length} confirmed finding(s) ${rulingAuthority(ig.matches)} ruled block came back after ${ig.misses} miss(es)`
             + `${ig.returns ? ` and ${ig.returns} fixer turn(s) ended without a new head` : ''} — fixer versus reviewer disagreement, needs the operator`,
         });
         notes.push({ kind: 'ruling-dispute', prNumber, head: ig.head, misses: ig.misses, rung: 'human', files,
@@ -3167,7 +3167,7 @@ export function planReconcile({
       dispatch.push({
         ...base, ...withPhase, kind: 'fix', mode: 'ruling-not-addressed', findings: ig.matches.length,
         rulingNotAddressed: { ...ig, rung: { id: rung.id, at: rung.at, label: rung.label, instruction: rung.instruction, taskType: rung.taskType, model: route?.model ?? null }, route },
-        why: `${ig.matches.length} confirmed finding(s) the operator already ruled block came back on a new head`
+        why: `${ig.matches.length} confirmed finding(s) ${rulingAuthority(ig.matches)} already ruled block came back on a new head`
           + ` (${files.join(', ')}) — the last fix did not satisfy the ruling; escalation rung ${rung.at} (${rung.id}): ${rung.label}`,
       });
       continue;
