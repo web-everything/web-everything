@@ -32,7 +32,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFileSync } from 'node:child_process';
+import { reviewExecFileSync as execFileSync } from '../lib/review-fetch.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
 import { ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
 import { REVIEWED_SHA_MARKER, CONVERTED_ADVISORY_NOTE_MARKER, REVIEW_PR_CHANNEL, normalizeDiffFingerprint } from '../lib/review-escalation.mjs';

@@ -39,7 +39,7 @@
  * billed call — `TARGETED_CHECK_BUDGET_USD`), because the preview exists to show the ACTUAL note it would post,
  * off a real answer, never a placeholder. A caller that wants no judge spend injects `runJudge`.
  */
-import { execFileSync } from 'node:child_process';
+import { reviewExecFileSync as execFileSync } from '../lib/review-fetch.mjs';
 import { resolve } from 'node:path';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import {

@@ -1,5 +1,16 @@
 # Testing — Three-Tier Strategy
 
+## Review fetch sharing
+
+The review daemon scopes `review.fetch.sharedPerTick` (default `true`) to one tick through
+`scripts/lib/review-fetch.mjs`. The cascade reads `fetch.sharedPerTick` from the review platform
+preference and `scripts/review-settings.json`; `WE_REVIEW_FETCH_SHARED_PER_TICK=true|false`
+overrides it. The cascade logs the winning source. Review readers share branch tracking refs
+per real clone path and remote, with targeted fetches for uncovered refs; failed shared fetches
+retain each reader's existing fallback. No tick context means no command changes. Keep this
+context inside the review daemon; merge admission must continue using its existing fresh reads.
+Regression coverage uses real local Git repositories in `scripts/lib/__tests__/review-fetch.test.mjs`.
+
 ## Daemon entry boot smoke
 
 Boot each entry in a fresh child to preserve cold import graphs. `rebuildSmoke.bootConcurrency`
