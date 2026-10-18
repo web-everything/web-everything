@@ -1,5 +1,6 @@
+// @repo-scanning-test scope=full — sole ruling-needed writer across scripts.
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { planMirror, renderPlan, runMirrorReport, runMirrorApply, planLabelInputRows, readLabelTimeline, addApplyLabel, main, readSelfLogin } from '../pr-label-mirror.mjs';
@@ -54,7 +55,7 @@ describe('report only', () => {
       expect(reportPart).not.toContain(bad);
     }
     for (const bad of ['--remove-label', 'pr comment', 'ensureLabel', 'writeRun', 'execFileSync']) expect(src).not.toContain(bad);
-    expect(src).not.toMatch(/remove:\s*\[[^\]]/); // no label removal is ever requested
+    expect(src.match(/remove:\s*\[[^\]]+\]/g)).toEqual(['remove: [RULING_NEEDED_LABEL]']); // G2 removes only its own family
   });
 });
 
@@ -444,5 +445,95 @@ describe('#5649 CLI exit code', () => {
       expect(await main([bad], { apply: async () => { applied = true; return {}; }, report: async () => { applied = true; return {}; }, write })).toBe(2);
       expect(applied).toBe(false);
     }
+  });
+});
+
+
+// #5647 G2: replay the false-alert sequence through the real ledger derive and label writer.
+describe('#5647 single ruling-needed writer', () => {
+  const label = 'advisory:ruling-needed';
+  const event = (type, payload, repo = REPO, pr = 7) => buildLedgerEvent({ type, repo, pr,
+    at: '2026-10-17T19:00:00Z', source: 'mandatory-reviewer', ...payload });
+  const referral = (headSha = HEAD, repo, pr) => event('referral', { headSha, findingKeys: ['finding-1'] }, repo, pr);
+  const ruling = (repo, pr) => event('ruling', { findingKey: 'finding-1', ruling: 'not-real' }, repo, pr);
+  function replay({ repo = REPO, pr = 7, rows = [], labels = [] } = {}) {
+    const w = world({ verdict: null, labels });
+    w.rows = rows;
+    w.opts.addLabel = async () => {}; // review:human is independently covered by slice K tests
+    w.opts.repo = repo;
+    w.opts.listPrs = () => [{ number: pr, labels: [...w.labels] }];
+    w.opts.setRulingLabel = async (r, n, wanted) => {
+      const mod = await import('../pr-label-mirror.mjs');
+      await mod.setRulingNeededLabel(r, n, wanted, { provider: { setLabels: (target, number, spec) => {
+        expect([target, number]).toEqual([repo, pr]);
+        w.log.push(spec);
+        w.labels = wanted ? [...w.labels, label] : w.labels.filter(l => l !== label);
+      } } });
+    };
+    return w;
+  }
+  it('already-ruled mandatory findings never raise the false needs-you label (#5482/#5486/#5514)', async () => {
+    const w = replay({ rows: [referral(), ruling()] });
+    await runMirrorApply(w.opts);
+    expect(w.log).toEqual([]);
+    expect(w.labels).not.toContain(label);
+  });
+  it('an open referral raises, then a recorded ruling clears in one mirror pass and stays cleared', async () => {
+    const w = replay({ rows: [referral()] });
+    expect((await runMirrorApply(w.opts)).failures).toEqual([]);
+    expect(w.labels).toContain(label);
+    w.rows.push(ruling());
+    expect((await runMirrorApply(w.opts)).failures).toEqual([]);
+    expect(w.labels).not.toContain(label);
+    await runMirrorApply(w.opts);
+    expect(w.log).toEqual([{ add: label, remove: [] }, { remove: [label] }]);
+  });
+  it('plateau-app #202 replay: an overruled finding returning on head 3 clears in one pass', async () => {
+    const repo = 'plateauapp/plateau-app', pr = 202;
+    const w = replay({ repo, pr, labels: [label], rows: [referral(HEAD, repo, pr), ruling(repo, pr), referral('c'.repeat(40), repo, pr)] });
+    expect((await runMirrorApply(w.opts)).failures).toEqual([]);
+    expect(w.labels).toEqual([]);
+    await runMirrorApply(w.opts);
+    expect(w.log).toEqual([{ remove: [label] }]);
+  });
+  it('a ruling arriving during the live refresh prevents even a transient raise', async () => {
+    const w = replay({ rows: [referral()] });
+    w.opts.readTimeline = async () => { w.rows.push(ruling()); return { status: 'ok', items: [] }; };
+    await runMirrorApply(w.opts);
+    expect(w.log).toEqual([]);
+  });
+  it('unreadable fresh facts or ledger refuse removal; another identity cannot clear it', async () => {
+    for (const failure of ['facts', 'ledger', 'malformed']) {
+      const w = replay({ rows: [referral(), ruling()], labels: [label] });
+      if (failure === 'facts') w.opts.readFacts = () => null;
+      else if (failure === 'malformed') w.rows.push({ ...ruling(), ruling: 'forged' });
+      else { let n = 0; const read = w.opts.readEvents; w.opts.readEvents = (...a) => ++n === 1 ? read(...a) : { status: 'unreadable', reason: 'truncated' }; }
+      const out = await runMirrorApply(w.opts);
+      expect(out.failures).not.toHaveLength(0);
+      expect(w.log).toEqual([]);
+    }
+    const w = replay({ rows: [referral(), ruling('other/repo'), ruling(REPO, 8)] });
+    await runMirrorApply(w.opts);
+    expect(w.labels).toContain(label);
+  });
+  it('legacy sweep and ruling follow-up never write the advisory, including resume', async () => {
+    const { sweepRulingNeededLabels } = await import('../ruling-needed-sweep.mjs');
+    const writes = [];
+    const provider = { setLabels: (...a) => writes.push(a), ensureLabel: (...a) => writes.push(a) };
+    expect(sweepRulingNeededLabels({ repo: REPO, provider,
+      listPrs: () => [{ number: 7 }], readPr: () => ({ number: 7, state: 'OPEN', headRefOid: HEAD, labels: [label], comments: [] })
+    })).toEqual([{ num: 7, action: 'remove' }]);
+    const { createRecordReferralRulingSinks } = await import('../../operations/record-referral-ruling-io.mjs');
+    const { OPERATOR_RULING_FOLLOW_UP_EFFECT } = await import('../../operations/record-referral-ruling.mjs');
+    const follow = createRecordReferralRulingSinks({ readPr: () => ({ headRefOid: HEAD, labels: [label] }),
+      setLabels: (...a) => writes.push(a) })[OPERATOR_RULING_FOLLOW_UP_EFFECT];
+    expect(await follow({ repo: REPO, pr: 7, head: HEAD, action: 'resume' })).toMatchObject({ labelCleared: false });
+    expect(writes).toEqual([]);
+  });
+  it('grep guard: only the mirror passes RULING_NEEDED_LABEL to setLabels or gh label edits', () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), '../..');
+    const writers = readdirSync(root, { recursive: true }).filter(p => p.endsWith('.mjs') && !p.includes('__tests__'))
+      .filter(p => /setLabels\([^;]*RULING_NEEDED_LABEL/.test(readFileSync(join(root, p), 'utf8')));
+    expect(writers.sort()).toEqual(['conveyor/pr-label-mirror.mjs']);
   });
 });

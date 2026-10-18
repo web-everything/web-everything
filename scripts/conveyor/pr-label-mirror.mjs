@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
  * @file scripts/conveyor/pr-label-mirror.mjs
- * @description THE LABEL MIRROR (ledger plan slices G1 + K). For every open PR it diffs
+ * @description THE LABEL MIRROR (ledger plan slices G1 + G2 + K). For every open PR it diffs
  *   `derivePrState().labels` against the live labels and lists the exact add and remove set per mirrored family.
  *   REPORT MODE (the default, G1) WRITES NOTHING: no label, no comment, no ledger row, no run record.
  *   `--apply` (slice K, #5649) is the only write path: it records hand-moved hold labels as `label-input` rows
  *   (only an `added` row can hold; a hand removal is audit-only) and re-adds a derived-but-missing `review:human`.
- *   It adds that one label only and never removes any label, so it can only tighten. The write mode for the
- *   other families is a later slice.
+ *   G2 also adds/removes `advisory:ruling-needed` from ledger-derived state; this is its sole writer.
+ *   All other families remain report-only.
  *
  * The compare is slice F's (`review-ledger-check.mjs#buildDerivedRows`), reused as is, so the checker and the
  * mirror can never disagree about what drift is. `missing` there is an ADD here; `extra` is a REMOVE.
@@ -18,14 +18,16 @@
 import { pathToFileURL } from 'node:url';
 import { DEFAULT_REPO, readOpenPrs, buildDerivedRows } from '../review-ledger-check.mjs';
 import { readLedgerEventsFromStore, appendVerdictAsync, buildLedgerEvent, EVENT_TYPES, verdictClears, ledgerEventId } from '../lib/verdict-ledger.mjs';
+import { RULING_NEEDED_LABEL } from '../lib/ruling-ledger.mjs';
 import { HOLD_LABELS } from '../lib/pr-state/holds/label-input.mjs';
 import { approvalValid, acceptanceCovers } from '../lib/pr-state/holds/verdict.mjs';
+import { derivePrState } from '../lib/pr-state.mjs';
 import { readPrFacts } from '../lib/pr-state-io.mjs';
 import { readGh } from '../lib/proc-read.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 
 const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
-/** The ONE label `--apply` may add (slice K). `advisory:ruling-needed` is slice G2's family, never this one's. */
+/** The tightening-only label owned by slice K; G2 reconciles its own advisory family separately. */
 export const APPLY_ADD_LABEL = 'review:human';
 
 /**
@@ -60,6 +62,7 @@ export function renderPlan(plan, { repo = DEFAULT_REPO } = {}) {
   }
   for (const r of plan.rowsAppended ?? []) lines.push(`  appended label-input #${r.pr} ${r.label} ${r.change} by ${r.sender}`);
   for (const a of plan.labelsAdded ?? []) lines.push(`  added ${a.label} to #${a.pr}`);
+  for (const a of plan.labelsRemoved ?? []) lines.push(`  removed ${a.label} from #${a.pr}`);
   for (const f of plan.failures ?? []) lines.push(`  FAILED ${f.pr == null ? '' : `#${f.pr} `}${f.reason} (nothing written for it)`);
   return lines.join('\n');
 }
@@ -188,32 +191,40 @@ export async function addApplyLabel(repo, pr, label, { provider } = {}) {
   gh.setLabels(repo, pr, { add: label, remove: [] });
 }
 
+/** G2's sole production writer. The closed family prevents changes to any other label. */
+export async function setRulingNeededLabel(repo, pr, wanted, { provider } = {}) {
+  if (typeof wanted !== 'boolean') throw new Error('pr-label-mirror: ruling-needed requires a boolean');
+  const gh = provider ?? (await import('../lib/review-label-provider.mjs')).createGhProvider();
+  if (wanted) gh.setLabels(repo, pr, { add: RULING_NEEDED_LABEL, remove: [] });
+  else gh.setLabels(repo, pr, { remove: [RULING_NEEDED_LABEL] });
+}
+
 /**
- * THE WRITE MODE. Per candidate PR (the derive wants `review:human` and the PR lacks it, or the PR carries a hold label):
+ * THE WRITE MODE. Candidates have a missing review:human, a hold label, or ruling-needed drift.
  * read the label timeline, append the not-yet-ledgered `label-input` rows, THEN add `review:human` if it is derived and
- * missing. Row-then-add, so a crash between the two leaves a row and the next pass restores. Adds one label, removes
- * none. Fails closed: an unreadable ledger, timeline or append means no row and no add for that PR, and a failure entry
- * the CLI turns into a non-zero exit.
+ * missing. Row-then-add lets a retry restore after a crash. G2 reconciles only `advisory:ruling-needed`.
+ * Unreadable ledger, timeline, facts or append refuses label writes and produces a non-zero CLI exit.
  */
 export async function runMirrorApply({
   repo = DEFAULT_REPO, store, limit = 200, listPrs = readOpenPrs, readEvents = readLedgerEventsFromStore, buildRows = buildDerivedRows,
   readFacts = readPrFacts,
   readTimeline = readLabelTimeline, selfLogin = readSelfLogin, appendRow = (row) => appendVerdictAsync(row, store ? { store } : {}),
-  addLabel = addApplyLabel,
+  addLabel = addApplyLabel, setRulingLabel = setRulingNeededLabel,
 } = {}) {
   const prs = await listPrs({ repo, limit });
   // A full page may be a truncated list: an apply pass over part of the open PRs would call the rest "no change".
   if (prs.length >= limit) throw new Error(`pr-label-mirror: the open-PR list hit --limit=${limit}; raise it, refusing to apply on a possibly truncated list`);
   const ledger = await readEvents(repo, { store });
   const events = ledger.status === 'ok' ? ledger.rows : null;
-  const rows = deriveRowsFor(buildRows, { repo, prs, events });
+  const rows = buildRows({ repo, prs, events, readFacts });
   const plan = planMirror(rows);
-  const out = { ...plan, mode: 'apply', writes: 0, store: ledger.store, rowsAppended: [], labelsAdded: [], failures: [],
+  const out = { ...plan, mode: 'apply', writes: 0, store: ledger.store, rowsAppended: [], labelsAdded: [], labelsRemoved: [], failures: [],
     ...(ledger.status === 'ok' ? {} : { ledgerUnreadable: { reason: ledger.reason, error: ledger.error } }) };
   if (ledger.status !== 'ok') { out.failures.push({ pr: null, reason: `ledger-unreadable: ${ledger.reason}` }); return out; }
   const wantsAdd = new Map(plan.changes.map((c) => [c.pr, c.add.includes(APPLY_ADD_LABEL)]));
+  const rulingDrift = new Set(plan.changes.filter(c => c.add.includes(RULING_NEEDED_LABEL) || c.remove.includes(RULING_NEEDED_LABEL)).map(c => c.pr));
   const candidates = prs.filter((p) => Number.isInteger(p?.number) && rows.find((r) => r.pr === p.number)?.status !== 'unreadable'
-    && ((wantsAdd.get(p.number) && !liveNames(p).includes(APPLY_ADD_LABEL)) || liveNames(p).some((n) => HOLD_LABELS.includes(n))));
+    && (rulingDrift.has(p.number) || (wantsAdd.get(p.number) && !liveNames(p).includes(APPLY_ADD_LABEL)) || liveNames(p).some((n) => HOLD_LABELS.includes(n))));
   if (!candidates.length) return out;
   const self = typeof selfLogin === 'function' ? await selfLogin() : selfLogin;
   if (!self) throw new Error('pr-label-mirror: the mirror\'s own login is unknown; refusing to write');
@@ -244,13 +255,25 @@ export async function runMirrorApply({
       out.writes += 1;
       out.rowsAppended.push({ pr: p.number, label: row.label, change: row.change, sender: row.sender, at: row.at });
     }
-    if (!ok || !wantsAdd.get(p.number) || liveNames(current).includes(APPLY_ADD_LABEL)) continue;
+    if (!ok) continue;
     // The add was planned from the snapshot taken at the start of the pass: a `clear-human` that landed since must win.
-    // Re-derive this one PR from a fresh ledger read and add only if `review:human` is still wanted.
+    // Re-derive both owned families from the fresh ledger before publishing their rendering.
     const latest = await readEvents(repo, { store });
-    const again = latest.status === 'ok' ? deriveRowsFor(buildRows, { repo, prs: [current], events: latest.rows })[0] : null;
+    const again = latest.status === 'ok' ? buildRows({ repo, prs: [current], events: latest.rows, readFacts: () => facts })[0] : null;
     if (!again || again.status === 'unreadable') { fail(`rederive-unreadable: ${latest.status === 'ok' ? 'facts' : latest.reason}`); continue; }
-    if (!again.families.some((f) => f.missing.includes(APPLY_ADD_LABEL))) continue;
+    // Never infer absence of the advisory from a failed derive (which returns a holding lifecycle).
+    if (derivePrState(latest.rows, { ...facts, repo, pr: p.number }).holds.some(h => ['ledger-unreadable', 'derive-crashed', 'scope-unknown'].includes(h.code))) { fail('rederive-unreadable: ledger'); continue; }
+    const ruling = again.families.find(f => f.family === 'ruling-needed');
+    if (ruling?.missing.includes(RULING_NEEDED_LABEL) || ruling?.extra.includes(RULING_NEEDED_LABEL)) {
+      const wanted = ruling.missing.includes(RULING_NEEDED_LABEL);
+      try {
+        await setRulingLabel(repo, p.number, wanted);
+        out.writes += 1;
+        (wanted ? out.labelsAdded : out.labelsRemoved).push({ pr: p.number, label: RULING_NEEDED_LABEL });
+      } catch (e) { fail(`ruling-label-write-failed: ${firstLine(e)}`); }
+    }
+    if (!wantsAdd.get(p.number) || liveNames(current).includes(APPLY_ADD_LABEL)
+      || !again.families.some((f) => f.missing.includes(APPLY_ADD_LABEL))) continue;
     try { await addLabel(repo, p.number, APPLY_ADD_LABEL); out.writes += 1; out.labelsAdded.push({ pr: p.number, label: APPLY_ADD_LABEL }); } catch (e) {
       fail(`label-add-failed: ${firstLine(e)}`);
     }

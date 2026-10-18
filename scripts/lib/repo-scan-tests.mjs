@@ -43,6 +43,13 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
+    test: 'scripts/conveyor/__tests__/pr-label-mirror.test.mjs',
+    scope: 'full',
+    why: 'enforces that pr-label-mirror is the sole ruling-needed label writer across scripts',
+    matches: (f) => f.endsWith('.mjs') && !f.includes('__tests__') && inTree(f, ['scripts']),
+    inputs: ['scripts/conveyor/__tests__/pr-label-mirror.test.mjs'],
+  },
+  {
     test: 'scripts/lib/__tests__/exec-output-guard.test.mjs',
     scope: 'files',
     why: 'captured gh/git reads cannot exceed the per-file unbounded-output baseline',
