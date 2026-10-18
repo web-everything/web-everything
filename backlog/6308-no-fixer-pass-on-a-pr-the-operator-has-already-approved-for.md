@@ -1,4 +1,5 @@
 ---
+bornAs: x84m5n2
 kind: story
 size: 2
 status: open
