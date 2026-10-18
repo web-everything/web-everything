@@ -2480,7 +2480,8 @@ export function referralEvidenceCarry({ runs = [], repo, pr, head, readNetDiff =
   const mine = (Array.isArray(runs) ? runs : []).filter(r => r && r.repo === repo && r.pr === Number(pr));
   if (mine.some(r => r.head === head)) return null;
   const prior = [...mine].sort((a, b) => b.completedAt - a.completedAt)[0];
-  if (!prior || prior.persistenceFailed || prior.parked || (prior.pending ?? []).length) return null;
+  // PR #5520 — a run under a chosen id (`custom`) never stands in as the clean review, here or on the head it reviewed.
+  if (!prior || prior.custom || prior.persistenceFailed || prior.parked || (prior.pending ?? []).length) return null;
   let before, after;
   try { before = readNetDiff(prior.head); after = readNetDiff(head); } catch { return null; }
   if (!before?.scored || !after?.scored) return null;
@@ -2510,10 +2511,10 @@ export function assertMandatoryReferralsCleared(state, { repo, pr, cardReadable 
   const head = state.headRefOid;
   const mine = r => r.repo === repo && r.pr === Number(pr) && r.head === head;
   const current = repo && pr ? result.records.filter(mine) : [];
-  // PR #5520 operator send-back — `custom` adds review runs started under a custom `--run-id`. Such a run is still
-  // this head's newest review when it is newest, so a lost referral check below applies to it, but it never counts
-  // as the completed clean review that clears the hold.
-  const last = repo && pr ? readRuns({ custom: true }).filter(r => r.repo === repo && r.pr === Number(pr) && r.head === head)
+  // PR #5520 operator send-back — a run under a chosen `--run-id` is tagged `custom` (only the id `newRunId` mints is
+  // trusted). It is still this head's newest review when it is newest, so the lost-referral check below applies to
+  // it, but it never counts as the completed clean review that clears the hold.
+  const last = repo && pr ? readRuns().filter(r => r.repo === repo && r.pr === Number(pr) && r.head === head)
     .sort((a, b) => b.completedAt - a.completedAt)[0] : undefined;
   // The newest review of this head failed to persist its referrals: only a record written at or after that
   // review started can speak for it. An earlier record of the same head (or an undated one) proves nothing

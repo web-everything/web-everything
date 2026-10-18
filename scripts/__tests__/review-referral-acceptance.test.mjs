@@ -42,7 +42,9 @@ describe('current-head mandatory referral acceptance', () => {
   });
 
   function review({ failure = false, time = 0, reviewedHead = head, subject = repo } = {}) {
-    const run = newRunRecord({ id: `review-pr-test-${time}`, op: 'review-pr', input: { repo: subject, pr } });
+    // Shaped as `newRunId('review-pr')` mints it: a run under a chosen id never counts as a clean review (PR #5520).
+    const id = `review-pr-00000000-0000-4000-8000-${String(time).padStart(12, '0')}`;
+    const run = newRunRecord({ id, op: 'review-pr', input: { repo: subject, pr } });
     const verdict = { verdict: failure ? 'needs-human' : 'accept',
       pendingReferrals: failure ? ['referral-persistence-failed'] : [] };
     run.findings = { read: { repo: subject, pr, netBasis: { rev: reviewedHead } }, referralVerdict: verdict,

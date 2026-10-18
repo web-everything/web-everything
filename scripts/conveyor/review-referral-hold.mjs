@@ -3,13 +3,12 @@
  * Persistence failures get three retries (15/30/60 minutes), then the same event-driven hold.
  */
 import { createHash } from 'node:crypto';
-import { closeSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { liveReferralState } from '../lib/referral-live-context.mjs';
-import { resolveRunsDir, tryReadRun } from '../operations/run-store.mjs';
-import { isValidRunId } from '../operations/run-record.mjs';
+import { resolveRunsDir, REVIEW_RUN_ID_PREFIX, tryReadRun } from '../operations/run-store.mjs';
 import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
@@ -97,71 +96,25 @@ function writeAtomic(file, text) {
     renameSync(tmp, file);
   } catch { try { unlinkSync(tmp); } catch { /* best effort: the cache is only a speed-up */ } }
 }
-/** `custom` adds the review runs named outside `review-pr-` ({@link customReviewRunNames}), each tagged `custom`. */
-export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryReadRun, memo = evidenceCache, persist = true,
-  custom = false, ops = opsCache } = {}) {
-  return readRunProjections({ dir, readRun, memo, persist, project: reviewRunEvidence, cacheFile: REVIEW_EVIDENCE_CACHE_FILE,
-    custom: custom && { ops } });
+export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryReadRun, memo = evidenceCache, persist = true } = {}) {
+  return readRunProjections({ dir, readRun, memo, persist, project: reviewRunEvidence, cacheFile: REVIEW_EVIDENCE_CACHE_FILE });
 }
 export const REVIEW_RUN_STORE_MISSING = 'REVIEW_RUN_STORE_MISSING';
-/** Every `review-pr` run's reviewed head ({@link reviewRunHead}), including runs that never finished and runs named
- *  outside `review-pr-` (tagged `custom`). A missing store throws {@link REVIEW_RUN_STORE_MISSING}: it proves nothing
- *  about which heads were reviewed, so it is never `[]`. */
-export function readReviewRunHeads({ dir = resolveRunsDir(), readRun = tryReadRun, memo = headCache, persist = true,
-  ops = opsCache } = {}) {
+/** Every `review-pr` run's reviewed head ({@link reviewRunHead}), including runs that never finished. A missing store
+ *  throws {@link REVIEW_RUN_STORE_MISSING}: it proves nothing about which heads were reviewed, so it is never `[]`. */
+export function readReviewRunHeads({ dir = resolveRunsDir(), readRun = tryReadRun, memo = headCache, persist = true } = {}) {
   return readRunProjections({ dir, readRun, memo, persist, project: reviewRunHead, cacheFile: REVIEW_HEAD_CACHE_FILE,
-    custom: { ops },
     missing: () => { throw Object.assign(new Error(`review run store missing: ${dir}`), { code: REVIEW_RUN_STORE_MISSING }); } });
 }
 
-/** PR #5520 operator send-back — `--run-id` names a run anything, so a file name never proves which operation wrote
- *  it: a review-pr run named `custom-live` (or `heavy-queue-<uuid>`) is still a review. Only the `review-pr-` names
- *  that `newRunId('review-pr')` mints are read by name; every other record's `op` is read from the record itself. */
-const REVIEW_RUN_PREFIX = 'review-pr-';
-export const REVIEW_RUN_OPS_CACHE_FILE = '.review-run-ops.cache';
-// `writeRun` serializes `newRunRecord`, whose first keys are `v`, `id`, `op`: 512 bytes classify a record unparsed.
-// Anything else is parsed whole, so a torn record refuses instead of reading as another operation.
-const RECORD_HEAD_RE = /^\{\s*"v":\s*\d+,\s*"id":\s*"([A-Za-z0-9._-]+)",\s*"op":\s*"([^"\\]*)"/;
-const RECORD_HEAD_BYTES = 512;
-// dir → the names whose record is another operation's. A record's `op` never changes, so a name is classified once.
-const opsCache = new Map();
-function recordOp(name, dir, readRun) {
-  const buf = Buffer.alloc(RECORD_HEAD_BYTES);
-  let fd;
-  let n;
-  try { fd = openSync(join(dir, name), 'r'); n = readSync(fd, buf, 0, buf.length, 0); }
-  catch (e) { if (e.code === 'ENOENT') return null; throw e; }
-  finally { if (fd !== undefined) closeSync(fd); }
-  const m = RECORD_HEAD_RE.exec(buf.toString('utf8', 0, n));
-  return m && m[1] === name.slice(0, -5) ? m[2] : readRun(name.slice(0, -5), dir)?.op ?? null;
-}
-function readOpsDiskCache(file) {
-  try {
-    const c = JSON.parse(readFileSync(file, 'utf8'));
-    return new Set(c?.v === 1 && Array.isArray(c.other) ? c.other.filter(n => typeof n === 'string') : []);
-  } catch { return new Set(); }
-}
-/** The review runs named outside `review-pr-`. Every other `.json` record is classified by its own `op`. */
-function customReviewRunNames({ dir, names, readRun, persist, ops }) {
-  const file = join(dir, REVIEW_RUN_OPS_CACHE_FILE);
-  const present = new Set(names);
-  const other = ops.get(dir) ?? (persist ? readOpsDiskCache(file) : new Set());
-  let changed = false;
-  for (const n of other) if (!present.has(n)) { other.delete(n); changed = true; }
-  const found = [];
-  for (const name of names) {
-    if (!name.endsWith('.json') || name.startsWith(REVIEW_RUN_PREFIX) || other.has(name)
-      || !isValidRunId(name.slice(0, -5))) continue;
-    const op = recordOp(name, dir, readRun);
-    if (op === 'review-pr') found.push(name);
-    else if (op !== null) { other.add(name); changed = true; }
-  }
-  ops.set(dir, other);
-  if (persist && changed) writeAtomic(file, JSON.stringify({ v: 1, other: [...other] }));
-  return found;
-}
+/** PR #5520 operator send-back — the readers find review runs by name, so the name must be true: `writeRun` writes a
+ *  `review-pr` record only under a `review-pr-` id, and no other operation's ({@link REVIEW_RUN_ID_PREFIX}). Inside
+ *  that namespace a chosen `--run-id` is still possible, so only the id `newRunId('review-pr')` mints is trusted: any
+ *  other is tagged `custom`. A custom run still counts as a review of its head; it never counts as a clean one. */
+const MINTED_REVIEW_RUN_ID_RE = /^review-pr-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+export const isMintedReviewRunId = id => MINTED_REVIEW_RUN_ID_RE.test(String(id));
 
-function readRunProjections({ dir, readRun, memo, persist, project, cacheFile, missing = () => [], custom = false }) {
+function readRunProjections({ dir, readRun, memo, persist, project, cacheFile, missing = () => [] }) {
   const code = projectionCode(project);
   let names;
   try { names = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return missing(); throw e; }
@@ -169,9 +122,7 @@ function readRunProjections({ dir, readRun, memo, persist, project, cacheFile, m
   let disk = null;
   let dirty = false;
   const kept = {};
-  const named = names.filter(n => n.startsWith(REVIEW_RUN_PREFIX) && n.endsWith('.json'));
-  const extra = custom ? customReviewRunNames({ dir, names, readRun, persist, ops: custom.ops }) : [];
-  const out = [...named, ...extra].flatMap(name => {
+  const out = names.filter(n => n.startsWith(REVIEW_RUN_ID_PREFIX) && n.endsWith('.json')).flatMap(name => {
     const path = join(dir, name);
     const stat = statSync(path);
     const key = `${stat.mtimeMs}:${stat.size}`;
@@ -188,7 +139,7 @@ function readRunProjections({ dir, readRun, memo, persist, project, cacheFile, m
     memo.set(path, cached);
     kept[name] = cached;
     if (!cached.evidence) return [];
-    return [name.startsWith(REVIEW_RUN_PREFIX) ? cached.evidence : { ...cached.evidence, custom: true }];
+    return [isMintedReviewRunId(name.slice(0, -5)) ? cached.evidence : { ...cached.evidence, custom: true }];
   });
   if (persist) {
     disk ??= readEvidenceDiskCache(file, code);
