@@ -34,3 +34,10 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Emergency fast start
+
+- An operator-only mode (`rebuild.emergencyFastStart`, requires --by and --reason, both logged) starts the new build at once after a minimal check (entries-boot, tree-clean, one gh call).
+- The full smoke runs right after on the new build. The old build stays warm on hold, and on any full-smoke failure it switches back automatically.
+- It never skips the PR or prototype guard audit; it only shortens time-to-start.
+- It is never the default, and it is never usable by an agent without an operator instruction.

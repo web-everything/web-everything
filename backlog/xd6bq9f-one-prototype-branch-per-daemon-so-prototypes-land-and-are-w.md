@@ -34,3 +34,9 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Per-daemon load smoke
+
+- Today every daemon runs the same live smoke (we:scripts/lib/daemon-live-smoke.mjs): lane-pool, gh, reconcile-dry-run (~21 s), dispatch-dry-run (~37 s; fix, ci-heal and review passes), entries-boot, tree-clean. The drain spends ~58 s dry-running passes it doesn't use, and its own merge pass is only boot-checked.
+- Each daemon declares its own smoke set; the drain gets a dry run of its merge pass.
+- A shared env failure (for example gh-shim role fallback, 2026-10-18 22:10Z) names the env cause instead of rejecting every daemon's build silently.
