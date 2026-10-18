@@ -12,7 +12,7 @@ import { countFindings } from '../reconcile-core.mjs';
 import {
   reviewRunEvidence, readReviewRunEvidence, decideReferralHold, enrichPrsWithReferralHolds,
   notifyReferralHold, REFERRAL_RETRY_MS, decideSameHeadHold, resolveSameHeadMaxReviews, PENDING_REASON_TOKENS,
-  GH_LIST_COMMENT_CAP, findResumableParkedRun, blockRuledReferralsFor,
+  GH_LIST_COMMENT_CAP, findResumableParkedRun, blockRuledReferralsFor, filterFixerReferrals,
 } from '../review-referral-hold.mjs';
 
 const repo = 'web-everything/web-everything';
@@ -103,6 +103,18 @@ describe('attempted mandatory referrals', () => {
       expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'review-referrals-pending', prNumber: 3481 }));
     }
     expect(readReviewRunEvidence({ dir })).toHaveLength(1);
+  });
+  it.each([
+    ['chalbert/web-everything', 'web-everything/web-everything', true],
+    ['web-everything/web-everything', 'chalbert/web-everything', true],
+    ['web-everything/web-everything', 'other/repo', false],
+  ])('operator block wakes the paused subject %s / %s', (subjectRepo, rulingRepo, matches) => {
+    const body = buildOperatorRulingComment({ version: 1, repo: rulingRepo, pr: 3481, head,
+      actor: 'chalbert', channel: 'test', reason: 'fix the defect', at: iso(at + 1), clearerId: '',
+      rulings: [{ runId: record().runId, key, result: 'block' }] });
+    const result = decideReferralHold(pr({ comments: [comment(body)] }), [{ ...evidence(), repo: subjectRepo }],
+      { repo: subjectRepo, now: at + 2 });
+    expect(result === null).toBe(matches);
   });
   it.each(['push', 'ruling', 'operator reply', 'send-back', 'rearm'])('%s re-enables review through the planner', action => {
     const dir = temp(); vi.stubEnv('OPERATION_RUNS_DIR', dir); writeRun(run(), dir);
@@ -600,6 +612,19 @@ describe('x84m5n2 dispatch respects the latest operator word without clearing th
   const subject = (comments = [], extra = {}) => pr({ comments: [comment(renderReferralRecord(record()), at - 100), auto(at), ...comments], ...extra });
   const options = { repo, cardReadable: () => true, safety: safety(true), log: () => {} };
   const fixes = p => reconcile({ ...p, blockRuledReferrals: [{ key, finding: normalizeFinding(original) }] }, { enrichReferralHolds: x => x }).dispatch.filter(d => d.kind === 'fix');
+  it.each([
+    ['chalbert/web-everything', 'web-everything/web-everything', 1],
+    ['web-everything/web-everything', 'chalbert/web-everything', 1],
+    ['web-everything/web-everything', 'other/repo', 0],
+  ])('fixer honours latest block across repo aliases %s / %s', (recordRepo, rulingRepo, count) => {
+    const p = pr({ comments: [
+      comment(renderReferralRecord({ ...record(), repo: recordRepo })),
+      ruling('not-real', at + 10, { repo: recordRepo }),
+      ruling('block', at + 20, { repo: rulingRepo }), clear(head),
+    ] });
+    const findings = [{ key, runId: record().runId, finding: normalizeFinding(original) }];
+    expect(filterFixerReferrals(p, findings, { ...options, repo: recordRepo })).toHaveLength(count);
+  });
   it.each(['card', 'not-real'])('A1 %s suppresses only on the cleared head', result => {
     const clearedHead = 'aa45975'.padEnd(40, '0');
     for (const h of [clearedHead, 'df9ee2d'.padEnd(40, '0')]) {

@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { liveReferralState } from '../lib/referral-live-context.mjs';
 import { resolveRunsDir, REVIEW_RUN_ID_PREFIX, tryReadRun } from '../operations/run-store.mjs';
-import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER } from '../lib/jury-core.mjs';
+import { sameRepo, parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -173,7 +173,7 @@ function wakeEvents(pr, run) {
     const operatorRuling = parseOperatorRulingComment(c);
     if (operatorRuling) {
       const r = operatorRuling.record;
-      return r && r.repo === run.repo && r.pr === run.pr && r.head === run.head ? [{ at, kind: 'ruling' }] : [];
+      return r && sameRepo(r.repo, run.repo) && r.pr === run.pr && r.head === run.head ? [{ at, kind: 'ruling' }] : [];
     }
     if (body.startsWith(REARM_COMMENT_MARKER) || body.startsWith('🔁 review — changes requested')) return [{ at, kind: 'fresh' }];
     // An operator reply is a request to reconsider, never authority to clear the human gate.
@@ -333,7 +333,7 @@ export function filterFixerReferrals(pr, findings, { repo,
         && r.referrals.some(x => x.key === f.key));
       if (!records.length) return true;
       return !records.every(r => {
-        const latest = operators.filter(o => o.repo === repo && o.pr === Number(pr.number)
+        const latest = operators.filter(o => sameRepo(o.repo, repo) && o.pr === Number(pr.number)
           && o.runId === r.runId && o.key === f.key)
           .sort((a, b) => Date.parse(a.at) - Date.parse(b.at)).at(-1);
         if (latest) return cleared && (latest.result === 'not-real' || (latest.result === 'card' && cardReadable(latest.card)));

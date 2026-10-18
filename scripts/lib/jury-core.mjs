@@ -3049,7 +3049,7 @@ export function knownVerificationReasons(rows, head) {
 }
 
 // Compare repo aliases without rewriting authored referral or ruling records.
-const sameRepo = (a, b) => canonicalizeSlug(a) === canonicalizeSlug(b);
+export const sameRepo = (a, b) => canonicalizeSlug(a) === canonicalizeSlug(b);
 
 const supersededRulings = (ruling) => ruling.supersedes == null ? []
   : Array.isArray(ruling.supersedes) ? ruling.supersedes : [ruling.supersedes];

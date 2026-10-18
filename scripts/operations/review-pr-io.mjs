@@ -5,7 +5,7 @@ import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { readReviewCiGate, readReviewHead } from '../lib/review-ci-gate-io.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
+import { sameRepo, normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
   readReferralRecords, mandatoryReferralState, renderReferralRecord, readOperatorRulings,
   findCarriedOperatorRuling, findCarriedReviewerRuling, exactCitedPath, REFERRAL_CARRY_REASON, activeReferrals, liveReferrals, referralRecheck, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON,
   findingIdentityTable, findingIdOf, findingIdentityPromptRows, sameAsLinkAllowed, FINDING_ID_PATTERN, FINDING_SAME_AS_MANDATE,
@@ -1061,7 +1061,7 @@ export function createReviewPrSinks({
           // clear a standing `block`.
           const dropped = activeReferrals(record).filter(f => referralSeatDisabled(f.seat, env)
             && !record.rulings.some(r => r.key === f.key)
-            && !priorOperatorRulings.some(o => o.repo === record.repo && o.pr === record.pr
+            && !priorOperatorRulings.some(o => sameRepo(o.repo, record.repo) && o.pr === record.pr
               && o.head === record.head && o.runId === record.runId && o.key === f.key))
             .map(f => ({ key: f.key, reason: REFERRAL_DROP_REASON }));
           if (!dropped.length) continue;
@@ -1213,7 +1213,7 @@ export function createReviewPrSinks({
             for (const f of activeReferrals(record)) {
               if ((record.carried ?? []).some(c => c.key === f.key)
                 || (stillPending && record.rulings.some(r => r.key === f.key) && !stillPending.has(f.key))
-                || operatorRulings.some(o => o.repo === record.repo && o.pr === record.pr
+                || operatorRulings.some(o => sameRepo(o.repo, record.repo) && o.pr === record.pr
                   && o.head === record.head && o.runId === record.runId && o.key === f.key)) continue;
               // #76c — else the mandatory reviewer's own counted not-real/card on the same deterministic finding
               // identity (never a block, never a declared link); the same unchanged-lines proof applies below.
@@ -1417,7 +1417,7 @@ export function createReviewPrSinks({
             if (record.repo !== read.repo || record.pr !== read.pr || record.head !== reviewed) continue;
             const effective = referralRecordState(record, { ...context(live), head: reviewed, records: settled.records,
               operatorRulings: settled.operatorRulings });
-            const operatorOn = key => (settled.operatorRulings ?? []).filter(o => o.repo === record.repo && o.pr === record.pr
+            const operatorOn = key => (settled.operatorRulings ?? []).filter(o => sameRepo(o.repo, record.repo) && o.pr === record.pr
               && o.head === record.head && o.runId === record.runId && o.key === key);
             const active = activeReferrals(record);
             for (const f of active) {
