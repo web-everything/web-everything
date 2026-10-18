@@ -19,10 +19,18 @@ Add TIERED retention. Each tier is a setting under `operations.runs`.
 
 The tier list is data (a setting), so a new operation is classified in one place; an unclassified operation is treated as Tier B (never deleted).
 
+## Archive target (operator 2026-10-18)
+- Archives (tier b) go to a private Google Drive folder via rclone for now. Setting `operations.archive.target` (default `gdrive-rw:we-ops-archive`), with its source logged. Keep a local copy for `operations.archive.localDays` (90).
+- Before each upload, a secrets scan runs (`operations.archive.scanSecrets`, on); an upload that fails the scan is refused, never forced.
+- The target is a policy, not hard-coded: the product (plateau) will later offer storage policies (Drive, object storage, self-hosted), selected by the same setting.
+- The uploader uses the existing `gdrive-rw` rclone remote; agents never read or print its credential.
+- Acceptance adds `[A3] Executable`: a test that the uploader refuses when the secrets scan fails, and one that the target is read from the setting.
+
 ## Acceptance
 
 - [A1] **Executable** — `npm run test:unit -- run-store-retention` fails before and passes after, covering: tier classification of every operation named above plus an unknown one (falls to Tier B); Tier A deleted past 2 days and kept inside it; Tier B compressed past 14 days into the month's archive; the archive round-trip (each reader above still returns the same records from an archive as from the loose file); open-PR records kept uncompressed in both tiers; scans stay bounded (a store with thousands of old records lists in a bounded number of reads).
 - [A2] The prune/compress step is a declared operation with a `--preview` that lists what it would delete and compress, and changes nothing.
+- [A3] **Executable** — a test that the uploader refuses when the secrets scan fails, and a test that the archive target is read from the `operations.archive.target` setting.
 
 ## Non-goals
 
