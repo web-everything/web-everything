@@ -13,7 +13,7 @@ Live 2026-10-18 #5549: the operator cleared it at head aa45975 (the 3 auto-polic
 
 ## Acceptance
 
-- [A1] **Executable** — a vitest case in `we:scripts/conveyor/__tests__/review-referral-hold.test.mjs` replays the #5549 sequence (head aa45975 cleared by the operator, the auto-policy blocks carded `we:backlog/xildp3y.md`, then df9ee2d with the same finding under a new auto-policy block) and asserts `blockRuledReferralsFor` and the reconcile pass dispatch no fixer. It fails before the fix and passes after, run through the heavy-admission queue.
+- [A1] **Executable** — a vitest case in `we:scripts/conveyor/__tests__/review-referral-hold.test.mjs` replays the #5549 sequence (head aa45975 cleared by the operator, the auto-policy blocks deferred to card xildp3y, then df9ee2d with the same finding under a new auto-policy block) and asserts `blockRuledReferralsFor` and the reconcile pass dispatch no fixer. It fails before the fix and passes after, run through the heavy-admission queue.
 
 ## Non-goals
 
