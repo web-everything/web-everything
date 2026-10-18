@@ -1,3 +1,4 @@
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { reviewStartGate, fastChecksFor, REVIEW_TIMING_DEFAULTS, joinedFixDecision, fixReadiness, FIX_TIMING_DEFAULTS } from '../lib/review-timing.mjs';
 /**
  * reconcile-core.mjs — the PURE reconcile pass (#3296): compare DESIRED delivery state against ACTUAL, for
@@ -104,7 +105,7 @@ import { reviewStartGate, fastChecksFor, REVIEW_TIMING_DEFAULTS, joinedFixDecisi
 import { roundExtensionGrants } from './round-extension-mark.mjs';
 import { isAiGeneratedPr } from '../lib/ai-pr-authorship.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
-import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
+import { filterFixerReferrals, REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
 import { rulingDisputeText, rulingAuthority, noticedRungs } from '../lib/ruling-ledger.mjs';
 import { openOperatorSendBacks, operatorSendBackRuling } from '../lib/operator-send-backs.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
@@ -2002,7 +2003,16 @@ export function planReconcile({
 
   // Stable: only the red-main fix PR moves to the front; every other PR keeps its order.
   const orderedPrs = (Array.isArray(prs) ? [...prs] : []).sort((a, b) => (isMainFixPriority(a?.number) ? 0 : 1) - (isMainFixPriority(b?.number) ? 0 : 1));
-  for (const pr of orderedPrs) {
+  for (const originalPr of orderedPrs) {
+    const subjectRepo = CONSTELLATION_REPOS[repo]?.slug ?? repo;
+    const pr = { ...originalPr };
+    if (Array.isArray(pr.blockRuledReferrals)) {
+      pr.blockRuledReferrals = filterFixerReferrals(pr, pr.blockRuledReferrals, { repo: subjectRepo });
+    }
+    if (pr.ignoredRulings?.matches?.length) {
+      const matches = filterFixerReferrals(pr, pr.ignoredRulings.matches.map(m => ({ ...m, key: m.finding.key })), { repo: subjectRepo });
+      pr.ignoredRulings = { ...pr.ignoredRulings, matches: matches.map(({ key, ...m }) => m) };
+    }
     const prNumber = Number(pr?.number);
     if (!Number.isInteger(prNumber) || prNumber <= 0) continue; // not a PR record; nothing to key on.
     const mainFixPriority = isMainFixPriority(prNumber);

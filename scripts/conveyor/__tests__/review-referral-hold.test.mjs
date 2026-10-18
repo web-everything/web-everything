@@ -3,7 +3,7 @@ import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord, tryReadRun, writeRun } from '../../operations/run-store.mjs';
-import { mandatoryReferralReviewer, mandatoryReferralState, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
+import { buildOperatorRulingComment, mandatoryReferralReviewer, mandatoryReferralState, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
 import { referralCardReadable } from '../../lib/referral-card-readable.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { runReconcilePass as runReconcilePassWithTiming } from '../reconcile-pass.mjs';
@@ -12,7 +12,7 @@ import { countFindings } from '../reconcile-core.mjs';
 import {
   reviewRunEvidence, readReviewRunEvidence, decideReferralHold, enrichPrsWithReferralHolds,
   notifyReferralHold, REFERRAL_RETRY_MS, decideSameHeadHold, resolveSameHeadMaxReviews, PENDING_REASON_TOKENS,
-  GH_LIST_COMMENT_CAP, findResumableParkedRun,
+  GH_LIST_COMMENT_CAP, findResumableParkedRun, blockRuledReferralsFor,
 } from '../review-referral-hold.mjs';
 
 const repo = 'web-everything/web-everything';
@@ -56,11 +56,11 @@ const pr = (overrides = {}) => ({ number: 3481, headRefOid: head, headRefName: '
 const evidence = opts => reviewRunEvidence(run(opts));
 const hold = (p = pr(), runs = [evidence()], now = at + 1) => decideReferralHold(p, runs, { repo, now });
 
-function reconcile(p) {
+function reconcile(p, options = {}) {
   return runReconcilePass({ repo, now: at + 1, readPrs: () => [p], readAgents: () => [], enrich: x => x,
     enrichMainRed: prs => ({ prs }), enrichAlreadyLanded: x => x, enrichBaseRef: x => x,
     enrichSystemFix: x => x, enrichFixClaims: x => x, enrichTimeouts: x => x,
-    resolveMainSha: () => null, readRequiredChecks: () => ({ checks: ['test'] }),
+    resolveMainSha: () => null, readRequiredChecks: () => ({ checks: ['test'] }), ...options,
   });
 }
 
@@ -583,5 +583,103 @@ describe('a ruling on an unchanged head resumes the parked run (replay of #4361)
       expect(reviewRunEvidence(late)).toMatchObject({ parked: true, pending: [key] });
       expect(find(pr({ comments: thread([ruling]) }), [reviewRunEvidence(late)])).toEqual({ id: 'review-pr-parked', head });
     });
+  });
+});
+
+
+describe('x84m5n2 dispatch respects the latest operator word without clearing the gate', () => {
+  const safety = value => ({ value: { noFixerOnClearedRuled: value }, sources: { noFixerOnClearedRuled: 'tool' } });
+  const ruling = (result, time, overrides = {}) => {
+    const r = { version: 1, repo, pr: 3481, head, actor: 'chalbert', channel: 'operator',
+      reason: 'explicit operator instruction', at: iso(time), clearerId: 'session',
+      rulings: [{ runId: record().runId, key, result, ...(result === 'card' ? { card: `we:backlog/${readdirSync('backlog').find(n => /^\d+-.+\.md$/.test(n))}` } : {}) }], ...overrides };
+    return comment(buildOperatorRulingComment(r), time);
+  };
+  const auto = time => ruling('block', time, { actor: 'auto-policy' });
+  const clear = h => comment(`✅ review — accepted\n<!-- reviewed-sha: ${h} -->\n<!-- cleared-human: chalbert -->`, at + 20);
+  const subject = (comments = [], extra = {}) => pr({ comments: [comment(renderReferralRecord(record()), at - 100), auto(at), ...comments], ...extra });
+  const options = { repo, cardReadable: () => true, safety: safety(true), log: () => {} };
+  const fixes = p => reconcile({ ...p, blockRuledReferrals: [{ key, finding: normalizeFinding(original) }] }, { enrichReferralHolds: x => x }).dispatch.filter(d => d.kind === 'fix');
+  it.each(['card', 'not-real'])('A1 replay #5549: %s survives a new head and auto-policy block', result => {
+    const clearedHead = 'aa45975'.padEnd(40, '0');
+    for (const h of [clearedHead, 'df9ee2d'.padEnd(40, '0')]) {
+      const p = pr({ headRefOid: h, comments: [
+        comment(renderReferralRecord({ ...record(), head: clearedHead }), at - 100),
+        ruling('block', at, { actor: 'auto-policy', head: clearedHead }),
+        ruling(result, at + 10, { head: clearedHead, reason: 'deferred to card xildp3y' }), clear(clearedHead),
+        comment(renderReferralRecord({ ...record(), head: h }), at + 31),
+        ruling('block', at + 32, { actor: 'auto-policy', head: h })] });
+      expect(blockRuledReferralsFor(p, options)).toEqual([]);
+      expect(fixes(p)).toEqual([]);
+      expect(reconcile(p).dispatch.filter(d => d.kind === 'fix')).toEqual([]);
+    }
+  });
+  it('A2 unmatched open block still dispatches', () => {
+    expect(blockRuledReferralsFor(subject(), options)).toHaveLength(1);
+    expect(fixes(subject())).toHaveLength(1);
+  });
+  it.each(['card', 'not-real'])('A2 %s omits only its own finding; gate unchanged', result => {
+    const otherOriginal = { ...original, summary: 'distinct broken case' };
+    const other = { ...record().referrals[0], key: referralFindingKey('judge', otherOriginal), original: otherOriginal, finding: normalizeFinding(otherOriginal) };
+    const rec = { ...record(), referrals: [...record().referrals, other], rulings: [
+      { id: 'other-block', key: other.key, reviewerId: record().reviewer.id, lens: record().reviewer.lens,
+        result: 'block', rationale: 'broken', evidence: ['diff'] }] };
+    const p = pr({ comments: [comment(renderReferralRecord(rec), at - 100), auto(at), ruling(result, at + 10), auto(at + 30)] });
+    const before = mandatoryReferralState(p.comments, { repo, pr: p.number, head, body: p.body, createdAt: p.createdAt, cardReadable: () => true });
+    expect(before.pending).toEqual([]);
+    expect(before.blocked).toContain(key);
+    expect(blockRuledReferralsFor(p, options).map(f => f.key)).toEqual([other.key]);
+    const out = reconcile({ ...p, blockRuledReferrals: blockRuledReferralsFor(p, { ...options, safety: safety(false) }) }, { enrichReferralHolds: x => x });
+    expect(out.dispatch.find(d => d.kind === 'fix')?.blockRuledReferrals.map(f => f.key)).toEqual([other.key]);
+    expect(mandatoryReferralState(p.comments, { repo, pr: p.number, head, body: p.body, createdAt: p.createdAt, cardReadable: () => true })).toEqual(before);
+  });
+  it.each([
+    ['exact', {} , true], ['repo', { repo: 'other/repo' }, false], ['PR', { pr: 3482 }, false],
+    ['run', { rulings: [{ runId: 'other-run', key, result: 'not-real' }] }, false],
+    ['key', { rulings: [{ runId: record().runId, key: 'other-key', result: 'not-real' }] }, false],
+  ])('A3 identity %s', (_name, overrides, suppressed) => {
+    const p = subject([ruling('not-real', at + 10, overrides), auto(at + 30)]);
+    expect(blockRuledReferralsFor(p, options)).toHaveLength(suppressed ? 0 : 1);
+    expect(fixes(p)).toHaveLength(suppressed ? 0 : 1);
+  });
+  it.each([['card', 'block', 1], ['not-real', 'block', 1], ['block', 'card', 0], ['block', 'not-real', 0]])(
+    'A4 latest chronologically: %s -> %s', (first, last, count) => {
+      // Deliberately reverse comment order; timestamps decide, not array position.
+      const p = subject([ruling(last, at + 20), ruling(first, at + 10), clear(head), auto(at + 30)]);
+      expect(blockRuledReferralsFor(p, options)).toHaveLength(count);
+      expect(fixes(p)).toHaveLength(count);
+    });
+  it.each(['card', 'not-real', 'block'])('A5 newer policy after operator %s is not a human ruling or clearance', result => {
+    const p = subject([ruling(result, at + 10), auto(at + 30)]);
+    expect(blockRuledReferralsFor(p, options)).toHaveLength(result === 'block' ? 1 : 0);
+    expect(fixes(subject([auto(at + 40)]))).toHaveLength(1);
+  });
+  it('live human clearance suppresses auto-only blocks; an explicit operator block still dispatches', () => {
+    expect(blockRuledReferralsFor(subject([clear(head)]), options)).toEqual([]);
+    expect(fixes(subject([clear(head)]))).toEqual([]);
+    expect(fixes(subject([clear(head), ruling('block', at + 40)]))).toHaveLength(1);
+  });
+  it.each(['card', 'not-real'])('also filters the ignored-ruling dispatch path for %s', result => {
+    const p = subject([ruling(result, at + 10), auto(at + 30)], { ignoredRulings: {
+      matches: [{ finding: { key, summary: original.summary }, runId: record().runId }], misses: 1, effectiveMisses: 1,
+    } });
+    expect(fixes(p)).toEqual([]);
+  });
+  it('unreadable card and malformed ruling evidence retain the fixer', () => {
+    const p = subject([ruling('card', at + 10), auto(at + 30)]);
+    expect(blockRuledReferralsFor(p, { ...options, cardReadable: () => false })).toHaveLength(1);
+    const damaged = subject([ruling('not-real', at + 10), auto(at + 30),
+      comment('<!-- mandatory-referral-operator-ruling-v1: broken -->')]);
+    expect(blockRuledReferralsFor(damaged, options)).toEqual(
+      blockRuledReferralsFor(damaged, { ...options, safety: safety(false) }));
+    expect(fixes(damaged)).toHaveLength(1);
+  });
+  it('rollback retains dispatch and suppression logs value and source', () => {
+    const p = subject([ruling('not-real', at + 10), auto(at + 30)]), log = vi.fn();
+    expect(blockRuledReferralsFor(p, { ...options, safety: safety(false) })).toHaveLength(1);
+    expect(blockRuledReferralsFor(p, { ...options, log })).toEqual([]);
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/review.noFixerOnClearedRuled=true.*tool/));
+    vi.stubEnv('WE_REVIEW_NO_FIXER_ON_CLEARED_RULED', 'false');
+    expect(fixes(p)).toHaveLength(1);
   });
 });

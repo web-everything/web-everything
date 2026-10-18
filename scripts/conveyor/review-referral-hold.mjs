@@ -14,7 +14,8 @@ import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authors
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
-import { parseReviewedSha } from '../lib/review-escalation.mjs';
+import { resolveReferralSafetySettings } from '../lib/review-settings.mjs';
+import { parseLatestHumanClearedSha, parseReviewedSha } from '../lib/review-escalation.mjs';
 
 export const REFERRAL_HOLD_MARKER = 'review paused:';
 export const GH_LIST_COMMENT_CAP = 100;
@@ -295,13 +296,63 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
  * (live 2026-10-06, #4017: three `block` rulings, the pause refused every fix tick, so no push ever came).
  * Read exactly as the gate reads it. Any pending referral, or no block, answers `[]`. Never throws.
  */
-export function blockRuledReferralsFor(pr, { repo, cardReadable = ref => referralCardReadable(ref, REPO_ROOT) } = {}) {
+export function blockRuledReferralsFor(pr, { repo, cardReadable = ref => referralCardReadable(ref, REPO_ROOT), ...options } = {}) {
   try {
     if (!sha(pr?.headRefOid)) return [];
     const live = liveReferralState(pr, { repo, pr: Number(pr.number), cardReadable });
     if (live.pending.length || !live.blockedFindings?.length) return [];
-    return live.blockedFindings.map(b => ({ key: b.key, findingId: b.findingId ?? null, finding: b.finding }));
+    return filterFixerReferrals(pr, live.blockedFindings.map(b => ({ key: b.key, findingId: b.findingId ?? null, finding: b.finding })),
+      { repo, cardReadable, ...options });
   } catch { return []; }
+}
+
+/** Dispatch only: never mutate the gate or infer identity from similar finding prose.
+ * Every current record holding a key must qualify; unknown/malformed evidence retains the dispatch.
+ * Head is deliberately absent from operator identity: a new auto-policy block cannot undo that word.
+ */
+export function filterFixerReferrals(pr, findings, { repo,
+  cardReadable = ref => referralCardReadable(ref, REPO_ROOT),
+  safety = resolveReferralSafetySettings(), log = line => console.error(line),
+} = {}) {
+  if (safety.value.noFixerOnClearedRuled !== true || !findings?.length) return findings;
+  try {
+    const read = readReferralRecords(pr.comments, { head: pr.headRefOid });
+    if (read.malformed || !repo || !sha(pr.headRefOid)) return findings;
+    const operators = [];
+    for (const comment of pr.comments ?? []) {
+      const parsed = parseOperatorRulingComment(comment);
+      if (parsed?.malformed) return findings;
+      const r = parsed?.record;
+      if (!r || r.actor.toLowerCase() === 'auto-policy') continue;
+      for (const x of r.rulings) operators.push({ ...x, repo: r.repo, pr: r.pr, at: r.at });
+    }
+    const cleared = parseLatestHumanClearedSha(pr.comments) === pr.headRefOid;
+    const kept = findings.filter(f => {
+      const records = read.records.filter(r => r.repo === repo && r.pr === Number(pr.number)
+        && r.head === pr.headRefOid && (!f.runId || f.runId === r.runId)
+        && r.referrals.some(x => x.key === f.key));
+      if (!records.length) return true;
+      return !records.every(r => {
+        const latest = operators.filter(o => o.repo === repo && o.pr === Number(pr.number)
+          && o.runId === r.runId && o.key === f.key)
+          .sort((a, b) => Date.parse(a.at) - Date.parse(b.at)).at(-1);
+        if (latest) return latest.result === 'not-real' || (latest.result === 'card' && cardReadable(latest.card));
+        // A known auto-only block is not a person's request to change a head they cleared.
+        // A reviewer block remains open; missing evidence never suppresses dispatch.
+        const own = r.rulings.filter(x => x.key === f.key);
+        const superseded = new Set(own.flatMap(x => x.supersedes ?? []));
+        if (own.some(x => x.result === 'block' && !superseded.has(x.id))) return false;
+        return cleared && (pr.comments ?? []).some(c => {
+          const policy = parseOperatorRulingComment(c)?.record;
+          return policy?.actor.toLowerCase() === 'auto-policy' && policy.repo === repo
+            && policy.pr === Number(pr.number) && policy.head === pr.headRefOid
+            && policy.rulings.some(x => x.runId === r.runId && x.key === f.key && x.result === 'block');
+        });
+      });
+    });
+    if (kept.length < findings.length) log(`review.noFixerOnClearedRuled=true (source: ${safety.sources.noFixerOnClearedRuled}) — ${repo}#${pr.number}: suppressed ${findings.length - kept.length} fixer referral(s)`);
+    return kept;
+  } catch { return findings; }
 }
 
 function defaultReadComments({ repo, number }) {
