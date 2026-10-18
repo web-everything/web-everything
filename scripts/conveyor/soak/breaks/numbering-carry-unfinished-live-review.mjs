@@ -30,7 +30,7 @@ export default {
     const jury = await load('scripts/lib/jury-core.mjs');
     const root = mkdtempSync(join(tmpdir(), 'soak-numbering-live-review-'));
     const violations = [];
-    const repo = 'web-everything/web-everything', pr = 5505;
+    const repo = 'example/project', pr = 5505;
     const from = '7ae496bef00d2096959b5f6d20cfd0394b976898';
     const to = '440cd1c4c18c773d1669189862322e9d0153b7b7';
     const body = '<!-- authored-by-actor: author -->';
