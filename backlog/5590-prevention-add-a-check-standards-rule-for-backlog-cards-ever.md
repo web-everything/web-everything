@@ -47,6 +47,7 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Also raised by
 
+- Also raised by web-everything/web-everything#5611 (correctness/COVERAGE: `we:backlog/xs4eugq-we-file-claims-last-until-the-pr-merges-or-closes-overlappin.md` — Add a deterministic card-validation gate requiring every behavioral edge-case requirement to reference a repository-qualified planned test file, named case, and observable assertion. Reject a card when any of those three fields is absent; add negative fixtures for each omission and a positive fixture with all three.)
 - Also raised by web-everything/web-everything#5525 (finding 2: `we:backlog/6240-overlap-yield-known-holds.md:43` — Card-lint gate: each Edge case item must map to an Acceptance ID.)
 - Also raised by web-everything/web-everything#5531 (finding 2: `we:backlog/5749-drain-remove-the-unlocked-fallback-on-the-numbering-and-land.md:35` — Same card-lint rule as above: any Acceptance reference to a test must use a named [A<n>] case that appears in the Test plan.)
 - Also raised by web-everything/web-everything#5546 (finding 1: `we:backlog/x2sgweq-the-drain-honours-mergegate-reviewauthority-labels-both-ledg.md:18` — A card-lint gate in check:standards requiring every non-n/a edge-case line to cite a test name that also appears in an [A#] tests list.)
