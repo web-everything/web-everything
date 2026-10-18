@@ -1,21 +1,22 @@
 ---
+bornAs: x2mi7wh
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/xmltnoi-prevention-backlog-prevention-cards-5605-and-5360-already-co.md"]
-dateOpened: "2026-10-14"
+scope: ["we:skills-src/conveyor/__tests__/build-dispatch-non-blocking-launch.test.mjs", "we:skills-src/conveyor/build-dispatch-daemon.mjs", "we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs"]
+dateOpened: "2026-10-16"
 tags: []
 ---
 
-# Prevention — Have the filer consume structured existing-card references and gate story creation on at least on… (from web-everything/web-everything#5353 review)
+# Prevention — Add a lifecycle test for clear-on-delivery. Optionally add a lint that flags unused optional test… (from web-everything/web-everything#5453 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/xmltnoi-prevention-backlog-prevention-cards-5605-and-5360-already-co.md:14` — Have the filer consume structured existing-card references and gate story creation on at least one unresolved, unmatched obligation; add a regression test asserting that an all-already-tracked verdict creates zero new cards.
-2. `we:backlog/xmltnoi-prevention-backlog-prevention-cards-5605-and-5360-already-co.md:14` — Require structured existing-card references when filing prevention debt, and add a deterministic filer test asserting that already-tracked findings update those cards without creating another open story.
+1. `we:skills-src/conveyor/__tests__/build-dispatch-non-blocking-launch.test.mjs:160` — Add a lifecycle test for clear-on-delivery. Optionally add a lint that flags unused optional test-helper params.
+2. `we:skills-src/conveyor/build-dispatch-daemon.mjs:875` — Record the lookup-unavailable case as a non-charged observation, for example by adding the reason to the clone-wide codes. Add a daemon test that a git failure writes no persisted attempt.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5353@013fe88b2eae7769fb113857b9328dafc96da1db
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5453@7e169d308d4ce9f23897e6ff6a640730edf0e07d
 
 ## Acceptance
 

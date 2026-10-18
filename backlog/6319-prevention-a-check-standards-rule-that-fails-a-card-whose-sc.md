@@ -1,4 +1,5 @@
 ---
+bornAs: x32o5m9
 kind: story
 size: 3
 parent: "4075"
@@ -12,7 +13,7 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/xrbt66r-prevention-have-the-filer-leave-scope-empty-or-marked-todo-f.md:6` — A check:standards rule that fails a card whose scope paths don't exist on main, or whose scope is only backlog/ paths on a prevention card. This is the rule the card itself describes.
+1. `we:backlog/6221-prevention-have-the-filer-leave-scope-empty-or-marked-todo-f.md:6` — A check:standards rule that fails a card whose scope paths don't exist on main, or whose scope is only backlog/ paths on a prevention card. This is the rule the card itself describes.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5526@fc47b475461e25d0e2c37e48a7773439ad45691a
 

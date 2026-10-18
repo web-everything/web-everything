@@ -1,17 +1,21 @@
 ---
+bornAs: x384jq0
 kind: story
 size: 3
+parent: "4075"
 status: open
-scope: ["we:scripts/lib/agy-review-juror.mjs", "we:scripts/lib/__tests__/agy-review-juror.test.mjs"]
-dateOpened: "2026-10-14"
+scope: ["we:scripts/conveyor/nightly-coroner-job.mjs", "we:scripts/conveyor/__tests__/nightly-coroner-job.test.mjs"]
+dateOpened: "2026-10-16"
 tags: []
 ---
 
-# Prevention — Add a test that a hooks or .git/config change in a shared checkout voids even when the transcript… (from web-everything/web-everything#5260 review)
+# Prevention — Add a job-test convention that every durable job's failure reporting needs a test showing a failu… (from web-everything/web-everything#5450 review)
 
-Filed mechanically by the unattended review loop (#2749) — every finding below reduced web-everything/web-everything#5260's review (reviewed head `9c59b3ee03605fb1008205501da920605e94535b`) to prevention-outstanding by naming a guard neither captured nor filed:
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/agy-review-juror.mjs:476` — Add a test that a hooks or `.git/config` change in a shared checkout voids even when the transcript names no path in it. Separate 'daemon-reset noise' (HEAD, tracked content) from 'control-file tamper' in the shared-checkout rule.
+1. `we:scripts/conveyor/nightly-coroner-job.mjs:62` — Add a job-test convention that every durable job's failure reporting needs a test showing a failure is reported once and cleared after a later success. Enforce it with a check:standards rule requiring such a test for job modules that return `failures`.
+
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5450@a3461b9aec1f26ff10023097f84bba67091e7a86
 
 ## Acceptance
 

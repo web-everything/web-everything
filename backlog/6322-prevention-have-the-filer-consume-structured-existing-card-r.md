@@ -1,21 +1,22 @@
 ---
+bornAs: x35iqg8
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/operator-controls-io.mjs", "we:scripts/operations/operator-why.mjs", "we:scripts/operations/__tests__/operator-controls-io.test.mjs", "we:scripts/operations/__tests__/operator-why.test.mjs"]
-dateOpened: "2026-10-15"
+scope: ["we:backlog/xmltnoi-prevention-backlog-prevention-cards-5605-and-5360-already-co.md"]
+dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — Move the viewer-equals-actor check from extend-rounds-io into validateOperatorAttribution or the… (from web-everything/web-everything#5169 review)
+# Prevention — Have the filer consume structured existing-card references and gate story creation on at least on… (from web-everything/web-everything#5353 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/operator-controls-io.mjs:96` — Move the viewer-equals-actor check from extend-rounds-io into `validateOperatorAttribution` or the shared sink, and add a test that every CONTROL_OPS entry refuses a mismatched viewer. A check:standards rule requiring each registered operator op to call the shared credential binding would make this deterministic.
-2. `we:scripts/operations/operator-why.mjs:72` — Share one `assertRepoSlug` helper and have the operation registry reject any input named `repo` that does not match it. That lint-level gate covers every op's `repo` input.
+1. `we:backlog/6142-prevention-backlog-prevention-cards-5605-and-5360-already-co.md:14` — Have the filer consume structured existing-card references and gate story creation on at least one unresolved, unmatched obligation; add a regression test asserting that an all-already-tracked verdict creates zero new cards.
+2. `we:backlog/6142-prevention-backlog-prevention-cards-5605-and-5360-already-co.md:14` — Require structured existing-card references when filing prevention debt, and add a deterministic filer test asserting that already-tracked findings update those cards without creating another open story.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5169@d8604e6334e79099e888ab869622124e62ad2706
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5353@013fe88b2eae7769fb113857b9328dafc96da1db
 
 ## Acceptance
 

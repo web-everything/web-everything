@@ -1,20 +1,22 @@
 ---
+bornAs: x33913a
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/nightly-coroner-job.mjs", "we:scripts/conveyor/__tests__/nightly-coroner-job.test.mjs"]
-dateOpened: "2026-10-16"
+scope: ["we:scripts/operations/operator-controls-io.mjs", "we:scripts/operations/operator-why.mjs", "we:scripts/operations/__tests__/operator-controls-io.test.mjs", "we:scripts/operations/__tests__/operator-why.test.mjs"]
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Add a job-test convention that every durable job's failure reporting needs a test showing a failu… (from web-everything/web-everything#5450 review)
+# Prevention — Move the viewer-equals-actor check from extend-rounds-io into validateOperatorAttribution or the… (from web-everything/web-everything#5169 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/nightly-coroner-job.mjs:62` — Add a job-test convention that every durable job's failure reporting needs a test showing a failure is reported once and cleared after a later success. Enforce it with a check:standards rule requiring such a test for job modules that return `failures`.
+1. `we:scripts/operations/operator-controls-io.mjs:96` — Move the viewer-equals-actor check from extend-rounds-io into `validateOperatorAttribution` or the shared sink, and add a test that every CONTROL_OPS entry refuses a mismatched viewer. A check:standards rule requiring each registered operator op to call the shared credential binding would make this deterministic.
+2. `we:scripts/operations/operator-why.mjs:72` — Share one `assertRepoSlug` helper and have the operation registry reject any input named `repo` that does not match it. That lint-level gate covers every op's `repo` input.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5450@a3461b9aec1f26ff10023097f84bba67091e7a86
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5169@d8604e6334e79099e888ab869622124e62ad2706
 
 ## Acceptance
 
