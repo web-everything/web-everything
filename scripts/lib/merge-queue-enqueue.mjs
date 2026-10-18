@@ -250,11 +250,14 @@ export function readPinnedChangedFiles({ headSha, base = 'main', cwd, exec = exe
   try {
     git(['fetch', '--quiet', '--end-of-options', 'origin', headSha, `+refs/heads/${base}:refs/remotes/origin/${base}`]);
     git(['cat-file', '-e', `${headSha}^{commit}`]);
-    const out = git(['diff', '--name-only', '--no-renames', '-z', '--end-of-options', `refs/remotes/origin/${base}...${headSha}`]);
-    // The base tip this diff used, so a caller can tell later whether the same list still holds. Best effort.
+    // Pin the base tip BEFORE the diff and diff against that sha: another drain sharing this checkout can move the
+    // remote-tracking ref at any moment, and `baseSha` must be the commit this list was actually read against.
+    // Unknown → diff the ref and report no `baseSha` (the list is then never reused).
     let baseSha = null;
     try { baseSha = git(['rev-parse', '--verify', '--end-of-options', `refs/remotes/origin/${base}^{commit}`]).trim(); } catch { /* unknown */ }
-    return { files: out.split('\0').filter(Boolean), baseSha: SHA_RE.test(baseSha) ? baseSha : null };
+    if (!SHA_RE.test(baseSha)) baseSha = null;
+    const out = git(['diff', '--name-only', '--no-renames', '-z', '--end-of-options', `${baseSha ?? `refs/remotes/origin/${base}`}...${headSha}`]);
+    return { files: out.split('\0').filter(Boolean), baseSha };
   } catch (e) { return { error: errText(e) }; }
 }
 

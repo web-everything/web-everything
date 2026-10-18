@@ -919,7 +919,8 @@ describe('drain pre-stage queue admission', () => {
   });
   // PR #5480 red-team finding: the prepared file list is bound to the base branch and tip it was read against,
   // so a PR retargeted (or whose base moved) between pre-stage and enqueue is re-read against the live base.
-  const diffAgainst = (calls, base) => calls.some(call => call[0] === 'git' && call[1] === 'diff' && call.some(a => String(a).startsWith(`refs/remotes/origin/${base}...`)));
+  const diffAgainst = (calls, base) => calls.some(call => call[0] === 'git' && call[1] === 'rev-parse' && call.includes(`refs/remotes/origin/${base}^{commit}`))
+    && calls.some(call => call[0] === 'git' && call[1] === 'diff' && call.some(a => String(a).endsWith(`...${HEAD}`)));
   it('binds the prepared file list to its base and re-reads the diff when the live base differs', () => {
     const { s, calls } = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], evidence: { loopPayload: null } });
     const c = { num: 42, repo: null, headRef: 'lane/a', baseRefName: 'release' };

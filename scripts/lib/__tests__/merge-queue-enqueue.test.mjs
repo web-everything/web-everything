@@ -218,6 +218,16 @@ describe('a PR that touches a workflow file is never enqueued (human-only hold)'
       expect(mutated).toBe(false);
     });
 
+    it('pins the base tip before the diff and diffs against that sha, so the recorded base is the one the list used', () => {
+      const calls = [];
+      const read = readPinnedChangedFiles({ headSha: HEAD, cwd: CWD, exec: execFor({ files: [['README.md', '']], baseTip: TIP, calls }) });
+      expect(read).toEqual({ files: ['README.md'], baseSha: TIP });
+      const at = (sub) => calls.findIndex(([c, a]) => c === 'git' && a[0] === sub);
+      expect(at('rev-parse')).toBeGreaterThan(-1);
+      expect(at('rev-parse')).toBeLessThan(at('diff'));
+      expect(calls[at('diff')][1].at(-1)).toBe(`${TIP}...${HEAD}`);
+    });
+
     it.each([['null', null], ['empty', '']])('fails closed (retryable, no git read, no mutation) when the live base is %s', (_name, liveBase) => {
       const { result, calls, mutated } = run(prepared(), liveBase);
       expect(result).toMatchObject({ ok: false, held: true, humanOnly: false, retryable: true, reason: 'unreadable' });
