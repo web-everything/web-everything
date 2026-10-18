@@ -2,10 +2,93 @@ import { it, expect, vi, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { runInNewContext } from 'node:vm';
 const dirs = [];
 const temp = () => { const d = mkdtempSync(join(tmpdir(), 'overload-')); dirs.push(d); return d; };
-afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
+afterEach(() => { vi.unstubAllEnvs(); for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
+
+// Exercise the command wiring without dispatching the lane-pool CLI or mutating Git metadata.
+function poolFunction(name, seams) {
+  const source = readFileSync(resolve('scripts/lane-pool.mjs'), 'utf8');
+  const body = source.match(new RegExp(`function ${name}\\([^]*?\\n\\}`))?.[0];
+  if (!body) throw Error(`missing lane-pool function ${name}`);
+  return runInNewContext(`(${body})`, seams);
+}
+
+it.each(['absent .git', 'missing HEAD'])('refresh heals %s before configuring gc and continues to the next lane', (damage) => {
+  let broken = true;
+  const config = vi.fn((_args, dir) => { if (broken && dir.endsWith('lane-1')) throw Error(damage); });
+  const heal = poolFunction('fetchOriginHealing', {
+    laneDir: (_repo, n) => `/pool/lane-${n}`,
+    fetchOriginPruneWithRetry: (dir) => { if (broken && dir.endsWith('lane-1')) throw Error('not a git repository'); },
+    healSharedStoreFor: () => false, diagnoseLane: () => ({ ok: !broken, problems: [damage] }),
+    looksLikeCorruption: () => false, msgOf: (e) => e.message, log: () => {}, healLaneRefs: () => {},
+    recloneLane: () => { broken = false; },
+  });
+  const refresh = poolFunction('refreshLane', {
+    laneDir: (_repo, n) => `/pool/lane-${n}`, gitQuiet: config, fetchOriginHealing: heal,
+    liveLease: () => null, ttlMsFromFlags: () => 0, laneHoldRefuses: () => false,
+    laneDirtyOrAhead: () => ({ dirty: true, uncommitted: 1, ahead: 0 }), log: () => {},
+  });
+  for (const n of [1, 2]) expect(refresh({ branch: 'main' }, n).skipped).toBe(true);
+  expect(broken).toBe(false);
+  expect(config.mock.calls).toEqual([
+    [['config', '--local', 'gc.auto', '0'], '/pool/lane-1'],
+    [['config', '--local', 'gc.auto', '0'], '/pool/lane-2'],
+  ]);
+});
+
+it.each([false, true])('sibling clone disables automatic gc (existing=%s)', (existing) => {
+  const gitQuiet = vi.fn(); const tryGit = vi.fn(() => 'origin/main');
+  poolFunction('ensureOneSibling', {
+    join, primarySiblingPath: () => '/primary/fui', lstatSync: () => { if (!existing) throw Error('absent'); return { isSymbolicLink: () => false }; },
+    existsSync: () => true, tryGit, gitQuiet, cloneReferenceArgs: () => [], log: () => {},
+    NETWORK_GIT_TIMEOUT_MS: 1, laneDirtyOrAhead: () => ({ dirty: true, ahead: 0 }),
+  })({ poolDir: '/pool' }, 'fui');
+  expect([...gitQuiet.mock.calls, ...tryGit.mock.calls]).toContainEqual([['config', '--local', 'gc.auto', '0'], '/pool/fui']);
+});
+
+it('gc command runs one pass and watch re-resolves policy with interactive bypass disabled', () => {
+  const run = (watch) => {
+    const scheduledLaneGc = vi.fn(() => ({ ran: true }));
+    const loadHostOverloadSettings = vi.fn().mockReturnValueOnce({ settings: { lanes: { gc: { schedule: 60000 } } } })
+      .mockReturnValue({ settings: { lanes: { gc: { schedule: 120000 } } } });
+    const timers = [];
+    const command = poolFunction('cmdGc', { scheduledLaneGc, loadHostOverloadSettings, flags: { watch },
+      existingLanes: () => [1], laneDir: () => '/pool/lane-1', log: () => {},
+      process: { stdin: { isTTY: true } }, setTimeout: (fn, ms) => timers.push({ fn, ms }) });
+    command({});
+    expect(scheduledLaneGc).toHaveBeenLastCalledWith(['/pool/lane-1'], expect.objectContaining({ interactive: !watch }));
+    if (watch) {
+      expect(timers[0].ms).toBe(60000);
+      timers[0].fn();
+      expect(timers[1].ms).toBe(120000);
+      expect(scheduledLaneGc).toHaveBeenCalledTimes(2);
+      expect(loadHostOverloadSettings).toHaveBeenCalledTimes(2);
+    } else expect(timers).toEqual([]);
+  };
+  run(false); run(true);
+});
+
+// Kept for the launcher gate: local repair sandboxes forbid executing lane-pool.mjs.
+it.each([false, true])('gc CLI dispatch accepts watch=%s and schedules only watch mode', (watch) => {
+  const root = temp();
+  const preload = `import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module';
+    os.userInfo = () => ({ homedir: ${JSON.stringify(root)} }); syncBuiltinESMExports();
+    ${watch ? "globalThis.setTimeout = (_fn, ms) => { process.stdout.write('GC_WATCH=' + ms); return { unref() {} }; };" : ''}`;
+  const child = spawnSync(process.execPath, [`--import=data:text/javascript,${encodeURIComponent(preload)}`,
+    'scripts/lane-pool.mjs', 'gc', `--repo=${root}`, '--pool=fixture', ...(watch ? ['--watch'] : [])], {
+    encoding: 'utf8', timeout: 10000, env: { ...process.env, LANE_POOL_ROOT: root,
+      WE_LANES_GC_SCHEDULE_MS: '60000', VITEST: 'true', WE_TEST_HOST_LOAD1: '0' },
+  });
+  expect(child.status, child.stderr).toBe(0);
+  if (watch) expect(child.stdout).toBe('GC_WATCH=60000');
+  else {
+    expect(child.stderr).toContain('gc: gc schedule not due');
+    expect(child.stdout).not.toContain('GC_WATCH=');
+  }
+});
 
 it('provisioned lanes disable automatic git gc', () => {
   const root = temp(); const source = join(root, 'source'); const pool = join(root, 'pool');
@@ -64,13 +147,36 @@ it('test load readings are deterministic, validated, and ignored outside Vitest'
     expect(hostLoadAdmission({ policy, interactive: false, load: () => readHostLoad({ env: { ...fixture, WE_TEST_HOST_LOAD1: value }, load }) }).admitted).toBe(false);
   }
 });
+it('the shared test setup supplies a fixed host load inherited by admission subprocesses', () => {
+  expect(process.env.WE_TEST_HOST_LOAD1).toBe('0');
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e',
+    "import { readHostLoad } from './scripts/lib/host-load.mjs'; process.stdout.write(JSON.stringify(readHostLoad({ load: () => { throw Error('sampled real host'); } })));"],
+  { encoding: 'utf8', timeout: 5000, env: { ...process.env } });
+  expect(child.status, child.stderr).toBe(0);
+  expect(child.stdout).toBe('[0]');
+});
 it('scheduled gc is host single-flight and skips before the next due pass', async () => {
   const { scheduledLaneGc } = await import(/* @vite-ignore */ String('../lib/host-load.mjs'));
   const stateRoot = temp(); const exec = vi.fn();
   const opts = { stateRoot, exec, admission: () => ({ admitted: true }), log: () => {}, schedule: 86400000, nowMs: 100000000 };
   expect(scheduledLaneGc(['/pool/lane-1', '/pool/lane-2'], opts).ran).toBe(true);
   expect(exec).toHaveBeenCalledTimes(2);
+  expect(exec).toHaveBeenCalledWith('git', expect.arrayContaining(['gc.autoDetach=false', '--no-detach']), expect.objectContaining({ timeout: 120000 }));
   expect(scheduledLaneGc(['/pool/lane-1'], opts).ran).toBe(false);
+});
+
+it('a failing gc lane does not starve later lanes or advance its successful-run cursor', async () => {
+  const { scheduledLaneGc } = await import('../lib/host-load.mjs');
+  const stateRoot = temp();
+  const exec = vi.fn((_command, _args, { cwd }) => { if (cwd.endsWith('lane-1')) throw Error('broken repo'); });
+  const log = vi.fn();
+  const opts = { stateRoot, exec, admission: () => ({ admitted: true }), log, schedule: 60000, nowMs: 100000 };
+  expect(scheduledLaneGc(['/pool/lane-1', '/pool/lane-2'], opts).ran).toBe(true);
+  expect(exec.mock.calls.map(([, , { cwd }]) => cwd)).toEqual(['/pool/lane-1', '/pool/lane-2']);
+  expect(log.mock.calls.flat().join(' ')).toContain('/pool/lane-1');
+  exec.mockClear();
+  scheduledLaneGc(['/pool/lane-1', '/pool/lane-2'], opts);
+  expect(exec.mock.calls.map(([, , { cwd }]) => cwd)).toEqual(['/pool/lane-1']);
 });
 
 it('gc refuses cursor serialization beyond the read limit and preserves the readable cursor', async () => {
@@ -127,6 +233,44 @@ it.each([false, true])('mandatory admission waits then proceeds when load drops=
 it('interactive operator commands remain admitted above the load cap', async () => {
   const { hostLoadAdmission } = await import('../lib/host-load.mjs');
   expect(hostLoadAdmission({ interactive: true, load: () => [1000], cores: () => 1 }).admitted).toBe(true);
+});
+
+it('default TTY admission bypasses host overload through acquireSlotBlocking', async () => {
+  const { acquireSlotBlocking } = await import('../readiness/heavy-admission.mjs');
+  vi.stubEnv('WE_TEST_HOST_LOAD1', '1000000');
+  const descriptor = Object.getOwnPropertyDescriptor(process.stdin, 'isTTY');
+  Object.defineProperty(process.stdin, 'isTTY', { configurable: true, value: true });
+  try {
+    const result = await acquireSlotBlocking({ lockRoot: temp(), cap: 1, owner: 'operator', canDefer: true,
+      env: { WE_HOST_MAX_LOAD_PER_CORE: '0.000000001' }, log: () => {} });
+    expect(result.ok).toBe(true);
+  } finally {
+    if (descriptor) Object.defineProperty(process.stdin, 'isTTY', descriptor);
+    else delete process.stdin.isTTY;
+  }
+});
+
+it.each([false, true])('held bypass uses the injected environment (held=%s)', async (held) => {
+  const { acquireSlotBlocking } = await import('../readiness/heavy-admission.mjs');
+  vi.stubEnv('WE_HEAVY_ADMISSION_HELD', held ? '' : '1');
+  // Invalid policy always refuses the unheld path, independent of real load or ambient test stubs.
+  const result = await acquireSlotBlocking({ lockRoot: temp(), cap: 1, owner: 'held', canDefer: true,
+    interactive: false, env: { WE_HEAVY_ADMISSION_HELD: held ? '1' : '', WE_HOST_MAX_LOAD_PER_CORE: 'bad' }, log: () => {} });
+  expect(result.ok).toBe(held);
+  expect(!!result.deferred).toBe(!held);
+  vi.unstubAllEnvs();
+});
+
+it('overloaded deferrable heavy command exits 75 without executing work', () => {
+  const pool = temp();
+  const child = spawnSync(process.execPath, ['scripts/readiness/heavy-admission.mjs', 'run', `--repo=${pool}`,
+    '--', process.execPath, '-e', "process.stdout.write('HEAVY WORK RAN')"], {
+    encoding: 'utf8', timeout: 10000, env: { ...process.env, CI: '', WE_HEAVY_ADMISSION: 'on', WE_HEAVY_ADMISSION_HELD: '',
+      LANE_POOL_ROOT: pool, VITEST: 'true', WE_TEST_HOST_LOAD1: '1000000' },
+  });
+  expect(child.status, child.stderr).toBe(75);
+  expect(child.stderr).toContain('heavy-command admission deferred: host load');
+  expect(child.stdout).not.toContain('HEAVY WORK RAN');
 });
 it('gc refuses concurrent passes and host overload before spawning git', async () => {
   const { scheduledLaneGc } = await import('../lib/host-load.mjs');

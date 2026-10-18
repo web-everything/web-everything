@@ -517,7 +517,6 @@ function ensureOneSibling(repo, name, { force = false } = {}) {
     log(`  clone ${name} sibling ← ${originUrl} ${ref.length ? `(--reference ${primary})` : '(no --reference: shallow)'} …`);
     try {
       gitQuiet(['clone', '--quiet', '-c', 'gc.auto=0', ...ref, originUrl, dest]);
-      gitQuiet(['config', '--local', 'gc.auto', '0'], dest);
     } catch (e) {
       // Unlike the old symlink (pure filesystem, no network), this is a real `git clone` of `originUrl` —
       // best-effort: a network blip / auth failure / moved remote must WARN and move on, not crash the
@@ -528,6 +527,8 @@ function ensureOneSibling(repo, name, { force = false } = {}) {
     }
   }
 
+  // Apply to existing siblings too; an unusable clone must still reach its fetch/recovery path.
+  tryGit(['config', '--local', 'gc.auto', '0'], dest);
   const branchRef = tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], dest);
   const branch = branchRef ? branchRef.replace(/^origin\//, '') : 'main';
   tryGit(['fetch', 'origin', '--prune', '--quiet'], dest, { timeout: NETWORK_GIT_TIMEOUT_MS });
@@ -1185,9 +1186,9 @@ function localRemoteShas(dir) {
 // (safe to unmap its stale item mapping, #2139) from a skipped one (still serving its in-flight item).
 function refreshLane(repo, n, { force = false } = {}) {
   const dir = laneDir(repo, n);
-  gitQuiet(['config', '--local', 'gc.auto', '0'], dir);
   // xj1vryw — self-healing fetch; may quarantine + re-clone a corrupt lane ONLY when no live lease holds it.
   fetchOriginHealing(repo, n, { allowReclone: !liveLease(dir, Date.now(), ttlMsFromFlags()) });
+  gitQuiet(['config', '--local', 'gc.auto', '0'], dir);
   // #2337(b) — a LIVE lease is an ownership hold (a process is presumed alive within TTL), distinct from the
   // dirty/ahead STALENESS guard below. `--force` exists to recycle stale residue, not to stomp an active
   // consumer, so the lease check runs REGARDLESS of `--force`: a leased lane is always skipped (loud), never

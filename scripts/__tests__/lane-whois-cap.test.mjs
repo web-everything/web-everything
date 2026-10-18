@@ -15,6 +15,41 @@ const admitted = () => ({ admitted: true });
 const quiet = () => {};
 
 describe('transcript backfill admission', () => {
+  it('overloaded background transcript scan exits 75 without scanning', () => {
+    const root = temp();
+    const url = pathToFileURL(resolve('scripts/lane-whois.mjs')).href;
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import os from 'node:os'; import cp from 'node:child_process';
+      import { syncBuiltinESMExports } from 'node:module';
+      os.userInfo = () => ({ homedir: ${JSON.stringify(root)} });
+      cp.execFileSync = (file) => { if (file === 'git') return ''; process.stdout.write('SCAN WORK RAN'); throw Error('unexpected subprocess'); };
+      syncBuiltinESMExports();
+      process.argv = [process.execPath, ${JSON.stringify(resolve('scripts/lane-whois.mjs'))}, '--scan-transcripts', '--lane=1', '--name=fixture', ${JSON.stringify(`--pool-root=${root}`)}];
+      await import(${JSON.stringify(url)});
+    `], { encoding: 'utf8', timeout: 10000,
+      env: { ...process.env, VITEST: 'true', WE_TEST_HOST_LOAD1: '1000000' } });
+    expect(child.status, child.stderr).toBe(75);
+    expect(child.stderr).toContain('transcript scan deferred: host load');
+    expect(child.stdout).not.toContain('SCAN WORK RAN');
+  });
+  it('host overload defers background transcript scanning before any scan starts', async () => {
+    const { cachedTranscriptAttribution } = await import('../lib/lane-transcript-backfill.mjs');
+    const scan = vi.fn(); const admission = vi.fn(() => ({ admitted: false, reason: 'overload' }));
+    expect(() => cachedTranscriptAttribution('unused', { 1: '/pool/1' }, {
+      stateRoot: temp(), scan, admission, log: quiet,
+    })).toThrow('transcript scan deferred: overload');
+    expect(scan).not.toHaveBeenCalled();
+    expect(admission).toHaveBeenCalledWith(expect.objectContaining({ interactive: false }));
+  });
+  it('policy can disable explicit transcript scans before admission or scanning', async () => {
+    const { cachedTranscriptAttribution } = await import('../lib/lane-transcript-backfill.mjs');
+    const scan = vi.fn(); const admission = vi.fn(admitted);
+    expect(() => cachedTranscriptAttribution('unused', { 1: '/pool/1' }, {
+      stateRoot: temp(), scan, admission, log: quiet,
+      env: { WE_LANE_TRANSCRIPT_EXPLICIT_SCAN: 'false' },
+    })).toThrow('explicit transcript scan disabled by policy');
+    expect(scan).not.toHaveBeenCalled(); expect(admission).not.toHaveBeenCalled();
+  });
   it('routine whois never invokes scanLaneTranscripts', () => {
     const scan = vi.spyOn(attribution, 'scanLaneTranscripts').mockReturnValue(new Map());
     whois({ poolDir: temp(), laneNumbers: [1], exec: () => '[]' });

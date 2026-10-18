@@ -24,8 +24,8 @@ export function cachedTranscriptAttribution(root, lanes, { stateRoot = hostState
       } catch (e) { if (e.code !== 'ENOENT') throw e; missing[key] = path; }
     }
     if (Object.keys(missing).length) {
-      const host = admission({ policy, env, log });
-      if (!host.admitted) throw Error(`transcript scan deferred: ${host.reason}`);
+      const host = admission({ policy, env, log, interactive: false });
+      if (!host.admitted) throw Object.assign(Error(`transcript scan deferred: ${host.reason}`), { code: 'HOST_LOAD_DEFERRED' });
       const scanned = scan(root, missing, { exec, strict: true });
       for (const [key, path] of Object.entries(missing)) {
         const touches = scanned.get(key);
