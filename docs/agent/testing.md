@@ -1,5 +1,36 @@
 # Testing — Three-Tier Strategy
 
+## Missing review prerequisite recovery
+
+The review timing policy can require checks that branch protection does not name.
+In the 2026-10-18 probe, PRs #5514, #5511 and #5502 all had completed `test`,
+no `standards`, and no missing-run markers; protection named only `test`, `smoke`,
+`daemon-soak`, and `soak-replay-gate`. Their head CI definitions also lacked the
+`standards` job. Review labels were not the exclusion: the recovery set omitted
+that review prerequisite.
+
+`scripts/conveyor/missing-run-rerequest.mjs` handles the stale, stalled WE
+`standards` gap when the other protected contexts have reported. It reuses the
+resolved review timing policy, maps `standards` to `ci.yml`, and reruns only an
+existing completed PR workflow run pinned to the examined head. Discovery uses
+the paginated repository runs endpoint and matches the exact workflow path: the
+current filename endpoint can resolve a different workflow ID from historical runs. All-absent heads,
+other missing protected checks, and stacks retain the existing recovery path.
+It rereads the PR head before reserving and again before submission. A trusted,
+complete PR thread supplies the per-(repo, PR, head, check) attempt count and
+cooldown; a reservation is posted before each submission so failures also consume
+the cap. Missing thread evidence or a failed reservation prevents submission.
+Settings live in `scripts/settings/missing-run-rerequest.json`, with env overrides
+and source logging through `policy-cascade`; defaults are on, 15 minutes, 2 attempts.
+
+This helper deliberately uses no dispatch: `missing-run-push.mjs` retains its
+#3209 synchronize-only rule. A rerun repeats that head's existing workflow definition;
+it cannot introduce a missing job into an old definition. Reaching the cap requires
+workflow/base repair rather than repeatedly nudging a recovery-marked tip. The
+review gate stays closed until a real successful check reports. Unit probes live
+in `scripts/conveyor/__tests__/missing-run-rerequest.test.mjs`; live verification
+of planning should use `apply: false` and must not submit reruns during diff review.
+
 ## Paused review recovery
 
 The ruling ledger omits unattempted referrals and suppresses findings after an operator verdict.
