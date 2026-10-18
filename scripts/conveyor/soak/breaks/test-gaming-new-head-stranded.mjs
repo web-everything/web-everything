@@ -11,7 +11,8 @@ export default {
   fixPresent(root) {
     const source = readFileSync(join(root, 'scripts/conveyor/test-gaming-route.mjs'), 'utf8');
     return source.includes('const fixEndHead =') && source.includes('isLatestAdvisoryFindingAddressed(episode)')
-      && source.includes('unresolved advisory finding') && source.includes("newest?.outcome === 'accept'");
+      && source.includes('unresolved advisory finding') && source.includes("newest?.outcome === 'accept'")
+      && source.includes('pendingNoticeMarker') && source.includes('publishAttention({ ...item');
   },
   async run({ sourceRoot } = {}) {
     const root = sourceRoot ?? process.env.SOAK_TREE_ROOT ?? resolve(fileURLToPath(import.meta.url), '../../../../..');
@@ -45,8 +46,58 @@ export default {
       },
     };
     const notices = [], plans = [], reviews = [];
+    let failDelivery = false;
     const route = args => sweepTestGamingRoutes({ ...args, provider, readVerdict: () => verdict,
-      readComments: () => structuredClone(pr.comments), enabled: true, notify: item => notices.push(item) });
+      readComments: () => structuredClone(pr.comments), enabled: true, notify: item => {
+        if (failDelivery) { failDelivery = false; throw Error('feed unavailable'); }
+        notices.push(item);
+      } });
+    const violations = [];
+    // PR #5537 advisory: a completed pass on the still-held head must reach
+    // the operator, and a failed ruling comment must not duplicate feed notices.
+    for (const completed of [false, true]) {
+      Object.assign(pr, structuredClone(initial));
+      route({ repo, prs: [pr] });
+      if (completed) pr.comments.push(bot(buildAdvisoryFixComment({})));
+      pr.comments.push(bot(buildFixEndComment({ who: 'fix-5537', headSha: old })
+        + (completed ? '' : '\n\ntest-removal-justified: obsolete behaviour removed')));
+      const before = notices.length, post = provider.postComment;
+      provider.postComment = () => { throw Error('ruling comment unavailable'); };
+      route({ repo, prs: [pr], log: () => {} });
+      provider.postComment = post;
+      if (notices.length !== before) violations.push('feed was notified before ruling comment persisted');
+      failDelivery = true;
+      route({ repo, prs: [pr], log: () => {} });
+      for (let retry = 0; retry < 2; retry++) {
+        route({ repo, prs: [pr] });
+        sweepAdvisoryLabels({ repo, listPrs: () => [structuredClone(pr)], readPr: () => structuredClone(pr), provider });
+      }
+      if (notices.length !== before + 1) violations.push('still-held pass did not notify exactly once');
+      if (planReconcile({ repo: 'we', prs: [pr], now: Date.parse(fx.observedAt),
+        requiredChecks: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'],
+        advisoryReviewOnHumanHandoff: 'on' }).dispatch.some(d => d.kind === 'fix')) violations.push('terminal held pass dispatched another fixer');
+    }
+    Object.assign(pr, structuredClone(initial));
+    const removal = verdict.results[0].reason;
+    verdict.results[0].reason += '; skip-only: tests/skipped.test.mjs';
+    route({ repo, prs: [pr] });
+    if (pr.comments.length) violations.push('mixed skipped/removal finding entered removal-only route');
+    verdict.results[0].reason = removal;
+
+    for (const marker of [ADVISORY_NOTE_MARKER, CONVERTED_ADVISORY_NOTE_MARKER]) {
+      Object.assign(pr, structuredClone(initial));
+      route({ repo, prs: [pr] });
+      pr.comments.push(bot(`${marker}\n\n**Verdict:** Changes requested\n\n**Advisory outcome:** \`changes\`\n\nAdmitted finding: unrelated defect\n\nNet basis: \`${'0'.repeat(40)}..${old}\``),
+        bot(buildAdvisoryFixComment({})), bot(buildFixEndComment({ who: 'other-fix', headSha: old })));
+      const routed = route({ repo, prs: [pr] });
+      if (routed[0]?.action !== 'admitted') violations.push('unrelated repair completed the removal obligation');
+      if (!pr.comments.at(-1).body.includes(`<!-- test-gaming-route: ${old} -->`)) violations.push('removal binding was not restored after unrelated repair');
+      if (!planReconcile({ repo: 'we', prs: [pr], now: Date.parse(fx.observedAt),
+        requiredChecks: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'],
+        advisoryReviewOnHumanHandoff: 'on' }).dispatch.some(d => d.kind === 'fix')) violations.push('removal obligation is no longer actionable');
+    }
+    Object.assign(pr, structuredClone(initial));
+    notices.length = 0;
     route({ repo, prs: [pr] });
     pr.comments.push(bot(`🔓 conveyor fix-end — fix claim released\n\nat \`${old.slice(0, 9)}\`\n\ntest-removal-justified: old behaviour removed`));
     pr.headRefOid = verdict.head_sha = head;
@@ -57,7 +108,6 @@ export default {
         requiredChecks: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'], advisoryReviewOnHumanHandoff: 'on' }),
     });
     tick();
-    const violations = [];
     if (notices.length) violations.push('old-head justification was forwarded to needs-you');
     if (!pr.comments.some(c => c.body.includes(`<!-- test-gaming-route: ${head} -->`))) violations.push('new head received no binding repair finding');
     if (!plans.some(p => p.dispatch.some(d => d.kind === 'fix'))) violations.push('daemon plan did not offer the new-head repair to the fix dispatcher');

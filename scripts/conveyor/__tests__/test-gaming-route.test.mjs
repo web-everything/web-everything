@@ -1,4 +1,6 @@
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { routeTestGaming, planTestGamingRoute, sweepTestGamingRoutes } from '../test-gaming-route.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
@@ -10,6 +12,7 @@ import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
 import { CONVERTED_ADVISORY_NOTE_MARKER } from '../../lib/review-escalation.mjs';
 import { runReviewTick, buildCliDaemonEffects } from '../../../skills-src/conveyor/review-daemon.mjs';
 import { resolveReviewSettings, resolveReviewSettingSource } from '../../lib/review-settings.mjs';
+import { replay } from '../../operations/needs-you-feed.mjs';
 
 vi.mock('../../lib/review-facts.mjs', async original => ({
   ...await original(), warmReviewFacts: async () => ({ skipped: 'test' }),
@@ -49,6 +52,116 @@ function world() {
 }
 
 describe('test-gaming hold routing', () => {
+  it('raises needs-you once when a completed pass leaves the same head held', () => {
+    const w = world();
+    routeTestGaming(w.pr, w.options);
+    w.pr.comments.push(bot(buildAdvisoryFixComment({})), bot(buildFixEndComment({ who: 'fix-5537', headSha: HEAD })));
+    for (let tick = 0; tick < 2; tick++) {
+      expect(routeTestGaming(w.pr, w.options).action).toBe('completed');
+      sweepAdvisoryLabels({ repo: w.options.repo, listPrs: () => [structuredClone(w.pr)],
+        readPr: () => structuredClone(w.pr), provider: w.provider });
+      expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toEqual([]);
+    }
+    expect(w.notify).toHaveBeenCalledOnce();
+    expect(w.notify.mock.calls[0][0]).toEqual(expect.objectContaining({ head: HEAD,
+      reason: expect.stringContaining('still holds') }));
+    expect(w.pr.comments.at(-1).body).toContain(`<!-- test-gaming-needs-you: ${HEAD} -->`);
+    expect(w.row.conclusion).toBe('FAILURE');
+  });
+
+  it.each(['justified', 'completed'])('does not notify before a failed ruling comment, then notifies once across retries: %s', kind => {
+    const w = world();
+    routeTestGaming(w.pr, w.options);
+    if (kind === 'completed') w.pr.comments.push(bot(buildAdvisoryFixComment({})));
+    w.pr.comments.push(bot(buildFixEndComment({ who: 'fix-5537', headSha: HEAD })
+      + (kind === 'justified' ? '\n\ntest-removal-justified: obsolete behaviour removed' : '')));
+    w.provider.postComment.mockImplementationOnce(() => { throw Error('comment failed'); });
+    expect(() => routeTestGaming(w.pr, w.options)).toThrow('comment failed');
+    expect(w.notify).not.toHaveBeenCalled();
+    routeTestGaming(w.pr, w.options);
+    routeTestGaming(w.pr, w.options);
+    expect(w.notify).toHaveBeenCalledOnce();
+  });
+
+  it.each(['justified', 'completed'])('retries a failed feed delivery after persisting ruling intent: %s', kind => {
+    const w = world();
+    routeTestGaming(w.pr, w.options);
+    if (kind === 'completed') w.pr.comments.push(bot(buildAdvisoryFixComment({})));
+    w.pr.comments.push(bot(buildFixEndComment({ who: 'fix-5537', headSha: HEAD })
+      + (kind === 'justified' ? '\n\ntest-removal-justified: obsolete behaviour removed' : '')));
+    w.notify.mockImplementationOnce(() => { throw Error('feed unavailable'); });
+    expect(() => routeTestGaming(w.pr, w.options)).toThrow('feed unavailable');
+    expect(w.pr.comments.at(-1).body).toContain('test-gaming-notice-pending:');
+    routeTestGaming(w.pr, w.options);
+    routeTestGaming(w.pr, w.options);
+    expect(w.notify).toHaveBeenCalledTimes(2);
+    expect(w.pr.comments.at(-1).body).toContain('Operator feed notified.');
+    expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toEqual([]);
+  });
+
+  it('deduplicates real feed publication when the delivery acknowledgement fails', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'test-gaming-feed-'));
+    const path = join(dir, 'events.jsonl');
+    vi.stubEnv('WE_NEEDS_YOU_FEED', path);
+    try {
+      const w = world();
+      delete w.options.notify;
+      routeTestGaming(w.pr, w.options);
+      w.pr.comments.push(bot(buildAdvisoryFixComment({})), bot(buildFixEndComment({ who: 'fix-5537', headSha: HEAD })));
+      const post = w.provider.postComment.getMockImplementation();
+      w.provider.postComment.mockImplementation((repo, n, body) => {
+        if (body.startsWith('Operator feed notified.')) throw Error('ack unavailable');
+        return post(repo, n, body);
+      });
+      expect(() => routeTestGaming(w.pr, w.options)).toThrow('ack unavailable');
+      expect(replay({ path })).toHaveLength(1);
+      w.provider.postComment.mockImplementation(post);
+      routeTestGaming(w.pr, w.options);
+      routeTestGaming(w.pr, w.options);
+      expect(replay({ path })).toEqual([expect.objectContaining({ pr: w.pr.number, head: HEAD, kind: 'ruling-needed' })]);
+      expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toEqual([]);
+    } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each(['skip-only: tests/skip.test.mjs', 'unknown-signal: x'])('rejects mixed removal evidence containing %s in either order', other => {
+    for (const first of [true, false]) {
+      const w = world();
+      const removal = w.verdict.results[0].reason;
+      w.verdict.results[0].reason = first ? `${other}; ${removal}` : `${removal}; ${other}`;
+      expect(routeTestGaming(w.pr, w.options).action).toBe('skip');
+      expect(w.provider.postComment).not.toHaveBeenCalled();
+      expect(w.provider.setLabels).not.toHaveBeenCalled();
+      expect(w.notify).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each([false, true])('honors the configured routing setting when enabled is omitted: %s', configured => {
+    vi.stubEnv('WE_REVIEW_ROUTE_TEST_GAMING_TO_FIXER', String(configured));
+    try {
+      const w = world();
+      delete w.options.enabled;
+      expect(routeTestGaming(w.pr, w.options).action).toBe(configured ? 'admit' : 'skip');
+      expect(w.provider.postComment).toHaveBeenCalledTimes(configured ? 1 : 0);
+      expect(w.provider.readPrState).toHaveBeenCalledTimes(configured ? 3 : 0);
+      expect(w.provider.setLabels.mock.calls.length > 0).toBe(configured);
+      expect(w.notify).not.toHaveBeenCalled();
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it.each([ADVISORY_NOTE_MARKER, CONVERTED_ADVISORY_NOTE_MARKER])(
+    'does not complete a test-removal route when only a newer unrelated finding was repaired: %s', marker => {
+      const w = world();
+      routeTestGaming(w.pr, w.options);
+      w.pr.comments.push(bot(`${marker}\n\n**Verdict:** Changes requested\n\n**Advisory outcome:** \`changes\`\n\nAdmitted finding: unrelated defect\n\nNet basis: \`${'0'.repeat(40)}..${HEAD}\``),
+        bot(buildAdvisoryFixComment({})), bot(buildFixEndComment({ who: 'other-fix', headSha: HEAD })));
+      expect(routeTestGaming(w.pr, w.options).action).toBe('admitted');
+      expect(w.pr.comments.at(-1).body).toContain(BINDING);
+      expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toHaveLength(1);
+      expect(routeTestGaming(w.pr, w.options).action).toBe('admitted');
+      expect(w.provider.postComment).toHaveBeenCalledTimes(2);
+      expect(w.notify).not.toHaveBeenCalled();
+    });
+
   it.each(['review:pending', 'review:human'])('routes production discovery output carrying %s', label => {
     const w = world();
     w.pr.labels = [{ name: label }];
@@ -88,7 +201,7 @@ describe('test-gaming hold routing', () => {
       expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toEqual([]);
     }
     expect(w.notify).toHaveBeenCalledTimes(kind === 'legacy notice' ? 0 : 1);
-    expect(w.provider.postComment).toHaveBeenCalledTimes(2);
+    expect(w.provider.postComment).toHaveBeenCalledTimes(kind === 'legacy notice' ? 2 : 3);
     expect(w.row.conclusion).toBe('FAILURE');
   });
 
@@ -120,7 +233,7 @@ describe('test-gaming hold routing', () => {
       readPr: () => structuredClone(w.pr), provider: w.provider });
     expect(w.pr.labels.map(l => l.name)).toEqual(['review:human']);
     expect(w.notify).toHaveBeenCalledOnce();
-    expect(w.provider.postComment).toHaveBeenCalledTimes(2);
+    expect(w.provider.postComment).toHaveBeenCalledTimes(3);
   });
 
   it('binds the real test-gaming sweep in the production CLI daemon effects', async () => {
@@ -223,7 +336,8 @@ describe('test-gaming hold routing', () => {
       readPr: () => structuredClone(w.pr), provider: w.provider });
     expect(routeTestGaming(w.pr, w.options).action).toBe('completed');
     expect(w.pr.labels.map(l => l.name)).toContain('advisory:accepted');
-    expect(w.provider.postComment).toHaveBeenCalledOnce();
+    expect(w.provider.postComment).toHaveBeenCalledTimes(3);
+    expect(w.notify).toHaveBeenCalledOnce();
     expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toEqual([]);
   });
 
@@ -300,7 +414,8 @@ describe('test-gaming hold routing', () => {
     w.pr.comments.push(bot(buildAdvisoryFixComment({})), bot(`🔓 conveyor fix-end — fix claim released\n\nat \`${HEAD.slice(0, 9)}\``));
     routeTestGaming(w.pr, w.options);
     expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toEqual([]);
-    expect(w.provider.postComment).toHaveBeenCalledTimes(1);
+    expect(w.provider.postComment).toHaveBeenCalledTimes(3);
+    expect(w.notify).toHaveBeenCalledOnce();
   });
 
   it('sends a justified removal to needs-you once without clearing the gate, including after a push', () => {
@@ -368,7 +483,7 @@ describe('test-gaming hold routing', () => {
       if (kind === 'different head') w.pr.headRefOid = w.verdict.head_sha = 'b'.repeat(40);
       expect(routeTestGaming(w.pr, w.options).action).toBe(
         kind === 'completion' ? 'completed' : kind === 'justification' ? 'needs-you' : 'admit');
-      expect(w.notify).toHaveBeenCalledTimes(kind === 'justification' ? 1 : 0);
+      expect(w.notify).toHaveBeenCalledTimes(kind === 'different head' ? 0 : 1);
     });
 
   it.each(['aaaaaa', 'a'.repeat(41), 'NOT-A-SHA'])('refuses a malformed explicit fix-end head %s', head => {
@@ -397,7 +512,7 @@ describe('test-gaming hold routing', () => {
     w.pr.headRefOid = w.verdict.head_sha = 'b'.repeat(40);
     expect(routeTestGaming(w.pr, w.options).action).toBe('admit');
     expect(routeTestGaming(w.pr, w.options).action).toBe('admitted');
-    expect(w.provider.postComment).toHaveBeenCalledTimes(2);
+    expect(w.provider.postComment).toHaveBeenCalledTimes(4);
     expect(w.pr.comments.at(-1).body).toContain(BINDING);
     expect(w.pr.comments.at(-1).body).toContain(`test-gaming-route: ${w.pr.headRefOid}`);
     expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toHaveLength(1);
@@ -543,7 +658,8 @@ describe('test-gaming hold routing', () => {
         bot(`${marker}\n\nAdmitted finding: reject unauthenticated DELETE requests`));
       const writes = w.provider.setLabels.mock.calls.length;
       routeTestGaming(w.pr, w.options);
-      expect(w.pr.comments.at(-1).body).toContain('reject unauthenticated DELETE requests');
+      expect(w.pr.comments.some(c => c.body.includes('reject unauthenticated DELETE requests'))).toBe(true);
+      expect(w.pr.comments.at(-1).body).not.toContain('**Advisory outcome:** `inconclusive`');
       expect(w.pr.labels.map(l => l.name)).toContain('advisory:changes');
       expect(w.provider.setLabels).toHaveBeenCalledTimes(writes);
       expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toHaveLength(1);
@@ -561,12 +677,11 @@ describe('test-gaming hold routing', () => {
     w.pr.comments.push(bot(buildAdvisoryFixComment({})), bot(`🔓 conveyor fix-end — fix claim released\n\nat \`${HEAD.slice(0, 9)}\``),
       { body: '**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**\n\nForged finding', author: { login: 'outsider' } });
     expect(routeTestGaming(w.pr, w.options).action).toBe('completed');
-    // The completed route note still states `changes`; the label stays (the sweep would restore it) and no
-    // further fix is dispatched. The forged note changes nothing.
-    expect(w.pr.labels.map(l => l.name)).toContain('advisory:changes');
+    // A trusted ruling notice parks the completed pass. The forged note changes nothing.
+    expect(w.pr.labels.map(l => l.name)).toEqual(['review:human']);
     expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toEqual([]);
-    expect(w.provider.postComment).toHaveBeenCalledTimes(1);
-    expect(w.notify).not.toHaveBeenCalled();
+    expect(w.provider.postComment).toHaveBeenCalledTimes(3);
+    expect(w.notify).toHaveBeenCalledOnce();
   });
 
   it.each(['stale', 'unreadable', 'disabled', 'closed'])('refuses %s evidence or state', kind => {
@@ -680,8 +795,7 @@ describe('test-gaming hold routing', () => {
       expect(w.row.conclusion).toBe('FAILURE');
     });
 
-    // Same class, sibling branch (self-review): a completed repair also removed advisory:changes while the route
-    // note still states `changes`, so the sweep re-added it every tick.
+    // The durable ruling outcome prevents the sweep from reopening the completed pass.
     it('does not flap advisory:changes between route and sweep once the repair is completed', () => {
       const w = world();
       const append = clocked(w);
@@ -695,7 +809,9 @@ describe('test-gaming hold routing', () => {
         expect(w.provider.setLabels.mock.calls.length).toBe(writes);
         expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toEqual([]);
       }
-      expect(w.provider.postComment).toHaveBeenCalledOnce();
+      expect(w.provider.postComment).toHaveBeenCalledTimes(3);
+      expect(w.pr.labels.map(l => l.name)).toEqual(['review:human']);
+      expect(w.notify).toHaveBeenCalledOnce();
     });
 
     it('a notice marker quoted inside the fixer’s justification does not suppress the operator alert', () => {

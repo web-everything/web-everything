@@ -13,10 +13,11 @@ import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 import { resolveReviewSettings } from '../lib/review-settings.mjs';
-import { appendLines, feedPath, diffFeed } from '../operations/needs-you-feed.mjs';
+import { publishAttention } from '../operations/needs-you-feed.mjs';
 
 const routeMarker = head => `<!-- test-gaming-route: ${head} -->`;
 const noticeMarker = head => `<!-- test-gaming-needs-you: ${head} -->`;
+const pendingNoticeMarker = head => `<!-- test-gaming-notice-pending: ${head} -->`;
 const trusted = c => isTrustedMarkerAuthor(c) && typeof c?.body === 'string';
 const latestAdvisoryNote = comments => comments.filter(c => trusted(c)
   && [ADVISORY_NOTE_MARKER, CONVERTED_ADVISORY_NOTE_MARKER].some(marker => c.body.trimStart().startsWith(marker))).at(-1);
@@ -31,8 +32,12 @@ const fixEndHead = body => /(?:^|\s)at `([a-f0-9]{7,40})`/.exec(body)?.[1];
 // rendered prompt/comment; reject unsafe paths whole rather than normalizing them.
 function removalEvidence(reason) {
   if (typeof reason !== 'string' || reason.length > 64 * 1024) return null;
-  const removals = [...reason.matchAll(/tests-removed: ([^\s<>`]+) \(net ([1-9]\d*) test case\(s\) removed\)/g)];
-  if (!removals.length || removals.length !== (reason.match(/tests-removed:/g) ?? []).length) return null;
+  // Consume every finding, rather than extracting removals from a mixed reason.
+  const removals = reason.replace(/^test-gaming suspected: /, '').split('; ').map(part => {
+    const match = /^tests-removed: ([^\s<>`]+) \(net ([1-9]\d*) test case\(s\) removed\)$/.exec(part);
+    return match?.[0] === part ? match : null;
+  });
+  if (!removals.length || removals.some(m => !m)) return null;
   if (removals.some(m => m[1].length > 240 || !/^[A-Za-z0-9_./-]+$/.test(m[1])
     || m[1].split('/').some(part => !part || part === '.' || part === '..' || part.startsWith('--'))
     || !Number.isSafeInteger(Number(m[2])))) return null;
@@ -55,9 +60,17 @@ export function planTestGamingRoute({ pr, verdict, enabled = true } = {}) {
   const routes = comments.flatMap((c, i) => trusted(c) && c.body.startsWith(ADVISORY_NOTE_MARKER)
     && /<!-- test-gaming-route: [a-f0-9]{40} -->/.test(c.body) ? [{ c, i }] : []);
   const latest = routes.at(-1);
+  const episodeAfter = route => {
+    const nextNote = comments.findIndex((c, i) => i > route.i && latestAdvisoryNote([c]));
+    return comments.slice(route.i, nextNote < 0 ? undefined : nextNote);
+  };
+  const notice = reason => ({ reason, marker: noticeMarker(pr.headRefOid),
+    noticeRecorded: comments.some(isNotice(pr.headRefOid)),
+    notified: comments.some(c => isNotice(pr.headRefOid)(c) && !c.body.includes(pendingNoticeMarker(pr.headRefOid))),
+    rulingRecorded: comments.some(c => isNotice(pr.headRefOid)(c) && latestAdvisory([c])?.outcome === 'inconclusive') });
   // A released claim may have pushed a new head. Bind its returned justification
   // to this route episode and (when present) the live short/full fix-end head.
-  const ended = latest && comments.slice(latest.i + 1).filter(c => {
+  const ended = latest && episodeAfter(latest).slice(1).filter(c => {
     if (!trusted(c) || !c.body.startsWith(FIX_END_HEADER)
       || c.body.includes('<!-- fix-end-outcome: blocked-on-infra -->')) return false;
     const head = fixEndHead(c.body);
@@ -67,18 +80,18 @@ export function planTestGamingRoute({ pr, verdict, enabled = true } = {}) {
       : !/(?:^|\s)at\s+`/.test(c.body) && latest.c.body.includes(routeMarker(pr.headRefOid));
   }).at(-1);
   const justification = ended && /^test-removal-justified:[ \t]*(\S[^\r\n]*)$/m.exec(ended.body)?.[1];
-  if (justification) return { action: 'needs-you', reason: `test-removal-justified: ${justification}`,
-    marker: noticeMarker(pr.headRefOid), notified: comments.some(isNotice(pr.headRefOid)),
-    rulingRecorded: comments.some(c => isNotice(pr.headRefOid)(c) && latestAdvisory([c])?.outcome === 'inconclusive') };
+  if (justification) return { action: 'needs-you', ...notice(`test-removal-justified: ${justification}`) };
   const existing = routes.filter(r => r.c.body.includes(routeMarker(pr.headRefOid))).at(-1);
   // Reclaim also posts fix-end. Only an explicit advisory repair mark completes
   // the finding; reuse reconcile's trusted, ordered episode check.
   if (existing) {
-    const nextNote = comments.findIndex((c, i) => i > existing.i && latestAdvisoryNote([c]));
-    const episode = comments.slice(existing.i, nextNote < 0 ? undefined : nextNote);
+    const episode = episodeAfter(existing);
     // A later panel note cannot undo a repair already recorded in our episode.
-    const addressed = isLatestAdvisoryFindingAddressed(episode) || isLatestAdvisoryFindingAddressed(comments);
-    return { action: ended && addressed ? 'completed' : 'admitted', body: existing.c.body };
+    const addressed = isLatestAdvisoryFindingAddressed(episode);
+    return ended && addressed
+      ? { action: 'completed', body: existing.c.body,
+        ...notice('The fixer pass completed, but the merge gate still holds this head for test-gaming. An operator ruling is required.') }
+      : { action: 'admitted', body: existing.c.body };
   }
   const latestNote = latestAdvisoryNote(comments.filter(isTrustedMarkerAuthor));
   // The fixer takes the latest advisory as binding input. Preserve an unrelated
@@ -99,7 +112,9 @@ export function planTestGamingRoute({ pr, verdict, enabled = true } = {}) {
 }
 
 function notifyNeedsYou(item) {
-  appendLines(feedPath(), diffFeed([], [{ ...item, kind: 'ruling-needed' }], Date.now()).lines);
+  // The shared publisher deduplicates by repo/PR/head/kind under its feed lock.
+  // Retrying after a failed acknowledgement must not append another event.
+  publishAttention({ ...item, kind: 'ruling-needed' });
 }
 
 /** Injectable synchronous IO shell; dryRun reads actual evidence but never writes. */
@@ -145,24 +160,29 @@ export function routeTestGaming(pr, { repo, provider = createGhProvider(), readV
   // marker and stale-head accepts). The gate above proves our current head.
   // Once posted, the durable note makes retries idempotent.
   const newest = latestAdvisory(trustedAdvisoryComments(comments));
-  if (plan.action === 'admitted' && newest?.outcome === 'accept') {
+  if (plan.action === 'admitted' && (newest?.outcome === 'accept'
+    || (latestNote?.body !== plan.body && isLatestAdvisoryFindingAddressed(comments)))) {
     provider.postComment(repo, pr.number, plan.body);
     ownsNote = true;
   }
-  if (plan.action === 'needs-you') {
-    if (!plan.notified) notify({ repo, pr: pr.number, head: pr.headRefOid, reason: plan.reason });
-    if (!plan.notified || (ownsNote && !plan.rulingRecorded)) {
+  const needsRuling = ['needs-you', 'completed'].includes(plan.action);
+  if (needsRuling) {
+    if (!plan.noticeRecorded || (ownsNote && !plan.rulingRecorded)) {
       // Labels are derived from advisory outcomes. Record the ruling handoff so
       // the label sweep cannot restore our old changes outcome. This is not an
       // accepted review or a new fixer episode (no advisory-note marker).
       const outcome = ownsNote ? `\n\n**Verdict:** Needs operator ruling\n\n**Advisory outcome:** \`inconclusive\`\n\nNet basis: \`${'0'.repeat(40)}..${pr.headRefOid}\`` : '';
-      provider.postComment(repo, pr.number, `Test removal needs your ruling. ${plan.reason}\n\nThe merge-gate hold remains in force.\n\n${plan.marker}${outcome}`);
+      provider.postComment(repo, pr.number, `Test removal needs your ruling. ${plan.reason}\n\nThe merge-gate hold remains in force.\n\n${plan.marker}\n${pendingNoticeMarker(pr.headRefOid)}${outcome}`);
+    }
+    if (!plan.notified) {
+      notify({ repo, pr: pr.number, head: pr.headRefOid, reason: plan.reason });
+      provider.postComment(repo, pr.number, `Operator feed notified.\n\n${plan.marker}`);
     }
   }
   if (!ownsNote) return plan;
-  // A completed repair keeps advisory:changes: the route note still states `changes` for this head, so the label
-  // sweep would restore it every tick. The next review judges the repaired head fresh, as for any advisory fix.
-  const active = ['admit', 'admitted', 'completed'].includes(plan.action);
+  // The durable inconclusive outcome parks terminal, still-held passes for the
+  // operator; later label sweeps must not reopen them for another fixer.
+  const active = ['admit', 'admitted'].includes(plan.action);
   // The existing advisory fixer requires needs-human. Never impersonate a human
   // send-back or weaken marker authorship to get there.
   const desired = ['review:human', ...(active ? ['advisory:changes'] : [])];

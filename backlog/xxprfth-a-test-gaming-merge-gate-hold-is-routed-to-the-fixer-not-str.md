@@ -31,13 +31,15 @@ One line per class: either the handling, or `n/a: <why>`.
 
 1. **Untrusted text** — PR-controlled gate paths must use ASCII letters, digits, `_./-`, contain no empty, dot, parent or leading-double-dash components, and fit 240 characters. Gate reasons fit 64 KiB; comments quote at most ten distinct paths as code plus an omitted count. Tests: `refuses unsafe gate-derived path`, `bounds gate-derived file lists and refuses oversized evidence`.
 2. **Truncated reads** — a truncated or unreadable gate summary or incomplete comment read routes nothing (fail closed). Tests: `refuses unreadable evidence or state`, `incomplete comment read`, `deduplicates a route found only in the complete comment read`.
-3. **Shared state files** — n/a: one marker comment per (PR, head) is the ledger.
+3. **Shared state files** — marker comments distinguish pending operator notification from delivery acknowledgement. The existing locked feed publisher deduplicates delivery retries by repo, PR, head and kind.
 4. **Fail closed** — unknown or mixed failing rules keep today review-hold-red behaviour. Tests: `refuses unknown gate evidence`, `refuses unusable removal evidence`, `keeps other failing merge rules on the existing path`.
 5. **Identity scoping** — dedupe key is (PR, head SHA); a new head re-arms within the round cap. Tests: `admits one new repair after a head change within the round cap`, `ignores a justified fix-end for a different head`, `recognizes a matching newline-delimited fix-end head`.
-6. **State over time** — one dispatch per head; the existing round cap applies. Tests: `admits the same head only once and does not dispatch another fix after completion`, `retains the existing advisory round cap`.
+6. **State over time** — one completed pass per head; a still-held completed pass needs an operator ruling, and the existing round cap applies. Completion and justification evidence belong to the route's advisory episode. Tests: `raises needs-you once when a completed pass leaves the same head held`, `does not complete a test-removal route when only a newer unrelated finding was repaired`, `retains the existing advisory round cap`.
 7. **Who wrote it** — only trusted marker authors count. Tests: `ignores forged route and justification markers`, `rejects an outsider %s after the legitimate route`, `ignores an untrusted newer advisory note when completing its own route`.
 
 ## Risks and test plan
+
+PR #5537 advisory prevention guards additionally cover mixed removal reasons, the configured default with `enabled` omitted, failed ruling comments, failed feed delivery and failed delivery acknowledgement. The existing daemon-soak break exercises terminal escalation and unrelated-advisory recovery. Longer-term terminal-state standards checking is tracked in prevention card `xifevv1`.
 
 The routing must remain bound in the production daemon, and one failed PR must not stop others. Tests: `binds the real test-gaming sweep in the production CLI daemon effects`, `replans a daemon tick from the routed labels so no competing review launches`, `continues routing subsequent PRs after one PR throws on %s`.
 
