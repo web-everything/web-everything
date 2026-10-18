@@ -532,6 +532,100 @@ describe('test-gaming hold routing', () => {
     expect(w.notify).not.toHaveBeenCalled();
   });
 
+  // Red-team break test-gaming-route.mjs:99 (PR #5537, head 5c9a2892a): the production list query has no `state`
+  // field, so a labelled PR was rejected as inactive before any gate or live-state read.
+  describe('red-team break :99 — production discovery omits the PR state', () => {
+    const discover = w => defaultReadPrs({ repo: w.options.repo, exec: (_file, args) => {
+      const fields = args[args.indexOf('--json') + 1].split(',');
+      return JSON.stringify([Object.fromEntries(fields.map(field => [field, w.pr[field]]))]);
+    }, readCommits: () => [], readComments: () => [] });
+
+    it('the production list query carries no state, so the route must verify it live', () => {
+      const w = world();
+      const [listed] = discover(w);
+      expect(listed.state).toBeUndefined();
+      expect(listed.statusCheckRollup).toBeDefined();
+      expect(routeTestGaming(listed, w.options).action).toBe('admit');
+      expect(w.provider.readPrState).toHaveBeenCalled();
+    });
+
+    it.each(['review:pending', 'review:human'])('admits a %s PR from the real daemon tick with no state in the snapshot', label => {
+      const w = world();
+      w.pr.labels = [{ name: label }];
+      const dispatch = vi.fn();
+      runReviewTick({ repo: w.options.repo, readPrs: () => discover(w), readAgents: () => [], holdReconcile: () => [],
+        tagRound: () => {}, tagStatus: () => {}, dispatch,
+        routeTestGaming: args => sweepTestGamingRoutes({ ...w.options, ...args }),
+        reconcile: () => w.plan() });
+      expect(w.provider.postComment).toHaveBeenCalledOnce();
+      expect(w.pr.labels.map(l => l.name)).toEqual(expect.arrayContaining(['review:human', 'advisory:changes']));
+      expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toHaveLength(1);
+    });
+
+    it('still writes nothing when the live state is not open', () => {
+      const w = world();
+      const [listed] = discover(w);
+      w.provider.readPrState.mockReturnValue({ ...w.pr, state: 'CLOSED' });
+      expect(routeTestGaming(listed, w.options).action).toBe('skip');
+      expect(w.provider.postComment).not.toHaveBeenCalled();
+      expect(w.provider.setLabels).not.toHaveBeenCalled();
+    });
+  });
+
+  // Red-team break test-gaming-route.mjs:135 (PR #5537, head 5c9a2892a): after a justified removal the route
+  // dropped advisory:changes, but the advisory label sweep re-derived it from the unchanged route note.
+  describe('red-team break :135 — the advisory label sweep reopens a justified removal', () => {
+    // Production comments carry createdAt; the sweep orders advisories by it, so stamp every comment in order.
+    const clocked = w => {
+      let tick = Date.parse('2026-10-18T12:00:00Z');
+      const stamp = c => ({ ...c, createdAt: new Date(tick += 60_000).toISOString() });
+      w.provider.postComment.mockImplementation((repo, n, body) => w.pr.comments.push(stamp(bot(body))));
+      return body => w.pr.comments.push(stamp(bot(body)));
+    };
+    const sweep = w => sweepAdvisoryLabels({ repo: w.options.repo, listPrs: () => [structuredClone(w.pr)],
+      readPr: () => structuredClone(w.pr), provider: w.provider });
+
+    it('does not restore advisory:changes after a justification without an advisory-fix marker', () => {
+      const w = world();
+      const append = clocked(w);
+      expect(routeTestGaming(w.pr, w.options).action).toBe('admit');
+      append(buildFixEndComment({ who: 'fix-5537', headSha: HEAD }) + '\n\ntest-removal-justified: obsolete behavior removed');
+      expect(routeTestGaming(w.pr, w.options).action).toBe('needs-you');
+      expect(w.pr.labels.map(l => l.name)).toEqual(['review:human']);
+      sweep(w);
+      expect(w.pr.labels.map(l => l.name)).toEqual(['review:human']);
+      expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toEqual([]);
+    });
+
+    it('stays parked across repeated route and sweep ticks with real timestamps', () => {
+      const w = world();
+      const append = clocked(w);
+      routeTestGaming(w.pr, w.options);
+      append(buildFixEndComment({ who: 'fix-5537', headSha: HEAD }) + '\n\ntest-removal-justified: obsolete behavior removed');
+      for (let tick = 0; tick < 3; tick++) {
+        expect(routeTestGaming(w.pr, w.options).action).toBe('needs-you');
+        sweep(w);
+        expect(w.pr.labels.map(l => l.name)).toEqual(['review:human']);
+        expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toEqual([]);
+      }
+      expect(w.notify).toHaveBeenCalledOnce();
+      expect(w.row.conclusion).toBe('FAILURE');
+    });
+
+    it('the ruling note on the old head does not block a new repair episode on a later head', () => {
+      const w = world();
+      const append = clocked(w);
+      routeTestGaming(w.pr, w.options);
+      append(buildFixEndComment({ who: 'fix-5537', headSha: HEAD }) + '\n\ntest-removal-justified: obsolete behavior removed');
+      expect(routeTestGaming(w.pr, w.options).action).toBe('needs-you');
+      w.pr.headRefOid = w.verdict.head_sha = 'b'.repeat(40);
+      expect(routeTestGaming(w.pr, w.options).action).toBe('admit');
+      sweep(w);
+      expect(w.pr.labels.map(l => l.name)).toContain('advisory:changes');
+      expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toHaveLength(1);
+    });
+  });
+
   it('cascades the setting through standard, platform, tool and environment with provenance', () => {
     const key = 'routeTestGamingToFixer';
     expect(resolveReviewSettings({ fileConfig: {}, platform: {}, env: {} })[key]).toBe(true);
