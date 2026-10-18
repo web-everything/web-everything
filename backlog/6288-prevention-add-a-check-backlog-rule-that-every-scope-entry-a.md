@@ -12,7 +12,7 @@ tags: []
 # Prevention — Add a check-backlog rule that every scope entry and we:backlog/... reference in an open card reso… (from web-everything/web-everything#5573 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/xd0axov-prevention-have-the-filer-seed-a1-with-the-specific-failing.md:6` — Add a check-backlog rule that every `scope` entry and `we:backlog/...` reference in an open card resolves to an existing file, or rewrites JIT-number renames.
+1. `we:backlog/6286-prevention-have-the-filer-seed-a1-with-the-specific-failing.md:6` — Add a check-backlog rule that every `scope` entry and `we:backlog/...` reference in an open card resolves to an existing file, or rewrites JIT-number renames.
 
 Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 2 → #5615.
 
