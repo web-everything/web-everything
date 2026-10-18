@@ -1,5 +1,16 @@
 # Testing — Three-Tier Strategy
 
+## Red-team panel timing
+
+`redTeam.timing` defaults to `panel-seat`; `WE_RED_TEAM_TIMING=post-accept` exercises
+the rollback path. Legacy tests of accept-only scheduling must select that timing in
+their IO/environment fixture. The panel reuses the speculative call's pinned read and
+finishes before the job reports done, even when the jurors reject or refer to a human.
+Missing/unrun seat evidence on a reviewed head stays held in drain beyond the pending
+deadline; it cannot use the never-scheduled escape or trigger a second post-accept pass.
+The focused timing, review-seat and drain-seat suites cover this boundary.
+
+
 ## Periodic card batch recovery
 
 `card-batch-reconcile.mjs` shares admission's terminal-PR retirement and per-state lease.
@@ -105,7 +116,16 @@ exercise diagnostic propagation through a real-git rebuild fixture. Run these su
 ## Red-team re-check evidence
 
 The drain reads saved red-team evidence for the exact repository, PR and live head when no
-trusted result comment exists. A completed clean result satisfies the hold; confirmed breaks
+trusted result comment exists. Saved rows require a completed `review-pr` run with
+`findings.savedRedTeamResult = { writer: 'review-job', references: [{ path, index }], sha256 }`.
+The review job attests the persisted result before running the gate, for panel-seat and
+post-accept timing. Hash the referenced rows as one JSON array, sorting object keys recursively
+and preserving array order, including all persisted fields. Readers verify every reference and
+the hash against the same scorecard snapshot. Missing or invalid provenance returns no result
+and logs a fixed `saved-red-team-ignored:` reason without row contents; the attempt still holds
+and cannot age into the never-scheduled escape. Nominally clean rows rejected by provenance do
+not launch another pass. Regression coverage: `saved-red-team-provenance.test.mjs` and the
+production writer-to-reader cases in `review-job-red-team.test.mjs`. A completed clean result satisfies the hold; confirmed breaks
 use the same gate, round cap and operator ruling as posted results. An identical result posted
 after a named round-cap ruling keeps that ruling; changed results and unknown saved chronology
 remain held. Saved finding text passes the publication scrub before comments or cards are written.

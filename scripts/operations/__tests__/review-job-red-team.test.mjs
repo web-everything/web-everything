@@ -1,3 +1,6 @@
+import { beforeEach as beforeTimingFixture, afterEach as afterTimingFixture, vi as timingFixture } from 'vitest';
+beforeTimingFixture(() => timingFixture.stubEnv('WE_RED_TEAM_TIMING', 'post-accept'));
+afterTimingFixture(() => timingFixture.unstubAllEnvs());
 /**
  * Card xyyuvyz — THE POST-ACCEPT RED TEAM RUNS ON EVERY HEAD THE PANEL ACCEPTS, ONCE PER HEAD. Live gap (PR #4722):
  * the red team broke head ea117e881, the PR was fixed, and the panel accepted the fixed head e125ac999 — but the PR
@@ -6,7 +9,7 @@
  */
 import { describe, it, expect } from 'vitest';
 
-import { runReviewJob } from '../review-job.mjs';
+import { createReviewJobIo, runReviewJob } from '../review-job.mjs';
 import { redTeamOwedFor, runRedTeam } from '../review-extra-seats.mjs';
 
 const REPO = 'web-everything/web-everything';
@@ -151,4 +154,63 @@ describe('runRedTeam — the pass itself honours the advisory accept and stays o
     expect(calls.some((c) => c[0] === 'reserve')).toBe(false);
     expect(r.status).not.toBe('not-owed');
   });
+});
+
+// Exercise the production run-store writer through both job paths, then the admission reader.
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { readRun, writeRun } from '../run-store.mjs';
+import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mjs';
+import { readSavedRedTeamResult } from '../../lib/drain-saved-red-team.mjs';
+import { provenanceRun, savedRowsHash } from '../../lib/__tests__/fixtures/saved-red-team-provenance.mjs';
+
+it.each(['post-accept', 'panel-seat'])('persists and verifies review-job provenance for %s', timing => {
+  const root = mkdtempSync(join(tmpdir(), 'review-job-provenance-'));
+  try {
+    const runsDir = join(root, 'runs');
+    const env = { CONVEYOR_STATE_ROOT: root, OPERATION_RUNS_DIR: runsDir, WE_SHARED_RUNS_DIR: runsDir,
+      WE_RED_TEAM_TIMING: timing };
+    const row = { dispatchKind: 'review-seat', seat: 'red-team', repo: REPO, pr: 4722, rev: HEAD_1,
+      callId: 'owned-call', status: 'ok', recheckStatus: 'ok', findings: [], confirmedMissCount: 0 };
+    const path = resolveScorecardStorePath(env);
+    mkdirSync(dirname(path), { recursive: true });
+    const rows = [{ ...row, v: 1, outcome: null, scoredAt: new Date(NOW).toISOString() }];
+    writeFileSync(path, JSON.stringify({ records: rows }));
+    const run = provenanceRun({ env, rows, id: 'review-pr-1' });
+    delete run.findings.savedRedTeamResult;
+    // Saving evidence cannot complete an unfinished run.
+    const cursor = run.cursor;
+    writeRun({ ...run, cursor: 0 }, runsDir);
+    const { io } = jobIo(payload());
+    const redTeam = { status: 'ran', rev: HEAD_1, callId: row.callId, seat: row,
+      recheckStatus: 'ok', findings: [], comment: { status: 'withheld' } };
+    const real = createReviewJobIo({ env, dir: join(root, 'jobs') });
+    io.recordSavedRedTeamResult = real.recordSavedRedTeamResult;
+    io.redTeamTimingSetting = () => ({ value: { timing }, sources: {}, invalid: [] });
+    io.runRedTeam = () => redTeam;
+    if (timing === 'panel-seat') {
+      io.startSpeculativeRedTeam = () => ({ pid: 123, startedAt: NOW });
+      io.speculativeReadSunk = () => true;
+      io.awaitSpeculativeRedTeam = () => ({ spec: { status: 'speculated', rev: HEAD_1 } });
+      io.finishSpeculativeRedTeam = () => redTeam;
+      io.cleanupSpeculativeRedTeam = () => {};
+    }
+    runReviewJob({ pr: 4722, repo: REPO, pid: 1 }, io);
+    const saved = readRun(run.id, runsDir);
+    expect(saved.findings.savedRedTeamResult).toEqual({ writer: 'review-job', references: [{ path, index: 0 }],
+      sha256: savedRowsHash(rows) });
+    const input = { repo: REPO, pr: 4722, head: HEAD_1, env, log: () => {} };
+    expect(readSavedRedTeamResult(input)).toBeNull();
+    writeRun({ ...saved, cursor }, runsDir);
+    expect(readSavedRedTeamResult(input)).toMatchObject({ findings: [], recheckIncomplete: false });
+    rows[0].privateNote = 'changed after attestation';
+    writeFileSync(path, JSON.stringify({ records: rows }));
+    expect(readSavedRedTeamResult(input)).toBeNull();
+    // The job cannot attest a row modified before its attestation either.
+    rows[0].findings = [{ confirmedByRecheck: true }];
+    writeFileSync(path, JSON.stringify({ records: rows }));
+    expect(() => real.recordSavedRedTeamResult({ runId: run.id, repo: REPO, pr: 4722, head: HEAD_1, redTeam }))
+      .toThrow(/changed before attestation/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

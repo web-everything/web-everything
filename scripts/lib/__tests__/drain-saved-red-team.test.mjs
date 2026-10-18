@@ -1,4 +1,7 @@
 // @vitest-environment node
+import { beforeEach as beforeTimingFixture, afterEach as afterTimingFixture, vi as timingFixture } from 'vitest';
+beforeTimingFixture(() => timingFixture.stubEnv('WE_RED_TEAM_TIMING', 'post-accept'));
+afterTimingFixture(() => timingFixture.unstubAllEnvs());
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -8,6 +11,7 @@ import { postAcceptRedTeamOwed, redTeamEnqueueHold } from '../drain-queue-safety
 import { applyRedTeamGate } from '../../operations/red-team-gate-apply.mjs';
 import { redTeamGateMarker, redTeamResultId } from '../red-team-gate.mjs';
 import { buildReviewedShaMarker, buildClearedHumanMarker } from '../review-escalation.mjs';
+import { saveProvenanceFixtures } from './fixtures/saved-red-team-provenance.mjs';
 import { scrubPublish } from '../secret-scrub.mjs';
 
 const head = 'a'.repeat(40), repo = 'Web-Everything/web-everything', pr = 5486;
@@ -17,9 +21,10 @@ const dirs = [];
 afterEach(() => dirs.splice(0).forEach(p => rmSync(p, { recursive: true, force: true })));
 function fixture(rows) {
   const root = mkdtempSync(join(tmpdir(), 'saved-red-team-')); dirs.push(root);
-  const env = { CONVEYOR_STATE_ROOT: root };
+  const env = { WE_RED_TEAM_TIMING: 'post-accept', CONVEYOR_STATE_ROOT: root, WE_SHARED_RUNS_DIR: join(root, 'runs') };
   const path = resolveScorecardStorePath(env); mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify({ version: 1, records: rows }));
+  saveProvenanceFixtures(env);
   return { env, path };
 }
 const hold = (env, over = {}) => redTeamEnqueueHold({ repo, pr, head, comments: [], env, scheduled: true,
@@ -195,6 +200,7 @@ describe('saved red-team admission', () => {
     expect(hold(env, { comments, confirmedBreaks: { broken: 'send-back' } })).toBeNull();
     writeFileSync(resolveScorecardStorePath(env), JSON.stringify({ version: 1,
       records: [row({ findings: [{ ...findings[0], summary: 'a newer break' }], confirmedMissCount: 1 })] }));
+    saveProvenanceFixtures(env);
     expect(hold(env, { comments, confirmedBreaks: { broken: 'send-back' } })).toMatch(/requiring send-back/);
   });
 });

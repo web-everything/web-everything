@@ -139,6 +139,25 @@ export function readConfirmedBreaks({ env = process.env, path = RED_TEAM_SETTING
   return resolveConfirmedBreaks({ file, env });
 }
 
+/**
+ * redTeam.timing: panel-seat (standard prototype default) runs on every reviewed head
+ * beside the jurors; post-accept restores the sequential accept-only path.
+ * Standard < platform < tool < WE_RED_TEAM_TIMING; invalid values keep the lower layer.
+ */
+export function resolveRedTeamTiming({ file = {}, platform, env = {} } = {}) {
+  const pick = o => o?.timing === undefined ? {} : { timing: o.timing };
+  return resolveCascade({ standard: { timing: 'panel-seat' }, platform: pick(platform),
+    tool: pick(file?.redTeam), envValues: { timing: env.WE_RED_TEAM_TIMING },
+    valid: v => ['panel-seat', 'post-accept'].includes(v) });
+}
+export function readRedTeamTiming({ env = process.env, path = RED_TEAM_SETTINGS_FILE, log = () => {} } = {}) {
+  let file = {};
+  try { file = JSON.parse(readFileSync(path, 'utf8')); } catch { /* defaults */ }
+  const resolved = resolveRedTeamTiming({ file, platform: platformPreference('redTeam', { env }), env });
+  log(formatCascadeSourcesLine('redTeam', resolved));
+  return resolved;
+}
+
 /** Repo-reading and card-only controls share the standard/platform/tool/env cascade. */
 export const RED_TEAM_PROBE_DEFAULTS = Object.freeze({ recheckReadsRepo: true, skipCardOnly: true, statusLabels: true });
 export const RED_TEAM_PROBE_ENV = Object.freeze({

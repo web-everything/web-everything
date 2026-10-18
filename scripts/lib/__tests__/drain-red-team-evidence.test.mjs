@@ -1,7 +1,11 @@
 // @vitest-environment node
+import { beforeEach as beforeTimingFixture, afterEach as afterTimingFixture, vi as timingFixture } from 'vitest';
+beforeTimingFixture(() => timingFixture.stubEnv('WE_RED_TEAM_TIMING', 'post-accept'));
+afterTimingFixture(() => timingFixture.unstubAllEnvs());
 import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { saveProvenanceFixtures } from './fixtures/saved-red-team-provenance.mjs';
 import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { dirname, join } from 'node:path';
@@ -17,7 +21,7 @@ function fixture() {
   roots.push(root);
   const runsDir = join(root, 'runs');
   return { repo: 'web-everything/web-everything', pr: 5439, head: 'b'.repeat(40), runsDir,
-    readScorecards: () => [], env: { WE_SHARED_RUNS_DIR: runsDir } };
+    readScorecards: () => [], env: { WE_RED_TEAM_TIMING: 'post-accept', WE_SHARED_RUNS_DIR: runsDir, CONVEYOR_STATE_ROOT: root } };
 }
 const payload = head => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
 
@@ -38,7 +42,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     expect(readDrainRedTeamEvidence(f).queued).toBeUndefined();
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), labels: ['review:accepted'], comments: [] })).toMatch(/no recorded result/);
     // A disabled scheduler or a non-accepting run schedules nothing; the job's finished status supersedes the run.
-    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence({ ...f, env: { ...f.env, WE_REVIEW_RED_TEAM: 'off' } }), comments: [] })).toBeNull();
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence({ ...f, env: { WE_RED_TEAM_TIMING: 'post-accept', ...f.env, WE_REVIEW_RED_TEAM: 'off' } }), comments: [] })).toBeNull();
     writeRun({ ...run, verdict: { verdict: 'changes' } }, f.runsDir);
     expect(readDrainRedTeamEvidence(f).scheduled).toBe(false);
     writeRun(run, f.runsDir);
@@ -74,19 +78,19 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     const f = fixture();
     const cardOnly = { ...payload(f.head), findings: { read: { netBasis: { rev: f.head }, netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] } } };
     const live = { ...f, isAlive: () => true, readPidStart: () => 'start' };
-    recordRedTeamStatus({ ...f, loopPayload: cardOnly, status: 'queued' }, { ...f, env: { ...f.env, WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, readPidStart: () => 'start' });
+    recordRedTeamStatus({ ...f, loopPayload: cardOnly, status: 'queued' }, { ...f, env: { WE_RED_TEAM_TIMING: 'post-accept', ...f.env, WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, readPidStart: () => 'start' });
     expect(readDrainRedTeamEvidence(live).skipCardOnly).toBe(false);
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(live), comments: [] })).toMatch(/no recorded result/);
-    recordRedTeamStatus({ ...f, loopPayload: cardOnly, status: 'queued' }, { ...f, env: { ...f.env, WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, readPidStart: () => 'start' });
-    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(live), env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, comments: [] })).toBeNull();
+    recordRedTeamStatus({ ...f, loopPayload: cardOnly, status: 'queued' }, { ...f, env: { WE_RED_TEAM_TIMING: 'post-accept', ...f.env, WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, readPidStart: () => 'start' });
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(live), env: { WE_RED_TEAM_TIMING: 'post-accept', WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, comments: [] })).toBeNull();
   });
   it('skips a card-only run before the job records a skip decision when skipCardOnly is on', () => {
     const f = fixture();
     const read = { netBasis: { rev: f.head }, netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] };
     writeRun({ ...newRunRecord({ id: 'review-pr-5439', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), verdict: { verdict: 'accept' }, findings: { read } }, f.runsDir);
     expect(readDrainRedTeamEvidence(f).skipCardOnly).toBeUndefined();
-    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, comments: [] })).toBeNull();
-    recordRedTeamStatus({ ...f, loopPayload: { verdict: { verdict: 'accept' }, findings: { read } }, status: 'queued' }, { ...f, env: { ...f.env, WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, readPidStart: () => 'start' });
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), env: { WE_RED_TEAM_TIMING: 'post-accept', WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, comments: [] })).toBeNull();
+    recordRedTeamStatus({ ...f, loopPayload: { verdict: { verdict: 'accept' }, findings: { read } }, status: 'queued' }, { ...f, env: { WE_RED_TEAM_TIMING: 'post-accept', ...f.env, WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, readPidStart: () => 'start' });
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence({ ...f, isAlive: () => true, readPidStart: () => 'start' }), comments: [] })).toBeNull();
   });
   it('keeps a pre-normalization status record held', () => {
@@ -147,7 +151,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     expect(pidStartTime(42, (cmd, args, opts) => {
       expect(cmd).toBe('ps');
       expect(args).toEqual(['-p', '42', '-o', 'lstart=']);
-      expect(opts).toMatchObject({ timeout: 5000, maxBuffer: 4096, env: { LC_ALL: 'C', TZ: 'UTC' } });
+      expect(opts).toMatchObject({ timeout: 5000, maxBuffer: 4096, env: { WE_RED_TEAM_TIMING: 'post-accept', LC_ALL: 'C', TZ: 'UTC' } });
       return '  Fri Oct 16 12:34:56 2026\n';
     })).toBe('Fri Oct 16 12:34:56 2026');
     expect(pidStartTime(42, () => { throw new Error('unavailable'); })).toBeNull();
@@ -196,6 +200,7 @@ it('replays #5461 saved and posted old-head breaks without treating them as live
   const path = resolveScorecardStorePath(f.env);
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify({ version: 1, records: [row] }));
+  saveProvenanceFixtures(f.env);
   recordRedTeamStatus({ ...f, loopPayload: payload(oldHead), status: 'finished', result: { status: 'ran' } }, f);
   const evidence = readDrainRedTeamEvidence({ ...f, readScorecards: () => [row] });
   expect(evidence).toMatchObject({ loopPayload: null, scheduled: false, attempted: false, recorded: false, inFlight: false });

@@ -666,6 +666,7 @@ describe('#4194 review-job — the seats run AFTER the arc, and can never change
   function fakeJobIo(over = {}) {
     const calls = [];
     const io = {
+    redTeamTimingSetting: () => ({ value: { timing: 'post-accept' }, sources: { timing: 'tool' }, invalid: [] }),
       root: '/daemon',
       now: (() => { let t = 1_000; return () => { t += 10; return t; }; })(),
       newActorId: () => 'actor',

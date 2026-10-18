@@ -12,6 +12,7 @@ import {
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { rulesetSuggestion } from '../merge-queue-enqueue.mjs';
+import { saveProvenanceFixtures } from './fixtures/saved-red-team-provenance.mjs';
 import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mjs';
 import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
 
@@ -22,7 +23,7 @@ const policyOf = (strategy) => ({ policy: resolveMergeDeliveryPolicy({ tool: str
 
 const DRAIN = 'drain-bot';
 
-function harness({ strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = process.env, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, baseTip = () => BASE_TIP } = {}) {
+function harness({ strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = { ...process.env, WE_RED_TEAM_TIMING: 'post-accept' }, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, baseTip = () => BASE_TIP } = {}) {
   const calls = [];
   const logs = [];
   let stored = initial;
@@ -584,6 +585,21 @@ describe('merge-ai-prs hook wiring', () => {
 
 
 describe('post-accept red-team enqueue barrier (#5283)', () => {
+  it('an owed panel seat never uses the overdue request or never-scheduled escape', () => {
+    let clock = 1000;
+    const requests = [];
+    const options = { strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'],
+      now: () => clock, env: { WE_RED_TEAM_TIMING: 'panel-seat', WE_DRAIN_ENQUEUE_WHEN_RED_TEAM_NEVER_SCHEDULED: 'true' },
+      evidence: { scheduled: true, recorded: false, attempted: false, inFlight: false,
+        loopPayload: { verdict: { verdict: 'needs-human' }, findings: { read: { netBasis: { rev: HEAD } } } } },
+      requestRedTeam: input => { requests.push(input); return { requested: false }; } };
+    const first = harness(options);
+    expect(first.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    clock += 120 * 60_000;
+    const overdue = harness({ ...options, initial: first.state() });
+    expect(overdue.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(requests).toEqual([]);
+  });
   it('a head with no red team ever scheduled gets one request, once, with a cooldown', () => {
     let clock = 1000;
     const requests = [];
@@ -633,12 +649,13 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
   it.each([null, LOCAL])('enqueues a saved clean live-head result without comments (repo=%s)', repo => {
     const root = mkdtempSync(join(tmpdir(), 'drain-saved-wiring-'));
     try {
-      const env = { CONVEYOR_STATE_ROOT: root, WE_RED_TEAM_DRAIN_READS_SAVED_RESULT: 'on' };
+      const env = { WE_RED_TEAM_TIMING: 'post-accept', CONVEYOR_STATE_ROOT: root, WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_DRAIN_READS_SAVED_RESULT: 'on' };
       const path = resolveScorecardStorePath(env);
       mkdirSync(dirname(path), { recursive: true });
       writeFileSync(path, JSON.stringify({ version: 1, records: [{ dispatchKind: 'review-seat', seat: 'red-team',
         repo: LOCAL, pr: 5283, rev: HEAD, status: 'ok', seatVerdict: 'accept',
         recheckStatus: 'ok', confirmedMissCount: 0, findings: [] }] }));
+      saveProvenanceFixtures(env);
       const h = harness({ strategy: 'github-merge-queue', env, labels: ['review:accepted', 'ready-to-merge'], liveComments: [] });
       expect(h.s.enqueue({ num: 5283, repo }, HEAD, { comments: [] })).toMatchObject({ enqueued: true });
       expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(true);
@@ -648,12 +665,13 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
   it.each(['pending', 'error', undefined])('persists incomplete saved rechecks and never waives them as unscheduled: %s', recheckStatus => {
     const root = mkdtempSync(join(tmpdir(), 'drain-incomplete-wiring-'));
     try {
-      const env = { CONVEYOR_STATE_ROOT: root, WE_RED_TEAM_DRAIN_READS_SAVED_RESULT: 'on' };
+      const env = { WE_RED_TEAM_TIMING: 'post-accept', CONVEYOR_STATE_ROOT: root, WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_DRAIN_READS_SAVED_RESULT: 'on' };
       const path = resolveScorecardStorePath(env);
       mkdirSync(dirname(path), { recursive: true });
       writeFileSync(path, JSON.stringify({ version: 1, records: [{ dispatchKind: 'review-seat', seat: 'red-team',
         repo: LOCAL, pr: 5283, rev: HEAD, status: 'ok', recheckStatus, confirmedMissCount: 1,
         findings: [{ confirmedByRecheck: true, impactIfUnfixed: 'degraded' }, { confirmedByRecheck: false }] }] }));
+      saveProvenanceFixtures(env);
       let clock = 0;
       const h = harness({ strategy: 'github-merge-queue', env, now: () => clock,
         labels: ['review:accepted', 'ready-to-merge'], liveComments: [] });
@@ -915,7 +933,7 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
   function erroredRunAfterDeadline({ status, row, writer = LOCAL, rev = HEAD, read = {} }) {
     const root = mkdtempSync(join(tmpdir(), 'drain-errored-red-team-'));
     try {
-      const env = { CONVEYOR_STATE_ROOT: root, WE_SHARED_RUNS_DIR: join(root, 'runs') };
+      const env = { WE_RED_TEAM_TIMING: 'post-accept', CONVEYOR_STATE_ROOT: root, WE_SHARED_RUNS_DIR: join(root, 'runs') };
       const rows = row ? [{ dispatchKind: 'review-seat', seat: 'red-team', repo: LOCAL, pr: 5283, rev: HEAD, status: row, seatVerdict: null }] : [];
       const path = resolveScorecardStorePath(env);
       mkdirSync(dirname(path), { recursive: true });

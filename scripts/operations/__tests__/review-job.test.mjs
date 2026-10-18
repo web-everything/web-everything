@@ -158,6 +158,7 @@ describe('job records — liveness by pid, without a transcript', () => {
 function fakeIo(over = {}) {
   const calls = [];
   const io = {
+    redTeamTimingSetting: () => ({ value: { timing: 'post-accept' }, sources: { timing: 'tool' }, invalid: [] }),
     root: '/daemon',
     now: (() => { let t = 1_000; return () => { t += 10; return t; }; })(),
     newActorId: () => 'actor-fresh-uuid',

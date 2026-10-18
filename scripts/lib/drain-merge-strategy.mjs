@@ -1,3 +1,4 @@
+import { redTeamPanelSeatOwed } from './review-red-team-policy.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 /**
@@ -436,7 +437,7 @@ export function createDrainMergeStrategy({
           const outcome = pendingOutcome(c, wait);
           // Never waive a recorded break or an active/recorded run. Only the scheduling gap has this escape: a run that
           // errored or left no usable result stays held until a usable result exists.
-          if ((!neverScheduled && !outcome.healthSmell) || evidence.inFlight || evidence.queued || reason.includes('requiring send-back')
+          if (evidence.untrustedSavedResult || redTeamPanelSeatOwed(evidence.loopPayload, env) || (!neverScheduled && !outcome.healthSmell) || evidence.inFlight || evidence.queued || reason.includes('requiring send-back')
             || reason.includes('saved red-team re-check incomplete')) return outcome;
           let requested = false;
           if (wait.requestedAt != null) return outcome;

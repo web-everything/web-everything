@@ -1,3 +1,4 @@
+import { reviewPrStepNames } from './review-pr-completion.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { advisoryLabelOutcome } from '../lib/review-advisory-outcome.mjs';
 export { advisoryLabelOutcome, deriveAdvisoryOutcome } from '../lib/review-advisory-outcome.mjs';
@@ -2643,7 +2644,7 @@ export function reviewPrOperation({
         // THE ROSTER, RECORDED BY THE BUILD ITSELF (not an input a caller could name): a resume reads it back with
         // `securitySeatFromRun`, so a seat that failed or has not answered yet cannot change it. `seatSteps` and the
         // minimum are read back the same way by `reviewSeatOptionsForRun`, at every cursor position.
-        return { ...finding, cardOnlyLight, securitySeat: securitySeat !== false, seatSteps: seats.map((seat) => seat.step), minNonClaudeSeats };
+        return { ...finding, referralVerifierDeclared: verifierDeclared, cardOnlyLight, securitySeat: securitySeat !== false, seatSteps: seats.map((seat) => seat.step), minNonClaudeSeats };
       },
     }),
 
@@ -3492,6 +3493,9 @@ export function reviewPrOperation({
     );
   }
 
+  const completionSteps = reviewPrStepNames(roster, verifierDeclared);
+  if (declaration.steps.map(s => s.name).join(',') !== completionSteps.join(','))
+    throw new Error('review-pr: completion step shape differs from declaration');
   return Object.freeze({ ...declaration, cardOnlyLight });
 }
 

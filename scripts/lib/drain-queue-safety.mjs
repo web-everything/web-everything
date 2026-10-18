@@ -1,5 +1,5 @@
 /** Queue admission and removal share this policy and head-bound red-team evidence. */
-import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
+import { redTeamOwedOnHead, redTeamPanelSeatOwed } from './review-red-team-policy.mjs';
 import { execFileSync } from 'node:child_process';
 import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
@@ -30,7 +30,7 @@ export function sendBackReason(labels) {
 
 /** Only head-bound scheduled work is owed; acceptance and status labels cannot invent a run. */
 export function postAcceptRedTeamOwed(loopPayload, env = process.env, evidence = {}) {
-  return redTeamOwedOnHead({ read: loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly });
+  return redTeamPanelSeatOwed(loopPayload, env) || redTeamOwedOnHead({ read: loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly });
 }
 
 export function redTeamEnqueueHold({ loopPayload, comments, repo, pr, head, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false, attempted = false, requestPending = false, skipCardOnly } = {}) {

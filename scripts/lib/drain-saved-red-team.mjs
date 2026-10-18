@@ -1,3 +1,5 @@
+import { verifySavedRedTeamProvenance } from './saved-red-team-provenance.mjs';
+import { readRedTeamTiming } from './red-team-gate.mjs';
 /** Completed evidence survives a withheld/failed comment. Readers must scrub saved text before publication. */
 import { readFileSync } from 'node:fs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
@@ -24,17 +26,19 @@ export const sameRepo = (a, b) => typeof a === 'string' && typeof b === 'string'
  * NEEDED, `operator-why`, the clear-human ruling): asked only when the thread has no live-head result. Throws on
  * unreadable evidence; each caller decides how to surface that.
  */
-export function savedRedTeamFallback({ repo, pr, head, env = process.env } = {}) {
-  return () => readSavedRedTeamResult({ repo, pr, head: String(head ?? '').toLowerCase(), env });
+export function savedRedTeamFallback({ repo, pr, head, env = process.env, runsDir, log } = {}) {
+  return () => readSavedRedTeamResult({ repo, pr, head: String(head ?? '').toLowerCase(), env, runsDir, log });
 }
 
-export function readSavedRedTeamResult({ repo, pr, head, env = process.env } = {}) {
+export function readSavedRedTeamResult({ repo, pr, head, env = process.env, runsDir,
+  log = line => process.stderr.write(`${line}\n`) } = {}) {
   if (!repo || !Number.isSafeInteger(Number(pr)) || Number(pr) <= 0 || !/^[a-f0-9]{40}$/.test(head ?? '')) return null;
-  if (!readSavedRedTeamSetting({ env }).value.drainReadsSavedResult) return null;
+  if (readRedTeamTiming({ env }).value.timing !== 'panel-seat' && !readSavedRedTeamSetting({ env }).value.drainReadsSavedResult) return null;
+  const ignore = reason => { log(`saved-red-team-ignored: ${reason}`); return null; };
   const path = resolveScorecardStorePath(env);
   let text;
   try { text = readFileSync(path, 'utf8'); }
-  catch (e) { if (e.code === 'ENOENT') return null; throw new Error('saved red-team evidence unreadable'); }
+  catch (e) { if (e.code === 'ENOENT') return ignore('saved result store missing'); throw new Error('saved red-team evidence unreadable'); }
   // The shared reader intentionally tolerates corrupt files for accounting. Admission must refuse them,
   // rather than let an empty history trigger the never-scheduled escape. Validate the same snapshot first.
   let store;
@@ -44,7 +48,9 @@ export function readSavedRedTeamResult({ repo, pr, head, env = process.env } = {
   // Same completed-seat selection as speculateRedTeam/resumeRedTeam, additionally bound to the repo.
   const row = records.filter(r => r?.dispatchKind === 'review-seat' && r.seat === 'red-team'
     && sameRepo(r.repo, repo) && r.pr === Number(pr) && r.rev === head && r.status === 'ok').at(-1);
-  if (!row) return null;
+  if (!row) return ignore('no matching completed saved result');
+  const ignored = verifySavedRedTeamProvenance({ repo, pr, head, path, records, index: records.indexOf(row), env, runsDir });
+  if (ignored) return ignore(ignored);
   if (!Array.isArray(row.findings) || row.findings.some(f => !f || typeof f.confirmedByRecheck !== 'boolean')
     || (row.confirmedMissCount !== undefined && row.confirmedMissCount !== row.findings.filter(f => f.confirmedByRecheck).length))
     throw new Error('saved red-team findings incomplete');
