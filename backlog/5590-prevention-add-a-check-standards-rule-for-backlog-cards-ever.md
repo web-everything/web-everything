@@ -51,4 +51,4 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Also raised by
 
-- Also raised by web-everything/web-everything#5525 (finding 1: `we:backlog/xyzpgol-overlap-yield-known-holds.md:24` — Add a check:standards rule that fails a card when an edge-case or non-goal guarantee has no Acceptance or Test plan line naming a test file and case. A card-gate item for this class already exists backlog 5668 .)
+- Also raised by web-everything/web-everything#5525 (finding 1: `we:backlog/6240-overlap-yield-known-holds.md:24` — Add a check:standards rule that fails a card when an edge-case or non-goal guarantee has no Acceptance or Test plan line naming a test file and case. A card-gate item for this class already exists backlog 5668 .)
