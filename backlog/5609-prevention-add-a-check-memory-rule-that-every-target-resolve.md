@@ -41,3 +41,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5693 (finding 2: `we:backlog/xgyj0q6-blue-green-daemon-rebuilds-start-the-new-build-on-hold-then.md:12` — Add a deterministic card-readiness gate requiring guarantee-to-test mappings with repository-qualified paths and observable assertions; default guarantees must include an unset-configuration case.)
