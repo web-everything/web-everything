@@ -480,7 +480,12 @@ describe('#5647 single ruling-needed writer', () => {
     expect(w.labels).not.toContain(label);
   });
   it.each(['not-real', 'card', 'block'])('a %s ruling before the first referral survives delayed publication and mirror retries', async result => {
-    const w = replay({ rows: [event('ruling', { findingKey: 'finding-1', ruling: result }), referral()] });
+    // Start from a covered acceptance so only the referral can hold this PR. Without it,
+    // FACTS has no ownership timestamps and independently derives a review:human fallback.
+    const accepted = { type: 'verdict', ...buildVerdictRecord({ repo: REPO, pr: 7, verdict: 'accepted',
+      at: '2026-10-17T18:00:00Z', reason: 'baseline accepted', headSha: HEAD,
+      declaredActor: 'reviewer', session: 's', channel: 'chat', source: 'review-set-label' }) };
+    const w = replay({ rows: [accepted, event('ruling', { findingKey: 'finding-1', ruling: result }), referral()] });
     w.opts.addLabel = async (_repo, _pr, name) => { w.log.push(name); };
     for (let pass = 0; pass < 2; pass++) {
       expect((await runMirrorApply(w.opts)).failures).toEqual([]);
@@ -489,6 +494,9 @@ describe('#5647 single ruling-needed writer', () => {
     expect(w.log).toEqual(result === 'block' ? ['review:human', 'review:human'] : []);
     expect(deriveReferrals(w.rows).get('finding-1'))
       .toMatchObject({ state: result === 'block' ? 'blocking' : 'ruled', ruling: result, head: HEAD });
+    const state = derivePrState(w.rows, { ...FACTS, repo: REPO, pr: 7 });
+    expect(state.holds.map(h => h.code)).toEqual(result === 'block' ? ['referral-blocked'] : []);
+    expect(state.lifecycleState).toBe(result === 'block' ? 'NEEDS-OPERATOR' : 'READY-TO-MERGE');
   });
   it('buffers only exact keys and valid rulings, without creating phantom referrals or retaining a consumed early block', () => {
     const key = ledgerFindingKey('full raw key');
