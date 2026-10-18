@@ -4,6 +4,7 @@ import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { isOperatorAuthored } from '../lib/marker-authorship.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
+import { repoKeyForScope } from '../lib/repo-profile.mjs';
 import { CHANGES_RE } from './fix-context-pack.mjs';
 
 export function resolveScopeFence({ env = process.env, tool = readSettings().fix, platform } = {}) {
@@ -82,13 +83,26 @@ export function addedLines(patch = '') {
   });
 }
 
-/** `additions` (lines) wins over `patch` when the caller already attributed the added lines. */
-export function scopeFenceDecision({ scope = [], repo, paths = [], patch = '', additions = addedLines(patch), removed = [], policy }) {
+/** The repo-relative scope paths that name `repo`; prefix aliases (`fui:`, `plateau:`) resolve through the shared repo profile. */
+export function declaredScopePaths(scope = [], repo) {
+  const key = repoKeyForSlug(repo) ?? repo;
+  return scope.map(s => s.trim().split('#')[0]).filter(s => !s.includes(':') || repoKeyForScope(s) === key)
+    .map(s => s.slice(s.indexOf(':') + 1));
+}
+
+/**
+ * `additions` (lines) wins over `patch` when the caller already attributed the added lines. `directories` names the
+ * extensionless scope paths that are directories at the PR head; any other extensionless entry stays one exact file.
+ */
+export function scopeFenceDecision({ scope = [], repo, paths = [], patch = '', additions = addedLines(patch), removed = [], directories = [], policy }) {
   if (policy?.enabled === false) return { action: 'push', violations: [] };
   const key = repoKeyForSlug(repo) ?? repo;
-  const allowed = scope.map(s => s.trim().split('#')[0]).filter(s => !s.includes(':') || s.startsWith(`${key}:`))
-    .map(s => s.replace(/^[^:]+:/, ''));
-  const outside = paths.filter(p => !allowed.some(s => coversFile(`${key}:${s}`, `${key}:${p}`)));
+  const dirs = new Set(directories), allowed = declaredScopePaths(scope, repo);
+  const covers = (s, p) => {
+    const subtree = /\/$|[*?]/.test(s) ? s : dirs.has(s) ? `${s}/` : null;
+    return subtree ? coversFile(`${key}:${subtree}`, `${key}:${p}`) : s === p;
+  };
+  const outside = paths.filter(p => !allowed.some(s => covers(s, p)));
   const addedIdentifiers = new Set(additions.join('\n').match(/[A-Za-z_$][\w$]*/g) ?? []);
   const identifiers = [...new Set(removed)].filter(id => addedIdentifiers.has(id));
   const violations = [...outside.map(p => `outside declared scope: ${inertText(p)}`), ...identifiers.map(id => `re-adds operator-removed identifier: ${inertText(id)}`)];

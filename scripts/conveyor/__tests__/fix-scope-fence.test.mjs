@@ -1,6 +1,6 @@
 import { beforeAll, describe, it, expect, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -105,6 +105,25 @@ describe('fix scope fence', () => {
     expect(scopeFenceDecision({ ...context, scope: [scope], paths: ['guard.mjs'], policy }).action).toBe('push');
     expect(scopeFenceDecision({ ...context, scope: [scope], paths: ['guard.mjs/child.mjs'], policy }).action).toBe('stand-down');
     expect(scopeFenceDecision({ ...context, scope: [scope], paths: ['guard.mjs-new'], policy }).action).toBe('stand-down');
+  });
+  it.each(['frontierui', 'frontier-ui/frontierui'])('accepts the canonical Frontier UI fui: scope prefix for repo %s', repo => {
+    expect(scopeFenceDecision({ scope: ['fui:src/button.ts'], repo, paths: ['src/button.ts'], policy }).action).toBe('push');
+    expect(scopeFenceDecision({ scope: ['fui:src/button.ts'], repo, paths: ['src/other.ts'], policy }).action).toBe('stand-down');
+  });
+  it.each(['plateau-app', 'plateauapp/plateau-app'])('accepts the canonical Plateau plateau: scope prefix for repo %s', repo => {
+    expect(scopeFenceDecision({ scope: ['plateau:src/app.ts'], repo, paths: ['src/app.ts'], policy }).action).toBe('push');
+    expect(scopeFenceDecision({ scope: ['plateau:src/app.ts'], repo, paths: ['src/other.ts'], policy }).action).toBe('stand-down');
+    expect(scopeFenceDecision({ scope: ['fui:src/app.ts'], repo, paths: ['src/app.ts'], policy }).action).toBe('stand-down');
+  });
+  it.each(['we:scripts/bin/tool', 'scripts/bin/tool'])('keeps the extensionless file scope %s a FILE scope, never an undeclared subtree', scope => {
+    expect(scopeFenceDecision({ ...context, scope: [scope], paths: ['scripts/bin/tool'], policy }).action).toBe('push');
+    expect(scopeFenceDecision({ ...context, scope: [scope], paths: ['scripts/bin/tool', 'scripts/bin/tool/payload.mjs'], policy }).action).toBe('stand-down');
+    expect(scopeFenceDecision({ ...context, scope: [scope], paths: ['scripts/bin/tool/payload.mjs'], policy }).action).toBe('stand-down');
+  });
+  it('widens an extensionless scope to a subtree only when the PR head has a directory there', () => {
+    const at = paths => scopeFenceDecision({ ...context, scope: ['we:scripts/lib'], directories: ['scripts/lib'], paths, policy }).action;
+    expect(at(['scripts/lib/x.mjs'])).toBe('push');
+    expect(at(['scripts/lib-other/x.mjs'])).toBe('stand-down');
   });
   it('warn mode logs structured files and identifiers then pushes', () => {
     const r = run({ policy: { ...policy, mode: 'warn' }, readDiff: () => ({ paths: ['other.mjs'], patch: '+cdLandings();' }) });
@@ -281,7 +300,7 @@ describe('the live scope fence adapter over a real repository', () => {
     return { dir, git, port, write, commit };
   }
   /** The live adapter against a fake GitHub: the PR head and base, one marker commit, and the compare verdict for a merged commit. */
-  function liveFence(repo, { head, sha, base = null, compare = 'ahead', port = repo.port }) {
+  function liveFence(repo, { head, sha, base = null, compare = 'ahead', port = repo.port, scoped = 'guard.mjs' }) {
     const writes = [], compares = [];
     const exec = (file, args) => {
       expect(file).toBe('gh');
@@ -293,8 +312,8 @@ describe('the live scope fence adapter over a real repository', () => {
         if (status === 404) throw Object.assign(new Error('gh: Not Found (HTTP 404)'), { status: 1, stderr: 'gh: No commit found for SHA (HTTP 404)' });
         return `${status}\n`;
       }
-      if (args[0] === 'api') return 'diff --git a/guard.mjs b/guard.mjs\n--- a/guard.mjs\n+++ b/guard.mjs\n';
-      if (args[0] === 'pr' && args[1] === 'diff') return 'guard.mjs\n';
+      if (args[0] === 'api') return `diff --git a/${scoped} b/${scoped}\n--- a/${scoped}\n+++ b/${scoped}\n`;
+      if (args[0] === 'pr' && args[1] === 'diff') return `${scoped}\n`;
       writes.push(args); return '';
     };
     const fence = createScopeFencedPush({ root: '.', exec, env: { WE_FIX_SCOPE_FENCE_MODE: 'stand-down' }, log: () => {},
@@ -320,6 +339,28 @@ describe('the live scope fence adapter over a real repository', () => {
       expect(result).toMatchObject({ ok: false, scopeFence: true, terminal: true });
       expect(result.reason).toContain('re-adds operator-removed identifier: cdLandings');
       expect(push).not.toHaveBeenCalled();
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+
+  it('keeps an extensionless file scope a FILE scope when the fixer replaces that file with an undeclared subtree', () => {
+    const r = realRepo();
+    try {
+      r.write('guard.mjs', 'safe();\n'); r.write('tool', '#!/bin/sh\n'); const head = r.commit('initial');
+      r.git(['rm', '-q', 'tool']); mkdirSync(join(r.dir, 'tool')); r.write('tool/payload.mjs', 'payload();\n'); const sha = r.commit('fixer replaces the file with a directory');
+      const { result, push } = liveFence(r, { head, sha, scoped: 'tool' });
+      expect(result).toMatchObject({ ok: false, scopeFence: true, terminal: true });
+      expect(result.reason).toContain('outside declared scope: tool/payload.mjs');
+      expect(push).not.toHaveBeenCalled();
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+  it('still lets an extensionless directory scope cover the files under it', () => {
+    const r = realRepo();
+    try {
+      mkdirSync(join(r.dir, 'lib')); r.write('lib/a.mjs', 'a();\n'); const head = r.commit('initial');
+      r.write('lib/b.mjs', 'b();\n'); const sha = r.commit('fixer adds a file under the declared directory');
+      const { result, push } = liveFence(r, { head, sha, scoped: 'lib' });
+      expect(result.ok).toBe(true);
+      expect(push).toHaveBeenCalledOnce();
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
   });
 

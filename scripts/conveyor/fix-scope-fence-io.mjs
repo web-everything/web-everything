@@ -6,7 +6,8 @@ import { planFixesFromReconcile, fetchPrDiffScope, fetchPrDiffPaths, fetchCardSc
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 import { unescapeTsvField } from './pr-comments-list.mjs';
 import { buildStandDownComment, STAND_DOWN_LABEL } from './stand-down.mjs';
-import { addedLines, fencedPush, operatorScope, removalMarkers, resolveScopeFence, ScopeFenceEvidenceError, ScopeFenceHeadMovedError } from './fix-scope-fence.mjs';
+import { isSubtreeEntry } from '../readiness/scope-lease.mjs';
+import { addedLines, declaredScopePaths, fencedPush, operatorScope, removalMarkers, resolveScopeFence, ScopeFenceEvidenceError, ScopeFenceHeadMovedError } from './fix-scope-fence.mjs';
 
 /**
  * Pins the diff output the fence parses against lane config and attributes: no colour, every file as text (a binary
@@ -150,7 +151,11 @@ export function createScopeFencedPush({ root, exec = execFileSync, env = process
       const added = (from, to, pathspec = []) => removed.length ? addedLines(git([...FENCE_DIFF, '-U0', from, to, '--', ...pathspec])) : [];
       const merged = mergedBase({ git, gh: budgetGh, repo, head, sha, base });
       const paths = mergeScopePaths({ git, names, head, sha, merged });
-      if (!merged) return { paths, additions: added(head, sha) };
+      // An extensionless scope entry covers a subtree only where the PR head already has a directory; a file stays exact.
+      const directories = declaredScopePaths(context.scope, context.repo).filter(s => isSubtreeEntry(s) && !/\/$|[*?]/.test(s))
+        .filter(s => git(['ls-tree', '-z', head, '--', `:(top,literal)${s}`]).split('\0')
+          .some(r => r.slice(r.indexOf('\t') + 1) === s && r.split(' ')[1] === 'tree'));
+      if (!merged) return { paths, additions: added(head, sha), directories };
       // Identifier exclusions also guard conflict resolutions that restore an operator removal. This is separate from
       // file scope. Never replay a merge using the lane's fixer-writable config and attributes.
       // Judge PR paths (and upstream renames of them) against the PR head; judge other additions against the merged base.
@@ -165,7 +170,7 @@ export function createScopeFencedPush({ root, exec = execFileSync, env = process
       }
       const literal = magic => p => `:(top,literal${magic})${p}`;
       const prPaths = names(head, sha).filter(p => pr.has(p));
-      return { paths,
+      return { paths, directories,
         additions: [...(prPaths.length ? added(head, sha, prPaths.map(literal(''))) : []), ...added(merged, sha, [...pr].map(literal(',exclude')))] };
     };
     const resolved = resolveScopeFence({ env });
