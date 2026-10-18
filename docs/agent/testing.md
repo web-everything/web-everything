@@ -13,6 +13,18 @@ list timestamp. Failed list/cache IO falls back to provisioning; failed creation
 only if a fresh list confirms another process created the label. Focused coverage lives in
 `scripts/lib/__tests__/label-cache.test.mjs`; adapter argv tests disable caching explicitly.
 
+## Immutable PR field sharing
+
+`scripts/lib/review-pr-snapshot.mjs` shares `files`, `commits` and the replay reader's `gh pr diff` across review readers
+in atomic on-disk snapshots, keyed by host, repo, PR, head SHA and live base SHA.
+`review.prSnapshot.ttlMs` defaults to 120000; 0 disables it. The source-logged cascade
+reads the platform `review.prSnapshot` block, then `prSnapshot` in
+`scripts/review-settings.json`, then `WE_REVIEW_PR_SNAPSHOT_TTL_MS`.
+Metadata, comments, reviews, labels and mergeability stay live. Net and stack diff
+bases also stay live: the current main/stack can change without the PR head moving.
+Missing, expired, corrupt or unwritable caches fall back to fresh PR fields.
+Focused coverage: `scripts/lib/__tests__/review-pr-snapshot.test.mjs`.
+
 ## Review fetch sharing
 
 The review daemon scopes `review.fetch.sharedPerTick` (default `true`) to one tick through

@@ -1,3 +1,4 @@
+import { readSnapshotPrView } from './lib/review-pr-snapshot.mjs';
 /**
  * review-detail.mjs — assemble a PARKED PR's review context as one JSON object (#2470, increment 1 of 2).
  *
@@ -185,10 +186,9 @@ function runCli() {
 
   let view;
   try {
-    const out = execFileSync('gh', [
-      'pr', 'view', pr, '--repo', repo, '--json', 'number,title,url,body,labels,comments,files',
-    ], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-    view = JSON.parse(out);
+    view = readSnapshotPrView({ repo, pr, fields: 'number,title,url,body,labels,comments,files'.split(','),
+      exec: args => execFileSync('gh', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }),
+    });
   } catch (e) {
     const msg = String((e && (e.stderr || e.message)) || e).split('\n').filter(Boolean).pop() || 'gh pr view failed';
     writeAllSync(1, `${JSON.stringify({ error: msg })}\n`);

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readSnapshotPrView } from '../lib/review-pr-snapshot.mjs';
 import { recordRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { redTeamCardOnly } from '../lib/review-red-team-policy.mjs';
@@ -1849,8 +1850,9 @@ if (IS_CLI) {
       return r.stdout;
     };
     const pr = Number(flag('pr'));
-    const view = JSON.parse(ghRead(['pr', 'view', String(pr), `--repo=${flag('repo')}`, '--json', 'title,body,headRefOid,files']));
-    const diffText = ghRead(['pr', 'diff', String(pr), `--repo=${flag('repo')}`]);
+    const { diff: diffText, ...view } = readSnapshotPrView({ pr, repo: flag('repo'),
+      fields: ['title', 'body', 'headRefOid', 'files', 'diff'], exec: ghRead,
+    });
     // Card 341: the open operator send-backs come from the COMPLETE thread (the shared reader), never a truncated view.
     import('../conveyor/pr-comments-complete.mjs')
       .then(({ readCompletePrComments }) => readCompletePrComments(pr, { repo: flag('repo') }))

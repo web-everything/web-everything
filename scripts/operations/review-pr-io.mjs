@@ -1,3 +1,4 @@
+import { readSnapshotPrView } from '../lib/review-pr-snapshot.mjs';
 import { basisLineOf, isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
 import { rereviewMode, reviewMustVoid } from '../lib/review-timing.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
@@ -155,9 +156,9 @@ const execFileIn = (cwd) => (cmd, args, opts) => reviewExecFileSync(cmd, args, {
  */
 export function ghPrView({ pr, repo, cwd = REPO_ROOT } = {}) {
   try {
-    return JSON.parse(execFileSync('gh', [
-      'pr', 'view', String(pr), '--repo', repo, '--json', PR_VIEW_FIELDS.join(','),
-    ], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, cwd }));
+    return readSnapshotPrView({ repo, pr, fields: PR_VIEW_FIELDS,
+      exec: args => execFileSync('gh', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, cwd }),
+    });
   } catch (e) {
     const msg = String((e && (e.stderr || e.message)) || e).split('\n').filter(Boolean).pop() || 'gh pr view failed';
     throw new Error(`review-pr-io: could not read ${repo}#${pr} — ${msg}`);
