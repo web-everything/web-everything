@@ -92,7 +92,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 
 import { fileIntoBatch, cardIdOf } from './card-batch-file.mjs';
 import { cardBatchStateDir } from './card-batch-io.mjs';
-import { loadPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
+import { loadPreventionBatchSettings, formatPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
 import {
   buildApprovalPreventionRetraction, APPROVAL_PREVENTION_DIGEST_KEY_SEP, APPROVAL_PREVENTION_KEY_PREFIX,
@@ -475,8 +475,16 @@ export async function landPreventionCard(input, {
   dedupe = runCardDedupe,
   batch = fileIntoBatch,
   loadPreventionBatchSettings: loadBatchSettings = loadPreventionBatchSettings,
+  loadFilingSettings = loadPreventionBatchSettings,
   sleep: wait = sleep,
 } = {}) {
+  const filing = loadFilingSettings();
+  write(`${formatPreventionBatchSettings(filing)}\n`);
+  if (filing.filingEnabled === false) {
+    const reason = 'prevention filing paused by prevention.filingEnabled';
+    write(`${reason}\n`);
+    return { ok: true, skipped: true, step: 'paused', reason, num: null, rel: null, pr: null, url: null };
+  }
   // ONE scratch dir per run, created lazily and removed on every exit path (#4317 advisory review, 2026-09-29 —
   // the first cut made a fresh `mkdtempSync` dir for each file and never removed either, leaking two per filing).
   let scratch = null;

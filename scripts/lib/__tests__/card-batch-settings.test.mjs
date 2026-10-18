@@ -61,8 +61,8 @@ describe('prevention.* batch settings cascade', () => {
   const standard = loadCardBatchPolicy().prevention;
   it('uses standard defaults without optional preferences', () => {
     const settings = loadPreventionBatchSettings({ env: {}, repo: {}, read: () => { throw new Error('missing'); } });
-    expect(settings).toEqual({ batchFiling: true, batchWindowMinutes: 120, batchMaxCards: 10, batchLeaseWaitMinutes: 15,
-      sources: { batchFiling: 'standard', batchWindowMinutes: 'standard', batchMaxCards: 'standard', batchLeaseWaitMinutes: 'standard' }, invalid: [] });
+    expect(settings).toEqual({ batchFiling: true, batchWindowMinutes: 120, batchMaxCards: 10, batchLeaseWaitMinutes: 15, filingEnabled: true,
+      sources: { batchFiling: 'standard', batchWindowMinutes: 'standard', batchMaxCards: 'standard', batchLeaseWaitMinutes: 'standard', filingEnabled: 'standard' }, invalid: [] });
   });
   it.each(['platform', 'repo', 'env'])('%s wins for each key', (layer) => {
     const layers = { standard, platform: { batchFiling: false, batchWindowMinutes: 30, batchMaxCards: 3, batchLeaseWaitMinutes: 3 } };
@@ -113,7 +113,7 @@ describe('prevention.* batch settings cascade', () => {
     const settings = loadPreventionBatchSettings({ env: {}, read: () => '{}' });
     expect(settings).toMatchObject({ batchFiling: true, batchWindowMinutes: 60, batchMaxCards: 10, batchLeaseWaitMinutes: 15,
       sources: { batchFiling: 'repo', batchWindowMinutes: 'repo', batchMaxCards: 'repo', batchLeaseWaitMinutes: 'repo' } });
-    expect(formatPreventionBatchSettings(settings)).toBe('prevention-batch settings: prevention.batchFiling=true (repo), prevention.batchWindowMinutes=60 (repo), prevention.batchMaxCards=10 (repo), prevention.batchLeaseWaitMinutes=15 (repo)');
+    expect(formatPreventionBatchSettings(settings)).toBe('prevention-batch settings: prevention.batchFiling=true (repo), prevention.batchWindowMinutes=60 (repo), prevention.batchMaxCards=10 (repo), prevention.batchLeaseWaitMinutes=15 (repo), prevention.filingEnabled=false (repo)');
     expect(effectiveCardBatchPolicy().prevention.maxAgeMinutes).toBe(60);
   });
   it('overlays prevention independently of filing and retains bypass policy', () => {

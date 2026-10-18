@@ -197,6 +197,7 @@ export async function fileItemForPreventionViaLandingJob(input, { spawnJob = spa
   if (!filed.ok) {
     return { code: 1, lines: [filed.error ?? 'land-prevention-card: unknown spawn failure'] };
   }
+  if (filed.skipped) return { code: 0, lines: [JSON.stringify({ skipped: true, reason: filed.reason })] };
   return {
     code: 0,
     lines: [JSON.stringify({
@@ -770,6 +771,12 @@ export async function runReviewLoopOnce({
       };
     }
 
+    if (filedPayload?.skipped) {
+      const rendered = renderOutcome({ outcome, json: parsed.control.json, declaration });
+      return { ...rendered, code: 0, lines: parsed.control.json
+        ? [JSON.stringify({ ...JSON.parse(rendered.lines[0]), preventionFilingPaused: filedPayload.reason })]
+        : [...rendered.lines, filedPayload.reason], run: outcome.run, stopped: outcome.stopped };
+    }
     const filedNum = alreadyFiled ? alreadyFiled.num : (filedPayload?.verdict?.num ?? null);
     const filedRel = alreadyFiled ? alreadyFiled.path : (filedPayload?.verdict?.rel ?? null);
     // #4493 — the production filer now spawns a detached landing job (see `fileItemForPreventionViaLandingJob`)
@@ -860,6 +867,12 @@ export async function runReviewLoopOnce({
         run: outcome.run,
         stopped: outcome.stopped,
       };
+    }
+    if (filedPayload?.skipped) {
+      const rendered = renderOutcome({ outcome, json: parsed.control.json, declaration });
+      return { ...rendered, code: 0, lines: parsed.control.json
+        ? [JSON.stringify({ ...JSON.parse(rendered.lines[0]), preventionFilingPaused: filedPayload.reason })]
+        : [...rendered.lines, filedPayload.reason], run: outcome.run, stopped: outcome.stopped };
     }
     const queued = alreadyFiled ? alreadyFiled.queued : filedPayload?.queued === true;
     const num = alreadyFiled ? alreadyFiled.num : (filedPayload?.verdict?.num ?? null);

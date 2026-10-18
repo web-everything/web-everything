@@ -29,6 +29,7 @@ import { join } from 'node:path';
 import { defaultSpawnDetached, REPO_ROOT } from '../operations/detached-dispatch.mjs';
 import { buildGhShimSettingsEnv } from './gh-app-shim.mjs';
 import { automationStateRoot } from './automation-home.mjs';
+import { loadPreventionBatchSettings, formatPreventionBatchSettings } from './card-batch-settings.mjs';
 
 /** The detached job every caller spawns — resolved by SCRIPT LOCATION, never `cwd` (which for every caller of
  *  this file is whatever checkout is running right now — a daemon clone, routinely). */
@@ -79,7 +80,16 @@ export function spawnPreventionLandingJob(input, {
   root = REPO_ROOT,
   resolveSettingsEnv = () => buildGhShimSettingsEnv(),
   sessionPrefix = 'prevention-card',
+  loadFilingSettings = loadPreventionBatchSettings,
+  write = line => process.stderr.write(line),
 } = {}) {
+  const filing = loadFilingSettings();
+  write(`${formatPreventionBatchSettings(filing)}\n`);
+  if (filing.filingEnabled === false) {
+    const reason = 'prevention filing paused by prevention.filingEnabled';
+    write(`${reason}\n`);
+    return { ok: true, skipped: true, reason, num: null, rel: null, error: null };
+  }
   // Resolver failure → `null` (the spawn still goes out, as it did before), never a thrown filing.
   let settingsEnv = null;
   try { settingsEnv = resolveSettingsEnv() || null; } catch { settingsEnv = null; }
