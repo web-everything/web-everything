@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { applyRedTeamGate, buildRedTeamCardInput, buildSendBackArgv, buildSendBackBody, gateExitCode, renderGateSummary, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
 import { runReviewJob } from '../review-job.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, redTeamGateMarker } from '../../lib/red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, parseRedTeamComment, redTeamGateMarker, redTeamResultId } from '../../lib/red-team-gate.mjs';
 import { runReviewLabelCli } from '../../review-set-label.mjs';
 
 const REPO = 'web-everything/web-everything';
@@ -38,6 +38,8 @@ function fakeIo({ comments, labels = ['review:accepted'], head = HEAD, liveHead 
   return { io, calls };
 }
 const kinds = (calls) => calls.map((c) => c[0]);
+// Every record the gate writes names the result it decided (PR #5482).
+const namedGate = (outcome) => redTeamGateMarker(4722, HEAD, outcome).replace(/ -->$/, ' result=');
 
 describe('applyRedTeamGate', () => {
   it('broken → send-back through review-set-label + ledger event + gate record', async () => {
@@ -47,7 +49,7 @@ describe('applyRedTeamGate', () => {
     expect(kinds(calls)).toEqual(['sendBack', 'ledger', 'comment']);
     expect(calls[0][1]).toMatchObject({ repo: REPO, pr: 4722, head: HEAD });
     expect(calls[0][1].body).toMatch(/1\. `scripts\/x\.mjs:3` — \(edge-case, broken\) two writers/);
-    expect(calls[2][1].body.startsWith(redTeamGateMarker(4722, HEAD, 'sent-back'))).toBe(true);
+    expect(calls[2][1].body.startsWith(namedGate('sent-back'))).toBe(true);
   });
 
   it('degraded → one follow-up card, no send-back', async () => {
@@ -57,7 +59,7 @@ describe('applyRedTeamGate', () => {
     expect(kinds(calls)).toEqual(['card', 'comment']);
     expect(calls[0][1]).toMatchObject({ kind: 'story', scope: 'we:scripts/x.mjs' });
     expect(calls[0][1].digest).toMatch(/stale config/);
-    expect(calls[1][1].body.startsWith(redTeamGateMarker(4722, HEAD, 'card-queued'))).toBe(true);
+    expect(calls[1][1].body.startsWith(namedGate('card-queued'))).toBe(true);
   });
 
   // Review of the repair: a card job that was spawned but whose record never posted would be queued AGAIN next run.
@@ -81,7 +83,7 @@ describe('applyRedTeamGate', () => {
     const retryIo = { ...io, readPr: () => ({ headRefOid: HEAD, labels: [{ name: 'review:changes' }], comments }) };
     expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, retryIo)).status).toBe('applied');
     expect(kinds(calls)).toEqual(['comment']);
-    expect(calls[0][1].body.startsWith(redTeamGateMarker(4722, HEAD, 'sent-back'))).toBe(true);
+    expect(calls[0][1].body.startsWith(namedGate('sent-back'))).toBe(true);
   });
   it('a round-cap record that cannot be posted is a visible failure too', async () => {
     const { io } = fakeIo({ comments: [comment([F()])], round: 5, postComment: () => { throw new Error('gh down'); } });
@@ -123,8 +125,8 @@ describe('applyRedTeamGate', () => {
     const { io, calls } = fakeIo({ comments: [comment([F(), F({ impactIfUnfixed: 'degraded' })])] });
     expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).status).toBe('applied');
     expect(kinds(calls)).toEqual(['sendBack', 'ledger', 'comment', 'card', 'comment']);
-    expect(calls[2][1].body.startsWith(redTeamGateMarker(4722, HEAD, 'sent-back'))).toBe(true);
-    expect(calls[4][1].body.startsWith(redTeamGateMarker(4722, HEAD, 'card-queued'))).toBe(true);
+    expect(calls[2][1].body.startsWith(namedGate('sent-back'))).toBe(true);
+    expect(calls[4][1].body.startsWith(namedGate('card-queued'))).toBe(true);
   });
 
   // F5 (review of PR #4762): a FAILED card used to write the permanent per-head record, so the card was never retried.
@@ -139,7 +141,7 @@ describe('applyRedTeamGate', () => {
     const retry = await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
     expect(retry.status).toBe('applied');
     expect(kinds(calls)).toEqual(['card', 'comment']);
-    expect(calls[1][1].body.startsWith(redTeamGateMarker(4722, HEAD, 'card-queued'))).toBe(true);
+    expect(calls[1][1].body.startsWith(namedGate('card-queued'))).toBe(true);
     calls.length = 0;
     expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).status).toBe('already-acted');
     expect(calls).toEqual([]);
@@ -190,6 +192,19 @@ describe('applyRedTeamGate', () => {
     const { io, calls } = fakeIo({ comments: [comment([F()]), done] });
     expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).status).toBe('already-acted');
     expect(calls).toEqual([]);
+  });
+
+  // PR #5482 operator ruling: a record for an earlier same-head result does not dedup a newer result's breaks.
+  it('acts on a newer same-head result even after an earlier one was sent back, and names the result it decided', async () => {
+    const earlier = comment([F({ summary: 'old break' })]);
+    const done = { author: { login: 'web-everything' }, createdAt: '2026-10-10T02:05:00Z', body: `${redTeamGateMarker(4722, HEAD, 'sent-back')}\nx` };
+    const newer = { ...comment([F({ summary: 'new break' })]), createdAt: '2026-10-10T03:00:00Z' };
+    const { io, calls } = fakeIo({ comments: [earlier, done, newer] });
+    expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).status).toBe('applied');
+    expect(kinds(calls)).toEqual(['sendBack', 'ledger', 'comment']);
+    expect(calls[2][1].body.startsWith(redTeamGateMarker(4722, HEAD, 'sent-back', redTeamResultId(parseRedTeamComment(newer.body))))).toBe(true);
+    const again = fakeIo({ comments: [earlier, done, newer, { author: { login: 'web-everything' }, body: calls[2][1].body }] });
+    expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, again.io)).status).toBe('already-acted');
   });
 
   // F3/F6: a gate record from anyone untrusted is forged text. These pass against the unchanged source too (the author
