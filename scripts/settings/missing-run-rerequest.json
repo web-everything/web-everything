@@ -1,0 +1,4 @@
+{
+  "$comment": "Re-request missing required/review checks on the same live head using its existing PR workflow run. Env > this file > defaults; sources logged by policy-cascade. WE_MISSING_RUN_REREQUEST=on|off, WE_MISSING_RUN_COOLDOWN_MINUTES (positive minutes; default 15), WE_MISSING_RUN_MAX_ATTEMPTS_PER_HEAD (default 2). Attempts are reserved in trusted PR thread comments before submission. No workflow_dispatch: a branch ref cannot pin the live head.",
+  "missingRunRerequest": { "enabled": "on", "cooldownMinutes": 15, "maxAttemptsPerHead": 2 }
+}

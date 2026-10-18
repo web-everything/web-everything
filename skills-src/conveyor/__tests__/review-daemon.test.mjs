@@ -1785,3 +1785,27 @@ it.each([
   expect(dispatch.mock.calls[0][0].expectedRedTeamHead).toBe(head);
   expect(finish).toHaveBeenCalledTimes(1);
 });
+
+
+it('passes live PR context to paused-review recovery and posts one head-bound re-arm', async () => {
+  const { notifyReferralHold, pausedReviewRearmMarker } = await import('../../../scripts/conveyor/review-referral-hold.mjs');
+  const { record, recordComment, H1, repo, BLOCK } = await import('../../../scripts/conveyor/__tests__/ruling-fixtures.mjs');
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'review-tick-auto-rearm-'));
+  const subject = { number: 3794, headRefOid: H1, body: '<!-- authored-by-actor: author -->', createdAt: '2026-10-03T07:00:00Z', labels: [{ name: 'review:human' }],
+    comments: [recordComment(record({ head: H1, runId: 'run-1', rulings: [BLOCK] }), 5)] };
+  const hold = { kind: 'same-head', head: H1, episode: 'auto-rearm', why: 'review paused: same head' };
+  const post = vi.fn(body => subject.comments.push({ body, author: { login: 'web-everything' }, createdAt: '2026-10-03T09:00:00Z' }));
+  try {
+    for (let tick = 0; tick < 2; tick++) runReviewTick({ repo,
+      reconcile: () => ({ dispatch: [], refusals: [{ kind: 'review-referrals-pending', prNumber: 3794, referralHold: hold }] }),
+      readPrs: () => [subject], readAgents: () => [], holdReconcile: () => [],
+      tagRound: vi.fn(), tagStatus: vi.fn(), dispatch: vi.fn(),
+      notifyReferral: args => notifyReferralHold({ ...args, dir, post, log: vi.fn(), readPr: () => subject }),
+    });
+    expect(post.mock.calls.filter(([body]) => body.includes(pausedReviewRearmMarker(H1)))).toHaveLength(1);
+    expect(subject.labels).toEqual([{ name: 'review:human' }]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

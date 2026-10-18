@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import { rerequestMissingCheck, resolveMissingRunRerequestSettings } from './missing-run-rerequest.mjs';
+import { fastChecksFor } from '../lib/review-timing.mjs';
+import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 /**
  * @file scripts/conveyor/ci-red-recovery-watch.mjs
  * @description we:backlog/x5uqim1-*.md (parent #4075, epic #3383) — THE ACTUAL RECOVERY ACTION.
@@ -1245,6 +1248,8 @@ export function sweepMissingRunRecovery({
   readComments = defaultReadPrComments, trigger = triggerCiForPr, postComment = defaultPostMissingRunComment,
   readPush = readFixPush, clearLabel = clearStaleCheckingLabel, thresholdMs = resolveHandoffSettings().value.ciMissingAfterPushMin * 60_000,
   maxRetriesPerSha = resolveRecoveryCaps().missingRunRetriesPerSha, maxRetriesPerPr = maxRetriesPerSha, now = Date.now(),
+  rerequest = rerequestMissingCheck, rerequestPolicy = resolveMissingRunRerequestSettings().value,
+  reviewPolicy = resolveTimingPolicy().review,
 } = {}) {
   // #2793 — `mergeable` added so {@link buildMissingRunCandidates} can exclude a real merge conflict (never a
   // "missing run", a conflicting PR can produce no `pull_request` run at all — see that function's own docblock).
@@ -1266,10 +1271,30 @@ export function sweepMissingRunRecovery({
   // Ruleset-only workflows may target only the default base (merge-gate targets main).
   // Keep the classic/declared population for stacks and unreadable bases; never restack a healthy chain
   // merely because a check that cannot run on its base is absent. The all-absent test is unchanged.
+  // Review prerequisites can name checks absent from branch protection (live #5514:
+  // standards). Labels such as review:human do not suspend CI recovery. Keep the
+  // same stale-head and stalled-rollup guards; never nudge a still-running workflow.
+  const reviewContexts = reviewPolicy.startAfter === 'fast-checks'
+    ? fastChecksFor(reviewPolicy.fastChecks, repoSlug(repo)) ?? [] : [];
+  const rerequestCandidates = rerequestPolicy.enabled === 'on' ? (Array.isArray(prs) ? prs : []).flatMap(pr => {
+    if (pr.baseRefName !== defaultBranch || !/^[a-f0-9]{40}$/.test(pr.headRefOid ?? '')) return [];
+    if (repoSlug(repo) !== CONSTELLATION_REPOS.we.slug) return [];
+    const reported = new Set((pr.statusCheckRollup ?? []).map(c => c.name || c.context));
+    // Empty rollups and other missing protected checks keep their existing
+    // synchronize recovery and caps. This path owns the additional review gap.
+    if (!reported.has('test') || (defaultBasePartialContexts ?? []).some(n => n !== 'standards' && !reported.has(n))) return [];
+    const contexts = [...new Set([...(defaultBasePartialContexts ?? []), ...reviewContexts])];
+    // Only an explicit check-to-workflow mapping can authorize a targeted rerun.
+    // Other missing contexts retain the established synchronize/restack path.
+    if (!contexts.includes('standards') || pr.statusCheckRollup?.some(c => (c.name || c.context) === 'standards')) return [];
+    return buildMissingRunCandidates([pr], { requiredContexts: contexts, stalledPartialContexts: contexts })
+      .map(c => ({ ...c, check: 'standards', workflow: 'ci.yml' }));
+  }) : [];
+  const targetedNumbers = new Set(rerequestCandidates.map(c => c.prNumber));
   const classicCandidateNumbers = new Set(buildMissingRunCandidates(prs, {
     requiredContexts: requiredContexts ?? null, stalledPartialContexts,
   }).map(c => c.prNumber));
-  const rawCandidates = (Array.isArray(prs) ? prs : []).flatMap(pr => buildMissingRunCandidates([pr], {
+  const rawCandidates = (Array.isArray(prs) ? prs : []).filter(pr => !targetedNumbers.has(Number(pr.number))).flatMap(pr => buildMissingRunCandidates([pr], {
     requiredContexts: requiredContexts ?? null,
     stalledPartialContexts: pr?.baseRefName === defaultBranch ? defaultBasePartialContexts : stalledPartialContexts,
   }));
@@ -1308,8 +1333,23 @@ export function sweepMissingRunRecovery({
   });
 
   const applied = [];
+  // The targeted path has its OWN per-(repo, PR, head, check) durable budget,
+  // independent of legacy empty-push refusals and ruleset-only PR caps.
+  for (const c of rerequestCandidates) {
+    const date = readPush({ repo: repoSlug(repo), pr: c.prNumber, head: c.headSha })?.pushedAt
+      ?? readHeadCommittedAt(c.headSha, { repo });
+    const overdue = planMissingRunRecoveries({ candidates: [{ ...c, headCommittedAt: date }], now, thresholdMs });
+    plan.refusals.push(...overdue.refusals);
+    if (!overdue.dispatch.length) continue;
+    const d = { ...c, kind: 'rerequest-missing-check', why: `required check ${c.check} is absent on the stale live head` };
+    if (apply) {
+      const result = rerequest(d, { repo: repoSlug(repo), now, policy: rerequestPolicy });
+      applied.push({ ...d, labelCleared: false, ...result });
+    }
+    plan.dispatch.push(d);
+  }
   if (apply) {
-    for (const d of plan.dispatch) {
+    for (const d of plan.dispatch.filter(d => d.kind !== 'rerequest-missing-check')) {
       // 2026-10-10 live (#4759…#4797): a stacked PR gets no run because its merge commit's ci.yml predates the
       // `lane/**` trigger — an empty push cannot fix that; restacking the chain onto main can.
       const stacked = d.baseRefName && d.baseRefName !== defaultBranch;
