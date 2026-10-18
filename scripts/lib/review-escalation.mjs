@@ -1,3 +1,4 @@
+import { RED_TEAM_STATUS_LABEL_META } from './red-team-status-label-meta.mjs';
 /**
  * review-escalation.mjs — the DETERMINISTIC drain review-escalation rubric (#2171, under #2162).
  *
@@ -58,6 +59,7 @@ export { REVIEW_LABELS } from './review-labels.mjs';
  * Colors are 6-hex, no leading '#'.
  */
 export const REVIEW_LABEL_META = {
+  ...RED_TEAM_STATUS_LABEL_META,
   [REVIEW_LABELS.pending]:  { color: 'FBCA04', description: 'Drain parked this PR — an independent review is owed before it merges (#2171)' },
   [REVIEW_LABELS.accepted]: { color: '0E8A16', description: 'Reviewer accepted — the drain may merge (#2171)' },
   [REVIEW_LABELS.changes]:  { color: 'D93F0B', description: 'Reviewer wants changes — the author lane fixes hot-context and re-pushes (#2171)' },
@@ -2028,6 +2030,7 @@ export function shouldReparkForTestTampering({ tampered, netDiffScored, humanCle
  */
 export function decideParkToHuman({ currentLabels = [], keepHumanClearance = false } = {}) {
   const removeLabels = [REVIEW_LABELS.pending, REVIEW_LABELS.redteamAccepted];
+  if (!keepHumanClearance) removeLabels.push('ready-to-merge');
   if (!keepHumanClearance) removeLabels.push(REVIEW_LABELS.accepted);
   return {
     allowed: true,

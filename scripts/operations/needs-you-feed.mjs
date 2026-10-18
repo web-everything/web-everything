@@ -67,7 +67,9 @@ export function itemsFromReport(report) {
     for (const row of report[field] ?? []) {
       const clues = [row.kind, row.reason, ...(row.findings ?? []).map(f => f.reason)].filter(Boolean).join(' ');
       const kind = baseKind !== 'ruling-needed' ? baseKind : /round-cap|at-round-limit|ci-heal-exhausted/.test(clues) ? 'at-round-limit' : /escalat|dispute/.test(clues) ? 'escalated' : baseKind;
-      const reason = row.reason || row.detail || row.headline || sectionReasons[field];
+      const reason = row.redTeam && field === 'rulingNeeded'
+        ? `${sectionReasons[field]}: ${(row.findings ?? []).map(f => f.summary).join('; ')}`
+        : row.reason || row.detail || row.headline || sectionReasons[field];
       const pr = row.number ?? row.pr;
       const command = row.command || (field === 'ready' || field === 'rulingNeeded'
         ? `node scripts/operations/run.mjs review-pr --pr=${shellArg(pr)} --repo=${shellArg(row.repo)}` : undefined);

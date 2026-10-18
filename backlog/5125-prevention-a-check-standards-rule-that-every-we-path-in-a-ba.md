@@ -28,3 +28,4 @@ Hint: a card that loosens a refusal needs two Must lines — what happens on err
 ## Also raised by
 
 - Also raised by web-everything/web-everything#5532 (finding 1: `we:backlog/6245-prevention-require-structured-guarantee-to-test-mappings-thr.md:7` — Add a check:standards rule that every path in a card's scope: exists in the tree.) · key `approval-prevention-key:web-everything/web-everything#5532@ebf13351b87ac7e69d64644516e95627843ba099`
+- Also raised by web-everything/web-everything#5532 (finding 1: `we:backlog/6245-prevention-require-structured-guarantee-to-test-mappings-thr.md:7` — Add a check:standards rule that every we:backlog/... path in a card's scope resolves to an existing file.) · key `approval-prevention-key:web-everything/web-everything#5532@4b6e07e145b20682efdd74fd6853b0f389b7fe58`

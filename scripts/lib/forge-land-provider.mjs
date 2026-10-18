@@ -50,6 +50,7 @@ import { assertMachineTitle } from '../operations/machine-pr-title.mjs';
  */
 
 import { runGhSync } from './gh-throttle.mjs';
+import { isReviewHoldLabel, READY_TO_MERGE_LABEL } from './review-escalation.mjs';
 import { clampLabelDescription } from './review-label-provider.mjs';
 
 /** The `gh pr merge` method flag for a merge method (default merge = --no-ff history the drain wants). */
@@ -187,7 +188,16 @@ export function createGhLandProvider({
      *  already applied against `ghC` before the port existed — so this is a no-op. */
     addLabel(pr, label) {
       const args = buildAddLabelArgs({ pr, label });
-      return args ? exec(args) : null;
+      if (!args) return null;
+      if (isReviewHoldLabel(label)) {
+        // A producer can reuse a PR after pushing a new head. Apply its hold and
+        // remove any old merge clearance in the same write, including --park.
+        const { labels } = JSON.parse(exec(GH_ARGV.viewPr(pr, 'labels')));
+        if (!Array.isArray(labels)) throw new Error('cannot apply review hold: labels unavailable');
+        if (labels.some(l => (typeof l === 'string' ? l : l?.name) === READY_TO_MERGE_LABEL))
+          args.push('--remove-label', READY_TO_MERGE_LABEL);
+      }
+      return exec(args);
     },
 
     removeLabel(pr, label) {
