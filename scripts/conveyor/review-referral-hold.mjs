@@ -96,14 +96,17 @@ function writeEvidenceDiskCache(file, code, entries) {
 export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryReadRun, memo = evidenceCache, persist = true } = {}) {
   return readRunProjections({ dir, readRun, memo, persist, project: reviewRunEvidence, cacheFile: REVIEW_EVIDENCE_CACHE_FILE });
 }
-/** Every `review-pr` run's reviewed head ({@link reviewRunHead}), including runs that never finished. */
+export const REVIEW_RUN_STORE_MISSING = 'REVIEW_RUN_STORE_MISSING';
+/** Every `review-pr` run's reviewed head ({@link reviewRunHead}), including runs that never finished. A missing store
+ *  throws {@link REVIEW_RUN_STORE_MISSING}: it proves nothing about which heads were reviewed, so it is never `[]`. */
 export function readReviewRunHeads({ dir = resolveRunsDir(), readRun = tryReadRun, memo = headCache, persist = true } = {}) {
-  return readRunProjections({ dir, readRun, memo, persist, project: reviewRunHead, cacheFile: REVIEW_HEAD_CACHE_FILE });
+  return readRunProjections({ dir, readRun, memo, persist, project: reviewRunHead, cacheFile: REVIEW_HEAD_CACHE_FILE,
+    missing: () => { throw Object.assign(new Error(`review run store missing: ${dir}`), { code: REVIEW_RUN_STORE_MISSING }); } });
 }
-function readRunProjections({ dir, readRun, memo, persist, project, cacheFile }) {
+function readRunProjections({ dir, readRun, memo, persist, project, cacheFile, missing = () => [] }) {
   const code = projectionCode(project);
   let names;
-  try { names = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
+  try { names = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return missing(); throw e; }
   const file = join(dir, cacheFile);
   let disk = null;
   let dirty = false;

@@ -175,6 +175,18 @@ describe('numbering carry referral evidence', () => {
       expect(guardDirect(heads, sha => ({ scored: true, text: `diff at ${sha}` })))
         .toMatchObject({ code: 'MANDATORY_REFERRAL_NO_REVIEW_RUN' });
     });
+    it('a missing run store is not proof that nobody reviewed the live head', () => {
+      dir = mkdtempSync(join(tmpdir(), 'numbering-unfinished-'));
+      const absent = join(dir, 'absent');
+      const heads = () => readReviewRunHeads({ dir: absent, memo: new Map(), persist: false });
+      expect(guardDirect(heads)).toMatchObject({ code: 'MANDATORY_REFERRAL_RUN_STORE_MISSING' });
+      const { result, writes } = replay({ readRuns: () => [], readRunHeads: heads,
+        guardOverride: (s, context) => assertMandatoryReferralsCleared(s, { ...context, env: {}, cardReadable: () => true,
+          readRuns: s.headRefOid === FROM ? () => [cleanRun] : () => [], readRunHeads: heads,
+          readNetDiff: sha => ({ scored: true, text: `diff at ${sha}` }) }) });
+      expect(result.action).toBe('retry');
+      expect(writes).toEqual([]);
+    });
     it('persists run heads in their own cache and still sees an unfinished run on a warm read', () => {
       dir = mkdtempSync(join(tmpdir(), 'numbering-unfinished-'));
       persist('review-pr-live', TO, live['persistence-failed'], false);
