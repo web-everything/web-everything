@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   createDrainMergeStrategy, resolveDrainMergePolicy, readEnqueueClearance, buildClearanceComment, hasClearanceFor, DRY_RUN_STRATEGY_ENV,
-  readQueueState, FOLLOW_UP_MAX_ATTEMPTS, readMergeDeliveryToolSettings, MERGE_DELIVERY_SETTINGS_FILE_ENV,
+  requestDrainRedTeam, readDrainRedTeamRequests, finishDrainRedTeamRequest, readQueueState, FOLLOW_UP_MAX_ATTEMPTS, readMergeDeliveryToolSettings, MERGE_DELIVERY_SETTINGS_FILE_ENV,
 } from '../drain-merge-strategy.mjs';
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 import { rulesetSuggestion } from '../merge-queue-enqueue.mjs';
@@ -834,8 +834,29 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false });
     expect(requests).toHaveLength(1);
     clock += 45 * 60_000;
-    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: true });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
     expect(requests).toHaveLength(1);
+  });
+  it('replays #5485: unparseable attempt requests once, holds across restart and deadline, then accepts a usable result', () => {
+    let clock = 1000;
+    const requests = [];
+    const thread = [];
+    const options = { strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], now: () => clock,
+      env: { WE_DRAIN_RED_TEAM_PENDING_MAX_MIN: '2' }, liveComments: thread,
+      evidence: { scheduled: true, recorded: true, attempted: true, loopPayload: { verdict: { verdict: 'accept' } } },
+      requestRedTeam: input => { requests.push(input); return { requested: true }; } };
+    const first = harness(options);
+    expect(first.s.enqueue({ num: 5485 }, HEAD, { comments: thread })).toMatchObject({ enqueued: false });
+    clock += 2 * 60_000;
+    expect(first.s.enqueue({ num: 5485 }, HEAD, { comments: thread })).toMatchObject({ enqueued: false, redTeamRequested: true });
+    const restarted = harness({ ...options, initial: first.state() });
+    clock += 60 * 60_000;
+    expect(restarted.s.enqueue({ num: 5485 }, HEAD, { comments: thread })).toMatchObject({ enqueued: false });
+    expect(requests).toHaveLength(1);
+    expect(restarted.logs.join('')).not.toContain('red team never scheduled');
+    expect(first.logs.join('')).toContain('redTeamPendingMaxMin=2, env');
+    thread.push({ user: { login: 'web-everything[bot]' }, body: `<!-- we:red-team-advisory pr=5485 rev=${HEAD} -->\n### Post-accept red team — no break found` });
+    expect(restarted.s.enqueue({ num: 5485 }, HEAD, { comments: thread })).toMatchObject({ enqueued: true });
   });
   // Operator ruling (PR #5551): a run that ran but left no usable result is not "never scheduled". The head stays
   // held until a usable result exists; the re-run path is a separate card.
@@ -877,7 +898,7 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     expect(second).toMatchObject({ enqueued: false, kind: 'red-team-pending', healthSmell: true });
     expect(h.logs.join('')).not.toContain('red team never scheduled');
     expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
-    expect(requests).toHaveLength(0);
+    expect(requests).toHaveLength(1);
   });
   it('keeps an errored card-only run held even without a seat row', () => {
     const { first, second, requests } = erroredRunAfterDeadline({
@@ -886,7 +907,7 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     });
     expect(first).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
     expect(second).toMatchObject({ enqueued: false, kind: 'red-team-pending', healthSmell: true });
-    expect(requests).toHaveLength(0);
+    expect(requests).toHaveLength(1);
   });
   it('honors the fallback switch and logs its source', () => {
     let clock = 1000;
@@ -966,5 +987,31 @@ describe('queue safeguard overrides and untracked queue entries', () => {
     const h = harness({ strategy: 'github-merge-queue', queued: true });
     h.s.dequeueSendBacks([{ number: 5283, labels: [] }]);
     expect(h.calls.some(c => c.some(a => String(a).includes('dequeuePullRequest')))).toBe(false);
+  });
+});
+
+describe('durable drain red-team requests', () => {
+  it('records once per normalized repo/PR/head, preserves consumption, and dry-run writes nothing', () => {
+    const root = mkdtempSync(join(tmpdir(), 'drain-request-'));
+    const env = { WE_COORDINATION_ROOT: root };
+    const input = { repo: LOCAL, pr: 5485, head: HEAD };
+    try {
+      expect(requestDrainRedTeam(input, { env, dryRun: true })).toEqual({ requested: false });
+      expect(readDrainRedTeamRequests({ env })).toEqual([]);
+      expect(requestDrainRedTeam(input, { env })).toEqual({ requested: true });
+      const [request] = readDrainRedTeamRequests({ env });
+      expect(request).toMatchObject(input);
+      finishDrainRedTeamRequest(request, { env });
+      expect(requestDrainRedTeam({ ...input, repo: LOCAL.toUpperCase(), head: HEAD.toUpperCase() }, { env })).toEqual({ requested: true });
+      expect(readDrainRedTeamRequests({ env })).toEqual([]);
+      expect(requestDrainRedTeam({ ...input, head: 'c'.repeat(40) }, { env })).toEqual({ requested: true });
+      expect(readDrainRedTeamRequests({ env })).toHaveLength(1);
+      expect(requestDrainRedTeam(input, { env, write: () => { throw new Error('disk full'); } })).toEqual({ requested: true });
+      expect(requestDrainRedTeam({ ...input, head: 'd'.repeat(40) }, { env, write: () => { throw new Error('disk full'); } })).toEqual({ requested: false });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('wires the live drain construction and suppresses the writer for dry-run', () => {
+    const source = readFileSync(new URL('../../merge-ai-prs.mjs', import.meta.url), 'utf8');
+    expect(/requestRedTeam:.*DRY_RUN.*requestDrainRedTeam/.test(source)).toBe(true);
   });
 });

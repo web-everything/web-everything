@@ -191,7 +191,7 @@ import { deliveredItemNumsFromPr, deliveredHashFromPr, declaredResolvedIdsFromPr
 import { parseArgvFlags, reconcileWouldRunFor } from './lib/reconcile-predicate.mjs';
 import { reviewCiGate } from './lib/review-ci-gate.mjs';
 import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, handleRequiredWorkflowsRefusal, resolveRefreshOnStaleMergeGate, handleStaleMergeGate } from './lib/merge-queue-enqueue.mjs';
-import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
+import { requestDrainRedTeam, createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
 // #3215 — the drain applies holds of its own (a fresh park, a #2409 stale-acceptance re-park); this is the
 // same ledger `review-set-label.mjs` already writes through for the review seam, never a second format.
 import { buildVerdictRecord, appendVerdict, labelVerdictOf, buildLedgerEvent, EVENT_TYPES, parseLedgerEvents, verdictLedgerPath } from './lib/verdict-ledger.mjs';
@@ -4616,7 +4616,7 @@ async function runCli() {
     onDeferred: (reason) => process.stderr.write(`  ⚠ ${repoTag(repo)}${pr.number} ${reason}\n`),
   });
   const resolvedMergePolicy = resolveDrainMergePolicy({ dryRun: DRY_RUN });
-  const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }) }); // xtpxusq — logs strategy + source once per pass
+  const mergeStrategy = createDrainMergeStrategy({ requestRedTeam: DRY_RUN ? null : requestDrainRedTeam, resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }) }); // xtpxusq — logs strategy + source once per pass
   const resolveListedChecks = (repo, prs) => mapWithConcurrency(prs, resolvedMergePolicy.policy.concurrency.gateReads, (pr) => resolveChecks(repo, pr));
   const fetchFreshPrForRevalidation = async (repo, num) => {
     try {

@@ -35,9 +35,10 @@ import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { readDrainRedTeamEvidence } from './drain-red-team-evidence.mjs';
 import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason } from './drain-queue-safety.mjs';
 import { defaultPostConflictFinding } from './conflict-finding.mjs';
+import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { loadMergeDeliveryPolicy, formatMergeDeliverySourcesLine, MERGE_DELIVERY_STRATEGIES } from './merge-delivery-policy.mjs';
 import { mergeActionFor, enqueuePr, planQueueFollowUps, REQUIRED_WORKFLOWS_UNSATISFIED } from './merge-queue-enqueue.mjs';
@@ -58,6 +59,46 @@ const COMMENTS_MAX_BUFFER = 256 * 1024 * 1024; // = merge-ai-prs PR_COMMENTS_MAX
 export const FOLLOW_UP_MAX_ATTEMPTS = 5;
 
 export function queueStatePath(env = process.env) { return join(resolveCoordinationRoot({ env }), 'drain-merge-queue-followups.json'); }
+
+// One durable request per repo/PR/head. Completed records remain as idempotency tombstones.
+const requestDir = env => join(resolveCoordinationRoot({ env }), 'drain-red-team-requests');
+const requestKey = ({ repo, pr, head }) => {
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !Number.isSafeInteger(pr) || pr <= 0 || !/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('invalid red-team request');
+  return `${encodeURIComponent(repo.toLowerCase())}-${pr}-${head.toLowerCase()}.json`;
+};
+export function requestDrainRedTeam(input, { env = process.env, dryRun = false, write = writeJsonAtomic } = {}) {
+  if (dryRun) return { requested: false };
+  try {
+    const path = join(requestDir(env), requestKey(input));
+    mkdirSync(dirname(path), { recursive: true });
+    return withFileLock(`${path}.lock`, () => {
+      try {
+        const existing = JSON.parse(readFileSync(path, 'utf8'));
+        return { requested: requestKey(existing) === requestKey(input) && Number.isFinite(existing.requestedAt) };
+      }
+      catch (e) { if (e.code !== 'ENOENT') return { requested: false }; }
+      write(path, { repo: input.repo.toLowerCase(), pr: input.pr, head: input.head.toLowerCase(), requestedAt: Date.now() });
+      return { requested: true };
+    });
+  } catch { return { requested: false }; }
+}
+export function readDrainRedTeamRequests({ env = process.env } = {}) {
+  let names;
+  try { names = readdirSync(requestDir(env)); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
+  return names.filter(n => n.endsWith('.json')).flatMap(name => {
+    try {
+      const request = JSON.parse(readFileSync(join(requestDir(env), name), 'utf8'));
+      return requestKey(request) === name && Number.isFinite(request.requestedAt) && !request.consumedAt ? [request] : [];
+    } catch { return []; }
+  });
+}
+export function finishDrainRedTeamRequest(request, { env = process.env } = {}) {
+  const path = join(requestDir(env), requestKey(request));
+  withFileLock(`${path}.lock`, () => {
+    const current = JSON.parse(readFileSync(path, 'utf8'));
+    writeJsonAtomic(path, { ...current, consumedAt: Date.now() });
+  });
+}
 
 /**
  * The settings object the tool layer reads. Hermetic by default, like `merge-queue-hook.mjs#resolveMergeQueueSettings`:
@@ -327,7 +368,7 @@ export function createDrainMergeStrategy({
         const pending = before.redTeamPending?.[key];
         const sameHead = pending?.headSha === headSha;
         const overdue = sameHead && now() - pending.firstPendingAt >= (safety.value.redTeamPendingMaxMin ?? 45) * 60_000;
-        const observation = createHash('sha256').update(JSON.stringify({ comments, reviews: live.reviews ?? [], scheduled: !!evidence.scheduled, inFlight: !!evidence.inFlight, queued: !!evidence.queued, recorded: !!evidence.recorded })).digest('hex');
+        const observation = createHash('sha256').update(JSON.stringify({ comments, reviews: live.reviews ?? [], scheduled: !!evidence.scheduled, inFlight: !!evidence.inFlight, queued: !!evidence.queued, recorded: !!evidence.recorded, attempted: !!evidence.attempted })).digest('hex');
         const newComment = pending?.observation ? observation !== pending.observation
           : Array.isArray(comments) && comments.length > (pending?.commentCount ?? 0);
         // At the deadline recheck evidence and comments even if the normal retry backoff is longer.
@@ -339,7 +380,7 @@ export function createDrainMergeStrategy({
         }
         const pages = readThreadPages(c.repo, c.num);
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team admission: unreadable complete comments');
-        const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), repo: slugOf(c.repo), pr: c.num, head: headSha, env });
+        const reason = redTeamEnqueueHold({ ...evidence, scheduled: evidence.scheduled || (sameHead && pending.requestedAt != null), comments: pages.flat(), repo: slugOf(c.repo), pr: c.num, head: headSha, env });
         try { syncRedTeamStatusLabels({ repo: slugOf(c.repo), pr: c.num, head: headSha, evidence, env,
           live, comments: pages.flat(), provider: statusProvider, dryRun, log: say }); }
         catch (e) { say(`red-team status labels #${c.num}: ${firstLine(e)}`); }
@@ -354,10 +395,10 @@ export function createDrainMergeStrategy({
           const outcome = pendingOutcome(c, wait);
           // Never waive a recorded break or an active/recorded run. Only the scheduling gap has this escape: a run that
           // errored or left no usable result stays held until a usable result exists.
-          if (!outcome.healthSmell || evidence.inFlight || evidence.queued || evidence.recorded || evidence.attempted || reason.includes('requiring send-back')
+          if (!outcome.healthSmell || evidence.inFlight || evidence.queued || reason.includes('requiring send-back')
             || reason.includes('saved red-team re-check incomplete')) return outcome;
           let requested = false;
-          if (wait.requestedAt != null && now() - wait.requestedAt < (safety.value.redTeamPendingMaxMin ?? 45) * 60_000) return outcome;
+          if (wait.requestedAt != null) return outcome;
           if (wait.requestedAt == null && typeof requestRedTeam === 'function') {
             try { requested = requestRedTeam({ repo: slugOf(c.repo), pr: c.num, head: headSha, loopPayload: evidence.loopPayload })?.requested === true; }
             catch (e) { log.write(`  red-team request failed #${c.num}: ${firstLine(e)}\n`); }
@@ -368,6 +409,7 @@ export function createDrainMergeStrategy({
             log.write(`  merge-queue: requested red team for #${c.num} on ${headSha} through review dispatch\n`);
             return { ...outcome, redTeamRequested: true };
           }
+          if (evidence.recorded || evidence.attempted) return outcome;
           const fallback = safety.value.enqueueWhenRedTeamNeverScheduled ?? true;
           log.write(`  merge-queue: #${c.num} red team never scheduled — enqueueWhenRedTeamNeverScheduled=${fallback} (${safety.sources?.enqueueWhenRedTeamNeverScheduled ?? 'standard'}); no successful red-team request path\n`);
           if (!fallback) return outcome;

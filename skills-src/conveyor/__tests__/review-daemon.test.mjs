@@ -1741,3 +1741,28 @@ describe('operator-hold snapshots (card 5653)', () => {
     expect(skipped.some((l) => l.includes('operator-holds'))).toBe(false);
   });
 });
+
+describe('drain red-team request consumption', () => {
+  it.each(['current', 'stale', 'paused', 'refused', 'skipped', 'no-lanes', 'sent-back'])('dispatches only a current unheld request (%s)', mode => {
+    const request = { repo: CONSTELLATION_REPOS.we?.slug ?? 'web-everything/web-everything', pr: 5485, head: 'b'.repeat(40) };
+    const dispatch = vi.fn(() => mode === 'skipped' ? { skipped: 'live-job' } : { mode: 'job', jobPid: 123 });
+    const finish = vi.fn();
+    runReviewTick({ repo: request.repo, paused: mode === 'paused',
+      reconcile: () => ({ dispatch: [], refusals: mode === 'refused' ? [{ prNumber: 5485, kind: 'live-process' }] : [] }),
+      readPrs: () => [{ number: 5485, headRefOid: mode === 'stale' ? 'c'.repeat(40) : request.head, labels: ['review:accepted', 'ready-to-merge', ...(mode === 'sent-back' ? ['review:changes'] : [])] }],
+      acquirableLanes: () => mode === 'no-lanes' ? 0 : 1,
+      readAgents: () => [], readRedTeamRequests: () => [request], finishRedTeamRequest: finish,
+      dispatch, tagRound: () => {}, tagStatus: () => {},
+    });
+    expect(dispatch).toHaveBeenCalledTimes(['current', 'skipped'].includes(mode) ? 1 : 0);
+    expect(finish).toHaveBeenCalledTimes(mode === 'current' ? 1 : 0);
+  });
+});
+
+it('pins a requested review to the head from its durable request at the live dispatch CI read', async () => {
+  const { headBoundRedTeamCiGate } = await import('../review-daemon.mjs');
+  const gate = vi.fn(() => ({ allowed: true, headSha: 'c'.repeat(40) }));
+  expect(headBoundRedTeamCiGate(gate, 'b'.repeat(40))({ pr: 5485 })).toMatchObject({ allowed: false, reason: 'head-changed' });
+  expect(headBoundRedTeamCiGate(gate, 'c'.repeat(40))({ pr: 5485 })).toMatchObject({ allowed: true });
+  expect(headBoundRedTeamCiGate(() => ({ allowed: false, headSha: 'c'.repeat(40) }), 'c'.repeat(40))({})).toMatchObject({ allowed: false });
+});

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readDrainRedTeamRequests, finishDrainRedTeamRequest } from '../../scripts/lib/drain-merge-strategy.mjs';
 import { withReviewFetchTick } from '../../scripts/lib/review-fetch.mjs';
 /**
  * @file skills-src/conveyor/review-daemon.mjs
@@ -312,6 +313,13 @@ export function sweepReviewHolds(opts) {
   return [...repark, ...(sweepReviewHoldLabels(opts) ?? [])];
 }
 
+// Keep the dispatcher's fresh CI/head read authoritative, including when the head moved after listing.
+export const headBoundRedTeamCiGate = (gate, head) => input => {
+  const facts = gate(input);
+  return head && facts?.headSha?.toLowerCase() !== head.toLowerCase()
+    ? { ...facts, allowed: false, reason: 'head-changed' } : facts;
+};
+
 /**
  * One tick: discover PRs owed a review (`reconcile`), dispatch an independent review for each
  * (`dispatch`), then apply the two purely-informative labels (`tagRound`/`tagStatus`) — the exact sequence
@@ -377,6 +385,8 @@ export function runReviewTick({
   promoteDrafts = null,
   notePromotions = null,
   onPlan = null,
+  readRedTeamRequests = null,
+  finishRedTeamRequest = finishDrainRedTeamRequest,
   // Clock for the operator-hold snapshot's `observedAt` (injectable so tests stay deterministic).
   now = Date.now,
 } = {}) {
@@ -468,6 +478,20 @@ export function runReviewTick({
   const mergeConflictedByPr = new Map((Array.isArray(rawPrs) ? rawPrs : [])
     .map((p) => [Number(p?.number), String(p?.mergeStateStatus ?? '').toUpperCase() === 'DIRTY']));
   const reviews = (plan.dispatch ?? []).filter((d) => d && d.kind === 'review');
+  // Re-use the ordinary lane/auth/CI/live-job guarded dispatch. A refusal always wins over a request.
+  if (readRedTeamRequests && Array.isArray(rawPrs)) {
+    const blocked = new Set([...(plan.refusals ?? []), ...(plan.dispatch ?? [])].map(d => Number(d.prNumber)));
+    for (const request of readRedTeamRequests()) {
+      if (request.repo.toLowerCase() !== repo.toLowerCase() || blocked.has(request.pr)) continue;
+      const subject = rawPrs.find(p => Number(p.number) === request.pr);
+      const labels = (subject?.labels ?? []).map(l => typeof l === 'string' ? l : l.name);
+      if (subject?.headRefOid?.toLowerCase() !== request.head || subject.isDraft
+        || !labels.includes('review:accepted') || !labels.includes('ready-to-merge')
+        || labels.some(l => ['review:changes', 'review:human', 'review:pending'].includes(l))) continue;
+      reviews.push({ kind: 'review', prNumber: request.pr, redTeamRequest: request });
+      blocked.add(request.pr);
+    }
+  }
   // Live-caught 2026-09-22, #xli631k: a PR that moved to being owed a FIX (not a review) used to never
   // reach `statusCandidates` at all, so its `review-status:reviewing` label sat stale once its review
   // session finished (PR #2472, ~2 hours stale). `selectStatusCandidates` now takes fix-owed entries as a
@@ -550,6 +574,7 @@ export function runReviewTick({
     try {
       const subject = (Array.isArray(rawPrs) ? rawPrs : []).find(p => Number(p?.number) === Number(d.prNumber));
       const result = dispatch({ pr: d.prNumber, repo,
+        ...(d.redTeamRequest ? { expectedRedTeamHead: d.redTeamRequest.head } : {}),
         ...(d.advisoryReview?.ciWaived === true ? { advisoryCiWaiver: { head: d.advisoryReview.head, reason: d.advisoryReview.reason } } : {}),
         ...(Array.isArray(lanes) ? { preferLane: lanes[i] } : {}),
         escalationReason: parseEscalationReason(subject?.body ?? ''),
@@ -558,6 +583,7 @@ export function runReviewTick({
       // x26lw6u — a job dispatch that declined to start (a live job already on this PR, or the lane cool-off)
       // did not advance the round, so it gets no round tag — same rule as a failed dispatch.
       if (result?.skipped) { notStarted.push({ prNumber: d.prNumber, reason: result.skipped }); continue; }
+      if (d.redTeamRequest) finishRedTeamRequest(d.redTeamRequest);
       dispatched.push({
         prNumber: d.prNumber, agentId: result?.agentId ?? null,
         ...(result?.mode ? { mode: result.mode } : {}), ...(Number.isInteger(result?.jobPid) ? { jobPid: result.jobPid } : {}),
@@ -1030,6 +1056,7 @@ export function buildCliDaemonEffects({
   runReview = (opts) => {
     const factsProvider = withFactsLabels(createGhProvider());
     return runReviewTickAllRepos({
+      readRedTeamRequests: readDrainRedTeamRequests,
       acquirableLanes: defaultAcquirableLaneNumbers, readPrs: defaultReadPrs, readAgents: defaultReadAgents,
       poolExhaustion: DAEMON_POOL_EXHAUSTION,
       refreshScopeBloat: refreshScopeBloatedPr,
@@ -1039,7 +1066,7 @@ export function buildCliDaemonEffects({
         for (const r of promotions) log.error(`review-daemon: ${repo}#${r.pr} same-pass promote ${r.action} — ${String(r.why ?? '').replace(/\s+/g, ' ').slice(0, 300)}`);
         if (replanError) log.error(`review-daemon: ${repo} same-pass re-plan failed (review goes out next pass): ${replanError}`);
       },
-      dispatch: (o) => dispatchReviewByMode({ ...o, ciGate: readReviewCiGateFactsFirst }),
+      dispatch: ({ expectedRedTeamHead, ...o }) => dispatchReviewByMode({ ...o, ciGate: headBoundRedTeamCiGate(readReviewCiGateFactsFirst, expectedRedTeamHead) }),
       tagRound: (o) => tagReviewRound({ ...o, provider: factsProvider }),
       tagStatus: (o) => tagReviewStatus({ ...o, provider: factsProvider }),
       ...opts,
