@@ -18,6 +18,7 @@ import { redTeamEnqueueHold } from '../../lib/drain-queue-safety.mjs';
 import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../../lib/drain-red-team-evidence.mjs';
 import { newRunRecord, writeRun } from '../run-store.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
+import { liveResultGateState, redTeamGateMarker } from '../../lib/red-team-gate.mjs';
 
 const REPO = 'web-everything/web-everything';
 const REV = 'a'.repeat(40);
@@ -90,6 +91,28 @@ describe('runReviewJob under review.speculativeRedTeam', () => {
     expect(runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io).outcome).toBe('carried');
     expect(kinds(calls)).toEqual([]);
     expect(redTeamEnqueueHold({ loopPayload: payload('accept'), comments, pr: 10, head, env: {} })).toBeNull();
+  });
+
+  // PR #5482 operator ruling: a carry moves only the gate decisions made on the result it carries.
+  it('a carry never moves an earlier same-head result\'s gate outcome onto the newer result it carries', () => {
+    const head = 'b'.repeat(40);
+    const degraded = summary => renderRedTeamComment({ pr: 10, rev: REV, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+      findings: [{ summary, category: 'edge-case', impactIfUnfixed: 'degraded', confirmedByRecheck: true }] });
+    const bot = body => ({ author: { login: 'web-everything' }, body });
+    const run = comments => {
+      const { io } = jobIo({ over: {
+        carryAcrossRebaseSetting: () => ({ value: 'on', source: 'test' }),
+        readCarryEvidence: () => ({ headSha: head, comments }),
+        contributionPatchId: () => 'c'.repeat(40),
+        restampVerdict: () => ({ ok: true }),
+        postCarryComment: ({ body }) => comments.push(bot(body)),
+      } });
+      expect(runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io).outcome).toBe('carried');
+      return [...liveResultGateState(comments, 10, head).outcomes];
+    };
+    const carded = bot(redTeamGateMarker(10, REV, 'card-queued'));
+    expect(run([bot(`<!-- reviewed-sha: ${REV} -->`), bot(degraded('old')), carded, bot(degraded('new'))])).toEqual([]);
+    expect(run([bot(`<!-- reviewed-sha: ${REV} -->`), bot(degraded('old')), carded])).toEqual(['card-queued']);
   });
 
   it.each([true, false])('records the pass as queued before the added seats and the dispatch, then finished (speculative=%s)', enabled => {

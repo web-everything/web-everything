@@ -83,7 +83,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { execRead } from '../lib/proc-read.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
-import { redTeamGateMarker, redTeamMarker } from '../lib/red-team-gate.mjs';
+import { liveResultGateState, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
 import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -753,7 +753,11 @@ function runReviewArc({
               const stamped = io.restampVerdict({ pr: planned.pr, repo: planned.repo, newHead: evidence.headSha,
                 reason: `${decision.reason}; from ${prior.sha}; patch-id ${headPatchId}` });
               if (!stamped?.ok) throw Error(`restamp refused: ${stamped?.reason ?? 'unknown error'}`);
-              const gate = prior.gateOutcomes.map(outcome => redTeamGateMarker(planned.pr, evidence.headSha, outcome));
+              // Carry only the gate decisions made on the result being carried, named by that result (PR #5482).
+              const decided = prior.advisory ? liveResultGateState(evidence.comments, planned.pr, prior.sha) : null;
+              const gate = !decided ? prior.gateOutcomes.map(outcome => redTeamGateMarker(planned.pr, evidence.headSha, outcome))
+                : decided.resultId !== redTeamResultId(prior.advisory) ? []
+                  : [...decided.outcomes].map(outcome => redTeamGateMarker(planned.pr, evidence.headSha, outcome, decided.resultId));
               const body = [...gate, buildVerdictCarriedMarker({ fromSha: prior.sha, toSha: evidence.headSha, patchId: headPatchId }),
                 'Review verdict carried across an identical contribution.',
                 ...(prior.advisoryBody ? [prior.advisoryBody.replace(redTeamMarker(planned.pr, prior.sha), redTeamMarker(planned.pr, evidence.headSha))] : [])].join('\n');

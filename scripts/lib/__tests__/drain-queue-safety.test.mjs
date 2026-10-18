@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason } from '../drain-queue-safety.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
-import { redTeamGateMarker, redTeamMarker } from '../red-team-gate.mjs';
+import { parseRedTeamComment, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../red-team-gate.mjs';
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
 import { buildReviewedShaMarker, buildClearedHumanMarker } from '../review-escalation.mjs';
 
@@ -77,6 +77,15 @@ describe('operator ruling at the round cap', () => {
     ['a carried marker for this head preceded by a non-gate line', [clean(head, 'web-everything', broken), gate(head, 'sent-back'), { ...bot, body: [
       'quoting:', redTeamGateMarker(5283, head, 'round-cap'), buildVerdictCarriedMarker({ fromSha: prior, toSha: head, patchId: 'c'.repeat(40) })].join('\n') }, accept(head, true)]],
   ])('keeps holding: %s', (_name, comments) => expect(hold({ comments })).toMatch(/requiring send-back/));
+  // PR #5482 operator ruling: a round-cap decision for an earlier same-head result is not a hand-over of a newer one.
+  it('a ruling after an earlier result\'s round-cap keeps holding a newer result with no gate record', () => {
+    const old = clean(head, 'web-everything', [{ ...broken[0], summary: 'old break' }]);
+    const newer = clean(head, 'web-everything', [{ ...broken[0], summary: 'new break' }]);
+    expect(hold({ comments: [old, gate(head, 'round-cap'), newer, accept(head, true)] })).toMatch(/requiring send-back/);
+    const named = { ...bot, body: redTeamGateMarker(5283, head, 'round-cap', redTeamResultId(parseRedTeamComment(old.body))) };
+    expect(hold({ comments: [old, newer, named, accept(head, true)] })).toMatch(/requiring send-back/);
+    expect(hold({ comments: [old, newer, { ...named, body: redTeamGateMarker(5283, head, 'round-cap', redTeamResultId(parseRedTeamComment(newer.body))) }, accept(head, true)] })).toBeNull();
+  });
   it('a ruling on the prior head survives a proven carry (restamped clearance, carried round-cap and result)', () => {
     const ruledOnPrior = [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true)];
     expect(hold({ comments: [...ruledOnPrior, restamp(head), carry({ findings: broken, gates: ['round-cap'] })] })).toBeNull();
@@ -124,6 +133,16 @@ describe('durable head-bound red-team admission', () => {
     expect(hold({ comments: [earlier, carded, newer] })).toMatch(/requiring send-back/);
     const dated = (c, at) => ({ ...c, createdAt: at });
     expect(hold({ comments: [dated(carded, '2026-10-17T10:00:00Z'), dated(newer, '2026-10-17T11:00:00Z')] })).toMatch(/requiring send-back/);
+  });
+  // PR #5482 operator ruling: each gate decision applies only to the result it names, wherever it sits in the thread.
+  it('a gate record naming an earlier same-head result never decides a newer one', () => {
+    const earlier = clean(head, 'web-everything', [{ ...broken[0], summary: 'old break' }]);
+    const newer = clean(head, 'web-everything', [{ ...broken[0], summary: 'new break' }]);
+    const advisoryFor = r => ({ ...bot, body: `${redTeamGateMarker(5283, head, 'card-queued', redTeamResultId(parseRedTeamComment(r.body)))}\n- 1 finding(s) left advisory (#1).` });
+    // The gate acted on `earlier`, but its record landed after `newer` was posted (a slow gate run).
+    expect(hold({ comments: [earlier, newer, advisoryFor(earlier)] })).toMatch(/requiring send-back/);
+    expect(hold({ comments: [earlier, newer, advisoryFor(newer)] })).toBeNull();
+    expect(hold({ comments: [earlier, advisoryFor(earlier)] })).toBeNull();
   });
   it('reads gate actions only from the anchored lines right after the gate marker', () => {
     const two = clean(head, 'web-everything', [broken[0], { ...broken[0], summary: 'second break' }]);
