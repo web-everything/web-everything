@@ -1,10 +1,12 @@
 ---
 kind: decision
 size: 3
-status: active
+status: resolved
 scaffoldedBy: "decision-collector-pr"
 dateScaffolded: "2026-10-18"
 dateOpened: "2026-10-18"
+dateResolved: "2026-10-18"
+codifiedIn: "docs/agent/platform-decisions.md#collector-pr-card-batching-streams"
 preparedDate: "2026-10-18"
 preparedAgainstSha: "257b2769a9a288323e9c3dab6a5afaf22c1e885c"
 relatedTo: ["4703", "6250"]
@@ -15,6 +17,19 @@ tags: [card-batch, pr-flow, prevention, decision]
 # Decision: collector PRs batch card-only filings per stream (count or age flush)
 
 Operator 2026-10-18 "Ok", verbatim idea: "group more finding in a single pr, could have a parked pr that collect those and merge once a count or delay is reached, then a new one take over."
+
+## Ruling
+
+**Ruled 2026-10-18 by the operator (Nicolas Gilbert), in conversation.** Verbatim: *"All ok"*, in answer to the card's recommended defaults. The rule is codified at [we:docs/agent/platform-decisions.md#collector-pr-card-batching-streams](../docs/agent/platform-decisions.md#collector-pr-card-batching-streams). The prepared text below is kept as the lineage; where it differs from this section, this section wins.
+
+- **Fork 1 = (a).** Streams `prevention` and `filing` (follow-up and expedite cards fold into `filing`), plus `ruling` declared and disabled.
+- **Fork 2 = (a).** Count and age, count wins a tie. Prevention 10 / 120, ruling 8 / 60, filing 10 / 60.
+- **Fork 3 = (a).** Expedite cards bypass the collector via `highPriorityBypass`.
+- **Fork 4 = (a).** A card with a blocking finding is extracted to its own PR; it is never re-queued.
+- **Fork 5 = (a).** Every member is numbered at seal, before the PR is marked ready.
+- **Fork 6 = (a).** The coordinator owns the collector branch and retires a stuck sealed state from GitHub truth.
+
+**Build:** epic x87psvt. First slice, top priority (unblocking): x5nmdnt, the self-heal (live case: prevention batch 9 sealed since 2026-10-14, 327 cards spooled). Then x1mmp60 (numbering at seal), x245i7o (resumable seal timeout), xf1z2w3 (age escape), xpabefb (ruling stream declared, follow-up and expedite folded into filing).
 
 ## Digest
 

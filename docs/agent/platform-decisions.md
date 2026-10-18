@@ -6274,3 +6274,23 @@ Codex-authored PRs get an Opus judge, same fallback dimension). Declared in `we:
 `we:config/platformDefaults.ts`; the daemon that consumes it is card 4880.
 
 **Lineage:** 4772 (ruled 2026-10-03). Instance of [config-extends-platform-default](#config-extends-platform-default).
+
+### Collector PRs batch card-only filings per stream; the coordinator owns each batch and heals it from GitHub {#collector-pr-card-batching-streams}
+
+**Ratified 2026-10-18 by the operator (Nicolas Gilbert), in conversation, all six forks at the card's default
+(`#x5ioz96`).** The operator's words: *"All ok"*. Builds on the rolling card-only PRs of epic #4703.
+
+**The rule:**
+1. **Streams.** `prevention` and `filing` (follow-up and expedite cards fold into `filing`), plus `ruling`,
+   declared and disabled until a filer routes to it. Code PRs never join a collector.
+2. **Flush.** Count and age, whichever first, count wins a tie. Defaults: prevention 10 cards / 120 min, ruling
+   8 / 60, filing 10 / 60. Every value is a cascade setting with its source logged.
+3. **Expedite.** High and urgent cards bypass the collector (`highPriorityBypass`).
+4. **Ejection.** A card with a blocking finding is extracted to its own PR and is never re-queued into a
+   collector.
+5. **Numbering.** Every member is numbered once at seal, before the PR is marked ready; numbering failure keeps
+   the batch held.
+6. **Ownership.** The coordinator owns the collector branch (lease plus state file). A sealed state whose PR is
+   merged or closed on GitHub is retired on the next admission; an unreadable PR state keeps it sealed and held.
+
+**Lineage:** `#x5ioz96` (ruled 2026-10-18). Epic x87psvt.
