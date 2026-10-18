@@ -554,6 +554,7 @@ export function runReviewTick({
       const rearmSubject = subject ?? (d.owedRedTeamReview
         ? { number: Number(d.prNumber), headRefOid: d.owedRedTeamReview.head } : null);
       const result = dispatch({ pr: d.prNumber, repo,
+        ...(d.owedRedTeamReview ? { owedRedTeamReview: d.owedRedTeamReview } : {}),
         // Planning is read-only. Claim any owed-comment exception after the dispatcher's CI and other gates.
         ...(d.owedRedTeamReview ? { beforeSpawn: ci => d.owedRedTeamReview.repo === repo
           && d.owedRedTeamReview.pr === Number(d.prNumber)

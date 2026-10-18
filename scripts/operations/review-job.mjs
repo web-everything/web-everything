@@ -369,6 +369,14 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     },
     // x00g3tt — the POST-ACCEPT RED TEAM, its own process and wall, run only after the added seats. Advisory: it
     // posts one deduped comment and writes evidence; nothing it returns reaches a label, merge or verdict.
+    resumeSavedRedTeam: ({ pr, repo, rev }) => {
+      const r = node(['scripts/operations/review-extra-seats.mjs', 'red-team-resume',
+        `--pr=${pr}`, `--repo=${repo}`, `--rev=${rev}`], { timeoutMs: 5 * 60 * 1000 });
+      const last = String(r.stdout ?? '').trim().split('\n').pop() ?? '';
+      try { return JSON.parse(last); } catch {
+        return { status: 'error', reason: `saved red-team retry exit ${r.status}${r.signal ? ` (${r.signal})` : ''}, no result` };
+      }
+    },
     runRedTeam: ({ pr, repo, lanePath, loopPayload, slug }) => {
       if (!redTeamEnabled(env)) return { status: 'disabled', reason: 'kill switch thrown' };
       const loopFile = join(dir, `${slug}.red-team.loop.json`);
@@ -705,7 +713,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
 }
 
 function runReviewArc({
-  pr, repo, preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid,
+  pr, repo, owedRedTeamHead = null, preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid,
 } = {}, io, seatsBox = {}) {
   const planned = planReviewDispatch({ pr, repo });
   const slug = planned.sessionSlug;
@@ -737,6 +745,20 @@ function runReviewArc({
   try {
     const prev = io.readPrevCompletion(slug);
     io.report({ session: slug, kind: 'review', pr: String(planned.pr), repo: planned.repo, status: 'started', timeoutMs: loopTimeoutMs });
+    if (owedRedTeamHead !== null) {
+      // A saved-result completion is not another verdict. Keep the job claim/report lifecycle, but never
+      // acquire a lane, carry a verdict, run the review loop, add seats, or apply a new review label.
+      if (!/^[0-9a-f]{40}$/.test(owedRedTeamHead)) throw new Error('invalid owed red-team head');
+      const redTeam = io.resumeSavedRedTeam({ pr: planned.pr, repo: planned.repo, rev: owedRedTeamHead });
+      const complete = redTeam?.status === 'already-ran'
+        || (redTeam?.status === 'resumed' && ['posted', 'deduped'].includes(redTeam?.comment?.status));
+      // Use the existing successful carry outcome understood by the worker envelope: the saved result
+      // was carried to the thread, without a new verdict. A failed retry remains an infrastructure hold.
+      classified = { outcome: complete ? 'carried' : BLOCKED_ON_INFRA,
+        label: redTeam?.reason ?? null, redTeam: summarizeRedTeam(redTeam) };
+      io.log(`review-job ${slug}: saved red-team retry — ${redTeam?.status ?? 'none'} (${redTeam?.reason ?? ''})`);
+      return result(classified);
+    }
     if (typeof io.carryAcrossRebaseSetting === 'function') {
       try {
         const setting = io.carryAcrossRebaseSetting();
@@ -875,7 +897,7 @@ function runReviewArc({
  */
 export function dispatchReviewJob({
   ciGate = readReviewCiGate, advisoryCiWaiver = null,
-  beforeSpawn = () => true,
+  beforeSpawn = () => true, owedRedTeamReview = null,
   pr, repo, preferLane = null, root = REPO_ROOT, env = process.env, now = Date.now(), checkStaleness,
   dir = reviewJobsDir(env, root),
   spawnJob = defaultSpawnJob,
@@ -910,6 +932,10 @@ export function dispatchReviewJob({
     && !['head-changed', 'unreadable-ci', 'missing-head', 'unknown-required-set', 'untrusted-required-set'].includes(String(ci.reason ?? '').split(' (')[0])
     && !(ci.affected ?? []).some(row => ['wrong-head', 'malformed', 'missing'].includes(row.reason));
   if (!ci?.allowed && !waived) return { pr: planned.pr, repo: planned.repo, headSha: ci?.headSha ?? null, skipped: formatReviewCiSkip(ci), ci };
+  if (owedRedTeamReview && (owedRedTeamReview.repo !== planned.repo || owedRedTeamReview.pr !== planned.pr
+    || !/^[0-9a-f]{40}$/.test(owedRedTeamReview.head) || ci?.headSha !== owedRedTeamReview.head)) {
+    return { ...base, jobPid: null, skipped: 'owed-red-team-identity' };
+  }
   const settingsEnv = resolveSettingsEnv() || {};
   const childEnv = { ...env, ...settingsEnv };
   // The dispatcher's own actor id (if it happens to run inside a session) must never leak into the job — the
@@ -919,6 +945,7 @@ export function dispatchReviewJob({
   if (!beforeSpawn(ci)) return { ...base, jobPid: null, skipped: 'same-head-hold' };
   const jobPid = spawnJob({
     argv: [THIS_FILE, 'run', `--pr=${planned.pr}`, `--repo=${planned.repo}`,
+      ...(owedRedTeamReview ? [`--owed-red-team-head=${owedRedTeamReview.head}`] : []),
       ...(Number.isInteger(preferLane) && preferLane > 0 ? [`--prefer-lane=${preferLane}`] : [])], cwd: root, env: childEnv, logPath,
   });
   // Claim the slot for the child NOW, so the very next reader (a tick 120s later, or a status tag this same
@@ -957,7 +984,8 @@ export function dispatchReviewByMode({ mode = resolveReviewDispatchMode(), stack
   const named = (r) => (stack?.base && r && !r.skipped
     ? { ...r, mode: `${r.mode ?? mode} against stack base #${stack.base.pr} (${stack.base.ref}@${stack.base.contained.slice(0, 9)})` }
     : r);
-  if (mode === 'session') {
+  // Saved effects are deterministic even when ordinary reviews use agent sessions.
+  if (mode === 'session' && !opts.owedRedTeamReview) {
     const { preferLane, ...sessionOpts } = opts;
     return named({ mode: 'session', ...dispatchReview(sessionOpts) });
   }
@@ -1064,6 +1092,7 @@ if (IS_CLI) {
     try {
       const lane = Number(flag('prefer-lane'));
       const out = runReviewJob({ pr: flag('pr'), repo: flag('repo'),
+        owedRedTeamHead: flag('owed-red-team-head') ?? null,
         preferLane: Number.isInteger(lane) && lane > 0 ? lane : null });
       writeAllSync(1, `${JSON.stringify(out)}\n`);
       // #4075/run-rating slice 1 — mechanical grading for this now-finished job-mode review, read back from

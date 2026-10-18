@@ -9,7 +9,8 @@ import { claimReviewDispatch, decideSameHeadHold, enrichPrsWithReferralHolds } f
 import { defaultReadNotesForRepo } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
 import { runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
 import { dispatchReviewByMode, runReviewJob } from '../../operations/review-job.mjs';
-import { runRedTeam } from '../../operations/review-extra-seats.mjs';
+import { reviewJobResult } from '../../operations/review-job-envelope.mjs';
+import { runRedTeam, resumeSavedRedTeam, speculateRedTeam } from '../../operations/review-extra-seats.mjs';
 import { redTeamMarker } from '../../lib/red-team-gate.mjs';
 import { resetCascadeLogForTest } from '../../lib/policy-cascade.mjs';
 import { repoKeyForSlug } from '../../lib/constellation-repos.mjs';
@@ -75,8 +76,11 @@ describe('same-head hold when the post-accept red-team comment is owed', () => {
       .toMatchObject({ kind: 'same-head' });
     expect(existsSync(opts.redTeam.stateDir)).toBe(false);
   });
-  it.each([null, 'standards', 'test-shard (1)'])('carries the owed-comment exception through the real reconcile planner (missing check: %s)', missing => {
-    const [p] = enrichPrsWithReferralHolds([pr({ labels: [{ name: 'review:pending' }],
+  it.each(['review:pending', 'review:accepted'].flatMap(label =>
+    [false, true].flatMap(marker => [null, 'standards', 'test-shard (1)'].map(missing => ({ label, marker, missing })))))
+  ('carries the owed-comment exception through the real reconcile planner ($label, marker=$marker, missing=$missing)', ({ label, marker, missing }) => {
+    const [p] = enrichPrsWithReferralHolds([pr({ labels: [{ name: label }],
+      comments: marker ? [{ author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${head} -->` }] : [],
       headRefName: 'lane/redteam-comment-retry', state: 'OPEN', isDraft: false,
       // The default WE review policy waits for these fast checks as well as refusing required CI failures.
       mergeStateStatus: 'CLEAN', statusCheckRollup: ['test', 'standards', 'test-shard (1)']
@@ -91,9 +95,28 @@ describe('same-head hold when the post-accept red-team comment is owed', () => {
         ci: expect.objectContaining({ affected: [{ name: missing, reason: 'missing' }] }) }));
     } else {
       expect(plan.dispatch).toContainEqual(expect.objectContaining({ kind: 'review', prNumber: number,
-        owedRedTeamReview: p.owedRedTeamReview }));
+        owedRedTeamReview: p.owedRedTeamReview, labels: [label] }));
+      expect(plan.dispatch).toHaveLength(1);
     }
     expect(existsSync(opts.redTeam.stateDir)).toBe(false);
+  });
+  it.each(['missing', 'spent', 'posted', 'wrong-repo', 'wrong-pr', 'wrong-head', 'held', 'draft'])
+  ('does not dispatch an accepted PR with an unavailable owed-comment exception (%s)', variant => {
+    if (variant === 'missing') save([]);
+    if (variant === 'spent') expect(claim()).toBe(true);
+    const [p] = enrichPrsWithReferralHolds([pr({ labels: [{ name: 'review:accepted' }],
+      headRefName: 'lane/redteam-comment-retry', state: 'OPEN', isDraft: variant === 'draft',
+      mergeStateStatus: 'CLEAN', statusCheckRollup: ['test', 'standards', 'test-shard (1)']
+        .map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })),
+      ...(variant === 'posted' ? { comments: [{ author: { login: 'chalbert' }, body: redTeamMarker(number, head) }] } : {}),
+    })], { ...opts, now: 3, readRuns: () => [run()] });
+    if (variant === 'wrong-repo') p.owedRedTeamReview.repo = 'frontier-ui/frontierui';
+    if (variant === 'wrong-pr') p.owedRedTeamReview.pr++;
+    if (variant === 'wrong-head') p.owedRedTeamReview.head = 'b'.repeat(40);
+    if (variant === 'held') p.referralHold = { kind: 'same-head', why: 'held' };
+    const plan = planReconcile({ repo: repoKeyForSlug(repo), prs: [p], agents: [], requiredChecks: ['test'], now: 3 });
+    expect(plan.dispatch.filter(d => d.kind === 'review')).toEqual([]);
+    expect(existsSync(opts.redTeam.stateDir)).toBe(variant === 'spent');
   });
   it('releases on the first decision in a real Node process without asynchronous reader warmup', () => {
     const source = `
@@ -150,6 +173,14 @@ describe('same-head hold when the post-accept red-team comment is owed', () => {
     settings({ reArmOnMissingComment: false });
     expect(decide()).toMatchObject({ kind: 'same-head' });
     expect(opts.redTeam.log).toHaveBeenCalledWith(expect.stringContaining('reArmOnMissingComment=false (tool)'));
+  });
+  it.each(['WE_REVIEW_RED_TEAM', 'WE_REVIEW_EXTRA_SEATS'])('keeps the allowance unspent while %s is disabled', key => {
+    opts.env[key] = '0';
+    expect(decide()).toMatchObject({ kind: 'same-head' });
+    expect(claim()).toBe(false);
+    expect(existsSync(opts.redTeam.stateDir)).toBe(false);
+    delete opts.env[key];
+    expect(decide()).toBeNull();
   });
   it('honors the platform setting and the environment override', () => {
     writeFileSync(opts.env.WE_PLATFORM_PREFERENCES_FILE, JSON.stringify({ redTeam: { reArmOnMissingComment: false } }));
@@ -316,13 +347,13 @@ describe('same-head hold when the post-accept red-team comment is owed', () => {
     })).toBe(false);
     expect(existsSync(opts.redTeam.stateDir)).toBe(false);
   });
-  it('reposts saved red-team evidence after hold release without invoking the model', async () => {
+  it.each([['x.mjs'], ['backlog/1-test.md']])('reposts saved red-team evidence after hold release without invoking the model (%s)', async (file) => {
     expect(decide()).toBeNull();
     let replayInput;
     const loopPayload = { verdict: { verdict: 'accept', loop: { outcome: 'converged' } },
       runId: 'saved-review', stopped: 'complete', findings: { read: {
         title: 'saved red-team pass', diffText: 'diff --git a/x.mjs b/x.mjs\n+fixed',
-        netChangedFiles: ['x.mjs'], netBasis: { rev: head },
+        netChangedFiles: [file], netBasis: { rev: head },
       } } };
     const spawnJob = vi.fn(() => {
       runReviewJob({ pr: number, repo, pid: 1 }, {
@@ -351,6 +382,61 @@ describe('same-head hold when the post-accept red-team comment is owed', () => {
     expect(runSeat).not.toHaveBeenCalled();
     expect(runRecheck).not.toHaveBeenCalled();
     expect(spawnJob).toHaveBeenCalledTimes(1);
+  });
+  it('defers saved card-only effects until acceptance during speculation', async () => {
+    const postComment = vi.fn();
+    const runSeat = vi.fn(() => { throw new Error('must not call the model'); });
+    const result = await speculateRedTeam({ pr: number, repo, env: {}, resume: false,
+      read: { diffText: '+card', netChangedFiles: ['backlog/1-test.md'], netBasis: { rev: head } },
+    }, { now: () => 1, readRecords: () => [row()], log: () => {}, postComment, runSeat });
+    expect(result.status).toBe('prior-row');
+    expect(postComment).not.toHaveBeenCalled();
+    expect(runSeat).not.toHaveBeenCalled();
+  });
+  it.each(['job', 'session'].flatMap(mode => ['posted', 'deduped'].map(status => ({ mode, status }))))
+  ('dispatches saved-result completion without running a review panel (mode=$mode, comment=$status)', async ({ mode, status }) => {
+    let replayInput;
+    const forbidden = vi.fn(() => { throw new Error('must not run another review'); });
+    const spawnJob = vi.fn(({ argv }) => {
+      const rev = argv.find(a => a.startsWith('--owed-red-team-head='))?.split('=')[1];
+      expect(rev).toBe(head);
+      const out = runReviewJob({ pr: number, repo, owedRedTeamHead: rev, pid: 1 }, {
+        root: '/daemon', now: () => 3, readPrevCompletion: () => null, report: () => {},
+        claim: () => ({ ok: true }), unclaim: () => {}, log: () => {},
+        acquireLane: forbidden, runLoop: forbidden, runExtraSeats: forbidden, runRedTeamGate: forbidden,
+        resumeSavedRedTeam: input => { replayInput = input; return { status: 'resumed', comment: { status } }; },
+      });
+      expect(out).toMatchObject({ outcome: 'carried', verdict: null, lanePath: null });
+      expect(reviewJobResult(out, { pr: number, repo })).toMatchObject({ outcome: 'done', blocker: null });
+      return 4242;
+    });
+    const out = dispatch({ mode, owedRedTeamReview: { repo, pr: number, head }, spawnJob, spawnAgent: forbidden });
+    expect(out.jobPid).toBe(4242);
+    const postComment = vi.fn();
+    const result = await resumeSavedRedTeam({ ...replayInput, env: {}, record: false }, {
+      readRecords: () => [row({ provider: 'codex', model: 'saved', callId: 'saved', findings: [] }),
+        row({ repo: 'other/repo', callId: 'foreign', findings: [] })],
+      readRetryPr: () => ({ headRefOid: head, state: 'OPEN', isDraft: false, title: 'saved card' }),
+      listComments: () => [], postComment, runSeat: forbidden, runRecheck: forbidden, log: () => {},
+    });
+    expect(result).toMatchObject({ status: 'resumed', callId: 'saved', comment: { status: 'posted' } });
+    expect(postComment).toHaveBeenCalledTimes(1);
+    expect(forbidden).not.toHaveBeenCalled();
+  });
+  it.each(['moved', 'closed', 'draft', 'missing-row', 'foreign-row', 'unreadable'])
+  ('refuses saved-result completion without a fresh model fallback (%s)', async variant => {
+    const forbidden = vi.fn(() => { throw new Error('unexpected effect'); });
+    const result = await resumeSavedRedTeam({ pr: number, repo, rev: head, env: {}, record: false }, {
+      readRecords: () => variant === 'missing-row' ? [] : [row(variant === 'foreign-row' ? { repo: 'other/repo' } : {})],
+      readRetryPr: () => {
+        if (variant === 'unreadable') throw new Error('read failed');
+        return { headRefOid: variant === 'moved' ? 'b'.repeat(40) : head,
+          state: variant === 'closed' ? 'CLOSED' : 'OPEN', isDraft: variant === 'draft' };
+      },
+      postComment: forbidden, runSeat: forbidden, runRecheck: forbidden,
+    });
+    expect(result.status).toBe('error');
+    expect(forbidden).not.toHaveBeenCalled();
   });
   it('keeps the hold if fetching the full capped comment thread fails', () => {
     const p = pr({ comments: Array.from({ length: 100 }, () => ({ body: 'old comment' })) });

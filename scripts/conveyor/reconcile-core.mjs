@@ -1,4 +1,5 @@
 import { reviewStartGate, fastChecksFor, REVIEW_TIMING_DEFAULTS, joinedFixDecision, fixReadiness, FIX_TIMING_DEFAULTS } from '../lib/review-timing.mjs';
+import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 /**
  * reconcile-core.mjs — the PURE reconcile pass (#3296): compare DESIRED delivery state against ACTUAL, for
  * every open PR, and return what to dispatch plus every refusal and the fact each turned on.
@@ -1459,9 +1460,10 @@ function dispatchReviewRow({
     return;
   }
   // ── `already-reviewed-head` (#2588) — see {@link planReconcile}'s note ahead of its call for the full incident.
-  // Raw-SHA comparison only, as it always was. A mechanically-REBASED accepted PR cannot reach this function
-  // with a stale marker: an accept moves the label to `review:accepted`, which the OWED table never owes a review
-  // (phase `queued`) and the ci-red-parallel caller never calls this for (it is gated on `review:pending`) —
+  // Raw-SHA comparison only, as it always was. An accepted PR reaches this function only when the enricher
+  // explicitly identifies a saved red-team result whose comment is missing. That bounded completion retry
+  // must pass the marker guard too; ordinary queued PRs still owe no review in the OWED table, and the
+  // ci-red-parallel caller never calls this for them (it is gated on `review:pending`) —
   // defended by the "accepted contribution awaiting its mechanical rebase's CI" test in reconcile-core.test.mjs.
   //
   // we:backlog/4352 — the marker alone OVER-TRUSTED "review is done": an accept whose `review:accepted` swap a
@@ -1475,7 +1477,7 @@ function dispatchReviewRow({
   const relabelOwed = !!(headSha && reviewedSha && reviewedSha === headSha)
     && acceptLabelDropped({ labels: withPhase?.labels, comments: pr?.comments, headSha, now });
   if (relabelOwed) extra = { ...extra, relabelOwed: true };
-  if (headSha && reviewedSha && reviewedSha === headSha && !relabelOwed) {
+  if (headSha && reviewedSha && reviewedSha === headSha && !relabelOwed && !base.owedRedTeamReview) {
     // #xconv1 (web-everything/web-everything#2766/#2767 unblock, epic #3383/#4075) — a `needs-human` PR in this
     // EXACT shape (accepted, then escalated — never a fresh push, or `reviewedSha` would no longer equal
     // `headSha`) is NOT the #2588 risk this refusal exists for: `review-pr.mjs`'s own `confirm` step
@@ -1568,7 +1570,8 @@ function dispatchReviewRow({
       if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra })) return;
       dispatch.push({
         ...base, ...withPhase, kind: 'review', findings: 0, attempts, ...extra, ...(finalReview ? { finalReview: true } : {}),
-        why: `parked for an independent review and no finding has been raised yet — a review is owed` +
+        why: (base.owedRedTeamReview ? 'saved red-team result is owed its missing comment — retry its completion'
+          : 'parked for an independent review and no finding has been raised yet — a review is owed') +
           ` (#3279 runs it); ${attempts} of ${roundCap} attempts are spent` + finalWhy,
       });
     }
@@ -1585,7 +1588,8 @@ function dispatchReviewRow({
   if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra })) return;
   dispatch.push({
     ...base, ...withPhase, kind: 'review', findings, attempts, ...extra, ...(finalReview ? { finalReview: true } : {}),
-    why: `parked for an independent review with ${findings} finding(s) on the thread and nothing live working it` + finalWhy,
+    why: (base.owedRedTeamReview ? 'saved red-team result is owed its missing comment — retry its completion'
+      : `parked for an independent review with ${findings} finding(s) on the thread and nothing live working it`) + finalWhy,
   });
 }
 
@@ -2057,7 +2061,11 @@ export function planReconcile({
       prNumber,
       headRefName: pr?.headRefName ?? null,
       headRefOid: pr?.headRefOid ?? null,
-      ...(pr?.owedRedTeamReview ? { owedRedTeamReview: pr.owedRedTeamReview } : {}),
+      ...(pr?.owedRedTeamReview?.head === pr?.headRefOid
+        && pr?.owedRedTeamReview?.pr === prNumber
+        && repoKeyForSlug(pr?.owedRedTeamReview?.repo) !== null
+        && repoKeyForSlug(pr?.owedRedTeamReview?.repo) === repoKeyForSlug(repo)
+        ? { owedRedTeamReview: pr.owedRedTeamReview } : {}),
       // #3383 — carried on every row (evidence, mirrors `transcriptMtimeMs`/`body` just below): the STACKED-BASE
       // CONFLICT branch reads it, and a reader auditing any other row can see at a glance whether this PR is
       // stacked on another lane/PR at all, with no need to go back to the raw listing.
@@ -3467,7 +3475,11 @@ export function planReconcile({
       }
     }
 
-    if (!OWED[phase]) {
+    // Acceptance settles the verdict, but can leave saved red-team effects unfinished. The enricher's
+    // head-bound exception owes one retry through the SAME review gates, without changing the phase or
+    // acceptance label. Planning never claims it; the dispatcher revalidates and reserves before spawning.
+    const owedRedTeamRetry = phase === 'queued' && !!base.owedRedTeamReview;
+    if (!OWED[phase] && !owedRedTeamRetry) {
       if (OWED_ELSEWHERE[phase]) refuse('owed-elsewhere', { ...withPhase, why: OWED_ELSEWHERE[phase] });
       else refuse('nothing-owed', { ...withPhase, why: `phase \`${phase}\` — reviewed and queued, or already landed; this pass has nothing to dispatch` });
       continue;
@@ -3500,7 +3512,7 @@ export function planReconcile({
     //
     // All three checks (the head guard, no-findings, the cap) live in {@link dispatchReviewRow} — the ONE copy,
     // shared with the ci-red-parallel review above (PR #2783 review: the review decision was duplicated here).
-    if (OWED[phase] === 'review') {
+    if (OWED[phase] === 'review' || owedRedTeamRetry) {
       dispatchReviewRow({ pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, refuse, refuseCapExhausted, dispatch, now });
       continue;
     }

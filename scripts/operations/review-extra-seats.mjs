@@ -1350,18 +1350,32 @@ async function resumeRedTeam({ pr, repo, rev, title, prior, records, post, recor
 }
 
 /**
- * RUN THE RED TEAM for one ACCEPTED PR. Never throws: every failure is a status in the result.
- * @param {{pr:number, repo:string, lanePath:string, loopPayload:object, env?:object, post?:boolean, record?:boolean}} o
- *   `post: false` renders the comment and returns it without posting. `record: false` (the replay) also writes
- *   nothing to the scorecard store — no evidence row, no miss row, no delegation trial; a payload marked
- *   `replay: true` is never recorded whatever `record` says. The daily-cap reservation is still taken: the call
- *   is real and is paid for.
- *
- * Card xbizuci — the pass is two halves so it can START before the verdict is known (`review.speculativeRedTeam`):
- * {@link speculateRedTeam} (provider pick, reservation, the model call, Claude's re-check — needs only the review's
- * `read`) and {@link completeRedTeam} (the seat row, the folded verdict, the effects — needs the finished review).
- * This sequential entry runs both back to back, exactly as before the split.
- * @param {ReturnType<typeof createRedTeamIo>} io
+ * Complete saved red-team effects on the still-live head. Unlike a normal pass, absent evidence or unreadable
+ * live state refuses; it can never fall back to model calls. Kill switches still apply, new-probe policies do not.
+ */
+export async function resumeSavedRedTeam({ pr, repo, rev, env = process.env, post = true, record = true } = {}, io = createRedTeamIo({ env })) {
+  try {
+    if (!redTeamEnabled(env)) return { status: 'disabled', reason: 'red-team kill switch thrown' };
+    if (!isPinnedRev(rev)) return { status: 'error', reason: 'saved-result retry requires a pinned head' };
+    const records = io.readRecords();
+    const prior = priorRedTeamRow(records.filter(r => r?.repo === repo), pr, rev);
+    if (!prior) return { status: 'error', reason: 'saved red-team result is unavailable; no new probe allowed' };
+    // Revalidate inside the worker, after spawn and immediately before completing effects. No fallback
+    // to a fresh review/model if the head moved or evidence disappeared while the job was starting.
+    const live = io.readRetryPr({ pr, repo });
+    if (live?.headRefOid !== rev || live?.state !== 'OPEN' || live?.isDraft !== false) {
+      return { status: 'error', reason: 'saved-result retry requires the same open, ready head' };
+    }
+    return await resumeRedTeam({ pr, repo, rev, title: live.title, prior, records, post, record }, io);
+  } catch (e) {
+    return { status: 'error', reason: String(e?.message ?? e).slice(0, MAX_TEXT) };
+  }
+}
+
+/**
+ * Run the red team for an accepted review. The speculative and completion halves share this sequential entry.
+ * `post: false` renders without posting; `record: false` or a replay payload writes no evidence/trials.
+ * A new model call still reserves daily-cap budget. Every failure returns a status instead of throwing.
  */
 export async function runRedTeam({ pr, repo, lanePath, loopPayload, env = process.env, post = true, record = true } = {}, io = createRedTeamIo({ env })) {
   try {
@@ -1405,21 +1419,23 @@ export async function speculateRedTeam({
     const rev = read.netBasis?.rev;
     if (!isPinnedRev(rev)) return { status: 'skipped', reason: 'the review printed no pinned head commit (netBasis.rev)' };
     const settings = readRedTeamProbes({ env, log: io.log });
-    // The net path list names only rename/copy destinations. Include sources so
-    // moving executable code into backlog/ cannot turn the probe off. Unknown
-    // or empty destination lists and malformed source lists must still probe.
-    if (settings.value.skipCardOnly && redTeamCardOnly(read)) {
-      io.log('red team skipped: card-only');
-      return { status: 'skipped', reason: 'red team skipped: card-only' };
-    }
     const now = io.now();
     let records = [];
     try { records = io.readRecords(); } catch (e) { io.log(`red team: could not read the scorecard store (${e.message}) — treating it as empty`); }
-    const prior = priorRedTeamRow(records, pr, rev);
+    // Legacy rows omitted repo; keep their historical dedupe semantics, but never select a named foreign repo.
+    // The explicit saved-result retry above requires positive repository identity.
+    const prior = priorRedTeamRow(records.filter(r => r?.repo == null || r.repo === repo), pr, rev);
     // A speculative pass (`resume: false`) must not finish a prior pass's effects before the verdict is known: it
     // reports the row and the job's sequential pass resumes it if, and only if, the review accepts.
     if (prior && !resume) return { status: 'prior-row', reason: `a clean red-team row already exists for #${pr} at ${rev.slice(0, 12)}` };
     if (prior) return await resumeRedTeam({ pr, repo, rev, title: read.title, prior, records, post, record }, io);
+    // Card-only policy prevents NEW probes, not completion of a saved result produced while the policy
+    // was off. Keep the speculative prior-row return above: effects still wait for acceptance.
+    // Include rename/copy sources so moving executable code into backlog/ cannot turn a new probe off.
+    if (settings.value.skipCardOnly && redTeamCardOnly(read)) {
+      io.log('red team skipped: card-only');
+      return { status: 'skipped', reason: 'red team skipped: card-only' };
+    }
     // Card xn2wf9t — each provider's OWN cap, same treatment as `runExtraSeats`: a provider already at its cap is
     // excluded from `available` up front, so `selectReviewSeatProvider` picks whichever else has budget rather
     // than the pass giving up outright. The reservation loop below still guards the rare RACE (a concurrent pass
@@ -1623,7 +1639,7 @@ export async function finishSpeculativeRedTeam({ pr, repo, loopPayload, pass, en
     }
     let records = [];
     try { records = io.readRecords(); } catch { records = []; }
-    if (priorRedTeamRow(records, pr, pass.rev)) return { status: 'superseded', reason: `a clean red-team row for #${pr} at ${String(pass.rev).slice(0, 12)} landed meanwhile` };
+    if (priorRedTeamRow(records.filter(r => r?.repo == null || r.repo === repo), pr, pass.rev)) return { status: 'superseded', reason: `a clean red-team row for #${pr} at ${String(pass.rev).slice(0, 12)} landed meanwhile` };
     const recording = loopPayload?.replay !== true;
     return await completeRedTeam({ pr, repo, loopPayload, pass, post, record: recording }, io);
   } catch (e) {
@@ -1684,6 +1700,7 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
   };
   return {
     ...base,
+    readRetryPr: ({ pr, repo }) => JSON.parse(gh(['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid,state,isDraft,title'])),
     redTeamStatus: input => {
       recordRedTeamStatus(input, { env });
       try { syncRedTeamStatusLabels({ repo: input.repo, pr: input.pr, head: input.loopPayload.findings.read.netBasis.rev,
@@ -1782,6 +1799,9 @@ if (IS_CLI) {
   if (sub === 'run' && flag('pr') && flag('repo') && flag('lane') && flag('loop-json')) {
     runExtraSeats({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload() })
       .then((result) => emit(result, renderSeatSummary));
+  } else if (sub === 'red-team-resume' && flag('pr') && flag('repo') && flag('rev')) {
+    resumeSavedRedTeam({ pr: Number(flag('pr')), repo: flag('repo'), rev: flag('rev') })
+      .then((result) => emit(result, renderRedTeamSummary));
   } else if (sub === 'red-team' && flag('pr') && flag('repo') && flag('lane') && flag('loop-json')) {
     runRedTeam({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload(), post: !rest.includes('--no-post') })
       .then((result) => emit(result, renderRedTeamSummary));

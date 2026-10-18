@@ -18,6 +18,7 @@ import { parseReviewedSha } from '../lib/review-escalation.mjs';
 import { readStore, resolveScorecardStorePath } from './run-scorecard-store.mjs';
 import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { priorRedTeamRow, redTeamCommentPosted } from '../lib/red-team-evidence.mjs';
+import { redTeamEnabled } from '../lib/review-red-team-policy.mjs';
 
 export const REFERRAL_HOLD_MARKER = 'review paused:';
 export const GH_LIST_COMMENT_CAP = 100;
@@ -241,7 +242,7 @@ function owedRedTeamReservation(pr, { repo, env, redTeam: {
   commentsReadable = true, log = line => console.error(line),
 } = {} }) {
   try {
-    if (!repo || !sha(pr.headRefOid) || !Array.isArray(pr.comments) || !commentsReadable) return false;
+    if (!redTeamEnabled(env) || !repo || !sha(pr.headRefOid) || !Array.isArray(pr.comments) || !commentsReadable) return false;
     const file = JSON.parse(readFileSync(settingsPath, 'utf8'));
     if (!file || typeof file !== 'object' || Array.isArray(file)) return false;
     // The cascade's convenience reader skips platform read failures. Here a read failure must retain the hold.
