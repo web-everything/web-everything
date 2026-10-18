@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, existsSync
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { coronerNightDue, runNightlyCoronerJob, extractNightlyCoroner, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed, NIGHTLY_DEFAULTS, coronerDeadline } from '../nightly-coroner-job.mjs';
+import { coronerNightDue, runNightlyCoronerJob, extractNightlyCoroner, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed, NIGHTLY_DEFAULTS, coronerDeadline, publishCoronerFailure } from '../nightly-coroner-job.mjs';
 import { createJobStore, reattachTick, runJob, JOB_ID_ENV, JOB_ATTEMPT_ENV } from '../../lib/daemon-jobs-runtime.mjs';
 import { HEALTH_WATCH_JOB_KINDS, HEALTH_NIGHTLY_CORONER_KIND } from '../../../skills-src/conveyor/daemon-manifest.mjs';
 import { parseFeedLine } from '../../operations/needs-you-feed.mjs';
@@ -74,6 +74,34 @@ it('refuses corrupt records and suppresses fixture/dry-run execution', async () 
     expect(nightlyCoronerTickAllowed(flags, { enabled: true })).toBe(false);
   }
   expect(nightlyCoronerTickAllowed({}, { enabled: true })).toBe(true);
+});
+it('clears retained failed nights after a later successful night without republishing the failure', async () => {
+  const opts = jobOptions(temp());
+  const failed = await runNightlyCoronerJob({ ...opts, now: Date.parse('2026-10-17T02:17:00Z') });
+  opts.store.update(failed.enqueued, (r) => ({ ...r, job: { ...r.job, status: 'failed', error: 'lane unavailable' } }));
+  const failure = await runNightlyCoronerJob({ ...opts, now: Date.parse('2026-10-17T03:00:00Z') });
+  expect(failure.alerts).toHaveLength(1);
+  expect(failure.failures).toHaveLength(1);
+  const feed = readFileSync(opts.statusFeed, 'utf8');
+  const next = await runNightlyCoronerJob({ ...opts, now: Date.parse('2026-10-18T02:17:00Z') });
+  opts.store.update(next.enqueued, (r) => ({ ...r, job: { ...r.job, status: 'succeeded' } }));
+  for (const now of ['2026-10-18T03:00:00Z', '2026-10-18T04:00:00Z']) {
+    const result = await runNightlyCoronerJob({ ...opts, now: Date.parse(now) });
+    expect(result.alerts).toEqual([]);
+    expect(result.failures).toEqual([]);
+    expect(readFileSync(opts.statusFeed, 'utf8')).toBe(feed);
+  }
+  expect(opts.store.read(failed.enqueued).job.status).toBe('failed');
+});
+it('scrubs and bounds failure text before appending the raw feed line', () => {
+  const feed = join(temp(), 'feed.jsonl');
+  const secret = `ghp_${'a'.repeat(36)}`;
+  publishCoronerFailure({ id: 'nightly-coroner-2026-10-16', error: `${secret}\n\r\u2028\u2029\u202e${'x'.repeat(20000)}`, reason: 'attempts exhausted', attempts: 3, maxAttempts: 3 }, feed);
+  const line = readFileSync(feed, 'utf8').trim();
+  expect(line).not.toContain(secret);
+  expect(line).not.toMatch(/[\u2028\u2029\u202e]/);
+  expect(line.length).toBeLessThan(6000);
+  expect(parseFeedLine(line)).toMatchObject({ kind: 'coroner-failed', attempts: 3 });
 });
 function extraction(root) {
   const home = join(root, 'handoff'), dir = join(root, 'state'), lane = { lane: 7, holder: 'coroner-test', path: join(root, 'lane') };
@@ -168,16 +196,25 @@ it.each([
 ])('resolves the next ET morning deadline for %s', (night, expected) => {
   expect(new Date(coronerDeadline(night)).toISOString()).toBe(expected);
 });
-it('passes a positive normal lane-pool wait even for an invalid zero input', async () => {
+it.each(['02:00', '02:15', '02:30', '02:59'])('expires nonexistent ET deadline %s at the first valid instant after the gap', (deadline) => {
+  expect(new Date(coronerDeadline('2026-03-07', deadline)).toISOString()).toBe('2026-03-08T07:00:00.000Z');
+});
+it('chooses the first occurrence of an ambiguous ET deadline', () => {
+  expect(new Date(coronerDeadline('2026-10-31', '01:30')).toISOString()).toBe('2026-11-01T05:30:00.000Z');
+});
+it.each([
+  [undefined, 600000], [0, 600000], [-1, 600000], [123456, 123456],
+])('forwards laneWaitMs=%s as --wait-ms=%s', async (laneWaitMs, expected) => {
   const { input, io } = extraction(temp());
   delete io.acquire;
   io.run.mockResolvedValueOnce(JSON.stringify({ lane: 7, holder: 'test', path: join(io.root, 'lane') }));
-  await extractNightlyCoroner({ ...input, nightly: { laneWaitMs: 0 } }, io);
-  expect(io.run.mock.calls[0][0]).toContain('--wait-ms=600000');
+  await extractNightlyCoroner({ ...input, nightly: { laneWaitMs } }, io);
+  expect(io.run.mock.calls[0][0]).toContain(`--wait-ms=${expected}`);
 });
-async function driveNight({ failAlways = false, deadline = false } = {}) {
+async function driveNight({ failAlways = false, deadline = false, retryBackoffMin = 10 } = {}) {
   const root = temp(), { input, io } = extraction(root), opts = jobOptions(root);
   opts.dir = input.dir;
+  opts.config.retryBackoffMin = retryBackoffMin;
   let now = Date.parse(input.until);
   vi.spyOn(Date, 'now').mockImplementation(() => now);
   const promises = [];
@@ -199,13 +236,14 @@ async function driveNight({ failAlways = false, deadline = false } = {}) {
   await tick(); // first extraction fails
   await tick(); // dead child requeued with ten minute backoff
   const id = 'nightly-coroner-2026-10-16';
-  expect(opts.store.read(id).job.nextAttemptAt).toBe('2026-10-17T02:27:00.000Z');
+  expect(opts.store.read(id).job.nextAttemptAt).toBe(new Date(Date.parse(input.until) + retryBackoffMin * 60000).toISOString());
   if (deadline) now = coronerDeadline(input.night);
-  else now += 10 * 60000;
+  else now += retryBackoffMin * 60000;
   await tick();
   if (failAlways && !deadline) {
     await tick(); // backoff doubles after attempt two
-    now += 20 * 60000;
+    expect(opts.store.read(id).job.nextAttemptAt).toBe(new Date(now + 2 * retryBackoffMin * 60000).toISOString());
+    now += 2 * retryBackoffMin * 60000;
     await tick();
   }
   const result = await tick();
@@ -236,6 +274,23 @@ it('expires queued retries at the ET deadline without another extraction', async
   expect(record.job.status).toBe('failed');
   expect(record.job.error).toContain('deadline exceeded');
   expect(io.acquire).toHaveBeenCalledOnce();
+  expect(readFileSync(opts.statusFeed, 'utf8')).toContain('deadline exceeded');
+});
+it('uses a configured retry backoff and doubles it for the second retry', async () => {
+  const { record, io } = await driveNight({ failAlways: true, retryBackoffMin: 3 });
+  expect(record.job.status).toBe('failed');
+  expect(io.acquire).toHaveBeenCalledTimes(3);
+});
+it('expires a fresh late catch-up without acquiring a lane or launching extraction', async () => {
+  const root = temp(), opts = jobOptions(root), { io } = extraction(root);
+  const launch = vi.fn(() => { io.acquire(); });
+  const now = Date.parse('2026-10-17T08:00:00Z'); // 04:00 ET, after the 03:30 deadline
+  opts.reattach = (args) => reattachTick({ ...args, observation: { now, slept: false, gapMs: 0 }, launch });
+  const result = await runNightlyCoronerJob({ ...opts, now });
+  expect(launch).not.toHaveBeenCalled();
+  expect(io.acquire).not.toHaveBeenCalled();
+  expect(opts.store.read(result.enqueued).job).toMatchObject({ status: 'failed', attempts: 0, error: expect.stringContaining('deadline exceeded') });
+  expect(result.alerts).toHaveLength(1);
   expect(readFileSync(opts.statusFeed, 'utf8')).toContain('deadline exceeded');
 });
 it('alerts on the configured consecutive probe failure threshold and resets on success', () => {

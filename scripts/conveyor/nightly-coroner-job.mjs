@@ -13,7 +13,8 @@ import { TERMINAL_JOB_STATUSES } from '../operations/job-record.mjs';
 import { readGit } from '../lib/proc-read.mjs';
 import { cascadePolicy, formatCascadeSourcesLine, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { handoffHome } from '../operations/handoff-home.mjs';
-import { feedPath, appendLines } from '../operations/needs-you-feed.mjs';
+import { feedPath, appendLines, sanitizeForFeed } from '../operations/needs-you-feed.mjs';
+import { scrubText } from './health-watch-core.mjs';
 import { prSweepTickAllowed } from './pr-sweep-job.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -61,25 +62,40 @@ export function coronerDeadline(night, deadlineEt = NIGHTLY_DEFAULTS.deadlineEt)
   if (!validTime(deadlineEt)) throw new Error('invalid coroner.nightly.deadlineEt');
   const next = new Date(Date.parse(`${night}T12:00:00Z`) + 86400000);
   const target = Date.UTC(next.getUTCFullYear(), next.getUTCMonth(), next.getUTCDate(), ...deadlineEt.split(':').map(Number));
+  const formatter = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York',
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  });
+  const wallAt = (instant) => {
+    const parts = Object.fromEntries(formatter.formatToParts(instant).map(({ type, value }) => [type, value]));
+    return Date.UTC(+parts.year, +parts.month - 1, +parts.day, +parts.hour, +parts.minute);
+  };
   let instant = target;
   for (let i = 0; i < 4; i++) {
-    const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York',
-      year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
-    }).formatToParts(instant).map(({ type, value }) => [type, value]));
-    const wall = Date.UTC(+parts.year, +parts.month - 1, +parts.day, +parts.hour, +parts.minute);
+    const wall = wallAt(instant);
     if (wall === target) return instant;
     instant += target - wall;
   }
   // A nonexistent spring-forward wall time expires at the first valid time after the gap.
-  return Math.max(instant, instant + 3600000);
+  // Offset iteration straddles the one-hour New York gap; find its transition boundary in minutes.
+  let low = instant, high = instant + 3600000;
+  while (high - low > 60000) {
+    const mid = low + Math.floor((high - low) / 120000) * 60000;
+    if (wallAt(mid) >= target) high = mid;
+    else low = mid;
+  }
+  return high;
 }
 
 export function publishCoronerFailure({ id, error, attempts, maxAttempts, reason }, statusFeed = feedPath()) {
+  const text = (value, max) => sanitizeForFeed(scrubText(value), max);
+  id = text(id, 128);
   const marker = `NEEDS-YOU nightly-coroner ${id} failed`;
   let feed = '';
   try { feed = readFileSync(statusFeed, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
   if (!feed.split('\n').some((line) => line.startsWith(`${marker} `))) {
-    appendLines(statusFeed, [`${marker} — ${JSON.stringify({ at: new Date().toISOString(), kind: 'coroner-failed', job: id, error, attempts, maxAttempts, reason })}`]);
+    appendLines(statusFeed, [`${marker} — ${JSON.stringify({ at: new Date().toISOString(), kind: 'coroner-failed', job: id,
+      error: text(error, 512), attempts: typeof attempts === 'number' ? attempts : text(attempts, 40),
+      maxAttempts: typeof maxAttempts === 'number' ? maxAttempts : text(maxAttempts, 40), reason: text(reason, 100) })}`]);
   }
 }
 
@@ -110,7 +126,9 @@ export async function runNightlyCoronerJob({ now, config, settings, dir, env = p
   const current = store.list().records;
   try { evict({ jobsDir: store.dir, referenced: current.filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status)).flatMap((r) => r.job.snapshotKeys ?? []) }); }
   catch (e) { log(`nightly-coroner eviction: ${e.message}`); }
-  const failures = current.filter((r) => r.job.kind === HEALTH_NIGHTLY_CORONER_KIND.kind &&
+  // Daily records are a permanent ledger. Only the currently due night owns an active alert;
+  // advancing to the next night closes the previous health episode without deleting its record or feed event.
+  const failures = current.filter((r) => r.job.kind === HEALTH_NIGHTLY_CORONER_KIND.kind && r.input.night === night &&
     r.job.status !== 'succeeded' && (r.job.status === 'failed' || now >= coronerDeadline(r.input.night, r.input.nightly?.deadlineEt ?? config.deadlineEt)))
     .map((r) => ({ id: r.id, error: r.job.error ?? 'not completed', attempts: r.job.attempts, maxAttempts: r.job.maxAttempts,
       reason: r.job.status === 'failed' ? 'attempts exhausted or launch failed' : 'ET deadline missed' }));

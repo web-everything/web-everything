@@ -1132,7 +1132,9 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   if (nightlyCoronerTickAllowed(flags, coronerSettings.value)) {
     const coroner = await attempt('nightlyCoronerJob', async () => {
       const out = await (deps.runNightlyCoronerJob ?? runNightlyCoronerJob)({ now, config: coronerSettings.value, settings: coronerSettings, dir });
-      const errors = [...coronerSettings.errors, ...(out.failures ?? [])];
+      // A terminal job failure already has its own event and health subject. Only supervisor/config
+      // errors count toward the probe streak; reading a failed job successfully is a healthy probe.
+      const errors = coronerSettings.errors;
       if (errors.length) probeErrors.nightlyCoronerJob = scrubText(errors.join('; '));
       return out;
     });
