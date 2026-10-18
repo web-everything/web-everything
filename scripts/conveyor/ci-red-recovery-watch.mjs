@@ -56,6 +56,8 @@
  * SAME requirement every other conveyor dispatcher in this directory already has, e.g.
  * `we:scripts/operations/dispatch-lane-io.mjs#REPO_ROOT`) — it fetches the lane ref and pushes the rebuilt tip.
  */
+import { readFixPush } from './fix-push-state.mjs';
+import { resolveHandoffSettings } from '../lib/handoff-settings.mjs';
 import { resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
@@ -1241,7 +1243,7 @@ export function sweepMissingRunRecovery({
     ? defaultReadAttributedRequiredChecks : readRequiredContexts,
   readHeadCommittedAt = defaultReadHeadCommittedAt, readDeclaredContexts = defaultReadDeclaredContexts,
   readComments = defaultReadPrComments, trigger = triggerCiForPr, postComment = defaultPostMissingRunComment,
-  clearLabel = clearStaleCheckingLabel, thresholdMs = DEFAULT_MISSING_RUN_THRESHOLD_MS,
+  readPush = readFixPush, clearLabel = clearStaleCheckingLabel, thresholdMs = resolveHandoffSettings().value.ciMissingAfterPushMin * 60_000,
   maxRetriesPerSha = resolveRecoveryCaps().missingRunRetriesPerSha, maxRetriesPerPr = maxRetriesPerSha, now = Date.now(),
 } = {}) {
   // #2793 — `mergeable` added so {@link buildMissingRunCandidates} can exclude a real merge conflict (never a
@@ -1282,7 +1284,7 @@ export function sweepMissingRunRecovery({
   // to (zero required-check rollup entries at all) — mirrors {@link sweepCiRedRecovery}/{@link sweepHungCiRecovery}'s
   // own "pay for it only when needed" discipline; never one extra `gh` call per ordinary open PR on every tick.
   const candidates = rawCandidates.map((c) => {
-    const headCommittedAt = readHeadCommittedAt(c.headSha, { repo });
+    const headCommittedAt = readPush({ repo: repoSlug(repo), pr: c.prNumber, head: c.headSha })?.pushedAt ?? readHeadCommittedAt(c.headSha, { repo });
     const comments = readComments(c.prNumber, { repo });
     return {
       ...c, headCommittedAt, triggerAttemptsForSha: countMissingRunComments(comments, c.headSha, { baseRefName: c.baseRefName, mainRedWindows, mainGreen, defaultBranch }),
