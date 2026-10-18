@@ -127,6 +127,57 @@ The observed comments and live reviews wake a pending head when their evidence c
 otherwise a recorded break waits until its retry deadline, including after the health-smell
 age. Only missing-result scheduling gaps retain the maximum-age scheduling fallback.
 
+## Heavy admission in a restricted filesystem
+
+The host queue needs write access to the admission pool's parent as well as the pool:
+`releaseLockDirIf` atomically renames a lock to a sibling tombstone before removal.
+An `EPERM` on that rename is an admission infrastructure failure, not a suite result.
+Keep the host queue; do not switch to a private pool or run tests directly.
+
+## Prepare throughput
+
+Prepare batches use `prepare.batchSize` (6) and the just-in-time window uses
+`prepare.aheadCount` (20), standard → platform `prepare` → tool `prepare` → env
+(`WE_PREPARE_BATCH_SIZE`, `WE_PREPARE_AHEAD_COUNT`). Effective values and sources are logged.
+An explicit `--prepare-ahead-window` or `WE_BUILD_DAEMON_PREPARE_AHEAD_WINDOW`
+overrides that cascade. Resolve it once per tick for planning, replanning, and batch
+membership; `off` disables the window while keeping queued cards eligible for batches.
+Only build-bound cards in that window are eligible, including stale stamps. Order is
+`build.priority`, then ready-queue order. Batch members must belong to the same repository
+and have disjoint scopes. Every card gets a fresh worker launch containing only its own
+card and scope, and one commit. `prepare.batchParallel` (true) uses separate leased lanes;
+`prepare.batchMaxParallel` (3) limits fan-out to the builder external concurrency cap.
+Both follow the same cascade with `WE_PREPARE_BATCH_PARALLEL` and
+`WE_PREPARE_BATCH_MAX_PARALLEL` overrides, logging effective values and sources.
+Sequential mode still launches a fresh worker per card. Worker IO and gates carry the
+card session identity; assembly reuses the first surviving card's lane and identity
+so verify-lane observes its own lease. Local `lane/prep-<card>` refs
+retain individual commits and never open PRs. An assembler lane cherry-picks them in
+priority order onto `lane/prepare-batch-<first-id>-<n>`; conflicts are aborted with rerere
+disabled and the card is deferred to the next batch, without manual resolution.
+Only cherry-pick conflicts enter `deferredToNextBatch`: the daemon releases deferred lead/member
+claims without a failure hold, then admits them again on the next tick. Each surviving card
+passes its own checks and receives its own stamp; a failed card is restored and its reason
+recorded in the batch result and PR body. One PR is titled `prepare: <ids>`.
+Worker failures stay in `groupDropped` and enter the normal prepare failure/hold path,
+including failed leads and members. A failed assembly gate or publication accounts for
+every undelivered card except conflicts. Test consecutive ticks to prevent immediate
+readmission; replay `prepare-batch-window-and-failure-accounting` for both cases.
+The batch branch uses the first surviving card and surviving count; status reads require
+that branch to agree with the exact title membership. Preserve the original group lead
+in settlement fixtures, including when that lead failed but a member has a stamped OPEN PR.
+Redact diagnostics before any head/tail limit and again at the public body writer;
+replay `prepare-batch-publication-boundaries` for credential cuts and claim retirement.
+
+`review.cardOnly.lightLane` (true) seats one blocking Codex correctness juror for a net
+diff containing only direct `backlog/*.md` cards. `review.cardOnly.claudeSeat` (false)
+adds a Claude seat when enabled. Both resolve standard → platform `review.cardOnly` →
+tool `review.json` `cardOnly` → environment (`WE_REVIEW_CARD_ONLY_LIGHT_LANE`,
+`WE_REVIEW_CARD_ONLY_CLAUDE_SEAT`), logging sources. Rename sources participate;
+unreadable/empty lists keep the full roster. The pinned net read must confirm the
+classification before judging, and resumes retain the saved roster.
+The existing `redTeam.skipCardOnly` cascade and CI card-only path filter are reused.
+
 ## Codex usage accounting
 
 Every direct task, Codex delivery/fix worker, wrapped Codex dispatch worker, and Codex review
@@ -1322,7 +1373,8 @@ remain active, including concurrency 1. Re-read live queue depth/capacity before
 reserve room for active siblings; retain the round attempt budget for ambiguous outcomes.
 A batching deferral stops new starts but lets existing children finish their locked admission checks.
 Probe busy scheduling from round completion with room and an unqueued runnable PR, and full-interval
-scheduling with a full queue or backed-off work. Suppress duplicate event wakes for active PRs;
+scheduling with a full queue or backed-off work. Never start a second drain for an active PR; a
+wake that arrives during its run stays pending until the run ends, unless that run verified the enqueue;
 shutdown must kill every child and prevent further starts. Inject all GitHub reads in these tests.
 
 ## Referral rulings answering stand-downs
@@ -1505,7 +1557,7 @@ Before finalizing prepare picks, inspect the actual planned picks using
 planner's prepare exclusions and re-plan the same tick so the next candidate gets the
 slot. Inspect selected group members before finalizing groups, refilling groups after
 cooldown skips. Share the same lookahead budget between leads and members; never scan
-the entire grouping pool. Bound it to eight distinct cards (at most 24 listing calls), leaving
+the entire grouping pool. Bound it to eight distinct cards (at most 32 listing calls), leaving
 the shared tick budget available for launch guards. Log the elapsed minutes and PR number.
 Picks outside that window still pass the final launch guard. Replay a merge 20 minutes
 ago with one slot and a clean second candidate; include grouped members, hash aliases,
@@ -1515,6 +1567,29 @@ listing-budget refusals. Also cover consecutive merged picks and group members b
 the lookahead limit, with uninspected replacements still passing final launch admission.
 
 ### Build dispatch launch lifetime and prepare discovery
+
+Dispatch confirmation consumes the real `run.mjs --json` envelope, not a synthetic full run. The
+dispatch-lane envelope includes persisted effect receipts (`key`, `type`, `status`, `handle`, `error`);
+an in-flight key alone does not prove a launch. Keep the serializer → daemon parser regression in
+`build-dispatch-non-blocking-launch.test.mjs`. Live 2026-10-17, #4413/#4415 workers had PID receipts,
+but the CLI omitted effects, making the primary confirmation falsely fail before live-session rescue.
+The launch timeout was not involved. Both cards were real WE prevention stories scoped to lease-reaper tests.
+
+Persist detached build launch failures before planning another launch in the same tick. Count unconfirmed
+launches by card and launch base (the dispatch checkout HEAD, carried in the pending record); unknown
+bases share a conservative bucket. At `build.unconfirmedLaunchMax` (2), hold for
+`build.unconfirmedCooldownMin` (120) and expose a durable needs-you row with the card, base and last
+redacted evidence. Both leaves use standard → platform `build` → tool `build` → environment
+(`WE_BUILD_UNCONFIRMED_LAUNCH_MAX`, `WE_BUILD_UNCONFIRMED_COOLDOWN_MIN`), with source logging.
+Replay two unconfirmed launches through detached settlement, restart, cooldown expiry and changed bases.
+Attempt exhaustion takes precedence over the unconfirmed cooldown: replay mixed failures with the last
+unconfirmed launch reaching the attempt cap, then verify the hold survives cooldown expiry until re-arm.
+Guard the shared CLI/HTTP `outcomePayload` with secret-bearing dispatch error and handle fixtures;
+new receipt fields require explicit payload assertions. Exercise raw producer envelopes too, since the
+daemon parser must scrub effect errors and verdict reasons independently. Detached settlement must
+redact stdout/stderr before truncating excerpts and attaching them to tick failure reasons. Decode
+JSON string values before scrubbing; omit undecodable structured excerpts so escaped credentials
+cannot return through the parse-error fallback.
 
 Launch admission and launch confirmation do not prove delivery. Retain the build failure ledger across
 both, including daemon restarts; clear it only after observing a delivering PR. Before releasing an
@@ -1534,7 +1609,8 @@ Group member claims (`member:`) are aliases on both paths too: orphan adoption c
 before the fail-group pass looks, but the member claims survive.
 
 Prepare discovery searches each card's current lane identity, bornAs lane identity and title, then
-unions the complete results. Never use an unfiltered repository PR listing as the launch guard's proof
+unions the complete results. The title is searched under both ids: a batch published before numbering
+names only the bornAs id, and its `lane/prepare-batch-<lead>-<n>` branch matches no per-id head search. Never use an unfiltered repository PR listing as the launch guard's proof
 of absence. Cache component failures for the tick as well as successes. The prepare policy leaf
 `maxPrListingCallsPerTick` defaults to 128, resolves through standard/platform/tool/env, and logs its
 source; `WE_PREPARE_MAX_PR_LISTING_CALLS_PER_TICK` overrides it. Prefetch and lazy readers share the
@@ -1767,6 +1843,63 @@ critical miss on its exact provider/model/prepare triple, an active provider quo
 or an unreadable trial history skips it for full preparation by the dispatched worker.
 Prompt evidence uses the shared `fenceUntrusted` helper and `FENCED_DATA_RULE`; test
 closing-tag injection in both the card and diff, including mixed case and whitespace.
+
+## Drain CI pre-stage
+
+The drain caches non-CI gate dispositions for accepted pending heads carrying `ready-to-merge` in coordination storage,
+bound to repo, PR and head. Green check events may consume this preparation before listing;
+head, label, body/base changes and TTL expiry require the full fast drain. So do the live fields the full
+classifier reads that move no cached signature: a `CHANGES_REQUESTED`/`REVIEW_REQUIRED` review decision,
+`mergeable` other than `MERGEABLE`, and a merge state other than `CLEAN`, `UNSTABLE` or `BLOCKED`. The required
+set is GitHub's queue-required checks plus the drain's own `--check` (`prestageRequiredChecks`): a failed selected
+check is never prepared, and the green event re-checks the `--check` it was invoked with. It reads that check
+through the same full read as the listing (`resolveRequiredCheck`, past gh's 100-context rollup cap); a failed
+full read falls back. Every required
+context needs its own successful row before enqueue; missing, pending, cancelled and red
+contexts never authorize enqueue. A newly failed optional CodeQL check also vetoes admission when
+`drainBlocksOnCodeQL` is enabled. Red-team evidence and the complete comment thread are re-read at enqueue;
+the cache never substitutes for live release-label or red-team authorization. `checking` alone is ineligible,
+including at the event wake boundary. Cached admission also reads the live fix claim before admission and
+again inside the locked enqueue callback: a claim acquired while waiting for the lock must still veto enqueue.
+`enqueuePrestage` owns that in-lock re-read (`fixClaimHeld`), the cascade's pre-landing steps (`beforeEnqueue`:
+the review-coverage notice and the stacked-PR retarget) and the post-enqueue ledger facts (`recordLanded`,
+the same recorder the cascade calls after a confirmed enqueue: exemption, restamp, drain-hold release); it
+refuses the shortcut when any of them is not wired.
+Check-event marks lack required-context identity and head SHA: preserve pending wakes on non-success marks,
+then let the live required-check read drop red preparation. Coupled candidates, manifest-carrying heads and branches requiring preparation
+keep the full cascade. Keep pre-stage tests separate from ordinary classification tests:
+preparation may evaluate the remaining gates while CI is pending, but must leave the real
+merge cascade before any enqueue. Regression home: `scripts/lib/__tests__/drain-prestage.test.mjs`.
+
+Pre-stage regression contracts (PR #5480): every enqueue entry point must cover throwing mutations
+(including required-workflow, conflict and unreadable-state failures). A shortcut refusal drops its cache
+and falls back without installing backoff that hides the error from ordinary cascade recovery. Keep
+table-driven coverage of every GitHub check conclusion at the `enqueuePrestage` boundary (not only at
+preparation), missing release labels, evidence added after
+preparation, optional CodeQL failures, coupled candidates and branch preparation. Include claims acquired
+after preparation, unreadable claim readers, and exceptions propagated through an async lock. The CLI fixture must
+assert pending manifest candidates cause no head writes or review writes, including a stale acceptance.
+The provisional `merge` disposition is used only to evaluate gates: collision healing, manifest rebuilding,
+review-label provisioning, clearance carry, baseline/ledger writes, parking and skip comments must suppress
+writes for `prestagePendingCi`; the actual merge set excludes these candidates.
+
+Source-contract tests for review writes must follow `candidateDryRun` and assert that it includes both
+`DRY_RUN` and `prestagePendingCi`. Queue fixtures must record membership only after a successful enqueue
+response; recording a refused mutation as queued masks the ordinary recovery attempt with an idempotent success.
+
+Prevention follow-up owed by this review: add an enqueue-call lint that recognizes both enclosing
+try/catch and callbacks protected by `enqueuePrestage`. It must flag unprotected `mergeStrategy.enqueue`
+calls without treating the protected callback as an uncaught call. The throwing-entry-point regression
+contracts above are the immediate guard; the repository-wide lint remains separate tooling work.
+
+The green-event shortcut must honor the full drain's resolved `--repos` / `--this-repo`
+selection and exact `--label` / `--base` filters before consuming preparation. The listing and the
+shortcut share one selection predicate (`operatorSelects`), so a new filter cannot reach only one path.
+CLI regressions must pair excluded scopes (WE#42 under `--repos=frontier-ui/frontierui`, including the short
+repo alias, cached main preparation under `--this-repo --base=release`, and cached `ready-to-merge`
+preparation under `--label=other`) with matching scopes that still enqueue without listing. Excluded
+repo/label/base scopes preserve preparation. A green mark that arrives while its PR's fast drain runs
+must wake it again after that run (`enqueue-on-event.test.mjs`, "pre-staged green events").
 
 ## Review scratch disk retention
 
