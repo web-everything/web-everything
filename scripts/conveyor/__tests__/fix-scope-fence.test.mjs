@@ -300,10 +300,11 @@ describe('the live scope fence adapter over a real repository', () => {
     return { dir, git, port, write, commit };
   }
   /** The live adapter against a fake GitHub: the PR head and base, one marker commit, and the compare verdict for a merged commit. */
-  function liveFence(repo, { head, sha, base = null, compare = 'ahead', port = repo.port, scoped = 'guard.mjs' }) {
+  function liveFence(repo, { head, sha, base = null, compare = 'ahead', port = repo.port, scoped = 'guard.mjs', fork = '' }) {
     const writes = [], compares = [];
     const exec = (file, args) => {
       expect(file).toBe('gh');
+      if (args.includes('.merge_base_commit.sha')) return `${fork}\n`;
       if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefName: 'lane/scope-fence', headRefOid: head, baseRefOid: base });
       if (args[0] === 'api' && args[1] === 'graphql') return `1\n${head}\tremoval\\n\\nscope-removed: cdLandings\n`;
       if (args[0] === 'api' && /\/compare\//.test(args[1])) {
@@ -358,7 +359,8 @@ describe('the live scope fence adapter over a real repository', () => {
     try {
       mkdirSync(join(r.dir, 'lib')); r.write('lib/a.mjs', 'a();\n'); const head = r.commit('initial');
       r.write('lib/b.mjs', 'b();\n'); const sha = r.commit('fixer adds a file under the declared directory');
-      const { result, push } = liveFence(r, { head, sha, base: head, scoped: 'lib' });
+      // The live base tip need not be in the lane: GitHub names the fork commit, an ancestor of the head.
+      const { result, push } = liveFence(r, { head, sha, base: 'f'.repeat(40), fork: head, scoped: 'lib' });
       expect(result.ok).toBe(true);
       expect(push).toHaveBeenCalledOnce();
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
@@ -369,8 +371,8 @@ describe('the live scope fence adapter over a real repository', () => {
       r.write('guard.mjs', 'safe();\n'); r.write('tool', '#!/bin/sh\n'); const base = r.commit('base');
       r.git(['rm', '-q', 'tool']); mkdirSync(join(r.dir, 'tool')); r.write('tool/a.mjs', 'a();\n'); const head = r.commit('build replaced the file');
       r.write('tool/payload.mjs', 'payload();\n'); const sha = r.commit('fixer grows the undeclared subtree');
-      for (const known of [base, null]) {
-        const { result, push } = liveFence(r, { head, sha, base: known, scoped: 'tool' });
+      for (const fork of [base, '']) {
+        const { result, push } = liveFence(r, { head, sha, base: 'f'.repeat(40), fork, scoped: 'tool' });
         expect(result).toMatchObject({ ok: false, scopeFence: true, terminal: true });
         expect(result.reason).toContain('outside declared scope: tool/payload.mjs');
         expect(push).not.toHaveBeenCalled();

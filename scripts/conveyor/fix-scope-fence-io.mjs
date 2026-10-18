@@ -151,16 +151,18 @@ export function createScopeFencedPush({ root, exec = execFileSync, env = process
       const added = (from, to, pathspec = []) => removed.length ? addedLines(git([...FENCE_DIFF, '-U0', from, to, '--', ...pathspec])) : [];
       const merged = mergedBase({ git, gh: budgetGh, repo, head, sha, base });
       const paths = mergeScopePaths({ git, names, head, sha, merged });
-      // An extensionless scope entry covers a subtree only where the PR head has a directory that was not a file where the
-      // PR forked from its base: agents wrote the head, so a file the PR itself replaced stays exact. No fork point → exact.
-      let fork = null;
-      if (OID.test(String(base ?? ''))) {
-        try { fork = git(['merge-base', head, base]).trim(); } catch (e) { if (e.status !== 1 && e.status !== 128) throw e; }
+      // An extensionless scope entry covers a subtree only where it was a directory at the commit GitHub reports the PR
+      // forked from (an ancestor of the head, so local). Agents wrote the head: a file the PR replaced, or a path it
+      // created, stays one exact file. No fork point → exact.
+      const bare = declaredScopePaths(context.scope, context.repo).filter(s => isSubtreeEntry(s) && !/\/$|[*?]/.test(s));
+      let fork = '';
+      if (bare.length && OID.test(String(base ?? ''))) {
+        try { fork = budgetGh(['api', `repos/${repo}/compare/${base}...${head}`, '--jq', '.merge_base_commit.sha']).trim(); } catch (e) {
+          if (!/HTTP (?:404|422)/.test(String(e?.stderr ?? e?.message ?? e))) throw e;
+        }
       }
-      const entryType = (rev, s) => git(['ls-tree', '--full-name', '-z', rev, '--', `:(top,literal)${s}`]).split('\0')
-        .find(r => r.slice(r.indexOf('\t') + 1) === s)?.split(' ')[1];
-      const directories = !fork ? [] : declaredScopePaths(context.scope, context.repo).filter(s => isSubtreeEntry(s) && !/\/$|[*?]/.test(s))
-        .filter(s => entryType(head, s) === 'tree' && entryType(fork, s) !== 'blob');
+      const directories = !OID.test(fork) ? [] : bare.filter(s => git(['ls-tree', '--full-name', '-z', fork, '--', `:(top,literal)${s}`])
+        .split('\0').some(r => r.slice(r.indexOf('\t') + 1) === s && r.split(' ')[1] === 'tree'));
       if (!merged) return { paths, additions: added(head, sha), directories };
       // Identifier exclusions also guard conflict resolutions that restore an operator removal. This is separate from
       // file scope. Never replay a merge using the lane's fixer-writable config and attributes.
