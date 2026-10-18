@@ -119,7 +119,7 @@ export async function extractNightlyCoroner({ night, until, dir, settings, sourc
       const metrics = JSON.parse(await run([realpathSync(join(lane.path, 'scripts/operations/coroner-extract.mjs')), ...args, '--no-save'], lane.path));
       let falseFindings = null;
       const optional = join(lane.path, 'scripts/operations/coroner-false-findings.mjs');
-      if (existsSync(optional)) falseFindings = JSON.parse(await run([realpathSync(optional), ...args], lane.path));
+      if (existsSync(optional)) falseFindings = JSON.parse(await run([realpathSync(optional), '--since', since, '--json'], lane.path));
       window = { since, until };
       const rate = (value) => value ? `${value.count}/${value.total} (${value.pct}%)` : 'unavailable';
       const fence = '```';

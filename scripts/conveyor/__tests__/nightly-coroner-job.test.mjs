@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { coronerNightDue, runNightlyCoronerJob, extractNightlyCoroner, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed } from '../nightly-coroner-job.mjs';
 import { createJobStore } from '../../lib/daemon-jobs-runtime.mjs';
+import { runFalseFindings } from '../../operations/coroner-false-findings.mjs';
 import { HEALTH_WATCH_JOB_KINDS, HEALTH_NIGHTLY_CORONER_KIND } from '../../../skills-src/conveyor/daemon-manifest.mjs';
 const roots = [];
 const temp = () => { const root = mkdtempSync(join(tmpdir(), 'nightly-coroner-')); roots.push(root); return root; };
@@ -143,6 +144,21 @@ it('runs the optional false-findings extractor when present', async () => {
   await extractNightlyCoroner(input, io);
   expect(io.run).toHaveBeenCalledTimes(2);
   expect(io.run.mock.calls[1][0][0]).toContain('coroner-false-findings.mjs');
+});
+it('builds accepted false-findings argv while preserving the report window and cursor', async () => {
+  const { input, io } = extraction(temp());
+  writeFileSync(join((await io.acquire()).path, 'scripts/operations/coroner-false-findings.mjs'), '');
+  const result = await extractNightlyCoroner(input, io);
+  const [, ...argv] = io.run.mock.calls[1][0];
+  const now = '2026-10-17T02:18:00.000Z';
+  const collect = vi.fn(() => ({ count: 0 }));
+  const parsed = runFalseFindings(argv, { now, env: {}, io: { readFileSync: () => '' }, collect });
+  expect(JSON.parse(parsed.output)).toEqual({ window: { since: result.window.since, until: now }, count: 0 });
+  expect(collect).toHaveBeenCalledWith({ since: result.window.since, until: now }, { shadowRows: [] });
+  expect(io.run.mock.calls[0][0]).toContain('--until');
+  expect(result.window.until).toBe(input.until);
+  expect(readFileSync(join(io.home, result.report), 'utf8')).toContain(`Window: ${result.window.since} → ${input.until}`);
+  expect(JSON.parse(readFileSync(join(input.dir, 'nightly-coroner-cursor.json'), 'utf8')).lastEnd).toBe(input.until);
 });
 it('publishes real deterministic extraction output from isolated inputs', async () => {
   const { runCoroner } = await import('../../operations/coroner-extract.mjs');
