@@ -22,6 +22,7 @@ import { execFileSync } from 'node:child_process';
 import { buildPrRounds, normalizeComment, classifyEvent } from '../operations/coroner-rounds.mjs';
 import { scrubPublish } from '../lib/secret-scrub.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
+import { readPinnedPrContext, readSnapshotPrView } from '../lib/review-pr-snapshot.mjs';
 
 export const ROUND_HISTORY_MAX_CHARS = 8000;
 export const ROUND_HISTORY_MAX_FINDINGS = 8;
@@ -140,12 +141,14 @@ export function withRoundHistory(prompt, section) {
  * one `gh pr view` read of commits and refs, mapped to the coroner's input shape. Returns null on any failure — the
  * history is best effort and must never block a fix dispatch.
  */
-export function readRoundHistoryInputs({ pr, repoSlug, exec = execFileSync, readComments = readCompletePrComments }) {
+export function readRoundHistoryInputs({ pr, repoSlug, headSha, exec = execFileSync, readComments = readCompletePrComments, snapshotOptions = {} }) {
   try {
-    const comments = readComments(pr, { repo: repoSlug });
-    const raw = exec('gh', ['pr', 'view', String(pr), '--repo', repoSlug, '--json', 'commits,baseRefName,headRefName'],
-      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 64 * 1024 * 1024 });
-    const j = JSON.parse(raw);
+    // These comments also feed repeated-finding guards: they must stay live.
+    const comments = readComments(pr, { repo: repoSlug, exec });
+    const run = args => exec('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 64 * 1024 * 1024 });
+    const j = headSha
+      ? readPinnedPrContext({ ...snapshotOptions, repo: repoSlug, pr, headSha, exec: run })
+      : readSnapshotPrView({ ...snapshotOptions, repo: repoSlug, pr, fields: ['commits', 'baseRefName', 'headRefName'], exec: run });
     return {
       comments: Array.isArray(comments) ? comments : [],
       commits: (Array.isArray(j.commits) ? j.commits : []).map((c) => ({ sha: c.oid, commit: { committer: { date: c.committedDate } }, parents: (c.parents ?? []).map((p) => ({ sha: p.oid })) })),

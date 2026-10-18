@@ -37,6 +37,32 @@ bases also stay live: the current main/stack can change without the PR head movi
 Missing, expired, corrupt or unwritable caches fall back to fresh PR fields.
 Focused coverage: `scripts/lib/__tests__/review-pr-snapshot.test.mjs`.
 
+## Shared PR context for jurors and fixers
+
+`review-pr-snapshot.mjs#readPinnedPrContext` shares informational body/files/commits/refs
+and comments by host + repo + PR + full examined head SHA, with atomic publication and
+a cross-process refresh lock. `scripts/pr-context.mjs <PR> --repo=<slug> --head=<full SHA>`
+is the agent read port; it and the fix context pack use the complete paginated comment
+reader, and cache that completeness separately from the CLI's capped comment connection.
+A miss reads comments before the final view, rejects a mismatched PR/head, and never stores
+a failed read. A different head selects a different file. An expired entry never serves.
+The TTL uses the existing source-logged `review.prSnapshot.ttlMs` cascade documented above;
+no separate context TTL or off-switch exists.
+
+`review-pr-io.mjs#ghPrView` and unpinned `review-detail` reads remain live and seed this
+context from their response. Juror requests carry the actual PR, examined SHA and absolute
+WE script path, so sibling-repo jurors can use the same port. Fix/CI dispatchers pass their
+planned head to the pack. Round history shares commit context, while its complete thread
+stays live because repeated-finding guards consume it. All label, merge, CI, head-revalidation
+and pre-mutation authority reads remain live; cached context cannot grant permission to act.
+Net/stack diffs continue using live bases. The older immutable-field adapter retains its
+head + base discriminator and live-metadata behavior.
+
+Regression coverage: `scripts/lib/__tests__/pr-context-sharing.test.mjs` stubs gh and counts
+calls across separate readers, changed heads, expiration, failures, context packs, the CLI,
+review detail and juror request construction. The source scan inventory is in
+[pr-read-inventory.md](pr-read-inventory.md).
+
 ## Review fetch sharing
 
 The review daemon scopes `review.fetch.sharedPerTick` (default `true`) to one tick through

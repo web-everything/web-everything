@@ -1,4 +1,5 @@
-/** Shared immutable PR fields (files, commits and optional gh diff). Mutable metadata is fetched on EVERY read.
+/** Shared PR reads: immutable fields keep live metadata; explicitly head-pinned
+ * informational context is TTL bounded. Authority readers always fetch live.
  * review.prSnapshot.ttlMs: standard 120000 < platform review.prSnapshot <
  * review-settings.json prSnapshot < WE_REVIEW_PR_SNAPSHOT_TTL_MS; 0 disables.
  * Diff bases can move without a push: baseRefOid is an additional discriminator.
@@ -11,12 +12,83 @@ import { fileURLToPath } from 'node:url';
 import { cascadePolicy, platformPreference } from './policy-cascade.mjs';
 import { defaultPoolRoot } from './lane-pool-paths.mjs';
 import { isUnderTest } from './under-test.mjs';
+import { withFileLock, writeJsonAtomic } from './atomic-json-file.mjs';
+import { PR_VIEW_FIELDS } from './pr-view-transport.mjs';
 
 const ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const IMMUTABLE = new Set(['files', 'commits', 'diff']);
 const validPart = (field, value) => field === 'diff' ? typeof value === 'string' : Array.isArray(value);
 const sha = v => typeof v === 'string' && /^[a-f0-9]{40,64}$/i.test(v);
 const readJson = path => { try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; } };
+
+// Informational context only. Never substitute this for label/merge/write authority or
+// a live head check. A caller must supply the head its work order is examining.
+export const PR_CONTEXT_FIELDS = Object.freeze([...new Set([
+  ...PR_VIEW_FIELDS, 'headRefOid', 'baseRefOid', 'baseRefName', 'commits',
+])]);
+
+/** Authority-bearing review entry reads stay LIVE, while seeding context for
+ * downstream jurors. No second gh call is needed to publish the same response. */
+export function readLivePrContext({ repo, pr, exec, ...options } = {}) {
+  const view = JSON.parse(String(exec(['pr', 'view', String(pr), '--repo', repo, '--json', PR_CONTEXT_FIELDS.join(',')])));
+  if (sha(view?.headRefOid) && Number(view.number) === Number(pr)
+    && Array.isArray(view.files) && Array.isArray(view.comments)) {
+    // A fresh authority read must also replace old same-head context.
+    try { readPinnedPrContext({ ...options, repo, pr, headSha: view.headRefOid, exec: () => JSON.stringify(view), refresh: true }); }
+    catch { /* Cache IO/lock failure must not fail a successful live authority read. */ }
+  }
+  return view;
+}
+
+/** Share contextual PR reads across jurors/fixers, with no gh probe on a hit.
+ * The explicit head is part of the key AND checked against a miss's response.
+ * readComments, when supplied, proves a complete REST thread (never a list snapshot).
+ * Read it before the view, so the final view also checks for a push during that read.
+ */
+export function readPinnedPrContext({ repo, pr, headSha, exec, readComments,
+  env = process.env, dir, now = Date.now, settings = resolvePrSnapshotSettings({ env }), refresh = false,
+} = {}) {
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !Number.isSafeInteger(Number(pr)) || Number(pr) <= 0 || !sha(headSha)) {
+    throw new Error('pr-context: repo, positive PR and full head SHA are required');
+  }
+  headSha = headSha.toLowerCase();
+  const identity = [env.GH_HOST || 'github.com', repo.toLowerCase(), Number(pr), headSha, 'context'];
+  const key = createHash('sha256').update(JSON.stringify(identity)).digest('hex');
+  const root = dir ?? join(defaultPoolRoot(ROOT, env), '.admission', 'pr-snapshots');
+  const path = join(root, `${key}.json`);
+  const ttl = settings.value.ttlMs;
+  const enabled = ttl > 0 && (!isUnderTest(env) || !!dir);
+  const hit = () => {
+    if (!enabled || refresh) return null;
+    const cached = readJson(path), age = now() - cached?.at;
+    return cached?.version === 2 && JSON.stringify(cached.identity) === JSON.stringify(identity)
+      && age >= 0 && age < ttl && Number(cached.data?.number) === Number(pr)
+      && cached.data?.headRefOid?.toLowerCase() === headSha
+      && Array.isArray(cached.data.files) && Array.isArray(cached.data.comments)
+      && (!readComments || cached.commentsComplete) ? cached.data : null;
+  };
+  const fetch = () => {
+    const comments = readComments?.(Number(pr), { repo, exec: (file, args, opts) => exec(args, opts) });
+    if (readComments && !Array.isArray(comments)) throw new Error('pr-context: complete comments unreadable');
+    const data = JSON.parse(String(exec(['pr', 'view', String(pr), '--repo', repo, '--json', PR_CONTEXT_FIELDS.join(',')])));
+    if (data?.headRefOid?.toLowerCase() !== headSha || Number(data.number) !== Number(pr)) {
+      throw new Error('pr-context: PR or head changed; refusing mismatched context');
+    }
+    if (!Array.isArray(data.files) || !Array.isArray(data.comments)) throw new Error('pr-context: incomplete view');
+    if (readComments) data.comments = comments;
+    if (enabled) {
+      try { writeJsonAtomic(path, { version: 2, identity, at: now(), data, commentsComplete: !!readComments }, { mode: 0o600 }); }
+      catch { /* An unwritable cache never changes the fresh read's result. */ }
+    }
+    return data;
+  };
+  const cached = hit();
+  if (cached) return cached;
+  if (!enabled) return fetch();
+  try { mkdirSync(root, { recursive: true }); } catch { return fetch(); }
+  // One refresh across processes; cache is checked again after acquiring the lock.
+  return withFileLock(`${path}.lock`, () => hit() ?? fetch(), { timeoutMs: 90000, staleMs: 120000 });
+}
 export function resolvePrSnapshotSettings({ env = process.env, fileConfig = readJson(join(ROOT, 'scripts', 'review-settings.json')), platform, log } = {}) {
   const pick = v => v?.ttlMs === undefined ? {} : { ttlMs: v.ttlMs };
   const raw = env.WE_REVIEW_PR_SNAPSHOT_TTL_MS;

@@ -1,4 +1,4 @@
-import { readSnapshotPrView } from '../lib/review-pr-snapshot.mjs';
+import { readLivePrContext } from '../lib/review-pr-snapshot.mjs';
 import { basisLineOf, isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
 import { rereviewMode, reviewMustVoid } from '../lib/review-timing.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
@@ -154,11 +154,9 @@ const execFileIn = (cwd) => (cmd, args, opts) => reviewExecFileSync(cmd, args, {
  * The default PR-view transport: ONE `gh pr view`, exactly as before.
  * @returns {object} the parsed `--json` view
  */
-export function ghPrView({ pr, repo, cwd = REPO_ROOT } = {}) {
+export function ghPrView({ pr, repo, cwd = REPO_ROOT, exec = args => execFileSync('gh', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, cwd }), snapshotOptions = {} } = {}) {
   try {
-    return readSnapshotPrView({ repo, pr, fields: PR_VIEW_FIELDS,
-      exec: args => execFileSync('gh', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, cwd }),
-    });
+    return readLivePrContext({ ...snapshotOptions, repo, pr, exec });
   } catch (e) {
     const msg = String((e && (e.stderr || e.message)) || e).split('\n').filter(Boolean).pop() || 'gh pr view failed';
     throw new Error(`review-pr-io: could not read ${repo}#${pr} — ${msg}`);

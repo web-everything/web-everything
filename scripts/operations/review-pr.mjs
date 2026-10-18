@@ -1544,6 +1544,21 @@ export function overridesJuror({ verdict, answer } = {}) {
   return false;
 }
 
+/** Concrete PR read guidance belongs to the operation, not the generic jury policy. */
+function sharedContextStanza(read) {
+  const headSha = read.netBasis?.rev;
+  if (!/^[\w.-]+\/[\w.-]+$/.test(read.repo ?? '') || !Number.isSafeInteger(read.pr)
+    || read.pr <= 0 || !/^[a-f0-9]{40,64}$/i.test(headSha ?? '')) return '';
+  const script = decodeURIComponent(new URL('../pr-context.mjs', import.meta.url).pathname);
+  const command = `node '${script.replaceAll("'", "'\\''")}' ${read.pr} --repo=${read.repo} --head=${headSha}`;
+  return [
+    '', 'For additional PR context, use the shared per-head read command below; do not re-fetch contextual body, files or comments with gh.',
+    'Cached context cannot authorize a mutation; live authority checks remain required.',
+    FENCED_DATA_RULE,
+    fenceUntrusted('pr-context-command', command),
+  ].join(' ');
+}
+
 /**
  * ONE JUROR CALL RECIPE, TWO LENSES (#3319). Both `judge` steps call THIS — a second copy of the request
  * literal is how the two seats would drift into different jurors, and the whole claim of the second seat is
@@ -1573,9 +1588,9 @@ export function buildReviewJudgeRequest({ read, lens, aim = '', seatProvider = n
     // opened the PR, so it goes to the juror inside the #2438 labelled data fence rather than in
     // instruction position. What that fixes is caller-supplied text reaching the mandate unfenced; whether
     // a crafted title could actually move a verdict is UNMEASURED, so this is hygiene, not a patched hole.
-    mandate: buildPanelMandate({
+    mandate: `${buildPanelMandate({
       lens, netChangedFiles: read.netChangedFiles, goal: read.title, fenced: true, aim,
-    }),
+    })}${sharedContextStanza(read)}`,
     input: renderJudgeInput(read),
     shape: REVIEW_JUDGE_SHAPE,
     lens,
@@ -1657,7 +1672,7 @@ export function buildReviewAdvisoryJudgeRequest({ read, aim = '' }) {
     // (shared by every other, genuinely tool-free-or-tool-bearing, panel seat).
     mandate: `${buildPanelMandate({
       lens: ADVISORY_JUDGE_LENS, netChangedFiles: read.netChangedFiles, goal: read.title, fenced: true, aim,
-    })} ${CODEX_ADVISORY_SANDBOX_CORRECTION}`,
+    })}${sharedContextStanza(read)} ${CODEX_ADVISORY_SANDBOX_CORRECTION}`,
     input: renderJudgeInput(read),
     shape: REVIEW_JUDGE_SHAPE,
     lens: ADVISORY_JUDGE_LENS,
