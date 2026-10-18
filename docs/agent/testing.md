@@ -66,6 +66,18 @@ exercise diagnostic propagation through a real-git rebuild fixture. Run these su
 
 ## Red-team re-check evidence
 
+The drain reads saved red-team evidence for the exact repository, PR and live head when no
+trusted result comment exists. A completed clean result satisfies the hold; confirmed breaks
+use the same gate, round cap and operator ruling as posted results. An identical result posted
+after a named round-cap ruling keeps that ruling; changed results and unknown saved chronology
+remain held. Saved finding text passes the publication scrub before comments or cards are written.
+Corrupt or incomplete evidence refuses admission. Errored, crashed, unparseable and unusable runs
+remain held and cannot use the never-scheduled fallback or re-request path. The existing broad
+recorded-run guard is preserved. Card-only diffs owe no new pass when `skipCardOnly` is on;
+recorded or started runs and confirmed breaks still hold. A saved-only gate decision cannot be
+carried across a rebase without its result. Regression coverage: `drain-saved-red-team.test.mjs`,
+`drain-merge-strategy.test.mjs`, and the saved round-cap soak case.
+
 The post-accept re-check reads a separate, self-contained checkout pinned to `read.netBasis.rev`,
 never the released review lane's current HEAD or the red-team probe's working tree. Its Claude
 juror uses `judge-spawn.mjs` with `Read`, `Glob`, and `Grep` only, in an independent lane-shaped

@@ -67,6 +67,12 @@ catch (error) { sendBackLedgerError = String(error?.message ?? error).split('\n'
 const operatorSendBackHoldReasons = (pr) => sendBackLedger
   ? sendBackLedger.operatorSendBackHoldReasons(pr)
   : [`operator send-back check unavailable: ${sendBackLedgerError}`];
+// Partial copies may also lack the saved red-team reader (and its store graph). The queue still runs, but says that a
+// round-cap break the gate decided on saved evidence could be missing from RULING NEEDED.
+let savedRedTeamFallback = null;
+let savedRedTeamError = null;
+try { ({ savedRedTeamFallback } = await import('../lib/drain-saved-red-team.mjs')); }
+catch (error) { savedRedTeamError = String(error?.message ?? error).split('\n')[0]; }
 // Staged CLI copies may omit this transitive graph. Without the canonical answer reader,
 // keep stand-downs visible as unanswered so the operator can still act on them.
 let standDownAnswers = null;
@@ -123,8 +129,8 @@ export function rulingNeededRow(repo, pr) {
 }
 
 /** A red-team round-cap ruling and its read-only operator command suggestions. PURE. */
-export function redTeamRulingRow(repo, pr, setting = CONFIRMED_BREAKS_DEFAULTS) {
-  const need = redTeamRulingNeeded(pr, setting);
+export function redTeamRulingRow(repo, pr, setting = CONFIRMED_BREAKS_DEFAULTS, { readSaved = null } = {}) {
+  const need = redTeamRulingNeeded(pr, setting, { readSaved });
   if (!need) return null;
   const command = `node scripts/review-set-label.mjs ${pr.number} --repo=${repo}`;
   return {
@@ -631,6 +637,7 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
   };
   if (rulingLedgerError) report.errors.push(`ruling-needed section unavailable: ${rulingLedgerError}`);
   if (sendBackLedgerError) report.errors.push(`operator send-back check unavailable: ${sendBackLedgerError}`);
+  if (savedRedTeamError) report.errors.push(`saved red-team ruling check unavailable: ${savedRedTeamError}`);
   let readFailures = 0;
   const failedRead = (subject, error) => {
     readFailures += 1;
@@ -734,9 +741,13 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
         readyNumbersThisRepo.add(pr.number);
       }
       for (const pr of prs) {
-        report.rulingNeeded.push(...mergeRulingRows(
-          rulingNeededRow(repo, pr), redTeamRulingRow(repo, pr, redTeamSetting),
-        ));
+        // The gate can hold a break decided on saved evidence (its comment withheld); unreadable evidence is a visible error.
+        let redTeamRow = null;
+        try {
+          redTeamRow = redTeamRulingRow(repo, pr, redTeamSetting,
+            { readSaved: savedRedTeamFallback?.({ repo, pr: pr.number, head: pr.headRefOid }) ?? null });
+        } catch (error) { failedRead(`${repo}#${pr.number} red-team ruling`, error); }
+        report.rulingNeeded.push(...mergeRulingRows(rulingNeededRow(repo, pr), redTeamRow));
       }
       for (const pr of prs) {
         if (readyNumbersThisRepo.has(pr.number)) continue;

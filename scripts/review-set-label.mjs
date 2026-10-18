@@ -1,5 +1,6 @@
 import { RED_TEAM_STATUS_LABELS } from './lib/red-team-status-label-meta.mjs';
 import { readConfirmedBreaks, redTeamRulingNeeded } from './lib/red-team-gate.mjs';
+import { savedRedTeamFallback } from './lib/drain-saved-red-team.mjs';
 import { signalFixDispatch } from './lib/fix-handoff.mjs';
 import { mandatoryReferralState, readReferralRecords, referralRecordState } from './lib/jury-core.mjs';
 import { referralSeatDisabled } from './operations/review-seat-policy.mjs';
@@ -1408,7 +1409,13 @@ export function runReviewLabelCli({
   };
   const redTeamRulingHold = to === 'clear-human' && hasReviewLabel(currentLabels, REVIEW_LABELS.accepted)
     && !hasReviewLabel(currentLabels, REVIEW_LABELS.human) && !hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical)
-    && redTeamRulingNeeded({ number: Number(pr), headRefOid: headSha, labels: currentLabels, comments: fullThread() }, readConfirmedBreaks().value) !== null;
+    && redTeamRulingNeeded({ number: Number(pr), headRefOid: headSha, labels: currentLabels, comments: fullThread() }, readConfirmedBreaks().value, {
+      // The gate holds a break decided on saved evidence when its comment was withheld; the ruling clears that too.
+      readSaved: () => {
+        try { return savedRedTeamFallback({ repo, pr, head: headSha })(); }
+        catch (e) { return fail(`saved red-team evidence unreadable — nothing was changed: ${e.message}`, 1); }
+      },
+    }) !== null;
   let decision = decideSetLabel({
     to,
     currentLabels,
