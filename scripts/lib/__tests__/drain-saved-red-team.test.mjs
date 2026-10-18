@@ -27,6 +27,19 @@ const hold = (env, over = {}) => redTeamEnqueueHold({ repo, pr, head, comments: 
   loopPayload: { verdict: { verdict: 'accept' } }, ...over });
 
 describe('saved red-team admission', () => {
+  it.each([undefined, null, '', '   '])('refuses missing repository identity: %j', repo => {
+    expect(() => hold(fixture([row()]).env, { repo })).toThrow(/repo.*required/i);
+  });
+  const inputClasses = ['scripts/example.mjs', 'docs/example.md', 'scripts/settings/example.json', 'src/_data/example.json'];
+  it.each(inputClasses)('saved clean evidence releases each input class: %s', path => {
+    const loopPayload = { verdict: { verdict: 'accept' }, findings: { read: { netChangedFiles: [path], netRenameSources: [] } } };
+    expect(hold(fixture([row()]).env, { loopPayload })).toBeNull();
+  });
+  it.each(inputClasses)('saved confirmed breaks hold each input class: %s', path => {
+    const loopPayload = { verdict: { verdict: 'accept' }, findings: { read: { netChangedFiles: [path], netRenameSources: [] } } };
+    const findings = [{ confirmedByRecheck: true, impactIfUnfixed: 'broken', summary: 'break' }];
+    expect(hold(fixture([row({ findings, confirmedMissCount: 1 })]).env, { loopPayload })).toMatch(/requiring send-back/);
+  });
   it('saved clean result releases the hold without a posted comment', () => {
     expect(hold(fixture([row()]).env)).toBeNull();
   });

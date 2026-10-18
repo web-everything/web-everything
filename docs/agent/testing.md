@@ -89,7 +89,15 @@ at the configured deadline and cannot use the never-scheduled fallback. To relea
 the re-check for the same head to completion or publish a usable trusted result on that head;
 a new head requires its own evidence. Confirmed send-back findings still route through the gate.
 The merge-strategy integration tests cover saved clean admission without comments and recovery
-from incomplete evidence. The review-job tests assert that finished status events retain the
+from incomplete evidence. Prestage and enqueue both require repository identity for the saved
+read; `redTeamEnqueueHold` rejects a missing repository rather than silently skipping evidence.
+The prestage saved-evidence matrix covers local and explicit repository callers, clean results,
+card-only breaks, incomplete re-checks, wrong heads, corrupt storage and a break appearing after
+preparation. Saved admission tests also pin source, docs, config and data paths.
+The review-job carry matrix covers posted/saved evidence with and without a gate marker:
+a posted result can carry alongside its saved scorecard row; a saved-only result cannot carry
+bare gate markers. The approved-human-head-review-churn soak also pins posted-plus-saved carry.
+The review-job tests assert that finished status events retain the
 full posted-result summary in both sequential and speculative modes. When threading a new
 argument into an existing call, add an integration test through the caller that depends on it.
 Regression coverage: **includes rename sources before deciding to skip probes**, covering both

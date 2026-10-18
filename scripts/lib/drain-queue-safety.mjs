@@ -34,6 +34,7 @@ export function postAcceptRedTeamOwed(loopPayload, env = process.env, evidence =
 }
 
 export function redTeamEnqueueHold({ loopPayload, comments, repo, pr, head, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false, skipCardOnly } = {}) {
+  if (typeof repo !== 'string' || !repo.trim()) throw new Error('red-team admission: repo is required');
   // A recorded break still holds even if the scheduler is now disabled or the payload is unavailable.
   let disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks });
   if (!disposition.result) {

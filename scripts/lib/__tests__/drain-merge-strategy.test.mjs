@@ -972,6 +972,44 @@ describe('queue safeguard overrides and untracked queue entries', () => {
 
 
 describe('drain pre-stage queue admission', () => {
+  it.each([null, LOCAL].flatMap(repo => ['clean', 'break', 'incomplete', 'other-head', 'corrupt'].map(result => ({ repo, result }))))
+    ('prestage reads saved evidence without comments: %j', ({ repo, result }) => {
+      const root = mkdtempSync(join(tmpdir(), 'prestage-saved-'));
+      try {
+        const env = { CONVEYOR_STATE_ROOT: root, WE_RED_TEAM_DRAIN_READS_SAVED_RESULT: 'on', WE_RED_TEAM_SKIP_CARD_ONLY: 'true' };
+        const path = resolveScorecardStorePath(env);
+        mkdirSync(dirname(path), { recursive: true });
+        const writeResult = kind => writeFileSync(path, JSON.stringify({ version: 1, records: [{
+          dispatchKind: 'review-seat', seat: 'red-team', repo: LOCAL, pr: 5283,
+          rev: kind === 'other-head' ? 'a'.repeat(40) : HEAD, status: 'ok',
+          recheckStatus: kind === 'incomplete' ? 'pending' : 'ok',
+          confirmedMissCount: kind === 'break' ? 1 : 0,
+          findings: kind === 'break' ? [{ confirmedByRecheck: true, impactIfUnfixed: 'broken' }] : [],
+        }] }));
+        writeResult(result);
+        if (result === 'corrupt') writeFileSync(path, '{truncated');
+        // Breaks hold even when a card-only diff owes no new pass.
+        const loopPayload = { verdict: { verdict: 'accept' }, findings: { read: {
+          netChangedFiles: [result === 'break' ? 'backlog/123-card.md' : 'scripts/example.mjs'], netRenameSources: [],
+        } } };
+        const h = harness({ strategy: 'github-merge-queue', env, labels: ['review:accepted', 'ready-to-merge'],
+          liveComments: [], evidence: { loopPayload, scheduled: true, skipCardOnly: true } });
+        const c = { num: 5283, repo };
+        const prepared = h.s.prestage(c, HEAD);
+        expect(prepared.allowed).toBe(result === 'clean');
+        if (result === 'break') expect(prepared.reason).toMatch(/requiring send-back/);
+        if (result === 'incomplete') expect(prepared.reason).toMatch(/re-check incomplete/);
+        if (result === 'other-head') expect(prepared.reason).toMatch(/no recorded result/);
+        if (result === 'corrupt') expect(prepared.reason).toMatch(/evidence unreadable/);
+        expect(h.state()).toBeNull();
+        expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
+        if (result === 'clean') {
+          writeResult('break');
+          expect(h.s.enqueue(c, HEAD, { prepared, comments: [] })).toMatchObject({ kind: 'red-team-pending' });
+          expect(h.state().redTeamPending[`${repo ?? 'cwd'}#5283`].reason).toMatch(/requiring send-back/);
+        }
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    });
   it('changed safety policy falls back before mutation or failure backoff', () => {
     const { s, calls, state } = harness({ strategy:'github-merge-queue', enqueueFails:true });
     const c = { num:42, repo:null };

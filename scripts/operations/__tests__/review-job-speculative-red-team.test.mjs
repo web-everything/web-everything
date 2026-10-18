@@ -90,7 +90,7 @@ describe('runReviewJob under review.speculativeRedTeam', () => {
     } });
     expect(runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io).outcome).toBe('carried');
     expect(kinds(calls)).toEqual([]);
-    expect(redTeamEnqueueHold({ loopPayload: payload('accept'), comments, pr: 10, head, env: {} })).toBeNull();
+    expect(redTeamEnqueueHold({ repo: REPO, loopPayload: payload('accept'), comments, pr: 10, head, env: {} })).toBeNull();
   });
 
   // PR #5482 operator ruling: a carry moves only the gate decisions made on the result it carries.
@@ -136,7 +136,7 @@ describe('runReviewJob under review.speculativeRedTeam', () => {
       const holds = [];
       const probe = step => {
         const evidence = readDrainRedTeamEvidence({ repo: REPO, pr: 10, head: REV, env, runsDir, readScorecards: () => [] });
-        holds.push([step, redTeamEnqueueHold({ ...evidence, comments: [], pr: 10, head: REV, env })]);
+        holds.push([step, redTeamEnqueueHold({ ...evidence, repo: REPO, comments: [], pr: 10, head: REV, env })]);
       };
       const { io } = jobIo({ setting: { enabled }, over: {
         redTeamStatus: row => recordRedTeamStatus(row, { env }),

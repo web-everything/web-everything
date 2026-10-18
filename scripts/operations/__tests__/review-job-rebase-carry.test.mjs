@@ -16,6 +16,19 @@ function fixture() {
   };
 }
 describe('review job rebase carry', () => {
+  it.each([true, false].flatMap(posted => [true, false].flatMap(saved => [true, false].map(gate => ({ posted, saved, gate })))))
+    ('posted/saved/gate carry matrix: %j', ({ posted, saved, gate }) => {
+      const io = fixture();
+      io.readCarryEvidence = () => ({ headSha: b, comments: [trusted(`<!-- reviewed-sha: ${a} -->`),
+        ...(posted ? [trusted(`<!-- we:red-team-advisory pr=1 rev=${a} -->\nNo confirmed breaks.`)] : []),
+        ...(gate ? [trusted(`<!-- we:red-team-gate pr=1 rev=${a} outcome=card-queued -->`)] : [])] });
+      io.readSavedResult = vi.fn(() => saved ? { pr: 1, rev: a, findings: [] } : null);
+      const carries = posted || (gate && !saved);
+      expect(runReviewJob({ pr: 1, repo: 'web-everything/web-everything' }, io).outcome === 'carried').toBe(carries);
+      expect(io.postCarryComment).toHaveBeenCalledTimes(carries ? 1 : 0);
+      expect(io.runLoop).toHaveBeenCalledTimes(carries ? 0 : 1);
+      if (posted) expect(io.readSavedResult).not.toHaveBeenCalled();
+    });
   it('restamps before one carry comment and starts no round or seats', () => {
     const io = fixture(); const out = runReviewJob({ pr: 1, repo: 'web-everything/web-everything' }, io);
     expect(out.outcome).toBe('carried'); expect(io.restampVerdict).toHaveBeenCalledWith(expect.objectContaining({ newHead: b }));

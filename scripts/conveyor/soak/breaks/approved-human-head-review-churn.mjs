@@ -102,7 +102,7 @@ export default {
       const red = { ...pr, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] };
       check(revalidateForMerge(retainApprovedHumanQueueHead(red, { hold: true, queueOwnsFreshness: true })).decision === 'skip', 'queue retention bypassed a red required check');
 
-      for (const mode of ['identical', 'whitespace', 'changed', 'unreadable', 'restamp-failed', 'off', 'red-team-pending', 'gate-with-hold',
+      for (const mode of ['identical', 'posted-saved', 'whitespace', 'changed', 'unreadable', 'restamp-failed', 'off', 'red-team-pending', 'gate-with-hold',
         'saved-only', 'saved-unreadable', 'no-saved-reader']) {
         const calls = [];
         const posted = [];
@@ -114,6 +114,7 @@ export default {
           updateRecord: () => {}, releaseLane: () => {},
           carryAcrossRebaseSetting: () => ({ value: mode === 'off' ? 'off' : 'on', source: 'soak' }),
           readCarryEvidence: () => ({ headSha: NEXT, comments: [clearance,
+            ...(mode === 'posted-saved' ? [trusted(`<!-- we:red-team-advisory pr=5354 rev=${HEAD} -->\nNo confirmed breaks.`)] : []),
             ...(mode === 'red-team-pending' ? [] : [trusted(`<!-- we:red-team-gate pr=5354 rev=${HEAD} outcome=card-queued -->`
               + (mode === 'gate-with-hold' ? '\nunknown hold' : ''))])] }),
           // Production checks saved evidence before carrying bare gate markers. An
@@ -121,7 +122,7 @@ export default {
           readSavedResult: input => {
             savedReads.push(input);
             if (mode === 'saved-unreadable') throw Error('saved red-team evidence malformed');
-            return mode === 'saved-only' ? { pr: 5354, rev: HEAD, findings: [] } : null;
+            return ['saved-only', 'posted-saved'].includes(mode) ? { pr: 5354, rev: HEAD, findings: [] } : null;
           },
           contributionPatchId: ({ sha }) => contributionPatchId({ sha, exec(tool, args, options) {
             if (tool !== 'git') throw Error(`unexpected tool: ${tool}`);
@@ -148,7 +149,8 @@ export default {
           check(savedReads.length === 1 && savedReads[0].pr === 5354 && savedReads[0].repo === repo && savedReads[0].head === HEAD,
             `${mode}: saved evidence was not checked for the prior head`);
         }
-        if (mode === 'identical') {
+        if (['identical', 'posted-saved'].includes(mode)) {
+          if (mode === 'posted-saved') check(savedReads.length === 0, 'posted evidence unnecessarily consulted the saved store');
           check(result.outcome === 'carried' && calls.join(',') === 'restamp,comment', 'identical rebase spent a lane, round or red-team pass, or posted before restamping');
           const marker = parseVerdictCarriedMarker(posted[0]?.body);
           check(marker?.fromSha === HEAD && marker?.toSha === NEXT && /^[a-f0-9]{40}$/.test(marker?.patchId ?? ''), 'carry comment lost its head/patch proof');
