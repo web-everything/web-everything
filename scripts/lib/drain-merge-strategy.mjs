@@ -311,7 +311,7 @@ export function createDrainMergeStrategy({
         const held = sendBackReason(live.labels);
         if (held) return { allowed: false, reason: held };
         const base = c.baseRefName || 'main';
-        const pinned = readPinnedChangedFiles({ headSha, base, cwd, exec });
+        const pinned = readPinnedChangedFiles({ headSha, base, cwd, exec, withBaseSha: true });
         const surface = workflowEditHold({ files: pinned.files, expectedCount: pinned.files?.length });
         if (surface.hold) return { allowed: false, reason: surface.reason, humanOnlySurface: surface };
         // Bound to the base branch and tip it was read against: enqueuePr re-reads the diff if either differs live.

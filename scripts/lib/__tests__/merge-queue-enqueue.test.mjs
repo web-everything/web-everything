@@ -220,8 +220,10 @@ describe('a PR that touches a workflow file is never enqueued (human-only hold)'
 
     it('pins the base tip before the diff and diffs against that sha, so the recorded base is the one the list used', () => {
       const calls = [];
-      const read = readPinnedChangedFiles({ headSha: HEAD, cwd: CWD, exec: execFor({ files: [['README.md', '']], baseTip: TIP, calls }) });
+      const read = readPinnedChangedFiles({ headSha: HEAD, cwd: CWD, withBaseSha: true, exec: execFor({ files: [['README.md', '']], baseTip: TIP, calls }) });
       expect(read).toEqual({ files: ['README.md'], baseSha: TIP });
+      // Callers that did not ask for it (the merge gate pins the exact shape) keep the plain `{files}` result.
+      expect(readPinnedChangedFiles({ headSha: HEAD, cwd: CWD, exec: execFor({ files: [['README.md', '']], baseTip: TIP }) })).toEqual({ files: ['README.md'] });
       const at = (sub) => calls.findIndex(([c, a]) => c === 'git' && a[0] === sub);
       expect(at('rev-parse')).toBeGreaterThan(-1);
       expect(at('rev-parse')).toBeLessThan(at('diff'));
@@ -362,7 +364,7 @@ describe('the workflow-edit refusal reads the change list of the exact enqueued 
       git(work, 'add', '.'); git(work, 'commit', '-qm', 'C3');
       const head = git(work, 'rev-parse', 'HEAD');
       git(work, 'push', '-q', 'origin', 'lane/y');
-      const read = readPinnedChangedFiles({ headSha: head, cwd: clone });
+      const read = readPinnedChangedFiles({ headSha: head, cwd: clone, withBaseSha: true });
       expect(read.files).toEqual(['README.md']);
       expect(read.baseSha).toBe(git(work, 'rev-parse', 'main'));
       const preparedSurface = { headSha: head, base: 'main', baseSha: read.baseSha, files: read.files };

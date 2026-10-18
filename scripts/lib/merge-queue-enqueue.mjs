@@ -241,8 +241,9 @@ const SAFE_BRANCH_RE = /^[A-Za-z0-9._/-]+$/;
  * that moved between the read and the enqueue could be judged on another commit's files). The diff is
  * `origin/<base>...<headSha>` (merge-base to head, what the queue lands) with `--no-renames`, so a rename shows
  * BOTH its old and new path. Every path is listed (no 3000-file REST cap). `{files}` or `{error}`. Never throws.
+ * `withBaseSha`: also return `baseSha`, the base commit the diff was read against (null when unknown).
  */
-export function readPinnedChangedFiles({ headSha, base = 'main', cwd, exec = execFileSync } = {}) {
+export function readPinnedChangedFiles({ headSha, base = 'main', cwd, exec = execFileSync, withBaseSha = false } = {}) {
   if (!SHA_RE.test(String(headSha))) return { error: 'head sha is not a 40-hex commit id' };
   if (!SAFE_BRANCH_RE.test(String(base)) || String(base).startsWith('-')) return { error: 'base branch name unusable' };
   if (!cwd) return { error: 'no checkout to read the pinned diff from' };
@@ -257,7 +258,8 @@ export function readPinnedChangedFiles({ headSha, base = 'main', cwd, exec = exe
     try { baseSha = git(['rev-parse', '--verify', '--end-of-options', `refs/remotes/origin/${base}^{commit}`]).trim(); } catch { /* unknown */ }
     if (!SHA_RE.test(baseSha)) baseSha = null;
     const out = git(['diff', '--name-only', '--no-renames', '-z', '--end-of-options', `${baseSha ?? `refs/remotes/origin/${base}`}...${headSha}`]);
-    return { files: out.split('\0').filter(Boolean), baseSha };
+    const files = out.split('\0').filter(Boolean);
+    return withBaseSha ? { files, baseSha } : { files };
   } catch (e) { return { error: errText(e) }; }
 }
 
