@@ -48,3 +48,7 @@ One line per class: either the handling, or `n/a: <why>`.
 ## Also raised by
 
 - Also raised by web-everything/web-everything#5531 (finding 2: `we:backlog/5749-drain-remove-the-unlocked-fallback-on-the-numbering-and-land.md:35` — Same card-lint rule as above: any Acceptance reference to a test must use a named [A<n>] case that appears in the Test plan.)
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5525 (finding 1: `we:backlog/xyzpgol-overlap-yield-known-holds.md:28` — Add a check:standards rule requiring every backlog Acceptance line marked Executable to cite a test file and a test name, or planned: <name> .)
