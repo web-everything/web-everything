@@ -28,6 +28,8 @@ The preparation below explains the forks; its example is updated to the build ca
 
 **Build slices:** see the children of this card (`parent` edges). The settings-edit authority decision `xugqjw1` is cited by id (not yet on main).
 
+**Operator authority, operator input 2026-10-18 (PR #5549).** A red-team round confirmed that a local authority check (an interactive terminal plus the host's `gh` login) can be passed by an agent on the same host. Per the operator's binding input, the "operator-only command" below is realized as slice 1's (`#6266`) request → protected-CI-verified operator review → apply flow, reusing `#6246` slice 2 A10's authenticated-actor pattern. Read the preparation's single `operator-override` command, its `--confirm-loosen` flag and "rejects any agent caller" with that meaning: anyone may request or apply, and only an allowlisted operator's verified GitHub review authorizes a write or a confirmation. A loosening override that expires between needs-you polls still produces an attention event on the next poll (`#6265`). The three fork rulings are unchanged.
+
 Operator, 2026-10-17, verbatim: "we should have the option to use a db for settings instead of in code, at least as override".
 Today every setting lives in a repo file, so a tweak needs a PR, and a file held by an open PR cannot be tweaked at all. This card decides the shape of one new top layer, `operator-override`, backed by a store the operator writes through one command. Three forks follow: where the store lives, where the layer sits in the cascade, and what stops an override from loosening a safety guard.
 

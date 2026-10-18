@@ -6293,14 +6293,15 @@ override"*, then "Ok" to defaults (a), (a), (a). Composes with [config-extends-p
    host-wide path, never inside a lane clone, so every daemon on the host reads the same answer. Plateau's DB is deferred
    and may replace the store later behind the same single read interface (`readOperatorOverrides`). The storage format is
    left to the build card. Daemons read the layer each tick.
-3. **Only the operator writes it.** One operator-only command is the sole writer; the write operation rejects any agent
-   caller. Each write records the operator's verbatim instruction (stored as a quoted string, never executed), actor and
+3. **Only the operator writes it.** A write is authorized only by an allowlisted operator's GitHub review of the exact
+   request, verified by protected CI with a key agents never hold; any caller may request or apply, and no agent can
+   authorize. Each write records the operator's verbatim instruction (stored as a quoted string, never executed), actor and
    channel (from a protected-CI-verified GitHub review by an allowlisted operator account, never a flag, terminal or
    local `gh` login, which an agent on the host can forge), time, an optional expiry and a reason. The change log is append-only.
    An expired override is ignored and logged once, and one that started and expired between two needs-you polls still
    produces an attention event on the next poll.
 4. **Guard floor: block until confirmed (Fork 3 = a).** Every key declares its safe direction in a table; a key with no
-   entry counts as loosening. A loosening write without the confirmation flag is refused. A confirmed one is logged and
+   entry counts as loosening. A loosening write without a confirmation inside the operator-approved request is refused. A confirmed one is logged and
    flagged in the needs-you feed. The floor also holds on read: the reader ignores any loosening entry that has no recorded
    confirmation, so a hand-edited snapshot cannot bypass it. The hard-coded confirmed-broken always-block is outside this
    layer.
