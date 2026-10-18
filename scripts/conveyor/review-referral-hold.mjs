@@ -308,7 +308,7 @@ export function blockRuledReferralsFor(pr, { repo, cardReadable = ref => referra
 
 /** Dispatch only: never mutate the gate or infer identity from similar finding prose.
  * Every current record holding a key must qualify; unknown/malformed evidence retains the dispatch.
- * Head is deliberately absent from operator identity: a new auto-policy block cannot undo that word.
+ * Operator identity spans heads, but suppression requires human clearance of the current head.
  */
 export function filterFixerReferrals(pr, findings, { repo,
   cardReadable = ref => referralCardReadable(ref, REPO_ROOT),
@@ -336,18 +336,9 @@ export function filterFixerReferrals(pr, findings, { repo,
         const latest = operators.filter(o => o.repo === repo && o.pr === Number(pr.number)
           && o.runId === r.runId && o.key === f.key)
           .sort((a, b) => Date.parse(a.at) - Date.parse(b.at)).at(-1);
-        if (latest) return latest.result === 'not-real' || (latest.result === 'card' && cardReadable(latest.card));
-        // A known auto-only block is not a person's request to change a head they cleared.
-        // A reviewer block remains open; missing evidence never suppresses dispatch.
-        const own = r.rulings.filter(x => x.key === f.key);
-        const superseded = new Set(own.flatMap(x => x.supersedes ?? []));
-        if (own.some(x => x.result === 'block' && !superseded.has(x.id))) return false;
-        return cleared && (pr.comments ?? []).some(c => {
-          const policy = parseOperatorRulingComment(c)?.record;
-          return policy?.actor.toLowerCase() === 'auto-policy' && policy.repo === repo
-            && policy.pr === Number(pr.number) && policy.head === pr.headRefOid
-            && policy.rulings.some(x => x.runId === r.runId && x.key === f.key && x.result === 'block');
-        });
+        if (latest) return cleared && (latest.result === 'not-real' || (latest.result === 'card' && cardReadable(latest.card)));
+        // Open reviewer/policy blocks and unruled findings still need a fixer, even on a cleared head.
+        return false;
       });
     });
     if (kept.length < findings.length) log(`review.noFixerOnClearedRuled=true (source: ${safety.sources.noFixerOnClearedRuled}) — ${repo}#${pr.number}: suppressed ${findings.length - kept.length} fixer referral(s)`);

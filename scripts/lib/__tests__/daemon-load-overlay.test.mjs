@@ -682,6 +682,35 @@ describe('runDaemonLoadOverlay — dispatch smoke wiring, rollback of ONLY this 
     expect(r).toMatchObject({ rolledBack: true, reason: 'dispatch-smoke-failed', head: 'h0', dispatchSmoke: { phase: 'post-adopt' } });
   });
 
+  it.each(['candidate', 'post-adopt'])('retryable timeout at %s defers only before adoption', async phase => {
+    const removeOverlayFn = vi.fn();
+    const rebuild = vi.fn(async ({ runSmoke }) => {
+      if (phase === 'candidate' && rebuild.mock.calls.length === 1) {
+        try { await runSmoke({ root: '/cand', env: {} }); } catch { /* candidate rejected */ }
+        return { moved: false, adopted: false, reason: 'smoke-rejected' };
+      }
+      return { moved: true, adopted: true, head: 'h0' };
+    });
+    const result = await runDaemonLoadOverlay({
+      clone: '/c', ref: 'lane/x', pr: 1, versions: null,
+      installed: () => ({ inHead: true, tip: 'abc', head: 'h0', reason: 'in-head' }),
+      addOverlayFn: vi.fn(), rebuild, removeOverlayFn, appendEventFn: vi.fn(),
+      settings: settingsOn, log: quietLog, baseSmoke: async () => ({ verdict: 'pass' }),
+      inspect: () => ({ inTree: true, required: true, matched: ['x'] }),
+      dispatchSmoke: async () => ({ ok: false, reason: 'timeout', retryable: true }),
+    });
+    expect(result.dispatchSmoke.phase).toBe(phase);
+    if (phase === 'candidate') {
+      expect(result).toMatchObject({ registered: true, adopted: false, pending: true, reason: 'dispatch-smoke-deferred' });
+      expect(removeOverlayFn).not.toHaveBeenCalled();
+      expect(rebuild).toHaveBeenCalledTimes(1);
+    } else {
+      expect(result).toMatchObject({ registered: false, adopted: false, rolledBack: true, reason: 'dispatch-smoke-failed' });
+      expect(removeOverlayFn).toHaveBeenCalledTimes(1);
+      expect(rebuild).toHaveBeenCalledTimes(2);
+    }
+  });
+
   it('a passing dispatch smoke keeps the overlay and reports the pass', async () => {
     const removeOverlayFn = vi.fn();
     const rebuild = vi.fn(async ({ runSmoke }) => { await runSmoke({ root: '/cand', env: {} }); return { moved: true, adopted: true, head: 'h1' }; });

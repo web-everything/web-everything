@@ -221,7 +221,7 @@ it.each(['post-accept', 'panel-seat'])('persists and verifies review-job provena
 });
 
 
-it('attests ran, resumed and already-ran stored results without a seat payload', () => {
+it.each(['missing', 'mismatched', 'valid'])('requires %s existing provenance for stored results without a seat payload', proof => {
   const root = mkdtempSync(join(tmpdir(), 'review-job-resumed-provenance-'));
   try {
     const env = { CONVEYOR_STATE_ROOT: root, OPERATION_RUNS_DIR: join(root, 'runs') };
@@ -233,14 +233,18 @@ it('attests ran, resumed and already-ran stored results without a seat payload',
     const run = provenanceRun({ env, rows, id: 'review-pr-resumed' });
     const real = createReviewJobIo({ env, dir: join(root, 'jobs') });
     for (const status of ['ran', 'resumed', 'already-ran']) {
-      delete run.findings.savedRedTeamResult;
+      const originalProof = { writer: 'review-job', references: [{ path, index: 0 }],
+        sha256: proof === 'mismatched' ? '0'.repeat(64) : savedRowsHash(rows) };
+      if (proof === 'missing') delete run.findings.savedRedTeamResult;
+      else run.findings.savedRedTeamResult = originalProof;
       writeRun(run, env.OPERATION_RUNS_DIR);
       real.recordSavedRedTeamResult({ runId: run.id, repo: REPO, pr: 4722, head: HEAD_1,
         redTeam: { status, callId: 'saved-call' } });
-      expect(readRun(run.id, env.OPERATION_RUNS_DIR).findings.savedRedTeamResult).toEqual({
-        writer: 'review-job', references: [{ path, index: 0 }], sha256: savedRowsHash(rows),
-      });
-      expect(readSavedRedTeamResult({ repo: REPO, pr: 4722, head: HEAD_1, env, log: () => {} })).not.toBeNull();
+      expect(readRun(run.id, env.OPERATION_RUNS_DIR).findings.savedRedTeamResult)
+        .toEqual(proof === 'missing' ? undefined : originalProof);
+      const saved = readSavedRedTeamResult({ repo: REPO, pr: 4722, head: HEAD_1, env, log: () => {} });
+      if (proof === 'valid') expect(saved).not.toBeNull();
+      else expect(saved).toBeNull();
     }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

@@ -731,7 +731,7 @@ export async function runDaemonLoadOverlay({
 
   // ROLLBACK — remove ONLY this overlay, then recover through `rebuildWithout`: main + every other overlay, unchanged.
   const rollBack = async (out, ctl, rebuildWithout) => {
-    if (ctl.result.reason === 'timeout' && ctl.result.retryable === true) {
+    if (ctl.phase === 'candidate' && !out.adopted && ctl.result.reason === 'timeout' && ctl.result.retryable === true) {
       log.error?.(`daemon-load-overlay: dispatch smoke deferred by host overload; ${ref} remains registered for a gated retry at the next tick boundary`);
       return { ...out, adopted: false, pending: true, reason: 'dispatch-smoke-deferred' };
     }

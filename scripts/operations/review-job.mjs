@@ -6,7 +6,7 @@ import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { speculativeSeatTimings } from '../lib/review-speculative-red-team.mjs';
 import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
 import { readRun, writeRun } from './run-store.mjs';
-import { savedRedTeamHash, savedRedTeamRunsDir, matchesSavedRedTeamHead } from '../lib/saved-red-team-provenance.mjs';
+import { savedRedTeamHash, savedRedTeamRunsDir, matchesSavedRedTeamHead, verifySavedRedTeamProvenance } from '../lib/saved-red-team-provenance.mjs';
 import { resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.mjs';
 /**
@@ -499,6 +499,8 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       const index = records.findLastIndex(row => matchesSavedRedTeamHead(row, { repo, pr, head })
         && row.callId === redTeam.callId);
       if (index < 0) throw new Error('saved red-team result reference missing');
+      // Stored results must already be admissible; never mint provenance for an unverified row.
+      if (!redTeam.seat && verifySavedRedTeamProvenance({ repo, pr, head, path, records, index, env, runsDir })) return;
       // A fresh result carries its seat row. Refuse if storage changed it beyond the store's defaults.
       if (redTeam.seat && Object.keys(redTeam.seat).some(key =>
         savedRedTeamHash([records[index][key] ?? null]) !== savedRedTeamHash([redTeam.seat[key] ?? null])))

@@ -361,19 +361,26 @@ describe('speculateRedTeam + finishSpeculativeRedTeam', () => {
   });
 
   it('refuses panel speculation when juror findings or a newer clean row invalidate it', async () => {
-    const env = { WE_RED_TEAM_TIMING: 'panel-seat' };
-    const observed = [];
-    for (const reason of ['juror-findings', 'newer-row']) {
-      const a = seatsIo();
-      const pass = await speculateRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', read: read(), env, resume: false }, a.io);
-      const loopPayload = payload('accept');
-      if (reason === 'juror-findings') loopPayload.findings.judge.findings = [BREAK];
-      else a.rows.push({ dispatchKind: 'review-seat', seat: 'red-team', pr: 5, rev: REV, status: 'ok' });
-      const before = a.rows.length;
-      const result = await finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload, pass, env }, a.io);
-      observed.push([reason, result.status, a.rows.length - before, a.posts.length]);
-    }
-    expect(observed).toEqual([['juror-findings', 'stale', 0, 0], ['newer-row', 'superseded', 0, 0]]);
+    const root = mkdtempSync(join(tmpdir(), 'speculative-supersession-'));
+    try {
+      const env = { WE_RED_TEAM_TIMING: 'panel-seat', CONVEYOR_STATE_ROOT: root, OPERATION_RUNS_DIR: join(root, 'runs') };
+      const observed = [];
+      for (const reason of ['juror-findings', 'newer-row']) {
+        const a = seatsIo();
+        const pass = await speculateRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', read: read(), env, resume: false }, a.io);
+        const loopPayload = payload('accept');
+        if (reason === 'juror-findings') loopPayload.findings.judge.findings = [BREAK];
+        else {
+          a.rows.push({ dispatchKind: 'review-seat', seat: 'red-team', repo: REPO, pr: 5, rev: REV,
+            callId: 'prior-call', status: 'ok', findings: [], recheckStatus: 'not-needed' });
+          writeRun(provenanceRun({ env, rows: a.rows }), env.OPERATION_RUNS_DIR);
+        }
+        const before = a.rows.length;
+        const result = await finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload, pass, env }, a.io);
+        observed.push([reason, result.status, a.rows.length - before, a.posts.length]);
+      }
+      expect(observed).toEqual([['juror-findings', 'stale', 0, 0], ['newer-row', 'superseded', 0, 0]]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   it('speculating writes nothing and posts nothing; finishing an accept records exactly what the sequential pass records', async () => {
