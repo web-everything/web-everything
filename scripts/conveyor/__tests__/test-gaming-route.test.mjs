@@ -176,6 +176,71 @@ describe('test-gaming hold routing', () => {
     expect(w.provider.postComment).toHaveBeenCalledOnce();
   });
 
+  it.each([ADVISORY_NOTE_MARKER, CONVERTED_ADVISORY_NOTE_MARKER, 'Legacy advisory'])(
+    'red-team: a later accepting advisory cannot strand an unfinished route (%s)', marker => {
+      const w = world();
+      routeTestGaming(w.pr, w.options);
+      const acceptance = `${marker}\n\n**Verdict:** Accept\n\n**Advisory outcome:** \`accept\`\n\nNet basis: \`${'0'.repeat(40)}..${HEAD}\``;
+      w.pr.comments.push(bot(acceptance));
+      sweepAdvisoryLabels({ repo: w.options.repo, listPrs: () => [structuredClone(w.pr)],
+        readPr: () => structuredClone(w.pr), provider: w.provider });
+      expect(w.pr.labels.map(l => l.name)).toContain('advisory:accepted');
+      for (let tick = 0; tick < 3; tick++) {
+        // Recovery survives later sweeps and an ordinary reclaimed-worker release.
+        if (tick === 1) w.pr.comments.push(bot(buildFixEndComment({ who: 'fix-5537', headSha: HEAD })));
+        const routed = routeTestGaming(w.pr, w.options);
+        expect(routed.action).toBe('admitted');
+        expect(routed.snapshot?.labels.map(l => l.name)).toContain('advisory:changes');
+        sweepAdvisoryLabels({ repo: w.options.repo, listPrs: () => [structuredClone(w.pr)],
+          readPr: () => structuredClone(w.pr), provider: w.provider });
+        expect(w.pr.labels.map(l => l.name)).toContain('advisory:changes');
+        expect(w.pr.labels.map(l => l.name)).not.toContain('advisory:accepted');
+        expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toHaveLength(1);
+      }
+      expect(w.provider.postComment).toHaveBeenCalledTimes(2);
+      expect(w.pr.comments.some(c => c.body === acceptance)).toBe(true);
+      expect(w.row.conclusion).toBe('FAILURE');
+    });
+
+  it('recovers an interrupted repair-label restoration after a later accepting advisory', () => {
+    const w = world();
+    routeTestGaming(w.pr, w.options);
+    w.pr.comments.push(bot(`${ADVISORY_NOTE_MARKER}\n\n**Verdict:** Accept\n\n**Advisory outcome:** \`accept\`\n\nNet basis: \`${'0'.repeat(40)}..${HEAD}\``));
+    w.pr.labels = [{ name: 'review:human' }, { name: 'advisory:accepted' }];
+    w.provider.setLabels.mockImplementationOnce(() => { throw Error('label write interrupted'); });
+    expect(() => routeTestGaming(w.pr, w.options)).toThrow('label write interrupted');
+    expect(routeTestGaming(w.pr, w.options).snapshot.labels.map(l => l.name)).toContain('advisory:changes');
+    expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toHaveLength(1);
+    expect(w.provider.postComment).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not reopen a completed route when an accepting advisory arrives after the repair', () => {
+    const w = world();
+    routeTestGaming(w.pr, w.options);
+    w.pr.comments.push(bot(buildAdvisoryFixComment({})), bot(buildFixEndComment({ who: 'fix-5537', headSha: HEAD })),
+      bot(`${ADVISORY_NOTE_MARKER}\n\n**Verdict:** Accept\n\n**Advisory outcome:** \`accept\`\n\nNet basis: \`${'0'.repeat(40)}..${HEAD}\``));
+    sweepAdvisoryLabels({ repo: w.options.repo, listPrs: () => [structuredClone(w.pr)],
+      readPr: () => structuredClone(w.pr), provider: w.provider });
+    expect(routeTestGaming(w.pr, w.options).action).toBe('completed');
+    expect(w.pr.labels.map(l => l.name)).toContain('advisory:accepted');
+    expect(w.provider.postComment).toHaveBeenCalledOnce();
+    expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toEqual([]);
+  });
+
+  it('keeps the current repair dispatchable after a stale-head accepting advisory', () => {
+    const w = world();
+    routeTestGaming(w.pr, w.options);
+    w.pr.comments.push(bot(`${ADVISORY_NOTE_MARKER}\n\n**Verdict:** Accept\n\n**Advisory outcome:** \`accept\`\n\nNet basis: \`${'0'.repeat(40)}..${'b'.repeat(40)}\``));
+    for (let tick = 0; tick < 2; tick++) {
+      expect(routeTestGaming(w.pr, w.options).action).toBe('admitted');
+      sweepAdvisoryLabels({ repo: w.options.repo, listPrs: () => [structuredClone(w.pr)],
+        readPr: () => structuredClone(w.pr), provider: w.provider });
+      expect(w.pr.labels.map(l => l.name)).toContain('advisory:changes');
+      expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toHaveLength(1);
+    }
+    expect(w.provider.postComment).toHaveBeenCalledTimes(2);
+  });
+
   it.each(['before route', 'outsider', 'infra stall'])(
     'does not complete a route using a repair marker from %s', kind => {
       const w = world();

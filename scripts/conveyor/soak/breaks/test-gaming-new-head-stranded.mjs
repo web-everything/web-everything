@@ -10,8 +10,8 @@ export default {
   fixedBy: { sha: 'HEAD', where: 'lane/test-gaming-route', paths: ['scripts/conveyor/test-gaming-route.mjs'] },
   fixPresent(root) {
     const source = readFileSync(join(root, 'scripts/conveyor/test-gaming-route.mjs'), 'utf8');
-    return source.includes('const fixEndHead =') && source.includes('ended && isLatestAdvisoryFindingAddressed(comments)')
-      && source.includes('unresolved advisory finding');
+    return source.includes('const fixEndHead =') && source.includes('isLatestAdvisoryFindingAddressed(episode)')
+      && source.includes('unresolved advisory finding') && source.includes("newest?.outcome === 'accept'");
   },
   async run({ sourceRoot } = {}) {
     const root = sourceRoot ?? process.env.SOAK_TREE_ROOT ?? resolve(fileURLToPath(import.meta.url), '../../../../..');
@@ -76,6 +76,33 @@ export default {
       if (!plans.some(p => p.dispatch.some(d => d.kind === 'fix'))) violations.push('reclaimed unfinished repair is not eligible for a fixer');
     }
     if (pr.comments.filter(c => c.body.includes(`<!-- test-gaming-route: ${old} -->`)).length !== 1) violations.push('reclaim posted a duplicate route');
+
+    // Red-team PR #5537: a later acceptance and its label sweep cannot strand
+    // an unfinished route, including a reclaimed fixer that released its claim.
+    for (const { marker, acceptedHead } of [ADVISORY_NOTE_MARKER, CONVERTED_ADVISORY_NOTE_MARKER, 'Legacy advisory']
+      .flatMap(marker => [old, head].map(acceptedHead => ({ marker, acceptedHead })))) {
+      Object.assign(pr, structuredClone(initial));
+      route({ repo, prs: [pr] });
+      pr.comments.push(bot(`${marker}\n\n**Verdict:** Accept\n\n**Advisory outcome:** \`accept\`\n\nNet basis: \`${'0'.repeat(40)}..${acceptedHead}\``));
+      for (let retry = 0; retry < 3; retry++) {
+        if (retry === 1) pr.comments.push(bot(buildFixEndComment({ who: 'fix-5537', headSha: old })));
+        sweepAdvisoryLabels({ repo, listPrs: () => [structuredClone(pr)], readPr: () => structuredClone(pr), provider });
+        plans.length = reviews.length = 0;
+        tick();
+        sweepAdvisoryLabels({ repo, listPrs: () => [structuredClone(pr)], readPr: () => structuredClone(pr), provider });
+        if (!pr.labels.some(l => l.name === 'advisory:changes')) violations.push('later accepting advisory stranded the unfinished repair label');
+        if (!plans.some(p => p.dispatch.some(d => d.kind === 'fix'))) violations.push('later accepting advisory stranded the unfinished fixer dispatch');
+        if (reviews.length) violations.push('later accepting advisory launched a competing review');
+      }
+      if (pr.comments.filter(c => c.body.includes(`<!-- test-gaming-route: ${old} -->`)).length !== 2) violations.push('acceptance recovery must repost the binding finding exactly once');
+      pr.comments.push(bot(buildAdvisoryFixComment({})), bot(buildFixEndComment({ who: 'fix-5537', headSha: old })),
+        bot(`${ADVISORY_NOTE_MARKER}\n\n**Verdict:** Accept\n\n**Advisory outcome:** \`accept\`\n\nNet basis: \`${'0'.repeat(40)}..${old}\``));
+      sweepAdvisoryLabels({ repo, listPrs: () => [structuredClone(pr)], readPr: () => structuredClone(pr), provider });
+      plans.length = reviews.length = 0;
+      tick();
+      if (plans.some(p => p.dispatch.some(d => d.kind === 'fix'))) violations.push('acceptance reopened an already completed repair');
+      if (pr.comments.filter(c => c.body.includes(`<!-- test-gaming-route: ${old} -->`)).length !== 2) violations.push('completed repair was reposted after acceptance');
+    }
 
     // The latest advisory is binding fixer input: let an earlier defect finish first.
     for (const { marker, hasLabel } of [ADVISORY_NOTE_MARKER, CONVERTED_ADVISORY_NOTE_MARKER]

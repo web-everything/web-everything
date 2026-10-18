@@ -7,7 +7,7 @@
 import { ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
 import { isLatestAdvisoryFindingAddressed } from './advisory-fix-mark.mjs';
 import { CONVERTED_ADVISORY_NOTE_MARKER } from '../lib/review-escalation.mjs';
-import { latestAdvisory } from '../lib/advisory-labels.mjs';
+import { latestAdvisory, trustedAdvisoryComments } from '../lib/advisory-labels.mjs';
 import { latestFailingMergeGate, readMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
@@ -70,10 +70,16 @@ export function planTestGamingRoute({ pr, verdict, enabled = true } = {}) {
   if (justification) return { action: 'needs-you', reason: `test-removal-justified: ${justification}`,
     marker: noticeMarker(pr.headRefOid), notified: comments.some(isNotice(pr.headRefOid)),
     rulingRecorded: comments.some(c => isNotice(pr.headRefOid)(c) && latestAdvisory([c])?.outcome === 'inconclusive') };
-  const existing = routes.find(r => r.c.body.includes(routeMarker(pr.headRefOid)));
+  const existing = routes.filter(r => r.c.body.includes(routeMarker(pr.headRefOid))).at(-1);
   // Reclaim also posts fix-end. Only an explicit advisory repair mark completes
   // the finding; reuse reconcile's trusted, ordered episode check.
-  if (existing) return { action: ended && isLatestAdvisoryFindingAddressed(comments) ? 'completed' : 'admitted', body: existing.c.body };
+  if (existing) {
+    const nextNote = comments.findIndex((c, i) => i > existing.i && latestAdvisoryNote([c]));
+    const episode = comments.slice(existing.i, nextNote < 0 ? undefined : nextNote);
+    // A later panel note cannot undo a repair already recorded in our episode.
+    const addressed = isLatestAdvisoryFindingAddressed(episode) || isLatestAdvisoryFindingAddressed(comments);
+    return { action: ended && addressed ? 'completed' : 'admitted', body: existing.c.body };
+  }
   const latestNote = latestAdvisoryNote(comments.filter(isTrustedMarkerAuthor));
   // The fixer takes the latest advisory as binding input. Preserve an unrelated
   // pending finding until it is addressed, then admit the test-removal repair.
@@ -131,8 +137,18 @@ export function routeTestGaming(pr, { repo, provider = createGhProvider(), readV
   if (plan.action === 'admit') provider.postComment(repo, pr.number, plan.body);
   // Complete only our own finding episode; never supersede a newer panel's note.
   const latestNote = latestAdvisoryNote(comments.filter(isTrustedMarkerAuthor));
-  const ownsNote = plan.action === 'admit' || latestNote?.body === plan.body
+  let ownsNote = plan.action === 'admit' || latestNote?.body === plan.body
     || (plan.action === 'needs-you' && /<!-- test-gaming-route: [a-f0-9]{40} -->/.test(latestNote?.body ?? ''));
+  // A panel already in flight can accept before the fixer acts. Restore the
+  // binding finding as well as its labels, so the label sweep cannot strand it
+  // again. Match the sweep's parsed outcome (including legacy notes without a
+  // marker and stale-head accepts). The gate above proves our current head.
+  // Once posted, the durable note makes retries idempotent.
+  const newest = latestAdvisory(trustedAdvisoryComments(comments));
+  if (plan.action === 'admitted' && newest?.outcome === 'accept') {
+    provider.postComment(repo, pr.number, plan.body);
+    ownsNote = true;
+  }
   if (plan.action === 'needs-you') {
     if (!plan.notified) notify({ repo, pr: pr.number, head: pr.headRefOid, reason: plan.reason });
     if (!plan.notified || (ownsNote && !plan.rulingRecorded)) {
