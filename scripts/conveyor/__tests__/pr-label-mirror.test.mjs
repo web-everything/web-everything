@@ -399,7 +399,10 @@ describe('#5649 planLabelInputRows', () => {
     expect(planLabelInputRows({ ...opts, liveLabels: [], items: [tl('review:human', 'removed', 'operator')] })).toHaveLength(1);
     const clear = { type: 'verdict', ...buildVerdictRecord({ repo: REPO, pr: 7, verdict: 'accepted', at: approval.at, reason: 'cleared', headSha: HEAD, declaredActor: 'op', session: 's', channel: 'chat', source: 'review-set-label' }) };
     const addition = [tl('review:human', 'added', 'operator')];
-    expect(planLabelInputRows({ ...opts, events: [clear], headSha: HEAD, items: addition })).toEqual([]);
+    expect(planLabelInputRows({ ...opts, events: [clear], headSha: HEAD, items: addition })).toHaveLength(1);
+    const humanClear = { ...clear, verdict: 'clear-human' };
+    expect(planLabelInputRows({ ...opts, events: [humanClear], headSha: HEAD, items: addition })).toEqual([]);
+    expect(planLabelInputRows({ ...opts, events: [humanClear], headSha: 'b'.repeat(40), items: addition })).toHaveLength(1);
     expect(planLabelInputRows({ ...opts, events: [clear], headSha: 'b'.repeat(40), items: addition })).toHaveLength(1);
   });
   it('a bot or missing actor is hand-made for added, not for removed', () => {

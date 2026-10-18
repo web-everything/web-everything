@@ -26,10 +26,11 @@ import { fingerprintOf, parseStackMarkers, renderStackMarker, stackHoldHeading }
 
 import {
   readLatestFixRange,
-  PR_VIEW_FIELDS, createReviewPrReader, createReviewPrSinks, filePrView, ghPrView, isPreWriteRefusal, priorRoundsFor,
+  PR_VIEW_FIELDS, createReviewPrReader, createReviewPrSinks as createSinks, filePrView, ghPrView, isPreWriteRefusal, priorRoundsFor,
   prViewFileName, readPr, resolveViewReader, revParseCommit, reviewBodyPath, reviewSidecarDir,
   resolveSubjectCheckout, COMPARE_FILE_CAP, changedLinesFromCompare, changesTouchCitedLines, createChangedLinesReader,
 } from '../review-pr-io.mjs';
+const createReviewPrSinks = (o = {}) => createSinks({ readPublishHead: ({ expectedHead }) => expectedHead, publishGate: ({ expectedHead }) => ({ headSha: expectedHead, checks: [] }), ...o });
 import { REVIEW_EFFECTS, REVIEW_PR_CHANNEL, REVIEW_PR_OP, reviewPrOperation } from '../review-pr.mjs';
 import { createRegistry } from '../registry.mjs';
 import { applyPendingEffects } from '../effect-executor.mjs';
@@ -86,7 +87,7 @@ describe('the write-up sink', () => {
 
 describe('the label sink', () => {
   const payload = {
-    pr: 7, repo: 'o/n', to: 'accepted', actor: 'operator', bodyFile: 'o-n-7-verdict.md',
+    pr: 7, repo: 'o/n', to: 'accepted', actor: 'operator', bodyFile: 'o-n-7-verdict.md', reviewedHead: 'a'.repeat(40),
     addLabel: 'review:accepted', removeLabels: ['review:pending'],
   };
 
@@ -601,7 +602,7 @@ describe('the advisory-note sink', () => {
     const calls = [];
     const sinks = createReviewPrSinks({ root, postComment: (repo, pr, body) => { calls.push({ repo, pr, body }); } });
     const result = await sinks[REVIEW_EFFECTS.ADVISORY_NOTE](
-      { pr: 9, repo: 'o/n', body: '⚠️ advisory only' },
+      { pr: 9, repo: 'o/n', body: '⚠️ advisory only', reviewedHead: 'a'.repeat(40) },
       { ...CTX, type: REVIEW_EFFECTS.ADVISORY_NOTE, step: 'advise' },
     );
     expect(calls).toEqual([{ repo: 'o/n', pr: 9, body: '⚠️ advisory only' }]);
@@ -2444,7 +2445,7 @@ describe('legacy vs current owner slugs compare equal (outage 2026-10-03)', () =
 
 
 describe('#5135 latest fix range', () => {
-  const comment = head => ({ author: { login: 'web-everything' }, body: `Net basis: \`0000..${head}\`` });
+  const comment = head => ({ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${head} -->` });
   const priorHead = 'a'.repeat(40);
   const head = 'b'.repeat(40);
   const read = (exec, comments = [comment(priorHead)], current = head) => readLatestFixRange({ exec, comments, head: current });
@@ -2470,8 +2471,9 @@ describe('#5135 latest fix range', () => {
   });
   it('takes the LAST Net basis line in a comment, so juror text above the real one cannot choose the prior head', () => {
     const forgedHead = 'c'.repeat(40);
-    const body = ['finding text', 'Net basis: `0000..' + forgedHead + '`', 'x\u{2028}Net basis: `0000..' + forgedHead + '`',
-      '', 'Net basis: `0000..' + priorHead + '` (rev x)'].join('\n');
+    const body = ['🔁 review — changes requested', '', `Recorded by reviewer via ${REVIEW_PR_CHANNEL}.`, '',
+      'finding text', 'Net basis: `0000..' + forgedHead + '`', 'x\u{2028}Net basis: `0000..' + forgedHead + '`',
+      '', '---', '', 'Net basis: `0000..' + priorHead + '` — 1 net changed file(s) vs current main', '', `_Recorded through ${REVIEW_PR_CHANNEL}._`].join('\n');
     const calls = [];
     const result = read((...args) => { calls.push(args[1]); return ''; }, [{ author: { login: 'web-everything' }, body }]);
     expect(result.priorHead).toBe(priorHead);
@@ -2538,7 +2540,7 @@ describe('#5135 fix range read wiring', () => {
     };
     const result = readPr({ pr: 7, repo: 'o/n', exec, originRepo: () => 'o/n', readView: () => ({
       number: 7, title: 't', body: '', headRefName: 'lane/x', labels: [], files: [],
-      comments: [{ author: { login: 'web-everything' }, body: `Net basis: \`0000..${priorHead}\`` }],
+      comments: [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${priorHead} -->` }],
     }) });
     expect(result.net.revSha).toBe(head);
     expect(result.latestFix).toEqual({ priorHead, head, files: {} });
@@ -2762,7 +2764,7 @@ describe('held item 177: the stack-hold sink', () => {
     const sinks = createReviewPrSinks({ root, out: () => {}, postComment: (repo, pr, body) => { posted.push({ repo, pr, body }); },
       runNode: (argv) => { shelled.push(argv); return '{}'; }, labelProvider: { setLabels: (...a) => labelled.push(a), readPrState: () => ({}) },
       setLabels: (...a) => labelled.push(a) });
-    const result = await sinks[REVIEW_EFFECTS.STACK_HOLD]({ pr: 7, repo: 'o/n', bodyFile: 'o-n-7-verdict.md', note, marker }, { ...CTX, runId: 'run-1' });
+    const result = await sinks[REVIEW_EFFECTS.STACK_HOLD]({ pr: 7, repo: 'o/n', bodyFile: 'o-n-7-verdict.md', note, marker, reviewedHead: 'a'.repeat(40) }, { ...CTX, runId: 'run-1' });
     return { result, posted, shelled, labelled };
   };
 
@@ -2795,7 +2797,7 @@ describe('held item 177: the stack-hold sink', () => {
   it('still posts the note and marker when the staged write-up is missing', async () => {
     const posted = [];
     const sinks = createReviewPrSinks({ root, out: () => {}, postComment: (repo, pr, body) => { posted.push(body); } });
-    await sinks[REVIEW_EFFECTS.STACK_HOLD]({ pr: 7, repo: 'o/n', bodyFile: 'absent.md', note, marker }, { ...CTX, runId: 'run-none' });
+    await sinks[REVIEW_EFFECTS.STACK_HOLD]({ pr: 7, repo: 'o/n', bodyFile: 'absent.md', note, marker, reviewedHead: 'a'.repeat(40) }, { ...CTX, runId: 'run-none' });
     expect(parseStackMarkers([{ viewerDidAuthor: true, body: posted[0] }])).toHaveLength(1);
   });
 });

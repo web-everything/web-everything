@@ -1,4 +1,5 @@
 import { observeLedgerHead } from './lib/ledger-observation.mjs';
+import { signalFixDispatch } from './lib/fix-handoff.mjs';
 import { mandatoryReferralState, readReferralRecords, referralRecordState } from './lib/jury-core.mjs';
 import { referralSeatDisabled } from './operations/review-seat-policy.mjs';
 import { readReviewRunEvidence } from './conveyor/review-referral-hold.mjs';
@@ -1061,6 +1062,8 @@ export function runReviewLabelCli({
   // #5649 — the ledger sink for the `approval` row beside a `clear-human` verdict; injected only by tests (a refused
   // append), production writes through the same `appendVerdict` the verdict row uses.
   appendApproval = appendVerdict,
+  // The fix daemon's wake signal after a `review:changes` write; injected by tests so no run touches a real mailbox.
+  signalFix = signalFixDispatch,
 } = {}) {
   // Shadows the module-level `fail` so EVERY refusal inside this function goes to the
   // injected emitter too. Without this the guards print past an in-process caller's collector (#3061); the
@@ -1893,6 +1896,7 @@ export function runReviewLabelCli({
   // Guarded carry leaves the live acceptance label alone; its fresh-state check already ran before the ledger.
   const steps = { comment: postComment, swap: guardedRestamp ? () => {} : applySwap };
   for (const step of writeOrder({ acceptanceAlreadyLive })) { steps[step](); }
+  signalFix({ repo, pr, label: decision.addLabel });
   // PR #5273: labels have no conditional write. A re-park that read before this clearance can land its
   // `review:human` after the swap. When the comment went last, read once more after it and undo only that park.
   // (Comment-first order needs no extra read: the swap's own fresh read already follows the comment.)

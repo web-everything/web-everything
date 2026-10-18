@@ -17,9 +17,8 @@
  */
 import { pathToFileURL } from 'node:url';
 import { DEFAULT_REPO, readOpenPrs, buildDerivedRows } from '../review-ledger-check.mjs';
-import { readLedgerEventsFromStore, appendVerdictAsync, buildLedgerEvent, EVENT_TYPES, verdictClears, ledgerEventId } from '../lib/verdict-ledger.mjs';
-import { HOLD_LABELS } from '../lib/pr-state/holds/label-input.mjs';
-import { approvalValid, acceptanceCovers } from '../lib/pr-state/holds/verdict.mjs';
+import { readLedgerEventsFromStore, appendVerdictAsync, buildLedgerEvent, EVENT_TYPES, verdictClears, ledgerEventId, appliedVerdictHistory, eventsSinceHeadMove, foldVerdictLedger } from '../lib/verdict-ledger.mjs';
+import { HOLD_LABELS, clearanceAnswersHold } from '../lib/pr-state/holds/label-input.mjs';
 import { readPrFacts } from '../lib/pr-state-io.mjs';
 import { readGh } from '../lib/proc-read.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
@@ -141,8 +140,10 @@ const sameTime = (a, b) => Number.isFinite(Date.parse(a)) && Date.parse(a) === D
 export function planLabelInputRows({ repo, pr, items = [], liveLabels = [], selfLogin, events = [], observedEvents = events, now = Date.now(), headSha } = {}) {
   const self = String(selfLogin ?? '').toLowerCase();
   const live = new Set(liveLabels);
-  const clearances = events.filter(e => e.pr === pr && String(e.repo).toLowerCase() === String(repo).toLowerCase()
-    && (e.type === EVENT_TYPES.APPROVAL || ((e.type === EVENT_TYPES.VERDICT || e.type === undefined) && verdictClears(e.verdict))));
+  const mine = events.filter(e => e.pr === pr && String(e.repo).toLowerCase() === String(repo).toLowerCase());
+  const clearances = mine.filter(e => e.type === EVENT_TYPES.APPROVAL || ((e.type === EVENT_TYPES.VERDICT || e.type === undefined) && verdictClears(e.verdict)));
+  const applied = appliedVerdictHistory(mine, pr);
+  const active = new Set(eventsSinceHeadMove(mine, foldVerdictLedger(mine).get(pr)));
   // Capture causality before reading the timeline, not from the later idempotency refresh: a clear
   // landing during that refresh must also beat a historical addition in the same second.
   const observedIds = new Set(observedEvents.map(ledgerEventId));
@@ -166,9 +167,8 @@ export function planLabelInputRows({ repo, pr, items = [], liveLabels = [], self
     // This also covers the interval between clear-human's approval append and its live label swap.
     // GitHub timestamps describe a whole second. Only a strictly later second proves a clearance
     // followed this addition. Same-second ambiguity tightens; connection order keeps a re-add latest.
-    if (it.change === 'added' && clearances.some((e) => Math.floor(Date.parse(e.at) / 1000) > Math.floor(Date.parse(it.createdAt) / 1000)
-      && (approvalValid(e, now) || ((e.type === EVENT_TYPES.VERDICT || e.type === undefined)
-        && verdictClears(e.verdict) && acceptanceCovers(e, headSha))))) continue;
+    if (it.change === 'added' && clearances.some((e) => active.has(e) && Math.floor(Date.parse(e.at) / 1000) > Math.floor(Date.parse(it.createdAt) / 1000)
+      && clearanceAnswersHold(e, { label: it.label, head: headSha, now, applied }))) continue;
     const dup = events.some((e) => e?.type === EVENT_TYPES.LABEL_INPUT && e.pr === pr && String(e.repo).toLowerCase() === String(repo).toLowerCase()
       && e.label === it.label && e.change === it.change && (it.id && e.timelineId ? it.id === e.timelineId
         : !it.id && sameTime(e.at, it.createdAt) && JSON.stringify(e.clearanceBaseline) === JSON.stringify(clearanceBaseline)));

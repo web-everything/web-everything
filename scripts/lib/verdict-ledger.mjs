@@ -110,6 +110,7 @@ import { reserve, releaseLockDir } from '../readiness/file-locks.mjs';
 import { writeAllSync } from './write-all-sync.mjs';
 import { createGitLedgerStore, appendGitRowsSync } from './verdict-ledger-io.mjs';
 import { registerLedgerStore, getLedgerStore, describeLedgerStore } from './verdict-ledger-store.mjs';
+import { sameHead } from './pr-state/referrals.mjs';
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 // SCHEMA
@@ -793,10 +794,10 @@ export function ledgerObservationApplies(row, existing) {
   if (row.source === 'first-seen') return !mine.length || !observedLedgerHead(mine);
   if (['head-moved', 'carried'].includes(row.verdict)) {
     const head = observedLedgerHead(mine);
-    if (head !== row.fromHead) return false;
+    if (!sameHead(head, row.fromHead) || sameHead(head, row.coverage?.headSha)) return false;
     if (row.verdict === 'carried') {
       const current = foldVerdictLedger(mine).get(row.pr)?.current;
-      return current?.clears === true && current.coverage?.headSha === row.fromHead;
+      return current?.clears === true && sameHead(current.coverage?.headSha, row.fromHead);
     }
     return true;
   }
@@ -893,6 +894,11 @@ export function foldVerdictLedger(records) {
   return foldWithWitness(records).byPr;
 }
 
+/** Bearing verdicts the fold actually applied, in order; inert delayed rows cannot extend a clearance's lineage. */
+export function appliedVerdictHistory(records, pr) {
+  return foldWithWitness(records).bearingByPr.get(pr) ?? [];
+}
+
 /** The fold plus each PR's witnessed head, which a headless current hold does not carry on its own row. */
 function foldWithWitness(records) {
   /** @type {Map<number, FoldedPr>} */
@@ -921,18 +927,19 @@ function foldWithWitness(records) {
     if (lateFirstSeen && (r.clears || !verdictBears(r.verdict))) continue;
     if (transition) {
       // A review may already have witnessed the destination before this observation arrived.
-      if (witnessed && r.fromHead !== witnessed) continue;
+      if (sameHead(witnessed, head) || (witnessed && !sameHead(r.fromHead, witnessed))) continue;
       if (r.fromHead) superseded.add(r.fromHead);
-      superseded.delete(head); // a live transition may deliberately return to an earlier head
+      for (const old of superseded) if (sameHead(old, head)) superseded.delete(old); // a live transition may deliberately return to an earlier head
     }
     // A headless or superseded-head HOLD still applies (fail closed): the drain's park writers may lack a head or
     // name a stale snapshot head, and the label they set holds whatever head is live. Such a CLEAR stays history:
     // it cannot vouch for the witnessed head. Neither moves the witness.
-    const offWitness = lateFirstSeen || (!transition && witnessed && (!head || superseded.has(head)));
+    const offWitness = lateFirstSeen || (!transition && witnessed && (!head || [...superseded].some(old => sameHead(old, head))));
     if (offWitness && r.clears) continue;
     if (head && !offWitness && (verdictBears(r.verdict) || r.source === 'first-seen')) {
-      if (witnessed && witnessed !== head) superseded.add(witnessed);
-      witnessedHeads.set(r.pr, head);
+      if (witnessed && !sameHead(witnessed, head)) superseded.add(witnessed);
+      // A restamp may abbreviate the current SHA. Keep the fullest witness already known for that commit.
+      witnessedHeads.set(r.pr, sameHead(witnessed, head) && witnessed.length > head.length ? witnessed : head);
     }
     // #3329 — the non-bearing skip. `history` above is the ONLY thing an `observed` row touches.
     if (!verdictBears(r.verdict)) continue;
@@ -947,7 +954,7 @@ function foldWithWitness(records) {
     bearing.forEach((r, i) => { if (r.clears) lastClearAt = i; });
     entry.outstandingHolds = bearing.slice(lastClearAt + 1).filter((r) => !r.clears);
   }
-  return { byPr, witnessedHeads };
+  return { byPr, witnessedHeads, bearingByPr };
 }
 
 /**

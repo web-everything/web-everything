@@ -71,3 +71,7 @@ Live before/after on a real card: run `node we:scripts/check-backlog-item.mjs 40
 - Part 2 of this card: require an explicit "on error/unknown, refuse" Must on gate-type cards. Needs a deterministic definition of "gate-type" first (tag or kind signal); file as its own item once one exists.
 - Promote the placeholder rule from WARNING to error after the 9 existing active cards are filled in.
 - Fill the placeholder on those 9 active cards (each is its own builder's job).
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5493 (finding 1: `we:backlog/6194-fixer-treats-operator-decisions-scope-baseline-and-main-regr.md:31` — Add a check:standards rule that fails when a card whose scope touches scripts/conveyor/ still has 'TODO' on the Untrusted-text or Who-wrote-it edge-case lines, before status can move from open to in-progress.) · key `approval-prevention-key:web-everything/web-everything#5493@3364a0972aa0a6d7b47220c80623103aa4f697c9`

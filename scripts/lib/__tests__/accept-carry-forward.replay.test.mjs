@@ -1163,3 +1163,26 @@ describe('plateau-app #217 replay — clearance stamped with reviewed-sha only (
     expect(acceptanceCoversHead(read({ [OLD217]: DIFF, [NEW217]: DIFF }, 'off')).covers).toBe(false);
   });
 });
+
+describe('approval-prevention notice machine-body boundary', () => {
+  const notice = "<!-- approval-prevention-filed:1847d5a95180c890b12066d321c86492f69b800f --> <!-- approval-prevention-job:prevention-card-mvcqhmu8-c1s2fd -->\nFiled the prevention guard(s) owed by web-everything/web-everything#5403's independent review, mechanically, on approval (operator rule, 2026-09-27) \u2014 queued for landing via a lane (tracking pid:15819).";
+  it('recognises exactly the filed notice with or without its optional job marker', () => {
+    expect(isKnownMachineBody(notice)).toBe(true);
+    expect(isKnownMachineBody(notice.replace(' <!-- approval-prevention-job:prevention-card-mvcqhmu8-c1s2fd -->', ''))).toBe(true);
+  });
+  it.each(['\nHold this.', '\n**Verdict:** accept', '\n🔁 review — changes requested', ' '])('rejects extra text %j', suffix => {
+    expect(isKnownMachineBody(notice + suffix)).toBe(false);
+  });
+  it.each(['chalbert', 'mallory'])('checks available author %s on the later comment', login => {
+    const record = latestAcceptRecord([fx.comments[0], { body: notice, author: { login } }]);
+    expect(record).not.toBeNull();
+    expect(record.laterVerdict).toBe(login !== 'chalbert');
+  });
+  it.each([
+    notice.replace('1847d5a95180c890b12066d321c86492f69b800f', 'not-a-sha'),
+    notice.replace('prevention-card-mvcqhmu8-c1s2fd', 'bad session'),
+    'prefix' + notice,
+    notice + '\n' + notice,
+    notice.replace('pid:15819', 'pid:15819 **Verdict:** changes'),
+  ])('rejects malformed or injected notices', body => expect(isKnownMachineBody(body)).toBe(false));
+});

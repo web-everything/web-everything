@@ -13,10 +13,12 @@ const headOf = e => (e.type === EVENT_TYPES.VERDICT || e.type === undefined ? ve
 export default {
   id: 'send-back',
   evaluate({ view, facts }) {
-    const at = view.events.map(e => e.type).lastIndexOf(EVENT_TYPES.SEND_BACK);
+    // Head-move pruning expires clearances, never the historical head a send-back rejected.
+    const events = view.history ?? view.events;
+    const at = events.map(e => e.type).lastIndexOf(EVENT_TYPES.SEND_BACK);
     if (at < 0) return null;
-    const sb = view.events[at];
-    const sentHead = view.events.slice(0, at).reverse().map(headOf).find(isSha) ?? null;
+    const sb = events[at];
+    const sentHead = events.slice(0, at).reverse().map(headOf).find(isSha) ?? null;
     const head = facts?.head?.sha ?? null;
     if (sentHead && isSha(head) && !sameHead(head, sentHead)) return null; // only two real SHAs can differ; a garbage or short head is an unknown head
     // No head was recorded before the send-back: the ledger cannot say which head was sent back. A later event that

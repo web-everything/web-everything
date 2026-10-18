@@ -11,6 +11,7 @@ import { proveNumberingOnlyMove, resolveNumberingHumanClearanceSetting } from '.
 import { proveIdenticalHeadTrees, resolveHumanClearanceCarrySetting } from './human-clearance-carry.mjs';
 import { proveIdenticalNetPatch, resolveIdenticalNetPatchSetting } from './identical-net-patch.mjs';
 import { resolveAcceptCarryForward } from './accept-carry-forward.mjs';
+import { sameHead } from './pr-state/referrals.mjs';
 
 export function resolveLedgerObservationSettings({ tool = readSettings().ledger, platform, env = process.env } = {}) {
   return cascadePolicy('ledger', tool, { standard: { firstSeenRows: true, headMoveInvalidation: true }, platform, env,
@@ -63,10 +64,10 @@ export function planLedgerObservation({ repo, pr, headSha, state = 'OPEN', label
     return [buildVerdictRecord({ ...fields, verdict, source: 'first-seen', state: label ?? 'unreviewed',
       reason: 'first observed open head; labels alone do not prove an acceptance' })];
   }
-  if (!settings.value.headMoveInvalidation || oldHead === headSha) return [];
+  if (!settings.value.headMoveInvalidation || sameHead(oldHead, headSha)) return [];
   const current = foldVerdictLedger(mine).get(pr)?.current;
   // Never carry a stale acceptance through an intervening unreviewed head or a hold.
-  const canCarry = current?.clears === true && current.coverage?.headSha === oldHead;
+  const canCarry = current?.clears === true && sameHead(current.coverage?.headSha, oldHead);
   const rule = canCarry ? proveCarry({ repo, fromSha: oldHead, toSha: headSha, human: current.verdict === 'clear-human' || current.state === 'clear-human' }) : null;
   return [buildVerdictRecord({ ...fields, source: 'head-observer', fromHead: oldHead,
     verdict: rule ? 'carried' : 'head-moved', carryRule: rule,
@@ -109,7 +110,7 @@ export function observeLiveLedgerHead({ repo, pr, listedHeadSha = null }, option
   if (listed && typeof options.read === 'function') {
     try {
       const mine = options.read(repo).filter(e => e.repo.toLowerCase() === repo.toLowerCase() && e.pr === Number(pr));
-      if (mine.length && observedLedgerHead(mine) === listed) return { ok: true, rows: [], skipped: 'head-unchanged' };
+      if (mine.length && sameHead(observedLedgerHead(mine), listed)) return { ok: true, rows: [], skipped: 'head-unchanged' };
     } catch { /* an unreadable snapshot never skips: the live read below decides, and logs its own miss */ }
   }
   return observeLedgerPrEvent({ repo }, pr, options);

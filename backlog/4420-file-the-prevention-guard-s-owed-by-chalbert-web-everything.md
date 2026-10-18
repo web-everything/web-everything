@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/__tests__/pr-ownership-io-real.test.mjs"]
+
 dateOpened: "2026-09-28"
 preparedDate: "2026-10-17"
 preparedAgainstSha: "6585e918c78551181559fe97261f19918d8b323b"
@@ -62,3 +62,12 @@ First capture a green focused baseline with the unmodified reader. Run the focus
 ## Follow-ups
 
 None required. The existing injection seam supports the requested prevention guard without a production API change, new dependency, or additional backlog edge.
+
+## Findings (standalone worker, 2026-10-17)
+
+The build-dispatch daemon held #4420 with:
+
+> worker-declined: The spec is contradictory as written: “Touch ONLY test files or test fixtures” conflicts with Done-when 3’s required temporary mutation of 'we:scripts/operations/pr-ownership-io.mjs'. Per your instruction for contradictory specs, I changed nothing and ran no tests. The existing backlog-file modification was already present and remains untouched.
+
+`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
+a prepare pass re-scopes it against the finding.

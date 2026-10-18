@@ -277,6 +277,11 @@ future-dated exhausted budget can otherwise make a fresh world wait for the prod
 Use the clone's routing policy rather than an inherited daemon snapshot, and exclude generated
 GitHub App shim directories before scanning the host's tool PATH.
 
+General simulator and soak fixtures model the full required-check set and pin `WE_REVIEW_START_AFTER=ci-green`
+in the shared world environment. Keep the planner and dispatch-time gate on the same fixture policy across
+daemon restarts. Production fast-check eligibility is covered by `review-timing-dispatch.test.mjs` and
+`review-ci-gate-io.test.mjs`; scenarios exercising that timing must explicitly set their world policy and checks.
+
 Fake-`gh` CLI fixtures that exercise throttling must set `WE_GH_THROTTLE_LOCK_ROOT` to a temporary
 directory per invocation and route the binary to their fake. An intentional rate-limit response writes
 cooldown state; sharing that state with another test or the host delays unrelated reads.
@@ -1494,6 +1499,32 @@ Run `nightly-coroner-*.test.mjs` under `scripts/conveyor/__tests__/` through hea
 Cover ET boundaries and DST, persisted job adoption/catch-up, source logging, cursor continuity,
 publication deduplication, real isolated extraction, and release without cursor advance on failure.
 
+## Automated repair hand-offs
+
+`review-set-label` and the red-team gate signal the local fix daemon after a successful
+send-back. CI lifecycle/status writers use the same `scripts/lib/fix-handoff.mjs` wake
+path after their existing classification; they do not classify failures a second time.
+The mailbox survives signals during a tick; one-second file polling interrupts the plain
+sleep without consuming native filesystem watchers, and the optional webhook sleep also checks the mailbox. `WE_FIX_HANDOFF_DIR`
+provides an isolated mailbox for tests. A wake only schedules a normal pass; claims,
+scope, host admission and attempt budgets remain authoritative.
+
+The shared policy cascade resolves `fix.sendBackReservedSlots` (standard 1),
+`fix.ciMissingAfterPushMin` (standard 10), and `drain.mergeableUnknownRepollSec`
+(standard 20), independently through platform preferences, declared tool settings and
+`WE_FIX_SEND_BACK_RESERVED_SLOTS`, `WE_FIX_CI_MISSING_AFTER_PUSH_MIN`, and
+`WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC`. The cascade logs the value and source in
+daemons. Ordinary repairs cannot consume reserved slots, even after memory pressure
+reduces the effective cap; a send-back still needs host admission.
+
+The fixer pusher ensures `checking` and `status:awaiting-ci` exist before marking its new
+head with them. Test an initially empty repository label catalog and a same-head retry;
+`gh pr edit --add-label` refuses labels that have not been created. The existing
+`ci-red-recovery-watch` missing-run pass re-requests absent CI after the configured
+age (using a recorded fixer push time when available), retaining its conflict, claim, head and retry-budget guards. The drain re-reads
+UNKNOWN listings before collecting head-bound context and also revalidates before
+merging, waiting for the configured delay at most three times per read stage.
+
 ## Referral re-checks on the live head
 
 `review.recheckCarriedReferrals` and `review.autoPolicyRespectsNotReal` default true in
@@ -1557,6 +1588,17 @@ head (paginated); omit `--dry-run` to append through the normal ledger writer an
 `head-moved` is a holding verdict at the new head and ends implicit approval scope. A `carried` verdict
 requires the previous live acceptance to name the immediately preceding head, plus an existing numbering,
 exact root-tree identity, or identical-net-patch proof; `fromHead` and `carryRule` retain the witness.
+Carries and restamps cannot answer a later manual hold, including mirrored inputs with a clearance baseline.
+An explicit valid approval or a fresh `clear-human` verdict covering the head must answer a manual human
+hold; an ordinary acceptance cannot. Send-back checks bind to the full scoped history so they still know
+the head rejected even after movement pruning expires a verdict or exemption's authority. Abbreviated restamp SHAs use
+the existing same-head comparison and never shorten a fuller witness or manufacture an invalidation.
+`ledger-head-lifecycle.test.mjs` replays all three carry rules against manual human holds, send-back releases
+across multiple moves, and abbreviated restamps through the planner, fold, append guard and drain observer.
+A human clearance that already answered a hold may follow equivalent carried/restamped heads; the chain
+starts at that fresh human answer, so it cannot answer a hold added after the source clearance.
+The label mirror's timeline input planner shares the same answer predicate, so it cannot discard a manual
+hold merely because a later carry exists. `ledger-manual-hold-input.test.mjs` exercises that production path.
 Observation preconditions are rechecked inside the home append lock and each transport retry, so a delayed
 baseline cannot overwrite a review or a delayed head observation overwrite a newer one. Feed events re-read
 GitHub's live head because delivered events and drain list snapshots may describe an older head. The bare
@@ -1581,6 +1623,45 @@ Regression coverage includes the four observation-setting combinations, late tra
 stale drain snapshots, reconciliation replay, and first-seen/head-moved/carried transport retry races.
 Unreadable ledgers are write misses,
 never empty ledgers. These records do not change the authority rollout setting.
+
+### Scope-only prepare re-validation
+
+The builder may send an individually dispatched `prepare-stale` card through a light
+re-validation before full preparation, only when the hold says scope changed (age
+holds still require full preparation). `prepare.lightRevalidate` defaults to true;
+`prepare.lightRevalidateMaxDiffLines` defaults to 400. Both use the prepare policy
+cascade and source logger, with `WE_PREPARE_LIGHT_REVALIDATE` and
+`WE_PREPARE_LIGHT_REVALIDATE_MAX_DIFF_LINES` environment overrides.
+
+The prepare runner supplies the existing card sections and the scope diff from
+`preparedAgainstSha` to the pinned main base to Codex sol at low effort. The worker
+must return JSON `{ "verdict": "still-valid" | "needs-reprepare", "reason": "one line" }`
+and leave the checkout unchanged. Only `still-valid` allows the runner to append
+`revalidated: <reason>` and refresh the sanctioned stamp. Missing evidence, invalid
+answers, disabled policy, and diffs above the cap use full preparation. A worker
+that changes files, HEAD, or hooks is refused. The worker runs in Codex's `--review`
+read-only sandbox with no network; that sandbox is the guard for edits deep inside
+collapsed ignored directories such as node_modules. As a second check, a fingerprint of
+the gitignored entries git lists (content for files up to 1 MiB, mode/size/mtime for
+collapsed directories, so only adding or removing a direct child shows there) is
+compared after the run. A change escalates for a human because a discard does not
+restore ignored files.
+Re-stamps use the existing verified
+card-only prepare PR lane; the builder waits for the stamp to land on main before
+building. Light candidates are excluded from grouped prepares so each verdict
+covers exactly the card and diff inspected. No direct write to main is permitted.
+
+Regression coverage must pair dispatch eligibility with age-stale and policy-disabled
+false cases, and exercise light candidates in both group-lead and group-member positions.
+Drive each read-only refusal guard independently (card text, HEAD, hooks, ignored files, and numstat),
+asserting discard and no stamp, commit, or PR. A failed stamp after `still-valid` must
+retry full preparation with the original dispatched provider, model, and effort; the
+result's scorecard and PR attribution follow whichever worker completed preparation.
+The light worker bypasses the router, so it applies the router's admission itself: a
+critical miss on its exact provider/model/prepare triple, an active provider quota hold,
+or an unreadable trial history skips it for full preparation by the dispatched worker.
+Prompt evidence uses the shared `fenceUntrusted` helper and `FENCED_DATA_RULE`; test
+closing-tag injection in both the card and diff, including mixed case and whitespace.
 
 ## Review scratch disk retention
 
@@ -1617,3 +1698,18 @@ warn below `health.diskFreeMinGb` (30 GiB), critical below 10 GiB. It opens imme
 notifies in shadow mode, and sends an opening event through the needs-you feed's serialized
 publisher. Host, subject and opening time identify each event, including reopenings within
 the same minute. Fixture state roots and dry runs never publish these events.
+
+### Tests-first delivery settings
+
+Prepared open cards must replace the Acceptance scaffold's `TODO: a command` with executable
+acceptance, one `[A<n>] Executable` line per guarantee. Unprepared cards remain exempt. Builders
+run and record failing acceptance tests before implementation, make their first commit contain
+only those new or updated tests, and report the named tests' red-then-green results. Reviewers
+map every stated Acceptance guarantee to a named test and report missing mappings as findings.
+
+`build.requireExecutableAcceptance`, `build.redFirst`, and `build.guaranteesMapToTests` default
+ON. They resolve through the shared policy cascade: standard → platform → repository
+(`scripts/settings/tests-first.json`) → environment (the `WE_BUILD_*` names documented there),
+with each source logged. Dispatch strips disabled brief sections. The verify step's first-commit
+check applies to build lane branches and delivery leases on local `main`, and warns if no test was added or updated; this advisory
+cannot prove a red run. Git-read errors are reported as unknown rather than evidence of compliance.

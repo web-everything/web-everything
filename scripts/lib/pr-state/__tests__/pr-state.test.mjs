@@ -92,7 +92,8 @@ describe('hold rules', () => {
     expect(state([verdict(VERDICTS.ACCEPTED, 1), added], facts()).lifecycleState).toBe('NEEDS-OPERATOR');
     const heldByChanges = state([verdict(VERDICTS.CHANGES, 1), removed], facts());
     expect(heldByChanges.clears).toBe(false);
-    expect(state([added, verdict(VERDICTS.ACCEPTED, 9)], facts()).holds).toEqual([]);
+    expect(state([added, verdict(VERDICTS.ACCEPTED, 9)], facts()).holds.map(h => h.code)).toContain('label-input:review:human');
+    expect(state([added, verdict(VERDICTS.CLEAR_HUMAN, 9)], facts()).holds).toEqual([]);
   });
   it('an approval lifts a human hold unless its delegation expired', () => {
     const approval = d => ev('approval', 5, { approval: 'judge', delegation: d });
@@ -206,11 +207,14 @@ describe('fail closed: every hold rule defaults to deny (review of PR #4326)', (
 
   describe('a clearing verdict lifts a hand-added hold only if it covers the current head', () => {
     const added = ev('label-input', 4, { label: 'review:human', sender: 'someone', change: 'added' });
-    it('an accept witnessed on another head, or on no head, leaves the label hold', () => {
+    it('only a human clearance covering the current head lifts a manual human hold', () => {
       const f = facts({ head: { sha: H2, committedAt: at(3) } });
       expect(state([added, verdict(VERDICTS.ACCEPTED, 9, H1)], f).holds.map(h => h.code)).toContain('label-input:review:human');
       expect(state([added, verdict(VERDICTS.ACCEPTED, 9, null)], f).holds.map(h => h.code)).toContain('label-input:review:human');
-      expect(state([added, verdict(VERDICTS.ACCEPTED, 9, H2)], f).holds.map(h => h.code)).not.toContain('label-input:review:human');
+      expect(state([added, verdict(VERDICTS.ACCEPTED, 9, H2)], f).holds.map(h => h.code)).toContain('label-input:review:human');
+      expect(state([added, verdict(VERDICTS.CLEAR_HUMAN, 9, H1)], f).holds.map(h => h.code)).toContain('label-input:review:human');
+      expect(state([added, verdict(VERDICTS.CLEAR_HUMAN, 9, null)], f).holds.map(h => h.code)).toContain('label-input:review:human');
+      expect(state([added, verdict(VERDICTS.CLEAR_HUMAN, 9, H2)], f).holds.map(h => h.code)).not.toContain('label-input:review:human');
     });
   });
 
@@ -371,10 +375,10 @@ describe('fail closed: every hold rule defaults to deny (review of PR #4326)', (
         expect(run([row], headed(H2), row)).toContain('stale-acceptance');
         expect(run([row], headed(H1), row)).not.toContain('stale-acceptance');
       });
-      it('label-input: the coverage-less accept for another head leaves a hand-added hold', () => {
+      it('label-input: a coverage-less human clearance must witness the current head', () => {
         const added = ev('label-input', 0, { label: 'review:human', sender: 'someone', change: 'added' });
-        expect(run([added, rawVerdict()], headed(H2))).toContain('label-input:review:human');
-        expect(run([added, rawVerdict({ headSha: H2 })], headed(H2))).not.toContain('label-input:review:human');
+        expect(run([added, rawVerdict({ verdict: 'clear-human' })], headed(H2))).toContain('label-input:review:human');
+        expect(run([added, rawVerdict({ verdict: 'clear-human', headSha: H2 })], headed(H2))).not.toContain('label-input:review:human');
       });
       it('a coverage object that names no head is not rescued by a top-level headSha', () => {
         const row = rawVerdict({ coverage: { headSha: null } });

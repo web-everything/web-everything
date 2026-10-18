@@ -648,7 +648,7 @@ Run \`npx vitest run\` with \`${test}\` (strip the locus prefix).
       git(['update-ref', 'HEAD', baseline]);
       git(['update-ref', 'refs/remotes/origin/main', baseline]);
       symlinkSync(join(ROOT, 'node_modules'), join(repo, 'node_modules'), 'dir');
-      for (const f of ['scripts/check-standards.mjs', 'scripts/check-standards-rules.mjs', 'scripts/lib/backlog-status.cjs', 'scripts/lib/git-grep-gate.mjs', 'backlog/026-droplist-njk-family-wording.md', 'backlog/027-droplist-trait-language.md']) copyFileSync(join(ROOT, f), join(repo, f));
+      for (const f of ['scripts/check-standards.mjs', 'scripts/check-standards-rules.mjs', 'scripts/lib/backlog-status.cjs', 'scripts/lib/git-grep-gate.mjs', 'scripts/lib/tests-first-policy.mjs', 'scripts/lib/policy-cascade.mjs', 'scripts/lib/settings-files.mjs', 'scripts/lib/under-test.mjs', 'scripts/lib/under-test.cjs', 'backlog/026-droplist-njk-family-wording.md', 'backlog/027-droplist-trait-language.md', 'backlog/4397-salvagelane-aborts-forever-on-a-socket-fifo-device-file-unde.md']) copyFileSync(join(ROOT, f), join(repo, f));
       const runGate = (args) => {
         const result = spawnSync(process.execPath, ['scripts/check-standards.mjs', '--json', ...args], {
           cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 360_000,
@@ -720,7 +720,7 @@ ${note}
       execFileSync('git', ['clone', '--quiet', '--shared', ROOT, repo], { stdio: 'pipe' });
       symlinkSync(join(ROOT, 'node_modules'), join(repo, 'node_modules'), 'dir');
       // The shared clone has only committed state: overlay the files under test.
-      for (const f of ['scripts/check-standards.mjs', 'scripts/check-standards-rules.mjs', 'scripts/lib/backlog-status.cjs', 'scripts/lib/git-grep-gate.mjs', 'backlog/026-droplist-njk-family-wording.md', 'backlog/027-droplist-trait-language.md']) copyFileSync(join(ROOT, f), join(repo, f));
+      for (const f of ['scripts/check-standards.mjs', 'scripts/check-standards-rules.mjs', 'scripts/lib/backlog-status.cjs', 'scripts/lib/git-grep-gate.mjs', 'scripts/lib/tests-first-policy.mjs', 'scripts/lib/policy-cascade.mjs', 'scripts/lib/settings-files.mjs', 'scripts/lib/under-test.mjs', 'scripts/lib/under-test.cjs', 'backlog/026-droplist-njk-family-wording.md', 'backlog/027-droplist-trait-language.md', 'backlog/4397-salvagelane-aborts-forever-on-a-socket-fifo-device-file-unde.md']) copyFileSync(join(ROOT, f), join(repo, f));
       // The gate's scope guards need an origin/main base ref; a clone of a CI checkout has none (the empty-stdout failure).
       execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repo });
       const warnings = () => {
@@ -763,7 +763,7 @@ ${note}
       execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repo, stdio: 'pipe' });
       symlinkSync(join(ROOT, 'node_modules'), join(repo, 'node_modules'), 'dir');
       // The shared clone has only committed state: overlay the files under test.
-      for (const f of ['scripts/check-standards.mjs', 'scripts/check-standards-rules.mjs', 'scripts/lib/backlog-status.cjs', 'scripts/lib/git-grep-gate.mjs', 'backlog/026-droplist-njk-family-wording.md', 'backlog/027-droplist-trait-language.md']) copyFileSync(join(ROOT, f), join(repo, f));
+      for (const f of ['scripts/check-standards.mjs', 'scripts/check-standards-rules.mjs', 'scripts/lib/backlog-status.cjs', 'scripts/lib/git-grep-gate.mjs', 'scripts/lib/tests-first-policy.mjs', 'scripts/lib/policy-cascade.mjs', 'scripts/lib/settings-files.mjs', 'scripts/lib/under-test.mjs', 'scripts/lib/under-test.cjs', 'backlog/026-droplist-njk-family-wording.md', 'backlog/027-droplist-trait-language.md', 'backlog/4397-salvagelane-aborts-forever-on-a-socket-fifo-device-file-unde.md']) copyFileSync(join(ROOT, f), join(repo, f));
       const warnings = () => {
         const r = spawnSync(process.execPath, ['scripts/check-standards.mjs', '--json', '--local', `--files=${card}`], {
           cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 180_000,

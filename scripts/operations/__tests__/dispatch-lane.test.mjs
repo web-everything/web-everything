@@ -1,3 +1,4 @@
+import { applyTestsFirstPolicy } from '../../lib/tests-first-policy.mjs';
 /**
  * @file dispatch-lane.test.mjs — the effect that STARTS rather than completes (#3037, under epic #3029).
  *
@@ -2297,7 +2298,7 @@ describe('#3165: the planner\'s prepare lists reach the spawner', () => {
    *  the KIND'S OWN required set (not `fillBrief`'s build-shaped default), so a name only one kind's brief
    *  carries — `DELIVERY_BASE` since #3637 — is never demanded of a kind that has no such token. */
   function expectedPrompt(kind, values) {
-    return fillBrief(readFileSync(briefPath(REPO_ROOT, kind), 'utf8'), values, BRIEF_REQUIRED_BY_KIND[kind]).prompt;
+    return fillBrief(applyTestsFirstPolicy(readFileSync(briefPath(REPO_ROOT, kind), 'utf8')), values, BRIEF_REQUIRED_BY_KIND[kind]).prompt;
   }
 
   // ── criterion 1 ──────────────────────────────────────────────────────────────────────────────────────────

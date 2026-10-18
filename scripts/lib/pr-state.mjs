@@ -52,6 +52,8 @@ export function ledgerView(events, facts) {
   let mine = scope ? scopedEvents(events, scope) : [];
   // Fold the complete stream so a delayed transition cannot erase a review that already witnessed its head.
   const folded = scope ? foldVerdictLedger(mine.filter(isVerdictRow)).get(scope.pr) ?? null : null;
+  // A send-back binds to the head witnessed before it, even after that witness loses clearance authority.
+  const history = mine;
   // Approvals have legacy implicit head scope. A movement boundary ends that scope.
   mine = eventsSinceHeadMove(mine, folded);
   const cur = folded?.current ?? null;
@@ -63,7 +65,7 @@ export function ledgerView(events, facts) {
   const reviewExempt = (!cur || (cur.verdict === 'head-moved' && mine.indexOf(lastExempt) > mine.indexOf(cur))) && fullSha(lastExempt?.headSha) && fullSha(facts?.head?.sha)
     && lastExempt.headSha.toLowerCase() === facts.head.sha.toLowerCase();
   clears = clears || reviewExempt;
-  return { events: mine, folded, clears, reviewExempt, referrals: deriveReferrals(mine) };
+  return { events: mine, history, folded, clears, reviewExempt, referrals: deriveReferrals(mine) };
 }
 
 /** Map a core phase plus the hold picture to a lifecycle state. The core's phase is kept except for two restrictions. */
