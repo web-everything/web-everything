@@ -1688,9 +1688,30 @@ The health log records each effective value and source. Fixture and dry-run tick
 A stable `nightly-coroner-YYYY-MM-DD` job ID and retained daily records enforce one job per ET night
 without depending on health `state.json`. The next live tick catches up the most recent due night,
 including before tonight's deadline after a restart; multiple missed nights coalesce into one extraction.
-There is one attempt per night: a failed/crashed attempt is exposed as a health probe failure, and the
-next night's extraction still starts at the last successfully published cursor. This avoids a second
-extraction for the same night. Never prune daily job records without preserving the once-per-night ledger.
+`coroner.nightly.laneWaitMs` defaults to 600000 and is passed to lane-pool's normal `--wait-ms`.
+`attempts` defaults to 3; the daemon retries the whole run with exponential backoff starting at
+`retryBackoffMin` (10 minutes). `deadlineEt` defaults to `03:30` on the following ET calendar date;
+no attempts launch after that deadline, including late catch-up. DST uses New York wall time:
+nonexistent deadlines expire at the first valid instant after the spring-forward gap; ambiguous
+deadlines use the first occurrence. Pin ordinary, gap (multiple configured minutes), and repeated
+wall times to explicit UTC instants in the named deadline tests.
+Exhaustion or a missed deadline emits a deduplicated needs-you event and the `nightly-coroner-failed`
+health smell, naming the job, last error and attempts. `alertAfterProbeFailures` (default 3) also
+alerts on consecutive `nightlyCoronerJob` probe errors, including exceptions before a record exists.
+This smell notifies in shadow mode. A successful probe resets the streak.
+Only the currently due night's job contributes to `alerts` and `failures`; retained failed nights
+remain historical ledger entries and feed events. Advancing to the next night clears their health
+episodes. A terminal job failure does not count as a supervisor probe error or emit a second probe
+failure event. Test this through the real job ledger and health tick, across a failed then successful
+night and repeated later ticks; the `nightly-coroner-retained-failure` soak break preserves the incident.
+Failure feed fields are scrubbed, sanitized and bounded before append; test the raw line with a
+credential-shaped token, oversized text, line separators and bidi controls. Every configurable
+behavior needs a valid nondefault value test asserting its observable effect, alongside fallback
+tests. The named lane-wait and retry-backoff tests pin exact arguments and persisted retry times;
+the fresh late-catch-up test asserts zero launches and lane acquisitions plus a deadline alert.
+For alerts sourced from any persistent ledger, define and test when the active alert clears.
+The next night's extraction still starts at the last successfully published cursor; retries recover
+an existing report through its receipt rather than extracting twice. Never prune daily job records without preserving the once-per-night ledger.
 
 The child leases a lane via the lane-pool CLI, runs its `coroner-extract.mjs` (which imports
 `coroner-rounds.mjs`) with explicit `--since`/`--until`, `--json`, `--no-save`, and releases the lane in
