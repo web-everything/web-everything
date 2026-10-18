@@ -58,7 +58,8 @@ export function scheduledLaneGc(lanes, { stateRoot = hostStateRoot(), exec = exe
         if (!host.admitted) { log(`gc skipped: ${host.reason}`); return { ran, reason: host.reason }; }
         exec('git', ['-c', 'gc.auto=0', '-c', 'gc.autoDetach=false', '-c', 'gc.pruneExpire=never', 'gc', '--no-detach'], { cwd: lane, timeout: 120000, stdio: 'pipe' });
         cursor[key] = nowMs;
-        if (Buffer.byteLength(JSON.stringify(cursor)) > 256 * 1024) throw Error('gc cursor too large');
+        // Match writeJsonAtomic's indentation and trailing newline, including at the read limit.
+        if (Buffer.byteLength(`${JSON.stringify(cursor, null, 2)}\n`) > 256 * 1024) throw Error('gc cursor too large');
         writeJsonAtomic(file, cursor);
         ran = true;
       }

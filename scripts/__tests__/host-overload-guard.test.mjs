@@ -1,5 +1,5 @@
 import { it, expect, vi, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -71,6 +71,23 @@ it('scheduled gc is host single-flight and skips before the next due pass', asyn
   expect(scheduledLaneGc(['/pool/lane-1', '/pool/lane-2'], opts).ran).toBe(true);
   expect(exec).toHaveBeenCalledTimes(2);
   expect(scheduledLaneGc(['/pool/lane-1'], opts).ran).toBe(false);
+});
+
+it('gc refuses cursor serialization beyond the read limit and preserves the readable cursor', async () => {
+  const { scheduledLaneGc, digest } = await import('../lib/host-load.mjs');
+  const { boundedText } = await import('../lib/host-overload-settings.mjs');
+  const stateRoot = temp();
+  const cursor = Object.fromEntries(Array.from({ length: 3700 }, (_, i) => [digest(`old-${i}`), 0]));
+  const original = JSON.stringify(cursor);
+  const file = join(stateRoot, 'gc-cursor.json');
+  expect(Buffer.byteLength(original)).toBeLessThan(256 * 1024);
+  expect(Buffer.byteLength(`${JSON.stringify(cursor, null, 2)}\n`)).toBeGreaterThan(256 * 1024);
+  writeFileSync(file, original);
+  const result = scheduledLaneGc(['/pool/lane-1'], { stateRoot, schedule: 60000, nowMs: 100000,
+    admission: () => ({ admitted: true }), exec: vi.fn(), log: () => {} });
+  expect(result.reason).toBe('gc cursor too large');
+  expect(readFileSync(file, 'utf8')).toBe(original);
+  expect(boundedText(file)).toBe(original);
 });
 
 it('deferrable heavy admission never acquires a slot above the host threshold', async () => {

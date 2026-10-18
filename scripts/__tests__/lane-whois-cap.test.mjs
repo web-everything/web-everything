@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, readdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readdirSync, writeFileSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
@@ -30,6 +30,46 @@ describe('transcript backfill admission', () => {
     expect(cachedTranscriptAttribution('unused', lanes, opts).get('1')).toEqual(touches);
     expect(cachedTranscriptAttribution('unused', lanes, { ...opts, scan: () => { throw Error('rescanned'); } }).get('1')).toEqual(touches);
     expect(scan).toHaveBeenCalledTimes(1);
+  });
+  it('rejects an indented cache over the read limit before publishing it and permits retry', async () => {
+    const { cachedTranscriptAttribution } = await import(/* @vite-ignore */ String('../lib/lane-transcript-backfill.mjs'));
+    const stateRoot = temp();
+    const lanes = { 1: '/pool/lane-1' };
+    const touches = Array.from({ length: 90_000 }, () => ({ sessionId: 's', ts: null, tool: 'Edit', path: '/pool/lane-1/a' }));
+    const saved = { lane: lanes[1], touches };
+    expect(Buffer.byteLength(JSON.stringify(saved))).toBeLessThan(8 * 1024 * 1024);
+    expect(Buffer.byteLength(`${JSON.stringify(saved, null, 2)}\n`)).toBeGreaterThan(8 * 1024 * 1024);
+    const opts = { stateRoot, admission: admitted, log: quiet };
+    expect(() => cachedTranscriptAttribution('unused', lanes, { ...opts, scan: () => new Map([['1', touches]]) })).toThrow('transcript cache too large');
+    expect(readdirSync(join(stateRoot, 'transcripts'))).toEqual([]);
+    const scan = vi.fn(() => new Map([['1', []]]));
+    expect(cachedTranscriptAttribution('unused', lanes, { ...opts, scan }).get('1')).toEqual([]);
+    expect(cachedTranscriptAttribution('unused', lanes, { ...opts, scan }).get('1')).toEqual([]);
+    expect(scan).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    { extraBytes: 0, char: 'a' },
+    { extraBytes: 1, char: 'a' },
+    { extraBytes: 1, char: 'é' },
+  ])('enforces the serialized byte boundary ($extraBytes extra bytes, $char)', async ({ extraBytes, char }) => {
+    const { cachedTranscriptAttribution } = await import(/* @vite-ignore */ String('../lib/lane-transcript-backfill.mjs'));
+    const stateRoot = temp();
+    const lanes = { 1: '/pool/lane-1' };
+    const touches = [{ sessionId: 's', ts: null, tool: 'Edit', path: '' }];
+    const limit = 8 * 1024 * 1024;
+    const baseBytes = Buffer.byteLength(`${JSON.stringify({ lane: lanes[1], touches }, null, 2)}\n`);
+    touches[0].path = char + 'a'.repeat(limit + extraBytes - baseBytes - Buffer.byteLength(char));
+    const opts = { stateRoot, admission: admitted, log: quiet, scan: vi.fn(() => new Map([['1', touches]])) };
+    if (extraBytes > 0) {
+      expect(() => cachedTranscriptAttribution('unused', lanes, opts)).toThrow('transcript cache too large');
+      expect(readdirSync(join(stateRoot, 'transcripts'))).toEqual([]);
+    } else {
+      expect(cachedTranscriptAttribution('unused', lanes, opts).get('1')).toEqual(touches);
+      const cacheDir = join(stateRoot, 'transcripts');
+      expect(statSync(join(cacheDir, readdirSync(cacheDir)[0])).size).toBe(limit);
+      expect(cachedTranscriptAttribution('unused', lanes, opts).get('1')).toEqual(touches);
+      expect(opts.scan).toHaveBeenCalledTimes(1);
+    }
   });
   it('two concurrent explicit scans refuse the second before its grep starts', async () => {
     const { cachedTranscriptAttribution } = await import(/* @vite-ignore */ String('../lib/lane-transcript-backfill.mjs'));

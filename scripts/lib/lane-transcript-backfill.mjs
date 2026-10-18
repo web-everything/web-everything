@@ -31,7 +31,8 @@ export function cachedTranscriptAttribution(root, lanes, { stateRoot = hostState
         const touches = scanned.get(key);
         if (!validTouches(touches)) throw Error('unknown transcript scan result');
         const saved = { lane: resolve(path), touches };
-        if (Buffer.byteLength(JSON.stringify(saved)) > 8 * 1024 * 1024) throw Error('transcript cache too large');
+        // Match writeJsonAtomic's indentation and trailing newline so every published cache fits the reader.
+        if (Buffer.byteLength(`${JSON.stringify(saved, null, 2)}\n`) > 8 * 1024 * 1024) throw Error('transcript cache too large');
         writeJsonAtomic(cachePath(path), saved); result.set(key, touches);
       }
     }
