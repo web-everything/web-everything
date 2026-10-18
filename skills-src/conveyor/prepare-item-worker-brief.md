@@ -33,3 +33,7 @@ same lane using its own brief. The card-only permissions above apply to every li
 A refusal stops work on that card only; continue preparing the others. For each declined member,
 include a separate final-report line `Not prepared: #<num> — <reason>`, even if you left a partial
 diff. The runner restores that member's pre-run bytes and reports it in the lead's single PR.
+
+<!-- tests-first:requireExecutableAcceptance -->
+Require at least one [A<n>] Executable line per stated guarantee in Acceptance, each naming a command or test that fails before the build and passes after. Replace the scaffold TODO before stamping preparedDate. Include changed defaults, callers, and fail-closed paths among the guarantees.
+<!-- /tests-first -->

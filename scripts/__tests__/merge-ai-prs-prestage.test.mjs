@@ -22,6 +22,7 @@ fs.appendFileSync(process.env.PRESTAGE_LOG, JSON.stringify(a) + '\\n');
 const out = x => { if (a.includes('-i')) fs.writeSync(1, 'HTTP/2 200 OK\\n\\n'); fs.writeSync(1, typeof x === 'string' ? x : JSON.stringify(x)); process.exit(0); };
 const page = ${openPrPageFixture};
 if (a[0] === 'repo') out('main');
+if (a[0] === 'pr' && ['list', 'view'].includes(a[1]) && a.includes('--repo') && a[a.indexOf('--repo') + 1] !== process.env.PRESTAGE_REPO) out([]);
 if (a[0] === 'pr' && a[1] === 'list' && a.includes('--base')) out(pr.stacked || []);
 if (a[0] === 'pr' && a[1] === 'list') out([pr]);
 if (a[0] === 'pr' && a[1] === 'view') out(pr);
@@ -39,6 +40,8 @@ if (a[0] === 'api') {
     if (q.includes('enqueuePullRequest')) { fs.writeFileSync(process.env.PRESTAGE_PR+'.queued',''); out({ data: { enqueuePullRequest: { mergeQueueEntry: { id:'E',position:1,state:'QUEUED' } } } }); }
     if (q.includes('isInMergeQueue')) out({ data: { repository: { pullRequest: { headRefOid:pr.headRefOid, isInMergeQueue:fs.existsSync(process.env.PRESTAGE_PR+'.queued') } } } });
     if (q.includes('mergeQueue(')) out({ data: { repository: { mergeQueue: { entries: { nodes:[],pageInfo:{hasNextPage:false} } } } } });
+    const [owner, name] = process.env.PRESTAGE_REPO.split('/');
+    if (q.includes('pullRequests(') && !q.includes('repository(owner:"'+owner+'",name:"'+name+'")')) out(page([], q));
     out(page([pr], q));
   }
 }
@@ -75,9 +78,9 @@ async function world(fn, { slug = 'fixture/prestage' } = {}) {
       commits: [{oid:sha,messageHeadline:'Update readme',authors:[{name:'Claude',email:'noreply@anthropic.com'}]}],
       statusCheckRollup: [{name:'test',status:'IN_PROGRESS',conclusion:null,head_sha:sha}],
       comments: [{author:{login:'chalbert'},body:'<!-- reviewed-sha: '+sha+' -->',createdAt:new Date().toISOString()}], reviews: [] };
-    const run = (green = false, { rebaseDrop = false, numbering = false, args = [] } = {}) => {
+    const run = (green = false, { rebaseDrop = false, numbering = false, thisRepo = true, args = [] } = {}) => {
       writeFileSync(fixture, JSON.stringify(pr)); writeFileSync(log, '');
-      const r = spawnSync(process.execPath, [script, '--this-repo','--label=ready-to-merge','--only=42', '--json', ...args,
+      const r = spawnSync(process.execPath, [script, ...(thisRepo ? ['--this-repo'] : []),'--label=ready-to-merge','--only=42', '--json', ...args,
         '--no-drain-lease','--no-red-main-freeze',...(!rebaseDrop ? ['--no-rebase-drop'] : []),'--no-heal-collision','--no-overlap-yield',
         ...(green ? ['--from-green-event'] : [])], { cwd:dir,encoding:'utf8',timeout:120_000, // a loaded host can push one real drain run past 30s
         env: { ...process.env, PATH:bin+':'+process.env.PATH, PRESTAGE_PR:fixture,PRESTAGE_LOG:log, PRESTAGE_REPO:slug,
@@ -93,6 +96,38 @@ async function world(fn, { slug = 'fixture/prestage' } = {}) {
 }
 
 describe('real drain pre-stage path', () => {
+  it.each(['--repos=frontier-ui/frontierui', '--repos=frontierui'])('a green event cannot enqueue WE#42 outside %s', scope => world(({pr,run,coord}) => {
+    expect(run().stderr).toContain('eligible=true');
+    const cacheDir = join(coord, 'drain-prestage');
+    const file = join(cacheDir, readdirSync(cacheDir)[0]);
+    const prepared = readFileSync(file, 'utf8');
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    const next = run(true, { thisRepo:false, args:[scope] });
+    expect(next.report.prestaged).not.toBe(true);
+    expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
+    expect(readFileSync(file, 'utf8')).toBe(prepared);
+  }, {slug:'web-everything/web-everything'}));
+  it('a green event under --this-repo --base=release cannot consume main preparation', () => world(({pr,run,coord}) => {
+    expect(run().stderr).toContain('eligible=true');
+    const cacheDir = join(coord, 'drain-prestage');
+    const file = join(cacheDir, readdirSync(cacheDir)[0]);
+    const prepared = readFileSync(file, 'utf8');
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    const next = run(true, { args:['--base=release'] });
+    expect(next.report.prestaged).not.toBe(true);
+    expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
+    expect(readFileSync(file, 'utf8')).toBe(prepared);
+  }));
+  it.each([
+    {thisRepo:true,args:['--base=main']},
+    {thisRepo:false,args:['--repos=web-everything/web-everything','--base=main']},
+  ])('a green event retains the shortcut for a matching scope (%j)', opts => world(({pr,run}) => {
+    expect(run().stderr).toContain('eligible=true');
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    const next = run(true, opts);
+    expect(next.report, next.stderr).toMatchObject({prestaged:true,enqueueOutcomes:[{num:42,outcome:'enqueued'}]});
+    expect(next.calls.some(a => a.some(x => x.includes('pullRequests(')))).toBe(false);
+  }, {slug:'web-everything/web-everything'}));
   it('a fix claim acquired after preparation prevents cached enqueue', () => world(({pr,run,coord}) => {
     expect(run().stderr).toContain('eligible=true');
     const now = Date.now();

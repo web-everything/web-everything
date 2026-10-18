@@ -36,7 +36,14 @@ describe('FUI sibling checkout uses a GitHub App token', () => {
       expect(mints.length).toBe(checkouts.length);
       for (const m of mints) {
         expect(m).toMatch(/id:\s*fui-app-token/);
-        expect(m).toMatch(/if:\s*vars\.WE_APP_ID != ''/);
+        // The shard also skips card-only changes. Both bare and wrapped expressions must
+        // require the app id; an OR must never bypass that guard.
+        const condition = m.match(/^\s*if:\s*(.+)$/m)?.[1]
+          .replace(/^\$\{\{\s*|\s*\}\}$/g, '').trim();
+        expect(condition).toBeDefined();
+        expect(condition).not.toContain('||');
+        expect(condition.split('&&').map(clause => clause.trim().replace(/^\((.*)\)$/, '$1').trim()))
+          .toContain("vars.WE_APP_ID != ''");
         expect(m).toMatch(/app-id:\s*\$\{\{\s*vars\.WE_APP_ID\s*\}\}/);
         expect(m).toMatch(/private-key:\s*\$\{\{\s*secrets\.WE_APP_PRIVATE_KEY\s*\}\}/);
         expect(m).toMatch(/owner:\s*frontier-ui/);
@@ -50,7 +57,7 @@ describe('FUI sibling checkout uses a GitHub App token', () => {
     });
   }
 
-  it('covers all 8 checkouts', () => {
-    expect(total).toBe(8);
+  it('covers all 9 checkouts, including the independent standards job', () => {
+    expect(total).toBe(9);
   });
 });

@@ -53,7 +53,7 @@ function pr(comments, { head = HEAD, mechanicalRound = facts(), labels = ['revie
 }
 // Rounds spent (5/5), then the final review bounced PRIOR, then a mechanical round made HEAD.
 const spent = [rearm(1), rearm(2), rearm(3), rearm(4), rearm(5), bounceOn(PRIOR, 6)];
-const plan = (p, opts = {}) => planReconcile({ prs: [p], agents: [], durableCounts: {}, now: Date.parse(at(12)),
+const plan = (p, opts = {}) => planReconcile({ reviewTiming: { startAfter: 'ci-green' }, prs: [p], agents: [], durableCounts: {}, now: Date.parse(at(12)),
   requiredChecks: ['test'], takeoverReviewAttempts: 1, ...opts });
 const row = (p) => p.dispatch.find((x) => x.prNumber === 7);
 const refusal = (p) => p.refusals.find((x) => x.prNumber === 7 && x.kind !== 'no-findings');

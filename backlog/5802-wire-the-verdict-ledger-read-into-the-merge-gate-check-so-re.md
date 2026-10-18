@@ -2,9 +2,10 @@
 bornAs: xo3rrf2
 kind: story
 size: 5
-status: open
+status: resolved
 scope: ["we:scripts/merge-gate-check.mjs", "we:scripts/lib/merge-gate-ci.mjs", "we:scripts/lib/__tests__/merge-gate-ci.test.mjs"]
 dateOpened: "2026-10-09"
+dateResolved: "2026-10-17"
 tags: []
 ---
 

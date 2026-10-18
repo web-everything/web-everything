@@ -204,6 +204,7 @@ export { mapWithConcurrency } from './lib/drain-concurrency.mjs';
 import { runLedgerShadow, formatShadowLine } from './lib/drain-ledger-shadow.mjs'; // #5444 — ledger gate in SHADOW beside the labels; journals, never decides
 import { drainReviewGateFact, readDrainLedgerSnapshot, recordDrainLedgerFacts } from './lib/drain-ledger-facts.mjs';
 import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overlapRowKey, readyToMergeLabelTimeMs } from './conveyor/land-overlap-yield.mjs'; // + readyToMergeLabelTimeMs: the drain order's ready-at (same cached label read) // #4308 — the land-time overlap-yield planner (see planLabelDrain's own `overlapContext` param)
+import { filterEnqueueableOverlapRows, resolveOverlapYieldOnlyToEnqueueableSetting, formatOverlapYieldOnlyToEnqueueableSetting } from './conveyor/overlap-yield-enqueueable.mjs';
 import { rankByDeliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES } from './lib/delivery-priority.mjs'; // drain order (2026-10-10): the shared P0-P4 class rule
 import { readDeliveryPrioritySettings } from './conveyor/delivery-priority-shadow.mjs'; // drain order: the shared aging/cap settings (platform preference `deliveryPriority`)
 import { execFileSyncThrottled } from './lib/gh-throttle.mjs'; // drain order: the operator-override labeler read
@@ -2331,7 +2332,7 @@ export function buildOverlapRows({ candidates, verdicts, openPrContext, mergedPr
     if (!base) continue; // no raw listing row — should not happen for a candidate drawn from this same listing
     candidateRows.push({ ...base, exempt: isExemptItem(c.item) });
   }
-  return { candidateRows, openPrRows };
+  return { candidateRows, openPrRows: filterEnqueueableOverlapRows({ openPrRows, verdicts, localSlug, enabled: resolveOverlapYieldOnlyToEnqueueableSetting({ argv, env: process.env }).value }) };
 }
 
 /**
@@ -4397,6 +4398,7 @@ async function runCli() {
   // value) throws here and is caught by this file's own top-level `runCli().catch(...)` — an ordinary CLI
   // usage-error exit, not a drain failure.
   const overlapYieldOverrides = parseOverlapYieldOverrides({ argv, env: process.env });
+  process.stderr.write(`${formatOverlapYieldOnlyToEnqueueableSetting(resolveOverlapYieldOnlyToEnqueueableSetting({ argv, env: process.env }))}\n`);
   const AS_JSON = !!flags.json;
   const DRY_RUN = !!flags['dry-run'];
   const REQUIRED = typeof flags.check === 'string' ? flags.check : 'test';
@@ -5011,7 +5013,10 @@ async function runCli() {
   const drainHeavyCacheByRepo = new Map(); // Reuse heavy fields across --watch passes.
   const sweepOnce = async () => {
   const prestageSetting = resolvePrestageSettings({ log: line => process.stderr.write(`${line}\n`) });
-  if (!DRY_RUN && flags['from-green-event'] && onlyPr != null && !onlyRepo && mergeStrategy.enqueues(null)) {
+  // Prepared admission is still a candidate selection: honor the same resolved repo set and
+  // exact base filter as listOne before consuming (or invalidating) a cached preparation.
+  if (!DRY_RUN && flags['from-green-event'] && onlyPr != null && !onlyRepo && REPOS.some(isLocalRepo) && mergeStrategy.enqueues(null)
+      && (!base || filterOpenPrsByBase([prestageCache.get(localSlug, Number(onlyPr), prestageSetting.value.prestageTtlMin)], base).length > 0)) {
     // The global stop-the-line signal can change independently of any PR head/label.
     const freeze = redMainBypass ? null : await readDrainFreezePass();
     const hold = redMainBypass ? null : drainFreezeSignal({ state: freeze, mainRedState: readMainRedState(), priority: readMainRedPriority(), now: Date.now(), holdOn: resolveRedMainHoldSetting().value === 'on' });
@@ -5020,8 +5025,10 @@ async function runCli() {
       readPr: async () => {
         const { stdout } = await execFileP('gh', ['pr', 'view', String(onlyPr), ...repoFlag(null), '--json',
           'number,headRefOid,labels,statusCheckRollup,state,isDraft,body,baseRefName,reviewDecision,mergeable,mergeStateStatus'], { encoding: 'utf8' });
+        const pr = filterOpenPrsByBase([JSON.parse(stdout)], base)[0];
+        if (!pr) return null;
         // The same full `--check` read the listing and the pre-merge re-read use: gh caps the rollup at 100 contexts.
-        return attachLiveFixClaim(await resolveChecks(null, JSON.parse(stdout)), { claimKey: repoKeyForSlug(localSlug), readClaim: readLiveFixClaim });
+        return attachLiveFixClaim(await resolveChecks(null, pr), { claimKey: repoKeyForSlug(localSlug), readClaim: readLiveFixClaim });
       },
       withLock: fn => withLandWriteLock(fn, { runUnlockedOnContention: false }),
       fixClaimHeld: () => prestageFixClaimHeld(onlyPr, { claimKey: repoKeyForSlug(localSlug) }),
