@@ -1,23 +1,21 @@
 ---
+bornAs: x3hlar1
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/review-stringency-classes.mjs", "we:scripts/lib/__tests__/review-stringency-classes.test.mjs"]
-dateOpened: "2026-10-17"
+scope: ["we:scripts/operations/review-pr-io.mjs", "we:scripts/operations/__tests__/review-pr-io.test.mjs"]
+dateOpened: "2026-10-16"
 tags: []
 ---
 
-# Prevention — Add a MUST_BLOCK subset to the module, make the validator require disposition 'blocker' for it, a… (from web-everything/web-everything#5516 review)
+# Prevention — Add a deterministic regression test covering a near-budget existing record with an omitted review… (from web-everything/web-everything#5448 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/review-stringency-classes.mjs:101` — Add a MUST_BLOCK subset to the module, make the validator require disposition 'blocker' for it, and add a test that downgrades each such class and expects a throw. Alternatively, do this in the slice that adds the evaluator.
-2. `we:scripts/lib/__tests__/review-stringency-classes.test.mjs:48` — Add a test with Symbol('x') and Object.defineProperty(..., {enumerable:false}) extra keys, each expecting an unknown class error.
-3. `we:scripts/lib/review-stringency-classes.mjs:110` — Add a deterministic isolated-import test that injects invalid definition data and asserts import rejection, then confirm removing the startup call makes that named test fail.
-4. `we:scripts/lib/review-stringency-classes.mjs:111` — Add the isolated import rejection test and a targeted mutation check that removes the module-level validation call and requires that named test to fail.
+1. `we:scripts/operations/review-pr-io.mjs:1169` — Add a deterministic regression test covering a near-budget existing record with an omitted reviewer answer, asserting that subsequent auto-policy planning cannot emit a block.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5516@72a514b7b9c97b486cf5d67484c5c290b88e82c6
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5448@659bfb4f09b5f0566aa15e66bb27dce916ec0481
 
 ## Acceptance
 

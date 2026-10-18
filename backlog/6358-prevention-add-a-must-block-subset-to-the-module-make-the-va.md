@@ -1,21 +1,24 @@
 ---
+bornAs: x4y11jy
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5961-labels-a-known-labels-cache-instead-of-label-create-before-e.md", "we:backlog/5946-takeover-chain-test-follow-ups-4797-4770-and-mechanical-roun.md"]
-dateOpened: "2026-10-14"
+scope: ["we:scripts/lib/review-stringency-classes.mjs", "we:scripts/lib/__tests__/review-stringency-classes.test.mjs"]
+dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Prevention — When a re-prepare changes a rule, rewrite the original statement of it rather than appending. A r… (from web-everything/web-everything#5325 review)
+# Prevention — Add a MUST_BLOCK subset to the module, make the validator require disposition 'blocker' for it, a… (from web-everything/web-everything#5516 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/5961-labels-a-known-labels-cache-instead-of-label-create-before-e.md` — When a re-prepare changes a rule, rewrite the original statement of it rather than appending. A review lens that checks cards for two statements of one rule would catch this.
-2. `we:backlog/5946-takeover-chain-test-follow-ups-4797-4770-and-mechanical-roun.md` — Add explicit planned cases with observable round-count assertions; require a constraint-to-test mapping during preparation review whenever a design promises refusal on missing or unreadable evidence.
+1. `we:scripts/lib/review-stringency-classes.mjs:101` — Add a MUST_BLOCK subset to the module, make the validator require disposition 'blocker' for it, and add a test that downgrades each such class and expects a throw. Alternatively, do this in the slice that adds the evaluator.
+2. `we:scripts/lib/__tests__/review-stringency-classes.test.mjs:48` — Add a test with Symbol('x') and Object.defineProperty(..., {enumerable:false}) extra keys, each expecting an unknown class error.
+3. `we:scripts/lib/review-stringency-classes.mjs:110` — Add a deterministic isolated-import test that injects invalid definition data and asserts import rejection, then confirm removing the startup call makes that named test fail.
+4. `we:scripts/lib/review-stringency-classes.mjs:111` — Add the isolated import rejection test and a targeted mutation check that removes the module-level validation call and requires that named test to fail.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5325@efcf924dc5bc77b2163d45ea6f4d1af9802a9018
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5516@72a514b7b9c97b486cf5d67484c5c290b88e82c6
 
 ## Acceptance
 

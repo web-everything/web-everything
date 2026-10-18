@@ -1,20 +1,22 @@
 ---
+bornAs: x479n86
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/x35ynor-dispatch-test-the-operatorpostbuild-route-flag-through-every.md"]
-dateOpened: "2026-10-15"
+scope: ["we:backlog/5961-labels-a-known-labels-cache-instead-of-label-create-before-e.md", "we:backlog/5946-takeover-chain-test-follow-ups-4797-4770-and-mechanical-roun.md"]
+dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — A backlog scaffold or check could require a blockedBy/dependsOn PR reference when a card cites a… (from web-everything/web-everything#5422 review)
+# Prevention — When a re-prepare changes a rule, rewrite the original statement of it rather than appending. A r… (from web-everything/web-everything#5325 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/x35ynor-dispatch-test-the-operatorpostbuild-route-flag-through-every.md:11` — A backlog scaffold or check could require a `blockedBy`/`dependsOn` PR reference when a card cites a symbol absent from main. This is not worth a gate for a single card, so file it as a note only.
+1. `we:backlog/5961-labels-a-known-labels-cache-instead-of-label-create-before-e.md` — When a re-prepare changes a rule, rewrite the original statement of it rather than appending. A review lens that checks cards for two statements of one rule would catch this.
+2. `we:backlog/5946-takeover-chain-test-follow-ups-4797-4770-and-mechanical-roun.md` — Add explicit planned cases with observable round-count assertions; require a constraint-to-test mapping during preparation review whenever a design promises refusal on missing or unreadable evidence.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5422@702521f0aa4d783aa7369d5a2332fd52a617a981
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5325@efcf924dc5bc77b2163d45ea6f4d1af9802a9018
 
 ## Acceptance
 
