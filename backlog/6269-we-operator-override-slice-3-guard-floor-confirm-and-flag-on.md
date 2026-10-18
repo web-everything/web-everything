@@ -22,6 +22,10 @@ Build the guard floor of decision 6268 (we:docs/agent/platform-decisions.md#oper
   - `the reader ignores a loosening entry that has no recorded confirmation (hand-edited snapshot)`
   - `the hard-coded confirmed-broken always-block cannot be reached by any override`
   - `an agent caller cannot pass the confirmation flag`
+  - `an unreadable safe-direction table treats every key as loosening: unconfirmed writes are refused and unconfirmed entries are ignored on read`
+  - `the reader ignores the whole snapshot when it cannot be checked against the safe-direction table`
+  - `an expired confirmation cannot authorize a loosening entry even if the entry has not expired`
+  - `a snapshot cannot create, replace or extend the append-only log confirmation for a loosening entry`
 
 ## Non-goals
 
