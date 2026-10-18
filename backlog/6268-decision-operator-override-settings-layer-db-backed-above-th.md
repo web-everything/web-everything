@@ -91,7 +91,7 @@ Fork-existence: env and the new layer both claim to be the last word; only one o
 - (b) Between tool and env. Keeps the launch-time env flag as the last word, but then a stale shell variable silently beats a recorded operator instruction, which is the opposite of the goal.
 
 Recommended: (a). Env stays useful for one-off process launches that carry no override.
-Skeptic: SURVIVES. It composes with the existing rule that an env var may sit on top of the settings file for a one-off run (`we:docs/agent/platform-decisions.md:3838`); the new layer goes above that. Build note: the review settings and the merge-queue switches each have their own env path separate from the cascade, so the build card must cover all three resolvers (slice 2, `#6264`).
+Skeptic: SURVIVES. It composes with the existing rule that an env var may sit on top of the settings file for a one-off run (`we:docs/agent/platform-decisions.md:3838`); the new layer goes above that. Build note: the merge-queue switches have their own env path separate from the cascade (the referral safety keys resolve through `cascadePolicy`), so the build card must cover the cascade, the review source reporter and the merge-queue resolver (slice 2, `#6264`).
 Screen: clear
 
 ## Fork 3 — Guard floor: what stops an override from loosening a safety guard
@@ -111,7 +111,7 @@ node scripts/operations/run.mjs operator-override --key=mergeQueue.refreshOnStal
 ```
 
 Recommended: (a). Blocking until confirmed means a guard is never off without the operator having said so.
-Skeptic: SURVIVES-WITH-AMENDMENT. A confirm flag alone stops nothing if an agent can call the command; the agent-rejecting authority check is what holds. Folded in: every key declares its safe direction in a table, a key with no entry counts as loosening, and the write operation rejects any agent caller. Statute to cite when codifying: an agent may veto but never grant its own constraints (`we:docs/agent/platform-decisions.md:4118`) and mutations go through typed, fail-closed operations (`we:docs/agent/platform-decisions.md:4787`). Citation fix: the confirmed-broken always-block above is hard-coded, not a setting, so an override cannot loosen it; the keys an override can loosen are `REFERRAL_SAFETY_KEYS` (`we:scripts/lib/review-settings.mjs:94`) and the merge-queue switches.
+Skeptic: SURVIVES-WITH-AMENDMENT. A confirm flag alone stops nothing if an agent can call the command; the agent-rejecting authority check is what holds. Folded in: every key declares its safe direction in a table, a key with no entry counts as loosening, and the write operation rejects any agent caller. Statute to cite when codifying: an agent may veto but never grant its own constraints (`we:docs/agent/platform-decisions.md:4118`) and mutations go through typed, fail-closed operations (`we:docs/agent/platform-decisions.md:4787`). Citation fix: the confirmed-broken always-block above is hard-coded, not a setting, so an override cannot loosen it; the keys an override can loosen are `REFERRAL_SAFETY_KEYS` (`we:scripts/lib/review-settings.mjs:94`), the merge-queue switches, and the cascade keys whose reader uses `cascadePolicy(...).value` (slice 1's `SETTABLE_OVERRIDE_KEYS`, `#6266`). Each still needs a safe-direction entry, and a key with none counts as loosening.
 Screen: flagged(impl) → fix applied: the on-read enforcement mechanism moved out of the fork into the settled note above; the fork now rules only block-until-confirmed vs flag-after.
 
 ## Acceptance

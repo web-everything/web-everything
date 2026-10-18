@@ -4,7 +4,7 @@ kind: story
 size: 5
 parent: "6268"
 status: open
-scope: ["we:scripts/lib/operator-override-store.mjs", "we:scripts/operations/operator-override.mjs", "we:scripts/lib/__tests__/operator-override-store.test.mjs", "we:scripts/operations/run.mjs", "we:scripts/operations/__tests__/http-adapter.test.mjs", "we:scripts/guard-bash.mjs", "we:scripts/__tests__/guard-bash.test.mjs"]
+scope: ["we:scripts/lib/operator-override-store.mjs", "we:scripts/operations/operator-override.mjs", "we:scripts/lib/__tests__/operator-override-store.test.mjs", "we:scripts/operations/run.mjs", "we:scripts/operations/__tests__/http-adapter.test.mjs", "we:scripts/guard-bash.mjs", "we:scripts/__tests__/guard-bash.test.mjs", "we:scripts/operations/effect-executor.mjs", "we:scripts/operations/__tests__/effect-executor.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
@@ -17,15 +17,18 @@ The store module, the operation module and the store test are new files. The ope
 
 **Authority.** The write follows the existing operator-only pattern of `land-human-only` (we:scripts/operations/land-human-only-io.mjs): `operatorTerminalPresent` refuses any call without an interactive terminal or from a recognized agent or CI session, and the actor is the operator's own `gh` login from `resolveOperatorCredential`, never a `--actor` flag. The channel is `terminal`.
 
+**The HTTP route.** An operation with an effect step gets `POST …/runs` routes from the HTTP adapter, which drives the run with `attemptedBy: 'unknown'`. Only the CLI adapter's terminal path drives it with `attemptedBy: 'human'`. Today we:scripts/operations/effect-executor.mjs records `attemptedBy` but never passes it on. This slice passes it to the effect sink, and the operator-override sink refuses unless `attemptedBy === 'human'` and `operatorTerminalPresent()` holds. So a write started over HTTP is refused even when the server process itself runs in the operator's terminal. The HTTP adapter itself is not changed (its route table stays a function of the step kinds).
+
 **Read interface.** `readOperatorOverrides()` returns `{ readable, entries }`. `readable` is false when the store or snapshot cannot be read or parsed, so a caller can tell "unreadable" from "no overrides". Each entry carries `key`, `value`, `entryId` (the log line it came from), `actor`, `channel`, `at`, `instruction`, `reason`, `expiresAt` and the recorded confirmation, if any. Slices 2, 3 and 4 build on exactly this shape.
 
 ## Acceptance
 
-- [A1] **Executable** — `npm run test:unit --` (vitest) on we:scripts/lib/__tests__/operator-override-store.test.mjs (a new file), we:scripts/operations/__tests__/http-adapter.test.mjs and we:scripts/__tests__/guard-bash.test.mjs. The store test fails before the module exists and passes after. Named tests, one per guarantee:
+- [A1] **Executable** — `npm run test:unit --` (vitest) on we:scripts/lib/__tests__/operator-override-store.test.mjs (a new file), we:scripts/operations/__tests__/http-adapter.test.mjs, we:scripts/operations/__tests__/effect-executor.test.mjs and we:scripts/__tests__/guard-bash.test.mjs. The store test fails before the module exists and passes after. Named tests, one per guarantee:
   - `set then readOperatorOverrides returns the value with source operator-db`
   - `the store path is host-wide and never inside a lane clone`
   - `an agent caller is rejected by the write operation and nothing is written`
-  - `the write is refused over the HTTP adapter's run route and nothing is written`
+  - `a write started through POST …/runs is refused by the sink and nothing is written, even when the server process has a terminal`
+  - `the effect executor passes attemptedBy to the sink` (in we:scripts/operations/__tests__/effect-executor.test.mjs)
   - `the actor comes from the operator's gh login, and an --actor flag is refused`
   - `each write records instruction, actor, channel, time, reason and optional expiry`
   - `readOperatorOverrides returns each entry with entryId, actor, at, instruction, expiresAt and confirmation`
@@ -38,7 +41,7 @@ The store module, the operation module and the store test are new files. The ope
 ## Non-goals
 
 - [N1] Does not wire the layer into the cascade (slice 2), the guard floor (slice 3), the needs-you flag (slice 4) or any plateau DB work.
-- [N2] The store module exports `SETTABLE_OVERRIDE_KEYS`: the referral safety keys and the merge-queue switches, plus the cascade keys read through `cascadePolicy`. Any other key is refused by the write (named test: `a key outside SETTABLE_OVERRIDE_KEYS is refused and nothing is written`), so an override that no resolver reads is never stored. Slice 2 proves every listed key is read.
+- [N2] The store module exports `SETTABLE_OVERRIDE_KEYS`: the referral safety keys, the merge-queue switches `refreshOnUnsatisfiedWorkflows` and `refreshOnStaleMergeGate`, and the cascade keys whose reader uses `cascadePolicy(...).value` (never a `.layered` reader that applies env itself). Any other key is refused by the write (named test: `a key outside SETTABLE_OVERRIDE_KEYS is refused and nothing is written`), so an override that no resolver reads is never stored. Slice 2 proves every listed key is read.
 
 ## Edge cases this change must handle
 

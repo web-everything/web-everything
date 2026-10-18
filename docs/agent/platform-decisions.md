@@ -6286,8 +6286,8 @@ override"*, then "Ok" to defaults (a), (a), (a). Composes with [config-extends-p
 **The rule:**
 1. **One new top layer, `operator-override`.** Order: standard < platform < tool < env < operator-override (Fork 2 = a).
    The layer wins over env, so a stale shell variable never beats a recorded operator instruction. Every resolver of a
-   settable key reads it: the cascade (`resolveCascade`, fed each call by `cascadePolicy`), the referral safety keys
-   (`resolveReferralSafetySettings`) and the merge-queue switches (`resolveRefreshSetting`). A key no such resolver reads
+   settable key reads it: the cascade (`resolveCascade`, fed each call by `cascadePolicy`, for readers of its `.value`;
+   the referral safety keys resolve this way) and the merge-queue switches (`resolveRefreshSetting`). A key no such resolver reads
    cannot be set. Each value taken from it logs `source: operator-db`.
 2. **Local first store at one host-wide path (Fork 1 = a).** The source of truth is a machine-local store at a single
    host-wide path, never inside a lane clone, so every daemon on the host reads the same answer. Plateau's DB is deferred

@@ -16,21 +16,22 @@ Add the operator-override layer to the resolvers that read the settable keys, pe
 
 The settable keys and the resolver that reads each one:
 
-- **Cascade keys** — `resolveCascade` (we:scripts/lib/policy-cascade.mjs) is pure. It takes the layer as an `operatorOverride` input, above env. `cascadePolicy` reads the layer through `readOperatorOverrides` on each call and passes it in, both for `.value` and for `.layered`, so a reader that applies env on top of `.layered` still loses to the override.
-- **Referral safety keys** (`REFERRAL_SAFETY_KEYS`) — `resolveReferralSafetySettings` in we:scripts/lib/review-settings.mjs reads the layer above its own env path. `resolveReviewSettingSource` reports `operator-db` for a value taken from it.
-- **Merge-queue switches** (for example `mergeQueue.refreshOnStaleMergeGate`, the decision's own example) — `resolveRefreshSetting` in we:scripts/lib/merge-queue-enqueue.mjs reads the layer above its env variable.
+- **Cascade keys** — `resolveCascade` (we:scripts/lib/policy-cascade.mjs) is pure. It takes the layer as an `operatorOverride` input, above env. `cascadePolicy` reads the layer through `readOperatorOverrides` on each call and passes it in for `.value`. It takes an `operatorOverride` option as a test seam, so unit tests never read the real host store. A key is settable only if its reader uses `cascadePolicy(...).value`. Readers that take `.layered` and apply env themselves (for example we:scripts/lib/drain-facts-source.mjs and we:scripts/lib/verify-settings.mjs) would let env beat the override, so their keys are not settable.
+- **Referral safety keys** (`REFERRAL_SAFETY_KEYS`) — `resolveReferralSafetySettings` in we:scripts/lib/review-settings.mjs already resolves through `cascadePolicy`, with its env inside `envValues`, so it gets the layer from the cascade change. `resolveReviewSettingSource` must then report `operator-db` for a value taken from it.
+- **Merge-queue switches** (exactly `refreshOnUnsatisfiedWorkflows` and `refreshOnStaleMergeGate`, the decision's own example) — the private `resolveRefreshSetting` in we:scripts/lib/merge-queue-enqueue.mjs reads the layer above its env variable. Tests go through its exported wrappers `resolveRefreshOnUnsatisfiedWorkflows` and `resolveRefreshOnStaleMergeGate`.
 
-A key resolved anywhere else (a direct `resolveCascade` caller that does not go through `cascadePolicy`, or another resolver such as the merge-gate readers) is not settable. Slice 1's write refuses it, so an override is never stored where no resolver reads it.
+A key resolved anywhere else (a `.layered` reader, a direct `resolveCascade` caller that does not go through `cascadePolicy`, or another resolver such as the merge-gate readers) is not settable. Slice 1's write refuses it, so an override is never stored where env or nothing would beat it.
 
 ## Acceptance
 
 - [A1] **Executable** — `npm run test:unit --` (vitest) on we:scripts/lib/__tests__/policy-cascade.test.mjs, we:scripts/lib/__tests__/review-settings.test.mjs and we:scripts/lib/__tests__/merge-queue-enqueue.test.mjs. Source-log tests set `WE_POLICY_CASCADE_LOG=1`, since the cascade log is silent under test without it. Named tests, one per guarantee:
   - `operator-override wins over env: order is standard < platform < tool < env < operator-override`
   - `a value taken from the layer logs source operator-db in the source line`
-  - `cascadePolicy applies the layer to .layered, so a reader that applies env on top still loses to the override`
-  - `resolveReferralSafetySettings reads the layer and resolveReviewSettingSource reports operator-db, separately from its own env path`
-  - `resolveRefreshSetting reads the layer for a merge-queue switch and reports operator-db`
-  - `every settable key resolves through a resolver that reads the layer`
+  - `cascadePolicy takes an injected operatorOverride layer and never reads the host store under test`
+  - `resolveReferralSafetySettings gets the layer through cascadePolicy and resolveReviewSettingSource reports operator-db`
+  - `resolveRefreshOnStaleMergeGate and resolveRefreshOnUnsatisfiedWorkflows read the layer above env and report operator-db`
+  - `every settable key resolves through a resolver that reads the layer above env`
+  - `no settable key is read through .layered by a reader that applies env itself`
   - `no operator layer present leaves every existing resolution unchanged`
   - `an unreadable layer is skipped and the lower layers still resolve`
   - `the layer is read each call, not cached across ticks`
@@ -38,7 +39,7 @@ A key resolved anywhere else (a direct `resolveCascade` caller that does not go 
 ## Non-goals
 
 - [N1] Does not build the store or the write CLI (slice 1), the guard floor (slice 3) or the needs-you flag (slice 4).
-- [N2] Does not wire the direct `resolveCascade` callers or other resolvers; their keys stay unsettable.
+- [N2] Does not wire the `.layered` readers, the direct `resolveCascade` callers or other resolvers; their keys stay unsettable.
 
 ## Edge cases this change must handle
 

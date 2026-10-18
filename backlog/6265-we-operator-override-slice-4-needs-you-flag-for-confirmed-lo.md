@@ -14,9 +14,11 @@ tags: []
 
 Show every confirmed loosening operator override in the needs-you feed, per decision 6268 (we:docs/agent/platform-decisions.md#operator-override-settings-layer), so a guard is never off without the operator seeing it.
 
-The live producer is `runOnce` in we:scripts/operations/needs-you-feed.mjs, run by we:scripts/conveyor/needs-you-feed-job.mjs. Today it reads only the operator-queue report. This slice makes `runOnce` also read the override layer directly and add one item per confirmed loosening override to the same `diffFeed` call. It uses slice 1's `readOperatorOverrides` (its `readable` flag and each entry's `entryId`, actor, time, instruction and expiry) and slice 3's `isLooseningOverride`. The operator-queue report is not changed.
+The live producer is `runOnce` in we:scripts/operations/needs-you-feed.mjs, run by we:scripts/conveyor/needs-you-feed-job.mjs. Today it reads only the operator-queue report. This slice makes `runOnce` also read the override layer directly and add one item per confirmed loosening override to the same `diffFeed` call (changed as below). It uses slice 1's `readOperatorOverrides` (its `readable` flag and each entry's `entryId`, actor, time, instruction and expiry) and slice 3's `isLooseningOverride`. The operator-queue report is not changed.
 
-**Key shape.** An override item uses `repo: "operator-override"`, `pr: 0` and `head: <entryId>`, so its state key is `operator-override#0@<entryId>:<kind>`. That key already parses with the current `fromKey`, so an older producer reading the same state file during a revert never throws. A new value or expiry is a new log entry with a new `entryId`, so it publishes a new line.
+**Key shape.** An override item uses `repo: "operator-override"`, `pr: 0`, `head: <entryId>` and `kind: "override-loosening"`, so its state key is `operator-override#0@<entryId>:override-loosening`. The `entryId` is limited to `[A-Za-z0-9-]`, at most 128 characters (the feed's `head` limit), so `fromKey`'s greedy pattern cannot misparse it. That key already parses with the current `fromKey`, so an older producer reading the same state file during a revert never throws. (An older producer does emit `NEEDS-YOU-CLEARED` for override keys during a revert, since it does not publish them; the next run of this producer reopens them.) A new value or expiry is a new log entry with a new `entryId`, so it publishes a new line.
+
+**`diffFeed` changes.** Today `diffFeed` takes one `incomplete` flag: it suppresses every clear and holds every earlier key open. This slice changes it to take incompleteness per source. Override keys (`repo === "operator-override"`) are held open only when the layer is unreadable, and PR keys only when the queue report is incomplete. `publishAttention` keeps passing a value that holds every key open, as it does today.
 
 ## Acceptance
 
@@ -28,6 +30,8 @@ The live producer is `runOnce` in we:scripts/operations/needs-you-feed.mjs, run 
   - `re-setting an override with a new value or expiry publishes a new line`
   - `an unreadable override layer publishes one layer-unreadable item, keeps earlier override entries open and emits no override clear`
   - `an unreadable override layer does not stop PR items from clearing, and an incomplete queue report does not stop override clears`
+  - `publishAttention still holds every earlier key open, PR and override alike`
+  - `an entryId outside [A-Za-z0-9-] or over 128 characters is not published and is logged`
   - `two override entries stay distinct in unacknowledged and the session bootstrap`
   - `parseFeedLine reads an override line and an override cleared line`
   - `delivery-metrics counts override entries apart from PR needs-you episodes and waits`
