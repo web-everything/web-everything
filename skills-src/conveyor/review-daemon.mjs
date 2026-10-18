@@ -1028,6 +1028,7 @@ export function priorityNamesForLiveProcessPrs(liveProcessPrs) {
 export function buildCliDaemonEffects({
   owner, intervalMs = DEFAULT_INTERVAL_MS, log = console,
   reapSessions = defaultReapSessions,
+  reviewTickAllRepos = runReviewTickAllRepos,
   // #3383 bug 3 — the real daemon wires the real `acquirableLanes` effect through by default, so production
   // dispatch is bounded by lane reality; `runReviewTick`'s OWN default stays unbounded (`() => Infinity`) so
   // every pre-existing test of it (which fakes reconcile/dispatch directly, never this) is unaffected.
@@ -1039,7 +1040,7 @@ export function buildCliDaemonEffects({
   // store is stale or partial; label READS try the store, label WRITES and the drain/merge path never do.
   runReview = (opts) => {
     const factsProvider = withFactsLabels(createGhProvider());
-    return runReviewTickAllRepos({
+    return reviewTickAllRepos({
       acquirableLanes: defaultAcquirableLaneNumbers, readPrs: defaultReadPrs, readAgents: defaultReadAgents,
       poolExhaustion: DAEMON_POOL_EXHAUSTION,
       routeTestGaming: sweepTestGamingRoutes,

@@ -17,6 +17,23 @@ const noticeMarker = head => `<!-- test-gaming-needs-you: ${head} -->`;
 const trusted = c => isTrustedMarkerAuthor(c) && typeof c?.body === 'string';
 const labelsOf = pr => (pr.labels ?? []).map(l => typeof l === 'string' ? l : l.name);
 const live = pr => pr?.state === 'OPEN' && /^[a-f0-9]{40}$/.test(pr.headRefOid ?? '');
+const fixEndHead = body => /(?:^|\s)at `([a-f0-9]{7,40})`/.exec(body)?.[1];
+
+// Gate reasons contain PR-controlled filenames. Bound both parsing work and the
+// rendered prompt/comment; reject unsafe paths whole rather than normalizing them.
+function removalEvidence(reason) {
+  if (typeof reason !== 'string' || reason.length > 64 * 1024) return null;
+  const removals = [...reason.matchAll(/tests-removed: ([^\s<>`]+) \(net ([1-9]\d*) test case\(s\) removed\)/g)];
+  if (!removals.length || removals.length !== (reason.match(/tests-removed:/g) ?? []).length) return null;
+  if (removals.some(m => m[1].length > 240 || !/^[A-Za-z0-9_./-]+$/.test(m[1])
+    || m[1].split('/').some(part => !part || part === '.' || part === '..' || part.startsWith('--'))
+    || !Number.isSafeInteger(Number(m[2])))) return null;
+  const count = removals.reduce((n, m) => n + Number(m[2]), 0);
+  if (!Number.isSafeInteger(count)) return null;
+  const paths = [...new Set(removals.map(m => m[1]))];
+  const files = [...paths.slice(0, 10).map(path => `\`${path}\``), ...(paths.length > 10 ? [`+${paths.length - 10} more`] : [])].join(', ');
+  return { count, files };
+}
 
 /** Pure decision. Unknown/mixed/stale evidence never admits a repair finding. */
 export function planTestGamingRoute({ pr, verdict, enabled = true } = {}) {
@@ -32,10 +49,15 @@ export function planTestGamingRoute({ pr, verdict, enabled = true } = {}) {
   const latest = routes.at(-1);
   // A completed turn may have pushed a new head. Bind its returned justification
   // to this route episode and (when present) the live short/full fix-end head.
-  const ended = latest && comments.slice(latest.i + 1).filter(c => trusted(c)
-    && c.body.startsWith('🔓 conveyor fix-end') && !c.body.includes('<!-- fix-end-outcome: blocked-on-infra -->')
-    && (!/ at `([a-f0-9]{7,40})`/.test(c.body)
-      || pr.headRefOid.startsWith(/ at `([a-f0-9]{7,40})`/.exec(c.body)[1]))).at(-1);
+  const ended = latest && comments.slice(latest.i + 1).filter(c => {
+    if (!trusted(c) || !c.body.startsWith('🔓 conveyor fix-end')
+      || c.body.includes('<!-- fix-end-outcome: blocked-on-infra -->')) return false;
+    const head = fixEndHead(c.body);
+    // Legacy completions with no head apply only to the head originally routed.
+    // A malformed explicit head never falls back to a legacy unscoped completion.
+    return head ? pr.headRefOid.startsWith(head)
+      : !/(?:^|\s)at\s+`/.test(c.body) && latest.c.body.includes(routeMarker(pr.headRefOid));
+  }).at(-1);
   const justification = ended && /^test-removal-justified:[ \t]*(\S[^\r\n]*)$/m.exec(ended.body)?.[1];
   if (justification) return { action: 'needs-you', reason: `test-removal-justified: ${justification}`,
     marker: noticeMarker(pr.headRefOid), notified: comments.some(c => trusted(c) && c.body.includes(noticeMarker(pr.headRefOid))) };
@@ -43,12 +65,9 @@ export function planTestGamingRoute({ pr, verdict, enabled = true } = {}) {
   if (existing) return { action: ended ? 'completed' : 'admitted', body: existing.c.body };
   // Only the net-removal subtype supplies the binding removal count and paths.
   // Other test-gaming signals remain held for the ordinary review path.
-  const reason = String(blocked[0].reason ?? '');
-  const removals = [...reason.matchAll(/tests-removed: ([^\s<>`]+) \(net ([1-9]\d*) test case\(s\) removed\)/g)];
-  if (!removals.length || removals.some(m => m[1].startsWith('/') || m[1].split('/').includes('..') || !Number.isSafeInteger(Number(m[2])))) return skip('no usable test-removal evidence');
-  const count = removals.reduce((n, m) => n + Number(m[2]), 0);
-  if (!Number.isSafeInteger(count)) return skip('invalid removal count');
-  const files = [...new Set(removals.map(m => m[1]))].join(', ');
+  const evidence = removalEvidence(blocked[0].reason);
+  if (!evidence) return skip('no usable test-removal evidence');
+  const { count, files } = evidence;
   const binding = `The merge gate flags a net removal of ${count} test case(s) in ${files}. Restore the removed test(s), or replace each with an equivalent test that still covers the same guarantee. If the removal is genuinely correct (the behaviour itself was removed), keep it, and state why in a \`test-removal-justified:\` line in the fix-end note.`;
   return { action: 'admit', binding, body: `${ADVISORY_NOTE_MARKER}\n\n**Verdict:** Changes requested\n\n**Advisory outcome:** \`changes\`\n\nAdmitted finding: ${binding}\n\n${routeMarker(pr.headRefOid)}\n\n---\n\nNet basis: \`${'0'.repeat(40)}..${pr.headRefOid}\`` };
 }

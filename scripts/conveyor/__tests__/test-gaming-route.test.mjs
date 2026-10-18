@@ -1,14 +1,20 @@
 import { readFileSync } from 'node:fs';
-import { describe, it, expect, vi } from 'vitest';
-import { routeTestGaming, planTestGamingRoute } from '../test-gaming-route.mjs';
+import { afterEach, describe, it, expect, vi } from 'vitest';
+import { routeTestGaming, planTestGamingRoute, sweepTestGamingRoutes } from '../test-gaming-route.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
 import { buildAdvisoryFixComment } from '../advisory-fix-mark.mjs';
-import { runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
+import { buildFixEndComment } from '../fix-procedure.mjs';
+import { runReviewTick, buildCliDaemonEffects } from '../../../skills-src/conveyor/review-daemon.mjs';
 import { resolveReviewSettings, resolveReviewSettingSource } from '../../lib/review-settings.mjs';
+
+vi.mock('../../lib/review-facts.mjs', async original => ({
+  ...await original(), warmReviewFacts: async () => ({ skipped: 'test' }),
+}));
+afterEach(() => vi.restoreAllMocks());
 
 const HEAD = 'a'.repeat(40);
 const FILE = 'scripts/conveyor/__tests__/health-responder-core.test.mjs';
-const BINDING = `The merge gate flags a net removal of 1 test case(s) in ${FILE}. Restore the removed test(s), or replace each with an equivalent test that still covers the same guarantee. If the removal is genuinely correct (the behaviour itself was removed), keep it, and state why in a \`test-removal-justified:\` line in the fix-end note.`;
+const BINDING = `The merge gate flags a net removal of 1 test case(s) in \`${FILE}\`. Restore the removed test(s), or replace each with an equivalent test that still covers the same guarantee. If the removal is genuinely correct (the behaviour itself was removed), keep it, and state why in a \`test-removal-justified:\` line in the fix-end note.`;
 const bot = body => ({ body, author: { login: 'web-everything' } });
 function world() {
   const fx = JSON.parse(readFileSync('scripts/conveyor/__tests__/fixtures/pr-ownership/pr-5157-before-ci-heal.json', 'utf8'));
@@ -39,6 +45,16 @@ function world() {
 }
 
 describe('test-gaming hold routing', () => {
+  it('binds the real test-gaming sweep in the production CLI daemon effects', async () => {
+    const reviewTickAllRepos = vi.fn(() => ({ liveProcessPrs: [] }));
+    await buildCliDaemonEffects({ owner: 'test', reviewTickAllRepos,
+      log: { error: () => {} }, reapSessions: () => null,
+      convertAdvisoryEnabled: false, runPrepReview: () => null,
+    }).tickOnce();
+    expect(reviewTickAllRepos).toHaveBeenCalledOnce();
+    expect(reviewTickAllRepos.mock.calls[0][0].routeTestGaming).toBe(sweepTestGamingRoutes);
+  });
+
   it('admits one binding finding through the real planner and fixer input, preserving the hold', () => {
     const w = world();
     expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toEqual([]);
@@ -102,7 +118,10 @@ describe('test-gaming hold routing', () => {
     const dispatch = vi.fn();
     runReviewTick({ repo: w.options.repo, readPrs: () => [structuredClone(w.pr)], readAgents: () => [],
       holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, dispatch,
-      routeTestGaming: () => { const result = routeTestGaming(w.pr, w.options); return [{ pr: w.pr.number, ...result }]; },
+      routeTestGaming: args => {
+        expect(args).toEqual({ repo: w.options.repo, prs: [w.pr] });
+        return sweepTestGamingRoutes({ ...w.options, ...args });
+      },
       reconcile: ({ readPrs }) => {
         const snapshot = readPrs();
         return { ...w.plan(), dispatch: snapshot[0].labels.some(l => l.name === 'review:pending')
@@ -110,6 +129,194 @@ describe('test-gaming hold routing', () => {
       },
     });
     expect(dispatch).not.toHaveBeenCalled();
+    expect(w.provider.postComment).toHaveBeenCalledOnce();
+    expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toHaveLength(1);
+  });
+
+  it.each([' ', '\n\n', '\r\n\r\n', '\t', '\u2028'])(
+    'ignores a justified fix-end for a different head with separator %j', separator => {
+      const w = world();
+      routeTestGaming(w.pr, w.options);
+      w.pr.comments.push(bot(`🔓 conveyor fix-end — fix claim released${separator}at \`${HEAD.slice(0, 9)}\`\n\ntest-removal-justified: old head only`));
+      w.pr.headRefOid = w.verdict.head_sha = 'b'.repeat(40);
+      expect(routeTestGaming(w.pr, w.options).action).toBe('admit');
+      expect(w.provider.postComment).toHaveBeenCalledTimes(2);
+      expect(w.notify).not.toHaveBeenCalled();
+      expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toHaveLength(1);
+    });
+
+  it.each([7, 9, 40])('recognizes a matching newline-delimited fix-end head of length %i', length => {
+    const w = world();
+    routeTestGaming(w.pr, w.options);
+    w.pr.comments.push(bot(`🔓 conveyor fix-end — fix claim released\n\nat \`${HEAD.slice(0, length)}\`\n\ntest-removal-justified: removed behaviour`));
+    expect(routeTestGaming(w.pr, w.options).action).toBe('needs-you');
+    expect(w.notify).toHaveBeenCalledOnce();
+  });
+
+  it.each(['completion', 'justification', 'different head'])(
+    'recognizes the production fix-end sentence for %s', kind => {
+      const w = world();
+      routeTestGaming(w.pr, w.options);
+      const completion = buildFixEndComment({ who: 'fix-5537', headSha: HEAD });
+      w.pr.comments.push(bot(completion + (kind === 'completion' ? '' : '\n\ntest-removal-justified: removed behaviour')));
+      if (kind === 'different head') w.pr.headRefOid = w.verdict.head_sha = 'b'.repeat(40);
+      expect(routeTestGaming(w.pr, w.options).action).toBe(
+        kind === 'completion' ? 'completed' : kind === 'justification' ? 'needs-you' : 'admit');
+      expect(w.notify).toHaveBeenCalledTimes(kind === 'justification' ? 1 : 0);
+    });
+
+  it.each(['aaaaaa', 'a'.repeat(41), 'NOT-A-SHA'])('refuses a malformed explicit fix-end head %s', head => {
+    const w = world();
+    routeTestGaming(w.pr, w.options);
+    w.pr.comments.push(bot(`🔓 conveyor fix-end\n\nat \`${head}\`\n\ntest-removal-justified: malformed head`));
+    expect(routeTestGaming(w.pr, w.options).action).toBe('admitted');
+    expect(w.notify).not.toHaveBeenCalled();
+  });
+
+  it('keeps legacy unscoped completions within their original routed head', () => {
+    const w = world();
+    routeTestGaming(w.pr, w.options);
+    w.pr.comments.push(bot('🔓 conveyor fix-end\n\ntest-removal-justified: legacy removal'));
+    expect(routeTestGaming(w.pr, w.options).action).toBe('needs-you');
+    w.pr.headRefOid = w.verdict.head_sha = 'b'.repeat(40);
+    expect(routeTestGaming(w.pr, w.options).action).toBe('admit');
+    expect(w.notify).toHaveBeenCalledOnce();
+  });
+
+  it('admits one new repair after a head change within the round cap', () => {
+    const w = world();
+    routeTestGaming(w.pr, w.options);
+    w.pr.comments.push(bot(buildAdvisoryFixComment({})), bot(`🔓 conveyor fix-end\n\nat \`${HEAD}\``));
+    expect(routeTestGaming(w.pr, w.options).action).toBe('completed');
+    w.pr.headRefOid = w.verdict.head_sha = 'b'.repeat(40);
+    expect(routeTestGaming(w.pr, w.options).action).toBe('admit');
+    expect(routeTestGaming(w.pr, w.options).action).toBe('admitted');
+    expect(w.provider.postComment).toHaveBeenCalledTimes(2);
+    expect(w.pr.comments.at(-1).body).toContain(BINDING);
+    expect(w.pr.comments.at(-1).body).toContain(`test-gaming-route: ${w.pr.headRefOid}`);
+    expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toHaveLength(1);
+  });
+
+  it('deduplicates a route found only in the complete comment read', () => {
+    const w = world();
+    routeTestGaming(w.pr, w.options);
+    const listed = { ...w.pr, comments: Array.from({ length: 100 }, () => bot('old discussion')) };
+    expect(routeTestGaming(listed, w.options).action).toBe('admitted');
+    expect(w.provider.postComment).toHaveBeenCalledOnce();
+  });
+
+  it.each([undefined, null, {}, { nodes: [], hasNextPage: true }])('incomplete comment read %j admits nothing', comments => {
+    const w = world();
+    const log = vi.fn();
+    expect(sweepTestGamingRoutes({ ...w.options, prs: [w.pr], readComments: () => comments, log })).toEqual([]);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('incomplete comment read'));
+    expect(w.provider.postComment).not.toHaveBeenCalled();
+    expect(w.provider.setLabels).not.toHaveBeenCalled();
+  });
+
+  it.each(['read', 'write'])('continues routing subsequent PRs after one PR throws on %s', stage => {
+    const bad = world(), good = world(), log = vi.fn();
+    bad.pr.number = 5487;
+    bad.verdict.num = bad.pr.number;
+    const provider = {
+      readPrState: (repo, n) => (n === bad.pr.number ? bad : good).provider.readPrState(repo, n),
+      postComment: (repo, n, body) => {
+        if (n === bad.pr.number && stage === 'write') throw Error('write failed');
+        return (n === bad.pr.number ? bad : good).provider.postComment(repo, n, body);
+      },
+      setLabels: (repo, n, labels) => (n === bad.pr.number ? bad : good).provider.setLabels(repo, n, labels),
+    };
+    const out = sweepTestGamingRoutes({ ...good.options, provider, prs: [bad.pr, good.pr], log,
+      readVerdict: ({ prNumber }) => {
+        if (prNumber === bad.pr.number && stage === 'read') throw Error('read failed');
+        return (prNumber === bad.pr.number ? bad : good).verdict;
+      },
+      readComments: n => (n === bad.pr.number ? bad : good).pr.comments,
+    });
+    expect(out).toEqual([expect.objectContaining({ pr: good.pr.number, action: 'admit' })]);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining(`${stage} failed`));
+    expect(good.provider.postComment).toHaveBeenCalledOnce();
+    expect(good.pr.labels.map(l => l.name)).toContain('advisory:changes');
+  });
+
+  it.each(['completion', 'justification', 'notice'])('rejects an outsider %s after the legitimate route', kind => {
+    const w = world();
+    routeTestGaming(w.pr, w.options);
+    const end = `🔓 conveyor fix-end\n\nat \`${HEAD}\``;
+    const justified = `${end}\n\ntest-removal-justified: removed behaviour`;
+    if (kind === 'notice') w.pr.comments.push(bot(justified));
+    w.pr.comments.push({ author: { login: 'outsider' }, body: kind === 'completion' ? end
+      : kind === 'justification' ? justified : `<!-- test-gaming-needs-you: ${HEAD} -->` });
+    const out = routeTestGaming(w.pr, w.options);
+    expect(out.action).toBe(kind === 'notice' ? 'needs-you' : 'admitted');
+    expect(w.notify).toHaveBeenCalledTimes(kind === 'notice' ? 1 : 0);
+    expect(w.pr.labels.map(l => l.name).includes('advisory:changes')).toBe(kind !== 'notice');
+  });
+
+  it.each([
+    { id: 'unknown', status: 'hold' },
+    { id: 'test-gaming', status: 'unknown' },
+    { id: 'other-rule', status: 'unknown' },
+  ])('refuses unknown gate evidence %j', row => {
+    const w = world();
+    w.verdict.results = [{ ...w.verdict.results[0], ...row }];
+    expect(routeTestGaming(w.pr, w.options).action).toBe('skip');
+    expect(w.provider.postComment).not.toHaveBeenCalled();
+    expect(w.provider.setLabels).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'skip-only: x.test.mjs',
+    'tests-removed: /absolute.test.mjs (net 1 test case(s) removed)',
+    'tests-removed: x/../up.test.mjs (net 1 test case(s) removed)',
+    ...['0', '-1', '1.5', 'NaN', '9007199254740992'].map(n => `tests-removed: x.test.mjs (net ${n} test case(s) removed)`),
+    'tests-removed: x.test.mjs (net 9007199254740991 test case(s) removed); tests-removed: y.test.mjs (net 1 test case(s) removed)',
+  ])('refuses unusable removal evidence %s', reason => {
+    const w = world();
+    w.verdict.results[0].reason = reason;
+    expect(routeTestGaming(w.pr, w.options).action).toBe('skip');
+    expect(w.provider.postComment).not.toHaveBeenCalled();
+    expect(w.provider.setLabels).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    '[click](https://evil).test.mjs', 'x`quoted`.test.mjs', 'x"quoted".test.mjs',
+    'x\'quoted\'.test.mjs', '--instruction.test.mjs', 'x/--instruction.test.mjs', './x.test.mjs',
+    'x\\windows.test.mjs', 'x\ninstruction.test.mjs', 'x\rinstruction.test.mjs',
+    'x\u2028instruction.test.mjs', 'x\u200binstruction.test.mjs', 'ｘ.test.mjs',
+    `${'x'.repeat(241)}.test.mjs`,
+  ])('refuses unsafe gate-derived path %j without write effects', path => {
+    const w = world();
+    w.verdict.results[0].reason = `tests-removed: ${path} (net 1 test case(s) removed)`;
+    expect(routeTestGaming(w.pr, w.options).action).toBe('skip');
+    expect(w.provider.postComment).not.toHaveBeenCalled();
+    expect(w.provider.setLabels).not.toHaveBeenCalled();
+  });
+
+  it('refuses a malformed removal appended to valid evidence', () => {
+    const w = world();
+    w.verdict.results[0].reason += '; tests-removed: broken';
+    expect(routeTestGaming(w.pr, w.options).action).toBe('skip');
+    expect(w.provider.postComment).not.toHaveBeenCalled();
+    expect(w.provider.setLabels).not.toHaveBeenCalled();
+  });
+
+  it('bounds gate-derived file lists and refuses oversized evidence', () => {
+    const w = world();
+    w.verdict.results[0].reason = Array.from({ length: 12 }, (_, i) => `tests-removed: tests/f${i}.test.mjs (net 1 test case(s) removed)`).join('; ');
+    const out = routeTestGaming(w.pr, w.options);
+    expect(out.action).toBe('admit');
+    expect(out.binding).toContain('12 test case(s)');
+    expect(out.binding).toContain('`tests/f9.test.mjs`, +2 more');
+    expect(out.binding).not.toContain('tests/f10.test.mjs');
+    expect(out.body.length).toBeLessThan(4000);
+    w.provider.postComment.mockClear();
+    w.provider.setLabels.mockClear();
+    w.pr.comments = [];
+    w.verdict.results[0].reason += 'x'.repeat(64 * 1024);
+    expect(routeTestGaming(w.pr, w.options).action).toBe('skip');
+    expect(w.provider.postComment).not.toHaveBeenCalled();
+    expect(w.provider.setLabels).not.toHaveBeenCalled();
   });
 
   it('keeps another reviewer’s newer finding intact', () => {
@@ -175,7 +382,8 @@ describe('test-gaming hold routing', () => {
     expect(resolveReviewSettingSource(key, { fileRaw: {}, platform: {}, env: {} })).toBe('standard');
     expect(resolveReviewSettings({ fileConfig: {}, platform: { [key]: false }, env: {} })[key]).toBe(false);
     expect(resolveReviewSettingSource(key, { fileRaw: {}, platform: { [key]: false }, env: {} })).toBe('platform');
-    expect(resolveReviewSettingSource(key, { fileRaw: { [key]: true }, platform: { [key]: false }, env: {} })).toBe('tool');
+    expect(resolveReviewSettings({ fileConfig: { [key]: false }, platform: { [key]: true }, env: {} })[key]).toBe(false);
+    expect(resolveReviewSettingSource(key, { fileRaw: { [key]: false }, platform: { [key]: true }, env: {} })).toBe('tool');
     const env = { WE_REVIEW_ROUTE_TEST_GAMING_TO_FIXER: 'false' };
     expect(resolveReviewSettings({ fileConfig: { [key]: true }, platform: {}, env })[key]).toBe(false);
     expect(resolveReviewSettingSource(key, { fileRaw: { [key]: true }, env })).toBe('env');
