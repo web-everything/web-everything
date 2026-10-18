@@ -1,4 +1,5 @@
 ---
+bornAs: xjg2t02
 kind: story
 size: 2
 status: open

@@ -12,9 +12,9 @@ tags: []
 # Prevention — A card-lint requirement that a card widening a permission or sandbox list states the exact path g… (from web-everything/web-everything#5547 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/xl6u8qo-codex-sandbox-can-write-the-coordination-dir-free-scope-regi.md:14` — A card-lint requirement that a card widening a permission or sandbox list states the exact path granted and a test asserting a path just outside it is still denied.
-2. `we:backlog/xcmo9wr-operations-match-a-checkout-when-the-repo-slug-and-origin-di.md:14` — Fill the Identity scoping edge-case line before a card becomes buildable. Enforce that with the same card-lint that rejects TODO placeholders.
-3. `we:backlog/xvs6bsd-free-scope-claims-files-not-directories-and-treats-a-stack-b.md:14` — Add a card-lint rule that a card relaxing a conflict or claim check must name a test where a non-qualifying claimant is still refused.
+1. `we:backlog/6255-codex-sandbox-can-write-the-coordination-dir-free-scope-regi.md:14` — A card-lint requirement that a card widening a permission or sandbox list states the exact path granted and a test asserting a path just outside it is still denied.
+2. `we:backlog/6252-operations-match-a-checkout-when-the-repo-slug-and-origin-di.md:14` — Fill the Identity scoping edge-case line before a card becomes buildable. Enforce that with the same card-lint that rejects TODO placeholders.
+3. `we:backlog/6258-free-scope-claims-files-not-directories-and-treats-a-stack-b.md:14` — Add a card-lint rule that a card relaxing a conflict or claim check must name a test where a non-qualifying claimant is still refused.
 
 Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 1 → #4706, finding 5 → #5360, finding 6 → #5360.
 
