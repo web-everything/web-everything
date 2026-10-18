@@ -1,4 +1,3 @@
-import { operatorScope, scopeBrief } from './fix-scope-fence.mjs';
 /**
  * @file scripts/conveyor/reconcile-fix-dispatch.mjs
  * @description #3438 — DISPATCH THE FIX AGENT `we:scripts/conveyor/reconcile-pass.mjs` DECIDES IS OWED.
@@ -170,6 +169,8 @@ import { resolveOperationRoute, resolvePolicyModel } from '../lib/dispatch-routi
 import { countRearmComments } from './rearm-review.mjs';
 import { countAdvisoryComments } from './advisory-round-count.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
+// Last on purpose: its graph reaches pr-stack.mjs, and entering that cycle FIRST deadlocks vite-node (pr-stack.test.mjs hung 25 min).
+import { operatorScope, scopeBrief } from './fix-scope-fence.mjs';
 
 // card 302 — resolve red-main capacity through the shared policy layers.
 export function resolveMainFixCapacity(env = process.env) {
