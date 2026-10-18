@@ -50,12 +50,23 @@ const lockExpiry = (lock, leaseMs) => Number.isFinite(ms(lock.lease?.expiresAt))
 export const tokenOf = path => readLock(path)?.lease?.token;
 
 /** Git runner whose captured output is bounded at 16 MiB; `maxBuffer` follows `...options`, so a caller cannot raise it. */
-export const gitIn = cwd => (args, options = {}) => execFileSync('git', args, {
+export const gitIn = (cwd, exec = execFileSync) => (args, options = {}) => exec('git', args, {
   cwd, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], ...options, maxBuffer: 16 * 1024 * 1024,
   env: { ...process.env, GIT_AUTHOR_NAME: 'Card batch', GIT_AUTHOR_EMAIL: 'card-batch@localhost',
     GIT_COMMITTER_NAME: 'Card batch', GIT_COMMITTER_EMAIL: 'card-batch@localhost',
     GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
 });
+
+/** Production GitHub lookup, with a fixed deadline and captured-output limit. */
+export const defaultGh = (args, exec = execFileSync) => exec('gh', args, {
+  encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+});
+
+/** Recovery cannot disable its per-command deadline or raise gitIn's output limit. */
+export const recoveryGitIn = (cwd, exec = execFileSync) => {
+  const run = gitIn(cwd, exec);
+  return (args, options = {}) => run(args, { ...options, timeout: 30_000 });
+};
 
 /** A token prevents a finishing, expired producer from releasing its successor's lease. */
 export function acquireLease(path, owner, now, leaseMs, hook) {
@@ -98,7 +109,7 @@ export function atomicRecord(path, state) {
 
 /** Archive before replacing the active slot; caller must own and recheck the existing lease. */
 export function retireBatch(statePath, state, { repo, kind, held }) {
-  if (basename(dirname(statePath)) === 'sealed') return;
+  if (basename(dirname(statePath)) === 'sealed') return state;
   if (!held()) throw new Error('lease-held');
   const archiveDir = join(dirname(statePath), 'sealed');
   mkdirSync(archiveDir, { recursive: true });
@@ -115,8 +126,7 @@ export function retireBatch(statePath, state, { repo, kind, held }) {
  * No receive endpoint is added: bounded gh/git output, a timed lookup and the lease bound recovery triggers.
  */
 function respoolClosed(state, input, stateDir, remote, held) {
-  const runGit = gitIn(input.laneDir ?? ROOT);
-  const git = (args, options = {}) => runGit(args, { timeout: 30_000, ...options });
+  const git = recoveryGitIn(input.laneDir ?? ROOT);
   // A stale origin/main must not cause us to discard or duplicate a member.
   git(['fetch', '--no-tags', remote, 'refs/heads/main']);
   const main = git(['rev-parse', 'FETCH_HEAD^{commit}']).trim();
@@ -167,7 +177,7 @@ function respoolClosed(state, input, stateDir, remote, held) {
 export async function admitCard(input, {
   stateDir = cardBatchStateDir(), remote = 'origin', clock = Date.now,
   owner = `${process.pid}:${randomUUID()}`, policy, leaseMs = 60_000, crashAt, hook,
-  gh = args => execFileSync('gh', args, { encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }),
+  gh = defaultGh,
   log = line => process.stderr.write(`${line}\n`),
 } = {}) {
   const now = () => ms(clock());
@@ -203,7 +213,12 @@ export async function admitCard(input, {
     // Permit independent producers to contend even when Git itself is synchronous.
     await setImmediate();
     let recorded = readJSON(statePath);
-    if (recorded?.batchRef && recorded.sealedAt && recorded.pr) {
+    if (basename(dirname(statePath)) === 'sealed') return refuse('batch-sealed');
+    if (recorded?.batchRef && !COMMIT_ID.test(String(recorded.headSha))) return refuse('head-mismatch');
+    // Preserve member retries before retiring their membership. Dedupe still takes the remote-head
+    // validation path below; the lockfile, rather than the previous writer's audit lease, is authoritative.
+    let plan = planAdmit({ state: recorded && { ...recorded, lease: auditLease }, input, policy, now: now(), owner });
+    if (plan.action !== 'dedupe' && recorded?.batchRef && recorded.sealedAt && recorded.pr) {
       let status = 'UNREADABLE';
       try {
         if (!Number.isSafeInteger(recorded.seq) || recorded.seq < 1 || !COMMIT_ID.test(String(recorded.headSha))
@@ -228,9 +243,7 @@ export async function admitCard(input, {
         return refuse('batch-sealed');
       }
     }
-    if (recorded?.batchRef && !COMMIT_ID.test(String(recorded.headSha))) return refuse('head-mismatch');
-    // The lockfile is authoritative. State's lease is the audit snapshot of its last writer.
-    let plan = planAdmit({ state: recorded && { ...recorded, lease: auditLease }, input, policy, now: now(), owner });
+    plan = planAdmit({ state: recorded && { ...recorded, lease: auditLease }, input, policy, now: now(), owner });
     if (plan.action === 'refuse') return plan;
     const seq = recorded?.batchRef ? recorded.seq : (recorded?.seq ?? 0) + 1;
     const ref = `refs/heads/${recorded?.batchRef ?? `lane/card-batch-${input.kind}-${seq}`}`;

@@ -5,9 +5,11 @@ import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 import { setTimeout } from 'node:timers/promises';
 import { loadCardBatchPolicy } from '../../lib/card-batch-policy.mjs';
 import { admitCard, gitIn } from '../card-batch-io.mjs';
+import * as batchIO from '../card-batch-io.mjs';
 import { drainPendingPrevention } from '../land-prevention-card.mjs';
 
 const roots = [];
@@ -77,7 +79,105 @@ function assertRecorded(f, inputs) {
   expect(readdirSync(f.stateDir)).toEqual(['org-repo-prevention.json']);
 }
 
+// Manufacture readable coordinator evidence independently of the admission guards.
+function recoveryEvidence(f, sealed, scenario) {
+  const member = sealed.members[0];
+  const originalPath = 'backlog/5192-card.md';
+  const originalMessage = git(f.remote, ['show', '-s', '--format=%B', member.commitSha]);
+  const metadata = JSON.parse(originalMessage.split('\n').find(line => line.startsWith('Card-Batch: ')).slice(12));
+  if (scenario === 'repo mismatch') metadata.source.repo = 'other/repo';
+  if (scenario === 'cardPath mismatch') metadata.cardPath = 'backlog/5192-other.md';
+  if (scenario === 'cardId mismatch') metadata.cardId = 'other';
+  if (scenario === 'idemKey mismatch') metadata.idemKey = 'other';
+  if (scenario === 'kind mismatch') metadata.kind = 'other';
+  if (scenario === 'batchRef mismatch') metadata.batchRef = 'lane/card-batch-prevention-99';
+  if (scenario === 'non-card path') metadata.cardPath = 'config.json';
+  if (scenario === 'nested backlog path') metadata.cardPath = 'backlog/nested/5192-card.md';
+  if (scenario === 'card prefix mismatch') metadata.cardPath = 'backlog/5193-card.md';
+  git(f.remote, ['read-tree', f.baseSha]);
+  const path = ['non-card path', 'nested backlog path', 'card prefix mismatch'].includes(scenario) ? metadata.cardPath : originalPath;
+  const content = scenario === 'non-UTF8 bytes' ? Buffer.from([0xff])
+    : scenario === 'oversized output' ? Buffer.alloc(16 * 1024 * 1024 + 1, 'x') : Buffer.from('committed evidence\n');
+  const blob = git(f.remote, ['hash-object', '-w', '--stdin'], { input: content }).trim();
+  const mode = scenario === 'symlink' ? '120000' : scenario === 'executable' ? '100755' : '100644';
+  git(f.remote, ['update-index', '--add', '--cacheinfo', mode, blob, path]);
+  if (scenario === 'extra changed file') git(f.remote, ['update-index', '--add', '--cacheinfo', '100644', blob, 'config.json']);
+  const tree = git(f.remote, ['write-tree']).trim();
+  const marker = `Card-Batch: ${JSON.stringify(metadata)}`;
+  const message = scenario === 'invalid marker' ? 'Card-Batch: {\n'
+    : scenario === 'missing marker' ? 'unmarked\n'
+    : `${marker}\n${scenario === 'duplicate marker' ? marker : ''}\n`;
+  const sha = git(f.remote, ['commit-tree', tree, '-p', f.baseSha], { input: message }).trim();
+  git(f.remote, ['update-ref', f.ref, sha]);
+  sealed.headSha = sha;
+  member.commitSha = sha;
+}
+
+// Mutations exist only in disposable modules: repository source and its guards stay intact.
+function mutantProbe(f, replacements, probe) {
+  const moduleURL = new URL('../card-batch-io.mjs', import.meta.url);
+  let source = readFileSync(moduleURL, 'utf8');
+  for (const [before, after] of replacements) {
+    expect(source.split(before)).toHaveLength(2);
+    source = source.replace(before, after);
+  }
+  for (const specifier of ['./card-batch.mjs', '../lib/automation-home.mjs']) {
+    source = source.replace(`'${specifier}'`, JSON.stringify(new URL(specifier, moduleURL).href));
+  }
+  const path = join(f.root, 'mutant.mjs');
+  writeFileSync(path, source);
+  return JSON.parse(execFileSync(process.execPath, ['--input-type=module'], {
+    input: `import * as io from ${JSON.stringify(pathToFileURL(path).href)};\n${probe}`,
+    cwd: f.laneDir, env, encoding: 'utf8', timeout: 30_000, stdio: ['pipe', 'pipe', 'pipe'],
+  }));
+}
+
+function mutantAdmission(f) {
+  const input = f.card('5193');
+  return `const logs = [];
+    const result = await io.admitCard(${JSON.stringify(input)}, {
+      stateDir: ${JSON.stringify(f.stateDir)}, remote: 'origin', clock: () => ${f.now()},
+      gh: async () => '{"state":"CLOSED"}', log: line => logs.push(line),
+    });
+    console.log(JSON.stringify({ result, logs }));`;
+}
+
 describe('durable card batch IO', () => {
+  it.each(['MERGED', 'OPEN', 'CLOSED', 'unreadable'])('dedupes a sealed %s batch member before looking up GitHub', async status => {
+    const f = fixture();
+    const input = f.card();
+    const original = await admitCard(input, f.options);
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    const before = readFileSync(f.statePath);
+    let calls = 0;
+    const result = await admitCard(input, { ...f.options, log: () => {}, gh: async () => {
+      calls++;
+      if (status === 'unreadable') throw new Error('unreadable');
+      return JSON.stringify({ state: status });
+    } });
+    expect(result).toMatchObject({ action: 'dedupe', member: original.member });
+    expect(calls).toBe(0);
+    expect(readFileSync(f.statePath)).toEqual(before);
+    expect(f.count()).toBe(1);
+    expect(readdirSync(f.stateDir)).toEqual(['org-repo-prevention.json']);
+  });
+
+  it('still validates the remote head before deduping a sealed member', async () => {
+    const f = fixture();
+    const input = f.card();
+    await admitCard(input, f.options);
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    const before = readFileSync(f.statePath);
+    const foreign = git(f.remote, ['commit-tree', `${f.ref}^{tree}`, '-p', f.head(), '-m', 'unrelated commit']).trim();
+    git(f.remote, ['update-ref', f.ref, foreign]);
+    let calls = 0;
+    expect(await admitCard(input, { ...f.options, gh: async () => { calls++; return '{"state":"MERGED"}'; }, log: () => {} }))
+      .toEqual({ action: 'refuse', reason: 'head-mismatch' });
+    expect(calls).toBe(0);
+    expect(readFileSync(f.statePath)).toEqual(before);
+    expect(f.head()).toBe(foreign);
+  });
+
   it.each(['MERGED', 'CLOSED'])('retires a sealed %s PR on admission and retries idempotently', async status => {
     const f = fixture();
     const first = f.card();
@@ -100,6 +200,194 @@ describe('durable card batch IO', () => {
     expect((await admitCard(next, options)).action).toBe('dedupe');
     expect(readFileSync(f.statePath)).toEqual(before);
     expect(calls).toHaveLength(1);
+  });
+
+  it('closed recovery preserves committed content after worktree edits', async () => {
+    const f = fixture();
+    const first = f.card();
+    await admitCard(first, f.options);
+    const committed = f.bytes(first.cardPath).toString('utf8');
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    writeFileSync(join(f.laneDir, first.cardPath), 'modified worktree content\n');
+    expect((await admitCard(f.card('5193'), { ...f.options, gh: async () => '{"state":"CLOSED"}', log: () => {} })).action).toBe('admit');
+    expect(JSON.parse(readFileSync(join(f.stateDir, 'pending-prevention/5192.json'), 'utf8')).content).toBe(committed);
+  });
+
+  it.each([
+    'extra changed file', 'symlink', 'executable', 'repo mismatch', 'cardPath mismatch',
+    'non-UTF8 bytes', 'duplicate marker', 'invalid marker', 'missing marker',
+    'non-card path', 'nested backlog path', 'card prefix mismatch', 'cardId mismatch',
+    'idemKey mismatch', 'kind mismatch', 'batchRef mismatch', 'oversized output',
+  ])('closed recovery refuses invalid evidence: %s', async scenario => {
+    const f = fixture();
+    await admitCard(f.card(), f.options);
+    const sealed = { ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 };
+    recoveryEvidence(f, sealed, scenario);
+    writeFileSync(f.statePath, JSON.stringify(sealed));
+    const before = readFileSync(f.statePath);
+    const head = f.head();
+    expect(await admitCard(f.card('5193'), { ...f.options, gh: async () => '{"state":"CLOSED"}', log: () => {} }))
+      .toEqual({ action: 'refuse', reason: 'batch-sealed' });
+    expect(readFileSync(f.statePath)).toEqual(before);
+    expect(f.head()).toBe(head);
+    expect(existsSync(join(f.stateDir, 'sealed'))).toBe(false);
+    expect(existsSync(join(f.stateDir, 'pending-prevention'))).toBe(false);
+  }, 30_000);
+
+  it.each(['MERGED', 'CLOSED', 'OPEN', 'unreadable'])('logs retirement and held recovery outcomes: %s', async status => {
+    const f = fixture();
+    await admitCard(f.card(), f.options);
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    const lines = [];
+    const result = await admitCard(f.card('5193'), { ...f.options, log: line => lines.push(line), gh: async () => {
+      if (status === 'unreadable') throw new Error('lookup failed');
+      return JSON.stringify({ state: status });
+    } });
+    const outcome = status === 'CLOSED' ? 'retired and re-spooled' : status === 'MERGED' ? 'retired'
+      : status === 'OPEN' ? 'kept sealed and held' : 'recovery unreadable; kept sealed and held';
+    expect(result.action).toBe(['MERGED', 'CLOSED'].includes(status) ? 'admit' : 'refuse');
+    expect(lines).toEqual([`card-batch lane/card-batch-prevention-1 PR 5272 GitHub ${status === 'unreadable' ? 'UNREADABLE' : status}: ${outcome}`]);
+  });
+
+  it.each(['MERGED', 'CLOSED'])('keeps %s recovery held when the lookup loses its lease', async status => {
+    const f = fixture();
+    await admitCard(f.card(), f.options);
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    const before = readFileSync(f.statePath);
+    const successor = JSON.stringify({ token: 'successor', expiresAt: f.now() + 60000 });
+    expect(await admitCard(f.card('5193'), { ...f.options, gh: async () => {
+      writeFileSync(`${f.statePath}.lock`, successor);
+      return JSON.stringify({ state: status });
+    } })).toEqual({ action: 'refuse', reason: 'lease-held' });
+    expect(readFileSync(f.statePath)).toEqual(before);
+    expect(readFileSync(`${f.statePath}.lock`, 'utf8')).toBe(successor);
+    expect(existsSync(join(f.stateDir, 'sealed'))).toBe(false);
+    expect(existsSync(join(f.stateDir, 'pending-prevention'))).toBe(false);
+  });
+
+  it.each(['MERGED', 'CLOSED'])('slow %s recovery cannot write after lease expiry', async status => {
+    const f = fixture();
+    await admitCard(f.card(), f.options);
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    const before = readFileSync(f.statePath);
+    expect(await admitCard(f.card('5193'), { ...f.options, gh: async () => {
+      f.tick(60_000);
+      return JSON.stringify({ state: status });
+    } })).toEqual({ action: 'refuse', reason: 'lease-held' });
+    expect(readFileSync(f.statePath)).toEqual(before);
+    expect(readdirSync(f.stateDir)).toEqual(['org-repo-prevention.json']);
+  });
+
+  it.each(['ETIMEDOUT', 'ENOBUFS'])('a bounded GitHub lookup failure keeps recovery held: %s', async code => {
+    const f = fixture();
+    await admitCard(f.card(), f.options);
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    const before = readFileSync(f.statePath);
+    const calls = [];
+    const gh = args => batchIO.defaultGh(args, (_command, _args, options) => {
+      calls.push(options);
+      throw Object.assign(new Error(code), { code });
+    });
+    expect(await admitCard(f.card('5193'), { ...f.options, gh, log: () => {} }))
+      .toEqual({ action: 'refuse', reason: 'batch-sealed' });
+    expect(calls).toEqual([expect.objectContaining({ timeout: 30_000, maxBuffer: 1024 * 1024 })]);
+    expect(readFileSync(f.statePath)).toEqual(before);
+    expect(readdirSync(f.stateDir)).toEqual(['org-repo-prevention.json']);
+  });
+
+  it('retirement preserves a state already inside the sealed archive', () => {
+    const f = fixture();
+    const state = { seq: 1, sealedAt: 'sealed' };
+    expect(batchIO.retireBatch(join(f.stateDir, 'sealed/batch.json'), state, { held: () => true })).toBe(state);
+  });
+
+  it('admission fails closed when directed at the sealed archive', async () => {
+    const f = fixture();
+    await admitCard(f.card(), f.options);
+    const archive = join(f.stateDir, 'sealed');
+    mkdirSync(archive);
+    const path = join(archive, 'org-repo-prevention.json');
+    writeFileSync(path, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    const before = readFileSync(path);
+    expect(await admitCard(f.card('5193'), { ...f.options, stateDir: archive, gh: async () => '{"state":"MERGED"}', log: () => {} }))
+      .toEqual({ action: 'refuse', reason: 'batch-sealed' });
+    expect(readFileSync(path)).toEqual(before);
+    expect(readdirSync(archive)).toEqual(['org-repo-prevention.json']);
+  });
+
+  it('recovery subprocesses enforce production timeout and output limits', () => {
+    const calls = [];
+    const exec = (...args) => { calls.push(args); return 'bounded result'; };
+    expect(batchIO.defaultGh(['pr', 'view', '5272'], exec)).toBe('bounded result');
+    expect(calls[0]).toEqual(['gh', ['pr', 'view', '5272'], {
+      encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+    }]);
+    const run = batchIO.recoveryGitIn('/fixture', exec);
+    for (const args of [['fetch', 'origin', 'main'], ['show', 'HEAD:backlog/5192-card.md'], ['diff-tree', 'HEAD'], ['ls-tree', 'HEAD']]) {
+      expect(run(args, { timeout: 0, maxBuffer: Infinity, encoding: 'buffer' })).toBe('bounded result');
+      expect(calls.at(-1)).toEqual(['git', args, expect.objectContaining({
+        cwd: '/fixture', timeout: 30_000, maxBuffer: 16 * 1024 * 1024, encoding: 'buffer',
+      })]);
+    }
+  });
+
+  it('mutation gate distinguishes committed recovery bytes from worktree reads', async () => {
+    const f = fixture();
+    const first = f.card();
+    await admitCard(first, f.options);
+    const committed = f.bytes(first.cardPath).toString('utf8');
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    writeFileSync(join(f.laneDir, first.cardPath), 'worktree mutant\n');
+    const probe = mutantProbe(f, [[
+      "const bytes = git(['show', `${member.commitSha}:${data.cardPath}`], { encoding: 'buffer' });",
+      'const bytes = readFileSync(resolve(input.laneDir, data.cardPath));',
+    ]], mutantAdmission(f));
+    expect(probe.result.action).toBe('admit');
+    const recovered = JSON.parse(readFileSync(join(f.stateDir, 'pending-prevention/5192.json'), 'utf8')).content;
+    expect(recovered).toBe('worktree mutant\n');
+    expect(recovered).not.toBe(committed);
+  });
+
+  it('mutation gate distinguishes removal of recovery path restrictions', async () => {
+    const f = fixture();
+    await admitCard(f.card(), f.options);
+    const sealed = { ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 };
+    recoveryEvidence(f, sealed, 'non-card path');
+    writeFileSync(f.statePath, JSON.stringify(sealed));
+    const probe = mutantProbe(f, [
+      ['!/^backlog\\/[a-z0-9]+-[a-z0-9-]+\\.md$/.test(data.cardPath)', 'false'],
+      ['!data.cardPath.startsWith(`backlog/${member.cardId}-`)', 'false'],
+    ], mutantAdmission(f));
+    expect(probe.result.action).toBe('admit');
+    expect(JSON.parse(readFileSync(join(f.stateDir, 'pending-prevention/5192.json'), 'utf8')).rel).toBe('config.json');
+  });
+
+  it.each([
+    ['GitHub timeout', 'timeout: 30_000, maxBuffer: 1024 * 1024', 'maxBuffer: 1024 * 1024', 'gh', 'timeout'],
+    ['GitHub output limit', 'maxBuffer: 1024 * 1024, stdio:', 'stdio:', 'gh', 'maxBuffer'],
+    ['Git timeout', '...options, timeout: 30_000', '...options', 'git', 'timeout'],
+    ['Git output limit', '...options, maxBuffer: 16 * 1024 * 1024', '...options', 'git', 'maxBuffer'],
+  ])('mutation gate detects removal of %s', (_name, before, after, runner, key) => {
+    const f = fixture();
+    const options = mutantProbe(f, [[before, after]], `
+      const exec = (_command, _args, options) => JSON.stringify(options);
+      const result = ${runner === 'gh' ? 'io.defaultGh([], exec)' : "io.recoveryGitIn('/fixture', exec)([])"};
+      console.log(result);`);
+    expect(options[key]).toBeUndefined();
+  });
+
+  it.each(['MERGED', 'CLOSED', 'OPEN', 'unreadable'])('mutation gate detects removal of %s outcome logging', async status => {
+    const f = fixture();
+    await admitCard(f.card(), f.options);
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    const target = ['MERGED', 'CLOSED'].includes(status) ? '\n          log(`card-batch ${retired.batchRef}'
+      : status === 'OPEN' ? '\n          log(`card-batch ${recorded.batchRef}' : '\n        log(`card-batch ${recorded.batchRef}';
+    const probe = mutantProbe(f, [[target, target.replace('log(', 'void(')]],
+      mutantAdmission(f).replace("gh: async () => '{\"state\":\"CLOSED\"}'",
+        status === 'unreadable' ? "gh: async () => { throw new Error('unreadable'); }"
+          : `gh: async () => ${JSON.stringify(JSON.stringify({ state: status }))}`));
+    expect(probe.result.action).toBe(['MERGED', 'CLOSED'].includes(status) ? 'admit' : 'refuse');
+    expect(probe.logs).toEqual([]);
   });
 
   it.each(['OPEN', 'error', 'truncated', 'unknown'])('keeps a sealed %s PR held without changing state', async status => {
