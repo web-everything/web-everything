@@ -1,4 +1,5 @@
 ---
+bornAs: x6vzie0
 kind: story
 size: 2
 status: open
@@ -49,4 +50,4 @@ Prove drain numbering, then check the accepted prior head whose review evidence 
 
 ## Prevention
 
-Distinct no-run and unfinished-run error codes replace prose-prefix control flow here. Named fallback and unfinished-run regressions pin the repaired class. The broader deterministic Risks-to-tests validation requested in review is filed as `we:backlog/xrc0nrr-require-named-observable-tests-for-backlog-risk-constraints.md`; it is not queued by this repair.
+Distinct no-run and unfinished-run error codes replace prose-prefix control flow here. Named fallback and unfinished-run regressions pin the repaired class. The broader deterministic Risks-to-tests validation requested in review is filed as `we:backlog/6272-require-named-observable-tests-for-backlog-risk-constraints.md`; it is not queued by this repair.

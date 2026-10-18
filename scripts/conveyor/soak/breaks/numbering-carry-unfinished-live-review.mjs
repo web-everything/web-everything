@@ -15,7 +15,7 @@ const PATHS = ['scripts/lib/numbering-carry.mjs', 'scripts/review-set-label.mjs'
 export default {
   id: 'numbering-carry-unfinished-live-review',
   title: 'numbering carry must refuse an unfinished live-head review without a referral record',
-  card: 'x6vzie0; PR #5520 review of the #5505 numbering re-stamp',
+  card: '6271; PR #5520 review of the #5505 numbering re-stamp',
   fixedBy: { sha: 'HEAD', where: 'lane/numbering-restamp-referral', paths: PATHS },
   fixPresent(root) {
     return readFileSync(join(root, PATHS[0]), 'utf8').includes("e?.code !== 'MANDATORY_REFERRAL_NO_REVIEW_RUN'");
