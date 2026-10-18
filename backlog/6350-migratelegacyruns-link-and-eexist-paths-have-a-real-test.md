@@ -1,15 +1,16 @@
 ---
+bornAs: xp0f3sb
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/lib/test-gaming-route.mjs"]
+scope: ["we:scripts/operations/run-store.mjs"]
 dateOpened: "2026-10-18"
 tags: []
 ---
 
-# Mixed test-gaming reasons are admitted by the route
+# migrateLegacyRuns link and EEXIST paths have a real test
 
-Priority: expedite (operator 2026-10-18, from PR #5537's review, we:scripts/lib/test-gaming-route.mjs:28; the expedite outcome isn't built yet, so treat it as top priority). A set of mixed test-gaming reasons is admitted; only a pure test-gaming set should be. Add a named test.
+Priority: expedite (operator 2026-10-18, from PR #5520's review; the expedite outcome isn't built yet, so treat it as top priority). Add a test for migrateLegacyRuns that covers the hard-link path and the EEXIST (target already exists) path, using real files.
 
 ## Acceptance
 

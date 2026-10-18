@@ -1,15 +1,16 @@
 ---
+bornAs: xqfisgu
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/conveyor/ledger-observation.mjs"]
+scope: ["we:scripts/lib/test-gaming-route.mjs"]
 dateOpened: "2026-10-18"
 tags: []
 ---
 
-# A later ordinary acceptance must not bypass the disabled human-clearance carry
+# An ordinary fix-end must not cancel a test-gaming justification handoff
 
-Priority: expedite (operator 2026-10-18, from PR #5492's review, we:scripts/conveyor/ledger-observation.mjs:74; the expedite outcome isn't built yet, so treat it as top priority; must-fix before ledger promotion). A later ordinary acceptance bypasses the disabled human-clearance carry. Close the bypass and add a named test.
+Priority: expedite (operator 2026-10-18, from PR #5537's review, we:scripts/lib/test-gaming-route.mjs:68; the expedite outcome isn't built yet, so treat it as top priority). A later ordinary fix-end cancels a justification handoff. It must leave the handoff in place. Add a named test.
 
 ## Acceptance
 

@@ -1,4 +1,5 @@
 ---
+bornAs: xooueoh
 kind: story
 size: 2
 status: open
@@ -7,9 +8,9 @@ dateOpened: "2026-10-18"
 tags: []
 ---
 
-# An ordinary fix-end must not cancel a test-gaming justification handoff
+# Mixed test-gaming reasons are admitted by the route
 
-Priority: expedite (operator 2026-10-18, from PR #5537's review, we:scripts/lib/test-gaming-route.mjs:68; the expedite outcome isn't built yet, so treat it as top priority). A later ordinary fix-end cancels a justification handoff. It must leave the handoff in place. Add a named test.
+Priority: expedite (operator 2026-10-18, from PR #5537's review, we:scripts/lib/test-gaming-route.mjs:28; the expedite outcome isn't built yet, so treat it as top priority). A set of mixed test-gaming reasons is admitted; only a pure test-gaming set should be. Add a named test.
 
 ## Acceptance
 

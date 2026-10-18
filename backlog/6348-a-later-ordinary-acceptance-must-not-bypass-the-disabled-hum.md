@@ -1,15 +1,16 @@
 ---
+bornAs: xhq5fqt
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/operations/run-store.mjs"]
+scope: ["we:scripts/conveyor/ledger-observation.mjs"]
 dateOpened: "2026-10-18"
 tags: []
 ---
 
-# migrateLegacyRuns link and EEXIST paths have a real test
+# A later ordinary acceptance must not bypass the disabled human-clearance carry
 
-Priority: expedite (operator 2026-10-18, from PR #5520's review; the expedite outcome isn't built yet, so treat it as top priority). Add a test for migrateLegacyRuns that covers the hard-link path and the EEXIST (target already exists) path, using real files.
+Priority: expedite (operator 2026-10-18, from PR #5492's review, we:scripts/conveyor/ledger-observation.mjs:74; the expedite outcome isn't built yet, so treat it as top priority; must-fix before ledger promotion). A later ordinary acceptance bypasses the disabled human-clearance carry. Close the bypass and add a named test.
 
 ## Acceptance
 

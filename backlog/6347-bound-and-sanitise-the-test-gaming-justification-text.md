@@ -1,15 +1,16 @@
 ---
+bornAs: x44a79g
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/operations/review-pr.mjs"]
+scope: ["we:scripts/lib/test-gaming-route.mjs"]
 dateOpened: "2026-10-18"
 tags: []
 ---
 
-# A non-prefixed review-pr run id is refused cleanly, not with a TypeError
+# Bound and sanitise the test-gaming justification text
 
-Priority: expedite (operator 2026-10-18, from PR #5520's review; the expedite outcome isn't built yet, so treat it as top priority). A review-pr run id without the expected prefix currently throws a TypeError; it must produce a clean refusal message. Add a test.
+Priority: normal (operator 2026-10-18, from PR #5537's review, we:scripts/lib/test-gaming-route.mjs:88). The justification text is neither length-bounded nor sanitised. Cap its length and strip control characters and markup before it is stored or posted. Add a test.
 
 ## Acceptance
 
