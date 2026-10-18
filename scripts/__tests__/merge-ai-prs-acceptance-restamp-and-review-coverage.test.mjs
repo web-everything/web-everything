@@ -457,9 +457,11 @@ describe('#3184 — the drain records a fingerprint READ MISS instead of collaps
     // A null label skips the notice structurally, and `revokesClearance` is false as well, so the structural
     // and the flag guard agree. Announcing a revocation that did not happen would send the operator to
     // re-clear a clearance that is still live.
-    expect(src).toMatch(/if \(gate\.applyLabel && !DRY_RUN\) \{/);
+    // Pre-stage candidates share the dry-run write barrier even during a live drain.
+    expect(src).toMatch(/const candidateDryRun = DRY_RUN \|\| v\.prestagePendingCi;/);
+    expect(src).toMatch(/if \(gate\.applyLabel && !candidateDryRun\) \{/);
     expect(src.indexOf('if (gate.revokesClearance) {'))
-      .toBeGreaterThan(src.indexOf('if (gate.applyLabel && !DRY_RUN) {'));
+      .toBeGreaterThan(src.indexOf('if (gate.applyLabel && !candidateDryRun) {'));
   });
 
   it('[green before #3184 — pinned, not proven] the #2324 body block keys on humanRequired, not the label', () => {
@@ -467,7 +469,8 @@ describe('#3184 — the drain records a fingerprint READ MISS instead of collaps
     // record survives only because the human-park body block is a separate branch keyed on `gate.humanRequired`
     // — which suppression deliberately leaves true. Re-key that guard to the label and a suppressed park
     // becomes a silent one, which is the #xmnl36p defect coming back by another door.
-    expect(src).toMatch(/if \(gate\.humanRequired && !DRY_RUN\) \{/);
+    expect(src).toMatch(/const candidateDryRun = DRY_RUN \|\| v\.prestagePendingCi;/);
+    expect(src).toMatch(/if \(gate\.humanRequired && !candidateDryRun\) \{/);
   });
 });
 
