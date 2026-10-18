@@ -1,15 +1,16 @@
 ---
+bornAs: xhrbbr8
 kind: story
-size: 3
+size: 5
 status: open
-scope: ["we:scripts/operations/free-scope-io.mjs", "we:scripts/lib/codex-direct-task-sandbox.mjs", "we:scripts/operations/__tests__/free-scope-sandbox.test.mjs"]
+scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/drain-hold-decision.mjs", "we:scripts/__tests__/merge-ai-prs-split.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Codex sandbox can write the coordination dir (free-scope register/release)
+# Split we:scripts/merge-ai-prs.mjs: extract the queue-selection and hold-decision logic into modules (part 1 of 2)
 
-Every Codex worker on 2026-10-17 hit EPERM on the scope-registry lock directory, so the drivers registered and released scope by hand. Fix: the Codex sandbox config grants write access to the coordination dir (or free-scope uses a path the sandbox already allows), so register and release work from inside a Codex worker. [A1] Executable: node --test we:scripts/operations/__tests__/free-scope-sandbox.test.mjs shows register then release succeeding under the Codex write-root list. Priority: top (operator 2026-10-17).
+we:scripts/merge-ai-prs.mjs is over 7000 lines and every drain fix lands in it, so fixes wait in line behind each other. On 2026-10-17 four open PRs (#5518, #5492, #5480, #5462) held it and five drain fixes waited behind them (xyzpgol, xrdwiud, xq7aczc, xrrtegi, red-team settings). Part 1 of 2: move the queue-selection and hold-decision functions into small modules under we:scripts/lib/ with no behavior change; the old file re-exports them. Related older card: 2784 (same goal, older and blocked). Part 2 is the next story. [A1] Executable: node --test we:scripts/__tests__/merge-ai-prs-split.test.mjs passes, and the existing drain tests pass unchanged. Priority: top (operator 2026-10-17).
 
 ## Acceptance
 

@@ -1,15 +1,16 @@
 ---
+bornAs: x75vli4
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/drain-land-path.mjs", "we:scripts/__tests__/merge-ai-prs-split-land.test.mjs"]
+scope: ["we:scripts/conveyor/prevention-filer.mjs", "we:scripts/conveyor/__tests__/prevention-filer.test.mjs", "we:scripts/settings/prevention-filer.json"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Split we:scripts/merge-ai-prs.mjs: extract the land, merge and report paths into modules (part 2 of 2)
+# The prevention filer batches its standards rules so its PRs do not collide
 
-Part 2 of 2 of the split of we:scripts/merge-ai-prs.mjs (part 1 moves queue selection and hold decisions). Move the land, merge and pass-report code into modules under we:scripts/lib/ with no behavior change, so the entry file is only wiring. Goal: two drain fixes touching different concerns stop colliding on one file. Related older card: 2784. [A1] Executable: node --test we:scripts/__tests__/merge-ai-prs-split-land.test.mjs passes and the full drain test set passes unchanged. Priority: top (operator 2026-10-17).
+Operator "Yes go", 2026-10-17. Live: around 23:00Z the approval-prevention filer opened about 8 PRs (5515, 5524, 5527, 5529, 5532, 5533, 5534, 5535), each adding a check:standards rule to the same file. 4 went DIRTY (conflict) against each other. Fix: prevention cards filed within a window (setting, default 30 min) that target the same rule file go into ONE PR, or stack. The filer checks open prevention PRs on the same file before opening a new one. Setting with its source logged. [A1] Executable: node --test we:scripts/conveyor/__tests__/prevention-filer.test.mjs, where 3 approvals in one window give 1 PR and a different file gives a separate PR.
 
 ## Acceptance
 

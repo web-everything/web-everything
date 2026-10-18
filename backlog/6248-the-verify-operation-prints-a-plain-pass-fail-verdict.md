@@ -1,15 +1,16 @@
 ---
+bornAs: x28khww
 kind: story
-size: 5
+size: 2
 status: open
-scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/drain-hold-decision.mjs", "we:scripts/__tests__/merge-ai-prs-split.test.mjs"]
+scope: ["we:scripts/operations/verify.mjs", "we:scripts/operations/__tests__/verify.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Split we:scripts/merge-ai-prs.mjs: extract the queue-selection and hold-decision logic into modules (part 1 of 2)
+# The verify operation prints a plain PASS/FAIL verdict
 
-we:scripts/merge-ai-prs.mjs is over 7000 lines and every drain fix lands in it, so fixes wait in line behind each other. On 2026-10-17 four open PRs (#5518, #5492, #5480, #5462) held it and five drain fixes waited behind them (xyzpgol, xrdwiud, xq7aczc, xrrtegi, red-team settings). Part 1 of 2: move the queue-selection and hold-decision functions into small modules under we:scripts/lib/ with no behavior change; the old file re-exports them. Related older card: 2784 (same goal, older and blocked). Part 2 is the next story. [A1] Executable: node --test we:scripts/__tests__/merge-ai-prs-split.test.mjs passes, and the existing drain tests pass unchanged. Priority: top (operator 2026-10-17).
+Live 2026-10-17: four worker drivers (#5505, #5506, #5507, #5510) reported "verify complete, 0 effects, no pass/fail line", so none could honestly say green. Fix: the verify operation's envelope and its last stdout line state PASS or FAIL plus the failing step; the default output carries it, not just --json. [A1] Executable: node --test we:scripts/operations/__tests__/verify.test.mjs asserts the last line is PASS or FAIL with the failing step on FAIL. Priority: top (operator 2026-10-17).
 
 ## Acceptance
 

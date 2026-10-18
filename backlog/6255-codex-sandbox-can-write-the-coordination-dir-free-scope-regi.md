@@ -1,15 +1,16 @@
 ---
+bornAs: xl6u8qo
 kind: story
-size: 2
+size: 3
 status: open
-scope: ["we:scripts/operations/verify.mjs", "we:scripts/operations/__tests__/verify.test.mjs"]
+scope: ["we:scripts/operations/free-scope-io.mjs", "we:scripts/lib/codex-direct-task-sandbox.mjs", "we:scripts/operations/__tests__/free-scope-sandbox.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
-# The verify operation prints a plain PASS/FAIL verdict
+# Codex sandbox can write the coordination dir (free-scope register/release)
 
-Live 2026-10-17: four worker drivers (#5505, #5506, #5507, #5510) reported "verify complete, 0 effects, no pass/fail line", so none could honestly say green. Fix: the verify operation's envelope and its last stdout line state PASS or FAIL plus the failing step; the default output carries it, not just --json. [A1] Executable: node --test we:scripts/operations/__tests__/verify.test.mjs asserts the last line is PASS or FAIL with the failing step on FAIL. Priority: top (operator 2026-10-17).
+Every Codex worker on 2026-10-17 hit EPERM on the scope-registry lock directory, so the drivers registered and released scope by hand. Fix: the Codex sandbox config grants write access to the coordination dir (or free-scope uses a path the sandbox already allows), so register and release work from inside a Codex worker. [A1] Executable: node --test we:scripts/operations/__tests__/free-scope-sandbox.test.mjs shows register then release succeeding under the Codex write-root list. Priority: top (operator 2026-10-17).
 
 ## Acceptance
 

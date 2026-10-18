@@ -1,15 +1,16 @@
 ---
+bornAs: xvs6bsd
 kind: story
-size: 5
+size: 3
 status: open
-scope: ["we:scripts/operations/land-human-only.mjs", "we:scripts/settings/land.json", "we:scripts/operations/__tests__/land-human-only-chat.test.mjs"]
+scope: ["we:scripts/operations/free-scope.mjs", "we:scripts/operations/free-scope-io.mjs", "we:scripts/operations/__tests__/free-scope.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Approve human-only enqueues from chat, with a recorded instruction
+# Free-scope claims files, not directories, and treats a stack base's files as available to its child
 
-Live: #5465 needed land-human-only, which only runs from an interactive terminal. The operator approved in chat ("Go, we will protect more when the project is more mature") and the session enqueued through the API, pinned to the head, with an audit comment. Fix: a sanctioned chat path that records the operator's verbatim instruction, pins the head, and runs the same human-only-surface and drain-gate checks as land-human-only, controlled by a setting (land.humanOnlyChannel=terminal|chat, default chat for now; tightened at public preview per the stringency levels). [A1] Executable: node --test we:scripts/operations/__tests__/land-human-only-chat.test.mjs, where chat mode without a recorded instruction is refused and terminal mode refuses chat.
+Free-scope registers whole directories, so two builders in the same folder block each other, and a child PR stacked on a base PR sees the base's files as taken. Fix: register exact files, and when the claimant is the child of a stacked base, treat the base's files as available. Links, does not duplicate: stacked-PR policy epic xejcrh1, slice xdqe5hm. [A1] Executable: node --test we:scripts/operations/__tests__/free-scope.test.mjs, with a case for two files in one directory (both free) and a stack child over its base (free). Priority: top (operator 2026-10-17).
 
 ## Acceptance
 

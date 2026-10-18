@@ -1,15 +1,16 @@
 ---
+bornAs: xqfah6d
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/merge-ai-prs-summary.test.mjs"]
+scope: ["we:scripts/operations/file-item.mjs", "we:scripts/operations/__tests__/file-item.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Drain pass summary counts each merged PR once
+# Slices filed at a decision ruling must carry scope
 
-Live: "merged 2 (#5522, #5522)" at 22:15Z and "merged 2 (#5517, #5517)" at 22:48Z. Each was one PR. The pass summary counts the same PR twice, which inflates the merged numbers the delivery metrics read. Fix: count distinct PR numbers. [A1] Executable: node --test we:scripts/__tests__/merge-ai-prs-summary.test.mjs, where one PR merged twice in a pass reports merged 1.
+Live 2026-10-17: decision xugqjw1's 5 slices were filed via the file-item operation; slice 1 (xdstsoh) had no scope, so the worker had to invent placement (PR #5516). An unscoped story cannot be dispatched by the conveyor (unshaped-no-scope). Fix: file-item refuses a buildable story or task without --scope (or a declared scope: tbd-prepare that routes it to prepare), and the decision-close procedure requires a scope per slice. [A1] Executable: node --test we:scripts/operations/__tests__/file-item.test.mjs, where a story with no scope is refused.
 
 ## Acceptance
 

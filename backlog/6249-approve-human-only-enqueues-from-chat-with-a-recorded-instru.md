@@ -1,15 +1,16 @@
 ---
+bornAs: x6ix36v
 kind: story
-size: 2
+size: 5
 status: open
-scope: ["we:scripts/operations/file-item.mjs", "we:scripts/operations/__tests__/file-item.test.mjs"]
+scope: ["we:scripts/operations/land-human-only.mjs", "we:scripts/settings/land.json", "we:scripts/operations/__tests__/land-human-only-chat.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Slices filed at a decision ruling must carry scope
+# Approve human-only enqueues from chat, with a recorded instruction
 
-Live 2026-10-17: decision xugqjw1's 5 slices were filed via the file-item operation; slice 1 (xdstsoh) had no scope, so the worker had to invent placement (PR #5516). An unscoped story cannot be dispatched by the conveyor (unshaped-no-scope). Fix: file-item refuses a buildable story or task without --scope (or a declared scope: tbd-prepare that routes it to prepare), and the decision-close procedure requires a scope per slice. [A1] Executable: node --test we:scripts/operations/__tests__/file-item.test.mjs, where a story with no scope is refused.
+Live: #5465 needed land-human-only, which only runs from an interactive terminal. The operator approved in chat ("Go, we will protect more when the project is more mature") and the session enqueued through the API, pinned to the head, with an audit comment. Fix: a sanctioned chat path that records the operator's verbatim instruction, pins the head, and runs the same human-only-surface and drain-gate checks as land-human-only, controlled by a setting (land.humanOnlyChannel=terminal|chat, default chat for now; tightened at public preview per the stringency levels). [A1] Executable: node --test we:scripts/operations/__tests__/land-human-only-chat.test.mjs, where chat mode without a recorded instruction is refused and terminal mode refuses chat.
 
 ## Acceptance
 
