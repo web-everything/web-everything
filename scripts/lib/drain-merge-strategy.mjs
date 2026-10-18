@@ -45,7 +45,7 @@ import { defaultPostConflictFinding } from './conflict-finding.mjs';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { loadMergeDeliveryPolicy, formatMergeDeliverySourcesLine, MERGE_DELIVERY_STRATEGIES } from './merge-delivery-policy.mjs';
 import { mergeActionFor, enqueuePr, planQueueFollowUps, REQUIRED_WORKFLOWS_UNSATISFIED, readPinnedChangedFiles, workflowEditHold } from './merge-queue-enqueue.mjs';
@@ -67,45 +67,7 @@ export const FOLLOW_UP_MAX_ATTEMPTS = 5;
 
 export function queueStatePath(env = process.env) { return join(resolveCoordinationRoot({ env }), 'drain-merge-queue-followups.json'); }
 
-// One durable request per repo/PR/head. Completed records remain as idempotency tombstones.
-const requestDir = env => join(resolveCoordinationRoot({ env }), 'drain-red-team-requests');
-const requestKey = ({ repo, pr, head }) => {
-  if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !Number.isSafeInteger(pr) || pr <= 0 || !/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('invalid red-team request');
-  return `${encodeURIComponent(repo.toLowerCase())}-${pr}-${head.toLowerCase()}.json`;
-};
-export function requestDrainRedTeam(input, { env = process.env, dryRun = false, write = writeJsonAtomic } = {}) {
-  if (dryRun) return { requested: false };
-  try {
-    const path = join(requestDir(env), requestKey(input));
-    mkdirSync(dirname(path), { recursive: true });
-    return withFileLock(`${path}.lock`, () => {
-      try {
-        const existing = JSON.parse(readFileSync(path, 'utf8'));
-        return { requested: requestKey(existing) === requestKey(input) && Number.isFinite(existing.requestedAt) };
-      }
-      catch (e) { if (e.code !== 'ENOENT') return { requested: false }; }
-      write(path, { repo: input.repo.toLowerCase(), pr: input.pr, head: input.head.toLowerCase(), requestedAt: Date.now() });
-      return { requested: true };
-    });
-  } catch { return { requested: false }; }
-}
-export function readDrainRedTeamRequests({ env = process.env } = {}) {
-  let names;
-  try { names = readdirSync(requestDir(env)); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
-  return names.filter(n => n.endsWith('.json')).flatMap(name => {
-    try {
-      const request = JSON.parse(readFileSync(join(requestDir(env), name), 'utf8'));
-      return requestKey(request) === name && Number.isFinite(request.requestedAt) && !request.consumedAt ? [request] : [];
-    } catch { return []; }
-  });
-}
-export function finishDrainRedTeamRequest(request, { env = process.env } = {}) {
-  const path = join(requestDir(env), requestKey(request));
-  withFileLock(`${path}.lock`, () => {
-    const current = JSON.parse(readFileSync(path, 'utf8'));
-    writeJsonAtomic(path, { ...current, consumedAt: Date.now() });
-  });
-}
+export { requestDrainRedTeam, readDrainRedTeamRequests, finishDrainRedTeamRequest } from './drain-red-team-requests.mjs';
 
 /**
  * The settings object the tool layer reads. Hermetic by default, like `merge-queue-hook.mjs#resolveMergeQueueSettings`:

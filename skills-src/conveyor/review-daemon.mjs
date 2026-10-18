@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { readDrainRedTeamRequests, finishDrainRedTeamRequest } from '../../scripts/lib/drain-merge-strategy.mjs';
+import { redTeamEnabled } from '../../scripts/lib/review-red-team-policy.mjs';
+import { readDrainRedTeamRequests, finishDrainRedTeamRequest } from '../../scripts/lib/drain-red-team-requests.mjs';
 import { withReviewFetchTick } from '../../scripts/lib/review-fetch.mjs';
 /**
  * @file skills-src/conveyor/review-daemon.mjs
@@ -480,10 +481,18 @@ export function runReviewTick({
   const reviews = (plan.dispatch ?? []).filter((d) => d && d.kind === 'review');
   // Re-use the ordinary lane/auth/CI/live-job guarded dispatch. A refusal always wins over a request.
   if (readRedTeamRequests && Array.isArray(rawPrs)) {
-    const blocked = new Set([...(plan.refusals ?? []), ...(plan.dispatch ?? [])].map(d => Number(d.prNumber)));
+    // A queued accepted PR owes no jury review. That disposition does not discharge its red-team seat.
+    // Every actual review hold/refusal and every live dispatch still blocks this branch.
+    const blocked = new Set([...(plan.refusals ?? []).filter(d => !(d.kind === 'nothing-owed' && d.phase === 'queued')),
+      ...(plan.dispatch ?? [])].map(d => Number(d.prNumber)));
     for (const request of readRedTeamRequests()) {
-      if (request.repo.toLowerCase() !== repo.toLowerCase() || blocked.has(request.pr)) continue;
+      if (request.repo.toLowerCase() !== repo.toLowerCase()) continue;
       const subject = rawPrs.find(p => Number(p.number) === request.pr);
+      if (subject?.headRefOid && subject.headRefOid.toLowerCase() !== request.head.toLowerCase()) {
+        finishRedTeamRequest(request, { status: 'stale' });
+        continue;
+      }
+      if (blocked.has(request.pr) || !redTeamEnabled()) continue;
       const labels = (subject?.labels ?? []).map(l => typeof l === 'string' ? l : l.name);
       if (subject?.headRefOid?.toLowerCase() !== request.head || subject.isDraft
         || !labels.includes('review:accepted') || !labels.includes('ready-to-merge')
@@ -575,7 +584,7 @@ export function runReviewTick({
     try {
       const subject = (Array.isArray(rawPrs) ? rawPrs : []).find(p => Number(p?.number) === Number(d.prNumber));
       const result = dispatch({ pr: d.prNumber, repo,
-        ...(d.redTeamRequest ? { expectedRedTeamHead: d.redTeamRequest.head } : {}),
+        ...(d.redTeamRequest ? { expectedRedTeamHead: d.redTeamRequest.head, drainRedTeamRequest: d.redTeamRequest } : {}),
         ...(d.advisoryReview?.ciWaived === true ? { advisoryCiWaiver: { head: d.advisoryReview.head, reason: d.advisoryReview.reason } } : {}),
         ...(Array.isArray(lanes) ? { preferLane: lanes[i] } : {}),
         escalationReason: parseEscalationReason(subject?.body ?? ''),
@@ -584,7 +593,6 @@ export function runReviewTick({
       // x26lw6u — a job dispatch that declined to start (a live job already on this PR, or the lane cool-off)
       // did not advance the round, so it gets no round tag — same rule as a failed dispatch.
       if (result?.skipped) { notStarted.push({ prNumber: d.prNumber, reason: result.skipped }); continue; }
-      if (d.redTeamRequest) finishRedTeamRequest(d.redTeamRequest);
       dispatched.push({
         prNumber: d.prNumber, agentId: result?.agentId ?? null,
         ...(result?.mode ? { mode: result.mode } : {}), ...(Number.isInteger(result?.jobPid) ? { jobPid: result.jobPid } : {}),
@@ -593,6 +601,7 @@ export function runReviewTick({
       failed.push({ prNumber: d.prNumber, error: String((e && e.message) || e).split('\n')[0] });
       continue; // no round tag on a failed dispatch — the round did not actually advance
     }
+    if (d.redTeamRequest) continue; // A red-team retry does not spend another jury round.
     try { tagRound({ pr: d.prNumber, repo, round: (d.attempts ?? 0) + 1, currentLabels: labelsByPr.get(Number(d.prNumber)) }); }
     catch { /* cosmetic — a failed tag never fails the tick, see review-round-tag.mjs's own header */ }
   }
@@ -1067,7 +1076,7 @@ export function buildCliDaemonEffects({
         for (const r of promotions) log.error(`review-daemon: ${repo}#${r.pr} same-pass promote ${r.action} — ${String(r.why ?? '').replace(/\s+/g, ' ').slice(0, 300)}`);
         if (replanError) log.error(`review-daemon: ${repo} same-pass re-plan failed (review goes out next pass): ${replanError}`);
       },
-      dispatch: ({ expectedRedTeamHead, ...o }) => dispatchReviewByMode({ ...o, ciGate: headBoundRedTeamCiGate(readReviewCiGateFactsFirst, expectedRedTeamHead) }),
+      dispatch: ({ expectedRedTeamHead, ...o }) => dispatchReviewByMode({ ...o, ...(o.drainRedTeamRequest ? { mode: 'job' } : {}), ciGate: headBoundRedTeamCiGate(readReviewCiGateFactsFirst, expectedRedTeamHead) }),
       tagRound: (o) => tagReviewRound({ ...o, provider: factsProvider }),
       tagStatus: (o) => tagReviewStatus({ ...o, provider: factsProvider }),
       ...opts,

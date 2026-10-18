@@ -1,11 +1,14 @@
 #!/usr/bin/env node
+import { runDrainRedTeamJob } from '../lib/drain-red-team-review.mjs';
+import { finishDrainRedTeamRequest } from '../lib/drain-red-team-requests.mjs';
+import { isCompletedReviewPr } from './review-pr-completion.mjs';
 import { formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { recordRedTeamStatus, readDrainRedTeamEvidence } from '../lib/drain-red-team-evidence.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { speculativeSeatTimings } from '../lib/review-speculative-red-team.mjs';
 import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
-import { readRun, writeRun } from './run-store.mjs';
+import { listRunIds, readRun, writeRun } from './run-store.mjs';
 import { savedRedTeamHash, savedRedTeamRunsDir, matchesSavedRedTeamHead, verifySavedRedTeamProvenance } from '../lib/saved-red-team-provenance.mjs';
 import { resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.mjs';
@@ -86,7 +89,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { execRead } from '../lib/proc-read.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
-import { liveResultGateState, redTeamGateMarker, redTeamMarker, redTeamResultId, readRedTeamTiming, readConfirmedBreaks, planRedTeamActions } from '../lib/red-team-gate.mjs';
+import { liveResultGateState, redTeamGateMarker, redTeamMarker, redTeamResultId, readRedTeamTiming, readRedTeamProbes, readConfirmedBreaks, planRedTeamActions } from '../lib/red-team-gate.mjs';
 import { savedRedTeamFallback } from '../lib/drain-saved-red-team.mjs';
 
 import { randomUUID } from 'node:crypto';
@@ -292,6 +295,21 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       catch (e) { process.stderr.write(`review-job: red-team status write failed: ${e.message}\n`); }
     },
     root,
+    redTeamEnabled: () => redTeamEnabled(env),
+    skipCardOnly: () => readRedTeamProbes({ env }).value.skipCardOnly,
+    finishDrainRedTeamRequest: (request, opts) => finishDrainRedTeamRequest(request, { env, ...opts }),
+    readDrainRedTeamCi: ({ repo, pr }) => readReviewCiGate({ repo, pr, policy: resolveTimingPolicy({ env }).review }),
+    readDrainRedTeamState: ({ repo, pr }) => JSON.parse(execRead('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid,state,isDraft,labels'], { cwd: root, env })),
+    readDrainRedTeamReview: ({ repo, pr, head }) => {
+      const runsDir = savedRedTeamRunsDir(env);
+      const at = run => Math.max(0, ...(run.stepTimings ?? []).flatMap(t =>
+        [Date.parse(t.startedAt) || 0, Date.parse(t.finishedAt) || 0]));
+      const run = listRunIds(runsDir).filter(id => id.startsWith('review-pr-')).map(id => readRun(id, runsDir))
+        .filter(run => run.op === 'review-pr' && run.input?.repo?.toLowerCase() === repo.toLowerCase()
+          && Number(run.input?.pr) === Number(pr) && run.findings?.read?.netBasis?.rev === head)
+        .sort((a, b) => at(b) - at(a))[0];
+      return run && isCompletedReviewPr(run) ? { runId: run.id, verdict: run.verdict, findings: run.findings } : null;
+    },
     // The carry's own resolver is its only source (logged with that source); no timing setting governs it.
     carryAcrossRebaseSetting: () => resolveCarryAcrossRebase({ env, readFile }),
     readCarryEvidence: ({ pr, repo }) => {
@@ -500,7 +518,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
         && row.callId === redTeam.callId);
       if (index < 0) throw new Error('saved red-team result reference missing');
       // Stored results must already be admissible; never mint provenance for an unverified row.
-      if (!redTeam.seat && verifySavedRedTeamProvenance({ repo, pr, head, path, records, index, env, runsDir })) return;
+      if (!redTeam.seat && verifySavedRedTeamProvenance({ repo, pr, head, path, records, index, env, runsDir })) return false;
       // A fresh result carries its seat row. Refuse if storage changed it beyond the store's defaults.
       if (redTeam.seat && Object.keys(redTeam.seat).some(key =>
         savedRedTeamHash([records[index][key] ?? null]) !== savedRedTeamHash([redTeam.seat[key] ?? null])))
@@ -508,6 +526,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       writeRun({ ...run, findings: { ...run.findings, savedRedTeamResult: {
         writer: 'review-job', references: [{ path, index }], sha256: savedRedTeamHash([records[index]]),
       } } }, runsDir);
+      return true;
     },
     recordSeatTimings: (runId, rows) => {
       if (!runId || !rows.length) return;
@@ -671,6 +690,7 @@ function attestSavedRedTeam(io, runId, input, redTeam) {
  *   timings:{acquireMs:(number|null), loopMs:(number|null), totalMs:number}}}
  */
 export function runReviewJob(opts = {}, io = createReviewJobIo()) {
+  if (opts.drainRedTeamRequest) return runDrainRedTeamJob(opts, io, planReviewDispatch);
   const timing = io.redTeamTimingSetting?.() ?? readRedTeamTiming();
   io.log(`review-job: ${formatCascadeSourcesLine('redTeam', timing)}`);
   const seatsBox = { panelSeat: timing.value.timing === 'panel-seat' };
@@ -960,7 +980,7 @@ function runReviewArc({
  */
 export function dispatchReviewJob({
   ciGate = readReviewCiGate, advisoryCiWaiver = null,
-  pr, repo, preferLane = null, root = REPO_ROOT, env = process.env, now = Date.now(), checkStaleness,
+  pr, repo, preferLane = null, drainRedTeamRequest = null, root = REPO_ROOT, env = process.env, now = Date.now(), checkStaleness,
   dir = reviewJobsDir(env, root),
   spawnJob = defaultSpawnJob,
   readCompletion = (slug) => { try { return tryReadCompletion(slug); } catch { return null; } },
@@ -999,6 +1019,8 @@ export function dispatchReviewJob({
   // The dispatcher's own actor id (if it happens to run inside a session) must never leak into the job — the
   // job mints its own per round.
   delete childEnv[ACTOR_ENV];
+  delete childEnv.WE_DRAIN_RED_TEAM_REQUEST;
+  if (drainRedTeamRequest) childEnv.WE_DRAIN_RED_TEAM_REQUEST = JSON.stringify(drainRedTeamRequest);
   mkdirSync(dir, { recursive: true });
   const jobPid = spawnJob({
     argv: [THIS_FILE, 'run', `--pr=${planned.pr}`, `--repo=${planned.repo}`,
@@ -1147,6 +1169,7 @@ if (IS_CLI) {
     try {
       const lane = Number(flag('prefer-lane'));
       const out = runReviewJob({ pr: flag('pr'), repo: flag('repo'),
+        drainRedTeamRequest: process.env.WE_DRAIN_RED_TEAM_REQUEST ? JSON.parse(process.env.WE_DRAIN_RED_TEAM_REQUEST) : null,
         preferLane: Number.isInteger(lane) && lane > 0 ? lane : null });
       writeAllSync(1, `${JSON.stringify(out)}\n`);
       // #4075/run-rating slice 1 — mechanical grading for this now-finished job-mode review, read back from

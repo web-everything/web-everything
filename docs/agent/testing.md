@@ -54,6 +54,30 @@ instead, including when the old live-release path would otherwise release it. No
 Focused tests cover hold/feed/daemon integration, a different receipt directory after re-arm,
 forged markers, reason-token holds and head movement. No live GitHub writes are needed.
 
+## Drain red-team request recovery
+
+The review daemon reads `drain-red-team-requests` in the shared coordination root each
+pass. Requests join its existing bounded review dispatch batch; planner refusals,
+auth pause, lane capacity and the live CI/head gate still apply. A moved head is
+retired with status `stale`. Starting a detached job does not consume the request
+or spend another jury round.
+
+The job's internal request branch loads a completed `review-pr` for that exact
+repo/PR/head and feeds its pinned read to the existing `review-extra-seats` red-team
+runner. It rechecks the head and review-blocking labels before and after lane
+acquisition, retains kill switches, provider caps and the card-only exemption, and
+finishes the request only after the existing saved-result provenance writer confirms
+success. Failures remain open for retry. No operator command or operation is added.
+Focused coverage: `review-job-drain-red-team.test.mjs`, `review-job.test.mjs` and
+`skills-src/conveyor/__tests__/review-daemon.test.mjs`.
+
+Shared seat policy must not import `review-pr.mjs`: label acceptance reads that
+policy, while the operation loads the label/stack/merge graph. Vitest can wait
+indefinitely on that circular graph before collecting any tests. Keep the shared
+Antigravity env/probation policy in `review-antigravity-policy.mjs`; the operation
+re-exports the existing API. `review-referral-acceptance.test.mjs` exercises the
+label reader through Vitest as well as a fresh Node dispatch import.
+
 ## Red-team panel timing
 
 `redTeam.timing` defaults to `panel-seat`; `WE_RED_TEAM_TIMING=post-accept` exercises

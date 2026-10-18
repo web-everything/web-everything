@@ -1747,15 +1747,18 @@ describe('drain red-team request consumption', () => {
     const request = { repo: CONSTELLATION_REPOS.we?.slug ?? 'web-everything/web-everything', pr: 5485, head: 'b'.repeat(40) };
     const dispatch = vi.fn(() => mode === 'skipped' ? { skipped: 'live-job' } : { mode: 'job', jobPid: 123 });
     const finish = vi.fn();
+    const tagRound = vi.fn();
     runReviewTick({ repo: request.repo, paused: mode === 'paused',
       reconcile: () => ({ dispatch: [], refusals: mode === 'refused' ? [{ prNumber: 5485, kind: 'live-process' }] : [] }),
       readPrs: () => [{ number: 5485, headRefOid: mode === 'stale' ? 'c'.repeat(40) : request.head, labels: ['review:accepted', 'ready-to-merge', ...(mode === 'sent-back' ? ['review:changes'] : [])] }],
       acquirableLanes: () => mode === 'no-lanes' ? 0 : 1,
       readAgents: () => [], readRedTeamRequests: () => [request], finishRedTeamRequest: finish,
-      dispatch, tagRound: () => {}, tagStatus: () => {},
+      dispatch, tagRound, tagStatus: () => {},
     });
+    expect(tagRound).not.toHaveBeenCalled();
     expect(dispatch).toHaveBeenCalledTimes(['current', 'skipped'].includes(mode) ? 1 : 0);
-    expect(finish).toHaveBeenCalledTimes(mode === 'current' ? 1 : 0);
+    expect(finish).toHaveBeenCalledTimes(mode === 'stale' ? 1 : 0);
+    if (mode === 'stale') expect(finish).toHaveBeenCalledWith(request, { status: 'stale' });
   });
 });
 
@@ -1775,7 +1778,7 @@ it.each([
   const request = { repo: 'web-everything/web-everything', pr, head };
   const dispatch = vi.fn(() => ({ mode: 'job', jobPid: 123 }));
   const finish = vi.fn();
-  runReviewTick({ repo: request.repo, reconcile: () => ({ dispatch: [], refusals: [] }),
+  runReviewTick({ repo: request.repo, reconcile: () => ({ dispatch: [], refusals: [{ prNumber: pr, kind: 'nothing-owed', phase: 'queued' }] }),
     readPrs: () => [{ number: pr, headRefOid: head, isDraft: false, labels:
       ['review:accepted', 'ready-to-merge', 'status:ready-to-merge', 'red-team:pending', round].map(name => ({ name })) }],
     readAgents: () => [], acquirableLanes: () => 1, readRedTeamRequests: () => [request], finishRedTeamRequest: finish,
@@ -1783,7 +1786,8 @@ it.each([
   });
   expect(dispatch).toHaveBeenCalledTimes(1);
   expect(dispatch.mock.calls[0][0].expectedRedTeamHead).toBe(head);
-  expect(finish).toHaveBeenCalledTimes(1);
+  expect(finish).not.toHaveBeenCalled();
+  expect(dispatch.mock.calls[0][0].drainRedTeamRequest).toEqual(request);
 });
 
 

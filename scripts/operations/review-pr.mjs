@@ -257,10 +257,6 @@ import {
 } from '../lib/review-escalation.mjs';
 import { liveStatusFor as liveProbationStatusFor } from '../lib/model-probation.mjs';
 import { CODEX_MODEL } from '../codex-direct-task.mjs';
-// #3383 — THE FIFTH SEAT'S IDENTITY. `ANTIGRAVITY_MODEL` is the pinned `{provider, model}` half
-// `defaultAntigravityReviewProbationCheck` reads the probation registry with, mirroring `CODEX_MODEL`'s import
-// immediately above exactly. A leaf import with no jury/markdown-it edge — see that module's own header.
-import { ANTIGRAVITY_MODEL } from '../lib/antigravity-judge-spawn.mjs';
 // #3383 mechanical-dispatcher round-cap fix — `renderAdvisoryNote`'s comment opens with this SAME literal
 // `we:scripts/conveyor/reconcile-core.mjs`'s round-cap check counts back off the PR's own comment thread
 // (`countAdvisoryComments`, `we:scripts/conveyor/advisory-round-count.mjs`). Build and count share ONE marker
@@ -755,7 +751,7 @@ export function buildReviewReferralVerifierJudgeRequest({ read, candidates }) {
  * env var from both Codex seats' own — the three optional seats are independently opt-in, so flipping one on
  * must never silently seat another.
  */
-export const ANTIGRAVITY_REVIEW_ENV_VAR = 'REVIEW_PR_ANTIGRAVITY_REVIEW';
+export { ANTIGRAVITY_REVIEW_ENV_VAR } from './review-antigravity-policy.mjs';
 
 /**
  * #3383 — READS {@link ANTIGRAVITY_REVIEW_ENV_VAR}. Mirrors `correctnessAdvisoryFromEnv` exactly, INCLUDING the
@@ -770,10 +766,7 @@ export const ANTIGRAVITY_REVIEW_ENV_VAR = 'REVIEW_PR_ANTIGRAVITY_REVIEW';
  * @param {{isOnProbation?: Function}} [deps] - injectable, mirroring `correctnessAdvisoryFromEnv`'s own seam.
  * @returns {boolean}
  */
-export function antigravityReviewFromEnv(env = process.env, { isOnProbation = defaultAntigravityReviewProbationCheck } = {}) {
-  if (env && Object.hasOwn(env, ANTIGRAVITY_REVIEW_ENV_VAR)) return env[ANTIGRAVITY_REVIEW_ENV_VAR] === '1';
-  return isOnProbation();
-}
+export { antigravityReviewFromEnv } from './review-antigravity-policy.mjs';
 
 /**
  * #xqa9ttq (PR #2117 review) - THE ROSTER A SAVED RUN WAS STARTED WITH, read off the RUN, not the ambient environment.
@@ -858,10 +851,7 @@ export function reviewSeatOptionsForRun(record, settings, live = {}) {
  * stubbing the whole default parameter chain.
  * @returns {boolean}
  */
-export function defaultAntigravityReviewProbationCheck() {
-  const status = liveProbationStatusFor({ provider: 'antigravity', model: ANTIGRAVITY_MODEL, role: 'advisory-review' });
-  return status === 'probation' || status === 'trusted';
-}
+export { defaultAntigravityReviewProbationCheck } from './review-antigravity-policy.mjs';
 
 /**
  * #3383 — THIS SEAT'S EFFORT, independent of {@link JUDGE_EFFORT} and {@link CORRECTNESS_ADVISORY_EFFORT}. NO
