@@ -149,10 +149,15 @@ describe('runRedTeam — the pass itself honours the advisory accept and stays o
       redTeamCallId: 'call-0', status: 'ok', provider: 'codex', model: 'm', findings: [], foldedVerdict: 'accept', confirmedMissCount: 0,
       scoredAt: new Date(NOW).toISOString(),
     };
-    const { io, calls } = seatIo([prior]);
-    const r = await runRedTeam({ pr: 4722, repo: REPO, lanePath: '/lane', loopPayload: advisoryAccept(HEAD_2), env: {} }, io);
-    expect(calls.some((c) => c[0] === 'reserve')).toBe(false);
-    expect(r.status).not.toBe('not-owed');
+    const root = mkdtempSync(join(tmpdir(), 'red-team-prior-row-'));
+    try {
+      const env = { CONVEYOR_STATE_ROOT: root, OPERATION_RUNS_DIR: join(root, 'runs') };
+      writeRun(provenanceRun({ env, rows: [prior] }), env.OPERATION_RUNS_DIR);
+      const { io, calls } = seatIo([prior]);
+      const r = await runRedTeam({ pr: 4722, repo: REPO, lanePath: '/lane', loopPayload: advisoryAccept(HEAD_2), env }, io);
+      expect(calls.some((c) => c[0] === 'reserve')).toBe(false);
+      expect(r.status).not.toBe('not-owed');
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
 
@@ -212,5 +217,30 @@ it.each(['post-accept', 'panel-seat'])('persists and verifies review-job provena
     writeFileSync(path, JSON.stringify({ records: rows }));
     expect(() => real.recordSavedRedTeamResult({ runId: run.id, repo: REPO, pr: 4722, head: HEAD_1, redTeam }))
       .toThrow(/changed before attestation/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+
+it('attests ran, resumed and already-ran stored results without a seat payload', () => {
+  const root = mkdtempSync(join(tmpdir(), 'review-job-resumed-provenance-'));
+  try {
+    const env = { CONVEYOR_STATE_ROOT: root, OPERATION_RUNS_DIR: join(root, 'runs') };
+    const rows = [{ dispatchKind: 'review-seat', seat: 'red-team', repo: REPO, pr: 4722, rev: HEAD_1,
+      callId: 'saved-call', status: 'ok', findings: [], recheckStatus: 'ok', privateNote: 'included in hash' }];
+    const path = resolveScorecardStorePath(env);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify({ records: rows }));
+    const run = provenanceRun({ env, rows, id: 'review-pr-resumed' });
+    const real = createReviewJobIo({ env, dir: join(root, 'jobs') });
+    for (const status of ['ran', 'resumed', 'already-ran']) {
+      delete run.findings.savedRedTeamResult;
+      writeRun(run, env.OPERATION_RUNS_DIR);
+      real.recordSavedRedTeamResult({ runId: run.id, repo: REPO, pr: 4722, head: HEAD_1,
+        redTeam: { status, callId: 'saved-call' } });
+      expect(readRun(run.id, env.OPERATION_RUNS_DIR).findings.savedRedTeamResult).toEqual({
+        writer: 'review-job', references: [{ path, index: 0 }], sha256: savedRowsHash(rows),
+      });
+      expect(readSavedRedTeamResult({ repo: REPO, pr: 4722, head: HEAD_1, env, log: () => {} })).not.toBeNull();
+    }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

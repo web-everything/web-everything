@@ -1,5 +1,4 @@
 import { verifySavedRedTeamProvenance } from './saved-red-team-provenance.mjs';
-import { readRedTeamTiming } from './red-team-gate.mjs';
 /** Completed evidence survives a withheld/failed comment. Readers must scrub saved text before publication. */
 import { readFileSync } from 'node:fs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
@@ -33,7 +32,7 @@ export function savedRedTeamFallback({ repo, pr, head, env = process.env, runsDi
 export function readSavedRedTeamResult({ repo, pr, head, env = process.env, runsDir,
   log = line => process.stderr.write(`${line}\n`) } = {}) {
   if (!repo || !Number.isSafeInteger(Number(pr)) || Number(pr) <= 0 || !/^[a-f0-9]{40}$/.test(head ?? '')) return null;
-  if (readRedTeamTiming({ env }).value.timing !== 'panel-seat' && !readSavedRedTeamSetting({ env }).value.drainReadsSavedResult) return null;
+  if (!readSavedRedTeamSetting({ env }).value.drainReadsSavedResult) return null;
   const ignore = reason => { log(`saved-red-team-ignored: ${reason}`); return null; };
   const path = resolveScorecardStorePath(env);
   let text;

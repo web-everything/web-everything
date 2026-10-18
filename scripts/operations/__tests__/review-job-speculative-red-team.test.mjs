@@ -16,6 +16,7 @@ import {
   speculateRedTeam, finishSpeculativeRedTeam, runRedTeam, buildRedTeamDiscardRow, reserveSeatCalls,
   RED_TEAM_DISCARD_DISPATCH_KIND, redTeamReadFingerprint, recordDiscardedRedTeam, ACTIVE_SEAT_PIDS, killActiveSeats,
 } from '../review-extra-seats.mjs';
+import { provenanceRun } from '../../lib/__tests__/fixtures/saved-red-team-provenance.mjs';
 import { validateScorecard } from '../../conveyor/run-scorecard-store.mjs';
 import { redTeamEnqueueHold } from '../../lib/drain-queue-safety.mjs';
 import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../../lib/drain-red-team-evidence.mjs';
@@ -326,6 +327,55 @@ function seatsIo(over = {}) {
 }
 
 describe('speculateRedTeam + finishSpeculativeRedTeam', () => {
+  it('requires completed exact-head hash provenance before saved-row speculation, resume or panel finish', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'speculative-provenance-'));
+    try {
+      const env = { WE_RED_TEAM_TIMING: 'panel-seat', CONVEYOR_STATE_ROOT: root, OPERATION_RUNS_DIR: join(root, 'runs') };
+      const prior = { dispatchKind: 'review-seat', seat: 'red-team', repo: REPO, pr: 5, rev: REV,
+        callId: 'prior-call', provider: 'codex', model: 'm', status: 'ok', findings: [],
+        recheckStatus: 'ok', foldedVerdict: 'accept', confirmedMissCount: 0 };
+      const records = [{ dispatchKind: 'other' }, prior];
+      const proof = provenanceRun({ env, rows: records, indexes: [1], repo: REPO, pr: 5, head: REV });
+      const observed = [];
+      for (const kind of ['missing', 'incomplete', 'wrong-head', 'hash-mismatch', 'valid']) {
+        rmSync(env.OPERATION_RUNS_DIR, { recursive: true, force: true });
+        if (kind !== 'missing') {
+          const run = structuredClone(proof);
+          if (kind === 'incomplete') run.cursor = 0;
+          if (kind === 'wrong-head') run.findings.read.netBasis.rev = 'b'.repeat(40);
+          if (kind === 'hash-mismatch') run.findings.savedRedTeamResult.sha256 = '0'.repeat(64);
+          writeRun(run, env.OPERATION_RUNS_DIR);
+        }
+        const a = seatsIo({ readRecords: () => records });
+        const pass = await speculateRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', read: read(), env, resume: false }, a.io);
+        const resumed = await speculateRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', read: read(), env, resume: true }, a.io);
+        const fin = await finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload: payload('accept'), env,
+          pass: { status: 'prior-row', rev: REV, readFingerprint: redTeamReadFingerprint(read()) } }, a.io);
+        observed.push([kind, pass.status, ['resumed', 'already-ran'].includes(resumed.status), fin.status]);
+      }
+      expect(observed).toEqual([
+        ...['missing', 'incomplete', 'wrong-head', 'hash-mismatch'].map(kind => [kind, 'speculated', false, 'stale']),
+        ['valid', 'prior-row', true, 'ran'],
+      ]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('refuses panel speculation when juror findings or a newer clean row invalidate it', async () => {
+    const env = { WE_RED_TEAM_TIMING: 'panel-seat' };
+    const observed = [];
+    for (const reason of ['juror-findings', 'newer-row']) {
+      const a = seatsIo();
+      const pass = await speculateRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', read: read(), env, resume: false }, a.io);
+      const loopPayload = payload('accept');
+      if (reason === 'juror-findings') loopPayload.findings.judge.findings = [BREAK];
+      else a.rows.push({ dispatchKind: 'review-seat', seat: 'red-team', pr: 5, rev: REV, status: 'ok' });
+      const before = a.rows.length;
+      const result = await finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload, pass, env }, a.io);
+      observed.push([reason, result.status, a.rows.length - before, a.posts.length]);
+    }
+    expect(observed).toEqual([['juror-findings', 'stale', 0, 0], ['newer-row', 'superseded', 0, 0]]);
+  });
+
   it('speculating writes nothing and posts nothing; finishing an accept records exactly what the sequential pass records', async () => {
     const a = seatsIo();
     const pass = await speculateRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', read: read(), env: { WE_RED_TEAM_TIMING: 'post-accept' }, resume: false }, a.io);
@@ -415,12 +465,17 @@ describe('speculateRedTeam + finishSpeculativeRedTeam', () => {
   });
 
   it('a prior clean row is reported, never resumed, by a speculative pass', async () => {
-    const { io, posts } = seatsIo();
-    await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io);
-    const before = posts.length;
-    const pass = await speculateRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', read: read(), env: { WE_RED_TEAM_TIMING: 'post-accept' }, resume: false }, io);
-    expect(pass.status).toBe('prior-row');
-    expect(posts.length).toBe(before);
+    const root = mkdtempSync(join(tmpdir(), 'speculative-prior-row-'));
+    try {
+      const env = { WE_RED_TEAM_TIMING: 'post-accept', CONVEYOR_STATE_ROOT: root, OPERATION_RUNS_DIR: join(root, 'runs') };
+      const { io, rows, posts } = seatsIo();
+      await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env }, io);
+      writeRun(provenanceRun({ env, rows, indexes: [0] }), env.OPERATION_RUNS_DIR);
+      const before = posts.length;
+      const pass = await speculateRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', read: read(), env, resume: false }, io);
+      expect(pass.status).toBe('prior-row');
+      expect(posts.length).toBe(before);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   it('the discard row names the spend under its own kind; a pass killed mid-call is recorded from its reservation', async () => {

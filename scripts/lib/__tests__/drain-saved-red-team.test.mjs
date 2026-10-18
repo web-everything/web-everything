@@ -31,6 +31,12 @@ const hold = (env, over = {}) => redTeamEnqueueHold({ repo, pr, head, comments: 
   loopPayload: { verdict: { verdict: 'accept' } }, ...over });
 
 describe('saved red-team admission', () => {
+  it('panel-seat timing honors the saved-result reader off switch', async () => {
+    const { readSavedRedTeamResult } = await import('../drain-saved-red-team.mjs');
+    const env = { ...fixture([row()]).env, WE_RED_TEAM_TIMING: 'panel-seat', WE_RED_TEAM_DRAIN_READS_SAVED_RESULT: 'false' };
+    expect(readSavedRedTeamResult({ repo, pr, head, env, log: () => {} })).toBeNull();
+  });
+
   it('saved clean result releases the hold without a posted comment', () => {
     expect(hold(fixture([row()]).env)).toBeNull();
   });

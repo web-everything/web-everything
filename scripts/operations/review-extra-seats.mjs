@@ -75,6 +75,7 @@ import { renameSourcePaths } from './review-pr.mjs';
 import { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTeamOwedFor, redTeamPanelSeatOwed } from '../lib/review-red-team-policy.mjs';
 export { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTeamOwedFor, redTeamPanelSeatOwed } from '../lib/review-red-team-policy.mjs';
 import { expectationForLens, huntBriefForLens } from '../lib/review-core.mjs';
+import { verifySavedRedTeamProvenance } from '../lib/saved-red-team-provenance.mjs';
 import { appendScorecard, readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { scrubPublish } from '../lib/secret-scrub.mjs';
 import { parseDelegationMarker } from '../lib/delegation-marker.mjs';
@@ -1018,6 +1019,13 @@ export function priorRedTeamRow(records, pr, rev) {
   return seatRows(records).filter((r) => r.seat === RED_TEAM_SEAT.seat && r.pr === Number(pr) && r.rev === rev && r.status === 'ok').at(-1) ?? null;
 }
 
+/** Saved rows can replace a model call only when a completed review job attests this snapshot. */
+function verifiedPriorRedTeamRow(records, { repo, pr, rev, env }) {
+  const prior = priorRedTeamRow(records, pr, rev);
+  return prior && !verifySavedRedTeamProvenance({ repo, pr, head: rev,
+    path: resolveScorecardStorePath(env), records, index: records.indexOf(prior), env }) ? prior : null;
+}
+
 /**
  * Has this `(pr, head)` already had a red-team pass that ran cleanly? PURE. A clean row only stops the MODEL from
  * running again — the effects after it (miss rows, delegation trial, comment) are re-checked and finished by
@@ -1430,7 +1438,7 @@ export async function speculateRedTeam({
     const now = io.now();
     let records = [];
     try { records = io.readRecords(); } catch (e) { io.log(`red team: could not read the scorecard store (${e.message}) — treating it as empty`); }
-    const prior = priorRedTeamRow(records, pr, rev);
+    const prior = verifiedPriorRedTeamRow(records, { repo, pr, rev, env });
     // A speculative pass (`resume: false`) must not finish a prior pass's effects before the verdict is known: it
     // reports the row and the job's sequential pass resumes it if, and only if, the review accepts.
     if (prior && !resume) return { status: 'prior-row', rev, readFingerprint: redTeamReadFingerprint(read), reason: `a clean red-team row already exists for #${pr} at ${rev.slice(0, 12)}` };
@@ -1627,7 +1635,7 @@ export async function finishSpeculativeRedTeam({ pr, repo, loopPayload, pass, en
     if (redTeamPanelSeatOwed(loopPayload, env) && pass?.status === 'prior-row'
       && pass.readFingerprint === redTeamReadFingerprint(loopPayload?.findings?.read)) {
       const records = io.readRecords();
-      const prior = priorRedTeamRow(records, pr, pass.rev);
+      const prior = verifiedPriorRedTeamRow(records, { repo, pr, rev: pass.rev, env });
       if (prior) {
         const resumed = await resumeRedTeam({ pr, repo, rev: pass.rev, title: loopPayload.findings.read.title,
           prior, records, post, record: loopPayload?.replay !== true }, io);
@@ -1646,12 +1654,12 @@ export async function finishSpeculativeRedTeam({ pr, repo, loopPayload, pass, en
     // The sequential brief lists the jurors' own findings so the red team does not repeat them; a speculative brief
     // was written before they existed. Identical only when there were none — otherwise the sequential pass runs.
     const jurorFindings = claudeFindingsFromLoop(loopPayload);
-    if (!redTeamPanelSeatOwed(loopPayload, env) && Array.isArray(jurorFindings) && jurorFindings.length) {
+    if (Array.isArray(jurorFindings) && jurorFindings.length) {
       return { status: 'stale', reason: `the jurors raised ${jurorFindings.length} finding(s) the speculative brief could not carry (the sequential brief lists them so the red team does not repeat them)` };
     }
     let records = [];
     try { records = io.readRecords(); } catch { records = []; }
-    if (!redTeamPanelSeatOwed(loopPayload, env) && priorRedTeamRow(records, pr, pass.rev)) return { status: 'superseded', reason: `a clean red-team row for #${pr} at ${String(pass.rev).slice(0, 12)} landed meanwhile` };
+    if (priorRedTeamRow(records, pr, pass.rev)) return { status: 'superseded', reason: `a clean red-team row for #${pr} at ${String(pass.rev).slice(0, 12)} landed meanwhile` };
     const recording = loopPayload?.replay !== true;
     return await completeRedTeam({ pr, repo, loopPayload, pass, post, record: recording }, io);
   } catch (e) {
