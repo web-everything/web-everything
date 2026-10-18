@@ -5,6 +5,7 @@ import { hostname } from 'node:os';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operations/run-store.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
+import { recordedRedTeamResult } from './drain-saved-red-team.mjs';
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
 
 export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDir(env)), 'red-team-status');
@@ -23,8 +24,8 @@ export function recordRedTeamStatus({ repo, pr, loopPayload, status, result = nu
 export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   runsDir = resolveRunsDir(), list = listRunIds, read = readRun, isAlive = pidAlive, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
   readScorecards = () => readStore({ path: resolveScorecardStorePath(env) }).records } = {}) {
-  const recorded = readScorecards().some(row => row.dispatchKind === 'review-seat' && row.seat === 'red-team'
-    && row.repo === repo && Number(row.pr) === Number(pr) && row.rev === head);
+  const rows = readScorecards();
+  const recorded = recordedRedTeamResult(rows, { repo, pr, head });
   let status;
   try { status = JSON.parse(readFileSync(statusPath({ repo, pr, head }, env), 'utf8')); }
   catch (e) { if (e.code !== 'ENOENT') throw e; }
@@ -40,12 +41,12 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
         inFlight = !start || !status.pidStart || start === status.pidStart;
       }
     }
-    return { loopPayload: status.loopPayload, inFlight, recorded: recorded || status.result === 'ran' };
+    return { loopPayload: status.loopPayload, inFlight, recorded: recordedRedTeamResult(rows, { repo, pr, head }, status.result) };
   }
   // Runs are immutable in identity but updated in place: choose the latest read of this exact repo/PR/head.
   const hits = list(runsDir).filter(id => id.startsWith('review-pr-')).map(id => ({ id, run: read(id, runsDir) }))
     .filter(({ run }) => run?.op === 'review-pr' && run.input?.repo === repo && Number(run.input?.pr) === Number(pr)
       && run.findings?.read?.netBasis?.rev === head);
   hits.sort((a, b) => statSync(join(runsDir, `${b.id}.json`)).mtimeMs - statSync(join(runsDir, `${a.id}.json`)).mtimeMs);
-  return { loopPayload: hits[0]?.run ?? null, inFlight: false, recorded };
+  return { loopPayload: hits[0]?.run ?? null, inFlight: false, recorded: recorded || recordedRedTeamResult([], { repo, pr, head }, hits[0]?.run?.redTeam) };
 }

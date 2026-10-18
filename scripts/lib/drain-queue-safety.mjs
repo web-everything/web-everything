@@ -8,6 +8,7 @@ import { redTeamForHead, planRedTeamActions, readConfirmedBreaks, parseRedTeamCo
 import { parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
 import { parseLatestHumanClearedSha } from './review-escalation.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { readSavedRedTeamResult, savedRedTeamPosition, skipCardOnlyRedTeam } from './drain-saved-red-team.mjs';
 
 export function readDrainQueueSafety({ env = process.env, tool, platform, log = () => {} } = {}) {
   const booleanEnv = key => env[key] === undefined ? undefined
@@ -32,7 +33,7 @@ export function sendBackReason(labels) {
 
 /** The review scheduler's decision over its actual head-bound payload, never inferred from labels. */
 export function postAcceptRedTeamOwed(loopPayload, env = process.env) {
-  return redTeamEnabled(env) && redTeamOwedFor(loopPayload);
+  return redTeamEnabled(env) && redTeamOwedFor(loopPayload) && !skipCardOnlyRedTeam(loopPayload, env);
 }
 
 const CARRIED_LINE_RE = /^<!-- review-verdict-carried from=[0-9a-f]{40} to=[0-9a-f]{40} patch-id=[0-9a-f]{40} -->$/;
@@ -70,14 +71,14 @@ function threadRecords(comments) {
  * comment counts: a restamp repeats the cleared-human marker for a ruling made on another head. A carried result
  * defers to the ruling on the head it was carried from, read from the thread before the carry. PURE.
  */
-function operatorRuled(records, pr, head) {
+function operatorRuled(records, pr, head, savedResult) {
   const trusted = records.filter(r => isTrustedMarkerAuthor(r.c));
   if (parseLatestHumanClearedSha(trusted.filter(r => !r.from).map(r => r.c)) !== head) return false;
   const lastAt = (rs, test) => rs.reduce((found, r) => (test(r) ? r : found), null);
   const body = r => (typeof r.c === 'string' ? r.c : r.c?.body);
   // Each carry removes its own comment and every later record, so even a cyclic head chain terminates.
   for (let sha = head, rs = trusted; sha && rs.length;) {
-    const result = lastAt(rs, r => { const p = parseRedTeamComment(body(r)); return p?.pr === Number(pr) && p.rev === sha; });
+    const result = lastAt(rs, r => { const p = parseRedTeamComment(body(r)); return p?.pr === Number(pr) && p.rev === sha; }) ?? savedRedTeamPosition(savedResult, pr, sha, rs);
     const cap = lastAt(rs, r => { const g = parseRedTeamGateMarker(body(r)); return g?.pr === Number(pr) && g.rev === sha && g.outcome === GATE_OUTCOMES.ROUND_CAP; });
     const cleared = lastAt(rs, r => !r.from && CLEAR_HUMAN_RULING_RE.test(String(body(r) ?? '').replace(/\r\n/g, '\n').trimStart())
       && parseLatestHumanClearedSha([r.c]) === sha);
@@ -90,13 +91,13 @@ function operatorRuled(records, pr, head) {
   return false;
 }
 
-export function redTeamEnqueueHold({ loopPayload, comments, pr, head, env = process.env, confirmedBreaks } = {}) {
+export function redTeamEnqueueHold({ loopPayload, comments, repo, pr, head, env = process.env, confirmedBreaks } = {}) {
   // A recorded break still holds even if the scheduler is now disabled or the payload is unavailable.
   const live = String(head ?? '').toLowerCase();
   const records = threadRecords(comments);
-  const result = redTeamForHead(records.map(r => r.c), pr, live);
+  const result = redTeamForHead(records.map(r => r.c), pr, live) ?? readSavedRedTeamResult({ repo, pr, head: live, env });
   if (result && planRedTeamActions(result, confirmedBreaks ?? readConfirmedBreaks({ env }).value).sendBack.length
-    && !operatorRuled(records, pr, live))
+    && !operatorRuled(records, pr, live, result))
     return 'post-accept red team confirmed a break requiring send-back';
   if (!postAcceptRedTeamOwed(loopPayload, env) || result) return null;
   return 'post-accept red team has no recorded result on the live head';

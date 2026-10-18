@@ -329,7 +329,7 @@ export function createDrainMergeStrategy({
         if (owed && sameHead && pending.retryAt > now() && !newComment && !overdue) return pendingOutcome(c, pending);
         const pages = readThreadPages(c.repo, c.num);
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team admission: unreadable complete comments');
-        const reason = redTeamEnqueueHold({ loopPayload: evidence.loopPayload, comments: pages.flat(), pr: c.num, head: headSha, env });
+        const reason = redTeamEnqueueHold({ loopPayload: evidence.loopPayload, comments: pages.flat(), repo: slugOf(c.repo), pr: c.num, head: headSha, env });
         if (reason) {
           before.redTeamPending ??= {};
           const wait = { headSha, firstPendingAt: sameHead ? pending.firstPendingAt : now(),

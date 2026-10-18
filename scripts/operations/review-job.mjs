@@ -690,7 +690,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
         ...(gate?.plan ? { sendBack: gate.plan.sendBack.length, card: gate.plan.card.length, advisory: gate.plan.advisory.length } : {}) };
     }
   }
-  if (accepted) io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: out.redTeam?.status ?? null });
+  if (accepted) io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: out.redTeam ?? null });
   return out;
 }
 

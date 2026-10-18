@@ -44,6 +44,11 @@ Effective values and sources are logged before probes. Card-only detection reuse
 `ci-card-only.mjs#isCardOnlyDiff` on the net changed-file list plus `netRenameSources` (both
 rename and copy sources); unknown/empty destination lists or malformed source lists do not skip.
 Moves into or out of `backlog/` probe whenever either side is code; card-to-card moves still skip.
+The drain uses the same card-only setting and net path rules when deciding whether a pass is owed.
+Scheduler evidence counts as recorded only for a posted result or a saved live-head seat with
+`status: ok` and a parsed `seatVerdict`; `ran` alone and unparseable rows cannot suppress the overdue fallback.
+Confirmed breaks still hold, including on card-only diffs. Regression coverage lives in
+`drain-saved-red-team.test.mjs`.
 Regression coverage: **includes rename sources before deciding to skip probes**, covering both
 sequential and speculative paths. The speculative fingerprint also includes rename sources.
 Replay derives rename/copy sources from diff headers using the review reader's existing parser;

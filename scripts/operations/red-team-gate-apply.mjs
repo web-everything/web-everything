@@ -29,6 +29,7 @@
  *     node scripts/operations/red-team-gate-apply.mjs --pr=<n> --repo=<owner/repo> [--dry-run]
  */
 import { readDrainQueueSafety, dequeueSentBack, sendBackReason } from '../lib/drain-queue-safety.mjs';
+import { readSavedRedTeamResult } from '../lib/drain-saved-red-team.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -119,7 +120,7 @@ export async function applyRedTeamGate({ repo, pr, dryRun = false, cap = DEFAULT
   try {
     const view = io.readPr({ repo, pr });
     const head = String(view?.headRefOid ?? '').toLowerCase();
-    const parsed = redTeamForHead(view?.comments, pr, head);
+    const parsed = redTeamForHead(view?.comments, pr, head) ?? (io.readSavedResult ?? readSavedRedTeamResult)({ repo, pr, head });
     if (!parsed) return { status: 'no-red-team-on-head', head };
     const setting = io.readSetting();
     const plan = planRedTeamActions(parsed, setting.value);
@@ -210,6 +211,7 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
       comments: readCompletePrComments(Number(pr), { repo }),
     }),
     readSetting: () => readConfirmedBreaks({ env }),
+    readSavedResult: args => readSavedRedTeamResult({ ...args, env }),
     readRound: ({ repo, pr, head }) => readReviewRound({ repo, pr, head }),
     // The live head, read fresh and alone (the PR view above can be minutes old by the time a slow step finishes).
     readHead: ({ repo, pr }) => String(JSON.parse(gh(['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'])).headRefOid ?? ''),
