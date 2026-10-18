@@ -1,20 +1,21 @@
 ---
+bornAs: xfdfsgf
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5360-prevention-add-a-check-standards-rule-that-fails-a-card-movi.md"]
-dateOpened: "2026-10-17"
+scope: ["we:backlog/5725-speed-up-the-5-slowest-test-files-fixers-run.md"]
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Have the filer assert that every finding is either written to a card or listed as skipped with a… (from web-everything/web-everything#5540 review)
+# Prevention — Add the named sentinel-file regression and verify that removing rating suppression or store isola… (from web-everything/web-everything#5419 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/5360-prevention-add-a-check-standards-rule-that-fails-a-card-movi.md:52` — Have the filer assert that every finding is either written to a card or listed as skipped with a reason. Run this as a post-write check that the count of 'Also raised by' lines plus skips equals the finding count.
+1. `we:backlog/5725-speed-up-the-5-slowest-test-files-fixers-run.md` — Add the named sentinel-file regression and verify that removing rating suppression or store isolation makes it fail.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5540@7f606464506d5072ee32043356128b76f4ffb01d
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5419@5d1352c0734063d9b775747e3c8f635868ecbba8
 
 ## Acceptance
 

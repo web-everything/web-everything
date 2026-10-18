@@ -1,21 +1,22 @@
 ---
+bornAs: xf81nsn
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/probation-build-run.mjs", "we:scripts/operations/review-loop-cli.mjs", "we:scripts/operations/__tests__/probation-build-run.test.mjs", "we:scripts/operations/__tests__/review-loop-cli.test.mjs"]
-dateOpened: "2026-10-17"
+scope: ["we:scripts/lib/enqueue-on-event.mjs", "we:scripts/lib/__tests__/enqueue-on-event.test.mjs"]
+dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — Add a runWorker test where the stub launcher writes to stderr after the JSON report and assert la… (from web-everything/web-everything#5486 review)
+# Prevention — Make resolveCascade's check dispatch on the full leaf path (valid['catchUp.intervalMinutes']), or… (from web-everything/web-everything#5241 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/probation-build-run.mjs:984` — Add a `runWorker` test where the stub launcher writes to stderr after the JSON report and assert `lastMessage` is still recovered. Better, build `out` as `stdout` on success and append `stderr` only on failure, matching `trySh`.
-2. `we:scripts/operations/review-loop-cli.mjs:451` — A table-driven test over every combination of the `seatsByTouchSet` and `cardOnly.lightLane` settings, with the precedence documented in we:docs/agent/testing.md. Any new roster-reducing setting would be reviewed against the existing off-switches.
+1. `we:scripts/lib/enqueue-on-event.mjs:55` — Make `resolveCascade`'s `check` dispatch on the full leaf path (`valid['catchUp.intervalMinutes']`), or add a cascade unit test that every nested policy leaf is validated per leaf. A deterministic check:standards rule against union validators over nested leaves would also catch this class.
+2. `we:scripts/lib/enqueue-on-event.mjs:330` — Add a check:standards rule: any caller of parseVerdictComment or a marker parser on raw comments must filter through isTrustedMarkerAuthor. Alternatively, have parseVerdictComment take a required `trusted` predicate.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5486@be5c87d2596c6f0fb8b356cf66cd6d65d20767aa
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5241@04c87502991dcf92853f6c176cd4a2abb44f3316
 
 ## Acceptance
 

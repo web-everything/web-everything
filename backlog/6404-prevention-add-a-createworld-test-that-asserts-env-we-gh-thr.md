@@ -1,21 +1,21 @@
 ---
+bornAs: xgtlo2l
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/enqueue-on-event.mjs", "we:scripts/lib/__tests__/enqueue-on-event.test.mjs"]
+scope: ["we:scripts/conveyor/__tests__/sim-world-env.test.mjs"]
 dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — Make resolveCascade's check dispatch on the full leaf path (valid['catchUp.intervalMinutes']), or… (from web-everything/web-everything#5241 review)
+# Prevention — Add a createWorld test that asserts env.WE_GH_THROTTLE_LOCK_ROOT is world-scoped and differs betw… (from web-everything/web-everything#5253 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/enqueue-on-event.mjs:55` — Make `resolveCascade`'s `check` dispatch on the full leaf path (`valid['catchUp.intervalMinutes']`), or add a cascade unit test that every nested policy leaf is validated per leaf. A deterministic check:standards rule against union validators over nested leaves would also catch this class.
-2. `we:scripts/lib/enqueue-on-event.mjs:330` — Add a check:standards rule: any caller of parseVerdictComment or a marker parser on raw comments must filter through isTrustedMarkerAuthor. Alternatively, have parseVerdictComment take a required `trusted` predicate.
+1. `we:scripts/conveyor/__tests__/sim-world-env.test.mjs:28` — Add a createWorld test that asserts env.WE_GH_THROTTLE_LOCK_ROOT is world-scoped and differs between two worlds. More generally, require a test of the call site whenever a fix is delivered as a helper plus a one-line wiring change.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5241@04c87502991dcf92853f6c176cd4a2abb44f3316
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5253@dea3cb43b247fddee993e941f9677c66258e078e
 
 ## Acceptance
 

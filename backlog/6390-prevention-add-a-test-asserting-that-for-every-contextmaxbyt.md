@@ -1,20 +1,21 @@
 ---
+bornAs: x5t3otw
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5725-speed-up-the-5-slowest-test-files-fixers-run.md"]
+scope: ["we:scripts/conveyor/fix-context-pack.mjs", "we:scripts/conveyor/__tests__/fix-context-pack.test.mjs"]
 dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Add the named sentinel-file regression and verify that removing rating suppression or store isola… (from web-everything/web-everything#5419 review)
+# Prevention — Add a test asserting that for every contextMaxBytes at or above a documented floor, the pack stil… (from web-everything/web-everything#5369 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/5725-speed-up-the-5-slowest-test-files-fixers-run.md` — Add the named sentinel-file regression and verify that removing rating suppression or store isolation makes it fail.
+1. `we:scripts/conveyor/fix-context-pack.mjs:221` — Add a test asserting that for every contextMaxBytes at or above a documented floor, the pack still contains the finding. Alternatively, clamp the effective budget at the floor, or move the long rule into the brief (we:fix-agent-brief.md already carries it) and keep the pack's tests section short.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5419@5d1352c0734063d9b775747e3c8f635868ecbba8
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5369@9efb3ce64110bd258edaecb0400d89fb743c77b8
 
 ## Acceptance
 

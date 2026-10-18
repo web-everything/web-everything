@@ -1,20 +1,22 @@
 ---
+bornAs: xgr7ouk
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/__tests__/worker-wrapper-launch-sentinel.test.mjs"]
-dateOpened: "2026-10-14"
+scope: ["we:scripts/operations/probation-build-run.mjs", "we:scripts/operations/review-loop-cli.mjs", "we:scripts/operations/__tests__/probation-build-run.test.mjs", "we:scripts/operations/__tests__/review-loop-cli.test.mjs"]
+dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Prevention — Add a deterministic parameterized test covering each refusal condition independently, including a… (from web-everything/web-everything#5321 review)
+# Prevention — Add a runWorker test where the stub launcher writes to stderr after the JSON report and assert la… (from web-everything/web-everything#5486 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/__tests__/worker-wrapper-launch-sentinel.test.mjs:14` — Add a deterministic parameterized test covering each refusal condition independently, including a sentinel PR paired with a non-sentinel session, and assert that the injected launcher is never called.
+1. `we:scripts/operations/probation-build-run.mjs:984` — Add a `runWorker` test where the stub launcher writes to stderr after the JSON report and assert `lastMessage` is still recovered. Better, build `out` as `stdout` on success and append `stderr` only on failure, matching `trySh`.
+2. `we:scripts/operations/review-loop-cli.mjs:451` — A table-driven test over every combination of the `seatsByTouchSet` and `cardOnly.lightLane` settings, with the precedence documented in we:docs/agent/testing.md. Any new roster-reducing setting would be reviewed against the existing off-switches.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5321@b0933c8f8c593816f361653f3cdc7d124f403c7e
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5486@be5c87d2596c6f0fb8b356cf66cd6d65d20767aa
 
 ## Acceptance
 

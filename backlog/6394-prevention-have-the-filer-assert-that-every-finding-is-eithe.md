@@ -1,20 +1,21 @@
 ---
+bornAs: xdqcska
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/fix-context-pack.mjs", "we:scripts/conveyor/__tests__/fix-context-pack.test.mjs"]
-dateOpened: "2026-10-15"
+scope: ["we:backlog/5360-prevention-add-a-check-standards-rule-that-fails-a-card-movi.md"]
+dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Prevention — Add a test asserting that for every contextMaxBytes at or above a documented floor, the pack stil… (from web-everything/web-everything#5369 review)
+# Prevention — Have the filer assert that every finding is either written to a card or listed as skipped with a… (from web-everything/web-everything#5540 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/fix-context-pack.mjs:221` — Add a test asserting that for every contextMaxBytes at or above a documented floor, the pack still contains the finding. Alternatively, clamp the effective budget at the floor, or move the long rule into the brief (we:fix-agent-brief.md already carries it) and keep the pack's tests section short.
+1. `we:backlog/5360-prevention-add-a-check-standards-rule-that-fails-a-card-movi.md:52` — Have the filer assert that every finding is either written to a card or listed as skipped with a reason. Run this as a post-write check that the count of 'Also raised by' lines plus skips equals the finding count.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5369@9efb3ce64110bd258edaecb0400d89fb743c77b8
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5540@7f606464506d5072ee32043356128b76f4ffb01d
 
 ## Acceptance
 

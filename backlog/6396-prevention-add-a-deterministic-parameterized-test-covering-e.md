@@ -1,23 +1,21 @@
 ---
+bornAs: xeqq78t
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/needs-you-feed.mjs", "we:scripts/conveyor/reconcile-fix-dispatch.mjs", "we:scripts/operations/fix-run.mjs", "we:scripts/operations/__tests__/fix-run.test.mjs", "we:scripts/operations/__tests__/needs-you-feed.test.mjs", "we:scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs"]
-dateOpened: "2026-10-16"
+scope: ["we:scripts/operations/__tests__/worker-wrapper-launch-sentinel.test.mjs"]
+dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — Add a cross-producer test: publishAttention followed by runOnce over a needsPerson report must em… (from web-everything/web-everything#5463 review)
+# Prevention — Add a deterministic parameterized test covering each refusal condition independently, including a… (from web-everything/web-everything#5321 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/needs-you-feed.mjs:66` — Add a cross-producer test: publishAttention followed by runOnce over a needsPerson report must emit no CLEARED line. Alternatively, drop head from the key for at-round-limit events.
-2. `we:scripts/conveyor/reconcile-fix-dispatch.mjs:1458` — Gate the repeat-plan routing on planned.repairKind !== 'ci-heal'. Add a dispatchFix test with repairKind 'ci-heal' and a repeated-finding history that asserts the ordinary executor choice.
-3. `we:scripts/operations/fix-run.mjs:774` — Filter scope entries to the lane's own repo prefix before stripping it, and add a unit test for multi-repo scope strings.
-4. `we:scripts/operations/__tests__/fix-run.test.mjs:1547` — Add a runFixCli integration test for the reset and stand-down branches, and a lint rule that requires a test per new launcher branch.
+1. `we:scripts/operations/__tests__/worker-wrapper-launch-sentinel.test.mjs:14` — Add a deterministic parameterized test covering each refusal condition independently, including a sentinel PR paired with a non-sentinel session, and assert that the injected launcher is never called.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5463@bce3433575f2af6150a7b1bd3684470776d2930c
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5321@b0933c8f8c593816f361653f3cdc7d124f403c7e
 
 ## Acceptance
 
