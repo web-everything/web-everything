@@ -1,15 +1,21 @@
 ---
+bornAs: x6e0fur
 kind: story
-size: 2
+size: 3
+parent: "4075"
 status: open
-scope: ["we:skills-src/conveyor/build-dispatch-daemon.mjs"]
+scope: ["we:scripts/operations/dispatch-lane-io.mjs", "we:scripts/operations/__tests__/dispatch-lane-io.test.mjs"]
 dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Diagnose unknown prepare result failure (2eda47d5dc0f3771)
+# Prevention — Have readTick (or decideDispatchRoute) force the Claude route when the runner is 'claude', and pa… (from web-everything/web-everything#5303 review)
 
-Prepare #6135 is held. Cause is unknown. Evidence is retained in the coordination-root prepare failure ledger under cause key 2eda47d5dc0f3771 and item 6135; inspect the recorded terminal output before making a diagnosis. Recover the terminal evidence, fix the cause and add a regression. Release requires a reviewed fix commit. Cause key: 2eda47d5dc0f3771.
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+
+1. `we:scripts/operations/dispatch-lane-io.mjs:545` — Have readTick (or decideDispatchRoute) force the Claude route when the runner is 'claude', and parametrize the wiring test over all three runner values. A contract test that enumerates every allowed runner value against each consumer would catch this class.
+
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5303@6e80f3508556e8a4a8ed17eee8ea64d75abc50a5
 
 ## Acceptance
 

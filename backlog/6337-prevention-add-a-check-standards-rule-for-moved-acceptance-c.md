@@ -1,21 +1,21 @@
 ---
+bornAs: x298stz
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/human-surface-repark.mjs", "we:scripts/review-set-label.mjs", "we:scripts/conveyor/__tests__/human-surface-repark.test.mjs", "we:scripts/__tests__/review-set-label.test.mjs"]
-dateOpened: "2026-10-15"
+scope: ["we:backlog/6246-review-stringency-hardening-before-preview.md"]
+dateOpened: "2026-10-18"
 tags: []
 ---
 
-# Prevention — Add a unit test that runs every listPrs consumer with a non-array deferred marker. The cheaper fi… (from web-everything/web-everything#5273 review)
+# Prevention — Add a check:standards rule for moved-acceptance cards: every bare 'An' reference must resolve to… (from web-everything/web-everything#5541 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/human-surface-repark.mjs:87` — Add a unit test that runs every listPrs consumer with a non-array deferred marker. The cheaper fix is to normalize the shared reader's result to an array in one place in review-daemon.
-2. `we:scripts/review-set-label.mjs:396` — Add a table-driven decideSetLabel test for clear-human over every review:* label combination, with and without humanOnlyHold. That would force an explicit decision for each starting state.
+1. `we:backlog/6246-review-stringency-hardening-before-preview.md:26` — Add a check:standards rule for moved-acceptance cards: every bare 'A<n>' reference must resolve to an item present in the card, or be written as 'x77cl1h A9' or 'xsnny7x A9'. Until that exists, prefix source-card ids when copying.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5273@e16ae0e2e159cb1f11dcde46c7da4e0e9a120967
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5541@e7aa982711ac7ff26ea9499ec414d52743fde632
 
 ## Acceptance
 
