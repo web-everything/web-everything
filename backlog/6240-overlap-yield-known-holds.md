@@ -1,4 +1,5 @@
 ---
+bornAs: xyzpgol
 kind: story
 size: 3
 status: active
