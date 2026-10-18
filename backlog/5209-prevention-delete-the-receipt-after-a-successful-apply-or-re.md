@@ -4,6 +4,8 @@ kind: story
 size: 3
 parent: "4075"
 status: open
+deliveryAgent: codex
+deliveryAgentReason: "Build this card on Codex as requested; its four-file receipt lifecycle scope exceeds the inherited feature probation envelope. Keep shared feature routing on the Argon/Codex roster."
 scope: ["we:scripts/conveyor/queue-prune.mjs", "we:scripts/conveyor/queue.mjs", "we:scripts/conveyor/__tests__/queue-prune.test.mjs", "we:scripts/conveyor/__tests__/queue.test.mjs"]
 dateOpened: "2026-10-06"
 preparedDate: "2026-10-14"

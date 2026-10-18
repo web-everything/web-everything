@@ -7,7 +7,9 @@ import {
 } from '../takeover-budget.mjs';
 import { takeoverMarkerBody, takeoverVoidMarkerBody, withTakeover } from '../fix-takeover.mjs';
 import { takeoverReviewGrant } from '../takeover-review.mjs';
-import { planReconcile, ADVISORY_FIX_ROUND_CAP } from '../reconcile-core.mjs';
+import { planReconcile as planReconcileWithTiming, ADVISORY_FIX_ROUND_CAP } from '../reconcile-core.mjs';
+// This historical fixture exercises the serial policy; new defaults have their own timing suite.
+const planReconcile = options => planReconcileWithTiming({ reviewTiming: { startAfter: 'ci-green' }, fixTiming: { joinCiAndReview: false }, ...options });
 import { buildAdvisoryFixComment } from '../advisory-fix-mark.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';

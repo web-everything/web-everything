@@ -29,8 +29,8 @@
  * and written it straight back, silently reverting the revoke. {@link withFileLock} closes that gap for any
  * caller that wraps its read-modify-write in it.
  */
-import {
-  writeFileSync, renameSync, readFileSync, unlinkSync, openSync, writeSync, closeSync, statSync, realpathSync,
+import fs, {
+  writeFileSync, renameSync, readFileSync, unlinkSync, writeSync, closeSync, statSync, realpathSync,
   existsSync,
 } from 'node:fs';
 import { sleepSyncMs } from '../readiness/drain-lock.mjs';
@@ -158,7 +158,8 @@ export function withFileLock(lockPath, fn, {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
-      const fd = openSync(lockPath, 'wx');
+      // Resolve through the shared fs object so runtime instrumentation sees acquisition.
+      const fd = fs.openSync(lockPath, 'wx');
       try { writeSync(fd, `${process.pid}\n`); } finally { closeSync(fd); }
       break; // acquired
     } catch (e) {
