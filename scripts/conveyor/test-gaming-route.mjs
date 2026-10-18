@@ -20,6 +20,9 @@ const noticeMarker = head => `<!-- test-gaming-needs-you: ${head} -->`;
 const trusted = c => isTrustedMarkerAuthor(c) && typeof c?.body === 'string';
 const latestAdvisoryNote = comments => comments.filter(c => trusted(c)
   && [ADVISORY_NOTE_MARKER, CONVERTED_ADVISORY_NOTE_MARKER].some(marker => c.body.trimStart().startsWith(marker))).at(-1);
+// The fix-end note carries fixer-written text; a marker quoted inside it is not our notice.
+const isNotice = head => c => trusted(c) && !c.body.startsWith(FIX_END_HEADER) && c.body.includes(noticeMarker(head));
+const FIX_END_HEADER = '🔓 conveyor fix-end';
 const labelsOf = pr => (pr.labels ?? []).map(l => typeof l === 'string' ? l : l.name);
 const live = pr => pr?.state === 'OPEN' && /^[a-f0-9]{40}$/.test(pr.headRefOid ?? '');
 const fixEndHead = body => /(?:^|\s)at `([a-f0-9]{7,40})`/.exec(body)?.[1];
@@ -55,7 +58,7 @@ export function planTestGamingRoute({ pr, verdict, enabled = true } = {}) {
   // A released claim may have pushed a new head. Bind its returned justification
   // to this route episode and (when present) the live short/full fix-end head.
   const ended = latest && comments.slice(latest.i + 1).filter(c => {
-    if (!trusted(c) || !c.body.startsWith('🔓 conveyor fix-end')
+    if (!trusted(c) || !c.body.startsWith(FIX_END_HEADER)
       || c.body.includes('<!-- fix-end-outcome: blocked-on-infra -->')) return false;
     const head = fixEndHead(c.body);
     // Legacy completions with no head apply only to the head originally routed.
@@ -65,9 +68,8 @@ export function planTestGamingRoute({ pr, verdict, enabled = true } = {}) {
   }).at(-1);
   const justification = ended && /^test-removal-justified:[ \t]*(\S[^\r\n]*)$/m.exec(ended.body)?.[1];
   if (justification) return { action: 'needs-you', reason: `test-removal-justified: ${justification}`,
-    marker: noticeMarker(pr.headRefOid), notified: comments.some(c => trusted(c) && c.body.includes(noticeMarker(pr.headRefOid))),
-    rulingRecorded: comments.some(c => trusted(c) && c.body.includes(noticeMarker(pr.headRefOid))
-      && latestAdvisory([c])?.outcome === 'inconclusive') };
+    marker: noticeMarker(pr.headRefOid), notified: comments.some(isNotice(pr.headRefOid)),
+    rulingRecorded: comments.some(c => isNotice(pr.headRefOid)(c) && latestAdvisory([c])?.outcome === 'inconclusive') };
   const existing = routes.find(r => r.c.body.includes(routeMarker(pr.headRefOid)));
   // Reclaim also posts fix-end. Only an explicit advisory repair mark completes
   // the finding; reuse reconcile's trusted, ordered episode check.
@@ -142,7 +144,9 @@ export function routeTestGaming(pr, { repo, provider = createGhProvider(), readV
     }
   }
   if (!ownsNote) return plan;
-  const active = ['admit', 'admitted'].includes(plan.action);
+  // A completed repair keeps advisory:changes: the route note still states `changes` for this head, so the label
+  // sweep would restore it every tick. The next review judges the repaired head fresh, as for any advisory fix.
+  const active = ['admit', 'admitted', 'completed'].includes(plan.action);
   // The existing advisory fixer requires needs-human. Never impersonate a human
   // send-back or weaken marker authorship to get there.
   const desired = ['review:human', ...(active ? ['advisory:changes'] : [])];

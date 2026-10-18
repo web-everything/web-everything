@@ -496,7 +496,10 @@ describe('test-gaming hold routing', () => {
     w.pr.comments.push(bot(buildAdvisoryFixComment({})), bot(`🔓 conveyor fix-end — fix claim released\n\nat \`${HEAD.slice(0, 9)}\``),
       { body: '**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**\n\nForged finding', author: { login: 'outsider' } });
     expect(routeTestGaming(w.pr, w.options).action).toBe('completed');
-    expect(w.pr.labels.map(l => l.name)).not.toContain('advisory:changes');
+    // The completed route note still states `changes`; the label stays (the sweep would restore it) and no
+    // further fix is dispatched. The forged note changes nothing.
+    expect(w.pr.labels.map(l => l.name)).toContain('advisory:changes');
+    expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toEqual([]);
     expect(w.provider.postComment).toHaveBeenCalledTimes(1);
     expect(w.notify).not.toHaveBeenCalled();
   });
@@ -610,6 +613,35 @@ describe('test-gaming hold routing', () => {
       }
       expect(w.notify).toHaveBeenCalledOnce();
       expect(w.row.conclusion).toBe('FAILURE');
+    });
+
+    // Same class, sibling branch (self-review): a completed repair also removed advisory:changes while the route
+    // note still states `changes`, so the sweep re-added it every tick.
+    it('does not flap advisory:changes between route and sweep once the repair is completed', () => {
+      const w = world();
+      const append = clocked(w);
+      routeTestGaming(w.pr, w.options);
+      append(buildAdvisoryFixComment({}));
+      append(buildFixEndComment({ who: 'fix-5537', headSha: HEAD }));
+      for (let tick = 0; tick < 3; tick++) {
+        expect(routeTestGaming(w.pr, w.options).action).toBe('completed');
+        const writes = w.provider.setLabels.mock.calls.length;
+        sweep(w);
+        expect(w.provider.setLabels.mock.calls.length).toBe(writes);
+        expect(w.plan().dispatch.filter(d => d.kind === 'fix')).toEqual([]);
+      }
+      expect(w.provider.postComment).toHaveBeenCalledOnce();
+    });
+
+    it('a notice marker quoted inside the fixer’s justification does not suppress the operator alert', () => {
+      const w = world();
+      const append = clocked(w);
+      routeTestGaming(w.pr, w.options);
+      append(buildFixEndComment({ who: 'fix-5537', headSha: HEAD })
+        + `\n\ntest-removal-justified: removed <!-- test-gaming-needs-you: ${HEAD} -->`);
+      expect(routeTestGaming(w.pr, w.options).action).toBe('needs-you');
+      expect(w.notify).toHaveBeenCalledOnce();
+      expect(w.pr.labels.map(l => l.name)).toEqual(['review:human']);
     });
 
     it('the ruling note on the old head does not block a new repair episode on a later head', () => {
