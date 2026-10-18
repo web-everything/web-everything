@@ -1,21 +1,25 @@
 ---
+bornAs: x4v5l97
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/review-extra-seats.mjs", "we:scripts/operations/__tests__/review-extra-seats.test.mjs"]
-dateOpened: "2026-10-16"
+scope: ["we:scripts/conveyor/pr-sweep.mjs", "we:scripts/conveyor/__tests__/pr-sweep.test.mjs"]
+dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — When the route is non-Claude and reads are on, fall back to a tool-free re-check and log a loud w… (from web-everything/web-everything#5452 review)
+# Prevention — Add a runPrSweep test for NEEDS YOU alert failure that asserts the preserved set. Add a review-le… (from web-everything/web-everything#5323 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/review-extra-seats.mjs:1537` — When the route is non-Claude and reads are on, fall back to a tool-free re-check and log a loud warning. Alternatively, add a startup or check:standards assertion that the resolved `review-recheck` provider supports `allowedTools`.
-2. `we:scripts/operations/review-extra-seats.mjs:1597` — Add a spawn-time confinement gate: refuse a tool-bearing juror unless the harness enforces a path allow-list or sandbox (for example a deny-rule for paths outside cwd) and pass a scrubbed env. Add a test that asserts the argv contains the path restriction. File this as a backlog item for filesystem read confinement.
+1. `we:scripts/conveyor/pr-sweep.mjs:122` — Add a runPrSweep test for NEEDS YOU alert failure that asserts the preserved set. Add a review-lens check that every prose guarantee in docs has a named test per branch.
+2. `we:scripts/conveyor/pr-sweep.mjs:108` — Add the queue-incomplete case to the 'failed owner reads' test. Assert `episodes` unchanged and `alerts` empty for each fail-closed input (owner read, PR read, queue).
+3. `we:scripts/conveyor/pr-sweep.mjs:43` — Add a deterministic readLogTail test that asserts filesystem read ranges for a log larger than 2 MiB.
+4. `we:scripts/conveyor/pr-sweep.mjs:116` — Add a deterministic overdue-episode queue-failure test, including preservation of the previous NEEDS YOU set.
+5. `we:scripts/conveyor/__tests__/pr-sweep.test.mjs:62` — Add deterministic default, explicit-false, and explicit-true diagnosis cases using an otherwise diagnosis-eligible PR.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5452@3bfab0b6836e6765cf3094e630150aa8b2d3bcbe
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5323@c7b96a8602cc50ba2147089d5e4d12eee660b9ba
 
 ## Acceptance
 

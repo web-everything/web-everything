@@ -1,22 +1,22 @@
 ---
+bornAs: x9sazq4
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/enqueue-on-event.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/lib/__tests__/enqueue-on-event.test.mjs"]
-dateOpened: "2026-10-14"
+scope: ["we:scripts/operations/record-referral-ruling.mjs", "we:scripts/operations/review-pr-io.mjs", "we:scripts/operations/__tests__/record-referral-ruling.test.mjs", "we:scripts/operations/__tests__/review-pr-io.test.mjs"]
+dateOpened: "2026-10-16"
 tags: []
 ---
 
-# Prevention — Add a contract test that runs the merge-ai-prs --only --json path against a stubbed strategy and… (from web-everything/web-everything#5256 review)
+# Prevention — Define the open-finding states as one exported constant, or a predicate such as isAwaitingReviewe… (from web-everything/web-everything#5448 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/merge-ai-prs.mjs:6578` — Add a contract test that runs the merge-ai-prs `--only --json` path against a stubbed strategy and asserts the `enqueueOutcomes` shape. Re-check it when #5217 lands.
-2. `we:scripts/lib/enqueue-on-event.mjs:560` — Reuse the honourSetting stripping helper (remove the 'catch-up' cause and keep entries with other causes) instead of deleting outright, and add a mixed-entry test.
-3. `we:scripts/lib/enqueue-on-event.mjs:556` — Reset or delete the counter on any non-miss outcome. Prune counters against the catch-up candidate list on each snapshot.
+1. `we:scripts/operations/record-referral-ruling.mjs:245` — Define the open-finding states as one exported constant, or a predicate such as `isAwaitingReviewer(o)`, and use it in `planRulingFollowUp`. Add a table test that runs every state value through `planRulingFollowUp`.
+2. `we:scripts/operations/review-pr-io.mjs:1184` — Add a deterministic regression test covering interruption after referral persistence followed by resumption with recheckCarriedReferrals disabled.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5256@f52faad53c7a71de2a43fad3c7efd125adfe1ba5
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5448@47aa32c7baf7a137a8ddd8d5b4a14e4e63ab1ed9
 
 ## Acceptance
 
