@@ -277,6 +277,11 @@ future-dated exhausted budget can otherwise make a fresh world wait for the prod
 Use the clone's routing policy rather than an inherited daemon snapshot, and exclude generated
 GitHub App shim directories before scanning the host's tool PATH.
 
+General simulator and soak fixtures model the full required-check set and pin `WE_REVIEW_START_AFTER=ci-green`
+in the shared world environment. Keep the planner and dispatch-time gate on the same fixture policy across
+daemon restarts. Production fast-check eligibility is covered by `review-timing-dispatch.test.mjs` and
+`review-ci-gate-io.test.mjs`; scenarios exercising that timing must explicitly set their world policy and checks.
+
 Fake-`gh` CLI fixtures that exercise throttling must set `WE_GH_THROTTLE_LOCK_ROOT` to a temporary
 directory per invocation and route the binary to their fake. An intentional rate-limit response writes
 cooldown state; sharing that state with another test or the host delays unrelated reads.

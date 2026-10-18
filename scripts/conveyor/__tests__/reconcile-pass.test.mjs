@@ -46,7 +46,7 @@ describe('mechanical round enrichment port (#5948)', () => {
     enrichBaseRef: p => p, enrichSystemFix: p => p, enrichEscalationBase: p => p,
     enrichFixClaims: p => p, enrichTimeouts: p => p, enrichReferralHolds: p => p,
     enrichLedgerHolds: p => p, enrichRulings: p => p, enrichScopeBloat: p => p,
-    enrichCodeQL: p => p, enrichOwedMainRule: () => {}, env: { WE_REVIEW_ROUND_CAP: '5' },
+    enrichCodeQL: p => p, enrichOwedMainRule: () => {}, env: { WE_REVIEW_ROUND_CAP: '5', WE_REVIEW_START_AFTER: 'ci-green' },
     now: Date.parse('2026-10-10T12:00:00Z') });
 
   it.each([['we', false, true], ['we', true, false], ['frontierui', false, false],
@@ -131,6 +131,7 @@ it('maps repo slugs before binding and refuses unknown repos before IO', async (
   const { runReconcilePass } = await import('../reconcile-pass.mjs');
   const requiredChecks = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'];
   const options = {
+    env: { WE_REVIEW_START_AFTER: 'ci-green' },
     readRequiredChecks: () => ({ checks: requiredChecks, source: 'live' }),
     readPrs: () => [{ statusCheckRollup: requiredChecks.map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })), number: 49, headRefName: 'lane/1-x', headRefOid: 'a'.repeat(40), labels: [{ name: 'review:pending' }], comments: [] }],
     readAgents: () => [{ name: 'review-fui-49', pidAlive: true, pid: 1 }], enrich: (agents) => agents,
@@ -1526,6 +1527,7 @@ it('cards 273/278 threads resolved ownership settings and keeps pure defaults on
   const { readFileSync } = await import('node:fs');
   const fx = JSON.parse(readFileSync('scripts/conveyor/__tests__/fixtures/pr-ownership/pr-5157-ci-heal-escalated.json', 'utf8'));
   const options = { ...xxOptions(), readPrs: () => [fx.pr], readRequiredChecks: () => ({ checks: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'] }),
+    env: { WE_REVIEW_START_AFTER: 'ci-green' }, // Keep this ownership fixture independent of fast-check timing.
     now: Date.parse(fx.observedAt), excuseMergeGateHolds: prs => prs, enrichMechanicalRound: prs => prs,
     enrichReferralHolds: prs => prs, enrichLedgerHolds: prs => prs, enrichRulings: prs => prs,
     enrichScopeBloat: prs => prs, enrichCodeQL: prs => prs, enrichEscalationBase: prs => prs,
