@@ -6278,7 +6278,7 @@ Codex-authored PRs get an Opus judge, same fallback dimension). Declared in `we:
 ### Operator overrides are a local-first store above the code cascade; a loosening write needs the operator's confirmation {#operator-override-settings-layer}
 
 **Ratified 2026-10-17 by the operator (Nicolas Gilbert), in conversation, all three forks at the card's default
-(`#xouq5b0`).** The operator's words: *"we should have the option to use a db for settings instead of in code, at least as
+(`#6268`).** The operator's words: *"we should have the option to use a db for settings instead of in code, at least as
 override"*, then "Ok" to defaults (a), (a), (a). Composes with [config-extends-platform-default](#config-extends-platform-default)
 (the new layer is one more cascade layer, each value with its source logged) and the settings-edit authority decision
 `#xugqjw1` (cited by id).
@@ -6302,4 +6302,4 @@ override"*, then "Ok" to defaults (a), (a), (a). Composes with [config-extends-p
    layer.
 5. **Fail closed.** An unreadable or unparsable layer is skipped whole and logged, never half-applied.
 
-**Lineage:** `#xouq5b0` (ruled 2026-10-17). Instance of [config-extends-platform-default](#config-extends-platform-default).
+**Lineage:** `#6268` (ruled 2026-10-17). Instance of [config-extends-platform-default](#config-extends-platform-default).

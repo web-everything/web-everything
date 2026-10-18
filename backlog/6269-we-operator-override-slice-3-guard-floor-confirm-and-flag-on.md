@@ -1,7 +1,8 @@
 ---
+bornAs: xt96sbx
 kind: story
 size: 5
-parent: "xouq5b0"
+parent: "6268"
 status: open
 scope: ["we:scripts/lib/operator-override-floor.mjs", "we:scripts/lib/operator-override-store.mjs", "we:scripts/lib/__tests__/operator-override-floor.test.mjs"]
 dateOpened: "2026-10-17"
@@ -10,7 +11,7 @@ tags: []
 
 # we: operator override slice 3 - guard floor confirm-and-flag on write and on read
 
-Build the guard floor of decision xouq5b0 (we:docs/agent/platform-decisions.md#operator-override-settings-layer): a safe-direction table per key (no entry means loosening), a loosening write refused until the operator confirms, and the reader ignoring any loosening entry with no recorded confirmation.
+Build the guard floor of decision 6268 (we:docs/agent/platform-decisions.md#operator-override-settings-layer): a safe-direction table per key (no entry means loosening), a loosening write refused until the operator confirms, and the reader ignoring any loosening entry with no recorded confirmation.
 
 ## Acceptance
 

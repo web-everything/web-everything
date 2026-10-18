@@ -1,7 +1,8 @@
 ---
+bornAs: x9ryzme
 kind: story
 size: 3
-parent: "xouq5b0"
+parent: "6268"
 status: open
 scope: ["we:scripts/lib/needs-you-feed.mjs", "we:scripts/lib/__tests__/needs-you-feed.test.mjs"]
 dateOpened: "2026-10-17"
@@ -10,7 +11,7 @@ tags: []
 
 # we: operator override slice 4 - needs-you flag for confirmed loosening overrides
 
-Show every confirmed loosening operator override in the needs-you feed, per decision xouq5b0 (we:docs/agent/platform-decisions.md#operator-override-settings-layer), so a guard is never off without the operator seeing it.
+Show every confirmed loosening operator override in the needs-you feed, per decision 6268 (we:docs/agent/platform-decisions.md#operator-override-settings-layer), so a guard is never off without the operator seeing it.
 
 ## Acceptance
 

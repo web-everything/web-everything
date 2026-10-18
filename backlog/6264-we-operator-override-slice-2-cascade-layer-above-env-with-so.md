@@ -1,7 +1,8 @@
 ---
+bornAs: x9p23rk
 kind: story
 size: 5
-parent: "xouq5b0"
+parent: "6268"
 status: open
 scope: ["we:scripts/lib/policy-cascade.mjs", "we:scripts/lib/review-settings.mjs", "we:scripts/lib/__tests__/policy-cascade.test.mjs", "we:scripts/lib/__tests__/review-settings.test.mjs"]
 dateOpened: "2026-10-17"
@@ -10,7 +11,7 @@ tags: []
 
 # we: operator override slice 2 - cascade layer above env with source logging
 
-Add the operator-override layer to resolveCascade and resolveReviewSettings per decision xouq5b0 (we:docs/agent/platform-decisions.md#operator-override-settings-layer): order standard < platform < tool < env < operator-override, every value from it logs source operator-db.
+Add the operator-override layer to resolveCascade and resolveReviewSettings per decision 6268 (we:docs/agent/platform-decisions.md#operator-override-settings-layer): order standard < platform < tool < env < operator-override, every value from it logs source operator-db.
 
 ## Acceptance
 

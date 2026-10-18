@@ -1,7 +1,8 @@
 ---
+bornAs: xkwhvyg
 kind: story
 size: 5
-parent: "xouq5b0"
+parent: "6268"
 status: open
 scope: ["we:scripts/lib/operator-override-store.mjs", "we:scripts/operations/operator-override.mjs", "we:scripts/lib/__tests__/operator-override-store.test.mjs"]
 dateOpened: "2026-10-17"
@@ -10,7 +11,7 @@ tags: []
 
 # we: operator override slice 1 - host-wide store and operator-only write CLI with audit log and expiry
 
-Build the store of decision xouq5b0 (we:docs/agent/platform-decisions.md#operator-override-settings-layer): a host-wide path outside any lane clone, one readOperatorOverrides read interface, and an operator-only operator-override set operation that rejects agent callers, appends a change log and supports expiry.
+Build the store of decision 6268 (we:docs/agent/platform-decisions.md#operator-override-settings-layer): a host-wide path outside any lane clone, one readOperatorOverrides read interface, and an operator-only operator-override set operation that rejects agent callers, appends a change log and supports expiry.
 
 ## Acceptance
 
