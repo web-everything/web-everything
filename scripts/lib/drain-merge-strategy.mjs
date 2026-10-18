@@ -314,8 +314,8 @@ export function createDrainMergeStrategy({
         const pinned = readPinnedChangedFiles({ headSha, base, cwd, exec });
         const surface = workflowEditHold({ files: pinned.files, expectedCount: pinned.files?.length });
         if (surface.hold) return { allowed: false, reason: surface.reason, humanOnlySurface: surface };
-        // Bound to the base it was read against: enqueuePr re-reads the diff if the live base differs.
-        const preparedSurface = { headSha, base, files: pinned.files };
+        // Bound to the base branch and tip it was read against: enqueuePr re-reads the diff if either differs live.
+        const preparedSurface = { headSha, base, baseSha: pinned.baseSha ?? null, files: pinned.files };
         const pages = readThreadPages(c.repo, c.num);
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) return { allowed: false, reason: 'red-team comments unreadable' };
         const comments = pages.flat();

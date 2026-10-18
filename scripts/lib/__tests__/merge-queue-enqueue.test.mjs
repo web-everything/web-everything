@@ -10,7 +10,8 @@ const HEAD = 'a'.repeat(40);
 
 // A fake `gh` + `git`: the PR read (live head), the pinned git diff of HEAD (NUL-separated paths), the mutation.
 // `--no-renames` means a rename arrives as two paths (old + new), so the fakes list both.
-const execFor = ({ files, liveHead = HEAD, liveBase = 'main', mutation = '{}', calls = [], filesError }) => (cmd, args) => {
+// `liveBase: null` = the PR read carries no usable base; `baseTip` = the base branch's tip as git reports it.
+const execFor = ({ files, liveHead = HEAD, liveBase = 'main', baseTip = '', mutation = '{}', calls = [], filesError }) => (cmd, args) => {
   calls.push([cmd, args]);
   if (cmd === 'gh' && args[0] === 'pr') return JSON.stringify({ id: 'PR_1', headRefOid: liveHead, baseRefName: liveBase });
   if (cmd === 'git') {
@@ -18,6 +19,8 @@ const execFor = ({ files, liveHead = HEAD, liveBase = 'main', mutation = '{}', c
       if (filesError) throw new Error(filesError);
       return files.map((f) => (Array.isArray(f) ? f.filter(Boolean).join('\0') : f)).join('\0');
     }
+    if (args[0] === 'ls-remote') return baseTip ? `${baseTip}\trefs/heads/${liveBase}\n` : '';
+    if (args[0] === 'rev-parse') return baseTip ? `${baseTip}\n` : '';
     return '';
   }
   if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: calls.some(([, a]) => a.includes(`query=${ENQUEUE_MUTATION}`)), headRefOid: HEAD } } } });
@@ -191,29 +194,41 @@ describe('a PR that touches a workflow file is never enqueued (human-only hold)'
   // so a workflow edit visible only against the new base was enqueued. The list is bound to its base.
   describe('a prepared file list is reused only against the base it was read against', () => {
     const ENQUEUED = JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'E' } } } });
-    const run = (preparedSurface, liveBase) => {
+    const TIP = 'c'.repeat(40);
+    const run = (preparedSurface, liveBase, baseTip = TIP) => {
       const calls = [];
-      const result = enqueuePr({ repo: 'o/r', num: 7, headSha: HEAD, cwd: CWD, preparedSurface, exec: execFor({ files: [['README.md', ''], ['.github/workflows/ci.yml', '']], liveBase, mutation: ENQUEUED, calls }) });
+      const result = enqueuePr({ repo: 'o/r', num: 7, headSha: HEAD, cwd: CWD, preparedSurface, exec: execFor({ files: [['README.md', ''], ['.github/workflows/ci.yml', '']], liveBase, baseTip, mutation: ENQUEUED, calls }) });
       return { result, calls, mutated: calls.some(([, a]) => a.includes(`query=${ENQUEUE_MUTATION}`)) };
     };
+    const prepared = (extra) => ({ headSha: HEAD, base: 'main', baseSha: TIP, files: ['README.md'], ...extra });
 
     it.each([
-      ['retargeted to another branch', { headSha: HEAD, base: 'main', files: ['README.md'] }, 'release'],
-      ['retargeted away and the base differs only by case', { headSha: HEAD, base: 'Release', files: ['README.md'] }, 'release'],
-      ['prepared without a recorded base', { headSha: HEAD, files: ['README.md'] }, 'main'],
-      ['prepared with a non-string base', { headSha: HEAD, base: ['main'], files: ['README.md'] }, 'main'],
-      ['the live base is unreadable', { headSha: HEAD, base: 'main', files: ['README.md'] }, undefined],
-    ])('re-reads the pinned diff and holds the workflow edit when %s', (_name, surface, liveBase) => {
-      const { result, calls, mutated } = run(surface, liveBase);
+      ['retargeted to another branch', prepared(), 'release', TIP],
+      ['retargeted away and the base differs only by case', prepared({ base: 'Release' }), 'release', TIP],
+      ['prepared without a recorded base', prepared({ base: undefined }), 'main', TIP],
+      ['prepared with a non-string base', prepared({ base: ['main'] }), 'main', TIP],
+      ['the base branch moved under the same name', prepared(), 'main', 'd'.repeat(40)],
+      ['prepared without a recorded base commit', prepared({ baseSha: undefined }), 'main', TIP],
+      ['prepared with a malformed base commit', prepared({ baseSha: 'C'.repeat(40) }), 'main', 'C'.repeat(40)],
+      ['the live base commit is unreadable', prepared(), 'main', ''],
+    ])('re-reads the pinned diff and holds the workflow edit when %s', (_name, surface, liveBase, baseTip) => {
+      const { result, calls, mutated } = run(surface, liveBase, baseTip);
       expect(result).toMatchObject({ ok: false, held: true, humanOnly: true, reason: 'workflow-edit', paths: ['.github/workflows/ci.yml'] });
       expect(calls.some(([c, a]) => c === 'git' && a[0] === 'diff')).toBe(true);
       expect(mutated).toBe(false);
     });
 
-    it('reuses the prepared list without a git read when head and base both still match', () => {
-      const { result, calls, mutated } = run({ headSha: HEAD, base: 'release', files: ['README.md'] }, 'release');
-      expect(result).toMatchObject({ ok: true });
+    it.each([['null', null], ['empty', '']])('fails closed (retryable, no git read, no mutation) when the live base is %s', (_name, liveBase) => {
+      const { result, calls, mutated } = run(prepared(), liveBase);
+      expect(result).toMatchObject({ ok: false, held: true, humanOnly: false, retryable: true, reason: 'unreadable' });
       expect(calls.some(([c]) => c === 'git')).toBe(false);
+      expect(mutated).toBe(false);
+    });
+
+    it('reuses the prepared list without a fetch or diff when head, base and base commit all still match', () => {
+      const { result, calls, mutated } = run(prepared({ base: 'release' }), 'release');
+      expect(result).toMatchObject({ ok: true });
+      expect(calls.some(([c, a]) => c === 'git' && ['fetch', 'diff'].includes(a[0]))).toBe(false);
       expect(mutated).toBe(true);
     });
   });
@@ -318,6 +333,37 @@ describe('the workflow-edit refusal reads the change list of the exact enqueued 
       const files = readPinnedChangedFiles({ headSha: renamed, cwd: clone }).files;
       expect(files.sort()).toEqual(['.github/workflows/merge-gate.yml', 'docs-gate.yml']);
       expect(workflowEditHold({ files, expectedCount: files.length })).toMatchObject({ hold: true, humanOnly: true });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  // PR #5480 self-review: same base NAME, but main moved. The head adds a workflow (C1), reverts it (C2), edits
+  // README. Prepared against the old main the list is README only; once C1 lands on main the merge base moves to
+  // C1 and the same head now deletes the workflow. A list bound only to the base name would hide that edit.
+  it('re-reads a prepared list once the base branch moved under the same name, and holds the newly visible workflow edit', () => {
+    const { root, work, clone } = setup();
+    try {
+      git(work, 'checkout', '-qb', 'lane/y', 'main');
+      mkdirSync(join(work, '.github/workflows'), { recursive: true });
+      writeFileSync(join(work, '.github/workflows/ci.yml'), 'jobs: {}\n');
+      git(work, 'add', '.'); git(work, 'commit', '-qm', 'C1');
+      const c1 = git(work, 'rev-parse', 'HEAD');
+      git(work, 'rm', '-q', '.github/workflows/ci.yml'); git(work, 'commit', '-qm', 'C2');
+      writeFileSync(join(work, 'README.md'), 'r\n');
+      git(work, 'add', '.'); git(work, 'commit', '-qm', 'C3');
+      const head = git(work, 'rev-parse', 'HEAD');
+      git(work, 'push', '-q', 'origin', 'lane/y');
+      const read = readPinnedChangedFiles({ headSha: head, cwd: clone });
+      expect(read.files).toEqual(['README.md']);
+      expect(read.baseSha).toBe(git(work, 'rev-parse', 'main'));
+      const preparedSurface = { headSha: head, base: 'main', baseSha: read.baseSha, files: read.files };
+      const unmoved = [];
+      expect(enqueuePr({ repo: 'o/r', num: 7, headSha: head, cwd: clone, preparedSurface, exec: realExec(head, unmoved) })).toMatchObject({ ok: true });
+      expect(unmoved.some(([c, a]) => c === 'git' && a[0] === 'diff')).toBe(false);
+      git(work, 'push', '-q', 'origin', `${c1}:refs/heads/main`); // C1 lands on main
+      const calls = [];
+      const result = enqueuePr({ repo: 'o/r', num: 7, headSha: head, cwd: clone, preparedSurface, exec: realExec(head, calls) });
+      expect(result).toMatchObject({ ok: false, held: true, humanOnly: true, reason: 'workflow-edit', paths: ['.github/workflows/ci.yml'] });
+      expect(calls.some(([c, a]) => c === 'gh' && a.includes(`query=${ENQUEUE_MUTATION}`))).toBe(false);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 

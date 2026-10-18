@@ -251,8 +251,21 @@ export function readPinnedChangedFiles({ headSha, base = 'main', cwd, exec = exe
     git(['fetch', '--quiet', '--end-of-options', 'origin', headSha, `+refs/heads/${base}:refs/remotes/origin/${base}`]);
     git(['cat-file', '-e', `${headSha}^{commit}`]);
     const out = git(['diff', '--name-only', '--no-renames', '-z', '--end-of-options', `refs/remotes/origin/${base}...${headSha}`]);
-    return { files: out.split('\0').filter(Boolean) };
+    // The base tip this diff used, so a caller can tell later whether the same list still holds. Best effort.
+    let baseSha = null;
+    try { baseSha = git(['rev-parse', '--verify', '--end-of-options', `refs/remotes/origin/${base}^{commit}`]).trim(); } catch { /* unknown */ }
+    return { files: out.split('\0').filter(Boolean), baseSha: SHA_RE.test(baseSha) ? baseSha : null };
   } catch (e) { return { error: errText(e) }; }
+}
+
+/** The base branch's current tip on `origin`, read live (no fetch). A 40-hex sha, or null. Never throws. */
+function readBaseTip({ base, cwd, exec }) {
+  if (!cwd || !SAFE_BRANCH_RE.test(String(base)) || String(base).startsWith('-')) return null;
+  try {
+    const out = String(exec('git', ['ls-remote', '--exit-code', 'origin', `refs/heads/${base}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 }) ?? '');
+    const rows = out.split('\n').filter(Boolean).map(l => l.split('\t'));
+    return rows.length === 1 && rows[0][1] === `refs/heads/${base}` && SHA_RE.test(rows[0][0]) ? rows[0][0] : null;
+  } catch { return null; }
 }
 
 /**
@@ -278,12 +291,17 @@ export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync, prepar
   if (pr?.headRefOid !== headSha) {
     return { ok: false, held: true, humanOnly: false, retryable: true, reason: 'head-moved', paths: [], error: `PR head is ${String(pr?.headRefOid).slice(0, 9)}, not the judged ${String(headSha).slice(0, 9)} — re-judge the new head before enqueueing` };
   }
-  // A prepared list describes `base...head` for the base it was read against: reuse it only while BOTH still match
-  // the live PR (a retargeted PR can show a workflow edit the prepared base hid). Anything else re-reads git.
   const liveBase = pr?.baseRefName;
-  const reusable = preparedSurface?.headSha === headSha && typeof liveBase === 'string' && liveBase !== '' && preparedSurface.base === liveBase
-    && Array.isArray(preparedSurface.files) && preparedSurface.files.every(p => typeof p === 'string');
-  const read = reusable ? { files: preparedSurface.files } : readPinnedChangedFiles({ headSha, base: liveBase || 'main', cwd, exec });
+  if (typeof liveBase !== 'string' || liveBase === '') {
+    return { ok: false, held: true, humanOnly: false, retryable: true, reason: 'unreadable', paths: [], error: 'changed files unreadable (the PR base branch is unreadable)' };
+  }
+  // A prepared list describes `base...head` at one base commit: reuse it only while the head, the base branch AND
+  // that branch's tip all still match (a retargeted PR, or a base that moved, can show a workflow edit the prepared
+  // list hid). Anything else re-reads git.
+  const reusable = preparedSurface?.headSha === headSha && preparedSurface.base === liveBase && SHA_RE.test(String(preparedSurface.baseSha))
+    && Array.isArray(preparedSurface.files) && preparedSurface.files.every(p => typeof p === 'string')
+    && readBaseTip({ base: liveBase, cwd, exec }) === preparedSurface.baseSha;
+  const read = reusable ? { files: preparedSurface.files } : readPinnedChangedFiles({ headSha, base: liveBase, cwd, exec });
   const hold = workflowEditHold({ files: read.files, expectedCount: read.files?.length });
   if (hold.hold) return { ok: false, held: true, humanOnly: hold.humanOnly, retryable: hold.retryable === true, reason: hold.reason, paths: hold.paths, error: read.error ? `${hold.error}: ${read.error}` : hold.error };
   const queueState = () => readMergeQueueState({ repo, pr: num, readJson: args => JSON.parse(exec('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}') });
