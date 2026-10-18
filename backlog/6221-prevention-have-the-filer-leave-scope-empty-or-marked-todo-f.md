@@ -44,4 +44,4 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Also raised by
 
-- Also raised by web-everything/web-everything#5543 (finding 2: `we:backlog/xmokcam-prevention-card-lint-plus-review-lens-when-prose-enumerates.md:6` — Make the filer leave scope empty or TODO for the implementer to set. Alternatively, a card-lint rule that rejects a prevention card whose scope contains only the card it was filed from.)
+- Also raised by web-everything/web-everything#5543 (finding 2: `we:backlog/6262-prevention-card-lint-plus-review-lens-when-prose-enumerates.md:6` — Make the filer leave scope empty or TODO for the implementer to set. Alternatively, a card-lint rule that rejects a prevention card whose scope contains only the card it was filed from.)

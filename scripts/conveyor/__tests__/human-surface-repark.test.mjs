@@ -13,7 +13,7 @@ describe('human surface re-park plan', () => {
     expect(p.repark).toBe(true);
     expect(p.decision.addLabel).toBe('review:human');
     expect(p.decision.removeLabels).toContain('review:accepted');
-    expect(p.decision.removeLabels).not.toContain('ready-to-merge');
+    expect(p.decision.removeLabels).toContain('ready-to-merge');
   });
   it.each([
     { files: ['src/example.js'] },
@@ -162,7 +162,7 @@ describe('human surface re-park sweep', () => {
     const f = fixture();
     expect(f.run()).toEqual([{ num: 7, repark: 'reparked', head, files: ['.github/workflows/ci.yml'] }]);
     expect(f.calls.map(c => c[0])).toEqual(['comment', 'labels']);
-    expect(f.calls[1][3]).toEqual({ add: 'review:human', remove: ['review:accepted'] });
+    expect(f.calls[1][3]).toEqual({ add: 'review:human', remove: ['ready-to-merge', 'review:accepted'] });
   });
   it('skips a moved head', () => {
     const f = fixture();
@@ -327,7 +327,7 @@ describe('human surface re-park sweep', () => {
   });
   it('withdraws without a failed remove when the ceremony already removed review:human', () => {
     const r = racing({ during: 'labels' });
-    expect(r.effects.at(-1)).toBe('labels:+review:human-review:accepted');
+    expect(r.effects.at(-1)).toBe('labels:+review:human-ready-to-merge,review:accepted');
     expect(r.results[0]).not.toHaveProperty('error');
   });
   it('leaves the hold (fail closed) and reports when the post-write read fails', () => {
@@ -420,7 +420,7 @@ describe('human surface re-park sweep', () => {
   });
   it('re-parks when no clearance lands during the write', () => {
     const r = racing({ during: 'none' });
-    expect(r.live.labels).toEqual(['ready-to-merge', 'review:human']);
+    expect(r.live.labels).toEqual(['review:human']);
     expect(r.results).toEqual([{ num: 7, repark: 'reparked', head, files: ['.github/workflows/ci.yml'] }]);
   });
   it('does not change labels after a failed comment', () => {

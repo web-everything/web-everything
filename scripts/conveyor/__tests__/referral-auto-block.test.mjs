@@ -118,10 +118,10 @@ describe('review-hold sweep end to end', () => {
     expect(JSON.stringify(calls)).not.toContain(RULING_NEEDED_LABEL);
     expect(results.find((r) => r.autoBlock)).toMatchObject({ num: 3794, autoBlock: 'auto-blocked' });
   });
-  it('operator mode: unchanged, the label goes on and nothing is auto-ruled', () => {
+  it('operator mode: leaves the ruling label to the mirror and nothing is auto-ruled', () => {
     const { calls, runRuling } = run(OPERATOR);
     expect(runRuling).not.toHaveBeenCalled();
-    expect(calls).toContainEqual(['set', 3794, { add: RULING_NEEDED_LABEL }]);
+    expect(JSON.stringify(calls)).not.toContain(RULING_NEEDED_LABEL);
   });
 });
 
@@ -225,17 +225,17 @@ describe('labels around an auto-block (review-hold sweep)', () => {
     const results = sweepReviewHoldLabels({ repo, listPrs: () => prs, readPr: ({ number }) => prs.find((p) => p.number === number), provider, settings, runRuling });
     return { calls, results };
   };
-  it('a judgment call left for the operator keeps the advisory:ruling-needed signal', () => {
+  it('a judgment call left for the operator leaves the ruling label to the mirror', () => {
     const runRuling = vi.fn();
     const { calls } = run([prWith([B, J])], AUTO, runRuling);
     expect(runRuling).toHaveBeenCalledTimes(1);
-    expect(calls).toContainEqual(['set', 3794, { add: RULING_NEEDED_LABEL }]);
+    expect(JSON.stringify(calls)).not.toContain(RULING_NEEDED_LABEL);
   });
-  it('a failed ruling leaves the PR parked and surfaced: the label still goes on', () => {
+  it('a failed ruling is reported without writing the mirror-owned label', () => {
     const runRuling = vi.fn(() => { throw new Error('boom'); });
     const { calls, results } = run([parked()], AUTO, runRuling);
     expect(results.find((r) => r.autoBlock)).toMatchObject({ autoBlock: 'failed' });
-    expect(calls).toContainEqual(['set', 3794, { add: RULING_NEEDED_LABEL }]);
+    expect(JSON.stringify(calls)).not.toContain(RULING_NEEDED_LABEL);
   });
   it('never touches review:human on an auto-blocked PR', () => {
     const { calls } = run([parked()], AUTO, vi.fn());
@@ -314,7 +314,7 @@ describe('fresh complete auto-block decisions (#5955)', () => {
     fail = false;
     expect(sweep().every((r) => r.action === 'auto-blocked')).toBe(true);
   });
-  it.each([false, true])('composed sweep reads anew after auto-block (dryRun=%s)', (dryRun) => {
+  it.each([false, true])('composed sweep leaves post-ruling label reconciliation to the mirror (dryRun=%s)', (dryRun) => {
     const trace = [];
     const pr = parked({ state: 'OPEN', labels: [RULING_NEEDED_LABEL] });
     const original = JSON.stringify(pr);
@@ -328,25 +328,29 @@ describe('fresh complete auto-block decisions (#5955)', () => {
     const out = sweepReviewHoldLabels({ repo, settings: AUTO, runRuling, readPr, provider, dryRun, listPrs: () => [pr] });
     expect(out.find((r) => r.autoBlock)).toMatchObject({ autoBlock: 'auto-blocked' });
     if (dryRun) {
-      expect(trace).toEqual(['read pending', 'read pending']);
+      expect(trace).toEqual(['read pending']);
       expect(runRuling).not.toHaveBeenCalled();
       expect(provider.setLabels).not.toHaveBeenCalled();
     } else {
-      expect(trace).toEqual(['read pending', 'rule', 'read ruled', 'label']);
-      expect(provider.setLabels).toHaveBeenCalledWith(repo, 3794, { remove: [RULING_NEEDED_LABEL] });
+      expect(trace).toEqual(['read pending', 'rule']);
+      expect(runRuling).toHaveBeenCalledOnce();
+      expect(provider.setLabels).not.toHaveBeenCalled();
     }
+    expect(provider.ensureLabel).not.toHaveBeenCalled();
+    expect(out.some((r) => 'ruling' in r)).toBe(false);
     expect(JSON.stringify(pr)).toBe(original);
   });
-  it('an auto-block read error never suppresses the subsequent ruling-label pass', () => {
+  it('an auto-block read error is reported without a legacy ruling-label pass', () => {
     let reads = 0;
     const readPr = () => { if (++reads === 1) throw new Error('unavailable'); return parked({ state: 'OPEN' }); };
     const provider = { ensureLabel: vi.fn(), setLabels: vi.fn() };
     const runRuling = vi.fn();
     const out = sweepReviewHoldLabels({ repo, settings: AUTO, runRuling, readPr, provider, listPrs: () => [parked()] });
-    expect(out.map((r) => r.autoBlock ?? r.ruling)).toEqual(['failed', 'add']);
-    expect(provider.ensureLabel).toHaveBeenCalledOnce();
+    expect(out.map((r) => r.autoBlock ?? r.ruling)).toEqual(['failed']);
+    expect(provider.ensureLabel).not.toHaveBeenCalled();
+    expect(provider.setLabels).not.toHaveBeenCalled();
     expect(runRuling).not.toHaveBeenCalled();
-    expect(reads).toBe(2);
+    expect(reads).toBe(1);
   });
 
 });
