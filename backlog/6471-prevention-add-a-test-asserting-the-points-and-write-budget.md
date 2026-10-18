@@ -1,20 +1,22 @@
 ---
+bornAs: x66ed3m
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/gh-throttle.mjs", "we:scripts/lib/__tests__/gh-throttle.test.mjs"]
-dateOpened: "2026-10-15"
+scope: ["we:scripts/lib/gh-throttle.mjs", "we:scripts/lib/__tests__/gh-throttle-slot-wait.test.mjs", "we:scripts/lib/__tests__/gh-throttle.test.mjs"]
+dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — Add a deterministic cross-runner regression using invalid UTF-8 bytes, requiring raw-byte equalit… (from web-everything/web-everything#5290 review)
+# Prevention — Add a test asserting the points and write-budget ledgers are unchanged after a slot_throttled out… (from web-everything/web-everything#5288 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/gh-throttle.mjs:1809` — Add a deterministic cross-runner regression using invalid UTF-8 bytes, requiring raw-byte equality after an encoded synchronous cache fill; preserve raw bytes before caller-specific decoding.
+1. `we:scripts/lib/gh-throttle.mjs:1874` — Add a test asserting the points and write-budget ledgers are unchanged after a slot_throttled outcome. Or acquire the slot first, or refund the points when the slot is refused.
+2. `we:scripts/lib/__tests__/gh-throttle-slot-wait.test.mjs:1` — Add one test where acquireGhSlotSync throws (expect the call runs), and one where passthrough has `outer` set on a full pool (expect the call runs, with no slot_throttled row).
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5290@a576d7d35116c40f6ed217d24d459d441c64f2c3
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5288@fa5a13eddcc603dbe1c403a19d2489caa849cb4d
 
 ## Acceptance
 

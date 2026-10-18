@@ -1,21 +1,21 @@
 ---
+bornAs: xoe1yq5
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/codex-usage-ledger.mjs", "we:scripts/lib/__tests__/codex-usage-ledger.test.mjs"]
-dateOpened: "2026-10-14"
+scope: ["we:backlog/4383-status-label-must-say-ci-red-when-required-ci-finished-red-n.md"]
+dateOpened: "2026-10-16"
 tags: []
 ---
 
-# Prevention — Add a wrapper-level test that drives withCodexUsage with the real spawnToCompletion resolve shape… (from web-everything/web-everything#5254 review)
+# Prevention — Add a deterministic cache-miss test with an injected network transport that fails on any call, an… (from web-everything/web-everything#5428 review)
 
-Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this PR's latest advisory review named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/codex-usage-ledger.mjs:196` — Add a wrapper-level test that drives withCodexUsage with the real spawnToCompletion resolve shape and asserts exit === 0. Alternatively, treat a resolved launch with no code as exit 0 when no error was thrown.
-2. `we:scripts/lib/codex-usage-ledger.mjs:88` — Record the rollout path and mtime with each quota sample. Set delta to null when before and after come from the same unchanged observation. Add a test for identical before/after samples.
+1. `we:backlog/4383-status-label-must-say-ci-red-when-required-ci-finished-red-n.md:28` — Add a deterministic cache-miss test with an injected network transport that fails on any call, and include it in the scoped regression suite.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5254@c0899e088573dcff71b3d5abf8dac651ef2cc658
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5428@170f38c3b77eee018e991ba2ba30c4225fb764ae
 
 ## Acceptance
 

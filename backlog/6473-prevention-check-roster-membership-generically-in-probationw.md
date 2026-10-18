@@ -1,21 +1,23 @@
 ---
+bornAs: xh8dzsw
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/x7llnqo-prevention-add-a-deterministic-filer-validation-that-flags-s.md"]
-dateOpened: "2026-10-17"
+scope: ["we:scripts/lib/dispatch-contracts.mjs", "we:scripts/lib/provider-routing.mjs", "we:scripts/lib/__tests__/dispatch-contracts.test.mjs", "we:scripts/lib/__tests__/provider-routing.test.mjs"]
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Add a filer or check-backlog validation that every scope path either exists on main or is marked… (from web-everything/web-everything#5561 review)
+# Prevention — Check roster membership generically in probationWorkerForRoute (or in decideDispatchRoute): rejec… (from web-everything/web-everything#5370 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/x7llnqo-prevention-add-a-deterministic-filer-validation-that-flags-s.md:6` — Add a filer or check-backlog validation that every `scope` path either exists on main or is marked as pending an unmerged PR.
 
-Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 2 → #5360, finding 3 → #5360, finding 4 → #x7llnqo.
+1. `we:scripts/lib/dispatch-contracts.mjs:1405` — Check roster membership generically in probationWorkerForRoute (or in decideDispatchRoute): reject any derived worker id that is not in PROBATION_ROSTER[taskType]. Add an invariant test over every roster task type and every catalogue model.
+2. `we:scripts/lib/provider-routing.mjs:70` — Add a lint or standards rule banning settings reads at module top level (cascade or readSettings calls outside functions). Add a test that flips settings between two routing calls and asserts the second call honours the change.
+3. `we:scripts/lib/dispatch-contracts.mjs:1405` — Put the enabled/model authorization check inside probationWorkerForRoute itself, so every hand-off shares one chokepoint. Add an invariant test that every route-to-worker path returns null or refuses when the worker's feature switch is off.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5561@a1b4e74e7fa0f29294dc4abe760a84a07a3a2e28
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5370@e0365f18a762ce3291abb01bd9e6f06e63ff13f1
 
 ## Acceptance
 

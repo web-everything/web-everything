@@ -1,4 +1,5 @@
 ---
+bornAs: xojxr2o
 kind: story
 size: 2
 status: open
@@ -11,10 +12,10 @@ tags: []
 
 Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5547 (reviewed head `093130d419ad0d7b8b8e1a05f07a860d141803ef`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:backlog/x28khww-the-verify-operation-prints-a-plain-pass-fail-verdict.md:12` — (failing-input, degraded) The top-priority marking has no effect on queue ordering.
+1. `we:backlog/6248-the-verify-operation-prints-a-plain-pass-fail-verdict.md:12` — (failing-input, degraded) The top-priority marking has no effect on queue ordering.
    - Scenario: Clear x28khww and an otherwise equivalent ordinary card dated 2026-10-16 for build, with priority enforcement enabled and no external priority override. Calling the actual orderQueueDetailed function places the ordinary card first; x28khww receives P3, reason 'normal', and no buildPriorityIndex. The new 'Priority: top' text exists only in prose, which buildQueuePriorityFacts never reads. The other top-priority markings use the same pattern. Record the operator priority through the supported structured priority mechanism so these cards receive the claimed ordering.
    - Claude's re-check: demonstrated break
-2. `we:backlog/xzukm4y-drain-pass-summary-counts-each-merged-pr-once.md:12` — (edge-case, degraded) Deduplicating by PR number collapses distinct PRs from different repositories.
+2. `we:backlog/6259-drain-pass-summary-counts-each-merged-pr-once.md:12` — (edge-case, degraded) Deduplicating by PR number collapses distinct PRs from different repositories.
    - Scenario: In one pass, record WE#42 twice and FrontierUI#42 once. The prescribed fix, 'count distinct PR numbers', produces 1; the correct merged count is 2. A read-only probe confirms these counts. This is a supported input: resolveRepos defaults to the constellation, and merged entries carry both repo and num. Require deduplication by canonical repository plus PR number, with a cross-repository collision test.
    - Claude's re-check: demonstrated break
 

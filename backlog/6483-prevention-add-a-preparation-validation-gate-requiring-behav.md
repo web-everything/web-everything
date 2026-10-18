@@ -1,21 +1,21 @@
 ---
+bornAs: xp7py6f
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5939-soak-replay-gate-diffs-against-the-current-main-tip-not-the.md"]
+scope: ["we:backlog/5958-every-github-call-carries-a-caller-name-40-are-unattributed.md"]
 dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Add a standards check that every [A#] Must-refuse clause in a backlog card is matched by a named… (from web-everything/web-everything#5410 review)
+# Prevention — Add a preparation validation gate requiring behavioral configuration defaults to map to named pla… (from web-everything/web-everything#5389 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/5939-soak-replay-gate-diffs-against-the-current-main-tip-not-the.md:58` — Add a standards check that every [A#] Must-refuse clause in a backlog card is matched by a named test case in the Test plan. Until then, use a review lens for it.
-2. `we:backlog/5939-soak-replay-gate-diffs-against-the-current-main-tip-not-the.md:49` — Add planned cases `refuses when live-body retrieval fails` and `refuses when diff execution fails` in we:scripts/lib/__tests__/soak-replay-gate-workflow.test.mjs, asserting nonzero shell exit and no clean verdict. Require an acceptance-to-named-test mapping when preparing behavioral guarantees.
+1. `we:backlog/5958-every-github-call-carries-a-caller-name-40-are-unattributed.md:66` — Add a preparation validation gate requiring behavioral configuration defaults to map to named planned cases and observable assertions, including absent, blank, and explicit zero inputs.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5410@af7c92af5d7f2c9cc8e3297b77ba3b84b80ba6a4
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5389@08418594778fb203d7ffa3c98ae87ff5025770f8
 
 ## Acceptance
 

@@ -1,20 +1,21 @@
 ---
+bornAs: xoxwy5k
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5958-every-github-call-carries-a-caller-name-40-are-unattributed.md"]
+scope: ["we:scripts/lib/gh-throttle.mjs", "we:scripts/lib/__tests__/gh-throttle.test.mjs"]
 dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Add a preparation validation gate requiring behavioral configuration defaults to map to named pla… (from web-everything/web-everything#5389 review)
+# Prevention — Add a deterministic cross-runner regression using invalid UTF-8 bytes, requiring raw-byte equalit… (from web-everything/web-everything#5290 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/5958-every-github-call-carries-a-caller-name-40-are-unattributed.md:66` — Add a preparation validation gate requiring behavioral configuration defaults to map to named planned cases and observable assertions, including absent, blank, and explicit zero inputs.
+1. `we:scripts/lib/gh-throttle.mjs:1809` — Add a deterministic cross-runner regression using invalid UTF-8 bytes, requiring raw-byte equality after an encoded synchronous cache fill; preserve raw bytes before caller-specific decoding.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5389@08418594778fb203d7ffa3c98ae87ff5025770f8
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5290@a576d7d35116c40f6ed217d24d459d441c64f2c3
 
 ## Acceptance
 
