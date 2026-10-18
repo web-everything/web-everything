@@ -8,7 +8,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { liveReferralState } from '../lib/referral-live-context.mjs';
-import { resolveRunsDir, tryReadRun } from '../operations/run-store.mjs';
+import { resolveRunsDir, REVIEW_RUN_ID_PREFIX, tryReadRun } from '../operations/run-store.mjs';
 import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
@@ -50,7 +50,10 @@ export function reviewRunEvidence(run) {
   const attempted = new Set((state?.records ?? [])
     .filter(r => r.repo === read.repo && r.pr === Number(read.pr) && r.head === head && r.attempted)
     .flatMap(r => r.referrals.map(f => f.key)));
+  // PR #5520 — a run started under a chosen `--run-id` says so in its record (`run-record.mjs#chosenRunIdRecord`).
+  // Inline, not a helper: the disk cache is keyed by this function's source.
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
+    ...(run.idChosen === true ? { custom: true } : {}),
     parked: verdict?.verdict === 'needs-human' && pending.length > 0,
     // A list of only reason tokens names no referral, so it was never "attempted" (not vacuously true).
     pending, attempted: findingKeys.length > 0 && findingKeys.every(key => attempted.has(key)),
@@ -60,55 +63,89 @@ export function reviewRunEvidence(run) {
   };
 }
 
+/** PR #5520 — the head a `review-pr` run reviewed, finished or not. {@link reviewRunEvidence} drops a run that never
+ *  finished `advise` (a publication effect that failed, a crash), but that run still reviewed this head: a carry
+ *  that may stand in only for a head nobody reviewed must see it. */
+export function reviewRunHead(run) {
+  if (run?.op !== 'review-pr') return null;
+  const read = run.findings?.read;
+  const head = read?.netBasis?.rev;
+  return sha(head) ? { id: run.id, repo: read.repo, pr: Number(read.pr), head,
+    ...(run.idChosen === true ? { custom: true } : {}) } : null;
+}
+
 // Cache only small projections, never full diffs/seat transcripts. A changed file is parsed again.
 const evidenceCache = new Map();
+const headCache = new Map();
 /** The on-disk projection beside the records (not `.json`, so no run-store listing reads it as a record). Live
  *  2026-10-10: 3,303 review-pr records (0.8 GB) were re-parsed by EVERY reconcile-pass process — minutes under host
  *  load, enough to time out the drain rebuild's reconcile/dispatch smoke checks. Keyed by the projection's own source,
  *  so a change to {@link reviewRunEvidence} never serves a stale projection. */
 export const REVIEW_EVIDENCE_CACHE_FILE = '.review-run-evidence.cache';
-const EVIDENCE_CODE = createHash('sha256').update(String(reviewRunEvidence)).digest('hex').slice(0, 16);
-function readEvidenceDiskCache(file) {
+export const REVIEW_HEAD_CACHE_FILE = '.review-run-heads.cache';
+const projectionCode = project => createHash('sha256').update(String(project)).digest('hex').slice(0, 16);
+function readEvidenceDiskCache(file, code) {
   try {
     const c = JSON.parse(readFileSync(file, 'utf8'));
-    return c?.v === 1 && c.code === EVIDENCE_CODE && c.entries && typeof c.entries === 'object' ? c.entries : {};
+    return c?.v === 1 && c.code === code && c.entries && typeof c.entries === 'object' ? c.entries : {};
   } catch { return {}; }
 }
-function writeEvidenceDiskCache(file, entries) {
+function writeEvidenceDiskCache(file, code, entries) {
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   try {
-    writeFileSync(tmp, JSON.stringify({ v: 1, code: EVIDENCE_CODE, entries }));
+    writeFileSync(tmp, JSON.stringify({ v: 1, code, entries }));
     renameSync(tmp, file);
   } catch { try { unlinkSync(tmp); } catch { /* best effort: the cache is only a speed-up */ } }
 }
 export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryReadRun, memo = evidenceCache, persist = true } = {}) {
+  return readRunProjections({ dir, readRun, memo, persist, project: reviewRunEvidence, cacheFile: REVIEW_EVIDENCE_CACHE_FILE });
+}
+export const REVIEW_RUN_STORE_MISSING = 'REVIEW_RUN_STORE_MISSING';
+/** Every `review-pr` run's reviewed head ({@link reviewRunHead}), including runs that never finished. A missing store
+ *  throws {@link REVIEW_RUN_STORE_MISSING}: it proves nothing about which heads were reviewed, so it is never `[]`. */
+export function readReviewRunHeads({ dir = resolveRunsDir(), readRun = tryReadRun, memo = headCache, persist = true } = {}) {
+  return readRunProjections({ dir, readRun, memo, persist, project: reviewRunHead, cacheFile: REVIEW_HEAD_CACHE_FILE,
+    missing: () => { throw Object.assign(new Error(`review run store missing: ${dir}`), { code: REVIEW_RUN_STORE_MISSING }); } });
+}
+
+/** PR #5520 operator send-back — the readers find review runs by name, so the name must be true: `writeRun` writes a
+ *  `review-pr` record only under a `review-pr-` id, and no other operation's ({@link REVIEW_RUN_ID_PREFIX}). Inside
+ *  that namespace a chosen `--run-id` is still possible: such a record carries `idChosen`, and an id not shaped as
+ *  `newRunId('review-pr')` mints it (a record written before `idChosen`) is not trusted either. Both are tagged
+ *  `custom`. A custom run still counts as a review of its head; it never counts as a clean one. */
+const MINTED_REVIEW_RUN_ID_RE = /^review-pr-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+export const isMintedReviewRunId = id => MINTED_REVIEW_RUN_ID_RE.test(String(id));
+
+function readRunProjections({ dir, readRun, memo, persist, project, cacheFile, missing = () => [] }) {
+  const code = projectionCode(project);
   let names;
-  try { names = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
-  const file = join(dir, REVIEW_EVIDENCE_CACHE_FILE);
+  try { names = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return missing(); throw e; }
+  const file = join(dir, cacheFile);
   let disk = null;
   let dirty = false;
   const kept = {};
-  const out = names.filter(n => n.startsWith('review-pr-') && n.endsWith('.json')).flatMap(name => {
+  const out = names.filter(n => n.startsWith(REVIEW_RUN_ID_PREFIX) && n.endsWith('.json')).flatMap(name => {
     const path = join(dir, name);
     const stat = statSync(path);
     const key = `${stat.mtimeMs}:${stat.size}`;
     let cached = memo.get(path);
     if (cached?.key !== key && persist) {
-      disk ??= readEvidenceDiskCache(file);
+      disk ??= readEvidenceDiskCache(file, code);
       const hit = disk[name];
       if (hit?.key === key) cached = { key, evidence: hit.evidence ?? null };
     }
     if (cached?.key !== key) {
-      cached = { key, evidence: reviewRunEvidence(readRun(name.slice(0, -5), dir)) };
+      cached = { key, evidence: project(readRun(name.slice(0, -5), dir)) };
       dirty = true;
     }
     memo.set(path, cached);
     kept[name] = cached;
-    return cached.evidence ? [cached.evidence] : [];
+    if (!cached.evidence) return [];
+    return [isMintedReviewRunId(name.slice(0, -5)) ? cached.evidence : { ...cached.evidence, custom: true }];
   });
   if (persist) {
-    disk ??= readEvidenceDiskCache(file);
-    if (dirty || Object.keys(disk).some(n => !kept[n])) writeEvidenceDiskCache(file, kept);
+    disk ??= readEvidenceDiskCache(file, code);
+    if (dirty || Object.keys(disk).some(n => !kept[n])) writeEvidenceDiskCache(file, code, kept);
   }
   return out;
 }
