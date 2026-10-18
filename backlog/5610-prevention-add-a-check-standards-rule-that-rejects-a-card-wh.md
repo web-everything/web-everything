@@ -44,4 +44,4 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Also raised by
 
-- Also raised by web-everything/web-everything#5554 (finding 2: `we:backlog/x9hf8a0-prevention-a-card-lint-requirement-that-a-card-widening-a-pe.md:24` — At preparation completion, deterministically reject unresolved Acceptance TODOs and require a repository-qualified test file, case name, and observable assertion for each guarantee. This guard is already described as backlog debt in #5360; the supplied diff does not establish an existing executable…)
+- Also raised by web-everything/web-everything#5554 (finding 2: `we:backlog/6279-prevention-a-card-lint-requirement-that-a-card-widening-a-pe.md:24` — At preparation completion, deterministically reject unresolved Acceptance TODOs and require a repository-qualified test file, case name, and observable assertion for each guarantee. This guard is already described as backlog debt in #5360; the supplied diff does not establish an existing executable…)
