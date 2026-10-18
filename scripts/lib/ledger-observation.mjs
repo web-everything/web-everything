@@ -1,7 +1,7 @@
 /** Open-head observations, shared by every writer. Missing evidence never grants a clearance. */
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { appendVerdict, buildVerdictRecord, foldVerdictLedger, labelVerdictOf,
+import { appendVerdict, buildVerdictRecord, foldVerdictLedger, labelVerdictOf, ledgerCarryAllowed,
   parseLedgerEvents, observedLedgerHead, verdictLedgerPath, resolveLedgerBoardDetail, resolveLedgerStoreChoice } from './verdict-ledger.mjs';
 import { readLedgerFromGit } from './verdict-ledger-io.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
@@ -66,8 +66,8 @@ export function planLedgerObservation({ repo, pr, headSha, state = 'OPEN', label
   }
   if (!settings.value.headMoveInvalidation || sameHead(oldHead, headSha)) return [];
   const current = foldVerdictLedger(mine).get(pr)?.current;
-  // Never carry a stale acceptance through an intervening unreviewed head or a hold.
-  const canCarry = current?.clears === true && sameHead(current.coverage?.headSha, oldHead);
+  // Never carry a stale acceptance through an intervening unreviewed head or a hold, or onto an already-judged head.
+  const canCarry = sameHead(current?.coverage?.headSha, oldHead) && ledgerCarryAllowed(mine, oldHead, headSha);
   const rule = canCarry ? proveCarry({ repo, fromSha: oldHead, toSha: headSha, human: current.verdict === 'clear-human' || current.state === 'clear-human' }) : null;
   return [buildVerdictRecord({ ...fields, source: 'head-observer', fromHead: oldHead,
     verdict: rule ? 'carried' : 'head-moved', carryRule: rule,

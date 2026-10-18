@@ -1594,8 +1594,10 @@ hold; an ordinary acceptance cannot. Decision: a human answer to a hand-added ho
 substantive (`head-moved`) push. The hold stands again until a fresh human answer at the new head; only an
 equivalent carry keeps the earlier answer. This fails closed. Delayed verdicts for a head the ledger never
 witnessed are also handled fail-closed: the fold takes the review's head as the witness, and the next observation
-invalidates it, so a re-review is owed instead of a stale acceptance standing for the live head. Both are pinned
-in `ledger-head-lifecycle.test.mjs`. Send-back checks bind to the full scoped history so they still know
+invalidates it, so a re-review is owed. A carry never lands on a head that already has a bearing verdict, so an
+equivalent move cannot carry the delayed acceptance over a newer verdict at the live head. Known residual of that
+class (ruled not-real): a send-back appended between the delayed row and the next observation binds to the
+delayed head. The fail-closed cases are pinned in `ledger-head-lifecycle.test.mjs`. Send-back checks bind to the full scoped history so they still know
 the head rejected even after movement pruning expires a verdict or exemption's authority. Binding a send-back
 uses the applied head witness at its append boundary, so delayed old-head clearances, stale/headless parks,
 and delayed transitions cannot release a new send-back immediately. `ledger-send-back-head.test.mjs` covers

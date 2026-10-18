@@ -104,6 +104,12 @@ describe('ledger head lifecycle red-team regressions', () => {
     const observed = [...events, ...plan(events, third)];
     expect(observed.at(-1)).toMatchObject({ verdict: 'head-moved', fromHead: middle });
     expect(derivePrState(observed, facts(third)).clears).toBe(false);
+    // An equivalent B→C move must not carry the delayed acceptance over the reviewer's changes(C).
+    const carriedOver = plan(events, third, () => 'tree-identical');
+    expect(carriedOver).toEqual([expect.objectContaining({ verdict: 'head-moved', fromHead: middle })]);
+    expect(derivePrState([...events, ...carriedOver], facts(third)).clears).toBe(false);
+    const forged = verdict('carried', third, { fromHead: middle, carryRule: 'tree-identical', source: 'head-observer' });
+    expect(ledgerObservationApplies(forged, events)).toBe(false);
   });
 
   it('a restamp cannot answer any kind of manual hold', () => {

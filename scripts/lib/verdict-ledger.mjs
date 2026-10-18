@@ -800,6 +800,15 @@ export function eventsSinceHeadMove(events, folded) {
   return events.filter((e, i) => i >= boundary || ![EVENT_TYPES.APPROVAL, EVENT_TYPES.REVIEW_EXEMPT, EVENT_TYPES.VERDICT].includes(e.type));
 }
 
+/** A carry may bring an acceptance only to a head no bearing verdict has judged yet. A destination that already has
+ *  one (for example a delayed review of an older head that rewound the witness) is re-reviewed, never carried over. */
+export function ledgerCarryAllowed(events, fromHead, toHead) {
+  const current = foldVerdictLedger(events).get(events.at(-1)?.pr)?.current;
+  return current?.clears === true && sameHead(current.coverage?.headSha, fromHead)
+    && !events.some(e => (e.type === undefined || e.type === EVENT_TYPES.VERDICT) && verdictBears(e.verdict)
+      && sameHead(e.coverage?.headSha, toHead));
+}
+
 /** Lifecycle observations are conditional at the locked/transport tip, never against a stale snapshot. */
 export function ledgerObservationApplies(row, existing) {
   const mine = existing.filter(e => e.repo.toLowerCase() === row.repo.toLowerCase() && e.pr === row.pr);
@@ -807,10 +816,7 @@ export function ledgerObservationApplies(row, existing) {
   if (['head-moved', 'carried'].includes(row.verdict)) {
     const head = observedLedgerHead(mine);
     if (!sameHead(head, row.fromHead) || sameHead(head, row.coverage?.headSha)) return false;
-    if (row.verdict === 'carried') {
-      const current = foldVerdictLedger(mine).get(row.pr)?.current;
-      return current?.clears === true && sameHead(current.coverage?.headSha, row.fromHead);
-    }
+    if (row.verdict === 'carried') return ledgerCarryAllowed(mine, row.fromHead, row.coverage?.headSha);
     return true;
   }
   return true;
