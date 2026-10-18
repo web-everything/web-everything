@@ -2400,6 +2400,29 @@ describe('CI-heal reset refund through the tick evidence path (#5968)', () => {
 
 describe('card 80 — prepare just in time', () => {
   const held = (num, reason) => ({ num, reason });
+  it.each([
+    [2, ['5919', '5745']],
+    [3, ['5919', '5745', '4327']],
+    [4, ['5919', '5745', '4327', '4322']],
+  ])('selects stale priority cards before non-priority fresh prepares with %i slots', (slots, expected) => {
+    const queue = [
+      { num: '4327' }, { num: '5745', buildPriority: 1 },
+      { num: '4322' }, { num: '5919', buildPriority: 0 },
+    ];
+    const r = planTick({
+      state: { queue, lanes: [], prs: [] },
+      plan: { launch: [], held: queue.map(({ num, buildPriority }) => ({
+        num, reason: Number.isFinite(buildPriority) ? 'prepare-stale' : 'needs-prepare',
+        ...(Number.isFinite(buildPriority) ? { detail: 'scope changed: scripts/merge-ai-prs.mjs, scripts/check-standards-rules.mjs' } : {}),
+      })) },
+      freeLanes: [7, 8, 9, 10],
+      // Re-prepares have prior attempts; fresh cards must not jump ahead of them.
+      bookkeeping: { tick: 1, itemPrepareAttempts: { 5919: 2, 5745: 1 } },
+      config: { maxConcurrentLanes: 10, maxConcurrentItemPrepares: slots, prepareAheadWindow: 4, prepareItemRetryCap: 3 },
+    });
+    expect(r.decisions.spawnPrepareItems.map(s => s.num)).toEqual(expected);
+  });
+
   const tick = (config, extraHeld = []) => planTick({
     state: { queue: [{ num: '1' }, { num: '2' }, { num: '3' }, { num: '4' }, { num: '5', tier: 'pinned' }], lanes: [], prs: [] },
     plan: { launch: [], held: [held('1', 'overlaps lane-19'), held('2', 'needs-prepare'), held('3', 'needs-prepare'), held('4', 'prepare-stale'), held('5', 'needs-prepare'), ...extraHeld] },
@@ -2407,12 +2430,12 @@ describe('card 80 — prepare just in time', () => {
     config: { maxConcurrentLanes: 10, maxConcurrentItemPrepares: 5, ...config },
   });
 
-  it('only prepares cards within the next N to build, pinned first; the rest wait with a note', () => {
+  it('only prepares cards within the next N in ready-queue order; the rest wait with a note', () => {
     const r = tick({ prepareAheadWindow: 3 });
-    // build order: pinned #5, then #1 (overlap, already prepared), #2 → window {5, 1, 2}
-    expect(r.decisions.spawnPrepareItems.map((s) => s.num)).toEqual(['2', '5']);
+    // Queue order: #1 (overlap, already prepared), #2, #3 → window {1, 2, 3}
+    expect(r.decisions.spawnPrepareItems.map((s) => s.num)).toEqual(['2', '3']);
     const waits = r.decisions.notes.filter((n) => n.kind === 'prepare-ahead-window').map((n) => n.num);
-    expect(waits).toEqual(['3', '4']);
+    expect(waits).toEqual(['4', '5']);
   });
 
   it('builder-starved: a card the caller holds never takes a prepare-ahead window slot', () => {
