@@ -55,10 +55,15 @@ import { performance } from 'node:perf_hooks';
 import { setTimeout as sleepAsync } from 'node:timers/promises';
 import { homedir, tmpdir } from 'node:os';
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
+  closeSync, constants, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, rmSync,
 } from 'node:fs';
 import { readHeadSha, isSafeBranchName } from './daemon-self-sync.mjs';
 import { gitRun } from './main-staleness.mjs';
+import { cascadePolicy } from './policy-cascade.mjs';
+import {
+  pickSmokeDiagnostics, smokeDiagnosticsDir, smokeErrorClass, smokeExitCode, smokeSignal, strictEnvInteger, writeStderrTail,
+} from './daemon-boot-smoke.mjs';
+import { redactDetail } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
 import { readRoutingPolicy, resolvePolicyModel } from './dispatch-routing-policy-io.mjs';
 import { repairCloneRefs } from './lane-repair.mjs';
 import { addOverlay, removeOverlay, appendOverlayEvent } from './daemon-overlays.mjs';
@@ -201,11 +206,17 @@ function readSettingsFile() {
 
 /**
  * The overlay-safety settings: built-in defaults, then `overlaySafety` in daemon-rebuild-settings.json, then env.
- * An invalid value falls back to the default (never to "off").
+ * An invalid safety value falls back to the default (never to "off"). Launch retries use the overlaySmoke policy cascade.
  * @returns {{dispatchSmoke:'on'|'off', dispatchPaths:string[], noPr:'warn'|'refuse', smokeTimeoutMs:number, smokeKind:'ci-heal'|'fix'}}
  */
 export function overlaySafetySettings(env = process.env, { readSettings = readSettingsFile } = {}) {
-  const file = (readSettings() || {}).overlaySafety || {};
+  const declared = readSettings() || {};
+  const file = declared.overlaySafety || {};
+  const retries = cascadePolicy('overlaySmoke', declared.overlaySmoke, {
+    standard: { dispatchLaunchRetries: 1 }, env,
+    envValues: { dispatchLaunchRetries: strictEnvInteger(env.WE_OVERLAY_DISPATCH_LAUNCH_RETRIES) },
+    valid: { dispatchLaunchRetries: (v) => Number.isInteger(v) && v >= 0 && v <= 1 },
+  });
   const pick = (envVal, fileVal, allowed, dflt) => {
     for (const v of [envVal, fileVal]) {
       const t = typeof v === 'string' ? v.trim() : v;
@@ -218,6 +229,8 @@ export function overlaySafetySettings(env = process.env, { readSettings = readSe
   const filePaths = Array.isArray(file.dispatchPaths) && file.dispatchPaths.every((x) => typeof x === 'string') ? file.dispatchPaths : null;
   const timeout = Number(env?.WE_OVERLAY_DISPATCH_SMOKE_TIMEOUT_MS ?? file.smokeTimeoutMs);
   return {
+    dispatchLaunchRetries: retries.value.dispatchLaunchRetries,
+    dispatchLaunchRetriesSource: retries.sources.dispatchLaunchRetries,
     dispatchSmoke: pick(env?.WE_OVERLAY_DISPATCH_SMOKE, file.dispatchSmoke, ['on', 'off'], 'on'),
     dispatchPaths: envPaths || filePaths || [...DISPATCH_PATH_DEFAULTS],
     noPr: pick(env?.WE_OVERLAY_NO_PR, file.noPr, ['warn', 'refuse'], 'warn'),
@@ -300,7 +313,11 @@ export function judgeDispatchSmoke({ nonce, marker, record, denials = [], timedO
   const blocker = record?.result?.blocker ?? null;
   const blockerKind = typeof blocker === 'string' ? blocker : blocker?.kind;
   if (denials.length || (blockerKind && PERMISSION_BLOCKER.test(String(blockerKind))) || record?.denied) {
-    return { ok: false, reason: 'commands-denied', detail: denials[0] || blockerKind || String(record?.denied) };
+    // A count or a kind token, never the denial text: the transcript stays a local file the result names.
+    const detail = denials.length ? `${denials.length} denied tool call(s) in the transcript`
+      : blockerKind ? `blocker=${/^[A-Za-z0-9_.:-]{1,64}$/.test(String(blockerKind)) ? blockerKind : 'unrecognised'}`
+        : 'the completion record is marked denied';
+    return { ok: false, reason: 'commands-denied', detail };
   }
   if (record?.status === 'done') {
     return marker === nonce ? { ok: true, reason: 'passed' } : { ok: false, reason: 'no-commands-ran', detail: 'the worker finished without running its smoke commands' };
@@ -321,7 +338,7 @@ function transcriptDenials(file) {
     for (const item of Array.isArray(row?.message?.content) ? row.message.content : []) {
       if (item?.type !== 'tool_result' || !item.is_error) continue;
       const body = typeof item.content === 'string' ? item.content : JSON.stringify(item.content ?? '');
-      if (/requires approval|permission/i.test(body)) out.push(body.slice(0, 200));
+      if (/requires approval|permission/i.test(body)) out.push(body);
     }
   }
   return out;
@@ -338,6 +355,39 @@ function findTranscript(ids, home = homedir()) {
     if (hit) return join(dir, p, hit);
   }
   return null;
+}
+
+/** The last `bytes` of a file as text ('' when unreadable); a partial first line is dropped when the read starts mid-file.
+ *  One read of at most `bytes`, positioned at the final window (`read` is injectable so a test can pin that range). */
+const LINE_BREAK = new RegExp(`[\\n\\r${String.fromCharCode(0x85, 0x2028, 0x2029)}]`);
+export function readFileTail(file, bytes = 64 * 1024, read = readSync) {
+  let fd;
+  try {
+    // O_NONBLOCK + O_NOFOLLOW: a FIFO or symlink left at the path must not block or redirect this synchronous read.
+    fd = openSync(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return '';
+    const size = stat.size;
+    const start = Math.max(0, size - bytes);
+    const buf = Buffer.alloc(size - start);
+    const n = read(fd, buf, 0, buf.length, start);
+    const text = buf.subarray(0, n).toString('utf8');
+    if (start === 0) return text;
+    // A mid-file read starts inside a line: drop it up to the first break of any kind; a window with no break at all
+    // is one partial line and is dropped too.
+    const br = text.search(LINE_BREAK);
+    return br >= 0 ? text.slice(br + 1) : '';
+  } catch {
+    return '';
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/** A failed attempt's `detail`: a fixed verdict phrase plus the allow-listed diagnostics — never child text. */
+function dispatchSummary(what, diagnostics) {
+  const picked = pickSmokeDiagnostics(diagnostics) ?? {};
+  return `${what}; ${Object.entries(picked).filter(([, v]) => v !== null).map(([k, v]) => `${k}=${v}`).join(', ')}`;
 }
 
 function readJson(file) {
@@ -374,11 +424,13 @@ export function dispatchSmokePrompt({ tree, store, marker, nonce, slug, kind, pr
  * {@link judgeDispatchSmoke}). Its completion record and spec go to a scratch store, never the real one.
  * @returns {Promise<{ok:boolean, reason:string, detail?:string, sessionId:string, handle?:string|null, wrapperPid?:number|null, scratch:string, transcript?:string|null, ms:number}>}
  */
-export async function runRealDispatchSmoke({
+async function runRealDispatchSmokeAttempt({
   tree, env = process.env, settings = overlaySafetySettings(env), spawn = spawnSync, pollMs = 2_000, home = homedir(), log = console,
-  routingPolicy = readRoutingPolicy(),
+  routingPolicy = readRoutingPolicy(), probeAlive = isAlive, stopWrapper = (pid) => process.kill(pid, 'SIGTERM'),
+  diagnosticsDir = smokeDiagnosticsDir(env),
 }) {
   const t0 = Date.now();
+  const launchStartedAt = new Date(t0).toISOString();
   const scratch = mkdtempSync(join(tmpdir(), 'we-overlay-dispatch-smoke-'));
   const store = join(scratch, 'completions');
   mkdirSync(store, { recursive: true });
@@ -393,11 +445,17 @@ export async function runRealDispatchSmoke({
   const base = { sessionId, scratch };
   const model = resolvePolicyModel('claude', routingPolicy.aliases.claude.haiku ? 'haiku' : 'sonnet', routingPolicy);
   log.error?.(`daemon-load-overlay: dispatch smoke — launching one real ${kind} worker model=${model} (source routing-policy cheapest Claude alias) from ${tree} (scratch store ${store})`);
-  const launch = spawn(process.execPath, [LAUNCH_HARNESS_FILE, tree, slug, kind, pr, sessionId, prompt, model], {
+  const launch = spawn(process.execPath, [LAUNCH_HARNESS_FILE, tree, slug, kind, pr, sessionId, prompt, model, scratch, String(t0)], {
     cwd: tree, env: childEnv, encoding: 'utf8', timeout: 120_000, killSignal: 'SIGKILL',
   });
   if (launch.status !== 0) {
-    return { ...base, ok: false, reason: 'launch-failed', detail: String(launch.stderr || launch.error?.message || '').trim().split('\n').slice(-3).join(' | '), ms: Date.now() - t0 };
+    const stderr = String(launch.stderr || launch.error?.message || '');
+    const diagnostics = {
+      launchStartedAt, signal: smokeSignal(launch.signal), exitCode: smokeExitCode(launch.status),
+      errorClass: smokeErrorClass(stderr) ?? smokeErrorClass(String(launch.error ?? '')),
+      stderrFile: writeStderrTail(stderr, { dir: diagnosticsDir, label: `dispatch-${sessionId}-launch` }),
+    };
+    return { ...base, ok: false, reason: 'launch-failed', detail: dispatchSummary('the launch harness failed', diagnostics), diagnostics, ms: Date.now() - t0 };
   }
   let launched = {};
   try { launched = JSON.parse(String(launch.stdout).trim().split('\n').pop()); } catch { /* keep {} */ }
@@ -407,11 +465,26 @@ export async function runRealDispatchSmoke({
   const deadline = t0 + settings.smokeTimeoutMs;
   let verdict;
   let transcript = null;
+  let session = null;
+  let markerAppeared = false;
+  let recordAppeared = false;
   const observe = (timedOut) => {
     transcript = transcript || findTranscript(ids, home);
+    const sessionDir = join(home, '.claude', 'sessions');
+    try {
+      session ||= readdirSync(sessionDir).map((n) => join(sessionDir, n)).find((f) => ids.filter(Boolean).includes(readJson(f)?.sessionId)) || null;
+    } catch { /* no session file yet */ }
+    const jobsDir = join(home, '.claude', 'jobs');
+    try {
+      session ||= readdirSync(jobsDir).map((n) => join(jobsDir, n, 'state.json')).find((f) => ids.filter(Boolean).includes(readJson(f)?.sessionId)) || null;
+    } catch { /* no background job file yet */ }
+    markerAppeared ||= existsSync(marker);
+    const record = readJson(join(store, `${slug}.json`));
+    // The wrapper writes its own `started` record when it spawns the child; only a later record shows the task ran.
+    recordAppeared ||= !!record && record.status !== 'started';
     const markerText = existsSync(marker) ? readFileSync(marker, 'utf8').trim() : null;
     return judgeDispatchSmoke({
-      nonce, marker: markerText, record: readJson(join(store, `${slug}.json`)), denials: transcript ? transcriptDenials(transcript) : [], timedOut,
+      nonce, marker: markerText, record, denials: transcript ? transcriptDenials(transcript) : [], timedOut,
     });
   };
   for (;;) {
@@ -422,16 +495,54 @@ export async function runRealDispatchSmoke({
   // A wrapped worker writes its own final record when `claude -p` exits — wait for it (bounded) and judge that too.
   if (verdict.ok && wrapperPid) {
     const until = Math.min(deadline, Date.now() + 90_000);
-    while (isAlive(wrapperPid) && Date.now() < until) await sleep(pollMs);
+    while (probeAlive(wrapperPid) && Date.now() < until) await sleep(pollMs);
     verdict = observe(false);
     if (verdict.pending) verdict = { ok: true, reason: 'passed' };
   }
-  if (!verdict.ok && verdict.reason === 'timeout' && isAlive(wrapperPid)) {
-    try { process.kill(wrapperPid, 'SIGTERM'); } catch { /* already gone */ }
+  const wrapperAliveAtTimeout = verdict.reason === 'timeout' ? probeAlive(wrapperPid) : null;
+  if (!verdict.ok && verdict.reason === 'timeout' && wrapperAliveAtTimeout) {
+    try { stopWrapper(wrapperPid); } catch { /* already gone */ }
   }
-  return {
-    ...base, ...verdict, handle, wrapperPid, transcript, ms: Date.now() - t0,
+  // The wrapper's raw stderr capture lives only for the attempt: a failure keeps its last 30 lines in the 0600 file
+  // under the daemon state dir, and the capture itself is removed either way.
+  const captured = join(scratch, 'wrapper.stderr');
+  const stderr = verdict.ok ? '' : readFileTail(captured);
+  try { rmSync(captured, { force: true }); } catch { /* best effort */ }
+  const diagnostics = {
+    wrapperPid, wrapperAliveAtTimeout, launchStartedAt, signal: null, exitCode: null,
+    sessionAppeared: !!session, transcriptAppeared: !!transcript,
+    firstOutputMs: readJson(join(scratch, 'first-output.json'))?.ms ?? null,
+    errorClass: smokeErrorClass(stderr),
+    stderrFile: writeStderrTail(stderr, { dir: diagnosticsDir, label: `dispatch-${sessionId}` }),
   };
+  const launchTimeout = verdict.reason === 'timeout' && !markerAppeared && !recordAppeared && !session && !transcript;
+  if (!verdict.ok) verdict.detail = dispatchSummary(verdict.detail || verdict.reason, diagnostics);
+  return {
+    ...base, ...verdict, handle, wrapperPid, transcript, diagnostics, launchTimeout, ms: Date.now() - t0,
+  };
+}
+
+/** Retry only a launch timeout with no evidence that the worker started its task. Each attempt has its own store and session. */
+export async function runRealDispatchSmoke(args) {
+  const settings = args.settings ?? overlaySafetySettings(args.env ?? process.env);
+  const retries = settings.dispatchLaunchRetries === 0 ? 0 : 1;
+  const log = args.log ?? console;
+  log.error?.(`daemon-load-overlay: overlaySmoke.dispatchLaunchRetries=${retries} (source ${settings.dispatchLaunchRetriesSource ?? 'standard'})`);
+  const attempts = [];
+  for (let attempt = 0; ; attempt++) {
+    const result = await runRealDispatchSmokeAttempt({ ...args, settings });
+    attempts.push(result);
+    if (!result.launchTimeout || attempt >= retries) {
+      if (attempt > 0) {
+        result.note = 'retried after launch timeout';
+        // The note first: the summary ends with its error class (child text), which must not pose as a later field.
+        result.detail = `${result.note}; attempts=${attempts.map((r) => r.reason).join(',')}; ${result.detail ?? result.reason}`;
+        log.error?.(`daemon-load-overlay: dispatch smoke ${result.reason} — ${result.note}`);
+      }
+      return { ...result, attempts: attempts.map((r) => ({ reason: r.reason, diagnostics: pickSmokeDiagnostics(r.diagnostics) })), ms: attempts.reduce((n, r) => n + r.ms, 0) };
+    }
+    log.error?.(`daemon-load-overlay: retrying dispatch smoke after launch timeout — ${result.detail}`);
+  }
 }
 
 /**
@@ -447,9 +558,12 @@ async function runDispatchSmokeSafely(dispatchSmoke, args) {
   try {
     const r = await dispatchSmoke(args);
     // Anything that is not a verdict object is a failed smoke: `.ok` / `.reason` are read unguarded downstream.
-    return r && typeof r === 'object' && typeof r.ok === 'boolean' ? r : { ok: false, reason: 'smoke-bad-result' };
+    if (!(r && typeof r === 'object' && typeof r.ok === 'boolean')) return { ok: false, reason: 'smoke-bad-result' };
+    // Every rollback, event-log and thrown-error sink reads `detail` (allow-listed at the source); bound it once, here.
+    return r.detail === undefined ? r : { ...r, detail: redactDetail(r.detail, 'dispatch-smoke') };
   } catch (e) {
-    return { ok: false, reason: 'smoke-threw', detail: String((e && e.message) || e).split('\n')[0] };
+    // The daemon's own exception (a spawn error), not child output: its first line, bounded.
+    return { ok: false, reason: 'smoke-threw', detail: redactDetail(String((e && e.message) || e).split('\n')[0]) };
   }
 }
 
@@ -561,7 +675,7 @@ export async function runDaemonLoadOverlay({
 
   // ROLLBACK — remove ONLY this overlay, then recover through `rebuildWithout`: main + every other overlay, unchanged.
   const rollBack = async (out, ctl, rebuildWithout) => {
-    const why = `dispatch-smoke-failed: ${ctl.result.reason}${ctl.result.detail ? ` — ${ctl.result.detail}` : ''}`;
+    const why = redactDetail(`dispatch-smoke-failed: ${ctl.result.reason}${ctl.result.detail ? ` — ${ctl.result.detail}` : ''}`, 'dispatch-smoke');
     log.error?.(`daemon-load-overlay: ${ref} FAILED the dispatch smoke (${ctl.phase}): ${why}. Removing it and recovering without it (other overlays untouched). Evidence: ${ctl.result.scratch ?? 'n/a'}${ctl.result.transcript ? `, transcript ${ctl.result.transcript}` : ''}`);
     try { removeOverlayFn(root, ref, { env, why }); } catch (e) {
       // The list could not be changed (e.g. its lock timed out): rebuilding now would just load the overlay again, and
