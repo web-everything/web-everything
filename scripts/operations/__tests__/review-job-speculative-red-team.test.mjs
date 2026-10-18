@@ -94,12 +94,13 @@ describe('runReviewJob under review.speculativeRedTeam', () => {
     const events = [];
     const { io } = jobIo({ setting: { enabled }, over: {
       redTeamStatus: row => events.push(row),
-      finishSpeculativeRedTeam: () => { expect(events.at(-1)?.status).toBe('running'); return { status: 'ran' }; },
-      runRedTeam: () => { expect(events.at(-1)?.status).toBe('running'); return { status: 'ran' }; },
+      finishSpeculativeRedTeam: () => { expect(events.at(-1)?.status).toBe('running'); return { status: 'ran', comment: { status: 'posted' } }; },
+      runRedTeam: () => { expect(events.at(-1)?.status).toBe('running'); return { status: 'ran', comment: { status: 'posted' } }; },
     } });
     runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
     expect(events.map(row => row.status)).toEqual(['running', 'finished']);
     expect(events[0]).toMatchObject({ repo: REPO, pr: 10, loopPayload: { findings: { read: { netBasis: { rev: REV } } } } });
+    expect(events[1]).toMatchObject({ repo: REPO, pr: 10, result: { status: 'ran', comment: 'posted' } });
   });
   it('starts the red team BEFORE the loop, hands the loop the read sink, and logs the layer that set the setting', () => {
     const { io, calls } = jobIo();

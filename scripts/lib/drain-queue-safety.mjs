@@ -99,6 +99,7 @@ export function redTeamEnqueueHold({ loopPayload, comments, repo, pr, head, env 
   if (result && planRedTeamActions(result, confirmedBreaks ?? readConfirmedBreaks({ env }).value).sendBack.length
     && !operatorRuled(records, pr, live, result))
     return 'post-accept red team confirmed a break requiring send-back';
+  if (result?.recheckIncomplete) return 'post-accept red team pending: saved red-team re-check incomplete';
   if (!postAcceptRedTeamOwed(loopPayload, env) || result) return null;
   return 'post-accept red team has no recorded result on the live head';
 }

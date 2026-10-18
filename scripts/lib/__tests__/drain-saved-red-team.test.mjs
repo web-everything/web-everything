@@ -38,12 +38,21 @@ describe('saved red-team admission', () => {
   it.each(['pending', 'error', undefined])('incomplete saved re-check refuses admission: %s', recheckStatus => {
     for (const findings of [[], [{ confirmedByRecheck: false, summary: 'unverified' }]]) {
       const { env } = fixture([row({ recheckStatus, findings })]);
-      expect(() => hold(env)).toThrow('saved red-team re-check incomplete');
+      expect(hold(env)).toMatch(/saved red-team re-check incomplete/);
     }
   });
   it('incomplete saved re-check with a confirmed break still refuses admission', () => {
     const findings = [{ confirmedByRecheck: true, impactIfUnfixed: 'broken' }, { confirmedByRecheck: false }];
     expect(hold(fixture([row({ recheckStatus: 'pending', findings, confirmedMissCount: 1 })]).env)).toMatch(/requiring send-back/);
+  });
+  it.each(['pending', 'error', undefined])('incomplete saved re-check holds every confirmed impact class: %s', recheckStatus => {
+    for (const impactIfUnfixed of ['broken', 'degraded', 'unconfirmed', undefined]) {
+      const findings = [{ confirmedByRecheck: true, impactIfUnfixed }, { confirmedByRecheck: false }];
+      const { env } = fixture([row({ recheckStatus, findings, confirmedMissCount: 1 })]);
+      expect(hold(env)).toMatch(/requiring send-back|saved red-team re-check incomplete/);
+      expect(hold(env, { confirmedBreaks: { broken: 'card', degraded: 'card', unconfirmed: 'advisory' } }))
+        .toMatch(/saved red-team re-check incomplete/);
+    }
   });
   it.each([{ rev: 'b'.repeat(40) }, { repo: 'other/repo' }, { pr: 999 }, { status: 'error' }, { seat: 'skeptic' }])(
     'ignores another identity or incomplete run: %j', over => {
@@ -175,8 +184,9 @@ describe('redTeam.drainReadsSavedResult cascade', () => {
   it('resolves platform, tool, environment and rejects invalid values', async () => {
     const { readSavedRedTeamSetting } = await import('../drain-saved-red-team.mjs');
     const read = over => readSavedRedTeamSetting({ env: {}, tool: {}, platform: {}, ...over });
-    expect(read({ platform: { drainReadsSavedResult: false } }).sources.drainReadsSavedResult).toBe('platform');
-    expect(read({ platform: { drainReadsSavedResult: false }, tool: { drainReadsSavedResult: true } }).sources.drainReadsSavedResult).toBe('tool');
+    expect(read({ platform: { drainReadsSavedResult: false } })).toMatchObject({ value: { drainReadsSavedResult: false }, sources: { drainReadsSavedResult: 'platform' } });
+    expect(read({ platform: { drainReadsSavedResult: true }, tool: { drainReadsSavedResult: false } })).toMatchObject({ value: { drainReadsSavedResult: false }, sources: { drainReadsSavedResult: 'tool' } });
+    expect(read({ platform: { drainReadsSavedResult: false }, tool: { drainReadsSavedResult: true } })).toMatchObject({ value: { drainReadsSavedResult: true }, sources: { drainReadsSavedResult: 'tool' } });
     const r = read({ tool: { drainReadsSavedResult: true }, env: { WE_RED_TEAM_DRAIN_READS_SAVED_RESULT: 'off' } });
     expect(r.value.drainReadsSavedResult).toBe(false); expect(r.sources.drainReadsSavedResult).toBe('env');
     expect(read({ tool: { drainReadsSavedResult: 'false' } }).value.drainReadsSavedResult).toBe(true);

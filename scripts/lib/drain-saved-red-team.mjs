@@ -38,9 +38,9 @@ export function readSavedRedTeamResult({ repo, pr, head, env = process.env } = {
   if (!Array.isArray(row.findings) || row.findings.some(f => !f || typeof f.confirmedByRecheck !== 'boolean')
     || (row.confirmedMissCount !== undefined && row.confirmedMissCount !== row.findings.filter(f => f.confirmedByRecheck).length))
     throw new Error('saved red-team findings incomplete');
-  if (!['ok', 'not-needed'].includes(row.recheckStatus) && !row.findings.some(f => f.confirmedByRecheck))
-    throw new Error('saved red-team re-check incomplete');
-  return { pr: Number(pr), rev: head, scoredAt: row.scoredAt, findings: row.findings.map((f, i) => ({
+  // Confirmed findings can still route through the gate, but do not prove the rest of the re-check finished.
+  return { pr: Number(pr), rev: head, scoredAt: row.scoredAt,
+    recheckIncomplete: !['ok', 'not-needed'].includes(row.recheckStatus), findings: row.findings.map((f, i) => ({
     index: i + 1, confirmed: f.confirmedByRecheck, impact: f.impactIfUnfixed ?? null,
     category: f.category ?? null, file: f.file ?? null, line: f.line ?? null,
     summary: f.summary ?? '', scenario: f.failure_scenario ?? null, recheck: f.recheckReason ?? null,

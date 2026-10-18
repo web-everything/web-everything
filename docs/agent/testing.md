@@ -55,6 +55,15 @@ withholds all finding text and file scope, retaining verdict, break count and ro
 Regression coverage: **publishes saved findings that pass the posted-comment secret scrub to
 comments and cards**, **withholds all saved finding text when the secret scrub refuses**,
 and **incomplete saved re-check refuses admission** (pending, error or missing status).
+An incomplete saved re-check is a persisted `red-team-pending` hold, including when its
+confirmed findings only route to cards or advisories. It emits the pending-age health smell
+at the configured deadline and cannot use the never-scheduled fallback. To release it, retry
+the re-check for the same head to completion or publish a usable trusted result on that head;
+a new head requires its own evidence. Confirmed send-back findings still route through the gate.
+The merge-strategy integration tests cover saved clean admission without comments and recovery
+from incomplete evidence. The review-job tests assert that finished status events retain the
+full posted-result summary in both sequential and speculative modes. When threading a new
+argument into an existing call, add an integration test through the caller that depends on it.
 Regression coverage: **includes rename sources before deciding to skip probes**, covering both
 sequential and speculative paths. The speculative fingerprint also includes rename sources.
 Replay derives rename/copy sources from diff headers using the review reader's existing parser;

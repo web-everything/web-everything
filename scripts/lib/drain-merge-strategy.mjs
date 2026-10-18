@@ -340,7 +340,8 @@ export function createDrainMergeStrategy({
           writeState(statePath, before);
           const outcome = pendingOutcome(c, wait);
           // Never waive a recorded break or an active/recorded run. Only the scheduling gap has this escape.
-          if (!outcome.healthSmell || evidence.inFlight || evidence.recorded || reason.includes('requiring send-back')) return outcome;
+          if (!outcome.healthSmell || evidence.inFlight || evidence.recorded || reason.includes('requiring send-back')
+            || reason.includes('saved red-team re-check incomplete')) return outcome;
           let requested = false;
           if (wait.requestedAt != null && now() - wait.requestedAt < (safety.value.redTeamPendingMaxMin ?? 45) * 60_000) return outcome;
           if (wait.requestedAt == null && typeof requestRedTeam === 'function') {
