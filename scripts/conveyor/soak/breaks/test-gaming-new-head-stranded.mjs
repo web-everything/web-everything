@@ -17,6 +17,8 @@ export default {
     const root = sourceRoot ?? process.env.SOAK_TREE_ROOT ?? resolve(fileURLToPath(import.meta.url), '../../../../..');
     const { sweepTestGamingRoutes } = await import(pathToFileURL(join(root, 'scripts/conveyor/test-gaming-route.mjs')).href);
     const { runReviewTick } = await import(pathToFileURL(join(root, 'skills-src/conveyor/review-daemon.mjs')).href);
+    const { defaultReadPrs } = await import(pathToFileURL(join(root, 'scripts/conveyor/reconcile-pass.mjs')).href);
+    const { sweepAdvisoryLabels } = await import(pathToFileURL(join(root, 'scripts/conveyor/advisory-label-sweep.mjs')).href);
     const { planReconcile } = await import(pathToFileURL(join(root, 'scripts/conveyor/reconcile-core.mjs')).href);
     const { buildFixEndComment } = await import(pathToFileURL(join(root, 'scripts/conveyor/fix-procedure.mjs')).href);
     const { buildAdvisoryFixComment } = await import(pathToFileURL(join(root, 'scripts/conveyor/advisory-fix-mark.mjs')).href);
@@ -89,6 +91,34 @@ export default {
       pr.comments.push(bot(buildAdvisoryFixComment({})));
       tick();
       if (!pr.comments.at(-1).body.includes(`<!-- test-gaming-route: ${old} -->`)) violations.push('test-removal route did not resume after prior repair');
+    }
+    // Production discovery projects only the fields in its actual gh query.
+    for (const label of ['review:pending', 'review:human']) {
+      Object.assign(pr, structuredClone(initial));
+      pr.labels = [{ name: label }];
+      const prs = defaultReadPrs({ repo, exec: (_file, args) => JSON.stringify([
+        Object.fromEntries(args[args.indexOf('--json') + 1].split(',').map(field => [field, pr[field]])),
+      ]), readCommits: () => [], readComments: () => [] });
+      route({ repo, prs });
+      if (!pr.labels.some(l => l.name === 'advisory:changes')) violations.push(`production discovery stranded ${label}`);
+    }
+
+    // The label sweep must not undo a justification handed to the operator.
+    for (const pushed of [false, true]) {
+      Object.assign(pr, structuredClone(initial));
+      verdict.head_sha = old;
+      route({ repo, prs: [pr] });
+      if (pushed) pr.headRefOid = verdict.head_sha = head;
+      pr.comments.push(bot(buildFixEndComment({ who: 'fix-5537', headSha: pr.headRefOid })
+        + '\n\ntest-removal-justified: obsolete behaviour removed'));
+      for (let retry = 0; retry < 2; retry++) {
+        route({ repo, prs: [pr] });
+        sweepAdvisoryLabels({ repo, listPrs: () => [structuredClone(pr)], readPr: () => structuredClone(pr), provider });
+        if (pr.labels.some(l => l.name.startsWith('advisory:'))) violations.push('advisory sweep reopened a justified removal');
+        const plan = planReconcile({ repo: 'we', prs: [pr], now: Date.parse(fx.observedAt),
+          requiredChecks: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'], advisoryReviewOnHumanHandoff: 'on' });
+        if (plan.dispatch.some(d => d.kind === 'fix')) violations.push('justified removal offered another fixer after label sweep');
+      }
     }
     return { violations };
   },

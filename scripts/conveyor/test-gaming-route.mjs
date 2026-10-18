@@ -65,7 +65,9 @@ export function planTestGamingRoute({ pr, verdict, enabled = true } = {}) {
   }).at(-1);
   const justification = ended && /^test-removal-justified:[ \t]*(\S[^\r\n]*)$/m.exec(ended.body)?.[1];
   if (justification) return { action: 'needs-you', reason: `test-removal-justified: ${justification}`,
-    marker: noticeMarker(pr.headRefOid), notified: comments.some(c => trusted(c) && c.body.includes(noticeMarker(pr.headRefOid))) };
+    marker: noticeMarker(pr.headRefOid), notified: comments.some(c => trusted(c) && c.body.includes(noticeMarker(pr.headRefOid))),
+    rulingRecorded: comments.some(c => trusted(c) && c.body.includes(noticeMarker(pr.headRefOid))
+      && latestAdvisory([c])?.outcome === 'inconclusive') };
   const existing = routes.find(r => r.c.body.includes(routeMarker(pr.headRefOid)));
   // Reclaim also posts fix-end. Only an explicit advisory repair mark completes
   // the finding; reuse reconcile's trusted, ordered episode check.
@@ -96,11 +98,18 @@ function notifyNeedsYou(item) {
 export function routeTestGaming(pr, { repo, provider = createGhProvider(), readVerdict = readMergeGateVerdict,
   readComments = readCompletePrComments, notify = notifyNeedsYou, enabled = resolveReviewSettings().routeTestGamingToFixer,
   dryRun = false } = {}) {
-  if (!enabled || !live(pr)) return { action: 'skip', why: 'disabled or inactive PR' };
-  const row = latestFailingMergeGate(pr.statusCheckRollup);
+  if (!enabled || (pr?.state != null && !live(pr))) return { action: 'skip', why: 'disabled or inactive PR' };
+  const row = latestFailingMergeGate(pr?.statusCheckRollup);
   if (!row) return { action: 'skip', why: 'no failing merge-gate' };
   const jobId = Number(/\/job\/(\d+)/.exec(row.detailsUrl ?? row.details_url ?? '')?.[1] ?? row.id);
   if (!Number.isSafeInteger(jobId) || jobId <= 0) return { action: 'skip', why: 'no job identity' };
+  // Production list snapshots omit state for labelled PRs. Verify it live rather
+  // than treating missing state as closed (or assuming the list is still open).
+  if (pr.state == null) {
+    const state = provider.readPrState(repo, pr.number);
+    if (!live(state) || state.headRefOid !== pr.headRefOid) return { action: 'skip', why: 'head moved or PR inactive' };
+    pr = { ...pr, state: state.state };
+  }
   const verdict = readVerdict({ repo, jobId, prNumber: pr.number });
   // The list page can omit either a pending note or its later repair mark. Use
   // it only for gate eligibility; episode decisions require the complete read.
@@ -118,16 +127,20 @@ export function routeTestGaming(pr, { repo, provider = createGhProvider(), readV
   if (dryRun || plan.action === 'skip') return plan;
   const labels = labelsOf(current);
   if (plan.action === 'admit') provider.postComment(repo, pr.number, plan.body);
-  if (plan.action === 'needs-you') {
-    if (!plan.notified) {
-      notify({ repo, pr: pr.number, head: pr.headRefOid, reason: plan.reason });
-      provider.postComment(repo, pr.number, `Test removal needs your ruling. ${plan.reason}\n\nThe merge-gate hold remains in force.\n\n${plan.marker}`);
-    }
-  }
-  // Complete only our own finding episode; never remove a newer panel's label.
+  // Complete only our own finding episode; never supersede a newer panel's note.
   const latestNote = latestAdvisoryNote(comments.filter(isTrustedMarkerAuthor));
   const ownsNote = plan.action === 'admit' || latestNote?.body === plan.body
     || (plan.action === 'needs-you' && /<!-- test-gaming-route: [a-f0-9]{40} -->/.test(latestNote?.body ?? ''));
+  if (plan.action === 'needs-you') {
+    if (!plan.notified) notify({ repo, pr: pr.number, head: pr.headRefOid, reason: plan.reason });
+    if (!plan.notified || (ownsNote && !plan.rulingRecorded)) {
+      // Labels are derived from advisory outcomes. Record the ruling handoff so
+      // the label sweep cannot restore our old changes outcome. This is not an
+      // accepted review or a new fixer episode (no advisory-note marker).
+      const outcome = ownsNote ? `\n\n**Verdict:** Needs operator ruling\n\n**Advisory outcome:** \`inconclusive\`\n\nNet basis: \`${'0'.repeat(40)}..${pr.headRefOid}\`` : '';
+      provider.postComment(repo, pr.number, `Test removal needs your ruling. ${plan.reason}\n\nThe merge-gate hold remains in force.\n\n${plan.marker}${outcome}`);
+    }
+  }
   if (!ownsNote) return plan;
   const active = ['admit', 'admitted'].includes(plan.action);
   // The existing advisory fixer requires needs-human. Never impersonate a human
