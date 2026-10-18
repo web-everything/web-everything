@@ -4,10 +4,11 @@ kind: story
 size: 2
 priority: high
 parent: "3007"
-status: open
+status: resolved
 blockedBy: ["5355", "5371"]
 scope: ["we:scripts/conveyor/pr-label-mirror.mjs", "we:scripts/conveyor/__tests__/pr-label-mirror.test.mjs", "we:scripts/conveyor/ruling-needed-sweep.mjs", "we:scripts/conveyor/review-hold-reconcile.mjs", "we:scripts/conveyor/__tests__/review-hold-reconcile.test.mjs", "we:scripts/operations/record-referral-ruling-io.mjs"]
 dateOpened: "2026-10-09"
+dateResolved: "2026-10-18"
 tags: []
 ---
 

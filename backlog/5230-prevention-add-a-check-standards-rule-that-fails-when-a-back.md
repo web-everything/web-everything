@@ -28,3 +28,4 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 ## Also raised by
 
 - Also raised by web-everything/web-everything#5268 (finding 2: `we:backlog/5028-drain-and-lander-must-not-resolve-a-landed-card-whose-blocke.md:33` — Add a check:standards rule that fails when a backlog card's scope lists a test file that the Test plan never mentions.)
+- Also raised by web-everything/web-everything#5566 (finding 1: `we:backlog/6275-prevention-extend-the-card-to-test-mapping-check-so-every-mu.md:5` — Add a check:standards rule that warns when a backlog card's scope: entries do not resolve on the base branch.) · key `approval-prevention-key:web-everything/web-everything#5566@68f070076b3e31b3d0333e43a3207459a9358362`

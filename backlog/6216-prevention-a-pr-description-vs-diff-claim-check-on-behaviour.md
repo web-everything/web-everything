@@ -53,3 +53,5 @@ One line per class: either the handling, or `n/a: <why>`.
 ## Also raised by
 
 - Also raised by web-everything/web-everything#5510 (finding 2: `we:backlog/x9jlvy0-a-head-whose-red-team-comment-is-owed-is-not-held-by-the-alr.md:24` — A check:standards rule that fails a card whose Acceptance Must line has no backtick-quoted test name or file reference. File this as a backlog item.)
+- Also raised by web-everything/web-everything#5510 (finding 1: `we:backlog/6273-a-head-whose-red-team-comment-is-owed-is-not-held-by-the-alr.md:28` — Add a card-lint rule that every [A#] **Must** line names a test case in backtick-quoted form, as A2, A4, A5 and A8 already do.) · key `approval-prevention-key:web-everything/web-everything#5510@b07c834c3ac418d1085fc11df0d1631a919d7486`
+- Also raised by web-everything/web-everything#5510 (finding 2: `we:backlog/6273-a-head-whose-red-team-comment-is-owed-is-not-held-by-the-alr.md:26` — Add a card-lint rule in check:standards that every Acceptance line marked **Must** names a backticked test case or a vitest path. The rule would fail A3 as written.)
