@@ -57,6 +57,8 @@ export default {
       mergeGateSetting: { value: 'on', source: 'soak' },
       enrichMainRed: prs => ({ prs, mainRedWindows: [] }),
       ...Object.fromEntries(['enrichAlreadyLanded', 'enrichBaseRef', 'enrichSystemFix', 'enrichEscalationBase', 'enrichFixClaims', 'enrichTimeouts', 'enrichReferralHolds', 'enrichLedgerHolds', 'enrichRulings', 'enrichScopeBloat', 'enrichCodeQL', 'enrichMechanicalRound', 'enrichOwedMainRule'].map(k => [k, identity])),
+      // The fixture models the full required-check set and the serial review→fix policy, not the production defaults.
+      env: { ...process.env, WE_REVIEW_START_AFTER: 'ci-green', WE_FIX_JOIN_CI_AND_REVIEW: 'false' },
       resolveMainSha: () => null, readPriority: () => null, now: Date.parse('2026-10-12T13:00:00Z'),
     });
     const dispatched = (number, kind) => plan.dispatch.some(d => d.prNumber === number && d.kind === kind);

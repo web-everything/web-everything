@@ -1224,7 +1224,7 @@ describe('xn025gx glue — buildAwaitVerifyStep, buildFixThrottle, buildDaemonEx
     vi.stubEnv('WE_RESOURCE_CUTOVER', 'shadow'); // the legacy cap + gate decide here; the cut-over is tested below
     vi.stubEnv('WE_RESOURCE_SHADOW', 'off');
     const fix = { meta: { kind: 'fix', repo: 'we', pr: 1 } };
-    const base = { env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '1' }, sample: () => null, loadavg: () => 0, cpuCount: () => 8, alive: () => true };
+    const base = { sendBackReservedSlots: 0, env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '1' }, sample: () => null, loadavg: () => 0, cpuCount: () => 8, alive: () => true };
     const full = buildFixThrottle({ ...base, slotClaims: () => [fix] }).tryAdmit('fix');
     expect(full).toMatchObject({ admit: false, kind: 'fix-cap' });
     const parkedGaveItBack = buildFixThrottle({ ...base, slotClaims: () => [] }).tryAdmit('fix');

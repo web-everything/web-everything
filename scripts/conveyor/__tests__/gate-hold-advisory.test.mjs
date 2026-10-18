@@ -1,6 +1,8 @@
 // Live #4764: repair exhaustion must leave a current advisory or a visible operator note.
 import { describe, it, expect } from 'vitest';
-import { planReconcile } from '../reconcile-core.mjs';
+import { planReconcile as planReconcileWithTiming } from '../reconcile-core.mjs';
+// This historical fixture exercises the serial policy; new defaults have their own timing suite.
+const planReconcile = options => planReconcileWithTiming({ reviewTiming: { startAfter: 'ci-green' }, fixTiming: { joinCiAndReview: false }, ...options });
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
 import { isStatusOnlyNote } from '../../lib/pr-comment-policy.mjs';

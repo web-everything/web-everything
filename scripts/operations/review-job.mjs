@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { recordRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
 import { speculativeSeatTimings } from '../lib/review-speculative-red-team.mjs';
 import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
@@ -267,7 +268,7 @@ export function laneCooloffActive(record, nowMs, cooloffMs = INFRA_RETRY_COOLOFF
 // ── THE ARC ────────────────────────────────────────────────────────────────────────────────────────────────────
 
 /** The real effects, each one command. `root` is the checkout the arc runs from (the daemon's clone). */
-export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root) } = {}) {
+export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync } = {}) {
   const node = (args, { actorId, timeoutMs, extraEnv = null } = {}) => spawnSync(process.execPath, args, {
     cwd: root,
     encoding: 'utf8',
@@ -281,7 +282,8 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       catch (e) { process.stderr.write(`review-job: red-team status write failed: ${e.message}\n`); }
     },
     root,
-    carryAcrossRebaseSetting: () => resolveCarryAcrossRebase({ env }),
+    // The carry's own resolver is its only source (logged with that source); no timing setting governs it.
+    carryAcrossRebaseSetting: () => resolveCarryAcrossRebase({ env, readFile }),
     readCarryEvidence: ({ pr, repo }) => {
       const view = JSON.parse(execRead('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], { cwd: root, env }));
       const comments = readCompletePrComments(pr, { repo, exec: (f, a, o) => execRead(f, a, { ...o, cwd: root, env }) });
@@ -885,9 +887,10 @@ export function dispatchReviewJob({
     return { ...base, jobPid: null, skipped: 'lane-cooloff' };
   }
 
-  const ci = ciGate({ repo: planned.repo, pr: planned.pr });
+  const policy = resolveTimingPolicy({ env }).review;
+  const ci = ciGate({ repo: planned.repo, pr: planned.pr, policy });
   // Card 273, #5157: a waiver is pinned to readable CI on this exact head.
-  const waived = typeof ci?.headSha === 'string' && typeof advisoryCiWaiver?.head === 'string'
+  const waived = policy.startAfter === 'ci-green' && typeof ci?.headSha === 'string' && typeof advisoryCiWaiver?.head === 'string'
     && ci.headSha.length > 0 && ci.headSha.toLowerCase() === advisoryCiWaiver.head.toLowerCase()
     && !['head-changed', 'unreadable-ci', 'missing-head', 'unknown-required-set', 'untrusted-required-set'].includes(String(ci.reason ?? '').split(' (')[0])
     && !(ci.affected ?? []).some(row => ['wrong-head', 'malformed', 'missing'].includes(row.reason));
