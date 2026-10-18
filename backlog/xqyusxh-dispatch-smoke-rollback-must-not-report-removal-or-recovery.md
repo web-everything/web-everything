@@ -35,4 +35,4 @@ One line per class: either the handling, or `n/a: <why>`.
 4. **Fail closed** — per-clone overlay list under the clone's own lock.
 5. **Identity scoping** — a retry after a partial rollback re-reads the list, never trusts the earlier report.
 6. **State over time** — n/a: operator CLI.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+7. **Who wrote it** — n/a: operator-run CLI; the overlay audit trail already names the actor.
