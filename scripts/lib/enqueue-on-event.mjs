@@ -689,6 +689,8 @@ export function createEnqueueOnEvent({
             verified = true;
             completed.add(p.num);
             misses.delete(p.num);
+            // A wake that arrived during this run is satisfied: the PR is in the queue.
+            if (pending.has(key)) { pending = new Map(pending); pending.delete(key); }
             what += ` (verified: isInMergeQueue=true${membership.entry?.position != null ? `, position ${membership.entry.position}` : ''}${membership.entry?.state ? `, state ${membership.entry.state}` : ''})`;
           } else {
             verified = false;
@@ -761,13 +763,11 @@ export function createEnqueueOnEvent({
   return {
     /** Fold one `consumer.pollOnce()` result in. */
     notePoll(r) {
-      if (r?.ok !== false) for (const mark of r?.marked || []) {
-        const cause = parseMarkCause(mark.cause), pr = parseMarkKey(mark.key);
-        if (pr?.repo !== String(localSlug).toLowerCase() || !cause) continue;
-        // Marks carry neither required-context identity nor head SHA. An optional or stale
-        // failure cannot withdraw a green wake; the drain re-reads current required checks.
-        if (!activeNums.has(pr.num)) pending = notePending(pending, [mark], { localSlug, now: now() });
-      }
+      // Marks carry neither required-context identity nor head SHA. An optional or stale
+      // failure cannot withdraw a green wake; the drain re-reads current required checks.
+      // A wake for a PR whose fast drain is running stays pending: the run loop never starts a second
+      // drain for an active PR, and the next tick re-wakes it unless that run verified the enqueue.
+      if (r?.ok !== false && Array.isArray(r?.marked) && r.marked.length) pending = notePending(pending, r.marked, { localSlug, now: now() });
     },
     /** Run due PRs now (bounded catch-up concurrency; serial events) if enabled and allowed; a no-op while a tick is already running. */
     tick() { return running && !runningCatchUpOnly ? running : startRun({}, running); },

@@ -118,6 +118,17 @@ describe('real drain pre-stage path', () => {
     expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
     expect(readFileSync(file, 'utf8')).toBe(prepared);
   }));
+  it('a green event preserves preparation without enqueueing outside --label', () => world(({pr,run,coord}) => {
+    expect(run().stderr).toContain('eligible=true');
+    const cacheDir = join(coord, 'drain-prestage');
+    const file = join(cacheDir, readdirSync(cacheDir)[0]);
+    const prepared = readFileSync(file, 'utf8');
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    const next = run(true, { args:['--label=other'] });
+    expect(next.report.prestaged).not.toBe(true);
+    expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
+    expect(readFileSync(file, 'utf8')).toBe(prepared);
+  }));
   it.each([
     {thisRepo:true,args:['--base=main']},
     {thisRepo:false,args:['--repos=web-everything/web-everything','--base=main']},

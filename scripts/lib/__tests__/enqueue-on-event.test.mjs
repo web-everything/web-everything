@@ -1573,6 +1573,44 @@ describe('pre-staged green events', () => {
     expect(calls).toHaveLength(0);
     expect(handle.pending()).toHaveLength(0);
   });
+  const flush = async () => { for (let i = 0; i < 60; i++) await Promise.resolve(); };
+  const pendingChecks = { ok: true, prestaged: true, considered: 1, merged: [], failed: [],
+    enqueueOutcomes: [{ num: 42, outcome: 'not-enqueued', kind: 'prestage', reason: 'required checks pending' }] };
+  it.each([
+    ['a green check', mark(42, 'check_suite.completed=success@13')],
+    ['an eligibility label', mark(42, 'pull_request.labeled(ready-to-merge)@13')],
+  ])('re-wakes a PR when %s arrives during its own run', async (_, late) => {
+    const prestageCache = { get: () => ({ eligible: true }), drop: vi.fn() };
+    const { handle, calls, children } = setup({ prestageCache, manualFinish: true, drainJson: pendingChecks });
+    handle.notePoll({ ok: true, marked: [mark()] });
+    const first = handle.tick();
+    await flush();
+    expect(calls).toHaveLength(1);
+    handle.notePoll({ ok: true, marked: [late] });
+    await flush();
+    expect(calls).toHaveLength(1);
+    children[0].finish();
+    await first;
+    const second = handle.tick();
+    await flush();
+    expect(calls).toHaveLength(2);
+    children[1].finish();
+    await second;
+    expect(handle.pending()).toHaveLength(0);
+  });
+  it('drops a wake that arrived during a run which verified the enqueue', async () => {
+    const prestageCache = { get: () => ({ eligible: true }), drop: vi.fn() };
+    const { handle, calls, children } = setup({ prestageCache, manualFinish: true });
+    handle.notePoll({ ok: true, marked: [mark()] });
+    const first = handle.tick();
+    await flush();
+    handle.notePoll({ ok: true, marked: [mark(42, 'check_suite.completed=success@13')] });
+    children[0].finish();
+    await first;
+    expect(handle.pending()).toHaveLength(0);
+    await handle.tick();
+    expect(calls).toHaveLength(1);
+  });
   it.each(['success', 'skipped', 'neutral', 'cancelled', 'failure', 'timed_out', 'action_required', 'stale', 'startup_failure', null])('keeps the green wake after an unattributed %s event', async conclusion => {
     const prestageCache = { get: () => ({ eligible: true }), drop: vi.fn() };
     const { handle, calls } = setup({ prestageCache });

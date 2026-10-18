@@ -1247,7 +1247,8 @@ remain active, including concurrency 1. Re-read live queue depth/capacity before
 reserve room for active siblings; retain the round attempt budget for ambiguous outcomes.
 A batching deferral stops new starts but lets existing children finish their locked admission checks.
 Probe busy scheduling from round completion with room and an unqueued runnable PR, and full-interval
-scheduling with a full queue or backed-off work. Suppress duplicate event wakes for active PRs;
+scheduling with a full queue or backed-off work. Never start a second drain for an active PR; a
+wake that arrives during its run stays pending until the run ends, unless that run verified the enqueue;
 shutdown must kill every child and prevent further starts. Inject all GitHub reads in these tests.
 
 ## Referral rulings answering stand-downs
@@ -1637,10 +1638,13 @@ calls without treating the protected callback as an uncaught call. The throwing-
 contracts above are the immediate guard; the repository-wide lint remains separate tooling work.
 
 The green-event shortcut must honor the full drain's resolved `--repos` / `--this-repo`
-selection and exact `--base` filter before consuming preparation. CLI regressions must
-pair excluded scopes (WE#42 under `--repos=frontier-ui/frontierui`, including the short
-repo alias, and cached main preparation under `--this-repo --base=release`) with matching
-scopes that still enqueue without listing. Excluded repo/base scopes preserve preparation.
+selection and exact `--label` / `--base` filters before consuming preparation. The listing and the
+shortcut share one selection predicate (`operatorSelects`), so a new filter cannot reach only one path.
+CLI regressions must pair excluded scopes (WE#42 under `--repos=frontier-ui/frontierui`, including the short
+repo alias, cached main preparation under `--this-repo --base=release`, and cached `ready-to-merge`
+preparation under `--label=other`) with matching scopes that still enqueue without listing. Excluded
+repo/label/base scopes preserve preparation. A green mark that arrives while its PR's fast drain runs
+must wake it again after that run (`enqueue-on-event.test.mjs`, "pre-staged green events").
 
 ## Review scratch disk retention
 

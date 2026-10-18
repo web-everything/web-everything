@@ -4422,6 +4422,9 @@ async function runCli() {
   // (the F1 signal), so this ONE lander serves both `/merge` (bare = every AI PR) and `/drain` (label-scoped +
   // manifest-ordered). Omit → the legacy sweep-all behaviour, unchanged.
   const label = typeof flags.label === 'string' ? flags.label : null;
+  // The operator's exact `--label` and `--base` selection, client-side (#no-label-search, #4108). One predicate for
+  // the listing and the --from-green-event shortcut, so cached admission never selects a PR the listing would not.
+  const operatorSelects = (r) => filterOpenPrsByBase(filterOpenPrsByLabel([r], label).prs, base).length > 0;
   // #2194 — /drain converges onto this lander: `--watch` turns the one-shot sweep into the long-lived monitor
   // (`/drain watch`), re-sweeping on `--interval=N`s and landing each PR the instant it goes green.
   const { watch: WATCH, intervalSec: INTERVAL, maxIdle: MAX_IDLE, untilBatchesIdle: UNTIL_BATCHES_IDLE, batchIdleDebounce: BATCH_DEBOUNCE } =
@@ -5014,9 +5017,12 @@ async function runCli() {
   const sweepOnce = async () => {
   const prestageSetting = resolvePrestageSettings({ log: line => process.stderr.write(`${line}\n`) });
   // Prepared admission is still a candidate selection: honor the same resolved repo set and
-  // exact base filter as listOne before consuming (or invalidating) a cached preparation.
+  // operator label/base filters as listOne before consuming (or invalidating) a cached preparation.
+  // The entry stores labels as their sorted-name signature; a missing entry falls through to the miss path.
+  const prepared = !DRY_RUN && flags['from-green-event'] && onlyPr != null ? prestageCache.get(localSlug, Number(onlyPr), prestageSetting.value.prestageTtlMin) : null;
+  const preparedLabels = (() => { try { return JSON.parse(prepared?.labels ?? 'null'); } catch { return null; } })();
   if (!DRY_RUN && flags['from-green-event'] && onlyPr != null && !onlyRepo && REPOS.some(isLocalRepo) && mergeStrategy.enqueues(null)
-      && (!base || filterOpenPrsByBase([prestageCache.get(localSlug, Number(onlyPr), prestageSetting.value.prestageTtlMin)], base).length > 0)) {
+      && (!prepared || operatorSelects({ ...prepared, labels: preparedLabels }))) {
     // The global stop-the-line signal can change independently of any PR head/label.
     const freeze = redMainBypass ? null : await readDrainFreezePass();
     const hold = redMainBypass ? null : drainFreezeSignal({ state: freeze, mainRedState: readMainRedState(), priority: readMainRedPriority(), now: Date.now(), holdOn: resolveRedMainHoldSetting().value === 'on' });
@@ -5025,8 +5031,8 @@ async function runCli() {
       readPr: async () => {
         const { stdout } = await execFileP('gh', ['pr', 'view', String(onlyPr), ...repoFlag(null), '--json',
           'number,headRefOid,labels,statusCheckRollup,state,isDraft,body,baseRefName,reviewDecision,mergeable,mergeStateStatus'], { encoding: 'utf8' });
-        const pr = filterOpenPrsByBase([JSON.parse(stdout)], base)[0];
-        if (!pr) return null;
+        const pr = JSON.parse(stdout);
+        if (!operatorSelects(pr)) return null;
         // The same full `--check` read the listing and the pre-merge re-read use: gh caps the rollup at 100 contexts.
         return attachLiveFixClaim(await resolveChecks(null, pr), { claimKey: repoKeyForSlug(localSlug), readClaim: readLiveFixClaim });
       },
@@ -5124,7 +5130,6 @@ async function runCli() {
       if (slug) {
         const paging = resolvePrListPaging();
         const heavyFields = ['body', ...((RECONCILE || workflowEditSetting.value !== 'off') ? ['files'] : [])];
-        const wanted = (r) => filterOpenPrsByBase(filterOpenPrsByLabel([r], label).prs, base).length > 0;
         // Seed body/files from the host-shared snapshot (its heavy copies persist across drain processes); a seed
         // row is used only when its updatedAt + head SHA match the LIVE page row, so it never serves stale content.
         let seed = snapshotSeed || [];
@@ -5132,7 +5137,7 @@ async function runCli() {
           try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' })) || []; } catch { seed = []; }
         }
         listed = __t.time('listing.pages', () => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging,
-          heavyFields, needsHeavy: RECONCILE ? () => true : wanted, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
+          heavyFields, needsHeavy: RECONCILE ? () => true : operatorSelects, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
           maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain page)' } } }));
         drainHeavyCacheByRepo.set(repo, listed.cache);
       } else if (!slug) {
@@ -5143,9 +5148,10 @@ async function runCli() {
         listed = { rows, truncated: rows.length >= OPEN_PR_LIST_LIMIT };
       }
       const rows = await __t.timeAsync('listing.checks', () => resolveListedChecks(repo, listed.rows));
-      const { prs: labelMatched, truncated } = filterOpenPrsByLabel(rows, label, OPEN_PR_LIST_LIMIT);
+      const listedRows = Array.isArray(rows) ? rows : [];
+      const truncated = Array.isArray(rows) && isDegradedOpenPrListing(rows.length, OPEN_PR_LIST_LIMIT);
       // Preparation observes the same release-label and operator label filter as the full drain.
-      const prs = filterOpenPrsByBase(labelMatched, base);
+      const prs = listedRows.filter(operatorSelects);
       if (listed.truncated || truncated) process.stderr.write(`  ⚠️  DEGRADED drain listing for ${repoTag(repo) || 'cwd'}: the open-PR list hit the --limit ${OPEN_PR_LIST_LIMIT} cap — it MAY be truncated, so a ${label || 'candidate'} PR past it can be missing this pass (#no-label-search)\n`);
       return { repo, prs, rows };
     }
