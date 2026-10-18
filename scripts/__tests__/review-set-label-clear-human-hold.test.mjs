@@ -6,6 +6,8 @@ import { execFileSync } from 'node:child_process';
 import { decideSetLabel, runReviewLabelCli, buildVerdictComment, defaultReadHumanOnlyHold, reassertHumanClearance, isHumanSurfacePark, HUMAN_SURFACE_REPARK_RE, buildMechanicalHandoffMarker, withdrawParkOnLiveClearance } from '../review-set-label.mjs';
 import { buildHumanSurfaceReparkComment } from '../conveyor/human-surface-repark.mjs';
 import { buildClearedHumanMarker, buildReviewedShaMarker } from '../lib/review-escalation.mjs';
+import { renderRedTeamComment } from '../operations/review-extra-seats.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, readRedTeamDisposition, redTeamGateMarker, redTeamRulingNeeded } from '../lib/red-team-gate.mjs';
 const head = 'a'.repeat(40);
 const labels = ['review:accepted', 'ready-to-merge'];
 const clearance = { author: { login: 'web-everything' }, body: `${buildReviewedShaMarker(head)}\n${buildClearedHumanMarker('operator')}` };
@@ -15,9 +17,13 @@ describe('clear-human hold decision', () => {
     expect(decideSetLabel({ to: 'clear-human', currentLabels: labels }).allowed).toBe(false);
     expect(decideSetLabel({ to: 'clear-human', currentLabels: labels, humanOnlyHold: true })).toMatchObject({ allowed: true, addLabel: 'review:accepted', keepsHuman: false, reason: expect.stringContaining('merge-gate human-only hold at the live head') });
   });
+  it('a red-team round-cap ruling is a hold the ceremony clears', () => {
+    expect(decideSetLabel({ to: 'clear-human', currentLabels: labels, redTeamRulingHold: true })).toMatchObject({ allowed: true, addLabel: 'review:accepted', reason: expect.stringContaining('red-team round-cap ruling') });
+  });
   it.each(['accepted', 'changes'])('does not affect %s', to => {
     const args = { to, currentLabels: labels };
     expect(decideSetLabel({ ...args, humanOnlyHold: true })).toEqual(decideSetLabel(args));
+    expect(decideSetLabel({ ...args, redTeamRulingHold: true })).toEqual(decideSetLabel(args));
   });
 });
 describe('default human-only hold reader', () => {
@@ -48,10 +54,10 @@ describe('clear-human CLI hold ceremony', () => {
     vi.stubEnv('WE_VERDICT_LEDGER_BOARD', '');
   });
   afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); rmSync(dir, { recursive: true, force: true }); });
-  function run(hold, currentLabels = labels) {
+  function run(hold, currentLabels = labels, comments = []) {
     const provider = {
       currentRepo: () => 'o/n', name: 'stub',
-      readPrState: () => ({ state: 'OPEN', headRefOid: head, headRefName: 'lane/x', baseRefName: 'release', labels: currentLabels, comments: [], body: '' }),
+      readPrState: () => ({ state: 'OPEN', headRefOid: head, headRefName: 'lane/x', baseRefName: 'release', labels: currentLabels, comments, body: '' }),
       readLabels: () => currentLabels, setLabels: vi.fn(), postComment: vi.fn(),
     };
     const readHumanOnlyHold = vi.fn(() => hold);
@@ -72,6 +78,32 @@ describe('clear-human CLI hold ceremony', () => {
     expect(body).toContain(buildClearedHumanMarker('operator'));
     expect(body).toContain(buildReviewedShaMarker(head));
     expect(r.readHumanOnlyHold).toHaveBeenCalledWith({ headSha: head, baseRefName: 'release', comments: [] });
+  });
+  // PR #5482 red team: RULING NEEDED advertises `--to=clear-human` as the not-real ruling for a red-team break held
+  // at the round cap, on an accepted PR that carries no review:human. That command must work and must release it.
+  describe('a red-team round-cap ruling on an accepted PR', () => {
+    const bot = { author: { login: 'web-everything' } };
+    const result = { ...bot, createdAt: '2026-10-18T01:00:00Z', body: renderRedTeamComment({ pr: 7, rev: head, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+      findings: [{ summary: 'two writers', category: 'edge-case', impactIfUnfixed: 'broken', file: 'a.mjs', line: 1, confirmedByRecheck: true }] }) };
+    const capped = { ...bot, createdAt: '2026-10-18T02:00:00Z', body: redTeamGateMarker(7, head, 'round-cap') };
+    const pr = (comments, prLabels = labels) => ({ number: 7, headRefOid: head, labels: prLabels, comments });
+    it('clears it through the advertised command, and the posted ruling releases the held break', () => {
+      expect(redTeamRulingNeeded(pr([result, capped]))).not.toBeNull();
+      const r = run(false, labels, [result, capped]);
+      expect(r.exitCode).toBe(0);
+      expect(r.provider.setLabels).toHaveBeenCalled();
+      const ruling = { ...bot, createdAt: '2026-10-18T03:00:00Z', body: r.provider.postComment.mock.calls[0][2] };
+      expect(redTeamRulingNeeded(pr([result, capped, ruling]))).toBeNull();
+      expect(readRedTeamDisposition({ comments: [result, capped, ruling], pr: 7, head, setting: CONFIRMED_BREAKS_DEFAULTS }).held).toEqual([]);
+    });
+    it('still refuses with no held break, or while the fixer owns it under review:changes', () => {
+      for (const [prLabels, comments] of [[labels, [result]], [labels, [result, { ...capped, author: { login: 'mallory' } }]], [['review:changes'], [result, capped]]]) {
+        vi.restoreAllMocks();
+        const r = run(false, prLabels, comments);
+        expect(r.exitCode).toBe(1);
+        expect(r.provider.postComment).not.toHaveBeenCalled();
+      }
+    });
   });
   it('refuses an absent hold without writing', () => {
     const r = run(false);

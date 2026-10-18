@@ -1,5 +1,5 @@
 /** Derived operator labels; head-bound scheduling and recorded dispositions remain authoritative. */
-import { redTeamCardOnly } from './review-red-team-policy.mjs';
+import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
 import { readRedTeamDisposition, readRedTeamProbes } from './red-team-gate.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 
@@ -10,7 +10,7 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
   const disposition = readRedTeamDisposition({ comments, pr, head, env });
   const desired = disposition.sendBack.length || disposition.held.length ? 'red-team:blocked'
     : disposition.result ? 'red-team:clear'
-      : !redTeamCardOnly(evidence.loopPayload?.findings?.read) && (evidence.scheduled || evidence.inFlight || evidence.recorded) ? 'red-team:pending' : null;
+      : redTeamOwedOnHead({ read: evidence.loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly }) ? 'red-team:pending' : null;
   const names = labels.map(l => typeof l === 'string' ? l : l?.name);
   return { add: desired && !names.includes(desired) ? desired : null,
     remove: names.filter(l => RED_TEAM_STATUS_LABELS.includes(l) && l !== desired) };

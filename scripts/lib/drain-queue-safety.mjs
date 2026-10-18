@@ -1,10 +1,10 @@
 /** Queue admission and removal share this policy and head-bound red-team evidence. */
-import { redTeamCardOnly } from './review-red-team-policy.mjs';
+import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
 import { execFileSync } from 'node:child_process';
 import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
 import { readMergeQueueState } from './merge-queue-enqueue.mjs';
-import { readRedTeamDisposition } from './red-team-gate.mjs';
+import { readRedTeamDisposition, readRedTeamProbes } from './red-team-gate.mjs';
 
 export function readDrainQueueSafety({ env = process.env, tool, platform, log = () => {} } = {}) {
   const booleanEnv = key => env[key] === undefined ? undefined
@@ -29,8 +29,7 @@ export function sendBackReason(labels) {
 
 /** Only head-bound scheduled work is owed; acceptance and status labels cannot invent a run. */
 export function postAcceptRedTeamOwed(loopPayload, env = process.env, evidence = {}) {
-  if (redTeamCardOnly(loopPayload?.findings?.read)) return false;
-  return !!(evidence.scheduled || evidence.inFlight || evidence.recorded);
+  return redTeamOwedOnHead({ read: loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly });
 }
 
 export function redTeamEnqueueHold({ loopPayload, comments, pr, head, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false } = {}) {

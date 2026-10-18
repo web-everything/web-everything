@@ -41,6 +41,13 @@ describe('head-bound red-team operator labels', () => {
     syncRedTeamStatusLabels({ ...input, env: { WE_RED_TEAM_STATUS_LABELS: 'false' }, provider });
     expect(provider.setLabels).not.toHaveBeenCalled();
   });
+  it('shows a card-only head as pending only when the pass is not skipped or has started', () => {
+    const loopPayload = { findings: { read: { netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] } } };
+    const plan = (env, evidence) => planRedTeamStatusLabels({ ...input, labels: [], comments: [], env, evidence: { loopPayload, ...evidence } }).add;
+    expect(plan({}, { scheduled: true })).toBeNull();
+    expect(plan({ WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, { scheduled: true })).toBe('red-team:pending');
+    expect(plan({}, { scheduled: true, inFlight: true })).toBe('red-team:pending');
+  });
   it('resolves the setting through standard, platform, tool, and env', () => {
     expect(resolveRedTeamProbes({ platform: { statusLabels: false } })).toMatchObject({ value: { statusLabels: false }, sources: { statusLabels: 'platform' } });
     expect(resolveRedTeamProbes({ platform: { statusLabels: false }, file: { redTeam: { statusLabels: true } } }))

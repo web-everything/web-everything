@@ -1,4 +1,5 @@
 import { RED_TEAM_STATUS_LABELS } from './lib/red-team-status-label-meta.mjs';
+import { readConfirmedBreaks, redTeamRulingNeeded } from './lib/red-team-gate.mjs';
 import { signalFixDispatch } from './lib/fix-handoff.mjs';
 import { mandatoryReferralState, readReferralRecords, referralRecordState } from './lib/jury-core.mjs';
 import { referralSeatDisabled } from './operations/review-seat-policy.mjs';
@@ -353,7 +354,7 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  *     a gate re-derive. REFUSED unless a live `review:accepted` is already on the PR: a re-stamp may only carry
  *     an acceptance ACROSS a head move, never manufacture one.
  * @param {{to:('accepted'|'changes'|'rearm'|'clear-human'), currentLabels?:Array, findingCount?:number|null,
- *   reason?:string, humanOnlyHold?:boolean, requireLive?:(null|'accepted'|'missing')}} o - `currentLabels` is the observed label array (string or `{name}` shape, per
+ *   reason?:string, humanOnlyHold?:boolean, redTeamRulingHold?:boolean, requireLive?:(null|'accepted'|'missing')}} o - `currentLabels` is the observed label array (string or `{name}` shape, per
  *   `hasReviewLabel`). `findingCount` and `reason` are the #3334 decision inputs: how many findings the juror
  *   raised (tri-state — `null` is UNKNOWN and never refuses) and the reason the caller stated, if any. They are
  *   ARGUMENTS, never fetched: this function is pure and stays pure. `requireLive` (#4333, `rearm` only) is the
@@ -363,7 +364,7 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  *   its CLI also binds OPEN state and the pushed head before writing and verifies the result afterward.
  * @returns {{allowed:boolean, addLabel:string, removeLabels:string[], keepsHuman:boolean, reason:string}}
  */
-export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, acceptanceStillCoversHead = false } = {}) {
+export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, redTeamRulingHold = false, acceptanceStillCoversHead = false } = {}) {
   // we:scripts/review-set-label.mjs#decideSetLabel — only the targets in the closed set are valid.
   if (!REVIEW_LABEL_TARGETS.includes(to)) {
     throw new Error(
@@ -398,7 +399,7 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
   // a barrier.
   if (to === 'clear-human') {
     // The operator may also clear the drain's mechanical park by hand (it is a hold a human resolves when no carry can).
-    if (!isHuman && !isHeldMechanical && !humanOnlyHold) {
+    if (!isHuman && !isHeldMechanical && !humanOnlyHold && !redTeamRulingHold) {
       return {
         allowed: false,
         addLabel: '',
@@ -435,7 +436,9 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
       keepsHuman: false,
       reason: humanOnlyHold && !isHuman && !isHeldMechanical
         ? 'merge-gate human-only hold at the live head cleared via --to=clear-human'
-        : 'gate-self CLEARED via --to=clear-human — review:human dropped, review:accepted added; drain may merge',
+        : redTeamRulingHold && !isHuman && !isHeldMechanical
+          ? 'red-team round-cap ruling at the live head recorded via --to=clear-human'
+          : 'gate-self CLEARED via --to=clear-human — review:human dropped, review:accepted added; drain may merge',
     };
   }
 
@@ -1394,6 +1397,11 @@ export function runReviewLabelCli({
   const humanOnlyHold = to === 'clear-human' && !hasReviewLabel(currentLabels, REVIEW_LABELS.human)
     && !hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical)
     && readHumanOnlyHold({ headSha, baseRefName, comments: prComments }) === true;
+  // PR #5482: RULING NEEDED advertises this ceremony as the not-real ruling on a red-team break held at the round cap,
+  // on any PR the fixer does not own (an accepted one included). The ceremony's comment is that ruling.
+  const redTeamRulingHold = to === 'clear-human' && !hasReviewLabel(currentLabels, REVIEW_LABELS.human)
+    && !hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical)
+    && redTeamRulingNeeded({ number: Number(pr), headRefOid: headSha, labels: currentLabels, comments: prComments }, readConfirmedBreaks().value) !== null;
   let decision = decideSetLabel({
     to,
     currentLabels,
@@ -1401,6 +1409,7 @@ export function runReviewLabelCli({
     reason: clearReason || bounceEvidence.reason,
     requireLive: onlyIf,
     humanOnlyHold,
+    redTeamRulingHold,
     acceptanceStillCoversHead: parseReviewedSha(prComments.filter(isTrustedMarkerAuthor)) === headSha,
   });
   if (!decision.allowed && !restampAcrossHold) {

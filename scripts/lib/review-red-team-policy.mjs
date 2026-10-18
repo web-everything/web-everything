@@ -50,3 +50,13 @@ export function redTeamCardOnly(read) {
     ? [...read.netChangedFiles, ...(read.netRenameSources ?? [])] : null;
   return isCardOnlyDiff(paths);
 }
+
+/**
+ * Is a red-team result owed on this head? A pass that started or finished is always owed its result. A card-only
+ * head is exempt only while the producer skips it (`skipCardOnly`, resolved by the caller from its setting).
+ */
+export function redTeamOwedOnHead({ read, evidence = {}, skipCardOnly = true } = {}) {
+  if (evidence.inFlight || evidence.recorded) return true;
+  if (skipCardOnly && redTeamCardOnly(read)) return false;
+  return !!evidence.scheduled;
+}
