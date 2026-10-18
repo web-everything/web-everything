@@ -3,6 +3,7 @@ kind: story
 size: 3
 parent: "6268"
 status: open
+priority: now
 scaffoldedBy: "fix-5549"
 dateScaffolded: "2026-10-18"
 blockedBy: ["6266"]

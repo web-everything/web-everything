@@ -2,6 +2,7 @@
 kind: story
 size: 3
 status: open
+priority: high
 scaffoldedBy: "fix-5549"
 dateScaffolded: "2026-10-18"
 scope: ["we:scripts/lib/merge-queue-enqueue.mjs", "we:scripts/lib/drain-workflow-edit-hold.mjs", "we:scripts/lib/__tests__/drain-workflow-edit-hold.test.mjs"]
