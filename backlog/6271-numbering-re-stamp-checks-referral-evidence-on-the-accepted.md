@@ -3,8 +3,8 @@ bornAs: x6vzie0
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/lib/numbering-carry.mjs", "we:scripts/review-set-label.mjs", "we:scripts/conveyor/review-referral-hold.mjs", "we:scripts/lib/__tests__/numbering-carry-referral.test.mjs", "we:scripts/lib/__tests__/numbering-carry.test.mjs", "we:scripts/conveyor/soak/breaks/numbering-carry-unfinished-live-review.mjs", "we:scripts/conveyor/soak/breaks/numbering-carry-unfinished-live-review.soak.test.mjs"]
-scopeRationale: "The shared guard's refusal code is exercised through the real guard and re-stamp writer in we:scripts/lib/__tests__/numbering-carry-referral.test.mjs; its existing we:scripts/__tests__/review-set-label.test.mjs needs no edit."
+scope: ["we:scripts/lib/numbering-carry.mjs", "we:scripts/review-set-label.mjs", "we:scripts/conveyor/review-referral-hold.mjs", "we:scripts/lib/__tests__/numbering-carry-referral.test.mjs", "we:scripts/lib/__tests__/numbering-carry.test.mjs", "we:scripts/conveyor/soak/breaks/numbering-carry-unfinished-live-review.mjs", "we:scripts/conveyor/soak/breaks/numbering-carry-unfinished-live-review.soak.test.mjs", "we:scripts/operations/__tests__/parallel-judges.test.mjs"]
+scopeRationale: "The shared guard's refusal codes are pinned directly and through the real re-stamp writer in we:scripts/lib/__tests__/numbering-carry-referral.test.mjs; its existing we:scripts/__tests__/review-set-label.test.mjs needs no edit. we:scripts/operations/__tests__/parallel-judges.test.mjs is a CI-heal on this PR: fake timers replace a wall-clock assertion that flaked under host load and blocked its CI."
 dateOpened: "2026-10-17"
 tags: []
 ---

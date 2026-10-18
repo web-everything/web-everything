@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as carry from '../numbering-carry.mjs';
 import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
 import { mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readReviewRunEvidence, readReviewRunHeads } from '../../conveyor/review-referral-hold.mjs';
@@ -150,6 +150,43 @@ describe('numbering carry referral evidence', () => {
         expect(guard.mock.results.findLast(r => r.type === 'throw').value)
           .toMatchObject({ code: 'MANDATORY_REFERRAL_UNFINISHED_REVIEW_RUN' });
       });
+    // The shared guard itself, without the re-stamp writer: the typed codes and the #4708 identical-diff carry.
+    const guardState = { state: 'OPEN', body: authorBody, labels: ['review:pending'], headRefOid: TO, comments: [record(OLD)] };
+    const guardDirect = (readRunHeads, readNetDiff = sha => ({ scored: true, text: 'same diff' })) => {
+      try {
+        return assertMandatoryReferralsCleared(guardState, { repo, pr, env: {}, cardReadable: () => true, readNetDiff,
+          readRuns: () => readReviewRunEvidence({ dir, memo: new Map(), persist: false }), readRunHeads });
+      } catch (e) { return e; }
+    };
+    it('the guard reports an unfinished live-head run and never carries identical-diff evidence over it', () => {
+      dir = mkdtempSync(join(tmpdir(), 'numbering-unfinished-'));
+      persist('review-pr-prior', FROM, { verdict: 'accept', pendingReferrals: [] }, true);
+      persist('review-pr-live', TO, live['persistence-failed'], false);
+      const outcome = guardDirect(() => readReviewRunHeads({ dir, memo: new Map(), persist: false }));
+      expect(outcome).toBeInstanceOf(Error);
+      expect(outcome).toMatchObject({ code: 'MANDATORY_REFERRAL_UNFINISHED_REVIEW_RUN',
+        message: expect.stringContaining('no-current-head-review-evidence') });
+    });
+    it('the guard reports no review run, and the identical-diff carry stands in, only when no run reviewed the live head', () => {
+      dir = mkdtempSync(join(tmpdir(), 'numbering-unfinished-'));
+      persist('review-pr-prior', FROM, { verdict: 'accept', pendingReferrals: [] }, true);
+      const heads = () => readReviewRunHeads({ dir, memo: new Map(), persist: false });
+      expect(guardDirect(heads)).toMatchObject({ carry: { fromHead: FROM, toHead: TO, runId: 'review-pr-prior' } });
+      expect(guardDirect(heads, sha => ({ scored: true, text: `diff at ${sha}` })))
+        .toMatchObject({ code: 'MANDATORY_REFERRAL_NO_REVIEW_RUN' });
+    });
+    it('persists run heads in their own cache and still sees an unfinished run on a warm read', () => {
+      dir = mkdtempSync(join(tmpdir(), 'numbering-unfinished-'));
+      persist('review-pr-live', TO, live['persistence-failed'], false);
+      const cold = readReviewRunHeads({ dir, memo: new Map() });
+      const evidence = readReviewRunEvidence({ dir, memo: new Map() });
+      const warm = readReviewRunHeads({ dir, memo: new Map(), readRun: () => { throw Error('cache miss'); } });
+      expect(cold).toEqual([{ id: 'review-pr-live', repo, pr, head: TO }]);
+      expect(warm).toEqual(cold);
+      expect(evidence).toEqual([]);
+      expect(readdirSync(dir).filter(n => n.endsWith('.cache')).sort())
+        .toEqual(['.review-run-evidence.cache', '.review-run-heads.cache']);
+    });
     it('still carries numbering evidence when no run reviewed the live head', () => {
       dir = mkdtempSync(join(tmpdir(), 'numbering-unfinished-'));
       persist('review-pr-prior', FROM, { verdict: 'accept', pendingReferrals: [] }, true);
