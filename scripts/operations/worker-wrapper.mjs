@@ -27,7 +27,7 @@
  * so the tests run it against a fake child. The CLI at the bottom runs a JSON spec detached.
  */
 import { spawn } from 'node:child_process';
-import { closeSync, constants, fstatSync, mkdirSync, openSync, readFileSync, readSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -191,6 +191,15 @@ export function extractAgyResult(stdout) {
 export const OPERATOR_STOP_SIGNALS = Object.freeze(['SIGTERM', 'SIGINT', 'SIGHUP']);
 /** After a forwarded stop signal, a child that ignores it is SIGKILLed after this long, so the wrapper still writes its record. */
 const STOP_GRACE_MS = 5_000;
+/** Opt-in smoke stderr capture: compact past 1 MiB to the newest 64 KiB (exported for the cap test). */
+export const DIAGNOSTIC_STDERR_MAX_BYTES = 1024 * 1024;
+export const DIAGNOSTIC_STDERR_KEEP_BYTES = 64 * 1024;
+/** The index of the first LF or CR byte in `buf`; -1 when it has none. */
+function firstLineBreak(buf) {
+  const lf = buf.indexOf(0x0a);
+  const cr = buf.indexOf(0x0d);
+  return lf < 0 ? cr : cr < 0 ? lf : Math.min(lf, cr);
+}
 /** `spawnToCompletion` kills the child itself on a stream overflow and says so in the message (it sets `killed` too). */
 const isOverflow = (failure) => /maxBuffer exceeded/.test(String(failure?.message ?? ''));
 
@@ -295,6 +304,51 @@ async function runWorkerOnce(spec, io, stop) {
   let graceTimer = null;
   const spawnWithPid = (cmd, argv, opts) => {
     const child = spawnFn(cmd, argv, opts);
+    // Opt-in smoke evidence: persist the first byte time and stderr while the worker is still running.
+    if (spec.diagnosticsDir) {
+      let first = true;
+      let stderrBytes = 0;
+      // `launchDetached` creates the capture before the worker starts: a capture already gone at a first chunk was removed.
+      const captureCreated = existsSync(join(spec.diagnosticsDir, 'wrapper.stderr'));
+      // Set when compaction cut through a line: the rest of that line is dropped as it arrives, up to its line break.
+      let discardStderrLine = false;
+      for (const [stream, name] of [[child.stdout, 'worker.stdout'], [child.stderr, 'wrapper.stderr']]) {
+        stream?.on?.('data', (chunk) => {
+          try {
+            if (first) {
+              writeFileSync(join(spec.diagnosticsDir, 'first-output.json'), JSON.stringify({ ms: clock() - Date.parse(spec.diagnosticsStartedAt ?? started.startedAt) }));
+              first = false;
+            }
+            // stdout is only a first-byte signal; stderr is the diagnostic tail.
+            if (name === 'wrapper.stderr') {
+              const file = join(spec.diagnosticsDir, name);
+              let bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+              if (discardStderrLine) {
+                const br = firstLineBreak(bytes);
+                if (br < 0) return;
+                bytes = bytes.subarray(br + 1);
+                discardStderrLine = false;
+              }
+              // Raw worker text: owner-only on disk. The smoke reads its tail into a 0600 file and removes this capture;
+              // once removed it stays removed (a later chunk must not recreate it in the scratch dir).
+              if ((stderrBytes > 0 || captureCreated) && !existsSync(file)) return;
+              appendFileSync(file, bytes, { mode: 0o600 });
+              stderrBytes += bytes.length;
+              // Bounded on disk, newest lines kept: past the cap, compact the file to the whole lines in its last 64 KiB.
+              if (stderrBytes > DIAGNOSTIC_STDERR_MAX_BYTES) {
+                const kept = readFileSync(file).subarray(-DIAGNOSTIC_STDERR_KEEP_BYTES);
+                const br = firstLineBreak(kept);
+                const whole = br >= 0 ? kept.subarray(br + 1) : Buffer.alloc(0);
+                writeFileSync(file, whole, { mode: 0o600 });
+                stderrBytes = whole.length;
+                // No break in the window: it was all one unfinished line, so its remainder must not start the file.
+                if (br < 0) discardStderrLine = true;
+              }
+            }
+          } catch { /* diagnostics cannot interrupt the worker */ }
+        });
+      }
+    }
     // An operator stop is forwarded to the child; one that ignores it is SIGKILLed after a grace, so the wrapper still writes its record.
     // The child's exit ends the window in which a stop can still have stopped it: a TERM that lands after a clean exit (before the spawn
     // promise settles) must not turn a finished result into `aborted`.
@@ -525,7 +579,12 @@ export function launchDetached(spec, { specDir, spawnFn = spawn, nodePath = proc
   // Owner-only permissions; the child deletes it once read.
   const { env: _env, ...safe } = spec;
   writeFileSync(specFile, `${JSON.stringify({ ...safe, specDir })}\n`, { mode: 0o600 });
-  const child = spawnFn(nodePath, [entry, `--spec=${specFile}`], { detached: true, stdio: 'ignore', env: markWorkerEnv(sanitizeSpawnEnv(spec.env ?? process.env)) });
+  let stderrFd;
+  let child;
+  try {
+    if (spec.diagnosticsDir) stderrFd = openSync(join(spec.diagnosticsDir, 'wrapper.stderr'), 'a', 0o600);
+    child = spawnFn(nodePath, [entry, `--spec=${specFile}`], { detached: true, stdio: stderrFd === undefined ? 'ignore' : ['ignore', 'ignore', stderrFd], env: markWorkerEnv(sanitizeSpawnEnv(spec.env ?? process.env)) });
+  } finally { if (stderrFd !== undefined) closeSync(stderrFd); }
   child.unref?.();
   return { wrapperPid: child.pid, specFile };
 }
