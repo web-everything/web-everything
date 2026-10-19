@@ -707,6 +707,27 @@ describe('prevention batch landing', () => {
     expect(land.mock.calls[0][0]).toMatchObject({ foldOpenSingles: true });
     expect(JSON.parse(lines.at(-1))).toEqual({ folded: [1], notFolded: [{ pr: 2, reason: 'multiple files' }] });
   });
+  it.each([
+    ['--drain-pending', '--dry-run'],
+    ['--dry-run', '--fold-open-singles'],
+    ['--drain-pending', '--fold-open-singles', '--dry-run=true'],
+  ])('CLI refuses recovery dry-run before dispatch: %j', async (...argv) => {
+    const exec = vi.fn(() => { throw new Error('unexpected subprocess'); });
+    const writeErr = vi.fn();
+    const result = await runLandPreventionCardCli(argv, { exec, write: () => {}, writeErr });
+    expect(exec).not.toHaveBeenCalled();
+    expect(result.code).not.toBe(0);
+    expect(writeErr.mock.calls.flat().join('')).toMatch(/dry-run.*recovery|recovery.*dry-run/i);
+  });
+  it.each([{ drainPending: true }, { foldOpenSingles: true }])('API refuses recovery dry-run before acquiring a lane: %j', async mode => {
+    const exec = vi.fn(() => { throw new Error('unexpected subprocess'); });
+    const dedupe = vi.fn(() => { throw new Error('unexpected dedupe'); });
+    const result = await realLandPreventionCard({ ...mode, dryRun: true }, { exec, dedupe, write: () => {} });
+    expect(exec).not.toHaveBeenCalled();
+    expect(dedupe).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ ok: false });
+    expect(result.reason).toMatch(/dry-run.*recovery|recovery.*dry-run/i);
+  });
   it.each(['coordinator refused: lease-held', 'admission failed: git unavailable', 'throw'])('holds and spools on %s without publishing', async (reason) => {
     const dir = mkdtempSync(join(tmpdir(), 'pending-prevention-test-'));
     try {

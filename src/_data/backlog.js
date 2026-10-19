@@ -425,7 +425,7 @@ function buildBacklog(fileNames) {
   });
   // Drop malformed cards (reported below) before merging independently stored raises.
   const items = index.load(files).filter(Boolean).map(({ body, item }) => {
-    item.raisedBy = readRaisedBy(item.num, ROOT, { body, backlogDir: BACKLOG_DIR });
+    item.raisedBy = readRaisedBy(item.num, ROOT, { body, bornAs: item.bornAs, backlogDir: BACKLOG_DIR });
     if (item.raisedBy.length) item.details = derive(withRaisedBy(body, item.raisedBy)).details;
     return item;
   });

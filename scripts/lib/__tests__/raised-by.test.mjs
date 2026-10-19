@@ -1,11 +1,12 @@
 import { execFileSync } from 'node:child_process';
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, renameSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { raisedByFile, readRaisedBy, validateRaisedBy } from '../raised-by.mjs';
 import { readOpenCards } from '../card-dedupe.mjs';
 import { isCardOnlyDiff } from '../../ci-card-only.mjs';
+import { applyLedger } from '../../backlog/id.mjs';
 const line = '- Also raised by o/r#77 (finding 1: `we:scripts/a.mjs:4` — Add a regression test) · key `approval-prevention-key:o/r#77@abc`';
 const fixture = (fn) => {
   const root = mkdtempSync(join(tmpdir(), 'raised-by-'));
@@ -15,6 +16,35 @@ const fixture = (fn) => {
 };
 const put = (root, f) => { mkdirSync(dirname(join(root, f.path)), { recursive: true }); writeFileSync(join(root, f.path), f.content); };
 describe('derived raised-by records', () => {
+  it('keeps provisional raises readable and valid after real JIT numbering', () => fixture(root => {
+    const name = 'x1abcde-parent.md';
+    const content = `---\nstatus: open\n---\n# Parent\n\n${line}\n`;
+    writeFileSync(join(root, 'backlog', name), content);
+    const provisional = raisedByFile('x1abcde', line.replaceAll('#77', '#78'));
+    put(root, provisional);
+    expect(validateRaisedBy(root)).toEqual([]);
+    const { renames, rewrites } = applyLedger([{ name, content }], { x1abcde: '6500' });
+    for (const rewrite of rewrites) writeFileSync(join(root, 'backlog', rewrite.name), rewrite.content);
+    for (const rename of renames) renameSync(join(root, 'backlog', rename.from), join(root, 'backlog', rename.to));
+    const body = readFileSync(join(root, 'backlog/6500-parent.md'), 'utf8');
+    expect(readRaisedBy('6500', root)).toHaveLength(2);
+    expect(readRaisedBy('6500', root, { body })).toHaveLength(2);
+    expect(readRaisedBy('x1abcde', root)).toHaveLength(2);
+    expect(readOpenCards(root).find(card => String(card.id) === '6500')?.items).toHaveLength(2);
+    expect(validateRaisedBy(root)).toEqual([]);
+    put(root, raisedByFile('6500', line.replaceAll('#77', '#79')));
+    expect(readRaisedBy('6500', root)).toHaveLength(3);
+    expect(validateRaisedBy(root)).toEqual([]);
+    put(root, raisedByFile('6500', line.replaceAll('#77', '#78')));
+    expect(readRaisedBy('6500', root)).toHaveLength(3);
+    expect(validateRaisedBy(root).join('\n')).toMatch(/duplicate/);
+  }));
+  it('does not accept a body citation as a bornAs parent alias', () => fixture(root => {
+    writeFileSync(join(root, 'backlog/6500-parent.md'), '---\nstatus: open\n---\nExample:\nbornAs: x1abcde\n');
+    put(root, raisedByFile('x1abcde', line.replaceAll('#77', '#78')));
+    expect(readRaisedBy('6500', root)).toEqual([]);
+    expect(validateRaisedBy(root).join('\n')).toContain('raised-by parent x1abcde does not exist');
+  }));
   it('A2 merges legacy and file records by key; readers see the derived finding', () => fixture(root => {
     put(root, raisedByFile('5125', line));
     put(root, raisedByFile('5125', line.replaceAll('#77', '#78')));

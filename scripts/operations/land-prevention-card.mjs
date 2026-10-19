@@ -219,6 +219,7 @@ export function parseLandPreventionCardArgv(argv = []) {
     else flags[a.slice(2, eq)] = a.slice(eq + 1);
   }
   if (flags['drain-pending'] === 'true' || flags['fold-open-singles'] === 'true') {
+    if (flags['dry-run'] === 'true') throw new TypeError('land-prevention-card: --dry-run is not supported for recovery modes');
     return { drainPending: flags['drain-pending'] === 'true', foldOpenSingles: flags['fold-open-singles'] === 'true',
       json: flags.json === 'true', session: flags.session || `prevention-recovery-${process.pid}` };
   }
@@ -493,6 +494,9 @@ export async function landPreventionCard(input, {
   // leaks the lane" gap: `mkTmp()`/`writeFile()` (and any other step that is not its own already-labelled failure
   // mode below) must still release the lane and return a clean failure, never propagate an unhandled rejection.
   try {
+    if (input.dryRun && (input.drainPending || input.foldOpenSingles)) {
+      return fail('dry-run', '--dry-run is not supported for recovery modes');
+    }
     if (input.dryRun) {
       const root = input.root || REPO_ROOT;
       const plan = dedupe(input, { lane: root, write });

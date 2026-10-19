@@ -26,7 +26,7 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { parseRaisedBy, mergeRaisedBy, readRaisedBy } from './raised-by.mjs';
+import { parseRaisedBy, mergeRaisedBy, raisedByParentIds, readRaisedBy } from './raised-by.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 
 // ── Policy ───────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -403,8 +403,9 @@ export function readPrHostedCards({ exec, cwd, repo = CONSTELLATION_REPOS.we.slu
           text = exec('gh', ['api', `repos/${repo}/contents/${f.path}?ref=${encodeURIComponent(pr.headRefName)}`, '-H', 'Accept: application/vnd.github.raw'], { cwd, encoding: 'utf8' });
         } catch { continue; }
         const id = f.path.split('/').pop().split('-')[0];
+        const parentIds = raisedByParentIds(id, text);
         const raisedBy = [];
-        for (const raise of (pr.files ?? []).filter(r => r.path?.startsWith(`backlog/raised-by/${id}/`) && r.path.endsWith('.md'))) {
+        for (const raise of (pr.files ?? []).filter(r => parentIds.some(parentId => r.path?.startsWith(`backlog/raised-by/${parentId}/`)) && r.path.endsWith('.md'))) {
           const body = exec('gh', ['api', `repos/${repo}/contents/${raise.path}?ref=${encodeURIComponent(pr.headRefName)}`, '-H', 'Accept: application/vnd.github.raw'], { cwd, encoding: 'utf8' });
           raisedBy.push(...parseRaisedBy(body));
         }
