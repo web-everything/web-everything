@@ -438,7 +438,7 @@ export function createDrainMergeStrategy({
     },
     /** Request only: the queue-file-overlap hold and every enqueue gate remain in force. */
     requestRedTeamWhileDeferred(c, headSha) {
-      if (!enqueues(c.repo) || dryRun || typeof requestRedTeam !== 'function'
+      if (!enqueueMode || dryRun || typeof requestRedTeam !== 'function'
         || !safety.value.waitForRedTeamBeforeEnqueue || !headSha) return null;
       try {
         const lock = withLock(() => {

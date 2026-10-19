@@ -1545,6 +1545,47 @@ describe('red-team requests while queue-file-overlap deferred', () => {
   }
   const hasEnqueueMutation = h => h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')));
 
+  const sibling = { ...c, repo: 'plateauapp/plateau-app' };
+  it('requests once for a non-local repo in enqueue mode without adding a hold', () => {
+    const h = setup();
+    expect(h.s.requestRedTeamWhileDeferred(sibling, HEAD)).toEqual({ requested: true });
+    expect(h.requestRedTeam).toHaveBeenCalledWith({ repo: sibling.repo, pr: 42, head: HEAD, loopPayload: panel });
+    expect(h.s.requestRedTeamWhileDeferred(sibling, HEAD)).toEqual({ requested: false });
+    expect(h.requestRedTeam).toHaveBeenCalledTimes(1);
+    expect(h.s.enqueues(sibling.repo)).toBe(false);
+    expect(h.s.recordedHold(sibling, HEAD)).toBeNull();
+    expect(h.s.queueOverlapHold(sibling, HEAD)).toBeNull();
+    expect(h.state().redTeamPending[`${sibling.repo}#42`].requestedAt).toBe(1000);
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it.each([
+    ['not accepted', { labels: ['ready-to-merge'] }],
+    ['dry run', { dryRun: true }],
+    ['head mismatch', { ghView: { 42: { headRefOid: 'a'.repeat(40), labels: ['review:accepted', 'ready-to-merge'] } } }],
+    ['direct mode', { strategy: 'drain-direct' }],
+  ])('does not request for a non-local repo when %s', (_label, extra) => {
+    const h = setup(extra);
+    expect(h.s.requestRedTeamWhileDeferred(sibling, HEAD)).toBeNull();
+    expect(h.requestRedTeam).not.toHaveBeenCalled();
+    expect(h.state()).toBeNull();
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it('respects request cooldown for a non-local repo', () => {
+    const requestRedTeam = vi.fn(() => ({ requested: false }));
+    const h = setup({ requestRedTeam });
+    expect(h.s.requestRedTeamWhileDeferred(sibling, HEAD)).toEqual({ requested: false });
+    h.advance(60_000);
+    expect(h.s.requestRedTeamWhileDeferred(sibling, HEAD)).toEqual({ requested: false });
+    expect(requestRedTeam).toHaveBeenCalledTimes(1);
+    h.advance(60_000);
+    expect(h.s.requestRedTeamWhileDeferred(sibling, HEAD)).toEqual({ requested: false });
+    expect(requestRedTeam).toHaveBeenCalledTimes(2);
+    expect(h.s.recordedHold(sibling, HEAD)).toBeNull();
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
   it.each([
     { labels: ['review:accepted'] },
     { labels: ['review:accepted', 'ready-to-merge', 'review:changes'] },
@@ -1661,10 +1702,9 @@ describe('red-team requests while queue-file-overlap deferred', () => {
     expect(hasEnqueueMutation(h)).toBe(false);
   });
 
-  it('does nothing without a head or for a different repo', () => {
+  it('does nothing without a head', () => {
     const h = setup();
     expect(h.s.requestRedTeamWhileDeferred(c, null)).toBeNull();
-    expect(h.s.requestRedTeamWhileDeferred({ ...c, repo: 'other/repo' }, HEAD)).toBeNull();
     expect(h.calls).toEqual([]);
     expect(h.requestRedTeam).not.toHaveBeenCalled();
   });

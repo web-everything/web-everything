@@ -6621,6 +6621,10 @@ async function runCli() {
           return hold;
         }
       }
+      if (!isLocalRepo(c.repo)) {
+        try { await mergeStrategy.requestRedTeamWhileDeferred(c, c.listedHeadSha || c.headSha); }
+        catch { /* Request failure must never change the decision. */ }
+      }
       return mergeStrategy.recordedHold(c, c.listedHeadSha || c.headSha);
     });
     if (throughput.value.holdFirst) {
