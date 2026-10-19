@@ -373,7 +373,9 @@ export async function smokeAndAdopt({
     });
     return false;
   };
-  const adoptedState = readRebuildState(root, stEnv).adopted ?? null;
+  const recordedAdoption = readRebuildState(root, stEnv).adopted ?? null;
+  // Main ancestry establishes overlay membership, never a previous live-smoke pass.
+  const adoptedState = recordedAdoption?.baselineOnly ? null : recordedAdoption;
   const adoptedHead = adoptedState?.head ?? null;
 
   // xhiqxz3 — which overlays of a build need the real dispatch smoke (none when the setting is off).

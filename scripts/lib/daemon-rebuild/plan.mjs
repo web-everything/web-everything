@@ -339,8 +339,8 @@ export async function planRebuild({
   const applied = [];
   let cur = mainSha;
 
-  // x5059uu — establishment is fail closed; the shared predicate requires complete adoption
-  // metadata and negative ancestry probes to prove a newcomer. Established overlays apply first (each group
+  // x5059uu — order by current-tip ancestry, not historical adoption or HOLD uncertainty.
+  // A moved tip is a newcomer even when its earlier content is protected. Established overlays apply first (each group
   // keeps list order), so when a newcomer conflicts with them it is the newcomer that is parked, never the proven
   // ones. Before this, #4643 (registered first) pushed a conflicting commit and the rebuild conflict-dropped the
   // live #4658/#4663 instead. With no newcomer (or no established overlay) the order is plain list order.
@@ -357,7 +357,12 @@ export async function planRebuild({
     };
   }
   const listed = mainOnly ? [] : overlays;
-  const establishedRefs = new Set(listed.filter(established).map((o) => o.ref));
+  // Unknown tips do not displace proven live tips or gain a LIVE-drop diagnosis. The HOLD
+  // guards above and in prepare/main-only retain the helper's fail-closed boolean result.
+  const establishedRefs = new Set(listed.filter((overlay) => isEstablished({
+    git, headSha, state, overlay, overlays: lineage, establishedRefs: establishedOverlayRefs,
+    evidence: 'tip', classify: true,
+  }) === 'established').map((o) => o.ref));
   const conflictFiles = new Map(); // ref → the files its conflict named (for the x5059uu alerts below)
   const toProcess = [
     ...listed.filter((o) => establishedRefs.has(o?.ref)), ...listed.filter((o) => !establishedRefs.has(o?.ref)),

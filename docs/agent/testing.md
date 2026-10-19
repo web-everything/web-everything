@@ -382,6 +382,23 @@ before the main-only guard (which runs before fetch); absent state or a missing 
 setting stack bases aside: cover contained and moved bases with an applying top in both registry
 orders, invalid pins, last-good preservation, and retirement of approved content already in main.
 
+Planner ordering and HOLD protection use different evidence from the same predicate: pass
+`classify: true` to retain `established | not-established | unknown`, and `evidence: 'tip'`
+for ordering by current-tip ancestry. Historical adoption/pins protect the old content but do
+not give an ordinarily moved tip priority or a LIVE-drop diagnosis. A published refresh
+rename carries affirmative lineage evidence into planner ordering and diagnostics too.
+Prepare may park a proven moved newcomer without HOLD; missing metadata or inconclusive
+tip ancestry still holds, and a failed refresh continues to protect established lineage. Unknown never outranks a proven live
+tip; boolean HOLD callers still treat unknown as established. Preserve only affirmative
+pre-refresh classifications as lineage evidence. A normal rebuild with no adoption record
+may persist an empty baseline only after Git proves the running HEAD is an ancestor of main;
+this keeps a passed-but-unadopted ready candidate from inventing running overlay content.
+That `baselineOnly` record has no adoption timestamp and cannot authorize skipping smoke,
+unchanged-code checks, or comparison against a supposedly verified last-good build.
+Main-only checks metadata before this bootstrap and continues to hold when it is missing.
+Regression: the unchanged keep-established, stack-tops and ready-candidate suites, plus the
+shared predicate's explicit-classification cases. Run all via heavy admission.
+
 ## Daemon entry import regression
 
 `daemon-entries-import.test.mjs` cold-imports every `DAEMON_ENTRY_MODULES` entry from the

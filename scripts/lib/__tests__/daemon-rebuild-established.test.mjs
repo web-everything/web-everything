@@ -135,3 +135,54 @@ describe('isEstablished — a newcomer must be proven', () => {
     expect(isEstablished(f)).toBe(true);
   });
 });
+
+
+describe('isEstablished — explicit evidence classification', () => {
+  it('distinguishes a proven newcomer from unknown metadata without weakening boolean HOLDs', () => {
+    const f = fixture();
+    expect(isEstablished({ ...f, classify: true })).toBe('not-established');
+    expect(isEstablished({ ...f, state: undefined, classify: true })).toBe('unknown');
+    expect(isEstablished({ ...f, state: undefined })).toBe(true);
+  });
+
+  it('orders a moved tip as new while preserving adoption and pin protection', () => {
+    const f = fixture();
+    f.state.adopted.applied = [{ ref: f.overlay.ref }];
+    expect(isEstablished({ ...f, classify: true })).toBe('established');
+    expect(isEstablished({ ...f, evidence: 'tip', classify: true })).toBe('not-established');
+    f.state.adopted.applied = [];
+    f.overlay.pinnedSha = 'old-pin';
+    const negative = f.git.getMockImplementation();
+    f.git.mockImplementation((args) => args[0] === 'merge-base' && args[2] === 'old-pin'
+      ? { status: 0 } : negative(args));
+    expect(isEstablished({ ...f, classify: true })).toBe('established');
+    expect(isEstablished({ ...f, evidence: 'tip', classify: true })).toBe('not-established');
+  });
+
+  it('preserves proven establishment for a published refresh rename in planner evidence', () => {
+    const f = fixture();
+    f.overlay = { ref: 'lane/refreshed', refreshedFrom: ['lane/a'] };
+    f.state.adopted.applied = [{ ref: 'lane/a' }];
+    expect(isEstablished({ ...f, evidence: 'tip', classify: true })).toBe('established');
+    f.state.adopted.applied = [];
+    expect(isEstablished({ ...f, evidence: 'tip', classify: true })).toBe('not-established');
+    f.git.mockImplementation(() => ({ status: 128 }));
+    expect(isEstablished({ ...f, evidence: 'tip', classify: true })).toBe('unknown');
+  });
+
+  it.each([0, 1, 128])('classifies tip ancestry status %s independently of missing adoption metadata', (status) => {
+    const f = fixture();
+    const negative = f.git.getMockImplementation();
+    f.git.mockImplementation((args) => args[0] === 'merge-base' ? { status } : negative(args));
+    expect(isEstablished({ ...f, state: undefined, evidence: 'tip', classify: true }))
+      .toBe(status === 0 ? 'established' : status === 1 ? 'not-established' : 'unknown');
+    expect(isEstablished({ ...f, state: undefined })).toBe(true);
+  });
+
+  it('does not turn a failed lineage probe into affirmative establishment', () => {
+    const f = fixture();
+    f.git.mockImplementation(() => ({ status: 128 }));
+    expect(isEstablished({ ...f, classify: true })).toBe('unknown');
+    expect(isEstablished(f)).toBe(true);
+  });
+});

@@ -237,6 +237,18 @@ export async function prepareRebuild({
   for (const ref of fetchResult.goneRefs) alert('overlay-ref-gone-on-fetch', { ref });
 
   const fetchedMainSha = verifyRev(git, 'origin/main^{commit}');
+  // A normal rebuild can establish its initial baseline: HEAD already belongs to main,
+  // so no overlay-only content is running there. Persist this observed fact before the
+  // off-lock smoke; a ready candidate blocked from adoption must not make its overlays live.
+  // This is ancestry evidence, not a smoke pass: no adoption timestamp or smoke-skip eligibility.
+  // Main-only still checks missing metadata before fetch and cannot bootstrap this proof.
+  if (!mainOnly && !state.adopted && fetchedMainSha) {
+    const baseline = git(['merge-base', '--is-ancestor', prevHead, fetchedMainSha]);
+    if (!baseline.error && baseline.status === 0) {
+      state.adopted = { head: prevHead, mainSha: prevHead, applied: [], baselineOnly: true };
+      writeState();
+    }
+  }
   const stack = resolveOverlayStackMode(env);
   const chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysBefore, env });
   const refreshSettings = resolveOverlayRefreshSettings(env);
@@ -244,10 +256,15 @@ export async function prepareRebuild({
   // Retain pre-refresh evidence, including pins, while the registry changes underneath us.
   const lineage = [...overlaysBefore];
   const establishedRefs = new Set(overlaysBefore.filter((overlay) => isEstablished({
-    state, overlays: lineage, git, headSha: prevHead, overlay,
-  })).map((overlay) => overlay.ref));
-  const established = (ref) => isEstablished({ state, overlays: lineage, git, headSha: prevHead,
-    overlay: lineage.find((entry) => entry.ref === ref) ?? { ref }, establishedRefs });
+    state, overlays: lineage, git, headSha: prevHead, overlay, classify: true,
+  }) === 'established').map((overlay) => overlay.ref));
+  const classification = (ref, evidence = 'lineage') => isEstablished({ state, overlays: lineage, git, headSha: prevHead,
+    overlay: lineage.find((entry) => entry.ref === ref) ?? { ref }, establishedRefs, evidence, classify: true });
+  const established = (ref) => classification(ref) !== 'not-established';
+  // An ordinary moved tip can be parked without holding the old build. Missing metadata
+  // or an inconclusive tip still holds; refresh renames retain their proven lineage.
+  const establishedDrop = (ref) => classification(ref) === 'unknown'
+    || classification(ref, 'tip') !== 'not-established';
   if (!mainOnly && refreshSettings.autoRefresh && fetchedMainSha) {
     const stackPlan = stack.mode === 'tops' && overlaysBefore.length > 1
       ? await planOverlayStacks({ git, mainSha: fetchedMainSha, overlays: overlaysBefore, headSha: prevHead,
@@ -343,7 +360,7 @@ export async function prepareRebuild({
     // Refused plans cannot release a hold, even if they contain a partial application.
     const applied = new Set((plan.ok ? plan.applied ?? [] : []).flatMap((o) =>
       [o.ref, ...(overlaysBefore.find((entry) => entry.ref === o.ref)?.refreshedFrom ?? [])]));
-    const drops = (plan.decisions ?? []).filter((d) => d.action === 'drop' && established(d.ref) && !applied.has(d.ref));
+    const drops = (plan.decisions ?? []).filter((d) => d.action === 'drop' && establishedDrop(d.ref) && !applied.has(d.ref));
     const removed = new Set((plan.decisions ?? []).filter((d) => d.action === 'remove').map((d) => d.ref));
     const failed = [...refreshFailures.keys()].filter((ref) => established(ref) && !removed.has(ref) && !applied.has(ref));
     const refs = [...new Set([...drops.map((d) => d.ref), ...failed])];
@@ -529,7 +546,8 @@ export async function prepareRebuild({
   const busyTrees = Array.isArray(state.busySkippedTrees) ? state.busySkippedTrees : [];
   const headTree = busyTrees.length ? verifyRev(git, `${prevHead}^{tree}`) : null;
   const busyUnverified = busyTrees.length > 0 && (!headTree || busyTrees.includes(headTree));
-  if (typeof skipCheck === 'function' && state.adopted?.head === prevHead && !state.held && !state.quarantine
+  if (typeof skipCheck === 'function' && state.adopted?.head === prevHead && !state.adopted.baselineOnly
+    && !state.held && !state.quarantine
     && !busyUnverified && !buildLeaseIsLive(state.building, { env: stEnv, nowMs: nowMs() })) {
     // --no-renames: a renamed file must list BOTH endpoints, or a renamed-away imported module hides from the closure.
     // -z: NUL-separated, so a non-ASCII path is not C-quoted into a string that never matches a closure member.
