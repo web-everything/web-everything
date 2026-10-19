@@ -234,6 +234,105 @@ describe('durable card batch IO', () => {
     expect(existsSync(join(f.stateDir, 'pending-prevention'))).toBe(false);
   }, 30_000);
 
+  it.each([
+    ['missing sequence', { seq: undefined }],
+    ['zero sequence', { seq: 0 }],
+    ['fractional sequence', { seq: 1.5 }],
+    ['unsafe sequence', { seq: Number.MAX_SAFE_INTEGER + 1 }],
+    ['missing PR number', { pr: undefined }, false],
+    ['zero PR number', { pr: 0 }, false],
+    ['empty PR number', { pr: '' }, false],
+    ['negative PR number', { pr: -1 }],
+    ['fractional PR number', { pr: 5272.5 }],
+    ['nonnumeric PR number', { pr: 'not-a-pr' }],
+    ['unsafe PR number', { pr: Number.MAX_SAFE_INTEGER + 1 }],
+    ['repository mismatch', { repo: 'other/repo' }],
+    ['kind mismatch', { kind: 'filing' }],
+    ['batch reference mismatch', { batchRef: 'lane/card-batch-prevention-99' }],
+  ])('sealed recovery refuses invalid batch identity before GitHub lookup: %s', async (_name, changes, logsInvalid = true) => {
+    const f = fixture();
+    await admitCard(f.card(), f.options);
+    const sealed = { ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272, ...changes };
+    writeFileSync(f.statePath, JSON.stringify(sealed));
+    const before = readFileSync(f.statePath);
+    const head = f.head();
+    const calls = [];
+    const logs = [];
+    expect(await admitCard(f.card('5193'), { ...f.options, log: line => logs.push(line), gh: async args => {
+      calls.push(args);
+      return '{"state":"MERGED"}';
+    } })).toEqual({ action: 'refuse', reason: 'batch-sealed' });
+    expect(calls).toEqual([]);
+    // Missing/falsey PRs stay sealed without entering the recovery lookup at all.
+    expect(logs).toEqual(logsInvalid
+      ? [`card-batch ${sealed.batchRef} PR ${sealed.pr} GitHub UNREADABLE: recovery unreadable; kept sealed and held`] : []);
+    expect(readFileSync(f.statePath)).toEqual(before);
+    expect(f.head()).toBe(head);
+    // No archive, pending spool, successor state, or abandoned lock may be published.
+    expect(readdirSync(f.stateDir)).toEqual(['org-repo-prevention.json']);
+    expect(git(f.remote, ['for-each-ref', '--format=%(refname)', 'refs/heads/lane/']).trim()).toBe(f.ref);
+  });
+
+  it.each([
+    ['missing head commit', undefined],
+    ['symbolic head commit', 'HEAD'],
+    ['short head commit', 'abc123'],
+    ['option-shaped head commit', '--all'],
+  ])('sealed recovery refuses invalid head identity before GitHub lookup: %s', async (_name, headSha) => {
+    const f = fixture();
+    await admitCard(f.card(), f.options);
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272, headSha }));
+    const before = readFileSync(f.statePath);
+    const head = f.head();
+    const calls = [];
+    expect(await admitCard(f.card('5193'), { ...f.options, gh: async args => {
+      calls.push(args);
+      return '{"state":"MERGED"}';
+    } })).toEqual({ action: 'refuse', reason: 'head-mismatch' });
+    expect(calls).toEqual([]);
+    expect(readFileSync(f.statePath)).toEqual(before);
+    expect(f.head()).toBe(head);
+    expect(readdirSync(f.stateDir)).toEqual(['org-repo-prevention.json']);
+    expect(git(f.remote, ['for-each-ref', '--format=%(refname)', 'refs/heads/lane/']).trim()).toBe(f.ref);
+  });
+
+  it.each([
+    ['missing member commit', { commitSha: undefined }],
+    ['symbolic member commit', { commitSha: 'HEAD' }],
+    ['short member commit', { commitSha: 'abc123' }],
+    ['option-shaped member commit', { commitSha: '--all' }],
+    ['missing member card ID', { cardId: undefined }],
+    ['empty member card ID', { cardId: '' }],
+    ['dot member card ID', { cardId: '..' }],
+    ['path-shaped member card ID', { cardId: '../5192' }],
+    ['uppercase member card ID', { cardId: 'CARD5192' }],
+    ['non-ASCII member card ID', { cardId: '５１９２' }],
+    ['member repository mismatch', { source: { repo: 'other/repo' } }],
+    ['missing member repository', { source: {} }],
+    ['missing member source', { source: undefined }],
+  ])('closed recovery refuses invalid saved member identity: %s', async (_name, changes) => {
+    const f = fixture();
+    await admitCard(f.card(), f.options);
+    const sealed = { ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 };
+    // Keep the immutable commit and its marker valid; corrupt only the saved membership.
+    Object.assign(sealed.members[0], changes);
+    writeFileSync(f.statePath, JSON.stringify(sealed));
+    const before = readFileSync(f.statePath);
+    const head = f.head();
+    const calls = [];
+    const logs = [];
+    expect(await admitCard(f.card('5193'), { ...f.options, log: line => logs.push(line), gh: async args => {
+      calls.push(args);
+      return '{"state":"CLOSED"}';
+    } })).toEqual({ action: 'refuse', reason: 'batch-sealed' });
+    expect(calls).toEqual([['pr', 'view', '5272', '--repo', 'org/repo', '--json', 'state']]);
+    expect(logs).toEqual(['card-batch lane/card-batch-prevention-1 PR 5272 GitHub CLOSED: recovery unreadable; kept sealed and held']);
+    expect(readFileSync(f.statePath)).toEqual(before);
+    expect(f.head()).toBe(head);
+    expect(readdirSync(f.stateDir)).toEqual(['org-repo-prevention.json']);
+    expect(git(f.remote, ['for-each-ref', '--format=%(refname)', 'refs/heads/lane/']).trim()).toBe(f.ref);
+  });
+
   it.each(['MERGED', 'CLOSED', 'OPEN', 'unreadable'])('logs retirement and held recovery outcomes: %s', async status => {
     const f = fixture();
     await admitCard(f.card(), f.options);
