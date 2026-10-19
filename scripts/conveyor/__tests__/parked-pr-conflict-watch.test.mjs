@@ -68,6 +68,7 @@ import {
 import { mintSessionSlug } from '../session-slug.mjs';
 import { UNOWNED_REBASE_INFRA_MARKER, countUnownedRebaseInfraFailures, formatUnownedRebaseInfraMarker, UNOWNED_REBASE_ATTEMPT_MARKER, UNOWNED_REBASE_ATTEMPT_CAP, countUnownedRebaseAttempts } from '../unowned-rebase-attempt-count.mjs';
 import { NOTE_COMMENT_MARKER, postNoteComment } from '../reconcile-note-comment.mjs';
+import { CARD_CONFLICT_PRECONDITION_REASONS } from '../../lib/card-conflict-resolve.mjs';
 import { notifyDesktopChecked } from '../branch-sync.mjs';
 
 // #xu38vlf — the two new operator-visible-escalation call sites (the round-cap-exhausted note on the unowned
@@ -3608,6 +3609,81 @@ it('skips a deferred discovery pass without posting a finding', () => {
 
 
 describe('conflict watch diagnostics', () => {
+  for (const labels of [
+    ['review:pending', 'review:changes', CONFLICT_LABEL],
+    ['review:pending', CONFLICT_LABEL],
+    ['review:accepted', 'ready-to-merge', CONFLICT_LABEL],
+  ]) {
+    it.each([
+      { action: 'skip', precondition: true, reason: 'ambiguous JIT reference mapping' },
+      { action: 'error', reason: 'card conflict fetch failed' },
+      { action: 'current', reason: 'already current' },
+      { action: 'rebased', reason: 'cards merged' },
+    ])(`retains card outcome %j exactly once through recovery for ${labels.join(', ')}`, outcome => {
+      const pr = { number: 42, mergeable: 'CONFLICTING', baseRefName: 'main',
+        labels: labels.map(name => ({ name })), files: [{ path: 'backlog/123-test.md' }] };
+      const postFinding = vi.fn();
+      const postRearm = vi.fn();
+      const postComment = vi.fn();
+      const results = watchParkedPrConflicts({
+        repo: 'o/n', sameLineConflict: 'fixer', listPrs: () => [pr],
+        provider: { ensureLabel() {}, setLabels() {}, postComment },
+        cardConflictSettings: { value: { autoResolveRaisedBy: true }, sources: {} },
+        listPrComments: () => [], listAgents: () => [],
+        attemptCardRebase: () => outcome, postRearm, postFinding,
+        computeConflictDisposition: () => 'clean', labelAgeMs: () => 0,
+      });
+      expect(results).toHaveLength(1);
+      expect(results[0].mechanicalRebase).toEqual(outcome);
+      expect(formatConflictWatchSummary(results, [pr]))
+        .toContain(`mechanicalRebase=${outcome.action} reason=${outcome.reason}`);
+      const resolved = ['current', 'rebased'].includes(outcome.action);
+      expect(postRearm).toHaveBeenCalledTimes(resolved ? 1 : 0);
+      const idle = labels.includes('review:pending') && !labels.includes('review:changes');
+      expect(postFinding).toHaveBeenCalledTimes(!resolved && idle ? 1 : 0);
+      expect(postComment.mock.calls.some(call => call[2].startsWith(UNOWNED_REBASE_ATTEMPT_MARKER))).toBe(false);
+    });
+  }
+
+  it('preserves the card refusal when the unowned route also attempts a mechanical rebase', () => {
+    const outcome = { action: 'skip', precondition: true, reason: 'PR is not proven card-only' };
+    const attemptMechanicalRebase = vi.fn(() => ({ action: 'current', reason: 'already current' }));
+    const results = watchParkedPrConflicts({
+      repo: 'o/n', sameLineConflict: 'fixer',
+      listPrs: () => [{ number: 42, mergeable: 'CONFLICTING', baseRefName: 'main', labels: [],
+        files: [{ path: 'backlog/123-test.md' }] }],
+      provider: { ensureLabel() {}, setLabels() {}, postComment() {} },
+      cardConflictSettings: { value: { autoResolveRaisedBy: true }, sources: {} },
+      listPrComments: () => [], listAgents: () => [],
+      attemptCardRebase: () => outcome, attemptMechanicalRebase,
+      computeConflictDisposition: () => 'clean', ...noopRouting(),
+    });
+    expect(attemptMechanicalRebase).toHaveBeenCalledTimes(1);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ mechanicalRebase: outcome, routedTo: 'mechanical-rebase' });
+    expect(formatConflictWatchSummary(results)).toContain(`mechanicalRebase=skip reason=${outcome.reason}`);
+  });
+
+  it('retains a thrown card attempt when same-line recovery cannot read the thread', () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      let reads = 0;
+      const results = watchParkedPrConflicts({
+        repo: 'o/n', sameLineConflict: 'fixer',
+        listPrs: () => [{ number: 42, mergeable: 'CONFLICTING', baseRefName: 'main',
+          labels: ['review:pending', 'review:changes', CONFLICT_LABEL].map(name => ({ name })),
+          files: [{ path: 'backlog/123-test.md' }] }],
+        provider: { ensureLabel() {}, setLabels() {}, postComment() {} },
+        cardConflictSettings: { value: { autoResolveRaisedBy: true }, sources: {} },
+        listPrComments: () => ++reads === 1 ? [] : null, listAgents: () => [],
+        attemptCardRebase: () => { throw new Error('offline'); }, ...noopRouting(),
+      });
+      expect(results).toHaveLength(1);
+      expect(results[0].mechanicalRebase).toMatchObject({ action: 'error', cause: 'offline' });
+      expect(formatConflictWatchSummary(results)).toContain('cause=offline');
+    } finally { log.mockRestore(); }
+  });
+
   it('reads missing files for an already-labelled queued card-only conflict and attempts card rebase', () => {
     const pr = { number: 5697, mergeable: 'CONFLICTING', baseRefName: 'main',
       labels: ['review:accepted', 'ready-to-merge', CONFLICT_LABEL].map(name => ({ name })) };
@@ -3750,6 +3826,7 @@ describe('attempt marker writes and operator cutoff in both populations', () => 
       { action: 'error', reason: 'read failed' },
       { action: 'skip', precondition: true, reason: 'card conflict clone does not match PR repository' },
       { action: 'skip', precondition: true, reason: 'not a main-base PR' },
+      ...CARD_CONFLICT_PRECONDITION_REASONS.map(reason => ({ action: 'skip', precondition: true, reason })),
       { action: 'skip', precondition: true, deferred: true, reason: 'branch moved before recovery' },
       { action: 'skip', deferred: true, reason: 'deferred' },
       { action: 'current' },
@@ -3761,6 +3838,22 @@ describe('attempt marker writes and operator cutoff in both populations', () => 
     it(`${population}: marks only content conflicts with a sanitized outcome`, () => {
       expect(sweep(population, { result: { action: 'skip', reason: ' content\nconflict ' } }).markers)
         .toEqual([`${UNOWNED_REBASE_ATTEMPT_MARKER} outcome=skip:content conflict`]);
+    });
+
+    it.each([
+      'conflict outside Also raised by list',
+      'unsupported conflict markers',
+      'section contains non-list content',
+      'missing or ambiguous Also raised by section',
+      'side already contains conflict markers',
+      'no complete list conflict',
+      'unreadable card',
+    ])(`${population}: posts a counted marker for resolver content refusal %s`, reason => {
+      expect(CARD_CONFLICT_PRECONDITION_REASONS).not.toContain(reason);
+      const result = { action: 'skip', reason };
+      expect(result).not.toHaveProperty('precondition');
+      expect(sweep(population, { result }).markers)
+        .toEqual([`${UNOWNED_REBASE_ATTEMPT_MARKER} outcome=skip:${reason}`]);
     });
 
     it(`${population}: never marks throws or comment read failures`, () => {

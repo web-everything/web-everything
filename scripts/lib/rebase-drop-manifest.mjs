@@ -37,7 +37,7 @@ import { gitRun as gitRunner, ensureFullHistory } from './git-run.mjs';
 import { applyCollisionHealToIndex } from './nnn-collision-heal.mjs';
 import { isFixEvidencePath, isDrainTransientPath } from './transient-paths.mjs';
 import { refuseHeldPush } from '../conveyor/fix-procedure.mjs';
-import { applyRaisedByConflictsToIndex, loadCardConflictSettings } from './card-conflict-resolve.mjs';
+import { applyRaisedByConflictsToIndex, loadCardConflictSettings, CARD_CONFLICT_PRECONDITION_REASONS } from './card-conflict-resolve.mjs';
 import { isCardPath } from '../ci-card-only.mjs';
 
 export const LANE_MANIFEST = '.lane-manifest.json';
@@ -234,7 +234,9 @@ export function rebaseDropManifest({
   if (cardConflict) {
     const resolution = applyRaisedByConflictsToIndex({ run, cwd, env, tree: parsed.tree, base, mergeRef,
       conflictPaths: parsed.conflictPaths, enabled: cardConflictSetting.value });
-    if (!resolution.ok) return { action: 'skip', reason: resolution.reason, conflictPaths: parsed.conflictPaths, cardConflictSetting };
+    if (!resolution.ok) return { action: 'skip',
+      ...(CARD_CONFLICT_PRECONDITION_REASONS.includes(resolution.reason) ? { precondition: true } : {}),
+      reason: resolution.reason, conflictPaths: parsed.conflictPaths, cardConflictSetting };
     resolvedRaisedBy = resolution.resolved;
   }
   // Drop the manifest if present (--ignore-unmatch: a clean merge with no manifest in the tree is fine).

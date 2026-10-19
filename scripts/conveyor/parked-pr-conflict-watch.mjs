@@ -1643,8 +1643,15 @@ export function watchParkedPrConflicts({
     const entry = { num: pr?.number, isConflicting, ...plan, commented: false, ...cardInfraState,
       ...(cardAttempt ? { mechanicalRebase: cardAttempt } : {}),
       ...(cardOnly ? { cardConflictSetting: { value: cardConflictSettings.value.autoResolveRaisedBy, source: cardConflictSettings.sources.autoResolveRaisedBy } } : {}) };
+    // Keep card attempts visible even when normal routing exits without reporting a change.
+    // Routing keeps mutating this same entry; report it only once.
+    let reported = false;
+    const reportEntry = () => {
+      if (!reported) { results.push(entry); reported = true; }
+    };
+    if (cardAttempt) reportEntry();
     if (!plan.add && plan.remove.length === 0 && !graceDue && !recheckCandidate && !idleConflictBounce && !sameLineRecovery) {
-      if (cardAttempt || cardInfraState.unownedRebaseInfraCapExhausted) results.push(entry);
+      if (cardAttempt || cardInfraState.unownedRebaseInfraCapExhausted) reportEntry();
       continue;
     }
     // The #2793 idle re-assert, shared with card xkugvzd's `review:human` case (`variant` only names the route).
@@ -1668,7 +1675,7 @@ export function watchParkedPrConflicts({
           }
           entry.routedTo = `cap-exhausted (conflict-fix, idle${variant ? `, ${variant}` : ''})`;
           entry.conflictFixRoundsSpent = conflictFixRoundsSpent;
-          results.push(entry);
+          reportEntry();
           return;
         }
         // The episode boundary for THIS narrow population is the last completed conflict-fix round (if any) —
@@ -1681,7 +1688,7 @@ export function watchParkedPrConflicts({
         if (hasRecentConflictFindingComment(comments, { now, sinceMs })) {
           // Already re-asserted for this round within the retry window — avoid reposting every tick.
           entry.routedTo = `reconcile-finding (idle conflict-bounce${variant ? `, ${variant}` : ''}, already re-asserted this round)`;
-          results.push(entry);
+          reportEntry();
           return;
         }
         if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
@@ -1690,10 +1697,10 @@ export function watchParkedPrConflicts({
           ? `reconcile-finding (idle conflict-bounce re-asserted, ${variant} — xkugvzd)`
           : 'reconcile-finding (idle conflict-bounce re-asserted — #2793)';
         entry.conflictFixRoundsSpent = conflictFixRoundsSpent;
-        results.push(entry);
+        reportEntry();
       } catch (e) {
         entry.error = String((e && e.message) || e).split('\n')[0];
-        results.push(entry);
+        reportEntry();
       }
     };
     let recoveryComments = null;
@@ -1710,12 +1717,12 @@ export function watchParkedPrConflicts({
           }
           entry.supersededStandDown = true;
           entry.routedTo = 'reconcile-finding (same-line conflict → fixer, marker superseded)';
-          results.push(entry);
+          reportEntry();
           continue;
         }
       } catch (e) {
         entry.error = String(e?.message ?? e).split('\n')[0];
-        results.push(entry);
+        reportEntry();
         continue;
       }
       if (!graceDue && !idleConflictBounce) continue;
@@ -1799,7 +1806,7 @@ export function watchParkedPrConflicts({
           } else {
             entry.routedTo = 'stand-down (unchanged)';
           }
-          results.push(entry);
+          reportEntry();
           continue;
         }
         // #xconflres1 — `!isStatuteTier` (the narrower conflict-path check found the real same-line conflict sits
@@ -1827,10 +1834,10 @@ export function watchParkedPrConflicts({
           : appendOnlyStatute
           ? 'reconcile-finding (append-only statute, marker superseded)'
           : 'reconcile-finding (review-human statute amendment, marker superseded)';
-        results.push(entry);
+        reportEntry();
       } catch (e) {
         entry.error = String((e && e.message) || e).split('\n')[0];
-        results.push(entry);
+        reportEntry();
       }
       continue;
     }
@@ -1890,7 +1897,7 @@ export function watchParkedPrConflicts({
         const baseRefName = pr?.baseRefName ?? null;
         if (baseRefName && baseRefName !== 'main') {
           entry.routedTo = 'deferred-to-reconcile (stacked base — see reconcile-core.mjs#3383, review labels untouched)';
-          results.push(entry);
+          reportEntry();
           continue;
         }
 
@@ -2032,14 +2039,14 @@ export function watchParkedPrConflicts({
             ? 'reconcile-finding (no longer statute-tier — #xconflres1, marker superseded, after drain grace)'
             : 'reconcile-finding (after drain grace)';
         }
-        results.push(entry);
+        reportEntry();
       } catch (e) {
         entry.error = String((e && e.message) || e).split('\n')[0];
-        results.push(entry);
+        reportEntry();
       }
       continue;
     }
-    if (dryRun) { results.push(entry); continue; }
+    if (dryRun) { reportEntry(); continue; }
     try {
       if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
       if (plan.add) {
@@ -2055,7 +2062,7 @@ export function watchParkedPrConflicts({
           provider.ensureLabel(resolvedRepo, CONFLICT_LABEL, CONFLICT_LABEL_META);
           provider.setLabels(resolvedRepo, pr?.number, { add: CONFLICT_LABEL, remove: [] });
           entry.routedTo = 'deferred-to-reconcile (stacked base — see reconcile-core.mjs#3383, review labels untouched)';
-          results.push(entry);
+          reportEntry();
           continue;
         }
 
@@ -2113,12 +2120,12 @@ export function watchParkedPrConflicts({
               try { result = attemptMechanicalRebase({ pr, repo: resolvedRepo }); }
               catch (eAttempt) { result = { action: 'error', reason: String((eAttempt && eAttempt.message) || eAttempt) }; }
               markInfraFailure(pr, result);
-              entry.mechanicalRebase = { action: result?.action, reason: result?.reason ?? null };
+              entry.mechanicalRebase = cardAttempt ?? { action: result?.action, reason: result?.reason ?? null };
               if (result?.action === 'rebased' || result?.action === 'current') {
                 // Resolved mechanically — no label, no bounce, no fix agent spent on a conflict a rebuild already
                 // cleared. GitHub's own `mergeable` flips on the next read of the PR once the push is seen.
                 entry.routedTo = 'mechanical-rebase';
-                results.push(entry);
+                reportEntry();
                 continue;
               }
               if (shouldCountRebaseAttempt(result)) {
@@ -2298,7 +2305,7 @@ export function watchParkedPrConflicts({
     } catch (e) {
       entry.error = String((e && e.message) || e).split('\n')[0];
     }
-    results.push(entry);
+    reportEntry();
   }
   return results;
 }

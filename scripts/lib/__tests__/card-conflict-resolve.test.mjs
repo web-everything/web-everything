@@ -4,10 +4,11 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { resolveRaisedByConflict, loadCardConflictSettings } from '../card-conflict-resolve.mjs';
+import { resolveRaisedByConflict, loadCardConflictSettings, CARD_CONFLICT_PRECONDITION_REASONS } from '../card-conflict-resolve.mjs';
 import { defaultAttemptCardConflictRebase } from '../../conveyor/parked-pr-conflict-watch.mjs';
 import { MISSING_RUN_CREDENTIAL_REFUSAL } from '../../conveyor/main-red-recovery.mjs';
 import { rebaseDropManifest } from '../rebase-drop-manifest.mjs';
+import { shouldCountRebaseAttempt } from '../../conveyor/unowned-rebase-attempt-count.mjs';
 
 const path = 'backlog/5360-parent.md';
 const entry = n => `- Also raised by o/r#${n} (finding 1: \`we:backlog/xabc123-child.md:12\` — guard)`;
@@ -16,6 +17,16 @@ const conflict = (left, right) => card([`<<<<<<< main\n${left.join('\n')}\n=====
 const resolve = (main, pr, extra = {}) => resolveRaisedByConflict({ path, main: card(main), pr: card(pr), merged: conflict(main, pr), ...extra });
 
 describe('raised-by union refuses every other conflict', () => {
+  it('exempts only the explicit precondition reasons from the content-conflict cap', () => {
+    expect(CARD_CONFLICT_PRECONDITION_REASONS).toEqual([
+      'ambiguous JIT reference mapping',
+      'cannot read JIT reference mapping',
+      'PR is not proven card-only',
+      'non-backlog conflict',
+      'conflicting card side is missing',
+      'conflicting card is not a regular file',
+    ]);
+  });
   it('unions two appended entries, main first, retaining following sections', () => {
     expect(resolve([entry(1)], [entry(2)])).toMatchObject({ ok: true, text: card([entry(1), entry(2)]) });
   });
@@ -56,7 +67,7 @@ describe('raised-by union refuses every other conflict', () => {
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
-function fixture({ code = false, outside = false } = {}) {
+function fixture({ code = false, outside = false, duplicateBornAs } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'we-card-union-')); roots.push(root);
   const cwd = join(root, 'clone'); mkdirSync(cwd);
   const run = (cmd, args, opts = {}) => spawnSync(cmd, args, { ...opts, cwd: opts.cwd ?? cwd,
@@ -66,12 +77,16 @@ function fixture({ code = false, outside = false } = {}) {
   git('init', '--initial-branch=main'); mkdirSync(join(cwd, 'backlog'));
   writeFileSync(join(cwd, path), card([entry(0)])); git('add', '.'); git('commit', '-m', 'base');
   const common = git('rev-parse', 'HEAD');
-  writeFileSync(join(cwd, path), card([entry(0), entry(1)]));
+  writeFileSync(join(cwd, path), card([entry(0), entry(1)]).replace('Body', outside ? 'Changed on main' : 'Body'));
   writeFileSync(join(cwd, 'backlog/6000-child.md'), '---\nbornAs: xabc123\n---\n# Child\n');
+  if (duplicateBornAs) {
+    for (const num of [3111, 3112]) {
+      writeFileSync(join(cwd, `backlog/${num}-historic.md`), `---\nbornAs: ${duplicateBornAs}\n---\n# Historic\n`);
+    }
+  }
   git('add', '.'); git('commit', '-m', 'main append'); git('update-ref', 'refs/remotes/origin/main', 'HEAD');
   git('checkout', '-b', 'lane/cards', common);
   writeFileSync(join(cwd, path), card([entry(0), entry(2)]).replace('Body', outside ? 'Changed' : 'Body'));
-  if (outside) { /* main must also change the same non-list hunk */ }
   if (code) writeFileSync(join(cwd, 'code.mjs'), 'export const x = 1;\n');
   git('add', '.'); git('commit', '-m', 'PR append');
   const head = git('rev-parse', 'HEAD');
@@ -82,6 +97,30 @@ function fixture({ code = false, outside = false } = {}) {
 }
 
 describe('trusted no-checkout rebase path with real local Git', () => {
+  it('keeps an outside-list content refusal counted without publishing', () => {
+    const f = fixture({ outside: true });
+    const result = rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run: f.run, fetch: false });
+    expect(result).toMatchObject({ action: 'skip', reason: 'conflict outside Also raised by list' });
+    expect(result).not.toHaveProperty('precondition');
+    expect(shouldCountRebaseAttempt(result)).toBe(true);
+    expect(f.git('ls-remote', 'origin', 'refs/heads/lane/cards')).toContain(f.head);
+    expect(readFileSync(join(f.cwd, path), 'utf8')).toBe(f.before);
+  });
+  it('resolves with unrelated duplicate bornAs hashes on main and still maps unambiguous references', () => {
+    const f = fixture({ duplicateBornAs: 'xzdi27a' });
+    const result = rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run: f.run, fetch: false });
+    expect(result).toMatchObject({ action: 'rebased', resolvedRaisedBy: [path] });
+    expect(f.git('show', `${result.newCommit}:${path}`) + '\n')
+      .toBe(card([entry(0), entry(1), entry(2)].map(e => e.replace('xabc123', '6000'))));
+  });
+  it('refuses an ambiguous bornAs hash referenced by a list entry without publishing', () => {
+    const f = fixture({ duplicateBornAs: 'xabc123' });
+    const result = rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run: f.run, fetch: false });
+    expect(result).toMatchObject({ action: 'skip', precondition: true, reason: 'ambiguous JIT reference mapping' });
+    expect(shouldCountRebaseAttempt(result)).toBe(false);
+    expect(f.git('ls-remote', 'origin', 'refs/heads/lane/cards')).toContain(f.head);
+    expect(readFileSync(join(f.cwd, path), 'utf8')).toBe(f.before);
+  });
   it('resolves and publishes a fast-forward merge with current JIT refs and unchanged checkout', () => {
     const f = fixture();
     const result = rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run: f.run, fetch: false });
@@ -94,13 +133,34 @@ describe('trusted no-checkout rebase path with real local Git', () => {
   });
   it('refuses a mixed code PR even when its only conflict is a list', () => {
     const f = fixture({ code: true });
-    expect(rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run: f.run, fetch: false }).action).toBe('skip');
+    const result = rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run: f.run, fetch: false });
+    expect(result).toMatchObject({ action: 'skip', precondition: true, reason: 'PR is not proven card-only' });
+    expect(shouldCountRebaseAttempt(result)).toBe(false);
     expect(f.git('ls-remote', 'origin', 'refs/heads/lane/cards')).toContain(f.head);
+  });
+  it.each([
+    ['grep', 'cannot read JIT reference mapping'],
+    ['show', 'conflicting card side is missing'],
+    ['ls-tree', 'conflicting card is not a regular file'],
+  ])('does not count a resolver refusal from failed %s', (command, reason) => {
+    const f = fixture();
+    const run = (cmd, args, opts) => {
+      if (args[0] === command) return { status: 2, stdout: '', stderr: 'unavailable' };
+      return f.run(cmd, args, opts);
+    };
+    const result = rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run, fetch: false });
+    expect(result).toMatchObject({ action: 'skip', precondition: true, reason });
+    expect(shouldCountRebaseAttempt(result)).toBe(false);
+    expect(f.git('ls-remote', 'origin', 'refs/heads/lane/cards')).toContain(f.head);
+    expect(readFileSync(join(f.cwd, path), 'utf8')).toBe(f.before);
   });
   it('disabled policy leaves the conflicting remote head untouched', () => {
     const f = fixture();
-    expect(rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run: f.run, fetch: false,
-      cardConflictSettings: { value: { autoResolveRaisedBy: false }, sources: { autoResolveRaisedBy: 'tool' } } }).action).toBe('skip');
+    const result = rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run: f.run, fetch: false,
+      cardConflictSettings: { value: { autoResolveRaisedBy: false }, sources: { autoResolveRaisedBy: 'tool' } } });
+    expect(result).toMatchObject({ action: 'skip', reason: 'cardConflicts.autoResolveRaisedBy disabled' });
+    expect(result).not.toHaveProperty('precondition');
+    expect(shouldCountRebaseAttempt(result)).toBe(true);
     expect(f.git('ls-remote', 'origin', 'refs/heads/lane/cards')).toContain(f.head);
   });
   it('pins and recomputes the card merge when another fetch advances main during the probe', () => {
