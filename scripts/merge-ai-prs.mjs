@@ -199,7 +199,10 @@ import { buildVerdictRecord, appendVerdict, labelVerdictOf, buildLedgerEvent, EV
 import { ensureFreshGithubAppEnv } from './lib/github-app-auth-env.mjs';
 // x2e120n — per-step pass timing ("why so slow", the resident drain daemon's history.jsonl carried only a
 // pass's TOTAL ms, no breakdown). See pass-timings.mjs's own header for the full shape/rationale.
-import { buildSkipReasons, formatSkipSummary, formatSkipReasonsLine } from './lib/drain-skip-reasons.mjs';
+import { buildSkipReasons, classifySkipReason, formatSkipSummary, formatSkipReasonsLine } from './lib/drain-skip-reasons.mjs';
+import { resolveDrainThroughput, createHoldMemo, carryReady, readCarry, writeCarry, orderCarry } from './lib/drain-throughput.mjs';
+import { numberingWithdrawalOwed } from './lib/numbering-carry.mjs';
+import { queueStatePath } from './lib/drain-merge-strategy.mjs';
 import { createStepTimer, formatTimingsSummary, PASS_STEP_ORDER } from './lib/pass-timings.mjs';
 import { mapWithConcurrency, runEnqueueCandidates, canParallelEnqueue, createBranchPreparationRequired, formatConcurrencySources } from './lib/drain-concurrency.mjs';
 import { execDrainAsync } from './lib/drain-gh-async.mjs';
@@ -208,7 +211,7 @@ export { mapWithConcurrency } from './lib/drain-concurrency.mjs';
 import { runLedgerShadow, formatShadowLine } from './lib/drain-ledger-shadow.mjs'; // #5444 — ledger gate in SHADOW beside the labels; journals, never decides
 import { drainReviewGateFact, readDrainLedgerSnapshot, recordDrainLedgerFacts } from './lib/drain-ledger-facts.mjs';
 import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overlapRowKey, readyToMergeLabelTimeMs } from './conveyor/land-overlap-yield.mjs'; // + readyToMergeLabelTimeMs: the drain order's ready-at (same cached label read) // #4308 — the land-time overlap-yield planner (see planLabelDrain's own `overlapContext` param)
-import { filterEnqueueableOverlapRows, resolveOverlapYieldOnlyToEnqueueableSetting, formatOverlapYieldOnlyToEnqueueableSetting } from './conveyor/overlap-yield-enqueueable.mjs';
+import { filterEnqueueableOverlapRows, resolveOverlapYieldOnlyToEnqueueableSetting, formatOverlapYieldOnlyToEnqueueableSetting, resolveOverlapYieldRequiresLandableSetting, formatOverlapYieldRequiresLandableSetting } from './conveyor/overlap-yield-enqueueable.mjs';
 import { rankByDeliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES } from './lib/delivery-priority.mjs'; // drain order (2026-10-10): the shared P0-P4 class rule
 import { readDeliveryPrioritySettings } from './conveyor/delivery-priority-shadow.mjs'; // drain order: the shared aging/cap settings (platform preference `deliveryPriority`)
 import { execFileSyncThrottled } from './lib/gh-throttle.mjs'; // drain order: the operator-override labeler read
@@ -1383,6 +1386,11 @@ export function canConsumePrestagedAdmission(c, { ready, branchPreparationRequir
     && !branchPreparationRequired && queueAdmission?.allowed === true;
 }
 
+/** Carry the listing evidence into queue admission even when the planner projects the candidate. */
+export function candidateWithListedFiles(c, verdict = c) {
+  return { ...c, listedFiles: verdict?.listedFiles, listedFilesComplete: verdict?.listedFilesComplete };
+}
+
 /**
  * #2684 — is this candidate a cross-locus couple's WE half that was OVERLAP-STACKED on its impl tip? Such a PR
  * carries the couple manifest (`hasManifest` + `crossRepo`) AND a per-repo `base` sha (`v.base` — the impl tip
@@ -2369,6 +2377,7 @@ export function buildOverlapRows({ candidates, verdicts, openPrContext, mergedPr
           labels: Array.isArray(p.labels) ? p.labels : [], files, filesComplete: files.length < OVERLAP_FILES_PAGE_CAP,
           readyAtMs: null, windowMs: null, headSha: v?.headSha ?? p.headRefOid ?? null,
           item: v?.item ?? null, exempt: false, requiredCheckRed: isRequiredCheckFailed(p, requiredCheck),
+          requiredCheckGreen: isRequiredCheckGreen(p, requiredCheck),
           dependsOn: new Set([...(v?.blockedBy || []), ...(v?.stackParents || []), ...bodyDeps]),
         });
       }
@@ -2382,7 +2391,7 @@ export function buildOverlapRows({ candidates, verdicts, openPrContext, mergedPr
     if (!base) continue; // no raw listing row — should not happen for a candidate drawn from this same listing
     candidateRows.push({ ...base, exempt: isExemptItem(c.item) });
   }
-  return { candidateRows, openPrRows: filterEnqueueableOverlapRows({ openPrRows, verdicts, localSlug, enabled: resolveOverlapYieldOnlyToEnqueueableSetting({ argv, env: process.env }).value }) };
+  return { candidateRows, openPrRows: filterEnqueueableOverlapRows({ openPrRows, verdicts, localSlug, enabled: resolveOverlapYieldOnlyToEnqueueableSetting({ argv, env: process.env }).value, requiresLandable: resolveOverlapYieldRequiresLandableSetting({ argv, env: process.env }).value }) };
 }
 
 /**
@@ -4370,6 +4379,28 @@ export function ghListErrText(e) {
   return cause && !head.includes(cause) ? `${head} — gh: ${cause}` : head;
 }
 
+/** Reporting only: account for every open allowed fix, including PRs absent from the pass listing. */
+export async function reportRedMainFixSkips({ rows, fixPrs, openPrs = [], verdicts, merged, enqueueOutcomes, localSlug, readPr }) {
+  const local = r => r == null || r === localSlug;
+  const has = (xs, num) => xs.some(x => Number(x.num) === num && local(x.repo));
+  const out = [...rows];
+  for (const num of fixPrs) {
+    if (has(out, num) || has(merged, num) || has(enqueueOutcomes.filter(x => x.outcome === 'enqueued' || x.enqueued === true), num)) continue;
+    let pr = openPrs.find(p => Number(p.number) === num);
+    if (!pr) { try { pr = await readPr(num); } catch { continue; } }
+    if (!pr || (pr.state && pr.state !== 'OPEN')) continue;
+    const outcome = enqueueOutcomes.find(x => Number(x.num) === num && local(x.repo));
+    const verdict = verdicts.find(x => Number(x.num) === num && local(x.repo));
+    const labels = (pr.labels || []).map(l => typeof l === 'string' ? l : l.name);
+    const reason = outcome?.reason || (verdict?.decision !== 'merge' && verdict?.reason) ||
+      (verdict ? 'ready at pass start; the pass ended before it was reached' :
+        !labels.includes('ready-to-merge') ? 'not listed: missing ready-to-merge label' : 'not in this pass listing');
+    out.push({ num, repo: localSlug, kind: outcome?.kind || classifySkipReason(reason), reason,
+      source: outcome ? 'enqueueOutcomes' : 'redMainFix' });
+  }
+  return out;
+}
+
 /**
  * Partial success exits 0 while JSON `failed` stays populated; `ok` still means no duplicate ids.
  * A failure with no landed PRs exits 2. Duplicate ids always take precedence (exit 3).
@@ -4449,6 +4480,7 @@ async function runCli() {
   // usage-error exit, not a drain failure.
   const overlapYieldOverrides = parseOverlapYieldOverrides({ argv, env: process.env });
   process.stderr.write(`${formatOverlapYieldOnlyToEnqueueableSetting(resolveOverlapYieldOnlyToEnqueueableSetting({ argv, env: process.env }))}\n`);
+  process.stderr.write(`${formatOverlapYieldRequiresLandableSetting(resolveOverlapYieldRequiresLandableSetting({ argv, env: process.env }))}\n`);
   const AS_JSON = !!flags.json;
   const DRY_RUN = !!flags['dry-run'];
   const REQUIRED = typeof flags.check === 'string' ? flags.check : 'test';
@@ -5087,7 +5119,7 @@ async function runCli() {
       fixClaimHeld: () => prestageFixClaimHeld(onlyPr, { claimKey: repoKeyForSlug(localSlug) }),
       // The cached base was verified unchanged, and preparation required it to be the default branch.
       beforeEnqueue: (c, sha, entry) => announceAndRetargetBeforeLand(c, { preread: fetchPrComments(c.repo, c.num), defaultBranch: entry.baseRefName }),
-      enqueue: (c, sha, entry) => mergeStrategy.enqueue(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }),
+      enqueue: (c, sha, entry) => mergeStrategy.enqueue(candidateWithListedFiles(c, entry.candidate), sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }),
       recordLanded: recordLandedLedgerFacts,
       requiredCheck: REQUIRED,
     });
@@ -5098,6 +5130,9 @@ async function runCli() {
     }
     process.stderr.write('drain-prestage: cache miss/stale — full fast drain\n');
   }
+  const throughput = resolveDrainThroughput();
+  const carryPath = join(dirname(queueStatePath()), 'drain-ready-carry.json');
+  const carry = throughput.value.carryOverReadyFirst && onlyPr == null ? readCarry(carryPath) : [];
   const prStateSetting = resolveDrainPrState();
   process.stderr.write(`policy · drain.prState.batched=${prStateSetting.value.batched} (${prStateSetting.sources.batched})\n`);
   passPrState = prStateSetting.value.batched
@@ -5158,9 +5193,9 @@ async function runCli() {
       const slug = repo || localSlug;
       let listed;
       let snapshotSeed;
-      // Snapshot rows seed heavy fields only. The open set must still be listed live:
-      // refreshing only the target can miss a newly opened blockedBy/stack/couple sibling.
-      if (slug && onlyPr != null && fastDrainListing.listing === 'snapshot' && isFastDrainTarget(repo, { number: onlyPr })) {
+      // Snapshots seed target/heavy-field hydration only. Every drain lists the live open set
+      // so overlap, blocker and couple decisions see siblings opened since the snapshot.
+      if (slug && onlyPr != null && (fastDrainListing.listing === 'snapshot' || process.env.WE_DRAIN_CATCH_UP_SNAPSHOT === '1') && isFastDrainTarget(repo, { number: onlyPr })) {
         const fields = RECONCILE ? SWEEP_LIST_FIELDS
           : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '');
         try {
@@ -6197,6 +6232,7 @@ async function runCli() {
   // Setting OFF: the freeze stop ran before this pass, but a freeze raised (or the setting switched OFF) since then
   // would reach no hold at all — so a manual freeze seen HERE holds every PR, the fix PR too, as the OFF stop does.
   let redMainHeld = false;
+  let allowedMainFixPrs = [];
   {
     const holdSetting = resolveRedMainHoldSetting();
     const holdOn = holdSetting.value === 'on';
@@ -6205,6 +6241,7 @@ async function runCli() {
       const sig = drainFreezeSignal({ state: freeze, mainRedState: readMainRedState(), priority: readMainRedPriority(), now: Date.now(), holdOn });
       if (sig.red) {
         redMainHeld = true;
+        allowedMainFixPrs = sig.fixPrs.filter(num => decideRedMainHold({ num, signal: sig, setting: 'on' }).fix);
         let held = 0;
         // Mode `quarantine`: hold only PRs overlapping the fix PR's files or a quarantined test's area; no live
         // quarantine entry (or an unreadable list) ⇒ every PR falls back to STOP inside decideQuarantineHold.
@@ -6563,6 +6600,29 @@ async function runCli() {
     // dependents next pass (mirrors the lane-drain cascade). A merge FAILURE (red/behind) marks the PR `skip`
     // so it keeps blocking its dependents — never land past a broken blocker.
     let remaining = verdicts.map((v) => ({ ...v }));
+    const memoHold = createHoldMemo(throughput.value.holdFirst);
+    const earlyHold = c => memoHold(c, async () => {
+      const overlap = preparedPass.plan.deferred.find(d => d.num === c.num && d.repo === c.repo
+        && (d.overlapYield || d.waitOn?.some(w => String(w).startsWith('overlap-yield:'))));
+      if (overlap) return { kind: 'overlap-yield', reason: overlap.waitOn.join(', '), overlapYield: overlap.overlapYield };
+      // Reuse the review hold rule, including the existing explicit relief for pending.
+      const allowPending = (escalationRelief.prs || []).includes(Number(c.num)) || (!!escalationRelief.passWide && !!label);
+      if (hasUnclearedReviewLabel(c.prLabels || [], { allowPending }))
+        return { kind: 'review-hold', reason: 'unsatisfied review hold (review:pending/review:human/review:changes)' };
+      if (numberingWithdrawalOwed(c.repo || localSlug, c.num))
+        return { kind: 'numbering', reason: 'numbering re-stamp withdrawal owed' };
+      return mergeStrategy.recordedHold(c, c.listedHeadSha || c.headSha);
+    });
+    if (throughput.value.holdFirst) {
+      for (const c of remaining.filter(v => v.decision === 'merge')) {
+        let hold;
+        try { hold = await earlyHold(c); }
+        catch (e) { hold = { kind: 'stale-read', reason: `could not re-read the PR fresh for early hold: ${ghListErrText(e)}` }; }
+        if (!hold) continue;
+        c.decision = 'skip'; c.reason = hold.reason;
+        enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', ...hold });
+      }
+    }
     // #2257 — an item is unique per (repo, PR#): match/remove candidates on both so a WE #10 and a FUI #10 never
     // collide in the cascade bookkeeping.
     const sameCand = (a, b) => a.num === b.num && a.repo === b.repo;
@@ -6584,7 +6644,7 @@ async function runCli() {
       // plateau-app#185 (impl), then web-everything#2746 (unrelated, moved WE main), and #2751 (#185's carrier)
       // then read BEHIND and was refused — the impl landed alone.
       const mergedKeysNow = new Set(merged.map((m) => candKey(m)));
-      const coupleStep = planCoupleCascadeStep(plan.ready, {
+      const coupleStep = planCoupleCascadeStep(orderCarry(plan.ready, carry, throughput.value.carryOverReadyFirst), {
         candidates: remaining,
         mergedKeys: mergedKeysNow,
         openSiblingRefs: openSiblingRefSet(openPrContext.prsByRepo, mergedKeysNow, repoKeyOfSlug),
@@ -6778,6 +6838,7 @@ async function runCli() {
           if (!(await mergeQueueGate(c, revalidated.headSha))) {
             const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; // re-judged next pass
             noteSplit('merge-queue: not merge-fresh');
+            revalidationAborted.push({ num: c.num, repo: c.repo, reason: 'merge-queue: not merge-fresh' });
             continue;
           }
           // xnsk54v follow-up (land-path tamper-evidence) — the park/skip comment paths only fire when the drain
@@ -6852,7 +6913,7 @@ async function runCli() {
           }
           const landLock = withLandWriteLock(() => {
             if (isPrAlreadyMerged(c.repo, c.num)) return { skipped: 'already-merged' };
-            if (mergeStrategy.enqueues(c.repo)) return mergeStrategy.enqueue(c, traceHeadSha, { comments: preread.read ? preread.comments : null }); // xtpxusq — never the merge API; throws on failure
+            if (mergeStrategy.enqueues(c.repo)) return mergeStrategy.enqueue(candidateWithListedFiles(c, verdicts.find(v => sameCand(v, c))), traceHeadSha, { comments: preread.read ? preread.comments : null }); // xtpxusq — never the merge API; throws on failure
             // x2e120n — the actual `gh pr merge` round-trip, timed on its own (a sub-component of the wider
             // "mergeCascade" step below, which also covers the pre-merge stamps/retarget for every candidate).
             __t.time('mergeCall', () => mergePr({ pr: c.num, repo: c.repo, method: 'merge', matchHeadCommit: traceHeadSha, caller: 'drain' }));
@@ -7267,11 +7328,20 @@ async function runCli() {
   // record. Never throws, never mutates a verdict; it runs after every merge decision of this pass is final.
   const ledgerShadow = await runLedgerShadow({ verdicts, localSlug, dryRun: DRY_RUN });
   process.stderr.write(`${formatShadowLine(ledgerShadow)}\n`);
-  const skipReasons = buildSkipReasons({ verdicts, merged, failedMerges, revalidationAborted, pendingRebased, coupleHeld, deferred, parked });
+  let skipReasons = buildSkipReasons({ verdicts, merged, failedMerges, revalidationAborted, pendingRebased, coupleHeld, deferred, parked, enqueueOutcomes, passEnded: !DRY_RUN });
+  if (redMainHeld) skipReasons = await reportRedMainFixSkips({ rows: skipReasons, fixPrs: allowedMainFixPrs,
+    openPrs: [...openPrContext.prsByRepo].filter(([repo]) => isLocalRepo(repo)).flatMap(([, prs]) => prs),
+    verdicts, merged, enqueueOutcomes, localSlug,
+    readPr: num => JSON.parse(readGh(['pr', 'view', String(num), '--repo', localSlug, '--json', 'number,state,labels'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })),
+  });
   process.stderr.write(`merge-ai-prs · pass timings: ${formatTimingsSummary(timingSteps, { total: passTotalMs, order: PASS_STEP_ORDER })} (considered ${verdicts.length}, merged ${merged.length}, ${formatSkipSummary(skipReasons)}; ${formatConcurrencySources(resolvedMergePolicy.policy)})\n`);
   // Card 122 slice 1 — logging only: the machine-readable twin of the summary above (coroner / perf-snapshot read it).
   process.stderr.write(`${formatSkipReasonsLine(skipReasons)}\n`);
   const result = { ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, skipReasons, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text, retryable: !!l.err.retryable })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
+  if (!DRY_RUN && onlyPr == null && throughput.value.carryOverReadyFirst) {
+    try { writeCarry(carryPath, carryReady(skipReasons)); }
+    catch (e) { process.stderr.write(`drain: carry-over write failed: ${e.message}\n`); }
+  }
   if (enqueueOutcomes.length) result.enqueueOutcomes = enqueueOutcomes;
   if (followup.mode === 'job' || followup.job) result.followupJob = { handedOff: followup.handedOff, job: followup.job ?? null, actions: followup.actions ?? [], ...(followup.handedOff ? {} : { reason: followup.reason }) }; // x4y74wj — a launch-failed job rides along (handedOff:false) so the fallback to inline is visible
   return { result, merged, failedMerges, pendingRebased: pendingAll, deferred, duplicateIdsOnMain };

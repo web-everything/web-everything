@@ -15,6 +15,7 @@ import { rulesetSuggestion } from '../merge-queue-enqueue.mjs';
 import { saveProvenanceFixtures } from './fixtures/saved-red-team-provenance.mjs';
 import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mjs';
 import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
+import { withLandWriteLock } from '../../readiness/drain-lock.mjs';
 
 const HEAD = 'b'.repeat(40);
 const BASE_TIP = 'e'.repeat(40);
@@ -583,6 +584,122 @@ describe('merge-ai-prs hook wiring', () => {
   });
 });
 
+
+describe('recorded hold read-only admission', () => {
+  const key = 'cwd#5283';
+  const initial = () => ({ pending: [], followedUp: [], redTeamPending: {
+    [key]: { headSha: HEAD, firstPendingAt: 0, retryAt: 0, reason: 'no recorded result on the live head' },
+  } });
+  function reader({ state, write, head = HEAD, evidence = {}, labels = ['review:accepted', 'ready-to-merge'], onView = () => {}, request = () => {} }) {
+    const mutations = [];
+    const s = createDrainMergeStrategy({ localSlug: LOCAL, statePath: 'unused-hold-state',
+      resolved: policyOf('github-merge-queue'), env: { WE_RED_TEAM_TIMING: 'post-accept' },
+      queueSafety: { value: { waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true } },
+      now: () => 1000, log: { write: () => {} },
+      readFile: () => JSON.stringify(state()), writeState: (_path, value) => write(structuredClone(value)),
+      readRedTeamEvidence: () => evidence, requestRedTeam: request,
+      labelProvider: { ensureLabel: () => mutations.push('ensure-label'), setLabels: () => mutations.push('labels') },
+      exec: (_cmd, args) => {
+        if (args[0] === 'pr' && args[1] === 'view') {
+          onView();
+          return JSON.stringify({ headRefOid: typeof head === 'function' ? head() : head, labels });
+        }
+        if (args.includes('--slurp')) return '[[]]';
+        mutations.push(args);
+        return '{}';
+      },
+    });
+    return { s, mutations };
+  }
+
+  it.each(['held', 'clear', 'request', 'sent-back'])('holdOnly performs zero shared-state writes: %s', mode => {
+    let stored = initial();
+    const writes = [];
+    const requests = [];
+    const h = reader({ state: () => stored, write: value => { writes.push(value); stored = value; },
+      labels: mode === 'sent-back' ? ['review:changes'] : mode === 'clear' ? ['ready-to-merge'] : ['review:accepted', 'ready-to-merge'],
+      evidence: mode === 'clear' ? { skipCardOnly: true, scheduled: false }
+        : mode === 'request' ? { scheduled: false, loopPayload: { verdict: { verdict: 'accept' } } }
+          : { scheduled: true, inFlight: true },
+      request: value => { requests.push(value); return { requested: true }; },
+    });
+    const before = structuredClone(stored);
+    const outcome = h.s.recordedHold({ num: 5283 }, HEAD);
+    expect(outcome).toBeNull(); // every case needs the ordinary locked path to refresh/clear/dequeue
+    expect(writes).toEqual([]);
+    expect(stored).toEqual(before);
+    expect(h.mutations).toEqual([]);
+    expect(requests).toEqual([]);
+  });
+
+  it('keeps a cached hold and refreshes an expired hold only on ordinary locked enqueue', () => {
+    const root = mkdtempSync(join(tmpdir(), 'hold-refresh-lock-'));
+    try {
+      let stored = initial();
+      stored.redTeamPending[key].retryAt = 2000;
+      const writes = [];
+      let locked = false;
+      const h = reader({ state: () => stored, write: value => { writes.push(locked); stored = value; },
+        evidence: { scheduled: true, inFlight: true },
+      });
+      expect(h.s.recordedHold({ num: 5283 }, HEAD)).toMatchObject({ kind: 'red-team-pending' });
+      expect(writes).toEqual([]);
+      stored.redTeamPending[key].retryAt = 0;
+      expect(h.s.recordedHold({ num: 5283 }, HEAD)).toBeNull();
+      expect(writes).toEqual([]);
+      // A peer's queue entry arrives after the pre-check and must survive the locked state re-read.
+      stored.pending.push({ num: 77, headSha: HEAD });
+      const result = withLandWriteLock(() => {
+        locked = true;
+        try { return h.s.enqueue({ num: 5283 }, HEAD); } finally { locked = false; }
+      }, { lockRoot: root, runUnlockedOnContention: false });
+      expect(result.result).toMatchObject({ kind: 'red-team-pending' });
+      expect(writes).toEqual([true]);
+      expect(stored.pending).toEqual([expect.objectContaining({ num: 77 })]);
+      expect(stored.redTeamPending[key].retryAt).toBe(301000);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(['held', 'clear'])('overlapping drains preserve the newer-head hold and queue entries: %s old head', mode => {
+    const root = mkdtempSync(join(tmpdir(), 'hold-merge-lock-'));
+    try {
+      let stored = initial();
+      let locked = false;
+      let liveHead = HEAD;
+      const newerHead = 'c'.repeat(40);
+      const writes = [];
+      const write = value => { writes.push({ locked, value }); stored = value; };
+      const lock = fn => withLandWriteLock(() => {
+        locked = true;
+        try { return fn(); } finally { locked = false; }
+      }, { lockRoot: root, runUnlockedOnContention: false });
+      const peer = reader({ state: () => stored, write, head: newerHead, evidence: { scheduled: true, inFlight: true } });
+      let interleaved = false;
+      const old = reader({ state: () => stored, write, head: () => liveHead,
+        labels: mode === 'clear' ? ['ready-to-merge'] : ['review:accepted', 'ready-to-merge'],
+        evidence: mode === 'clear' ? { skipCardOnly: true, scheduled: false } : { scheduled: true, inFlight: true },
+        onView: () => {
+          if (interleaved) return;
+          interleaved = true;
+          // The old drain has read its snapshot. A second drain now records a new head under the real mutex.
+          expect(lock(() => {
+            stored.pending.push({ num: 77, repo: null, headSha: newerHead });
+            return peer.s.enqueue({ num: 5283 }, newerHead);
+          }).result).toMatchObject({ kind: 'red-team-pending' });
+        },
+      });
+      old.s.recordedHold({ num: 5283 }, HEAD);
+      expect(stored.redTeamPending[key].headSha).toBe(newerHead);
+      expect(stored.pending).toEqual([expect.objectContaining({ num: 77 })]);
+      expect(writes.every(w => w.locked)).toBe(true);
+      // Falling through the pre-check is not clearance: locked enqueue re-reads state and the live head.
+      liveHead = newerHead;
+      expect(lock(() => old.s.enqueue({ num: 5283 }, HEAD)).result).toMatchObject({ kind: 'live-state-unreadable' });
+      expect(stored.redTeamPending[key].headSha).toBe(newerHead);
+      expect(stored.pending).toHaveLength(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
 
 describe('post-accept red-team enqueue barrier (#5283)', () => {
   it('an owed panel seat never uses the overdue request or never-scheduled escape', () => {
@@ -1307,5 +1424,50 @@ describe('orphaned accepted panel-seat recovery', () => {
     expect(h.logs.join('')).toContain('requested red team for #5485');
     thread.push({ user: { login: 'web-everything[bot]' }, body: `<!-- we:red-team-advisory pr=5485 rev=${HEAD} -->\n### Post-accept red team — no break found` });
     expect(h.s.enqueue({ num: 5485 }, HEAD, { comments: thread })).toMatchObject({ enqueued: true });
+  });
+});
+
+describe('live queue file-overlap admission', () => {
+  const card = 'backlog/123-card.md';
+  const candidate = { num: 42, listedFiles: [card], listedFilesComplete: true };
+  const facts = numbers => ({ data: { repository: { mergeQueue: { entries: {
+    pageInfo: { hasNextPage: false }, nodes: numbers.map(number => ({ pullRequest: { number } })),
+  } } } } });
+  const setup = (over = {}) => harness({ strategy: 'github-merge-queue',
+    queueFacts: facts([43]), ghView: { 43: { files: [{ path: card }] } }, ...over });
+  it('defers shared cards before any enqueue mutation and reports policy source', () => {
+    const h = setup();
+    expect(h.s.enqueue(candidate, HEAD, { comments: stampedBy(DRAIN) })).toEqual({
+      enqueued: false, deferred: true, kind: 'queue-file-overlap', reason: `#43 share ${card}`,
+    });
+    expect(h.calls.some(call => call.some(arg => arg.includes('enqueuePullRequest')))).toBe(false);
+    expect(h.logs.join('')).toContain(`defer #42 (shares ${card} with queued #43) — includeCards=true (standard)`);
+    expect(h.calls.filter(call => call[0] === 'gh' && call.includes('files'))).toEqual([
+      ['gh', 'pr', 'view', '43', '--repo', LOCAL, '--json', 'files'],
+    ]);
+    expect(h.calls.some(call => call[0] === 'git' && ['fetch', 'diff'].includes(call[1]))).toBe(false);
+  });
+  it.each([
+    ['disjoint', { ghView: { 43: { files: [{ path: 'scripts/other.mjs' }] } } }],
+    ['self excluded', { queueFacts: facts([42]) }],
+    ['cards disabled', { env: { WE_DRAIN_QUEUE_FILE_OVERLAP_INCLUDES_CARDS: 'off' } }],
+    ['queue read failed', { viewThrows: [43] }],
+    ['queued list capped', { ghView: { 43: { files: Array(100).fill({ path: card }) } } }],
+  ])('continues through existing admission when %s', (label, over) => {
+    const h = setup(over);
+    expect(h.s.enqueue(candidate, HEAD, { comments: stampedBy(DRAIN) })).toMatchObject({ enqueued: true });
+    expect(h.calls.some(call => call.some(arg => arg.includes('enqueuePullRequest')))).toBe(true);
+    if (label === 'queue read failed') expect(h.logs.join('')).toContain('gh: HTTP 502');
+  });
+  it.each([
+    ['missing', { num: 42 }],
+    ['incomplete', { ...candidate, listedFilesComplete: false }],
+    ['capped', { ...candidate, listedFiles: Array(100).fill(card) }],
+    ['malformed', { ...candidate, listedFiles: [null] }],
+  ])('fails open when candidate files are %s', (_label, c) => {
+    const h = setup();
+    expect(h.s.enqueue(c, HEAD, { comments: stampedBy(DRAIN) })).toMatchObject({ enqueued: true });
+    expect(h.logs.join('')).toContain('candidate files unknown — continuing enqueue');
+    expect(h.calls.some(call => call[0] === 'gh' && call.includes('files'))).toBe(false);
   });
 });

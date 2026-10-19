@@ -52,6 +52,7 @@ import { mergeActionFor, enqueuePr, planQueueFollowUps, REQUIRED_WORKFLOWS_UNSAT
 import { getRequiredStatusChecks } from './required-status-checks.mjs';
 import { readSettings } from './settings-files.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
+import { queueFileOverlap, readQueueEntryFiles, completeListedFiles } from './queue-file-overlap.mjs';
 import { createAdaptiveBatching, readQueueFacts } from './merge-queue-adaptive-batching.mjs';
 import { cancelObsoleteQueueRuns } from './merge-queue-obsolete-runs.mjs';
 
@@ -369,7 +370,16 @@ export function createDrainMergeStrategy({
         return { allowed: !reason, reason, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
       } catch { return { allowed: false, reason: 'red-team evidence unreadable' }; }
     },
-    enqueue(c, headSha, { comments = null, prepared = null } = {}) {
+    /** Read-only pre-check outside the land mutex, only for a recorded wait on this exact head.
+     * A clear result is NOT authorization; enqueue re-reads state and runs every live gate under the mutex.
+     * A hold needing refresh or any side effect falls through to that ordinary enqueue path. */
+    recordedHold(c, headSha) {
+      if (!enqueues(c.repo) || !headSha) return null;
+      const state = readQueueState(statePath, readFile);
+      if (state.redTeamPending?.[keyOf(c.repo, c.num)]?.headSha !== headSha) return null;
+      return this.enqueue(c, headSha, { holdOnly: true });
+    },
+    enqueue(c, headSha, { comments = null, prepared = null, holdOnly = false } = {}) {
       if (!enqueues(c.repo)) throw new Error('enqueue called for a repo outside github-merge-queue');
       if (dryRun) throw new Error('enqueue refused in dry run');
       if (!headSha) throw new Error('github-merge-queue: no pinned head — refusing to enqueue (and NOT merging directly)');
@@ -388,7 +398,8 @@ export function createDrainMergeStrategy({
       if (preparedAdmission && prepared.labels !== labelSignature(live.labels)) return { fallback: true };
       const held = sendBackReason(live.labels);
       if (held) {
-        removeSentBack(c.repo, c.num, live.labels);
+        if (holdOnly && safety.value.dequeueOnSendBack) return null; // dequeue belongs to locked enqueue too
+        if (!holdOnly) removeSentBack(c.repo, c.num, live.labels);
         return { enqueued: false, deferred: true, kind: 'sent-back', reason: held };
       }
       // Head-bound file preparation is reusable; authorization evidence is always live.
@@ -446,6 +457,9 @@ export function createDrainMergeStrategy({
           log.write(`  merge-queue: #${c.num} red-team-pending backoff until ${new Date(pending.retryAt).toISOString()} (head and review/comment evidence unchanged)\n`);
           return pendingOutcome(c, pending, true);
         }
+        // Refreshing the hold can update labels, dispatch work, or write shared state. Leave all of that
+        // to ordinary enqueue under withLandWriteLock, including its fresh state/head reads.
+        if (holdOnly) return null;
         const pages = readThreadPages(c.repo, c.num);
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team admission: unreadable complete comments');
         const reason = redTeamEnqueueHold({ ...evidence, requestPending: neverScheduled || (sameHead && pending.requestedAt != null), comments: pages.flat(), repo: slugOf(c.repo), pr: c.num, head: headSha, env });
@@ -487,10 +501,33 @@ export function createDrainMergeStrategy({
           if (!fallback) return outcome;
         }
       }
+      if (holdOnly) return null;
       if (before.redTeamPending?.[key]) {
         delete before.redTeamPending[key];
         writeState(statePath, before);
       }
+      try {
+        const candidateFiles = c.listedFilesComplete === true ? completeListedFiles(c.listedFiles) : null;
+        const queue = candidateFiles === null ? null : readQueueEntryFiles({ repo: slugOf(c.repo), exec });
+        if (candidateFiles === null) {
+          say('  merge-queue file-overlap: candidate files unknown — continuing enqueue');
+        } else if (queue.error) {
+          say(`  merge-queue file-overlap: read failed (${queue.error}) — continuing enqueue`);
+        } else {
+          const includeCards = safety.value.queueFileOverlapIncludesCards ?? true;
+          const source = safety.sources?.queueFileOverlapIncludesCards ?? 'standard';
+          const overlap = queueFileOverlap({ candidateFiles,
+            queuedEntries: queue.entries.filter(entry => entry.num !== c.num), includeCards });
+          if (overlap.unknown.length) say(`  merge-queue file-overlap: unknown files for ${overlap.unknown.map(num => `#${num}`).join(',')} — continuing without those entries`);
+          if (overlap.overlap) {
+            const first = overlap.with[0];
+            say(`  merge-queue file-overlap: defer #${c.num} (shares ${first.files[0]} with queued #${first.num}) — includeCards=${includeCards} (${source})`);
+            const files = [...new Set(overlap.with.flatMap(entry => entry.files))].slice(0, 3);
+            return { enqueued: false, deferred: true, kind: 'queue-file-overlap',
+              reason: `${overlap.with.map(entry => `#${entry.num}`).join(',')} share ${files.join(', ')}` };
+          }
+        }
+      } catch (e) { say(`  merge-queue file-overlap: read failed (${firstLine(e)}) — continuing enqueue`); }
       let batchingGroupId;
       try {
         const g = adaptiveBatching().gate(c.num);

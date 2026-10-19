@@ -2105,6 +2105,38 @@ GitHub's node ceiling before a query runs. Overflow must use the original reader
 never truncate evidence. The focused regression is `scripts/lib/__tests__/drain-pr-state.test.mjs`;
 run it through heavy admission.
 
+## Drain throughput scheduling
+
+`scripts/settings/drain-throughput.json` owns the default-on `drain.holdFirst`,
+`drain.catchUpSkipUnchangedHolds`, `drain.redMainSkipCatchUp` and `drain.carryOverReadyFirst` switches; their resolver
+logs the source of each value. Early checks remember only refusals per repo/PR/head for
+the cascade. While red-main-hold is active, `drain.redMainSkipCatchUp` skips local
+non-fix catch-up work without spawning a drain; false restores the previous scheduling.
+The published main-fix PR runs before other pending work, including event-only work in
+a catch-up pass, without debounce. Its red-team request takes the first review lane.
+These priorities retain every wake, refusal, head, CI and post-accept red-team guard.
+A cleared early check never authorizes a write: live admission still runs.
+Catch-up remembers PR holds until the live head/labels/update time, local red-team
+evidence, overlap deadline, yielded-to PR state/head, or numbering withdrawal debt
+changes. `drain.catchUpSkipMaxMin` (default 15, nonnegative minutes, source logged)
+bounds every remembered hold from the child's start time; zero disables skips.
+The memo also includes durable queue retry state (`retryAt`, `firstPendingAt`,
+`requestAttemptedAt` and `requestedAt`) and the effective pending/request timing policy.
+It expires at the earliest queue retry, pending-health deadline, request cooldown,
+TTL or overlap deadline. Read this evidence again after the child finishes, so its
+newly persisted deadlines bound the next skip. An expired deadline or unknown/unreadable
+dependency always reruns the drain; it never clears the underlying admission hold.
+Skip-reason JSON retains `partner-pending` when a ready member's partner is held,
+including dry-run; `ready-not-reached` is reserved for a true pass end.
+Numbering withdrawal debt is process-local to the drain child: the daemon cannot
+infer clearance from its own empty memo, so numbering holds rerun unless a reader
+can supply live debt. Snapshots may seed hydration, but every catch-up child lists
+the live open set for overlap, blocker and couple decisions. Transient merge-lock
+contention retains normal retries. Carry-over
+stores only `ready-not-reached` rows beside drain queue state, never enqueued PRs or
+known holds; it orders the next full pass before couple grouping and main-fix priority.
+The focused injected-process and pure checks are in `drain-throughput.test.mjs`.
+
 ### Drain recovery across review timing and clone selection
 
 A panel seat being owed is policy evidence, not proof of queued work. For an already
