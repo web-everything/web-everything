@@ -11,7 +11,7 @@
  *   for a DIFFERENT sha mid-run — i.e. between this run's start-write and its finish-write, exactly when a real
  *   sibling run B would claim the marker.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, chmodSync, readdirSync, renameSync } from 'node:fs';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -21,6 +21,10 @@ import { VERIFY_DAEMON_LEASE_KEY } from '../../skills-src/conveyor/verify-daemon
 import { LEASE_FILENAME } from '../lib/lane-lease.mjs';
 import { verifyFinishBody } from '../lib/lane-verify.mjs';
 import { GATE_STARTED_MARKER, GATE_QUEUED_MARKER } from '../conveyor/verify-dispatch.mjs';
+
+// Selection fixtures retain the historical related gate explicitly.
+beforeEach(() => vi.stubEnv('WE_BUILD_FINAL_GATE', 'related'));
+afterEach(() => vi.unstubAllEnvs());
 
 const VERIFY_LANE = resolve(process.cwd(), 'scripts/verify-lane.mjs');
 const OTHER_SHA = 'b'.repeat(40); // "Y" — the sha the overlapping run's marker belongs to (never this HEAD)
@@ -1709,4 +1713,97 @@ describe('item 98 — --help prints usage without running the gate', () => {
       expect(r.stdout).toMatch(/Usage: node scripts\/verify-lane\.mjs/);
     });
   }
+});
+
+describe('full build gate default', () => {
+  it('runs both whole-unit and standards scripts without a gate flag', () => {
+    const scripts = {
+      'test:unit': `node -e "require('fs').writeFileSync('whole-unit-ran', 'yes')"`,
+      'check:standards': `node -e "require('fs').writeFileSync('standards-ran', 'yes')"`,
+    };
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts }));
+    const env = { ...process.env };
+    delete env.WE_BUILD_FINAL_GATE;
+    const r = spawnSync('node', [VERIFY_LANE, 'run', '--json'], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stderr).toContain('finalGate="full" (standard)');
+    expect(readFileSync(join(dir, 'whole-unit-ran'), 'utf8')).toBe('yes');
+    expect(readFileSync(join(dir, 'standards-ran'), 'utf8')).toBe('yes');
+  });
+
+  // Only `full` replaces the default selection; `related` and `none` keep it, and an explicit --gate still wins.
+  it.each([
+    ['full', true], ['related', false], ['none', false],
+  ])('finalGate=%s runs the whole unit tier only when full', (finalGate, wholeUnit) => {
+    const scripts = {
+      'test:unit': `node -e "require('fs').writeFileSync('whole-unit-ran', 'yes')"`,
+      'check:standards': `node -e "require('fs').writeFileSync('standards-ran', 'yes')"`,
+    };
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts }));
+    const env = { ...process.env, WE_BUILD_FINAL_GATE: finalGate };
+    const r = spawnSync('node', [VERIFY_LANE, 'run', '--json'], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
+    expect(r.stderr).toContain(`finalGate="${finalGate}" (env)`);
+    expect(existsSync(join(dir, 'whole-unit-ran'))).toBe(wholeUnit);
+    const explicit = spawnSync('node', [VERIFY_LANE, 'run', '--json', '--gate=npm run check:standards'], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
+    expect(explicit.status, explicit.stderr).toBe(0);
+    expect(existsSync(join(dir, 'whole-unit-ran'))).toBe(wholeUnit);
+  });
+
+  // The full gate is still the DEFAULT gate: its green feeds the ledger, and the marker keeps the diff's changed files.
+  it('a default verify under finalGate=full records the green ledger and the changed files, and is not an explicit gate', () => {
+    const git = (...a) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' });
+    const ledgerDir = mkdtempSync(join(tmpdir(), 'green-ledger-'));
+    try {
+      git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: {
+        'test:unit': `node -e "require('fs').writeFileSync('whole-unit-ran', 'yes')"`,
+        'check:standards': `node -e "require('fs').writeFileSync('standards-ran', 'yes')"`,
+      } }));
+      writeFileSync(join(dir, '.gitignore'), 'whole-unit-ran\nstandards-ran\n');
+      mkdirSync(join(dir, 'scripts', 'lib'), { recursive: true });
+      writeFileSync(join(dir, 'scripts', 'lib', 'zz-full.mjs'), 'export {};\n');
+      git('add', '-A'); git('commit', '-qm', 'full gate fixture');
+      const env = { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_GREEN_LEDGER_DIR: ledgerDir,
+        WE_PLATFORM_PREFERENCES_FILE: join(tmpdir(), 'no-such-platform-preferences.json') };
+      delete env.WE_BUILD_FINAL_GATE;
+      const r = spawnSync('node', [VERIFY_LANE, 'verify', '--json'], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
+      expect(JSON.parse(r.stdout.trim().split('\n').pop()), r.stderr).toMatchObject({ status: 'green' });
+      expect(readFileSync(join(dir, 'whole-unit-ran'), 'utf8')).toBe('yes');
+      const onDisk = JSON.parse(readFileSync(marker(), 'utf8'));
+      expect(onDisk).toMatchObject({ status: 'green', sha: headSha(), suites: 'npm run test:unit && npm run check:standards' });
+      expect(onDisk.phases.changedFileCount).toBe(3);
+      expect(r.stderr).toContain('build.finalGate=full');
+      expect(r.stderr).not.toContain('mode=explicit');
+      expect(JSON.parse(readFileSync(join(ledgerDir, `${headSha()}.json`), 'utf8'))).toMatchObject({ status: 'green', suites: onDisk.suites });
+      // The dispatched child receives that same command back via --gate: still the default gate, not an explicit one.
+      const child = spawnSync('node', [VERIFY_LANE, 'verify', '--json', '--run-id=full-child', `--gate=${onDisk.suites}`], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
+      expect(JSON.parse(child.stdout.trim().split('\n').pop()), child.stderr).toMatchObject({ status: 'green' });
+      expect(child.stderr).toMatch(/selection @ \w+ mode=full reason="build\.finalGate=full[^\n]* files=3/);
+      expect(child.stderr).not.toContain('mode=explicit');
+      expect(child.stderr).not.toContain('whole-gate admission');
+    } finally { rmSync(ledgerDir, { recursive: true, force: true }); }
+  });
+
+  // The requester and the dispatched child can resolve different finalGate settings (own env, older lane base).
+  it.each([['related', 'full', /mode=pr /], ['full', 'related', /mode=full /]])(
+    'a child under finalGate=%2$s recognizes a default gate stamped under %1$s', (requester, child, mode) => {
+      const git = (...a) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' });
+      git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+      mkdirSync(join(dir, 'node_modules', '.bin'), { recursive: true });
+      writeFileSync(join(dir, 'node_modules', '.bin', 'vitest'), '#!/bin/sh\nexit 0\n');
+      chmodSync(join(dir, 'node_modules', '.bin', 'vitest'), 0o755);
+      writeFileSync(join(dir, '.gitignore'), 'node_modules/\n');
+      mkdirSync(join(dir, 'scripts', 'lib'), { recursive: true });
+      writeFileSync(join(dir, 'scripts', 'lib', 'zz-cross.mjs'), 'export {};\n');
+      git('add', '-A'); git('commit', '-qm', 'cross-policy fixture');
+      const env = (finalGate) => ({ ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_BUILD_FINAL_GATE: finalGate,
+        WE_PLATFORM_PREFERENCES_FILE: join(tmpdir(), 'no-such-platform-preferences.json') });
+      const request = spawnSync('node', [VERIFY_LANE, 'request', '--json'], { cwd: dir, encoding: 'utf8', env: env(requester), timeout: 60_000 });
+      const suites = JSON.parse(readFileSync(marker(), 'utf8')).suites;
+      expect(suites, request.stderr).toBeTruthy();
+      const run = spawnSync('node', [VERIFY_LANE, 'verify', '--json', '--run-id=cross-child', `--gate=${suites}`], { cwd: dir, encoding: 'utf8', env: env(child), timeout: 60_000 });
+      expect(run.stderr).toMatch(new RegExp(`selection @ \\w+ ${mode.source}`));
+      expect(run.stderr).not.toContain('mode=explicit');
+      expect(run.stderr).not.toContain('whole-gate admission');
+    });
 });

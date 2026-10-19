@@ -36,7 +36,7 @@ describe('renderWorkerBrief', () => {
       'free-scope-cli.mjs release --agent=fix-widget --owner=tok12345',
       'lane-pool.mjs acquire --purpose=fix-widget --adopt',
       'lane-pool.mjs release --lane=<N> --session=<holder slug it printed>',
-      'codex-direct-task.mjs --task-file=<f> --dir=<lane> --gate=standards',
+      'codex-direct-task.mjs --task-file=<f> --dir=<lane> --gate=full',
       'npm run test:unit -- <test files>', 'operations/run.mjs verify --checkout=<lane>',
       'open-pr --ref=lane/fix-widget',
       `check --files=${files} --exclude-agent=fix-widget --exclude-owner=tok12345`,
@@ -80,6 +80,14 @@ describe('renderWorkerBrief', () => {
     expect(brief).toContain('at most 4 lines');
     expect(brief).not.toContain(defaultProof);
     expect(renderWorkerBrief(input)).toBe(brief);
+  });
+
+  // A plateau-app lane has no scripts/verify-lane.mjs, so Codex's full or related gate would be gate-unavailable.
+  it.each([['full', 'standards'], ['related', 'standards'], ['none', 'none']])('a plateau-app brief under finalGate=%s sends Codex --gate=%s', (finalGate, codexGate) => {
+    const policy = { finalGate, selfReview: { enabled: false, maxRounds: 2 }, reviewerExpectations: { enabled: false } };
+    const brief = renderWorkerBrief({ ...params, repo: 'plateau-app', policy });
+    expect(brief).toContain(`--dir=<lane> --gate=${codexGate}\``);
+    expect(renderWorkerBrief({ ...params, policy })).toContain(`--dir=<lane> --gate=${finalGate}\``);
   });
 });
 

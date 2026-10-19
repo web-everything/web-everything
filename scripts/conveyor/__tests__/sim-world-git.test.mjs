@@ -13,6 +13,26 @@ import { scenario, runScenario } from './sim/scenario.mjs';
 const IMPORTED = 'scripts/lib/daemon-self-sync.mjs';
 
 describe('simulator git and budget regressions', () => {
+  it('renders the living reviewer checklist from the isolated simulator clone', async () => {
+    const checklistPath = 'docs/agent/reviewer-expectations.md';
+    const checklist = readFileSync(resolve(process.cwd(), checklistPath), 'utf8').trim();
+    await runScenario(scenario('dispatch brief dependencies', {
+      lanes: 1,
+      play: [(w) => {
+        expect(readFileSync(join(w.simCloneRoot, checklistPath), 'utf8').trim()).toBe(checklist);
+        const policyModule = pathToFileURL(join(w.simCloneRoot, 'scripts/lib/build-policy.mjs')).href;
+        const brief = execFileSync(process.execPath, ['--input-type=module', '-e', `
+          import { renderBuildRequirements, resolveBuildPolicy } from ${JSON.stringify(policyModule)};
+          process.stdout.write(renderBuildRequirements({
+            policy: resolveBuildPolicy({ env: {}, tool: {}, platform: {} }),
+          }));
+        `], { cwd: w.simCloneRoot, env: w.env, encoding: 'utf8', timeout: 5_000 });
+        expect(brief).toContain(checklist);
+        expect(brief).toContain('not done until `node scripts/verify-lane.mjs` is green');
+      }],
+    }));
+  }, 180_000);
+
   it('isolates throttle windows across worlds whose clocks move backwards', async () => {
     // cwd-based: under the default vitest transform `import.meta.url` is an http: URL, which neither
     // `import()` in a child node nor `readFileSync` accepts.

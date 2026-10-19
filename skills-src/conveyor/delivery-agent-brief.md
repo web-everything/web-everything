@@ -709,3 +709,8 @@ never self-clear a review, and never build a card that failed the readiness gate
 - **Work only through the normal verbs** (claim → lane clone → build → resolve in the lane → commits → PR →
   daemon merge; the claim and the resolve ride that PR) — those are exactly the channels the lane board reads, so state is reflected **for free**. No parallel
   state store, ever (#2612 ruling).
+
+
+The dispatch composer appends the effective build safeguards and the contents of
+`docs/agent/reviewer-expectations.md`. Follow that configured block for the final gate
+and the capped pre-review check; the mechanical wrapper owns the check on wrapped builds.
