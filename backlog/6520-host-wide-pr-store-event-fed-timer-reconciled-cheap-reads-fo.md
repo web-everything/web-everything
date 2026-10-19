@@ -1,4 +1,5 @@
 ---
+bornAs: xdk2pq6
 kind: story
 size: 8
 status: open
