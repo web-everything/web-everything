@@ -1,15 +1,16 @@
 ---
+bornAs: x6605ax
 kind: story
-size: 3
+size: 5
 status: open
-scope: ["we:scripts/conveyor"]
+scope: ["we:scripts/conveyor", "we:scripts/settings/missing-run-rerequest.json"]
 dateOpened: "2026-10-19"
 tags: []
 ---
 
-# card-conflict-owner tests: 6 failed on the hot-rearm-fail4 stack; find and fix the cause
+# Graduate parked batch-4 feature: targeted missing-check rerun
 
-Six tests in we:scripts/conveyor/__tests__/card-conflict-owner.test.mjs failed on the lane/hot-rearm-fail4 stack before the later fixes of 2026-10-18. The file is not on main yet; it lives on that stack, so first reproduce on the stack tip. Find the root cause (not just the six symptoms), fix it on the owner module, and prove before and after with the six named tests passing.
+Parked on branch lane/proto-b4-missing-check (feature b4b: re-request a missing required check run for the live head, with cooldown; commit e0d00b083; reverted from the proto-daemon branch in 4e640e983). It must land through a graduation PR, not by merging the prototype branch. The audit findings that parked it are in the operator audit transcript of 2026-10-18 and were not restated in the filing request: the graduating worker must recover them first, fix each, and give each a named test.
 
 ## Acceptance
 

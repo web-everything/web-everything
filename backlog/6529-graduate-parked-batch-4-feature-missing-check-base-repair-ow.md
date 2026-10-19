@@ -1,15 +1,16 @@
 ---
+bornAs: xvp26kp
 kind: story
 size: 8
 status: open
-scope: ["we:scripts/settings/host-overload.json"]
+scope: ["we:scripts/conveyor", "we:skills-src/conveyor"]
 dateOpened: "2026-10-19"
 tags: []
 ---
 
-# Graduate per-identity gh slot pools with three open audit findings
+# Graduate parked batch-4 feature: missing-check base repair owner
 
-Parked on lane/hot-gh-slots-wip (commits 31b51130e and 4af5b9286): gh throttle slots become per-identity pools with a reserved background slot, per the operator on 2026-10-18 ('Slots should also be per gh app'). Three audit findings are still open: (1) span cap, (2) mutex fencing, (3) lease-expired exclusion. Fix each with a named test, then land through a graduation PR.
+Parked on branch lane/proto-b4-base-repair (feature 6b: missing-check base repair owner; moved there from lane/proto-b4-missing-check in commit 2e0ed84da). It was parked by the batch-4 audit and must land through a graduation PR, not by merging the prototype branch. The audit findings that parked it are in the operator audit transcript of 2026-10-18 and were not restated in the filing request: the graduating worker must recover them first, fix each, and give each a named test.
 
 ## Acceptance
 

@@ -1,15 +1,16 @@
 ---
+bornAs: xdow1tl
 kind: story
-size: 5
+size: 3
 status: open
-scope: ["we:scripts/conveyor", "we:scripts/settings/missing-run-rerequest.json"]
+scope: ["we:scripts/backlog.mjs"]
 dateOpened: "2026-10-19"
 tags: []
 ---
 
-# Graduate parked batch-4 feature: targeted missing-check rerun
+# Ten duplicate bornAs hashes on main make the card resolver's JIT mapping ambiguous
 
-Parked on branch lane/proto-b4-missing-check (feature b4b: re-request a missing required check run for the live head, with cooldown; commit e0d00b083; reverted from the proto-daemon branch in 4e640e983). It must land through a graduation PR, not by merging the prototype branch. The audit findings that parked it are in the operator audit transcript of 2026-10-18 and were not restated in the filing request: the graduating worker must recover them first, fix each, and give each a named test.
+Ten bornAs hashes appear on two or more cards on main, so the card resolver's just-in-time number mapping cannot tell which card a hash means. Pairs: x2t6cr5 (3201, 3244); x8hzy1m (3660, 3663); xhprieg (3664, 3661); xldrls6 (3662, 3665); xp12dod (4498, 4512); xu2krte (3557, 3544); xzdi27a (3111, 3112). Card 4658 also carries three foreign hashes: x7pj0mw (also 4397), xggb0ep (also 4383), xycb80x (also 4398). Re-hash the later card of each pair through the sanctioned renumber path, then add a check:standards rule that fails on any duplicate bornAs.
 
 ## Acceptance
 

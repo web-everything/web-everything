@@ -1,15 +1,16 @@
 ---
+bornAs: xfnp6yt
 kind: story
-size: 3
+size: 8
 status: open
-scope: ["we:scripts/backlog.mjs"]
+scope: ["we:scripts/settings/host-overload.json"]
 dateOpened: "2026-10-19"
 tags: []
 ---
 
-# Ten duplicate bornAs hashes on main make the card resolver's JIT mapping ambiguous
+# Graduate per-identity gh slot pools with three open audit findings
 
-Ten bornAs hashes appear on two or more cards on main, so the card resolver's just-in-time number mapping cannot tell which card a hash means. Pairs: x2t6cr5 (3201, 3244); x8hzy1m (3660, 3663); xhprieg (3664, 3661); xldrls6 (3662, 3665); xp12dod (4498, 4512); xu2krte (3557, 3544); xzdi27a (3111, 3112). Card 4658 also carries three foreign hashes: x7pj0mw (also 4397), xggb0ep (also 4383), xycb80x (also 4398). Re-hash the later card of each pair through the sanctioned renumber path, then add a check:standards rule that fails on any duplicate bornAs.
+Parked on lane/hot-gh-slots-wip (commits 31b51130e and 4af5b9286): gh throttle slots become per-identity pools with a reserved background slot, per the operator on 2026-10-18 ('Slots should also be per gh app'). Three audit findings are still open: (1) span cap, (2) mutex fencing, (3) lease-expired exclusion. Fix each with a named test, then land through a graduation PR.
 
 ## Acceptance
 

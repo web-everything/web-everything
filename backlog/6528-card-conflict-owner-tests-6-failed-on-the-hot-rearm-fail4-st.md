@@ -1,15 +1,16 @@
 ---
+bornAs: xu0qant
 kind: story
-size: 8
+size: 3
 status: open
-scope: ["we:scripts/conveyor", "we:skills-src/conveyor"]
+scope: ["we:scripts/conveyor"]
 dateOpened: "2026-10-19"
 tags: []
 ---
 
-# Graduate parked batch-4 feature: missing-check base repair owner
+# card-conflict-owner tests: 6 failed on the hot-rearm-fail4 stack; find and fix the cause
 
-Parked on branch lane/proto-b4-base-repair (feature 6b: missing-check base repair owner; moved there from lane/proto-b4-missing-check in commit 2e0ed84da). It was parked by the batch-4 audit and must land through a graduation PR, not by merging the prototype branch. The audit findings that parked it are in the operator audit transcript of 2026-10-18 and were not restated in the filing request: the graduating worker must recover them first, fix each, and give each a named test.
+Six tests in we:scripts/conveyor/__tests__/card-conflict-owner.test.mjs failed on the lane/hot-rearm-fail4 stack before the later fixes of 2026-10-18. The file is not on main yet; it lives on that stack, so first reproduce on the stack tip. Find the root cause (not just the six symptoms), fix it on the owner module, and prove before and after with the six named tests passing.
 
 ## Acceptance
 
