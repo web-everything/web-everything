@@ -67,6 +67,7 @@ export function buildPostmortem(input, { benchmarks = SETTINGS.handoffP90Minutes
   const { repo, pr, openedAt, mergedAt, verdicts = null, fixLoop = [], scope = null, prepares = [] } = input;
   const comments = (input.comments ?? []).filter(c => time(c.created_at ?? c.createdAt) <= time(mergedAt));
   const commits = (input.commits ?? []).filter(c => time(c.commit?.committer?.date ?? c.commit?.author?.date) <= time(mergedAt));
+  const heads = headsOf(commits);
   const checks = [...new Map((input.checks ?? []).filter(c => time(c.created_at ?? c.started_at ?? c.completed_at) <= time(mergedAt)).map(c => [c.id ?? JSON.stringify(c), c])).values()].map(c => time(c.completed_at) > time(mergedAt) ? { ...c, completed_at: null, conclusion: null } : c);
   validateSubject(repo, pr);
   if (!Number.isFinite(time(openedAt)) || !Number.isFinite(time(mergedAt)) || time(mergedAt) < time(openedAt)) throw Error('postmortem requires a merged PR with valid timestamps');
@@ -129,7 +130,9 @@ export function buildPostmortem(input, { benchmarks = SETTINGS.handoffP90Minutes
   const finalChecks = new Map();
   for (const c of [...checks].sort((a,b) => String(a.completed_at).localeCompare(String(b.completed_at)))) finalChecks.set(`${c.head_sha}|${c.name}`,c);
   for (const c of finalChecks.values()) {
-    if (c.name === 'test' && c.conclusion === 'success') mark('ci-green',c.completed_at,c.html_url ?? c.id);
+    // A late old-head success must neither start a gap nor supersede a current-head success.
+    const completedHead = heads.filter(h => time(h.at) <= time(c.completed_at)).at(-1)?.sha;
+    if (c.name === 'test' && c.conclusion === 'success' && same(c.head_sha,completedHead)) mark('ci-green',c.completed_at,c.html_url ?? c.id);
     if (!/review.?gate/i.test(c.name) && ['failure','timed_out','startup_failure'].includes(c.conclusion)) mark('ci-red',c.completed_at,c.html_url ?? c.id);
   }
   mark('merged', mergedAt, input.url ?? `https://github.com/${repo}/pull/${pr}`);
@@ -140,11 +143,10 @@ export function buildPostmortem(input, { benchmarks = SETTINGS.handoffP90Minutes
     const superseded = marks.some(m => m.kind === from && time(m.at) > time(a.at) && time(m.at) <= time(b?.at));
     if (!b || superseded) continue;
     // CI green is only a valid dispatch boundary if the head did not change in between.
-    if (kind === 'ci-green-review' && headsOf(commits).some(h => time(h.at) > time(a.at) && time(h.at) <= time(b.at))) continue;
+    if (kind === 'ci-green-review' && heads.some(h => time(h.at) > time(a.at) && time(h.at) <= time(b.at))) continue;
     const duration = minutes(a.at,b.at), p90 = benchmarks[kind];
     gaps.push({ kind, from: a.at, to: b.at, minutes: duration, p90, minutesLost: Math.round(Math.max(0,duration-p90)*10)/10, evidence: [a.evidence,b.evidence].filter(v => v !== undefined) });
   }
-  const heads = headsOf(commits);
   const approvals = sorted((verdicts ?? []).filter(v => ['accept','accepted','clear-human'].includes(v.verdict ?? v.action)).map(v => ({ at: v.at, head: v.coverage?.headSha ?? v.head, evidence: v.id ?? v.at })));
   for (const m of marks.filter(m => m.kind === 'accepted' || m.kind === 'clearance')) if (!approvals.some(a => Math.abs(time(a.at)-time(m.at)) < 60000)) approvals.push({ at: m.at, head: heads.filter(h => time(h.at) <= time(m.at)).at(-1)?.sha, evidence: m.evidence });
   const changes = approvals.flatMap(a => {

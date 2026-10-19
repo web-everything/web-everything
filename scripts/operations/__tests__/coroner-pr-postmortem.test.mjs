@@ -7,6 +7,7 @@ import { buildPostmortem, shouldPostmortem, publishPostmortem, resolvePostmortem
 import { runPostmortemPass, listMergedSince } from '../../conveyor/pass-daemons/pr-postmortem-pass.mjs';
 import { hostname } from 'node:os';
 import { reserve } from '../../readiness/file-locks.mjs';
+import { buildOperatorRulingComment } from '../../lib/jury-core.mjs';
 
 const at = m => new Date(Date.UTC(2026, 9, 17, 0, m)).toISOString();
 const comment = (m, body) => ({ createdAt: at(m), body, author: { login: 'web-everything' } });
@@ -226,12 +227,73 @@ describe('per PR postmortem', () => {
     expect(r.events).toEqual(expect.arrayContaining([expect.objectContaining({kind:'comment',actor:'outsider'}),expect.objectContaining({kind:'comment',actor:'web-everything'})]));
     expect(r.events.every(e => Object.hasOwn(e,'actor'))).toBe(true);
   });
+  it.each([
+    ...fixture().comments.map((c,i) => [`fixture marker ${i+1}`,{
+      ...c,createdAt:at([51,65,65,95,125][i]),body:i === 0 ? c.body.replace('a'.repeat(40),'b'.repeat(40)) : c.body,
+    }]),
+    ['carried verdict',comment(80,`<!-- review-verdict-carried from=${'a'.repeat(40)} to=${'b'.repeat(40)} patch-id=${'c'.repeat(40)} -->`)],
+    ['red-team gate',comment(81,`<!-- we:red-team-gate pr=1 rev=${'b'.repeat(40)} outcome=sent-back -->`)],
+    ['red-team false finding',comment(82,'### Post-accept red team — 1 possible break(s)\n· red team codex/test · re-check ok\n1. [not confirmed] (correctness, broken) `src/a.js:2` — claim\n   - Re-check: deliberate design')],
+    ['advisory verdict',comment(50,`**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**\n### Findings\n**judge/correctness** (1)\n- \`src/a.js:3\` — another guard\n**Advisory outcome:** \`changes\`\nNet basis: \`${'a'.repeat(40)}..${'b'.repeat(40)}\``)],
+    ['referral ruling',comment(50,`Mandatory review owner: judge\nAttempt recorded: true. Rulings: ${JSON.stringify([{key:JSON.stringify(['judge','src/a.js',3,'another guard']),result:'block'}])}`)],
+    ['operator ruling',comment(50,'## Operator ruling on mandatory referrals\n1. **block** — another guard')],
+    ['operator false finding',{...comment(85,buildOperatorRulingComment({
+      version:1,repo:'example/repo',pr:1,head:'b'.repeat(40),actor:'chalbert',channel:'chat',reason:'deliberate design',at:at(85),clearerId:'test',
+      rulings:[{runId:'test-run',key:JSON.stringify(['judge','src/a.js',3,'another guard']),result:'not-real'}],
+    })),author:{login:'chalbert'}}],
+    ['policy ruling',comment(50,'## Automatic policy ruling on mandatory referrals\n1. **block** — another guard')],
+    ['CI heal',comment(30,'🩹 conveyor CI-heal')],
+    ['review dispatch',comment(140,'review dispatched')],
+    ['review begin',comment(140,'review-begin')],
+    ['human clearance',comment(85,'clear-human')],
+    ['mechanical drain',comment(80,'drain-mechanical: complete')],
+    ['conflict fix',comment(80,'conflict-fix complete')],
+    ['rebase',comment(80,'rebase applied')],
+    ['conflict watcher',comment(80,'parked-pr-conflict-watch (conflict resolved)')],
+  ])('ignores outsider comments and PR bodies for marker kind: %s', (kind,marker) => {
+    const f = fixture();
+    const observed = input => { const {events,...report} = buildPostmortem(input); return report; };
+    const baseline = observed(f);
+    for (const author of [{author:{login:'outsider'}},{author:undefined,user:{login:'outsider'}}]) {
+      expect(observed({...f,body:marker.body,comments:[...f.comments,{...marker,...author}]})).toEqual(baseline);
+    }
+    // Every payload must affect trusted analysis, so an inert fixture cannot hide a missing guard.
+    expect(observed({...f,comments:[...f.comments,marker]})).not.toEqual(baseline);
+    if (kind === 'carried verdict') expect(buildPostmortem({...f,comments:[...f.comments,marker]}).approvals.lost).toBe(0);
+    if (kind === 'red-team false finding') expect(buildPostmortem({...f,comments:[...f.comments,marker]}).falseFindings.some(x => x.source === 'red-team')).toBe(true);
+  });
   it('excludes CI-green review gaps across head changes with an unchanged-head control', () => {
     const f = fixture(); f.labels = [{event:'labeled',created_at:at(40),label:{name:'review:running'}}];
     f.checks = [{name:'test',head_sha:'a'.repeat(40),started_at:at(10),completed_at:at(20),conclusion:'success'}];
     expect(buildPostmortem(f).gaps.some(g => g.kind === 'ci-green-review')).toBe(true);
     f.commits[1].commit.committer.date = at(30);
     expect(buildPostmortem(f).gaps.some(g => g.kind === 'ci-green-review')).toBe(false);
+  });
+  it.each([
+    ['stale head only',[['a',20]],null],
+    ['current head only',[['b',20]],20],
+    ['current head then stale completion',[['b',20],['a',25]],20],
+    ['stale completion then current head',[['a',20],['b',25]],25],
+    ['unknown check head',[[null,20]],null],
+  ])('excludes stale-head check completion before review: %s', (_name,runs,greenAt) => {
+    const dir = temp(); const f = fixture();
+    f.labels = [{event:'labeled',created_at:at(40),label:{name:'review:running'}}];
+    f.commits[1].commit.committer.date = at(15);
+    f.checks = runs.map(([head,minute],i) => ({id:i+1,name:'test',head_sha:head?.repeat(40),started_at:at(head === 'b' ? 16 : 10),completed_at:at(minute),conclusion:'success'}));
+    try {
+      const r = buildPostmortem(f);
+      const gaps = r.gaps.filter(g => g.kind === 'ci-green-review');
+      if (greenAt === null) expect(gaps).toEqual([]);
+      else expect(gaps).toEqual([expect.objectContaining({from:at(greenAt),to:at(40),minutes:40-greenAt})]);
+      const causes = r.causes.filter(c => c.cause === 'handoff:ci-green-review');
+      expect(causes).toHaveLength(greenAt === null ? 0 : 1);
+      publishPostmortem(r,{dir});
+      const journal = join(dir,'incidents.jsonl');
+      const rows = fs.existsSync(journal) ? fs.readFileSync(journal,'utf8').trim().split('\n').map(JSON.parse) : [];
+      const incidents = rows.filter(row => row.cause === 'handoff:ci-green-review');
+      expect(incidents).toHaveLength(greenAt === null ? 0 : 1);
+      if (greenAt !== null) expect(incidents[0]).toMatchObject({minutesLost:Math.round((40-greenAt-6.6)*10)/10,evidence:causes[0].evidence});
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
   });
   it.each([{}, [], [null], [[],{}]].map(pages => [pages]))('rejects missing timeline pages: %j', pages => {
     expect(() => collectWith(collectorGh({'/events?':pages}))).toThrow(/incomplete/);
@@ -256,6 +318,16 @@ describe('per PR postmortem', () => {
       fs.writeFileSync(file,' '.repeat(1024*1024)+'\n'+JSON.stringify({v:1,repo:'example/repo',pr:1,kind:'fix',head:'a'.repeat(40),at:at(20)})+'\n');
       const raw = read();
       expect(raw.completeness.fixLoop).toBe('bounded'); expect(raw.fixLoop).toHaveLength(1);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+  it.each([['untruncated',''],['oversized',' '.repeat(1024*1024)+'\n']])('marks %s local ledgers bounded rather than complete', (_name,prefix) => {
+    const dir = temp(); const file = join(dir,'ledger.jsonl');
+    const row = {v:1,repo:'example/repo',pr:1,kind:'fix',head:'a'.repeat(40),at:at(20)};
+    try {
+      fs.writeFileSync(file,prefix+JSON.stringify(row)+'\n');
+      const raw = collectPrTimeline('example/repo',1,{gh:collectorGh(),comments:() => [],env:{WE_FIX_LOOP_LEDGER:file}});
+      expect(raw.completeness.fixLoop).toBe('bounded');
+      expect(raw.fixLoop).toEqual([expect.objectContaining(row)]);
     } finally { fs.rmSync(dir,{recursive:true,force:true}); }
   });
   it('marks malformed verdict ledger rows incomplete rather than reporting zero lost approvals', () => {
