@@ -310,3 +310,24 @@ describe('confirmed dequeue', () => {
     expect(sendBackReason(['review:accepted', 'ready-to-merge'])).toBeNull();
   });
 });
+
+
+describe('queue file overlap card policy', () => {
+  it('defaults true with standard source and logs it', () => {
+    const lines = [];
+    const r = readDrainQueueSafety({ env: {}, tool: {}, platform: {}, log: l => lines.push(l) });
+    expect(r.value.queueFileOverlapIncludesCards).toBe(true);
+    expect(r.sources.queueFileOverlapIncludesCards).toBe('standard');
+    expect(lines.join('')).toContain('queueFileOverlapIncludesCards=true (standard)');
+  });
+  it('uses the existing cascade and boolean env override', () => {
+    const input = { platform: { queueFileOverlapIncludesCards: false }, tool: { queueFileOverlapIncludesCards: true } };
+    expect(readDrainQueueSafety({ ...input, env: {} }).sources.queueFileOverlapIncludesCards).toBe('tool');
+    const r = readDrainQueueSafety({ ...input, env: { WE_DRAIN_QUEUE_FILE_OVERLAP_INCLUDES_CARDS: 'off' } });
+    expect(r.value.queueFileOverlapIncludesCards).toBe(false);
+    expect(r.sources.queueFileOverlapIncludesCards).toBe('env');
+    const invalid = readDrainQueueSafety({ env: { WE_DRAIN_QUEUE_FILE_OVERLAP_INCLUDES_CARDS: 'typo' }, tool: { queueFileOverlapIncludesCards: 'false' }, platform: {} });
+    expect(invalid.value.queueFileOverlapIncludesCards).toBe(true);
+    expect(invalid.invalid).toHaveLength(2);
+  });
+});
