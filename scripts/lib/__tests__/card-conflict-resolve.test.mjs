@@ -10,6 +10,7 @@ import { MISSING_RUN_CREDENTIAL_REFUSAL } from '../../conveyor/main-red-recovery
 import { rebaseDropManifest } from '../rebase-drop-manifest.mjs';
 import { shouldCountRebaseAttempt } from '../../conveyor/unowned-rebase-attempt-count.mjs';
 
+const legacyCardRebaseSettings = { value: { squashToSingleCommit: false }, sources: { squashToSingleCommit: 'tool' } };
 const path = 'backlog/5360-parent.md';
 const entry = n => `- Also raised by o/r#${n} (finding 1: \`we:backlog/xabc123-child.md:12\` — guard)`;
 const card = entries => `---\nstatus: open\n---\n# Parent\n\nBody\n\n## Also raised by\n\n${entries.join('\n')}\n\n## Next\n\nUnchanged\n`;
@@ -108,7 +109,7 @@ describe('trusted no-checkout rebase path with real local Git', () => {
   });
   it('resolves with unrelated duplicate bornAs hashes on main and still maps unambiguous references', () => {
     const f = fixture({ duplicateBornAs: 'xzdi27a' });
-    const result = rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run: f.run, fetch: false });
+    const result = rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run: f.run, fetch: false, cardRebaseSettings: legacyCardRebaseSettings });
     expect(result).toMatchObject({ action: 'rebased', resolvedRaisedBy: [path] });
     expect(f.git('show', `${result.newCommit}:${path}`) + '\n')
       .toBe(card([entry(0), entry(1), entry(2)].map(e => e.replace('xabc123', '6000'))));
@@ -123,7 +124,7 @@ describe('trusted no-checkout rebase path with real local Git', () => {
   });
   it('resolves and publishes a fast-forward merge with current JIT refs and unchanged checkout', () => {
     const f = fixture();
-    const result = rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run: f.run, fetch: false });
+    const result = rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run: f.run, fetch: false, cardRebaseSettings: legacyCardRebaseSettings });
     expect(result).toMatchObject({ action: 'rebased', resolvedRaisedBy: [path] });
     expect(f.git('show', `${result.newCommit}:${path}`) + '\n').toBe(card([entry(0), entry(1), entry(2)].map(e => e.replace('xabc123', '6000'))));
     expect(f.git('merge-base', '--is-ancestor', f.head, result.newCommit)).toBe('');
@@ -179,7 +180,7 @@ describe('trusted no-checkout rebase path with real local Git', () => {
       }
       return result;
     };
-    const result = rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run, fetch: false });
+    const result = rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run, fetch: false, cardRebaseSettings: legacyCardRebaseSettings });
     expect(result.action).toBe('rebased');
     expect(f.git('show', `${result.newCommit}:main-only.mjs`)).toBe('export const preserved = true;');
   });
@@ -195,7 +196,7 @@ it('the card owner enforces credential refusal and a pinned Also-raised-by push'
     if (args.includes('push')) pushes.push({ args, opts });
     return f.run(cmd, args, opts);
   };
-  const attempt = env => defaultAttemptCardConflictRebase({ pr, repo: 'web-everything/web-everything', cwd: f.cwd, run, env, readCache: () => null });
+  const attempt = env => defaultAttemptCardConflictRebase({ pr, repo: 'web-everything/web-everything', cwd: f.cwd, run, env, readCache: () => null, cardRebaseSettings: legacyCardRebaseSettings });
   const refused = attempt({ GH_TOKEN: 'ghs_untrusted' });
   expect(refused).toMatchObject({ ok: false, action: 'error', error: MISSING_RUN_CREDENTIAL_REFUSAL });
   expect(pushes).toEqual([]);
@@ -226,4 +227,14 @@ describe('gitRecheckFiles settings cascade', () => {
       sources: { gitRecheckFiles: source, autoResolveRaisedBy: 'standard' },
     });
   });
+});
+
+
+it('default squash refuses a list union that rewrites PR JIT references instead of preserving the old net patch', () => {
+  const f = fixture();
+  const result = rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run: f.run, fetch: false });
+  expect(result).toMatchObject({ action: 'error', guard: 'squash-net-diff-mismatch' });
+  expect(f.git('ls-remote', 'origin', 'refs/heads/lane/cards')).toContain(f.head);
+  expect(f.git('rev-parse', 'HEAD')).toBe(f.head);
+  expect(readFileSync(join(f.cwd, path), 'utf8')).toBe(f.before);
 });

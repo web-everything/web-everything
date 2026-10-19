@@ -50,7 +50,11 @@ export function redTeamPanelSeatOwed(loopPayload, env = process.env) {
     && /^[a-f0-9]{40}$/i.test(loopPayload?.findings?.read?.netBasis?.rev ?? '');
 }
 
-/** Net diff includes rename/copy sources; unknown paths cannot justify skipping. */
+/** Net diff includes rename/copy sources; unknown paths cannot justify skipping.
+ * Drain consumers (drain-red-team-review/evidence, drain-merge-strategy and drain-queue-safety)
+ * read saved review-pr evidence pinned by netBasis.rev, whose netChangedFiles comes from git.
+ * Never substitute GitHub view.files here. The separate replay producer resolves its GitHub
+ * list through pr-real-files before constructing this read. */
 export function redTeamCardOnly(read) {
   const paths = Array.isArray(read?.netChangedFiles) && read.netChangedFiles.length
     && (read.netRenameSources == null || Array.isArray(read.netRenameSources))

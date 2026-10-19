@@ -1613,3 +1613,38 @@ describe('unattended accept reads the live head', () => {
     if (!cleared) expect(out.lines.join('\n')).toMatch(/mandatory referrals remain open/);
   });
 });
+
+// Real net-file routing is independent of the execution/acceptance fixtures above.
+import { chooseSecuritySeat, defaultReadChangedFiles, TOUCH_SET_FILE_CAP } from '../review-loop-cli.mjs';
+describe('card light lane uses verified git files', () => {
+  const repo = 'web-everything/web-everything';
+  const info = { headRefName: 'lane/cards', headRefOid: 'a'.repeat(40), baseRefName: 'main' };
+  const cardOnly = { lightLane: true, claudeSeat: false };
+  function reads({ capped = false, moved = false, gitFiles = 'backlog/123-card.md' } = {}) {
+    const calls = [];
+    const exec = (_cmd, args) => {
+      calls.push(args);
+      return JSON.stringify(args[0] === 'pr' ? info : capped
+        ? Array.from({ length: TOUCH_SET_FILE_CAP }, (_, n) => ({ filename: `backlog/${n}-card.md` })) : [{ filename: 'scripts/stale.mjs' }]);
+    };
+    const run = (_cmd, args) => ({ status: 0, stdout: args[0] === 'remote' ? `https://github.com/${repo}.git`
+      : args[0] === 'rev-parse' ? (moved ? 'b'.repeat(40) : info.headRefOid) : args[0] === 'diff' ? gitFiles : '' });
+    return { calls, exec, readChangedFiles: ({ pr }) => defaultReadChangedFiles({ pr, repo, exec, run }) };
+  }
+  it('overrides inflated files and reads mutable head metadata once per attempt', () => {
+    const r = reads();
+    for (let n = 0; n < 2; n++) expect(chooseSecuritySeat(['--pr=5'], { ...r, cardOnly })).toMatchObject({ cardOnlyLight: true, securitySeat: false });
+    expect(r.calls.filter(a => a[0] === 'pr')).toHaveLength(2);
+  });
+  it('a capped GitHub list needs verified git evidence', () => {
+    expect(chooseSecuritySeat(['--pr=5'], { ...reads({ capped: true }), cardOnly }).cardOnlyLight).toBe(true);
+    expect(chooseSecuritySeat(['--pr=5'], { ...reads({ capped: true, moved: true }), cardOnly }).securitySeat).toBe(true);
+  });
+  it('verified lists above the REST cap stay complete and eligible', () => {
+    const r = reads({ capped: true, gitFiles: Array.from({ length: 110 }, (_, n) => `backlog/${n}-card.md`).join('\n') });
+    expect(chooseSecuritySeat(['--pr=5'], { ...r, cardOnly }).cardOnlyLight).toBe(true);
+  });
+  it('a verified code path keeps the full review lane', () => {
+    expect(chooseSecuritySeat(['--pr=5'], { ...reads({ gitFiles: 'scripts/code.mjs' }), cardOnly }).cardOnlyLight).not.toBe(true);
+  });
+});

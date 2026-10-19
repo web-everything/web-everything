@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolveRealFiles } from '../lib/pr-real-files.mjs';
 /**
  * @file scripts/operations/review-loop-cli.mjs
  * @description #3072's REMAINING SLICE, MADE CALLABLE — drives ONE `review-pr` run unattended, using
@@ -444,11 +445,15 @@ export function chooseSecuritySeat(argv, { enabled = true, store = null, readCha
   const pr = Number(argvFlag(argv, 'pr'));
   const repo = argvFlag(argv, 'repo');
   if (!Number.isInteger(pr) || pr <= 0) return { securitySeat: true, reason: 'no --pr — full roster' };
-  let files;
-  try { files = readChangedFiles({ pr, repo }); } catch (e) {
+  let files, verified = false;
+  try {
+    const result = readChangedFiles({ pr, repo });
+    files = Array.isArray(result) ? result : result?.files;
+    verified = result?.source === 'git';
+  } catch (e) {
     return { securitySeat: true, reason: `touch-set unreadable (${String(e?.message ?? e).slice(0, 200)}) — full roster` };
   }
-  if (!Array.isArray(files) || files.length >= TOUCH_SET_FILE_CAP) {
+  if (!Array.isArray(files) || (!verified && files.length >= TOUCH_SET_FILE_CAP)) {
     return { securitySeat: true, reason: `touch-set ${Array.isArray(files) ? `has ${files.length} file(s), may be truncated` : 'unreadable'} — full roster` };
   }
   if (cardOnly.lightLane && isCardOnlyDiff(files) && (argvFlag(argv, 'lens') || DEFAULT_LENS) === 'correctness') {
@@ -474,15 +479,21 @@ export function pathsWithRenameSources(files) {
   return out;
 }
 
-function defaultReadChangedFiles({ pr, repo }) {
+export function defaultReadChangedFiles({ pr, repo, cwd = process.cwd(), exec = execFileSyncThrottled, run, enabled } = {}) {
   // No repo, no REST path: throw, which `chooseSecuritySeat` answers with the full roster. 100 entries is one page and
   // is the cap above, so a list that long is never trusted to buy prose.
   if (!/^[\w.-]+\/[\w.-]+$/.test(String(repo ?? ''))) throw new Error('no valid --repo: the file list with rename sources needs <owner>/<name>');
   // `--jq` drops each file's `patch`, which would otherwise make a documentation-heavy PR overflow the read buffer.
-  const out = JSON.parse(execFileSyncThrottled('gh', ['api', `repos/${repo}/pulls/${Number(pr)}/files?per_page=${TOUCH_SET_FILE_CAP}`,
+  const out = JSON.parse(exec('gh', ['api', `repos/${repo}/pulls/${Number(pr)}/files?per_page=${TOUCH_SET_FILE_CAP}`,
     '--jq', '[.[] | {filename, previous_filename}]'],
   { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 16 * 1024 * 1024 }));
-  return pathsWithRenameSources(out);
+  // Head metadata is mutable: read it once per attempt, then let pr-real-files cache only
+  // immutable repo+head evidence. Caching by PR number could grant an old head's card exemption.
+  let info;
+  try { info = JSON.parse(exec('gh', ['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefName,headRefOid,baseRefName'],
+    { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 })); } catch { info = null; }
+  return resolveRealFiles({ pr: info, repo, cwd, run, enabled,
+    ghFiles: !Array.isArray(out) || out.length >= TOUCH_SET_FILE_CAP ? null : pathsWithRenameSources(out) });
 }
 
 /**

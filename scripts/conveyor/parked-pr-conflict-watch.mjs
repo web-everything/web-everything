@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { postCardSquashMarker } from '../lib/card-squash-marker.mjs';
 import { buildConflictFindingBody, defaultPostConflictFinding } from '../lib/conflict-finding.mjs';
 export { buildConflictFindingBody, defaultPostConflictFinding };
 /**
@@ -125,6 +126,8 @@ import { gitRun } from '../lib/git-run.mjs';
 import { ownerInstallationToken, recoveryPushCredential } from './missing-run-push.mjs';
 import { MISSING_RUN_CREDENTIAL_REFUSAL } from './main-red-recovery.mjs';
 import { repoKeyFromRemoteUrl } from './fix-procedure.mjs';
+import { gitRealFiles, resolveRealFiles } from '../lib/pr-real-files.mjs';
+import { loadCardRebaseSettings } from '../lib/card-squash-rebuild.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { loadCardConflictSettings } from '../lib/card-conflict-resolve.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -436,24 +439,11 @@ function recoveryPushContext(repo, {
 
 /** Fresh file evidence for routing only; the resolver still proves the full diff and hunks. */
 export function gitCardOnlyRecheck({ pr, repo, cwd = REPO_ROOT, run = gitRun } = {}) {
-  try {
-    if (!pr?.headRefName?.startsWith('lane/') || pr.baseRefName !== 'main' || !/^[a-f0-9]{40}$/.test(pr.headRefOid ?? '')) return false;
-    const expected = repoKeyForSlug(repo);
-    if (!expected) return false;
-    const remote = run('git', ['remote', 'get-url', 'origin'], { cwd });
-    if (remote.status !== 0 || repoKeyFromRemoteUrl(remote.stdout) !== expected) return false;
-    if (run('git', ['fetch', 'origin', 'main'], { cwd }).status !== 0) return false;
-    if (run('git', ['fetch', '--no-tags', 'origin', `refs/heads/${pr.headRefName}`], { cwd }).status !== 0) return false;
-    const head = run('git', ['rev-parse', 'FETCH_HEAD'], { cwd });
-    if (head.status !== 0 || String(head.stdout).trim() !== pr.headRefOid) return false;
-    // List both sides of renames so moving a non-card into backlog cannot hide it.
-    const diff = run('git', ['diff', '--name-only', '--no-renames', `origin/main...${pr.headRefOid}`], { cwd });
-    return diff.status === 0 && isCardOnlyDiff(String(diff.stdout ?? '').split('\n').filter(Boolean));
-  } catch { return false; }
+  return isCardOnlyDiff(gitRealFiles({ pr, repo, cwd, run }));
 }
 
 /** Same trusted fast-forward plumbing, with a fresh main and a private index for the card path. */
-export function defaultAttemptCardConflictRebase({ pr, repo, cwd = REPO_ROOT, run = gitRun, cardConflictSettings,
+export function defaultAttemptCardConflictRebase({ pr, repo, cwd = REPO_ROOT, run = gitRun, cardConflictSettings, cardRebaseSettings,
   env = process.env, readCache, now = Date.now(),
 } = {}) {
   // Establish clone ownership before eligibility checks or any fetch/ref work.
@@ -490,7 +480,7 @@ export function defaultAttemptCardConflictRebase({ pr, repo, cwd = REPO_ROOT, ru
   };
   const tmpIndex = join(cwd, '.git', `card-conflict-index-${process.pid}-${randomUUID()}`);
   try {
-    return rebaseDropManifest({ laneRef: pr.headRefName, readRef: pr.headRefOid, base: 'origin/main', cwd, run: recoveryRun, fetch: false, tmpIndex, cardConflictSettings });
+    return rebaseDropManifest({ laneRef: pr.headRefName, readRef: pr.headRefOid, base: 'origin/main', cwd, run: recoveryRun, fetch: false, tmpIndex, cardConflictSettings, cardRebaseSettings });
   } finally {
     try { unlinkSync(tmpIndex); } catch { /* private index may not have been created */ }
   }
@@ -1499,6 +1489,7 @@ export function watchParkedPrConflicts({
   attemptMechanicalRebase = defaultAttemptUnownedConflictRebase,
   attemptCardRebase = defaultAttemptCardConflictRebase,
   gitCardOnlyRecheck: recheckCardOnly = gitCardOnlyRecheck,
+  resolveRealFiles: readRealFiles = resolveRealFiles,
   cardConflictSettings = loadCardConflictSettings(),
   unownedRebaseSettings = loadUnownedRebaseSettings(),
   listAgents = defaultListAgents,
@@ -1575,24 +1566,27 @@ export function watchParkedPrConflicts({
     let cardAttempt = null;
     const cardInfraState = {};
     if ((isConflicting || plan.newlyResolved) && (!pr.baseRefName || pr.baseRefName === 'main')) {
+      let files = null;
       try {
-        // Already-labelled queued PRs with an unknown base stay with the grace owner;
-        // only an explicit main base warrants fetching their missing card-only evidence.
-        const files = Array.isArray(pr.files) && pr.files.length < GH_FILES_GRAPHQL_CAP
+        files = Array.isArray(pr.files) && pr.files.length < GH_FILES_GRAPHQL_CAP
           ? pr.files : queued && !plan.add && !pr.baseRefName ? [] : listPrFiles({ number: pr.number, repo: resolvedRepo });
-        cardOnly = isCardOnlyDiff(files.map(f => typeof f === 'string' ? f : f.path));
       } catch (error) {
-        // Unknown files prove neither card-only eligibility nor a card rebase attempt.
         console.error(`parked-pr-conflict-watch: PR #${pr.number}: card file list unavailable; normal conflict owner required: ${conflictWatchCause(error)}`);
       }
-    }
-    if ((isConflicting || plan.newlyResolved) && !cardOnly && cardConflictSettings.value.gitRecheckFiles
-      && pr.baseRefName === 'main' && /^[a-f0-9]{40}$/.test(pr.headRefOid ?? '') && pr.headRefName?.startsWith('lane/')) {
       try {
-        if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
-        cardOnly = recheckCardOnly({ pr, repo: resolvedRepo }) === true;
+        if (resolvedRepo == null && cardConflictSettings.value.gitRecheckFiles === true) resolvedRepo = provider.currentRepo();
+        const evidence = readRealFiles({ pr, repo: resolvedRepo, ghFiles: files,
+          enabled: cardConflictSettings.value.gitRecheckFiles === true && recheckCardOnly === gitCardOnlyRecheck });
+        cardOnly = isCardOnlyDiff(evidence.files);
+        if (evidence.source === 'git' && evidence.disagreed)
+          console.error(`parked-pr-conflict-watch: PR #${pr.number}: git overrode GitHub files; cardConflicts.gitRecheckFiles=true (source: ${cardConflictSettings.sources.gitRecheckFiles})`);
+        // Historical injectable boolean seam, used only by callers that explicitly replace the wrapper.
+        if (recheckCardOnly !== gitCardOnlyRecheck && cardConflictSettings.value.gitRecheckFiles
+          && pr.baseRefName === 'main' && /^[a-f0-9]{40}$/.test(pr.headRefOid ?? '') && pr.headRefName?.startsWith('lane/')) {
+          cardOnly = recheckCardOnly({ pr, repo: resolvedRepo }) === true;
+          if (cardOnly) console.error(`parked-pr-conflict-watch: PR #${pr.number}: git recheck proved card-only; cardConflicts.gitRecheckFiles=true (source: ${cardConflictSettings.sources.gitRecheckFiles})`);
+        }
       } catch { cardOnly = false; }
-      if (cardOnly) console.error(`parked-pr-conflict-watch: PR #${pr.number}: git recheck proved card-only; cardConflicts.gitRecheckFiles=true (source: ${cardConflictSettings.sources.gitRecheckFiles})`);
     }
     if (isConflicting && cardOnly && cardConflictSettings.value.autoResolveRaisedBy && !dryRun) {
       const cardEntry = { num: pr.number, isConflicting, ...plan, commented: false,
@@ -1613,7 +1607,11 @@ export function watchParkedPrConflicts({
           // newlyResolved branch, including a formerly accepted/queued or unowned card.
           provider.ensureLabel(resolvedRepo, CONFLICT_LABEL, CONFLICT_LABEL_META);
           provider.setLabels(resolvedRepo, pr.number, { add: CONFLICT_LABEL, remove: [] });
-          cardAttempt = attemptCardRebase({ pr, repo: resolvedRepo, cardConflictSettings });
+          const cardRebaseSettings = loadCardRebaseSettings();
+          console.error(`parked-pr-conflict-watch: PR #${pr.number}: cardRebase.squashToSingleCommit=${cardRebaseSettings.value.squashToSingleCommit} (source: ${cardRebaseSettings.sources.squashToSingleCommit})`);
+          cardAttempt = attemptCardRebase({ pr, repo: resolvedRepo, cardConflictSettings, cardRebaseSettings });
+          postCardSquashMarker({ result: cardAttempt, comments,
+            postComment: body => provider.postComment(resolvedRepo, pr.number, body) });
           markInfraFailure(pr, cardAttempt);
           cardEntry.mechanicalRebase = cardAttempt;
           if (cardAttempt?.action === 'rebased' || cardAttempt?.action === 'current') {

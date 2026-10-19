@@ -188,9 +188,11 @@ describe('git card-only routing recheck', () => {
       expect(s.attemptCardRebase).toHaveBeenCalledOnce();
       expect(log).toHaveBeenCalledWith(expect.stringContaining('cardConflicts.gitRecheckFiles=true (source: env)'));
       expect(run.mock.calls.map(([, args]) => args)).toEqual([
-        ['remote', 'get-url', 'origin'], ['fetch', 'origin', 'main'],
-        ['fetch', '--no-tags', 'origin', 'refs/heads/lane/cards'], ['rev-parse', 'FETCH_HEAD'],
-        ['diff', '--name-only', '--no-renames', `origin/main...${pr.headRefOid}`],
+        ['rev-parse', '--verify', 'origin/main^{commit}'], ['remote', 'get-url', 'origin'], ['fetch', 'origin', 'main'],
+        ['fetch', '--no-tags', 'origin', 'refs/heads/lane/cards'], ['rev-parse', '--verify', 'origin/main^{commit}'],
+        ['rev-parse', 'FETCH_HEAD'],
+        ['diff', '--name-only', '--no-renames', `${pr.headRefOid}...${pr.headRefOid}`],
+        ['rev-parse', '--verify', 'origin/main^{commit}'],
       ]);
       expect(run.mock.calls.every(([, , opts]) => opts.cwd === '/test')).toBe(true);
     } finally { log.mockRestore(); }
@@ -223,7 +225,7 @@ describe('git card-only routing recheck', () => {
   it.each([
     { remote: 'https://github.com/other/repo.git' }, { head: 'b'.repeat(40) },
     ...['remote get-url origin', 'fetch origin main', 'fetch --no-tags origin refs/heads/lane/cards',
-      'rev-parse FETCH_HEAD', `diff --name-only --no-renames origin/main...${pr.headRefOid}`].map(fail => ({ fail })),
+      'rev-parse FETCH_HEAD', `diff --name-only --no-renames ${pr.headRefOid}...${pr.headRefOid}`].map(fail => ({ fail })),
   ])('git proof fails closed: %j', options => {
     expect(gitCardOnlyRecheck({ pr, repo: 'web-everything/web-everything', run: runner(options) })).toBe(false);
   });
@@ -233,4 +235,12 @@ describe('git card-only routing recheck', () => {
     expect(gitCardOnlyRecheck({ pr, run })).toBe(false);
     expect(run).not.toHaveBeenCalled();
   });
+});
+
+it('first-pass card routing uses resolved files even when GitHub claims all-card', () => {
+  const readRealFiles = vi.fn(() => ({ files: ['scripts/code.mjs'], source: 'git', disagreed: true }));
+  const s = sweep([], [cardPath], 'rebased', { resolveRealFiles: readRealFiles });
+  expect(readRealFiles).toHaveBeenCalledOnce();
+  expect(s.attemptCardRebase).not.toHaveBeenCalled();
+  expect(s.postFinding).toHaveBeenCalledOnce();
 });
