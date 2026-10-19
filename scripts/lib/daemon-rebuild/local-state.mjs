@@ -360,7 +360,7 @@ export function ensureSafeToMove({
 /** Shas a clone was previously built from — see {@link findUnsafeLocalState}'s `knownInputs`. */
 export function knownInputsOf(state) {
   return [
-    state?.adopted?.head, state?.adopted?.mainSha, ...((state?.adopted?.applied) || []).map((a) => a?.sha),
+    state?.adopted?.head, state?.adopted?.mainSha, ...(Array.isArray(state?.adopted?.applied) ? state.adopted.applied : []).map((a) => a?.sha),
     state?.quarantine?.prevHead,
   ].filter(Boolean);
 }

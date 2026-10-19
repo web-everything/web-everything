@@ -7,11 +7,12 @@
  *   `<stateDir>/<cloneKey>.builder.json` and exits. The daemon keeps ticking meanwhile and swaps onto the adopted
  *   build only between ticks (see `daemon-background-build.mjs`). Started by `withSelfSync`, never by hand.
  *
- *   node scripts/lib/daemon-rebuild-builder.mjs --root=<clone> [--entry=<daemon script>]... [--main-only]
+ *   node scripts/lib/daemon-rebuild-builder.mjs --root=<clone> [--entry=<daemon script>]... [--main-only [--main-only-force --by=<operator> --reason=<text>]]
  */
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { hostname } from 'node:os';
+import { mainOnlyForceFromArgs } from './daemon-rebuild/shared.mjs';
 import { rebuildClone } from './daemon-rebuild.mjs';
 import { readBuilderState, writeBuilderState } from './daemon-background-build.mjs';
 
@@ -34,6 +35,8 @@ export function parseBuilderArgs(argv) {
     // every builder record `builder-deadline` and exit at once.
     else if (a.startsWith('--max-age-ms=')) { const n = Number(a.slice('--max-age-ms='.length)); if (Number.isSafeInteger(n) && n > 0) out.maxAgeMs = Math.min(n, MAX_TIMER_MS); }
   }
+  const force = mainOnlyForceFromArgs(argv);
+  if (force) out.mainOnlyForce = force;
   return out;
 }
 
@@ -67,7 +70,7 @@ async function main() {
     const { installDaemonLog } = await import('../../skills-src/conveyor/daemon-log.mjs');
     installDaemonLog({ logPath: null, timers: false }); // stamp lines; the daemon owns rotation of the shared log
   } catch { /* unstamped lines are still lines */ }
-  const { root, entries, mainOnly, maxAgeMs } = parseBuilderArgs(process.argv.slice(2));
+  const { root, entries, mainOnly, mainOnlyForce, maxAgeMs } = parseBuilderArgs(process.argv.slice(2));
   if (!root) { console.error('daemon-rebuild-builder: --root=<clone> is required'); process.exit(2); }
   const startedMs = Date.now();
   const prev = readBuilderState(root) || {};
@@ -89,7 +92,7 @@ async function main() {
   // on it, and rebuild once more right away (the inline path's "the next tick rebuilds from the fresh clone").
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      result = summarizeRebuildResult(await rebuildClone({ root, entries: entries.length ? entries : undefined, mainOnly }));
+      result = summarizeRebuildResult(await rebuildClone({ root, entries: entries.length ? entries : undefined, mainOnly, mainOnlyForce }));
     } catch (e) {
       result = { moved: false, adopted: false, reason: `threw: ${String((e && e.message) || e).split('\n')[0]}` };
     }

@@ -323,3 +323,9 @@ describe('liveness gather paths and human output', () => {
     expect(lines[4]).toBe('  outcome: dry-run'); expect(lines.at(-2)).toBe('1 finding(s)'); expect(lines.at(-1)).toContain('offline');
   });
 });
+
+it('retains main-only-forced operator attribution from rebuild log lines', () => {
+  const detail = { by: 'operator', reason: 'recovery', refs: ['lane/guard'] };
+  expect(parseRebuildLogLines(`${now} daemon-rebuild: main-only-forced ${JSON.stringify(detail)}`, { cloneKey: 'c' }))
+    .toEqual([{ cloneKey: 'c', at: now, kind: 'main-only-forced', detail }]);
+});

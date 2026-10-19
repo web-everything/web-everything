@@ -52,3 +52,19 @@ export function verifyRev(git, rev) {
   const out = String(r.stdout ?? '').trim();
   return r.status === 0 && out ? out : null;
 }
+
+/** Explicit operator authorization for discarding established overlays. Never infer an identity or reason. */
+export function validateMainOnlyForce(mainOnly, force) {
+  if (force === undefined) return undefined;
+  if (!mainOnly || typeof force?.by !== 'string' || !force.by.trim()
+    || typeof force?.reason !== 'string' || !force.reason.trim()) {
+    throw new Error('--main-only-force requires --main-only, --by=<operator> and --reason=<text>');
+  }
+  return { by: force.by.trim(), reason: force.reason.trim() };
+}
+
+export function mainOnlyForceFromArgs(argv) {
+  if (!argv.includes('--main-only-force')) return undefined;
+  const value = (name) => argv.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3);
+  return validateMainOnlyForce(argv.includes('--main-only'), { by: value('by'), reason: value('reason') });
+}

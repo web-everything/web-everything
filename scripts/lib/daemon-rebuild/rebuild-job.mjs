@@ -142,12 +142,12 @@ function clockFor(dir) {
 /**
  * TICK SIDE. Never waits on a smoke. Returns a `rebuildClone`-shaped result (`moved`/`adopted`/`reason`) plus
  * `job` (the in-flight or just-started job) and `finishedJobs` (outcomes consumed this tick).
- * @param {{root: string, env?: object, log?: object, mainOnly?: boolean, entries?: string[],
+ * @param {{root: string, env?: object, log?: object, mainOnly?: boolean, mainOnlyForce?: {by:string, reason:string}, entries?: string[],
  *   adopt: (o?: object) => Promise<object>, store?: object, reattach?: Function, clock?: object, now?: () => number,
  *   codeSha?: string, snapshot?: object, settings?: object, evict?: Function}} o
  */
 export async function rebuildCloneAsJob({
-  root, env = process.env, log = console, mainOnly = false, entries = [], adopt,
+  root, env = process.env, log = console, mainOnly = false, mainOnlyForce, entries = [], adopt,
   store = createJobStore(rebuildJobsDir(root, env)), reattach = reattachTick, clock, now = () => Date.now(),
   codeSha, snapshot, settings = loadRebuildAsJobSettings(), evict = evictSnapshots,
 }) {
@@ -230,7 +230,7 @@ export async function rebuildCloneAsJob({
   try {
     queued = enqueueJob({
       store, kindDef: REBUILD_JOB_KIND, codeSha: codeSha ?? readHead(root), now: now(),
-      input: { root: resolve(root), entries, mainOnly: !!mainOnly, target: r.plan?.finalSha ?? null },
+      input: { root: resolve(root), entries, mainOnly: !!mainOnly, ...(mainOnlyForce ? { mainOnlyForce } : {}), target: r.plan?.finalSha ?? null },
     });
   } catch (e) {
     say(`could not queue a rebuild job (${String(e?.message || e).split('\n')[0]}) — the next tick retries`);
@@ -252,6 +252,7 @@ export function rebuildChildArgs(input, cliPath) {
     cliPath, `--clone=${input.root}`, '--ready-only', '--json',
     ...(input.entries || []).map((e) => `--entry=${e}`),
     ...(input.mainOnly ? ['--main-only'] : []),
+    ...(input.mainOnlyForce ? ['--main-only-force', `--by=${input.mainOnlyForce.by}`, `--reason=${input.mainOnlyForce.reason}`] : []),
   ];
 }
 

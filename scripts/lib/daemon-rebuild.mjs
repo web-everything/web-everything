@@ -113,8 +113,10 @@ import { resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { rebuildClone, dryRunRebuild } from './daemon-rebuild/index.mjs';
 
+import { mainOnlyForceFromArgs } from './daemon-rebuild/shared.mjs';
+
 // ── CLI ──────────────────────────────────────────────────────────────────────────────────────────────────
-// `node scripts/lib/daemon-rebuild.mjs --clone=<path> [--dry-run] [--json] [--ready-only] [--entry=<script>]... [--main-only]`
+// `node scripts/lib/daemon-rebuild.mjs --clone=<path> [--dry-run] [--json] [--ready-only] [--entry=<script>]... [--main-only [--main-only-force --by=<operator> --reason=<text>]]`
 
 function parseFlags(argv) {
   const flags = {};
@@ -128,6 +130,7 @@ function parseFlags(argv) {
 }
 
 async function runCli(argv) {
+  const mainOnlyForce = mainOnlyForceFromArgs(argv);
   const flags = parseFlags(argv);
   const clone = typeof flags.clone === 'string' ? flags.clone : null;
   if (!clone) {
@@ -155,7 +158,7 @@ async function runCli(argv) {
   // daemon's scripts, `--main-only` builds plain main. Job mode is always off here: this IS the build.
   const entries = argv.filter((a) => a.startsWith('--entry=')).map((a) => a.slice('--entry='.length)).filter(Boolean);
   const result = await rebuildClone({
-    root, asJob: false, readyOnly: !!flags['ready-only'], mainOnly: !!flags['main-only'],
+    root, asJob: false, readyOnly: !!flags['ready-only'], mainOnly: !!flags['main-only'], mainOnlyForce,
     ...(entries.length ? { entries } : {}),
   });
   if (flags.json) {

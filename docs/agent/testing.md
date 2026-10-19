@@ -355,6 +355,33 @@ Probe identical-content commits, changed trees, expiry, disabled reuse, failure 
 results through the real rebuild fixture, plus actual check selection through `runLiveSmoke`.
 Run these suites through the host heavy-admission queue.
 
+## Overlay refresh hold liveness
+
+In `daemon-rebuild.test.mjs`, use real Git fixtures to prove that an established conflict
+emits its planner alerts and records the PR fixer wake before returning `overlay-refresh-held`.
+A refresh failure still holds a dropped or unapplied established overlay; an applied overlay
+or its registered `refreshedFrom` successor proceeds through smoke and normal adoption,
+which clears the previous hold. Cover operator-approved edge resolution and successor
+application while refresh still reports failure. Run through heavy admission.
+Read the real needs-you feed with `operations/needs-you-feed.mjs#replay` to verify refresh
+failures, last-good holds and forced main-only bypasses reach operator attention independently
+of health-watch shadow mode. Forced notes retain `by`, `reason` and affected `refs`, including
+`unknown` for a corrupt registry; verify the versioned route with and without `--main-only`.
+Move a pinned branch to a commit in main while its approved content is absent: planning must
+refuse and an established build must hold without unregistering it. Cover both ancestor and
+equivalent-tree tips, plus legitimate retirement when the approved content really is in main. A failed feed write must
+prevent a forced rebuild from proceeding.
+Treat adoption as unknown when its head is absent, empty or not a string, even with `applied: []`;
+prove main-only holds every registered overlay until explicitly forced. Test the shared
+`daemon-rebuild/established.mjs#isEstablished` predicate directly: only complete metadata and
+negative ancestry probes prove a newcomer. Cover missing remote refs, unresolved HEAD, thrown
+probes and status 128, a pinned SHA in HEAD after the remote moved, and applied membership and
+ancestry across refresh lineage in either registry order. Newcomer fixtures must explicitly
+record complete adoption metadata with an empty applied list and resolve their remote-tracking refs
+before the main-only guard (which runs before fetch); absent state or a missing ref proves nothing. Validate SHA pins before
+setting stack bases aside: cover contained and moved bases with an applying top in both registry
+orders, invalid pins, last-good preservation, and retirement of approved content already in main.
+
 ## Daemon entry import regression
 
 `daemon-entries-import.test.mjs` cold-imports every `DAEMON_ENTRY_MODULES` entry from the

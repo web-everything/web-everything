@@ -2,12 +2,12 @@
  * Split out of daemon-rebuild.mjs (move-only).
  */
 
-import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV } from './shared.mjs';
+import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV, validateMainOnlyForce } from './shared.mjs';
 import {
-  alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate, readReadyCandidate,
+  readRebuildState, writeRebuildState, clearReadyCandidate, readReadyCandidate,
 } from './state.mjs';
-import { mkdirSync, appendFileSync, statSync, unlinkSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { statSync, unlinkSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   READY_MAX_AGE_ENV, DEFAULT_READY_MAX_AGE_MS, claimBuildLease, buildLeaseIsLive,
 } from './lease.mjs';
@@ -23,7 +23,10 @@ import {
   readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, makePrBaseChain, resolveOverlayStackMode, persistStackBases,
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
-import { planRebuild } from './plan.mjs';
+import { createOverlayScratch, refreshStaleOverlay, resolveOverlayRefreshSettings } from './overlay-refresh.mjs';
+import { planOverlayStacks, pinnedStatus, planRebuild } from './plan.mjs';
+import { guardMainOnly, makeRebuildAlert } from './main-only.mjs';
+import { isEstablished } from './established.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
 import { repairCloneRefs, holdsCloneWriteLock } from '../lane-repair.mjs';
 import {
@@ -38,23 +41,16 @@ import {
  * smoke a candidate — see {@link rebuildClone}).
  */
 export async function prepareRebuild({
-  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes,
+  root, env, log, run, prState, stateOpts, mainOnly, mainOnlyForce, now, skipCheck, prBaseChain, prForcePushes, refreshOverlay = refreshStaleOverlay,
 }) {
+  mainOnlyForce = validateMainOnlyForce(mainOnly, mainOnlyForce);
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
   const alertsList = [];
   const nowMs = () => now();
   const nowIso = () => new Date(nowMs()).toISOString();
 
-  const alert = (kind, detail) => {
-    alertsList.push({ kind, detail });
-    log?.error?.(`daemon-rebuild: ${kind}${detail !== undefined ? ` ${JSON.stringify(detail)}` : ''}`);
-    try {
-      const file = alertsFilePath(root, stEnv);
-      mkdirSync(dirname(file), { recursive: true });
-      appendFileSync(file, `${JSON.stringify({ at: nowIso(), kind, detail })}\n`, 'utf8');
-    } catch { /* best-effort audit trail only */ }
-  };
+  const alert = makeRebuildAlert({ root, stEnv, log, nowIso, alerts: alertsList });
   const terminal = (result) => {
     // A clone the rebuild will NOT advance while origin/main (or an overlay) has moved is STALE — every dispatch
     // from it refuses as stale-main. Say so loudly, every tick it stays that way, instead of leaving the daemons
@@ -203,13 +199,11 @@ export async function prepareRebuild({
 
   // ── Step 2: fetch ────────────────────────────────────────────────────────────────────────────────────
   // A corrupt overlay file reads as an empty list. Building on that would quietly rebuild onto main alone and
-  // drop every registered fix, so refuse and alert instead (mainOnly ignores overlays anyway, so it proceeds).
+  // drop every registered fix, so the shared guard requires an explicit main-only override.
   const overlayState = readOverlayState(root, { env });
-  if (overlayState.corrupt) {
-    alert('overlay-state-corrupt', { file: overlayFilePath(root, env) });
-    if (!mainOnly) return terminal({ moved: false, reason: 'overlay-state-corrupt' });
-  }
-  const overlaysBefore = overlayState.overlays;
+  const mainOnlyHold = guardMainOnly({ root, env, stEnv, state, overlayState, git, prevHead, mainOnly, mainOnlyForce, nowIso, alert });
+  if (mainOnlyHold) return terminal(mainOnlyHold);
+  let overlaysBefore = overlayState.overlays;
   const edgeResolve = env[OVERLAY_EDGE_RESOLVE_ENV] !== '0';
   // Heal dangling remote-tracking refs (and a clone that is itself broken) BEFORE the fetch: one such ref makes
   // `fetch --prune` reject the whole batch. Daemon clones are never acquired through lane-pool, so this is their only heal.
@@ -243,6 +237,70 @@ export async function prepareRebuild({
   for (const ref of fetchResult.goneRefs) alert('overlay-ref-gone-on-fetch', { ref });
 
   const fetchedMainSha = verifyRev(git, 'origin/main^{commit}');
+  const stack = resolveOverlayStackMode(env);
+  const chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysBefore, env });
+  const refreshSettings = resolveOverlayRefreshSettings(env);
+  const refreshFailures = new Map();
+  // Retain pre-refresh evidence, including pins, while the registry changes underneath us.
+  const lineage = [...overlaysBefore];
+  const establishedRefs = new Set(overlaysBefore.filter((overlay) => isEstablished({
+    state, overlays: lineage, git, headSha: prevHead, overlay,
+  })).map((overlay) => overlay.ref));
+  const established = (ref) => isEstablished({ state, overlays: lineage, git, headSha: prevHead,
+    overlay: lineage.find((entry) => entry.ref === ref) ?? { ref }, establishedRefs });
+  if (!mainOnly && refreshSettings.autoRefresh && fetchedMainSha) {
+    const stackPlan = stack.mode === 'tops' && overlaysBefore.length > 1
+      ? await planOverlayStacks({ git, mainSha: fetchedMainSha, overlays: overlaysBefore, headSha: prevHead,
+        stateOf: async (pr) => prState ? prState(pr) : null, prBaseChain: chainOf,
+        prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
+        isPinned: (raw, sha) => pinnedStatus(git, raw, fetchedMainSha, sha).pinned })
+      : null;
+    const scratchSession = createOverlayScratch({ root, env, run });
+    try {
+      for (const overlay of overlaysBefore) {
+        if (stackPlan?.setAside.has(overlay.ref)) continue;
+        // A recorded SHA cannot be silently replaced by refreshing an unapproved moving tip.
+        if (overlay.pinnedSha !== undefined && verifyRev(git, `origin/${overlay.ref}^{commit}`) !== overlay.pinnedSha) continue;
+        let refreshed;
+        try {
+          const sg = await scratchSession.git();
+          const tip = verifyRev(git, `origin/${overlay.ref}^{commit}`);
+          const probe = sg(['merge-tree', '--write-tree', tip ?? `origin/${overlay.ref}`, fetchedMainSha]);
+          if (probe.status === 0) continue;
+          if (probe.status !== 1) throw new Error('Refresh preflight merge-tree failed');
+          refreshed = await refreshOverlay({ root, overlay, mainSha: fetchedMainSha, env, settings: refreshSettings, alert, run, scratchSession });
+        } catch (e) {
+          refreshed = { ok: false, files: [], reason: String(e?.message ?? e) };
+          alert('overlay-refresh-failed', { ref: overlay.ref, ...refreshed });
+        }
+        if (!refreshed.ok) refreshFailures.set(overlay.ref, refreshed);
+        else if (refreshed.ref && refreshed.ref !== overlay.ref) {
+          lineage.push({ ref: refreshed.ref, refreshedFrom: [overlay.ref] });
+          // Publishing never mutates this clone. Fetch the registered ref before verifying its pin.
+          const fetched = git(['fetch', 'origin', `refs/heads/${refreshed.ref}:refs/remotes/origin/${refreshed.ref}`]);
+          if (fetched.status !== 0) {
+            const failure = { files: [], reason: 'Refreshed overlay fetch failed' };
+            refreshFailures.set(overlay.ref, failure);
+            alert('overlay-refresh-failed', { ref: overlay.ref, ...failure });
+          }
+        }
+      }
+    } finally { await scratchSession.cleanup(); }
+    const current = readOverlayState(root, { env });
+    if (current.corrupt) {
+      alert('overlay-state-corrupt', { file: overlayFilePath(root, env) });
+      return terminal({ moved: false, reason: 'overlay-state-corrupt' });
+    }
+    overlaysBefore = current.overlays;
+    lineage.push(...overlaysBefore);
+  }
+  for (const overlay of overlaysBefore) {
+    if (overlay.pinnedSha !== undefined && verifyRev(git, `origin/${overlay.ref}^{commit}`) !== overlay.pinnedSha) {
+      const failure = { files: [], reason: 'tip differs from registered sha' };
+      refreshFailures.set(overlay.ref, failure);
+      alert('overlay-refresh-failed', { ref: overlay.ref, ...failure });
+    }
+  }
   pruneLandedBacklogSidecars({ git, root, paths: unsafe.untracked, mainSha: fetchedMainSha, alert });
   const remaining = collectUntrackedPaths(git);
   if (remaining === null) {
@@ -255,11 +313,10 @@ export async function prepareRebuild({
   // ── Step 3: plan + apply list edits ─────────────────────────────────────────────────────────────────
   // Held item 212 — stacked overlay PRs apply as stacks (only their tops) unless `overlay.stackMode` says independent.
   // The PR base chains come from gh, else from each entry's recorded `stackBases`, else ancestry alone.
-  const stack = resolveOverlayStackMode(env);
-  const chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysBefore, env });
   const plan = await planRebuild({
-    git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysBefore, prState, mainOnly, edgeResolve,
+    git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysBefore, prState, mainOnly, mainOnlyForce, edgeResolve,
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
+    state, lineage, establishedOverlayRefs: establishedRefs,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
   });
   // The chains gh answered completely are written back onto the entries (only when they changed), so a rebuild that
@@ -278,6 +335,28 @@ export async function prepareRebuild({
     if (event.kind === 'overlay-newcomer-parked' && event.detail.pr != null) {
       const { pr, ref, files, collidesWith } = event.detail;
       markOverlayConflictWake(env, { pr, ref, files, collidesWith, at: nowIso(), clone: root });
+    }
+  }
+  // A verified established overlay must never disappear in favour of plain main.
+  if (!mainOnly && refreshSettings.autoRefresh) {
+    // A failed refresh is advisory once planning preserves the overlay (including a registered successor).
+    // Refused plans cannot release a hold, even if they contain a partial application.
+    const applied = new Set((plan.ok ? plan.applied ?? [] : []).flatMap((o) =>
+      [o.ref, ...(overlaysBefore.find((entry) => entry.ref === o.ref)?.refreshedFrom ?? [])]));
+    const drops = (plan.decisions ?? []).filter((d) => d.action === 'drop' && established(d.ref) && !applied.has(d.ref));
+    const removed = new Set((plan.decisions ?? []).filter((d) => d.action === 'remove').map((d) => d.ref));
+    const failed = [...refreshFailures.keys()].filter((ref) => established(ref) && !removed.has(ref) && !applied.has(ref));
+    const refs = [...new Set([...drops.map((d) => d.ref), ...failed])];
+    if (refs.length) {
+      const files = [...new Set([...drops.flatMap((d) => d.files ?? []), ...refs.flatMap((ref) => refreshFailures.get(ref)?.files ?? [])])];
+      if (state.adopted?.head === prevHead) {
+        state.held = { since: state.held?.since ?? nowIso(), reason: 'overlay-refresh-held',
+        failed: `Overlay refresh held: ${refs.join(', ')}`, details: [], lastGood: prevHead,
+        target: null, mainSha: null, updatedAt: nowIso() };
+        writeState();
+      }
+      alert('overlay-held-on-last-good', { refs, files });
+      return terminal({ moved: false, reason: 'overlay-refresh-held' });
     }
   }
   for (const [pr, wake] of readOverlayConflictWakes(env, { maxAgeMs: Infinity })) {

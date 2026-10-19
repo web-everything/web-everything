@@ -26,11 +26,12 @@ import {
   readyBuildVerified, resolveOverlayConflict, OVERLAY_EDGE_RESOLVE_ENV,
 } from '../daemon-rebuild.mjs';
 import {
-  addOverlay, removeOverlay, readOverlays, overlayFilePath, writeOverlays, recordEdgeResolution,
+  addOverlay, removeOverlay, readOverlays, overlayFilePath, writeOverlays, recordEdgeResolution, replaceOverlayRef,
 } from '../daemon-overlays.mjs';
 import { acquireRead, releaseRead } from '../daemon-clone-lock.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { readOverlayConflictWakes, markOverlayConflictWake } from '../overlay-conflict-wake.mjs';
+import { replay } from '../../operations/needs-you-feed.mjs';
 
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
@@ -117,8 +118,10 @@ function makeFixture() {
   const env = {
     ...process.env,
     WE_DAEMON_STATE_DIR: stateDir,
+    WE_NEEDS_YOU_FEED: join(stateDir, 'needs-you-events.jsonl'),
     WE_DAEMON_CLONE_LOCK_ROOT: lockDir,
     WE_DAEMON_OVERLAY_DIR: overlayDir,
+    WE_DAEMON_OVERLAY_AUTO_REFRESH: '0', // Legacy cases retain pre-refresh behavior.
   };
   return { base, originDir, cloneDir, stateDir, lockDir, overlayDir, env };
 }
@@ -144,7 +147,145 @@ function conflictFixture({ replay = false } = {}) {
 
 describe('overlay conflict resolution', () => {
   const plan = (f, options = {}) => planRebuild({
-    git: f.runGit, headSha: f.main, mainRef: 'origin/main', overlays: f.overlays, ...options,
+    git: f.runGit, headSha: f.main, mainRef: 'origin/main', overlays: f.overlays,
+    state: { adopted: { head: f.main, applied: [] } }, ...options,
+  });
+
+  it.each(['CLOSED', 'gone', 'squashed'])('retires a SHA-pinned overlay with %s removal evidence before checking the pin', async (kind) => {
+    const f = makeFixture();
+    const ref = 'lane/retired';
+    const oldMain = gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim();
+    pushBranch(f.originDir, ref, (dir) => writeFile(dir, 'a.txt', 'a\n'));
+    pushBranch(f.originDir, ref, (dir) => writeFile(dir, 'b.txt', 'b\n'), { base: `origin/${ref}` });
+    if (kind === 'gone') gitOk(f.originDir, ['update-ref', '-d', `refs/heads/${ref}`]);
+    if (kind === 'squashed') advanceMain(f.originDir, (dir) => {
+      writeFile(dir, 'a.txt', 'a\n'); writeFile(dir, 'b.txt', 'b\n');
+    });
+    gitOk(f.cloneDir, ['fetch', '-q', '--prune', 'origin']);
+    if (kind === 'squashed') expect(gitOk(f.cloneDir, ['cherry', 'origin/main', `origin/${ref}`])).toContain('+');
+    const result = await planRebuild({
+      git: (args, opts = {}) => gitRun(args, { cwd: f.cloneDir, env: { ...f.env, ...opts.env } }),
+      headSha: oldMain, mainRef: 'origin/main', overlays: [{ ref, pr: 7, pinnedSha: oldMain }],
+      prState: () => kind === 'CLOSED' ? 'CLOSED' : 'OPEN',
+    });
+    expect(result.ok).toBe(true);
+    expect(result.applied).toEqual([]);
+    expect(result.decisions).toContainEqual(expect.objectContaining({ ref, action: 'remove', reason: { CLOSED: 'pr-closed', gone: 'ref-gone', squashed: 'in-main' }[kind] }));
+  });
+
+  it.each(['ancestor', 'equivalent-tree', 'approved-ancestor', 'approved-squash'])('uses approved content for pinned retirement: %s', async (kind) => {
+    const f = makeFixture();
+    const ref = 'lane/pinned-retirement';
+    pushBranch(f.originDir, ref, (dir) => writeFile(dir, 'approved.txt', 'approved\n'));
+    const pinnedSha = pushBranch(f.originDir, ref, (dir) => writeFile(dir, 'second.txt', 'second approved\n'), { base: `origin/${ref}` });
+    gitOk(f.cloneDir, ['fetch', '-q', 'origin']); // retain the approved object before the remote moves
+    pushBranch(f.originDir, ref, (dir) => writeFile(dir, 'remote.txt', 'unapproved\n'), { base: `origin/${ref}` });
+    let tip;
+    if (kind === 'approved-ancestor') {
+      gitOk(f.originDir, ['update-ref', 'refs/heads/main', pinnedSha]);
+      tip = advanceMain(f.originDir, (dir) => writeFile(dir, 'main.txt', 'main\n'));
+    } else if (kind === 'approved-squash') {
+      tip = advanceMain(f.originDir, (dir) => {
+        writeFile(dir, 'approved.txt', 'approved\n');
+        writeFile(dir, 'second.txt', 'second approved\n');
+        writeFile(dir, 'main.txt', 'main\n');
+      });
+    } else {
+      tip = advanceMain(f.originDir, (dir) => writeFile(dir, 'main.txt', 'main\n'));
+      if (kind === 'equivalent-tree') {
+        const tree = gitOk(f.originDir, ['rev-parse', `${tip}^{tree}`]).trim();
+        tip = gitOk(f.originDir, ['commit-tree', tree, '-p', tip, '-m', 'unapproved empty commit']).trim();
+      }
+    }
+    gitOk(f.originDir, ['update-ref', `refs/heads/${ref}`, tip]);
+    gitOk(f.cloneDir, ['fetch', '-q', 'origin']);
+    if (kind === 'approved-squash') expect(gitOk(f.cloneDir, ['cherry', 'origin/main', pinnedSha])).toContain('+');
+    const result = await planRebuild({
+      git: (args, opts = {}) => gitRun(args, { cwd: f.cloneDir, env: { ...f.env, ...opts.env } }),
+      headSha: pinnedSha, mainRef: 'origin/main', overlays: [{ ref, pinnedSha }],
+    });
+    if (kind.startsWith('approved-')) {
+      expect(result.ok).toBe(true);
+      expect(result.applied).toEqual([]);
+      expect(result.decisions).toContainEqual({ ref, pr: null, action: 'remove', reason: 'in-main', sha: pinnedSha });
+    } else {
+      expect(result).toMatchObject({ ok: false, reason: 'pinned-overlay-sha-mismatch', detail: { ref, expected: pinnedSha, actual: tip } });
+    }
+  });
+
+  it.each([
+    ['stack-contained', false], ['stack-contained', true],
+    ['stack-base-moved', false], ['stack-base-moved', true],
+  ])('validates %s base pins even when the top applies (topFirst=%s)', async (reason, topFirst) => {
+    const f = makeFixture();
+    const head = gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim();
+    const approved = pushBranch(f.originDir, 'lane/base', (dir) => writeFile(dir, 'base.txt', 'approved\n'));
+    let base = approved;
+    if (reason === 'stack-contained') {
+      base = pushBranch(f.originDir, 'lane/base', (dir) => writeFile(dir, 'extra.txt', 'unapproved\n'), { base: 'origin/lane/base' });
+    }
+    const top = pushBranch(f.originDir, 'lane/top', (dir) => writeFile(dir, 'top.txt', 'top\n'), { base: 'origin/lane/base' });
+    if (reason === 'stack-base-moved') {
+      base = pushBranch(f.originDir, 'lane/base', (dir) => writeFile(dir, 'base.txt', 'moved\n'), { base: 'origin/lane/base' });
+      // A conflicting top carries the proven old base head; the current base is set aside.
+      pushBranch(f.originDir, 'lane/top', (dir) => writeFile(dir, 'base.txt', 'top adaptation\n'), { base: 'origin/lane/top' });
+    }
+    gitOk(f.cloneDir, ['fetch', '-q', 'origin']);
+    const entries = [{ ref: 'lane/base', pr: 1 }, { ref: 'lane/top', pr: 2 }];
+    if (topFirst) entries.reverse();
+    const options = {
+      git: (args, opts = {}) => gitRun(args, { cwd: f.cloneDir, env: { ...f.env, ...opts.env } }),
+      headSha: head, mainRef: 'origin/main', overlays: entries, edgeResolve: false,
+      prState: () => 'OPEN', prBaseChain: async (pr) => pr === 2 ? ['lane/base'] : [],
+      prForcePushes: async (pr) => pr === 1 ? [{ before: approved, after: base }] : [],
+    };
+    const control = await planRebuild(options);
+    expect(control.ok).toBe(true);
+    expect(control.decisions).toContainEqual(expect.objectContaining({ ref: 'lane/base', action: 'skip', reason }));
+    expect(control.applied).toContainEqual(expect.objectContaining({ ref: 'lane/top' }));
+    expect(gitOk(f.cloneDir, ['merge-base', '--is-ancestor', top, control.finalSha])).toBe('');
+    for (const pinnedSha of [approved, 'not-a-sha']) {
+      const result = await planRebuild({ ...options, overlays: entries.map((o) => o.pr === 1 ? { ...o, pinnedSha } : o) });
+      expect(result).toMatchObject({ ok: false, reason: 'pinned-overlay-sha-mismatch',
+        detail: { ref: 'lane/base', expected: pinnedSha, actual: base } });
+    }
+    // A pin whose approved SHA really is in main still retires legitimately.
+    const retired = await planRebuild({ ...options, overlays: entries.map((o) => o.pr === 1 ? { ...o, pinnedSha: head } : o) });
+    expect(retired.ok).toBe(true);
+    expect(retired.decisions).toContainEqual({ ref: 'lane/base', pr: 1, action: 'remove', reason: 'in-main', sha: head });
+    expect(retired.applied).toContainEqual(expect.objectContaining({ ref: 'lane/top' }));
+
+    for (const entry of entries) addOverlay(f.cloneDir, entry, { env: f.env });
+    const opts = { root: f.cloneDir, env: f.env, prState: options.prState, prBaseChain: options.prBaseChain,
+      prForcePushes: options.prForcePushes, edgeResolve: false, lockOpts: LOCK_OPTS };
+    const first = await rebuildClone({ ...opts, runSmoke: passSmoke() });
+    expect(first.moved).toBe(true);
+    const lastGood = gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim();
+    addOverlay(f.cloneDir, { ref: 'lane/base', pinnedSha: approved }, { env: f.env });
+    const before = readOverlays(f.cloneDir, { env: f.env });
+    const runSmoke = passSmoke();
+    const held = await rebuildClone({ ...opts, runSmoke });
+    expect(held).toMatchObject({ moved: false, reason: 'pinned-overlay-sha-mismatch' });
+    expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(lastGood);
+    expect(readOverlays(f.cloneDir, { env: f.env })).toEqual(before);
+    expect(readRebuildState(f.cloneDir, f.env).held.lastGood).toBe(lastGood);
+    expect(runSmoke).not.toHaveBeenCalled();
+  });
+
+  it('refuses a mismatched pin when a skipped stack base would apply as fallback', async () => {
+    const f = makeFixture();
+    const head = gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim();
+    const approved = pushBranch(f.originDir, 'lane/base', (dir) => writeFile(dir, 'approved.txt', 'approved intent\n'));
+    const base = pushBranch(f.originDir, 'lane/base', (dir) => writeFile(dir, 'base.txt', 'base intent\n'), { base: 'origin/lane/base' });
+    pushBranch(f.originDir, 'lane/top', (dir) => writeFile(dir, 'README.md', 'top conflict\n'), { base: 'origin/lane/base' });
+    advanceMain(f.originDir, (dir) => writeFile(dir, 'README.md', 'main conflict\n'));
+    gitOk(f.cloneDir, ['fetch', '-q', 'origin']);
+    const result = await planRebuild({
+      git: (args, opts = {}) => gitRun(args, { cwd: f.cloneDir, env: { ...f.env, ...opts.env } }),
+      headSha: head, mainRef: 'origin/main', edgeResolve: false,
+      overlays: [{ ref: 'lane/base', pinnedSha: approved }, { ref: 'lane/top' }],
+    });
+    expect(result).toMatchObject({ ok: false, reason: 'pinned-overlay-sha-mismatch', detail: { ref: 'lane/base', expected: approved, actual: base } });
   });
 
   it('replays a conflicting overlay deterministically and verifies the ready build', async () => {
@@ -443,6 +584,8 @@ describe('overlay conflict resolution', () => {
   it('honors the disable env in rebuilds and previews without fetching edges', async () => {
     const f = conflictFixture({ replay: true });
     f.env[OVERLAY_EDGE_RESOLVE_ENV] = '0';
+    const { writeRebuildState } = await import('../daemon-rebuild/state.mjs');
+    writeRebuildState(f.cloneDir, { adopted: { head: f.main, applied: [] } }, f.env);
     for (const o of f.overlays) addOverlay(f.cloneDir, o, { env: f.env });
     const run = vi.fn(gitRun);
     const preview = await dryRunRebuild({ root: f.cloneDir, env: f.env, run, prState: () => null });
@@ -887,10 +1030,13 @@ describe('rebuildClone', () => {
     expect(existsSync(join(cloneDir, 'planted.txt'))).toBe(true);
   });
 
-  it('mainOnly ignores every overlay', async () => {
+  it('mainOnly ignores newcomers when valid adoption metadata confirms none were applied', async () => {
     const { originDir, cloneDir, env } = makeFixture();
     pushBranch(originDir, 'lane/refused', (dir) => writeFile(dir, 'f.txt', 'x\n'));
     addOverlay(cloneDir, { ref: 'lane/refused' }, { env });
+    gitOk(cloneDir, ['fetch', '-q', 'origin']); // A missing tracking ref cannot prove a newcomer.
+    const { writeRebuildState } = await import('../daemon-rebuild/state.mjs');
+    writeRebuildState(cloneDir, { adopted: { head: gitOk(cloneDir, ['rev-parse', 'HEAD']).trim(), applied: [] } }, env);
 
     const runSmoke = passSmoke();
     const result = await rebuildClone({
@@ -2593,5 +2739,591 @@ describe('starved rebuild wait is bounded (live 2026-10-07: 900s waits starved t
     const { starvationLockWaitMs, DEFAULT_STARVED_LOCK_WAIT_MS } = await import('../daemon-rebuild/lease.mjs');
     expect(DEFAULT_STARVED_LOCK_WAIT_MS).toBeLessThanOrEqual(180_000);
     expect(starvationLockWaitMs(60_000, 5, {})).toBeLessThanOrEqual(180_000);
+  });
+});
+
+// x9diisp — prepare refreshes after fetch, before planning; established failures hold last-good.
+// Legacy fixtures explicitly disable refresh to exercise the pre-refresh conflict behavior.
+describe('overlay auto-refresh — prepareRebuild/rebuildClone wiring', () => {
+  it.each(['main-only-forced', 'overlay-refresh-failed', 'overlay-held-on-last-good'])(
+    '%s writes a real operator note while health notifications are suppressed in shadow mode', async (kind) => {
+      const { makeRebuildAlert } = await import('../daemon-rebuild/main-only.mjs');
+      const { planActions } = await import('../../conveyor/health-watch-core.mjs');
+      const key = 'overlay-dropped::clone';
+      const actions = planActions([{ type: 'opened', key,
+        episode: { smell: 'overlay-dropped', severity: 'high' } }],
+      { 'overlay-dropped': { id: 'overlay-dropped' } }, { mode: 'shadow' });
+      expect(actions).toContainEqual(expect.objectContaining({ kind: 'notify', suppressed: 'shadow mode' }));
+      const root = mktemp('we-rebuild-feed-');
+      const path = join(root, 'needs-you-events.jsonl');
+      const detail = { by: 'operator', reason: 'approved recovery', refs: ['lane/a', 'lane/b'] };
+      const alert = makeRebuildAlert({ root, stEnv: { WE_NEEDS_YOU_FEED: path,
+        WE_DAEMON_STATE_DIR: root }, log: { error: vi.fn() },
+        nowIso: () => '2026-10-19T12:00:00.000Z', alerts: [] });
+      alert(kind, detail);
+      expect(replay({ path })).toEqual([expect.objectContaining({ kind, ...detail })]);
+      expect(readFileSync(path, 'utf8')).toContain('NEEDS-YOU ');
+    });
+
+  async function setup({ adopted = true, enabled = true, otherEstablished = false } = {}) {
+    const f = makeFixture();
+    const ref = 'lane/refresh-guards';
+    if (otherEstablished) {
+      pushBranch(f.originDir, 'lane/other-live', (dir) => writeFile(dir, 'shared.txt', 'other intent\n'));
+      addOverlay(f.cloneDir, { ref: 'lane/other-live' }, { env: f.env });
+    }
+    pushBranch(f.originDir, ref, (dir) => writeFile(dir, 'README.md', 'overlay guard\n'));
+    addOverlay(f.cloneDir, { ref, pr: 6386 }, { env: f.env });
+    if (adopted) {
+      const first = await rebuildClone({ root: f.cloneDir, env: f.env, runSmoke: passSmoke(), prState: () => 'OPEN', lockOpts: LOCK_OPTS });
+      expect(first.moved).toBe(true);
+      expect(readRebuildState(f.cloneDir, f.env).adopted.applied.map((o) => o.ref)).toContain(ref);
+    }
+    const prevHead = gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim();
+    const mainSha = advanceMain(f.originDir, (dir) => writeFile(dir, 'README.md', 'main guard\n'));
+    f.env.WE_DAEMON_OVERLAY_AUTO_REFRESH = enabled ? '1' : '0';
+    const refreshOverlay = vi.fn(async ({ overlay, alert }) => {
+      const result = { ok: false, files: ['README.md'], reason: 'injected refresh failure' };
+      alert('overlay-refresh-failed', { ref: overlay.ref, files: result.files, reason: result.reason });
+      return result;
+    });
+    const runSmoke = passSmoke();
+    const opts = { root: f.cloneDir, env: f.env, run: gitRun, runSmoke, prState: () => 'OPEN', prBaseChain: async () => [], refreshOverlay, lockOpts: LOCK_OPTS };
+    return { ...f, ref, prevHead, mainSha, refreshOverlay, runSmoke, opts };
+  }
+
+  it.each([true, false])('mainOnly holds established overlays before dropping them (refresh=%s)', async (enabled) => {
+    const f = await setup({ enabled });
+    const before = readOverlays(f.cloneDir, { env: f.env });
+    const result = await rebuildClone({ ...f.opts, mainOnly: true });
+    expect(result).toMatchObject({ moved: false, reason: 'overlay-refresh-held' });
+    expect(result.alerts).toContainEqual({ kind: 'overlay-held-on-last-good', detail: { refs: [f.ref], files: [] } });
+    expect(readRebuildState(f.cloneDir, f.env).held.lastGood).toBe(f.prevHead);
+    expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(f.prevHead);
+    expect(readOverlays(f.cloneDir, { env: f.env })).toEqual(before);
+    expect(f.runSmoke).not.toHaveBeenCalled();
+  });
+
+  it.each(['json', 'pin-string', 'pin-null', 'pin-number'])('mainOnly holds a corrupt registry (%s) unless forced, auditing unknown refs', async (kind) => {
+    const f = await setup();
+    const file = overlayFilePath(f.cloneDir, f.env);
+    const contents = kind === 'json' ? '{ not json' : JSON.stringify({ overlays: [
+      { ref: f.ref, pinnedSha: { 'pin-string': 'not-a-sha', 'pin-null': null, 'pin-number': 123 }[kind] },
+    ] });
+    writeFileSync(file, contents);
+    const result = await rebuildClone({ ...f.opts, mainOnly: true });
+    expect(result).toMatchObject({ moved: false, reason: 'overlay-state-corrupt' });
+    expect(result.alerts).toContainEqual({ kind: 'overlay-state-corrupt', detail: { file } });
+    expect(result.alerts.some((a) => a.kind === 'main-only-forced')).toBe(false);
+    expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(f.prevHead);
+    expect(readFileSync(join(f.cloneDir, 'README.md'), 'utf8')).toBe('overlay guard\n');
+    expect(readFileSync(file, 'utf8')).toBe(contents);
+    expect(f.runSmoke).not.toHaveBeenCalled();
+
+    const mainOnlyForce = { by: 'operator', reason: 'approved corrupt-registry recovery' };
+    const forced = await rebuildClone({ ...f.opts, mainOnly: true, mainOnlyForce });
+    expect(forced.moved).toBe(true);
+    expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(f.mainSha);
+    expect(forced.alerts).toContainEqual({ kind: 'main-only-forced', detail: { ...mainOnlyForce, refs: ['unknown'] } });
+    const events = readFileSync(file.replace(/\.json$/, '.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(events.filter((e) => e.kind === 'main-only-forced')).toEqual([
+      expect.objectContaining({ ...mainOnlyForce, refs: ['unknown'] }),
+    ]);
+    expect(readFileSync(file, 'utf8')).toBe(contents);
+    expect(f.runSmoke).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['missing', 'unreadable', 'missing-applied', 'invalid-applied', 'missing-head', 'empty-head', 'blank-head', 'null-head', 'numeric-head'])('mainOnly conservatively holds every registered overlay with %s adoption metadata', async (kind) => {
+    // No overlay was adopted: only the conservative metadata fallback can establish these refs.
+    const f = await setup({ adopted: false });
+    pushBranch(f.originDir, 'lane/another-registered', (dir) => writeFile(dir, 'another.txt', 'another intent\n'));
+    addOverlay(f.cloneDir, { ref: 'lane/another-registered' }, { env: f.env });
+    const before = readOverlays(f.cloneDir, { env: f.env });
+    if (kind !== 'missing') {
+      const file = rebuildStatePath(f.cloneDir, f.env);
+      mkdirSync(dirname(file), { recursive: true });
+      const incompleteHeads = { 'missing-head': undefined, 'empty-head': '', 'blank-head': '   ', 'null-head': null, 'numeric-head': 123 };
+      const adopted = Object.hasOwn(incompleteHeads, kind)
+        ? { head: incompleteHeads[kind], applied: [] }
+        : { head: f.prevHead, ...(kind === 'invalid-applied' ? { applied: {} } : {}) };
+      writeFileSync(file, kind === 'unreadable' ? '{ not json' : JSON.stringify({ adopted }));
+    }
+    const result = await rebuildClone({ ...f.opts, mainOnly: true });
+    expect(result).toMatchObject({ moved: false, reason: 'overlay-refresh-held' });
+    expect(result.alerts).toContainEqual({ kind: 'overlay-held-on-last-good', detail: { refs: before.map((o) => o.ref), files: [] } });
+    expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(f.prevHead);
+    expect(readOverlays(f.cloneDir, { env: f.env })).toEqual(before);
+    expect(f.runSmoke).not.toHaveBeenCalled();
+    const mainOnlyForce = { by: 'operator', reason: 'approved unknown adoption recovery' };
+    const forced = await rebuildClone({ ...f.opts, mainOnly: true, mainOnlyForce });
+    expect(forced.moved).toBe(true);
+    expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(f.mainSha);
+    expect(forced.alerts).toContainEqual({ kind: 'main-only-forced', detail: { ...mainOnlyForce, refs: before.map((o) => o.ref) } });
+  });
+
+  it.each([false, true])('mainOnly holds overlays established only by HEAD ancestry (successor=%s)', async (successor) => {
+    const f = await setup();
+    // Keep readable, valid adoption metadata but remove its applied list's evidence.
+    // The tip in HEAD (or its refreshed predecessor) is the only establishment evidence.
+    const state = readRebuildState(f.cloneDir, f.env);
+    state.adopted.applied = [];
+    const { writeRebuildState } = await import('../daemon-rebuild/state.mjs');
+    writeRebuildState(f.cloneDir, state, f.env);
+    if (successor) {
+      const next = `${f.ref}-mainsync-${f.mainSha.slice(0, 7)}`;
+      pushBranch(f.originDir, next, (dir) => writeFile(dir, 'successor.txt', 'new successor intent\n'));
+      const sha = gitOk(f.originDir, ['rev-parse', `refs/heads/${next}`]).trim();
+      replaceOverlayRef(f.cloneDir, readOverlays(f.cloneDir, { env: f.env })[0], next, { env: f.env, pinnedSha: sha });
+      f.ref = next;
+    }
+    const before = readOverlays(f.cloneDir, { env: f.env });
+    const result = await rebuildClone({ ...f.opts, mainOnly: true });
+    expect(result).toMatchObject({ moved: false, reason: 'overlay-refresh-held' });
+    expect(result.alerts).toContainEqual({ kind: 'overlay-held-on-last-good', detail: { refs: [f.ref], files: [] } });
+    expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(f.prevHead);
+    expect(readOverlays(f.cloneDir, { env: f.env })).toEqual(before);
+    expect(f.runSmoke).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('mainOnly holds a registered pin mismatch, including successor=%s', async (successor) => {
+    const f = await setup();
+    if (successor) {
+      const next = `${f.ref}-mainsync-${f.mainSha.slice(0, 7)}`;
+      gitOk(f.originDir, ['update-ref', `refs/heads/${next}`, `refs/heads/${f.ref}`]);
+      replaceOverlayRef(f.cloneDir, readOverlays(f.cloneDir, { env: f.env })[0], next, { env: f.env, pinnedSha: f.mainSha });
+      f.ref = next;
+    } else addOverlay(f.cloneDir, { ref: f.ref, pinnedSha: f.mainSha }, { env: f.env });
+    const before = readOverlays(f.cloneDir, { env: f.env });
+    const result = await rebuildClone({ ...f.opts, mainOnly: true });
+    const { planRebuild } = await import('../daemon-rebuild/plan.mjs');
+    const { makeGit } = await import('../daemon-rebuild/shared.mjs');
+    const pinPlan = await planRebuild({
+      git: makeGit({ run: gitRun, cwd: f.cloneDir, env: f.env }), headSha: f.prevHead,
+      mainRef: 'origin/main', overlays: before, mainOnly: true, establishedOverlayRefs: new Set([f.ref]),
+    });
+    expect(pinPlan).toMatchObject({ ok: false, reason: 'pinned-overlay-sha-mismatch', detail: { ref: f.ref } });
+    expect(result).toMatchObject({ moved: false, reason: 'overlay-refresh-held' });
+    expect(result.alerts).toContainEqual({ kind: 'overlay-held-on-last-good', detail: { refs: [f.ref], files: [] } });
+    expect(readRebuildState(f.cloneDir, f.env).held.lastGood).toBe(f.prevHead);
+    expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(f.prevHead);
+    expect(readOverlays(f.cloneDir, { env: f.env })).toEqual(before);
+    expect(f.runSmoke).not.toHaveBeenCalled();
+  });
+
+  it('force proceeds despite established pin mismatch and audits operator, reason and refs', async () => {
+    const f = await setup();
+    addOverlay(f.cloneDir, { ref: f.ref, pinnedSha: f.mainSha }, { env: f.env });
+    // First establish the hold, then exercise the explicit bypass.
+    await rebuildClone({ ...f.opts, mainOnly: true });
+    const mainOnlyForce = { by: 'operator', reason: 'approved recovery' };
+    const result = await rebuildClone({ ...f.opts, mainOnly: true, mainOnlyForce });
+    expect(result.moved).toBe(true);
+    expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(f.mainSha);
+    expect(result.alerts).toContainEqual({ kind: 'main-only-forced', detail: { ...mainOnlyForce, refs: [f.ref] } });
+    const events = readFileSync(overlayFilePath(f.cloneDir, f.env).replace(/\.json$/, '.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(events).toContainEqual(expect.objectContaining({ kind: 'main-only-forced', ...mainOnlyForce, refs: [f.ref] }));
+    expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toContainEqual(expect.objectContaining({
+      kind: 'main-only-forced', ...mainOnlyForce, refs: [f.ref],
+    }));
+    expect(f.runSmoke).toHaveBeenCalled();
+  });
+
+  it('mainOnly with no established overlays retains plain-main behavior', async () => {
+    const f = await setup({ adopted: false });
+    gitOk(f.cloneDir, ['fetch', '-q', 'origin']); // Resolve the tracking ref before the pre-fetch guard.
+    const { writeRebuildState } = await import('../daemon-rebuild/state.mjs');
+    writeRebuildState(f.cloneDir, { adopted: { head: f.prevHead, applied: [] } }, f.env);
+    const result = await rebuildClone({ ...f.opts, mainOnly: true });
+    expect(result.moved).toBe(true);
+    expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(f.mainSha);
+    expect(result.alerts.map((a) => a.kind)).not.toContain('overlay-held-on-last-good');
+  });
+
+  it('refuses the forced bypass when the real needs-you feed cannot be written', async () => {
+    const f = await setup();
+    f.env.WE_NEEDS_YOU_FEED = f.stateDir; // A directory cannot be appended as a feed.
+    await expect(rebuildClone({ ...f.opts, mainOnly: true,
+      mainOnlyForce: { by: 'operator', reason: 'approved recovery' } })).rejects.toThrow();
+    expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(f.prevHead);
+    expect(f.runSmoke).not.toHaveBeenCalled();
+    expect(readOverlays(f.cloneDir, { env: f.env }).map((o) => o.ref)).toContain(f.ref);
+  });
+
+  it.each([{}, { by: 'operator' }, { reason: 'recovery' }, { by: ' ', reason: 'recovery' }])('refuses incomplete API authorization %j before IO', async (mainOnlyForce) => {
+    await expect(rebuildClone({ root: '/does-not-exist', mainOnly: true, mainOnlyForce })).rejects.toThrow('--by=<operator> and --reason=<text>');
+  });
+
+  it.each([[], ['--by=operator'], ['--reason=recovery'], ['--by=', '--reason=recovery']].map((extra) => ({ extra })))('CLI refuses incomplete force $extra before rebuilding', ({ extra }) => {
+    for (const [file, rootFlag] of [['daemon-rebuild.mjs', '--clone'], ['daemon-rebuild-builder.mjs', '--root']]) {
+      const result = spawnSync(process.execPath, [`scripts/lib/${file}`, `${rootFlag}=/does-not-exist`, '--main-only', '--main-only-force', ...extra], { encoding: 'utf8', timeout: 20000 });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain('--by=<operator> and --reason=<text>');
+    }
+  });
+
+  it('rebuildClone threads refreshOverlay to preparation after fetch and holds the established last-good tree', async () => {
+    const f = await setup();
+    const before = readOverlays(f.cloneDir, { env: f.env });
+    const result = await rebuildClone(f.opts);
+    expect(f.refreshOverlay).toHaveBeenCalledTimes(1);
+    expect(f.refreshOverlay).toHaveBeenCalledWith(expect.objectContaining({ root: f.cloneDir, overlay: expect.objectContaining({ ref: f.ref }), mainSha: f.mainSha }));
+    expect(result).toMatchObject({ moved: false, reason: 'overlay-refresh-held' });
+    expect(f.runSmoke).not.toHaveBeenCalled();
+    expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(f.prevHead);
+    expect(readFileSync(join(f.cloneDir, 'README.md'), 'utf8')).toBe('overlay guard\n');
+    expect(readOverlays(f.cloneDir, { env: f.env })).toEqual(before);
+    const held = readRebuildState(f.cloneDir, f.env).held;
+    expect(held).toMatchObject({ reason: 'overlay-refresh-held', failed: expect.stringContaining(f.ref), lastGood: f.prevHead, target: null, mainSha: null, details: [], since: expect.any(String), updatedAt: expect.any(String) });
+    expect(result.alerts).toContainEqual({ kind: 'overlay-held-on-last-good', detail: { refs: [f.ref], files: ['README.md'] } });
+    const feed = replay({ path: f.env.WE_NEEDS_YOU_FEED });
+    expect(feed).toContainEqual(expect.objectContaining({ kind: 'overlay-refresh-failed', ref: f.ref,
+      reason: 'injected refresh failure', files: ['README.md'] }));
+    expect(feed).toContainEqual(expect.objectContaining({ kind: 'overlay-held-on-last-good', refs: [f.ref], files: ['README.md'] }));
+    expect(result.alerts.map((a) => a.kind)).not.toContain('overlay-conflict-dropped');
+    const since = held.since;
+    await rebuildClone(f.opts);
+    expect(readRebuildState(f.cloneDir, f.env).held.since).toBe(since);
+  });
+
+  it('emits established conflict alerts and wakes its fixer before returning the refresh hold', async () => {
+    const f = await setup();
+    const result = await rebuildClone(f.opts);
+    expect(result).toMatchObject({ moved: false, reason: 'overlay-refresh-held' });
+    const kinds = result.alerts.map((a) => a.kind);
+    for (const kind of ['established-overlay-dropped', 'overlay-conflict-unresolved']) {
+      expect(kinds.filter((k) => k === kind)).toHaveLength(1);
+      expect(kinds.indexOf(kind)).toBeLessThan(kinds.indexOf('overlay-held-on-last-good'));
+    }
+    expect(readOverlayConflictWakes(f.env).get(6386)).toMatchObject({
+      pr: 6386, ref: f.ref, files: ['README.md'], clone: f.cloneDir,
+    });
+    expect(f.runSmoke).not.toHaveBeenCalled();
+    expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(f.prevHead);
+    expect(readRebuildState(f.cloneDir, f.env).held.lastGood).toBe(f.prevHead);
+  });
+
+  it.each([false, true])('releases a failed refresh hold when the approved edge applies (successor=%s)', async (successor) => {
+    const f = await setup();
+    expect((await rebuildClone(f.opts)).reason).toBe('overlay-refresh-held');
+    expect(readRebuildState(f.cloneDir, f.env).held.lastGood).toBe(f.prevHead);
+    const ref = successor ? `${f.ref}-successor` : f.ref;
+    if (successor) {
+      // The failed source refresh may still register a successor. Only an applied successor releases it.
+      const sha = pushBranch(f.originDir, ref, (dir) => writeFile(dir, 'successor.txt', 'preserved successor intent\n'), { base: `origin/${f.ref}` });
+      const refresh = f.refreshOverlay.getMockImplementation();
+      f.refreshOverlay.mockImplementation(async (opts) => {
+        replaceOverlayRef(f.cloneDir, opts.overlay, ref, { env: f.env, pinnedSha: sha });
+        gitOk(f.cloneDir, ['fetch', '-q', 'origin', `refs/heads/${ref}:refs/remotes/origin/${ref}`]);
+        return refresh(opts);
+      });
+    }
+    const edgeSha = pushBranch(f.originDir, `edge/${ref}`, (dir) => {
+      expect(git(dir, ['merge', '--no-commit', '--no-ff', 'origin/main']).status).toBe(1);
+      writeFile(dir, 'README.md', 'operator resolved guard\n');
+    }, { base: `origin/${ref}` });
+    if (successor) {
+      // Register approval with the replacement during the refresh, after the tick fetches main.
+      const refresh = f.refreshOverlay.getMockImplementation();
+      f.refreshOverlay.mockImplementation(async (opts) => {
+        const result = await refresh(opts);
+        recordEdgeResolution(f.cloneDir, ref, { sha: edgeSha, by: 'operator', reason: 'reviewed' }, { env: f.env });
+        gitOk(f.cloneDir, ['fetch', '-q', 'origin', `refs/heads/edge/${ref}:refs/remotes/origin/edge/${ref}`]);
+        return result;
+      });
+    } else {
+      recordEdgeResolution(f.cloneDir, ref, { sha: edgeSha, by: 'operator', reason: 'reviewed' }, { env: f.env });
+    }
+    f.refreshOverlay.mockClear();
+    const result = await rebuildClone(f.opts);
+    expect(f.refreshOverlay).toHaveBeenCalledTimes(1);
+    expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'overlay-refresh-failed', detail: expect.objectContaining({ ref: f.ref }) }));
+    expect(result).toMatchObject({ moved: true, adopted: true });
+    expect(result.plan.decisions).toContainEqual(expect.objectContaining({ ref, action: 'apply', reason: 'applied-edge-ref' }));
+    expect(result.plan.applied).toContainEqual(expect.objectContaining({ ref, resolvedVia: 'edge-ref', edgeSha }));
+    expect(f.runSmoke).toHaveBeenCalledTimes(1);
+    const state = readRebuildState(f.cloneDir, f.env);
+    expect(state.held).toBeNull();
+    expect(state.adopted.applied).toContainEqual(expect.objectContaining({ ref }));
+    expect(readOverlayConflictWakes(f.env).has(6386)).toBe(false);
+    expect(readFileSync(join(f.cloneDir, 'README.md'), 'utf8')).toBe('operator resolved guard\n');
+    if (successor) expect(readFileSync(join(f.cloneDir, 'successor.txt'), 'utf8')).toBe('preserved successor intent\n');
+  });
+
+  it('prepareRebuild itself returns terminal before rebuild and preserves the adopted head on failed refresh', async () => {
+    const f = await setup();
+    const { prepareRebuild } = await import('../daemon-rebuild/prepare.mjs');
+    const result = await prepareRebuild({ ...f.opts, log: { warn: vi.fn(), error: vi.fn() }, now: () => Date.now() });
+    expect(result).toMatchObject({ terminal: true, result: { moved: false, reason: 'overlay-refresh-held' } });
+    expect(f.refreshOverlay).toHaveBeenCalledTimes(1);
+    expect(readRebuildState(f.cloneDir, f.env).held.lastGood).toBe(f.prevHead);
+    expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(f.prevHead);
+  });
+
+  it('holds an established conflict-drop even when the refresh returns no explicit failure', async () => {
+    const f = await setup();
+    f.refreshOverlay.mockResolvedValue({ ok: true, refreshed: false });
+    const result = await rebuildClone(f.opts);
+    expect(result).toMatchObject({ moved: false, reason: 'overlay-refresh-held' });
+    expect(f.runSmoke).not.toHaveBeenCalled();
+    expect(readRebuildState(f.cloneDir, f.env).held.lastGood).toBe(f.prevHead);
+  });
+
+  it.each([['merge-tree', false], ['commit-tree', false], ['merge-tree', true], ['commit-tree', true]])('holds an established overlay dropped by a planner %s error (successor=%s)', async (command, successor) => {
+    const f = await setup();
+    if (successor) {
+      const next = `${f.ref}-mainsync-${f.mainSha.slice(0, 7)}`;
+      gitOk(f.originDir, ['update-ref', `refs/heads/${next}`, `refs/heads/${f.ref}`]);
+      const expected = readOverlays(f.cloneDir, { env: f.env })[0];
+      const sha = gitOk(f.originDir, ['rev-parse', `refs/heads/${f.ref}`]).trim();
+      replaceOverlayRef(f.cloneDir, expected, next, { env: f.env, pinnedSha: sha });
+      f.ref = next;
+    }
+    // Preflight is clean; exercise the planner's error independently of refresh failures.
+    const run = vi.fn((args, opts) => {
+      if (args.includes('merge-tree') && opts.cwd !== f.cloneDir) return { status: 0, stdout: '', stderr: '' };
+      if (args[0] === command) return { status: 128, stdout: '', stderr: 'injected planner error' };
+      // Allow commit-tree to be reached despite this fixture's real content conflict.
+      if (command === 'commit-tree' && args[0] === 'merge-tree') {
+        return { status: 0, stdout: gitOk(f.cloneDir, ['rev-parse', `origin/${f.ref}^{tree}`]).trim(), stderr: '' };
+      }
+      return gitRun(args, opts);
+    });
+    const before = readOverlays(f.cloneDir, { env: f.env });
+    const result = await rebuildClone({ ...f.opts, run });
+    expect(run.mock.calls.some(([args, opts]) => args[0] === command && opts.cwd === f.cloneDir)).toBe(true);
+    expect(result).toMatchObject({ moved: false, reason: 'overlay-refresh-held' });
+    expect(f.refreshOverlay).not.toHaveBeenCalled();
+    expect(f.runSmoke).not.toHaveBeenCalled();
+    expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(f.prevHead);
+    expect(readOverlays(f.cloneDir, { env: f.env })).toEqual(before);
+    expect(readRebuildState(f.cloneDir, f.env).held.lastGood).toBe(f.prevHead);
+  });
+
+  it('holds on isolated preflight errors and cleans its shared tick scratch', async () => {
+    const f = await setup();
+    const probes = [];
+    const run = (args, opts) => {
+      if (args.includes('merge-tree') && !args.includes('--no-messages') && !args.includes('--name-only')) {
+        probes.push({ args, ...opts });
+        return { status: 128, stdout: '', stderr: 'preflight failed' };
+      }
+      return gitRun(args, opts);
+    };
+    const result = await rebuildClone({ ...f.opts, run });
+    expect(result).toMatchObject({ moved: false, reason: 'overlay-refresh-held' });
+    expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'overlay-refresh-failed' }));
+    expect(probes).toHaveLength(1);
+    expect(probes[0].cwd).not.toBe(f.cloneDir);
+    expect(probes[0].args).toContain('core.attributesFile=/dev/null');
+    expect(probes[0].env).toMatchObject({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
+    expect(existsSync(probes[0].cwd)).toBe(false);
+    expect(f.refreshOverlay).not.toHaveBeenCalled();
+    expect(f.runSmoke).not.toHaveBeenCalled();
+    expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(f.prevHead);
+  });
+
+  it('shares one lazy hardened scratch across all preflight probes and refreshes in a tick', async () => {
+    const f = await setup({ otherEstablished: true });
+    const probes = [], clones = [];
+    const run = (args, opts) => {
+      if (args.includes('clone')) clones.push(opts);
+      if (args.includes('merge-tree') && !args.includes('--no-messages') && !args.includes('--name-only')) probes.push(opts);
+      return gitRun(args, opts);
+    };
+    let refreshRoot;
+    f.refreshOverlay.mockImplementation(async ({ scratchSession }) => {
+      const sg = await scratchSession.git();
+      refreshRoot = scratchSession.root;
+      expect(sg(['rev-parse', '--git-dir']).status).toBe(0);
+      return { ok: false, files: [], reason: 'injected failure' };
+    });
+    const result = await rebuildClone({ ...f.opts, run });
+    expect(result).toMatchObject({ moved: false, reason: 'overlay-refresh-held' });
+    expect(clones).toHaveLength(1);
+    expect(probes).toHaveLength(2);
+    expect(new Set(probes.map((p) => p.cwd))).toEqual(new Set([refreshRoot]));
+    expect(refreshRoot).not.toBe(f.cloneDir);
+    expect(existsSync(refreshRoot)).toBe(false);
+  });
+
+  it.each(['pr-merged', 'pr-closed', 'ref-gone', 'in-main'])('permits legitimate %s removal even if refresh preflight fails', async (reason) => {
+    const f = await setup();
+    if (reason === 'ref-gone') deleteBranch(f.originDir, f.ref);
+    if (reason === 'in-main') advanceMain(f.originDir, (dir) => writeFile(dir, 'README.md', 'overlay guard\n'));
+    const run = (args, opts) => args.includes('merge-tree') && !args.includes('--no-messages') && !args.includes('--name-only')
+      ? { status: 128, stdout: '', stderr: 'injected preflight error' } : gitRun(args, opts);
+    const result = await rebuildClone({ ...f.opts, run,
+      prState: () => reason === 'pr-merged' ? 'MERGED' : reason === 'pr-closed' ? 'CLOSED' : 'OPEN' });
+    expect(result.moved).toBe(true);
+    expect(result.alerts.map((a) => a.kind)).not.toContain('overlay-held-on-last-good');
+    expect(readOverlays(f.cloneDir, { env: f.env })).toEqual([]);
+  });
+
+  it('autoRefresh off retains the old conflict-drop behaviour even for an established overlay', async () => {
+    const f = await setup({ enabled: false });
+    const result = await rebuildClone(f.opts);
+    expect(f.refreshOverlay).not.toHaveBeenCalled();
+    expect(result.moved).toBe(true);
+    expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'overlay-conflict-dropped' }));
+    expect(result.alerts.map((a) => a.kind)).not.toContain('overlay-held-on-last-good');
+    expect(readRebuildState(f.cloneDir, f.env).held).toBeNull();
+    expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(f.mainSha);
+  });
+
+  it('a newcomer conflicting with main keeps drop behaviour after a failed refresh', async () => {
+    const f = await setup({ adopted: false });
+    // Complete adoption metadata plus negative ancestry proves this overlay is a newcomer.
+    const { writeRebuildState } = await import('../daemon-rebuild/state.mjs');
+    writeRebuildState(f.cloneDir, { adopted: { head: f.prevHead, applied: [] } }, f.env);
+    const result = await rebuildClone(f.opts);
+    expect(f.refreshOverlay).toHaveBeenCalledTimes(1);
+    expect(result.reason).not.toBe('overlay-refresh-held');
+    expect(result.alerts.map((a) => a.kind)).toContain('overlay-conflict-dropped');
+    expect(result.alerts.map((a) => a.kind)).not.toContain('overlay-held-on-last-good');
+    expect(readRebuildState(f.cloneDir, f.env).held).toBeNull();
+  });
+
+  it('a newcomer colliding only with an established overlay remains parked', async () => {
+    const f = makeFixture();
+    pushBranch(f.originDir, 'lane/established', (dir) => writeFile(dir, 'README.md', 'established guard\n'));
+    addOverlay(f.cloneDir, { ref: 'lane/established', pr: 1 }, { env: f.env });
+    await rebuildClone({ root: f.cloneDir, env: f.env, runSmoke: passSmoke(), prState: () => 'OPEN', lockOpts: LOCK_OPTS });
+    pushBranch(f.originDir, 'lane/newcomer', (dir) => writeFile(dir, 'README.md', 'new guard\n'));
+    addOverlay(f.cloneDir, { ref: 'lane/newcomer', pr: 2 }, { env: f.env });
+    f.env.WE_DAEMON_OVERLAY_AUTO_REFRESH = '1';
+    const refreshOverlay = vi.fn(() => { throw new Error('clean individual tips must not refresh'); });
+    const result = await rebuildClone({ root: f.cloneDir, env: f.env, refreshOverlay, runSmoke: passSmoke(), prState: () => 'OPEN', prBaseChain: async () => [], lockOpts: LOCK_OPTS });
+    expect(result.reason).not.toBe('overlay-refresh-held');
+    expect(result.alerts.map((a) => a.kind)).toContain('overlay-newcomer-parked');
+    expect(refreshOverlay).not.toHaveBeenCalled();
+    expect(readRebuildState(f.cloneDir, f.env).held).toBeNull();
+  });
+
+  it('does not mark a non-adopted current head as a verified last-good build', async () => {
+    const f = await setup();
+    const { writeRebuildState } = await import('../daemon-rebuild/state.mjs');
+    const state = readRebuildState(f.cloneDir, f.env);
+    state.adopted.head = '0'.repeat(40);
+    writeRebuildState(f.cloneDir, state, f.env);
+    await rebuildClone(f.opts);
+    expect(readRebuildState(f.cloneDir, f.env).held).toBeNull();
+  });
+
+  it.each(['mismatch', 'deleted'])('removes a merged PR with a %s registered pin', async (kind) => {
+    const f = await setup();
+    addOverlay(f.cloneDir, { ref: f.ref, pr: 6386, pinnedSha: f.mainSha }, { env: f.env });
+    if (kind === 'deleted') gitOk(f.originDir, ['update-ref', '-d', `refs/heads/${f.ref}`]);
+    const result = await rebuildClone({ ...f.opts, prState: () => 'MERGED' });
+    expect(result.moved).toBe(true);
+    expect(result.plan.decisions).toContainEqual(expect.objectContaining({ ref: f.ref, action: 'remove', reason: 'pr-merged' }));
+    expect(readOverlays(f.cloneDir, { env: f.env })).toEqual([]);
+    expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(f.mainSha);
+    expect(f.runSmoke).toHaveBeenCalled();
+  });
+
+  it.each([false, true])('retires a moved pinned overlay only when approved content is in main (inMain=%s)', async (approvedInMain) => {
+    const f = await setup({ enabled: false });
+    const pinnedSha = gitOk(f.cloneDir, ['rev-parse', `origin/${f.ref}`]).trim();
+    addOverlay(f.cloneDir, { ref: f.ref, pinnedSha }, { env: f.env });
+    const mainSha = approvedInMain
+      ? advanceMain(f.originDir, (dir) => writeFile(dir, 'README.md', 'overlay guard\n'))
+      : f.mainSha;
+    // Simulate a remote branch moving to main without changing the approved registry pin.
+    gitOk(f.originDir, ['update-ref', `refs/heads/${f.ref}`, mainSha]);
+    const before = readOverlays(f.cloneDir, { env: f.env });
+    const result = await rebuildClone(f.opts);
+    expect(f.refreshOverlay).not.toHaveBeenCalled();
+    if (approvedInMain) {
+      expect(result.moved).toBe(true);
+      expect(result.plan.decisions).toContainEqual(expect.objectContaining({ ref: f.ref, action: 'remove', reason: 'in-main', sha: pinnedSha }));
+      expect(readOverlays(f.cloneDir, { env: f.env })).toEqual([]);
+      expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(mainSha);
+      expect(f.runSmoke).toHaveBeenCalled();
+    } else {
+      expect(result).toMatchObject({ moved: false, reason: 'pinned-overlay-sha-mismatch' });
+      expect(readOverlays(f.cloneDir, { env: f.env })).toEqual(before);
+      expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(f.prevHead);
+      expect(f.runSmoke).not.toHaveBeenCalled();
+      expect(readRebuildState(f.cloneDir, f.env).held.lastGood).toBe(f.prevHead);
+      expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'pinned-overlay-sha-mismatch', detail: expect.objectContaining({ expected: pinnedSha, actual: mainSha }) }));
+    }
+  });
+
+  it.each([true, false])('refuses a pinned remote mismatch on later rebuilds with refresh=%s', async (enabled) => {
+    const f = await setup({ enabled });
+    const pinnedSha = gitOk(f.cloneDir, ['rev-parse', `origin/${f.ref}`]).trim();
+    addOverlay(f.cloneDir, { ref: f.ref, pinnedSha }, { env: f.env });
+    // Move the remote while the approved content is still absent from main.
+    pushBranch(f.originDir, f.ref, (dir) => writeFile(dir, 'extra.txt', 'unapproved code\n'), { base: `origin/${f.ref}` });
+    const result = await rebuildClone(f.opts);
+    expect(result.moved).toBe(false);
+    expect(f.refreshOverlay).not.toHaveBeenCalled();
+    expect(f.runSmoke).not.toHaveBeenCalled();
+    expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(f.prevHead);
+    expect(readOverlays(f.cloneDir, { env: f.env })[0].pinnedSha).toBe(pinnedSha);
+    expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'overlay-refresh-failed', detail: expect.objectContaining({ reason: 'tip differs from registered sha' }) }));
+    expect(readRebuildState(f.cloneDir, f.env).held.lastGood).toBe(f.prevHead);
+  });
+
+  it('refuses a post-registration tip mismatch without unregistering either overlay', async () => {
+    const f = await setup();
+    const next = `${f.ref}-mainsync-${f.mainSha.slice(0, 7)}`;
+    const pinnedSha = gitOk(f.cloneDir, ['rev-parse', `origin/${f.ref}`]).trim();
+    f.refreshOverlay.mockImplementation(async ({ overlay }) => {
+      pushBranch(f.originDir, next, (dir) => writeFile(dir, 'README.md', 'different remote code\n'));
+      replaceOverlayRef(f.cloneDir, overlay, next, { env: f.env, pinnedSha });
+      return { ok: true, ref: next, from: overlay.ref, sha: pinnedSha };
+    });
+    const result = await rebuildClone(f.opts);
+    expect(result).toMatchObject({ moved: false, reason: 'overlay-refresh-held' });
+    expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'overlay-refresh-failed', detail: expect.objectContaining({ ref: next, reason: 'tip differs from registered sha' }) }));
+    expect(readOverlays(f.cloneDir, { env: f.env })).toEqual([expect.objectContaining({ ref: next, pinnedSha })]);
+    expect(f.runSmoke).not.toHaveBeenCalled();
+    expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(f.prevHead);
+  });
+
+  it('holds a refreshed successor conflicting with another established overlay on this and later ticks', async () => {
+    const f = await setup({ otherEstablished: true });
+    const next = `${f.ref}-mainsync-${f.mainSha.slice(0, 7)}`;
+    expect(readFileSync(join(f.cloneDir, 'shared.txt'), 'utf8')).toBe('other intent\n');
+    f.refreshOverlay.mockImplementation(async ({ overlay }) => {
+      pushBranch(f.originDir, next, (dir) => {
+        writeFile(dir, 'README.md', 'refreshed intent\n');
+        writeFile(dir, 'shared.txt', 'refreshed shared intent\n');
+      });
+      const sha = gitOk(f.originDir, ['rev-parse', `refs/heads/${next}`]).trim();
+      replaceOverlayRef(f.cloneDir, overlay, next, { env: f.env, pinnedSha: sha });
+      return { ok: true, from: overlay.ref, ref: next, sha };
+    });
+    for (let tick = 0; tick < 2; tick++) {
+      const result = await rebuildClone(f.opts);
+      expect(result).toMatchObject({ moved: false, reason: 'overlay-refresh-held' });
+      expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'overlay-held-on-last-good', detail: expect.objectContaining({ refs: [next] }) }));
+      expect(result.alerts.map((a) => a.kind)).not.toContain('overlay-newcomer-parked');
+      expect(result.alerts.map((a) => a.kind)).not.toContain('overlay-conflict-dropped');
+      expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(f.prevHead);
+    }
+    expect(f.runSmoke).not.toHaveBeenCalled();
+    expect(f.refreshOverlay).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-reads the replaced registry entry before planning so the refreshed overlay is applied', async () => {
+    const f = await setup();
+    const next = `${f.ref}-mainsync-${f.mainSha.slice(0, 7)}`;
+    f.refreshOverlay.mockImplementation(async ({ overlay, mainSha }) => {
+      // Callback observes the fetched main; write only in a throwaway author, as the real refresh must.
+      expect(mainSha).toBe(f.mainSha);
+      expect(gitOk(f.cloneDir, ['rev-parse', 'origin/main']).trim()).toBe(mainSha);
+      pushBranch(f.originDir, next, (dir) => writeFile(dir, 'README.md', 'resolved stricter guard\n'));
+      gitOk(f.cloneDir, ['fetch', '-q', 'origin', `refs/heads/${next}:refs/remotes/origin/${next}`]);
+      replaceOverlayRef(f.cloneDir, overlay, next, { env: f.env, pinnedSha: gitOk(f.cloneDir, ['rev-parse', `origin/${next}`]).trim() });
+      return { ok: true, from: overlay.ref, ref: next, sha: gitOk(f.cloneDir, ['rev-parse', `origin/${next}`]).trim() };
+    });
+    const result = await rebuildClone(f.opts);
+    expect(f.refreshOverlay).toHaveBeenCalledTimes(1);
+    expect(result.moved).toBe(true);
+    expect(readRebuildState(f.cloneDir, f.env).adopted.applied.map((o) => o.ref)).toContain(next);
+    expect(readRebuildState(f.cloneDir, f.env).adopted.applied.map((o) => o.ref)).not.toContain(f.ref);
+    expect(readFileSync(join(f.cloneDir, 'README.md'), 'utf8')).toBe('resolved stricter guard\n');
   });
 });

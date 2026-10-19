@@ -84,7 +84,7 @@ export async function dryRunRebuild({
           fetchMainAndOverlays({ git: scratchGit, overlays, edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0' });
 
           plan = await planRebuild({
-            git: scratchGit,
+            git: scratchGit, state,
             headSha: head,
             mainRef: 'origin/main',
             overlays,
@@ -229,7 +229,8 @@ export async function previewOverlayConflict({
     let planExisting;
     for (;;) {
       planExisting = await planRebuild({
-        git: scratchGit, headSha: mainSha, mainRef: 'origin/main', overlays: folding,
+        git: scratchGit, headSha: verifyRev(rootGit, 'HEAD'), state: readRebuildState(root, env),
+        mainRef: 'origin/main', overlays: folding, lineage: existingOverlays,
         prState: (p) => defaultPrState({ pr: p, root }),
         edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
       });

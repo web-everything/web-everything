@@ -99,6 +99,7 @@ describe('builder helpers', () => {
     expect(summarizeRebuildResult({ moved: true, adopted: true, head: 'abc', alerts: [1] })).toEqual({ moved: true, adopted: true, reason: 'adopted', head: 'abc' });
     expect(summarizeRebuildResult(null).reason).toBe('no-result');
     expect(parseBuilderArgs(['--root=/c', '--entry=/c/a.mjs', '--main-only'])).toEqual({ root: '/c', entries: ['/c/a.mjs'], mainOnly: true, maxAgeMs: 0 });
+    expect(parseBuilderArgs(['--root=/c', '--main-only', '--main-only-force', '--by=operator', '--reason=recovery'])).toMatchObject({ mainOnly: true, mainOnlyForce: { by: 'operator', reason: 'recovery' } });
     expect(parseBuilderArgs(['--root=/c', '--max-age-ms=5400000']).maxAgeMs).toBe(5_400_000);
     expect(parseBuilderArgs(['--root=/c', '--max-age-ms=junk']).maxAgeMs).toBe(0);
   });

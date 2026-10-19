@@ -6,6 +6,7 @@ import { verifyRev, rebuildCommitEnv, FULL_SHA_RE, REBUILD_IDENTITY_ENV } from '
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
 import { recordedEdgeSha } from './edge-fetch.mjs';
 import { createHash } from 'node:crypto';
+import { isEstablished } from './established.mjs';
 
 // ── pinned overlays — the self-destruct guard ───────────────────────────────────────────────────────────────
 
@@ -317,7 +318,7 @@ export async function planOverlayStacks({
  * rather than removed as `in-main`), and an overlay already an ancestor of main is not part of any stack.
  * @param {{git:(args:string[], opts?:{env?:object})=>{status:number,stdout:string,stderr:string},
  *   headSha:string, mainRef:string, overlays?:Array<{ref:string, pr?:number|null}>,
- *   prState?:(pr:number)=>(Promise<string|null>|string|null), mainOnly?:boolean, edgeResolve?:boolean,
+ *   prState?:(pr:number)=>(Promise<string|null>|string|null), mainOnly?:boolean, mainOnlyForce?:{by:string, reason:string}, edgeResolve?:boolean,
  *   prBaseChain?:((pr:number)=>(Promise<string[]|null>|string[]|null))|null,
  *   prForcePushes?:((pr:number)=>(Promise<Array<{before:string,after?:string|null}>|null>))|null, stackMode?:'tops'|'independent',
  *   stackModeSource?:string}} o
@@ -328,7 +329,7 @@ export async function planOverlayStacks({
  */
 export async function planRebuild({
   git, headSha, mainRef, overlays = [], prState, mainOnly = false, edgeResolve = true,
-  prBaseChain = null, prForcePushes = null, stackMode = 'tops', stackModeSource = 'standard', keepIndependent = new Set(),
+  mainOnlyForce, prBaseChain = null, prForcePushes = null, stackMode = 'tops', stackModeSource = 'standard', keepIndependent = new Set(), establishedOverlayRefs = new Set(), state, lineage = overlays,
 }) {
   const mainSha = verifyRev(git, `${mainRef}^{commit}`);
   if (!mainSha) return { ok: false, reason: 'main-unresolved' };
@@ -338,18 +339,25 @@ export async function planRebuild({
   const applied = [];
   let cur = mainSha;
 
-  // x5059uu (live 2026-10-09 19:54:32Z) — an overlay whose tip is already in the running HEAD is ESTABLISHED: it is
-  // live and proven. A changed or newly added overlay is a NEWCOMER. Established overlays apply first (each group
+  // x5059uu — establishment is fail closed; the shared predicate requires complete adoption
+  // metadata and negative ancestry probes to prove a newcomer. Established overlays apply first (each group
   // keeps list order), so when a newcomer conflicts with them it is the newcomer that is parked, never the proven
   // ones. Before this, #4643 (registered first) pushed a conflicting commit and the rebuild conflict-dropped the
   // live #4658/#4663 instead. With no newcomer (or no established overlay) the order is plain list order.
-  const isEstablished = (raw) => {
-    if (!headSha || !raw?.ref) return false;
-    const sha = verifyRev(git, `refs/remotes/origin/${raw.ref}^{commit}`);
-    return !!sha && git(['merge-base', '--is-ancestor', sha, headSha]).status === 0;
-  };
+  const established = (overlay) => isEstablished({ git, headSha, state, overlay, overlays: lineage, establishedRefs: establishedOverlayRefs });
+  // Main-only keeps its historical established-pin refusal; normal builds validate only
+  // after legitimate removals, before either setting aside or applying an overlay.
+  for (const raw of mainOnly ? overlays : []) {
+    if (mainOnlyForce || !established(raw)) continue;
+    if (raw?.pinnedSha === undefined) continue;
+    const tip = verifyRev(git, `refs/remotes/origin/${raw.ref}^{commit}`);
+    if (!OID.test(raw.pinnedSha) || tip !== raw.pinnedSha) return {
+      ok: false, reason: 'pinned-overlay-sha-mismatch',
+      detail: { ref: raw.ref, expected: raw.pinnedSha, actual: tip, message: 'tip differs from registered sha' },
+    };
+  }
   const listed = mainOnly ? [] : overlays;
-  const establishedRefs = new Set(listed.filter(isEstablished).map((o) => o.ref));
+  const establishedRefs = new Set(listed.filter(established).map((o) => o.ref));
   const conflictFiles = new Map(); // ref → the files its conflict named (for the x5059uu alerts below)
   const toProcess = [
     ...listed.filter((o) => establishedRefs.has(o?.ref)), ...listed.filter((o) => !establishedRefs.has(o?.ref)),
@@ -454,13 +462,6 @@ export async function planRebuild({
       continue;
     }
 
-    // 1b. a stack base set aside for its tops (held item 212): skipped this pass, never dropped or removed.
-    const aside = stacks.setAside.get(ref);
-    if (aside) {
-      decisions.push({ ref, pr, action: 'skip', reason: aside.reason, sha: aside.sha, tops: aside.tops.map((t) => t.ref) });
-      continue;
-    }
-
     // 2. resolve the overlay ref's remote-tracking tip.
     const ovSha = verifyRev(git, `refs/remotes/origin/${ref}^{commit}`);
     if (!ovSha) {
@@ -499,15 +500,33 @@ export async function planRebuild({
       return null;
     };
 
-    // 3. already upstream-equivalent to main? (`git cherry` compares patch-ids; a failed cherry is treated as
-    //    inconclusive — proceed to the merge-tree attempt rather than silently dropping a real overlay.)
-    const cherry = git(['cherry', mainSha, ovSha]);
-    if (cherry.status === 0) {
+    // Retirement evidence must describe the approved content, never a moved remote tip.
+    const approvedSha = raw.pinnedSha ?? ovSha;
+    const validPin = raw.pinnedSha === undefined || OID.test(raw.pinnedSha);
+    const pinMismatch = !validPin || ovSha !== approvedSha;
+    if (validPin) {
+      // `git cherry` compares patch-ids; failure is inconclusive, never retirement evidence.
+      const cherry = git(['cherry', mainSha, approvedSha]);
       const lines = String(cherry.stdout ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
-      if (lines.length === 0 || lines.every((l) => l.startsWith('-'))) {
-        decisions.push({ ref, pr, action: 'remove', reason: 'in-main', sha: ovSha });
+      // Patch IDs can miss squash merges spanning several commits; check the approved tree too.
+      if ((cherry.status === 0 && (lines.length === 0 || lines.every((l) => l.startsWith('-'))))
+        || (pinMismatch && inMain(approvedSha))) {
+        decisions.push({ ref, pr, action: 'remove', reason: 'in-main', sha: approvedSha });
         continue;
       }
+    }
+    // Every remaining overlay must match its registered SHA, including set-aside stack bases.
+    if (pinMismatch) return {
+      ok: false, reason: 'pinned-overlay-sha-mismatch',
+      detail: { ref, expected: raw.pinnedSha, actual: ovSha, message: 'tip differs from registered sha' },
+    };
+
+    // 3. Only set a stack base aside after retirement and SHA-pin validation.
+    // Its top may carry this tip into the build even when the base never applies independently.
+    const aside = stacks.setAside.get(ref);
+    if (aside) {
+      decisions.push({ ref, pr, action: 'skip', reason: aside.reason, sha: aside.sha, tops: aside.tops.map((t) => t.ref) });
+      continue;
     }
 
     // 4. merge-tree in the object DB — no working tree, no index.
@@ -629,7 +648,7 @@ export async function planRebuild({
   if (lostBases.length > 0) {
     return planRebuild({
       git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
-      keepIndependent: new Set([...keepIndependent, ...lostBases]),
+      keepIndependent: new Set([...keepIndependent, ...lostBases]), establishedOverlayRefs, state, lineage,
     });
   }
 

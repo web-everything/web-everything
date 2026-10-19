@@ -23,6 +23,7 @@ import {
   removeOverlay,
   appendOverlayEvent,
   recordEdgeResolution,
+  replaceOverlayRef,
 } from '../daemon-overlays.mjs';
 
 const CLI_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'daemon-overlay.mjs');
@@ -379,5 +380,42 @@ describe('pinned overlays (self-destruct guard, 2026-09-25)', () => {
     });
     expect(r.status, r.stderr).toBe(0);
     expect(JSON.parse(r.stdout).list[0]).toMatchObject({ ref: 'lane/mech', pinned: true });
+  });
+});
+
+
+describe('refreshed overlay SHA registration', () => {
+  it('preserves metadata and ancestry while pinning successive replacements', () => {
+    const opts = { env: env() }, a = 'a'.repeat(40), b = 'b'.repeat(40);
+    addOverlay(cloneRoot, { ref: 'lane/old', pr: 7, pinned: true, stackBases: ['lane/base'], pinnedSha: a }, opts);
+    const original = readOverlays(cloneRoot, opts)[0];
+    replaceOverlayRef(cloneRoot, original, 'lane/next', { ...opts, pinnedSha: b });
+    expect(readOverlays(cloneRoot, opts)).toEqual([{ ...original, ref: 'lane/next', pinnedSha: b, refreshedFrom: ['lane/old'] }]);
+    replaceOverlayRef(cloneRoot, readOverlays(cloneRoot, opts)[0], 'lane/newest', { ...opts, pinnedSha: a });
+    addOverlay(cloneRoot, { ref: 'lane/newest', pr: 7 }, opts);
+    expect(readOverlays(cloneRoot, opts)[0]).toMatchObject({ pinnedSha: a, refreshedFrom: ['lane/old', 'lane/next'] });
+  });
+  it.each(['changed', 'added', 'removed', 'vanished'])('compare-and-swap refuses a pin %s since the entry was read', (change) => {
+    const opts = { env: env() }, a = 'a'.repeat(40), b = 'b'.repeat(40);
+    addOverlay(cloneRoot, { ref: 'lane/old', ...(change === 'added' ? {} : { pinnedSha: a }) }, opts);
+    const expected = readOverlays(cloneRoot, opts)[0];
+    const current = { ...expected };
+    if (change === 'removed') delete current.pinnedSha;
+    else current.pinnedSha = b;
+    writeOverlays(cloneRoot, change === 'vanished' ? [] : [current], opts);
+    const before = readOverlays(cloneRoot, opts);
+    expect(() => replaceOverlayRef(cloneRoot, expected, 'lane/new', { ...opts, pinnedSha: a })).toThrow('Overlay registry changed');
+    expect(readOverlays(cloneRoot, opts)).toEqual(before);
+  });
+  it.each(['short', 'A'.repeat(40), null, ['a'.repeat(40)], 1])('rejects invalid pinned SHA %s at write and read', (pinnedSha) => {
+    const opts = { env: env() };
+    addOverlay(cloneRoot, { ref: 'lane/old' }, opts);
+    expect(() => addOverlay(cloneRoot, { ref: 'lane/new', pinnedSha }, opts)).toThrow('Invalid pinnedSha');
+    expect(() => replaceOverlayRef(cloneRoot, { ref: 'lane/old' }, 'lane/new', { ...opts, pinnedSha })).toThrow('Invalid pinnedSha');
+    const entry = readOverlays(cloneRoot, opts)[0];
+    writeOverlays(cloneRoot, [{ ...entry, pinnedSha }], opts);
+    expect(readOverlayState(cloneRoot, opts).corrupt).toBe(true);
+    expect(readOverlays(cloneRoot, opts)).toEqual([]);
+    expect(() => addOverlay(cloneRoot, { ref: 'lane/another' }, opts)).toThrow();
   });
 });

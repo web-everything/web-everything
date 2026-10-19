@@ -244,6 +244,8 @@ describe('opt-in and child plumbing', () => {
   it('builds the ready-only CLI argv and parses its last JSON line', () => {
     expect(rebuildChildArgs({ root: '/c', entries: ['scripts/merge-ai-prs.mjs'], mainOnly: true }, '/s/cli.mjs'))
       .toEqual(['/s/cli.mjs', '--clone=/c', '--ready-only', '--json', '--entry=scripts/merge-ai-prs.mjs', '--main-only']);
+    expect(rebuildChildArgs({ root: '/c', mainOnly: true, mainOnlyForce: { by: 'operator', reason: 'restore main now' } }, '/s/cli.mjs'))
+      .toEqual(['/s/cli.mjs', '--clone=/c', '--ready-only', '--json', '--main-only', '--main-only-force', '--by=operator', '--reason=restore main now']);
     expect(parseRebuildChildOutput('noise\n{"reason":"x"}\n{"reason":"ready-recorded","readyRecorded":true}\n'))
       .toEqual({ reason: 'ready-recorded', readyRecorded: true });
     expect(parseRebuildChildOutput('no json')).toBeNull();

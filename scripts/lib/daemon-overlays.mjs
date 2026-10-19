@@ -112,6 +112,7 @@ export function readOverlayState(root, { env = process.env } = {}) {
   if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.overlays)) {
     return { clone: null, overlays: [], corrupt: true };
   }
+  if (parsed.overlays.some((o) => o?.pinnedSha !== undefined && (typeof o.pinnedSha !== 'string' || !/^[a-f0-9]{40}$/.test(o.pinnedSha)))) return { clone: null, overlays: [], corrupt: true };
   return { clone: typeof parsed.clone === 'string' ? parsed.clone : null, overlays: parsed.overlays, corrupt: false };
 }
 
@@ -205,16 +206,17 @@ export function writeOverlays(root, list, { env = process.env } = {}) {
  * `stackBases` (held item 212) records the PR's base-branch chain, nearest first (e.g. `['lane/b', 'lane/a']` for a PR
  * stacked on lane/b, itself on lane/a). The rebuild reads it only when gh cannot answer; leaving it out keeps it as is.
  * @param {{ref:string, pr?:number|null, addedBy?:string|null, reason?:string|null, now?:string, pinned?:boolean,
- *   stackBases?:string[]}} entry
+ *   pinnedSha?:string, stackBases?:string[]}} entry
  * @param {{env?:NodeJS.ProcessEnv}} [o]
  * @returns {Array<object>} the new list
  */
 export function addOverlay(root, {
-  ref, pr = null, addedBy = null, reason = null, now, pinned, stackBases,
+  ref, pr = null, addedBy = null, reason = null, now, pinned, pinnedSha, stackBases,
 } = {}, { env = process.env } = {}) {
   if (!isSafeBranchName(ref)) {
     throw new TypeError(`daemon-overlays: ref ${JSON.stringify(ref)} is not a safe branch name — refusing to add it`);
   }
+  if (pinnedSha !== undefined && (typeof pinnedSha !== 'string' || !/^[a-f0-9]{40}$/.test(pinnedSha))) throw new TypeError('Invalid pinnedSha');
   const bases = Array.isArray(stackBases) ? stackBases.filter((b) => isSafeBranchName(b)) : null;
   return withListLock(root, env, (pause) => {
     const list = readOverlaysForWrite(root, env).slice();
@@ -224,6 +226,7 @@ export function addOverlay(root, {
       list.push({
         ref, pr: pr ?? null, addedAt: now || new Date().toISOString(), addedBy: addedBy ?? null, reason: reason ?? null,
         ...(pinned === true ? { pinned: true } : {}),
+        ...(pinnedSha !== undefined ? { pinnedSha } : {}),
         ...(bases ? { stackBases: bases } : {}),
       });
     } else {
@@ -231,6 +234,7 @@ export function addOverlay(root, {
       if (pinned === true) next.pinned = true;
       else if (pinned === false) delete next.pinned;
       if (bases) next.stackBases = bases;
+      if (pinnedSha !== undefined) next.pinnedSha = pinnedSha;
       list[idx] = next;
     }
     return writeOverlays(root, list, { env });
@@ -512,5 +516,21 @@ export function persistStackBases(root, fresh, { env = process.env } = {}) {
     }
     if (written > 0) writeOverlays(root, list, { env });
     return { written };
+  });
+}
+
+/** Replace a refreshed tip atomically, retaining metadata, ordering, concurrent edits and ref lineage.
+ * Compare the expected entry's ref and pin under the list lock; preserve concurrent metadata edits.
+ * `pinnedSha` is required: subsequent rebuilds refuse a different remote tip. */
+export function replaceOverlayRef(root, expected, to, { env = process.env, pinnedSha } = {}) {
+  const from = expected?.ref;
+  if (!from) throw new TypeError('Expected overlay entry required');
+  if (typeof pinnedSha !== 'string' || !/^[a-f0-9]{40}$/.test(pinnedSha)) throw new TypeError('Invalid pinnedSha');
+  if (!isSafeBranchName(to)) throw new Error('Unsafe refreshed ref');
+  return withListLock(root, env, () => {
+    const list = readOverlaysForWrite(root, env);
+    if (!list.some((o) => o.ref === from && o.pinnedSha === expected.pinnedSha) || list.some((o) => o.ref === to)) throw new Error('Overlay registry changed during refresh');
+    writeOverlays(root, list.map((o) => o.ref === from ? { ...o, ref: to, pinnedSha, refreshedFrom: [...new Set([...(o.refreshedFrom ?? []), from])] } : o), { env });
+    appendOverlayEvent(root, { kind: 'refreshed', from, to }, { env });
   });
 }

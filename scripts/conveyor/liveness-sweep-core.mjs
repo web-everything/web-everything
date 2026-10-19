@@ -70,7 +70,7 @@ const latestTime = values => { const times = values.map(time).filter(Number.isFi
 export function parseRebuildLogLines(text, { cloneKey } = {}) {
   return String(text ?? '').split(/\r?\n/).flatMap(line => {
     const m = line.match(/(\d{4}-\d\d-\d\dT\S+) daemon-rebuild: ([\w-]+) (\{.*\})/);
-    if (!m || !['clone-held-stale', 'pinned-overlay-conflict', 'overlay-conflict-unresolved', 'ready-candidate-adopted'].includes(m[2])) return [];
+    if (!m || !['clone-held-stale', 'pinned-overlay-conflict', 'overlay-conflict-unresolved', 'overlay-refreshed', 'main-only-forced', 'overlay-refresh-failed', 'overlay-held-on-last-good', 'ready-candidate-adopted'].includes(m[2])) return [];
     try { return [{ cloneKey, at: m[1], kind: m[2], detail: JSON.parse(m[3]) }]; } catch { return []; }
   });
 }
@@ -142,7 +142,7 @@ function detectPrs(snapshot, settings, add, named) {
     if (!owner && !pr.isDraft && !labels.includes('review:human') && !named(subject)) add('pr-no-movement', subject, movementTime(pr), settings.prNoMovementMinutes, 'PR has no movement or live owner', evidence);
   }
 }
-const refusalKinds = new Set(['pinned-overlay-conflict', 'overlay-conflict-unresolved', 'clone-held-stale']);
+const refusalKinds = new Set(['pinned-overlay-conflict', 'overlay-conflict-unresolved', 'overlay-refresh-failed', 'overlay-held-on-last-good', 'clone-held-stale']);
 function detectRebuilds(snapshot, settings, add) {
   const keys = new Set([...(snapshot.rebuildAlerts ?? []).map(a => a.cloneKey), ...(snapshot.rebuildStates ?? []).map(s => s.cloneKey)]);
   for (const cloneKey of keys) {

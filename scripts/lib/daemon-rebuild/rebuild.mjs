@@ -13,8 +13,10 @@ import {
   ACTIVE_BUILD_TOKENS,
 } from './lease.mjs';
 import { readReadyCandidate, readRebuildState, writeRebuildState } from './state.mjs';
-import { verifyRev, makeGit } from './shared.mjs';
+import { verifyRev, makeGit, validateMainOnlyForce } from './shared.mjs';
 import { makeSkipCheck } from './skip-unrelated.mjs';
+import { readOverlayState } from '../daemon-overlays.mjs';
+import { guardMainOnly, makeRebuildAlert } from './main-only.mjs';
 import { prepareRebuild } from './prepare.mjs';
 import { smokeAndAdopt } from './smoke.mjs';
 import { resolveVersionedContext, versionedRebuild } from '../daemon-version-runtime.mjs';
@@ -31,33 +33,47 @@ import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
  * a smoke-passed candidate (including one already waiting on this head) retains the finalize wait.
  * @param {{root:string, env?:NodeJS.ProcessEnv, log?:Console, run?:typeof gitRun, runSmoke?:typeof runLiveSmokeWithRetry,
  *   prState?:(pr:number)=>(Promise<string|null>|string|null), lockOpts?:object, stateOpts?:{env?:NodeJS.ProcessEnv},
- *   mainOnly?:boolean, admissionWaitMs?:number, now?:()=>number, sleep?:(ms:number)=>Promise<void>,
+ *   mainOnly?:boolean, mainOnlyForce?:{by:string, reason:string}, admissionWaitMs?:number, now?:()=>number, sleep?:(ms:number)=>Promise<void>,
  *   dispatchSmoke?:{settings?:object, run?:Function, match?:Function}}} o — `dispatchSmoke` (xhiqxz3): injected
  *   pieces of the real dispatch smoke the candidate smoke runs for a new dispatch-touching overlay (default: #4481's).
  * @returns {Promise<object>}
  */
 export async function rebuildClone({
   root, env = process.env, log = console, run = gitRun, runSmoke = runLiveSmokeWithRetry,
-  prState = (pr) => defaultPrState({ pr, root }), lockOpts = {}, stateOpts = {}, mainOnly = false,
+  prState = (pr) => defaultPrState({ pr, root }), lockOpts = {}, stateOpts = {}, mainOnly = false, mainOnlyForce,
   now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke, readyOnly = false, adoptOnly = false,
-  asJob, admissionWaitMs,
+  asJob, admissionWaitMs, refreshOverlay, prBaseChain, prForcePushes,
 } = {}) {
+  mainOnlyForce = validateMainOnlyForce(mainOnly, mainOnlyForce);
   // #4126 — the opted-in daemon's tick never smokes: it adopts a ready candidate (fast) and otherwise starts or
   // watches a detached rebuild JOB (`rebuild-job.mjs`). `asJob` undefined resolves from daemon-rebuild-settings.json
   // by the caller's `entries`; the job itself and the adopt-only pass inside it always run the inline path.
   if (!readyOnly && !adoptOnly && (asJob === undefined ? resolveRebuildAsJob({ entries, env }) : asJob)) {
     return rebuildCloneAsJob({
-      root, env, log, mainOnly, entries,
+      root, env, log, mainOnly, mainOnlyForce, entries,
       adopt: (o = {}) => rebuildClone({
-        root, env, log, run, runSmoke, prState, lockOpts, stateOpts, mainOnly, now, sleep, versions, skipCheck, entries,
-        dispatchSmoke, admissionWaitMs, ...o, adoptOnly: true, asJob: false,
+        root, env, log, run, runSmoke, prState, lockOpts, stateOpts, mainOnly, mainOnlyForce, now, sleep, versions, skipCheck, entries,
+        dispatchSmoke, admissionWaitMs, refreshOverlay, prBaseChain, prForcePushes, ...o, adoptOnly: true, asJob: false,
       }),
     });
   }
   // Card 89 S5: a versioned clone never moves in place — it builds a version and flips `current`, taking no
   // clone lock at all. `versions: null` forces the legacy path; unset resolves from the settings (default off).
   const vctx = versions === undefined ? resolveVersionedContext({ root, env }) : versions;
-  if (vctx) return versionedRebuild({ ctx: vctx, log });
+  if (vctx) {
+    const stEnv = { ...env, ...(stateOpts?.env || {}) };
+    const alerts = [];
+    const nowIso = () => new Date(now()).toISOString();
+    const alert = makeRebuildAlert({ root, stEnv, log, nowIso, alerts });
+    const git = makeGit({ run, cwd: root, env });
+    const overlayState = readOverlayState(root, { env });
+    const held = guardMainOnly({ root, env, stEnv, state: readRebuildState(root, stEnv), overlayState,
+      // Versioned builds always build plain origin/main, regardless of the caller's flag.
+      git, prevHead: verifyRev(git, 'HEAD'), mainOnly: true, mainOnlyForce, nowIso, alert });
+    if (held) return { ...held, alerts };
+    const result = await versionedRebuild({ ctx: vctx, log });
+    return { ...result, alerts: [...alerts, ...(result.alerts ?? [])] };
+  }
   // daemonRebuild.skipUnrelated (default on): `skipCheck` is injectable; else built from the daemon's `entries`.
   // #4126 readyOnly (the rebuild job) never moves `root`: no skip-unrelated adoption here (the tick's adopt-only
   // pass does that), and a ready candidate already waiting is the tick's to adopt — nothing to build.
@@ -103,7 +119,7 @@ export async function rebuildClone({
     && pendingReady.prevHead === verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
   const startedMs = now();
   const prep = await withWriteLock(root, () => prepareRebuild({
-    root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider,
+    root, env, log, run, prState, stateOpts, mainOnly, mainOnlyForce, now, skipCheck: skipDecider, refreshOverlay, prBaseChain, prForcePushes,
   }), readyOnHead ? finalizeLockOpts : admissionLockOpts);
 
   if (prep.ok) {

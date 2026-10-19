@@ -723,7 +723,7 @@ export async function smokeAndAdopt({
       const culpritRefs = new Set(culprits.map((ap) => ap.ref));
       const kept = plan.applied.filter((ap) => !culpritRefs.has(ap.ref));
       const planA2 = await planRebuild({
-        git, headSha: prevHead, mainRef: 'origin/main',
+        git, headSha: prevHead, state: { adopted: adoptedState }, lineage: overlaysBefore, mainRef: 'origin/main',
         overlays: kept.map((ap) => ({ ...(rawByRef.get(ap.ref) ?? {}), ref: ap.ref, pr: ap.pr })),
         edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
       });
@@ -762,7 +762,7 @@ export async function smokeAndAdopt({
   if (!mainOnly && suspects.length > 0) {
     const pinnedOverlays = withPin.filter((ap) => ap.pinned).map((ap) => ({ ...(rawByRef.get(ap.ref) ?? {}), ref: ap.ref, pr: ap.pr }));
     const planB = await planRebuild({
-      git, headSha: prevHead, mainRef: 'origin/main', overlays: pinnedOverlays,
+      git, headSha: prevHead, state: { adopted: adoptedState }, lineage: overlaysBefore, mainRef: 'origin/main', overlays: pinnedOverlays,
       edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
     });
     if (planB.ok) {

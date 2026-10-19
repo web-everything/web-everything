@@ -101,6 +101,71 @@ describe('card 89 S5 — versioned in-tick path', () => {
     expect(lock.acquireRead).not.toHaveBeenCalled();
   });
 
+  it.each([true, false].flatMap((mainOnly) =>
+    ['recorded', 'unknown', 'ancestry', 'successor', 'pin-mismatch', 'corrupt'].map((kind) => [mainOnly, kind])))('versioned route mainOnly=%s protects %s overlays and audits force', async (mainOnly, kind) => {
+    const { addOverlay, readOverlays, overlayFilePath, replaceOverlayRef } = await import('../daemon-overlays.mjs');
+    const { readRebuildState, writeRebuildState, alertsFilePath } = await import('../daemon-rebuild/state.mjs');
+    const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: join(fixture, 'overlays'), WE_DAEMON_STATE_DIR: join(fixture, 'state'),
+      WE_NEEDS_YOU_FEED: join(fixture, 'needs-you-events.jsonl') };
+    const head = git(clone, 'rev-parse', 'HEAD');
+    const ref = 'lane/live';
+    git(clone, 'update-ref', 'refs/remotes/origin/lane/old', head);
+    if (kind === 'ancestry') git(clone, 'update-ref', `refs/remotes/origin/${ref}`, head);
+    addOverlay(clone, { ref: kind === 'successor' ? 'lane/old' : ref, ...(kind === 'pin-mismatch' ? { pinnedSha: 'f'.repeat(40) } : {}) }, { env });
+    if (kind === 'successor') replaceOverlayRef(clone, readOverlays(clone, { env })[0], ref, { env, pinnedSha: head });
+    const registryBefore = readOverlays(clone, { env });
+    if (kind !== 'unknown') writeRebuildState(clone, { adopted: { head, applied: ['recorded', 'pin-mismatch'].includes(kind) ? [{ ref }] : [] } }, env);
+    const file = overlayFilePath(clone, env);
+    if (kind === 'corrupt') writeFileSync(file, '{ invalid json');
+    const before = readFileSync(file, 'utf8');
+    // Deliberately unreachable version source: a guard must return before the versioned fetch.
+    const opts = { root: clone, env, versions: { ...ctx, clone: join(fixture, 'not-a-repo') }, asJob: false, log, ...(mainOnly ? { mainOnly: true } : {}) };
+    const held = await rebuildClone(opts);
+    expect(held).toMatchObject({ moved: false, reason: kind === 'corrupt' ? 'overlay-state-corrupt' : 'overlay-refresh-held' });
+    if (kind !== 'corrupt') {
+      expect(readRebuildState(clone, env).held).toMatchObject({ reason: 'overlay-refresh-held', lastGood: head });
+      const { replay } = await import('../../operations/needs-you-feed.mjs');
+      expect(replay({ path: env.WE_NEEDS_YOU_FEED })).toContainEqual(expect.objectContaining({ kind: 'overlay-held-on-last-good', refs: [ref] }));
+      expect(log.error).toHaveBeenCalledWith(expect.stringContaining('overlay-held-on-last-good'));
+    }
+    expect(readFileSync(file, 'utf8')).toBe(before);
+    expect(git(clone, 'rev-parse', 'HEAD')).toBe(head);
+    expect(rt.currentVersion(ctx)).toBeNull();
+    expect(buildDeps.runSmoke).not.toHaveBeenCalled();
+    const mainOnlyForce = { by: 'operator', reason: 'approved version recovery' };
+    const forced = await rebuildClone({ ...opts, mainOnly: true, mainOnlyForce });
+    expect(forced.reason).toBe('fetch-failed');
+    const detail = { ...mainOnlyForce, refs: [kind === 'corrupt' ? 'unknown' : ref] };
+    expect(forced.alerts).toContainEqual({ kind: 'main-only-forced', detail });
+    const events = readFileSync(file.replace(/\.json$/, '.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(events.filter((e) => e.kind === 'main-only-forced')).toEqual([expect.objectContaining(detail)]);
+    const alerts = readFileSync(alertsFilePath(clone, env), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(alerts).toContainEqual(expect.objectContaining({ kind: 'main-only-forced', detail }));
+    const { replay } = await import('../../operations/needs-you-feed.mjs');
+    expect(replay({ path: env.WE_NEEDS_YOU_FEED })).toContainEqual(expect.objectContaining({ kind: 'main-only-forced', ...detail }));
+    expect(log.error).toHaveBeenCalledWith(`daemon-rebuild: main-only-forced ${JSON.stringify(detail)}`);
+    expect(lock.withWriteLock).not.toHaveBeenCalled();
+    if (kind !== 'corrupt') expect(readOverlays(clone, { env })).toEqual(registryBefore);
+  });
+
+  it.each([{}, { by: 'operator' }, { reason: 'recovery' }, { by: ' ', reason: 'recovery' }])('versioned force requires complete authorization %j', async (mainOnlyForce) => {
+    await expect(rebuildClone({ root: clone, versions: ctx, mainOnly: true, mainOnlyForce, asJob: false, log }))
+      .rejects.toThrow('--by=<operator> and --reason=<text>');
+    expect(rt.currentVersion(ctx)).toBeNull();
+    expect(buildDeps.runSmoke).not.toHaveBeenCalled();
+  });
+
+  it('versioned normal rebuild also refuses a corrupt registry', async () => {
+    const { overlayFilePath } = await import('../daemon-overlays.mjs');
+    const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: join(fixture, 'overlays') };
+    const file = overlayFilePath(clone, env);
+    mkdirSync(join(fixture, 'overlays'), { recursive: true });
+    writeFileSync(file, '{ invalid json');
+    expect(await rebuildClone({ root: clone, env, versions: ctx, asJob: false, log }))
+      .toMatchObject({ moved: false, reason: 'overlay-state-corrupt' });
+    expect(rt.currentVersion(ctx)).toBeNull();
+  });
+
   it('first adoption then a second main commit: two switches, current follows, nothing locked', async () => {
     const first = await rebuild();
     expect(first).toMatchObject({ moved: true, adopted: true, reason: 'adopted' });

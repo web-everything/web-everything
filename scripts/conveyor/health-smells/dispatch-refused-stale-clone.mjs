@@ -20,7 +20,7 @@ import { MINUTE, fmtAge } from '../health-watch-core.mjs';
 const REBUILD_BLOCKED = new Set([
   'pinned-overlay-conflict', 'pinned-overlay-unavailable', 'smoke-rejected', 'clone-held-stale', 'quarantined',
   'rebuild-failed', 'dirty', 'overlay-state-corrupt', 'fetch-failed', 'not-on-main', 'local-commits',
-  'merge-in-progress', 'untracked-collision',
+  'merge-in-progress', 'untracked-collision', 'overlay-refresh-failed', 'overlay-held-on-last-good',
 ]);
 
 /** PURE: the trailing run of stale-refused ticks — `{ticks, since}` (since = the run's first tick). */

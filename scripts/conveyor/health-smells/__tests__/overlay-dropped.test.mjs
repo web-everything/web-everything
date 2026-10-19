@@ -142,3 +142,29 @@ describe('overlay-dropped — rule edges', () => {
     }
   });
 });
+
+describe('overlay refresh attention', () => {
+  it('surfaces failed refreshes and holds even while the adopted overlay remains live, then clears on refresh', () => {
+    const clone = { cloneKey: 'held', rebuild: { adopted: { head: 'good', applied: [{ ref: 'lane/guard' }] } }, alerts: [
+      { at: NOW - MINUTE, kind: 'overlay-refresh-failed', detail: { ref: 'lane/guard', files: ['guard.txt'], reason: 'audit refused' } },
+      { at: NOW - MINUTE, kind: 'overlay-held-on-last-good', detail: { refs: ['lane/guard'], files: ['guard.txt'] } },
+    ] };
+    const rows = overlayDropped.evaluate({ selfSync: [clone] }, { now: NOW });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].summary).toContain('operator attention required');
+    expect(rows[0].recommendation).toContain('without weakening either parent');
+    clone.alerts.push({ at: NOW, kind: 'overlay-refreshed', detail: { from: 'lane/guard', ref: 'lane/guard-mainsync-1234567' } });
+    expect(overlayDropped.evaluate({ selfSync: [clone] }, { now: NOW })).toEqual([]);
+  });
+});
+
+ it.each(['lane/guard', 'unknown'])('main-only-forced surfaces operator attribution for %s as an attention note', (ref) => {
+   const detail = { by: 'operator', reason: 'recovery', refs: [ref] };
+   const clone = { cloneKey: 'forced', alerts: [{ at: NOW - MINUTE, kind: 'main-only-forced', detail }] };
+   const [row] = overlayDropped.evaluate({ selfSync: [clone] }, { now: NOW });
+   expect(row).toMatchObject({ subject: 'main-only-forced:forced', breach: true, measure: detail });
+   expect(row.summary).toContain('operator');
+   expect(row.summary).toContain('recovery');
+   expect(row.recommendation).toContain(ref);
+   expect(overlayDropped.evaluate({ selfSync: [clone] }, { now: NOW + 31 * MINUTE })).toEqual([]);
+ });

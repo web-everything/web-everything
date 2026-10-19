@@ -56,15 +56,31 @@ export function droppedOverlays(clone, { now, freshMs }) {
   const applied = new Set((clone?.rebuild?.adopted?.applied ?? []).map((a) => a?.ref).filter(Boolean));
   const byRef = new Map();
   const get = (ref) => {
-    if (!byRef.has(ref)) byRef.set(ref, { dropAt: null, removedAt: null, files: [], pr: null, sha: null });
+    if (!byRef.has(ref)) byRef.set(ref, { dropAt: null, removedAt: null, files: [], pr: null, sha: null, refreshFailed: false });
     return byRef.get(ref);
   };
   for (const a of clone?.alerts ?? []) {
+    if (a.kind === 'overlay-refreshed' && a.detail?.from && Number.isFinite(a.at)) {
+      get(a.detail.from).removedAt = a.at;
+    }
+    if (a.kind === 'overlay-held-on-last-good' && Number.isFinite(a.at)) {
+      for (const ref of a.detail?.refs ?? []) {
+        const r = get(ref);
+        r.dropAt = Math.max(r.dropAt ?? 0, a.at);
+        r.refreshFailed = true;
+        r.files = a.detail.files ?? [];
+      }
+    }
     const ref = a?.detail?.ref;
     if (!ref || !Number.isFinite(a.at)) continue;
     const r = get(ref);
     if (a.detail.pr != null) r.pr = a.detail.pr;
-    if (DROP_KINDS.has(a.kind)) r.dropAt = Math.max(r.dropAt ?? 0, a.at);
+    if (a.kind === 'overlay-refresh-failed') {
+      r.dropAt = Math.max(r.dropAt ?? 0, a.at);
+      r.refreshFailed = true;
+      r.files = a.detail.files ?? [];
+    }
+    else if (DROP_KINDS.has(a.kind)) r.dropAt = Math.max(r.dropAt ?? 0, a.at);
     else if (a.kind === 'overlay-auto-dropped') r.removedAt = Math.max(r.removedAt ?? 0, a.at);
     else if (a.kind === 'overlay-conflict-unresolved') {
       r.files = Array.isArray(a.detail.files) ? a.detail.files.map(String) : [];
@@ -76,9 +92,9 @@ export function droppedOverlays(clone, { now, freshMs }) {
     if (r.dropAt == null) continue;
     if (now - r.dropAt > freshMs) continue;
     if (r.removedAt != null && r.removedAt >= r.dropAt) continue;
-    if (applied.has(ref)) continue;
+    if (applied.has(ref) && !r.refreshFailed) continue;
     out.push({
-      ref, pr: r.pr, droppedAt: r.dropAt, files: r.files, sha: r.sha,
+      ref, pr: r.pr, ...(r.refreshFailed ? { refreshFailed: true } : {}), droppedAt: r.dropAt, files: r.files, sha: r.sha,
       settingsOnly: r.files.length > 0 && r.files.every(isSettingsFile),
     });
   }
@@ -99,6 +115,14 @@ export default {
   evaluate({ selfSync }, { now }) {
     const rows = [];
     for (const c of selfSync || []) {
+      const forced = (c.alerts ?? []).filter((a) => a.kind === 'main-only-forced'
+        && Number.isFinite(a.at) && now - a.at <= this.freshMs).at(-1);
+      if (forced) rows.push({
+        subject: `main-only-forced:${c.cloneKey}`, breach: true,
+        measure: { ...forced.detail, at: forced.at },
+        summary: `Main-only rebuild forced by ${forced.detail?.by} on clone ${c.cloneKey}: ${forced.detail?.reason}`,
+        recommendation: `Operator attention: review intentionally omitted overlays ${(forced.detail?.refs ?? []).join(', ') || '(none)'}.`,
+      });
       const dropped = droppedOverlays(c, { now, freshMs: this.freshMs });
       for (const d of dropped) {
         const pr = d.pr != null ? ` (PR #${d.pr})` : '';
@@ -110,8 +134,8 @@ export default {
             ref: d.ref, pr: d.pr, sha: d.sha, files: d.files, settingsOnly: d.settingsOnly,
             droppedAtIso: new Date(d.droppedAt).toISOString(), adoptedHead: c.rebuild?.adopted?.head ?? null,
           },
-          summary: `overlay ${d.ref}${pr} is registered on clone ${c.cloneKey} but not in its HEAD — the rebuild dropped it ${fmtAge(now - d.droppedAt)} ago (conflict on ${files}); its fix is off the daemon.`,
-          recommendation: d.settingsOnly
+          summary: d.refreshFailed ? `Overlay refresh failed for ${d.ref}${pr} on clone ${c.cloneKey} (${files}); operator attention required. The daemon preserves its verified last-good build when this overlay is established.` : `overlay ${d.ref}${pr} is registered on clone ${c.cloneKey} but not in its HEAD — the rebuild dropped it ${fmtAge(now - d.droppedAt)} ago (conflict on ${files}); its fix is off the daemon.`,
+          recommendation: d.refreshFailed ? `Inspect the overlay-refresh-failed and overlay-held-on-last-good alerts, resolve ${files} without weakening either parent, then retry. Never hand-edit the daemon clone.` : d.settingsOnly
             ? settingsConflictAdvice(d, files)
             : `Real code conflict on ${files}: ${d.ref}${pr} must rebase onto main; the next rebuild re-applies it. Never hand-edit the clone. History: ~/.claude/daemon-self-sync-state/${c.cloneKey}.alerts.jsonl.`,
         });

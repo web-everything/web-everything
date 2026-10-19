@@ -5752,6 +5752,52 @@ clauses:
      second parent and still passes the live smoke before adoption. Unresolved conflicts retain the pinned
      refusal/skip rules and otherwise drop for the pass with an alert; a six-hour wake prioritizes the PR's
      fixer past scope overlap. `WE_DAEMON_OVERLAY_EDGE_RESOLVE=0` restores plain merge/drop behavior.
+     **Automatic main refresh (card 6386):** before planning, a status-1 merge-tree probe of a registered
+     tip against main triggers a scratch-only merge. Publish `<top>-mainsync-<main first 7 sha>` as a new,
+     non-force branch, then atomically replace the registry ref, retaining metadata and the old git ref.
+     Only a pure clean git merge with exactly [top, main] as parents may publish. Scratch git calls
+     disable hooks, fsmonitor, external configuration, filters and attributes; no worker resolves conflicts.
+     Conflicts alert with git's unmerged paths and register nothing. The registry records `pinnedSha`;
+     every rebuild refuses a different remote tip, including immediately after the registration fetch.
+     Refreshed successors retain their established lineage: conflicts hold the last good build under
+     either ref name, for every drop or refresh/preflight failure; only legitimate removals
+     (`pr-merged`, `in-main`, `pr-closed`, `ref-gone`) may remove them. Preflight probes share
+     one lazily created hardened scratch per tick with refresh merges, cleaned in `finally`.
+     Refresh verifies the input SHA pin before scratch creation; registry replacement compares
+     the ref and pin read at entry under the list lock and refuses concurrent changes.
+     Newcomers retain park/drop behavior.
+     Setting `overlay.autoRefresh` (default true) uses standard → platform → tool `overlay` in
+     `scripts/lib/daemon-rebuild-settings.json` → env `WE_DAEMON_OVERLAY_AUTO_REFRESH`, with its
+     source logged in `overlay-refresh-settings`. Invalid values are ignored. Disabling refresh restores
+     the prior conflict behavior; SHA pins remain enforced. `overlay.stackMode` is independent.
+     Main-only rebuilds also hold when registered established overlays (including refreshed successors)
+     would be omitted, regardless of auto-refresh settings. Pins are checked before the main-only list is
+     cleared. Only `mainOnlyForce: { by, reason }` authorizes bypassing that hold; both values must be
+     nonempty. The rebuild CLI and detached builder expose `--main-only --main-only-force
+     --by=<operator> --reason=<text>`. Forced builds append a `main-only-forced` overlay event and
+     needs-you feed note (via `operations/needs-you-feed.mjs#publishAttention`, independent of
+     health-watch shadow mode) naming the operator, reason and affected refs (`refs: ["unknown"]` when the
+     registry is corrupt). Corrupt registries, including invalid `pinnedSha` entries, refuse with
+     `overlay-state-corrupt` even in main-only mode unless explicitly forced. Establishment uses
+     the shared fail-closed `daemon-rebuild/established.mjs#isEstablished` predicate: applied-list
+     membership under any predecessor/successor name, or a pinned SHA or remote tip in the running
+     HEAD's ancestry, establishes the entire refresh lineage. Missing/incomplete adoption metadata
+     (nonempty string head plus applied array required), unresolved HEAD or remote refs, and Git probe
+     errors also establish it conservatively on every path. Only status 1 from every applicable
+     ancestry probe, with complete metadata and no applied membership, proves a newcomer.
+     With valid adoption metadata and no established overlays,
+     ordinary main-only behavior is unchanged. The same shared guard runs before every versioned
+     rebuild (which always builds plain origin/main), even without `--main-only`, including hold
+     persistence and forced event/alert attribution. During normal planning,
+     legitimate removals (`pr-merged`, `pr-closed`, `in-main`, `ref-gone`) precede SHA-pin validation;
+     in-main retirement evidence (patch IDs and tree comparisons) must use `pinnedSha` when present,
+     never the unapproved remote tip. An overlay that would still apply refuses a mismatched tip
+     instead of applying unapproved code.
+     Alerts: `overlay-refreshed` records success; `overlay-refresh-failed` requests operator attention;
+     `overlay-held-on-last-good` names the preserved overlays and conflict files.
+     Both failure and hold alerts publish to that same needs-you feed directly; feed publication
+     errors propagate so a forced bypass cannot silently proceed without its operator note.
+     Health-watch's `overlay-dropped` sign surfaces failures and holds even when the adopted build still includes the ref.
    - (d) **Rollback = remove the overlay.** The trigger lives outside the daemon (new code may crash at
      import): a crash loop or a stalled heartbeat after an overlay change removes that overlay and alerts.
    - (e) **Scope: every daemon may run overlays, the review daemon included** — the operator's explicit choice
