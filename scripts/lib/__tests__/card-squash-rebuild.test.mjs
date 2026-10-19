@@ -2,7 +2,7 @@ import { squashPatchHash } from '../card-squash-marker.mjs';
 // @vitest-environment node
 import { describe, it, expect, vi } from 'vitest';
 import { rebaseDropManifest } from '../rebase-drop-manifest.mjs';
-import { cardTreeOnly, loadCardRebaseSettings, patchWithoutPositions } from '../card-squash-rebuild.mjs';
+import { cardSquashRebuild, cardTreeOnly, loadCardRebaseSettings, patchWithoutPositions } from '../card-squash-rebuild.mjs';
 import { isAiGeneratedPr, isDrainBookkeepingCommit } from '../ai-pr-authorship.mjs';
 const base = 'b'.repeat(40), head = 'a'.repeat(40), tree = 'c'.repeat(40), next = 'd'.repeat(40);
 const card = 'backlog/123-card.md';
@@ -88,7 +88,7 @@ describe('card rebase settings', () => {
 });
 
 import { gitRun } from '../git-run.mjs';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 it('real object-only git dry-run preserves a card patch across concurrent main changes and leaves one commit', () => {
@@ -185,4 +185,62 @@ it('real Git trees reject card-shaped links and gitlinks on either side', () => 
     }
     expect(cardTreeOnly({ run, base: regular, tree: '0'.repeat(40) })).toBe(false);
   } finally { rmSync(scratch, { recursive: true, force: true }); }
+});
+
+// Real Git object graphs exercise exclusion pathspecs and the blob proof independently of the runner stub.
+describe('resolver-proven squash blobs', () => {
+  function unionFixture(check, { subdir = false } = {}) {
+    const top = mkdtempSync(join(tmpdir(), 'card-squash-union-'));
+    const cwd = subdir ? join(top, 'elsewhere') : top;
+    if (subdir) mkdirSync(cwd);
+    const run = (cmd, args, opts = {}) => gitRun(cmd, args, { ...opts, cwd,
+      env: { GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.com', GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.com' } });
+    const g = (args, input) => {
+      const r = run('git', args, { input }); expect(r.status, r.stderr).toBe(0); return String(r.stdout).trim();
+    };
+    try {
+      g(subdir ? ['init', '--quiet', top] : ['init', '--bare', '--quiet']);
+      const resolvedPath = 'backlog/123-[card].md';
+      const other = 'backlog/456-other.md';
+      const blob = text => g(['hash-object', '-w', '--stdin'], text);
+      const makeTree = (text, otherText, code = false) => {
+        const backlog = g(['mktree'], `100644 blob ${blob(text)}\t123-[card].md\n100644 blob ${blob(otherText)}\t456-other.md\n`);
+        return g(['mktree'], `040000 tree ${backlog}\tbacklog\n${code ? `100644 blob ${blob('extra')}\tcode.js\n` : ''}`);
+      };
+      const cardText = entries => `# Card\n\n## Also raised by\n\n${entries.map(n => `- Also raised by o/r#${n} (backlog/xabc123-child.md)`).join('\n')}\n`;
+      const commit = (tree, parent) => g(['commit-tree', tree, ...(parent ? ['-p', parent] : []), '-m', 'fixture']);
+      const root = commit(makeTree(cardText([0]), 'old\n'));
+      const base = commit(makeTree(cardText([0, 1]), 'old\n'), root);
+      const mergeRef = commit(makeTree(cardText([0, 2]), 'PR change\n'), root);
+      const text = cardText([0, 1, 2]).replaceAll('xabc123', '6000');
+      const resolved = [{ path: resolvedPath, oid: blob(text) }];
+      const tree = makeTree(text, 'PR change\n');
+      const invoke = extra => cardSquashRebuild({ run, cwd, base, mergeRef, tree, message: 'union', resolved, ...extra });
+      check({ invoke, g, base, resolved, tree, makeTree, text, other });
+    } finally { rmSync(top, { recursive: true, force: true }); }
+  }
+  it('accepts the exact union blob and hashes the full new patch', () => unionFixture(({ invoke, g, base, resolved }) => {
+    const result = invoke();
+    expect(result).toMatchObject({ newCommit: expect.any(String), proof: { patchEqual: true, resolvedPaths: [resolved[0].path] } });
+    const fullPatch = g(['diff', '--binary', '--no-renames', '-U0', base, result.newCommit]) + '\n';
+    expect(result.proof.patchHash).toBe(squashPatchHash(fullPatch));
+  }));
+  it.each([{ resolved: undefined }, { resolved: [] }])('still refuses the union without resolver evidence: %j', ({ resolved }) => unionFixture(({ invoke }) => {
+    expect(invoke({ resolved })).toMatchObject({ action: 'error', guard: 'squash-net-diff-mismatch' });
+  }));
+  it('refuses a resolved blob that differs from the verified oid', () => unionFixture(({ invoke, makeTree, text }) => {
+    expect(invoke({ tree: makeTree(text + 'tampered\n', 'PR change\n') })).toMatchObject({ action: 'error', guard: 'squash-net-diff-mismatch' });
+  }));
+  it('refuses an extra change on an unresolved path within the same path set', () => unionFixture(({ invoke, makeTree, text }) => {
+    expect(invoke({ tree: makeTree(text, 'tampered\n') })).toMatchObject({ action: 'error', guard: 'squash-net-diff-mismatch' });
+  }));
+  it('proves unresolved paths repo-wide even when run from a subdirectory', () => unionFixture(({ invoke, makeTree, text }) => {
+    expect(invoke({ tree: makeTree(text, 'tampered\n') })).toMatchObject({ action: 'error', guard: 'squash-net-diff-mismatch' });
+  }, { subdir: true }));
+  it('still accepts the exact union blob from a subdirectory', () => unionFixture(({ invoke }) => {
+    expect(invoke()).toMatchObject({ proof: { patchEqual: true } });
+  }, { subdir: true }));
+  it('refuses a non-card path-set addition even with a verified union blob', () => unionFixture(({ invoke, makeTree, text }) => {
+    expect(invoke({ tree: makeTree(text, 'PR change\n', true) })).toMatchObject({ action: 'error', guard: 'squash-net-diff-mismatch' });
+  }));
 });

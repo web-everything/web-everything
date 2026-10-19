@@ -242,6 +242,7 @@ export function rebaseDropManifest({
   const read = run('git', ['read-tree', parsed.tree], { env, cwd });
   if (read.status !== 0) return { action: 'error', reason: `read-tree failed (${(read.stderr || '').split('\n')[0]})` };
   let resolvedRaisedBy = [];
+  let resolvedBlobs = [];
   if (cardConflict) {
     const resolution = applyRaisedByConflictsToIndex({ run, cwd, env, tree: parsed.tree, base, mergeRef,
       conflictPaths: parsed.conflictPaths, enabled: cardConflictSetting.value });
@@ -249,6 +250,7 @@ export function rebaseDropManifest({
       ...(CARD_CONFLICT_PRECONDITION_REASONS.includes(resolution.reason) ? { precondition: true } : {}),
       reason: resolution.reason, conflictPaths: parsed.conflictPaths, cardConflictSetting };
     resolvedRaisedBy = resolution.resolved;
+    resolvedBlobs = resolution.resolvedBlobs;
   }
   // Drop the manifest if present (--ignore-unmatch: a clean merge with no manifest in the tree is fine).
   run('git', ['rm', '--cached', '--ignore-unmatch', manifest], { env, cwd });
@@ -321,7 +323,8 @@ export function rebaseDropManifest({
     return { action: 'error', guard: 'scope-jump', prevFiles: jump.prev, postFiles: jump.post, reason: `refusing to push ${laneRef}: ${jump.reason}` };
   }
 
-  const built = squash ? cardSquashRebuild({ run, cwd, base, mergeRef, tree: resolvedTree, message: msg }) : null;
+  const built = squash ? cardSquashRebuild({ run, cwd, base, mergeRef, tree: resolvedTree, message: msg,
+    ...(cardConflict ? { resolved: resolvedBlobs } : {}) }) : null;
   if (built?.action === 'error') return built;
   const ct = built ? { status: 0, stdout: built.newCommit } : run('git', ['commit-tree', resolvedTree, '-p', base, '-p', mergeRef, '-m', msg], { cwd });
   const newCommit = String(ct.stdout || '').trim();

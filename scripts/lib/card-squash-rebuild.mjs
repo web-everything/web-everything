@@ -46,7 +46,7 @@ export function dirtyCardStack({ run, cwd, base, mergeRef }) {
   return counts.some(r => r.status !== 0 || !/^\d+$/.test(String(r.stdout).trim()))
     || Number(counts[0].stdout) !== 1 || Number(counts[1].stdout) !== 0;
 }
-export function cardSquashRebuild({ run, cwd, base, mergeRef, tree, message }) {
+export function cardSquashRebuild({ run, cwd, base, mergeRef, tree, message, resolved = [] }) {
   const log = run('git', ['log', `${base}..${mergeRef}`, '--format=%B'], { cwd });
   if (log.status !== 0) return { action: 'error', reason: 'cannot read squash co-authors' };
   const trailers = [...new Set(String(log.stdout).split('\n').filter(line => /^Co-Authored-By:/i.test(line)))];
@@ -59,9 +59,22 @@ export function cardSquashRebuild({ run, cwd, base, mergeRef, tree, message }) {
   const newFiles = paths(run('git', ['diff', '--name-only', '--no-renames', base, newCommit], { cwd }));
   const oldPatch = run('git', ['diff', '--binary', '--no-renames', '-U0', oldRange], { cwd });
   const newPatch = run('git', ['diff', '--binary', '--no-renames', '-U0', base, newCommit], { cwd });
+  // Only resolver-proven blobs may differ; all other paths retain the original net patch proof.
+  const pathspecs = resolved.length ? ['--', ':(top)', ...resolved.map(({ path }) => `:(top,exclude,literal)${path}`)] : [];
+  const oldUnresolved = resolved.length
+    ? run('git', ['diff', '--binary', '--no-renames', '-U0', oldRange, ...pathspecs], { cwd }) : oldPatch;
+  const newUnresolved = resolved.length
+    ? run('git', ['diff', '--binary', '--no-renames', '-U0', base, newCommit, ...pathspecs], { cwd }) : newPatch;
+  const blobsEqual = resolved.every(({ path, oid }) => {
+    if (!oldFiles?.includes(path) || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(oid)) return false;
+    const blob = run('git', ['rev-parse', `${newCommit}:${path}`], { cwd });
+    return blob.status === 0 && String(blob.stdout ?? '').trim() === oid;
+  });
   if (!oldFiles || !newFiles || JSON.stringify(oldFiles) !== JSON.stringify(newFiles)
     || oldPatch.status !== 0 || newPatch.status !== 0
-    || patchWithoutPositions(oldPatch.stdout) !== patchWithoutPositions(newPatch.stdout))
+    || oldUnresolved.status !== 0 || newUnresolved.status !== 0 || !blobsEqual
+    || patchWithoutPositions(oldUnresolved.stdout) !== patchWithoutPositions(newUnresolved.stdout))
     return { action: 'error', guard: 'squash-net-diff-mismatch', reason: 'card squash changed the PR net patch or changed path set; refusing push' };
-  return { newCommit, proof: { oldHead: mergeRef, newHead: newCommit, patchHash: squashPatchHash(newPatch.stdout), oldFiles, newFiles, patchEqual: true } };
+  return { newCommit, proof: { oldHead: mergeRef, newHead: newCommit, patchHash: squashPatchHash(newPatch.stdout), oldFiles, newFiles, patchEqual: true,
+    ...(resolved.length ? { resolvedPaths: resolved.map(({ path }) => path) } : {}) } };
 }
