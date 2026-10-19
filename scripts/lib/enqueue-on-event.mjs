@@ -740,7 +740,7 @@ export function createEnqueueOnEvent({
             const overlapYield = outcome?.overlapYield || hit(json?.deferred)?.overlapYield;
             try {
               const evidence = await readMemoEvidence({ repo: p.repo, num: p.num, head: pr.headRefOid, overlapYield });
-              lastHolds.set(p.num, { kind, overlapYield, recordedAt: startedAt, signature: holdSignature(pr, evidence) });
+              lastHolds.set(p.num, { kind, overlapYield, recordedAt: now(), signature: holdSignature(pr, evidence) });
             } catch { lastHolds.delete(p.num); } // uncertain dependencies retry the drain
           }
         }

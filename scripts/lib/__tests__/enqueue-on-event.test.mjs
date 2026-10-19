@@ -509,6 +509,44 @@ describe('readCatchUpCandidates', () => {
 
 describe('catch-up handle', () => {
   it.each([
+    ['10 minutes after child end', 10, null, true],
+    ['16 minutes after child end', 16, null, false],
+    ['enqueue retry deadline passed', 10, 'enqueueFailures', false],
+    ['red-team retry deadline passed', 10, 'redTeamPending', false],
+  ])('measures unchanged hold age from child completion: %s', async (_name, minutesAfterEnd, retryState, skips) => {
+    const head = 'a'.repeat(40);
+    const state = retryState ? { [retryState]: { [`${REPO}#42`]: {
+      headSha: head, retryAt: 1_000 + 600_000 + 5 * 60_000,
+      firstPendingAt: 1_000, requestedAt: 1_000,
+    } } } : {};
+    const f = catchUpSetup({
+      resolveSetting: () => ({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp, intervalMinutes: 1 } }),
+      resolveThroughput: () => ({ value: { catchUpSkipUnchangedHolds: true, catchUpSkipMaxMin: 15 } }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42, 100)] }),
+      readPr: async () => ({ ...READY_PR, headRefOid: head }),
+      readHoldEvidence: () => ({ recorded: false }),
+      readHoldQueueState: () => state,
+      resolveQueueSafety: () => ({ value: { redTeamPendingMaxMin: 60, redTeamRequestCooldownMin: 3 } }),
+      drainResult: () => {
+        f.advance(600_000);
+        return { considered: 1, skipReasons: [{ num: 42, kind: 'red-team-pending', reason: 'waiting' }] };
+      },
+    });
+    try {
+      await f.handle.catchUp();
+      expect(f.calls).toHaveLength(1);
+      f.advance(minutesAfterEnd * 60_000);
+      const result = await f.handle.catchUp();
+      expect(f.calls).toHaveLength(skips ? 1 : 2);
+      if (skips) {
+        expect(result).toEqual([expect.objectContaining({ num: 42, what: 'unchanged hold: red-team-pending', outcome: 'skipped' })]);
+      } else {
+        expect(result.some(row => row.what.startsWith('unchanged hold'))).toBe(false);
+      }
+    } finally { f.handle.kill(); }
+  });
+
+  it.each([
     ['gate skip', { considered: 1, toMerge: [], skipReasons: [{ num: 1, reason: 'checks failing' }] }],
     ['revalidation abort', { considered: 1, toMerge: [{ num: 1 }], revalidationAborted: [{ num: 1, reason: 'blockedBy' }] }],
     ['dependency deferral', { considered: 1, toMerge: [{ num: 1 }], deferred: [{ num: 1, waitOn: [99] }], skipReasons: [{ num: 1, kind: 'blocked-by' }] }],
