@@ -1,3 +1,4 @@
+export { validateRaisedBy } from './lib/raised-by.mjs';
 import { readTestsFirstPolicy } from './lib/tests-first-policy.mjs';
 /**
  * check-standards-rules.mjs — pure, individually-testable rule bodies for the validator.
