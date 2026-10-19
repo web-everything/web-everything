@@ -13,7 +13,12 @@
  * the CALLER's use of it is what the other file asserts.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+// These adapter assertions exercise uncached argv; label-cache.test.mjs covers shared caching.
+beforeEach(() => vi.stubEnv('WE_LABELS_CACHE_TTL_MS', '0'));
+afterEach(() => vi.unstubAllEnvs());
+
 import { spawnSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -105,14 +110,14 @@ describe('GH_ARGV is byte-identical to the pre-port inline calls', () => {
     expect(PR_STATE_FIELDS).toEqual(['labels', 'headRefOid', 'headRefName', 'baseRefName', 'state', 'body', 'createdAt', 'title', 'comments', 'isDraft']);
   });
 
-  it('creates a label with --force — create-or-update, never an error on one that already exists', () => {
+  it('builds label provisioning argv without overwriting existing metadata', () => {
     expect(GH_ARGV.ensureLabel('o/n', 'review-round:3'))
-      .toEqual(['label', 'create', 'review-round:3', '--repo', 'o/n', '--color', 'ededed', '--description', '', '--force']);
+      .toEqual(['label', 'create', 'review-round:3', '--repo', 'o/n', '--color', 'ededed', '--description', '']);
   });
 
   it('ensureLabel accepts an optional color/description override', () => {
     expect(GH_ARGV.ensureLabel('o/n', 'review-status:reviewing', { color: 'c5def5', description: 'a reviewer is actively working this PR' }))
-      .toEqual(['label', 'create', 'review-status:reviewing', '--repo', 'o/n', '--color', 'c5def5', '--description', 'a reviewer is actively working this PR', '--force']);
+      .toEqual(['label', 'create', 'review-status:reviewing', '--repo', 'o/n', '--color', 'c5def5', '--description', 'a reviewer is actively working this PR']);
   });
 
   it('clamps the ruling-needed description to GitHub’s limit', () => {

@@ -3,6 +3,7 @@
  * should not count accepted or story-only PRs. Other open-PR guards retain every PR.
  * Pure resolution/counting, with a never-throwing settings IO shell.
  */
+// Pure cap readers accept already-resolved pr.realFiles; they do not fetch on the admission hot path.
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { hasLabel } from './ai-pr-authorship.mjs';
 import { readSettings } from './settings-files.mjs';
@@ -53,7 +54,8 @@ export function countOpenPrsForCap(openPrs, scope = OPEN_PR_CAP_SCOPE_DEFAULTS) 
   const acceptedPrs = [];
   for (const pr of openPrs) {
     const id = `${pr.repo}#${pr.number}`;
-    if (scope.excludeCardOnly && isCardOnlyDiff((pr.files || []).map((f) => f?.path ?? f))) cardOnlyPrs.push(id);
+    const files = Object.hasOwn(pr, 'realFiles') ? pr.realFiles : pr.files;
+    if (scope.excludeCardOnly && isCardOnlyDiff(Array.isArray(files) ? files.map((f) => f?.path ?? f) : null)) cardOnlyPrs.push(id);
     else if (scope.excludeAccepted && hasLabel(pr, ACCEPTED_LABEL)) acceptedPrs.push(id);
     else countedPrs.push(id);
   }
