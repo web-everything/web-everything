@@ -662,4 +662,10 @@ export function isCliEntry(argv1 = process.argv[1], moduleUrl = import.meta.url)
   return moduleUrl === pathToFileURL(resolved).href;
 }
 
-if (isCliEntry()) main();
+if (isCliEntry()) {
+  try { main(); }
+  catch (e) {
+    process.stderr.write(`${e.message}\n`);
+    process.exitCode = e.code === 'HOST_LOAD_DEFERRED' ? 75 : 1;
+  }
+}

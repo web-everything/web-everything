@@ -1130,7 +1130,7 @@ export async function acquireSlotBlocking({
   pid = process.pid, now = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   log = (m) => process.stderr.write(m), env = process.env,
   policy = loadAdmissionPolicy({ env }), canDefer = false, readResourceSnapshot = readSnapshot,
-  hostAdmission = (o) => process.env[ADMISSION_HELD_ENV] === '1'
+  hostAdmission = (o) => env[ADMISSION_HELD_ENV] === '1'
     ? { admitted: true, reason: 'host admission already held' } : hostLoadAdmission(o),
   interactive = !!process.stdin.isTTY, ...seams
 }) {

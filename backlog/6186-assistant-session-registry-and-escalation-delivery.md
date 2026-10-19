@@ -5,8 +5,8 @@ size: 8
 status: open
 scope: ["we:scripts/operations/operator-session-bootstrap.mjs", "we:scripts/operations/operator-session-bootstrap-io.mjs", "we:scripts/operations/operator-session-registry.mjs", "we:scripts/operations/operator-session-registry-io.mjs", "we:scripts/operations/escalation-delivery.mjs", "we:scripts/operations/escalation-delivery-io.mjs", "we:scripts/operations/needs-you-feed.mjs", "we:scripts/settings/operator-session.json", "we:scripts/conveyor/needs-you-feed-job.mjs", "we:scripts/operations/__tests__/operator-session-bootstrap.test.mjs", "we:scripts/operations/__tests__/operator-session-bootstrap-io.test.mjs", "we:scripts/operations/__tests__/operator-session-registry.test.mjs", "we:scripts/operations/__tests__/operator-session-registry-io.test.mjs", "we:scripts/operations/__tests__/escalation-delivery.test.mjs", "we:scripts/operations/__tests__/escalation-delivery-io.test.mjs", "we:scripts/operations/__tests__/needs-you-feed.test.mjs", "we:scripts/conveyor/__tests__/needs-you-feed-job.test.mjs"]
 dateOpened: "2026-10-17"
-preparedDate: "2026-10-17"
-preparedAgainstSha: "7d3009812a3d4516a0497a98b08964406760a9a6"
+preparedDate: "2026-10-18"
+preparedAgainstSha: "10abaa04449d0b3393d5e18c5f4615498521efed"
 tags: []
 ---
 
@@ -119,3 +119,5 @@ No autonomous decision-making, automatic execution of suggested picks, changes t
 5. **Identity scoping:** session/account/host/feed/generation must match; no wildcard recipients or cross-account receipt reuse.
 6. **State over time:** stale/future heartbeat, restart, DST, cleared/reopened asks and account replacement retain durable history; legacy cursor state is not a decision.
 7. **Who wrote it:** preserve producer provenance and receipt actor separately; local account aliases are routing labels, not authenticated human approvals.
+
+revalidated: The diff only changes red-team ruling reason text; the preparation already covers bounded untrusted display fields and feed compatibility, so no design, scope, or proof-plan revision is needed.

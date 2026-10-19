@@ -49,6 +49,7 @@ export function scheduledLaneGc(lanes, { stateRoot = hostStateRoot(), exec = exe
       try { cursor = JSON.parse(boundedText(file)); } catch (e) { if (e.code !== 'ENOENT') throw e; }
       if (!cursor || typeof cursor !== 'object' || Array.isArray(cursor)) throw Error('unknown gc cursor');
       let ran = false;
+      let failures = 0;
       for (const lane of lanes) {
         const key = digest(resolve(lane));
         const last = cursor[key];
@@ -56,13 +57,21 @@ export function scheduledLaneGc(lanes, { stateRoot = hostStateRoot(), exec = exe
         if (last !== undefined && nowMs - last < schedule) continue;
         const host = admission({ env, log, interactive });
         if (!host.admitted) { log(`gc skipped: ${host.reason}`); return { ran, reason: host.reason }; }
-        exec('git', ['-c', 'gc.auto=0', '-c', 'gc.autoDetach=false', '-c', 'gc.pruneExpire=never', 'gc', '--no-detach'], { cwd: lane, timeout: 120000, stdio: 'pipe' });
+        try {
+          exec('git', ['-c', 'gc.auto=0', '-c', 'gc.autoDetach=false', '-c', 'gc.pruneExpire=never', 'gc', '--no-detach'], { cwd: lane, timeout: 120000, stdio: 'pipe' });
+        } catch (e) {
+          // A damaged or slow clone must not starve the rest of the pool. Leave it due for retry.
+          failures++;
+          log(`gc failed for ${lane}: ${e.message}`);
+          continue;
+        }
         cursor[key] = nowMs;
-        if (Buffer.byteLength(JSON.stringify(cursor)) > 256 * 1024) throw Error('gc cursor too large');
+        // Match writeJsonAtomic's indentation and trailing newline, including at the read limit.
+        if (Buffer.byteLength(`${JSON.stringify(cursor, null, 2)}\n`) > 256 * 1024) throw Error('gc cursor too large');
         writeJsonAtomic(file, cursor);
         ran = true;
       }
-      return { ran, ...(!ran ? { reason: 'gc schedule not due' } : {}) };
+      return { ran, ...(failures ? { reason: `${failures} lane gc run(s) failed` } : !ran ? { reason: 'gc schedule not due' } : {}) };
     }, { stateRoot });
   } catch (e) { log(`gc skipped: ${e.message}`); return { ran: false, reason: e.message }; }
 }
