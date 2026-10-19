@@ -14,6 +14,7 @@ import {
   classifyPausedReview, reviewRunEvidence, readReviewRunEvidence, decideReferralHold, enrichPrsWithReferralHolds,
   notifyReferralHold, REFERRAL_RETRY_MS, decideSameHeadHold, resolveSameHeadMaxReviews, PENDING_REASON_TOKENS,
   GH_LIST_COMMENT_CAP, findResumableParkedRun, blockRuledReferralsFor, filterFixerReferrals, REFERRAL_REARM_COMMENT_MARKER,
+  VERDICT_COOLDOWN_BASE_MS, VERDICT_COOLDOWN_CAP_MS, VERDICT_COOLDOWN_MAX_RELEASES,
 } from '../review-referral-hold.mjs';
 
 it('keeps the cycle-free referral matcher equal to the canonical re-arm marker', () => {
@@ -517,11 +518,69 @@ describe('same-head hold never silences a review whose verdict never landed (liv
   it('releases (null) when the only completed run left the PR review:pending with no reviewed-sha marker', () => {
     expect(decideSameHeadHold(labelled(['review:pending', 'review-round:1']), [lost()], { repo, env: {} })).toBeNull();
   });
-  it('is bounded: after the extra automatic runs it holds again and says why', () => {
-    const runs = [lost(), lost({ id: 'b', startedAt: Date.now() - 3600_000 }), lost({ id: 'c', startedAt: Date.now() - 3500_000 })];
-    const held = decideSameHeadHold(labelled(['review:pending']), runs, { repo, env: {} });
-    expect(held).toMatchObject({ kind: 'same-head', count: 3 });
-    expect(held.why).toMatch(/no verdict ever landed/);
+  const lostRuns = count => Array.from({ length: count }, (_, i) => lost({
+    id: `lost-${i}`, completedAt: at - i * 120_000, startedAt: at - i * 120_000 - 60_000,
+  }));
+  const oldWhy = count => `review paused: head ${head.slice(0, 9)} was already reviewed ${count} time(s); it resumes on a new push or an explicit re-arm`
+    + " (no verdict ever landed on the PR for those runs, and the 2 automatic re-runs are spent: a person must look at why the review's write-back fails)";
+  it('holds three no-verdict runs under one hour with retryAt and the due-time text', () => {
+    const held = decideSameHeadHold(labelled(['review:pending']), lostRuns(3), { repo, env: {}, now: at + 30 * 60_000 });
+    expect(VERDICT_COOLDOWN_BASE_MS).toBe(3600_000);
+    expect(held).toMatchObject({ kind: 'same-head', count: 3, retryAt: at + 3600_000,
+      why: `${oldWhy(3)}; the next automatic re-run is due at ${iso(at + 3600_000)}` });
+  });
+  it('releases three no-verdict runs once the one-hour cool-down is due', () => {
+    const p = labelled(['review:pending']), runs = lostRuns(3);
+    for (const elapsed of [3600_000, 3600_001]) {
+      expect(decideSameHeadHold(p, runs, { repo, env: {}, now: at + elapsed })).toBeNull();
+    }
+  });
+  it('requires two hours after one cool-down release (four no-verdict runs)', () => {
+    const p = labelled(['review:pending']), runs = lostRuns(4);
+    expect(decideSameHeadHold(p, runs, { repo, env: {}, now: at + 7200_000 - 1 }))
+      .toMatchObject({ retryAt: at + 7200_000 });
+    expect(decideSameHeadHold(p, runs, { repo, env: {}, now: at + 7200_000 })).toBeNull();
+  });
+  it('caps cool-down backoff at eight hours while releases remain', () => {
+    expect(VERDICT_COOLDOWN_CAP_MS).toBe(8 * 3600_000);
+    const p = labelled(['review:pending']);
+    for (const count of [6, 7, 8]) {
+      const runs = lostRuns(count);
+      expect(decideSameHeadHold(p, runs, { repo, env: {}, now: at + 8 * 3600_000 - 1 }))
+        .toMatchObject({ retryAt: at + 8 * 3600_000 });
+      expect(decideSameHeadHold(p, runs, { repo, env: {}, now: at + 8 * 3600_000 })).toBeNull();
+    }
+  });
+  it('keeps the permanent hold and old wording after six cool-down releases', () => {
+    expect(VERDICT_COOLDOWN_MAX_RELEASES).toBe(6);
+    expect(decideSameHeadHold(labelled(['review:pending']), lostRuns(9), { repo, env: {}, now: at + 30 * 86400_000 }))
+      .toMatchObject({ kind: 'same-head', count: 9, retryAt: null, why: oldWhy(9) });
+  });
+  it('keeps landed-verdict holds unchanged for reviewed-sha and verdict labels', () => {
+    const runs = lostRuns(3), opts = { repo, env: {}, now: at + 86400_000 };
+    const landed = [labelled(['review:pending'], { comments: [comment(`✅ review — accepted\n<!-- reviewed-sha: ${head} -->`)] }),
+      ...['review:accepted', 'review:changes', 'review:human'].map(label => labelled([label])),
+      labelled(['review:pending', 'review:changes'])];
+    for (const p of landed) {
+      expect(decideSameHeadHold(p, runs, opts)).toMatchObject({ kind: 'same-head', retryAt: null,
+        why: `review paused: head ${head.slice(0, 9)} was already reviewed 3 time(s); it resumes on a new push or an explicit re-arm` });
+    }
+  });
+  it('preserves the off-switch, persistence-failure exclusion, operator wake and head reset', () => {
+    const p = labelled(['review:pending']), runs = lostRuns(9), opts = { repo, env: {}, now: at + 86400_000 };
+    expect(decideSameHeadHold(p, runs, { ...opts, env: { WE_REVIEW_SAME_HEAD_MAX_REVIEWS: '0' } })).toBeNull();
+    expect(decideSameHeadHold(p, runs.map(r => ({ ...r, persistenceFailed: true })), opts)).toBeNull();
+    expect(decideSameHeadHold({ ...p, comments: [comment(REARM_COMMENT_MARKER, at + 1)] }, runs, opts)).toBeNull();
+    expect(decideSameHeadHold({ ...p, headRefOid: 'b'.repeat(40) }, runs, opts)).toBeNull();
+  });
+  it('posts no repeated same-head notice when a cool-down retryAt is present', () => {
+    const p = labelled(['review:pending']), runs = lostRuns(3), post = vi.fn(), log = vi.fn(), dir = temp();
+    const held = decideSameHeadHold(p, runs, { repo, env: {}, now: at + 30 * 60_000 });
+    for (const now of [at + 30 * 60_000, held.retryAt, held.retryAt + 1]) {
+      notifyReferralHold({ repo, prNumber: p.number, pr: p, hold: held, dir, post, log, now });
+    }
+    expect(post).not.toHaveBeenCalled();
+    expect(log).not.toHaveBeenCalled();
   });
   it('still holds when a verdict label landed, or the run is too fresh to judge', () => {
     expect(decideSameHeadHold(labelled(['review:pending', 'review:changes']), [lost()], { repo, env: {} })).not.toBeNull();
