@@ -28,7 +28,7 @@ import {
 } from '../review-set-label.mjs';
 // #3334, routes 2 and 3 — asserted through the OTHER two sanctioned paths' own entry points, because a shared
 // core one caller forgets to ask is the defect this item closes.
-import { appendVerdict } from '../lib/verdict-ledger.mjs';
+import { appendVerdict, buildVerdictRecord } from '../lib/verdict-ledger.mjs';
 import { buildDelegationMarker } from '../lib/delegation-marker.mjs';
 import { RULING_NEEDED_LABEL } from '../lib/ruling-ledger.mjs';
 import { readStore } from '../conveyor/run-scorecard-store.mjs';
@@ -4008,6 +4008,20 @@ describe('#5649 — approval rows at the label home', () => {
   const rows = () => readdirSync(ledgerDir).filter((f) => f.endsWith('.jsonl')).flatMap((f) =>
     readFileSync(join(ledgerDir, f), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse)).filter(row => row.source !== 'first-seen');
   const sink = () => { const seen = []; return { seen, fn: (row) => { seen.push(row); return appendVerdict(row); } }; };
+
+  it('a live read racing a newer acceptance writes no head move away from it (snapshot taken before the live read)', () => {
+    const [A, B] = ['a'.repeat(40), 'b'.repeat(40)];
+    const verdict = (headSha) => buildVerdictRecord({ repo: 'o/n', pr: 77, headSha, verdict: 'accepted', source: 'test', at: '2026-10-19T00:00:00.000Z' });
+    expect(appendVerdict(verdict(A))).toMatchObject({ ok: true });
+    const provider = stubProvider(['review:human']);
+    let raced = false;
+    // GitHub answers head A; before the observer reads the ledger, another process pushes B and records accepted(B).
+    const read = provider.readPrState;
+    provider.readPrState = (...args) => { if (!raced) { raced = true; expect(appendVerdict(verdict(B))).toMatchObject({ ok: true }); } return read(...args); };
+    run(provider, CLEAR, { appendApproval: () => ({ ok: true }) });
+    expect(raced).toBe(true);
+    expect(rows().filter((r) => r.source === 'head-observer')).toEqual([]);
+  });
 
   it('clear-human appends an approval row after the verdict row', () => {
     const s = sink();

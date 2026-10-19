@@ -369,6 +369,35 @@ describe('open-head ledger observations', () => {
       expect(readObservationLedger(repo).filter(r => r.verdict === 'carried')).toHaveLength(1);
     }));
   });
+  describe('racing observation (live read before a newer ledger acceptance)', () => {
+    const withHome = fn => {
+      const dir = mkdtempSync(join(tmpdir(), 'ledger-race-'));
+      vi.stubEnv('WE_VERDICT_LEDGER_DIR', join(dir, 'rows'));
+      vi.stubEnv('WE_VERDICT_LEDGER_STORE', 'home');
+      try { fn(row => appendVerdict(row, { store: 'home' })); } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+    };
+    const acceptedB = () => buildVerdictRecord({ repo, pr: 1, headSha: next, verdict: 'accepted', source: 'test', at: now });
+    const observe = (facts, opts) => observeLedgerHead(facts, { ...opts, settings, log: () => {}, proveCarry: () => null });
+    it('discards a racing observation without invalidating the newer acceptance or rewinding the witnessed head', () => withHome(append => {
+      expect(append(accepted())).toMatchObject({ ok: true });
+      // The observer reads GitHub head A; before it reads the ledger, another process pushes B and records accepted(B).
+      const readPr = () => { expect(append(acceptedB())).toMatchObject({ ok: true }); return { state: 'OPEN', headRefOid: head, labels: [] }; };
+      expect(observeLedgerPrEvent({ repo }, 1, { readPr, read: readObservationLedger, observe, log: () => {} })).toMatchObject({ ok: true, rows: [] });
+      expect(readObservationLedger(repo).map(r => r.verdict)).toEqual(['accepted', 'accepted']);
+      // Observing the real head B afterwards writes nothing either: B's acceptance still clears.
+      observeLedgerPrEvent({ repo }, 1, { readPr: () => ({ state: 'OPEN', headRefOid: next, labels: [] }), read: readObservationLedger, observe });
+      const events = readObservationLedger(repo);
+      expect(events.map(r => r.verdict)).toEqual(['accepted', 'accepted']);
+      expect(foldVerdictLedger(events).get(1)).toMatchObject({ clears: true, current: { coverage: { headSha: next } } });
+      expect(derivePrState(events, facts)).toMatchObject({ verdict: 'accepted', clears: true });
+    }));
+    it('still records a real move seen after the snapshot, and a deliberate return to an old head', () => withHome(append => {
+      expect(append(accepted())).toMatchObject({ ok: true });
+      const live = sha => ({ readPr: () => ({ state: 'OPEN', headRefOid: sha, labels: [] }), read: readObservationLedger, observe });
+      expect(observeLedgerPrEvent({ repo }, 1, live(next)).rows).toMatchObject([{ verdict: 'head-moved', fromHead: head }]);
+      expect(observeLedgerPrEvent({ repo }, 1, live(head)).rows).toMatchObject([{ verdict: 'head-moved', fromHead: next }]);
+    }));
+  });
   it('feeds open PR sightings to the observer and ignores historical check SHAs', async () => {
     const seen = [];
     const event = { type: 'pull_request', repo, prs: [1], sha: next, state: 'open', action: 'synchronize' };
@@ -393,7 +422,7 @@ describe('open-head ledger observations', () => {
   });
   it('reads the current PR instead of rewinding to a delayed feed SHA', () => {
     let seen;
-    observeLedgerPrEvent({ repo, sha: head }, 1, { readPr: () => ({ state: 'OPEN', headRefOid: next, labels: [] }), observe: f => { seen = f; } });
+    observeLedgerPrEvent({ repo, sha: head }, 1, { read: () => [], readPr: () => ({ state: 'OPEN', headRefOid: next, labels: [] }), observe: f => { seen = f; } });
     expect(seen.headSha).toBe(next);
   });
   it('keeps a newer ledger acceptance when a drain snapshot still names an older head', () => {
@@ -401,7 +430,7 @@ describe('open-head ledger observations', () => {
     const append = vi.fn();
     const readPr = vi.fn(() => ({ state: 'OPEN', headRefOid: next, labels: [] }));
     const result = observeLiveLedgerHead({ repo, pr: 1, headSha: head, listedHeadSha: head }, {
-      readPr, observe: live => observeLedgerHead(live, { settings, read: () => [current], append }),
+      read: () => [current], readPr, observe: (live, opts) => observeLedgerHead(live, { ...opts, settings, append }),
     });
     expect(readPr).toHaveBeenCalledWith(repo, 1);
     expect(result).toMatchObject({ ok: true, rows: [] });

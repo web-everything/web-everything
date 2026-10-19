@@ -1,4 +1,4 @@
-import { observeLedgerHead } from './lib/ledger-observation.mjs';
+import { ledgerSnapshot, observeLedgerHead } from './lib/ledger-observation.mjs';
 import { RED_TEAM_STATUS_LABELS } from './lib/red-team-status-label-meta.mjs';
 import { readConfirmedBreaks, redTeamRulingNeeded } from './lib/red-team-gate.mjs';
 import { signalFixDispatch } from './lib/fix-handoff.mjs';
@@ -1260,8 +1260,10 @@ export function runReviewLabelCli({
   // `referralEvidenceCarry`); the durable comment then records which head, which run and which diff fingerprint.
   let referralCarry = null;
   try {
+    // Snapshot the ledger before the live read, so a newer head's acceptance recorded in between is never moved away from.
+    const ledgerBefore = ledgerSnapshot(repo);
     const parsed = provider.readPrState(repo, pr);
-    observeLedgerHead({ repo, pr: Number(pr), headSha: parsed.headRefOid, state: parsed.state, labels: parsed.labels });
+    observeLedgerHead({ repo, pr: Number(pr), headSha: parsed.headRefOid, state: parsed.state, labels: parsed.labels }, { read: ledgerBefore });
     if (['accepted', 'restamp', 'clear-human'].includes(to)) {
       referralCarry = assertMandatoryReferralsCleared(parsed, { repo, pr, ...referralOptions })?.carry ?? null;
     }

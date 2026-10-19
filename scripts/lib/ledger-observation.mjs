@@ -102,20 +102,30 @@ export const ghBudget = (ms, env = process.env) => {
   return { timeout: Math.max(1, ms - 2 * wait), throttle: { acquireTimeoutMs: wait, maxAttempts: 1, env: { ...env, WE_GH_JSON_RETRIES: '0' } } };
 };
 
+/** Read the ledger NOW, for an observation whose live head is read after it, and replay it as that observation's `read`.
+ *  A ledger read after the live read can already hold a newer head's acceptance, and the stale live head would then
+ *  plan a head move away from it that the locked tip accepts. Planned from an older snapshot, any row appended between
+ *  the two reads moves the tip's witness and refuses the stale row. A failed read replays as the same error. */
+export function ledgerSnapshot(repo, read = readObservationLedger) {
+  try { const events = read(repo); return () => events; } catch (e) { return () => { throw e; }; }
+}
+
 /** Feed records can arrive late. Re-read the live PR before observing; never rewind to an event's old SHA. */
 export function observeLedgerPrEvent(event, pr, { readPr = (repo, number, { timeout } = {}) => JSON.parse(String(execFileSyncThrottled('gh',
   // With a budget, the throttle's slot/points wait is bounded by it and a rate-limited read is not retried: one try, then a logged miss.
   ['pr', 'view', String(number), '--repo', repo, '--json', 'state,headRefOid,labels'], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024,
     ...(timeout ? ghBudget(timeout) : {}) }))),
-  observe = observeLedgerHead, log = s => process.stderr.write(`${s}\n`), deadline = null, clock = Date.now } = {}) {
+  read = readObservationLedger, observe = observeLedgerHead, log = s => process.stderr.write(`${s}\n`), deadline = null, clock = Date.now } = {}) {
   try {
     // A deadline also bounds the live read; never start one past it.
+    if (deadline != null && deadline - clock() <= 0) throw Error('observation budget spent before the live read');
+    const snapshot = ledgerSnapshot(event.repo, read);
     const left = deadline == null ? null : deadline - clock();
     if (left != null && left <= 0) throw Error('observation budget spent before the live read');
     const live = left == null ? readPr(event.repo, pr) : readPr(event.repo, pr, { timeout: left });
     const facts = { repo: event.repo, pr, headSha: live.headRefOid, state: live.state,
       labels: (live.labels ?? []).map(l => typeof l === 'string' ? l : l.name) };
-    return deadline == null ? observe(facts) : observe(facts, { deadline, clock });
+    return observe(facts, deadline == null ? { read: snapshot } : { read: snapshot, deadline, clock });
   } catch (e) { log(`ledger-write-miss: event observation ${event.repo}#${pr}: ${e.message}`); return { ok: false }; }
 }
 
@@ -154,8 +164,9 @@ export function drainLedgerBudget({ settings = resolveLedgerObservationSettings(
  */
 export function observeDrainLedgerHeads(targets, { read, settings = resolveLedgerObservationSettings(), clock = Date.now,
   log = s => process.stderr.write(`${s}\n`), readPr, append, // test seams: the live `gh` read and the ledger writer
-  observe = (target, deadline) => observeLedgerPrEvent({ repo: target.repo }, target.pr, { deadline, clock, log, ...(readPr ? { readPr } : {}),
-    observe: facts => observeLedgerHead(facts, { read, settings, deadline, clock, log, ...(append ? { append } : {}) }) }) } = {}) {
+  // The pass snapshot predates every live read, so it is also each observation's planning snapshot.
+  observe = (target, deadline) => observeLedgerPrEvent({ repo: target.repo }, target.pr, { read, deadline, clock, log, ...(readPr ? { readPr } : {}),
+    observe: (facts, opts) => observeLedgerHead(facts, { ...opts, settings, log, ...(append ? { append } : {}) }) }) } = {}) {
   const out = { observed: 0, unchanged: 0, missed: [], capped: [] };
   try {
     const { max, budget, deadline } = drainLedgerBudget({ settings, clock, log });
