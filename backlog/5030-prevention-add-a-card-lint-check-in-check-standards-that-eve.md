@@ -24,3 +24,7 @@ Idempotency key (do not edit): approval-prevention-key:web-everything/web-everyt
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5552 (finding 3: `we:backlog/6247-we-ci-artifact-uploads-never-fail-a-merge-group-run.md:22` — Add a card-lint check: a non-goal must not negate an item listed in scope or an Acceptance item. Failing that, add a review-lens note.)

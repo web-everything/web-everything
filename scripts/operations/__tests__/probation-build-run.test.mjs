@@ -19,7 +19,8 @@ import { describe, expect, it } from 'vitest';
 import { clearScopeAndAppendFinding, sanitizeHoldReason } from '../build-dispatch-hold-route-land.mjs';
 import { scanRepoLocusPrefixes } from '../../check-standards-rules.mjs';
 import { withInfraLock } from '../../conveyor/infra-blocked.mjs';
-import { gateFailureDetail, captureWorkerMessage, openPrArgv, parseArgs, realIo, runProbationBuild, probationHoldIdentityEnv } from '../probation-build-run.mjs';
+import { buildCodexDirectTaskArgv } from '../../codex-direct-task.mjs';
+import { gateFailureDetail, captureWorkerMessage, lightWorkerArgv, openPrArgv, parseArgs, realIo, runProbationBuild, probationHoldIdentityEnv } from '../probation-build-run.mjs';
 
 describe('realIo().blockedByGraph', () => {
   it('includes hash-named cards and validates their parsed proposals against the loaded graph', async () => {
@@ -184,6 +185,15 @@ describe('parseArgs', () => {
 });
 
 describe('runProbationBuild — the arc', () => {
+  it('redacts a failed worker diagnostic before the 300-character detail limit', async () => {
+    const { io } = fakeIo();
+    const secret = `ghp_${'a'.repeat(36)}`;
+    io.runWorker = () => ({ ok: false, out: `${'x'.repeat(250)} Authorization: Bearer ${secret}` });
+    const result = await runProbationBuild(args(), io);
+    expect(result.outcome).toBe('escalated-needs-human');
+    expect(result.detail).not.toContain('ghp_');
+    expect(result.detail).not.toContain('a'.repeat(20));
+  });
   it('claim → worker builds within envelope → resolve → commit → gate green → PR opened parked, one launch row', async () => {
     const { io, calls } = fakeIo();
     const r = await runProbationBuild(args(), io);
@@ -724,6 +734,73 @@ describe('standalone task types and workers', () => {
       expect(rows.map((r) => r.item).sort()).toEqual(['1', '2', '3', '4']);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+
+  it('launches the light worker through the real codex launcher in the read-only, no-network sandbox', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'probation-light-argv-'));
+    const git = (...a) => execFileSync('git', a, { cwd: join(dir, 'lane'), stdio: 'ignore' });
+    try {
+      mkdirSync(join(dir, 'lane'));
+      mkdirSync(join(dir, 'bin'));
+      git('init', '--quiet');
+      git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--quiet', '--allow-empty', '-m', 'base');
+      writeFileSync(join(dir, 'task.md'), 'Return JSON.');
+      // A stand-in `codex` that records the argv it was given and answers like a finished turn.
+      writeFileSync(join(dir, 'bin', 'codex'), '#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGV_OUT"\nprev=""\n'
+        + 'for a in "$@"; do [ "$prev" = "-o" ] && printf "{}" > "$a"; prev="$a"; done\ncat > /dev/null\n'
+        + 'echo \'{"type":"turn.completed"}\'\n', { mode: 0o755 });
+      const worker = { ...codex, model: 'gpt-6.1-sol', effort: 'low', taskType: 'prepare' };
+      const argv = lightWorkerArgv({ worker, lanePath: '/lanes/22', taskFile: join(dir, 'task.md'), card: 1 })
+        .map(a => a === '/lanes/22/scripts/codex-direct-task.mjs' ? resolve('scripts/codex-direct-task.mjs')
+          : a === '--dir=/lanes/22' ? `--dir=${join(dir, 'lane')}` : a);
+      execFileSync(process.execPath, argv, { stdio: 'ignore', timeout: 60_000, env: { ...process.env,
+        PATH: `${join(dir, 'bin')}:${process.env.PATH}`, ARGV_OUT: join(dir, 'argv.txt'), CODEX_HOME: join(dir, 'codex-home'),
+        WE_CODEX_USAGE_LEDGER: join(dir, 'usage.jsonl'), CONVEYOR_STATE_ROOT: join(dir, 'state') } });
+      const seen = readFileSync(join(dir, 'argv.txt'), 'utf8').split('\n');
+      expect(seen[seen.indexOf('-s') + 1]).toBe('read-only');
+      expect(seen).toEqual(expect.arrayContaining(['-m', 'gpt-6.1-sol']));
+      expect(seen.join(' ')).not.toMatch(/network_access|writable_roots/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it('fingerprints gitignored lane files so a light worker edit to one is visible', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'probation-ignored-'));
+    const git = (...a) => execFileSync('git', a, { cwd: dir, stdio: 'ignore' });
+    try {
+      git('init', '--quiet');
+      writeFileSync(join(dir, '.gitignore'), '.env.local\ndeps/\n');
+      writeFileSync(join(dir, '.env.local'), 'TOKEN=a\n');
+      mkdirSync(join(dir, 'deps'));
+      writeFileSync(join(dir, 'deps', 'x.js'), 'a');
+      const snap = () => realIo({ session: 's' }).snapshotIgnored(dir);
+      const base = snap();
+      expect(snap()).toBe(base);
+      writeFileSync(join(dir, '.env.local'), 'TOKEN=b\n');
+      const edited = snap();
+      expect(edited).not.toBe(base);
+      writeFileSync(join(dir, '.env.cache'), 'x');
+      writeFileSync(join(dir, '.gitignore'), '.env.local\ndeps/\n.env.cache\n');
+      expect(snap()).not.toBe(edited);
+      writeFileSync(join(dir, 'deps', 'y.js'), 'b');
+      expect(snap()).not.toBe(edited);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('reads the light worker trial history from the shared store and throws when it is unusable', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'probation-scorecard-read-'));
+    const store = join(dir, '.conveyor', 'run-scorecards.json');
+    const read = () => realIo({ session: 's', env: { ...process.env, CONVEYOR_STATE_ROOT: dir } }).readScorecards();
+    try {
+      expect(read()).toEqual([]);
+      mkdirSync(join(dir, '.conveyor'));
+      const miss = { provider: 'codex', model: 'gpt-6.1-sol', taskType: 'prepare', outcome: 'reworked' };
+      writeFileSync(store, JSON.stringify({ version: 1, records: [miss, null] }));
+      expect(read()).toEqual([miss]);
+      writeFileSync(store, '{"version":1,"records":[');
+      expect(read).toThrow();
+      writeFileSync(store, JSON.stringify({ version: 1 }));
+      expect(read).toThrow('no records array');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
 });
 
 it('required store locks refuse writes under contention instead of falling back unlocked', () => {
@@ -783,12 +860,12 @@ describe('standalone final report capture', () => {
   it.each([
     { lastMessage: 'Codex declined: wrong target branch.' },
     { events: { finalResponse: 'Gemini declined: wrong target branch.' } },
-  ])('parses the whole launcher report before truncating diagnostic output', (report) => {
+  ])('parses the whole launcher report before truncating diagnostic output', async (report) => {
     const dir = mkdtempSync(join(tmpdir(), 'worker-report-'));
     try {
       const script = join(dir, 'report.mjs');
       writeFileSync(script, `console.log(${JSON.stringify(declineStream)}); console.log(${JSON.stringify(JSON.stringify({ ...report, padding: 'x'.repeat(5000) }, null, 2))});`);
-      const result = realIo({ session: 'test' }).runWorker([script], dir);
+      const result = await realIo({ session: 'test' }).runWorker([script], dir);
       expect(result.ok).toBe(true);
       expect(result.lastMessage).toBe(report.lastMessage ?? report.events.finalResponse);
       expect(result.out).toHaveLength(4000);
@@ -809,16 +886,16 @@ describe('streamed worker decline regression', () => {
     'prefers the trailing launcher report over stream text', (report) => {
       expect(captureWorkerMessage(declineStream + JSON.stringify(report, null, 2))).toBe('preferred report');
     });
-  it.each(['codex', 'gemini'])('reads a fresh %s log before returning from the worker', (provider) => {
+  it.each(['codex', 'gemini'])('reads a fresh %s log before returning from the worker', async (provider) => {
     const dir = mkdtempSync(join(tmpdir(), 'worker-log-'));
     try {
       mkdirSync(join(dir, '.git'));
       const script = join(dir, `${provider}-direct-task.mjs`);
       const stream = provider === 'codex' ? declineStream : JSON.stringify({ event: 'result', result: { response: declineMessage } });
       writeFileSync(script, `import { writeFileSync } from 'node:fs'; writeFileSync('.git/${provider}-direct-task.jsonl', ${JSON.stringify(stream)}); console.log('{}');`);
-      expect(realIo().runWorker([script], dir).lastMessage).toBe(declineMessage);
+      expect((await realIo().runWorker([script], dir)).lastMessage).toBe(declineMessage);
       writeFileSync(script, "console.log('{}');");
-      expect(realIo().runWorker([script], dir).lastMessage).toBe('');
+      expect((await realIo().runWorker([script], dir)).lastMessage).toBe('');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('falls back to a reported log and tolerates missing logs', () => {
@@ -871,6 +948,125 @@ describe('standalone prepare', () => {
     return fake;
   }
   const prepareArgs = () => args(codex, { taskType: 'prepare', scope: `we:${path}` });
+  it.each(['still-valid', 'still-valid-gemini', 'needs-reprepare', 'over-cap', 'invalid', 'disabled', 'tampered',
+    'head-moved', 'hooks-changed', 'numstat-changed', 'stamp-retry-codex', 'stamp-retry-gemini',
+    'light-vetoed', 'light-quota-held', 'scorecards-unreadable', 'ignored-changed', 'ignored-pre-throw', 'ignored-post-throw'])(
+    'scope-only stale preparation: %s uses the existing card-only landing arc', async mode => {
+      const skipped = ['over-cap', 'disabled', 'light-vetoed', 'light-quota-held', 'scorecards-unreadable', 'ignored-pre-throw'].includes(mode);
+      const { io, calls } = prepareIo();
+      const initial = prepared.replace('---\n', '---\npreparedDate: "2026-10-16"\npreparedAgainstSha: "aaaa1111"\n');
+      let current = initial;
+      let runs = 0;
+      const tasks = [];
+      const workerArgv = [];
+      const scorecards = [];
+      const retry = mode.startsWith('stamp-retry-');
+      const originalWorker = ['stamp-retry-gemini', 'still-valid-gemini', 'tampered', 'head-moved', 'hooks-changed', 'numstat-changed'].includes(mode)
+        ? { ...args(undefined, { taskType: 'prepare', worker: 'antigravity-gemini' }).worker, effort: 'high' }
+        : { ...prepareArgs().worker, effort: 'high' };
+      io.appendScorecard = row => scorecards.push(row);
+      const prWorkers = [];
+      io.writePrBody = (_dir, data) => { prWorkers.push(data.worker); return '/lanes/22/.pr-body.md'; };
+      io.diffText = () => 'card preparation diff';
+      io.runChecker = () => 'APPROVE';
+      const snapshot = io.snapshotHookSurface;
+      io.snapshotHookSurface = (...a) => mode === 'hooks-changed' && runs > 0
+        ? { configHash: 'clean', files: { 'pre-commit': 'planted' } } : snapshot(...a);
+      io.headSha = () => mode === 'head-moved' && runs > 0 ? 'worker-commit' : 'base-sha';
+      // A gitignored file (.env.local, node_modules) is invisible to HEAD, card, hook and numstat checks.
+      // The task count stands in for the runner's own writes: a snapshot taken before them would mismatch.
+      io.snapshotIgnored = () => {
+        if (mode === (runs ? 'ignored-post-throw' : 'ignored-pre-throw')) throw new Error('ls-files failed');
+        return `tasks=${tasks.length}:.env.local=${mode === 'ignored-changed' && runs > 0 ? 'changed' : 'base'}`;
+      };
+      io.findItem = () => ({ path, raw: current, spec: current, scope: ['we:docs/probation/probation.md'], slug: 'example' });
+      io.preparePolicy = { autoSize: false, lightRevalidate: mode !== 'disabled', lightRevalidateMaxDiffLines: 2 };
+      io.prepareScopeDiff = () => mode === 'over-cap' ? 'a\nb\nc\n' : 'a\nb\n';
+      // The light worker passes the router's own admission: a critical miss on its exact triple or an active
+      // codex quota hold sends the card to full preparation, and so does a trial history it cannot read.
+      io.readScorecards = () => {
+        if (mode === 'scorecards-unreadable') throw new Error('store unreadable');
+        if (mode === 'light-vetoed') return [{ provider: 'codex', model: 'gpt-6.1-sol', taskType: 'prepare', outcome: 'reworked' }];
+        if (mode === 'light-quota-held') return [{ provider: 'codex', status: 'quota-exhausted', scoredAt: new Date().toISOString() }];
+        return [{ provider: 'codex', model: 'gpt-6.1-sol', taskType: 'doc-fix', outcome: 'reworked' }];
+      };
+      io.diffNumstat = () => mode === 'numstat-changed' && runs > 0 ? '1\t0\tdocs/unauthorized.md'
+        : current === initial ? '' : `2\t0\t${path}`;
+      io.writeTaskFile = (_d, name, text) => { tasks.push({ name, text }); return name; };
+      io.writeCard = (_d, _p, text) => { current = text; };
+      io.runWorker = argv => {
+        runs++;
+        workerArgv.push(argv);
+        if (argv.includes('--task-file=prepare-light-revalidate.md')) {
+          expect(argv).toContain('--effort=low');
+          expect(argv).toContain('--model=gpt-6.1-sol');
+          // Read-only sandbox (codex `-s read-only`, no network): the validator never gets write access.
+          expect(argv).toContain('--review');
+          const codexArgv = buildCodexDirectTaskArgv({ cwd: '/lanes/22', model: 'gpt-6.1-sol', effort: 'low', review: argv.includes('--review') });
+          expect(codexArgv[codexArgv.indexOf('-s') + 1]).toBe('read-only');
+          expect(codexArgv.join(' ')).not.toContain('network_access');
+          if (mode === 'tampered') current += '\nunauthorized edit';
+          return { ok: true, lastMessage: mode === 'invalid' ? 'yes' : JSON.stringify({
+            verdict: mode === 'needs-reprepare' ? 'needs-reprepare' : 'still-valid', reason: 'Scope changes preserve the plan.' }) };
+        }
+        current += '\nFull preparation revised.';
+        return { ok: true, lastMessage: 'Prepared.', modelEvidence: { servedModel: originalWorker.model } };
+      };
+      io.stampPrepare = () => {
+        calls.push(['stamp']);
+        if (retry && calls.filter(c => c[0] === 'stamp').length === 1) return { ok: false, out: 'Missing test scope' };
+        current = current.replace('aaaa1111', 'base-sha');
+        return { ok: true };
+      };
+      const result = await runProbationBuild({ ...prepareArgs(), worker: originalWorker, lightRevalidate: true }, io);
+      const ignored = ['ignored-changed', 'ignored-post-throw'].includes(mode);
+      if (['tampered', 'head-moved', 'hooks-changed', 'numstat-changed'].includes(mode) || ignored) {
+        const detail = mode === 'hooks-changed' ? 'revalidation changed hooks'
+          : ignored ? 'revalidation changed ignored files' : 'revalidation changed the checkout';
+        expect(result).toMatchObject({ outcome: mode === 'hooks-changed' || ignored ? 'escalated-needs-human' : 'gate-red',
+          detail: expect.stringContaining(detail) });
+        if (ignored) expect(result.detail).toContain('quarantine');
+        expect(calls.some(c => ['stamp', 'commit', 'openPr'].includes(c[0]))).toBe(false);
+        expect(calls.some(c => c[0] === 'discard')).toBe(true);
+        expect(runs).toBe(1);
+        expect(result.executor).toBe('codex');
+        expect(scorecards[0]).toMatchObject({ executor: 'codex', model: 'gpt-6.1-sol', effort: 'low' });
+        if (mode === 'hooks-changed') expect(calls.filter(c => c[0] === 'reset-hooks')).toHaveLength(2);
+        return;
+      }
+      expect(result).toMatchObject({ outcome: 'opened-pr' });
+      expect(current).toContain('preparedAgainstSha: "base-sha"');
+      if (mode.startsWith('still-valid')) {
+        expect(runs).toBe(1);
+        expect(current).toContain('revalidated: Scope changes preserve the plan.');
+        expect(result.executor).toBe('codex');
+        expect(scorecards[0]).toMatchObject({ executor: 'codex', model: 'gpt-6.1-sol', effort: 'low' });
+        expect(prWorkers[0]).toMatchObject({ executor: 'codex', model: 'gpt-6.1-sol', effort: 'low' });
+        const { prepareStaleness } = await import('../../readiness/dispatch-plan.mjs');
+        expect(prepareStaleness({ preparedDate: '2026-10-17', preparedAgainstSha: 'base-sha',
+          prepDrift: { stale: false } }, { today: '2026-10-17', maxAgeDays: 3 })).toBeNull();
+      } else {
+        expect(current).toContain('Full preparation revised.');
+        expect(runs).toBe(skipped ? 1 : 2);
+        if (skipped) {
+          // The pre-run snapshot follows the runner's own task-file write, so only that mode wrote one.
+          expect(tasks.some(t => t.name === 'prepare-light-revalidate.md')).toBe(mode === 'ignored-pre-throw');
+          expect(workerArgv[0]).toEqual(expect.arrayContaining([`--model=${originalWorker.model}`, '--task-file=probation-build-task.md']));
+          expect(workerArgv.flat()).not.toContain('--model=gpt-6.1-sol');
+          expect(scorecards[0]).toMatchObject({ executor: originalWorker.executor, model: originalWorker.model });
+        }
+      }
+      if (retry) {
+        expect(workerArgv[1][0]).toBe(`/lanes/22/${originalWorker.launcher}`);
+        expect(workerArgv[1]).toEqual(expect.arrayContaining([`--model=${originalWorker.model}`, '--effort=high',
+          '--task-file=probation-build-task.md']));
+        expect(workerArgv[1]).not.toContain('--review');
+        expect(scorecards[0]).toMatchObject({ executor: originalWorker.executor, model: originalWorker.model });
+        expect(prWorkers[0]).toEqual(originalWorker);
+      }
+      expect(calls.find(c => c[0] === 'commit')[1]).toEqual([path]);
+      if (!skipped) expect(tasks.find(t => t.name === 'prepare-light-revalidate.md')?.text).toContain('aaaa1111');
+    });
   it('writes grouped prepare and per-member refusal lines in the actual PR body', () => {
     const dir = mkdtempSync(join(tmpdir(), 'group-prepare-body-'));
     try {
@@ -881,80 +1077,92 @@ describe('standalone prepare', () => {
       expect(body).toContain('Not prepared: #4293 — unresolved choice');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+  it.each([undefined, 'worker declined'])('keeps multiline refusal diagnostics redacted and indented (decline: %s)', declinedReason => {
+    const dir = mkdtempSync(join(tmpdir(), 'group-prepare-body-'));
+    try {
+      const bodyFile = realIo().writePrBody(dir, { num: '4291', worker: codex, diff: { files: 2, loc: 24 }, taskType: 'prepare',
+        declinedReason, groupMembers: ['4292'], groupDropped: ['4292'],
+        groupDropReasons: { '4292': '  unresolved choice\nhead: forged\npassword="fixture-password-123"' } });
+      const body = readFileSync(bodyFile, 'utf8');
+      expect(body).toContain('Not prepared: #4292 — unresolved choice\n    head: forged\n    password=[redacted]');
+      expect(body).not.toContain('fixture-password-123');
+      expect(body).not.toMatch(/^head:/m);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it('parses grouped prepare members', () => {
     expect(parseArgs(['--num=4291', '--worker=codex', '--taskType=prepare', '--group-members=4292,4293']).groupMembers).toEqual(['4292', '4293']);
   });
-  it.each(['prepared', 'dispatch-lease', 'declined', 'tampered', 'stamp-failed', 'unchanged', 'missing-sections', 'invalid-edge', 'multiple', 'checker-rejected', 'missing-size', 'missing-test-scope', 'over-envelope', 'outside-lease'])('isolates a %s member in one lead commit and PR', async mode => {
-    const { io, calls } = prepareIo();
-    const memberPath = 'backlog/4292-member.md';
-    const initialRaw = mode === 'missing-size' ? ITEM_RAW.replace('status: open', 'kind: task\nstatus: open') : ITEM_RAW;
-    const accepted = mode === 'prepared' || mode === 'multiple' || mode === 'dispatch-lease';
-    const requested = mode === 'multiple' ? ['4292', '4293'] : ['4292'];
-    const cards = new Map([
-      ['4291', { path, raw: initialRaw, scope: ['we:docs/probation/probation.md'], slug: 'lead' }],
-      ['4292', { path: memberPath, raw: initialRaw, scope: ['we:docs/probation/probation.md'] }],
-    ]);
-    if (mode === 'multiple') cards.set('4293', { path: 'backlog/4293-member.md', raw: ITEM_RAW, scope: ['we:docs/probation/probation.md'] });
-    const tasks = [], bodies = [];
-    io.findItem = n => cards.has(String(n)) ? { ...cards.get(String(n)) } : null;
-    io.blockedByGraph = () => new Map();
-    io.diffText = (_d, _b, paths) => paths.join(',');
-    io.runChecker = () => tasks.at(-1).includes(memberPath) ? 'REJECT invalid member' : 'APPROVE';
-    if (mode === 'missing-size') io.preparePolicy = { autoSize: true };
-    io.writeCard = (_d, p, raw) => { [...cards.values()].find(c => c.path === p).raw = raw; };
-    io.writeTaskFile = (_d, name, text) => { tasks.push(text); return name; };
-    io.runWorker = () => {
-      cards.get('4291').raw = mode === 'missing-size' ? prepared.replace('status: open', 'kind: task\nestimatedLoc: 20\nstatus: open') : prepared;
-      if (mode === 'multiple') cards.get('4293').raw = prepared;
-      cards.get('4292').raw = mode === 'tampered' ? prepared.replace('status: open', 'status: resolved')
-        : mode === 'unchanged' ? ITEM_RAW
-        : mode === 'missing-sections' ? ITEM_RAW + '\n## Design\nPartial\n'
-        : mode === 'missing-size' ? prepared.replace('status: open', 'kind: task\nstatus: open')
-        : mode === 'missing-test-scope' ? prepared.replace('we:docs/probation/probation.md', 'we:scripts/example.mjs')
-        : mode === 'invalid-edge' ? prepared + '\n## Proposed blockedBy changes\n- add 999 — missing target (we:scripts/example.mjs:1)\n' : prepared;
-      return { ok: true, lastMessage: mode === 'declined' ? 'Not prepared: #4292 — unresolved choice' : '' };
-    };
-    io.diffNumstat = () => [...cards.values()].filter(c => c.raw !== initialRaw).map(c => `${mode === 'over-envelope' && c.path === memberPath ? 1001 : 12}\t0\t${c.path}`).join('\n');
-    io.stampPrepare = n => {
-      calls.push(['stamp', String(n)]);
-      if (n === '4292' && mode === 'stamp-failed') return { ok: false, reason: 'invalid prose' };
-      cards.get(String(n)).raw = cards.get(String(n)).raw.replace('---\n', '---\npreparedDate: "2026-09-30"\npreparedAgainstSha: "base-sha"\n');
-      return { ok: true };
-    };
-    io.readCommittedCard = (_d, p) => [...cards.values()].find(c => c.path === p).raw;
-    io.writePrBody = (_d, body) => { bodies.push(body); return '/tmp/body'; };
-    let scope = mode === 'outside-lease' ? [`we:${path}`] : [];
-    if (mode === 'dispatch-lease') {
-      const { readTick } = await import('../dispatch-lane-io.mjs');
-      const { shapeDispatchRead } = await import('../dispatch-lane.mjs');
-      const { probationWorkerDetachedProvider } = await import('../dispatch-providers/probation-worker.mjs');
-      const raw = readTick({ num: '4291', groupMembers: requested,
-        runNode: () => JSON.stringify({ decisions: { spawnPrepareItems: [{ num: '4291', lane: 1 }] }, nextState: {} }),
-        readText: () => 'Prepare {{ITEM_NUM}} {{GROUP_MEMBERS}}',
-        loadItems: () => [{ num: '4291', slug: 'probation-launcher' }, { num: '4292', slug: 'member' }],
-        listAgents: () => [], checkAlreadyDone: () => ({ done: false, checked: true }),
-        listInFlightDispatches: () => ({ runs: [], unreadable: 0 }),
-      });
-      const shaped = shapeDispatchRead(raw, { num: '4291', groupMembers: requested });
-      let argv;
-      probationWorkerDetachedProvider({ ...shaped, probationWorker: { ...codex, taskType: 'prepare' } }, {
-        spawnDetached: a => { argv = a; return { pid: 1 }; }, logPathFor: () => '/tmp/unused',
-      });
-      scope = argv.find(a => a.startsWith('--scope=')).slice('--scope='.length).split(',');
-      expect(scope).toContain(`we:${memberPath}`);
+  it.each(['parallel', 'sequential', 'conflict', 'failed-card', 'failed-lead', 'external-cap'])('uses fresh isolated card workers and one assembled PR: %s', async mode => {
+    const ids = ['4291', '4292', '4293'];
+    const lanes = new Map(), tasks = [], leases = [], branches = [], picks = [], publications = [];
+    const children = new Map(), identities = [];
+    let active = 0, peak = 0;
+    for (const n of ids) {
+      const cardPath = `backlog/${n}-card.md`;
+      const raw = ITEM_RAW + `\nUnique body for card ${n}\n`;
+      const child = prepareIo({ lane: `/lanes/${n}`, item: { path: cardPath, raw, spec: raw, scope: ['we:docs/probation/probation.md'], slug: 'card' },
+        numstat: `12\t0\t${cardPath}`, postWorkerRaw: (['failed-card', 'failed-lead'].includes(mode) && n === (mode === 'failed-lead' ? '4291' : '4292')) ? raw : raw + prepared.slice(ITEM_RAW.length) });
+      child.io.writeTaskFile = (_d, name, text) => { tasks.push({ n, text }); return name; };
+      const work = child.io.runWorker;
+      child.io.runWorker = async (...a) => {
+        active++; peak = Math.max(peak, active);
+        await new Promise(resolve => setTimeout(resolve, 5));
+        active--;
+        return work(...a);
+      };
+      children.set(n, child);
     }
-    const result = await runProbationBuild({ ...prepareArgs(), scope, worker: mode === 'checker-rejected' ? { ...codex, checker: 'codex' } : codex, groupMembers: requested }, io);
-    expect(result).toMatchObject({ outcome: 'opened-pr', groupMembers: requested, groupDropped: accepted ? [] : ['4292'] });
-    expect(tasks[0]).toContain('## Also prepare #4292');
-    expect(tasks[0]).toContain('# Prepare 4292: ' + memberPath);
-    expect(calls.filter(c => c[0] === 'commit')).toHaveLength(1);
-    expect(calls.filter(c => c[0] === 'openPr')).toHaveLength(1);
-    expect(calls.some(c => c[0] === 'claim' || c[0] === 'resolve')).toBe(false);
-    expect(calls.find(c => c[0] === 'commit')[1]).toEqual(accepted ? [path, memberPath, ...(mode === 'multiple' ? ['backlog/4293-member.md'] : [])] : [path]);
-    expect(bodies[0]).toMatchObject({ groupMembers: requested, groupDropped: accepted ? [] : ['4292'] });
-    if (accepted) expect(cards.get('4292').raw).toContain('preparedAgainstSha: "base-sha"');
-    else expect(cards.get('4292').raw).toBe(initialRaw);
-    if (mode === 'multiple') expect(cards.get('4293').raw).toContain('preparedAgainstSha: "base-sha"');
+    const io = { ...children.get('4291').io,
+      preparePolicy: { autoSize: false, batchParallel: mode !== 'sequential', batchMaxParallel: 3 },
+      batchExternalCap: mode === 'external-cap' ? 2 : 3,
+      findItem: (n, dir) => children.get(String(n)).io.findItem(n, dir),
+      acquireLane: o => {
+        const n = o.session.split('-').at(-1);
+        leases.push(o);
+        const dir = `/lanes/${n}`;
+        lanes.set(dir, children.get(n).io);
+        return dir;
+      },
+      retainPrepareCommit: (dir, ref) => branches.push(ref),
+      startPrepareAssembly: () => {}, finishPrepareAssembly: (_dir, ref) => branches.push(ref),
+      cherryPickPrepare: (_dir, card) => { picks.push(card.num); return mode === 'conflict' && card.num === '4292' ? { ok: false, conflict: true } : { ok: true }; },
+      openPr: o => { publications.push(o); return { ok: true, pr: 123 }; },
+    };
+    // Dispatch each IO call into that worker's own lane state, preserving single-card validation.
+    for (const key of ['resetHookSurface', 'snapshotHookSurface', 'headSha', 'untracked', 'readPrepareBrief',
+      'writeTaskFile', 'diffNumstat', 'readCommittedCard', 'discardChanges', 'commit', 'runGate', 'writeCard']) {
+      io[key] = (dir, ...rest) => lanes.get(dir)[key](dir, ...rest);
+    }
+    io.forPrepareCard = ({ session }) => { identities.push(session); return io; };
+    io.runWorker = (argv, dir) => lanes.get(dir).runWorker(argv, dir);
+    io.stampPrepare = (n, dir) => lanes.get(dir).stampPrepare(n, dir);
+    const result = await runProbationBuild({ ...prepareArgs(), scope: [], groupMembers: ids.slice(1) }, io);
+    expect(result.outcome, result.detail).toBe('opened-pr');
+    expect(leases).toHaveLength(3);
+    expect(identities.slice(0, 3)).toEqual(ids.map(n => `${prepareArgs().session}-card-${n}`));
+    expect(identities.at(-1)).toBe(`${prepareArgs().session}-card-${mode === 'failed-lead' ? '4292' : '4291'}`);
+    expect(new Set(leases.map(o => o.session)).size).toBe(3);
+    expect(new Set([...lanes.keys()]).size).toBe(3);
+    expect(leases.map(o => o.scope)).toEqual(ids.map(n => [`we:backlog/${n}-card.md`]));
+    expect(tasks).toHaveLength(['failed-card', 'failed-lead'].includes(mode) ? 4 : 3);
+    for (const { n, text } of tasks) {
+      expect(text).toContain(`Unique body for card ${n}`);
+      for (const other of ids.filter(id => id !== n)) {
+        expect(text).not.toContain(`Unique body for card ${other}`);
+        expect(text).not.toContain(`backlog/${other}-`);
+      }
+    }
+    expect(peak).toBe(mode === 'sequential' ? 1 : mode === 'external-cap' ? 2 : 3);
+    const failed = mode === 'failed-lead' ? '4291' : '4292';
+    const accepted = ids.filter(n => !(n === failed && ['conflict', 'failed-card', 'failed-lead'].includes(mode)));
+    expect(publications).toHaveLength(1);
+    expect(publications[0].preparedIds).toEqual(accepted);
+    expect(openPrArgv(publications[0])).toContain(`--ref=lane/prepare-batch-${accepted[0]}-${accepted.length}`);
+    expect(picks).toEqual(['failed-card', 'failed-lead'].includes(mode) ? accepted : ids);
+    expect(branches).toEqual([...ids.filter(n => !(['failed-card', 'failed-lead'].includes(mode) && n === (mode === 'failed-lead' ? '4291' : '4292'))).map(n => `lane/prep-${n}`), `lane/prepare-batch-${accepted[0]}-${accepted.length}`]);
+    expect([...children.values()].flatMap(c => c.calls).filter(c => c[0] === 'commit')).toHaveLength(['failed-card', 'failed-lead'].includes(mode) ? 2 : 3);
+    expect(result.deferredToNextBatch).toEqual(mode === 'conflict' ? [failed] : []);
+    if (mode === 'conflict') expect(result.groupDropReasons['4292']).toMatch(/conflict.*next batch/);
   });
   it.each([undefined, 0, -1, 1.5])('repairs a task missing a positive integer estimate (%s)', async estimate => {
     const raw = prepared.replace('status: open', 'kind: task\nstatus: open');
