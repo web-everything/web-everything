@@ -58,6 +58,7 @@ function setup(extra = {}) {
     resolveSetting: () => ({ enabled: true, debounceSeconds: 15, line: 'x' }),
     readQueueDepth: async () => ({ ok: true, queued: 0 }),
     readPr: async () => READY_PR,
+    readMainFixPr: () => null, readRedMainState: () => null, readManualFreeze: () => null,
     readMembership: async () => ({ ok: true, inQueue: true, entry: { position: 1, state: 'QUEUED' }, lastEvents: [] }),
     ...extra,
   });
@@ -508,6 +509,45 @@ describe('readCatchUpCandidates', () => {
 });
 
 describe('catch-up handle', () => {
+  it.each([
+    ['10 minutes after child end', 10, null, true],
+    ['16 minutes after child end', 16, null, false],
+    ['enqueue retry deadline passed', 10, 'enqueueFailures', false],
+    ['requested red-team retry deadline passed', 10, 'redTeamPending', true],
+    ['unattempted red-team retry deadline passed', 10, 'redTeamPending', false, null],
+  ])('measures unchanged hold age from child completion: %s', async (_name, minutesAfterEnd, retryState, skips, requestedAt = 1_000) => {
+    const head = 'a'.repeat(40);
+    const state = retryState ? { [retryState]: { [`${REPO}#42`]: {
+      headSha: head, retryAt: 1_000 + 600_000 + 5 * 60_000,
+      firstPendingAt: 1_000, requestedAt,
+    } } } : {};
+    const f = catchUpSetup({
+      resolveSetting: () => ({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp, intervalMinutes: 1 } }),
+      resolveThroughput: () => ({ value: { catchUpSkipUnchangedHolds: true, catchUpSkipMaxMin: 15 } }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42, 100)] }),
+      readPr: async () => ({ ...READY_PR, headRefOid: head }),
+      readHoldEvidence: () => ({ recorded: false }),
+      readHoldQueueState: () => state,
+      resolveQueueSafety: () => ({ value: { redTeamPendingMaxMin: 60, redTeamRequestCooldownMin: 3 } }),
+      drainResult: () => {
+        f.advance(600_000);
+        return { considered: 1, skipReasons: [{ num: 42, kind: 'red-team-pending', reason: 'waiting' }] };
+      },
+    });
+    try {
+      await f.handle.catchUp();
+      expect(f.calls).toHaveLength(1);
+      f.advance(minutesAfterEnd * 60_000);
+      const result = await f.handle.catchUp();
+      expect(f.calls).toHaveLength(skips ? 1 : 2);
+      if (skips) {
+        expect(result).toEqual([expect.objectContaining({ num: 42, what: 'unchanged hold: red-team-pending', outcome: 'skipped' })]);
+      } else {
+        expect(result.some(row => row.what.startsWith('unchanged hold'))).toBe(false);
+      }
+    } finally { f.handle.kill(); }
+  });
+
   it.each([
     ['gate skip', { considered: 1, toMerge: [], skipReasons: [{ num: 1, reason: 'checks failing' }] }],
     ['revalidation abort', { considered: 1, toMerge: [{ num: 1 }], revalidationAborted: [{ num: 1, reason: 'blockedBy' }] }],
@@ -1621,5 +1661,67 @@ describe('pre-staged green events', () => {
     expect(prestageCache.drop).not.toHaveBeenCalled();
     expect(calls).toHaveLength(1);
     expect(handle.pending()).toHaveLength(0);
+  });
+});
+
+describe('red-main scheduling', () => {
+  const mainFix = { repo: 'we', pr: 42, prs: [42], expiresAt: 1e15 };
+  it('runs an event-only main fix first in catchUpOnly without debounce, and waits before starting catch-up', async () => {
+    const f = catchUpSetup({ manualFinish: true,
+      readMainFixPr: () => mainFix,
+      resolveThroughput: () => ({ value: { redMainSkipCatchUp: false } }),
+      resolveSetting: () => ({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp, concurrency: 3 } }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(43), candidate(42)] }),
+    });
+    try {
+      f.handle.notePoll({ ok: true, marked: [mark(42)] });
+      const run = f.handle.catchUp();
+      for (let i = 0; i < 30; i++) await new Promise(r => setImmediate(r));
+      expect(f.calls.map(c => c.args.find(a => a.startsWith('--only=')))).toEqual(['--only=42']);
+      expect(f.lines.join('\n')).not.toContain('#42 already pending');
+      f.children[0].finish();
+      for (let i = 0; i < 30; i++) await new Promise(r => setImmediate(r));
+      f.children.slice(1).forEach(c => c.finish());
+      await run;
+      expect(f.calls.map(c => c.args.find(a => a.startsWith('--only=')))).toEqual(['--only=42', '--only=43']);
+      expect(f.lines).toContain('enqueue-on-event: main-fix #42 first (red main)');
+    } finally { f.handle.kill(); }
+  });
+  it('starts no other catch-up PR while the main-fix catch-up drain is active', async () => {
+    const f = catchUpSetup({ manualFinish: true, readMainFixPr: () => mainFix,
+      resolveThroughput: () => ({ value: { redMainSkipCatchUp: false } }),
+      resolveSetting: () => ({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp, concurrency: 3 } }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42), candidate(43)] }),
+    });
+    try {
+      const run = f.handle.catchUp();
+      for (let i = 0; i < 30; i++) await new Promise(r => setImmediate(r));
+      expect(f.calls.map(c => c.args[1])).toEqual(['--only=42']);
+      f.children[0].finish();
+      for (let i = 0; i < 30; i++) await new Promise(r => setImmediate(r));
+      expect(f.calls.map(c => c.args[1])).toEqual(['--only=42', '--only=43']);
+      f.children[1].finish();
+      await run;
+    } finally { f.handle.kill(); }
+  });
+  it.each([
+    ['on', 'on', mainFix, true, [42]],
+    ['off', 'on', mainFix, false, [42, 43]],
+    ['on', 'off', mainFix, false, [42, 43]],
+    ['on', 'on', { ...mainFix, repo: 'fui' }, true, []],
+  ])('catch-up skip %s, hold %s, ownership %j', async (skip, hold, priority, logsSkip, expected) => {
+    const f = catchUpSetup({ readMainFixPr: () => priority,
+      readRedMainState: () => ({ red: true, expiresAt: 1e15 }),
+      readManualFreeze: () => null,
+      resolveRedMainHold: () => ({ value: hold }),
+      resolveThroughput: () => ({ value: { redMainSkipCatchUp: skip === 'on' }, sources: { redMainSkipCatchUp: 'tool' } }),
+      readPriorities: () => ({ mainFix: priority }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42), candidate(43)] }),
+    });
+    try {
+      await f.handle.catchUp();
+      expect(f.calls.map(c => Number(c.args.find(a => a.startsWith('--only=')).split('=')[1]))).toEqual(expected);
+      expect(f.lines.some(l => l.includes('catch-up skipped') && l.includes('drain.redMainSkipCatchUp=on (tool)'))).toBe(logsSkip);
+    } finally { f.handle.kill(); }
   });
 });
