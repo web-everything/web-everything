@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { validateRaisedBy } from './check-standards-rules.mjs';
 import { isTerminalStatus } from './lib/backlog-status.cjs';
 import { relatedReportRefs } from './lib/related-report.cjs';
 /**
@@ -267,7 +268,7 @@ const outgoingBacklogTargets = (changedFiles) => {
 // touches a backlog/*.md file; a diff that touches none gets the full backlog-load saving with ZERO added
 // overhead (`LINKED_FILES` stays `null`, `EFFECTIVE_FILES` falls back to plain `LOCAL_FILES` below).
 const CHANGED_BACKLOG_FILES = LOCAL_FILES_LIST
-  ? LOCAL_FILES_LIST.filter((f) => f.startsWith('backlog/') && f.endsWith('.md'))
+  ? LOCAL_FILES_LIST.filter((f) => /^backlog\/[^/]+\.md$/.test(f))
   : [];
 const LINKED_FILES = CHANGED_BACKLOG_FILES.length
   ? new Set([...linkedFilesFor(CHANGED_BACKLOG_FILES, { gitGrep }), ...outgoingBacklogTargets(CHANGED_BACKLOG_FILES)])
@@ -381,13 +382,15 @@ const loadBacklog = require(join(ROOT, 'src/_data/backlog.js'));
 // → note iff --local"). Full soundness argument: src/_data/backlog.js's `loadBacklogScoped` docblock. The
 // default no-flag run and a bare `--local` (no `--files=`) are untouched — `SCOPE_TO_FILES` is false.
 const backlogScopedFiles = SCOPE_TO_FILES
-  ? [...EFFECTIVE_FILES].filter((f) => f.startsWith('backlog/') && f.endsWith('.md')).map((f) => f.slice('backlog/'.length))
+  ? [...EFFECTIVE_FILES].filter((f) => /^backlog\/[^/]+\.md$/.test(f)).map((f) => f.slice('backlog/'.length))
   : null;
 const backlog = arr(
   SCOPE_TO_FILES
     ? loadBacklog.loadBacklogScoped(backlogScopedFiles)
     : (typeof loadBacklog === 'function' ? loadBacklog() : loadBacklog),
 );
+
+for (const message of validateRaisedBy(ROOT)) err(message);
 
 mark("Load specs");
 // ── 1. Spec ↔ description coverage ────────────────────────────────────────────
@@ -1048,7 +1051,7 @@ mark("6d-quinquies. Unquoted-colon scalar in frontmatter (#453)");
     err(`"${path}" is a fix-evidence scratch file and must never be committed — it is shared by every fixer and conflicts every other PR that carries it. Post evidence as a PR comment (gh pr comment --body-file <file outside the repo>) and \`git rm --cached ${path}\`.`);
   }
   const changedScopeCards = new Set(scopeChanges.changedFiles.filter((f) =>
-    f.startsWith('backlog/') && f.endsWith('.md') && !scopeChanges.deletedFiles.includes(f)
+    /^backlog\/[^/]+\.md$/.test(f) && !scopeChanges.deletedFiles.includes(f)
     && (!LOCAL_FILES || LOCAL_FILES.has(f))));
   for (const file of readdirSync(join(ROOT, 'backlog')).filter((f) => f.endsWith('.md'))) {
     let raw, body = '';
