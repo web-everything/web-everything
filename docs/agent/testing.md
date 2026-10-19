@@ -1810,8 +1810,11 @@ green ledger and the marker keeps the diff's changed files (**a default verify u
 records the green ledger and the changed files**). Codex resolves its gate from the same policy
 (**a real codexDirectTask with WE_BUILD_FINAL_GATE %s runs the policy gate**); `full` and `related`
 need `scripts/verify-lane.mjs`, so a sibling-repo `--dir` without it gets the named failed outcome
-`gate-unavailable` (**%s gate in a checkout without verify-lane is a named unavailable failure**) and
-must pass `--gate=standards` or `--gate=none`. Briefs that append the checklist (fix, ci-heal, the dispatch
+`gate-unavailable` (**%s gate in a checkout without verify-lane is a named unavailable failure**),
+refused before any Codex spend (**refuses --gate=%s in a checkout without verify-lane before any Codex
+spend**), and must pass `--gate=standards` or `--gate=none`; a plateau-app worker brief does that
+itself. A dispatched verify child also recognizes a default gate the requester stamped under the
+other `finalGate` (**a child under finalGate=%2$s recognizes a default gate stamped under %1$s**). Briefs that append the checklist (fix, ci-heal, the dispatch
 tick, the delivery v2 brief and its resume prompts, Codex) do it through `appendBuildRequirements`,
 which appends it once and never to a brief that already has it (**brief composers carry the
 checklist exactly once**); `worker-brief.mjs` places it inside its own template. Codex callers opt out of self-review with
