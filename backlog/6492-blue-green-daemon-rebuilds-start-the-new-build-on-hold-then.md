@@ -3,6 +3,7 @@ bornAs: xgyj0q6
 kind: story
 size: 8
 status: open
+deliveryMode: prototype
 scope: ["we:scripts/lib/daemon-rebuild.mjs", "we:scripts/lib/daemon-rebuild/prepare.mjs", "we:scripts/lib/daemon-rebuild/smoke.mjs", "we:scripts/lib/daemon-load-overlay.mjs"]
 dateOpened: "2026-10-18"
 tags: []
@@ -54,3 +55,13 @@ One line per class: either the handling, or `n/a: <why>`.
 - **Interim, already built as a hotfix (lane/hot-rebuild-no-starve):** a ready candidate waiting more than N ticks makes the next tick yield, so the swap happens within one tick. The pause flag is reusable for manual "pause, switch, resume".
 - **Evidence, 2026-10-19:** the review clone was stuck about 70 min (17:42-18:52 ET) because reader priority starved the rebuild writer, and 4 hotfixes stayed un-adopted.
 - **Estimate:** about 1 day; most of it is the state move. Build it via the builder as proper work, not as a hotfix.
+
+## Delivery mode (operator 2026-10-19)
+
+The field `deliveryMode` has its home in card xbamp05 (deliveryMode per card). This card is `prototype`.
+
+- Prototype first, then shadow, on ONE daemon (review) first.
+- Shadow: build and smoke into the idle clone, with "dry" switches that only log.
+- Then a few real switches in quiet hours, with the old clone kept warm for an instant revert.
+- Proof before the PR: a log of real switches with no lost review jobs and no lock issues, plus at least one deliberate failed switch that auto-reverted.
+- Then graduate via a normal PR, and repeat for the drain.
