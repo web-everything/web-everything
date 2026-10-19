@@ -39,7 +39,7 @@ export default {
         `const m = await import(${JSON.stringify(pathToFileURL(join(ROOT, SOURCE)).href)});`,
         `const rt = await import(${JSON.stringify(pathToFileURL(join(ROOT, 'scripts/lib/daemon-jobs-runtime.mjs')).href)});`,
         `const o = ${JSON.stringify(io)};`,
-        `const io = { home: o.home, statusFeed: o.statusFeed, acquire: async () => o.lane, release: async () => writeFileSync(o.released, '1') };`,
+        `const io = { home: o.home, statusFeed: o.statusFeed, acquire: async () => o.lane, release: async () => writeFileSync(o.released, '1'), sweep: async () => {} };`,
         `if (m.runNightlyCoronerEntry) await m.runNightlyCoronerEntry({ io });`,
         `else await rt.runJob({ steps: [{ name: 'nightly-coroner', run: ({ input }) => m.extractNightlyCoroner(input, io) }] });`,
       ].join('\n'));

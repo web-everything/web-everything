@@ -373,6 +373,7 @@ describe('stopping a job that owns subprocesses', () => {
   it.each([
     ['a wrapper that exits on SIGTERM', '', 'setInterval(() => {}, 1000)', 'SIGTERM'],
     ['a tree that ignores SIGTERM', "process.on('SIGTERM', () => {});", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)", 'SIGKILL'],
+    ['a child left running after its wrapper exits', '', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)", 'SIGTERM'],
   ])('stops the whole detached process group, not only the wrapper pid: %s', async (_name, parentTrap, childCode, signal) => {
     const parent = spawn(process.execPath, ['-e', [
       parentTrap,

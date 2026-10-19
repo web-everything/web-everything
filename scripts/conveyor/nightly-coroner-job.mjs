@@ -4,7 +4,6 @@ import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, realpat
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { HEALTH_NIGHTLY_CORONER_KIND, HEALTH_WATCH_JOB_KINDS } from '../../skills-src/conveyor/daemon-manifest.mjs';
 import { createJobStore, createTickClock, enqueueJob, reattachTick, runJob } from '../lib/daemon-jobs-runtime.mjs';
 import { createWarmGate, evictToTrash } from './health-watch-job.mjs';
@@ -20,7 +19,6 @@ import { prSweepTickAllowed } from './pr-sweep-job.mjs';
 const SELF = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(SELF), '../..');
 const clocks = new Map();
-const exec = promisify(execFile);
 export const NIGHTLY_DEFAULTS = Object.freeze({ enabled: true, at: '22:17', laneWaitMs: 600000, attempts: 3, retryBackoffMin: 10, deadlineEt: '03:30', alertAfterProbeFailures: 3 });
 const positiveInt = (v) => Number.isSafeInteger(v) && v > 0;
 const validTime = (v) => typeof v === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(v);
@@ -101,7 +99,8 @@ export function publishCoronerFailure({ id, error, attempts, maxAttempts, reason
 
 export async function runNightlyCoronerJob({ now, config, settings, dir, env = process.env, sourceRoot = ROOT,
   store = createJobStore(daemonJobsDir('nightly-coroner', env)), enqueue = enqueueJob, reattach = reattachTick,
-  evict = evictToTrash, codeSha, snapshot, log = console.error, warmGate = {}, statusFeed = feedPath() } = {}) {
+  evict = evictToTrash, codeSha, snapshot, log = console.error, warmGate = {}, statusFeed = feedPath(),
+  sweepLanes = () => sweepCoronerLeases(ROOT, sourceRoot) } = {}) {
   config = { ...NIGHTLY_DEFAULTS, ...config };
   mkdirSync(store.dir, { recursive: true });
   const { records, corrupt = [] } = store.list();
@@ -119,10 +118,18 @@ export async function runNightlyCoronerJob({ now, config, settings, dir, env = p
   }
   if (!clocks.has(store.dir)) clocks.set(store.dir, createTickClock());
   const gate = createWarmGate({ jobsDir: store.dir, sourceRoot, ...warmGate });
-  await reattach({ store, kinds: HEALTH_WATCH_JOB_KINDS, maxConcurrent: 1, clock: clocks.get(store.dir),
+  const pass = await reattach({ store, kinds: HEALTH_WATCH_JOB_KINDS, maxConcurrent: 1, clock: clocks.get(store.dir),
     deadlineAt: (r) => coronerDeadline(r.input.night, r.input.nightly?.deadlineEt ?? config.deadlineEt),
     backoffBaseMs: config.retryBackoffMin * 60000,
     snapshot: snapshot ?? { repoDir: sourceRoot }, log, launch: gate.launch });
+  // A job just failed (a live child is stopped first) and no coroner attempt is queued or running, so a coroner
+  // lease still held — its child SIGKILLed or crashed before its own release — is an orphan: hand it back now.
+  // A requeued attempt sweeps for itself before it acquires.
+  const isCoroner = (r) => r?.job.kind === HEALTH_NIGHTLY_CORONER_KIND.kind;
+  if ((pass?.actions ?? []).some((a) => a.action === 'fail' && isCoroner(store.read(a.id)))
+    && !store.list().records.some((r) => isCoroner(r) && !TERMINAL_JOB_STATUSES.includes(r.job.status))) {
+    try { await sweepLanes(); } catch (e) { log(`nightly-coroner lane sweep: ${e.message}`); }
+  }
   const current = store.list().records;
   try { evict({ jobsDir: store.dir, referenced: current.filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status)).flatMap((r) => r.job.snapshotKeys ?? []) }); }
   catch (e) { log(`nightly-coroner eviction: ${e.message}`); }
@@ -143,15 +150,41 @@ function atomicWrite(path, text) {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.${process.pid}.tmp`; writeFileSync(tmp, text); renameSync(tmp, path);
 }
-const command = async (args, cwd, { signal } = {}) => (await exec(process.execPath, args, {
-  cwd, encoding: 'utf8', timeout: 30 * 60000, maxBuffer: 32 * 1024 * 1024, signal,
-})).stdout;
+// A stop's budget, inside the kind's stopGraceMs (45s): the aborted child gets CHILD_STOP_GRACE_MS to exit, then
+// the lane release (or orphan sweep) gets RELEASE_TIMEOUT_MS, so neither is cut off by the daemon's SIGKILL.
+export const CHILD_STOP_GRACE_MS = 10_000;
+export const RELEASE_TIMEOUT_MS = 30_000;
+// Every coroner lease carries this session, so a lease whose holder slug was never learned (an acquire killed
+// mid-way, a child SIGKILLed) can still be released. One coroner job runs at a time, so any such lease seen
+// when no attempt is live is an orphan.
+export const CORONER_LANE_SESSION = 'nightly-coroner';
+const command = (args, cwd, { signal, timeout = 30 * 60000 } = {}) => new Promise((resolve, reject) => {
+  if (signal?.aborted) { reject(signal.reason); return; }
+  let exited = false;
+  const child = execFile(process.execPath, args, { cwd, encoding: 'utf8', timeout, maxBuffer: 32 * 1024 * 1024 }, (e, stdout) => {
+    signal?.removeEventListener('abort', onAbort);
+    if (!signal?.aborted) { if (e) reject(e); else resolve(stdout); }
+  });
+  child.once('exit', () => { exited = true; });
+  // On a stop, reject only once the child has EXITED, so a lane release never races a live extractor.
+  function onAbort() {
+    if (exited) { reject(signal.reason); return; }
+    const hard = setTimeout(() => child.kill('SIGKILL'), CHILD_STOP_GRACE_MS);
+    child.once('exit', () => { clearTimeout(hard); reject(signal.reason); });
+    child.kill('SIGTERM');
+  }
+  signal?.addEventListener('abort', onAbort, { once: true });
+});
+const sweepCoronerLeases = (root, sourceRoot, run = command) => run([join(root, 'scripts/lane-pool.mjs'), 'release', '--all-pools',
+  `--session=${CORONER_LANE_SESSION}`, `--repo=${sourceRoot}`], sourceRoot, { timeout: RELEASE_TIMEOUT_MS });
 
 /** `signal` aborts the acquire and extractor subprocesses (a stop); the lane release is never given it. */
 export async function extractNightlyCoroner({ night, until, dir, settings, nightly = NIGHTLY_DEFAULTS, sourceRoot = ROOT }, {
   root = ROOT, home = handoffHome(), statusFeed = feedPath(), run = command, signal,
-  acquire = async () => JSON.parse(await run([join(root, 'scripts/lane-pool.mjs'), 'acquire', '--purpose=nightly-coroner', `--wait-ms=${positiveInt(nightly.laneWaitMs) ? nightly.laneWaitMs : NIGHTLY_DEFAULTS.laneWaitMs}`, `--repo=${sourceRoot}`, '--json'], sourceRoot, { signal })),
-  release = async (lane) => run([join(root, 'scripts/lane-pool.mjs'), 'release', `--lane=${lane.lane}`, `--session=${lane.holder}`, `--repo=${sourceRoot}`], sourceRoot),
+  acquire = async () => JSON.parse(await run([join(root, 'scripts/lane-pool.mjs'), 'acquire', '--purpose=nightly-coroner', `--session=${CORONER_LANE_SESSION}`, `--wait-ms=${positiveInt(nightly.laneWaitMs) ? nightly.laneWaitMs : NIGHTLY_DEFAULTS.laneWaitMs}`, `--repo=${sourceRoot}`, '--json'], sourceRoot, { signal })),
+  release = async (lane) => run([join(root, 'scripts/lane-pool.mjs'), 'release', `--lane=${lane.lane}`, `--session=${lane.holder}`, `--repo=${sourceRoot}`], sourceRoot,
+    signal?.aborted ? { timeout: RELEASE_TIMEOUT_MS } : {}),
+  sweep = async () => sweepCoronerLeases(root, sourceRoot, run),
 } = {}) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(night)) throw new Error('invalid coroner night');
   const cursorPath = join(dir, 'nightly-coroner-cursor.json');
@@ -167,8 +200,16 @@ export async function extractNightlyCoroner({ night, until, dir, settings, night
     window = JSON.parse(receipt[1]);
   } else {
     signal?.throwIfAborted();
-    const lane = await acquire();
-    if (!lane?.path || !lane?.holder || !Number.isInteger(lane.lane)) throw new Error('nightly-coroner: no lane acquired');
+    await sweep().catch(() => {}); // a lease left by an earlier attempt that was killed outright; acquire reports a broken pool
+    let lane;
+    try {
+      lane = await acquire();
+      if (!lane?.path || !lane?.holder || !Number.isInteger(lane.lane)) throw new Error('nightly-coroner: no lane acquired');
+    } catch (e) {
+      // A killed or failed acquire may already have claimed a lane it never reported: release it by session.
+      await sweep().catch(() => {});
+      throw e;
+    }
     try {
       signal?.throwIfAborted();
       // The extractor imports coroner-rounds.mjs itself; --no-save leaves cursor publication to this job.

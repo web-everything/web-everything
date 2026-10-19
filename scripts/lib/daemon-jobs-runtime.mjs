@@ -298,12 +298,17 @@ export async function stopHandle(handle, {
       try { kill(-pid, sig); } catch { kill(pid, sig); }
     } catch { /* raced its own exit */ }
   };
+  // Once the job pid is gone, SIGKILL whatever is left of its group (a grandchild the job did not wait for).
+  // While any member lives the group id stays reserved, so it cannot name a newer process.
+  const sweepGroup = () => { try { kill(-pid, 0); kill(-pid, 'SIGKILL'); } catch { /* no group left */ } };
   if (probe(handle) !== 'alive') return { gone: true, signal: null };
   send('SIGTERM');
   send('SIGCONT');
-  if (await waitGone(termGraceMs)) return { gone: true, signal: 'SIGTERM' };
+  if (await waitGone(termGraceMs)) { sweepGroup(); return { gone: true, signal: 'SIGTERM' }; }
   send('SIGKILL');
-  return { gone: await waitGone(killGraceMs), signal: 'SIGKILL' };
+  const gone = await waitGone(killGraceMs);
+  if (gone) sweepGroup();
+  return { gone, signal: 'SIGKILL' };
 }
 
 /**
