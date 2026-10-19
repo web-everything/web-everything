@@ -42,13 +42,14 @@ export const EMPTY_BLOB_OID = 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391';
  * The canonical git runner. `spawnSync` (NOT execFileSync) so a non-zero exit — `merge-tree` on conflict is
  * exit 1, expected — is RETURNED, not thrown.
  *   `opts.env`      merged over `process.env` (carries `GIT_INDEX_FILE` for the temp-index pattern).
+ *   `opts.inheritEnv` false uses the exact supplied environment (credential-pinned recovery pushes).
  *   `opts.input`    stdin — required by `git hash-object --stdin`. Dropping this is exactly #2923.
  *   `opts.cwd`      run in a SIBLING clone instead of `process.cwd()` (#2263).
  *   `opts.encoding` `'buffer'` returns `stdout` as raw bytes (never utf8-decoded) — required to read blob
  *                   content byte-exact so non-UTF-8 blobs are detected, not lossily coerced to U+FFFD.
  */
-export function gitRun(cmd, args, { env, input, cwd, encoding = 'utf8' } = {}) {
-  const r = spawnSync(cmd, args, { encoding, input, env: env ? { ...process.env, ...env } : process.env, ...(cwd ? { cwd } : {}) });
+export function gitRun(cmd, args, { env, input, cwd, encoding = 'utf8', inheritEnv = true } = {}) {
+  const r = spawnSync(cmd, args, { encoding, input, env: inheritEnv ? (env ? { ...process.env, ...env } : process.env) : env, ...(cwd ? { cwd } : {}) });
   const empty = encoding === 'buffer' ? Buffer.alloc(0) : '';
   return { status: r.status == null ? 1 : r.status, stdout: r.stdout ?? empty, stderr: r.stderr == null ? '' : String(r.stderr) };
 }

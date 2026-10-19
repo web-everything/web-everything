@@ -161,7 +161,7 @@ export function planReattach(record, state, { kindDef } = {}) {
   const why = stopFirst ? 'heartbeat stale on a live pid' : 'handle dead';
   if (!kindDef) return { type: 'fail', stopFirst, reason: `${why}; kind ${job.kind} is not declared by this daemon` };
   if (job.attempts >= job.maxAttempts) {
-    return { type: 'fail', stopFirst, reason: `${why}; ${job.attempts}/${job.maxAttempts} attempts used` };
+    return { type: 'fail', stopFirst, reason: `${why}; ${job.attempts}/${job.maxAttempts} attempts used; last error: ${job.error ?? 'unknown'}` };
   }
   return { type: 'requeue', stopFirst, reason: why, resume: kindDef.resumable };
 }
