@@ -48,7 +48,7 @@ One line per class: either the handling, or `n/a: <why>`.
 ## Also raised by
 
 - Also raised by web-everything/web-everything#4806 (finding 2: `we:backlog/4425-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md:1` — A PR lint rule or check:standards gate that requires all backlog cards to contain explicit Risks and Test plan headings before they can be merged.)
-
+- Also raised by web-everything/web-everything#5580 (finding 3: `we:backlog/5961-labels-a-known-labels-cache-instead-of-label-create-before-e.md:60` — Card lint for presence of Risks heading when review mandate requires it.)
 ## Also raised by
 
 - Also raised by web-everything/web-everything#4810 (finding 1: `we:backlog/5767-every-daemon-tick-is-schedule-only-async-job-model.md` — A lint rule enforcing the presence of 'Risks' and 'Test plan' headings in backlog cards.)

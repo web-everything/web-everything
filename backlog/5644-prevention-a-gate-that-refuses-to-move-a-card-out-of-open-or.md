@@ -41,3 +41,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5575 (finding 1: `we:backlog/6288-prevention-add-a-check-backlog-rule-that-every-scope-entry-a.md:15` — A check-backlog gate that refuses to move a card from open to active while any TODO placeholder remains in Acceptance, Non-goals or Edge cases. Also have the filer seed A1 with the specific rule text.) · key `approval-prevention-key:web-everything/web-everything#5575@5a4cecb5428a264d8dee52c30ebce7776ec7d37a`

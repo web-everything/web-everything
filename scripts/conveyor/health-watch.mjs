@@ -110,7 +110,7 @@ import { readSeatCapUsage } from '../operations/review-extra-seats.mjs';
 import { runSessionWatchdogPass, resolveSessionWatchdogConfig } from './session-watchdog.mjs';
 import { runGhProbeJobs, resolveHealthJobSwitches, GH_GROUP_PROBE_NAMES } from './health-watch-job.mjs';
 import { runPrSweepJob, resolvePrSweepSettings, prSweepTickAllowed } from './pr-sweep-job.mjs';
-import { runNightlyCoronerJob, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed } from './nightly-coroner-job.mjs';
+import { runNightlyCoronerJob, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed, publishCoronerFailure, coronerNightDue } from './nightly-coroner-job.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const BOOTSTRAP_TAIL_BYTES = 512 * 1024;
@@ -1130,12 +1130,23 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
 
   const coronerSettings = resolveNightlyCoronerSettings({ config });
   if (nightlyCoronerTickAllowed(flags, coronerSettings.value)) {
-    await attempt('nightlyCoronerJob', async () => {
+    const coroner = await attempt('nightlyCoronerJob', async () => {
       const out = await (deps.runNightlyCoronerJob ?? runNightlyCoronerJob)({ now, config: coronerSettings.value, settings: coronerSettings, dir });
-      const errors = [...coronerSettings.errors, ...(out.failures ?? [])];
+      // A terminal job failure already has its own event and health subject. Only supervisor/config
+      // errors count toward the probe streak; reading a failed job successfully is a healthy probe.
+      const errors = coronerSettings.errors;
       if (errors.length) probeErrors.nightlyCoronerJob = scrubText(errors.join('; '));
       return out;
     });
+    probes.nightlyCoronerStatus = { alerts: coroner?.alerts ?? [], threshold: coronerSettings.value.alertAfterProbeFailures };
+    const count = probeErrors.nightlyCoronerJob ? (prev.probeErrors?.nightlyCoronerJob?.count ?? 0) + 1 : 0;
+    if (count >= coronerSettings.value.alertAfterProbeFailures) {
+      await attempt('nightlyCoronerAlert', () => (deps.publishCoronerFailure ?? publishCoronerFailure)({
+        id: `nightly-coroner-probe-${coronerNightDue(now)}`, error: probeErrors.nightlyCoronerJob,
+        attempts: coroner?.alerts?.[0]?.attempts ?? 'unknown', maxAttempts: coronerSettings.value.attempts,
+        reason: `nightlyCoronerJob probe failed ${count} consecutive times`,
+      }));
+    }
   }
 
   const logs = attempt('daemonLogs', () => probeDaemonLogs(logsDir, prev.cursors || {}));

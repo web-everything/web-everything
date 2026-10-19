@@ -17,7 +17,9 @@ import { mandatoryReferralState, readReferralRecords } from '../../lib/jury-core
 import { rulingNeeded } from '../../lib/ruling-ledger.mjs';
 import { renderAdvisoryNote } from '../../operations/review-pr.mjs';
 import { enrichPrsWithReferralHolds } from '../review-referral-hold.mjs';
-import { planReconcile } from '../reconcile-core.mjs';
+import { planReconcile as planReconcileWithTiming } from '../reconcile-core.mjs';
+// This historical fixture exercises the serial policy; new defaults have their own timing suite.
+const planReconcile = options => planReconcileWithTiming({ reviewTiming: { startAfter: 'ci-green' }, fixTiming: { joinCiAndReview: false }, ...options });
 import { explainPendingNotDispatched } from '../../../skills-src/conveyor/review-daemon.mjs';
 import { planRulingFollowUp } from '../../operations/record-referral-ruling.mjs';
 

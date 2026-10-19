@@ -26,3 +26,4 @@ Hint: a card that loosens a refusal needs two Must lines — what happens on err
 ## Also raised by
 
 - Also raised by web-everything/web-everything#4811 (finding 1: `we:backlog/5786-prevention-a-checklist-or-review-bot-that-cross-references-e.md:4` — Have the approval-time prevention filer resolve each cited we:backlog/x… slug to its current numbered filename or drop paths that don't exist before writing scope: . Add a check:standards rule that every scope: entry of a backlog card must exist.)
+- Also raised by web-everything/web-everything#5543 (finding 1: `we:backlog/6262-prevention-card-lint-plus-review-lens-when-prose-enumerates.md:8` — A check:standards rule that every scope path in a backlog card's frontmatter resolves to an existing file. The filer could also normalise scope to the numbered filename.) · key `approval-prevention-key:web-everything/web-everything#5543@878c3257f75a55a056c40abac45ba533c57d23eb`

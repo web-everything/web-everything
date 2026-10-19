@@ -142,23 +142,24 @@ const MAX_TRANSCRIPT_FILES = Number(process.env.WE_LANE_WHOIS_TRANSCRIPT_MAX_FIL
  * @param {string} root
  * @returns {string[]}
  */
-export function recentTranscriptFiles(root, { maxAgeMs = MAX_TRANSCRIPT_AGE_MS, maxFiles = MAX_TRANSCRIPT_FILES, nowMs = Date.now() } = {}) {
-  if (!existsSync(root)) return [];
+export function recentTranscriptFiles(root, { maxAgeMs = MAX_TRANSCRIPT_AGE_MS, maxFiles = MAX_TRANSCRIPT_FILES, nowMs = Date.now(), strict = false } = {}) {
+  if (!existsSync(root)) { if (strict) throw Error('transcript root unavailable'); return []; }
   const cutoff = nowMs - maxAgeMs;
   const found = [];
   const walk = (dir) => {
     let entries;
-    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch (e) { if (strict) throw e; return; }
     for (const entry of entries) {
       const full = join(dir, entry.name);
       if (entry.isDirectory()) { walk(full); continue; }
       if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
       let mtimeMs;
-      try { mtimeMs = statSync(full).mtimeMs; } catch { continue; }
+      try { mtimeMs = statSync(full).mtimeMs; } catch (e) { if (strict) throw e; continue; }
       if (mtimeMs >= cutoff) found.push({ path: full, mtimeMs });
     }
   };
   walk(root);
+  if (strict && found.length > maxFiles) throw Error('transcript file list truncated');
   found.sort((a, b) => b.mtimeMs - a.mtimeMs);
   return found.slice(0, maxFiles).map((f) => f.path);
 }
@@ -192,7 +193,7 @@ export function recentTranscriptFiles(root, { maxAgeMs = MAX_TRANSCRIPT_AGE_MS, 
  * @param {string[]} files - explicit file list (from {@link recentTranscriptFiles}), never a directory to walk.
  * @param {string[]} needles - absolute lane paths, fed as literal (never regex) patterns.
  */
-function grepMatchingLines(files, needles, { exec = execFileSync } = {}) {
+function grepMatchingLines(files, needles, { exec = execFileSync, strict = false } = {}) {
   if (!needles.length || !files.length) return [];
   let patternDir;
   let patternFile;
@@ -200,7 +201,8 @@ function grepMatchingLines(files, needles, { exec = execFileSync } = {}) {
     patternDir = mkdtempSync(join(tmpdir(), 'lane-whois-patterns-'));
     patternFile = join(patternDir, 'lanes.txt');
     writeFileSync(patternFile, `${needles.join('\n')}\n`, 'utf8');
-  } catch {
+  } catch (e) {
+    if (strict) throw e;
     return []; // can't even stage the pattern file (e.g. a read-only/full tmp) — degrade, never throw
   }
   try {
@@ -211,11 +213,14 @@ function grepMatchingLines(files, needles, { exec = execFileSync } = {}) {
     try {
       const out = exec('rg', ['--no-config', '--no-filename', '--no-line-number', '-F', '-f', patternFile, ...files], execOpts);
       return out.split('\n').filter(Boolean);
-    } catch {
+    } catch (e) {
+      if (strict && e.status === 1 && !e.signal && !e.code) return [];
+      if (strict && e.code !== 'ENOENT') throw e;
       try {
         const out = exec('grep', ['-hF', '-f', patternFile, ...files], execOpts);
         return out.split('\n').filter(Boolean);
-      } catch {
+      } catch (e) {
+        if (strict && !(e.status === 1 && !e.signal && !e.code)) throw e;
         return []; // no matches, a timeout, or neither binary present — all degrade the same way
       }
     }
@@ -234,12 +239,12 @@ function grepMatchingLines(files, needles, { exec = execFileSync } = {}) {
  * @param {Record<string,string>} lanePaths - laneKey -> absolute lane dir.
  * @returns {Map<string, Array<{ts:?string, sessionId:string, tool:string, path:?string}>>}
  */
-export function scanLaneTranscripts(root, lanePaths, { exec = execFileSync, listFiles = recentTranscriptFiles } = {}) {
+export function scanLaneTranscripts(root, lanePaths, { exec = execFileSync, listFiles = recentTranscriptFiles, strict = false } = {}) {
   const keys = Object.keys(lanePaths);
   const result = new Map(keys.map((k) => [k, []]));
   if (!keys.length) return result;
-  const files = listFiles(root);
-  const lines = grepMatchingLines(files, Object.values(lanePaths), { exec });
+  const files = listFiles(root, strict ? { strict: true, maxAgeMs: Infinity } : {});
+  const lines = grepMatchingLines(files, Object.values(lanePaths), { exec, strict });
   for (const line of lines) {
     for (const k of keys) {
       if (!line.includes(lanePaths[k])) continue;

@@ -299,7 +299,7 @@ describe('decideSetLabel — rearm (#2644, folded in from the conveyor decideRea
     // #2832 — re-arm applies review:pending (a hold), so ready-to-merge is stripped in the same swap. #2811 —
     // the remove set now unconditionally names `accepted` too (narrowed to what the PR actually carries by
     // `presentRemoveLabels`), so the SAME swap also covers a stale-accepted re-arm with no second code path.
-    expect(d.removeLabels).toEqual([REVIEW_LABELS.changes, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL]);
+    expect(d.removeLabels).toEqual([REVIEW_LABELS.changes, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL, 'red-team:pending', 'red-team:clear', 'red-team:blocked']);
     expect(d.keepsHuman).toBe(false);
   });
 
@@ -307,7 +307,7 @@ describe('decideSetLabel — rearm (#2644, folded in from the conveyor decideRea
     const d = decideSetLabel({ to: 'rearm', currentLabels: humanChanges });
     expect(d.allowed).toBe(true);
     expect(d.addLabel).not.toBe(REVIEW_LABELS.accepted);
-    expect(d.removeLabels).toEqual([REVIEW_LABELS.changes, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL]);
+    expect(d.removeLabels).toEqual([REVIEW_LABELS.changes, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL, 'red-team:pending', 'red-team:clear', 'red-team:blocked']);
     expect(d.removeLabels).not.toContain(REVIEW_LABELS.human);
     expect(d.keepsHuman).toBe(true);
   });
@@ -358,7 +358,7 @@ describe('decideSetLabel — rearm (#2644, folded in from the conveyor decideRea
     const d = decideSetLabel({ to: 'rearm', currentLabels: accepted });
     expect(d.allowed).toBe(true);
     expect(d.addLabel).toBe(REVIEW_LABELS.pending);
-    expect(d.removeLabels).toEqual([REVIEW_LABELS.changes, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL]);
+    expect(d.removeLabels).toEqual([REVIEW_LABELS.changes, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL, 'red-team:pending', 'red-team:clear', 'red-team:blocked']);
     expect(presentRemoveLabels(d.removeLabels, accepted)).toEqual(
       expect.arrayContaining([REVIEW_LABELS.accepted, READY_TO_MERGE_LABEL]),
     );
@@ -3944,7 +3944,7 @@ describe('xe8y12n missing-only rearm boundary', () => {
     expect(result.removeLabels).toEqual(expect.arrayContaining(['ready-to-merge', 'redteam:accepted']));
   });
   it.each([['ready-to-merge'], [{ name: 'ready-to-merge' }, { name: 'checking' }]].map(labels => [labels]))('preserves the producer merge clearance: refuses %j', labels => {
-    const result = decideSetLabel({ to: 'rearm', requireLive: 'missing', currentLabels: labels });
+    const result = decideSetLabel({ to: 'rearm', requireLive: 'missing', currentLabels: labels, acceptanceStillCoversHead: true });
     expect(result.allowed).toBe(false);
     expect(result.reason).toContain('ready-to-merge');
   });
@@ -4093,5 +4093,15 @@ describe('#5649 — approval rows at the label home', () => {
       expect(r.exitCode).toBe(0);
       expect(s.seen).toEqual([]);
     }
+  });
+});
+
+describe('new-head rearm merge clearance', () => {
+  it.each(['missing', 'accepted'])('removes readiness and stale status for %s rearm', requireLive => {
+    const currentLabels = ['ready-to-merge', 'red-team:clear', ...(requireLive === 'accepted' ? ['review:accepted'] : [])];
+    const plan = decideSetLabel({ to: 'rearm', requireLive, currentLabels, acceptanceStillCoversHead: false });
+    expect(plan.allowed).toBe(true);
+    expect(plan.addLabel).toBe('review:pending');
+    expect(plan.removeLabels).toEqual(expect.arrayContaining(['ready-to-merge', 'red-team:clear']));
   });
 });

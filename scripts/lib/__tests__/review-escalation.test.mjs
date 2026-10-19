@@ -1,3 +1,4 @@
+import { RED_TEAM_STATUS_LABELS } from '../red-team-status-label-meta.mjs';
 /**
  * @file review-escalation.test.mjs — proof of the #2171 deterministic drain review-escalation rubric: the
  *   SCORER (which signals escalate), the COUPLE rule (strictest member wins), and the non-blocking REVIEW
@@ -1929,7 +1930,7 @@ describe('shouldApplyReviewLabel — #2307 the shared no-double-apply gate (prod
 
 describe('REVIEW_LABEL_META — single source of truth for provisioning (#2279)', () => {
   it('carries valid color + description for EVERY REVIEW_LABELS value (no label mints with a placeholder)', () => {
-    const names = Object.values(REVIEW_LABELS);
+    const names = [...Object.values(REVIEW_LABELS), ...RED_TEAM_STATUS_LABELS];
     // exact 1:1 coverage — no label missing (the review:human gap #2279 fixed) and no orphan meta key
     expect(new Set(Object.keys(REVIEW_LABEL_META))).toEqual(new Set(names));
     for (const name of names) {
