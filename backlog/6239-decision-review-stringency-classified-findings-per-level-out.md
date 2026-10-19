@@ -30,8 +30,12 @@ The prepared text below is kept as the lineage; where it differs from this secti
   ruling falls back to (b), kind `task` plus debt frontmatter fields.
 - **Always-block rows** are accepted as proposed.
 - **Ratified invariants retained.** Each level inherits every block below it. Reckless or inadvertent debt
-  blocks regardless of cell or confidence. Low confidence on an always-block class triggers a second check
-  and stays block pending it. Overdue expedite counts as debt due now at the current level and blocks a move;
+  cannot be admitted as ordinary deferred debt; this does not impose a quadrant on other outcomes. Low
+  confidence on an always-block class triggers a second check and stays block pending it. Confirmed keeps
+  block; verified not-real through the authenticated ruling path closes only that finding, never downgrades
+  it to advisory. Failure, unavailable, inconclusive, timeout, malformed, stale, mismatched or forged results
+  retain block. Results bind repository/PR/head/finding and classification/settings revision (slice 2 A12).
+  Overdue expedite counts as debt due now at the current level and blocks a move without a quadrant assessment;
   unpaid debt resurfaces after 45 days and never expires silently. Only the operator changes effective settings.
 
 **Security handoff clarification (advisory repair, 2026-10-17).** The implementation must make these existing
@@ -44,8 +48,8 @@ with typed provenance kept separately, never interpolated PR-derived prose. Thes
 in the canonical statute and slices 2 A8–A12, 3 A6–A10 and 5 A5, not features delivered by this decision PR.
 
 **Coverage handoff clarification (latest advisory repair, 2026-10-17).** Statute items 8–10 spell out wire
-domains (severity low/medium/high/critical; confidence low/medium/high, exact low token; required four-value
-debtQuadrant), security's severity-partitioned key, ambiguous path/pattern and same-kind rule conflicts
+domains (severity low/medium/high/critical; confidence low/medium/high, exact low token; four-value
+debtQuadrant required only for ordinary debt admission), security's severity-partitioned key, ambiguous path/pattern and same-kind rule conflicts
 (block before the cap), read-side cascade value/source/revision logging, repeated staleness baselines and
 repository/class feed aggregation. Expedite starts at ruling time; staleness starts at openedAt and repeats
 45 elapsed days after each successful surfacing. The register retains the quadrant and trusted clock fields.
@@ -53,6 +57,15 @@ Protected base code/policy, PR-job credential isolation and bounded ingress have
 owners in slice 2 A15–A16, slice 3 A11, slice 4 A6 and slice 5 A8. Prevention tooling for every newly identified
 gap is owed by 6235 A6–A12; A5/A6 also cover missing/malformed quadrant. These clarify the implementation
 handoff, without changing ratified cell outcomes or claiming implementation delivery.
+
+**Advisory handoff repair (2026-10-18).** Slice 2 A17 pins all ratified initial settings as independent literals,
+including current level internal-delivery and lessons enabled true. A12 now declares every second-check
+result, including failure/timeout. Debt admission applies only to an effective debt outcome after the
+confidence cap: the accountable debt owner supplies the deferral assessment/rationale and the authenticated
+operator confirms it, rather than a reviewer guessing intent for every defect. A5/A18 prove expedite and
+advisory need no quadrant and ordinary debt remains reachable. Verified overdue expedite remains due now
+without that assessment (slice 3 A2/A8). Register/gate injected display-text fixtures are slice 3 A12;
+prevention obligations for these four gaps are recorded in 6235 A3/A6/A7. No runtime implementation is claimed.
 
 **Amended table** (order: internal delivery, dogfood, public preview, public release). It replaces the
 "The table" section below for the rows named here; all other rows stand as proposed.
@@ -250,8 +263,9 @@ The change spans four existing surfaces. None of them knows about release levels
   are data: expedite deadline 72 hours; debt has no calendar deadline (its due point is a level), with a
   45-day staleness re-surface so open debt cannot sit unseen. No evidence in our record sizes either number, so
   the first re-count after build should set them.
-- **Careless debt is never accepted.** Only prudent-deliberate debt (Fowler) may be recorded. A finding that is
-  reckless or inadvertent is a block regardless of cell.
+- **Careless debt is never accepted.** Only prudent-deliberate ordinary deferred debt (Fowler) may be
+  recorded. Reject reckless or inadvertent debt admission; block, expedite and advisory findings do not
+  require a quadrant. The assessment concerns accepting a deferral, not guessing the original defect's intent.
 - **Level gate.** The move up a level is blocked while debt due at that level is open.
 - **Plateau debt panel.** A read view over the debt items. Build last.
 - **Build order.** Closed class list, then settings table, then debt register, then plateau panel.
@@ -364,7 +378,7 @@ is owned by the still-open epic and slices listed below.
   in [epic 6236](/backlog/6236-we-review-stringency-build-classed-findings-per-level-outcom/). This resolved
   decision delivers the design handoff; it does not claim a shipped settings validator.
 - [A2] **Inspection** — trace `decision-acceptance-owners` maps class validation to slice 1 A1–A3; settings schema,
-  monotonicity and ruling failures to slice 2 A1–A16; debt lifecycle, authority and provenance to slice 3 A1–A11;
+  monotonicity and ruling failures to slice 2 A1–A18; debt lifecycle, authority and provenance to slice 3 A1–A12;
   panel safety to slice 4 A1–A6; advisory recording/lessons to slice 5 A1–A8; live before/after and recount proof
   to epic A3–A4. Those cards remain open until their executable tests and evidence are delivered.
 
@@ -372,7 +386,9 @@ is owned by the still-open epic and slices listed below.
 
 A stricter level could accidentally relax a block (slice 2 A6). Missing or injected reviewer fields could become
 advisory (slice 2 A8–A9). Forged authority or mutable debt fields could bypass the gate (slice 2 A10, slice 3
-A6–A10). Advisory prose could become stored prompt injection (slice 5 A5). Fixture success alone cannot show
+A6–A10). Unpinned defaults or a pending-only second-check contract could change behaviour (slice 2 A12/A17),
+and universal quadrant checks could collapse non-block outcomes (slice 2 A5/A18). Debt display prose could
+become policy (slice 3 A12); advisory prose could become stored prompt injection (slice 5 A5). Fixture success alone cannot show
 delivery impact; epic A3–A4 require a live PR and fresh-window measurement. This PR rules and specifies those
 checks; the implementation remains owed by the open epic and slices.
 
@@ -391,9 +407,11 @@ Risks and Test plan sections assigning all acceptance cases to its planned file.
 |---|---|---|
 | Closed classes and row selection | `we:scripts/__tests__/review-stringency-classes.test.mjs`; `class-mapping-complete`, `unknown-class-fails-closed` | Pin exact tokens and unique row mappings; invalid input refuses. |
 | Relaxed levels / wrong table cell | `we:scripts/__tests__/review-stringency-ruling.test.mjs`; `monotonic-levels`, `ratified-table-cells`, `override-precedence` | Reject relaxed blocks and conflicting rules; pin every class/severity/level outcome, including both security rows. |
-| Malformed reviewer fields / missing provenance | `we:scripts/__tests__/review-stringency-ruling.test.mjs`; `malformed-finding-blocks`, `unreadable-table-blocks`, `cell-cascade-source-logged` | Missing/invalid quadrant and other fields block; each consumed cell/scalar persists its winning cascade source/revision. |
+| Malformed reviewer fields / missing provenance | `we:scripts/__tests__/review-stringency-ruling.test.mjs`; `malformed-finding-blocks`, `unreadable-table-blocks`, `cell-cascade-source-logged` | Missing/invalid consumed fields block; quadrant validation is conditional on ordinary debt admission; each consumed cell/scalar persists its winning cascade source/revision. |
+| Wrong initial settings / incomplete second check / unreachable outcomes | `we:scripts/__tests__/review-stringency-ruling.test.mjs`; `ratified-initial-settings`, `always-block-second-check`, `non-block-outcomes-reachable`, `careless-debt-block` | Independently pin literal defaults; only verified not-real removes its own block; expedite/advisory need no quadrant and ordinary debt requires confirmed admission. |
 | Forged settings authority / trust-root edits / resource abuse | `we:scripts/__tests__/review-stringency-ruling.test.mjs`; `forged-settings-operator`, `allowlist-and-gate-self-protection`, `review-ingress-bounds` | Invalid approval, PR-edited roots, token access and over-limit input cannot authorize a write. |
 | Debt tampering / race / unreadable inventory | `we:scripts/__tests__/review-stringency-debt.test.mjs`; `debt-item-tamper`, `debt-approval-provenance`, `debt-register-unreadable`, `debt-gate-revision-race`, `debt-source-required` | Invalid transitions refuse and debt stays effective; no missing-quadrant admission or stale-writer bypass. |
+| Register display-text injection | `we:scripts/__tests__/review-stringency-debt.test.mjs`; `debt-display-text-inert` | Injected instructions/markup round-trip as data, cannot change policy/payment/authority, and unpaid due debt still blocks through both register representations. |
 | Missed escalation / silent staleness | `we:scripts/__tests__/review-stringency-debt.test.mjs`; `expedite-deadline-escalation`, `debt-staleness-resurface` | N+1 same-class debts aggregate; unpaid debt resurfaces at first and second threshold crossings without expiry. |
 | Panel disclosure / stale or active content / request abuse | `plateau-app:tests/debt-panel.spec.ts`; `debt-panel-untrusted-content`, `debt-panel-unavailable`, `debt-panel-read-only-scope`, `debt-panel-revision-refresh`, `debt-panel-request-bounds` | Inert content, authenticated read-only scope, unavailable indication and bounded same-origin reads. |
 | Stored lesson injection / partial output | `we:scripts/__tests__/review-stringency-lessons.test.mjs`; `lesson-content-template-only`, `lesson-input-unreadable`, `lesson-input-bounds` | PR prose never enters instructions; incomplete/over-limit input publishes nothing and advances no checkpoint. |

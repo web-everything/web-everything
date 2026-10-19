@@ -6286,7 +6286,11 @@ invariants that already win) and the deterministic-core rule.
 **The rule:**
 1. **Class source.** The reviewer tags the class from a closed list; a path or pattern rule table overrides the
    tag. Valid low reviewer confidence caps the outcome at advisory, except for always-block classes, where it
-   triggers a second check and stays block pending that check. Unknown, missing or malformed class, severity
+   triggers a second check and stays block pending that check. A confirmed result retains block; a verified
+   not-real result through the authenticated review/ruling path closes only that finding, leaving other
+   blocks effective, never converting it to advisory. Unavailable, failed, inconclusive, timeout, malformed,
+   stale, mismatched or forged results retain block for retry or human resolution. Results bind repository,
+   PR, exact head, stable finding id and classification/settings revision. Unknown, missing or malformed class, severity
    or confidence, a gap in the table, or an unreadable/incomplete finding or table is a block (fail closed),
    before any confidence cap. Class tokens are exact: case, whitespace and Unicode variants do not silently
    alias a valid class. Reviewer and PR text are data, never policy or edit authority.
@@ -6314,8 +6318,14 @@ invariants that already win) and the deterministic-core rule.
    kind-set reference; else kind `task` plus debt fields. Both representations have the same gate and write
    guards. Entries retain class, impact, severity, confidence, must-pay-before level, deadline (absent for
    ordinary debt), fix cost, interest, and source repository/PR/finding id. Unpaid debt resurfaces after 45 days
-   and never silently expires or disappears. Only prudent-deliberate debt is acceptable: reckless or
-   inadvertent debt is block regardless of cell or low confidence.
+   and never silently expires or disappears. Only prudent-deliberate ordinary deferred debt is acceptable:
+   reckless or inadvertent debt blocks the proposed admission. This restriction applies only after the
+   effective outcome is debt, not to block, expedite or advisory findings. The accountable debt owner records
+   an assessment and rationale for the deferral, confirmed by the authenticated operator through the protected
+   writer; reviewers need not infer a defect author's intent. Overdue expedite remains a mandatory due-now
+   gate obligation without that assessment, never dropped as invalid ordinary debt. Display text remains
+   data with no authority; slice 3 A12 injects instructions/markup through register reads, gate evaluation
+   and consumer handoffs and observes no policy, payment or instruction effect.
 6. **Settings.** Every cell and value is a cascade setting with its source logged. Current level: internal
    delivery. Only the operator changes the level, an invariant row, or loosens a cell. Advisory lessons:
    `advisory.lessons.enabled` (on), `.schedule` (Sunday 20:00 ET), `.recurrenceThreshold` (5 per class per
@@ -6331,16 +6341,22 @@ invariants that already win) and the deterministic-core rule.
    this is required implementation, not a claim that an agent-editable field already proves authority.
 8. **Handoff input and resolution contract.** Exact wire tokens: severity `low | medium | high | critical`
    (security high row = high/critical, lower row = low/medium); confidence `low | medium | high` (only the
-   token low triggers the cap, no numeric coercion); required `debtQuadrant` is `prudent-deliberate |
-   prudent-inadvertent | reckless-deliberate | reckless-inadvertent`. Missing/malformed quadrant blocks;
-   each reckless/inadvertent value blocks regardless of cell/confidence. Only explicit prudent-deliberate
-   may enter debt, and the register retains it. Exact class tokens and their unique row mapping belong to
+   token low triggers the cap, no numeric coercion). Debt-admission `debtQuadrant` is `prudent-deliberate |
+   prudent-inadvertent | reckless-deliberate | reckless-inadvertent`; it is not a required reviewer field.
+   Only an effective debt outcome requires it: missing/malformed or non-prudent-deliberate assessment blocks
+   ordinary admission, as does absent operator confirmation. Block, expedite and advisory do not consult it;
+   classification and the low-confidence cap run before ordinary debt admission. The register retains the
+   admitted quadrant, owner rationale and confirmation; verified overdue expedite is distinguished by source
+   ruling provenance and retains its gate obligation without a quadrant. Exact class tokens and their unique row mapping belong to
    slice 1; security adds the severity partition. Levels are `internal-delivery | dogfood | public-preview |
    public-release`; outcomes are `block | expedite | debt | advisory`. Reject case/whitespace/Unicode aliases.
    Multiple matching path/pattern rules of the same class deduplicate; different selected classes block as
    ambiguous policy before the confidence cap, including same-kind conflicts, independent of iteration order.
    Every ruling records the effective cascade value, source and revision for each consumed cell/scalar,
    using one validated snapshot; logging writes alone does not satisfy this guarantee.
+   Slice 2 A17 independently pins every ratified initial setting as a literal (internal-delivery, lessons
+   enabled true, 72 hours, 45 days, Sunday 20:00 America/Toronto, threshold 5); resolving an unspecified
+   default is insufficient. Slice 2 A18 proves expedite, ordinary debt and advisory remain reachable.
 9. **Clock and aggregation contract.** Expedite's deadline starts at persisted ruling time plus initially
    72 elapsed hours; overdue means strictly past it. Needs-you aggregates by repository/class with all item
    ids retained, including multiple overdue debts of the same class. Staleness starts at trusted `openedAt`,
@@ -6370,9 +6386,10 @@ not resolve solely because its children land. Named acceptance coverage: slice 2
 (`always-block-second-check`); slice 3 `#6237` A2 (`expedite-deadline-escalation`), A3
 (`debt-staleness-resurface`), A6–A10 (tamper, authority, source, unreadable state and revision races); slice 5
 `#6234` A2–A7 (threshold, disable flag, proposal-only promotion, template safety, scheduling and input failure).
-Additional handoff coverage: slice 2 A2/A13–A16 (all competing rule pairs, literal table cells/domains,
-read-side cascade provenance, protected roots and ingress bounds); slice 3 A2–A3/A8/A11 (N+1 aggregation,
-repeat baselines, quadrant admission and bounds); slice 4 A6 and slice 5 A8 (surface-specific bounds).
+Additional handoff coverage: slice 2 A2/A13–A18 (all competing rule pairs, literal table cells/domains and
+initial settings, read-side cascade provenance, protected roots, ingress bounds and reachable non-block
+outcomes); slice 3 A2–A3/A8/A11–A12 (N+1 aggregation, repeat baselines, ordinary-debt quadrant admission,
+bounds and inert display-text fixtures); slice 4 A6 and slice 5 A8 (surface-specific bounds).
 Each slice's Test plan and the decision's risk mapping identify repository-qualified planned test files
 as implementation destinations.
 
