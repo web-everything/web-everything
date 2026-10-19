@@ -553,6 +553,7 @@ export function createEnqueueOnEvent({
   const misses = new Map();
   const backoff = new Map();
   const lastHolds = new Map();
+  const overlapBlockers = new Map();
   let catchUpRound = 0; // successful listings, never ticks
   let pending = new Map();
   let running = null; // the serialized tick/catch-up promise
@@ -654,10 +655,33 @@ export function createEnqueueOnEvent({
             if (causes.length) { const event = { ...p, causes }; delete event.catchUp; pending.set(key, event); }
           }
         }
-        listedPrs = catchUpPrs;
         const listed = new Set(result.prs.filter(p => !p.inQueue).map(p => p.num));
         for (const num of backoff.keys()) if (!listed.has(num)) backoff.delete(num);
         for (const num of lastHolds.keys()) if (!listed.has(num)) lastHolds.delete(num);
+        for (const num of overlapBlockers.keys()) if (!listed.has(num)) overlapBlockers.delete(num);
+        if (throughput.catchUpSkipQueueOverlap && overlapBlockers.size) {
+          let depth;
+          try { depth = await readQueueDepth({ repo: localSlug }); } catch { depth = null; }
+          if (depth?.ok && Array.isArray(depth.queuedNums)) {
+            const queued = new Set(depth.queuedNums);
+            const skipped = new Map();
+            for (const num of listed) {
+              const blockers = overlapBlockers.get(num);
+              if (!blockers) continue;
+              const active = [...blockers].filter(n => queued.has(n));
+              if (active.length) skipped.set(num, active);
+              else overlapBlockers.delete(num);
+            }
+            catchUpPrs = catchUpPrs.filter(p => !skipped.has(p.num));
+            if (skipped.size) log(`enqueue-on-event: catch-up skipped ${skipped.size} PR(s): queue-file-overlap blocker still queued (${[...skipped].map(([num, blockers]) => `#${num}<-${blockers.map(n => `#${n}`).join(',')}`).join(' ')}) (drain.catchUpSkipQueueOverlap=on (${throughputSetting.sources?.catchUpSkipQueueOverlap || 'default'}))`);
+            for (const [key, p] of pending) if (p.catchUp && skipped.has(p.num)) {
+              pending = new Map(pending); pending.delete(key);
+              const causes = p.causes.filter(c => c !== 'catch-up');
+              if (causes.length) { const event = { ...p, causes }; delete event.catchUp; pending.set(key, event); }
+            }
+          }
+        }
+        listedPrs = catchUpPrs;
         const { capacity, source } = await readCapacity(s);
         catchUpRoom = Math.max(0, capacity - result.queued);
         catchUpCapacity = capacity;
@@ -772,13 +796,19 @@ export function createEnqueueOnEvent({
         const r = await runChild({ args, cwd, env: p.catchUp && throughput.catchUpSkipUnchangedHolds ? { ...env, WE_DRAIN_CATCH_UP_SNAPSHOT: '1' } : env, spawnImpl, timeoutMs: childTimeoutMs, onChild: (c) => { ownChild = c; children.add(c); } });
         children.delete(ownChild);
         const json = lastJsonLine(r.stdout);
+        const hit = rows => Array.isArray(rows) ? rows.find(x => Number(x.num) === p.num) : undefined;
+        const drainOutcome = hit(json?.enqueueOutcomes) || hit(json?.skipReasons) || hit(json?.skipped);
+        const kind = drainOutcome?.kind === 'branch-preparation' ? classifySkipReason(drainOutcome.reason)
+          : drainOutcome?.kind || classifySkipReason(drainOutcome?.reason);
+        if (throughput.catchUpSkipQueueOverlap && !r.error && !r.timedOut && kind === 'queue-file-overlap') {
+          const leading = drainOutcome.reason?.match(/^(#\d+(?:,#\d+)*) share /)?.[1];
+          const nums = leading ? leading.split(',').map(n => Number(n.slice(1))) : [];
+          if (nums.length) overlapBlockers.set(p.num, new Set(nums));
+          else overlapBlockers.delete(p.num);
+        } else overlapBlockers.delete(p.num);
         if (p.catchUp && throughput.catchUpSkipUnchangedHolds && !r.error && !r.timedOut && holdEvidence !== undefined) {
-          const hit = rows => rows?.find(x => Number(x.num) === p.num);
-          const outcome = hit(json?.enqueueOutcomes) || hit(json?.skipReasons) || hit(json?.skipped);
-          const kind = outcome?.kind === 'branch-preparation' ? classifySkipReason(outcome.reason)
-            : outcome?.kind || classifySkipReason(outcome?.reason);
           if (HOLD_KINDS.has(kind)) {
-            const overlapYield = outcome?.overlapYield || hit(json?.deferred)?.overlapYield;
+            const overlapYield = drainOutcome?.overlapYield || hit(json?.deferred)?.overlapYield;
             try {
               const evidence = await readMemoEvidence({ repo: p.repo, num: p.num, head: pr.headRefOid, overlapYield });
               lastHolds.set(p.num, { kind, overlapYield, recordedAt: now(), signature: holdSignature(pr, evidence) });

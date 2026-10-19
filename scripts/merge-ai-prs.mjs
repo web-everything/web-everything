@@ -6611,6 +6611,14 @@ async function runCli() {
         return { kind: 'review-hold', reason: 'unsatisfied review hold (review:pending/review:human/review:changes)' };
       if (numberingWithdrawalOwed(c.repo || localSlug, c.num))
         return { kind: 'numbering', reason: 'numbering re-stamp withdrawal owed' };
+      if (throughput.value.overlapFirst) {
+        const hold = mergeStrategy.queueOverlapHold(c, c.listedHeadSha || c.headSha);
+        if (hold) {
+          const [blockers, files] = hold.reason.split(' share ');
+          if (!AS_JSON) process.stderr.write(`  merge-queue file-overlap: early defer #${c.num} (shares ${files.split(', ')[0]} with queued ${blockers.split(',')[0]}) - drain.overlapFirst=on (${throughput.sources?.overlapFirst || 'default'})\n`);
+          return hold;
+        }
+      }
       return mergeStrategy.recordedHold(c, c.listedHeadSha || c.headSha);
     });
     if (throughput.value.holdFirst) {

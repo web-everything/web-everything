@@ -309,6 +309,15 @@ export function createDrainMergeStrategy({
   const enqueues = (repo) => enqueueMode && !!isLocalRepo(repo);
   const slugOf = (repo) => repo || localSlug;
 
+  const overlapCache = new Map();
+  const pickQueueOverlap = (c, candidateFiles, queue) => {
+    const overlap = queueFileOverlap({ candidateFiles,
+      queuedEntries: queue.entries.filter(entry => entry.num !== c.num),
+      includeCards: safety.value.queueFileOverlapIncludesCards ?? true });
+    const files = [...new Set(overlap.with.flatMap(entry => entry.files))].slice(0, 3);
+    return { ...overlap, reason: `${overlap.with.map(entry => `#${entry.num}`).join(',')} share ${files.join(', ')}` };
+  };
+
   return {
     policy,
     strategy: policy.strategy,
@@ -369,6 +378,21 @@ export function createDrainMergeStrategy({
         const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, env });
         return { allowed: !reason, reason, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
       } catch { return { allowed: false, reason: 'red-team evidence unreadable' }; }
+    },
+    /** Read-only overlap hint; enqueue always re-reads the queue under the land mutex. */
+    queueOverlapHold(c, headSha) {
+      if (!enqueues(c.repo)) return null;
+      const candidateFiles = c.listedFilesComplete === true ? completeListedFiles(c.listedFiles) : null;
+      if (candidateFiles === null) return null;
+      const repo = slugOf(c.repo);
+      const cached = overlapCache.get(repo);
+      const at = now();
+      const queue = cached && at >= cached.at && at - cached.at < 30_000
+        ? cached.queue : readQueueEntryFiles({ repo, exec });
+      if (queue.error) return null;
+      if (queue !== cached?.queue) overlapCache.set(repo, { at, queue });
+      const overlap = pickQueueOverlap(c, candidateFiles, queue);
+      return overlap.overlap ? { kind: 'queue-file-overlap', reason: overlap.reason, deferred: true } : null;
     },
     /** Read-only pre-check outside the land mutex, only for a recorded wait on this exact head.
      * A clear result is NOT authorization; enqueue re-reads state and runs every live gate under the mutex.
@@ -516,15 +540,13 @@ export function createDrainMergeStrategy({
         } else {
           const includeCards = safety.value.queueFileOverlapIncludesCards ?? true;
           const source = safety.sources?.queueFileOverlapIncludesCards ?? 'standard';
-          const overlap = queueFileOverlap({ candidateFiles,
-            queuedEntries: queue.entries.filter(entry => entry.num !== c.num), includeCards });
+          const overlap = pickQueueOverlap(c, candidateFiles, queue);
           if (overlap.unknown.length) say(`  merge-queue file-overlap: unknown files for ${overlap.unknown.map(num => `#${num}`).join(',')} — continuing without those entries`);
           if (overlap.overlap) {
             const first = overlap.with[0];
             say(`  merge-queue file-overlap: defer #${c.num} (shares ${first.files[0]} with queued #${first.num}) — includeCards=${includeCards} (${source})`);
-            const files = [...new Set(overlap.with.flatMap(entry => entry.files))].slice(0, 3);
             return { enqueued: false, deferred: true, kind: 'queue-file-overlap',
-              reason: `${overlap.with.map(entry => `#${entry.num}`).join(',')} share ${files.join(', ')}` };
+              reason: overlap.reason };
           }
         }
       } catch (e) { say(`  merge-queue file-overlap: read failed (${firstLine(e)}) — continuing enqueue`); }

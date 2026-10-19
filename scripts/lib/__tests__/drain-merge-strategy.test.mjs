@@ -1435,6 +1435,58 @@ describe('live queue file-overlap admission', () => {
   } } } } });
   const setup = (over = {}) => harness({ strategy: 'github-merge-queue',
     queueFacts: facts([43]), ghView: { 43: { files: [{ path: card }] } }, ...over });
+  it('pre-check shares the enqueue reason, caches only its own reads and expires after 30s', () => {
+    let time = 1_000;
+    const h = setup({ now: () => time });
+    const hold = h.s.queueOverlapHold(candidate, HEAD);
+    expect(hold).toEqual({ kind: 'queue-file-overlap', deferred: true, reason: `#43 share ${card}` });
+    expect(h.s.queueOverlapHold({ ...candidate, num: 44 }, HEAD)).toEqual(hold);
+    expect(h.calls).toHaveLength(2); // queue discovery + queued PR files, no writes
+    const result = h.s.enqueue(candidate, HEAD, { comments: stampedBy(DRAIN) });
+    expect(result).toEqual({ enqueued: false, ...hold });
+    expect(h.calls.filter(c => c.includes('files'))).toHaveLength(2); // enqueue read fresh
+    time += 30_000;
+    expect(h.s.queueOverlapHold(candidate, HEAD)).toEqual(hold);
+    expect(h.calls.filter(c => c.includes('files'))).toHaveLength(3);
+  });
+  it.each([
+    ['missing', { num: 42 }],
+    ['incomplete', { ...candidate, listedFilesComplete: false }],
+    ['capped', { ...candidate, listedFiles: Array(100).fill(card) }],
+    ['malformed', { ...candidate, listedFiles: [null] }],
+    ['other repo', { ...candidate, repo: 'other/repo' }],
+  ])('pre-check makes no reads when files or mode are unknown: %s', (_name, c) => {
+    const h = setup();
+    expect(h.s.queueOverlapHold(c, HEAD)).toBeNull();
+    expect(h.calls).toEqual([]);
+    expect(h.state()).toBeNull();
+  });
+  it('pre-check never caches queue read errors', () => {
+    const failures = [43];
+    const h = setup({ viewThrows: failures });
+    expect(h.s.queueOverlapHold(candidate, HEAD)).toBeNull();
+    expect(h.s.queueOverlapHold(candidate, HEAD)).toBeNull();
+    expect(h.calls).toHaveLength(4);
+    failures.pop();
+    expect(h.s.queueOverlapHold(candidate, HEAD)?.kind).toBe('queue-file-overlap');
+    expect(h.calls).toHaveLength(6);
+  });
+  it.each([
+    ['self excluded', { queueFacts: facts([42]), ghView: { 42: { files: [card] } } }],
+    ['cards disabled', { env: { WE_DRAIN_QUEUE_FILE_OVERLAP_INCLUDES_CARDS: 'off' } }],
+    ['disjoint', { ghView: { 43: { files: ['other'] } } }],
+    ['unknown queued files', { ghView: { 43: { files: null } } }],
+    ['direct mode', { strategy: 'drain-direct' }],
+  ])('pre-check fails open for %s', (_name, options) => {
+    const h = setup(options);
+    expect(h.s.queueOverlapHold(candidate, HEAD)).toBeNull();
+  });
+  it('pre-check also reads in dry run without any mutation', () => {
+    const h = setup({ dryRun: true });
+    expect(h.s.queueOverlapHold(candidate, HEAD)?.kind).toBe('queue-file-overlap');
+    expect(h.calls).toHaveLength(2);
+    expect(h.state()).toBeNull();
+  });
   it('defers shared cards before any enqueue mutation and reports policy source', () => {
     const h = setup();
     expect(h.s.enqueue(candidate, HEAD, { comments: stampedBy(DRAIN) })).toEqual({
