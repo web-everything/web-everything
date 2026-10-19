@@ -72,7 +72,10 @@ import { cascadePolicy } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { readBuildPrioritySettings, readBuildQueuePrioritySettings } from './build-queue.mjs';
 import { rankByDeliveryPriority, PRIORITY_CLASSES } from './delivery-priority.mjs';
-import { readMainRedPriority } from './main-red-priority.mjs';
+import { readMainRedState } from './main-red-priority.mjs';
+import { readMainFixPriority } from './merge-queue-hook.mjs';
+import { redMainSignal, resolveRedMainHoldSetting, decideRedMainHold } from './red-main-hold.mjs';
+import { readFreeze } from '../readiness/red-main-remediation.mjs';
 import { extractManifestFromBody, repoKeyFromSlug } from '../readiness/lane-manifest.mjs';
 import { parseVerdictComment } from './review-log-claims.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
@@ -491,7 +494,11 @@ export function createEnqueueOnEvent({
   cwd, localSlug, scriptRoot = () => cwd, allowed = () => true, log = (m) => process.stderr.write(`${m}\n`),
   env = process.env, now = () => Date.now(), spawnImpl = spawn, resolveSetting = () => resolveEnqueueOnEventSetting({ env }),
   readCandidates = ({ repo }) => readCatchUpCandidates({ repo, env }), readCapacity = (s) => readQueueCapacity(s),
-  readPriorities = () => ({ priority: readBuildQueuePrioritySettings({ env }), buildPriority: readBuildPrioritySettings({ env }).ids, mainFix: readMainRedPriority({ env }) }),
+  readPriorities = () => ({ priority: readBuildQueuePrioritySettings({ env }), buildPriority: readBuildPrioritySettings({ env }).ids, mainFix: readMainFixPriority({ env }) }),
+  readMainFixPr = () => readMainFixPriority({ env, now: now() }),
+  readRedMainState = () => readMainRedState({ env, now: now() }),
+  readManualFreeze = () => { const marker = readFreeze(); return marker?.frozen ? marker : null; },
+  resolveRedMainHold = () => resolveRedMainHoldSetting({ env }),
   readQueueDepth = ({ repo }) => readCatchUpQueueDepth({ repo, env }),
   readMembership = ({ repo, num }) => readMergeQueueMembership({ repo, num, env }),
   prestageCache = createPrestageCache({ env }),
@@ -592,7 +599,12 @@ export function createEnqueueOnEvent({
   }
 
   async function runDue({ catchUpOnly = false } = {}) {
-    const throughput = resolveThroughput().value;
+    const throughputSetting = resolveThroughput();
+    const throughput = throughputSetting.value;
+    const readFix = async () => { try { return await readMainFixPr(); } catch { return null; } };
+    let mainFix = await readFix();
+    const ownsFix = (num, repo = localSlug) => !!mainFix &&
+      (mainFix.repo ?? 'we') === repoKeyFromSlug(repo) && [mainFix.pr, ...(mainFix.prs || [])].includes(num);
     let s = readSetting();
     if (!await honourSetting(s)) return [];
     let catchUpLater = [].values();
@@ -626,7 +638,23 @@ export function createEnqueueOnEvent({
       if (!result.ok) log(`enqueue-on-event: catch-up could not list ready PRs (${result.error}) — retrying in ${s.catchUp.intervalMinutes} min`);
       else {
         catchUpRound++;
-        listedPrs = result.prs;
+        let catchUpPrs = result.prs;
+        if (throughput.redMainSkipCatchUp) {
+          const signal = redMainSignal({ mainRedState: await readRedMainState(), priority: mainFix,
+            manualFreeze: await readManualFreeze(), now: now(), repo: repoKeyFromSlug(localSlug) });
+          const setting = resolveRedMainHold().value;
+          const held = num => decideRedMainHold({ num, signal, setting }).hold;
+          catchUpPrs = result.prs.filter(p => !held(p.num));
+          const skipped = result.prs.length - catchUpPrs.length;
+          if (skipped) log(`enqueue-on-event: catch-up skipped ${skipped} PR(s): red-main-hold active (drain.redMainSkipCatchUp=on (${throughputSetting.sources?.redMainSkipCatchUp || 'default'}))`);
+          // Withdraw retained catch-up work too. Event work keeps its ordinary admission path.
+          for (const [key, p] of pending) if (p.catchUp && held(p.num)) {
+            pending = new Map(pending); pending.delete(key);
+            const causes = p.causes.filter(c => c !== 'catch-up');
+            if (causes.length) { const event = { ...p, causes }; delete event.catchUp; pending.set(key, event); }
+          }
+        }
+        listedPrs = catchUpPrs;
         const listed = new Set(result.prs.filter(p => !p.inQueue).map(p => p.num));
         for (const num of backoff.keys()) if (!listed.has(num)) backoff.delete(num);
         for (const num of lastHolds.keys()) if (!listed.has(num)) lastHolds.delete(num);
@@ -634,7 +662,8 @@ export function createEnqueueOnEvent({
         catchUpRoom = Math.max(0, capacity - result.queued);
         catchUpCapacity = capacity;
         const reserved = [...pending.values()].filter((p) => p.catchUp).length;
-        const plan = planCatchUp({ ...result, capacity: capacity - reserved, ...await readPriorities(), repo: localSlug, now: now(), order: s.catchUp.order, pendingNums: [...pending.values()].map((p) => p.num) });
+        const priorities = await readPriorities();
+        const plan = planCatchUp({ ...result, prs: catchUpPrs, capacity: capacity - reserved, ...priorities, mainFix: mainFix ?? priorities.mainFix, repo: localSlug, now: now(), order: s.catchUp.order, pendingNums: [...pending.values()].filter(p => p.catchUp || !ownsFix(p.num, p.repo)).map(p => p.num) });
         const nums = (ps) => ps.map((n) => `#${n}`).join(' ');
         log(`enqueue-on-event: catch-up listed ${result.prs.length} ready-to-merge PR(s), ${result.queued} in the merge queue, room ${Math.max(0, capacity - result.queued)} (capacity ${capacity} from ${source}) — ${plan.run.length ? `fast drain for ${nums(plan.run.map((p) => p.num))} (${s.catchUp.order ?? 'priority-then-first-accept'})` : 'nothing to run'}${plan.later.length ? `; later: ${nums(plan.later)}` : ''}${plan.skipped.length ? `; skipped: ${plan.skipped.map((p) => `#${p.num} ${p.reason}`).join(', ')}` : ''}`);
         for (const { num } of plan.run) queueCatchUp(num);
@@ -650,9 +679,14 @@ export function createEnqueueOnEvent({
         if (!await honourSetting(s)) break;
         if (!s.catchUp?.enabled) catchUpLater = [].values();
       }
+      mainFix = await readFix();
+      const fixPending = [...pending.values()].filter(p => ownsFix(p.num, p.repo));
+      const fixActive = [...activeNums].some(num => ownsFix(num));
+      const fixOutstanding = fixPending.length > 0 || fixActive;
       const immediate = [...pending.values()].filter(p => greenEvent(p) && staged(p));
-      const [p] = [...immediate, ...duePending(pending, { now: now(), debounceSeconds: s.debounceSeconds })]
-        .filter((p) => !activeNums.has(p.num) && !attempted.has(p.num) && (!catchUpOnly || p.catchUp) && (!p.catchUp || !batchingDeferred && catchUpRoom > 0));
+      const [p] = [...fixPending, ...immediate, ...duePending(pending, { now: now(), debounceSeconds: s.debounceSeconds })]
+        .filter((p) => !activeNums.has(p.num) && !attempted.has(p.num) && (!catchUpOnly || p.catchUp || ownsFix(p.num, p.repo)) &&
+          (!p.catchUp || !fixActive && (!fixOutstanding || ownsFix(p.num, p.repo)) && !batchingDeferred && catchUpRoom > 0));
       if (!p) { if (active.size) { await Promise.race(active.values()); continue; } break; }
       if (!p.catchUp && active.size) { await Promise.race(active.values()); continue; }
       const key = `${p.repo}#${p.num}`;
@@ -718,12 +752,19 @@ export function createEnqueueOnEvent({
           break;
         }
       }
+      // A fix event may have arrived during the live wake/depth reads above.
+      if (p.catchUp && !ownsFix(p.num, p.repo) &&
+        ([...pending.values()].some(entry => ownsFix(entry.num, entry.repo)) || [...activeNums].some(num => ownsFix(num)))) {
+        pending = new Map(pending).set(key, taken);
+        continue;
+      }
       attempted.add(p.num);
       activeNums.add(p.num);
       const startedAt = now();
       const args = fastDrainArgs({ scriptRoot: scriptRoot(), num: p.num });
       if (greenEvent(p)) args.push('--from-green-event');
       if (p.catchUp) catchUpRoom--; // keep the bound across ticks and window closures; unknown results consume room
+      if (ownsFix(p.num, p.repo)) log(`enqueue-on-event: main-fix #${p.num} first (red main)`);
       log(`${prefix} ${taken.causes.join(', ')} — running the drain's single-PR fast drain ${Math.round((startedAt - taken.lastAt) / 1000)}s after the last event`);
       const finish = async () => {
         let ownChild;

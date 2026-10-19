@@ -199,7 +199,7 @@ import { buildVerdictRecord, appendVerdict, labelVerdictOf, buildLedgerEvent, EV
 import { ensureFreshGithubAppEnv } from './lib/github-app-auth-env.mjs';
 // x2e120n — per-step pass timing ("why so slow", the resident drain daemon's history.jsonl carried only a
 // pass's TOTAL ms, no breakdown). See pass-timings.mjs's own header for the full shape/rationale.
-import { buildSkipReasons, formatSkipSummary, formatSkipReasonsLine } from './lib/drain-skip-reasons.mjs';
+import { buildSkipReasons, classifySkipReason, formatSkipSummary, formatSkipReasonsLine } from './lib/drain-skip-reasons.mjs';
 import { resolveDrainThroughput, createHoldMemo, carryReady, readCarry, writeCarry, orderCarry } from './lib/drain-throughput.mjs';
 import { numberingWithdrawalOwed } from './lib/numbering-carry.mjs';
 import { queueStatePath } from './lib/drain-merge-strategy.mjs';
@@ -4374,6 +4374,28 @@ export function ghListErrText(e) {
   return cause && !head.includes(cause) ? `${head} — gh: ${cause}` : head;
 }
 
+/** Reporting only: account for every open allowed fix, including PRs absent from the pass listing. */
+export async function reportRedMainFixSkips({ rows, fixPrs, openPrs = [], verdicts, merged, enqueueOutcomes, localSlug, readPr }) {
+  const local = r => r == null || r === localSlug;
+  const has = (xs, num) => xs.some(x => Number(x.num) === num && local(x.repo));
+  const out = [...rows];
+  for (const num of fixPrs) {
+    if (has(out, num) || has(merged, num) || has(enqueueOutcomes.filter(x => x.outcome === 'enqueued' || x.enqueued === true), num)) continue;
+    let pr = openPrs.find(p => Number(p.number) === num);
+    if (!pr) { try { pr = await readPr(num); } catch { continue; } }
+    if (!pr || (pr.state && pr.state !== 'OPEN')) continue;
+    const outcome = enqueueOutcomes.find(x => Number(x.num) === num && local(x.repo));
+    const verdict = verdicts.find(x => Number(x.num) === num && local(x.repo));
+    const labels = (pr.labels || []).map(l => typeof l === 'string' ? l : l.name);
+    const reason = outcome?.reason || (verdict?.decision !== 'merge' && verdict?.reason) ||
+      (verdict ? 'ready at pass start; the pass ended before it was reached' :
+        !labels.includes('ready-to-merge') ? 'not listed: missing ready-to-merge label' : 'not in this pass listing');
+    out.push({ num, repo: localSlug, kind: outcome?.kind || classifySkipReason(reason), reason,
+      source: outcome ? 'enqueueOutcomes' : 'redMainFix' });
+  }
+  return out;
+}
+
 /**
  * Partial success exits 0 while JSON `failed` stays populated; `ok` still means no duplicate ids.
  * A failure with no landed PRs exits 2. Duplicate ids always take precedence (exit 3).
@@ -6205,6 +6227,7 @@ async function runCli() {
   // Setting OFF: the freeze stop ran before this pass, but a freeze raised (or the setting switched OFF) since then
   // would reach no hold at all — so a manual freeze seen HERE holds every PR, the fix PR too, as the OFF stop does.
   let redMainHeld = false;
+  let allowedMainFixPrs = [];
   {
     const holdSetting = resolveRedMainHoldSetting();
     const holdOn = holdSetting.value === 'on';
@@ -6213,6 +6236,7 @@ async function runCli() {
       const sig = drainFreezeSignal({ state: freeze, mainRedState: readMainRedState(), priority: readMainRedPriority(), now: Date.now(), holdOn });
       if (sig.red) {
         redMainHeld = true;
+        allowedMainFixPrs = sig.fixPrs.filter(num => decideRedMainHold({ num, signal: sig, setting: 'on' }).fix);
         let held = 0;
         // Mode `quarantine`: hold only PRs overlapping the fix PR's files or a quarantined test's area; no live
         // quarantine entry (or an unreadable list) ⇒ every PR falls back to STOP inside decideQuarantineHold.
@@ -7299,7 +7323,12 @@ async function runCli() {
   // record. Never throws, never mutates a verdict; it runs after every merge decision of this pass is final.
   const ledgerShadow = await runLedgerShadow({ verdicts, localSlug, dryRun: DRY_RUN });
   process.stderr.write(`${formatShadowLine(ledgerShadow)}\n`);
-  const skipReasons = buildSkipReasons({ verdicts, merged, failedMerges, revalidationAborted, pendingRebased, coupleHeld, deferred, parked, enqueueOutcomes, passEnded: !DRY_RUN });
+  let skipReasons = buildSkipReasons({ verdicts, merged, failedMerges, revalidationAborted, pendingRebased, coupleHeld, deferred, parked, enqueueOutcomes, passEnded: !DRY_RUN });
+  if (redMainHeld) skipReasons = await reportRedMainFixSkips({ rows: skipReasons, fixPrs: allowedMainFixPrs,
+    openPrs: [...openPrContext.prsByRepo].filter(([repo]) => isLocalRepo(repo)).flatMap(([, prs]) => prs),
+    verdicts, merged, enqueueOutcomes, localSlug,
+    readPr: num => JSON.parse(readGh(['pr', 'view', String(num), '--repo', localSlug, '--json', 'number,state,labels'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })),
+  });
   process.stderr.write(`merge-ai-prs · pass timings: ${formatTimingsSummary(timingSteps, { total: passTotalMs, order: PASS_STEP_ORDER })} (considered ${verdicts.length}, merged ${merged.length}, ${formatSkipSummary(skipReasons)}; ${formatConcurrencySources(resolvedMergePolicy.policy)})\n`);
   // Card 122 slice 1 — logging only: the machine-readable twin of the summary above (coroner / perf-snapshot read it).
   process.stderr.write(`${formatSkipReasonsLine(skipReasons)}\n`);

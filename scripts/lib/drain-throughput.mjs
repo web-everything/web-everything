@@ -6,13 +6,14 @@ import { cascadePolicy, platformPreference, formatCascadeSourcesLine } from './p
 import { readDeclaredSettings } from './settings-files.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 
-const defaults = { holdFirst: true, catchUpSkipUnchangedHolds: true, carryOverReadyFirst: true, catchUpSkipMaxMin: 15 };
+const defaults = { redMainSkipCatchUp: true, holdFirst: true, catchUpSkipUnchangedHolds: true, carryOverReadyFirst: true, catchUpSkipMaxMin: 15 };
 export function resolveDrainThroughput({ env = process.env, file, platform, log = line => process.stderr.write(`${line}\n`) } = {}) {
   const pick = v => Object.fromEntries(Object.keys(defaults).filter(k => v?.[k] !== undefined).map(k => [k, v[k]]));
   const out = cascadePolicy('drain', pick((file ?? readDeclaredSettings().settings)?.drain), {
     standard: defaults, platform: pick(platform ?? platformPreference('drain', { env })), env,
     valid: Object.fromEntries(Object.keys(defaults).map(k => [k, k === 'catchUpSkipMaxMin' ? v => Number.isFinite(v) && v >= 0 : v => typeof v === 'boolean'])),
   });
+  if (out.sources.redMainSkipCatchUp === 'standard') out.sources.redMainSkipCatchUp = 'default';
   log(formatCascadeSourcesLine('drain', out));
   return out;
 }

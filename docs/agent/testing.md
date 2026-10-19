@@ -2108,9 +2108,14 @@ run it through heavy admission.
 ## Drain throughput scheduling
 
 `scripts/settings/drain-throughput.json` owns the default-on `drain.holdFirst`,
-`drain.catchUpSkipUnchangedHolds` and `drain.carryOverReadyFirst` switches; their resolver
+`drain.catchUpSkipUnchangedHolds`, `drain.redMainSkipCatchUp` and `drain.carryOverReadyFirst` switches; their resolver
 logs the source of each value. Early checks remember only refusals per repo/PR/head for
-the cascade. A cleared early check never authorizes a write: live admission still runs.
+the cascade. While red-main-hold is active, `drain.redMainSkipCatchUp` skips local
+non-fix catch-up work without spawning a drain; false restores the previous scheduling.
+The published main-fix PR runs before other pending work, including event-only work in
+a catch-up pass, without debounce. Its red-team request takes the first review lane.
+These priorities retain every wake, refusal, head, CI and post-accept red-team guard.
+A cleared early check never authorizes a write: live admission still runs.
 Catch-up remembers PR holds until the live head/labels/update time, local red-team
 evidence, overlap deadline, yielded-to PR state/head, or numbering withdrawal debt
 changes. `drain.catchUpSkipMaxMin` (default 15, nonnegative minutes, source logged)

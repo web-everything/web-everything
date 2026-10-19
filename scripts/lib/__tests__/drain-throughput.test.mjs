@@ -16,11 +16,11 @@ import { buildSkipReasons } from '../drain-skip-reasons.mjs';
 describe('drain throughput', () => {
   it('defaults on, supports rollback and reports each source', () => {
     const log = vi.fn();
-    expect(resolveDrainThroughput({ file: {}, platform: {}, env: {}, log }).value).toEqual({ holdFirst: true, catchUpSkipUnchangedHolds: true, carryOverReadyFirst: true, catchUpSkipMaxMin: 15 });
+    expect(resolveDrainThroughput({ file: {}, platform: {}, env: {}, log }).value).toEqual({ redMainSkipCatchUp: true, holdFirst: true, catchUpSkipUnchangedHolds: true, carryOverReadyFirst: true, catchUpSkipMaxMin: 15 });
     const out = resolveDrainThroughput({ file: { drain: { holdFirst: false } }, platform: {}, env: {}, log });
     expect(out.value.holdFirst).toBe(false);
     expect(out.sources.holdFirst).toBe('tool');
-    expect(log).toHaveBeenCalled();
+    expect(log.mock.calls.flat().join(' ')).toContain('redMainSkipCatchUp=true (default)');
   });
   it('evaluates holds once per repo, PR and head; disabled calls every time', async () => {
     const evaluate = vi.fn(() => ({ kind: 'red-team-pending' }));
@@ -86,7 +86,7 @@ describe('drain throughput', () => {
     const src = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');
     const listing = src.slice(src.indexOf('  const listOne = async (repo) => {'), src.indexOf('  const resolveDefaultBranch = async (repo) => {'));
     const target = { number: 1, state: 'OPEN', baseRefName: 'main', headRefOid: 'a', files: [{ path: 'shared', additions: 1 }], labels: [] };
-    const sibling = { number: 2, baseRefName: 'main', headRefOid: 'b', files: [{ path: 'shared', additions: 100 }], labels: ['review:pending'] };
+    const sibling = { number: 2, baseRefName: 'main', headRefOid: 'b', files: [{ path: 'shared', additions: 100 }], labels: ['review:pending', 'ready-to-merge'], statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
     const live = vi.fn(() => ({ rows: [target, sibling], truncated: false, cache: {} }));
     const context = {
       process: { env: { WE_DRAIN_CATCH_UP_SNAPSHOT: '1' }, stderr: { write() {} } },
@@ -271,4 +271,12 @@ describe('drain throughput', () => {
     expect(exec).toHaveBeenCalledTimes(1);
   });
 
+});
+
+it('cascades redMainSkipCatchUp and logs its source', () => {
+  const log = vi.fn();
+  const out = resolveDrainThroughput({ file: { drain: { redMainSkipCatchUp: false } }, platform: { redMainSkipCatchUp: true }, env: {}, log });
+  expect(out.value.redMainSkipCatchUp).toBe(false);
+  expect(out.sources.redMainSkipCatchUp).toBe('tool');
+  expect(log.mock.calls.flat().join(' ')).toContain('redMainSkipCatchUp=false (tool)');
 });
