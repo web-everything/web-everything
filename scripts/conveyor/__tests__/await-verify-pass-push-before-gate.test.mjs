@@ -203,3 +203,15 @@ describe('the held claim blocks every dispatch on a red intermediate head', () =
     expect(attachLiveFixClaim(green(), { claimKey: null, readClaim: throwing }).fixClaim).toBeUndefined();
   });
 });
+
+it('scope fence stand-down resumes immediately without waiting for verify or attempting another push', async () => {
+  const h = harness();
+  h.io.push = () => ({ ok: false, scopeFence: true, reason: 'scope-increase request: re-adds cdLandings' });
+  await pass(h);
+  expect(h.state.remote).toBeNull();
+  expect(h.calls.resume).toHaveLength(1);
+  expect(h.calls.resume[0].prompt).toContain('needs-you');
+  expect(h.calls.resume[0].prompt).toContain('Do not retry');
+  await pass(h);
+  expect(h.calls.resume).toHaveLength(1);
+});

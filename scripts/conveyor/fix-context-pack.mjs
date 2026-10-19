@@ -106,7 +106,7 @@ export function logContextPackSettings(resolved, { log = (l) => console.error(l)
 // ---------------------------------------------------------------------------------------------------------------
 // Finding extraction (PURE)
 
-const CHANGES_RE = /^\s*🔁\s*(?:human\s+)?review\s+—\s+changes requested/u;
+export const CHANGES_RE = /^\s*🔁\s*(?:human\s+)?review\s+—\s+changes requested/u;
 const ADVISORY_RE = /^\s*\*{0,2}⚠️\s*THIS IS AN ADVISORY REVIEW/u;
 const REF_RE = /(?<![\w@./-])([\w@.-][\w@.\-/]*\.[A-Za-z0-9]{1,8}):(\d{1,6})(?:-(\d{1,6}))?/g;
 const JSON_REF_RE = /"([\w@.-][\w@.\-/]*\.[A-Za-z0-9]{1,8})",\s*(\d{1,6})/g;

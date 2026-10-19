@@ -1,0 +1,4 @@
+{
+  "$comment": "fix.scopeFence: deterministic repair push fence. Defaults enabled=true, mode=warn (operator 2026-10-17: enforce later, once the follow-up card makes the fence merge-aware); stand-down is the enforcing mode, which refuses the push. Cascade standard -> platform fix.scopeFence -> tool -> WE_FIX_SCOPE_FENCE_ENABLED / WE_FIX_SCOPE_FENCE_MODE. Sources are logged at push time. Out-of-scope work requires an operator scope-increase request. scope-removed: identifier, functionName in an operator send-back or removal commit prevents reintroduction.",
+  "fix": { "scopeFence": { "enabled": true, "mode": "warn" } }
+}
