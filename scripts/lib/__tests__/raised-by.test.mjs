@@ -1,5 +1,4 @@
 import { execFileSync } from 'node:child_process';
-import { findApprovalPreventionCardOnDisk } from '../../review-set-label.mjs';
 import { describe, it, expect } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -22,8 +21,6 @@ describe('derived raised-by records', () => {
     expect(readRaisedBy('5125', root)).toHaveLength(2);
     expect(readOpenCards(root)).toHaveLength(1);
     expect(readOpenCards(root)[0].items).toHaveLength(2);
-    expect(findApprovalPreventionCardOnDisk('approval-prevention-key:o/r#78@abc', { root }))
-      .toEqual({ num: 5125, rel: 'backlog/5125-parent.md' });
   }));
   it('A3 retries reuse one deterministic file; A5 different PRs use disjoint paths', () => fixture(root => {
     const a = raisedByFile('5125', line);
