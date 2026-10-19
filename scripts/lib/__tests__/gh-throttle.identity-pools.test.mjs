@@ -37,6 +37,47 @@ it('saturates one identity without blocking another and reports pool attribution
   expect(ghThrottleStatus({ lockRoot: f.lockRoot, cap: 4 }).held).toEqual(expect.arrayContaining([expect.objectContaining({ pool: ghAuthIdentity(f.a) })]));
 });
 
+it.each(['x'.repeat(200), 'ghp_synthetic_identity'])('enforces quotas with a stable sanitized key for identity %s', (identity) => {
+  const lockRoot = temp();
+  const hold = (identity, owner) => acquireGhSlotSync({ lockRoot, identity, owner, cap: 2, hostMaxSlots: 6,
+    reservedBackgroundSlots: 0, timeoutMs: 0, policy: { maxHoldSeconds: 0, reapGraceSeconds: 0, perCallerMax: 0 } });
+  expect(hold(identity, 'first').ok).toBe(true);
+  expect(hold(identity, 'second').ok).toBe(true);
+  expect(hold(identity, 'third').ok).toBe(false);
+  expect(hold(`${identity}-other`, 'other').ok).toBe(true);
+  const holders = readGhSlotHolders({ lockRoot, cap: 6 });
+  expect(holders[0].pool).toBe(holders[1].pool);
+  expect(holders[0].pool).not.toBe('unknown');
+  expect(holders[0].pool).not.toBe(identity);
+  expect(holders[2].pool).not.toBe(holders[0].pool);
+});
+
+it.each([[2, 0], [3, 1]])('counts identity and priority holders beyond a smaller host span (cap %s, reserved %s)', (cap, reservedBackgroundSlots) => {
+  const lockRoot = temp();
+  const hold = (identity, owner, hostMaxSlots = 6) => acquireGhSlotSync({ lockRoot, identity, owner, cap, hostMaxSlots,
+    reservedBackgroundSlots, timeoutMs: 0, policy: { maxHoldSeconds: 0, reapGraceSeconds: 0, perCallerMax: 0 } });
+  for (let i = 0; i < 3; i++) expect(hold(`filler-${i}`, `filler-${i}`).ok).toBe(true);
+  expect(hold('a', 'a1').ok).toBe(true);
+  expect(hold('a', 'a2').ok).toBe(true);
+  for (let i = 0; i < 3; i++) releaseGhSlotSync({ lockRoot, hostMaxSlots: 6, owner: `filler-${i}` });
+  expect(readGhSlotHolders({ lockRoot, cap: 6 }).map(h => h.slot)).toEqual([3, 4]);
+  expect(hold('a', 'a3', 3).ok).toBe(false);
+  expect(hold('b', 'b1', 3).ok).toBe(true);
+  expect(hold('c', 'c1', 3).ok).toBe(false); // full host count, despite free slots 1 and 2
+});
+
+it('enforces perCallerMax across identities while allowing another caller', () => {
+  const lockRoot = temp();
+  const hold = (identity, owner, caller = 'worker') => acquireGhSlotSync({ lockRoot, identity, owner, cap: 4,
+    hostMaxSlots: 6, reservedBackgroundSlots: 0, timeoutMs: 0, meta: { caller, op: 'pr list' },
+    policy: { maxHoldSeconds: 0, reapGraceSeconds: 0, perCallerMax: 2 } });
+  expect(hold('a', 'a1').ok).toBe(true);
+  expect(hold('b', 'b1').ok).toBe(true);
+  expect(hold('a', 'a2').ok).toBe(false);
+  expect(hold('c', 'c1').ok).toBe(false);
+  expect(hold('a', 'other', 'other-worker').ok).toBe(true);
+});
+
 it('reserves background capacity, permits background borrowing, and includes pool/class on refusal', () => {
   const f = fixture({ reservedBackgroundSlots: 1 });
   expect(f.hold(f.a, 'priority').ok).toBe(true);

@@ -1,5 +1,5 @@
 /** Holder attribution, bounded holds and caller admission for the shared gh semaphore. */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { basename } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -153,7 +153,11 @@ export function acquireGhHolderSlot({ lockRoot, cap, owner, pid, pollMs, timeout
   const mutexOwner = randomUUID();
   if (poolLimits) mkdirSync(lockRoot, { recursive: true });
   const safe = sanitizeGhHolder(meta);
-  const slotMeta = { ...(poolLimits ? { pool: poolLimits.identity, class: poolLimits.class } : {}), caller: safe.caller, op: safe.op, args: safe.args, parent: safe.parent, pid, ppid: safe.ppid, ...(safe.timeoutMs !== undefined ? { timeoutMs: safe.timeoutMs } : {}) };
+  const sanitizedPool = poolLimits ? sanitizeHolderField(poolLimits.identity) : undefined;
+  const poolKey = poolLimits && sanitizedPool !== poolLimits.identity
+    ? `pool-${createHash('sha256').update(poolLimits.identity).digest('hex').slice(0, 24)}` : sanitizedPool;
+  const scanCap = Math.max(cap, GH_SLOT_POOL_STANDARD.hostMaxSlots, 64);
+  const slotMeta = { ...(poolLimits ? { pool: poolKey, class: poolLimits.class } : {}), caller: safe.caller, op: safe.op, args: safe.args, parent: safe.parent, pid, ppid: safe.ppid, ...(safe.timeoutMs !== undefined ? { timeoutMs: safe.timeoutMs } : {}) };
   const overAge = h => h.timeoutMs !== 0 && h.heldMs > Math.max(policy.maxHoldSeconds * 1000, h.timeoutMs ?? 0) + policy.reapGraceSeconds * 1000;
   for (;;) {
     const nowMs = now();
@@ -164,16 +168,16 @@ export function acquireGhHolderSlot({ lockRoot, cap, owner, pid, pollMs, timeout
       entry => Number.isInteger(entry.pid) && entry.pid !== pid && !alive(entry.pid) ? 'dead' : 'unknown', 1).ok;
     let r = { ok: false }, holders = [];
     if (locked) try {
-      const entries = Array.from({ length: cap }, (_, slot) => readLockEntry(lockRoot, slotPath(slot)));
+      const entries = Array.from({ length: scanCap }, (_, slot) => readLockEntry(lockRoot, slotPath(slot)));
       holders = entries.flatMap((e, slot) => e ? [holder(slot, e, nowMs)] : []);
       // Exclude only entries the underlying slot primitive itself can reclaim. Legacy holders
       // without identity metadata belong to the default pool during rolling upgrades.
       const occupied = () => holders.filter(h => !reclaimDecision(entries[h.slot], nowMs, owner,
         entries[h.slot].pid !== pid && Number.isInteger(entries[h.slot].pid) ? (h.alive ? 'alive' : 'dead') : 'unknown',
         ADMISSION_LEASE_MINUTES, pid).acquirable);
-      const pool = () => occupied().filter(h => !poolLimits || h.pool === poolLimits.identity);
-      const capped = () => (policy.perCallerMax > 0 && pool().filter(h => h.alive && ghCallerKey(h) === ghCallerKey(slotMeta)).length >= policy.perCallerMax)
-        || (poolLimits && (pool().length >= poolLimits.slotsPerIdentity
+      const pool = () => occupied().filter(h => !poolLimits || h.pool === poolKey);
+      const capped = () => (policy.perCallerMax > 0 && occupied().filter(h => h.alive && ghCallerKey(h) === ghCallerKey(slotMeta)).length >= policy.perCallerMax)
+        || (poolLimits && (occupied().length >= cap || pool().length >= poolLimits.slotsPerIdentity
           || (poolLimits.class !== 'background' && pool().filter(h => h.class !== 'background').length >= poolLimits.slotsPerIdentity - poolLimits.reservedBackgroundSlots)));
       const attempt = () => capped() ? { ok: false } : trySlot({ lockRoot, cap, owner, pid, nowMs, nowIso: new Date(nowMs).toISOString(), meta: { ...slotMeta, acquiredAt: new Date(nowMs).toISOString() } });
       r = attempt();
@@ -184,7 +188,7 @@ export function acquireGhHolderSlot({ lockRoot, cap, owner, pid, pollMs, timeout
           if (!entry || entry.owner !== entries[h.slot]?.owner || entry.heartbeatAt !== entries[h.slot]?.heartbeatAt || !overAge(holder(h.slot, entry, nowMs))) continue;
           if (releaseLockDirIf(lockRoot, slotPath(h.slot), entry)) onReap(holder(h.slot, entry, nowMs));
         }
-        holders = readGhSlotHolders({ lockRoot, cap, nowMs });
+        holders = readGhSlotHolders({ lockRoot, cap: scanCap, nowMs });
         r = attempt();
       }
     } finally {
