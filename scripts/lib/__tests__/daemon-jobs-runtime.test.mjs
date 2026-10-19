@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   JOB_ATTEMPT_ENV, JOB_ID_ENV, createJobStore, enqueueJob, hostName, launchJob, localHostAliases, probeHandle, readProcStart,
-  reattachTick, runJob, selfHandle, stopHandle,
+  reapDeadGroup, reattachTick, runJob, selfHandle, stopHandle,
 } from '../daemon-jobs-runtime.mjs';
 import { defineJobKind, kindRegistry, markClaimed, markLaunching } from '../daemon-jobs.mjs';
 import { formatJobHandle } from '../../operations/job-record.mjs';
@@ -366,5 +366,95 @@ describe('reattachTick deadlines', () => {
       deadlineAt: () => now, probe: () => 'alive', stop: async () => ({ gone: false }), launch: vi.fn() });
     expect(out.actions).toContainEqual(expect.objectContaining({ action: 'stop-failed' }));
     expect(store.read('deadline-stuck').job.status).toBe('running');
+  });
+});
+
+describe('stopping a job that owns subprocesses', () => {
+  it.each([
+    ['a wrapper that exits on SIGTERM', '', 'setInterval(() => {}, 1000)', 'SIGTERM'],
+    ['a tree that ignores SIGTERM', "process.on('SIGTERM', () => {});", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)", 'SIGKILL'],
+    ['a child left running after its wrapper exits', '', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)", 'SIGTERM'],
+  ])('stops the whole detached process group, not only the wrapper pid: %s', async (_name, parentTrap, childCode, signal) => {
+    const parent = spawn(process.execPath, ['-e', [
+      parentTrap,
+      `const c = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(childCode)}], { stdio: 'ignore' });`,
+      'console.log(c.pid); setInterval(() => {}, 1000);',
+    ].join('\n')], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
+    let out = '';
+    parent.stdout.on('data', (b) => { out += b; });
+    const childPid = Number(await waitFor(() => out.trim()));
+    const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    try {
+      await waitFor(() => readProcStart(parent.pid));
+      const handle = formatJobHandle({ host: hostName(), pid: parent.pid, procStart: readProcStart(parent.pid) });
+      const res = await stopHandle(handle, { termGraceMs: 300, killGraceMs: 3_000 });
+      expect(res).toEqual({ gone: true, signal });
+      await waitFor(() => !alive(childPid), 3_000);
+    } finally {
+      for (const pid of [childPid, parent.pid]) { try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ } }
+    }
+  });
+
+  it('kills the leftover process group of a job that died on its own before requeuing it', async () => {
+    const parent = spawn(process.execPath, ['-e', [
+      "const c = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
+      'c.unref(); console.log(c.pid); setInterval(() => {}, 1000);',
+    ].join('\n')], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
+    let out = '';
+    parent.stdout.on('data', (b) => { out += b; });
+    const childPid = Number(await waitFor(() => out.trim()));
+    const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    try {
+      const procStart = await waitFor(() => readProcStart(parent.pid));
+      const handle = formatJobHandle({ host: hostName(), pid: parent.pid, procStart });
+      const exited = new Promise((r) => parent.on('exit', r));
+      process.kill(parent.pid, 'SIGKILL'); // the wrapper dies on its own (an OOM kill); its child keeps running
+      await exited;
+      expect(alive(childPid)).toBe(true);
+      const now = Date.now();
+      enqueueJob({ store, kindDef: noop, codeSha: 'test-sha', id: 'died-alone', now });
+      store.update('died-alone', (r) => markClaimed(markLaunching(r, { at: new Date(now).toISOString() }), {
+        at: new Date(now).toISOString(), handle, host: hostName(), pid: parent.pid, procStart,
+      }));
+      const out2 = await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now, slept: false, gapMs: 0 }, launch: () => null });
+      expect(out2.actions).toContainEqual(expect.objectContaining({ id: 'died-alone', action: 'requeue' }));
+      await waitFor(() => !alive(childPid), 3_000);
+    } finally {
+      for (const pid of [childPid, parent.pid]) { try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ } }
+    }
+  });
+
+  it('never kills a group for a dead pid that is in use again or not on this host', () => {
+    const kill = vi.fn();
+    const reused = formatJobHandle({ host: hostName(), pid: process.pid, procStart: 'Thu Jan  1 00:00:00 1970' });
+    expect(reapDeadGroup(reused, { kill, notAfterMs: Date.now() })).toBe(false);
+    expect(reapDeadGroup(formatJobHandle({ host: 'elsewhere', pid: 999999, procStart: 'x' }), { kill, notAfterMs: Date.now() })).toBe(false);
+    // A dead job's unused pid whose group id was taken over later: members started after the job was last
+    // alive, or the host rebooted since the job started — never the job's group.
+    const procStart = 'Mon Oct 19 00:00:00 2026', started = Date.parse(procStart);
+    const dead = formatJobHandle({ host: 'h', pid: 999999, procStart });
+    const base = { host: 'h', readStart: () => null, bootTime: () => started - 3600000, kill, notAfterMs: started + 60000 };
+    expect(reapDeadGroup(dead, { ...base, groupStarts: () => [started + 120000] })).toBe(false);
+    expect(reapDeadGroup(dead, { ...base, groupStarts: () => [started - 60000] })).toBe(false);
+    expect(reapDeadGroup(dead, { ...base, bootTime: () => started + 1000, groupStarts: () => [started + 5000] })).toBe(false);
+    expect(reapDeadGroup(dead, { ...base, bootTime: () => null, groupStarts: () => [started + 5000] })).toBe(false);
+    expect(reapDeadGroup(dead, { ...base, groupStarts: () => null })).toBe(false);
+    expect(kill).not.toHaveBeenCalled();
+    expect(reapDeadGroup(dead, { ...base, groupStarts: () => [started, started + 5000] })).toBe(true);
+    expect(kill).toHaveBeenCalledWith(-999999, 'SIGKILL');
+  });
+
+  it('gives a kind its declared stop grace on a deadline stop', async () => {
+    const graceful = defineJobKind({ kind: 'graceful', entry: 'job.mjs', stopGraceMs: 45_000 });
+    const now = Date.now();
+    enqueueJob({ store, kindDef: graceful, codeSha: 'test-sha', id: 'graceful-live', now });
+    store.update('graceful-live', (r) => markClaimed(markLaunching(r, { at: new Date(now).toISOString() }), {
+      at: new Date(now).toISOString(), handle: formatJobHandle({ host: 'test', pid: 123, procStart: 'test' }), host: 'test', pid: 123, procStart: 'test',
+    }));
+    const stop = vi.fn(async () => ({ gone: true, signal: 'SIGTERM' }));
+    await reattachTick({ store, kinds: kindRegistry([graceful]), maxConcurrent: 1, observation: { now, slept: false },
+      deadlineAt: () => now, probe: () => 'alive', stop, launch: vi.fn() });
+    expect(stop).toHaveBeenCalledWith(expect.any(String), { termGraceMs: 45_000 });
+    expect(() => defineJobKind({ kind: 'bad', entry: 'job.mjs', stopGraceMs: 0 })).toThrow(/stopGraceMs/);
   });
 });

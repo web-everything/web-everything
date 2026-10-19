@@ -39,10 +39,11 @@ if (resolve(process.argv[1]) === fileURLToPath(import.meta.url)) console.log(JSO
       // Probe the actual CLI surface without invoking lane-pool, GitHub, or operator state.
       const input = { night: '2026-10-16', until: '2026-10-17T02:17:00.000Z', dir: join(root, 'state') };
       const lane = { lane: 7, holder: 'soak-coroner', path: lanePath };
-      let acquired = 0, released = 0, calls = 0;
+      let acquired = 0, released = 0, swept = 0, calls = 0;
       const io = { home: join(root, 'handoff'), statusFeed: join(root, 'feed.jsonl'),
         acquire: async () => { acquired++; return lane; },
         release: async (value) => { released++; if (value !== lane) violations.push('released a different lease'); },
+        sweep: async () => { swept++; },
         run: async (args, cwd) => {
           calls++;
           const stdout = execFileSync(process.execPath, args, { cwd, env, encoding: 'utf8', timeout: 5000 });
@@ -57,6 +58,7 @@ if (resolve(process.argv[1]) === fileURLToPath(import.meta.url)) console.log(JSO
         // Recovery must reuse the receipt without acquiring another lane or rerunning either CLI.
         await extractNightlyCoroner(input, io);
         if (calls !== 2 || acquired !== 1) violations.push('unexpected extraction or acquisition count');
+        if (swept !== 1) violations.push(`expected one orphan lease sweep, got ${swept}`);
         if (readFileSync(io.statusFeed, 'utf8').trim().split('\n').length !== 1) violations.push('duplicate notification');
       } catch (error) {
         violations.push(`extraction failed: ${error.message}`);

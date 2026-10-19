@@ -60,7 +60,7 @@ export const DEFAULT_SNAPSHOT_KEEP = 2;
 export function defineJobKind(def) {
   const {
     kind, entry, codeMode = 'readonly-tree', serial = false, resumable = true, maxAttempts = DEFAULT_MAX_ATTEMPTS,
-    nodeModules = false, prepareWorktree = null,
+    nodeModules = false, prepareWorktree = null, stopGraceMs = null,
   } = def || {};
   if (!isValidJobKind(kind)) throw new TypeError(`daemon-jobs: invalid job kind ${JSON.stringify(kind)}`);
   if (typeof entry !== 'string' || !entry || entry.startsWith('/') || entry.split('/').includes('..')) {
@@ -73,7 +73,9 @@ export function defineJobKind(def) {
     throw new TypeError(`daemon-jobs: mutates-tree kind ${kind} must provide prepareWorktree(record)`);
   }
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1) throw new TypeError(`daemon-jobs: kind ${kind} maxAttempts must be a positive integer`);
-  return Object.freeze({ kind, entry, codeMode, serial: !!serial, resumable: !!resumable, maxAttempts, nodeModules: !!nodeModules, prepareWorktree });
+  // How long a stop waits after SIGTERM before SIGKILL — a kind whose child cleans up (releases a lane) on SIGTERM needs it.
+  if (stopGraceMs !== null && (!Number.isInteger(stopGraceMs) || stopGraceMs < 1)) throw new TypeError(`daemon-jobs: kind ${kind} stopGraceMs must be a positive integer`);
+  return Object.freeze({ kind, entry, codeMode, serial: !!serial, resumable: !!resumable, maxAttempts, nodeModules: !!nodeModules, prepareWorktree, stopGraceMs });
 }
 
 /** Index kind definitions by name, refusing duplicates. */
