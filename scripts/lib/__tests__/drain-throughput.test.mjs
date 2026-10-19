@@ -16,11 +16,31 @@ import { buildSkipReasons } from '../drain-skip-reasons.mjs';
 describe('drain throughput', () => {
   it('defaults on, supports rollback and reports each source', () => {
     const log = vi.fn();
-    expect(resolveDrainThroughput({ file: {}, platform: {}, env: {}, log }).value).toEqual({ redMainSkipCatchUp: true, holdFirst: true, catchUpSkipUnchangedHolds: true, carryOverReadyFirst: true, catchUpSkipMaxMin: 15 });
+    expect(resolveDrainThroughput({ file: {}, platform: {}, env: {}, log }).value).toEqual({ redMainSkipCatchUp: true, holdFirst: true, overlapFirst: true, catchUpSkipQueueOverlap: true, catchUpSkipUnchangedHolds: true, carryOverReadyFirst: true, catchUpSkipMaxMin: 15 });
     const out = resolveDrainThroughput({ file: { drain: { holdFirst: false } }, platform: {}, env: {}, log });
     expect(out.value.holdFirst).toBe(false);
     expect(out.sources.holdFirst).toBe('tool');
     expect(log.mock.calls.flat().join(' ')).toContain('redMainSkipCatchUp=true (default)');
+  });
+  it.each([
+    ['overlapFirst', 'WE_DRAIN_OVERLAP_FIRST'],
+    ['catchUpSkipQueueOverlap', 'WE_DRAIN_CATCH_UP_SKIP_QUEUE_OVERLAP'],
+  ])('validates overrides and logs sources for %s', (key, envKey) => {
+    const log = vi.fn();
+    const resolve = (file = {}, env = {}) => resolveDrainThroughput({ file: { drain: file }, platform: {}, env, log });
+    expect(resolve().value[key]).toBe(true);
+    expect(resolve().sources[key]).toBe('default');
+    expect(resolve({ [key]: false }).value[key]).toBe(false);
+    expect(resolve({ [key]: false }).sources[key]).toBe('tool');
+    expect(resolve({ [key]: 'false' }).value[key]).toBe(true);
+    expect(resolve({}, { [envKey]: 'off' }).value[key]).toBe(false);
+    expect(resolve({}, { [envKey]: 'off' }).sources[key]).toBe('env');
+    expect(resolve({ [key]: false }, { [envKey]: 'on' }).value[key]).toBe(true);
+    const invalid = resolve({ [key]: false }, { [envKey]: 'invalid' });
+    expect(invalid.value[key]).toBe(false);
+    expect(invalid.sources[key]).toBe('tool');
+    expect(invalid.invalid).toEqual(expect.arrayContaining([expect.stringContaining(`env.${key}`)]));
+    expect(log.mock.calls.flat().join(' ')).toContain(`${key}=true (default)`);
   });
   it('evaluates holds once per repo, PR and head; disabled calls every time', async () => {
     const evaluate = vi.fn(() => ({ kind: 'red-team-pending' }));

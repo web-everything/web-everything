@@ -304,10 +304,61 @@ export function createDrainMergeStrategy({
     const reason = sendBackReason(labels);
     if (reason) dequeueSentBack({ repo: slugOf(repo), pr: num, reason, exec, log: say });
   };
+  // Shared request eligibility: deferred requests must obey the same recovery and cooldown rules as enqueue.
+  const redTeamRequestEligibility = (c, headSha, live, evidence, pending) => {
+    const sameHead = pending?.headSha === headSha;
+    // No scheduler artifact exists on this head. Ask the ordinary review dispatcher promptly;
+    // preserve card-only exemptions and the scheduler kill switches.
+    const panelSeat = redTeamPanelSeatOwed(evidence.loopPayload, env);
+    let orphanedPanelSeat = false;
+    if (panelSeat && redTeamOwedFor(evidence.loopPayload) && redTeamEnabled(env) && !evidence.recorded && !evidence.attempted
+      && !evidence.inFlight && !evidence.queued && !evidence.untrustedSavedResult
+      && evidence.loopPayload?.findings?.read?.netBasis?.rev?.toLowerCase() === headSha.toLowerCase()
+      && live.labels.some(l => (typeof l === 'string' ? l : l.name) === 'review:accepted')
+      && redTeamOwedOnHead({ read: evidence.loopPayload?.findings?.read,
+        evidence: { ...evidence, scheduled: true }, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly })) {
+      // Owed is policy, not a queue entry. An older accepted head has no job left to seat it.
+      // Unknown job discovery stays held; the consumer repeats the ordinary dispatch guards.
+      try {
+        const repoKey = repoKeyForSlug(slugOf(c.repo));
+        const name = repoKey && mintSessionSlug({ kind: 'review', id: c.num, repo: repoKey });
+        const agents = readReviewAgents();
+        orphanedPanelSeat = !!name && Array.isArray(agents) && !agents.incomplete?.length
+          && !agents.some(a => !['stopped', 'completed', 'failed'].includes(a.state)
+            && (a.name === name || (Number(a.pr) === c.num && a.repo?.toLowerCase() === slugOf(c.repo).toLowerCase())));
+      } catch { /* cannot prove no review work will seat this head */ }
+    }
+    const neverScheduled = (panelSeat ? orphanedPanelSeat : evidence.scheduled === false) && !evidence.recorded && !evidence.attempted
+      && !evidence.inFlight && !evidence.queued && redTeamEnabled(env)
+      && live.labels.some(l => (typeof l === 'string' ? l : l.name) === 'review:accepted')
+      && postAcceptRedTeamOwed(evidence.loopPayload, env, { scheduled: true, skipCardOnly: evidence.skipCardOnly })
+      && typeof requestRedTeam === 'function';
+    const cooldownMin = safety.value.redTeamRequestCooldownMin ?? 5;
+    const cooldownSource = safety.sources?.redTeamRequestCooldownMin ?? 'standard';
+    let reviewAgents = null;
+    if (panelSeat && evidence.noUsableResult && (evidence.recorded || evidence.attempted || evidence.untrustedSavedResult)) {
+      try { reviewAgents = readReviewAgents(); } catch { /* unknown jobs remain held */ }
+    }
+    const staleRequest = staleRedTeamRequestEligibility({ evidence, repo: slugOf(c.repo), pr: c.num,
+      head: headSha, labels: live.labels, enabled: redTeamEnabled(env), panelSeat,
+      skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly, reviewAgents, pending, now: now(), cooldownMin, dryRun });
+    const requestDue = (neverScheduled || (staleRequest.eligible && typeof requestRedTeam === 'function')) && !(sameHead && pending.requestedAt != null)
+      && (!sameHead || pending.requestAttemptedAt == null || now() - pending.requestAttemptedAt >= cooldownMin * 60_000);
+    return { sameHead, panelSeat, neverScheduled, staleRequest, requestDue, cooldownMin, cooldownSource };
+  };
   const enqueueMode = mergeActionFor(policy) === 'enqueue';
   const adaptiveBatching = () => batching ??= createAdaptiveBatching({ repo: localSlug, exec, dryRun, log: say });
   const enqueues = (repo) => enqueueMode && !!isLocalRepo(repo);
   const slugOf = (repo) => repo || localSlug;
+
+  const overlapCache = new Map();
+  const pickQueueOverlap = (c, candidateFiles, queue) => {
+    const overlap = queueFileOverlap({ candidateFiles,
+      queuedEntries: queue.entries.filter(entry => entry.num !== c.num),
+      includeCards: safety.value.queueFileOverlapIncludesCards ?? true });
+    const files = [...new Set(overlap.with.flatMap(entry => entry.files))].slice(0, 3);
+    return { ...overlap, reason: `${overlap.with.map(entry => `#${entry.num}`).join(',')} share ${files.join(', ')}` };
+  };
 
   return {
     policy,
@@ -370,6 +421,72 @@ export function createDrainMergeStrategy({
         return { allowed: !reason, reason, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
       } catch { return { allowed: false, reason: 'red-team evidence unreadable' }; }
     },
+    /** Read-only overlap hint; enqueue always re-reads the queue under the land mutex. */
+    queueOverlapHold(c, headSha) {
+      if (!enqueues(c.repo)) return null;
+      const candidateFiles = c.listedFilesComplete === true ? completeListedFiles(c.listedFiles) : null;
+      if (candidateFiles === null) return null;
+      const repo = slugOf(c.repo);
+      const cached = overlapCache.get(repo);
+      const at = now();
+      const queue = cached && at >= cached.at && at - cached.at < 30_000
+        ? cached.queue : readQueueEntryFiles({ repo, exec });
+      if (queue.error) return null;
+      if (queue !== cached?.queue) overlapCache.set(repo, { at, queue });
+      const overlap = pickQueueOverlap(c, candidateFiles, queue);
+      return overlap.overlap ? { kind: 'queue-file-overlap', reason: overlap.reason, deferred: true } : null;
+    },
+    /** Request only: the queue-file-overlap hold and every enqueue gate remain in force. */
+    requestRedTeamWhileDeferred(c, headSha) {
+      if (!enqueueMode || dryRun || typeof requestRedTeam !== 'function'
+        || !safety.value.waitForRedTeamBeforeEnqueue || !headSha) return null;
+      try {
+        const lock = withLock(() => {
+          const before = readQueueState(statePath, readFile);
+          if (before.unreadable) return null;
+          const live = readLive(c.repo, c.num);
+          if (live.headRefOid !== headSha || !Array.isArray(live.labels)
+            || !live.labels.some(l => (typeof l === 'string' ? l : l.name) === 'review:accepted')) return null;
+          if (sendBackReason(live.labels)) return { requested: false };
+          const evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env });
+          const key = keyOf(c.repo, c.num);
+          const pending = before.redTeamPending?.[key];
+          const { sameHead, neverScheduled, requestDue, cooldownMin, cooldownSource }
+            = redTeamRequestEligibility(c, headSha, live, evidence, pending);
+          const pages = readThreadPages(c.repo, c.num);
+          if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) return null;
+          const reason = redTeamEnqueueHold({ ...evidence, requestPending: neverScheduled || (sameHead && pending.requestedAt != null), comments: pages.flat(), repo: slugOf(c.repo), pr: c.num, head: headSha, env });
+          if (!reason || reason.includes('requiring send-back') || reason.includes('saved red-team re-check incomplete')) return { requested: false };
+          if (!requestDue) {
+            if (neverScheduled && sameHead && pending.requestedAt == null)
+              log.write(`  merge-queue: #${c.num} red-team request cooldown: redTeamRequestCooldownMin=${cooldownMin} (${cooldownSource})\n`);
+            return { requested: false };
+          }
+          const at = now();
+          const wait = sameHead ? { ...pending, requestAttemptedAt: at } : {
+            headSha, firstPendingAt: at, retryAt: at, commentCount: 0, checkedAt: at,
+            reason: 'red team requested while queue-file-overlap deferred', requestAttemptedAt: at,
+          };
+          before.redTeamPending ??= {};
+          before.redTeamPending[key] = wait;
+          writeState(statePath, before);
+          log.write(`  merge-queue: requesting red team for #${c.num} on ${headSha}: redTeamRequestCooldownMin=${cooldownMin} (${cooldownSource})\n`);
+          let requested = false;
+          try { requested = requestRedTeam({ repo: slugOf(c.repo), pr: c.num, head: headSha, loopPayload: evidence.loopPayload })?.requested === true; }
+          catch (e) { log.write(`  red-team request failed #${c.num}: ${firstLine(e)}\n`); }
+          if (requested) {
+            wait.requestedAt = now();
+            writeState(statePath, before);
+            log.write(`  merge-queue: requested red team for #${c.num} on ${headSha} through review dispatch\n`);
+          }
+          return { requested };
+        });
+        return lock?.ran === false ? null : lock?.result ?? null;
+      } catch (e) {
+        say(`  red-team deferred request failed #${c.num}: ${firstLine(e)}`);
+        return null;
+      }
+    },
     /** Read-only pre-check outside the land mutex, only for a recorded wait on this exact head.
      * A clear result is NOT authorization; enqueue re-reads state and runs every live gate under the mutex.
      * A hold needing refresh or any side effect falls through to that ordinary enqueue path. */
@@ -406,44 +523,8 @@ export function createDrainMergeStrategy({
       if (safety.value.waitForRedTeamBeforeEnqueue) {
         const evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env });
         const pending = before.redTeamPending?.[key];
-        const sameHead = pending?.headSha === headSha;
-        // No scheduler artifact exists on this head. Ask the ordinary review dispatcher promptly;
-        // preserve card-only exemptions and the scheduler kill switches.
-        const panelSeat = redTeamPanelSeatOwed(evidence.loopPayload, env);
-        let orphanedPanelSeat = false;
-        if (panelSeat && redTeamOwedFor(evidence.loopPayload) && redTeamEnabled(env) && !evidence.recorded && !evidence.attempted
-          && !evidence.inFlight && !evidence.queued && !evidence.untrustedSavedResult
-          && evidence.loopPayload?.findings?.read?.netBasis?.rev?.toLowerCase() === headSha.toLowerCase()
-          && live.labels.some(l => (typeof l === 'string' ? l : l.name) === 'review:accepted')
-          && redTeamOwedOnHead({ read: evidence.loopPayload?.findings?.read,
-            evidence: { ...evidence, scheduled: true }, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly })) {
-          // Owed is policy, not a queue entry. An older accepted head has no job left to seat it.
-          // Unknown job discovery stays held; the consumer repeats the ordinary dispatch guards.
-          try {
-            const repoKey = repoKeyForSlug(slugOf(c.repo));
-            const name = repoKey && mintSessionSlug({ kind: 'review', id: c.num, repo: repoKey });
-            const agents = readReviewAgents();
-            orphanedPanelSeat = !!name && Array.isArray(agents) && !agents.incomplete?.length
-              && !agents.some(a => !['stopped', 'completed', 'failed'].includes(a.state)
-                && (a.name === name || (Number(a.pr) === c.num && a.repo?.toLowerCase() === slugOf(c.repo).toLowerCase())));
-          } catch { /* cannot prove no review work will seat this head */ }
-        }
-        const neverScheduled = (panelSeat ? orphanedPanelSeat : evidence.scheduled === false) && !evidence.recorded && !evidence.attempted
-          && !evidence.inFlight && !evidence.queued && redTeamEnabled(env)
-          && live.labels.some(l => (typeof l === 'string' ? l : l.name) === 'review:accepted')
-          && postAcceptRedTeamOwed(evidence.loopPayload, env, { scheduled: true, skipCardOnly: evidence.skipCardOnly })
-          && typeof requestRedTeam === 'function';
-        const cooldownMin = safety.value.redTeamRequestCooldownMin ?? 5;
-        const cooldownSource = safety.sources?.redTeamRequestCooldownMin ?? 'standard';
-        let reviewAgents = null;
-        if (panelSeat && evidence.noUsableResult && (evidence.recorded || evidence.attempted || evidence.untrustedSavedResult)) {
-          try { reviewAgents = readReviewAgents(); } catch { /* unknown jobs remain held */ }
-        }
-        const staleRequest = staleRedTeamRequestEligibility({ evidence, repo: slugOf(c.repo), pr: c.num,
-          head: headSha, labels: live.labels, enabled: redTeamEnabled(env), panelSeat,
-          skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly, reviewAgents, pending, now: now(), cooldownMin, dryRun });
-        const requestDue = (neverScheduled || (staleRequest.eligible && typeof requestRedTeam === 'function')) && !(sameHead && pending.requestedAt != null)
-          && (!sameHead || pending.requestAttemptedAt == null || now() - pending.requestAttemptedAt >= cooldownMin * 60_000);
+        const { sameHead, panelSeat, neverScheduled, staleRequest, requestDue, cooldownMin, cooldownSource }
+          = redTeamRequestEligibility(c, headSha, live, evidence, pending);
         if (neverScheduled && sameHead && pending.requestedAt == null && !requestDue)
           log.write(`  merge-queue: #${c.num} red-team request cooldown: redTeamRequestCooldownMin=${cooldownMin} (${cooldownSource})\n`);
         const overdue = sameHead && now() - pending.firstPendingAt >= (safety.value.redTeamPendingMaxMin ?? 45) * 60_000;
@@ -516,15 +597,13 @@ export function createDrainMergeStrategy({
         } else {
           const includeCards = safety.value.queueFileOverlapIncludesCards ?? true;
           const source = safety.sources?.queueFileOverlapIncludesCards ?? 'standard';
-          const overlap = queueFileOverlap({ candidateFiles,
-            queuedEntries: queue.entries.filter(entry => entry.num !== c.num), includeCards });
+          const overlap = pickQueueOverlap(c, candidateFiles, queue);
           if (overlap.unknown.length) say(`  merge-queue file-overlap: unknown files for ${overlap.unknown.map(num => `#${num}`).join(',')} — continuing without those entries`);
           if (overlap.overlap) {
             const first = overlap.with[0];
             say(`  merge-queue file-overlap: defer #${c.num} (shares ${first.files[0]} with queued #${first.num}) — includeCards=${includeCards} (${source})`);
-            const files = [...new Set(overlap.with.flatMap(entry => entry.files))].slice(0, 3);
             return { enqueued: false, deferred: true, kind: 'queue-file-overlap',
-              reason: `${overlap.with.map(entry => `#${entry.num}`).join(',')} share ${files.join(', ')}` };
+              reason: overlap.reason };
           }
         }
       } catch (e) { say(`  merge-queue file-overlap: read failed (${firstLine(e)}) — continuing enqueue`); }

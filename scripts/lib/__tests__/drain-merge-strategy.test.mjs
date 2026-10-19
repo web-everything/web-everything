@@ -1435,6 +1435,58 @@ describe('live queue file-overlap admission', () => {
   } } } } });
   const setup = (over = {}) => harness({ strategy: 'github-merge-queue',
     queueFacts: facts([43]), ghView: { 43: { files: [{ path: card }] } }, ...over });
+  it('pre-check shares the enqueue reason, caches only its own reads and expires after 30s', () => {
+    let time = 1_000;
+    const h = setup({ now: () => time });
+    const hold = h.s.queueOverlapHold(candidate, HEAD);
+    expect(hold).toEqual({ kind: 'queue-file-overlap', deferred: true, reason: `#43 share ${card}` });
+    expect(h.s.queueOverlapHold({ ...candidate, num: 44 }, HEAD)).toEqual(hold);
+    expect(h.calls).toHaveLength(2); // queue discovery + queued PR files, no writes
+    const result = h.s.enqueue(candidate, HEAD, { comments: stampedBy(DRAIN) });
+    expect(result).toEqual({ enqueued: false, ...hold });
+    expect(h.calls.filter(c => c.includes('files'))).toHaveLength(2); // enqueue read fresh
+    time += 30_000;
+    expect(h.s.queueOverlapHold(candidate, HEAD)).toEqual(hold);
+    expect(h.calls.filter(c => c.includes('files'))).toHaveLength(3);
+  });
+  it.each([
+    ['missing', { num: 42 }],
+    ['incomplete', { ...candidate, listedFilesComplete: false }],
+    ['capped', { ...candidate, listedFiles: Array(100).fill(card) }],
+    ['malformed', { ...candidate, listedFiles: [null] }],
+    ['other repo', { ...candidate, repo: 'other/repo' }],
+  ])('pre-check makes no reads when files or mode are unknown: %s', (_name, c) => {
+    const h = setup();
+    expect(h.s.queueOverlapHold(c, HEAD)).toBeNull();
+    expect(h.calls).toEqual([]);
+    expect(h.state()).toBeNull();
+  });
+  it('pre-check never caches queue read errors', () => {
+    const failures = [43];
+    const h = setup({ viewThrows: failures });
+    expect(h.s.queueOverlapHold(candidate, HEAD)).toBeNull();
+    expect(h.s.queueOverlapHold(candidate, HEAD)).toBeNull();
+    expect(h.calls).toHaveLength(4);
+    failures.pop();
+    expect(h.s.queueOverlapHold(candidate, HEAD)?.kind).toBe('queue-file-overlap');
+    expect(h.calls).toHaveLength(6);
+  });
+  it.each([
+    ['self excluded', { queueFacts: facts([42]), ghView: { 42: { files: [card] } } }],
+    ['cards disabled', { env: { WE_DRAIN_QUEUE_FILE_OVERLAP_INCLUDES_CARDS: 'off' } }],
+    ['disjoint', { ghView: { 43: { files: ['other'] } } }],
+    ['unknown queued files', { ghView: { 43: { files: null } } }],
+    ['direct mode', { strategy: 'drain-direct' }],
+  ])('pre-check fails open for %s', (_name, options) => {
+    const h = setup(options);
+    expect(h.s.queueOverlapHold(candidate, HEAD)).toBeNull();
+  });
+  it('pre-check also reads in dry run without any mutation', () => {
+    const h = setup({ dryRun: true });
+    expect(h.s.queueOverlapHold(candidate, HEAD)?.kind).toBe('queue-file-overlap');
+    expect(h.calls).toHaveLength(2);
+    expect(h.state()).toBeNull();
+  });
   it('defers shared cards before any enqueue mutation and reports policy source', () => {
     const h = setup();
     expect(h.s.enqueue(candidate, HEAD, { comments: stampedBy(DRAIN) })).toEqual({
@@ -1469,5 +1521,230 @@ describe('live queue file-overlap admission', () => {
     expect(h.s.enqueue(c, HEAD, { comments: stampedBy(DRAIN) })).toMatchObject({ enqueued: true });
     expect(h.logs.join('')).toContain('candidate files unknown — continuing enqueue');
     expect(h.calls.some(call => call[0] === 'gh' && call.includes('files'))).toBe(false);
+  });
+});
+
+
+describe('red-team requests while queue-file-overlap deferred', () => {
+  const c = { num: 42, listedFiles: ['scripts/x.mjs'], listedFilesComplete: true };
+  const panel = { verdict: { verdict: 'accept' }, findings: { read: {
+    netBasis: { rev: HEAD }, netChangedFiles: ['scripts/x.mjs'],
+  } } };
+  const evidence = { scheduled: false, recorded: false, attempted: false, inFlight: false, loopPayload: panel };
+  const key = 'cwd#42';
+  function setup(extra = {}) {
+    let clock = 1000;
+    const requestRedTeam = vi.fn(() => ({ requested: true }));
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'],
+      env: { WE_RED_TEAM_TIMING: 'post-accept', WE_DRAIN_RED_TEAM_REQUEST_COOLDOWN_MIN: '2' }, evidence,
+      requestRedTeam, now: () => clock,
+      queueFacts: { data: { repository: { mergeQueue: { entries: {
+        pageInfo: { hasNextPage: false }, nodes: [{ pullRequest: { number: 43 } }],
+      } } } } }, ghView: { 43: { files: [{ path: 'scripts/x.mjs' }] } }, ...extra });
+    return { ...h, requestRedTeam, advance: ms => { clock += ms; } };
+  }
+  const hasEnqueueMutation = h => h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')));
+
+  const sibling = { ...c, repo: 'plateauapp/plateau-app' };
+  it('requests once for a non-local repo in enqueue mode without adding a hold', () => {
+    const h = setup();
+    expect(h.s.requestRedTeamWhileDeferred(sibling, HEAD)).toEqual({ requested: true });
+    expect(h.requestRedTeam).toHaveBeenCalledWith({ repo: sibling.repo, pr: 42, head: HEAD, loopPayload: panel });
+    expect(h.s.requestRedTeamWhileDeferred(sibling, HEAD)).toEqual({ requested: false });
+    expect(h.requestRedTeam).toHaveBeenCalledTimes(1);
+    expect(h.s.enqueues(sibling.repo)).toBe(false);
+    expect(h.s.recordedHold(sibling, HEAD)).toBeNull();
+    expect(h.s.queueOverlapHold(sibling, HEAD)).toBeNull();
+    expect(h.state().redTeamPending[`${sibling.repo}#42`].requestedAt).toBe(1000);
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it.each([
+    ['not accepted', { labels: ['ready-to-merge'] }],
+    ['dry run', { dryRun: true }],
+    ['head mismatch', { ghView: { 42: { headRefOid: 'a'.repeat(40), labels: ['review:accepted', 'ready-to-merge'] } } }],
+    ['direct mode', { strategy: 'drain-direct' }],
+  ])('does not request for a non-local repo when %s', (_label, extra) => {
+    const h = setup(extra);
+    expect(h.s.requestRedTeamWhileDeferred(sibling, HEAD)).toBeNull();
+    expect(h.requestRedTeam).not.toHaveBeenCalled();
+    expect(h.state()).toBeNull();
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it('respects request cooldown for a non-local repo', () => {
+    const requestRedTeam = vi.fn(() => ({ requested: false }));
+    const h = setup({ requestRedTeam });
+    expect(h.s.requestRedTeamWhileDeferred(sibling, HEAD)).toEqual({ requested: false });
+    h.advance(60_000);
+    expect(h.s.requestRedTeamWhileDeferred(sibling, HEAD)).toEqual({ requested: false });
+    expect(requestRedTeam).toHaveBeenCalledTimes(1);
+    h.advance(60_000);
+    expect(h.s.requestRedTeamWhileDeferred(sibling, HEAD)).toEqual({ requested: false });
+    expect(requestRedTeam).toHaveBeenCalledTimes(2);
+    expect(h.s.recordedHold(sibling, HEAD)).toBeNull();
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it.each([
+    { labels: ['review:accepted'] },
+    { labels: ['review:accepted', 'ready-to-merge', 'review:changes'] },
+    { labels: ['review:accepted', 'ready-to-merge', 'review:human'] },
+    { labels: ['review:accepted', 'ready-to-merge', 'review:pending'] },
+  ])('refuses send-back labels without writing state: $labels', ({ labels }) => {
+    const h = setup({ labels });
+    expect(h.s.requestRedTeamWhileDeferred(c, HEAD)).toEqual({ requested: false });
+    expect(h.requestRedTeam).not.toHaveBeenCalled();
+    expect(h.state()).toBeNull();
+    expect(h.calls.some(call => call.includes('--slurp'))).toBe(false);
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it.each([true, false])('does not request after a complete live-head result (confirmed break=%s)', confirmedBreak => {
+    const h = setup({ liveComments: [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
+      pr: 42, rev: HEAD, recheckStatus: 'ok',
+      findings: confirmedBreak ? [{ summary: 'live break', category: 'security', impactIfUnfixed: 'broken', confirmedByRecheck: true }] : [],
+    }) }] });
+    expect(h.s.requestRedTeamWhileDeferred(c, HEAD)).toEqual({ requested: false });
+    expect(h.calls).toContainEqual(['gh', 'api', '--paginate', '--slurp', `repos/${LOCAL}/issues/42/comments`]);
+    expect(h.requestRedTeam).not.toHaveBeenCalled();
+    expect(h.state()).toBeNull();
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it('refuses an incomplete saved red-team recheck without writing state', () => {
+    const root = mkdtempSync(join(tmpdir(), 'drain-deferred-incomplete-'));
+    try {
+      const env = { WE_RED_TEAM_TIMING: 'post-accept', CONVEYOR_STATE_ROOT: root,
+        WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_DRAIN_READS_SAVED_RESULT: 'on' };
+      const path = resolveScorecardStorePath(env);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, JSON.stringify({ version: 1, records: [{ dispatchKind: 'review-seat', seat: 'red-team',
+        repo: LOCAL, pr: 42, rev: HEAD, status: 'ok', recheckStatus: 'pending', confirmedMissCount: 1,
+        findings: [{ confirmedByRecheck: true, impactIfUnfixed: 'degraded' }, { confirmedByRecheck: false }] }] }));
+      saveProvenanceFixtures(env);
+      const h = setup({ env, liveComments: [] });
+      expect(h.s.requestRedTeamWhileDeferred(c, HEAD)).toEqual({ requested: false });
+      expect(h.requestRedTeam).not.toHaveBeenCalled();
+      expect(h.state()).toBeNull();
+      expect(hasEnqueueMutation(h)).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('returns null for unreadable complete comments without writing state', () => {
+    const h = setup({ liveComments: { unreadable: true } });
+    expect(h.s.requestRedTeamWhileDeferred(c, HEAD)).toBeNull();
+    expect(h.requestRedTeam).not.toHaveBeenCalled();
+    expect(h.state()).toBeNull();
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it('requests once during overlap, persists the request, and leaves admission held', () => {
+    const h = setup();
+    const hold = h.s.queueOverlapHold(c, HEAD);
+    expect(hold).toMatchObject({ kind: 'queue-file-overlap' });
+    expect(h.s.requestRedTeamWhileDeferred(c, HEAD)).toEqual({ requested: true });
+    expect(h.requestRedTeam).toHaveBeenCalledWith({ repo: LOCAL, pr: 42, head: HEAD, loopPayload: panel });
+    expect(h.requestRedTeam).toHaveBeenCalledTimes(1);
+    expect(h.state().redTeamPending[key]).toEqual({ headSha: HEAD, firstPendingAt: 1000, retryAt: 1000,
+      checkedAt: 1000, commentCount: 0, requestAttemptedAt: 1000, requestedAt: 1000,
+      reason: 'red team requested while queue-file-overlap deferred' });
+    expect(hasEnqueueMutation(h)).toBe(false);
+    expect(h.s.requestRedTeamWhileDeferred(c, HEAD)).toEqual({ requested: false });
+    h.advance(60 * 60_000);
+    expect(h.s.requestRedTeamWhileDeferred(c, HEAD)).toEqual({ requested: false });
+    expect(h.s.enqueue(c, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(h.requestRedTeam).toHaveBeenCalledTimes(1);
+    expect(h.s.queueOverlapHold(c, HEAD)).toEqual(hold);
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it('persists failed attempts before dispatch and retries only after cooldown', () => {
+    let h;
+    const requestRedTeam = vi.fn(() => {
+      expect(h.state().redTeamPending[key].requestAttemptedAt).toBeDefined();
+      throw new Error('dispatcher unavailable');
+    });
+    h = setup({ requestRedTeam });
+    expect(h.s.requestRedTeamWhileDeferred(c, HEAD)).toEqual({ requested: false });
+    h.advance(60_000);
+    h.s.requestRedTeamWhileDeferred(c, HEAD);
+    expect(requestRedTeam).toHaveBeenCalledTimes(1);
+    h.advance(60_000);
+    h.s.requestRedTeamWhileDeferred(c, HEAD);
+    expect(requestRedTeam).toHaveBeenCalledTimes(2);
+    expect(h.state().redTeamPending[key].requestedAt).toBeUndefined();
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it.each(['recorded', 'attempted', 'inFlight', 'queued'])('refuses %s evidence without stale recovery eligibility', field => {
+    const h = setup({ evidence: { ...evidence, [field]: true } });
+    h.s.requestRedTeamWhileDeferred(c, HEAD);
+    expect(h.requestRedTeam).not.toHaveBeenCalled();
+    expect(h.state()).toBeNull();
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it.each([
+    { labels: ['ready-to-merge'] },
+    { ghView: { 42: { headRefOid: 'a'.repeat(40), labels: ['review:accepted'] } } },
+    { dryRun: true },
+    { env: { WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE: 'false' } },
+    { strategy: 'drain-direct' },
+    { requestRedTeam: null },
+    { evidence: { ...evidence, readError: true } },
+    { viewThrows: [42] },
+  ])('does nothing when prerequisites fail (%j)', extra => {
+    const h = setup(extra);
+    expect(() => h.s.requestRedTeamWhileDeferred(c, HEAD)).not.toThrow();
+    expect(h.requestRedTeam).not.toHaveBeenCalled();
+    expect(h.state()).toBeNull();
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it('does nothing without a head', () => {
+    const h = setup();
+    expect(h.s.requestRedTeamWhileDeferred(c, null)).toBeNull();
+    expect(h.calls).toEqual([]);
+    expect(h.requestRedTeam).not.toHaveBeenCalled();
+  });
+
+  it('takes the land lock before reading state and respects lock refusal', () => {
+    const withLock = vi.fn(fn => ({ ran: true, result: fn() }));
+    const h = setup({ withLock });
+    h.s.requestRedTeamWhileDeferred(c, HEAD);
+    expect(withLock).toHaveBeenCalledTimes(1);
+    expect(h.requestRedTeam).toHaveBeenCalledTimes(1);
+    const refused = setup({ withLock: () => ({ ran: false }) });
+    expect(refused.s.requestRedTeamWhileDeferred(c, HEAD)).toBeNull();
+    expect(refused.calls).toEqual([]);
+    expect(refused.state()).toBeNull();
+    expect(refused.requestRedTeam).not.toHaveBeenCalled();
+  });
+
+  it.each(['post-accept', 'panel-seat'])('shares stale recovery eligibility for %s', timing => {
+    const h = setup({ env: { WE_RED_TEAM_TIMING: timing },
+      evidence: { ...evidence, scheduled: true, recorded: true, attempted: true, noUsableResult: true } });
+    expect(h.s.requestRedTeamWhileDeferred(c, HEAD)).toEqual({ requested: true });
+    expect(h.requestRedTeam).toHaveBeenCalledTimes(1);
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it('requests an orphaned accepted panel seat even when policy marks it scheduled', () => {
+    const h = setup({ env: { WE_RED_TEAM_TIMING: 'panel-seat' }, evidence: { ...evidence, scheduled: true } });
+    expect(h.s.requestRedTeamWhileDeferred(c, HEAD)).toEqual({ requested: true });
+    expect(h.requestRedTeam).toHaveBeenCalledTimes(1);
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it.each([
+    () => [{ name: 'review-42', state: 'queued', repo: LOCAL, pr: 42 }],
+    () => { throw new Error('unknown jobs'); },
+  ])('does not request an orphaned panel seat without proving jobs inactive', readReviewAgents => {
+    const h = setup({ env: { WE_RED_TEAM_TIMING: 'panel-seat' }, readReviewAgents,
+      evidence: { ...evidence, scheduled: true } });
+    expect(h.s.requestRedTeamWhileDeferred(c, HEAD)).toEqual({ requested: false });
+    expect(h.requestRedTeam).not.toHaveBeenCalled();
+    expect(hasEnqueueMutation(h)).toBe(false);
   });
 });

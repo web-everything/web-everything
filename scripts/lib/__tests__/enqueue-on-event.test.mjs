@@ -1725,3 +1725,73 @@ describe('red-main scheduling', () => {
     } finally { f.handle.kill(); }
   });
 });
+
+
+describe('queue overlap catch-up scheduling', () => {
+  const overlap = { considered: 1, enqueueOutcomes: [
+    { num: 42, outcome: 'not-enqueued', kind: 'queue-file-overlap', reason: '#12,#13 share backlog/card.md, scripts/a.mjs' },
+  ] };
+  const options = {
+    resolveThroughput: () => ({ value: { catchUpSkipQueueOverlap: true }, sources: { catchUpSkipQueueOverlap: 'tool' } }),
+    readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42)] }),
+    drainJson: overlap,
+  };
+  it('skips while any blocker is queued, resumes after departure and forgets a different outcome', async () => {
+    let queuedNums = [13], result = overlap;
+    const f = catchUpSetup({ ...options,
+      readQueueDepth: async () => ({ ok: true, queued: queuedNums.length, queuedNums }),
+      drainResult: () => result,
+    });
+    try {
+      await f.handle.catchUp();
+      f.advance(600_001);
+      await f.handle.catchUp();
+      expect(f.calls).toHaveLength(1);
+      expect(f.lines).toContain('enqueue-on-event: catch-up skipped 1 PR(s): queue-file-overlap blocker still queued (#42<-#13) (drain.catchUpSkipQueueOverlap=on (tool))');
+      queuedNums = [];
+      result = { considered: 1, enqueueOutcomes: [{ num: 42, outcome: 'not-enqueued', kind: 'checks', reason: 'checks pending' }] };
+      f.advance(600_001);
+      await f.handle.catchUp();
+      expect(f.calls).toHaveLength(2);
+      queuedNums = [12, 13];
+      f.advance(600_001);
+      await f.handle.catchUp();
+      expect(f.calls).toHaveLength(3);
+    } finally { f.handle.kill(); }
+  });
+  it('applies no skip when the queue is unreadable (no drain starts without a readable depth either)', async () => {
+    const f = catchUpSetup({ ...options, readQueueDepth: async () => ({ ok: false, error: 'HTTP 502' }) });
+    try {
+      await f.handle.catchUp();
+      f.advance(600_001);
+      await f.handle.catchUp();
+      expect(f.lines.some(l => l.includes('queue-file-overlap blocker still queued'))).toBe(false);
+    } finally { f.handle.kill(); }
+  });
+  it.each([
+    ['setting off', false, { ok: true, queued: 1, queuedNums: [12] }],
+  ])('fails open with %s', async (_name, enabled, depth) => {
+    const f = catchUpSetup({ ...options,
+      resolveThroughput: () => ({ value: { catchUpSkipQueueOverlap: enabled } }),
+      readQueueDepth: async () => depth,
+    });
+    try {
+      await f.handle.catchUp();
+      f.advance(600_001);
+      await f.handle.catchUp();
+      expect(f.calls).toHaveLength(2);
+    } finally { f.handle.kill(); }
+  });
+  it('leaves event-driven runs eligible while a blocker remains queued', async () => {
+    const f = catchUpSetup({ ...options,
+      readQueueDepth: async () => ({ ok: true, queued: 1, queuedNums: [12] }),
+    });
+    try {
+      await f.handle.catchUp();
+      f.handle.notePoll({ ok: true, marked: [mark(42)] });
+      f.advance(16_000);
+      await f.handle.tick();
+      expect(f.calls).toHaveLength(2);
+    } finally { f.handle.kill(); }
+  });
+});
