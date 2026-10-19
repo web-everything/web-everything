@@ -1,4 +1,5 @@
 ---
+bornAs: xgyj0q6
 kind: story
 size: 8
 status: open
