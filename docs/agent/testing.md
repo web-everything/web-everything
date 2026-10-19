@@ -2090,6 +2090,39 @@ cannot prove a red run. Git-read errors are reported as unknown rather than evid
 
 ### Drain pass-start PR batching
 
+`drain.pipeline` defaults to `shadow` in `scripts/settings/drain-pipeline.json`;
+`drain["pipeline.workers"]` defaults to 4 (env `WE_DRAIN_PIPELINE` /
+`WE_DRAIN_PIPELINE_WORKERS`). `drain["pipeline.timeoutMs"]` defaults to 240000ms
+(env `WE_DRAIN_PIPELINE_TIMEOUT_MS`, valid 1..600000). Sources are logged per cycle.
+The live shadow reuses `hostLoadAdmission` with `interactive: false` and
+`execDrainAsync`'s gh throttle. It takes no heavy-admission slot. Overloaded or
+unknown host load makes workers wait with abort-aware polls every 2 seconds, bounded
+by the shadow time box; no read proceeds without host admission. Each synchronous
+queue reader is replayed only against its own freshly captured async gh responses,
+so its production parsing and decisions are reused without blocking throttle waits.
+No `on` writer exists. Unknown gates refuse, with reasons in the JSON record.
+Local evidence scanning and its hold evaluator run in a cancellable read-only
+subprocess under the preparation host-load gate. Pass the pure `savedRedTeamRunsDir` result
+explicitly to evidence readers: the
+default `resolveRunsDir` migrates files. Keep scorecard reads on explicit paths too.
+`readPinnedChangedFiles` fetches git and cannot run in the read-only shadow; branch
+preparation, acceptance restamps and live couple preflight also remain unproven.
+`complete` means the read/projection stages completed, not full guard parity.
+The final pass summary awaits the single emit for `drain["pipeline.graceMs"]`
+(default 60000ms for the shadow day; env `WE_DRAIN_PIPELINE_GRACE_MS`, valid 0..600000),
+then aborts pending shadow work and emits an incomplete record. This grace is the
+only way shadow lengthens a pass. Each preparation row includes classification,
+decision, reason and `prepMs` (null until prep finishes), including on abort. The
+record includes `prepWallMs`, `mergeCascadeMs`, `serialReadyMs` and actual enqueue
+agreement/diffs; dry-run actual enqueues are empty by definition. `finish` itself never waits.
+Construct the live shadow only after every pass-local dependency is initialized,
+including both repo-key callbacks. Keep adapter/input evaluation inside
+`setupPipelineShadow` and finish facts inside `finishPipelineShadow`; shadow setup,
+finish and await errors must remain diagnostic-only. The pipeline suite statically
+checks all hook references for declaration order and probes throwing lifecycle paths.
+`serialReadyMs` measures pass-start to the last confirmed enqueue; no enqueue is null.
+Exercise `scripts/lib/__tests__/drain-pipeline.test.mjs` through heavy admission.
+
 `drain.prState.batched` defaults true in `scripts/settings/drain-pr-state.json` and
 resolves through standard → platform `drain.prState` → tool → environment
 (`WE_DRAIN_PR_STATE_BATCHED`). The drain logs the effective value and source each pass.

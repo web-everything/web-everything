@@ -1,0 +1,9 @@
+{
+  "$comment": "Shadow-only: drain.pipeline is off|shadow|on; on has no writer. pipeline.workers defaults 4. pipeline.timeoutMs defaults 240000, valid 1..600000. pipeline.graceMs defaults 60000 for the shadow day, valid 0..600000. WE_DRAIN_PIPELINE, WE_DRAIN_PIPELINE_WORKERS, WE_DRAIN_PIPELINE_TIMEOUT_MS and WE_DRAIN_PIPELINE_GRACE_MS override the standard/platform/tool cascade. Reads wait for the shared host-load gate without taking heavy-admission slots, bounded by the shadow time box, and use the existing gh throttle. Unknown writer-dependent guards refuse. End-of-pass pipeline.graceMs is the ONLY way shadow lengthens a pass, bounded by this value.",
+  "drain": {
+    "pipeline": "shadow",
+    "pipeline.workers": 4,
+    "pipeline.timeoutMs": 240000,
+    "pipeline.graceMs": 60000
+  }
+}

@@ -208,6 +208,7 @@ import { mapWithConcurrency, runEnqueueCandidates, canParallelEnqueue, createBra
 import { execDrainAsync } from './lib/drain-gh-async.mjs';
 import { resolveDrainPrState, readDrainPrStateBatch, batchedDrainPr } from './lib/drain-pr-state.mjs';
 export { mapWithConcurrency } from './lib/drain-concurrency.mjs';
+import { startPipelineShadow, setupPipelineShadow, finishPipelineShadow, createPipelineReadAdapters, awaitPipelineShadow } from './lib/drain-pipeline.mjs';
 import { runLedgerShadow, formatShadowLine } from './lib/drain-ledger-shadow.mjs'; // #5444 — ledger gate in SHADOW beside the labels; journals, never decides
 import { drainReviewGateFact, readDrainLedgerSnapshot, recordDrainLedgerFacts } from './lib/drain-ledger-facts.mjs';
 import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overlapRowKey, readyToMergeLabelTimeMs } from './conveyor/land-overlap-yield.mjs'; // + readyToMergeLabelTimeMs: the drain order's ready-at (same cached label read) // #4308 — the land-time overlap-yield planner (see planLabelDrain's own `overlapContext` param)
@@ -6445,6 +6446,8 @@ async function runCli() {
   const merged = [];
   const failedMerges = [];
   const enqueueOutcomes = [];
+  let pipelineLastEnqueueMs = null;
+
   // #2779-incident — the OTHER currently-open PR numbers for a candidate's own repo, at pass-start, EXCLUDING
   // the candidate's own `c.num` and any number already recorded into `merged` THIS pass (a sibling that merged
   // earlier in this same cascade has already left the open set — the same staleness `liveOpenHeadRefs` already
@@ -6550,6 +6553,17 @@ async function runCli() {
   const coupleSplit = [];
   const repoKeyOfVerdict = (v) => (isLocalRepo(v.repo) ? (repoKeyFromSlug(localSlug) || 'we') : repoKeyFromSlug(v.repo));
   const repoKeyOfSlug = (slug) => (isLocalRepo(slug) ? (repoKeyFromSlug(localSlug) || 'we') : repoKeyFromSlug(slug));
+  // Construct only after all pass-local dependencies (including both repo-key callbacks) exist.
+  const pipelineShadow = setupPipelineShadow(() => startPipelineShadow({ prs: verdicts, passElapsedMs: Date.now() - __passStart, ...createPipelineReadAdapters({
+    prs: verdicts, localSlug, enqueues: repo => mergeStrategy.enqueues(repo),
+    plannerOptions: { provenOnMain: new Set(provenOnMain), extraOpenItems: new Set(orderExtraOpenItems),
+      contextComplete: !!openPrContext.contextComplete, strictAbsentHashDependencies: onlyPr != null, isWeRepo: isLocalRepo },
+    coupleOptions: { openSiblingRefs: openSiblingRefSet(openPrContext.prsByRepo, new Set(), repoKeyOfSlug), repoKeyOf: repoKeyOfVerdict },
+    resolveRequiredCheck, revalidateWithUnknownRetry, planLabelDrain, unknownRetry: UNKNOWN_RETRY,
+    optionsOf: c => ({ requiredCheck: REQUIRED, queueRequiredChecks: queueRequiredChecksOf(c.repo),
+      allowPendingReview: (escalationRelief.prs || []).includes(Number(c.num)) || (!!escalationRelief.passWide && !!label),
+      defaultBranch: defaultBranchOf(c.repo), expectedHeadSha: c.listedHeadSha || c.headSha || null }),
+  }) }));
   // All non-CI gates and the couple/dependency plan have now run. Provisional pending candidates
   // leave the real cascade here: preparation NEVER authorizes an enqueue (or a direct merge).
   const stageReady = new Set(preparedPass.plan.ready.map(c => candKey(c)));
@@ -6944,6 +6958,7 @@ async function runCli() {
           }
           if (landLock.result?.enqueued === true) {
             enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'enqueued', already: !!landLock.result.already });
+            pipelineLastEnqueueMs = Date.now() - __passStart;
             await recordLandedLedgerFacts(c, traceHeadSha); // PR #5195 — only a confirmed enqueue writes the clearing facts
           }
           if (landLock.result?.enqueued === false) {
@@ -7314,9 +7329,11 @@ async function runCli() {
   // #gh-graphql-budget — this pass's own writes (merges, label flips, parks) go straight to `gh`, not through the
   // throttle that marks the shared open-PR snapshot dirty on a write — so mark it here, once, when anything moved.
   if (merged.length || reconciledLabels.length || parked.length) for (const r of REPOS) markPrSnapshotDirty({ repo: r || localSlug });
-  const passTotalMs = Date.now() - __passStart;
+  let passTotalMs = Date.now() - __passStart;
   const timingSteps = __t.snapshot();
   const timings = { ...timingSteps, total: passTotalMs };
+  finishPipelineShadow(pipelineShadow, () => ({ actual: enqueueOutcomes.filter(r => r.outcome === 'enqueued'), serialReadyMs: pipelineLastEnqueueMs, timings }));
+
   // UNCONDITIONAL (never gated on `!AS_JSON` like every other progress line above): the resident daemon always
   // runs with `--json`, and its child's stderr is the ONLY channel that reaches `we:.drain-daemon/daemon.log` —
   // gating this the way every other line here is gated would make the summary invisible on the one caller that
@@ -7334,6 +7351,8 @@ async function runCli() {
     verdicts, merged, enqueueOutcomes, localSlug,
     readPr: num => JSON.parse(readGh(['pr', 'view', String(num), '--repo', localSlug, '--json', 'number,state,labels'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })),
   });
+  await awaitPipelineShadow(pipelineShadow); // Wait only the configured shadow grace for the single emit before this child exits.
+  timings.total = passTotalMs = Date.now() - __passStart;
   process.stderr.write(`merge-ai-prs · pass timings: ${formatTimingsSummary(timingSteps, { total: passTotalMs, order: PASS_STEP_ORDER })} (considered ${verdicts.length}, merged ${merged.length}, ${formatSkipSummary(skipReasons)}; ${formatConcurrencySources(resolvedMergePolicy.policy)})\n`);
   // Card 122 slice 1 — logging only: the machine-readable twin of the summary above (coroner / perf-snapshot read it).
   process.stderr.write(`${formatSkipReasonsLine(skipReasons)}\n`);
