@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   createDrainMergeStrategy, resolveDrainMergePolicy, readEnqueueClearance, buildClearanceComment, hasClearanceFor, DRY_RUN_STRATEGY_ENV,
-  requestDrainRedTeam, readDrainRedTeamRequests, finishDrainRedTeamRequest, readQueueState, FOLLOW_UP_MAX_ATTEMPTS, readMergeDeliveryToolSettings, MERGE_DELIVERY_SETTINGS_FILE_ENV,
+  staleRedTeamRequestEligibility, requestDrainRedTeam, readDrainRedTeamRequests, finishDrainRedTeamRequest, readQueueState, FOLLOW_UP_MAX_ATTEMPTS, readMergeDeliveryToolSettings, MERGE_DELIVERY_SETTINGS_FILE_ENV,
 } from '../drain-merge-strategy.mjs';
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
@@ -15,6 +15,7 @@ import { rulesetSuggestion } from '../merge-queue-enqueue.mjs';
 import { saveProvenanceFixtures } from './fixtures/saved-red-team-provenance.mjs';
 import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mjs';
 import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
+import { withLandWriteLock } from '../../readiness/drain-lock.mjs';
 
 const HEAD = 'b'.repeat(40);
 const BASE_TIP = 'e'.repeat(40);
@@ -584,6 +585,122 @@ describe('merge-ai-prs hook wiring', () => {
 });
 
 
+describe('recorded hold read-only admission', () => {
+  const key = 'cwd#5283';
+  const initial = () => ({ pending: [], followedUp: [], redTeamPending: {
+    [key]: { headSha: HEAD, firstPendingAt: 0, retryAt: 0, reason: 'no recorded result on the live head' },
+  } });
+  function reader({ state, write, head = HEAD, evidence = {}, labels = ['review:accepted', 'ready-to-merge'], onView = () => {}, request = () => {} }) {
+    const mutations = [];
+    const s = createDrainMergeStrategy({ localSlug: LOCAL, statePath: 'unused-hold-state',
+      resolved: policyOf('github-merge-queue'), env: { WE_RED_TEAM_TIMING: 'post-accept' },
+      queueSafety: { value: { waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true } },
+      now: () => 1000, log: { write: () => {} },
+      readFile: () => JSON.stringify(state()), writeState: (_path, value) => write(structuredClone(value)),
+      readRedTeamEvidence: () => evidence, requestRedTeam: request,
+      labelProvider: { ensureLabel: () => mutations.push('ensure-label'), setLabels: () => mutations.push('labels') },
+      exec: (_cmd, args) => {
+        if (args[0] === 'pr' && args[1] === 'view') {
+          onView();
+          return JSON.stringify({ headRefOid: typeof head === 'function' ? head() : head, labels });
+        }
+        if (args.includes('--slurp')) return '[[]]';
+        mutations.push(args);
+        return '{}';
+      },
+    });
+    return { s, mutations };
+  }
+
+  it.each(['held', 'clear', 'request', 'sent-back'])('holdOnly performs zero shared-state writes: %s', mode => {
+    let stored = initial();
+    const writes = [];
+    const requests = [];
+    const h = reader({ state: () => stored, write: value => { writes.push(value); stored = value; },
+      labels: mode === 'sent-back' ? ['review:changes'] : mode === 'clear' ? ['ready-to-merge'] : ['review:accepted', 'ready-to-merge'],
+      evidence: mode === 'clear' ? { skipCardOnly: true, scheduled: false }
+        : mode === 'request' ? { scheduled: false, loopPayload: { verdict: { verdict: 'accept' } } }
+          : { scheduled: true, inFlight: true },
+      request: value => { requests.push(value); return { requested: true }; },
+    });
+    const before = structuredClone(stored);
+    const outcome = h.s.recordedHold({ num: 5283 }, HEAD);
+    expect(outcome).toBeNull(); // every case needs the ordinary locked path to refresh/clear/dequeue
+    expect(writes).toEqual([]);
+    expect(stored).toEqual(before);
+    expect(h.mutations).toEqual([]);
+    expect(requests).toEqual([]);
+  });
+
+  it('keeps a cached hold and refreshes an expired hold only on ordinary locked enqueue', () => {
+    const root = mkdtempSync(join(tmpdir(), 'hold-refresh-lock-'));
+    try {
+      let stored = initial();
+      stored.redTeamPending[key].retryAt = 2000;
+      const writes = [];
+      let locked = false;
+      const h = reader({ state: () => stored, write: value => { writes.push(locked); stored = value; },
+        evidence: { scheduled: true, inFlight: true },
+      });
+      expect(h.s.recordedHold({ num: 5283 }, HEAD)).toMatchObject({ kind: 'red-team-pending' });
+      expect(writes).toEqual([]);
+      stored.redTeamPending[key].retryAt = 0;
+      expect(h.s.recordedHold({ num: 5283 }, HEAD)).toBeNull();
+      expect(writes).toEqual([]);
+      // A peer's queue entry arrives after the pre-check and must survive the locked state re-read.
+      stored.pending.push({ num: 77, headSha: HEAD });
+      const result = withLandWriteLock(() => {
+        locked = true;
+        try { return h.s.enqueue({ num: 5283 }, HEAD); } finally { locked = false; }
+      }, { lockRoot: root, runUnlockedOnContention: false });
+      expect(result.result).toMatchObject({ kind: 'red-team-pending' });
+      expect(writes).toEqual([true]);
+      expect(stored.pending).toEqual([expect.objectContaining({ num: 77 })]);
+      expect(stored.redTeamPending[key].retryAt).toBe(301000);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(['held', 'clear'])('overlapping drains preserve the newer-head hold and queue entries: %s old head', mode => {
+    const root = mkdtempSync(join(tmpdir(), 'hold-merge-lock-'));
+    try {
+      let stored = initial();
+      let locked = false;
+      let liveHead = HEAD;
+      const newerHead = 'c'.repeat(40);
+      const writes = [];
+      const write = value => { writes.push({ locked, value }); stored = value; };
+      const lock = fn => withLandWriteLock(() => {
+        locked = true;
+        try { return fn(); } finally { locked = false; }
+      }, { lockRoot: root, runUnlockedOnContention: false });
+      const peer = reader({ state: () => stored, write, head: newerHead, evidence: { scheduled: true, inFlight: true } });
+      let interleaved = false;
+      const old = reader({ state: () => stored, write, head: () => liveHead,
+        labels: mode === 'clear' ? ['ready-to-merge'] : ['review:accepted', 'ready-to-merge'],
+        evidence: mode === 'clear' ? { skipCardOnly: true, scheduled: false } : { scheduled: true, inFlight: true },
+        onView: () => {
+          if (interleaved) return;
+          interleaved = true;
+          // The old drain has read its snapshot. A second drain now records a new head under the real mutex.
+          expect(lock(() => {
+            stored.pending.push({ num: 77, repo: null, headSha: newerHead });
+            return peer.s.enqueue({ num: 5283 }, newerHead);
+          }).result).toMatchObject({ kind: 'red-team-pending' });
+        },
+      });
+      old.s.recordedHold({ num: 5283 }, HEAD);
+      expect(stored.redTeamPending[key].headSha).toBe(newerHead);
+      expect(stored.pending).toEqual([expect.objectContaining({ num: 77 })]);
+      expect(writes.every(w => w.locked)).toBe(true);
+      // Falling through the pre-check is not clearance: locked enqueue re-reads state and the live head.
+      liveHead = newerHead;
+      expect(lock(() => old.s.enqueue({ num: 5283 }, HEAD)).result).toMatchObject({ kind: 'live-state-unreadable' });
+      expect(stored.redTeamPending[key].headSha).toBe(newerHead);
+      expect(stored.pending).toHaveLength(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
 describe('post-accept red-team enqueue barrier (#5283)', () => {
   it('an owed panel seat never uses the overdue request or never-scheduled escape', () => {
     let clock = 1000;
@@ -929,7 +1046,7 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     expect(restarted.s.enqueue({ num: 5485 }, HEAD, { comments: thread })).toMatchObject({ enqueued: true });
   });
   // Operator ruling (PR #5551): a run that ran but left no usable result is not "never scheduled". The head stays
-  // held until a usable result exists; the re-run path is a separate card.
+  // held until a usable result exists; stale attempts can request recovery without admission.
   function erroredRunAfterDeadline({ status, row, writer = LOCAL, rev = HEAD, read = {} }) {
     const root = mkdtempSync(join(tmpdir(), 'drain-errored-red-team-'));
     try {
@@ -968,7 +1085,7 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     expect(second).toMatchObject({ enqueued: false, kind: 'red-team-pending', healthSmell: true });
     expect(h.logs.join('')).not.toContain('red team never scheduled');
     expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
-    expect(requests).toHaveLength(0);
+    expect(requests).toHaveLength(run.status ? 1 : 0);
   });
   it('releases an errored card-only attempt without a seat row when the producer skips cards', () => {
     const { first, second, requests } = erroredRunAfterDeadline({
@@ -1197,6 +1314,52 @@ describe('orphaned accepted panel-seat recovery', () => {
       requestRedTeam: input => { requests.push(input); return { requested: false }; }, now: () => clock, ...extra });
     return { ...h, requests, advance: ms => { clock += ms; } };
   }
+  const stale = { ...evidence, recorded: true, attempted: true, untrustedSavedResult: true, noUsableResult: true };
+  it.each(['panel-seat', 'post-accept'])('%s requests stale rows once and keeps the head held', timing => {
+    const requestRedTeam = vi.fn(() => ({ requested: true }));
+    const h = setup({ evidence: stale, requestRedTeam, env: { WE_RED_TEAM_TIMING: timing } });
+    expect(h.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending', redTeamRequested: true });
+    expect(requestRedTeam).toHaveBeenCalledWith({ repo: LOCAL, pr: 5485, head: HEAD, loopPayload: panel });
+    expect(requestRedTeam).toHaveBeenCalledTimes(1);
+    h.advance(60 * 60_000);
+    const restarted = setup({ evidence: stale, requestRedTeam, initial: h.state(), now: () => 3_601_000,
+      env: { WE_RED_TEAM_TIMING: timing } });
+    expect(restarted.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(requestRedTeam).toHaveBeenCalledTimes(1);
+    expect(restarted.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
+  });
+  it.each([
+    { noUsableResult: false }, { inFlight: true }, { queued: true },
+  ])('does not request stale-looking rows with usable or active evidence (%j)', extra => {
+    const h = setup({ evidence: { ...stale, ...extra } });
+    h.s.enqueue({ num: 5485 }, HEAD);
+    h.advance(60 * 60_000);
+    expect(h.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(h.requests).toHaveLength(0);
+  });
+  it('respects cooldown for failed stale-row requests and never falls through to enqueue', () => {
+    const h = setup({ evidence: stale });
+    h.s.enqueue({ num: 5485 }, HEAD);
+    expect(h.requests).toHaveLength(1);
+    h.advance(60_000);
+    h.s.enqueue({ num: 5485 }, HEAD);
+    expect(h.requests).toHaveLength(1);
+    h.advance(60_000);
+    h.s.enqueue({ num: 5485 }, HEAD);
+    expect(h.requests).toHaveLength(2);
+    h.advance(60 * 60_000);
+    expect(h.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
+  });
+  it.each(['requiring send-back', 'saved red-team re-check incomplete'])('does not recover a recorded break: %s', reason => {
+    expect(staleRedTeamRequestEligibility({ evidence: stale, repo: LOCAL, pr: 5485, head: HEAD,
+      labels: ['review:accepted'], enabled: true, panelSeat: true, reviewAgents: [], reason }).eligible).toBe(false);
+  });
+  it('does not request stale rows in dry run', () => {
+    const h = setup({ evidence: stale, dryRun: true });
+    expect(() => h.s.enqueue({ num: 5485 }, HEAD)).toThrow('enqueue refused in dry run');
+    expect(h.requests).toHaveLength(0);
+  });
   it('requests an unseated accepted head promptly, retries on cooldown, and holds until a usable result', () => {
     const h = setup();
     expect(h.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });

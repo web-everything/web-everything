@@ -36,10 +36,12 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   const recorded = rows.some(row => row?.dispatchKind === 'review-seat' && row.seat === 'red-team'
     && sameRepo(row.repo, repo) && Number(row.pr) === Number(pr) && String(row.rev ?? '').toLowerCase() === head);
   let attempted = attemptedRedTeamRun(rows, { repo, pr, head });
-  // A nominally clean row rejected by provenance must not launch another pass or age into admission.
+  // Saved-result usability is independent of historical scorecard attempts.
+  const noSavedResult = readSavedRedTeamResult({ repo, pr, head, env, runsDir }) === null;
+  const withUsability = evidence => ({ ...evidence, noUsableResult: noSavedResult && !evidence.inFlight && !evidence.queued });
   const untrustedSavedResult = rows.some(row => row?.status === 'ok' && row?.dispatchKind === 'review-seat'
     && row.seat === 'red-team' && sameRepo(row.repo, repo) && Number(row.pr) === Number(pr) && row.rev === head)
-    && readSavedRedTeamResult({ repo, pr, head, env, runsDir }) === null;
+    && noSavedResult;
   // Runs are immutable in identity but updated in place: choose the latest read of this exact repo/PR/head.
   const latestRun = () => {
     const hits = list(runsDir).filter(id => id.startsWith('review-pr-')).map(id => ({ id, run: read(id, runsDir) }))
@@ -68,7 +70,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     // of an unchanged head labels its accept before its job writes `queued`).
     if (!['queued', 'running'].includes(status.status)) {
       const latest = latestRun();
-      if (latest.at > statusAt && owes(latest.run)) return { ...(untrustedSavedResult ? { untrustedSavedResult: true } : {}), loopPayload: latest.run, inFlight: false, scheduled: true, recorded, attempted };
+      if (latest.at > statusAt && owes(latest.run)) return withUsability({ ...(untrustedSavedResult ? { untrustedSavedResult: true } : {}), loopPayload: latest.run, inFlight: false, scheduled: true, recorded, attempted });
     }
     // A local pid probe says nothing about another host or namespace: keep that pass held for its result.
     // For local records, a changed birth time proves pid reuse. An unavailable birth time is unknown,
@@ -83,16 +85,16 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
       }
     }
     const resultStatus = typeof status.result === 'string' ? status.result : status.result?.status;
-    return { ...(untrustedSavedResult ? { untrustedSavedResult: true } : {}), loopPayload: status.loopPayload, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
+    return withUsability({ ...(untrustedSavedResult ? { untrustedSavedResult: true } : {}), loopPayload: status.loopPayload, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
       ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: redTeamPanelSeatOwed(status.loopPayload, env) || ['queued', 'running'].includes(status.status) || ['ran', 'error'].includes(resultStatus),
       recorded: recorded || resultStatus === 'ran',
       // A pass whose job died while running started and left no usable result, like one that errored.
-      attempted: attemptedRedTeamRun(rows, { repo, pr, head }, status.result) || (status.status === 'running' && !live) };
+      attempted: attemptedRedTeamRun(rows, { repo, pr, head }, status.result) || (status.status === 'running' && !live) });
   }
   const loopPayload = latestRun().run;
   // Without a job status, use the resolved card-only policy; a recorded or started pass still holds.
   // A pass that already ran (even unusably) is scheduled, never "never scheduled".
   const ran = attempted || attemptedRedTeamRun([], { repo, pr, head }, loopPayload?.redTeam);
-  return { ...(untrustedSavedResult ? { untrustedSavedResult: true } : {}), loopPayload, inFlight: false, scheduled: recorded || ran || owes(loopPayload),
-    recorded, attempted: ran };
+  return withUsability({ ...(untrustedSavedResult ? { untrustedSavedResult: true } : {}), loopPayload, inFlight: false, scheduled: recorded || ran || owes(loopPayload),
+    recorded, attempted: ran });
 }

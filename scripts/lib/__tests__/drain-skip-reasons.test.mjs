@@ -40,6 +40,20 @@ describe('drain skip reasons (card 122 slice 1)', () => {
     expect(rows.find((r) => r.num === 212)).toMatchObject({ kind: 'partner-pending', source: 'unaccounted' });
     expect(rows.find((r) => r.num === 212).reason).toMatch(/#4288.*checks-pending/);
   });
+  it.each([true, false])('reports held partners in JSON with passEnded=%s', passEnded => {
+    const skipReasons = buildSkipReasons({ passEnded, verdicts: [
+      { num: 1, repo: 'app', item: 42, decision: 'merge' },
+      { num: 2, item: 42, decision: 'skip', reason: 'required check "test" is not green' },
+      { num: 3, decision: 'merge' },
+      { num: 4, item: 99, decision: 'merge' },
+      { num: 5, item: 99, decision: 'merge' },
+    ] });
+    const rows = JSON.parse(JSON.stringify({ dryRun: !passEnded, skipReasons })).skipReasons;
+    expect(rows.find(r => r.num === 1)).toMatchObject({ kind: 'partner-pending' });
+    expect(rows.find(r => r.num === 1).reason).toContain('checks-pending');
+    expect(rows.some(r => r.kind === 'ready-not-reached')).toBe(passEnded);
+    if (!passEnded) expect(rows.map(r => r.num).sort()).toEqual([1, 2]);
+  });
   it('never emits the "other" bucket, for any skip reason', () => {
     for (const r of ['', undefined, 'something new', 'not AI-generated (x)', 'base is not main (y)', 'CodeQL check failed',
       'empty/whitespace description — x', 'could not re-read the PR fresh right before merging', 'test-gaming suspected']) {
