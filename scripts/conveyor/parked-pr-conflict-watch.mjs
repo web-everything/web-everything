@@ -210,6 +210,11 @@ export function isParkedConflictTarget(pr) {
   return hasUnclearedReviewLabel(pr?.labels, { allowPending: false });
 }
 
+/** Pure: rearm-review requires a live changes or accepted review label. */
+export function rearmIsOwed(labels) {
+  return hasReviewLabel(labels, REVIEW_LABELS.changes) || hasReviewLabel(labels, REVIEW_LABELS.accepted);
+}
+
 /** How long an APPROVED/queued PR may sit conflicting before it is bounced to a fix agent. The drain runs every
  *  minute or so but a pass can take many minutes; this gives it a real chance at the one conflict it heals on
  *  its own (a shared-manifest-only conflict, rebase-dropped on land) before the PR is sent back through fix
@@ -1586,11 +1591,13 @@ export function watchParkedPrConflicts({
           cardEntry.mechanicalRebase = cardAttempt;
           if (cardAttempt?.action === 'rebased' || cardAttempt?.action === 'current') {
             try {
-              postRearm({ pr, repo: resolvedRepo });
+              if (rearmIsOwed(pr.labels)) postRearm({ pr, repo: resolvedRepo });
               provider.setLabels(resolvedRepo, pr.number, { remove: [CONFLICT_LABEL] });
               cardEntry.owner = 'review';
               cardEntry.routedTo = 'card-conflict-resolver';
-            } catch {
+            } catch (err) {
+              cardEntry.error = cardEntry.rearmCause = conflictWatchCause(err);
+              console.error(`parked-pr-conflict-watch: PR #${pr.number}: card rearm failed: ${cardEntry.rearmCause}`);
               cardEntry.owner = 'conflict-watch';
               cardEntry.routedTo = 'card-conflict-rearm-pending';
             }
@@ -2224,7 +2231,7 @@ export function watchParkedPrConflicts({
         provider.setLabels(resolvedRepo, pr?.number, { add: CONFLICT_LABEL, remove: [] });
       } else if (plan.remove.length) {
         // `planConflictLabelChange` only ever returns a non-empty `remove` alongside `newlyResolved: true`.
-        const needsRearm = hasReviewLabel(pr?.labels, REVIEW_LABELS.changes) || cardOnly;
+        const needsRearm = hasReviewLabel(pr?.labels, REVIEW_LABELS.changes) || (cardOnly && rearmIsOwed(pr.labels));
         let deferRearm = false;
         if (needsRearm) {
           // #4118 (c) — never hand a repaired bounce back for re-review while a fix agent is STILL actively
@@ -2296,7 +2303,7 @@ export function watchParkedPrConflicts({
               postRearm({ pr, repo: resolvedRepo });
               entry.routedTo = 'rearm-review';
             } catch (e2) {
-              entry.error = String((e2 && e2.message) || e2).split('\n')[0];
+              entry.error = conflictWatchCause(e2);
             }
           }
           if (!entry.error) provider.setLabels(resolvedRepo, pr?.number, { add: undefined, remove: plan.remove });
