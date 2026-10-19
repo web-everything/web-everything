@@ -200,6 +200,8 @@ import { ensureFreshGithubAppEnv } from './lib/github-app-auth-env.mjs';
 // pass's TOTAL ms, no breakdown). See pass-timings.mjs's own header for the full shape/rationale.
 import { buildSkipReasons, formatSkipSummary, formatSkipReasonsLine } from './lib/drain-skip-reasons.mjs';
 import { createStepTimer, formatTimingsSummary, PASS_STEP_ORDER } from './lib/pass-timings.mjs';
+// Operator 2026-10-19 hotfix: persistent commit lists; manifests and read health always remain live.
+import { createDrainContextCache, resolveDrainContextCacheSettings } from './lib/drain-context-cache.mjs';
 import { mapWithConcurrency, runEnqueueCandidates, canParallelEnqueue, createBranchPreparationRequired, formatConcurrencySources } from './lib/drain-concurrency.mjs';
 import { execDrainAsync } from './lib/drain-gh-async.mjs';
 export { mapWithConcurrency } from './lib/drain-concurrency.mjs';
@@ -2762,7 +2764,7 @@ export { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing };
  *  listing is the overlap-yield planner's ONLY source for a same-based/non-draft/changed-file read on an open PR
  *  that is NOT itself `ready-to-merge` (a label-scoped candidate listing never sees it at all — #4308 Data). The
  *  measured cost of widening it is exactly Task 5's "warm and cold caches" number (this PR's own body). */
-export const CONTEXT_LIST_FIELDS = 'number,title,body,labels,statusCheckRollup,headRefName,headRefOid,baseRefName,isDraft,files';
+export const CONTEXT_LIST_FIELDS = 'number,updatedAt,title,body,labels,statusCheckRollup,headRefName,headRefOid,baseRefName,isDraft,files';
 
 /** #4108 (converge round 2) — the candidate listing's OWN fields, unwidened. Used verbatim when RECONCILE is
  *  off (a bare `/merge`/`/finish`/`/pr` sweep — no repo's context is ever collected that pass, #xc7p3q9 B3), so
@@ -4775,7 +4777,7 @@ async function runCli() {
   // Cross-pass read caches (live for the whole runCli lifetime, so a `--watch` loop reuses them each pass, like
   // `ensuredLabels` above). Two independent caches for the two deliberately-independent listings (#2421): the
   // unfiltered open-PR context, and the (possibly `--label`-scoped) merge-candidate sweep.
-  const ctxReadCache = new Map();   // collectOpenPrContext: (repo, num, sha + body) → { manifest, commits }
+  const contextCacheSettings = resolveDrainContextCacheSettings();
   const sweepReadCache = new Map(); // the merge-candidate loop: (repo, num, sha + body) → { commits, manifest }
   // #3674 — each swept repo's default branch (`gh repo view --json defaultBranchRef`), resolved once per run and
   // reused across `--watch` passes. A failed read stays unresolved (retried next pass) and leaves the
@@ -4792,7 +4794,7 @@ async function runCli() {
   // missing data); a genuinely-empty successful read returns `{ commits: [], degraded: false }` and DOES cache.
   const fetchPrCommits = async (repo, num, headSha = null) => {
     // #gh-graphql-budget — a PR's commit list is fixed by its head SHA, and the resident daemon starts a FRESH
-    // process every pass (so the in-process `ctxReadCache`/`sweepReadCache` below start empty each time and
+    // process every pass (so the in-process read maps below start empty each time and
     // re-read every open PR's commits every 60s). Persist a successful read on disk keyed by (repo, PR, head SHA).
     const cached = readShaCache({ repo: shaCacheRepo(repo, localSlug), num, sha: headSha, kind: 'commits' });
     if (Array.isArray(cached)) return { commits: cached, degraded: false };
@@ -4834,12 +4836,12 @@ async function runCli() {
   // `--only` sweep filtered out of the candidate set is still visible for the couple gate's health read.
   // #4108 (converge round 1 v3, simplicity lens) — no default: the sole call site (below) always passes
   // `liveListingsByRepo` explicitly.
-  const collectContext = (liveByRepo) => collectOpenPrContext({
+  const collectContext = (liveByRepo, __t, contextCache) => collectOpenPrContext({
     contextRepos: CONTEXT_REPOS,
     reconcileRan: true,
     // #999/xq985wu F3 — `--limit OPEN_PR_LIST_LIMIT` (raised off the old silent 100). This listing is the SOLE
     // cross-item ordering source on a full sweep, so a truncated page is a MERGE-SAFETY hazard.
-    listOpenPrs: async (repo) => {
+    listOpenPrs: (repo) => __t.timeAsync('listing.context.list', async () => {
       // #4108 — this repo was already listed LIVE this pass for the merge-candidate set below
       // (`SWEEP_LIST_FIELDS` widens that call to cover everything this context needs too) — reuse it instead of
       // a second `gh pr list` round-trip for the SAME repo, same pass. Only covers `repo`s in `REPOS`; a repo
@@ -4863,25 +4865,39 @@ async function runCli() {
       }
       const { stdout } = await execFileP('gh', ['pr', 'list', ...repoFlag(repo), '--state', 'open', '--limit', String(OPEN_PR_LIST_LIMIT), '--json', CONTEXT_LIST_FIELDS], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
       return resolveListedChecks(repo, JSON.parse(stdout.trim() || '[]'));
-    },
-    // #2417 — fan out the per-PR manifest + commits reads across ALL repos' open PRs at once (bounded pool), cached
-    // across `--watch` passes on unchanged head SHA + body. Returns key→{manifest, commits, degraded}.
-    fetchReads: async (flat) => {
+    }),
+    // Fan out live manifests + optionally cached commit lists across all open PRs (bounded pool).
+    fetchReads: (flat) => __t.timeAsync('listing.context.reads', async () => {
       const readsRaw = await fetchPrReadsCached(flat, {
-        cache: ctxReadCache,
+        // Never reuse manifest/health results across passes, even when the commit cache is disabled.
+        cache: new Map(),
         keyOf: ({ repo, p }) => prCacheKey(repo, p.number),
         shaOf: ({ p }) => prReadCacheIdentity(p),
         isDegraded: (v) => !!v?.degraded || !!v?.transient, // #2417 review — an error-path or non-head read is NOT cached
         fetchOne: async ({ repo, p }) => {
           const readCommits = shouldReadContextCommits({ onlyPr, scope: fastDrain.scope, isTarget: isFastDrainTarget(repo, p) });
-          const [manifestRes, commitsRes] = await Promise.all([readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p)), readCommits ? fetchPrCommits(repo, p.number, prHeadSha(p)) : { degraded: false }]);
-          return { manifest: manifestRes.manifest, ...(readCommits ? { commits: commitsRes.commits } : {}), degraded: manifestRes.degraded || commitsRes.degraded, transient: !!manifestRes.transient };
+          const cacheKey = { repo: shaCacheRepo(repo, localSlug), num: p.number, headRefOid: p.headRefOid,
+            updatedAt: p.updatedAt, identity: prReadCacheIdentity(p), readCommits };
+          const readCommitsLive = async () => {
+            if (!readCommits) return { degraded: false };
+            const cached = contextCache.get(cacheKey);
+            if (cached !== undefined) return { commits: cached, degraded: false };
+            const readStart = Date.now();
+            const result = await fetchPrCommits(repo, p.number, prHeadSha(p));
+            if (!result.degraded) contextCache.set(cacheKey, result.commits, Date.now() - readStart);
+            return result;
+          };
+          const [manifestRes, commitsRes] = await Promise.all([
+            readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p)), readCommitsLive(),
+          ]);
+          const value = { manifest: manifestRes.manifest, ...(readCommits ? { commits: commitsRes.commits } : {}), degraded: manifestRes.degraded || commitsRes.degraded, transient: !!manifestRes.transient };
+          return value;
         },
       });
       const out = new Map();
       for (const { repo, p } of flat) { const k = prCacheKey(repo, p.number); out.set(k, readsRaw.get(k)?.value || {}); }
       return out;
-    },
+    }),
     onListingFailed: (repo) => { if (!AS_JSON) process.stderr.write(`  ⚠️  FAILED open-PR listing for ${repoTag(repo) || 'cwd'}: gh pr list threw — the couple gate treats the open-PR context as INCOMPLETE this pass (fail closed; #xc7p3q9 B2).\n`); },
     onListingTruncated: (repo, n) => { if (!AS_JSON) process.stderr.write(`  ⚠️  DEGRADED open-PR listing for ${repoTag(repo) || 'cwd'}: ${n} PRs hit the --limit ${OPEN_PR_LIST_LIMIT} cap — the page MAY be truncated (oldest, longest-held blockers dropped first). The cross-item merge order derived from this listing is NOT trustworthy for the early-land decision this pass (#999/xq985wu F3).\n`); },
   });
@@ -5104,6 +5120,8 @@ async function runCli() {
   // rationale; the short version: attach `result.timings` + print one unconditional stderr summary line so
   // "why is a pass slow" has a real breakdown instead of a single opaque `ms`.
   const __t = createStepTimer();
+  const contextCache = createDrainContextCache({ enabled: contextCacheSettings.contextCache,
+    maxAgeSec: contextCacheSettings.contextCacheMaxAgeSec });
   const __passStart = Date.now();
   // #2257 — collect + classify across EVERY repo in the sweep set into ONE global candidate list. PR numbers
   // are per-repo (WE #10 ≠ FUI #10), so each verdict carries its own `repo` + head ref instead of a
@@ -5235,7 +5253,7 @@ async function runCli() {
   const prsByRepo = narrowPrsByRepo(listings, { onlyPr, onlyRepo, repos: REPOS, isLocalRepo });
   const openPrContext = await repollThenCollectContext({
     repoll: () => repollUnknownListings({ prsByRepo, read: fetchFreshPrForRevalidation, setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) }),
-    collect: () => (RECONCILE ? __t.timeAsync('listing', () => __t.timeAsync('listing.context', () => collectContext(liveListingsByRepo))) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false })),
+    collect: () => (RECONCILE ? __t.timeAsync('listing', () => __t.timeAsync('listing.context', () => collectContext(liveListingsByRepo, __t, contextCache))) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false })),
   });
   // #xc7p3q9 (R2) — the operator escape hatch symmetric to `--no-review-escalation`: `--assume-complete-context`
   // FORCES the context complete so a genuinely-stuck couple (e.g. a persistent read-noise fail-closed) can land
@@ -7262,6 +7280,9 @@ async function runCli() {
   const ledgerShadow = await runLedgerShadow({ verdicts, localSlug, dryRun: DRY_RUN });
   process.stderr.write(`${formatShadowLine(ledgerShadow)}\n`);
   const skipReasons = buildSkipReasons({ verdicts, merged, failedMerges, revalidationAborted, pendingRebased, coupleHeld, deferred, parked });
+  // Operator 2026-10-19 hotfix: unconditional per-pass context-cache accounting, including --json.
+  const { hits, misses, savedMs } = contextCache.stats;
+  process.stderr.write(`merge-ai-prs · context cache: hits=${hits} misses=${misses} savedMs=${Math.round(savedMs)} (${contextCacheSettings.contextCache ? 'enabled' : 'disabled'}, ${contextCacheSettings.line})\n`);
   process.stderr.write(`merge-ai-prs · pass timings: ${formatTimingsSummary(timingSteps, { total: passTotalMs, order: PASS_STEP_ORDER })} (considered ${verdicts.length}, merged ${merged.length}, ${formatSkipSummary(skipReasons)}; ${formatConcurrencySources(resolvedMergePolicy.policy)})\n`);
   // Card 122 slice 1 — logging only: the machine-readable twin of the summary above (coroner / perf-snapshot read it).
   process.stderr.write(`${formatSkipReasonsLine(skipReasons)}\n`);

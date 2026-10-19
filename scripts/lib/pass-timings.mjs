@@ -82,6 +82,10 @@ export function formatTimingsSummary(timings, { total = null, order = null } = {
  *  timings object itself is an unordered map), kept here so the CLI and its tests read the same list. */
 export const PASS_STEP_ORDER = [
   'listing',
+  // Operator 2026-10-19 hotfix: separate context listing from per-PR reads.
+  'listing.context',
+  'listing.context.list',
+  'listing.context.reads',
   'classifyGateReads',
   'rebaseDropManifest',
   'mergeCascade',
