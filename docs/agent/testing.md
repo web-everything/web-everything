@@ -2206,3 +2206,44 @@ homes and ledgers, and injected minters. Cover `chalbert/web-everything` via `-R
 paths, and a real temporary clone's SSH origin: each selects the worker installation for
 canonical owner `web-everything`. Run the touched `gh-app-shim`, `github-app-auth-env`,
 `github-app-per-owner-routing`, and `github-auth-policy` suites through heavy admission.
+
+## Card rebase net evidence
+
+Card rebuilds default to `cardRebase.squashToSingleCommit=true`, loaded by
+`loadCardRebaseSettings` in `scripts/lib/card-squash-rebuild.mjs`. The cascade is
+standard → platform `cardRebase` → `scripts/settings/card-rebase.json` →
+`WE_CARD_REBASE_SQUASH_TO_SINGLE_COMMIT` (`true/false/1/0`). Settings files are
+auto-discovered by `settings-files.mjs`; no hand-maintained registry is needed.
+Before a single-parent rebuild pushes, pinned old/new path sets and binary patches
+must agree after removing index and hunk-position headers. Attribution trailers
+survive the rebuild. The expected old head pins the force-with-lease push.
+
+Use `scripts/lib/pr-real-files.mjs` for GitHub-list card routing. Its bounded,
+short-lived per-process git cache is scoped to repository, pinned head, clone and
+runner. It reuses `cardConflicts.gitRecheckFiles` (including its existing cascade),
+so an unverifiable git read falls back to the GitHub evidence; a missing/capped
+GitHub list must be passed as null and cannot grant an exemption. Pure cap readers
+accept an already-resolved `pr.realFiles` without adding admission-time network IO.
+The drain reads saved git net-basis evidence; replay resolves its separate GitHub
+list before producing that evidence shape. `card-rebase-probe.mjs --pr=N
+--repo=owner/name` prints file evidence and a private-index dry-run, with a hard
+no-push runner boundary.
+
+A single-parent card squash is mechanical only with a trusted `card squash proof`
+comment naming its SHA and the SHA-256 of its binary zero-context patch (index and
+hunk-position headers stripped). Enrichment rechecks the card paths, upstream
+parent and patch; reconcile also requires the trusted SHA marker before refunding.
+The drain/watch post proofs only after a successful push, deduping by new head;
+comment failures leave the round spent. Cover forged subjects, foreign authors,
+wrong hashes/SHAs and post failures in the focused squash/round suites.
+The real-files cache also keys by the local `origin/main` commit read on every
+call, records the post-fetch base, and checks head object presence on a hit.
+Base movement or missing objects require fresh fetch/diff evidence; an unreadable
+base fails closed. Cache hits perform no network IO.
+
+Card-only squash eligibility requires `100644 blob` entries for every changed path
+in the resolved tree and for every corresponding base entry that exists; symlinks,
+gitlinks, executable files and failed tree reads retain the two-parent rebuild.
+Mechanical squash recognition uses that same tree check. Real-files diffs use the
+post-fetch base OID literally, then re-read `origin/main`; a moved or unreadable
+base returns null without caching. Focused tests cover these modes and base races.

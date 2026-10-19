@@ -948,3 +948,22 @@ describe('speculative red-team supersession provenance', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
+
+import { replayPayload, resolvedReplayPayload } from '../review-extra-seats.mjs';
+describe('red-team replay resolves inflated GitHub file evidence', () => {
+  const view = { title: 'card', headRefName: 'lane/cards', headRefOid: 'a'.repeat(40), baseRefName: 'main', files: [{ path: 'scripts/stale.mjs' }] };
+  const repo = 'web-everything/web-everything';
+  function run(_cmd, args) {
+    return { status: 0, stdout: args[0] === 'remote' ? `https://github.com/${repo}.git`
+      : args[0] === 'rev-parse' ? view.headRefOid : args[0] === 'diff' ? 'backlog/123-card.md' : '' };
+  }
+  it('the replay caller uses git net files before constructing the payload', () => {
+    const payload = resolvedReplayPayload({ view, diffText: 'd', repo, run });
+    expect(payload.findings.read.netChangedFiles).toEqual(['backlog/123-card.md']);
+    expect(payload.findings.read.netBasis.rev).toBe(view.headRefOid);
+  });
+  it('explicit realFiles, including null, override view.files', () => {
+    expect(replayPayload({ view, realFiles: ['backlog/123-card.md'] }).findings.read.netChangedFiles).toEqual(['backlog/123-card.md']);
+    expect(replayPayload({ view, realFiles: null }).findings.read.netChangedFiles).toBeNull();
+  });
+});

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolveRealFiles } from '../lib/pr-real-files.mjs';
 import { readSnapshotPrView } from '../lib/review-pr-snapshot.mjs';
 import { recordRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
@@ -1785,20 +1786,27 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
  * (title, body, head commit, net diff). The verdict is `accept` because the caller replays an ACCEPTED PR;
  * Claude's own findings are unknown here (null). PURE over its inputs.
  */
-export function replayPayload({ view, diffText }) {
+export function replayPayload({ view, diffText, realFiles }) {
   return {
     replay: true,
     verdict: { verdict: 'accept' },
     findings: {
       read: {
         title: view?.title ?? '', body: view?.body ?? '', diffText: String(diffText ?? ''),
-        netChangedFiles: (view?.files ?? []).map((f) => f.path).filter(Boolean),
+        netChangedFiles: realFiles === undefined ? (view?.files ?? []).map((f) => f.path).filter(Boolean) : realFiles,
         netRenameSources: renameSourcePaths(diffText),
         netBasis: { rev: view?.headRefOid ?? null },
         openOperatorSendBacks: openOperatorSendBacks(view),
       },
     },
   };
+}
+
+/** Resolve GitHub replay files before they can grant a card-only red-team exemption. */
+export function resolvedReplayPayload({ view, diffText, repo, cwd, run, enabled } = {}) {
+  const evidence = resolveRealFiles({ pr: view, repo, cwd, run, enabled,
+    ghFiles: Array.isArray(view?.files) && view.files.length < 100 ? view.files : null });
+  return replayPayload({ view, diffText, realFiles: evidence.files });
 }
 
 // ── CLI ─────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -1874,12 +1882,12 @@ if (IS_CLI) {
     };
     const pr = Number(flag('pr'));
     const { diff: diffText, ...view } = readSnapshotPrView({ pr, repo: flag('repo'),
-      fields: ['title', 'body', 'headRefOid', 'files', 'diff'], exec: ghRead,
+      fields: ['title', 'body', 'headRefName', 'headRefOid', 'baseRefName', 'files', 'diff'], exec: ghRead,
     });
     // Card 341: the open operator send-backs come from the COMPLETE thread (the shared reader), never a truncated view.
     import('../conveyor/pr-comments-complete.mjs')
       .then(({ readCompletePrComments }) => readCompletePrComments(pr, { repo: flag('repo') }))
-      .then((comments) => runRedTeam({ pr, repo: flag('repo'), lanePath: flag('lane'), loopPayload: replayPayload({ view: { ...view, comments }, diffText }), post: false, record: false }))
+      .then((comments) => runRedTeam({ pr, repo: flag('repo'), lanePath: flag('lane'), loopPayload: resolvedReplayPayload({ view: { ...view, comments }, diffText, repo: flag('repo'), cwd: flag('lane') }), post: false, record: false }))
       .then((result) => emit(result, renderRedTeamSummary));
   } else {
     process.stderr.write('usage: review-extra-seats.mjs run|red-team --pr=<n> --repo=<owner/repo> --lane=<path> --loop-json=<file> [--no-post]\n'
