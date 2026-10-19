@@ -119,11 +119,13 @@ export function applyRaisedByConflictsToIndex({ run, cwd, env, tree, base, merge
     if (!result.ok) return result;
     plans.push({ path, text: result.text });
   }
+  const resolvedBlobs = [];
   for (const { path, text } of plans) {
     const blob = hashObjectVerified(run, text, { cwd, env, label: path });
     if (!blob.ok) return blob;
     const staged = run('git', ['update-index', '--add', '--cacheinfo', '100644', blob.oid, path], { cwd, env });
     if (staged.status !== 0) return refuse('could not stage resolved card');
+    resolvedBlobs.push({ path, oid: blob.oid, text });
   }
-  return { ok: true, resolved: plans.map(p => p.path) };
+  return { ok: true, resolved: plans.map(p => p.path), resolvedBlobs };
 }

@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { resolveRaisedByConflict, loadCardConflictSettings, CARD_CONFLICT_PRECONDITION_REASONS } from '../card-conflict-resolve.mjs';
+import { applyRaisedByConflictsToIndex, resolveRaisedByConflict, loadCardConflictSettings, CARD_CONFLICT_PRECONDITION_REASONS } from '../card-conflict-resolve.mjs';
 import { defaultAttemptCardConflictRebase } from '../../conveyor/parked-pr-conflict-watch.mjs';
 import { MISSING_RUN_CREDENTIAL_REFUSAL } from '../../conveyor/main-red-recovery.mjs';
 import { rebaseDropManifest } from '../rebase-drop-manifest.mjs';
@@ -230,11 +230,28 @@ describe('gitRecheckFiles settings cascade', () => {
 });
 
 
-it('default squash refuses a list union that rewrites PR JIT references instead of preserving the old net patch', () => {
+it('default squash proves the resolved union including rewritten PR JIT references', () => {
   const f = fixture();
   const result = rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run: f.run, fetch: false });
-  expect(result).toMatchObject({ action: 'error', guard: 'squash-net-diff-mismatch' });
-  expect(f.git('ls-remote', 'origin', 'refs/heads/lane/cards')).toContain(f.head);
+  expect(result).toMatchObject({ action: 'rebased', proof: { resolvedPaths: [path], patchEqual: true } });
+  expect(f.git('show', `${result.newCommit}:${path}`) + '\n').toBe(card([entry(0), entry(1), entry(2)].map(e => e.replace('xabc123', '6000'))));
+  expect(f.git('rev-list', '--parents', '-n', '1', result.newCommit)).toBe(`${result.newCommit} ${f.git('rev-parse', 'origin/main')}`);
+  expect(f.git('ls-remote', 'origin', 'refs/heads/lane/cards')).toContain(result.newCommit);
   expect(f.git('rev-parse', 'HEAD')).toBe(f.head);
   expect(readFileSync(join(f.cwd, path), 'utf8')).toBe(f.before);
+});
+
+it('returns each verified resolution blob with its exact text and staged oid', () => {
+  const f = fixture();
+  const merged = f.run('git', ['merge-tree', '--write-tree', 'origin/main', f.head]);
+  expect(merged.status).toBe(1);
+  const tree = merged.stdout.split('\n')[0];
+  const env = { GIT_INDEX_FILE: join(f.cwd, 'resolution-index') };
+  expect(f.run('git', ['read-tree', tree], { env }).status).toBe(0);
+  const result = applyRaisedByConflictsToIndex({ run: f.run, cwd: f.cwd, env, tree, base: 'origin/main', mergeRef: f.head, conflictPaths: [path] });
+  const text = card([entry(0), entry(1), entry(2)].map(e => e.replace('xabc123', '6000')));
+  const oid = f.run('git', ['hash-object', '--stdin'], { input: text }).stdout.trim();
+  expect(result).toEqual({ ok: true, resolved: [path], resolvedBlobs: [{ path, oid, text }] });
+  const writtenTree = f.run('git', ['write-tree'], { env }).stdout.trim();
+  expect(f.git('rev-parse', `${writtenTree}:${path}`)).toBe(oid);
 });
