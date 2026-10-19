@@ -1,5 +1,18 @@
 import { describe, it, expect } from 'vitest';
-import { redTeamOwedOnHead } from '../review-red-team-policy.mjs';
+import { redTeamOwedForAcceptedPr, redTeamOwedOnHead } from '../review-red-team-policy.mjs';
+
+describe('redTeamOwedForAcceptedPr', () => {
+  it.each([
+    [{ verdict: { verdict: 'accept' } }, true],
+    [{ verdict: { verdict: 'needs-human' }, findings: { read: { netBasis: { rev: 'a'.repeat(40) } } } }, true],
+    [{ findings: { read: { netBasis: { rev: 'a'.repeat(40) } } } }, false],
+    [{ verdict: { verdict: 'needs-human' } }, false],
+    [{ verdict: { verdict: 'needs-human' }, findings: { read: { netBasis: { rev: 'a'.repeat(39) } } } }, false],
+    [{ verdict: { verdict: 'needs-human' }, findings: { read: { netBasis: { rev: 'g'.repeat(40) } } } }, false],
+  ])('payload %j owes %s', (loopPayload, owed) => {
+    expect(redTeamOwedForAcceptedPr(loopPayload)).toBe(owed);
+  });
+});
 
 const card = { netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] };
 const code = { netChangedFiles: ['scripts/a.mjs'] };

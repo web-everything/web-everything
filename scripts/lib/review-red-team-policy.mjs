@@ -43,6 +43,18 @@ export function redTeamOwedFor(loopPayload) {
   return advisoryLabelOutcome({ read: loopPayload?.findings?.read, verdict }) === ADVISORY_OUTCOMES.ACCEPT;
 }
 
+/**
+ * The caller must first verify a live `review:accepted` label: an operator may accept a pinned review
+ * whose panel verdict still says `needs-human`.
+ * @param {object|null} loopPayload - `review-loop-cli.mjs --json`'s payload.
+ * @returns {boolean}
+ */
+export function redTeamOwedForAcceptedPr(loopPayload) {
+  return redTeamOwedFor(loopPayload)
+    || (loopPayload?.verdict != null && typeof loopPayload.verdict === 'object'
+      && /^[a-f0-9]{40}$/i.test(loopPayload?.findings?.read?.netBasis?.rev ?? ''));
+}
+
 
 /** A pinned reviewed head owes the panel seat regardless of the panel verdict. */
 export function redTeamPanelSeatOwed(loopPayload, env = process.env) {

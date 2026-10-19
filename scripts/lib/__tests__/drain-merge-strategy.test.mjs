@@ -1318,6 +1318,18 @@ describe('orphaned accepted panel-seat recovery', () => {
     return { ...h, requests, advance: ms => { clock += ms; } };
   }
   const stale = { ...evidence, recorded: true, attempted: true, untrustedSavedResult: true, noUsableResult: true };
+  it.each([
+    [HEAD, ['review:accepted'], { eligible: true, reason: 'stale rows with no usable result' }],
+    ['c'.repeat(40), ['review:accepted'], { eligible: false, reason: 'review payload does not match head' }],
+    [HEAD, [], { eligible: false, reason: 'PR not accepted' }],
+  ])('recovers an operator-accepted needs-human review only on the accepted live head (%s, %j)', (rev, labels, expected) => {
+    const loopPayload = { verdict: { verdict: 'needs-human' },
+      findings: { read: { netBasis: { rev }, netChangedFiles: ['scripts/x.mjs'] } } };
+    expect(staleRedTeamRequestEligibility({
+      evidence: { attempted: true, noUsableResult: true, loopPayload },
+      repo: LOCAL, pr: 5485, head: HEAD, labels, enabled: true,
+    })).toEqual(expected);
+  });
   it.each(['panel-seat', 'post-accept'])('%s requests stale rows once and keeps the head held', timing => {
     const requestRedTeam = vi.fn(() => ({ requested: true }));
     const h = setup({ evidence: stale, requestRedTeam, env: { WE_RED_TEAM_TIMING: timing } });
