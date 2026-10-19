@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { queueFileOverlap, readQueueEntryFiles } from '../queue-file-overlap.mjs';
 
 const card = 'backlog/123-card.md';
@@ -39,6 +39,18 @@ describe('read queue entry files', () => {
   it('reads paths once per PR, marking capped, missing and malformed lists unknown', () => {
     expect(read({ 42: [{ path: card }], 43: Array(100).fill({ path: script }), 44: undefined, 45: [null] }))
       .toEqual({ entries: [{ num: 42, files: [card] }, { num: 43, files: null }, { num: 44, files: null }, { num: 45, files: null }] });
+  });
+  it.each([[[ 'scripts/net.mjs' ]], [null]])('passes full PR metadata to the optional resolver and preserves its result: %j', files => {
+    const view = { files: [{ path: card }], headRefName: 'lane/queued', baseRefName: 'main', headRefOid: 'a'.repeat(40) };
+    const resolveFiles = vi.fn(() => files);
+    const exec = vi.fn((_cmd, args) => args[0] === 'pr' ? JSON.stringify(view)
+      : JSON.stringify({ data: { repository: { mergeQueue: { entries: {
+        nodes: [{ pullRequest: { number: 42 } }], pageInfo: { hasNextPage: false },
+      } } } } }));
+    expect(readQueueEntryFiles({ repo: 'owner/repo', exec, resolveFiles })).toEqual({ entries: [{ num: 42, files }] });
+    expect(resolveFiles).toHaveBeenCalledTimes(1);
+    expect(resolveFiles).toHaveBeenCalledWith({ num: 42, repo: 'owner/repo', view });
+    expect(exec.mock.calls[1][1]).toEqual(['pr', 'view', '42', '--repo', 'owner/repo', '--json', 'files,headRefName,baseRefName,headRefOid']);
   });
   it('fails open on queue pagination and read errors', () => {
     expect(read({}, true)).toMatchObject({ entries: [], error: expect.any(String) });

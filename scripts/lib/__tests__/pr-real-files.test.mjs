@@ -4,7 +4,7 @@ import { gitRealFiles, resolveRealFiles, realFilesCardOnly } from '../pr-real-fi
 const repo = 'web-everything/web-everything';
 const pr = { headRefName: 'lane/cards', headRefOid: 'a'.repeat(40), baseRefName: 'main' };
 const card = 'backlog/123-card.md';
-function runner({ head = pr.headRefOid, remote = `https://github.com/${repo}.git`, files = card, fail = '' } = {}) {
+function runner({ head = pr.headRefOid, remote = `https://github.com/${repo}.git`, files = `${card}\0`, fail = '' } = {}) {
   return vi.fn((_cmd, args) => ({ status: args[0] === fail ? 1 : 0,
     stdout: args[0] === 'remote' ? remote : args[0] === 'rev-parse' ? head : args[0] === 'diff' ? files : '' }));
 }
@@ -18,7 +18,17 @@ describe('PR real files', () => {
     expect(run).toHaveBeenCalledTimes(14);
   });
   it('a git non-card overrides even a GitHub all-card list', () => {
-    expect(realFilesCardOnly({ pr, repo, ghFiles: [card], run: runner({ files: `${card}\ncode.js` }) })).toBe(false);
+    expect(realFilesCardOnly({ pr, repo, ghFiles: [card], run: runner({ files: `${card}\0code.js\0` }) })).toBe(false);
+  });
+  it('preserves raw Unicode and space paths when verifying GitHub files', () => {
+    const paths = ['docs/café ñ.md', 'docs/with space.md'];
+    const run = runner({ files: [...paths, paths[0]].join('\0') + '\0' });
+    expect(gitRealFiles({ pr, repo, run })).toEqual(paths);
+    expect(resolveRealFiles({ pr, repo, ghFiles: paths.map(path => ({ path })), run }))
+      .toEqual({ files: paths, source: 'git', disagreed: false, reason: 'git verified GitHub files' });
+    expect(run).toHaveBeenCalledWith('git',
+      ['diff', '-z', '--name-only', '--no-renames', `${pr.headRefOid}...${pr.headRefOid}`],
+      { cwd: process.cwd() });
   });
   it('FETCH_HEAD mismatch returns null and falls back to GitHub', () => {
     const run = runner({ head: 'b'.repeat(40) });
@@ -49,7 +59,7 @@ describe('PR real files', () => {
 });
 
 it('cache checks local base and object without network, and recomputes after either changes', () => {
-  let base = 'b'.repeat(40), present = true, files = card;
+  let base = 'b'.repeat(40), present = true, files = `${card}\0`;
   const run = vi.fn((cmd, args) => {
     if (args[0] === 'rev-parse' && args.includes('--verify')) return { status: 0, stdout: base };
     if (args[0] === 'cat-file') return { status: present ? 0 : 1, stdout: '' };
@@ -59,10 +69,10 @@ it('cache checks local base and object without network, and recomputes after eit
   run.mockClear();
   expect(gitRealFiles({ pr, repo, run })).toEqual([card]);
   expect(run.mock.calls.map(([, a]) => a[0])).toEqual(['rev-parse', 'cat-file']);
-  base = 'c'.repeat(40); files = 'code.js'; run.mockClear();
+  base = 'c'.repeat(40); files = 'code.js\0'; run.mockClear();
   expect(gitRealFiles({ pr, repo, run })).toEqual(['code.js']);
   expect(run.mock.calls.filter(([, a]) => a[0] === 'fetch')).toHaveLength(2);
-  present = false; files = 'other.js'; run.mockClear();
+  present = false; files = 'other.js\0'; run.mockClear();
   expect(gitRealFiles({ pr, repo, run })).toEqual(['other.js']);
   expect(run.mock.calls.filter(([, a]) => a[0] === 'fetch')).toHaveLength(2);
   base = ''; run.mockClear();
@@ -92,7 +102,7 @@ it.each(['moved', 'missing', 'failed', 'throws'])('base %s during diff fails clo
       return { status: 0, stdout: pinned };
     }
     if (args[0] === 'diff') {
-      expect(args).toEqual(['diff', '--name-only', '--no-renames', `${pinned}...${pr.headRefOid}`]);
+      expect(args).toEqual(['diff', '-z', '--name-only', '--no-renames', `${pinned}...${pr.headRefOid}`]);
       afterDiff = true;
     }
     return runner()(cmd, args);
@@ -116,7 +126,7 @@ it('pins the post-fetch oid for the diff and checks the same oid before caching'
     ['remote', 'get-url', 'origin'], ['fetch', 'origin', 'main'],
     ['fetch', '--no-tags', 'origin', 'refs/heads/lane/cards'],
     ['rev-parse', '--verify', 'origin/main^{commit}'], ['rev-parse', 'FETCH_HEAD'],
-    ['diff', '--name-only', '--no-renames', `${pinned}...${pr.headRefOid}`],
+    ['diff', '-z', '--name-only', '--no-renames', `${pinned}...${pr.headRefOid}`],
     ['rev-parse', '--verify', 'origin/main^{commit}'],
   ]);
   run.mockClear();

@@ -53,6 +53,7 @@ import { getRequiredStatusChecks } from './required-status-checks.mjs';
 import { readSettings } from './settings-files.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { queueFileOverlap, readQueueEntryFiles, completeListedFiles } from './queue-file-overlap.mjs';
+import { resolveRealFiles as defaultResolveRealFiles } from './pr-real-files.mjs';
 import { createAdaptiveBatching, readQueueFacts } from './merge-queue-adaptive-batching.mjs';
 import { activeReserveBlockers, isPriorityLabels, readReserves, writeReserves } from './priority-reserve.mjs';
 import { cancelObsoleteQueueRuns } from './merge-queue-obsolete-runs.mjs';
@@ -258,7 +259,7 @@ export function createDrainMergeStrategy({
   priorityReserve = () => ({ enabled: false, source: 'default' }), resolved = resolveDrainMergePolicy({ dryRun }), log = process.stderr,
   readFile = readFileSync, writeState = writeQueueState, withLock = (fn) => ({ ran: true, result: fn() }),
   postConflictFinding = defaultPostConflictFinding, now = () => Date.now(),
-  cancelObsoleteRuns = cancelObsoleteQueueRuns, batching,
+  cancelObsoleteRuns = cancelObsoleteQueueRuns, batching, resolveRealFiles = defaultResolveRealFiles,
   env = process.env, queueSafety, labelProvider, readRedTeamEvidence = readDrainRedTeamEvidence, requestRedTeam = null, readReviewAgents = listAgentsWithReviewJobs,
   cwd = process.cwd(), // a clone of the local repo: enqueuePr reads the judged commit's change list from it
 } = {}) {
@@ -353,12 +354,36 @@ export function createDrainMergeStrategy({
   const enqueues = (repo) => enqueueMode && !!isLocalRepo(repo);
   const slugOf = (repo) => repo || localSlug;
 
+  // Use the strategy's executor so injected GitHub/git IO stays hermetic too.
+  const realFilesRun = (cmd, args, options) => {
+    try {
+      return { status: 0, stdout: exec(cmd, args, { ...options, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) };
+    } catch (e) { return { status: e.status ?? 1, stdout: e.stdout ?? '', stderr: e.stderr ?? '' }; }
+  };
+  // One log budget covers candidate and queue resolutions for an admission decision.
+  const realFilesOf = ({ num, repo, view }, decision) => {
+    const ghFiles = view.files;
+    try {
+      const result = resolveRealFiles({ pr: view, repo: slugOf(repo), ghFiles, cwd, run: realFilesRun });
+      if (result.source === 'git' && result.disagreed && !decision.logged) {
+        decision.logged = true;
+        say(`  merge-queue file-overlap: real files for #${num} (git net diff: ${result.files.length} files vs GitHub ${Array.isArray(ghFiles) ? ghFiles.length : 'unknown'})`);
+      }
+      // Retain the strict completeness/shape checks for conservative GitHub fallback.
+      return result.source === 'github' && completeListedFiles(ghFiles) === null ? null : result.files ?? null;
+    } catch { return completeListedFiles(ghFiles); }
+  };
+  const candidateFilesOf = (c, headSha, decision) => realFilesOf({ num: c.num, repo: c.repo,
+    view: { headRefName: c.headRef, baseRefName: c.baseRefName || 'main', headRefOid: headSha,
+      files: c.listedFilesComplete === true ? c.listedFiles : null } }, decision);
+  const queueResolver = decision => entry => realFilesOf(entry, decision);
+
   const overlapCache = new Map();
-  const cachedQueue = repo => {
+  const cachedQueue = (repo, decision) => {
     const cached = overlapCache.get(repo);
     const at = now();
     const queue = cached && at >= cached.at && at - cached.at < 30_000
-      ? cached.queue : readQueueEntryFiles({ repo, exec });
+      ? cached.queue : readQueueEntryFiles({ repo, exec, resolveFiles: queueResolver(decision) });
     if (!queue.error && queue !== cached?.queue) overlapCache.set(repo, { at, queue });
     return queue;
   };
@@ -387,11 +412,10 @@ export function createDrainMergeStrategy({
     }, true);
   };
   const reserveLiveCache = new Map();
-  const priorityReserveHold = (c, headSha, locked = false) => {
+  const priorityReserveHold = (c, headSha, locked = false, decision = {}) => {
     const setting = priorityReserve();
-    if (!setting.enabled || dryRun || !enqueues(c.repo) || isPriorityLabels(c.prLabels)
-      || c.listedFilesComplete !== true) return null;
-    const files = completeListedFiles(c.listedFiles);
+    if (!setting.enabled || dryRun || !enqueues(c.repo) || isPriorityLabels(c.prLabels)) return null;
+    const files = candidateFilesOf(c, headSha, decision);
     if (files === null) return null;
     const reserves = readReserves(reservePath);
     const invalid = new Set();
@@ -413,7 +437,7 @@ export function createDrainMergeStrategy({
           const labels = live.labels.map(l => typeof l === 'string' ? l : l?.name);
           if (live.state !== 'OPEN' || live.headRefOid !== stamp.headSha || !labels.includes('ready-to-merge')
             || !isPriorityLabels(live.labels) || sendBackReason(live.labels)) { invalid.add(key); return false; }
-          const queue = cachedQueue(slugOf(stamp.repo));
+          const queue = cachedQueue(slugOf(stamp.repo), decision);
           if (queue.error) return false;
           if (queue.entries.some(e => e.num === stamp.num)) { invalid.add(key); return false; }
           return true;
@@ -505,10 +529,11 @@ export function createDrainMergeStrategy({
     /** Overlap hint; reserve writes take the land mutex, and enqueue re-reads the queue under it. */
     queueOverlapHold(c, headSha) {
       if (!enqueues(c.repo)) return null;
-      const candidateFiles = c.listedFilesComplete === true ? completeListedFiles(c.listedFiles) : null;
+      const decision = {};
+      const candidateFiles = candidateFilesOf(c, headSha, decision);
       if (candidateFiles === null) return null;
       const repo = slugOf(c.repo);
-      const queue = cachedQueue(repo);
+      const queue = cachedQueue(repo, decision);
       if (queue.error) return null;
       const overlap = pickQueueOverlap(c, candidateFiles, queue);
       if (overlap.overlap) stampReserve(c, headSha, candidateFiles);
@@ -665,9 +690,10 @@ export function createDrainMergeStrategy({
         delete before.redTeamPending[key];
         writeState(statePath, before);
       }
+      const decision = {};
       try {
-        const candidateFiles = c.listedFilesComplete === true ? completeListedFiles(c.listedFiles) : null;
-        const queue = candidateFiles === null ? null : readQueueEntryFiles({ repo: slugOf(c.repo), exec });
+        const candidateFiles = candidateFilesOf(c, headSha, decision);
+        const queue = candidateFiles === null ? null : readQueueEntryFiles({ repo: slugOf(c.repo), exec, resolveFiles: queueResolver(decision) });
         if (candidateFiles === null) {
           say('  merge-queue file-overlap: candidate files unknown — continuing enqueue');
         } else if (queue.error) {
@@ -687,7 +713,7 @@ export function createDrainMergeStrategy({
           dropReserve(c);
         }
       } catch (e) { say(`  merge-queue file-overlap: read failed (${firstLine(e)}) — continuing enqueue`); }
-      const reserve = priorityReserveHold(c, headSha, true);
+      const reserve = priorityReserveHold(c, headSha, true, decision);
       if (reserve) return { enqueued: false, ...reserve };
       let batchingGroupId;
       try {

@@ -23,7 +23,7 @@ export function completeListedFiles(files) {
   return paths.every(path => typeof path === 'string' && path.length > 0) ? paths : null;
 }
 
-export function readQueueEntryFiles({ repo, exec = execFileSync }) {
+export function readQueueEntryFiles({ repo, exec = execFileSync, resolveFiles }) {
   try {
     const [owner, name] = repo.split('/');
     const data = graphql(exec, 'query($owner:String!,$name:String!){repository(owner:$owner,name:$name){mergeQueue(branch:"main"){entries(first:100){pageInfo{hasNextPage} nodes{pullRequest{number}}}}}}', [`owner=${owner}`, `name=${name}`]);
@@ -33,8 +33,8 @@ export function readQueueEntryFiles({ repo, exec = execFileSync }) {
     const entries = page.nodes.map(node => {
       const pr = node?.pullRequest;
       if (!Number.isInteger(pr?.number)) throw new Error('invalid merge queue entry');
-      const view = JSON.parse(exec('gh', ['pr', 'view', String(pr.number), '--repo', repo, '--json', 'files'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }));
-      return { num: pr.number, files: completeListedFiles(view.files) };
+      const view = JSON.parse(exec('gh', ['pr', 'view', String(pr.number), '--repo', repo, '--json', resolveFiles ? 'files,headRefName,baseRefName,headRefOid' : 'files'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }));
+      return { num: pr.number, files: resolveFiles ? resolveFiles({ num: pr.number, repo, view }) : completeListedFiles(view.files) };
     });
     return { entries };
   } catch (e) { return { entries: [], error: String(e?.message ?? e).split('\n')[0] }; }

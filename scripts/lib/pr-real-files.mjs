@@ -41,10 +41,10 @@ export function gitRealFiles({ pr, repo, cwd = process.cwd(), run = gitRun } = {
       const head = run('git', ['rev-parse', 'FETCH_HEAD'], { cwd });
       if (head.status === 0 && String(head.stdout).trim() === pr.headRefOid) {
         // --no-renames exposes source paths too: moving code into backlog cannot buy an exemption.
-        const diff = run('git', ['diff', '--name-only', '--no-renames', `${baseOid}...${pr.headRefOid}`], { cwd });
+        const diff = run('git', ['diff', '-z', '--name-only', '--no-renames', `${baseOid}...${pr.headRefOid}`], { cwd });
         // A concurrent fetch must not publish evidence under a different base.
         if (readBase() !== baseOid) return null;
-        if (diff.status === 0) files = [...new Set(String(diff.stdout ?? '').split('\n').filter(Boolean))];
+        if (diff.status === 0) files = [...new Set(String(diff.stdout ?? '').split('\0').filter(Boolean))];
       }
     }
   } catch { return null; } // Unverifiable: never cache a failed base recheck.
