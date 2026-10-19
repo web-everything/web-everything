@@ -21,6 +21,14 @@ function fixture() {
   return { io, payload };
 }
 describe('drain request through the review job red-team path', () => {
+  it('runs a pinned needs-human review once the PR carries live acceptance', () => {
+    const { io, payload } = fixture();
+    payload.verdict = { verdict: 'needs-human' };
+    const result = runReviewJob({ ...request, drainRedTeamRequest: request }, io);
+    expect(result.outcome).toBe('ran');
+    expect(io.runRedTeam).toHaveBeenCalledWith(expect.objectContaining({ loopPayload: payload }));
+    expect(io.finishDrainRedTeamRequest).toHaveBeenCalledWith(request);
+  });
   it('uses the existing exact-head review and finishes only after saving provenance', () => {
     const { io, payload } = fixture();
     runReviewJob({ ...request, drainRedTeamRequest: request }, io);

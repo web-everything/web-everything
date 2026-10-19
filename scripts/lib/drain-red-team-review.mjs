@@ -1,4 +1,4 @@
-import { redTeamCardOnly, redTeamOwedFor } from './review-red-team-policy.mjs';
+import { redTeamCardOnly, redTeamOwedForAcceptedPr } from './review-red-team-policy.mjs';
 
 /** Internal review-job branch: use a completed review's pinned read, never manufacture a verdict. */
 export function runDrainRedTeamJob({ pr, repo, drainRedTeamRequest: request, preferLane = null }, io, plan) {
@@ -29,7 +29,7 @@ export function runDrainRedTeamJob({ pr, repo, drainRedTeamRequest: request, pre
     if (!ready() || io.redTeamEnabled?.() === false) return result({ outcome: 'deferred' });
     const loopPayload = io.readDrainRedTeamReview(request);
     if (loopPayload?.findings?.read?.netBasis?.rev?.toLowerCase() !== request.head.toLowerCase()
-      || !redTeamOwedFor(loopPayload)) return result({ outcome: 'deferred-no-review-evidence' });
+      || !redTeamOwedForAcceptedPr(loopPayload)) return result({ outcome: 'deferred-no-review-evidence' });
     if (io.skipCardOnly?.() && redTeamCardOnly(loopPayload.findings.read)) return result({ outcome: 'card-only' });
     const actorId = io.newActorId?.();
     const acquired = io.acquireLane({ laneRepo: planned.laneRepo, slug, actorId,
