@@ -5,6 +5,11 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { readSharedOpenPrs } from '../../lib/pr-snapshot.mjs';
+
+vi.mock('../../lib/pr-snapshot.mjs', async (importOriginal) => ({
+  ...await importOriginal(), readSharedOpenPrs: vi.fn(() => null),
+}));
 
 import {
   CONFLICT_LABEL,
@@ -284,12 +289,23 @@ describe('buildConflictComment — next-step wording across the full routing com
 });
 
 describe('defaultListParkedPrs — argv shape (exec injected, no real gh call)', () => {
+  it('requests headRefOid from the shared snapshot for card conflict rebases', () => {
+    const prs = [{ number: 42, headRefOid: 'a'.repeat(40) }];
+    vi.mocked(readSharedOpenPrs).mockReturnValueOnce(prs);
+    expect(defaultListParkedPrs({ repo: 'o/n' })).toBe(prs);
+    expect(readSharedOpenPrs).toHaveBeenLastCalledWith({
+      repo: 'o/n',
+      fields: 'number,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,labels,files',
+      allowDeferred: true,
+    });
+  });
+
   it('queries open PRs with the narrow field set, no --repo when omitted', () => {
     let capturedArgv;
     const exec = (cmd, argv) => { capturedArgv = argv; return '[]'; };
     defaultListParkedPrs({ exec });
     expect(capturedArgv).toEqual(['pr', 'list', '--state', 'open', '--limit', '200',
-      '--json', 'number,headRefName,baseRefName,mergeable,mergeStateStatus,labels,files']);
+      '--json', 'number,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,labels,files']);
   });
 
   it('appends --repo when given', () => {
@@ -297,7 +313,7 @@ describe('defaultListParkedPrs — argv shape (exec injected, no real gh call)',
     const exec = (cmd, argv) => { capturedArgv = argv; return '[]'; };
     defaultListParkedPrs({ exec, repo: 'o/n' });
     expect(capturedArgv).toEqual(['pr', 'list', '--state', 'open', '--limit', '200',
-      '--json', 'number,headRefName,baseRefName,mergeable,mergeStateStatus,labels,files', '--repo', 'o/n']);
+      '--json', 'number,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,labels,files', '--repo', 'o/n']);
   });
 });
 
@@ -2030,7 +2046,7 @@ import { prFileContract } from './pr-file-test-helpers.mjs';
 prFileContract({
   name: 'parked-pr-conflict-watch', load: () => import('../parked-pr-conflict-watch.mjs'),
   reader: 'defaultListParkedPrs', run: 'watchParkedPrConflicts',
-  fields: 'number,headRefName,baseRefName,mergeable,mergeStateStatus,labels,files',
+  fields: 'number,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,labels,files',
 });
 
 
