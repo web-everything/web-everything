@@ -43,7 +43,9 @@ import { ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
 // on which notes exist again.
 import { CONVERTED_ADVISORY_NOTE_MARKER } from '../lib/review-escalation.mjs';
 import { STAND_DOWN_MARKER, isSelfAuthored } from './stand-down.mjs';
-import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
+// Match we:scripts/conveyor/rearm-review.mjs#REARM_COMMENT_MARKER locally to avoid a daemon boot cycle.
+// The equality test keeps this matcher tied to the canonical first line.
+export const ADVISORY_REARM_COMMENT_MARKER = '🔧 conveyor fix — re-armed for re-review';
 
 /** #xconv1-evidence — pure: is comment `c` a TRUSTED advisory note — its leading line EITHER shape of note (a
  *  fresh `advise`-step one, or a converted #xconv1 one) AND its author passes `isTrustedMarkerAuthor`?
@@ -311,7 +313,7 @@ export function isAdvisoryMechanismStandDownSuperseded(comments, index) {
     // fix-begin / fix-end are NOT boundaries: a fixer posts fix-begin before any stand-down and fix-end after
     // its hand-back mark, so treating either as one would un-supersede the exact #2549 shape.
     if (isTrustedMarkerAuthor(b) && (
-      head.startsWith(REARM_COMMENT_MARKER) || /^(?:✅|🔁|📌) review — /.test(head)
+      head.startsWith(ADVISORY_REARM_COMMENT_MARKER) || /^(?:✅|🔁|📌) review — /.test(head)
     )) fixedInCycle = false;
     if (head.startsWith(ADVISORY_FIX_COMMENT_MARKER) && isSelfAuthored(b)) {
       fixedInCycle = true;

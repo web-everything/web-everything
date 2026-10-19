@@ -330,7 +330,7 @@ export function recloneInPlace(dir, quarantineRoot, { log = () => {}, reason = '
   try { moved = quarantineLane(dir, quarantineRoot, { log, reason }); }
   catch (e) { return { ok: false, error: `could not quarantine the clone (${String(e && e.message || e).split('\n')[0]}); left in place` }; }
   // `--` ends option parsing: a URL is never read as a flag. `--reference=<p>` / `--branch=<b>` bind their values.
-  const args = ['clone', '--quiet', ...(reference ? [`--reference=${reference}`] : []), `--branch=${branch}`, '--', url, dir];
+  const args = ['clone', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '--quiet', ...(reference ? [`--reference=${reference}`] : []), `--branch=${branch}`, '--', url, dir];
   const c = runGit(args, dirname(dir));
   let failure = c.code !== 0 ? `re-clone failed (${c.err.trim().split('\n')[0]})` : '';
   if (!failure) {
@@ -356,6 +356,10 @@ export function recloneInPlace(dir, quarantineRoot, { log = () => {}, reason = '
       writeFileSync(tmp, freshConfig); renameSync(tmp, join(dir, '.git', 'config'));
       log(`  ⚠ clone-repair ${basename(dir)}: the old .git/config broke the fresh clone; kept the fresh config (the old one is in quarantine)`);
     } catch (e) { return { ok: false, error: `the carried-over config broke the fresh clone and could not be undone (${String(e && e.message || e).split('\n')[0]}); the old clone is at ${moved}` }; }
+  }
+  for (const [key, value] of [['gc.auto', '0'], ['maintenance.auto', 'false']]) {
+    const configured = runGit(['config', '--local', key, value], dir);
+    if (configured.code !== 0) return { ok: false, error: `could not configure ${key} after clone repair` };
   }
   return { ok: true, quarantinedTo: moved };
 }
