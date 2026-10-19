@@ -129,7 +129,11 @@ import { reduceCheckState, CI_TRUTH_EXCLUDED_CHECKS } from '../operations/pr-sta
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { isForeignCompletionSessionId, sanitizeDeniedCommand } from '../operations/completion-record.mjs';
 import { NEGOTIATION_ROUND_CAP } from '../lib/jury-core.mjs';
-import { countRearmComments, REARM_COMMENT_MARKER } from './rearm-review.mjs';
+import { countRearmComments } from './rearm-review.mjs';
+// Match rearm-review.mjs's first line locally, as review-referral-hold.mjs does:
+// reading its exported const during boot closes an initialization cycle through the drain.
+// The acceptance test pins this matcher to the canonical marker.
+const REARM_COMMENT_MARKER = '🔧 conveyor fix — re-armed for re-review';
 // #3383 — see this module's own REFUSAL 3 note below, and `advisory-round-count.mjs`'s header for the
 // `#2117`/`#2298` incident this closes.
 import { countAdvisoryComments, ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
