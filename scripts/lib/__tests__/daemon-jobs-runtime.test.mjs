@@ -427,9 +427,21 @@ describe('stopping a job that owns subprocesses', () => {
   it('never kills a group for a dead pid that is in use again or not on this host', () => {
     const kill = vi.fn();
     const reused = formatJobHandle({ host: hostName(), pid: process.pid, procStart: 'Thu Jan  1 00:00:00 1970' });
-    expect(reapDeadGroup(reused, { kill })).toBe(false);
-    expect(reapDeadGroup(formatJobHandle({ host: 'elsewhere', pid: 999999, procStart: 'x' }), { kill })).toBe(false);
+    expect(reapDeadGroup(reused, { kill, notAfterMs: Date.now() })).toBe(false);
+    expect(reapDeadGroup(formatJobHandle({ host: 'elsewhere', pid: 999999, procStart: 'x' }), { kill, notAfterMs: Date.now() })).toBe(false);
+    // A dead job's unused pid whose group id was taken over later: members started after the job was last
+    // alive, or the host rebooted since the job started — never the job's group.
+    const procStart = 'Mon Oct 19 00:00:00 2026', started = Date.parse(procStart);
+    const dead = formatJobHandle({ host: 'h', pid: 999999, procStart });
+    const base = { host: 'h', readStart: () => null, bootTime: () => started - 3600000, kill, notAfterMs: started + 60000 };
+    expect(reapDeadGroup(dead, { ...base, groupStarts: () => [started + 120000] })).toBe(false);
+    expect(reapDeadGroup(dead, { ...base, groupStarts: () => [started - 60000] })).toBe(false);
+    expect(reapDeadGroup(dead, { ...base, bootTime: () => started + 1000, groupStarts: () => [started + 5000] })).toBe(false);
+    expect(reapDeadGroup(dead, { ...base, bootTime: () => null, groupStarts: () => [started + 5000] })).toBe(false);
+    expect(reapDeadGroup(dead, { ...base, groupStarts: () => null })).toBe(false);
     expect(kill).not.toHaveBeenCalled();
+    expect(reapDeadGroup(dead, { ...base, groupStarts: () => [started, started + 5000] })).toBe(true);
+    expect(kill).toHaveBeenCalledWith(-999999, 'SIGKILL');
   });
 
   it('gives a kind its declared stop grace on a deadline stop', async () => {

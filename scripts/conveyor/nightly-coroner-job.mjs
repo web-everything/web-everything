@@ -101,7 +101,7 @@ export function publishCoronerFailure({ id, error, attempts, maxAttempts, reason
 export async function runNightlyCoronerJob({ now, config, settings, dir, env = process.env, sourceRoot = ROOT,
   store = createJobStore(daemonJobsDir('nightly-coroner', env)), enqueue = enqueueJob, reattach = reattachTick,
   evict = evictToTrash, codeSha, snapshot, log = console.error, warmGate = {}, statusFeed = feedPath(),
-  sweepLanes = () => sweepCoronerLeases(ROOT, sourceRoot, coronerLaneSession(store.dir)) } = {}) {
+  sweepLanes = (session) => sweepCoronerLeases(ROOT, sourceRoot, session) } = {}) {
   config = { ...NIGHTLY_DEFAULTS, ...config };
   mkdirSync(store.dir, { recursive: true });
   const { records, corrupt = [] } = store.list();
@@ -127,14 +127,20 @@ export async function runNightlyCoronerJob({ now, config, settings, dir, env = p
   // its child SIGKILLed or crashed before its own release. With no coroner attempt queued or running, that lease
   // is an orphan. The sweep stays owed until one succeeds and is stamped on the record, so a sweep that fails or
   // a tick killed before it retries on the next tick. A requeued attempt sweeps for itself before it acquires.
+  // Each record is swept by the session its own attempt leased under; a record with none (enqueued before
+  // sessions existed) cannot be swept and is never stamped as if it had been.
   const coroners = store.list().records.filter((r) => r.job.kind === HEALTH_NIGHTLY_CORONER_KIND.kind);
-  const owed = coroners.filter((r) => r.job.status === 'failed' && !r.laneSweptAt);
+  const owed = coroners.filter((r) => r.job.status === 'failed' && typeof r.input?.laneSession === 'string' && r.input.laneSession && !r.laneSweptAt);
   if (owed.length && !coroners.some((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status))) {
-    try {
-      await sweepLanes();
-      const at = new Date().toISOString();
-      for (const r of owed) store.update(r.id, (f) => (f.job.status === 'failed' && !f.laneSweptAt ? { ...f, laneSweptAt: at } : null));
-    } catch (e) { log(`nightly-coroner lane sweep: ${e.message}`); }
+    for (const session of new Set(owed.map((r) => r.input.laneSession))) {
+      try {
+        await sweepLanes(session);
+        const at = new Date().toISOString();
+        for (const r of owed.filter((x) => x.input.laneSession === session)) {
+          store.update(r.id, (f) => (f.job.status === 'failed' && !f.laneSweptAt ? { ...f, laneSweptAt: at } : null));
+        }
+      } catch (e) { log(`nightly-coroner lane sweep (${session}): ${e.message}`); }
+    }
   }
   const current = store.list().records;
   try { evict({ jobsDir: store.dir, referenced: current.filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status)).flatMap((r) => r.job.snapshotKeys ?? []) }); }

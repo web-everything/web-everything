@@ -374,6 +374,14 @@ it('sweeps orphaned coroner leases after a failure until a sweep succeeds, never
   expect(opts.store.read(first.enqueued).laneSweptAt).toBeTruthy();
   await runNightlyCoronerJob({ ...opts, now: now + 120000 });
   expect(opts.sweepLanes).toHaveBeenCalledTimes(2); // paid: never swept again
+  expect(opts.sweepLanes).toHaveBeenLastCalledWith(coronerLaneSession(opts.store.dir));
+  // A failed record from before lane sessions existed cannot be swept, so it is never stamped as swept.
+  const legacy = jobOptions(temp());
+  const old = await runNightlyCoronerJob({ ...legacy, now: Date.parse('2026-10-17T03:00:00Z') });
+  legacy.store.update(old.enqueued, (r) => ({ ...r, input: { ...r.input, laneSession: undefined }, job: { ...r.job, status: 'failed' } }));
+  await runNightlyCoronerJob({ ...legacy, now: Date.parse('2026-10-17T03:01:00Z') });
+  expect(legacy.sweepLanes).not.toHaveBeenCalled();
+  expect(legacy.store.read(old.enqueued).laneSweptAt).toBeUndefined();
   expect(coronerLaneSession(join(root, 'other-store'))).not.toBe(coronerLaneSession(opts.store.dir));
   const live = jobOptions(temp());
   live.reattach = vi.fn(async ({ store }) => {

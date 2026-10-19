@@ -311,22 +311,51 @@ export async function stopHandle(handle, {
   return { gone, signal: 'SIGKILL' };
 }
 
+/** Start times (ms) of every process in group `pgid`, or null when `ps` did not answer. */
+export function readGroupStarts(pgid, { execFn = execFileSync } = {}) {
+  try {
+    const out = execFn('ps', ['-A', '-o', 'pgid=,lstart='], {
+      env: { ...process.env, LC_ALL: 'C' }, encoding: 'utf8', timeout: PS_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return out.split('\n').map((l) => l.trim().match(/^(\d+)\s+(.+)$/)).filter((m) => m && Number(m[1]) === pgid).map((m) => Date.parse(m[2]));
+  } catch { return null; }
+}
+
+/** This host's boot time (ms), or null when unknown. */
+export function readBootTime({ execFn = execFileSync, readFile = readFileSync } = {}) {
+  try {
+    if (process.platform === 'linux') {
+      const s = Number(readFile('/proc/stat', 'utf8').match(/^btime (\d+)$/m)?.[1]);
+      return Number.isFinite(s) ? s * 1000 : null;
+    }
+    const s = Number(execFn('sysctl', ['-n', 'kern.boottime'], { encoding: 'utf8', timeout: PS_TIMEOUT_MS }).match(/sec = (\d+)/)?.[1]);
+    return Number.isFinite(s) ? s * 1000 : null;
+  } catch { return null; }
+}
+
 /**
  * A job whose pid died on its own (crash, OOM kill) can leave its subprocesses running in its process group.
- * SIGKILL that group before the job is requeued or failed. Only when the pid itself is unused: a pid is never
- * handed out while a group with that id exists, so a group seen then is the dead job's own. A pid in use again
- * means the job's group is already gone.
+ * SIGKILL that group before the job is requeued or failed — only when it is provably the job's own: the pid is
+ * unused, the host has not rebooted since the job started, and every member started between the job's start
+ * and `notAfterMs` (when it was last known alive, plus the staleness window). A group whose id was reused
+ * after the job died has members started later, so it is never touched. Anything unreadable skips the reap.
  * @returns {boolean} whether a leftover group was killed
  */
 export function reapDeadGroup(handle, {
-  host = hostName(), aliases = null, readStart = readProcStart, kill = (pid, sig) => process.kill(pid, sig),
+  notAfterMs, host = hostName(), aliases = null, readStart = readProcStart, groupStarts = readGroupStarts,
+  bootTime = readBootTime, kill = (pid, sig) => process.kill(pid, sig),
 } = {}) {
   const h = parseJobHandle(handle);
-  if (!h?.pid) return false;
+  if (!h?.pid || !Number.isFinite(notAfterMs)) return false;
   const local = aliases ?? (arguments[1]?.host !== undefined ? new Set([host]) : localHostAliases());
   if (h.host !== host && !local.has(h.host)) return false;
   try { if (readStart(h.pid)) return false; } catch { return false; }
-  try { kill(-h.pid, 0); kill(-h.pid, 'SIGKILL'); return true; } catch { return false; }
+  const startedMs = Date.parse(h.procStart);
+  const boot = bootTime();
+  if (!Number.isFinite(startedMs) || !Number.isFinite(boot) || boot > startedMs) return false;
+  const members = groupStarts(h.pid);
+  if (!members?.length || members.some((t) => !Number.isFinite(t) || t < startedMs - 1000 || t > notAfterMs)) return false;
+  try { kill(-h.pid, 'SIGKILL'); return true; } catch { return false; }
 }
 
 /**
@@ -357,7 +386,7 @@ export async function reattachTick({
   store, kinds, maxConcurrent, clock, observation, probe = (h) => probeHandle(h), stop = (h, o = {}) => stopHandle(h, { probe, ...o }),
   launch = launchJob, staleMs = DEFAULT_HEARTBEAT_STALE_MS, launchGraceMs = DEFAULT_LAUNCH_GRACE_MS,
   backoffBaseMs = DEFAULT_BACKOFF_BASE_MS, snapshot, heartbeatIntervalMs, log = () => {}, deadlineAt = () => null,
-  reapGroup = (h) => reapDeadGroup(h),
+  reapGroup = (h, notAfterMs) => reapDeadGroup(h, { notAfterMs }),
 }) {
   const obs = observation ?? (clock ? clock.observe() : { now: Date.now(), slept: false, gapMs: 0 });
   const { now, slept, gapMs } = obs;
@@ -376,7 +405,8 @@ export async function reattachTick({
       reason: `deadline exceeded; ${r.job.attempts}/${r.job.maxAttempts} attempts; last error: ${r.job.error ?? 'not completed'}` }
       : planReattach(r, state, { kindDef });
     if (plan.type === 'none') continue;
-    if (liveness === 'dead' && reapGroup(r.job.handle)) log(`daemon-jobs: job ${r.id} died with subprocesses still running — killed its process group`);
+    const lastAliveMs = Date.parse(r.job.heartbeatAt ?? r.job.startedAt ?? '');
+    if (liveness === 'dead' && Number.isFinite(lastAliveMs) && reapGroup(r.job.handle, lastAliveMs + staleMs)) log(`daemon-jobs: job ${r.id} died with subprocesses still running — killed its process group`);
     if (plan.stopFirst) {
       const res = await stop(r.job.handle, kindDef?.stopGraceMs ? { termGraceMs: kindDef.stopGraceMs } : {});
       if (!res.gone) {
