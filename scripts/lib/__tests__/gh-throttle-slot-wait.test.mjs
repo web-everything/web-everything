@@ -87,7 +87,7 @@ it('resolves platform and env knobs with sources and invalid fallback', () => {
   for (const bad of ['-1', '120001', '1.5', 'no', '']) {
     expect(resolveGhSlotWait({ ...env, WE_GH_THROTTLE_BACKGROUND_WAIT_MS: bad, WE_GH_THROTTLE_ON_SLOT_TIMEOUT: 'bad' })).toMatchObject({ backgroundWaitMs: 8000, onSlotTimeout: 'throttled', source: { backgroundWaitMs: 'standard', onSlotTimeout: 'standard' } });
   }
-  expect(resolveGhSlotWait(null)).toMatchObject(GH_SLOT_WAIT_STANDARD);
+  expect(resolveGhSlotWait({ WE_PLATFORM_PREFERENCES_FILE: join(temp(), 'absent.json') })).toMatchObject(GH_SLOT_WAIT_STANDARD);
 });
 it('recognizes shared throttled markers without confusing deferrals or ordinary failures', () => {
   expect(sharedIsGhThrottled).toBe(isGhThrottled);

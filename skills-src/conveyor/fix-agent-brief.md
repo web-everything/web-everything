@@ -145,10 +145,12 @@ The `/review` changes-verdict posts a durable PR comment (header `🔁 human rev
 `🔁 review — changes requested`) summarizing what to fix. Read it — and the escalation block in the PR body:
 
 ```bash
-gh pr view {{PR_NUM}} --json title,body,comments --repo {{REPO}}
+node "{{WE_ROOT}}/scripts/pr-context.mjs" {{PR_NUM}} --repo={{REPO}} --head="$(git rev-parse HEAD)"
 ```
 
-Take the **latest** changes-requested comment as the authoritative ask.
+The shared read is pinned to the examined checkout head and TTL bounded. It is context for the repair;
+all live claim, label, base and hand-back checks below still apply. If the head differs, refresh the
+work order instead of substituting another SHA. Take the **latest** changes-requested comment as the ask.
 
 **If this prompt opens with a `Previous rounds` (or `Takeover`) section, read it first** (card xx0055i). It lists
 each earlier round's findings, what the previous fixer changed, which findings were raised again, and the current
@@ -203,7 +205,7 @@ There is no `review:changes` comment on this population — the finding is the a
 instead (leading line `⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.`):
 
 ```bash
-gh pr view {{PR_NUM}} --json title,body,comments --repo {{REPO}}
+node "{{WE_ROOT}}/scripts/pr-context.mjs" {{PR_NUM}} --repo={{REPO}} --head="$(git rev-parse HEAD)"
 ```
 
 Take the **latest** such comment as the authoritative ask — read its findings table and its
@@ -364,6 +366,12 @@ node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo=
 > If the overlap is a genuine same-line conflict you cannot safely resolve, the same stand-down escalation above
 > applies unchanged (`stand-down.mjs {{PR_NUM}} --repo={{REPO}} --reason=conflict --detail=...`) — this mode
 > changes only what a *successful* resolution hands back with, never the escalation path.
+
+> **STALE-BASE MODE — dispatched with `mode: stale-base-rebase`.** The PR base is main but a required job
+> is missing because the base predates it. Rebase (or merge) onto current `origin/main` (usually conflict-free),
+> make no other edit, run the gate green, and push. **Touch no `review:*` label.** Hand back exactly like
+> STACKED-BASE MODE: `conflict-fix-mark.mjs` with `--base-ref=main`, then `completion-cli.mjs report`, then
+> `fix-procedure.mjs fix-end`. Never run `rearm-review.mjs`.
 
 **Build-brief discipline applies to the repair too** (statute:
 [we:docs/agent/platform-decisions.md#build-brief-discipline](../../../docs/agent/platform-decisions.md#build-brief-discipline),
