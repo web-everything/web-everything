@@ -51,7 +51,7 @@ import { pickAgyEvidence } from '../lib/antigravity-run-evidence.mjs';
 import { describeSubmit, extractSubmitResult } from './open-pr.mjs';
 import { advance, runStatus, startRun } from './engine.mjs';
 import { applyPendingEffects, inFlightEntries } from './effect-executor.mjs';
-import { normalizeJudgeTelemetry, totalJudgeSpend, withStepFinish, withStepStart } from './run-record.mjs';
+import { chosenRunIdRecord, normalizeJudgeTelemetry, totalJudgeSpend, withStepFinish, withStepStart } from './run-record.mjs';
 import { planJudgeBatch, runJudgeBatch, sameJudgeRequest } from './parallel-judges.mjs';
 import { isReadOnlyOperation, validateInput } from './registry.mjs';
 import { assertNoForbiddenArgv, EFFORT_LEVELS, judgeSpawn } from '../lib/judge-spawn.mjs';
@@ -1293,6 +1293,11 @@ export async function runOperationCli({ declaration, argv, registry, store, sink
     }
   } else {
     run = startRun({ op: declaration.name, id: parsed.control.runId || newRunId(), input: parsed.input, registry });
+    if (parsed.control.runId) {
+      const chosen = chosenRunIdRecord(run, store);
+      if (chosen.error) return { code: 2, lines: [`error: ${chosen.error}`], run: null, stopped: 'refused' };
+      run = chosen.run;
+    }
     store.write(run);
   }
 

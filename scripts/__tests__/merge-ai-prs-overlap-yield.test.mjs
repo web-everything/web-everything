@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import { planLabelDrain, isPassIdle, buildOverlapRows } from '../merge-ai-prs.mjs';
 import { overlapRowKey, overlapYieldWaits } from '../conveyor/land-overlap-yield.mjs';
 import { embedManifestInBody } from '../readiness/lane-manifest.mjs';
@@ -7,6 +7,8 @@ import { embedManifestInBody } from '../readiness/lane-manifest.mjs';
 // `we:scripts/conveyor/land-overlap-yield.mjs#computeOverlapContext`, exercised on its own in that module's own
 // test file). This suite drives `planLabelDrain` directly with a hand-built Map, mirroring the existing
 // `#2188 blockedBy ordering` suite's `cand()` convention (`merge-ai-prs-ai-detection-and-drain-ordering.test.mjs`).
+afterEach(() => vi.unstubAllEnvs());
+
 const cand = (num, item = null, blockedBy = [], decision = 'merge', repo = null) => ({ num, item, blockedBy, decision, repo });
 const overlapWait = (num, yieldTo, repo = null, extra = {}) => new Map([[
   overlapRowKey({ repo, number: num }),
@@ -79,8 +81,9 @@ describe('planLabelDrain — #4308 overlap-yield wiring', () => {
 });
 
 describe('buildOverlapRows — #4308 row-shape wiring (2026-09-29 review finding)', () => {
-  const rawPr = (num, { baseRefName = 'main', isDraft = false, labels = [], files = [], headRefOid = null } = {}) =>
-    ({ number: num, baseRefName, isDraft, labels, files, headRefOid });
+  const rawPr = (num, { baseRefName = 'main', isDraft = false, labels = ['ready-to-merge'], files = [], headRefOid = null } = {}) =>
+    ({ number: num, baseRefName, isDraft, labels, files, headRefOid,
+      statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] });
 
   it('normalizes a null (local-repo) Map key to `localSlug` — for BOTH the row\'s own `.repo` and the matching keys', () => {
     const openPrContext = { prsByRepo: new Map([[null, [rawPr(10, { files: [{ path: 'a', additions: 5, deletions: 0 }] })]]]) };
@@ -141,7 +144,7 @@ describe('buildOverlapRows — #4308 row-shape wiring (2026-09-29 review finding
     const yBody = embedManifestInBody('', { item: 200, blockedBy: [100] });
     const openPrContext = { prsByRepo: new Map([['we', [
       { ...rawPr(1, { files: small }) },
-      { ...rawPr(2, { files: big, labels: [{ name: 'review:pending' }] }), body: yBody },
+      { ...rawPr(2, { files: big, labels: [{ name: 'review:pending' }, { name: 'ready-to-merge' }] }), body: yBody },
     ]]]) };
     const x = { num: 1, repo: 'we', decision: 'merge', item: 100, blockedBy: [], stackParents: [], headSha: 'abc' };
     const { candidateRows, openPrRows } = buildOverlapRows({ candidates: [x], verdicts: [x], openPrContext });
@@ -167,8 +170,11 @@ describe('overlap-yield required CI wiring', () => {
     [{ name: 'test', status: 'IN_PROGRESS', conclusion: null }, false],
     [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, false],
   ])('classifies required checks: %j', (check, red) => {
-    const { openPrRows } = buildOverlapRows({ openPrContext: { prsByRepo: new Map([['we', [{ number: 1, statusCheckRollup: [check] }]]]) } });
-    expect(openPrRows[0].requiredCheckRed).toBe(red);
+    const x = cand(1, null, [], 'merge', 'we');
+    const { candidateRows, openPrRows } = buildOverlapRows({ candidates: [x], verdicts: [x], openPrContext: { prsByRepo: new Map([['we', [{ number: 1, labels: ['ready-to-merge'], statusCheckRollup: [check] }]]]) } });
+    expect(candidateRows[0].requiredCheckRed).toBe(red);
+    expect(candidateRows[0].requiredCheckGreen).toBe(check.conclusion === 'SUCCESS');
+    expect(openPrRows).toHaveLength(check.conclusion === 'SUCCESS' ? 1 : 0);
   });
 
   it('attaches skip tokens to ready and deferred entries without changing waits or idle accounting', () => {
@@ -184,7 +190,8 @@ describe('overlap-yield required CI wiring', () => {
     expect(isPassIdle({ merged: 0, pendingRebased: 0, deferred })).toBe(true);
   });
 
-  it('replays #3983 held behind red #3990 on stand-down.test.mjs', () => {
+  it('replays #3983 held behind red #3990 with the landable policy disabled', () => {
+    vi.stubEnv('WE_DRAIN_OVERLAP_YIELD_REQUIRES_LANDABLE', '0');
     const path = 'scripts/conveyor/__tests__/stand-down.test.mjs';
     const prs = [
       { number: 3983, baseRefName: 'main', files: [{ path, additions: 289 }] },
