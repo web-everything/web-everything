@@ -8,7 +8,7 @@
 
 import { EventEmitter } from 'node:events';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -42,6 +42,12 @@ import {
 // Historical orchestration fixtures isolate the new independently tested self-review.
 beforeEach(() => vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'false'));
 afterEach(() => vi.unstubAllEnvs());
+
+/** A fixture `--dir` standing for a WE checkout: the default full gate needs its scripts/verify-lane.mjs. */
+function weCheckout(dir) {
+  mkdirSync(join(dir, 'scripts'), { recursive: true });
+  writeFileSync(join(dir, 'scripts', 'verify-lane.mjs'), '');
+}
 
 function flagValue(argv, flag) {
   const i = argv.indexOf(flag);
@@ -874,6 +880,7 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
 
   it('#4665 isolates each edit run, honors the pool override, and leaves review permissions alone', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'we-codex-permissions-test-'));
+    weCheckout(dir);
     const allocated = [];
     const env = { ...process.env, LANE_POOL_ROOT: join(dir, 'pool override'), TMPDIR: '/old/tmp' };
     const execFn = (bin, args) => args.includes('--absolute-git-dir') ? join(dir, 'metadata') : args.includes('rev-parse') ? 'sha' : '';
@@ -1126,6 +1133,7 @@ describe('direct CLI flags reach the actual spawn and JSON result', () => {
     [['--review'], 'review', 'gpt-6.1-sol', 'medium', 'tool', 'tool'],
   ])('%j', (flags, kind, model, effort, modelSource, effortSource) => {
     const dir = mkdtempSync(join(tmpdir(), 'we-direct-cli-'));
+    weCheckout(dir);
     const preload = `import cp from 'node:child_process';
       import { syncBuiltinESMExports } from 'node:module';
       import { EventEmitter } from 'node:events';

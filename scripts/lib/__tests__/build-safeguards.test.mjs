@@ -181,6 +181,7 @@ describe('production self-review adapter', () => {
     ['a verdict after a leading sentence', 'Here is the result:\n{"findings":[]}', []],
     ['a fenced verdict between prose lines, with CRLF', 'Result {see below}:\r\n```json\r\n{"findings":["a {b}"]}\r\n```\r\nDone.', ['a {b}']],
     ['a verdict with trailing prose', '{"findings":[]}\nNo blocking defects.', []],
+    ['a finding that itself mentions a findings key', '```json\n{"findings":["a.mjs:1 the \\"findings\\": list is unbounded"]}\n```\nNo other findings.', ['a.mjs:1 the "findings": list is unbounded']],
   ])('accepts %s', async (_name, lastMessage, expected) => {
     const task = vi.spyOn(codexTasks, 'codexDirectTask').mockResolvedValue({ exitCode: 0, timedOut: false, lastMessage });
     try { await expect(reviewBuildDiff({ dir: '.', diff: 'net change', env: {} })).resolves.toEqual(expected); }
@@ -200,6 +201,15 @@ describe('production self-review adapter', () => {
     ['a fenced verdict beside an upper-case JSON fence', '```json\n{"findings":[]}\n```\n```JSON\n{"findings":["a.mjs:1 defect"]}\n```'],
     ['a fenced verdict beside a tilde fence', '```json\n{"findings":[]}\n```\n~~~\n{"findings":["a.mjs:1 defect"]}\n~~~'],
     ['a text fence beside a bare verdict', '```text\n{"findings":["a.mjs:1 defect"]}\n```\n{"findings":[]}'],
+    ['a repeated key in a fenced verdict', '```json\n{"findings":["a.mjs:1 defect"],"findings":[]}\n```'],
+    ['a repeated key in a bare verdict', '{"findings":["a.mjs:1 defect"],"findings":[]}'],
+    ['a repeated escaped key', '{"findings":["a.mjs:1 defect"],"find\\u0069ngs":[]}'],
+    ['a fenced verdict beside an escaped-quote verdict', '```json\n{"findings":[]}\n```\n{\\"findings\\":[\\"a.mjs:1 defect\\"]}'],
+    ['a fenced verdict beside YAML findings', '```json\n{"findings":[]}\n```\nfindings:\n- a.mjs:1 defect'],
+    ['a bare verdict beside YAML findings', 'findings:\n- a.mjs:1 defect\n{"findings":[]}'],
+    ['a fenced verdict beside a zero-width-split key', '```json\n{"findings":[]}\n```\n{"find​ings":["a.mjs:1 defect"]}'],
+    ['a fenced verdict beside a \\u-escaped key', '```json\n{"findings":[]}\n```\n{"\\u0066indings":["a.mjs:1 defect"]}'],
+    ['a fenced verdict beside a ligature key', '```json\n{"findings":[]}\n```\n{"ﬁndings":["a.mjs:1 defect"]}'],
   ])('rejects %s', async (_name, lastMessage) => {
     const task = vi.spyOn(codexTasks, 'codexDirectTask').mockResolvedValue({ exitCode: 0, timedOut: false, lastMessage });
     try { await expect(reviewBuildDiff({ dir: '.', diff: 'net change', env: {} })).rejects.toThrow(); }
@@ -412,6 +422,16 @@ describe('Codex completion wiring', () => {
       expect(report.gate).toMatchObject(expected);
       const verifies = execFn.mock.calls.filter(([bin, args]) => bin === 'node' && args[0] === 'scripts/verify-lane.mjs');
       expect(verifies).toHaveLength(expected.ran ? 1 : 0);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each(['full', 'related'])('refuses --gate=%s in a checkout without verify-lane before any Codex spend', async gate => {
+    const dir = mkdtempSync(join(tmpdir(), 'build-gate-refuse-'));
+    const spawnFn = vi.fn();
+    try {
+      await expect(codexDirectTask({ dir, task: 'change', gate, selfReview: false, env: isolated({}), execFn: fakeGit(dir),
+        spawnFn, stream: false, log: () => {} })).rejects.toThrow('gate-unavailable');
+      expect(spawnFn).not.toHaveBeenCalled();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 

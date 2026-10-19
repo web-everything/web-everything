@@ -38,25 +38,47 @@ export async function selfReviewPrompt(diff) {
     FENCED_DATA_RULE, fenceUntrusted('material', diff)].join('\n\n');
 }
 
-// A `findings` key outside the chosen fence: quoted (straight or curly quotes) or bare right after a brace.
-const STRAY_FINDINGS_KEY = /["'“”‘’]findings["'“”‘’]\s*:|\{\s*findings\s*:/i;
+// Prose outside the verdict that still states findings, in any notation: JSON (escaped or not), YAML, a bare key.
+// Matched after NFKC and with format characters removed, so look-alike or zero-width spellings count too.
+const STRAY_FINDINGS_KEY = /findings[^\p{L}\p{N}\n]{0,6}:/iu;
+
+/** The top-level keys of valid JSON object text, in order, duplicates kept (`JSON.parse` keeps only the last). */
+function topLevelKeys(json) {
+  const keys = [];
+  let depth = 0;
+  let expectKey = false;
+  for (let i = 0; i < json.length; i++) {
+    const c = json[i];
+    if (c === '"') {
+      let j = i + 1;
+      while (j < json.length && json[j] !== '"') j += json[j] === '\\' ? 2 : 1;
+      if (depth === 1 && expectKey) keys.push(JSON.parse(json.slice(i, j + 1)));
+      i = j;
+    } else if (c === '{' || c === '[') { depth++; expectKey = c === '{' && depth === 1; }
+    else if (c === '}' || c === ']') depth--;
+    else if (depth === 1 && c === ',') expectKey = true;
+    else if (depth === 1 && c === ':') expectKey = false;
+  }
+  return keys;
+}
 
 /**
  * One verdict object: bare, or inside exactly one fenced block, either with prose around it. Without a fence the
- * object runs from the first `{` to the last `}`. Anything else (two blocks, two objects, a second verdict outside
- * the fence, extra keys) is invalid.
+ * object runs from the first `{` to the last `}`. Anything else is invalid: two blocks, two objects, a second
+ * verdict in the prose outside the object, a repeated or extra key.
  */
 export function parseSelfReviewVerdict(message) {
   const text = String(message ?? '').replace(/\r\n?/g, '\n').trim();
   const fences = [...text.matchAll(/^```[ \t]*(?:json)?[ \t]*\n([\s\S]*?)\n```[ \t]*$/gim)];
   if (fences.length > 1) throw new Error('invalid self-review verdict: more than one fenced block');
-  if (fences.length) {
-    const outside = text.slice(0, fences[0].index) + text.slice(fences[0].index + fences[0][0].length);
-    if (STRAY_FINDINGS_KEY.test(outside)) throw new Error('invalid self-review verdict: a second verdict outside the fenced block');
-  }
-  const body = fences.length ? fences[0][1] : text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1);
+  const [start, end] = fences.length ? [fences[0].index, fences[0].index + fences[0][0].length]
+    : [text.indexOf('{'), text.lastIndexOf('}') + 1];
+  const body = fences.length ? fences[0][1] : text.slice(start, end);
+  const outside = (text.slice(0, Math.max(start, 0)) + '\n' + text.slice(end))
+    .replace(/\\u([0-9a-f]{4})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))).normalize('NFKC').replace(/\p{Cf}/gu, '');
+  if (STRAY_FINDINGS_KEY.test(outside)) throw new Error('invalid self-review verdict: findings outside the verdict object');
   const parsed = JSON.parse(body);
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.keys(parsed).join() !== 'findings') {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || topLevelKeys(body.trim()).join() !== 'findings') {
     throw new Error('invalid self-review verdict');
   }
   return parsed;

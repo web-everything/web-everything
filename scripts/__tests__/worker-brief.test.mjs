@@ -81,6 +81,14 @@ describe('renderWorkerBrief', () => {
     expect(brief).not.toContain(defaultProof);
     expect(renderWorkerBrief(input)).toBe(brief);
   });
+
+  // A plateau-app lane has no scripts/verify-lane.mjs, so Codex's full or related gate would be gate-unavailable.
+  it.each([['full', 'standards'], ['related', 'standards'], ['none', 'none']])('a plateau-app brief under finalGate=%s sends Codex --gate=%s', (finalGate, codexGate) => {
+    const policy = { finalGate, selfReview: { enabled: false, maxRounds: 2 }, reviewerExpectations: { enabled: false } };
+    const brief = renderWorkerBrief({ ...params, repo: 'plateau-app', policy });
+    expect(brief).toContain(`--dir=<lane> --gate=${codexGate}\``);
+    expect(renderWorkerBrief({ ...params, policy })).toContain(`--dir=<lane> --gate=${finalGate}\``);
+  });
 });
 
 describe('main', () => {

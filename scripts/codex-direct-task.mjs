@@ -869,6 +869,10 @@ export async function codexDirectTask({
   } else if (!existsFn(targetDir)) {
     throw new Error(`codex-direct-task: --dir=${targetDir} does not exist`);
   }
+  // Refuse before any Codex spend: the gate this run would end on cannot run in this checkout.
+  if (!review && (gate === 'full' || gate === 'related') && !existsFn(join(targetDir, 'scripts', 'verify-lane.mjs'))) {
+    throw new Error(`codex-direct-task: gate-unavailable — --gate=${gate} needs scripts/verify-lane.mjs, which ${targetDir} does not have; pass --gate=standards or --gate=none`);
+  }
 
   const startSha = execFn('git', ['-C', targetDir, 'rev-parse', 'HEAD']).trim();
   // Same `.git/`-hiding reasoning as `outputLastMessageFile` above — the default log file must never leak
@@ -1077,9 +1081,9 @@ async function main() {
       for (const c of report.diff.commits) console.log(`    ${c}`);
     }
     console.log(report.diff.hasChanges ? `\n${report.diff.diffStat}` : '\n  (no changes)');
-    if (report.gate.ran) {
-      console.log(`\n  gate (${report.gate.mode}): ${report.gate.pass ? 'PASS' : 'FAIL'}`);
-      for (const s of report.gate.steps) console.log(`    ${s.pass ? '✓' : '✗'} ${s.cmd}`);
+    if (report.gate.ran || report.gate.unavailable) {
+      console.log(`\n  gate (${report.gate.mode}): ${report.gate.unavailable ?? (report.gate.pass ? 'PASS' : 'FAIL')}`);
+      for (const s of report.gate.steps) console.log(`    ${s.pass ? '✓' : '✗'} ${s.cmd}${report.gate.unavailable ? ` — ${s.output}` : ''}`);
     }
     if (report.selfReview.notes.length) console.log(renderSelfReviewNotes(report.selfReview));
     console.log('\n  NOTHING WAS COMMITTED OR PUSHED. Review the diff above (or `cd` into the dir and run `git diff`), then commit/land it yourself if you want it.');

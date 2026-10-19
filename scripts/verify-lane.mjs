@@ -357,7 +357,12 @@ function resolveBuildDefaultGate(env) {
   const tests = !scripts || scripts.includes('test:unit') ? 'npm run test:unit' : 'npm test';
   const command = tests + (!scripts || scripts.includes('check:standards') ? ' && npm run check:standards' : '');
   let changedFiles = null;
-  try { changedFiles = localChangedSet({ runGit: git })?.changedFiles ?? null; } catch { /* unknown diff: no attribution */ }
+  try {
+    // Untracked lane litter is not the change's own (the same rule as the diff selection).
+    const diff = localChangedSet({ runGit: git });
+    const untracked = new Set(diff?.untrackedFiles ?? []);
+    changedFiles = diff ? diff.changedFiles.filter((p) => !untracked.has(p) || !isAllowlistedLitterPath(p)) : null;
+  } catch { /* unknown diff: no attribution */ }
   const reason = 'build.finalGate=full — the whole unit tier plus standards';
   return { command, gateReasons: [reason], decision: { mode: 'full', reasons: [reason], changedFiles,
     selectionMode: { mode: 'pr', reason: 'build.finalGate=full' } } };
@@ -413,9 +418,17 @@ if (!resolvedGate && typeof flags.gate === 'string') {
     // and (#66) the related-test mode or timeout factor. If the stamped command is exactly what some declared
     // variant resolves to for this same diff, it is still the default gate: run the requester's selection with
     // OUR standards policy, and keep `GATE` (the marker's `suites`) as requested so the cache key still matches.
+    // The requester may also resolve the other `build.finalGate` (its own env, or a lane base from before the
+    // setting): a stamped selection under our `full`, or a stamped full gate under our `related`, is still a default.
     else if (MODE === 'verify' && typeof flags['run-id'] === 'string') {
-      resolvedGate = matchRequestedDefaultGate({ gate: GATE, env: process.env, resolved, resolveUnder,
-        variants: verifySetting('matchRequestVariants', process.env) }) ?? undefined;
+      const variants = verifySetting('matchRequestVariants', process.env);
+      const ours = resolveBuildPolicy({ env: process.env }).finalGate === 'full' ? 'full' : 'related';
+      for (const finalGate of [ours, ours === 'full' ? 'related' : 'full']) {
+        const env = finalGate === ours ? process.env : { ...process.env, WE_BUILD_FINAL_GATE: finalGate };
+        const base = finalGate === ours ? resolved : resolveUnder(env);
+        resolvedGate = (base.command === GATE ? base : matchRequestedDefaultGate({ gate: GATE, env, resolved: base, resolveUnder, variants })) ?? undefined;
+        if (resolvedGate) break;
+      }
     }
   } catch { /* Unknown selection cannot authorize a retry. */ }
   // #66 — never fall back to whole-gate admission silently: say so on stderr (the dispatcher copies this line into

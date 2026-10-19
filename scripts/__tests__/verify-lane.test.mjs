@@ -1783,4 +1783,27 @@ describe('full build gate default', () => {
       expect(child.stderr).not.toContain('whole-gate admission');
     } finally { rmSync(ledgerDir, { recursive: true, force: true }); }
   });
+
+  // The requester and the dispatched child can resolve different finalGate settings (own env, older lane base).
+  it.each([['related', 'full', /mode=pr /], ['full', 'related', /mode=full /]])(
+    'a child under finalGate=%2$s recognizes a default gate stamped under %1$s', (requester, child, mode) => {
+      const git = (...a) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' });
+      git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+      mkdirSync(join(dir, 'node_modules', '.bin'), { recursive: true });
+      writeFileSync(join(dir, 'node_modules', '.bin', 'vitest'), '#!/bin/sh\nexit 0\n');
+      chmodSync(join(dir, 'node_modules', '.bin', 'vitest'), 0o755);
+      writeFileSync(join(dir, '.gitignore'), 'node_modules/\n');
+      mkdirSync(join(dir, 'scripts', 'lib'), { recursive: true });
+      writeFileSync(join(dir, 'scripts', 'lib', 'zz-cross.mjs'), 'export {};\n');
+      git('add', '-A'); git('commit', '-qm', 'cross-policy fixture');
+      const env = (finalGate) => ({ ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_BUILD_FINAL_GATE: finalGate,
+        WE_PLATFORM_PREFERENCES_FILE: join(tmpdir(), 'no-such-platform-preferences.json') });
+      const request = spawnSync('node', [VERIFY_LANE, 'request', '--json'], { cwd: dir, encoding: 'utf8', env: env(requester), timeout: 60_000 });
+      const suites = JSON.parse(readFileSync(marker(), 'utf8')).suites;
+      expect(suites, request.stderr).toBeTruthy();
+      const run = spawnSync('node', [VERIFY_LANE, 'verify', '--json', '--run-id=cross-child', `--gate=${suites}`], { cwd: dir, encoding: 'utf8', env: env(child), timeout: 60_000 });
+      expect(run.stderr).toMatch(new RegExp(`selection @ \\w+ ${mode.source}`));
+      expect(run.stderr).not.toContain('mode=explicit');
+      expect(run.stderr).not.toContain('whole-gate admission');
+    });
 });
