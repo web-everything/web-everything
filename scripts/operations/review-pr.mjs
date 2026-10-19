@@ -1,3 +1,4 @@
+import { reviewPrStepNames } from './review-pr-completion.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { advisoryLabelOutcome } from '../lib/review-advisory-outcome.mjs';
 export { advisoryLabelOutcome, deriveAdvisoryOutcome } from '../lib/review-advisory-outcome.mjs';
@@ -256,10 +257,6 @@ import {
 } from '../lib/review-escalation.mjs';
 import { liveStatusFor as liveProbationStatusFor } from '../lib/model-probation.mjs';
 import { CODEX_MODEL } from '../codex-direct-task.mjs';
-// #3383 — THE FIFTH SEAT'S IDENTITY. `ANTIGRAVITY_MODEL` is the pinned `{provider, model}` half
-// `defaultAntigravityReviewProbationCheck` reads the probation registry with, mirroring `CODEX_MODEL`'s import
-// immediately above exactly. A leaf import with no jury/markdown-it edge — see that module's own header.
-import { ANTIGRAVITY_MODEL } from '../lib/antigravity-judge-spawn.mjs';
 // #3383 mechanical-dispatcher round-cap fix — `renderAdvisoryNote`'s comment opens with this SAME literal
 // `we:scripts/conveyor/reconcile-core.mjs`'s round-cap check counts back off the PR's own comment thread
 // (`countAdvisoryComments`, `we:scripts/conveyor/advisory-round-count.mjs`). Build and count share ONE marker
@@ -754,7 +751,7 @@ export function buildReviewReferralVerifierJudgeRequest({ read, candidates }) {
  * env var from both Codex seats' own — the three optional seats are independently opt-in, so flipping one on
  * must never silently seat another.
  */
-export const ANTIGRAVITY_REVIEW_ENV_VAR = 'REVIEW_PR_ANTIGRAVITY_REVIEW';
+export { ANTIGRAVITY_REVIEW_ENV_VAR } from './review-antigravity-policy.mjs';
 
 /**
  * #3383 — READS {@link ANTIGRAVITY_REVIEW_ENV_VAR}. Mirrors `correctnessAdvisoryFromEnv` exactly, INCLUDING the
@@ -769,10 +766,7 @@ export const ANTIGRAVITY_REVIEW_ENV_VAR = 'REVIEW_PR_ANTIGRAVITY_REVIEW';
  * @param {{isOnProbation?: Function}} [deps] - injectable, mirroring `correctnessAdvisoryFromEnv`'s own seam.
  * @returns {boolean}
  */
-export function antigravityReviewFromEnv(env = process.env, { isOnProbation = defaultAntigravityReviewProbationCheck } = {}) {
-  if (env && Object.hasOwn(env, ANTIGRAVITY_REVIEW_ENV_VAR)) return env[ANTIGRAVITY_REVIEW_ENV_VAR] === '1';
-  return isOnProbation();
-}
+export { antigravityReviewFromEnv } from './review-antigravity-policy.mjs';
 
 /**
  * #xqa9ttq (PR #2117 review) - THE ROSTER A SAVED RUN WAS STARTED WITH, read off the RUN, not the ambient environment.
@@ -857,10 +851,7 @@ export function reviewSeatOptionsForRun(record, settings, live = {}) {
  * stubbing the whole default parameter chain.
  * @returns {boolean}
  */
-export function defaultAntigravityReviewProbationCheck() {
-  const status = liveProbationStatusFor({ provider: 'antigravity', model: ANTIGRAVITY_MODEL, role: 'advisory-review' });
-  return status === 'probation' || status === 'trusted';
-}
+export { defaultAntigravityReviewProbationCheck } from './review-antigravity-policy.mjs';
 
 /**
  * #3383 — THIS SEAT'S EFFORT, independent of {@link JUDGE_EFFORT} and {@link CORRECTNESS_ADVISORY_EFFORT}. NO
@@ -1544,6 +1535,21 @@ export function overridesJuror({ verdict, answer } = {}) {
   return false;
 }
 
+/** Concrete PR read guidance belongs to the operation, not the generic jury policy. */
+function sharedContextStanza(read) {
+  const headSha = read.netBasis?.rev;
+  if (!/^[\w.-]+\/[\w.-]+$/.test(read.repo ?? '') || !Number.isSafeInteger(read.pr)
+    || read.pr <= 0 || !/^[a-f0-9]{40,64}$/i.test(headSha ?? '')) return '';
+  const script = decodeURIComponent(new URL('../pr-context.mjs', import.meta.url).pathname);
+  const command = `node '${script.replaceAll("'", "'\\''")}' ${read.pr} --repo=${read.repo} --head=${headSha}`;
+  return [
+    '', 'For additional PR context, use the shared per-head read command below; do not re-fetch contextual body, files or comments with gh.',
+    'Cached context cannot authorize a mutation; live authority checks remain required.',
+    FENCED_DATA_RULE,
+    fenceUntrusted('pr-context-command', command),
+  ].join(' ');
+}
+
 /**
  * ONE JUROR CALL RECIPE, TWO LENSES (#3319). Both `judge` steps call THIS — a second copy of the request
  * literal is how the two seats would drift into different jurors, and the whole claim of the second seat is
@@ -1573,9 +1579,9 @@ export function buildReviewJudgeRequest({ read, lens, aim = '', seatProvider = n
     // opened the PR, so it goes to the juror inside the #2438 labelled data fence rather than in
     // instruction position. What that fixes is caller-supplied text reaching the mandate unfenced; whether
     // a crafted title could actually move a verdict is UNMEASURED, so this is hygiene, not a patched hole.
-    mandate: buildPanelMandate({
+    mandate: `${buildPanelMandate({
       lens, netChangedFiles: read.netChangedFiles, goal: read.title, fenced: true, aim,
-    }),
+    })}${sharedContextStanza(read)}`,
     input: renderJudgeInput(read),
     shape: REVIEW_JUDGE_SHAPE,
     lens,
@@ -1657,7 +1663,7 @@ export function buildReviewAdvisoryJudgeRequest({ read, aim = '' }) {
     // (shared by every other, genuinely tool-free-or-tool-bearing, panel seat).
     mandate: `${buildPanelMandate({
       lens: ADVISORY_JUDGE_LENS, netChangedFiles: read.netChangedFiles, goal: read.title, fenced: true, aim,
-    })} ${CODEX_ADVISORY_SANDBOX_CORRECTION}`,
+    })}${sharedContextStanza(read)} ${CODEX_ADVISORY_SANDBOX_CORRECTION}`,
     input: renderJudgeInput(read),
     shape: REVIEW_JUDGE_SHAPE,
     lens: ADVISORY_JUDGE_LENS,
@@ -2628,7 +2634,7 @@ export function reviewPrOperation({
         // THE ROSTER, RECORDED BY THE BUILD ITSELF (not an input a caller could name): a resume reads it back with
         // `securitySeatFromRun`, so a seat that failed or has not answered yet cannot change it. `seatSteps` and the
         // minimum are read back the same way by `reviewSeatOptionsForRun`, at every cursor position.
-        return { ...finding, cardOnlyLight, securitySeat: securitySeat !== false, seatSteps: seats.map((seat) => seat.step), minNonClaudeSeats };
+        return { ...finding, referralVerifierDeclared: verifierDeclared, cardOnlyLight, securitySeat: securitySeat !== false, seatSteps: seats.map((seat) => seat.step), minNonClaudeSeats };
       },
     }),
 
@@ -3477,6 +3483,9 @@ export function reviewPrOperation({
     );
   }
 
+  const completionSteps = reviewPrStepNames(roster, verifierDeclared);
+  if (declaration.steps.map(s => s.name).join(',') !== completionSteps.join(','))
+    throw new Error('review-pr: completion step shape differs from declaration');
   return Object.freeze({ ...declaration, cardOnlyLight });
 }
 

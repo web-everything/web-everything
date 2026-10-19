@@ -72,6 +72,12 @@ import { checksArgv, parseJsonLines } from './pr-status-io.mjs';
 import { reduceCheckState } from './pr-status.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { applyReviewStatus } from '../conveyor/review-status-tag.mjs';
+import { spawnCiHealRearm } from '../conveyor/ci-heal-mark.mjs';
+import { staleAcceptanceOwed } from '../conveyor/rearm-review.mjs';
+import { createGhProvider } from '../lib/review-label-provider.mjs';
+import { execFileSync } from 'node:child_process';
+import { readNetDiffAtHead } from '../merge-ai-prs.mjs';
+import { defaultCloneDirFor } from '../conveyor/accept-carry-sweep.mjs';
 import { CLOSE_SUPERSEDED_MARKER } from '../conveyor/stand-down-answer-core.mjs';
 import { isGithubStacked, stackReviewWhileBaseOpen } from '../lib/stack-review-while-open.mjs';
 
@@ -149,6 +155,34 @@ export function defaultReadPrLabels({ repoSlug, prNumber, runGh = runGhSync } = 
   });
   const envelope = JSON.parse(raw);
   return validatePrLabels(envelope?.labels);
+}
+
+/** Re-read before handing a stale accept to the existing label boundary. That
+ * boundary also refuses when a changes verdict has replaced the acceptance. */
+export function defaultRearmStaleAcceptance({ repoSlug, prNumber, headSha,
+  readPr = (repo, number) => createGhProvider().readPrState(repo, number), rearm = spawnCiHealRearm,
+  readNetDiff = () => {
+    const cwd = repoKeyForSlug(repoSlug) === 'we' ? THIS_CODE_ROOT : defaultCloneDirFor(repoSlug);
+    if (cwd === null) return { scored: false };
+    return readNetDiffAtHead({ exec: (c, a, o) => execFileSync(c, a, { ...o, cwd }), headSha, headRef: headSha });
+  },
+} = {}) {
+  try {
+    let fresh = readPr(repoSlug, prNumber);
+    if (fresh.state !== 'OPEN' || fresh.headRefOid !== headSha || !staleAcceptanceOwed(fresh, { requireProof: false })) {
+      return { ok: false, reason: 'head, review verdict or withdrawal changed since the plan' };
+    }
+    if (!staleAcceptanceOwed(fresh)) {
+      const net = readNetDiff();
+      if (!net?.scored || net.rev !== headSha || typeof net.text !== 'string') return { ok: false, reason: 'live acceptance coverage unreadable' };
+      fresh = readPr(repoSlug, prNumber);
+      if (fresh.state !== 'OPEN' || fresh.headRefOid !== headSha
+          || !staleAcceptanceOwed({ ...fresh, headDiff: net.text, headContribution: net.text })) {
+        return { ok: false, reason: 'acceptance still covers the head, or review state changed' };
+      }
+    }
+    return rearm({ repo: repoSlug, pr: prNumber, onlyIfAccepted: true, actor: 'conveyor stale-accept recovery' });
+  } catch (e) { return { ok: false, reason: String(e?.message ?? e).split('\n')[0] }; }
 }
 
 /** #3902 — strip `ready-to-merge` when the STUCK restore variant applies a review hold. */
@@ -284,6 +318,7 @@ export function runReconcilePromoteDraftDispatch({
   // `restore-review-label` (PR #3830 incident): the one write for an open, green, label-less lane PR.
   // Idempotent (`gh pr edit --add-label`); re-reads labels first so a label another actor just set wins.
   addLabel = defaultAddLabel,
+  rearmReview = defaultRearmStaleAcceptance,
   // #3850 — the close-superseded disposition's two IO seams (a test injects both).
   closePr = defaultClosePr,
   readCardsOnMain = defaultReadCardsOnMain,
@@ -393,6 +428,14 @@ export function runReconcilePromoteDraftDispatch({
   }
   // ── restore-review-label half: green, open, label-less lane PRs get `review:pending` (see reconcile-core).
   for (const entry of (reconciled.dispatch ?? []).filter((e) => e.kind === 'restore-review-label')) {
+    if (entry.variant === 'stale-accept') {
+      let result;
+      try { result = rearmReview({ repoSlug, prNumber: entry.prNumber, headSha: entry.headRefOid }); }
+      catch (e) { result = { ok: false, reason: String(e?.message ?? e).split('\n')[0] }; }
+      if (result?.ok) dispatched.push({ pr: entry.prNumber, kind: 'restore-review-label', label: 'review:pending' });
+      else refusals.push({ pr: entry.prNumber, kind: 'stale-accept-rearm-refused', why: result?.reason ?? 're-arm not confirmed' });
+      continue;
+    }
     let labels;
     try {
       labels = validatePrLabels(readPrLabels({ repoSlug, prNumber: entry.prNumber }))
