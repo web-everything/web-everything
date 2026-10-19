@@ -333,6 +333,7 @@ const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
 const SHA_RE = /^[0-9a-f]{7,40}$/;
 const DIGEST_RE = /^[0-9a-f]{64}$/;
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+const EVENT_ID_RE = /^[A-Za-z0-9:._-]{8,128}$/;
 
 /** Normalize a witness to a lowercase digest string, or `null`. A malformed witness becomes `null` rather
  *  than failing the record: losing a witness costs a fail-closed coverage test later, losing the whole row
@@ -374,7 +375,7 @@ export function buildVerdictRecord({
   repo, pr, verdict, at, reason = '',
   headSha = null, reviewedDiff = null, reviewedContribution = null,
   declaredActor = '', session = '', channel = '', independence = null,
-  source, writer = '', findingCount = null, mode, wouldClear, fromHead = null, carryRule = null, state,
+  source, writer = '', findingCount = null, mode, wouldClear, fromHead = null, carryRule = null, state, basis = null,
 } = {}) {
   if (typeof repo !== 'string' || !REPO_RE.test(repo)) {
     throw new TypeError(`verdict-ledger: \`repo\` must be <owner/name>, got ${JSON.stringify(repo)}`);
@@ -423,6 +424,10 @@ export function buildVerdictRecord({
   if (fromHead) record.fromHead = shaOrNull(fromHead);
   if (carryRule) record.carryRule = oneLine(carryRule, 100);
   if (state) record.state = oneLine(state, 100);
+  if (basis != null) {
+    if (typeof basis !== 'string' || !EVENT_ID_RE.test(basis)) throw new TypeError(`verdict-ledger: \`basis\` must be an event id, got ${JSON.stringify(basis)}`);
+    record.basis = basis;
+  }
   if (Number.isInteger(findingCount) && findingCount >= 0) record.findingCount = findingCount;
   if (mode !== undefined || wouldClear !== undefined) {
     if (mode !== 'shadow' || verdict !== VERDICTS.OBSERVED || typeof wouldClear !== 'boolean') {
@@ -492,6 +497,7 @@ export function validateVerdictRecord(raw) {
   if (raw.fromHead) record.fromHead = shaOrNull(raw.fromHead);
   if (raw.carryRule) record.carryRule = raw.carryRule;
   if (raw.state) record.state = oneLine(raw.state, 100);
+  if (typeof raw.basis === 'string' && EVENT_ID_RE.test(raw.basis)) record.basis = raw.basis;
   if (Number.isInteger(raw.findingCount) && raw.findingCount >= 0) record.findingCount = raw.findingCount;
   if (raw.unlocked === true) record.unlocked = true;
   if (shadow) Object.assign(record, { mode: 'shadow', wouldClear: raw.wouldClear, applied: false, mutated: false });
@@ -830,6 +836,10 @@ export function ledgerObservationApplies(row, existing) {
   if (['head-moved', 'carried'].includes(row.verdict)) {
     const head = observedLedgerHead(mine);
     if (!sameHead(head, row.fromHead) || sameHead(head, row.coverage?.headSha)) return false;
+    // Compare-and-swap on the planning snapshot: a head-bearing row after its last event means the witness moved in
+    // between, even back to `fromHead` (A→B→A). A legacy row or a basis this store never saw keeps the head check alone.
+    const at = row.basis ? mine.findIndex(e => { try { return ledgerEventId(e) === row.basis; } catch { return false; } }) : -1;
+    if (at >= 0 && mine.slice(at + 1).some(e => isSha(e.coverage?.headSha) || isSha(e.headSha) || isSha(e.fromHead))) return false;
     if (row.verdict === 'carried') return ledgerCarryAllowed(mine, row.fromHead, row.coverage?.headSha);
     return true;
   }

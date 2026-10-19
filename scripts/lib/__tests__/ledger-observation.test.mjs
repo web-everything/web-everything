@@ -393,6 +393,27 @@ describe('open-head ledger observations', () => {
       expect(foldVerdictLedger(events).get(1)).toMatchObject({ clears: true, current: { coverage: { headSha: next } } });
       expect(derivePrState(events, facts)).toMatchObject({ verdict: 'accepted', clears: true });
     }));
+    it('discards a stale move when the witness round-trips back to its from-head (A→B→A) between snapshot and append', () => withHome(append => {
+      expect(append(accepted())).toMatchObject({ ok: true });
+      const move = (from, to) => buildVerdictRecord({ repo, pr: 1, headSha: to, fromHead: from, verdict: 'head-moved', source: 'head-observer', at: now });
+      const acceptedAgain = buildVerdictRecord({ repo, pr: 1, headSha: head, verdict: 'accepted', source: 'test', at: '2026-10-17T12:05:00.000Z' });
+      // Snapshot witnesses A; the live read sees B; before this observer appends, B is observed, force-pushed back to A and re-accepted.
+      const readPr = () => { append(move(head, next)); return { state: 'OPEN', headRefOid: next, labels: [] }; };
+      const racing = row => { append(move(next, head)); append(acceptedAgain); return append(row); };
+      observeLedgerPrEvent({ repo }, 1, { readPr, read: readObservationLedger, observe: (f, o) => observe(f, { ...o, append: racing }) });
+      const events = readObservationLedger(repo);
+      expect(events.map(r => r.verdict)).toEqual(['accepted', 'head-moved', 'head-moved', 'accepted']);
+      expect(foldVerdictLedger(events).get(1)).toMatchObject({ clears: true, current: acceptedAgain });
+      expect(derivePrState(events, facts)).toMatchObject({ verdict: 'accepted', clears: true });
+    }));
+    it('a headless hold appended after the snapshot does not refuse a real move', () => withHome(append => {
+      expect(append(accepted())).toMatchObject({ ok: true });
+      const hold = buildVerdictRecord({ repo, pr: 1, verdict: 'changes', source: 'merge-ai-prs', at: now });
+      const racing = row => { append(hold); return append(row); };
+      observeLedgerPrEvent({ repo }, 1, { readPr: () => ({ state: 'OPEN', headRefOid: next, labels: [] }), read: readObservationLedger,
+        observe: (f, o) => observe(f, { ...o, append: racing }) });
+      expect(readObservationLedger(repo).map(r => r.verdict)).toEqual(['accepted', 'changes', 'head-moved']);
+    }));
     it('still records a real move seen after the snapshot, and a deliberate return to an old head', () => withHome(append => {
       expect(append(accepted())).toMatchObject({ ok: true });
       const live = sha => ({ readPr: () => ({ state: 'OPEN', headRefOid: sha, labels: [] }), read: readObservationLedger, observe });
