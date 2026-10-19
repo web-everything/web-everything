@@ -1505,6 +1505,8 @@ Resolve both extractor filenames to physical paths before invoking Node: CLI ent
 compare argv with Node's canonical module URL, so a symlinked lane or script can otherwise exit
 successfully without output. The `nightly-coroner-symlinked-lane` soak break exercises both CLIs
 through real subprocesses, including report publication, lane release, and receipt recovery.
+Extraction fixtures must inject `sweep` alongside `acquire` and `release` so orphan-lease cleanup
+cannot invoke the real lane pool or be counted as an extractor subprocess.
 The first window is 24 hours; subsequent windows begin at `nightly-coroner-cursor.json`'s `lastEnd`
 beside health `state.json`. Cursor writes are atomic and follow atomic publication of the dated
 `coroner-YYYY-MM-DD.md` in `handoffHome()`. The report carries a recovery receipt, so direct re-entry
