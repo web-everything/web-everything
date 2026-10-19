@@ -9,6 +9,7 @@ import { defaultAttemptCardConflictRebase } from '../../conveyor/parked-pr-confl
 import { MISSING_RUN_CREDENTIAL_REFUSAL } from '../../conveyor/main-red-recovery.mjs';
 import { rebaseDropManifest } from '../rebase-drop-manifest.mjs';
 
+const legacyCardRebaseSettings = { value: { squashToSingleCommit: false }, sources: { squashToSingleCommit: 'tool' } };
 const path = 'backlog/5360-parent.md';
 const entry = n => `- Also raised by o/r#${n} (finding 1: \`we:backlog/xabc123-child.md:12\` — guard)`;
 const card = entries => `---\nstatus: open\n---\n# Parent\n\nBody\n\n## Also raised by\n\n${entries.join('\n')}\n\n## Next\n\nUnchanged\n`;
@@ -84,7 +85,7 @@ function fixture({ code = false, outside = false } = {}) {
 describe('trusted no-checkout rebase path with real local Git', () => {
   it('resolves and publishes a fast-forward merge with current JIT refs and unchanged checkout', () => {
     const f = fixture();
-    const result = rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run: f.run, fetch: false });
+    const result = rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run: f.run, fetch: false, cardRebaseSettings: legacyCardRebaseSettings });
     expect(result).toMatchObject({ action: 'rebased', resolvedRaisedBy: [path] });
     expect(f.git('show', `${result.newCommit}:${path}`) + '\n').toBe(card([entry(0), entry(1), entry(2)].map(e => e.replace('xabc123', '6000'))));
     expect(f.git('merge-base', '--is-ancestor', f.head, result.newCommit)).toBe('');
@@ -94,7 +95,7 @@ describe('trusted no-checkout rebase path with real local Git', () => {
   });
   it('refuses a mixed code PR even when its only conflict is a list', () => {
     const f = fixture({ code: true });
-    expect(rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run: f.run, fetch: false }).action).toBe('skip');
+    expect(rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run: f.run, fetch: false, cardRebaseSettings: legacyCardRebaseSettings }).action).toBe('skip');
     expect(f.git('ls-remote', 'origin', 'refs/heads/lane/cards')).toContain(f.head);
   });
   it('disabled policy leaves the conflicting remote head untouched', () => {
@@ -119,7 +120,7 @@ describe('trusted no-checkout rebase path with real local Git', () => {
       }
       return result;
     };
-    const result = rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run, fetch: false });
+    const result = rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run, fetch: false, cardRebaseSettings: legacyCardRebaseSettings });
     expect(result.action).toBe('rebased');
     expect(f.git('show', `${result.newCommit}:main-only.mjs`)).toBe('export const preserved = true;');
   });
@@ -135,7 +136,7 @@ it('the card owner enforces credential refusal and a pinned Also-raised-by push'
     if (args.includes('push')) pushes.push({ args, opts });
     return f.run(cmd, args, opts);
   };
-  const attempt = env => defaultAttemptCardConflictRebase({ pr, repo: 'web-everything/web-everything', cwd: f.cwd, run, env, readCache: () => null });
+  const attempt = env => defaultAttemptCardConflictRebase({ pr, repo: 'web-everything/web-everything', cwd: f.cwd, run, env, readCache: () => null, cardRebaseSettings: legacyCardRebaseSettings });
   const refused = attempt({ GH_TOKEN: 'ghs_untrusted' });
   expect(refused).toMatchObject({ ok: false, action: 'error', error: MISSING_RUN_CREDENTIAL_REFUSAL });
   expect(pushes).toEqual([]);

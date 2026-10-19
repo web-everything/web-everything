@@ -430,7 +430,7 @@ function recoveryPushContext(repo, {
 }
 
 /** Same trusted fast-forward plumbing, with a fresh main and a private index for the card path. */
-export function defaultAttemptCardConflictRebase({ pr, repo, cwd = REPO_ROOT, run = gitRun, cardConflictSettings,
+export function defaultAttemptCardConflictRebase({ pr, repo, cwd = REPO_ROOT, run = gitRun, cardConflictSettings, cardRebaseSettings,
   env = process.env, readCache, now = Date.now(),
 } = {}) {
   // Establish clone ownership before eligibility checks or any fetch/ref work.
@@ -467,7 +467,7 @@ export function defaultAttemptCardConflictRebase({ pr, repo, cwd = REPO_ROOT, ru
   };
   const tmpIndex = join(cwd, '.git', `card-conflict-index-${process.pid}-${randomUUID()}`);
   try {
-    return rebaseDropManifest({ laneRef: pr.headRefName, readRef: pr.headRefOid, base: 'origin/main', cwd, run: recoveryRun, fetch: false, tmpIndex, cardConflictSettings });
+    return rebaseDropManifest({ laneRef: pr.headRefName, readRef: pr.headRefOid, base: 'origin/main', cwd, run: recoveryRun, fetch: false, tmpIndex, cardConflictSettings, cardRebaseSettings });
   } finally {
     try { unlinkSync(tmpIndex); } catch { /* private index may not have been created */ }
   }
