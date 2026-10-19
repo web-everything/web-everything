@@ -59,6 +59,7 @@ export const OBSERVATION_ONLY = Object.freeze({
   "ledger-readiness-regressed": "Report the readiness regression and inspect replay evidence; never promote the ledger, change review authority or relax readiness thresholds from the responder.",
   "live-process-stale-transcript": "Silence does not prove death; owning job watchdog/reaper alone handles the worker.",
   "machine-overload": "Inhibit new responder jobs; no process kill, cap increase or automatic global pause overwrite.",
+  "nightly-coroner-failed": "The nightly-coroner supervisor owns bounded retries and failure alerts; inspect the job record, never rerun the job or release a lane from the responder.",
   "open-prs-over-limit": "Preserve existing backpressure; never raise/disable the PR limit.",
   "pass-failing-repeatedly": "A failing pass is fixed in the pass itself via normal delivery; never rerun the pass, raise its heap or restart the daemon from the responder.",
   "pr-events-stale":"Existing polling fallback owns availability; no webhook/token/deployment edits.",

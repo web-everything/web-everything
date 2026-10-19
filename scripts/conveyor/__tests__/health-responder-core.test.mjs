@@ -56,6 +56,16 @@ describe('health responder closed decision table', () => {
     i.config.smells = { [e.smell]: true };
     expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false });
   });
+  it('keeps nightly coroner failure alerts observation-only even with a permitted action plan', () => {
+    const i = input();
+    const e = i.episodes[0], facts = i.subjectFacts[e.key];
+    e.smell = 'nightly-coroner-failed'; e.key = `${e.smell}::${e.subject}`;
+    e.recommendation = 'Grant rounds and re-arm review';
+    facts.episodeKey = e.key;
+    i.subjectFacts = { [e.key]: facts };
+    i.config.smells = { [e.smell]: true };
+    expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false });
+  });
   it('keeps disk-space alerts observation-only with or without subject facts', () => {
     const i = input();
     const e = i.episodes[0], facts = i.subjectFacts[e.key];

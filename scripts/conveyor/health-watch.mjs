@@ -46,6 +46,7 @@ import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { superviseNeedsYouFeed } from './needs-you-feed-job.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { sealDueBatches } from '../operations/card-batch-seal-io.mjs';
+import { reconcileCardBatches, resolveReconcileIntervalMin } from '../operations/card-batch-reconcile.mjs';
 import { readFixLoopRows } from './fix-loop-ledger.mjs';
 import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 import { archiveClaudeJobs, formatClaudeJobsArchiveLine } from './claude-jobs-archive.mjs';
@@ -110,7 +111,7 @@ import { readSeatCapUsage } from '../operations/review-extra-seats.mjs';
 import { runSessionWatchdogPass, resolveSessionWatchdogConfig } from './session-watchdog.mjs';
 import { runGhProbeJobs, resolveHealthJobSwitches, GH_GROUP_PROBE_NAMES } from './health-watch-job.mjs';
 import { runPrSweepJob, resolvePrSweepSettings, prSweepTickAllowed } from './pr-sweep-job.mjs';
-import { runNightlyCoronerJob, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed } from './nightly-coroner-job.mjs';
+import { runNightlyCoronerJob, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed, publishCoronerFailure, coronerNightDue } from './nightly-coroner-job.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const BOOTSTRAP_TAIL_BYTES = 512 * 1024;
@@ -1110,6 +1111,15 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
 
   if (sweepAllowed && config.tmpSweepEnabled) attempt('reviewTmp', () => sweepReviewTmp({ tmpRoot: flags['tmp-sweep-root'] || tmpdir(), config, now, dryRun: !!flags['dry-run'] }));
 
+  const cardBatchReconcile = !flags['state-root'] && !flags['dry-run']
+    && cadenceDue(prev.cardBatchReconcile?.completedAt, now, resolveReconcileIntervalMin() * 60_000)
+    ? await attempt('cardBatchReconcile', async () => {
+      const results = await reconcileCardBatches({ now });
+      const failures = results.filter(result => result.action === 'error');
+      if (failures.length) throw new Error(failures.map(result => result.reason).join('; '));
+      return { completedAt: now };
+    }) : null;
+
   if (!flags['state-root'] && !flags['dry-run']) await attempt('cardBatchSeal', () => sealDueBatches({ now }));
 
   const archiveAllowed = flags['claude-jobs-root'] || (!flags['state-root'] && !flags['dry-run']);
@@ -1130,12 +1140,21 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
 
   const coronerSettings = resolveNightlyCoronerSettings({ config });
   if (nightlyCoronerTickAllowed(flags, coronerSettings.value)) {
-    await attempt('nightlyCoronerJob', async () => {
+    const coroner = await attempt('nightlyCoronerJob', async () => {
       const out = await (deps.runNightlyCoronerJob ?? runNightlyCoronerJob)({ now, config: coronerSettings.value, settings: coronerSettings, dir });
       const errors = [...coronerSettings.errors, ...(out.failures ?? [])];
       if (errors.length) probeErrors.nightlyCoronerJob = scrubText(errors.join('; '));
       return out;
     });
+    probes.nightlyCoronerStatus = { alerts: coroner?.alerts ?? [], threshold: coronerSettings.value.alertAfterProbeFailures };
+    const count = probeErrors.nightlyCoronerJob ? (prev.probeErrors?.nightlyCoronerJob?.count ?? 0) + 1 : 0;
+    if (count >= coronerSettings.value.alertAfterProbeFailures) {
+      await attempt('nightlyCoronerAlert', () => (deps.publishCoronerFailure ?? publishCoronerFailure)({
+        id: `nightly-coroner-probe-${coronerNightDue(now)}`, error: probeErrors.nightlyCoronerJob,
+        attempts: coroner?.alerts?.[0]?.attempts ?? 'unknown', maxAttempts: coronerSettings.value.attempts,
+        reason: `nightlyCoronerJob probe failed ${count} consecutive times`,
+      }));
+    }
   }
 
   const logs = attempt('daemonLogs', () => probeDaemonLogs(logsDir, prev.cursors || {}));
@@ -1366,6 +1385,8 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
       }, { now }));
     }
   }
+  if (cardBatchReconcile) state.cardBatchReconcile = cardBatchReconcile;
+  else if (prev.cardBatchReconcile) state.cardBatchReconcile = prev.cardBatchReconcile;
   if (tmpSweep) state.tmpSweep = { at: now, ...(tmpSweep.complete ? { completedAt: now } : {}), ...tmpSweep };
   else if (prev.tmpSweep) state.tmpSweep = prev.tmpSweep;
   state.notifiedSilences = (result.state.silences || []).filter((x) => x.expiredNotified).map(silenceSig);

@@ -26,9 +26,11 @@
  * @see we:scripts/operations/land-prevention-card.mjs for the detached job itself.
  */
 import { join } from 'node:path';
+import { owePreventionFiling, owedPreventionRecord, preventionFilingKey } from './prevention-filing-owed.mjs';
 import { defaultSpawnDetached, REPO_ROOT } from '../operations/detached-dispatch.mjs';
 import { buildGhShimSettingsEnv } from './gh-app-shim.mjs';
 import { automationStateRoot } from './automation-home.mjs';
+import { loadPreventionBatchSettings, formatPreventionBatchSettings } from './card-batch-settings.mjs';
 
 /** The detached job every caller spawns — resolved by SCRIPT LOCATION, never `cwd` (which for every caller of
  *  this file is whatever checkout is running right now — a daemon clone, routinely). */
@@ -79,7 +81,22 @@ export function spawnPreventionLandingJob(input, {
   root = REPO_ROOT,
   resolveSettingsEnv = () => buildGhShimSettingsEnv(),
   sessionPrefix = 'prevention-card',
+  loadFilingSettings = loadPreventionBatchSettings,
+  write = line => process.stderr.write(line),
 } = {}) {
+  const filing = loadFilingSettings();
+  write(`${formatPreventionBatchSettings(filing)}\n`);
+  if (filing.filingEnabled === false) {
+    const reason = 'prevention filing paused by prevention.filingEnabled';
+    try { owePreventionFiling(input); }
+    catch (e) { return { ok: false, step: 'paused', error: `could not record owed filing: ${e.message}`, reason, num: null, rel: null }; }
+    write(`${reason}\n`);
+    return { ok: false, skipped: true, step: 'paused', reason, num: null, rel: null, error: reason };
+  }
+  let owed;
+  try { owed = owedPreventionRecord(input); }
+  catch (e) { return { ok: false, error: e.message, num: null, rel: null }; }
+  if (owed?.status === 'done') return owed.result;
   // Resolver failure → `null` (the spawn still goes out, as it did before), never a thrown filing.
   let settingsEnv = null;
   try { settingsEnv = resolveSettingsEnv() || null; } catch { settingsEnv = null; }
@@ -94,6 +111,7 @@ export function spawnPreventionLandingJob(input, {
     ...(input.parent ? [`--parent=${input.parent}`] : []),
     `--queue=${input.queue}`,
     `--session=${sessionSlug}`,
+    `--owed-key=${preventionFilingKey(input)}`,
     ...(input.retractTo?.repo && input.retractTo?.pr && input.retractTo?.headSha
       ? [`--retract-repo=${input.retractTo.repo}`, `--retract-pr=${input.retractTo.pr}`, `--retract-head=${input.retractTo.headSha}`]
       : []),

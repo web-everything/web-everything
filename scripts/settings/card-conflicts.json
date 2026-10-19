@@ -1,0 +1,4 @@
+{
+  "$comment": "cardConflicts.autoResolveRaisedBy (boolean, standard true): card-only PRs with conflicts entirely inside an Also raised by list use a stable main-first union and fresh review. Cascade: standard → platform cardConflicts → declared repo settings → WE_CARD_CONFLICTS_AUTO_RESOLVE_RAISED_BY (true/false/1/0). Every other conflict keeps its existing owner and guards.",
+  "cardConflicts": { "autoResolveRaisedBy": true }
+}

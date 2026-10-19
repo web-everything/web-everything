@@ -13,13 +13,16 @@ import { TERMINAL_JOB_STATUSES } from '../operations/job-record.mjs';
 import { readGit } from '../lib/proc-read.mjs';
 import { cascadePolicy, formatCascadeSourcesLine, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { handoffHome } from '../operations/handoff-home.mjs';
-import { feedPath, appendLines } from '../operations/needs-you-feed.mjs';
+import { feedPath, appendLines, sanitizeForFeed } from '../operations/needs-you-feed.mjs';
+import { scrubText } from './health-watch-core.mjs';
 import { prSweepTickAllowed } from './pr-sweep-job.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(SELF), '../..');
 const clocks = new Map();
 const exec = promisify(execFile);
+export const NIGHTLY_DEFAULTS = Object.freeze({ enabled: true, at: '22:17', laneWaitMs: 600000, attempts: 1, retryBackoffMin: 10, deadlineEt: '03:30', alertAfterProbeFailures: 3 });
+const positiveInt = (v) => Number.isSafeInteger(v) && v > 0;
 const validTime = (v) => typeof v === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(v);
 export function resolveNightlyCoronerSettings({ config = {}, env = process.env, read = readFileSync, log = console.error } = {}) {
   let tool = {}; const errors = [];
@@ -31,8 +34,8 @@ export function resolveNightlyCoronerSettings({ config = {}, env = process.env, 
   const enabled = env.WE_CORONER_NIGHTLY_ENABLED;
   if (enabled !== undefined) envValues.enabled = ['1', 'true'].includes(enabled) ? true : ['0', 'false'].includes(enabled) ? false : enabled;
   const out = cascadePolicy('coroner.nightly', { ...tool, ...config.coroner?.nightly }, {
-    standard: { enabled: true, at: '22:17' }, platform: platform.prefs.coroner?.nightly ?? {}, envValues,
-    valid: { enabled: (v) => typeof v === 'boolean', at: validTime }, env,
+    standard: NIGHTLY_DEFAULTS, platform: platform.prefs.coroner?.nightly ?? {}, envValues,
+    valid: { enabled: (v) => typeof v === 'boolean', at: validTime, laneWaitMs: positiveInt, attempts: v => positiveInt(v) && v <= NIGHTLY_DEFAULTS.attempts, retryBackoffMin: positiveInt, deadlineEt: validTime, alertAfterProbeFailures: positiveInt }, env,
   });
   log(formatCascadeSourcesLine('coroner.nightly', out));
   return { ...out, errors: [...errors, ...platform.errors, ...out.invalid] };
@@ -54,32 +57,91 @@ export function coronerNightDue(now, { at = '22:17', enabled = true } = {}, last
   return lastNight && lastNight >= night ? null : night;
 }
 
+/** Next calendar morning in ET, resolved using the offset at the target wall time (DST safe). */
+export function coronerDeadline(night, deadlineEt = NIGHTLY_DEFAULTS.deadlineEt) {
+  if (!validTime(deadlineEt)) throw new Error('invalid coroner.nightly.deadlineEt');
+  const next = new Date(Date.parse(`${night}T12:00:00Z`) + 86400000);
+  const target = Date.UTC(next.getUTCFullYear(), next.getUTCMonth(), next.getUTCDate(), ...deadlineEt.split(':').map(Number));
+  const formatter = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York',
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  });
+  const wallAt = (instant) => {
+    const parts = Object.fromEntries(formatter.formatToParts(instant).map(({ type, value }) => [type, value]));
+    return Date.UTC(+parts.year, +parts.month - 1, +parts.day, +parts.hour, +parts.minute);
+  };
+  let instant = target;
+  for (let i = 0; i < 4; i++) {
+    const wall = wallAt(instant);
+    if (wall === target) return instant;
+    instant += target - wall;
+  }
+  // A nonexistent spring-forward wall time expires at the first valid time after the gap.
+  // Offset iteration straddles the one-hour New York gap; find its transition boundary in minutes.
+  let low = instant, high = instant + 3600000;
+  while (high - low > 60000) {
+    const mid = low + Math.floor((high - low) / 120000) * 60000;
+    if (wallAt(mid) >= target) high = mid;
+    else low = mid;
+  }
+  return high;
+}
+
+export function publishCoronerFailure({ id, error, attempts, maxAttempts, reason }, statusFeed = feedPath()) {
+  const text = (value, max) => sanitizeForFeed(scrubText(value), max);
+  id = text(id, 128);
+  const marker = `NEEDS-YOU nightly-coroner ${id} failed`;
+  let feed = '';
+  try { feed = readFileSync(statusFeed, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  if (!feed.split('\n').some((line) => line.startsWith(`${marker} `))) {
+    appendLines(statusFeed, [`${marker} — ${JSON.stringify({ at: new Date().toISOString(), kind: 'coroner-failed', job: id,
+      error: text(error, 512), attempts: typeof attempts === 'number' ? attempts : text(attempts, 40),
+      maxAttempts: typeof maxAttempts === 'number' ? maxAttempts : text(maxAttempts, 40), reason: text(reason, 100) })}`]);
+  }
+}
+
 export async function runNightlyCoronerJob({ now, config, settings, dir, env = process.env, sourceRoot = ROOT,
   store = createJobStore(daemonJobsDir('nightly-coroner', env)), enqueue = enqueueJob, reattach = reattachTick,
-  evict = evictToTrash, codeSha, snapshot, log = console.error, warmGate = {} } = {}) {
+  evict = evictToTrash, codeSha, snapshot, log = console.error, warmGate = {}, statusFeed = feedPath() } = {}) {
+  config = { ...NIGHTLY_DEFAULTS, ...config };
+  if (!positiveInt(config.attempts) || config.attempts > NIGHTLY_DEFAULTS.attempts) config.attempts = NIGHTLY_DEFAULTS.attempts;
   mkdirSync(store.dir, { recursive: true });
   const { records, corrupt = [] } = store.list();
   if (corrupt.length) throw new Error(`nightly-coroner: corrupt job records: ${corrupt.join(', ')}`);
   const mine = records.filter((r) => r.job.kind === HEALTH_NIGHTLY_CORONER_KIND.kind);
+  // Persisted jobs from an earlier configuration must not retain a larger retry allowance.
+  for (const record of mine) {
+    if (record.job.maxAttempts !== NIGHTLY_DEFAULTS.attempts) store.update(record.id, current => ({
+      ...current, job: { ...current.job, maxAttempts: NIGHTLY_DEFAULTS.attempts },
+    }));
+  }
   const night = coronerNightDue(now, config);
   const id = night && `nightly-coroner-${night}`;
   let enqueued = null;
   if (id && !mine.some((r) => r.id === id) && !mine.some((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status))) {
     // Stable ID + store.create's exclusive lock closes the enqueue/state-save restart window.
-    const record = enqueue({ store, id, kindDef: HEALTH_NIGHTLY_CORONER_KIND, now,
+    const record = enqueue({ store, id, kindDef: { ...HEALTH_NIGHTLY_CORONER_KIND, maxAttempts: config.attempts }, now,
       codeSha: codeSha ?? readGit(['-C', sourceRoot, 'rev-parse', 'HEAD']).trim(),
-      input: { night, until: new Date(now).toISOString(), dir, settings, sourceRoot } });
+      input: { night, nightly: config, until: new Date(now).toISOString(), dir, settings, sourceRoot } });
     enqueued = record.id;
   }
   if (!clocks.has(store.dir)) clocks.set(store.dir, createTickClock());
   const gate = createWarmGate({ jobsDir: store.dir, sourceRoot, ...warmGate });
   await reattach({ store, kinds: HEALTH_WATCH_JOB_KINDS, maxConcurrent: 1, clock: clocks.get(store.dir),
+    deadlineAt: (r) => coronerDeadline(r.input.night, r.input.nightly?.deadlineEt ?? config.deadlineEt),
+    backoffBaseMs: config.retryBackoffMin * 60000,
     snapshot: snapshot ?? { repoDir: sourceRoot }, log, launch: gate.launch });
   const current = store.list().records;
   try { evict({ jobsDir: store.dir, referenced: current.filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status)).flatMap((r) => r.job.snapshotKeys ?? []) }); }
   catch (e) { log(`nightly-coroner eviction: ${e.message}`); }
+  // Unresolved earlier nights remain failures until their records actually succeed.
+  const failures = current.filter((r) => r.job.status === 'failed' ||
+    (r.job.kind === HEALTH_NIGHTLY_CORONER_KIND.kind && r.job.status !== 'succeeded' &&
+      now >= coronerDeadline(r.input.night, r.input.nightly?.deadlineEt ?? config.deadlineEt)))
+    .map((r) => ({ id: r.id, error: r.job.error ?? 'not completed', attempts: r.job.attempts, maxAttempts: r.job.maxAttempts,
+      reason: r.job.status === 'failed' ? 'attempts exhausted or launch failed' : 'ET deadline missed' }));
+  for (const failure of failures) publishCoronerFailure(failure, statusFeed);
   // Retain the small daily records as the durable once-per-night ledger, independent of health state.json.
-  return { enqueued, failures: current.filter((r) => r.job.status === 'failed').map((r) => `${r.id}: ${r.job.error ?? 'failed'}`) };
+  return { enqueued, alerts: failures, failures: failures.map((r) => `${r.id}: ${r.error}; ${r.attempts}/${r.maxAttempts} attempts; ${r.reason}`) };
 }
 function readOptionalJson(path) {
   try { return JSON.parse(readFileSync(path, 'utf8')); } catch (e) { if (e.code === 'ENOENT') return null; throw e; }
@@ -92,9 +154,9 @@ const command = async (args, cwd) => (await exec(process.execPath, args, {
   cwd, encoding: 'utf8', timeout: 30 * 60000, maxBuffer: 32 * 1024 * 1024,
 })).stdout;
 
-export async function extractNightlyCoroner({ night, until, dir, settings, sourceRoot = ROOT }, {
+export async function extractNightlyCoroner({ night, until, dir, settings, nightly = NIGHTLY_DEFAULTS, sourceRoot = ROOT }, {
   root = ROOT, home = handoffHome(), statusFeed = feedPath(), run = command,
-  acquire = async () => JSON.parse(await run([join(root, 'scripts/lane-pool.mjs'), 'acquire', '--purpose=nightly-coroner', `--repo=${sourceRoot}`, '--json'], sourceRoot)),
+  acquire = async () => JSON.parse(await run([join(root, 'scripts/lane-pool.mjs'), 'acquire', '--purpose=nightly-coroner', `--wait-ms=${positiveInt(nightly.laneWaitMs) ? nightly.laneWaitMs : NIGHTLY_DEFAULTS.laneWaitMs}`, `--repo=${sourceRoot}`, '--json'], sourceRoot)),
   release = async (lane) => run([join(root, 'scripts/lane-pool.mjs'), 'release', `--lane=${lane.lane}`, `--session=${lane.holder}`, `--repo=${sourceRoot}`], sourceRoot),
 } = {}) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(night)) throw new Error('invalid coroner night');
@@ -119,7 +181,7 @@ export async function extractNightlyCoroner({ night, until, dir, settings, sourc
       const metrics = JSON.parse(await run([realpathSync(join(lane.path, 'scripts/operations/coroner-extract.mjs')), ...args, '--no-save'], lane.path));
       let falseFindings = null;
       const optional = join(lane.path, 'scripts/operations/coroner-false-findings.mjs');
-      if (existsSync(optional)) falseFindings = JSON.parse(await run([realpathSync(optional), ...args], lane.path));
+      if (existsSync(optional)) falseFindings = JSON.parse(await run([realpathSync(optional), '--since', since, '--json'], lane.path));
       window = { since, until };
       const rate = (value) => value ? `${value.count}/${value.total} (${value.pct}%)` : 'unavailable';
       const fence = '```';
