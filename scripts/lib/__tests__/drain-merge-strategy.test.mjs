@@ -1426,3 +1426,48 @@ describe('orphaned accepted panel-seat recovery', () => {
     expect(h.s.enqueue({ num: 5485 }, HEAD, { comments: thread })).toMatchObject({ enqueued: true });
   });
 });
+
+describe('live queue file-overlap admission', () => {
+  const card = 'backlog/123-card.md';
+  const candidate = { num: 42, listedFiles: [card], listedFilesComplete: true };
+  const facts = numbers => ({ data: { repository: { mergeQueue: { entries: {
+    pageInfo: { hasNextPage: false }, nodes: numbers.map(number => ({ pullRequest: { number } })),
+  } } } } });
+  const setup = (over = {}) => harness({ strategy: 'github-merge-queue',
+    queueFacts: facts([43]), ghView: { 43: { files: [{ path: card }] } }, ...over });
+  it('defers shared cards before any enqueue mutation and reports policy source', () => {
+    const h = setup();
+    expect(h.s.enqueue(candidate, HEAD, { comments: stampedBy(DRAIN) })).toEqual({
+      enqueued: false, deferred: true, kind: 'queue-file-overlap', reason: `#43 share ${card}`,
+    });
+    expect(h.calls.some(call => call.some(arg => arg.includes('enqueuePullRequest')))).toBe(false);
+    expect(h.logs.join('')).toContain(`defer #42 (shares ${card} with queued #43) — includeCards=true (standard)`);
+    expect(h.calls.filter(call => call[0] === 'gh' && call.includes('files'))).toEqual([
+      ['gh', 'pr', 'view', '43', '--repo', LOCAL, '--json', 'files'],
+    ]);
+    expect(h.calls.some(call => call[0] === 'git' && ['fetch', 'diff'].includes(call[1]))).toBe(false);
+  });
+  it.each([
+    ['disjoint', { ghView: { 43: { files: [{ path: 'scripts/other.mjs' }] } } }],
+    ['self excluded', { queueFacts: facts([42]) }],
+    ['cards disabled', { env: { WE_DRAIN_QUEUE_FILE_OVERLAP_INCLUDES_CARDS: 'off' } }],
+    ['queue read failed', { viewThrows: [43] }],
+    ['queued list capped', { ghView: { 43: { files: Array(100).fill({ path: card }) } } }],
+  ])('continues through existing admission when %s', (label, over) => {
+    const h = setup(over);
+    expect(h.s.enqueue(candidate, HEAD, { comments: stampedBy(DRAIN) })).toMatchObject({ enqueued: true });
+    expect(h.calls.some(call => call.some(arg => arg.includes('enqueuePullRequest')))).toBe(true);
+    if (label === 'queue read failed') expect(h.logs.join('')).toContain('gh: HTTP 502');
+  });
+  it.each([
+    ['missing', { num: 42 }],
+    ['incomplete', { ...candidate, listedFilesComplete: false }],
+    ['capped', { ...candidate, listedFiles: Array(100).fill(card) }],
+    ['malformed', { ...candidate, listedFiles: [null] }],
+  ])('fails open when candidate files are %s', (_label, c) => {
+    const h = setup();
+    expect(h.s.enqueue(c, HEAD, { comments: stampedBy(DRAIN) })).toMatchObject({ enqueued: true });
+    expect(h.logs.join('')).toContain('candidate files unknown — continuing enqueue');
+    expect(h.calls.some(call => call[0] === 'gh' && call.includes('files'))).toBe(false);
+  });
+});

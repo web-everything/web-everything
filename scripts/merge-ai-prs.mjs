@@ -1386,6 +1386,11 @@ export function canConsumePrestagedAdmission(c, { ready, branchPreparationRequir
     && !branchPreparationRequired && queueAdmission?.allowed === true;
 }
 
+/** Carry the listing evidence into queue admission even when the planner projects the candidate. */
+export function candidateWithListedFiles(c, verdict = c) {
+  return { ...c, listedFiles: verdict?.listedFiles, listedFilesComplete: verdict?.listedFilesComplete };
+}
+
 /**
  * #2684 — is this candidate a cross-locus couple's WE half that was OVERLAP-STACKED on its impl tip? Such a PR
  * carries the couple manifest (`hasManifest` + `crossRepo`) AND a per-repo `base` sha (`v.base` — the impl tip
@@ -5114,7 +5119,7 @@ async function runCli() {
       fixClaimHeld: () => prestageFixClaimHeld(onlyPr, { claimKey: repoKeyForSlug(localSlug) }),
       // The cached base was verified unchanged, and preparation required it to be the default branch.
       beforeEnqueue: (c, sha, entry) => announceAndRetargetBeforeLand(c, { preread: fetchPrComments(c.repo, c.num), defaultBranch: entry.baseRefName }),
-      enqueue: (c, sha, entry) => mergeStrategy.enqueue(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }),
+      enqueue: (c, sha, entry) => mergeStrategy.enqueue(candidateWithListedFiles(c, entry.candidate), sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }),
       recordLanded: recordLandedLedgerFacts,
       requiredCheck: REQUIRED,
     });
@@ -6908,7 +6913,7 @@ async function runCli() {
           }
           const landLock = withLandWriteLock(() => {
             if (isPrAlreadyMerged(c.repo, c.num)) return { skipped: 'already-merged' };
-            if (mergeStrategy.enqueues(c.repo)) return mergeStrategy.enqueue(c, traceHeadSha, { comments: preread.read ? preread.comments : null }); // xtpxusq — never the merge API; throws on failure
+            if (mergeStrategy.enqueues(c.repo)) return mergeStrategy.enqueue(candidateWithListedFiles(c, verdicts.find(v => sameCand(v, c))), traceHeadSha, { comments: preread.read ? preread.comments : null }); // xtpxusq — never the merge API; throws on failure
             // x2e120n — the actual `gh pr merge` round-trip, timed on its own (a sub-component of the wider
             // "mergeCascade" step below, which also covers the pre-merge stamps/retarget for every candidate).
             __t.time('mergeCall', () => mergePr({ pr: c.num, repo: c.repo, method: 'merge', matchHeadCommit: traceHeadSha, caller: 'drain' }));

@@ -52,6 +52,7 @@ import { mergeActionFor, enqueuePr, planQueueFollowUps, REQUIRED_WORKFLOWS_UNSAT
 import { getRequiredStatusChecks } from './required-status-checks.mjs';
 import { readSettings } from './settings-files.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
+import { queueFileOverlap, readQueueEntryFiles, completeListedFiles } from './queue-file-overlap.mjs';
 import { createAdaptiveBatching, readQueueFacts } from './merge-queue-adaptive-batching.mjs';
 import { cancelObsoleteQueueRuns } from './merge-queue-obsolete-runs.mjs';
 
@@ -505,6 +506,28 @@ export function createDrainMergeStrategy({
         delete before.redTeamPending[key];
         writeState(statePath, before);
       }
+      try {
+        const candidateFiles = c.listedFilesComplete === true ? completeListedFiles(c.listedFiles) : null;
+        const queue = candidateFiles === null ? null : readQueueEntryFiles({ repo: slugOf(c.repo), exec });
+        if (candidateFiles === null) {
+          say('  merge-queue file-overlap: candidate files unknown — continuing enqueue');
+        } else if (queue.error) {
+          say(`  merge-queue file-overlap: read failed (${queue.error}) — continuing enqueue`);
+        } else {
+          const includeCards = safety.value.queueFileOverlapIncludesCards ?? true;
+          const source = safety.sources?.queueFileOverlapIncludesCards ?? 'standard';
+          const overlap = queueFileOverlap({ candidateFiles,
+            queuedEntries: queue.entries.filter(entry => entry.num !== c.num), includeCards });
+          if (overlap.unknown.length) say(`  merge-queue file-overlap: unknown files for ${overlap.unknown.map(num => `#${num}`).join(',')} — continuing without those entries`);
+          if (overlap.overlap) {
+            const first = overlap.with[0];
+            say(`  merge-queue file-overlap: defer #${c.num} (shares ${first.files[0]} with queued #${first.num}) — includeCards=${includeCards} (${source})`);
+            const files = [...new Set(overlap.with.flatMap(entry => entry.files))].slice(0, 3);
+            return { enqueued: false, deferred: true, kind: 'queue-file-overlap',
+              reason: `${overlap.with.map(entry => `#${entry.num}`).join(',')} share ${files.join(', ')}` };
+          }
+        }
+      } catch (e) { say(`  merge-queue file-overlap: read failed (${firstLine(e)}) — continuing enqueue`); }
       let batchingGroupId;
       try {
         const g = adaptiveBatching().gate(c.num);
