@@ -509,6 +509,24 @@ export function splitFailingChecks(rollup, requiredChecks) {
   return out;
 }
 
+/** PURE: settled head CI missing a required job introduced after this PR's base. */
+export function staleRequiredBaseRepair({ pr, requiredChecks, defaultBranch }) {
+  if (!Array.isArray(requiredChecks) || !requiredChecks.length
+      || requiredChecks.some(name => typeof name !== 'string' || !name.trim())
+      || typeof pr?.headRefOid !== 'string' || !pr.headRefOid.trim()) return null;
+  if (pr.isDraft || (pr.baseRefName != null && pr.baseRefName !== defaultBranch)
+      || String(pr.mergeStateStatus).toUpperCase() === 'DIRTY') return null;
+  const rows = collapseRollupToLatestPerName(pr.statusCheckRollup)
+    .filter(row => !row?.head_sha || row.head_sha === pr.headRefOid);
+  if (!rows.length || rows.some(row =>
+    ['queued', 'in_progress', 'pending', 'waiting', 'requested'].includes(String(row?.status ?? row?.state).toLowerCase())
+    || String(row?.state).toLowerCase() === 'expected')) return null;
+  const gate = reviewStartGate({ headSha: pr.headRefOid, requiredChecks, checks: pr.statusCheckRollup, policy: pr.reviewTiming });
+  if (gate.allowed || gate.reason !== 'required-checks-not-successful' || !gate.affected.length
+      || gate.affected.some(row => row.reason !== 'missing')) return null;
+  return { missing: gate.affected.map(row => row.name) };
+}
+
 /** How long a requested-but-unobserved CI re-run may be held quietly before it becomes an operator escalation. */
 export const TIMEOUT_RETRY_PENDING_ESCALATE_MS = 30 * 60 * 1000;
 /** Max mechanical re-runs per head for a queued PR GitHub holds BLOCKED on a cancelled required check (PR #4651). */
@@ -3418,6 +3436,28 @@ export function planReconcile({
           ' negotiation-round cap (that cap\'s own count is fed by past advisory notes — this review\'s own' +
           ' future output — not by a failure to converge)',
       });
+      continue;
+    }
+
+    // Settled CI on an older main base cannot publish a newly required job. Existing repair owners
+    // above keep priority; the review-local holds still apply before this mechanical fix can own it.
+    const staleBase = (['needs-review', 'needs-human'].includes(phase)
+      || (phase === 'queued' && withPhase.labels.includes('red-team:pending')))
+      ? staleRequiredBaseRepair({ pr, requiredChecks, defaultBranch }) : null;
+    if (staleBase) {
+      if (refuseReferralHold({ pr, refuse, withPhase })) continue;
+      if (refuseUnreviewable({ pr, refuse, withPhase })) continue;
+      const { stale: attempts, total } = countStaleConflictFixRounds(pr.comments, {
+        currentRef: defaultBranch, currentSha: mainSha,
+      });
+      const why = `PR base predates required job(s) ${staleBase.missing.join(', ')} — rebase onto current ${defaultBranch}`;
+      if (attempts >= conflictFixCapHere || total >= CONFLICT_FIX_ABSOLUTE_CEILING) {
+        refuseCapExhausted({ ...withPhase, attempts, cap: conflictFixCapHere, capKind: 'stale-base-rebase',
+          why: `${why}; durable conflict-fix count ${attempts}/${conflictFixCapHere}, total ${total}/${CONFLICT_FIX_ABSOLUTE_CEILING} — mechanical repair exhausted; a person must take it` });
+      } else {
+        dispatch.push({ ...base, ...withPhase, kind: 'fix', isConflict: true, mode: 'stale-base-rebase',
+          staleBase: { missing: staleBase.missing, defaultBranch }, attempts, cap: conflictFixCapHere, why });
+      }
       continue;
     }
 
