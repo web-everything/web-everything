@@ -3560,6 +3560,25 @@ it('skips a deferred discovery pass without posting a finding', () => {
 
 
 describe('conflict watch diagnostics', () => {
+  it('reads missing files for an already-labelled queued card-only conflict and attempts card rebase', () => {
+    const pr = { number: 5697, mergeable: 'CONFLICTING', baseRefName: 'main',
+      labels: ['review:accepted', 'ready-to-merge', CONFLICT_LABEL].map(name => ({ name })) };
+    const listPrFiles = vi.fn(() => [{ path: 'backlog/123-test.md' }]);
+    const attemptCardRebase = vi.fn(() => ({ action: 'rebased' }));
+    const [result] = watchParkedPrConflicts({
+      repo: 'o/n', sameLineConflict: 'stand-down',
+      listPrs: () => [pr], provider: { ensureLabel() {}, setLabels() {}, postComment() {} },
+      cardConflictSettings: { value: { autoResolveRaisedBy: true }, sources: { autoResolveRaisedBy: 'test' } },
+      listPrFiles, listPrComments: () => [], listAgents: () => [],
+      attemptCardRebase, postRearm: () => {}, ...noopRouting(),
+    });
+    expect(listPrFiles).toHaveBeenCalledWith({ number: 5697, repo: 'o/n' });
+    expect(attemptCardRebase).toHaveBeenCalledWith({ pr, repo: 'o/n', cardConflictSettings: {
+      value: { autoResolveRaisedBy: true }, sources: { autoResolveRaisedBy: 'test' },
+    } });
+    expect(result.routedTo).toBe('card-conflict-resolver');
+  });
+
   it.each(['message', 'stderr', 'stdout'])('retains and logs the meaningful %s of a thrown card rebase error', (field) => {
     const cause = 'GraphQL: API rate limit exceeded';
     const error = new Error(field === 'message' ? `\n[gh-shim] warning: wrapper\nwarning: shim active\n\n${cause}\nextra detail` : '');

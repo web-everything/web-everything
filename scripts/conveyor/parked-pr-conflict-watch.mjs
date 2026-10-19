@@ -1523,14 +1523,19 @@ export function watchParkedPrConflicts({
     // This owner sits OUTSIDE fix dispatch's scope queue. The git helper independently proves the full
     // card-only diff and every hunk; no exemption is granted to code fixers or arbitrary card edits.
     let cardOnly = false;
+    let cardAttempt = null;
     if ((isConflicting || plan.newlyResolved) && (!pr.baseRefName || pr.baseRefName === 'main')) {
       try {
+        // Already-labelled queued PRs with an unknown base stay with the grace owner;
+        // only an explicit main base warrants fetching their missing card-only evidence.
         const files = Array.isArray(pr.files) && pr.files.length < GH_FILES_GRAPHQL_CAP
-          ? pr.files : queued && !plan.add ? [] : listPrFiles({ number: pr.number, repo: resolvedRepo });
+          ? pr.files : queued && !plan.add && !pr.baseRefName ? [] : listPrFiles({ number: pr.number, repo: resolvedRepo });
         cardOnly = isCardOnlyDiff(files.map(f => typeof f === 'string' ? f : f.path));
-      } catch { /* unknown file set stays on the normal guarded path */ }
+      } catch (error) {
+        // Unknown files prove neither card-only eligibility nor a card rebase attempt.
+        console.error(`parked-pr-conflict-watch: PR #${pr.number}: card file list unavailable; normal conflict owner required: ${conflictWatchCause(error)}`);
+      }
     }
-    let cardAttempt = null;
     if (isConflicting && cardOnly && cardConflictSettings.value.autoResolveRaisedBy && !dryRun) {
       const cardEntry = { num: pr.number, isConflicting, ...plan, commented: false,
         cardConflictSetting: { value: true, source: cardConflictSettings.sources.autoResolveRaisedBy } };
@@ -1608,10 +1613,13 @@ export function watchParkedPrConflicts({
     // Recover live #5017 (2026-10-13), including an existing review:changes bounce.
     const sameLineRecovery = sameLineConflict === 'fixer' && isConflicting && !plan.add && !plan.remove.length
       && hasReviewLabel(pr?.labels, CONFLICT_LABEL) && !hasReviewLabel(pr?.labels, REVIEW_LABELS.human);
-    if (!plan.add && plan.remove.length === 0 && !graceDue && !recheckCandidate && !idleConflictBounce && !sameLineRecovery) continue;
     const entry = { num: pr?.number, isConflicting, ...plan, commented: false,
       ...(cardAttempt ? { mechanicalRebase: cardAttempt } : {}),
       ...(cardOnly ? { cardConflictSetting: { value: cardConflictSettings.value.autoResolveRaisedBy, source: cardConflictSettings.sources.autoResolveRaisedBy } } : {}) };
+    if (!plan.add && plan.remove.length === 0 && !graceDue && !recheckCandidate && !idleConflictBounce && !sameLineRecovery) {
+      if (cardAttempt) results.push(entry);
+      continue;
+    }
     // The #2793 idle re-assert, shared with card xkugvzd's `review:human` case (`variant` only names the route).
     // Same round cap, same once-per-round guard, same `postFinding` (which keeps `review:human`). Pushes `entry`.
     const reassertIdleConflict = (comments, variant) => {
