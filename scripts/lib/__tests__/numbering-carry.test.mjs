@@ -791,10 +791,11 @@ describe('numbering acceptance restamp', () => {
     it('re-checks the referral guard on the re-read state', () => {
       const { calls, provider } = recording();
       let reads = 0;
-      const guardReferrals = () => { if (++reads > 1) throw Error('mandatory referral hold: unresolved'); };
+      const guardReferrals = () => { if (++reads > 2) throw Error('mandatory referral hold: unresolved'); };
       expect(run({ provider, guardReferrals, prove: () => ({ ok: true, reason: 'verified' }) }))
         .toMatchObject({ action: 'retry', reason: 'mandatory referral hold: unresolved' });
       expect(calls).toEqual([]);
+      expect(reads).toBe(3);
     });
     it('keeps pending and withdraws our record when the objection lands between the record and the label write', () => {
       const { thread, calls, provider, step } = liveThread();
@@ -1043,7 +1044,7 @@ describe('numbering acceptance restamp', () => {
   it('refuses an unsatisfied mandatory referral through the shared guard', () => {
     const state = { labels: ['review:pending'], headRefOid: TO,
       comments: [{ author: { login: 'chalbert' }, body: '<!-- mandatory-referrals-v1: truncated -->' }, ...liveComments()] };
-    expect(run({ state, prove: () => { throw Error('unexpected proof'); } })).toMatchObject({ action: 'retry' });
+    expect(run({ state, prove: () => ({ ok: false, reason: 'unproven' }) })).toMatchObject({ action: 'retry' });
   });
   it.each([{ enabled: false }, { acceptCarry: 'off' }])('writes nothing with a disabled carry setting: %j', (settings) => {
     expect(run({ ...settings, prove: () => { throw Error('unexpected proof'); } })).toBeNull();
@@ -1057,7 +1058,7 @@ describe('numbering acceptance restamp', () => {
       guardReferrals: (s) => { checked.push(s.headRefOid); throw Error('mandatory referral hold: unresolved'); },
       provider: { postComment: () => { throw Error('unexpected write'); }, setLabels: () => { throw Error('unexpected write'); } } }))
       .toMatchObject({ action: 'retry', reason: 'mandatory referral hold: unresolved' });
-    expect(checked).toEqual([TO]);
+    expect(checked).toEqual([FROM]);
   });
   it('posts before labels, then remembers the settled head', () => {
     const calls = [];

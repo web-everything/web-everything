@@ -339,3 +339,32 @@ describe('a real detached launch from a pinned snapshot', () => {
     expect(() => enqueueJob({ store, kindDef: noop, id: 'x' })).toThrow(/codeSha/);
   });
 });
+
+describe('reattachTick deadlines', () => {
+  it('stops a live expired job before failing it and never starts an expired queued job', async () => {
+    const now = Date.now();
+    const live = enqueueJob({ store, kindDef: noop, codeSha: 'test-sha', id: 'deadline-live', now });
+    store.update(live.id, (r) => markClaimed(markLaunching(r, { at: new Date(now).toISOString() }), {
+      at: new Date(now).toISOString(), handle: formatJobHandle({ host: 'test', pid: 123, procStart: 'test' }), host: 'test', pid: 123, procStart: 'test',
+    }));
+    enqueueJob({ store, kindDef: noop, codeSha: 'test-sha', id: 'deadline-queued', now });
+    const stop = vi.fn(async () => ({ gone: true, signal: 'SIGTERM' }));
+    const launch = vi.fn();
+    await reattachTick({ store, kinds, maxConcurrent: 2, observation: { now, slept: false },
+      deadlineAt: () => now, probe: () => 'alive', stop, launch });
+    expect(stop).toHaveBeenCalledOnce();
+    expect(launch).not.toHaveBeenCalled();
+    for (const id of ['deadline-live', 'deadline-queued']) expect(store.read(id).job).toMatchObject({ status: 'failed', error: expect.stringContaining('deadline exceeded') });
+  });
+  it('keeps an expired job occupying its slot if stopping it fails', async () => {
+    const now = Date.now();
+    enqueueJob({ store, kindDef: noop, codeSha: 'test-sha', id: 'deadline-stuck', now });
+    store.update('deadline-stuck', (r) => markClaimed(markLaunching(r, { at: new Date(now).toISOString() }), {
+      at: new Date(now).toISOString(), handle: formatJobHandle({ host: 'test', pid: 123, procStart: 'test' }), host: 'test', pid: 123, procStart: 'test',
+    }));
+    const out = await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now, slept: false },
+      deadlineAt: () => now, probe: () => 'alive', stop: async () => ({ gone: false }), launch: vi.fn() });
+    expect(out.actions).toContainEqual(expect.objectContaining({ action: 'stop-failed' }));
+    expect(store.read('deadline-stuck').job.status).toBe('running');
+  });
+});
