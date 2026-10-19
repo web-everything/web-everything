@@ -7,9 +7,10 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseRaisedBy, raisedByKey, raisedByFile, readRaisedBy } from '../lib/raised-by.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
+import { ghRepoSlug } from '../lib/constellation-repos.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
-const REPO = 'web-everything/web-everything';
+const REPO = ghRepoSlug('we');
 const FIELDS = 'number,headRefName,headRefOid,labels,isDraft,baseRefName,headRepositoryOwner,isCrossRepository';
 const positive = value => /^\d+$/.test(String(value)) && Number.isSafeInteger(Number(value)) && Number(value) > 0;
 
