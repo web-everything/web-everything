@@ -399,7 +399,11 @@ export function createDrainMergeStrategy({
   const stampReserve = (c, headSha, files, locked = false) => {
     if (dryRun || !priorityReserve().enabled || !isPriorityLabels(c.prLabels) || !headSha) return;
     mutateReserves(reserves => {
-      reserves[keyOf(c.repo, c.num)] = { num: c.num, repo: c.repo ?? null, headSha, files, at: now() };
+      const key = keyOf(c.repo, c.num);
+      const previous = reserves[key];
+      const retainRt = previous?.rt && previous.headSha === headSha && !rtExpired(previous);
+      reserves[key] = { num: c.num, repo: c.repo ?? null, headSha, files, at: now(),
+        ...(retainRt ? { rt: true, rtSince: previous.rtSince, maxMs: previous.maxMs } : {}) };
       return true;
     }, locked);
   };
@@ -410,6 +414,48 @@ export function createDrainMergeStrategy({
       if (!reserves[key]) return false;
       delete reserves[key]; return true;
     }, true);
+  };
+  const rtSendBack = reason => reason?.includes('requiring send-back') || reason?.includes('saved red-team re-check incomplete');
+  const rtExpired = stamp => {
+    const maxMs = Math.min(stamp.maxMs, (priorityReserve().maxMin ?? 90) * 60_000);
+    return !Number.isFinite(stamp.rtSince) || !Number.isFinite(maxMs) || maxMs <= 0
+      || now() < stamp.rtSince || now() - stamp.rtSince >= maxMs;
+  };
+  // Preserve producer evidence (including skipCardOnly) and request state for every admission reason.
+  const enqueueRedTeamReason = (c, headSha, evidence, comments, requestPending) => redTeamEnqueueHold({
+    ...evidence, requestPending, comments, repo: slugOf(c.repo), pr: c.num, head: headSha, env,
+  });
+  const reserveRedTeamReason = (c, headSha, live) => {
+    const evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env });
+    const pages = readThreadPages(c.repo, c.num);
+    if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team comments unreadable');
+    const pending = readQueueState(statePath, readFile).redTeamPending?.[keyOf(c.repo, c.num)];
+    const { sameHead, neverScheduled } = redTeamRequestEligibility(c, headSha, live, evidence, pending);
+    return enqueueRedTeamReason(c, headSha, evidence, pages.flat(), neverScheduled || (sameHead && pending.requestedAt != null));
+  };
+  // Scheduling only: this stamp grants no enqueue authority and never clears a hold.
+  const priorityReserveStamp = (c, headSha, locked = false) => {
+    const setting = priorityReserve();
+    if (dryRun || !setting.enabled || !enqueues(c.repo) || !isPriorityLabels(c.prLabels) || !headSha) return;
+    mutateReserves(reserves => {
+      const key = keyOf(c.repo, c.num);
+      const previous = reserves[key];
+      const drop = () => { if (!previous?.rt) return false; delete reserves[key]; return true; };
+      const live = JSON.parse(exec('gh', ['pr', 'view', String(c.num), '--repo', slugOf(c.repo), '--json', 'state,headRefOid,labels,reviews'],
+        { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }));
+      const labels = live.labels?.map(l => typeof l === 'string' ? l : l?.name) ?? [];
+      if (live.state !== 'OPEN' || live.headRefOid !== headSha || !labels.includes('ready-to-merge')
+        || !labels.includes('review:accepted') || !isPriorityLabels(labels) || sendBackReason(labels)
+        || (previous?.rt && (previous.headSha !== headSha || rtExpired(previous)))) return drop();
+      const reason = reserveRedTeamReason(c, headSha, live);
+      if (rtSendBack(reason) || (setting.maxMin ?? 90) <= 0) return drop();
+      if (!safety.value.waitForRedTeamBeforeEnqueue || !reason) return false;
+      const files = candidateFilesOf(c, headSha, {});
+      if (files === null) return false;
+      reserves[key] = { num: c.num, repo: c.repo ?? null, headSha, files, at: now(), rt: true,
+        rtSince: previous?.rt ? previous.rtSince : now(), maxMs: (setting.maxMin ?? 90) * 60_000 };
+      return true;
+    }, locked);
   };
   const reserveLiveCache = new Map();
   const priorityReserveHold = (c, headSha, locked = false, decision = {}) => {
@@ -424,10 +470,11 @@ export function createDrainMergeStrategy({
       reserves, now: now(), includeCards, isValid: stamp => {
         if (slugOf(stamp.repo) !== slugOf(c.repo)) return false;
         const key = keyOf(stamp.repo, stamp.num);
+        if (stamp.rt && rtExpired(stamp)) { invalid.add(key); return false; }
         let live;
         const cached = reserveLiveCache.get(key);
         try {
-          if (cached && now() >= cached.at && now() - cached.at < 30_000) live = cached.live;
+          if (!stamp.rt && cached && now() >= cached.at && now() - cached.at < 30_000) live = cached.live;
           else {
             live = JSON.parse(exec('gh', ['pr', 'view', String(stamp.num), '--repo', slugOf(stamp.repo), '--json', 'state,headRefOid,labels'],
               { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }));
@@ -436,7 +483,8 @@ export function createDrainMergeStrategy({
           }
           const labels = live.labels.map(l => typeof l === 'string' ? l : l?.name);
           if (live.state !== 'OPEN' || live.headRefOid !== stamp.headSha || !labels.includes('ready-to-merge')
-            || !isPriorityLabels(live.labels) || sendBackReason(live.labels)) { invalid.add(key); return false; }
+            || !isPriorityLabels(live.labels) || sendBackReason(live.labels)
+            || (stamp.rt && (!labels.includes('review:accepted') || rtSendBack(reserveRedTeamReason({ repo: stamp.repo, num: stamp.num }, stamp.headSha, live))))) { invalid.add(key); return false; }
           const queue = cachedQueue(slugOf(stamp.repo), decision);
           if (queue.error) return false;
           if (queue.entries.some(e => e.num === stamp.num)) { invalid.add(key); return false; }
@@ -453,7 +501,7 @@ export function createDrainMergeStrategy({
     if (!blockers.length) return null;
     const first = blockers[0];
     const shared = queueFileOverlap({ candidateFiles: files, queuedEntries: [first], includeCards }).with[0].files[0];
-    say(`reserved files for priority #${first.num}: blocks #${c.num} - drain.priorityReservesFiles=on (${setting.source})`);
+    say(`reserved files for priority #${first.num}: blocks #${c.num} - drain.priorityReservesFiles=on (${setting.source})${first.rt ? `; priorityReserveMaxMin=${setting.maxMin ?? 90} (${setting.maxMinSource ?? 'standard'})` : ''}`);
     return { kind: 'priority-reserve', reason: `priority #${first.num} reserves ${shared}`, deferred: true };
   };
   const pickQueueOverlap = (c, candidateFiles, queue) => {
@@ -469,6 +517,7 @@ export function createDrainMergeStrategy({
     strategy: policy.strategy,
     enqueues,
     priorityReserveHold,
+    priorityReserveStamp,
     /** GitHub's queue re-tests every entry against the queue tip, so the drain's freshness refresh is skipped. */
     queueOwnsFreshness: (repo) => enqueues(repo),
 
@@ -558,7 +607,7 @@ export function createDrainMergeStrategy({
             = redTeamRequestEligibility(c, headSha, live, evidence, pending);
           const pages = readThreadPages(c.repo, c.num);
           if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) return null;
-          const reason = redTeamEnqueueHold({ ...evidence, requestPending: neverScheduled || (sameHead && pending.requestedAt != null), comments: pages.flat(), repo: slugOf(c.repo), pr: c.num, head: headSha, env });
+          const reason = enqueueRedTeamReason(c, headSha, evidence, pages.flat(), neverScheduled || (sameHead && pending.requestedAt != null));
           if (!reason || reason.includes('requiring send-back') || reason.includes('saved red-team re-check incomplete')) return { requested: false };
           if (!requestDue) {
             if (neverScheduled && sameHead && pending.requestedAt == null)
@@ -639,6 +688,7 @@ export function createDrainMergeStrategy({
           && !(overdue && pending.reason.includes('no recorded result')
             && (pending.checkedAt ?? pending.firstPendingAt) < pending.firstPendingAt + (safety.value.redTeamPendingMaxMin ?? 45) * 60_000)) {
           log.write(`  merge-queue: #${c.num} red-team-pending backoff until ${new Date(pending.retryAt).toISOString()} (head and review/comment evidence unchanged)\n`);
+          if (!holdOnly) priorityReserveStamp(c, headSha, true);
           return pendingOutcome(c, pending, true);
         }
         // Refreshing the hold can update labels, dispatch work, or write shared state. Leave all of that
@@ -646,7 +696,7 @@ export function createDrainMergeStrategy({
         if (holdOnly) return null;
         const pages = readThreadPages(c.repo, c.num);
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team admission: unreadable complete comments');
-        const reason = redTeamEnqueueHold({ ...evidence, requestPending: neverScheduled || (sameHead && pending.requestedAt != null), comments: pages.flat(), repo: slugOf(c.repo), pr: c.num, head: headSha, env });
+        const reason = enqueueRedTeamReason(c, headSha, evidence, pages.flat(), neverScheduled || (sameHead && pending.requestedAt != null));
         try { syncRedTeamStatusLabels({ repo: slugOf(c.repo), pr: c.num, head: headSha, evidence, env,
           live, comments: pages.flat(), provider: statusProvider, dryRun, log: say }); }
         catch (e) { say(`red-team status labels #${c.num}: ${firstLine(e)}`); }
@@ -659,6 +709,7 @@ export function createDrainMergeStrategy({
             ...(sameHead && pending.requestAttemptedAt != null ? { requestAttemptedAt: pending.requestAttemptedAt } : {}) };
           before.redTeamPending[key] = wait;
           writeState(statePath, before);
+          priorityReserveStamp(c, headSha, true);
           const outcome = pendingOutcome(c, wait);
           // Historical rows can request recovery, but never waive the hold or use the enqueue escape.
           if (reason.includes('requiring send-back') || reason.includes('saved red-team re-check incomplete')) return outcome;

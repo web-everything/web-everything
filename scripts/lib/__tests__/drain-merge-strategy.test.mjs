@@ -1796,6 +1796,129 @@ describe('priority file reservations', () => {
   const stamp = (h, extra = {}) => writeReserves(h.reservePath, {
     'cwd#42': { num: 42, repo: null, headSha: HEAD, files, at: Date.now(), ...extra },
   });
+  const accepted = ['priority:now', 'review:accepted', 'ready-to-merge'];
+  const panel = { verdict: { verdict: 'accept' }, findings: { read: {
+    netBasis: { rev: HEAD }, netChangedFiles: files,
+  } } };
+  const pendingEvidence = { scheduled: true, inFlight: true, recorded: false, loopPayload: panel };
+  const rtSetup = (extra = {}) => setup({ labels: accepted, evidence: pendingEvidence,
+    env: { WE_RED_TEAM_TIMING: 'post-accept' }, now: () => 1000, ...extra });
+  it.each(['priority:now', 'priority:urgent'])('stamps %s before a recorded hold and retains its first timestamp', label => {
+    let clock = 1000;
+    const labels = accepted.map(l => l === 'priority:now' ? label : l);
+    const h = rtSetup({ labels, now: () => clock });
+    const c = { ...priority, prLabels: labels };
+    h.s.priorityReserveStamp(c, HEAD);
+    expect(h.calls.filter(call => call.includes('state,headRefOid,labels,reviews'))).toHaveLength(1);
+    expect(readReserves(h.reservePath)['cwd#42']).toMatchObject({ headSha: HEAD, files, rt: true, rtSince: 1000, maxMs: 90 * 60_000 });
+    expect(h.s.enqueue(c, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    clock += 60_000;
+    h.s.priorityReserveStamp(c, HEAD);
+    expect(h.s.recordedHold(c, HEAD)).toMatchObject({ kind: 'red-team-pending' });
+    expect(readReserves(h.reservePath)['cwd#42'].rtSince).toBe(1000);
+    expect(h.s.priorityReserveHold(candidate, HEAD)?.kind).toBe('priority-reserve');
+    expect(h.logs.join('')).toContain('priorityReserveMaxMin=90 (standard)');
+    expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+  });
+  it('stamps in ordinary enqueue without changing the red-team hold', () => {
+    const h = rtSetup();
+    expect(h.s.enqueue({ ...priority, prLabels: accepted }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(readReserves(h.reservePath)['cwd#42']).toMatchObject({ rt: true, rtSince: 1000 });
+  });
+  it.each([
+    ['not accepted', ['priority:now', 'ready-to-merge']],
+    ['not ready', ['priority:now', 'review:accepted']],
+    ['send-back', [...accepted, 'review:changes']],
+  ])('does not stamp when %s and drops an existing rt stamp in either path', (_name, labels) => {
+    const live = { state: 'OPEN', headRefOid: HEAD, labels };
+    const h = rtSetup({ ghView: { 42: live } });
+    h.s.priorityReserveStamp(priority, HEAD);
+    expect(readReserves(h.reservePath)).toEqual({});
+    stamp(h, { at: 1000, rt: true, rtSince: 1000, maxMs: 90 * 60_000 });
+    expect(h.s.priorityReserveHold(candidate, HEAD)).toBeNull();
+    expect(readReserves(h.reservePath)).toEqual({});
+    stamp(h, { at: 1000, rt: true, rtSince: 1000, maxMs: 90 * 60_000 });
+    h.s.priorityReserveStamp(priority, HEAD);
+    expect(readReserves(h.reservePath)).toEqual({});
+  });
+  it.each(['hold', 'stamp'])('expires at maxMin in the %s path without extending rtSince', path => {
+    let clock = 1000;
+    const h = rtSetup({ now: () => clock, priorityReserve: () => ({ enabled: true, source: 'default', maxMin: 40, maxMinSource: 'tool' }) });
+    h.s.priorityReserveStamp(priority, HEAD);
+    clock += 31 * 60_000;
+    h.s.priorityReserveStamp(priority, HEAD);
+    expect(readReserves(h.reservePath)['cwd#42'].rtSince).toBe(1000);
+    expect(h.s.priorityReserveHold(candidate, HEAD)?.kind).toBe('priority-reserve');
+    expect(h.logs.join('')).toContain('priorityReserveMaxMin=40 (tool)');
+    clock = 1000 + 40 * 60_000;
+    if (path === 'hold') expect(h.s.priorityReserveHold(candidate, HEAD)).toBeNull();
+    else h.s.priorityReserveStamp(priority, HEAD);
+    expect(readReserves(h.reservePath)).toEqual({});
+  });
+  it.each([
+    ['head changed', { state: 'OPEN', headRefOid: 'a'.repeat(40), labels: accepted }],
+    ['closed', { state: 'CLOSED', headRefOid: HEAD, labels: accepted }],
+  ])('expires rt stamps when %s', (_name, live) => {
+    const h = rtSetup({ ghView: { 42: live } });
+    stamp(h, { at: 1000, rt: true, rtSince: 1000, maxMs: 90 * 60_000 });
+    expect(h.s.priorityReserveHold(candidate, HEAD)).toBeNull();
+    expect(readReserves(h.reservePath)).toEqual({});
+  });
+  it('requests the current head locally without overlap, keeps cooldown and preserves the hold', () => {
+    const requestRedTeam = vi.fn(() => ({ requested: true }));
+    const h = rtSetup({ requestRedTeam, evidence: { ...pendingEvidence, scheduled: false, inFlight: false } });
+    h.s.priorityReserveStamp(priority, HEAD);
+    expect(h.s.requestRedTeamWhileDeferred(priority, HEAD)).toEqual({ requested: true });
+    expect(requestRedTeam).toHaveBeenCalledWith({ repo: LOCAL, pr: 42, head: HEAD, loopPayload: panel });
+    expect(h.s.requestRedTeamWhileDeferred(priority, HEAD)).toEqual({ requested: false });
+    expect(requestRedTeam).toHaveBeenCalledTimes(1);
+    expect(h.s.enqueue(priority, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(h.s.recordedHold(priority, HEAD)).toMatchObject({ kind: 'red-team-pending' });
+    expect(readReserves(h.reservePath)['cwd#42'].rt).toBe(true);
+  });
+  it.each(['break', 'incomplete'])('drops rt reservations for a red-team %s before send-back labels arrive', kind => {
+    const thread = [];
+    const h = rtSetup({ liveComments: thread });
+    h.s.priorityReserveStamp(priority, HEAD);
+    thread.push({ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
+      pr: 42, rev: HEAD, provider: 'codex', model: 'm',
+      recheckStatus: kind === 'incomplete' ? 'pending' : 'ok', foldedVerdict: 'changes',
+      findings: [{ summary: 'unresolved security break', category: 'security', impactIfUnfixed: 'broken', confirmedByRecheck: true }],
+    }) });
+    expect(h.s.priorityReserveHold(candidate, HEAD)).toBeNull();
+    expect(readReserves(h.reservePath)).toEqual({});
+    stamp(h, { at: 1000, rt: true, rtSince: 1000, maxMs: 90 * 60_000 });
+    h.s.priorityReserveStamp(priority, HEAD);
+    expect(readReserves(h.reservePath)).toEqual({});
+  });
+  it.each([
+    ['default card-only exemption', {}, {}, false],
+    ['card-only skipping disabled', {}, { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, true],
+    ['producer exemption overrides disabled skipping', { skipCardOnly: true }, { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, false],
+    ['producer requires a pass', { skipCardOnly: false }, {}, true],
+    ['in-flight pass', { inFlight: true }, {}, true],
+    ['recorded pass', { recorded: true }, {}, true],
+    ['attempt-only exemption', { attempted: true }, {}, false],
+  ])('matches the enqueue reason for a card-only PR: %s', (_name, evidence, env, held) => {
+    const h = rtSetup({ env: { WE_RED_TEAM_TIMING: 'post-accept', ...env }, evidence: {
+      ...pendingEvidence, inFlight: false, ...evidence, loopPayload: {
+        verdict: { verdict: 'accept' }, findings: { read: {
+          netBasis: { rev: HEAD }, netChangedFiles: ['backlog/123-card.md'],
+        } },
+      },
+    } });
+    h.s.priorityReserveStamp(priority, HEAD);
+    if (held) expect(readReserves(h.reservePath)['cwd#42']).toMatchObject({ rt: true });
+    else expect(readReserves(h.reservePath)).toEqual({});
+    const result = h.s.enqueue(priority, HEAD);
+    if (held) expect(result).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    else expect(result.enqueued).toBe(true);
+  });
+  it.each([0])('disables rt stamping with maxMin=%s', maxMin => {
+    const h = rtSetup({ priorityReserve: () => ({ enabled: true, source: 'tool', maxMin }) });
+    h.s.priorityReserveStamp(priority, HEAD);
+    expect(readReserves(h.reservePath)).toEqual({});
+  });
   it.each([
     ['disjoint net files', 'git', ['scripts/other.mjs'], false],
     ['shared net files', 'git', [files[0]], true],
@@ -1833,6 +1956,21 @@ describe('priority file reservations', () => {
     writeReserves(h.reservePath, {});
     expect(h.s.enqueue(c, HEAD).kind).toBe('queue-file-overlap');
     expect(readReserves(h.reservePath)['cwd#42'].files).toEqual(files);
+  });
+  it.each([
+    ['expired', 'hint'],
+    ['expired', 'enqueue'],
+    ['head-mismatched', 'hint'],
+    ['head-mismatched', 'enqueue'],
+  ])('replaces an %s rt stamp with an ordinary overlap reservation in the %s path', (reason, path) => {
+    const clock = 1000 + 90 * 60_000;
+    const h = setup({ now: () => clock, queueFacts: facts([43]), ghView: { 43: { files: [files[0]] } } });
+    stamp(h, { headSha: reason === 'head-mismatched' ? 'a'.repeat(40) : HEAD,
+      files: ['old.mjs'], at: 1000, rt: true,
+      rtSince: reason === 'expired' ? 1000 : clock - 1000, maxMs: 90 * 60_000 });
+    const result = path === 'hint' ? h.s.queueOverlapHold(priority, HEAD) : h.s.enqueue(priority, HEAD);
+    expect(result?.kind).toBe('queue-file-overlap');
+    expect(readReserves(h.reservePath)['cwd#42']).toEqual({ num: 42, repo: null, headSha: HEAD, files, at: clock });
   });
   it('reserves across passes, permits disjoint work and lets priority enqueue and clear its stamp', () => {
     const queued = facts([43]);

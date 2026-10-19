@@ -19,7 +19,7 @@ export function writeReserves(path, obj) {
 
 export function activeReserveBlockers({ candidate, reserves, now, ttlMs = 30 * 60_000, includeCards = true, isValid = () => true }) {
   return Object.entries(reserves).filter(([key, stamp]) => key !== candidate.key
-    && stamp && Number.isFinite(stamp.at) && now >= stamp.at && now - stamp.at < ttlMs
+    && stamp && Number.isFinite(stamp.at) && now >= stamp.at && (stamp.rt || now - stamp.at < ttlMs)
     && Array.isArray(stamp.files) && stamp.files.every(f => typeof f === 'string')
     && isValid(stamp)
     && queueFileOverlap({ candidateFiles: candidate.files, queuedEntries: [stamp], includeCards }).overlap)

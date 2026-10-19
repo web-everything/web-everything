@@ -2131,6 +2131,12 @@ Catch-up remembers PR holds until the live head/labels/update time, local red-te
 evidence, overlap deadline, yielded-to PR state/head, or numbering withdrawal debt
 changes. `drain.catchUpSkipMaxMin` (default 15, nonnegative minutes, source logged)
 bounds every remembered hold from the child's start time; zero disables skips.
+`drain.priorityReserveMaxMin` (default 90, nonnegative minutes, source logged)
+bounds priority file reservations while red team is pending; zero disables these
+reservations. They require live acceptance/readiness and expire on send-back,
+head change, closure or label loss. Restamps retain the first red-team timestamp
+on that head. Ordinary overlap reservations retain their 30-minute TTL.
+
 The memo also includes durable queue retry state (`retryAt`, `firstPendingAt`,
 `requestAttemptedAt` and `requestedAt`) and the effective pending/request timing policy.
 It expires at the earliest queue retry, pending-health deadline, request cooldown,

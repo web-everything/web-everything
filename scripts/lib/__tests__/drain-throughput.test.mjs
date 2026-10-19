@@ -16,11 +16,25 @@ import { buildSkipReasons } from '../drain-skip-reasons.mjs';
 describe('drain throughput', () => {
   it('defaults on, supports rollback and reports each source', () => {
     const log = vi.fn();
-    expect(resolveDrainThroughput({ file: {}, platform: {}, env: {}, log }).value).toEqual({ redMainSkipCatchUp: true, holdFirst: true, overlapFirst: true, priorityReservesFiles: true, catchUpSkipQueueOverlap: true, catchUpSkipUnchangedHolds: true, carryOverReadyFirst: true, catchUpSkipMaxMin: 15 });
+    expect(resolveDrainThroughput({ file: {}, platform: {}, env: {}, log }).value).toEqual({ redMainSkipCatchUp: true, holdFirst: true, overlapFirst: true, priorityReservesFiles: true, catchUpSkipQueueOverlap: true, catchUpSkipUnchangedHolds: true, carryOverReadyFirst: true, catchUpSkipMaxMin: 15, priorityReserveMaxMin: 90 });
     const out = resolveDrainThroughput({ file: { drain: { holdFirst: false } }, platform: {}, env: {}, log });
     expect(out.value.holdFirst).toBe(false);
     expect(out.sources.holdFirst).toBe('tool');
     expect(log.mock.calls.flat().join(' ')).toContain('redMainSkipCatchUp=true (default)');
+  });
+  it('cascades the red-team priority reservation deadline and reports its source', () => {
+    const log = vi.fn();
+    const resolve = (drain = {}, platform = {}) => resolveDrainThroughput({ file: { drain }, platform, env: {}, log });
+    expect(resolve().value.priorityReserveMaxMin).toBe(90);
+    expect(resolve().sources.priorityReserveMaxMin).toBe('standard');
+    expect(resolve({ priorityReserveMaxMin: 20 }).value.priorityReserveMaxMin).toBe(20);
+    expect(resolve({ priorityReserveMaxMin: 20 }).sources.priorityReserveMaxMin).toBe('tool');
+    expect(resolve({}, { priorityReserveMaxMin: 30 }).value.priorityReserveMaxMin).toBe(30);
+    expect(resolve({}, { priorityReserveMaxMin: 30 }).sources.priorityReserveMaxMin).toBe('platform');
+    expect(resolve({ priorityReserveMaxMin: 0 }).value.priorityReserveMaxMin).toBe(0);
+    for (const value of [-1, Infinity, NaN, '90'])
+      expect(resolve({ priorityReserveMaxMin: value }).value.priorityReserveMaxMin).toBe(90);
+    expect(log.mock.calls.flat().join(' ')).toContain('priorityReserveMaxMin=90 (standard)');
   });
   it.each([
     ['priorityReservesFiles', 'WE_DRAIN_PRIORITY_RESERVES_FILES'],
@@ -102,6 +116,30 @@ describe('drain throughput', () => {
     expect(cascade.indexOf('earlyHold(c)')).toBeLessThan(cascade.indexOf('await revalidateFresh('));
     expect(src).toMatch(/buildSkipReasons\(\{[^\n]*enqueueOutcomes/);
     expect(src.includes('listed = { rows: snapshotSeed')).toBe(false);
+  });
+  it('earlyHold stamps and requests a local priority head before returning its recorded red-team hold', async () => {
+    const src = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');
+    const start = src.indexOf('    const earlyHold = c =>');
+    const end = src.indexOf('    if (throughput.value.holdFirst)', start);
+    const hold = { kind: 'red-team-pending', deferred: true };
+    const order = [];
+    const strategy = {
+      priorityReserveStamp: vi.fn(() => order.push('stamp')),
+      requestRedTeamWhileDeferred: vi.fn(() => order.push('request')),
+      priorityReserveHold: () => null,
+      recordedHold: () => { order.push('hold'); return hold; },
+    };
+    const earlyHold = runInNewContext(`${src.slice(start, end)}; earlyHold`, {
+      memoHold: (_c, fn) => fn(), preparedPass: { plan: { deferred: [] } },
+      localSlug: 'o/r', escalationRelief: {}, hasUnclearedReviewLabel: () => false, numberingWithdrawalOwed: () => false,
+      throughput: { value: { overlapFirst: false } }, isLocalRepo: () => true,
+      isPriorityLabels: labels => labels.includes('priority:now'), mergeStrategy: strategy,
+    });
+    const c = { num: 42, prLabels: ['priority:now', 'review:accepted', 'ready-to-merge'], listedHeadSha: 'current', headSha: 'old' };
+    expect(await earlyHold(c)).toEqual(hold);
+    expect(order).toEqual(['stamp', 'request', 'hold']);
+    expect(strategy.priorityReserveStamp).toHaveBeenCalledWith(c, 'current');
+    expect(strategy.requestRedTeamWhileDeferred).toHaveBeenCalledWith(c, 'current');
   });
   it('catch-up sees a sibling opened after the snapshot and yields to it', async () => {
     const src = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');

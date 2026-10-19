@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { isPriorityLabels } from './lib/priority-reserve.mjs';
 import { postCardSquashMarker } from './lib/card-squash-marker.mjs';
 import { ensureLabelCached } from './lib/label-cache.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
@@ -4674,7 +4675,7 @@ async function runCli() {
   });
   const resolvedMergePolicy = resolveDrainMergePolicy({ dryRun: DRY_RUN });
   let throughput; // Refreshed before either enqueue path on every sweep.
-  const mergeStrategy = createDrainMergeStrategy({ requestRedTeam: DRY_RUN ? null : requestDrainRedTeam, resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), priorityReserve: () => ({ enabled: throughput.value.priorityReservesFiles !== false, source: throughput.sources?.priorityReservesFiles || 'default' }) }); // xtpxusq — logs strategy + source once per pass
+  const mergeStrategy = createDrainMergeStrategy({ requestRedTeam: DRY_RUN ? null : requestDrainRedTeam, resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), priorityReserve: () => ({ enabled: throughput.value.priorityReservesFiles !== false, source: throughput.sources?.priorityReservesFiles || 'default', maxMin: throughput.value.priorityReserveMaxMin, maxMinSource: throughput.sources?.priorityReserveMaxMin || 'standard' }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
   // PR #5195 — the drain's ledger facts (review-exempt, carried-acceptance restamp, drain-hold release) can clear a
   // head, so they are written per candidate only once an enqueue entry point CONFIRMS its merge or enqueue: the
@@ -6622,6 +6623,7 @@ async function runCli() {
         return { kind: 'review-hold', reason: 'unsatisfied review hold (review:pending/review:human/review:changes)' };
       if (numberingWithdrawalOwed(c.repo || localSlug, c.num))
         return { kind: 'numbering', reason: 'numbering re-stamp withdrawal owed' };
+      if (isPriorityLabels(c.prLabels)) mergeStrategy.priorityReserveStamp(c, c.listedHeadSha || c.headSha);
       if (throughput.value.overlapFirst) {
         const hold = mergeStrategy.queueOverlapHold(c, c.listedHeadSha || c.headSha);
         if (hold) {
@@ -6632,7 +6634,7 @@ async function runCli() {
           return hold;
         }
       }
-      if (!isLocalRepo(c.repo)) {
+      if (!isLocalRepo(c.repo) || isPriorityLabels(c.prLabels)) {
         try { await mergeStrategy.requestRedTeamWhileDeferred(c, c.listedHeadSha || c.headSha); }
         catch { /* Request failure must never change the decision. */ }
       }
