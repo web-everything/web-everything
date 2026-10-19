@@ -197,3 +197,18 @@ describe('replayDedupe (we:scripts/operations/card-dedupe-replay.mjs) — a past
       .toMatchObject({ mentions: 0, filed: 2 });
   });
 });
+
+
+it('PR-hosted reader merges per-raise records without treating them as cards', () => {
+  const rel = 'backlog/x1abcde-prevention.md';
+  const raise = '- Also raised by o/r#77 (finding 1: `we:scripts/extra.mjs:4` — Add a regression test) · key `pr-key`';
+  const exec = (cmd, args) => {
+    if (args[0] === 'pr') return JSON.stringify([{ number: 5, headRefName: 'lane/card-batch-prevention-3',
+      files: [{ path: rel }, { path: 'backlog/raised-by/x1abcde/77-raise.md' }] }]);
+    return args[1].includes('/raised-by/') ? `${raise}\n` : card({ id: 'x1abcde', items: [PROBE_TEST] }).text;
+  };
+  const cards = readPrHostedCards({ exec, cwd: '/l' });
+  expect(cards).toHaveLength(1);
+  expect(cards[0].items).toHaveLength(2);
+  expect(cards[0].items[1].file).toBe('scripts/extra.mjs');
+});

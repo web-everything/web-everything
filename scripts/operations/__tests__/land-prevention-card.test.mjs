@@ -11,6 +11,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, existsSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { readRaisedBy, raisedByFile } from '../../lib/raised-by.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -265,7 +266,7 @@ describe('landPreventionCard — dedupe before filing', () => {
   });
   const cleanup = () => rmSync(lane, { recursive: true, force: true });
 
-  it('a duplicate becomes an "Also raised by" line on the open card: no file-item, the edit lands through the same gate + PR', async () => {
+  it('A1 duplicate creates one raise file and leaves the parent byte-identical', async () => {
     const acquire = setup();
     try {
       const { exec, calls } = scriptedExec([acquire, 'added-card', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'labelled', 'released']);
@@ -278,14 +279,36 @@ describe('landPreventionCard — dedupe before filing', () => {
       expect(batch).not.toHaveBeenCalled();
       expect(result).toMatchObject({ ok: true, step: 'done', num: null, rel: null, pr: 5555, mentions: 1 });
       expect(calls.some((c) => c.args.includes('file-item'))).toBe(false);
-      expect(calls[1].args).toEqual(['-C', lane, 'add', '--', REL]);
+      expect(calls[1].args.slice(0, 4)).toEqual(['-C', lane, 'add', '--']);
+      expect(calls[1].args[4]).toMatch(/^backlog\/raised-by\/4706\//);
       const after = readFileSync(join(lane, REL), 'utf8');
-      expect(after).toContain('## Also raised by');
-      expect(after).toContain('- Also raised by o/r#77 (finding 1: `we:scripts/review-ledger-check.mjs:44` — ');
-      // The filing's key is now on the existing card, so the approval filer's on-disk lookup finds it on a retry.
-      expect(after).toContain('approval-prevention-key:o/r#77@abc');
+      expect(after).toBe(cardText('open'));
+      expect(readRaisedBy('4706', lane)).toHaveLength(1);
+      expect(readRaisedBy('4706', lane)[0].line).toContain('approval-prevention-key:o/r#77@abc');
       expect(written.find(({ p }) => p.endsWith('commit-msg.txt')).c.split('\n')[0]).toMatch(/^WE #4706: prevention — also raised: /);
       expect(calls[4].args.find((a) => a.startsWith('--ref='))).toBe('--ref=lane/prevention-card-test');
+      const retry = scriptedExec([acquire, 'released']);
+      const writeAgain = vi.fn();
+      const again = await landPreventionCard(input(), { exec: retry.exec, dedupe, write: () => {}, writeFile: writeAgain });
+      expect(again).toMatchObject({ ok: true, step: 'mentioned' });
+      expect(writeAgain).not.toHaveBeenCalled();
+      expect(readRaisedBy('4706', lane)).toHaveLength(1);
+      expect(readFileSync(join(lane, REL), 'utf8')).toBe(cardText('open'));
+    } finally { cleanup(); }
+  });
+
+  it('dry-run lists the exact new file without acquiring a lane or modifying the parent', async () => {
+    setup();
+    try {
+      const exec = vi.fn();
+      const write = vi.fn();
+      const result = await landPreventionCard({ ...input(), dryRun: true, root: lane }, { exec, write, dedupe });
+      expect(result).toMatchObject({ ok: true, step: 'dry-run', modifies: [] });
+      expect(result.creates).toHaveLength(1);
+      expect(result.creates[0]).toMatch(/^backlog\/raised-by\/4706\//);
+      expect(exec).not.toHaveBeenCalled();
+      expect(readFileSync(join(lane, REL), 'utf8')).toBe(cardText('open'));
+      expect(readRaisedBy('4706', lane)).toEqual([]);
     } finally { cleanup(); }
   });
 
@@ -303,7 +326,8 @@ describe('landPreventionCard — dedupe before filing', () => {
         writeFile: (p, c, e) => { if (p.startsWith(lane)) writeFileSync(p, c, e); },
       });
       expect(result).toMatchObject({ ok: true, step: 'done', rel: 'backlog/9001-file-the-prevention.md', mentions: 1 });
-      expect(readFileSync(join(lane, REL), 'utf8')).toContain('## Also raised by');
+      expect(readFileSync(join(lane, REL), 'utf8')).toBe(cardText('open'));
+      expect(readRaisedBy('4706', lane)).toHaveLength(1);
       expect(batch).not.toHaveBeenCalled();
       expect(calls.some(({ args }) => args.includes('file-item'))).toBe(true);
       expect(calls.some(({ args }) => args.includes('open-pr'))).toBe(true);
