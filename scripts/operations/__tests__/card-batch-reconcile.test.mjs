@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { retireBatch } from '../card-batch-io.mjs';
 import { reconcileCardBatches, resolveReconcileIntervalMin, main } from '../card-batch-reconcile.mjs';
 
 const roots = [];
@@ -11,17 +12,20 @@ function fixture() {
   const stateDir = mkdtempSync(join(tmpdir(), 'batch-reconcile-')); roots.push(stateDir);
   const path = join(stateDir, 'org-repo-prevention.json');
   const state = { seq: 9, batchRef: 'lane/card-batch-prevention-9', headSha: 'a'.repeat(40),
-    repo: 'org/repo', kind: 'prevention', sealedAt: '2026-10-18T12:00:00Z', pr: 272, members: [] };
+    repo: 'org/repo', kind: 'prevention', sealedAt: '2026-10-18T12:00:00Z', pr: 272, seal: { step: 'label-on-green' }, members: [] };
   writeFileSync(path, JSON.stringify(state));
   return { stateDir, path, state, seal: vi.fn(async () => []), drain: vi.fn(), log: () => {} };
 }
 
 describe('reconcileCardBatches', () => {
-  it.each(['OPEN', 'unreadable', 'unknown'])('keeps %s state untouched', async status => {
-    const f = fixture(); const before = readFileSync(f.path, 'utf8');
+  it.each(['OPEN', 'unreadable', 'unknown', null, undefined, '', 'merged', 'wrong-pr', 'wrong-branch'])('keeps %s state untouched', async status => {
+    const f = fixture(); f.state.terminalPrState = 'MERGED'; writeFileSync(f.path, JSON.stringify(f.state));
+    const before = readFileSync(f.path, 'utf8');
     const results = await reconcileCardBatches({ ...f, gh: async () => {
       if (status === 'unreadable') throw Error('offline');
-      return JSON.stringify({ state: status });
+      return JSON.stringify({ number: status === 'wrong-pr' ? 999 : 272,
+        headRefName: status === 'wrong-branch' ? 'other' : 'lane/card-batch-prevention-9',
+        state: ['wrong-pr', 'wrong-branch'].includes(status) ? 'MERGED' : status });
     } });
     expect(results[0]).toMatchObject({ action: 'refuse', reason: 'batch-sealed' });
     expect(readFileSync(f.path, 'utf8')).toBe(before);
@@ -32,10 +36,10 @@ describe('reconcileCardBatches', () => {
   it.each(['identity', 'lease', 'expired'])('preserves the %s guard', async scenario => {
     const f = fixture();
     if (scenario === 'identity') { f.state.repo = 'wrong/repo'; writeFileSync(f.path, JSON.stringify(f.state)); }
-    const gh = vi.fn(async () => '{"state":"MERGED"}');
+    const gh = vi.fn(async () => '{"number":272,"headRefName":"lane/card-batch-prevention-9","state":"MERGED"}');
     let clock = 100;
     if (scenario === 'lease') writeFileSync(`${f.path}.lock`, JSON.stringify({ token: 'other', expiresAt: 1000 }));
-    if (scenario === 'expired') gh.mockImplementation(async () => { clock = 1000; return '{"state":"MERGED"}'; });
+    if (scenario === 'expired') gh.mockImplementation(async () => { clock = 1000; return '{"number":272,"headRefName":"lane/card-batch-prevention-9","state":"MERGED"}'; });
     const before = readFileSync(f.path, 'utf8');
     await reconcileCardBatches({ ...f, gh, clock: () => clock, leaseMs: 50 });
     expect(readFileSync(f.path, 'utf8')).toBe(before);
@@ -44,7 +48,7 @@ describe('reconcileCardBatches', () => {
   it('continues past corrupt states and never scans sealed archives', async () => {
     const f = fixture(); writeFileSync(join(f.stateDir, 'aaa.json'), '{');
     mkdirSync(join(f.stateDir, 'sealed')); writeFileSync(join(f.stateDir, 'sealed', 'bad.json'), '{');
-    const results = await reconcileCardBatches({ ...f, gh: async () => '{"state":"MERGED"}' });
+    const results = await reconcileCardBatches({ ...f, gh: async () => '{"number":272,"headRefName":"lane/card-batch-prevention-9","state":"MERGED"}' });
     expect(results.map(result => result.action)).toEqual(['error', 'retired']);
     expect(JSON.parse(readFileSync(f.path))).toMatchObject({ seq: 9, lastSealedState: expect.any(String) });
     expect(f.seal).toHaveBeenCalledOnce();
@@ -94,3 +98,12 @@ it('reports drain and seal failures independently', async () => {
 it('defaults the interval when settings cannot be read', () => {
   expect(resolveReconcileIntervalMin({ read: () => { throw Error('unreadable'); } })).toBe(5);
 });
+
+it.each(['OPEN', 'MERGED', 'CLOSED', null, undefined, 'UNKNOWN'])(
+  'the archive writer refuses an unverified terminalPrState hint %s', terminalPrState => {
+    const f = fixture(); const before = readFileSync(f.path, 'utf8');
+    expect(() => retireBatch(f.path, f.state, { repo: 'org/repo', kind: 'prevention', held: () => true, terminalPrState }))
+      .toThrow('batch-sealed');
+    expect(readFileSync(f.path, 'utf8')).toBe(before);
+    expect(existsSync(join(f.stateDir, 'sealed'))).toBe(false);
+  });

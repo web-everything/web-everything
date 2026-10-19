@@ -1485,6 +1485,7 @@ export async function speculateRedTeam({
     if (typeof onReserved === 'function') {
       try { onReserved({ callId, provider, model, effort, rev, reservedAt: new Date(io.now()).toISOString() }); } catch { /* best effort */ }
     }
+
     if (record && post) {
       try { io.redTeamStatus?.({ repo, pr, loopPayload: { findings: { read } }, status: 'running' }); }
       catch (e) { io.log(`red-team status: ${e.message}`); }
@@ -1599,7 +1600,7 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
     let rowsWritten = 0;
     let delegationTrial = 'not-delegated';
     let comment = { status: 'not-posted', reason: 'the red team did not run cleanly' };
-    if (ran) {
+    if (ran && redTeamOwedFor(loopPayload)) {
       ({ rowsWritten, delegationTrial, comment } = await finishRedTeamEffects({
         pr, repo, rev, title: pass.title, callId, provider, model, findings, recheckStatus, foldedVerdict, builder, records, seatRow: row, post, record,
       }, io));
@@ -1608,7 +1609,7 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
       try { io.append(row); rowsWritten = 1; } catch (e) { io.log(`red team: evidence row (${row.seat}) NOT written — ${e.message}`); }
     }
 
-    if (record && post) {
+    if (record && post && redTeamOwedFor(loopPayload)) {
       try { io.redTeamStatus?.({ repo, pr, loopPayload, status: 'finished', result: 'ran' }); }
       catch (e) { io.log(`red-team status: ${e.message}`); }
     }
@@ -1631,14 +1632,15 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
 export async function finishSpeculativeRedTeam({ pr, repo, loopPayload, pass, env = process.env, post = true } = {}, io = createRedTeamIo({ env })) {
   try {
     if (!redTeamEnabled(env)) return { status: 'disabled', reason: `${RED_TEAM_ENV}=${env?.[RED_TEAM_ENV] ?? ''} ${EXTRA_SEATS_ENV}=${env?.[EXTRA_SEATS_ENV] ?? ''}`.trim() };
-    if (!redTeamPanelSeatOwed(loopPayload, env) && !redTeamOwedFor(loopPayload)) return { status: 'not-owed', reason: notOwedReason(loopPayload) };
+    if (!redTeamOwedFor(loopPayload)) return { status: 'not-owed', reason: notOwedReason(loopPayload) };
     if (redTeamPanelSeatOwed(loopPayload, env) && pass?.status === 'prior-row'
       && pass.readFingerprint === redTeamReadFingerprint(loopPayload?.findings?.read)) {
       const records = io.readRecords();
       const prior = verifiedPriorRedTeamRow(records, { repo, pr, rev: pass.rev, env });
       if (prior) {
-        const resumed = await resumeRedTeam({ pr, repo, rev: pass.rev, title: loopPayload.findings.read.title,
-          prior, records, post, record: loopPayload?.replay !== true }, io);
+        const resumed = redTeamOwedFor(loopPayload) ? await resumeRedTeam({ pr, repo, rev: pass.rev, title: loopPayload.findings.read.title,
+          prior, records, post, record: loopPayload?.replay !== true }, io)
+          : { rowsWritten: 0, delegationTrial: 'not-accepted', comment: { status: 'not-posted', reason: 'review not accepted' } };
         // Resume reports effects, but the panel also needs the saved verdict and re-check evidence.
         return { ...resumed, status: 'ran', rev: pass.rev, callId: prior.callId, provider: prior.provider, model: prior.model,
           findings: prior.findings, recheckStatus: prior.recheckStatus,

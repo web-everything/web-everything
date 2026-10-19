@@ -1,6 +1,6 @@
 // @vitest-environment node
 /** Real Git admission probes: remote trees, crash recovery and durable state, with no host repository writes. */
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -138,23 +138,39 @@ function mutantAdmission(f) {
   return `const logs = [];
     const result = await io.admitCard(${JSON.stringify(input)}, {
       stateDir: ${JSON.stringify(f.stateDir)}, remote: 'origin', clock: () => ${f.now()},
-      gh: async () => '{"state":"CLOSED"}', log: line => logs.push(line),
+      gh: async () => '{"number":5272,"headRefName":"lane/card-batch-prevention-1","state":"CLOSED"}', log: line => logs.push(line),
     });
     console.log(JSON.stringify({ result, logs }));`;
 }
 
 describe('durable card batch IO', () => {
+  it('cannot retire an incomplete seal even when GitHub would report merged', async () => {
+    const f = fixture(); await admitCard(f.card(), f.options);
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272, seal: { step: 'ready' } }));
+    const before = readFileSync(f.statePath), gh = vi.fn(async () => JSON.stringify({ state: 'MERGED' }));
+    expect(await admitCard(f.card('5193'), { ...f.options, gh })).toEqual({ action: 'refuse', reason: 'batch-sealed' });
+    expect(gh).not.toHaveBeenCalled(); expect(readFileSync(f.statePath)).toEqual(before);
+  });
+  it.each([{ number: 999, headRefName: 'lane/card-batch-prevention-1', state: 'MERGED' },
+    { number: 5272, headRefName: 'lane/other', state: 'CLOSED' }])('requires the exact recorded sealed PR identity: %j', async view => {
+    const f = fixture(); await admitCard(f.card(), f.options);
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272, seal: { step: 'label-on-green' } }));
+    const before = readFileSync(f.statePath);
+    expect(await admitCard(f.card('5193'), { ...f.options, gh: async () => JSON.stringify(view), log: () => {} }))
+      .toEqual({ action: 'refuse', reason: 'batch-sealed' });
+    expect(readFileSync(f.statePath)).toEqual(before); expect(existsSync(join(f.stateDir, 'sealed'))).toBe(false);
+  });
   it.each(['MERGED', 'OPEN', 'CLOSED', 'unreadable'])('dedupes a sealed %s batch member before looking up GitHub', async status => {
     const f = fixture();
     const input = f.card();
     const original = await admitCard(input, f.options);
-    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272, seal: { step: 'label-on-green' } }));
     const before = readFileSync(f.statePath);
     let calls = 0;
     const result = await admitCard(input, { ...f.options, log: () => {}, gh: async () => {
       calls++;
       if (status === 'unreadable') throw new Error('unreadable');
-      return JSON.stringify({ state: status });
+      return JSON.stringify({ number: 5272, headRefName: 'lane/card-batch-prevention-1', state: status });
     } });
     expect(result).toMatchObject({ action: 'dedupe', member: original.member });
     expect(calls).toBe(0);
@@ -167,12 +183,12 @@ describe('durable card batch IO', () => {
     const f = fixture();
     const input = f.card();
     await admitCard(input, f.options);
-    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272, seal: { step: 'label-on-green' } }));
     const before = readFileSync(f.statePath);
     const foreign = git(f.remote, ['commit-tree', `${f.ref}^{tree}`, '-p', f.head(), '-m', 'unrelated commit']).trim();
     git(f.remote, ['update-ref', f.ref, foreign]);
     let calls = 0;
-    expect(await admitCard(input, { ...f.options, gh: async () => { calls++; return '{"state":"MERGED"}'; }, log: () => {} }))
+    expect(await admitCard(input, { ...f.options, gh: async () => { calls++; return '{"number":5272,"headRefName":"lane/card-batch-prevention-1","state":"MERGED"}'; }, log: () => {} }))
       .toEqual({ action: 'refuse', reason: 'head-mismatch' });
     expect(calls).toBe(0);
     expect(readFileSync(f.statePath)).toEqual(before);
@@ -183,13 +199,13 @@ describe('durable card batch IO', () => {
     const f = fixture();
     const first = f.card();
     await admitCard(first, f.options);
-    const sealed = { ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272, seal: { step: 'ready' } };
+    const sealed = { ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272, seal: { step: 'label-on-green' } };
     writeFileSync(f.statePath, JSON.stringify(sealed));
     const calls = [];
-    const options = { ...f.options, gh: async args => { calls.push(args); return JSON.stringify({ state: status }); }, log: () => {} };
+    const options = { ...f.options, gh: async args => { calls.push(args); return JSON.stringify({ number: 5272, headRefName: 'lane/card-batch-prevention-1', state: status }); }, log: () => {} };
     const next = f.card('5193');
     expect(await admitCard(next, options)).toMatchObject({ action: 'admit', batchRef: 'lane/card-batch-prevention-2' });
-    expect(calls).toEqual([['pr', 'view', '5272', '--repo', 'org/repo', '--json', 'state']]);
+    expect(calls).toEqual([['pr', 'view', '5272', '--repo', 'org/repo', '--json', 'number,state,headRefName']]);
     expect(JSON.parse(readFileSync(join(f.stateDir, 'sealed/org-repo-1-prevention.json')))).toMatchObject(sealed);
     if (status === 'CLOSED') {
       expect(JSON.parse(readFileSync(join(f.stateDir, 'pending-prevention/5192.json')))).toMatchObject({
@@ -208,9 +224,9 @@ describe('durable card batch IO', () => {
     const first = f.card();
     await admitCard(first, f.options);
     const committed = f.bytes(first.cardPath).toString('utf8');
-    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272, seal: { step: 'label-on-green' } }));
     writeFileSync(join(f.laneDir, first.cardPath), 'modified worktree content\n');
-    expect((await admitCard(f.card('5193'), { ...f.options, gh: async () => '{"state":"CLOSED"}', log: () => {} })).action).toBe('admit');
+    expect((await admitCard(f.card('5193'), { ...f.options, gh: async () => '{"number":5272,"headRefName":"lane/card-batch-prevention-1","state":"CLOSED"}', log: () => {} })).action).toBe('admit');
     expect(JSON.parse(readFileSync(join(f.stateDir, 'pending-prevention/5192.json'), 'utf8')).content).toBe(committed);
   });
 
@@ -222,12 +238,12 @@ describe('durable card batch IO', () => {
   ])('closed recovery refuses invalid evidence: %s', async scenario => {
     const f = fixture();
     await admitCard(f.card(), f.options);
-    const sealed = { ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 };
+    const sealed = { ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272, seal: { step: 'label-on-green' } };
     recoveryEvidence(f, sealed, scenario);
     writeFileSync(f.statePath, JSON.stringify(sealed));
     const before = readFileSync(f.statePath);
     const head = f.head();
-    expect(await admitCard(f.card('5193'), { ...f.options, gh: async () => '{"state":"CLOSED"}', log: () => {} }))
+    expect(await admitCard(f.card('5193'), { ...f.options, gh: async () => '{"number":5272,"headRefName":"lane/card-batch-prevention-1","state":"CLOSED"}', log: () => {} }))
       .toEqual({ action: 'refuse', reason: 'batch-sealed' });
     expect(readFileSync(f.statePath)).toEqual(before);
     expect(f.head()).toBe(head);
@@ -238,11 +254,11 @@ describe('durable card batch IO', () => {
   it.each(['MERGED', 'CLOSED', 'OPEN', 'unreadable'])('logs retirement and held recovery outcomes: %s', async status => {
     const f = fixture();
     await admitCard(f.card(), f.options);
-    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272, seal: { step: 'label-on-green' } }));
     const lines = [];
     const result = await admitCard(f.card('5193'), { ...f.options, log: line => lines.push(line), gh: async () => {
       if (status === 'unreadable') throw new Error('lookup failed');
-      return JSON.stringify({ state: status });
+      return JSON.stringify({ number: 5272, headRefName: 'lane/card-batch-prevention-1', state: status });
     } });
     const outcome = status === 'CLOSED' ? 'retired and re-spooled' : status === 'MERGED' ? 'retired'
       : status === 'OPEN' ? 'kept sealed and held' : 'recovery unreadable; kept sealed and held';
@@ -253,12 +269,12 @@ describe('durable card batch IO', () => {
   it.each(['MERGED', 'CLOSED'])('keeps %s recovery held when the lookup loses its lease', async status => {
     const f = fixture();
     await admitCard(f.card(), f.options);
-    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272, seal: { step: 'label-on-green' } }));
     const before = readFileSync(f.statePath);
     const successor = JSON.stringify({ token: 'successor', expiresAt: f.now() + 60000 });
     expect(await admitCard(f.card('5193'), { ...f.options, gh: async () => {
       writeFileSync(`${f.statePath}.lock`, successor);
-      return JSON.stringify({ state: status });
+      return JSON.stringify({ number: 5272, headRefName: 'lane/card-batch-prevention-1', state: status });
     } })).toEqual({ action: 'refuse', reason: 'lease-held' });
     expect(readFileSync(f.statePath)).toEqual(before);
     expect(readFileSync(`${f.statePath}.lock`, 'utf8')).toBe(successor);
@@ -269,11 +285,11 @@ describe('durable card batch IO', () => {
   it.each(['MERGED', 'CLOSED'])('slow %s recovery cannot write after lease expiry', async status => {
     const f = fixture();
     await admitCard(f.card(), f.options);
-    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272, seal: { step: 'label-on-green' } }));
     const before = readFileSync(f.statePath);
     expect(await admitCard(f.card('5193'), { ...f.options, gh: async () => {
       f.tick(60_000);
-      return JSON.stringify({ state: status });
+      return JSON.stringify({ number: 5272, headRefName: 'lane/card-batch-prevention-1', state: status });
     } })).toEqual({ action: 'refuse', reason: 'lease-held' });
     expect(readFileSync(f.statePath)).toEqual(before);
     expect(readdirSync(f.stateDir)).toEqual(['org-repo-prevention.json']);
@@ -282,7 +298,7 @@ describe('durable card batch IO', () => {
   it.each(['ETIMEDOUT', 'ENOBUFS'])('a bounded GitHub lookup failure keeps recovery held: %s', async code => {
     const f = fixture();
     await admitCard(f.card(), f.options);
-    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272, seal: { step: 'label-on-green' } }));
     const before = readFileSync(f.statePath);
     const calls = [];
     const gh = args => batchIO.defaultGh(args, (_command, _args, options) => {
@@ -308,9 +324,9 @@ describe('durable card batch IO', () => {
     const archive = join(f.stateDir, 'sealed');
     mkdirSync(archive);
     const path = join(archive, 'org-repo-prevention.json');
-    writeFileSync(path, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    writeFileSync(path, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272, seal: { step: 'label-on-green' } }));
     const before = readFileSync(path);
-    expect(await admitCard(f.card('5193'), { ...f.options, stateDir: archive, gh: async () => '{"state":"MERGED"}', log: () => {} }))
+    expect(await admitCard(f.card('5193'), { ...f.options, stateDir: archive, gh: async () => '{"number":5272,"headRefName":"lane/card-batch-prevention-1","state":"MERGED"}', log: () => {} }))
       .toEqual({ action: 'refuse', reason: 'batch-sealed' });
     expect(readFileSync(path)).toEqual(before);
     expect(readdirSync(archive)).toEqual(['org-repo-prevention.json']);
@@ -337,7 +353,7 @@ describe('durable card batch IO', () => {
     const first = f.card();
     await admitCard(first, f.options);
     const committed = f.bytes(first.cardPath).toString('utf8');
-    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272, seal: { step: 'label-on-green' } }));
     writeFileSync(join(f.laneDir, first.cardPath), 'worktree mutant\n');
     const probe = mutantProbe(f, [[
       "const bytes = git(['show', `${member.commitSha}:${data.cardPath}`], { encoding: 'buffer' });",
@@ -352,7 +368,7 @@ describe('durable card batch IO', () => {
   it('mutation gate distinguishes removal of recovery path restrictions', async () => {
     const f = fixture();
     await admitCard(f.card(), f.options);
-    const sealed = { ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 };
+    const sealed = { ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272, seal: { step: 'label-on-green' } };
     recoveryEvidence(f, sealed, 'non-card path');
     writeFileSync(f.statePath, JSON.stringify(sealed));
     const probe = mutantProbe(f, [
@@ -380,13 +396,13 @@ describe('durable card batch IO', () => {
   it.each(['MERGED', 'CLOSED', 'OPEN', 'unreadable'])('mutation gate detects removal of %s outcome logging', async status => {
     const f = fixture();
     await admitCard(f.card(), f.options);
-    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272, seal: { step: 'label-on-green' } }));
     const target = ['MERGED', 'CLOSED'].includes(status) ? '\n      log(`card-batch ${retired.batchRef}'
       : status === 'OPEN' ? '\n      log(`card-batch ${recorded.batchRef}' : '\n    log(`card-batch ${recorded.batchRef}';
     const probe = mutantProbe(f, [[target, target.replace('log(', 'void(')]],
-      mutantAdmission(f).replace("gh: async () => '{\"state\":\"CLOSED\"}'",
+      mutantAdmission(f).replace(/gh: async \(\) => '[^']*'/,
         status === 'unreadable' ? "gh: async () => { throw new Error('unreadable'); }"
-          : `gh: async () => ${JSON.stringify(JSON.stringify({ state: status }))}`));
+          : `gh: async () => ${JSON.stringify(JSON.stringify({ number: 5272, headRefName: 'lane/card-batch-prevention-1', state: status }))}`));
     expect(probe.result.action).toBe(['MERGED', 'CLOSED'].includes(status) ? 'admit' : 'refuse');
     expect(probe.logs).toEqual([]);
   });
@@ -394,11 +410,11 @@ describe('durable card batch IO', () => {
   it.each(['OPEN', 'error', 'truncated', 'unknown'])('keeps a sealed %s PR held without changing state', async status => {
     const f = fixture();
     await admitCard(f.card(), f.options);
-    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272, seal: { step: 'label-on-green' } }));
     const before = readFileSync(f.statePath);
     const gh = async () => {
       if (status === 'error') throw new Error('unreadable');
-      return status === 'truncated' ? '{' : JSON.stringify({ state: status });
+      return status === 'truncated' ? '{' : JSON.stringify({ number: 5272, headRefName: 'lane/card-batch-prevention-1', state: status });
     };
     expect(await admitCard(f.card('5193'), { ...f.options, gh, log: () => {} })).toEqual({ action: 'refuse', reason: 'batch-sealed' });
     expect(readFileSync(f.statePath)).toEqual(before);
@@ -409,7 +425,7 @@ describe('durable card batch IO', () => {
     const f = fixture();
     const first = f.card();
     await admitCard(first, f.options);
-    const sealed = { ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 };
+    const sealed = { ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272, seal: { step: 'label-on-green' } };
     if (scenario === 'landed') git(f.remote, ['update-ref', 'refs/heads/main', sealed.headSha]);
     if (scenario === 'missing-member') sealed.members[0].commitSha = 'a'.repeat(40);
     const pending = join(f.stateDir, 'pending-prevention');
@@ -421,7 +437,7 @@ describe('durable card batch IO', () => {
     const before = readFileSync(f.statePath);
     const result = await admitCard(f.card('5193'), { ...f.options, log: () => {}, gh: async () => {
       if (scenario === 'lease-lost') writeFileSync(`${f.statePath}.lock`, JSON.stringify({ token: 'successor', expiresAt: f.now() + 60000 }));
-      return '{"state":"CLOSED"}';
+      return '{"number":5272,"headRefName":"lane/card-batch-prevention-1","state":"CLOSED"}';
     } });
     if (scenario === 'landed') {
       expect(result.action).toBe('admit');
@@ -436,7 +452,7 @@ describe('durable card batch IO', () => {
   it('drains 327 spooled cards through admission into batches of ten and an idempotent tail', async () => {
     const f = fixture();
     await admitCard(f.card('old'), f.options);
-    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272, seal: { step: 'label-on-green' } }));
     const pendingDir = join(f.stateDir, 'pending-prevention');
     mkdirSync(pendingDir);
     for (let i = 0; i < 327; i++) {
@@ -448,12 +464,12 @@ describe('durable card batch IO', () => {
     const batch = async input => {
       const cardId = input.cardPath.split('/')[1].split('-')[0];
       const result = await admitCard({ ...input, cardId, baseSha: f.baseSha }, { ...f.options,
-        gh: async () => '{"state":"MERGED"}', log: () => {} });
+        gh: async () => JSON.stringify({ number: f.state().pr, headRefName: f.state().batchRef, state: 'MERGED' }), log: () => {} });
       if (result.action !== 'admit') return { batched: false };
       if (result.state.members.length === 10) {
         sizes.push(10);
         // Inject the seal worker's terminal state; no PR publication in this fixture.
-        writeFileSync(f.statePath, JSON.stringify({ ...result.state, sealedAt: new Date(f.now()).toISOString(), pr: 5272 + result.state.seq }));
+        writeFileSync(f.statePath, JSON.stringify({ ...result.state, sealedAt: new Date(f.now()).toISOString(), pr: 5272 + result.state.seq, seal: { step: 'label-on-green' } }));
       }
       return { batched: true, batchRef: result.batchRef };
     };
@@ -724,7 +740,7 @@ describe('periodic terminal batch recovery with real Git', () => {
     const f = fixture();
     const first = f.card();
     await admitCard(first, f.options);
-    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272 }));
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272, seal: { step: 'label-on-green' } }));
     if (status === 'MERGED') {
       const pending = join(f.stateDir, 'pending-prevention'); mkdirSync(pending);
       writeFileSync(join(pending, '5193.json'), JSON.stringify({ cardId: '5193', rel: 'backlog/5193-card.md',
@@ -733,7 +749,7 @@ describe('periodic terminal batch recovery with real Git', () => {
     let drained = 0;
     let flushed = false;
     const results = await reconcileCardBatches({ ...f.options, laneDir: f.laneDir, now: f.now(),
-      gh: async () => JSON.stringify({ state: status }), log: () => {},
+      gh: async () => JSON.stringify({ number: 5272, headRefName: 'lane/card-batch-prevention-1', state: status }), log: () => {},
       drain: async (input, options) => {
         expect(input.drainPending).toBe(true);
         expect(f.state()).toMatchObject({ seq: 1, lastSealedState: expect.any(String) });

@@ -294,6 +294,15 @@ describe('dispatchReviewJob — what the daemon calls', () => {
     expect(readJobRecord('review-10', dir)).toMatchObject({ slug: 'review-10', pid: 4242, pr: 10 });
   });
 
+  it('carries an internal drain request to the existing job without adding a CLI operation', () => {
+    const request = { repo: REPO, pr: 10, head: 'a'.repeat(40), requestedAt: 1 };
+    const spawned = [];
+    dispatchReviewJob({ ...base, dir, drainRedTeamRequest: request,
+      resolveSettingsEnv: () => null, spawnJob: o => { spawned.push(o); return 4242; } });
+    expect(JSON.parse(spawned[0].env.WE_DRAIN_RED_TEAM_REQUEST)).toEqual(request);
+    expect(spawned[0].argv.slice(1)).toEqual(['run', '--pr=10', `--repo=${REPO}`]);
+  });
+
   it('declines to spawn while a live job holds the PR, or during the lane cool-off', () => {
     writeJobRecord({ slug: 'review-10', pid: 555, pr: 10, repo: REPO, startedAt: new Date().toISOString(), cwd: '/x' }, dir);
     const spawnJob = () => { throw new Error('must not spawn'); };

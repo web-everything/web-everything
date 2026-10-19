@@ -178,6 +178,71 @@ describe('drain throughput', () => {
       await handle.catchUp(); expect(spawnImpl).toHaveBeenCalledTimes(2);
     } finally { handle.kill(); }
   });
+  it.each(['retryAt', 'firstPendingAt', 'requestAttemptedAt', 'retry-deadline', 'pending-deadline', 'request-deadline', 'unreadable', 'invalid-deadline', 'enqueue-retry', 'child-deadline'])('reruns catch-up for durable red-team scheduling: %s', async change => {
+    let time = 1_000;
+    const head = 'a'.repeat(40);
+    const pending = { headSha: head, retryAt: 601_000, firstPendingAt: 1_000, requestAttemptedAt: 1_000 };
+    const state = { redTeamPending: { 'cwd#1': pending } };
+    if (change === 'child-deadline') pending.retryAt = 41_000;
+    const pr = { state: 'OPEN', headRefOid: head, labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [] };
+    const spawnImpl = vi.fn(() => {
+      const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.kill = vi.fn();
+      queueMicrotask(() => {
+        if (change === 'child-deadline') pending.retryAt = 121_000;
+        child.stdout.emit('data', JSON.stringify({ considered: 1, enqueueOutcomes: [{ num: 1, outcome: 'not-enqueued', kind: 'red-team-pending' }] }));
+        child.emit('close', 0);
+      });
+      return child;
+    });
+    const handle = createEnqueueOnEvent({ cwd: process.cwd(), localSlug: 'o/r', env: {}, now: () => time, log: () => {}, spawnImpl,
+      resolveThroughput: () => ({ value: { catchUpSkipUnchangedHolds: true, catchUpSkipMaxMin: 15 } }),
+      resolveSetting: () => ({ enabled: true, debounceSeconds: 0, catchUp: { enabled: true, intervalMinutes: 1, concurrency: 2, maxQueued: 3 } }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [{ num: 1, inQueue: false, isDraft: false }] }),
+      readCapacity: () => ({ capacity: 3 }), readPriorities: () => ({}), readPr: async () => pr,
+      readHoldEvidence: () => ({ recorded: false }), readHoldQueueState: () => state,
+      resolveQueueSafety: () => ({ value: { redTeamPendingMaxMin: 4, redTeamRequestCooldownMin: 3 } }),
+      readQueueDepth: async () => ({ ok: true, queued: 0, queuedNums: [] }),
+    });
+    try {
+      await handle.catchUp(); expect(spawnImpl).toHaveBeenCalledTimes(1);
+      time = 61_000;
+      await handle.catchUp(); expect(spawnImpl).toHaveBeenCalledTimes(1);
+      if (['retryAt', 'firstPendingAt', 'requestAttemptedAt'].includes(change)) pending[change] += 1;
+      if (change === 'retry-deadline') { pending.requestedAt = 1_000; time = pending.retryAt; }
+      if (change === 'pending-deadline') { pending.requestedAt = 1_000; time = 241_000; }
+      if (change === 'request-deadline') time = 181_000;
+      if (change === 'enqueue-retry') state.enqueueFailures = { 'o/r#1': { headSha: head, retryAt: 121_000 } };
+      if (change === 'unreadable') state.unreadable = true;
+      if (change === 'invalid-deadline') pending.retryAt = 'unknown';
+      time = Math.max(time, 121_000);
+      await handle.catchUp(); expect(spawnImpl).toHaveBeenCalledTimes(2);
+    } finally { handle.kill(); }
+  });
+  it.each([
+    { retryAt: 101_000, firstPendingAt: 1_000, requestAttemptedAt: 1_000, due: 101_000 },
+    { retryAt: 601_000, firstPendingAt: 1_000, requestedAt: 1_000, due: 241_000 },
+    { retryAt: 601_000, firstPendingAt: 1_000, requestAttemptedAt: 1_000, due: 181_000 },
+  ])('ends the memo at the earliest scheduling deadline: $due', ({ due, ...pending }) => {
+    const pr = { headRefOid: 'a', labels: [] };
+    const evidence = { scheduling: { redTeamPending: { headSha: 'a', ...pending }, redTeamPendingMaxMin: 4, redTeamRequestCooldownMin: 3 } };
+    const previous = { kind: 'red-team-pending', recordedAt: 1_000, signature: holdSignature(pr, evidence) };
+    expect(unchangedHold(previous, pr, evidence, { now: due - 1 })).toBe(true);
+    expect(unchangedHold(previous, pr, evidence, { now: due })).toBe(false);
+  });
+
+  it('bounds all holds by the earliest enqueue retry, TTL and overlap deadline', () => {
+    const pr = { headRefOid: 'a', labels: [] };
+    const evidence = { scheduling: { enqueueFailure: { headSha: 'a', retryAt: 201_000 } },
+      overlap: { untilMs: 301_000, state: 'OPEN', head: 'b' } };
+    const previous = { kind: 'overlap-yield', recordedAt: 1_000, signature: holdSignature(pr, evidence) };
+    expect(unchangedHold(previous, pr, evidence, { now: 200_999 })).toBe(true);
+    expect(unchangedHold(previous, pr, evidence, { now: 201_000 })).toBe(false);
+    expect(unchangedHold(previous, pr, evidence, { now: 61_000, maxMin: 1 })).toBe(false);
+    evidence.overlap.untilMs = 101_000;
+    previous.signature = holdSignature(pr, evidence);
+    expect(unchangedHold(previous, pr, evidence, { now: 101_000 })).toBe(false);
+  });
+
   it('validates the skip TTL and logs its winning source', () => {
     const log = vi.fn();
     const out = resolveDrainThroughput({ file: { drain: { catchUpSkipMaxMin: 2 } }, platform: {}, env: {}, log });

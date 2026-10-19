@@ -90,13 +90,13 @@ export function buildSkipReasons({ verdicts = [], merged = [], failedMerges = []
   // Listed ready at pass start but never landed and never reported by a bucket above. Name the cause: a couple
   // partner (same item) that did not land, else the pass simply ended before reaching it.
   for (const v of verdicts) {
-    if (v.decision !== 'merge' || !passEnded) continue;
+    if (v.decision !== 'merge') continue;
     const partner = v.item == null ? null : verdicts.find((o) => o !== v && o.item != null && String(o.item) === String(v.item)
-      && keyOf(o) !== keyOf(v) && !landed.has(keyOf(o)));
+      && keyOf(o) !== keyOf(v) && !landed.has(keyOf(o)) && (passEnded || rows.has(keyOf(o))));
     if (partner) {
       const pr = rows.get(keyOf(partner));
       put(v, 'partner-pending', `couple partner ${keyOf(partner)} did not land (${pr ? pr.kind : 'ready, not reached'}${pr?.reason ? `: ${pr.reason}` : ''})`, 'unaccounted');
-    } else {
+    } else if (passEnded) {
       put(v, 'ready-not-reached', 'ready at pass start; the pass ended before it was reached', 'unaccounted');
     }
   }

@@ -1,15 +1,69 @@
 # Testing — Three-Tier Strategy
 
+## Paused review recovery
+
+The ruling ledger omits unattempted referrals and suppresses findings after an operator verdict.
+A same-head pause can therefore need a separate report source: `pausedReviewRulingNeeded`
+reads `liveReferralState` with the gate's PR body, creation time and readable-card rule, then
+uses review-run evidence to prove the pause. Its findings flow through the existing operator
+queue and needs-you feed. Partly ruled heads list only pending findings.
+The pause notifier raises a ruling-needed notice rather than minting an automatic
+same-head wake. Historical `paused-review-auto-rearm` receipts do not reset the
+same-head counting window. Main's live-release, explicit operator events and
+bounded missing-verdict retries retain their existing eligibility. No labels change.
+Focused tests cover hold/feed/daemon integration, receipt dedupe, historical auto-rearm
+markers, reason-token holds and explicit operator wakes. No live GitHub writes are needed.
+
+## Drain red-team request recovery
+
+The review daemon reads `drain-red-team-requests` in the shared coordination root each
+pass. Requests join its existing bounded review dispatch batch; planner refusals,
+auth pause, lane capacity and the live CI/head gate still apply. A moved head is
+retired with status `stale`. Starting a detached job does not consume the request
+or spend another jury round.
+
+The job's internal request branch loads a completed `review-pr` for that exact
+repo/PR/head and feeds its pinned read to the existing `review-extra-seats` red-team
+runner. It rechecks the head and review-blocking labels before and after lane
+acquisition, retains kill switches, provider caps and the card-only exemption, and
+finishes the request only after the existing saved-result provenance writer confirms
+success. Failures remain open for retry. No operator command or operation is added.
+Focused coverage: `review-job-drain-red-team.test.mjs`, `review-job.test.mjs` and
+`skills-src/conveyor/__tests__/review-daemon.test.mjs`.
+
+Shared seat policy must not import `review-pr.mjs`: label acceptance reads that
+policy, while the operation loads the label/stack/merge graph. Vitest can wait
+indefinitely on that circular graph before collecting any tests. Keep the shared
+Antigravity env/probation policy in `review-antigravity-policy.mjs`; the operation
+re-exports the existing API. `review-referral-acceptance.test.mjs` exercises the
+label reader through Vitest as well as a fresh Node dispatch import.
+
 ## Red-team panel timing
 
 `redTeam.timing` defaults to `panel-seat`; `WE_RED_TEAM_TIMING=post-accept` exercises
 the rollback path. Legacy tests of accept-only scheduling must select that timing in
 their IO/environment fixture. The panel reuses the speculative call's pinned read and
-finishes before the job reports done, even when the jurors reject or refer to a human.
+finishes before the job reports done for accepted, owed heads. Non-accepted reviews
+cancel and discard the speculative pass in every timing mode. Panel timing never
+bypasses `redTeamOwedFor` at completion; comments, status labels, delegation trials
+and send-back effects retain the existing acceptance predicate.
 Missing/unrun seat evidence on a reviewed head stays held in drain beyond the pending
 deadline; it cannot use the never-scheduled escape or trigger a second post-accept pass.
 The focused timing, review-seat and drain-seat suites cover this boundary.
 
+
+## Paused prevention filing obligations
+
+A `prevention.filingEnabled=false` result remains a failed/paused filing. Both the spawn
+seam and detached filer persist the card input under the shared card-batch state's
+`owed-prevention/` directory. The obligation key excludes session/transport flags and includes
+source repo/PR plus the card input. Exclusive publication preserves the first record;
+completed records remain as dedupe tombstones. A subsequent landing call or the periodic
+card-batch reconcile tick uses the existing filer under an obligation lease. Only a successful
+filing (including a durable pending-card spool) marks it done; refused or failed filings stay owed.
+A detached spawn alone never completes the obligation. Replay carries the original obligation
+key across the CLI's text bounding so truncation cannot create another obligation identity.
+Use temporary `WE_CARD_BATCH_STATE_DIR` roots when testing pause/replay.
 
 ## Periodic card batch recovery
 
@@ -18,8 +72,11 @@ Health-watch samples `cardBatch.reconcileIntervalMin` through `readSettings` (po
 default 5), persists `cardBatchReconcile.completedAt`, and skips fixture-root/dry-run ticks.
 Reconciliation drains `pending-prevention` through the same lane-acquiring recovery path as
 `land-prevention-card --drain-pending` after retirement or for open slots, releasing the state
-lease before draining so admission can open sequence + 1. Terminal PR archives carry
-`terminalPrState` so the archive seal-retry scan cannot relaunch them. Its CLI dry-run only reads states.
+lease before draining so admission can open sequence + 1. Terminal retirement requires the existing completed-seal condition plus a fresh
+GitHub MERGED/CLOSED read for the recorded PR number and batch branch. Retirement
+archives the generation and logs the outcome. Terminal PR archives carry
+`terminalPrState`; an explicit seal retry revalidates that hint with GitHub before
+returning sealed. Incomplete seals remain held. Its CLI dry-run only reads states.
 Use temporary state directories, fake GitHub and local bare Git origins for these probes;
 never run a recovery test against the automation state home.
 
@@ -951,6 +1008,20 @@ npx vitest run --coverage           # coverage report
 
 ## Developing & manually testing in a lane
 
+PR ownership regressions (#5649, #5675, #5647, #5664, #5628) live in
+`scripts/conveyor/__tests__/pr-singleton-owners.test.mjs`. Reconcile (consumed by
+both the review and fix daemons) and the conveyor tick share `ci-heal-rule.mjs`;
+keep live green/pending evidence, the legacy `ci:failed` classifier guard and the
+resolved CI-heal cap intact. A timeout retry without an Actions origin falls
+through to CI-heal, and its diagnostic names that owner only when a heal is planned.
+Withdrawn drafts surface through `needsPersonRow` with an operator release command;
+they never auto-release. Missing review labels use the existing restoration pass.
+Moved agent accepts use that pass's `stale-accept` variant, a live pinned diff read
+and the existing accepted-only re-arm helper. Equal fingerprints, unreadable
+fingerprints and human clearances must never be invalidated by this recovery.
+No new thresholds are introduced: the existing CI-heal budget and
+`WE_REVIEW_LABEL_HEAL` policy remain the controls.
+
 Every edit — including an ad-hoc "just fix this one thing" — happens in an **isolated lane clone**, never the main checkout (#2123; the writer model in [platform-decisions.md#pr-flow-rollout-mechanism](platform-decisions.md#pr-flow-rollout-mechanism)). The lane trigger is *making an edit*, not *running a command*. The main checkout stays the human's — its dev server on `:3000`/`:8080` is theirs; don't build or serve into it.
 
 **1 — Pick or provision a lane** (persistent clone pool under `~/workspace/.lanes/<repo>/lane-N`, git objects shared via `--reference`, own HEAD):
@@ -1736,8 +1807,9 @@ A stable `nightly-coroner-YYYY-MM-DD` job ID and retained daily records enforce 
 without depending on health `state.json`. The next live tick catches up the most recent due night,
 including before tonight's deadline after a restart; multiple missed nights coalesce into one extraction.
 `coroner.nightly.laneWaitMs` defaults to 600000 and is passed to lane-pool's normal `--wait-ms`.
-`attempts` defaults to 3; the daemon retries the whole run with exponential backoff starting at
-`retryBackoffMin` (10 minutes). `deadlineEt` defaults to `03:30` on the following ET calendar date;
+`attempts` defaults to 1 and has a hard upper bound of 1. Invalid settings fall back to 1;
+persisted job allowances are clamped before reattachment without resetting their attempt counts.
+`retryBackoffMin` (10 minutes) remains configured but cannot authorize an extra attempt. `deadlineEt` defaults to `03:30` on the following ET calendar date;
 no attempts launch after that deadline, including late catch-up. DST uses New York wall time:
 nonexistent deadlines expire at the first valid instant after the spring-forward gap; ambiguous
 deadlines use the first occurrence. Pin ordinary, gap (multiple configured minutes), and repeated
@@ -1746,10 +1818,9 @@ Exhaustion or a missed deadline emits a deduplicated needs-you event and the `ni
 health smell, naming the job, last error and attempts. `alertAfterProbeFailures` (default 3) also
 alerts on consecutive `nightlyCoronerJob` probe errors, including exceptions before a record exists.
 This smell notifies in shadow mode. A successful probe resets the streak.
-Only the currently due night's job contributes to `alerts` and `failures`; retained failed nights
-remain historical ledger entries and feed events. Advancing to the next night clears their health
-episodes. A terminal job failure does not count as a supervisor probe error or emit a second probe
-failure event. Test this through the real job ledger and health tick, across a failed then successful
+Earlier unresolved failed nights continue to contribute to `alerts`, `failures` and the
+existing `nightlyCoronerJob` probe-error channel; a later successful night does not clear them.
+The deduplicated current-night notification supplements that channel. Test this through the real job ledger and health tick, across a failed then successful
 night and repeated later ticks; the `nightly-coroner-retained-failure` soak break preserves the incident.
 Failure feed fields are scrubbed, sanitized and bounded before append; test the raw line with a
 credential-shaped token, oversized text, line separators and bidi controls. Every configurable
@@ -2044,7 +2115,14 @@ Catch-up remembers PR holds until the live head/labels/update time, local red-te
 evidence, overlap deadline, yielded-to PR state/head, or numbering withdrawal debt
 changes. `drain.catchUpSkipMaxMin` (default 15, nonnegative minutes, source logged)
 bounds every remembered hold from the child's start time; zero disables skips.
-An expired overlap window or unknown/unreadable dependency always reruns the drain.
+The memo also includes durable queue retry state (`retryAt`, `firstPendingAt`,
+`requestAttemptedAt` and `requestedAt`) and the effective pending/request timing policy.
+It expires at the earliest queue retry, pending-health deadline, request cooldown,
+TTL or overlap deadline. Read this evidence again after the child finishes, so its
+newly persisted deadlines bound the next skip. An expired deadline or unknown/unreadable
+dependency always reruns the drain; it never clears the underlying admission hold.
+Skip-reason JSON retains `partner-pending` when a ready member's partner is held,
+including dry-run; `ready-not-reached` is reserved for a true pass end.
 Numbering withdrawal debt is process-local to the drain child: the daemon cannot
 infer clearance from its own empty memo, so numbering holds rerun unless a reader
 can supply live debt. Snapshots may seed hydration, but every catch-up child lists
@@ -2053,3 +2131,43 @@ contention retains normal retries. Carry-over
 stores only `ready-not-reached` rows beside drain queue state, never enqueued PRs or
 known holds; it orders the next full pass before couple grouping and main-fix priority.
 The focused injected-process and pure checks are in `drain-throughput.test.mjs`.
+
+### Drain recovery across review timing and clone selection
+
+A panel seat being owed is policy evidence, not proof of queued work. For an already
+accepted pinned head with no red-team attempt/result, the drain may request the ordinary
+review dispatcher only after proving no review job is active or queued. Unknown job
+reads keep the hold. Card-only producer settings and both seat kill switches still
+apply; request failures use `redTeamRequestCooldownMin`, and a successful request never
+substitutes for a usable result. The existing review-daemon consumer pins the request
+head and retains its dispatch refusals.
+
+Do not assume the drain's DATA clone is fresh: on 2026-10-18 the log selected
+`lane-1 (no-overlays)` while that checkout was 367 commits behind and its sibling CODE
+clone was current. The operator CLI fallback refuses when cwd resolves to that same
+stale checkout. Acceptance restamps select `DRAIN_DAEMON_WE_CODE_CLONE` (default:
+`code` beside `DRAIN_DAEMON_WE_CLONE`) when present, preserve the target repository cwd,
+and still run the CLI's freshness refusal. Regression homes are
+`drain-merge-strategy.test.mjs`, `merge-ai-prs-restamp-local-repo.test.mjs`, and the
+existing review-daemon request and operator-fallback suites.
+
+## Prototype guard audit verification
+
+Prevention filing pauses return `ok: false` with `skipped: true`; CLI adapters
+return nonzero and never record a filed card. Nightly coroner attempts have a hard
+maximum of one, including direct job config. Earlier failed nights remain in both
+the failure ledger and health-watch's existing probe-error channel. CI-heal requires
+a definitive red rollup; a red label alone cannot authorize dispatch, and tick
+retains its green-at-open provenance. Round-history metadata retries a head mismatch
+at most three times and preserves comments already read even if metadata remains
+unavailable. The focused regression suite is `guard-audit-regressions.test.mjs`.
+
+The Also-raised-by card resolver uses `recoveryPushContext`
+from `missing-run-push.mjs`: the owner installation token or a validated recovery
+credential is required. Pushes pin `WE_CI_PUSH_TOKEN` and clear inherited `GIT_*`
+configuration; `gitRun` must use `inheritEnv: false` for that exact environment,
+otherwise its normal merge with `process.env` restores the rejected configuration.
+Standalone red-team producers write `running` before the model call (best effort)
+when recording and posting are enabled. Card rebase skips, errors and throws all
+spend the existing unowned rebase cap. Nightly failure scans retain failed records
+of every kind alongside the nightly-only deadline check.

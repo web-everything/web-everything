@@ -63,6 +63,8 @@ import { execFile, spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveDrainThroughput, holdSignature, unchangedHold, HOLD_KINDS } from './drain-throughput.mjs';
+import { queueStatePath, readQueueState } from './drain-merge-strategy.mjs';
+import { readDrainQueueSafety } from './drain-queue-safety.mjs';
 import { classifySkipReason } from './drain-skip-reasons.mjs';
 import { readSavedRedTeamResult } from './drain-saved-red-team.mjs';
 import { readDrainRedTeamEvidence } from './drain-red-team-evidence.mjs';
@@ -497,6 +499,8 @@ export function createEnqueueOnEvent({
     ...readDrainRedTeamEvidence({ repo, pr: num, head, env }),
     saved: readSavedRedTeamResult({ repo, pr: num, head, env }),
   }),
+  readHoldQueueState = () => readQueueState(queueStatePath(env)),
+  resolveQueueSafety = () => readDrainQueueSafety({ env }),
   // Withdrawal debt lives in the drain child, not this daemon. Unknown debt must run
   // that child again; never mistake this process's empty numbering memo for clearance.
   readNumberingOwed = () => undefined,
@@ -516,7 +520,23 @@ export function createEnqueueOnEvent({
   const readMemoEvidence = async ({ repo, num, head, overlapYield }) => {
     const evidence = await readHoldEvidence({ repo, num, head });
     if (!isObj(evidence)) throw Error('hold evidence unavailable');
-    return { ...evidence, ...await readDependencies({ repo, num, overlapYield }) };
+    const state = await readHoldQueueState();
+    if (!isObj(state) || state.unreadable) throw Error('queue hold state unavailable');
+    const safety = resolveQueueSafety().value;
+    const key = `${repo || 'cwd'}#${num}`;
+    const scheduling = {
+      enqueueFailure: state.enqueueFailures?.[key] ?? null,
+      redTeamPending: state.redTeamPending?.[key] ?? null,
+      // --this-repo uses a null repo token in the child, persisted as cwd#N.
+      // Full passes use the slug; retain both so neither deadline gets hidden.
+      local: repo === localSlug ? {
+        enqueueFailure: state.enqueueFailures?.[`cwd#${num}`] ?? null,
+        redTeamPending: state.redTeamPending?.[`cwd#${num}`] ?? null,
+      } : null,
+      redTeamPendingMaxMin: safety.redTeamPendingMaxMin,
+      redTeamRequestCooldownMin: safety.redTeamRequestCooldownMin,
+    };
+    return { ...evidence, scheduling, ...await readDependencies({ repo, num, overlapYield }) };
   };
   const staged = p => {
     const s = resolvePrestageSettings({ env });
@@ -719,7 +739,7 @@ export function createEnqueueOnEvent({
           if (HOLD_KINDS.has(kind)) {
             const overlapYield = outcome?.overlapYield || hit(json?.deferred)?.overlapYield;
             try {
-              const evidence = { ...holdEvidence, ...await readDependencies({ repo: p.repo, num: p.num, overlapYield }) };
+              const evidence = await readMemoEvidence({ repo: p.repo, num: p.num, head: pr.headRefOid, overlapYield });
               lastHolds.set(p.num, { kind, overlapYield, recordedAt: startedAt, signature: holdSignature(pr, evidence) });
             } catch { lastHolds.delete(p.num); } // uncertain dependencies retry the drain
           }

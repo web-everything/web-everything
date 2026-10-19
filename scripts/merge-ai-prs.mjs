@@ -1278,9 +1278,9 @@ export function isRebaseDropCandidate(v) {
  *
  * Setting the CHILD'S cwd rather than threading a flag pins EVERY git read the CLI makes, not only the one
  * that is known about today, and leaves the operator's single-PR invocation untouched. `undefined` for a
- * local-repo PR means "inherit", which is already correct. The scripts still come from THIS checkout — the
- * path below resolves from `import.meta.url`, never from cwd. `spawn` is injected so the pinning is
- * assertable without a subprocess.
+ * local-repo PR means "inherit", which is already correct. Script selection is independent of cwd:
+ * daemon restamps prefer their gated CODE clone; other callers use this checkout. `spawn` is injected
+ * so the pinning is assertable without a subprocess.
  */
 /**
  * #1671 review finding — every internal caller of `review-set-label.mjs` needs the SINGLE-token `--repo=`
@@ -1309,12 +1309,19 @@ export function spawnReviewSetLabel({ pr, repo, to, cwd, actor, channel, reason,
   }
 }
 
-export function restampAcceptance({ pr, repo, newHead, cwd, spawn = spawnSync, localRepo = () => localRepoSlug({ cwd }) }) {
+export function restampAcceptance({ pr, repo, newHead, cwd, spawn = spawnSync, localRepo = () => localRepoSlug({ cwd }),
+  env = process.env, exists = existsSync }) {
   try {
     const target = repo || localRepo();
     if (!target) return { ok: false, reason: 'no repo to re-stamp (PR repo unset and the local repo slug unreadable)' };
+    // A no-overlay daemon pass can run from stale DATA even while its gated CODE clone is current.
+    // Select code independently of the target cwd; review-set-label still enforces its freshness refusal.
+    const drainCode = env.DRAIN_DAEMON_WE_CODE_CLONE
+      || (env.DRAIN_DAEMON_WE_CLONE && join(dirname(env.DRAIN_DAEMON_WE_CLONE), 'code'));
+    const drainEntry = drainCode && resolve(drainCode, 'scripts/review-set-label.mjs');
+    const entry = drainEntry && exists(drainEntry) ? drainEntry : new URL('./review-set-label.mjs', import.meta.url).pathname;
     const r = spawn(process.execPath, [
-      new URL('./review-set-label.mjs', import.meta.url).pathname,
+      entry,
       String(pr), `--repo=${target}`, '--to=restamp', '--actor=drain',
       '--channel=drain-rebase', `--reason=head moved to ${newHead} by this drain's own content-preserving rebase`,
       // #x9krtkb (bug 2) — `newHead` used to reach the child ONLY inside `--reason`'s free text, which

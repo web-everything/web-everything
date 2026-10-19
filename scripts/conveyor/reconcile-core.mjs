@@ -123,6 +123,8 @@ const DEFAULT_FIXER_LADDER = Object.freeze({
 });
 import { OPERATOR_ANSWER_MARKER, isOperatorAnswerStandDownSuperseded, latestOperatorAnswer } from './stand-down-answer-core.mjs';
 import { classifyPr } from '../progress-board.mjs';
+import { ciHealOwed } from './ci-heal-rule.mjs';
+import { staleAcceptanceOwed } from './rearm-review.mjs';
 import { reduceCheckState, CI_TRUTH_EXCLUDED_CHECKS } from '../operations/pr-status.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { isForeignCompletionSessionId, sanitizeDeniedCommand } from '../operations/completion-record.mjs';
@@ -2614,7 +2616,7 @@ export function planReconcile({
     // PR is owed the same neutral `review:pending` (the promote-draft half strips the contradictory
     // `ready-to-merge` when it writes). Policy `reviewLabelHeal` (env `WE_REVIEW_LABEL_HEAL`): `stuck` (default)
     // adds this variant; `green` keeps only the branch above; `off` disables both.
-    if (reviewLabelHeal === 'stuck' && !pr?.isDraft && (pr?.state ?? 'OPEN') === 'OPEN' && withPhase.check === 'red'
+    if (reviewLabelHeal === 'stuck' && !pr?.isDraft && (pr?.state ?? 'OPEN') === 'OPEN' && ['red', 'green'].includes(withPhase.check)
         && String(pr?.headRefName ?? '').startsWith('lane/')
         && withPhase.labels.includes('ready-to-merge')
         && !withPhase.labels.some((l) => l.startsWith('review:'))
@@ -2622,9 +2624,18 @@ export function planReconcile({
         && greenSettledForRestoreGrace(pr?.statusCheckRollup, now)) {
       dispatch.push({
         ...base, ...withPhase, kind: 'restore-review-label', label: 'review:pending', variant: 'stuck',
-        why: 'ready-to-merge lane PR with a red required check and no review:* label — the drain only scores '
+        why: 'ready-to-merge lane PR with settled checks and no review:* label — the drain only scores '
           + 'review escalation for merge candidates, so nothing would ever review it; apply review:pending',
       });
+      continue;
+    }
+
+    // #5628: a recorded accept on an older head needs the existing guarded re-arm,
+    // then the ordinary review dispatcher. The write half compares recorded
+    // fingerprints before re-arming; a read miss never revokes an acceptance.
+    if (reviewLabelHeal !== 'off' && withPhase.check === 'green' && staleAcceptanceOwed(pr, { requireProof: false })) {
+      dispatch.push({ ...base, ...withPhase, kind: 'restore-review-label', variant: 'stale-accept',
+        label: 'review:pending', why: 'head moved past its accept — verify coverage, then guarded re-arm hands a stale accept to independent review' });
       continue;
     }
 
@@ -2668,7 +2679,8 @@ export function planReconcile({
             ? 'ci-heal handed this head to a human, so one advisory AI review runs so the human gets its verdict; it never accepts a review:human PR'
             : 'review holds handed this head to review, so one advisory AI review supplies its verdict; it never accepts a review:human PR' } });
     };
-    const ciRepairOwed = phase === 'ci-red' || (phase === 'needs-human' && check.state === 'red');
+    const ciRepairOwed = ['ci-red', 'needs-human'].includes(phase)
+      && ciHealOwed({ state: pr.state, labels: pr.labels, ci: check.state, phase });
     if (!(advisoryReviewOnHumanHandoff === 'on' && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) && ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
         && reviewCi.affected.every(row => row.name === 'review-gate')) {
       refuse('review-ci', { ...withPhase, ci: reviewCi, why: 'required review-gate must succeed before review; resolve the review-dependent required-check configuration' });
@@ -3092,8 +3104,9 @@ export function planReconcile({
           continue;
         }
       }
-      if (pr.timeoutRetry && !pr.timeoutRetry.eligible) refusals.push({ kind: 'timeout-retry-ineligible', prNumber,
-        why: `PR #${prNumber}: ${pr.timeoutRetry.reason}` });
+      const retryRefusal = pr.timeoutRetry && !pr.timeoutRetry.eligible
+        ? { kind: 'timeout-retry-ineligible', prNumber, why: `PR #${prNumber}: ${pr.timeoutRetry.reason}` } : null;
+      if (retryRefusal) refusals.push(retryRefusal);
       // Live PR #4631 — only REQUIRED failures are healed or named as the failure; a non-required red (`merge-gate`,
       // red by design until #4715) is reported beside it, never healed. The budget is the heals since the PR's last
       // non-mechanical head ({@link ciHealBudgetResetAt}), not every heal it ever had.
@@ -3108,7 +3121,7 @@ export function planReconcile({
       const refunded = healBudget.windowRefunded;
       const healFacts = { failingRequiredChecks: failing.required, nonRequiredRed: failing.nonRequired, ciHealBudget: healBudget.log };
       const refund = refunded > 0 ? { refunded } : {};
-      if (ciHealAttempts >= ciHealCap) {
+      if (!ciHealOwed({ state: pr.state, labels: pr.labels, ci: check.state, phase, attempts: ciHealAttempts, cap: ciHealCap })) {
         refuse('cap-exhausted', {
           ...withPhase, ...refund, ...healFacts, attempts: ciHealAttempts, cap: ciHealCap,
           why: `the PR's own durable CI-heal count is ${ciHealAttempts} against a cap of ${ciHealCap} — auto-heal is exhausted here and a person must take it`,
@@ -3135,6 +3148,7 @@ export function planReconcile({
             + ` repair this required-check failure any further; a person must take it over. Last failure: ${lastFailureReason}${reported}`,
         });
       } else {
+        if (retryRefusal) retryRefusal.owner = 'ci-heal';
         dispatch.push({
           ...base, ...withPhase, ...refund, ...healFacts, ...owedMainRuleFact, kind: 'ci-heal', attempts: ciHealAttempts,
           ...(fixTiming.joinCiAndReview && readiness.reviewFindings ? { reviewFixAttempts: roundAttempts() } : {}),

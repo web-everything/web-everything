@@ -35,7 +35,31 @@ export function holdSignature(pr, evidence) {
     updatedAt: pr.updatedAt, comments: pr.comments, reviews: pr.reviews, evidence })).digest('hex');
 }
 export function unchangedHold(previous, pr, evidence, { now = Date.now(), maxMin = 15 } = {}) {
+  if (!Number.isFinite(now) || !Number.isFinite(maxMin) || maxMin <= 0) return false;
   if (!Number.isFinite(previous?.recordedAt) || now < previous.recordedAt || now - previous.recordedAt >= maxMin * 60_000) return false;
+  // Scheduling is evidence too: never let a memo outlive the earliest retry,
+  // pending-health deadline, request cooldown, TTL, or overlap window. Unknowns run the drain.
+  const scheduling = evidence?.scheduling;
+  if (scheduling) {
+    const { redTeamPendingMaxMin, redTeamRequestCooldownMin } = scheduling;
+    for (const entry of [scheduling, scheduling.local].filter(Boolean)) {
+      const { enqueueFailure, redTeamPending } = entry;
+      if (enqueueFailure && (enqueueFailure.headSha !== pr?.headRefOid
+        || !Number.isFinite(enqueueFailure.retryAt) || now >= enqueueFailure.retryAt)) return false;
+      if (redTeamPending) {
+        if (redTeamPending.headSha !== pr?.headRefOid || !Number.isFinite(redTeamPending.retryAt)
+          || !Number.isFinite(redTeamPending.firstPendingAt) || !Number.isFinite(redTeamPendingMaxMin)
+          || redTeamPendingMaxMin <= 0) return false;
+        const deadlines = [redTeamPending.retryAt, redTeamPending.firstPendingAt + redTeamPendingMaxMin * 60_000];
+        if (redTeamPending.requestedAt == null && redTeamPending.requestAttemptedAt != null) {
+          if (!Number.isFinite(redTeamPending.requestAttemptedAt) || !Number.isFinite(redTeamRequestCooldownMin)
+            || redTeamRequestCooldownMin <= 0) return false;
+          deadlines.push(redTeamPending.requestAttemptedAt + redTeamRequestCooldownMin * 60_000);
+        }
+        if (deadlines.some(deadline => !Number.isFinite(deadline) || now >= deadline)) return false;
+      }
+    }
+  }
   if (previous.kind === 'overlap-yield' && (!Number.isFinite(evidence?.overlap?.untilMs)
     || now >= evidence.overlap.untilMs || evidence.overlap.state !== 'OPEN' || !evidence.overlap.head)) return false;
   if (previous.kind === 'numbering' && evidence?.numberingOwed !== true) return false;

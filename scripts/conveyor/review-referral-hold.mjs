@@ -11,12 +11,14 @@ import { liveReferralState } from '../lib/referral-live-context.mjs';
 import { resolveRunsDir, REVIEW_RUN_ID_PREFIX, tryReadRun } from '../operations/run-store.mjs';
 import { sameRepo, parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
-import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
 import { resolveReferralSafetySettings } from '../lib/review-settings.mjs';
 import { parseLatestHumanClearedSha, parseReviewedSha } from '../lib/review-escalation.mjs';
 
+// Match we:scripts/conveyor/rearm-review.mjs#REARM_COMMENT_MARKER locally: importing it closes a daemon boot cycle.
+// The equality test keeps this first-line matcher tied to the canonical marker.
+export const REFERRAL_REARM_COMMENT_MARKER = '🔧 conveyor fix — re-armed for re-review';
 export const REFERRAL_HOLD_MARKER = 'review paused:';
 export const GH_LIST_COMMENT_CAP = 100;
 export const PENDING_REASON_TOKENS = Object.freeze(new Set(['author-stamp-missing']));
@@ -175,7 +177,8 @@ function wakeEvents(pr, run) {
       const r = operatorRuling.record;
       return r && sameRepo(r.repo, run.repo) && r.pr === run.pr && r.head === run.head ? [{ at, kind: 'ruling' }] : [];
     }
-    if (body.startsWith(REARM_COMMENT_MARKER) || body.startsWith('🔁 review — changes requested')) return [{ at, kind: 'fresh' }];
+    if (body.includes('<!-- paused-review-auto-rearm:')) return [];
+    if (body.startsWith(REFERRAL_REARM_COMMENT_MARKER) || body.startsWith('🔁 review — changes requested')) return [{ at, kind: 'fresh' }];
     // An operator reply is a request to reconsider, never authority to clear the human gate.
     return isOperatorAuthored(c) ? [{ at, kind: 'fresh' }] : [];
   });
@@ -229,7 +232,8 @@ function evaluateReferralHold(pr, runs, { repo, now = Date.now(), env = process.
     // Read exactly as the gate reads it (readable-card rule, author stamp, PR body/createdAt): a release the
     // gate would immediately re-park loops the review on every tick, which this hold exists to prevent.
     const live = liveReferralState(pr, { repo, pr: Number(pr.number), cardReadable });
-    if (!live.pending.length && live.records.some(r => r.head === pr.headRefOid
+    if (!live.pending.length
+      && live.records.some(r => r.head === pr.headRefOid
       && r.repo === repo && r.pr === Number(pr.number))) return { hold: null, released: 'live-release' };
   }
   const why = `review paused: ${last.count} referrals need a ruling; it resumes on a new push, a ruling, or a send-back`;
@@ -289,6 +293,44 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
     + (noVerdict ? ` (no verdict ever landed on the PR for those runs, and the ${VERDICT_RETRY_EXTRA} automatic re-runs are spent: a person must look at why the review's write-back fails)` : '');
   return { kind: 'same-head', head, episode: hash([repo, pr.number, head, wake, 'same-head']), count,
     why, retryAt: null, persistenceFailed: false, exhausted: false };
+}
+
+/** Historical auto-rearm receipt, retained for readers; it no longer creates a wake. */
+export const pausedReviewRearmMarker = head => `<!-- paused-review-auto-rearm: ${head} -->`;
+
+/** Pure classification of a paused PR using the gate's live state, including unattempted records and reason holds.
+ * Same-head pauses need a person even if all finding rulings are already recorded.
+ */
+export function classifyPausedReview(pr, live) {
+  if (!sha(pr?.headRefOid)) return { action: 'none', findings: [] };
+  const records = live.records.filter(r => r.head === pr.headRefOid);
+  const all = [...new Map(records.flatMap(r => r.referrals.map(f => [f.key, {
+    key: f.key, file: f.finding?.file ?? null, line: f.finding?.line ?? null,
+    summary: f.finding?.summary ?? '',
+  }]))).values()];
+  const pending = [...new Map(live.pendingFindings.map(f => [f.key, {
+    key: f.key, file: f.file, line: f.line, summary: f.summary,
+  }])).values()];
+  if (live.pending.length) return { action: 'raise', findings: pending.length ? pending : all, reasons: live.pendingReasons };
+  if (!records.length || !all.length) return { action: 'none', findings: [] };
+  // Ruled findings need an explicit operator re-arm; never spend a new same-head window.
+  return { action: 'raise', findings: all };
+}
+
+/** Shared paused-referral report source. The ordinary ledger deliberately filters unattempted records and
+ * operator-verdict send-backs; a later same-head pause still owes visibility of what the live gate holds.
+ */
+export function pausedReviewRulingNeeded(pr, { repo, readRuns = readReviewRunEvidence,
+  cardReadable = ref => referralCardReadable(ref, REPO_ROOT) } = {}) {
+  const live = liveReferralState(pr, { repo, pr: Number(pr.number), cardReadable });
+  if (!live.records.some(r => r.head === pr.headRefOid)) return null;
+  const decision = classifyPausedReview(pr, live);
+  if (decision.action !== 'raise') return null;
+  const runs = readRuns();
+  if (!(pr.referralHold?.head === pr.headRefOid || decideReferralHold(pr, runs, { repo })
+    || decideSameHeadHold(pr, runs, { repo }))) return null;
+  return { head: pr.headRefOid, since: null,
+    findings: decision.findings.map(f => ({ ...f, reason: 'paused-referral' })) };
 }
 
 /** Block-ruled referrals on the PR's CURRENT head, once EVERY referral on it is ruled (none pending): the PR is owed a
@@ -375,13 +417,18 @@ export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), readRu
 /** Reserve before sending: an ambiguous transport failure must not create duplicate comments on every tick.
  * Known pre-send rate-limit failures can retry with bounded backoff; all other failures remain visible locally.
  */
-export function notifyReferralHold({ repo, prNumber, hold, comments = [],
+export function notifyReferralHold({ repo, prNumber, hold, comments = [], pr,
   dir = join(dirname(resolveRunsDir()), 'review-referral-notices'), now = Date.now(),
   log = line => console.error(line),
   post = body => execFileSyncThrottled('gh', ['pr', 'comment', String(prNumber), '--repo', repo, '--body', body],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }),
 }) {
-  if (hold.kind === 'same-head') return;
+  let paused;
+  if (pr?.headRefOid === hold.head) {
+    paused = classifyPausedReview(pr, liveReferralState(pr, { repo, pr: Number(prNumber),
+      cardReadable: ref => referralCardReadable(ref, REPO_ROOT) }));
+  }
+  if (hold.kind === 'same-head' && (!paused || paused.action === 'none')) return;
   const marker = `<!-- review-referral-hold: ${hold.episode} -->`;
   const path = join(dir, `${hash([repo, prNumber, hold.episode])}.json`);
   mkdirSync(dir, { recursive: true });
@@ -401,7 +448,7 @@ export function notifyReferralHold({ repo, prNumber, hold, comments = [],
   // "N referrals need a ruling" named nothing). A read failure just leaves the old, shorter notice.
   let findings = '';
   try {
-    const need = rulingNeeded({ headRefOid: hold.head, comments }, { cardReadable: ref => referralCardReadable(ref, REPO_ROOT) });
+    const need = paused?.action === 'raise' ? paused : rulingNeeded({ headRefOid: hold.head, comments }, { cardReadable: ref => referralCardReadable(ref, REPO_ROOT) });
     if (need) findings = `\n\nWaiting on your ruling (block, card or not-real):\n${need.findings
       .map(f => `- \`${f.file ?? 'no file'}${f.line ? `:${f.line}` : ''}\` — ${f.summary}`).join('\n')}`;
   } catch { /* the short notice still posts */ }
