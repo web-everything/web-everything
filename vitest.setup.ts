@@ -141,6 +141,10 @@ if (hermetic) {
 
 process.env.WE_UNDER_TEST = '1';
 
+// Admission tests and their child CLIs must not wait on the machine running the suite.
+// Tests of overload set their own reading; production ignores this Vitest-only seam.
+if (process.env.WE_TEST_HOST_LOAD1 === undefined) process.env.WE_TEST_HOST_LOAD1 = '0';
+
 // #3383: isolate tests from home AND from each other's durable action holds.
 const ownsCoordinationRoot = process.env.WE_COORDINATION_ROOT === undefined;
 if (ownsCoordinationRoot) process.env.WE_COORDINATION_ROOT = lazyRoot('coord');

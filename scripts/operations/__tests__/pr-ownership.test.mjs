@@ -6,7 +6,8 @@ import { createPrOwnershipReader, buildPrToCardMap, cardForPr } from '../pr-owne
 import { createRegistry, isReadOnlyOperation } from '../registry.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { runOperationCli } from '../cli-adapter.mjs';
-import { runReconcilePass } from '../../conveyor/reconcile-pass.mjs';
+import { runReconcilePass as runReconcilePassWithTiming } from '../../conveyor/reconcile-pass.mjs';
+const runReconcilePass = (options = {}) => runReconcilePassWithTiming({ ...options, env: { WE_REVIEW_START_AFTER: 'ci-green', WE_FIX_JOIN_CI_AND_REVIEW: 'false', ...options.env } });
 import { bindAgents } from '../../conveyor/reconcile-core.mjs';
 
 const NOW = Date.parse('2026-09-24T20:00:00.000Z');

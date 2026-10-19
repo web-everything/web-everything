@@ -74,4 +74,5 @@ Live before/after on a real card: run `node we:scripts/check-backlog-item.mjs 40
 
 ## Also raised by
 
-- Also raised by web-everything/web-everything#5493 (finding 1: `we:backlog/xkt0ix9-fixer-treats-operator-decisions-scope-baseline-and-main-regr.md:31` — Add a check:standards rule that fails when a card whose scope touches scripts/conveyor/ still has 'TODO' on the Untrusted-text or Who-wrote-it edge-case lines, before status can move from open to in-progress.) · key `approval-prevention-key:web-everything/web-everything#5493@3364a0972aa0a6d7b47220c80623103aa4f697c9`
+- Also raised by web-everything/web-everything#5493 (finding 1: `we:backlog/6194-fixer-treats-operator-decisions-scope-baseline-and-main-regr.md:31` — Add a check:standards rule that fails when a card whose scope touches scripts/conveyor/ still has 'TODO' on the Untrusted-text or Who-wrote-it edge-case lines, before status can move from open to in-progress.) · key `approval-prevention-key:web-everything/web-everything#5493@3364a0972aa0a6d7b47220c80623103aa4f697c9`
+- Also raised by web-everything/web-everything#5525 (finding 7: `we:backlog/6219-overlap-yield-held.md:1` — The already-filed check:standards rule 4858 should fail a card in scope scripts/conveyor/ that still has TODO on the Untrusted-text or Who-wrote-it lines before it can be active.)

@@ -1,0 +1,4 @@
+{
+  "$comment": "Unconfirmed build launches on the same card/base: standard -> platform build -> tool build -> env. WE_BUILD_UNCONFIRMED_LAUNCH_MAX (positive integer, default 2); WE_BUILD_UNCONFIRMED_COOLDOWN_MIN (positive minutes, default 120).",
+  "build": { "unconfirmedLaunchMax": 2, "unconfirmedCooldownMin": 120 }
+}

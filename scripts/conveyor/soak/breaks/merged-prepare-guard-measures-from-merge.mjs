@@ -58,10 +58,12 @@ export default {
     const tick = await runBuildDispatchTick({ live: true, effects });
     // A large held backlog must not consume the reader's budget before the actual late-ordered pick.
     const rows = Array.from({ length: 60 }, (_, i) => ({ num: String(8000 + i), bornAs: `xabc${String(i).padStart(3, '0')}` }));
-    let searches = 0;
-    const reader = createPrepareStatusReader({ exec: cmd => {
+    const searches = [];
+    // Both identities require branch and title searches. Give only the actual pick enough budget;
+    // scanning held cards or repeating the planning queries at launch must still fail this probe.
+    const reader = createPrepareStatusReader({ maxPrListingCalls: 4, exec: (cmd, args) => {
       if (cmd !== 'gh') throw new Error(`unexpected ${cmd} in listing-only probe`);
-      searches++;
+      searches.push(args[args.indexOf('--search') + 1]);
       return '[]';
     } });
     const volumeClaims = [], volumeDispatches = [];
@@ -78,7 +80,9 @@ export default {
   },
   judge(report) {
     const problems = [];
-    if (report.volume.searches !== 3 || report.volume.claimed.join() !== '8059'
+    const expectedSearches = ['head:lane/8059', 'head:lane/xabc059',
+      'in:title "prepare" "8059"', 'in:title "prepare" "xabc059"'];
+    if (report.volume.searches.join('\n') !== expectedSearches.join('\n') || report.volume.claimed.join() !== '8059'
       || report.volume.dispatchCount !== 1 || report.volume.launched.join() !== '8059' || report.volume.refused.length) {
       problems.push('held backlog exhausted the prepare listing budget before the actual pick');
     }

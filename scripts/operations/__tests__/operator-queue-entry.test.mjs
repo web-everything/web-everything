@@ -67,9 +67,12 @@ const stage = (root) => {
   copyFileSync(join(dirname(LEAF), 'daemon-last-good.mjs'), join(root, 'lib/daemon-last-good.mjs'));
   // item 68a — the health parsers strip the daemon-log timestamp via the import-free `../lib/log-timestamp.mjs`.
   copyFileSync(join(dirname(LEAF), 'log-timestamp.mjs'), join(root, 'lib/log-timestamp.mjs'));
-  // card x1b8hlo — the queue reads the red-team gate's light leaf (it imports only `marker-authorship.mjs`, staged
-  // above). Its settings file is optional: absent, the built-in default stands.
+  // The red-team disposition reader also imports carry-marker and human-clearance readers.
+  // Link review-escalation like gh-throttle above so its larger graph resolves from the source tree;
+  // the queue's optional readers remain absent from this partial copy.
   copyFileSync(join(dirname(LEAF), 'red-team-gate.mjs'), join(root, 'lib/red-team-gate.mjs'));
+  copyFileSync(join(dirname(LEAF), 'review-verdict-carried-marker.mjs'), join(root, 'lib/review-verdict-carried-marker.mjs'));
+  symlinkSync(join(dirname(LEAF), 'review-escalation.mjs'), join(root, 'lib/review-escalation.mjs'));
 };
 
 let dir;
@@ -91,7 +94,7 @@ describe('operator-queue CLI entry guard', () => {
     stage(join(dir, 'real'));
     symlinkSync(join(dir, 'real'), join(dir, 'link'));
     const result = run(join(dir, 'link', 'operations', 'operator-queue.mjs'));
-    expect(result.status).toBe(0);
+    expect(result.status, result.stderr).toBe(0);
     expect(result.stdout).toContain('NEEDS YOU');
   });
 
@@ -99,6 +102,7 @@ describe('operator-queue CLI entry guard', () => {
     stage(join(dir, 'real'));
     symlinkSync(join(dir, 'real', 'operations', 'operator-queue.mjs'), join(dir, 'real', 'operations', 'alias.mjs'));
     const result = run(`${dir}/real//operations//alias.mjs`);
+    expect(result.status, result.stderr).toBe(0);
     expect(result.stdout).toContain('NEEDS YOU');
   });
 
@@ -122,7 +126,7 @@ describe('operator-queue CLI entry guard', () => {
     const result = spawnSync(process.execPath,
       [join(dir, 'real', 'operations', 'operator-queue.mjs'), '--repo=x/y', '--json'],
       { encoding: 'utf8', env: { ...env, WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'throttle') } });
-    expect(result.status).toBe(0);
+    expect(result.status, result.stderr).toBe(0);
     const report = JSON.parse(result.stdout);
     expect(report.errors).toContainEqual(expect.stringMatching(/operator send-back check unavailable:.*operator-send-backs\.mjs/));
     expect(report.ready).toEqual([]);

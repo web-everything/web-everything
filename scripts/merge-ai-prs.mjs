@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
+import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
 import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, refreshHeldHead, retainApprovedHumanQueueHead } from './lib/approved-human-surface-hold.mjs';
 /**
@@ -186,6 +188,7 @@ import { deliveredItemNumsFromPr, deliveredHashFromPr, declaredResolvedIdsFromPr
 // leaf so plateau-app's drain-daemon guard can mirror it (and a cross-repo contract test can pin the mirror
 // to this source). See scripts/lib/reconcile-predicate.mjs for the full rationale.
 import { parseArgvFlags, reconcileWouldRunFor } from './lib/reconcile-predicate.mjs';
+import { createPrestageCache, resolvePrestageSettings, prestageCi, prestageRequiredChecks, labelSignature, enqueuePrestage } from './lib/drain-prestage.mjs';
 import { reviewCiGate } from './lib/review-ci-gate.mjs';
 import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, handleRequiredWorkflowsRefusal, resolveRefreshOnStaleMergeGate, handleStaleMergeGate } from './lib/merge-queue-enqueue.mjs';
 import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
@@ -203,6 +206,7 @@ export { mapWithConcurrency } from './lib/drain-concurrency.mjs';
 import { runLedgerShadow, formatShadowLine } from './lib/drain-ledger-shadow.mjs'; // #5444 — ledger gate in SHADOW beside the labels; journals, never decides
 import { drainReviewGateFact, readDrainLedgerSnapshot, recordDrainLedgerFacts } from './lib/drain-ledger-facts.mjs';
 import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overlapRowKey, readyToMergeLabelTimeMs } from './conveyor/land-overlap-yield.mjs'; // + readyToMergeLabelTimeMs: the drain order's ready-at (same cached label read) // #4308 — the land-time overlap-yield planner (see planLabelDrain's own `overlapContext` param)
+import { filterEnqueueableOverlapRows, resolveOverlapYieldOnlyToEnqueueableSetting, formatOverlapYieldOnlyToEnqueueableSetting } from './conveyor/overlap-yield-enqueueable.mjs';
 import { rankByDeliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES } from './lib/delivery-priority.mjs'; // drain order (2026-10-10): the shared P0-P4 class rule
 import { readDeliveryPrioritySettings } from './conveyor/delivery-priority-shadow.mjs'; // drain order: the shared aging/cap settings (platform preference `deliveryPriority`)
 import { execFileSyncThrottled } from './lib/gh-throttle.mjs'; // drain order: the operator-override labeler read
@@ -954,6 +958,10 @@ export function attachLiveFixClaim(data, { claimKey, readClaim }) {
   return data;
 }
 
+/** Whether a live fix claim (or an unreadable claim store) holds the PR right now. */
+export const prestageFixClaimHeld = (num, { claimKey, readClaim = readLiveFixClaim }) =>
+  !!attachLiveFixClaim({ number: Number(num) }, { claimKey, readClaim }).fixClaim?.who;
+
 /**
  * Classify one PR into a merge/skip verdict. Pure — no gh calls. Returns
  *   { num, title, decision: 'merge'|'skip', reason, aiGenerated, certifyLabel, testGreen, state, mergeable }.
@@ -988,7 +996,9 @@ export function attachLiveFixClaim(data, { claimKey, readClaim }) {
  * `checking` forever with no reason. `defaultBranch` is the caller's per-repo resolution (never a literal
  * `'main'`); when it or `baseRefName` is unknown the arm is inert and the chain behaves exactly as before.
  */
-export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-merge', allowPendingReview = false, defaultBranch = null, blockOnCodeQL = DRAIN_GATE_SETTINGS.drainBlocksOnCodeQL, queueRequiredChecks = null } = {}) {
+export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-merge', allowPendingReview = false, defaultBranch = null, blockOnCodeQL = DRAIN_GATE_SETTINGS.drainBlocksOnCodeQL, queueRequiredChecks = null, preparePendingCi = false } = {}) {
+  const prestagePendingCi = preparePendingCi && hasLabel(pr, REVIEW_LABELS.accepted) && hasLabel(pr, 'ready-to-merge') && !pr.isDraft
+    && prestageCi(pr, prestageRequiredChecks(queueRequiredChecks, requiredCheck)) === 'pending';
   const num = pr?.number;
   const title = pr?.title || '';
   const aiGenerated = isAiGeneratedPr(pr);
@@ -1070,13 +1080,13 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   // #3674 — ahead of the required-check arm, so a non-default base is held with its real reason (even when `test`
   // is green) instead of waiting on a check that never runs there.
   else if (offDefaultBase) { decision = 'skip'; reason = `base is not ${defaultBranch || 'the default branch'} (${base})`; }
-  else if (!testGreen) { decision = 'skip'; reason = `required check "${requiredCheck}" is not green`; }
+  else if (!testGreen && !prestagePendingCi) { decision = 'skip'; reason = `required check "${requiredCheck}" is not green`; }
   else if (blockOnCodeQL && isCodeQLFailed(pr)) { decision = 'skip'; codeqlBlocked = true; reason = `CodeQL check failed (new code-scanning alerts in the changed code) — refusing to land; fix the alert and re-push (drainBlocksOnCodeQL)`; }
   else if (mergeable !== 'MERGEABLE') { decision = 'skip'; reason = `not mergeable (mergeable=${mergeable || 'UNKNOWN'})`; }
   // The reason names the ACTUAL state: the old one-size text always said "BEHIND⇒needs rebase", so a PR that was
   // only BLOCKED (checks red/pending, ci-heal already running: #4235, 2026-10-07) was classified `behind` in the
   // skip-reasons log and read as an unowned rebase.
-  else if (!landableState && !relieveQueueBlocked()) { decision = 'skip'; reason = unlandableStateReason(state) + queueBlocker; }
+  else if (!landableState && !(prestagePendingCi && state === 'BLOCKED' && !['CHANGES_REQUESTED', 'REVIEW_REQUIRED'].includes(pr.reviewDecision)) && !relieveQueueBlocked()) { decision = 'skip'; reason = unlandableStateReason(state) + queueBlocker; }
   // #2324 — refuse to land a PR with an empty/whitespace description, same rule pr-land.mjs enforces before
   // labelling (PR #206 landed bodyless). Checked before the review hold so the more actionable reasons win.
   else if (!hasNonEmptyBody(pr?.body)) { decision = 'skip'; reason = 'empty/whitespace description — refusing to land it (add a real summary of what changed and why; #2324)'; }
@@ -1088,7 +1098,7 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   // held ⇒ a no-op for the common case (#2820-review-fix finding 3 — "checked LAST so earlier reasons win").
   else if (reviewUncleared) { decision = 'skip'; reviewHeld = true; reason = `unsatisfied review hold ("${heldLabel}") present without review:accepted — refusing to merge regardless of "${trustLabel}" (#2820)`; }
   if (queueBlockedRelief && decision === 'merge') reason += `; BLOCKED only by the required merge queue (all ${queueRequiredChecks.length} required checks green) — enqueue`;
-  return { num, title, decision, reason, aiGenerated, certifyLabel, humanCleared, reviewHeld, codeqlBlocked, testGreen, state, mergeable, offDefaultBase,
+  return { num, title, decision, reason, aiGenerated, certifyLabel, humanCleared, reviewHeld, codeqlBlocked, testGreen, ...(prestagePendingCi ? { prestagePendingCi: true } : {}), state, mergeable, offDefaultBase,
     ...(queueBlockedRelief && decision === 'merge' ? { queueBlockedRelief: true } : {}),
     ...(pr?.requiredCheckReadError ? { requiredCheckReadError: pr.requiredCheckReadError } : {}) };
 }
@@ -1146,15 +1156,17 @@ export function isTransientUnknownMergeability(verdict) {
   return !!verdict && verdict.decision !== 'merge' && /^not mergeable \(mergeable=UNKNOWN\)/.test(String(verdict.reason || ''));
 }
 
-/** Setting: how many extra re-reads a transient UNKNOWN gets, and the wait before each (bounded: ≤ 4 × 3 s). */
-export const UNKNOWN_MERGEABILITY_RETRY = Object.freeze({ retries: 4, delayMs: 3000 });
-/** Env knob: an integer 0–10 overrides `retries` (0 = the old single read). Anything else keeps the default. */
+/** Setting: how many extra re-reads a transient UNKNOWN gets, and the wait before each (bounded: ≤ 3 × 20 s by default). */
+export const UNKNOWN_MERGEABILITY_RETRY = Object.freeze({ retries: 3, delayMs: 20000 });
+/** Env knob: an integer 0–3 overrides `retries` (0 = the old single read). Anything else keeps the default. */
 export const UNKNOWN_MERGEABILITY_RETRY_ENV = 'WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES';
-export function resolveUnknownMergeabilityRetry(env = {}) {
+export function resolveUnknownMergeabilityRetry(env = {}, layers = {}) {
+  // `layers` ({ tool, platform }) pins the cascade's file layers for a test; production reads the settings files.
+  const setting = { ...UNKNOWN_MERGEABILITY_RETRY, delayMs: resolveHandoffSettings('drain', { env, ...layers }).value.mergeableUnknownRepollSec * 1000 };
   const raw = env?.[UNKNOWN_MERGEABILITY_RETRY_ENV];
-  if (typeof raw !== 'string' || !/^\d+$/.test(raw.trim())) return UNKNOWN_MERGEABILITY_RETRY;
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw.trim())) return setting;
   const n = Number(raw.trim());
-  return n <= 10 ? { ...UNKNOWN_MERGEABILITY_RETRY, retries: n } : UNKNOWN_MERGEABILITY_RETRY;
+  return n <= 3 ? { ...setting, retries: n } : setting;
 }
 
 /**
@@ -1165,10 +1177,47 @@ export function resolveUnknownMergeabilityRetry(env = {}) {
 export async function revalidateWithUnknownRetry({ read, opts, setting = UNKNOWN_MERGEABILITY_RETRY, sleep }) {
   let verdict = revalidateForMerge(await read(), opts);
   for (let attempt = 0; attempt < setting.retries && isTransientUnknownMergeability(verdict); attempt += 1) {
-    sleep(setting.delayMs);
+    await sleep(setting.delayMs);
     verdict = revalidateForMerge(await read(), opts);
   }
   return verdict;
+}
+
+/** The pass's ordering: UNKNOWN listings are re-polled BEFORE the head-bound open-PR context is collected. */
+export async function repollThenCollectContext({ repoll, collect }) {
+  await repoll();
+  return collect();
+}
+
+/**
+ * Apply one PR's ci-lifecycle label plan: removals, then additions. Each addition goes through
+ * `writeLabelWithHandoff`, so a `ci:failed` written here wakes the fix daemon right after the write lands.
+ * Best effort: a failed write is skipped (the next pass retries). Returns whether every write landed.
+ */
+export function applyCiLifecycleLabelPlan({ plan, pr, repo = null, slug = repo, exec = execFileSync, signal = signalFixDispatch }) {
+  const flag = repo ? ['--repo', repo] : [];
+  let ok = true;
+  for (const rm of plan.toRemove) { try { exec('gh', ['pr', 'edit', String(pr), ...flag, '--remove-label', rm], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { ok = false; } }
+  for (const add of plan.toAdd) {
+    try { writeLabelWithHandoff({ repo: slug, pr, label: add, write: () => exec('gh', ['pr', 'edit', String(pr), ...flag, '--add-label', add], { stdio: ['ignore', 'ignore', 'pipe'] }) }, signal); } catch { ok = false; }
+  }
+  return ok;
+}
+
+/** Refresh UNKNOWN listing facts before reading head-bound manifests/commits or classifying the pass. */
+export async function repollUnknownListings({ prsByRepo, read, sleep, setting = UNKNOWN_MERGEABILITY_RETRY, concurrency = 4 }) {
+  const unknown = pr => String(pr.mergeable ?? '').toUpperCase() === 'UNKNOWN';
+  let pending = [...prsByRepo].flatMap(([repo, prs]) => prs.filter(unknown).map(pr => ({ repo, pr })));
+  for (let attempt = 0; pending.length && attempt < Math.min(3, setting.retries); attempt++) {
+    await sleep(setting.delayMs);
+    const unresolved = await mapWithConcurrency(pending, concurrency, async ({ repo, pr }) => {
+      const fresh = await read(repo, pr.number);
+      if (!fresh || fresh.number !== pr.number) return null;
+      Object.assign(pr, fresh);
+      return unknown(pr) ? { repo, pr } : null;
+    });
+    pending = unresolved.filter(Boolean);
+  }
 }
 
 /**
@@ -1316,7 +1365,13 @@ export function needsAcceptanceRestamp(v, rebase) {
  * whole mechanism.
  */
 export function needsManifestStripBeforeMerge(v) {
-  return !!v && v.decision === 'merge' && !!v.hasManifest; // @merge-gate-exempt a held PR must NEVER be manifest-stripped (a force-push mutation); reviewHeld PRs are excluded here on purpose
+  return !!v && v.decision === 'merge' && !v.prestagePendingCi && !!v.hasManifest; // @merge-gate-exempt a held or pending PR must NEVER be manifest-stripped (a force-push mutation)
+}
+
+/** A cached admission cannot bypass head preparation or the coupled landing cascade. */
+export function canConsumePrestagedAdmission(c, { ready, branchPreparationRequired, queueAdmission }) {
+  return !!c && c.decision === 'merge' && ready && !c.hasManifest && !isImplHalf(c)
+    && !branchPreparationRequired && queueAdmission?.allowed === true;
 }
 
 /**
@@ -2009,7 +2064,7 @@ export async function readRemoteManifestViaApi({ exec, repo, headRef, apiArgs = 
  * @param {{prsByRepo:Map, readOf:function, repos:Array, requiredCheck?:string, escalationRelief?:object, label?:(string|null), isLocalRepo?:function, localSlug?:(string|null), defaultBranchOf?:function}} o
  * @returns {Array} verdicts (classify + manifest fields attached; NOT yet couple-joined)
  */
-export function buildDrainVerdicts({ prsByRepo, readOf, repos = [], requiredCheck = 'test', escalationRelief = { prs: [], passWide: false }, label = null, isLocalRepo = () => false, localSlug = null, defaultBranchOf = () => null, queueRequiredChecksOf = () => null } = {}) {
+export function buildDrainVerdicts({ prsByRepo, readOf, repos = [], requiredCheck = 'test', escalationRelief = { prs: [], passWide: false }, label = null, isLocalRepo = () => false, localSlug = null, defaultBranchOf = () => null, queueRequiredChecksOf = () => null, preparePendingCi = false } = {}) {
   const verdicts = [];
   const relief = escalationRelief || { prs: [], passWide: false };
   for (const repo of (Array.isArray(repos) ? repos : [])) {
@@ -2017,7 +2072,7 @@ export function buildDrainVerdicts({ prsByRepo, readOf, repos = [], requiredChec
     for (const p of prs) {
       const read = (typeof readOf === 'function' ? readOf(repo, p.number) : null) || {};
       p.commits = read.commits || [];
-      const v = classifyPr(p, { queueRequiredChecks: queueRequiredChecksOf(repo), requiredCheck, allowPendingReview: (relief.prs || []).includes(Number(p.number)) || (relief.passWide && !!label), defaultBranch: (typeof defaultBranchOf === 'function' ? defaultBranchOf(repo) : null) || null });
+      const v = classifyPr(p, { preparePendingCi: preparePendingCi && isLocalRepo(repo), queueRequiredChecks: queueRequiredChecksOf(repo), requiredCheck, allowPendingReview: (relief.prs || []).includes(Number(p.number)) || (relief.passWide && !!label), defaultBranch: (typeof defaultBranchOf === 'function' ? defaultBranchOf(repo) : null) || null });
       // #2502 — the tip commit's SHA, threaded onto every emitted verdict and, via the `{...v}` spread used to
       // build `remaining`/`plan.ready`/`plan.deferred`, onto each of the six result buckets a caller (the
       // drain-daemon stuck detector) actually reads: toMerge/merged/skipped/parked/deferred/failed — NOT
@@ -2318,7 +2373,7 @@ export function buildOverlapRows({ candidates, verdicts, openPrContext, mergedPr
     if (!base) continue; // no raw listing row — should not happen for a candidate drawn from this same listing
     candidateRows.push({ ...base, exempt: isExemptItem(c.item) });
   }
-  return { candidateRows, openPrRows };
+  return { candidateRows, openPrRows: filterEnqueueableOverlapRows({ openPrRows, verdicts, localSlug, enabled: resolveOverlapYieldOnlyToEnqueueableSetting({ argv, env: process.env }).value }) };
 }
 
 /**
@@ -4384,6 +4439,7 @@ async function runCli() {
   // value) throws here and is caught by this file's own top-level `runCli().catch(...)` — an ordinary CLI
   // usage-error exit, not a drain failure.
   const overlapYieldOverrides = parseOverlapYieldOverrides({ argv, env: process.env });
+  process.stderr.write(`${formatOverlapYieldOnlyToEnqueueableSetting(resolveOverlapYieldOnlyToEnqueueableSetting({ argv, env: process.env }))}\n`);
   const AS_JSON = !!flags.json;
   const DRY_RUN = !!flags['dry-run'];
   const REQUIRED = typeof flags.check === 'string' ? flags.check : 'test';
@@ -4407,6 +4463,9 @@ async function runCli() {
   // (the F1 signal), so this ONE lander serves both `/merge` (bare = every AI PR) and `/drain` (label-scoped +
   // manifest-ordered). Omit → the legacy sweep-all behaviour, unchanged.
   const label = typeof flags.label === 'string' ? flags.label : null;
+  // The operator's exact `--label` and `--base` selection, client-side (#no-label-search, #4108). One predicate for
+  // the listing and the --from-green-event shortcut, so cached admission never selects a PR the listing would not.
+  const operatorSelects = (r) => filterOpenPrsByBase(filterOpenPrsByLabel([r], label).prs, base).length > 0;
   // #2194 — /drain converges onto this lander: `--watch` turns the one-shot sweep into the long-lived monitor
   // (`/drain watch`), re-sweeping on `--interval=N`s and landing each PR the instant it goes green.
   const { watch: WATCH, intervalSec: INTERVAL, maxIdle: MAX_IDLE, untilBatchesIdle: UNTIL_BATCHES_IDLE, batchIdleDebounce: BATCH_DEBOUNCE } =
@@ -4577,6 +4636,52 @@ async function runCli() {
   });
   const resolvedMergePolicy = resolveDrainMergePolicy({ dryRun: DRY_RUN });
   const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }) }); // xtpxusq — logs strategy + source once per pass
+  const prestageCache = createPrestageCache();
+  // PR #5195 — the drain's ledger facts (review-exempt, carried-acceptance restamp, drain-hold release) can clear a
+  // head, so they are written per candidate only once an enqueue entry point CONFIRMS its merge or enqueue: the
+  // cascade below and the green-event pre-stage shortcut both call this one recorder. The pass-start `decision` is
+  // not enough: the fresh re-read, merge-queue freshness, branch preparation, the merge lock and the merge itself
+  // can each still refuse it. The ledger is re-read right before the write, never reused from pass start: a
+  // `changes`/`human` row appended mid-cascade must not be followed by a clearing restamp.
+  // Fail-soft: an unreadable ledger writes nothing, and a failed write never changes the landing.
+  const recordLandedLedgerFacts = async (c, headSha) => {
+    if (DRY_RUN) return;
+    const read = await readDrainLedgerSnapshot([c.repo || localSlug]);
+    const facts = recordDrainLedgerFacts({ verdicts: [{ ...c, decision: 'merge', listedHeadSha: headSha }], localSlug, read });
+    if (!facts.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} verdict-ledger drain facts (non-fatal) — ${facts.errors.slice(0, 3).join('; ')}\n`);
+  };
+  // The steps every landing entry point runs right before its merge or enqueue: the cascade below and the
+  // green-event pre-stage shortcut both call this one function. Best-effort: neither step can block the landing.
+  //
+  // #3308 — announce a skipped or degraded review on the PR, so the record survives on the merged PR. Gated on a
+  // successful comment read: a `gh` miss returns `[]`, and announcing `no-recorded-review` off a failed fetch would
+  // assert an absence from an unknown. `postDrainReasonComment` dedupes on the rendered text.
+  //
+  // #3383 — retarget any OPEN PR stacked on this branch to the default branch. The merge (or the queue's merge)
+  // deletes the head branch, and GitHub CLOSES (never retargets) a PR whose base branch vanished — the #2578
+  // incident; once closed, GitHub refuses both `pr edit --base` and reopen, so this MUST run before landing.
+  // `--base <headRef>` scopes the listing to exactly the stacked set — no full-repo PR fan-out.
+  const announceAndRetargetBeforeLand = (c, { preread, defaultBranch }) => {
+    if (preread.read) {
+      const gaps = reviewCoverageGaps(reviewCoverageGapArgs(c, preread.comments));
+      if (gaps.length) {
+        const reason = buildReviewCoverageReason(gaps);
+        const posted = postDrainReasonComment(c.repo, c.num, REVIEW_COVERAGE_KIND, reason, null, preread.comments);
+        if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} review coverage: ${gaps.map((g) => g.code).join(', ')}${posted ? ' — announced on the PR' : ' (already stamped / post failed)'}\n`);
+      }
+    } else if (!AS_JSON) {
+      process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} could not read PR comments — review coverage NOT assessed (unknown, not clean; #3308)\n`);
+    }
+    retargetStackedPrs({ repo: c.repo, headRef: c.headRef, defaultBranch,
+      onRetarget: (num) => { if (!AS_JSON) process.stderr.write(`  ↷ ${repoTag(c.repo)}${num} retargeted ${c.headRef}→${defaultBranch} before deleting the merged branch (#3383)\n`); },
+      onFailed: (num) => {
+        if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${num} could not be retargeted off ${c.headRef} before the merge — it may get closed by the branch delete (#3383)\n`);
+        // #4138 — a PR GitHub is about to close (via the base-branch-delete cascade) must ALWAYS carry a reason
+        // comment, posted BEFORE the close happens. Best-effort like the retarget itself.
+        postDrainReasonComment(c.repo, num, STACKED_BASE_CLOSE_KIND, buildStackedBaseCloseReason({ headRef: c.headRef }), null);
+      },
+    });
+  };
   const resolveListedChecks = (repo, prs) => mapWithConcurrency(prs, resolvedMergePolicy.policy.concurrency.gateReads, (pr) => resolveChecks(repo, pr));
   const fetchFreshPrForRevalidation = async (repo, num) => {
     try {
@@ -4890,9 +4995,8 @@ async function runCli() {
             touched = true;
             if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} would reconcile ci-lifecycle → "${desired}"${plan.toRemove.length ? ` (drop ${plan.toRemove.join(', ')})` : ''}\n`);
           } else {
-            let ok = true;
-            for (const rm of plan.toRemove) { try { execFileSync('gh', ['pr', 'edit', String(p.number), ...repoFlag(repo), '--remove-label', rm], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { ok = false; /* best-effort — the next pass retries */ } }
-            for (const add of plan.toAdd) { try { execFileSync('gh', ['pr', 'edit', String(p.number), ...repoFlag(repo), '--add-label', add], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { ok = false; /* a label race/permission miss is non-fatal — the next pass retries */ } }
+            // Best effort — a label race/permission miss is non-fatal; the next pass retries.
+            const ok = applyCiLifecycleLabelPlan({ plan, pr: p.number, repo, slug: repo || localSlug });
             if (ok) { touched = true; if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} ci-lifecycle → "${desired}" (reconcile)\n`); }
           }
         }
@@ -4951,6 +5055,45 @@ async function runCli() {
   // emit/exit), so the watch loop can call it repeatedly. A gh-list failure still hard-fails (bad env).
   const drainHeavyCacheByRepo = new Map(); // Reuse heavy fields across --watch passes.
   const sweepOnce = async () => {
+  const prestageSetting = resolvePrestageSettings({ log: line => process.stderr.write(`${line}\n`) });
+  // Prepared admission is still a candidate selection: honor the same resolved repo set and
+  // operator label/base filters as listOne before consuming (or invalidating) a cached preparation.
+  // The entry stores labels as their sorted-name signature; a missing entry falls through to the miss path.
+  const prepared = !DRY_RUN && flags['from-green-event'] && onlyPr != null ? prestageCache.get(localSlug, Number(onlyPr), prestageSetting.value.prestageTtlMin) : null;
+  const preparedLabels = (() => { try { return JSON.parse(prepared?.labels ?? 'null'); } catch { return null; } })();
+  // `--only` matches the listing's string comparison (`matchesOnlyTarget`): `--only=042` selects no PR there.
+  if (!DRY_RUN && flags['from-green-event'] && onlyPr != null && String(Number(onlyPr)) === String(onlyPr) && !onlyRepo && REPOS.some(isLocalRepo) && mergeStrategy.enqueues(null)
+      && (!prepared || operatorSelects({ ...prepared, labels: preparedLabels }))) {
+    // The global stop-the-line signal can change independently of any PR head/label.
+    const freeze = redMainBypass ? null : await readDrainFreezePass();
+    const hold = redMainBypass ? null : drainFreezeSignal({ state: freeze, mainRedState: readMainRedState(), priority: readMainRedPriority(), now: Date.now(), holdOn: resolveRedMainHoldSetting().value === 'on' });
+    const blocked = hold?.red && decideRedMainHold({ num: onlyPr, isLocal: true, signal: hold, setting: 'on' }).hold;
+    const fast = blocked ? { fallback: true } : await enqueuePrestage({ cache: prestageCache, repo: localSlug, num: Number(onlyPr), settings: prestageSetting,
+      readPr: async () => {
+        const { stdout } = await execFileP('gh', ['pr', 'view', String(onlyPr), ...repoFlag(null), '--json',
+          'number,headRefOid,labels,statusCheckRollup,state,isDraft,body,baseRefName,reviewDecision,mergeable,mergeStateStatus'], { encoding: 'utf8' });
+        const pr = JSON.parse(stdout);
+        // The cache is re-read inside enqueuePrestage, so a concurrently written entry may be unchecked here. Out of
+        // scope is not stale: throwing falls back without dropping it (a null read would invalidate it).
+        if (!operatorSelects(pr)) throw new Error('PR outside this run\'s --label/--base selection');
+        // The same full `--check` read the listing and the pre-merge re-read use: gh caps the rollup at 100 contexts.
+        return attachLiveFixClaim(await resolveChecks(null, pr), { claimKey: repoKeyForSlug(localSlug), readClaim: readLiveFixClaim });
+      },
+      withLock: fn => withLandWriteLock(fn, { runUnlockedOnContention: false }),
+      fixClaimHeld: () => prestageFixClaimHeld(onlyPr, { claimKey: repoKeyForSlug(localSlug) }),
+      // The cached base was verified unchanged, and preparation required it to be the default branch.
+      beforeEnqueue: (c, sha, entry) => announceAndRetargetBeforeLand(c, { preread: fetchPrComments(c.repo, c.num), defaultBranch: entry.baseRefName }),
+      enqueue: (c, sha, entry) => mergeStrategy.enqueue(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }),
+      recordLanded: recordLandedLedgerFacts,
+      requiredCheck: REQUIRED,
+    });
+    if (!fast.fallback) {
+      const result = { ok: true, prestaged: true, considered: 1, merged: [], failed: [], pendingRebased: [], deferred: [],
+        enqueueOutcomes: [{ num: Number(onlyPr), repo: localSlug, outcome: fast.enqueued ? 'enqueued' : 'not-enqueued', kind: fast.kind || 'prestage', ...fast }] };
+      return { result, merged: [], failedMerges: [], pendingRebased: [], deferred: [], duplicateIdsOnMain: [] };
+    }
+    process.stderr.write('drain-prestage: cache miss/stale — full fast drain\n');
+  }
   // Keep listing, bare-loop and review-escalation policy on one fresh snapshot per pass.
   const workflowEditSetting = resolveDrainWorkflowEditHuman();
   process.stderr.write(`policy · drainWorkflowEditHuman=${workflowEditSetting.value} (${workflowEditSetting.source})\n`);
@@ -5030,7 +5173,6 @@ async function runCli() {
       if (slug) {
         const paging = resolvePrListPaging();
         const heavyFields = ['body', ...((RECONCILE || workflowEditSetting.value !== 'off') ? ['files'] : [])];
-        const wanted = (r) => filterOpenPrsByBase(filterOpenPrsByLabel([r], label).prs, base).length > 0;
         // Seed body/files from the host-shared snapshot (its heavy copies persist across drain processes); a seed
         // row is used only when its updatedAt + head SHA match the LIVE page row, so it never serves stale content.
         let seed = snapshotSeed || [];
@@ -5038,7 +5180,7 @@ async function runCli() {
           try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' })) || []; } catch { seed = []; }
         }
         listed = __t.time('listing.pages', () => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging,
-          heavyFields, needsHeavy: RECONCILE ? () => true : wanted, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
+          heavyFields, needsHeavy: RECONCILE ? () => true : operatorSelects, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
           maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain page)' } } }));
         drainHeavyCacheByRepo.set(repo, listed.cache);
       } else if (!slug) {
@@ -5049,8 +5191,10 @@ async function runCli() {
         listed = { rows, truncated: rows.length >= OPEN_PR_LIST_LIMIT };
       }
       const rows = await __t.timeAsync('listing.checks', () => resolveListedChecks(repo, listed.rows));
-      const { prs: labelMatched, truncated } = filterOpenPrsByLabel(rows, label, OPEN_PR_LIST_LIMIT);
-      const prs = filterOpenPrsByBase(labelMatched, base);
+      const listedRows = Array.isArray(rows) ? rows : [];
+      const truncated = Array.isArray(rows) && isDegradedOpenPrListing(rows.length, OPEN_PR_LIST_LIMIT);
+      // Preparation observes the same release-label and operator label filter as the full drain.
+      const prs = listedRows.filter(operatorSelects);
       if (listed.truncated || truncated) process.stderr.write(`  ⚠️  DEGRADED drain listing for ${repoTag(repo) || 'cwd'}: the open-PR list hit the --limit ${OPEN_PR_LIST_LIMIT} cap — it MAY be truncated, so a ${label || 'candidate'} PR past it can be missing this pass (#no-label-search)\n`);
       return { repo, prs, rows };
     }
@@ -5088,7 +5232,11 @@ async function runCli() {
   // #xc7p3q9 (B3) — when the blind context is NEVER collected (`RECONCILE` false: a bare `/merge` sweep or
   // `--no-reconcile-labels`), it is INCOMPLETE by construction — `contextComplete:false` — so the couple gate
   // fails closed (a coupled impl defers rather than orphan-landing past a carrier the gate cannot see).
-  const openPrContext = RECONCILE ? await __t.timeAsync('listing', () => __t.timeAsync('listing.context', () => collectContext(liveListingsByRepo))) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false });
+  const prsByRepo = narrowPrsByRepo(listings, { onlyPr, onlyRepo, repos: REPOS, isLocalRepo });
+  const openPrContext = await repollThenCollectContext({
+    repoll: () => repollUnknownListings({ prsByRepo, read: fetchFreshPrForRevalidation, setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) }),
+    collect: () => (RECONCILE ? __t.timeAsync('listing', () => __t.timeAsync('listing.context', () => collectContext(liveListingsByRepo))) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false })),
+  });
   // #xc7p3q9 (R2) — the operator escape hatch symmetric to `--no-review-escalation`: `--assume-complete-context`
   // FORCES the context complete so a genuinely-stuck couple (e.g. a persistent read-noise fail-closed) can land
   // short of editing the script. Prints a LOUD one-line waiver. Off by default; the fail-closed gate stays live.
@@ -5103,7 +5251,6 @@ async function runCli() {
   // the cross-repo ordering context below.
   // #xc7p3q9 (Fix 4) — the REAL `--only`/`--repos` narrowing is now `narrowPrsByRepo` (shared with the
   // test suite so tests drive the same wiring runCli does).
-  const prsByRepo = narrowPrsByRepo(listings, { onlyPr, onlyRepo, repos: REPOS, isLocalRepo });
   // #2417 — fan out the per-PR commits + manifest reads across EVERY candidate PR at once (bounded pool),
   // cached across `--watch` passes on unchanged head SHA + body — was one serial `gh pr view --json commits` + one
   // serial manifest probe per PR, one repo at a time (~2×N serial `gh` round-trips a pass). The merge cascade
@@ -5150,6 +5297,7 @@ async function runCli() {
     },
   });
   verdicts.push(...buildDrainVerdicts({
+    preparePendingCi: prestageSetting.value.prestageWhileCiRuns && queueEnqueueMode && !!REVIEW_ESCALATION,
     queueRequiredChecksOf,
     prsByRepo,
     readOf: (repo, num) => sweepReads.get(prCacheKey(repo, num))?.value,
@@ -5241,7 +5389,7 @@ async function runCli() {
       // lane/* ref (renumbers the NNN), moving the head out from under an active reviewer and invalidating any
       // #2409 acceptance stamped against the old SHA. The heal's premise ("a red required check is the symptom")
       // never held for a green-held PR: it has no collision to heal. Excluding `reviewHeld` restores that premise.
-      if (!certified || v.decision === 'merge' || v.reviewHeld || v.requiredCheckReadError) continue;
+      if (!certified || v.prestagePendingCi || v.decision === 'merge' || v.reviewHeld || v.requiredCheckReadError) continue;
       if (!isLocalRepo(v.repo) || !v.headRef) continue;
       // #2276 — a rebase-drop candidate (stale-green + BEHIND/CONFLICTING) is healed INSIDE the rebase-drop
       // rebuild below (one rebuilt tip drops the manifest AND renumbers), so skip it here to avoid a double
@@ -5330,7 +5478,7 @@ async function runCli() {
       // Rebuild-to-drop the manifest when the PR is BLOCKED on it (CONFLICTING/BEHIND) OR when it is already
       // landable but still CARRIES the manifest on its head (#2183 first-lander leak — a clean merge would
       // otherwise commit the transient file to `main`). Both cases route through the same plumbing.
-      if (!isRebaseDropCandidate(v) && !needsManifestStripBeforeMerge(v)) continue;
+      if (v.prestagePendingCi || (!isRebaseDropCandidate(v) && !needsManifestStripBeforeMerge(v))) continue;
       if (approvedHeadHold(v)) {
         const pr = (prsByRepo.get(v.repo) || []).find(p => p.number === v.num);
         if (pr && mergeStrategy.queueOwnsFreshness(v.repo) && v.reason?.startsWith('merge state ')
@@ -5483,7 +5631,7 @@ async function runCli() {
   // Best-effort, exactly like every other label write here: the merge gate re-checks the hold directly and parks
   // a held PR whether or not `ready-to-merge` is present, so the label is a collection filter, never the land gate.
   const stripReadyOnPark = (v, { applyLabel = null, staleAcceptance = false } = {}) => {
-    if (DRY_RUN) return;
+    if (DRY_RUN || v.prestagePendingCi) return;
     if (!decideParkReadyStrip(v.prLabels, { applyLabel, staleAcceptance })) return;
     try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--remove-label', READY_TO_MERGE_LABEL], { stdio: ['ignore', 'ignore', 'pipe'] }); }
     catch { /* label best-effort */ }
@@ -5510,7 +5658,7 @@ async function runCli() {
       // catch: the PR reports `humanRequired:true` in JSON but carries only `review:pending` on GitHub, and
       // `review-parked-prs.mjs` then treats it as agent-clearable and auto-accepts a PR a human was required to
       // clear. Minting for held PRs too keeps every verdict label present before any escalation pass applies one.
-      const escalationRepos = new Set(verdicts.filter((v) => v.decision === 'merge' || v.reviewHeld).map((v) => v.repo || null));
+      const escalationRepos = new Set(verdicts.filter((v) => !v.prestagePendingCi && (v.decision === 'merge' || v.reviewHeld)).map((v) => v.repo || null));
       for (const repo of escalationRepos) {
         for (const [name, meta] of Object.entries(REVIEW_LABEL_META)) {
           const ensureKey = `${repo || 'cwd'}::${name}`;
@@ -5539,6 +5687,7 @@ async function runCli() {
       // not, and decideReviewGate never returns `merge` for it (an uncleared, non-accepted review label always
       // parks). Everything else (no review label) is unaffected — only `decision === 'merge'` OR `reviewHeld`.
       if (v.decision !== 'merge' && !v.reviewHeld) continue;
+      const candidateDryRun = DRY_RUN || v.prestagePendingCi;
       let changedFiles = [];
       let diffLines = 0;
       // #2390-review-fix — the CUMULATIVE origin/main…head file set the gate-self/human trigger scores over
@@ -5611,6 +5760,7 @@ async function runCli() {
       // "did this PR's own commits touch the file my test-gaming finding cites?" without re-fetching — the
       // stacked-base-origin check a few lines below (`describeStackedTestGamingOrigin`) is the one consumer.
       v.changedFiles = Array.isArray(changedFiles) ? changedFiles : [];
+      if (v.prestagePendingCi) v.prestageHumanBasisFiles = humanBasisFiles;
       // #2447 — the graduatedTo RESOLUTION BASIS, off the same file set + diff text the score just read (no extra
       // `gh` call). Backlog-only is judged on the CUMULATIVE basis (`humanBasisFiles`) so a de-inflated stacked
       // base can never make a code-carrying PR claim "no code change". Presentation only: it feeds the park/skip
@@ -5640,7 +5790,7 @@ async function runCli() {
       // durable per-PR signal, so it is not defended here (see review-baseline-state.mjs's cache-loss residual).
       const liveManifestValues = { hasManifest: !!v.hasManifest, dismissedFindings: v.dismissedFindings, crossRepo: v.crossRepo, blockedBy: v.blockedBy };
       const priorBaseline = getBaseline(baselineState, { repo: v.repo, num: v.num });
-      if (!priorBaseline && !DRY_RUN) {
+      if (!priorBaseline && !candidateDryRun) {
         const nextBaseline = recordBaseline(baselineState, { repo: v.repo, num: v.num }, liveManifestValues);
         if (nextBaseline !== baselineState) { baselineState = nextBaseline; baselineStateChanged = true; }
       }
@@ -5655,7 +5805,7 @@ async function runCli() {
         v.humanRequired = true;
         v.escalateReasons = tamper.reasons;
         v.reason = `manifest baseline mismatch — post-review tamper suspected: ${tamper.reasons.join('; ')}`;
-        if (!DRY_RUN) {
+        if (!candidateDryRun) {
           // #2766/#2767 — same mutual-exclusivity target as the test-gaming park below, but this site has no
           // `humanClearedSha` proof of its own (no fetch — the manifest-tamper trigger never checked comments),
           // so `keepHumanClearance: true` UNCONDITIONALLY: a co-present `review:accepted` is left standing
@@ -5742,7 +5892,7 @@ async function runCli() {
               setting: resolveAcceptCarryForward().value, comments: evidence.comments, reviews: evidence.reviews,
               humanClearedSha, headSha: tamperHeadSha, pinnedHeadSha: v.listedHeadSha || v.headSha || null,
               readHeadDiff: (sha) => (diffExec ? readNetDiffAtHead({ exec: diffExec, headSha: sha, headRef: v.headRef }) : null),
-              applyNumberingCarry: createTamperParkCarryCallback({ pr: v.num, repo: slug, exec: diffExec, dryRun: DRY_RUN }),
+              applyNumberingCarry: createTamperParkCarryCallback({ pr: v.num, repo: slug, exec: diffExec, dryRun: candidateDryRun }),
             });
             humanClearedSha = carried.humanClearedSha;
             carryRetryable = carried.retryable === true;
@@ -5768,7 +5918,7 @@ async function runCli() {
           baseAlreadyEscalated: hasReviewLabel(stackedBase.prLabels, REVIEW_LABELS.human),
         }) : null;
         v.reason = buildTestGamingParkReason(gaming.reasons, stackedOrigin, stackedBase?.num);
-        if (!DRY_RUN) {
+        if (!candidateDryRun) {
           // #2766/#2767 — MUTUAL EXCLUSIVITY. `keepHumanClearance` is `true` ONLY when the humanClearedSha
           // fetch above never ran/succeeded (`tamperHeadSha === null`, incl. a `gh` fetch miss) — the fail-
           // closed-toward-PRESERVATION direction (see `decideParkToHuman`'s own docstring). It successfully
@@ -5836,7 +5986,7 @@ async function runCli() {
       // named, tested place.
       const gate = decideDrainReviewGate(
         drainGateInputs({ score, labels: v.prLabels, deviation: v.deviation }),
-        { pr: v.num, repo: v.repo, cwd: escCwd, local: isLocalRepo(v.repo), dryRun: DRY_RUN, ...workflowReadOptions(v) });
+        { pr: v.num, repo: v.repo, cwd: escCwd, local: isLocalRepo(v.repo), dryRun: candidateDryRun, ...workflowReadOptions(v) });
       if (gate.action === 'defer') {
         v.decision = 'skip';
         v.reason = gate.reason;
@@ -5887,7 +6037,7 @@ async function runCli() {
         // redundant `gh pr edit --add-label` call when the verdict label is already present (never a
         // double-apply). `shouldApplyReviewLabel` is the SAME shared gate `pr-land.mjs` uses at open, so
         // producer- and drain-applied verdicts can never drift on what "already labelled" means.
-        if (gate.applyLabel && !DRY_RUN) {
+        if (gate.applyLabel && !candidateDryRun) {
           if (shouldApplyReviewLabel(gate.applyLabel, v.prLabels)) {
             // #3215 — the ledger is written FIRST, before the `gh` transport call, same ordering rationale as
             // `review-set-label.mjs`'s Phase-1 write: this hold is already DECIDED (the gate verdict above is
@@ -5972,7 +6122,7 @@ async function runCli() {
         // re-park that scores a different set than the first park replaces the stale block; a re-park scoring
         // the SAME set writes nothing. Then verify the write landed — best-effort (a write/verify miss is
         // surfaced, never fatal: the label already carries the signal).
-        if (gate.humanRequired && !DRY_RUN) {
+        if (gate.humanRequired && !candidateDryRun) {
           let liveBody = '';
           let liveBodyRead = false; // 74b — an unread body is UNKNOWN: never reconcile/overwrite from '' (that would clobber the PR body)
           try { liveBody = JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'body'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}').body || ''; liveBodyRead = true; } catch { /* fetch miss — unknown body: skip the write, fall to the loud skip-stamp */ }
@@ -6205,7 +6355,7 @@ async function runCli() {
     logDrainOrder(p);
     return p;
   };
-  const toMerge = verdicts.filter((v) => v.decision === 'merge'); // @merge-gate-exempt the FINAL set actually merged; a held PR is `decision:'skip'` and MUST be excluded here — this is the hard AND that never lands a held PR
+  const toMerge = verdicts.filter((v) => v.decision === 'merge' && !v.prestagePendingCi); // @merge-gate-exempt the FINAL set actually merged; a held PR is `decision:'skip'` and MUST be excluded here — this is the hard AND that never lands a held PR
   const skipped = verdicts.filter((v) => v.decision === 'skip' && !v.requiredCheckReadError);
   // #xc7p3q9 (R6) — the held couple's members (its `skip` carrier + its deferred impl half — both carry
   // `coupleDeferReason:'held'`) so `decideBatchesIdleExit` can SUBTRACT them from `considered` rather than waive
@@ -6227,14 +6377,14 @@ async function runCli() {
     // store its writes land in, taken before it writes, so a shared-store miss is retried next pass.
     const readDrainLedger = await readDrainLedgerSnapshot(verdicts.map((v) => v.repo || localSlug));
     for (const v of skipped) {
-      if (!v.reason || !(v.certifyLabel || v.aiGenerated)) continue;
+      if (v.prestagePendingCi || !v.reason || !(v.certifyLabel || v.aiGenerated)) continue;
       const held = recordDrainHold({ repo: v.repo || localSlug, pr: v.num, reason: v.reason, read: readDrainLedger });
       if (!held.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger drain-hold append (E3 #3929, non-fatal) — ${held.errors.join('; ')}\n`);
     }
     for (const v of skipped) {
       // red-main-hold: a transient, pass-level hold recorded in the skip-reasons line + the drain-hold ledger; no PR
       // comment (one `gh pr view` per held PR per pass would burn the shared API budget for the whole red window).
-      if (v.escalated === 'yes' || v.reviewParked || v.collisionHealed || v.redMainHold) continue;
+      if (v.prestagePendingCi || v.escalated === 'yes' || v.reviewParked || v.collisionHealed || v.redMainHold) continue;
       if (!(v.certifyLabel || v.aiGenerated)) continue;
       // xnsk54v follow-up — mirror the park path: record the acted-on manifest values into the durable skip
       // comment for a manifest-carrying PR (tamper-evidence), leaving orphan/impl skip comments unchanged.
@@ -6250,18 +6400,6 @@ async function runCli() {
   }
 
   const merged = [];
-  // PR #5195 — the drain's ledger facts (review-exempt, carried-acceptance restamp, drain-hold release) can clear a
-  // head, so they are written per candidate only once the cascade below CONFIRMS its merge or enqueue. The
-  // pass-start `decision` is not enough: the fresh re-read, merge-queue freshness, branch preparation, the merge
-  // lock and the merge itself can each still refuse it. The ledger is re-read right before the write, never reused
-  // from pass start: a `changes`/`human` row appended mid-cascade must not be followed by a clearing restamp.
-  // Fail-soft: an unreadable ledger writes nothing, and a failed write never changes the landing.
-  const recordLandedLedgerFacts = async (c, headSha) => {
-    if (DRY_RUN) return;
-    const read = await readDrainLedgerSnapshot([c.repo || localSlug]);
-    const facts = recordDrainLedgerFacts({ verdicts: [{ ...c, decision: 'merge', listedHeadSha: headSha }], localSlug, read });
-    if (!facts.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} verdict-ledger drain facts (non-fatal) — ${facts.errors.slice(0, 3).join('; ')}\n`);
-  };
   const failedMerges = [];
   const enqueueOutcomes = [];
   // #2779-incident — the OTHER currently-open PR numbers for a candidate's own repo, at pass-start, EXCLUDING
@@ -6369,6 +6507,31 @@ async function runCli() {
   const coupleSplit = [];
   const repoKeyOfVerdict = (v) => (isLocalRepo(v.repo) ? (repoKeyFromSlug(localSlug) || 'we') : repoKeyFromSlug(v.repo));
   const repoKeyOfSlug = (slug) => (isLocalRepo(slug) ? (repoKeyFromSlug(localSlug) || 'we') : repoKeyFromSlug(slug));
+  // All non-CI gates and the couple/dependency plan have now run. Provisional pending candidates
+  // leave the real cascade here: preparation NEVER authorizes an enqueue (or a direct merge).
+  const stageReady = new Set(preparedPass.plan.ready.map(c => candKey(c)));
+  for (const c of verdicts) {
+    if (!c.prestagePendingCi) {
+      if (!DRY_RUN && mergeStrategy.enqueues(c.repo)) prestageCache.drop(c.repo || localSlug, c.num);
+      continue;
+    }
+    const row = (prsByRepo.get(c.repo) || []).find(p => p.number === c.num);
+    if (!DRY_RUN && row && mergeStrategy.enqueues(c.repo)) {
+      const queueAdmission = mergeStrategy.prestage(c, c.listedHeadSha);
+      const eligible = canConsumePrestagedAdmission(c, { ready: stageReady.has(candKey(c)),
+        branchPreparationRequired: branchPreparationRequired(c), queueAdmission });
+      prestageCache.put(c.repo || localSlug, c.num, {
+        headSha: c.listedHeadSha, labels: labelSignature(row.labels), body: row.body, baseRefName: row.baseRefName,
+        requiredChecks: prestageRequiredChecks(queueRequiredChecksOf(c.repo), REQUIRED), candidate: c, eligible, queueAdmission,
+        conflict: c.mergeable, mergeability: c.state, gate: c.reviewGate,
+        mergeGateInputs: { candidacy: c.decision, couple: { carrier: c.coupleCarrier ?? null, refs: c.manifestRepoRefs ?? [], defer: c.coupleDeferReason ?? null }, blockedBy: c.blockedBy },
+        humanOnlySurface: { files: c.prestageHumanBasisFiles ?? c.changedFiles, humanRequired: c.humanRequired, reasons: c.escalateReasons },
+      });
+      process.stderr.write(`drain-prestage: ${c.repo || localSlug}#${c.num}@${c.listedHeadSha} prepared while CI pending (eligible=${eligible})\n`);
+    }
+    c.decision = 'skip'; c.reason = 'pre-staged while required CI is pending — no enqueue';
+    if (!skipped.includes(c)) skipped.push(c);
+  }
   let deferred = [];
   if (DRY_RUN) {
     // Report the planned first-pass order (blockedBy + #2393 stackParents-honoured) without merging. Nothing has
@@ -6648,16 +6811,10 @@ async function runCli() {
           // byte-identical to before this item; and `postDrainReasonComment` dedupes on the rendered text, so a
           // `--watch` loop that re-lands nothing re-posts nothing. It cannot affect the merge either — the post
           // swallows every `gh` error internally and returns a bool.
-          if (preread.read) {
-            const gaps = reviewCoverageGaps(reviewCoverageGapArgs(c, preread.comments));
-            if (gaps.length) {
-              const reason = buildReviewCoverageReason(gaps);
-              const posted = postDrainReasonComment(c.repo, c.num, REVIEW_COVERAGE_KIND, reason, null, preread.comments);
-              if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} review coverage: ${gaps.map((g) => g.code).join(', ')}${posted ? ' — announced on the PR' : ' (already stamped / post failed)'}\n`);
-            }
-          } else if (!AS_JSON) {
-            process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} could not read PR comments — review coverage NOT assessed (unknown, not clean; #3308)\n`);
-          }
+          //
+          // #3383 — the same shared step also retargets any OPEN PR stacked on THIS branch BEFORE the merge or
+          // enqueue below (see `announceAndRetargetBeforeLand`); the green-event pre-stage shortcut calls it too.
+          announceAndRetargetBeforeLand(c, { preread, defaultBranch: defaultBranchOf(c.repo) || 'main' });
           // #2412 Gap 2 — the before-land trace: the exact head SHA about to land, plus the merging
           // caller/session. Read fresh (not reused from earlier in the pass) so the SHA names the commit
           // actually about to merge. #xngv3vn — the WRITE is deferred until the merge is CONFIRMED
@@ -6671,29 +6828,6 @@ async function runCli() {
           // pass-start decision judged), not a second best-effort read that could miss or see a newer head.
           const traceHeadSha = revalidated.headSha;
           postMergeTrace = makeMergeTrace(traceHeadSha, preread.comments);
-          // #3383 — BEFORE the merge below (which lands with `--delete-branch`, or the repo may auto-delete
-          // the head branch on merge either way), retarget any OPEN PR stacked on THIS branch to the repo's
-          // default branch. Left unguarded, GitHub CLOSES (never retargets) a PR whose base branch just
-          // vanished — the #2578 incident: an approved, unmerged sibling PR was silently killed by a
-          // base-branch delete it had nothing to do with, and by the time it's closed GitHub refuses both
-          // `pr edit --base` and reopen (verified live recovering #2578), so this MUST run before the merge,
-          // not after. `--base <headRef>` scopes the listing to exactly the stacked set — no full-repo PR
-          // fan-out. Best-effort: a `gh` miss here must never block the merge itself.
-          {
-            const defBranch = defaultBranchOf(c.repo) || 'main';
-            retargetStackedPrs({ repo: c.repo, headRef: c.headRef, defaultBranch: defBranch,
-              onRetarget: (num) => { if (!AS_JSON) process.stderr.write(`  ↷ ${repoTag(c.repo)}${num} retargeted ${c.headRef}→${defBranch} before deleting the merged branch (#3383)\n`); },
-              onFailed: (num) => {
-                if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${num} could not be retargeted off ${c.headRef} before the merge — it may get closed by the branch delete (#3383)\n`);
-                // #4138 — a PR GitHub is about to close (via the base-branch-delete cascade) must ALWAYS carry
-                // a reason comment, posted BEFORE the close happens (never after — GitHub refuses both
-                // `pr edit --base` and reopen once it has actually closed, so "after" may be too late to even
-                // post against the right state). Best-effort like the retarget itself: a `gh pr comment` miss
-                // here must never block the merge that is about to run.
-                postDrainReasonComment(c.repo, num, STACKED_BASE_CLOSE_KIND, buildStackedBaseCloseReason({ headRef: c.headRef }), null);
-              },
-            });
-          }
           // #2290 — the drain is the SOLE writer to main: the one `gh pr merge` now routes through the shared
           // gate (caller 'drain' — the only caller the gate permits). Behaviour is identical to the prior
           // inline call (`gh pr merge <n> [--repo …] --merge --delete-branch`, throw on a non-zero gh exit).
