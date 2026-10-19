@@ -23,8 +23,8 @@
  *   4. push that commit to the `lane/*` ref (a fast-forward — the new commit has `<laneRef>` as an ancestor).
  *   → the caller then `gh pr merge`s the now-CLEAN PR.
  *
- * If `merge-tree` reports ANY conflict beyond the manifest, this returns `{ action: 'skip' }` — a real
- * conflict needs a human; the lander never force-resolves code.
+ * Beyond the transient paths, only a proven card-only PR whose conflicts are entirely inside Also raised by
+ * lists can use the stable union resolver. Every other content conflict returns `{ action: 'skip' }`.
  *
  * Repo-root fix-evidence markdown files are transient like the manifest: fixer agents share these
  * scratch paths, so drop them from the rebuilt tree and accept conflicts confined to either kind.
@@ -37,6 +37,8 @@ import { gitRun as gitRunner, ensureFullHistory } from './git-run.mjs';
 import { applyCollisionHealToIndex } from './nnn-collision-heal.mjs';
 import { isFixEvidencePath, isDrainTransientPath } from './transient-paths.mjs';
 import { refuseHeldPush } from '../conveyor/fix-procedure.mjs';
+import { applyRaisedByConflictsToIndex, loadCardConflictSettings } from './card-conflict-resolve.mjs';
+import { isCardPath } from '../ci-card-only.mjs';
 
 export const LANE_MANIFEST = '.lane-manifest.json';
 
@@ -145,6 +147,7 @@ export function rebaseDropManifest({
   message,
   tmpIndex = '.git/rebase-drop-index',
   healCollision = false,
+  cardConflictSettings = loadCardConflictSettings(),
   cwd,
   run = gitRunner,
 } = {}) {
@@ -155,7 +158,7 @@ export function rebaseDropManifest({
   // bare name fail with "not something we can merge" and the whole auto-rebase is inert. Fetch the lane ref
   // first (so the remote-tracking ref is current), then feed the RESOLVED `<remote>/<laneRef>` to the merge
   // inputs. The PUSH still targets the bare `refs/heads/<laneRef>` (that part was always correct).
-  const mergeRef = readRef || `${remote}/${laneRef}`;
+  let mergeRef = readRef || `${remote}/${laneRef}`;
   if (fetch) {
     const f = run('git', ['fetch', remote, laneRef], { cwd });
     if (f.status !== 0) return { action: 'error', reason: `fetch ${laneRef} failed (${(f.stderr || '').split('\n')[0]})` };
@@ -197,13 +200,43 @@ export function rebaseDropManifest({
     }
   }
 
-  const disp = manifestConflictDisposition(parsed, manifest);
-  if (disp === 'real') return { action: 'skip', reason: `real conflict beyond ${manifest}`, conflictPaths: parsed.conflictPaths };
+  let disp = manifestConflictDisposition(parsed, manifest);
+  const cardConflictSetting = { value: cardConflictSettings.value.autoResolveRaisedBy,
+    source: cardConflictSettings.sources.autoResolveRaisedBy };
+  let cardConflict = disp === 'real' && parsed.conflictPaths.length > 0 && parsed.conflictPaths.every(isCardPath);
+  if (disp === 'real' && (!cardConflict || !cardConflictSetting.value)) return { action: 'skip',
+    reason: !cardConflictSetting.value ? 'cardConflicts.autoResolveRaisedBy disabled' : `real conflict beyond ${manifest}`,
+    conflictPaths: parsed.conflictPaths, cardConflictSetting };
+
+  if (cardConflict) {
+    // Other watchers may fetch into this clone while the probe runs. Freeze BOTH inputs and recompute
+    // before reading either list: a tree from main A must never be committed with main B as its parent.
+    const inputs = [base, mergeRef].map(ref => run('git', ['rev-parse', '--verify', `${ref}^{commit}`], { cwd }));
+    const ids = inputs.map(r => String(r.stdout || '').trim());
+    if (inputs.some(r => r.status !== 0) || ids.some(id => !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(id)))
+      return { action: 'skip', reason: 'cannot pin card conflict inputs', cardConflictSetting };
+    [base, mergeRef] = ids;
+    const pinned = run('git', ['merge-tree', '--write-tree', base, mergeRef], { cwd });
+    parsed = parseMergeTree(pinned.stdout, pinned.status);
+    if (!parsed.tree || (!parsed.clean && !parsed.conflictPaths.length))
+      return { action: 'skip', reason: 'cannot prove pinned card conflict', cardConflictSetting };
+    disp = manifestConflictDisposition(parsed, manifest);
+    cardConflict = disp === 'real' && parsed.conflictPaths.every(isCardPath);
+    if (disp === 'real' && !cardConflict) return { action: 'skip', reason: 'pinned merge has a non-card conflict',
+      conflictPaths: parsed.conflictPaths, cardConflictSetting };
+  }
 
   // Build a resolved, manifest-free tree in a TEMP index — never touches HEAD or the working tree.
   const env = { GIT_INDEX_FILE: tmpIndex };
   const read = run('git', ['read-tree', parsed.tree], { env, cwd });
   if (read.status !== 0) return { action: 'error', reason: `read-tree failed (${(read.stderr || '').split('\n')[0]})` };
+  let resolvedRaisedBy = [];
+  if (cardConflict) {
+    const resolution = applyRaisedByConflictsToIndex({ run, cwd, env, tree: parsed.tree, base, mergeRef,
+      conflictPaths: parsed.conflictPaths, enabled: cardConflictSetting.value });
+    if (!resolution.ok) return { action: 'skip', reason: resolution.reason, conflictPaths: parsed.conflictPaths, cardConflictSetting };
+    resolvedRaisedBy = resolution.resolved;
+  }
   // Drop the manifest if present (--ignore-unmatch: a clean merge with no manifest in the tree is fine).
   run('git', ['rm', '--cached', '--ignore-unmatch', manifest], { env, cwd });
   const rootEntries = run('git', ['ls-tree', '--name-only', parsed.tree], { env, cwd });
@@ -276,5 +309,6 @@ export function rebaseDropManifest({
   const push = run('git', ['push', remote, `${newCommit}:refs/heads/${laneRef}`], { cwd });
   if (push.status !== 0) return { action: 'error', reason: `push to ${laneRef} failed (${(push.stderr || '').split('\n')[0]})` };
 
-  return { action: 'rebased', newCommit, dropped: disp === 'manifest-only', droppedEvidence, healed, base, laneRef };
+  return { action: 'rebased', newCommit, dropped: disp === 'manifest-only', droppedEvidence, healed, base, laneRef,
+    ...(resolvedRaisedBy.length ? { resolvedRaisedBy, cardConflictSetting } : {}) };
 }
