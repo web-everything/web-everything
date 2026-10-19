@@ -256,6 +256,10 @@ export function resolveSameHeadMaxReviews(env = process.env) {
 
 /** Extra automatic review runs allowed on one head when none of the prior runs left a verdict on the PR. */
 export const VERDICT_RETRY_EXTRA = 2;
+/** Missing verdicts get bounded cool-down releases after the immediate retry budget is spent. */
+export const VERDICT_COOLDOWN_BASE_MS = 60 * 60_000;
+export const VERDICT_COOLDOWN_CAP_MS = 8 * 60 * 60_000;
+export const VERDICT_COOLDOWN_MAX_RELEASES = 6;
 /** A just-finished run gets this long for its verdict write-back to show up in the (cached) PR listing. */
 export const VERDICT_GRACE_MS = 10 * 60_000;
 const VERDICT_LABELS = ['review:accepted', 'review:changes', 'review:human'];
@@ -285,14 +289,22 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   // A completed run whose verdict NEVER LANDED on the PR (GitHub refused the comment/label write; live 2026-10-07,
   // #4288: GraphQL error as the review finished, so the PR stayed `review:pending` with no verdict and this hold
   // then silenced it forever, unlogged) did not review the head in any way the PR can see. Re-arm it ourselves,
-  // bounded to VERDICT_RETRY_EXTRA extra runs, and past that keep the hold with an explicit reason.
+  // bounded to VERDICT_RETRY_EXTRA extra runs, then bounded cool-down releases with exponential backoff.
   const noVerdict = verdictNeverLanded(pr, last, now);
   if (noVerdict && count < max + VERDICT_RETRY_EXTRA) return null;
+  let retryAt = null;
+  const spent = count - (max + VERDICT_RETRY_EXTRA);
+  if (noVerdict && spent < VERDICT_COOLDOWN_MAX_RELEASES) {
+    const cooldown = Math.min(VERDICT_COOLDOWN_BASE_MS * 2 ** spent, VERDICT_COOLDOWN_CAP_MS);
+    retryAt = last.completedAt + cooldown;
+    if (now >= retryAt) return null;
+  }
   const head = pr.headRefOid;
   const why = `${REFERRAL_HOLD_MARKER} head ${head.slice(0, 9)} was already reviewed ${count} time(s); it resumes on a new push or an explicit re-arm`
-    + (noVerdict ? ` (no verdict ever landed on the PR for those runs, and the ${VERDICT_RETRY_EXTRA} automatic re-runs are spent: a person must look at why the review's write-back fails)` : '');
+    + (noVerdict ? ` (no verdict ever landed on the PR for those runs, and the ${VERDICT_RETRY_EXTRA} automatic re-runs are spent: a person must look at why the review's write-back fails)` : '')
+    + (retryAt !== null ? `; the next automatic re-run is due at ${new Date(retryAt).toISOString()}` : '');
   return { kind: 'same-head', head, episode: hash([repo, pr.number, head, wake, 'same-head']), count,
-    why, retryAt: null, persistenceFailed: false, exhausted: false };
+    why, retryAt, persistenceFailed: false, exhausted: false };
 }
 
 /** Historical auto-rearm receipt, retained for readers; it no longer creates a wake. */
