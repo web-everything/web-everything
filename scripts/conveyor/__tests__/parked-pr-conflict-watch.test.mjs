@@ -66,7 +66,7 @@ import {
   STAND_DOWN_MARKER, WATCHER_STAND_DOWN_ACTOR, SUPERSEDE_STAND_DOWN_MARKER, buildStandDownComment,
 } from '../stand-down.mjs';
 import { mintSessionSlug } from '../session-slug.mjs';
-import { UNOWNED_REBASE_ATTEMPT_MARKER, UNOWNED_REBASE_ATTEMPT_CAP, countUnownedRebaseAttempts } from '../unowned-rebase-attempt-count.mjs';
+import { UNOWNED_REBASE_INFRA_MARKER, countUnownedRebaseInfraFailures, formatUnownedRebaseInfraMarker, UNOWNED_REBASE_ATTEMPT_MARKER, UNOWNED_REBASE_ATTEMPT_CAP, countUnownedRebaseAttempts } from '../unowned-rebase-attempt-count.mjs';
 import { NOTE_COMMENT_MARKER, postNoteComment } from '../reconcile-note-comment.mjs';
 import { notifyDesktopChecked } from '../branch-sync.mjs';
 
@@ -2886,6 +2886,46 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
     });
 
     // Replay content-conflict skips against PR #2709's branch shape until the cap is exhausted.
+    it('REPLAY — persistent index.lock throws stop at the separate infra cap and surface once even when routing fails', () => {
+      postNoteComment.mockClear();
+      notifyDesktopChecked.mockClear();
+      const provider = fakeProvider();
+      const pr = { number: 2709, mergeable: 'CONFLICTING', headRefName: 'lane/2709-fix',
+        headRefOid: 'abc123', baseRefName: 'main', labels: [] };
+      const thread = [];
+      const attempt = vi.fn(() => { throw new Error("fatal: Unable to create '.git/index.lock': File exists."); });
+      const routed = vi.fn(() => { if (routed.mock.calls.length < 5) throw new Error('downstream routing unavailable'); });
+      vi.spyOn(provider, 'postComment').mockImplementation((_repo, _pr, body) => {
+        thread.push({ body, author: { login: 'web-everything' } });
+      });
+      let replayedNotes = 0;
+      const outcomes = [];
+      for (let sweep = 0; sweep < 5; sweep += 1) {
+        const [entry] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+          repo: 'o/n', listPrs: () => [pr], provider, postFinding: routed,
+          unownedRebaseSettings: { value: { countSince: null, infraRetryCap: 3 }, sources: {} },
+          computeConflictDisposition: () => 'clean', attemptMechanicalRebase: attempt,
+          listPrComments: () => thread,
+        });
+        outcomes.push(entry);
+        // Replay actual posted note bodies as durable trusted comments for the next sweep's dedup.
+        for (const [note] of postNoteComment.mock.calls.slice(replayedNotes)) {
+          thread.push({ body: note.body, author: { login: 'web-everything' } });
+        }
+        replayedNotes = postNoteComment.mock.calls.length;
+        expect(countUnownedRebaseAttempts(thread)).toBe(0);
+      }
+      expect(attempt).toHaveBeenCalledTimes(3);
+      expect(countUnownedRebaseInfraFailures(thread, { headSha: pr.headRefOid })).toBe(3);
+      expect(outcomes.slice(0, 3).every(entry => !entry.unownedRebaseInfraCapExhausted)).toBe(true);
+      expect(outcomes.slice(3).every(entry => entry.unownedRebaseInfraCapExhausted && entry.unownedRebaseInfraFailures === 3)).toBe(true);
+      expect(routed).toHaveBeenCalledTimes(5); // cap never suppresses the onward routing attempt
+      expect(outcomes[4].routedTo).toBe('reconcile-finding');
+      expect(postNoteComment).toHaveBeenCalledTimes(1);
+      expect(postNoteComment.mock.calls[0][0].body).toContain('unowned-mechanical-rebase-infra:3/3');
+      expect(notifyDesktopChecked).toHaveBeenCalledTimes(1);
+    });
+
     it('REPLAY — real PR #2709 shape: persistent content-conflict skips are capped at 3 attempts and surfaced exactly once', () => {
       postNoteComment.mockClear();
       notifyDesktopChecked.mockClear();
@@ -3736,6 +3776,57 @@ describe('attempt marker writes and operator cutoff in both populations', () => 
       }));
       expect(sweep(population, { result: { action: 'current' }, comments }).attempt).not.toHaveBeenCalled();
       expect(sweep(population, { result: { action: 'current' }, comments, countSince: '2026-10-02T00:00:00Z' }).attempt).toHaveBeenCalledTimes(1);
+    });
+  }
+});
+
+
+describe('infrastructure markers and caps in both populations', () => {
+  for (const population of ['card', 'unowned']) {
+    function sweep({ comments = [], result, throws = false, markerThrows = false, head = 'abc' } = {}) {
+      const attempt = vi.fn(() => { if (throws) throw new Error('index.lock exists'); return result; });
+      const postComment = vi.fn((_repo, _pr, body) => {
+        if (markerThrows && body.startsWith(UNOWNED_REBASE_INFRA_MARKER)) throw new Error('comment write unavailable');
+      });
+      const routed = vi.fn();
+      const pr = { number: 42, mergeable: 'CONFLICTING', headRefName: 'lane/test', headRefOid: head, baseRefName: 'main',
+        labels: population === 'card' ? [{ name: 'review:pending' }] : [],
+        files: [{ path: population === 'card' ? 'backlog/123-test.md' : 'scripts/test.mjs' }] };
+      const entries = watchParkedPrConflicts({
+        repo: 'o/n', sameLineConflict: 'stand-down', listPrs: () => [pr],
+        provider: { ensureLabel() {}, setLabels() {}, postComment },
+        cardConflictSettings: { value: { autoResolveRaisedBy: population === 'card' }, sources: {} },
+        unownedRebaseSettings: { value: { countSince: null, infraRetryCap: 2 }, sources: {} },
+        listPrComments: () => comments, listAgents: () => [], listPrFiles: () => pr.files,
+        computeConflictDisposition: () => 'clean', attemptCardRebase: attempt, attemptMechanicalRebase: attempt,
+        ...noopRouting(), postFinding: routed,
+      });
+      return { entries, attempt, postComment, routed };
+    }
+
+    it.each([false, true])(`${population}: writes head-scoped infrastructure markers for errors and throws (%s)`, throws => {
+      const { postComment } = sweep({ throws, result: { action: 'error', reason: 'offline' } });
+      const markers = postComment.mock.calls.map(call => call[2]).filter(body => body.startsWith(UNOWNED_REBASE_INFRA_MARKER));
+      expect(markers).toHaveLength(1);
+      expect(markers[0]).toContain('head=abc outcome=infra:');
+      expect(countUnownedRebaseAttempts(markers.map(body => ({ body, author: { login: 'web-everything' } })))).toBe(0);
+    });
+
+    it(`${population}: marker write failure still routes onward`, () => {
+      const { routed } = sweep({ throws: true, markerThrows: true });
+      expect(routed).toHaveBeenCalled();
+    });
+
+    it(`${population}: stops at its infrastructure cap and permits a new head`, () => {
+      const comments = Array.from({ length: 2 }, () => ({
+        body: formatUnownedRebaseInfraMarker({ action: 'error', reason: 'lock' }, 'abc'),
+        author: { login: 'web-everything' },
+      }));
+      const capped = sweep({ comments });
+      expect(capped.attempt).not.toHaveBeenCalled();
+      expect(capped.entries[0]).toMatchObject({ unownedRebaseInfraCapExhausted: true, unownedRebaseInfraFailures: 2 });
+      expect(capped.routed).toHaveBeenCalled();
+      expect(sweep({ comments, head: 'new', result: { action: 'current' } }).attempt).toHaveBeenCalledTimes(1);
     });
   }
 });

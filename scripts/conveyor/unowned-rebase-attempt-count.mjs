@@ -18,7 +18,8 @@
  * nobody centrally watches.
  *
  * Only content-conflict skips spend the cap. Infrastructure failures, throws, precondition skips,
- * deferred attempts and clean successes post no marker. New markers include the outcome on their first
+ * deferred attempts and clean successes post no content marker. Infrastructure failures use a separate
+ * head-scoped marker and retry cap. New markers include the outcome on their first
  * line; legacy markers remain readable through the stable prefix.
  *
  * PURE reader (this file, mirrors every sibling counter's split); the writer (posting the marker comment) lives
@@ -48,12 +49,17 @@ export const UNOWNED_REBASE_ATTEMPT_MARKER = '🔁 conveyor — unowned mechanic
  */
 export const UNOWNED_REBASE_ATTEMPT_CAP = 3;
 
+/** Independent stable prefix: infrastructure never spends a content round. */
+export const UNOWNED_REBASE_INFRA_MARKER = '🔁 conveyor — unowned mechanical rebase infrastructure failure';
+export const UNOWNED_REBASE_INFRA_RETRY_CAP_DEFAULT = 10;
+
 /** Resolve the operator cutoff; null means count all historical attempts. */
 export function loadUnownedRebaseSettings({ env = process.env, platform = platformPreference('unownedRebase', { env }),
   repo = readSettings()?.unownedRebase } = {}) {
-  return cascadePolicy('unownedRebase', repo, { standard: { countSince: null }, platform, env,
-    envValues: { countSince: env.WE_UNOWNED_REBASE_COUNT_SINCE },
-    valid: { countSince: v => typeof v === 'string'
+  return cascadePolicy('unownedRebase', repo, { standard: { countSince: null, infraRetryCap: UNOWNED_REBASE_INFRA_RETRY_CAP_DEFAULT }, platform, env,
+    envValues: { countSince: env.WE_UNOWNED_REBASE_COUNT_SINCE,
+      infraRetryCap: env.WE_UNOWNED_REBASE_INFRA_RETRY_CAP === undefined ? undefined : Number(env.WE_UNOWNED_REBASE_INFRA_RETRY_CAP) },
+    valid: { infraRetryCap: v => Number.isInteger(v) && v > 0, countSince: v => typeof v === 'string'
       && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(v)
       && Number.isFinite(Date.parse(v)) } });
 }
@@ -93,4 +99,33 @@ export function countUnownedRebaseAttempts(comments, { countSince } = {}) {
     if (typeof body === 'string' && body.trimStart().startsWith(UNOWNED_REBASE_ATTEMPT_MARKER) && isTrustedMarkerAuthor(c)) n += 1;
   }
   return n;
+}
+
+/** An error result or caught exception spends only the infrastructure budget. */
+export function shouldCountRebaseInfra(result) {
+  return result instanceof Error || result?.thrown === true || result?.action === 'error';
+}
+
+/** Put head before the free-text reason so reason tokens cannot impersonate a head. */
+export function formatUnownedRebaseInfraMarker(result, headSha) {
+  const reason = String(result?.reason ?? result?.message ?? result ?? '')
+    .replace(/[\r\n\u2028\u2029]+/g, ' ').trim().slice(0, 120);
+  const head = headSha ? ` head=${String(headSha).replace(/\s/g, '')}` : '';
+  return `${UNOWNED_REBASE_INFRA_MARKER}${head} outcome=infra:${reason}`;
+}
+
+/** Trusted leading markers only; legacy headless markers match every head. Same cutoff as content. */
+export function countUnownedRebaseInfraFailures(comments, { countSince, headSha } = {}) {
+  if (!Array.isArray(comments)) return 0;
+  const cutoff = Date.parse(countSince);
+  return comments.filter(c => {
+    if (Date.parse(c?.createdAt) < cutoff || !isTrustedMarkerAuthor(c)) return false;
+    const body = typeof c === 'string' ? c : c?.body;
+    if (typeof body !== 'string') return false;
+    const line = body.trimStart().split(/[\r\n\u2028\u2029]/, 1)[0];
+    if (!line.startsWith(UNOWNED_REBASE_INFRA_MARKER)) return false;
+    const metadata = line.slice(UNOWNED_REBASE_INFRA_MARKER.length).split(' outcome=')[0];
+    const markerHead = metadata.match(/(?:^|\s)head=(\S+)/)?.[1];
+    return !headSha || !markerHead || markerHead === headSha;
+  }).length;
 }

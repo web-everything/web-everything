@@ -6,7 +6,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { rebaseDropManifest } from '../../lib/rebase-drop-manifest.mjs';
-import { countUnownedRebaseAttempts, UNOWNED_REBASE_ATTEMPT_MARKER, UNOWNED_REBASE_ATTEMPT_CAP, shouldCountRebaseAttempt, formatUnownedRebaseAttemptMarker, loadUnownedRebaseSettings } from '../unowned-rebase-attempt-count.mjs';
+import { UNOWNED_REBASE_INFRA_MARKER, UNOWNED_REBASE_INFRA_RETRY_CAP_DEFAULT, formatUnownedRebaseInfraMarker, shouldCountRebaseInfra, countUnownedRebaseInfraFailures, countUnownedRebaseAttempts, UNOWNED_REBASE_ATTEMPT_MARKER, UNOWNED_REBASE_ATTEMPT_CAP, shouldCountRebaseAttempt, formatUnownedRebaseAttemptMarker, loadUnownedRebaseSettings } from '../unowned-rebase-attempt-count.mjs';
 
 const AUTOMATION = { login: 'web-everything' };
 
@@ -107,8 +107,8 @@ describe('operator count cutoff', () => {
 
   it('defaults to unset with standard provenance', () => {
     const settings = loadUnownedRebaseSettings({ env: {}, platform: {}, repo: {} });
-    expect(settings.value).toEqual({ countSince: null });
-    expect(settings.sources).toEqual({ countSince: 'standard' });
+    expect(settings.value).toEqual({ countSince: null, infraRetryCap: 10 });
+    expect(settings.sources).toEqual({ countSince: 'standard', infraRetryCap: 'standard' });
   });
 
   it('loads the declared repo cutoff with tool/repo provenance', () => {
@@ -132,5 +132,93 @@ describe('operator count cutoff', () => {
     const settings = loadUnownedRebaseSettings({ platform: { countSince }, repo: { countSince }, env: { WE_UNOWNED_REBASE_COUNT_SINCE: countSince } });
     expect(settings.value.countSince).toBeNull();
     expect(settings.sources.countSince).toBe('standard');
+  });
+});
+
+
+describe('separate infrastructure retry budget', () => {
+  const marker = (headSha, createdAt) => ({
+    body: formatUnownedRebaseInfraMarker({ action: 'error', reason: 'index.lock' }, headSha),
+    author: AUTOMATION, createdAt,
+  });
+
+  it('uses distinct prefixes and never cross counts content and infrastructure', () => {
+    expect(UNOWNED_REBASE_INFRA_MARKER.startsWith(UNOWNED_REBASE_ATTEMPT_MARKER)).toBe(false);
+    expect(UNOWNED_REBASE_ATTEMPT_MARKER.startsWith(UNOWNED_REBASE_INFRA_MARKER)).toBe(false);
+    const content = { body: UNOWNED_REBASE_ATTEMPT_MARKER, author: AUTOMATION };
+    expect(countUnownedRebaseAttempts([marker('abc')])).toBe(0);
+    expect(countUnownedRebaseInfraFailures([content])).toBe(0);
+    expect(countUnownedRebaseAttempts([content, marker('abc')])).toBe(1);
+    expect(countUnownedRebaseInfraFailures([content, marker('abc')])).toBe(1);
+  });
+
+  it('formats a bounded single-line reason and includes the head', () => {
+    const body = formatUnownedRebaseInfraMarker(new Error(` lock\r\n${'x'.repeat(150)}`), 'abc');
+    expect(body).toBe(`${UNOWNED_REBASE_INFRA_MARKER} head=abc outcome=infra:${`lock ${'x'.repeat(150)}`.slice(0, 120)}`);
+    expect(formatUnownedRebaseInfraMarker({ action: 'error', reason: 'offline' }))
+      .toBe(`${UNOWNED_REBASE_INFRA_MARKER} outcome=infra:offline`);
+  });
+
+  it.each([
+    [new Error('lock'), true], [{ thrown: true, reason: 'lock' }, true],
+    [{ action: 'error' }, true], [undefined, false],
+    [{ action: 'skip', precondition: true }, false], [{ action: 'skip', deferred: true }, false],
+    [{ action: 'skip', reason: 'content conflict' }, false],
+    [{ action: 'rebased' }, false], [{ action: 'current' }, false],
+  ])('counts only errors or throws: %j', (result, expected) => {
+    expect(shouldCountRebaseInfra(result)).toBe(expected);
+  });
+
+  it('counts matching heads and legacy headless markers, or all heads when none is available', () => {
+    const comments = [marker('abc'), marker('def'), marker()];
+    expect(countUnownedRebaseInfraFailures(comments, { headSha: 'abc' })).toBe(2);
+    expect(countUnownedRebaseInfraFailures(comments, { headSha: 'new' })).toBe(1);
+    expect(countUnownedRebaseInfraFailures(comments)).toBe(3);
+    const fakeHeadInReason = { body: `${UNOWNED_REBASE_INFRA_MARKER} outcome=infra:failed head=def`, author: AUTOMATION };
+    expect(countUnownedRebaseInfraFailures([fakeHeadInReason], { headSha: 'abc' })).toBe(1);
+  });
+
+  it('uses the content cutoff semantics including missing and invalid dates', () => {
+    const comments = ['2026-10-01T00:00:00Z', '2026-10-02T00:00:00Z', '2026-10-03T00:00:00Z', undefined, 'bad-date']
+      .map(date => marker('abc', date));
+    expect(countUnownedRebaseInfraFailures(comments)).toBe(5);
+    expect(countUnownedRebaseInfraFailures(comments, { countSince: '2026-10-02T00:00:00Z', headSha: 'abc' })).toBe(4);
+  });
+
+  it('ignores untrusted, bare-string, quoted and non-leading markers', () => {
+    const { body } = marker('abc');
+    expect(countUnownedRebaseInfraFailures([
+      { body, author: { login: 'mallory' } }, body,
+      { body: `> ${body}`, author: AUTOMATION }, { body: `hello\n${body}`, author: AUTOMATION },
+    ])).toBe(0);
+    expect(countUnownedRebaseInfraFailures([{ body: `  ${body}`, author: { login: 'chalbert' } }])).toBe(1);
+    for (const input of [null, undefined, []]) expect(countUnownedRebaseInfraFailures(input)).toBe(0);
+  });
+
+  it('defaults to ten and resolves platform, repo and environment with provenance', () => {
+    expect(UNOWNED_REBASE_INFRA_RETRY_CAP_DEFAULT).toBe(10);
+    const resolve = (platform = {}, repo = {}, env = {}) => loadUnownedRebaseSettings({ platform, repo, env });
+    expect(resolve().value.infraRetryCap).toBe(10);
+    expect(resolve().sources.infraRetryCap).toBe('standard');
+    expect(resolve({ infraRetryCap: 7 }).sources.infraRetryCap).toBe('platform');
+    expect(resolve({ infraRetryCap: 7 }, { infraRetryCap: 5 }).value.infraRetryCap).toBe(5);
+    expect(resolve({}, { infraRetryCap: 5 }).sources.infraRetryCap).toBe('tool');
+    const settings = resolve({ infraRetryCap: 7 }, { infraRetryCap: 5 }, { WE_UNOWNED_REBASE_INFRA_RETRY_CAP: '3' });
+    expect(settings.value.infraRetryCap).toBe(3);
+    expect(settings.sources.infraRetryCap).toBe('env');
+  });
+
+  it.each([0, -1, 1.5, 'bad', null, true, Infinity])('rejects invalid positive integer cap %j at every layer', infraRetryCap => {
+    const settings = loadUnownedRebaseSettings({ platform: { infraRetryCap }, repo: { infraRetryCap },
+      env: { WE_UNOWNED_REBASE_INFRA_RETRY_CAP: String(infraRetryCap) } });
+    expect(settings.value.infraRetryCap).toBe(10);
+    expect(settings.sources.infraRetryCap).toBe('standard');
+  });
+
+  it('invalid overrides preserve the valid lower layer', () => {
+    const settings = loadUnownedRebaseSettings({ platform: { infraRetryCap: 4 }, repo: { infraRetryCap: 0 },
+      env: { WE_UNOWNED_REBASE_INFRA_RETRY_CAP: '1.5' } });
+    expect(settings.value.infraRetryCap).toBe(4);
+    expect(settings.sources.infraRetryCap).toBe('platform');
   });
 });
