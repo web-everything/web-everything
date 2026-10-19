@@ -389,6 +389,17 @@ describe('the live scope fence adapter over a real repository', () => {
       expect(push).not.toHaveBeenCalled();
     } finally { rmSync(r.dir, { recursive: true, force: true }); rmSync(root, { recursive: true, force: true }); }
   });
+  it('does not withhold for a bornAs line that another card only quotes in its body', () => {
+    const r = realRepo();
+    const root = mkdtempSync(join(tmpdir(), 'fix-scope-fence-backlog-'));
+    try {
+      mkdirSync(join(root, 'backlog')); writeFileSync(join(root, 'backlog', '4658-quotes.md'), '---\ntitle: quotes\n---\nbornAs: xq9test\n');
+      r.write('guard.mjs', 'safe();\n'); const head = r.commit('initial');
+      r.write('guard.mjs', 'safer();\n'); const sha = r.commit('fixer edits the scoped file');
+      const { result } = liveFence(r, { head, sha, loadItems: () => [], headRefName: 'lane/xq9test-gone', root });
+      expect(result.reason ?? '').not.toMatch(/backlog unreadable/);
+    } finally { rmSync(r.dir, { recursive: true, force: true }); rmSync(root, { recursive: true, force: true }); }
+  });
   it('keeps an extensionless file scope a FILE scope when the fixer replaces that file with an undeclared subtree', () => {
     const r = realRepo();
     try {

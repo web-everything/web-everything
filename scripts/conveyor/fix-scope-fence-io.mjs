@@ -216,11 +216,18 @@ export function createScopeFencedPush({ root, exec = execFileSync, env = process
         // A renumbered card keeps the branch's key only in its `bornAs:` line, so a miss also reads the card files for it.
         if (itemNum && !findItem(itemNum, () => items)) {
           const dir = env.WE_BACKLOG_DIR || join(root, 'backlog');
-          const bornAs = new RegExp(`^bornAs:[ \\t]*['"]?${itemNum.replace(/[^\w]/g, '\\$&')}['"]?[ \\t]*$`, 'm');
+          const bornAs = new RegExp(`^bornAs:[ \\t]*['"]?${itemNum.replace(/[^\w]/g, '\\$&')}['"]?[ \\t]*\\r?$`, 'm');
+          // Only the frontmatter counts: a card body may quote another card's `bornAs:` line. A card gone mid-scan is absent.
+          const frontmatter = f => {
+            try { return readFileSync(join(dir, f), 'utf8').match(/^---\r?\n([\s\S]*?)(?:^---[ \t]*\r?$|$(?![\s\S]))/m)?.[1] ?? ''; } catch (e) {
+              if (e?.code === 'ENOENT') return '';
+              throw e;
+            }
+          };
           let skipped = false;
           try {
             skipped = readdirSync(dir).filter(f => f.endsWith('.md'))
-              .some(f => f.startsWith(`${itemNum}-`) || bornAs.test(readFileSync(join(dir, f), 'utf8')));
+              .some(f => f.startsWith(`${itemNum}-`) || bornAs.test(frontmatter(f)));
           } catch (e) { if (e?.code !== 'ENOENT') throw new Error(`backlog unreadable: ${inertText(e?.message)}`); }
           if (skipped) throw new Error(`backlog unreadable: card ${inertText(itemNum)} exists but the loader skipped it`);
         }
