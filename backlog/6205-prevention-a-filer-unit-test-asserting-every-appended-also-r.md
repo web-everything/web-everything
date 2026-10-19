@@ -41,3 +41,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5688 (finding 1: `we:backlog/5360-prevention-add-a-check-standards-rule-that-fails-a-card-movi.md:85` — A unit test on the 'Also raised by' appender asserting every appended line ends with · key approval-prevention-key:... , plus a check:standards rule that flags 'Also raised by' lines without a key.) · key `approval-prevention-key:...``,`
