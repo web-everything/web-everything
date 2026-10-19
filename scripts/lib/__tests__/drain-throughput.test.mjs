@@ -178,17 +178,20 @@ describe('drain throughput', () => {
       await handle.catchUp(); expect(spawnImpl).toHaveBeenCalledTimes(2);
     } finally { handle.kill(); }
   });
-  it.each(['retryAt', 'firstPendingAt', 'requestAttemptedAt', 'retry-deadline', 'pending-deadline', 'request-deadline', 'unreadable', 'invalid-deadline', 'enqueue-retry', 'child-deadline'])('reruns catch-up for durable red-team scheduling: %s', async change => {
+  it.each(['retry-rewrite', 'firstPendingAt', 'requestAttemptedAt', 'unattempted-retry-deadline', 'pending-deadline', 'request-deadline', 'unreadable', 'invalid-deadline', 'enqueue-retry', 'unattempted-child-deadline'])('honors catch-up deadlines for durable red-team scheduling: %s', async change => {
     let time = 1_000;
     const head = 'a'.repeat(40);
     const pending = { headSha: head, retryAt: 601_000, firstPendingAt: 1_000, requestAttemptedAt: 1_000 };
     const state = { redTeamPending: { 'cwd#1': pending } };
-    if (change === 'child-deadline') pending.retryAt = 41_000;
+    if (['unattempted-retry-deadline', 'unattempted-child-deadline', 'invalid-deadline'].includes(change)) delete pending.requestAttemptedAt;
+    if (change === 'unattempted-retry-deadline') pending.retryAt = 121_000;
+    if (change === 'unattempted-child-deadline') pending.retryAt = 41_000;
+    if (change === 'pending-deadline') pending.requestedAt = 1_000;
     const pr = { state: 'OPEN', headRefOid: head, labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [] };
     const spawnImpl = vi.fn(() => {
       const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.kill = vi.fn();
       queueMicrotask(() => {
-        if (change === 'child-deadline') pending.retryAt = 121_000;
+        if (change === 'unattempted-child-deadline') pending.retryAt = 121_000;
         child.stdout.emit('data', JSON.stringify({ considered: 1, enqueueOutcomes: [{ num: 1, outcome: 'not-enqueued', kind: 'red-team-pending' }] }));
         child.emit('close', 0);
       });
@@ -207,27 +210,147 @@ describe('drain throughput', () => {
       await handle.catchUp(); expect(spawnImpl).toHaveBeenCalledTimes(1);
       time = 61_000;
       await handle.catchUp(); expect(spawnImpl).toHaveBeenCalledTimes(1);
-      if (['retryAt', 'firstPendingAt', 'requestAttemptedAt'].includes(change)) pending[change] += 1;
-      if (change === 'retry-deadline') { pending.requestedAt = 1_000; time = pending.retryAt; }
-      if (change === 'pending-deadline') { pending.requestedAt = 1_000; time = 241_000; }
+      if (change === 'retry-rewrite') { pending.retryAt += 1; pending.checkedAt = time; }
+      if (['firstPendingAt', 'requestAttemptedAt'].includes(change)) pending[change] += 1;
+      if (change === 'unattempted-retry-deadline') time = pending.retryAt;
+      if (change === 'pending-deadline') time = 241_000;
       if (change === 'request-deadline') time = 181_000;
       if (change === 'enqueue-retry') state.enqueueFailures = { 'o/r#1': { headSha: head, retryAt: 121_000 } };
       if (change === 'unreadable') state.unreadable = true;
       if (change === 'invalid-deadline') pending.retryAt = 'unknown';
       time = Math.max(time, 121_000);
-      await handle.catchUp(); expect(spawnImpl).toHaveBeenCalledTimes(2);
+      await handle.catchUp(); expect(spawnImpl).toHaveBeenCalledTimes(change === 'retry-rewrite' ? 1 : 2);
     } finally { handle.kill(); }
   });
   it.each([
-    { retryAt: 101_000, firstPendingAt: 1_000, requestAttemptedAt: 1_000, due: 101_000 },
-    { retryAt: 601_000, firstPendingAt: 1_000, requestedAt: 1_000, due: 241_000 },
-    { retryAt: 601_000, firstPendingAt: 1_000, requestAttemptedAt: 1_000, due: 181_000 },
+    { retryAt: 101_000, firstPendingAt: 1_000, due: 101_000 },
+    { retryAt: 101_000, firstPendingAt: 1_000, requestedAt: 1_000, due: 241_000 },
+    { retryAt: 1_000, firstPendingAt: 1_000, requestedAt: 1_000, due: 241_000 },
+    { retryAt: 101_000, firstPendingAt: 1_000, requestAttemptedAt: 1_000, due: 181_000 },
+    { retryAt: 1_000, firstPendingAt: 1_000, requestAttemptedAt: 1_000, due: 181_000 },
   ])('ends the memo at the earliest scheduling deadline: $due', ({ due, ...pending }) => {
     const pr = { headRefOid: 'a', labels: [] };
     const evidence = { scheduling: { redTeamPending: { headSha: 'a', ...pending }, redTeamPendingMaxMin: 4, redTeamRequestCooldownMin: 3 } };
     const previous = { kind: 'red-team-pending', recordedAt: 1_000, signature: holdSignature(pr, evidence) };
     expect(unchangedHold(previous, pr, evidence, { now: due - 1 })).toBe(true);
     expect(unchangedHold(previous, pr, evidence, { now: due })).toBe(false);
+  });
+
+  it.each(['shared', 'local'])('ends the memo at an unspent pending deadline (%s)', location => {
+    const pr = { headRefOid: 'a', labels: [] };
+    const redTeamPending = { headSha: 'a', firstPendingAt: 1_000, checkedAt: 200_000, requestedAt: 1_000, retryAt: 101_000 };
+    const evidence = { scheduling: { redTeamPendingMaxMin: 4,
+      ...(location === 'shared' ? { redTeamPending } : { local: { redTeamPending } }) } };
+    const previous = { kind: 'red-team-pending', recordedAt: 200_000, signature: holdSignature(pr, evidence) };
+    expect(unchangedHold(previous, pr, evidence, { now: 240_999 })).toBe(true);
+    expect(unchangedHold(previous, pr, evidence, { now: 241_000 })).toBe(false);
+  });
+
+  it.each(['shared', 'local'])('preserves TTL after an old pending deadline is spent (%s)', location => {
+    const pr = { headRefOid: 'a', labels: [] };
+    const now = 3 * 24 * 60 * 60_000;
+    const redTeamPending = { headSha: 'a', firstPendingAt: 1_000, checkedAt: 242_000,
+      requestedAt: 1_000, retryAt: 101_000 };
+    const evidence = { scheduling: { redTeamPendingMaxMin: 4,
+      ...(location === 'shared' ? { redTeamPending } : { local: { redTeamPending } }) } };
+    const previous = { kind: 'red-team-pending', recordedAt: now, signature: holdSignature(pr, evidence) };
+    expect(unchangedHold(previous, pr, evidence, { now: now + 60_000 })).toBe(true);
+    expect(unchangedHold(previous, pr, evidence, { now: now + 15 * 60_000 })).toBe(false);
+  });
+
+  it.each(['shared', 'local'])('reruns a never-attempted request with passed retryAt after the pending deadline is spent (%s)', location => {
+    const pr = { headRefOid: 'a', labels: [] };
+    const now = 3 * 24 * 60 * 60_000;
+    const redTeamPending = { headSha: 'a', firstPendingAt: 1_000, checkedAt: 242_000, retryAt: now + 1_000 };
+    const evidence = { scheduling: { redTeamPendingMaxMin: 4,
+      ...(location === 'shared' ? { redTeamPending } : { local: { redTeamPending } }) } };
+    const previous = { kind: 'red-team-pending', recordedAt: now, signature: holdSignature(pr, evidence) };
+    expect(unchangedHold(previous, pr, evidence, { now })).toBe(true);
+    expect(unchangedHold(previous, pr, evidence, { now: now + 1_000 })).toBe(false);
+  });
+
+  it.each(['requestedAt', 'requestAttemptedAt'])('requires finite retryAt after %s while allowing a stale finite retryAt', field => {
+    const pr = { headRefOid: 'a', labels: [] };
+    for (const location of ['shared', 'local']) {
+      const redTeamPending = { headSha: 'a', firstPendingAt: 1_000, [field]: 1_000, retryAt: 1_000 };
+      const evidence = { scheduling: { redTeamPendingMaxMin: 4, redTeamRequestCooldownMin: 3,
+        ...(location === 'shared' ? { redTeamPending } : { local: { redTeamPending } }) } };
+      const previous = { kind: 'red-team-pending', recordedAt: 1_000, signature: holdSignature(pr, evidence) };
+      expect(unchangedHold(previous, pr, evidence, { now: 61_000 })).toBe(true);
+      for (const retryAt of [NaN, Infinity, undefined, 'x']) {
+        redTeamPending.retryAt = retryAt;
+        expect(unchangedHold(previous, pr, evidence, { now: 61_000 })).toBe(false);
+      }
+    }
+  });
+
+  it.each(['requestedAt', 'requestAttemptedAt'])('reruns on invalid %s even with a recorded request', field => {
+    const pr = { headRefOid: 'a', labels: [] };
+    for (const location of ['shared', 'local']) {
+      for (const value of [NaN, Infinity, 'x']) {
+        const redTeamPending = { headSha: 'a', firstPendingAt: 1_000, requestedAt: 1_000,
+          requestAttemptedAt: 1_000, retryAt: 101_000, [field]: value };
+        const evidence = { scheduling: { redTeamPendingMaxMin: 4, redTeamRequestCooldownMin: 3,
+          ...(location === 'shared' ? { redTeamPending } : { local: { redTeamPending } }) } };
+        const previous = { kind: 'red-team-pending', recordedAt: 1_000, signature: holdSignature(pr, evidence) };
+        expect(unchangedHold(previous, pr, evidence, { now: 61_000 })).toBe(false);
+      }
+    }
+  });
+
+  it.each(['requestedAt', 'requestAttemptedAt'])('ignores retryAt and checkedAt rewrites after %s without mutating evidence', field => {
+    const pr = { headRefOid: 'a', labels: [] };
+    const pending = { headSha: 'a', retryAt: 101_000, checkedAt: 1_000, firstPendingAt: 1_000,
+      [field]: 1_000, observation: 'pending', commentCount: 2, reason: 'waiting' };
+    const evidence = { scheduling: { redTeamPending: { ...pending }, local: { redTeamPending: { ...pending } },
+      enqueueFailure: { headSha: 'a', retryAt: 301_000 }, redTeamPendingMaxMin: 4, redTeamRequestCooldownMin: 3 } };
+    const original = structuredClone(evidence);
+    const signature = holdSignature(pr, evidence);
+    expect(evidence).toEqual(original);
+    const previous = { kind: 'red-team-pending', recordedAt: 1_000, signature };
+    for (const entry of [evidence.scheduling, evidence.scheduling.local]) {
+      entry.redTeamPending.retryAt = 121_000;
+      entry.redTeamPending.checkedAt = 61_000;
+    }
+    const rewritten = structuredClone(evidence);
+    expect(holdSignature(pr, evidence)).toBe(signature);
+    expect(unchangedHold(previous, pr, evidence, { now: 150_000 })).toBe(true);
+    expect(evidence).toEqual(rewritten);
+    const due = field === 'requestedAt' ? 241_000 : 181_000;
+    expect(unchangedHold(previous, pr, evidence, { now: due - 1 })).toBe(true);
+    expect(unchangedHold(previous, pr, evidence, { now: due })).toBe(false);
+    for (const location of ['shared', 'local']) {
+      for (const key of ['headSha', 'firstPendingAt', 'requestedAt', 'requestAttemptedAt', 'observation', 'commentCount', 'reason']) {
+        const changed = structuredClone(evidence);
+        const entry = location === 'shared' ? changed.scheduling : changed.scheduling.local;
+        entry.redTeamPending[key] = 'changed';
+        expect(holdSignature(pr, changed)).not.toBe(signature);
+      }
+      const changed = structuredClone(evidence);
+      const entry = location === 'shared' ? changed.scheduling : changed.scheduling.local;
+      entry.enqueueFailure = { headSha: 'a', retryAt: 302_000 };
+      expect(holdSignature(pr, changed)).not.toBe(signature);
+    }
+  });
+
+  it.each([
+    { pending: { headSha: 'b' } },
+    { pending: { firstPendingAt: NaN } },
+    { policy: { redTeamPendingMaxMin: Infinity } },
+    { policy: { redTeamPendingMaxMin: 0 } },
+    { pending: { requestedAt: null, requestAttemptedAt: NaN } },
+    { pending: { requestedAt: null, requestAttemptedAt: 1_000 }, policy: { redTeamRequestCooldownMin: NaN } },
+    { pending: { requestedAt: null, requestAttemptedAt: 1_000 }, policy: { redTeamRequestCooldownMin: 0 } },
+    { pending: { requestedAt: null, requestAttemptedAt: null, retryAt: undefined } },
+    { pending: { requestedAt: null, requestAttemptedAt: null, retryAt: 'unknown' } },
+  ])('reruns on invalid pending scheduling evidence: %j', ({ pending, policy }) => {
+    const pr = { headRefOid: 'a', labels: [] };
+    const scheduling = { redTeamPending: { headSha: 'a', firstPendingAt: 1_000, requestedAt: 1_000, retryAt: 101_000, ...pending },
+      redTeamPendingMaxMin: 4, redTeamRequestCooldownMin: 3, ...policy };
+    for (const evidence of [{ scheduling }, { scheduling: { ...scheduling, redTeamPending: undefined, local: { redTeamPending: scheduling.redTeamPending } } }]) {
+      const previous = { kind: 'red-team-pending', recordedAt: 1_000, signature: holdSignature(pr, evidence) };
+      expect(unchangedHold(previous, pr, evidence, { now: 61_000 })).toBe(false);
+    }
   });
 
   it('bounds all holds by the earliest enqueue retry, TTL and overlap deadline', () => {

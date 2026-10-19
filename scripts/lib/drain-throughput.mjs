@@ -31,6 +31,16 @@ export function createHoldMemo(enabled) {
 export const HOLD_KINDS = new Set(['red-team-pending', 'overlap-yield', 'review-hold', 'numbering']);
 export function holdSignature(pr, evidence) {
   if (!pr?.headRefOid || !Array.isArray(pr.labels)) return null;
+  const stableEntry = entry => {
+    if (!entry?.redTeamPending) return entry;
+    const { retryAt, checkedAt, ...redTeamPending } = entry.redTeamPending;
+    return { ...entry, redTeamPending };
+  };
+  if (evidence?.scheduling) {
+    const scheduling = stableEntry(evidence.scheduling);
+    evidence = { ...evidence, scheduling: { ...scheduling,
+      ...(scheduling.local ? { local: stableEntry(scheduling.local) } : {}) } };
+  }
   return createHash('sha256').update(JSON.stringify({ head: pr.headRefOid,
     labels: pr.labels.map(l => typeof l === 'string' ? l : l.name).sort(),
     updatedAt: pr.updatedAt, comments: pr.comments, reviews: pr.reviews, evidence })).digest('hex');
@@ -48,10 +58,18 @@ export function unchangedHold(previous, pr, evidence, { now = Date.now(), maxMin
       if (enqueueFailure && (enqueueFailure.headSha !== pr?.headRefOid
         || !Number.isFinite(enqueueFailure.retryAt) || now >= enqueueFailure.retryAt)) return false;
       if (redTeamPending) {
-        if (redTeamPending.headSha !== pr?.headRefOid || !Number.isFinite(redTeamPending.retryAt)
+        if (redTeamPending.headSha !== pr?.headRefOid
+          || !Number.isFinite(redTeamPending.retryAt)
+          || (redTeamPending.requestedAt != null && !Number.isFinite(redTeamPending.requestedAt))
+          || (redTeamPending.requestAttemptedAt != null && !Number.isFinite(redTeamPending.requestAttemptedAt))
           || !Number.isFinite(redTeamPending.firstPendingAt) || !Number.isFinite(redTeamPendingMaxMin)
           || redTeamPendingMaxMin <= 0) return false;
-        const deadlines = [redTeamPending.retryAt, redTeamPending.firstPendingAt + redTeamPendingMaxMin * 60_000];
+        const pendingDeadline = redTeamPending.firstPendingAt + redTeamPendingMaxMin * 60_000;
+        const checkedAt = Number.isFinite(redTeamPending.checkedAt) ? redTeamPending.checkedAt : redTeamPending.firstPendingAt;
+        const deadlines = checkedAt < pendingDeadline ? [pendingDeadline] : [];
+        if (redTeamPending.requestedAt == null && redTeamPending.requestAttemptedAt == null) {
+          deadlines.push(redTeamPending.retryAt);
+        }
         if (redTeamPending.requestedAt == null && redTeamPending.requestAttemptedAt != null) {
           if (!Number.isFinite(redTeamPending.requestAttemptedAt) || !Number.isFinite(redTeamRequestCooldownMin)
             || redTeamRequestCooldownMin <= 0) return false;

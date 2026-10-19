@@ -513,12 +513,13 @@ describe('catch-up handle', () => {
     ['10 minutes after child end', 10, null, true],
     ['16 minutes after child end', 16, null, false],
     ['enqueue retry deadline passed', 10, 'enqueueFailures', false],
-    ['red-team retry deadline passed', 10, 'redTeamPending', false],
-  ])('measures unchanged hold age from child completion: %s', async (_name, minutesAfterEnd, retryState, skips) => {
+    ['requested red-team retry deadline passed', 10, 'redTeamPending', true],
+    ['unattempted red-team retry deadline passed', 10, 'redTeamPending', false, null],
+  ])('measures unchanged hold age from child completion: %s', async (_name, minutesAfterEnd, retryState, skips, requestedAt = 1_000) => {
     const head = 'a'.repeat(40);
     const state = retryState ? { [retryState]: { [`${REPO}#42`]: {
       headSha: head, retryAt: 1_000 + 600_000 + 5 * 60_000,
-      firstPendingAt: 1_000, requestedAt: 1_000,
+      firstPendingAt: 1_000, requestedAt,
     } } } : {};
     const f = catchUpSetup({
       resolveSetting: () => ({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp, intervalMinutes: 1 } }),
