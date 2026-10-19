@@ -22,7 +22,7 @@ const ok = () => ({ status: 0, stdout: Buffer.from('[]'), stderr: Buffer.alloc(0
 /** Fill every slot with a LIVE holder (this test process), exactly like the outer `runGhSync` callers did. */
 function fillPool(lockRoot, cap) {
   for (let i = 0; i < cap; i += 1) {
-    const r = acquireGhSlotSync({ lockRoot, cap, owner: `${process.pid}:outer-${i}`, pid: process.pid, timeoutMs: 0, sleep: () => {} });
+    const r = acquireGhSlotSync({ lockRoot, cap, reservedBackgroundSlots: 0, owner: `${process.pid}:outer-${i}`, pid: process.pid, timeoutMs: 0, sleep: () => {} });
     expect(r.ok).toBe(true);
   }
 }

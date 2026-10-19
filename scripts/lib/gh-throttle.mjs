@@ -26,7 +26,15 @@
  * heavy-command concurrency are two independent pools sharing one proven mechanism, not two copies of it. A
  * second implementation of that policy would be exactly what #2607 forbids (heavy-admission.mjs's own header).
  *
- * THE CAP IS DELIBERATELY WELL UNDER GitHub's 100-concurrent secondary ceiling (`DEFAULT_GH_CONCURRENCY_CAP`,
+ * Slot pools are keyed by ghAuthIdentity (the same identity as budget blocks/backoff). ghThrottle's
+ * cascade resolves slotsPerIdentity=6, hostMaxSlots=24 and reservedBackgroundSlots=1. The reservation is
+ * clamped below slotsPerIdentity; only background calls may use it, and background may also use shared
+ * capacity. A short atomic admission mutex protects identity counts and claims in the shared host slot
+ * table. Each slot carries pool/class metadata; legacy slots count against the default identity.
+ * WE_GH_THROTTLE_CAP remains an alias for WE_GH_THROTTLE_SLOTS_PER_IDENTITY. Host and reservation env
+ * overrides are WE_GH_THROTTLE_HOST_MAX_SLOTS and WE_GH_THROTTLE_RESERVED_BACKGROUND_SLOTS.
+ *
+ * THE PER-IDENTITY CAP IS DELIBERATELY WELL UNDER GitHub's 100-concurrent secondary ceiling (`DEFAULT_GH_CONCURRENCY_CAP`,
  * overridable via `WE_GH_THROTTLE_CAP`) — conservative by the same design principle heavy-admission.mjs states
  * for its own cap (below measured/documented capacity, never near-full-utilization), leaving headroom for
  * whatever else on the host also calls `gh` outside this wrapper (the 84 not-yet-migrated sites).
@@ -199,9 +207,9 @@ import { resolveFinishedCiCacheSettings, finishedCiAuthScope, classifyFinishedCi
 
 // ── TUNING (env-overridable, mirroring heavy-admission.mjs's own resolve*() convention) ────────────────────
 
-/** Concurrency cap for `gh` calls routed through this wrapper — conservative against GitHub's 100-concurrent
+/** Per-identity concurrency cap for `gh` calls routed through this wrapper — conservative against GitHub's 100-concurrent
  *  secondary ceiling, leaving headroom for callers not yet migrated. Overridable via `WE_GH_THROTTLE_CAP`. */
-export const DEFAULT_GH_CONCURRENCY_CAP = 6;
+export const DEFAULT_GH_CONCURRENCY_CAP = GH_SLOT_POOL_STANDARD.slotsPerIdentity;
 
 /** How often a blocked caller re-polls for a free slot (`gh` calls are far shorter than a heavy command, so
  *  this polls faster than heavy-admission.mjs's 2000ms default). */
@@ -667,9 +675,14 @@ const CALL_LOG_FILENAME = 'calls.jsonl';
 const WRITE_BUDGET_LOCK_KEY = 'write-budget';
 const WRITE_BUDGET_STATE_FILENAME = 'write-budget-state.json';
 
+/** Identity quotas share the existing ghThrottle settings cascade and its source logging. */
+export { GH_SLOT_POOL_STANDARD } from './gh-throttle-holders.mjs';
+export function resolveGhSlotPools(env = process.env, settings) {
+  const r = loadGhThrottleSettings({ env, ...(settings ? { file: settings } : {}) });
+  return { ...r.value, reservedBackgroundSlots: Math.min(r.value.reservedBackgroundSlots, r.value.slotsPerIdentity - 1), source: r.sources };
+}
 export function resolveGhCap(env = process.env) {
-  const n = Number(env.WE_GH_THROTTLE_CAP);
-  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_GH_CONCURRENCY_CAP;
+  return resolveGhSlotPools(env).slotsPerIdentity;
 }
 
 export function resolveAcquireTimeoutMs(env = process.env) {
@@ -1114,7 +1127,7 @@ function recordGhThrottleMetric(name, value, { op, attempt, source, outcome, uni
 // in the header import block, to keep this change's hunks clear of the open gh-throttle PRs).
 import { classifyGhResource, parseGhApiArgs } from './gh-argv.mjs';
 export { classifyGhResource } from './gh-argv.mjs';
-import { acquireGhHolderSlot, ghHolderPolicy, ghHolderMeta, ghExecOptions, ghCallHoldFields, isGhWatch, ghHoldersSummary, ghOpLabel, ghCommandPath, ghCommandWords, sanitizeGhHolder } from './gh-throttle-holders.mjs';
+import { GH_SLOT_POOL_STANDARD, loadGhThrottleSettings, acquireGhHolderSlot, ghHolderPolicy, ghHolderMeta, ghExecOptions, ghCallHoldFields, isGhWatch, ghHoldersSummary, ghOpLabel, ghCommandPath, ghCommandWords, sanitizeGhHolder } from './gh-throttle-holders.mjs';
 
 // ── the concurrency semaphore — thin orchestration over heavy-admission.mjs's own primitives ────────────────
 
@@ -1126,12 +1139,13 @@ import { acquireGhHolderSlot, ghHolderPolicy, ghHolderMeta, ghExecOptions, ghCal
  * themselves run via `execFileSync`/`spawnSync`, not an async `exec`.
  */
 export function acquireGhSlotSync({
-  lockRoot, cap, owner, pid = process.pid,
+  lockRoot, cap = DEFAULT_GH_CONCURRENCY_CAP, owner, pid = process.pid,
+  identity = 'default', class: waitClass = 'priority', hostMaxSlots = GH_SLOT_POOL_STANDARD.hostMaxSlots, reservedBackgroundSlots = GH_SLOT_POOL_STANDARD.reservedBackgroundSlots,
   pollMs = DEFAULT_ACQUIRE_POLL_MS, timeoutMs = DEFAULT_ACQUIRE_TIMEOUT_MS,
   now = () => Date.now(), sleep = sleepSyncMs,
   meta = ghHolderMeta({ caller: 'unknown', args: [], pid }), policy = ghHolderPolicy(), logPath, warn,
 }) {
-  return acquireGhHolderSlot({ lockRoot, cap, owner, pid, pollMs, timeoutMs, now, sleep, meta, policy,
+  return acquireGhHolderSlot({ lockRoot, cap: hostMaxSlots, poolLimits: { identity, class: waitClass, slotsPerIdentity: cap, reservedBackgroundSlots: Math.max(0, Math.min(reservedBackgroundSlots, cap - 1)) }, owner, pid, pollMs, timeoutMs, now, sleep, meta, policy,
     trySlot: (opts) => tryAcquireSlot({ ...opts, leaseMinutes: ADMISSION_LEASE_MINUTES }),
     onReap: (holder) => {
       recordGhCallLogEntry(logPath || ghThrottleLogPath(lockRoot), { outcome: 'slot_reaped', ...holder });
@@ -1142,8 +1156,8 @@ export function acquireGhSlotSync({
 }
 
 /** Release whichever `gh`-call slot `owner` holds (idempotent — a no-op if it holds none). */
-export function releaseGhSlotSync({ lockRoot, cap, owner }) {
-  return releaseOwnedSlot({ lockRoot, cap, owner });
+export function releaseGhSlotSync({ lockRoot, cap, hostMaxSlots = Math.max(GH_SLOT_POOL_STANDARD.hostMaxSlots, cap ?? 0), owner }) {
+  return releaseOwnedSlot({ lockRoot, cap: hostMaxSlots, fastSlots: 0, owner });
 }
 
 /**
@@ -1153,8 +1167,9 @@ export function releaseGhSlotSync({ lockRoot, cap, owner }) {
  * (it stays a pure passthrough of whatever argv gh itself takes, by design — see the module header).
  * @test-only-export-ok: operator diagnostic seam mirroring an existing wired one, no internal caller yet
  */
-export function ghThrottleStatus({ lockRoot, cap }) {
-  return admissionStatus({ lockRoot, cap });
+export function ghThrottleStatus({ lockRoot, cap, hostMaxSlots = cap ?? resolveGhSlotPools().hostMaxSlots }) {
+  const status = admissionStatus({ lockRoot, cap: hostMaxSlots });
+  return { ...status, held: status.held.map(h => ({ ...h, pool: h.meta?.pool ?? 'default', class: h.meta?.class ?? 'priority' })) };
 }
 
 // ── the per-minute points budget (#3670) — a SECOND, independent gate over SPEND, not concurrency ────────────
@@ -1588,8 +1603,8 @@ function slotTimeoutMessage(logPath, acq, entry, settings, waitClass, warn) {
     return null;
   }
   const waitedMs = acq.waitedMs ?? 0;
-  recordGhCallLogEntry(logPath, { ...entry, points: 0, outcome: 'slot_throttled', waitedMs, class: waitClass });
-  const message = `gh-throttle: throttled — no gh slot within ${waitedMs / 1000}s (class=${waitClass}); retry next tick\n`;
+  recordGhCallLogEntry(logPath, { ...entry, points: 0, outcome: 'slot_throttled', waitedMs, pool: entry.id, class: waitClass });
+  const message = `gh-throttle: throttled — no gh slot within ${waitedMs / 1000}s (pool=${entry.id}, class=${waitClass}); retry next tick\n`;
   try { (warn || (m => process.stderr.write(m)))(message); } catch { /* best-effort */ }
   return message;
 }
@@ -1848,7 +1863,10 @@ function runGhSyncUnmemoized(args, opts = {}) {
   const env = throttle.env || process.env;
   const repo = throttle.repo || process.cwd();
   const lockRoot = throttle.lockRoot || ghThrottleLockRoot(repo, env);
-  const cap = throttle.cap != null ? throttle.cap : resolveGhCap(env);
+  const slotPools = resolveGhSlotPools(env);
+  const cap = throttle.cap != null ? throttle.cap : slotPools.slotsPerIdentity;
+  const hostMaxSlots = throttle.hostMaxSlots ?? slotPools.hostMaxSlots;
+  const reservedBackgroundSlots = throttle.reservedBackgroundSlots ?? slotPools.reservedBackgroundSlots;
   const acquireTimeoutMs = throttle.acquireTimeoutMs != null ? throttle.acquireTimeoutMs : resolveAcquireTimeoutMs(env);
   const pollMs = throttle.pollMs != null ? throttle.pollMs : DEFAULT_ACQUIRE_POLL_MS;
   const maxAttempts = throttle.maxAttempts != null ? throttle.maxAttempts : resolveRetryMaxAttempts(env);
@@ -1950,12 +1968,12 @@ function runGhSyncUnmemoized(args, opts = {}) {
     const acq = gated ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
       acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      return isGhWatch(args) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args, pid, nowMs: now(), timeoutMs: ghExecOptions(execOpts, args, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
+      return isGhWatch(args) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap, hostMaxSlots, reservedBackgroundSlots, identity, class: waitClass, owner, pid, pollMs, timeoutMs: slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args, pid, nowMs: now(), timeoutMs: ghExecOptions(execOpts, args, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
     }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
     const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, slotWait, waitClass, throttle.warn);
     if (throttledMessage) {
       const error = new Error(throttledMessage);
-      Object.assign(error, { status: 1, stdout: '', stderr: throttledMessage, ghThrottled: { class: waitClass, waitedMs: acq.waitedMs ?? 0 } });
+      Object.assign(error, { status: 1, stdout: '', stderr: throttledMessage, ghThrottled: { pool: identity, class: waitClass, waitedMs: acq.waitedMs ?? 0 } });
       throw error;
     }
     let result;
@@ -1974,7 +1992,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
     } catch (e) {
       failure = e;
     } finally {
-      if (acq.ok) failOpenGate('release', () => releaseGhSlotSync({ lockRoot, cap, owner }), gateOpts);
+      if (acq.ok) failOpenGate('release', () => releaseGhSlotSync({ lockRoot, cap, hostMaxSlots, owner }), gateOpts);
     }
     if (!failure && isGhDeferred(result)) return result; // nested CLI deferral is not a landed write
     const captured = lastCapture;
@@ -2130,7 +2148,10 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
   const env = throttle.env || process.env;
   const repo = throttle.repo || process.cwd();
   const lockRoot = throttle.lockRoot || ghThrottleLockRoot(repo, env);
-  const cap = throttle.cap != null ? throttle.cap : resolveGhCap(env);
+  const slotPools = resolveGhSlotPools(env);
+  const cap = throttle.cap != null ? throttle.cap : slotPools.slotsPerIdentity;
+  const hostMaxSlots = throttle.hostMaxSlots ?? slotPools.hostMaxSlots;
+  const reservedBackgroundSlots = throttle.reservedBackgroundSlots ?? slotPools.reservedBackgroundSlots;
   const maxBuffer = throttle.maxBuffer != null ? throttle.maxBuffer : DEFAULT_GH_CLI_MAX_BUFFER;
   const acquireTimeoutMs = throttle.acquireTimeoutMs != null ? throttle.acquireTimeoutMs : resolveAcquireTimeoutMs(env);
   const pollMs = throttle.pollMs != null ? throttle.pollMs : DEFAULT_ACQUIRE_POLL_MS;
@@ -2219,7 +2240,7 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
     const acq = gated && !outer ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
       acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      return isGhWatch(argv) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args: argv, pid, nowMs: now(), timeoutMs: ghExecOptions(spawnOpts, argv, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
+      return isGhWatch(argv) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap, hostMaxSlots, reservedBackgroundSlots, identity, class: waitClass, owner, pid, pollMs, timeoutMs: slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args: argv, pid, nowMs: now(), timeoutMs: ghExecOptions(spawnOpts, argv, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
     }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
     const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv, ...(outer ? { outer } : {}) }, slotWait, waitClass, throttle.warn);
     if (throttledMessage) return { status: 1, throttled: true, stdout: Buffer.alloc(0), stderr: Buffer.from(throttledMessage) };
@@ -2230,7 +2251,7 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
       // A nested call runs under the outer exec's timeout and kill signal, never its own default over the outer's.
       r = spawn(bin, argv, ghExecOptions(outerLimits === null ? spawnOpts : { ...spawnOpts, ...outerLimits }, argv, ghHolderPolicy(env)));
     } finally {
-      if (acq.ok) failOpenGate('release', () => releaseGhSlotSync({ lockRoot, cap, owner }), gateOpts);
+      if (acq.ok) failOpenGate('release', () => releaseGhSlotSync({ lockRoot, cap, hostMaxSlots, owner }), gateOpts);
     }
     if (r.error) { recordGhCallLogEntry(logPath, { op: opLabel, attempt, points, outcome: 'call', ok: false, caller, inv, ...ghCallHoldFields(argv, r.error), ...(outer ? { outer } : {}) }); throw r.error; } // e.g. `gh` not on PATH — not a `gh`-level failure to retry
     const stdoutOverflow = capture && r.stdout && r.stdout.length > maxBuffer;

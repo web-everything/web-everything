@@ -47,7 +47,7 @@ it.each([['lane-pool-health-watch-we', 'background', 8000], ['review-daemon.mjs'
   try { runGhSync(READ, { encoding: 'utf8', throttle: f.throttle }); } catch (e) { error = e; }
   expect(error).toBeInstanceOf(Error);
   expect(error).toMatchObject({ status: 1, stdout: '', ghThrottled: { class: cls, waitedMs } });
-  expect(error.stderr).toBe(`gh-throttle: throttled — no gh slot within ${waitedMs / 1000}s (class=${cls}); retry next tick\n`);
+  expect(error.stderr).toBe(`gh-throttle: throttled — no gh slot within ${waitedMs / 1000}s (pool=default, class=${cls}); retry next tick\n`);
   expect(isGhThrottled(error)).toBe(true);
   expect(f.elapsed()).toBe(waitedMs);
   expect(f.throttle.exec).not.toHaveBeenCalled();

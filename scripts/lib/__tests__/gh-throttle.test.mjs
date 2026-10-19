@@ -292,13 +292,13 @@ describe('acquireGhSlotSync / releaseGhSlotSync — cap-independent slots over a
     let clock = 0;
     const now = () => clock;
     const sleep = (ms) => { clock += ms; };
-    const a = acquireGhSlotSync({ lockRoot, cap, owner: 'A', now, sleep, timeoutMs: 10 });
-    const b = acquireGhSlotSync({ lockRoot, cap, owner: 'B', now, sleep, timeoutMs: 10 });
+    const a = acquireGhSlotSync({ lockRoot, cap, reservedBackgroundSlots: 0, owner: 'A', now, sleep, timeoutMs: 10 });
+    const b = acquireGhSlotSync({ lockRoot, cap, reservedBackgroundSlots: 0, owner: 'B', now, sleep, timeoutMs: 10 });
     expect(a.ok).toBe(true);
     expect(b.ok).toBe(true);
     expect(new Set([a.slot, b.slot]).size).toBe(2);
 
-    const c = acquireGhSlotSync({ lockRoot, cap, owner: 'C', now, sleep, pollMs: 5, timeoutMs: 20 });
+    const c = acquireGhSlotSync({ lockRoot, cap, reservedBackgroundSlots: 0, owner: 'C', now, sleep, pollMs: 5, timeoutMs: 20 });
     expect(c.ok).toBe(false);
     expect(c.timedOut).toBe(true);
     expect(ghThrottleStatus({ lockRoot, cap }).heldCount).toBe(2);

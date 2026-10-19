@@ -12,7 +12,7 @@ let root, logPath;
 const policy = { maxHoldSeconds: 90, reapGraceSeconds: 15, perCallerMax: 4 };
 const clock = 1_800_000_000_000;
 function acquire(owner, caller = 'worker', extra = {}) {
-  return acquireGhSlotSync({ lockRoot: root, logPath, cap: 6, owner, pid: process.pid, meta: ghHolderMeta({ caller, args: ['api', 'user'], nowMs: clock }), now: () => clock, sleep: () => {}, timeoutMs: 0, policy, warn: () => {}, ...extra });
+  return acquireGhSlotSync({ lockRoot: root, logPath, cap: 6, reservedBackgroundSlots: 0, owner, pid: process.pid, meta: ghHolderMeta({ caller, args: ['api', 'user'], nowMs: clock }), now: () => clock, sleep: () => {}, timeoutMs: 0, policy, warn: () => {}, ...extra });
 }
 function rows() { return readFileSync(logPath, 'utf8').trim().split('\n').map(JSON.parse); }
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'gh-holders-')); logPath = join(root, 'calls.jsonl'); });
