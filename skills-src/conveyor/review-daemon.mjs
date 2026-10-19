@@ -75,6 +75,8 @@ import { withReviewFetchTick } from '../../scripts/lib/review-fetch.mjs';
  * pass in this repo (`runner.mjs`'s `makeCliMechanicalPasses`) — it never fails the review tick itself.
  */
 
+import { readReviewEvidenceAtHead } from '../../scripts/lib/review-evidence-at-head.mjs';
+import { readRedTeamTiming } from '../../scripts/lib/red-team-gate.mjs';
 import { readFileSync } from 'node:fs';
 import { cascadePolicy } from '../../scripts/lib/policy-cascade.mjs';
 import { resolve } from 'node:path';
@@ -321,6 +323,15 @@ export const headBoundRedTeamCiGate = (gate, head) => input => {
     ? { ...facts, allowed: false, reason: 'head-changed' } : facts;
 };
 
+/** Pure plan for an otherwise eligible drain request; reason is also its dry-run explanation. */
+export function planRedTeamRequestAction({ request, subject, evidence, setting, atRoundCap }) {
+  if (!subject || subject.headRefOid?.toLowerCase() !== request.head.toLowerCase())
+    return { action: 'skip', reason: 'request head is not current' };
+  if (evidence || !setting) return { action: 'job', reason: 'dispatch red-team job' };
+  if (atRoundCap) return { action: 'skip', reason: `review round cap reached for #${request.pr}` };
+  return { action: 'fresh-review', reason: `would dispatch fresh review for #${request.pr} @${request.head.slice(0, 8)}` };
+}
+
 /**
  * One tick: discover PRs owed a review (`reconcile`), dispatch an independent review for each
  * (`dispatch`), then apply the two purely-informative labels (`tagRound`/`tagStatus`) — the exact sequence
@@ -387,6 +398,9 @@ export function runReviewTick({
   notePromotions = null,
   onPlan = null,
   readRedTeamRequests = null,
+  readReviewEvidence = null,
+  redTeamTimingSetting = readRedTeamTiming,
+  log = () => {},
   finishRedTeamRequest = finishDrainRedTeamRequest,
   // Clock for the operator-hold snapshot's `observedAt` (injectable so tests stay deterministic).
   now = Date.now,
@@ -485,6 +499,8 @@ export function runReviewTick({
     // Every actual review hold/refusal and every live dispatch still blocks this branch.
     const blocked = new Set([...(plan.refusals ?? []).filter(d => !(d.kind === 'nothing-owed' && d.phase === 'queued')),
       ...(plan.dispatch ?? [])].map(d => Number(d.prNumber)));
+    const setting = readReviewEvidence ? redTeamTimingSetting() : null;
+    if (setting) log(`review-daemon: redTeam.carriedAcceptTriggersReview=${setting.value.carriedAcceptTriggersReview} (source: ${setting.sources.carriedAcceptTriggersReview})`);
     for (const request of readRedTeamRequests()) {
       if (request.repo.toLowerCase() !== repo.toLowerCase()) continue;
       const subject = rawPrs.find(p => Number(p.number) === request.pr);
@@ -497,7 +513,31 @@ export function runReviewTick({
       if (subject?.headRefOid?.toLowerCase() !== request.head || subject.isDraft
         || !labels.includes('review:accepted') || !labels.includes('ready-to-merge')
         || labels.some(l => ['review:changes', 'review:human', 'review:pending'].includes(l))) continue;
-      reviews.push({ kind: 'review', prNumber: request.pr, redTeamRequest: request });
+      let freshReview = false;
+      let attempts = 0;
+      if (readReviewEvidence) {
+        // Only the reconciler knows the exact shared count and effective cap (including
+        // operator verdicts, mechanical rounds and extensions). Never reconstruct them here.
+        const planned = (plan.refusals ?? []).find(d => Number(d.prNumber) === request.pr);
+        const budgetKnown = Number.isInteger(planned?.attempts) && planned.attempts >= 0
+          && Number.isInteger(planned?.cap) && planned.cap > 0;
+        attempts = budgetKnown ? Math.max(planned.attempts, planned.operatorFixBudget?.attempts ?? 0) : 0;
+        const action = planRedTeamRequestAction({ request, subject,
+          evidence: readReviewEvidence({ repo, pr: request.pr, head: request.head }),
+          setting: setting.value.carriedAcceptTriggersReview, atRoundCap: budgetKnown && attempts >= planned.cap });
+        if (action.action === 'skip') {
+          log(`review-daemon: ${action.reason}`);
+          continue;
+        }
+        freshReview = action.action === 'fresh-review';
+        if (freshReview && !budgetKnown) {
+          log(`review-daemon: skipping fresh review for #${request.pr}: exact reconcile attempts/cap unavailable`);
+          continue;
+        }
+      }
+      reviews.push(freshReview
+        ? { kind: 'review', prNumber: request.pr, attempts, carriedAcceptHead: request.head }
+        : { kind: 'review', prNumber: request.pr, redTeamRequest: request });
       blocked.add(request.pr);
     }
   }
@@ -583,6 +623,7 @@ export function runReviewTick({
   for (const [i, d] of dispatchable.entries()) {
     try {
       const subject = (Array.isArray(rawPrs) ? rawPrs : []).find(p => Number(p?.number) === Number(d.prNumber));
+      if (d.carriedAcceptHead) log(`review-daemon: dispatching fresh review for #${d.prNumber} @${d.carriedAcceptHead.slice(0, 8)} (carried accept, no review evidence)`);
       const result = dispatch({ pr: d.prNumber, repo,
         ...(d.redTeamRequest ? { expectedRedTeamHead: d.redTeamRequest.head, drainRedTeamRequest: d.redTeamRequest } : {}),
         ...(d.advisoryReview?.ciWaived === true ? { advisoryCiWaiver: { head: d.advisoryReview.head, reason: d.advisoryReview.reason } } : {}),
@@ -1067,6 +1108,8 @@ export function buildCliDaemonEffects({
     const factsProvider = withFactsLabels(createGhProvider());
     return runReviewTickAllRepos({
       readRedTeamRequests: readDrainRedTeamRequests,
+      readReviewEvidence: readReviewEvidenceAtHead,
+      log: line => log.error(line),
       acquirableLanes: defaultAcquirableLaneNumbers, readPrs: defaultReadPrs, readAgents: defaultReadAgents,
       poolExhaustion: DAEMON_POOL_EXHAUSTION,
       refreshScopeBloat: refreshScopeBloatedPr,

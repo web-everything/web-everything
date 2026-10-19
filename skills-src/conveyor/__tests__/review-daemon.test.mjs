@@ -9,6 +9,18 @@ import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+
+it.each([
+  'skills-src/conveyor/review-daemon.mjs',
+  'scripts/operations/review-job.mjs',
+  'scripts/conveyor/reconcile-core.mjs',
+])('imports %s in plain Node without an initialization cycle', entry => {
+  const result = spawnSync(process.execPath, ['-e', `import(${JSON.stringify(`./${entry}`)})`], {
+    cwd: process.cwd(), encoding: 'utf8', timeout: 10000,
+  });
+  expect(result.status, result.stderr).toBe(0);
+});
 
 // Mocked so `defaultReapSessions`'s own describe block below can assert exactly what it passes through
 // WITHOUT ever shelling a real `claude agents`/`claude stop`/`gh` call — this repo's own hard rule (never touch
@@ -41,7 +53,7 @@ vi.mock('../../../scripts/conveyor/human-surface-repark.mjs', async (importOrigi
 });
 
 import {
-  runDaemonLoop, runReviewTick, runReviewTickAllRepos, REVIEW_DAEMON_REPOS, buildCliDaemonEffects, realSleep,
+  planRedTeamRequestAction, runDaemonLoop, runReviewTick, runReviewTickAllRepos, REVIEW_DAEMON_REPOS, buildCliDaemonEffects, realSleep,
   REVIEW_DAEMON_LEASE_KEY, DEFAULT_INTERVAL_MS, defaultReapSessions, hasStaleMainRefusal, defaultAcquirableLaneCount,
   explainPendingNotDispatched, priorityNamesForLiveProcessPrs, runConvertAdvisoryTick, runConvertAdvisoryTickAllRepos,
   resolveConvertAdvisoryEnabled, sweepReviewHolds, operatorHoldsFromPlan, formatOperatorHoldsRecord, OPERATOR_HOLD_KINDS,
@@ -1743,6 +1755,119 @@ describe('operator-hold snapshots (card 5653)', () => {
 });
 
 describe('drain red-team request consumption', () => {
+  it.each([
+    ['evidence present', { runId: 'review-pr-current' }, true, 2, 'job'],
+    ['carried accept', null, true, 2, 'fresh-review'],
+    ['setting off', null, false, 2, 'job'],
+    ['at cap', null, true, 5, 'skip'],
+    ['above cap', null, true, 11, 'skip'],
+    ['evidence at cap', { runId: 'review-pr-current' }, true, 5, 'job'],
+    ['setting off at cap', null, false, 5, 'job'],
+  ])('%s respects evidence, settings and round budget', (_name, evidence, setting, round, action) => {
+    const request = { repo: 'web-everything/web-everything', pr: 5616, head: '690d3e57' + 'a'.repeat(32) };
+    const subject = { number: request.pr, headRefOid: request.head, isDraft: false,
+      labels: ['review:accepted', 'ready-to-merge', { name: `review-round:${round}` }] };
+    const plan = { dispatch: [], refusals: [{ prNumber: request.pr, kind: 'nothing-owed', phase: 'queued', attempts: round, cap: 5 }] };
+    const dispatch = vi.fn(() => ({ mode: 'job', jobPid: 123 }));
+    const finish = vi.fn();
+    const tagRound = vi.fn();
+    const log = vi.fn();
+    const readReviewEvidence = vi.fn(() => evidence);
+    const tick = runReviewTick({ repo: request.repo, reconcile: () => plan,
+      readPrs: () => [subject], readAgents: () => [], readRedTeamRequests: () => [request, request],
+      readReviewEvidence, redTeamTimingSetting: () => ({ value: { carriedAcceptTriggersReview: setting },
+        sources: { carriedAcceptTriggersReview: 'standard' } }), log,
+      finishRedTeamRequest: finish, dispatch, tagRound, tagStatus: () => {},
+    });
+    expect(dispatch).toHaveBeenCalledTimes(action === 'skip' ? 0 : 1);
+    expect(finish).not.toHaveBeenCalled();
+    expect(tagRound).toHaveBeenCalledTimes(action === 'fresh-review' ? 1 : 0);
+    expect(log.mock.calls.filter(([line]) => line.includes('carriedAcceptTriggersReview='))).toEqual([
+      [`review-daemon: redTeam.carriedAcceptTriggersReview=${setting} (source: standard)`],
+    ]);
+    if (action === 'fresh-review') {
+      expect(dispatch.mock.calls[0][0]).not.toHaveProperty('drainRedTeamRequest');
+      expect(dispatch.mock.calls[0][0]).not.toHaveProperty('expectedRedTeamHead');
+      expect(tagRound).toHaveBeenCalledWith(expect.objectContaining({ pr: request.pr, round: round + 1 }));
+      expect(readReviewEvidence).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledWith('review-daemon: dispatching fresh review for #5616 @690d3e57 (carried accept, no review evidence)');
+    } else if (action === 'job') {
+      expect(dispatch.mock.calls[0][0].drainRedTeamRequest).toEqual(request);
+    } else {
+      expect(log).toHaveBeenCalledWith('review-daemon: review round cap reached for #5616');
+      expect(tick.reviewsOwed).toBe(0);
+    }
+    const dryRun = planRedTeamRequestAction({ request, subject, evidence, setting, atRoundCap: round >= 5 });
+    expect(dryRun.action).toBe(action);
+    if (action === 'fresh-review') expect(dryRun.reason).toBe('would dispatch fresh review for #5616 @690d3e57');
+    expect(subject.labels).toEqual(['review:accepted', 'ready-to-merge', { name: `review-round:${round}` }]);
+  });
+
+  it('does not dispatch after 3 rearms before and 2 advisories after an operator verdict at cap 5', async () => {
+    const { planReconcile } = await import('../../../scripts/conveyor/reconcile-core.mjs');
+    const { REARM_COMMENT_MARKER } = await import('../../../scripts/conveyor/rearm-review.mjs');
+    const { ADVISORY_NOTE_MARKER } = await import('../../../scripts/conveyor/advisory-round-count.mjs');
+    const request = { repo: 'web-everything/web-everything', pr: 5616, head: 'a'.repeat(40) };
+    const comment = body => ({ body, author: { login: 'chalbert' } });
+    const subject = { number: request.pr, headRefOid: request.head, state: 'OPEN', isDraft: false,
+      labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }], comments: [
+        ...Array.from({ length: 3 }, () => comment(REARM_COMMENT_MARKER)),
+        { ...comment('🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\nFix required.'),
+          id: 'operator-send-back', createdAt: '2026-10-01T11:00:53Z' },
+        ...Array.from({ length: 2 }, () => comment(ADVISORY_NOTE_MARKER)),
+      ] };
+    const plan = planReconcile({ repo: 'we', prs: [subject], agents: [], roundCap: 5 });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'nothing-owed', phase: 'queued',
+      operatorFixBudget: { verdictId: 'operator-send-back', attempts: 5, cap: 5 } })]);
+    const dispatch = vi.fn();
+    const log = vi.fn();
+    const tick = runReviewTick({ repo: request.repo, reconcile: () => plan,
+      readPrs: () => [subject], readAgents: () => [], readRedTeamRequests: () => [request],
+      readReviewEvidence: () => null,
+      redTeamTimingSetting: () => ({ value: { carriedAcceptTriggersReview: true },
+        sources: { carriedAcceptTriggersReview: 'standard' } }),
+      dispatch, log, tagRound: vi.fn(), tagStatus: () => {},
+    });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(tick.reviewsOwed).toBe(0);
+    expect(log).toHaveBeenCalledWith('review-daemon: skipping fresh review for #5616: exact reconcile attempts/cap unavailable');
+  });
+
+  it.each([{ cap: 5 }, { attempts: 0 }, { attempts: NaN, cap: 5 }, { attempts: 0, cap: 0 }])(
+    'skips fresh review when the reconcile budget is incomplete or invalid: %j', budget => {
+      const request = { repo: 'web-everything/web-everything', pr: 5616, head: 'a'.repeat(40) };
+      const subject = { number: request.pr, headRefOid: request.head,
+        labels: ['review:accepted', 'ready-to-merge'] };
+      const dispatch = vi.fn();
+      const log = vi.fn();
+      runReviewTick({ repo: request.repo,
+        reconcile: () => ({ dispatch: [], refusals: [{ prNumber: request.pr,
+          kind: 'nothing-owed', phase: 'queued', ...budget }] }),
+        readPrs: () => [subject], readAgents: () => [], readRedTeamRequests: () => [request],
+        readReviewEvidence: () => null,
+        redTeamTimingSetting: () => ({ value: { carriedAcceptTriggersReview: true },
+          sources: { carriedAcceptTriggersReview: 'standard' } }),
+        dispatch, log, tagStatus: () => {},
+      });
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(log).toHaveBeenCalledWith('review-daemon: skipping fresh review for #5616: exact reconcile attempts/cap unavailable');
+    });
+
+  it('resolves the carried-accept setting through the timing policy cascade', async () => {
+    const { resolveRedTeamTiming } = await import('../../../scripts/lib/red-team-gate.mjs');
+    expect(resolveRedTeamTiming().value.carriedAcceptTriggersReview).toBe(true);
+    expect(resolveRedTeamTiming().sources.carriedAcceptTriggersReview).toBe('standard');
+    const file = { redTeam: { carriedAcceptTriggersReview: false } };
+    expect(resolveRedTeamTiming({ platform: { carriedAcceptTriggersReview: false } }).sources.carriedAcceptTriggersReview).toBe('platform');
+    expect(resolveRedTeamTiming({ file }).value.carriedAcceptTriggersReview).toBe(false);
+    expect(resolveRedTeamTiming({ file }).sources.carriedAcceptTriggersReview).toBe('tool');
+    const overridden = resolveRedTeamTiming({ file, env: { WE_RED_TEAM_CARRIED_ACCEPT_TRIGGERS_REVIEW: 'true' } });
+    expect(overridden.value.carriedAcceptTriggersReview).toBe(true);
+    expect(overridden.sources.carriedAcceptTriggersReview).toBe('env');
+    expect(resolveRedTeamTiming({ file, env: { WE_RED_TEAM_CARRIED_ACCEPT_TRIGGERS_REVIEW: 'invalid' } }).value.carriedAcceptTriggersReview).toBe(false);
+  });
+
   it.each(['current', 'stale', 'paused', 'refused', 'skipped', 'no-lanes', 'sent-back'])('dispatches only a current unheld request (%s)', mode => {
     const request = { repo: CONSTELLATION_REPOS.we?.slug ?? 'web-everything/web-everything', pr: 5485, head: 'b'.repeat(40) };
     const dispatch = vi.fn(() => mode === 'skipped' ? { skipped: 'live-job' } : { mode: 'job', jobPid: 123 });
