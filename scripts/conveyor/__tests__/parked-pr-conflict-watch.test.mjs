@@ -15,6 +15,7 @@ import {
   CONFLICT_LABEL,
   CONFLICT_LABEL_META,
   isParkedConflictTarget,
+  rearmIsOwed,
   planConflictLabelChange,
   buildConflictComment,
   watchParkedPrConflicts,
@@ -3608,6 +3609,83 @@ it('skips a deferred discovery pass without posting a finding', () => {
 });
 
 
+describe('conflict rearm eligibility', () => {
+  it.each([
+    [undefined, false],
+    [[], false],
+    [['review:pending'], false],
+    [['review:human', 'ready-to-merge'], false],
+    [['review:changes'], true],
+    [[{ name: 'review:accepted' }], true],
+  ])('rearmIsOwed(%j) is %s', (labels, owed) => {
+    expect(rearmIsOwed(labels)).toBe(owed);
+  });
+
+  it.each(['rebased', 'current'])('a %s card skips pending-only rearm and rearms accepted reviews', action => {
+    for (const label of ['review:pending', 'review:accepted']) {
+      const pr = { number: 42, mergeable: 'CONFLICTING', baseRefName: 'main',
+        labels: [{ name: label }], files: [{ path: 'backlog/123-test.md' }] };
+      const postRearm = vi.fn();
+      const setLabels = vi.fn();
+      const [result] = watchParkedPrConflicts({
+        repo: 'o/n', listPrs: () => [pr],
+        provider: { ensureLabel() {}, setLabels, postComment() {} },
+        cardConflictSettings: { value: { autoResolveRaisedBy: true }, sources: {} },
+        listPrComments: () => [], listAgents: () => [],
+        attemptCardRebase: () => ({ action }), postRearm,
+      });
+      expect(postRearm).toHaveBeenCalledTimes(label === 'review:accepted' ? 1 : 0);
+      if (label === 'review:accepted') expect(postRearm).toHaveBeenCalledWith({ pr, repo: 'o/n' });
+      expect(setLabels).toHaveBeenLastCalledWith('o/n', 42, { remove: [CONFLICT_LABEL] });
+      expect(result.routedTo).toBe('card-conflict-resolver');
+      expect(result.error).toBeUndefined();
+    }
+  });
+
+  it.each(['review:pending', 'review:accepted', 'review:changes'])('resolved cards with %s only rearm when owed', label => {
+    const pr = { number: 42, mergeable: 'MERGEABLE', baseRefName: 'main',
+      labels: [CONFLICT_LABEL, label], files: [{ path: 'backlog/123-test.md' }] };
+    const postRearm = vi.fn();
+    const setLabels = vi.fn();
+    const [result] = watchParkedPrConflicts({
+      repo: 'o/n', listPrs: () => [pr],
+      provider: { ensureLabel() {}, setLabels, postComment() {} },
+      listAgents: () => [], postRearm,
+    });
+    expect(postRearm).toHaveBeenCalledTimes(label === 'review:pending' ? 0 : 1);
+    expect(setLabels).toHaveBeenCalledWith('o/n', 42, { add: undefined, remove: [CONFLICT_LABEL] });
+    expect(result.newlyResolved).toBe(true);
+    expect(result.error).toBeUndefined();
+  });
+
+  it.each(['CONFLICTING', 'MERGEABLE'])('preserves rearm stderr and the conflict marker for a %s card', mergeable => {
+    const cause = 'neither review:changes nor review:accepted is live — nothing to re-arm';
+    const error = Object.assign(new Error('Command failed: node rearm-review.mjs'), {
+      stderr: Buffer.from(`\n[gh-shim] warning: wrapper\n${cause}\nextra detail`),
+    });
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const setLabels = vi.fn();
+      const [result] = watchParkedPrConflicts({
+        repo: 'o/n', listPrs: () => [{ number: 42, mergeable, baseRefName: 'main',
+          labels: [CONFLICT_LABEL, 'review:accepted'], files: [{ path: 'backlog/123-test.md' }] }],
+        provider: { ensureLabel() {}, setLabels, postComment() {} },
+        cardConflictSettings: { value: { autoResolveRaisedBy: true }, sources: {} },
+        listPrComments: () => [], listAgents: () => [],
+        attemptCardRebase: () => ({ action: 'rebased' }),
+        postRearm: () => { throw error; },
+      });
+      expect(result.error).toBe(cause);
+      expect(setLabels.mock.calls.some(call => call[2].remove?.includes(CONFLICT_LABEL))).toBe(false);
+      if (mergeable === 'CONFLICTING') {
+        expect(result.rearmCause).toBe(cause);
+        expect(result.routedTo).toBe('card-conflict-rearm-pending');
+        expect(log).toHaveBeenCalledWith(`parked-pr-conflict-watch: PR #42: card rearm failed: ${cause}`);
+      }
+    } finally { log.mockRestore(); }
+  });
+});
+
 describe('conflict watch diagnostics', () => {
   for (const labels of [
     ['review:pending', 'review:changes', CONFLICT_LABEL],
@@ -3638,7 +3716,8 @@ describe('conflict watch diagnostics', () => {
       expect(formatConflictWatchSummary(results, [pr]))
         .toContain(`mechanicalRebase=${outcome.action} reason=${outcome.reason}`);
       const resolved = ['current', 'rebased'].includes(outcome.action);
-      expect(postRearm).toHaveBeenCalledTimes(resolved ? 1 : 0);
+      const owesRearm = labels.includes('review:changes') || labels.includes('review:accepted');
+      expect(postRearm).toHaveBeenCalledTimes(resolved && owesRearm ? 1 : 0);
       const idle = labels.includes('review:pending') && !labels.includes('review:changes');
       expect(postFinding).toHaveBeenCalledTimes(!resolved && idle ? 1 : 0);
       expect(postComment.mock.calls.some(call => call[2].startsWith(UNOWNED_REBASE_ATTEMPT_MARKER))).toBe(false);
