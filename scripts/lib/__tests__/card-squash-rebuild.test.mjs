@@ -61,6 +61,7 @@ describe('card squash rebuild', () => {
   it.each([{ mismatch: true }, { pathMismatch: true }])('fallback refuses all-absent entries for a mismatching candidate: %j', options => {
     const { run: plumbing } = setup(options);
     const run = vi.fn((cmd, args, opts) => args[0] === 'merge-base' ? { status: 0, stdout: base }
+      : args[0] === 'rev-parse' && args.at(-1).includes(':') ? { status: 1, stdout: '', stderr: '' }
       : args[0] === 'ls-tree' ? { status: 0, stdout: '' } : plumbing(cmd, args, opts));
     expect(cardSquashRebuild({ run, base, mergeRef: head, tree, message: 'test' }))
       .toMatchObject({ action: 'error', guard: 'squash-net-diff-mismatch' });
@@ -271,7 +272,7 @@ describe('per-path squash merge proof', () => {
   const original = 'first\none\ntwo\nthree\nfour\nfive\nsix\nlast\n';
   const first = original.replace('first', 'PR first');
   const both = first.replace('last', 'PR last');
-  function absorbedFixture(check, { main = first, pr = both, result = both, extra = false, headMode = '100644', baseMode = '100644', treeMode = '100644', ancestorMode = '100644', resolved = false, ancestor = original, companion = false, fault } = {}) {
+  function absorbedFixture(check, { main = first, pr = both, result = both, extra = false, headExtra = false, headMode = '100644', baseMode = '100644', treeMode = '100644', ancestorMode = '100644', resolved = false, ancestor = original, companion = false, fault } = {}) {
     const cwd = mkdtempSync(join(tmpdir(), 'card-squash-absorbed-'));
     const run = vi.fn((cmd, args, opts = {}) => {
       if (['push', 'fetch'].includes(args[0])) throw new Error('fixture forbids remote writes');
@@ -292,7 +293,7 @@ describe('per-path squash merge proof', () => {
       const commit = (tree, parent) => g(['commit-tree', tree, ...(parent ? ['-p', parent] : []), '-m', 'fixture']);
       const root = commit(makeTree(ancestor, false, ancestorMode));
       const base = commit(makeTree(main, false, baseMode), root);
-      const mergeRef = commit(makeTree(pr, false, headMode), root);
+      const mergeRef = commit(makeTree(pr, headExtra, headMode), root);
       const tree = makeTree(result, extra, treeMode);
       const proofRun = fault ? (cmd, args, opts) => {
         const result = run(cmd, args, opts);
@@ -303,6 +304,82 @@ describe('per-path squash merge proof', () => {
       check({ outcome, run, g, base, mergeRef });
     } finally { rmSync(cwd, { recursive: true, force: true }); }
   }
+
+  it('accepts a genuine addition using unmodified real Git absence probes', () => absorbedFixture(({ outcome, run }) => {
+    expect(outcome).toMatchObject({ proof: { proofKind: 'per-path-merge', patchEqual: false } });
+    const probes = run.mock.calls.flatMap(([, args], index) => args[0] === 'rev-parse'
+      && args.at(-1).endsWith(':backlog/456-extra.md') ? [run.mock.results[index].value] : []);
+    expect(probes).toHaveLength(2);
+    for (const probe of probes) expect(probe).toMatchObject({ status: 1, stdout: '', stderr: '' });
+  }, { extra: true, headExtra: true }));
+  it.each([
+    { status: 128 },
+    { status: 0, stdout: head + '\n' },
+    { status: 0, stdout: 'invalid oid' },
+    { status: 1, stdout: 'unexpected output' },
+    { status: 1, stderr: 'unreadable' },
+    { status: null },
+    { status: 1, error: new Error('unreadable') },
+    { status: 1, signal: 'SIGTERM' },
+  ])('refuses an unproven rev-parse absence: %j', absence => {
+    let absenceChecks = 0;
+    absorbedFixture(({ outcome }) => {
+      expect(absenceChecks).toBeGreaterThan(0);
+      expect(outcome).toMatchObject({ action: 'error', guard: 'squash-net-diff-mismatch' });
+    }, { extra: true, headExtra: true, fault: (args, result) => {
+      if (args[0] !== 'rev-parse' || !args.at(-1).includes(':')) return;
+      // The added companion path is genuinely absent in the ancestor/base trees.
+      expect(args.at(-1)).toMatch(/:backlog\/456-extra\.md$/);
+      expect(result).toMatchObject({ status: 1, stdout: '', stderr: '' });
+      absenceChecks++;
+      return { ...result, ...absence };
+    } });
+  });
+  it('refuses non-octal ls-tree mode 100888 even when base, head and result entries match', () => absorbedFixture(({ outcome }) => {
+    expect(outcome).toMatchObject({ action: 'error', guard: 'squash-net-diff-mismatch' });
+  }, { pr: first, result: first, headExtra: true, extra: true, fault: (args, result) => args[0] === 'ls-tree'
+    ? { ...result, stdout: String(result.stdout).replace(/^100644/, '100888') } : undefined }));
+  it('refuses empty ls-tree output when rev-parse confirms the path exists', () => absorbedFixture(({ outcome, run }) => {
+    expect(outcome).toMatchObject({ action: 'error', guard: 'squash-net-diff-mismatch' });
+    const call = run.mock.calls.findIndex(([, args]) => args[0] === 'rev-parse' && args.at(-1).includes(':'));
+    expect(call).toBeGreaterThanOrEqual(0);
+    expect(run.mock.results[call].value.status).toBe(0);
+    expect(run.mock.results[call].value.stdout.trim()).toMatch(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/);
+  }, { fault: (args, result) => args[0] === 'ls-tree' ? { ...result, stdout: '' } : undefined }));
+  it.each([
+    ['unparseable', () => 'garbled\0'],
+    ['wrong path', output => String(output).replace(card, 'backlog/wrong.md')],
+    ['extra entry', output => String(output) + String(output)],
+    ['trailing newline', output => String(output) + '\n'],
+    ['missing stdout', () => undefined],
+  ])('refuses ls-tree output with %s', (_name, falsify) => absorbedFixture(({ outcome }) => {
+    expect(outcome).toMatchObject({ action: 'error', guard: 'squash-net-diff-mismatch' });
+  }, { fault: (args, result) => args[0] === 'ls-tree' ? { ...result, stdout: falsify(result.stdout) } : undefined }));
+  it('refuses non-zero ls-tree despite a valid entry', () => absorbedFixture(({ outcome }) => {
+    expect(outcome).toMatchObject({ action: 'error', guard: 'squash-net-diff-mismatch' });
+  }, { fault: (args, result) => args[0] === 'ls-tree' ? { ...result, status: 1 } : undefined }));
+  it.each([1, 128, 129])('refuses merge-file status %s despite clean output', status => absorbedFixture(({ outcome }) => {
+    expect(outcome).toMatchObject({ action: 'error', guard: 'squash-net-diff-mismatch' });
+  }, { fault: (args, result) => args[0] === 'merge-file' ? { ...result, status } : undefined }));
+  it('refuses empty merge output from three non-empty inputs even for an empty candidate', () => absorbedFixture(({ outcome }) => {
+    expect(outcome).toMatchObject({ action: 'error', guard: 'squash-net-diff-mismatch' });
+  }, { result: '', fault: (args, result) => args[0] === 'merge-file' ? { ...result, stdout: Buffer.alloc(0) } : undefined }));
+  it('refuses merge-file output that is not a Buffer', () => absorbedFixture(({ outcome }) => {
+    expect(outcome).toMatchObject({ action: 'error', guard: 'squash-net-diff-mismatch' });
+  }, { fault: (args, result) => args[0] === 'merge-file' ? { ...result, stdout: String(result.stdout) } : undefined }));
+  it('refuses different bytes on the second merge-file run with identical inputs', () => {
+    let calls = 0;
+    const inputs = [];
+    absorbedFixture(({ outcome }) => {
+      expect(outcome).toMatchObject({ action: 'error', guard: 'squash-net-diff-mismatch' });
+      expect(calls).toBe(2);
+      expect(inputs[1]).toEqual(inputs[0]);
+    }, { fault: (args, result) => {
+      if (args[0] !== 'merge-file') return;
+      inputs.push(args);
+      if (++calls === 2) return { ...result, stdout: Buffer.from('different\n') };
+    } });
+  });
 
   it('refuses the head blob when it drops the base middle edit', () => absorbedFixture(({ outcome, run }) => {
     expect(outcome).toMatchObject({ action: 'error', guard: 'squash-net-diff-mismatch' });

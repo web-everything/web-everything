@@ -12,24 +12,33 @@ import { join } from 'node:path';
 // Independently reproduce each unresolved result from the three immutable inputs.
 function provePerPathMerge({ run, cwd, base, mergeRef, newCommit, oldFiles, newFiles, resolved }) {
   const isOid = value => /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(value);
-  const succeeded = result => result.status === 0 && !result.error && !result.signal;
+  const ok = result => result?.status === 0 && !result.error && !result.signal;
   let scratch;
   try {
     const mb = run('git', ['merge-base', base, mergeRef], { cwd });
     const ancestor = String(mb.stdout ?? '').trim();
-    if (!succeeded(mb) || !isOid(ancestor)) return null;
-    // A successful empty ls-tree means absence only in a previously verified tree.
+    if (!ok(mb) || !isOid(ancestor)) return null;
+    // Verify every input tree independently of its per-path listing.
     for (const ref of new Set([ancestor, base, mergeRef, newCommit])) {
       const verified = run('git', ['rev-parse', '--verify', '-q', `${ref}^{tree}`], { cwd });
-      if (!succeeded(verified) || !isOid(String(verified.stdout ?? '').trim())) return null;
+      if (!ok(verified) || !isOid(String(verified.stdout ?? '').trim())) return null;
     }
     const readEntry = (ref, path) => {
       const result = run('git', ['ls-tree', '--full-tree', '-z', ref, '--', path], { cwd });
-      if (!succeeded(result)) throw new Error('unreadable squash proof entry');
-      const output = String(result.stdout ?? '');
-      if (!output) return null;
+      if (!ok(result) || !(typeof result.stdout === 'string' || Buffer.isBuffer(result.stdout)))
+        throw new Error('unreadable squash proof entry');
+      const output = String(result.stdout);
+      if (!output) {
+        const exists = run('git', ['rev-parse', '--verify', '-q', `${ref}:${path}`], { cwd });
+        const verified = run('git', ['rev-parse', '--verify', '-q', `${ref}^{tree}`], { cwd });
+        if (exists.status !== 1 || exists.error || exists.signal
+          || ![exists.stdout, exists.stderr].every(value => value === '' || (Buffer.isBuffer(value) && value.length === 0))
+          || !ok(verified) || !isOid(String(verified.stdout ?? '').trim()))
+          throw new Error('unproven squash proof absence');
+        return null;
+      }
       const match = /^([0-7]{6}) (blob|tree|commit) ([a-f0-9]{40}|[a-f0-9]{64})\t([^\0]+)\0$/.exec(output);
-      if (!match || match[4] !== path) throw new Error('invalid squash proof entry');
+      if (!match || match[0] !== output || match[4] !== path) throw new Error('invalid squash proof entry');
       return { mode: match[1], type: match[2], oid: match[3] };
     };
     const entriesEqual = (a, b) => a === b || (a !== null && b !== null
@@ -54,20 +63,25 @@ function provePerPathMerge({ run, cwd, base, mergeRef, newCommit, oldFiles, newF
         if (!equalsHead) return null;
       } else if (entries.every(regularBlob)) {
         scratch ??= mkdtempSync(join(tmpdir(), 'card-squash-proof-'));
+        let allInputsNonEmpty = true;
         const files = [baseEntry, mbEntry, headEntry].map(({ oid }, index) => {
           const blob = run('git', ['cat-file', 'blob', oid], { cwd, encoding: 'buffer' });
-          if (!succeeded(blob) || !Buffer.isBuffer(blob.stdout)) throw new Error('unreadable squash merge input');
+          if (!ok(blob) || !Buffer.isBuffer(blob.stdout)) throw new Error('unreadable squash merge input');
+          allInputsNonEmpty &&= blob.stdout.length > 0;
           const hash = run('git', ['hash-object', '--stdin'], { cwd, input: blob.stdout });
-          if (!succeeded(hash) || String(hash.stdout ?? '').trim() !== oid)
+          if (!ok(hash) || String(hash.stdout ?? '').trim() !== oid)
             throw new Error('invalid squash merge input bytes');
           const file = join(scratch, String(index));
           writeFileSync(file, blob.stdout, { mode: 0o600 });
           return file;
         });
         const merged = run('git', ['merge-file', '-p', ...files], { cwd, encoding: 'buffer' });
-        if (!succeeded(merged) || !Buffer.isBuffer(merged.stdout)) return null;
+        if (!ok(merged) || !Buffer.isBuffer(merged.stdout)
+          || (allInputsNonEmpty && merged.stdout.length === 0)) return null;
+        const repeated = run('git', ['merge-file', '-p', ...files], { cwd, encoding: 'buffer' });
+        if (!ok(repeated) || !Buffer.isBuffer(repeated.stdout) || !merged.stdout.equals(repeated.stdout)) return null;
         const hash = run('git', ['hash-object', '--stdin'], { cwd, input: merged.stdout });
-        if (!succeeded(hash) || String(hash.stdout ?? '').trim() !== treeEntry.oid) return null;
+        if (!ok(hash) || String(hash.stdout ?? '').trim() !== treeEntry.oid) return null;
       } else if (!entriesEqual(headEntry, baseEntry) || !entriesEqual(treeEntry, baseEntry)) return null;
       if (oldFiles.includes(path) !== newFiles.includes(path) || !equalsHead) absorbedPaths.push(path);
     }
