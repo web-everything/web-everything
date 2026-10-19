@@ -373,16 +373,19 @@ describe('the live scope fence adapter over a real repository', () => {
       }
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
   });
-  it('withholds the push when the backlog loader skipped the PR card as malformed instead of treating it as absent', () => {
+  it.each([
+    ['its own number', 'lane/5957-leading-cd', '5957', '5957-leading-cd.md', '---\nscope: [unclosed\n---\n'],
+    ['the bornAs key of a renumbered card', 'lane/xq9test-leading-cd', 'xq9test', '6001-leading-cd.md', '---\nbornAs: xq9test\nscope: [unclosed\n---\n'],
+  ])('withholds the push when the backlog loader skipped the PR card named by %s instead of treating it as absent', (_, headRefName, key, file, text) => {
     const r = realRepo();
     const root = mkdtempSync(join(tmpdir(), 'fix-scope-fence-backlog-'));
     try {
-      mkdirSync(join(root, 'backlog')); writeFileSync(join(root, 'backlog', '5957-leading-cd.md'), '---\nscope: [unclosed\n---\n');
+      mkdirSync(join(root, 'backlog')); writeFileSync(join(root, 'backlog', file), text);
       r.write('guard.mjs', 'safe();\n'); r.write('outside.mjs', 'o();\n'); const head = r.commit('initial');
       r.write('outside.mjs', 'changed();\n'); const sha = r.commit('fixer edits a file only the PR diff names');
-      const { result, push } = liveFence(r, { head, sha, scoped: 'outside.mjs', loadItems: () => [], headRefName: 'lane/5957-leading-cd', root });
+      const { result, push } = liveFence(r, { head, sha, scoped: 'outside.mjs', loadItems: () => [], headRefName, root });
       expect(result.ok).toBe(false);
-      expect(result.reason).toMatch(/backlog unreadable: card 5957 exists but the loader skipped it/);
+      expect(result.reason).toContain(`backlog unreadable: card ${key} exists but the loader skipped it`);
       expect(push).not.toHaveBeenCalled();
     } finally { rmSync(r.dir, { recursive: true, force: true }); rmSync(root, { recursive: true, force: true }); }
   });
