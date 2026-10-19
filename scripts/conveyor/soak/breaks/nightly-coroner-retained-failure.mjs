@@ -19,7 +19,7 @@ export default {
     const violations = [];
     try {
       const store = createJobStore(join(root, 'jobs')), statusFeed = join(root, 'feed.jsonl');
-      const options = { store, statusFeed, dir: root, sourceRoot: root, config: {}, codeSha: 'abc', snapshot: {}, reattach: async () => {}, evict: () => {} };
+      const options = { store, statusFeed, dir: root, sourceRoot: root, config: {}, codeSha: 'abc', snapshot: {}, reattach: async () => {}, evict: () => {}, sweepLanes: async () => {} };
       const run = (at) => runNightlyCoronerJob({ ...options, now: Date.parse(at) });
       const first = await run('2026-10-17T02:17:00Z');
       store.update(first.enqueued, (r) => ({ ...r, job: { ...r.job, status: 'failed', error: 'no lane within 0ms (lock contention)' } }));

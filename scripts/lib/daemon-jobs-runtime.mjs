@@ -312,6 +312,24 @@ export async function stopHandle(handle, {
 }
 
 /**
+ * A job whose pid died on its own (crash, OOM kill) can leave its subprocesses running in its process group.
+ * SIGKILL that group before the job is requeued or failed. Only when the pid itself is unused: a pid is never
+ * handed out while a group with that id exists, so a group seen then is the dead job's own. A pid in use again
+ * means the job's group is already gone.
+ * @returns {boolean} whether a leftover group was killed
+ */
+export function reapDeadGroup(handle, {
+  host = hostName(), aliases = null, readStart = readProcStart, kill = (pid, sig) => process.kill(pid, sig),
+} = {}) {
+  const h = parseJobHandle(handle);
+  if (!h?.pid) return false;
+  const local = aliases ?? (arguments[1]?.host !== undefined ? new Set([host]) : localHostAliases());
+  if (h.host !== host && !local.has(h.host)) return false;
+  try { if (readStart(h.pid)) return false; } catch { return false; }
+  try { kill(-h.pid, 0); kill(-h.pid, 'SIGKILL'); return true; } catch { return false; }
+}
+
+/**
  * Tick clock for the sleep rule: each `observe()` compares the wall and monotonic gaps since the last call.
  */
 export function createTickClock({ wallNow = Date.now, monoNow = () => performance.now(), thresholdMs = SLEEP_GAP_THRESHOLD_MS } = {}) {
@@ -331,7 +349,7 @@ const sameGeneration = (a, b) => a.job.status === b.job.status && a.job.handle =
 /**
  * ONE reattach-and-admit pass. Run at boot and every tick.
  * @param {{store: object, kinds: Map<string, object>, maxConcurrent: number, clock?: object, observation?: object,
- *   probe?: Function, stop?: Function, launch?: Function, staleMs?: number, launchGraceMs?: number,
+ *   probe?: Function, stop?: Function, launch?: Function, staleMs?: number, launchGraceMs?: number, reapGroup?: Function,
  *   deadlineAt?: (record: object) => number|null, backoffBaseMs?: number, snapshot?: object, heartbeatIntervalMs?: number, log?: Function}} o
  * @returns {Promise<{slept: boolean, gapMs: number, actions: object[], corrupt: string[]}>}
  */
@@ -339,6 +357,7 @@ export async function reattachTick({
   store, kinds, maxConcurrent, clock, observation, probe = (h) => probeHandle(h), stop = (h, o = {}) => stopHandle(h, { probe, ...o }),
   launch = launchJob, staleMs = DEFAULT_HEARTBEAT_STALE_MS, launchGraceMs = DEFAULT_LAUNCH_GRACE_MS,
   backoffBaseMs = DEFAULT_BACKOFF_BASE_MS, snapshot, heartbeatIntervalMs, log = () => {}, deadlineAt = () => null,
+  reapGroup = (h) => reapDeadGroup(h),
 }) {
   const obs = observation ?? (clock ? clock.observe() : { now: Date.now(), slept: false, gapMs: 0 });
   const { now, slept, gapMs } = obs;
@@ -357,6 +376,7 @@ export async function reattachTick({
       reason: `deadline exceeded; ${r.job.attempts}/${r.job.maxAttempts} attempts; last error: ${r.job.error ?? 'not completed'}` }
       : planReattach(r, state, { kindDef });
     if (plan.type === 'none') continue;
+    if (liveness === 'dead' && reapGroup(r.job.handle)) log(`daemon-jobs: job ${r.id} died with subprocesses still running — killed its process group`);
     if (plan.stopFirst) {
       const res = await stop(r.job.handle, kindDef?.stopGraceMs ? { termGraceMs: kindDef.stopGraceMs } : {});
       if (!res.gone) {

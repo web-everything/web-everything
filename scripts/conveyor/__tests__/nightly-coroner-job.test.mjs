@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
-import { coronerNightDue, runNightlyCoronerJob, extractNightlyCoroner, runNightlyCoronerEntry, CHILD_STOP_GRACE_MS, RELEASE_TIMEOUT_MS, CORONER_LANE_SESSION, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed, NIGHTLY_DEFAULTS, coronerDeadline, publishCoronerFailure } from '../nightly-coroner-job.mjs';
+import { coronerNightDue, runNightlyCoronerJob, extractNightlyCoroner, runNightlyCoronerEntry, CHILD_STOP_GRACE_MS, RELEASE_TIMEOUT_MS, CORONER_LANE_SESSION, coronerLaneSession, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed, NIGHTLY_DEFAULTS, coronerDeadline, publishCoronerFailure } from '../nightly-coroner-job.mjs';
 import { createJobStore, enqueueJob, reattachTick, runJob, JOB_ID_ENV, JOB_ATTEMPT_ENV } from '../../lib/daemon-jobs-runtime.mjs';
 import { HEALTH_WATCH_JOB_KINDS, HEALTH_NIGHTLY_CORONER_KIND } from '../../../skills-src/conveyor/daemon-manifest.mjs';
 import { parseFeedLine } from '../../operations/needs-you-feed.mjs';
@@ -361,12 +361,20 @@ it('acquires under the fixed coroner session and bounds the release after a stop
   expect(release[0]).toContain(`--session=${lane.holder}`);
   expect(release[2]).toEqual({ timeout: RELEASE_TIMEOUT_MS });
 });
-it('sweeps orphaned coroner leases once a job fails and nothing is queued or running, never while one is', async () => {
+it('sweeps orphaned coroner leases after a failure until a sweep succeeds, never while an attempt is live', async () => {
   const root = temp(), opts = jobOptions(root);
   const now = Date.parse('2026-10-17T08:00:00Z'); // after the deadline: the fresh catch-up fails at once
   opts.reattach = (args) => reattachTick({ ...args, observation: { now, slept: false, gapMs: 0 }, launch: vi.fn() });
-  await runNightlyCoronerJob({ ...opts, now });
-  expect(opts.sweepLanes).toHaveBeenCalledOnce();
+  opts.sweepLanes.mockRejectedValueOnce(new Error('lane-pool timed out'));
+  const first = await runNightlyCoronerJob({ ...opts, now });
+  expect(opts.store.read(first.enqueued).input.laneSession).toBe(coronerLaneSession(opts.store.dir));
+  expect(opts.store.read(first.enqueued).laneSweptAt).toBeUndefined(); // the failed sweep stays owed
+  await runNightlyCoronerJob({ ...opts, now: now + 60000 });
+  expect(opts.sweepLanes).toHaveBeenCalledTimes(2);
+  expect(opts.store.read(first.enqueued).laneSweptAt).toBeTruthy();
+  await runNightlyCoronerJob({ ...opts, now: now + 120000 });
+  expect(opts.sweepLanes).toHaveBeenCalledTimes(2); // paid: never swept again
+  expect(coronerLaneSession(join(root, 'other-store'))).not.toBe(coronerLaneSession(opts.store.dir));
   const live = jobOptions(temp());
   live.reattach = vi.fn(async ({ store }) => {
     const id = store.list().records[0].id;
