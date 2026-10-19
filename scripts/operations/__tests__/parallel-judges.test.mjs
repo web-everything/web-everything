@@ -127,15 +127,16 @@ describe('review.parallelSeats — concurrency and an identical record', () => {
   it('starts every seat before any ends, and wall time is about the slowest seat', async () => {
     const judge = scriptedJudge();
     const { provider } = lanes();
-    const t0 = Date.now();
     const { run } = await loop({ parallel: true, judge, seatLanes: provider, runId: 'r-par' });
-    const wall = Date.now() - t0;
     expect(judge.calls.map((c) => c.lens).sort()).toEqual(['codex-correctness', 'correctness', 'security', 'simplicity'].sort());
     const lastStart = Math.max(...judge.calls.map((c) => c.start));
     const firstEnd = Math.min(...judge.calls.map((c) => c.end));
     expect(lastStart).toBeLessThan(firstEnd);
     const sum = judge.calls.reduce((n, c) => n + (c.end - c.start), 0);
-    expect(wall).toBeLessThan(sum * 0.75);
+    // The seats' own span (first start to last end), not the whole loop's wall clock: the loop's setup and teardown
+    // are not seat time, and on a loaded CI host they alone pushed the wall past the bar (250 vs 249 ms, main @ 8754d6254).
+    const span = Math.max(...judge.calls.map((c) => c.end)) - Math.min(...judge.calls.map((c) => c.start));
+    expect(span).toBeLessThan(sum * 0.75);
     expect(run.seatTimings).toHaveLength(4);
     for (const row of run.seatTimings) {
       expect(Object.keys(row).sort()).toEqual(['seat', 'lens', 'provider', 'model', 'startedAt', 'finishedAt', 'verdict', 'findingsCount'].sort());
