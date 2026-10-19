@@ -2154,3 +2154,23 @@ Disabled auto-resolution skips retain their existing behavior without a `precond
 Card attempt outcomes remain in conflict-watch results
 even when normal routing exits early. Nightly failure scans retain failed records
 of every kind alongside the nightly-only deadline check.
+
+## GitHub App daemon fallback probes
+
+Daemon auth uses a 30-minute refresh lookahead (interactive callers keep 10 minutes).
+Keep the legacy App cache fresh while it remains the last role fallback; its best-effort
+refresh must not change the selected role, applied token provenance, or recorded outcome.
+The standalone gh shim recognizes `WE_GH_DAEMON_CALLER` and launchd labels under
+`com.we.` / `com.plateau.`. A daemon cache miss gets one synchronous refresh CLI attempt
+(90-second timeout), then refuses personal auth by default, including after an App 401.
+Only an inherited `GH_TOKEN` with matching `WE_GH_AUTH_TOKEN_HASH` is trusted as App auth.
+`ghAuth.personalFallback` resolves default → platform → tool →
+`WE_GH_AUTH_PERSONAL_FALLBACK`; refusals and explicit allows name the effective source.
+Interactive shells retain their inherited-auth behavior. Dispatched shim settings carry
+the daemon marker even when session spawning does not inherit the parent environment.
+
+Exercise these paths with synthetic cache entries, fake gh/refresh executables, isolated
+homes and ledgers, and injected minters. Cover `chalbert/web-everything` via `-R`, REST
+paths, and a real temporary clone's SSH origin: each selects the worker installation for
+canonical owner `web-everything`. Run the touched `gh-app-shim`, `github-app-auth-env`,
+`github-app-per-owner-routing`, and `github-auth-policy` suites through heavy admission.

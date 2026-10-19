@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,6 +8,16 @@ import { assertMandatoryReferralsCleared, runReviewLabelCli } from '../review-se
 import { mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../lib/jury-core.mjs';
 import { newRunRecord, writeRun } from '../operations/run-store.mjs';
 import { DAEMON_ENTRY_MODULES } from '../lib/daemon-boot-smoke.mjs';
+import { BOOKKEEPING_MARKERS } from '../conveyor/reconcile-core.mjs';
+import { REARM_COMMENT_MARKER } from '../conveyor/rearm-review.mjs';
+
+const conveyorDir = resolve(dirname(fileURLToPath(import.meta.url)), '../conveyor');
+// Include direct main checks and checks using an intermediate SELF/IS_CLI variable.
+const conveyorEntryModules = readdirSync(conveyorDir).filter(name => {
+  if (!name.endsWith('.mjs')) return false;
+  const source = readFileSync(join(conveyorDir, name), 'utf8');
+  return source.includes('import.meta.url') && /process\.argv\[\s*1\s*\]/.test(source);
+}).map(name => `scripts/conveyor/${name}`);
 
 const repo = 'o/r', pr = 3481, head = '8dad651' + 'a'.repeat(33);
 const authorBody = '<!-- authored-by-actor: author -->';
@@ -36,10 +46,23 @@ describe('current-head mandatory referral acceptance', () => {
   });
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
 
-  it.each(['scripts/operations/review-dispatch.mjs', ...DAEMON_ENTRY_MODULES])('loads %s in a fresh process without an initialization cycle', entry => {
+  it.each([...new Set(['scripts/operations/review-dispatch.mjs', ...DAEMON_ENTRY_MODULES, ...conveyorEntryModules])])('loads %s in a fresh process without an initialization cycle', entry => {
     const result = spawnSync(process.execPath, ['-e', `import(${JSON.stringify(`./${entry}`)})`],
       { cwd: resolve(dirname(fileURLToPath(import.meta.url)), '../..'), encoding: 'utf8', timeout: 10000 });
     expect(result.status, result.stderr).toBe(0);
+  });
+
+  it('starts the re-arm CLI with --help in a fresh process', () => {
+    const result = spawnSync(process.execPath, ['scripts/conveyor/rearm-review.mjs', '--help'],
+      { cwd: resolve(dirname(fileURLToPath(import.meta.url)), '../..'), encoding: 'utf8', timeout: 10000 });
+    expect(result.stderr).not.toContain('ReferenceError');
+    // The shared CLI prints usage and exits 2 when no PR number is supplied.
+    expect(result.status, result.stderr).toBe(2);
+    expect(result.stdout).toContain('usage: rearm-review.mjs');
+  });
+
+  it('keeps the reconcile first-line re-arm matcher equal to the canonical marker', () => {
+    expect(BOOKKEEPING_MARKERS).toContain(REARM_COMMENT_MARKER);
   });
 
   function review({ failure = false, time = 0, reviewedHead = head, subject = repo } = {}) {
