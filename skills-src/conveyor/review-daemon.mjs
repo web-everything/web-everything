@@ -469,6 +469,7 @@ export function runReviewTick({
   // can block the rest of the tick. Still-conflicting PRs stay with the later status pass.
   const staleStatusSwept = [];
   const staleConflictStatusCleared = [];
+  const statusTaggedThisTick = new Set();
   const statusPlanRows = [...(plan.dispatch ?? []), ...(plan.refusals ?? []), ...(plan.notes ?? [])];
   rawPrs = Array.isArray(rawPrs) ? rawPrs.map(prState => {
     let pr = '?';
@@ -485,7 +486,8 @@ export function runReviewTick({
         mergeConflicted: String(prState.mergeStateStatus ?? '').toUpperCase() === 'DIRTY',
         planRows: statusPlanRows.filter(r => Number(r?.prNumber) === pr),
       });
-      // The writer returns both label families; carry its result into the later idempotent pass.
+      statusTaggedThisTick.add(pr);
+      // The writer returns both label families; carry its result into the shared snapshot.
       const removed = new Set(result?.removed ?? []);
       const labels = currentLabels.filter(l => {
         const name = typeof l === 'string' ? l : l?.name;
@@ -719,10 +721,14 @@ export function runReviewTick({
     if (Number.isInteger(n)) rowsByPr.set(n, [...(rowsByPr.get(n) ?? []), r]);
   }
   for (const c of new Map(candidates.map(c => [Number(c.prNumber), c])).values()) {
+    // Swept this tick and not dispatched since: the sweep tag is still current, so skip the repeat.
+    if (statusTaggedThisTick.has(Number(c.prNumber)) && !dispatchedThisTick.has(Number(c.prNumber))) continue;
+    const rawPr = (rawPrs ?? []).find(p => Number(p?.number) === Number(c.prNumber));
+    if (rawPr && rawPr.labels === null) continue; // malformed listing entry: nothing safe to tag
     const agents = dispatchedThisTick.has(Number(c.prNumber)) ? undefined : (rawAgents ?? undefined);
     try {
       tagStatus({
-        pr: c.prNumber, repo, agents, defaultBranch, prState: (rawPrs ?? []).find(p => Number(p.number) === Number(c.prNumber)), currentLabels: labelsByPr.get(Number(c.prNumber)),
+        pr: c.prNumber, repo, agents, defaultBranch, prState: (rawPrs ?? []).find(p => Number(p?.number) === Number(c.prNumber)), currentLabels: labelsByPr.get(Number(c.prNumber)),
         isDraft: isDraftByPr.get(Number(c.prNumber)), mergeConflicted: mergeConflictedByPr.get(Number(c.prNumber)),
         planRows: rowsByPr.get(Number(c.prNumber)) ?? [],
       });
