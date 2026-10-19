@@ -404,7 +404,8 @@ describe('open-head ledger observations', () => {
       const events = readObservationLedger(repo);
       expect(events.map(r => r.verdict)).toEqual(['accepted', 'head-moved', 'head-moved', 'accepted']);
       expect(foldVerdictLedger(events).get(1)).toMatchObject({ clears: true, current: acceptedAgain });
-      expect(derivePrState(events, facts)).toMatchObject({ verdict: 'accepted', clears: true });
+      // The live head is A again.
+      expect(derivePrState(events, { ...facts, head: { sha: head } })).toMatchObject({ verdict: 'accepted', clears: true });
     }));
     it('a headless hold appended after the snapshot does not refuse a real move', () => withHome(append => {
       expect(append(accepted())).toMatchObject({ ok: true });
