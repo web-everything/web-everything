@@ -113,6 +113,21 @@ it('publishes a previous night failed by a restart after the next boundary, once
   for (const at of ['2026-10-18T02:18:00Z', '2026-10-18T03:00:00Z']) await runNightlyCoronerJob({ ...opts, now: Date.parse(at) });
   expect(readFileSync(opts.statusFeed, 'utf8').trim().split('\n')).toHaveLength(1);
 });
+it('keeps alerting on a previous night wedged past its deadline that cannot be stopped, publishing it once', async () => {
+  const opts = jobOptions(temp());
+  const first = await runNightlyCoronerJob({ ...opts, now: Date.parse('2026-10-17T02:17:00Z') });
+  opts.store.update(first.enqueued, (r) => ({ ...r, job: { ...r.job, status: 'running', handle: 'testhost:4242:1', attempts: 1 } }));
+  for (const at of ['2026-10-18T02:17:00Z', '2026-10-18T03:00:00Z', '2026-10-19T02:17:00Z']) {
+    const now = Date.parse(at);
+    const wedged = { ...opts, reattach: (args) => reattachTick({ ...args, observation: { now, slept: false, gapMs: 0 },
+      probe: () => 'alive', stop: async () => ({ gone: false }), launch: vi.fn() }) };
+    const result = await runNightlyCoronerJob({ ...wedged, now });
+    expect(result.enqueued).toBeNull();
+    expect(result.alerts.map((a) => a.id)).toEqual([first.enqueued]);
+  }
+  expect(opts.store.read(first.enqueued).job.status).toBe('running');
+  expect(readFileSync(opts.statusFeed, 'utf8').trim().split('\n')).toHaveLength(1);
+});
 it('publishes a retained historical failure that was never published, once', async () => {
   const opts = jobOptions(temp());
   const old = await runNightlyCoronerJob({ ...opts, now: Date.parse('2026-10-15T02:17:00Z') });
