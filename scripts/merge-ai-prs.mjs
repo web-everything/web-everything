@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { postCardSquashMarker } from './lib/card-squash-marker.mjs';
 import { ensureLabelCached } from './lib/label-cache.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
@@ -143,6 +144,7 @@ import { GH_ARGV, PR_COMMENTS_PAGE_SIZE, parseJsonLines } from './lib/review-lab
 import { existsSync, readFileSync, writeFileSync, realpathSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { resolve, join, dirname } from 'node:path';
+import { loadCardRebaseSettings } from './lib/card-squash-rebuild.mjs';
 import { rebaseDropManifest, gitRunner } from './lib/rebase-drop-manifest.mjs';
 // fix-couple-split — a couple lands WHOLE in one pass or not at all (hold + contiguous order + carrier pre-flight).
 import { planCoupleCascadeStep, carrierPreflight, openSiblingRefSet, candKey, isImplHalf, isCoupleCarrier } from './lib/couple-cascade.mjs';
@@ -5562,7 +5564,9 @@ async function runCli() {
         if (!AS_JSON) process.stderr.write(`  ↻ ${repoTag(v.repo)}${v.num} would rebase-drop manifest (state ${v.state}/${v.mergeable})${cloneDir ? ` via ${cloneDir}` : ''} then merge\n`);
         continue;
       }
-      let r = rebaseDropManifest({ laneRef, base: 'origin/main', healCollision: HEAL_COLLISION, run: gitRunner, cwd: cloneDir });
+      const cardRebaseSettings = loadCardRebaseSettings();
+      console.error(`drain rebase: cardRebase.squashToSingleCommit=${cardRebaseSettings.value.squashToSingleCommit} (source: ${cardRebaseSettings.sources.squashToSingleCommit})`);
+      let r = rebaseDropManifest({ cardRebaseSettings, laneRef, base: 'origin/main', healCollision: HEAL_COLLISION, run: gitRunner, cwd: cloneDir });
       // #2371 — a REAL (non-manifest) conflict is the manifest resolver's own skip boundary; retry it with the
       // wider content resolver, which ONLY auto-resolves if every conflicting hunk is non-overlapping. Its own
       // skip (a genuine overlapping/unsafe hunk) is left exactly as before — surfaced for `/finish`.
@@ -5576,6 +5580,12 @@ async function runCli() {
       }
       v.rebaseDrop = r.action;
       if (r.action === 'rebased') {
+        postCardSquashMarker({ result: r, readComments: () => {
+          const fetched = fetchPrComments(v.repo, v.num);
+          if (!fetched.read) throw new Error('comments unreadable');
+          return fetched.comments;
+        }, postComment: body => execFileSync('gh', ['pr', 'comment', String(v.num), ...repoFlag(v.repo), '--body', body],
+          { stdio: ['ignore', 'ignore', 'pipe'] }) });
         v.decision = 'merge';
         const healTag = r.healed && r.healed.length ? ` (renumbered ${r.healed.map((h) => `#${h.oldNum}→#${h.newNum}`).join('/')})` : '';
         const contentTag = contentResolved ? ` (auto-resolved non-overlapping content conflict in ${r.mergedPaths.join(', ')})` : '';

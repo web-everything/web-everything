@@ -1,3 +1,5 @@
+import { parseCardSquashMarkers } from '../lib/card-squash-marker.mjs';
+import { CARD_SQUASH_SUBJECT } from '../lib/card-squash-rebuild.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { reviewStartGate, fastChecksFor, REVIEW_TIMING_DEFAULTS, joinedFixDecision, fixReadiness, FIX_TIMING_DEFAULTS } from '../lib/review-timing.mjs';
 /**
@@ -443,7 +445,10 @@ export function countRealFixRounds(pr) {
     if (!c || !shaPattern.test(c.sha) || seen.has(c.sha) || !Array.isArray(c.parents)
       || c.parents.some((p) => !shaPattern.test(p)) || typeof c.subject !== 'string'
       || typeof c.authoredAt !== 'string' || !Number.isFinite(Date.parse(c.authoredAt))
-      || (c.parents.length > 1 && typeof c.mergesPrWork !== 'boolean')) return fail('invalid-commit');
+      || (c.parents.length > 1 && typeof c.mergesPrWork !== 'boolean')
+      // Old saved facts omit the flag and retain real single-parent accounting; present flags are strict.
+      || (c.mechanicalSquash !== undefined && (typeof c.mechanicalSquash !== 'boolean'
+        || (c.mechanicalSquash && (c.parents.length !== 1 || !CARD_SQUASH_SUBJECT.test(c.subject)))))) return fail('invalid-commit');
     seen.add(c.sha);
   }
   // An empty/truncated enrichment cannot establish that a round was mechanical.
@@ -475,9 +480,10 @@ export function countRealFixRounds(pr) {
     const inWindow = facts.commits.filter((commit) => Date.parse(commit.authoredAt) > start && Date.parse(commit.authoredAt) <= end);
     // A merge that brings the PR's own work in (a repair branch merged --no-ff, or an edit folded into the merge
     // itself) is real, like a fix commit.
-    // A single-parent commit is always real: the drain's rebase is a two-parent commit-tree, so a single-parent
-    // `drain: rebase …` subject is only ever a fix commit borrowing the name.
-    const shas = inWindow.filter((commit) => commit.parents.length === 1 || commit.mergesPrWork)
+    // A single-parent drain subject remains real unless enrichment proved a card-only squash on main.
+    const squashMarkers = parseCardSquashMarkers(pr?.comments);
+    const shas = inWindow.filter((commit) => (commit.parents.length === 1 && (commit.mechanicalSquash !== true
+      || !squashMarkers.some(m => m.newHead === commit.sha))) || commit.mergesPrWork)
       .map((commit) => commit.sha);
     previous = end;
     // Refund only on positive evidence: the window holds commits and every one is an upstream merge or drain rebase.

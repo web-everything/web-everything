@@ -11,8 +11,11 @@ export function loadCardConflictSettings({ env = process.env, platform = platfor
   repo = readSettings()?.cardConflicts } = {}) {
   const raw = env.WE_CARD_CONFLICTS_AUTO_RESOLVE_RAISED_BY;
   const value = raw === 'true' || raw === '1' ? true : raw === 'false' || raw === '0' ? false : raw || undefined;
-  return cascadePolicy('cardConflicts', repo, { standard: { autoResolveRaisedBy: true }, platform,
-    envValues: { autoResolveRaisedBy: value }, valid: { autoResolveRaisedBy: v => typeof v === 'boolean' } });
+  const recheckRaw = env.WE_CARD_CONFLICTS_GIT_RECHECK_FILES;
+  const recheck = recheckRaw === 'true' || recheckRaw === '1' ? true : recheckRaw === 'false' || recheckRaw === '0' ? false : recheckRaw || undefined;
+  return cascadePolicy('cardConflicts', repo, { standard: { autoResolveRaisedBy: true, gitRecheckFiles: true }, platform,
+    envValues: { autoResolveRaisedBy: value, gitRecheckFiles: recheck },
+    valid: { autoResolveRaisedBy: v => typeof v === 'boolean', gitRecheckFiles: v => typeof v === 'boolean' } });
 }
 
 const markers = /^(?:<{7}|={7}|>{7}|\|{7})(?: |$)/m;
