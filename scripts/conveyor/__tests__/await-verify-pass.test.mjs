@@ -1,6 +1,6 @@
-import { describe, it, expect, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync, lstatSync, existsSync, utimesSync, readdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, lstatSync, existsSync, utimesSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { computeWorkingTreeHash } from '../../lib/verify-lane-gate.mjs';
@@ -116,6 +116,14 @@ function harness({ records = [rec()], session = { sessionId: rec().sessionId, na
 
 describe('scope fence default wiring regressions', () => {
   const ref = 'lane/scope-fence';
+  let weRoot;
+  beforeAll(() => {
+    weRoot = mkdtempSync(join(tmpdir(), 'await-verify-scope-'));
+    mkdirSync(join(weRoot, 'src', '_data'), { recursive: true });
+    // Keep the real default loader wired: this item-less PR resolves its scope from the mocked PR diff.
+    writeFileSync(join(weRoot, 'src', '_data', 'backlog.js'), 'module.exports = () => [];\n');
+  });
+  afterAll(() => { if (weRoot) rmSync(weRoot, { recursive: true, force: true }); });
   function fixture({ ancestry = 'ancestor', outside = true, evidenceError = null, mode = 'stand-down' } = {}) {
     const calls = [];
     const exec = (cmd, args) => {
@@ -144,7 +152,7 @@ describe('scope fence default wiring regressions', () => {
       throw new Error(`unexpected command: ${cmd}`);
     };
     return { calls, build: () => defaultAwaitVerifyIo({
-      weRoot: '/we', exec, env: { WE_FIX_SCOPE_FENCE_ENABLED: 'true', WE_FIX_SCOPE_FENCE_MODE: mode },
+      weRoot, exec, env: { WE_FIX_SCOPE_FENCE_ENABLED: 'true', WE_FIX_SCOPE_FENCE_MODE: mode },
       poolRoot: '/lanes', realpath: p => p, dispatchIo: {}, stopSessionFn: () => {},
       pushRefusalFn: () => null, readClaimFn: () => ({ meta: { sessionId: 'S', branch: ref } }),
     }) };
@@ -203,7 +211,9 @@ describe('scope fence default wiring regressions', () => {
   for (const evidenceError of ['unavailable', 'fatal', 'missing-verified']) {
     it(`keeps ${evidenceError} Git evidence failures transient and never pushes`, async () => {
       const f = fixture({ evidenceError }), real = await f.build();
-      expect(real.push(pushArg())).toMatchObject({ ok: false, scopeFence: true, transient: true });
+      const result = real.push(pushArg());
+      expect(result).toMatchObject({ ok: false, scopeFence: true, transient: true });
+      expect(result.reason).toContain(evidenceError === 'missing-verified' ? 'missing verified commit' : 'git unavailable');
       expect(f.calls.some(c => c[0] === 'git' && c.includes('push'))).toBe(false);
     });
   }
