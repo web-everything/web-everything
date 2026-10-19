@@ -141,7 +141,7 @@ describe('runReviewTick — stale status sweep', () => {
     });
     const out = runReviewTick({ ...base, tagStatus,
       dispatch: () => { order.push('dispatch'); return { agentId: 'review-11' }; } });
-    expect(order).toEqual(['tag', 'write', 'dispatch', 'tag']);
+    expect(order).toEqual(['tag', 'write', 'dispatch']);
     expect(tagStatus.mock.calls[0][0]).toMatchObject({ pr: 10, repo, agents: [],
       defaultBranch: 'main', prState: cleanPr, currentLabels: cleanPr.labels,
       isDraft: false, mergeConflicted: false, planRows: plan.notes });
@@ -151,9 +151,8 @@ describe('runReviewTick — stale status sweep', () => {
     expect(provider.setLabels).toHaveBeenCalledWith(repo, 10, {
       add: 'status:ready-to-merge', remove: ['status:conflict'],
     });
-    expect(tagStatus.mock.calls[1][0].currentLabels).toEqual([
-      { name: 'review:accepted' }, 'status:ready-to-merge',
-    ]);
+    // PR 10 was swept and not dispatched, so the end-of-tick pass skips it: tagged once per tick.
+    expect(tagStatus).toHaveBeenCalledTimes(1);
   });
 
   it.each([
