@@ -751,7 +751,9 @@ function describeGateBody({ command, decision, scanCommands = [] }) {
   if (decision.mode === 'card-only-skip') return `verify-lane gate: SKIPPED — card-only diff (CI's definition, scripts/ci-card-only.mjs); CI runs the full check:standards and stays the merge authority.`;
   if (decision.mode === 'blocked') return `verify-lane gate: BLOCKED selection — ${decision.reasons.join('; ')}`;
   const out = [];
-  if (decision.mode === 'shrink') {
+  if (decision.mode === 'full') {
+    out.push('verify-lane gate: FULL — the whole unit tier plus standards');
+  } else if (decision.mode === 'shrink') {
     out.push(`verify-lane gate: SELECTED tests only — ${decision.changedFiles.length} changed path(s) → \`vitest related\` on ${decision.targets.length} target(s) (${decision.referencedTests.length} added because they name a changed file). CI still runs the full suite.`);
     if (decision.selection) out.push(`  related-test selection: ${decision.selection.status} — ${decision.selection.reason}`
       + (decision.selection.hubs?.length ? ` (hubs: ${decision.selection.hubs.map((h) => `${h.file} ${h.direct}/${h.transitive}`).join(', ')})` : ''));

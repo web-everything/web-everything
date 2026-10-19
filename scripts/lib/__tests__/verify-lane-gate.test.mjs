@@ -260,6 +260,22 @@ describe('resolveDefaultGate (xpnhz4o) — the LOCAL gate runs only the diff-sel
     expect(full).toContain('package.json');
     expect(full).toContain('No local full suite');
   });
+
+  it('describeGate identifies the configured full gate and includes its reason, selection mode and command', () => {
+    const full = describeGate({
+      command: FULL_GATE,
+      decision: {
+        mode: 'full',
+        reasons: ['build.finalGate=full — the whole unit tier plus standards'],
+        selectionMode: { mode: 'pr', reason: 'build.finalGate=full' },
+      },
+    });
+    expect(full).toMatch(/^verify-lane gate: FULL — the whole unit tier plus standards/);
+    expect(full).toContain('  - build.finalGate=full');
+    expect(full).toContain('  selection mode: pr — whole PR diff vs origin/main (build.finalGate=full)');
+    expect(full).toContain(`  command: ${FULL_GATE}`);
+    expect(full).not.toContain('fallback');
+  });
 });
 
 // #3919 — the gate must only name npm scripts the TARGET checkout has (real package.json script-name sets).

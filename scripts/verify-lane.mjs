@@ -402,7 +402,7 @@ if (typeof flags.gate === 'string') {
   resolvedGate = resolved;
   // xpnhz4o — always SAY whether this is a selected run or a full-suite fallback, and why (stderr, so `--json`
   // stdout stays one parseable document).
-  process.stderr.write((resolved.decision.mode === 'full' ? `verify-lane gate: FULL — ${resolved.decision.reasons[0]}` : describeGate(resolved)) + '\n');
+  process.stderr.write(describeGate(resolved) + '\n');
 }
 
 // The dispatcher passes the requested default command back via --gate. Recognize that exact command,
