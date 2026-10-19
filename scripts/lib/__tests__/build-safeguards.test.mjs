@@ -197,7 +197,7 @@ describe('production self-review adapter', () => {
     ['mixed fenced and unfenced verdicts', '```json\n{"findings":[]}\n```\n{"findings":["a.mjs:1 defect"]}'],
     ['mixed unfenced and fenced verdicts', '{"findings":["a.mjs:1 defect"]}\n```json\n{"findings":[]}\n```'],
     ['a fenced verdict beside an unquoted-key verdict', '```json\n{"findings":[]}\n```\n{findings: ["a.mjs:1 defect"]}'],
-    ['a fenced verdict beside a smart-quoted verdict', '```json\n{"findings":[]}\n```\n{“findings”: ["a.mjs:1 defect"]}'],
+    ['a fenced verdict beside a smart-quoted verdict', `\`\`\`json\n{"findings":[]}\n\`\`\`\n{${String.fromCharCode(0x201C)}findings${String.fromCharCode(0x201D)}: ["a.mjs:1 defect"]}`],
     ['a fenced verdict beside an upper-case JSON fence', '```json\n{"findings":[]}\n```\n```JSON\n{"findings":["a.mjs:1 defect"]}\n```'],
     ['a fenced verdict beside a tilde fence', '```json\n{"findings":[]}\n```\n~~~\n{"findings":["a.mjs:1 defect"]}\n~~~'],
     ['a text fence beside a bare verdict', '```text\n{"findings":["a.mjs:1 defect"]}\n```\n{"findings":[]}'],
@@ -207,11 +207,11 @@ describe('production self-review adapter', () => {
     ['a fenced verdict beside an escaped-quote verdict', '```json\n{"findings":[]}\n```\n{\\"findings\\":[\\"a.mjs:1 defect\\"]}'],
     ['a fenced verdict beside YAML findings', '```json\n{"findings":[]}\n```\nfindings:\n- a.mjs:1 defect'],
     ['a bare verdict beside YAML findings', 'findings:\n- a.mjs:1 defect\n{"findings":[]}'],
-    ['a fenced verdict beside a zero-width-split key', '```json\n{"findings":[]}\n```\n{"find​ings":["a.mjs:1 defect"]}'],
+    ['a fenced verdict beside a zero-width-split key', `\`\`\`json\n{"findings":[]}\n\`\`\`\n{"find${String.fromCharCode(0x200B)}ings":["a.mjs:1 defect"]}`],
     ['a fenced verdict beside a \\u-escaped key', '```json\n{"findings":[]}\n```\n{"\\u0066indings":["a.mjs:1 defect"]}'],
     ['a fenced verdict beside a key spaced from its colon', '{"findings"        :["a.mjs:1 defect"]}\n```json\n{"findings":[]}\n```'],
     ['a fenced verdict beside a key with a newline before its colon', '{"findings"\n:["a.mjs:1 defect"]}\n```json\n{"findings":[]}\n```'],
-    ['a fenced verdict beside a ligature key','```json\n{"findings":[]}\n```\n{"ﬁndings":["a.mjs:1 defect"]}'],
+    ['a fenced verdict beside a ligature key',`\`\`\`json\n{"findings":[]}\n\`\`\`\n{"${String.fromCharCode(0xFB01)}ndings":["a.mjs:1 defect"]}`],
   ])('rejects %s', async (_name, lastMessage) => {
     const task = vi.spyOn(codexTasks, 'codexDirectTask').mockResolvedValue({ exitCode: 0, timedOut: false, lastMessage });
     try { await expect(reviewBuildDiff({ dir: '.', diff: 'net change', env: {} })).rejects.toThrow(); }
