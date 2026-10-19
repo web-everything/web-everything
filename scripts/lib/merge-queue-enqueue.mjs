@@ -241,8 +241,9 @@ const SAFE_BRANCH_RE = /^[A-Za-z0-9._/-]+$/;
  * that moved between the read and the enqueue could be judged on another commit's files). The diff is
  * `origin/<base>...<headSha>` (merge-base to head, what the queue lands) with `--no-renames`, so a rename shows
  * BOTH its old and new path. Every path is listed (no 3000-file REST cap). `{files}` or `{error}`. Never throws.
+ * `withBaseSha`: also return `baseSha`, the base commit the diff was read against (null when unknown).
  */
-export function readPinnedChangedFiles({ headSha, base = 'main', cwd, exec = execFileSync } = {}) {
+export function readPinnedChangedFiles({ headSha, base = 'main', cwd, exec = execFileSync, withBaseSha = false } = {}) {
   if (!SHA_RE.test(String(headSha))) return { error: 'head sha is not a 40-hex commit id' };
   if (!SAFE_BRANCH_RE.test(String(base)) || String(base).startsWith('-')) return { error: 'base branch name unusable' };
   if (!cwd) return { error: 'no checkout to read the pinned diff from' };
@@ -250,9 +251,26 @@ export function readPinnedChangedFiles({ headSha, base = 'main', cwd, exec = exe
   try {
     git(['fetch', '--quiet', '--end-of-options', 'origin', headSha, `+refs/heads/${base}:refs/remotes/origin/${base}`]);
     git(['cat-file', '-e', `${headSha}^{commit}`]);
-    const out = git(['diff', '--name-only', '--no-renames', '-z', '--end-of-options', `refs/remotes/origin/${base}...${headSha}`]);
-    return { files: out.split('\0').filter(Boolean) };
+    // Pin the base tip BEFORE the diff and diff against that sha: another drain sharing this checkout can move the
+    // remote-tracking ref at any moment, and `baseSha` must be the commit this list was actually read against.
+    // Unknown → diff the ref and report no `baseSha` (the list is then never reused).
+    let baseSha = null;
+    try { baseSha = git(['rev-parse', '--verify', '--end-of-options', `refs/remotes/origin/${base}^{commit}`]).trim(); } catch { /* unknown */ }
+    if (!SHA_RE.test(baseSha)) baseSha = null;
+    const out = git(['diff', '--name-only', '--no-renames', '-z', '--end-of-options', `${baseSha ?? `refs/remotes/origin/${base}`}...${headSha}`]);
+    const files = out.split('\0').filter(Boolean);
+    return withBaseSha ? { files, baseSha } : { files };
   } catch (e) { return { error: errText(e) }; }
+}
+
+/** The base branch's current tip on `origin`, read live (no fetch). A 40-hex sha, or null. Never throws. */
+function readBaseTip({ base, cwd, exec }) {
+  if (!cwd || !SAFE_BRANCH_RE.test(String(base)) || String(base).startsWith('-')) return null;
+  try {
+    const out = String(exec('git', ['ls-remote', '--exit-code', 'origin', `refs/heads/${base}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 }) ?? '');
+    const rows = out.split('\n').filter(Boolean).map(l => l.split('\t'));
+    return rows.length === 1 && rows[0][1] === `refs/heads/${base}` && SHA_RE.test(rows[0][0]) ? rows[0][0] : null;
+  } catch { return null; }
 }
 
 /**
@@ -265,7 +283,7 @@ export function readPinnedChangedFiles({ headSha, base = 'main', cwd, exec = exe
  * refusal and the queue entry therefore always describe the same commit.
  * @param {{repo:string, num:number, headSha:string, cwd:string, exec?:Function}} o  `cwd`: a clone of `repo`.
  */
-export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync }) {
+export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync, preparedSurface = null }) {
   if (!/^[\w.-]+\/[\w.-]+$/.test(String(repo)) || !Number.isInteger(Number(num))) {
     return { ok: false, held: true, humanOnly: false, retryable: true, reason: 'unreadable', paths: [], error: 'changed files unreadable (repo or PR number is malformed)' };
   }
@@ -278,7 +296,17 @@ export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync }) {
   if (pr?.headRefOid !== headSha) {
     return { ok: false, held: true, humanOnly: false, retryable: true, reason: 'head-moved', paths: [], error: `PR head is ${String(pr?.headRefOid).slice(0, 9)}, not the judged ${String(headSha).slice(0, 9)} — re-judge the new head before enqueueing` };
   }
-  const read = readPinnedChangedFiles({ headSha, base: pr?.baseRefName || 'main', cwd, exec });
+  const liveBase = pr?.baseRefName;
+  if (typeof liveBase !== 'string' || liveBase === '') {
+    return { ok: false, held: true, humanOnly: false, retryable: true, reason: 'unreadable', paths: [], error: 'changed files unreadable (the PR base branch is unreadable)' };
+  }
+  // A prepared list describes `base...head` at one base commit: reuse it only while the head, the base branch AND
+  // that branch's tip all still match (a retargeted PR, or a base that moved, can show a workflow edit the prepared
+  // list hid). Anything else re-reads git.
+  const reusable = preparedSurface?.headSha === headSha && preparedSurface.base === liveBase && SHA_RE.test(String(preparedSurface.baseSha))
+    && Array.isArray(preparedSurface.files) && preparedSurface.files.every(p => typeof p === 'string')
+    && readBaseTip({ base: liveBase, cwd, exec }) === preparedSurface.baseSha;
+  const read = reusable ? { files: preparedSurface.files } : readPinnedChangedFiles({ headSha, base: liveBase, cwd, exec });
   const hold = workflowEditHold({ files: read.files, expectedCount: read.files?.length });
   if (hold.hold) return { ok: false, held: true, humanOnly: hold.humanOnly, retryable: hold.retryable === true, reason: hold.reason, paths: hold.paths, error: read.error ? `${hold.error}: ${read.error}` : hold.error };
   const queueState = () => readMergeQueueState({ repo, pr: num, readJson: args => JSON.parse(exec('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}') });

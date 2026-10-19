@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.mjs';
 /**
  * @file scripts/operations/review-dispatch.mjs
@@ -438,8 +439,10 @@ const REVIEW_CODE_PATH_FILES = new Set([
   'scripts/operations/engine.mjs', 'scripts/operations/effect-executor.mjs', 'scripts/operations/registry.mjs',
   'scripts/operations/run-record.mjs', 'scripts/operations/run-store.mjs', 'scripts/operations/run.mjs',
   'scripts/operations/scaffold-io.mjs', 'scripts/operations/step-kinds.mjs',
-  // cli-adapter's submit outcome summary helpers
-  'scripts/operations/open-pr.mjs',
+  // cli-adapter's submit outcome summary and spawn diagnostic redaction helpers
+  'scripts/operations/open-pr.mjs', 'scripts/lib/describe-spawn-failure.mjs',
+  // Shared card-only classification is a direct dependency of the review entry points.
+  'scripts/ci-card-only.mjs',
   // review-pr's remaining direct imports
   'scripts/codex-direct-task.mjs', 'scripts/review-core-cli.mjs', 'scripts/review-set-label.mjs',
   'scripts/lib/advisory-labels.mjs', 'scripts/lib/model-probation.mjs', 'scripts/lib/pr-liveness.mjs',
@@ -459,6 +462,7 @@ const REVIEW_CODE_PATH_FILES = new Set([
   'scripts/conveyor/run-rating.mjs', 'scripts/operations/telemetry-store.mjs', 'scripts/conveyor/reconcile-core.mjs',
   // Verdict carry and red-team marker helpers are direct dependencies of review-job's acceptance path.
   'scripts/lib/rebase-verdict-carry.mjs', 'scripts/lib/red-team-gate.mjs', 'scripts/lib/drain-red-team-evidence.mjs',
+  'scripts/lib/red-team-status-labels.mjs',
   // 117 S3b — the review session and the review job now launch / record through the unified worker wrapper.
   'scripts/operations/worker-wrapper-launch.mjs', 'scripts/operations/worker-wrapper.mjs',
 ]);
@@ -553,7 +557,7 @@ export function planReviewDispatch({ pr, repo, checkoutExists = existsSync, home
  */
 export function dispatchReview({
   ciGate = readReviewCiGate, advisoryCiWaiver = null,
-  pr, repo, root = REPO_ROOT,
+  pr, repo, root = REPO_ROOT, env = process.env,
   readBrief = (r) => readFileSync(reviewBriefPath(r), 'utf8'),
   mintSessionId = () => randomUUID(),
   spawnAgent = defaultSpawnAgent,
@@ -603,9 +607,10 @@ export function dispatchReview({
       + 'Opt in with REVIEW_PR_CODEX_ADVISORY=1 in the environment instead.',
     );
   }
-  const ci = ciGate({ repo: planned.repo, pr: planned.pr });
+  const policy = resolveTimingPolicy({ env }).review;
+  const ci = ciGate({ repo: planned.repo, pr: planned.pr, policy });
   // Card 273, #5157: a waiver is pinned to readable CI on this exact head.
-  const waived = typeof ci?.headSha === 'string' && typeof advisoryCiWaiver?.head === 'string'
+  const waived = policy.startAfter === 'ci-green' && typeof ci?.headSha === 'string' && typeof advisoryCiWaiver?.head === 'string'
     && ci.headSha.length > 0 && ci.headSha.toLowerCase() === advisoryCiWaiver.head.toLowerCase()
     && !['head-changed', 'unreadable-ci', 'missing-head', 'unknown-required-set', 'untrusted-required-set'].includes(String(ci.reason ?? '').split(' (')[0])
     && !(ci.affected ?? []).some(row => ['wrong-head', 'malformed', 'missing'].includes(row.reason));

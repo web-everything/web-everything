@@ -160,12 +160,21 @@ describe('merge-ai-prs — #4138: a PR about to be closed by the stacked-base ca
   });
 
   it('onFailed posts the reason comment, and the whole retarget block (comment included) runs BEFORE the merge write', () => {
-    const idx = src.indexOf('retargetStackedPrs({ repo: c.repo, headRef: c.headRef, defaultBranch: defBranch,');
-    expect(idx).toBeGreaterThan(-1);
-    const lockIdx = src.indexOf('const landLock = withLandWriteLock(', idx);
-    expect(lockIdx).toBeGreaterThan(idx); // #4138 — the retarget block (and its onFailed comment) precedes the merge write
-    const block = src.slice(idx, lockIdx);
+    // The retarget block lives in the shared pre-landing step both landing entry points call.
+    const helper = src.indexOf('const announceAndRetargetBeforeLand = (c, { preread, defaultBranch }) => {');
+    expect(helper).toBeGreaterThan(-1);
+    const idx = src.indexOf('retargetStackedPrs({ repo: c.repo, headRef: c.headRef, defaultBranch,', helper);
+    const end = src.indexOf('\n  };\n', helper);
+    expect(idx).toBeGreaterThan(helper);
+    expect(end).toBeGreaterThan(idx);
+    const block = src.slice(idx, end);
     expect(block).toMatch(/onFailed: \(num\) => \{/);
     expect(block).toMatch(/postDrainReasonComment\(c\.repo, num, STACKED_BASE_CLOSE_KIND, buildStackedBaseCloseReason\(\{ headRef: c\.headRef \}\), null\);/);
+    // #4138 — the cascade runs the step (and its onFailed comment) BEFORE the merge write.
+    const call = src.indexOf('announceAndRetargetBeforeLand(c, { preread, defaultBranch: defaultBranchOf(c.repo) || \'main\' });');
+    expect(call).toBeGreaterThan(-1);
+    expect(src.indexOf('const landLock = withLandWriteLock(', call)).toBeGreaterThan(call);
+    // The green-event shortcut runs it through `beforeEnqueue`, which enqueuePrestage awaits before its lock.
+    expect(src).toMatch(/beforeEnqueue: \(c, sha, entry\) => announceAndRetargetBeforeLand\(c,/);
   });
 });

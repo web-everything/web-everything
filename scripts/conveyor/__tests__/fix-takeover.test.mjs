@@ -7,7 +7,9 @@ import {
 } from '../fix-takeover.mjs';
 // The planner moved to the takeover-budget module (fix.takeoverBudget, progress guard, gate holds).
 import { planTakeover, resolveTakeoverBudget } from '../takeover-budget.mjs';
-import { planReconcile } from '../reconcile-core.mjs';
+import { planReconcile as planReconcileWithTiming } from '../reconcile-core.mjs';
+// This historical fixture exercises the serial policy; new defaults have their own timing suite.
+const planReconcile = options => planReconcileWithTiming({ reviewTiming: { startAfter: 'ci-green' }, fixTiming: { joinCiAndReview: false }, ...options });
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { briefWithRoundContext, fixerTableFor, dispatchFix } from '../reconcile-fix-dispatch.mjs';
 import { readDeclaredSettings } from '../../lib/settings-files.mjs';

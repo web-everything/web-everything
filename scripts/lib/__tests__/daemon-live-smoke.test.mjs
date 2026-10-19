@@ -1009,6 +1009,16 @@ describe('gateMergedCommit — the one entry point daemon-self-sync.mjs and daem
 const ghApiCheck = SMOKE_CHECKS.find((c) => c.name === 'gh-api-repo').run;
 const ghPrListCheck = SMOKE_CHECKS.find((c) => c.name === 'gh-pr-list').run;
 
+it('gh-api-repo still fails and preserves the real error plus shim warning in a combined child message', async () => {
+  const warning = 'gh-shim: GitHub App role "worker" unavailable (worker: no fresh token cached) - using the legacy App for this call';
+  const cause = 'gh-throttle: GitHub core API rate limit exceeded for this identity — shared backoff until 2026-10-18T12:00:00Z, call not sent';
+  const message = `exited 1: ${cause} [warning: ${warning}]`;
+  const runChild = vi.fn().mockRejectedValue(new Error(message));
+  const result = await ghApiCheck({ ghChildEnv: {}, budgets: { ghApiMs: 1000 }, runChild });
+  expect(result.ok).toBe(false);
+  expect(result.detail).toContain(`failed: ${message}`);
+});
+
 describe('ghDispatchedSessionEnv — pure composition (#4072)', () => {
   it('strips an inherited GH_TOKEN/GITHUB_TOKEN even when App auth is not configured (no shim to fall back on)', () => {
     const out = ghDispatchedSessionEnv({ GH_TOKEN: 'daemon-ambient-stale', GITHUB_TOKEN: 'also-stale', PATH: '/usr/bin', HOME: '/x' });

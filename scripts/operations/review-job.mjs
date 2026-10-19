@@ -1,5 +1,7 @@
 #!/usr/bin/env node
-import { recordRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
+import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
+import { recordRedTeamStatus, readDrainRedTeamEvidence } from '../lib/drain-red-team-evidence.mjs';
+import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { speculativeSeatTimings } from '../lib/review-speculative-red-team.mjs';
 import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
 import { readRun, writeRun } from './run-store.mjs';
@@ -81,7 +83,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { execRead } from '../lib/proc-read.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
-import { redTeamGateMarker, redTeamMarker } from '../lib/red-team-gate.mjs';
+import { liveResultGateState, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
 import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -267,7 +269,7 @@ export function laneCooloffActive(record, nowMs, cooloffMs = INFRA_RETRY_COOLOFF
 // ── THE ARC ────────────────────────────────────────────────────────────────────────────────────────────────────
 
 /** The real effects, each one command. `root` is the checkout the arc runs from (the daemon's clone). */
-export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root) } = {}) {
+export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync } = {}) {
   const node = (args, { actorId, timeoutMs, extraEnv = null } = {}) => spawnSync(process.execPath, args, {
     cwd: root,
     encoding: 'utf8',
@@ -277,11 +279,17 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
   });
   return {
     redTeamStatus: input => {
-      try { recordRedTeamStatus(input, { env }); }
+      try {
+        recordRedTeamStatus(input, { env });
+        syncRedTeamStatusLabels({ repo: input.repo, pr: input.pr, head: input.loopPayload?.findings?.read?.netBasis?.rev,
+          evidence: readDrainRedTeamEvidence({ repo: input.repo, pr: input.pr, head: input.loopPayload?.findings?.read?.netBasis?.rev, env }), env,
+          log: line => process.stderr.write(`${line}\n`) });
+      }
       catch (e) { process.stderr.write(`review-job: red-team status write failed: ${e.message}\n`); }
     },
     root,
-    carryAcrossRebaseSetting: () => resolveCarryAcrossRebase({ env }),
+    // The carry's own resolver is its only source (logged with that source); no timing setting governs it.
+    carryAcrossRebaseSetting: () => resolveCarryAcrossRebase({ env, readFile }),
     readCarryEvidence: ({ pr, repo }) => {
       const view = JSON.parse(execRead('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], { cwd: root, env }));
       const comments = readCompletePrComments(pr, { repo, exec: (f, a, o) => execRead(f, a, { ...o, cwd: root, env }) });
@@ -630,6 +638,14 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     const observed = rows.filter(r => r?.startedAt).map(r => seatTiming({ ...r, verdict: r.seatVerdict ?? r.verdict ?? null }));
     try { io.recordSeatTimings?.(out.runId, observed); } catch (e) { io.log(`review-job: seat timing write failed (${e.message})`); }
   };
+  // Card xbizuci — under `review.speculativeRedTeam` the red team was already started beside the loop.
+  const spec = seatsBox.speculative ?? null;
+  // Card xyyuvyz — EVERY head the panel accepts, a `review:human` advisory accept included (`redTeamOwedFor`); once
+  // per head is the pass's own `(pr, rev)` row + comment marker.
+  const accepted = Boolean(seatsBox.input) && redTeamOwedFor(seatsBox.input.loopPayload);
+  // The accept is already labelled, and the added seats below can take minutes: record the pass as queued now, so
+  // the drain holds the head until the pass records its result. The `finished` write at the end supersedes it.
+  if (accepted && (spec || typeof io.runRedTeam === 'function')) io.redTeamStatus?.({ ...seatsBox.input, status: 'queued' });
   // #4194 — THE ADDED NON-CLAUDE SEATS (advisory lenses + one extra juror on Codex/Gemini), beside Claude's
   // mandatory seats and strictly AFTER the arc is over: the verdict is labelled, `done` is reported, the lane is
   // released and the job slot dropped — so the seats never delay the pipeline and nothing they do can touch the
@@ -650,11 +666,6 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   // everything above. Same containment as the seats: a crash is a status in `redTeam`, never a changed outcome.
   // Card xbizuci — under `review.speculativeRedTeam` it was already started beside the loop (`seatsBox.speculative`):
   // an accept finishes THAT pass (same rows, comment and gate as the sequential pass); anything else calls it off.
-  const spec = seatsBox.speculative ?? null;
-  // Card xyyuvyz — EVERY head the panel accepts, a `review:human` advisory accept included (`redTeamOwedFor`); once
-  // per head is the pass's own `(pr, rev)` row + comment marker.
-  const accepted = Boolean(seatsBox.input) && redTeamOwedFor(seatsBox.input.loopPayload);
-  if (accepted) io.redTeamStatus?.({ ...seatsBox.input, status: 'running' });
   if (spec) {
     try {
       out.redTeamSpeculative = settleSpeculativeRedTeam({ spec, accepted, out, input: seatsBox.input }, io);
@@ -689,6 +700,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     }
   }
   if (accepted) io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: out.redTeam?.status ?? null });
+  else if (spec && seatsBox.input) io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: 'not-owed' });
   return out;
 }
 
@@ -741,7 +753,11 @@ function runReviewArc({
               const stamped = io.restampVerdict({ pr: planned.pr, repo: planned.repo, newHead: evidence.headSha,
                 reason: `${decision.reason}; from ${prior.sha}; patch-id ${headPatchId}` });
               if (!stamped?.ok) throw Error(`restamp refused: ${stamped?.reason ?? 'unknown error'}`);
-              const gate = prior.gateOutcomes.map(outcome => redTeamGateMarker(planned.pr, evidence.headSha, outcome));
+              // Carry only the gate decisions made on the result being carried, named by that result (PR #5482).
+              const decided = prior.advisory ? liveResultGateState(evidence.comments, planned.pr, prior.sha) : null;
+              const gate = !decided ? prior.gateOutcomes.map(outcome => redTeamGateMarker(planned.pr, evidence.headSha, outcome))
+                : decided.resultId !== redTeamResultId(prior.advisory) ? []
+                  : [...decided.outcomes].map(outcome => redTeamGateMarker(planned.pr, evidence.headSha, outcome, decided.resultId));
               const body = [...gate, buildVerdictCarriedMarker({ fromSha: prior.sha, toSha: evidence.headSha, patchId: headPatchId }),
                 'Review verdict carried across an identical contribution.',
                 ...(prior.advisoryBody ? [prior.advisoryBody.replace(redTeamMarker(planned.pr, prior.sha), redTeamMarker(planned.pr, evidence.headSha))] : [])].join('\n');
@@ -885,9 +901,10 @@ export function dispatchReviewJob({
     return { ...base, jobPid: null, skipped: 'lane-cooloff' };
   }
 
-  const ci = ciGate({ repo: planned.repo, pr: planned.pr });
+  const policy = resolveTimingPolicy({ env }).review;
+  const ci = ciGate({ repo: planned.repo, pr: planned.pr, policy });
   // Card 273, #5157: a waiver is pinned to readable CI on this exact head.
-  const waived = typeof ci?.headSha === 'string' && typeof advisoryCiWaiver?.head === 'string'
+  const waived = policy.startAfter === 'ci-green' && typeof ci?.headSha === 'string' && typeof advisoryCiWaiver?.head === 'string'
     && ci.headSha.length > 0 && ci.headSha.toLowerCase() === advisoryCiWaiver.head.toLowerCase()
     && !['head-changed', 'unreadable-ci', 'missing-head', 'unknown-required-set', 'untrusted-required-set'].includes(String(ci.reason ?? '').split(' (')[0])
     && !(ci.affected ?? []).some(row => ['wrong-head', 'malformed', 'missing'].includes(row.reason));

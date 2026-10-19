@@ -6,7 +6,7 @@
  * commit messages and changed files, or by grepping Claude transcripts one lane at a time. This is the
  * declared operation that does it for every lane in a pool, read-only, in one pass:
  *
- *   node scripts/lane-whois.mjs [--lane=N] [--json] [--repo=<checkout>] [--branch=<ref>] [--pool-root=<path>]
+ *   node scripts/lane-whois.mjs [--lane=N] [--json] [--repo=<checkout>] [--branch=<ref>] [--pool-root=<path>] [--scan-transcripts]  # explicit historical backfill only
  *   node scripts/lane-whois.mjs --history <N> [--json] [--pool-root=<path>]   # #4370 lane N's lifecycle journal
  *
  * READ-ONLY, ALWAYS: every git/gh call this file makes is a read (`status`, `log`, `rev-list`, `cherry`,
@@ -50,7 +50,8 @@ import { pathToFileURL } from 'node:url';
 import { guardedPoolRoot } from './lib/lane-pool-paths.mjs';
 import { LEASE_FILENAME, isLeaseStale, describeLease, laneHolderSlug, DEFAULT_LEASE_TTL_MINUTES } from './lib/lane-lease.mjs';
 import { readLaneHistory, lastLaneHistoryEntry, readLaneJournal } from './lib/lane-history.mjs';
-import { claudeProjectsRoot, scanLaneTranscripts, summarizeLaneTouches } from './lib/lane-transcript-attribution.mjs';
+import { claudeProjectsRoot, summarizeLaneTouches } from './lib/lane-transcript-attribution.mjs';
+import { cachedTranscriptAttribution } from './lib/lane-transcript-backfill.mjs';
 import { liveAgentInLane, agentsInLane, leaseSessionIds } from './lib/lane-salvage.mjs';
 
 // #4544 — the `claude agents --json` vocabulary for "actually running", observed on a live host: background
@@ -549,17 +550,18 @@ export function resolvePool({ checkoutRoot = process.cwd(), poolRootOverride, po
 }
 
 /**
- * The full read-only whois report over a pool. ONE transcript grep pass for every lane requested (never one
- * per lane), per #3383's own performance note.
+ * The routine report uses lease + ledger only. --scan-transcripts explicitly requests historical backfill;
+ * it is host single-flight and permanently cached per lane path.
  */
 export function whois({
   poolDir, laneNumbers, branch = 'main', ghRepo = null, projectsRoot = claudeProjectsRoot(), nowMs = Date.now(),
   ttlMinutes = DEFAULT_LEASE_TTL_MINUTES, exec = execFileSync,
+  scanTranscripts = false, transcriptBackfill = cachedTranscriptAttribution,
 } = {}) {
   const lanes = laneNumbers && laneNumbers.length ? laneNumbers : listLaneNumbers(poolDir);
   const branchRef = branch.startsWith('origin/') ? branch : `origin/${branch}`;
   const lanePaths = Object.fromEntries(lanes.map((n) => [String(n), join(poolDir, `lane-${n}`)]));
-  const touchesByLane = scanLaneTranscripts(projectsRoot, lanePaths, { exec });
+  const touchesByLane = scanTranscripts ? transcriptBackfill(projectsRoot, lanePaths, { exec }) : new Map();
   const agents = liveAgentSessions({ exec });
   const allPrs = fetchAllPrs({ ghRepo, exec, poolDir, nowMs });
   const listingCache = new Map();
@@ -648,7 +650,7 @@ export function main(argv = process.argv.slice(2)) {
     branch: flags.branch || 'main',
   });
   const laneNumbers = flags.lane !== undefined ? [Number(flags.lane)] : null;
-  const report = whois({ poolDir, laneNumbers, branch, ghRepo: flags['gh-repo'] || null });
+  const report = whois({ poolDir, laneNumbers, branch, ghRepo: flags['gh-repo'] || null, scanTranscripts: flags['scan-transcripts'] === true });
   if (flags.json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   else printReport(report);
 }
@@ -660,4 +662,10 @@ export function isCliEntry(argv1 = process.argv[1], moduleUrl = import.meta.url)
   return moduleUrl === pathToFileURL(resolved).href;
 }
 
-if (isCliEntry()) main();
+if (isCliEntry()) {
+  try { main(); }
+  catch (e) {
+    process.stderr.write(`${e.message}\n`);
+    process.exitCode = e.code === 'HOST_LOAD_DEFERRED' ? 75 : 1;
+  }
+}

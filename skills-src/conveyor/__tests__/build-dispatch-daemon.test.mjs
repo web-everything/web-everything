@@ -1,5 +1,6 @@
 import { resolveCostAdmissionSettings } from '../../../scripts/lib/cost-admission.mjs';
 import { resolvePreparePolicy } from '../../../scripts/conveyor/prepare-policy-settings.mjs';
+import { runPrepareBatch } from '../../../scripts/operations/prepare-batch.mjs';
 import { recordPrepareFailure, readFailureState, releaseDuePrepareRetries, takePrepareRouteHolds, requeuePrepareRouteHold, completePrepareFailures } from '../../../scripts/conveyor/prepare-failure-policy.mjs';
 import { planPrepareSpawns } from '../../../scripts/conveyor/tick-core.mjs';
 import { cliEffects } from '../build-dispatch-daemon.mjs';
@@ -143,6 +144,9 @@ describe('prepare status batched', () => {
       ['lane/1234d-prepare-x', 'ordinary', '1234'],
       ['lane/abc.12d-prepare-x', 'ordinary', 'abc.12'],
       ['lane/abc.12d-prepare-x', 'ordinary', 'abc.12', true],
+      // A batch published before numbering names only the bornAs id; neither head search reaches its branch.
+      ['lane/prepare-batch-xabc12-2', 'prepare: xabc12, xdef34', 'xabc12'],
+      ['lane/prepare-batch-xdef34-2', 'prepare: xdef34, xabc12', 'xabc12', true],
     ]) {
       const identity = fromCard ? undefined : bornAs;
       const card = `---\nstatus: open\n${fromCard ? `bornAs: ${bornAs}\n` : ''}---\nquery-aware`;
@@ -154,9 +158,9 @@ describe('prepare status batched', () => {
         if (cmd !== 'gh') return git(cmd, args, opts);
         const search = args[args.indexOf('--search') + 1] ?? '';
         const head = /head:([^ ]+)/.exec(search)?.[1];
-        const phrase = /"([^"]+)"/.exec(search)?.[1];
+        const phrases = [...search.matchAll(/"([^"]+)"/g)].map(m => m[1]);
         const floor = /created:>=(\S+)/.exec(search)?.[1];
-        const matches = (!head || headRefName.startsWith(head)) && (!phrase || title.includes(phrase))
+        const matches = (!head || headRefName.startsWith(head)) && phrases.every(phrase => title.includes(phrase))
           && (!floor || pr.createdAt >= floor);
         const perItem = /^head:lane\/\S+$/.test(search) || search.includes('in:title');
         if (['saturated', 'prefetched'].includes(mode) && !perItem) {
@@ -1824,7 +1828,7 @@ describe('automatic item preparation', () => {
     const tick = await runBuildDispatchTick({ live: true, effects });
     expect(tick.prepare.refused).toEqual([]);
     expect(tick.prepare.launched.map(row => row.num)).toEqual(['8058', '8059']);
-    expect(searches).toHaveLength(6);
+    expect(searches).toHaveLength(8);
     expect(effects.dispatch).toHaveBeenCalledTimes(2);
   });
   it.each([3, 60])('bounds replanning through %s consecutive guarded picks and still evaluates the final pick', async guardedCount => {
@@ -1838,7 +1842,7 @@ describe('automatic item preparation', () => {
       const search = args[args.indexOf('--search') + 1];
       searches.push(search);
       const row = rows.find(row => search === `head:lane/${row.num}` || search === `head:lane/${row.bornAs}`
-        || search === `in:title "WE #${row.num}: prepare"`);
+        || search === `in:title "prepare" "${row.num}"` || search === `in:title "prepare" "${row.bornAs}"`);
       return JSON.stringify(row !== rows.at(-1) ? [{ number: Number(row.num), state: 'MERGED',
         headRefName: `lane/${row.num}-prepare-design`, mergedAt: '2026-10-16T22:40:00Z' }] : []);
     } });
@@ -1853,7 +1857,7 @@ describe('automatic item preparation', () => {
       const tick = await runBuildDispatchTick({ live: true, effects });
       expect(tick.prepare.skippedInPlanning).toHaveLength(Math.min(guardedCount, 8));
       // The successor outside the planning window must still get a complete final guard observation.
-      expect(searches).toHaveLength((Math.min(guardedCount, 8) + 1) * 3);
+      expect(searches).toHaveLength((Math.min(guardedCount, 8) + 1) * 4);
       if (guardedCount === 3) {
         expect(tick.prepare.launched.map(row => row.num)).toEqual(['8103']);
         expect(tick.prepare.refused).toEqual([]);
@@ -2204,6 +2208,7 @@ describe('automatic item preparation', () => {
       expect(effects.dispatch).toHaveBeenCalledTimes(launches ? 1 : 0);
       expect(effects.listPrepareClaims()).toHaveLength(launches ? 1 : 0);
       if (launches) {
+        expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({ lightRevalidate: true, launchKind: 'prepare-item' }));
         expect(tick.prepare.refused).toEqual([]);
       } else {
         // The planning skip carries the same reconciliation note and persisted refusal the launch guard writes.
@@ -2215,6 +2220,23 @@ describe('automatic item preparation', () => {
         expect(log).toHaveBeenCalledWith(expect.stringContaining(note));
       }
     } finally { log.mockRestore(); }
+  });
+  it.each([undefined, true, false].flatMap(enabled => [
+    ['scope changed since aaaa1111: scripts/a.mjs', enabled, enabled !== false],
+    ['prepared 2026-10-01 16d ago', enabled, false],
+  ]))('dispatches scope/age hold %s with light policy %s as light=%s', async (detail, enabled, lightRevalidate) => {
+    const effects = fixture();
+    effects.preparePolicy = () => resolvePreparePolicy({ tool: enabled === undefined ? {} : { lightRevalidate: enabled } });
+    effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5966' }], admission: {
+      queue: [{ num: '5966', preparedDate: '2026-10-01', preparedAgainstSha: 'aaaa1111' }],
+      held: [{ num: '5966', reason: 'prepare-stale', detail }],
+    } }, nextState: {} });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.launched.map(r => r.num)).toEqual(['5966']);
+    expect(effects.dispatch).toHaveBeenCalledTimes(1);
+    expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({
+      num: '5966', launchKind: 'prepare-item', lightRevalidate,
+    }));
   });
   it('a planning skip with an open duplicate beside the merge persists the open PR, as the launch guard does', async () => {
     const effects = fixture();
@@ -2271,7 +2293,7 @@ describe('automatic item preparation', () => {
         const kind = mode === 'on' ? 'prepare-item' : 'prepare';
         const prefix = `build-dispatch-daemon: ${kind} launch of #4501 ${admit ? 'admitted:' : 'deferred ('}`;
         expect(log.mock.calls.some(([line]) => line.startsWith(prefix)
-          && line.endsWith(` · runner=${runner} (prepare.runner=${runner} from ${from}) · mergedGuardHours=24 (from standard)`))).toBe(true);
+          && line.endsWith(` · runner=${runner} (prepare.runner=${runner} from ${from}) · batchSize=6 (from standard) · batchParallel=true (from standard) · batchMaxParallel=3 (from standard) · aheadCount=20 (from standard) · mergedGuardHours=24 (from standard)`))).toBe(true);
       } finally { log.mockRestore(); }
     });
   it('passes its tick to dispatch-lane', async () => {
@@ -3396,6 +3418,24 @@ describe('probation prepare route circuit breaker', () => {
     expect(prepareRouteFallback([failed[0], row('24', 'opened-pr', 99), failed[1]])).toBe(true);
     expect(prepareRouteFallback([...failed, row('26', 'opened-pr', 99)])).toBe(true);
   });
+  it('hands the scope-only candidate to the detached prepare runner through its environment', async () => {
+    const exec = vi.fn(() => '{}');
+    cliDispatch({ num: '4327', launchKind: 'prepare-item', lightRevalidate: true }, { exec });
+    const env = exec.mock.calls[0][2].env;
+    expect(env.WE_PREPARE_LIGHT_REVALIDATE_ITEM).toBe('4327');
+    const { parseArgs } = await import('../../../scripts/operations/probation-build-run.mjs');
+    const previous = process.env.WE_PREPARE_LIGHT_REVALIDATE_ITEM;
+    try {
+      process.env.WE_PREPARE_LIGHT_REVALIDATE_ITEM = env.WE_PREPARE_LIGHT_REVALIDATE_ITEM;
+      expect(parseArgs(['--num=4327', '--taskType=prepare']).lightRevalidate).toBe(true);
+      expect(parseArgs(['--num=4328', '--taskType=prepare']).lightRevalidate).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.WE_PREPARE_LIGHT_REVALIDATE_ITEM;
+      else process.env.WE_PREPARE_LIGHT_REVALIDATE_ITEM = previous;
+    }
+    cliDispatch({ num: '4328', launchKind: 'prepare-item' }, { exec });
+    expect(exec.mock.calls.at(-1)[2].env.WE_PREPARE_LIGHT_REVALIDATE_ITEM).toBe('');
+  });
   it('disables probation only for fallback prepares without overriding the policy model', () => {
     for (const launchKind of ['prepare-item', 'build']) {
       const exec = vi.fn(() => '{}');
@@ -3528,13 +3568,13 @@ describe('runBuildDispatchTick — queue prune wiring', () => {
 
 describe('card 80 — prepare just in time (daemon wiring)', () => {
   it('policyFrom declares the two settings with defaults, flag/env overrides and an off switch', () => {
-    expect(policyFrom({}, {})).toMatchObject({ prepareAheadWindow: 4, preparedMaxAgeDays: 3 });
+    expect(policyFrom({}, {})).toMatchObject({ prepareAheadWindow: 20, preparedMaxAgeDays: 3 });
     expect(policyFrom({ 'prepare-ahead-window': '2' }, { WE_BUILD_DAEMON_PREPARED_MAX_AGE_DAYS: '7' })).toMatchObject({ prepareAheadWindow: 2, preparedMaxAgeDays: 7 });
     expect(policyFrom({ 'prepare-ahead-window': 'off', 'prepared-max-age-days': 'off' }, {})).toMatchObject({ prepareAheadWindow: null, preparedMaxAgeDays: null });
   });
 
   it('planConfigFrom passes only the settings that are on', () => {
-    expect(planConfigFrom(policyFrom({}, {}))).toEqual({ launchKinds: ['prepare-item'], prepareAheadWindow: 4, preparedMaxAgeDays: 3 });
+    expect(planConfigFrom(policyFrom({}, {}))).toEqual({ launchKinds: ['prepare-item'], prepareAheadWindow: 20, preparedMaxAgeDays: 3 });
     expect(planConfigFrom(policyFrom({ 'prepare-ahead-window': 'off' }, {}))).toEqual({ launchKinds: ['prepare-item'], preparedMaxAgeDays: 3 });
   });
 
@@ -3553,7 +3593,7 @@ describe('card 80 — prepare just in time (daemon wiring)', () => {
       killSwitch: () => ({ engaged: false }),
     };
     await runBuildDispatchTick({ live: false, effects, policy: policyFrom({}, {}) });
-    expect(seen).toEqual({ config: { launchKinds: ['prepare-item'], prepareAheadWindow: 4, preparedMaxAgeDays: 3 } });
+    expect(seen).toEqual({ config: { launchKinds: ['prepare-item'], prepareAheadWindow: 20, preparedMaxAgeDays: 3 } });
   });
 
   it('the status reader reads an older main stamp as UNPREPARED for a newer re-prepare claim, and looks for its PR', () => {
@@ -4175,7 +4215,8 @@ describe('grouped BUILD daemon ticks', () => {
 
   it.each(['build', 'prepare-item'])('threads groupMembers to dispatch-lane argv (%s)', launchKind => {
     const exec = vi.fn(() => JSON.stringify({ dispatching: true }));
-    cliDispatch({ num: '7101', groupMembers: ['7102', '7103'], launchKind }, { exec });
+    cliDispatch({ num: '7101', groupMembers: ['7102', '7103'], launchKind, batchExternalCap: 2 }, { exec });
+    expect(exec.mock.calls[0][2].env.WE_BUILD_DAEMON_MAX_CONCURRENT_EXTERNAL).toBe('2');
     expect(exec.mock.calls[0][1]).toContain('--groupMembers=7102,7103');
   });
 
@@ -4212,6 +4253,26 @@ describe('grouped PREPARE daemon ticks', () => {
   beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'bdd-group-prepare-')); });
   afterEach(() => { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); });
 
+  it.each(['lead', 'member'])('excludes a scope-stale light candidate from grouped prepare as %s', async position => {
+    const effects = fixture();
+    const stale = position === 'lead' ? rows[0] : rows[1];
+    const spawns = position === 'lead' ? [stale, rows[1]] : [rows[0], stale];
+    effects.preparePolicy = () => resolvePreparePolicy();
+    effects.loadGroupingCards = vi.fn(async () => rows.map(r => ({ ...r, kind: 'story', size: 1 })));
+    effects.planTick = () => ({ decisions: { spawnPrepareItems: spawns, admission: { queue: rows, held: rows.map(r => ({
+      num: r.num, reason: r === stale ? 'prepare-stale' : 'needs-prepare',
+      ...(r === stale ? { detail: 'scope changed since aaaa1111: scripts/a.mjs' } : {}),
+    })) } }, nextState: {} });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.groups).toHaveLength(1);
+    expect(tick.prepare.groups[0].lead).not.toBe(stale.num);
+    expect(tick.prepare.groups[0].members).not.toContain(stale.num);
+    const launches = effects.dispatch.mock.calls.map(([request]) => request);
+    expect(launches.find(r => r.num === stale.num)).toMatchObject({ launchKind: 'prepare-item', lightRevalidate: true });
+    expect(launches.find(r => r.num === stale.num).groupMembers).toBeUndefined();
+    expect(launches.find(r => r.num !== stale.num).groupMembers).toHaveLength(3);
+  });
+
   it('uses enriched minimal queue rows for the per-group prepare pool', async () => {
     const queue = rows.slice(0, 4).map(({ num, scope }) => ({ num, scope, preparedDate: null }));
     const effects = fixture({ queue, spawns: [queue[0]] });
@@ -4220,6 +4281,87 @@ describe('grouped PREPARE daemon ticks', () => {
     expect(tick.prepare.groups).toEqual([expect.objectContaining({ lead: '7201', members: ['7202', '7203', '7204'] })]);
     expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({ launchKind: 'prepare-item', groupMembers: ['7202', '7203', '7204'] }));
     expect(effects.loadGroupingCards).toHaveBeenCalledTimes(1);
+  });
+
+  it('dispatches one six-card batch and keeps the seventh outside an aheadCount=6 window', async () => {
+    const queue = Array.from({ length: 7 }, (_, i) => ({ num: String(7301 + i), scope: [`we:scripts/batch${i}.mjs`] }));
+    const effects = fixture({ queue, spawns: [queue[0]] });
+    effects.preparePolicy = () => resolvePreparePolicy({ tool: { aheadCount: 6 } });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(effects.dispatch).toHaveBeenCalledTimes(1);
+    expect(tick.prepare.launched[0].groupMembers).toEqual(['7302', '7303', '7304', '7305', '7306']);
+    expect(effects.listPrepareClaims()).toHaveLength(6);
+    expect(effects.acquirePrepareClaim.mock.calls.map(([a]) => a.num)).not.toContain('7307');
+  });
+
+  it.each([
+    ['flag', { 'prepare-ahead-window': '2' }, {}, 2],
+    ['env', {}, { WE_BUILD_DAEMON_PREPARE_AHEAD_WINDOW: '2' }, 2],
+    ['flag off', { 'prepare-ahead-window': 'off' }, {}, null],
+    ['env off', {}, { WE_BUILD_DAEMON_PREPARE_AHEAD_WINDOW: 'off' }, null],
+    ['flag negative', { 'prepare-ahead-window': '-1' }, {}, null],
+    ['flag over env', { 'prepare-ahead-window': '2' }, { WE_BUILD_DAEMON_PREPARE_AHEAD_WINDOW: 'off' }, 2],
+    ['flag at default over cascade', { 'prepare-ahead-window': '20' }, {}, 20, { aheadCount: 1 }],
+  ])('honors the explicit %s window in planning, replanning, and batch membership', async (_name, flags, env, window, tool) => {
+    const effects = fixture({ spawns: rows.slice(0, 2) });
+    effects.preparePolicy = () => resolvePreparePolicy({ tool });
+    const plan = effects.planTick;
+    effects.planTick = vi.fn(plan);
+    // Force a replan after the first member's recent prepare is discovered.
+    effects.listPreparePrs = ({ num }) => num === '7202' ? [{ number: 94, state: 'MERGED',
+      headRefName: 'lane/7202-prepare-design', mergedAt: '2026-10-15T11:00:00Z' }] : [];
+    effects.now = () => Date.parse('2026-10-15T12:00:00Z');
+    const tick = await runBuildDispatchTick({ live: true, effects, policy: policyFrom(flags, env) });
+    expect(effects.planTick.mock.calls.length).toBeGreaterThan(1);
+    for (const [, { config }] of effects.planTick.mock.calls) {
+      expect(config.prepareAheadWindow).toBe(window ?? undefined);
+    }
+    expect(tick.prepare.aheadCount).toBe(window);
+    expect(effects.dispatch.mock.calls[0][0].groupMembers ?? []).toEqual(window === 2 ? ['7203'] : ['7203', '7204', '7205']);
+  });
+
+  it.each(['declined', 'spec-defect', 'gate-red', 'could-not-prepare', 'throw', 'failed-lead', 'all-failed',
+    'assembled-gate-red', 'publication-failed', 'assembly-threw'])
+  ('accounts for a batch %s failure and holds failed cards on the next tick', async mode => {
+    const ids = ['7201', '7202'];
+    const assemblyFailed = ['assembled-gate-red', 'publication-failed', 'assembly-threw'].includes(mode);
+    const failed = mode === 'all-failed' || assemblyFailed ? ids : [mode === 'failed-lead' ? '7201' : '7202'];
+    const result = await runPrepareBatch({ num: ids[0], groupMembers: [ids[1]], session: 'failure-test' }, {
+      log: () => {}, findItem: num => ({ path: `backlog/${num}-card.md` }),
+      retainPrepareCommit: () => {}, startPrepareAssembly: () => { if (mode === 'assembly-threw') throw new Error('assembly failed'); },
+      cherryPickPrepare: () => ({ ok: true }), finishPrepareAssembly: () => {},
+      runGate: () => ({ pass: mode !== 'assembled-gate-red' }), writePrBody: () => '/tmp/body',
+      openPr: () => ({ ok: mode !== 'publication-failed', pr: 99 }),
+    }, resolvePreparePolicy(), async ({ num }) => {
+      if (!assemblyFailed && failed.includes(num)) {
+        if (mode === 'throw') throw new Error('worker crashed');
+        return { outcome: ['failed-lead', 'all-failed'].includes(mode) ? 'gate-red' : mode };
+      }
+      return { outcome: 'prepared-commit', num, lanePath: '/tmp/fixture-lane', baseSha: 'base', sha: 'commit' };
+    });
+    expect(result.groupDropped).toEqual(failed);
+    expect(result.deferredToNextBatch).toEqual([]);
+    const effects = fixture({ claims: [rows[0], { ...rows[1], groupLead: '7201' }], queue: rows.slice(0, 2), spawns: [] });
+    effects.listSettledPrepares = () => [{ ...result, num: '7201', startedAt: '9999-01-01T00:00:00Z' }];
+    effects.readPrepareStatus = ({ num }) => ({ preparedDate: failed.includes(num) ? null : '2026-10-17' });
+    const first = await runBuildDispatchTick({ live: true, effects });
+    for (const num of failed) expect(effects.placePrepareHold).toHaveBeenCalledWith(expect.objectContaining({ num }));
+    effects.listHolds = () => effects.placePrepareHold.mock.calls.map(([hold]) => hold);
+    effects.planTick = fixture({ queue: rows.slice(0, 2), spawns: rows.slice(0, 2) }).planTick;
+    await runBuildDispatchTick({ live: true, effects, bookkeeping: first.nextBookkeeping });
+    const readmitted = effects.dispatch.mock.calls.flatMap(([args]) => [args.num, ...(args.groupMembers ?? [])]);
+    for (const num of failed) expect(readmitted).not.toContain(num);
+  });
+
+  it('uses build.priority before queue order when choosing members and leaves overlaps for another batch', async () => {
+    const queue = rows.map(r => ({ ...r }));
+    queue[4].buildPriority = 0;
+    queue[2].scope = queue[4].scope;
+    const effects = fixture({ queue, spawns: [queue[4]] });
+    effects.preparePolicy = () => resolvePreparePolicy({ tool: { aheadCount: 3 } });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.launched[0]).toMatchObject({ num: '7205', groupMembers: ['7201', '7202'] });
+    expect(effects.acquirePrepareClaim.mock.calls.map(([a]) => a.num)).not.toContain('7203');
   });
 
   // PR #5366 review round 5 self-review: a card held out of tick-core for a fresh launch refusal (an open prepare
@@ -4291,7 +4433,7 @@ describe('grouped PREPARE daemon ticks', () => {
     expect(tick.prepare.refused).toEqual([]);
     expect(effects.acquirePrepareClaim.mock.calls.map(([a]) => a.num)).toEqual(['7201', '7202', '7204', '7205', '7206', '7207']);
     expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({ groupMembers: ['7202', '7204', '7205', '7206', '7207'] }));
-    expect(searches).toHaveLength(21); // Seven selected cards, three searches each; launch admission reuses the reader cache.
+    expect(searches).toHaveLength(28); // Seven selected cards, four searches each; launch admission reuses the reader cache.
   });
 
   it('shares the eight-card planning budget with group members and guards uninspected replacements at launch', async () => {
@@ -4400,11 +4542,40 @@ describe('grouped PREPARE daemon ticks', () => {
     expect(tick.prepare.retired).toContainEqual({ num: '7202', why: 'prepared on main', released: true });
   });
 
-  it('drops failed member claims and releases members when the surviving group is too small', async () => {
+  it('drops a failed claim while keeping the remaining batch member', async () => {
     const effects = fixture({ queue: rows.slice(0, 3), refuse: ['7203'] });
     await runBuildDispatchTick({ live: true, effects });
-    expect(effects.dispatch.mock.calls[0][0].groupMembers ?? []).toEqual([]);
-    expect(effects.listPrepareClaims().map(c => c.meta.num)).toEqual(['7201']);
+    expect(effects.dispatch.mock.calls[0][0].groupMembers).toEqual(['7202']);
+    expect(effects.listPrepareClaims().map(c => c.meta.num).sort()).toEqual(['7201', '7202']);
+  });
+
+  it('preserves next-batch deferrals in the settled prepare reader', async () => {
+    const rows = await cliListSettledBuilds({ launchKind: 'prepare-item', records: [{ id: 'batch', run: {
+      effects: [{ type: DISPATCH_EFFECT, status: 'applied', payload: { launchKind: 'prepare-item', num: '7201' },
+        result: { outcome: 'opened-pr', deferredToNextBatch: ['7202'] } }],
+    } }] });
+    expect(rows[0]).toMatchObject({ num: '7201', deferredToNextBatch: ['7202'] });
+  });
+
+  it.each(['7201', '7202'])('requeues a deferred batch card without a failure hold: %s', async deferred => {
+    const effects = fixture({ claims: [
+      { num: '7201', scope: rows[0].scope },
+      { num: '7202', scope: rows[1].scope, groupLead: '7201' },
+    ], spawns: [], queue: rows.slice(0, 2) });
+    const settledAt = new Date().toISOString();
+    effects.listSettledPrepares = () => [{ num: '7201', startedAt: settledAt,
+      outcome: 'opened-pr', deferredToNextBatch: [deferred] }];
+    effects.readPrepareStatus = vi.fn(() => ({ preparedDate: null,
+      pr: { number: 900, state: 'OPEN', preparedDate: '2026-10-17', preparedAgainstSha: 'base' } }));
+    const first = await runBuildDispatchTick({ live: true, effects });
+    expect(first.prepare.retired).toContainEqual({ num: deferred, why: 'deferred-to-next-batch', released: true });
+    expect(effects.placePrepareHold).not.toHaveBeenCalled();
+    expect(first.prepare.failures).toEqual([]);
+    // A retained settlement must not suppress the next batch after the claim was released.
+    effects.planTick = fixture({ spawns: [rows[Number(deferred) - 7201]], queue: [rows[Number(deferred) - 7201]] }).planTick;
+    effects.readPrepareStatus = vi.fn(() => ({ preparedDate: null }));
+    await runBuildDispatchTick({ live: true, effects });
+    expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({ num: deferred, launchKind: 'prepare-item' }));
   });
 
   it('releases all member claims on failed dispatch', async () => {
@@ -4414,8 +4585,8 @@ describe('grouped PREPARE daemon ticks', () => {
     expect(effects.listPrepareClaims()).toEqual([]);
   });
 
-  it.each(['per-card', 'off'])('preserves single-card launches with %s', async mode => {
-    vi.stubEnv(mode === 'off' ? 'WE_BUILD_GROUP_SMALL_FINDINGS' : 'WE_BUILD_GROUP_PREPARE', mode === 'off' ? 'false' : mode);
+  it('preserves single-card launches with prepare.batchSize=1', async () => {
+    vi.stubEnv('WE_PREPARE_BATCH_SIZE', '1');
     const effects = fixture({ spawns: rows.slice(0, 2) });
     await runBuildDispatchTick({ live: true, effects });
     expect(effects.dispatch).toHaveBeenCalledTimes(2);
@@ -4428,8 +4599,8 @@ describe('grouped PREPARE daemon ticks', () => {
     const plan = effects.planTick;
     effects.planTick = () => { const out = plan(); out.decisions.admission.held[4].reason = 'blocked'; return out; };
     await runBuildDispatchTick({ live: true, effects });
-    expect(effects.dispatch.mock.calls[0][0].groupMembers ?? []).toEqual([]);
-    expect(effects.acquirePrepareClaim).toHaveBeenCalledTimes(1);
+    expect(effects.dispatch.mock.calls[0][0].groupMembers).toEqual(['7204']);
+    expect(effects.acquirePrepareClaim).toHaveBeenCalledTimes(2);
   });
 
   it('retires members in the same tick the lead retires, regardless of claim order', async () => {
@@ -4468,20 +4639,20 @@ describe('prepare discovery under repository PR volume', () => {
       const search = args[args.indexOf('--search') + 1];
       searches.push(search);
       const head = /^head:(.+)$/.exec(search)?.[1];
-      const title = /^in:title "(.+)"$/.exec(search)?.[1];
+      const title = /^in:title "prepare" "(.+)"$/.exec(search)?.[1];
       expect(Boolean(head || title)).toBe(true);
-      return JSON.stringify(population.filter(pr => head ? pr.headRefName.startsWith(head) : pr.title.includes(title))
+      return JSON.stringify(population.filter(pr => head ? pr.headRefName.startsWith(head) : pr.title.includes('prepare') && pr.title.includes(title))
         .slice(0, Number(args[args.indexOf('--limit') + 1])));
     };
-    const reader = createPrepareStatusReader({ exec: answer, maxPrListingCalls: 12,
+    const reader = createPrepareStatusReader({ exec: answer, maxPrListingCalls: 16,
       ...(prefetch ? { execAsync: async (...args) => answer(...args) } : {}) });
     await reader.prime(nums.map(num => ({ num })));
     for (const [i, num] of nums.entries()) expect(reader.listPrs({ num }).map(pr => pr.number)).toEqual([9000 + i]);
-    expect(searches).toHaveLength(12);
+    expect(searches).toHaveLength(16);
     // A second read uses the same complete observations; a new identity fails closed without another gh call.
     for (const num of nums) reader.listPrs({ num });
     expect(() => reader.listPrs({ num: nums[0], bornAs: 'xother1' })).toThrow('budget exhausted');
-    expect(searches).toHaveLength(12);
+    expect(searches).toHaveLength(16);
   });
 
   it('resolves #4413 as a WE card and refuses unknown ids before dispatch', async () => {

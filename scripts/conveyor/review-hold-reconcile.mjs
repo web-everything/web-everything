@@ -66,7 +66,7 @@ import {
 } from '../lib/numbering-carry.mjs';
 import { readNetDiffAtHead } from '../merge-ai-prs.mjs';
 import { assertMandatoryReferralsCleared } from '../review-set-label.mjs';
-import { latestAcceptRecord } from '../lib/accept-carry-forward.mjs';
+import { latestAcceptRecord, resolveAcceptCarryForward } from '../lib/accept-carry-forward.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import {
   REVIEW_LABELS, hasReviewLabel, findContradictoryReviewVerdicts, decideContradictoryVerdictHeal,
@@ -76,7 +76,6 @@ import { ADVISORY_LABELS } from '../lib/advisory-labels.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { LIST_COMMENTS_CAP, defaultListPrs, defaultReadPr } from './advisory-label-sweep.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
-import { sweepRulingNeededLabels } from './ruling-needed-sweep.mjs';
 import { sweepAutoBlock } from './referral-auto-block.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { sweepAcceptCarry, defaultCloneDirFor } from './accept-carry-sweep.mjs';
@@ -161,8 +160,12 @@ export function _resetStrandedCheckMemo() { strandedChecked.clear(); }
 export function sweepReviewHoldLabels({
   repo = null, listPrs = defaultListPrs, provider = createGhProvider(), dryRun = false, settings, runRuling, acceptCarry,
   readComments = readCompletePrComments, readPr = defaultReadPr,
-  numberingRestamp = restampAfterNumbering, exec = execFileSync, now = Date.now,
+  numberingRestamp = restampAfterNumbering, exec = execFileSync, now = Date.now, log = (line) => writeLineSync(2, line),
 } = {}) {
+  // The ONE source of the accept-carry setting (WE_ACCEPT_CARRY_FORWARD > settings/accept-carry-forward.json >
+  // default), read once per sweep and logged with its source. No timing setting (review.skipDrainMechanical) governs it.
+  const carrySetting = resolveAcceptCarryForward();
+  let carryLogged = false;
   const prs = listPrs({ repo });
   const startedAt = now();
   for (const [k, until] of strandedChecked) if (until <= startedAt) strandedChecked.delete(k);
@@ -250,8 +253,14 @@ export function sweepReviewHoldLabels({
       const readNetDiff = (sha) => readNetDiffAtHead({
         exec: (c, a, o) => execFileSync(c, a, { ...o, ...(cwd ? { cwd } : {}) }), headSha: sha, headRef: sha,
       });
+      // Logged once per sweep, the first time the numbering carry is consulted: the setting and where it came from.
+      if (!carryLogged) {
+        carryLogged = true;
+        log(`  numbering carry: accept carry-forward ${carrySetting.value} (source: ${carrySetting.source})`);
+      }
       const r = numberingRestamp({ repo: slug, pr: pr.number, state, reviews, provider, dryRun, cwd: noCheckout ? undefined : cwd,
         readNetDiff, readLiveState, exec, guardReferrals: assertMandatoryReferralsCleared,
+        acceptCarry: carrySetting.value,
         ...(noCheckout ? { prove: () => ({ ok: false, retryable: true, reason: 'no checkout for repository' }) } : {}) });
       // A pass that withdrew, posted or failed is read again next pass. A clean one settles the check until it expires —
       // briefly when the formal reviews were unreadable, since without them a record they strand looks like any other.
@@ -337,7 +346,7 @@ export function sweepReviewHoldLabels({
   // card xu7kxtt (#5472) — an operator clearance a mechanical pass re-held after the head moved (merge queue / rebase)
   // is carried by the sanctioned re-stamp when the net diff is byte-identical. Same listing, own entry shape (`carry`).
   try {
-    for (const r of sweepAcceptCarry({ prs, repo, dryRun, ...(acceptCarry ? { runRestamp: acceptCarry } : {}) })) {
+    for (const r of sweepAcceptCarry({ prs, repo, dryRun, setting: carrySetting.value, ...(acceptCarry ? { runRestamp: acceptCarry } : {}) })) {
       results.push({ num: r.num, carry: r.carry, detail: r.detail });
     }
   } catch (e) {
@@ -352,13 +361,7 @@ export function sweepReviewHoldLabels({
   } catch (e) {
     results.push({ num: 0, autoBlock: 'sweep-failed', error: String((e && e.message) || e).split('\n')[0] });
   }
-  try {
-    for (const r of sweepRulingNeededLabels({ repo: resolvedRepo, listPrs: () => prs, readPr, provider, dryRun })) {
-      results.push({ num: r.num, ruling: r.action, ...(r.error ? { error: r.error } : {}) });
-    }
-  } catch (e) {
-    results.push({ num: 0, ruling: 'sweep-failed', error: String((e && e.message) || e).split('\n')[0] });
-  }
+  // advisory:ruling-needed is reconciled only by pr-label-mirror --apply (G2).
   return results;
 }
 

@@ -6,7 +6,7 @@
  *   dispatched-not-yet-queued). Never touches the real lane pool: every lock root is a `mkdtemp` dir and lane
  *   leases are injected.
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,6 +16,8 @@ import {
 } from '../heavy-admission.mjs';
 
 const roots = [];
+beforeEach(() => vi.stubEnv('WE_TEST_HOST_LOAD1', '0'));
+afterEach(() => vi.unstubAllEnvs());
 function tempRoot() {
   const r = mkdtempSync(join(tmpdir(), 'heavy-fast-lane-'));
   roots.push(r);
