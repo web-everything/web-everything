@@ -115,6 +115,11 @@ describe('fix scope fence', () => {
     expect(scopeFenceDecision({ scope: ['plateau:src/app.ts'], repo, paths: ['src/other.ts'], policy }).action).toBe('stand-down');
     expect(scopeFenceDecision({ scope: ['fui:src/app.ts'], repo, paths: ['src/app.ts'], policy }).action).toBe('stand-down');
   });
+  it('keeps a literal # in a scoped filename instead of truncating it to a directory', () => {
+    const at = paths => scopeFenceDecision({ scope: ['we:scripts#policy.mjs'], repo: 'we', directories: ['scripts'], paths, policy }).action;
+    expect(at(['scripts#policy.mjs'])).toBe('push');
+    expect(at(['scripts/unrelated.mjs'])).toBe('stand-down');
+  });
   it.each(['we:scripts/bin/tool', 'scripts/bin/tool'])('keeps the extensionless file scope %s a FILE scope, never an undeclared subtree', scope => {
     expect(scopeFenceDecision({ ...context, scope: [scope], paths: ['scripts/bin/tool'], policy }).action).toBe('push');
     expect(scopeFenceDecision({ ...context, scope: [scope], paths: ['scripts/bin/tool', 'scripts/bin/tool/payload.mjs'], policy }).action).toBe('stand-down');
@@ -300,7 +305,8 @@ describe('the live scope fence adapter over a real repository', () => {
     return { dir, git, port, write, commit };
   }
   /** The live adapter against a fake GitHub: the PR head and base, one marker commit, and the compare verdict for a merged commit. */
-  function liveFence(repo, { head, sha, base = null, compare = 'ahead', port = repo.port, scoped = 'guard.mjs', fork = '' }) {
+  function liveFence(repo, { head, sha, base = null, compare = 'ahead', port = repo.port, scoped = 'guard.mjs', fork = '',
+    loadItems = () => [{ num: '5957', slug: 'leading-cd', scope: ['we:guard.mjs'] }] }) {
     const writes = [], compares = [];
     const exec = (file, args) => {
       expect(file).toBe('gh');
@@ -318,7 +324,7 @@ describe('the live scope fence adapter over a real repository', () => {
       writes.push(args); return '';
     };
     const fence = createScopeFencedPush({ root: '.', exec, env: { WE_FIX_SCOPE_FENCE_MODE: 'stand-down' }, log: () => {},
-      loadItems: () => [{ num: '5957', slug: 'leading-cd', scope: ['we:guard.mjs'] }], readComments: () => [] });
+      loadItems, readComments: () => [] });
     const push = vi.fn(() => ({ ok: true }));
     return { result: fence({ repo: 'web-everything/web-everything', pr: 5403, sha, git: port, push }), push, writes, compares };
   }
@@ -343,6 +349,30 @@ describe('the live scope fence adapter over a real repository', () => {
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
   });
 
+  it('keeps a literal # in a scoped filename and never widens it to the directory before the #', () => {
+    const r = realRepo();
+    try {
+      mkdirSync(join(r.dir, 'scripts')); r.write('scripts/unrelated.mjs', 'a();\n'); r.write('scripts#policy.mjs', 'p();\n'); const head = r.commit('initial');
+      r.write('scripts/unrelated.mjs', 'b();\n'); const sha = r.commit('fixer edits an undeclared file');
+      const { result, push } = liveFence(r, { head, sha, base: 'f'.repeat(40), fork: head, scoped: 'scripts#policy.mjs' });
+      expect(result).toMatchObject({ ok: false, scopeFence: true, terminal: true });
+      expect(result.reason).toContain('outside declared scope: scripts/unrelated.mjs');
+      expect(push).not.toHaveBeenCalled();
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+  it('withholds the push when the backlog cannot be read instead of falling back to the PR-diff scope', () => {
+    const r = realRepo();
+    try {
+      r.write('guard.mjs', 'safe();\n'); r.write('outside.mjs', 'o();\n'); const head = r.commit('initial');
+      r.write('outside.mjs', 'changed();\n'); const sha = r.commit('fixer edits a file only the PR diff names');
+      for (const loadItems of [() => { throw new Error('backlog loader failed'); }, () => undefined]) {
+        const { result, push } = liveFence(r, { head, sha, scoped: 'outside.mjs', loadItems });
+        expect(result.ok).toBe(false);
+        expect(result.reason).toMatch(/backlog unreadable/);
+        expect(push).not.toHaveBeenCalled();
+      }
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
   it('keeps an extensionless file scope a FILE scope when the fixer replaces that file with an undeclared subtree', () => {
     const r = realRepo();
     try {

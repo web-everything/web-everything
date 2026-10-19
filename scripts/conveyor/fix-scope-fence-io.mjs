@@ -7,7 +7,7 @@ import { readCompletePrComments } from './pr-comments-complete.mjs';
 import { unescapeTsvField } from './pr-comments-list.mjs';
 import { buildStandDownComment, STAND_DOWN_LABEL } from './stand-down.mjs';
 import { isSubtreeEntry } from '../readiness/scope-lease.mjs';
-import { addedLines, declaredScopePaths, fencedPush, operatorScope, removalMarkers, resolveScopeFence, ScopeFenceEvidenceError, ScopeFenceHeadMovedError } from './fix-scope-fence.mjs';
+import { addedLines, declaredScopePaths, fencedPush, inertText, operatorScope, removalMarkers, resolveScopeFence, ScopeFenceEvidenceError, ScopeFenceHeadMovedError } from './fix-scope-fence.mjs';
 
 /**
  * Pins the diff output the fence parses against lane config and attributes: no colour, every file as text (a binary
@@ -203,9 +203,14 @@ export function createScopeFencedPush({ root, exec = execFileSync, env = process
           if (e.permanent || e instanceof RangeError) throw new ScopeFenceEvidenceError(e.message, evidence);
           throw e;
         }
+        // An unreadable backlog must withhold the push: `findItem` reads a loader failure as "no card", and the planner
+        // would then fence with the PR's own, wider diff scope.
+        let items;
+        try { items = loadItems(); } catch (e) { throw new Error(`backlog unreadable: ${inertText(e?.message)}`); }
+        if (!Array.isArray(items)) throw new Error('backlog unreadable: the loader returned no item list');
         const options = { root, repo, exec };
         const result = planFixesFromReconcile([{ kind: 'fix', prNumber: pr, ...view }], findItem,
-          loadItems, n => fetchPrDiffScope(n, options), key,
+          () => items, n => fetchPrDiffScope(n, options), key,
           n => fetchPrDiffPaths(n, options), (path, ref) => fetchCardScopeAtRef(path, ref, options));
         const scope = result.planned[0]?.scope;
         if (!scope?.length) throw new Error('declared scope could not be resolved');

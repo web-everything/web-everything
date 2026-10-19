@@ -83,10 +83,13 @@ export function addedLines(patch = '') {
   });
 }
 
-/** The repo-relative scope paths that name `repo`; prefix aliases (`fui:`, `plateau:`) resolve through the shared repo profile. */
+/**
+ * The repo-relative scope paths that name `repo`; prefix aliases (`fui:`, `plateau:`) resolve through the shared repo
+ * profile. A `#` is part of the filename: truncating at it would turn `scripts#policy.mjs` into the directory `scripts`.
+ */
 export function declaredScopePaths(scope = [], repo) {
   const key = repoKeyForSlug(repo) ?? repo;
-  return scope.map(s => s.trim().split('#')[0]).filter(s => !s.includes(':') || repoKeyForScope(s) === key)
+  return scope.map(s => s.trim()).filter(s => !s.includes(':') || repoKeyForScope(s) === key)
     .map(s => s.slice(s.indexOf(':') + 1));
 }
 
