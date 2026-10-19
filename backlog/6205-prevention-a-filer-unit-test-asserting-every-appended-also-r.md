@@ -21,6 +21,7 @@ Idempotency key (do not edit): approval-prevention-key:web-everything/web-everyt
 ## Acceptance
 
 - [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A2] **Regression guard (PR #5717 review)** — Add a deterministic appender test named `alsoRaisedBy_preservesExactApprovalKeyDespiteKeyExampleInDescription`: use prevention prose containing the placeholder `approval-prevention-key:...` and supply the event key `approval-prevention-key:web-everything/web-everything#5688@60d62f8d68721e9b8f2569dabe9b20ad64dfe821` separately. Assert that the appended line ends with exactly `· key ` followed by the supplied event key in one Markdown code span, with no trailing punctuation, and that retrying the same event adds no further attribution.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -41,3 +42,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5688 (finding 1: `we:backlog/5360-prevention-add-a-check-standards-rule-that-fails-a-card-movi.md:85` — A unit test on the 'Also raised by' appender asserting every appended line ends with · key approval-prevention-key:... , plus a check:standards rule that flags 'Also raised by' lines without a key.) · key `approval-prevention-key:web-everything/web-everything#5688@60d62f8d68721e9b8f2569dabe9b20ad64dfe821`
