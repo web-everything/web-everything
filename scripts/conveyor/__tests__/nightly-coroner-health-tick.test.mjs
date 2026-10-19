@@ -54,7 +54,7 @@ it('keeps unresolved job failures in the probe streak after the next successful 
   const flags = { 'state-root': root, 'logs-dir': join(root, 'logs'), 'lock-root': join(root, 'locks'), 'self-sync-dir': join(root, 'sync'), 'ps-fixture': ps, 'no-gh': true, 'no-diagnose': true, 'no-investigate': true, 'no-file': true };
   writeFileSync(join(dir, 'config.json'), JSON.stringify({ prSweep: { enabled: false }, coroner: { nightly: { enabled: true } }, tmpSweepEnabled: false, claudeJobsArchiveEnabled: false }));
   const store = createJobStore(join(root, 'jobs')), statusFeed = join(root, 'feed.jsonl');
-  const opts = { store, statusFeed, codeSha: 'abc', snapshot: {}, evict: () => {}, reattach: async () => {}, sourceRoot: root, dir };
+  const opts = { store, statusFeed, codeSha: 'abc', snapshot: {}, evict: () => {}, reattach: async () => {}, sweepLanes: async () => {}, sourceRoot: root, dir };
   const publish = vi.fn();
   const job = (args) => runNightlyCoronerJob({ ...args, ...opts });
   try {
