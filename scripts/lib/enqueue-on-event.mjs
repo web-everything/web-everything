@@ -72,6 +72,8 @@ import { cascadePolicy } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { readBuildPrioritySettings, readBuildQueuePrioritySettings } from './build-queue.mjs';
 import { rankByDeliveryPriority, PRIORITY_CLASSES } from './delivery-priority.mjs';
+import { PRIORITY_RESERVE_LABELS } from './priority-reserve.mjs';
+import { isOperatorAuthored } from './marker-authorship.mjs';
 import { readMainRedState } from './main-red-priority.mjs';
 import { readMainFixPriority } from './merge-queue-hook.mjs';
 import { redMainSignal, resolveRedMainHoldSetting, decideRedMainHold } from './red-main-hold.mjs';
@@ -317,7 +319,7 @@ export async function readMergeQueueMembership({ repo, num, env = process.env, e
 }
 
 export const CATCH_UP_QUERY = `query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){
-  pullRequests(states:OPEN,labels:["ready-to-merge"],first:100,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){nodes{number body isDraft isInMergeQueue} pageInfo{hasNextPage endCursor}}
+  pullRequests(states:OPEN,labels:["ready-to-merge"],first:100,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){nodes{number body isDraft isInMergeQueue labels(first:30){nodes{name}}} pageInfo{hasNextPage endCursor}}
   mergeQueue(branch:"main"){entries(first:100){totalCount}}}}`;
 
 /**
@@ -363,7 +365,7 @@ function ghGraphql({ query, owner, name, cursor, env, execFileImpl }) {
  * IO: the open ready-to-merge PRs of `repo` and the merge queue's size, through the GraphQL repository connection
  * (never the issue-search budget `gh pr list --label` uses). Then, for the PRs that are neither drafts nor queued,
  * when each got its label and first acceptance (ready-time fallback when acceptance is unreadable). Never rejects.
- * @returns {Promise<{ok:true, prs:Array<{num:number, isDraft:boolean, inQueue:boolean, readyAt:(number|null)}>, queued:number}|{ok:false, error:string}>}
+ * @returns {Promise<{ok:true, prs:Array<{num:number, isDraft:boolean, inQueue:boolean, labels:string[], override?:{value:'now'|'urgent', byOperator:boolean}, readyAt:(number|null)}>, queued:number}|{ok:false, error:string}>}
  */
 export async function readCatchUpCandidates({ repo, env = process.env, execFileImpl = execFile, readComments = readCompletePrComments }) {
   const [owner, name] = String(repo ?? '').split('/');
@@ -379,12 +381,32 @@ export async function readCatchUpCandidates({ repo, env = process.env, execFileI
     if (!Array.isArray(nodes)) return { ok: false, error: 'no pullRequests in the GraphQL answer' };
     if (typeof pageInfo?.hasNextPage !== 'boolean') return { ok: false, error: 'no pullRequests pageInfo in the GraphQL answer' };
     if (cursor === undefined) queued = list.repository.mergeQueue?.entries?.totalCount ?? 0;
-    prs.push(...nodes.map((pr) => ({ ...(pr.body ? { itemIds: [extractManifestFromBody(pr.body)?.item].filter((id) => id != null).map(String) } : {}), num: pr.number, isDraft: pr.isDraft === true, inQueue: pr.isInMergeQueue === true, readyAt: null })));
+    prs.push(...nodes.map((pr) => ({ ...(pr.body ? { itemIds: [extractManifestFromBody(pr.body)?.item].filter((id) => id != null).map(String) } : {}), num: pr.number, isDraft: pr.isDraft === true, inQueue: pr.isInMergeQueue === true,
+      labels: (pr.labels?.nodes || []).map((label) => label?.name).filter((name) => typeof name === 'string'), readyAt: null })));
     if (!pageInfo.hasNextPage) break;
     const next = pageInfo.endCursor;
     if (typeof next !== 'string' || !next || seenCursors.has(next)) return { ok: false, error: 'invalid pullRequests pagination cursor' };
     seenCursors.add(next);
     cursor = next;
+  }
+  for (const pr of prs) {
+    const label = pr.labels.find((name) => PRIORITY_RESERVE_LABELS.includes(name));
+    if (!label) continue;
+    // Match the drain's operator override provenance; this changes ordering only.
+    const byOperator = await new Promise((resolve) => {
+      try {
+        execFileImpl('gh', ['api', `repos/${repo}/issues/${pr.num}/events`, '--paginate'],
+          { env, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 30_000 }, (err, stdout) => {
+            if (err) { resolve(false); return; }
+            try {
+              const events = JSON.parse(String(stdout));
+              const last = (Array.isArray(events) ? events : []).filter((event) => event?.event === 'labeled' && event?.label?.name === label).at(-1);
+              resolve(isOperatorAuthored({ author: { login: last?.actor?.login } }));
+            } catch { resolve(false); }
+          });
+      } catch { resolve(false); }
+    });
+    pr.override = { value: label.slice('priority:'.length), byOperator };
   }
   const open = prs.filter((p) => !p.isDraft && !p.inQueue);
   // Keep each aliased timeline query bounded even when the listing spans many pages.
@@ -434,6 +456,7 @@ export function planCatchUp({ prs, queued, capacity, pendingNums = [], order = '
   }
   const classes = new Map(rankByDeliveryPriority(candidates.map((pr) => ({ id: pr.num, facts: {
     waitingSince: pr.firstAcceptedAt ?? pr.readyAt,
+    ...(pr.override ? { override: pr.override } : {}),
     incident: { open: !!mainFix, owner: !!mainFix && [mainFix.pr, ...(mainFix.prs || [])].includes(pr.num) &&
       (mainFix.repo ?? 'we') === repoKeyFromSlug(repo) },
   } })), priority, now).map((p) => [p.id, PRIORITY_CLASSES.indexOf(p.class)]));

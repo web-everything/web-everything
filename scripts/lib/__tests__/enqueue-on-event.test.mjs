@@ -13,6 +13,7 @@ import {
 } from '../enqueue-on-event.mjs';
 import * as enqueueModule from '../enqueue-on-event.mjs';
 import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
+import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 
 const REPO = 'web-everything/web-everything';
 const GREEN = 'check_suite.completed=success@12';
@@ -317,7 +318,7 @@ describe('summarizeFastDrain — queue-mode accounting (live 2026-10-13, #5202)'
 });
 
 const CATCH_UP_SETTING = { enabled: true, debounceSeconds: 15, catchUp: { enabled: true, intervalMinutes: 10, concurrency: 1, maxQueued: 3, order: 'priority-then-first-accept' } };
-const candidate = (num, readyAt = null, extra = {}) => ({ num, readyAt, isDraft: false, inQueue: false, ...extra });
+const candidate = (num, readyAt = null, extra = {}) => ({ num, readyAt, isDraft: false, inQueue: false, labels: [], ...extra });
 const catchUpSetup = (extra = {}) => setup({
   resolveSetting: () => CATCH_UP_SETTING,
   readCandidates: async () => ({ ok: true, prs: [candidate(43, 200), candidate(42, 100), candidate(44)], queued: 1 }),
@@ -355,6 +356,23 @@ describe('catch-up setting', () => {
 });
 
 describe('planCatchUp', () => {
+  it.each(['now', 'urgent'])('ranks an operator priority:%s PR first even without readyAt', (value) => {
+    const plan = planCatchUp({ priority: { mode: 'enforce' }, queued: 0, capacity: 1, prs: [
+      candidate(42, 100), candidate(5715, null, { override: { value, byOperator: true } }),
+    ] });
+    expect(plan.run).toEqual([{ num: 5715, readyAt: null }]);
+    expect(plan.later).toEqual([42]);
+  });
+
+  it.each(['now', 'urgent'])('does not raise rank for a non-operator priority:%s label', (value) => {
+    const plan = planCatchUp({ priority: { mode: 'enforce' }, queued: 0, capacity: 1, prs: [
+      candidate(5715, null, { labels: [`priority:${value}`], override: { value, byOperator: false } }),
+      candidate(42, 100),
+    ] });
+    expect(plan.run).toEqual([{ num: 42, readyAt: 100 }]);
+    expect(plan.later).toEqual([5715]);
+  });
+
   const prs = [candidate(9), candidate(5, 200), candidate(4, 100), candidate(3, 100), candidate(8),
     candidate(1, 0, { isDraft: true }), candidate(2, 0, { inQueue: true }), candidate(7, 0)];
   it('skips drafts, queued and pending PRs, sorts oldest ready first and caps by room', () => {
@@ -369,6 +387,59 @@ describe('planCatchUp', () => {
 });
 
 describe('readCatchUpCandidates', () => {
+  it.each([
+    ['now', 'operator-last', true],
+    ['urgent', 'operator-last', true],
+    ['now', 'non-operator-last', false],
+    ['urgent', 'non-operator-last', false],
+    ['now', 'missing', false],
+    ['now', 'error', false],
+    ['now', 'throw', false],
+    ['now', 'malformed', false],
+    ['now', 'non-array', false],
+  ])('reads priority:%s labels and verifies event history (%s)', async (value, history, byOperator) => {
+    const label = `priority:${value}`;
+    const env = { TEST: 'priority' };
+    const calls = [];
+    const event = (login, name = label, kind = 'labeled') => ({ event: kind, label: { name }, actor: { login } });
+    const operator = OPERATOR_LOGINS[0];
+    const outsider = 'untrusted-priority-labeler';
+    const result = await readCatchUpCandidates({ repo: REPO, env, readComments: () => [],
+      execFileImpl: (cmd, args, opts, cb) => {
+        calls.push(args);
+        expect(cmd).toBe('gh');
+        expect(opts.env).toBe(env);
+        if (args[1] !== 'graphql') {
+          expect(args).toEqual(['api', `repos/${REPO}/issues/5715/events`, '--paginate']);
+          if (history === 'throw') throw new Error('spawn failed');
+          if (history === 'error') { cb(new Error('HTTP 503')); return; }
+          if (history === 'malformed') { cb(null, '{'); return; }
+          if (history === 'non-array') { cb(null, '{}'); return; }
+          const events = history === 'missing' ? [] : [
+            event(history === 'operator-last' ? outsider : operator),
+            event(history === 'operator-last' ? operator : outsider),
+            event(operator, 'unrelated'), event(operator, label, 'unlabeled'),
+          ];
+          cb(null, JSON.stringify(events));
+          return;
+        }
+        const listing = args.includes(`query=${CATCH_UP_QUERY}`);
+        if (listing) expect(CATCH_UP_QUERY).toContain('labels(first:30){nodes{name}}');
+        cb(null, JSON.stringify({ data: { repository: listing ? {
+          pullRequests: { nodes: [
+            { number: 5715, labels: { nodes: [{ name: 'ready-to-merge' }, { name: label }] } },
+            { number: 42, labels: { nodes: [{ name: 'ready-to-merge' }] } },
+          ], pageInfo: { hasNextPage: false } },
+        } : {} } }));
+      },
+    });
+    expect(result).toEqual({ ok: true, queued: 0, prs: [
+      candidate(5715, null, { labels: ['ready-to-merge', label], override: { value, byOperator } }),
+      candidate(42, null, { labels: ['ready-to-merge'] }),
+    ] });
+    expect(calls.filter(args => args[1] !== 'graphql')).toHaveLength(1);
+  });
+
   it('considers a ready candidate after a full page of drafts', async () => {
     const calls = [];
     const result = await readCatchUpCandidates({ repo: REPO, readComments: () => [], execFileImpl: (_cmd, args, _opts, cb) => {
