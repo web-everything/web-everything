@@ -40,7 +40,7 @@ import { readLockEntry } from '../file-locks.mjs';
 vi.mock('../../lib/resource-admission.mjs', () => ({ shadowAdmission: vi.fn(), admit: vi.fn(), decideAdmission: vi.fn(), readSnapshot: vi.fn() }));
 // x6nuodj — the legacy telemetry rule's tests run with the shared decision observing only (`shadow`); the cut-over
 // (admit() deciding) has its own describe below with an explicit `mode`.
-beforeEach(() => { vi.stubEnv('WE_RESOURCE_SHADOW', 'off'); vi.stubEnv('WE_RESOURCE_CUTOVER', 'shadow'); });
+beforeEach(() => { vi.stubEnv('WE_RESOURCE_SHADOW', 'off'); vi.stubEnv('WE_RESOURCE_CUTOVER', 'shadow'); vi.stubEnv('WE_TEST_HOST_LOAD1', '0'); });
 // admission-no-fail-open — hermetic: the admission policy's platform layer never reads the operator's real file.
 beforeEach(() => { vi.stubEnv('WE_PLATFORM_PREFERENCES', join(tmpdir(), 'heavy-admission-test-no-such-platform-preferences.json')); });
 afterEach(() => vi.unstubAllEnvs());
