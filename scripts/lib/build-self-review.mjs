@@ -39,8 +39,9 @@ export async function selfReviewPrompt(diff) {
 }
 
 // Prose outside the verdict that still states findings, in any notation: JSON (escaped or not), YAML, a bare key.
-// Matched after NFKC and with format characters removed, so look-alike or zero-width spellings count too.
-const STRAY_FINDINGS_KEY = /findings[^\p{L}\p{N}\n]{0,6}:/iu;
+// Matched after NFKC, with format characters and all whitespace removed, so look-alike, zero-width or spaced-out
+// spellings (JSON allows any whitespace, newlines included, before the colon) count too.
+const STRAY_FINDINGS_KEY = /findings[^\p{L}\p{N}]{0,6}:/iu;
 
 /** The top-level keys of valid JSON object text, in order, duplicates kept (`JSON.parse` keeps only the last). */
 function topLevelKeys(json) {
@@ -75,7 +76,7 @@ export function parseSelfReviewVerdict(message) {
     : [text.indexOf('{'), text.lastIndexOf('}') + 1];
   const body = fences.length ? fences[0][1] : text.slice(start, end);
   const outside = (text.slice(0, Math.max(start, 0)) + '\n' + text.slice(end))
-    .replace(/\\u([0-9a-f]{4})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))).normalize('NFKC').replace(/\p{Cf}/gu, '');
+    .replace(/\\u([0-9a-f]{4})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))).normalize('NFKC').replace(/[\p{Cf}\s]/gu, '');
   if (STRAY_FINDINGS_KEY.test(outside)) throw new Error('invalid self-review verdict: findings outside the verdict object');
   const parsed = JSON.parse(body);
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || topLevelKeys(body.trim()).join() !== 'findings') {

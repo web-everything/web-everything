@@ -862,6 +862,10 @@ export async function codexDirectTask({
     if (typeof repoRoot !== 'string' || !repoRoot.trim()) {
       throw new TypeError('codex-direct-task: `dir` was omitted, so `repoRoot` is required to make a scratch clone from');
     }
+    // Same refusal as below, before the clone and dependency install it would leave behind.
+    if (!review && (gate === 'full' || gate === 'related') && !existsFn(join(repoRoot, 'scripts', 'verify-lane.mjs'))) {
+      throw new Error(`codex-direct-task: gate-unavailable — --gate=${gate} needs scripts/verify-lane.mjs, which ${repoRoot} does not have; pass --gate=standards or --gate=none`);
+    }
     scratch = setupScratchClone({
       repoRoot, mkTempDir, execFn, existsFn, installDeps, wireOriginToRemote,
     });

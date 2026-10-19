@@ -209,7 +209,9 @@ describe('production self-review adapter', () => {
     ['a bare verdict beside YAML findings', 'findings:\n- a.mjs:1 defect\n{"findings":[]}'],
     ['a fenced verdict beside a zero-width-split key', '```json\n{"findings":[]}\n```\n{"find​ings":["a.mjs:1 defect"]}'],
     ['a fenced verdict beside a \\u-escaped key', '```json\n{"findings":[]}\n```\n{"\\u0066indings":["a.mjs:1 defect"]}'],
-    ['a fenced verdict beside a ligature key', '```json\n{"findings":[]}\n```\n{"ﬁndings":["a.mjs:1 defect"]}'],
+    ['a fenced verdict beside a key spaced from its colon', '{"findings"        :["a.mjs:1 defect"]}\n```json\n{"findings":[]}\n```'],
+    ['a fenced verdict beside a key with a newline before its colon', '{"findings"\n:["a.mjs:1 defect"]}\n```json\n{"findings":[]}\n```'],
+    ['a fenced verdict beside a ligature key','```json\n{"findings":[]}\n```\n{"ﬁndings":["a.mjs:1 defect"]}'],
   ])('rejects %s', async (_name, lastMessage) => {
     const task = vi.spyOn(codexTasks, 'codexDirectTask').mockResolvedValue({ exitCode: 0, timedOut: false, lastMessage });
     try { await expect(reviewBuildDiff({ dir: '.', diff: 'net change', env: {} })).rejects.toThrow(); }
@@ -433,6 +435,16 @@ describe('Codex completion wiring', () => {
         spawnFn, stream: false, log: () => {} })).rejects.toThrow('gate-unavailable');
       expect(spawnFn).not.toHaveBeenCalled();
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('refuses the default full gate for a scratch run of a repo without verify-lane before cloning it', async () => {
+    const repoRoot = mkdtempSync(join(tmpdir(), 'build-gate-scratch-'));
+    const execFn = vi.fn(); const mkTempDir = vi.fn(); const spawnFn = vi.fn();
+    try {
+      await expect(codexDirectTask({ repoRoot, task: 'change', selfReview: false, env: isolated({}), execFn, mkTempDir,
+        spawnFn, stream: false, log: () => {} })).rejects.toThrow('gate-unavailable');
+      expect(mkTempDir).not.toHaveBeenCalled(); expect(execFn).not.toHaveBeenCalled(); expect(spawnFn).not.toHaveBeenCalled();
+    } finally { rmSync(repoRoot, { recursive: true, force: true }); }
   });
 
   it('a review run never self-reviews, resumes or gates itself, even with self-review on and ephemeral', async () => {
