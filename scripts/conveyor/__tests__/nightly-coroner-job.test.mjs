@@ -97,6 +97,33 @@ it('clears retained failed nights after a later successful night without republi
   }
   expect(opts.store.read(failed.enqueued).job.status).toBe('failed');
 });
+it('publishes a previous night failed by a restart after the next boundary, once, without a current alert', async () => {
+  const opts = jobOptions(temp());
+  const first = await runNightlyCoronerJob({ ...opts, now: Date.parse('2026-10-17T02:17:00Z') });
+  opts.store.update(first.enqueued, (r) => markLaunching(r, { at: '2026-10-17T02:17:01.000Z' })); // its child then dies
+  const now = Date.parse('2026-10-18T02:17:00Z');
+  const restarted = { ...opts, reattach: (args) => reattachTick({ ...args, observation: { now, slept: false, gapMs: 0 }, launch: vi.fn() }) };
+  const result = await runNightlyCoronerJob({ ...restarted, now });
+  expect(opts.store.read(first.enqueued).job).toMatchObject({ status: 'failed', error: expect.stringContaining('deadline exceeded') });
+  expect(result.alerts).toEqual([]);
+  const lines = readFileSync(opts.statusFeed, 'utf8').trim().split('\n');
+  expect(lines).toHaveLength(1);
+  expect(parseFeedLine(lines[0])).toMatchObject({ kind: 'coroner-failed', job: first.enqueued, error: expect.stringContaining('deadline exceeded') });
+  expect(opts.store.read(first.enqueued).failurePublishedAt).toBeTruthy();
+  for (const at of ['2026-10-18T02:18:00Z', '2026-10-18T03:00:00Z']) await runNightlyCoronerJob({ ...opts, now: Date.parse(at) });
+  expect(readFileSync(opts.statusFeed, 'utf8').trim().split('\n')).toHaveLength(1);
+});
+it('publishes a retained historical failure that was never published, once', async () => {
+  const opts = jobOptions(temp());
+  const old = await runNightlyCoronerJob({ ...opts, now: Date.parse('2026-10-15T02:17:00Z') });
+  opts.store.update(old.enqueued, (r) => ({ ...r, job: { ...r.job, status: 'failed', error: 'lane unavailable' } }));
+  for (const at of ['2026-10-18T03:00:00Z', '2026-10-18T03:01:00Z']) {
+    expect((await runNightlyCoronerJob({ ...opts, now: Date.parse(at) })).alerts).toEqual([]);
+  }
+  const lines = readFileSync(opts.statusFeed, 'utf8').trim().split('\n');
+  expect(lines).toHaveLength(1);
+  expect(parseFeedLine(lines[0])).toMatchObject({ job: old.enqueued, error: 'lane unavailable' });
+});
 it('scrubs and bounds failure text before appending the raw feed line', () => {
   const feed = join(temp(), 'feed.jsonl');
   const secret = `ghp_${'a'.repeat(36)}`;

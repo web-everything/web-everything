@@ -145,13 +145,20 @@ export async function runNightlyCoronerJob({ now, config, settings, dir, env = p
   const current = store.list().records;
   try { evict({ jobsDir: store.dir, referenced: current.filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status)).flatMap((r) => r.job.snapshotKeys ?? []) }); }
   catch (e) { log(`nightly-coroner eviction: ${e.message}`); }
-  // Daily records are a permanent ledger. Only the currently due night owns an active alert;
-  // advancing to the next night closes the previous health episode without deleting its record or feed event.
-  const failures = current.filter((r) => r.job.kind === HEALTH_NIGHTLY_CORONER_KIND.kind && r.input.night === night &&
-    r.job.status !== 'succeeded' && (r.job.status === 'failed' || now >= coronerDeadline(r.input.night, r.input.nightly?.deadlineEt ?? config.deadlineEt)))
-    .map((r) => ({ id: r.id, error: r.job.error ?? 'not completed', attempts: r.job.attempts, maxAttempts: r.job.maxAttempts,
-      reason: r.job.status === 'failed' ? 'attempts exhausted or launch failed' : 'ET deadline missed' }));
-  for (const failure of failures) publishCoronerFailure(failure, statusFeed);
+  // Every failed night gets its one feed event, stamped on its record so it is never re-sent — including a night that
+  // a restart past the next boundary fails, which is no longer current. Only the currently due night owns an active
+  // alert; advancing to the next night closes the previous health episode without deleting its record or feed event.
+  const failed = current.filter((r) => r.job.kind === HEALTH_NIGHTLY_CORONER_KIND.kind && r.job.status !== 'succeeded' &&
+    (r.job.status === 'failed' || now >= coronerDeadline(r.input.night, r.input.nightly?.deadlineEt ?? config.deadlineEt)))
+    .map((r) => ({ record: r, failure: { id: r.id, error: r.job.error ?? 'not completed', attempts: r.job.attempts, maxAttempts: r.job.maxAttempts,
+      reason: r.job.status === 'failed' ? 'attempts exhausted or launch failed' : 'ET deadline missed' } }));
+  for (const { record, failure } of failed.filter(({ record: r }) => !r.failurePublishedAt)) {
+    publishCoronerFailure(failure, statusFeed);
+    // Stamp only a terminal failure: a deadline-missed record reattach has not failed yet republishes nothing (the feed
+    // marker dedups) and is stamped once it settles.
+    if (record.job.status === 'failed') store.update(record.id, (f) => (f.job.status === 'failed' && !f.failurePublishedAt ? { ...f, failurePublishedAt: new Date().toISOString() } : null));
+  }
+  const failures = failed.filter(({ record: r }) => r.input.night === night).map(({ failure }) => failure);
   // Retain the small daily records as the durable once-per-night ledger, independent of health state.json.
   return { enqueued, alerts: failures, failures: failures.map((r) => `${r.id}: ${r.error}; ${r.attempts}/${r.maxAttempts} attempts; ${r.reason}`) };
 }
