@@ -272,8 +272,8 @@ export function launchJob({ store, id, kindDef, snapshot, now = () => Date.now()
 const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
- * Stop a live job: SIGTERM (plus SIGCONT, so a frozen process can act on it), wait, SIGKILL, then confirm the
- * handle is gone. Each signal is sent only while the handle still probes alive — a reused pid is never hit.
+ * Stop a live job and its subprocesses: SIGTERM (plus SIGCONT, so a frozen process can act on it), wait, SIGKILL,
+ * then confirm the handle is gone. Each signal is sent only while the handle still probes alive — a reused pid is never hit.
  * @returns {Promise<{gone: boolean, signal: string|null}>}
  */
 export async function stopHandle(handle, {
@@ -289,7 +289,15 @@ export async function stopHandle(handle, {
     }
     return probe(handle) !== 'alive';
   };
-  const send = (sig) => { try { if (probe(handle) === 'alive') kill(pid, sig); } catch { /* raced its own exit */ } };
+  // Every signal goes to the job's process group (a detached launch leads one), so no subprocess outlives the
+  // job; a handle that leads no group is signalled by pid. Subprocesses the job starts after SIGTERM (its own
+  // cleanup, e.g. a lane release) are spared it, and the grace lets them finish.
+  const send = (sig) => {
+    try {
+      if (probe(handle) !== 'alive') return;
+      try { kill(-pid, sig); } catch { kill(pid, sig); }
+    } catch { /* raced its own exit */ }
+  };
   if (probe(handle) !== 'alive') return { gone: true, signal: null };
   send('SIGTERM');
   send('SIGCONT');
@@ -323,7 +331,7 @@ const sameGeneration = (a, b) => a.job.status === b.job.status && a.job.handle =
  * @returns {Promise<{slept: boolean, gapMs: number, actions: object[], corrupt: string[]}>}
  */
 export async function reattachTick({
-  store, kinds, maxConcurrent, clock, observation, probe = (h) => probeHandle(h), stop = (h) => stopHandle(h, { probe }),
+  store, kinds, maxConcurrent, clock, observation, probe = (h) => probeHandle(h), stop = (h, o = {}) => stopHandle(h, { probe, ...o }),
   launch = launchJob, staleMs = DEFAULT_HEARTBEAT_STALE_MS, launchGraceMs = DEFAULT_LAUNCH_GRACE_MS,
   backoffBaseMs = DEFAULT_BACKOFF_BASE_MS, snapshot, heartbeatIntervalMs, log = () => {}, deadlineAt = () => null,
 }) {
@@ -345,7 +353,7 @@ export async function reattachTick({
       : planReattach(r, state, { kindDef });
     if (plan.type === 'none') continue;
     if (plan.stopFirst) {
-      const res = await stop(r.job.handle);
+      const res = await stop(r.job.handle, kindDef?.stopGraceMs ? { termGraceMs: kindDef.stopGraceMs } : {});
       if (!res.gone) {
         actions.push({ id: r.id, state, action: 'stop-failed' });
         log(`daemon-jobs: could not stop stalled job ${r.id} (${r.job.handle}) — it keeps its slot; alerting`);

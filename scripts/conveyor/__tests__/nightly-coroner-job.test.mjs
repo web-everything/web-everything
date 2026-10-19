@@ -1,10 +1,13 @@
+// @vitest-environment node
+// The job child runs under plain Node; happy-dom's AbortController is not one child_process accepts.
 import { it, expect, vi, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, existsSync, symlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { coronerNightDue, runNightlyCoronerJob, extractNightlyCoroner, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed, NIGHTLY_DEFAULTS, coronerDeadline, publishCoronerFailure } from '../nightly-coroner-job.mjs';
-import { createJobStore, reattachTick, runJob, JOB_ID_ENV, JOB_ATTEMPT_ENV } from '../../lib/daemon-jobs-runtime.mjs';
+import { EventEmitter } from 'node:events';
+import { coronerNightDue, runNightlyCoronerJob, extractNightlyCoroner, runNightlyCoronerEntry, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed, NIGHTLY_DEFAULTS, coronerDeadline, publishCoronerFailure } from '../nightly-coroner-job.mjs';
+import { createJobStore, enqueueJob, reattachTick, runJob, JOB_ID_ENV, JOB_ATTEMPT_ENV } from '../../lib/daemon-jobs-runtime.mjs';
 import { HEALTH_WATCH_JOB_KINDS, HEALTH_NIGHTLY_CORONER_KIND } from '../../../skills-src/conveyor/daemon-manifest.mjs';
 import { parseFeedLine } from '../../operations/needs-you-feed.mjs';
 import { markLaunching } from '../../lib/daemon-jobs.mjs';
@@ -292,6 +295,36 @@ it('expires a fresh late catch-up without acquiring a lane or launching extracti
   expect(opts.store.read(result.enqueued).job).toMatchObject({ status: 'failed', attempts: 0, error: expect.stringContaining('deadline exceeded') });
   expect(result.alerts).toHaveLength(1);
   expect(readFileSync(opts.statusFeed, 'utf8')).toContain('deadline exceeded');
+});
+it('on SIGTERM stops the running extractor subprocess and releases the lane before the job child exits', async () => {
+  const root = temp(), { input, io } = extraction(root);
+  const lane = await io.acquire();
+  const pidFile = join(root, 'extractor.pid');
+  writeFileSync(join(lane.path, 'scripts/operations/coroner-extract.mjs'),
+    `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetInterval(() => {}, 1000);\n`);
+  delete io.run; // the real subprocess runner, so the extractor is a live child process
+  const store = createJobStore(join(root, 'jobs'));
+  mkdirSync(store.dir, { recursive: true });
+  enqueueJob({ store, id: 'nightly-coroner-2026-10-16', kindDef: HEALTH_NIGHTLY_CORONER_KIND, codeSha: 'test-sha', input, now: Date.now() });
+  const record = store.update('nightly-coroner-2026-10-16', (r) => markLaunching(r, { at: new Date().toISOString() }));
+  const signals = new EventEmitter();
+  const done = runNightlyCoronerEntry({ io, signals, env: { [JOB_ID_ENV]: record.id, [JOB_ATTEMPT_ENV]: String(record.job.attempts), OPERATION_RUNS_DIR: store.dir } });
+  let pid = 0;
+  for (let i = 0; i < 200 && !pid; i++) { await new Promise((r) => setTimeout(r, 25)); pid = existsSync(pidFile) ? Number(readFileSync(pidFile, 'utf8')) : 0; }
+  expect(pid).toBeGreaterThan(0);
+  const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  try {
+    signals.emit('SIGTERM', 'SIGTERM');
+    expect(await done).toMatchObject({ outcome: 'error' });
+    expect(io.release).toHaveBeenCalledWith(lane);
+    for (let i = 0; i < 100 && alive(); i++) await new Promise((r) => setTimeout(r, 25));
+    expect(alive()).toBe(false);
+    expect(signals.listenerCount('SIGTERM')).toBe(0);
+    expect(existsSync(join(input.dir, 'nightly-coroner-cursor.json'))).toBe(false);
+  } finally { if (alive()) process.kill(pid, 'SIGKILL'); }
+});
+it('declares a stop grace long enough for the SIGTERM path to release its lane', () => {
+  expect(HEALTH_NIGHTLY_CORONER_KIND.stopGraceMs).toBeGreaterThanOrEqual(30_000);
 });
 it('alerts on the configured consecutive probe failure threshold and resets on success', () => {
   let state = emptyHealthState();

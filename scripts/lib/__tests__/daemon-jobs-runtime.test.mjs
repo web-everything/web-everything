@@ -368,3 +368,43 @@ describe('reattachTick deadlines', () => {
     expect(store.read('deadline-stuck').job.status).toBe('running');
   });
 });
+
+describe('stopping a job that owns subprocesses', () => {
+  it.each([
+    ['a wrapper that exits on SIGTERM', '', 'setInterval(() => {}, 1000)', 'SIGTERM'],
+    ['a tree that ignores SIGTERM', "process.on('SIGTERM', () => {});", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)", 'SIGKILL'],
+  ])('stops the whole detached process group, not only the wrapper pid: %s', async (_name, parentTrap, childCode, signal) => {
+    const parent = spawn(process.execPath, ['-e', [
+      parentTrap,
+      `const c = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(childCode)}], { stdio: 'ignore' });`,
+      'console.log(c.pid); setInterval(() => {}, 1000);',
+    ].join('\n')], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
+    let out = '';
+    parent.stdout.on('data', (b) => { out += b; });
+    const childPid = Number(await waitFor(() => out.trim()));
+    const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    try {
+      await waitFor(() => readProcStart(parent.pid));
+      const handle = formatJobHandle({ host: hostName(), pid: parent.pid, procStart: readProcStart(parent.pid) });
+      const res = await stopHandle(handle, { termGraceMs: 300, killGraceMs: 3_000 });
+      expect(res).toEqual({ gone: true, signal });
+      await waitFor(() => !alive(childPid), 3_000);
+    } finally {
+      for (const pid of [childPid, parent.pid]) { try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ } }
+    }
+  });
+
+  it('gives a kind its declared stop grace on a deadline stop', async () => {
+    const graceful = defineJobKind({ kind: 'graceful', entry: 'job.mjs', stopGraceMs: 45_000 });
+    const now = Date.now();
+    enqueueJob({ store, kindDef: graceful, codeSha: 'test-sha', id: 'graceful-live', now });
+    store.update('graceful-live', (r) => markClaimed(markLaunching(r, { at: new Date(now).toISOString() }), {
+      at: new Date(now).toISOString(), handle: formatJobHandle({ host: 'test', pid: 123, procStart: 'test' }), host: 'test', pid: 123, procStart: 'test',
+    }));
+    const stop = vi.fn(async () => ({ gone: true, signal: 'SIGTERM' }));
+    await reattachTick({ store, kinds: kindRegistry([graceful]), maxConcurrent: 1, observation: { now, slept: false },
+      deadlineAt: () => now, probe: () => 'alive', stop, launch: vi.fn() });
+    expect(stop).toHaveBeenCalledWith(expect.any(String), { termGraceMs: 45_000 });
+    expect(() => defineJobKind({ kind: 'bad', entry: 'job.mjs', stopGraceMs: 0 })).toThrow(/stopGraceMs/);
+  });
+});

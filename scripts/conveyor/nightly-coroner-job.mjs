@@ -143,13 +143,14 @@ function atomicWrite(path, text) {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.${process.pid}.tmp`; writeFileSync(tmp, text); renameSync(tmp, path);
 }
-const command = async (args, cwd) => (await exec(process.execPath, args, {
-  cwd, encoding: 'utf8', timeout: 30 * 60000, maxBuffer: 32 * 1024 * 1024,
+const command = async (args, cwd, { signal } = {}) => (await exec(process.execPath, args, {
+  cwd, encoding: 'utf8', timeout: 30 * 60000, maxBuffer: 32 * 1024 * 1024, signal,
 })).stdout;
 
+/** `signal` aborts the acquire and extractor subprocesses (a stop); the lane release is never given it. */
 export async function extractNightlyCoroner({ night, until, dir, settings, nightly = NIGHTLY_DEFAULTS, sourceRoot = ROOT }, {
-  root = ROOT, home = handoffHome(), statusFeed = feedPath(), run = command,
-  acquire = async () => JSON.parse(await run([join(root, 'scripts/lane-pool.mjs'), 'acquire', '--purpose=nightly-coroner', `--wait-ms=${positiveInt(nightly.laneWaitMs) ? nightly.laneWaitMs : NIGHTLY_DEFAULTS.laneWaitMs}`, `--repo=${sourceRoot}`, '--json'], sourceRoot)),
+  root = ROOT, home = handoffHome(), statusFeed = feedPath(), run = command, signal,
+  acquire = async () => JSON.parse(await run([join(root, 'scripts/lane-pool.mjs'), 'acquire', '--purpose=nightly-coroner', `--wait-ms=${positiveInt(nightly.laneWaitMs) ? nightly.laneWaitMs : NIGHTLY_DEFAULTS.laneWaitMs}`, `--repo=${sourceRoot}`, '--json'], sourceRoot, { signal })),
   release = async (lane) => run([join(root, 'scripts/lane-pool.mjs'), 'release', `--lane=${lane.lane}`, `--session=${lane.holder}`, `--repo=${sourceRoot}`], sourceRoot),
 } = {}) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(night)) throw new Error('invalid coroner night');
@@ -165,16 +166,20 @@ export async function extractNightlyCoroner({ night, until, dir, settings, night
     if (!receipt) throw new Error('nightly coroner report lacks recovery receipt');
     window = JSON.parse(receipt[1]);
   } else {
+    signal?.throwIfAborted();
     const lane = await acquire();
     if (!lane?.path || !lane?.holder || !Number.isInteger(lane.lane)) throw new Error('nightly-coroner: no lane acquired');
     try {
+      signal?.throwIfAborted();
       // The extractor imports coroner-rounds.mjs itself; --no-save leaves cursor publication to this job.
       const args = ['--since', since, '--until', until, '--json'];
       // Node resolves main-module symlinks; pass the same physical path to the CLI entry guard.
-      const metrics = JSON.parse(await run([realpathSync(join(lane.path, 'scripts/operations/coroner-extract.mjs')), ...args, '--no-save'], lane.path));
+      const metrics = JSON.parse(await run([realpathSync(join(lane.path, 'scripts/operations/coroner-extract.mjs')), ...args, '--no-save'], lane.path, { signal }));
       let falseFindings = null;
       const optional = join(lane.path, 'scripts/operations/coroner-false-findings.mjs');
-      if (existsSync(optional)) falseFindings = JSON.parse(await run([realpathSync(optional), ...args], lane.path));
+      signal?.throwIfAborted();
+      if (existsSync(optional)) falseFindings = JSON.parse(await run([realpathSync(optional), ...args], lane.path, { signal }));
+      signal?.throwIfAborted();
       window = { since, until };
       const rate = (value) => value ? `${value.count}/${value.total} (${value.pct}%)` : 'unavailable';
       const fence = '```';
@@ -207,8 +212,22 @@ function isEntry(path) {
   if (!path) return false;
   try { return realpathSync(path) === realpathSync(SELF); } catch { return false; }
 }
+/**
+ * The job child. A stop (deadline or stale heartbeat) sends SIGTERM: abort the running subprocess, let the
+ * extraction's `finally` release the lane, then exit — inside the kind's `stopGraceMs`, before any SIGKILL.
+ */
+export async function runNightlyCoronerEntry({ io = {}, signals = process, env = process.env } = {}) {
+  const controller = new AbortController();
+  const onStop = (sig) => controller.abort(new Error(`nightly-coroner stopped by ${sig}`));
+  for (const sig of ['SIGTERM', 'SIGINT']) signals.on(sig, onStop);
+  try {
+    return await runJob({ env, steps: [{ name: 'nightly-coroner', run: ({ input }) => extractNightlyCoroner(input, { ...io, signal: controller.signal }) }] });
+  } finally {
+    for (const sig of ['SIGTERM', 'SIGINT']) signals.off(sig, onStop);
+  }
+}
 if (isEntry(process.argv[1])) {
-  runJob({ steps: [{ name: 'nightly-coroner', run: ({ input }) => extractNightlyCoroner(input) }] })
+  runNightlyCoronerEntry()
     .then((r) => { process.exitCode = r.outcome === 'succeeded' ? 0 : 1; })
     .catch((e) => { console.error(e); process.exitCode = 1; });
 }
