@@ -54,6 +54,7 @@ import { readSettings } from './settings-files.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { queueFileOverlap, readQueueEntryFiles, completeListedFiles } from './queue-file-overlap.mjs';
 import { createAdaptiveBatching, readQueueFacts } from './merge-queue-adaptive-batching.mjs';
+import { activeReserveBlockers, isPriorityLabels, readReserves, writeReserves } from './priority-reserve.mjs';
 import { cancelObsoleteQueueRuns } from './merge-queue-obsolete-runs.mjs';
 
 /** Pure request recovery for historical rows that left no usable exact-head result. Never grants admission. */
@@ -253,7 +254,8 @@ const firstLine = (e) => String(e?.stderr || e?.message || e).trim().split('\n')
  */
 export function createDrainMergeStrategy({
   dryRun = false, quiet = false, isLocalRepo = () => true, localSlug = null, exec = execFileSync,
-  statePath = queueStatePath(), resolved = resolveDrainMergePolicy({ dryRun }), log = process.stderr,
+  statePath = queueStatePath(), reservePath = join(dirname(statePath), 'drain-priority-reserve.json'),
+  priorityReserve = () => ({ enabled: false, source: 'default' }), resolved = resolveDrainMergePolicy({ dryRun }), log = process.stderr,
   readFile = readFileSync, writeState = writeQueueState, withLock = (fn) => ({ ran: true, result: fn() }),
   postConflictFinding = defaultPostConflictFinding, now = () => Date.now(),
   cancelObsoleteRuns = cancelObsoleteQueueRuns, batching,
@@ -352,6 +354,84 @@ export function createDrainMergeStrategy({
   const slugOf = (repo) => repo || localSlug;
 
   const overlapCache = new Map();
+  const cachedQueue = repo => {
+    const cached = overlapCache.get(repo);
+    const at = now();
+    const queue = cached && at >= cached.at && at - cached.at < 30_000
+      ? cached.queue : readQueueEntryFiles({ repo, exec });
+    if (!queue.error && queue !== cached?.queue) overlapCache.set(repo, { at, queue });
+    return queue;
+  };
+  const mutateReserves = (fn, locked = false) => {
+    try {
+      const write = () => {
+        const reserves = readReserves(reservePath);
+        if (fn(reserves)) writeReserves(reservePath, reserves);
+      };
+      if (locked) write(); else withLock(write);
+    } catch { /* Reservations are best effort; failed IO never wedges the drain. */ }
+  };
+  const stampReserve = (c, headSha, files, locked = false) => {
+    if (dryRun || !priorityReserve().enabled || !isPriorityLabels(c.prLabels) || !headSha) return;
+    mutateReserves(reserves => {
+      reserves[keyOf(c.repo, c.num)] = { num: c.num, repo: c.repo ?? null, headSha, files, at: now() };
+      return true;
+    }, locked);
+  };
+  const dropReserve = c => {
+    if (dryRun || !priorityReserve().enabled || !isPriorityLabels(c.prLabels)) return;
+    mutateReserves(reserves => {
+      const key = keyOf(c.repo, c.num);
+      if (!reserves[key]) return false;
+      delete reserves[key]; return true;
+    }, true);
+  };
+  const reserveLiveCache = new Map();
+  const priorityReserveHold = (c, headSha, locked = false) => {
+    const setting = priorityReserve();
+    if (!setting.enabled || dryRun || !enqueues(c.repo) || isPriorityLabels(c.prLabels)
+      || c.listedFilesComplete !== true) return null;
+    const files = completeListedFiles(c.listedFiles);
+    if (files === null) return null;
+    const reserves = readReserves(reservePath);
+    const invalid = new Set();
+    const includeCards = safety.value.queueFileOverlapIncludesCards ?? true;
+    const blockers = activeReserveBlockers({ candidate: { num: c.num, key: keyOf(c.repo, c.num), files },
+      reserves, now: now(), includeCards, isValid: stamp => {
+        if (slugOf(stamp.repo) !== slugOf(c.repo)) return false;
+        const key = keyOf(stamp.repo, stamp.num);
+        let live;
+        const cached = reserveLiveCache.get(key);
+        try {
+          if (cached && now() >= cached.at && now() - cached.at < 30_000) live = cached.live;
+          else {
+            live = JSON.parse(exec('gh', ['pr', 'view', String(stamp.num), '--repo', slugOf(stamp.repo), '--json', 'state,headRefOid,labels'],
+              { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }));
+            if (!live?.state || !live.headRefOid || !Array.isArray(live.labels)) return false;
+            reserveLiveCache.set(key, { at: now(), live });
+          }
+          const labels = live.labels.map(l => typeof l === 'string' ? l : l?.name);
+          if (live.state !== 'OPEN' || live.headRefOid !== stamp.headSha || !labels.includes('ready-to-merge')
+            || !isPriorityLabels(live.labels) || sendBackReason(live.labels)) { invalid.add(key); return false; }
+          const queue = cachedQueue(slugOf(stamp.repo));
+          if (queue.error) return false;
+          if (queue.entries.some(e => e.num === stamp.num)) { invalid.add(key); return false; }
+          return true;
+        } catch { return false; }
+      } });
+    if (invalid.size) mutateReserves(current => {
+      let changed = false;
+      for (const key of invalid) if (JSON.stringify(current[key]) === JSON.stringify(reserves[key])) {
+        delete current[key]; changed = true;
+      }
+      return changed;
+    }, locked);
+    if (!blockers.length) return null;
+    const first = blockers[0];
+    const shared = queueFileOverlap({ candidateFiles: files, queuedEntries: [first], includeCards }).with[0].files[0];
+    say(`reserved files for priority #${first.num}: blocks #${c.num} - drain.priorityReservesFiles=on (${setting.source})`);
+    return { kind: 'priority-reserve', reason: `priority #${first.num} reserves ${shared}`, deferred: true };
+  };
   const pickQueueOverlap = (c, candidateFiles, queue) => {
     const overlap = queueFileOverlap({ candidateFiles,
       queuedEntries: queue.entries.filter(entry => entry.num !== c.num),
@@ -364,6 +444,7 @@ export function createDrainMergeStrategy({
     policy,
     strategy: policy.strategy,
     enqueues,
+    priorityReserveHold,
     /** GitHub's queue re-tests every entry against the queue tip, so the drain's freshness refresh is skipped. */
     queueOwnsFreshness: (repo) => enqueues(repo),
 
@@ -421,19 +502,16 @@ export function createDrainMergeStrategy({
         return { allowed: !reason, reason, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
       } catch { return { allowed: false, reason: 'red-team evidence unreadable' }; }
     },
-    /** Read-only overlap hint; enqueue always re-reads the queue under the land mutex. */
+    /** Overlap hint; reserve writes take the land mutex, and enqueue re-reads the queue under it. */
     queueOverlapHold(c, headSha) {
       if (!enqueues(c.repo)) return null;
       const candidateFiles = c.listedFilesComplete === true ? completeListedFiles(c.listedFiles) : null;
       if (candidateFiles === null) return null;
       const repo = slugOf(c.repo);
-      const cached = overlapCache.get(repo);
-      const at = now();
-      const queue = cached && at >= cached.at && at - cached.at < 30_000
-        ? cached.queue : readQueueEntryFiles({ repo, exec });
+      const queue = cachedQueue(repo);
       if (queue.error) return null;
-      if (queue !== cached?.queue) overlapCache.set(repo, { at, queue });
       const overlap = pickQueueOverlap(c, candidateFiles, queue);
+      if (overlap.overlap) stampReserve(c, headSha, candidateFiles);
       return overlap.overlap ? { kind: 'queue-file-overlap', reason: overlap.reason, deferred: true } : null;
     },
     /** Request only: the queue-file-overlap hold and every enqueue gate remain in force. */
@@ -600,13 +678,17 @@ export function createDrainMergeStrategy({
           const overlap = pickQueueOverlap(c, candidateFiles, queue);
           if (overlap.unknown.length) say(`  merge-queue file-overlap: unknown files for ${overlap.unknown.map(num => `#${num}`).join(',')} — continuing without those entries`);
           if (overlap.overlap) {
+            stampReserve(c, headSha, candidateFiles, true);
             const first = overlap.with[0];
             say(`  merge-queue file-overlap: defer #${c.num} (shares ${first.files[0]} with queued #${first.num}) — includeCards=${includeCards} (${source})`);
             return { enqueued: false, deferred: true, kind: 'queue-file-overlap',
               reason: overlap.reason };
           }
+          dropReserve(c);
         }
       } catch (e) { say(`  merge-queue file-overlap: read failed (${firstLine(e)}) — continuing enqueue`); }
+      const reserve = priorityReserveHold(c, headSha, true);
+      if (reserve) return { enqueued: false, ...reserve };
       let batchingGroupId;
       try {
         const g = adaptiveBatching().gate(c.num);
@@ -652,6 +734,7 @@ export function createDrainMergeStrategy({
         if (r.reason === REQUIRED_WORKFLOWS_UNSATISFIED) { err.code = REQUIRED_WORKFLOWS_UNSATISFIED; err.headSha = headSha; }
         throw err;
       }
+      dropReserve(c);
       try { adaptiveBatching().confirm?.(c.num, batchingGroupId, { already: !!r.already }); } catch { /* batching bookkeeping never blocks an enqueue */ }
       const state = readQueueState(statePath, readFile);
       // The file can break between the pre-check above and here. Writing over it would erase every other pending

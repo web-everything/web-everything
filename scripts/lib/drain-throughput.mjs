@@ -6,17 +6,17 @@ import { cascadePolicy, platformPreference, formatCascadeSourcesLine } from './p
 import { readDeclaredSettings } from './settings-files.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 
-const defaults = { redMainSkipCatchUp: true, holdFirst: true, overlapFirst: true, catchUpSkipQueueOverlap: true, catchUpSkipUnchangedHolds: true, carryOverReadyFirst: true, catchUpSkipMaxMin: 15 };
+const defaults = { redMainSkipCatchUp: true, holdFirst: true, overlapFirst: true, priorityReservesFiles: true, catchUpSkipQueueOverlap: true, catchUpSkipUnchangedHolds: true, carryOverReadyFirst: true, catchUpSkipMaxMin: 15 };
 export function resolveDrainThroughput({ env = process.env, file, platform, log = line => process.stderr.write(`${line}\n`) } = {}) {
   const booleanEnv = key => env[key] === undefined ? undefined
     : /^(true|1|on)$/i.test(env[key]) ? true : /^(false|0|off)$/i.test(env[key]) ? false : env[key];
   const pick = v => Object.fromEntries(Object.keys(defaults).filter(k => v?.[k] !== undefined).map(k => [k, v[k]]));
   const out = cascadePolicy('drain', pick((file ?? readDeclaredSettings().settings)?.drain), {
-    envValues: { overlapFirst: booleanEnv('WE_DRAIN_OVERLAP_FIRST'), catchUpSkipQueueOverlap: booleanEnv('WE_DRAIN_CATCH_UP_SKIP_QUEUE_OVERLAP') },
+    envValues: { priorityReservesFiles: booleanEnv('WE_DRAIN_PRIORITY_RESERVES_FILES'), overlapFirst: booleanEnv('WE_DRAIN_OVERLAP_FIRST'), catchUpSkipQueueOverlap: booleanEnv('WE_DRAIN_CATCH_UP_SKIP_QUEUE_OVERLAP') },
     standard: defaults, platform: pick(platform ?? platformPreference('drain', { env })), env,
     valid: Object.fromEntries(Object.keys(defaults).map(k => [k, k === 'catchUpSkipMaxMin' ? v => Number.isFinite(v) && v >= 0 : v => typeof v === 'boolean'])),
   });
-  for (const key of ['redMainSkipCatchUp', 'overlapFirst', 'catchUpSkipQueueOverlap']) {
+  for (const key of ['redMainSkipCatchUp', 'priorityReservesFiles', 'overlapFirst', 'catchUpSkipQueueOverlap']) {
     if (out.sources[key] === 'standard') out.sources[key] = 'default';
   }
   log(formatCascadeSourcesLine('drain', out));

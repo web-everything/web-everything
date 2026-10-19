@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -9,6 +9,7 @@ import {
   createDrainMergeStrategy, resolveDrainMergePolicy, readEnqueueClearance, buildClearanceComment, hasClearanceFor, DRY_RUN_STRATEGY_ENV,
   staleRedTeamRequestEligibility, requestDrainRedTeam, readDrainRedTeamRequests, finishDrainRedTeamRequest, readQueueState, FOLLOW_UP_MAX_ATTEMPTS, readMergeDeliveryToolSettings, MERGE_DELIVERY_SETTINGS_FILE_ENV,
 } from '../drain-merge-strategy.mjs';
+import { readReserves, writeReserves } from '../priority-reserve.mjs';
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { rulesetSuggestion } from '../merge-queue-enqueue.mjs';
@@ -24,7 +25,7 @@ const policyOf = (strategy) => ({ policy: resolveMergeDeliveryPolicy({ tool: str
 
 const DRAIN = 'drain-bot';
 
-function harness({ strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = { ...process.env, WE_RED_TEAM_TIMING: 'post-accept' }, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, readReviewAgents = () => [], baseTip = () => BASE_TIP } = {}) {
+function harness({ priorityReserve, reservePath, strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = { ...process.env, WE_RED_TEAM_TIMING: 'post-accept' }, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, readReviewAgents = () => [], baseTip = () => BASE_TIP } = {}) {
   const calls = [];
   const logs = [];
   let stored = initial;
@@ -67,6 +68,7 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
   const readFile = () => { if (stored == null) { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; } return JSON.stringify(stored); };
   const writeState = (_p, s) => { stored = JSON.parse(JSON.stringify(s)); };
   const s = createDrainMergeStrategy({
+    ...(priorityReserve ? { priorityReserve } : {}), ...(reservePath ? { reservePath } : {}),
     dryRun, env, readReviewAgents, readRedTeamEvidence: () => { if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }, requestRedTeam, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
     cancelObsoleteRuns: () => {}, batching: { gate: () => ({ admit: true }), observe: () => ({}) },
     postConflictFinding, ...(now ? { now } : {}), resolved: policyOf(strategy), log: { write: (l) => logs.push(l) }, readFile, writeState, ...(withLock ? { withLock } : {}),
@@ -1746,5 +1748,118 @@ describe('red-team requests while queue-file-overlap deferred', () => {
     expect(h.s.requestRedTeamWhileDeferred(c, HEAD)).toEqual({ requested: false });
     expect(h.requestRedTeam).not.toHaveBeenCalled();
     expect(hasEnqueueMutation(h)).toBe(false);
+  });
+});
+
+
+describe('priority file reservations', () => {
+  let dir;
+  afterEach(() => { if (dir) rmSync(dir, { recursive: true, force: true }); });
+  const files = ['scripts/shared.mjs', 'scripts/second.mjs'];
+  const priority = { num: 42, prLabels: ['priority:now'], listedFiles: files, listedFilesComplete: true };
+  const candidate = { num: 44, listedFiles: [files[0]], listedFilesComplete: true };
+  const facts = numbers => ({ data: { repository: { mergeQueue: { entries: {
+    pageInfo: { hasNextPage: false }, nodes: numbers.map(number => ({ pullRequest: { number } })),
+  } } } } });
+  const setup = (over = {}) => {
+    dir = mkdtempSync(join(tmpdir(), 'priority-reserve-'));
+    const reservePath = join(dir, 'drain-priority-reserve.json');
+    const h = harness({ strategy: 'github-merge-queue', reservePath,
+      priorityReserve: () => ({ enabled: true, source: 'default' }), ...over });
+    return { ...h, reservePath };
+  };
+  const stamp = (h, extra = {}) => writeReserves(h.reservePath, {
+    'cwd#42': { num: 42, repo: null, headSha: HEAD, files, at: Date.now(), ...extra },
+  });
+  it.each(['priority:now', 'priority:urgent'])('persists %s overlap defers in both paths', label => {
+    const h = setup({ queueFacts: facts([43]), ghView: { 43: { files: [files[0]] } } });
+    const c = { ...priority, prLabels: [{ name: label }] };
+    expect(h.s.queueOverlapHold(c, HEAD)?.kind).toBe('queue-file-overlap');
+    expect(readReserves(h.reservePath)['cwd#42']).toMatchObject({ num: 42, headSha: HEAD, files });
+    writeReserves(h.reservePath, {});
+    expect(h.s.enqueue(c, HEAD).kind).toBe('queue-file-overlap');
+    expect(readReserves(h.reservePath)['cwd#42'].files).toEqual(files);
+  });
+  it('reserves across passes, permits disjoint work and lets priority enqueue and clear its stamp', () => {
+    const queued = facts([43]);
+    const ghView = {
+      43: { files: [files[0]] },
+      42: { state: 'OPEN', headRefOid: HEAD, labels: ['ready-to-merge', 'priority:now'] },
+    };
+    let h = setup({ queueFacts: queued, ghView });
+    expect(h.s.enqueue(priority, HEAD).kind).toBe('queue-file-overlap');
+    queued.data.repository.mergeQueue.entries.nodes = [];
+    h = { ...h, ...harness({ strategy: 'github-merge-queue', reservePath: h.reservePath,
+      priorityReserve: () => ({ enabled: true, source: 'default' }), queueFacts: queued, ghView }) };
+    expect(h.s.enqueue(candidate, HEAD)).toEqual({ enqueued: false, deferred: true, kind: 'priority-reserve', reason: `priority #42 reserves ${files[0]}` });
+    expect(h.logs.join('')).toContain('reserved files for priority #42: blocks #44');
+    expect(h.s.enqueue({ ...candidate, num: 45, listedFiles: ['other.mjs'] }, HEAD).enqueued).toBe(true);
+    expect(h.s.enqueue(priority, HEAD).enqueued).toBe(true);
+    expect(readReserves(h.reservePath)).toEqual({});
+  });
+  it.each([
+    ['not ready', { state: 'OPEN', headRefOid: HEAD, labels: ['priority:now'] }],
+    ['head moved', { state: 'OPEN', headRefOid: 'a'.repeat(40), labels: ['ready-to-merge', 'priority:now'] }],
+    ['closed', { state: 'CLOSED', headRefOid: HEAD, labels: ['ready-to-merge', 'priority:now'] }],
+    ['priority removed', { state: 'OPEN', headRefOid: HEAD, labels: ['ready-to-merge'] }],
+    ['sent back', { state: 'OPEN', headRefOid: HEAD, labels: ['ready-to-merge', 'priority:now', 'review:changes'] }],
+    ['queued', { state: 'OPEN', headRefOid: HEAD, labels: ['ready-to-merge', 'priority:now'], files: ['other.mjs'] }, [42]],
+  ])('drops a stamp when %s', (_name, live, queued = []) => {
+    const h = setup({ ghView: { 42: live }, queueFacts: facts(queued) });
+    stamp(h);
+    expect(h.s.priorityReserveHold(candidate, HEAD)).toBeNull();
+    expect(readReserves(h.reservePath)).toEqual({});
+    // The harness uses the first view head for queue confirmation too.
+    live.headRefOid = HEAD;
+    expect(h.s.enqueue(candidate, HEAD).enqueued).toBe(true);
+  });
+  it('keeps unreadable live stamps without blocking, and retries reads', () => {
+    const failures = [42];
+    const h = setup({ viewThrows: failures, ghView: { 42: { state: 'OPEN', headRefOid: HEAD, labels: ['ready-to-merge', 'priority:urgent'] } } });
+    stamp(h);
+    expect(h.s.priorityReserveHold(candidate, HEAD)).toBeNull();
+    expect(readReserves(h.reservePath)['cwd#42']).toBeDefined();
+    failures.pop();
+    expect(h.s.priorityReserveHold(candidate, HEAD)?.kind).toBe('priority-reserve');
+  });
+  it('refreshes successful live and queue reads after 30 seconds', () => {
+    let time = 1_000;
+    const live = { state: 'OPEN', headRefOid: HEAD, labels: ['ready-to-merge', 'priority:now'] };
+    const h = setup({ now: () => time, ghView: { 42: live } });
+    stamp(h, { at: time });
+    expect(h.s.priorityReserveHold(candidate, HEAD)?.kind).toBe('priority-reserve');
+    const count = h.calls.length;
+    expect(h.s.priorityReserveHold(candidate, HEAD)?.kind).toBe('priority-reserve');
+    expect(h.calls).toHaveLength(count);
+    live.labels = [];
+    time += 30_000;
+    expect(h.s.priorityReserveHold(candidate, HEAD)).toBeNull();
+    expect(readReserves(h.reservePath)).toEqual({});
+  });
+  it('disabled setting prevents stamping and holding', () => {
+    const h = setup({ priorityReserve: () => ({ enabled: false, source: 'env' }), queueFacts: facts([43]), ghView: { 43: { files } } });
+    expect(h.s.queueOverlapHold(priority, HEAD)?.kind).toBe('queue-file-overlap');
+    expect(h.s.enqueue(priority, HEAD).kind).toBe('queue-file-overlap');
+    expect(readReserves(h.reservePath)).toEqual({});
+    stamp(h);
+    const count = h.calls.length;
+    expect(h.s.priorityReserveHold(candidate, HEAD)).toBeNull();
+    expect(h.calls).toHaveLength(count);
+  });
+  it.each([() => ({ ran: false }), () => { throw new Error('lock unavailable'); }])('hint tolerates a refused or throwing lock', withLock => {
+    const h = setup({ withLock, queueFacts: facts([43]), ghView: { 43: { files } } });
+    expect(h.s.queueOverlapHold(priority, HEAD)?.kind).toBe('queue-file-overlap');
+    expect(readReserves(h.reservePath)).toEqual({});
+  });
+  it.each([
+    ['dry run', { dryRun: true }, candidate],
+    ['other repo', {}, { ...candidate, repo: 'other/repo' }],
+    ['priority', {}, { ...candidate, prLabels: ['priority:urgent'] }],
+    ['unknown files', {}, { ...candidate, listedFilesComplete: false }],
+  ])('does no reserve reads for %s', (_name, options, c) => {
+    const h = setup(options);
+    stamp(h);
+    expect(h.s.priorityReserveHold(c, HEAD)).toBeNull();
+    expect(h.calls).toEqual([]);
   });
 });

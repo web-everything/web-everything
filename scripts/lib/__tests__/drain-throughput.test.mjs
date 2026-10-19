@@ -16,13 +16,14 @@ import { buildSkipReasons } from '../drain-skip-reasons.mjs';
 describe('drain throughput', () => {
   it('defaults on, supports rollback and reports each source', () => {
     const log = vi.fn();
-    expect(resolveDrainThroughput({ file: {}, platform: {}, env: {}, log }).value).toEqual({ redMainSkipCatchUp: true, holdFirst: true, overlapFirst: true, catchUpSkipQueueOverlap: true, catchUpSkipUnchangedHolds: true, carryOverReadyFirst: true, catchUpSkipMaxMin: 15 });
+    expect(resolveDrainThroughput({ file: {}, platform: {}, env: {}, log }).value).toEqual({ redMainSkipCatchUp: true, holdFirst: true, overlapFirst: true, priorityReservesFiles: true, catchUpSkipQueueOverlap: true, catchUpSkipUnchangedHolds: true, carryOverReadyFirst: true, catchUpSkipMaxMin: 15 });
     const out = resolveDrainThroughput({ file: { drain: { holdFirst: false } }, platform: {}, env: {}, log });
     expect(out.value.holdFirst).toBe(false);
     expect(out.sources.holdFirst).toBe('tool');
     expect(log.mock.calls.flat().join(' ')).toContain('redMainSkipCatchUp=true (default)');
   });
   it.each([
+    ['priorityReservesFiles', 'WE_DRAIN_PRIORITY_RESERVES_FILES'],
     ['overlapFirst', 'WE_DRAIN_OVERLAP_FIRST'],
     ['catchUpSkipQueueOverlap', 'WE_DRAIN_CATCH_UP_SKIP_QUEUE_OVERLAP'],
   ])('validates overrides and logs sources for %s', (key, envKey) => {

@@ -4673,7 +4673,8 @@ async function runCli() {
     onDeferred: (reason) => process.stderr.write(`  ⚠ ${repoTag(repo)}${pr.number} ${reason}\n`),
   });
   const resolvedMergePolicy = resolveDrainMergePolicy({ dryRun: DRY_RUN });
-  const mergeStrategy = createDrainMergeStrategy({ requestRedTeam: DRY_RUN ? null : requestDrainRedTeam, resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }) }); // xtpxusq — logs strategy + source once per pass
+  let throughput; // Refreshed before either enqueue path on every sweep.
+  const mergeStrategy = createDrainMergeStrategy({ requestRedTeam: DRY_RUN ? null : requestDrainRedTeam, resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), priorityReserve: () => ({ enabled: throughput.value.priorityReservesFiles !== false, source: throughput.sources?.priorityReservesFiles || 'default' }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
   // PR #5195 — the drain's ledger facts (review-exempt, carried-acceptance restamp, drain-hold release) can clear a
   // head, so they are written per candidate only once an enqueue entry point CONFIRMS its merge or enqueue: the
@@ -5093,6 +5094,7 @@ async function runCli() {
   // emit/exit), so the watch loop can call it repeatedly. A gh-list failure still hard-fails (bad env).
   const drainHeavyCacheByRepo = new Map(); // Reuse heavy fields across --watch passes.
   const sweepOnce = async () => {
+  throughput = resolveDrainThroughput();
   const prestageSetting = resolvePrestageSettings({ log: line => process.stderr.write(`${line}\n`) });
   // Prepared admission is still a candidate selection: honor the same resolved repo set and
   // operator label/base filters as listOne before consuming (or invalidating) a cached preparation.
@@ -5132,7 +5134,6 @@ async function runCli() {
     }
     process.stderr.write('drain-prestage: cache miss/stale — full fast drain\n');
   }
-  const throughput = resolveDrainThroughput();
   const carryPath = join(dirname(queueStatePath()), 'drain-ready-carry.json');
   const carry = throughput.value.carryOverReadyFirst && onlyPr == null ? readCarry(carryPath) : [];
   const prStateSetting = resolveDrainPrState();
@@ -6635,6 +6636,8 @@ async function runCli() {
         try { await mergeStrategy.requestRedTeamWhileDeferred(c, c.listedHeadSha || c.headSha); }
         catch { /* Request failure must never change the decision. */ }
       }
+      const reserve = mergeStrategy.priorityReserveHold(c, c.listedHeadSha || c.headSha);
+      if (reserve) return reserve;
       return mergeStrategy.recordedHold(c, c.listedHeadSha || c.headSha);
     });
     if (throughput.value.holdFirst) {

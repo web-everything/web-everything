@@ -2109,6 +2109,15 @@ run it through heavy admission.
 
 ## Drain throughput scheduling
 
+`drain.priorityReservesFiles` defaults on (`WE_DRAIN_PRIORITY_RESERVES_FILES=off`
+rolls it back). A `priority:now` or `priority:urgent` queue-overlap defer persists
+its complete file set beside queue state in `drain-priority-reserve.json`, including
+for later `--only` passes. Reservations expire after 30 minutes; live readiness,
+head, priority, send-back and queue-membership reads invalidate them. Failed reads
+never block admission. Only overlapping non-priority candidates wait; every existing
+gate still applies. Focused coverage lives in `priority-reserve.test.mjs`,
+`drain-merge-strategy.test.mjs` and `drain-throughput.test.mjs`.
+
 `scripts/settings/drain-throughput.json` owns the default-on `drain.holdFirst`,
 `drain.catchUpSkipUnchangedHolds`, `drain.redMainSkipCatchUp` and `drain.carryOverReadyFirst` switches; their resolver
 logs the source of each value. Early checks remember only refusals per repo/PR/head for
