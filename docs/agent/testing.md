@@ -1889,14 +1889,3 @@ ON. They resolve through the shared policy cascade: standard → platform → re
 with each source logged. Dispatch strips disabled brief sections. The verify step's first-commit
 check applies to build lane branches and delivery leases on local `main`, and warns if no test was added or updated; this advisory
 cannot prove a red run. Git-read errors are reported as unknown rather than evidence of compliance.
-
-## Health-watch lane scan throttle
-
-Health-watch passes its health state directory to the stale-state CLI, including when probes run
-in a background job. Only the full lane sweep and leased-lane ahead counts are cached in
-`healthDir/lane-scan.json`; claim reads and PID liveness checks remain per invocation. The
-`healthWatch.laneScanIntervalSec` cascade is standard 300 seconds → platform →
-`scripts/settings/health-watch.json` → `WE_HEALTH_WATCH_LANE_SCAN_INTERVAL_SEC`. Invalid
-positive-integer settings fall back to 300 seconds and are named in the scan decision log.
-Fixture/dry-run ticks without an explicit state root disable cache writes; with one, writes stay
-in that root. Focused coverage: `scripts/operations/__tests__/health-watch-lane-scan.test.mjs`.
