@@ -1405,6 +1405,33 @@ export function defaultPostConflictRearm({ pr, repo, exec = execFileSync }) {
   exec('node', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
 }
 
+// Prefer captured command diagnostics over the generic "Command failed" message.
+function conflictWatchCause(error) {
+  for (const value of [error?.stderr, error?.stdout, error?.message, error]) {
+    if (value == null) continue;
+    const line = String(value).split(/\r?\n/).map(line => line.trim())
+      .find(line => line && !/gh-shim|(?:shim.*warn|warn.*shim)/i.test(line));
+    if (line) return line.slice(0, 300);
+  }
+  return 'unknown error';
+}
+
+/** Pure human-readable diagnostics. Counts may overlap (an error can still route to the fixer).
+ * Optional listed PRs include unchanged/skipped PRs without altering the machine result array.
+ */
+export function formatConflictWatchSummary(results, prs = results) {
+  const byNumber = new Map(results.map(result => [result.num, result]));
+  const entries = prs.map(pr => byNumber.get(pr.num ?? pr.number) ?? {
+    num: pr.num ?? pr.number,
+    isConflicting: isParkedConflictTarget(pr) || isQueuedConflictTarget(pr) || isUnownedConflictTarget(pr),
+  });
+  const text = value => String(value ?? '-').replace(/[\r\n]+/g, ' ');
+  const lines = entries.map(entry => `PR #${entry.num}: conflicting=${entry.isConflicting ? 'yes' : 'no'} owner=${text(entry.owner)} routedTo=${text(entry.routedTo)} mechanicalRebase=${text(entry.mechanicalRebase?.action)} reason=${text(entry.mechanicalRebase?.reason)} cause=${text(entry.mechanicalRebase?.cause)}`);
+  const count = predicate => entries.filter(predicate).length;
+  lines.push(`Counts: considered=${entries.length} resolved by card resolver=${count(entry => entry.routedTo === 'card-conflict-resolver')} sent to fixer=${count(entry => entry.routedTo?.startsWith('reconcile-finding'))} errors=${count(entry => entry.error || entry.mechanicalRebase?.action === 'error')} skipped=${count(entry => !entry.routedTo && !entry.error && !entry.mechanicalRebase)}`);
+  return lines.join('\n');
+}
+
 /**
  * THE IO SHELL. Lists open PRs, classifies each, applies the label change + posts the one-time comment when a
  * PR newly transitions into conflict, and reports what happened. Never throws on a per-PR write failure — one
@@ -1456,8 +1483,17 @@ export function watchParkedPrConflicts({
   // `off`, exactly the behaviour before this card.
   conflictReassertSettings = CONFLICT_REASSERT_OFF,
 } = {}) {
-  const listed = listPrs({ repo });
-  if (isGhDeferred(listed)) return []; // throttle already logged the skipped pass
+  let listed;
+  try { listed = listPrs({ repo }); }
+  catch (error) {
+    console.error(`parked-pr-conflict-watch: run skipped: open-PR listing failed: ${conflictWatchCause(error)}`);
+    throw error;
+  }
+  if (isGhDeferred(listed)) {
+    const deferred = typeof listed === 'string' || Buffer.isBuffer(listed) ? JSON.parse(String(listed)) : listed;
+    console.error(`parked-pr-conflict-watch: run skipped: open-PR listing unavailable: ${conflictWatchCause(deferred.reason ?? 'deferred-low-budget (no gh slot or budget)')}`);
+    return [];
+  }
   const prs = scopePrsToQueue(listed, { label: 'parked-pr-conflict-watch', ...queueScope });
   const results = [];
   // xoh8fkw — resolved LAZILY, only once, only when a real write is about to happen (the common empty-sweep tick
@@ -1532,8 +1568,9 @@ export function watchParkedPrConflicts({
           try { provider.postComment(resolvedRepo, pr.number, UNOWNED_REBASE_ATTEMPT_MARKER); }
           catch { /* same best-effort counter as the existing unowned owner */ }
         }
-      } catch {
-        cardAttempt = { action: 'error', reason: 'card rebase unavailable; normal conflict owner required' };
+      } catch (error) {
+        cardAttempt = { action: 'error', reason: 'card rebase unavailable; normal conflict owner required', cause: conflictWatchCause(error) };
+        console.error(`parked-pr-conflict-watch: PR #${pr.number}: ${cardAttempt.reason}: ${cardAttempt.cause}`);
         if (attempted) {
           try { provider.postComment(resolvedRepo, pr.number, UNOWNED_REBASE_ATTEMPT_MARKER); } catch { /* same best-effort counter as the existing owner */ }
         }
@@ -2253,8 +2290,14 @@ if (IS_CLI) {
     try {
       const cardConflictSettings = loadCardConflictSettings();
       writeLineSync(2, `parked-pr-conflict-watch · cardConflicts.autoResolveRaisedBy=${cardConflictSettings.value.autoResolveRaisedBy} (source: ${cardConflictSettings.sources.autoResolveRaisedBy})`);
+      let listedPrs = [];
       const results = watchParkedPrConflicts({
-        repo, dryRun, cardConflictSettings, ...(prsFile ? { listPrs: () => readPrsFromFile(prsFile) } : {}),
+        repo, dryRun, cardConflictSettings,
+        listPrs: options => {
+          const listed = prsFile ? readPrsFromFile(prsFile) : defaultListParkedPrs(options);
+          if (Array.isArray(listed)) listedPrs = listed;
+          return listed;
+        },
         conflictReassertSettings: resolveConflictReassertSettings(),
       });
       for (const r of results) {
@@ -2263,6 +2306,7 @@ if (IS_CLI) {
         writeLineSync(2, `  ⚠ PR #${r.num}: ${verb2} ${what}${r.error ? ` (${r.error})` : ''}`);
       }
       writeAllSync(1, `${JSON.stringify({ checked: true, changed: results.length, results })}\n`);
+      writeLineSync(2, formatConflictWatchSummary(results, listedPrs));
     } catch (e) {
       writeLineSync(2, `error: ${String(e?.message ?? e)}`);
       process.exitCode = 1;

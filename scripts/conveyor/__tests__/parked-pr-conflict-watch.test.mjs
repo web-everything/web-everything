@@ -13,6 +13,7 @@ import {
   planConflictLabelChange,
   buildConflictComment,
   watchParkedPrConflicts,
+  formatConflictWatchSummary,
   defaultListParkedPrs,
   isStatuteTierConflict,
   buildConflictFindingBody,
@@ -3555,4 +3556,62 @@ it('skips a deferred discovery pass without posting a finding', () => {
     listPrs: () => ({ outcome: 'deferred-low-budget', deferred: true }), postFinding,
   })).toEqual([]);
   expect(postFinding).not.toHaveBeenCalled();
+});
+
+
+describe('conflict watch diagnostics', () => {
+  it.each(['message', 'stderr', 'stdout'])('retains and logs the meaningful %s of a thrown card rebase error', (field) => {
+    const cause = 'GraphQL: API rate limit exceeded';
+    const error = new Error(field === 'message' ? `\n[gh-shim] warning: wrapper\nwarning: shim active\n\n${cause}\nextra detail` : '');
+    if (field !== 'message') error[field] = Buffer.from(`\n[gh-shim] warning: wrapper\n${cause}\nextra detail`);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const [result] = watchParkedPrConflicts({
+        repo: 'o/n', sameLineConflict: 'stand-down',
+        listPrs: () => [{ number: 42, mergeable: 'CONFLICTING', baseRefName: 'main',
+          labels: [{ name: 'review:pending' }], files: [{ path: 'backlog/123-test.md' }] }],
+        provider: { ensureLabel() {}, setLabels() {}, postComment() {} },
+        cardConflictSettings: { value: { autoResolveRaisedBy: true }, sources: { autoResolveRaisedBy: 'test' } },
+        listPrComments: () => [], listAgents: () => [],
+        attemptCardRebase: () => { throw error; },
+        listPrFiles: () => [{ path: 'backlog/123-test.md' }],
+        computeConflictDisposition: () => 'real', ...noopRouting(),
+      });
+      expect(result.mechanicalRebase).toEqual({ action: 'error',
+        reason: 'card rebase unavailable; normal conflict owner required', cause });
+      expect(log.mock.calls.flat().join(' ')).toContain(cause);
+    } finally { log.mockRestore(); }
+  });
+
+  it('formats each PR and counts resolver, fixer, errors and skipped PRs', () => {
+    const results = [
+      { num: 1, isConflicting: true, owner: 'review', routedTo: 'card-conflict-resolver', mechanicalRebase: { action: 'rebased', reason: 'cards merged' } },
+      { num: 2, isConflicting: true, routedTo: 'reconcile-finding', mechanicalRebase: { action: 'error', reason: 'normal owner required', cause: 'rate limit' } },
+      { num: 3, isConflicting: false },
+    ];
+    expect(formatConflictWatchSummary(results)).toBe([
+      'PR #1: conflicting=yes owner=review routedTo=card-conflict-resolver mechanicalRebase=rebased reason=cards merged cause=-',
+      'PR #2: conflicting=yes owner=- routedTo=reconcile-finding mechanicalRebase=error reason=normal owner required cause=rate limit',
+      'PR #3: conflicting=no owner=- routedTo=- mechanicalRebase=- reason=- cause=-',
+      'Counts: considered=3 resolved by card resolver=1 sent to fixer=1 errors=1 skipped=1',
+    ].join('\n'));
+    expect(formatConflictWatchSummary([], [{ number: 4, mergeable: 'MERGEABLE' }])).toContain('PR #4: conflicting=no');
+  });
+
+  it('logs listing failure while preserving the thrown error', () => {
+    const error = new Error('GraphQL rate limit exhausted');
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(() => watchParkedPrConflicts({ listPrs: () => { throw error; } })).toThrow(error);
+      expect(log).toHaveBeenCalledWith('parked-pr-conflict-watch: run skipped: open-PR listing failed: GraphQL rate limit exhausted');
+    } finally { log.mockRestore(); }
+  });
+
+  it('logs a skipped run when discovery has no gh slot, retaining empty results', () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(watchParkedPrConflicts({ listPrs: () => ({ outcome: 'deferred-low-budget', deferred: true, reason: 'no gh slot' }) })).toEqual([]);
+      expect(log).toHaveBeenCalledWith('parked-pr-conflict-watch: run skipped: open-PR listing unavailable: no gh slot');
+    } finally { log.mockRestore(); }
+  });
 });
