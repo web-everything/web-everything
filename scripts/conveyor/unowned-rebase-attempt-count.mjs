@@ -17,24 +17,22 @@
  * silently retried forever, with no cap and no operator-visible trace beyond a per-tick `entry.error` line
  * nobody centrally watches.
  *
- * MARKER POSTED THE MOMENT THE OUTCOME IS KNOWN TO BE RETRY-WORTHY, NEVER ON A CLEAN SUCCESS. Unlike
- * `conflict-fix-round-count.mjs`'s marker (posted only once a round FULLY completes and re-arms), this marker
- * is posted by the IO shell right after `attemptMechanicalRebase` returns (or throws) `'skip'`/`'error'` —
- * BEFORE anything else that could itself throw (the comment/dispatch/label writes below it), so a persistently
- * failing attempt still durably advances the count even if everything downstream of it also fails. A clean
- * `'rebased'`/`'current'` result posts nothing: the common healthy path pays no extra write, and there is no
- * "next attempt" to bound in the first place once the conflict is actually resolved.
+ * Only content-conflict skips spend the cap. Infrastructure failures, throws, precondition skips,
+ * deferred attempts and clean successes post no marker. New markers include the outcome on their first
+ * line; legacy markers remain readable through the stable prefix.
  *
  * PURE reader (this file, mirrors every sibling counter's split); the writer (posting the marker comment) lives
  * in the IO shell (`parked-pr-conflict-watch.mjs`), same split as every sibling counter in this directory.
  */
+import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
+import { readSettings } from '../lib/settings-files.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 
 /**
- * we:scripts/conveyor/unowned-rebase-attempt-count.mjs#UNOWNED_REBASE_ATTEMPT_MARKER — the stable FIRST LINE of
+ * we:scripts/conveyor/unowned-rebase-attempt-count.mjs#UNOWNED_REBASE_ATTEMPT_MARKER — the stable first-line PREFIX of
  * the durable comment posted right after each unowned-population mechanical rebase-drop attempt that came back
- * (or threw) `'skip'`/`'error'`. Single-sourced HERE: `parked-pr-conflict-watch.mjs` posts it,
- * {@link countUnownedRebaseAttempts} matches it. Treat this line as fixed — changing it orphans the count on
+ * with a content-conflict `'skip'`. Single-sourced HERE: `parked-pr-conflict-watch.mjs` posts it,
+ * {@link countUnownedRebaseAttempts} matches it. Treat this prefix as fixed — changing it orphans the count on
  * every open unowned-conflict PR's existing history.
  */
 export const UNOWNED_REBASE_ATTEMPT_MARKER = '🔁 conveyor — unowned mechanical rebase attempted (#xu38vlf)';
@@ -50,6 +48,27 @@ export const UNOWNED_REBASE_ATTEMPT_MARKER = '🔁 conveyor — unowned mechanic
  */
 export const UNOWNED_REBASE_ATTEMPT_CAP = 3;
 
+/** Resolve the operator cutoff; null means count all historical attempts. */
+export function loadUnownedRebaseSettings({ env = process.env, platform = platformPreference('unownedRebase', { env }),
+  repo = readSettings()?.unownedRebase } = {}) {
+  return cascadePolicy('unownedRebase', repo, { standard: { countSince: null }, platform, env,
+    envValues: { countSince: env.WE_UNOWNED_REBASE_COUNT_SINCE },
+    valid: { countSince: v => typeof v === 'string'
+      && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(v)
+      && Number.isFinite(Date.parse(v)) } });
+}
+
+/** Only a rebase that ran and stopped on content spends the attempt cap. */
+export function shouldCountRebaseAttempt(result) {
+  return result?.action === 'skip' && !result.precondition && !result.deferred;
+}
+
+/** Stable prefix plus a single-line, bounded outcome for operator inspection. */
+export function formatUnownedRebaseAttemptMarker(result) {
+  const reason = String(result?.reason ?? '').replace(/[\r\n]+/g, ' ').trim().slice(0, 120);
+  return `${UNOWNED_REBASE_ATTEMPT_MARKER} outcome=${result.action}:${reason}`;
+}
+
 /**
  * we:scripts/conveyor/unowned-rebase-attempt-count.mjs#countUnownedRebaseAttempts — how many unowned-population
  * mechanical rebase-drop attempts have already run against this PR, read back off its OWN comment thread.
@@ -59,13 +78,17 @@ export const UNOWNED_REBASE_ATTEMPT_CAP = 3;
  * author passes {@link isTrustedMarkerAuthor} — a forged marker from an untrusted login must never inflate this
  * population's attempt cap (the same authz rule every other durable marker reader in this file's sibling
  * modules already applies).
- * @param {Array<{body?:string}|string>|null|undefined} comments
+ * A cutoff excludes only parseable createdAt values strictly before it; missing/invalid dates still count.
+ * @param {Array<{body?:string,createdAt?:string}|string>|null|undefined} comments
+ * @param {{countSince?:string|null}} [options]
  * @returns {number} the number of durable unowned-rebase-attempt comments on the PR (0 for a non-array / empty input)
  */
-export function countUnownedRebaseAttempts(comments) {
+export function countUnownedRebaseAttempts(comments, { countSince } = {}) {
   if (!Array.isArray(comments)) return 0;
+  const cutoff = Date.parse(countSince);
   let n = 0;
   for (const c of comments) {
+    if (Date.parse(c?.createdAt) < cutoff) continue;
     const body = typeof c === 'string' ? c : c?.body;
     if (typeof body === 'string' && body.trimStart().startsWith(UNOWNED_REBASE_ATTEMPT_MARKER) && isTrustedMarkerAuthor(c)) n += 1;
   }

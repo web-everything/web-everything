@@ -214,12 +214,12 @@ export function rebaseDropManifest({
     const inputs = [base, mergeRef].map(ref => run('git', ['rev-parse', '--verify', `${ref}^{commit}`], { cwd }));
     const ids = inputs.map(r => String(r.stdout || '').trim());
     if (inputs.some(r => r.status !== 0) || ids.some(id => !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(id)))
-      return { action: 'skip', reason: 'cannot pin card conflict inputs', cardConflictSetting };
+      return { action: 'skip', precondition: true, reason: 'cannot pin card conflict inputs', cardConflictSetting };
     [base, mergeRef] = ids;
     const pinned = run('git', ['merge-tree', '--write-tree', base, mergeRef], { cwd });
     parsed = parseMergeTree(pinned.stdout, pinned.status);
     if (!parsed.tree || (!parsed.clean && !parsed.conflictPaths.length))
-      return { action: 'skip', reason: 'cannot prove pinned card conflict', cardConflictSetting };
+      return { action: 'skip', precondition: true, reason: 'cannot prove pinned card conflict', cardConflictSetting };
     disp = manifestConflictDisposition(parsed, manifest);
     cardConflict = disp === 'real' && parsed.conflictPaths.every(isCardPath);
     if (disp === 'real' && !cardConflict) return { action: 'skip', reason: 'pinned merge has a non-card conflict',
