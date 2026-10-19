@@ -377,7 +377,9 @@ describe('open-head ledger observations', () => {
       try { fn(row => appendVerdict(row, { store: 'home' })); } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
     };
     const acceptedB = () => buildVerdictRecord({ repo, pr: 1, headSha: next, verdict: 'accepted', source: 'test', at: now });
-    const observe = (facts, opts) => observeLedgerHead(facts, { ...opts, settings, log: () => {}, proveCarry: () => null });
+    // Own sources: the settings line is logged once per process, and a later test asserts it for the shared `settings`.
+    const raceSettings = { ...settings, sources: { firstSeenRows: 'race-test', headMoveInvalidation: 'race-test' } };
+    const observe = (facts, opts) => observeLedgerHead(facts, { ...opts, settings: raceSettings, log: () => {}, proveCarry: () => null });
     it('discards a racing observation without invalidating the newer acceptance or rewinding the witnessed head', () => withHome(append => {
       expect(append(accepted())).toMatchObject({ ok: true });
       // The observer reads GitHub head A; before it reads the ledger, another process pushes B and records accepted(B).
