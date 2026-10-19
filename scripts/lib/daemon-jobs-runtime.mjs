@@ -272,8 +272,8 @@ export function launchJob({ store, id, kindDef, snapshot, now = () => Date.now()
 const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
- * Stop a live job: SIGTERM (plus SIGCONT, so a frozen process can act on it), wait, SIGKILL, then confirm the
- * handle is gone. Each signal is sent only while the handle still probes alive — a reused pid is never hit.
+ * Stop a live job and its subprocesses: SIGTERM (plus SIGCONT, so a frozen process can act on it), wait, SIGKILL,
+ * then confirm the handle is gone. Each signal is sent only while the handle still probes alive — a reused pid is never hit.
  * @returns {Promise<{gone: boolean, signal: string|null}>}
  */
 export async function stopHandle(handle, {
@@ -289,13 +289,73 @@ export async function stopHandle(handle, {
     }
     return probe(handle) !== 'alive';
   };
-  const send = (sig) => { try { if (probe(handle) === 'alive') kill(pid, sig); } catch { /* raced its own exit */ } };
+  // Every signal goes to the job's process group (a detached launch leads one), so no subprocess outlives the
+  // job; a handle that leads no group is signalled by pid. Subprocesses the job starts after SIGTERM (its own
+  // cleanup, e.g. a lane release) are spared it, and the grace lets them finish.
+  const send = (sig) => {
+    try {
+      if (probe(handle) !== 'alive') return;
+      try { kill(-pid, sig); } catch { kill(pid, sig); }
+    } catch { /* raced its own exit */ }
+  };
+  // Once the job pid is gone, SIGKILL whatever is left of its group (a grandchild the job did not wait for).
+  // While any member lives the group id stays reserved, so it cannot name a newer process.
+  const sweepGroup = () => { try { kill(-pid, 0); kill(-pid, 'SIGKILL'); } catch { /* no group left */ } };
   if (probe(handle) !== 'alive') return { gone: true, signal: null };
   send('SIGTERM');
   send('SIGCONT');
-  if (await waitGone(termGraceMs)) return { gone: true, signal: 'SIGTERM' };
+  if (await waitGone(termGraceMs)) { sweepGroup(); return { gone: true, signal: 'SIGTERM' }; }
   send('SIGKILL');
-  return { gone: await waitGone(killGraceMs), signal: 'SIGKILL' };
+  const gone = await waitGone(killGraceMs);
+  if (gone) sweepGroup();
+  return { gone, signal: 'SIGKILL' };
+}
+
+/** Start times (ms) of every process in group `pgid`, or null when `ps` did not answer. */
+export function readGroupStarts(pgid, { execFn = execFileSync } = {}) {
+  try {
+    const out = execFn('ps', ['-A', '-o', 'pgid=,lstart='], {
+      env: { ...process.env, LC_ALL: 'C' }, encoding: 'utf8', timeout: PS_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return out.split('\n').map((l) => l.trim().match(/^(\d+)\s+(.+)$/)).filter((m) => m && Number(m[1]) === pgid).map((m) => Date.parse(m[2]));
+  } catch { return null; }
+}
+
+/** This host's boot time (ms), or null when unknown. */
+export function readBootTime({ execFn = execFileSync, readFile = readFileSync } = {}) {
+  try {
+    if (process.platform === 'linux') {
+      const s = Number(readFile('/proc/stat', 'utf8').match(/^btime (\d+)$/m)?.[1]);
+      return Number.isFinite(s) ? s * 1000 : null;
+    }
+    const s = Number(execFn('sysctl', ['-n', 'kern.boottime'], { encoding: 'utf8', timeout: PS_TIMEOUT_MS }).match(/sec = (\d+)/)?.[1]);
+    return Number.isFinite(s) ? s * 1000 : null;
+  } catch { return null; }
+}
+
+/**
+ * A job whose pid died on its own (crash, OOM kill) can leave its subprocesses running in its process group.
+ * SIGKILL that group before the job is requeued or failed — only when it is provably the job's own: the pid is
+ * unused, the host has not rebooted since the job started, and every member started between the job's start
+ * and `notAfterMs` (when it was last known alive, plus the staleness window). A group whose id was reused
+ * after the job died has members started later, so it is never touched. Anything unreadable skips the reap.
+ * @returns {boolean} whether a leftover group was killed
+ */
+export function reapDeadGroup(handle, {
+  notAfterMs, host = hostName(), aliases = null, readStart = readProcStart, groupStarts = readGroupStarts,
+  bootTime = readBootTime, kill = (pid, sig) => process.kill(pid, sig),
+} = {}) {
+  const h = parseJobHandle(handle);
+  if (!h?.pid || !Number.isFinite(notAfterMs)) return false;
+  const local = aliases ?? (arguments[1]?.host !== undefined ? new Set([host]) : localHostAliases());
+  if (h.host !== host && !local.has(h.host)) return false;
+  try { if (readStart(h.pid)) return false; } catch { return false; }
+  const startedMs = Date.parse(h.procStart);
+  const boot = bootTime();
+  if (!Number.isFinite(startedMs) || !Number.isFinite(boot) || boot > startedMs) return false;
+  const members = groupStarts(h.pid);
+  if (!members?.length || members.some((t) => !Number.isFinite(t) || t < startedMs - 1000 || t > notAfterMs)) return false;
+  try { kill(-h.pid, 'SIGKILL'); return true; } catch { return false; }
 }
 
 /**
@@ -318,14 +378,15 @@ const sameGeneration = (a, b) => a.job.status === b.job.status && a.job.handle =
 /**
  * ONE reattach-and-admit pass. Run at boot and every tick.
  * @param {{store: object, kinds: Map<string, object>, maxConcurrent: number, clock?: object, observation?: object,
- *   probe?: Function, stop?: Function, launch?: Function, staleMs?: number, launchGraceMs?: number,
+ *   probe?: Function, stop?: Function, launch?: Function, staleMs?: number, launchGraceMs?: number, reapGroup?: Function,
  *   deadlineAt?: (record: object) => number|null, backoffBaseMs?: number, snapshot?: object, heartbeatIntervalMs?: number, log?: Function}} o
  * @returns {Promise<{slept: boolean, gapMs: number, actions: object[], corrupt: string[]}>}
  */
 export async function reattachTick({
-  store, kinds, maxConcurrent, clock, observation, probe = (h) => probeHandle(h), stop = (h) => stopHandle(h, { probe }),
+  store, kinds, maxConcurrent, clock, observation, probe = (h) => probeHandle(h), stop = (h, o = {}) => stopHandle(h, { probe, ...o }),
   launch = launchJob, staleMs = DEFAULT_HEARTBEAT_STALE_MS, launchGraceMs = DEFAULT_LAUNCH_GRACE_MS,
   backoffBaseMs = DEFAULT_BACKOFF_BASE_MS, snapshot, heartbeatIntervalMs, log = () => {}, deadlineAt = () => null,
+  reapGroup = (h, notAfterMs) => reapDeadGroup(h, { notAfterMs }),
 }) {
   const obs = observation ?? (clock ? clock.observe() : { now: Date.now(), slept: false, gapMs: 0 });
   const { now, slept, gapMs } = obs;
@@ -344,8 +405,10 @@ export async function reattachTick({
       reason: `deadline exceeded; ${r.job.attempts}/${r.job.maxAttempts} attempts; last error: ${r.job.error ?? 'not completed'}` }
       : planReattach(r, state, { kindDef });
     if (plan.type === 'none') continue;
+    const lastAliveMs = Date.parse(r.job.heartbeatAt ?? r.job.startedAt ?? '');
+    if (liveness === 'dead' && Number.isFinite(lastAliveMs) && reapGroup(r.job.handle, lastAliveMs + staleMs)) log(`daemon-jobs: job ${r.id} died with subprocesses still running — killed its process group`);
     if (plan.stopFirst) {
-      const res = await stop(r.job.handle);
+      const res = await stop(r.job.handle, kindDef?.stopGraceMs ? { termGraceMs: kindDef.stopGraceMs } : {});
       if (!res.gone) {
         actions.push({ id: r.id, state, action: 'stop-failed' });
         log(`daemon-jobs: could not stop stalled job ${r.id} (${r.job.handle}) — it keeps its slot; alerting`);

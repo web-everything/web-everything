@@ -228,6 +228,9 @@ export const HEALTH_PR_SWEEP_KIND = defineJobKind({
 export const HEALTH_NIGHTLY_CORONER_KIND = defineJobKind({
   kind: 'nightly-coroner', entry: 'scripts/conveyor/nightly-coroner-job.mjs', codeMode: 'readonly-tree', serial: true,
   nodeModules: true, resumable: false, maxAttempts: 1,
+  // On SIGTERM the child stops its extractor (≤10s) and releases its lane (≤30s) before exiting; give that time
+  // before SIGKILL (nightly-coroner-job.mjs CHILD_STOP_GRACE_MS + RELEASE_TIMEOUT_MS).
+  stopGraceMs: 45_000,
 });
 export const HEALTH_WATCH_JOB_KINDS = kindRegistry([HEALTH_GH_PROBE_KIND, HEALTH_PR_SWEEP_KIND, HEALTH_NIGHTLY_CORONER_KIND]);
 export const HEALTH_WATCH_JOB_SWITCHES = Object.freeze({ ghProbes: false });

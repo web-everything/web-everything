@@ -40,6 +40,15 @@ it('wakes an already sleeping daemon from the real filesystem event', async () =
     await expect(sleep(1)).resolves.toBe('interval');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+it('wakes from the directory event well inside the 1s stat-poll interval (not load-sensitive)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fix-handoff-fast-'));
+  try {
+    const pending = createFixHandoffSleep({ dir })(60_000);
+    await new Promise(r => setTimeout(r, 100)); // let the poll's first stat run, so only an event (not the 1s poll) can wake it in time
+    signalFixDispatch({ repo: 'o/r', pr: 4, label: 'status:ci-red' }, { dir });
+    await expect(Promise.race([pending, new Promise(r => setTimeout(() => r('too-slow'), 700))])).resolves.toBe('handoff');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 it('a send-back reservation never waives the host gate', () => {
   const throttle = createResourceFixThrottle({ sendBackReservedSlots: 1, listClaims: () => [], readSnap: () => null,
     settings: { cutover: 'enforce', fixCap: { floor: 1, ceiling: 1 } },
