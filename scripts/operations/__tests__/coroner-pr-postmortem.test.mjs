@@ -381,6 +381,61 @@ describe('per PR postmortem', () => {
       expect(fs.existsSync(join(dir, 'postmortem-example%2Frepo-1.md'))).toBe(true);
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
+  it.each([
+    [1,2,3], [1,3,2], [2,1,3], [2,3,1], [3,1,2], [3,2,1],
+  ].map(order => [order.join(','), order]))('emits recurrence candidates after out-of-order retry publication: %s', (_name, order) => {
+    for (const span of [1200,1440,1441]) {
+      const dir = temp();
+      try {
+        const reports = [1,2,3].map(pr => buildPostmortem({...fixture(pr),mergedAt:at(600+(pr-1)*span/2)}));
+        for (const pr of order) publishPostmortem(reports[pr-1],{dir});
+        const journal = join(dir,'incidents.jsonl');
+        const beforeRetry = fs.readFileSync(journal,'utf8');
+        for (const pr of order) publishPostmortem(reports[pr-1],{dir});
+        expect(fs.readFileSync(journal,'utf8')).toBe(beforeRetry);
+        const candidates = beforeRetry.trim().split('\n').map(JSON.parse).filter(r => r.kind === 'triage-candidate' && r.cause === 'review-finding');
+        expect(candidates).toHaveLength(span <= 1440 ? 1 : 0);
+        if (span <= 1440) expect(candidates[0]).toMatchObject({at:at(600+span),evidence:['example/repo#1','example/repo#2','example/repo#3']});
+      } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+    }
+  });
+  it.each([
+    ['existing candidate',[0,1,2,2800,2880,1440],[2,2880]],
+    ['new candidate',[0,1,2880,2880,1440],[1440,2880]],
+  ])('checks later retry windows after a suppressed window: %s', (_name, offsets, expected) => {
+    const dir = temp();
+    try {
+      const reports = offsets.map((offset,i) => buildPostmortem({...fixture(i+1),mergedAt:at(600+offset)}));
+      for (const report of reports) publishPostmortem(report,{dir});
+      const journal = join(dir,'incidents.jsonl'), beforeRetry = fs.readFileSync(journal,'utf8');
+      const candidates = beforeRetry.trim().split('\n').map(JSON.parse).filter(r => r.kind === 'triage-candidate' && r.cause === 'review-finding');
+      expect(candidates.map(c => c.at)).toEqual(expected.map(offset => at(600+offset)));
+      for (const candidate of candidates) {
+        const members = reports.filter(r => candidate.evidence.includes(`${r.repo}#${r.pr}`));
+        expect(members.length).toBeGreaterThanOrEqual(3);
+        expect(Math.max(...members.map(r => Date.parse(r.mergedAt)))-Math.min(...members.map(r => Date.parse(r.mergedAt)))).toBeLessThanOrEqual(86400000);
+      }
+      publishPostmortem(reports.at(-1),{dir});
+      expect(fs.readFileSync(journal,'utf8')).toBe(beforeRetry);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+  it('emits a recurrence candidate when the watcher retries an earlier failed collection', async () => {
+    const dir = temp();
+    try {
+      const args = {repo:'example/repo',dir,settings,now:at(900),listMerged:() => [1,2,3].map(number => ({number})),
+        collect:(_repo,pr) => {
+          if (pr === 1) throw Error('timeline temporarily unavailable');
+          return {...fixture(pr),mergedAt:at(600+pr*60)};
+        }};
+      await expect(runPostmortemPass(args)).rejects.toThrow('timeline temporarily unavailable');
+      const journal = join(dir,'incidents.jsonl');
+      expect(fs.readFileSync(journal,'utf8')).not.toContain('triage-candidate');
+      await runPostmortemPass({...args,now:at(901),listMerged:() => [],collect:(_repo,pr) => ({...fixture(pr),mergedAt:at(600+pr*60)})});
+      const candidates = fs.readFileSync(journal,'utf8').trim().split('\n').map(JSON.parse).filter(r => r.kind === 'triage-candidate' && r.cause === 'review-finding');
+      expect(candidates).toHaveLength(1);
+      expect(candidates[0]).toMatchObject({at:at(780),evidence:['example/repo#1','example/repo#2','example/repo#3']});
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
   it('uses production labels and queue events, excludes outsiders and post-merge evidence', () => {
     const f = fixture();
     f.labels = [

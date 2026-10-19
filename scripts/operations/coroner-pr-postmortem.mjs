@@ -226,10 +226,28 @@ export function publishPostmortem(r, { dir = coronerStateDir() } = {}) {
   }
   const all = [...rows,...pending];
   for (const cause of grouped.keys()) {
-    const recent = all.filter(row => row.kind !== 'triage-candidate' && row.cause === cause && time(row.at) <= time(r.mergedAt) && time(row.at) >= time(r.mergedAt)-86400000);
-    const prs = [...new Set(recent.map(row => `${row.repo}#${row.pr}`))].sort();
-    const candidate = all.some(row => row.kind === 'triage-candidate' && row.cause === cause && Math.abs(time(r.mergedAt)-time(row.at)) < 86400000);
-    if (prs.length >= 3 && !candidate) pending.push({ at: r.mergedAt, repo: r.repo, pr: r.pr, cause, phase: 'triage', minutesLost: null, evidence: prs, kind: 'triage-candidate', id: `triage-candidate:${cause}:${r.mergedAt}` });
+    // A retried publication can precede incidents already journaled. Examine the
+    // 24-hour windows containing this merge, anchored at each observed merge.
+    const merged = time(r.mergedAt), day = 86400000;
+    const incidents = all.filter(row => row.kind !== 'triage-candidate' && row.cause === cause && time(row.at) >= merged-day && time(row.at) <= merged+day)
+      .sort((a,b) => time(a.at)-time(b.at));
+    const candidates = all.filter(row => row.kind === 'triage-candidate' && row.cause === cause).map(row => time(row.at)).sort((a,b) => a-b);
+    const counts = new Map();
+    let start = 0, candidateIndex = 0, lastCandidate = -Infinity;
+    for (let end = 0; end < incidents.length; end++) {
+      const row = incidents[end], subject = `${row.repo}#${row.pr}`;
+      counts.set(subject,(counts.get(subject) ?? 0)+1);
+      while (time(incidents[start].at) < time(row.at)-day) {
+        const old = incidents[start++], oldSubject = `${old.repo}#${old.pr}`;
+        const count = counts.get(oldSubject)-1;
+        if (count) counts.set(oldSubject,count); else counts.delete(oldSubject);
+      }
+      if (time(row.at) < merged || counts.size < 3 || (incidents[end+1] && time(incidents[end+1].at) === time(row.at))) continue;
+      while (candidateIndex < candidates.length && candidates[candidateIndex] <= time(row.at)-day) candidateIndex++;
+      if ((candidateIndex < candidates.length && candidates[candidateIndex] < time(row.at)+day) || time(row.at)-lastCandidate < day) continue;
+      pending.push({ at: row.at, repo: row.repo, pr: row.pr, cause, phase: 'triage', minutesLost: null, evidence: [...counts.keys()].sort(), kind: 'triage-candidate', id: `triage-candidate:${cause}:${row.at}` });
+      lastCandidate = time(row.at);
+    }
   }
   if (pending.length) fs.appendFileSync(path, pending.map(row => JSON.stringify(row)).join('\n')+'\n');
   const name = `postmortem-${repoFilenameKey(r.repo)}-${r.pr}`;
