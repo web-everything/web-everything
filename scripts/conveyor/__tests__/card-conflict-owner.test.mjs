@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, it, expect, vi } from 'vitest';
-import { watchParkedPrConflicts, CONFLICT_LABEL, defaultAttemptCardConflictRebase } from '../parked-pr-conflict-watch.mjs';
+import { watchParkedPrConflicts, CONFLICT_LABEL, defaultAttemptCardConflictRebase, gitCardOnlyRecheck } from '../parked-pr-conflict-watch.mjs';
 import { gitRun } from '../../lib/git-run.mjs';
 import { filterFixesByInFlightScope } from '../reconcile-fix-dispatch.mjs';
 import { UNOWNED_REBASE_ATTEMPT_MARKER, UNOWNED_REBASE_ATTEMPT_CAP } from '../unowned-rebase-attempt-count.mjs';
@@ -158,4 +158,79 @@ it('the real Git runner cannot reintroduce inherited Git environment into a pinn
     expect(env.GIT_CONFIG_COUNT).toBeUndefined(); expect(env.GIT_DIR).toBeUndefined();
     expect(env.WE_CI_PUSH_TOKEN).toBe('test');
   } finally { vi.unstubAllEnvs(); }
+});
+
+
+describe('git card-only routing recheck', () => {
+  const pr = { number: 42, headRefName: 'lane/cards', headRefOid: 'a'.repeat(40), baseRefName: 'main',
+    mergeable: 'CONFLICTING', labels: [], files: [{ path: 'scripts/stale.mjs' }] };
+  const settings = enabled => ({ value: { autoResolveRaisedBy: true, gitRecheckFiles: enabled },
+    sources: { autoResolveRaisedBy: 'standard', gitRecheckFiles: 'env' } });
+  function runner({ files = `${cardPath}\n`, fail, head = pr.headRefOid, remote = 'https://github.com/web-everything/web-everything.git' } = {}) {
+    return vi.fn((_cmd, args) => {
+      if (args.join(' ') === fail) return { status: 1, stdout: '' };
+      return { status: 0, stdout: args[0] === 'remote' ? remote : args[0] === 'rev-parse' ? head
+        : args[0] === 'diff' ? files : '' };
+    });
+  }
+  function recheckSweep(extra = {}) {
+    return sweep([], ['scripts/stale.mjs'], 'rebased', {
+      repo: 'web-everything/web-everything', listPrs: () => [pr], cardConflictSettings: settings(true), ...extra,
+    });
+  }
+  it('stale GitHub files plus git card proof reach the strict resolver and log the setting source', () => {
+    const run = runner();
+    const recheck = vi.fn(args => gitCardOnlyRecheck({ ...args, run, cwd: '/test' }));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const s = recheckSweep({ gitCardOnlyRecheck: recheck });
+      expect(recheck).toHaveBeenCalledWith({ pr, repo: 'web-everything/web-everything' });
+      expect(s.attemptCardRebase).toHaveBeenCalledOnce();
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('cardConflicts.gitRecheckFiles=true (source: env)'));
+      expect(run.mock.calls.map(([, args]) => args)).toEqual([
+        ['remote', 'get-url', 'origin'], ['fetch', 'origin', 'main'],
+        ['fetch', '--no-tags', 'origin', 'refs/heads/lane/cards'], ['rev-parse', 'FETCH_HEAD'],
+        ['diff', '--name-only', '--no-renames', `origin/main...${pr.headRefOid}`],
+      ]);
+      expect(run.mock.calls.every(([, , opts]) => opts.cwd === '/test')).toBe(true);
+    } finally { log.mockRestore(); }
+  });
+  it.each([`${cardPath}\nscripts/code.mjs\n`, '', 'backlog/not-a-card.txt\n'])
+  ('git files %j do not reach the resolver', files => {
+    const s = recheckSweep({ gitCardOnlyRecheck: args => gitCardOnlyRecheck({ ...args, run: runner({ files }) }) });
+    expect(s.attemptCardRebase).not.toHaveBeenCalled();
+    expect(s.postFinding).toHaveBeenCalledOnce();
+  });
+  it('disabled recheck does not run', () => {
+    const recheck = vi.fn(() => true);
+    const s = recheckSweep({ gitCardOnlyRecheck: recheck, cardConflictSettings: settings(false) });
+    expect(recheck).not.toHaveBeenCalled();
+    expect(s.attemptCardRebase).not.toHaveBeenCalled();
+  });
+  it.each([{ baseRefName: 'release' }, { baseRefName: undefined }, { headRefOid: 'bad' },
+    { headRefOid: 'A'.repeat(40) }, { headRefOid: undefined }, { headRefName: 'feature/cards' }])
+  ('ineligible refs never recheck: %j', refs => {
+    const recheck = vi.fn(() => true);
+    const s = recheckSweep({ gitCardOnlyRecheck: recheck, listPrs: () => [{ ...pr, ...refs }] });
+    expect(recheck).not.toHaveBeenCalled();
+    expect(s.attemptCardRebase).not.toHaveBeenCalled();
+  });
+  it('a throwing injected recheck keeps normal ownership', () => {
+    const s = recheckSweep({ gitCardOnlyRecheck: () => { throw new Error('git unavailable'); } });
+    expect(s.attemptCardRebase).not.toHaveBeenCalled();
+    expect(s.postFinding).toHaveBeenCalledOnce();
+  });
+  it.each([
+    { remote: 'https://github.com/other/repo.git' }, { head: 'b'.repeat(40) },
+    ...['remote get-url origin', 'fetch origin main', 'fetch --no-tags origin refs/heads/lane/cards',
+      'rev-parse FETCH_HEAD', `diff --name-only --no-renames origin/main...${pr.headRefOid}`].map(fail => ({ fail })),
+  ])('git proof fails closed: %j', options => {
+    expect(gitCardOnlyRecheck({ pr, repo: 'web-everything/web-everything', run: runner(options) })).toBe(false);
+  });
+  it('git errors and missing repository fail closed', () => {
+    expect(gitCardOnlyRecheck({ pr, repo: 'web-everything/web-everything', run: () => { throw new Error('git failed'); } })).toBe(false);
+    const run = runner();
+    expect(gitCardOnlyRecheck({ pr, run })).toBe(false);
+    expect(run).not.toHaveBeenCalled();
+  });
 });

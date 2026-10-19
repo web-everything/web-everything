@@ -434,6 +434,24 @@ function recoveryPushContext(repo, {
       '-c', 'credential.helper=!f() { echo username=x-access-token; printf "password=%s\\n" "$WE_CI_PUSH_TOKEN"; }; f'] };
 }
 
+/** Fresh file evidence for routing only; the resolver still proves the full diff and hunks. */
+export function gitCardOnlyRecheck({ pr, repo, cwd = REPO_ROOT, run = gitRun } = {}) {
+  try {
+    if (!pr?.headRefName?.startsWith('lane/') || pr.baseRefName !== 'main' || !/^[a-f0-9]{40}$/.test(pr.headRefOid ?? '')) return false;
+    const expected = repoKeyForSlug(repo);
+    if (!expected) return false;
+    const remote = run('git', ['remote', 'get-url', 'origin'], { cwd });
+    if (remote.status !== 0 || repoKeyFromRemoteUrl(remote.stdout) !== expected) return false;
+    if (run('git', ['fetch', 'origin', 'main'], { cwd }).status !== 0) return false;
+    if (run('git', ['fetch', '--no-tags', 'origin', `refs/heads/${pr.headRefName}`], { cwd }).status !== 0) return false;
+    const head = run('git', ['rev-parse', 'FETCH_HEAD'], { cwd });
+    if (head.status !== 0 || String(head.stdout).trim() !== pr.headRefOid) return false;
+    // List both sides of renames so moving a non-card into backlog cannot hide it.
+    const diff = run('git', ['diff', '--name-only', '--no-renames', `origin/main...${pr.headRefOid}`], { cwd });
+    return diff.status === 0 && isCardOnlyDiff(String(diff.stdout ?? '').split('\n').filter(Boolean));
+  } catch { return false; }
+}
+
 /** Same trusted fast-forward plumbing, with a fresh main and a private index for the card path. */
 export function defaultAttemptCardConflictRebase({ pr, repo, cwd = REPO_ROOT, run = gitRun, cardConflictSettings,
   env = process.env, readCache, now = Date.now(),
@@ -1480,6 +1498,7 @@ export function watchParkedPrConflicts({
   computeConflictingPaths = defaultConflictingFilePaths,
   attemptMechanicalRebase = defaultAttemptUnownedConflictRebase,
   attemptCardRebase = defaultAttemptCardConflictRebase,
+  gitCardOnlyRecheck: recheckCardOnly = gitCardOnlyRecheck,
   cardConflictSettings = loadCardConflictSettings(),
   unownedRebaseSettings = loadUnownedRebaseSettings(),
   listAgents = defaultListAgents,
@@ -1566,6 +1585,14 @@ export function watchParkedPrConflicts({
         // Unknown files prove neither card-only eligibility nor a card rebase attempt.
         console.error(`parked-pr-conflict-watch: PR #${pr.number}: card file list unavailable; normal conflict owner required: ${conflictWatchCause(error)}`);
       }
+    }
+    if ((isConflicting || plan.newlyResolved) && !cardOnly && cardConflictSettings.value.gitRecheckFiles
+      && pr.baseRefName === 'main' && /^[a-f0-9]{40}$/.test(pr.headRefOid ?? '') && pr.headRefName?.startsWith('lane/')) {
+      try {
+        if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
+        cardOnly = recheckCardOnly({ pr, repo: resolvedRepo }) === true;
+      } catch { cardOnly = false; }
+      if (cardOnly) console.error(`parked-pr-conflict-watch: PR #${pr.number}: git recheck proved card-only; cardConflicts.gitRecheckFiles=true (source: ${cardConflictSettings.sources.gitRecheckFiles})`);
     }
     if (isConflicting && cardOnly && cardConflictSettings.value.autoResolveRaisedBy && !dryRun) {
       const cardEntry = { num: pr.number, isConflicting, ...plan, commented: false,

@@ -207,3 +207,23 @@ it('the card owner enforces credential refusal and a pinned Also-raised-by push'
   expect(f.git('show', `${result.newCommit}:${path}`)).toContain(entry(2).replace('xabc123', '6000'));
   expect(f.git('ls-remote', 'origin', 'refs/heads/lane/cards')).toContain(result.newCommit);
 });
+
+
+describe('gitRecheckFiles settings cascade', () => {
+  const base = { env: {}, platform: {}, repo: {} };
+  it.each([
+    [{}, true, 'standard'],
+    [{ platform: { gitRecheckFiles: false } }, false, 'platform'],
+    [{ platform: { gitRecheckFiles: false }, repo: { gitRecheckFiles: true } }, true, 'tool'],
+    ...[['true', true], ['false', false], ['1', true], ['0', false]].map(([raw, value]) =>
+      [{ repo: { gitRecheckFiles: !value }, env: { WE_CARD_CONFLICTS_GIT_RECHECK_FILES: raw } }, value, 'env']),
+    [{ platform: { gitRecheckFiles: false }, repo: { gitRecheckFiles: 'true' },
+      env: { WE_CARD_CONFLICTS_GIT_RECHECK_FILES: 'invalid' } }, false, 'platform'],
+    [{ platform: { gitRecheckFiles: 1 } }, true, 'standard'],
+  ])('resolves %j as %s from %s', (overrides, value, source) => {
+    expect(loadCardConflictSettings({ ...base, ...overrides })).toMatchObject({
+      value: { gitRecheckFiles: value, autoResolveRaisedBy: true },
+      sources: { gitRecheckFiles: source, autoResolveRaisedBy: 'standard' },
+    });
+  });
+});
