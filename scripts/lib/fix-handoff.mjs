@@ -1,5 +1,5 @@
 /** Local, wake-only hand-off. The daemon re-reads GitHub and retains all dispatch gates. */
-import { mkdirSync, readFileSync, writeFileSync, renameSync, watchFile, unwatchFile } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, renameSync, watch, watchFile, unwatchFile } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -19,10 +19,12 @@ export function createFixHandoffSleep({ dir = fixHandoffDir() } = {}) {
   mkdirSync(dir, { recursive: true });
   let seen = read(dir);
   return ms => new Promise(resolve => {
-    let timer;
+    let timer, watcher;
     const file = join(dir, 'wake');
-    const finish = reason => { clearTimeout(timer); unwatchFile(file, check); resolve(reason); };
+    const finish = reason => { clearTimeout(timer); unwatchFile(file, check); try { watcher?.close(); } catch { /* already closed */ } resolve(reason); };
     const check = () => { const value = read(dir); if (value !== seen) { seen = value; finish('handoff'); } };
+    // Event-driven wake first (immediate, even on a loaded host); the 1s stat poll stays as the fallback where fs.watch is unavailable.
+    try { watcher = watch(dir, check); watcher.on('error', () => {}); } catch { /* poll only */ }
     watchFile(file, { interval: 1000 }, check);
     timer = setTimeout(() => finish('interval'), ms);
     check(); // watch before read: includes events that arrived during the preceding tick

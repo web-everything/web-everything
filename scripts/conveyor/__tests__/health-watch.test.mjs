@@ -628,6 +628,18 @@ describe('probePrs — carries headRefName (stale-claim\'s open-PR exclusion nee
 });
 
 describe('probeStaleState', () => {
+  it('passes the tick cache root and write control to the CLI and exposes scan decisions on stderr', () => {
+    const calls = [];
+    const exec = (...args) => { calls.push(args); return JSON.stringify({ verdict: { records: [], gaps: [] } }); };
+    probeStaleState({ exec, laneScanDir: '/fixture/health', laneScanWrite: true });
+    expect(calls[0][2]).toMatchObject({ stderr: 'inherit', env: {
+      WE_HEALTH_WATCH_LANE_SCAN: '1', WE_HEALTH_WATCH_LANE_SCAN_DIR: '/fixture/health',
+      WE_HEALTH_WATCH_LANE_SCAN_WRITE: '1',
+    } });
+    probeStaleState({ exec, laneScanDir: null, laneScanWrite: false });
+    expect(calls[1][2].env).toMatchObject({ WE_HEALTH_WATCH_LANE_SCAN_DIR: '', WE_HEALTH_WATCH_LANE_SCAN_WRITE: '0' });
+  });
+
   it('shells the declared stale-state read and returns its verdict (records/gaps), not the whole run envelope', () => {
     const exec = () => JSON.stringify({ runId: 'x', verdict: { observedAt: 'now', records: [{ kind: 'claim', id: '4169' }], gaps: ['g'] } });
     const out = probeStaleState({ exec });
