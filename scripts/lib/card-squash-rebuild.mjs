@@ -4,6 +4,77 @@ export { patchWithoutPositions } from './card-squash-marker.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { cascadePolicy, platformPreference } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+// A changed base can absorb PR hunks, so patch equality alone is insufficient.
+// Independently reproduce each unresolved result from the three immutable inputs.
+function provePerPathMerge({ run, cwd, base, mergeRef, newCommit, oldFiles, newFiles, resolved }) {
+  const isOid = value => /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(value);
+  const succeeded = result => result.status === 0 && !result.error && !result.signal;
+  let scratch;
+  try {
+    const mb = run('git', ['merge-base', base, mergeRef], { cwd });
+    const ancestor = String(mb.stdout ?? '').trim();
+    if (!succeeded(mb) || !isOid(ancestor)) return null;
+    // A successful empty ls-tree means absence only in a previously verified tree.
+    for (const ref of new Set([ancestor, base, mergeRef, newCommit])) {
+      const verified = run('git', ['rev-parse', '--verify', '-q', `${ref}^{tree}`], { cwd });
+      if (!succeeded(verified) || !isOid(String(verified.stdout ?? '').trim())) return null;
+    }
+    const readEntry = (ref, path) => {
+      const result = run('git', ['ls-tree', '--full-tree', '-z', ref, '--', path], { cwd });
+      if (!succeeded(result)) throw new Error('unreadable squash proof entry');
+      const output = String(result.stdout ?? '');
+      if (!output) return null;
+      const match = /^([0-7]{6}) (blob|tree|commit) ([a-f0-9]{40}|[a-f0-9]{64})\t([^\0]+)\0$/.exec(output);
+      if (!match || match[4] !== path) throw new Error('invalid squash proof entry');
+      return { mode: match[1], type: match[2], oid: match[3] };
+    };
+    const entriesEqual = (a, b) => a === b || (a !== null && b !== null
+      && a.mode === b.mode && a.type === b.type && a.oid === b.oid);
+    const absorbedPaths = [];
+    const regularBlob = entry => entry?.mode === '100644' && entry.type === 'blob';
+    const resolvedPaths = new Set(resolved.map(({ path }) => path));
+    for (const path of [...new Set([...oldFiles, ...newFiles])].sort()) {
+      // Union resolver output is exempt only while the path remains in both diffs.
+      const entries = [ancestor, base, mergeRef, newCommit].map(ref => readEntry(ref, path));
+      const [mbEntry, baseEntry, headEntry, treeEntry] = entries;
+      if (entries.every(entry => entry === null)) return null;
+      if (resolvedPaths.has(path) && oldFiles.includes(path) && newFiles.includes(path)) {
+        // A resolved addition may lack ancestor/base entries, but never its head/result.
+        if (!regularBlob(headEntry) || !regularBlob(treeEntry)
+          || (mbEntry && !regularBlob(mbEntry)) || (baseEntry && !regularBlob(baseEntry))
+          || (mbEntry && !baseEntry)) return null;
+        continue;
+      }
+      const equalsHead = entriesEqual(treeEntry, headEntry);
+      if (entriesEqual(baseEntry, mbEntry)) {
+        if (!equalsHead) return null;
+      } else if (entries.every(regularBlob)) {
+        scratch ??= mkdtempSync(join(tmpdir(), 'card-squash-proof-'));
+        const files = [baseEntry, mbEntry, headEntry].map(({ oid }, index) => {
+          const blob = run('git', ['cat-file', 'blob', oid], { cwd, encoding: 'buffer' });
+          if (!succeeded(blob) || !Buffer.isBuffer(blob.stdout)) throw new Error('unreadable squash merge input');
+          const hash = run('git', ['hash-object', '--stdin'], { cwd, input: blob.stdout });
+          if (!succeeded(hash) || String(hash.stdout ?? '').trim() !== oid)
+            throw new Error('invalid squash merge input bytes');
+          const file = join(scratch, String(index));
+          writeFileSync(file, blob.stdout, { mode: 0o600 });
+          return file;
+        });
+        const merged = run('git', ['merge-file', '-p', ...files], { cwd, encoding: 'buffer' });
+        if (!succeeded(merged) || !Buffer.isBuffer(merged.stdout)) return null;
+        const hash = run('git', ['hash-object', '--stdin'], { cwd, input: merged.stdout });
+        if (!succeeded(hash) || String(hash.stdout ?? '').trim() !== treeEntry.oid) return null;
+      } else if (!entriesEqual(headEntry, baseEntry) || !entriesEqual(treeEntry, baseEntry)) return null;
+      if (oldFiles.includes(path) !== newFiles.includes(path) || !equalsHead) absorbedPaths.push(path);
+    }
+    return { patchEqual: false, proofKind: 'per-path-merge', absorbedPaths };
+  } catch { return null; }
+  finally { if (scratch) rmSync(scratch, { recursive: true, force: true }); }
+}
 
 export function loadCardRebaseSettings({ env = process.env, platform = platformPreference('cardRebase', { env }),
   repo = readSettings()?.cardRebase } = {}) {
@@ -70,11 +141,18 @@ export function cardSquashRebuild({ run, cwd, base, mergeRef, tree, message, res
     const blob = run('git', ['rev-parse', `${newCommit}:${path}`], { cwd });
     return blob.status === 0 && String(blob.stdout ?? '').trim() === oid;
   });
+  let mergeProof;
   if (!oldFiles || !newFiles || JSON.stringify(oldFiles) !== JSON.stringify(newFiles)
     || oldPatch.status !== 0 || newPatch.status !== 0
     || oldUnresolved.status !== 0 || newUnresolved.status !== 0 || !blobsEqual
-    || patchWithoutPositions(oldUnresolved.stdout) !== patchWithoutPositions(newUnresolved.stdout))
-    return { action: 'error', guard: 'squash-net-diff-mismatch', reason: 'card squash changed the PR net patch or changed path set; refusing push' };
+    || patchWithoutPositions(oldUnresolved.stdout) !== patchWithoutPositions(newUnresolved.stdout)) {
+    if (oldFiles && newFiles && oldPatch.status === 0 && newPatch.status === 0
+      && oldUnresolved.status === 0 && newUnresolved.status === 0 && blobsEqual)
+      mergeProof = provePerPathMerge({ run, cwd, base, mergeRef, newCommit, oldFiles, newFiles, resolved });
+    if (!mergeProof)
+      return { action: 'error', guard: 'squash-net-diff-mismatch', reason: 'card squash changed the PR net patch or changed path set; refusing push' };
+  }
   return { newCommit, proof: { oldHead: mergeRef, newHead: newCommit, patchHash: squashPatchHash(newPatch.stdout), oldFiles, newFiles, patchEqual: true,
+    ...mergeProof,
     ...(resolved.length ? { resolvedPaths: resolved.map(({ path }) => path) } : {}) } };
 }
