@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { assertMandatoryReferralsCleared, runReviewLabelCli } from '../review-set-label.mjs';
 import { mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../lib/jury-core.mjs';
 import { newRunRecord, writeRun } from '../operations/run-store.mjs';
+import { DAEMON_ENTRY_MODULES } from '../lib/daemon-boot-smoke.mjs';
 
 const repo = 'o/r', pr = 3481, head = '8dad651' + 'a'.repeat(33);
 const authorBody = '<!-- authored-by-actor: author -->';
@@ -35,14 +36,16 @@ describe('current-head mandatory referral acceptance', () => {
   });
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
 
-  it('loads review dispatch in a fresh process without a seat-policy initialization cycle', () => {
-    const result = spawnSync(process.execPath, ['--input-type=module', '-e', "await import('./scripts/operations/review-dispatch.mjs')"],
+  it.each(['scripts/operations/review-dispatch.mjs', ...DAEMON_ENTRY_MODULES])('loads %s in a fresh process without an initialization cycle', entry => {
+    const result = spawnSync(process.execPath, ['-e', `import(${JSON.stringify(`./${entry}`)})`],
       { cwd: resolve(dirname(fileURLToPath(import.meta.url)), '../..'), encoding: 'utf8', timeout: 10000 });
     expect(result.status, result.stderr).toBe(0);
   });
 
   function review({ failure = false, time = 0, reviewedHead = head, subject = repo } = {}) {
-    const run = newRunRecord({ id: `review-pr-test-${time}`, op: 'review-pr', input: { repo: subject, pr } });
+    // Shaped as `newRunId('review-pr')` mints it: a run under a chosen id never counts as a clean review (PR #5520).
+    const id = `review-pr-00000000-0000-4000-8000-${String(time).padStart(12, '0')}`;
+    const run = newRunRecord({ id, op: 'review-pr', input: { repo: subject, pr } });
     const verdict = { verdict: failure ? 'needs-human' : 'accept',
       pendingReferrals: failure ? ['referral-persistence-failed'] : [] };
     run.findings = { read: { repo: subject, pr, netBasis: { rev: reviewedHead } }, referralVerdict: verdict,
