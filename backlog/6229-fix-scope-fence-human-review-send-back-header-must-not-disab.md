@@ -3,7 +3,7 @@ bornAs: xtbxcp8
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/conveyor/fix-scope-fence.mjs", "we:scripts/conveyor/fix-scope-fence.test.mjs"]
+scope: ["we:scripts/conveyor/fix-scope-fence.mjs", "we:scripts/conveyor/__tests__/fix-scope-fence.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
