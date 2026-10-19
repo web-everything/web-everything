@@ -400,7 +400,7 @@ function buildBacklog(fileNames) {
         ? (data.relatedReport.match(/(\d{4}-\d{2}-\d{2})/) || [])[1]
         : undefined;
 
-      return {
+      const item = {
         ...data,
         id,
         num,
@@ -418,14 +418,17 @@ function buildBacklog(fileNames) {
         scope: normalizeScope(data.scope),
         details: src.details || data.details || undefined,
       };
+      // Cache the authored body alongside the item; raises are merged after the cache read
+      // so independent raise-file changes never require re-reading an unchanged card.
+      return { body: content, item };
     },
   });
-  const items = index.load(files).filter(Boolean); // drop malformed cards (reported below)
-  for (const item of items) {
-    const body = matter(readFileSync(join(BACKLOG_DIR, `${item.id}.md`), 'utf8'), {}).content;
+  // Drop malformed cards (reported below) before merging independently stored raises.
+  const items = index.load(files).filter(Boolean).map(({ body, item }) => {
     item.raisedBy = readRaisedBy(item.num, ROOT, { body, backlogDir: BACKLOG_DIR });
     if (item.raisedBy.length) item.details = derive(withRaisedBy(body, item.raisedBy)).details;
-  }
+    return item;
+  });
 
   if (malformed.length) {
     const lines = malformed.map((m) => `  • ${m.file} — ${m.reason}`).join('\n');

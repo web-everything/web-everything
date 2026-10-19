@@ -268,7 +268,7 @@ const outgoingBacklogTargets = (changedFiles) => {
 // touches a backlog/*.md file; a diff that touches none gets the full backlog-load saving with ZERO added
 // overhead (`LINKED_FILES` stays `null`, `EFFECTIVE_FILES` falls back to plain `LOCAL_FILES` below).
 const CHANGED_BACKLOG_FILES = LOCAL_FILES_LIST
-  ? LOCAL_FILES_LIST.filter((f) => /^backlog\/[^/]+\.md$/.test(f))
+  ? LOCAL_FILES_LIST.filter((f) => f.startsWith('backlog/') && f.endsWith('.md') && !f.slice('backlog/'.length).includes('/'))
   : [];
 const LINKED_FILES = CHANGED_BACKLOG_FILES.length
   ? new Set([...linkedFilesFor(CHANGED_BACKLOG_FILES, { gitGrep }), ...outgoingBacklogTargets(CHANGED_BACKLOG_FILES)])
