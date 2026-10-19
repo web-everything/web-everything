@@ -38,14 +38,22 @@ export async function selfReviewPrompt(diff) {
     FENCED_DATA_RULE, fenceUntrusted('material', diff)].join('\n\n');
 }
 
+// A `findings` key outside the chosen fence: quoted (straight or curly quotes) or bare right after a brace.
+const STRAY_FINDINGS_KEY = /["'“”‘’]findings["'“”‘’]\s*:|\{\s*findings\s*:/i;
+
 /**
  * One verdict object: bare, or inside exactly one fenced block, either with prose around it. Without a fence the
- * object runs from the first `{` to the last `}`. Anything else (two blocks, two objects, extra keys) is invalid.
+ * object runs from the first `{` to the last `}`. Anything else (two blocks, two objects, a second verdict outside
+ * the fence, extra keys) is invalid.
  */
 export function parseSelfReviewVerdict(message) {
   const text = String(message ?? '').replace(/\r\n?/g, '\n').trim();
-  const fences = [...text.matchAll(/^```[ \t]*(?:json)?[ \t]*\n([\s\S]*?)\n```[ \t]*$/gm)];
+  const fences = [...text.matchAll(/^```[ \t]*(?:json)?[ \t]*\n([\s\S]*?)\n```[ \t]*$/gim)];
   if (fences.length > 1) throw new Error('invalid self-review verdict: more than one fenced block');
+  if (fences.length) {
+    const outside = text.slice(0, fences[0].index) + text.slice(fences[0].index + fences[0][0].length);
+    if (STRAY_FINDINGS_KEY.test(outside)) throw new Error('invalid self-review verdict: a second verdict outside the fenced block');
+  }
   const body = fences.length ? fences[0][1] : text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1);
   const parsed = JSON.parse(body);
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.keys(parsed).join() !== 'findings') {

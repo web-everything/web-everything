@@ -121,6 +121,7 @@ import {
   classifyOpenPrFailure,
   gateFailureResumePrompt,
 } from '../deliver-item-wrapper.mjs';
+import { laneGitHardeningEnv } from '../../lib/lane-git-hardening.mjs';
 import { runDeliverItemCli } from '../deliver-item-run.mjs';
 import { REPO_ROOT } from '../minimal-context-provider.mjs';
 import { repoProfile } from '../../lib/repo-profile.mjs';
@@ -3567,6 +3568,26 @@ describe('deliverItem (#3627 bug 13 — the success-path result string names the
     expect(diffCalls).toHaveLength(1);
     expect(diffCalls[0].args).toEqual(expect.arrayContaining(['--no-ext-diff', '--no-textconv', 'core.fsmonitor=false']));
     expect(diffCalls[0].opts.maxBuffer).toBe(512 * 1024 + 1);
+    expect(diffCalls[0].opts.env).toEqual(laneGitHardeningEnv());
+  });
+
+  // The default build settings replace the converge round with one self-review, so a Claude-executed delivery parks
+  // for independent review (review:pending), never label-on-green. Pinned with no build setting from env or platform.
+  it('with default build settings, a Claude-executed delivery self-reviews once, skips converge and parks review:pending', async () => {
+    for (const name of ['WE_BUILD_SELF_REVIEW_ENABLED', 'WE_BUILD_SELF_REVIEW_MAX_ROUNDS', 'WE_BUILD_FINAL_GATE', 'WE_BUILD_REVIEWER_EXPECTATIONS_ENABLED']) {
+      vi.stubEnv(name, undefined);
+    }
+    vi.stubEnv('WE_PLATFORM_PREFERENCES_FILE', join(tmpdir(), 'no-such-platform-preferences.json'));
+    const reviewBuild = vi.fn(async () => []);
+    const provider = { spawn: vi.fn(), vendor: 'claude' };
+    const result = await deliverItem(
+      { item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999', attemptTag: '', runId: 'dispatch-lane-fixture', effectKey: 'dispatch:0:0' },
+      provider, { newSessionId: () => 'uuid-fixed', reviewBuild },
+    );
+    expect(result.result).toBe('PR #4321 (review:pending)');
+    expect(reviewBuild).toHaveBeenCalledOnce();
+    expect(provider.spawn).toHaveBeenCalledOnce();
+    expect(execFileSync.mock.calls.some(([, args]) => args?.[0] === 'scripts/converge-cli.mjs')).toBe(false);
   });
 
   it.each([

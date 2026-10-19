@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync, writeFileSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, rmSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -42,6 +43,23 @@ describe('build safeguards policy and briefs', () => {
     expect(renderBuildRequirements({ policy })).toBe('');
     expect(runGate({ mode: 'none', execFn: () => { throw Error('must not run'); } }).ran).toBe(false);
   });
+  // A blank or malformed environment value is an unset one: it never turns a safeguard off, for every build setting.
+  it.each([
+    ['WE_BUILD_SELF_REVIEW_MAX_ROUNDS', ''], ['WE_BUILD_SELF_REVIEW_MAX_ROUNDS', '  '], ['WE_BUILD_SELF_REVIEW_MAX_ROUNDS', 'abc'],
+    ['WE_BUILD_SELF_REVIEW_MAX_ROUNDS', '0x1'], ['WE_BUILD_SELF_REVIEW_MAX_ROUNDS', '1e0'], ['WE_BUILD_SELF_REVIEW_MAX_ROUNDS', '1.5'],
+    ['WE_BUILD_SELF_REVIEW_MAX_ROUNDS', '-1'], ['WE_BUILD_SELF_REVIEW_ENABLED', ''], ['WE_BUILD_SELF_REVIEW_ENABLED', ' '],
+    ['WE_BUILD_SELF_REVIEW_ENABLED', 'no'], ['WE_BUILD_FINAL_GATE', ''], ['WE_BUILD_FINAL_GATE', ' '], ['WE_BUILD_FINAL_GATE', 'off'],
+    ['WE_BUILD_REVIEWER_EXPECTATIONS_ENABLED', ''], ['WE_BUILD_REVIEWER_EXPECTATIONS_ENABLED', '0'],
+  ])('%s=%j keeps the standard default', (name, value) => {
+    const p = resolve({ env: { [name]: value } });
+    expect(p).toMatchObject({ finalGate: 'full', selfReview: { enabled: true, maxRounds: 2 }, reviewerExpectations: { enabled: true } });
+    expect(Object.values(p.sources)).not.toContain('env');
+  });
+  it('a well-formed environment value still wins, surrounding blanks trimmed', () => {
+    const p = resolve({ env: { WE_BUILD_SELF_REVIEW_MAX_ROUNDS: ' 0 ', WE_BUILD_FINAL_GATE: ' related', WE_BUILD_SELF_REVIEW_ENABLED: 'false ' } });
+    expect(p).toMatchObject({ finalGate: 'related', selfReview: { enabled: false, maxRounds: 0 } });
+    expect(p.sources).toMatchObject({ finalGate: 'env', 'selfReview.enabled': 'env', 'selfReview.maxRounds': 'env' });
+  });
   it('related gate requests the historical selection through verify-lane', () => {
     const exec = vi.fn(() => 'green');
     expect(runGate({ dir: '.', mode: 'related', execFn: exec, env: {} }).pass).toBe(true);
@@ -57,6 +75,17 @@ describe('build safeguards policy and briefs', () => {
     const exec = vi.fn(() => 'green');
     expect(runGate({ dir: '.', mode: 'full', execFn: exec }).pass).toBe(true);
     expect(exec.mock.calls[0].slice(0, 2)).toEqual(['node', ['scripts/verify-lane.mjs', 'run', '--gate=npm run test:unit && npm run check:standards']]);
+  });
+  // A checkout without WE's verify-lane (a sibling-repo --dir) gets a named, failed outcome, never a silent pass.
+  it.each(['full', 'related'])('%s gate in a checkout without verify-lane is a named unavailable failure', mode => {
+    const empty = mkdtempSync(join(tmpdir(), 'build-gate-empty-'));
+    const exec = vi.fn(() => 'green');
+    try {
+      const result = runGate({ dir: empty, mode, execFn: exec, env: {} });
+      expect(result).toMatchObject({ ran: false, mode, pass: false, unavailable: 'gate-unavailable' });
+      expect(result.steps[0].output).toContain('scripts/verify-lane.mjs');
+      expect(exec).not.toHaveBeenCalled();
+    } finally { rmSync(empty, { recursive: true, force: true }); }
   });
 });
 
@@ -164,6 +193,13 @@ describe('production self-review adapter', () => {
     ['two fenced verdicts', '```json\n{"findings":[]}\n```\n```json\n{"findings":["x"]}\n```'],
     ['an unexpected key', '{"findings":[],"clear":true}'],
     ['an array', '[]'],
+    ['mixed fenced and unfenced verdicts', '```json\n{"findings":[]}\n```\n{"findings":["a.mjs:1 defect"]}'],
+    ['mixed unfenced and fenced verdicts', '{"findings":["a.mjs:1 defect"]}\n```json\n{"findings":[]}\n```'],
+    ['a fenced verdict beside an unquoted-key verdict', '```json\n{"findings":[]}\n```\n{findings: ["a.mjs:1 defect"]}'],
+    ['a fenced verdict beside a smart-quoted verdict', '```json\n{"findings":[]}\n```\n{“findings”: ["a.mjs:1 defect"]}'],
+    ['a fenced verdict beside an upper-case JSON fence', '```json\n{"findings":[]}\n```\n```JSON\n{"findings":["a.mjs:1 defect"]}\n```'],
+    ['a fenced verdict beside a tilde fence', '```json\n{"findings":[]}\n```\n~~~\n{"findings":["a.mjs:1 defect"]}\n~~~'],
+    ['a text fence beside a bare verdict', '```text\n{"findings":["a.mjs:1 defect"]}\n```\n{"findings":[]}'],
   ])('rejects %s', async (_name, lastMessage) => {
     const task = vi.spyOn(codexTasks, 'codexDirectTask').mockResolvedValue({ exitCode: 0, timedOut: false, lastMessage });
     try { await expect(reviewBuildDiff({ dir: '.', diff: 'net change', env: {} })).rejects.toThrow(); }
@@ -290,6 +326,8 @@ describe('Codex completion wiring', () => {
     const { tmpdir } = await import('node:os');
     const { codexDirectTask } = await import('../../codex-direct-task.mjs');
     const dir = mkdtempSync(join(tmpdir(), 'build-self-review-'));
+    mkdirSync(join(dir, 'scripts'));
+    writeFileSync(join(dir, 'scripts', 'verify-lane.mjs'), '');
     const spawns = [];
     const execFn = vi.fn((bin, args) => {
       if (args.includes('--absolute-git-dir')) return join(dir, '.git');
@@ -331,6 +369,68 @@ describe('Codex completion wiring', () => {
       expect(report.lastMessage).toBe('completion 3');
       expect(report.events.agentMessages).toEqual(['completion 1', 'completion 2', 'completion 3']);
       expect(execFn.mock.calls.filter(([bin, args]) => bin === 'node' && args.includes('scripts/verify-lane.mjs'))).toHaveLength(3);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  // A fake `codex exec`: every turn writes its final message and one thread id, then exits 0.
+  const fakeCodex = spawns => (cli, argv) => {
+    spawns.push(argv);
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+    child.stdin = { on() {}, end() { queueMicrotask(() => {
+      writeFileSync(argv[argv.indexOf('-o') + 1], '{"findings":[]}');
+      child.stdout.emit('data', Buffer.from(`${JSON.stringify({ type: 'thread.started', thread_id: 'builder' })}\n`));
+      child.emit('close', 0);
+    }); } };
+    return child;
+  };
+  const fakeGit = dir => vi.fn((bin, args) => {
+    if (args.includes('--absolute-git-dir')) return join(dir, '.git');
+    if (args.includes('rev-parse')) return 'builder-start';
+    return '';
+  });
+  // No operator platform file or repo tool file can stand in for the standard default here.
+  const isolated = extra => ({ ...process.env, WE_PLATFORM_PREFERENCES_FILE: join(tmpdir(), 'no-such-platform-preferences.json'),
+    WE_BUILD_FINAL_GATE: undefined, WE_BUILD_SELF_REVIEW_ENABLED: undefined, WE_BUILD_SELF_REVIEW_MAX_ROUNDS: undefined, ...extra });
+
+  it.each([
+    ['unset', {}, { mode: 'full', ran: true }],
+    ['none', { WE_BUILD_FINAL_GATE: 'none' }, { mode: 'none', ran: false }],
+    ['related', { WE_BUILD_FINAL_GATE: 'related' }, { mode: 'related', ran: true }],
+  ])('a real codexDirectTask with WE_BUILD_FINAL_GATE %s runs the policy gate', async (_name, extra, expected) => {
+    const dir = mkdtempSync(join(tmpdir(), 'build-gate-default-'));
+    mkdirSync(join(dir, 'scripts'));
+    writeFileSync(join(dir, 'scripts', 'verify-lane.mjs'), '');
+    const env = isolated(extra);
+    for (const key of Object.keys(env)) if (env[key] === undefined) delete env[key];
+    const execFn = fakeGit(dir);
+    const spawns = [];
+    try {
+      const report = await codexDirectTask({ dir, task: 'change', env, selfReview: false, execFn, spawnFn: fakeCodex(spawns),
+        readQuotaFn: () => ({ quota: null, rolloutFile: null }), stream: false, log: () => {} });
+      expect(report.buildPolicy.sources.finalGate).toBe(extra.WE_BUILD_FINAL_GATE ? 'env' : 'standard');
+      expect(report.gate).toMatchObject(expected);
+      const verifies = execFn.mock.calls.filter(([bin, args]) => bin === 'node' && args[0] === 'scripts/verify-lane.mjs');
+      expect(verifies).toHaveLength(expected.ran ? 1 : 0);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('a review run never self-reviews, resumes or gates itself, even with self-review on and ephemeral', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'build-review-mode-'));
+    const env = isolated({ WE_BUILD_SELF_REVIEW_ENABLED: 'true' });
+    for (const key of Object.keys(env)) if (env[key] === undefined) delete env[key];
+    const execFn = fakeGit(dir);
+    const selfReviewFn = vi.fn(async () => ['file:1 defect']);
+    const spawns = [];
+    try {
+      const report = await codexDirectTask({ dir, task: 'review this', review: true, ephemeral: true, env, execFn, selfReviewFn,
+        spawnFn: fakeCodex(spawns), stream: false, log: () => {} });
+      expect(selfReviewFn).not.toHaveBeenCalled();
+      expect(report.selfReview).toMatchObject({ skipped: true, rounds: 0 });
+      expect(report.gate.ran).toBe(false);
+      expect(spawns).toHaveLength(1);
+      expect(spawns[0]).not.toContain('resume');
+      expect(execFn.mock.calls.some(([bin]) => bin === 'node')).toBe(false);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 

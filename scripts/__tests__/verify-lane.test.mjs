@@ -1748,4 +1748,39 @@ describe('full build gate default', () => {
     expect(explicit.status, explicit.stderr).toBe(0);
     expect(existsSync(join(dir, 'whole-unit-ran'))).toBe(wholeUnit);
   });
+
+  // The full gate is still the DEFAULT gate: its green feeds the ledger, and the marker keeps the diff's changed files.
+  it('a default verify under finalGate=full records the green ledger and the changed files, and is not an explicit gate', () => {
+    const git = (...a) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' });
+    const ledgerDir = mkdtempSync(join(tmpdir(), 'green-ledger-'));
+    try {
+      git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: {
+        'test:unit': `node -e "require('fs').writeFileSync('whole-unit-ran', 'yes')"`,
+        'check:standards': `node -e "require('fs').writeFileSync('standards-ran', 'yes')"`,
+      } }));
+      writeFileSync(join(dir, '.gitignore'), 'whole-unit-ran\nstandards-ran\n');
+      mkdirSync(join(dir, 'scripts', 'lib'), { recursive: true });
+      writeFileSync(join(dir, 'scripts', 'lib', 'zz-full.mjs'), 'export {};\n');
+      git('add', '-A'); git('commit', '-qm', 'full gate fixture');
+      const env = { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_GREEN_LEDGER_DIR: ledgerDir,
+        WE_PLATFORM_PREFERENCES_FILE: join(tmpdir(), 'no-such-platform-preferences.json') };
+      delete env.WE_BUILD_FINAL_GATE;
+      const r = spawnSync('node', [VERIFY_LANE, 'verify', '--json'], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
+      expect(JSON.parse(r.stdout.trim().split('\n').pop()), r.stderr).toMatchObject({ status: 'green' });
+      expect(readFileSync(join(dir, 'whole-unit-ran'), 'utf8')).toBe('yes');
+      const onDisk = JSON.parse(readFileSync(marker(), 'utf8'));
+      expect(onDisk).toMatchObject({ status: 'green', sha: headSha(), suites: 'npm run test:unit && npm run check:standards' });
+      expect(onDisk.phases.changedFileCount).toBe(3);
+      expect(r.stderr).toContain('build.finalGate=full');
+      expect(r.stderr).not.toContain('mode=explicit');
+      expect(JSON.parse(readFileSync(join(ledgerDir, `${headSha()}.json`), 'utf8'))).toMatchObject({ status: 'green', suites: onDisk.suites });
+      // The dispatched child receives that same command back via --gate: still the default gate, not an explicit one.
+      const child = spawnSync('node', [VERIFY_LANE, 'verify', '--json', '--run-id=full-child', `--gate=${onDisk.suites}`], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
+      expect(JSON.parse(child.stdout.trim().split('\n').pop()), child.stderr).toMatchObject({ status: 'green' });
+      expect(child.stderr).toMatch(/selection @ \w+ mode=full reason="build\.finalGate=full[^\n]* files=3/);
+      expect(child.stderr).not.toContain('mode=explicit');
+      expect(child.stderr).not.toContain('whole-gate admission');
+    } finally { rmSync(ledgerDir, { recursive: true, force: true }); }
+  });
 });

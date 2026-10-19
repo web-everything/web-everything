@@ -344,11 +344,23 @@ const SELECTED_TEST_COMMAND = /^npx vitest (?:related|run) /;
 // `run` is the fix / ci-heal reproduce-and-confirm gate (`gateFor`): a card-only PR is CI-red exactly when CI's full
 // check:standards fails on a card, so `run` must execute the real gate. Only the marker-producing modes skip.
 const ALLOW_CARD_ONLY_SKIP = MODE !== 'run';
-const buildPolicy = resolveBuildPolicy({ log: line => process.stderr.write(line + '\n') });
-if (flags.gate === undefined && buildPolicy.finalGate === 'full') {
+resolveBuildPolicy({ log: line => process.stderr.write(line + '\n') });
+// The DEFAULT gate under the build policy. `build.finalGate=full` runs the whole unit tier plus standards, but it is
+// still the default gate, not an explicit `--gate`: its green feeds the ledger, and the marker keeps the diff's
+// changed files for red-cause attribution. It runs no selected-test half (`testCommand`), so no phase, scan or
+// isolated retry built for a selection applies. Any other policy keeps the diff-driven selection.
+function resolveBuildDefaultGate(env) {
+  if (resolveBuildPolicy({ env }).finalGate !== 'full') {
+    return resolveDefaultGate({ runGit: git, env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP, hasGreen });
+  }
   const scripts = readCheckoutScripts();
   const tests = !scripts || scripts.includes('test:unit') ? 'npm run test:unit' : 'npm test';
-  flags.gate = tests + (!scripts || scripts.includes('check:standards') ? ' && npm run check:standards' : '');
+  const command = tests + (!scripts || scripts.includes('check:standards') ? ' && npm run check:standards' : '');
+  let changedFiles = null;
+  try { changedFiles = localChangedSet({ runGit: git })?.changedFiles ?? null; } catch { /* unknown diff: no attribution */ }
+  const reason = 'build.finalGate=full — the whole unit tier plus standards';
+  return { command, gateReasons: [reason], decision: { mode: 'full', reasons: [reason], changedFiles,
+    selectionMode: { mode: 'pr', reason: 'build.finalGate=full' } } };
 }
 let GATE;
 let resolvedGate;
@@ -379,13 +391,13 @@ if (typeof flags.gate === 'string') {
     }
   }
 } else {
-  const resolved = resolveDefaultGate({ runGit: git, env: process.env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP, hasGreen });
+  const resolved = resolveBuildDefaultGate(process.env);
   if (resolved.decision.mode === 'blocked') emit({ sha: headSha, status: 'selection-required', reason: 'local-selection-bound', ok: false, redCause: 'refused', redCauseFiles: [], detail: describeGate(resolved) }, 3);
   GATE = resolved.command;
   resolvedGate = resolved;
   // xpnhz4o — always SAY whether this is a selected run or a full-suite fallback, and why (stderr, so `--json`
   // stdout stays one parseable document).
-  process.stderr.write(describeGate(resolved) + '\n');
+  process.stderr.write((resolved.decision.mode === 'full' ? `verify-lane gate: FULL — ${resolved.decision.reasons[0]}` : describeGate(resolved)) + '\n');
 }
 
 // The dispatcher passes the requested default command back via --gate. Recognize that exact command,
@@ -393,7 +405,7 @@ if (typeof flags.gate === 'string') {
 let admissionFallback = null;
 if (!resolvedGate && typeof flags.gate === 'string') {
   try {
-    const resolveUnder = (env) => resolveDefaultGate({ runGit: git, env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP, hasGreen });
+    const resolveUnder = resolveBuildDefaultGate;
     const resolved = resolveUnder(process.env);
     if (resolved.command === GATE) resolvedGate = resolved;
     // The requester (an agent session, often on an older lane base) resolves its default gate under ITS settings,

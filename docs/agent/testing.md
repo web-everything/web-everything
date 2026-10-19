@@ -1791,14 +1791,27 @@ builder can write its lane's git config, so every self-review diff read uses the
 builder-planted external diff, textconv or fsmonitor command**). A clean filter cannot be switched
 off, so Codex's worktree read refuses a checkout that defines one (**refuses a checkout that defines
 a filter driver before any worktree read runs it**). The reviewer verdict may be bare or in exactly
-one fenced block, with prose around either; anything else is invalid. Notes reach the PR body as a
+one fenced block, with prose around either; anything else is invalid, including a second `findings`
+object outside the chosen fence (**rejects mixed fenced and unfenced verdicts** and its variants).
+Notes reach the PR body as a
 code block, with `<`, `>`, `@`, `#`, `GH-` and `://` swapped for look-alikes: no links, images,
-issue references, mentions or machine markers.
+issue references, mentions or machine markers. A blank or malformed `WE_BUILD_*` value is unset and
+never turns a safeguard off (**%s=%j keeps the standard default**). With default settings a
+Claude-executed delivery self-reviews once instead of running converge and parks `review:pending`
+(**with default build settings, a Claude-executed delivery self-reviews once, skips converge and parks
+review:pending**). A review run never self-reviews, resumes or gates itself (**a review run never
+self-reviews, resumes or gates itself**).
 
 `finalGate` changes the default of every `verify-lane.mjs` mode, including `request` and the
 dispatched verify child, so a lane's marker means the same gate however it was requested. Only
 `full` replaces the default selection; an explicit `--gate` always wins (**finalGate=%s runs the
-whole unit tier only when full**). Briefs that append the checklist (fix, ci-heal, the dispatch
+whole unit tier only when full**). The full gate is still the default gate: its clean green feeds the
+green ledger and the marker keeps the diff's changed files (**a default verify under finalGate=full
+records the green ledger and the changed files**). Codex resolves its gate from the same policy
+(**a real codexDirectTask with WE_BUILD_FINAL_GATE %s runs the policy gate**); `full` and `related`
+need `scripts/verify-lane.mjs`, so a sibling-repo `--dir` without it gets the named failed outcome
+`gate-unavailable` (**%s gate in a checkout without verify-lane is a named unavailable failure**) and
+must pass `--gate=standards` or `--gate=none`. Briefs that append the checklist (fix, ci-heal, the dispatch
 tick, the delivery v2 brief and its resume prompts, Codex) do it through `appendBuildRequirements`,
 which appends it once and never to a brief that already has it (**brief composers carry the
 checklist exactly once**); `worker-brief.mjs` places it inside its own template. Codex callers opt out of self-review with

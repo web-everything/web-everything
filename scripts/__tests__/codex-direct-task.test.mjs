@@ -682,7 +682,8 @@ describe('runGate — none/standards/full, never commits', () => {
 
   it('mode "full" runs verify-lane with the whole unit tier and standards', () => {
     const execFn = vi.fn(() => 'ok');
-    const r = runGate({ dir: '/d', mode: 'full', execFn });
+    // `/d` stands in for a WE checkout, which has scripts/verify-lane.mjs.
+    const r = runGate({ dir: '/d', mode: 'full', execFn, existsFn: () => true });
     expect(r.steps.map((s) => s.cmd)).toEqual(['node scripts/verify-lane.mjs run --gate=npm run test:unit && npm run check:standards']);
   });
 
@@ -691,7 +692,7 @@ describe('runGate — none/standards/full, never commits', () => {
       if (args.some(a => a.includes('check:standards'))) { const e = new Error('exit 1'); e.stdout = 'BAD'; throw e; }
       return 'ok';
     });
-    const r = runGate({ dir: '/d', mode: 'full', execFn });
+    const r = runGate({ dir: '/d', mode: 'full', execFn, existsFn: () => true });
     expect(r.pass).toBe(false);
     expect(r.steps[0].pass).toBe(false);
     expect(r.steps[0].output).toContain('BAD');

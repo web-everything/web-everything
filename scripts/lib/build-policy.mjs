@@ -10,15 +10,18 @@ export function resolveBuildPolicy({ env = process.env, tool, platform, readFile
     try { tool = JSON.parse(readFile(join(HERE, '../settings/build.json'), 'utf8')); }
     catch (e) { if (e.code !== 'ENOENT') throw e; }
   }
-  const bool = v => v === undefined ? undefined : v === 'true' ? true : v === 'false' ? false : v;
+  // A blank env value is unset. Any other text that does not parse stays a string, so the cascade drops it as invalid.
+  const text = v => (v === undefined || !String(v).trim() ? undefined : String(v).trim());
+  const bool = v => { const t = text(v); return t === 'true' ? true : t === 'false' ? false : t; };
+  const int = v => { const t = text(v); return t !== undefined && /^\d+$/.test(t) ? Number(t) : t; };
   platform ??= platformPreference('build', { env });
   const gate = cascadePolicy('build.finalGate', tool?.finalGate, {
     standard: 'full', platform: platform?.finalGate, env,
-    envValues: { '': env.WE_BUILD_FINAL_GATE }, valid: v => ['full', 'related', 'none'].includes(v),
+    envValues: { '': text(env.WE_BUILD_FINAL_GATE) }, valid: v => ['full', 'related', 'none'].includes(v),
   });
   const selfReview = cascadePolicy('build.selfReview', tool?.selfReview, {
     standard: { enabled: true, maxRounds: 2 }, platform: platform?.selfReview, env,
-    envValues: { enabled: bool(env.WE_BUILD_SELF_REVIEW_ENABLED), maxRounds: env.WE_BUILD_SELF_REVIEW_MAX_ROUNDS === undefined ? undefined : Number(env.WE_BUILD_SELF_REVIEW_MAX_ROUNDS) },
+    envValues: { enabled: bool(env.WE_BUILD_SELF_REVIEW_ENABLED), maxRounds: int(env.WE_BUILD_SELF_REVIEW_MAX_ROUNDS) },
     valid: { enabled: v => typeof v === 'boolean', maxRounds: v => Number.isSafeInteger(v) && v >= 0 && v <= 10 },
   });
   const checklist = cascadePolicy('build.reviewerExpectations', tool?.reviewerExpectations, {

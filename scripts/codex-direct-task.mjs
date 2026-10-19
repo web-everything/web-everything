@@ -616,15 +616,22 @@ export function captureDiff({ dir, startSha, execFn = defaultExecFn }) {
  *   - `'standards'`: compatibility alias for standards only.
  *   - `'related'`: diff-selected verify-lane gate.
  *   - `'full'` (default for edit tasks): verify-lane whole unit tier plus standards.
+ * `full` and `related` need this repo's `scripts/verify-lane.mjs`; a checkout without it (a sibling repo's `--dir`)
+ * gets the named failed outcome `unavailable: 'gate-unavailable'`, never a pass.
  * @param {object} opts
  * @param {string} opts.dir
- * @param {'none'|'standards'|'full'} opts.mode
+ * @param {'none'|'standards'|'related'|'full'} opts.mode
  * @param {Function} [opts.execFn]
- * @returns {{ran: boolean, mode: string, steps: {cmd: string, pass: boolean, output: string}[], pass: boolean}}
+ * @param {(path: string) => boolean} [opts.existsFn]
+ * @returns {{ran: boolean, mode: string, steps: {cmd: string, pass: boolean, output: string}[], pass: boolean, unavailable?: string}}
  */
-export function runGate({ dir, mode, execFn = defaultExecFn, env = process.env }) {
+export function runGate({ dir, mode, execFn = defaultExecFn, env = process.env, existsFn = existsSync }) {
   if (mode === 'none' || !mode) return { ran: false, mode: 'none', steps: [], pass: true };
   if (!['full', 'related', 'standards'].includes(mode)) throw new Error('invalid build gate');
+  if (mode !== 'standards' && !existsFn(join(dir, 'scripts', 'verify-lane.mjs'))) {
+    return { ran: false, mode, unavailable: 'gate-unavailable', pass: false, steps: [{ cmd: 'node scripts/verify-lane.mjs', pass: false,
+      output: `gate unavailable: ${mode} needs scripts/verify-lane.mjs, which this checkout does not have; pass --gate=standards or --gate=none for it` }] };
+  }
   const plan = mode === 'full'
     ? [['node', ['scripts/verify-lane.mjs', 'run', '--gate=npm run test:unit && npm run check:standards']]]
     : mode === 'related' ? [['node', ['scripts/verify-lane.mjs', 'run']]]
@@ -887,7 +894,7 @@ export async function codexDirectTask({
   let lastMessage = null;
   try { lastMessage = readFileSync(run.outputLastMessageFile, 'utf8'); } catch { lastMessage = null; }
 
-  let gateResult = review ? runGate({ mode: 'none' }) : runGate({ dir: targetDir, mode: gate, execFn, env });
+  let gateResult = review ? runGate({ mode: 'none' }) : runGate({ dir: targetDir, mode: gate, execFn, env, existsFn });
   const selfReview = !review && run.code === 0 && !run.timedOut && gateResult.pass ? await runBuildSelfReview({
     policy, dir: targetDir, env, ...(selfReviewFn ? { review: selfReviewFn } : {}),
     readDiff: () => boundedSelfReviewDiff(() => captureDiff({ dir: targetDir, startSha, execFn }).diff),
@@ -902,7 +909,7 @@ export async function codexDirectTask({
       summary = summarizeEvents(events);
       try { lastMessage = readFileSync(fixed.outputLastMessageFile, 'utf8'); } catch { lastMessage = null; }
     },
-    gate: () => { gateResult = runGate({ dir: targetDir, mode: gate, execFn, env }); return gateResult.pass; },
+    gate: () => { gateResult = runGate({ dir: targetDir, mode: gate, execFn, env, existsFn }); return gateResult.pass; },
   }) : { skipped: true, rounds: 0, notes: [] };
   const diff = captureDiff({ dir: targetDir, startSha, execFn });
 
