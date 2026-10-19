@@ -84,7 +84,7 @@ import { cascadePolicy } from '../../scripts/lib/policy-cascade.mjs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { hostname } from 'node:os';
-import { runReconcilePass, defaultReadPrs, defaultReadAgents } from '../../scripts/conveyor/reconcile-pass.mjs';
+import { runReconcilePass, defaultReadPrs, defaultReadAgents, isConflictingPr } from '../../scripts/conveyor/reconcile-pass.mjs';
 import { promoteDraftsThenReplan, promoteDraftsGuarded } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
 import { notifyReferralHold } from '../../scripts/conveyor/review-referral-hold.mjs';
 // card x29vm8a — a scope-bloated PR (stale base) is refreshed onto main through the SAME mechanical path the ci-red
@@ -98,6 +98,7 @@ import { parseEscalationReason } from '../../scripts/review-detail.mjs';
 import { dispatchReviewByMode } from '../../scripts/operations/review-job.mjs';
 import { tagReviewRound } from '../../scripts/conveyor/review-round-tag.mjs';
 import { tagReviewStatus } from '../../scripts/conveyor/review-status-tag.mjs';
+import { PR_STATUS_LABEL_RE } from '../../scripts/conveyor/pr-status-label.mjs';
 // #x01u7az — the review-hold reconcile sweep (a stray review:pending beside a live review:human; a stray
 // advisory:* once review:human is cleared) lives here, not only in we:skills-src/conveyor/runner.mjs's own
 // `makeCliMechanicalPasses` (see that file's header: it is NOT itself running — replaced by this daemon and
@@ -350,7 +351,7 @@ export function planRedTeamRequestAction({ request, subject, evidence, setting, 
  * is a real read (`defaultAcquirableLaneCount`, wired in by `buildCliDaemonEffects` for the actual daemon) that
  * this tick caps its own dispatch batch by; it defaults to an unbounded `() => Infinity` here so every
  * pre-existing caller/test of this pure function is unaffected unless it opts in.
- * @returns {{reviewsOwed:number, dispatched:Array<{prNumber:number, agentId:string|null}>, failed:Array<{prNumber:number, error:string}>, refusals:number, reconcileError:string|null, deferredForLanes:number, holdReconcile:Array<object>, holdReconcileError:string|null, operatorHolds:({observedAt:number, holds:Array<{prNumber:number, kind:string}>}|null)}}
+ * @returns {{staleStatusSwept:number[], staleConflictStatusCleared:number[], reviewsOwed:number, dispatched:Array<{prNumber:number, agentId:string|null}>, failed:Array<{prNumber:number, error:string}>, refusals:number, reconcileError:string|null, deferredForLanes:number, holdReconcile:Array<object>, holdReconcileError:string|null, operatorHolds:({observedAt:number, holds:Array<{prNumber:number, kind:string}>}|null)}}
  */
 export function runReviewTick({
   defaultBranch = 'main',
@@ -460,10 +461,49 @@ export function runReviewTick({
   } catch (e) {
     return {
       reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, deferredForLanes: 0,
-      reconcileError: describeReconcileError(e),
+      reconcileError: describeReconcileError(e), staleStatusSwept: [], staleConflictStatusCleared: [],
       holdReconcile: holdReconcileResults, holdReconcileError,
     };
   }
+  // Refresh stale status labels (including legacy status:awaiting-base) before promotion/dispatch
+  // can block the rest of the tick. Still-conflicting PRs stay with the later status pass.
+  const staleStatusSwept = [];
+  const staleConflictStatusCleared = [];
+  const statusPlanRows = [...(plan.dispatch ?? []), ...(plan.refusals ?? []), ...(plan.notes ?? [])];
+  rawPrs = Array.isArray(rawPrs) ? rawPrs.map(prState => {
+    const currentLabels = prState.labels ?? [];
+    const labelNames = currentLabels.map(l => typeof l === 'string' ? l : l?.name);
+    if (!labelNames.some(name => PR_STATUS_LABEL_RE.test(name))
+      || isConflictingPr(prState)) return prState;
+    const pr = Number(prState.number);
+    try {
+      const result = tagStatus({
+        pr, repo, agents: rawAgents ?? undefined, defaultBranch, prState, currentLabels,
+        isDraft: !!prState.isDraft,
+        mergeConflicted: String(prState.mergeStateStatus ?? '').toUpperCase() === 'DIRTY',
+        planRows: statusPlanRows.filter(r => Number(r?.prNumber) === pr),
+      });
+      // The writer returns both label families; carry its result into the later idempotent pass.
+      const removed = new Set(result?.removed ?? []);
+      const labels = currentLabels.filter(l => {
+        const name = typeof l === 'string' ? l : l?.name;
+        return !removed.has(name) && !(result?.prStatus !== undefined && PR_STATUS_LABEL_RE.test(name));
+      });
+      for (const label of [result?.label, result?.prStatus]) {
+        if (label && !labels.some(l => (typeof l === 'string' ? l : l?.name) === label)) labels.push(label);
+      }
+      const nextNames = new Set(labels.map(l => typeof l === 'string' ? l : l?.name));
+      const previousNames = new Set(labelNames);
+      if (nextNames.size !== previousNames.size || labelNames.some(name => !nextNames.has(name))) {
+        staleStatusSwept.push(pr);
+        if (previousNames.has('status:conflict')) staleConflictStatusCleared.push(pr);
+      }
+      return { ...prState, labels };
+    } catch (e) {
+      log(`review-daemon: ${repo}#${pr} status tag failed: ${String(e?.message ?? e).split(/\r?\n/)[0]}`);
+      return prState;
+    }
+  }) : rawPrs;
   // A failed promotion replan keeps the earlier plan, so it is not an authoritative post-promotion snapshot.
   let replanError = null;
   if (typeof promoteDrafts === 'function') {
@@ -683,14 +723,16 @@ export function runReviewTick({
         planRows: rowsByPr.get(Number(c.prNumber)) ?? [],
       });
     }
-    catch { /* cosmetic — see review-status-tag.mjs's own header */ }
+    catch (e) {
+      log(`review-daemon: ${repo}#${c.prNumber} status tag failed: ${String(e?.message ?? e).split(/\r?\n/)[0]}`);
+    }
   }
   return {
     reviewsOwed: reviews.length, dispatched, failed, notStarted, refusals: (plan.refusals ?? []).length,
     pendingNotDispatched: explainPendingNotDispatched({
       prs: rawPrs, plan, dispatchable, deferredForLanes: reviews.slice(dispatchable.length), paused,
     }),
-    reconcileError: null, deferredForLanes, deferredForAuth, operatorHolds,
+    reconcileError: null, deferredForLanes, deferredForAuth, operatorHolds, staleStatusSwept, staleConflictStatusCleared,
     authPaused: paused, authPauseReason: paused ? pauseReason : null,
     holdReconcile: holdReconcileResults, holdReconcileError,
     ...(scopeBloatRefreshed.length ? { scopeBloatRefreshed } : {}),

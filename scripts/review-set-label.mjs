@@ -1,3 +1,4 @@
+import { proveCardUnionOnly, resolveCardUnionCarrySetting } from './lib/card-union-carry.mjs';
 import { RED_TEAM_STATUS_LABELS } from './lib/red-team-status-label-meta.mjs';
 import { readConfirmedBreaks, redTeamRulingNeeded } from './lib/red-team-gate.mjs';
 import { savedRedTeamFallback } from './lib/drain-saved-red-team.mjs';
@@ -1092,6 +1093,8 @@ export function runReviewLabelCli({
   // `--new-head` is the fix: an explicit, caller-asserted override that WINS over the re-read for `restamp`
   // only. Optional and validated here (fail closed on a malformed SHA) so a caller who does not have it yet —
   // there are none in this repo, but nothing stops a future one — still gets the pre-#x9krtkb re-read fallback.
+  const cardUnionAccepted = argv.find(a => a.startsWith('--card-union-accepted='))?.slice('--card-union-accepted='.length);
+  if (cardUnionAccepted !== undefined && (to !== 'restamp' || !/^[0-9a-f]{40}$/.test(cardUnionAccepted))) fail('invalid card-union restamp');
   const newHeadArg = (argv.find((a) => a.startsWith('--new-head=')) || '').slice('--new-head='.length).trim();
   // #xan09na — opt-in head-bound carry. Legacy drain callers remain a separate migration.
   const expectHeadFlag = argv.find((a) => a === '--expect-head' || a.startsWith('--expect-head='));
@@ -1700,9 +1703,23 @@ export function runReviewLabelCli({
 
   // we:scripts/review-set-label.mjs#runReviewLabelCli — render the durable comment ONCE, here, so the bytes
   // that are size-checked, written and posted are the same bytes.
+  // Relaxation #10 never creates acceptance or carries a human clearance without its existing proof.
+  // Re-prove in the sanctioned writer, so the marker cannot be asserted by a caller alone.
+  let cardUnionMarker = '';
+  if (cardUnionAccepted !== undefined) {
+    const record = latestAcceptRecord(fullThread());
+    const unionSetting = resolveCardUnionCarrySetting();
+    const carrySetting = resolveAcceptCarryForward();
+    if (!unionSetting.value || carrySetting.value !== 'on') fail(`card-union carry requires carryAcceptanceOnUnion=true and acceptCarryForward=on (carryAcceptanceOnUnion=${unionSetting.value}; acceptCarryForward=${carrySetting.value})`, 1);
+    if (!record || record.sha !== cardUnionAccepted
+      || record.laterVerdict || record.laterBodyDerivedHold) fail('card-union carry has no standing trusted acceptance', 1);
+    const proof = proveCardUnionOnly({ acceptedHead: cardUnionAccepted, newHead: headSha });
+    if (!proof.ok) fail(`card-union carry unproven: ${proof.reason}`, 1);
+    cardUnionMarker = `\n<!-- carry-relaxation: 10 card-union-only; accepted=${cardUnionAccepted}; head=${headSha} -->`;
+  }
   const commentBody = buildComment({
     to, actor, decision, headSha, reason: clearReason, reviewedDiff, clearerId, independence, humanClearance,
-  }) + renderReferralCarryRecord(referralCarry);
+  }) + renderReferralCarryRecord(referralCarry) + cardUnionMarker;
 
   // we:scripts/review-set-label.mjs#runReviewLabelCli — THE SIZE GUARD, on the RENDERED bytes, before ANY write.
   // GitHub rejects a comment over `GH_COMMENT_MAX`. The cause this guard exists for: an oversize comment used to
@@ -1757,6 +1774,22 @@ export function runReviewLabelCli({
   // construction, not by both happening to be maintained.
   // Re-read BEFORE the first durable write, including the shadow ledger. A replacement
   // verdict/clearance cannot be carried using evidence captured before it arrived.
+  const recheckCardUnionAcceptance = () => {
+    const fresh = provider.readPrState(repo, pr);
+    if (fresh.headRefOid !== headSha || classifyPrLiveness({ state: fresh.state }).outcome !== 'reviewable') throw Error('card-union head or PR state changed');
+    const liveDecision = decideSetLabel({ to: 'restamp', currentLabels: fresh.labels });
+    if (!liveDecision.allowed) throw Error(liveDecision.reason);
+    const comments = provider.readComments(repo, pr);
+    const reviews = provider.readPrReviews(repo, pr);
+    if (!Array.isArray(comments) || !Array.isArray(reviews)) throw Error('card-union thread or reviews unreadable');
+    const record = latestAcceptRecord(comments, reviews);
+    if (!record || record.sha !== cardUnionAccepted || record.laterVerdict || record.laterBodyDerivedHold || record.reviewsUnreadable) throw Error('card-union acceptance superseded or unreadable');
+    assertMandatoryReferralsCleared(fresh, { repo, pr, ...referralOptions });
+  };
+  if (cardUnionAccepted !== undefined) {
+    try { recheckCardUnionAcceptance(); }
+    catch (error) { fail(ghErr(error, 'card-union live state unreadable'), 1); }
+  }
   if (guardedRestamp) {
     try {
       const fresh = provider.readPrState(repo, pr);
@@ -1873,6 +1906,8 @@ export function runReviewLabelCli({
         }
         removals = presentRemoveLabels(decision.removeLabels, fresh.labels);
       }
+      // The ledger and general swap checks can race a revocation after preflight.
+      if (cardUnionAccepted !== undefined) recheckCardUnionAcceptance();
       provider.setLabels(repo, pr, { add: decision.addLabel, remove: removals });
     } catch (e) {
       fail(ghErr(e, 'gh pr edit failed'), 1);

@@ -126,6 +126,7 @@ import { ownerInstallationToken, recoveryPushCredential } from './missing-run-pu
 import { MISSING_RUN_CREDENTIAL_REFUSAL } from './main-red-recovery.mjs';
 import { repoKeyFromRemoteUrl } from './fix-procedure.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
+import { tryCardUnionCarry } from '../lib/card-union-carry.mjs';
 import { loadCardConflictSettings } from '../lib/card-conflict-resolve.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
@@ -1498,6 +1499,7 @@ export function watchParkedPrConflicts({
   computeConflictingPaths = defaultConflictingFilePaths,
   attemptMechanicalRebase = defaultAttemptUnownedConflictRebase,
   attemptCardRebase = defaultAttemptCardConflictRebase,
+  carryCardUnion = tryCardUnionCarry,
   gitCardOnlyRecheck: recheckCardOnly = gitCardOnlyRecheck,
   cardConflictSettings = loadCardConflictSettings(),
   unownedRebaseSettings = loadUnownedRebaseSettings(),
@@ -1586,17 +1588,17 @@ export function watchParkedPrConflicts({
         console.error(`parked-pr-conflict-watch: PR #${pr.number}: card file list unavailable; normal conflict owner required: ${conflictWatchCause(error)}`);
       }
     }
-    if ((isConflicting || plan.newlyResolved) && !cardOnly && cardConflictSettings.value.gitRecheckFiles
+    if ((isConflicting || plan.newlyResolved) && !cardOnly && cardConflictSettings?.value?.gitRecheckFiles
       && pr.baseRefName === 'main' && /^[a-f0-9]{40}$/.test(pr.headRefOid ?? '') && pr.headRefName?.startsWith('lane/')) {
       try {
         if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
         cardOnly = recheckCardOnly({ pr, repo: resolvedRepo }) === true;
       } catch { cardOnly = false; }
-      if (cardOnly) console.error(`parked-pr-conflict-watch: PR #${pr.number}: git recheck proved card-only; cardConflicts.gitRecheckFiles=true (source: ${cardConflictSettings.sources.gitRecheckFiles})`);
+      if (cardOnly) console.error(`parked-pr-conflict-watch: PR #${pr.number}: git recheck proved card-only; cardConflicts.gitRecheckFiles=true (source: ${cardConflictSettings?.sources?.gitRecheckFiles})`);
     }
-    if (isConflicting && cardOnly && cardConflictSettings.value.autoResolveRaisedBy && !dryRun) {
+    if (isConflicting && cardOnly && cardConflictSettings?.value?.autoResolveRaisedBy && !dryRun) {
       const cardEntry = { num: pr.number, isConflicting, ...plan, commented: false,
-        cardConflictSetting: { value: true, source: cardConflictSettings.sources.autoResolveRaisedBy } };
+        cardConflictSetting: { value: true, source: cardConflictSettings?.sources?.autoResolveRaisedBy ?? 'unset' } };
       try {
         if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
         const comments = listPrComments({ number: pr.number, repo: resolvedRepo });
@@ -1618,7 +1620,18 @@ export function watchParkedPrConflicts({
           cardEntry.mechanicalRebase = cardAttempt;
           if (cardAttempt?.action === 'rebased' || cardAttempt?.action === 'current') {
             try {
-              if (rearmIsOwed(pr.labels)) postRearm({ pr, repo: resolvedRepo });
+              const setting = { value: cardConflictSettings?.value?.carryAcceptanceOnUnion === true,
+                source: cardConflictSettings?.sources?.carryAcceptanceOnUnion ?? 'unset' };
+              let carry;
+              try {
+                carry = carryCardUnion({ labels: pr.labels, comments, newHead: cardAttempt.newCommit,
+                  repo: resolvedRepo, pr: pr.number, cwd: REPO_ROOT, setting });
+              } catch (error) {
+                carry = { ok: false, reason: `carry unavailable: ${conflictWatchCause(error)}` };
+              }
+              cardEntry.cardUnionCarry = carry;
+              console.error(`parked-pr-conflict-watch: PR #${pr.number}: cardConflicts.carryAcceptanceOnUnion=${setting.value} (source: ${setting.source}); accepted=${carry.acceptedHead ?? 'unknown'}; head=${cardAttempt.newCommit ?? 'unknown'}; ${carry.ok ? 'RESTAMP' : 'REREVIEW'} ${carry.reason}`);
+              if (!carry.ok && rearmIsOwed(pr.labels)) postRearm({ pr, repo: resolvedRepo });
               provider.setLabels(resolvedRepo, pr.number, { remove: [CONFLICT_LABEL] });
               cardEntry.owner = 'review';
               cardEntry.routedTo = 'card-conflict-resolver';
@@ -1676,7 +1689,7 @@ export function watchParkedPrConflicts({
       && hasReviewLabel(pr?.labels, CONFLICT_LABEL) && !hasReviewLabel(pr?.labels, REVIEW_LABELS.human);
     const entry = { num: pr?.number, isConflicting, ...plan, commented: false, ...cardInfraState,
       ...(cardAttempt ? { mechanicalRebase: cardAttempt } : {}),
-      ...(cardOnly ? { cardConflictSetting: { value: cardConflictSettings.value.autoResolveRaisedBy, source: cardConflictSettings.sources.autoResolveRaisedBy } } : {}) };
+      ...(cardOnly ? { cardConflictSetting: { value: cardConflictSettings?.value?.autoResolveRaisedBy, source: cardConflictSettings?.sources?.autoResolveRaisedBy ?? 'unset' } } : {}) };
     // Keep card attempts visible even when normal routing exits without reporting a change.
     // Routing keeps mutating this same entry; report it only once.
     let reported = false;
@@ -2358,6 +2371,7 @@ if (IS_CLI) {
   } else {
     try {
       const cardConflictSettings = loadCardConflictSettings();
+      writeLineSync(2, `parked-pr-conflict-watch · cardConflicts.carryAcceptanceOnUnion=${cardConflictSettings.value.carryAcceptanceOnUnion} (source: ${cardConflictSettings.sources.carryAcceptanceOnUnion})`);
       writeLineSync(2, `parked-pr-conflict-watch · cardConflicts.autoResolveRaisedBy=${cardConflictSettings.value.autoResolveRaisedBy} (source: ${cardConflictSettings.sources.autoResolveRaisedBy})`);
       let listedPrs = [];
       const unownedRebaseSettings = loadUnownedRebaseSettings();

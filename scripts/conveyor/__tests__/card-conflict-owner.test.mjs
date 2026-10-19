@@ -1,9 +1,10 @@
 // @vitest-environment node
 import { describe, it, expect, vi } from 'vitest';
 import { watchParkedPrConflicts, CONFLICT_LABEL, defaultAttemptCardConflictRebase, gitCardOnlyRecheck } from '../parked-pr-conflict-watch.mjs';
+import { tryCardUnionCarry } from '../../lib/card-union-carry.mjs';
 import { gitRun } from '../../lib/git-run.mjs';
 import { filterFixesByInFlightScope } from '../reconcile-fix-dispatch.mjs';
-import { UNOWNED_REBASE_ATTEMPT_MARKER, UNOWNED_REBASE_ATTEMPT_CAP } from '../unowned-rebase-attempt-count.mjs';
+import { UNOWNED_REBASE_ATTEMPT_MARKER, UNOWNED_REBASE_INFRA_MARKER, UNOWNED_REBASE_ATTEMPT_CAP } from '../unowned-rebase-attempt-count.mjs';
 import { MISSING_RUN_CREDENTIAL_REFUSAL } from '../main-red-recovery.mjs';
 import { mintSessionSlug } from '../session-slug.mjs';
 
@@ -28,7 +29,7 @@ describe('conflicts always have an owner, outside the fixer scope queue for mech
   ('tries the resolver this tick for unowned, parked, already bounced and queued cards: %j', labels => {
     const s = sweep(labels, [cardPath]);
     expect(s.attemptCardRebase).toHaveBeenCalledOnce();
-    expect(s.postRearm).toHaveBeenCalledOnce();
+    expect(s.postRearm).toHaveBeenCalledTimes(labels.includes('review:changes') || labels.includes('review:accepted') ? 1 : 0);
     expect(s.postFinding).not.toHaveBeenCalled();
     expect(s.result[0]).toMatchObject({ routedTo: 'card-conflict-resolver', owner: 'review',
       cardConflictSetting: { value: true, source: 'standard' } });
@@ -38,11 +39,11 @@ describe('conflicts always have an owner, outside the fixer scope queue for mech
     expect(s.attemptCardRebase).toHaveBeenCalledOnce();
     expect(s.postFinding).toHaveBeenCalledOnce();
     expect(s.postRearm).not.toHaveBeenCalled();
-    expect(s.provider.postComment).toHaveBeenCalledWith('o/r', 42, UNOWNED_REBASE_ATTEMPT_MARKER);
+    expect(s.provider.postComment).toHaveBeenCalledWith('o/r', 42, expect.stringContaining(UNOWNED_REBASE_ATTEMPT_MARKER));
   });
-  it('counts error results against the same cap', () => {
+  it('counts error results against the infrastructure cap', () => {
     const s = sweep([], [cardPath], 'error');
-    expect(s.provider.postComment).toHaveBeenCalledWith('o/r', 42, UNOWNED_REBASE_ATTEMPT_MARKER);
+    expect(s.provider.postComment).toHaveBeenCalledWith('o/r', 42, expect.stringContaining(UNOWNED_REBASE_INFRA_MARKER));
   });
   it('non-card owed-elsewhere conflicts are sent to the existing conflict finding/fixer path', () => {
     const s = sweep([], ['scripts/code.mjs']);
@@ -84,9 +85,9 @@ describe('conflicts always have an owner, outside the fixer scope queue for mech
     expect(s.postRearm).not.toHaveBeenCalled();
     expect(s.result[0].owner).toBe('fixer');
   });
-  it('records a thrown rebase attempt under the existing bounded retry marker', () => {
+  it('records a thrown rebase attempt under the infrastructure retry marker', () => {
     const s = sweep([], [cardPath], 'rebased', { attemptCardRebase: () => { throw new Error('git unavailable'); } });
-    expect(s.provider.postComment).toHaveBeenCalledWith('o/r', 42, UNOWNED_REBASE_ATTEMPT_MARKER);
+    expect(s.provider.postComment).toHaveBeenCalledWith('o/r', 42, expect.stringContaining(UNOWNED_REBASE_INFRA_MARKER));
     expect(s.postFinding).toHaveBeenCalledOnce();
   });
   it.each([
@@ -101,7 +102,7 @@ describe('conflicts always have an owner, outside the fixer scope queue for mech
   });
   it('retries rearm after a resolver push and a failed review write', () => {
     const postRearm = vi.fn(() => { throw new Error('write unavailable'); });
-    const s = sweep([], [cardPath], 'rebased', { postRearm });
+    const s = sweep(['review:accepted'], [cardPath], 'rebased', { postRearm });
     expect(s.result[0]).toMatchObject({ owner: 'conflict-watch', routedTo: 'card-conflict-rearm-pending' });
     const retry = sweep([CONFLICT_LABEL, 'review:accepted'], [cardPath], 'current', {
       listPrs: () => [{ ...s.pr, mergeable: 'MERGEABLE', labels: [CONFLICT_LABEL, 'review:accepted'] }],
@@ -232,5 +233,61 @@ describe('git card-only routing recheck', () => {
     const run = runner();
     expect(gitCardOnlyRecheck({ pr, run })).toBe(false);
     expect(run).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('relaxation #10 conflict watch hook', () => {
+  it('treats missing carry settings and sources as off and unset', () => {
+    const carryCardUnion = vi.fn(() => ({ ok: false, reason: 'disabled' }));
+    const s = sweep(['review:accepted'], [cardPath], 'rebased', {
+      cardConflictSettings: { value: { autoResolveRaisedBy: true } }, carryCardUnion,
+    });
+    expect(carryCardUnion).toHaveBeenCalledWith(expect.objectContaining({
+      setting: { value: false, source: 'unset' },
+    }));
+    expect(s.postRearm).toHaveBeenCalledOnce();
+    expect(s.result[0].routedTo).toBe('card-conflict-resolver');
+  });
+
+  it.each(['rebased', 'current'])('falls back to rearm when carry throws after %s', action => {
+    const s = sweep(['review:accepted'], [cardPath], action, {
+      carryCardUnion: () => { throw new Error('carry failed'); },
+    });
+    expect(s.postRearm).toHaveBeenCalledOnce();
+    expect(s.result[0]).toMatchObject({ owner: 'review', routedTo: 'card-conflict-resolver',
+      cardUnionCarry: { ok: false, reason: 'carry unavailable: carry failed' } });
+    expect(s.provider.setLabels).toHaveBeenCalledWith('o/r', 42, { remove: [CONFLICT_LABEL] });
+  });
+
+  it.each(['skip', 'error'])('does not try carry or rearm after resolver %s', action => {
+    const carryCardUnion = vi.fn();
+    const s = sweep([], [cardPath], action, {
+      cardConflictSettings: { value: { autoResolveRaisedBy: true } }, carryCardUnion,
+    });
+    expect(carryCardUnion).not.toHaveBeenCalled();
+    expect(s.postRearm).not.toHaveBeenCalled();
+    expect(s.postFinding).toHaveBeenCalledOnce();
+    expect(s.provider.setLabels).not.toHaveBeenCalledWith('o/r', 42, { remove: [CONFLICT_LABEL] });
+  });
+
+  it.each([
+    [true, true, true, false, 'rebased'],
+    [true, true, true, false, 'current'],
+    [false, true, true, true, 'rebased'],
+    [true, false, true, true, 'rebased'],
+    [true, true, false, true, 'rebased'],
+  ])('setting=%s proof=%s restamp=%s rearm=%s action=%s', (enabled, proven, written, rearmed, action) => {
+    const prove = vi.fn(() => ({ ok: proven, reason: proven ? 'union only' : 'extra prose' }));
+    const restamp = vi.fn(() => ({ ok: written, reason: 'writer refusal' }));
+    const s = sweep(['review:accepted'], [cardPath], action, {
+      cardConflictSettings: { value: { autoResolveRaisedBy: true, carryAcceptanceOnUnion: enabled },
+        sources: { autoResolveRaisedBy: 'standard', carryAcceptanceOnUnion: 'env' } },
+      listPrComments: () => [{ author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${'b'.repeat(40)} -->` }],
+      carryCardUnion: args => tryCardUnionCarry({ ...args, prove, restamp }),
+    });
+    expect(s.postRearm).toHaveBeenCalledTimes(rearmed ? 1 : 0);
+    expect(restamp).toHaveBeenCalledTimes(enabled && proven ? 1 : 0);
+    expect(s.provider.setLabels).toHaveBeenCalledWith('o/r', 42, { remove: [CONFLICT_LABEL] });
   });
 });

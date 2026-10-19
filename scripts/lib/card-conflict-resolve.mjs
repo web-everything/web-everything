@@ -13,9 +13,11 @@ export function loadCardConflictSettings({ env = process.env, platform = platfor
   const value = raw === 'true' || raw === '1' ? true : raw === 'false' || raw === '0' ? false : raw || undefined;
   const recheckRaw = env.WE_CARD_CONFLICTS_GIT_RECHECK_FILES;
   const recheck = recheckRaw === 'true' || recheckRaw === '1' ? true : recheckRaw === 'false' || recheckRaw === '0' ? false : recheckRaw || undefined;
-  return cascadePolicy('cardConflicts', repo, { standard: { autoResolveRaisedBy: true, gitRecheckFiles: true }, platform,
-    envValues: { autoResolveRaisedBy: value, gitRecheckFiles: recheck },
-    valid: { autoResolveRaisedBy: v => typeof v === 'boolean', gitRecheckFiles: v => typeof v === 'boolean' } });
+  const carryRaw = env.WE_CARD_CONFLICTS_CARRY_ACCEPTANCE_ON_UNION;
+  const carry = carryRaw === 'true' || carryRaw === '1' ? true : carryRaw === 'false' || carryRaw === '0' ? false : carryRaw || undefined;
+  return cascadePolicy('cardConflicts', repo, { standard: { autoResolveRaisedBy: true, gitRecheckFiles: true, carryAcceptanceOnUnion: true }, platform,
+    envValues: { autoResolveRaisedBy: value, gitRecheckFiles: recheck, carryAcceptanceOnUnion: carry },
+    valid: { autoResolveRaisedBy: v => typeof v === 'boolean', gitRecheckFiles: v => typeof v === 'boolean', carryAcceptanceOnUnion: v => typeof v === 'boolean' } });
 }
 
 const markers = /^(?:<{7}|={7}|>{7}|\|{7})(?: |$)/m;
@@ -32,7 +34,7 @@ export const CARD_CONFLICT_PRECONDITION_REASONS = Object.freeze([
 const refuse = reason => ({ ok: false, reason });
 
 // Only a single real section, outside fenced examples, can be rebuilt. Its entries may have indented children.
-function section(text) {
+export function section(text) {
   const lines = text.split('\n');
   let offset = 0, start = null, end = text.length, fenced = false;
   for (const line of lines) {
@@ -49,7 +51,7 @@ function section(text) {
   return { start, end, body: text.slice(start, end) };
 }
 
-function entries(body) {
+export function entries(body) {
   const out = [];
   for (const line of body.split('\n')) {
     if (!line.trim()) continue;

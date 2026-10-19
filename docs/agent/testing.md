@@ -2174,3 +2174,17 @@ homes and ledgers, and injected minters. Cover `chalbert/web-everything` via `-R
 paths, and a real temporary clone's SSH origin: each selects the worker installation for
 canonical owner `web-everything`. Run the touched `gh-app-shim`, `github-app-auth-env`,
 `github-app-per-owner-routing`, and `github-auth-policy` suites through heavy admission.
+
+
+## Card union acceptance carry probes
+
+Relaxation #10 uses `scripts/lib/card-union-carry.mjs`: compare each head's net patch
+against its own merge base, validate the resolver's single mention section and entry
+grammar, and normalize references with its existing hash visitor. Keep fixtures for
+main-only list additions, normalized child references, non-list edits, duplicate
+sections, new cards, and non-regular blobs. The conflict watch falls back to re-arm on
+proof or sanctioned writer refusal. `--new-head` and `--expect-head` are mutually
+exclusive in the label writer; the card path uses the existing new-head restamp and
+also checks fresh live state before writing. Catch-up is audit-only: a pending PR is
+refused by `decideSetLabel` with “no review:accepted label — there is no acceptance to
+carry across the rebase”; never manufacture acceptance to get past that refusal.
