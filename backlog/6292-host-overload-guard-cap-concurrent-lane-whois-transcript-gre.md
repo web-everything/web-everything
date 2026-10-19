@@ -2,9 +2,10 @@
 bornAs: xbu87uk
 kind: story
 size: 3
-status: open
+status: resolved
 scope: ["we:scripts/lane-whois.mjs"]
 dateOpened: "2026-10-18"
+dateResolved: "2026-10-18"
 tags: []
 ---
 
