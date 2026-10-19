@@ -1,5 +1,8 @@
 /** Fresh, daemon-owned evidence for the repair push fence; never reads scope from the fixer's working tree. */
 import { execFileSync } from 'node:child_process';
+import { readdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { laneRefItemNum } from './lease-reaper.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { defaultLoadItems, findItem } from '../operations/dispatch-lane-io.mjs';
 import { planFixesFromReconcile, fetchPrDiffScope, fetchPrDiffPaths, fetchCardScopeAtRef } from './reconcile-fix-dispatch.mjs';
@@ -208,6 +211,13 @@ export function createScopeFencedPush({ root, exec = execFileSync, env = process
         let items;
         try { items = loadItems(); } catch (e) { throw new Error(`backlog unreadable: ${inertText(e?.message)}`); }
         if (!Array.isArray(items)) throw new Error('backlog unreadable: the loader returned no item list');
+        // The loader skips a card whose frontmatter does not parse; that card is unreadable, not absent.
+        const itemNum = laneRefItemNum(view.headRefName);
+        if (itemNum && !findItem(itemNum, () => items)) {
+          let cards;
+          try { cards = readdirSync(env.WE_BACKLOG_DIR || join(root, 'backlog')); } catch (e) { if (e?.code !== 'ENOENT') throw new Error(`backlog unreadable: ${inertText(e?.message)}`); }
+          if (cards?.some(f => f.startsWith(`${itemNum}-`) && f.endsWith('.md'))) throw new Error(`backlog unreadable: card ${inertText(itemNum)} exists but the loader skipped it`);
+        }
         const options = { root, repo, exec };
         const result = planFixesFromReconcile([{ kind: 'fix', prNumber: pr, ...view }], findItem,
           () => items, n => fetchPrDiffScope(n, options), key,

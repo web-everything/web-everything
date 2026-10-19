@@ -306,12 +306,12 @@ describe('the live scope fence adapter over a real repository', () => {
   }
   /** The live adapter against a fake GitHub: the PR head and base, one marker commit, and the compare verdict for a merged commit. */
   function liveFence(repo, { head, sha, base = null, compare = 'ahead', port = repo.port, scoped = 'guard.mjs', fork = '',
-    loadItems = () => [{ num: '5957', slug: 'leading-cd', scope: ['we:guard.mjs'] }] }) {
+    loadItems = () => [{ num: '5957', slug: 'leading-cd', scope: ['we:guard.mjs'] }], headRefName = 'lane/scope-fence', root = '.' }) {
     const writes = [], compares = [];
     const exec = (file, args) => {
       expect(file).toBe('gh');
       if (args.includes('.merge_base_commit.sha')) return `${fork}\n`;
-      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefName: 'lane/scope-fence', headRefOid: head, baseRefOid: base });
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefName, headRefOid: head, baseRefOid: base });
       if (args[0] === 'api' && args[1] === 'graphql') return `1\n${head}\tremoval\\n\\nscope-removed: cdLandings\n`;
       if (args[0] === 'api' && /\/compare\//.test(args[1])) {
         compares.push(args[1]);
@@ -323,7 +323,7 @@ describe('the live scope fence adapter over a real repository', () => {
       if (args[0] === 'pr' && args[1] === 'diff') return `${scoped}\n`;
       writes.push(args); return '';
     };
-    const fence = createScopeFencedPush({ root: '.', exec, env: { WE_FIX_SCOPE_FENCE_MODE: 'stand-down' }, log: () => {},
+    const fence = createScopeFencedPush({ root, exec, env: { WE_FIX_SCOPE_FENCE_MODE: 'stand-down' }, log: () => {},
       loadItems, readComments: () => [] });
     const push = vi.fn(() => ({ ok: true }));
     return { result: fence({ repo: 'web-everything/web-everything', pr: 5403, sha, git: port, push }), push, writes, compares };
@@ -372,6 +372,19 @@ describe('the live scope fence adapter over a real repository', () => {
         expect(push).not.toHaveBeenCalled();
       }
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+  it('withholds the push when the backlog loader skipped the PR card as malformed instead of treating it as absent', () => {
+    const r = realRepo();
+    const root = mkdtempSync(join(tmpdir(), 'fix-scope-fence-backlog-'));
+    try {
+      mkdirSync(join(root, 'backlog')); writeFileSync(join(root, 'backlog', '5957-leading-cd.md'), '---\nscope: [unclosed\n---\n');
+      r.write('guard.mjs', 'safe();\n'); r.write('outside.mjs', 'o();\n'); const head = r.commit('initial');
+      r.write('outside.mjs', 'changed();\n'); const sha = r.commit('fixer edits a file only the PR diff names');
+      const { result, push } = liveFence(r, { head, sha, scoped: 'outside.mjs', loadItems: () => [], headRefName: 'lane/5957-leading-cd', root });
+      expect(result.ok).toBe(false);
+      expect(result.reason).toMatch(/backlog unreadable: card 5957 exists but the loader skipped it/);
+      expect(push).not.toHaveBeenCalled();
+    } finally { rmSync(r.dir, { recursive: true, force: true }); rmSync(root, { recursive: true, force: true }); }
   });
   it('keeps an extensionless file scope a FILE scope when the fixer replaces that file with an undeclared subtree', () => {
     const r = realRepo();
