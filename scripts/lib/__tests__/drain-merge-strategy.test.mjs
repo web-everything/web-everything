@@ -25,7 +25,7 @@ const policyOf = (strategy) => ({ policy: resolveMergeDeliveryPolicy({ tool: str
 
 const DRAIN = 'drain-bot';
 
-function harness({ resolveRealFiles, priorityReserve, reservePath, strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = { ...process.env, WE_RED_TEAM_TIMING: 'post-accept' }, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, readReviewAgents = () => [], baseTip = () => BASE_TIP } = {}) {
+function harness({ gitExec, resolveRealFiles, priorityReserve, reservePath, strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = { ...process.env, WE_RED_TEAM_TIMING: 'post-accept' }, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, readReviewAgents = () => [], baseTip = () => BASE_TIP } = {}) {
   const calls = [];
   const logs = [];
   let stored = initial;
@@ -33,6 +33,7 @@ function harness({ resolveRealFiles, priorityReserve, reservePath, strategy = nu
   let removed = false;
   const exec = (cmd, args, opts) => {
     calls.push([cmd, ...args]);
+    if (cmd === 'git' && gitExec) return gitExec(args, opts);
     if (args.includes('--slurp')) {
       // Exercise Node's real output-buffer limit for the oversized-thread regression.
       const out = JSON.stringify([liveComments ?? ghView[args[2]]?.comments ?? []]);
@@ -2053,5 +2054,59 @@ describe('priority file reservations', () => {
     stamp(h);
     expect(h.s.priorityReserveHold(c, HEAD)).toBeNull();
     expect(h.calls).toEqual([]);
+  });
+});
+
+
+describe('card-only restamped head with no review run', () => {
+  const candidate = { num: 42, repo: null, headRef: 'lane/restamped', baseRefName: 'main' };
+  const evidence = { loopPayload: null, scheduled: true, recorded: false, attempted: false, inFlight: false, queued: false };
+  const setup = (files, failure, over = {}) => harness({
+    strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], evidence,
+    env: { WE_RED_TEAM_TIMING: 'post-accept', WE_DRAIN_ENQUEUE_WHEN_RED_TEAM_NEVER_SCHEDULED: 'false' },
+    now: () => 1000,
+    initial: { pending: [], followedUp: [], redTeamPending: { 'cwd#42': {
+      headSha: HEAD, firstPendingAt: 0, retryAt: 0, requestedAt: 0,
+      reason: 'post-accept red team has no recorded result on the live head',
+    } } },
+    gitExec: args => {
+      if (args[0] === 'remote') return 'https://github.com/web-everything/web-everything.git\n';
+      if (args[0] === 'fetch') {
+        if (failure === 'exit' && args.includes('--no-tags')) throw Object.assign(new Error('fetch failed'), { status: 1 });
+        return '';
+      }
+      if (args[0] === 'rev-parse') return `${args[1] === 'FETCH_HEAD' ? (failure === 'head' ? 'c'.repeat(40) : HEAD) : BASE_TIP}\n`;
+      if (args[0] === 'ls-remote') return `${BASE_TIP}\t${args.at(-1)}\n`;
+      if (args[0] === 'diff') return files.map(f => `${f}\0`).join('');
+      if (args[0] === 'cat-file') return '';
+      throw new Error(`unexpected git ${args.join(' ')}`);
+    },
+    ...over,
+  });
+  it.each(['enqueue', 'prestage'])('%s exempts only verified non-empty card diffs', method => {
+    for (const [files, failure, exempt] of [
+      [['backlog/123-card.md'], null, true],
+      [['backlog/123-card.md', 'scripts/x.mjs'], null, false],
+      [['backlog/123-card.md'], 'exit', false],
+      [['backlog/123-card.md'], 'head', false],
+      [[], null, false],
+    ]) {
+      const h = setup(files, failure);
+      const result = h.s[method](candidate, HEAD);
+      if (method === 'prestage') {
+        expect(result.allowed).toBe(exempt);
+        if (!exempt) expect(result.reason).toBe('post-accept red team has no recorded result on the live head');
+      } else if (exempt) expect(result).toMatchObject({ enqueued: true });
+      else expect(result).toMatchObject({ enqueued: false, kind: 'red-team-pending',
+        reason: 'post-accept red team has no recorded result on the live head' });
+    }
+  });
+  it.each([
+    { recorded: true }, { attempted: true }, { inFlight: true }, { queued: true },
+    { loopPayload: { findings: { read: { netBasis: { rev: HEAD.toUpperCase() } } } } },
+  ])('does not fetch real files when existing evidence rules out the exemption: %j', over => {
+    const h = setup(['backlog/123-card.md'], null, { evidence: { ...evidence, ...over } });
+    expect(h.s.enqueue(candidate, HEAD)).toMatchObject({ kind: 'red-team-pending' });
+    expect(h.calls.some(call => call[0] === 'git')).toBe(false);
   });
 });

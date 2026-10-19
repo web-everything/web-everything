@@ -35,7 +35,7 @@ export function postAcceptRedTeamOwed(loopPayload, env = process.env, evidence =
     evidence: { ...evidence, scheduled: evidence.scheduled || panel }, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly });
 }
 
-export function redTeamEnqueueHold({ loopPayload, comments, repo, pr, head, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false, attempted = false, requestPending = false, skipCardOnly } = {}) {
+export function redTeamEnqueueHold({ loopPayload, comments, repo, pr, head, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false, attempted = false, requestPending = false, skipCardOnly, realFilesCardOnly = false, queued = false } = {}) {
   // A recorded break still holds even if the scheduler is now disabled or the payload is unavailable.
   let disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks });
   if (!disposition.result) {
@@ -46,6 +46,8 @@ export function redTeamEnqueueHold({ loopPayload, comments, repo, pr, head, env 
     return 'post-accept red team confirmed a break requiring send-back';
   if (disposition.result?.recheckIncomplete) return 'post-accept red team pending: saved red-team re-check incomplete';
   if (disposition.result) return null;
+  if (realFilesCardOnly === true && !inFlight && !recorded && !attempted && !queued
+    && loopPayload?.findings?.read?.netBasis?.rev?.toLowerCase() !== head?.toLowerCase()) return null;
   if (!requestPending && !postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded, attempted, skipCardOnly })) return null;
   return 'post-accept red team has no recorded result on the live head';
 }

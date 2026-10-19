@@ -53,7 +53,8 @@ import { getRequiredStatusChecks } from './required-status-checks.mjs';
 import { readSettings } from './settings-files.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { queueFileOverlap, readQueueEntryFiles, completeListedFiles } from './queue-file-overlap.mjs';
-import { resolveRealFiles as defaultResolveRealFiles } from './pr-real-files.mjs';
+import { gitRealFiles, resolveRealFiles as defaultResolveRealFiles } from './pr-real-files.mjs';
+import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { createAdaptiveBatching, readQueueFacts } from './merge-queue-adaptive-batching.mjs';
 import { activeReserveBlockers, isPriorityLabels, readReserves, writeReserves } from './priority-reserve.mjs';
 import { cancelObsoleteQueueRuns } from './merge-queue-obsolete-runs.mjs';
@@ -360,6 +361,15 @@ export function createDrainMergeStrategy({
       return { status: 0, stdout: exec(cmd, args, { ...options, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) };
     } catch (e) { return { status: e.status ?? 1, stdout: e.stdout ?? '', stderr: e.stderr ?? '' }; }
   };
+  const restampCardOnly = (c, headSha, evidence) => {
+    if (evidence.recorded || evidence.attempted || evidence.inFlight || evidence.queued
+      || evidence.loopPayload?.findings?.read?.netBasis?.rev?.toLowerCase() === headSha.toLowerCase()) return false;
+    try {
+      const files = gitRealFiles({ pr: { headRefName: c.headRef, baseRefName: c.baseRefName || 'main', headRefOid: headSha },
+        repo: slugOf(c.repo), cwd, run: realFilesRun });
+      return Array.isArray(files) && files.length > 0 && isCardOnlyDiff(files);
+    } catch { return false; }
+  };
   // One log budget covers candidate and queue resolutions for an admission decision.
   const realFilesOf = ({ num, repo, view }, decision) => {
     const ghFiles = view.files;
@@ -423,7 +433,7 @@ export function createDrainMergeStrategy({
   };
   // Preserve producer evidence (including skipCardOnly) and request state for every admission reason.
   const enqueueRedTeamReason = (c, headSha, evidence, comments, requestPending) => redTeamEnqueueHold({
-    ...evidence, requestPending, comments, repo: slugOf(c.repo), pr: c.num, head: headSha, env,
+    ...evidence, realFilesCardOnly: restampCardOnly(c, headSha, evidence), requestPending, comments, repo: slugOf(c.repo), pr: c.num, head: headSha, env,
   });
   const reserveRedTeamReason = (c, headSha, live) => {
     const evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env });
@@ -571,7 +581,7 @@ export function createDrainMergeStrategy({
         const comments = pages.flat();
         if (!safety.value.waitForRedTeamBeforeEnqueue) return { allowed: true, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
         const evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env });
-        const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, env });
+        const reason = redTeamEnqueueHold({ ...evidence, realFilesCardOnly: restampCardOnly(c, headSha, evidence), comments: pages.flat(), pr: c.num, head: headSha, env });
         return { allowed: !reason, reason, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
       } catch { return { allowed: false, reason: 'red-team evidence unreadable' }; }
     },

@@ -367,3 +367,23 @@ describe('queue file overlap card policy', () => {
     expect(invalid.invalid).toHaveLength(2);
   });
 });
+
+
+describe('card-only restamped head without a review run', () => {
+  it('exempts verified card files even with a pending request', () => {
+    expect(hold({ loopPayload: null, requestPending: true, realFilesCardOnly: true })).toBeNull();
+    expect(hold({ loopPayload: null, requestPending: true, realFilesCardOnly: false })).toMatch(/no recorded result/);
+    expect(hold({ loopPayload: { findings: { read: { netBasis: { rev: prior } } } }, requestPending: true, realFilesCardOnly: true })).toBeNull();
+  });
+  it.each(['recorded', 'inFlight', 'attempted', 'queued'])('preserves %s work', flag => {
+    expect(hold({ loopPayload: null, requestPending: true, realFilesCardOnly: true, [flag]: true })).toMatch(/no recorded result/);
+  });
+  it('preserves a review for this head, including uppercase revisions', () => {
+    expect(hold({ loopPayload: { findings: { read: { netBasis: { rev: head.toUpperCase() } } } },
+      requestPending: true, realFilesCardOnly: true })).toMatch(/no recorded result/);
+  });
+  it('preserves a recorded send-back before applying the exemption', () => {
+    expect(hold({ loopPayload: null, requestPending: true, realFilesCardOnly: true,
+      comments: [clean(head, 'web-everything', broken), gate(head, 'sent-back')] })).toMatch(/requiring send-back/);
+  });
+});
