@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { readMainFixPriority } from '../../scripts/lib/merge-queue-hook.mjs';
+import { repoKeyFromSlug } from '../../scripts/readiness/lane-manifest.mjs';
 import { redTeamEnabled } from '../../scripts/lib/review-red-team-policy.mjs';
 import { readDrainRedTeamRequests, finishDrainRedTeamRequest } from '../../scripts/lib/drain-red-team-requests.mjs';
 import { withReviewFetchTick } from '../../scripts/lib/review-fetch.mjs';
@@ -401,6 +403,7 @@ export function runReviewTick({
   readReviewEvidence = null,
   redTeamTimingSetting = readRedTeamTiming,
   log = () => {},
+  readMainFixPr = readMainFixPriority,
   finishRedTeamRequest = finishDrainRedTeamRequest,
   // Clock for the operator-hold snapshot's `observedAt` (injectable so tests stay deterministic).
   now = Date.now,
@@ -501,7 +504,13 @@ export function runReviewTick({
       ...(plan.dispatch ?? [])].map(d => Number(d.prNumber)));
     const setting = readReviewEvidence ? redTeamTimingSetting() : null;
     if (setting) log(`review-daemon: redTeam.carriedAcceptTriggersReview=${setting.value.carriedAcceptTriggersReview} (source: ${setting.sources.carriedAcceptTriggersReview})`);
-    for (const request of readRedTeamRequests()) {
+    let mainFix = null;
+    try { mainFix = readMainFixPr(); } catch { /* unreadable priority grants no preference */ }
+    const ownsFix = request => !!mainFix && (mainFix.repo ?? 'we') === repoKeyFromSlug(request.repo)
+      && [mainFix.pr, ...(mainFix.prs || [])].includes(request.pr);
+    const requests = [...readRedTeamRequests()].sort((a, b) => Number(ownsFix(b)) - Number(ownsFix(a)));
+    const fixReviews = [];
+    for (const request of requests) {
       if (request.repo.toLowerCase() !== repo.toLowerCase()) continue;
       const subject = rawPrs.find(p => Number(p.number) === request.pr);
       if (subject?.headRefOid && subject.headRefOid.toLowerCase() !== request.head.toLowerCase()) {
@@ -535,11 +544,12 @@ export function runReviewTick({
           continue;
         }
       }
-      reviews.push(freshReview
+      (ownsFix(request) ? fixReviews : reviews).push(freshReview
         ? { kind: 'review', prNumber: request.pr, attempts, carriedAcceptHead: request.head }
         : { kind: 'review', prNumber: request.pr, redTeamRequest: request });
       blocked.add(request.pr);
     }
+    reviews.unshift(...fixReviews);
   }
   // Live-caught 2026-09-22, #xli631k: a PR that moved to being owed a FIX (not a review) used to never
   // reach `statusCandidates` at all, so its `review-status:reviewing` label sat stale once its review

@@ -1939,3 +1939,18 @@ it('passes live PR context to paused-review recovery and raises without re-armin
     expect(subject.labels).toEqual([{ name: 'review:human' }]);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+it.each(['allowed', 'refused', 'foreign', 'unreadable'])('main-fix red-team request takes the first lane (%s)', mode => {
+  const repo = CONSTELLATION_REPOS.we?.slug ?? 'web-everything/web-everything';
+  const requests = [43, 42].map(pr => ({ repo, pr, head: 'b'.repeat(40) }));
+  const dispatch = vi.fn(() => ({ mode: 'job', jobPid: 123 }));
+  runReviewTick({ repo,
+    readMainFixPr: () => { if (mode === 'unreadable') throw Error('unreadable'); return { repo: mode === 'foreign' ? 'fui' : 'we', pr: 42 }; },
+    reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 44 }], refusals: mode === 'refused' ? [{ prNumber: 42, kind: 'live-process' }] : [] }),
+    readPrs: () => requests.map(r => ({ number: r.pr, headRefOid: r.head, labels: ['review:accepted', 'ready-to-merge'] })),
+    readAgents: () => [], readRedTeamRequests: () => requests, acquirableLanes: () => 1,
+    dispatch, tagRound: () => {}, tagStatus: () => {},
+  });
+  expect(dispatch).toHaveBeenCalledTimes(1);
+  expect(dispatch.mock.calls[0][0].pr).toBe(mode === 'allowed' ? 42 : 44);
+});
