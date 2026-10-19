@@ -109,6 +109,7 @@ async function defaultListInstallationRepos(token, fetchImpl = fetch) {
 /** Refresh this long before the real 1-hour expiry — generous enough that a slow mint, a daemon restart
  *  mid-refresh, or plain clock skew never leaves a consumer holding a token GitHub has already rejected. */
 export const REFRESH_BUFFER_MS = 10 * 60 * 1000;
+export const DAEMON_REFRESH_BUFFER_MS = 30 * 60 * 1000;
 
 /** One shared cache, not per-daemon — the review daemon, the fix-dispatch daemon and the drain all draw
  *  from the SAME installation, so one fresh token serves all of them; minting three independent tokens for
@@ -390,6 +391,8 @@ export async function ensureFreshGithubAppEnv({
   readKeyRef = readPrivateKeyRef,
   canReadKeyRef = mint === mintInstallationToken ? (ref) => canReadPrivateKeyRef(ref) : () => true,
 } = {}) {
+  if (daemon) env.WE_GH_DAEMON_CALLER = caller;
+  const bufferMs = daemon ? DAEMON_REFRESH_BUFFER_MS : REFRESH_BUFFER_MS;
   const recordCaller = (result, extra = {}) => {
     writeCallerStatus(callerStatusFile(callerStatusDir, caller), { caller, daemon, ...result, ...extra, checkedAt: new Date(now).toISOString() });
   };
@@ -439,12 +442,12 @@ export async function ensureFreshGithubAppEnv({
 
   // ONE App, end to end: cached-or-minted token, access check, per-owner caches, then GH_TOKEN or the shim.
   // Returns the outcome WITHOUT recording it; the caller records (today's App) or falls through (a role App).
-  const attempt = async ({ appId, installationId, privateKeyPath, keyRef, installations, cachePath: candCache, required: candRequired }) => {
+  const attempt = async ({ appId, installationId, privateKeyPath, keyRef, installations, cachePath: candCache, required: candRequired }, { cacheOnly = false } = {}) => {
     const config = { appId, installationId, privateKeyPath };
     const keyOpts = keyRef?.keychain ? { readKey: () => readKeyRef(keyRef) } : {};
     let cached = readCache(candCache);
     let source = 'cache';
-    if (!isCacheFresh(cached, now) || typeof cached.token !== 'string' || !cached.token || cached.installationId !== config.installationId || cached.appId !== config.appId) {
+    if (!isCacheFresh(cached, now, bufferMs) || typeof cached.token !== 'string' || !cached.token || cached.installationId !== config.installationId || cached.appId !== config.appId) {
       source = 'mint';
       if (!(keyRef?.keychain ? canReadKeyRef(keyRef) : canReadKey(config.privateKeyPath))) {
         const keyDiag = { state: 'half', missing: [], keyUnreadable: true };
@@ -518,7 +521,7 @@ export async function ensureFreshGithubAppEnv({
     // mapped installation in its own cache file, which the gh shim picks by the target repo's owner.
     // Best-effort: a failure here never affects the primary token applied below.
     if (extraInstallations && !perOwner && Object.values(installations).includes(String(config.installationId))) {
-      await ensurePerInstallationCaches({ config, primary: cached, env, cachePath: candCache, now, readCache, writeCache, mint, log, installations, mintExtra: keyOpts });
+      await ensurePerInstallationCaches({ config, primary: cached, env, cachePath: candCache, now, readCache, writeCache, mint, log, installations, mintExtra: keyOpts, bufferMs });
     }
 
     // MULTI-REPO CALLERS (the drain sweeps web-everything + frontier-ui + plateauapp in one process): one pinned
@@ -533,7 +536,8 @@ export async function ensureFreshGithubAppEnv({
         return ({ applied: false, reason: 'owner-map-missing' });
       }
       // The per-owner caches must be fresh for EVERY owner even when the primary came from the cache.
-      await ensurePerInstallationCaches({ config, primary: cached, env, cachePath: candCache, now, readCache, writeCache, mint, log, installations, mintExtra: keyOpts });
+      await ensurePerInstallationCaches({ config, primary: cached, env, cachePath: candCache, now, readCache, writeCache, mint, log, installations, mintExtra: keyOpts, bufferMs });
+      if (cacheOnly) return { applied: true, reason: 'ok' };
       let shim;
       try { shim = await installShim(env, { cachePath, identity }); } catch (e) { shim = { ok: false, reason: String((e && e.message) || e) }; }
       if (!shim || !shim.ok) {
@@ -543,6 +547,7 @@ export async function ensureFreshGithubAppEnv({
       return ({ applied: true, reason: 'ok', perOwner: true });
     }
 
+    if (cacheOnly) return { applied: true, reason: 'ok' };
     setEnv(cached.token);
     // Bind provenance to the credential actually applied; inherited metadata cannot label a fallback token.
     env.WE_GH_AUTH_SOURCE = source;
@@ -557,7 +562,16 @@ export async function ensureFreshGithubAppEnv({
     if (!readable) { fallbackFrom.push({ role: cand.role, reason: 'key-unreadable' }); continue; }
     const { [LOCAL_RESULT]: _local, ...r } = await attempt(cand);
     // A role App's outcome goes to the caller file only: the shared status file reports today's installation.
-    if (r.applied) return record(withRole({ ...r, appId: cand.appId }, cand.role), { shared: false });
+    if (r.applied) {
+      // Keep the last App in the shim's fallback chain alive without applying its identity.
+      try {
+        const legacy = resolveGithubAppEnvConfig(env);
+        if (legacy && canReadKey(legacy.privateKeyPath)) {
+          await attempt(chain.candidates.at(-1), { cacheOnly: true });
+        }
+      } catch { /* best-effort: never replace the selected role's outcome */ }
+      return record(withRole({ ...r, appId: cand.appId }, cand.role), { shared: false });
+    }
     fallbackFrom.push({ role: cand.role, reason: r.reason, ...(r.missingPermissions?.length ? { missingPermissions: r.missingPermissions } : {}) });
   }
 
@@ -622,7 +636,7 @@ async function defaultInstallOwnerShim(env, { cachePath, identity }) {
  * Keep one fresh token cache per mapped installation (`web-everything.<installationId>.json` beside the legacy
  * cache). The primary installation's already-fresh token is reused, not re-minted. Never throws.
  */
-export async function ensurePerInstallationCaches({ config, primary, env, cachePath, now, readCache, writeCache, mint, log, installations = installationMap(env), mintExtra = {} }) {
+export async function ensurePerInstallationCaches({ config, primary, env, cachePath, now, readCache, writeCache, mint, log, installations = installationMap(env), mintExtra = {}, bufferMs = REFRESH_BUFFER_MS }) {
   const done = {};
   const entries = Object.entries(installations);
   for (const [owner, installationId] of entries) {
@@ -635,7 +649,7 @@ export async function ensurePerInstallationCaches({ config, primary, env, cacheP
         continue;
       }
       const have = readCache(path);
-      if (isCacheFresh(have, now) && have.token && String(have.installationId) === String(installationId) && have.appId === config.appId) continue;
+      if (isCacheFresh(have, now, bufferMs) && have.token && String(have.installationId) === String(installationId) && have.appId === config.appId) continue;
       const minted = await mint({ appId: config.appId, installationId, privateKeyPath: config.privateKeyPath, now, ...mintExtra });
       writeCache(path, { v: CACHE_VERSION, appId: config.appId, installationId: String(installationId), token: minted.token, expiresAt: minted.expiresAt });
     } catch (e) {
