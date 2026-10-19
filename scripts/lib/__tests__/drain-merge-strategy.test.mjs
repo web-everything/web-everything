@@ -970,13 +970,13 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
     expect(requests).toHaveLength(run.status ? 1 : 0);
   });
-  it('keeps an errored card-only run held even without a seat row', () => {
+  it('releases an errored card-only attempt without a seat row when the producer skips cards', () => {
     const { first, second, requests } = erroredRunAfterDeadline({
       status: { status: 'finished', result: { status: 'error' } },
       read: { netChangedFiles: ['backlog/123-card.md'] },
     });
-    expect(first).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
-    expect(second).toMatchObject({ enqueued: false, kind: 'red-team-pending', healthSmell: true });
+    expect(first).toMatchObject({ enqueued: true });
+    expect(second).toMatchObject({ enqueued: true });
     expect(requests).toHaveLength(0);
   });
   it('honors the fallback switch and logs its source', () => {

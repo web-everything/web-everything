@@ -953,7 +953,8 @@ export function runApprovalPreventionFiling({
       // Where a landing job that fails after spawning posts its retraction (`fileApprovalPreventionCard`).
       retractTo: { repo, pr, headSha },
     });
-  if (filed.skipped || !filed.ok) {
+  const owed = filed.step === 'paused' && filed.skipped === true;
+  if (!owed && (filed.skipped || !filed.ok)) {
     process.stderr.write(
       `review-set-label: approval-time prevention filing for ${subject} FAILED (the approval above already `
       + `landed and is UNAFFECTED) — ${filed.error ?? filed.reason}\n`,
@@ -965,19 +966,19 @@ export function runApprovalPreventionFiling({
   // already reached this checkout); the ordinary path spawns a detached landing job (see
   // `fileApprovalPreventionCard`) and knows only that job's `pid:<n>` handle at comment-post time. Either
   // phrasing records a real, checkable fact — never a guess at a number that does not exist yet.
-  const landedDesc = filed.rel
+  const landedDesc = owed ? 'recorded, owed; filing paused and will resume automatically' : filed.rel
     ? `${filed.rel} (#${filed.num ?? '?'})`
     : `queued for landing via a lane (tracking ${filed.handle ?? 'an untracked job'})`;
   // The job marker lets a landing job that later FAILS retract exactly this marker (see
   // `buildApprovalPreventionJobMarker`), so the next approval on this head files again.
   const jobMarker = filed.session ? buildApprovalPreventionJobMarker(filed.session) : '';
-  const noteBody = `${marker}${jobMarker ? ` ${jobMarker}` : ''}\nFiled the prevention guard(s) owed by ${subject}'s independent review, `
+  const noteBody = `${marker}${jobMarker ? ` ${jobMarker}` : ''}\n${owed ? 'Recorded the prevention filing' : 'Filed the prevention guard(s)'} owed by ${subject}'s independent review, `
     + `mechanically, on approval (operator rule, 2026-09-27) — ${landedDesc}.`;
   try {
     provider.postComment(repo, pr, noteBody);
   } catch (e) {
     process.stderr.write(
-      `review-set-label: ${subject}'s approval-time prevention card ${filed.rel ?? filed.handle ?? filed.num} filed OK, but its `
+      `review-set-label: ${subject}'s approval-time prevention ${owed ? 'filing recorded as owed' : `card ${filed.rel ?? filed.handle ?? filed.num} filed OK`}, but its `
       + `marker comment failed to post (a LATER run may attempt to re-file) — ${ghErr(e, String(e))}\n`,
     );
   }
