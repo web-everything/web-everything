@@ -213,8 +213,8 @@ export const RED_TEAM_GATE_MARKER = '<!-- we:red-team-gate';
 /**
  * What the gate records per head, one comment per ACTION so a failed action stays retryable on its own:
  * the send-back step records `sent-back`, or `round-cap` (the cap is reached or the round could not be read; the
- * operator rules instead); the card step records `card-queued`, and only after the landing job was really spawned
- * (a spawn is all the shared seam reports: whether the detached job later lands the card is that job's own concern).
+ * operator rules instead); the card step records `card-queued` after a durable owed filing or a spawned landing job
+ * (for a spawn, the shared seam reports only that it started; the detached job owns the later landing).
  * `no-send-back` is only ever a RESULT label (nothing to send back); it is never recorded.
  */
 export const GATE_OUTCOMES = Object.freeze({ SENT_BACK: 'sent-back', ROUND_CAP: 'round-cap', NOTHING_TO_SEND: 'no-send-back', CARD_QUEUED: 'card-queued' });
@@ -437,6 +437,7 @@ function operatorRuled(records, pr, head) {
 const INDEX_LIST = '\\((#\\d+(?:, #\\d+)*)\\)';
 const GATE_ACTION_LINES = [
   ['card', new RegExp(`^- \\d+ finding\\(s\\) filed as a follow-up card ${INDEX_LIST}(?: — landing job [^\\n]*)?\\.$`)],
+  ['card', new RegExp(`^- \\d+ finding\\(s\\) recorded, owed as a follow-up card ${INDEX_LIST} — filing paused; will file on resume\\.$`)],
   ['advisory', new RegExp(`^- \\d+ finding\\(s\\) left advisory ${INDEX_LIST}\\.$`)],
   ['send-back', new RegExp(`^- \\d+ confirmed break\\(s\\) sent back to the fixer ${INDEX_LIST}(?: — the PR was already under review:changes)?\\.$`)],
   ['held', new RegExp(`^- \\d+ confirmed break\\(s\\) NOT sent back: [^\\n]*?(?: ${INDEX_LIST})?\\.$`)],

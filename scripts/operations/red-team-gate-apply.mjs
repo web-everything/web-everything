@@ -108,8 +108,9 @@ export function buildGateComment({ pr, head, outcome, plan, round, result = null
       : `- ${plan.sendBack.length} confirmed break(s) sent back to the fixer (${plan.sendBack.map((f) => `#${f.index}`).join(', ')})${sendBackResult?.already ? ' — the PR was already under review:changes' : ''}.`);
   }
   if (plan.card.length) {
-    lines.push(`- ${plan.card.length} finding(s) filed as a follow-up card (${plan.card.map((f) => `#${f.index}`).join(', ')})`
-      + `${cardResult?.ok ? ` — landing job ${sanitizeCardField(cardResult.session ?? cardResult.handle ?? '', 120)}` : ` — FILING FAILED: ${sanitizeCardField(cardResult?.error ?? 'unknown', 300)}`}.`);
+    const owed = cardResult?.step === 'paused' && cardResult?.skipped === true;
+    lines.push(`- ${plan.card.length} finding(s) ${owed ? 'recorded, owed as a follow-up card' : 'filed as a follow-up card'} (${plan.card.map((f) => `#${f.index}`).join(', ')})`
+      + `${owed ? ' — filing paused; will file on resume' : cardResult?.ok ? ` — landing job ${sanitizeCardField(cardResult.session ?? cardResult.handle ?? '', 120)}` : ` — FILING FAILED: ${sanitizeCardField(cardResult?.error ?? 'unknown', 300)}`}.`);
   }
   if (plan.advisory.length) lines.push(`- ${plan.advisory.length} finding(s) left advisory (${plan.advisory.map((f) => `#${f.index}`).join(', ')}).`);
   return lines.join('\n');
@@ -199,8 +200,8 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
     let cardMarker = null;
     if (cardPending) {
       cardResult = io.fileCard(cardInput);
-      // A card that was not filed records nothing: a permanent per-head record here would make the failure unretryable.
-      if (!cardResult?.ok) return { status: 'card-failed', head, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, error: cardResult?.error ?? 'unknown' };
+      // A durable owed filing is handled on resume; every other failure must remain retryable.
+      if (!cardResult?.ok && !(cardResult?.step === 'paused' && cardResult?.skipped === true)) return { status: 'card-failed', head, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, error: cardResult?.error ?? 'unknown' };
       cardMarker = record(GATE_OUTCOMES.CARD_QUEUED, { sendBack: [], card: plan.card, advisory: sendPending ? [] : plan.advisory }, { cardResult });
       // The job is spawned but its record is not on the PR: the next run would queue a DUPLICATE card. Say so, loudly.
       if (cardMarker !== 'posted') return { status: 'card-record-failed', head, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, cardMarker, error: cardMarker };

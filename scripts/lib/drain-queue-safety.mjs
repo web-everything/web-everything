@@ -30,7 +30,9 @@ export function sendBackReason(labels) {
 
 /** Only head-bound scheduled work is owed; acceptance and status labels cannot invent a run. */
 export function postAcceptRedTeamOwed(loopPayload, env = process.env, evidence = {}) {
-  return redTeamPanelSeatOwed(loopPayload, env) || redTeamOwedOnHead({ read: loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly });
+  const panel = redTeamPanelSeatOwed(loopPayload, env);
+  return redTeamOwedOnHead({ read: loopPayload?.findings?.read,
+    evidence: { ...evidence, scheduled: evidence.scheduled || panel }, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly });
 }
 
 export function redTeamEnqueueHold({ loopPayload, comments, repo, pr, head, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false, attempted = false, requestPending = false, skipCardOnly } = {}) {
@@ -44,7 +46,7 @@ export function redTeamEnqueueHold({ loopPayload, comments, repo, pr, head, env 
     return 'post-accept red team confirmed a break requiring send-back';
   if (disposition.result?.recheckIncomplete) return 'post-accept red team pending: saved red-team re-check incomplete';
   if (disposition.result) return null;
-  if (!requestPending && !postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded: recorded || attempted, skipCardOnly })) return null;
+  if (!requestPending && !postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded, attempted, skipCardOnly })) return null;
   return 'post-accept red team has no recorded result on the live head';
 }
 

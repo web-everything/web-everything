@@ -395,6 +395,21 @@ describe('runReviewLoopOnce — property 4, MECHANIZED (#2749 fix, 2026-09-26 sc
     expect(out.lines.join('\n')).toContain('filing paused');
   });
 
+  it('a recorded owed filing holds the run without a failure exit or false filing receipt', async () => {
+    const { declaration, registry } = registryFor({});
+    const seen = [];
+    const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV, store: createMemoryRunStore(),
+      sinks: recordingSinks(seen), makeJudge: cannedJudge(PREVENTION_ANSWER), mintRunId: () => 'r-paused',
+      findFiledPrevention: () => null,
+      fileItem: async () => ({ code: 0, lines: [JSON.stringify({ skipped: true, owed: true, reason: 'filing paused' })] }),
+    });
+    expect(out.code).toBe(0);
+    expect(out.stopped).toBe('confirm');
+    expect(out.run.findings.confirm).not.toBe('accept');
+    expect(seen.map(s => s.type)).not.toContain(REVIEW_EFFECTS.LABEL);
+    expect(out.lines.join('\n')).toContain('filing paused');
+  });
+
   it('files ONE backlog card via file-item, then completes the run as an accept — no learnings-pool notice at all', async () => {
     const { declaration, registry } = registryFor({});
     const store = createMemoryRunStore();

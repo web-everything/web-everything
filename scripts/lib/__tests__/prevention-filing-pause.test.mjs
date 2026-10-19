@@ -50,19 +50,33 @@ describe('independent prevention filing pause', () => {
     expect(exec).not.toHaveBeenCalled(); expect(writeFile).not.toHaveBeenCalled(); expect(batch).not.toHaveBeenCalled();
     expect(write.mock.calls.flat().join('')).toContain('prevention.filingEnabled=false (repo)');
   });
-  it('review-loop adapter preserves skipped state and never claims the card queued', async () => {
-    const result = await fileItemForPreventionViaLandingJob(input, { spawnJob: () => ({ ok: false, skipped: true, reason: 'filing paused' }) });
-    expect(result.code).toBe(1);
-    expect(JSON.parse(result.lines[0])).toMatchObject({ skipped: true, reason: 'filing paused' });
+  it('review-loop adapter reports recorded owed state without claiming the card queued', async () => {
+    const result = await fileItemForPreventionViaLandingJob(input, { spawnJob: () => ({ ok: false, skipped: true, step: 'paused', reason: 'filing paused' }) });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.lines[0])).toMatchObject({ skipped: true, owed: true, reason: 'filing paused' });
     expect(JSON.parse(result.lines[0]).queued).not.toBe(true);
   });
-  it('approval does not mark paused filing as filed', () => {
-    const postComment = vi.fn();
-    runApprovalPreventionFiling({ to: 'accepted', repo: 'o/r', pr: 42, headSha: 'a'.repeat(40),
+  it.each([
+    { ok: false, step: 'paused', error: 'could not record owed filing' },
+    { ok: false, skipped: true, reason: 'unrelated skip' },
+  ])('review-loop preserves real filing failures: %j', async filed => {
+    const result = await fileItemForPreventionViaLandingJob(input, { spawnJob: () => filed });
+    expect(result.code).toBe(1);
+    expect(result.lines.join('')).not.toContain('"owed":true');
+  });
+  it('approval records paused filing as owed and deduplicates the next approval', () => {
+    const prComments = [];
+    const postComment = vi.fn((repo, pr, body) => prComments.push({ body, author: { login: 'web-everything' } }));
+    const fileApprovalPrevention = vi.fn(() => ({ ok: false, skipped: true, step: 'paused', reason: 'filing paused' }));
+    const approve = () => runApprovalPreventionFiling({ to: 'accepted', repo: 'o/r', pr: 42, headSha: 'a'.repeat(40),
       commentBody: '**Verdict:** ✅ pass — no blocking findings\n- `scripts/a.mjs:1` — an issue\n  - _Prevention (OWED — file it):_ add a guard',
-      prComments: [], provider: { postComment }, findFiledApprovalPrevention: () => null,
-      fileApprovalPrevention: () => ({ ok: false, skipped: true, reason: 'filing paused' }) });
-    expect(postComment).not.toHaveBeenCalled();
+      prComments, provider: { postComment }, findFiledApprovalPrevention: () => null, fileApprovalPrevention });
+    approve();
+    expect(postComment).toHaveBeenCalledTimes(1);
+    expect(prComments[0].body).toContain('recorded, owed; filing paused');
+    expect(prComments[0].body).not.toContain('Filed the');
+    approve();
+    expect(fileApprovalPrevention).toHaveBeenCalledTimes(1);
   });
 });
 

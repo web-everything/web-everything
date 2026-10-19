@@ -194,6 +194,7 @@ export async function fileItemForPrevention(input, {
  */
 export async function fileItemForPreventionViaLandingJob(input, { spawnJob = spawnPreventionLandingJob } = {}) {
   const filed = spawnJob(input, { sessionPrefix: 'review-loop-prevention' });
+  if (filed.step === 'paused' && filed.skipped === true) return { code: 0, lines: [JSON.stringify({ skipped: true, owed: true, reason: filed.reason })] };
   if (filed.skipped) return { code: 1, lines: [JSON.stringify({ skipped: true, reason: filed.reason })] };
   if (!filed.ok) {
     return { code: 1, lines: [filed.error ?? 'land-prevention-card: unknown spawn failure'] };
@@ -773,9 +774,9 @@ export async function runReviewLoopOnce({
 
     if (filedPayload?.skipped) {
       const rendered = renderOutcome({ outcome, json: parsed.control.json, declaration });
-      return { ...rendered, code: 1, lines: parsed.control.json
-        ? [JSON.stringify({ ...JSON.parse(rendered.lines[0]), preventionFilingPaused: filedPayload.reason })]
-        : [...rendered.lines, filedPayload.reason], run: outcome.run, stopped: outcome.stopped };
+      return { ...rendered, code: filedPayload.owed === true ? 0 : 1, lines: parsed.control.json
+        ? [JSON.stringify({ ...JSON.parse(rendered.lines[0]), preventionFilingPaused: filedPayload.reason, ...(filedPayload.owed === true ? { preventionFilingOwed: true } : {}) })]
+        : [...rendered.lines, filedPayload.owed === true ? `Prevention filing recorded, owed — ${filedPayload.reason}` : filedPayload.reason], run: outcome.run, stopped: outcome.stopped };
     }
     const filedNum = alreadyFiled ? alreadyFiled.num : (filedPayload?.verdict?.num ?? null);
     const filedRel = alreadyFiled ? alreadyFiled.path : (filedPayload?.verdict?.rel ?? null);
@@ -870,9 +871,9 @@ export async function runReviewLoopOnce({
     }
     if (filedPayload?.skipped) {
       const rendered = renderOutcome({ outcome, json: parsed.control.json, declaration });
-      return { ...rendered, code: 1, lines: parsed.control.json
-        ? [JSON.stringify({ ...JSON.parse(rendered.lines[0]), preventionFilingPaused: filedPayload.reason })]
-        : [...rendered.lines, filedPayload.reason], run: outcome.run, stopped: outcome.stopped };
+      return { ...rendered, code: filedPayload.owed === true ? 0 : 1, lines: parsed.control.json
+        ? [JSON.stringify({ ...JSON.parse(rendered.lines[0]), preventionFilingPaused: filedPayload.reason, ...(filedPayload.owed === true ? { preventionFilingOwed: true } : {}) })]
+        : [...rendered.lines, filedPayload.owed === true ? `Prevention filing recorded, owed — ${filedPayload.reason}` : filedPayload.reason], run: outcome.run, stopped: outcome.stopped };
     }
     const queued = alreadyFiled ? alreadyFiled.queued : filedPayload?.queued === true;
     const num = alreadyFiled ? alreadyFiled.num : (filedPayload?.verdict?.num ?? null);
