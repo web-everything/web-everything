@@ -16,6 +16,21 @@ const fixture = (fn) => {
 };
 const put = (root, f) => { mkdirSync(dirname(join(root, f.path)), { recursive: true }); writeFileSync(join(root, f.path), f.content); };
 describe('derived raised-by records', () => {
+  it('ignores unused duplicate birth aliases but rejects raised-by directories that use them', () => fixture(root => {
+    for (const id of ['6500', '6501']) {
+      writeFileSync(join(root, `backlog/${id}-parent.md`), '---\nbornAs: x1abcde\nstatus: open\n---\n# Parent\n');
+    }
+    // Historical duplicate bornAs stamps are unrelated to raises filed by current ID.
+    expect(validateRaisedBy(root)).toEqual([]);
+    put(root, raisedByFile('6500', line));
+    put(root, raisedByFile('6501', line));
+    expect(validateRaisedBy(root)).toEqual([]);
+    expect(readRaisedBy('6500', root)).toHaveLength(1);
+    expect(readRaisedBy('6501', root)).toHaveLength(1);
+    // Once a raise uses the shared alias, its parent really is ambiguous.
+    put(root, raisedByFile('x1abcde', line.replaceAll('#77', '#78')));
+    expect(validateRaisedBy(root)).toContain('raised-by parent x1abcde is ambiguous');
+  }));
   it('keeps provisional raises readable and valid after real JIT numbering', () => fixture(root => {
     const name = 'x1abcde-parent.md';
     const content = `---\nstatus: open\n---\n# Parent\n\n${line}\n`;

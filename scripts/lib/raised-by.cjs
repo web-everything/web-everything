@@ -59,18 +59,21 @@ function readRaisedBy(cardId, root, { body, bornAs, backlogDir = join(root, 'bac
 function validateRaisedBy(root, { backlogDir = join(root, 'backlog') } = {}) {
   const errors = [];
   const parents = new Map();
+  const ambiguous = new Set();
   for (const name of list(backlogDir).filter(n => n.endsWith('.md'))) {
     const id = name.split('-')[0];
     const body = readFileSync(join(backlogDir, name), 'utf8');
     const seen = new Set(parseRaisedBy(body).map(raisedByKey));
     // Both directories belong to one card, so duplicate checking must also span them.
     for (const alias of raisedByParentIds(id, body)) {
-      if (parents.has(alias)) errors.push(`raised-by parent ${alias} is ambiguous`);
+      if (parents.has(alias)) ambiguous.add(alias);
       else parents.set(alias, seen);
     }
   }
   for (const id of list(join(backlogDir, 'raised-by'))) {
     if (!CARD_ID.test(id) || !parents.has(id)) errors.push(`raised-by parent ${id} does not exist`);
+    // Historical bornAs collisions matter only when a raise uses that parent.
+    if (ambiguous.has(id)) errors.push(`raised-by parent ${id} is ambiguous`);
     // Legacy duplicates remain readable; a new file must not repeat an existing raise.
     const seen = parents.get(id) ?? new Set();
     let files;
