@@ -37,7 +37,7 @@ import { gitRun as gitRunner, ensureFullHistory } from './git-run.mjs';
 import { applyCollisionHealToIndex } from './nnn-collision-heal.mjs';
 import { isFixEvidencePath, isDrainTransientPath } from './transient-paths.mjs';
 import { refuseHeldPush } from '../conveyor/fix-procedure.mjs';
-import { applyRaisedByConflictsToIndex, loadCardConflictSettings } from './card-conflict-resolve.mjs';
+import { applyRaisedByConflictsToIndex, loadCardConflictSettings, CARD_CONFLICT_PRECONDITION_REASONS } from './card-conflict-resolve.mjs';
 import { isCardPath } from '../ci-card-only.mjs';
 
 export const LANE_MANIFEST = '.lane-manifest.json';
@@ -214,12 +214,12 @@ export function rebaseDropManifest({
     const inputs = [base, mergeRef].map(ref => run('git', ['rev-parse', '--verify', `${ref}^{commit}`], { cwd }));
     const ids = inputs.map(r => String(r.stdout || '').trim());
     if (inputs.some(r => r.status !== 0) || ids.some(id => !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(id)))
-      return { action: 'skip', reason: 'cannot pin card conflict inputs', cardConflictSetting };
+      return { action: 'skip', precondition: true, reason: 'cannot pin card conflict inputs', cardConflictSetting };
     [base, mergeRef] = ids;
     const pinned = run('git', ['merge-tree', '--write-tree', base, mergeRef], { cwd });
     parsed = parseMergeTree(pinned.stdout, pinned.status);
     if (!parsed.tree || (!parsed.clean && !parsed.conflictPaths.length))
-      return { action: 'skip', reason: 'cannot prove pinned card conflict', cardConflictSetting };
+      return { action: 'skip', precondition: true, reason: 'cannot prove pinned card conflict', cardConflictSetting };
     disp = manifestConflictDisposition(parsed, manifest);
     cardConflict = disp === 'real' && parsed.conflictPaths.every(isCardPath);
     if (disp === 'real' && !cardConflict) return { action: 'skip', reason: 'pinned merge has a non-card conflict',
@@ -234,7 +234,9 @@ export function rebaseDropManifest({
   if (cardConflict) {
     const resolution = applyRaisedByConflictsToIndex({ run, cwd, env, tree: parsed.tree, base, mergeRef,
       conflictPaths: parsed.conflictPaths, enabled: cardConflictSetting.value });
-    if (!resolution.ok) return { action: 'skip', reason: resolution.reason, conflictPaths: parsed.conflictPaths, cardConflictSetting };
+    if (!resolution.ok) return { action: 'skip',
+      ...(CARD_CONFLICT_PRECONDITION_REASONS.includes(resolution.reason) ? { precondition: true } : {}),
+      reason: resolution.reason, conflictPaths: parsed.conflictPaths, cardConflictSetting };
     resolvedRaisedBy = resolution.resolved;
   }
   // Drop the manifest if present (--ignore-unmatch: a clean merge with no manifest in the tree is fine).

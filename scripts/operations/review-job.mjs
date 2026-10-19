@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { runDrainRedTeamJob } from '../lib/drain-red-team-review.mjs';
 import { finishDrainRedTeamRequest } from '../lib/drain-red-team-requests.mjs';
-import { isCompletedReviewPr } from './review-pr-completion.mjs';
+import { readReviewEvidenceAtHead } from '../lib/review-evidence-at-head.mjs';
 import { formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { recordRedTeamStatus, readDrainRedTeamEvidence } from '../lib/drain-red-team-evidence.mjs';
@@ -300,16 +300,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     finishDrainRedTeamRequest: (request, opts) => finishDrainRedTeamRequest(request, { env, ...opts }),
     readDrainRedTeamCi: ({ repo, pr }) => readReviewCiGate({ repo, pr, policy: resolveTimingPolicy({ env }).review }),
     readDrainRedTeamState: ({ repo, pr }) => JSON.parse(execRead('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid,state,isDraft,labels'], { cwd: root, env })),
-    readDrainRedTeamReview: ({ repo, pr, head }) => {
-      const runsDir = savedRedTeamRunsDir(env);
-      const at = run => Math.max(0, ...(run.stepTimings ?? []).flatMap(t =>
-        [Date.parse(t.startedAt) || 0, Date.parse(t.finishedAt) || 0]));
-      const run = listRunIds(runsDir).filter(id => id.startsWith('review-pr-')).map(id => readRun(id, runsDir))
-        .filter(run => run.op === 'review-pr' && run.input?.repo?.toLowerCase() === repo.toLowerCase()
-          && Number(run.input?.pr) === Number(pr) && run.findings?.read?.netBasis?.rev === head)
-        .sort((a, b) => at(b) - at(a))[0];
-      return run && isCompletedReviewPr(run) ? { runId: run.id, verdict: run.verdict, findings: run.findings } : null;
-    },
+    readDrainRedTeamReview: input => readReviewEvidenceAtHead({ ...input, env }),
     // The carry's own resolver is its only source (logged with that source); no timing setting governs it.
     carryAcrossRebaseSetting: () => resolveCarryAcrossRebase({ env, readFile }),
     readCarryEvidence: ({ pr, repo }) => {

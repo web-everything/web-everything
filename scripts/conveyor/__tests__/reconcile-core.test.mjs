@@ -165,6 +165,23 @@ describe('case 1 — the dispatch, keyed by PR NUMBER (#3296)', () => {
     expect(plan.refusals.map((r) => r.kind)).toEqual(['nothing-owed', 'nothing-owed', 'nothing-owed']);
   });
 
+  it.each([0, 3])('a queued accepted PR carries its shared attempts and effective cap (durable count %i)', durableCount => {
+    const pr = pr1563({ labels: lbl('review:accepted', 'ready-to-merge'), comments: [
+      ...Array.from({ length: 2 }, () => ({ author: AUTOMATION, body: REARM_COMMENT_MARKER })),
+      { author: { login: 'chalbert' }, body: buildRoundExtensionComment({ repo: 'we', pr: 1563,
+        by: 2, actor: 'chalbert', channel: 'test', reason: 'two more', at: '2026-10-06T10:44:00Z' }) },
+    ] });
+    const plan = planReconcile({ repo: 'we', prs: [pr], agents: [], durableCounts: { 1563: durableCount },
+      roundCap: 6, now: NOW });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toHaveLength(1);
+    const refusal = plan.refusals[0];
+    expect(refusal).toMatchObject({ kind: 'nothing-owed', phase: 'queued', prNumber: 1563,
+      attempts: Math.max(2, durableCount), cap: 8 });
+    expect(Number.isInteger(refusal.attempts)).toBe(true);
+    expect(Number.isInteger(refusal.cap)).toBe(true);
+  });
+
   it('EVERY PR yields exactly one row — a pass that drops a PR silently is the original defect one level up', () => {
     const prs = [...OPEN_AT_1734, pr1563(), pr1563({ number: 9001, comments: [] })];
     const plan = planReconcile({ prs, agents: [], durableCounts: {}, now: NOW });

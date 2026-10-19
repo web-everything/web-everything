@@ -142,13 +142,21 @@ export function readConfirmedBreaks({ env = process.env, path = RED_TEAM_SETTING
 /**
  * redTeam.timing: panel-seat (standard prototype default) runs on every reviewed head
  * beside the jurors; post-accept restores the sequential accept-only path.
- * Standard < platform < tool < WE_RED_TEAM_TIMING; invalid values keep the lower layer.
+ * carriedAcceptTriggersReview defaults true: a carried accept lacking head-bound review evidence
+ * owes a fresh capped review before the drain red-team job can run.
+ * Standard < platform < tool < env (WE_RED_TEAM_TIMING / WE_RED_TEAM_CARRIED_ACCEPT_TRIGGERS_REVIEW);
+ * invalid values keep the lower layer.
  */
 export function resolveRedTeamTiming({ file = {}, platform, env = {} } = {}) {
-  const pick = o => o?.timing === undefined ? {} : { timing: o.timing };
-  return resolveCascade({ standard: { timing: 'panel-seat' }, platform: pick(platform),
-    tool: pick(file?.redTeam), envValues: { timing: env.WE_RED_TEAM_TIMING },
-    valid: v => ['panel-seat', 'post-accept'].includes(v) });
+  const pick = o => Object.fromEntries(['timing', 'carriedAcceptTriggersReview']
+    .filter(k => o?.[k] !== undefined).map(k => [k, o[k]]));
+  const raw = env.WE_RED_TEAM_CARRIED_ACCEPT_TRIGGERS_REVIEW;
+  const normalized = String(raw ?? '').trim().toLowerCase();
+  const carried = raw === undefined || raw === '' ? undefined
+    : ['true', 'on', '1'].includes(normalized) ? true : ['false', 'off', '0'].includes(normalized) ? false : raw;
+  return resolveCascade({ standard: { timing: 'panel-seat', carriedAcceptTriggersReview: true }, platform: pick(platform),
+    tool: pick(file?.redTeam), envValues: { timing: env.WE_RED_TEAM_TIMING, carriedAcceptTriggersReview: carried },
+    valid: { timing: v => ['panel-seat', 'post-accept'].includes(v), carriedAcceptTriggersReview: v => typeof v === 'boolean' } });
 }
 export function readRedTeamTiming({ env = process.env, path = RED_TEAM_SETTINGS_FILE, log = () => {} } = {}) {
   let file = {};

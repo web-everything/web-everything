@@ -3496,7 +3496,7 @@ export function planReconcile({
 
     if (!OWED[phase]) {
       if (OWED_ELSEWHERE[phase]) refuse('owed-elsewhere', { ...withPhase, why: OWED_ELSEWHERE[phase] });
-      else refuse('nothing-owed', { ...withPhase, why: `phase \`${phase}\` — reviewed and queued, or already landed; this pass has nothing to dispatch` });
+      else refuse('nothing-owed', { ...withPhase, attempts: roundAttempts(), cap: effectiveRoundCap, why: `phase \`${phase}\` — reviewed and queued, or already landed; this pass has nothing to dispatch` });
       continue;
     }
 

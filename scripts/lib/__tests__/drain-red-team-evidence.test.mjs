@@ -27,7 +27,7 @@ const payload = head => ({ verdict: { verdict: 'accept' }, findings: { read: { n
 
 describe('drain reads actual head-bound review scheduler inputs', () => {
   it('does not invent an accept when no review run exists', () => {
-    expect(readDrainRedTeamEvidence(fixture())).toEqual({ loopPayload: null, recorded: false, scheduled: false, inFlight: false, attempted: false });
+    expect(readDrainRedTeamEvidence(fixture())).toEqual({ loopPayload: null, recorded: false, scheduled: false, inFlight: false, attempted: false, noUsableResult: true });
   });
   it('pins the accepted-label boundary with empty status and run stores', () => {
     const f = fixture();

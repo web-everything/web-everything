@@ -16,6 +16,16 @@ export function loadCardConflictSettings({ env = process.env, platform = platfor
 }
 
 const markers = /^(?:<{7}|={7}|>{7}|\|{7})(?: |$)/m;
+// Only these resolver refusals bypass the unowned content-conflict attempt cap.
+// Unknown reasons (including new content refusals) keep spending it by default.
+export const CARD_CONFLICT_PRECONDITION_REASONS = Object.freeze([
+  'ambiguous JIT reference mapping',
+  'cannot read JIT reference mapping',
+  'PR is not proven card-only',
+  'non-backlog conflict',
+  'conflicting card side is missing',
+  'conflicting card is not a regular file',
+]);
 const refuse = reason => ({ ok: false, reason });
 
 // Only a single real section, outside fenced examples, can be rebuilt. Its entries may have indented children.
@@ -48,7 +58,7 @@ function entries(body) {
 }
 
 /** PURE: only conflict markers wholly inside the mention list are eligible. Preserve all other merged bytes. */
-export function resolveRaisedByConflict({ path, merged, main, pr, referenceMap = new Map(), enabled = true } = {}) {
+export function resolveRaisedByConflict({ path, merged, main, pr, referenceMap = new Map(), ambiguousHashes = new Set(), enabled = true } = {}) {
   if (!enabled) return refuse('cardConflicts.autoResolveRaisedBy disabled');
   if (!isCardPath(path)) return refuse('conflict is not a backlog card');
   if ([merged, main, pr].some(t => typeof t !== 'string' || t.includes('\0'))) return refuse('unreadable card');
@@ -68,8 +78,13 @@ export function resolveRaisedByConflict({ path, merged, main, pr, referenceMap =
   const left = entries(a.body), right = entries(b.body);
   if (!left || !right) return refuse('section contains non-list content');
   // The existing JIT reference visitor and bornAs index are shared with backlog numbering/queue recovery.
-  const normalize = text => mapHashReferences(text, hash => referenceMap.get(hash) ?? hash);
+  let ambiguousReference = false;
+  const normalize = text => mapHashReferences(text, hash => {
+    if (ambiguousHashes.has(hash)) { ambiguousReference = true; return hash; }
+    return referenceMap.get(hash) ?? hash;
+  });
   const union = [...new Set([...left, ...right].map(normalize))];
+  if (ambiguousReference) return refuse('ambiguous JIT reference mapping');
   const tail = m.end === merged.length ? '\n' : `\n\n${merged.slice(m.end)}`;
   return { ok: true, text: `${merged.slice(0, m.start)}\n${union.join('\n')}${tail}` };
 }
@@ -88,15 +103,16 @@ export function applyRaisedByConflictsToIndex({ run, cwd, env, tree, base, merge
     if (match) items.push({ num: match[1], bornAs: match[2] });
   }
   const referenceMap = bornAsIndexFromItems(items);
-  if (items.some((item, i) => items.some((other, j) => i !== j && item.bornAs === other.bornAs && item.num !== other.num)))
-    return refuse('ambiguous JIT reference mapping');
+  const ambiguousHashes = new Set(items.filter(item => referenceMap.get(item.bornAs) !== item.num).map(item => item.bornAs));
+  // Historic duplicates cannot be rewritten, but only referenced duplicates block this union.
+  for (const hash of ambiguousHashes) referenceMap.delete(hash);
   const plans = [];
   for (const path of conflictPaths) {
     const texts = [tree, base, mergeRef].map(ref => run('git', ['show', `${ref}:${path}`], { cwd }));
     if (texts.some(r => r.status !== 0)) return refuse('conflicting card side is missing');
     const modes = [tree, base, mergeRef].map(ref => run('git', ['ls-tree', ref, '--', path], { cwd }));
     if (modes.some(r => r.status !== 0 || !String(r.stdout).startsWith('100644 blob '))) return refuse('conflicting card is not a regular file');
-    const result = resolveRaisedByConflict({ path, merged: texts[0].stdout, main: texts[1].stdout, pr: texts[2].stdout, referenceMap });
+    const result = resolveRaisedByConflict({ path, merged: texts[0].stdout, main: texts[1].stdout, pr: texts[2].stdout, referenceMap, ambiguousHashes });
     if (!result.ok) return result;
     plans.push({ path, text: result.text });
   }

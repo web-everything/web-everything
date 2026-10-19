@@ -2141,8 +2141,18 @@ credential is required. Pushes pin `WE_CI_PUSH_TOKEN` and clear inherited `GIT_*
 configuration; `gitRun` must use `inheritEnv: false` for that exact environment,
 otherwise its normal merge with `process.env` restores the rejected configuration.
 Standalone red-team producers write `running` before the model call (best effort)
-when recording and posting are enabled. Card rebase skips, errors and throws all
-spend the existing unowned rebase cap. Nightly failure scans retain failed records
+when recording and posting are enabled. Only card content-conflict skips spend the
+existing unowned rebase cap, including resolver content refusals (outside-list conflicts,
+unsupported markers, non-list content, missing/ambiguous sections, markers already on
+a side, incomplete list conflicts, and unreadable cards). These have no `precondition`
+flag. Only the explicit `CARD_CONFLICT_PRECONDITION_REASONS` allowlist in
+`scripts/lib/card-conflict-resolve.mjs` exempts resolver refusals: ambiguous or unreadable
+JIT reference mapping, an unproven card-only PR, non-backlog conflicts, missing card
+sides, or non-regular card files. Those carry
+`precondition: true`; errors and throws do not spend the cap either.
+Disabled auto-resolution skips retain their existing behavior without a `precondition` flag.
+Card attempt outcomes remain in conflict-watch results
+even when normal routing exits early. Nightly failure scans retain failed records
 of every kind alongside the nightly-only deadline check.
 
 ## GitHub App daemon fallback probes
