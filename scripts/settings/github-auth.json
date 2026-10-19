@@ -1,4 +1,5 @@
 {
+  "ghAuth": { "personalFallback": "refuse" },
   "github": {
     "auth": "app",
     "personalExceptions": {
