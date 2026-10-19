@@ -39,6 +39,8 @@ import { CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
 import { ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
 import { REVIEWED_SHA_MARKER, CONVERTED_ADVISORY_NOTE_MARKER, REVIEW_PR_CHANNEL, normalizeDiffFingerprint } from '../lib/review-escalation.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { readGhJson } from '../lib/proc-read.mjs';
+import { sanitizeSpawnEnv } from '../lib/gh-app-shim.mjs';
 
 export const MECHANICAL_ROUNDS_SETTING = 'mechanicalRoundsCountTowardCap';
 export const MECHANICAL_ROUNDS_ENV = 'WE_REVIEW_MECHANICAL_ROUNDS_COUNT_TOWARD_CAP';
@@ -465,6 +467,41 @@ export function readRoundCommits({ pr, defaultBranch = 'main', remote = 'origin'
   } catch { return fail('git-read-failed'); }
 }
 
+/** Complete PR head evidence. A truncated timeline or any unreadable node fails closed. Never throws. */
+export function readPrHeadHistory({ pr, repo, exec } = {}) {
+  try {
+    if (!Number.isSafeInteger(pr?.number) || pr.number <= 0 || !SHA40.test(pr?.headRefOid ?? '')) return { ok: false };
+    // Equivalent to env -u GH_TOKEN -u GITHUB_TOKEN: let the gh shim select fresh credentials.
+    const opts = { ...(exec ? { exec } : {}), env: sanitizeSpawnEnv(),
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 };
+    const slug = repo ?? readGhJson(['repo', 'view', '--json', 'nameWithOwner'], opts)?.nameWithOwner;
+    if (typeof slug !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(slug)) return { ok: false };
+    const [owner, name] = slug.split('/');
+    const query = `query { repository(owner:${JSON.stringify(owner)}, name:${JSON.stringify(name)}) {
+      pullRequest(number:${pr.number}) {
+        timelineItems(first:100, itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT,PULL_REQUEST_COMMIT]) {
+          pageInfo { hasNextPage }
+          nodes { __typename
+            ... on HeadRefForcePushedEvent { beforeCommit { oid } afterCommit { oid } }
+            ... on PullRequestCommit { commit { oid } }
+          }
+        }
+      }
+    } }`;
+    const result = readGhJson(['api', 'graphql', '-f', `query=${query}`], opts);
+    const timeline = result?.data?.repository?.pullRequest?.timelineItems;
+    if (result?.errors || timeline?.pageInfo?.hasNextPage !== false || !Array.isArray(timeline?.nodes)) return { ok: false };
+    const shas = new Set([pr.headRefOid]);
+    for (const node of timeline.nodes) {
+      const oids = node?.__typename === 'HeadRefForcePushedEvent' ? [node.beforeCommit?.oid, node.afterCommit?.oid]
+        : node?.__typename === 'PullRequestCommit' ? [node.commit?.oid] : [null];
+      if (oids.some(oid => typeof oid !== 'string' || !SHA40.test(oid))) return { ok: false };
+      for (const oid of oids) shas.add(oid);
+    }
+    return { ok: true, shas: [...shas] };
+  } catch { return { ok: false }; }
+}
+
 // Same leading-line/authorship match as countRearmComments; avoid importing its label CLI dependency.
 // Pinned to REARM_COMMENT_MARKER by the enrichment regression in mechanical-rebase-rounds.test.mjs.
 const isRearmMarker = (c) => isTrustedMarkerAuthor(c) && bodyOf(c).trimStart().startsWith('🔧 conveyor fix — re-armed for re-review');
@@ -488,6 +525,7 @@ function resolveRoundCap(env = process.env) {
 /** IO: attach `mechanicalRound` facts to each PR whose latest round was mechanical. Never throws. */
 export function enrichPrsWithMechanicalRound(prs, {
   defaultBranch = 'main', readFacts = readMechanicalRoundFacts, readRoundCommits: readCommits = readRoundCommits,
+  repo, readPrHeadHistory: readHistory = readPrHeadHistory,
   roundCap = resolveRoundCap(),
 } = {}) {
   return (Array.isArray(prs) ? prs : []).map((pr) => {
@@ -498,6 +536,8 @@ export function enrichPrsWithMechanicalRound(prs, {
     if (Array.isArray(pr?.comments) && pr.comments.filter(isRearmMarker).length >= roundCap) {
       try { enriched = { ...enriched, roundCommits: readCommits({ pr, defaultBranch }) }; }
       catch { enriched = { ...enriched, roundCommits: { head: lc(pr?.headRefOid), ok: false, reason: 'git-read-failed' } }; }
+      try { enriched = { ...enriched, headHistory: readHistory({ pr, repo }) }; }
+      catch { enriched = { ...enriched, headHistory: { ok: false } }; }
     }
     return enriched;
   });

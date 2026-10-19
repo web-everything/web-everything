@@ -7,10 +7,15 @@ import { join } from 'node:path';
 import { countRealFixRounds, planReconcile as planReconcileWithTiming, resolveRoundCap } from '../reconcile-core.mjs';
 // This historical fixture exercises the serial policy; new defaults have their own timing suite.
 const planReconcile = options => planReconcileWithTiming({ reviewTiming: { startAfter: 'ci-green' }, fixTiming: { joinCiAndReview: false }, ...options });
-import { readRoundCommits, enrichPrsWithMechanicalRound, BOUNCE_PREFIX, LANE_MANIFEST } from '../mechanical-round-cap.mjs';
+import { readPrHeadHistory, readRoundCommits, enrichPrsWithMechanicalRound, BOUNCE_PREFIX, LANE_MANIFEST } from '../mechanical-round-cap.mjs';
 import { LANE_MANIFEST as DRAIN_MANIFEST } from '../../lib/rebase-drop-manifest.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
-import { FIX_BEGIN_MARKER } from '../fix-procedure.mjs';
+import { FIX_BEGIN_MARKER, FIX_END_MARKER } from '../fix-procedure.mjs';
+import { CONCURRENT_AUTHOR_PAUSE_MARKER, STAND_DOWN_MARKER } from '../stand-down.mjs';
+import { CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-round-count.mjs';
+import { ADVISORY_FIX_COMMENT_MARKER } from '../advisory-fix-mark.mjs';
+import { CI_HEAL_COMMENT_MARKER, CI_HEAL_FAILURE_MARKER } from '../ci-heal-mark.mjs';
+import { CI_HEAL_ESCALATION_MARKER } from '../ci-heal-escalation-mark.mjs';
 
 // Live #4757 own-line history. Dates are UTC (00:49:38Z = Oct 10 20:49:38-04:00).
 const history = [
@@ -53,7 +58,7 @@ const comments = [
   comment('11T01:17:40', '🔀 conveyor rebase-onto-main'),
   ...['10T14:45:15', '10T20:28:30', '10T21:50:09', '11T01:22:19', '11T02:18:51', '11T04:39:04'].map((t) => comment(t, `${BOUNCE_PREFIX}\n\n### Findings\n- repair needed\n\nNet basis: \`${'0'.repeat(40)}..${commits[1].sha}\``)),
 ];
-const pr = { number: 4757, headRefOid: head, headRefName: 'lane/fixer-resume-ladder', baseRefName: 'lane/fixer-history-takeover',
+const pr = { number: 4757, headHistory: { ok: true, shas: [head] }, headRefOid: head, headRefName: 'lane/fixer-resume-ladder', baseRefName: 'lane/fixer-history-takeover',
   labels: ['review:pending', 'review-round:5'].map((name) => ({ name })), isDraft: false, createdAt: at('10T12:00:00'),
   files: [{ path: 'scripts/conveyor/reconcile-core.mjs' }], comments,
   statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: head }],
@@ -254,10 +259,10 @@ describe('mechanical re-arm rounds', () => {
     expect(readRoundCommits({ pr, exec: () => { throw new Error('offline'); } })).toMatchObject({ head, ok: false });
   });
   it('enriches trusted re-arms without requiring a conflict marker, and contains injected failures', () => {
-    expect(enrichPrsWithMechanicalRound([pr], { roundCap: 6, readRoundCommits: () => facts })[0].roundCommits).toEqual(facts);
-    expect(enrichPrsWithMechanicalRound([pr], { roundCap: 6, readRoundCommits: () => { throw new Error('offline'); } })[0].roundCommits).toMatchObject({ head, ok: false });
+    expect(enrichPrsWithMechanicalRound([pr], { readPrHeadHistory: () => pr.headHistory, roundCap: 6, readRoundCommits: () => facts })[0].roundCommits).toEqual(facts);
+    expect(enrichPrsWithMechanicalRound([pr], { readPrHeadHistory: () => pr.headHistory, roundCap: 6, readRoundCommits: () => { throw new Error('offline'); } })[0].roundCommits).toMatchObject({ head, ok: false });
     const foreign = { ...pr, comments: comments.map((c) => ({ ...c, author: { login: 'outsider' } })) };
-    expect(enrichPrsWithMechanicalRound([foreign], { roundCap: 6, readRoundCommits: () => { throw new Error('must not read'); } })[0]).toBe(foreign);
+    expect(enrichPrsWithMechanicalRound([foreign], { readPrHeadHistory: () => pr.headHistory, roundCap: 6, readRoundCommits: () => { throw new Error('must not read'); } })[0]).toBe(foreign);
   });
   it('leaves a PR with one trusted re-arm unchanged without reading commits', () => {
     const belowCap = { ...pr, comments: [comment('11T06:06:06', REARM_COMMENT_MARKER)] };
@@ -272,7 +277,7 @@ describe('mechanical re-arm rounds', () => {
       for (const count of [0, 1, 2, 3, 4, 5, 6, 7]) {
         const candidate = { ...pr, comments: Array.from({ length: count }, () => comment('11T06:06:06', REARM_COMMENT_MARKER)) };
         const reader = vi.fn(() => facts);
-        const enriched = enrichPrsWithMechanicalRound([candidate], { readRoundCommits: reader })[0];
+        const enriched = enrichPrsWithMechanicalRound([candidate], { readPrHeadHistory: () => candidate.headHistory, readRoundCommits: reader })[0];
         expect(reader).toHaveBeenCalledTimes(count >= cap ? 1 : 0);
         if (count < cap) expect(enriched).toBe(candidate);
         else expect(enriched.roundCommits).toEqual(facts);
@@ -342,8 +347,153 @@ describe('single-parent card squash round evidence', () => {
       expect(result).toMatchObject({ ok: true, real: mechanicalSquash === true ? 0 : 1 });
     }
   });
+  describe('squash-collapsed card rounds (#5689)', () => {
+    const earlierHead = 'e'.repeat(40);
+    const originalHead = 'd'.repeat(40);
+    const rearms = ['11T01:00:00', '11T03:00:00', '11T06:06:06']
+      .map(date => comment(date, REARM_COMMENT_MARKER));
+    const earlierMarker = (date = '11T02:00:00', extra = {}, author = 'chalbert') => ({
+      ...marker({ oldHead: originalHead, newHead: earlierHead, ...extra }, author), createdAt: at(date),
+    });
+    const headMarker = { ...marker({ oldHead: earlierHead }), createdAt: at('11T05:06:30') };
+    const count = (markers = [earlierMarker()], commitList = [{ ...c, mechanicalSquash: true }], extraComments = [], headHistory = { ok: true, shas: [earlierHead] }) =>
+      countRealFixRounds({ ...pr, number: 5689, headHistory, comments: [...rearms, ...extraComments, ...markers, headMarker],
+        roundCommits: { head, commits: commitList } });
+
+    it('refunds a receipt-only round while keeping empty rounds without proof spent', () => {
+      const result = count();
+      expect(result).toMatchObject({ ok: true, total: 3, real: 1 });
+      expect(result.rounds).toEqual([
+        { at: rearms[0].createdAt, real: false, mechanical: false, shas: [] },
+        { at: rearms[1].createdAt, real: false, mechanical: true, shas: [] },
+        { at: rearms[2].createdAt, real: false, mechanical: true, shas: [] },
+      ]);
+      expect(count([])).toMatchObject({ ok: true, real: 2 });
+    });
+    it('does not refund when a fix-begin follows the marker', () => {
+      expect(count([earlierMarker()], undefined, [begin('11T02:30:00')]).rounds[1].mechanical).toBe(false);
+    });
+    it('keeps a round spent when a squash receipt and real fix precede a later fix-begin', () => {
+      const fix = { ...commits[0], sha: originalHead, parents: [parent], authoredAt: at('11T02:15:00') };
+      const result = count([earlierMarker()], [{ ...c, parents: [fix.sha], mechanicalSquash: true }, fix],
+        [begin('11T02:30:00')]);
+      expect(result).toMatchObject({ ok: true, total: 3, real: 2 });
+      expect(result.rounds[1]).toEqual({ at: rearms[1].createdAt, real: false, mechanical: false, shas: [] });
+    });
+    it('keeps a real fix commit in the window spent despite a squash receipt', () => {
+      const fix = { ...commits[0], sha: originalHead, parents: [parent], authoredAt: at('11T02:30:00') };
+      const result = count([earlierMarker()], [{ ...c, parents: [fix.sha], mechanicalSquash: true }, fix]);
+      expect(result).toMatchObject({ ok: true, real: 2 });
+      expect(result.rounds[1]).toEqual({ at: rearms[1].createdAt, real: true, mechanical: false, shas: [fix.sha] });
+    });
+    it('does not refund an untrusted-author marker', () => {
+      expect(count([earlierMarker('11T02:00:00', {}, 'outsider')]).rounds[1].mechanical).toBe(false);
+    });
+    it.each(['11T01:00:00', '11T03:00:01', 'invalid'])('does not refund with a marker outside the window: %s', date => {
+      expect(count([earlierMarker(date)]).rounds[1].mechanical).toBe(false);
+    });
+    it('includes a marker exactly at the closing re-arm', () => {
+      expect(count([earlierMarker('11T03:00:00')]).rounds[1].mechanical).toBe(true);
+    });
+    it('does not refund an unchained receipt whose new head is outside this PR history', () => {
+      expect(count([earlierMarker('11T02:00:00', { newHead: 'a'.repeat(40) })]).rounds[1].mechanical).toBe(false);
+    });
+    it('refunds a receipt-only round whose new head is in this PR history', () => {
+      expect(count().rounds[1].mechanical).toBe(true);
+      expect(count(undefined, undefined, [], { ok: true, shas: new Set([earlierHead]) }).rounds[1].mechanical).toBe(true);
+    });
+    it('also accepts the current PR head with valid history', () => {
+      expect(count([earlierMarker('11T02:00:00', { newHead: head })], undefined, [], { ok: true, shas: [] })
+        .rounds[1].mechanical).toBe(true);
+    });
+    it('keeps an empty window without a marker spent', () => {
+      expect(count([]).rounds[1]).toEqual({ at: rearms[1].createdAt, real: false, mechanical: false, shas: [] });
+    });
+    it.each([undefined, null, {}, { ok: false, shas: [earlierHead] }, { ok: true },
+      { ok: true, shas: 'bad' }, { ok: true, shas: Array(1) }, { ok: true, shas: [earlierHead, 'bad'] }])('does not refund without valid headHistory: %j', headHistory => {
+      const result = countRealFixRounds({ ...pr, headHistory, comments: [...rearms, earlierMarker()],
+        roundCommits: { head, commits: [{ ...c, mechanicalSquash: true }] } });
+      expect(result.rounds[1].mechanical).toBe(false);
+    });
+    it('does not refund any receipt-only round when trusted PR receipts form a cycle', () => {
+      const result = count([earlierMarker('11T02:00:00', { oldHead: head }),
+        earlierMarker('11T00:30:00')]);
+      expect(result.rounds[0].mechanical).toBe(false);
+      expect(result.rounds[1].mechanical).toBe(false);
+      expect(result.rounds[2].mechanical).toBe(false);
+    });
+    it.each([FIX_BEGIN_MARKER, FIX_END_MARKER, CONCURRENT_AUTHOR_PAUSE_MARKER, STAND_DOWN_MARKER,
+      CONFLICT_FIX_COMMENT_MARKER, ADVISORY_FIX_COMMENT_MARKER, CI_HEAL_COMMENT_MARKER,
+      CI_HEAL_FAILURE_MARKER, CI_HEAL_ESCALATION_MARKER])('keeps an empty round with fixer activity spent: %s', body => {
+      expect(count([earlierMarker()], undefined, [comment('11T01:30:00', body)]).rounds[1].mechanical).toBe(false);
+    });
+    it('includes fixer activity at the closing re-arm but excludes activity at the previous re-arm', () => {
+      expect(count(undefined, undefined, [begin('11T03:00:00')]).rounds[1].mechanical).toBe(false);
+      expect(count(undefined, undefined, [begin('11T01:00:00')]).rounds[1].mechanical).toBe(true);
+    });
+    it('does not treat an untrusted fixer marker as activity', () => {
+      expect(count(undefined, undefined, [{ ...begin('11T01:30:00'), author: { login: 'outsider' } }])
+        .rounds[1].mechanical).toBe(true);
+    });
+    it.each([undefined, 'invalid'])('does not refund when any comment timestamp is unreadable: %s', createdAt => {
+      expect(count(undefined, undefined, [{ body: 'ordinary comment', createdAt, author: { login: 'outsider' } }])
+        .rounds[1].mechanical).toBe(false);
+    });
+    it('still rejects an invalid fix-begin timestamp', () => {
+      expect(count(undefined, undefined, [{ ...begin('11T01:30:00'), createdAt: 'invalid' }]))
+        .toMatchObject({ ok: false, reason: 'invalid-comment-time' });
+    });
+    it.each([undefined, null, {}, 'unreadable'])('does not refund with missing or non-array comments: %s', comments => {
+      expect(countRealFixRounds({ ...pr, comments, roundCommits: { head, commits: [{ ...c, mechanicalSquash: true }] } }))
+        .toMatchObject({ ok: false, reason: 'invalid-comments' });
+    });
+  });
   it.each([{ mechanicalSquash: 'true' }, { mechanicalSquash: true, subject: 'fix' },
     { mechanicalSquash: true, parents: [parent, 'e'.repeat(40)], mergesPrWork: false }])('rejects malformed squash facts: %j', bad => {
     expect(countRealFixRounds({ ...pr, roundCommits: { head, commits: [{ ...c, ...bad }] } })).toMatchObject({ ok: false, reason: 'invalid-commit' });
+  });
+});
+
+
+describe('readPrHeadHistory', () => {
+  const before = 'b'.repeat(40); const after = 'c'.repeat(40); const commit = 'd'.repeat(40);
+  const response = (hasNextPage = false) => JSON.stringify({ data: { repository: { pullRequest: {
+    timelineItems: { pageInfo: { hasNextPage }, nodes: [
+      { __typename: 'HeadRefForcePushedEvent', beforeCommit: { oid: before }, afterCommit: { oid: after } },
+      { __typename: 'PullRequestCommit', commit: { oid: commit } },
+    ] },
+  } } } });
+  it('collects force-push before/after, commit and current head oids using injected exec', () => {
+    const exec = vi.fn((bin, args, opts) => {
+      expect(bin).toBe('gh');
+      expect(opts.env).not.toHaveProperty('GH_TOKEN');
+      expect(opts.env).not.toHaveProperty('GITHUB_TOKEN');
+      expect(args.slice(0, 3)).toEqual(['api', 'graphql', '-f']);
+      expect(args[3]).toContain('HEAD_REF_FORCE_PUSHED_EVENT,PULL_REQUEST_COMMIT');
+      return response();
+    });
+    expect(readPrHeadHistory({ pr, repo: 'chalbert/web-everything', exec }))
+      .toEqual({ ok: true, shas: [head, before, after, commit] });
+    const enriched = enrichPrsWithMechanicalRound([pr], { roundCap: 6, readRoundCommits: () => facts,
+      repo: 'chalbert/web-everything', readPrHeadHistory: options => readPrHeadHistory({ ...options, exec }) })[0];
+    expect(enriched.headHistory).toEqual({ ok: true, shas: [head, before, after, commit] });
+  });
+  it('fails closed on a truncated timeline', () => {
+    expect(readPrHeadHistory({ pr, repo: 'chalbert/web-everything', exec: () => response(true) })).toEqual({ ok: false });
+  });
+  it('fails closed on exec, parse, GraphQL and malformed timeline failures', () => {
+    for (const exec of [() => { throw new Error('offline'); }, () => 'invalid', () => '{}',
+      () => JSON.stringify({ errors: [{ message: 'partial' }], ...JSON.parse(response()) }),
+      () => response().replace(before, 'bad')]) {
+      expect(readPrHeadHistory({ pr, repo: 'chalbert/web-everything', exec })).toEqual({ ok: false });
+    }
+    expect(enrichPrsWithMechanicalRound([pr], { roundCap: 6, readRoundCommits: () => facts,
+      readPrHeadHistory: () => { throw new Error('offline'); } })[0].headHistory).toEqual({ ok: false });
+  });
+  it('resolves the checkout repository when repo is omitted', () => {
+    const exec = vi.fn((_bin, args) => args[0] === 'repo'
+      ? JSON.stringify({ nameWithOwner: 'chalbert/web-everything' }) : response());
+    expect(readPrHeadHistory({ pr, exec }).ok).toBe(true);
+    expect(exec).toHaveBeenCalledTimes(2);
   });
 });

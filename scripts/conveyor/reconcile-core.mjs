@@ -432,7 +432,9 @@ export { CI_HEAL_ROUND_CAP, CI_HEAL_ATTEMPT_CAP_ENV, CI_HEAL_RESET_ON_FIX_HEAD_E
  * every round except one proven mechanical (its window holds only upstream merges git reproduces cleanly, plain drain
  * rebases included; a merge flagged `mergesPrWork` brought a repair branch in, or carries content git's clean merge of
  * its parents does not, and is real, so a drain rebase that auto-resolved a conflict or renumbered a card is spent too).
- * A round with no commit at all is spent, never refunded.
+ * An empty commit window is spent unless its re-arm interval has a trusted card squash receipt and no
+ * fixer activity. Receipts require complete PR head history and a cycle-free chain; unreadable comments
+ * cannot establish the absence of fixer activity.
  */
 export function countRealFixRounds(pr) {
   const facts = pr?.roundCommits;
@@ -460,7 +462,8 @@ export function countRealFixRounds(pr) {
     // The last commit must lead out of the range; a parentless one is a root or shallow boundary (missing rounds).
     if (i + 1 === facts.commits.length && !shaPattern.test(next ?? '')) return fail('truncated-history');
   }
-  const comments = (Array.isArray(pr?.comments) ? pr.comments : []).filter(isTrustedMarkerAuthor);
+  if (!Array.isArray(pr?.comments)) return fail('invalid-comments');
+  const comments = pr.comments.filter(isTrustedMarkerAuthor);
   const rearms = comments.filter((c) => typeof c.body === 'string' && c.body.trimStart().startsWith(REARM_COMMENT_MARKER));
   const begins = comments.filter((c) => typeof c.body === 'string' && c.body.trimStart().startsWith(FIX_BEGIN_MARKER)
     && /^fix-\d+$/.test(FIX_MARKER_WHO_RE.exec(c.body)?.[1] ?? ''));
@@ -468,6 +471,40 @@ export function countRealFixRounds(pr) {
   if ([...rearms, ...begins].some((c) => !Number.isFinite(time(c)))) return fail('invalid-comment-time');
   rearms.sort((a, b) => time(a) - time(b));
   begins.sort((a, b) => time(a) - time(b));
+  // Parse each comment through the trusted parser while retaining its timestamp locally.
+  const timedSquashMarkers = comments.flatMap((c) => parseCardSquashMarkers([c])
+    .map((marker) => ({ ...marker, at: time(c) })));
+  const history = pr?.headHistory;
+  const historyShas = history?.shas instanceof Set ? [...history.shas] : history?.shas;
+  const validHistory = history?.ok === true && Array.isArray(historyShas)
+    && [...historyShas].every(sha => typeof sha === 'string' && shaPattern.test(sha));
+  const heads = new Set(validHistory ? [...historyShas, pr.headRefOid] : []);
+  const prReceipts = timedSquashMarkers.filter(marker => heads.has(marker.newHead));
+  // Kahn's walk handles branching receipts and duplicate links without trusting comment order.
+  const links = new Map(); const indegrees = new Map();
+  for (const { oldHead, newHead } of prReceipts) {
+    if (!links.has(oldHead)) links.set(oldHead, new Set());
+    if (!indegrees.has(oldHead)) indegrees.set(oldHead, 0);
+    if (!links.get(oldHead).has(newHead)) {
+      links.get(oldHead).add(newHead);
+      indegrees.set(newHead, (indegrees.get(newHead) ?? 0) + 1);
+    }
+  }
+  const ready = [...indegrees.keys()].filter(sha => indegrees.get(sha) === 0);
+  for (let i = 0; i < ready.length; i++) {
+    for (const next of links.get(ready[i]) ?? []) {
+      indegrees.set(next, indegrees.get(next) - 1);
+      if (indegrees.get(next) === 0) ready.push(next);
+    }
+  }
+  const squashMarkers = ready.length === indegrees.size ? prReceipts : [];
+  // These markers are posted by fix/CI-heal procedures. Re-arms and squash receipts are not activity;
+  // reviewer/operator/watch bookkeeping is not evidence that a fixer ran either.
+  const fixerMarkers = [FIX_BEGIN_MARKER, FIX_END_MARKER, CONCURRENT_AUTHOR_PAUSE_MARKER,
+    STAND_DOWN_MARKER, CONFLICT_FIX_COMMENT_MARKER, ADVISORY_FIX_COMMENT_MARKER,
+    CI_HEAL_COMMENT_MARKER, CI_HEAL_FAILURE_MARKER, CI_HEAL_ESCALATION_MARKER];
+  // An undated comment cannot be proven outside a round, even if untrusted. Fail closed on the refund.
+  const readableComments = pr.comments.every(c => Number.isFinite(Date.parse(c?.createdAt ?? '')));
   let previous = -Infinity;
   const rounds = rearms.map((c) => {
     const end = time(c);
@@ -481,14 +518,19 @@ export function countRealFixRounds(pr) {
     // A merge that brings the PR's own work in (a repair branch merged --no-ff, or an edit folded into the merge
     // itself) is real, like a fix commit.
     // A single-parent drain subject remains real unless enrichment proved a card-only squash on main.
-    const squashMarkers = parseCardSquashMarkers(pr?.comments);
     const shas = inWindow.filter((commit) => (commit.parents.length === 1 && (commit.mechanicalSquash !== true
       || !squashMarkers.some(m => m.newHead === commit.sha))) || commit.mergesPrWork)
       .map((commit) => commit.sha);
+    // Squashing can erase commits, but it cannot refund a round in which a fixer ran. Use the full
+    // (previous re-arm, this re-arm] interval so a fix-begin at/before the commit-window start still counts.
+    const fixerActivity = comments.some(comment => time(comment) > previous && time(comment) <= end
+      && typeof comment.body === 'string'
+      && fixerMarkers.some(marker => comment.body.trimStart().startsWith(marker)));
+    const collapsedSquash = inWindow.length === 0 && readableComments && !fixerActivity
+      && squashMarkers.some(marker => marker.at > previous && marker.at <= end);
     previous = end;
-    // Refund only on positive evidence: the window holds commits and every one is an upstream merge or drain rebase.
-    // A window with NO commit proves nothing (an unchanged head re-armed again, a rewritten branch), so it stays spent.
-    return { at: c.createdAt, real: shas.length > 0, mechanical: shas.length === 0 && inWindow.length > 0, shas };
+    return { at: c.createdAt, real: shas.length > 0,
+      mechanical: shas.length === 0 && (inWindow.length > 0 || collapsedSquash), shas };
   });
   return { ok: true, real: rounds.filter((r) => !r.mechanical).length, total: rounds.length, rounds };
 }
