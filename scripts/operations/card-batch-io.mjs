@@ -196,11 +196,31 @@ export function validMergeProof(recorded, mergeOid) {
   return ids.size === 0;
 }
 
+/** Never trust the stored proof's content: re-verify it against git. The merge commit must be an ancestor of main,
+ * and `git ls-tree <merge> -- <path>` must return exactly the stored blob for every member. A mismatch or a clean
+ * negative is false; any other git failure throws (the caller keeps the batch held). */
+export async function verifyMergeProof(recorded, mergeOid, { git, remote = 'origin' }) {
+  if (!validMergeProof(recorded, mergeOid)) return false;
+  const no = async args => {
+    try { await git(args); return false; } catch (error) { if (error?.status === 1) return true; throw error; }
+  };
+  await git(['fetch', '--no-tags', remote, 'refs/heads/main']);
+  const main = String(await git(['rev-parse', 'FETCH_HEAD^{commit}'])).trim();
+  if (await no(['rev-parse', '--verify', '--quiet', `${mergeOid}^{commit}`])) await git(['fetch', '--no-tags', remote, mergeOid]);
+  if (await no(['merge-base', '--is-ancestor', mergeOid, main])) return false;
+  for (const entry of recorded.sealFailure.mergeProof.members) {
+    const out = String(await git(['ls-tree', mergeOid, '--', entry.path])).replace(/\n$/, '');
+    const match = out.match(/^\d{6} blob ([0-9a-f]{40}(?:[0-9a-f]{24})?)\t([^\n]+)$/);
+    if (!match || match[1] !== entry.blob || match[2] !== entry.path) return false;
+  }
+  return true;
+}
+
 /** A sealed card batch may be retired and replaced only when a fresh GitHub read confirms its PR is MERGED or CLOSED.
  * Retire a terminal sealed generation under the caller's admission lease; unreadable evidence stays held. */
 export async function retireTerminalBatch(recorded, input, {
   statePath, stateDir = dirname(statePath), remote = 'origin', gh = defaultGh,
-  held: stillHeld, log = line => process.stderr.write(`${line}\n`),
+  held: stillHeld, log = line => process.stderr.write(`${line}\n`), git = null,
 }) {
   if ((!recorded?.sealFailure && recorded?.seal?.step !== 'label-on-green')
     || !recorded?.batchRef || !recorded.sealedAt || !recorded.pr
@@ -220,7 +240,7 @@ export async function retireTerminalBatch(recorded, input, {
     if (recorded.sealFailure?.terminalPrState === 'MERGED') {
       const merged = status === 'MERGED'
         ? JSON.parse(await gh(['pr', 'view', String(recorded.pr), '--repo', input.source.repo, '--json', 'mergeCommit']))?.mergeCommit?.oid : null;
-      if (!validMergeProof(recorded, merged)) {
+      if (!await verifyMergeProof(recorded, merged, { git: git ?? recoveryGitIn(input.laneDir ?? ROOT), remote })) {
         log(`card-batch ${recorded.batchRef} PR ${recorded.pr} GitHub ${status}: no valid landing proof; kept sealed and held`);
         return refuse('batch-sealed');
       }

@@ -16,6 +16,8 @@ import { parseRunJsonTail } from './land-prevention-card.mjs';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 export const CARD_BATCH_STATE_DIR = cardBatchStateDir();
 export const HOLD_LABEL = 'review-status:draft-withdrawn';
+/** Carries a landing-proof failure out of stuck-seal recovery unchanged (see orRecoverMerged). */
+class ProofFailure { constructor(cause) { this.cause = cause; } }
 /** Unrun verifies tolerated before the batch is held for a person; keeps a permanently broken verify from looping forever. */
 export const VERIFY_UNRUN_CAP = 3;
 const refuse = reason => ({ action: 'refuse', reason });
@@ -180,7 +182,7 @@ export async function publishBatch(input, opts = {}) {
       state.sealFailure = { ...state.sealFailure, mergeProof: proof };
       save();
       return retireTerminalBatch(state, { ...input, source: { repo }, kind, laneDir: cwd }, {
-        statePath, stateDir, remote, gh, held, log: opts.log,
+        statePath, stateDir, remote, gh, held, log: opts.log, git: args => run('git', args),
       });
     };
     const retire = async () => {
@@ -189,7 +191,7 @@ export async function publishBatch(input, opts = {}) {
       if (state.sealFailure?.terminalPrState === 'MERGED') return retireMerged();
       if (state.sealFailure) return retireBatch(statePath, state, { repo, kind, held });
       return retireTerminalBatch(state, { ...input, source: { repo }, kind, laneDir: cwd }, {
-        statePath, stateDir, remote, gh, held, log: opts.log,
+        statePath, stateDir, remote, gh, held, log: opts.log, git: args => run('git', args),
       });
     };
     if (state.sealFailure?.terminalPrState === 'MERGED') {
@@ -211,7 +213,8 @@ export async function publishBatch(input, opts = {}) {
       if (Number(view?.number) !== Number(state.pr) || view.headRefName !== state.batchRef || view.state !== 'MERGED') return null;
       let missing;
       let proof;
-      try { ({ missing, proof } = await cardsNotProvenOnMain()); } catch { return null; }
+      // A proof that cannot be completed (a git/IO failure, not a clean "no") propagates as itself.
+      try { ({ missing, proof } = await cardsNotProvenOnMain()); } catch (error) { throw new ProofFailure(error); }
       if (missing.length) {
         process.stderr.write(`card-batch ${state.batchRef} PR ${state.pr} MERGED but ${missing.length} card(s) not proven on main `
           + `(${missing.slice(0, 5).join(', ')}): kept held\n`);
@@ -222,14 +225,16 @@ export async function publishBatch(input, opts = {}) {
       save();
       // retire() re-runs the proof before retiring. Only a completed retirement replaces the original outcome;
       // otherwise the next run retries (proof included) and this run keeps its own failure.
-      const retired = await retire();
+      let retired;
+      try { retired = await retire(); } catch (error) { throw new ProofFailure(error); }
       return retired?.action === 'retired' ? { action: 'held', state, retired: true } : null;
     };
     // Recovery replaces the original outcome only when it completed. Otherwise a thrown original is rethrown
     // unchanged (whatever was thrown), and a returned refusal is returned; a failing recovery never fulfils in their place.
     const orRecoverMerged = async ({ threw = false, thrown, returned }) => {
       let recovered = null;
-      try { recovered = await recoverMergedSeal(); } catch { /* keep the original outcome */ }
+      try { recovered = await recoverMergedSeal(); }
+      catch (error) { if (error instanceof ProofFailure) throw error.cause; /* any other recovery failure keeps the original */ }
       if (recovered) return recovered;
       if (threw) throw thrown;
       return returned;

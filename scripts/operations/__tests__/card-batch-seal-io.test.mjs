@@ -511,6 +511,10 @@ const terminalFixture = (prState, main = landedMain()) => {
       if (args[2] === main.mergeOid && main.mergeOnMain) return '';
       throw Object.assign(new Error('not an ancestor'), { status: 1 });
     }
+    if (cmd === 'git' && args[0] === 'ls-tree' && args[2] === '--') {
+      // `ls-tree <sha> -- <path>`: the fixture's blob id for every existing path is the fixture rev-parse value.
+      return (tree(args[1]) ?? {})[args[3]] === undefined ? '' : `100644 blob ${'a'.repeat(40)}\t${args[3]}\n`;
+    }
     if (cmd === 'git' && args[0] === 'ls-tree') return Object.keys(tree(args[2]) ?? {}).join('\n');
     if (cmd === 'git' && args[0] === 'grep') {
       const hits = Object.entries(main.mergeFiles).filter(([, text]) => /^bornAs: [a-z0-9]+$/m.test(text)).map(([path]) => `${main.mergeOid}:${path}`);
@@ -758,7 +762,7 @@ it('#5680: protection re-armed by head adoption that fails on a merged PR takes 
 });
 
 describe('the stored landing proof gates every terminal retirement of a MERGED-mid-seal batch', () => {
-  const proofOf = (oid = MERGE) => ({ merge: oid, members: [{ cardId: '123', path: 'backlog/6597-card.md', blob: 'c'.repeat(40) }] });
+  const proofOf = (oid = MERGE, entry = {}) => ({ merge: oid, members: [{ cardId: '123', path: 'backlog/6597-card.md', blob: 'a'.repeat(40), ...entry }] });
   const recordedState = (f, mergeProof) => {
     const state = { ...activeSlot(f), restoreProtection: undefined, holdApplied: true,
       sealFailure: { reason: 'PR MERGED before the seal finished', terminalPrState: 'MERGED', ...(mergeProof ? { mergeProof } : {}) } };
@@ -766,7 +770,7 @@ describe('the stored landing proof gates every terminal retirement of a MERGED-m
     return state;
   };
   const reconcileRetire = (f, exec, state) => retireTerminalBatch(state, { kind: 'prevention', source: { repo: 'org/repo' }, laneDir: f.dir }, {
-    statePath: f.statePath, stateDir: f.dir, gh: args => exec('gh', args), held: () => true, log: () => {} });
+    statePath: f.statePath, stateDir: f.dir, gh: args => exec('gh', args), git: args => exec('git', args), held: () => true, log: () => {} });
   it('reconcile refuses a MERGED seal failure with no stored proof', async () => {
     const { f, exec } = terminalFixture('MERGED');
     expect(await reconcileRetire(f, exec, recordedState(f, null))).toEqual({ action: 'refuse', reason: 'batch-sealed' });
@@ -780,6 +784,24 @@ describe('the stored landing proof gates every terminal retirement of a MERGED-m
     const { f, exec } = terminalFixture('MERGED');
     const bad = { merge: MERGE, members: [{ cardId: '999', path: 'backlog/6597-card.md', blob: 'c'.repeat(40) }] };
     expect(await reconcileRetire(f, exec, recordedState(f, bad))).toEqual({ action: 'refuse', reason: 'batch-sealed' });
+  });
+  it('reconcile refuses a tampered blob id', async () => {
+    const { f, exec } = terminalFixture('MERGED');
+    expect(await reconcileRetire(f, exec, recordedState(f, proofOf(MERGE, { blob: 'c'.repeat(40) })))).toEqual({ action: 'refuse', reason: 'batch-sealed' });
+  });
+  it('reconcile refuses a proof retargeted at a path that is not in the merge tree', async () => {
+    const { f, exec } = terminalFixture('MERGED');
+    expect(await reconcileRetire(f, exec, recordedState(f, proofOf(MERGE, { path: 'backlog/9999-elsewhere.md' })))).toEqual({ action: 'refuse', reason: 'batch-sealed' });
+  });
+  it('reconcile refuses when the merge commit is not on main (re-verified, not trusted)', async () => {
+    const { f, exec } = terminalFixture('MERGED', landedMain({ mergeOnMain: false }));
+    expect(await reconcileRetire(f, exec, recordedState(f, proofOf()))).toEqual({ action: 'refuse', reason: 'batch-sealed' });
+  });
+  it('reconcile keeps the batch held when re-verification hits a git failure', async () => {
+    const { f, exec: base } = terminalFixture('MERGED');
+    const exec = vi.fn((cmd, args, options) => { if (cmd === 'git' && args[0] === 'ls-tree') throw Object.assign(new Error('bad'), { status: 128 }); return base(cmd, args, options); });
+    expect(await reconcileRetire(f, exec, recordedState(f, proofOf()))).toEqual({ action: 'refuse', reason: 'batch-sealed' });
+    expect(activeSlot(f).lastSealedState).toBeUndefined();
   });
   it('reconcile retires with a valid stored proof for the actual merge commit', async () => {
     const { f, exec } = terminalFixture('MERGED');
@@ -817,4 +839,12 @@ describe('the stored landing proof gates every terminal retirement of a MERGED-m
     try { expect(await publishBatch(f.input, { ...f.opts, exec })).toEqual({ action: 'refuse', reason: 'cards-not-proven-on-main' }); }
     finally { err.mockRestore(); }
   });
+});
+
+it('a first-attempt proof git failure (not a clean no) propagates instead of the original failure', async () => {
+  const { f, exec: base } = terminalFixture('MERGED');
+  const boom = Object.assign(new Error('fatal: bad object'), { status: 128 });
+  const exec = failUndo(vi.fn((cmd, args, options) => { if (cmd === 'git' && args[0] === 'merge-base' && args[3] === MAIN) throw boom; return base(cmd, args, options); }));
+  await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toBe(boom);
+  expect(activeSlot(f).sealFailure).toBeUndefined();
 });
