@@ -178,7 +178,7 @@ it('age jobs are detached, unrefed and never awaited; unfinished seals are retri
 it('an unopenable seal log never blocks the launch', async () => {
   const f = fixture(); const spawn = vi.fn(fakeChild);
   expect(await sealDueBatches({ now: 60000, stateDir: f.dir, policy: f.opts.policy, spawn, open: () => { throw Error('EACCES'); } })).toEqual([f.statePath]);
-  expect(spawn.mock.calls[0][2].stdio).toBe('ignore');
+  expect(spawn.mock.calls[0][2].stdio).toEqual(['ignore', 'ignore', 'ignore']);
 });
 it('rechecks the remote after verification and refuses drift without releasing the hold', async () => {
   const f = fixture({ maxCards: 1 });
