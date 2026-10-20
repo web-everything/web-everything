@@ -72,6 +72,9 @@ export function resolveRefillMode({ env = process.env, toolPath = SETTINGS_PATH,
       env, standard: { refillOnCompletion: 'off' },
       envValues: { refillOnCompletion: typeof raw === 'string' && REFILL_MODES.includes(raw) ? raw : undefined },
       valid: { refillOnCompletion: (v) => REFILL_MODES.includes(v) },
+      // The cascade's own source line goes to console.error, which in a daemon can rotate its log files. Silence it;
+      // the resolved source is logged once by `start()` through the daemon's normal log path instead.
+      log: () => {},
     });
     const mode = r.value?.refillOnCompletion;
     if (!REFILL_MODES.includes(mode)) return { mode: 'off', source: 'standard' };
@@ -153,7 +156,7 @@ export function createReviewRefill({
   /** The pass's `onPlan`, tapped: remember each repo's plan, then call the existing consumer unchanged. */
   function tapPlan(next = null) {
     return (info) => {
-      try { if (info?.repo && info.plan) planning.set(info.repo, { plan: info.plan, rawPrs: info.rawPrs }); } catch { /* observation only */ }
+      try { if (info?.repo && info.plan) planning.set(info.repo, { plan: info.plan, rawPrs: info.rawPrs, at: now() }); } catch { /* observation only */ }
       return typeof next === 'function' ? next(info) : undefined;
     };
   }
@@ -235,7 +238,7 @@ export function createReviewRefill({
 
   /** The pass finished: match what it dispatched against earlier would-dispatches, and keep its leftover queue. */
   function notePass(result) {
-    if (mode() === 'off') { planning = new Map(); return; }
+    if (mode() === 'off' || result?.skipped) { planning = new Map(); return; } // no plan was made: keep any older queue, which keeps aging
     const end = now();
     for (const d of (Array.isArray(result?.dispatched) ? result.dispatched : [])) {
       const k = keyOf(d.repo, d.prNumber);
@@ -247,18 +250,21 @@ export function createReviewRefill({
       savedMinutes += mins;
       log(`refill-shadow: pass dispatched #${d.prNumber} (${d.repo}) ${mins.toFixed(1)} min after the refill would have${Number.isFinite(d.at) ? '' : ' (upper bound: pass end time)'}; idle-slot minutes saved ${mins.toFixed(1)}, total ${savedMinutes.toFixed(1)}`);
     }
-    try { queue = planning.size ? { at: end, rows: buildQueue(result) } : null; } catch { queue = null; } // doubt: no queue
+    // The queue ages from when its OLDEST plan was captured, not from when the pass ended.
+    try { queue = planning.size ? { at: Math.min(...[...planning.values()].map((p) => p.at)), rows: buildQueue(result) } : null; } catch { queue = null; } // doubt: no queue
     planning = new Map();
     freed = []; // the pass just refilled whatever it could
   }
 
   async function guardPass(fn) {
     const release = await lock.acquire('pass');
-    try { return await fn(); } finally { release(); }
+    planning = new Map(); // plans left by an earlier aborted pass are never trusted
+    try { return await fn(); } finally { planning = new Map(); release(); } // an aborted pass leaves nothing behind
   }
 
   function start() {
     if (pollTimer !== null) return stop;
+    mode(); // logs the resolved setting and its source once, through the daemon's normal log
     pollTimer = setPoll(() => { try { poll(); } catch { /* fail closed */ } }, pollMs);
     pollTimer?.unref?.();
     return stop;

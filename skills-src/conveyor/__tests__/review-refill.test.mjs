@@ -70,6 +70,68 @@ describe('resolveRefillMode', () => {
   });
 });
 
+describe('silent cascade and start-up log', () => {
+  it('resolving the mode never writes to console.error, even when the cascade log is forced on', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const r = resolveRefillMode({ env: isolatedEnv({ WE_POLICY_CASCADE_LOG: '1' }), toolPath: tmpSettings({ refillOnCompletion: 'shadow' }) });
+      expect(r.mode).toBe('shadow');
+      expect(spy).not.toHaveBeenCalled();
+    } finally { spy.mockRestore(); }
+  });
+  it('passes the cascade a silent logger', () => {
+    let seen;
+    resolveRefillMode({ env: isolatedEnv(), toolPath: '/nonexistent.json', cascade: (_p, _t, o) => { seen = o; return { value: { refillOnCompletion: 'off' }, sources: {} }; } });
+    expect(typeof seen.log).toBe('function');
+    expect(seen.log('x')).toBeUndefined();
+  });
+  it('start() logs the resolved setting and source once through the injected log', () => {
+    const h = rig();
+    h.r.start(); h.r.start();
+    expect(h.logs.filter((l) => l.startsWith('refill: review.refillOnCompletion=shadow (test)'))).toHaveLength(1);
+  });
+});
+
+describe('aborted and skipped passes', () => {
+  it('a pass that aborts leaves no plans behind, so a later skipped pass builds no queue', async () => {
+    const h = rig();
+    await expect(h.r.guardPass(async () => {
+      h.r.tapPlan(null)({ repo: 'o/r', plan: { dispatch: [{ kind: 'review', prNumber: 2 }] }, rawPrs: [{ number: 2, headRefOid: HEAD(2) }] });
+      throw new Error('abort');
+    })).rejects.toThrow('abort');
+    h.advance(QUEUE_MAX_AGE_MS + 1000);
+    h.r.notePass({ skipped: true });
+    expect(h.r._state().queue).toBeNull();
+    freeSlot(h); h.fire();
+    expect(h.reads).toEqual([]);
+  });
+  it('plans captured before a pass starts are dropped when the next pass begins', async () => {
+    const h = rig();
+    h.r.tapPlan(null)({ repo: 'o/r', plan: { dispatch: [{ kind: 'review', prNumber: 2 }] }, rawPrs: [{ number: 2, headRefOid: HEAD(2) }] });
+    await h.r.guardPass(async () => { h.r.notePass({ dispatched: [] }); });
+    expect(h.r._state().queue).toBeNull();
+  });
+  it('a skipped pass keeps the older queue and does not refresh its age', () => {
+    const h = rig();
+    runPass(h);
+    const before = h.r._state().queue.at;
+    h.advance(10 * 60_000);
+    h.r.notePass({ skipped: true });
+    expect(h.r._state().queue.at).toBe(before);
+  });
+  it('the queue ages from plan capture, not from the end of the pass', () => {
+    const h = rig();
+    h.r.tapPlan(null)({ repo: 'o/r', plan: { dispatch: [{ kind: 'review', prNumber: 2 }, { kind: 'review', prNumber: 3 }] },
+      rawPrs: [{ number: 2, headRefOid: HEAD(2) }, { number: 3, headRefOid: HEAD(3) }] });
+    h.advance(20 * 60_000);          // an 20-minute pass
+    h.r.notePass({ dispatched: [] });
+    expect(h.r._state().queue.at).toBe(1_000_000);
+    h.advance(6 * 60_000);           // 26 min since capture, only 6 since the pass ended
+    freeSlot(h); h.fire();
+    expect(h.reads).toEqual([]);
+  });
+});
+
 describe('queue from the last pass', () => {
   it('taps the plan, calls the existing consumer unchanged, and queues undispatched reviews in the pass order', () => {
     const h = rig();
