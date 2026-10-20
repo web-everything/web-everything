@@ -5,7 +5,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   checkGitIdentity, identityVerdict, parseIdent, readGitIdentity, resolveGitIdentityPlaceholders, BUILTIN_PLACEHOLDERS,
-  configHasUserOverride, laneIdentityReport,
+  laneIdentityReport,
 } from '../git-identity.mjs';
 
 describe('checkGitIdentity', () => {
@@ -94,35 +94,26 @@ describe('parseIdent / readGitIdentity', () => {
   });
 });
 
-describe('configHasUserOverride / laneIdentityReport (lane-pool status)', () => {
-  it('detects a [user] override in a .git/config', () => {
-    expect(configHasUserOverride('[core]\n\tbare = false\n[user]\n\tname = test\n')).toBe(true);
-    expect(configHasUserOverride('[core]\n\tname = x\n[remote "origin"]\n\turl = u\n')).toBe(false);
-    expect(configHasUserOverride('')).toBe(false);
-    expect(configHasUserOverride('[author]\n\tname = test\n')).toBe(true);
-    expect(configHasUserOverride('[committer]\n\temail = x@test.com\n')).toBe(true);
-    expect(configHasUserOverride('[includeIf "gitdir:~/w/"]\n\tpath = id.inc\n')).toBe(true);
-    expect(configHasUserOverride('[include]\n\tpath = x\n')).toBe(true);
-  });
+describe('laneIdentityReport (lane-pool status) — git resolves each lane', () => {
   const real = { author: { name: 'Ada', email: 'ada@x.io' }, committer: { name: 'Ada', email: 'ada@x.io' } };
   const fake = { author: { name: 'test', email: 'test@test.com' }, committer: { name: 'test', email: 'test@test.com' } };
   const lanes = [1, 2, 3].map((n) => ({ lane: n, dir: `/p/lane-${n}` }));
-  it('reads the ambient identity ONCE for lanes with no override', () => {
+  it('asks git in EVERY lane (no config-file parsing to fool)', () => {
     const reads = [];
-    const r = laneIdentityReport({ lanes, readIn: (d) => { reads.push(d); return fake; }, hasOverride: () => false });
-    expect(reads).toEqual(['/p/lane-1']);
+    const r = laneIdentityReport({ lanes, readIn: (d) => { reads.push(d); return fake; } });
+    expect(reads).toEqual(['/p/lane-1', '/p/lane-2', '/p/lane-3']);
     expect(r.status).toBe('placeholder');
     expect(r.bad.map((b) => b.lane)).toEqual([1, 2, 3]);
   });
-  it('a lane whose own config overrides to a placeholder is singled out', () => {
-    const r = laneIdentityReport({ lanes, readIn: (d) => (d.endsWith('2') ? fake : real), hasOverride: (d) => d.endsWith('2') });
+  it('a lane whose own config resolves to a placeholder is singled out', () => {
+    const r = laneIdentityReport({ lanes, readIn: (d) => (d.endsWith('2') ? fake : real) });
     expect(r.bad.map((b) => b.lane)).toEqual([2]);
   });
   it('an unreadable identity is not reported as a placeholder lane', () => {
-    expect(laneIdentityReport({ lanes, readIn: () => ({ ...real, error: 'ETIMEDOUT' }), hasOverride: () => false }).bad).toEqual([]);
+    expect(laneIdentityReport({ lanes, readIn: () => ({ ...real, error: 'ETIMEDOUT' }) }).bad).toEqual([]);
   });
   it('all real → ok', () => {
-    expect(laneIdentityReport({ lanes, readIn: () => real, hasOverride: () => false })).toEqual({ status: 'ok', bad: [] });
+    expect(laneIdentityReport({ lanes, readIn: () => real })).toEqual({ status: 'ok', bad: [] });
   });
 });
 

@@ -10,6 +10,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { guardDecision, isLaneRoot } from '../guard-git-identity.mjs';
+import { readGitIdentity, laneIdentityReport } from '../lib/git-identity.mjs';
+import { appendFileSync } from 'node:fs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const GUARD = resolve(HERE, '../guard-git-identity.mjs');
@@ -99,6 +101,17 @@ describe('end to end: real git commit through the hook', () => {
     const r = commit(lane, { GIT_AUTHOR_NAME: 'test', GIT_AUTHOR_EMAIL: 'test@test.com' });
     expect(r.status).not.toBe(0);
     expect(r.stderr).toMatch(/author:/);
+  });
+
+  it('lane-pool report: an INLINE `[user] name = test` lane config is caught (git resolves it, no file parsing)', () => {
+    const ok = makeRepo('.lanes/web-everything/lane-4');
+    setIdent(ok, real);
+    const bad = makeRepo('.lanes/web-everything/lane-5');
+    setIdent(bad, real);
+    appendFileSync(join(bad, '.git/config'), '[user] name = test\n[author] email = a@test.com\n');
+    const r = laneIdentityReport({ lanes: [{ lane: 4, dir: ok }, { lane: 5, dir: bad }], readIn: (d) => readGitIdentity(d, { env }) });
+    expect(r.bad.map((b) => b.lane)).toEqual([5]);
+    expect(r.status).toBe('placeholder');
   });
 
   it('outside a lane the guard never blocks', () => {

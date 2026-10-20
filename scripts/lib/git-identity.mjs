@@ -140,42 +140,17 @@ export const GIT_IDENTITY_FIX_HINT =
   + '(and check no lane .git/config or GIT_AUTHOR_*/GIT_COMMITTER_* env overrides it)';
 
 /**
- * PURE: could a `.git/config` text change the identity for its lane? True for a `[user]`, `[author]` or
- * `[committer]` name/email, and for ANY `[include]` / `[includeIf …]` (its target may set one — reading it is
- * cheaper than proving it doesn't; audit finding). Conservative on purpose: a false positive costs one `git var`.
- */
-export function configHasUserOverride(text) {
-  let inIdent = false;
-  for (const raw of String(text ?? '').split('\n')) {
-    const line = raw.trim();
-    const sec = /^\[([^\]\s"]+)/.exec(line);
-    if (sec) {
-      const name = sec[1].toLowerCase();
-      if (name === 'include' || name === 'includeif') return true;
-      inIdent = name === 'user' || name === 'author' || name === 'committer';
-      continue;
-    }
-    if (inIdent && /^(name|email)\s*(=|$)/i.test(line)) return true;
-  }
-  return false;
-}
-
-/**
- * The pool-wide identity check for `lane-pool.mjs status`/`provision`, cheap on a big pool: ONE `git var` read for
- * the ambient identity (global config + env, shared by every lane), plus a read in each lane whose own
- * `.git/config` overrides `[user]`. IO is injected.
- * @param {{lanes:{lane:number,dir:string}[], readIn:(dir:string)=>{author:object,committer:object},
- *   hasOverride:(dir:string)=>boolean, lists?:object}} o
+ * The pool-wide identity check for `lane-pool.mjs status`/`provision`. Asks GIT for the resolved identity IN EACH
+ * LANE (`readIn` = `git var GIT_AUTHOR_IDENT`/`GIT_COMMITTER_IDENT` there) — never parses config files, so every
+ * valid config syntax, `[author]`/`[committer]`, include and includeIf is covered (audit finding). IO injected.
+ * @param {{lanes:{lane:number,dir:string}[], readIn:(dir:string)=>{author:object,committer:object,error?:string},
+ *   lists?:object}} o
  * @returns {{status:'ok'|'placeholder'|'missing', bad:{lane:number,status:string,detail:string}[]}}
  */
-export function laneIdentityReport({ lanes, readIn, hasOverride, lists = BUILTIN_PLACEHOLDERS }) {
-  if (!lanes.length) return { status: 'ok', bad: [] };
-  let ambient = null; // read once, in the first lane WITHOUT its own override
+export function laneIdentityReport({ lanes, readIn, lists = BUILTIN_PLACEHOLDERS }) {
   const bad = [];
   for (const { lane, dir } of lanes) {
-    const own = hasOverride(dir);
-    if (!own && !ambient) ambient = identityVerdict(readIn(dir), lists);
-    const v = own ? identityVerdict(readIn(dir), lists) : ambient;
+    const v = identityVerdict(readIn(dir), lists);
     if (v.status !== 'ok' && v.status !== 'error') bad.push({ lane, status: v.status, detail: v.detail });
   }
   const status = bad.some((b) => b.status === 'missing') ? 'missing' : bad.length ? 'placeholder' : 'ok';
