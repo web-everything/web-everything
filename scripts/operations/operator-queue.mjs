@@ -124,7 +124,7 @@ export function rulingNeededRow(repo, pr) {
 
 /** A red-team round-cap ruling and its read-only operator command suggestions. PURE. */
 export function redTeamRulingRow(repo, pr, setting = CONFIRMED_BREAKS_DEFAULTS) {
-  const need = redTeamRulingNeeded(pr, setting);
+  const need = redTeamRulingNeeded(pr, setting, { repo: repo || pr?.repo || null });
   if (!need) return null;
   const command = `node scripts/review-set-label.mjs ${pr.number} --repo=${repo}`;
   return {

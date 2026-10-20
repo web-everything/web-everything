@@ -214,7 +214,7 @@ describe('applyRedTeamGate', () => {
       expect(kinds(calls)).toEqual(['sendBack', 'ledger', 'comment']);
       // The send-back record after the grant now decides the step: no second send-back, and the break is the fixer's.
       expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'already-acted', outcome: 'sent-back' });
-      const pr = { number: 4722, headRefOid: HEAD, labels: ['review:changes'], comments };
+      const pr = { number: 4722, repo: REPO, headRefOid: HEAD, labels: ['review:changes'], comments };
       expect(redTeamQueueReason(pr)).toMatch(/the fixer owns them/);
       expect(redTeamRulingNeeded({ ...pr, labels: ['review:accepted'] })).toBeNull();
     });
@@ -230,6 +230,19 @@ describe('applyRedTeamGate', () => {
       expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'applied', outcome: 'round-cap' });
       expect(kinds(calls)).toEqual(['comment']);
       expect(calls[0][1].body).toMatch(/review round 12 has reached the round cap \(6\)/);
+      expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'already-acted', outcome: 'round-cap' });
+    });
+
+    it('the shared reader credits a grant only for this PR\'s repo; no repo means no credit (Codex audit)', async () => {
+      const raced = { author: { login: 'web-everything' }, createdAt: '2026-10-19T13:00:00Z',
+        body: buildGateComment({ pr: 4722, head: HEAD, outcome: GATE_OUTCOMES.SENT_BACK, plan: { sendBack: [{ index: 1 }], card: [], advisory: [] },
+          round: 12, result: redTeamResultId(parseRedTeamComment(comment([F()]).body)) }) };
+      const fui = { ...grant(1), body: buildRoundExtensionComment({ repo: 'frontier-ui/frontierui', pr: 4722, by: 1, actor: 'chalbert', channel: 'c', reason: 'Yes', at: '2026-10-19T12:00:00Z' }) };
+      const pr = (g) => ({ number: 4722, headRefOid: HEAD, labels: ['review:accepted'], comments: [comment([F()]), capRecord(), g, raced] });
+      expect(redTeamRulingNeeded(pr(fui), CONFIRMED_BREAKS_DEFAULTS, { repo: REPO })).not.toBeNull();
+      expect(redTeamRulingNeeded(pr(grant(1)))).not.toBeNull();
+      expect(redTeamRulingNeeded(pr(grant(1)), CONFIRMED_BREAKS_DEFAULTS, { repo: REPO })).toBeNull();
+      const { io } = fakeIo({ comments: [comment([F()]), capRecord(), fui], round: 12, readRoundAsOf: () => 12 });
       expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'already-acted', outcome: 'round-cap' });
     });
 
