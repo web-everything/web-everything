@@ -100,6 +100,15 @@ describe('drain merge strategy — drain-direct (default) is unchanged', () => {
 });
 
 describe('drain merge strategy — github-merge-queue', () => {
+  it('xym8nt4: a card-group source is deferred as card-grouped and never reaches the enqueue mutation', () => {
+    const { s, calls } = harness({ strategy: 'github-merge-queue', strategyExtra: {
+      cardGroupHold: c => (c.num === 42 ? { kind: 'card-grouped', reason: 'grouped into #9 (lands with it; drain.group)' } : null) } });
+    const r = s.enqueue({ num: 42, repo: null }, HEAD, { comments: [] });
+    expect(r).toMatchObject({ enqueued: false, deferred: true, kind: 'card-grouped' });
+    expect(calls.some(c => c.join(' ').includes('enqueuePullRequest'))).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
   it('enqueues only the local repo PRs (sibling-repo impl halves stay direct)', () => {
     const { s } = harness({ strategy: 'github-merge-queue' });
     expect(s.enqueues(null)).toBe(true);
