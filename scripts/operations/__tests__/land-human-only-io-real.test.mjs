@@ -22,17 +22,21 @@ it('finds the clone of the repo from inside it, and refuses a checkout of anothe
       return args.includes('get-url') ? origin : real;
     };
     for (const origin of [`https://github.com/${slug}.git`, `git@github.com:${slug}.git`, `ssh://git@github.com/${slug}.git`]) {
-      const options = { candidates: [nested], exec: withOrigin(origin) };
+      const options = { candidates: [nested], exec: withOrigin(origin), canonical: () => null };
       expect(cloneFor(slug, options)).toBe(clone);
       expect(cloneFor(`someone/${slug.split('/')[1]}`, options)).toBeNull();
       expect(cloneFor('someone/other-repo', options)).toBeNull();
     }
     expect(cloneFor(slug, { candidates: [nested], exec: withOrigin(`https://elsewhere.test/${slug}.git`) })).toBeNull();
+    // A clone whose origin keeps a renamed repo's old owner counts once GitHub resolves that spelling to the repo.
+    const renamed = { candidates: [nested], exec: withOrigin(`git@github.com:old-owner/${slug.split('/')[1]}.git`) };
+    expect(cloneFor(slug, { ...renamed, canonical: () => slug.toLowerCase() })).toBe(clone);
+    expect(cloneFor(slug, { ...renamed, canonical: () => null })).toBeNull();
     // A local path cannot establish the GitHub host even when owner/name matches.
     expect(cloneFor(slug, { candidates: [nested] })).toBeNull();
   });
   // A checkout with no origin at all is never mistaken for the repo.
   await withRealRepo(async ({ root }) => {
-    expect(cloneFor('web-everything/repo', { candidates: [root] })).toBeNull();
+    expect(cloneFor('web-everything/repo', { candidates: [root], canonical: () => null })).toBeNull();
   });
 });
