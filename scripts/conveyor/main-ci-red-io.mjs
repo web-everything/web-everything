@@ -15,6 +15,7 @@
  * UNKNOWN NEVER ACTS. A failed or throttled runs read throws (the tick records a probe error, the smell is skipped,
  * no dispatch). An unreadable or possibly-truncated open-PR read makes ownership unknown: no dispatch.
  */
+import { listMergeGroupCiRuns } from '../lib/latent-red-main.mjs';
 import { readFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
@@ -204,9 +205,11 @@ export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAU
     failing.groupEvidence = null;
     if (settings.mainCiRedMergeGroupFlakeEvidence && settings.mainCiRedMergeGroupRunLimit > 0 && tip?.sha) {
       try {
-        const groupRuns = ghJson(exec, ['run', 'list', '--repo', repoSlug, '--workflow', settings.mainCiRedWorkflow,
-          '--event', 'merge_group', '--limit', String(settings.mainCiRedMergeGroupRunLimit), '--json',
-          'databaseId,conclusion,status,createdAt,updatedAt,headBranch,headSha,event,attempt']);
+        // Merge-group runs live under a different workflow id than `--workflow ci.yml`, so `gh run list --workflow
+        // --event merge_group` returned [] (live 2026-10-20): read the REST runs endpoint filtered by workflow path.
+        const groupRuns = listMergeGroupCiRuns({ repo: repoSlug, limit: settings.mainCiRedMergeGroupRunLimit,
+          workflowPath: `.github/workflows/${settings.mainCiRedWorkflow}`,
+          exec: (bin, argv, opts) => { const out = exec(bin, argv, opts); if (isGhDeferred(out)) throw new Error('gh read deferred (low budget)'); return out; } });
         let groupReads = 0;
         failing.groupEvidence = findMergeGroupFlakeEvidence({ groupRuns, tipSha: tip.sha, failedJobs: failing.jobs, settings,
           jobsOf: (runId) => {
