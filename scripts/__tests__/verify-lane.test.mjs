@@ -129,6 +129,22 @@ describe('verify-lane — hard per-phase timeout (verify-admission, 2026-10-20)'
     const grandchild = Number(readFileSync(pidFile, 'utf8'));
     expect(() => process.kill(grandchild, 0)).toThrow();
   }, 70_000);
+
+  it('also kills a descendant reparented out of the tree that still holds the output pipe (audit finding 1)', () => {
+    // The gate double-forks a sleeper (its parent exits at once, so it is reparented to init but keeps stdout open),
+    // then hangs. Before: tree discovery missed it and 'close' never fired, so the run outlived its ceiling.
+    const pidFile = join(dir, 'orphan.pid');
+    const gateScript = join(dir, 'orphan.sh');
+    writeFileSync(gateScript, `( sleep 120 & echo $! > ${JSON.stringify(pidFile)} ) ; sleep 120\n`);
+    const started = Date.now();
+    const r = spawnSync('node', [VERIFY_LANE, `--gate=sh ${gateScript}`, '--json'], { cwd: dir, encoding: 'utf8', timeout: 60_000, detached: true,
+      env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_PHASE_TIMEOUT_MS: '2000' } });
+    expect(Date.now() - started).toBeLessThan(45_000);
+    expect(JSON.parse(readFileSync(marker(), 'utf8')).infrastructure).toMatchObject({ reason: 'verify-timeout' });
+    const orphan = Number(readFileSync(pidFile, 'utf8'));
+    expect(() => process.kill(orphan, 0)).toThrow();
+    expect(r.status).not.toBe(0);
+  }, 70_000);
 });
 
 describe('verify-lane — card-only diff skips the local gate (skipLocalForCardOnly)', () => {

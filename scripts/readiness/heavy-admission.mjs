@@ -842,7 +842,12 @@ export function heartbeatOwnedSlot({ lockRoot, cap, owner, pid = process.pid, no
   for (let i = 0; i < cap + fastSlots; i++) {
     const entry = readLockEntry(lockRoot, slotPath(i));
     if (!entry || entry.owner !== owner || entry.pid !== pid) continue;
-    return heartbeatOwn(lockRoot, slotPath(i), owner, nowIso) ? i : null;
+    // Residual (audited): the heartbeat file is keyed by owner, so a same-owner sibling that reclaimed this slot in
+    // the instant between the read above and the write would get the refresh. Reclaiming needs THIS holder's lease
+    // expired or its pid dead, and a live holder heartbeats every few minutes against a 60-min lease, so the window
+    // cannot open while this process lives; the re-read below still reports the loss.
+    if (!heartbeatOwn(lockRoot, slotPath(i), owner, nowIso)) return null;
+    return readLockEntry(lockRoot, slotPath(i))?.pid === pid ? i : null;
   }
   return null;
 }

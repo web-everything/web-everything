@@ -23,6 +23,13 @@ describe('killProcessTree', () => {
     expect(killProcessTree(0)).toEqual([]);
   });
 
+  it('orphansOfGroup also kills reparented (ppid 1) members of that group, never the leader, self, or other groups', () => {
+    const sent = [];
+    const ps = ['10 5 77', '11 10 77', '40 1 77', '41 1 99', '77 1 77', '50 1 77'].join('\n');
+    killProcessTree(10, 'SIGKILL', { orphansOfGroup: 77, selfPid: 50, listProcesses: () => ps, kill: (pid) => sent.push(pid) });
+    expect(sent).toEqual([40, 11, 10]);
+  });
+
   it('kills a real grandchild that a plain child.kill() would orphan', async () => {
     const child = spawn('sh', ['-c', 'sleep 60 & echo $!; wait'], { stdio: ['ignore', 'pipe', 'ignore'] });
     const grandchild = await new Promise((r) => child.stdout.once('data', (d) => r(Number(String(d).trim()))));

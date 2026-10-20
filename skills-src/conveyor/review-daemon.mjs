@@ -550,8 +550,9 @@ export function runReviewTick({
   if (!paused && reviews.length) {
     try { host = hostAdmission() ?? host; } catch (e) { host = { admitted: false, reason: `host admission unknown: ${String(e?.message ?? e).split('\n')[0]}` }; }
   }
-  const hostLimit = host.admitted ? (Number.isFinite(host.maxPerTick) && host.maxPerTick >= 1 ? host.maxPerTick : Infinity) : 0;
+  const hostLimit = !host.admitted ? 0 : Number.isFinite(host.maxPerTick) ? Math.max(0, host.maxPerTick) : Infinity;
   const dispatchable = reviews.slice(0, Math.min(reviews.length, acquirable, hostLimit));
+  if (typeof host.take === 'function') host.take(dispatchable.length);
   const deferredForHost = !paused && !host.admitted ? reviews.length : 0;
   if (deferredForHost) process.stderr.write(`review-daemon: ${deferredForHost} owed review(s) queued, not dispatched — ${host.reason}\n`);
   const deferredForLanes = paused || deferredForHost ? 0 : reviews.length - dispatchable.length;
@@ -724,6 +725,21 @@ export const REVIEW_DAEMON_APP_AUTH_OPTS = FLEET_APP_AUTH_OPTS;
  *     flagged?:string[], flagReason?:string, error?:string, fetchError?:string, repo:string}>,
  *   holdReconcileFailed:Array<{repo:string, error:string}>}}
  */
+/** Wrap a host admission so it is evaluated once and its `maxPerTick` is a budget shared by every caller: each
+ *  call returns the SAME verdict with what is left, and `take(n)` spends it. A throwing check fails closed. */
+export function sharedHostBudget(hostAdmission) {
+  let verdict = null;
+  let left = 0;
+  return () => {
+    if (!verdict) {
+      try { verdict = hostAdmission() ?? { admitted: false, reason: 'host admission returned nothing' }; }
+      catch (e) { verdict = { admitted: false, reason: `host admission unknown: ${String(e?.message ?? e).split('\n')[0]}` }; }
+      left = verdict.admitted ? (Number.isFinite(verdict.maxPerTick) && verdict.maxPerTick >= 1 ? verdict.maxPerTick : Infinity) : 0;
+    }
+    return { ...verdict, maxPerTick: left, take: (n) => { left = Math.max(0, left - n); } };
+  };
+}
+
 export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runReviewTick, authGateOverride, ...tickOpts } = {}) {
   // card x5kagse (epic #4075/#3383) — computed ONCE per tick (the login is a host-global fact, not per-repo),
   // then forwarded into every repo's own `runReviewTick` call below. Real IO runs only for a genuine production
@@ -734,6 +750,9 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
   const authGate = authGateOverride ? authGateOverride()
     : (tick === runReviewTick ? planClaudeAuthDispatchGate() : { paused: false, reason: null });
   const perRepoMs = {};
+  // verify-admission (audit) — ONE host verdict and ONE dispatch budget per daemon tick, shared by every repo, so
+  // the per-tick cap is host-wide (never cap × repos).
+  if (typeof tickOpts.hostAdmission === 'function') tickOpts.hostAdmission = sharedHostBudget(tickOpts.hostAdmission);
   const perRepo = forEachRepo(repos, (repo) => {
     const started = Date.now();
     try { return tick({ ...tickOpts, repo, paused: authGate.paused, pauseReason: authGate.reason }); }

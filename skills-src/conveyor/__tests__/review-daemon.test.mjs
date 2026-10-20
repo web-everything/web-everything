@@ -628,6 +628,19 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     expect(failed.deferredForHost).toBe(2);
   });
 
+  it('host admission (verify-admission audit): one shared per-tick budget across repos, evaluated once', async () => {
+    const { sharedHostBudget } = await import('../review-daemon.mjs');
+    const check = vi.fn(() => ({ admitted: true, reason: 'ok', maxPerTick: 2 }));
+    const hostAdmission = sharedHostBudget(check);
+    const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+    for (let i = 0; i < 3; i++) {
+      runReviewTick({ reconcile: () => reviewsPlan(3), dispatch, tagRound: () => {}, tagStatus: () => {},
+        statusCandidates: () => [], acquirableLanes: () => 10, hostAdmission });
+    }
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(check).toHaveBeenCalledTimes(1);
+  });
+
   it('deferred reviews still feed statusCandidates (the whole owed list, not just what got dispatched)', () => {
     const statusCandidates = vi.fn(() => []);
     runReviewTick({

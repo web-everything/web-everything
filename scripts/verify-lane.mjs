@@ -86,7 +86,7 @@ import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRe
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
-import { killProcessTree } from './lib/bounded-child.mjs';
+import { killProcessTree, ownProcessGroup } from './lib/bounded-child.mjs';
 import { summarizeSelection, selectionNotice, verdictNotice } from './lib/verify-selection-log.mjs';
 
 // ── tiny arg parsing (matches push-if-green.mjs / lane-pool.mjs) ─────────────────────────────────────
@@ -628,17 +628,32 @@ async function runGate(command, args) {
     // verify-admission — kill the phase's whole process TREE on the ceiling (shell → npm exec → vitest → esbuild).
     // The child stays in this process's group, so a supervisor's group kill of verify-lane still reaches it.
     let timedOut = false;
+    let settled = false;
+    let exited = null;
+    let grace = null;
+    const finish = (code, closeSignal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(grace);
+      resolveGate({ exitCode: Number.isFinite(code) ? code : 2, signal: timedOut ? 'SIGKILL' : closeSignal || null, ...(timedOut ? { timedOut: true } : {}) });
+    };
     const timer = setTimeout(() => {
       timedOut = true;
       process.stderr.write(`\n✗ verify-lane: phase exceeded phaseTimeoutMs=${PHASE_TIMEOUT_MS} (${PHASE_TIMEOUT_SOURCE}) — killing its process tree (pid ${child.pid}); recorded as a timeout, not a test verdict\n`);
-      killProcessTree(child.pid, 'SIGKILL');
+      // Orphans of this group too: a descendant whose shell already exited is reparented out of the tree.
+      killProcessTree(child.pid, 'SIGKILL', { orphansOfGroup: ownProcessGroup() });
+      // A survivor still holding the output pipes would keep 'close' pending forever: settle on exit, or after a grace.
+      grace = setTimeout(() => {
+        child.stdout?.destroy(); child.stderr?.destroy();
+        finish(exited?.code ?? null, exited?.signal ?? 'SIGKILL');
+      }, 10_000);
+      grace.unref();
     }, PHASE_TIMEOUT_MS);
     timer.unref();
-    child.on('error', (e) => { clearTimeout(timer); reject(e); });
-    child.on('close', (code, closeSignal) => {
-      clearTimeout(timer);
-      resolveGate({ exitCode: Number.isFinite(code) ? code : 2, signal: timedOut ? 'SIGKILL' : closeSignal || null, ...(timedOut ? { timedOut: true } : {}) });
-    });
+    child.on('error', (e) => { clearTimeout(timer); clearTimeout(grace); if (!settled) { settled = true; reject(e); } });
+    child.on('exit', (code, sig) => { exited = { code, signal: sig }; });
+    child.on('close', (code, closeSignal) => finish(code, closeSignal));
   });
   return { ...result, failureDetails: collector.finish(), output: bytes <= MAX_TIMEOUT_LOG_BYTES ? output : null };
 }
