@@ -22,6 +22,15 @@ Add every stacking value as a cascade setting with its source logged in we:scrip
   - `smallChildMaxLines, lowRiskClasses, urgentClasses, maxDepth and onBaseHeadMove are read from settings, not constants`.
   - `fail closed: unknown base state, unknown class, or missing proof gate returns no-stack`.
   - `class is derived from touched paths, not from card text or PR body`.
+  - `untrusted text: child size is measured from the diff; a size claimed in the PR body or card text is ignored`.
+  - `truncated read: an unreadable base state returns no-stack`.
+  - `truncated read: an unreadable or truncated file list returns no-stack`.
+  - `shared state: every stack value is read from we:scripts/settings/stack.json and the evaluator writes no settings file`.
+  - `identity: a base PR by a different actor returns no-stack`.
+  - `identity: a base or child that is not a trusted lane PR returns no-stack`.
+  - `state over time: the evaluator is pure; the same inputs give the same result, and a different base state at call time gives the result for that state`.
+  - `who wrote it: an urgent flag set by an automation's comment is ignored and the child is evaluated as not urgent`.
+  - `who wrote it: an emergency flag set by an automation's comment is ignored; only an operator-flagged emergency counts`.
 
 ## Non-goals
 

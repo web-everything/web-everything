@@ -32,6 +32,12 @@ Make the drain land a policy-stacked child only after its base, restack the chil
   - `fail closed: a missing gate holds the child`.
   - `review:accepted is applied only at collapse through the net-diff carry (gate not weakened)`.
   - `onBaseHeadMove setting set to a different value changes the behaviour (not a constant)`.
+  - `untrusted text: fingerprint and touched files come from git data; PR text naming other files or a fingerprint is ignored`.
+  - `shared state: the drain reads its own keys from we:scripts/settings/pr-stack.json and writes no key to we:scripts/settings/stack.json`.
+  - `identity: a base and child by different actors are not treated as a stack (no held landing, no restack)`.
+  - `identity: a base or child that is not a trusted lane PR is not treated as a stack`.
+  - `state over time: each base move re-evaluates the cell and fingerprint at that moment; a cell that became no-stack since the last move holds the child`.
+  - `who wrote it: an automation's own comment never moves the hold marker`.
 
 ## Non-goals
 

@@ -28,6 +28,12 @@ When a stacked child's base PR is closed or rejected, rebase a low-risk child on
   - `a rebase that errors or times out without a conflict goes to the operator`.
   - `a fingerprint or risk class that cannot be computed goes to the operator`.
   - `a missing or unreadable auto-rebase setting sends the child to the operator`.
+  - `untrusted text: PR body or card text claiming low-risk does not change the class; class and fingerprint come from the diff and paths`.
+  - `shared state: a child sent to the operator is posted on the existing needs-you channel and no new shared file is written`.
+  - `identity: a child or base PR by a different actor goes to the operator`.
+  - `identity: a child or base that is not a trusted lane PR goes to the operator`.
+  - `state over time: reopening a closed base re-evaluates the child at reopen time instead of reusing the close-time decision`.
+  - `who wrote it: an automation's comment marking a child low-risk does not make it low-risk`.
 
 ## Non-goals
 

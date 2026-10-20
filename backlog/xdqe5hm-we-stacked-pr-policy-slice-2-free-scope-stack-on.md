@@ -22,6 +22,16 @@ Add --stack-on=<n> to free-scope: derive the base PR chain, ask the stack policy
   - `stack-on: a PR outside the chain on the same file still reports OCCUPIED`.
   - `excludePr accepts a list and keeps the single-number form working`.
   - `stack-on: an unreadable base state or file list fails closed to OCCUPIED`.
+  - `stack-on: a base PR value that is not a positive integer (0, negative, decimal, non-numeric, leading --) is rejected and reports OCCUPIED`.
+  - `stack-on: the chain and class come from API data and the diff; PR body text naming another base or class is ignored`.
+  - `stack-on: a truncated or failed PR list fails closed to OCCUPIED`.
+  - `stack-on: a truncated file list fails closed to OCCUPIED`.
+  - `stack-on: the agent-scope registry is read and never written`.
+  - `stack-on: an unknown base state, unknown class or missing policy reports OCCUPIED`.
+  - `stack-on: a chain member by a different actor is not excluded and the file reports OCCUPIED`.
+  - `stack-on: a chain member that is not a trusted lane PR is not excluded and the file reports OCCUPIED`.
+  - `stack-on: a second call re-reads the chain and cell; a base state change between calls changes the result`.
+  - `stack-on: an automation's comment marking a PR urgent does not change the cell`.
 
 ## Non-goals
 
