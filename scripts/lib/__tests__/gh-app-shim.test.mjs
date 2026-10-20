@@ -35,6 +35,15 @@ const CONFIGURED_ENV = {
 };
 // Interactive-path tests: a daemon-run verify inherits these markers, which put the shim in refuse mode.
 const NOT_A_DAEMON = { WE_GH_DAEMON_CALLER: undefined, XPC_SERVICE_NAME: undefined, WE_GH_AUTH_PERSONAL_FALLBACK: undefined };
+// Shim spawns that pass no env inherit process.env, so clear the markers there for the whole file.
+// The daemon-guard fixture builds its own env and sets WE_GH_DAEMON_CALLER explicitly.
+const inheritedDaemonEnv = {};
+beforeAll(() => {
+  for (const key of Object.keys(NOT_A_DAEMON)) { inheritedDaemonEnv[key] = process.env[key]; delete process.env[key]; }
+});
+afterAll(() => {
+  for (const [key, value] of Object.entries(inheritedDaemonEnv)) if (value !== undefined) process.env[key] = value;
+});
 
 // #4064 — isolate every "live" test's gh-throttle admission lock from the REAL, host-shared one for the
 // duration of this file (restored after). `LANE_POOL_ROOT` is the existing, already-recognized override
