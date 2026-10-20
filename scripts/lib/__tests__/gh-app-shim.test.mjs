@@ -1179,12 +1179,39 @@ require(${JSON.stringify(shim)});
     [{}, ['auth', 'token', '--hostname', 'github.corp.example']],
     [{}, ['api', '--hostname=github.corp.example', 'user']],
     [{}, ['auth', 'token', '-hgithub.corp.example']],
+    [{}, ['auth', 'token', '-henteRprise']],
     [{}, ['auth', 'token', '-h', 'github.corp.example']],
     [{ GH_HOST: 'github.corp.example' }, ['api', 'user']],
     [{ GH_REPO: 'github.corp.example/web-everything/repo' }, ['pr', 'list']],
     [{}, ['pr', 'list', '-R', 'https://github.corp.example/web-everything/repo']],
     [{}, ['pr', 'list', '--repo=github.corp.example/web-everything/repo']],
     [{}, ['repo', 'clone', 'github.corp.example/web-everything/repo']],
+    [{}, ['repo', 'view', 'enterprise/owner/repo']],
+    [{}, ['repo', 'view', 'git@enterprise:owner/repo']],
+    [{}, ['repo', 'clone', 'enterprise/owner/repo']],
+    [{}, ['repo', 'clone', 'git@enterprise:owner/repo']],
+    [{}, ['repo', 'view', 'enterprise:owner/repo']],
+    [{}, ['label', 'clone', 'enterprise/owner/repo']],
+    [{}, ['label', 'clone', 'git@enterprise:owner/repo']],
+    [{}, ['repo', 'view', 'ssh://git@enterprise/owner/repo']],
+    [{}, ['repo', 'create', 'enterprise/owner/repo']],
+    [{}, ['repo', 'create', 'public-repo', '--template', 'enterprise/owner/repo']],
+    [{}, ['repo', 'create', 'public-repo', '--template=enterprise/owner/repo']],
+    [{}, ['repo', 'create', 'public-repo', '-pgit@enterprise:owner/repo']],
+    [{}, ['repo', 'sync', '--source', 'enterprise/owner/repo']],
+    [{}, ['repo', 'sync', '--source=enterprise/owner/repo']],
+    [{}, ['repo', 'sync', '-senterprise/owner/repo']],
+    [{}, ['repo', 'sync', '-fsenterprise/owner/repo']],
+    [{}, ['repo', 'create', 'public-repo', '-ipenterprise/owner/repo']],
+    [{}, ['pr', 'view', '-cRenterprise/owner/repo', '123']],
+    [{}, ['pr', 'view', '-cR=enterprise/owner/repo', '123']],
+    [{}, ['pr', 'view', '-cR', 'enterprise/owner/repo', '123']],
+    [{}, ['pr', 'checks', '-wRenterprise/owner/repo', '123']],
+    [{}, ['run', 'rerun', '-dRenterprise/owner/repo', '123']],
+    [{}, ['workflow', 'list', '-aRenterprise/owner/repo']],
+    [{}, ['release', 'delete', '-cyRenterprise/owner/repo', 'v1']],
+    [{}, ['repo', 'clone', '--origin', 'upstream', 'enterprise/owner/repo']],
+    [{}, ['repo', 'clone', '--upstream-remote-name', 'upstream', 'git@enterprise:owner/repo']],
     [{}, ['api', 'https://github.corp.example/api/v3/user']],
     [{}, ['api', '--preview', 'corsair', 'https://github.corp.example/api/v3/user']],
     [{}, ['pr', 'checkout', '--branch', 'work', 'https://github.corp.example/o/r/pull/1']],
@@ -1213,10 +1240,14 @@ require(${JSON.stringify(shim)});
     } finally { rmSync(f.dir, { recursive: true, force: true }); }
   });
 
-  it('refuses enterprise hosts before using a fresh public App cache', () => {
+  it.each([
+    ['pr', 'list', '-Rgithub.corp.example/web-everything/repo'],
+    ['repo', 'view', 'enterprise/owner/repo'],
+    ['repo', 'view', 'git@enterprise:owner/repo'],
+  ])('refuses enterprise hosts before using a fresh public App cache: %j', (...argv) => {
     const f = fixture({ fresh: true });
     try {
-      const r = f.run({ GH_ENTERPRISE_TOKEN: 'fixture-personal-enterprise' }, ['pr', 'list', '-Rgithub.corp.example/web-everything/repo']);
+      const r = f.run({ GH_ENTERPRISE_TOKEN: 'fixture-personal-enterprise' }, argv);
       expect(r.status).toBe(1);
       expect(r.stderr).toContain('unsupported GitHub host');
       expect(existsSync(f.invoked)).toBe(false);
@@ -1250,6 +1281,26 @@ require(${JSON.stringify(shim)});
   });
 
   it.each([
+    ['repo', 'view', 'github.com/web-everything/repo'],
+    ['repo', 'view', 'git@github.com:web-everything/repo'],
+    ['repo', 'view', 'web-everything/repo'],
+    ['label', 'clone', 'github.com/web-everything/repo'],
+    ['repo', 'clone', 'web-everything/repo', 'work/repos/repo'],
+    ['repo', 'clone', 'web-everything/repo', '../work/repos/my repo'],
+    ['repo', 'clone', '--origin', 'upstream', 'web-everything/repo', 'work/repos/repo'],
+    ['release', 'upload', 'v1', 'dist/linux/app.tar.gz'],
+    ['workflow', 'run', 'build.yml', '-f', 'artifact=dist/linux/app.tar.gz'],
+    ['workflow', 'run', 'build.yml', '-fR=dist/linux/app.tar.gz'],
+    ['pr', 'list', '-SfooRbar/baz/qux'],
+    ['repo', 'create', 'public-repo', '--template', 'web-everything/repo'],
+    ['repo', 'sync', '--source', 'github.com/web-everything/repo'],
+    ['pr', 'view', '-cRgithub.com/web-everything/repo', '123'],
+    ['pr', 'view', '-cw', '123'],
+    ['pr', 'comment', '123', '-bRenterprise/owner/repo'],
+    ['pr', 'comment', '123', '-ebRenterprise/owner/repo'],
+    ['api', 'repos/web-everything/repo/issues'],
+    ['pr', 'comment', '123', '--body', 'enterprise/owner/repo'],
+    ['pr', 'comment', '123', '--body', 'git@enterprise:owner/repo'],
     ['pr', 'comment', '123', '-R', 'web-everything/web-everything', '--body', 'https://docs.example.com'],
     ['issue', 'create', '-R', 'web-everything/web-everything', '--title', 'https://docs.example.com', '--body', '--hostname=github.corp.example'],
     ['api', '--method', 'POST', 'https://api.github.com/repos/web-everything/repo/issues', '-f', 'body=https://docs.example.com'],

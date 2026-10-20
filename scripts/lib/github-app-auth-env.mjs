@@ -40,6 +40,16 @@ import { readGithubAuthPolicy } from './github-auth-policy.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { installationMap, ownerOfSlug, remapLegacyInstallationId, installationCachePath } from './github-app-installations.mjs';
 
+/** A missing refusal boundary is fatal even to callers that tolerate transient refresh errors. */
+export class GithubAppAuthGuardError extends Error {
+  constructor() {
+    super('github-app-auth-env: refusing to run daemon without the gh auth guard');
+    this.code = 'GITHUB_APP_AUTH_GUARD_UNAVAILABLE';
+  }
+}
+
+export const isGithubAppAuthGuardError = (error) => error?.code === 'GITHUB_APP_AUTH_GUARD_UNAVAILABLE';
+
 /**
  * What the fleet's `gh` calls actually need, as GitHub App permission levels. Live-caught 2026-09-23: the
  * first real installation was registered with NO repository permissions at all (`{}`) — its token still
@@ -433,7 +443,7 @@ export async function ensureFreshGithubAppEnv({
     try { daemonShim = await installShim(env, { cachePath, identity }); } catch { /* fail closed below */ }
     if (!daemonShim?.ok) {
       record({ applied: false, reason: 'shim-failed' });
-      throw new Error('github-app-auth-env: refusing to run daemon without the gh auth guard');
+      throw new GithubAppAuthGuardError();
     }
   }
   const fallbackFrom = [];

@@ -637,6 +637,27 @@ describe('half-configured App auth (2026-10-09 drain incident)', () => {
 });
 
 describe('daemon refresh lookahead and legacy fallback liveness', () => {
+  it.each(['pass', 'verify'].flatMap((loop) => ['returned', 'thrown'].map((failure) => [loop, failure])))
+  ('stops the real %s loop when guard installation fails (%s)', async (loop, failure) => {
+    const { runPassDaemonLoop } = await import('../../../skills-src/conveyor/pass-daemon.mjs');
+    const { runLoopCycle } = await import('../../conveyor/await-verify-loop.mjs');
+    const env = { PATH: '/usr/bin:/bin', GH_TOKEN: 'fixture-personal' };
+    const work = vi.fn(async () => ({ code: 0 }));
+    const refresh = () => ensureFreshGithubAppEnv({
+      ...NOOP_STATUS, env, daemon: true, caller: 'guard-loop-test',
+      identity: {}, policy: { auth: 'app' },
+      installShim: async () => {
+        if (failure === 'thrown') throw Error('fixture unwritable shim');
+        return { ok: false };
+      },
+    });
+    const attempt = loop === 'pass'
+      ? runPassDaemonLoop({ refreshAuth: refresh, runPass: work, sleep: async () => {}, intervalMs: 1, maxRuns: 1 })
+      : runLoopCycle({ ensureAuth: refresh, cycle: work });
+    await expect(attempt).rejects.toThrow('refusing to run daemon without the gh auth guard');
+    expect(work).not.toHaveBeenCalled();
+  });
+
   it('installs the daemon refusal shim before a failed early refresh and before the tick', async () => {
     const { resolveDeliveryIdentity } = await import('../github-app-identity.mjs');
     const now = Date.now();

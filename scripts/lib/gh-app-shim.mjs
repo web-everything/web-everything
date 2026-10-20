@@ -661,8 +661,60 @@ function unsupportedTargetHost(argv, env) {
     for (const flag of ['-q', '-t']) valueFlags.add(flag);
   }
   if (command === 'repo create') for (const flag of ['-d', '-h']) valueFlags.add(flag);
+  if (command === 'repo clone') for (const flag of ['-o', '--origin', '--upstream-remote-name']) valueFlags.add(flag);
+  const repositoryPositionals = (argv[0] === 'repo' && ['archive', 'clone', 'create', 'delete', 'edit',
+    'fork', 'rename', 'set-default', 'sync', 'unarchive', 'view'].includes(argv[1])) || command === 'label clone';
+  // --template is output content elsewhere, but repo create uses it as a source repository.
+  const repositoryFlags = command === 'repo create' ? ['--template', '-p'] : command === 'repo sync' ? ['--source', '-s'] : [];
+  // Only advance over known boolean shorthands. An unknown shorthand may consume the
+  // rest of the argument as content (-fR=... is a workflow field, not a repo selector).
+  const booleanShorthands = {
+    'pr view': 'cw', 'issue view': 'cw', 'repo view': 'w',
+    'pr list': 'dw', 'pr create': 'defw', 'issue create': 'ew', 'pr checks': 'w',
+    'pr checkout': 'f', 'pr merge': 'admrs', 'pr comment': 'ce', 'issue comment': 'ce',
+    'pr close': 'd', 'pr diff': 'w', 'pr ready': 'u', 'pr review': 'acr', 'pr update-branch': 'r',
+    'issue delete': 'y', 'issue develop': 'cl',
+    'repo create': 'ci', 'repo sync': 'f', 'repo fork': 'cr',
+    'repo archive': 'y', 'repo unarchive': 'y', 'repo delete': 'y', 'repo deploy-key': 'w',
+    'release create': 'dp', 'release delete': 'cy', 'release delete-asset': 'y', 'release upload': 'c', 'release view': 'w',
+    'run list': 'a', 'run view': 'evw', 'run watch': 'e', 'run rerun': 'df',
+    'workflow list': 'a', 'workflow view': 'wy', 'cache delete': 'a',
+    'label create': 'f', 'label clone': 'f', 'label delete': 'y',
+    'secret set': 'u', 'secret list': 'u', 'secret delete': 'u',
+    'search code': 'w', 'search commits': 'w', 'search issues': 'w', 'search prs': 'w', 'search repos': 'w',
+  }[command] || '';
+  let cloneSourceSeen = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
+    // pflag permits boolean bundles before a value flag: -cRhost/o/r, -fsHOST/o/r.
+    // A known content flag consumes the remainder, so -bRhost/o/r stays body text.
+    if (a.startsWith('-') && !a.startsWith('--')) {
+      let consumed = false;
+      for (let j = 1; j < a.length; j++) {
+        const flag = '-' + a[j];
+        if (flag === '-R' || repositoryFlags.includes(flag)) {
+          const value = j + 1 < a.length ? a.slice(j + 1).replace(/^=/, '') : argv[++i];
+          const host = repoHost(value);
+          if (host) return host;
+          consumed = true;
+          break;
+        }
+        if (valueFlags.has(flag)) {
+          if (j + 1 === a.length) i++;
+          consumed = true;
+          break;
+        }
+        if (!booleanShorthands.includes(a[j])) break;
+      }
+      if (consumed) continue;
+    }
+    const repositoryFlag = repositoryFlags.find((flag) => a === flag || a.startsWith(flag + '='));
+    if (repositoryFlag) {
+      const value = a === repositoryFlag ? argv[++i] : a.slice(repositoryFlag.length).replace(/^=/, '');
+      const host = repoHost(value);
+      if (host) return host;
+      continue;
+    }
     if (valueFlags.has(a)) { i++; continue; }
     if (a === '--hostname' || a === '--host' || (argv[0] === 'auth' && a === '-h')) {
       const host = argv[i + 1];
@@ -675,12 +727,15 @@ function unsupportedTargetHost(argv, env) {
       continue;
     }
     if (argv[0] === 'auth' && a.startsWith('-h') && a.length > 2) { if (!publicHost(a.slice(2))) return a.slice(2); continue; }
-    if (a === '--repo' || a === '-R') { const host = repoHost(argv[++i]); if (host) return host; continue; }
+    if (a === '--repo') { const host = repoHost(argv[++i]); if (host) return host; continue; }
     if (a.startsWith('--repo=')) { const host = repoHost(a.slice(7)); if (host) return host; continue; }
-    if (a.startsWith('-R') && a.length > 2) { const host = repoHost(a.slice(2)); if (host) return host; continue; }
-    // Inspect all remaining target-shaped positionals. Unknown option arity must never hide
-    // a later enterprise URL; ambiguous URL-valued options fail closed.
-    if (targetCommand && !a.startsWith('-') && (/^[a-z][a-z0-9+.-]*:[/][/]/i.test(a) || /^[^/]+[.][^/]+[/]/.test(a))) {
+    // Repository arguments also accept single-label host/owner/repo and SCP syntax. A
+    // clone's second positional is a local directory; asset paths and relative API
+    // endpoints likewise do not select a host. Keep scanning URLs after unknown flags.
+    const repositoryTarget = repositoryPositionals && i > 1 && !a.startsWith('-')
+      && (command !== 'repo clone' || !cloneSourceSeen);
+    if (repositoryTarget && command === 'repo clone') cloneSourceSeen = true;
+    if (targetCommand && !a.startsWith('-') && (repositoryTarget || /^[a-z][a-z0-9+.-]*:[/][/]/i.test(a) || /^[^/]+[.][^/]+[/]/.test(a))) {
       const host = repoHost(a, argv[0] === 'api');
       if (host) return host;
     }

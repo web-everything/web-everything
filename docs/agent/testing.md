@@ -1923,11 +1923,19 @@ The standalone gh shim recognizes `WE_GH_DAEMON_CALLER` and launchd labels under
 (90-second timeout), then refuses personal auth by default, including after an App 401.
 Install the daemon refusal shim before reading keys/caches or refreshing tokens, including
 when no App is configured. If installation fails, stop before the daemon tick runs.
+The pass daemon and await-verify loop must propagate `GithubAppAuthGuardError` even
+though they tolerate transient refresh failures. Replay first-refresh and later-refresh
+installation failures with `daemon-gh-guard-refusal` in the daemon soak registry.
 Only an inherited `GH_TOKEN` with matching `WE_GH_AUTH_TOKEN_HASH` is trusted as App auth
 for github.com. Host flags, repository/URL arguments, `GH_HOST`, `GH_REPO`, and git
 remotes or implicit gh configuration naming other hosts refuse by default, even with a fresh public-host App cache;
 enterprise credentials and stored logins have no validated provenance here. Conflicting
 host hints are handled conservatively. Explicit personal-fallback allows still apply.
+Positional repository targets use the same host parser as `-R`, including single-label
+`enterprise/owner/repo` and `git@enterprise:owner/repo`; relative REST paths remain public.
+Check repository selectors in short-option bundles too (`-cRhost/owner/repo`), and
+source repositories in create templates and sync sources. Known content options consume
+their attached values; clone destinations and asset paths remain local arguments.
 URL text in bodies, titles, and API fields is content rather than a target host.
 Unknown aliases, extension execution, and ambiguous URL-valued options refuse by default;
 their command expansion cannot prove which credential gh will select. Short flag arity
