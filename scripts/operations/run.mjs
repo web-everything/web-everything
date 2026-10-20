@@ -161,7 +161,7 @@ import { assertRunnerFreshness } from './runner-freshness.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 // Hot-swap operational knobs (operator 2026-10-20): the runtime-operator settings layer's audited writer.
 import { runtimeSettingOperation, RUNTIME_SETTING_OP, RUNTIME_SETTING_WRITE_EFFECT, runtimeSettingArgv, finishRuntimeSetting } from './runtime-setting.mjs';
-import { readRuntimeFile, writeRuntimeSettings } from '../lib/runtime-settings.mjs';
+import { readRuntimeFile, readRuntimeAuditTail, writeRuntimeSettings } from '../lib/runtime-settings.mjs';
 
 /**
  * THE OPERATION TABLE — the only per-operation code in the command line. Each entry builds its declaration and
@@ -382,8 +382,8 @@ export const OPERATIONS = Object.freeze({
   // `daemon-status`/`runner-activity`: every step is `compute`. `collectHeavyQueue`'s real `admissionStatus`/
   // `ps`/`git` reads are bound here, and ONLY here.
   [RUNTIME_SETTING_OP]: () => ({
-    declaration: runtimeSettingOperation({ readRuntime: () => readRuntimeFile() }),
-    sinks: { [RUNTIME_SETTING_WRITE_EFFECT]: async (payload) => { writeRuntimeSettings(payload); return { written: payload.path }; } },
+    declaration: runtimeSettingOperation({ readRuntime: () => { const r = readRuntimeFile(); return { ...r, auditTail: readRuntimeAuditTail(r.path) }; } }),
+    sinks: { [RUNTIME_SETTING_WRITE_EFFECT]: async (payload) => ({ written: payload.path, ...writeRuntimeSettings(payload) }) },
     finish: finishRuntimeSetting,
   }),
   [HEAVY_QUEUE_OP]: () => ({

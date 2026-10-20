@@ -1,14 +1,15 @@
 // Runtime-operator settings layer (operator 2026-10-20: hot-swap operational knobs with no rebuild).
 // Precedence env > runtime > tool > platform > standard; allowlist + bounds; read fresh each call; never throws.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
   RUNTIME_SETTINGS_ALLOWLIST, RUNTIME_SETTINGS_ENV, planRuntimeSetting, readRuntimeFile, readRuntimeLayer,
-  runtimeAuditPath, runtimeSettingsPath, writeRuntimeSettings,
+  runtimeAuditPath, runtimeSettingsPath, writeRuntimeSettings, isLiveRuntimeFile, runtimeAuditStatus,
 } from '../runtime-settings.mjs';
+import { withPathLock } from '../../readiness/with-lock.mjs';
 import { cascadePolicy, resetCascadeLogForTest } from '../policy-cascade.mjs';
 import { resolveBatchingSettings } from '../merge-queue-adaptive-batching.mjs';
 import { applyReviewCapMemoryFloor, liveReviewRoundBudget, resetReviewCapFloorForTest, resolveRedTeamSeatShare } from '../../../skills-src/conveyor/review-daemon.mjs';
@@ -34,6 +35,17 @@ describe('runtime settings path', () => {
     expect(runtimeSettingsPath({ env })).toBe(path);
     // An override inherited from an operator shell that names the LIVE file is refused under test.
     expect(runtimeSettingsPath({ env: { [RUNTIME_SETTINGS_ENV]: join('/h', 'workspace', '.operations', 'settings', 'runtime.json') }, home: '/h' })).toBeNull();
+    // …also through a symlink (real-path identity, not spelling).
+    const fakeHome = join(dir, 'home');
+    mkdirSync(join(fakeHome, 'workspace', '.operations', 'settings'), { recursive: true });
+    writeFileSync(join(fakeHome, 'workspace', '.operations', 'settings', 'runtime.json'), '{}');
+    symlinkSync(join(fakeHome, 'workspace', '.operations', 'settings', 'runtime.json'), join(dir, 'link.json'));
+    expect(isLiveRuntimeFile(join(dir, 'link.json'), { home: fakeHome })).toBe(true);
+    expect(runtimeSettingsPath({ env: { [RUNTIME_SETTINGS_ENV]: join(dir, 'link.json') }, home: fakeHome })).toBeNull();
+    // …and for an explicit `path` argument naming the host's real live file (refused before any read or write).
+    const live = join(homedir(), 'workspace', '.operations', 'settings', 'runtime.json');
+    expect(readRuntimeFile({ path: live }).path).toBeNull();
+    expect(() => writeRuntimeSettings({ path: live, next: { settings: {} }, audit: {} })).toThrow(/refusing to write the live/);
   });
 });
 
@@ -206,18 +218,23 @@ describe('planRuntimeSetting + atomic write', () => {
     expect(audit.map((a) => a.outcome)).toEqual(['intent', 'applied', 'intent', 'applied']);
     expect(audit[1].id).toBe(audit[0].id);
   });
-  it('a lock left by a dead writer is taken over; one held by a live writer is not', () => {
-    writeFileSync(`${path}.lock`, '999999999:dead');
+  it('uses the repo file lock: a write while the lock is held times out and changes nothing', () => {
     writeRuntimeSettings(planRuntimeSetting({ ...base, path, action: 'set', key: 'reviewConcurrency.maxLiveReviewRounds', value: '6' }));
-    expect(readRuntimeFile({ env }).entries['reviewConcurrency.maxLiveReviewRounds'].value).toBe(6);
-    expect(existsSync(`${path}.lock`)).toBe(false);
-    writeFileSync(`${path}.lock`, `${process.pid}:live`);
     const p = planRuntimeSetting({ ...base, path, action: 'set', key: 'reviewConcurrency.maxLiveReviewRounds', value: '7', entries: readRuntimeFile({ env }).entries });
-    expect(() => writeRuntimeSettings(p)).toThrow(/is held/);
-    expect(readFileSync(`${path}.lock`, 'utf8')).toBe(`${process.pid}:live`);
+    withPathLock(path, () => { expect(() => writeRuntimeSettings(p, { env })).toThrow(/timed out/); });
     expect(readRuntimeFile({ env }).entries['reviewConcurrency.maxLiveReviewRounds'].value).toBe(6);
-    rmSync(`${path}.lock`);
-  }, 15_000);
+    writeRuntimeSettings(p, { env });
+    expect(readRuntimeFile({ env }).entries['reviewConcurrency.maxLiveReviewRounds'].value).toBe(7);
+  }, 20_000);
+  it('get surfaces an unconfirmed or failed last change', () => {
+    const rec = [{ key: 'k', id: 'a', outcome: 'intent', at: 't', actor: 'x' }];
+    expect(runtimeAuditStatus(rec, 'k').status).toBe('unconfirmed');
+    expect(runtimeAuditStatus([...rec, { id: 'a', outcome: 'failed', error: 'boom' }], 'k')).toMatchObject({ status: 'failed', error: 'boom' });
+    expect(runtimeAuditStatus([...rec, { id: 'a', outcome: 'applied', warnings: ['directory fsync failed'] }], 'k')).toMatchObject({ status: 'applied', warnings: ['directory fsync failed'] });
+    expect(runtimeAuditStatus([], 'k').status).toBe('none');
+    const g = planRuntimeSetting({ action: 'get', key: 'reviewConcurrency.maxLiveReviewRounds', path, entries: {}, auditTail: [{ key: 'reviewConcurrency.maxLiveReviewRounds', id: 'z', outcome: 'intent' }] });
+    expect(g.audit.status).toBe('unconfirmed');
+  });
   it('a failed apply leaves an intent + failed audit pair and the old file', () => {
     write({ 'reviewConcurrency.maxLiveReviewRounds': entry(4) });
     const p = planRuntimeSetting({ ...base, path, action: 'set', key: 'reviewConcurrency.maxLiveReviewRounds', value: '6', entries: readRuntimeFile({ env }).entries });

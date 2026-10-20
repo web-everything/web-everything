@@ -24,10 +24,11 @@
  *   lower layers — never throws. Guards and trust settings (auth, round caps for limit lifting, red-team gate rules)
  *   are deliberately NOT on the allowlist: changing those stays a reviewed code change.
  */
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeSync } from 'node:fs';
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
+import { withPathLock } from '../readiness/with-lock.mjs';
 import { isUnderTest } from './under-test.mjs';
 
 export const RUNTIME_SETTINGS_ENV = 'WE_RUNTIME_SETTINGS_FILE';
@@ -66,17 +67,31 @@ export const RUNTIME_SETTINGS_ALLOWLIST = Object.freeze({
 });
 
 const livePath = (home) => join(home, 'workspace', '.operations', 'settings', 'runtime.json');
-/** The runtime file path, or `null` when the layer is off. Under test it is off unless the env names a file, and an
- *  override naming the host's LIVE file (e.g. one inherited from an operator shell) is refused — a test never reads
- *  or writes the live layer. */
-export function runtimeSettingsPath({ env = process.env, home = homedir() } = {}) {
-  const testing = isUnderTest(env) || isUnderTest(process.env);
-  const override = String(env?.[RUNTIME_SETTINGS_ENV] ?? '').trim();
-  if (override) {
-    if (testing && [livePath(home), livePath(homedir())].some((p) => resolve(p) === resolve(override))) return null;
-    return override;
+/** The real (symlink-resolved) form of a path that may not exist yet: realpath its longest existing ancestor. */
+export function realPathOf(p) {
+  let head = resolve(p); const rest = [];
+  for (;;) {
+    try { return join(realpathSync.native(head), ...rest); } catch { /* walk up */ }
+    const parent = dirname(head);
+    if (parent === head) return resolve(p);
+    rest.unshift(basename(head)); head = parent;
   }
-  if (testing) return null;
+}
+const testing = (env) => isUnderTest(env) || isUnderTest(process.env);
+/** True when `p` is (by real path, through any symlink) the host's LIVE runtime file. */
+export function isLiveRuntimeFile(p, { home = homedir() } = {}) {
+  const real = realPathOf(p);
+  return [livePath(home), livePath(homedir())].some((l) => realPathOf(l) === real);
+}
+/** Under test, refuse ANY path (env override or explicit argument) that is the live file. */
+const testSafe = (p, env) => (p && testing(env) && isLiveRuntimeFile(p) ? null : p);
+
+/** The runtime file path, or `null` when the layer is off. Under test it is off unless the env names a file, and a
+ *  path that resolves (by real path) to the host's LIVE file is refused — a test never reads or writes the live layer. */
+export function runtimeSettingsPath({ env = process.env, home = homedir() } = {}) {
+  const override = String(env?.[RUNTIME_SETTINGS_ENV] ?? '').trim();
+  if (override) return testing(env) && isLiveRuntimeFile(override, { home }) ? null : override;
+  if (testing(env)) return null;
   return livePath(home);
 }
 
@@ -105,8 +120,9 @@ const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
  * IO: read the whole runtime file fresh. Never throws.
  * @returns {{path:string|null, entries:Record<string,{value:unknown}>, warnings:string[]}}
  */
-export function readRuntimeFile({ env = process.env, path = runtimeSettingsPath({ env }), stat = statSync, readFile = readFileSync } = {}) {
-  if (!path) return { path, entries: {}, warnings: [] };
+export function readRuntimeFile({ env = process.env, path: given, stat = statSync, readFile = readFileSync } = {}) {
+  const path = given === undefined ? runtimeSettingsPath({ env }) : testSafe(given, env);
+  if (!path) return { path: path ?? null, entries: {}, warnings: [] };
   try {
     if (stat(path).size > RUNTIME_SETTINGS_MAX_BYTES) return { path, entries: {}, warnings: [`runtime settings ${path}: larger than ${RUNTIME_SETTINGS_MAX_BYTES} bytes — layer ignored`] };
     const data = JSON.parse(String(readFile(path, 'utf8')));
@@ -147,7 +163,7 @@ export function parseRuntimeValue(raw) {
  * @returns {{ok:boolean, action:string, error?:string, key?:string, before?:unknown, after?:unknown,
  *   next?:{settings:object}, audit?:object, entries?:object, allowlist?:object}}
  */
-export function planRuntimeSetting({ action, key, value, actor, reason, now = new Date().toISOString(), entries = {}, path }) {
+export function planRuntimeSetting({ action, key, value, actor, reason, now = new Date().toISOString(), entries = {}, path, auditTail = [] }) {
   const fail = (error) => ({ ok: false, action, error });
   if (!path) return fail('runtime settings layer is off (no path; under test set WE_RUNTIME_SETTINGS_FILE)');
   if (action === 'list') {
@@ -157,7 +173,7 @@ export function planRuntimeSetting({ action, key, value, actor, reason, now = ne
   const rule = ruleFor(key);
   if (!rule) return fail(`${JSON.stringify(key)} is not runtime-settable; allowed: ${Object.keys(RUNTIME_SETTINGS_ALLOWLIST).join(', ')}`);
   const before = entries[key]?.value;
-  if (action === 'get') return { ok: true, action, key, path, before, entry: entries[key] ?? null, bounds: rule.bounds, note: rule.note };
+  if (action === 'get') return { ok: true, action, key, path, before, entry: entries[key] ?? null, bounds: rule.bounds, note: rule.note, audit: runtimeAuditStatus(auditTail, key) };
   if (!String(actor ?? '').trim()) return fail('--actor=<login> is required');
   if (!String(reason ?? '').trim()) return fail('--reason=… is required');
   if (String(actor).trim().length > RUNTIME_ACTOR_MAX) return fail(`--actor is longer than ${RUNTIME_ACTOR_MAX} characters`);
@@ -177,7 +193,6 @@ export function planRuntimeSetting({ action, key, value, actor, reason, now = ne
   return { ok: true, action, key, path, before, after, expected: entries, next, audit };
 }
 
-const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 /** IO: write ALL of `text` to `fd` (writeSync may write fewer bytes than asked), then fsync. */
 function writeAllAndSync(fd, text) {
   const buf = Buffer.from(text);
@@ -194,70 +209,67 @@ function appendAuditLine(path, record) {
   const fd = openSync(runtimeAuditPath(path), 'a', 0o644);
   try { writeAllAndSync(fd, `${JSON.stringify(record)}\n`); } finally { closeSync(fd); }
 }
-const pidAlive = (pid) => {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; }
-};
-/**
- * IO: an exclusive create-lock beside the file, owned by a token. A held lock is taken over ONLY when its owner
- * process is gone (never by age alone, so a paused live writer keeps it); release removes the lock only while it
- * still holds this writer's token. Throws when it cannot be taken in ~5 s.
- */
-function withRuntimeLock(path, fn) {
-  const lock = `${path}.lock`;
-  const token = `${process.pid}:${randomUUID()}`;
-  for (let i = 0; ; i++) {
-    try {
-      const fd = openSync(lock, 'wx', 0o644);
-      try { writeAllAndSync(fd, token); } finally { closeSync(fd); }
-      break;
-    } catch (e) {
-      if (e?.code !== 'EEXIST') throw e;
-      let owner = '';
-      try { owner = String(readFileSync(lock, 'utf8')); } catch { /* raced */ }
-      const ownerPid = Number(owner.split(':')[0]);
-      // A lock whose content is still empty/partial is a writer mid-create: wait. Only a dead owner is taken over.
-      if (owner.includes(':') && !pidAlive(ownerPid)) {
-        try { if (String(readFileSync(lock, 'utf8')) === owner) rmSync(lock, { force: true }); } catch { /* raced */ }
-        continue;
-      }
-      if (i >= 50) throw new Error(`runtime settings: ${lock} is held by ${owner || 'another writer'} — try again`);
-      sleepMs(100);
-    }
-  }
-  try { return fn(); } finally {
-    try { if (String(readFileSync(lock, 'utf8')) === token) rmSync(lock, { force: true }); } catch { /* already gone */ }
-  }
+
+/** IO: the last `max` audit records (parsed); [] when absent/unreadable. */
+export function readRuntimeAuditTail(path, { max = 200 } = {}) {
+  if (!path) return [];
+  try {
+    return String(readFileSync(runtimeAuditPath(path), 'utf8')).trim().split('\n').slice(-max)
+      .flatMap((l) => { try { return [JSON.parse(l)]; } catch { return []; } });
+  } catch { return []; }
+}
+
+/** PURE: the audit status of `key`'s most recent change — `applied`, `failed`, or `unconfirmed` (an intent with no
+ *  outcome line: the write may or may not have taken effect), plus any warnings recorded with it. */
+export function runtimeAuditStatus(records, key) {
+  const intent = records.filter((r) => r?.key === key && r.outcome === 'intent').at(-1);
+  if (!intent) return { status: 'none' };
+  const outcomes = records.filter((r) => r?.id === intent.id && r.outcome !== 'intent');
+  const last = outcomes.at(-1);
+  const warnings = outcomes.flatMap((r) => r.warnings ?? []);
+  return { status: last?.outcome ?? 'unconfirmed', id: intent.id, at: intent.at, actor: intent.actor, ...(last?.error ? { error: last.error } : {}), ...(warnings.length ? { warnings } : {}) };
 }
 
 /**
- * IO: under an exclusive lock, refuse when the file changed since it was planned (compare-and-swap — a concurrent
- * write is never lost); append a durable `intent` audit line FIRST (a change is never effective without its record),
- * write the new contents atomically (full write + fsync, rename, directory fsync), then append the `applied` — or, on
- * any failure, `failed` — outcome line. Throws on failure.
+ * IO: under the repo's file lock (`we:scripts/readiness/with-lock.mjs#withPathLock` — owner-checked reserve,
+ * dead-owner fast path, compare-and-remove reclaim, `touch()` that throws ELOCKLOST once reclaimed), refuse when the
+ * file changed since it was planned (compare-and-swap — a concurrent write is never lost); append a durable `intent`
+ * audit line FIRST, write the new contents (full write + fsync), re-confirm the lock is still ours (`touch`) right
+ * before the rename, rename, fsync the directory, then append the `applied` — or, on failure, `failed` — outcome.
+ * A directory-fsync error is recorded as a warning on the `applied` line and returned. A failed `applied` append
+ * (the change IS live) is returned as a warning, logged, and shows as `unconfirmed` in `runtime-setting get`.
+ * @returns {{warnings:string[]}}
  */
-export function writeRuntimeSettings({ path, next, audit, expected }) {
+export function writeRuntimeSettings({ path: given, next, audit, expected }, { env = process.env, log = (l) => console.error(l) } = {}) {
+  const path = testSafe(given, env);
+  if (!path) throw new Error('runtime settings: refusing to write the live runtime file under test');
   mkdirSync(dirname(path), { recursive: true });
-  return withRuntimeLock(path, () => {
+  return withPathLock(path, ({ touch }) => {
     if (expected !== undefined) {
-      const now = readRuntimeFile({ path });
+      const now = readRuntimeFile({ path, env });
       if (now.warnings.length || JSON.stringify(now.entries) !== JSON.stringify(expected)) {
         throw new Error('runtime settings changed since this command read them — re-run it');
       }
     }
     const id = randomUUID();
+    const warnings = [];
     appendAuditLine(path, { ...audit, id, outcome: 'intent' });
     const tmp = `${path}.${process.pid}.${id}.tmp`;
     try {
       const fd = openSync(tmp, 'w', 0o644);
       try { writeAllAndSync(fd, `${JSON.stringify(next, null, 2)}\n`); } finally { closeSync(fd); }
+      touch(); // throws ELOCKLOST if another writer reclaimed the lock — then nothing is published
       renameSync(tmp, path);
-      try { const d = openSync(dirname(path), 'r'); try { fsyncSync(d); } finally { closeSync(d); } } catch { /* best effort */ }
     } catch (e) {
       try { rmSync(tmp, { force: true }); } catch { /* ignore */ }
       try { appendAuditLine(path, { id, key: audit?.key, outcome: 'failed', error: String(e?.message ?? e).split('\n')[0], at: new Date().toISOString() }); } catch { /* best effort */ }
       throw e;
     }
-    appendAuditLine(path, { id, key: audit?.key, outcome: 'applied', at: new Date().toISOString() });
+    try { const d = openSync(dirname(path), 'r'); try { fsyncSync(d); } finally { closeSync(d); } }
+    catch (e) { warnings.push(`directory fsync failed (${String(e?.message ?? e).split('\n')[0]}) — the change is live but may not survive a crash`); }
+    try { appendAuditLine(path, { id, key: audit?.key, outcome: 'applied', at: new Date().toISOString(), ...(warnings.length ? { warnings } : {}) }); }
+    catch (e) { warnings.push(`the change is LIVE but its "applied" audit line failed (${String(e?.message ?? e).split('\n')[0]}) — \`runtime-setting get\` shows it as unconfirmed`); }
+    for (const w of warnings) { try { log(`runtime-setting: WARNING ${w}`); } catch { /* ignore */ } }
+    return { warnings };
   });
 }

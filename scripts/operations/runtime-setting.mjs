@@ -44,8 +44,8 @@ export function runtimeSettingOperation({ readRuntime, now = () => new Date().to
     plan: compute({
       reads: ['findings.read', 'input.action', 'input.key', 'input.value', 'input.actor', 'input.reason'],
       fn: (view) => {
-        const { path, entries, warnings } = view.findings.read;
-        const r = planRuntimeSetting({ ...view.input, now: now(), entries, path });
+        const { path, entries, warnings, auditTail = [] } = view.findings.read;
+        const r = planRuntimeSetting({ ...view.input, now: now(), entries, path, auditTail });
         return { ...r, warnings };
       },
     }),
@@ -63,5 +63,9 @@ export function runtimeSettingOperation({ readRuntime, now = () => new Date().to
 export function finishRuntimeSetting({ run, code, lines }) {
   const v = run?.verdict;
   if (v && v.ok === false) return { code: code || 1, lines: [...(lines ?? []), `runtime-setting: refused — ${v.error}`] };
+  if (v?.action === 'get' && v.audit && !['applied', 'none'].includes(v.audit.status)) {
+    return { code, lines: [...(lines ?? []), `runtime-setting: WARNING ${v.key} last change is ${v.audit.status}${v.audit.error ? ` (${v.audit.error})` : ''}`] };
+  }
+  if (v?.action === 'get' && v.audit?.warnings?.length) return { code, lines: [...(lines ?? []), ...v.audit.warnings.map((w) => `runtime-setting: WARNING ${w}`)] };
   return { code, lines };
 }
