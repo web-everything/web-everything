@@ -23,7 +23,7 @@ In `signed`, everything below about the trust root, signing, checkpoints, quaran
 verification applies. Where the Design text below says a row "must" be signed or the ledger "is unreadable"
 without a trusted signature, read it as applying in `signed` only. Key provisioning, the bootstrap trust-root PR
 and the `review:human` hold are required only when `ledgerAuth` is `signed`; they no longer block `--apply`.
-Cards numbered at birth (slice 6564) need no row, so this ledger carries only fallback and seed rows.
+Cards numbered at birth (slice xx7o40x) need no row, so this ledger carries only fallback and seed rows.
 
 ## Design
 

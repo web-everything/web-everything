@@ -35,7 +35,7 @@ Operator, verbatim, 2026-10-19 (in conversation, answering the re-check of this 
 
 The ruling, in five points:
 
-1. Cards are numbered at birth, as new slice 0 (6564, "Card numbers assigned at birth").
+1. Cards are numbered at birth, as new slice 0 (xx7o40x, "Card numbers assigned at birth").
 2. The ledger is the fallback for cards that could not be numbered at birth.
 3. Renames are NOT hourly. A NIGHTLY batch renames any fallback `x<6>` card to `NNN-slug` and rewrites x-id
    references to numbers, including the ~830 backlog lines and ~890 non-backlog lines that cite x-ids today.
@@ -194,7 +194,7 @@ This prerequisite belongs to slice (d); slice (e)'s later local-ledger retiremen
 
 | Slice | Card | Size | blockedBy |
 |---|---|---|---|
-| (0) card numbers assigned at birth | 6564 | 5 | — |
+| (0) card numbers assigned at birth | xx7o40x | 5 | — |
 | (a) ledger store and assign-at-land, in shadow | 6121 | 5 | — |
 | (b) readers and renderers use the ledger | 6124 | 5 | 6121 |
 | (c) check-standards rules accept ledger-numbered x-id file names | 6125 | 3 | 6121, 6124 |
