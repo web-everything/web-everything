@@ -6,7 +6,7 @@ import { readReviewCiGate } from '../../../scripts/lib/review-ci-gate-io.mjs';
  *   and the per-tick sequence, both with every effect injected (no real gh/claude, no real lease/timer).
  */
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -74,6 +74,11 @@ const noPrepReview = () => null;
 /** The `review-status:*` writes only (the same writer also keeps the one `status:*` label, pr-status-label.mjs). */
 const reviewStatusCalls = (calls) => calls.filter((c) => !(String(c.spec?.add ?? '').startsWith('status:')
   || (!c.spec?.add && (c.spec?.remove ?? []).length && c.spec.remove.every((r) => r.startsWith('status:')))));
+
+// The live-review cap these tests exercise is the SHIPPED tool-layer value (an emergency knob that moves); read it
+// rather than hard-coding it, so a cap change never turns the suite red.
+const LIVE_CAP = JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/review-concurrency.json'), 'utf8')).maxLiveReviewRounds;
+const liveJobs = (n) => Array.from({ length: n }, (_, k) => `node j${k}/review-job.mjs run`).join('\n');
 
 describe('hasStaleMainRefusal', () => {
   const staleMessage = () => {
@@ -613,11 +618,12 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
   it('EMERGENCY live-review cap: a shared budget bounds new reviews across repos; 0 left dispatches nothing', async () => {
     const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
     const budget = liveReviewRoundBudget({ env: {}, listCommands: () => 'node scripts/operations/review-job.mjs --pr=1\nnode x/review-loop-cli.mjs\nnode other.mjs\n' });
-    expect(budget).toMatchObject({ live: 1, max: 3, left: 2 });
+    expect(budget).toMatchObject({ live: 1, max: LIVE_CAP, left: LIVE_CAP - 1 });
     const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
-    for (let i = 0; i < 2; i++) runReviewTick({ reconcile: () => reviewsPlan(3), dispatch, tagRound: () => {}, tagStatus: () => {},
-      statusCandidates: () => [], acquirableLanes: () => 10, liveReviewBudget: budget });
-    expect(dispatch).toHaveBeenCalledTimes(2);
+    const owed = LIVE_CAP + 1; // more owed per tick than the cap allows, across two ticks
+    for (let i = 0; i < 2; i++) runReviewTick({ reconcile: () => reviewsPlan(owed), dispatch, tagRound: () => {}, tagStatus: () => {},
+      statusCandidates: () => [], acquirableLanes: () => 10 * owed, liveReviewBudget: budget });
+    expect(dispatch).toHaveBeenCalledTimes(LIVE_CAP - 1);
     const closed = liveReviewRoundBudget({ env: {}, listCommands: () => { throw Error('ps failed'); } });
     expect(closed.left).toBe(0);
     expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '5' }, listCommands: () => '' })).toMatchObject({ max: 5, left: 5 });
@@ -633,7 +639,7 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
       'grep review-job.mjs',
       'vim scripts/operations/review-loop-cli.mjs',
     ].join('\n');
-    expect(liveReviewRoundBudget({ env: {}, listCommands: () => ps })).toMatchObject({ live: 1, max: 3, left: 2 });
+    expect(liveReviewRoundBudget({ env: {}, listCommands: () => ps })).toMatchObject({ live: 1, max: LIVE_CAP, left: LIVE_CAP - 1 });
     // a preload / loader value is not the script; other node runtimes and a direct (shebang) run still count
     const preloaded = [
       'node --import ./boot.mjs scripts/operations/review-loop-cli.mjs --pr=1',
@@ -641,19 +647,19 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
       '/usr/bin/nodejs scripts/operations/review-loop-cli.mjs --pr=3',
       '/clone/scripts/operations/review-loop-cli.mjs --pr=4',
     ].join('\n');
-    expect(liveReviewRoundBudget({ env: {}, listCommands: () => preloaded })).toMatchObject({ live: 4, left: 0 });
+    expect(liveReviewRoundBudget({ env: {}, listCommands: () => preloaded })).toMatchObject({ live: 4, left: Math.max(0, LIVE_CAP - 4) });
   });
 
   it('a cap-bound tick says the live-review cap held the review, never "no acquirable lane"', async () => {
     const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
-    const budget = liveReviewRoundBudget({ env: {}, listCommands: () => 'node a/review-job.mjs run\nnode b/review-job.mjs run\nnode c/review-job.mjs run' });
+    const budget = liveReviewRoundBudget({ env: {}, listCommands: () => liveJobs(LIVE_CAP) });
     const prs = [100, 101].map((number) => ({ number, labels: [{ name: 'review:human' }] }));
     const out = runReviewTick({ reconcile: () => reviewsPlan(2), readPrs: () => prs, readAgents: () => [], dispatch: vi.fn(),
       tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 40, liveReviewBudget: budget });
     expect(out.deferredForLanes).toBe(0);
     expect(out.deferredForCap).toBe(2);
     const reasons = out.pendingNotDispatched.flatMap((p) => p.reasons).join('\n');
-    expect(reasons).toMatch(/held by the live-review cap \(live review rounds 3 of maxLiveReviewRounds=3 \(tool\); 40 lane\(s\) acquirable\)/);
+    expect(reasons).toContain(`held by the live-review cap (live review rounds ${LIVE_CAP} of maxLiveReviewRounds=${LIVE_CAP} (tool); 40 lane(s) acquirable)`);
     expect(reasons).not.toMatch(/no acquirable lane/);
     const starved = runReviewTick({ reconcile: () => reviewsPlan(2), readPrs: () => prs, readAgents: () => [], dispatch: vi.fn(),
       tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 0 });
