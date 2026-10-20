@@ -114,6 +114,72 @@ describe('run-fresh', () => {
     expect(calls.at(-1).args[1]).toBe('release');
     expect(['SIGINT', 'SIGTERM', 'SIGHUP'].map((s) => proc.listenerCount(s))).toEqual([0, 0, 0]);
   });
+  it.skipIf(process.platform === 'win32').each([
+    ['SIGTERM', 143], ['SIGKILL', 137], ['exit', 0],
+  ])('retains the lane for surviving descendants when the leader ends independently (%s)', async (ending, expectedCode) => {
+    const dir = await mkdtemp(join(tmpdir(), 'run-fresh-leader-'));
+    let wrapper;
+    let operationPid;
+    let watchdog;
+    let output = '';
+    const stopFixture = () => {
+      if (operationPid) {
+        try { process.kill(-operationPid, 'SIGKILL'); } catch { /* already stopped */ }
+      }
+      wrapper?.kill('SIGKILL');
+    };
+    try {
+      await mkdir(join(dir, 'scripts', 'operations'), { recursive: true });
+      await writeFile(join(dir, 'scripts', 'operations', 'run.mjs'), `
+        import { spawn } from 'node:child_process';
+        process.on('SIGUSR1', () => process.exit(0));
+        console.log('OPERATION GROUP ' + process.pid);
+        spawn(process.execPath, ['-e', ${JSON.stringify(`
+          console.log('DESCENDANT READY');
+          setTimeout(() => { console.log('DESCENDANT STOPPED'); process.exit(0); }, 500);
+        `)}], { stdio: 'inherit' });
+      `);
+      const runner = join(dir, 'wrapper.mjs');
+      await writeFile(runner, `
+        import { runFresh } from ${JSON.stringify(new URL('../run-fresh.mjs', import.meta.url).href)};
+        const spawn = (cmd, args) => {
+          if (cmd === 'git') return { status: 0, stdout: '${SHA}' };
+          if (args[1] === 'acquire') return { status: 0, stdout: JSON.stringify({ lane: 7, path: ${JSON.stringify(dir)}, holder: 'probe-holder' }) };
+          if (args[1] === 'release') { console.log('LANE RELEASED'); return { status: 0 }; }
+          throw new Error('unexpected fixture command');
+        };
+        process.exitCode = await runFresh(['probe'], { spawn, root: ${JSON.stringify(dir)}, log: () => {} });
+      `);
+      wrapper = spawnChild(process.execPath, [runner], { stdio: ['ignore', 'pipe', 'pipe'] });
+      watchdog = setTimeout(stopFixture, 3000);
+      const closed = new Promise((resolve, reject) => {
+        wrapper.once('error', reject);
+        wrapper.once('close', (code, signal) => resolve({ code, signal }));
+      });
+      let sent = false;
+      wrapper.stdout.on('data', (chunk) => {
+        output += chunk;
+        const group = /OPERATION GROUP (\d+)/.exec(output);
+        if (group) operationPid = Number(group[1]);
+        if (!sent && operationPid && output.includes('DESCENDANT READY')) {
+          sent = true;
+          // Target only the leader: the wrapper receives no cancellation signal.
+          process.kill(operationPid, ending === 'exit' ? 'SIGUSR1' : ending);
+        }
+      });
+      wrapper.stderr.on('data', (chunk) => { output += chunk; });
+      const result = await closed;
+      expect(sent).toBe(true);
+      expect(result).toEqual({ code: expectedCode, signal: null });
+      expect(output).toContain('DESCENDANT STOPPED');
+      expect(output).toContain('LANE RELEASED');
+      expect(output.indexOf('LANE RELEASED'), output).toBeGreaterThan(output.indexOf('DESCENDANT STOPPED'));
+    } finally {
+      clearTimeout(watchdog);
+      stopFixture();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
   it.each([
     ['SIGINT', false, false], ['SIGTERM', false, false], ['SIGHUP', false, false],
     ['SIGTERM', true, false], ['SIGINT', false, true],

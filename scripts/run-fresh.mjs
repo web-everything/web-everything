@@ -38,7 +38,7 @@ function signalOperation(child, signal) {
   }
 }
 
-/** A cancelled operation may have left a writing subprocess behind. Zombies cannot write and need no wait. */
+/** An exited operation may have left a writing subprocess behind. Zombies cannot write and need no wait. */
 async function waitForGroupStop(pid) {
   for (;;) {
     try { process.kill(-pid, 0); } catch (error) { if (error.code === 'ESRCH') return; }
@@ -94,13 +94,14 @@ export function runFresh(argv, { spawn = defaultSpawn, spawnOperation = spawnChi
       const run = await new Promise((resolveRun) => {
         cancellation.child = child;
         child.once('error', (error) => log(`run-fresh: could not run ${op}: ${error.message}`));
-        // close follows exit/error and waits for stdio too; only then is it safe to release the lane.
+        // close follows exit/error, but descendants can still be using the lane after the leader exits.
         child.once('close', (status, signal) => {
           resolveRun({ status, signal });
         });
         if (cancellation.signal) signalOperation(child, cancellation.signal);
       });
-      if (cancellation.signal && operationGroups && child.pid) await waitForGroupStop(child.pid);
+      // Always drain the group, even if only the leader was killed or exited normally.
+      if (operationGroups && child.pid) await waitForGroupStop(child.pid);
       cancellation.child = null;
       code = typeof run.status === 'number' && run.status >= 0 ? run.status
         : (run.signal ? 128 + constants.signals[run.signal] : 1);
