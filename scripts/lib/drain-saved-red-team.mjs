@@ -1,7 +1,7 @@
 import { verifySavedRedTeamProvenance } from './saved-red-team-provenance.mjs';
 /** Completed evidence survives a withheld/failed comment. Readers must scrub saved text before publication. */
-import { readFileSync } from 'node:fs';
-import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
+import { resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
+import { scorecardOperationSnapshot } from './scorecard-operation-snapshot.mjs';
 import { cascadePolicy, formatCascadeSourcesLine, platformPreference } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
 
@@ -29,21 +29,24 @@ export function savedRedTeamFallback({ repo, pr, head, env = process.env, runsDi
   return () => readSavedRedTeamResult({ repo, pr, head: String(head ?? '').toLowerCase(), env, runsDir, log });
 }
 
-export function readSavedRedTeamResult({ repo, pr, head, env = process.env, runsDir,
+export function readSavedRedTeamResult({ repo, pr, head, env = process.env, runsDir, scorecardSnapshot,
   log = line => process.stderr.write(`${line}\n`) } = {}) {
   if (!repo || !Number.isSafeInteger(Number(pr)) || Number(pr) <= 0 || !/^[a-f0-9]{40}$/.test(head ?? '')) return null;
   if (!readSavedRedTeamSetting({ env }).value.drainReadsSavedResult) return null;
   const ignore = reason => { log(`saved-red-team-ignored: ${reason}`); return null; };
   const path = resolveScorecardStorePath(env);
-  let text;
-  try { text = readFileSync(path, 'utf8'); }
-  catch (e) { if (e.code === 'ENOENT') return ignore('saved result store missing'); throw new Error('saved red-team evidence unreadable'); }
+  // The calling operation's one scorecard read when it handed one over for this same path (xwu9oxh S2), else a
+  // fresh read of our own. Either way this check applies its own refusals to that read's outcome.
+  const snapshot = scorecardSnapshot?.path === path ? scorecardSnapshot : scorecardOperationSnapshot(path);
+  const read = snapshot.read();
+  if (!read.ok) { if (read.error?.code === 'ENOENT') return ignore('saved result store missing'); throw new Error('saved red-team evidence unreadable'); }
   // The shared reader intentionally tolerates corrupt files for accounting. Admission must refuse them,
   // rather than let an empty history trigger the never-scheduled escape. Validate the same snapshot first.
-  let store;
-  try { store = JSON.parse(text); } catch { throw new Error('saved red-team evidence malformed'); }
+  if ('parseError' in read) throw new Error('saved red-team evidence malformed');
+  const store = read.value;
   if (!Array.isArray(store?.records)) throw new Error('saved red-team evidence malformed');
-  const records = readStore({ path, read: () => text, exists: () => true }).records;
+  // A valid store's records: exactly what readStore makes of the same text.
+  const records = store.records;
   // Same completed-seat selection as speculateRedTeam/resumeRedTeam, additionally bound to the repo.
   const row = records.filter(r => r?.dispatchKind === 'review-seat' && r.seat === 'red-team'
     && sameRepo(r.repo, repo) && r.pr === Number(pr) && r.rev === head && r.status === 'ok').at(-1);
