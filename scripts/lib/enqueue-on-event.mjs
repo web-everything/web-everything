@@ -86,7 +86,7 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 
 export const ENQUEUE_ON_EVENT_POLICY = 'mergeQueue.enqueueOnEvent';
 export const ENQUEUE_ON_EVENT_ENV = 'WE_ENQUEUE_ON_EVENT';
-export const ENQUEUE_ON_EVENT_DEFAULTS = Object.freeze({ enabled: false, debounceSeconds: 15, timeoutSeconds: 600, catchUp: Object.freeze({ enabled: false, intervalMinutes: 10, concurrency: 3, busyIntervalSeconds: 60, maxQueued: 12, missSmellAfter: 3, blockedBackoffRounds: 6, timeoutBackoffRounds: 3, order: 'priority-then-first-accept' }) });
+export const ENQUEUE_ON_EVENT_DEFAULTS = Object.freeze({ enabled: false, debounceSeconds: 15, timeoutSeconds: 600, catchUp: Object.freeze({ enabled: false, intervalMinutes: 10, concurrency: 3, busyIntervalSeconds: 60, maxQueued: 12, missSmellAfter: 3, blockedBackoffRounds: 6, timeoutBackoffRounds: 3, order: 'priority-then-first-accept', stalePendingMinutes: 10 }) });
 /** Compatibility constant for the standard fast-drain timeout; the setting controls child runs. */
 export const FAST_DRAIN_TIMEOUT_MS = 10 * 60_000;
 const READY_LABEL = 'ready-to-merge';
@@ -104,6 +104,8 @@ const CATCH_UP_VALID = {
   blockedBackoffRounds: (v) => Number.isInteger(v) && v >= 0,
   timeoutBackoffRounds: (v) => Number.isInteger(v) && v >= 0,
   order: (v) => ['priority-then-first-accept', 'oldest-ready'].includes(v),
+  // Event work pending this long with no live fast drain is planned by catch-up instead of skipped (0 = never).
+  stalePendingMinutes: (v) => Number.isFinite(v) && v >= 0 && v <= 1440,
 };
 const VALID = {
   catchUp: (v) => Object.values(CATCH_UP_VALID).some((valid) => valid(v)),
@@ -148,11 +150,11 @@ export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform
   }
   // The cascade rejects values outside the union before the per-leaf type check can see them.
   for (const invalid of c.invalid || []) {
-    const match = /^(?:tool|platform)\.(catchUp\.(?:enabled|intervalMinutes|concurrency|busyIntervalSeconds|maxQueued|missSmellAfter|blockedBackoffRounds|timeoutBackoffRounds|order)=.*)$/.exec(invalid);
+    const match = /^(?:tool|platform)\.(catchUp\.(?:enabled|intervalMinutes|concurrency|busyIntervalSeconds|maxQueued|missSmellAfter|blockedBackoffRounds|timeoutBackoffRounds|order|stalePendingMinutes)=.*)$/.exec(invalid);
     if (match && !out.invalid.includes(match[1])) out.invalid.push(match[1]);
   }
   const src = (k) => out.sources[k] || 'standard';
-  out.line = `enqueue-on-event: setting ${ENQUEUE_ON_EVENT_POLICY} enabled=${out.enabled} (${src('enabled')}), debounceSeconds=${out.debounceSeconds} (${src('debounceSeconds')}), timeoutSeconds=${out.timeoutSeconds} (${src('timeoutSeconds')}), catchUp.enabled=${out.catchUp.enabled} (${src('catchUp.enabled')}), catchUp.intervalMinutes=${out.catchUp.intervalMinutes} (${src('catchUp.intervalMinutes')}), catchUp.concurrency=${out.catchUp.concurrency} (${src('catchUp.concurrency')}), catchUp.busyIntervalSeconds=${out.catchUp.busyIntervalSeconds} (${src('catchUp.busyIntervalSeconds')}), catchUp.maxQueued=${out.catchUp.maxQueued} (${src('catchUp.maxQueued')}), catchUp.missSmellAfter=${out.catchUp.missSmellAfter} (${src('catchUp.missSmellAfter')}), catchUp.blockedBackoffRounds=${out.catchUp.blockedBackoffRounds} (${src('catchUp.blockedBackoffRounds')}), catchUp.timeoutBackoffRounds=${out.catchUp.timeoutBackoffRounds} (${src('catchUp.timeoutBackoffRounds')}), catchUp.order=${out.catchUp.order} (${src('catchUp.order')})${out.invalid.length ? ` · ignored invalid: ${out.invalid.join('; ')}` : ''}`;
+  out.line = `enqueue-on-event: setting ${ENQUEUE_ON_EVENT_POLICY} enabled=${out.enabled} (${src('enabled')}), debounceSeconds=${out.debounceSeconds} (${src('debounceSeconds')}), timeoutSeconds=${out.timeoutSeconds} (${src('timeoutSeconds')}), catchUp.enabled=${out.catchUp.enabled} (${src('catchUp.enabled')}), catchUp.intervalMinutes=${out.catchUp.intervalMinutes} (${src('catchUp.intervalMinutes')}), catchUp.concurrency=${out.catchUp.concurrency} (${src('catchUp.concurrency')}), catchUp.busyIntervalSeconds=${out.catchUp.busyIntervalSeconds} (${src('catchUp.busyIntervalSeconds')}), catchUp.maxQueued=${out.catchUp.maxQueued} (${src('catchUp.maxQueued')}), catchUp.missSmellAfter=${out.catchUp.missSmellAfter} (${src('catchUp.missSmellAfter')}), catchUp.blockedBackoffRounds=${out.catchUp.blockedBackoffRounds} (${src('catchUp.blockedBackoffRounds')}), catchUp.timeoutBackoffRounds=${out.catchUp.timeoutBackoffRounds} (${src('catchUp.timeoutBackoffRounds')}), catchUp.order=${out.catchUp.order} (${src('catchUp.order')}), catchUp.stalePendingMinutes=${out.catchUp.stalePendingMinutes} (${src('catchUp.stalePendingMinutes')})${out.invalid.length ? ` · ignored invalid: ${out.invalid.join('; ')}` : ''}`;
   return out;
 }
 
@@ -641,8 +643,20 @@ export function createEnqueueOnEvent({
     const completed = new Set();
     const concurrency = s.catchUp?.concurrency ?? ENQUEUE_ON_EVENT_DEFAULTS.catchUp.concurrency;
     let catchUpIndex = 0;
+    // Live 2026-10-20 (#5738): event work can sit in `pending` while no path runs it (a catch-up-only round never
+    // runs event work; the full pass may defer it). Once it is older than catchUp.stalePendingMinutes and no fast
+    // drain is working it, catch-up plans it in its NORMAL order instead of skipping it as "already pending".
+    const staleMs = (s.catchUp?.stalePendingMinutes ?? ENQUEUE_ON_EVENT_DEFAULTS.catchUp.stalePendingMinutes) * 60_000;
+    const stalePending = (p) => staleMs > 0 && !p.catchUp && p.repo === localSlug && !activeNums.has(p.num)
+      && !attempted.has(p.num) && Number.isFinite(p.firstAt) && now() - p.firstAt >= staleMs;
     const queueCatchUp = (num) => {
       const key = `${localSlug}#${num}`;
+      const held = pending.get(key);
+      if (held && stalePending(held)) {
+        pending = new Map(pending).set(key, { ...held, causes: [...new Set([...held.causes, 'catch-up'])], catchUp: true,
+          firstAt: now() + catchUpIndex++, lastAt: Math.min(held.lastAt, now() - s.debounceSeconds * 1000) });
+        return true;
+      }
       if (pending.has(key) || activeNums.has(num) || attempted.has(num)) return false;
       pending = new Map(pending).set(key, {
         // Keep the planned priority order through duePending, independently of ready-label churn.
@@ -712,7 +726,9 @@ export function createEnqueueOnEvent({
         catchUpCapacity = capacity;
         const reserved = [...pending.values()].filter((p) => p.catchUp).length;
         const priorities = await readPriorities();
-        const plan = planCatchUp({ ...result, prs: catchUpPrs, capacity: capacity - reserved, ...priorities, mainFix: mainFix ?? priorities.mainFix, repo: localSlug, now: now(), order: s.catchUp.order, pendingNums: [...pending.values()].filter(p => p.catchUp || !ownsFix(p.num, p.repo)).map(p => p.num) });
+        const stale = [...pending.values()].filter(p => !ownsFix(p.num, p.repo) && stalePending(p)).map(p => p.num);
+        if (stale.length) log(`enqueue-on-event: catch-up plans stale pending event work ${stale.map(n => `#${n}`).join(' ')} in normal order (pending >= ${staleMs / 60_000} min with no live fast drain — catchUp.stalePendingMinutes (${s.sources?.['catchUp.stalePendingMinutes'] || 'standard'}))`);
+        const plan = planCatchUp({ ...result, prs: catchUpPrs, capacity: capacity - reserved, ...priorities, mainFix: mainFix ?? priorities.mainFix, repo: localSlug, now: now(), order: s.catchUp.order, pendingNums: [...pending.values()].filter(p => (p.catchUp || !ownsFix(p.num, p.repo)) && !stale.includes(p.num)).map(p => p.num) });
         const nums = (ps) => ps.map((n) => `#${n}`).join(' ');
         log(`enqueue-on-event: catch-up listed ${result.prs.length} ready-to-merge PR(s), ${result.queued} in the merge queue, room ${Math.max(0, capacity - result.queued)} (capacity ${capacity} from ${source}) — ${plan.run.length ? `fast drain for ${nums(plan.run.map((p) => p.num))} (${s.catchUp.order ?? 'priority-then-first-accept'})` : 'nothing to run'}${plan.later.length ? `; later: ${nums(plan.later)}` : ''}${plan.skipped.length ? `; skipped: ${plan.skipped.map((p) => `#${p.num} ${p.reason}`).join(', ')}` : ''}`);
         for (const { num } of plan.run) queueCatchUp(num);

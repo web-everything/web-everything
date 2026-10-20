@@ -1866,3 +1866,42 @@ describe('queue overlap catch-up scheduling', () => {
     } finally { f.handle.kill(); }
   });
 });
+
+describe('stale pending event work in catch-up (live 2026-10-20, #5738 skipped as "already pending" for 80+ min)', () => {
+  const run = async ({ ageMs, stalePendingMinutes, mainFix = null, capacity = 3 }) => {
+    const f = catchUpSetup({ manualFinish: true,
+      resolveThroughput: () => ({ value: { redMainSkipCatchUp: false } }),
+      ...(mainFix ? { readMainFixPr: () => mainFix } : {}),
+      readCapacity: () => ({ capacity, source: 'test' }),
+      resolveSetting: () => ({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp, ...(stalePendingMinutes !== undefined ? { stalePendingMinutes } : {}) } }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(43, 100), candidate(42, 200), candidate(99, 300)] }),
+    });
+    f.handle.notePoll({ ok: true, marked: [mark(42)] });
+    f.advance(ageMs);
+    const done = f.handle.catchUp();
+    for (let i = 0; i < 30; i++) await new Promise(r => setImmediate(r));
+    const first = f.calls.map(c => c.args.find(a => a.startsWith('--only=')));
+    for (let i = 0; i < 40; i++) { f.children.forEach(c => c.finish()); await new Promise(r => setImmediate(r)); }
+    await done;
+    f.handle.kill();
+    return { f, first, all: f.calls.map(c => c.args.find(a => a.startsWith('--only='))) };
+  };
+  it('plans stale event work in its normal order (no priority jump)', async () => {
+    const { f, first, all } = await run({ ageMs: 11 * 60_000 });
+    expect(first).toEqual(['--only=43']);
+    expect(all).toEqual(['--only=43', '--only=42', '--only=99']);
+    expect(f.lines.join('\n')).not.toContain('#42 already pending');
+    expect(f.lines.join('\n')).toContain('catch-up plans stale pending event work #42 in normal order');
+  });
+  it('still skips fresh pending work, and stalePendingMinutes=0 disables the fold', async () => {
+    for (const o of [{ ageMs: 60_000 }, { ageMs: 60 * 60_000, stalePendingMinutes: 0 }]) {
+      const { f, all } = await run(o);
+      expect(all).not.toContain('--only=42');
+      expect(f.lines.join('\n')).toContain('#42 already pending');
+    }
+  });
+  it('keeps catch-up room: stale work only takes a planned slot', async () => {
+    const { all } = await run({ ageMs: 11 * 60_000, capacity: 1 });
+    expect(all).toEqual(['--only=43']);
+  });
+});
