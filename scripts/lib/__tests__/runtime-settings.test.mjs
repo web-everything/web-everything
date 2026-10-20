@@ -1,7 +1,7 @@
 // Runtime-operator settings layer (operator 2026-10-20: hot-swap operational knobs with no rebuild).
 // Precedence env > runtime > tool > platform > standard; allowlist + bounds; read fresh each call; never throws.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -32,6 +32,8 @@ describe('runtime settings path', () => {
     // Even a reader handed a bare env never reads the host's live file while this process is under test.
     expect(runtimeSettingsPath({ env: {}, home: '/h' })).toBeNull();
     expect(runtimeSettingsPath({ env })).toBe(path);
+    // An override inherited from an operator shell that names the LIVE file is refused under test.
+    expect(runtimeSettingsPath({ env: { [RUNTIME_SETTINGS_ENV]: join('/h', 'workspace', '.operations', 'settings', 'runtime.json') }, home: '/h' })).toBeNull();
   });
 });
 
@@ -200,7 +202,30 @@ describe('planRuntimeSetting + atomic write', () => {
     writeRuntimeSettings(u);
     expect(readRuntimeFile({ env }).entries).toEqual({});
     const audit = readFileSync(runtimeAuditPath(path), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
-    expect(audit.map((a) => [a.action, a.before, a.after, a.actor])).toEqual([['set', null, 8, 'chalbert'], ['unset', 8, null, 'chalbert']]);
+    expect(audit.filter((a) => a.outcome === 'intent').map((a) => [a.action, a.before, a.after, a.actor])).toEqual([['set', null, 8, 'chalbert'], ['unset', 8, null, 'chalbert']]);
+    expect(audit.map((a) => a.outcome)).toEqual(['intent', 'applied', 'intent', 'applied']);
+    expect(audit[1].id).toBe(audit[0].id);
+  });
+  it('a lock left by a dead writer is taken over; one held by a live writer is not', () => {
+    writeFileSync(`${path}.lock`, '999999999:dead');
+    writeRuntimeSettings(planRuntimeSetting({ ...base, path, action: 'set', key: 'reviewConcurrency.maxLiveReviewRounds', value: '6' }));
+    expect(readRuntimeFile({ env }).entries['reviewConcurrency.maxLiveReviewRounds'].value).toBe(6);
+    expect(existsSync(`${path}.lock`)).toBe(false);
+    writeFileSync(`${path}.lock`, `${process.pid}:live`);
+    const p = planRuntimeSetting({ ...base, path, action: 'set', key: 'reviewConcurrency.maxLiveReviewRounds', value: '7', entries: readRuntimeFile({ env }).entries });
+    expect(() => writeRuntimeSettings(p)).toThrow(/is held/);
+    expect(readFileSync(`${path}.lock`, 'utf8')).toBe(`${process.pid}:live`);
+    expect(readRuntimeFile({ env }).entries['reviewConcurrency.maxLiveReviewRounds'].value).toBe(6);
+    rmSync(`${path}.lock`);
+  }, 15_000);
+  it('a failed apply leaves an intent + failed audit pair and the old file', () => {
+    write({ 'reviewConcurrency.maxLiveReviewRounds': entry(4) });
+    const p = planRuntimeSetting({ ...base, path, action: 'set', key: 'reviewConcurrency.maxLiveReviewRounds', value: '6', entries: readRuntimeFile({ env }).entries });
+    // Make the target a directory so the rename fails.
+    rmSync(path); mkdirSync(path);
+    expect(() => writeRuntimeSettings({ ...p, expected: undefined })).toThrow();
+    const audit = readFileSync(runtimeAuditPath(path), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    expect(audit.map((a) => a.outcome)).toEqual(['intent', 'failed']);
   });
 });
 

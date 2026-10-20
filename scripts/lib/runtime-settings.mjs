@@ -24,9 +24,10 @@
  *   lower layers — never throws. Guards and trust settings (auth, round caps for limit lifting, red-team gate rules)
  *   are deliberately NOT on the allowlist: changing those stays a reviewed code change.
  */
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeSync, appendFileSync } from 'node:fs';
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { isUnderTest } from './under-test.mjs';
 
 export const RUNTIME_SETTINGS_ENV = 'WE_RUNTIME_SETTINGS_FILE';
@@ -64,12 +65,19 @@ export const RUNTIME_SETTINGS_ALLOWLIST = Object.freeze({
   }),
 });
 
-/** The runtime file path, or `null` when the layer is off (under test without an explicit path). */
+const livePath = (home) => join(home, 'workspace', '.operations', 'settings', 'runtime.json');
+/** The runtime file path, or `null` when the layer is off. Under test it is off unless the env names a file, and an
+ *  override naming the host's LIVE file (e.g. one inherited from an operator shell) is refused — a test never reads
+ *  or writes the live layer. */
 export function runtimeSettingsPath({ env = process.env, home = homedir() } = {}) {
+  const testing = isUnderTest(env) || isUnderTest(process.env);
   const override = String(env?.[RUNTIME_SETTINGS_ENV] ?? '').trim();
-  if (override) return override;
-  if (isUnderTest(env) || isUnderTest(process.env)) return null;
-  return join(home, 'workspace', '.operations', 'settings', 'runtime.json');
+  if (override) {
+    if (testing && [livePath(home), livePath(homedir())].some((p) => resolve(p) === resolve(override))) return null;
+    return override;
+  }
+  if (testing) return null;
+  return livePath(home);
 }
 
 export const runtimeAuditPath = (path) => path.replace(/\.json$/, '') + '.audit.jsonl';
@@ -169,26 +177,64 @@ export function planRuntimeSetting({ action, key, value, actor, reason, now = ne
   return { ok: true, action, key, path, before, after, expected: entries, next, audit };
 }
 
-const LOCK_STALE_MS = 30_000;
 const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-/** IO: an exclusive create-lock beside the file (stale after 30 s). Throws when it cannot be taken in ~5 s. */
-function withRuntimeLock(path, fn, { stat = statSync } = {}) {
+/** IO: write ALL of `text` to `fd` (writeSync may write fewer bytes than asked), then fsync. */
+function writeAllAndSync(fd, text) {
+  const buf = Buffer.from(text);
+  let off = 0;
+  while (off < buf.length) {
+    const n = writeSync(fd, buf, off, buf.length - off);
+    if (!(n > 0)) throw new Error('runtime settings: write made no progress');
+    off += n;
+  }
+  fsyncSync(fd);
+}
+/** IO: append one durable audit line (full write + fsync). */
+function appendAuditLine(path, record) {
+  const fd = openSync(runtimeAuditPath(path), 'a', 0o644);
+  try { writeAllAndSync(fd, `${JSON.stringify(record)}\n`); } finally { closeSync(fd); }
+}
+const pidAlive = (pid) => {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; }
+};
+/**
+ * IO: an exclusive create-lock beside the file, owned by a token. A held lock is taken over ONLY when its owner
+ * process is gone (never by age alone, so a paused live writer keeps it); release removes the lock only while it
+ * still holds this writer's token. Throws when it cannot be taken in ~5 s.
+ */
+function withRuntimeLock(path, fn) {
   const lock = `${path}.lock`;
+  const token = `${process.pid}:${randomUUID()}`;
   for (let i = 0; ; i++) {
-    try { closeSync(openSync(lock, 'wx')); break; } catch (e) {
+    try {
+      const fd = openSync(lock, 'wx', 0o644);
+      try { writeAllAndSync(fd, token); } finally { closeSync(fd); }
+      break;
+    } catch (e) {
       if (e?.code !== 'EEXIST') throw e;
-      try { if (Date.now() - stat(lock).mtimeMs > LOCK_STALE_MS) { rmSync(lock, { force: true }); continue; } } catch { /* raced */ }
-      if (i >= 50) throw new Error(`runtime settings: ${lock} is held — try again`);
+      let owner = '';
+      try { owner = String(readFileSync(lock, 'utf8')); } catch { /* raced */ }
+      const ownerPid = Number(owner.split(':')[0]);
+      // A lock whose content is still empty/partial is a writer mid-create: wait. Only a dead owner is taken over.
+      if (owner.includes(':') && !pidAlive(ownerPid)) {
+        try { if (String(readFileSync(lock, 'utf8')) === owner) rmSync(lock, { force: true }); } catch { /* raced */ }
+        continue;
+      }
+      if (i >= 50) throw new Error(`runtime settings: ${lock} is held by ${owner || 'another writer'} — try again`);
       sleepMs(100);
     }
   }
-  try { return fn(); } finally { rmSync(lock, { force: true }); }
+  try { return fn(); } finally {
+    try { if (String(readFileSync(lock, 'utf8')) === token) rmSync(lock, { force: true }); } catch { /* already gone */ }
+  }
 }
 
 /**
  * IO: under an exclusive lock, refuse when the file changed since it was planned (compare-and-swap — a concurrent
- * write is never lost), append the audit line FIRST (a change is never effective without its record), then write the
- * new contents atomically (temp + fsync + rename + directory fsync). Throws on failure.
+ * write is never lost); append a durable `intent` audit line FIRST (a change is never effective without its record),
+ * write the new contents atomically (full write + fsync, rename, directory fsync), then append the `applied` — or, on
+ * any failure, `failed` — outcome line. Throws on failure.
  */
 export function writeRuntimeSettings({ path, next, audit, expected }) {
   mkdirSync(dirname(path), { recursive: true });
@@ -199,11 +245,19 @@ export function writeRuntimeSettings({ path, next, audit, expected }) {
         throw new Error('runtime settings changed since this command read them — re-run it');
       }
     }
-    appendFileSync(runtimeAuditPath(path), `${JSON.stringify(audit)}\n`);
-    const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
-    const fd = openSync(tmp, 'w', 0o644);
-    try { writeSync(fd, `${JSON.stringify(next, null, 2)}\n`); fsyncSync(fd); } finally { closeSync(fd); }
-    renameSync(tmp, path);
-    try { const d = openSync(dirname(path), 'r'); try { fsyncSync(d); } finally { closeSync(d); } } catch { /* best effort */ }
+    const id = randomUUID();
+    appendAuditLine(path, { ...audit, id, outcome: 'intent' });
+    const tmp = `${path}.${process.pid}.${id}.tmp`;
+    try {
+      const fd = openSync(tmp, 'w', 0o644);
+      try { writeAllAndSync(fd, `${JSON.stringify(next, null, 2)}\n`); } finally { closeSync(fd); }
+      renameSync(tmp, path);
+      try { const d = openSync(dirname(path), 'r'); try { fsyncSync(d); } finally { closeSync(d); } } catch { /* best effort */ }
+    } catch (e) {
+      try { rmSync(tmp, { force: true }); } catch { /* ignore */ }
+      try { appendAuditLine(path, { id, key: audit?.key, outcome: 'failed', error: String(e?.message ?? e).split('\n')[0], at: new Date().toISOString() }); } catch { /* best effort */ }
+      throw e;
+    }
+    appendAuditLine(path, { id, key: audit?.key, outcome: 'applied', at: new Date().toISOString() });
   });
 }
