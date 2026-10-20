@@ -3,10 +3,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { migrateRaisedBy, parseArgs, resolveMax, formatResult } from '../migrate-raised-by.mjs';
 import * as migration from '../migrate-raised-by.mjs';
 import { raisedByFile } from '../../lib/raised-by.mjs';
+
+// Keep filesystem paths out of Vite's new URL(asset, import.meta.url) transform.
+const TEST_FILE = fileURLToPath(import.meta.url);
+const MIGRATION_FILE = join(dirname(TEST_FILE), '..', 'migrate-raised-by.mjs');
 
 const LINE = '- Also raised by web-everything/web-everything#5710 (finding 1: `scripts/a.mjs` — Keep the guard)';
 const CARD = '---\nstatus: open\n---\n\n# Card\n';
@@ -214,7 +219,7 @@ describe('raised-by migration', () => {
     } finally { rawStderr.mockRestore(); }
   });
   it('CLI entry process exits nonzero for invalid arguments', () => {
-    const child = spawnSync(process.execPath, [new URL('../migrate-raised-by.mjs', import.meta.url).pathname, '--invalid'], { encoding: 'utf8' });
+    const child = spawnSync(process.execPath, [MIGRATION_FILE, '--invalid'], { encoding: 'utf8' });
     expect(child.status).toBe(1); expect(child.stdout).toBe(''); expect(child.stderr).toContain('Invalid argument: --invalid');
   });
   it('does not charge all-known PRs against the apply cap', () => {
@@ -292,8 +297,8 @@ describe('raised-by migration', () => {
     expect(() => parseArgs(['--max=0'])).toThrow();
   });
   it('requires every migration reason and status literal to appear in regression tests', () => {
-    const source = fs.readFileSync(new URL('../migrate-raised-by.mjs', import.meta.url), 'utf8');
-    const tests = fs.readFileSync(new URL(import.meta.url), 'utf8');
+    const source = fs.readFileSync(MIGRATION_FILE, 'utf8');
+    const tests = fs.readFileSync(TEST_FILE, 'utf8');
     const literals = [...source.matchAll(/(?:reasons\.(?:push|add)\(|row\.status\s*=\s*)(['`])([^'`\n$]+)/g)].map(match => match[2]);
     expect(literals.length).toBeGreaterThan(0);
     for (const literal of literals) expect(tests, `missing regression assertion for ${literal}`).toContain(literal);
