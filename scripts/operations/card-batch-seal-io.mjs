@@ -16,8 +16,6 @@ import { parseRunJsonTail } from './land-prevention-card.mjs';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 export const CARD_BATCH_STATE_DIR = cardBatchStateDir();
 export const HOLD_LABEL = 'review-status:draft-withdrawn';
-/** Carries a landing-proof failure out of stuck-seal recovery unchanged (see orRecoverMerged). */
-class ProofFailure { constructor(cause) { this.cause = cause; } }
 /** Unrun verifies tolerated before the batch is held for a person; keeps a permanently broken verify from looping forever. */
 export const VERIFY_UNRUN_CAP = 3;
 const refuse = reason => ({ action: 'refuse', reason });
@@ -122,8 +120,9 @@ export async function publishBatch(input, opts = {}) {
       const view = JSON.parse(await gh(['pr', 'view', String(state.pr), '--repo', repo, '--json', 'number,state,headRefName']));
       if (Number(view?.number) !== Number(state.pr) || view.headRefName !== state.batchRef || view.state !== 'MERGED') return null;
       let missing;
-      // A proof that cannot be completed (a git/IO failure, not a clean "no") propagates as itself.
-      try { missing = await provenMergedLanding(state, { repo, gh, git: gitRun, remote }); } catch (error) { throw new ProofFailure(error); }
+      // Every error inside recovery (GitHub read, bad JSON, git/IO, save, retirement) propagates unchanged; only the
+      // documented clean negatives (not a matching MERGED PR, a card not proven, a retirement refusal) return null.
+      missing = await provenMergedLanding(state, { repo, gh, git: gitRun, remote });
       if (missing.length) {
         process.stderr.write(`card-batch ${state.batchRef} PR ${state.pr} MERGED but ${missing.length} card(s) not proven on main `
           + `(${missing.slice(0, 5).join(', ')}): kept held\n`);
@@ -134,16 +133,14 @@ export async function publishBatch(input, opts = {}) {
       save();
       // retire() recomputes the proof before retiring. Only a completed retirement replaces the original outcome;
       // otherwise the next run retries (proof included) and this run keeps its own failure.
-      let retired;
-      try { retired = await retire(); } catch (error) { throw new ProofFailure(error); }
+      const retired = await retire();
       return retired?.action === 'retired' ? { action: 'held', state, retired: true } : null;
     };
-    // Recovery replaces the original outcome only when it completed. Otherwise a thrown original is rethrown
-    // unchanged (whatever was thrown), and a returned refusal is returned; a failing recovery never fulfils in their place.
+    // Recovery replaces the original outcome only when it completed; an error inside recovery propagates as itself.
+    // On a clean negative, a thrown original is rethrown unchanged (whatever was thrown) and a returned refusal is
+    // returned; a failing recovery never fulfils in their place.
     const orRecoverMerged = async ({ threw = false, thrown, returned }) => {
-      let recovered = null;
-      try { recovered = await recoverMergedSeal(); }
-      catch (error) { if (error instanceof ProofFailure) throw error.cause; /* any other recovery failure keeps the original */ }
+      const recovered = await recoverMergedSeal();
       if (recovered) return recovered;
       if (threw) throw thrown;
       return returned;

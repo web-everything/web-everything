@@ -658,18 +658,39 @@ describe('retries re-run the proof and never report a refusal as held', () => {
   });
 });
 
-it('the stuck path keeps the original failure when the PR is not merged or the read fails', async () => {
-  for (const view of [() => JSON.stringify({ number: 9, state: 'OPEN', headRefName: 'lane/card-batch-prevention-1' }), () => { throw new Error('gh down'); }]) {
-    const { f, exec: base } = terminalFixture('MERGED');
-    const exec = vi.fn((cmd, args, options) => {
-      if (args.includes('--undo')) throw new Error('protection unavailable');
-      if (args[1] === 'view' && args.includes('number,state,headRefName')) return view();
-      return base(cmd, args, options);
-    });
-    await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toThrow('protection unavailable');
-    expect(undoFired(exec)).toBe(true);
+it('the stuck path keeps the original failure when the PR is not merged (a clean negative)', async () => {
+  const { f, exec: base } = terminalFixture('MERGED');
+  const exec = vi.fn((cmd, args, options) => {
+    if (args.includes('--undo')) throw new Error('protection unavailable');
+    if (args[1] === 'view' && args.includes('number,state,headRefName')) return JSON.stringify({ number: 9, state: 'OPEN', headRefName: 'lane/card-batch-prevention-1' });
+    return base(cmd, args, options);
+  });
+  await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toThrow('protection unavailable');
+  expect(undoFired(exec)).toBe(true);
+  expect(activeSlot(f).sealFailure).toBeUndefined();
+});
+it.each([
+  ['a GitHub read that throws', () => { throw new Error('gh timeout'); }, 'gh timeout'],
+  ['a GitHub read that returns bad JSON', () => '{not json', /JSON/],
+])('inside recovery, %s propagates unchanged (not the original failure)', async (_name, view, expected) => {
+  const { f, exec: base } = terminalFixture('MERGED');
+  const exec = failUndo(vi.fn((cmd, args, options) => (args[1] === 'view' && args.includes('number,state,headRefName') ? view() : base(cmd, args, options))));
+  await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toThrow(expected);
+  expect(undoFired(exec)).toBe(true);
+  expect(activeSlot(f).sealFailure).toBeUndefined();
+});
+it('inside recovery, a failed marker save propagates unchanged (not the original failure)', async () => {
+  const { f, exec: base } = terminalFixture('MERGED');
+  // The lease is lost after the proof passes: save() throws lease-held before the marker is written.
+  const exec = failUndo(vi.fn((cmd, args, options) => {
+    if (cmd === 'git' && args[0] === 'merge-base') rmSync(`${f.statePath}.lock`, { force: true });
+    return base(cmd, args, options);
+  }));
+  const err = quiet();
+  try {
+    await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toThrow('lease-held');
     expect(activeSlot(f).sealFailure).toBeUndefined();
-  }
+  } finally { err.mockRestore(); }
 });
 it.each([['a string', 'boom'], ['a plain object', { message: 'obj boom' }], ['undefined', undefined]])(
   'a stuck step that throws %s is rethrown unchanged (same value) when recovery does not complete', async (_name, value) => {
