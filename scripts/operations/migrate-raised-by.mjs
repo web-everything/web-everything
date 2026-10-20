@@ -13,6 +13,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const REPO = ghRepoSlug('we');
 const FIELDS = 'number,headRefName,headRefOid,labels,isDraft,baseRefName,headRepositoryOwner,isCrossRepository';
 const positive = value => /^\d+$/.test(String(value)) && Number.isSafeInteger(Number(value)) && Number(value) > 0;
+const safeError = error => String(error?.message ?? error).replace(/\/\/[^/\s]+@/g, '//[redacted]@');
 
 export function parseArgs(argv) {
   const options = { apply: false, json: false };
@@ -63,6 +64,8 @@ function inspect(git, main, head, snapshot, fs, readRaises) {
     const keys = known.get(cardId);
     const diff = git(['diff', '--unified=0', '--no-ext-diff', '--no-textconv', basis, '--', card]);
     if (/^(?:old|new) mode /m.test(diff)) reasons.add('other-files');
+    // Binary differences (and any other hunkless change) cannot be proven append-only.
+    if (!/^@@ /m.test(diff)) { reasons.add('unsupported-card-diff'); continue; }
     let inHunk = false;
     for (const line of diff.split('\n')) {
       if (line.startsWith('@@')) { inHunk = true; continue; }
@@ -90,19 +93,20 @@ function inspect(git, main, head, snapshot, fs, readRaises) {
 /** All process/filesystem boundaries can be replaced by a caller; writes stay in scratch until leased push. */
 export function migrateRaisedBy(options = {}, deps = {}) {
   const { fs = nodeFs, exec = execFileSync, spawn = spawnSync, env = process.env, settings = readSettings,
-    gh = args => exec('gh', args, { cwd: options.root ?? ROOT, encoding: 'utf8' }),
+    gh = args => exec('gh', args, { cwd: options.root ?? ROOT, encoding: 'utf8', stdio: 'pipe' }),
     tempRoot = tmpdir(), readRaises = readRaisedBy } = deps;
   const root = options.root ?? ROOT;
   const max = resolveMax(options, { env, settings });
   const result = { apply: !!options.apply, max, prs: [] };
-  const remote = String(exec('git', ['remote', 'get-url', 'origin'], { cwd: root, encoding: 'utf8' })).trim();
+  const remote = String(exec('git', ['remote', 'get-url', 'origin'], { cwd: root, encoding: 'utf8', stdio: 'pipe' })).trim();
   const prs = JSON.parse(gh(['pr', 'list', '--repo', REPO, '--state=open', '--limit=10000', '--json', FIELDS]));
   const scratch = fs.mkdtempSync(join(tempRoot, 'migrate-raised-by-'));
   const bare = join(scratch, 'git');
-  const git = (args, extra = {}) => exec('git', args, { cwd: bare, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...extra });
+  // execFileSync otherwise echoes raw child stderr before throwing, bypassing error redaction.
+  const git = (args, extra = {}) => exec('git', args, { cwd: bare, encoding: 'utf8', stdio: 'pipe', maxBuffer: 64 * 1024 * 1024, ...extra });
   let processed = 0;
   try {
-    exec('git', ['init', '--bare', bare], { cwd: scratch, encoding: 'utf8' });
+    exec('git', ['init', '--bare', bare], { cwd: scratch, encoding: 'utf8', stdio: 'pipe' });
     for (const pr of prs) {
       if (options.prs && !options.prs.includes(pr.number)) continue;
       const row = { number: pr.number, branch: pr.headRefName, head: pr.headRefOid, status: 'skipped', reasons: [], moved: [], files: [] };
@@ -122,10 +126,12 @@ export function migrateRaisedBy(options = {}, deps = {}) {
         snapshot = fs.mkdtempSync(join(scratch, 'main-'));
         if (git(['ls-tree', '--name-only', main, '--', 'backlog']).trim()) {
           const archive = git(['archive', main, 'backlog'], { encoding: null });
-          exec('tar', ['-xf', '-', '-C', snapshot], { input: archive });
+          exec('tar', ['-xf', '-', '-C', snapshot], { input: archive, stdio: 'pipe' });
         }
         Object.assign(row, inspect(git, main, head, snapshot, fs, readRaises));
         if (row.reasons.length) continue;
+        // Keep the original head when main already contains every mention; never create an empty PR.
+        if (!row.files.length) { row.reasons.push('all-mentions-already-present'); continue; }
         row.status = 'migratable';
         if (!options.apply) continue;
         if (processed >= max.value) { row.status = 'max-reached'; continue; }
@@ -166,7 +172,7 @@ export function migrateRaisedBy(options = {}, deps = {}) {
         }
       } catch (error) {
         row.status = 'skipped';
-        row.reasons.push(`probe-or-build-failed: ${error.message}`);
+        row.reasons.push(`probe-or-build-failed: ${safeError(error)}`);
       } finally {
         if (snapshot) fs.rmSync(snapshot, { recursive: true, force: true });
       }
@@ -187,11 +193,16 @@ export function formatResult(result) {
   return lines.join('\n');
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+/** Return the CLI exit code so recovery failures are tested through the same output path. */
+export function runCli(argv, { migrate = migrateRaisedBy, stdout = console.log, stderr = console.error } = {}) {
   try {
-    const options = parseArgs(process.argv.slice(2));
-    const result = migrateRaisedBy(options);
-    console.log(options.json ? JSON.stringify(result, null, 2) : formatResult(result));
-    if (result.prs.some(pr => pr.status.startsWith('refused:') || pr.status === 'push-rejected' || pr.reasons.some(r => r.startsWith('probe-or-build-failed:')))) process.exitCode = 1;
-  } catch (error) { console.error(error.message); process.exitCode = 1; }
+    const options = parseArgs(argv);
+    const result = migrate(options);
+    stdout(options.json ? JSON.stringify(result, null, 2) : formatResult(result));
+    return result.prs.some(pr => pr.status.startsWith('refused:') || pr.status === 'push-rejected' || pr.reasons.some(r => r.startsWith('probe-or-build-failed:'))) ? 1 : 0;
+  } catch (error) { stderr(safeError(error)); return 1; }
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  process.exitCode = runCli(process.argv.slice(2));
 }
