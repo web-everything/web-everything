@@ -124,6 +124,26 @@ export function resolveRunsDir() {
 }
 
 /**
+ * The same directory as {@link resolveRunsDir}, with NO side effects: it never migrates. When this process has not
+ * migrated yet and the legacy per-clone folder still holds run records, the shared folder may be missing them, so
+ * this throws instead of answering (a read-only caller then treats the answer as unknown).
+ */
+export function resolveRunsDirReadOnly() {
+  const env = process.env.OPERATION_RUNS_DIR;
+  if (env && env.trim()) return resolve(env.trim());
+  const dir = sharedRunsDir();
+  if (process.env.WE_UNDER_TEST === '1' || migrated.has(dir)) return dir;
+  const legacy = runsDir();
+  if (legacy && resolve(legacy) !== resolve(dir) && existsSync(legacy)) {
+    let pending;
+    try { pending = readdirSync(legacy).some((f) => f.endsWith('.json') && isValidRunId(f.slice(0, -5))); }
+    catch { throw new Error(`legacy runs folder ${legacy} unreadable`); }
+    if (pending) throw new Error('legacy run records are not migrated yet');
+  }
+  return dir;
+}
+
+/**
  * WHERE DAEMON JOB RECORDS LIVE (#4125 — the open detail statute `#daemon-jobs` left to this slice, settled
  * here as the ratify-time suggestion): ONE parent folder, `~/.claude/daemon-jobs/<daemon>/`, so the health
  * daemon scans one place instead of each daemon's scattered state folder. `WE_DAEMON_JOBS_ROOT` moves the

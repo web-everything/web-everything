@@ -647,7 +647,9 @@ describe('recorded hold read-only admission', () => {
   });
 
   describe('yieldTargetHold (overlap-yield target eligibility, read-only)', () => {
-    const requested = (k = key, extra = {}) => ({ pending: [], followedUp: [], redTeamPending: { [k]: { ...initial().redTeamPending[key], requestedAt: 500, ...extra } } });
+    const rec = (extra = {}) => ({ ...initial().redTeamPending[key], requestedAt: 500, ...extra });
+    // A local target: enqueue may read either cwd# or owner/name#, so a settled answer needs both.
+    const requested = (extra = {}) => ({ pending: [], followedUp: [], redTeamPending: { [key]: rec(extra), [`${LOCAL}#5283`]: rec(extra) } });
     const run = (opts) => {
       let stored = opts.state ?? requested();
       const writes = []; const requests = [];
@@ -661,22 +663,38 @@ describe('recorded hold read-only admission', () => {
       expect(r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toMatchObject({ kind: 'red-team-pending' });
       expect(r.writes).toEqual([]); expect(r.requests).toEqual([]); expect(r.h.mutations).toEqual([]);
     });
-    it.each([[`${LOCAL}#5283`, LOCAL], [`${LOCAL}#5283`, null], ['cwd#5283', LOCAL]])('finds the wait under alias %s (repo %s)', (k, repoArg) => {
-      const r = run({ state: requested(k), evidence: inFlight });
-      expect(r.h.s.yieldTargetHold({ num: 5283, repo: repoArg }, HEAD)).toMatchObject({ kind: 'red-team-pending' });
+    it.each([['cwd#5283', null], ['cwd#5283', LOCAL], [`${LOCAL}#5283`, null], [`${LOCAL}#5283`, LOCAL]])('a wait under only %s (repo %s) is unknown — it throws, waiters keep yielding', (k, repoArg) => {
+      const r = run({ state: { pending: [], followedUp: [], redTeamPending: { [k]: rec() } }, evidence: inFlight });
+      expect(() => r.h.s.yieldTargetHold({ num: 5283, repo: repoArg }, HEAD)).toThrow(/only some of the keys/);
+    });
+    it('both keys recorded on this head ⇒ blocked for either repo naming', () => {
+      for (const repoArg of [null, LOCAL]) {
+        const r = run({ evidence: inFlight });
+        expect(r.h.s.yieldTargetHold({ num: 5283, repo: repoArg }, HEAD)).toMatchObject({ kind: 'red-team-pending' });
+      }
+    });
+    it('reads red-team evidence with an explicit, migration-free runs dir', () => {
+      const seen = [];
+      const s2 = createDrainMergeStrategy({ localSlug: LOCAL, statePath: 'x', resolved: policyOf('github-merge-queue'),
+        env: { WE_RED_TEAM_TIMING: 'post-accept' }, queueSafety: { value: { waitForRedTeamBeforeEnqueue: true } }, log: { write: () => {} },
+        readFile: () => JSON.stringify(requested()), readRedTeamEvidence: (a) => { seen.push(a); return inFlight; },
+        exec: (_c, args) => (args[0] === 'pr' ? JSON.stringify({ headRefOid: HEAD, labels: ['review:accepted'] }) : args.includes('--slurp') ? '[[]]' : '{}') });
+      s2.yieldTargetHold({ num: 5283 }, HEAD);
+      expect(seen).toHaveLength(1);
+      expect(typeof seen[0].runsDir).toBe('string');
     });
     it('aliases that disagree on the request state are unknown (throws — keep yielding)', () => {
       const st = requested();
-      st.redTeamPending[`${LOCAL}#5283`] = { ...initial().redTeamPending[key] }; // no requestedAt
+      st.redTeamPending[`${LOCAL}#5283`] = rec({ requestedAt: undefined }); // no requestedAt
       const r = run({ state: st, evidence: { scheduled: false, loopPayload: { verdict: { verdict: 'accept' } } } });
       expect(() => r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toThrow();
     });
     it('a held reason that could still take the never-scheduled enqueue escape is unknown (throws)', () => {
-      const r = run({ state: { pending: [], followedUp: [], redTeamPending: initial().redTeamPending }, evidence: inFlight });
+      const r = run({ state: requested({ requestedAt: undefined }), evidence: inFlight });
       expect(() => r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toThrow(/never-scheduled/);
     });
     it('no recorded wait on THIS head ⇒ not blocked (waiters keep yielding)', () => {
-      const r = run({ state: requested(key, { headSha: 'f'.repeat(40) }), evidence: inFlight });
+      const r = run({ state: requested({ headSha: 'f'.repeat(40) }), evidence: inFlight });
       expect(r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toBeNull();
     });
     it('a live head that moved is unknown — it throws so the caller keeps the yield', () => {

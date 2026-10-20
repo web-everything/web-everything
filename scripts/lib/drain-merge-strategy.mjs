@@ -1,4 +1,5 @@
 import { listAgentsWithReviewJobs } from '../operations/review-job-store.mjs';
+import { resolveRunsDirReadOnly } from '../operations/run-store.mjs';
 import { mintSessionSlug } from '../conveyor/session-slug.mjs';
 import { repoKeyForSlug } from './constellation-repos.mjs';
 import { readRedTeamProbes } from './red-team-gate.mjs';
@@ -698,13 +699,18 @@ export function createDrainMergeStrategy({
       if (state.unreadable) throw new Error(`follow-up state ${statePath} is unreadable`);
       const rows = state.redTeamPending || {};
       const keys = [keyOf(c.repo, c.num), keyOf(null, c.num), keyOf(localSlug, c.num)];
-      const onHead = keys.map(k => rows[k]).filter(p => p?.headSha === headSha);
+      // Enqueue reads ONE key, and which one (cwd# or owner/name#) depends on how the pass named the repo. So every
+      // key it could read must hold a record on this head before the probe answers; a partial set is unknown.
+      const records = [...new Set(isLocalRepo(c.repo) ? keys : [keyOf(c.repo, c.num)])].map(k => rows[k]);
+      const onHead = records.filter(p => p?.headSha === headSha);
       if (!onHead.length) return null;
+      if (onHead.length !== records.length) throw new Error('red-team wait is recorded under only some of the keys enqueue may read');
       const live = readLive(c.repo, c.num);
       if (live.headRefOid !== headSha || !Array.isArray(live.labels)) throw new Error('live head or labels do not match the listed state');
       const sent = sendBackReason(live.labels);
       if (sent) return { kind: 'sent-back', reason: sent };
-      const evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env });
+      // runsDir resolved without the first-use legacy migration (which moves files); it throws when that is owed.
+      const evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env, runsDir: resolveRunsDirReadOnly() });
       const pages = readThreadPages(c.repo, c.num);
       if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team comments unreadable');
       // No agent/job listing here: those readers prune records and write caches. Instead every input the probe
