@@ -83,7 +83,9 @@ describe('generated shim picks the token by repo owner', () => {
     }
     const shim = join(dir, 'shim.js');
     writeFileSync(shim, renderGhShimScript({ realGhPath: fakeGh, cachePath, ghThrottleCliPath: join(dir, 'missing-throttle.mjs') }));
-    const run = (args) => spawnSync(process.execPath, [shim, ...args], { encoding: 'utf8', cwd: dir, env: { ...process.env, GH_TOKEN: '', GH_REPO: '', HOME: dir } });
+    const run = (args) => spawnSync(process.execPath, [shim, ...args], { encoding: 'utf8', cwd: dir, env: { ...process.env, GH_TOKEN: '', GH_REPO: '', HOME: dir,
+      // A daemon-run verify inherits these markers, which put the shim in refuse mode.
+      WE_GH_DAEMON_CALLER: undefined, XPC_SERVICE_NAME: undefined, WE_GH_AUTH_PERSONAL_FALLBACK: undefined } });
     return { run, cachePath };
   };
   it.each([

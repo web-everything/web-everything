@@ -17,6 +17,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { renderGhShimScript } from '../gh-app-shim.mjs';
 
+// A daemon-run verify inherits these markers, which put the shim in refuse mode.
+const NOT_A_DAEMON = { WE_GH_DAEMON_CALLER: undefined, XPC_SERVICE_NAME: undefined, WE_GH_AUTH_PERSONAL_FALLBACK: undefined };
+
 let PRE_EXISTING_LANE_POOL_ROOT;
 beforeAll(() => {
   PRE_EXISTING_LANE_POOL_ROOT = process.env.LANE_POOL_ROOT;
@@ -76,7 +79,7 @@ describe('the rendered shim script — every real `gh` call is paced by gh-throt
     const startedAt = Date.now();
     const calls = Array.from({ length: N }, (_, i) => spawnAsync(shimPath, ['api', 'ping'], {
       env: {
-        ...process.env, GH_TOKEN: undefined, GITHUB_TOKEN: undefined,
+        ...process.env, ...NOT_A_DAEMON, GH_TOKEN: undefined, GITHUB_TOKEN: undefined,
         LANE_POOL_ROOT: isolatedLockRoot, WE_GH_THROTTLE_CAP: String(CAP),
         WE_TEST_LOG: logPath, WE_TEST_IDX: String(i),
       },
@@ -134,7 +137,7 @@ describe('the rendered shim script — every real `gh` call is paced by gh-throt
 
     try {
       const { code, stdout } = await spawnAsync(shimPath, ['pr', 'view', '2582'], {
-        env: { ...process.env, GH_TOKEN: undefined, LANE_POOL_ROOT: isolatedLockRoot },
+        env: { ...process.env, ...NOT_A_DAEMON, GH_TOKEN: undefined, LANE_POOL_ROOT: isolatedLockRoot },
       });
       expect(code).toBe(0);
       const parsed = JSON.parse(stdout);

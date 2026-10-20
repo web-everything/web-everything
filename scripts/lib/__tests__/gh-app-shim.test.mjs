@@ -33,6 +33,8 @@ const CONFIGURED_ENV = {
   WE_GITHUB_APP_INSTALLATION_ID: '167640002',
   WE_GITHUB_APP_PRIVATE_KEY_PATH: '/Users/x/.secrets/github-apps/web-everything.pem',
 };
+// Interactive-path tests: a daemon-run verify inherits these markers, which put the shim in refuse mode.
+const NOT_A_DAEMON = { WE_GH_DAEMON_CALLER: undefined, XPC_SERVICE_NAME: undefined, WE_GH_AUTH_PERSONAL_FALLBACK: undefined };
 
 // #4064 — isolate every "live" test's gh-throttle admission lock from the REAL, host-shared one for the
 // duration of this file (restored after). `LANE_POOL_ROOT` is the existing, already-recognized override
@@ -240,7 +242,7 @@ describe('renderGhShimScript — pure text, and REALLY RUN against a fake real g
       const { dir, cachePath, shimPath } = setup();
       try {
         writeFileSync(cachePath, JSON.stringify({ v: 2, token: 'ghs_live_stale', expiresAt: new Date(Date.now() + 60 * 1000).toISOString() }), 'utf8');
-        const out = JSON.parse(execFileSync(shimPath, ['pr', 'view', '181'], { encoding: 'utf8', env: { ...process.env, GH_TOKEN: undefined } }));
+        const out = JSON.parse(execFileSync(shimPath, ['pr', 'view', '181'], { encoding: 'utf8', env: { ...process.env, ...NOT_A_DAEMON, GH_TOKEN: undefined }}));
         expect(out.ghToken).toBeFalsy();
       } finally {
         rmSync(dir, { recursive: true, force: true });
@@ -367,7 +369,7 @@ describe('renderGhShimScript — pure text, and REALLY RUN against a fake real g
         const shimPath = join(dir, 'gh');
         writeFileSync(shimPath, renderGhShimScript({ realGhPath: realGh, cachePath, ghThrottleCliPath: relayCli }), 'utf8');
         chmodSync(shimPath, 0o755);
-        const r = spawnSync(shimPath, ['pr', 'comment', '1', '--body', 'x'], { encoding: 'utf8', env: { ...process.env, GH_TOKEN: undefined } });
+        const r = spawnSync(shimPath, ['pr', 'comment', '1', '--body', 'x'], { encoding: 'utf8', env: { ...process.env, ...NOT_A_DAEMON, GH_TOKEN: undefined }});
         expect(readFileSync(counter, 'utf8')).toBe('x'); // exactly one real invocation — never a silent replay
         expect(r.status).toBe(1); // the genuine failure is preserved, not masked by a fallback's result
         expect(r.stderr).toContain("Cannot find module '/some/unrelated/hook.js'");
@@ -381,7 +383,7 @@ describe('renderGhShimScript — pure text, and REALLY RUN against a fake real g
       const { dir, shimPath } = setup(); // cache.json is never written
       try {
         // GH_TOKEN cleared: a host running under App auth would otherwise leak its own token into the fake.
-        const out = JSON.parse(execFileSync(shimPath, ['--version'], { encoding: 'utf8', env: { ...process.env, GH_TOKEN: undefined } }));
+        const out = JSON.parse(execFileSync(shimPath, ['--version'], { encoding: 'utf8', env: { ...process.env, ...NOT_A_DAEMON, GH_TOKEN: undefined }}));
         expect(out.ghToken).toBeFalsy();
         expect(out.argv).toEqual(['--version']);
       } finally {
@@ -406,7 +408,7 @@ describe('renderGhShimScript — pure text, and REALLY RUN against a fake real g
       chmodSync(shimPath, 0o755);
       try {
         writeFileSync(cachePath, JSON.stringify({ v: 2, token: 'ghs_rejected_but_fresh', expiresAt: new Date(Date.now() + 55 * 60 * 1000).toISOString() }), 'utf8');
-        const out = JSON.parse(execFileSync(shimPath, ['pr', 'view', '2582'], { encoding: 'utf8', env: { ...process.env, GH_TOKEN: undefined } }));
+        const out = JSON.parse(execFileSync(shimPath, ['pr', 'view', '2582'], { encoding: 'utf8', env: { ...process.env, ...NOT_A_DAEMON, GH_TOKEN: undefined }}));
         expect(out.ok).toBe(true);
         expect(out.ghToken).toBeFalsy(); // the retry ran with no token override — personal auth, not the rejected one
         expect(existsSync(cachePath)).toBe(false); // invalidated so the fleet's next refresh mints a replacement
@@ -521,7 +523,7 @@ describe('renderGhShimScript — pure text, and REALLY RUN against a fake real g
       writeBigFakeGh(realGh, { rejectToken: true });
       try {
         writeFileSync(cachePath, JSON.stringify({ v: 2, token: 'ghs_rejected', expiresAt: new Date(Date.now() + 55 * 60 * 1000).toISOString() }), 'utf8');
-        const out = spawnSync(shimPath, ['api', 'big'], { maxBuffer: 64 << 20, env: { ...process.env, GH_TOKEN: undefined } });
+        const out = spawnSync(shimPath, ['api', 'big'], { maxBuffer: 64 << 20, env: { ...process.env, ...NOT_A_DAEMON, GH_TOKEN: undefined }});
         expect(out.status).toBe(0);
         expect(out.stdout.length).toBe(BIG);
         expect(existsSync(cachePath)).toBe(false);
@@ -581,7 +583,7 @@ describe('renderGhShimScript — sets WE_GH_THROTTLE_CALLER on the throttle CLI 
     const shimPath = join(dir, 'gh');
     writeFileSync(shimPath, renderGhShimScript({ realGhPath: realGh, cachePath: join(dir, 'cache.json'), ghThrottleCliPath: relayCli }));
     chmodSync(shimPath, 0o755);
-    const env = { ...process.env, GH_TOKEN: undefined, GH_CALLER: undefined, CLAUDE_CODE_SESSION_ID: undefined };
+    const env = { ...process.env, ...NOT_A_DAEMON, GH_TOKEN: undefined, GH_CALLER: undefined, CLAUDE_CODE_SESSION_ID: undefined };
     return { dir, shimPath, env };
   }
   const callerOf = (r) => JSON.parse(r.stdout).caller;
