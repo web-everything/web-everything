@@ -1915,3 +1915,48 @@ ON. They resolve through the shared policy cascade: standard → platform → re
 with each source logged. Dispatch strips disabled brief sections. The verify step's first-commit
 check applies to build lane branches and delivery leases on local `main`, and warns if no test was added or updated; this advisory
 cannot prove a red run. Git-read errors are reported as unknown rather than evidence of compliance.
+
+## GitHub App daemon fallback probes
+
+Daemon auth uses a 30-minute refresh lookahead (interactive callers keep 10 minutes).
+Keep the legacy App cache fresh while it remains the last role fallback; its best-effort
+refresh must not change the selected role, applied token provenance, or recorded outcome.
+The standalone gh shim recognizes `WE_GH_DAEMON_CALLER` and launchd labels under
+`com.we.` / `com.plateau.`. A daemon cache miss gets one synchronous refresh CLI attempt
+(90-second timeout), then refuses personal auth by default, including after an App 401.
+Install the daemon refusal shim before reading keys/caches or refreshing tokens, including
+when no App is configured. If installation fails, stop before the daemon tick runs.
+The pass daemon and await-verify loop must propagate `GithubAppAuthGuardError` even
+though they tolerate transient refresh failures. Replay first-refresh and later-refresh
+installation failures with `daemon-gh-guard-refusal` in the daemon soak registry.
+Only an inherited `GH_TOKEN` with matching `WE_GH_AUTH_TOKEN_HASH` is trusted as App auth
+for github.com. Host flags, repository/URL arguments, `GH_HOST`, `GH_REPO`, and git
+remotes or implicit gh configuration naming other hosts refuse by default, even with a fresh public-host App cache;
+enterprise credentials and stored logins have no validated provenance here. Conflicting
+host hints are handled conservatively. Explicit personal-fallback allows still apply.
+Positional repository targets use the same host parser as `-R`, including single-label
+`enterprise/owner/repo` and `git@enterprise:owner/repo`; relative REST paths remain public.
+Check repository selectors in short-option bundles too (`-cRhost/owner/repo`), and
+source repositories in create templates and sync sources. Known content options consume
+their attached values; clone destinations and asset paths remain local arguments.
+Built-in aliases (including `repo new`) use canonical argument rules. Cover clone `-u`
+and repository branch/source option values before classifying positional targets. An
+enterprise selector after a boolean bundle must still reach the host parser;
+keep the command's boolean shorthands aligned with the supported CLI options.
+URL text in bodies, titles, and API fields is content rather than a target host.
+Unknown aliases, extension execution, and ambiguous URL-valued options refuse by default;
+their command expansion cannot prove which credential gh will select. Short flag arity
+must be resolved per command (for example checkout `-q` is boolean, API `-q` consumes jq).
+`ghAuth.personalFallback` resolves default → platform → tool →
+`WE_GH_AUTH_PERSONAL_FALLBACK`; refusals and explicit allows name the effective source.
+Interactive shells retain their inherited-auth behavior. Dispatched shim settings carry
+the daemon marker even for XPC-only parents and when session spawning does not inherit
+the parent environment.
+Daemon settings construction must throw on a missing binary or failed shim write;
+returning no settings would leave the dispatched session outside the refusal boundary.
+
+Exercise these paths with synthetic cache entries, fake gh/refresh executables, isolated
+homes and ledgers, and injected minters. Cover `chalbert/web-everything` via `-R`, REST
+paths, and a real temporary clone's SSH origin: each selects the worker installation for
+canonical owner `web-everything`. Run the touched `gh-app-shim`, `github-app-auth-env`,
+`github-app-per-owner-routing`, and `github-auth-policy` suites through heavy admission.
