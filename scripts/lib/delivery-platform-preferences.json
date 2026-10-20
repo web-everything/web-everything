@@ -5,5 +5,8 @@
     "maxGroupWaitMinutes": 5,
     "mergeMethod": "merge",
     "redMainFreezeBranch": "ops/red-main-freeze"
+  },
+  "ghThrottleSlotWait": {
+    "priorityCallers": ["^(ci-red-recovery|main-ci-red|red-main|main-red|enqueue)", "^parked-pr-conflict-watch"]
   }
 }

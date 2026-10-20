@@ -336,7 +336,7 @@ async function migrateInner({ clone, settings, dryRun = false, force = false, de
   try {
     fs.mkdirSync(p.root, { recursive: true });
     if (!stat(fs, join(p.repo, 'HEAD'))) {
-      git(dirname(p.logical), ['clone', '--bare', '--quiet', '--', p.logical, p.repo]);
+      git(dirname(p.logical), ['clone', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '--bare', '--quiet', '--', p.logical, p.repo]);
       steps.push('repo.git');
     }
     // Also for a repo.git kept from an earlier migrate: the clone's origin may have changed since, and every later

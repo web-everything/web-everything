@@ -31,7 +31,7 @@
 import { describe, it, expect } from 'vitest';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER, buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
 import {
-  planReconcile as planReconcileCore, fixWaitingSince, countFindings, bindAgents, assessLiveness, isAwaitingPermission, startedAtMs,
+  staleRequiredBaseRepair, planReconcile as planReconcileCore, fixWaitingSince, countFindings, bindAgents, assessLiveness, isAwaitingPermission, startedAtMs,
   REFUSAL_KINDS, DISPATCH_KINDS, selectStatusCandidates, markSelfReportedDone, markHungSessions,
   markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, CI_HEAL_ROUND_CAP,
   CONFLICT_FIX_ROUND_CAP, ADVISORY_FIX_ROUND_CAP, CONFLICT_FIX_ABSOLUTE_CEILING, foldReviewRefusalInto,
@@ -163,6 +163,23 @@ describe('case 1 — the dispatch, keyed by PR NUMBER (#3296)', () => {
     // #1576 was the only one of the four with work owed; the other three were reviewed and queued to land.
     expect(plan.dispatch.map((d) => [d.prNumber, d.kind])).toEqual([[1576, 'fix']]);
     expect(plan.refusals.map((r) => r.kind)).toEqual(['nothing-owed', 'nothing-owed', 'nothing-owed']);
+  });
+
+  it.each([0, 3])('a queued accepted PR carries its shared attempts and effective cap (durable count %i)', durableCount => {
+    const pr = pr1563({ labels: lbl('review:accepted', 'ready-to-merge'), comments: [
+      ...Array.from({ length: 2 }, () => ({ author: AUTOMATION, body: REARM_COMMENT_MARKER })),
+      { author: { login: 'chalbert' }, body: buildRoundExtensionComment({ repo: 'we', pr: 1563,
+        by: 2, actor: 'chalbert', channel: 'test', reason: 'two more', at: '2026-10-06T10:44:00Z' }) },
+    ] });
+    const plan = planReconcile({ repo: 'we', prs: [pr], agents: [], durableCounts: { 1563: durableCount },
+      roundCap: 6, now: NOW });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toHaveLength(1);
+    const refusal = plan.refusals[0];
+    expect(refusal).toMatchObject({ kind: 'nothing-owed', phase: 'queued', prNumber: 1563,
+      attempts: Math.max(2, durableCount), cap: 8 });
+    expect(Number.isInteger(refusal.attempts)).toBe(true);
+    expect(Number.isInteger(refusal.cap)).toBe(true);
   });
 
   it('EVERY PR yields exactly one row — a pass that drops a PR silently is the original defect one level up', () => {
@@ -909,13 +926,13 @@ describe('case 5h — a CANCELLED required check reads ci-red and is ci-healed, 
     // the regression; this case additionally documents, in the plan's own vocabulary, what the pre-fix output
     // looked like — `nothing-owed` must never again be the verdict for a PR whose rollup carries a real failing
     // conclusion, cancelled or otherwise.
-    const plan = planReconcile({ prs: [pr2636()], agents: [], now: NOW });
+    const plan = planReconcile({ prs: [pr2636()], agents: [], now: NOW, requiredChecks: ['test-shard (1)', 'smoke'] });
     expect(plan.refusals.map((r) => r.kind)).not.toContain('nothing-owed');
   });
 
   it('under the cap: dispatches `ci-heal`, exactly PR #2636\'s real live count (2 of 3) at the moment of the incident', () => {
     const comments = Array.from({ length: 2 }, () => ({ body: buildCiHealComment({ reason: 'red-ci' }), author: AUTOMATION }));
-    const plan = planReconcile({ prs: [pr2636({ comments })], agents: [], now: NOW });
+    const plan = planReconcile({ prs: [pr2636({ comments })], agents: [], now: NOW, requiredChecks: ['test-shard (1)', 'smoke'] });
     expect(plan.refusals).toEqual([]);
     expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', prNumber: 2636, attempts: 2 })]);
     expect(plan.dispatch[0].phase).toBe('ci-red');
@@ -923,7 +940,7 @@ describe('case 5h — a CANCELLED required check reads ci-red and is ci-healed, 
 
   it(`AT the cap (${CI_HEAL_ROUND_CAP} durable heal-mark comments): refused \`cap-exhausted\` AND escalated visibly — never silently \`nothing-owed\``, () => {
     const comments = Array.from({ length: CI_HEAL_ROUND_CAP }, () => ({ body: buildCiHealComment({ reason: 'red-ci' }), author: AUTOMATION }));
-    const plan = planReconcile({ prs: [pr2636({ comments })], agents: [], now: NOW });
+    const plan = planReconcile({ prs: [pr2636({ comments })], agents: [], now: NOW, requiredChecks: ['test-shard (1)', 'smoke'] });
     expect(plan.dispatch).toEqual([]);
     expect(plan.refusals).toEqual([expect.objectContaining({
       kind: 'cap-exhausted', prNumber: 2636, attempts: CI_HEAL_ROUND_CAP, cap: CI_HEAL_ROUND_CAP, phase: 'ci-red',
@@ -980,7 +997,7 @@ describe('case 5j — requiredChecks makes a NEW advisory check\'s red never rea
   // is the one call site actually wired end-to-end (`reconcile-pass.mjs` → `planReconcile`) and the one that
   // remains correct even against a FUTURE advisory check nobody has added to the exclusion list yet.
   it('with no requiredChecks (the exclusion-list default, now carrying soak-replay-gate too): never ci-red', () => {
-    const plan = planReconcile({ prs: [pr2748()], agents: [], now: NOW });
+    const plan = planReconcile({ prs: [pr2748()], agents: [], now: NOW, requiredChecks: null });
     expect(plan.dispatch).toEqual([]);
     expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'nothing-owed', phase: 'queued', prNumber: 2748 })]);
   });
@@ -1050,7 +1067,7 @@ describe('case 5k — a stale ci:failed label beside a RESTARTED (not yet conclu
   });
 
   it('AFTER: planReconcile never dispatches ci-heal for the restarted-but-unconcluded check — nothing owed', () => {
-    const plan = planReconcile({ prs: [pr2782()], agents: [], now: NOW, mainRedWindows: MAIN_RED_WINDOWS });
+    const plan = planReconcile({ prs: [pr2782()], agents: [], now: NOW, requiredChecks: ['test', 'smoke', 'daemon-soak'], mainRedWindows: MAIN_RED_WINDOWS });
     expect(plan.dispatch).toEqual([]);
     expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'nothing-owed', phase: 'queued', prNumber: 2782 })]);
   });
@@ -1058,7 +1075,7 @@ describe('case 5k — a stale ci:failed label beside a RESTARTED (not yet conclu
   it('still reviewed correctly once the SAME rebase lands and test genuinely concludes green (no regression on the ordinary path)', () => {
     const greenAfterRebase = restartedRollup.map((c) => (c.name === 'test' ? { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' } : c));
     const plan = planReconcile({
-      prs: [pr2782({ statusCheckRollup: greenAfterRebase })], agents: [], now: NOW, mainRedWindows: MAIN_RED_WINDOWS,
+      prs: [pr2782({ statusCheckRollup: greenAfterRebase })], agents: [], now: NOW, requiredChecks: ['test', 'smoke', 'daemon-soak'], mainRedWindows: MAIN_RED_WINDOWS,
     });
     expect(plan.dispatch).toEqual([]);
     expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'nothing-owed', phase: 'queued', prNumber: 2782 })]);
@@ -1068,7 +1085,7 @@ describe('case 5k — a stale ci:failed label beside a RESTARTED (not yet conclu
     const genuinelyFailed = restartedRollup.map((c) => (c.name === 'test' ? { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' } : c));
     const plan = planReconcile({
       prs: [pr2782({ statusCheckRollup: genuinelyFailed, labels: lbl('ci:failed') })],
-      agents: [], now: NOW, mainRedWindows: MAIN_RED_WINDOWS,
+      agents: [], now: NOW, requiredChecks: ['test', 'smoke', 'daemon-soak'], mainRedWindows: MAIN_RED_WINDOWS,
     });
     expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', prNumber: 2782, phase: 'ci-red' })]);
   });
@@ -3976,5 +3993,98 @@ describe('green-head needs-human retirement (#5012)', () => {
   it.each([{ labels: pr.labels }, { labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }] }])('preserves a non-required CodeQL escalation with labels %j', ({ labels }) => {
     const result = plan({ ...pr, labels, codeqlFailure: { reason: 'security alert' } });
     expect(result.notes.filter(n => n.kind === 'ci-heal-escalation-moot')).toEqual([]);
+  });
+});
+
+
+describe('stale required-job base repair (2026-10-19 live PRs)', () => {
+  const requiredChecks = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'];
+  const reviewTiming = { startAfter: 'fast-checks', fastChecks: ['test', 'integration', 'standards'] };
+  const head = 'a'.repeat(40);
+  const rows = requiredChecks.map(name => ({
+    name, status: 'completed', conclusion: 'success', head_sha: head,
+  }));
+  const pr = (over = {}) => pr1563({ headRefOid: head, baseRefName: 'main', comments: [],
+    labels: lbl('review:pending'), statusCheckRollup: rows, reviewTiming, ...over });
+  const repair = (over = {}, required = requiredChecks) => staleRequiredBaseRepair({
+    pr: pr(over), requiredChecks: required, defaultBranch: 'main',
+  });
+  const plan = (over = {}, options = {}) => planReconcileCore({
+    prs: [pr(over)], agents: [], now: NOW, requiredChecks, reviewTiming, mainSha: 'b'.repeat(40), ...options,
+  });
+
+  it('finds standards on settled live-shape CI, respecting implied integration', () => {
+    expect(repair()).toEqual({ missing: ['standards'] });
+    expect(repair({ baseRefName: undefined })).toEqual({ missing: ['standards'] });
+  });
+  it.each([
+    ['draft', { isDraft: true }], ['DIRTY', { mergeStateStatus: 'dirty' }],
+    ['stacked base', { baseRefName: 'lane/other' }], ['empty rollup', { statusCheckRollup: [] }],
+    ['missing head', { headRefOid: '' }], ['blank head', { headRefOid: ' ' }],
+    ['wrong-head rows', { statusCheckRollup: rows.map(row => ({ ...row, head_sha: 'old' })) }],
+    ['wrong-head fast check', { statusCheckRollup: [...rows, { name: 'standards', status: 'completed', conclusion: 'success', head_sha: 'old' }] }],
+    ['red fast check', { statusCheckRollup: [...rows, { name: 'standards', status: 'completed', conclusion: 'failure', head_sha: head }] }],
+    ['malformed fast check', { statusCheckRollup: [...rows, { name: 'standards', head_sha: head }] }],
+    ['red required row', { statusCheckRollup: [{ ...rows[0], conclusion: 'failure' }] }],
+    ['nothing missing', { statusCheckRollup: [...rows, { name: 'standards', status: 'completed', conclusion: 'success' }] }],
+  ])('declines %s', (_name, over) => expect(repair(over)).toBeNull());
+  it.each(['queued', 'in_progress', 'pending', 'waiting', 'requested'])('waits for any %s row, even non-required', status => {
+    expect(repair({ statusCheckRollup: [...rows, { name: 'advisory', status }] })).toBeNull();
+  });
+  it.each([null, [], [''], ['test', ' '], [1]])('declines invalid required set %j', required => {
+    expect(repair({}, required)).toBeNull();
+  });
+  it('collapses superseded failures and ignores other-head rows', () => {
+    expect(repair({ statusCheckRollup: [{ ...rows[0], conclusion: 'failure' }, ...rows,
+      { name: 'other', status: 'queued', head_sha: 'old' }] })).toEqual({ missing: ['standards'] });
+  });
+  it.each([
+    ['red', { status: 'completed', conclusion: 'failure', head_sha: head }],
+    ['pending', { status: 'in_progress', head_sha: head }],
+    ['wrong-head', { status: 'completed', conclusion: 'success', head_sha: 'old' }],
+  ])('declines mixed missing and %s fast checks', (_name, row) => {
+    expect(repair({
+      reviewTiming: { ...reviewTiming, fastChecks: ['standards', 'new-job'] },
+      statusCheckRollup: [...rows, { name: 'standards', ...row }],
+    })).toBeNull();
+  });
+  it.each([
+    ['needs-review', ['review:pending']], ['needs-human', ['review:human']],
+    ['queued', ['review:accepted', 'ready-to-merge', 'red-team:pending']],
+  ])('routes %s through the conflict fixer without label mutations', (phase, labels) => {
+    const result = plan({ labels: lbl(...labels) });
+    expect(result.refusals).toEqual([]);
+    expect(result.dispatch).toMatchObject([{ phase, kind: 'fix', isConflict: true, mode: 'stale-base-rebase',
+      staleBase: { missing: ['standards'], defaultBranch: 'main' }, attempts: 0, cap: CONFLICT_FIX_ROUND_CAP }]);
+    expect(result.dispatch[0].why).toContain('base predates required job(s) standards');
+    expect(result.dispatch[0].labels).toEqual(labels);
+  });
+  it('does not repair queued PRs without a pending red-team request', () => {
+    const result = plan({ labels: lbl('review:accepted', 'ready-to-merge') });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toMatchObject([{ phase: 'queued', kind: 'nothing-owed' }]);
+  });
+  it('refuses a live session owning the head', () => {
+    const result = plan({}, { agents: [{ sessionId: 'live', pid: 123, pidAlive: true, laneHeadOid: head }] });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toMatchObject([{ kind: 'live-process' }]);
+  });
+  it.each([
+    ['fix claim', { fixClaim: { who: 'fixer' } }, 'fix-claimed'],
+    ['referral hold', { referralHold: { why: 'waiting for referral' } }, 'review-referrals-pending'],
+    ['draft', { isDraft: true, statusCheckRollup: [{ ...rows[0], status: 'in_progress', conclusion: null }] }, 'draft'],
+  ])('preserves %s refusal', (_name, over, kind) => {
+    const result = plan(over);
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toMatchObject([{ kind }]);
+  });
+  it.each([
+    [CONFLICT_FIX_ROUND_CAP, {}],
+    [CONFLICT_FIX_ABSOLUTE_CEILING, { conflictFixCap: CONFLICT_FIX_ABSOLUTE_CEILING + 1 }],
+  ])('refuses exhausted mechanical budget (%i rounds)', (count, options) => {
+    const comments = Array.from({ length: count }, () => ({ body: CONFLICT_FIX_COMMENT_MARKER, author: AUTOMATION }));
+    const result = plan({ comments }, options);
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toMatchObject([{ kind: 'cap-exhausted', capKind: 'stale-base-rebase' }]);
   });
 });
