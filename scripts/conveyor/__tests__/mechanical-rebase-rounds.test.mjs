@@ -1,3 +1,4 @@
+import { formatCardSquashMarker, squashPatchHash } from '../../lib/card-squash-marker.mjs';
 import { describe, it, expect, vi, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -41,7 +42,7 @@ const gitDouble = (list) => (_bin, args) => {
 };
 // Every #4757 merge pulled in upstream history (its base lane or main), never the PR's own work.
 const commits = history.map(([sha, parents, date, subject]) => ({ sha, parents: parents.split(' '), authoredAt: at(date), subject,
-  ...(parents.includes(' ') ? { mergesPrWork: false } : {}) }));
+  mechanicalSquash: false, ...(parents.includes(' ') ? { mergesPrWork: false } : {}) }));
 const head = commits[0].sha;
 const comment = (date, body) => ({ createdAt: at(date), body, author: { login: 'web-everything' } });
 const begin = (date, who = 'fix-4757') => comment(date, `${FIX_BEGIN_MARKER}\n\n**Who:** \`${who}\``);
@@ -279,5 +280,70 @@ describe('mechanical re-arm rounds', () => {
     } finally {
       vi.unstubAllEnvs();
     }
+  });
+});
+
+
+describe('single-parent card squash round evidence', () => {
+  const subject = 'drain: rebase lane/cards onto origin/main, drop transient .lane-manifest.json, squash to one commit';
+  const parent = 'f'.repeat(40);
+  const c = { ...commits[0], parents: [parent], subject };
+  const patch = 'diff --git a/backlog/123-card.md b/backlog/123-card.md\n+card\n';
+  const proof = { oldHead: parent, newHead: c.sha, patchHash: squashPatchHash(patch) };
+  const marker = (extra = {}, author = 'chalbert') => ({ body: formatCardSquashMarker({ ...proof, ...extra }), author: { login: author } });
+  function read({ files = 'backlog/123-card.md', upstream = true, headline = subject, markers = [marker()], resultMode = '100644', baseMode = '100644', treeFailure = false } = {}) {
+    const exec = (_cmd, args) => {
+      if (args[0] === 'fetch') return '';
+      if (args[0] === 'log') return [c.sha, parent, treeOf(c), c.authoredAt, headline].join('\0');
+      if (args[0] === 'ls-tree') {
+        expect(args).toEqual(['ls-tree', '-r', '-z', args[3], '--', files]);
+        if (treeFailure) throw new Error('unreadable tree');
+        const mode = args[3] === c.sha ? resultMode : baseMode;
+        return mode ? `${mode} ${mode === '160000' ? 'commit' : 'blob'} ${parent}\t${files}\0` : '';
+      }
+      if (args[0] === 'merge-base') { if (!upstream) throw new Error('not upstream'); return ''; }
+      if (args[0] === 'diff') {
+        if (args.includes('--binary')) { expect(args).toEqual(['diff', '--binary', '--no-renames', '-U0', parent, c.sha]); return patch; }
+        expect(args).toEqual(['diff', '--name-only', '--no-renames', parent, c.sha]); return files;
+      }
+      throw new Error(`unexpected ${args}`);
+    };
+    return readRoundCommits({ pr: { ...pr, comments: [...pr.comments, ...markers], baseRefName: 'main' }, exec });
+  }
+  it('only exact subjects, an upstream parent and a nonempty all-card diff establish mechanicalSquash', () => {
+    expect(read().commits[0].mechanicalSquash).toBe(true);
+    for (const options of [{ files: 'code.js' }, { files: '' }, { upstream: false }, { headline: `${subject}, borrowed` }])
+      expect(read(options).commits[0].mechanicalSquash).toBe(false);
+  });
+  it.each([[], [marker({}, 'outsider')], [marker({ patchHash: '0'.repeat(64) })], [marker({ newHead: parent })]].map(markers => ({ markers })))('forged or mismatched proof counts real: %j', ({ markers }) => {
+    const facts = read({ markers });
+    expect(facts.commits[0].mechanicalSquash).toBe(false);
+    expect(countRealFixRounds({ ...pr, comments: [comment('11T06:06:06', REARM_COMMENT_MARKER), ...markers], roundCommits: facts })).toMatchObject({ ok: true, real: 1 });
+  });
+  it.each([
+    ...['120000', '160000', '100755'].flatMap(mode => [{ resultMode: mode }, { baseMode: mode }]),
+    { resultMode: '' }, { treeFailure: true },
+  ])('card-shaped non-regular entries remain real fix work: %j', options => {
+    const facts = read(options);
+    expect(facts.commits[0].mechanicalSquash).toBe(false);
+    expect(countRealFixRounds({ ...pr, comments: [comment('11T06:06:06', REARM_COMMENT_MARKER), marker()], roundCommits: facts })).toMatchObject({ ok: true, real: 1 });
+  });
+  it('a newly added regular card can be mechanical', () => {
+    expect(read({ baseMode: '' }).commits[0].mechanicalSquash).toBe(true);
+  });
+  it('reconcile refuses to refund a flagged squash without its trusted marker', () => {
+    expect(countRealFixRounds({ ...pr, comments: [comment('11T06:06:06', REARM_COMMENT_MARKER)],
+      roundCommits: { head, commits: [{ ...c, mechanicalSquash: true }] } })).toMatchObject({ ok: true, real: 1 });
+  });
+  it('refunds only the validated boolean true; plain single-parent drain subjects remain real', () => {
+    for (const mechanicalSquash of [true, false, undefined]) {
+      const result = countRealFixRounds({ ...pr, comments: [comment('11T06:06:06', REARM_COMMENT_MARKER), marker()],
+        roundCommits: { head, commits: [{ ...c, mechanicalSquash }] } });
+      expect(result).toMatchObject({ ok: true, real: mechanicalSquash === true ? 0 : 1 });
+    }
+  });
+  it.each([{ mechanicalSquash: 'true' }, { mechanicalSquash: true, subject: 'fix' },
+    { mechanicalSquash: true, parents: [parent, 'e'.repeat(40)], mergesPrWork: false }])('rejects malformed squash facts: %j', bad => {
+    expect(countRealFixRounds({ ...pr, roundCommits: { head, commits: [{ ...c, ...bad }] } })).toMatchObject({ ok: false, reason: 'invalid-commit' });
   });
 });

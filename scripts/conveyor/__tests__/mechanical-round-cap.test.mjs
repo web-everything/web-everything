@@ -557,8 +557,7 @@ describe('readMechanicalRoundFacts (real git)', { timeout: 30_000 }, () => {
     expect(calls).toBe(0);
   });
 
-  // A git read that fails never proves a round mechanical (fail closed); only the fetch may fail, as it falls back to
-  // the cached refs the reads then probe.
+  // A failed refresh or git read never proves a round mechanical, even with cached refs.
   it('every git call failing is git-read-failed, never proven', () => {
     const exec = () => { throw new Error('fatal: not a git repository\nmore'); };
     expect(readMechanicalRoundFacts({ pr: { headRefOid: HEAD, headRefName: 'lane/x', baseRefName: 'main' }, exec }))
@@ -603,13 +602,13 @@ describe('readMechanicalRoundFacts (real git)', { timeout: 30_000 }, () => {
     expect(readMechanicalRoundFacts({ pr: { headRefOid: HEAD, headRefName: 'lane/x', baseRefName: 'main' }, exec: () => undefined }))
       .toMatchObject({ proven: false, reason: 'not-a-merge' });
   });
-  it('a failed fetch alone falls back to the cached refs and still proves a real conflict-resolution merge', () => {
+  it('a failed fetch refuses cached evidence of a real conflict-resolution merge', () => {
     const r = repo();
     try {
       const exec = (c, args, opts) => { if (args[0] === 'fetch') throw new Error('network down'); return r.exec(c, args, opts); };
       r.g('fetch', '-q', 'origin', '+main:refs/remotes/origin/main');
       expect(readMechanicalRoundFacts({ pr: { headRefOid: r.g('rev-parse', 'HEAD'), headRefName: 'lane/x', baseRefName: 'main' }, exec }))
-        .toMatchObject({ proven: true, changedFiles: ['a.txt'] });
+        .toMatchObject({ proven: false, reason: 'git-read-failed', error: 'network down' });
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
   });
   it('a failed fetch with no cached base ref is refused, never proven', () => {
