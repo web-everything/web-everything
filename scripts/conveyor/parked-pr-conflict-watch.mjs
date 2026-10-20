@@ -179,6 +179,7 @@ import { operatorAnswerForStandDown } from './stand-down-answer-core.mjs';
 // module's `CONFLICT_LABEL`/`CONFLICT_LABEL_META` (`reconcile-fix-dispatch.mjs`) needs no edit either. See that
 // leaf's own header for the full reasoning and the original docblock this text used to carry.
 import { CONFLICT_LABEL, CONFLICT_LABEL_META } from './conflict-label.mjs';
+import { readInCardGroup } from '../lib/card-group.mjs';
 import { loadSameLineConflictSetting } from './conflict-watch-same-line.mjs';
 // Card xkugvzd — the idle re-assert for an already-labelled, still-conflicting `review:human` PR (live: #4481).
 import { CONFLICT_REASSERT_OFF, decideConflictReassert, resolveConflictReassertSettings } from './conflict-reassert-rule.mjs';
@@ -1430,6 +1431,7 @@ export function defaultPostConflictRearm({ pr, repo, exec = execFileSync }) {
  */
 export function watchParkedPrConflicts({
   repo = null, listPrs = defaultListParkedPrs, provider = createGhProvider(), dryRun = false,
+  inCardGroupFn = readInCardGroup, // xym8nt4 — open card-group members are the drain grouping's to handle
   sameLineConflict = loadSameLineConflictSetting().value,
   postFinding = defaultPostConflictFinding, postStandDown = defaultPostConflictStandDown,
   postRearm = defaultPostConflictRearm,
@@ -1474,6 +1476,10 @@ export function watchParkedPrConflicts({
   // docblock) and was simply never called here.
   let resolvedRepo = repo;
   for (const pr of Array.isArray(prs) ? prs : []) {
+    // xym8nt4 — a post-approval card group's sources and combined PR belong to the drain's grouping while the
+    // group is open: it dissolves the group on a conflict and returns the sources to the normal path, where
+    // this watch applies again. A send-back here would strip the combined PR's review instead.
+    if (inCardGroupFn({ num: pr?.number, repo: resolvedRepo || repo, headRef: pr?.headRefName })) continue;
     const parked = isParkedConflictTarget(pr);
     const queued = !parked && isQueuedConflictTarget(pr);
     // #xs81oxb — the THIRD population: neither parked nor queued (no review-workflow label at all). Folded into

@@ -206,6 +206,7 @@ import { ensureFreshGithubAppEnv } from './lib/github-app-auth-env.mjs';
 import { buildSkipReasons, classifySkipReason, formatSkipSummary, formatSkipReasonsLine } from './lib/drain-skip-reasons.mjs';
 import { createCardGrouping } from './lib/card-group.mjs';
 import { readQueueFacts } from './lib/merge-queue-adaptive-batching.mjs';
+import { readQueueEntryFiles } from './lib/queue-file-overlap.mjs';
 import { resolveDrainThroughput, createHoldMemo, carryReady, readCarry, writeCarry, orderCarry } from './lib/drain-throughput.mjs';
 import { numberingWithdrawalOwed } from './lib/numbering-carry.mjs';
 import { queueStatePath } from './lib/drain-merge-strategy.mjs';
@@ -4683,7 +4684,8 @@ async function runCli() {
   // xym8nt4 — post-approval card grouping: sources of a combined card PR are held; groups form/reconcile after each pass.
   const cardGrouping = createCardGrouping({ localSlug, dryRun: DRY_RUN, prestage: (c, sha) => mergeStrategy.prestage(c, sha),
     withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }),
-    readQueue: () => readQueueFacts({ repo: localSlug, exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, timeout: 60_000 }) }) });
+    readQueue: () => readQueueFacts({ repo: localSlug, exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, timeout: 60_000 }) }),
+    readQueueFiles: () => readQueueEntryFiles({ repo: localSlug, exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, timeout: 60_000 }) }) });
   // PR #5195 — the drain's ledger facts (review-exempt, carried-acceptance restamp, drain-hold release) can clear a
   // head, so they are written per candidate only once an enqueue entry point CONFIRMS its merge or enqueue: the
   // cascade below and the green-event pre-stage shortcut both call this one recorder. The pass-start `decision` is
@@ -5467,6 +5469,7 @@ async function runCli() {
       // rebuild below (one rebuilt tip drops the manifest AND renumbers), so skip it here to avoid a double
       // rebuild. The standalone rebuild then only covers a collision-RED PR that is not a rebase-drop candidate.
       if (REBASE_DROP && isRebaseDropCandidate(v)) continue;
+      if (cardGrouping.inGroup(v)) continue; // xym8nt4 — never move a card group member's head
       if (DRY_RUN) {
         // Cheap detect only (no push) so the dry-run plan can flag a collision without mutating anything.
         const probe = healNnnCollision({ laneRef: v.headRef, base: 'origin/main', run: (cmd, args, opts) => (args[0] === 'push' || args[0] === 'commit-tree' || args[0] === 'update-index' || args[0] === 'write-tree' || args[0] === 'read-tree' || args[0] === 'hash-object' || args[0] === 'cat-file' ? { status: 0, stdout: '' } : gitRunner(cmd, args, opts)) });
@@ -5551,6 +5554,9 @@ async function runCli() {
       // landable but still CARRIES the manifest on its head (#2183 first-lander leak — a clean merge would
       // otherwise commit the transient file to `main`). Both cases route through the same plumbing.
       if (v.prestagePendingCi || (!isRebaseDropCandidate(v) && !needsManifestStripBeforeMerge(v))) continue;
+      // xym8nt4 — a card group's sources and combined PR are never rebased by the drain while the group is open:
+      // a moved source head would dissolve the group (the combined PR carries the source content).
+      if (isLocalRepo(v.repo) && cardGrouping.inGroup(v)) { if (!AS_JSON) process.stderr.write(`  ↻ ${repoTag(v.repo)}${v.num} rebase skipped: in an open card group (drain.group)\n`); continue; }
       if (approvedHeadHold(v)) {
         const pr = (prsByRepo.get(v.repo) || []).find(p => p.number === v.num);
         if (pr && mergeStrategy.queueOwnsFreshness(v.repo) && v.reason?.startsWith('merge state ')

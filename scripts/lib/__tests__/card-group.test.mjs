@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import {
   planCardGroups, overlapReasonIsCardOnly, buildCombined, verifyUnion, sourceLanded, cardGroupHold, readCardGroupSettings,
   readGroupState, groupId, cardOnlyFiles, readReferenceMap, createCardGrouping, combinedPrBody, CARD_GROUP_MARKER,
-  resolveCardGroupStatePath, cardGroupStatePath, isSubsequence,
+  resolveCardGroupStatePath, cardGroupStatePath, isSubsequence, inCardGroup, queueBlocksGroup,
 } from '../card-group.mjs';
 
 const dirs = [];
@@ -229,6 +229,30 @@ describe('resolveCardGroupStatePath (one resolver for grouping and enqueue)', ()
   });
 });
 
+describe('reservation, membership, queue wait', () => {
+  const state = { groups: [{ id: 'g', repo: 'o/r', pr: 9, files: ['backlog/1-a.md'], sources: [{ num: 5, headSha: 'a'.repeat(40) }] }], failed: {} };
+  it('an open group reserves its card files against every other PR; the combined PR itself is not held', () => {
+    expect(cardGroupHold(state, { num: 7, localSlug: 'o/r', files: ['backlog/1-a.md', 'scripts/x.mjs'] })).toMatchObject({ kind: 'card-grouped', reason: expect.stringMatching(/reserved by open card group #9/) });
+    expect(cardGroupHold(state, { num: 7, localSlug: 'o/r', files: [{ path: 'backlog/2-b.md' }] })).toBeNull();
+    expect(cardGroupHold(state, { num: 9, localSlug: 'o/r', files: ['backlog/1-a.md'] })).toBeNull();
+  });
+  it('membership covers sources, the combined PR, card-group branches, and unreadable state', () => {
+    expect(inCardGroup(state, { num: 5, localSlug: 'o/r' })).toBe(true);
+    expect(inCardGroup(state, { num: 9, localSlug: 'o/r' })).toBe(true);
+    expect(inCardGroup(state, { num: 1, localSlug: 'o/r', headRef: 'lane/card-group-abc' })).toBe(true);
+    expect(inCardGroup(state, { num: 1, localSlug: 'o/r', headRef: 'lane/x' })).toBe(false);
+    expect(inCardGroup({ unreadable: true }, { num: 1 })).toBe(true);
+  });
+  it('a queued PR sharing a group card (or unknown files, or a queued source) makes the group wait', () => {
+    const g = { sources: [{ num: 5 }], files: ['backlog/1-a.md'] };
+    expect(queueBlocksGroup({ entries: [{ num: 3, files: ['backlog/1-a.md'] }] }, g)).toMatch(/queued #3 still shares backlog\/1-a\.md/);
+    expect(queueBlocksGroup({ entries: [{ num: 3, files: null }] }, g)).toMatch(/unknown file list/);
+    expect(queueBlocksGroup({ entries: [{ num: 5, files: [] }] }, g)).toMatch(/#5 is already in the merge queue/);
+    expect(queueBlocksGroup({ entries: [], error: 'x' }, g)).toMatch(/unreadable/);
+    expect(queueBlocksGroup({ entries: [{ num: 3, files: ['backlog/2-b.md'] }] }, g)).toBeNull();
+  });
+});
+
 describe('readCardGroupSettings (cascade)', () => {
   it('standard is off; tool turns it on; env wins; invalid eligibility never enables code grouping', () => {
     expect(readCardGroupSettings({ env: { VITEST: '1' }, tool: {} })).toMatchObject({ enabled: false, maxSize: 8, sources: { enabled: 'standard' } });
@@ -269,7 +293,7 @@ describe('createCardGrouping.form (fail closed)', () => {
     const outcomes = [1, 2].map(n => ({ num: n, kind: 'queue-file-overlap', reason: `#9 share ${CARD}` }));
     expect(g.form({ outcomes, verdicts }).reason).toMatch(/live re-check left fewer than 2/);
     // Dry run with an admission check: builds and proves, pushes nothing, writes no group.
-    const dry = createCardGrouping({ localSlug: 'o/r', cwd, run, exec, statePath: join(d, 's2.json'), settings, log: { write() {} }, dryRun: true, prestage: () => ({ allowed: true }) });
+    const dry = createCardGrouping({ localSlug: 'o/r', cwd, run, exec, statePath: join(d, 's2.json'), settings, log: { write() {} }, dryRun: true, prestage: () => ({ allowed: true }), readQueueFiles: () => ({ entries: [] }) });
     const r = dry.form({ outcomes, verdicts });
     expect(r.dryRun).toBe(true);
     expect(r.proof.ok).toBe(true);
@@ -311,21 +335,26 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     const d = tmp();
     const base = () => t.base;
     const opts = { localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, base), exec: t.exec, settings, log: { write() {} }, prestage: () => ({ allowed: true }), cardConflictSettings: cc };
-    expect(createCardGrouping({ ...opts, statePath: join(d, 'a.json') }).form({ outcomes: t.outcomes, verdicts: t.verdicts }).reason).toMatch(/no land mutex/);
+    expect(createCardGrouping({ ...opts, statePath: join(d, 'a.json') }).form({ outcomes: t.outcomes, verdicts: t.verdicts }).reason).toMatch(/no queue file read wired/);
+    expect(createCardGrouping({ ...opts, statePath: join(d, 'a2.json'), readQueueFiles: () => ({ entries: [] }) }).form({ outcomes: t.outcomes, verdicts: t.verdicts }).reason).toMatch(/no land mutex/);
+    // A queued PR still sharing the card: wait, build nothing, memo nothing.
+    const waiting = createCardGrouping({ ...opts, statePath: join(d, 'w.json'), withLock: fn => ({ ran: true, result: fn() }), readQueueFiles: () => ({ entries: [{ num: 99, files: [CARD] }] }) });
+    expect(waiting.form({ outcomes: t.outcomes, verdicts: t.verdicts })).toMatchObject({ waiting: true, reason: expect.stringMatching(/queued #99 still shares/) });
+    expect(existsSync(join(d, 'w.json'))).toBe(false);
     let locked = false;
     const withLock = fn => { locked = true; try { return { ran: true, result: fn() }; } finally { locked = false; } };
-    const queued = createCardGrouping({ ...opts, statePath: join(d, 'b.json'), withLock, readQueue: () => { expect(locked).toBe(true); return { inQueue: new Set([2]) }; } });
+    const queued = createCardGrouping({ ...opts, statePath: join(d, 'b.json'), withLock, readQueueFiles: () => (locked ? { entries: [{ num: 2, files: [CARD] }] } : { entries: [] }) });
     expect(queued.form({ outcomes: t.outcomes, verdicts: t.verdicts }).reason).toMatch(/#2 is already in the merge queue/);
     expect(readGroupState(join(d, 'b.json')).groups ?? []).toEqual([]);
-    const busy = createCardGrouping({ ...opts, statePath: join(d, 'c.json'), withLock: () => ({ ran: false }), readQueue: () => ({ inQueue: new Set() }) });
+    const busy = createCardGrouping({ ...opts, statePath: join(d, 'c.json'), withLock: () => ({ ran: false }), readQueueFiles: () => ({ entries: [] }) });
     expect(busy.form({ outcomes: t.outcomes, verdicts: t.verdicts }).reason).toMatch(/land mutex held/);
     // A clean claim records the group inside the lock and opens the PR.
-    const ok = createCardGrouping({ ...opts, statePath: join(d, 'e.json'), withLock, readQueue: () => ({ inQueue: new Set() }) });
+    const ok = createCardGrouping({ ...opts, statePath: join(d, 'e.json'), withLock, readQueueFiles: () => ({ entries: [] }) });
     const r = ok.form({ outcomes: t.outcomes, verdicts: t.verdicts });
     expect(r.formed).toMatchObject({ pr: 77 });
     // overlap-yield holds are a waiting kind too (the git card-only check still decides).
     const t2 = setup();
-    const y = createCardGrouping({ ...opts, cwd: t2.cwd, run: runIn(t2.cwd, () => t2.base), exec: t2.exec, statePath: join(d, 'y.json'), withLock, readQueue: () => ({ inQueue: new Set() }) });
+    const y = createCardGrouping({ ...opts, cwd: t2.cwd, run: runIn(t2.cwd, () => t2.base), exec: t2.exec, statePath: join(d, 'y.json'), withLock, readQueueFiles: () => ({ entries: [] }) });
     expect(y.form({ outcomes: [1, 2].map(n => ({ num: n, kind: 'overlap-yield', reason: 'overlap-yield:#9' })), verdicts: t2.verdicts }).formed).toMatchObject({ pr: 77 });
     expect(ok.holdFor({ num: 1 })).toMatchObject({ kind: 'card-grouped' });
     expect(t.calls.some(c => c.startsWith('pr create') && c.includes('review:pending'))).toBe(true);
