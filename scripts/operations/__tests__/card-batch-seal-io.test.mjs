@@ -479,3 +479,24 @@ it('retires an active cached terminal hint only after a fresh exact PR read, ret
   expect(JSON.parse(readFileSync(f.statePath))).toMatchObject({ seq: 1, lastSealedState: expect.any(String) });
   expect(log).toHaveBeenCalledWith(expect.stringContaining('GitHub MERGED: retired'));
 });
+it.each(['MERGED', 'CLOSED'])('#5680: a started seal whose PR is already %s is archived as a seal failure, never re-held', async (prState) => {
+  const f = fixture();
+  writeFileSync(f.statePath, JSON.stringify({ ...f.state, pr: 9, kind: 'prevention', repo: 'org/repo', holdApplied: false,
+    restoreProtection: true, sealedAt: new Date(500).toISOString(), seal: { reason: 'count', step: 'record-sealed' } }));
+  const exec = vi.fn((cmd, args, options) => (args[1] === 'view' && args.includes('number,state,headRefName')
+    ? JSON.stringify({ number: 9, state: prState, headRefName: f.state.batchRef }) : f.exec(cmd, args, options)));
+  expect((await publishBatch(f.input, { ...f.opts, exec })).action).toBe('held');
+  const active = JSON.parse(readFileSync(f.statePath, 'utf8'));
+  expect(active).toEqual({ seq: 1, lastSealedState: expect.stringContaining('sealed') });
+  expect(f.read().sealFailure).toMatchObject({ terminalPrState: prState, reason: expect.stringContaining('step record-sealed') });
+  expect(exec.mock.calls.some(([, args]) => args[1] === 'edit' || args[1] === 'ready')).toBe(false);
+});
+it('a started seal whose PR is still open resumes as before', async () => {
+  const f = fixture();
+  writeFileSync(f.statePath, JSON.stringify({ ...f.state, pr: 9, kind: 'prevention', repo: 'org/repo', holdApplied: true,
+    sealedAt: new Date(500).toISOString(), seal: { reason: 'count', step: 'record-sealed' } }));
+  const exec = vi.fn((cmd, args, options) => (args[1] === 'view' && args.includes('number,state,headRefName')
+    ? JSON.stringify({ number: 9, state: 'OPEN', headRefName: f.state.batchRef }) : f.exec(cmd, args, options)));
+  expect((await publishBatch(f.input, { ...f.opts, exec })).action).toBe('sealed');
+  expect(f.read().sealFailure).toBeUndefined();
+});
