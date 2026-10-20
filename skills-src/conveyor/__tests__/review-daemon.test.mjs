@@ -277,7 +277,7 @@ describe('runReviewTick — the per-tick sequence', () => {
     expect(tagRound).toHaveBeenCalledWith({ pr: 10, repo: expect.any(String), round: 2 }); // attempts+1
     expect(out).toEqual({
       reviewsOwed: 1, dispatched: [{ prNumber: 10, agentId: 'agent-10' }], failed: [], notStarted: [], refusals: 0,
-      pendingNotDispatched: [], reconcileError: null, deferredForLanes: 0, deferredForAuth: 0, authPaused: false, authPauseReason: null,
+      pendingNotDispatched: [], reconcileError: null, deferredForLanes: 0, deferredForAuth: 0, deferredForHost: 0, authPaused: false, authPauseReason: null,
       staleStatusSwept: [], staleConflictStatusCleared: [],
       holdReconcile: [], holdReconcileError: null, liveProcessPrs: [], operatorHolds: { observedAt: 7, holds: [] },
     });
@@ -596,6 +596,49 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     });
     expect(dispatch).not.toHaveBeenCalled();
     expect(out.deferredForLanes).toBe(3);
+  });
+
+  it('host admission (verify-admission): not admitted → dispatches nothing, every review stays owed (queued, never dropped)', () => {
+    const dispatch = vi.fn();
+    const out = runReviewTick({
+      reconcile: () => reviewsPlan(3), dispatch, tagRound: () => {}, tagStatus: () => {},
+      statusCandidates: () => [], acquirableLanes: () => 10,
+      hostAdmission: () => ({ admitted: false, reason: 'host memory headroom 1785MB (free+swap); host.minMemoryHeadroomMb=2048 (standard)' }),
+    });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(out.reviewsOwed).toBe(3);
+    expect(out.deferredForHost).toBe(3);
+    expect(out.deferredForLanes).toBe(0);
+  });
+
+  it('host admission (verify-admission): admitted → at most maxPerTick new sessions; a throwing check fails closed', () => {
+    const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+    const out = runReviewTick({
+      reconcile: () => reviewsPlan(5), dispatch, tagRound: () => {}, tagStatus: () => {},
+      statusCandidates: () => [], acquirableLanes: () => 10, hostAdmission: () => ({ admitted: true, reason: 'ok', maxPerTick: 2 }),
+    });
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(out.reviewsOwed).toBe(5);
+    const closed = vi.fn();
+    const failed = runReviewTick({
+      reconcile: () => reviewsPlan(2), dispatch: closed, tagRound: () => {}, tagStatus: () => {},
+      statusCandidates: () => [], acquirableLanes: () => 10, hostAdmission: () => { throw Error('vm_stat timed out'); },
+    });
+    expect(closed).not.toHaveBeenCalled();
+    expect(failed.deferredForHost).toBe(2);
+  });
+
+  it('host admission (verify-admission audit): one shared per-tick budget across repos, evaluated once', async () => {
+    const { sharedHostBudget } = await import('../review-daemon.mjs');
+    const check = vi.fn(() => ({ admitted: true, reason: 'ok', maxPerTick: 2 }));
+    const hostAdmission = sharedHostBudget(check);
+    const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+    for (let i = 0; i < 3; i++) {
+      runReviewTick({ reconcile: () => reviewsPlan(3), dispatch, tagRound: () => {}, tagStatus: () => {},
+        statusCandidates: () => [], acquirableLanes: () => 10, hostAdmission });
+    }
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(check).toHaveBeenCalledTimes(1);
   });
 
   it('deferred reviews still feed statusCandidates (the whole owed list, not just what got dispatched)', () => {

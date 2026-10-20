@@ -16,7 +16,7 @@
  * LIMIT, stated plainly: a parent killed with SIGKILL runs no handler at all, so its detached children survive.
  * Nothing in-process can cover that case. The timeout still bounds how long they can run.
  */
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 
 /** Default hard ceiling for one child call — generous against a slow real pool, but never "forever". */
 export const DEFAULT_CHILD_TIMEOUT_MS = 5 * 60 * 1000;
@@ -147,4 +147,73 @@ export function runBounded(cmd, args, { timeoutMs = DEFAULT_CHILD_TIMEOUT_MS, en
       else resolvePromise(Buffer.concat(chunks).toString('utf8'));
     });
   });
+}
+
+/**
+ * Every descendant of `rootPid` in a `ps -A -o pid=,ppid=` listing, deepest first (so a kill in this order never
+ * lets a parent respawn a child it has not seen die). Pure. `rootPid` itself is excluded.
+ * @param {number} rootPid
+ * @param {string} psText  `pid ppid` per line
+ * @returns {number[]}
+ */
+export function descendantPids(rootPid, psText) {
+  const children = new Map();
+  for (const line of String(psText || '').split('\n')) {
+    const [pid, ppid] = line.trim().split(/\s+/).map(Number);
+    if (!Number.isInteger(pid) || !Number.isInteger(ppid) || pid === ppid) continue;
+    if (!children.has(ppid)) children.set(ppid, []);
+    children.get(ppid).push(pid);
+  }
+  const out = [];
+  const seen = new Set([rootPid]);
+  const walk = (pid) => {
+    for (const c of children.get(pid) ?? []) {
+      if (seen.has(c)) continue;
+      seen.add(c);
+      walk(c);
+      out.push(c);
+    }
+  };
+  walk(rootPid);
+  return out;
+}
+
+/**
+ * Kill `rootPid` and its whole process TREE (not its process group). For a child that must stay in its parent's
+ * group (so a supervisor's group kill of the parent still reaches it) but must also be killable on its own, e.g.
+ * verify-lane's gate phases (`shell → npm exec → node vitest → esbuild`). Best-effort and synchronous.
+ * `orphansOfGroup` (a pgid): ALSO kill processes of that group that were reparented to init (ppid 1) — a
+ * descendant whose intermediate parent already exited is no longer reachable through the tree, but it keeps the
+ * group it was forked into. The caller passes its OWN pgid; an ancestor is never ppid 1 inside that group
+ * unless it is the group's launchd-started leader, which is excluded along with the caller.
+ * @returns {number[]} the pids signalled
+ */
+export function killProcessTree(rootPid, signal = 'SIGKILL', { orphansOfGroup = null, selfPid = process.pid,
+  listProcesses = () => execFileSync('ps', ['-A', '-o', 'pid=,ppid=,pgid='], { encoding: 'utf8', timeout: 10_000 }), kill = process.kill.bind(process) } = {}) {
+  if (!Number.isInteger(rootPid) || rootPid <= 0) return [];
+  let tree = [];
+  let orphans = [];
+  try {
+    const text = listProcesses();
+    tree = descendantPids(rootPid, text);
+    if (Number.isInteger(orphansOfGroup) && orphansOfGroup > 1) {
+      for (const line of String(text).split('\n')) {
+        const [pid, ppid, pgid] = line.trim().split(/\s+/).map(Number);
+        if (ppid === 1 && pgid === orphansOfGroup && pid !== orphansOfGroup && pid !== selfPid && !tree.includes(pid)) orphans.push(pid);
+      }
+    }
+  } catch { /* ps unavailable: still kill the root */ }
+  const signalled = [];
+  for (const pid of [...orphans, ...tree, rootPid]) {
+    try { kill(pid, signal); signalled.push(pid); } catch { /* already gone */ }
+  }
+  return signalled;
+}
+
+/** This process's process-group id (null when `ps` cannot say). */
+export function ownProcessGroup({ pid = process.pid, exec = execFileSync } = {}) {
+  try {
+    const n = Number(String(exec('ps', ['-o', 'pgid=', '-p', String(pid)], { encoding: 'utf8', timeout: 10_000 })).trim());
+    return Number.isInteger(n) && n > 0 ? n : null;
+  } catch { return null; }
 }

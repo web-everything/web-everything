@@ -145,7 +145,7 @@ import { DEFAULT_HOST_MAX_WAIT_MS, loadHostOverloadSettings } from '../lib/host-
 import { LEGACY_SETTINGS_PATH, readDeclaredSettings } from '../lib/settings-files.mjs';
 import { cutoverDecision, loadResourceGateSettings } from '../lib/resource-gate.mjs';
 import { LEASE_FILENAME, isLeaseStale } from '../lib/lane-lease.mjs';
-import { reserve, releaseLockDir, readLockEntry } from './file-locks.mjs';
+import { reserve, releaseLockDir, readLockEntry, heartbeatOwn } from './file-locks.mjs';
 import { defaultPoolRoot, guardedPoolRoot, workspaceFor } from '../lib/lane-pool-paths.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
@@ -211,6 +211,7 @@ export const ADMISSION_SWITCH_ENV = 'WE_HEAVY_ADMISSION';
 export const HEAVY_ADMISSION_CLI = fileURLToPath(import.meta.url);
 
 const SUBDIR = join('.admission', 'heavy');
+const MODULE_CHECKOUT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const WAITING_SUBDIR = 'waiting';
 const REAP_LOG = 'reaped.jsonl';
 
@@ -728,8 +729,18 @@ export function resolveLoadAdmission({ env = process.env, minIdlePct, minPressur
 
 /** The host-shared lock root for a checkout (lane or primary) — a sibling of every lane clone, never inside
  *  any one of them, so every lane on the host contends over the SAME slots. */
-export function admissionLockRoot(checkoutRoot = process.cwd(), env = process.env) {
-  return join(defaultPoolRoot(checkoutRoot, env), SUBDIR);
+export function admissionLockRoot(checkoutRoot = process.cwd(), env = process.env, { ownCheckout = MODULE_CHECKOUT, exists = existsSync } = {}) {
+  const derived = defaultPoolRoot(checkoutRoot, env);
+  // verify-admission (2026-10-20) — a caller whose cwd/repo is outside the workspace (`~`, a temp dir) used to derive
+  // a pool that does not exist (`/Users/.lanes`, `/.lanes`): `heavy-queue` then reported 0 held / 0 waiting while the
+  // real pool was full, and `heavy-admission run` from such a cwd queued on a private, empty pool. When the derived
+  // pool is absent, use the pool of the checkout this module runs from, if THAT one exists. Never under test (a test
+  // must not reach the real pool by accident) and never over an explicit LANE_POOL_ROOT.
+  if (!env.LANE_POOL_ROOT && !isUnderTest(env) && !exists(derived)) {
+    const own = defaultPoolRoot(ownCheckout, env);
+    if (own !== derived && exists(own)) return join(own, SUBDIR);
+  }
+  return join(derived, SUBDIR);
 }
 
 /** The synthetic per-slot "path" `file-locks.mjs` locks — slot identity is just its index. */
@@ -826,6 +837,30 @@ export function releaseOwnedSlot({ lockRoot, cap, owner, pid = process.pid, fast
     return { released: true, slot: ownerOnlyFallback };
   }
   return { released: false, slot: null };
+}
+
+/**
+ * Refresh the lease of the slot THIS process holds (verify-admission). The slot lease (ADMISSION_LEASE_MINUTES)
+ * used to be a fixed TTL with no refresh, so a gate still running past it lost its slot to the next waiter
+ * (`reclaimDecision` reclaims an expired lease even when the holder is alive) and kept running UNSLOTTED and
+ * invisible to `heavy-queue` - the cap stopped holding. An async holder (verify-lane spawns its gate with
+ * `spawn`, not `execSync`) can heartbeat; its run is bounded separately by verify-lane's per-phase timeout, so a
+ * refreshed lease can never keep a hung run's slot forever. Only a slot whose entry names this owner AND this
+ * pid is refreshed (a sibling same-owner process's slot is never touched). Uses `heartbeatOwn`, which never
+ * rewrites `lock.json`. Returns the refreshed slot index, or null when this process holds none.
+ */
+export function heartbeatOwnedSlot({ lockRoot, cap, owner, pid = process.pid, nowIso = new Date().toISOString(), fastSlots = resolveSlotSpan({ ...loadAdmissionPolicy({ env: process.env }).settings, cap }) - cap }) {
+  for (let i = 0; i < cap + fastSlots; i++) {
+    const entry = readLockEntry(lockRoot, slotPath(i));
+    if (!entry || entry.owner !== owner || entry.pid !== pid) continue;
+    // Residual (audited): the heartbeat file is keyed by owner, so a same-owner sibling that reclaimed this slot in
+    // the instant between the read above and the write would get the refresh. Reclaiming needs THIS holder's lease
+    // expired or its pid dead, and a live holder heartbeats every few minutes against a 60-min lease, so the window
+    // cannot open while this process lives; the re-read below still reports the loss.
+    if (!heartbeatOwn(lockRoot, slotPath(i), owner, nowIso)) return null;
+    return readLockEntry(lockRoot, slotPath(i))?.pid === pid ? i : null;
+  }
+  return null;
 }
 
 /** Read-only snapshot of every slot's holder, for `status` / observability. */

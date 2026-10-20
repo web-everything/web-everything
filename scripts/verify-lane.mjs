@@ -80,12 +80,13 @@ import { writeAllSync } from './lib/write-all-sync.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs } from './lib/lane-git-hardening.mjs';
 import { classifyRedCause, reachesChanged } from './lib/red-cause.mjs';
 import { baseRerunCandidate, measureBaseFailures, classifyPreExisting, runVitestOnBase } from './lib/verify-base-rerun.mjs';
-import { alwaysRunPlan, alwaysRunInventory,matchRequestedDefaultGate, verifySetting, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
+import { alwaysRunPlan, alwaysRunInventory,matchRequestedDefaultGate, verifySetting, verifySettingSource, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
 import { readAwaitVerifyRecord } from './conveyor/await-verify.mjs';
 import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRedToVerdict } from './lib/verify-revert-red.mjs';
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
-import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
+import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
+import { killProcessTree, ownProcessGroup } from './lib/bounded-child.mjs';
 import { summarizeSelection, selectionNotice, verdictNotice } from './lib/verify-selection-log.mjs';
 
 // ── tiny arg parsing (matches push-if-green.mjs / lane-pool.mjs) ─────────────────────────────────────
@@ -570,6 +571,20 @@ async function acquireAdmission(phase) {
 }
 const admission = await acquireAdmission('vitest');
 let firstPhaseAdmission = phaseAdmission ? admission : null;
+// verify-admission (2026-10-20) — keep whichever slot this process holds alive while the gate runs. The slot lease
+// had no refresh, so a gate past ADMISSION_LEASE_MINUTES lost its slot to the next waiter and kept running
+// unslotted (12 concurrent verify-lanes, `heavy-queue` showing 0 held). The per-phase timeout below bounds how
+// long a refreshed slot can be kept. Unref'd: never keeps this process alive by itself.
+const SLOT_HEARTBEAT_MS = 5 * 60_000;
+const slotHeartbeat = setInterval(() => {
+  try { heartbeatOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO }); } catch { /* best-effort */ }
+}, SLOT_HEARTBEAT_MS);
+slotHeartbeat.unref();
+// verify-admission — the hard per-phase ceiling (verify setting `phaseTimeoutMs`, logged with its source).
+const PHASE_TIMEOUT_MS = verifySetting('phaseTimeoutMs', process.env);
+const PHASE_TIMEOUT_SOURCE = verifySettingSource('phaseTimeoutMs', process.env);
+process.stderr.write(`verify-lane: phase timeout ${PHASE_TIMEOUT_MS}ms (phaseTimeoutMs, ${PHASE_TIMEOUT_SOURCE})\n`);
+let phaseTimeout = null;
 
 // 3. Run the gate in the FOREGROUND, waiting until it exits (forwarded stdio — the agent sees the output live).
 // #3383 (Skeptic review, 2026-09-14) — an UNCONDITIONAL marker, unlike the two admission log lines above
@@ -610,8 +625,38 @@ async function runGate(command, args) {
         writeAllSync(fd, chunk);
       });
     }
-    child.on('error', reject);
-    child.on('close', (code, closeSignal) => resolveGate({ exitCode: Number.isFinite(code) ? code : 2, signal: closeSignal || null }));
+    // verify-admission — kill the phase's whole process TREE on the ceiling (shell → npm exec → vitest → esbuild).
+    // The child stays in this process's group, so a supervisor's group kill of verify-lane still reaches it.
+    let timedOut = false;
+    let settled = false;
+    let exited = null;
+    let grace = null;
+    const finish = (code, closeSignal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(grace);
+      resolveGate({ exitCode: Number.isFinite(code) ? code : 2, signal: timedOut ? 'SIGKILL' : closeSignal || null, ...(timedOut ? { timedOut: true } : {}) });
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      process.stderr.write(`\n✗ verify-lane: phase exceeded phaseTimeoutMs=${PHASE_TIMEOUT_MS} (${PHASE_TIMEOUT_SOURCE}) — killing its process tree (pid ${child.pid}); recorded as a timeout, not a test verdict\n`);
+      // Orphans of this group too (a descendant whose shell already exited is reparented out of the tree) — ONLY when
+      // this process leads its own group (the verify daemon spawns it detached), so every member is provably ours.
+      // Run inside someone else's group (an agent shell), the orphan sweep is skipped; the grace below still settles.
+      const pgid = ownProcessGroup();
+      killProcessTree(child.pid, 'SIGKILL', { orphansOfGroup: pgid === process.pid ? pgid : null });
+      // A survivor still holding the output pipes would keep 'close' pending forever: settle on exit, or after a grace.
+      grace = setTimeout(() => {
+        child.stdout?.destroy(); child.stderr?.destroy();
+        finish(exited?.code ?? null, exited?.signal ?? 'SIGKILL');
+      }, 10_000);
+      grace.unref();
+    }, PHASE_TIMEOUT_MS);
+    timer.unref();
+    child.on('error', (e) => { clearTimeout(timer); clearTimeout(grace); if (!settled) { settled = true; reject(e); } });
+    child.on('exit', (code, sig) => { exited = { code, signal: sig }; });
+    child.on('close', (code, closeSignal) => finish(code, closeSignal));
   });
   return { ...result, failureDetails: collector.finish(), output: bytes <= MAX_TIMEOUT_LOG_BYTES ? output : null };
 }
@@ -642,6 +687,7 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
   const started = performance.now();
   try {
     const result = await runGate(command, args);
+    if (result.timedOut && !phaseTimeout) phaseTimeout = { phase: kind || 'gate', ceilingMs: PHASE_TIMEOUT_MS };
     if (kind) recordOutcome(outcomeKey ?? kind, buildPhaseOutcome({ ...result, kind, decision: resolvedGate?.decision }));
     return result;
   } catch (error) {
@@ -762,6 +808,7 @@ try {
 } finally {
   if (alwaysRunReportDir) rmSync(alwaysRunReportDir, { recursive: true, force: true });
   gateMs = performance.now() - gateStarted;
+  clearInterval(slotHeartbeat);
   if ((!phaseAdmission && admission.ok) || firstPhaseAdmission?.ok) releaseOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO });
 }
 
@@ -806,7 +853,7 @@ const retryAudit = isolatedRetryAudit(retriedFailures, isolatedRetry);
 const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }), ...retryAudit };
 const retryDetail = describeIsolatedRetry(retryAudit);
 // Item 99 — why the gate was red (also when a flaky failure outside the diff went green alone), with the files.
-const infrastructure = verificationInfrastructureFailure({ exitCode, signal });
+const infrastructure = verificationInfrastructureFailure({ exitCode, signal, ...(phaseTimeout ? { timedOutPhase: phaseTimeout.phase, ceilingMs: phaseTimeout.ceilingMs, killer: 'verify-lane' } : {}) });
 // The gate's own diff plus whatever was edited while it queued or ran (the same set the isolated retry judges against).
 const diffFiles = Array.isArray(resolvedGate?.decision?.changedFiles) ? [...new Set([...resolvedGate.decision.changedFiles, ...editedDuringRun])] : resolvedGate?.decision?.changedFiles;
 // An UNEDITED failing test that imports the edited source is the change's own regression (`testReachesChanged`).
