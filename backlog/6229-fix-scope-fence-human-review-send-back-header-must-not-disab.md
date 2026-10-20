@@ -2,7 +2,10 @@
 bornAs: xtbxcp8
 kind: story
 size: 2
-status: open
+status: closed
+closedReason: duplicate
+closedInto: "x2w653g"
+dateClosed: "2026-10-20"
 scope: ["we:scripts/conveyor/fix-scope-fence.mjs", "we:scripts/conveyor/fix-scope-fence.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
