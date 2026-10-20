@@ -5,8 +5,8 @@ parent: "5767"
 status: open
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/conveyor/fix-procedure.mjs", "we:scripts/lib/drain-skip-reasons.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/__tests__/merge-ai-prs-claim-held.test.mjs", "we:scripts/conveyor/__tests__/fix-procedure.test.mjs", "we:scripts/lib/__tests__/drain-skip-reasons.test.mjs", "we:scripts/conveyor/__tests__/await-verify-pass-push-before-gate.test.mjs", "we:scripts/lib/__tests__/drain-prestage.test.mjs"]
 dateOpened: "2026-10-10"
-preparedDate: "2026-10-18"
-preparedAgainstSha: "087ef5046c6eb43cac3409cfc24dae9adfc63a76"
+preparedDate: "2026-10-20"
+preparedAgainstSha: "3bc3130234485e4ff8a9f89d489cd99ffb51627b"
 tags: []
 estimatedLoc: 500
 ---
@@ -128,3 +128,5 @@ Run the scoped suites and the existing merge-gate suite through the queue, then 
 
 - 2026-10-18 re-preparation against `087ef5046c6eb43cac3409cfc24dae9adfc63a76`: old premise limited enqueue coverage to the shared fresh-revalidation boundary. Corrected premise: the dispatch gap remains, and cached-prestage enqueue adds two fixing-only consumer seams (we:scripts/merge-ai-prs.mjs:962-963,5080-5083) alongside ordinary revalidation (we:scripts/merge-ai-prs.mjs:4693,6735-6768). The in-lock cached check already exists (we:scripts/lib/drain-prestage.mjs:114); its default reader must expand, not its locking policy. Stable `claim-held` is still absent (we:scripts/lib/drain-skip-reasons.mjs:13-38). Refreshed current citations; earlier Progress citations remain historical. No delivering commit or unresolved policy fork was found.
 - Old scope: eight files, three sources/five tests. Corrected scope: the same sources plus six tests, adding existing we:scripts/lib/__tests__/drain-prestage.test.mjs for cached admission (existing claim coverage at lines 150-156 and 220-232). Planned we:scripts/__tests__/merge-ai-prs-claim-held.test.mjs remains absent. estimatedLoc **410 → 500**: we:scripts/conveyor/fix-procedure.mjs ~60; we:scripts/merge-ai-prs.mjs ~20; we:scripts/lib/drain-skip-reasons.mjs ~5; we:scripts/conveyor/__tests__/fix-procedure.test.mjs ~80; we:scripts/__tests__/merge-ai-prs.test.mjs ~30; we:scripts/__tests__/merge-ai-prs-claim-held.test.mjs ~240; we:scripts/lib/__tests__/drain-skip-reasons.test.mjs ~20; we:scripts/conveyor/__tests__/await-verify-pass-push-before-gate.test.mjs ~5; we:scripts/lib/__tests__/drain-prestage.test.mjs ~40. The extra 90 lines cover two additional reader seams, cached CLI setup/control, and lock-recheck tests. No size or blockedBy change. Existing stamps preserved; runner owns stamping and checks. Preparation used source inspection only, with no implementation, test run, claim mutation, commit, push, or PR.
+
+revalidated: The supplied changes affect overlap-yield filtering and startup diagnostics without changing claim readers, merge/enqueue gates, head pinning, or the preparation’s test and proof requirements.
