@@ -209,7 +209,10 @@ export async function rebuildCloneAsJob({
 
   // 3. Adopt-only: a ready candidate (or a skip-unrelated move) is adopted here, fast, under the existing rules.
   const r = await adopt();
-  if (r?.reason !== 'needs-build') {
+  // xqz26k1 — a held clone whose auto-refresh candidate still owes its check (smoke + tests) gets a job too: the job's
+  // own prepare claims the check and runs it off the daemon's tick.
+  const refreshCheck = r?.reason === 'established-overlay-conflict' && r.autoRefresh?.checkWanted === true;
+  if (r?.reason !== 'needs-build' && !refreshCheck) {
     housekeeping();
     return { ...r, finishedJobs };
   }
@@ -230,7 +233,7 @@ export async function rebuildCloneAsJob({
   try {
     queued = enqueueJob({
       store, kindDef: REBUILD_JOB_KIND, codeSha: codeSha ?? readHead(root), now: now(),
-      input: { root: resolve(root), entries, mainOnly: !!mainOnly, target: r.plan?.finalSha ?? null },
+      input: { root: resolve(root), entries, mainOnly: !!mainOnly, target: (refreshCheck ? r.autoRefresh.candidate : r.plan?.finalSha) ?? null },
     });
   } catch (e) {
     say(`could not queue a rebuild job (${String(e?.message || e).split('\n')[0]}) — the next tick retries`);

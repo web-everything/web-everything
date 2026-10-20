@@ -19,6 +19,7 @@ import { prepareRebuild } from './prepare.mjs';
 import { smokeAndAdopt } from './smoke.mjs';
 import { resolveVersionedContext, versionedRebuild } from '../daemon-version-runtime.mjs';
 import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
+import { runAutoRefreshCheck } from './auto-refresh.mjs';
 
 // ── rebuildClone — the IO shell ──────────────────────────────────────────────────────────────────────────────
 
@@ -104,6 +105,9 @@ export async function rebuildClone({
   const startedMs = now();
   const prep = await withWriteLock(root, () => prepareRebuild({
     root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider,
+    // xqz26k1 — the off-lock auto-refresh check (a full smoke + tests) runs only in the rebuild job or an inline daemon
+    // tick, never in the job-mode tick (adopt-only: it queues the job instead) or a foreground CLI without entries.
+    canAutoRefreshCheck: !adoptOnly && (readyOnly || (Array.isArray(entries) && entries.length > 0)),
   }), readyOnHead ? finalizeLockOpts : admissionLockOpts);
 
   if (prep.ok) {
@@ -122,7 +126,17 @@ export async function rebuildClone({
     return { moved: false, reason: prep.reason, ...(prep.heldBy ? { heldBy: prep.heldBy } : {}) };
   }
   if (prep.value.terminal) {
-    return { ...prep.value.result, alerts: prep.value.alerts };
+    const res = { ...prep.value.result, alerts: prep.value.alerts };
+    // xqz26k1 — UNLOCKED, like the candidate smoke: check the claimed auto-refresh candidate (shadow: log only).
+    if (res.autoRefresh?.checkDue) {
+      res.autoRefresh = {
+        ...res.autoRefresh,
+        check: await runAutoRefreshCheck({
+          root, env, stEnv, run, runSmoke, log, now, ar: res.autoRefresh,
+        }),
+      };
+    }
+    return res;
   }
   const {
     plan, prevHead, lease, overlays: overlaysBefore = [], alerts: prepAlerts,

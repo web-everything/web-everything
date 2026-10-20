@@ -24,6 +24,7 @@ import {
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
+import { autoRefreshAtHold } from './auto-refresh.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
 import { repairCloneRefs, holdsCloneWriteLock } from '../lane-repair.mjs';
 import {
@@ -38,7 +39,7 @@ import {
  * smoke a candidate — see {@link rebuildClone}).
  */
 export async function prepareRebuild({
-  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes,
+  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes, canAutoRefreshCheck = false,
 }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
@@ -333,7 +334,16 @@ export async function prepareRebuild({
       };
       writeState();
     }
-    return terminal({ moved: false, reason: 'established-overlay-conflict', detail });
+    // xqz26k1 — the held clone builds its own refresh candidate (last-good HEAD + origin/main, object DB only, the
+    // deterministic containment rule) and logs the decision; its smoke + tests run off-lock (rebuild.mjs). Only from a
+    // smoke-verified HEAD: an unverified tree is never the base of a candidate.
+    const autoRefresh = state.adopted?.head === prevHead && plan.mainSha
+      ? autoRefreshAtHold({
+        run, root, env, stEnv, headSha: prevHead, mainSha: plan.mainSha, alert, now: nowMs, canCheck: !!canAutoRefreshCheck,
+        registeredRefs: (overlaysBefore || []).map((o) => o?.ref).filter(Boolean),
+      })
+      : null;
+    return terminal({ moved: false, reason: 'established-overlay-conflict', detail, ...(autoRefresh ? { autoRefresh } : {}) });
   }
   for (const d of plan.decisions) {
     if (d.pr != null && (d.action === 'apply' || d.action === 'remove')) clearOverlayConflictWake(env, d.pr);
