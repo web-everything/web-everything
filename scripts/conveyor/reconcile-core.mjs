@@ -2050,7 +2050,9 @@ export function planReconcile({
     const roundExtensions = grants.reduce((sum, g) => sum + g.by, 0);
     // Each cap uses its own production counter on the thread prefix, never today's durable count map.
     const anchoredCap = (cap, count) => Math.max(cap + roundExtensions,
-      ...grants.map(g => roundExtensionAnchor.value === 'grant'
+      // A standing-ruling (automatic) grant is ALWAYS anchored at the rounds spent when it was posted, whatever the
+      // setting: it answers one limit hit, so it must free a round NOW (max(base + grants, usedAtGrant + by)).
+      ...grants.map(g => (roundExtensionAnchor.value === 'grant' || g.standingRuling)
         ? count({ ...pr, comments: pr.comments.slice(0, g.index) }) + g.by : 0));
     const advisoryFixCapHere = anchoredCap(advisoryFixCap, p => countCompletedAdvisoryEpisodes(p.comments));
     const conflictFixCapHere = anchoredCap(conflictFixCap, p => countStaleConflictFixRounds(p.comments, {
