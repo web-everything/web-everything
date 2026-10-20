@@ -175,6 +175,61 @@ describe('open-head ledger observations', () => {
     expect(ledgerObservationApplies(carried, [cleared, approval])).toBe(true);
     expect(derivePrState([cleared, approval, carried], facts).clears).toBe(true);
   });
+  describe('a carry that would reuse an earlier human answer is a human carry, not only when the latest verdict is one', () => {
+    const v = (verdict, extra = {}) => buildVerdictRecord({ repo, pr: 1, at: now, source: 'test', verdict, headSha: head, ...extra });
+    const manual = () => buildLedgerEvent({ repo, pr: 1, at: now, source: 'test', type: 'label-input', label: 'review:human', change: 'added', sender: 'op' });
+    const approval = kind => buildLedgerEvent({ repo, pr: 1, at: now, source: 'test', type: 'approval', approval: kind });
+    const cases = {
+      'manual review:human answered by clear-human, then an ordinary accept': () => [v('accepted'), manual(), v('clear-human'), v('accepted')],
+      'human park cleared, then an ordinary accept': () => [v('human'), v('clear-human'), v('accepted')],
+      'human park lifted by an approval, then an ordinary accept': () => [v('human'), approval('clear-operator'), v('accepted')],
+      'clear-human approval, then an ordinary accept': () => [v('accepted'), approval('clear-human'), v('accepted')],
+    };
+    for (const [name, events] of Object.entries(cases)) it(name, () => {
+      let human;
+      plan({ events: events(), proveCarry: args => { human = args.human; return null; } });
+      expect(human).toBe(true);
+    });
+    it('an ordinary accept with no human answer stays an ordinary carry', () => {
+      let human;
+      plan({ events: [v('accepted'), approval('judge'), v('accepted')], proveCarry: args => { human = args.human; return null; } });
+      expect(human).toBe(false);
+    });
+    it('a human answer pruned by an earlier head move is not reused', () => {
+      const moved = buildVerdictRecord({ repo, pr: 1, at: now, source: 'head-observer', verdict: 'head-moved', headSha: head, fromHead: 'c'.repeat(40) });
+      let human;
+      plan({ events: [v('human', { headSha: 'c'.repeat(40) }), v('clear-human', { headSha: 'c'.repeat(40) }), moved, v('accepted')],
+        proveCarry: args => { human = args.human; return null; } });
+      expect(human).toBe(false);
+    });
+    it('the append tip refuses an ordinary carry once a headless human answer followed its snapshot', () => {
+      const base = [v('accepted')];
+      const carried = plan({ events: base, proveCarry: () => 'tree-identical' })[0];
+      expect(ledgerObservationApplies(carried, base)).toBe(true);
+      expect(ledgerObservationApplies(carried, [...base, manual()])).toBe(false);
+      expect(ledgerObservationApplies(carried, [...base, approval('clear-human')])).toBe(false);
+      expect(ledgerObservationApplies(carried, [...base, approval('judge')])).toBe(true);
+      // A snapshot that already saw the human answer was planned as a human carry.
+      const seen = [v('accepted'), manual(), v('clear-human'), v('accepted')];
+      expect(ledgerObservationApplies(plan({ events: seen, proveCarry: () => 'tree-identical' })[0], seen)).toBe(true);
+    });
+    it('with the human-clearance carry off, the manual hold survives the tree-identical move (live scenario)', () => {
+      const events = cases['manual review:human answered by clear-human, then an ordinary accept']();
+      const env = { WE_ACCEPT_CARRY_FORWARD: process.env.WE_ACCEPT_CARRY_FORWARD, WE_REVIEW_HUMAN_CLEARANCE_CARRY: process.env.WE_REVIEW_HUMAN_CLEARANCE_CARRY };
+      process.env.WE_ACCEPT_CARRY_FORWARD = 'on';
+      process.env.WE_REVIEW_HUMAN_CLEARANCE_CARRY = 'off';
+      try {
+        // Matching trees through the exec seam: only the human-carry policy can refuse this carry.
+        const exec = (cmd, args) => { if (args.some(a => /\^\{tree\}$/.test(String(a)))) return 'f'.repeat(40); throw Error('no other git'); };
+        expect(proveLedgerCarry({ fromSha: head, toSha: next, cwd: process.cwd(), exec })).toBe('tree-identical');
+        const rows = plan({ events, proveCarry: args => proveLedgerCarry({ ...args, cwd: process.cwd(), exec }) });
+        expect(rows[0]).toMatchObject({ verdict: 'head-moved' });
+        expect(derivePrState([...events, ...rows], facts).clears).toBe(false);
+      } finally {
+        for (const [k, val] of Object.entries(env)) { if (val === undefined) delete process.env[k]; else process.env[k] = val; }
+      }
+    });
+  });
   it('rechecks observation preconditions against the append tip', () => {
     const baseline = plan({ events: [] })[0], moved = plan()[0];
     expect(ledgerObservationApplies(baseline, [])).toBe(true);

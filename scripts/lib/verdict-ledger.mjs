@@ -807,6 +807,16 @@ export function eventsSinceHeadMove(events, folded) {
   return events.filter((e, i) => i >= boundary || ![EVENT_TYPES.APPROVAL, EVENT_TYPES.REVIEW_EXEMPT, EVENT_TYPES.VERDICT].includes(e.type));
 }
 
+/** Does a carry from this PR's witnessed head reuse a human answer? Not only the latest verdict: a manual review:human
+ *  hold (never pruned by a head move), or a human park, clearance or human approval since the last head move. The carry
+ *  planner and the append tip both ask this, so a human answer appended after the planner's snapshot still counts. */
+export function ledgerCarriesHumanAnswer(events, folded = foldVerdictLedger(events).get(events.at(-1)?.pr)) {
+  const isVerdict = e => e.type === undefined || e.type === EVENT_TYPES.VERDICT;
+  return events.some(e => e.type === EVENT_TYPES.LABEL_INPUT && e.change === 'added' && e.label === 'review:human')
+    || eventsSinceHeadMove(events, folded).some(e => (isVerdict(e) && (['human', 'clear-human'].includes(e.verdict) || e.state === 'clear-human'))
+      || (e.type === EVENT_TYPES.APPROVAL && e.approval === 'clear-human'));
+}
+
 /** A finding still awaiting a ruling, or ruled `block` and not yet fixed, read through the pr-state view's boundary.
  *  A carry or restamp re-witnesses the same content, so it is never the fix such a finding waits for. With `toHead` (the
  *  head a carry or restamp would vouch for, re-witnessing `fromHead`'s content), a fix must lead to it through that
@@ -840,6 +850,8 @@ export function ledgerObservationApplies(row, existing) {
     // between, even back to `fromHead` (A→B→A). A legacy row or a basis this store never saw keeps the head check alone.
     const at = row.basis ? mine.findIndex(e => { try { return ledgerEventId(e) === row.basis; } catch { return false; } }) : -1;
     if (at >= 0 && mine.slice(at + 1).some(e => isSha(e.coverage?.headSha) || isSha(e.headSha) || isSha(e.fromHead))) return false;
+    // A headless human answer (a manual hold, a human approval) after the snapshot: the carry was proved without the human policy.
+    if (row.verdict === 'carried' && at >= 0 && ledgerCarriesHumanAnswer(mine) && !ledgerCarriesHumanAnswer(mine.slice(0, at + 1))) return false;
     if (row.verdict === 'carried') return ledgerCarryAllowed(mine, row.fromHead, row.coverage?.headSha);
     return true;
   }
