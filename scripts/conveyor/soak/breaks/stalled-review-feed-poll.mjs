@@ -2,6 +2,7 @@
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ghRepoSlug } from '../../../lib/constellation-repos.mjs';
 import { decideSameHeadHold, raiseNoVerdictNeedsYou } from '../../review-referral-hold.mjs';
 import { publishAttention, runOnce, unacknowledged, acknowledge, replay } from '../../../operations/needs-you-feed.mjs';
 
@@ -15,7 +16,7 @@ export default {
   async run() {
     const dir = mkdtempSync(join(tmpdir(), 'soak-stalled-review-feed-'));
     try {
-      const path = join(dir, 'events.jsonl'), repo = 'web-everything/web-everything', head = 'a'.repeat(40);
+      const path = join(dir, 'events.jsonl'), repo = ghRepoSlug('we'), head = 'a'.repeat(40);
       const now = Date.parse('2026-10-20T12:00:00Z');
       const pr = { number: 5765, headRefOid: head, labels: ['review:pending'], comments: [] };
       const runs = Array.from({ length: 9 }, (_, i) => ({
