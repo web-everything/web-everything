@@ -44,6 +44,7 @@ import {
   withholdUnpublishableFindings,
 } from '../lib/red-team-gate.mjs';
 import { roundExtensionGrants } from '../conveyor/round-extension-mark.mjs';
+import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 import { cleanFindingFile, qualifyLocusRefs, sanitizeCardField } from '../lib/review-loop-policy.mjs';
 import { IN_REPO_LOCUS } from '../lib/citation-check.mjs';
 import { DEFAULT_ROUND_CAP } from '../lib/jury-core.mjs';
@@ -135,11 +136,14 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
   try {
     const view = io.readPr({ repo, pr });
     const head = String(view?.headRefOid ?? '').toLowerCase();
+    // Verify once for this read; both the retry decision and the cap must use the same trusted grant scope.
+    // Verify once for this read; a failed verification is an error status (no write), never a silent fallback.
+    const standingRuling = io.standingRuling?.({ repo, pr: { ...view, number: pr } }) ?? null;
     // The live head's latest result, and only the records that decide THAT result (an earlier same-head result's
     // records never dedup a newer one, PR #5482).
-    const posted = liveResultGateState(view?.comments, pr, head, null, repo);
+    const posted = liveResultGateState(view?.comments, pr, head, null, repo, standingRuling);
     const saved = posted.result ? null : (io.readSavedResult ?? readSavedRedTeamResult)({ repo, pr, head });
-    const { result, resultId, outcomes: recorded, sendBackOutcome, reopened } = saved ? liveResultGateState(view?.comments, pr, head, saved, repo) : posted;
+    const { result, resultId, outcomes: recorded, sendBackOutcome, reopened } = saved ? liveResultGateState(view?.comments, pr, head, saved, repo, standingRuling) : posted;
     let parsed = result;
     if (!parsed) return { status: 'no-red-team-on-head', head };
     // Saved evidence may be precisely the result whose comment failed this scrub. Check raw fields
@@ -163,7 +167,7 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
     if (!sendPending && !cardPending) return { status: 'already-acted', head, outcome: priorSend ?? GATE_OUTCOMES.CARD_QUEUED, plan };
     const round = sendPending ? io.readRound({ repo, pr, head }) : null;
     // The operator's audited grants raise the cap with the same grant-time anchor fix dispatch uses.
-    const grants = sendPending ? roundExtensionGrants(view?.comments, { repo, pr }) : [];
+    const grants = sendPending ? roundExtensionGrants(view?.comments, { repo, pr, standingRuling }) : [];
     const effectiveCap = gateRoundCap({ cap, grants, roundAt: (at) => {
       try { return io.readRoundAsOf?.({ repo, pr, at }) ?? null; } catch { return null; }
     } });
@@ -252,6 +256,7 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
     }),
     readSetting: () => readConfirmedBreaks({ env }),
     readSavedResult: args => readSavedRedTeamResult({ ...args, env }),
+    standingRuling: standingRulingScope,
     readRound: ({ repo, pr, head }) => readReviewRound({ repo, pr, head }),
     readRoundAsOf: ({ repo, pr, at }) => readReviewRoundAsOf({ repo, pr, at }),
     // The live head, read fresh and alone (the PR view above can be minutes old by the time a slow step finishes).
