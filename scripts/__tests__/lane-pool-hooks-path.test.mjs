@@ -14,31 +14,52 @@ import { ensureLaneHooksPath, LANE_HOOKS_PATH } from '../lib/git-identity.mjs';
 const POOL_SCRIPT = resolve(process.cwd(), 'scripts/lane-pool.mjs');
 const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
 
-describe('ensureLaneHooksPath (injected IO)', () => {
+describe('ensureLaneHooksPath (injected IO) — the EFFECTIVE value, every scope', () => {
   const has = () => true;
-  it('sets it when unset, and logs', () => {
+  const GET = ['config', '--show-scope', '--get', 'core.hooksPath'];
+  // A fake git whose config is a scope→value map, resolved worktree > local > global like real git.
+  const fakeGit = (cfg) => {
     const calls = [];
+    const run = (args) => {
+      calls.push(args);
+      if (args.join(' ') === GET.join(' ')) {
+        for (const sc of ['worktree', 'local', 'global']) if (cfg[sc]) return `${sc}\t${cfg[sc]}\n`;
+        throw new Error('exit 1');
+      }
+      if (args[1] === '--local') { cfg.local = args[3]; return ''; }
+      if (args[1] === '--worktree' && args[2] === '--unset-all') { delete cfg.worktree; return ''; }
+      throw new Error(`unexpected ${args.join(' ')}`);
+    };
+    return { run, calls, cfg };
+  };
+  it('sets it when unset, and logs', () => {
+    const g = fakeGit({});
     const logs = [];
-    const run = (args) => { calls.push(args); if (args[2] === '--get') throw new Error('exit 1'); return ''; };
-    expect(ensureLaneHooksPath('/l', { exists: has, run, log: (l) => logs.push(l) })).toEqual({ status: 'set', was: null });
-    expect(calls.at(-1)).toEqual(['config', '--local', 'core.hooksPath', LANE_HOOKS_PATH]);
+    expect(ensureLaneHooksPath('/l', { exists: has, run: g.run, log: (l) => logs.push(l) })).toMatchObject({ status: 'set', was: null });
+    expect(g.cfg.local).toBe(LANE_HOOKS_PATH);
     expect(logs[0]).toMatch(/core\.hooksPath \(unset\) → \.githooks/);
   });
-  it('is idempotent: already .githooks → no write', () => {
-    const calls = [];
-    const run = (args) => { calls.push(args); return '.githooks\n'; };
-    expect(ensureLaneHooksPath('/l', { exists: has, run }).status).toBe('ok');
-    expect(calls).toHaveLength(1);
+  it('is idempotent: effective .githooks → no write', () => {
+    const g = fakeGit({ local: '.githooks' });
+    expect(ensureLaneHooksPath('/l', { exists: has, run: g.run }).status).toBe('ok');
+    expect(g.calls).toHaveLength(1);
   });
-  it('repoints a foreign value', () => {
-    const run = (args) => (args[2] === '--get' ? '/dev/null\n' : '');
-    expect(ensureLaneHooksPath('/l', { exists: has, run })).toEqual({ status: 'set', was: '/dev/null' });
+  it('a WORKTREE /dev/null override beating a correct local value is flagged and repaired', () => {
+    const g = fakeGit({ local: '.githooks', worktree: '/dev/null' });
+    expect(ensureLaneHooksPath('/l', { exists: has, run: g.run, write: false })).toMatchObject({ status: 'override', scope: 'worktree' });
+    expect(ensureLaneHooksPath('/l', { exists: has, run: g.run })).toMatchObject({ status: 'set', was: '/dev/null', scope: 'worktree' });
+    expect(g.cfg.worktree).toBeUndefined();
+  });
+  it('an override the repair cannot remove (a higher scope, e.g. command) → override, logged', () => {
+    const stubborn = { run: (args) => (args.join(' ') === GET.join(' ') ? 'command\t/dev/null\n' : ''), };
+    const logs = [];
+    expect(ensureLaneHooksPath('/l', { exists: has, run: stubborn.run, log: (l) => logs.push(l) })).toMatchObject({ status: 'override', scope: 'command' });
+    expect(logs[0]).toMatch(/still \/dev\/null/);
   });
   it('write:false only reports', () => {
-    const calls = [];
-    const run = (args) => { calls.push(args); throw new Error('exit 1'); };
-    expect(ensureLaneHooksPath('/l', { exists: has, run, write: false }).status).toBe('unset');
-    expect(calls).toHaveLength(1);
+    const g = fakeGit({});
+    expect(ensureLaneHooksPath('/l', { exists: has, run: g.run, write: false }).status).toBe('unset');
+    expect(g.calls).toHaveLength(1);
   });
   it('a checkout with no .githooks/pre-commit is skipped', () => {
     expect(ensureLaneHooksPath('/l', { exists: () => false, run: () => { throw new Error('no'); } }).status).toBe('skipped');
@@ -81,6 +102,17 @@ describe('provision --no-install sets core.hooksPath in the lane (real git)', ()
     expect(again.code).toBe(0);
     expect(again.err).not.toMatch(/core\.hooksPath .* → /);
     expect(git(['config', '--local', '--get', 'core.hooksPath'], lane)).toBe('.githooks');
+  });
+
+  it('a real WORKTREE-scope core.hooksPath=/dev/null is reported by status and repaired by provision', () => {
+    const lane = join(base, 'pool', 'hookspath', 'lane-1');
+    git(['config', '--local', 'extensions.worktreeConfig', 'true'], lane);
+    git(['config', '--worktree', 'core.hooksPath', '/dev/null'], lane);
+    expect(git(['config', '--get', 'core.hooksPath'], lane)).toBe('/dev/null');
+    expect(runPool(['status', ...poolArgs()]).err).toMatch(/core\.hooksPath is not \.githooks in 1 lane\(s\) \(lane-1\)/);
+    expect(git(['config', '--get', 'core.hooksPath'], lane)).toBe('/dev/null'); // status wrote nothing
+    expect(runPool(['provision', '--count=1', ...poolArgs()]).code).toBe(0);
+    expect(git(['config', '--get', 'core.hooksPath'], lane)).toBe('.githooks');
   });
 
   it('status reports a lane whose hooksPath was unset, without writing', () => {

@@ -33,7 +33,10 @@ export const BUILTIN_PLACEHOLDERS = Object.freeze({
 });
 
 const norm = (v) => String(v ?? '').trim().toLowerCase();
-const isStrList = (v) => Array.isArray(v) && v.every((s) => typeof s === 'string');
+/** A setting value is accepted ONLY as a plain array of non-empty strings (audit finding: a nested object slipped through). */
+const isStrList = (v) => Array.isArray(v) && v.every((s) => typeof s === 'string' && s.trim() !== '');
+const EXTRA_KEYS = Object.freeze(['extraNames', 'extraEmails', 'extraEmailDomains']);
+const defaultWarn = (line) => { try { process.stderr.write(`${line}\n`); } catch { /* best effort */ } };
 
 /**
  * IO-light: resolve the effective placeholder lists (built-in ∪ configured extras) through the policy cascade.
@@ -43,7 +46,7 @@ const isStrList = (v) => Array.isArray(v) && v.every((s) => typeof s === 'string
  * one starting `@` is a domain). Never throws — a broken setting falls back to the built-in floor.
  * @returns {{names:string[], emails:string[], emailDomains:string[], sources:Record<string,string>}}
  */
-export function resolveGitIdentityPlaceholders({ env = process.env, tool, readSettings = readDeclaredSettings } = {}) {
+export function resolveGitIdentityPlaceholders({ env = process.env, tool, readSettings = readDeclaredSettings, warn = defaultWarn } = {}) {
   const standard = { extraNames: [], extraEmails: [], extraEmailDomains: [] };
   let extras = standard;
   let sources = { extraNames: 'standard', extraEmails: 'standard', extraEmailDomains: 'standard' };
@@ -60,14 +63,27 @@ export function resolveGitIdentityPlaceholders({ env = process.env, tool, readSe
       env, standard, envValues,
       valid: { extraNames: isStrList, extraEmails: isStrList, extraEmailDomains: isStrList },
     });
-    extras = { ...standard, ...(r.value ?? {}) };
-    sources = { ...sources, ...r.sources };
-  } catch { /* the built-in floor still applies */ }
+    const value = r.value && typeof r.value === 'object' && !Array.isArray(r.value) ? r.value : {};
+    // RE-VALIDATE each key's FINAL value: the cascade validates leaves, so `extraNames: {nested: [...]}` reached
+    // here as an object. Anything that is not a plain array of non-empty strings is ignored with a warning.
+    const bad = [...(r.invalid ?? [])];
+    extras = { ...standard };
+    for (const k of EXTRA_KEYS) {
+      if (value[k] === undefined) continue;
+      if (isStrList(value[k])) extras[k] = value[k];
+      else { bad.push(`${k}=${JSON.stringify(value[k])}`); sources[k] = 'standard (invalid value ignored)'; }
+    }
+    for (const k of EXTRA_KEYS) if (extras[k] !== standard[k] && r.sources?.[k]) sources[k] = r.sources[k];
+    if (bad.length) warn(`git-identity: ignored invalid ${GIT_IDENTITY_POLICY} setting(s) — need a plain array of non-empty strings: ${bad.join('; ')} (built-in list still applies)`);
+  } catch (e) {
+    extras = standard;
+    warn(`git-identity: ${GIT_IDENTITY_POLICY} setting unreadable (${String(e?.message ?? e).split('\n')[0]}) — built-in list applies`);
+  }
   const union = (a, b) => [...new Set([...a, ...b].map(norm).filter(Boolean))];
   return {
-    names: union(BUILTIN_PLACEHOLDERS.names, extras.extraNames ?? []),
-    emails: union(BUILTIN_PLACEHOLDERS.emails, extras.extraEmails ?? []),
-    emailDomains: union(BUILTIN_PLACEHOLDERS.emailDomains, extras.extraEmailDomains ?? []),
+    names: union(BUILTIN_PLACEHOLDERS.names, extras.extraNames),
+    emails: union(BUILTIN_PLACEHOLDERS.emails, extras.extraEmails),
+    emailDomains: union(BUILTIN_PLACEHOLDERS.emailDomains, extras.extraEmailDomains),
     sources,
   };
 }
@@ -179,29 +195,49 @@ export function identityVerdict({ author, committer, error }, lists = BUILTIN_PL
 /** The tracked hooks dir every lane must point `core.hooksPath` at (so the identity guard actually runs). */
 export const LANE_HOOKS_PATH = '.githooks';
 
+/** `env` without git's command-scope config overrides, so a read sees what an agent's own `git commit` would. */
+export function withoutGitConfigEnv(env = process.env) {
+  const out = {};
+  for (const [k, v] of Object.entries(env)) if (!/^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+|PARAMETERS)$/.test(k)) out[k] = v;
+  return out;
+}
+
 /**
- * IO (injected): make a lane's `core.hooksPath` point at the tracked `.githooks`. The `prepare` npm script used to be
- * the ONLY thing that set it — `provision --no-install` skips npm, and a `--reference` clone does not inherit it, so
- * the pre-commit guard silently never ran there (audit finding). Idempotent: reads first, writes only on a
- * difference, logs the change. Skipped when the checkout has no `.githooks/pre-commit` (another pool's convention).
- * `write: false` only REPORTS (for read-only callers like `status`). Never throws.
- * @returns {{status:'ok'|'set'|'unset'|'skipped'|'error', was?:string|null, detail?:string}}
+ * IO (injected): make a lane's EFFECTIVE `core.hooksPath` (what git resolves across every scope, incl. worktree
+ * config) the tracked `.githooks`. The `prepare` npm script used to be the only thing that set it — `provision
+ * --no-install` skips npm and a `--reference` clone does not inherit it — so the pre-commit guard silently never
+ * ran there; a worktree-scope `core.hooksPath=/dev/null` also beat a correct local value (audit findings).
+ * Repair: set `--local`, drop a lane-owned `--worktree` override, re-read. A global/system override is NOT ours to
+ * change — reported as `override`. Idempotent (reads first, writes only on a difference), logged. Skipped when the
+ * checkout has no `.githooks/pre-commit`. `write: false` only reports (read-only callers like `status`). Never throws.
+ * @returns {{status:'ok'|'set'|'unset'|'override'|'skipped'|'error', was?:string|null, scope?:string, detail?:string}}
  */
 export function ensureLaneHooksPath(dir, {
   write = true,
   exists = existsSync,
-  run = (args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000 }),
+  run = (args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000, env: withoutGitConfigEnv(process.env) }),
   log = () => {},
 } = {}) {
   try {
     if (!exists(join(dir, LANE_HOOKS_PATH, 'pre-commit'))) return { status: 'skipped' };
-    let was = null;
-    try { was = String(run(['config', '--local', '--get', 'core.hooksPath'])).trim() || null; } catch { was = null; }
-    if (was === LANE_HOOKS_PATH) return { status: 'ok', was };
-    if (!write) return { status: 'unset', was };
+    const effective = () => {
+      try {
+        const [scope, ...rest] = String(run(['config', '--show-scope', '--get', 'core.hooksPath'])).trim().split('\t');
+        return { scope, value: rest.join('\t') || null };
+      } catch { return { scope: null, value: null }; }
+    };
+    const before = effective();
+    if (before.value === LANE_HOOKS_PATH) return { status: 'ok', was: before.value, scope: before.scope };
+    if (!write) return { status: before.value ? 'override' : 'unset', was: before.value, scope: before.scope };
     run(['config', '--local', 'core.hooksPath', LANE_HOOKS_PATH]);
-    try { log(`  ${dir}: core.hooksPath ${was ?? '(unset)'} → ${LANE_HOOKS_PATH} (lane pre-commit guards now run)`); } catch { /* log only */ }
-    return { status: 'set', was };
+    if (before.scope === 'worktree') { try { run(['config', '--worktree', '--unset-all', 'core.hooksPath']); } catch { /* re-read decides */ } }
+    const after = effective();
+    if (after.value !== LANE_HOOKS_PATH) {
+      try { log(`  ⚠ ${dir}: core.hooksPath is still ${after.value} (${after.scope} scope) — the pre-commit guards do NOT run; remove that override`); } catch { /* log only */ }
+      return { status: 'override', was: before.value, scope: after.scope };
+    }
+    try { log(`  ${dir}: core.hooksPath ${before.value ?? '(unset)'}${before.scope ? ` (${before.scope})` : ''} → ${LANE_HOOKS_PATH} (lane pre-commit guards now run)`); } catch { /* log only */ }
+    return { status: 'set', was: before.value, scope: before.scope };
   } catch (e) {
     return { status: 'error', detail: String(e?.message ?? e).split('\n')[0] };
   }

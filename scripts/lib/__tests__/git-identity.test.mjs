@@ -132,9 +132,19 @@ describe('resolveGitIdentityPlaceholders — a cascade setting that can only wid
     expect(r.sources.extraNames).toBe('tool');
     expect(checkGitIdentity({ name: 'Claude Agent', email: 'a@realcorp.io' }, r).status).toBe('placeholder');
   });
-  it('an invalid block falls back to the floor (never weakens it)', () => {
-    const r = resolveGitIdentityPlaceholders({ env: {}, tool: { extraNames: 'test' } });
+  it.each([
+    [{ extraNames: 'test' }],
+    [{ extraNames: { nested: ['bad'] } }],          // audit finding: a nested object used to slip through
+    [{ extraNames: ['ok', 7] }],
+    [{ extraNames: [''] }],
+    [{ extraEmailDomains: [['x']] }],
+  ])('an invalid block %j is ignored with a warning; the floor still applies', (tool) => {
+    const warns = [];
+    const r = resolveGitIdentityPlaceholders({ env: {}, tool, warn: (l) => warns.push(l) });
     expect(r.names).toEqual([...BUILTIN_PLACEHOLDERS.names]);
+    expect(r.emailDomains).toEqual([...BUILTIN_PLACEHOLDERS.emailDomains]);
+    expect(warns.join(' ')).toMatch(/ignored invalid gitIdentityPlaceholders/);
+    expect(checkGitIdentity({ name: 'test', email: 'a@realcorp.io' }, r).status).toBe('placeholder');
   });
   it('env adds names, emails and @domains', () => {
     const r = resolveGitIdentityPlaceholders({ env: { WE_GIT_IDENTITY_EXTRA_PLACEHOLDERS: 'bot, ci@realcorp.io, @realcorp.local' }, readSettings: noSettings });
@@ -144,7 +154,7 @@ describe('resolveGitIdentityPlaceholders — a cascade setting that can only wid
     expect(r.sources.extraNames).toBe('env');
   });
   it('a throwing settings read still yields the floor', () => {
-    const r = resolveGitIdentityPlaceholders({ env: {}, readSettings: () => { throw new Error('boom'); } });
+    const r = resolveGitIdentityPlaceholders({ env: {}, readSettings: () => { throw new Error('boom'); }, warn: () => {} });
     expect(r.names).toEqual([...BUILTIN_PLACEHOLDERS.names]);
   });
 });

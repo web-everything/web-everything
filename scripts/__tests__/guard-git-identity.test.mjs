@@ -9,7 +9,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync,
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { guardDecision, isLaneRoot } from '../guard-git-identity.mjs';
+import { guardDecision, isLaneRoot, main as guardMain } from '../guard-git-identity.mjs';
 import { readGitIdentity, laneIdentityReport } from '../lib/git-identity.mjs';
 import { appendFileSync } from 'node:fs';
 
@@ -31,9 +31,11 @@ describe('guardDecision (pure)', () => {
     expect(d.allow).toBe(false);
     expect(d.message).toMatch(/MISSING/);
   });
-  it('the guard\'s own read failure never blocks a commit', () => {
+  it('FAIL CLOSED: an unreadable identity (git timed out) refuses the commit', () => {
     const blank = { name: '', email: '' };
-    expect(guardDecision({ root: '/w/.lanes/p/lane-1', identity: { author: blank, committer: blank, error: 'ETIMEDOUT' } })).toEqual({ allow: true });
+    const d = guardDecision({ root: '/w/.lanes/p/lane-1', identity: { author: blank, committer: blank, error: 'ETIMEDOUT' } });
+    expect(d.allow).toBe(false);
+    expect(d.message).toMatch(/could not verify.*fail-closed/);
   });
   it('passes a real identity in a lane', () => {
     expect(guardDecision({ root: '/w/.lanes/p/lane-1', identity: { author: real, committer: real } })).toEqual({ allow: true });
@@ -42,6 +44,23 @@ describe('guardDecision (pure)', () => {
     expect(guardDecision({ root: '/w/webeverything', identity: { author: placeholder, committer: placeholder } })).toEqual({ allow: true });
     expect(isLaneRoot('/w/lanes/x')).toBe(false);
     expect(isLaneRoot('/w/.lanes/p/lane-2')).toBe(true);
+  });
+});
+
+describe('main() — any unexpected error refuses the commit (fail closed)', () => {
+  const laneExec = () => '/w/.lanes/p/lane-1\n';
+  const realIdent = () => ({ author: real, committer: real });
+  it.each([
+    ['the identity read throws', { exec: laneExec, readIdentity: () => { throw new Error('boom'); } }],
+    ['the settings resolve throws', { exec: laneExec, readIdentity: realIdent, resolveLists: () => { throw new Error('bad settings'); } }],
+    ['git rev-parse throws', { exec: () => { throw new Error('EMFILE'); } }],
+  ])('%s → exit 1 with a clear message', (_label, deps) => {
+    const errs = [];
+    expect(guardMain({ cwd: '/w', env: {}, err: (l) => errs.push(l), deps })).toBe(1);
+    expect(errs.join('\n')).toMatch(/could not verify the git identity \(fail-closed\)[\s\S]*unexpected error/);
+  });
+  it('a real identity in a lane still exits 0', () => {
+    expect(guardMain({ cwd: '/w', env: {}, err: () => {}, deps: { exec: laneExec, readIdentity: realIdent } })).toBe(0);
   });
 });
 

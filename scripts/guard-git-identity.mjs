@@ -8,9 +8,9 @@
  *   and nothing noticed. Wired via `.githooks/pre-commit` (`core.hooksPath .githooks`, set by the `prepare` npm
  *   script and carried into every lane clone), so it covers an agent's `git commit` in a lane however it is typed.
  *
- *   SCOPE: lane clones only (a checkout under `/.lanes/`), which is where agent commits land. FAIL-CLOSED only for
- *   the placeholder / missing verdict — a real identity passes, and an internal error in the check itself passes
- *   (the guard never wedges a commit over its own bug; `git` itself still refuses a truly missing identity).
+ *   SCOPE: lane clones only (a checkout under `/.lanes/`), which is where agent commits land. A real identity passes;
+ *   a placeholder / missing identity is refused, and so is ANY unexpected error in the guard (FAIL CLOSED, operator
+ *   ruling 2026-10-20) — with a message saying the identity could not be verified.
  *
  *   Exit 1 = refuse (message on stderr), 0 = allow.
  */
@@ -33,8 +33,10 @@ export function isLaneRoot(root, sepChar = sep) {
 export function guardDecision({ root, identity, lists }) {
   if (!isLaneRoot(root)) return { allow: true };
   const v = identityVerdict(identity, lists);
-  // `error` = the check could not run (git timed out, EMFILE, …): never wedge a commit over the guard's own fault.
-  if (v.status === 'ok' || v.status === 'error') return { allow: true };
+  if (v.status === 'ok') return { allow: true };
+  // FAIL CLOSED (operator ruling 2026-10-20): a check that could not run (git timed out, EMFILE, …) refuses too —
+  // an unverified identity is exactly how the "test" author went unnoticed.
+  if (v.status === 'error') return { allow: false, message: failClosedMessage(v.detail) };
   return {
     allow: false,
     message: [
@@ -47,16 +49,30 @@ export function guardDecision({ root, identity, lists }) {
   };
 }
 
-export function main({ cwd = process.cwd(), env = process.env, err = (s) => process.stderr.write(s + '\n') } = {}) {
+/** The refusal for "the guard could not decide" — never a silent pass. */
+export function failClosedMessage(detail) {
+  return [
+    '✗ commit refused: the placeholder-author guard could not verify the git identity (fail-closed).',
+    `  ${detail}`,
+    '  Re-run the commit; if it persists, check `git var GIT_AUTHOR_IDENT` / `git var GIT_COMMITTER_IDENT` in this lane.',
+    `  ${GIT_IDENTITY_FIX_HINT}`,
+  ].join('\n');
+}
+
+/**
+ * The hook entry. ANY unexpected error refuses the commit with a clear message (fail closed). `deps` is a test seam.
+ */
+export function main({ cwd = process.cwd(), env = process.env, err = (s) => process.stderr.write(s + '\n'), deps = {} } = {}) {
+  const { exec = execFileSync, readIdentity = readGitIdentity, resolveLists = resolveGitIdentityPlaceholders } = deps;
   let decision;
   try {
-    const top = execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    const top = String(exec('git', ['rev-parse', '--show-toplevel'], { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })).trim();
     let root = top;
     try { root = realpathSync(top); } catch { /* keep the git answer */ }
     if (!isLaneRoot(root) && !isLaneRoot(top)) return 0;
-    decision = guardDecision({ root: isLaneRoot(root) ? root : top, identity: readGitIdentity(cwd, { env }), lists: resolveGitIdentityPlaceholders({ env }) });
-  } catch {
-    return 0; // the guard's own fault never blocks a commit
+    decision = guardDecision({ root: isLaneRoot(root) ? root : top, identity: readIdentity(cwd, { env }), lists: resolveLists({ env }) });
+  } catch (e) {
+    decision = { allow: false, message: failClosedMessage(`unexpected error: ${String(e?.message ?? e).split('\n')[0]}`) };
   }
   if (decision.allow) return 0;
   err(decision.message);
