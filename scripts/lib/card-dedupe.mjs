@@ -12,7 +12,7 @@
  *     - CLAIM SIMILARITY ≥ the threshold — IDF-weighted Jaccard over normalized word tokens ({@link claimSimilarity},
  *       {@link buildIdf}). No LLM. The default 0.3 is calibrated on the 2026-10-03..09 replay
  *       (`we:scripts/operations/card-dedupe-replay.mjs`).
- *   A matched finding becomes one "Also raised by …" line appended to the existing card; the unmatched rest is filed
+ *   A matched finding becomes an independent raised-by file; the unmatched rest is filed
  *   as today (all matched → no new card). Never across different files or classes; never into a card whose status is
  *   not `open` (an `active` card is claimed by a session and is never touched).
  *
@@ -26,6 +26,7 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { parseRaisedBy, mergeRaisedBy, raisedByParentIds, readRaisedBy } from './raised-by.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 
 // ── Policy ───────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -159,8 +160,6 @@ export const normalizeTarget = (p) => String(p ?? '').trim().replace(/^we:/, '')
 
 /** A numbered finding line: `N. \`we:path:line\` — claim` (the shape every mechanical filer writes). */
 const ITEM_RE = /^(\d+)\.\s+`([^`\n]+)`\s+—\s+(.+)$/;
-/** A mention line this module appends (so a card's own mentions keep matching later filings). */
-const MENTION_RE = /^- Also raised by (\S+#\d+) \(finding \d+: `([^`\n]+)` — (.+?)\)(?: · key `[^`]*`)?$/;
 
 const toItem = (n, anchor, claim, raw) => {
   const file = /^(?:we:)?[A-Za-z0-9_.][A-Za-z0-9._/-]*(?::\d+(?:[:-]\d+)?)?$/.test(anchor.trim()) ? normalizeTarget(anchor) : null;
@@ -186,17 +185,16 @@ export function parseFilingItems(digest) {
  * PURE. The findings an existing card carries: the numbered lines of its filed digest (the body before its first `## `
  * section — later sections are the preparer's own Design/MVP lists, not filed findings) plus its "Also raised by" lines.
  */
-export function parseCardItems(text) {
+export function parseCardItems(text, raisedBy = []) {
   const out = [];
   let inDigest = true;
   for (const raw of String(text ?? '').split('\n')) {
     const t = raw.trim();
     if (/^## /.test(t)) inDigest = false;
     const m = inDigest ? ITEM_RE.exec(t) : null;
-    if (m) { out.push(toItem(Number(m[1]), m[2], m[3], raw)); continue; }
-    const k = MENTION_RE.exec(t);
-    if (k) out.push(toItem(0, k[2], k[3], raw));
+    if (m) out.push(toItem(Number(m[1]), m[2], m[3], raw));
   }
+  for (const r of mergeRaisedBy(parseRaisedBy(text), raisedBy)) out.push(toItem(0, r.anchor, r.claim, r.line));
   return out;
 }
 
@@ -209,12 +207,12 @@ const readFm = (text, key) => {
  * PURE. A card as the matcher sees it. `host` is `'main'` (a card on origin/main, edited in a lane) or `{pr}` (a card
  * still in an open filing PR — mentioned there by a PR comment, since that branch is not ours to push to).
  */
-export function cardFromText({ rel, text, host = 'main' }) {
+export function cardFromText({ rel, text, host = 'main', raisedBy = [] }) {
   const name = String(rel ?? '').split('/').pop() ?? '';
   return {
     rel, host, id: /^([^-]+)-/.exec(name)?.[1] ?? name.replace(/\.md$/, ''),
     status: readFm(text, 'status'), title: /^# (.+)$/m.exec(String(text ?? ''))?.[1] ?? '',
-    items: parseCardItems(text), text: String(text ?? ''),
+    items: parseCardItems(text, raisedBy), text: String(text ?? ''),
   };
 }
 
@@ -330,8 +328,7 @@ export function planDedupe({ input, cards = [], policy }) {
   for (const m of matches) {
     const entry = byCard.get(m.card.rel) ?? { card: m.card, lines: [], items: [] };
     entry.items.push(m.item);
-    // The key goes on the FIRST mention only: it makes the existing card answer the filer's own on-disk idempotency
-    // lookup (`findApprovalPreventionCardOnDisk` matches the key text) when nothing new was filed.
+    // The first raise carries the filing key for the approval filer's durable idempotency lookup.
     entry.lines.push(mentionLine({ source, item: m.item, key: !keep.length && matches[0] === m ? key : null }));
     byCard.set(m.card.rel, entry);
   }
@@ -377,7 +374,8 @@ export function readOpenCards(dir, { list = readdirSync, read = readFileSync } =
   for (const name of names.filter((n) => n.endsWith('.md')).sort()) {
     let text;
     try { text = read(join(dir, 'backlog', name), 'utf8'); } catch { continue; }
-    const card = cardFromText({ rel: `backlog/${name}`, text });
+    const id = name.split('-')[0];
+    const card = cardFromText({ rel: `backlog/${name}`, text, raisedBy: readRaisedBy(id, dir, { body: text }) });
     if (card.status === 'open' && card.items.length) out.push(card);
   }
   return out;
@@ -404,7 +402,14 @@ export function readPrHostedCards({ exec, cwd, repo = CONSTELLATION_REPOS.we.slu
         try {
           text = exec('gh', ['api', `repos/${repo}/contents/${f.path}?ref=${encodeURIComponent(pr.headRefName)}`, '-H', 'Accept: application/vnd.github.raw'], { cwd, encoding: 'utf8' });
         } catch { continue; }
-        const card = cardFromText({ rel: f.path, text, host: { pr: pr.number } });
+        const id = f.path.split('/').pop().split('-')[0];
+        const parentIds = raisedByParentIds(id, text);
+        const raisedBy = [];
+        for (const raise of (pr.files ?? []).filter(r => parentIds.some(parentId => r.path?.startsWith(`backlog/raised-by/${parentId}/`)) && r.path.endsWith('.md'))) {
+          const body = exec('gh', ['api', `repos/${repo}/contents/${raise.path}?ref=${encodeURIComponent(pr.headRefName)}`, '-H', 'Accept: application/vnd.github.raw'], { cwd, encoding: 'utf8' });
+          raisedBy.push(...parseRaisedBy(body));
+        }
+        const card = cardFromText({ rel: f.path, text, host: { pr: pr.number }, raisedBy });
         if (card.status === 'open' && card.items.length) out.push(card);
       }
     }
