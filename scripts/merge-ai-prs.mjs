@@ -177,6 +177,7 @@ import { autoStrandedSweepPass } from './backlog-stranded-sweep.mjs'; // xvr2o8r
 import { parseEscalationReason } from './review-detail.mjs';
 import { deriveResolutionBasis, graduatedToFromBody, renderResolutionBasisBanner } from './lib/review-render.mjs'; // #2447 — the graduatedTo resolution-basis banner (presentation only; never gates)
 import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, nextLimit } from './lib/pr-snapshot.mjs';
+import { ROUND_SNAPSHOT_ENV, readRoundSnapshot, writeRoundSnapshot, readRoundSnapshotSetting } from './lib/drain-round-snapshot.mjs';
 import { listOpenPrsPagedHydrated, resolvePrListPaging } from './lib/pr-list-paged.mjs';
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
 import { logQueueNumbering, mainAcceptsBranchNumbering, prepareBranchBeforeEnqueue, finishBranchPreparation, openReservationPr, probeQueuedLand, repairHashOnMain, fallbackMinNext, sweepQueuedHashCards, hashBacklogFiles } from './lib/queue-branch-numbering.mjs';
@@ -5203,7 +5204,22 @@ async function runCli() {
         const fields = RECONCILE ? SWEEP_LIST_FIELDS
           : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '');
         try {
-          const snap = __t.time('listing.snapshot', () => readSharedOpenPrs({ repo: slug, fields: `${fields},updatedAt`, caller: 'merge-ai-prs.mjs' }));
+          // A catch-up round shares one seed across its fast drains (drain.roundSnapshotMaxAgeSec). The target is
+          // still re-read live below and the live open set is still listed, so only the seed is reused.
+          const roundPath = process.env[ROUND_SNAPSHOT_ENV] || null;
+          const snap = __t.time('listing.snapshot', () => {
+            if (roundPath) {
+              let setting = { maxAgeSec: 0, source: 'unreadable' };
+              try { setting = readRoundSnapshotSetting(); } catch { /* disabled */ }
+              const round = readRoundSnapshot({ path: roundPath, repo: slug, fields: `${fields},updatedAt`, maxAgeSec: setting.maxAgeSec });
+              process.stderr.write(`fast-drain: round snapshot ${round.rows ? `reused (${Math.round(round.ageMs / 1000)}s old, ${round.rows.length} rows)` : `not reused (${round.why})`} — drain.roundSnapshotMaxAgeSec=${setting.maxAgeSec} (${setting.source})\n`);
+              if (round.rows) return round.rows;
+              const fresh = readSharedOpenPrs({ repo: slug, fields: `${fields},updatedAt`, caller: 'merge-ai-prs.mjs' });
+              if (fresh != null && setting.maxAgeSec > 0) writeRoundSnapshot({ path: roundPath, repo: slug, fields: `${fields},updatedAt`, rows: fresh });
+              return fresh;
+            }
+            return readSharedOpenPrs({ repo: slug, fields: `${fields},updatedAt`, caller: 'merge-ai-prs.mjs' });
+          });
           if (snap == null) {
             process.stderr.write('fast-drain: listing fell back to live (snapshot disabled/unavailable)\n');
           } else {

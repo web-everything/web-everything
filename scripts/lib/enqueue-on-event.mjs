@@ -65,6 +65,8 @@ import { fileURLToPath } from 'node:url';
 import { resolveDrainThroughput, holdSignature, unchangedHold, HOLD_KINDS } from './drain-throughput.mjs';
 import { queueStatePath, readQueueState } from './drain-merge-strategy.mjs';
 import { readDrainQueueSafety } from './drain-queue-safety.mjs';
+import { ROUND_SNAPSHOT_ENV, roundSnapshotPath } from './drain-round-snapshot.mjs';
+import { prSnapshotDir } from './pr-snapshot-store.mjs';
 import { classifySkipReason } from './drain-skip-reasons.mjs';
 import { readSavedRedTeamResult } from './drain-saved-red-team.mjs';
 import { readDrainRedTeamEvidence } from './drain-red-team-evidence.mjs';
@@ -816,7 +818,12 @@ export function createEnqueueOnEvent({
       const finish = async () => {
         let ownChild;
         const childTimeoutMs = timeoutMs ?? (s.timeoutSeconds ?? ENQUEUE_ON_EVENT_DEFAULTS.timeoutSeconds) * 1000;
-        const r = await runChild({ args, cwd, env: p.catchUp && throughput.catchUpSkipUnchangedHolds ? { ...env, WE_DRAIN_CATCH_UP_SNAPSHOT: '1' } : env, spawnImpl, timeoutMs: childTimeoutMs, onChild: (c) => { ownChild = c; children.add(c); } });
+        let roundEnv = {};
+        if (p.catchUp && throughput.catchUpSkipUnchangedHolds) {
+          try { roundEnv = { [ROUND_SNAPSHOT_ENV]: roundSnapshotPath({ dir: join(prSnapshotDir(env), 'catch-up-rounds'), repo: localSlug, round: catchUpRound }) }; }
+          catch { roundEnv = {}; }
+        }
+        const r = await runChild({ args, cwd, env: p.catchUp && throughput.catchUpSkipUnchangedHolds ? { ...env, WE_DRAIN_CATCH_UP_SNAPSHOT: '1', ...roundEnv } : env, spawnImpl, timeoutMs: childTimeoutMs, onChild: (c) => { ownChild = c; children.add(c); } });
         children.delete(ownChild);
         const json = lastJsonLine(r.stdout);
         const hit = rows => Array.isArray(rows) ? rows.find(x => Number(x.num) === p.num) : undefined;

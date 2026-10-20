@@ -12,6 +12,7 @@ import { createEnqueueOnEvent } from '../enqueue-on-event.mjs';
 import { createDrainMergeStrategy } from '../drain-merge-strategy.mjs';
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 import { buildSkipReasons } from '../drain-skip-reasons.mjs';
+import { ROUND_SNAPSHOT_ENV, readRoundSnapshot, writeRoundSnapshot } from '../drain-round-snapshot.mjs';
 
 describe('drain throughput', () => {
   it('defaults on, supports rollback and reports each source', () => {
@@ -141,6 +142,43 @@ describe('drain throughput', () => {
     expect(strategy.priorityReserveStamp).toHaveBeenCalledWith(c, 'current');
     expect(strategy.requestRedTeamWhileDeferred).toHaveBeenCalledWith(c, 'current');
   });
+  it.each([
+    ['fresh round seed is reused', 10_000, false],
+    ['stale round seed is ignored and rewritten', 500_000, true],
+  ])('catch-up round snapshot: %s; target and open set are still read live', async (_name, ageMs, sharedRead) => {
+    const src = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');
+    const listing = src.slice(src.indexOf('  const listOne = async (repo) => {'), src.indexOf('  const resolveDefaultBranch = async (repo) => {'));
+    const dir = mkdtempSync(join(tmpdir(), 'round-snap-'));
+    const path = join(dir, 'o_r-1-r1.json');
+    const stale = { number: 1, state: 'OPEN', headRefOid: 'old', labels: [], files: [] };
+    const target = { number: 1, state: 'OPEN', headRefOid: 'live', labels: [{ name: 'ready-to-merge' }], files: [] };
+    writeRoundSnapshot({ path, repo: 'o/r', fields: 'number,files,updatedAt', rows: [stale], now: Date.now() - ageMs });
+    const shared = vi.fn(() => [stale]);
+    const targetRead = vi.fn(async () => ({ stdout: JSON.stringify(target) }));
+    const live = vi.fn(({ seed }) => ({ rows: seed, truncated: false, cache: {} }));
+    const context = {
+      process: { env: { WE_DRAIN_CATCH_UP_SNAPSHOT: '1', WE_DRAIN_ROUND_SNAPSHOT: path }, stderr: { write() {} } },
+      ROUND_SNAPSHOT_ENV, readRoundSnapshot, writeRoundSnapshot, readRoundSnapshotSetting: () => ({ maxAgeSec: 120, source: 'test' }),
+      localSlug: 'o/r', onlyPr: 1, fastDrainListing: { listing: 'snapshot' }, isFastDrainTarget: () => true,
+      RECONCILE: true, SWEEP_LIST_FIELDS: 'number,files', workflowEditSetting: { value: 'off' },
+      __t: { time: (_, f) => f(), timeAsync: (_, f) => f() },
+      readSharedOpenPrs: shared, execFileP: targetRead,
+      mergeLiveTargetIntoRows: (snap, row) => [...snap.filter(r => r.number !== row.number), row], resolvePrListPaging: () => ({}),
+      listOpenPrsPagedHydrated: live, execFileSyncThrottled() {}, operatorSelects: () => true,
+      drainHeavyCacheByRepo: new Map(), passPrState: new Map(), OPEN_PR_LIST_LIMIT: 500,
+      resolveListedChecks: async (_, rows) => rows, isDegradedOpenPrListing: () => false,
+      describeGhListError: e => String(e),
+    };
+    try {
+      const result = await runInNewContext(`(async () => { ${listing}; return listOne(null); })()`, context);
+      expect(result.err).toBeUndefined();
+      expect(shared).toHaveBeenCalledTimes(sharedRead ? 1 : 0);
+      expect(targetRead).toHaveBeenCalledTimes(1); // the target is always re-read live
+      expect(live).toHaveBeenCalledTimes(1); // the live open set is always listed
+      expect(result.rows.find(r => r.number === 1).headRefOid).toBe('live');
+      if (sharedRead) expect(readRoundSnapshot({ path, repo: 'o/r', fields: 'number', maxAgeSec: 120 }).rows).toEqual([stale]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it('catch-up sees a sibling opened after the snapshot and yields to it', async () => {
     const src = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');
     const listing = src.slice(src.indexOf('  const listOne = async (repo) => {'), src.indexOf('  const resolveDefaultBranch = async (repo) => {'));
@@ -148,7 +186,7 @@ describe('drain throughput', () => {
     const sibling = { number: 2, baseRefName: 'main', headRefOid: 'b', files: [{ path: 'shared', additions: 100 }], labels: ['review:pending', 'ready-to-merge'], statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
     const live = vi.fn(() => ({ rows: [target, sibling], truncated: false, cache: {} }));
     const context = {
-      process: { env: { WE_DRAIN_CATCH_UP_SNAPSHOT: '1' }, stderr: { write() {} } },
+      process: { env: { WE_DRAIN_CATCH_UP_SNAPSHOT: '1' }, stderr: { write() {} } }, ROUND_SNAPSHOT_ENV,
       localSlug: 'o/r', onlyPr: 1, fastDrainListing: { listing: 'snapshot' }, isFastDrainTarget: () => true,
       RECONCILE: true, SWEEP_LIST_FIELDS: 'number,files', workflowEditSetting: { value: 'off' },
       throughput: { value: { catchUpSkipUnchangedHolds: true } },
@@ -173,6 +211,8 @@ describe('drain throughput', () => {
     const pr = { state: 'OPEN', headRefOid: 'a'.repeat(40), labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [] };
     const spawnImpl = vi.fn((command, args, options) => {
       expect(options.env.WE_DRAIN_CATCH_UP_SNAPSHOT).toBe(enabled ? '1' : undefined);
+      if (enabled) expect(options.env.WE_DRAIN_ROUND_SNAPSHOT).toMatch(/catch-up-rounds\/o_r-\d+-r\d+\.json$/);
+      else expect(options.env.WE_DRAIN_ROUND_SNAPSHOT).toBeUndefined();
       const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.kill = vi.fn();
       queueMicrotask(() => {
         child.stdout.emit('data', JSON.stringify({ considered: 1, enqueueOutcomes: [{ num: 1, outcome: 'not-enqueued', kind: 'red-team-pending', reason: 'waiting' }] }));
