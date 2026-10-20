@@ -270,14 +270,14 @@ async function retireMergedMidSeal(recorded, input, { statePath, remote, gh, hel
     || recorded.batchRef !== `lane/card-batch-${input.kind}-${recorded.seq}`) return refuse('batch-sealed');
   const missing = await provenMergedLanding(recorded, { repo: input.source.repo, gh, git, remote });
   if (missing.length) {
-    log(`card-batch ${recorded.batchRef} PR ${recorded.pr} MERGED mid-seal but ${missing.length} card(s) not proven on main `
+    log(`card-batch MERGED-mid-seal ${recorded.batchRef} PR ${recorded.pr}: but ${missing.length} card(s) not proven on main `
       + `(${missing.slice(0, 5).join(', ')}): kept held`);
     return refuse('cards-not-proven-on-main');
   }
   if (!stillHeld()) return refuse('lease-held');
   const retired = recorded;
   const state = retireBatch(statePath, recorded, { repo: input.source.repo, kind: input.kind, held: stillHeld, terminalPrState: 'MERGED', authorization: terminalRetirement });
-  log(`card-batch ${retired.batchRef} PR ${retired.pr} GitHub MERGED: retired (cards proven on main)`);
+  log(`card-batch MERGED-mid-seal ${retired.batchRef} PR ${retired.pr}: retired (cards proven on main)`);
   return { action: 'retired', state };
 }
 

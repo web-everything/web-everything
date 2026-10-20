@@ -7,6 +7,8 @@ import { join } from 'node:path';
 import { retireTerminalBatch } from '../card-batch-io.mjs';
 import { publishBatch, sealDueBatches, HOLD_LABEL, VERIFY_UNRUN_CAP, resolveAdoptDescendantHead } from '../card-batch-seal-io.mjs';
 import { loadCardBatchPolicy } from '../../lib/card-batch-policy.mjs';
+// Every git/gh call in this file is stubbed (no network); a bounded per-test timeout turns any hang into a failure.
+vi.setConfig({ testTimeout: 30_000 });
 const dirs = [];
 afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
 function fixture({ maxCards = 2, red = false, descendant = false, descendantMessages = 'Repair CI\n',
