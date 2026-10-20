@@ -75,7 +75,8 @@ export function deriveReferrals(events, { applied = appliedVerdictRows(events), 
       witness = to;
       if (!chain.some(h => sameHead(h, from)) || chain.some(h => sameHead(h, to))) return;
       chain.push(to);
-      if (!SAME_CONTENT.has(e.verdict)) since.push([to, i]);
+      // A re-witness copies its source head's content: newer code only when that source already was.
+      if (!SAME_CONTENT.has(e.verdict) || since.some(([h]) => sameHead(h, from))) since.push([to, i]);
     });
     return since;
   };

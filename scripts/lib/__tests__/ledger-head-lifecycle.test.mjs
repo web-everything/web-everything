@@ -387,6 +387,14 @@ describe('ledger head lifecycle red-team regressions', () => {
         // A real move on from the re-witnessed head is newer code.
         const onward = [verdict('accepted'), move, verdict('head-moved', third, { fromHead: next, source: 'head-observer' }), ...late('block'), verdict('accepted', third)];
         expect(ledgerView(onward, facts(third)).referrals.get(key).state).toBe('resolved-by-fix');
+        // Push B (newer), then a mechanical move B→C before the late referral: C carries newer code, so a fresh accept of C fixes it.
+        const rebased = verdict(kind, third, kind === 'carried' ? { fromHead: next, carryRule: 'tree-identical', source: 'head-observer' } : {});
+        for (const ruled of [null, 'block']) {
+          const events = [verdict('accepted'), verdict('head-moved', next, { fromHead: head, source: 'head-observer' }), verdict('accepted', next),
+            rebased, ...late(ruled), verdict('accepted', third)];
+          expect(ledgerView(events, facts(third)).referrals.get(key).state).toBe('resolved-by-fix');
+          expect(codes(events, third)).not.toContain(ruled ? 'referral-blocked' : 'referral-unruled');
+        }
       });
       it('a head that was older than A stays no fix, even when a later move returns to it', () => {
         const events = [verdict('accepted', next), verdict('head-moved', head, { fromHead: next, source: 'head-observer' }), verdict('accepted'),
