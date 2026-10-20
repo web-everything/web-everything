@@ -8,9 +8,8 @@ export default {
   id: 'card-group-default-repo-conflict-watch',
   title: 'default conflict sweeps leave grouped sources and combined PRs to reconciliation',
   card: 'PR #5762 / xym8nt4',
-  // The launcher creates this repair's commit after the edit-only session. HEAD resolves it at handback;
-  // later replays should pass --revert=<the launcher repair sha> explicitly.
-  fixedBy: { sha: 'HEAD', where: 'lane/xym8nt4-card-group',
+  // Pin the commit that introduced the fix so replay keeps targeting it after later commits land.
+  fixedBy: { sha: 'e55ef4474f96748122b3afcd42ca6955afb631fd', where: 'lane/xym8nt4-card-group',
     paths: ['scripts/conveyor/parked-pr-conflict-watch.mjs'] },
   fixPresent(root) {
     return readFileSync(join(root, this.fixedBy.paths[0]), 'utf8')
