@@ -10,9 +10,25 @@ dateOpened: "2026-10-20"
 tags: [prevention, acceptance-coverage]
 ---
 
-# Prevention: validate decision and slice acceptance contracts
+# Prevention — validate decision and slice acceptance contracts (from web-everything/web-everything#5530 review)
 
-Track all prevention owed by the advisory review of web-everything/web-everything#5530 at head 9d2d3b722be831f3bfe887e3245582e06259eab9 (2026-10-20). The decision's guard-settings amendment, matrix configurability and rebase gate preservation were not pinned by named planned tests; the epic also omitted a child's test file and failed to encode its slice order. The repair adds those contracts; this card owns the reusable checks below, not the stacking implementation.
+Track all prevention owed by the advisory review of web-everything/web-everything#5530 (reviewed head `9d2d3b722be831f3bfe887e3245582e06259eab9`, 2026-10-20). The decision's guard-settings amendment, matrix configurability and rebase gate preservation were not pinned by named planned tests; the epic also omitted a child's test file and failed to encode its slice order. The repair adds those contracts; this card owns the reusable checks below, not the stacking implementation.
+
+## Review prevention mapping
+
+Locations below identify findings on the reviewed head, not current line numbers. Each owed guard maps to the acceptance criterion that implements it.
+
+| Finding location | Lens and owed guard | Acceptance |
+| --- | --- | --- |
+| `we:backlog/xv85eqi-decision-when-prs-may-stack-base-state-child-size-risk-with.md` | correctness/coverage: map every Skeptic amendment to a named child test, with a review-lens fallback | A1 decision amendments; A3 |
+| `we:backlog/xejcrh1-we-stacked-pr-policy-build-configurable-cascade-policy-for-w.md` | correctness/coverage: epic A1 includes every child's A1 test file | A1 epic A1 |
+| `we:backlog/xkmrswh-we-stacked-pr-policy-slice-3-drain-ordered-landing-restack-d.md` | correctness/correctness: order siblings with overlapping scopes | A1 sibling scopes |
+| `we:backlog/x44bz7l-we-stacked-pr-policy-slice-4-closed-or-rejected-base-handlin.md` | correctness/correctness: missing-setting tests name the default and missing layer | A1 missing setting; A3 |
+| `we:backlog/xv85eqi-decision-when-prs-may-stack-base-state-child-size-risk-with.md` | correctness/prose: parent claims and child counts resolve to actual parent fields | A1 parent claims |
+| `we:backlog/xcq5jb9-we-stacked-pr-policy-slice-1-policy-settings-and-evaluator.md:20` | security/coverage: categorical Fork and Skeptic exceptions map to named tests, including every gate-read settings file classifying as guard | A1 decision amendments; A2 classification contract; A3 |
+| `we:backlog/x44bz7l-we-stacked-pr-policy-slice-4-closed-or-rejected-base-handlin.md:26` | security/coverage: the card template and lint require a gates-unchanged test for PR-head mutation, including closed-base rebase | A1 head mutation; A3 |
+| `we:backlog/xcq5jb9-we-stacked-pr-policy-slice-1-policy-settings-and-evaluator.md:19` | simplicity/coverage: every configurable matrix cell outside the safety floor demonstrates an effective non-default override | A2 configuration contract |
+| `we:backlog/xcq5jb9-we-stacked-pr-policy-slice-1-policy-settings-and-evaluator.md:18` | codex-correctness/coverage: deterministic matrix override tests change outcomes while the independent floor remains enforced | A2 configuration contract |
 
 ## Acceptance
 
