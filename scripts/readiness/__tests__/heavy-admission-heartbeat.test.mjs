@@ -35,3 +35,17 @@ describe('heartbeatOwnedSlot', () => {
     expect(heartbeatOwnedSlot({ lockRoot: root(), cap: 2, owner: OWNER, pid: process.pid, fastSlots: 1 })).toBe(null);
   });
 });
+
+describe('admissionLockRoot outside the workspace (verify-admission, 2026-10-20)', () => {
+  it('falls back to the running checkout pool when the cwd-derived pool does not exist (heavy-queue read 0/0 from ~)', async () => {
+    const { admissionLockRoot } = await import('../heavy-admission.mjs');
+    const env = { HOME: '/home/u' };
+    const own = '/home/u/workspace/.lanes/web-everything/lane-3';
+    const exists = (p) => p === '/home/u/workspace/.lanes';
+    expect(admissionLockRoot('/home/u', env, { ownCheckout: own, exists })).toBe(join('/home/u/workspace/.lanes', '.admission', 'heavy'));
+    // A pool that exists where the caller is, an explicit LANE_POOL_ROOT, or a test env keep their own root.
+    expect(admissionLockRoot('/srv/ws/proj', env, { ownCheckout: own, exists: () => true })).toBe(join('/srv/ws/.lanes', '.admission', 'heavy'));
+    expect(admissionLockRoot('/home/u', { ...env, LANE_POOL_ROOT: '/p' }, { ownCheckout: own, exists })).toBe(join('/p', '.admission', 'heavy'));
+    expect(admissionLockRoot('/home/u', { ...env, VITEST: 'true' }, { ownCheckout: own, exists })).toBe(join('/home/.lanes', '.admission', 'heavy'));
+  });
+});

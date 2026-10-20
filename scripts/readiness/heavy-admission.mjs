@@ -211,6 +211,7 @@ export const ADMISSION_SWITCH_ENV = 'WE_HEAVY_ADMISSION';
 export const HEAVY_ADMISSION_CLI = fileURLToPath(import.meta.url);
 
 const SUBDIR = join('.admission', 'heavy');
+const MODULE_CHECKOUT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const WAITING_SUBDIR = 'waiting';
 const REAP_LOG = 'reaped.jsonl';
 
@@ -728,8 +729,18 @@ export function resolveLoadAdmission({ env = process.env, minIdlePct, minPressur
 
 /** The host-shared lock root for a checkout (lane or primary) — a sibling of every lane clone, never inside
  *  any one of them, so every lane on the host contends over the SAME slots. */
-export function admissionLockRoot(checkoutRoot = process.cwd(), env = process.env) {
-  return join(defaultPoolRoot(checkoutRoot, env), SUBDIR);
+export function admissionLockRoot(checkoutRoot = process.cwd(), env = process.env, { ownCheckout = MODULE_CHECKOUT, exists = existsSync } = {}) {
+  const derived = defaultPoolRoot(checkoutRoot, env);
+  // verify-admission (2026-10-20) — a caller whose cwd/repo is outside the workspace (`~`, a temp dir) used to derive
+  // a pool that does not exist (`/Users/.lanes`, `/.lanes`): `heavy-queue` then reported 0 held / 0 waiting while the
+  // real pool was full, and `heavy-admission run` from such a cwd queued on a private, empty pool. When the derived
+  // pool is absent, use the pool of the checkout this module runs from, if THAT one exists. Never under test (a test
+  // must not reach the real pool by accident) and never over an explicit LANE_POOL_ROOT.
+  if (!env.LANE_POOL_ROOT && !isUnderTest(env) && !exists(derived)) {
+    const own = defaultPoolRoot(ownCheckout, env);
+    if (own !== derived && exists(own)) return join(own, SUBDIR);
+  }
+  return join(derived, SUBDIR);
 }
 
 /** The synthetic per-slot "path" `file-locks.mjs` locks — slot identity is just its index. */

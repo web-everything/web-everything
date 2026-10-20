@@ -641,8 +641,11 @@ async function runGate(command, args) {
     const timer = setTimeout(() => {
       timedOut = true;
       process.stderr.write(`\n✗ verify-lane: phase exceeded phaseTimeoutMs=${PHASE_TIMEOUT_MS} (${PHASE_TIMEOUT_SOURCE}) — killing its process tree (pid ${child.pid}); recorded as a timeout, not a test verdict\n`);
-      // Orphans of this group too: a descendant whose shell already exited is reparented out of the tree.
-      killProcessTree(child.pid, 'SIGKILL', { orphansOfGroup: ownProcessGroup() });
+      // Orphans of this group too (a descendant whose shell already exited is reparented out of the tree) — ONLY when
+      // this process leads its own group (the verify daemon spawns it detached), so every member is provably ours.
+      // Run inside someone else's group (an agent shell), the orphan sweep is skipped; the grace below still settles.
+      const pgid = ownProcessGroup();
+      killProcessTree(child.pid, 'SIGKILL', { orphansOfGroup: pgid === process.pid ? pgid : null });
       // A survivor still holding the output pipes would keep 'close' pending forever: settle on exit, or after a grace.
       grace = setTimeout(() => {
         child.stdout?.destroy(); child.stderr?.destroy();
