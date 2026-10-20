@@ -15,6 +15,7 @@ import {
   notifyReferralHold, REFERRAL_RETRY_MS, decideSameHeadHold, resolveSameHeadMaxReviews, PENDING_REASON_TOKENS,
   GH_LIST_COMMENT_CAP, findResumableParkedRun, blockRuledReferralsFor, filterFixerReferrals, REFERRAL_REARM_COMMENT_MARKER,
   VERDICT_COOLDOWN_BASE_MS, VERDICT_COOLDOWN_CAP_MS, VERDICT_COOLDOWN_MAX_RELEASES,
+  resolveNoVerdictRetry, NO_VERDICT_RETRY_STANDARD, raiseNoVerdictNeedsYou,
 } from '../review-referral-hold.mjs';
 
 it('keeps the cycle-free referral matcher equal to the canonical re-arm marker', () => {
@@ -581,6 +582,78 @@ describe('same-head hold never silences a review whose verdict never landed (liv
     }
     expect(post).not.toHaveBeenCalled();
     expect(log).not.toHaveBeenCalled();
+  });
+  describe('reviewNoVerdictRetry cascade setting (operator 2026-10-20)', () => {
+    const absent = () => ({ WE_PLATFORM_PREFERENCES_FILE: join(temp(), 'absent.json') });
+    it('standard is 0 (main: permanent hold at the third no-verdict run); tool layer sets 6, source logged', () => {
+      expect(NO_VERDICT_RETRY_STANDARD.cooldownReleases).toBe(0);
+      expect(resolveNoVerdictRetry(absent(), { tool: {} })).toEqual({ cooldownReleases: 0, source: 'standard' });
+      expect(resolveNoVerdictRetry(absent())).toEqual({ cooldownReleases: 6, source: 'tool' });
+      const retry = resolveNoVerdictRetry(absent(), { tool: {} });
+      expect(decideSameHeadHold(labelled(['review:pending']), lostRuns(3), { repo, env: {}, now: at + 30 * 86400_000, retry }))
+        .toMatchObject({ kind: 'same-head', count: 3, retryAt: null, why: oldWhy(3), noVerdict: { exhausted: true, releases: 0, source: 'standard' } });
+    });
+    it('bounds: 0..6 accepted; out-of-range / non-integer / wrong type fall back to the standard 0; env wins', () => {
+      for (const ok of [0, 3, 6]) expect(resolveNoVerdictRetry(absent(), { tool: { cooldownReleases: ok } })).toEqual({ cooldownReleases: ok, source: 'tool' });
+      for (const bad of [7, -1, 1.5, '6', null, true, [6], 1e9]) {
+        expect(resolveNoVerdictRetry(absent(), { tool: { cooldownReleases: bad } })).toEqual({ cooldownReleases: 0, source: 'standard' });
+      }
+      for (const tool of [6, [6], 'x', null]) expect(resolveNoVerdictRetry(absent(), { tool })).toEqual({ cooldownReleases: 0, source: 'standard' });
+      expect(resolveNoVerdictRetry({ ...absent(), WE_REVIEW_NO_VERDICT_COOLDOWN_RELEASES: '2' })).toEqual({ cooldownReleases: 2, source: 'env' });
+      for (const bad of ['7', '-1', 'x']) expect(resolveNoVerdictRetry({ ...absent(), WE_REVIEW_NO_VERDICT_COOLDOWN_RELEASES: bad })).toEqual({ cooldownReleases: 6, source: 'tool' });
+      expect(resolveNoVerdictRetry(null)).toEqual({ cooldownReleases: 0, source: 'standard' });
+    });
+    it('the 6th cool-down release is allowed and the 7th attempt is refused (permanent hold), even past any wait', () => {
+      const p = labelled(['review:pending']), retry = { cooldownReleases: 6, source: 'tool' };
+      // count 8 = 5 releases spent: the 6th release is due after the 8 h cap.
+      expect(decideSameHeadHold(p, lostRuns(8), { repo, env: {}, now: at + 8 * 3600_000, retry })).toBeNull();
+      // count 9 = all 6 releases spent: the 7th is refused forever.
+      for (const later of [8 * 3600_000, 30 * 86400_000, 365 * 86400_000]) {
+        expect(decideSameHeadHold(p, lostRuns(9), { repo, env: {}, now: at + later, retry }))
+          .toMatchObject({ retryAt: null, why: oldWhy(9), noVerdict: { exhausted: true, releasesSpent: 6, releases: 6 } });
+      }
+      // A setting above the hard cap can never buy a 7th release.
+      expect(decideSameHeadHold(p, lostRuns(9), { repo, env: {}, now: at + 30 * 86400_000, retry: { cooldownReleases: 99 } }))
+        .toMatchObject({ retryAt: null, noVerdict: { exhausted: true, releases: 0 } });
+    });
+    it('a cool-down hold is not exhausted and raises no needs-you; a landed-verdict hold carries no noVerdict at all', () => {
+      const p = labelled(['review:pending']), retry = { cooldownReleases: 6, source: 'tool' };
+      expect(decideSameHeadHold(p, lostRuns(3), { repo, env: {}, now: at + 30 * 60_000, retry }).noVerdict).toMatchObject({ exhausted: false });
+      expect(decideSameHeadHold(labelled(['review:accepted']), lostRuns(3), { repo, env: {}, now: at + 86400_000, retry }).noVerdict).toBeUndefined();
+      const publish = vi.fn(), dir = temp(), log = vi.fn();
+      const cool = decideSameHeadHold(p, lostRuns(3), { repo, env: {}, now: at + 30 * 60_000, retry });
+      expect(cool.retryAt).toBe(at + 3600_000);
+      notifyReferralHold({ repo, prNumber: p.number, pr: p, hold: cool, dir, post: vi.fn(), log, now: at + 30 * 60_000, publishNeedsYou: publish });
+      expect(publish).not.toHaveBeenCalled();
+    });
+    it('needs-you is emitted exactly once per PR+head across ticks, again for a new head, and retried after a failed publish', () => {
+      const p = labelled(['review:pending']), retry = { cooldownReleases: 6, source: 'tool' }, dir = temp(), log = vi.fn(), post = vi.fn();
+      const held = decideSameHeadHold(p, lostRuns(9), { repo, env: {}, now: at + 30 * 86400_000, retry });
+      const publish = vi.fn();
+      for (let i = 0; i < 4; i++) notifyReferralHold({ repo, prNumber: p.number, pr: p, hold: held, dir, post, log, now: at + i, publishNeedsYou: publish });
+      expect(publish).toHaveBeenCalledTimes(1);
+      expect(publish.mock.calls[0][0]).toMatchObject({ repo, pr: p.number, head, kind: 'review-no-verdict' });
+      expect(log.mock.calls.flat().filter(l => l.includes('NEEDS-YOU review-no-verdict'))).toHaveLength(1);
+      expect(log.mock.calls.flat().find(l => l.includes('NEEDS-YOU'))).toContain('source=tool');
+      // A new head is a new subject.
+      const head2 = 'b'.repeat(40);
+      raiseNoVerdictNeedsYou({ repo, prNumber: p.number, hold: { ...held, head: head2 }, dir, log, publish });
+      raiseNoVerdictNeedsYou({ repo, prNumber: p.number, hold: { ...held, head: head2 }, dir, log, publish });
+      expect(publish).toHaveBeenCalledTimes(2);
+      // A failed publish drops the receipt, so the next tick retries and then stops.
+      const flaky = vi.fn().mockImplementationOnce(() => { throw new Error('feed down'); });
+      const d2 = temp();
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: p.number, hold: held, dir: d2, log, publish: flaky })).toBe(false);
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: p.number, hold: held, dir: d2, log, publish: flaky })).toBe(true);
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: p.number, hold: held, dir: d2, log, publish: flaky })).toBe(false);
+      expect(flaky).toHaveBeenCalledTimes(2);
+    });
+    it('never writes the real feed from a test without an injected publisher', () => {
+      const dir = temp();
+      const held = decideSameHeadHold(labelled(['review:pending']), lostRuns(9), { repo, env: {}, now: at + 30 * 86400_000, retry: { cooldownReleases: 6 } });
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log: vi.fn() })).toBe(false);
+      expect(readdirSync(dir)).toEqual([]);
+    });
   });
   it('still holds when a verdict label landed, or the run is too fresh to judge', () => {
     expect(decideSameHeadHold(labelled(['review:pending', 'review:changes']), [lost()], { repo, env: {} })).not.toBeNull();

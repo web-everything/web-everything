@@ -15,6 +15,9 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
 import { resolveReferralSafetySettings } from '../lib/review-settings.mjs';
 import { parseLatestHumanClearedSha, parseReviewedSha } from '../lib/review-escalation.mjs';
+import { cascadePolicy } from '../lib/policy-cascade.mjs';
+import { publishAttention } from '../operations/needs-you-feed.mjs';
+import { isUnderTest } from '../lib/under-test.mjs';
 
 // Match we:scripts/conveyor/rearm-review.mjs#REARM_COMMENT_MARKER locally: importing it closes a daemon boot cycle.
 // The equality test keeps this first-line matcher tied to the canonical marker.
@@ -256,10 +259,41 @@ export function resolveSameHeadMaxReviews(env = process.env) {
 
 /** Extra automatic review runs allowed on one head when none of the prior runs left a verdict on the PR. */
 export const VERDICT_RETRY_EXTRA = 2;
-/** Missing verdicts get bounded cool-down releases after the immediate retry budget is spent. */
+/** Missing verdicts get bounded cool-down releases after the immediate retry budget is spent: 1h, 2h, 4h, 8h, 8h, ... */
 export const VERDICT_COOLDOWN_BASE_MS = 60 * 60_000;
 export const VERDICT_COOLDOWN_CAP_MS = 8 * 60 * 60_000;
+/** Hard upper bound on cool-down releases per head, whatever any layer says. */
 export const VERDICT_COOLDOWN_MAX_RELEASES = 6;
+/**
+ * `reviewNoVerdictRetry.cooldownReleases` — how many bounded cool-down releases a head whose verdict never landed gets
+ * after the immediate re-runs are spent. Standard 0 (main's permanent hold); the tool layer
+ * scripts/settings/review-no-verdict-retry.json sets 6 (operator 2026-10-20); env
+ * WE_REVIEW_NO_VERDICT_COOLDOWN_RELEASES beats both. Integer 0..VERDICT_COOLDOWN_MAX_RELEASES; anything else is
+ * ignored (the lower layer / standard applies). Resolves standard → platform → tool → env with policy-cascade source logging.
+ */
+export const NO_VERDICT_RETRY_STANDARD = Object.freeze({ cooldownReleases: 0 });
+export const NO_VERDICT_RETRY_TOOL_FILE = resolve(dirname(fileURLToPath(import.meta.url)), '../settings/review-no-verdict-retry.json');
+const validCooldownReleases = v => Number.isInteger(v) && v >= 0 && v <= VERDICT_COOLDOWN_MAX_RELEASES;
+function readNoVerdictRetryTool(path = NO_VERDICT_RETRY_TOOL_FILE) {
+  try { return JSON.parse(readFileSync(path, 'utf8'))?.reviewNoVerdictRetry; } catch { return undefined; }
+}
+export function resolveNoVerdictRetry(env = process.env, { tool } = {}) {
+  if (!env || typeof env !== 'object') return { cooldownReleases: NO_VERDICT_RETRY_STANDARD.cooldownReleases, source: 'standard' };
+  try {
+    const raw = env.WE_REVIEW_NO_VERDICT_COOLDOWN_RELEASES;
+    const block = tool !== undefined ? tool : readNoVerdictRetryTool();
+    const r = cascadePolicy('reviewNoVerdictRetry', block && typeof block === 'object' && !Array.isArray(block)
+      ? { cooldownReleases: block.cooldownReleases } : undefined, {
+      env, standard: NO_VERDICT_RETRY_STANDARD,
+      envValues: { cooldownReleases: raw == null || String(raw).trim() === '' ? undefined : /^\d+$/.test(String(raw).trim()) ? Number(raw) : raw },
+      valid: { cooldownReleases: validCooldownReleases },
+    });
+    const value = r.value?.cooldownReleases;
+    return validCooldownReleases(value)
+      ? { cooldownReleases: value, source: r.sources?.cooldownReleases ?? 'standard' }
+      : { cooldownReleases: NO_VERDICT_RETRY_STANDARD.cooldownReleases, source: 'standard' };
+  } catch { return { cooldownReleases: NO_VERDICT_RETRY_STANDARD.cooldownReleases, source: 'standard' }; }
+}
 /** A just-finished run gets this long for its verdict write-back to show up in the (cached) PR listing. */
 export const VERDICT_GRACE_MS = 10 * 60_000;
 const VERDICT_LABELS = ['review:accepted', 'review:changes', 'review:human'];
@@ -276,7 +310,7 @@ export function verdictNeverLanded(pr, last, now = Date.now()) {
   return !(head && parseReviewedSha(pr?.comments) === head);
 }
 
-export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Date.now() } = {}) {
+export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Date.now(), retry = resolveNoVerdictRetry(env) } = {}) {
   const max = resolveSameHeadMaxReviews(env);
   if (max === 0) return null;
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid)
@@ -293,18 +327,24 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   const noVerdict = verdictNeverLanded(pr, last, now);
   if (noVerdict && count < max + VERDICT_RETRY_EXTRA) return null;
   let retryAt = null;
+  // Cool-down releases already spent on this head/wake (each release produced one more completed run).
   const spent = count - (max + VERDICT_RETRY_EXTRA);
-  if (noVerdict && spent < VERDICT_COOLDOWN_MAX_RELEASES) {
+  const releases = validCooldownReleases(retry?.cooldownReleases) ? Math.min(retry.cooldownReleases, VERDICT_COOLDOWN_MAX_RELEASES) : 0;
+  if (noVerdict && spent < releases) {
     const cooldown = Math.min(VERDICT_COOLDOWN_BASE_MS * 2 ** spent, VERDICT_COOLDOWN_CAP_MS);
     retryAt = last.completedAt + cooldown;
     if (now >= retryAt) return null;
   }
   const head = pr.headRefOid;
+  // Past the last release: the permanent hold main has always had, now also raised to the operator (needs-you).
+  const noVerdictExhausted = noVerdict && retryAt === null;
   const why = `${REFERRAL_HOLD_MARKER} head ${head.slice(0, 9)} was already reviewed ${count} time(s); it resumes on a new push or an explicit re-arm`
     + (noVerdict ? ` (no verdict ever landed on the PR for those runs, and the ${VERDICT_RETRY_EXTRA} automatic re-runs are spent: a person must look at why the review's write-back fails)` : '')
     + (retryAt !== null ? `; the next automatic re-run is due at ${new Date(retryAt).toISOString()}` : '');
   return { kind: 'same-head', head, episode: hash([repo, pr.number, head, wake, 'same-head']), count,
-    why, retryAt, persistenceFailed: false, exhausted: false };
+    why, retryAt, persistenceFailed: false, exhausted: false,
+    ...(noVerdict ? { noVerdict: { exhausted: noVerdictExhausted, releasesSpent: Math.max(0, Math.min(spent, releases)),
+      releases, source: retry?.source ?? 'standard' } } : {}) };
 }
 
 /** Historical auto-rearm receipt, retained for readers; it no longer creates a wake. */
@@ -429,12 +469,52 @@ export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), readRu
 /** Reserve before sending: an ambiguous transport failure must not create duplicate comments on every tick.
  * Known pre-send rate-limit failures can retry with bounded backoff; all other failures remain visible locally.
  */
+/**
+ * A no-verdict same-head hold past its last cool-down release is permanent (as on main) and must never be silent:
+ * raise ONE needs-you event per repo+PR+head. The receipt is reserved (`wx`) before publishing, so repeated ticks and
+ * concurrent daemons never emit twice; a failed publish drops the receipt so the next tick retries. Never throws.
+ */
+export function raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now = Date.now(), log = line => console.error(line),
+  publish }) {
+  try {
+    if (!sha(hold?.head)) return false;
+    // The real operator feed is never written from a test run unless the test injects its own publisher.
+    if (!publish) {
+      if (isUnderTest(process.env)) return false;
+      publish = item => publishAttention(item, { now });
+    }
+    const path = join(dir, `${hash([repo, Number(prNumber), hold.head, 'no-verdict-needs-you'])}.json`);
+    mkdirSync(dir, { recursive: true });
+    try { writeFileSync(path, JSON.stringify({ at: new Date(now).toISOString(), repo, pr: Number(prNumber), head: hold.head }), { flag: 'wx' }); }
+    catch (e) { if (e.code === 'EEXIST') return false; throw e; }
+    try {
+      publish({ repo, pr: Number(prNumber), head: hold.head, kind: 'review-no-verdict',
+        reason: `review verdict never landed after ${hold.count} runs and ${hold.noVerdict?.releasesSpent ?? 0} cool-down retries; held until a push or re-arm`,
+        pick: `https://github.com/${repo}/pull/${prNumber}` });
+    } catch (e) {
+      try { unlinkSync(path); } catch { /* the next tick retries only if the receipt is gone */ }
+      log(`${repo}#${prNumber} no-verdict needs-you could not be published: ${String(e?.message ?? e).split('\n')[0]}`);
+      return false;
+    }
+    log(`${repo}#${prNumber} NEEDS-YOU review-no-verdict head ${hold.head.slice(0, 9)}: ${hold.count} runs, `
+      + `${hold.noVerdict?.releasesSpent ?? 0}/${hold.noVerdict?.releases ?? 0} cool-down retries spent `
+      + `(reviewNoVerdictRetry.cooldownReleases source=${hold.noVerdict?.source ?? 'standard'}); permanent hold`);
+    return true;
+  } catch (e) {
+    try { log(`${repo}#${prNumber} no-verdict needs-you failed: ${String(e?.message ?? e).split('\n')[0]}`); } catch { /* never throws */ }
+    return false;
+  }
+}
+
 export function notifyReferralHold({ repo, prNumber, hold, comments = [], pr,
   dir = join(dirname(resolveRunsDir()), 'review-referral-notices'), now = Date.now(),
-  log = line => console.error(line),
+  log = line => console.error(line), publishNeedsYou,
   post = body => execFileSyncThrottled('gh', ['pr', 'comment', String(prNumber), '--repo', repo, '--body', body],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }),
 }) {
+  if (hold.kind === 'same-head' && hold.noVerdict?.exhausted) {
+    raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now, log, publish: publishNeedsYou });
+  }
   let paused;
   if (pr?.headRefOid === hold.head) {
     paused = classifyPausedReview(pr, liveReferralState(pr, { repo, pr: Number(prNumber),
