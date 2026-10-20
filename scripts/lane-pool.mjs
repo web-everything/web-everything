@@ -181,6 +181,7 @@ import { VERIFY_FILENAME, keepMarkerAfterReset, readVerifyMarker } from './lib/l
 import { checkLaneHold, laneHoldJournalFields, clearLaneAwaitRecords } from './lib/lane-hold-io.mjs';
 import { resolveLaneHoldSettings } from './lib/lane-lease.mjs';
 import { laneGitHardeningEnv, scrubRiskyLaneConfig } from './lib/lane-git-hardening.mjs';
+import { readGitIdentity, laneIdentityReport, ensureLaneHooksPath, resolveGitIdentityPlaceholders, GIT_IDENTITY_FIX_HINT } from './lib/git-identity.mjs';
 
 // #2560 — `--scope=a,b,c` → a normalized, repo-qualified array (empty when the flag is absent/blank).
 const parseScopeFlag = (v) => (typeof v === 'string' && v ? normScope(v.split(',')) : []);
@@ -383,6 +384,11 @@ function laneEnvLocal(repo, n) {
 // Write AFTER refreshLane's `git clean -fd` (which would otherwise remove this untracked file). `.env.local`
 // is git-ignored so a lane never commits it.
 function writeLaneEnv(repo, n) {
+  // Rides every provision/refresh/acquire call site: point the lane at the tracked hooks so the pre-commit guards
+  // (incl. the placeholder-author guard) run even when npm `prepare` never did (`--no-install`, `--reference` clone).
+  // Default runner on purpose: NOT laneGitHardeningEnv, which pins core.hooksPath=/dev/null and would hide the value
+  // an agent's own commit resolves. `git config` reads/writes execute nothing.
+  ensureLaneHooksPath(laneDir(repo, n), { log });
   const contents = laneEnvLocal(repo, n);
   if (contents === null) return;
   writeFileSync(join(laneDir(repo, n), '.env.local'), contents);
@@ -2821,6 +2827,25 @@ function printStatus(repo) {
         (r.leased ? ` · ${describeLease(r.lease)}` : ''),
     );
   }
+  warnPlaceholderIdentity(rows.filter((r) => r.exists).map((r) => ({ lane: r.lane, dir: r.path })));
+}
+
+// 2026-10-05..20: the global git config said `test` / `test@test.com` and every lane commit was authored "test"
+// with nothing flagging it. Human-readable `status` (and `provision`, which ends in it) now warns. NOT in `--json`:
+// the machine readers poll that on every tick and only want lane rows. Git resolves the identity in each lane
+// (`git var`, see `laneIdentityReport`), so any per-lane config syntax is covered.
+function warnPlaceholderIdentity(lanes) {
+  try {
+    const env = laneGitHardeningEnv({ ...process.env, GIT_OPTIONAL_LOCKS: '0' });
+    // REPORT-only here: `status` writes no state (stale-state and other readers pin that); provision/refresh/acquire set it.
+    const unhooked = lanes.filter(({ dir }) => ['unset', 'override'].includes(ensureLaneHooksPath(dir, { write: false }).status)).map((l) => `lane-${l.lane}`);
+    if (unhooked.length) log(`⚠ core.hooksPath is not .githooks in ${unhooked.length} lane(s) (${unhooked.slice(0, 5).join(', ')}${unhooked.length > 5 ? ', …' : ''}) — the pre-commit guards do not run there; \`provision\`/\`refresh\`/\`acquire\` sets it.`);
+    const r = laneIdentityReport({ lanes, readIn: (dir) => readGitIdentity(dir, { env }), lists: resolveGitIdentityPlaceholders() });
+    if (r.status === 'ok') return;
+    const shown = r.bad.slice(0, 3).map((b) => `lane-${b.lane}: ${b.detail}`).join(' | ');
+    log(`⚠ git identity ${r.status.toUpperCase()} in ${r.bad.length} lane(s) — commits there would carry it (the lane pre-commit guard refuses them). ${shown}${r.bad.length > 3 ? ' | …' : ''}`);
+    log(`  ${GIT_IDENTITY_FIX_HINT}`);
+  } catch { /* a reporting aid never breaks status */ }
 }
 
 // ── list --acquirable: single-flight + short result cache (#xn432dz) ─────────────────────────────────
