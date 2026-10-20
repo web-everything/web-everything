@@ -404,11 +404,11 @@ export function evaluateNeedsYourMerge(pr, { files, changedFiles } = {}) {
 
 /**
  * Card 334 — the one command the operator runs for a needs-your-merge row. Pure. It goes through
- * `we:scripts/run-fresh.mjs`, which runs it from a fresh lane at origin/main, so it works from any checkout of the
- * repo however far behind origin/main that checkout is.
+ * an explicit fast-forward update so even a checkout predating `we:scripts/run-fresh.mjs` gets the launcher.
+ * The launcher then runs it from a fresh lane at origin/main. A failed update stops before the operation runs.
  */
 export function needsYourMergeCommand({ repo, number }) {
-  return `node scripts/run-fresh.mjs land-human-only --pr=${number} --repo=${repo} --actor=<your login> `
+  return `git pull --ff-only origin main && node scripts/run-fresh.mjs land-human-only --pr=${number} --repo=${repo} --actor=<your login> `
     + "--channel=<where you said it> --reason='<your words>'";
 }
 

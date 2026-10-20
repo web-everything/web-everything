@@ -629,8 +629,8 @@ export function resolveOperation(name, opts = {}) {
   if (typeof build !== 'function') {
     throw new Error(
       `operations: no operation named ${JSON.stringify(name)} (known: ${Object.keys(OPERATIONS).sort().join(', ')})`
-      + ' — if this checkout is behind origin/main, update it, or run the operation from a fresh lane at origin/main:'
-      + ` node scripts/run-fresh.mjs ${JSON.stringify(String(name ?? ''))} …`,
+      + ' — if this checkout is behind origin/main, update it with `git pull --ff-only origin main`.'
+      + ' After updating, land-human-only can run from a fresh lane: node scripts/run-fresh.mjs land-human-only …',
     );
   }
   // `finish` is OPTIONAL (most builders omit it): a per-operation post-process over `runOperationCli`'s

@@ -42,6 +42,21 @@ const opts = (spawn) => ({
 });
 
 describe('run-fresh', () => {
+  it.each([
+    ['restart-runner'],
+    ['restart-runner', '--checkout=/stable', '--supervisor=/stable/supervisor.mjs'],
+    ['restart-runner', '--dry-run=true'],
+    ['dispatch-lane'],
+    ['review-pr'],
+    ['future-detached-operation'],
+    ['../operations/restart-runner'],
+  ])('refuses unaudited operation %s before leasing or starting workers', async (...argv) => {
+    const { spawn, calls } = fakeSpawn();
+    const messages = [];
+    expect(await runFresh(argv, { ...opts(spawn), log: (message) => messages.push(message) })).toBe(1);
+    expect(calls).toEqual([]);
+    expect(messages.join('\n')).toMatch(/only supports land-human-only.*detached/i);
+  });
   it('parses only a complete acquire payload', () => {
     expect(parseAcquire(JSON.stringify(lease))).toEqual(lease);
     expect(parseAcquire('{"lane":7,"path":"/x"}')).toBeNull();
@@ -95,7 +110,7 @@ describe('run-fresh', () => {
       if (args[1] === 'acquire') proc.emit('SIGTERM');
       return result;
     };
-    expect(await runFresh(['probe'], { ...opts(wrapped), proc })).toBe(143);
+    expect(await runFresh(['land-human-only'], { ...opts(wrapped), proc })).toBe(143);
     expect(calls.some((c) => String(c.args[0]).endsWith('run.mjs'))).toBe(false);
     expect(calls.at(-1).args[1]).toBe('release');
     expect(proc.listenerCount('SIGTERM')).toBe(0);
@@ -111,7 +126,7 @@ describe('run-fresh', () => {
       });
       return child;
     };
-    expect(await runFresh(['probe'], { ...opts(spawn), spawnOperation, proc })).toBe(1);
+    expect(await runFresh(['land-human-only'], { ...opts(spawn), spawnOperation, proc })).toBe(1);
     expect(calls.at(-1).args[1]).toBe('release');
     expect(['SIGINT', 'SIGTERM', 'SIGHUP'].map((s) => proc.listenerCount(s))).toEqual([0, 0, 0]);
   });
@@ -149,7 +164,7 @@ describe('run-fresh', () => {
           if (args[1] === 'release') { console.log('LANE RELEASED'); return { status: 0 }; }
           throw new Error('unexpected fixture command');
         };
-        process.exitCode = await runFresh(['probe'], { spawn, root: ${JSON.stringify(dir)}, log: () => {} });
+        process.exitCode = await runFresh(['land-human-only'], { spawn, root: ${JSON.stringify(dir)}, log: () => {} });
       `);
       wrapper = spawnChild(process.execPath, [runner], { stdio: ['ignore', 'pipe', 'pipe'] });
       watchdog = setTimeout(stopFixture, 3000);
@@ -227,7 +242,7 @@ describe('run-fresh', () => {
           if (args[1] === 'release') { console.log('LANE RELEASED'); return { status: 0 }; }
           return spawnSync(cmd, args, { ...opts, detached: process.platform !== 'win32' });
         };
-        process.exitCode = await runFresh(['probe'], { spawn, root: ${JSON.stringify(dir)}, log: () => {} });
+        process.exitCode = await runFresh(['land-human-only'], { spawn, root: ${JSON.stringify(dir)}, log: () => {} });
       `);
       child = spawnChild(process.execPath, [runner], { stdio: ['ignore', 'pipe', 'pipe'] });
       watchdog = setTimeout(stopFixture, 3000);
