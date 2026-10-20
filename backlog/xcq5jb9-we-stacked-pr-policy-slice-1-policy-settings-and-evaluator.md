@@ -10,7 +10,7 @@ tags: []
 
 # we: stacked PR policy slice 1 - policy settings and evaluator
 
-Add every stacking value as a cascade setting with its source logged in we:scripts/settings/stack.json (matrix cells, safety floor, urgent classes, smallChildMaxLines 50, lowRiskClasses, maxDepth 1, onBaseHeadMove, base-closed handling) and a pure evaluator in we:scripts/lib/stack-policy.mjs that returns stack or no-stack for a base state and child class. Ruled in xv85eqi.
+Add every stacking value as a cascade setting with its source logged in we:scripts/settings/stack.json (matrix cells, safety floor, urgent classes, smallChildMaxLines 50, lowRiskClasses, maxDepth 1, onBaseHeadMove, base-closed handling) and a pure evaluator in we:scripts/lib/stack-policy.mjs that returns stack or no-stack for a base state and child class (plus the two PRs' actor and lane-trust facts for the identity rule). Ruled in xv85eqi.
 
 ## Acceptance
 
@@ -25,7 +25,11 @@ Add every stacking value as a cascade setting with its source logged in we:scrip
   - `untrusted text: child size is measured from the diff; a size claimed in the PR body or card text is ignored`.
   - `truncated read: an unreadable base state returns no-stack`.
   - `truncated read: an unreadable or truncated file list returns no-stack`.
-  - `shared state: every stack value is read from we:scripts/settings/stack.json and the evaluator writes no settings file`.
+  - `shared state: stack values resolve through the cascade with we:scripts/settings/stack.json as their tool layer, and the evaluator writes no settings file`.
+  - `maxDepth: with the default of 1, a base that is itself stacked on another open PR returns no-stack`.
+  - `smallChildMaxLines: with the default of 50, a 50-line child counts as small and a 51-line child does not`.
+  - `emergency: an emergency flag set by an agent (a label, PR body text, or an agent-sourced setting) is ignored`.
+  - `emergency: an operator-flagged emergency lets a normal child stack on an in-review or fixing base`.
   - `identity: a base PR by a different actor returns no-stack`.
   - `identity: a base or child that is not a trusted lane PR returns no-stack`.
   - `state over time: the evaluator is pure; the same inputs give the same result, and a different base state at call time gives the result for that state`.
@@ -42,7 +46,7 @@ One line per class: either the handling, or `n/a: <why>`.
 
 1. **Untrusted text** — the child's size and class are read from the diff and touched paths by code, never from the PR body or card text.
 2. **Truncated reads** — an unreadable base state or file list returns no-stack.
-3. **Shared state files** — settings stay in we:scripts/settings/stack.json; no other feature edits it in this slice.
+3. **Shared state files** — settings stay in we:scripts/settings/stack.json (the cascade's tool layer); the evaluator writes no settings file.
 4. **Fail closed** — unknown state, unknown class or missing gate means no stacking.
 5. **Identity scoping** — a stack relation counts only between trusted lane PRs of the same actor.
 6. **State over time** — the evaluator is pure and takes the base state at call time; callers re-evaluate when the base moves.

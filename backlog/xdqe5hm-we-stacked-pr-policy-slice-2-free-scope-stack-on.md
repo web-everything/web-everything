@@ -26,7 +26,8 @@ Add --stack-on=<n> to free-scope: derive the base PR chain, ask the stack policy
   - `stack-on: the chain and class come from API data and the diff; PR body text naming another base or class is ignored`.
   - `stack-on: a truncated or failed PR list fails closed to OCCUPIED`.
   - `stack-on: a truncated file list fails closed to OCCUPIED`.
-  - `stack-on: the agent-scope registry is read and never written`.
+  - `stack-on: the call writes no file; the agent-scope registry is only read`.
+  - `stack-on: with maxDepth 1, a base PR that is itself stacked on another open PR reports OCCUPIED`.
   - `stack-on: an unknown base state, unknown class or missing policy reports OCCUPIED`.
   - `stack-on: a chain member by a different actor is not excluded and the file reports OCCUPIED`.
   - `stack-on: a chain member that is not a trusted lane PR is not excluded and the file reports OCCUPIED`.

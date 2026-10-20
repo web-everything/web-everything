@@ -32,6 +32,7 @@ When a stacked child's base PR is closed or rejected, rebase a low-risk child on
   - `shared state: a child sent to the operator is posted on the existing needs-you channel and no new shared file is written`.
   - `identity: a child or base PR by a different actor goes to the operator`.
   - `identity: a child or base that is not a trusted lane PR goes to the operator`.
+  - `state over time: the decision uses the base and child state read when the base closes, never an earlier cached read`.
   - `state over time: reopening a closed base re-evaluates the child at reopen time instead of reusing the close-time decision`.
   - `who wrote it: an automation's comment marking a child low-risk does not make it low-risk`.
 

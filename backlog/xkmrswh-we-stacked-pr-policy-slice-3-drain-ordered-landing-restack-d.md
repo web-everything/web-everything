@@ -34,10 +34,10 @@ Make the drain land a policy-stacked child only after its base, restack the chil
   - `onBaseHeadMove setting set to a different value changes the behaviour (not a constant)`.
   - `untrusted text: fingerprint and touched files come from git data; PR text naming other files or a fingerprint is ignored`.
   - `shared state: the drain reads its own keys from we:scripts/settings/pr-stack.json and writes no key to we:scripts/settings/stack.json`.
-  - `identity: a base and child by different actors are not treated as a stack (no held landing, no restack)`.
-  - `identity: a base or child that is not a trusted lane PR is not treated as a stack`.
-  - `state over time: each base move re-evaluates the cell and fingerprint at that moment; a cell that became no-stack since the last move holds the child`.
-  - `who wrote it: an automation's own comment never moves the hold marker`.
+  - `identity: a base and child by different actors get no policy-stack treatment (no restack, no carried marker) and the child stays held by the existing lane-base guard`.
+  - `identity: a base or child that is not a trusted lane PR gets no policy-stack treatment and the child stays held by the existing lane-base guard`.
+  - `state over time: each base move re-evaluates the cell and fingerprint at that moment, never reusing the values from an earlier move`.
+  - `who wrote it: a hold marker echoed inside another automation's comment (e.g. a juror), placed mid-comment, or posted by an untrusted author is ignored; only the hold comment's own exact shape counts`.
 
 ## Non-goals
 
@@ -53,4 +53,4 @@ One line per class: either the handling, or `n/a: <why>`.
 4. **Fail closed** — an unknown base head, a failed restack or a missing gate holds the child.
 5. **Identity scoping** — the relation counts only between trusted lane PRs of the same actor, as we:scripts/conveyor/review-stack-base.mjs already requires.
 6. **State over time** — every base move re-evaluates the cell and the fingerprint at that moment.
-7. **Who wrote it** — an automation's own comment never moves the hold marker.
+7. **Who wrote it** — only the hold comment's own exact shape from a trusted author moves the hold marker (as `parseStackMarkers` in we:scripts/conveyor/review-stack-base.mjs already requires); a marker echoed in another automation's comment is ignored.
