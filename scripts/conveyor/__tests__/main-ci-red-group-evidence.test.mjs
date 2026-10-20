@@ -15,13 +15,17 @@ const settings = core.mainCiRedSettings(isolated);
 const find = (extra = {}) => core.findMergeGroupFlakeEvidence({ groupRuns: [group], tipSha,
   failedJobs: ['integration', 'test'], jobsOf: (id) => episode.jobs[id] ?? null, settings, ...extra });
 
+const isGroupList = (args) => args[0] === 'api' && /actions\/runs\?event=merge_group/.test(String(args[1]));
 function host(t = '2026-10-14T06:26:00Z', overrides = {}) {
   return vi.fn((bin, args) => {
     if (args[0] === 'run' && args.includes('--branch')) return JSON.stringify(overrides.mainRuns ?? episode.mainRuns);
-    if (args[0] === 'run' && args.includes('--event')) {
+    if (isGroupList(args)) {
       if (overrides.groupError) throw new Error('unreadable groups');
-      return JSON.stringify((overrides.groupRuns ?? episode.mergeGroupRuns).filter((r) => Date.parse(r.createdAt) <= Date.parse(t))
-        .map((r) => Date.parse(r.updatedAt) > Date.parse(t) ? { ...r, status: 'in_progress', conclusion: null } : r));
+      // The REST runs endpoint shape (merge-group runs are not listed under `--workflow ci.yml`, live 2026-10-20).
+      return JSON.stringify({ workflow_runs: (overrides.groupRuns ?? episode.mergeGroupRuns).filter((r) => Date.parse(r.createdAt) <= Date.parse(t))
+        .map((r) => Date.parse(r.updatedAt) > Date.parse(t) ? { ...r, status: 'in_progress', conclusion: null } : r)
+        .map((r) => ({ id: r.databaseId, status: r.status, conclusion: r.conclusion, created_at: r.createdAt, updated_at: r.updatedAt,
+          head_branch: r.headBranch, head_sha: r.headSha, event: 'merge_group', run_attempt: r.attempt, path: '.github/workflows/ci.yml' })) });
     }
     const path = args[1];
     const jobs = /\/runs\/(\d+)\/jobs/.exec(path);
@@ -94,7 +98,7 @@ describe('card 303 merge-group evidence', () => {
     try {
       const exec = host();
       probe(exec, { ...isolated, mainCiRedMergeGroupFlakeEvidence: true });
-      expect(exec.mock.calls.filter(([, args]) => args.includes('--event'))).toHaveLength(1);
+      expect(exec.mock.calls.filter(([, args]) => isGroupList(args))).toHaveLength(1);
       expect(exec.mock.calls.filter(([, args]) => args[1]?.endsWith('/commits/main'))).toHaveLength(1);
       expect(log).toHaveBeenCalledWith(expect.stringContaining('source health)'));
       const candidates = [0, 1, 2].map((i) => ({ ...group, databaseId: 42 + i, updatedAt: `2026-10-14T06:2${5 - i}:00Z` }));
@@ -104,7 +108,7 @@ describe('card 303 merge-group evidence', () => {
       for (const config of [{ ...isolated, mainCiRedMergeGroupFlakeEvidence: false }, { ...isolated, mainCiRedFlakeRerun: false }]) {
         const off = host();
         probe(off, config);
-        expect(off.mock.calls.some(([, args]) => args.includes('--event'))).toBe(false);
+        expect(off.mock.calls.some(([, args]) => isGroupList(args))).toBe(false);
       }
       for (const overrides of [{ groupError: true }, { jobsError: true }, { incomplete: true }, { tipSha: 'a'.repeat(40) }]) {
         expect(probe(host(undefined, overrides)).failing.flake.eligible).toBe(false);

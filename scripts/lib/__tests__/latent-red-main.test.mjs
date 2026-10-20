@@ -1,0 +1,80 @@
+// @vitest-environment node
+import { describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { detectLatentRedMain, listMergeGroupCiRuns, runLatentRedMainCheck } from '../latent-red-main.mjs';
+
+const T = 'scripts/lib/__tests__/ledger-readiness-drain-facts.test.mjs > replay reports before, after';
+const TIP = 'f'.repeat(40);
+const run = (id, conclusion, extra = {}) => ({ databaseId: id, status: 'completed', conclusion, createdAt: new Date(1e12 + id * 1000).toISOString(), headBranch: `gh-readonly-queue/main/pr-${id}-abc`, ...extra });
+const rest = (r, path = '.github/workflows/ci.yml') => ({ id: r.databaseId, status: r.status, conclusion: r.conclusion, created_at: r.createdAt, head_branch: r.headBranch, head_sha: r.headSha ?? 'a'.repeat(40), event: 'merge_group', run_attempt: 1, path });
+
+describe('detectLatentRedMain (live 2026-10-20: every merge group failed on one expired-fixture test)', () => {
+  const fails = { 3: [T, 'x'], 2: [T], 1: [T, 'y'] };
+  const failuresOf = (r) => fails[r.databaseId] ?? null;
+  const runs = [run(3, 'failure'), run(2, 'failure'), run(1, 'failure')];
+  it('fires when the newest N completed runs fail on a shared test', () => {
+    expect(detectLatentRedMain({ runs, threshold: 3, failuresOf })).toMatchObject({ fire: true, tests: [T], runIds: [3, 2, 1], prs: [3, 2, 1] });
+  });
+  it('skips in-progress and cancelled runs; a success ends the streak', () => {
+    const mixed = [run(9, null, { status: 'in_progress' }), run(8, 'cancelled'), ...runs];
+    expect(detectLatentRedMain({ runs: mixed, threshold: 3, failuresOf }).fire).toBe(true);
+    expect(detectLatentRedMain({ runs: [run(3, 'failure'), run(2, 'success'), run(1, 'failure')], threshold: 2, failuresOf }).fire).toBe(false);
+  });
+  it('fails closed: no shared test, an unreadable run, too short a streak, or off', () => {
+    expect(detectLatentRedMain({ runs, threshold: 3, failuresOf: (r) => [`t${r.databaseId}`] }).fire).toBe(false);
+    expect(detectLatentRedMain({ runs, threshold: 3, failuresOf: (r) => (r.databaseId === 2 ? null : [T]) }).fire).toBe(false);
+    expect(detectLatentRedMain({ runs: runs.slice(0, 2), threshold: 3, failuresOf }).fire).toBe(false);
+    expect(detectLatentRedMain({ runs, threshold: 0, failuresOf }).reason).toBe('off');
+  });
+});
+
+describe('listMergeGroupCiRuns', () => {
+  it('reads the REST runs endpoint and keeps only the CI workflow path, newest first', () => {
+    const exec = vi.fn(() => JSON.stringify({ workflow_runs: [rest(run(1, 'failure')), rest(run(2, 'failure'), '.github/workflows/merge-gate.yml'), rest(run(3, 'success'))] }));
+    expect(listMergeGroupCiRuns({ repo: 'o/r', exec }).map((r) => r.databaseId)).toEqual([3, 1]);
+    expect(exec.mock.calls[0][1]).toEqual(['api', 'repos/o/r/actions/runs?event=merge_group&per_page=100']);
+  });
+});
+
+describe('runLatentRedMainCheck', () => {
+  const host = ({ mainConclusion = 'success', rerunThrows = false } = {}) => vi.fn((bin, args) => {
+    const a = args.join(' ');
+    if (a.includes('event=merge_group')) return JSON.stringify({ workflow_runs: [3, 2, 1].map((n) => rest(run(n, 'failure'))) });
+    if (a.includes('event=push')) return JSON.stringify({ workflow_runs: [{ ...rest(run(7, mainConclusion)), event: 'push', head_sha: TIP }] });
+    if (/runs\/\d+\/jobs/.test(a)) return JSON.stringify({ jobs: [{ id: 50, name: 'test-shard (1)', conclusion: 'failure' }, { id: 51, name: 'test', conclusion: 'failure' }] });
+    if (a.endsWith('/logs')) return `2026-10-20T07:00:00Z FAIL  ${T.split(' > ')[0]} > ${T.split(' > ')[1]}\n`;
+    if (a.includes('commits/main')) return TIP;
+    if (args[0] === 'run' && args[1] === 'rerun') { if (rerunThrows) throw new Error('HTTP 403'); return ''; }
+    throw new Error(`unexpected ${a}`);
+  });
+  const withDir = (fn) => { const d = mkdtempSync(join(tmpdir(), 'lrm-')); try { return fn(join(d, 'l.json')); } finally { rmSync(d, { recursive: true, force: true }); } };
+  it('re-runs main tip\'s green CI once and publishes one needs-you event', () => withDir((ledgerPath) => {
+    const exec = host(); const publish = vi.fn(); const lines = [];
+    const first = runLatentRedMainCheck({ repo: 'o/r', exec, threshold: 3, ledgerPath, publish, log: (l) => lines.push(l) });
+    expect(first).toMatchObject({ fired: true, action: 'rerun-main', detail: { rerun: 'requested' } });
+    expect(exec.mock.calls.filter(([, a]) => a[0] === 'run' && a[1] === 'rerun').map(([, a]) => a)).toEqual([['run', 'rerun', '7', '--repo', 'o/r']]);
+    expect(publish).toHaveBeenCalledWith(expect.objectContaining({ kind: 'latent-red-main', head: `latent-red-main:${TIP}` }));
+    expect(lines.join('\n')).toContain('drain.latentRedMainRuns=3 (standard)');
+    expect(JSON.parse(readFileSync(ledgerPath, 'utf8')).acted[TIP]).toMatchObject({ mainRun: 7, rerun: 'requested' });
+    expect(runLatentRedMainCheck({ repo: 'o/r', exec, threshold: 3, ledgerPath, publish, log: () => {} }).action).toBe('already-acted');
+    expect(exec.mock.calls.filter(([, a]) => a[1] === 'rerun')).toHaveLength(1);
+    expect(publish).toHaveBeenCalledTimes(1);
+  }));
+  it('leaves an already-red main to the red-main machinery, and dry run writes nothing', () => withDir((ledgerPath) => {
+    const exec = host({ mainConclusion: 'failure' });
+    expect(runLatentRedMainCheck({ repo: 'o/r', exec, threshold: 3, ledgerPath, publish: () => {}, log: () => {} }).action).toBe('main-already-red');
+    expect(exec.mock.calls.some(([, a]) => a[1] === 'rerun')).toBe(false);
+    const dry = host();
+    expect(runLatentRedMainCheck({ repo: 'o/r', exec: dry, threshold: 3, ledgerPath: `${ledgerPath}.dry`, dryRun: true, log: () => {} })).toMatchObject({ fired: true, action: 'rerun-main' });
+    expect(dry.mock.calls.some(([, a]) => a[1] === 'rerun')).toBe(false);
+  }));
+  it('retries a refused re-run next pass and never throws on unreadable reads', () => withDir((ledgerPath) => {
+    const exec = host({ rerunThrows: true });
+    expect(runLatentRedMainCheck({ repo: 'o/r', exec, threshold: 3, ledgerPath, publish: () => {}, log: () => {} }).detail.rerun).toMatch(/^failed/);
+    expect(runLatentRedMainCheck({ repo: 'o/r', exec, threshold: 3, ledgerPath, publish: () => {}, log: () => {} }).action).toBe('rerun-main');
+    expect(runLatentRedMainCheck({ repo: 'o/r', exec: () => { throw new Error('rate'); }, threshold: 3, ledgerPath, log: () => {} }).action).toBe('error');
+    expect(runLatentRedMainCheck({ repo: 'o/r', exec, threshold: 0, ledgerPath, log: () => {} }).action).toBe('off');
+  }));
+});

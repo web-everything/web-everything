@@ -218,7 +218,8 @@ import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overla
 import { filterEnqueueableOverlapRows, resolveOverlapYieldOnlyToEnqueueableSetting, formatOverlapYieldOnlyToEnqueueableSetting, resolveOverlapYieldRequiresLandableSetting, formatOverlapYieldRequiresLandableSetting } from './conveyor/overlap-yield-enqueueable.mjs';
 import { rankByDeliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES } from './lib/delivery-priority.mjs'; // drain order (2026-10-10): the shared P0-P4 class rule
 import { readDeliveryPrioritySettings } from './conveyor/delivery-priority-shadow.mjs'; // drain order: the shared aging/cap settings (platform preference `deliveryPriority`)
-import { execFileSyncThrottled } from './lib/gh-throttle.mjs'; // drain order: the operator-override labeler read
+import { execFileSyncThrottled } from './lib/gh-throttle.mjs';
+import { runLatentRedMainCheck, loadNeedsYouPublisher } from './lib/latent-red-main.mjs'; // drain order: the operator-override labeler read
 import { resolveCascade, platformPreference } from './lib/policy-cascade.mjs'; // drain order: `drain.order` / `drain.priorityMode` via the shared cascade
 import { readSettings as readDeclaredDrainSettings } from './lib/settings-files.mjs'; // drain order: the tool layer (`drain` block of the declared settings)
 import { CONSTELLATION_REPOS, canonicalizeSlug, repoKeyForSlug } from './lib/constellation-repos.mjs';
@@ -5097,6 +5098,14 @@ async function runCli() {
   const drainHeavyCacheByRepo = new Map(); // Reuse heavy fields across --watch passes.
   const sweepOnce = async () => {
   throughput = resolveDrainThroughput();
+  // Latent red main: a full pass (never a single-PR fast drain) checks whether the newest merge groups all fail on
+  // the same test; if so it re-runs main tip's green CI once, so the existing red-main machinery can see it.
+  if (onlyPr == null && localSlug && !process.env.VITEST && !process.env.WE_UNDER_TEST) {
+    await loadNeedsYouPublisher();
+    runLatentRedMainCheck({ repo: localSlug, dryRun: DRY_RUN, threshold: throughput.value.latentRedMainRuns,
+      source: throughput.sources?.latentRedMainRuns || 'standard',
+      exec: (cmd, args, opts) => execFileSyncThrottled(cmd, args, { ...opts, throttle: { op: 'latent-red-main' } }) });
+  }
   const prestageSetting = resolvePrestageSettings({ log: line => process.stderr.write(`${line}\n`) });
   // Prepared admission is still a candidate selection: honor the same resolved repo set and
   // operator label/base filters as listOne before consuming (or invalidating) a cached preparation.
