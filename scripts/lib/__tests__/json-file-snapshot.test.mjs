@@ -1,16 +1,19 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, utimesSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readJsonSnapshot, clearJsonSnapshots } from '../json-file-snapshot.mjs';
 import { readStore, readStoreShared } from '../../conveyor/run-scorecard-store.mjs';
 
-const old = (path) => { const t = new Date(Date.now() - 60_000); utimesSync(path, t, t); };
+// ctime cannot be set back, so "settled" is reached by moving the clock this module reads forward.
+const realNow = Date.now.bind(Date);
+const settle = () => { const at = realNow() + 60_000; vi.spyOn(Date, 'now').mockReturnValue(at); };
+const old = () => settle();
 
 describe('readJsonSnapshot (xwu9oxh S2a)', () => {
   let dir;
   beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'json-snap-')); clearJsonSnapshots(); });
-  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  afterEach(() => { vi.restoreAllMocks(); rmSync(dir, { recursive: true, force: true }); });
 
   it('reuses one frozen parse while the settled file is unchanged', () => {
     const p = join(dir, 's.json');
@@ -28,10 +31,11 @@ describe('readJsonSnapshot (xwu9oxh S2a)', () => {
     writeFileSync(p, JSON.stringify({ records: [1] }));
     old(p);
     const first = readJsonSnapshot(p).value;
+    expect(readJsonSnapshot(p).value).toBe(first);
     writeFileSync(`${p}.tmp`, JSON.stringify({ records: [2] }));
-    old(`${p}.tmp`);
     renameSync(`${p}.tmp`, p);
     expect(readJsonSnapshot(p).value.records).toEqual([2]);
+    readJsonSnapshot(p);
     writeFileSync(p, JSON.stringify({ records: [3] }));
     expect(readJsonSnapshot(p).value.records).toEqual([3]);
     expect(first.records).toEqual([1]);
@@ -41,6 +45,32 @@ describe('readJsonSnapshot (xwu9oxh S2a)', () => {
     const p = join(dir, 's.json');
     writeFileSync(p, JSON.stringify({ records: [1] }));
     expect(readJsonSnapshot(p).value).not.toBe(readJsonSnapshot(p).value);
+  });
+
+  it('a mtime set back by a writer is still caught by ctime', () => {
+    const p = join(dir, 's.json');
+    writeFileSync(p, JSON.stringify({ records: [1] }));
+    const t = new Date(realNow() - 60_000);
+    utimesSync(p, t, t);
+    expect(readJsonSnapshot(p).value).not.toBe(readJsonSnapshot(p).value);
+  });
+
+  it('an open error after a cached read is thrown, not hidden by the cache', () => {
+    const p = join(dir, 's.json');
+    writeFileSync(p, JSON.stringify({ records: [1] }));
+    old(p);
+    readJsonSnapshot(p);
+    rmSync(p);
+    expect(() => readJsonSnapshot(p)).toThrow(expect.objectContaining({ code: 'ENOENT' }));
+  });
+
+  it('freezes deeply nested values without overflowing the stack', () => {
+    const p = join(dir, 's.json');
+    writeFileSync(p, `{"records":[{"q":1,"deep":${'['.repeat(20000)}${']'.repeat(20000)}}]}`);
+    old(p);
+    expect(readStore({ path: p }).records.map((r) => r.q)).toEqual([1]);
+    expect(readStoreShared({ path: p }).records.map((r) => r.q)).toEqual([1]);
+    expect(Object.isFrozen(readStoreShared({ path: p }).records[0].deep)).toBe(true);
   });
 
   it('throws read errors as is and returns parse errors, never cached', () => {
