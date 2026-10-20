@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createActionStore } from '../../operations/action-store.mjs';
+import { publishAttention, runOnce as pollNeedsYou, unacknowledged, acknowledge } from '../../operations/needs-you-feed.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord, tryReadRun, writeRun } from '../../operations/run-store.mjs';
@@ -614,6 +615,69 @@ describe('same-head hold never silences a review whose verdict never landed (liv
     const res = `${repo}#pr:1`;
     const storeAt = (dir, t) => createActionStore({ root: needsYouClaimRoot(dir), now: () => t });
     const raise = (dir, t, o = {}) => raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: o.hold ?? exhausted(T0), dir, now: t, log: o.log ?? vi.fn(), publish: o.publish, store: o.store, beforePublish: o.beforePublish });
+    it('keeps the exhausted-hold alert visible across successful queue polls after its claim settles', async () => {
+      const dir = temp(), path = join(dir, 'events.jsonl');
+      const publish = vi.fn(item => publishAttention(item, { path, now: T0 }));
+      expect(raise(dir, T0, { publish })).toBe(true);
+      expect(storeAt(dir, T0).attempts(res)).toEqual([
+        expect.objectContaining({ state: 'terminal', outcome: 'settled' }),
+      ]);
+      const poll = report => pollNeedsYou({
+        checkoutRoot: join(dir, 'workspace/.lanes/we/lane-1'),
+        env: { WE_NEEDS_YOU_FEED: path }, now: T0 + 1, log: vi.fn(),
+        exec: () => JSON.stringify(report),
+      });
+      // The queue cannot represent review-no-verdict, even in a complete successful report.
+      for (const report of [{ ready: [] }, { ready: [], incomplete: true }, { ready: [] }]) {
+        expect((await poll(report)).lines).toEqual([]);
+        expect(unacknowledged({ path })).toEqual([
+          expect.objectContaining({ repo, pr: 1, head, kind: 'review-no-verdict' }),
+        ]);
+      }
+      expect(raise(dir, T0 + 2, { publish })).toBe(false);
+      expect(publish).toHaveBeenCalledTimes(1);
+      acknowledge({ path });
+      expect((await poll({ ready: [] })).lines).toEqual([]);
+      expect(unacknowledged({ path })).toEqual([]);
+    });
+    it.each(['review-no-verdict', 'disk-space'])('preserves event-only %s publication during a queue read and dedupes later publications', async kind => {
+      const dir = temp(), path = join(dir, 'events.jsonl');
+      const item = { repo, pr: 1, head, kind, reason: 'operator attention needed' };
+      const poll = () => pollNeedsYou({
+        checkoutRoot: join(dir, 'workspace/.lanes/we/lane-1'),
+        env: { WE_NEEDS_YOU_FEED: path }, now: T0 + 1, log: vi.fn(),
+        exec: () => {
+          // The report is collected outside the feed lock; a second producer can publish meanwhile.
+          publishAttention(item, { path, now: T0 });
+          return JSON.stringify({ ready: [] });
+        },
+      });
+      expect((await poll()).lines).toEqual([]);
+      expect((await poll()).lines).toEqual([]);
+      expect(unacknowledged({ path })).toEqual([expect.objectContaining(item)]);
+      // The unclaimed fallback also uses publishAttention on every tick: no duplicate event.
+      expect(publishAttention(item, { path, now: T0 + 2 }).lines).toEqual([]);
+      acknowledge({ path });
+      expect((await poll()).lines).toEqual([]);
+      expect(unacknowledged({ path })).toEqual([]);
+    });
+    it.each([
+      ['ready', {}], ['needsYourMerge', {}], ['rulingNeeded', {}],
+      ['rulingNeeded', { reason: 'round-cap' }], ['rulingNeeded', { reason: 'dispute' }],
+      ['stoodDown', {}], ['needsPerson', {}],
+    ])('still clears resolved report-owned alerts from %s (%j)', async (field, extra) => {
+      const dir = temp(), path = join(dir, 'events.jsonl');
+      const poll = report => pollNeedsYou({
+        checkoutRoot: join(dir, 'workspace/.lanes/we/lane-1'),
+        env: { WE_NEEDS_YOU_FEED: path }, now: T0, log: vi.fn(),
+        exec: () => JSON.stringify(report),
+      });
+      expect((await poll({ ready: [], [field]: [{ repo, number: 1, head, ...extra }] })).lines).toHaveLength(1);
+      const resolved = await poll({ ready: [] });
+      expect(resolved.lines).toHaveLength(1);
+      expect(resolved.lines[0]).toMatch(/^NEEDS-YOU-CLEARED /);
+      expect(unacknowledged({ path })).toEqual([]);
+    });
     it('at-least-once (operator ruling), deduped in the normal path: once across ticks, again for a new head; claim settled in the ledger', () => {
       const dir = temp(), log = vi.fn(), post = vi.fn(), publish = vi.fn(), p = labelled(['review:pending']), held = exhausted(T0);
       for (let i = 0; i < 4; i++) notifyReferralHold({ repo, prNumber: p.number, pr: p, hold: held, dir, post, log, now: T0 + i, publishNeedsYou: publish });
