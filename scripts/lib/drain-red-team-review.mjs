@@ -38,7 +38,8 @@ export function runDrainRedTeamJob({ pr, repo, drainRedTeamRequest: request, pre
     if (!lanePath) return result({ outcome: 'deferred-no-lane' });
     io.updateRecord?.({ ...record, cwd: lanePath, actorId });
     if (!ready()) return result({ outcome: 'deferred' });
-    const input = { pr: planned.pr, repo: planned.repo, lanePath, loopPayload, slug };
+    // ready() just read a live review:accepted on request.head: the pass owes this accepted head (redTeamOwedForPass).
+    const input = { pr: planned.pr, repo: planned.repo, lanePath, loopPayload: { ...loopPayload, acceptedPrHead: request.head.toLowerCase() }, slug };
     io.redTeamStatus?.({ ...input, status: 'running' });
     const redTeam = io.runRedTeam(input);
     if (['ran', 'resumed', 'already-ran'].includes(redTeam?.status) && redTeam.callId) {

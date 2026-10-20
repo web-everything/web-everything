@@ -54,6 +54,21 @@ export function redTeamOwedForAcceptedPr(loopPayload) {
     && /^[a-f0-9]{40}$/i.test(loopPayload?.findings?.read?.netBasis?.rev ?? ''));
 }
 
+/**
+ * The red-team pass's own owed gate: a panel accept ({@link redTeamOwedFor}), or a drain request for an accepted PR.
+ * `acceptedPrHead` is stamped only by the drain request consumer after it read a live `review:accepted` on that exact
+ * head; it counts only when it names the payload's pinned head. Live gap #5549: the consumer ran, the pass said
+ * `not-owed`, and the head stayed red-team-pending.
+ * @param {object|null} loopPayload
+ * @returns {boolean}
+ */
+export function redTeamOwedForPass(loopPayload) {
+  if (redTeamOwedFor(loopPayload)) return true;
+  const rev = loopPayload?.findings?.read?.netBasis?.rev;
+  return typeof loopPayload?.acceptedPrHead === 'string' && typeof rev === 'string'
+    && loopPayload.acceptedPrHead.toLowerCase() === rev.toLowerCase() && redTeamOwedForAcceptedPr(loopPayload);
+}
+
 
 /** A pinned reviewed head owes the panel seat regardless of the panel verdict. */
 export function redTeamPanelSeatOwed(loopPayload, env = process.env) {

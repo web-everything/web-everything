@@ -26,13 +26,14 @@ describe('drain request through the review job red-team path', () => {
     payload.verdict = { verdict: 'needs-human' };
     const result = runReviewJob({ ...request, drainRedTeamRequest: request }, io);
     expect(result.outcome).toBe('ran');
-    expect(io.runRedTeam).toHaveBeenCalledWith(expect.objectContaining({ loopPayload: payload }));
+    // The consumer stamps the head it just read as live-accepted; the pass's owed gate accepts only that head.
+    expect(io.runRedTeam).toHaveBeenCalledWith(expect.objectContaining({ loopPayload: { ...payload, acceptedPrHead: request.head } }));
     expect(io.finishDrainRedTeamRequest).toHaveBeenCalledWith(request);
   });
   it('uses the existing exact-head review and finishes only after saving provenance', () => {
     const { io, payload } = fixture();
     runReviewJob({ ...request, drainRedTeamRequest: request }, io);
-    expect(io.runRedTeam.mock.calls[0][0].loopPayload).toBe(payload);
+    expect(io.runRedTeam.mock.calls[0][0].loopPayload).toEqual({ ...payload, acceptedPrHead: request.head });
     expect(io.recordSavedRedTeamResult).toHaveBeenCalledWith(expect.objectContaining({ runId: payload.runId, head: request.head }));
     expect(io.finishDrainRedTeamRequest).toHaveBeenCalledWith(request);
     expect(io.recordSavedRedTeamResult.mock.invocationCallOrder[0]).toBeLessThan(io.finishDrainRedTeamRequest.mock.invocationCallOrder[0]);

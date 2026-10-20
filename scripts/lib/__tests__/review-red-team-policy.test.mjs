@@ -1,5 +1,20 @@
 import { describe, it, expect } from 'vitest';
-import { redTeamOwedForAcceptedPr, redTeamOwedOnHead } from '../review-red-team-policy.mjs';
+import { redTeamOwedForAcceptedPr, redTeamOwedForPass, redTeamOwedOnHead } from '../review-red-team-policy.mjs';
+
+describe('redTeamOwedForPass (live gap #5549)', () => {
+  const head = 'a'.repeat(40);
+  const needsHuman = { verdict: { verdict: 'needs-human', humanRequired: true }, findings: { read: { netBasis: { rev: head } } } };
+  it.each([
+    ['a panel accept', { verdict: { verdict: 'accept' } }, true],
+    ['an operator-accepted head stamped by the drain consumer', { ...needsHuman, acceptedPrHead: head }, true],
+    ['the stamp in another case', { ...needsHuman, acceptedPrHead: head.toUpperCase() }, true],
+    ['a needs-human review with no stamp', needsHuman, false],
+    ['a stamp naming another head', { ...needsHuman, acceptedPrHead: 'b'.repeat(40) }, false],
+    ['a stamp with no verdict', { findings: needsHuman.findings, acceptedPrHead: head }, false],
+  ])('%s owes %s', (_, payload, owed) => {
+    expect(redTeamOwedForPass(payload)).toBe(owed);
+  });
+});
 
 describe('redTeamOwedForAcceptedPr (caller verified live acceptance)', () => {
   const pinned = { read: { netBasis: { rev: 'a'.repeat(40) } } };
