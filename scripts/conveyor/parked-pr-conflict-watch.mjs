@@ -157,6 +157,7 @@ import { planNoteComment, postNoteComment } from './reconcile-note-comment.mjs';
 import { notifyDesktopChecked } from './branch-sync.mjs';
 import { UNOWNED_REBASE_INFRA_RETRY_CAP_DEFAULT, countUnownedRebaseAggregateAttempts, countUnownedRebaseInfraFailures, shouldCountRebaseInfra, formatUnownedRebaseInfraMarker, UNOWNED_REBASE_ATTEMPT_CAP, loadUnownedRebaseSettings, shouldCountRebaseAttempt, formatUnownedRebaseAttemptMarker, grantedRebaseCap } from './unowned-rebase-attempt-count.mjs';
 import { standingRulingScope } from './standing-ruling-io.mjs';
+import { ROUND_EXTENSION_MARKER } from './round-extension-mark.mjs';
 import { countConflictFixComments, CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
 // #4118 (c) — the SAME name-based, gh-agents-truth liveness check `review-status-tag.mjs` already uses, and for
 // the identical reason its own docblock states: staying independent of `reconcile-core.mjs#assessLiveness`'s
@@ -1540,9 +1541,11 @@ export function watchParkedPrConflicts({
   // cannot change the decision, so the healthy path pays no standing-ruling read.
   const grantedCap = (pr, comments, baseCap, used, count) => {
     if (!(used >= baseCap)) return baseCap;
-    let grantRepo = resolvedRepo;
-    try { if (grantRepo == null) grantRepo = provider.currentRepo(); } catch { grantRepo = null; }
+    // Reuse the repo the caller supplied (the daemon always passes --repo); never a currentRepo() read here.
+    const grantRepo = resolvedRepo ?? repo;
     if (grantRepo == null) return baseCap;
+    // No grant comment on the thread → nothing can raise the cap; skip the injected scope reader entirely.
+    if (!Array.isArray(comments) || !comments.some(c => typeof c?.body === 'string' && c.body.startsWith(ROUND_EXTENSION_MARKER))) return baseCap;
     let standingRuling = null;
     try { standingRuling = standingRulingFor({ repo: grantRepo, pr: { number: pr.number, comments } }) ?? null; }
     catch { standingRuling = null; }
