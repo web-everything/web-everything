@@ -1,0 +1,4 @@
+{
+  "$comment": "Card x3mfxzv (prototype, operator OK 2026-10-20). review.refillOnCompletion = off | shadow | on. Standard is off. This repo runs shadow: after a review job exits, the daemon logs which owed PR the pass would dispatch into the freed slot, never dispatches it, and later logs the idle-slot minutes saved when the pass dispatches that PR. Only shadow is built so far: 'on' behaves exactly like shadow. Env override: WE_REVIEW_REFILL_ON_COMPLETION.",
+  "refillOnCompletion": "shadow"
+}
