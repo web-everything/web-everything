@@ -10,9 +10,9 @@ dateOpened: "2026-10-20"
 tags: []
 ---
 
-# Slice 3: retire the full review-run scan to a missing-index fallback only
+# Slice 3: retire the full review-run scan to index-directory and writer-fence fallbacks
 
-Epic x5wqxb3. Delete the shadow comparison. The full scan stays only for a missing or unreadable index directory. Optionally move review-referral-hold's own mtime/size projection cache (same race class) onto the index. Delivery mode: pr.
+Epic x5wqxb3. Delete the shadow comparison. Retain the full scan for a missing or unreadable index directory (I4) and whenever the writer fence (I5) cannot prove that every live daemon build enforces slice 0's identity immutability, including an older or unknown build. Check the writer fence on every evidence/provenance read; a daemon rollback must restore full scanning even after the indexed reader has been enabled. Missing or invalid per-run entries still require fresh full reads of those records (I4). Optionally move review-referral-hold's own mtime/size projection cache (same race class) onto the index. Delivery mode: pr.
 
 ## Acceptance
 
