@@ -195,7 +195,6 @@ import { readGithubAuthPolicy, personalAllowed } from './github-auth-policy.mjs'
 export { isGhDeferred, isGhThrottled } from './gh-deferred.mjs';
 import { markPrSnapshotDirty, repoFromGhArgs } from './pr-snapshot-store.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
-import { SETTINGS_DIR } from './settings-files.mjs';
 import { resolveFinishedCiCacheSettings, finishedCiAuthScope, classifyFinishedCiRead, finishedCiCacheable, finishedCiStorable, finishedCiProofArgs, recordFinishedCiProof, finishedCiCacheGeneration, lookupFinishedCi, storeFinishedCi, invalidateForWrite } from './finished-ci-cache.mjs';
 
 // ── TUNING (env-overridable, mirroring heavy-admission.mjs's own resolve*() convention) ────────────────────
@@ -573,7 +572,10 @@ const validSlotWaitMs = n => Number.isInteger(n) && n >= 0 && n <= GH_SLOT_WAIT_
 // The TOOL layer contributes ONLY `callerWaitMs`, read fresh from scripts/settings/gh-throttle.json on each resolve
 // (one small file, like the platform file the cascade already reads per call). Every other ghThrottleSlotWait leaf
 // (class lists, onSlotTimeout, backgroundWaitMs) stays standard/platform/env exactly as on main.
-export const GH_SLOT_WAIT_TOOL_FILE = join(SETTINGS_DIR, 'gh-throttle.json');
+// Resolved from this module's own location, NOT imported from settings-files.mjs: gh-throttle is imported by nearly
+// every script, and a test that stubs settings-files.mjs with a partial factory would otherwise throw on a missing export.
+// NodeURL, not the global URL: happy-dom (the unit-test environment) replaces the global, and fileURLToPath rejects its instances.
+export const GH_SLOT_WAIT_TOOL_FILE = fileURLToPath(new NodeURL('../settings/gh-throttle.json', import.meta.url));
 function slotWaitToolBlock(path = GH_SLOT_WAIT_TOOL_FILE) {
   try {
     const block = JSON.parse(readFileSync(path, 'utf8'))?.ghThrottleSlotWait;
