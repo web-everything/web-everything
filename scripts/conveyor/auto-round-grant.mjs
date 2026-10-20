@@ -30,6 +30,9 @@ export const STANDING_RULING = 'operator 2026-10-19 standing ruling (confirmed 2
 /** The `github.auth` personal exception that lets this one write post under the operator's own login. */
 export const AUTO_GRANT_PERSONAL_EXCEPTION = 'standing-ruling-round-grant';
 
+/** The ruling's own ceiling: configuration may lower the per-PR cap, never raise it past this. */
+export const AUTO_GRANT_ABSOLUTE_MAX = 3;
+
 export const AUTO_ROUND_GRANT_STANDARD = Object.freeze({
   enabled: false, maxPerPr: 3, repos: Object.freeze(['web-everything/web-everything']),
 });
@@ -45,7 +48,7 @@ export function validCardOnlyLayer(block) {
   if (!block || typeof block !== 'object' || Array.isArray(block)) return {};
   const out = {};
   if (typeof block.enabled === 'boolean') out.enabled = block.enabled;
-  if (Number.isInteger(block.maxPerPr) && block.maxPerPr >= 0 && block.maxPerPr <= 10) out.maxPerPr = block.maxPerPr;
+  if (Number.isInteger(block.maxPerPr) && block.maxPerPr >= 0 && block.maxPerPr <= AUTO_GRANT_ABSOLUTE_MAX) out.maxPerPr = block.maxPerPr;
   if (Array.isArray(block.repos) && block.repos.every((r) => typeof r === 'string' && /^[^/\s]+\/[^/\s]+$/.test(r))) {
     out.repos = [...block.repos];
   }

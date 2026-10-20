@@ -11,7 +11,7 @@ import {
   AUTO_GRANT_CHANNEL, AUTO_GRANT_PERSONAL_EXCEPTION, autoGrantKey, countAutoRoundGrants, decideAutoGrant,
   isCardOnlyNetDiff, resolveAutoRoundGrantSettings, screenAutoGrantNote, STANDING_RULING,
 } from '../auto-round-grant.mjs';
-import { autoRoundGrant, claimLimitHit, operatorGhEnv } from '../auto-round-grant-io.mjs';
+import { autoRoundGrant, withPrLedger, operatorGhEnv, redact } from '../auto-round-grant-io.mjs';
 import { buildRoundExtensionComment } from '../round-extension-mark.mjs';
 import { runReconcileNotesAllRepos } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
 
@@ -24,11 +24,11 @@ const grantComment = (channel, login = 'chalbert', by = 1) => ({
   body: buildRoundExtensionComment({ repo: WE, pr: 5654, by, actor: 'chalbert', channel, reason: 'r', at: '2026-10-20T00:00:00Z' }),
 });
 const allow = () => ({ auth: 'app', personalExceptions: { [AUTO_GRANT_PERSONAL_EXCEPTION]: 'x' } });
-const tmpClaim = () => { const dir = mkdtempSync(join(tmpdir(), 'arg-')); return (key) => claimLimitHit(key, { dir }); };
+const tmpLedger = () => { const dir = mkdtempSync(join(tmpdir(), 'arg-')); return (slug, pr, fn) => withPrLedger(slug, pr, fn, { dir }); };
 const deps = (over = {}) => ({
   settings: ON, readThread: () => ({ state: 'OPEN', comments: [] }),
   readNet: () => ({ ok: true, files: ['backlog/x8js7c9-prevention.md', 'backlog/raised-by/x8js7c9.json'], added: [] }),
-  claim: tmpClaim(), policy: allow, ghEnv: () => ({ ok: true, env: { GH_TOKEN: 'operator' } }),
+  ledger: tmpLedger(), policy: allow, ghEnv: () => ({ ok: true, env: { GH_TOKEN: 'operator' } }),
   extend: vi.fn(() => ({ runId: 'extend-rounds-1' })), ...over,
 });
 
@@ -110,9 +110,40 @@ describe('idempotency per (PR, head, cap episode)', () => {
     expect(autoRoundGrant({ repo: 'we', note: { ...note, attempts: 9, cap: 8 }, pr: { headRefOid: HEAD } }, d).action).toBe('granted');
     expect(autoGrantKey({ repo: 'we', note, head: HEAD })).toBe(`${WE}#5654@${HEAD}:review:8/7`);
   });
-  it('a failed run keeps its claim (no automatic retry) and reports failed', () => {
-    const d = deps({ extend: vi.fn(() => { throw new Error('extend-rounds must run under the operator credential'); }) });
-    expect(autoRoundGrant({ repo: 'we', note, pr: { headRefOid: HEAD } }, d)).toMatchObject({ action: 'failed' });
+  it('a reservation from another episode (crashed or concurrent) still spends quota: no 4th grant', () => {
+    const d = deps();
+    const pr = { headRefOid: HEAD };
+    for (const [a, c] of [[8, 7], [9, 8], [10, 9]]) expect(autoRoundGrant({ repo: 'we', note: { ...note, attempts: a, cap: c }, pr }, d).action).toBe('granted');
+    // GitHub still shows none of them (e.g. posts not yet visible): the ledger alone holds the cap.
+    expect(autoRoundGrant({ repo: 'we', note: { ...note, attempts: 11, cap: 10 }, pr }, d)).toMatchObject({ action: 'cap-reached', used: 3 });
+    expect(d.extend).toHaveBeenCalledTimes(3);
+  });
+  it('the thread is read and counted under the PR lock; a busy lock never grants', () => {
+    const order = [];
+    const d = deps({
+      readThread: () => { order.push('read'); return { state: 'OPEN', comments: [] }; },
+      ledger: (slug, pr, fn) => { order.push('lock'); const r = fn({ entries: [], save: () => order.push('save') }); order.push('unlock'); return r; },
+      extend: () => { order.push('extend'); return { runId: 'r' }; },
+    });
+    autoRoundGrant({ repo: 'we', note, pr: { headRefOid: HEAD } }, d);
+    expect(order).toEqual(['lock', 'read', 'save', 'extend', 'save', 'unlock']);
+    const busy = deps({ ledger: () => { throw new Error('withFileLock: timed out'); } });
+    expect(autoRoundGrant({ repo: 'we', note, pr: { headRefOid: HEAD } }, busy)).toMatchObject({ action: 'skip' });
+    expect(busy.extend).not.toHaveBeenCalled();
+  });
+  it('configuration can lower the cap but never raise it past 3', () => {
+    expect(resolveAutoRoundGrantSettings({ tool: { autoRoundGrant: { cardOnly: { maxPerPr: 5 } } } }).maxPerPr).toBe(3);
+    expect(resolveAutoRoundGrantSettings({ tool: { autoRoundGrant: { cardOnly: { maxPerPr: 1 } } } }).maxPerPr).toBe(1);
+    const d = deps({ settings: { ...ON, maxPerPr: 9 }, readThread: () => ({ state: 'OPEN', comments: [grantComment(AUTO_GRANT_CHANNEL), grantComment(AUTO_GRANT_CHANNEL), grantComment(AUTO_GRANT_CHANNEL)] }) });
+    expect(autoRoundGrant({ repo: 'we', note, pr: { headRefOid: HEAD } }, d)).toMatchObject({ action: 'cap-reached', max: 3 });
+  });
+  it('a failed run keeps its claim (no automatic retry) and reports failed, with credentials redacted', () => {
+    const d = deps({ ghEnv: () => ({ ok: true, env: { GH_TOKEN: 'sekrit-operator-token' } }),
+      extend: vi.fn(() => { throw new Error('gh failed with sekrit-operator-token and ghp_abcdefghijklmnop'); }) });
+    const out = autoRoundGrant({ repo: 'we', note, pr: { headRefOid: HEAD } }, d);
+    expect(out).toMatchObject({ action: 'failed' });
+    expect(out.why).toBe('gh failed with [redacted] and [redacted]');
+    expect(redact('x github_pat_ABCDEFGHIJ123 y')).toBe('x [redacted] y');
     expect(autoRoundGrant({ repo: 'we', note, pr: { headRefOid: HEAD } }, d)).toMatchObject({ action: 'skip' });
     expect(d.extend).toHaveBeenCalledTimes(1);
   });
