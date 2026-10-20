@@ -24,6 +24,8 @@ export const ledgerFindingKey = k => (HASHED_KEY.test(String(k ?? '')) ? String(
 
 /** The channel of a clearing ruling row that retires a finding its seat no longer reports (seat disabled by config). */
 export const REFERRAL_RETIRED_CHANNEL = 'mandatory-referral-retired';
+/** Verdicts that re-witness the content a head already had (a mechanical move), so their head is never newer code. */
+const SAME_CONTENT = new Set(['carried', 'restamped']); // literals: verdict-ledger imports this module, so its VERDICTS is not ready at load
 const RULING_STATE = new Map([['block', 'blocking'], ['not-real', 'ruled'], ['card', 'ruled']]); // a Map: a raw name like 'toString' or '__proto__' must never resolve through the prototype chain
 const normSha = v => (typeof v === 'string' ? v.trim().toLowerCase() : '');
 /** A head SHA a rule may act on: 7 to 64 hex characters. Anything else (garbage, a number, 'abc') is an UNKNOWN head, never "a different head". */
@@ -60,8 +62,8 @@ export function deriveReferrals(events, { applied = appliedVerdictRows(events), 
   // Heads the witness moved on to FROM the finding's head before its referral landed (review of A in flight, push B,
   // head-moved(A→B), then referral(A)): newer code, not an older head. A sighting at or after that move is no evidence
   // of an older head; one before it still is. Only moves the fold applied count (a head-moved row, or a fresh review
-  // that moved the witness). A carry re-witnesses the same content: its head is never newer code, though a later move
-  // from it is.
+  // that moved the witness). A carry or a restamp re-witnesses the same content: its head is never newer code, though a
+  // later move from it is. A head first sighted by a non-bearing first-seen row stays unknown (it may be older), never newer.
   const movedOnFrom = (findingHead, row) => {
     const at = position.get(row) ?? -1;
     const chain = [findingHead], since = [];
@@ -73,7 +75,7 @@ export function deriveReferrals(events, { applied = appliedVerdictRows(events), 
       witness = to;
       if (!chain.some(h => sameHead(h, from)) || chain.some(h => sameHead(h, to))) return;
       chain.push(to);
-      if (e.verdict !== 'carried') since.push([to, i]);
+      if (!SAME_CONTENT.has(e.verdict)) since.push([to, i]);
     });
     return since;
   };

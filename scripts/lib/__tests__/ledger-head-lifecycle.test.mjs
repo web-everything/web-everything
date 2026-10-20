@@ -380,10 +380,13 @@ describe('ledger head lifecycle red-team regressions', () => {
           ...late('block'), verdict('accepted', third)];
         expect(ledgerView(events, facts(third)).referrals.get(key).state).toBe('blocking');
       });
-      it('a carry A→B is the same content: a fresh accept of B after a late referral of A is still no fix', () => {
-        const events = [verdict('accepted'), verdict('carried', next, { fromHead: head, carryRule: 'tree-identical', source: 'head-observer' }),
-          ...late('block'), verdict('accepted', next)];
+      for (const kind of ['carried', 'restamped']) it(`a ${kind} A→B is the same content: a fresh accept of B after a late referral of A is still no fix`, () => {
+        const move = verdict(kind, next, kind === 'carried' ? { fromHead: head, carryRule: 'tree-identical', source: 'head-observer' } : {});
+        const events = [verdict('accepted'), move, ...late('block'), verdict('accepted', next)];
         expect(ledgerView(events, facts(next)).referrals.get(key).state).toBe('blocking');
+        // A real move on from the re-witnessed head is newer code.
+        const onward = [verdict('accepted'), move, verdict('head-moved', third, { fromHead: next, source: 'head-observer' }), ...late('block'), verdict('accepted', third)];
+        expect(ledgerView(onward, facts(third)).referrals.get(key).state).toBe('resolved-by-fix');
       });
       it('a head that was older than A stays no fix, even when a later move returns to it', () => {
         const events = [verdict('accepted', next), verdict('head-moved', head, { fromHead: next, source: 'head-observer' }), verdict('accepted'),
