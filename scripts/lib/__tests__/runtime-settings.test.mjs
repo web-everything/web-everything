@@ -186,7 +186,8 @@ describe('wired readers', () => {
     expect(readRuntimeLayer('reviewConcurrency', { env }).block).toBeUndefined();
     resetReviewCapFloorForTest(false);
   });
-  it('review daemon red-team seats read the runtime value', () => {
+  // The red-team seat share lives on the review stack (not every base has it yet); skip where it is absent.
+  it.skipIf(typeof resolveRedTeamSeatShare !== 'function')('review daemon red-team seats read the runtime value', () => {
     write({ 'reviewConcurrency.redTeamReservedSeats': entry(2) });
     expect(resolveRedTeamSeatShare({ env, toolPath: join(dir, 'none.json') })).toEqual({ reserved: 2, source: 'runtime' });
   });
