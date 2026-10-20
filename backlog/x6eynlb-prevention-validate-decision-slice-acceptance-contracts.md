@@ -32,14 +32,25 @@ Locations below identify findings on the reviewed head, not current line numbers
 
 ## Acceptance
 
-- [A1] **Executable** — `npm run test:unit -- scripts/__tests__/check-standards-rules-backlog-integrity.test.mjs` fails on new negative fixtures before the rules exist and passes after. Wire the rules into `npm run check:standards`. Named tests:
+- [A1] **Executable** — the following command fails on new negative fixtures before the rules exist and passes after. Wire the rules into `npm run check:standards`.
+
+  ```bash
+  npm run test:unit -- scripts/__tests__/check-standards-rules-backlog-integrity.test.mjs
+  ```
+
+  Named tests:
   - `decision amendments: every Skeptic AMENDED or SURVIVES-WITH-AMENDMENT clause maps to a named test in an implementing epic child` (follow actual parent fields; include Fork sentences of the form "X counts as" or "never Y", guard-settings classification, and mixed-child precedence). Use explicit clause-to-test references; prose that cannot be checked mechanically must go through the documented review lens and cannot silently count as covered.
   - `epic A1: the test-file set contains the union of all children A1 test files` (include a child with two files and an epic omitting only the drain-ordering file; normalize repo-qualified paths).
   - `sibling scopes: overlapping paths require ordering by blockedBy reachability` (shared file, directory-prefix overlap, disjoint siblings, direct and transitive order, reverse order and cycles; a cycle never satisfies ordering).
   - `missing setting: a fail-closed test states both the cascade default and which layer or resolved result is missing` (unset repo layer with a default is distinct from no resolved value or an unreadable cascade).
   - `parent claims: child counts and parent-edge assertions resolve to actual parent fields` (wrong parent, stale count, missing card and a corrected four-child epic).
-  - `head mutation: a slice scoping pr-stack.mjs or pr-merge-gate.mjs requires a named gates-unchanged test` (review approval, CI and proof-of-land for the new head; include closed-base rebase as well as restack). Document the same requirement in the card-authoring template in we:docs/agent/backlog-workflow.md; explicitly record a review-lens rationale for scope false positives.
-- [A2] **Executable** — `npm run test:unit -- scripts/lib/__tests__/stack-policy.test.mjs` includes `configuration contract: each matrix cell outside the safety floor changes outcome under an effective non-default override`. Parameterize every allowedBaseStates cell outside the independently tested safety floor, keeping all other inputs fixed. Include `configuration contract: floor-covered cells remain blocked under agent overrides` and `classification contract: every gate-read settings file is guard even with settings in lowRiskClasses`. Coordinate with slice 1 xcq5jb9, which owns this runtime test file; land that slice first so this card extends its contract instead of creating a competing evaluator.
+  - `head mutation: a slice scoping we:scripts/conveyor/pr-stack.mjs or we:scripts/lib/pr-merge-gate.mjs requires a named gates-unchanged test` (review approval, CI and proof-of-land for the new head; include closed-base rebase as well as restack). Document the same requirement in the card-authoring template in we:docs/agent/backlog-workflow.md; explicitly record a review-lens rationale for scope false positives.
+- [A2] **Executable** — the following command includes `configuration contract: each matrix cell outside the safety floor changes outcome under an effective non-default override`. Parameterize every allowedBaseStates cell outside the independently tested safety floor, keeping all other inputs fixed. Include `configuration contract: floor-covered cells remain blocked under agent overrides` and `classification contract: every gate-read settings file is guard even with settings in lowRiskClasses`. Coordinate with slice 1 xcq5jb9, which owns this runtime test file; land that slice first so this card extends its contract instead of creating a competing evaluator.
+
+  ```bash
+  npm run test:unit -- scripts/lib/__tests__/stack-policy.test.mjs
+  ```
+
 - [A3] **Review lens** — amend the authoring checklist in we:docs/agent/backlog-workflow.md: every decision amendment and categorical exception has an explicit named child-test reference; every missing-setting test names the default and missing layer; every PR-head mutation preserves gates. Where semantic prose exceeds the deterministic rules, a reviewer records the clause, test and assertion, or a concrete coverage gap. This is the fallback for A1's semantic checks, not a claim that keyword matching proves coverage.
 
 ## Non-goals
