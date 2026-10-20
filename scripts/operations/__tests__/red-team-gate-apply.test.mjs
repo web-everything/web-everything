@@ -239,9 +239,13 @@ describe('applyRedTeamGate', () => {
       expect(await applyRedTeamGate({ repo: REPO, pr: 4722, dryRun: true }, unverified.io)).toMatchObject({ status: 'already-acted', outcome: 'round-cap' });
       const ok = fakeIo({ comments, round: 12, readRoundAsOf: () => 12, standingRuling: () => verified });
       expect(await applyRedTeamGate({ repo: REPO, pr: 4722, dryRun: true }, ok.io)).toMatchObject({ status: 'dry-run', reopened: true, cap: 13, outcome: 'sent-back' });
+      // The pure readers treat a verified automatic grant exactly like a manual grant at the same position, and an
+      // unverified one exactly like no grant at all.
       const pr = { number: 4722, repo: REPO, headRefOid: HEAD, labels: ['review:accepted'], comments };
-      expect(redTeamRulingNeeded(pr)).not.toBeNull();
-      expect(redTeamRulingNeeded({ ...pr, standingRuling: verified })).toBeNull();
+      const manual = { ...pr, comments: [comment([F()]), capRecord(), grant(1)] };
+      const none = { ...pr, comments: [comment([F()]), capRecord()] };
+      expect(redTeamRulingNeeded({ ...pr, standingRuling: verified })).toEqual(redTeamRulingNeeded(manual));
+      expect(redTeamRulingNeeded(pr)).toEqual(redTeamRulingNeeded(none));
     });
 
     it('a round-cap record with no later grant stays already-acted (unchanged)', async () => {

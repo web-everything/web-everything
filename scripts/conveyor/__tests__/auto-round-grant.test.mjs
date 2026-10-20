@@ -51,7 +51,7 @@ describe('the operator ruling record', () => {
     ['no marker', { body: rulingBody.replace('🧭', '') }],
     ['two records', { body: `${rulingBody}\n<!-- standing-ruling: {} -->` }],
     ['bigger by', { body: rulingBody.replace('"by":1', '"by":2') }],
-    ['repo not covered', { body: rulingBody.replace(WE, 'other/repo') }],
+    ['repo not covered', { body: rulingBody.replaceAll(WE, 'other/repo') }],
   ])('refuses a ruling that is %s', (_, over) => {
     expect(verifyStandingRuling(rulingIssue(over), { repo: WE }).ok).toBe(false);
   });
