@@ -11,7 +11,10 @@
  *        `WE_PLATFORM_PREFERENCES_FILE` replaces both (tests, a one-off live proof).
  *     3. TOOL / repo override (Longshore settings) — the reader's settings file block (`we:scripts/settings/*.json`
  *        or its own per-feature file). Only when this repo deliberately differs from the team.
- *     4. ENV — the reader's existing env override (unchanged; each reader keeps its own env parsing).
+ *     4. RUNTIME operator layer — `we:scripts/lib/runtime-settings.mjs`: a file OUTSIDE the daemon clones, read fresh
+ *        on every call, honoured ONLY for its allowlisted `<policy>.<leaf>` keys within their declared bounds (and
+ *        the reader's own `valid`). Lets an operator hot-swap a knob with no rebuild; logged as `(runtime)`.
+ *     5. ENV — the reader's existing env override (unchanged; each reader keeps its own env parsing).
  *
  *   Each LEAF resolves independently: the tool value when it is set AND valid, else the platform's, else the
  *   reader's standard default. An invalid value never overrides a lower layer; it is named in `invalid`.
@@ -28,6 +31,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isUnderTest } from './under-test.mjs';
+import { readRuntimeLayer, filterRuntimeBlock } from './runtime-settings.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const PLATFORM_PREFERENCES_PATH = join(HERE, 'delivery-platform-preferences.json');
@@ -35,7 +39,7 @@ export const PLATFORM_PREFERENCES_PATH = join(HERE, 'delivery-platform-preferenc
 export const LEGACY_PLATFORM_PREFERENCES_PATHS = Object.freeze([join(HERE, 'delivery-priority-settings.json')]);
 export const PLATFORM_PREFERENCES_ENV = 'WE_PLATFORM_PREFERENCES_FILE';
 export const POLICY_CASCADE_LOG_ENV = 'WE_POLICY_CASCADE_LOG';
-export const CASCADE_LAYERS = Object.freeze(['standard', 'platform', 'tool', 'env']);
+export const CASCADE_LAYERS = Object.freeze(['standard', 'platform', 'tool', 'runtime', 'env']);
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const UNSAFE = new Set(['__proto__', 'constructor', 'prototype']);
@@ -95,13 +99,13 @@ function setLeaf(obj, parts, value) {
  * @returns {{value:unknown, sources:Record<string,string>, leafValues:Record<string,unknown>, invalid:string[]}}
  *   `sources` names the layer of every effective leaf, keyed by its dotted path ('' for a scalar policy).
  */
-export function resolveCascade({ standard, platform, tool, envValues = {}, valid = {} } = {}) {
+export function resolveCascade({ standard, platform, tool, runtime, envValues = {}, valid = {} } = {}) {
   const check = (path, v) => (typeof valid === 'function' ? valid(v) : (valid?.[path[0]] ? valid[path[0]](v) : true));
   const eff = new Map();
   const at = (path) => (path.length ? `.${path.join('.')}` : '');
   const invalid = [];
   for (const [key, { path, v }] of leaves(standard)) eff.set(key, { path, v, layer: 'standard' });
-  for (const [name, layer] of [['platform', platform], ['tool', tool]]) {
+  for (const [name, layer] of [['platform', platform], ['tool', tool], ['runtime', runtime]]) {
     if (layer === undefined || layer === null) continue;
     for (const [key, { path, v }] of leaves(layer)) {
       if (!check(path, v)) { invalid.push(`${name}${at(path)}=${JSON.stringify(v)}`); continue; }
@@ -170,18 +174,45 @@ export function logCascadeSources(policy, resolved, { env = process.env, log = (
  * `.value` and the source log complete.
  * @param {string} policy  the key in the platform preference file (same name as the tool block)
  * @param {unknown} tool   the reader's tool-layer block (or scalar)
+ * `runtime`: the runtime-operator block for this policy; omitted → read FRESH from the runtime file
+ *   (`we:scripts/lib/runtime-settings.mjs#readRuntimeLayer`, allowlisted + bounded leaves only). `null` disables it.
  * @param {{standard?:unknown, envValues?:Record<string,unknown>, valid?:object|Function, platform?:unknown,
- *   env?:object, log?:Function}} [o]
+ *   runtime?:object|null, env?:object, log?:Function}} [o]
  */
-export function cascadePolicy(policy, tool, { standard, envValues, valid, platform, env = process.env, log } = {}) {
+export function cascadePolicy(policy, tool, { standard, envValues, valid, platform, runtime, env = process.env, log } = {}) {
   let plat = platform;
   if (plat === undefined) { try { plat = platformPreference(policy, { env }); } catch { plat = undefined; } }
-  const resolved = resolveCascade({ standard, platform: plat, tool, envValues, valid });
+  let rt = runtime;
+  if (rt === undefined) {
+    try {
+      const r = readRuntimeLayer(policy, { env });
+      rt = r.block;
+      for (const w of r.warnings) logRuntimeWarning(w, { env, ...(log ? { log } : {}) });
+    } catch { rt = undefined; }
+  } else if (rt !== null) {
+    // An injected block gets the same allowlist + bounds as a file-read one.
+    try { rt = filterRuntimeBlock(policy, rt).block; } catch { rt = undefined; }
+  }
+  const resolved = resolveCascade({ standard, platform: plat, tool, runtime: rt ?? undefined, envValues, valid });
   logCascadeSources(policy, resolved, { env, ...(log ? { log } : {}) });
-  // `layered`: platform under tool only (no standard, no env) — the drop-in replacement for a reader's tool block.
-  const layered = resolveCascade({ platform: plat, tool, valid }).value;
-  return { ...resolved, platform: plat, layered };
+  // `layered`: platform < tool < runtime (no standard, no env) — the drop-in replacement for a reader's tool block, so
+  // a reader that applies its own env on top keeps env > runtime.
+  const layered = resolveCascade({ platform: plat, tool, runtime: rt ?? undefined, valid }).value;
+  return { ...resolved, platform: plat, runtime: rt ?? undefined, layered };
+}
+
+const warned = new Set();
+/** Log a runtime-layer warning once per process per distinct message (same gating as the source log). Never throws. */
+export function logRuntimeWarning(line, { env = process.env, log = (l) => console.error(l) } = {}) {
+  try {
+    const on = env?.[POLICY_CASCADE_LOG_ENV];
+    if (on === '0') return;
+    if (on !== '1' && (isUnderTest(env) || !inDaemon())) return;
+    if (warned.has(line)) return;
+    warned.add(line);
+    log(`policy-cascade · warning: ${line}`);
+  } catch { /* logging never breaks a reader */ }
 }
 
 /** Test seam: forget what was logged. @test-only-export-ok */
-export function resetCascadeLogForTest() { logged.clear(); }
+export function resetCascadeLogForTest() { logged.clear(); warned.clear(); }

@@ -74,10 +74,11 @@
 
 import { readFileSync, statSync } from 'node:fs';
 import { cascadePolicy } from '../../scripts/lib/policy-cascade.mjs';
+import { isUnderTest } from '../../scripts/lib/under-test.mjs';
 import { resolve, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
-import { hostname } from 'node:os';
+import { hostname, freemem } from 'node:os';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents, isConflictingPr } from '../../scripts/conveyor/reconcile-pass.mjs';
 import { promoteDraftsThenReplan, promoteDraftsGuarded } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
 import { notifyReferralHold } from '../../scripts/conveyor/review-referral-hold.mjs';
@@ -1244,22 +1245,82 @@ export function countLiveReviewRounds(lines, { isScriptFile = null } = {}) {
 /** EMERGENCY 2026-10-20 — the host-wide cap on live review rounds, from the tool layer
  *  (`scripts/settings/review-concurrency.json`, source logged by the cascade). Counts live `review-job.mjs` /
  *  `review-loop-cli.mjs` processes (a round is one job, or one bare loop). An unreadable `ps` fails closed (no new
- *  review this tick). Revert condition: see the settings file's comment. */
+ *  review this tick). Revert condition: see the settings file's comment.
+ *  HOT-SWAP (2026-10-20): every leaf is also runtime-settable (`we:scripts/lib/runtime-settings.mjs`, read fresh each
+ *  tick). MEMORY FLOOR (operator ruling 2026-10-20 — reviews barely use CPU, so the safety rule watches FREE MEMORY,
+ *  not load): when free RAM + free swap < `capMemoryFloorMb` (standard 3072), the effective cap drops to
+ *  `capFloorValue` (standard 5) until free memory is back above floor + `capMemoryHysteresisMb` (standard 1024). */
+export const REVIEW_CAP_MEMORY_STANDARD = Object.freeze({ capMemoryFloorMb: 3072, capFloorValue: 5, capMemoryHysteresisMb: 1024 });
+const intIn = (min, max) => (v) => Number.isSafeInteger(v) && v >= min && v <= max;
+const REVIEW_CAP_VALID = {
+  maxLiveReviewRounds: (v) => v === null || (Number.isSafeInteger(v) && v >= 1),
+  capMemoryFloorMb: intIn(0, 65536), capFloorValue: intIn(1, 12), capMemoryHysteresisMb: intIn(256, 8192),
+};
+
+/** PURE: the memory-floor rule with hysteresis. `engaged` is the previous tick's state; `freeMb` null (unreadable)
+ *  fails CLOSED (engaged). A floor of 0 turns the rule off. The floor never RAISES the cap.
+ *  @returns {{max:number, engaged:boolean, switched:boolean}} */
+export function applyReviewCapMemoryFloor({ max, freeMb, floorMb, floorValue, hysteresisMb, engaged = false }) {
+  let next = engaged;
+  if (!(floorMb > 0)) next = false;
+  else if (!Number.isFinite(freeMb)) next = true;
+  else next = engaged ? freeMb < floorMb + hysteresisMb : freeMb < floorMb;
+  return { max: next ? Math.min(max, floorValue) : max, engaged: next, switched: next !== engaged };
+}
+
+/** IO: free RAM + free swap in MB (`os.freemem()` + `sysctl -n vm.swapusage`'s `free`); null when unreadable. */
+export function readFreeMemoryMb({ readFree = freemem, run = (c, a) => execFileSync(c, a, { encoding: 'utf8', timeout: 5000 }) } = {}) {
+  try {
+    const ram = Number(readFree());
+    if (!Number.isFinite(ram)) return null;
+    let swap = 0;
+    try { const m = /free\s*=\s*([\d.]+)M/.exec(String(run('sysctl', ['-n', 'vm.swapusage']))); if (m) swap = Number(m[1]); } catch { swap = 0; }
+    return Math.round(ram / (1024 * 1024) + (Number.isFinite(swap) ? swap : 0));
+  } catch { return null; }
+}
+
+let reviewCapFloorEngaged = false;
+/** Test seam. @test-only-export-ok */
+export function resetReviewCapFloorForTest(v = false) { reviewCapFloorEngaged = v; }
+
 export function liveReviewRoundBudget({ env = process.env, listCommands = () => execFileSync('ps', ['-Aww', '-o', 'pid=,ppid=,command='], { encoding: 'utf8', timeout: 10_000, maxBuffer: 32 * 1024 * 1024 }),
-  toolPath = join(dirname(fileURLToPath(import.meta.url)), '../../scripts/settings/review-concurrency.json') } = {}) {
+  toolPath = join(dirname(fileURLToPath(import.meta.url)), '../../scripts/settings/review-concurrency.json'),
+  readFreeMb, log = (l) => console.error(l) } = {}) {
+  // Under test the host's real free memory never steers a cap (a low-memory CI host would flake); tests inject it.
+  readFreeMb ??= (isUnderTest(process.env) || isUnderTest(env)) ? () => Number.MAX_SAFE_INTEGER : readFreeMemoryMb;
   let tool;
   try { tool = JSON.parse(readFileSync(toolPath, 'utf8')); } catch { tool = undefined; }
   const raw = env?.WE_REVIEW_MAX_LIVE_ROUNDS;
-  const r = cascadePolicy('reviewConcurrency', tool && { maxLiveReviewRounds: tool.maxLiveReviewRounds }, {
-    env, standard: { maxLiveReviewRounds: null },
+  const toolBlock = tool && Object.fromEntries(['maxLiveReviewRounds', ...Object.keys(REVIEW_CAP_MEMORY_STANDARD)]
+    .filter((k) => tool[k] !== undefined).map((k) => [k, tool[k]]));
+  const r = cascadePolicy('reviewConcurrency', toolBlock, {
+    env, standard: { maxLiveReviewRounds: null, ...REVIEW_CAP_MEMORY_STANDARD },
     envValues: { maxLiveReviewRounds: typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : undefined },
-    valid: { maxLiveReviewRounds: (v) => v === null || (Number.isSafeInteger(v) && v >= 1) },
+    valid: REVIEW_CAP_VALID,
   });
-  const max = r.value.maxLiveReviewRounds;
-  if (max == null) return null;
+  const configured = r.value.maxLiveReviewRounds;
+  if (configured == null) return null;
   const src = r.sources?.maxLiveReviewRounds ?? 'standard';
+  const { capMemoryFloorMb: floorMb, capFloorValue: floorValue, capMemoryHysteresisMb: hysteresisMb } = r.value;
+  const srcOf = (k) => r.sources?.[k] ?? 'standard';
+  let freeMb = null;
+  try { freeMb = readFreeMb(); } catch { freeMb = null; }
+  const floor = applyReviewCapMemoryFloor({ max: configured, freeMb, floorMb, floorValue, hysteresisMb, engaged: reviewCapFloorEngaged });
+  reviewCapFloorEngaged = floor.engaged;
+  const floorNote = `capMemoryFloorMb=${floorMb} (${srcOf('capMemoryFloorMb')}), capFloorValue=${floorValue} (${srcOf('capFloorValue')}), capMemoryHysteresisMb=${hysteresisMb} (${srcOf('capMemoryHysteresisMb')})`;
+  if (floor.switched) {
+    try {
+      log(floor.engaged
+        ? `review-daemon: memory floor ENGAGED — free RAM+swap ${freeMb ?? 'unreadable (fail closed)'} MB < ${floorMb} MB; live-review cap ${configured} → ${floor.max} (${floorNote})`
+        : `review-daemon: memory floor RELEASED — free RAM+swap ${freeMb ?? '?'} MB ≥ ${floorMb + hysteresisMb} MB; live-review cap back to ${configured} (${src}) (${floorNote})`);
+    } catch { /* logging never breaks the tick */ }
+  }
+  const max = floor.max;
+  const capText = floor.engaged && max < configured
+    ? `maxLiveReviewRounds=${max} (memory floor: free RAM+swap ${freeMb ?? '?'} MB, floor ${floorMb} MB, releases at ${floorMb + hysteresisMb} MB; configured ${configured} (${src}))`
+    : `maxLiveReviewRounds=${max} (${src})`;
   let lines;
-  try { lines = String(listCommands()).split('\n'); } catch (e) { return { left: 0, reason: `live review rounds unknown (${String(e?.message ?? e).split('\n')[0]}); maxLiveReviewRounds=${max} (${src})` }; }
+  try { lines = String(listCommands()).split('\n'); } catch (e) { return { left: 0, max, configured, freeMb, floorEngaged: floor.engaged, reason: `live review rounds unknown (${String(e?.message ?? e).split('\n')[0]}); ${capText}` }; }
   let live;
   try {
     live = countLiveReviewRounds(lines, { isScriptFile: (path) => {
@@ -1272,9 +1333,9 @@ export function liveReviewRoundBudget({ env = process.env, listCommands = () => 
       }
     } });
   } catch {
-    return { left: 0, reason: `live review rounds unknown (ambiguous script path); maxLiveReviewRounds=${max} (${src})` };
+    return { left: 0, max, configured, freeMb, floorEngaged: floor.engaged, reason: `live review rounds unknown (ambiguous script path); ${capText}` };
   }
-  return { left: Math.max(0, max - live), live, max, reason: `live review rounds ${live} of maxLiveReviewRounds=${max} (${src})` };
+  return { left: Math.max(0, max - live), live, max, configured, freeMb, floorEngaged: floor.engaged, reason: `live review rounds ${live} of ${capText}` };
 }
 
 export function buildCliDaemonEffects({
