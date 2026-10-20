@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { detectLatentRedMain, listMergeGroupCiRuns, runLatentRedMainCheck } from '../latent-red-main.mjs';
@@ -70,11 +70,47 @@ describe('runLatentRedMainCheck', () => {
     expect(runLatentRedMainCheck({ repo: 'o/r', exec: dry, threshold: 3, ledgerPath: `${ledgerPath}.dry`, dryRun: true, log: () => {} })).toMatchObject({ fired: true, action: 'rerun-main' });
     expect(dry.mock.calls.some(([, a]) => a[1] === 'rerun')).toBe(false);
   }));
-  it('retries a refused re-run next pass and never throws on unreadable reads', () => withDir((ledgerPath) => {
+  it('retries a refused re-run at most 3 times in all and never throws on unreadable reads', () => withDir((ledgerPath) => {
     const exec = host({ rerunThrows: true });
-    expect(runLatentRedMainCheck({ repo: 'o/r', exec, threshold: 3, ledgerPath, publish: () => {}, log: () => {} }).detail.rerun).toMatch(/^failed/);
-    expect(runLatentRedMainCheck({ repo: 'o/r', exec, threshold: 3, ledgerPath, publish: () => {}, log: () => {} }).action).toBe('rerun-main');
+    const go = () => runLatentRedMainCheck({ repo: 'o/r', exec, threshold: 3, ledgerPath, publish: () => {}, log: () => {} });
+    expect(go().detail.rerun).toMatch(/^failed/);
+    expect(go().action).toBe('rerun-main');
+    expect(go().action).toBe('rerun-main');
+    expect(go().action).toBe('already-acted');
+    expect(exec.mock.calls.filter(([, a]) => a[1] === 'rerun')).toHaveLength(3);
     expect(runLatentRedMainCheck({ repo: 'o/r', exec: () => { throw new Error('rate'); }, threshold: 3, ledgerPath, log: () => {} }).action).toBe('error');
     expect(runLatentRedMainCheck({ repo: 'o/r', exec, threshold: 0, ledgerPath, log: () => {} }).action).toBe('off');
   }));
+  it('an unreadable ledger never re-runs: needs-you only', () => withDir((ledgerPath) => {
+    writeFileSync(ledgerPath, '{not json');
+    const exec = host(); const publish = vi.fn();
+    for (let i = 0; i < 3; i++) expect(runLatentRedMainCheck({ repo: 'o/r', exec, threshold: 3, ledgerPath, publish, log: () => {} }).action).toBe('ledger-unreadable');
+    expect(exec.mock.calls.some(([, a]) => a[1] === 'rerun')).toBe(false);
+    expect(publish).toHaveBeenCalledWith(expect.objectContaining({ kind: 'latent-red-main' }));
+  }));
+  it('never caches a no-signal from unreadable evidence', () => withDir((ledgerPath) => {
+    let logsReadable = false;
+    const base = host();
+    const exec = vi.fn((bin, args) => { if (args.join(' ').endsWith('/logs') && !logsReadable) throw new Error('HTTP 502'); return base(bin, args); });
+    expect(runLatentRedMainCheck({ repo: 'o/r', exec, threshold: 3, ledgerPath, publish: () => {}, log: () => {} }).action).toBe('no-signal');
+    logsReadable = true;
+    expect(runLatentRedMainCheck({ repo: 'o/r', exec, threshold: 3, ledgerPath, publish: () => {}, log: () => {} }).action).toBe('rerun-main');
+  }));
+  it('records nothing while main CI is still running; a throwing logger never escapes', () => withDir((ledgerPath) => {
+    const base = host();
+    const running = vi.fn((bin, args) => (args.join(' ').includes('event=push')
+      ? JSON.stringify({ workflow_runs: [{ ...rest(run(7, null, { status: 'in_progress' })), event: 'push', head_sha: TIP }] }) : base(bin, args)));
+    expect(runLatentRedMainCheck({ repo: 'o/r', exec: running, threshold: 3, ledgerPath, publish: () => {}, log: () => {} }).action).toBe('main-run-in-progress');
+    expect(runLatentRedMainCheck({ repo: 'o/r', exec: base, threshold: 3, ledgerPath, publish: () => {}, log: () => {} }).action).toBe('rerun-main');
+    expect(() => runLatentRedMainCheck({ repo: 'o/r', exec: () => { throw new Error('x'); }, threshold: 3, ledgerPath, log: () => { throw new Error('log'); } })).not.toThrow();
+  }));
+  it('pages the REST list until enough CI rows, and fails closed when the page budget runs out', () => {
+    const other = (n) => ({ ...rest(run(n, 'success'), '.github/workflows/merge-gate.yml') });
+    const pages = (p) => (p <= 5 ? Array.from({ length: 100 }, (_, i) => other(p * 1000 + i)) : []);
+    const exec = vi.fn((bin, args) => { const p = Number(/[&]page=(\d+)/.exec(args[1])?.[1] ?? 1); return JSON.stringify({ total_count: 10_000, workflow_runs: p === 2 ? [rest(run(5, 'failure')), ...pages(2).slice(1)] : pages(p) }); });
+    expect(() => listMergeGroupCiRuns({ repo: 'o/r', exec, limit: 2 })).toThrow(/within 5 pages/);
+    const found = vi.fn((bin, args) => { const p = Number(/[&]page=(\d+)/.exec(args[1])?.[1] ?? 1); return JSON.stringify({ total_count: 10_000, workflow_runs: p === 2 ? [rest(run(5, 'failure')), ...pages(2).slice(1)] : pages(p) }); });
+    expect(listMergeGroupCiRuns({ repo: 'o/r', exec: found, limit: 1 }).map((r) => r.databaseId)).toEqual([5]);
+    expect(found.mock.calls).toHaveLength(2);
+  });
 });
