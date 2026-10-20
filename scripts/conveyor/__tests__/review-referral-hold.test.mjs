@@ -15,7 +15,7 @@ import {
   notifyReferralHold, REFERRAL_RETRY_MS, decideSameHeadHold, resolveSameHeadMaxReviews, PENDING_REASON_TOKENS,
   GH_LIST_COMMENT_CAP, findResumableParkedRun, blockRuledReferralsFor, filterFixerReferrals, REFERRAL_REARM_COMMENT_MARKER,
   VERDICT_COOLDOWN_BASE_MS, VERDICT_COOLDOWN_CAP_MS, VERDICT_COOLDOWN_MAX_RELEASES,
-  resolveNoVerdictRetry, NO_VERDICT_RETRY_STANDARD, raiseNoVerdictNeedsYou,
+  resolveNoVerdictRetry, NO_VERDICT_RETRY_STANDARD, raiseNoVerdictNeedsYou, NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS,
 } from '../review-referral-hold.mjs';
 
 it('keeps the cycle-free referral matcher equal to the canonical re-arm marker', () => {
@@ -647,6 +647,24 @@ describe('same-head hold never silences a review whose verdict never landed (liv
       expect(raiseNoVerdictNeedsYou({ repo, prNumber: p.number, hold: held, dir: d2, log, publish: flaky })).toBe(true);
       expect(raiseNoVerdictNeedsYou({ repo, prNumber: p.number, hold: held, dir: d2, log, publish: flaky })).toBe(false);
       expect(flaky).toHaveBeenCalledTimes(2);
+    });
+    it('a pending receipt left by a crash or a failed cleanup is reclaimed once stale; a fresh one is respected; corrupt is reclaimed', () => {
+      const dir = temp(), log = vi.fn(), publish = vi.fn(), t0 = at + 30 * 86400_000;
+      const held = decideSameHeadHold(labelled(['review:pending']), lostRuns(9), { repo, env: {}, now: t0, retry: { cooldownReleases: 6 } });
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 })).toBe(true);
+      const [name] = readdirSync(dir);
+      const receiptPath = join(dir, name);
+      const pending = ms => writeFileSync(receiptPath, JSON.stringify({ state: 'pending', at: iso(ms), repo, pr: 1, head }));
+      // Same on-disk state as a crash between reserve and publish, or a failed publish whose receipt removal failed.
+      pending(t0);
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 + NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS - 1 })).toBe(false);
+      expect(publish).toHaveBeenCalledTimes(1);
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 + NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS })).toBe(true);
+      expect(publish).toHaveBeenCalledTimes(2);
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 + 2 * NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS })).toBe(false);
+      writeFileSync(receiptPath, '{not json');
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 })).toBe(true);
+      expect(publish).toHaveBeenCalledTimes(3);
     });
     it('never writes the real feed from a test without an injected publisher', () => {
       const dir = temp();
