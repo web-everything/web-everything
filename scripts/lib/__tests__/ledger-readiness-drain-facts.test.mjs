@@ -11,6 +11,9 @@ it('replay reports before, after, projected and residual strictness without proj
   const argv = process.argv;
   const log = vi.spyOn(console, 'log').mockImplementation(() => {});
   try {
+    // Keep the fixture inside the live readiness window regardless of the test run date.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-10-13T14:00:00Z'));
     process.argv = ['node', 'ledger-readiness', '--replay', '--json'];
     await import('../../ledger-readiness.mjs');
     const report = JSON.parse(log.mock.calls[0][0]);
@@ -19,5 +22,5 @@ it('replay reports before, after, projected and residual strictness without proj
     expect(report.replay.projected).toMatchObject({ agree: 1, disagree: 3,
       remainingByCode: { 'verdict:pending': 1, 'hold:drain:review': 1, 'unknown strictness': 1 } });
     expect(report.disagree).toBe(4);
-  } finally { process.argv = argv; log.mockRestore(); }
+  } finally { process.argv = argv; log.mockRestore(); vi.useRealTimers(); }
 });
