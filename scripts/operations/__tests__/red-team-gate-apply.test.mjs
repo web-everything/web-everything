@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { applyRedTeamGate, buildGateComment, buildRedTeamCardInput, buildSendBackArgv, buildSendBackBody, gateExitCode, renderGateSummary, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
 import { runReviewJob } from '../review-job.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, parseRedTeamComment, redTeamGateMarker, redTeamQueueReason, redTeamResultId, redTeamRulingNeeded } from '../../lib/red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, parseRedTeamComment, parseRedTeamGateMarker, redTeamGateMarker, redTeamQueueReason, redTeamResultId, redTeamRulingNeeded } from '../../lib/red-team-gate.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 import { runReviewLabelCli } from '../../review-set-label.mjs';
 
@@ -194,9 +194,9 @@ describe('applyRedTeamGate', () => {
     const OPERATOR = { login: 'chalbert' };
     const grant = (by = 1, at = '2026-10-19T12:00:00Z') => ({ author: OPERATOR, createdAt: at,
       body: buildRoundExtensionComment({ repo: REPO, pr: 4722, by, actor: 'chalbert', channel: 'claude-code-chat', reason: 'Yes', at }) });
-    const capRecord = (round = 12) => ({ author: { login: 'web-everything' }, createdAt: '2026-10-10T03:00:00Z',
+    const capRecord = (round = 12, grantIds = null) => ({ author: { login: 'web-everything' }, createdAt: '2026-10-10T03:00:00Z',
       body: buildGateComment({ pr: 4722, head: HEAD, outcome: GATE_OUTCOMES.ROUND_CAP, plan: { sendBack: [{ index: 1 }], card: [], advisory: [] },
-        round, result: redTeamResultId(parseRedTeamComment(comment([F()]).body)) }) });
+        round, grantIds, result: redTeamResultId(parseRedTeamComment(comment([F()]).body)) }) });
 
     // Standing-ruling grants (operator option B): the gate uses the SAME trusted reader, so an App-posted grant
     // counts only when the io hands it the scope verified from GitHub at this read.
@@ -227,6 +227,43 @@ describe('applyRedTeamGate', () => {
       expect(calls).toEqual([]);
     });
 
+    it.each([[false, null], [true, null], [false, 'delete'], [true, 'delete'], [false, 'edit'], [true, 'edit']])(
+      'a grant during a cap POST survives the stale record (send-back first: %s, replace old grant: %s)', async (sendFirst, replace) => {
+      const comments = [comment([F()])];
+      const oldAt = '2026-10-18T12:00:00Z';
+      const oldGrant = grant(1, oldAt);
+      if (replace) comments.push(oldGrant);
+      let delayedCap;
+      const { io, calls } = fakeIo({ comments, round: 12, readRoundAsOf: ({ at }) => at === oldAt ? 1 : 12,
+        postComment: (a) => {
+          calls.push(['comment', a]);
+          if (a.body.startsWith(namedGate('round-cap'))) {
+            // Gate A decided without the fresh grant; the operator grants while its POST is in flight.
+            if (replace === 'delete') comments.splice(comments.indexOf(oldGrant), 1);
+            if (replace === 'edit') oldGrant.body = 'Grant withdrawn';
+            comments.push(grant());
+            if (sendFirst) { delayedCap = a; return; }
+          }
+          comments.push({ author: { login: 'web-everything' }, body: a.body });
+        },
+      });
+      expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'applied', outcome: 'round-cap' });
+      if (sendFirst) {
+        expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'applied', outcome: 'sent-back' });
+        comments.push({ author: { login: 'web-everything' }, body: delayedCap.body });
+      }
+      else {
+        expect(await applyRedTeamGate({ repo: REPO, pr: 4722, dryRun: true }, io))
+          .toMatchObject({ status: 'dry-run', reopened: true, cap: 13, outcome: 'sent-back' });
+        expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'applied', outcome: 'sent-back' });
+      }
+      expect(calls.filter(([kind]) => kind === 'sendBack')).toHaveLength(1);
+      expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'already-acted', outcome: 'sent-back' });
+      const pr = { number: 4722, repo: REPO, headRefOid: HEAD, labels: ['review:changes'], comments };
+      expect(redTeamQueueReason(pr)).toMatch(/the fixer owns them/);
+      expect(redTeamRulingNeeded({ ...pr, labels: ['review:accepted'] })).toBeNull();
+    });
+
     it('--by=1 granted at round 12 sends the break back once: the cap is anchored at the grant round', async () => {
       const comments = [comment([F()]), capRecord(), grant(1)];
       const { io, calls } = fakeIo({ comments, round: 12, readRoundAsOf: () => 12 });
@@ -240,6 +277,26 @@ describe('applyRedTeamGate', () => {
       const pr = { number: 4722, repo: REPO, headRefOid: HEAD, labels: ['review:changes'], comments };
       expect(redTeamQueueReason(pr)).toMatch(/the fixer owns them/);
       expect(redTeamRulingNeeded({ ...pr, labels: ['review:accepted'] })).toBeNull();
+    });
+
+    it('a later edit cannot make a historical sender claim the enlarged grant', async () => {
+      const extension = grant(1);
+      const comments = [comment([F()]), capRecord(), extension];
+      let round = 12;
+      const { io, calls } = fakeIo({ comments, readRound: () => round, readRoundAsOf: () => 12 });
+      expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'applied', outcome: 'sent-back' });
+      const snapshot = parseRedTeamGateMarker(comments.at(-1).body).grantIds;
+      expect(snapshot).toHaveLength(1);
+      // A concurrent decision at round 13 consumed the original grant and landed after the sender.
+      comments.push(capRecord(13, snapshot));
+      round = 13;
+      expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'already-acted', outcome: 'round-cap' });
+      extension.body = grant(2).body;
+      expect(await applyRedTeamGate({ repo: REPO, pr: 4722, dryRun: true }, io))
+        .toMatchObject({ status: 'dry-run', reopened: true, cap: 14, outcome: 'sent-back' });
+      expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'applied', outcome: 'sent-back' });
+      expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'already-acted', outcome: 'sent-back' });
+      expect(calls.filter(([kind]) => kind === 'sendBack')).toHaveLength(2);
     });
 
     it('the next round past the grant is capped again: exactly one more round', async () => {
@@ -292,7 +349,7 @@ describe('applyRedTeamGate', () => {
     const { io, calls } = fakeIo({ comments: [earlier, done, newer] });
     expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).status).toBe('applied');
     expect(kinds(calls)).toEqual(['sendBack', 'ledger', 'comment']);
-    expect(calls[2][1].body.startsWith(redTeamGateMarker(4722, HEAD, 'sent-back', redTeamResultId(parseRedTeamComment(newer.body))))).toBe(true);
+    expect(calls[2][1].body.startsWith(redTeamGateMarker(4722, HEAD, 'sent-back', redTeamResultId(parseRedTeamComment(newer.body)), []))).toBe(true);
     const again = fakeIo({ comments: [earlier, done, newer, { author: { login: 'web-everything' }, body: calls[2][1].body }] });
     expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, again.io)).status).toBe('already-acted');
   });

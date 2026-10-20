@@ -236,4 +236,30 @@ describe('sendBackStepState — a grant after the cap reopens the send-back step
     expect(sendBackStepState([rec('round-cap', 1), rec('round-cap', 3)], [2])).toEqual({ outcome: 'round-cap', reopened: false });
     expect(sendBackStepState([rec('round-cap', 2)], [1])).toEqual({ outcome: 'round-cap', reopened: false });
   });
+  it('uses the cap decision snapshot even when its comment lands after the grant or send-back', () => {
+    const cap = (at, grantIds) => ({ ...rec('round-cap', at), gate: { outcome: 'round-cap', grantIds } });
+    const sent = (at, grantIds = ['1']) => ({ ...rec('sent-back', at), gate: { outcome: 'sent-back', grantIds } });
+    expect(sendBackStepState([cap(2, [])], [1])).toEqual({ outcome: 'round-cap', reopened: true });
+    expect(sendBackStepState([cap(2, []), sent(3)], [1])).toEqual({ outcome: 'sent-back', reopened: false });
+    expect(sendBackStepState([sent(2), cap(3, [])], [1])).toEqual({ outcome: 'sent-back', reopened: false });
+    // An older decision cannot undo a newer decision that already considered the grant.
+    expect(sendBackStepState([cap(2, ['1']), cap(3, [])], [1])).toEqual({ outcome: 'round-cap', reopened: false });
+    expect(sendBackStepState([sent(2), cap(3, ['1'])], [1])).toEqual({ outcome: 'round-cap', reopened: false });
+    // Unknown repo / foreign grants receive no credit, even with snapshot metadata.
+    expect(sendBackStepState([sent(2), cap(3, [])])).toEqual({ outcome: 'round-cap', reopened: false });
+    // Replacing an older grant does not hide the fresh one behind an unchanged grant count.
+    expect(sendBackStepState([cap(2, ['old'])], [{ index: 1, id: 'new' }])).toEqual({ outcome: 'round-cap', reopened: true });
+    // A historical sender cannot claim it saw a later edit to a grant at the same position.
+    expect(sendBackStepState([sent(2, ['old']), cap(3, ['old'])], [{ index: 1, id: 'edited' }]))
+      .toEqual({ outcome: 'round-cap', reopened: true });
+    expect(sendBackStepState([rec('sent-back', 2), cap(3, ['old'])], [{ index: 1, id: 'edited' }]))
+      .toEqual({ outcome: 'round-cap', reopened: true });
+    expect(sendBackStepState([cap(2, ['old']), rec('sent-back', 3)], [{ index: 1, id: 'edited' }]))
+      .toEqual({ outcome: 'round-cap', reopened: true });
+    // Duplicate senders with older or absent snapshots cannot erase proven usage of the fresh grant.
+    expect(sendBackStepState([sent(2), sent(3, []), cap(4, [])], [1]))
+      .toEqual({ outcome: 'sent-back', reopened: false });
+    expect(sendBackStepState([sent(2), rec('sent-back', 3), cap(4, [])], [1]))
+      .toEqual({ outcome: 'sent-back', reopened: false });
+  });
 });
