@@ -2,7 +2,7 @@
 kind: story
 size: 2
 status: open
-scope: ["["we:scripts/lib/__tests__/merge-gate-inventory.test.mjs"", ""we:scripts/lib/drain-skip-reasons.mjs"]"]
+scope: ["we:scripts/lib/__tests__/merge-gate-inventory.test.mjs", "we:scripts/lib/drain-skip-reasons.mjs"]
 dateOpened: "2026-10-20"
 tags: []
 ---
