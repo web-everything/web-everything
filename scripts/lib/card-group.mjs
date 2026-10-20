@@ -659,7 +659,7 @@ export function createCardGrouping({
      * Form at most one new group from this pass's deferrals. `outcomes` = enqueueOutcomes, `verdicts` = the pass
      * candidates (for labels / listed head). Returns { formed?, plan?, reason }.
      */
-    form({ outcomes = [], verdicts = [], deferred: planDeferred = [], early = [] } = {}) {
+    form({ outcomes = [], verdicts = [], deferred: planDeferred = [], early = [], admitted = null } = {}) {
       if (!setting.enabled) return { reason: 'disabled' };
       if (!statePath) return { reason: 'no state path' };
       try {
@@ -715,6 +715,10 @@ export function createCardGrouping({
           try { pr = readPr(s.num); } catch (e) { say(`#${s.num} live read failed (${firstLine(e)}) — left out`); continue; }
           const bad = admissible(pr, s.headSha);
           if (bad) { say(`#${s.num} left out (${bad})`); continue; }
+          // The drain's own single-path gates, run fresh by the caller (`admitted`: num → head it admitted): no
+          // admission at this exact head → left out. No map at all → every member left out (fail closed).
+          if (!(admitted instanceof Map)) { say(`#${s.num} left out (no fresh drain admission wired — fail closed)`); continue; }
+          if (admitted.get(Number(s.num)) !== s.headSha) { say(`#${s.num} left out (not admitted by the drain's fresh pre-enqueue gates at ${s.headSha.slice(0, 10)})`); continue; }
           if (typeof prestage === 'function') {
             const adm = prestage({ num: s.num, repo: null, baseRefName: 'main' }, s.headSha);
             if (!adm?.allowed) { say(`#${s.num} left out (admission: ${adm?.reason || 'refused'})`); continue; }

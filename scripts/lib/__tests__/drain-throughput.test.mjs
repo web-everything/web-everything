@@ -120,8 +120,10 @@ describe('drain throughput', () => {
   });
   it('earlyHold stamps and requests a local priority head before returning its recorded red-team hold', async () => {
     const src = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');
-    const start = src.indexOf('    const earlyHold = c =>');
-    const end = src.indexOf('    if (throughput.value.holdFirst)', start);
+    // earlyHold is the memoised single definition `preEnqueueHold` (card-group admission reuses it).
+    expect(src).toContain('const earlyHold = c => memoHold(c, () => preEnqueueHold(c));');
+    const start = src.indexOf('  const preEnqueueHold = async');
+    const end = src.indexOf('  // xym8nt4 — card-group admission', start);
     const hold = { kind: 'red-team-pending', deferred: true };
     const order = [];
     const strategy = {
@@ -130,8 +132,8 @@ describe('drain throughput', () => {
       priorityReserveHold: () => null,
       recordedHold: () => { order.push('hold'); return hold; },
     };
-    const earlyHold = runInNewContext(`${src.slice(start, end)}; earlyHold`, {
-      memoHold: (_c, fn) => fn(), preparedPass: { plan: { deferred: [] } },
+    const earlyHold = runInNewContext(`${src.slice(start, end)}; preEnqueueHold`, {
+      preparedPass: { plan: { deferred: [] } },
       localSlug: 'o/r', escalationRelief: {}, hasUnclearedReviewLabel: () => false, numberingWithdrawalOwed: () => false,
       throughput: { value: { overlapFirst: false } }, isLocalRepo: () => true,
       isPriorityLabels: labels => labels.includes('priority:now'), mergeStrategy: strategy,
@@ -141,6 +143,10 @@ describe('drain throughput', () => {
     expect(order).toEqual(['stamp', 'request', 'hold']);
     expect(strategy.priorityReserveStamp).toHaveBeenCalledWith(c, 'current');
     expect(strategy.requestRedTeamWhileDeferred).toHaveBeenCalledWith(c, 'current');
+    // forGroup: the same safety hold, without the side-effect stamp/request.
+    order.length = 0;
+    expect(await earlyHold(c, { forGroup: true })).toEqual(hold);
+    expect(order).toEqual(['hold']);
   });
   it.each([
     ['fresh round seed is reused', 10_000, false],

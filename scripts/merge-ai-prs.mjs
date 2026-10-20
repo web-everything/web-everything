@@ -205,6 +205,7 @@ import { ensureFreshGithubAppEnv } from './lib/github-app-auth-env.mjs';
 // pass's TOTAL ms, no breakdown). See pass-timings.mjs's own header for the full shape/rationale.
 import { buildSkipReasons, classifySkipReason, formatSkipSummary, formatSkipReasonsLine } from './lib/drain-skip-reasons.mjs';
 import { createCardGrouping } from './lib/card-group.mjs';
+import { isCardPath } from './ci-card-only.mjs';
 import { readQueueFacts } from './lib/merge-queue-adaptive-batching.mjs';
 import { readQueueEntryFiles } from './lib/queue-file-overlap.mjs';
 import { resolveDrainThroughput, createHoldMemo, carryReady, readCarry, writeCarry, orderCarry } from './lib/drain-throughput.mjs';
@@ -6683,6 +6684,61 @@ async function runCli() {
     c.decision = 'skip'; c.reason = 'pre-staged while required CI is pending — no enqueue';
     if (!skipped.includes(c)) skipped.push(c);
   }
+  // The single path's pre-enqueue holds, ONE definition: the cascade's early hold (memoised) and card-group admission
+  // both call it. `forGroup` skips only the ORDERING waits grouping replaces (overlap-yield, overlapFirst's
+  // queue-file overlap — the group's own queue wait covers the queue) and the side-effect stamps/requests; every
+  // safety hold (review hold, numbering withdrawal, priority reservation, recorded red-team/send-back hold) applies.
+  const preEnqueueHold = async (c, { forGroup = false } = {}) => {
+    const overlap = preparedPass.plan.deferred.find(d => d.num === c.num && d.repo === c.repo
+      && (d.overlapYield || d.waitOn?.some(w => String(w).startsWith('overlap-yield:'))));
+    if (overlap && !forGroup) return { kind: 'overlap-yield', reason: overlap.waitOn.join(', '), overlapYield: overlap.overlapYield };
+    // Reuse the review hold rule, including the existing explicit relief for pending.
+    const allowPending = (escalationRelief.prs || []).includes(Number(c.num)) || (!!escalationRelief.passWide && !!label);
+    if (hasUnclearedReviewLabel(c.prLabels || [], { allowPending }))
+      return { kind: 'review-hold', reason: 'unsatisfied review hold (review:pending/review:human/review:changes)' };
+    if (numberingWithdrawalOwed(c.repo || localSlug, c.num))
+      return { kind: 'numbering', reason: 'numbering re-stamp withdrawal owed' };
+    if (!forGroup && isPriorityLabels(c.prLabels)) mergeStrategy.priorityReserveStamp(c, c.listedHeadSha || c.headSha);
+    if (!forGroup && throughput.value.overlapFirst) {
+      const hold = mergeStrategy.queueOverlapHold(c, c.listedHeadSha || c.headSha);
+      if (hold) {
+        try { await mergeStrategy.requestRedTeamWhileDeferred(c, c.listedHeadSha || c.headSha); }
+        catch { /* Request failure must never change the queue-file-overlap hold. */ }
+        const [blockers, files] = hold.reason.split(' share ');
+        if (!AS_JSON) process.stderr.write(`  merge-queue file-overlap: early defer #${c.num} (shares ${files.split(', ')[0]} with queued ${blockers.split(',')[0]}) - drain.overlapFirst=on (${throughput.sources?.overlapFirst || 'default'})\n`);
+        return hold;
+      }
+    }
+    if (!forGroup && (!isLocalRepo(c.repo) || isPriorityLabels(c.prLabels))) {
+      try { await mergeStrategy.requestRedTeamWhileDeferred(c, c.listedHeadSha || c.headSha); }
+      catch { /* Request failure must never change the decision. */ }
+    }
+    const reserve = mergeStrategy.priorityReserveHold(c, c.listedHeadSha || c.headSha);
+    if (reserve) return reserve;
+    return mergeStrategy.recordedHold(c, c.listedHeadSha || c.headSha);
+};
+
+  // xym8nt4 — card-group admission = the single path's own gates, fresh: the pre-enqueue holds above, then the SAME
+  // fresh full classification the cascade runs per candidate before enqueue (`revalidateFresh`: CI/CodeQL,
+  // review:held-mechanical, labels, mergeability, pinned head). Returns Map num → admitted head; a refusal or read
+  // error leaves the PR out (form() refuses any member not in the map at its own head).
+  const cardGroupAdmission = async (pool) => {
+    const admitted = new Map();
+    const cands = pool.filter(v => isLocalRepo(v.repo) && v.listedFilesComplete === true && Array.isArray(v.listedFiles) && v.listedFiles.length
+      && v.listedFiles.every(f => isCardPath(typeof f === 'string' ? f : f?.path)) && (Array.isArray(v.prLabels) ? v.prLabels : []).some(l => (typeof l === 'string' ? l : l?.name) === 'review:accepted'));
+    for (const c of cands) {
+      const head = c.listedHeadSha || c.headSha || null;
+      try {
+        const hold = await preEnqueueHold(c, { forGroup: true });
+        if (hold) { process.stderr.write(`  card-group: #${c.num} not admitted (${hold.kind}: ${hold.reason})\n`); continue; }
+        const r = await revalidateFresh(c.repo, c.num, { queueRequiredChecks: queueRequiredChecksOf(c.repo), requiredCheck: REQUIRED,
+          allowPendingReview: false, defaultBranch: defaultBranchOf(c.repo), expectedHeadSha: head });
+        if (r.decision !== 'merge') { process.stderr.write(`  card-group: #${c.num} not admitted (fresh re-read: ${r.reason})\n`); continue; }
+        admitted.set(Number(c.num), r.headSha || head);
+      } catch (e) { process.stderr.write(`  card-group: #${c.num} not admitted (admission read failed: ${String(e?.message || e).split('\n')[0]})\n`); }
+    }
+    return admitted;
+  };
   let deferred = [];
   if (DRY_RUN) {
     // Report the planned first-pass order (blockedBy + #2393 stackParents-honoured) without merging. Nothing has
@@ -6718,7 +6774,7 @@ async function runCli() {
     if (onlyPr == null && mergeStrategy.enqueues(null)) {
       cardGrouping.reconcile();
       const early = remaining.filter(v => isLocalRepo(v.repo) && v.decision === 'merge' && !v.prestagePendingCi);
-      const grouping = cardGrouping.form({ verdicts, early });
+      const grouping = cardGrouping.form({ verdicts, early, admitted: await cardGroupAdmission(early) });
       if (grouping?.formed) process.stderr.write(`  card-group: formed #${grouping.formed.pr} before single enqueue (group first)\n`);
       else if (grouping?.reason && !/^(disabled|[01] card-only overlap deferral)/.test(grouping.reason)) process.stderr.write(`  card-group: no early group — ${grouping.reason}\n`);
     }
@@ -6730,35 +6786,7 @@ async function runCli() {
       enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', ...grouped });
     }
     const memoHold = createHoldMemo(throughput.value.holdFirst);
-    const earlyHold = c => memoHold(c, async () => {
-      const overlap = preparedPass.plan.deferred.find(d => d.num === c.num && d.repo === c.repo
-        && (d.overlapYield || d.waitOn?.some(w => String(w).startsWith('overlap-yield:'))));
-      if (overlap) return { kind: 'overlap-yield', reason: overlap.waitOn.join(', '), overlapYield: overlap.overlapYield };
-      // Reuse the review hold rule, including the existing explicit relief for pending.
-      const allowPending = (escalationRelief.prs || []).includes(Number(c.num)) || (!!escalationRelief.passWide && !!label);
-      if (hasUnclearedReviewLabel(c.prLabels || [], { allowPending }))
-        return { kind: 'review-hold', reason: 'unsatisfied review hold (review:pending/review:human/review:changes)' };
-      if (numberingWithdrawalOwed(c.repo || localSlug, c.num))
-        return { kind: 'numbering', reason: 'numbering re-stamp withdrawal owed' };
-      if (isPriorityLabels(c.prLabels)) mergeStrategy.priorityReserveStamp(c, c.listedHeadSha || c.headSha);
-      if (throughput.value.overlapFirst) {
-        const hold = mergeStrategy.queueOverlapHold(c, c.listedHeadSha || c.headSha);
-        if (hold) {
-          try { await mergeStrategy.requestRedTeamWhileDeferred(c, c.listedHeadSha || c.headSha); }
-          catch { /* Request failure must never change the queue-file-overlap hold. */ }
-          const [blockers, files] = hold.reason.split(' share ');
-          if (!AS_JSON) process.stderr.write(`  merge-queue file-overlap: early defer #${c.num} (shares ${files.split(', ')[0]} with queued ${blockers.split(',')[0]}) - drain.overlapFirst=on (${throughput.sources?.overlapFirst || 'default'})\n`);
-          return hold;
-        }
-      }
-      if (!isLocalRepo(c.repo) || isPriorityLabels(c.prLabels)) {
-        try { await mergeStrategy.requestRedTeamWhileDeferred(c, c.listedHeadSha || c.headSha); }
-        catch { /* Request failure must never change the decision. */ }
-      }
-      const reserve = mergeStrategy.priorityReserveHold(c, c.listedHeadSha || c.headSha);
-      if (reserve) return reserve;
-      return mergeStrategy.recordedHold(c, c.listedHeadSha || c.headSha);
-    });
+    const earlyHold = c => memoHold(c, () => preEnqueueHold(c));
     if (throughput.value.holdFirst) {
       for (const c of remaining.filter(v => v.decision === 'merge')) {
         let hold;
@@ -7488,7 +7516,7 @@ async function runCli() {
   // pass's card-only queue-file-overlap deferrals. Never throws; a failure leaves every PR on the serial path.
   if (onlyPr == null && mergeStrategy.enqueues(null)) {
     cardGrouping.reconcile();
-    const grouping = cardGrouping.form({ outcomes: enqueueOutcomes, verdicts, deferred });
+    const grouping = cardGrouping.form({ outcomes: enqueueOutcomes, verdicts, deferred, admitted: await cardGroupAdmission(verdicts.filter(v => !enqueueOutcomes.some(o => o.outcome === 'enqueued' && Number(o.num) === Number(v.num) && isLocalRepo(o.repo))) ) });
     if (grouping?.reason && !/^(disabled|[01] card-only overlap deferral)/.test(grouping.reason)) process.stderr.write(`  card-group: no group this pass — ${grouping.reason}\n`);
   }
   const result = { ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, skipReasons, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text, retryable: !!l.err.retryable })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
