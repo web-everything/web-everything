@@ -471,9 +471,12 @@ export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), readRu
  */
 /**
  * A no-verdict same-head hold past its last cool-down release is permanent (as on main) and must never be silent:
- * raise ONE needs-you event per repo+PR+head. The receipt is reserved (`wx`) before publishing, so repeated ticks and
- * concurrent daemons never emit twice; a failed publish drops the receipt so the next tick retries. Never throws.
+ * raise ONE needs-you event per repo+PR+head. A `pending` receipt is reserved (`wx`) before publishing and marked
+ * `published` after, so repeated ticks and concurrent daemons do not emit twice; a failed publish drops the receipt so
+ * the next tick retries, and a stale `pending` (crash, failed cleanup) or corrupt receipt is reclaimed. Never throws.
  */
+/** A `pending` needs-you reservation older than this is treated as abandoned (crash or failed cleanup) and retried. */
+export const NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS = 10 * 60_000;
 export function raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now = Date.now(), log = line => console.error(line),
   publish }) {
   try {
@@ -485,17 +488,29 @@ export function raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now = Date.n
     }
     const path = join(dir, `${hash([repo, Number(prNumber), hold.head, 'no-verdict-needs-you'])}.json`);
     mkdirSync(dir, { recursive: true });
-    try { writeFileSync(path, JSON.stringify({ at: new Date(now).toISOString(), repo, pr: Number(prNumber), head: hold.head }), { flag: 'wx' }); }
+    const receipt = state => JSON.stringify({ state, at: new Date(now).toISOString(), repo, pr: Number(prNumber), head: hold.head });
+    let prior;
+    try { prior = JSON.parse(readFileSync(path, 'utf8')); }
+    catch (e) { if (e.code !== 'ENOENT') prior = { state: 'corrupt' }; }
+    if (prior?.state === 'published') return false;
+    // A fresh `pending` reservation belongs to a publish in flight elsewhere. A stale or corrupt one (a crash between
+    // reserve and publish, or a failed publish whose receipt could not be removed) is reclaimed: never silent forever.
+    if (prior?.state === 'pending' && Number.isFinite(Date.parse(prior.at)) && now - Date.parse(prior.at) < NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS) return false;
+    try { writeFileSync(path, receipt('pending'), { flag: prior ? 'w' : 'wx' }); }
     catch (e) { if (e.code === 'EEXIST') return false; throw e; }
     try {
       publish({ repo, pr: Number(prNumber), head: hold.head, kind: 'review-no-verdict',
         reason: `review verdict never landed after ${hold.count} runs and ${hold.noVerdict?.releasesSpent ?? 0} cool-down retries; held until a push or re-arm`,
         pick: `https://github.com/${repo}/pull/${prNumber}` });
     } catch (e) {
-      try { unlinkSync(path); } catch { /* the next tick retries only if the receipt is gone */ }
+      // Drop the reservation so the next tick retries; if that fails too, the pending receipt goes stale and is reclaimed.
+      try { unlinkSync(path); } catch { /* reclaimed after NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS */ }
       log(`${repo}#${prNumber} no-verdict needs-you could not be published: ${String(e?.message ?? e).split('\n')[0]}`);
       return false;
     }
+    // If this write fails the receipt stays pending and the event may be raised again after the stale window: a rare
+    // duplicate is preferred to silence (the feed's own open-key state also dedupes it).
+    try { writeFileSync(path, receipt('published')); } catch { /* see above */ }
     log(`${repo}#${prNumber} NEEDS-YOU review-no-verdict head ${hold.head.slice(0, 9)}: ${hold.count} runs, `
       + `${hold.noVerdict?.releasesSpent ?? 0}/${hold.noVerdict?.releases ?? 0} cool-down retries spent `
       + `(reviewNoVerdictRetry.cooldownReleases source=${hold.noVerdict?.source ?? 'standard'}); permanent hold`);
