@@ -181,6 +181,7 @@ import { VERIFY_FILENAME, keepMarkerAfterReset, readVerifyMarker } from './lib/l
 import { checkLaneHold, laneHoldJournalFields, clearLaneAwaitRecords } from './lib/lane-hold-io.mjs';
 import { resolveLaneHoldSettings } from './lib/lane-lease.mjs';
 import { laneGitHardeningEnv, scrubRiskyLaneConfig } from './lib/lane-git-hardening.mjs';
+import { readGitIdentity, laneIdentityReport, configHasUserOverride, resolveGitIdentityPlaceholders, GIT_IDENTITY_FIX_HINT } from './lib/git-identity.mjs';
 
 // #2560 — `--scope=a,b,c` → a normalized, repo-qualified array (empty when the flag is absent/blank).
 const parseScopeFlag = (v) => (typeof v === 'string' && v ? normScope(v.split(',')) : []);
@@ -2821,6 +2822,23 @@ function printStatus(repo) {
         (r.leased ? ` · ${describeLease(r.lease)}` : ''),
     );
   }
+  warnPlaceholderIdentity(rows.filter((r) => r.exists).map((r) => ({ lane: r.lane, dir: r.path })));
+}
+
+// 2026-10-05..20: the global git config said `test` / `test@test.com` and every lane commit was authored "test"
+// with nothing flagging it. Human-readable `status` (and `provision`, which ends in it) now warns. NOT in `--json`:
+// the machine readers poll that on every tick and only want lane rows. Cheap: one `git var` for the ambient
+// identity, plus one per lane whose own `.git/config` overrides `[user]` (see `laneIdentityReport`).
+function warnPlaceholderIdentity(lanes) {
+  try {
+    const env = laneGitHardeningEnv({ ...process.env, GIT_OPTIONAL_LOCKS: '0' });
+    const hasOverride = (dir) => { try { return configHasUserOverride(readFileSync(join(dir, '.git', 'config'), 'utf8')); } catch { return false; } };
+    const r = laneIdentityReport({ lanes, readIn: (dir) => readGitIdentity(dir, { env }), hasOverride, lists: resolveGitIdentityPlaceholders() });
+    if (r.status === 'ok') return;
+    const shown = r.bad.slice(0, 3).map((b) => `lane-${b.lane}: ${b.detail}`).join(' | ');
+    log(`⚠ git identity ${r.status.toUpperCase()} in ${r.bad.length} lane(s) — commits there would carry it (the lane pre-commit guard refuses them). ${shown}${r.bad.length > 3 ? ' | …' : ''}`);
+    log(`  ${GIT_IDENTITY_FIX_HINT}`);
+  } catch { /* a reporting aid never breaks status */ }
 }
 
 // ── list --acquirable: single-flight + short result cache (#xn432dz) ─────────────────────────────────
