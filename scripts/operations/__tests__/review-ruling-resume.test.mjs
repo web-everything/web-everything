@@ -551,6 +551,12 @@ describe('runReviewLoopOnce — a ruling on an unchanged head resumes the paused
     const p = { number: 4361, headRefOid: reviewRunEvidence(store.read('r-1')).head, comments: [], labels: [] };
     expect(decideReferralHold(p, [reviewRunEvidence(store.read('r-1'))], { repo: 'o/n', now: Date.now() + 86_400_000 }))
       .toMatchObject({ exhausted: true, retryAt: null });
+    // Spent: even if a review is dispatched anyway, it never falls back to a fresh panel; the round refuses.
+    const refused = await runReviewLoopOnce({ declaration, registry, argv, store, sinks: dies, makeJudge,
+      mintRunId: () => 'must-not-be-minted', findResumableRun: () => 'r-1' });
+    expect(refused).toMatchObject({ code: 2, stopped: 'refused' });
+    expect(refused.lines.join('\n')).toMatch(/persist retries are spent/);
+    expect(store.read('must-not-be-minted')).toBeFalsy();
   });
 
   it('without a resumable run it starts a fresh review exactly as before (new push, re-arm, send-back)', async () => {

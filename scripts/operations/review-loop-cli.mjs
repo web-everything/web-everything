@@ -80,7 +80,7 @@ import {
 import { unattendedAcceptableVerdict, unattendedAcceptHold, unattendedAcceptPolicy } from '../lib/unattended-review-accept.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { hasUncapturedPrevention } from '../lib/jury-core.mjs';
-import { findResumableParkedRun, readReviewRunEvidence, reviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
+import { findResumableParkedRun, persistRetryBudgetSpent, readReviewRunEvidence, reviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
@@ -641,6 +641,7 @@ export async function runReviewLoopOnce({
     }
     // Any doubt (an unreadable record, a run that cannot be rewound) falls back to a fresh review, never aborts the round.
     let rewound = null;
+    let persistSpent = null;
     try {
       const parked = resumedId ? store.read(resumedId) : null;
       // A run parked on a confirm, or one an earlier resume rewound and never finished (it died or threw part-way).
@@ -653,7 +654,12 @@ export async function runReviewLoopOnce({
       // starts a fresh review instead (same fallback as any other doubt here).
       const rosterMatches = !parked || securitySeatFromRun(parked) === declaresSecuritySeat(declaration)
         && Boolean(parked?.findings?.read?.cardOnlyLight) === Boolean(declaration.cardOnlyLight);
-      if (parked && parked.op === declaration.name && attempts < RESUME_MAX_ATTEMPTS && rosterMatches
+      // Card 5752 — a parked run whose referral persist failed and whose retry budget is spent is never replaced by a
+      // fresh panel: that is the operator's call now (the exhausted hold raises the needs-you), so the round refuses.
+      const parkedEvidence = parked && parked.op === declaration.name ? reviewRunEvidence(parked) : null;
+      if (parkedEvidence?.persistenceFailed && (persistRetryBudgetSpent(parkedEvidence) || attempts >= RESUME_MAX_ATTEMPTS)) {
+        persistSpent = parked.id;
+      } else if (parked && parked.op === declaration.name && attempts < RESUME_MAX_ATTEMPTS && rosterMatches
         && (parked.pending?.kind === 'confirm' || unfinishedResume)) {
         rewound = rewindRunToStep(parked, { registry, step: RESUME_STEP, at: now() });
         // The rewind drops the parked verdict and the referral step, and the record is saved before the resumed pass
@@ -673,6 +679,11 @@ export async function runReviewLoopOnce({
             ...(persistRetries ? { persistRetries } : {}) } };
       }
     } catch { rewound = null; }
+    if (persistSpent) {
+      return { code: 2, run: null, stopped: 'refused', lines: [`error: run ${persistSpent} failed to persist its mandatory `
+        + 'referrals and its automatic persist retries are spent; no fresh panel is started in its place. It waits on the '
+        + 'operator (needs-you via the exhausted referral hold) or a new push.'] };
+    }
     if (rewound) {
       run = rewound;
       store.write(run);

@@ -431,6 +431,24 @@ describe('same-head review loop regression (live #202)', () => {
     expect(hold(pr(), [reviewRunEvidence(resumed(REFERRAL_RETRY_MS.length))], at + 1))
       .toMatchObject({ retryAt: null, exhausted: true });
   });
+  // Codex audit round 2: the budget is checked BEFORE any wake. A ruling or an automated re-arm cannot fix a persist,
+  // so it neither skips the backoff nor revives a spent budget; only the operator in person (or a new push) does.
+  it('checks the persist budget before any wake: rulings and automated re-arms do not release, the operator does', () => {
+    const resumed = n => reviewRunEvidence({ ...run({ failure: true }), resumeOf: { persistRetries: n, attempts: 1 } });
+    const ruling = comment(renderReferralRecord({ ...record(), rulings: [{ id: 'r1', key, reviewerId: record().reviewer.id,
+      lens: record().reviewer.lens, result: 'not-real', rationale: 'checked', evidence: ['diff'] }] }), at + 60_000);
+    const rearm = comment(`${REARM_COMMENT_MARKER} round 2`, at + 60_000);
+    const operator = comment('please look again', at + 60_000, 'chalbert');
+    // Inside the budget: the backoff stands against a ruling and a re-arm.
+    expect(hold(pr({ comments: [ruling, rearm] }), [resumed(0)], at + 120_000)).toMatchObject({ retryAt: at + REFERRAL_RETRY_MS[0] });
+    // Spent: still held (exhausted) whatever automation posts, long after.
+    const spent = resumed(REFERRAL_RETRY_MS.length);
+    expect(hold(pr({ comments: [ruling, rearm] }), [spent], at + 86_400_000)).toMatchObject({ exhausted: true, retryAt: null });
+    expect(hold(pr({ comments: [ruling, rearm] }), [spent], at + 86_400_000).why).toMatch(/retries are spent/);
+    // The operator's own reply answers the needs-you; a new push owes a new review.
+    expect(hold(pr({ comments: [operator] }), [spent], at + 120_000)).toBeNull();
+    expect(hold(pr({ headRefOid: 'b'.repeat(40) }), [spent], at + 120_000)).toBeNull();
+  });
   // Review round 1, finding 1: the referral hold's deliberate live release must not be re-held by the same-head guard.
   it('does not re-hold a PR whose referrals were ruled in the live thread before the parked run started', () => {
     const r = record();
@@ -766,7 +784,10 @@ describe('a ruling on an unchanged head resumes the parked run (replay of #4361)
     const failed = reviewRunEvidence(run({ failure: true }));
     expect(find(pr({ comments: thread() }), [failed])).toEqual({ id: 'review-pr-parked', head });
     expect(find(pr({ comments: thread([ruling]) }), [failed])).toEqual({ id: 'review-pr-parked', head });
-    expect(find(pr({ comments: thread([comment(`${REARM_COMMENT_MARKER} round 2`, at + 90_000)]) }), [failed])).toBeNull();
+    // Only the operator in person asks for a fresh look; an automated re-arm still resumes (card 5752 round 3).
+    expect(find(pr({ comments: thread([comment(`${REARM_COMMENT_MARKER} round 2`, at + 90_000)]) }), [failed]))
+      .toEqual({ id: 'review-pr-parked', head });
+    expect(find(pr({ comments: thread([comment('please look again', at + 90_000, 'chalbert')]) }), [failed])).toBeNull();
     expect(find(pr({ headRefOid: 'b'.repeat(40) }), [failed])).toBeNull();
   });
   it('a run that was already resumed does not resume on the ruling it already answered', () => {
