@@ -2,7 +2,7 @@
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/check-standards.mjs", "we:scripts/check-standards-rules.mjs", "we:scripts/lib/", "we:scripts/merge-ai-prs.mjs", "we:scripts/conveyor/parked-pr-conflict-watch.mjs"]
+scope: ["we:scripts/check-standards.mjs", "we:scripts/__tests__/check-standards.test.mjs", "we:scripts/check-standards-rules.mjs", "we:scripts/lib/", "we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/conveyor/parked-pr-conflict-watch.mjs", "we:scripts/conveyor/__tests__/parked-pr-conflict-watch.test.mjs"]
 dateOpened: "2026-10-20"
 tags: []
 ---
@@ -16,7 +16,7 @@ PR #5762's advisory review (2026-10-20) owes prevention for the security and cor
 - [A1] **Executable** — `npm run check:standards` rejects a fixture that introduces an unclassified skip/defer kind in a landing path. Enumerate emitted scheduling/admission kinds, including helper-returned kinds, and compare them with an explicit inventory; do not confuse unrelated error/status `kind` fields with drain kinds.
 - [A2] **Executable** — `npm run check:standards` rejects a fixture adding a `scripts/lib/*.mjs` export with no sibling test reference. Carry test files with carried library files. Cover both a missing test and an existing but unrelated test.
 - [A3] **Executable** — A standards-rule fixture containing an untested automated candidate exclusion fails; a table-driven exclusion with named negative cases passes. Apply this to item, couple, coupleKey and sibling-repository exclusions in card grouping, and to every `cardGrouping.*` call site in the drain. The rule may require an explicit test map rather than infer semantic coverage from test text.
-- [A4] **Executable** — `npm run test:unit -- scripts/lib/__tests__/card-group-drain-wiring.test.mjs scripts/lib/__tests__/card-group.test.mjs scripts/lib/__tests__/queue-file-overlap.test.mjs scripts/lib/__tests__/card-conflict-resolve.test.mjs scripts/conveyor/__tests__/parked-pr-conflict-watch.test.mjs` exercises source and combined membership, cascade holds, collision repair, ordinary rebase, manifest stripping, whole-pass formation/reconciliation, candidate exclusions, queue truncation, conflict dissolution and resolver refusals. Preserve these cases in the normal affected-test gate.
+- [A4] **Executable** — The suites we:scripts/lib/__tests__/card-group-drain-wiring.test.mjs, we:scripts/lib/__tests__/card-group.test.mjs, we:scripts/lib/__tests__/queue-file-overlap.test.mjs, we:scripts/lib/__tests__/card-conflict-resolve.test.mjs and we:scripts/conveyor/__tests__/parked-pr-conflict-watch.test.mjs exercise source and combined membership, cascade holds, collision repair, ordinary rebase, manifest stripping, whole-pass formation/reconciliation, candidate exclusions, queue truncation, conflict dissolution and resolver refusals. Preserve these cases in the normal affected-test gate.
 - [A5] **Must** — Missing or empty repository identity in an exemption reader must produce a diagnostic or explicit refusal, with a named empty-slug test. It must never exempt a foreign PR with the same number. Preserve the no-group/empty-sweep fast path and test repository-resolution failures before any mutation.
 
 ## Non-goals
@@ -40,3 +40,9 @@ Text-only matching can reward a test that names an export without exercising it.
 ## Test plan
 
 Add accepted and rejected fixtures for A1–A3 to the standards rule tests; include helper-returned kinds and unrelated kinds. Run the A4 suites through heavy admission, plus the existing conflict-watch soak break `card-group-default-repo-conflict-watch`. Verify that removing each exemption or truncation guard makes its own regression case fail. Do not weaken production guards manually to obtain red evidence; use the verify harness's revert-red proof.
+
+From the WE checkout, run the A4 suites:
+
+```bash
+npm run test:unit -- scripts/lib/__tests__/card-group-drain-wiring.test.mjs scripts/lib/__tests__/card-group.test.mjs scripts/lib/__tests__/queue-file-overlap.test.mjs scripts/lib/__tests__/card-conflict-resolve.test.mjs scripts/conveyor/__tests__/parked-pr-conflict-watch.test.mjs
+```

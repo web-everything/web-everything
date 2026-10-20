@@ -2,7 +2,7 @@
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/lib/__tests__/merge-gate-inventory.test.mjs", "we:scripts/lib/drain-skip-reasons.mjs"]
+scope: ["we:scripts/lib/__tests__/merge-gate-inventory.test.mjs", "we:scripts/lib/drain-skip-reasons.mjs", "we:scripts/lib/__tests__/drain-skip-reasons.test.mjs"]
 dateOpened: "2026-10-20"
 tags: []
 ---
@@ -13,7 +13,7 @@ we:scripts/lib/__tests__/merge-gate-inventory.test.mjs > 'exactly classifies eve
 
 ## Acceptance
 
-- [A1] **Executable** — `npm run test:unit -- scripts/lib/__tests__/merge-gate-inventory.test.mjs`: “exactly classifies every drain skip kind” compares the sorted `SKIP_KINDS` set with `classifiedSkipKinds()` with no missing or stale entries. On the overlay stack this must classify `merge-lock-held`, `numbering`, and `red-team-pending` as well as `card-grouped`.
+- [A1] **Executable** — In we:scripts/lib/__tests__/merge-gate-inventory.test.mjs, “exactly classifies every drain skip kind” compares the sorted `SKIP_KINDS` set with `classifiedSkipKinds()` with no missing or stale entries. On the overlay stack this must classify `merge-lock-held`, `numbering`, and `red-team-pending` as well as `card-grouped`.
 - [A2] **Executable** — The same command's “classifies card-group source, reserved-file and unreadable-state holds as enqueue scheduling” maps the real `cardGroupHold` reasons into `card-grouped` and proves the inventory places that kind at enqueue. PR #5762 supplies this case; preserve it while classifying the other overlay kinds.
 - [A3] **Must** — An unknown skip kind still fails the inventory equality check. Do not remove a kind or weaken a landing gate to make the inventory agree.
 
@@ -40,3 +40,9 @@ Misclassifying an admission refusal as scheduling can hide a missing merge-gate 
 ## Test plan
 
 Run the A1 command on main and on the overlay stack. Both must have exact inventory equality; A2 must cover all three group-hold reasons. Add a new kind temporarily in a test fixture to prove that an unclassified kind fails, without changing production guards. The broader emitted-kind standards gate is tracked by prevention card xp7g4rd.
+
+From the WE checkout:
+
+```bash
+npm run test:unit -- scripts/lib/__tests__/merge-gate-inventory.test.mjs
+```

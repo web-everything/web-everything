@@ -11,6 +11,8 @@ import {
 } from '../drain-merge-strategy.mjs';
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 import { rulesetSuggestion } from '../merge-queue-enqueue.mjs';
+// Load the renderer during collection: its cold import graph must not consume a gate assertion's timeout.
+import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 
 const HEAD = 'b'.repeat(40);
 const BASE_TIP = 'e'.repeat(40);
@@ -616,8 +618,7 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [result] })).toMatchObject({ enqueued: true });
     expect(h.calls.some(c => c.includes('--add-label') && c.includes('red-team:clear'))).toBe(true);
   });
-  it.each([false, true])('holds a confirmed break before the gate acts (scheduled=%s)', async scheduled => {
-    const { renderRedTeamComment } = await import('../../operations/review-extra-seats.mjs');
+  it.each([false, true])('holds a confirmed break before the gate acts (scheduled=%s)', scheduled => {
     const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
       pr: 5283, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
       findings: [{ summary: 'unresolved security break', category: 'security', impactIfUnfixed: 'broken', confirmedByRecheck: true }],
@@ -649,7 +650,6 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
   });
   it('a real round-cap record followed by the clear-human renderer releases admission before retry backoff', async () => {
     const { applyRedTeamGate } = await import('../../operations/red-team-gate-apply.mjs');
-    const { renderRedTeamComment } = await import('../../operations/review-extra-seats.mjs');
     const { buildVerdictComment } = await import('../../review-set-label.mjs');
     const { CONFIRMED_BREAKS_DEFAULTS } = await import('../red-team-gate.mjs');
     const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
@@ -677,7 +677,6 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     ['mixed #5460', ['degraded', 'broken'], 5, false],
   ])('follows the real gate disposition: %s', async (_name, impacts, round, enqueued) => {
     const { applyRedTeamGate } = await import('../../operations/red-team-gate-apply.mjs');
-    const { renderRedTeamComment } = await import('../../operations/review-extra-seats.mjs');
     const { CONFIRMED_BREAKS_DEFAULTS } = await import('../red-team-gate.mjs');
     const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
       pr: 5283, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
@@ -973,7 +972,6 @@ describe('drain pre-stage queue admission', () => {
     const prepared = s.prestage(c, HEAD);
     expect(prepared.allowed).toBe(true);
     if (variant === 'break') {
-      const { renderRedTeamComment } = await import('../../operations/review-extra-seats.mjs');
       comments.push({ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
         pr: 5283, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
         findings: [{ summary: 'new break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }],
