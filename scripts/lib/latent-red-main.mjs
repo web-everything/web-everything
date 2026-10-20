@@ -29,7 +29,7 @@ export const CI_WORKFLOW_PATH = '.github/workflows/ci.yml';
 const SUMMARY_JOBS = new Set(['test', 'daemon-soak']);
 const MAX_JOB_LOGS_PER_RUN = 3;
 
-const ioOpts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, timeout: 60_000 };
+const ioOpts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL' };
 const ghText = (exec, args) => {
   const out = exec('gh', args, ioOpts);
   if (isGhDeferred(out)) throw new Error('gh read deferred (low budget)');
@@ -217,9 +217,15 @@ export function runLatentRedMainCheck({ repo, exec, threshold, source = 'standar
     }
     say(`latent-red-main: ${what} — main tip ${tipSha.slice(0, 9)} CI run ${tipRun.databaseId} is completed/success → re-running it (attempt ${reserved.attempts}/${MAX_RERUN_ATTEMPTS}; source: merge-group failure streak) — ${setting}`);
     let rerun;
-    try { ghText(exec, ['run', 'rerun', String(tipRun.databaseId), '--repo', repo]); rerun = 'requested'; }
-    catch (e) { rerun = `failed: ${String(e?.message || e).split('\n')[0].slice(0, 200)}`; }
-    update({ status: rerun === 'requested' ? 'requested' : 'failed', rerun, at: now });
+    // Only a request proven never sent (a gh-throttle deferral) is retryable; any other error may have been applied
+    // by GitHub (lost response, timeout), so it stays an unknown-outcome reservation and is never re-issued.
+    let status;
+    try {
+      const out = exec('gh', ['run', 'rerun', String(tipRun.databaseId), '--repo', repo], ioOpts);
+      if (isGhDeferred(out)) { rerun = 'failed: deferred before sending (low gh budget)'; status = 'failed'; }
+      else { rerun = 'requested'; status = 'requested'; }
+    } catch (e) { rerun = `outcome unknown: ${String(e?.message || e).split('\n')[0].slice(0, 200)}`; status = 'unknown'; }
+    update({ status, rerun, at: now });
     say(`latent-red-main: re-run of main CI run ${tipRun.databaseId} ${rerun} — ${setting}`);
     if (publishOnce(item(rerun))) update({ published: true });
     return { fired: true, action, detail: { ...det, tipSha, rerun } };
