@@ -9,7 +9,7 @@ import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 import {
-  buildRoundExtensionComment, countGrantedRoundExtensions, MAX_TOTAL_ROUND_EXTENSIONS,
+  buildRoundExtensionComment, countGrantedRoundExtensions, countStandingRulingGrantRecords, MAX_TOTAL_ROUND_EXTENSIONS,
 } from '../conveyor/round-extension-mark.mjs';
 
 export const EXTEND_ROUNDS_OP = 'extend-rounds';
@@ -28,7 +28,8 @@ export function planRoundExtension(read, input) {
   if (!/^[^/\s]+\/[^/\s]+$/.test(repo ?? '')) throw new Error('--repo must be <owner/repo>');
   if (!Number.isSafeInteger(pr) || pr <= 0) throw new Error('--pr must be a positive integer');
   if (read.state !== 'OPEN') throw new Error('the PR must be open to extend its rounds');
-  const granted = countGrantedRoundExtensions(read.comments, { repo, pr });
+  // Standing-ruling grants (automation-posted) count toward the ceiling conservatively, verified or not.
+  const granted = countGrantedRoundExtensions(read.comments, { repo, pr }) + countStandingRulingGrantRecords(read.comments, { repo, pr });
   if (granted + by > MAX_TOTAL_ROUND_EXTENSIONS) {
     throw new Error(`this PR already has ${granted} extra round(s); +${by} would pass the ${MAX_TOTAL_ROUND_EXTENSIONS}-round ceiling`);
   }
