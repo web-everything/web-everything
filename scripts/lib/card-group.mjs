@@ -454,18 +454,21 @@ export function cardGroupHold(state, { num, repo, localSlug, files = null } = {}
   return null;
 }
 
-/** PURE: is PR `num` (or head ref) a source or the combined PR of a recorded group? Unreadable state → true. */
+/**
+ * PURE: is PR `num` a source, or THE combined PR (number AND recorded branch), of a group recorded in readable
+ * state? This is an EXEMPTION (from rebase/repair and the conflict watch), so it needs proof: unreadable state,
+ * a branch name alone, or a dissolved group (record removed) never exempts.
+ */
 export function inCardGroup(state, { num, repo, localSlug, headRef = null } = {}) {
-  if (state?.unreadable) return true;
+  if (!state || state.unreadable || !Number.isInteger(Number(num))) return false;
   const slug = String(repo || localSlug || '').toLowerCase();
-  if (String(headRef ?? '').startsWith(CARD_GROUP_BRANCH_PREFIX)) return true;
-  return (state?.groups ?? []).some(g => String(g.repo || '').toLowerCase() === slug
-    && (Number(g.pr) === Number(num) || g.sources?.some(s => Number(s.num) === Number(num))));
+  return (state.groups ?? []).some(g => String(g.repo || '').toLowerCase() === slug
+    && ((g.pr != null && Number(g.pr) === Number(num) && headRef != null && headRef === g.branch)
+      || g.sources?.some(s => Number(s.num) === Number(num))));
 }
 
-/** IO: the same membership, read from THE shared state path. No state path / no file → false. */
+/** IO: the same membership, read from THE shared state path. No state path / no file / unreadable → false. */
 export function readInCardGroup({ num, repo, localSlug, headRef = null, env = process.env } = {}) {
-  if (String(headRef ?? '').startsWith(CARD_GROUP_BRANCH_PREFIX)) return true;
   const path = resolveCardGroupStatePath(env);
   if (!path || !existsSync(path)) return false;
   return inCardGroup(readGroupState(path), { num, repo, localSlug, headRef });
@@ -553,7 +556,6 @@ export function createCardGrouping({
     },
     /** A source or combined PR of a recorded group: the drain's own rebase/repair must not move its head. */
     inGroup(c) {
-      if (String(c?.headRef ?? '').startsWith(CARD_GROUP_BRANCH_PREFIX)) return true;
       if (!statePath || !existsSync(statePath)) return false;
       return inCardGroup(readGroupState(statePath, readFile), { num: c?.num, repo: c?.repo, localSlug, headRef: c?.headRef });
     },
