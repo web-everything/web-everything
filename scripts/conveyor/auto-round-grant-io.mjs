@@ -25,8 +25,9 @@ import { platformPreference } from '../lib/policy-cascade.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import {
   buildRoundExtensionComment, countGrantedRoundExtensions, countStandingRulingGrantRecords, MAX_TOTAL_ROUND_EXTENSIONS,
-  roundExtensionGrants, standingRulingGrantEpisodes,
+  ROUND_EXTENSION_MARKER, roundExtensionGrants, standingRulingGrantEpisodes,
 } from './round-extension-mark.mjs';
+import { isAutomationAuthored, isOperatorAuthored } from '../lib/marker-authorship.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { readStandingRuling, standingRulingScope, redact } from './standing-ruling-io.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
@@ -214,7 +215,17 @@ export function stuckAfterGrant({ repo, pr }, { scopeOf = standingRulingScope, n
   const mine = roundExtensionGrants(comments, { repo: slug, pr: pr.number, standingRuling: scope }).filter((g) => g.standingRuling && g.head === head);
   const at = mine.length ? Math.max(...mine.map((g) => Date.parse(g.at))) : NaN;
   // An uncredited grant (no scope / not trusted) is stuck by definition once it exists on the thread.
-  const postedAt = Number.isFinite(at) ? at : Math.max(...comments.filter((c) => String(c?.body ?? '').includes(`@${head}:`)).map((c) => Date.parse(c?.createdAt)).filter(Number.isFinite), -Infinity);
+  // Uncredited fallback: ONLY automation-authored standing-ruling grant records for this repo + PR + current head,
+  // timed by GitHub's createdAt (earliest), so no other commenter can restart the grace period.
+  const postedAt = Number.isFinite(at) ? at : Math.min(...comments.filter((c) => {
+    if (!isAutomationAuthored(c) || isOperatorAuthored(c) || !String(c?.body ?? '').startsWith(ROUND_EXTENSION_MARKER + '\n')) return false;
+    const m = [...String(c.body).matchAll(/^<!-- round-extension: (.+) -->$/gm)];
+    if (m.length !== 1) return false;
+    try {
+      const r = JSON.parse(m[0][1]);
+      return !!r?.standingRuling && (CONSTELLATION_REPOS[r.repo]?.slug ?? r.repo) === slug && r.pr === Number(pr.number) && r.head === head;
+    } catch { return false; }
+  }).map((c) => Date.parse(c?.createdAt)).filter(Number.isFinite), Infinity);
   if (!Number.isFinite(postedAt) || now() - postedAt < minAgeMs) return null;
   const minutes = Math.round((now() - postedAt) / 60_000);
   return `auto-grant did not free a round: still at the round limit ${minutes} min after it${mine.length ? '' : ' (grant not credited)'} — a person must check`;
