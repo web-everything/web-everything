@@ -17,7 +17,7 @@ import { ROUND_SNAPSHOT_ENV, readRoundSnapshot, writeRoundSnapshot } from '../dr
 describe('drain throughput', () => {
   it('defaults on, supports rollback and reports each source', () => {
     const log = vi.fn();
-    expect(resolveDrainThroughput({ file: {}, platform: {}, env: {}, log }).value).toEqual({ redMainSkipCatchUp: true, holdFirst: true, overlapFirst: true, priorityReservesFiles: true, catchUpSkipQueueOverlap: true, catchUpSkipUnchangedHolds: true, carryOverReadyFirst: true, catchUpSkipMaxMin: 15, priorityReserveMaxMin: 90 });
+    expect(resolveDrainThroughput({ file: {}, platform: {}, env: {}, log }).value).toEqual({ redMainSkipCatchUp: true, holdFirst: true, overlapFirst: true, priorityReservesFiles: true, catchUpSkipQueueOverlap: true, catchUpSkipUnchangedHolds: true, carryOverReadyFirst: true, catchUpSkipMaxMin: 15, priorityReserveMaxMin: 90, latentRedMainRuns: 3 });
     const out = resolveDrainThroughput({ file: { drain: { holdFirst: false } }, platform: {}, env: {}, log });
     expect(out.value.holdFirst).toBe(false);
     expect(out.sources.holdFirst).toBe('tool');
