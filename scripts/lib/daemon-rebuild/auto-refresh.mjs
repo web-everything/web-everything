@@ -44,10 +44,13 @@ import { mkdtempSync, rmSync, readFileSync, writeFileSync, renameSync, mkdirSync
 import { tmpdir, hostname } from 'node:os';
 import { join, dirname, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { cascadePolicy } from '../policy-cascade.mjs';
-import { cloneKey, addOverlay, appendOverlayEvent, readOverlayState } from '../daemon-overlays.mjs';
+import {
+  cloneKey, addOverlay, appendOverlayEvent, readOverlayState, removeOverlay,
+} from '../daemon-overlays.mjs';
+import { runLiveSmoke, runLiveSmokeWithRetry, refreshSmokeGithubEnv, decideSmokeVerdict } from '../daemon-live-smoke.mjs';
 import { stateDir, alertsFilePath } from './state.mjs';
 import {
   verifyRev, rebuildCommitEnv, FULL_SHA_RE, REBUILD_IDENTITY_ENV,
@@ -326,6 +329,19 @@ function filePatchIds(git, from, notIn, path) {
   return ids;
 }
 
+/**
+ * `git merge-file --object-id -p --diff3` with the exit SIGNAL kept: the shared runner maps a killed or timed-out
+ * child to status 1 (= "one conflict"), so a truncated output could pass as a resolution. Only an un-signalled exit with
+ * 1..127 conflicts and no spawn error is accepted.
+ */
+function mergeFile({ root, env, ours, base, theirs }) {
+  const args = ['merge-file', '--object-id', '-p', '--diff3', '-L', 'overlay', '-L', 'base', '-L', 'main', ours, base, theirs];
+  const r = spawnSync('git', ['-c', 'gc.auto=0', ...args], {
+    cwd: root, env: { ...env, ...REBUILD_IDENTITY_ENV }, encoding: 'utf8', timeout: 120_000, killSignal: 'SIGKILL', maxBuffer: 256 * 1024 * 1024,
+  });
+  return { ok: !r.error && r.signal == null && r.status >= 1 && r.status <= 127, stdout: r.stdout ?? '' };
+}
+
 /** `<mode> <sha> <stage>\t<path>` lines after merge-tree's tree line → {path → {1,2,3: {mode, sha}}}. */
 function conflictStages(stdout) {
   const files = new Map();
@@ -400,8 +416,8 @@ export function buildRefreshCandidate({
       if (!ov || !mn) { unresolved.push({ path, why: 'git-failed: patch-id' }); continue; }
       patchIdCarried = ov.length > 0 && ov.every((id) => mn.includes(id));
     }
-    const mf = git(['merge-file', '--object-id', '-p', '--diff3', '-L', 'overlay', '-L', 'base', '-L', 'main', st[2].sha, st[1].sha, st[3].sha]);
-    if (mf.status < 0 || mf.status > 127 || String(mf.stdout ?? '').includes('\u0000')) { unresolved.push({ path, why: 'merge-file-failed-or-binary' }); continue; }
+    const mf = mergeFile({ root, env, ours: st[2].sha, base: st[1].sha, theirs: st[3].sha });
+    if (!mf.ok || String(mf.stdout ?? '').includes('\u0000')) { unresolved.push({ path, why: 'merge-file-failed-or-binary' }); continue; }
     // Content that already looks like a conflict marker in any side is never parsed (it could be mistaken for one).
     const sides = [st[1].sha, st[2].sha, st[3].sha].map((s) => git(['cat-file', 'blob', s]));
     if (sides.some((s) => s.status !== 0) || sides.some((s) => String(s.stdout ?? '').split('\n').some((l) => MARKER_RE.test(l)))) {
@@ -449,8 +465,15 @@ export function buildRefreshCandidate({
   const ct = git(['commit-tree', tree, '-p', headSha, '-p', mainSha, '-m', message], { env: rebuildCommitEnv(git, headSha, mainSha) });
   const candidate = String(ct.stdout ?? '').trim();
   if (ct.status !== 0 || !FULL_SHA_RE.test(candidate)) return fail('git-failed: commit-tree');
-  const tests = touchedTests(git, candidate, [...stages.keys()]);
+  const brought = git(['diff', '--name-only', '--no-renames', headSha, candidate]);
+  if (brought.status !== 0) return fail('git-failed: diff');
+  const changed = [...new Set([...stages.keys(), ...String(brought.stdout ?? '').split('\n').filter(Boolean)])];
+  const tests = touchedTests(git, candidate, changed);
   if (tests === null) return fail('git-failed: ls-tree');
+  // 4. no conflict markers anywhere the refresh changes: a changed file may not carry more marker lines than either parent.
+  const markers = markersAdded(git, { headSha, mainSha, candidate, paths: changed });
+  if (markers === null) return fail('git-failed: marker-scan');
+  if (markers.length > 0) return fail(`markers-left: ${markers.join(', ')}`, { files, unresolved: markers.map((p) => ({ path: p, why: 'markers-left' })), tests });
   // 2. WHOLE-FILE guard check (not only the conflict hunks): in every file BOTH sides changed, each guard fact a side
   //    INTRODUCED (absent from the merge base) must survive in the candidate — git's clean merge of the other hunks
   //    included. A side's own change is never silently relaxed by the other side.
@@ -466,6 +489,30 @@ export function buildRefreshCandidate({
   };
 }
 
+/** A file's lines at `rev`: [] when the path is absent there, null on any git error (fail closed). */
+function readLines(git, rev, p) {
+  const ls = git(['ls-tree', rev, '--', p]);
+  if (ls.status !== 0) return null;
+  if (!String(ls.stdout ?? '').trim()) return [];
+  const r = git(['cat-file', 'blob', `${rev}:${p}`]);
+  return r.status === 0 ? String(r.stdout ?? '').split('\n') : null;
+}
+
+/** Changed paths whose candidate version has more conflict-marker lines than both parents. Null on a git error. */
+export function markersAdded(git, { headSha, mainSha, candidate, paths }) {
+  const out = [];
+  for (const p of paths) {
+    const counts = [];
+    for (const rev of [candidate, headSha, mainSha]) {
+      const lines = readLines(git, rev, p);
+      if (!lines) return null;
+      counts.push(lines.filter((l) => MARKER_RE.test(l)).length);
+    }
+    if (counts[0] > Math.max(counts[1], counts[2])) out.push(p);
+  }
+  return out;
+}
+
 /** Files both sides changed whose candidate version lost a guard fact one side introduced. Null on a git error. */
 export function guardsLost(git, { headSha, mainSha, candidate }) {
   const mb = git(['merge-base', headSha, mainSha]);
@@ -479,16 +526,16 @@ export function guardsLost(git, { headSha, mainSha, candidate }) {
   const mn = names(baseSha, mainSha);
   if (!ov || !mn) return null;
   const both = ov.filter((p) => mn.includes(p));
-  const read = (rev, p) => {
-    const r = git(['cat-file', '-p', `${rev}:${p}`]);
-    return r.status === 0 ? String(r.stdout ?? '').split('\n') : [];
-  };
   const out = [];
   for (const p of both) {
-    const b = guardFacts(read(baseSha, p));
-    const c = guardFacts(read(candidate, p));
-    const introduced = [...guardFacts(read(headSha, p)), ...guardFacts(read(mainSha, p))].filter((f) => !b.has(f));
-    const facts = [...new Set(introduced.filter((f) => !c.has(f)))];
+    const h = readLines(git, headSha, p);
+    const m = readLines(git, mainSha, p);
+    const c = readLines(git, candidate, p);
+    if (!h || !m || !c) return null;
+    // Round-2 audit: a guard either PARENT holds (inherited from the base or introduced) must survive in the candidate,
+    // whichever side changed it — a deliberate relaxation on one side is a decision for a person, never auto-taken.
+    const cf = guardFacts(c);
+    const facts = [...new Set([...guardFacts(h), ...guardFacts(m)].filter((f) => !cf.has(f)))];
     if (facts.length > 0) out.push({ path: p, facts });
   }
   return out;
@@ -589,6 +636,14 @@ export function autoRefreshAtHold({
 
 // ── the off-lock check ─────────────────────────────────────────────────────────────────────────────────────────
 
+/** The daemon's live smoke, run exactly once (one token refresh, one `runLiveSmoke`, no retry of any kind). */
+export async function singleLiveSmoke({ root, env, changedFiles = null }) {
+  const { env: runEnv } = await refreshSmokeGithubEnv({ env });
+  const smoke = await runLiveSmoke({ root, env: runEnv, changedFiles });
+  if (smoke.disabled) return { verdict: 'fail', attempts: 1, smoke, error: 'smoke gate disabled — not evidence' };
+  return { verdict: decideSmokeVerdict(smoke.results) ? 'pass' : 'code', attempts: 1, smoke };
+}
+
 /** Default touched-tests runner: vitest on the candidate worktree through the host-wide heavy-admission queue. */
 export function runTestsUnderAdmission({ cwd, files, env, timeoutMs = AUTO_REFRESH_TESTS_TIMEOUT_MS }) {
   return new Promise((resolveRun) => {
@@ -624,7 +679,16 @@ export function registerRefreshedTop({
     if (p.status !== 0) return { ok: false, reason: `push-failed: ${String(p.stderr ?? '').trim().split('\n')[0]}` };
   }
   const reason = `auto-refresh (xqz26k1): last-good ${headSha.slice(0, 9)} + main ${mainSha.slice(0, 9)}, smoke + touched tests passed`;
+  const before = new Set((readOverlayState(root, { env }).overlays || []).map((o) => o?.ref));
   addOverlay(root, { ref, reason, addedBy: 'daemon-rebuild-auto-refresh' }, { env });
+  // Round-2 audit: membership check and registration are not one atomic step, so re-scope AFTER the add: if an overlay
+  // the candidate carries was removed in between, the refresh top is removed again (never left carrying it).
+  const after = readOverlayState(root, { env });
+  const scope = after.corrupt ? null : unregisteredCarried(git, headSha, mainSha, after.overlays || []);
+  if (!scope || scope.gone.length > 0) {
+    if (!before.has(ref)) removeOverlay(root, ref, { env, why: 'auto-refresh: a carried overlay left during registration' });
+    return { ok: false, reason: scope ? `overlay-no-longer-registered: ${scope.gone.join(', ')}` : 'overlay-state-unreadable', rolledBack: !before.has(ref) };
+  }
   appendOverlayEvent(root, { kind: 'auto-refresh-registered', ref, reason }, { env });
   return { ok: true, ref };
 }
@@ -647,6 +711,9 @@ export async function runAutoRefreshCheck({
     } catch { /* best-effort */ }
   };
   const git = gitIO({ run, cwd: root, env });
+  // Round-2 audit: exactly ONE smoke run per candidate. The daemon's retrying wrapper may re-run the whole smoke (transient,
+  // env-timeout, auth paths), so the real default is replaced by one fresh-token `runLiveSmoke`; an injected smoke is used as-is.
+  const smokeOnce = !runSmoke || runSmoke === runLiveSmokeWithRetry ? singleLiveSmoke : runSmoke;
   const cloneKind = posix.basename(root.replace(/\\/g, '/')) === 'code'
     ? posix.basename(posix.dirname(root.replace(/\\/g, '/'))) : posix.basename(root);
   const result = { smoke: 'not-run', tests: 'not-run', testsSummary: null, stale: false };
@@ -658,7 +725,7 @@ export async function runAutoRefreshCheck({
       try {
         const smokeEnv = candidateSmokeEnv({ root, env });
         let s;
-        try { s = await runSmoke({ root: c.path, env: smokeEnv, changedFiles: null, retries: 0 }); } catch (e) { s = { verdict: 'error', error: String(e?.message ?? e) }; }
+        try { s = await smokeOnce({ root: c.path, env: smokeEnv, changedFiles: null }); } catch (e) { s = { verdict: 'error', error: String(e?.message ?? e) }; }
         result.smoke = s?.verdict === 'pass' ? 'pass' : `fail${s?.smoke?.results ? `: ${s.smoke.results.filter((x) => !x.ok).map((x) => x.name).join(',')}` : ''}`;
         if (result.smoke === 'pass' && ar.tests.length > 0) {
           const t = await runTests({ cwd: c.path, files: ar.tests, env: smokeEnv });

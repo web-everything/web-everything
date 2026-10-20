@@ -241,6 +241,45 @@ describe('xqz26k1 — a held clone builds and checks its own refresh candidate',
     expect(voided.alerts.find((a) => a.kind === 'auto-refresh-candidate-voided')?.detail.reason).toMatch(/overlay-no-longer-registered: lane\/feat/);
   });
 
+  it('round-2 audit: a guard inherited from the base that main relaxes OUTSIDE the conflict keeps the hold', async () => {
+    const f = fixture();
+    const CFG = 'scripts/lib/cfg.mjs';
+    const cfg = (attempts, tail = 'const tail = 0;') => `export const D = { attempts: ${attempts} };\n\n\n\n\n${tail}\n`;
+    f.commit('main', 'origin/main', { [CFG]: cfg(1) }, 'cfg');
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    f.commit('lane/feat', 'origin/main', { [FILE]: lines({ 5: "const line5 = 'feature v1';" }), [CFG]: cfg(1, 'const tail = 7;') });
+    addOverlay(f.clone, { ref: 'lane/feat' }, { env: f.env });
+    expect((await rebuild(f)).adopted).toBe(true);
+    f.commit('main', 'origin/main', { [FILE]: lines({ 1: "const line1 = 'graduated header';", 5: "const line5 = 'feature v1';" }) }, 'graduate');
+    f.commit('main', 'origin/main', { [FILE]: lines({ 1: "const line1 = 'graduated header';", 5: "const line5 = 'feature v1 (main evolved it)';" }), [CFG]: cfg(3) }, 'main relaxes');
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const r = await rebuild(f);
+    expect(r.autoRefresh).toMatchObject({ verdict: 'needs-human' });
+    const why = r.alerts.find((a) => a.kind === 'auto-refresh-candidate').detail.unresolved;
+    expect(why).toEqual([{ path: CFG, why: expect.stringMatching(/^guard-lost: .*attempts=1/) }]);
+  });
+
+  it('round-2 audit: tests cover cleanly merged files too, and marker lines brought in by the merge keep the hold', async () => {
+    const f = fixture();
+    const OTHER = 'scripts/lib/other.mjs';
+    const TEST = 'scripts/lib/__tests__/other.test.mjs';
+    f.commit('main', 'origin/main', { [TEST]: 'test\n', [OTHER]: 'a\n' }, 'add other');
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    await heldOnGraduation(f);
+    f.commit('main', 'origin/main', { [OTHER]: 'a\nb changed by main\n' }, 'main touches other');
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const r = await rebuild(f, { entries: undefined });
+    expect(r.autoRefresh.verdict).toBe('clean');
+    expect(r.autoRefresh.tests).toEqual([TEST]);
+
+    const g = fixture();
+    await heldOnGraduation(g);
+    g.commit('main', 'origin/main', { 'notes.txt': '<<<<<<< ours\nx\n=======\ny\n>>>>>>> theirs\n' }, 'main commits markers');
+    gitOk(g.clone, ['fetch', '-q', 'origin']);
+    // markers main itself carries are not "added" by the refresh: the candidate holds no more than main
+    expect((await rebuild(g, { entries: undefined })).autoRefresh.verdict).toBe('clean');
+  });
+
   it('mode off: the plain x9diisp hold, no candidate', async () => {
     const f = fixture();
     f.env[AUTO_REFRESH_MODE_ENV] = 'off';
