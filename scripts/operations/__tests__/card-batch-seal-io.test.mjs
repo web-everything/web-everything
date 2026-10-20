@@ -479,3 +479,49 @@ it('retires an active cached terminal hint only after a fresh exact PR read, ret
   expect(JSON.parse(readFileSync(f.statePath))).toMatchObject({ seq: 1, lastSealedState: expect.any(String) });
   expect(log).toHaveBeenCalledWith(expect.stringContaining('GitHub MERGED: retired'));
 });
+
+const terminalFixture = (prState) => {
+  const f = fixture();
+  writeFileSync(f.statePath, JSON.stringify({ ...f.state, pr: 9, kind: 'prevention', repo: 'org/repo', holdApplied: false,
+    restoreProtection: true, sealedAt: new Date(500).toISOString(), seal: { reason: 'count', step: 'record-sealed' } }));
+  const exec = vi.fn((cmd, args, options) => (args[1] === 'view' && args.includes('number,state,headRefName')
+    ? JSON.stringify({ number: 9, state: prState, headRefName: f.state.batchRef }) : f.exec(cmd, args, options)));
+  return { f, exec };
+};
+it('#5680: a started seal whose PR already MERGED is archived as a seal failure and frees the slot, never re-held', async () => {
+  const { f, exec } = terminalFixture('MERGED');
+  expect(await publishBatch(f.input, { ...f.opts, exec })).toMatchObject({ action: 'held', retired: true });
+  expect(JSON.parse(readFileSync(f.statePath, 'utf8'))).toEqual({ seq: 1, lastSealedState: expect.stringContaining('sealed') });
+  expect(f.read()).toMatchObject({ terminalPrState: 'MERGED',
+    sealFailure: { terminalPrState: 'MERGED', reason: expect.stringContaining('step record-sealed') } });
+  // Two fresh reads: the seal job's own, then the terminal retirement's.
+  expect(exec.mock.calls.filter(([, a]) => a.includes('number,state,headRefName'))).toHaveLength(2);
+  expect(exec.mock.calls.some(([, args]) => args[1] === 'edit' || args[1] === 'ready')).toBe(false);
+  // The archived generation is terminal: the next scan launches nothing for it.
+  const spawn = vi.fn();
+  expect(await sealDueBatches({ now: 1000, stateDir: f.dir, policy: f.opts.policy, spawn })).toEqual([]);
+});
+it('a started seal whose PR is CLOSED is left exactly as today (no failure recorded, no retire)', async () => {
+  const { f, exec } = terminalFixture('CLOSED');
+  await publishBatch(f.input, { ...f.opts, exec }).catch(() => {});
+  const active = JSON.parse(readFileSync(f.statePath, 'utf8'));
+  expect(active.sealFailure).toBeUndefined();
+  expect(active.lastSealedState).toBeUndefined();
+  expect(active.pr).toBe(9);
+});
+it('a started seal whose PR is still open resumes as before', async () => {
+  const f = fixture();
+  writeFileSync(f.statePath, JSON.stringify({ ...f.state, pr: 9, kind: 'prevention', repo: 'org/repo', holdApplied: true,
+    sealedAt: new Date(500).toISOString(), seal: { reason: 'count', step: 'record-sealed' } }));
+  const exec = vi.fn((cmd, args, options) => (args[1] === 'view' && args.includes('number,state,headRefName')
+    ? JSON.stringify({ number: 9, state: 'OPEN', headRefName: f.state.batchRef }) : f.exec(cmd, args, options)));
+  expect((await publishBatch(f.input, { ...f.opts, exec })).action).toBe('sealed');
+  expect(f.read().sealFailure).toBeUndefined();
+});
+it('a MERGED view for a different branch is not trusted', async () => {
+  const { f } = terminalFixture('MERGED');
+  const exec = vi.fn((cmd, args, options) => (args[1] === 'view' && args.includes('number,state,headRefName')
+    ? JSON.stringify({ number: 9, state: 'MERGED', headRefName: 'lane/other' }) : f.exec(cmd, args, options)));
+  await publishBatch(f.input, { ...f.opts, exec }).catch(() => {});
+  expect(JSON.parse(readFileSync(f.statePath, 'utf8')).sealFailure).toBeUndefined();
+});

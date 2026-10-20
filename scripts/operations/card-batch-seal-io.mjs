@@ -88,14 +88,31 @@ export async function publishBatch(input, opts = {}) {
       atomicRecord(statePath, state);
     };
     const retire = async () => {
-      // The existing failed-seal quarantine is outside terminal-PR recovery.
-      if (state.sealFailure) return retireBatch(statePath, state, { repo, kind, held });
+      // The existing failed-seal quarantine is outside terminal-PR recovery, except a failure recorded because the PR
+      // MERGED mid-seal (below): that one retires only through the fresh-read terminal path.
+      if (state.sealFailure && state.sealFailure.terminalPrState !== 'MERGED') return retireBatch(statePath, state, { repo, kind, held });
       return retireTerminalBatch(state, { ...input, source: { repo }, kind, laneDir: cwd }, {
         statePath, stateDir, remote, gh, held, log: opts.log,
       });
     };
     if (state.sealFailure) { await retire(); return { action: 'held', state }; }
     if (state.seal?.step === 'label-on-green') { await retire(); return { action: 'sealed', state }; }
+    // A started seal whose PR already MERGED (landed by another path) can never finish: every remaining step targets
+    // an open PR, and terminal retirement accepts only a finished seal. Live: #5680 merged at step record-sealed and
+    // held the prevention slot (and the pending spool behind it). Record a seal failure naming the merge, then retire
+    // through the fresh-read terminal path, which re-reads the PR and archives the batch, freeing the slot. Its cards
+    // are on main, so nothing is re-spooled. CLOSED is deliberately not handled here: it stays held as before.
+    // An unreadable view throws as before.
+    if (state.sealedAt && state.pr) {
+      const view = JSON.parse(await gh(['pr', 'view', String(state.pr), '--repo', repo, '--json', 'number,state,headRefName']));
+      if (Number(view?.number) === Number(state.pr) && view.headRefName === state.batchRef && view.state === 'MERGED') {
+        state.sealFailure = { reason: `PR MERGED before the seal finished (step ${state.seal?.step ?? 'none'}); the seal cannot resume`,
+          at: new Date(now()).toISOString(), terminalPrState: 'MERGED' };
+        save();
+        const retired = await retire();
+        return { action: 'held', state, retired: retired?.action === 'retired' };
+      }
+    }
     const restoreProtection = async () => {
       if (!state.restoreProtection) return;
       await gh(['pr', 'edit', String(state.pr), '--repo', repo, '--add-label', HOLD_LABEL]);
