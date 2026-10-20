@@ -76,7 +76,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     // of an unchanged head labels its accept before its job writes `queued`).
     if (!['queued', 'running'].includes(status.status)) {
       const latest = latestRun();
-      if (latest.at > statusAt && owes(latest.run)) return withUsability({ ...(untrustedSavedResult ? { untrustedSavedResult: true } : {}), loopPayload: latest.run, inFlight: false, scheduled: true, recorded, attempted });
+      if (latest.at > statusAt && owes(latest.run)) return withUsability({ ...(untrustedSavedResult ? { untrustedSavedResult: true } : {}), loopPayload: latest.run, inFlight: false, scheduled: true, recorded, attempted, skipCardOnly: false });
     }
     // A local pid probe says nothing about another host or namespace: keep that pass held for its result.
     // For local records, a changed birth time proves pid reuse. An unavailable birth time is unknown,
@@ -98,9 +98,10 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
       attempted: attemptedRedTeamRun(rows, { repo, pr, head }, status.result) || (status.status === 'running' && !live) });
   }
   const loopPayload = latestRun().run;
-  // Without a job status, use the resolved card-only policy; a recorded or started pass still holds.
+  // An owing run with no job status yet: only the job's process knows its card-only skip decision, so hold the head
+  // (skip off) until that status records it (main's guard, kept). A recorded or started pass still holds.
   // A pass that already ran (even unusably) is scheduled, never "never scheduled".
   const ran = attempted || attemptedRedTeamRun([], { repo, pr, head }, loopPayload?.redTeam);
   return withUsability({ ...(untrustedSavedResult ? { untrustedSavedResult: true } : {}), loopPayload, inFlight: false, scheduled: recorded || ran || owes(loopPayload),
-    recorded, attempted: ran });
+    recorded, attempted: ran, ...(owes(loopPayload) ? { skipCardOnly: false } : {}) });
 }

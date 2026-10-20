@@ -84,12 +84,13 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     recordRedTeamStatus({ ...f, loopPayload: cardOnly, status: 'queued' }, { ...f, env: { WE_RED_TEAM_TIMING: 'post-accept', ...f.env, WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, readPidStart: () => 'start' });
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(live), env: { WE_RED_TEAM_TIMING: 'post-accept', WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, comments: [] })).toBeNull();
   });
-  it('skips a card-only run before the job records a skip decision when skipCardOnly is on', () => {
+  it('holds a card-only run until the job records its skip decision, then honours that decision', () => {
     const f = fixture();
     const read = { netBasis: { rev: f.head }, netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] };
     writeRun({ ...newRunRecord({ id: 'review-pr-5439', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), verdict: { verdict: 'accept' }, findings: { read } }, f.runsDir);
-    expect(readDrainRedTeamEvidence(f).skipCardOnly).toBeUndefined();
-    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), env: { WE_RED_TEAM_TIMING: 'post-accept', WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, comments: [] })).toBeNull();
+    // No job status yet: only the job knows its card-only decision, so the head is held (main's guard).
+    expect(readDrainRedTeamEvidence(f).skipCardOnly).toBe(false);
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), env: { WE_RED_TEAM_TIMING: 'post-accept', WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, comments: [] })).not.toBeNull();
     recordRedTeamStatus({ ...f, loopPayload: { verdict: { verdict: 'accept' }, findings: { read } }, status: 'queued' }, { ...f, env: { WE_RED_TEAM_TIMING: 'post-accept', ...f.env, WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, readPidStart: () => 'start' });
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence({ ...f, isAlive: () => true, readPidStart: () => 'start' }), comments: [] })).toBeNull();
   });
