@@ -14,7 +14,7 @@ import {
   resolveAutoRoundGrantSettings, screenAutoGrantNote, STANDING_RULING,
 } from '../auto-round-grant.mjs';
 import { autoRoundGrant, withPrLedger, redact } from '../auto-round-grant-io.mjs';
-import { buildRoundExtensionComment, countGrantedRoundExtensions, roundExtensionGrants } from '../round-extension-mark.mjs';
+import { buildRoundExtensionComment, countGrantedRoundExtensions, countStandingRulingGrantRecords, roundExtensionGrants, standingRulingGrantEpisodes } from '../round-extension-mark.mjs';
 import { buildStandingRulingBody, citedGrantHeads, pickStandingRuling, verifyStandingRuling } from '../standing-ruling-mark.mjs';
 import { enrichPrsWithStandingRulingGrants, headIsCardOnly, readStandingRuling, standingRulingScope } from '../standing-ruling-io.mjs';
 import { planRoundExtension } from '../../operations/extend-rounds.mjs';
@@ -31,9 +31,10 @@ const rulingIssue = (over = {}) => ({ number: 6000, state: 'OPEN', body: rulingB
 const RULING = { ok: true, id: RULING_ID, author: 'chalbert', by: 1, maxPerPr: 3, repos: [WE] };
 let ids = 0;
 const scope = (heads = { [HEAD]: true }, over = {}) => ({ ...RULING, cardOnlyHeads: heads, uneditedComments: [...Array(10000).keys()].map((i) => `IC_${i}`), ...over });
-const autoGrant = ({ head = HEAD, login = 'web-everything[bot]', ruling = RULING_ID, by = 1, pr = 5654, repo = WE, actor = 'chalbert' } = {}) => ({
+let eps = 0;
+const autoGrant = ({ head = HEAD, login = 'web-everything[bot]', ruling = RULING_ID, by = 1, pr = 5654, repo = WE, actor = 'chalbert', episode = `${WE}#${pr}@${head}:review:${++eps}/0` } = {}) => ({
   id: `IC_${++ids}`, author: { login },
-  body: buildRoundExtensionComment({ repo, pr, by, actor, channel: AUTO_GRANT_CHANNEL, reason: 'r', at: '2026-10-20T00:00:00Z', standingRuling: ruling, head }),
+  body: buildRoundExtensionComment({ repo, pr, by, actor, channel: AUTO_GRANT_CHANNEL, reason: 'r', at: '2026-10-20T00:00:00Z', standingRuling: ruling, head, episode }),
 });
 const manualGrant = (login = 'chalbert') => ({ author: { login },
   body: buildRoundExtensionComment({ repo: WE, pr: 5654, by: 1, actor: 'chalbert', channel: 'claude-code-chat', reason: 'r', at: '2026-10-20T00:00:00Z' }) });
@@ -158,7 +159,7 @@ describe('card-only is judged on the NET diff', () => {
   it('an inflated three-dot list does not matter: the net read decides', () => {
     const gh = fakeGh(); const readNet = vi.fn(() => ({ ok: true, files: ['backlog/x.md'] }));
     expect(autoRoundGrant({ repo: 'we', note, pr: { headRefOid: HEAD, files: [{ path: 'scripts/foo.mjs' }] } }, deps(gh, { readNet }))).toMatchObject({ action: 'granted', count: 1, max: 3 });
-    expect(readNet).toHaveBeenCalledWith({ repo: WE, number: 5654, headRefOid: HEAD });
+    expect(readNet).toHaveBeenCalledWith({ repo: WE, number: 5654, headRefOid: HEAD }, { log: expect.any(Function) });
   });
   it('a code PR is refused and nothing is posted; an unreadable net diff fails closed', () => {
     const gh = fakeGh();
@@ -262,6 +263,42 @@ describe('ten-round ceiling over both kinds', () => {
     expect(call(d).action).toBe('granted');
     gh.t.comments.push(autoGrant({ head: HEAD2 }), autoGrant({ head: HEAD2 }));
     expect(call(d, { ...note, attempts: 9, cap: 8 })).toMatchObject({ action: 'cap-reached', used: 3 });
+  });
+});
+
+describe('audit round 3 patches', () => {
+  it('(a) a non-automation author never consumes room or blocks a manual grant', () => {
+    const forged = { ...autoGrant(), author: { login: 'mallory' } };
+    expect(countStandingRulingGrantRecords([forged, forged, forged], { repo: WE, pr: 5654 })).toBe(0);
+    expect(() => planRoundExtension({ state: 'OPEN', comments: [...Array(9).fill(manualGrant()), forged], now: 'x' },
+      { repo: WE, pr: 5654, by: 1, actor: 'chalbert', channel: 'c', reason: 'r' })).not.toThrow();
+    expect(countStandingRulingGrantRecords([autoGrant()], { repo: WE, pr: 5654 })).toBe(1);
+  });
+  it('(b) a head moved during the slow verification, just before the post, is never granted and keeps the slot', () => {
+    const gh = fakeGh(); let reads = 0;
+    gh.readThread.mockImplementation(() => { reads += 1; if (reads === 3) gh.t.head = HEAD2; return { state: gh.t.state, headRefOid: gh.t.head, comments: gh.t.comments }; });
+    const d = deps(gh);
+    expect(call(d)).toMatchObject({ action: 'skip', why: expect.stringContaining('right before the post') });
+    expect(gh.post).not.toHaveBeenCalled();
+    gh.t.head = HEAD;
+    expect(call(d)).toMatchObject({ action: 'skip', why: expect.stringMatching(/^already claimed/) });
+  });
+  it('(c) a historical grant for the same limit hit blocks a second one on a fresh ledger', () => {
+    const key = `${WE}#5654@${HEAD}:review:8/7`;
+    const gh = fakeGh({ comments: [autoGrant({ episode: key })] });
+    expect(call(deps(gh))).toMatchObject({ action: 'skip', why: `already claimed: ${key}` });
+    expect(gh.post).not.toHaveBeenCalled();
+  });
+  it('(c) a historical record without a recoverable key fails closed', () => {
+    const gh = fakeGh({ comments: [autoGrant({ episode: null })] });
+    expect(call(deps(gh))).toMatchObject({ action: 'skip', why: expect.stringContaining('recoverable') });
+    expect(gh.post).not.toHaveBeenCalled();
+  });
+  it('(c) the posted record carries its limit-hit key, and the reader requires it to name this PR and head', () => {
+    const gh = fakeGh(); call(deps(gh));
+    expect(gh.post.mock.calls[0][2]).toContain(`"episode":"${WE}#5654@${HEAD}:review:8/7"`);
+    expect(countGrantedRoundExtensions([autoGrant({ episode: `${WE}#5654@${HEAD2}:review:1/0` })], { repo: WE, pr: 5654, standingRuling: scope() })).toBe(0);
+    expect(standingRulingGrantEpisodes([autoGrant({ episode: 'x' })], { repo: WE, pr: 5654 })).toEqual({ episodes: [], unrecoverable: 1 });
   });
 });
 

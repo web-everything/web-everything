@@ -19,8 +19,8 @@ export const ROUND_EXTENSION_MARKER = '➕ conveyor — review round extension g
 /** The most extra rounds all grants together may add to one PR; repeated grants clamp here, never grow past it. */
 export const MAX_TOTAL_ROUND_EXTENSIONS = 10;
 
-export function buildRoundExtensionComment({ repo, pr, by, actor, channel, reason, at, standingRuling, head }) {
-  const record = { version: 1, repo, pr, by, actor, channel, reason, at, ...(standingRuling ? { standingRuling, head } : {}) };
+export function buildRoundExtensionComment({ repo, pr, by, actor, channel, reason, at, standingRuling, head, episode }) {
+  const record = { version: 1, repo, pr, by, actor, channel, reason, at, ...(standingRuling ? { standingRuling, head, episode } : {}) };
   // Escape markup in the machine record without changing the parsed operator words. U+2028/U+2029 are escaped too:
   // the counter's `.`/`^`/`$` treat them as line breaks, so a raw one would stop this grant from counting.
   const json = JSON.stringify(record).replace(/</g, '\\u003c').replace(/>/g, '\\u003e')
@@ -55,6 +55,8 @@ function withinStandingRuling(r, { repo, slug }, ruling, autoSoFar, commentId) {
   if (String(r.actor).toLowerCase() !== String(ruling.author).toLowerCase()) return false;
   // Bound to the comment GitHub shows as never edited since it was posted (the IO shell's own read).
   if (!Array.isArray(ruling.uneditedComments) || !ruling.uneditedComments.includes(commentId)) return false;
+  // The limit hit it answers (`<repo>#<pr>@<head>:<capKind>:<attempts>/<cap>`) must name this PR and this head.
+  if (typeof r.episode !== 'string' || !r.episode.startsWith(`${slug(repo)}#${Number(r.pr)}@${r.head}:`)) return false;
   return typeof r.head === 'string' && /^[0-9a-f]{40}$/.test(r.head) && ruling.cardOnlyHeads?.[r.head] === true;
 }
 
@@ -105,7 +107,9 @@ export function countStandingRulingGrantRecords(comments, { repo, pr }) {
   const slug = (value) => CONSTELLATION_REPOS[value]?.slug ?? value;
   let total = 0;
   for (const comment of Array.isArray(comments) ? comments : []) {
-    if (isOperatorAuthored(comment) || typeof comment?.body !== 'string' || !comment.body.startsWith(ROUND_EXTENSION_MARKER + '\n')) continue;
+    // Only the automation's own comments can ever become standing-ruling grants; anyone else's never consumes room.
+    if (isOperatorAuthored(comment) || !isAutomationAuthored(comment)
+      || typeof comment?.body !== 'string' || !comment.body.startsWith(ROUND_EXTENSION_MARKER + '\n')) continue;
     for (const m of comment.body.matchAll(/^<!-- round-extension: (.+) -->$/gm)) {
       try {
         const r = JSON.parse(m[1]);
@@ -114,4 +118,26 @@ export function countStandingRulingGrantRecords(comments, { repo, pr }) {
     }
   }
   return total;
+}
+
+/**
+ * The limit-hit keys (`episode`) of every automation-posted standing-ruling grant record on this PR, unverified.
+ * `unrecoverable` counts records with no usable key — a caller seeding a ledger from them must fail closed.
+ */
+export function standingRulingGrantEpisodes(comments, { repo, pr }) {
+  const slug = (value) => CONSTELLATION_REPOS[value]?.slug ?? value;
+  const episodes = [];
+  let unrecoverable = 0;
+  for (const comment of Array.isArray(comments) ? comments : []) {
+    if (isOperatorAuthored(comment) || !isAutomationAuthored(comment)
+      || typeof comment?.body !== 'string' || !comment.body.startsWith(ROUND_EXTENSION_MARKER + '\n')) continue;
+    for (const m of comment.body.matchAll(/^<!-- round-extension: (.+) -->$/gm)) {
+      let r;
+      try { r = JSON.parse(m[1]); } catch { continue; }
+      if (!r?.standingRuling || slug(r.repo) !== slug(repo) || r.pr !== Number(pr)) continue;
+      if (typeof r.episode === 'string' && r.episode.startsWith(`${slug(repo)}#${Number(pr)}@`)) episodes.push(r.episode);
+      else unrecoverable += 1;
+    }
+  }
+  return { episodes, unrecoverable };
 }
