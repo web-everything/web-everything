@@ -170,7 +170,7 @@ export function persistRetryBudgetSpent(run) {
  * parked on mandatory referrals at the PR's CURRENT head, it persisted them, and everything that woke it since it began
  * is a ruling. Any re-arm, send-back or operator reply since asks for a fresh look, so it answers `null`, as does a
  * head that moved (a new push owes a new review). A parked run whose referral persist FAILED is always resumable
- * (unless a fresh look was asked): the retry budget picks the time, and the retry re-runs the persist step only. Pure.
+ * (unless the operator in person asked for a fresh look): the retry budget picks the time, and the retry re-runs the persist step only. Pure.
  * @returns {{id: string, head: string}|null}
  */
 export function findResumableParkedRun(pr, runs, { repo } = {}) {
