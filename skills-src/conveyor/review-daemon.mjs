@@ -79,7 +79,7 @@ import { withReviewFetchTick } from '../../scripts/lib/review-fetch.mjs';
 
 import { readReviewEvidenceAtHead } from '../../scripts/lib/review-evidence-at-head.mjs';
 import { readRedTeamTiming } from '../../scripts/lib/red-team-gate.mjs';
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { cascadePolicy } from '../../scripts/lib/policy-cascade.mjs';
 import { resolve, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -747,8 +747,10 @@ export function runReviewTick({
   reviews.splice(0, reviews.length, ...orderReviewsForDispatch(reviews, { labelsByPr, plan }));
   const lanes = paused ? 0 : acquirableLanes({ repo });
   const acquirable = Math.max(0, (Array.isArray(lanes) ? lanes.length : Number(lanes)) || 0);
-  const liveCap = liveReviewBudget && Number.isFinite(liveReviewBudget.left) ? Math.max(0, liveReviewBudget.left) : Infinity;
-  const seats = Math.min(reviews.length, acquirable, liveCap);
+  const remainingReviewCapacity = () => liveReviewBudget && Number.isFinite(liveReviewBudget.left)
+    ? Math.max(0, liveReviewBudget.left) : Infinity;
+  const initialLiveCap = remainingReviewCapacity();
+  const seats = Math.min(reviews.length, acquirable, initialLiveCap);
   // 2026-10-20 — red-team rows were appended after every owed review, so under the live-review cap (3 seats,
   // ~17 owed) they never reached a seat. They now get a reserved share of whatever seats this tick has.
   if (redTeamSeatShare && redTeamSeatShare.reserved > 0) {
@@ -758,32 +760,8 @@ export function runReviewTick({
       log(`review-daemon: red-team seat share — moved #${share.moved.join(', #')} into this tick's ${seats} seat(s): redTeamReservedSeats=${redTeamSeatShare.reserved} (${redTeamSeatShare.source ?? 'standard'})`);
     }
   }
-  const dispatchable = reviews.slice(0, seats);
-  if (liveReviewBudget && Number.isFinite(liveReviewBudget.left)) liveReviewBudget.left = Math.max(0, liveReviewBudget.left - dispatchable.length);
-  if (liveCap < reviews.length && liveReviewBudget?.reason) process.stderr.write(`review-daemon: ${reviews.length - dispatchable.length} owed review(s) queued — ${liveReviewBudget.reason}\n`);
-  // Which limit held the rest back: the live-review cap (when it is the tighter limit) or the lane pool.
-  // Only a lane shortfall is reported as "no acquirable lane" — health smells read that text as lane starvation.
-  const capBound = !paused && liveCap < acquirable;
-  const deferredTotal = reviews.length - dispatchable.length;
-  const deferredForCap = capBound ? deferredTotal : 0;
-  const deferredForLanes = paused || capBound ? 0 : deferredTotal;
-  const deferredForAuth = paused ? deferredTotal : 0;
-  const deferReason = paused ? 'review owed, but dispatch is paused (Claude login)'
-    : capBound ? `review owed, but held by the live-review cap (${liveReviewBudget?.reason ?? `maxLiveReviewRounds, ${liveCap} left`}; ${acquirable} lane(s) acquirable)`
-      : `review owed, but no acquirable lane this tick (${acquirable} acquirable)`;
-  // A queued red-team row has no hold label, so `explainPendingNotDispatched` never names it — say it here.
-  for (const d of reviews.slice(dispatchable.length)) {
-    const head = d.redTeamRequest?.head ?? d.carriedAcceptHead;
-    if (!head) continue;
-    try { log(`review-daemon: red-team request #${d.prNumber} @${head.slice(0, 8)} held — no dispatch seat this tick: ${deferReason}${redTeamSeatShare ? `; redTeamReservedSeats=${redTeamSeatShare.reserved} (${redTeamSeatShare.source ?? 'standard'})` : ''}`); }
-    catch { /* diagnostics never abort the tick */ }
-  }
-  if (poolExhaustion && !paused) {
-    try {
-      if (acquirable === 0 && deferredForLanes > 0) poolExhaustion.exhausted({ repo, lanePoolRepo: poolExhaustionLanePoolRepo(repo), deferred: deferredForLanes });
-      else if (acquirable > 0) poolExhaustion.recovered(repo);
-    } catch { /* reporting only — never fails the tick */ }
-  }
+  const dispatchable = [];
+  let occupiedLanes = 0;
   const dispatched = [];
   const failed = [];
   for (const row of plan.refusals ?? []) {
@@ -830,31 +808,69 @@ export function runReviewTick({
   // x26lw6u — NOT named `skipped`: `withSelfSync` already returns `{skipped: true}` for a whole skipped tick,
   // and `onTick` reads both shapes.
   const notStarted = [];
-  for (const [i, d] of dispatchable.entries()) {
+  for (const d of reviews) {
+    if (paused || occupiedLanes >= acquirable || remainingReviewCapacity() <= 0) break;
+    dispatchable.push(d);
+    // Reserve only this start. A confirmed refusal releases the seat for the next PR (including later
+    // repos). A throw may follow a successful spawn, so its reservation must remain until the next ps read.
+    const reserved = Number.isFinite(remainingReviewCapacity());
+    if (reserved) liveReviewBudget.left--;
     try {
       const subject = (Array.isArray(rawPrs) ? rawPrs : []).find(p => Number(p?.number) === Number(d.prNumber));
       if (d.carriedAcceptHead) log(`review-daemon: dispatching fresh review for #${d.prNumber} @${d.carriedAcceptHead.slice(0, 8)} (carried accept, no review evidence)`);
       const result = dispatch({ pr: d.prNumber, repo,
         ...(d.redTeamRequest ? { expectedRedTeamHead: d.redTeamRequest.head, drainRedTeamRequest: d.redTeamRequest } : {}),
         ...(d.advisoryReview?.ciWaived === true ? { advisoryCiWaiver: { head: d.advisoryReview.head, reason: d.advisoryReview.reason } } : {}),
-        ...(Array.isArray(lanes) ? { preferLane: lanes[i] } : {}),
+        ...(Array.isArray(lanes) ? { preferLane: lanes[occupiedLanes] } : {}),
         escalationReason: parseEscalationReason(subject?.body ?? ''),
         scopePaths: (subject?.files ?? []).map(f => typeof f === 'string' ? f : f.path),
       });
       // x26lw6u — a job dispatch that declined to start (a live job already on this PR, or the lane cool-off)
       // did not advance the round, so it gets no round tag — same rule as a failed dispatch.
-      if (result?.skipped) { notStarted.push({ prNumber: d.prNumber, reason: result.skipped }); continue; }
+      if (result?.skipped) {
+        if (reserved) liveReviewBudget.left++;
+        notStarted.push({ prNumber: d.prNumber, reason: result.skipped });
+        continue;
+      }
       dispatched.push({
         prNumber: d.prNumber, agentId: result?.agentId ?? null,
         ...(result?.mode ? { mode: result.mode } : {}), ...(Number.isInteger(result?.jobPid) ? { jobPid: result.jobPid } : {}),
       });
+      occupiedLanes++;
     } catch (e) {
+      occupiedLanes++;
       failed.push({ prNumber: d.prNumber, error: String((e && e.message) || e).split('\n')[0] });
-      continue; // no round tag on a failed dispatch — the round did not actually advance
+      continue; // no round tag when the dispatch result is unknown
     }
     if (d.redTeamRequest) continue; // A red-team retry does not spend another jury round.
     try { tagRound({ pr: d.prNumber, repo, round: (d.attempts ?? 0) + 1, currentLabels: labelsByPr.get(Number(d.prNumber)) }); }
     catch { /* cosmetic — a failed tag never fails the tick, see review-round-tag.mjs's own header */ }
+  }
+  // Compute deferrals after confirmed starts, so skipped attempts neither spend capacity nor leave later
+  // eligible PRs outside a preselected batch. Only an actual lane shortfall uses the starvation diagnostic.
+  // Keep the original tick-start capacity in diagnostics; use refunded capacity for admission.
+  const liveCap = initialLiveCap;
+  const capBound = !paused && remainingReviewCapacity() < acquirable - occupiedLanes;
+  const deferredTotal = reviews.length - dispatchable.length;
+  const deferredForCap = capBound ? deferredTotal : 0;
+  const deferredForLanes = paused || capBound ? 0 : deferredTotal;
+  const deferredForAuth = paused ? deferredTotal : 0;
+  const deferReason = paused ? 'review owed, but dispatch is paused (Claude login)'
+    : capBound ? `review owed, but held by the live-review cap (${liveReviewBudget?.reason ?? `maxLiveReviewRounds, ${liveCap} left`}; ${acquirable} lane(s) acquirable)`
+      : `review owed, but no acquirable lane this tick (${acquirable} acquirable)`;
+  if (deferredTotal && liveCap < reviews.length && liveReviewBudget?.reason) process.stderr.write(`review-daemon: ${deferredTotal} owed review(s) queued — ${liveReviewBudget.reason}\n`);
+  // A queued red-team row has no hold label, so `explainPendingNotDispatched` never names it — say it here.
+  for (const d of reviews.slice(dispatchable.length)) {
+    const head = d.redTeamRequest?.head ?? d.carriedAcceptHead;
+    if (!head) continue;
+    try { log(`review-daemon: red-team request #${d.prNumber} @${head.slice(0, 8)} held — no dispatch seat this tick: ${deferReason}${redTeamSeatShare ? `; redTeamReservedSeats=${redTeamSeatShare.reserved} (${redTeamSeatShare.source ?? 'standard'})` : ''}`); }
+    catch { /* diagnostics never abort the tick */ }
+  }
+  if (poolExhaustion && !paused) {
+    try {
+      if (acquirable === 0 && deferredForLanes > 0) poolExhaustion.exhausted({ repo, lanePoolRepo: poolExhaustionLanePoolRepo(repo), deferred: deferredForLanes });
+      else if (acquirable > 0) poolExhaustion.recovered(repo);
+    } catch { /* reporting only — never fails the tick */ }
   }
   // A PR dispatched THIS tick is absent from the pre-dispatch `rawAgents` snapshot, yet its review job record
   // already exists (`dispatchReviewJob` writes it before returning) — reusing the snapshot would tag it "nothing
@@ -1314,38 +1330,120 @@ export function priorityNamesForLiveProcessPrs(liveProcessPrs) {
 }
 
 /**
- * How many review rounds are live in a `ps -A -o command=` listing. A line counts only when the script node RUNS
+ * How many review rounds are live in a `ps -A -o pid=,ppid=,command=` listing. A line counts only when the script node RUNS
  * is the review script itself — never when the name merely appears in an argument. Live-caught 2026-10-20: two
  * `verify-lane.mjs` runs whose changed-file list named `review-job.mjs` counted as 2 of the 3 allowed rounds, so
  * the daemon dispatched nothing with 1 real round live. A round is one job or one bare loop (a job runs a loop).
+ * Command-only lines are accepted conservatively: without ancestry every matching process is a round.
  * @param {string[]} lines
+ * @param {{isScriptFile?: function(string): boolean}} options Optional absolute-path classifier. Ambiguous
+ *   or unreadable candidates throw; the live budget holds dispatch. Relative argv uses lexical conventions.
  */
-export function countLiveReviewRounds(lines) {
+export function countLiveReviewRounds(lines, { isScriptFile = null } = {}) {
   // Runtimes that run a script file, and the runtime flags that take their value as the NEXT word (a preload,
   // a loader): those values are not the script. An unknown runtime still counts when its argv[0] is the script.
   const RUNTIME = /(^|\/)(node|nodejs|bun|electron)(\.exe)?$/;
   const VALUE_FLAGS = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader', '--env-file',
     '-C', '--conditions', '--title', '--input-type', '--experimental-config-file']);
-  const script = (line) => {
-    const tokens = String(line).trim().split(/\s+/);
-    if (!RUNTIME.test(tokens[0] ?? '')) return (tokens[0] ?? '').split('/').pop(); // run directly (shebang)
-    for (let i = 1; i < tokens.length; i++) {
-      const t = tokens[i];
-      if (VALUE_FLAGS.has(t)) { i++; continue; }
-      if (t.startsWith('-')) continue;
-      return t.split('/').pop();
+  const PRELOAD_FLAGS = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader']);
+  const word = (text) => {
+    const match = /^(?:"([^"]*)"|'([^']*)'|(\S+))\s*/.exec(text);
+    return match ? { value: match[1] ?? match[2] ?? match[3], rest: text.slice(match[0].length) } : { value: '', rest: '' };
+  };
+  const path = (text) => {
+    if (/^["']/.test(text)) return word(text);
+    const first = word(text);
+    // ps prints argv joined by spaces, without shell quoting. Retain the whole path up to its script
+    // extension instead of treating a checkout directory's first space as the end of the script.
+    // Flattened ps text can lose a path's boundaries, including extensionless prefixes and option-like
+    // directory fragments. Check every plausible absolute candidate before applying lexical conventions.
+    const candidates = [];
+    const mentionsReview = /review-(?:job|loop-cli)\.mjs(?:\s|$)/.test(text);
+    const boundary = text.search(/\s+(?=(?:--?[A-Za-z0-9]|\/|\.{1,2}\/))/);
+    const span = boundary < 0 ? text : text.slice(0, boundary);
+    for (const match of text.matchAll(/\.(?:mjs|cjs|js)(?=\s|$)/g)) {
+      const candidate = text.slice(0, match.index + match[0].length);
+      // No script opened by these POSIX runtimes can exceed Linux's 4096-byte pathname bound (macOS is
+      // tighter). Long changed-file argv must not turn impossible concatenated paths into a cap hold.
+      if (Buffer.byteLength(candidate) >= 4096) break;
+      candidates.push(candidate);
+      // No review filename anywhere in this span: later argument boundaries cannot change its count.
+      if (!mentionsReview) break;
+    }
+    let resolved;
+    if (isScriptFile && mentionsReview && first.value.startsWith('/')) {
+      const files = [...new Set([first.value, ...candidates])].filter(candidate => isScriptFile(candidate));
+      if (files.length > 1) throw new Error('ambiguous script path in process listing');
+      [resolved] = files;
+      const lexicalCandidates = candidates.filter(candidate => candidate.length <= span.length);
+      if (!resolved && lexicalCandidates.length !== 1) throw new Error('ambiguous script path in process listing');
+    }
+    // Relative paths belong to the other process's cwd. Preserve the first complete script convention
+    // (including relative preload values), but never turn an ambiguous extensionless entrypoint into zero.
+    if (!first.value.includes('/') && !/\.(?:mjs|cjs|js)$/.test(first.value)) {
+      if (isScriptFile && mentionsReview) throw new Error('ambiguous script path in process listing');
+      return first;
+    }
+    // Bare '-' / '--' may be directory fragments. A normal option or a rooted path starts a new argument
+    // in the lexical fallback; an existing absolute path above takes precedence over that convention.
+    const match = /^(.*?\.(?:mjs|cjs|js))(?=\s|$)/.exec(span);
+    const value = resolved ?? match?.[1] ?? first.value;
+    return { value, rest: text.slice(value.length).trimStart() };
+  };
+  const script = (command) => {
+    const runtime = word(command);
+    if (!RUNTIME.test(runtime.value)) {
+      // Only argv[0] can be a direct script; never consume a utility's arguments. Node shebang execution
+      // appears as interpreter + script in ps, so its spaced paths use the runtime branch below.
+      return runtime.value.split('/').pop();
+    }
+    let rest = runtime.rest;
+    while (rest) {
+      const t = word(rest);
+      if (t.value === '--') return path(t.rest).value.split('/').pop();
+      // Evaluation modes never execute a script from the remaining argv.
+      if (/^(?:-[ep]|--(?:eval|print)(?:=|$))/.test(t.value)) return '';
+      const equals = rest.indexOf('=');
+      if (equals > 0 && PRELOAD_FLAGS.has(rest.slice(0, equals))) {
+        rest = path(rest.slice(equals + 1)).rest;
+        continue;
+      }
+      if (VALUE_FLAGS.has(t.value)) {
+        rest = PRELOAD_FLAGS.has(t.value) && /^(?:\/|\.{1,2}\/)/.test(t.rest) ? path(t.rest).rest : word(t.rest).rest;
+        continue;
+      }
+      if (t.value.startsWith('-')) { rest = t.rest; continue; }
+      return path(rest).value.split('/').pop();
     }
     return '';
   };
-  const names = lines.map(script);
-  return Math.max(names.filter((n) => n === 'review-job.mjs').length, names.filter((n) => n === 'review-loop-cli.mjs').length);
+  const processes = lines.map((line) => {
+    const text = String(line).trim();
+    const ids = /^(\d+)\s+(\d+)\s+(.+)$/.exec(text);
+    return { pid: ids?.[1], ppid: ids?.[2], name: script(ids ? ids[3] : text) };
+  });
+  const byPid = new Map(processes.filter(p => p.pid).map(p => [p.pid, p]));
+  const hasJobAncestor = (process) => {
+    const seen = new Set([process.pid]);
+    let pid = process.ppid;
+    while (pid && !seen.has(pid)) {
+      seen.add(pid);
+      const parent = byPid.get(pid);
+      if (!parent) break;
+      if (parent.name === 'review-job.mjs') return true;
+      pid = parent.ppid;
+    }
+    return false;
+  };
+  return processes.filter(p => p.name === 'review-job.mjs'
+    || (p.name === 'review-loop-cli.mjs' && !hasJobAncestor(p))).length;
 }
 
 /** EMERGENCY 2026-10-20 — the host-wide cap on live review rounds, from the tool layer
  *  (`scripts/settings/review-concurrency.json`, source logged by the cascade). Counts live `review-job.mjs` /
  *  `review-loop-cli.mjs` processes (a round is one job, or one bare loop). An unreadable `ps` fails closed (no new
  *  review this tick). Revert condition: see the settings file's comment. */
-export function liveReviewRoundBudget({ env = process.env, listCommands = () => execFileSync('ps', ['-A', '-o', 'command='], { encoding: 'utf8', timeout: 10_000, maxBuffer: 32 * 1024 * 1024 }),
+export function liveReviewRoundBudget({ env = process.env, listCommands = () => execFileSync('ps', ['-Aww', '-o', 'pid=,ppid=,command='], { encoding: 'utf8', timeout: 10_000, maxBuffer: 32 * 1024 * 1024 }),
   toolPath = join(dirname(fileURLToPath(import.meta.url)), '../../scripts/settings/review-concurrency.json') } = {}) {
   let tool;
   try { tool = JSON.parse(readFileSync(toolPath, 'utf8')); } catch { tool = undefined; }
@@ -1360,7 +1458,20 @@ export function liveReviewRoundBudget({ env = process.env, listCommands = () => 
   const src = r.sources?.maxLiveReviewRounds ?? 'standard';
   let lines;
   try { lines = String(listCommands()).split('\n'); } catch (e) { return { left: 0, reason: `live review rounds unknown (${String(e?.message ?? e).split('\n')[0]}); maxLiveReviewRounds=${max} (${src})` }; }
-  const live = countLiveReviewRounds(lines);
+  let live;
+  try {
+    live = countLiveReviewRounds(lines, { isScriptFile: (path) => {
+      // Another process's relative paths must never be resolved against the daemon's cwd.
+      if (!path.startsWith('/')) return false;
+      try { return statSync(path).isFile(); }
+      catch (error) {
+        if (['ENOENT', 'ENOTDIR', 'ENAMETOOLONG'].includes(error?.code)) return false;
+        throw error;
+      }
+    } });
+  } catch {
+    return { left: 0, reason: `live review rounds unknown (ambiguous script path); maxLiveReviewRounds=${max} (${src})` };
+  }
   return { left: Math.max(0, max - live), live, max, reason: `live review rounds ${live} of maxLiveReviewRounds=${max} (${src})` };
 }
 
