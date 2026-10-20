@@ -14,7 +14,7 @@ function fixture() {
   const state = { seq: 9, batchRef: 'lane/card-batch-prevention-9', headSha: 'a'.repeat(40),
     repo: 'org/repo', kind: 'prevention', sealedAt: '2026-10-18T12:00:00Z', pr: 272, seal: { step: 'label-on-green' }, members: [] };
   writeFileSync(path, JSON.stringify(state));
-  return { stateDir, path, state, seal: vi.fn(async () => []), drain: vi.fn(), log: () => {} };
+  return { stateDir, path, state, seal: vi.fn(async () => []), drain: vi.fn(), log: () => {}, loadFilingSettings: () => ({ filingEnabled: true }) };
 }
 
 describe('reconcileCardBatches', () => {
@@ -93,6 +93,28 @@ it('reports drain and seal failures independently', async () => {
     { action: 'error', step: 'drain', reason: 'lane unavailable' },
     { action: 'error', step: 'seal', reason: 'seal failed' },
   ]);
+});
+
+it('skips the pending drain while filing is paused and reports a paused state, not an error', async () => {
+  const f = fixture(); writeFileSync(f.path, JSON.stringify({ seq: 9 }));
+  mkdirSync(join(f.stateDir, 'pending-prevention')); writeFileSync(join(f.stateDir, 'pending-prevention/card.json'), '{}');
+  const results = await reconcileCardBatches({ ...f, loadFilingSettings: () => ({ filingEnabled: false }) });
+  expect(f.drain).not.toHaveBeenCalled();
+  expect(results).toEqual([{ action: 'paused', step: 'drain', reason: 'prevention filing paused by prevention.filingEnabled' }]);
+  expect(results.some(result => result.action === 'error')).toBe(false);
+  expect(f.seal).toHaveBeenCalledOnce();
+});
+
+it('stays quiet when filing is paused and nothing is pending', async () => {
+  const f = fixture(); writeFileSync(f.path, JSON.stringify({ seq: 9 }));
+  expect(await reconcileCardBatches({ ...f, loadFilingSettings: () => ({ filingEnabled: false }) })).toEqual([]);
+});
+
+it('still reports a real drain failure as an error when filing is enabled', async () => {
+  const f = fixture(); writeFileSync(f.path, JSON.stringify({ seq: 9 }));
+  mkdirSync(join(f.stateDir, 'pending-prevention')); writeFileSync(join(f.stateDir, 'pending-prevention/card.json'), '{}');
+  f.drain.mockRejectedValue(Error('boom'));
+  expect(await reconcileCardBatches(f)).toEqual([{ action: 'error', step: 'drain', reason: 'boom' }]);
 });
 
 it('defaults the interval when settings cannot be read', () => {

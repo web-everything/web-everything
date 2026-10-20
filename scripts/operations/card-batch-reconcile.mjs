@@ -69,11 +69,16 @@ export async function reconcileCardBatches({
   if (!dryRun && (drainNeeded || !files.some(file => file.isFile() && file.name.endsWith('.json')))) {
     try {
       if (readdirSync(pendingDir).some(name => name.endsWith('.json'))) {
-        const result = await drain({ drainPending: true, session: `card-batch-reconcile-${randomUUID()}` }, {
-          pendingDir, write: line => log(line.trimEnd()),
-          batch: (input, options) => batch(input, { ...options, stateDir }),
-        });
-        if (!result.ok) throw new Error(result.reason ?? 'pending drain failed');
+        // Filing paused by the operator is a visible state, not a failure (matches the owed step below).
+        if (loadFilingSettings().filingEnabled === false) {
+          results.push({ action: 'paused', step: 'drain', reason: 'prevention filing paused by prevention.filingEnabled' });
+        } else {
+          const result = await drain({ drainPending: true, session: `card-batch-reconcile-${randomUUID()}` }, {
+            pendingDir, write: line => log(line.trimEnd()),
+            batch: (input, options) => batch(input, { ...options, stateDir }),
+          });
+          if (!result.ok) throw new Error(result.reason ?? 'pending drain failed');
+        }
       }
     } catch (error) {
       if (error.code !== 'ENOENT') results.push({ action: 'error', step: 'drain', reason: error.message });
