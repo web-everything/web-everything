@@ -3144,14 +3144,20 @@ mark("19. Unfenced mandate params (#2967b)");
 // ── 19b. Unmanaged keep-alive children (keep-alive leak fix, 2026-10-20) ─────────────────────────────────────
 // A do-nothing empty-callback timer child outlives any test that fails to kill it (154 orphans, up to 19 days
 // old, live-caught). Keep-alives come from scripts/lib/test-keepalive.mjs only — anchored + bounded.
-// The git invocation lives here; the pure filter is `findUnmanagedKeepAlives`. Only a checkout that git itself
-// says is not a work tree skips the scan; inside one, a failed grep or an unreadable listed file is itself a
-// finding (fail closed).
+// The git invocation lives here; the pure filter is `findUnmanagedKeepAlives`. The scan is NEVER skipped: a
+// failed or negative work-tree probe, a failed grep, or an unreadable listed file is itself a finding (fail
+// closed, loudly).
 {
   let listed = null;
-  let inRepo = false;
-  try { inRepo = execFileSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: ROOT, encoding: 'utf8' }).trim() === 'true'; } catch { /* no git / not a repo */ }
-  if (inRepo) {
+  // Never skipped: a probe that fails, or a checkout git does not confirm as a work tree, is itself a finding.
+  let probe = null;
+  try { probe = execFileSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: ROOT, encoding: 'utf8' }).trim(); } catch (e) {
+    err(`keep-alive scan could not confirm a git work tree (${String(e.message).split('\n')[0]}) — the scan did not run`, { kind: 'unmanaged-keepalive' });
+  }
+  if (probe !== null && probe !== 'true') {
+    err(`keep-alive scan: git rev-parse --is-inside-work-tree said ${JSON.stringify(probe)} — the scan did not run`, { kind: 'unmanaged-keepalive' });
+  }
+  if (probe === 'true') {
     try {
       // --untracked: a brand-new file must be caught before it is ever committed.
       listed = execFileSync('git', ['grep', '-l', '--untracked', '-E', 'set(Interval|Timeout)', '--', ...KEEPALIVE_SCAN_DIRS], { cwd: ROOT, encoding: 'utf8' });
