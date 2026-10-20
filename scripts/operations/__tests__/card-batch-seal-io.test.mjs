@@ -480,64 +480,176 @@ it('retires an active cached terminal hint only after a fresh exact PR read, ret
   expect(log).toHaveBeenCalledWith(expect.stringContaining('GitHub MERGED: retired'));
 });
 
-const terminalFixture = (prState) => {
+// ── #5680: a seal stuck mid-way on a PR that already MERGED ───────────────────────────────────────────────────
+const MERGE = 'm'.repeat(40).replace(/m/g, 'd');
+const MAIN = 'e'.repeat(40);
+const RECORDED = '---\nkind: story\n---\n\n# Card 123\n\nSee backlog/123 and backlog/xold.\n';
+const LANDED = '---\nbornAs: 123\nkind: story\n---\n\n# Card 123\n\nSee backlog/6597 and backlog/6311.\n';
+const OLD = '---\nbornAs: xold\n---\n\n# Old card\n';
+/** A merge tree on main: by default member `123` landed as backlog/6597 by content, and old card xold is #6311. */
+const landedMain = ({ mergeFiles = { 'backlog/6597-card.md': LANDED, 'backlog/6311-old.md': OLD },
+  recordedFiles = { 'backlog/123-card.md': RECORDED }, mergeOnMain = true, mergeOid = MERGE, recordedOid = null } = {}) => ({ mergeFiles, recordedFiles, mergeOnMain, mergeOid, recordedOid });
+const terminalFixture = (prState, main = landedMain()) => {
   const f = fixture();
   writeFileSync(f.statePath, JSON.stringify({ ...f.state, pr: 9, kind: 'prevention', repo: 'org/repo', holdApplied: false,
     restoreProtection: true, sealedAt: new Date(500).toISOString(), seal: { reason: 'count', step: 'record-sealed' } }));
+  const head = main.recordedOid ?? f.state.headSha;
+  const tree = sha => (sha === head ? main.recordedFiles : sha === main.mergeOid ? main.mergeFiles : null);
   // The PR reads as ready (not draft), so restoring protection really runs `ready --undo` — the step that fails live.
-  // Main carries the member card (fixture member `123`), so the cards-landed check passes unless a test overrides it.
-  const exec = vi.fn((cmd, args, options) => (args[1] === 'view' && args.includes('number,state,headRefName')
-    ? JSON.stringify({ number: 9, state: prState, headRefName: f.state.batchRef })
-    : args[1] === 'view' && args.includes('isDraft') ? JSON.stringify({ isDraft: false })
-      : args[0] === 'ls-tree' ? 'backlog/123-card.md\nbacklog/77-other.md\n' : f.exec(cmd, args, options)));
+  const exec = vi.fn((cmd, args, options) => {
+    if (args[1] === 'view' && args.includes('number,state,headRefName,mergeCommit')) {
+      return JSON.stringify({ number: 9, state: prState, headRefName: f.state.batchRef, mergeCommit: { oid: main.mergeOid } });
+    }
+    if (args[1] === 'view' && args.includes('number,state,headRefName')) return JSON.stringify({ number: 9, state: prState, headRefName: f.state.batchRef });
+    if (args[1] === 'view' && args.includes('isDraft')) return JSON.stringify({ isDraft: false });
+    if (cmd === 'git' && args[0] === 'fetch' && args.includes('refs/heads/main')) return '';
+    if (cmd === 'git' && args[0] === 'rev-parse' && args[1] === 'FETCH_HEAD^{commit}') return `${MAIN}\n`;
+    if (cmd === 'git' && args[0] === 'cat-file') return '';
+    if (cmd === 'git' && args[0] === 'merge-base' && args[3] === MAIN) {
+      if (args[2] === main.mergeOid && main.mergeOnMain) return '';
+      throw Object.assign(new Error('not an ancestor'), { status: 1 });
+    }
+    if (cmd === 'git' && args[0] === 'ls-tree') return Object.keys(tree(args[2]) ?? {}).join('\n');
+    if (cmd === 'git' && args[0] === 'grep') {
+      const hits = Object.entries(main.mergeFiles).filter(([, text]) => /^bornAs: [a-z0-9]+$/m.test(text)).map(([path]) => `${main.mergeOid}:${path}`);
+      if (!hits.length) throw Object.assign(new Error('no match'), { status: 1 });
+      return hits.join('\n');
+    }
+    if (cmd === 'git' && args[0] === 'show' && /^[0-9a-f]{40}:/.test(args[1])) {
+      const [sha, path] = [args[1].slice(0, 40), args[1].slice(41)];
+      const text = tree(sha)?.[path];
+      if (text === undefined) throw new Error(`no such path ${path}`);
+      return text;
+    }
+    return f.exec(cmd, args, options);
+  });
   return { f, exec };
 };
 const undoFired = (exec) => exec.mock.calls.some(([, args]) => args.includes('--undo'));
-it('#5680: a stuck seal (protection retry fails) whose PR already MERGED is archived and frees the slot', async () => {
-  const { f, exec: base } = terminalFixture('MERGED');
-  // Live shape: restoring protection on a merged PR fails at `ready --undo`.
-  const exec = vi.fn((cmd, args, options) => { if (args.includes('--undo')) throw new Error('pull request is merged'); return base(cmd, args, options); });
-  expect(await publishBatch(f.input, { ...f.opts, exec })).toMatchObject({ action: 'held', retired: true });
-  expect(undoFired(exec)).toBe(true);
-  expect(JSON.parse(readFileSync(f.statePath, 'utf8'))).toEqual({ seq: 1, lastSealedState: expect.stringContaining('sealed') });
-  expect(f.read()).toMatchObject({ terminalPrState: 'MERGED',
-    sealFailure: { terminalPrState: 'MERGED', reason: expect.stringContaining('step record-sealed') } });
-  // Two fresh reads: the recovery's own, then the terminal retirement's.
-  expect(exec.mock.calls.filter(([, a]) => a.includes('number,state,headRefName'))).toHaveLength(2);
-  const spawn = vi.fn();
-  expect(await sealDueBatches({ now: 1000, stateDir: f.dir, policy: f.opts.policy, spawn })).toEqual([]);
+const failUndo = (exec, error = new Error('pull request is merged')) => vi.fn((cmd, args, options) => {
+  if (args.includes('--undo')) throw error;
+  return exec(cmd, args, options);
 });
-it('#5680: a stuck seal refused for head-mismatch (merged branch deleted) whose PR MERGED is archived', async () => {
+const quiet = () => vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+const activeSlot = f => JSON.parse(readFileSync(f.statePath, 'utf8'));
+
+it('#5680: a stuck seal whose MERGED PR landed every card (proven by content) is archived and frees the slot', async () => {
   const { f, exec: base } = terminalFixture('MERGED');
-  writeFileSync(f.statePath, JSON.stringify({ ...JSON.parse(readFileSync(f.statePath, 'utf8')), restoreProtection: undefined, holdApplied: true }));
-  const exec = vi.fn((cmd, args, options) => (args[0] === 'ls-remote' ? '' : base(cmd, args, options)));
-  expect(await publishBatch(f.input, { ...f.opts, exec })).toMatchObject({ action: 'held', retired: true });
-  expect(exec.mock.calls.some(([, args]) => args[1] === 'edit' || args[1] === 'ready')).toBe(false);
-});
-it('the stuck path keeps the original failure when retirement\'s second read fails, then retries retirement without re-holding', async () => {
-  const { f, exec: base } = terminalFixture('MERGED');
-  let reads = 0;
-  const exec = vi.fn((cmd, args, options) => {
-    if (args.includes('--undo')) throw new Error('pull request is merged');
-    if (args[1] === 'view' && args.includes('number,state,headRefName') && ++reads === 2) throw new Error('gh down');
-    return base(cmd, args, options);
-  });
-  const log = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  const exec = failUndo(base);
+  const err = quiet();
   try {
-    await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toThrow('pull request is merged');
+    expect(await publishBatch(f.input, { ...f.opts, exec })).toMatchObject({ action: 'held', retired: true });
     expect(undoFired(exec)).toBe(true);
-    expect(reads).toBe(2);
-    const kept = JSON.parse(readFileSync(f.statePath, 'utf8'));
-    expect(kept).toMatchObject({ pr: 9, sealFailure: { terminalPrState: 'MERGED' } });
-    expect(kept.lastSealedState).toBeUndefined();
-    // Confirmed MERGED: the next run retires through the fresh read and never re-adds the hold label.
-    const edits = () => exec.mock.calls.filter(([, args]) => args.includes('--add-label')).length;
-    const before = edits();
-    expect(await publishBatch(f.input, { ...f.opts, exec })).toMatchObject({ action: 'held' });
-    expect(edits()).toBe(before);
-    expect(JSON.parse(readFileSync(f.statePath, 'utf8'))).toEqual({ seq: 1, lastSealedState: expect.stringContaining('sealed') });
-  } finally { log.mockRestore(); }
+    expect(activeSlot(f)).toEqual({ seq: 1, lastSealedState: expect.stringContaining('sealed') });
+    expect(f.read()).toMatchObject({ terminalPrState: 'MERGED', sealFailure: { terminalPrState: 'MERGED', reason: expect.stringContaining('step record-sealed') } });
+    const spawn = vi.fn();
+    expect(await sealDueBatches({ now: 1000, stateDir: f.dir, policy: f.opts.policy, spawn })).toEqual([]);
+  } finally { err.mockRestore(); }
 });
+it('an unrenamed card at its admitted path with identical content also proves', async () => {
+  const { f, exec: base } = terminalFixture('MERGED', landedMain({ mergeFiles: { 'backlog/123-card.md': RECORDED } }));
+  const err = quiet();
+  try { expect(await publishBatch(f.input, { ...f.opts, exec: failUndo(base) })).toMatchObject({ action: 'held', retired: true }); }
+  finally { err.mockRestore(); }
+});
+it('the head-mismatch stuck path (merged branch deleted) uses the same proof', async () => {
+  const { f, exec: base } = terminalFixture('MERGED');
+  writeFileSync(f.statePath, JSON.stringify({ ...activeSlot(f), restoreProtection: undefined, holdApplied: true }));
+  const exec = vi.fn((cmd, args, options) => (args[0] === 'ls-remote' ? '' : base(cmd, args, options)));
+  const err = quiet();
+  try {
+    expect(await publishBatch(f.input, { ...f.opts, exec })).toMatchObject({ action: 'held', retired: true });
+    expect(exec.mock.calls.some(([, args]) => args[1] === 'edit' || args[1] === 'ready')).toBe(false);
+  } finally { err.mockRestore(); }
+});
+
+describe('the landing proof rejects every spoof and keeps the batch held with its original failure', () => {
+  const held = async (main, { mismatch = false } = {}) => {
+    const { f, exec: base } = terminalFixture('MERGED', main);
+    if (mismatch) writeFileSync(f.statePath, JSON.stringify({ ...activeSlot(f), restoreProtection: undefined, holdApplied: true }));
+    const exec = mismatch ? vi.fn((cmd, args, options) => (args[0] === 'ls-remote' ? '' : base(cmd, args, options))) : failUndo(base);
+    const err = quiet();
+    try {
+      const outcome = await publishBatch(f.input, { ...f.opts, exec }).then(v => ({ v }), e => ({ e }));
+      if (mismatch) expect(outcome.v).toEqual({ action: 'refuse', reason: 'head-mismatch' });
+      else { expect(outcome.e?.message).toBe('pull request is merged'); expect(undoFired(exec)).toBe(true); }
+      expect(activeSlot(f).sealFailure).toBeUndefined();
+      expect(activeSlot(f).lastSealedState).toBeUndefined();
+      expect(err.mock.calls.map(c => String(c[0])).join('')).toContain('not proven on main');
+    } finally { err.mockRestore(); }
+  };
+  it('a commit message is never evidence: no matching file in the merge tree', () => held(landedMain({ mergeFiles: { 'backlog/6311-old.md': OLD } })));
+  it('an unrelated file that merely shares the id prefix (different content)', () =>
+    held(landedMain({ mergeFiles: { 'backlog/123-card.md': '---\nkind: story\n---\n\nsomething else\n' } })));
+  it('a bornAs file whose content differs from the recorded card', () =>
+    held(landedMain({ mergeFiles: { 'backlog/6597-card.md': LANDED.replace('# Card 123', '# Spoof'), 'backlog/6311-old.md': OLD } })));
+  it('two files claiming the same card (ambiguous)', () =>
+    held(landedMain({ mergeFiles: { 'backlog/6597-card.md': LANDED, 'backlog/6598-card.md': LANDED, 'backlog/6311-old.md': OLD } })));
+  it('bornAs outside the front matter does not count', () =>
+    held(landedMain({ mergeFiles: { 'backlog/6597-card.md': '---\nkind: story\n---\nbornAs: 123\n', 'backlog/6311-old.md': OLD } })));
+  it('a merge commit that is not on main', () => held(landedMain({ mergeOnMain: false })));
+  it('the recorded head lacks the member file', () => held(landedMain({ recordedFiles: {} })));
+  it('the head-mismatch path rejects the same spoof', () => held(landedMain({ mergeFiles: { 'backlog/6311-old.md': OLD } }), { mismatch: true }));
+  it('two members cannot be satisfied by one landed file', async () => {
+    const { f, exec: base } = terminalFixture('MERGED', landedMain({
+      recordedFiles: { 'backlog/123-card.md': RECORDED, 'backlog/456-card.md': RECORDED },
+      mergeFiles: { 'backlog/123-card.md': RECORDED, 'backlog/6311-old.md': OLD } }));
+    writeFileSync(f.statePath, JSON.stringify({ ...activeSlot(f), members: [{ cardId: '123', source: { repo: 'org/repo' } }, { cardId: '456', source: { repo: 'org/repo' } }] }));
+    const err = quiet();
+    try {
+      await expect(publishBatch(f.input, { ...f.opts, exec: failUndo(base) })).rejects.toThrow('pull request is merged');
+      expect(activeSlot(f).sealFailure).toBeUndefined();
+    } finally { err.mockRestore(); }
+  });
+});
+
+describe('retries re-run the proof and never report a refusal as held', () => {
+  const recorded = (f) => writeFileSync(f.statePath, JSON.stringify({ ...activeSlot(f), restoreProtection: undefined, holdApplied: true,
+    sealFailure: { reason: 'PR MERGED before the seal finished', terminalPrState: 'MERGED' } }));
+  it('a recorded MERGED failure whose cards are no longer provable is refused, not retired', async () => {
+    const { f, exec } = terminalFixture('MERGED', landedMain({ mergeFiles: { 'backlog/6311-old.md': OLD } }));
+    recorded(f);
+    const err = quiet();
+    try {
+      expect(await publishBatch(f.input, { ...f.opts, exec })).toEqual({ action: 'refuse', reason: 'cards-not-proven-on-main' });
+      expect(activeSlot(f).lastSealedState).toBeUndefined();
+    } finally { err.mockRestore(); }
+  });
+  it('a recorded MERGED failure whose retirement read fails returns that refusal', async () => {
+    const { f, exec: base } = terminalFixture('MERGED');
+    recorded(f);
+    let reads = 0;
+    const exec = vi.fn((cmd, args, options) => {
+      if (args[1] === 'view' && args.includes('number,state,headRefName') && !args.includes('number,state,headRefName,mergeCommit') && ++reads === 1) throw new Error('gh down');
+      return base(cmd, args, options);
+    });
+    const err = quiet();
+    try {
+      expect(await publishBatch(f.input, { ...f.opts, exec })).toMatchObject({ action: 'refuse', reason: 'batch-sealed' });
+      expect(activeSlot(f).lastSealedState).toBeUndefined();
+      // The next attempt (read healthy again) proves and retires; the hold label is never re-added.
+      expect(await publishBatch(f.input, { ...f.opts, exec })).toMatchObject({ action: 'held', retired: true });
+      expect(exec.mock.calls.some(([, args]) => args.includes('--add-label'))).toBe(false);
+    } finally { err.mockRestore(); }
+  });
+  it('a first-run retirement that fails keeps the original failure; the retry then retires', async () => {
+    const { f, exec: base } = terminalFixture('MERGED');
+    let reads = 0;
+    const exec = failUndo(vi.fn((cmd, args, options) => {
+      if (args[1] === 'view' && args.includes('number,state,headRefName') && !args.includes('number,state,headRefName,mergeCommit') && ++reads === 2) throw new Error('gh down');
+      return base(cmd, args, options);
+    }));
+    const err = quiet();
+    try {
+      await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toThrow('pull request is merged');
+      expect(activeSlot(f)).toMatchObject({ pr: 9, sealFailure: { terminalPrState: 'MERGED' } });
+      const adds = exec.mock.calls.filter(([, args]) => args.includes('--add-label')).length;
+      expect(await publishBatch(f.input, { ...f.opts, exec })).toMatchObject({ action: 'held', retired: true });
+      expect(exec.mock.calls.filter(([, args]) => args.includes('--add-label')).length).toBe(adds);
+    } finally { err.mockRestore(); }
+  });
+});
+
 it('the stuck path keeps the original failure when the PR is not merged or the read fails', async () => {
   for (const view of [() => JSON.stringify({ number: 9, state: 'OPEN', headRefName: 'lane/card-batch-prevention-1' }), () => { throw new Error('gh down'); }]) {
     const { f, exec: base } = terminalFixture('MERGED');
@@ -548,16 +660,28 @@ it('the stuck path keeps the original failure when the PR is not merged or the r
     });
     await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toThrow('protection unavailable');
     expect(undoFired(exec)).toBe(true);
-    expect(JSON.parse(readFileSync(f.statePath, 'utf8')).sealFailure).toBeUndefined();
+    expect(activeSlot(f).sealFailure).toBeUndefined();
   }
 });
+it.each([['a string', 'boom'], ['a plain object', { message: 'obj boom' }], ['undefined', undefined]])(
+  'a stuck step that throws %s is rethrown as an Error when recovery does not complete', async (_name, value) => {
+    const { f, exec: base } = terminalFixture('OPEN');
+    const outcome = await publishBatch(f.input, { ...f.opts, exec: failUndo(base, value) }).then(v => ({ fulfilled: v }), e => ({ rejected: e }));
+    expect(outcome.fulfilled).toBeUndefined();
+    expect(outcome.rejected).toBeInstanceOf(Error);
+  });
 it('a started seal whose PR is CLOSED is left exactly as today (no failure recorded, no retire)', async () => {
   const { f, exec } = terminalFixture('CLOSED');
+  await publishBatch(f.input, { ...f.opts, exec: failUndo(exec) }).catch(() => {});
+  expect(activeSlot(f).sealFailure).toBeUndefined();
+  expect(activeSlot(f).lastSealedState).toBeUndefined();
+});
+it('a MERGED view for a different branch is not trusted', async () => {
+  const { f, exec: base } = terminalFixture('MERGED');
+  const exec = failUndo(vi.fn((cmd, args, options) => (args[1] === 'view' && args.includes('number,state,headRefName')
+    ? JSON.stringify({ number: 9, state: 'MERGED', headRefName: 'lane/other', mergeCommit: { oid: MERGE } }) : base(cmd, args, options))));
   await publishBatch(f.input, { ...f.opts, exec }).catch(() => {});
-  const active = JSON.parse(readFileSync(f.statePath, 'utf8'));
-  expect(active.sealFailure).toBeUndefined();
-  expect(active.lastSealedState).toBeUndefined();
-  expect(active.pr).toBe(9);
+  expect(activeSlot(f).sealFailure).toBeUndefined();
 });
 it('a started seal whose PR is still open resumes as before', async () => {
   const f = fixture();
@@ -567,94 +691,27 @@ it('a started seal whose PR is still open resumes as before', async () => {
     ? JSON.stringify({ number: 9, state: 'OPEN', headRefName: f.state.batchRef }) : f.exec(cmd, args, options)));
   expect((await publishBatch(f.input, { ...f.opts, exec })).action).toBe('sealed');
   expect(f.read().sealFailure).toBeUndefined();
-  // Not stuck: the stuck-path read never runs; the only PR-state read is the existing post-seal terminal retirement,
-  // after label-on-green, so retry order is unchanged.
+  // Not stuck: the only PR-state read is the existing post-seal terminal retirement, after label-on-green.
   const reads = exec.mock.calls.map(([, a], i) => (a.includes('number,state,headRefName') ? i : -1)).filter(i => i >= 0);
   const sealed = exec.mock.calls.findIndex(([, a]) => a[1] === 'open-pr' && a.includes('--mode=label-on-green'));
   expect(reads).toHaveLength(1);
   expect(reads[0]).toBeGreaterThan(sealed);
 });
-it('a MERGED view for a different branch is not trusted', async () => {
-  const { f } = terminalFixture('MERGED');
-  const exec = vi.fn((cmd, args, options) => (args[1] === 'view' && args.includes('number,state,headRefName')
-    ? JSON.stringify({ number: 9, state: 'MERGED', headRefName: 'lane/other' }) : f.exec(cmd, args, options)));
-  await publishBatch(f.input, { ...f.opts, exec }).catch(() => {});
-  expect(JSON.parse(readFileSync(f.statePath, 'utf8')).sealFailure).toBeUndefined();
-});
-
-it('#5680: protection re-armed by head adoption that fails on a merged PR takes the same recovery', async () => {
-  const f = fixture({ descendant: true });
-  writeFileSync(f.statePath, JSON.stringify({ ...f.state, pr: 9, kind: 'prevention', repo: 'org/repo', holdApplied: true,
-    sealedAt: new Date(500).toISOString(), seal: { reason: 'count', step: 'record-sealed' } }));
+it('#5680: protection re-armed by head adoption that fails on a merged PR takes the same recovery (proof on the adopted head)', async () => {
   const advertised = 'b'.repeat(40);
+  const { f, exec: base } = terminalFixture('MERGED', landedMain({ recordedOid: advertised }));
+  writeFileSync(f.statePath, JSON.stringify({ ...activeSlot(f), restoreProtection: undefined, holdApplied: true }));
   const exec = vi.fn((cmd, args, options) => {
     if (args[0] === 'ls-remote') return `${advertised}\tref`;
-    if (args[1] === 'view' && args.includes('number,state,headRefName')) return JSON.stringify({ number: 9, state: 'MERGED', headRefName: f.state.batchRef });
-    if (args[1] === 'view' && args.includes('isDraft')) return JSON.stringify({ isDraft: false });
+    if (args[0] === 'merge-base' && args[3] === advertised) return '';
+    if (args[0] === 'log') return args.includes('--raw') ? ':100644 100644 abc def M\0backlog/123-card.md\0' : 'Repair CI\n';
     if (args.includes('--undo')) throw new Error('pull request is merged');
-    if (args[0] === 'ls-tree') return 'backlog/123-card.md\n';
-    return f.exec(cmd, args, options);
+    return base(cmd, args, options);
   });
-  const log = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  const err = quiet();
   try {
     expect(await publishBatch(f.input, { ...f.opts, exec })).toMatchObject({ action: 'held', retired: true });
     expect(undoFired(exec)).toBe(true);
-    expect(f.read()).toMatchObject({ terminalPrState: 'MERGED', sealFailure: { terminalPrState: 'MERGED' } });
-  } finally { log.mockRestore(); }
-});
-
-describe('stuck-seal recovery: cards must be on main, and failures are never fulfilled', () => {
-  const withMain = (base, { tree, log = '' }) => vi.fn((cmd, args, options) => {
-    if (args.includes('--undo')) throw new Error('pull request is merged');
-    if (args[0] === 'ls-tree') return tree;
-    if (args[0] === 'log' && args.includes('--fixed-strings')) return log;
-    return base(cmd, args, options);
-  });
-  it('a merged PR whose cards are not on main (rewritten branch) stays held with its original failure', async () => {
-    const { f, exec: base } = terminalFixture('MERGED');
-    const exec = withMain(base, { tree: 'backlog/77-other.md\n' });
-    const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    try {
-      await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toThrow('pull request is merged');
-      expect(undoFired(exec)).toBe(true);
-      const kept = JSON.parse(readFileSync(f.statePath, 'utf8'));
-      expect(kept.sealFailure).toBeUndefined();
-      expect(kept.lastSealedState).toBeUndefined();
-      expect(err.mock.calls.map(c => String(c[0])).join('')).toContain('not on main');
-    } finally { err.mockRestore(); }
-  });
-  it('the head-mismatch path also requires the cards on main', async () => {
-    const { f, exec: base } = terminalFixture('MERGED');
-    writeFileSync(f.statePath, JSON.stringify({ ...JSON.parse(readFileSync(f.statePath, 'utf8')), restoreProtection: undefined, holdApplied: true }));
-    const exec = vi.fn((cmd, args, options) => (args[0] === 'ls-remote' ? '' : args[0] === 'ls-tree' ? 'backlog/77-other.md\n' : base(cmd, args, options)));
-    const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    try {
-      expect(await publishBatch(f.input, { ...f.opts, exec })).toEqual({ action: 'refuse', reason: 'head-mismatch' });
-      expect(JSON.parse(readFileSync(f.statePath, 'utf8')).sealFailure).toBeUndefined();
-    } finally { err.mockRestore(); }
-  });
-  it('a card renamed by the land-time JIT numbering counts as on main', async () => {
-    const { f, exec: base } = terminalFixture('MERGED');
-    const exec = withMain(base, { tree: 'backlog/6597-card.md\n', log: 'drain: JIT-number x2sfbjr→#6595, 123→#6597 at land (#2288)\n' });
-    const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    try {
-      expect(await publishBatch(f.input, { ...f.opts, exec })).toMatchObject({ action: 'held', retired: true });
-    } finally { err.mockRestore(); }
-  });
-  it('a JIT message naming a number whose file is not on main does not count', async () => {
-    const { f, exec: base } = terminalFixture('MERGED');
-    const exec = withMain(base, { tree: 'backlog/77-other.md\n', log: 'drain: JIT-number 123→#6597 at land (#2288)\n' });
-    const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    try {
-      await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toThrow('pull request is merged');
-    } finally { err.mockRestore(); }
-  });
-  it.each([['a string', 'boom'], ['a plain object', { message: 'obj boom' }], ['undefined', undefined]])(
-    'a stuck step that throws %s is rethrown as an Error when recovery does not complete', async (_name, value) => {
-      const { f, exec: base } = terminalFixture('OPEN');
-      const exec = vi.fn((cmd, args, options) => { if (args.includes('--undo')) throw value; return base(cmd, args, options); });
-      const outcome = await publishBatch(f.input, { ...f.opts, exec }).then(v => ({ fulfilled: v }), e => ({ rejected: e }));
-      expect(outcome.fulfilled).toBeUndefined();
-      expect(outcome.rejected).toBeInstanceOf(Error);
-    });
+    expect(f.read()).toMatchObject({ headSha: advertised, terminalPrState: 'MERGED', sealFailure: { terminalPrState: 'MERGED' } });
+  } finally { err.mockRestore(); }
 });
