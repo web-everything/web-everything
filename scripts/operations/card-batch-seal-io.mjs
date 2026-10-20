@@ -173,7 +173,8 @@ export async function publishBatch(input, opts = {}) {
         process.stderr.write(`card-batch adopted head ${state.batchRef}: ${from}→${advertised}\n`);
       }
     }
-    await restoreProtection();
+    // Adoption above can re-arm protection; a failure restoring it on a merged PR is the same stuck path.
+    try { await restoreProtection(); } catch (error) { return orRecoverMerged(error); }
     let mismatch = await check();
     // A started seal refused here may be a merged PR whose branch moved or was deleted: the stuck path.
     if (mismatch) return state.sealedAt && mismatch === 'head-mismatch' ? orRecoverMerged(refuse(mismatch)) : refuse(mismatch);

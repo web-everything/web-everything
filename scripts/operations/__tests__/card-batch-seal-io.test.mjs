@@ -484,15 +484,19 @@ const terminalFixture = (prState) => {
   const f = fixture();
   writeFileSync(f.statePath, JSON.stringify({ ...f.state, pr: 9, kind: 'prevention', repo: 'org/repo', holdApplied: false,
     restoreProtection: true, sealedAt: new Date(500).toISOString(), seal: { reason: 'count', step: 'record-sealed' } }));
+  // The PR reads as ready (not draft), so restoring protection really runs `ready --undo` — the step that fails live.
   const exec = vi.fn((cmd, args, options) => (args[1] === 'view' && args.includes('number,state,headRefName')
-    ? JSON.stringify({ number: 9, state: prState, headRefName: f.state.batchRef }) : f.exec(cmd, args, options)));
+    ? JSON.stringify({ number: 9, state: prState, headRefName: f.state.batchRef })
+    : args[1] === 'view' && args.includes('isDraft') ? JSON.stringify({ isDraft: false }) : f.exec(cmd, args, options)));
   return { f, exec };
 };
+const undoFired = (exec) => exec.mock.calls.some(([, args]) => args.includes('--undo'));
 it('#5680: a stuck seal (protection retry fails) whose PR already MERGED is archived and frees the slot', async () => {
   const { f, exec: base } = terminalFixture('MERGED');
   // Live shape: restoring protection on a merged PR fails at `ready --undo`.
   const exec = vi.fn((cmd, args, options) => { if (args.includes('--undo')) throw new Error('pull request is merged'); return base(cmd, args, options); });
   expect(await publishBatch(f.input, { ...f.opts, exec })).toMatchObject({ action: 'held', retired: true });
+  expect(undoFired(exec)).toBe(true);
   expect(JSON.parse(readFileSync(f.statePath, 'utf8'))).toEqual({ seq: 1, lastSealedState: expect.stringContaining('sealed') });
   expect(f.read()).toMatchObject({ terminalPrState: 'MERGED',
     sealFailure: { terminalPrState: 'MERGED', reason: expect.stringContaining('step record-sealed') } });
@@ -519,6 +523,8 @@ it('the stuck path keeps the original failure when retirement\'s second read fai
   const log = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
   try {
     await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toThrow('pull request is merged');
+    expect(undoFired(exec)).toBe(true);
+    expect(reads).toBe(2);
     const kept = JSON.parse(readFileSync(f.statePath, 'utf8'));
     expect(kept).toMatchObject({ pr: 9, sealFailure: { terminalPrState: 'MERGED' } });
     expect(kept.lastSealedState).toBeUndefined();
@@ -539,6 +545,7 @@ it('the stuck path keeps the original failure when the PR is not merged or the r
       return base(cmd, args, options);
     });
     await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toThrow('protection unavailable');
+    expect(undoFired(exec)).toBe(true);
     expect(JSON.parse(readFileSync(f.statePath, 'utf8')).sealFailure).toBeUndefined();
   }
 });
@@ -567,4 +574,24 @@ it('a MERGED view for a different branch is not trusted', async () => {
     ? JSON.stringify({ number: 9, state: 'MERGED', headRefName: 'lane/other' }) : f.exec(cmd, args, options)));
   await publishBatch(f.input, { ...f.opts, exec }).catch(() => {});
   expect(JSON.parse(readFileSync(f.statePath, 'utf8')).sealFailure).toBeUndefined();
+});
+
+it('#5680: protection re-armed by head adoption that fails on a merged PR takes the same recovery', async () => {
+  const f = fixture({ descendant: true });
+  writeFileSync(f.statePath, JSON.stringify({ ...f.state, pr: 9, kind: 'prevention', repo: 'org/repo', holdApplied: true,
+    sealedAt: new Date(500).toISOString(), seal: { reason: 'count', step: 'record-sealed' } }));
+  const advertised = 'b'.repeat(40);
+  const exec = vi.fn((cmd, args, options) => {
+    if (args[0] === 'ls-remote') return `${advertised}\tref`;
+    if (args[1] === 'view' && args.includes('number,state,headRefName')) return JSON.stringify({ number: 9, state: 'MERGED', headRefName: f.state.batchRef });
+    if (args[1] === 'view' && args.includes('isDraft')) return JSON.stringify({ isDraft: false });
+    if (args.includes('--undo')) throw new Error('pull request is merged');
+    return f.exec(cmd, args, options);
+  });
+  const log = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  try {
+    expect(await publishBatch(f.input, { ...f.opts, exec })).toMatchObject({ action: 'held', retired: true });
+    expect(undoFired(exec)).toBe(true);
+    expect(f.read()).toMatchObject({ terminalPrState: 'MERGED', sealFailure: { terminalPrState: 'MERGED' } });
+  } finally { log.mockRestore(); }
 });
