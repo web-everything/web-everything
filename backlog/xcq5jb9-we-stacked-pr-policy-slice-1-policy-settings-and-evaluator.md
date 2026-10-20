@@ -16,6 +16,9 @@ Add every stacking value as a cascade setting with its source logged in we:scrip
 
 - [A1] **Executable** — `node --test` on we:scripts/lib/__tests__/stack-policy.test.mjs fails before the module exists and passes after. Named tests, one per guarantee:
   - `matrix: each of the nine cells returns the ruled default` (base state x child class table in the statute we:docs/agent/platform-decisions.md#stacked-pr-policy-configurable).
+  - `matrix: each configured allowedBaseStates cell outside the safety floor overrides its default and changes the decision with all other inputs fixed` (parameterized over every configurable cell; floor-covered cells remain governed by the independent floor tests).
+  - `class: a settings path that feeds drain, review or merge gates is guard even when settings is in lowRiskClasses` (enumerate the settings files those gates read, including stack.json and pr-stack.json).
+  - `class: a mixed low-risk and guard or merge-path child is guard or merge-path; guard classification takes precedence over lowRiskClasses` (include docs plus a gate-feeding settings file, on both in-review and fixing bases).
   - `floor: guard or merge-path child on an in-review or fixing base never stacks, even with urgent or emergency set`.
   - `floor: only an operator-sourced setting can change the floor; an agent-sourced override is ignored and logged`.
   - `every value reports its source (default, repo, operator) from the cascade`.

@@ -6446,14 +6446,21 @@ from its class list) and the drain's existing proof-of-land gate (base lands fir
    emergency. Guard or merge-path children stack on an approved-waiting base, on an approved-held base only when
    urgent, and never on an in-review or fixing base.
 3. **Safety floor (Fork 1 = a).** Guard or merge-path code never stacks on an in-review or fixing base. The class is read
-   from the touched paths, not from the card label. "Emergency" is operator-flagged only. The floor can be changed only
+   from the touched paths, not from the card label. Any path under `we:scripts/settings/` that feeds drain, review or
+   merge gates counts as guard, even though settings is a default low-risk class. Guard or merge-path classification
+   takes precedence over low-risk membership, including a child mixing docs or other low-risk files with guard files.
+   "Emergency" is operator-flagged only. The floor can be changed only
    by an operator-sourced setting, never by an agent. Unknown state, unknown class or a missing proof gate means no
    stacking (fail closed).
 4. **Base first.** The drain lands the base before the child. Review judges the child's own delta. When the base head
    moves, the child is restacked and only its delta is re-reviewed; the hold marker moves only when the delta
    fingerprint is unchanged and the base's new commits touch none of the child's files.
 5. **Closed or rejected base (Fork 2 = a).** A low-risk child rebases onto main by itself only when the rebase is clean
-   and its delta fingerprint is unchanged. Every other child goes to the operator.
+   and its delta fingerprint is unchanged. Every other child goes to the operator. The cascade default enables
+   auto-rebase; an unset repo-layer value uses that default. No resolved cascade value (including no default), or an
+   unreadable cascade result, goes to the operator. Gate-feeding settings and mixed guard children remain guard class
+   here too. Rebase grants no `review:accepted` label or carried approval; review, CI and proof-of-land gates must
+   still pass for the new head.
 6. **Free-scope.** The caller names the intended base PR (`--stack-on=<n>`); free-scope applies the matrix and excludes
    only PR holders in that chain, never agent-registry holders. A cell that may not stack still reports OCCUPIED.
 

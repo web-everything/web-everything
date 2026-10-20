@@ -13,7 +13,7 @@ Build the ruling of decision xv85eqi (we:docs/agent/platform-decisions.md#stacke
 
 ## Acceptance
 
-- [A1] **Executable** — all four slices' named tests pass: `node --test` on we:scripts/lib/__tests__/stack-policy.test.mjs, we:scripts/operations/__tests__/free-scope.test.mjs, we:scripts/conveyor/__tests__/pr-stack-policy.test.mjs and we:scripts/lib/__tests__/pr-merge-gate-base-closed.test.mjs.
+- [A1] **Executable** — all four slices' named tests pass: `node --test` on we:scripts/lib/__tests__/stack-policy.test.mjs, we:scripts/operations/__tests__/free-scope.test.mjs, we:scripts/conveyor/__tests__/pr-stack-policy.test.mjs, we:scripts/__tests__/merge-ai-prs-stack-order.test.mjs and we:scripts/lib/__tests__/pr-merge-gate-base-closed.test.mjs.
 
 ## Non-goals
 

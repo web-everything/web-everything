@@ -3,7 +3,7 @@ kind: story
 size: 8
 parent: "xejcrh1"
 status: open
-blockedBy: ["xcq5jb9"]
+blockedBy: ["xcq5jb9", "xdqe5hm"]
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/conveyor/pr-stack.mjs", "we:scripts/conveyor/review-stack-base.mjs", "we:scripts/settings/pr-stack.json"]
 dateOpened: "2026-10-17"
 tags: []

@@ -3,7 +3,7 @@ kind: story
 size: 5
 parent: "xejcrh1"
 status: open
-blockedBy: ["xcq5jb9"]
+blockedBy: ["xcq5jb9", "xkmrswh"]
 scope: ["we:scripts/lib/pr-merge-gate.mjs", "we:scripts/conveyor/pr-stack.mjs"]
 dateOpened: "2026-10-17"
 tags: []
@@ -20,6 +20,8 @@ When a stacked child's base PR is closed or rejected, rebase a low-risk child on
   - `base closed: a low-risk child with a conflicting rebase goes to the operator`.
   - `base closed: a low-risk child whose fingerprint changed goes to the operator`.
   - `base closed: a normal or guard child always goes to the operator`.
+  - `base closed: gate-feeding settings and mixed docs-plus-guard children go to the operator even when settings and docs are in lowRiskClasses` (reuse slice 1's path-derived class precedence).
+  - `base closed: an auto-rebased child receives no review:accepted label or carried approval from the rebase and must pass review, CI and proof-of-land gates for its new head` (integration through the rebase handler and drain, with a clean rebase and unchanged fingerprint; stale acceptance on the old head cannot authorize the new head).
   - `base rejected is handled the same as closed`.
   - `the auto-rebase behaviour follows the setting; turning it off sends every child to the operator`.
   - `an unreadable base state fails closed to the operator`.
@@ -27,7 +29,8 @@ When a stacked child's base PR is closed or rejected, rebase a low-risk child on
   - `a partial base-state read (fields missing or cut short) fails closed to the operator`.
   - `a rebase that errors or times out without a conflict goes to the operator`.
   - `a fingerprint or risk class that cannot be computed goes to the operator`.
-  - `a missing or unreadable auto-rebase setting sends the child to the operator`.
+  - `auto-rebase setting: an unset repo layer resolves to the cascade default of enabled and a low-risk clean child with unchanged fingerprint rebases onto main`.
+  - `auto-rebase setting: no resolved cascade value (including no default), or an unreadable cascade result, sends the child to the operator`.
   - `untrusted text: PR body or card text claiming low-risk does not change the class; class and fingerprint come from the diff and paths`.
   - `shared state: a child sent to the operator is posted on the existing needs-you channel and no new shared file is written`.
   - `identity: a child or base PR by a different actor goes to the operator`.

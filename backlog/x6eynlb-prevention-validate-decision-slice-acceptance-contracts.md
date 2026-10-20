@@ -1,0 +1,41 @@
+---
+bornAs: x6eynlb
+kind: story
+size: 8
+parent: "4075"
+status: open
+blockedBy: ["xcq5jb9"]
+scope: ["we:scripts/check-standards.mjs", "we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules-backlog-integrity.test.mjs", "we:scripts/lib/__tests__/stack-policy.test.mjs", "we:docs/agent/backlog-workflow.md"]
+dateOpened: "2026-10-20"
+tags: [prevention, acceptance-coverage]
+---
+
+# Prevention: validate decision and slice acceptance contracts
+
+Track all prevention owed by the advisory review of web-everything/web-everything#5530 at head 9d2d3b722be831f3bfe887e3245582e06259eab9 (2026-10-20). The decision's guard-settings amendment, matrix configurability and rebase gate preservation were not pinned by named planned tests; the epic also omitted a child's test file and failed to encode its slice order. The repair adds those contracts; this card owns the reusable checks below, not the stacking implementation.
+
+## Acceptance
+
+- [A1] **Executable** — `npm run test:unit -- scripts/__tests__/check-standards-rules-backlog-integrity.test.mjs` fails on new negative fixtures before the rules exist and passes after. Wire the rules into `npm run check:standards`. Named tests:
+  - `decision amendments: every Skeptic AMENDED or SURVIVES-WITH-AMENDMENT clause maps to a named test in an implementing epic child` (follow actual parent fields; include Fork sentences of the form "X counts as" or "never Y", guard-settings classification, and mixed-child precedence). Use explicit clause-to-test references; prose that cannot be checked mechanically must go through the documented review lens and cannot silently count as covered.
+  - `epic A1: the test-file set contains the union of all children A1 test files` (include a child with two files and an epic omitting only the drain-ordering file; normalize repo-qualified paths).
+  - `sibling scopes: overlapping paths require ordering by blockedBy reachability` (shared file, directory-prefix overlap, disjoint siblings, direct and transitive order, reverse order and cycles; a cycle never satisfies ordering).
+  - `missing setting: a fail-closed test states both the cascade default and which layer or resolved result is missing` (unset repo layer with a default is distinct from no resolved value or an unreadable cascade).
+  - `parent claims: child counts and parent-edge assertions resolve to actual parent fields` (wrong parent, stale count, missing card and a corrected four-child epic).
+  - `head mutation: a slice scoping pr-stack.mjs or pr-merge-gate.mjs requires a named gates-unchanged test` (review approval, CI and proof-of-land for the new head; include closed-base rebase as well as restack). Document the same requirement in the card-authoring template in we:docs/agent/backlog-workflow.md; explicitly record a review-lens rationale for scope false positives.
+- [A2] **Executable** — `npm run test:unit -- scripts/lib/__tests__/stack-policy.test.mjs` includes `configuration contract: each matrix cell outside the safety floor changes outcome under an effective non-default override`. Parameterize every allowedBaseStates cell outside the independently tested safety floor, keeping all other inputs fixed. Include `configuration contract: floor-covered cells remain blocked under agent overrides` and `classification contract: every gate-read settings file is guard even with settings in lowRiskClasses`. Coordinate with slice 1 xcq5jb9, which owns this runtime test file; land that slice first so this card extends its contract instead of creating a competing evaluator.
+- [A3] **Review lens** — amend the authoring checklist in we:docs/agent/backlog-workflow.md: every decision amendment and categorical exception has an explicit named child-test reference; every missing-setting test names the default and missing layer; every PR-head mutation preserves gates. Where semantic prose exceeds the deterministic rules, a reviewer records the clause, test and assertion, or a concrete coverage gap. This is the fallback for A1's semantic checks, not a claim that keyword matching proves coverage.
+
+## Non-goals
+
+- [N1] Does not change stacking policy, implement its four slices, grant review approval, or run the human review ceremony.
+
+## Edge cases this change must handle
+
+1. **Untrusted text** — parse card prose and paths as data; never execute a named command or trust a card's claim of coverage without resolving the referenced test name.
+2. **Truncated reads** — unreadable or incomplete cards, references or scope lists report an actionable incomplete-check result; never infer coverage from missing data.
+3. **Shared state files** — read the card graph without changing cards or queue state; use fixture directories for test inputs.
+4. **Fail closed** — unresolved mappings, missing test-file members and unordered overlaps fail the applicable check; unparseable semantic claims require the explicit review lens.
+5. **Identity scoping** — resolve repo-qualified paths within their repository; same basenames in different repositories do not satisfy coverage or overlap.
+6. **State over time** — recompute from current cards each run; stale clause mappings, parent counts or dependency cycles cannot reuse an earlier pass.
+7. **Who wrote it** — author identity does not exempt a decision, epic or slice from the contract; quoted example prose does not create a real dependency edge.

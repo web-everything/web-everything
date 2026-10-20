@@ -23,11 +23,11 @@ tags: [stacked-prs, drain, free-scope, decision-prep]
 [we:docs/agent/platform-decisions.md#stacked-pr-policy-configurable](../docs/agent/platform-decisions.md#stacked-pr-policy-configurable).
 The prepared text below is kept as the lineage; where it differs from this section, this section wins.
 
-- **Fork 1 = (a).** Guard or merge-path code never stacks on an in-review or fixing base; the matrix ships as default settings values.
-- **Fork 2 = (a).** A low-risk child rebases onto main only on a clean rebase with an unchanged delta fingerprint; all else goes to the operator.
+- **Fork 1 = (a).** Guard or merge-path code never stacks on an in-review or fixing base; the matrix ships as default settings values. Gate-feeding settings paths count as guard, and guard or merge-path classification takes precedence over low-risk membership in a mixed child. Slice 1's named `class:` tests pin both amendments.
+- **Fork 2 = (a).** A low-risk child rebases onto main only on a clean rebase with an unchanged delta fingerprint; all else goes to the operator. The cascade default enables this handling; an unset repo layer uses that default, while an unreadable or absent resolved cascade value goes to the operator. Rebase grants no approval and preserves review, CI and proof-of-land gates for the new head (slice 4's named `base closed:` and `auto-rebase setting:` tests).
 - **Amendment.** The WHOLE policy is a configurable cascade policy, each value with its source logged: every matrix cell (base state x child class), the safety floor (default: guard or merge-path never stacks on an in-review or fixing base; changeable only by an operator-sourced setting, never by an agent), the urgent classes, `stack.smallChildMaxLines` (50), `stack.lowRiskClasses`, `stack.maxDepth` (1), `stack.onBaseHeadMove` (restack + delta re-review) and the closed or rejected base handling.
 
-**Build slices:** see the children of this card (`parent` edges): policy settings and evaluator; free-scope `--stack-on`; drain ordered landing, restack and delta re-review; base-closed handling.
+**Build slices:** the four children of epic xejcrh1 (`parent: "xejcrh1"`): xcq5jb9 (policy settings and evaluator), xdqe5hm (free-scope `--stack-on`), xkmrswh (drain ordered landing, restack and delta re-review), and x44bz7l (base-closed handling). The epic implements this decision; the slices are not children of this decision.
 
 Operator ask, 2026-10-17: "We'll need to normalise when we can use stacked pr, both in circumstance and timing, like a pr waiting for drain could probably be stacked on with little cost or risk, and in some cases it might be cheaper to use stacked pr for urgent things" … "Or when little change or risk maybe". Operator go ("Yes") to file and prepare one card.
 
@@ -117,7 +117,7 @@ Screen: clear.
 
 ## Edge cases this change must handle
 
-1. **Untrusted text** — the child's size and class are read from the diff and labels by code, never from the PR body text.
+1. **Untrusted text** — the child's size and class are read from the diff and touched paths by code, never from labels or PR body text; gate-feeding settings paths are guard class, including in a mixed low-risk child.
 2. **Truncated reads** — an unreadable base state or file list fails closed to "does not stack" and free-scope keeps reporting OCCUPIED.
 3. **Shared state files** — settings live in per-feature files under `we:scripts/settings/`; no shared file is edited by two features.
 4. **Fail closed** — any unknown base state, unknown class or missing proof gate means no stacking.
@@ -131,4 +131,4 @@ Screen: clear.
 
 ## Non-goals
 
-- [N1] This card ratifies the policy only. The build is carved off after the call as separate children (policy module, free-scope change, base-closed handler).
+- [N1] This card ratifies the policy only. Epic xejcrh1 owns the four build slices: policy settings and evaluator; free-scope; drain ordered landing, restack and delta re-review; closed or rejected base handling.
