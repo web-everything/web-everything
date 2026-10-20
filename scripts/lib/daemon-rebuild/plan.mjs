@@ -636,10 +636,16 @@ export async function planRebuild({
   // x5059uu — say who lost, after the retry pass (a retried overlay is no longer dropped). A newcomer is PARKED: the
   // alert names its conflicting files and the established overlays they collide with, so its author can merge
   // those branches in. An established overlay that still drops (main itself moved onto it) is never silent.
+  // x9diisp (live 2026-10-20T11:51Z review clone) — the overlays the RUNNING build carries that this plan would build
+  // without because they conflict-dropped. `prepareRebuild` holds the clone on its last-good build instead of building
+  // (and later adopting) a tree that lost live hotfixes. A pinned overlay SKIPPED by xpinskip is not counted: that
+  // ruling deliberately builds without it (loudly, `pinned-overlay-conflict-skipped`) so the fleet keeps moving.
+  const establishedLost = [];
   for (const d of decisions) {
     if (d.action !== 'drop' || d.reason !== 'conflict') continue;
     const files = conflictFiles.get(d.ref) ?? [];
     if (establishedRefs.has(d.ref)) {
+      establishedLost.push({ ref: d.ref, pr: d.pr, sha: d.sha, reason: 'conflict', files });
       alerts.push({
         kind: 'established-overlay-dropped',
         detail: {
@@ -673,6 +679,6 @@ export async function planRebuild({
     .slice(0, 16);
 
   return {
-    ok: true, mainSha, finalSha: cur, applied, decisions, alerts, inputsKey, upToDate: cur === headSha,
+    ok: true, mainSha, finalSha: cur, applied, decisions, alerts, inputsKey, upToDate: cur === headSha, establishedLost,
   };
 }
