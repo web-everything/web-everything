@@ -206,9 +206,10 @@ export function redTeamGateMarker(pr, rev, outcome, result = null, grantIds = nu
   return `${RED_TEAM_GATE_MARKER} pr=${Number(pr)} rev=${String(rev).toLowerCase()} outcome=${outcome}${result ? ` result=${result}` : ''}${grantIds ? ` grants=${grantIds.join(',') || 'none'}` : ''} -->`;
 }
 
-/** PURE: parse the anchored gate marker, shared by gate reads and verdict carry. */
+/** PURE: parse the anchored gate marker, shared by gate reads and verdict carry. `grants=` takes any number of ids:
+ * the writer records every grant it read, so a count bound here would make a valid record unreadable (fail-open). */
 export function parseRedTeamGateMarker(body) {
-  const m = /^<!-- we:red-team-gate pr=(\d+) rev=([0-9a-f]{40}) outcome=([a-z-]+)(?: result=([0-9a-f]{16}))?(?: grants=(none|[0-9a-f]{16}(?:,[0-9a-f]{16}){0,9}))? -->/.exec(String(body ?? '').trimStart());
+  const m = /^<!-- we:red-team-gate pr=(\d+) rev=([0-9a-f]{40}) outcome=([a-z-]+)(?: result=([0-9a-f]{16}))?(?: grants=(none|[0-9a-f]{16}(?:,[0-9a-f]{16})*))? -->/.exec(String(body ?? '').trimStart());
   return m ? { pr: Number(m[1]), rev: m[2], outcome: m[3], ...(m[4] ? { result: m[4] } : {}),
     ...(m[5] ? { grantIds: m[5] === 'none' ? [] : m[5].split(',') } : {}) } : null;
 }
