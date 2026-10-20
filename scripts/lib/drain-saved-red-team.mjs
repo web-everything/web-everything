@@ -1,7 +1,7 @@
 import { verifySavedRedTeamProvenance } from './saved-red-team-provenance.mjs';
 /** Completed evidence survives a withheld/failed comment. Readers must scrub saved text before publication. */
-import { readFileSync } from 'node:fs';
-import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
+import { resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
+import { readJsonSnapshot } from './json-file-snapshot.mjs';
 import { cascadePolicy, formatCascadeSourcesLine, platformPreference } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
 
@@ -35,15 +35,17 @@ export function readSavedRedTeamResult({ repo, pr, head, env = process.env, runs
   if (!readSavedRedTeamSetting({ env }).value.drainReadsSavedResult) return null;
   const ignore = reason => { log(`saved-red-team-ignored: ${reason}`); return null; };
   const path = resolveScorecardStorePath(env);
-  let text;
-  try { text = readFileSync(path, 'utf8'); }
+  // One parse shared with the other readers in this process while the file is unchanged (xwu9oxh S2a).
+  let snap;
+  try { snap = readJsonSnapshot(path, { env }); }
   catch (e) { if (e.code === 'ENOENT') return ignore('saved result store missing'); throw new Error('saved red-team evidence unreadable'); }
   // The shared reader intentionally tolerates corrupt files for accounting. Admission must refuse them,
   // rather than let an empty history trigger the never-scheduled escape. Validate the same snapshot first.
-  let store;
-  try { store = JSON.parse(text); } catch { throw new Error('saved red-team evidence malformed'); }
+  if ('parseError' in snap) throw new Error('saved red-team evidence malformed');
+  const store = snap.value;
   if (!Array.isArray(store?.records)) throw new Error('saved red-team evidence malformed');
-  const records = readStore({ path, read: () => text, exists: () => true }).records;
+  // A valid store's records, exactly what readStore makes of the same text.
+  const records = store.records;
   // Same completed-seat selection as speculateRedTeam/resumeRedTeam, additionally bound to the repo.
   const row = records.filter(r => r?.dispatchKind === 'review-seat' && r.seat === 'red-team'
     && sameRepo(r.repo, repo) && r.pr === Number(pr) && r.rev === head && r.status === 'ok').at(-1);

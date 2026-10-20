@@ -44,6 +44,7 @@ import { dirname, join, resolve } from 'node:path';
 import { scrubReasons } from '../lib/secret-scrub.mjs';
 import { daemonConveyorStateRoot } from '../lib/daemon-rebuild.mjs';
 import { withInfraLock } from './infra-blocked.mjs';
+import { readJsonSnapshot } from '../lib/json-file-snapshot.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -113,16 +114,20 @@ export function validateScorecard(row) {
 /** `{version, records, migrations}` from store JSON text; `null` when it is not that shape (never guessed). */
 function parseStoreText(text) {
   try {
-    const parsed = JSON.parse(text);
-    if (!parsed || !Array.isArray(parsed.records)) return null;
-    return {
-      version: parsed.version ?? 1,
-      records: parsed.records,
-      migrations: Array.isArray(parsed.migrations) ? parsed.migrations : [],
-    };
+    return storeShape(JSON.parse(text));
   } catch {
     return null;
   }
+}
+
+/** `{version, records, migrations}` from an already-parsed store value; `null` when it is not that shape. */
+function storeShape(parsed) {
+  if (!parsed || !Array.isArray(parsed.records)) return null;
+  return {
+    version: parsed.version ?? 1,
+    records: parsed.records,
+    migrations: Array.isArray(parsed.migrations) ? parsed.migrations : [],
+  };
 }
 
 /** Prefix of every stamp the migration writes into the shared store's `migrations`. */
@@ -310,6 +315,25 @@ export function readStore({ path, read, exists } = {}) {
   try {
     if (!(exists ?? existsSync)(target)) return { version: 1, records: [] };
     return parseStoreText(doRead(target)) ?? { version: 1, records: [] };
+  } catch {
+    return { version: 1, records: [] };
+  }
+}
+
+/**
+ * Card xwu9oxh S2a: {@link readStore} with real file IO, but the parse is shared across readers in this process
+ * while the file is unchanged ({@link readJsonSnapshot}: re-checked by stat on every call). Same answer as
+ * `readStore({ path })` at this moment, the same one-time migration of the default store, and the same "never
+ * throws, degrade to empty" rule. The returned records are DEEP-FROZEN and shared: only for readers that never
+ * change them. Writers keep `readStore`.
+ */
+export function readStoreShared({ path, env = process.env } = {}) {
+  ensureMigrated({ path });
+  const target = path ?? resolveScorecardStorePath();
+  try {
+    if (!existsSync(target)) return { version: 1, records: [] };
+    const snap = readJsonSnapshot(target, { env });
+    return ('parseError' in snap ? null : storeShape(snap.value)) ?? { version: 1, records: [] };
   } catch {
     return { version: 1, records: [] };
   }

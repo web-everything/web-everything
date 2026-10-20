@@ -77,7 +77,7 @@ import { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTe
 export { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTeamOwedFor, redTeamPanelSeatOwed } from '../lib/review-red-team-policy.mjs';
 import { expectationForLens, huntBriefForLens } from '../lib/review-core.mjs';
 import { verifySavedRedTeamProvenance } from '../lib/saved-red-team-provenance.mjs';
-import { appendScorecard, readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
+import { appendScorecard, readStoreShared, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { scrubPublish } from '../lib/secret-scrub.mjs';
 import { parseDelegationMarker } from '../lib/delegation-marker.mjs';
 import { logDelegationTrial } from '../conveyor/log-delegation-trial.mjs';
@@ -709,7 +709,7 @@ export function readSeatCapUsage({ env = process.env, storePath, now = Date.now(
     const path = join(stateDir, reservationLedgerFileFor(p));
     return [p, existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : null];
   }));
-  return reviewSeatCapUsage(readStore(storePath ? { path: storePath } : {}).records, now, env, ledgers);
+  return reviewSeatCapUsage(readStoreShared(storePath ? { path: storePath, env } : { env }).records, now, env, ledgers);
 }
 
 /** How long a reservation waits for the ledger lock before giving up (and launching nothing). */
@@ -865,7 +865,8 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
     now: () => Date.now(),
     newId,
     log: (line) => process.stderr.write(`[${new Date().toISOString()}] ${line}\n`),
-    readRecords: () => readStore(storeIo).records,
+    // Shared, frozen parse while the file is unchanged (xwu9oxh S2a); every reader of these rows only reads them.
+    readRecords: () => readStoreShared({ ...storeIo, env }).records,
     append: (row) => appendScorecard(row, storeIo),
     // Read → reserve → write under a FAIL-CLOSED lock: a lock not taken in time THROWS, and so does an unreadable
     // ledger (rather than being overwritten, which would forget today's outstanding reservations). Either way the
@@ -878,7 +879,7 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
       const ledgerPath = ledgerPathFor(provider);
       return withLedgerLock(ledgerPath, () => {
         const ledger = existsSync(ledgerPath) ? JSON.parse(readFileSync(ledgerPath, 'utf8')) : null;
-        const r = reserveSeatCalls({ ledger, records: readStore(storeIo).records, want, dailyCap, now, newId, provider });
+        const r = reserveSeatCalls({ ledger, records: readStoreShared({ ...storeIo, env }).records, want, dailyCap, now, newId, provider });
         const tmp = `${ledgerPath}.${process.pid}.tmp`;
         writeFileSync(tmp, `${JSON.stringify(r.ledger, null, 2)}\n`);
         renameSync(tmp, ledgerPath);

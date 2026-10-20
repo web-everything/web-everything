@@ -11,6 +11,7 @@ import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
 import { listRunIds, readRun, writeRun } from './run-store.mjs';
 import { savedRedTeamHash, savedRedTeamRunsDir, matchesSavedRedTeamHead, verifySavedRedTeamProvenance } from '../lib/saved-red-team-provenance.mjs';
 import { resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
+import { readJsonSnapshot } from '../lib/json-file-snapshot.mjs';
 import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.mjs';
 /**
  * @file scripts/operations/review-job.mjs
@@ -504,7 +505,10 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
         throw new Error('saved red-team review identity mismatch');
       const path = resolveScorecardStorePath(env);
       // Read the persisted snapshot: appendScorecard adds fields that also belong in the digest.
-      const records = JSON.parse(readFileSync(path, 'utf8')).records;
+      // One parse shared with this process's other readers while the file is unchanged (xwu9oxh S2a).
+      const snap = readJsonSnapshot(path, { env });
+      if ('parseError' in snap) throw snap.parseError;
+      const records = snap.value.records;
       const index = records.findLastIndex(row => matchesSavedRedTeamHead(row, { repo, pr, head })
         && row.callId === redTeam.callId);
       if (index < 0) throw new Error('saved red-team result reference missing');
