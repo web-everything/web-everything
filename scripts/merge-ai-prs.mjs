@@ -5206,7 +5206,7 @@ async function runCli() {
         try {
           // A catch-up round shares one seed across its fast drains (drain.roundSnapshotMaxAgeSec). The target is
           // still re-read live below and the live open set is still listed, so only the seed is reused.
-          const roundPath = process.env[ROUND_SNAPSHOT_ENV] || null;
+          const roundPath = process.env.WE_PR_SNAPSHOT === '0' ? null : process.env[ROUND_SNAPSHOT_ENV] || null;
           const snap = __t.time('listing.snapshot', () => {
             if (roundPath) {
               let setting = { maxAgeSec: 0, source: 'unreadable' };

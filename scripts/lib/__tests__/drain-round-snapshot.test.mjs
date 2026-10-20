@@ -21,11 +21,12 @@ describe('catch-up round snapshot', () => {
     expect(readRoundSnapshot({ path, repo: 'o/r', fields: 'number', maxAgeSec: 120 }).rows).toBeNull();
   }));
   it('names one file per daemon round and prunes files older than an hour', () => withDir(dir => {
-    const old = join(dir, 'old.json');
-    writeFileSync(old, '{}');
-    utimesSync(old, new Date(0), new Date(0));
+    const old = join(dir, 'o_r-1-r1.json');
+    const foreign = join(dir, 'keep.json');
+    for (const f of [old, foreign]) { writeFileSync(f, '{}'); utimesSync(f, new Date(0), new Date(0)); }
     expect(roundSnapshotPath({ dir, repo: 'o/r', round: 3, pid: 7 })).toBe(join(dir, 'o_r-7-r3.json'));
     expect(existsSync(old)).toBe(false);
+    expect(existsSync(foreign)).toBe(true);
   }));
   it('resolves the max age through the cascade', () => {
     expect(readRoundSnapshotSetting({ env: { VITEST: '1' }, tool: {}, platform: {} })).toEqual({ maxAgeSec: 120, source: 'standard' });

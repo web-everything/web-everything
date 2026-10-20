@@ -48,7 +48,7 @@ export function readRoundSnapshot({ path, repo, fields, maxAgeSec, now = Date.no
   if (snap?.version !== VERSION || snap.repo !== repo || !Array.isArray(snap.rows) || !Array.isArray(snap.fields)) {
     return { rows: null, why: 'unusable file' };
   }
-  const age = now - snap.capturedAtMs;
+  const age = typeof snap.capturedAtMs === 'number' ? now - snap.capturedAtMs : NaN;
   if (!Number.isFinite(age) || age < 0) return { rows: null, why: 'bad captured-at' };
   if (age >= maxAgeSec * 1000) return { rows: null, why: `stale (${Math.round(age / 1000)}s >= ${maxAgeSec}s)` };
   const missing = fieldList(fields).filter(f => !snap.fields.includes(f));
@@ -71,6 +71,7 @@ export function roundSnapshotPath({ dir, repo, round, pid = process.pid, now = D
   const key = String(repo || 'cwd').replace(/[^A-Za-z0-9_.-]+/g, '_');
   try {
     for (const name of readdirSync(dir)) {
+      if (!/-\d+-r\d+\.json$/.test(name)) continue; // only round files this module names
       const p = join(dir, name);
       try { if (now - statSync(p).mtimeMs > 3_600_000) unlinkSync(p); } catch { /* best effort */ }
     }
