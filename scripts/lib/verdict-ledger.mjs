@@ -375,7 +375,7 @@ export function buildVerdictRecord({
   repo, pr, verdict, at, reason = '',
   headSha = null, reviewedDiff = null, reviewedContribution = null,
   declaredActor = '', session = '', channel = '', independence = null,
-  source, writer = '', findingCount = null, mode, wouldClear, fromHead = null, carryRule = null, state, basis = null,
+  source, writer = '', findingCount = null, mode, wouldClear, fromHead = null, carryRule = null, carryHuman = false, state, basis = null,
 } = {}) {
   if (typeof repo !== 'string' || !REPO_RE.test(repo)) {
     throw new TypeError(`verdict-ledger: \`repo\` must be <owner/name>, got ${JSON.stringify(repo)}`);
@@ -423,6 +423,7 @@ export function buildVerdictRecord({
   };
   if (fromHead) record.fromHead = shaOrNull(fromHead);
   if (carryRule) record.carryRule = oneLine(carryRule, 100);
+  if (carryHuman === true && verdict === VERDICTS.CARRIED) record.carryHuman = true;
   if (state) record.state = oneLine(state, 100);
   if (basis != null) {
     if (typeof basis !== 'string' || !EVENT_ID_RE.test(basis)) throw new TypeError(`verdict-ledger: \`basis\` must be an event id, got ${JSON.stringify(basis)}`);
@@ -496,6 +497,7 @@ export function validateVerdictRecord(raw) {
   };
   if (raw.fromHead) record.fromHead = shaOrNull(raw.fromHead);
   if (raw.carryRule) record.carryRule = raw.carryRule;
+  if (raw.carryHuman === true && raw.verdict === VERDICTS.CARRIED) record.carryHuman = true;
   if (raw.state) record.state = oneLine(raw.state, 100);
   if (typeof raw.basis === 'string' && EVENT_ID_RE.test(raw.basis)) record.basis = raw.basis;
   if (Number.isInteger(raw.findingCount) && raw.findingCount >= 0) record.findingCount = raw.findingCount;
@@ -804,7 +806,8 @@ export function observedLedgerHead(events, { includeEventHeads = false } = {}) {
 export function eventsSinceHeadMove(events, folded) {
   const boundary = events.indexOf(folded?.lastHeadMove);
   if (boundary < 0) return events;
-  return events.filter((e, i) => i >= boundary || ![EVENT_TYPES.APPROVAL, EVENT_TYPES.REVIEW_EXEMPT, EVENT_TYPES.VERDICT].includes(e.type));
+  // A row with no `type` is a legacy verdict row, as the fold reads it.
+  return events.filter((e, i) => i >= boundary || ![EVENT_TYPES.APPROVAL, EVENT_TYPES.REVIEW_EXEMPT, EVENT_TYPES.VERDICT].includes(e.type ?? EVENT_TYPES.VERDICT));
 }
 
 /** Does a carry from this PR's witnessed head reuse a human answer? Not only the latest verdict: a manual review:human
@@ -850,8 +853,9 @@ export function ledgerObservationApplies(row, existing) {
     // between, even back to `fromHead` (A→B→A). A legacy row or a basis this store never saw keeps the head check alone.
     const at = row.basis ? mine.findIndex(e => { try { return ledgerEventId(e) === row.basis; } catch { return false; } }) : -1;
     if (at >= 0 && mine.slice(at + 1).some(e => isSha(e.coverage?.headSha) || isSha(e.headSha) || isSha(e.fromHead))) return false;
-    // A headless human answer (a manual hold, a human approval) after the snapshot: the carry was proved without the human policy.
-    if (row.verdict === 'carried' && at >= 0 && ledgerCarriesHumanAnswer(mine) && !ledgerCarriesHumanAnswer(mine.slice(0, at + 1))) return false;
+    // A carry proved without the human policy never lands over a human answer, including a headless one (a manual hold,
+    // a human approval) appended after the snapshot or behind a basis this store never saw.
+    if (row.verdict === 'carried' && row.carryHuman !== true && ledgerCarriesHumanAnswer(mine)) return false;
     if (row.verdict === 'carried') return ledgerCarryAllowed(mine, row.fromHead, row.coverage?.headSha);
     return true;
   }

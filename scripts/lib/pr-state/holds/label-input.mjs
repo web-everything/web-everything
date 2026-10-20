@@ -6,17 +6,21 @@ export const HOLD_LABELS = Object.freeze(['review:human', 'review:changes', 'rev
 
 /** Follow equivalent-head witnesses from a fresh answer to a hold, never from a carry's append position.
  * A new content head or a bearing hold ends this chain. Restamps are the legacy equivalent-head witness;
- * carried rows additionally name their source head. Only rows applied by the ledger fold participate. */
+ * carried rows additionally name their source head. Only rows applied by the ledger fold participate.
+ * A human clearance moves only through a carry its writer proved under the human-clearance policy (`carryHuman`). */
 function clearanceCovers(row, events, head) {
   const at = events.indexOf(row);
   if (at < 0) return false;
   if (acceptanceCovers(row, head)) return true;
   let witnessed = verdictHead(row);
   if (!isSha(witnessed)) return false;
+  const human = row.verdict === 'clear-human' || row.state === 'clear-human';
   for (const e of events.slice(at + 1)) {
     const next = verdictHead(e);
     if (e.verdict === 'carried') {
-      if (sameHead(e.fromHead, witnessed)) witnessed = next;
+      if (!sameHead(e.fromHead, witnessed)) continue;
+      if (human && e.carryHuman !== true) return false;
+      witnessed = next;
       continue;
     }
     if (!verdictClears(e.verdict)) return false;

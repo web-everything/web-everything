@@ -23,7 +23,7 @@ for (const kind of ['restamped', 'accepted']) it(`mirror cannot discard a manual
 
 it('mirror recognizes a real human answer after the hold followed by an equivalent carry', () => {
   const events = [row('accepted', head), row('clear-human', head, '2026-10-17T12:01:30.000Z'),
-    row('carried', next, after, { fromHead: head, carryRule: 'tree-identical', state: 'clear-human' })];
+    row('carried', next, after, { fromHead: head, carryRule: 'tree-identical', state: 'clear-human', carryHuman: true })];
   expect(input(events)).toEqual([]);
 });
 

@@ -74,10 +74,12 @@ export function planLedgerObservation({ repo, pr, headSha, state = 'OPEN', label
   const current = folded?.current;
   // Never carry a stale acceptance through an intervening unreviewed head or a hold, or onto an already-judged head.
   const canCarry = sameHead(current?.coverage?.headSha, oldHead) && ledgerCarryAllowed(mine, oldHead, headSha);
-  const rule = canCarry ? proveCarry({ repo, fromSha: oldHead, toSha: headSha, human: ledgerCarriesHumanAnswer(mine, folded) }) : null;
+  const human = canCarry && ledgerCarriesHumanAnswer(mine, folded);
+  const rule = canCarry ? proveCarry({ repo, fromSha: oldHead, toSha: headSha, human }) : null;
   // `basis` names the snapshot's last event: the tip refuses this row if the witness moved after it, even back to `oldHead`.
+  // `carryHuman` records that the human-clearance policy approved this carry; only such a carry moves a human answer.
   return [buildVerdictRecord({ ...fields, source: 'head-observer', fromHead: oldHead, basis: eventIdOrNull(mine.at(-1)),
-    verdict: rule ? 'carried' : 'head-moved', carryRule: rule,
+    verdict: rule ? 'carried' : 'head-moved', carryRule: rule, carryHuman: !!rule && human,
     state: rule ? (current.state ?? current.verdict) : 'pending',
     reason: rule ? `acceptance carried by ${rule}` : 'head moved; prior head verdicts and clearances invalidated' })];
 }

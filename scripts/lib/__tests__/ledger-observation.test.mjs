@@ -209,9 +209,24 @@ describe('open-head ledger observations', () => {
       expect(ledgerObservationApplies(carried, [...base, manual()])).toBe(false);
       expect(ledgerObservationApplies(carried, [...base, approval('clear-human')])).toBe(false);
       expect(ledgerObservationApplies(carried, [...base, approval('judge')])).toBe(true);
-      // A snapshot that already saw the human answer was planned as a human carry.
-      const seen = [v('accepted'), manual(), v('clear-human'), v('accepted')];
-      expect(ledgerObservationApplies(plan({ events: seen, proveCarry: () => 'tree-identical' })[0], seen)).toBe(true);
+      // Behind a basis this store never saw, the row's own carryHuman is what the tip reads.
+      const unseen = { ...carried, basis: 'f'.repeat(64) };
+      expect(ledgerObservationApplies(unseen, [...base, manual()])).toBe(false);
+      // A snapshot that already saw the human answer was planned (and recorded) as a human carry.
+      const seen = [v('accepted'), manual(), v('clear-human', { at: '2026-10-17T12:01:00.000Z' }), v('accepted', { at: '2026-10-17T12:02:00.000Z' })];
+      const human = plan({ events: seen, proveCarry: () => 'tree-identical' })[0];
+      expect(human.carryHuman).toBe(true);
+      expect(validateVerdictRecord(human).record.carryHuman).toBe(true);
+      expect(ledgerObservationApplies(human, seen)).toBe(true);
+    });
+    it('pr-state moves a human clearance only through a carry proved as human', () => {
+      const events = cases['manual review:human answered by clear-human, then an ordinary accept']();
+      const carry = (over = {}) => buildVerdictRecord({ repo, pr: 1, headSha: next, fromHead: head, verdict: 'carried', carryRule: 'tree-identical',
+        state: 'accepted', source: 'head-observer', at: now, ...over });
+      const ordinary = carry();
+      expect(derivePrState([...events, ordinary], facts).holds.map(h => h.code)).toContain('label-input:review:human');
+      const human = carry({ carryHuman: true });
+      expect(derivePrState([...events, human], facts).holds.map(h => h.code)).not.toContain('label-input:review:human');
     });
     it('with the human-clearance carry off, the manual hold survives the tree-identical move (live scenario)', () => {
       const events = cases['manual review:human answered by clear-human, then an ordinary accept']();

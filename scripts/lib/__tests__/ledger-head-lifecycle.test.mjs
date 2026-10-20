@@ -155,10 +155,10 @@ describe('ledger head lifecycle red-team regressions', () => {
     const accepted = verdict('accepted');
     const hold = event('label-input', { label: 'review:human', change: 'added', sender: 'operator' });
     const clearance = verdict('clear-human');
-    const carry = verdict(kind, next, kind === 'carried' ? { fromHead: head, carryRule: 'tree-identical', state: 'clear-human' } : {});
+    const carry = verdict(kind, next, kind === 'carried' ? { fromHead: head, carryRule: 'tree-identical', state: 'clear-human', carryHuman: true } : {});
     expect(derivePrState([accepted, hold, clearance, carry], facts(next)).clears).toBe(true);
     expect(codes([accepted, clearance, hold, carry])).toContain('label-input:review:human');
-    const onward = verdict('carried', third, { fromHead: next, carryRule: 'identical-net-patch', state: 'clear-human' });
+    const onward = verdict('carried', third, { fromHead: next, carryRule: 'identical-net-patch', state: 'clear-human', carryHuman: true });
     expect(derivePrState([accepted, hold, clearance, carry, onward], facts(third)).clears).toBe(true);
     // A new manual hold between the two carries still requires a new human answer.
     expect(codes([accepted, hold, clearance, carry, hold, onward], third)).toContain('label-input:review:human');
@@ -167,9 +167,9 @@ describe('ledger head lifecycle red-team regressions', () => {
   it('ignores delayed transitions and superseded clearances when following the human answer', () => {
     const hold = event('label-input', { label: 'review:human', change: 'added', sender: 'operator' });
     const clearance = verdict('clear-human');
-    const carry = verdict('carried', next, { fromHead: head, carryRule: 'tree-identical', state: 'clear-human' });
+    const carry = verdict('carried', next, { fromHead: head, carryRule: 'tree-identical', state: 'clear-human', carryHuman: true });
     const delayedMove = verdict('head-moved', third, { fromHead: head });
-    const onward = verdict('carried', third, { fromHead: next, carryRule: 'tree-identical', state: 'clear-human' });
+    const onward = verdict('carried', third, { fromHead: next, carryRule: 'tree-identical', state: 'clear-human', carryHuman: true });
     for (const delayed of [delayedMove, verdict('accepted'), verdict('restamped')]) {
       expect(derivePrState([hold, clearance, carry, delayed, onward], facts(third)).clears).toBe(true);
     }
@@ -180,8 +180,8 @@ describe('ledger head lifecycle red-team regressions', () => {
     const previous = [verdict('accepted', old), verdict('head-moved', intermediate, { fromHead: old }),
       verdict('head-moved', head, { fromHead: intermediate })];
     const hold = event('label-input', { label: 'review:human', change: 'added', sender: 'operator' });
-    const carry = verdict('carried', next, { fromHead: head, carryRule: 'tree-identical', state: 'clear-human' });
-    const onward = verdict('carried', third, { fromHead: next, carryRule: 'tree-identical', state: 'clear-human' });
+    const carry = verdict('carried', next, { fromHead: head, carryRule: 'tree-identical', state: 'clear-human', carryHuman: true });
+    const onward = verdict('carried', third, { fromHead: next, carryRule: 'tree-identical', state: 'clear-human', carryHuman: true });
     const events = [...previous, hold, verdict('clear-human'), carry, verdict('accepted', old), onward];
     expect(derivePrState(events, { ...facts(third), pr: String(pr) }).clears).toBe(true);
   });
