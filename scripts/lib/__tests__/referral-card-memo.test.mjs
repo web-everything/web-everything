@@ -1,118 +1,122 @@
 /**
- * @file referral-card-memo.test.mjs — the per-process read memo in referral-card-readable: same verdicts as the
- *   uncached path, far fewer reads, errors never cached, head lookups expire, the backlog index follows main.
+ * @file referral-card-memo.test.mjs — the only cache in referral-card-readable is a bounded memo of card TEXT keyed by
+ *   (repo, file, commit sha). Every verdict is compared against the PRE-CHANGE implementation, kept verbatim in
+ *   referral-card-readable.old.fixture.mjs (a copy of 2d16b951c's file).
  */
 import { describe, expect, it } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { checkoutHeadSha, createCardReadCache, readCardAtPrHead, referralCardReadable, _resetBornIndexCache } from '../referral-card-readable.mjs';
+import * as next from '../referral-card-readable.mjs';
+import * as old from './referral-card-readable.old.fixture.mjs';
 
 const CARD = '---\nstatus: open\n---\n# card\n';
 const SHA = 'c'.repeat(40);
 const SHA2 = 'd'.repeat(40);
 const quiet = () => {};
 
-function fakeGh(state = {}) {
+/** A scriptable fake gh. `meta` may be a function of the call number so a PR can change between calls. */
+function fakeGh({ meta = { state: 'OPEN', headRefOid: SHA, baseRefName: 'main' }, text = CARD, fail = false, rawMeta } = {}) {
   const calls = [];
   const run = (cmd, args) => {
     calls.push(args[0]);
-    if (state.fail) throw new Error('gh down');
-    if (args[0] === 'pr') return JSON.stringify({ state: 'OPEN', headRefOid: state.sha ?? SHA, baseRefName: 'main' });
-    return state.text ?? CARD;
+    if (fail) throw new Error('gh down');
+    if (args[0] === 'pr') return rawMeta ?? JSON.stringify(typeof meta === 'function' ? meta(calls.filter(c => c === 'pr').length) : meta);
+    return typeof text === 'function' ? text(args) : text;
   };
   return { run, calls };
 }
-const mkRoot = () => { const r = mkdtempSync(join(tmpdir(), 'card-memo-')); mkdirSync(join(r, 'backlog')); return r; };
+const outcome = fn => { try { return { value: fn() }; } catch (e) { return { threw: e.constructor.name }; } };
 
-describe('readCardAtPrHead memo', () => {
-  it('N lookups of one ref cost one pr view and one contents read, with identical results to no cache', () => {
-    const cached = fakeGh(); const plain = fakeGh();
-    const cache = createCardReadCache();
-    const a = Array.from({ length: 10 }, () => readCardAtPrHead('x1.md', '7', { run: cached.run, cache, log: quiet }));
-    const b = Array.from({ length: 10 }, () => readCardAtPrHead('x1.md', '7', { run: plain.run, cache: null, log: quiet }));
-    expect(a).toEqual(b);
-    expect(cached.calls).toEqual(['pr', 'api']);
-    expect(plain.calls).toHaveLength(20);
+describe('readCardAtPrHead: memo vs the old code', () => {
+  const scenarios = {
+    'open with card': {},
+    'closed': { meta: { state: 'CLOSED', headRefOid: SHA, baseRefName: 'main' } },
+    'merged': { meta: { state: 'MERGED', headRefOid: SHA, baseRefName: 'main' } },
+    'side-branch base': { meta: { state: 'OPEN', headRefOid: SHA, baseRefName: 'feature/x' } },
+    'bad head sha': { meta: { state: 'OPEN', headRefOid: 'nope', baseRefName: 'main' } },
+    'gh outage': { fail: true },
+    'null response': { rawMeta: 'null' },
+    'garbage response': { rawMeta: 'not json' },
+    'contents is not a string': { text: () => null },
+  };
+  for (const [name, spec] of Object.entries(scenarios)) {
+    it(`same outcome, cold and warm: ${name}`, () => {
+      const want = outcome(() => old.readCardAtPrHead('x1.md', '7', { run: fakeGh(spec).run }));
+      const memo = next.createCardTextMemo();
+      for (let i = 0; i < 3; i++) {
+        expect(outcome(() => next.readCardAtPrHead('x1.md', '7', { run: fakeGh(spec).run, memo, log: quiet }))).toEqual(want);
+      }
+    });
+  }
+  it('a warm memo does not hide a later outage, null response, close or base change (pr view is always asked fresh)', () => {
+    const memo = next.createCardTextMemo();
+    expect(next.readCardAtPrHead('x1.md', '7', { run: fakeGh().run, memo, log: quiet })).toBe(CARD);
+    for (const spec of [{ fail: true }, { rawMeta: 'null' }, { meta: { state: 'CLOSED', headRefOid: SHA, baseRefName: 'main' } },
+      { meta: { state: 'OPEN', headRefOid: SHA, baseRefName: 'other' } }, { meta: { state: 'OPEN', headRefOid: 'zz', baseRefName: 'main' } }]) {
+      const want = outcome(() => old.readCardAtPrHead('x1.md', '7', { run: fakeGh(spec).run }));
+      expect(outcome(() => next.readCardAtPrHead('x1.md', '7', { run: fakeGh(spec).run, memo, log: quiet }))).toEqual(want);
+    }
   });
-  it('a different head sha is a different content key (immutable-input keying)', () => {
-    const g = fakeGh(); const cache = createCardReadCache();
-    readCardAtPrHead('x1.md', '7', { run: g.run, cache, log: quiet });
-    cache.now = () => Date.now() + 120_000; // head entry expired
-    const g2 = fakeGh({ sha: SHA2, text: '---\nv: 2\n---\n' });
-    expect(readCardAtPrHead('x1.md', '7', { run: g2.run, cache, log: quiet })).toBe('---\nv: 2\n---\n');
-    expect(g2.calls).toEqual(['pr', 'api']);
+  it('N reads of one ref at one sha cost N pr views but one contents read', () => {
+    const g = fakeGh(); const memo = next.createCardTextMemo();
+    for (let i = 0; i < 10; i++) expect(next.readCardAtPrHead('x1.md', '7', { run: g.run, memo, log: quiet })).toBe(CARD);
+    expect(g.calls.filter(c => c === 'pr')).toHaveLength(10);
+    expect(g.calls.filter(c => c === 'api')).toHaveLength(1);
   });
-  it('the pr-view answer expires after the TTL, so a changed PR is re-read', () => {
-    let t = 1000; const cache = createCardReadCache({ now: () => t, headTtlMs: 60_000 });
+  it('a new head sha is a new key: the new text is read, as in the old code', () => {
+    const memo = next.createCardTextMemo();
+    next.readCardAtPrHead('x1.md', '7', { run: fakeGh().run, memo, log: quiet });
+    const spec = { meta: { state: 'OPEN', headRefOid: SHA2, baseRefName: 'main' }, text: '---\nv: 2\n---\n' };
+    expect(next.readCardAtPrHead('x1.md', '7', { run: fakeGh(spec).run, memo, log: quiet }))
+      .toBe(old.readCardAtPrHead('x1.md', '7', { run: fakeGh(spec).run }));
+  });
+  it('a failed contents read is not stored: it throws each time, then a good read works', () => {
+    const memo = next.createCardTextMemo(); let n = 0;
+    const flaky = fakeGh({ text: () => { if (n++ < 2) throw new Error('404'); return CARD; } });
+    expect(() => next.readCardAtPrHead('x1.md', '7', { run: flaky.run, memo, log: quiet })).toThrow();
+    expect(() => next.readCardAtPrHead('x1.md', '7', { run: flaky.run, memo, log: quiet })).toThrow();
+    expect(next.readCardAtPrHead('x1.md', '7', { run: flaky.run, memo, log: quiet })).toBe(CARD);
+    expect(memo.text.size).toBe(1);
+  });
+  it('the memo is bounded', () => {
+    const memo = next.createCardTextMemo({ max: 3 }); const g = fakeGh();
+    for (let i = 0; i < 10; i++) next.readCardAtPrHead(`x${i}.md`, '7', { run: g.run, memo, log: quiet });
+    expect(memo.text.size).toBe(3);
+  });
+  it('without a memo (an injected runner, no memo passed) nothing is cached', () => {
     const g = fakeGh();
-    readCardAtPrHead('x1.md', '7', { run: g.run, cache, log: quiet });
-    t += 59_000; readCardAtPrHead('x1.md', '7', { run: g.run, cache, log: quiet });
-    expect(g.calls).toEqual(['pr', 'api']);
-    t += 2_000; readCardAtPrHead('x1.md', '7', { run: g.run, cache, log: quiet });
-    expect(g.calls).toEqual(['pr', 'api', 'pr']); // content at the same sha is still memoised
-  });
-  it('errors are not cached: a failing read throws every time, and a later success works', () => {
-    const cache = createCardReadCache(); const bad = fakeGh({ fail: true });
-    for (let i = 0; i < 3; i++) expect(() => readCardAtPrHead('x1.md', '7', { run: bad.run, cache, log: quiet })).toThrow();
-    expect(bad.calls).toHaveLength(3);
-    const ok = fakeGh();
-    expect(readCardAtPrHead('x1.md', '7', { run: ok.run, cache, log: quiet })).toBe(CARD);
-    const ref = f => referralCardReadable(`we:backlog/${f}@pr7`, '/nonexistent', { readOnPr: (file, pr) => readCardAtPrHead(file, pr, { run: bad.run, cache: createCardReadCache(), log: quiet }) });
-    expect(ref('x1.md')).toBe(false); // fail-closed, as before
-  });
-  it('content memo is bounded', () => {
-    const cache = createCardReadCache({ contentMax: 3 }); const g = fakeGh();
-    for (let i = 0; i < 10; i++) readCardAtPrHead(`x${i}.md`, '7', { run: g.run, cache, log: quiet });
-    expect(cache.content.size).toBe(3);
+    next.readCardAtPrHead('x1.md', '7', { run: g.run, log: quiet });
+    next.readCardAtPrHead('x1.md', '7', { run: g.run, log: quiet });
+    expect(g.calls).toEqual(['pr', 'api', 'pr', 'api']);
   });
   it('emits enrich-timing lines for the gh stages', () => {
-    const lines = []; const g = fakeGh();
-    readCardAtPrHead('x1.md', '7', { run: g.run, cache: createCardReadCache(), log: l => lines.push(l) });
+    const lines = [];
+    next.readCardAtPrHead('x1.md', '7', { run: fakeGh().run, memo: next.createCardTextMemo(), log: l => lines.push(l) });
     expect(lines.map(l => l.replace(/ \d+$/, ''))).toEqual(['enrich-timing: referral-card-gh-pr-view', 'enrich-timing: referral-card-gh-contents']);
     expect(lines[0]).toMatch(/^enrich-timing: \S+ \d+$/);
   });
 });
 
-describe('backlog bornAs index', () => {
-  it('gives the old verdicts, builds once per main sha, and rebuilds when main moves', () => {
-    _resetBornIndexCache();
-    const root = mkRoot();
-    mkdirSync(join(root, '.git'));
-    const setSha = sha => writeFileSync(join(root, '.git', 'HEAD'), `${sha}\n`);
-    setSha(SHA);
-    writeFileSync(join(root, 'backlog', '5100-landed.md'), '---\nbornAs: xvm9vbu\n---\n# c\n');
-    writeFileSync(join(root, 'backlog', '5101-nofm.md'), 'bornAs: xaaaaaa\n');
-    expect(checkoutHeadSha(root)).toBe(SHA);
-    const lines = []; const log = l => lines.push(l);
-    const q = ref => referralCardReadable(ref, root, { log });
-    for (let i = 0; i < 5; i++) {
-      expect(q('we:backlog/xvm9vbu-whatever.md')).toBe(true);
-      expect(q('we:backlog/xaaaaaa-nofm.md')).toBe(false); // no frontmatter -> not a card
-      expect(q('we:backlog/xzzzzzz-ghost.md')).toBe(false);
+describe('referralCardReadable: same verdicts as the old code', () => {
+  const root = mkdtempSync(join(tmpdir(), 'card-memo-'));
+  mkdirSync(join(root, 'backlog'));
+  writeFileSync(join(root, 'backlog', '5100-landed.md'), '---\nbornAs: xvm9vbu\n---\n# c\n');
+  writeFileSync(join(root, 'backlog', '5101-nofm.md'), 'bornAs: xaaaaaa\n');
+  writeFileSync(join(root, 'backlog', 'xhere01-main.md'), CARD);
+  const refs = ['we:backlog/5100-landed.md', 'we:backlog/xvm9vbu-whatever.md', 'we:backlog/xaaaaaa-nofm.md', 'we:backlog/xzzzzzz-ghost.md',
+    'we:backlog/xhere01-main.md', 'we:backlog/xsjn0uf-gate.md@pr7', 'we:backlog/xsjn0uf-gate.md@pr8', 'we:backlog/a.md@pr0', 'bad', '', undefined];
+  it('agrees on every ref, with a good gh, a failing gh and a null response', () => {
+    for (const spec of [{}, { fail: true }, { rawMeta: 'null' }, { meta: { state: 'CLOSED', headRefOid: SHA, baseRefName: 'main' } }]) {
+      const memo = next.createCardTextMemo();
+      for (let pass = 0; pass < 2; pass++) {
+        for (const ref of refs) {
+          const want = old.referralCardReadable(ref, root, { readOnPr: (f, p) => old.readCardAtPrHead(f, p, { run: fakeGh(spec).run }) });
+          const got = next.referralCardReadable(ref, root, { readOnPr: (f, p) => next.readCardAtPrHead(f, p, { run: fakeGh(spec).run, memo, log: quiet }) });
+          expect(got, `${ref} ${JSON.stringify(spec)} pass ${pass}`).toBe(want);
+        }
+      }
     }
-    expect(lines.filter(l => l.includes('backlog-index'))).toHaveLength(1);
-    // main moves (new landed card + new sha) -> rebuilt
-    writeFileSync(join(root, 'backlog', '5102-new.md'), '---\nbornAs: "xnew001"\n---\n');
-    setSha(SHA2);
-    expect(q('we:backlog/xnew001-n.md')).toBe(true);
-    expect(lines.filter(l => l.includes('backlog-index'))).toHaveLength(2);
-    rmSync(root, { recursive: true, force: true });
-  });
-  it('without a resolvable sha nothing is cached (every lookup sees the current disk)', () => {
-    _resetBornIndexCache();
-    const root = mkRoot();
-    const q = () => referralCardReadable('we:backlog/xnew001-n.md', root, { log: quiet });
-    expect(q()).toBe(false);
-    writeFileSync(join(root, 'backlog', '5102-new.md'), '---\nbornAs: xnew001\n---\n');
-    expect(q()).toBe(true);
-    rmSync(root, { recursive: true, force: true });
-  });
-  it('an unreadable card falls back to the original scan verdict', () => {
-    _resetBornIndexCache();
-    const root = mkRoot();
-    mkdirSync(join(root, 'backlog', '5000-dir.md')); // readFileSync on a directory throws
-    expect(referralCardReadable('we:backlog/xnew001-n.md', root, { log: quiet })).toBe(false);
     rmSync(root, { recursive: true, force: true });
   });
 });
