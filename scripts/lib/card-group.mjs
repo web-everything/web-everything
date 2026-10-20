@@ -63,6 +63,8 @@ export const CARD_GROUP_TRAILER = 'Co-Authored-By: Claude Opus 5.5 (1M context) 
 const SHA = /^[0-9a-f]{40}$/;
 const firstLine = e => String(e?.message ?? e ?? '').split('\n')[0];
 const labelNames = labels => (Array.isArray(labels) ? labels : []).map(l => (typeof l === 'string' ? l : l?.name)).filter(Boolean);
+const repoIdentity = repo => String(repo ?? '').trim().toLowerCase();
+const sameRepo = (a, b) => !!repoIdentity(a) && repoIdentity(a) === repoIdentity(b);
 
 export function cardGroupStatePath(env = process.env) { return join(resolveCoordinationRoot({ env }), 'drain-card-groups.json'); }
 export const CARD_GROUP_STATE_ENV = 'WE_DRAIN_CARD_GROUP_STATE';
@@ -438,10 +440,11 @@ export function readGroupState(path, readFile = readFileSync) {
  */
 export function cardGroupHold(state, { num, repo, localSlug, files = null } = {}) {
   if (state?.unreadable) return { kind: 'card-grouped', reason: 'card-group state unreadable — holding (fail closed)' };
-  const slug = String(repo || localSlug || '').toLowerCase();
+  const slug = repoIdentity(repo || localSlug);
+  if (!slug) return { kind: 'card-grouped', reason: 'card-group repository identity missing — holding (fail closed)' };
   const paths = Array.isArray(files) ? files.map(f => (typeof f === 'string' ? f : f?.path)).filter(Boolean) : [];
   for (const g of state?.groups ?? []) {
-    if (String(g.repo || '').toLowerCase() !== slug) continue;
+    if (!sameRepo(g.repo, slug)) continue;
     if (Number(g.pr) === Number(num)) continue; // the combined PR itself lands normally
     const where = g.pr ? `#${g.pr}` : `pending card group ${g.id}`;
     if (g.sources?.some(s => Number(s.num) === Number(num)))
@@ -461,8 +464,8 @@ export function cardGroupHold(state, { num, repo, localSlug, files = null } = {}
  */
 export function inCardGroup(state, { num, repo, localSlug, headRef = null } = {}) {
   if (!state || state.unreadable || !Number.isInteger(Number(num))) return false;
-  const slug = String(repo || localSlug || '').toLowerCase();
-  return (state.groups ?? []).some(g => String(g.repo || '').toLowerCase() === slug
+  const slug = repoIdentity(repo || localSlug);
+  return (state.groups ?? []).some(g => sameRepo(g.repo, slug)
     && ((g.pr != null && Number(g.pr) === Number(num) && headRef != null && headRef === g.branch)
       || g.sources?.some(s => Number(s.num) === Number(num))));
 }
@@ -502,6 +505,8 @@ export function createCardGrouping({
   cardConflictSettings = null,
 } = {}) {
   const say = line => { if (!quiet) log.write(`  card-group: ${line}\n`); };
+  const isLocalGroup = g => sameRepo(g.repo, localSlug);
+  const isLocalGroupId = (g, id) => isLocalGroup(g) && g.id === id;
   let setting = settings;
   if (!setting) setting = readCardGroupSettings({ env, log: line => log.write(`  ${line}\n`) });
   if (!statePath) setting = { ...setting, enabled: false, sources: { ...(setting.sources ?? {}), enabled: 'no state path (test run)' } };
@@ -563,22 +568,25 @@ export function createCardGrouping({
     /** Re-read active groups (throttled by reconcileSec). Never throws. */
     reconcile({ force = false } = {}) {
       try {
+        if (!repoIdentity(localSlug)) return { checked: 0, reason: 'repository identity missing' };
         if (!statePath || !existsSync(statePath)) return { checked: 0 };
         const st = readGroupState(statePath, readFile);
         if (st.unreadable) { say('state unreadable — sources stay held; fix or remove the file'); return { checked: 0 }; }
-        if (!st.groups.length) return { checked: 0 };
+        // PR numbers and group IDs are repository-local, even when coordination state is shared.
+        const groups = st.groups.filter(isLocalGroup);
+        if (!groups.length) return { checked: 0 };
         if (!force && now() - (st.lastReconcileAt ?? 0) < setting.reconcileSec * 1000) return { checked: 0, throttled: true };
         if (dryRun) return { checked: 0, dryRun: true };
         mutate(s => { s.lastReconcileAt = now(); });
         const done = [], dissolved = [];
-        for (const g of st.groups) {
+        for (const g of groups) {
           const tag = `group ${g.id}${g.pr ? ` (#${g.pr})` : ''}`;
           if (!g.pr) {
             // Opening interrupted: adopt the PR if one exists for the branch, else drop the record after 15 min.
             let found = null;
             try { found = JSON.parse(gh(['pr', 'list', '--repo', localSlug, '--head', g.branch, '--state', 'all', '--json', 'number,state']))[0] ?? null; } catch { continue; }
-            if (found) { mutate(s => { const x = s.groups.find(y => y.id === g.id); if (x) x.pr = found.number; }); say(`${tag}: adopted #${found.number}`); }
-            else if (now() - (g.createdAt ?? 0) > 15 * 60_000) { mutate(s => { s.groups = s.groups.filter(y => y.id !== g.id); }); say(`${tag}: no PR was opened — record dropped, sources released`); dissolved.push(g.id); }
+            if (found) { mutate(s => { const x = s.groups.find(y => isLocalGroupId(y, g.id)); if (x) x.pr = found.number; }); say(`${tag}: adopted #${found.number}`); }
+            else if (now() - (g.createdAt ?? 0) > 15 * 60_000) { mutate(s => { s.groups = s.groups.filter(y => !isLocalGroupId(y, g.id)); }); say(`${tag}: no PR was opened — record dropped, sources released`); dissolved.push(g.id); }
             continue;
           }
           let pr;
@@ -611,7 +619,7 @@ export function createCardGrouping({
               }
             }
             if (retry) continue;
-            mutate(s => { s.groups = s.groups.filter(y => y.id !== g.id); });
+            mutate(s => { s.groups = s.groups.filter(y => !isLocalGroupId(y, g.id)); });
             done.push(g.id);
             continue;
           }
@@ -634,11 +642,11 @@ export function createCardGrouping({
             catch (e) { say(`${tag}: closing combined PR failed (${firstLine(e)}) — sources stay held, retried`); continue; }
           }
           for (const s of g.sources) comment(s.num, `Card group #${g.pr} dissolved (${why}). This PR goes back to the normal drain path. (drain.group, card xym8nt4)`);
-          mutate(s => { s.groups = s.groups.filter(y => y.id !== g.id); });
+          mutate(s => { s.groups = s.groups.filter(y => !isLocalGroupId(y, g.id)); });
           say(`${tag}: dissolved — ${why}`);
           dissolved.push(g.id);
         }
-        return { checked: st.groups.length, done, dissolved };
+        return { checked: groups.length, done, dissolved };
       } catch (e) { say(`reconcile error (${firstLine(e)}) — sources stay held`); return { error: firstLine(e) }; }
     },
 
@@ -649,11 +657,12 @@ export function createCardGrouping({
     form({ outcomes = [], verdicts = [] } = {}) {
       if (!setting.enabled) return { reason: 'disabled' };
       if (!statePath) return { reason: 'no state path' };
+      if (!repoIdentity(localSlug)) return { reason: 'repository identity missing' };
       try {
         const st = existsSync(statePath) ? readGroupState(statePath, readFile) : { groups: [], failed: {} };
         if (st.unreadable) return { reason: 'state unreadable' };
-        const grouped = new Set(st.groups.flatMap(g => g.sources.map(s => Number(s.num))));
-        const local = r => !r || String(r).toLowerCase() === String(localSlug).toLowerCase();
+        const grouped = new Set(st.groups.filter(isLocalGroup).flatMap(g => g.sources.map(s => Number(s.num))));
+        const local = r => !r || sameRepo(r, localSlug);
         // Both overlap waits qualify: a queue-file-overlap deferral (its reason must name only card files) and an
         // overlap-yield hold (its reason names no files). Either way the git card-only check below decides.
         const waiting = o => (o.kind === 'queue-file-overlap' && overlapReasonIsCardOnly(o.reason)) || o.kind === 'overlap-yield';
@@ -777,7 +786,7 @@ export function createCardGrouping({
             if (bad) return { ok: false, reason: `#${x.num} ${bad}` };
           }
           const claimed = mutate(s => {
-            const taken = new Set(s.groups.flatMap(g => g.sources.map(y => Number(y.num))));
+            const taken = new Set(s.groups.filter(isLocalGroup).flatMap(g => g.sources.map(y => Number(y.num))));
             if (record.sources.some(y => taken.has(y.num))) return false;
             s.groups.push(record);
             return true;
@@ -790,12 +799,12 @@ export function createCardGrouping({
         const remote = run('git', ['ls-remote', 'origin', `refs/heads/${branch}`], { cwd });
         const existing = String(remote.stdout ?? '').split(/\s/)[0];
         if (remote.status !== 0 || (existing && existing !== built.commit)) {
-          mutate(s => { s.groups = s.groups.filter(g => g.id !== id); });
+          mutate(s => { s.groups = s.groups.filter(g => !isLocalGroupId(g, id)); });
           return failAll(p.sources, existing ? `branch ${branch} already exists at another commit` : 'ls-remote failed');
         }
         if (!existing) {
           const push = run('git', ['push', 'origin', `${built.commit}:refs/heads/${branch}`], { cwd, env });
-          if (push.status !== 0) { mutate(s => { s.groups = s.groups.filter(g => g.id !== id); }); return failAll(p.sources, `push failed (${String(push.stderr ?? '').split('\n')[0]})`); }
+          if (push.status !== 0) { mutate(s => { s.groups = s.groups.filter(g => !isLocalGroupId(g, id)); }); return failAll(p.sources, `push failed (${String(push.stderr ?? '').split('\n')[0]})`); }
         }
         const title = `card group: ${p.sources.length} approved card PRs on ${p.files.map(f => f.split('/').pop().split('-')[0]).join(', ')}`;
         let num = null;
@@ -805,7 +814,7 @@ export function createCardGrouping({
           num = Number(/\/pull\/(\d+)/.exec(url)?.[1]);
         } catch (e) { say(`PR create for ${branch} failed (${firstLine(e)}) — the next reconcile adopts or drops it`); return { reason: 'pr create failed' }; }
         if (!Number.isInteger(num)) return { reason: 'pr create returned no number' };
-        mutate(s => { const x = s.groups.find(g => g.id === id); if (x) x.pr = num; });
+        mutate(s => { const x = s.groups.find(g => isLocalGroupId(g, id)); if (x) x.pr = num; });
         for (const s of p.sources) comment(s.num, `Grouped with ${p.sources.filter(x => x.num !== s.num).map(x => `#${x.num}`).join(', ')} into the combined card PR #${num} (they all edit ${p.files.map(f => `\`${f}\``).join(', ')}). This PR stays open and is held by the drain; it is closed only after #${num} merges and its lines are confirmed on main. If #${num} closes, fails, or is sent back, this PR goes back to landing on its own. (drain.group, card xym8nt4)`);
         say(`opened #${num}: ${summary} — ${formatCardGroupSetting(setting)}`);
         return { formed: { id, pr: num, branch, sources: record.sources }, proof };

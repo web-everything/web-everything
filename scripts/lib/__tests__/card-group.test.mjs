@@ -194,6 +194,13 @@ describe('readReferenceMap', () => {
 });
 
 describe('cardGroupHold / state', () => {
+  it.each([undefined, null, '', '   '])('empty repository identity %j never grants a group exemption and holds before enqueue', repo => {
+    const state = { groups: [{ id: 'empty', repo, pr: 9, branch: 'lane/card-group-empty', sources: [{ num: 5 }] }] };
+    expect(inCardGroup(state, { num: 5, repo })).toBe(false);
+    expect(inCardGroup(state, { num: 9, repo, headRef: 'lane/card-group-empty' })).toBe(false);
+    expect(cardGroupHold(state, { num: 5, repo })).toMatchObject({ kind: 'card-grouped', reason: expect.stringContaining('repository identity missing') });
+  });
+
   const state = { groups: [{ id: 'g1', repo: 'o/r', pr: 9, sources: [{ num: 5, headSha: 'a'.repeat(40) }] }], failed: {} };
   it('holds a source, not a stranger, not another repo', () => {
     expect(cardGroupHold(state, { num: 5, repo: null, localSlug: 'o/r' })).toMatchObject({ kind: 'card-grouped', reason: expect.stringContaining('#9') });
@@ -331,6 +338,41 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     return { cwd, base, a, b, heads, calls, exec, verdicts, outcomes };
   }
   const cc = { value: { autoResolveRaisedBy: true }, sources: { autoResolveRaisedBy: 'standard' } };
+
+  it.each([
+    ['before planning', null], ['inside claim', null],
+    ['before planning', 'branch collision'], ['inside claim', 'push failed'],
+  ])('formation ignores foreign source numbers %s and preserves a colliding group ID on %s', (timing, failure) => {
+    const t = setup();
+    const statePath = join(tmp(), 's.json');
+    const sources = [1, 2].map(num => ({ num, headSha: t.heads[num] }));
+    const foreign = { id: groupId(sources), repo: 'o/foreign', pr: null, sources };
+    writeFileSync(statePath, JSON.stringify({ groups: timing === 'before planning' ? [foreign] : [], failed: {} }));
+    const withLock = fn => {
+      if (timing === 'inside claim') writeFileSync(statePath, JSON.stringify({ groups: [foreign], failed: {} }));
+      return { ran: true, result: fn() };
+    };
+    const run = (cmd, args, opts) => {
+      if (failure === 'branch collision' && args[0] === 'ls-remote' && args.at(-1) !== 'refs/heads/main') return { status: 0, stdout: 'f'.repeat(40) };
+      if (failure === 'push failed' && args[0] === 'push') return { status: 1, stdout: '', stderr: 'push refused' };
+      return runIn(t.cwd, () => t.base)(cmd, args, opts);
+    };
+    const g = createCardGrouping({ localSlug: 'o/r', cwd: t.cwd, run, exec: t.exec,
+      statePath, settings, log: { write() {} }, prestage: () => ({ allowed: true }), cardConflictSettings: cc,
+      withLock, readQueueFiles: () => ({ entries: [] }) });
+    const result = g.form({ outcomes: t.outcomes, verdicts: t.verdicts });
+    const groups = readGroupState(statePath).groups;
+    expect(groups[0]).toEqual(foreign);
+    if (failure) {
+      expect(result.formed).toBeUndefined();
+      expect(result.reason).toMatch(/already exists at another commit|push failed/);
+      expect(groups).toEqual([foreign]);
+    } else {
+      expect(result.formed).toMatchObject({ pr: 77 });
+      expect(groups).toHaveLength(2);
+      expect(groups[1]).toMatchObject({ repo: 'o/r', pr: 77 });
+    }
+  });
 
   it('refuses without the land mutex, and when a source is already queued at claim time', () => {
     const t = setup();
@@ -612,9 +654,11 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     const T0 = 1_000_000;
     // A live combined PR carries ready-to-merge + review:pending (it is re-reviewed); that alone must never dissolve it.
     const waiting = [{ name: 'ready-to-merge' }, { name: 'review:pending' }];
-    function reconcileCase({ combined = { state: 'OPEN', labels: waiting }, sources = {}, readFails = [], closeFails = false, pr = 77, list = [], listThrows = false, at = T0 } = {}) {
+    function reconcileCase({ combined = { state: 'OPEN', labels: waiting }, sources = {}, readFails = [], closeFails = false, pr = 77, list = [], listThrows = false, at = T0,
+      repo = 'o/r', localSlug = 'o/r', extraGroups = [] } = {}) {
       const statePath = join(tmp(), 's.json');
-      writeFileSync(statePath, JSON.stringify({ groups: [{ id: 'g', repo: 'o/r', pr, branch: 'lane/card-group-g', createdAt: T0, sources: [{ num: 1, headSha: A }, { num: 2, headSha: B }] }], failed: {} }));
+      writeFileSync(statePath, JSON.stringify({ groups: [{ id: 'g', repo, pr, branch: 'lane/card-group-g', createdAt: T0, sources: [{ num: 1, headSha: A }, { num: 2, headSha: B }] }, ...extraGroups], failed: {} }));
+      const before = readFileSync(statePath, 'utf8');
       const live = { 1: { state: 'OPEN', isDraft: false, headRefOid: A, headRefName: 'lane/x', baseRefName: 'main', labels: accepted, ...sources[1] },
         2: { state: 'OPEN', isDraft: false, headRefOid: B, headRefName: 'lane/x', baseRefName: 'main', labels: accepted, ...sources[2] } };
       const calls = [];
@@ -631,10 +675,49 @@ describe('createCardGrouping — claim under the land mutex, close on current he
         throw new Error(`unexpected ${args.join(' ')}`);
       };
       const out = [];
-      const g = createCardGrouping({ localSlug: 'o/r', cwd: tmp(), run: () => { throw new Error('no git on this path'); }, exec, statePath, settings, log: { write: l => out.push(l) }, now: () => at });
+      const g = createCardGrouping({ localSlug, cwd: tmp(), run: () => { throw new Error('no git on this path'); }, exec, statePath, settings, log: { write: l => out.push(l) }, now: () => at });
       const r = g.reconcile({ force: true });
-      return { r, calls, out: out.join(''), state: readGroupState(statePath), g };
+      return { r, calls, out: out.join(''), state: readGroupState(statePath), g, unchanged: readFileSync(statePath, 'utf8') === before };
     }
+
+    it.each([
+      ['merged', { combined: { state: 'MERGED' } }],
+      ['closed', { combined: { state: 'CLOSED' } }],
+      ['sent back', { combined: { state: 'OPEN', labels: [{ name: 'review:changes' }] } }],
+      ['interrupted creation', { pr: null, list: [{ number: 88 }], at: T0 + 20 * 60_000 }],
+      ['expired creation', { pr: null, at: T0 + 20 * 60_000 }],
+    ])('ignores a foreign repository group (%s) without reads, writes, or releasing its holds', (_, c) => {
+      const t = reconcileCase({ ...c, repo: 'o/foreign' });
+      expect(t.r).toEqual({ checked: 0 });
+      expect(t.calls).toEqual([]);
+      expect(t.unchanged).toBe(true);
+      expect(t.g.holdFor({ num: 1, repo: 'o/foreign' })).toMatchObject({ kind: 'card-grouped' });
+    });
+
+    it.each([null, '', '   '])('refuses reconciliation with missing local repository identity %j', localSlug => {
+      const t = reconcileCase({ localSlug, repo: localSlug, combined: { state: 'CLOSED' } });
+      expect(t.calls).toEqual([]);
+      expect(t.unchanged).toBe(true);
+      expect(t.r).toMatchObject({ checked: 0, reason: 'repository identity missing' });
+    });
+
+    it('dissolves only the local group when repository groups share IDs and PR numbers', () => {
+      const foreign = { id: 'g', repo: 'o/foreign', pr: 77, branch: 'lane/card-group-g', sources: [{ num: 1, headSha: A }] };
+      const t = reconcileCase({ repo: 'O/R', combined: { state: 'CLOSED' }, extraGroups: [foreign] });
+      expect(t.r).toMatchObject({ checked: 1, dissolved: ['g'] });
+      expect(t.state.groups).toEqual([foreign]);
+      expect(t.calls.filter(c => c.startsWith('pr view 77 '))).toHaveLength(1);
+      expect(t.calls.filter(c => c.startsWith('pr comment '))).toHaveLength(2);
+    });
+
+    it('adopts only the local interrupted group when repository groups share an ID', () => {
+      const foreign = { id: 'g', repo: 'o/foreign', pr: null, branch: 'lane/card-group-g', sources: [{ num: 1, headSha: A }] };
+      const t = reconcileCase({ pr: null, list: [{ number: 88 }], extraGroups: [foreign] });
+      expect(t.r.checked).toBe(1);
+      expect(t.state.groups[0].pr).toBe(88);
+      expect(t.state.groups[1]).toEqual(foreign);
+      expect(t.calls.filter(c => c.startsWith('pr list '))).toHaveLength(1);
+    });
 
     it.each([
       ['combined PR closed unmerged', { combined: { state: 'CLOSED', labels: [] } }, /combined PR closed without merging/, false],
