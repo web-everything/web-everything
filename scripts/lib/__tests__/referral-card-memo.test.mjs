@@ -93,18 +93,18 @@ describe('backlog bornAs index', () => {
     }
     expect(lines.filter(l => l.includes('backlog-index'))).toHaveLength(1);
     // main moves (new landed card + new sha) -> rebuilt
-    writeFileSync(join(root, 'backlog', '5102-new.md'), '---\nbornAs: "xnew0001"\n---\n');
+    writeFileSync(join(root, 'backlog', '5102-new.md'), '---\nbornAs: "xnew001"\n---\n');
     setSha(SHA2);
-    expect(q('we:backlog/xnew0001-n.md')).toBe(true);
+    expect(q('we:backlog/xnew001-n.md')).toBe(true);
     expect(lines.filter(l => l.includes('backlog-index'))).toHaveLength(2);
     rmSync(root, { recursive: true, force: true });
   });
   it('without a resolvable sha nothing is cached (every lookup sees the current disk)', () => {
     _resetBornIndexCache();
     const root = mkRoot();
-    const q = () => referralCardReadable('we:backlog/xnew0001-n.md', root, { log: quiet });
+    const q = () => referralCardReadable('we:backlog/xnew001-n.md', root, { log: quiet });
     expect(q()).toBe(false);
-    writeFileSync(join(root, 'backlog', '5102-new.md'), '---\nbornAs: xnew0001\n---\n');
+    writeFileSync(join(root, 'backlog', '5102-new.md'), '---\nbornAs: xnew001\n---\n');
     expect(q()).toBe(true);
     rmSync(root, { recursive: true, force: true });
   });
@@ -112,7 +112,7 @@ describe('backlog bornAs index', () => {
     _resetBornIndexCache();
     const root = mkRoot();
     mkdirSync(join(root, 'backlog', '5000-dir.md')); // readFileSync on a directory throws
-    expect(referralCardReadable('we:backlog/xnew0001-n.md', root, { log: quiet })).toBe(false);
+    expect(referralCardReadable('we:backlog/xnew001-n.md', root, { log: quiet })).toBe(false);
     rmSync(root, { recursive: true, force: true });
   });
 });
