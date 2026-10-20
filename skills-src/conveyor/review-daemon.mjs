@@ -1152,9 +1152,16 @@ export function countLiveReviewRounds(lines, { isScriptFile = null } = {}) {
     const match = /^(?:"([^"]*)"|'([^']*)'|(\S+))\s*/.exec(text);
     return match ? { value: match[1] ?? match[2] ?? match[3], rest: text.slice(match[0].length) } : { value: '', rest: '' };
   };
-  const path = (text) => {
+  const path = (text, { preload = false } = {}) => {
     if (/^["']/.test(text)) return word(text);
     const first = word(text);
+    // require() accepts JSON and native addons too. Use their suffix
+    // as a preload boundary so a relative preload cannot swallow the following review script.
+    const extension = preload ? '\\.(?:mjs|cjs|js|json|node)' : '\\.(?:mjs|cjs|js)';
+    // An extensionless require (including directory/index resolution), or a custom suffix, can precede
+    // a review entrypoint directly. Do not concatenate those two relative argv values into one path.
+    const unknownRelativePreload = preload && !first.value.startsWith('/') && !new RegExp(`${extension}$`).test(first.value);
+    if (unknownRelativePreload && /(?:^|\/)review-(?:job|loop-cli)\.mjs$/.test(word(first.rest).value)) return first;
     // ps prints argv joined by spaces, without shell quoting. Retain the whole path up to its script
     // extension instead of treating a checkout directory's first space as the end of the script.
     // Flattened ps text can lose a path's boundaries, including extensionless prefixes and option-like
@@ -1163,7 +1170,15 @@ export function countLiveReviewRounds(lines, { isScriptFile = null } = {}) {
     const mentionsReview = /review-(?:job|loop-cli)\.mjs(?:\s|$)/.test(text);
     const boundary = text.search(/\s+(?=(?:--?[A-Za-z0-9]|\/|\.{1,2}\/))/);
     const span = boundary < 0 ? text : text.slice(0, boundary);
-    for (const match of text.matchAll(/\.(?:mjs|cjs|js)(?=\s|$)/g)) {
+    if (unknownRelativePreload) {
+      const review = /(?:^|\s)(\S*review-(?:job|loop-cli)\.mjs)(?=\s|$)/.exec(span);
+      // Without a suffix before a spaced review path, flattened relative argv cannot distinguish
+      // a spaced preload from an extensionless preload followed by the actual review entrypoint.
+      if (review && !new RegExp(`${extension}(?=\\s|$)`).test(span.slice(0, review.index))) {
+        throw new Error('ambiguous preload path in process listing');
+      }
+    }
+    for (const match of text.matchAll(new RegExp(`${extension}(?=\\s|$)`, 'g'))) {
       const candidate = text.slice(0, match.index + match[0].length);
       // No script opened by these POSIX runtimes can exceed Linux's 4096-byte pathname bound (macOS is
       // tighter). Long changed-file argv must not turn impossible concatenated paths into a cap hold.
@@ -1182,13 +1197,13 @@ export function countLiveReviewRounds(lines, { isScriptFile = null } = {}) {
     }
     // Relative paths belong to the other process's cwd. Preserve the first complete script convention
     // (including relative preload values), but never turn an ambiguous extensionless entrypoint into zero.
-    if (!first.value.includes('/') && !/\.(?:mjs|cjs|js)$/.test(first.value)) {
+    if (!first.value.includes('/') && !new RegExp(`${extension}$`).test(first.value)) {
       if (isScriptFile && mentionsReview) throw new Error('ambiguous script path in process listing');
       return first;
     }
     // Bare '-' / '--' may be directory fragments. A normal option or a rooted path starts a new argument
     // in the lexical fallback; an existing absolute path above takes precedence over that convention.
-    const match = /^(.*?\.(?:mjs|cjs|js))(?=\s|$)/.exec(span);
+    const match = new RegExp(`^(.*?${extension})(?=\\s|$)`).exec(span);
     const value = resolved ?? match?.[1] ?? first.value;
     return { value, rest: text.slice(value.length).trimStart() };
   };
@@ -1207,11 +1222,11 @@ export function countLiveReviewRounds(lines, { isScriptFile = null } = {}) {
       if (/^(?:-[ep]|--(?:eval|print)(?:=|$))/.test(t.value)) return '';
       const equals = rest.indexOf('=');
       if (equals > 0 && PRELOAD_FLAGS.has(rest.slice(0, equals))) {
-        rest = path(rest.slice(equals + 1)).rest;
+        rest = path(rest.slice(equals + 1), { preload: true }).rest;
         continue;
       }
       if (VALUE_FLAGS.has(t.value)) {
-        rest = PRELOAD_FLAGS.has(t.value) && /^(?:\/|\.{1,2}\/)/.test(t.rest) ? path(t.rest).rest : word(t.rest).rest;
+        rest = PRELOAD_FLAGS.has(t.value) && /^(?:\/|\.{1,2}\/)/.test(t.rest) ? path(t.rest, { preload: true }).rest : word(t.rest).rest;
         continue;
       }
       if (t.value.startsWith('-')) { rest = t.rest; continue; }
