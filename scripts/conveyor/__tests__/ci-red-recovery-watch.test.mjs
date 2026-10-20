@@ -1785,3 +1785,25 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
   });
 
 });
+
+describe('missing-run recovery scope', () => {
+  it('leaves a review-only standards gap alone when all required contexts have reported', () => {
+    const result = sweepMissingRunRecovery({
+      repo: 'web-everything/web-everything', apply: false,
+      now: Date.parse('2026-10-18T12:00:00Z'), mainRuns: [],
+      readOpenPrs: () => [{
+        number: 5514, headRefOid: 'a'.repeat(40), headRefName: 'lane/example',
+        baseRefName: 'main', mergeable: 'MERGEABLE',
+        labels: [{ name: 'review:human' }, { name: 'status:awaiting-review' }],
+        statusCheckRollup: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate']
+          .map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })),
+      }],
+      readRequiredContexts: () => ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'],
+      readDeclaredContexts: () => ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'],
+      readPush: () => null,
+      readHeadCommittedAt: () => '2026-10-18T10:00:00Z', readComments: () => [],
+    });
+    expect(result.dispatch).toEqual([]);
+    expect(result.applied).toEqual([]);
+  });
+});

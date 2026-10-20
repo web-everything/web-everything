@@ -11,7 +11,10 @@ import { takeoverEpisodes, takeoverProgress } from './takeover-budget.mjs';
 // Its import-time dependencies have no path back here (including its ruling-ledger load).
 const { evaluatePr, rulingNeededRow } = await import('../operations/operator-queue.mjs');
 import { FALLBACK_REQUIRED_STATUS_CHECKS, withoutImpliedRequiredChecks } from '../lib/required-status-checks.mjs';
-import { redTeamQueueReason } from '../lib/red-team-gate.mjs';
+import { redTeamQueueReason, redTeamRulingNeeded } from '../lib/red-team-gate.mjs';
+let savedRedTeamFallback = null;
+try { ({ savedRedTeamFallback } = await import('../lib/drain-saved-red-team.mjs')); }
+catch { /* Partial CLI copies can still label from posted evidence. */ }
 import { standDownComments } from './stand-down.mjs';
 import { latestUnresolvedStandDown } from './stand-down-answer-core.mjs';
 
@@ -45,15 +48,20 @@ export const PR_STATUS_DESCRIPTIONS = Object.freeze({
 const ESCALATED = new Set(['takeover-budget-spent', 'takeover-not-converging', 'takeover-spent', 'takeover-void-limit', 'ruling-dispute', 'setting-person', 'setting-disabled']);
 const names = (labels) => (Array.isArray(labels) ? labels : []).map((l) => (typeof l === 'string' ? l : l?.name)).filter(Boolean);
 
-/** PURE: exactly the operator queue's NEEDS YOU or RULING NEEDED gate. */
+/** Exactly the operator queue's NEEDS YOU or RULING NEEDED gate; saved evidence is read lazily. */
 export function operatorQueueNeedsYou(pr, { humanAt } = {}) {
   const subject = { ...pr, labels: names(pr?.labels).map((name) => ({ name })) };
   // The daemon snapshot omits mergeable; preserve an explicit value when supplied.
   if (subject.mergeable === undefined && subject.mergeStateStatus && subject.mergeStateStatus !== 'UNKNOWN') {
     subject.mergeable = subject.mergeStateStatus === 'DIRTY' ? 'CONFLICTING' : 'MERGEABLE';
   }
-  return evaluatePr(subject).ready || Boolean(humanAt === undefined
-    ? rulingNeededRow('', subject) : rulingNeeded(subject, { humanAt }));
+  if (evaluatePr(subject).ready || Boolean(humanAt === undefined
+    ? rulingNeededRow('', subject) : rulingNeeded(subject, { humanAt }))) return true;
+  try {
+    const readSaved = subject.repo
+      ? savedRedTeamFallback?.({ repo: subject.repo, pr: subject.number, head: subject.headRefOid }) ?? null : null;
+    return redTeamRulingNeeded(subject, undefined, { readSaved }) !== null;
+  } catch { return false; }
 }
 
 const timeOf = (c) => { const t = Date.parse(c?.createdAt ?? c?.created_at ?? ''); return Number.isFinite(t) ? t : NaN; };

@@ -1,10 +1,11 @@
+import { readLivePrContext } from '../lib/review-pr-snapshot.mjs';
 import { basisLineOf, isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
 import { rereviewMode, reviewMustVoid } from '../lib/review-timing.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { readReviewCiGate, readReviewHead } from '../lib/review-ci-gate-io.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
+import { sameRepo, normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
   readReferralRecords, mandatoryReferralState, renderReferralRecord, readOperatorRulings,
   findCarriedOperatorRuling, findCarriedReviewerRuling, exactCitedPath, REFERRAL_CARRY_REASON, activeReferrals, liveReferrals, referralRecheck, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON,
   findingIdentityTable, findingIdOf, findingIdentityPromptRows, sameAsLinkAllowed, FINDING_ID_PATTERN, FINDING_SAME_AS_MANDATE,
@@ -152,11 +153,9 @@ const execFileIn = (cwd) => (cmd, args, opts) => execFileSync(cmd, args, { ...op
  * The default PR-view transport: ONE `gh pr view`, exactly as before.
  * @returns {object} the parsed `--json` view
  */
-export function ghPrView({ pr, repo, cwd = REPO_ROOT } = {}) {
+export function ghPrView({ pr, repo, cwd = REPO_ROOT, exec = args => execFileSync('gh', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, cwd }), snapshotOptions = {} } = {}) {
   try {
-    return JSON.parse(execFileSync('gh', [
-      'pr', 'view', String(pr), '--repo', repo, '--json', PR_VIEW_FIELDS.join(','),
-    ], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, cwd }));
+    return readLivePrContext({ ...snapshotOptions, repo, pr, exec });
   } catch (e) {
     const msg = String((e && (e.stderr || e.message)) || e).split('\n').filter(Boolean).pop() || 'gh pr view failed';
     throw new Error(`review-pr-io: could not read ${repo}#${pr} — ${msg}`);
@@ -404,6 +403,24 @@ export function readReviewRound({ repo, pr, head, readLedgerRows = defaultReadLe
     const rows = (readLedgerRows(repo) ?? []).filter((r) => Number(r?.pr) === Number(pr)
       && (r.type === EVENT_TYPES.REVIEW_RUN || r.type === EVENT_TYPES.FINDING));
     return reviewRoundOf(rows, head);
+  } catch { return null; }
+}
+
+/**
+ * THIS PR'S REVIEW ROUND AS OF a moment (an operator round grant's `at`): the distinct heads reviewed by then, the last
+ * of them being that moment's round. Same rows as {@link readReviewRound}. Rows without a readable time are left out,
+ * so a doubt lowers the anchored cap, never raises it. An unreadable ledger, a bad time, or no reviewed head is `null`.
+ * @param {{repo: string, pr: number, at: string, readLedgerRows?: Function}} o
+ * @returns {number|null}
+ */
+export function readReviewRoundAsOf({ repo, pr, at, readLedgerRows = defaultReadLedgerRows }) {
+  const t = Date.parse(at);
+  if (!Number.isFinite(t)) return null;
+  try {
+    const heads = new Set((readLedgerRows(repo) ?? []).filter((r) => Number(r?.pr) === Number(pr)
+      && (r.type === EVENT_TYPES.REVIEW_RUN || r.type === EVENT_TYPES.FINDING) && Date.parse(r.at) <= t
+      && typeof r.headSha === 'string' && r.headSha).map((r) => r.headSha.toLowerCase()));
+    return heads.size > 0 ? heads.size : null;
   } catch { return null; }
 }
 
@@ -1062,7 +1079,7 @@ export function createReviewPrSinks({
           // clear a standing `block`.
           const dropped = activeReferrals(record).filter(f => referralSeatDisabled(f.seat, env)
             && !record.rulings.some(r => r.key === f.key)
-            && !priorOperatorRulings.some(o => o.repo === record.repo && o.pr === record.pr
+            && !priorOperatorRulings.some(o => sameRepo(o.repo, record.repo) && o.pr === record.pr
               && o.head === record.head && o.runId === record.runId && o.key === f.key))
             .map(f => ({ key: f.key, reason: REFERRAL_DROP_REASON }));
           if (!dropped.length) continue;
@@ -1214,7 +1231,7 @@ export function createReviewPrSinks({
             for (const f of activeReferrals(record)) {
               if ((record.carried ?? []).some(c => c.key === f.key)
                 || (stillPending && record.rulings.some(r => r.key === f.key) && !stillPending.has(f.key))
-                || operatorRulings.some(o => o.repo === record.repo && o.pr === record.pr
+                || operatorRulings.some(o => sameRepo(o.repo, record.repo) && o.pr === record.pr
                   && o.head === record.head && o.runId === record.runId && o.key === f.key)) continue;
               // #76c — else the mandatory reviewer's own counted not-real/card on the same deterministic finding
               // identity (never a block, never a declared link); the same unchanged-lines proof applies below.
@@ -1418,7 +1435,7 @@ export function createReviewPrSinks({
             if (record.repo !== read.repo || record.pr !== read.pr || record.head !== reviewed) continue;
             const effective = referralRecordState(record, { ...context(live), head: reviewed, records: settled.records,
               operatorRulings: settled.operatorRulings });
-            const operatorOn = key => (settled.operatorRulings ?? []).filter(o => o.repo === record.repo && o.pr === record.pr
+            const operatorOn = key => (settled.operatorRulings ?? []).filter(o => sameRepo(o.repo, record.repo) && o.pr === record.pr
               && o.head === record.head && o.runId === record.runId && o.key === key);
             const active = activeReferrals(record);
             for (const f of active) {
@@ -1747,7 +1764,7 @@ export function createReviewPrSinks({
       const plan = planAdvisoryLabels({ outcome: payload.outcome, currentLabels: labels });
       if (plan.reason) return { applied: false, reason: plan.reason };
       if (!plan.add && plan.remove.length === 0) return { applied: false, reason: 'already-current' };
-      // `gh pr edit --add-label` refuses a label the repo has never had; ensure is create-or-update (`--force`).
+      // `gh pr edit --add-label` refuses a label the repo has never had; ensure provisions missing labels through the shared cache.
       if (plan.add) labelProvider.ensureLabel(payload.repo, plan.add, ADVISORY_LABEL_META[plan.add]);
       labelProvider.setLabels(payload.repo, payload.pr, { add: plan.add ?? undefined, remove: plan.remove });
       return { applied: true, added: plan.add, removed: plan.remove };

@@ -158,6 +158,7 @@ describe('job records — liveness by pid, without a transcript', () => {
 function fakeIo(over = {}) {
   const calls = [];
   const io = {
+    redTeamTimingSetting: () => ({ value: { timing: 'post-accept' }, sources: { timing: 'tool' }, invalid: [] }),
     root: '/daemon',
     now: (() => { let t = 1_000; return () => { t += 10; return t; }; })(),
     newActorId: () => 'actor-fresh-uuid',
@@ -291,6 +292,15 @@ describe('dispatchReviewJob — what the daemon calls', () => {
     expect(spawned[0].env.PATH).toBe('/shim:/usr/bin');
     expect(spawned[0].env.CLAUDE_CODE_SESSION_ID).toBeUndefined();
     expect(readJobRecord('review-10', dir)).toMatchObject({ slug: 'review-10', pid: 4242, pr: 10 });
+  });
+
+  it('carries an internal drain request to the existing job without adding a CLI operation', () => {
+    const request = { repo: REPO, pr: 10, head: 'a'.repeat(40), requestedAt: 1 };
+    const spawned = [];
+    dispatchReviewJob({ ...base, dir, drainRedTeamRequest: request,
+      resolveSettingsEnv: () => null, spawnJob: o => { spawned.push(o); return 4242; } });
+    expect(JSON.parse(spawned[0].env.WE_DRAIN_RED_TEAM_REQUEST)).toEqual(request);
+    expect(spawned[0].argv.slice(1)).toEqual(['run', '--pr=10', `--repo=${REPO}`]);
   });
 
   it('declines to spawn while a live job holds the PR, or during the lane cool-off', () => {

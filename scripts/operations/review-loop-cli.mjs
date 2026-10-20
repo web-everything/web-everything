@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolveRealFiles } from '../lib/pr-real-files.mjs';
 /**
  * @file scripts/operations/review-loop-cli.mjs
  * @description #3072's REMAINING SLICE, MADE CALLABLE — drives ONE `review-pr` run unattended, using
@@ -66,6 +67,7 @@ import {
 } from './cli-adapter.mjs';
 import { startRun, runStatus, rewindRunToStep } from './engine.mjs';
 import { createFileRunStore, newRunId } from './run-store.mjs';
+import { chosenRunIdRecord } from './run-record.mjs';
 import { REPO_ROOT as SCAFFOLD_ROOT } from './scaffold-io.mjs';
 import { resolveOperation, createCliJudgeFactory } from './run.mjs';
 import { appendEntry } from '../conveyor/learnings-drop.mjs';
@@ -193,6 +195,8 @@ export async function fileItemForPrevention(input, {
  */
 export async function fileItemForPreventionViaLandingJob(input, { spawnJob = spawnPreventionLandingJob } = {}) {
   const filed = spawnJob(input, { sessionPrefix: 'review-loop-prevention' });
+  if (filed.step === 'paused' && filed.skipped === true) return { code: 0, lines: [JSON.stringify({ skipped: true, owed: true, reason: filed.reason })] };
+  if (filed.skipped) return { code: 1, lines: [JSON.stringify({ skipped: true, reason: filed.reason })] };
   if (!filed.ok) {
     return { code: 1, lines: [filed.error ?? 'land-prevention-card: unknown spawn failure'] };
   }
@@ -441,11 +445,15 @@ export function chooseSecuritySeat(argv, { enabled = true, store = null, readCha
   const pr = Number(argvFlag(argv, 'pr'));
   const repo = argvFlag(argv, 'repo');
   if (!Number.isInteger(pr) || pr <= 0) return { securitySeat: true, reason: 'no --pr — full roster' };
-  let files;
-  try { files = readChangedFiles({ pr, repo }); } catch (e) {
+  let files, verified = false;
+  try {
+    const result = readChangedFiles({ pr, repo });
+    files = Array.isArray(result) ? result : result?.files;
+    verified = result?.source === 'git';
+  } catch (e) {
     return { securitySeat: true, reason: `touch-set unreadable (${String(e?.message ?? e).slice(0, 200)}) — full roster` };
   }
-  if (!Array.isArray(files) || files.length >= TOUCH_SET_FILE_CAP) {
+  if (!Array.isArray(files) || (!verified && files.length >= TOUCH_SET_FILE_CAP)) {
     return { securitySeat: true, reason: `touch-set ${Array.isArray(files) ? `has ${files.length} file(s), may be truncated` : 'unreadable'} — full roster` };
   }
   if (cardOnly.lightLane && isCardOnlyDiff(files) && (argvFlag(argv, 'lens') || DEFAULT_LENS) === 'correctness') {
@@ -471,15 +479,21 @@ export function pathsWithRenameSources(files) {
   return out;
 }
 
-function defaultReadChangedFiles({ pr, repo }) {
+export function defaultReadChangedFiles({ pr, repo, cwd = process.cwd(), exec = execFileSyncThrottled, run, enabled } = {}) {
   // No repo, no REST path: throw, which `chooseSecuritySeat` answers with the full roster. 100 entries is one page and
   // is the cap above, so a list that long is never trusted to buy prose.
   if (!/^[\w.-]+\/[\w.-]+$/.test(String(repo ?? ''))) throw new Error('no valid --repo: the file list with rename sources needs <owner>/<name>');
   // `--jq` drops each file's `patch`, which would otherwise make a documentation-heavy PR overflow the read buffer.
-  const out = JSON.parse(execFileSyncThrottled('gh', ['api', `repos/${repo}/pulls/${Number(pr)}/files?per_page=${TOUCH_SET_FILE_CAP}`,
+  const out = JSON.parse(exec('gh', ['api', `repos/${repo}/pulls/${Number(pr)}/files?per_page=${TOUCH_SET_FILE_CAP}`,
     '--jq', '[.[] | {filename, previous_filename}]'],
   { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 16 * 1024 * 1024 }));
-  return pathsWithRenameSources(out);
+  // Head metadata is mutable: read it once per attempt, then let pr-real-files cache only
+  // immutable repo+head evidence. Caching by PR number could grant an old head's card exemption.
+  let info;
+  try { info = JSON.parse(exec('gh', ['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefName,headRefOid,baseRefName'],
+    { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 })); } catch { info = null; }
+  return resolveRealFiles({ pr: info, repo, cwd, run, enabled,
+    ghFiles: !Array.isArray(out) || out.length >= TOUCH_SET_FILE_CAP ? null : pathsWithRenameSources(out) });
 }
 
 /**
@@ -664,6 +678,11 @@ export async function runReviewLoopOnce({
         input: applyUnattendedActorDefault(parsed.input, argv),
         registry,
       });
+      if (parsed.control.runId) {
+        const chosen = chosenRunIdRecord(run, store);
+        if (chosen.error) return { code: 2, lines: [`error: ${chosen.error}`], run: null, stopped: 'refused' };
+        run = chosen.run;
+      }
       store.write(run);
     }
   }
@@ -764,6 +783,12 @@ export async function runReviewLoopOnce({
       };
     }
 
+    if (filedPayload?.skipped) {
+      const rendered = renderOutcome({ outcome, json: parsed.control.json, declaration });
+      return { ...rendered, code: filedPayload.owed === true ? 0 : 1, lines: parsed.control.json
+        ? [JSON.stringify({ ...JSON.parse(rendered.lines[0]), preventionFilingPaused: filedPayload.reason, ...(filedPayload.owed === true ? { preventionFilingOwed: true } : {}) })]
+        : [...rendered.lines, filedPayload.owed === true ? `Prevention filing recorded, owed — ${filedPayload.reason}` : filedPayload.reason], run: outcome.run, stopped: outcome.stopped };
+    }
     const filedNum = alreadyFiled ? alreadyFiled.num : (filedPayload?.verdict?.num ?? null);
     const filedRel = alreadyFiled ? alreadyFiled.path : (filedPayload?.verdict?.rel ?? null);
     // #4493 — the production filer now spawns a detached landing job (see `fileItemForPreventionViaLandingJob`)
@@ -854,6 +879,12 @@ export async function runReviewLoopOnce({
         run: outcome.run,
         stopped: outcome.stopped,
       };
+    }
+    if (filedPayload?.skipped) {
+      const rendered = renderOutcome({ outcome, json: parsed.control.json, declaration });
+      return { ...rendered, code: filedPayload.owed === true ? 0 : 1, lines: parsed.control.json
+        ? [JSON.stringify({ ...JSON.parse(rendered.lines[0]), preventionFilingPaused: filedPayload.reason, ...(filedPayload.owed === true ? { preventionFilingOwed: true } : {}) })]
+        : [...rendered.lines, filedPayload.owed === true ? `Prevention filing recorded, owed — ${filedPayload.reason}` : filedPayload.reason], run: outcome.run, stopped: outcome.stopped };
     }
     const queued = alreadyFiled ? alreadyFiled.queued : filedPayload?.queued === true;
     const num = alreadyFiled ? alreadyFiled.num : (filedPayload?.verdict?.num ?? null);
