@@ -565,8 +565,12 @@ it('a started seal whose PR is still open resumes as before', async () => {
     ? JSON.stringify({ number: 9, state: 'OPEN', headRefName: f.state.batchRef }) : f.exec(cmd, args, options)));
   expect((await publishBatch(f.input, { ...f.opts, exec })).action).toBe('sealed');
   expect(f.read().sealFailure).toBeUndefined();
-  // Not stuck: the PR-state read never runs, so retry order is unchanged.
-  expect(exec.mock.calls.some(([, a]) => a.includes('number,state,headRefName'))).toBe(false);
+  // Not stuck: the stuck-path read never runs; the only PR-state read is the existing post-seal terminal retirement,
+  // after label-on-green, so retry order is unchanged.
+  const reads = exec.mock.calls.map(([, a], i) => (a.includes('number,state,headRefName') ? i : -1)).filter(i => i >= 0);
+  const sealed = exec.mock.calls.findIndex(([, a]) => a[1] === 'open-pr' && a.includes('--mode=label-on-green'));
+  expect(reads).toHaveLength(1);
+  expect(reads[0]).toBeGreaterThan(sealed);
 });
 it('a MERGED view for a different branch is not trusted', async () => {
   const { f } = terminalFixture('MERGED');

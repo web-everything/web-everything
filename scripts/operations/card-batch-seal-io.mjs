@@ -134,7 +134,7 @@ export async function publishBatch(input, opts = {}) {
       save();
     };
     // Pending protection recovery must run even if a subsequent push is no longer adoptable.
-    try { await restoreProtection(); } catch (error) { return orRecoverMerged(error); }
+    try { await restoreProtection(); } catch (error) { return await orRecoverMerged(error); }
     const advertised = String(await run('git', ['ls-remote', '--refs', remote, `refs/heads/${state.batchRef}`]))
       .trim().split(/\s+/)[0];
     if (advertised && advertised !== state.headSha && resolveAdoptDescendantHead(opts) === 'on') {
@@ -174,10 +174,10 @@ export async function publishBatch(input, opts = {}) {
       }
     }
     // Adoption above can re-arm protection; a failure restoring it on a merged PR is the same stuck path.
-    try { await restoreProtection(); } catch (error) { return orRecoverMerged(error); }
+    try { await restoreProtection(); } catch (error) { return await orRecoverMerged(error); }
     let mismatch = await check();
     // A started seal refused here may be a merged PR whose branch moved or was deleted: the stuck path.
-    if (mismatch) return state.sealedAt && mismatch === 'head-mismatch' ? orRecoverMerged(refuse(mismatch)) : refuse(mismatch);
+    if (mismatch) return state.sealedAt && mismatch === 'head-mismatch' ? await orRecoverMerged(refuse(mismatch)) : refuse(mismatch);
     const plan = planPublish({ state, kind, policy, now: now() });
     bodyPath = `${statePath}.${lease.token}.body.md`;
     writeFileSync(bodyPath, renderBatchBody(state));
