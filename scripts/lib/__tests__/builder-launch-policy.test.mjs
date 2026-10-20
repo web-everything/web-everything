@@ -58,6 +58,31 @@ describe('builder.pausedPollSec cascade', () => {
       .toMatchObject({ pausedPollSec: 600, source: 'standard', invalid: [expect.stringContaining(PAUSED_POLL_ENV)] });
   });
 
+  describe.each(['platform', 'tool', 'env'])('Node timer bounds for %s', (layer) => {
+    const optionsFor = value => layer === 'env'
+      ? { env: { [PAUSED_POLL_ENV]: String(value) } }
+      : { [layer]: { pausedPollSec: value } };
+
+    it('accepts the largest whole-second delay below the timer limit', () => {
+      expect(resolveBuilderPausedPollPolicy(optionsFor(2_147_483)))
+        .toEqual({ pausedPollSec: 2_147_483, source: layer, invalid: [] });
+    });
+
+    it.each([2_147_484, 4_294_967, Number.MAX_SAFE_INTEGER])('rejects overflowing delay %s with a diagnostic', value => {
+      const policy = resolveBuilderPausedPollPolicy(optionsFor(value));
+      expect(policy).toMatchObject({ pausedPollSec: 600, source: 'standard' });
+      expect(policy.invalid).toHaveLength(1);
+      expect(formatBuilderPausedPollPolicyLine(policy)).toContain('invalid setting, fallback to 600s');
+    });
+  });
+
+  it('resets an overflowing higher layer, and allows a valid later override', () => {
+    const options = { platform: { pausedPollSec: 90 }, tool: { pausedPollSec: 2_147_484 } };
+    expect(resolveBuilderPausedPollPolicy(options)).toMatchObject({ pausedPollSec: 600, source: 'standard' });
+    expect(resolveBuilderPausedPollPolicy({ ...options, env: { [PAUSED_POLL_ENV]: '120' } }))
+      .toMatchObject({ pausedPollSec: 120, source: 'env', invalid: ['tool.pausedPollSec=2147484'] });
+  });
+
   it('loads the same platform and tool layers as launch policy and reports their source', () => {
     const options = { readFile: () => JSON.stringify({ builder: { pausedPollSec: 90 } }), toolSettings: {}, env: {} };
     expect(loadBuilderPausedPollPolicy(options)).toMatchObject({ pausedPollSec: 90, source: 'platform' });

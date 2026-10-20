@@ -66,6 +66,7 @@ import {
 import { BUILD_DISPATCH_POLICY } from '../../../scripts/conveyor/build-dispatch-policy.mjs';
 import { createFileRunStore, newRunRecord } from '../../../scripts/operations/run-store.mjs';
 import { DISPATCH_EFFECT } from '../../../scripts/operations/dispatch-lane.mjs';
+import { loadBuilderPausedPollPolicy, PAUSED_POLL_ENV } from '../../../scripts/lib/builder-launch-policy.mjs';
 
 describe('effectiveTickIntervalMs', () => {
   const paused = { maxConcurrentBuilds: 0, maxConcurrentExternalBuilds: 0 };
@@ -94,6 +95,17 @@ describe('effectiveTickIntervalMs', () => {
     expect(effectiveTickIntervalMs({ policy: paused, defaultMs: 700_000 })).toBe(700_000);
     expect(effectiveTickIntervalMs({ policy: paused, pausedPollSec: 300 })).toBe(300_000);
     expect(effectiveTickIntervalMs()).toBe(DEFAULT_INTERVAL_MS);
+  });
+
+  it.each([
+    ['2147483', 2_147_483_000],
+    ['2147484', 600_000],
+  ])('keeps the loaded paused setting %s within Node timer bounds', (value, expectedMs) => {
+    const pausedPollPolicy = loadBuilderPausedPollPolicy({
+      readFile: () => '{}', toolSettings: {}, env: { [PAUSED_POLL_ENV]: value },
+    });
+    expect(effectiveTickIntervalMs({ policy: paused, pausedPollSec: pausedPollPolicy.pausedPollSec }))
+      .toBe(expectedMs);
   });
 });
 

@@ -79,13 +79,15 @@ function loadBuilderPolicyLayers({ platformPath, toolSettings, env, readFile }, 
 /** `builder.pausedPollSec`: standard → platform → tool → env. Invalid values reset to 600. */
 export const STANDARD_PAUSED_POLL_SEC = 600;
 export const PAUSED_POLL_ENV = 'WE_BUILDER_PAUSED_POLL_SEC';
+// Node resets delays above its signed 32-bit millisecond limit to 1ms.
+const MAX_PAUSED_POLL_SEC = Math.floor(2_147_483_647 / 1000);
 
 export function resolveBuilderPausedPollPolicy({ platform, tool, env } = {}) {
   let pausedPollSec = STANDARD_PAUSED_POLL_SEC;
   let source = 'standard';
   const invalid = [];
   const apply = (value, layer, label) => {
-    if (Number.isSafeInteger(value) && value > 0 && Number.isSafeInteger(value * 1000)) {
+    if (Number.isSafeInteger(value) && value > 0 && value <= MAX_PAUSED_POLL_SEC) {
       pausedPollSec = value;
       source = layer;
     } else {
