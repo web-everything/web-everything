@@ -7,7 +7,7 @@
  *   until they were re-adopted at 20:19Z. These tests replay that sequence through the real rebuild path.
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -74,7 +74,7 @@ function fixture() {
   const pushNewcomer = () => push('lane/c', 'origin/lane/c', { [DAEMON]: lines({ 2: 'c2', 5: 'c5', 8: 'c8' }) });
   gitOk(clone, ['fetch', '-q', 'origin']);
   const runGit = (args, opts = {}) => gitRun(args, { cwd: clone, env: { ...env, ...opts.env } });
-  return { clone, env, init, cOld, p, h, overlays, pushNewcomer, runGit };
+  return { clone, env, init, cOld, p, h, overlays, pushNewcomer, runGit, push };
 }
 
 const passSmoke = () => vi.fn(async () => ({
@@ -138,5 +138,88 @@ describe('x5059uu — rebuild keeps established overlays and parks the conflicti
     const loud = plan.alerts.find((a) => a.kind === 'established-overlay-dropped');
     expect(loud?.detail).toMatchObject({ ref: 'lane/prepare-launch-stall', pr: 4658, files: [DAEMON] });
     expect(plan.applied.map((a) => a.ref)).toEqual(['lane/ruled-hold-release']);
+    expect(plan.establishedLost).toEqual([expect.objectContaining({ ref: 'lane/prepare-launch-stall', pr: 4658, reason: 'conflict', files: [DAEMON] })]);
+  });
+
+  // x9diisp — live 2026-10-20T11:51Z (review clone): main graduated hotfixes the running build carried as overlays,
+  // every stacked overlay then conflicted with main, and the rebuild built + adopted plain main (all hotfixes lost).
+  it('main moving onto a LIVE overlay HOLDS the clone on its last-good build instead of building without it', async () => {
+    const f = fixture();
+    for (const o of f.overlays.slice(1)) addOverlay(f.clone, o, { env: f.env });
+    const first = await rebuildClone({ root: f.clone, env: f.env, runSmoke: passSmoke(), prState: async () => 'OPEN' });
+    expect(first, JSON.stringify(first.alerts)).toMatchObject({ adopted: true });
+    const liveHead = gitOk(f.clone, ['rev-parse', 'HEAD']).trim();
+
+    const author = join(dirname(f.clone), 'author');
+    gitOk(author, ['fetch', '-q', 'origin']);
+    gitOk(author, ['checkout', '-q', '-B', 'main', 'origin/main']);
+    write(author, DAEMON, lines({ 2: 'main graduated it differently' }));
+    gitOk(author, ['commit', '-q', '-am', 'graduate']);
+    gitOk(author, ['push', '-q', 'origin', 'HEAD:refs/heads/main']);
+
+    const { dryRunRebuild } = await import('../daemon-rebuild.mjs');
+    const dry = await dryRunRebuild({ root: f.clone, env: f.env, prState: async () => 'OPEN' });
+    expect(dry.wouldDo).toBe('hold (established-overlay-conflict)');
+    const smoke = passSmoke();
+    const second = await rebuildClone({ root: f.clone, env: f.env, runSmoke: smoke, prState: async () => 'OPEN' });
+    expect(second.moved).toBe(false);
+    expect(second.reason).toBe('established-overlay-conflict');
+    expect(smoke).not.toHaveBeenCalled();
+    expect(gitOk(f.clone, ['rev-parse', 'HEAD']).trim()).toBe(liveHead);
+    const hold = second.alerts.find((a) => a.kind === 'established-overlay-hold');
+    expect(hold?.detail.refs).toEqual(['lane/prepare-launch-stall']);
+    const { readRebuildState } = await import('../daemon-rebuild/state.mjs');
+    expect(readRebuildState(f.clone, f.env).held).toMatchObject({ reason: 'established-overlay-conflict', lastGood: liveHead });
+    const { readOverlays } = await import('../daemon-overlays.mjs');
+    expect(readOverlays(f.clone, { env: f.env }).map((o) => o.ref)).toEqual(['lane/prepare-launch-stall', 'lane/ruled-hold-release']);
+
+    // The overlay's author merges main in (its new tip is a newcomer): the next rebuild builds, adopts, clears the hold.
+    gitOk(author, ['fetch', '-q', 'origin']);
+    gitOk(author, ['checkout', '-q', '-B', 'lane/prepare-launch-stall', 'origin/lane/prepare-launch-stall']);
+    spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'merge', '-q', 'origin/main'], { cwd: author });
+    write(author, DAEMON, lines({ 2: 'prepare launches + main' }));
+    gitOk(author, ['add', '-A']);
+    gitOk(author, ['commit', '-q', '-m', 'merge main']);
+    gitOk(author, ['push', '-q', 'origin', 'HEAD:refs/heads/lane/prepare-launch-stall']);
+    const third = await rebuildClone({ root: f.clone, env: f.env, runSmoke: passSmoke(), prState: async () => 'OPEN' });
+    expect(third, JSON.stringify(third.alerts)).toMatchObject({ adopted: true });
+    expect(readRebuildState(f.clone, f.env).held ?? null).toBeNull();
+  });
+
+  // x9diisp — the attributed smoke fallback (set the culprit aside, keep the rest) replans without the culprit. Here the
+  // culprit's change is what let the LIVE overlay apply (main moved onto the overlay's block; the culprit carries the
+  // resolution), so replanning without it would drop that live overlay, smoke clean and adopt the tree without it.
+  it('attributed smoke fallback is refused when setting the culprit aside would lose an established overlay', async () => {
+    const f = fixture();
+    const BAD = 'scripts/conveyor/bad.mjs';
+    f.push('lane/live-y', f.init, { [DAEMON]: lines({ 2: 'Y2', 5: 'Y5' }) });
+    f.push('lane/good', f.init, { 'good.txt': 'good\n' });
+    for (const ref of ['lane/live-y', 'lane/good']) addOverlay(f.clone, { ref, pr: ref === 'lane/live-y' ? 5001 : 5002 }, { env: f.env });
+    const first = await rebuildClone({ root: f.clone, env: f.env, runSmoke: passSmoke(), prState: async () => 'OPEN' });
+    expect(first, JSON.stringify(first.alerts)).toMatchObject({ adopted: true });
+
+    // main moves onto the live overlay's block; the culprit (registered after) carries the resolution of line 2
+    const author = join(dirname(f.clone), 'author');
+    gitOk(author, ['fetch', '-q', 'origin']);
+    gitOk(author, ['checkout', '-q', '-B', 'main', 'origin/main']);
+    write(author, DAEMON, lines({ 2: 'M2' }));
+    gitOk(author, ['commit', '-q', '-am', 'main moved']);
+    gitOk(author, ['push', '-q', 'origin', 'HEAD:refs/heads/main']);
+    f.push('lane/culprit', 'origin/main', { [DAEMON]: lines({ 2: 'Y2' }), [BAD]: 'bad\n' });
+    addOverlay(f.clone, { ref: 'lane/culprit', pr: 5003 }, { env: f.env });
+
+    const runSmoke = vi.fn(async ({ root }) => (existsSync(join(root, BAD))
+      ? { verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'x', mayBeTransient: false, detail: `exited 1: file://${root}/${BAD}:20` }] } }
+      : { verdict: 'pass', attempts: 1, smoke: { results: [] } }));
+    const second = await rebuildClone({ root: f.clone, env: f.env, runSmoke, prState: async () => 'OPEN' });
+
+    expect(second.reason).not.toBe('overlay-set-aside');
+    const kinds = second.alerts.map((a) => a.kind);
+    expect(kinds).not.toContain('overlay-set-aside-attributed');
+    const refused = second.alerts.find((a) => a.kind === 'overlay-set-aside-failed');
+    expect(refused?.detail.failed).toBe('established-overlay-conflict: lane/live-y');
+    expect(refused.detail.culprits.map((c) => c.ref)).toEqual(['lane/culprit']);
+    // only the failed candidate (A) and the later plain-main comparison were smoked — never the culprit-less tree
+    expect(runSmoke).toHaveBeenCalledTimes(2);
   });
 });
