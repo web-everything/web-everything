@@ -4,7 +4,7 @@ size: 5
 status: open
 scaffoldedBy: "fix-5762"
 dateScaffolded: "2026-10-20"
-scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/card-group.mjs", "we:scripts/lib/drain-merge-strategy.mjs"]
+scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/card-group.mjs", "we:scripts/lib/drain-merge-strategy.mjs", "we:scripts/lib/__tests__/card-group-drain-wiring.test.mjs", "we:scripts/lib/__tests__/card-group.test.mjs"]
 dateOpened: "2026-10-20"
 tags: []
 ---

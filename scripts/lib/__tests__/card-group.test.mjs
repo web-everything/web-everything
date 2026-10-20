@@ -416,7 +416,8 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       const octx = new Map([1, 2].map(n => [overlapRowKey({ repo: null, number: n }), { yieldTo: 40, repo: null, files: [CARD], untilMs: 1_000, windowMinutes: 45 }]));
       const { ready, deferred } = planLabelDrain([1, 2].map(n => ({ num: n, item: null, blockedBy: [], decision: 'merge', repo: null })), { overlapContext: octx });
       expect(ready).toEqual([]);
-      expect(cardGroupCandidates({ enqueueOutcomes: [], deferred }).map(o => [o.num, o.kind])).toEqual([[1, 'overlap-yield'], [2, 'overlap-yield']]);
+      // #40 (the PR both yield to) is listed too; it has no verdict here, so form() leaves it out.
+      expect(cardGroupCandidates({ enqueueOutcomes: [], deferred }).map(o => [o.num, o.outcome])).toEqual([[1, 'deferred'], [2, 'deferred'], [40, 'yield-target']]);
       const g = createCardGrouping({ localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, () => t.base), exec: t.exec, statePath: join(tmp(), 's.json'),
         settings, log: { write() {} }, prestage: () => ({ allowed: true }), cardConflictSettings: cc, ...lockOpts });
       const verdicts = t.verdicts.map(v => ({ ...v, decision: 'merge' }));
