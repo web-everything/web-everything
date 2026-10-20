@@ -4628,10 +4628,15 @@ export function findUnjournaledLaneMutations(files) {
 export const KEEPALIVE_HELPER_PATH = 'scripts/lib/test-keepalive.mjs';
 export const KEEPALIVE_SCAN_DIRS = ['scripts', 'skills-src', 'tools'];
 export const KEEPALIVE_NOT_A_SPAWN_MARKER = 'keepalive-guard: not-a-spawn';
-/** An idle timer: `setInterval` or `setTimeout` (optional space) whose callback is an empty arrow (sync or
- *  async) or an empty function, across line breaks too. Matched on whole file contents, never line by line.
- *  Not global: callers that iterate build their own `g` copy, so `.test()` here is stateless. */
-export const EMPTY_TIMER_RE = /set(?:Interval|Timeout)\s*\(\s*(?:(?:async\s*)?\(\s*\)\s*=>\s*\{\s*\}|(?:async\s+)?function\s*\w*\s*\(\s*\)\s*\{\s*\})\s*,/;
+/** An idle timer: `setInterval` or `setTimeout` (optional space) whose callback does nothing — an arrow (sync or
+ *  async, any parameters) or a function (any name/parameters) whose body holds only whitespace and/or comments.
+ *  "Whitespace" includes the escaped `\n`/`\t`/`\r` of generated source inside a string literal. Matched on whole
+ *  file contents (so multi-line too), never line by line. Not global: callers that iterate build their own `g`
+ *  copy, so `.test()` here is stateless. */
+const WS = String.raw`(?:\s|\\[nrt])*`;
+const EMPTY_BODY = String.raw`\{(?:\s|\\[nrt]|\/\*[\s\S]*?\*\/|\/\/[^\n]*\n)*\}`;
+const PARAMS = String.raw`(?:\([^()]*\)|[A-Za-z_$][\w$]*)`;
+export const EMPTY_TIMER_RE = new RegExp(String.raw`set(?:Interval|Timeout)${WS}\(${WS}(?:(?:async${WS})?${PARAMS}${WS}=>${WS}${EMPTY_BODY}|(?:async${WS})?function${WS}[\w$]*${WS}\([^()]*\)${WS}${EMPTY_BODY})${WS},`);
 /** The exemption: a `//` line comment ENDING the line the match starts on (not text anywhere in the line). */
 const NOT_A_SPAWN_COMMENT = /\/\/\s*keepalive-guard: not-a-spawn\b[^'"`]*$/;
 

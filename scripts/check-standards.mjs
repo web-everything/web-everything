@@ -3144,17 +3144,21 @@ mark("19. Unfenced mandate params (#2967b)");
 // ── 19b. Unmanaged keep-alive children (keep-alive leak fix, 2026-10-20) ─────────────────────────────────────
 // A do-nothing empty-callback timer child outlives any test that fails to kill it (154 orphans, up to 19 days
 // old, live-caught). Keep-alives come from scripts/lib/test-keepalive.mjs only — anchored + bounded.
-// The git invocation lives here; the pure filter is `findUnmanagedKeepAlives`. Only a non-git environment
-// skips the scan; a failed grep or an unreadable listed file is itself a finding (fail closed).
+// The git invocation lives here; the pure filter is `findUnmanagedKeepAlives`. Only a checkout that git itself
+// says is not a work tree skips the scan; inside one, a failed grep or an unreadable listed file is itself a
+// finding (fail closed).
 {
   let listed = null;
-  try {
-    // --untracked: a brand-new file must be caught before it is ever committed.
-    listed = execFileSync('git', ['grep', '-l', '--untracked', '-E', 'set(Interval|Timeout)', '--', ...KEEPALIVE_SCAN_DIRS], { cwd: ROOT, encoding: 'utf8' });
-  } catch (e) {
-    if (e.status === 1) listed = ''; // exit 1 = no match
-    else if (e.code === 'ENOENT' || e.status === 128) listed = null; // no git / not a repo: skip like the other git-backed sections
-    else err(`keep-alive scan could not list files (${String(e.message).split('\n')[0]}) — the scan did not run`, { kind: 'unmanaged-keepalive' });
+  let inRepo = false;
+  try { inRepo = execFileSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: ROOT, encoding: 'utf8' }).trim() === 'true'; } catch { /* no git / not a repo */ }
+  if (inRepo) {
+    try {
+      // --untracked: a brand-new file must be caught before it is ever committed.
+      listed = execFileSync('git', ['grep', '-l', '--untracked', '-E', 'set(Interval|Timeout)', '--', ...KEEPALIVE_SCAN_DIRS], { cwd: ROOT, encoding: 'utf8' });
+    } catch (e) {
+      if (e.status === 1) listed = ''; // exit 1 = no match
+      else err(`keep-alive scan could not list files (${String(e.message).split('\n')[0]}) — the scan did not run`, { kind: 'unmanaged-keepalive' });
+    }
   }
   const files = [];
   for (const file of (listed ?? '').split('\n').filter(Boolean)) {

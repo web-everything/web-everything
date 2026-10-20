@@ -102,8 +102,13 @@ describe('check:standards — findUnmanagedKeepAlives', () => {
       'setTimeout(()=>{},30000)', // keepalive-guard: not-a-spawn (scan fixture)
       'setTimeout(() => process.exit(0), 30000);',
       'await new Promise((r) => setTimeout(r, 50));',
+      'setInterval(_ => {}, 1000);', // keepalive-guard: not-a-spawn (scan fixture)
+      'setInterval(function (unused) {}, 1000);', // keepalive-guard: not-a-spawn (scan fixture)
+      'setInterval(() => {/* idle */}, 1000);', // keepalive-guard: not-a-spawn (scan fixture)
+      String.raw`x("setInterval(() => {\n}, 1000)");`, // keepalive-guard: not-a-spawn (scan fixture)
+      'setInterval((a, b) => { tick(a, b); }, 1000);',
     ].join('\n');
-    expect(at([{ file: 'scripts/a.mjs', content }])).toEqual(['scripts/a.mjs:1', 'scripts/a.mjs:2', 'scripts/a.mjs:3', 'scripts/a.mjs:4', 'scripts/a.mjs:7', 'scripts/a.mjs:8', 'scripts/a.mjs:9']);
+    expect(at([{ file: 'scripts/a.mjs', content }])).toEqual(['scripts/a.mjs:1', 'scripts/a.mjs:2', 'scripts/a.mjs:3', 'scripts/a.mjs:4', 'scripts/a.mjs:7', 'scripts/a.mjs:8', 'scripts/a.mjs:9', 'scripts/a.mjs:12', 'scripts/a.mjs:13', 'scripts/a.mjs:14', 'scripts/a.mjs:15']);
   });
   it('exempts only the helper and a line ENDING in the not-a-spawn comment — not the marker text inside a string', () => {
     const idle = 'setInterval(()=>{},1000)'; // keepalive-guard: not-a-spawn (scan fixture)
