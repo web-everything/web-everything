@@ -235,7 +235,9 @@ const ALWAYS_EXPLAINED_LABEL = 'review:human';
 /**
  * The dispatch order for this tick's owed reviews. Pure, stable. Rank 0: a main-fix PR (the plan marks it
  * `mainFix`); rank 1: a PR someone is blocked on (`review:human` or `ready-to-merge`); rank 2: the rest.
- * Within a rank the oldest PR (lowest number) goes first.
+ * Within a rank the oldest PR (lowest number) goes first. Only the plan's own review rows move: a red-team
+ * request row (`redTeamRequest` / `carriedAcceptHead`) keeps its slot, since the code that adds those rows already
+ * places them deliberately (the main-fix PR's red-team first).
  * @param {Array<object>} reviews
  * @param {{labelsByPr?:Map<number, Array<string|{name:string}>>, plan?:{dispatch?:Array<object>}}} [o]
  */
@@ -247,9 +249,13 @@ export function orderReviewsForDispatch(reviews, { labelsByPr = new Map(), plan 
     const names = (labelsByPr.get(n) ?? []).map((l) => (typeof l === 'string' ? l : l?.name));
     return names.includes('review:human') || names.includes('ready-to-merge') ? 1 : 2;
   };
-  return reviews.map((d, i) => ({ d, i, r: rank(d), n: Number(d?.prNumber) }))
-    .sort((a, b) => a.r - b.r || (Number.isFinite(a.n) && Number.isFinite(b.n) ? a.n - b.n : 0) || a.i - b.i)
-    .map((x) => x.d);
+  const movable = (d) => !d?.redTeamRequest && !d?.carriedAcceptHead;
+  const slots = reviews.map((d, i) => (movable(d) ? i : -1)).filter((i) => i >= 0);
+  const sorted = slots.map((i) => ({ d: reviews[i], i, r: rank(reviews[i]), n: Number(reviews[i]?.prNumber) }))
+    .sort((a, b) => a.r - b.r || (Number.isFinite(a.n) && Number.isFinite(b.n) ? a.n - b.n : 0) || a.i - b.i);
+  const out = [...reviews];
+  slots.forEach((slot, k) => { out[slot] = sorted[k].d; });
+  return out;
 }
 
 export function explainPendingNotDispatched({ prs, plan, dispatchable = [], deferredForLanes = [], paused = false, deferReason = null }) {
@@ -538,8 +544,7 @@ export function runReviewTick({
   // generic `fixing` — no second `gh` read.
   const mergeConflictedByPr = new Map((Array.isArray(rawPrs) ? rawPrs : [])
     .map((p) => [Number(p?.number), String(p?.mergeStateStatus ?? '').toUpperCase() === 'DIRTY']));
-  // Seat order when fewer reviews can go than are owed: see orderReviewsForDispatch (main-fix, then blocked PRs).
-  const reviews = orderReviewsForDispatch((plan.dispatch ?? []).filter((d) => d && d.kind === 'review'), { labelsByPr, plan });
+  const reviews = (plan.dispatch ?? []).filter((d) => d && d.kind === 'review');
   // Live-caught 2026-09-22, #xli631k: a PR that moved to being owed a FIX (not a review) used to never
   // reach `statusCandidates` at all, so its `review-status:reviewing` label sat stale once its review
   // session finished (PR #2472, ~2 hours stale). `selectStatusCandidates` now takes fix-owed entries as a
@@ -562,6 +567,9 @@ export function runReviewTick({
   // whole block): every review stays owed exactly like a lane-starved tick already does (`reviewsOwed` and
   // `statusCandidates` below are unaffected), so nothing here re-derives a second "was anything dispatched"
   // path — it is the SAME deferred-not-lost shape `deferredForLanes` already models, just for a different cause.
+  // 2026-10-20 — when this tick can dispatch fewer reviews than are owed, the scarce seats go in priority
+  // order (see orderReviewsForDispatch): main-fix first, then PRs a human or the merge queue waits on, oldest first.
+  reviews.splice(0, reviews.length, ...orderReviewsForDispatch(reviews, { labelsByPr, plan }));
   const lanes = paused ? 0 : acquirableLanes({ repo });
   const acquirable = Math.max(0, (Array.isArray(lanes) ? lanes.length : Number(lanes)) || 0);
   const liveCap = liveReviewBudget && Number.isFinite(liveReviewBudget.left) ? Math.max(0, liveReviewBudget.left) : Infinity;

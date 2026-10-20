@@ -646,6 +646,9 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     const reviews = [{ prNumber: 9 }, { prNumber: 8 }, { prNumber: 7 }, { prNumber: 6, mainFix: true }, { prNumber: 5 }];
     const labelsByPr = new Map([[8, [{ name: 'review:human' }]], [9, ['ready-to-merge']]]);
     expect(orderReviewsForDispatch(reviews, { labelsByPr }).map((r) => r.prNumber)).toEqual([6, 8, 9, 5, 7]);
+    // red-team request rows keep their slots (the main-fix red-team is placed first on purpose)
+    const withRedTeam = [{ prNumber: 20, redTeamRequest: {} }, { prNumber: 9 }, { prNumber: 8 }, { prNumber: 3, carriedAcceptHead: 'a' }];
+    expect(orderReviewsForDispatch(withRedTeam, { labelsByPr }).map((r) => r.prNumber)).toEqual([20, 8, 9, 3]);
     const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
     runReviewTick({ reconcile: () => ({ dispatch: reviews.map((r) => ({ kind: 'review', ...r })), refusals: [] }),
       readPrs: () => [5, 6, 7, 8, 9].map((number) => ({ number, labels: labelsByPr.get(number) ?? [] })), readAgents: () => [],
