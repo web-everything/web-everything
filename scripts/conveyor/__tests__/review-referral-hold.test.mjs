@@ -126,7 +126,12 @@ describe('attempted mandatory referrals', () => {
     expect(hold(pr({ number: 3507 }))).toBeNull();
     expect(hold(pr(), [{ ...evidence(), repo: 'frontier-ui/frontierui' }])).toBeNull();
     const unfinished = run(); unfinished.stepTimings.pop();
-    expect(reviewRunEvidence(unfinished)).toBeNull();
+    const partial = reviewRunEvidence(unfinished);
+    expect(partial).toMatchObject({ incomplete: true, completedAt: null, parked: false, attempted: false });
+    expect(partial.pending.length).toBeGreaterThan(0); // never evidence of a clean, completed review
+    expect(hold(pr(), [partial])).toBeNull();
+    expect(findResumableParkedRun(pr(), [partial], { repo })).toBeNull();
+    expect(decideSameHeadHold(pr(), [partial], { repo })).toBeNull();
   });
   // Live 2026-10-10: 3,303 review-pr records (0.8 GB) were re-read and JSON-parsed by EVERY reconcile-pass process —
   // minutes under host load, which timed out the drain rebuild's reconcile/dispatch smoke checks. The projection
@@ -525,6 +530,73 @@ describe('same-head hold never silences a review whose verdict never landed (liv
     expect(decideSameHeadHold(p, runs, { repo, env: {}, now: at + 7200_000 - 1 }))
       .toMatchObject({ retryAt: at + 7200_000 });
     expect(decideSameHeadHold(p, runs, { repo, env: {}, now: at + 7200_000 })).toBeNull();
+  });
+  it('charges pre-advise crashes to growing cooldowns and refuses a seventh release through reconciliation', () => {
+    const dir = temp(); vi.stubEnv('OPERATION_RUNS_DIR', dir);
+    vi.stubEnv('WE_REVIEW_NO_VERDICT_COOLDOWN_RELEASES', '6');
+    for (let i = 0; i < 3; i++) {
+      const r = run({ id: `review-pr-complete-${i}`, time: at - i * 120_000 });
+      r.findings.referralVerdict = r.verdict = { verdict: 'accept', pendingReferrals: [] };
+      writeRun(r, dir);
+    }
+    const p = labelled(['review:pending']);
+    const decide = now => enrichPrsWithReferralHolds([p], { repo, now,
+      readRuns: () => readReviewRunEvidence({ dir, memo: new Map() }) })[0];
+    const planned = now => runReconcilePass({ repo, now, readPrs: () => [p], readAgents: () => [],
+      enrich: x => x, enrichMainRed: prs => ({ prs }), enrichAlreadyLanded: x => x, enrichBaseRef: x => x,
+      enrichSystemFix: x => x, enrichFixClaims: x => x, enrichTimeouts: x => x,
+      resolveMainSha: () => null, readRequiredChecks: () => ({ checks: ['test'] }),
+      enrichReferralHolds: () => [decide(now)],
+    }).dispatch.filter(d => d.kind === 'review');
+    let due = at + VERDICT_COOLDOWN_BASE_MS;
+    for (let release = 1; release <= 6; release++) {
+      expect(planned(due)).toHaveLength(1);
+      const crashed = newRunRecord({ id: `review-pr-crash-${release}`, op: 'review-pr', input: { repo, pr: p.number } });
+      crashed.findings.read = { repo, pr: p.number, netBasis: { rev: head } };
+      crashed.stepTimings = [{ step: 'read', stepIndex: 0, startedAt: iso(due), finishedAt: iso(due + 1), durationMs: 1 }];
+      writeRun(crashed, dir);
+      const held = decide(due + 1).referralHold;
+      expect(held).toMatchObject({ count: 3 + release,
+        noVerdict: { releasesSpent: release, exhausted: release === 6 } });
+      expect(planned(due + 1)).toEqual([]);
+      if (release < 6) {
+        due += Math.min(VERDICT_COOLDOWN_BASE_MS * 2 ** release, VERDICT_COOLDOWN_CAP_MS);
+        expect(held.retryAt).toBe(due);
+        expect(planned(due - 1)).toEqual([]);
+      } else {
+        expect(held.retryAt).toBeNull();
+        expect(planned(due + 365 * 86400_000)).toEqual([]);
+      }
+    }
+  });
+  it('counts incomplete immediate retries once, replaces them on completion, and scopes them to the head and wake', () => {
+    const dir = temp(), p = labelled(['review:pending']);
+    const retry = { cooldownReleases: 6, source: 'tool' }, opts = { repo, env: {}, now: at + 20 * 60_000, retry };
+    const crashed = run({ id: 'review-pr-incomplete', time: at + 120_000 });
+    crashed.stepTimings.pop();
+    writeRun(crashed, dir);
+    const partial = readReviewRunEvidence({ dir, memo: new Map() })[0];
+    expect(partial).toMatchObject({ incomplete: true, completedAt: null });
+    const rows = [lostRuns(1)[0], partial];
+    expect(decideSameHeadHold(p, rows, opts)).toBeNull(); // one immediate retry remains
+    const another = { ...partial, id: 'review-pr-another', startedAt: at + 180_000 };
+    expect(decideSameHeadHold(p, [...rows, another], opts)).toMatchObject({ count: 3, retryAt: at + 180_000 + 3600_000 });
+    for (const foreign of [{ ...another, repo: 'other/repo' }, { ...another, pr: 99 }, { ...another, head: 'b'.repeat(40) }]) {
+      expect(decideSameHeadHold(p, [...rows, foreign], opts)).toBeNull();
+    }
+    expect(decideSameHeadHold({ ...p, comments: [comment(REARM_COMMENT_MARKER, at + 240_000)] }, [...rows, another], opts)).toBeNull();
+    expect(decideSameHeadHold(labelled(['review:accepted']), [lostRuns(1)[0], partial, another], opts))
+      .toMatchObject({ count: 1, retryAt: null }); // completed-review semantics remain unchanged
+    const done = run({ id: crashed.id, time: at + 120_000 });
+    writeRun(done, dir);
+    const completed = readReviewRunEvidence({ dir, memo: new Map() });
+    expect(completed).toHaveLength(1);
+    expect(completed[0].incomplete).toBeUndefined();
+    expect(completed[0].completedAt).toBe(at + 120_000);
+    const invalid = run(); invalid.stepTimings = [];
+    expect(reviewRunEvidence(invalid)).toBeNull();
+    const noHead = run(); delete noHead.findings.read;
+    expect(reviewRunEvidence(noHead)).toBeNull();
   });
   it('caps cool-down backoff at eight hours while releases remain', () => {
     expect(VERDICT_COOLDOWN_CAP_MS).toBe(8 * 3600_000);

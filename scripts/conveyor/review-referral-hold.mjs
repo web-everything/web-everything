@@ -28,7 +28,8 @@ export const REFERRAL_RETRY_MS = [15, 30, 60].map(n => n * 60_000);
 const sha = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
-/** A run suspended at human confirmation has completed its panel, although the operation is pending. */
+/** Completed-panel evidence, or an incomplete attempt that can spend a no-verdict retry but prove no verdict.
+ * A run suspended at human confirmation has completed its panel, although the operation is pending. */
 export function reviewRunEvidence(run) {
   if (run?.op !== 'review-pr') return null;
   const read = run.findings?.read;
@@ -48,7 +49,14 @@ export function reviewRunEvidence(run) {
   const startedAt = Math.max(Date.parse(run.stepTimings?.find(t => t.step === 'read')?.startedAt),
     resuming ? 0 : Date.parse(run.resumedAt ?? '') || 0);
   const completedAt = Date.parse(finish);
-  if (!sha(head) || !Number.isFinite(completedAt) || !Number.isFinite(startedAt)) return null;
+  if (!sha(head) || !Number.isFinite(startedAt)) return null;
+  if (!Number.isFinite(completedAt)) {
+    // Crashes before/during advise still consumed a retry. Keep them in the cached projection, without
+    // inventing a completed panel or clean referral evidence for acceptance/carry readers.
+    return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt: null,
+      incomplete: true, parked: false, attempted: false, persistenceFailed: false, count: 0,
+      pending: ['review-incomplete'], rulings: [] };
+  }
   const state = (resuming ? run.resumeOf.mandatoryReferrals : run.findings?.mandatoryReferrals)?.effects?.find(e => e.type === 'review.mandatory-referrals')?.result;
   const pending = verdict?.pendingReferrals ?? [];
   const findingKeys = pending.filter(key => !PENDING_REASON_TOKENS.has(key));
@@ -162,7 +170,8 @@ function wakeTime(pr, run) {
  * @returns {{id: string, head: string}|null}
  */
 export function findResumableParkedRun(pr, runs, { repo } = {}) {
-  const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number)).sort((a, b) => b.completedAt - a.completedAt);
+  const history = runs.filter(r => Number.isFinite(r.completedAt) && r.repo === repo && r.pr === Number(pr.number))
+    .sort((a, b) => b.completedAt - a.completedAt);
   const last = history[0];
   if (!last?.parked || last.head !== pr.headRefOid || !last.attempted || last.persistenceFailed) return null;
   const events = wakeEvents(pr, last).filter(e => e.at > last.startedAt);
@@ -178,7 +187,7 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 function evaluateReferralHold(pr, runs, { repo, now = Date.now(), env = process.env,
   // The SAME reader the review gate uses, so a `card` ruling naming a card that does not exist yet keeps the hold.
   cardReadable = ref => referralCardReadable(ref, REPO_ROOT) } = {}) {
-  const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number))
+  const history = runs.filter(r => Number.isFinite(r.completedAt) && r.repo === repo && r.pr === Number(pr.number))
     .sort((a, b) => b.completedAt - a.completedAt);
   const last = history[0];
   if (!last?.parked || last.head !== pr.headRefOid || (!last.attempted && !last.persistenceFailed)) return { hold: null, released: null };
@@ -275,24 +284,29 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   if (max === 0) return null;
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid)
     .sort((a, b) => b.completedAt - a.completedAt);
-  const last = history[0];
+  const last = history.find(r => Number.isFinite(r.completedAt));
   if (!last || last.persistenceFailed) return null;
   const wake = wakeTime(pr, last);
-  const count = history.filter(r => r.startedAt >= wake).length;
-  if (count < max) return null;
   // A completed run whose verdict NEVER LANDED on the PR (GitHub refused the comment/label write; live 2026-10-07,
   // #4288: GraphQL error as the review finished, so the PR stayed `review:pending` with no verdict and this hold
   // then silenced it forever, unlogged) did not review the head in any way the PR can see. Re-arm it ourselves,
   // bounded to VERDICT_RETRY_EXTRA extra runs, then bounded cool-down releases with exponential backoff.
   const noVerdict = verdictNeverLanded(pr, last, now);
+  // Normal same-head and referral holds still require completed panels. A no-verdict retry spends its
+  // budget as soon as read identifies the head, even if the process dies before advise can finish.
+  const attempts = history.filter(r => r.startedAt >= wake && (noVerdict || Number.isFinite(r.completedAt)));
+  const count = attempts.length;
+  if (count < max) return null;
   if (noVerdict && count < max + VERDICT_RETRY_EXTRA) return null;
   let retryAt = null;
-  // Cool-down releases already spent on this head/wake (each release produced one more completed run).
+  // Cool-down releases already spent on this head/wake, including unfinished retries.
   const spent = count - (max + VERDICT_RETRY_EXTRA);
   const releases = validCooldownReleases(retry?.cooldownReleases) ? Math.min(retry.cooldownReleases, VERDICT_COOLDOWN_MAX_RELEASES) : 0;
   if (noVerdict && spent < releases) {
     const cooldown = Math.min(VERDICT_COOLDOWN_BASE_MS * 2 ** spent, VERDICT_COOLDOWN_CAP_MS);
-    retryAt = last.completedAt + cooldown;
+    const latestAttemptAt = attempts.reduce((latest, r) => Math.max(latest,
+      Number.isFinite(r.completedAt) ? r.completedAt : r.startedAt), last.completedAt);
+    retryAt = latestAttemptAt + cooldown;
     if (now >= retryAt) return null;
   }
   const head = pr.headRefOid;
@@ -326,7 +340,7 @@ function defaultReadComments({ repo, number }) {
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 32 * 1024 * 1024 })).comments;
 }
 
-export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), readRuns = readReviewRunEvidence,
+export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), env = process.env, readRuns = readReviewRunEvidence,
   readComments = defaultReadComments } = {}) {
   const runs = readRuns();
   return prs.map(pr => {
@@ -340,10 +354,10 @@ export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), readRu
       catch { /* Keep the list snapshot when the full thread is unavailable. */ }
     }
     // A deliberate release (ruling cleared, new event, retry due) owes a fresh review: the same-head guard stays out.
-    const { hold, released } = evaluateReferralHold(pr, runs, { repo, now });
+    const { hold, released } = evaluateReferralHold(pr, runs, { repo, now, env });
     const blockRuledReferrals = blockRuledReferralsFor(pr, { repo });
     return { ...pr, blockRuledReferrals,
-      referralHold: hold ?? (released ? null : decideSameHeadHold(pr, runs, { repo })) };
+      referralHold: hold ?? (released ? null : decideSameHeadHold(pr, runs, { repo, now, env })) };
   });
 }
 
