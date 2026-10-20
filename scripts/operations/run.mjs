@@ -159,6 +159,9 @@ import { itemActivityOperation, ITEM_ACTIVITY_OP } from './item-activity.mjs';
 import { createItemActivityReader } from './item-activity-io.mjs';
 import { assertRunnerFreshness } from './runner-freshness.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
+// Hot-swap operational knobs (operator 2026-10-20): the runtime-operator settings layer's audited writer.
+import { runtimeSettingOperation, RUNTIME_SETTING_OP, RUNTIME_SETTING_WRITE_EFFECT, runtimeSettingArgv, finishRuntimeSetting } from './runtime-setting.mjs';
+import { readRuntimeFile, readRuntimeAuditTail, writeRuntimeSettings } from '../lib/runtime-settings.mjs';
 
 /**
  * THE OPERATION TABLE — the only per-operation code in the command line. Each entry builds its declaration and
@@ -378,6 +381,11 @@ export const OPERATIONS = Object.freeze({
   // report (the operator's own hand-built report, made mechanical). Read-only, same no-sinks reasoning as
   // `daemon-status`/`runner-activity`: every step is `compute`. `collectHeavyQueue`'s real `admissionStatus`/
   // `ps`/`git` reads are bound here, and ONLY here.
+  [RUNTIME_SETTING_OP]: () => ({
+    declaration: runtimeSettingOperation({ readRuntime: () => { const r = readRuntimeFile(); return { ...r, auditTail: readRuntimeAuditTail(r.path) }; } }),
+    sinks: { [RUNTIME_SETTING_WRITE_EFFECT]: async (payload) => ({ written: payload.path, ...writeRuntimeSettings(payload) }) },
+    finish: finishRuntimeSetting,
+  }),
   [HEAVY_QUEUE_OP]: () => ({
     declaration: heavyQueueOperation({ collect: collectHeavyQueue }),
     sinks: {},
@@ -684,7 +692,8 @@ export function operatorControlCliPolicy(name, argv) {
 // The standard main check used across `we:scripts` — importing this module (tests do) must not run the CLI.
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 if (IS_CLI) {
-  const [name, ...rest] = process.argv.slice(2);
+  const [name, ...rawRest] = process.argv.slice(2);
+  const rest = name === RUNTIME_SETTING_OP ? runtimeSettingArgv(rawRest) : rawRest;
   if (!name || name === '--help' || name === '-h') {
     writeAllSync(1, `${rootUsage()}\n`);
     process.exit(name ? 0 : 2);
