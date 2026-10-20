@@ -850,6 +850,19 @@ describe('provenMergedLanding reads blobs through one cat-file process', () => {
     const raw = Buffer.concat([Buffer.from(`${'c'.repeat(40)} blob ${big.length}\n`), big, Buffer.from('\n')]);
     expect(batchIO.parseCatFileBatch(raw, ['x']).get('x')).toBeNull();
   });
+  it('gives cat-file a 30 s deadline, and keeps control-character specs off the batch protocol', async () => {
+    let options;
+    batchIO.catFileBatch('/nope', ['a:b'], (cmd, args, opts) => { options = opts; return { status: 0, stdout: Buffer.alloc(0) }; });
+    expect(options.timeout).toBe(30_000);
+    const f = landing();
+    const seen = [];
+    const run = (members, catFile) => batchIO.provenMergedLanding({ ...f.recorded, members }, { repo: 'o/r', gh: f.gh,
+      git: async args => execFileSync('git', args, { cwd: f.repo, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }),
+      catFile: (dir, specs) => { seen.push(...specs); return catFile(dir, specs); } });
+    await run(f.recorded.members, batchIO.catFileBatch);
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.some(spec => /[\x00-\x1f\x7f]/.test(spec))).toBe(false);
+  });
   it('fails closed when cat-file fails or its output is malformed', async () => {
     const f = landing();
     await expect(harness(f, () => { throw new Error('boom'); }).run()).rejects.toThrow('boom');

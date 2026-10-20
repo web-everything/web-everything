@@ -200,7 +200,7 @@ const removeBornAsLine = (text, id) => {
  */
 export const catFileBatch = (gitDir, specs, spawn = spawnSync) => {
   const result = spawn('git', ['--git-dir', gitDir, 'cat-file', '--batch'], {
-    input: `${specs.join('\n')}\n`, maxBuffer: 1024 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'],
+    input: `${specs.join('\n')}\n`, timeout: 30_000, maxBuffer: 1024 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
   });
   if (result.error) throw result.error;
@@ -278,7 +278,8 @@ export async function provenMergedLanding(recorded, { repo, gh, git, remote = 'o
     wanted.add(`${recorded.headSha}:${recordedPaths[0]}`);
     if (mergeTree.includes(recordedPaths[0])) wanted.add(`${merge}:${recordedPaths[0]}`);
   }
-  const specs = [...wanted].filter(spec => !spec.includes('\n'));
+  // A spec with any control character (CR, LF, ...) is not safe on the line protocol: it stays on `git show`.
+  const specs = [...wanted].filter(spec => !/[\x00-\x1f\x7f]/.test(spec));
   let blobs = new Map();
   if (specs.length) {
     const gitDir = (await text(['rev-parse', '--absolute-git-dir'])).trim();
