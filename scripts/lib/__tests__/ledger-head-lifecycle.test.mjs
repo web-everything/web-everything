@@ -420,6 +420,22 @@ describe('ledger head lifecycle red-team regressions', () => {
         const pushed = [...events, verdict('head-moved', third, { fromHead: next, source: 'head-observer' }), verdict('accepted', third)];
         expect(ledgerView(pushed, facts(third)).referrals.get(key).state).toBe('resolved-by-fix');
       });
+      it('every earlier referral still counts after a late re-referral of A: no carry of a reproduced head, no return to a head older than it', () => {
+        const atB = [event('referral', { headSha: next, findingKeys: [key] }), event('ruling', { findingKey: key, ruling: 'block' })];
+        const reLate = [verdict('accepted'), event('referral', { headSha: head, findingKeys: [key] })];
+        // C carries B's content, where the finding was reproduced.
+        const carried = [verdict('changes'), moved, verdict('accepted', next),
+          verdict('carried', third, { fromHead: next, carryRule: 'tree-identical', source: 'head-observer' }), ...atB, ...reLate, verdict('accepted', third)];
+        expect(ledgerView(carried, facts(third)).referrals.get(key).state).toBe('open');
+        expect(codes(carried, third)).toContain('referral-unruled');
+        // X was the head before B, where the finding was reproduced; a return to it is no fix.
+        const older = 'e'.repeat(40);
+        const rollback = [verdict('changes'), verdict('head-moved', older, { fromHead: head, source: 'head-observer' }),
+          verdict('head-moved', next, { fromHead: older, source: 'head-observer' }), verdict('accepted', next), ...atB,
+          event('referral', { headSha: head, findingKeys: [key] }), verdict('head-moved', older, { fromHead: next, source: 'head-observer' }), verdict('accepted', older)];
+        expect(ledgerView(rollback, facts(older)).referrals.get(key).state).toBe('open');
+        expect(codes(rollback, older)).toContain('referral-unruled');
+      });
       it('a head that was older than A stays no fix, even when a later move returns to it', () => {
         const events = [verdict('accepted', next), verdict('head-moved', head, { fromHead: next, source: 'head-observer' }), verdict('accepted'),
           verdict('head-moved', next, { fromHead: head, source: 'head-observer' }), ...late('block'), verdict('accepted', next)];

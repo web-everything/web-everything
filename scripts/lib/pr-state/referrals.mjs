@@ -57,8 +57,7 @@ const rowHeads = e => [verdictHead(e), e?.fromHead, e?.headSha].filter(isSha);
 export function deriveReferrals(events, { applied = appliedVerdictRows(events), history = events, liveHead = null } = {}) {
   const position = new Map((history ?? []).map((e, i) => [e, i]));
   const sightings = (history ?? []).flatMap((e, i) => rowHeads(e).map(h => [i, h, e]));
-  const referralRow = new Map(); // key → the referral row that last (re)opened it
-  const referredAt = new Map(); // key → every head a referral named it at: the finding was reproduced there, so none is its fix
+  const referredBy = new Map(); // key → every referral row that named it: the finding was reproduced at each one's head
   const resolvedFrom = new Map(); // key → { state before a fix resolved it, every head that qualified as the fix }
   // Heads the witness moved on to FROM the finding's head before its referral landed (review of A in flight, push B,
   // head-moved(A→B), then referral(A)): newer code, not an older head. A sighting at or after that move is no evidence
@@ -98,7 +97,9 @@ export function deriveReferrals(events, { applied = appliedVerdictRows(events), 
     const rootAt = moved ? (sightings.find(([, h]) => sameHead(h, findingHead))?.[0] ?? -1) : Infinity;
     return sightings.some(([i, h, e]) => i < at && sameHead(h, head) && (!moved || (i < moved[1] && (i < rootAt || ordersHeads(e)))));
   };
-  const reproducedAt = (key, head) => (referredAt.get(key) ?? []).some(h => sameHead(h, head));
+  // No fix for the key: its head is one a referral of the key named, or older than (or a carry of) one. Every referral
+  // counts, not only the latest: a late re-referral of A must not make a carry of, or a return behind, B a fix.
+  const noFix = (key, head) => (referredBy.get(key) ?? []).some(r => sameHead(head, r.headSha) || seenBefore(head, r, r.headSha));
   const keys = new Map();
   // A public referral can be ruled on while review-pr is parked before its final ledger step.
   // Retain the latest valid ruling until the FIRST referral supplies the finding's head. Do not
@@ -110,12 +111,11 @@ export function deriveReferrals(events, { applied = appliedVerdictRows(events), 
         // An overruled finding (not-real, card) coming back is not new news (live plateau-app #202); a `block` that
         // comes back, or a fix that did not hold, re-opens the key.
         if (keys.get(key)?.state === 'ruled') continue;
-        if (isSha(e.headSha)) referredAt.set(key, [...(referredAt.get(key) ?? []), e.headSha]);
+        referredBy.set(key, [...(referredBy.get(key) ?? []), e]);
         const early = earlyRulings.get(key);
         earlyRulings.delete(key);
         keys.set(key, { key, state: early?.state ?? 'open', head: e.headSha,
           ruling: early?.ruling ?? null, resolvedAtHead: null });
-        referralRow.set(key, e);
         resolvedFrom.delete(key);
       }
     } else if (e.type === EVENT_TYPES.RULING) {
@@ -135,7 +135,7 @@ export function deriveReferrals(events, { applied = appliedVerdictRows(events), 
     } else if ((e.type === EVENT_TYPES.VERDICT || e.type === undefined) && verdictClears(e.verdict) && applied.has(e)) {
       const head = verdictHead(e);
       for (const [key, k] of keys) {
-        if (!(isSha(head) && isSha(k.head) && !sameHead(head, k.head) && !reproducedAt(key, head) && !seenBefore(head, referralRow.get(key), k.head))) continue;
+        if (!(isSha(head) && isSha(k.head) && !noFix(key, head))) continue;
         if (k.state === 'open' || k.state === 'blocking') {
           resolvedFrom.set(key, { state: k.state, heads: [head] });
           keys.set(key, { ...k, state: 'resolved-by-fix', resolvedAtHead: head });
@@ -149,7 +149,7 @@ export function deriveReferrals(events, { applied = appliedVerdictRows(events), 
       if (k?.state !== 'resolved-by-fix') continue;
       // A path back through the finding's own head, or any head named before the referral, proves no fix: a carry
       // there is the same content the finding was raised on.
-      const stale = h => sameHead(h, k.head) || reproducedAt(key, h) || seenBefore(h, referralRow.get(key), k.head);
+      const stale = h => noFix(key, h);
       const fix = heads.find(h => leadsTo(history ?? [], h, liveHead, stale));
       keys.set(key, fix ? { ...k, resolvedAtHead: fix } : { ...k, state, resolvedAtHead: null });
     }
