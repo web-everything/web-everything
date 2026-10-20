@@ -17,10 +17,12 @@ describe('detectLatentRedMain (live 2026-10-20: every merge group failed on one 
   it('fires when the newest N completed runs fail on a shared test', () => {
     expect(detectLatentRedMain({ runs, threshold: 3, failuresOf })).toMatchObject({ fire: true, tests: [T], runIds: [3, 2, 1], prs: [3, 2, 1] });
   });
-  it('skips in-progress and cancelled runs; a success ends the streak', () => {
+  it('passes over only in-progress and cancelled runs; any other non-failure conclusion ends the streak', () => {
     const mixed = [run(9, null, { status: 'in_progress' }), run(8, 'cancelled'), ...runs];
     expect(detectLatentRedMain({ runs: mixed, threshold: 3, failuresOf }).fire).toBe(true);
-    expect(detectLatentRedMain({ runs: [run(3, 'failure'), run(2, 'success'), run(1, 'failure')], threshold: 2, failuresOf }).fire).toBe(false);
+    for (const c of ['success', 'skipped', 'neutral', 'stale', null, 'action_required', 'startup_failure']) {
+      expect(detectLatentRedMain({ runs: [run(4, c), ...runs], threshold: 3, failuresOf }).fire).toBe(false);
+    }
   });
   it('fails closed: no shared test, an unreadable run, too short a streak, or off', () => {
     expect(detectLatentRedMain({ runs, threshold: 3, failuresOf: (r) => [`t${r.databaseId}`] }).fire).toBe(false);
@@ -119,14 +121,21 @@ describe('runLatentRedMainCheck', () => {
     expect(found.mock.calls).toHaveLength(2);
   });
   it('fails closed on a structurally malformed ledger (Codex round 3)', () => withDir((ledgerPath) => {
-    for (const bad of [{ acted: { [TIP]: false } }, { acted: { [TIP]: { status: 'failed', attempts: -5 } } }, { acted: [] }, { lastNoFire: 'x' }]) {
+    const good = { at: 1, published: false, mainRun: 7, runIds: [3, 2, 1], tests: [T] };
+    for (const bad of [{ acted: { [TIP]: false } }, { acted: { [TIP]: { status: 'failed', attempts: -5 } } }, { acted: [] }, { lastNoFire: 'x' },
+      { acted: { [TIP]: { status: 'failed', published: 'invalid', mainRun: null } } },
+      { acted: { [TIP]: { ...good, status: 'failed', attempts: 1, rerun: 'failed: deferred before sending (x)' } } },
+      { acted: { [TIP]: { ...good, status: 'failed', attempts: 1, unsent: true, rerun: 'outcome unknown: timeout' } } },
+      { acted: { [TIP]: { ...good, status: 'requested', attempts: 1 } } },
+      { acted: { notasha: { ...good, status: 'main-already-red' } } }]) {
       writeFileSync(ledgerPath, JSON.stringify(bad));
       const exec = host();
       expect(runLatentRedMainCheck({ repo: 'o/r', exec, threshold: 3, ledgerPath, publish: () => {}, log: () => {} }).action).toBe('ledger-unreadable');
       expect(exec.mock.calls.some(([, a]) => a[1] === 'rerun')).toBe(false);
     }
     expect(validLedger({})).toBe(true);
-    expect(validLedger({ acted: { [TIP]: { status: 'requested', attempts: 1 } } })).toBe(true);
+    expect(validLedger({ acted: { [TIP]: { ...good, status: 'requested', attempts: 1, rerun: 'requested' } } })).toBe(true);
+    expect(validLedger({ acted: { [TIP]: { ...good, status: 'failed', attempts: 2, unsent: true, rerun: 'failed: deferred before sending (low gh budget)' } } })).toBe(true);
   }));
   it('a threshold change never reuses a cached no-signal', () => withDir((ledgerPath) => {
     const base = host();

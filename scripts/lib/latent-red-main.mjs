@@ -99,18 +99,19 @@ export function readRunFailingTests({ repo, exec, runId }) {
 const prOf = (headBranch) => { const m = /\/pr-(\d+)-/.exec(String(headBranch ?? '')); return m ? Number(m[1]) : null; };
 
 /**
- * PURE. Fire when the newest `threshold` completed, non-cancelled merge-group runs all failed and every one of them
- * has a readable failing-test list sharing at least one test. In-progress, cancelled and skipped runs are not
- * evidence either way; a success ends the streak. Any unreadable list → no fire.
+ * PURE. Fire when the newest `threshold` completed, non-cancelled merge-group runs all have a known failing conclusion
+ * (failure / timed_out) and every one has a readable failing-test list sharing at least one test. In-progress and
+ * cancelled runs are passed over; any other conclusion ends the streak. Any unreadable list → no fire.
  * @returns {{fire:boolean, reason:string, tests?:string[], runIds?:number[], prs?:number[]}}
  */
 export function detectLatentRedMain({ runs, failuresOf, threshold }) {
   if (!(threshold > 0)) return { fire: false, reason: 'off' };
   const streak = [];
   for (const r of runs || []) {
-    if (r.status !== 'completed') continue;
-    if (['cancelled', 'skipped', 'neutral', 'stale', null].includes(r.conclusion)) continue;
-    if (!['failure', 'timed_out'].includes(r.conclusion)) break;
+    // Only an incomplete or cancelled run is passed over; every other conclusion that is not a known failure
+    // (success, skipped, neutral, stale, null, anything new) ends the streak — fail closed.
+    if (r.status !== 'completed' || r.conclusion === 'cancelled') continue;
+    if (r.conclusion !== 'failure' && r.conclusion !== 'timed_out') break;
     streak.push(r);
     if (streak.length >= threshold) break;
   }
@@ -128,15 +129,30 @@ export function detectLatentRedMain({ runs, failuresOf, threshold }) {
 
 export function latentRedMainPath(env = process.env) { return join(resolveCoordinationRoot({ env }), 'latent-red-main.json'); }
 const plain = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
-const RECORD_STATUSES = new Set(['reserved', 'requested', 'failed', 'unknown', 'main-already-red']);
-/** PURE: every field the dedup / retry decisions read has its expected shape. */
+const SHA40 = /^[0-9a-f]{40}$/;
+const posInt = (v) => Number.isInteger(v) && v > 0;
+const attemptsOk = (v) => Number.isInteger(v) && v >= 1 && v <= MAX_RERUN_ATTEMPTS;
+/** PURE: one acted record, by status. Every field a dedup / retry decision reads must be present and well-typed. */
+export function validRecord(r) {
+  if (!plain(r) || !Number.isFinite(r.at) || typeof r.published !== 'boolean' || !posInt(r.mainRun)) return false;
+  if (!Array.isArray(r.runIds) || !r.runIds.length || !r.runIds.every(posInt)) return false;
+  if (!Array.isArray(r.tests) || !r.tests.every((t) => typeof t === 'string')) return false;
+  switch (r.status) {
+    case 'main-already-red': return r.attempts === undefined && r.rerun === undefined && r.unsent === undefined;
+    case 'reserved': return attemptsOk(r.attempts) && r.unsent === undefined;
+    case 'requested': return attemptsOk(r.attempts) && r.rerun === 'requested' && r.unsent === undefined;
+    case 'unknown': return attemptsOk(r.attempts) && typeof r.rerun === 'string' && r.rerun.startsWith('outcome unknown') && r.unsent === undefined;
+    case 'failed': return attemptsOk(r.attempts) && r.unsent === true && typeof r.rerun === 'string' && r.rerun.startsWith('failed: deferred before sending');
+    default: return false;
+  }
+}
+/** PURE: the whole ledger; any malformed field makes it unreadable (callers fail closed: no re-run). */
 export function validLedger(o) {
   if (!plain(o)) return false;
   if (o.lastNoFire !== undefined && !(plain(o.lastNoFire) && typeof o.lastNoFire.head === 'string' && Number.isFinite(o.lastNoFire.at))) return false;
   if (o.acted === undefined) return true;
   if (!plain(o.acted)) return false;
-  return Object.values(o.acted).every((r) => plain(r) && RECORD_STATUSES.has(r.status)
-    && (r.attempts === undefined || (Number.isInteger(r.attempts) && r.attempts >= 1 && r.attempts <= MAX_RERUN_ATTEMPTS)));
+  return Object.entries(o.acted).every(([sha, r]) => SHA40.test(sha) && validRecord(r));
 }
 /** `{}` when absent; null when present but unreadable or malformed in ANY field (callers fail closed: no re-run). */
 function readLedger(path) {
@@ -207,7 +223,8 @@ export function runLatentRedMainCheck({ repo, exec, threshold, source = 'standar
       const cur = readLedger(ledgerPath);
       if (!cur) return { go: false, why: 'ledger-unreadable' };
       const prev = cur.acted?.[tipSha];
-      if (prev && !(prev.status === 'failed' && (prev.attempts ?? 1) < MAX_RERUN_ATTEMPTS)) return { go: false, why: 'already-acted', prev };
+      // Only a request PROVEN never sent (status failed + unsent) is retried, within the attempt cap.
+      if (prev && !(prev.status === 'failed' && prev.unsent === true && prev.attempts < MAX_RERUN_ATTEMPTS)) return { go: false, why: 'already-acted', prev };
       if (action !== 'rerun-main') {
         mkdirSync(dirname(ledgerPath), { recursive: true });
         writeJsonAtomic(ledgerPath, { ...cur, acted: { ...(cur.acted || {}), [tipSha]: { at: now, status: action, runIds: det.runIds, tests: det.tests.slice(0, 5), mainRun: tipRun.databaseId, published: false } } });
@@ -247,7 +264,7 @@ export function runLatentRedMainCheck({ repo, exec, threshold, source = 'standar
       if (isGhDeferred(out)) { rerun = 'failed: deferred before sending (low gh budget)'; status = 'failed'; }
       else { rerun = 'requested'; status = 'requested'; }
     } catch (e) { rerun = `outcome unknown: ${String(e?.message || e).split('\n')[0].slice(0, 200)}`; status = 'unknown'; }
-    update({ status, rerun, at: now });
+    update({ status, rerun, at: now, ...(status === 'failed' ? { unsent: true } : { unsent: undefined }) });
     say(`latent-red-main: re-run of main CI run ${tipRun.databaseId} ${rerun} — ${setting}`);
     if (publishOnce(item(rerun))) update({ published: true });
     return { fired: true, action, detail: { ...det, tipSha, rerun } };
