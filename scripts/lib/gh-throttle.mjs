@@ -574,7 +574,8 @@ const validSlotWaitMs = n => Number.isInteger(n) && n >= 0 && n <= GH_SLOT_WAIT_
 // (class lists, onSlotTimeout, backgroundWaitMs) stays standard/platform/env exactly as on main.
 // Resolved from this module's own location, NOT imported from settings-files.mjs: gh-throttle is imported by nearly
 // every script, and a test that stubs settings-files.mjs with a partial factory would otherwise throw on a missing export.
-export const GH_SLOT_WAIT_TOOL_FILE = fileURLToPath(new URL('../settings/gh-throttle.json', import.meta.url));
+// NodeURL, not the global URL: happy-dom (the unit-test environment) replaces the global, and fileURLToPath rejects its instances.
+export const GH_SLOT_WAIT_TOOL_FILE = fileURLToPath(new NodeURL('../settings/gh-throttle.json', import.meta.url));
 function slotWaitToolBlock(path = GH_SLOT_WAIT_TOOL_FILE) {
   try {
     const block = JSON.parse(readFileSync(path, 'utf8'))?.ghThrottleSlotWait;
