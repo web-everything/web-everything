@@ -270,3 +270,20 @@ describe('the declaration end to end', () => {
     expect(() => scaffoldOperation({})).toThrow(/needs a `readScaffoldContext/);
   });
 });
+
+it('refuses an injected numeric allocation already taken, including zero padding', () => {
+  expect(reasonOf(() => planScaffold(read({ existingIds: ['001'], allocatedId: '001' }),
+    { title: 'New', kind: 'task' }))).toBe('id-exhausted');
+});
+
+
+it('keeps a reserved birth hash and still supports older readers without one', () => {
+  const input = { title: 'New', kind: 'task' };
+  const numbered = planScaffold(read({ allocatedId: '041', bornAs: 'xdef456' }), input);
+  expect(numbered.content).toMatch(/^bornAs: xdef456$/m);
+  const legacyReader = planScaffold(read({ allocatedId: '042' }), input);
+  expect(legacyReader.content).toMatch(/^bornAs: x[0-9a-z]{6}$/m);
+  const fallback = planScaffold(read({ bornAs: 'xdef456' }), input);
+  expect(fallback.rel).toBe('backlog/xdef456-new.md');
+  expect(fallback.content).not.toContain('bornAs:');
+});
