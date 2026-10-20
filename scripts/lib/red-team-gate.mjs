@@ -30,6 +30,8 @@ import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
 import { parseLatestHumanClearedSha } from './review-escalation.mjs';
 import { scrubPublish } from './secret-scrub.mjs';
+import { roundExtensionGrants } from '../conveyor/round-extension-mark.mjs';
+import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 
 // ── The comment the producer writes ─────────────────────────────────────────────────────────────────────────────
 
@@ -265,6 +267,52 @@ export function sendBackStepOutcome(found) {
 }
 
 /**
+ * Thread positions of the operator's audited round grants on this PR (`extend-rounds`). The repo is optional here: a
+ * reader that only asks "did a grant come between these two gate records" cannot create a send-back by itself, and
+ * the gate that writes the later `sent-back` record matches the grant against its own repo first. PURE.
+ */
+function grantPositions(comments, pr, repo = null) {
+  // No repo: a grant for this PR under any constellation repo (an unknown repo never matches: fail closed).
+  const repos = repo ? [repo] : Object.values(CONSTELLATION_REPOS).map(r => r.slug);
+  return [...new Set(repos.flatMap(slug => roundExtensionGrants(comments, { repo: slug, pr }).map(g => g.index)))];
+}
+
+/**
+ * The send-back step's outcome from ONE result's gate records, in thread order. Without a grant this is exactly
+ * {@link sendBackStepOutcome} (raced records: the cap wins). An operator round grant posted AFTER the latest
+ * `round-cap` record reopens the step (`reopened`), and a `sent-back` record posted after such a grant supersedes the
+ * cap: the operator gave the fixer another round, and the gate used it. PURE.
+ */
+export function sendBackStepState(gates, grants = []) {
+  const step = [...gates].filter(r => r.gate.outcome === GATE_OUTCOMES.ROUND_CAP || r.gate.outcome === GATE_OUTCOMES.SENT_BACK)
+    .sort((a, b) => a.at - b.at || threadOrder(a, b));
+  let outcome = null, capAt = null;
+  for (const r of step) {
+    if (r.gate.outcome === GATE_OUTCOMES.ROUND_CAP) { outcome = GATE_OUTCOMES.ROUND_CAP; capAt = r.at; continue; }
+    if (outcome !== GATE_OUTCOMES.ROUND_CAP) outcome = GATE_OUTCOMES.SENT_BACK;
+    else if (grants.some(g => g > capAt && g < r.at)) { outcome = GATE_OUTCOMES.SENT_BACK; capAt = null; }
+  }
+  const reopened = outcome === GATE_OUTCOMES.ROUND_CAP && grants.some(g => g > capAt);
+  return { outcome, reopened };
+}
+
+/**
+ * The round cap the gate sends back under, after the operator's audited grants. The SAME anchor fix dispatch uses
+ * (`we:scripts/conveyor/reconcile-core.mjs#resolveRoundExtensionAnchor`, default `grant`): a grant of `by` rounds
+ * means `by` more rounds from the round the PR was on when it was granted, so `--by=1` on a PR already past the cap
+ * still buys exactly one more round. The additive floor (`cap` + every grant) never lowers the cap. A grant whose
+ * round cannot be read (`roundAt` returns null) counts only additively. PURE.
+ * @param {{cap:number, grants:Array<{by:number, at:string}>, roundAt?:(at:string)=>number|null}} o
+ */
+export function gateRoundCap({ cap, grants = [], roundAt = () => null }) {
+  const total = grants.reduce((sum, g) => sum + g.by, 0);
+  return Math.max(cap + total, ...grants.map(g => {
+    const r = roundAt(g.at);
+    return Number.isInteger(r) && r > 0 ? r + g.by : 0;
+  }));
+}
+
+/**
  * The operator-queue reason: why this PR is NOT READY because of the red team, or null. PURE. The hold exists only
  * while the fixer demonstrably owns the break: a TRUSTED gate record says it SENT the break back on this head and the
  * PR still carries `review:changes`. Every other state releases it, so a gate that never acted (crashed, timed out,
@@ -326,7 +374,10 @@ const CLEAR_HUMAN_RULING_RE = /^✅ review — `review:human` cleared via the sa
  */
 function threadRecords(comments) {
   // Every reader below counts trusted records only, so untrusted comments are dropped before any parse.
-  return (Array.isArray(comments) ? comments : []).filter(isTrustedMarkerAuthor).flatMap((c, at) => {
+  // `at` is the comment's position in the WHOLE thread, so it compares directly with an operator grant's index
+  // ({@link roundExtensionGrants}); every reader below only compares positions, never counts them.
+  return (Array.isArray(comments) ? comments : []).flatMap((c, at) => {
+    if (!isTrustedMarkerAuthor(c)) return [];
     const body = typeof c === 'string' ? c : c?.body;
     const lines = typeof body === 'string' ? body.replace(/\r\n/g, '\n').trimStart().split('\n') : [];
     const k = lines.findIndex(line => CARRIED_LINE_RE.test(line));
@@ -396,12 +447,15 @@ function gateRecordsFor(records, pr, sha, hit) {
  * The live head's latest red-team result (carried ones included) and the outcomes the gate recorded for THAT result.
  * The gate dedups on this, so a record for an earlier same-head result never stops it deciding a newer one. PURE.
  */
-export function liveResultGateState(comments, pr, head, savedResult = null) {
+export function liveResultGateState(comments, pr, head, savedResult = null, repo = null) {
   const live = String(head ?? '').toLowerCase();
   const records = indexedRecords(comments, savedResult);
   const hit = latestResult(records, pr, live);
-  if (!hit) return { result: null, resultId: null, outcomes: new Set() };
-  return { result: hit.parsed, resultId: redTeamResultId(hit.parsed), outcomes: new Set(gateRecordsFor(records, pr, live, hit).map(r => r.gate.outcome)) };
+  if (!hit) return { result: null, resultId: null, outcomes: new Set(), sendBackOutcome: null, reopened: false };
+  const gates = gateRecordsFor(records, pr, live, hit);
+  const { outcome, reopened } = sendBackStepState(gates, grantPositions(comments, pr, repo));
+  return { result: hit.parsed, resultId: redTeamResultId(hit.parsed), outcomes: new Set(gates.map(r => r.gate.outcome)),
+    sendBackOutcome: outcome, reopened };
 }
 
 /**
@@ -498,7 +552,8 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     sha = hit.from;
   }
   const capRecord = liveGates.filter(r => r.gate.outcome === GATE_OUTCOMES.ROUND_CAP).sort(threadOrder).at(-1)?.c ?? null;
-  const outcome = sendBackStepOutcome(new Set(liveGates.map(r => r.gate.outcome)));
+  // An operator round grant between the cap record and a later `sent-back` record lets that send-back stand.
+  const outcome = sendBackStepState(liveGates, grantPositions(comments, pr)).outcome;
   const ruled = operatorRuled(records, pr, live);
   const sendBack = [], held = [];
   for (const f of result?.findings ?? []) {

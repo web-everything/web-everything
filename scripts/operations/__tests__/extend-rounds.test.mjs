@@ -78,6 +78,19 @@ describe('operator round extension', () => {
     await expect(sinks[ROUND_EXTENSION_POST_EFFECT](plan)).resolves.toMatchObject({ granted: 2 });
     expect(post).toHaveBeenCalledTimes(1);
   });
+  it('re-runs the red-team gate on the PR after a proven grant, and a gate failure never undoes the grant', async () => {
+    const plan = planRoundExtension(read, input);
+    const posted = [];
+    const readThread = () => ({ ...read, comments: posted.map(trusted) });
+    const post = vi.fn((_r, _p, body) => posted.push(body));
+    const regate = vi.fn(() => ({ status: 'applied', outcome: 'sent-back' }));
+    const sinks = createExtendRoundsSinks({ readThread, post, readViewerLogin: () => OPERATOR_LOGINS[0], regate });
+    await expect(sinks[ROUND_EXTENSION_POST_EFFECT](plan)).resolves.toMatchObject({ granted: 2, redTeamGate: { outcome: 'sent-back' } });
+    expect(regate).toHaveBeenCalledWith({ repo: input.repo, pr: input.pr });
+    posted.length = 0;
+    const failing = createExtendRoundsSinks({ readThread, post, readViewerLogin: () => OPERATOR_LOGINS[0], regate: () => { throw new Error('gh down'); } });
+    await expect(failing[ROUND_EXTENSION_POST_EFFECT](plan)).resolves.toMatchObject({ granted: 2, redTeamGate: { status: 'error' } });
+  });
   it('refuses to post under a credential that is not the named operator', async () => {
     const plan = planRoundExtension(read, input);
     for (const viewer of [AUTOMATION_LOGINS[0], 'outsider', '']) {
