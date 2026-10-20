@@ -136,11 +136,11 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
   try {
     const view = io.readPr({ repo, pr });
     const head = String(view?.headRefOid ?? '').toLowerCase();
+    // Verify once for this read; both the retry decision and the cap must use the same trusted grant scope.
+    let standingRuling = null;
+    try { standingRuling = io.standingRuling?.({ repo, pr: { ...view, number: pr } }) ?? null; } catch { standingRuling = null; }
     // The live head's latest result, and only the records that decide THAT result (an earlier same-head result's
     // records never dedup a newer one, PR #5482).
-    // Standing-ruling grants count only under the scope verified from GitHub at THIS read (the shared trusted reader).
-    let standingRuling = null;
-    try { standingRuling = io.standingRuling?.({ repo, pr, comments: view?.comments }) ?? null; } catch { standingRuling = null; }
     const posted = liveResultGateState(view?.comments, pr, head, null, repo, standingRuling);
     const saved = posted.result ? null : (io.readSavedResult ?? readSavedRedTeamResult)({ repo, pr, head });
     const { result, resultId, outcomes: recorded, sendBackOutcome, reopened } = saved ? liveResultGateState(view?.comments, pr, head, saved, repo, standingRuling) : posted;
@@ -245,7 +245,6 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
   };
   const safety = readDrainQueueSafety({ env, log: line => process.stderr.write(`${line}\n`) });
   return {
-    standingRuling: ({ repo, pr, comments }) => standingRulingScope({ repo, pr: { number: Number(pr), comments } }),
     syncStatusLabels: ({ repo, pr, head }) => head ? syncRedTeamStatusLabels({ repo, pr, head, env,
       log: line => process.stderr.write(`${line}\n`) }) : null,
     signalFix: signalFixDispatch,
@@ -257,6 +256,7 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
     }),
     readSetting: () => readConfirmedBreaks({ env }),
     readSavedResult: args => readSavedRedTeamResult({ ...args, env }),
+    standingRuling: standingRulingScope,
     readRound: ({ repo, pr, head }) => readReviewRound({ repo, pr, head }),
     readRoundAsOf: ({ repo, pr, at }) => readReviewRoundAsOf({ repo, pr, at }),
     // The live head, read fresh and alone (the PR view above can be minutes old by the time a slow step finishes).
