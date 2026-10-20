@@ -113,8 +113,9 @@ function resolveCurrent(prev, items) {
   for (const item of known) {
     const key = keyOf(item), open = prevByCondition.get(conditionOf(item)) ?? [];
     current.set(key, item);
-    // Adopt only when this is the condition's ONLY known head this read; two known heads are two real events.
-    const sole = known.filter(k => conditionOf(k) === conditionOf(item)).length === 1;
+    // Adopt only when this read names ONE distinct known head for the condition (duplicate rows of it are one head);
+    // two distinct known heads are two real events.
+    const sole = new Set(known.filter(k => conditionOf(k) === conditionOf(item)).map(k => k.head)).size === 1;
     if (!prev.has(key) && sole && open.length && open.every(o => !o.head)) { adopted.add(key); for (const o of open) retired.add(o.key); }
   }
   for (const item of unknown) {

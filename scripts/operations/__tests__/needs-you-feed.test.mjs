@@ -123,7 +123,9 @@ describe('feed', () => {
     expect(items[2].command).toBe('human merge');
     expect(items[4].command).toBeUndefined();
     expect(items.every(i => i.title === row.title)).toBe(true);
-    const line = diffFeed([], [items[0]], at).lines[0];
+    // A head-less row is held, never published (#5716); the same row once its head is known posts.
+    expect(diffFeed([], [items[0]], at).lines).toEqual([]);
+    const line = diffFeed([], [{ ...items[0], head: 'abc' }], at).lines[0];
     expect(line.slice(0, line.indexOf(' {"at":'))).toContain(row.title);
     expect(line).toContain(`| pick: ${review}`);
     expect(parseFeedLine(line)).toMatchObject({ title: row.title, reason: items[0].reason });
@@ -180,6 +182,10 @@ describe('feed', () => {
     // Two distinct known heads with only a legacy key open are two real events: both post, the legacy key clears.
     const two = diffFeed([legacy], [live, { ...live, head: 'b47' }], at);
     expect(two.lines.map(l => l.split(' ')[0])).toEqual(['NEEDS-YOU', 'NEEDS-YOU', 'NEEDS-YOU-CLEARED']);
+    // Duplicate rows of ONE known head still adopt the legacy key silently.
+    expect(diffFeed([legacy], [live, { ...live }], at)).toEqual({ lines: [], openKeys: [`${item.repo}#12@a36:at-round-limit`] });
+    // A genuinely new head still posts (and clears the old head's key).
+    expect(diffFeed([`${item.repo}#12@a36:at-round-limit`], [{ ...live, head: 'c58' }], at).lines.map(l => l.split(' ')[0])).toEqual(['NEEDS-YOU', 'NEEDS-YOU-CLEARED']);
     // Same condition reported twice (known + unknown) is one key.
     expect(diffFeed([], [unknown, live], at).openKeys).toEqual([`${item.repo}#12@a36:at-round-limit`]);
   });
