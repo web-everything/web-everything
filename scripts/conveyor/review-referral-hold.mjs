@@ -477,14 +477,36 @@ export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), readRu
  * - A stale `pending` (crash between reserve and publish, failed cleanup, or a crash/failed write AFTER publishing) or a
  *   corrupt receipt is reclaimed after NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS. In the after-publish case this re-raises
  *   the event: a rare duplicate after a crash is accepted (the feed's open-key state usually absorbs it).
- * - Reclaiming is exclusive too: each stale receipt generation (its exact bytes) gets one `wx` reclaim token, so two
- *   reclaimers that read the same stale receipt can never both publish. Tokens are never deleted (a deleted token would
- *   let a slow reclaimer win again); a newer stale generation has different bytes, so a token never blocks a later retry.
+ * - Any unreadable or invalid receipt (bad JSON, null, false, 0, "", wrong shape) is treated as stale: reclaimed.
+ * - Reclaiming is exclusive AND expiring ({@link takeReclaimLease}): two reclaimers of the same stale generation can
+ *   never both publish, and a reclaimer that crashed holding its lease is taken over once the lease expires — so
+ *   nothing can block the event forever.
  * Never throws.
  */
 /** A `pending` needs-you reservation older than this is treated as abandoned (crash or failed cleanup) and retried. */
 export const NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS = 10 * 60_000;
 const NEEDS_YOU_FS = Object.freeze({ readFileSync, writeFileSync, unlinkSync, mkdirSync });
+/**
+ * Exclusive, EXPIRING reclaim lease for one stale receipt generation (its exact bytes). Lease attempt n is the file
+ * `<receipt>.reclaim-<generation>-<n>`, created with `wx` and carrying a timestamp. A live lease (younger than
+ * NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS) means another reclaimer owns the generation: refuse. An expired or unreadable
+ * lease (its holder crashed) is taken over by exclusively creating attempt n+1, so a crashed reclaimer can never block
+ * forever and two reclaimers can never both win the same attempt. Returns true only for the winner.
+ */
+export function takeReclaimLease({ fs, path, raw, now, maxAttempts = 10_000 }) {
+  const generation = createHash('sha256').update(raw ?? '').digest('hex').slice(0, 16);
+  for (let n = 0; n < maxAttempts; n++) {
+    const lease = `${path}.reclaim-${generation}-${n}`;
+    try { fs.writeFileSync(lease, JSON.stringify({ at: new Date(now).toISOString(), attempt: n }), { flag: 'wx' }); return true; }
+    catch (e) { if (e.code !== 'EEXIST') throw e; }
+    let held = NaN;
+    try { held = Date.parse(JSON.parse(String(fs.readFileSync(lease, 'utf8')))?.at); } catch { held = NaN; }
+    if (Number.isFinite(held) && now - held < NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS) return false;
+    // Expired or unreadable: its holder is gone; compete for the next attempt.
+  }
+  return false;
+}
+
 export function raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now = Date.now(), log = line => console.error(line),
   publish, fs = NEEDS_YOU_FS }) {
   try {
@@ -498,21 +520,23 @@ export function raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now = Date.n
     fs.mkdirSync(dir, { recursive: true });
     const receipt = state => JSON.stringify({ state, at: new Date(now).toISOString(), repo, pr: Number(prNumber), head: hold.head });
     let raw = null;
-    let prior;
-    try { raw = String(fs.readFileSync(path, 'utf8')); prior = JSON.parse(raw); }
-    catch (e) { if (e.code !== 'ENOENT') prior = { state: 'corrupt' }; }
-    if (prior?.state === 'published') return false;
-    // A fresh `pending` reservation belongs to a publish in flight elsewhere.
-    if (prior?.state === 'pending' && Number.isFinite(Date.parse(prior.at)) && now - Date.parse(prior.at) < NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS) return false;
-    if (prior) {
-      // Stale/corrupt: exactly one reclaimer per stale generation wins its exclusive token (see the doc comment).
-      const token = `${path}.reclaim-${createHash('sha256').update(raw ?? '').digest('hex').slice(0, 16)}`;
-      try { fs.writeFileSync(token, JSON.stringify({ at: new Date(now).toISOString() }), { flag: 'wx' }); }
-      catch (e) { if (e.code === 'EEXIST') return false; throw e; }
-      fs.writeFileSync(path, receipt('pending'));
-    } else {
+    try { raw = String(fs.readFileSync(path, 'utf8')); }
+    catch (e) { if (e.code !== 'ENOENT') raw = ''; }
+    if (raw === null) {
+      // No receipt: the normal path, an exclusive reservation.
       try { fs.writeFileSync(path, receipt('pending'), { flag: 'wx' }); }
       catch (e) { if (e.code === 'EEXIST') return false; throw e; }
+    } else {
+      let prior = null;
+      try { prior = JSON.parse(raw); } catch { prior = null; }
+      const at = prior && typeof prior === 'object' ? Date.parse(prior.at) : NaN;
+      if (prior && typeof prior === 'object' && prior.state === 'published') return false;
+      // A fresh, well-formed `pending` reservation belongs to a publish in flight elsewhere.
+      if (prior && typeof prior === 'object' && prior.state === 'pending' && Number.isFinite(at)
+        && now - at < NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS) return false;
+      // Everything else (stale pending, unreadable, bad JSON, null/false/0/"", any other shape) is reclaimed.
+      if (!takeReclaimLease({ fs, path, raw, now })) return false;
+      fs.writeFileSync(path, receipt('pending'));
     }
     try {
       publish({ repo, pr: Number(prNumber), head: hold.head, kind: 'review-no-verdict',

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { newRunRecord, tryReadRun, writeRun } from '../../operations/run-store.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, mandatoryReferralState, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
@@ -15,7 +16,7 @@ import {
   notifyReferralHold, REFERRAL_RETRY_MS, decideSameHeadHold, resolveSameHeadMaxReviews, PENDING_REASON_TOKENS,
   GH_LIST_COMMENT_CAP, findResumableParkedRun, blockRuledReferralsFor, filterFixerReferrals, REFERRAL_REARM_COMMENT_MARKER,
   VERDICT_COOLDOWN_BASE_MS, VERDICT_COOLDOWN_CAP_MS, VERDICT_COOLDOWN_MAX_RELEASES,
-  resolveNoVerdictRetry, NO_VERDICT_RETRY_STANDARD, raiseNoVerdictNeedsYou, NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS,
+  resolveNoVerdictRetry, NO_VERDICT_RETRY_STANDARD, raiseNoVerdictNeedsYou, NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS, takeReclaimLease,
 } from '../review-referral-hold.mjs';
 
 it('keeps the cycle-free referral matcher equal to the canonical re-arm marker', () => {
@@ -696,6 +697,53 @@ describe('same-head hold never silences a review whose verdict never landed (liv
       writeFileSync(receiptPath, JSON.stringify({ state: 'pending', at: iso(later), repo, pr: 1, head }));
       expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: later + NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS })).toBe(true);
       expect(publish).toHaveBeenCalledTimes(3);
+    });
+    it('crash case 1: a reclaimer that dies holding its lease (before replacing the receipt) blocks only until the lease expires', () => {
+      const dir = temp(), log = vi.fn(), publish = vi.fn(), t0 = at + 30 * 86400_000, STALE = NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS;
+      const held = decideSameHeadHold(labelled(['review:pending']), lostRuns(9), { repo, env: {}, now: t0, retry: { cooldownReleases: 6 } });
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 })).toBe(true);
+      const receiptPath = join(dir, readdirSync(dir)[0]);
+      const stale = JSON.stringify({ state: 'pending', at: iso(t0), repo, pr: 1, head });
+      writeFileSync(receiptPath, stale);
+      // Reclaimer A takes the lease and crashes before rewriting the receipt.
+      expect(takeReclaimLease({ fs: { readFileSync, writeFileSync }, path: receiptPath, raw: stale, now: t0 + STALE })).toBe(true);
+      // While A's lease is live, nobody reclaims (exclusive)...
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 + STALE + 60_000 })).toBe(false);
+      expect(publish).toHaveBeenCalledTimes(1);
+      // ...and once it expires the next reclaimer takes over with a new exclusive attempt and publishes: never forever.
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 + 2 * STALE })).toBe(true);
+      expect(publish).toHaveBeenCalledTimes(2);
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 + 2 * STALE + 1 })).toBe(false);
+    });
+    it('expired-lease takeover is exclusive too: two takers of the same expired lease cannot both win', () => {
+      const dir = temp(), path = join(dir, 'r.json'), raw = 'x', t = at, fs = { readFileSync, writeFileSync };
+      expect(takeReclaimLease({ fs, path, raw, now: t })).toBe(true);
+      const later = t + NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS;
+      expect(takeReclaimLease({ fs, path, raw, now: later })).toBe(true);
+      expect(takeReclaimLease({ fs, path, raw, now: later })).toBe(false);
+      // An unreadable lease counts as expired, never as a permanent block.
+      const d2 = temp(), p2 = join(d2, 'r.json');
+      writeFileSync(`${p2}.reclaim-${createHash('sha256').update('y').digest('hex').slice(0, 16)}-0`, '{garbage');
+      expect(takeReclaimLease({ fs, path: p2, raw: 'y', now: t })).toBe(true);
+    });
+    it.each([['null'], ['false'], ['0'], ['""'], ['{bad json'], [''], ['[]'], ['{"state":"pending"}'], ['{"state":"weird","at":"2026-10-03T08:00:00Z"}']])(
+      'crash case 2: an invalid receipt %s is treated as stale and reclaimed (never returns forever)', content => {
+        const dir = temp(), log = vi.fn(), publish = vi.fn(), t0 = at + 30 * 86400_000;
+        const held = decideSameHeadHold(labelled(['review:pending']), lostRuns(9), { repo, env: {}, now: t0, retry: { cooldownReleases: 6 } });
+        expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 })).toBe(true);
+        writeFileSync(join(dir, readdirSync(dir)[0]), content);
+        expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 + 1 })).toBe(true);
+        expect(publish).toHaveBeenCalledTimes(2);
+        expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 + 2 })).toBe(false);
+      });
+    it('normal path: concurrent fresh reservations dedupe (second daemon sees the fresh pending receipt)', () => {
+      const dir = temp(), log = vi.fn(), t0 = at + 30 * 86400_000;
+      const held = decideSameHeadHold(labelled(['review:pending']), lostRuns(9), { repo, env: {}, now: t0, retry: { cooldownReleases: 6 } });
+      const second = vi.fn();
+      const first = vi.fn(() => { expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish: second, now: t0 })).toBe(false); });
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish: first, now: t0 })).toBe(true);
+      expect(first).toHaveBeenCalledTimes(1);
+      expect(second).not.toHaveBeenCalled();
     });
     it('never writes the real feed from a test without an injected publisher', () => {
       const dir = temp();
