@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { listRunIds, readRun } from '../../operations/run-store.mjs';
@@ -22,7 +22,9 @@ const counting = () => {
   const reads = [];
   return { reads, read: (id, d) => { reads.push(id); return JSON.parse(readFileSync(join(d, `${id}.json`), 'utf8')); } };
 };
-const ask = (runsDir, extra = {}) => readMatchingReviewRuns({ runsDir, repo: 'Web-Everything/web-everything', pr: 7, head: head.toUpperCase(), list: listRunIds, ...extra });
+// `later` = an hour on, so files written by the test are older than the 10-minute settle window.
+const later = () => Date.now() + 3_600_000;
+const ask = (runsDir, extra = {}) => readMatchingReviewRuns({ runsDir, repo: 'Web-Everything/web-everything', pr: 7, head: head.toUpperCase(), list: listRunIds, now: later, settleMs: 600_000, ...extra });
 
 describe('readMatchingReviewRuns', () => {
   it('returns only matching review-pr runs, in list order, read fresh', () => {
@@ -53,5 +55,59 @@ describe('readMatchingReviewRuns', () => {
     writeFileSync(join(runsDir, 'review-pr-z.json'), '{not json');
     expect(() => ask(runsDir, { read: readRun })).toThrow(/refusing to read run review-pr-z/);
     expect(() => ask(runsDir, { read: readRun })).toThrow(/refusing to read run review-pr-z/);
+  });
+
+  it('a file newer than the settle window is always read, never served from the index', () => {
+    const { runsDir, put } = dir();
+    put('review-pr-c', { pr: 8 });
+    const fresh = { now: Date.now, settleMs: 600_000 };
+    ask(runsDir, { ...fresh, read: counting().read });
+    const again = counting();
+    ask(runsDir, { ...fresh, read: again.read });
+    expect(again.reads).toEqual(['review-pr-c']);
+  });
+
+  it('closes the stat-to-skip race: a skipped file rewritten mid-scan is re-stat, read and matched', () => {
+    const { runsDir, put } = dir();
+    put('review-pr-a', { pr: 8 }); put('review-pr-b', { pr: 9 });
+    ask(runsDir, { read: counting().read }); // both indexed as non-matching
+    let swapped = false;
+    const stat = (path, opts) => {
+      const st = statSync(path, opts);
+      if (!swapped && path.endsWith('review-pr-a.json')) { // atomic replace right AFTER the stat, as writeRun does
+        swapped = true;
+        const tmp = join(runsDir, 'tmp-a');
+        writeFileSync(tmp, JSON.stringify(record('review-pr-a', { pr: 7, note: 'now an accepting run' })));
+        renameSync(tmp, join(runsDir, 'review-pr-a.json'));
+      }
+      return st;
+    };
+    const { reads, read } = counting();
+    expect(ask(runsDir, { read, stat }).map(h => h.id)).toEqual(['review-pr-a']);
+    expect(reads).toEqual(['review-pr-a']);
+  });
+
+  it('a skipped file corrupted or deleted mid-scan still throws, never skipped', () => {
+    for (const mutate of ['corrupt', 'delete']) {
+      const { runsDir, put } = dir();
+      put('review-pr-a', { pr: 8 });
+      ask(runsDir, { read: counting().read });
+      let done = false;
+      const stat = (path, opts) => {
+        const st = statSync(path, opts);
+        if (!done) { done = true; if (mutate === 'corrupt') { const tmp = join(runsDir, 't'); writeFileSync(tmp, '{bad'); renameSync(tmp, path); } else unlinkSync(path); }
+        return st;
+      };
+      expect(() => ask(runsDir, { read: readRun, stat })).toThrow(/review-pr-a/);
+    }
+  });
+
+  it('a stat error means the file is read, so its read error surfaces', () => {
+    const { runsDir, put } = dir();
+    put('review-pr-a', { pr: 8 });
+    ask(runsDir, { read: counting().read });
+    const { reads, read } = counting();
+    ask(runsDir, { read, stat: () => { throw Object.assign(new Error('EIO'), { code: 'EIO' }); } });
+    expect(reads).toEqual(['review-pr-a']);
   });
 });

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readReviewRunIndexSetting } from './lib/review-run-index.mjs';
 import { isPriorityLabels } from './lib/priority-reserve.mjs';
 import { postCardSquashMarker } from './lib/card-squash-marker.mjs';
 import { ensureLabelCached } from './lib/label-cache.mjs';
@@ -6548,6 +6549,7 @@ async function runCli() {
   };
   // Queue-mode branch numbering (mq-number-before-enqueue): number cards on the PR branch before enqueue.
   const numberCardsBeforeEnqueue = logQueueNumbering();
+  readReviewRunIndexSetting({ log: (line) => process.stderr.write(`${line}\n`) }); // red-team evidence index settle window + source
   const numberingOnBranch = numberCardsBeforeEnqueue && mergeStrategy.enqueues(null) && mainAcceptsBranchNumbering();
   if (numberCardsBeforeEnqueue && mergeStrategy.enqueues(null) && !numberingOnBranch) process.stderr.write("  merge-queue: numberCardsBeforeEnqueue=on but main's CI does not yet accept drain-numbered cards (contract drain-branch-numbering-ci-v1 missing on origin/main) — numbering at land (post-land push) this pass\n");
   if (numberingOnBranch && !DRY_RUN) sweepQueuedHashCards({ repo: localSlug, cwd: process.cwd(), isOpen: (repo, num) => openReservationPr(openPrContext, repo, num) });
