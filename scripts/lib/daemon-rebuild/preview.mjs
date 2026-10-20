@@ -114,6 +114,8 @@ export async function dryRunRebuild({
   let wouldDo = 'refuse';
   if (unsafe.safe && onMain === true && plan.ok) {
     if (untrackedCollision.length > 0 || overlayStateCorrupt) wouldDo = 'refuse'; // mirrors doRebuild's refusals
+    // x9diisp — mirrors prepareRebuild: a plan that would lose overlays the running build carries is HELD, not built.
+    else if (plan.establishedLost?.length > 0) wouldDo = 'hold (established-overlay-conflict)';
     else if (plan.finalSha === head) wouldDo = 'nothing';
     else if (stillRejected) wouldDo = 'nothing (still-rejected)';
     else wouldDo = 'rebuild-and-smoke';
