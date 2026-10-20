@@ -30,8 +30,11 @@ import { fileIntoBatch } from '../card-batch-file.mjs';
 import { resolvePreventionBatchSettings } from '../../lib/card-batch-settings.mjs';
 import { loadCardBatchPolicy } from '../../lib/card-batch-policy.mjs';
 
+// The lane paths below are fakes, so the post-file "card is in the lane" check reads a scripted fs, and the
+// filer checkout (whose `run.mjs` file-item runs) is a fixed fake root distinct from the lane.
+const FILER_ROOT = '/workspace/wev-review-daemon';
 const landPreventionCard = (input, deps) => realLandPreventionCard(input, {
-  pendingDir: '/tmp/no-prevention-spool-for-unit-tests',
+  pendingDir: '/tmp/no-prevention-spool-for-unit-tests', fileExists: () => true, filerRoot: FILER_ROOT,
   batch: async () => ({ batched: false, disabled: true, reason: 'per-card test' }), ...deps,
 });
 
@@ -91,6 +94,20 @@ describe('landPreventionCard — the real acquire → file-item → commit → v
     expect(d).toBe('lane/prevention-card-d');
   });
 
+  it('a filed card that is not in the lane fails closed at file-item and still releases the lane', async () => {
+    const { exec, calls } = scriptedExec([ACQUIRE_OK, FILE_ITEM_OK, 'released']);
+    const checked = [];
+    const result = await landPreventionCard(INPUT, {
+      exec, write: () => {}, mkTmp: () => '/tmp/x', rmTmp: () => {}, writeFile: () => {},
+      fileExists: (p) => { checked.push(p); return false; },
+    });
+    expect(result).toMatchObject({ ok: false, step: 'file-item', num: 9001 });
+    expect(result.reason).toMatch(/not in the lane/);
+    expect(checked).toEqual(['/workspace/.lanes/web-everything/lane-7/backlog/9001-file-the-prevention.md']);
+    expect(calls.map((c) => c.args[0] === 'add' || c.args.includes('commit'))).not.toContain(true);
+    expect(calls.at(-1).args).toContain('release');
+  });
+
   it('lands the card: reaches an opened, labelled PR, and releases the lane', async () => {
     const { exec, calls } = scriptedExec([ACQUIRE_OK, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'labelled', 'released']);
     const written = [];
@@ -109,7 +126,10 @@ describe('landPreventionCard — the real acquire → file-item → commit → v
     // resolve their repo root by SCRIPT LOCATION, not cwd, so running the wrong run.mjs would silently re-file
     // the card into the WRONG checkout even with `cwd: lane` set).
     expect(calls[1].opts.cwd).toBe('/workspace/.lanes/web-everything/lane-7');
-    expect(calls[1].args[0]).toBe('/workspace/.lanes/web-everything/lane-7/scripts/operations/run.mjs');
+    // card xx7o40x follow-up: the FILER checkout's code (where daemon overlays such as number-at-birth are
+    // adopted) runs file-item, and the lane is named as the explicit write target — never the filer's own tree.
+    expect(calls[1].args[0]).toBe(`${FILER_ROOT}/scripts/operations/run.mjs`);
+    expect(calls[1].opts.env.WE_FILE_ITEM_ROOT).toBe('/workspace/.lanes/web-everything/lane-7');
     expect(calls[1].args).toContain('file-item');
     expect(calls[1].args).toContain('--title=Prevention — Reject malformed flags (from o/r#42 review)');
     // git add + commit, in the lane, of exactly the filed card.
@@ -632,6 +652,7 @@ describe('postLandingRetraction — a failed job retracts its own marker on the 
 
 describe('prevention batch landing', () => {
   const deps = { pendingDir: '/tmp/no-prevention-spool-for-unit-tests', dedupe: () => null, mkTmp: () => '/tmp/x', rmTmp: () => {}, writeFile: () => {},
+    fileExists: () => true, filerRoot: FILER_ROOT,
     loadPreventionBatchSettings: () => resolvePreventionBatchSettings({ standard: loadCardBatchPolicy().prevention }) };
   it.each([null, { repo: 'o/r', pr: '42', headSha: 'abc' }])('hands a new hash card to the batch and releases without publishing (%j)', async (retract) => {
     const rel = 'backlog/x123456-prevention.md';

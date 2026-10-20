@@ -16,7 +16,7 @@ import { describe, it, expect } from 'vitest';
 import { join } from 'node:path';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { createFileItemReader, createFileItemSinks } from '../file-item-io.mjs';
+import { createFileItemReader, createFileItemSinks, fileItemRoot, FILE_ITEM_ROOT_ENV, REPO_ROOT } from '../file-item-io.mjs';
 import { SCAFFOLD_EFFECT } from '../scaffold.mjs';
 import { FILE_ITEM_QUEUE_EFFECT } from '../file-item.mjs';
 import { withRealRepo } from './helpers/real-repo.mjs';
@@ -188,5 +188,23 @@ describe('against a REAL git checkout (#2949 fidelity qualifier)', () => {
         .rejects.toThrow(/locus-prefix/);
       expect(() => readFileSync(abs, 'utf8')).toThrow();
     });
+  });
+});
+
+describe('fileItemRoot — the explicit target checkout (card xx7o40x follow-up)', () => {
+  const lane = '/lanes/lane-7';
+  const real = new Set([`${lane}/backlog`, `${lane}/.git`]);
+  const exists = (p) => real.has(p);
+  it('unset or empty → this checkout, exactly as before', () => {
+    expect(fileItemRoot({}, { exists })).toBe(REPO_ROOT);
+    expect(fileItemRoot({ [FILE_ITEM_ROOT_ENV]: '' }, { exists })).toBe(REPO_ROOT);
+  });
+  it('a real checkout with backlog/ is the target', () => {
+    expect(fileItemRoot({ [FILE_ITEM_ROOT_ENV]: lane }, { exists })).toBe(lane);
+  });
+  it('a relative, missing or non-checkout target throws instead of writing into this checkout', () => {
+    expect(() => fileItemRoot({ [FILE_ITEM_ROOT_ENV]: 'lanes/lane-7' }, { exists })).toThrow(/not an absolute checkout/);
+    expect(() => fileItemRoot({ [FILE_ITEM_ROOT_ENV]: '/nowhere' }, { exists })).toThrow(/not an absolute checkout/);
+    expect(() => fileItemRoot({ [FILE_ITEM_ROOT_ENV]: lane }, { exists: (p) => p === `${lane}/backlog` })).toThrow(/not an absolute checkout/);
   });
 });

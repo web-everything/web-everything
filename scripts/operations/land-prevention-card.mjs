@@ -94,6 +94,7 @@ import { fileIntoBatch, cardIdOf } from './card-batch-file.mjs';
 import { cardBatchStateDir } from './card-batch-io.mjs';
 import { loadPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
+import { FILE_ITEM_ROOT_ENV } from './file-item-io.mjs';
 import {
   buildApprovalPreventionRetraction, APPROVAL_PREVENTION_DIGEST_KEY_SEP, APPROVAL_PREVENTION_KEY_PREFIX,
 } from '../lib/approval-prevention-notice.mjs';
@@ -480,6 +481,8 @@ export async function landPreventionCard(input, {
   batch = fileIntoBatch,
   loadPreventionBatchSettings: loadBatchSettings = loadPreventionBatchSettings,
   sleep: wait = sleep,
+  fileExists = existsSync,
+  filerRoot = REPO_ROOT,
 } = {}) {
   // ONE scratch dir per run, created lazily and removed on every exit path (#4317 advisory review, 2026-09-29 —
   // the first cut made a fresh `mkdtempSync` dir for each file and never removed either, leaking two per filing).
@@ -538,6 +541,7 @@ export async function landPreventionCard(input, {
     // one hop further out. A real delivery agent avoids this by `cd $LANE` + a RELATIVE `scripts/...` path; this
     // does the equivalent by building the lane's own absolute path explicitly.
     const laneRunMjs = join(lane, 'scripts', 'operations', 'run.mjs');
+    const filerRunMjs = join(filerRoot, 'scripts', 'operations', 'run.mjs');
     await drainPendingPrevention({ lane }, { pendingDir, exec, batch, write });
     if (input.foldOpenSingles) {
       const summary = await foldOpenSingles({ lane }, { exec, batch, write });
@@ -597,16 +601,23 @@ export async function landPreventionCard(input, {
     let num = null;
     let rel = null;
     if (filingInput) {
-      write(`land-prevention-card: filing the card in ${lane}…\n`);
+      // THE CARD IS BORN BY THIS CHECKOUT'S CODE, WRITTEN INTO THE LANE (card xx7o40x follow-up, live 2026-10-20:
+      // PR #5728's card was hash-named although number-at-birth was adopted on the review daemon clone, because
+      // this step ran the LANE's own `run.mjs` — origin/main code, which no daemon overlay ever reaches). The
+      // #4317 property is kept by naming the target explicitly (`WE_FILE_ITEM_ROOT`) rather than by borrowing
+      // the lane's code, and re-checked below: the card must exist in the lane.
+      write(`land-prevention-card: filing the card in ${lane} with ${filerRoot}'s file-item…\n`);
       const fileArgv = [
-        laneRunMjs, 'file-item', `--title=${retitle(filingInput, input)}`, `--kind=${filingInput.kind}`, `--size=${filingInput.size}`,
+        filerRunMjs, 'file-item', `--title=${retitle(filingInput, input)}`, `--kind=${filingInput.kind}`, `--size=${filingInput.size}`,
         `--digest=${filingInput.digest}`, `--scope=${filingInput.scope}`,
         ...(filingInput.parent ? [`--parent=${filingInput.parent}`] : []),
         `--queue=${filingInput.queue}`, '--json',
       ];
       let filed;
       try {
-        filed = parseRunJsonTail(exec('node', fileArgv, { cwd: lane, timeout: FILE_ITEM_TIMEOUT_MS }));
+        filed = parseRunJsonTail(exec('node', fileArgv, {
+          cwd: lane, timeout: FILE_ITEM_TIMEOUT_MS, env: { ...process.env, [FILE_ITEM_ROOT_ENV]: lane },
+        }));
       } catch (e) {
         filed = parseRunJsonTail(e?.stdout);
         if (!filed) return fail('file-item', String(e?.message || e).split('\n')[0]);
@@ -614,6 +625,7 @@ export async function landPreventionCard(input, {
       num = filed?.verdict?.num ?? null;
       rel = filed?.verdict?.rel ?? null;
       if (!rel) return fail('file-item', filed?.error || 'file-item produced no card path', { num });
+      if (!fileExists(join(lane, rel))) return fail('file-item', `filed card ${rel} is not in the lane ${lane}`, { num });
     } else if (!mentioned.length) {
       // Every finding is already recorded (on an open PR's card, or verbatim on the card from a retried filing).
       write('land-prevention-card: every finding is already on an open card — nothing to file or land\n');
