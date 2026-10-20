@@ -18,6 +18,7 @@ import { buildRoundExtensionComment, countGrantedRoundExtensions, countStandingR
 import { buildStandingRulingBody, citedGrantHeads, pickStandingRuling, verifyStandingRuling } from '../standing-ruling-mark.mjs';
 import { enrichPrsWithStandingRulingGrants, headIsCardOnly, readStandingRuling, standingRulingScope } from '../standing-ruling-io.mjs';
 import { planRoundExtension } from '../../operations/extend-rounds.mjs';
+import { gateRoundCap } from '../../lib/red-team-gate.mjs';
 import { runReconcileNotesAllRepos } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
 
 const WE = 'web-everything/web-everything';
@@ -33,7 +34,7 @@ let ids = 0;
 const scope = (heads = { [HEAD]: true }, over = {}) => ({ ...RULING, cardOnlyHeads: heads, uneditedComments: [...Array(10000).keys()].map((i) => `IC_${i}`), ...over });
 let eps = 0;
 const autoGrant = ({ head = HEAD, login = 'web-everything[bot]', ruling = RULING_ID, by = 1, pr = 5654, repo = WE, actor = 'chalbert', episode = `${WE}#${pr}@${head}:review:${++eps}/0` } = {}) => ({
-  id: `IC_${++ids}`, author: { login },
+  id: `IC_${++ids}`, author: { login }, createdAt: '2026-10-20T12:00:00Z',
   body: buildRoundExtensionComment({ repo, pr, by, actor, channel: AUTO_GRANT_CHANNEL, reason: 'r', at: '2026-10-20T00:00:00Z', standingRuling: ruling, head, episode }),
 });
 const manualGrant = (login = 'chalbert') => ({ author: { login },
@@ -134,7 +135,7 @@ const tmpLedger = () => { const dir = mkdtempSync(join(tmpdir(), 'arg-')); retur
 const fakeGh = ({ comments = [], head = HEAD, state = 'OPEN' } = {}) => {
   const t = { comments: [...comments], head, state };
   return { t, readThread: vi.fn(() => ({ state: t.state, headRefOid: t.head, comments: t.comments })),
-    post: vi.fn((repo, pr, body) => { t.comments.push({ id: `IC_${++ids}`, author: { login: 'web-everything[bot]' }, body }); }) };
+    post: vi.fn((repo, pr, body) => { t.comments.push({ id: `IC_${++ids}`, author: { login: 'web-everything[bot]' }, createdAt: '2026-10-20T12:00:00Z', body }); }) };
 };
 const deps = (gh = fakeGh(), over = {}) => ({
   settings: ON, readRuling: () => RULING, readThread: gh.readThread, post: gh.post, ledger: tmpLedger(),
@@ -317,6 +318,27 @@ describe('audit round 3 patches', () => {
     expect(gh.post.mock.calls[0][2]).toContain(`"episode":"${WE}#5654@${HEAD}:review:8/7"`);
     expect(countGrantedRoundExtensions([autoGrant({ episode: `${WE}#5654@${HEAD2}:review:1/0` })], { repo: WE, pr: 5654, standingRuling: scope() })).toBe(0);
     expect(standingRulingGrantEpisodes([autoGrant({ episode: 'x' })], { repo: WE, pr: 5654 })).toEqual({ episodes: [], unrecoverable: 1 });
+  });
+});
+
+describe('anchor time of an automatic grant', () => {
+  it('is GitHub createdAt, never the body at; missing/invalid createdAt is not trusted; manual unchanged', () => {
+    const future = { ...autoGrant(), createdAt: '2026-10-20T12:00:00Z' };
+    future.body = future.body.replace('"at":"2026-10-20T00:00:00Z"', '"at":"2099-01-01T00:00:00Z"');
+    expect(roundExtensionGrants([future], { repo: WE, pr: 5654, standingRuling: scope() })).toEqual([expect.objectContaining({ at: '2026-10-20T12:00:00Z' })]);
+    expect(roundExtensionGrants([{ ...autoGrant(), createdAt: undefined }], { repo: WE, pr: 5654, standingRuling: scope() })).toEqual([]);
+    expect(roundExtensionGrants([{ ...autoGrant(), createdAt: 'not-a-date' }], { repo: WE, pr: 5654, standingRuling: scope() })).toEqual([]);
+    expect(roundExtensionGrants([{ ...manualGrant(), createdAt: '2030-01-01T00:00:00Z' }], { repo: WE, pr: 5654 })).toEqual([expect.objectContaining({ at: '2026-10-20T00:00:00Z' })]);
+  });
+  it('a future body timestamp cannot make one grant advance the red-team cap as ledger rows grow', () => {
+    const future = { ...autoGrant(), createdAt: '2026-10-20T12:00:00Z' };
+    future.body = future.body.replace('"at":"2026-10-20T00:00:00Z"', '"at":"2099-01-01T00:00:00Z"');
+    const grants = roundExtensionGrants([future], { repo: WE, pr: 5654, standingRuling: scope() });
+    // The ledger's round as of the anchor: fixed at 12 for the real post time, growing for any later time.
+    for (const reviewedHeads of [12, 13, 20]) {
+      const roundAt = (at) => (Date.parse(at) <= Date.parse('2026-10-20T12:00:00Z') ? 12 : reviewedHeads);
+      expect(gateRoundCap({ cap: 5, grants, roundAt })).toBe(13);
+    }
   });
 });
 
