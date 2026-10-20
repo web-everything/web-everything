@@ -9,6 +9,18 @@ import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+
+it.each([
+  'skills-src/conveyor/review-daemon.mjs',
+  'scripts/operations/review-job.mjs',
+  'scripts/conveyor/reconcile-core.mjs',
+])('imports %s in plain Node without an initialization cycle', entry => {
+  const result = spawnSync(process.execPath, ['-e', `import(${JSON.stringify(`./${entry}`)})`], {
+    cwd: process.cwd(), encoding: 'utf8', timeout: 10000,
+  });
+  expect(result.status, result.stderr).toBe(0);
+});
 
 // Mocked so `defaultReapSessions`'s own describe block below can assert exactly what it passes through
 // WITHOUT ever shelling a real `claude agents`/`claude stop`/`gh` call — this repo's own hard rule (never touch
@@ -41,7 +53,7 @@ vi.mock('../../../scripts/conveyor/human-surface-repark.mjs', async (importOrigi
 });
 
 import {
-  runDaemonLoop, runReviewTick, runReviewTickAllRepos, REVIEW_DAEMON_REPOS, buildCliDaemonEffects, realSleep,
+  planRedTeamRequestAction, runDaemonLoop, runReviewTick, runReviewTickAllRepos, REVIEW_DAEMON_REPOS, buildCliDaemonEffects, realSleep,
   REVIEW_DAEMON_LEASE_KEY, DEFAULT_INTERVAL_MS, defaultReapSessions, hasStaleMainRefusal, defaultAcquirableLaneCount,
   explainPendingNotDispatched, priorityNamesForLiveProcessPrs, runConvertAdvisoryTick, runConvertAdvisoryTickAllRepos,
   resolveConvertAdvisoryEnabled, sweepReviewHolds, operatorHoldsFromPlan, formatOperatorHoldsRecord, OPERATOR_HOLD_KINDS,
@@ -1869,4 +1881,206 @@ describe('operator-hold snapshots (card 5653)', () => {
     fx2.onTick({ skipped: true, reason: 'tick-in-progress', repos: [], dispatched: [], failed: [], refusals: [], reconcileFailed: [], reviewsOwed: 0 });
     expect(skipped.some((l) => l.includes('operator-holds'))).toBe(false);
   });
+});
+
+describe('drain red-team request consumption', () => {
+  it.each([
+    ['evidence present', { runId: 'review-pr-current' }, true, 2, 'job'],
+    ['carried accept', null, true, 2, 'fresh-review'],
+    ['setting off', null, false, 2, 'job'],
+    ['at cap', null, true, 5, 'skip'],
+    ['above cap', null, true, 11, 'skip'],
+    ['evidence at cap', { runId: 'review-pr-current' }, true, 5, 'job'],
+    ['setting off at cap', null, false, 5, 'job'],
+  ])('%s respects evidence, settings and round budget', (_name, evidence, setting, round, action) => {
+    const request = { repo: 'web-everything/web-everything', pr: 5616, head: '690d3e57' + 'a'.repeat(32) };
+    const subject = { number: request.pr, headRefOid: request.head, isDraft: false,
+      labels: ['review:accepted', 'ready-to-merge', { name: `review-round:${round}` }] };
+    const plan = { dispatch: [], refusals: [{ prNumber: request.pr, kind: 'nothing-owed', phase: 'queued', attempts: round, cap: 5 }] };
+    const dispatch = vi.fn(() => ({ mode: 'job', jobPid: 123 }));
+    const finish = vi.fn();
+    const tagRound = vi.fn();
+    const log = vi.fn();
+    const readReviewEvidence = vi.fn(() => evidence);
+    const tick = runReviewTick({ repo: request.repo, reconcile: () => plan,
+      readPrs: () => [subject], readAgents: () => [], readRedTeamRequests: () => [request, request],
+      readReviewEvidence, redTeamTimingSetting: () => ({ value: { carriedAcceptTriggersReview: setting },
+        sources: { carriedAcceptTriggersReview: 'standard' } }), log,
+      finishRedTeamRequest: finish, dispatch, tagRound, tagStatus: () => {},
+    });
+    expect(dispatch).toHaveBeenCalledTimes(action === 'skip' ? 0 : 1);
+    expect(finish).not.toHaveBeenCalled();
+    expect(tagRound).toHaveBeenCalledTimes(action === 'fresh-review' ? 1 : 0);
+    expect(log.mock.calls.filter(([line]) => line.includes('carriedAcceptTriggersReview='))).toEqual([
+      [`review-daemon: redTeam.carriedAcceptTriggersReview=${setting} (source: standard)`],
+    ]);
+    if (action === 'fresh-review') {
+      expect(dispatch.mock.calls[0][0]).not.toHaveProperty('drainRedTeamRequest');
+      expect(dispatch.mock.calls[0][0]).not.toHaveProperty('expectedRedTeamHead');
+      expect(tagRound).toHaveBeenCalledWith(expect.objectContaining({ pr: request.pr, round: round + 1 }));
+      expect(readReviewEvidence).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledWith('review-daemon: dispatching fresh review for #5616 @690d3e57 (carried accept, no review evidence)');
+    } else if (action === 'job') {
+      expect(dispatch.mock.calls[0][0].drainRedTeamRequest).toEqual(request);
+    } else {
+      expect(log).toHaveBeenCalledWith('review-daemon: review round cap reached for #5616');
+      expect(tick.reviewsOwed).toBe(0);
+    }
+    const dryRun = planRedTeamRequestAction({ request, subject, evidence, setting, atRoundCap: round >= 5 });
+    expect(dryRun.action).toBe(action);
+    if (action === 'fresh-review') expect(dryRun.reason).toBe('would dispatch fresh review for #5616 @690d3e57');
+    expect(subject.labels).toEqual(['review:accepted', 'ready-to-merge', { name: `review-round:${round}` }]);
+  });
+
+  it('does not dispatch after 3 rearms before and 2 advisories after an operator verdict at cap 5', async () => {
+    const { planReconcile } = await import('../../../scripts/conveyor/reconcile-core.mjs');
+    const { REARM_COMMENT_MARKER } = await import('../../../scripts/conveyor/rearm-review.mjs');
+    const { ADVISORY_NOTE_MARKER } = await import('../../../scripts/conveyor/advisory-round-count.mjs');
+    const request = { repo: 'web-everything/web-everything', pr: 5616, head: 'a'.repeat(40) };
+    const comment = body => ({ body, author: { login: 'chalbert' } });
+    const subject = { number: request.pr, headRefOid: request.head, state: 'OPEN', isDraft: false,
+      labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }], comments: [
+        ...Array.from({ length: 3 }, () => comment(REARM_COMMENT_MARKER)),
+        { ...comment('🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\nFix required.'),
+          id: 'operator-send-back', createdAt: '2026-10-01T11:00:53Z' },
+        ...Array.from({ length: 2 }, () => comment(ADVISORY_NOTE_MARKER)),
+      ] };
+    const plan = planReconcile({ repo: 'we', prs: [subject], agents: [], roundCap: 5 });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'nothing-owed', phase: 'queued',
+      operatorFixBudget: { verdictId: 'operator-send-back', attempts: 5, cap: 5 } })]);
+    const dispatch = vi.fn();
+    const log = vi.fn();
+    const tick = runReviewTick({ repo: request.repo, reconcile: () => plan,
+      readPrs: () => [subject], readAgents: () => [], readRedTeamRequests: () => [request],
+      readReviewEvidence: () => null,
+      redTeamTimingSetting: () => ({ value: { carriedAcceptTriggersReview: true },
+        sources: { carriedAcceptTriggersReview: 'standard' } }),
+      dispatch, log, tagRound: vi.fn(), tagStatus: () => {},
+    });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(tick.reviewsOwed).toBe(0);
+    // main's reconcile now reports the exact operator-fix budget (5/5), so the gate refuses on the cap itself.
+    expect(log).toHaveBeenCalledWith('review-daemon: review round cap reached for #5616');
+  });
+
+  it.each([{ cap: 5 }, { attempts: 0 }, { attempts: NaN, cap: 5 }, { attempts: 0, cap: 0 }])(
+    'skips fresh review when the reconcile budget is incomplete or invalid: %j', budget => {
+      const request = { repo: 'web-everything/web-everything', pr: 5616, head: 'a'.repeat(40) };
+      const subject = { number: request.pr, headRefOid: request.head,
+        labels: ['review:accepted', 'ready-to-merge'] };
+      const dispatch = vi.fn();
+      const log = vi.fn();
+      runReviewTick({ repo: request.repo,
+        reconcile: () => ({ dispatch: [], refusals: [{ prNumber: request.pr,
+          kind: 'nothing-owed', phase: 'queued', ...budget }] }),
+        readPrs: () => [subject], readAgents: () => [], readRedTeamRequests: () => [request],
+        readReviewEvidence: () => null,
+        redTeamTimingSetting: () => ({ value: { carriedAcceptTriggersReview: true },
+          sources: { carriedAcceptTriggersReview: 'standard' } }),
+        dispatch, log, tagStatus: () => {},
+      });
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(log).toHaveBeenCalledWith('review-daemon: skipping fresh review for #5616: exact reconcile attempts/cap unavailable');
+    });
+
+  it('resolves the carried-accept setting through the timing policy cascade', async () => {
+    const { resolveRedTeamTiming } = await import('../../../scripts/lib/red-team-gate.mjs');
+    expect(resolveRedTeamTiming().value.carriedAcceptTriggersReview).toBe(true);
+    expect(resolveRedTeamTiming().sources.carriedAcceptTriggersReview).toBe('standard');
+    const file = { redTeam: { carriedAcceptTriggersReview: false } };
+    expect(resolveRedTeamTiming({ platform: { carriedAcceptTriggersReview: false } }).sources.carriedAcceptTriggersReview).toBe('platform');
+    expect(resolveRedTeamTiming({ file }).value.carriedAcceptTriggersReview).toBe(false);
+    expect(resolveRedTeamTiming({ file }).sources.carriedAcceptTriggersReview).toBe('tool');
+    const overridden = resolveRedTeamTiming({ file, env: { WE_RED_TEAM_CARRIED_ACCEPT_TRIGGERS_REVIEW: 'true' } });
+    expect(overridden.value.carriedAcceptTriggersReview).toBe(true);
+    expect(overridden.sources.carriedAcceptTriggersReview).toBe('env');
+    expect(resolveRedTeamTiming({ file, env: { WE_RED_TEAM_CARRIED_ACCEPT_TRIGGERS_REVIEW: 'invalid' } }).value.carriedAcceptTriggersReview).toBe(false);
+  });
+
+  it.each(['current', 'stale', 'paused', 'refused', 'skipped', 'no-lanes', 'sent-back'])('dispatches only a current unheld request (%s)', mode => {
+    const request = { repo: CONSTELLATION_REPOS.we?.slug ?? 'web-everything/web-everything', pr: 5485, head: 'b'.repeat(40) };
+    const dispatch = vi.fn(() => mode === 'skipped' ? { skipped: 'live-job' } : { mode: 'job', jobPid: 123 });
+    const finish = vi.fn();
+    const tagRound = vi.fn();
+    runReviewTick({ repo: request.repo, paused: mode === 'paused',
+      reconcile: () => ({ dispatch: [], refusals: mode === 'refused' ? [{ prNumber: 5485, kind: 'live-process' }] : [] }),
+      readPrs: () => [{ number: 5485, headRefOid: mode === 'stale' ? 'c'.repeat(40) : request.head, labels: ['review:accepted', 'ready-to-merge', ...(mode === 'sent-back' ? ['review:changes'] : [])] }],
+      acquirableLanes: () => mode === 'no-lanes' ? 0 : 1,
+      readAgents: () => [], readRedTeamRequests: () => [request], finishRedTeamRequest: finish,
+      dispatch, tagRound, tagStatus: () => {},
+    });
+    expect(tagRound).not.toHaveBeenCalled();
+    expect(dispatch).toHaveBeenCalledTimes(['current', 'skipped'].includes(mode) ? 1 : 0);
+    expect(finish).toHaveBeenCalledTimes(mode === 'stale' ? 1 : 0);
+    if (mode === 'stale') expect(finish).toHaveBeenCalledWith(request, { status: 'stale' });
+  });
+});
+
+it('pins a requested review to the head from its durable request at the live dispatch CI read', async () => {
+  const { headBoundRedTeamCiGate } = await import('../review-daemon.mjs');
+  const gate = vi.fn(() => ({ allowed: true, headSha: 'c'.repeat(40) }));
+  expect(headBoundRedTeamCiGate(gate, 'b'.repeat(40))({ pr: 5485 })).toMatchObject({ allowed: false, reason: 'head-changed' });
+  expect(headBoundRedTeamCiGate(gate, 'c'.repeat(40))({ pr: 5485 })).toMatchObject({ allowed: true });
+  expect(headBoundRedTeamCiGate(() => ({ allowed: false, headSha: 'c'.repeat(40) }), 'c'.repeat(40))({})).toMatchObject({ allowed: false });
+});
+
+it.each([
+  [5461, 'ff45ed96c40644e5537370df84b6b30328b1a73e', 'review-round:11'],
+  [5485, 'e57c222ec2d3b998f3b007202b6155f4c9aa1534', 'review-round:5'],
+  [5487, '1cbf326956bd56f0480ff93918b949b545fff4c8', 'review-round:3'],
+])('dispatches the never-scheduled live PR #%s shape including red-team:pending', (pr, head, round) => {
+  const request = { repo: 'web-everything/web-everything', pr, head };
+  const dispatch = vi.fn(() => ({ mode: 'job', jobPid: 123 }));
+  const finish = vi.fn();
+  runReviewTick({ repo: request.repo, reconcile: () => ({ dispatch: [], refusals: [{ prNumber: pr, kind: 'nothing-owed', phase: 'queued' }] }),
+    readPrs: () => [{ number: pr, headRefOid: head, isDraft: false, labels:
+      ['review:accepted', 'ready-to-merge', 'status:ready-to-merge', 'red-team:pending', round].map(name => ({ name })) }],
+    readAgents: () => [], acquirableLanes: () => 1, readRedTeamRequests: () => [request], finishRedTeamRequest: finish,
+    dispatch, tagRound: () => {}, tagStatus: () => {},
+  });
+  expect(dispatch).toHaveBeenCalledTimes(1);
+  expect(dispatch.mock.calls[0][0].expectedRedTeamHead).toBe(head);
+  expect(finish).not.toHaveBeenCalled();
+  expect(dispatch.mock.calls[0][0].drainRedTeamRequest).toEqual(request);
+});
+
+
+it('passes live PR context to paused-review recovery and raises without re-arming', async () => {
+  const { notifyReferralHold, pausedReviewRearmMarker } = await import('../../../scripts/conveyor/review-referral-hold.mjs');
+  const { record, recordComment, H1, repo, BLOCK } = await import('../../../scripts/conveyor/__tests__/ruling-fixtures.mjs');
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'review-tick-auto-rearm-'));
+  const subject = { number: 3794, headRefOid: H1, body: '<!-- authored-by-actor: author -->', createdAt: '2026-10-03T07:00:00Z', labels: [{ name: 'review:human' }],
+    comments: [recordComment(record({ head: H1, runId: 'run-1', rulings: [BLOCK] }), 5)] };
+  const hold = { kind: 'same-head', head: H1, episode: 'auto-rearm', why: 'review paused: same head' };
+  const post = vi.fn(body => subject.comments.push({ body, author: { login: 'web-everything' }, createdAt: '2026-10-03T09:00:00Z' }));
+  try {
+    for (let tick = 0; tick < 2; tick++) runReviewTick({ repo,
+      reconcile: () => ({ dispatch: [], refusals: [{ kind: 'review-referrals-pending', prNumber: 3794, referralHold: hold }] }),
+      readPrs: () => [subject], readAgents: () => [], holdReconcile: () => [],
+      tagRound: vi.fn(), tagStatus: vi.fn(), dispatch: vi.fn(),
+      notifyReferral: args => notifyReferralHold({ ...args, dir, post, log: vi.fn(), readPr: () => subject }),
+    });
+    expect(post.mock.calls.filter(([body]) => body.includes(pausedReviewRearmMarker(H1)))).toHaveLength(0);
+    expect(post.mock.calls.filter(([body]) => body.includes('Waiting on your ruling'))).toHaveLength(1);
+    expect(subject.labels).toEqual([{ name: 'review:human' }]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it.each(['allowed', 'refused', 'foreign', 'unreadable'])('main-fix red-team request takes the first lane (%s)', mode => {
+  const repo = CONSTELLATION_REPOS.we?.slug ?? 'web-everything/web-everything';
+  const requests = [43, 42].map(pr => ({ repo, pr, head: 'b'.repeat(40) }));
+  const dispatch = vi.fn(() => ({ mode: 'job', jobPid: 123 }));
+  runReviewTick({ repo,
+    readMainFixPr: () => { if (mode === 'unreadable') throw Error('unreadable'); return { repo: mode === 'foreign' ? 'fui' : 'we', pr: 42 }; },
+    reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 44 }], refusals: mode === 'refused' ? [{ prNumber: 42, kind: 'live-process' }] : [] }),
+    readPrs: () => requests.map(r => ({ number: r.pr, headRefOid: r.head, labels: ['review:accepted', 'ready-to-merge'] })),
+    readAgents: () => [], readRedTeamRequests: () => requests, acquirableLanes: () => 1,
+    dispatch, tagRound: () => {}, tagStatus: () => {},
+  });
+  expect(dispatch).toHaveBeenCalledTimes(1);
+  expect(dispatch.mock.calls[0][0].pr).toBe(mode === 'allowed' ? 42 : 44);
 });

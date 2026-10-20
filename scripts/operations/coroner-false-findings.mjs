@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { readGhJson } from '../lib/proc-read.mjs';
-import { readOperatorRulings, readReferralRecords } from '../lib/jury-core.mjs';
+import { sameRepo, readOperatorRulings, readReferralRecords } from '../lib/jury-core.mjs';
 import { normalizeComment } from './coroner-rounds.mjs';
 import { readShadowRows, resolveShadowAgreementPath } from '../lib/review-shadow-agreement.mjs';
 import { FALSE_FINDING_CAUSES } from '../lib/false-finding-causes.mjs';
@@ -40,7 +40,7 @@ export function falseFindingsForPr({ repo, pr, prType = 'unknown', comments, win
   const records = normalized.flatMap(c => readReferralRecords([c], { repo, pr }).records.map(r => ({ ...r, at: c.createdAt ?? c.created_at })));
   const out = [];
   for (const r of rulings) {
-    if (r.repo !== repo || r.pr !== pr || r.result !== 'not-real' || !inWindow(r.at, window)) continue;
+    if (!sameRepo(r.repo, repo) || r.pr !== pr || r.result !== 'not-real' || !inWindow(r.at, window)) continue;
     const [lens, file, line, claim] = keyParts(r.key);
     const same = key => { const p = keyParts(key); return p[0] === lens && p[1] === file && p[3] === claim; };
     const reviewerNotReal = records.flatMap(rec => (rec.rulings ?? []).filter(o => o.result === 'not-real' && same(o.key)).map(() => rec.at));

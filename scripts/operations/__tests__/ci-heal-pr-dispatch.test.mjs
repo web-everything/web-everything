@@ -67,10 +67,13 @@ beforeAll(() => {
   savedLockRoot = process.env.WE_GH_THROTTLE_LOCK_ROOT;
   isolatedLockRoot = mkdtempSync(join(tmpdir(), 'ci-heal-dispatch-lockroot-'));
   process.env.WE_GH_THROTTLE_LOCK_ROOT = isolatedLockRoot;
+  // Hermetic: the real file-item path must not allocate a card number over git/network (slice 0).
+  process.env.WE_NUMBER_AT_BIRTH = 'off';
 });
 afterAll(() => {
   if (savedLockRoot === undefined) delete process.env.WE_GH_THROTTLE_LOCK_ROOT;
   else process.env.WE_GH_THROTTLE_LOCK_ROOT = savedLockRoot;
+  delete process.env.WE_NUMBER_AT_BIRTH;
   rmSync(isolatedLockRoot, { recursive: true, force: true });
 });
 

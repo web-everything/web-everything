@@ -6,7 +6,7 @@
  *   header for the full incident and the live before/after evidence gathered against the real branch.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { gitRun, parseIsShallow, ensureFullHistory } from '../git-run.mjs';
+import { gitRun, hashObjectVerified, parseIsShallow, ensureFullHistory } from '../git-run.mjs';
 
 describe('gitRun', () => {
   it('kills a timed-out command and reports failure with the timeout and first argument', () => {
@@ -103,4 +103,25 @@ describe('ensureFullHistory', () => {
     expect(r).toEqual({ ok: true, wasShallow: false, unshallowed: false });
     expect(calls).toHaveLength(1);
   });
+});
+
+it('reports the spawn error when no stderr was produced', () => {
+  const r = gitRun('/nonexistent/we-missing-git-executable', ['hash-object', '--stdin']);
+  expect(r.status).toBe(1);
+  expect(r.stderr).toContain('git hash-object failed to run: ENOENT');
+  expect(r.stderr).toMatch(/spawnSync.*ENOENT/);
+});
+it('reports a terminating signal even when the process writes no stderr', () => {
+  const r = gitRun(process.execPath, ['-e', 'process.kill(process.pid, "SIGKILL")']);
+  expect(r.status).toBe(1);
+  expect(r.stderr).toContain('terminated by signal SIGKILL');
+});
+it.each([
+  [{ status: 7, stdout: '', stderr: 'spawn failed' }, /exit status 7; spawn failed/],
+  [{ status: 0, stdout: '', stderr: '' }, /exit status 0; empty output/],
+])('includes exit status and empty-output diagnostics in hash-object refusal: %j', (result, diagnostic) => {
+  const r = hashObjectVerified(() => result, 'card text', { label: 'card.md' });
+  expect(r.ok).toBe(false);
+  expect(r.reason).toMatch(/^hash-object card.md failed/);
+  expect(r.reason).toMatch(diagnostic);
 });
