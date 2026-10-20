@@ -13,7 +13,7 @@ export default {
   title: 'daemon loops stop when their gh refusal guard cannot be installed',
   card: 'PR #5729',
   fixedBy: {
-    sha: 'working-tree', where: 'lane/grad-gh-auth-2026-10-19',
+    sha: '07a112db9', where: 'lane/grad-gh-auth-2026-10-19',
     paths: ['scripts/lib/github-app-auth-env.mjs', 'scripts/conveyor/await-verify-loop.mjs', 'skills-src/conveyor/pass-daemon.mjs'],
   },
   fixPresent(root) {

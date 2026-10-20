@@ -649,7 +649,9 @@ function unsupportedTargetHost(argv, env) {
     '--assignee', '--reviewer', '--milestone', '--project', '--base', '--head', '--author', '--owner', '--limit', '--state']);
   // Short names change arity between commands: checkout -q/-f and merge -m/-s/-a are booleans.
   // Exempt content values only where their consuming option is known; uncertain URL arguments refuse.
-  const command = argv[0] + ' ' + argv[1];
+  // Built-in aliases have the same argument arity and target positions as their commands.
+  const subcommand = ({ new: 'create', ls: 'list', co: 'checkout' })[argv[1]] || argv[1];
+  const command = (argv[0] === 'cs' ? 'codespace' : argv[0]) + ' ' + subcommand;
   if (argv[0] === 'api') for (const flag of ['-F', '-f', '-H', '-X', '-q', '-t']) valueFlags.add(flag);
   if (['pr create', 'pr edit', 'pr merge', 'issue create', 'issue edit'].includes(command)) {
     for (const flag of ['-b', '-F', '-t']) valueFlags.add(flag);
@@ -660,29 +662,45 @@ function unsupportedTargetHost(argv, env) {
   if (['pr view', 'pr list', 'pr status', 'pr checks', 'issue view', 'issue list', 'issue status', 'repo view'].includes(command)) {
     for (const flag of ['-q', '-t']) valueFlags.add(flag);
   }
-  if (command === 'repo create') for (const flag of ['-d', '-h']) valueFlags.add(flag);
-  if (command === 'repo clone') for (const flag of ['-o', '--origin', '--upstream-remote-name']) valueFlags.add(flag);
+  if (command === 'workflow run') for (const flag of ['-f', '-F']) valueFlags.add(flag);
+  if (['pr list', 'issue list'].includes(command)) valueFlags.add('-S');
+  const repositoryContentFlags = {
+    'repo clone': ['-o', '--origin', '-u', '--upstream-remote-name'],
+    'repo create': ['-d', '--description', '-h', '--homepage', '-g', '--gitignore', '-l', '--license',
+      '-r', '--remote', '-s', '--source', '-t', '--team'],
+    'repo edit': ['--add-topic', '--default-branch', '-d', '--description', '-h', '--homepage',
+      '--remove-topic', '--squash-merge-commit-message', '--visibility'],
+    'repo fork': ['--fork-name', '--org', '--remote-name'],
+    'repo sync': ['-b', '--branch'],
+    'repo view': ['-b', '--branch'],
+  }[command] || [];
+  for (const flag of repositoryContentFlags) valueFlags.add(flag);
   const repositoryPositionals = (argv[0] === 'repo' && ['archive', 'clone', 'create', 'delete', 'edit',
-    'fork', 'rename', 'set-default', 'sync', 'unarchive', 'view'].includes(argv[1])) || command === 'label clone';
+    'fork', 'rename', 'set-default', 'sync', 'unarchive', 'view'].includes(subcommand)) || command === 'label clone';
   // --template is output content elsewhere, but repo create uses it as a source repository.
   const repositoryFlags = command === 'repo create' ? ['--template', '-p'] : command === 'repo sync' ? ['--source', '-s'] : [];
   // Only advance over known boolean shorthands. An unknown shorthand may consume the
   // rest of the argument as content (-fR=... is a workflow field, not a repo selector).
   const booleanShorthands = {
     'pr view': 'cw', 'issue view': 'cw', 'repo view': 'w',
-    'pr list': 'dw', 'pr create': 'defw', 'issue create': 'ew', 'pr checks': 'w',
-    'pr checkout': 'f', 'pr merge': 'admrs', 'pr comment': 'ce', 'issue comment': 'ce',
+    'pr list': 'dw', 'issue list': 'w', 'pr status': 'c', 'pr create': 'defw', 'issue create': 'ew', 'pr checks': 'w',
+    'pr checkout': 'f', 'pr merge': 'admrs', 'pr comment': 'cew', 'issue comment': 'cew',
     'pr close': 'd', 'pr diff': 'w', 'pr ready': 'u', 'pr review': 'acr', 'pr update-branch': 'r',
+    'pr revert': 'd',
     'issue delete': 'y', 'issue develop': 'cl',
     'repo create': 'ci', 'repo sync': 'f', 'repo fork': 'cr',
     'repo archive': 'y', 'repo unarchive': 'y', 'repo delete': 'y', 'repo deploy-key': 'w',
+    'repo rename': 'y', 'repo autolink': 'nw',
     'release create': 'dp', 'release delete': 'cy', 'release delete-asset': 'y', 'release upload': 'c', 'release view': 'w',
     'run list': 'a', 'run view': 'evw', 'run watch': 'e', 'run rerun': 'df',
     'workflow list': 'a', 'workflow view': 'wy', 'cache delete': 'a',
-    'label create': 'f', 'label clone': 'f', 'label delete': 'y',
+    'label create': 'f', 'label clone': 'f', 'label delete': 'y', 'label list': 'w',
+    'ruleset check': 'w', 'ruleset list': 'pw', 'ruleset view': 'pw',
+    'codespace code': 'w', 'codespace cp': 'er', 'codespace create': 'sw',
+    'codespace delete': 'f', 'codespace list': 'w', 'codespace logs': 'f', 'codespace ssh': 'd',
     'secret set': 'u', 'secret list': 'u', 'secret delete': 'u',
     'search code': 'w', 'search commits': 'w', 'search issues': 'w', 'search prs': 'w', 'search repos': 'w',
-  }[command] || '';
+  }[command] || (argv[0] === 'browse' ? 'anprsw' : '');
   let cloneSourceSeen = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];

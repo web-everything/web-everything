@@ -1936,6 +1936,10 @@ Positional repository targets use the same host parser as `-R`, including single
 Check repository selectors in short-option bundles too (`-cRhost/owner/repo`), and
 source repositories in create templates and sync sources. Known content options consume
 their attached values; clone destinations and asset paths remain local arguments.
+Built-in aliases (including `repo new`) use canonical argument rules. Cover clone `-u`
+and repository branch/source option values before classifying positional targets. An
+enterprise selector after a boolean bundle must still reach the host parser;
+keep the command's boolean shorthands aligned with the supported CLI options.
 URL text in bodies, titles, and API fields is content rather than a target host.
 Unknown aliases, extension execution, and ambiguous URL-valued options refuse by default;
 their command expansion cannot prove which credential gh will select. Short flag arity
