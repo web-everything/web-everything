@@ -16,7 +16,8 @@
  *   one `git fetch`. The operation's own guards are unchanged.
  */
 
-import { spawnSync } from 'node:child_process';
+import { spawnSync, spawn as spawnChild } from 'node:child_process';
+import { constants } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -24,6 +25,33 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const SHA_RE = /^[0-9a-f]{40}$/;
 
 const defaultSpawn = (cmd, args, opts) => spawnSync(cmd, args, { encoding: 'utf8', ...opts });
+const operationGroups = process.platform !== 'win32';
+
+function signalOperation(child, signal) {
+  if (!child) return;
+  try {
+    if (operationGroups && child.pid) process.kill(-child.pid, signal);
+    else child.kill(signal);
+  } catch (error) {
+    // An exited group needs no signal. Other failures retain the lease until the operation actually stops.
+    if (error.code !== 'ESRCH') process.stderr.write(`run-fresh: could not forward ${signal}: ${error.message}\n`);
+  }
+}
+
+/** A cancelled operation may have left a writing subprocess behind. Zombies cannot write and need no wait. */
+async function waitForGroupStop(pid) {
+  for (;;) {
+    try { process.kill(-pid, 0); } catch (error) { if (error.code === 'ESRCH') return; }
+    const members = defaultSpawn('ps', ['-ax', '-o', 'pgid=,stat='],
+      { stdio: ['ignore', 'pipe', 'pipe'], timeout: 1000 });
+    if (members.status === 0 && !String(members.stdout).split('\n').some((line) => {
+      const [group, state] = line.trim().split(/\s+/);
+      return group === String(pid) && !state?.startsWith('Z');
+    })) return;
+    // Retain the lease if live processes remain or process inspection fails.
+    await new Promise((resolvePoll) => setTimeout(resolvePoll, 100));
+  }
+}
 
 /** Parse `lane-pool.mjs acquire --json` stdout. `{lane, path, holder}` or null. Pure. */
 export function parseAcquire(stdout) {
@@ -35,51 +63,77 @@ export function parseAcquire(stdout) {
 }
 
 /**
- * @returns {number} the exit code (the operation's own, or 1 for a refusal before it ran).
+ * @returns {Promise<number>} the exit code (the operation's own, or 1 for a refusal before it ran).
  */
-export function runFresh(argv, { spawn = defaultSpawn, root = REPO_ROOT, log = (m) => process.stderr.write(`${m}\n`) } = {}) {
-  const [op, ...rest] = argv;
-  if (!op || op.startsWith('-')) { log('usage: node scripts/run-fresh.mjs <operation> [--flag=value …]'); return 1; }
-  const pool = join(root, 'scripts', 'lane-pool.mjs');
-  const acq = spawn(process.execPath, [pool, 'acquire', `--purpose=run-fresh-${op}`, '--json', '--wait-ms=300000', `--repo=${root}`],
-    { cwd: root, stdio: ['ignore', 'pipe', 'inherit'] });
-  const lease = acq.status === 0 ? parseAcquire(acq.stdout) : null;
-  if (!lease) { log(`run-fresh: REFUSED — could not lease a fresh lane (lane-pool acquire exited ${acq.status}); nothing ran`); return 1; }
-  let code = 1;
-  try {
-    const git = (args) => spawn('git', ['-C', lease.path, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
-    const fetched = git(['fetch', '--quiet', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
-    const head = String(git(['rev-parse', 'HEAD']).stdout ?? '').trim();
-    const main = String(git(['rev-parse', 'refs/remotes/origin/main']).stdout ?? '').trim();
-    if (fetched.status !== 0 || !SHA_RE.test(head) || head !== main) {
-      log(`run-fresh: REFUSED — lane-${lease.lane} is not at origin/main (HEAD ${head || '?'}, origin/main ${main || '?'}`
-        + `${fetched.status !== 0 ? ', fetch failed' : ''}); nothing ran`);
-      return 1;
+export function runFresh(argv, { spawn = defaultSpawn, spawnOperation = spawnChild, root = REPO_ROOT, log = (m) => process.stderr.write(`${m}\n`), proc = process } = {}) {
+  return withSignalsDeferred(async (cancellation) => {
+    const [op, ...rest] = argv;
+    if (!op || op.startsWith('-')) { log('usage: node scripts/run-fresh.mjs <operation> [--flag=value …]'); return 1; }
+    const pool = join(root, 'scripts', 'lane-pool.mjs');
+    const acq = spawn(process.execPath, [pool, 'acquire', `--purpose=run-fresh-${op}`, '--json', '--wait-ms=300000', `--repo=${root}`],
+      { cwd: root, stdio: ['ignore', 'pipe', 'inherit'] });
+    const lease = acq.status === 0 ? parseAcquire(acq.stdout) : null;
+    if (!lease) { log(`run-fresh: REFUSED — could not lease a fresh lane (lane-pool acquire exited ${acq.status}); nothing ran`); return 1; }
+    let code = 1;
+    try {
+      const git = (args) => spawn('git', ['-C', lease.path, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+      const fetched = git(['fetch', '--quiet', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
+      const head = String(git(['rev-parse', 'HEAD']).stdout ?? '').trim();
+      const main = String(git(['rev-parse', 'refs/remotes/origin/main']).stdout ?? '').trim();
+      if (fetched.status !== 0 || !SHA_RE.test(head) || head !== main) {
+        log(`run-fresh: REFUSED — lane-${lease.lane} is not at origin/main (HEAD ${head || '?'}, origin/main ${main || '?'}`
+          + `${fetched.status !== 0 ? ', fetch failed' : ''}); nothing ran`);
+        return 1;
+      }
+      // Deliver signals queued during synchronous acquire/fetch before starting an operation that can write.
+      await new Promise((resolveTurn) => setImmediate(resolveTurn));
+      if (cancellation.signal) return 128 + constants.signals[cancellation.signal];
+      log(`run-fresh: running ${op} from lane-${lease.lane} at origin/main ${head.slice(0, 9)}`);
+      const child = spawnOperation(process.execPath, [join(lease.path, 'scripts', 'operations', 'run.mjs'), op, ...rest],
+        { cwd: lease.path, stdio: 'inherit', detached: operationGroups });
+      const run = await new Promise((resolveRun) => {
+        cancellation.child = child;
+        child.once('error', (error) => log(`run-fresh: could not run ${op}: ${error.message}`));
+        // close follows exit/error and waits for stdio too; only then is it safe to release the lane.
+        child.once('close', (status, signal) => {
+          resolveRun({ status, signal });
+        });
+        if (cancellation.signal) signalOperation(child, cancellation.signal);
+      });
+      if (cancellation.signal && operationGroups && child.pid) await waitForGroupStop(child.pid);
+      cancellation.child = null;
+      code = typeof run.status === 'number' && run.status >= 0 ? run.status
+        : (run.signal ? 128 + constants.signals[run.signal] : 1);
+      return code;
+    } finally {
+      const rel = spawn(process.execPath, [pool, 'release', `--lane=${lease.lane}`, `--session=${lease.holder}`, `--repo=${root}`],
+        { cwd: root, stdio: ['ignore', 'ignore', 'inherit'] });
+      if (rel.status !== 0) log(`run-fresh: lane-${lease.lane} was not released (exit ${rel.status}); release it: node scripts/lane-pool.mjs release --lane=${lease.lane} --session=${lease.holder}`);
     }
-    log(`run-fresh: running ${op} from lane-${lease.lane} at origin/main ${head.slice(0, 9)}`);
-    const run = spawn(process.execPath, [join(lease.path, 'scripts', 'operations', 'run.mjs'), op, ...rest],
-      { cwd: lease.path, stdio: 'inherit' });
-    code = typeof run.status === 'number' ? run.status : (run.signal ? 130 : 1);
-    return code;
-  } finally {
-    const rel = spawn(process.execPath, [pool, 'release', `--lane=${lease.lane}`, `--session=${lease.holder}`, `--repo=${root}`],
-      { cwd: root, stdio: ['ignore', 'ignore', 'inherit'] });
-    if (rel.status !== 0) log(`run-fresh: lane-${lease.lane} was not released (exit ${rel.status}); release it: node scripts/lane-pool.mjs release --lane=${lease.lane} --session=${lease.holder}`);
-  }
+  }, { proc });
 }
 
 /**
- * Keep this process alive through Ctrl-C / SIGTERM / SIGHUP while the operation runs: the operation (same process
- * group, inherited terminal) receives the signal and decides how to stop, and this process then still reaches the
- * lane release in `runFresh`'s `finally` instead of dying with the lease held. Removed once the run returns.
+ * Forward cancellation to the active operation group, but keep the wrapper alive until it stops and releases its lane.
+ * A child that handles the signal and exits successfully still leaves the wrapper with a cancellation exit code.
+ * Listeners remain installed across the asynchronous wait and are removed after cleanup finishes.
  */
-export function withSignalsDeferred(fn, { proc = process } = {}) {
+export async function withSignalsDeferred(fn, { proc = process } = {}) {
   const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'];
-  const noop = () => {};
-  for (const s of signals) proc.on(s, noop);
-  try { return fn(); } finally { for (const s of signals) proc.off(s, noop); }
+  const cancellation = { signal: null, child: null };
+  const handlers = signals.map((signal) => [signal, () => {
+    cancellation.signal ??= signal;
+    signalOperation(cancellation.child, signal);
+  }]);
+  for (const [signal, handler] of handlers) proc.on(signal, handler);
+  try {
+    const code = await fn(cancellation);
+    return cancellation.signal ? 128 + constants.signals[cancellation.signal] : code;
+  } finally {
+    for (const [signal, handler] of handlers) proc.off(signal, handler);
+  }
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  process.exitCode = withSignalsDeferred(() => runFresh(process.argv.slice(2)));
+  process.exitCode = await runFresh(process.argv.slice(2));
 }
