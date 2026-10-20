@@ -702,7 +702,11 @@ export function createCardGrouping({
         const withFiles = [];
         for (const c of cands) {
           const sf = sourceFiles({ base, headSha: c.headSha, cwd, run });
-          if (sf && cardOnlyFiles(sf.files)) withFiles.push({ ...c, files: sf.files });
+          if (!sf || !cardOnlyFiles(sf.files)) continue;
+          // The SAME reservation holdFor applies: a card file an open group reserves waits for that group.
+          const reserved = cardGroupHold(st, { num: c.num, repo: localSlug, localSlug, files: sf.files });
+          if (reserved) { say(`#${c.num} left out (${reserved.reason}) — waits for that group`); continue; }
+          withFiles.push({ ...c, files: sf.files });
         }
         let plans = planCardGroups({ candidates: withFiles, maxSize: setting.maxSize })
           .filter(p => !(st.failed?.[sourceSetKey(p.sources)] > now() - setting.retryMin * 60_000));
@@ -808,9 +812,14 @@ export function createCardGrouping({
           const claimed = mutate(s => {
             const taken = new Set(s.groups.flatMap(g => g.sources.map(y => Number(y.num))));
             if (record.sources.some(y => taken.has(y.num))) return false;
+            // Re-read under the lock: another open group reserving any of these card files refuses the claim
+            // (two combined PRs on one card would block each other).
+            if (s.groups.some(g => String(g.repo || '').toLowerCase() === String(localSlug).toLowerCase()
+              && (g.files ?? []).some(f => record.files.includes(f)))) return 'reserved';
             s.groups.push(record);
             return true;
           });
+          if (claimed?.ok && claimed.result === 'reserved') return { ok: false, reason: 'a card file is reserved by another open card group' };
           if (!claimed?.ok || claimed.result !== true) return { ok: false, reason: 'a source joined another group meanwhile' };
           return { ok: true };
         });

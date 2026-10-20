@@ -403,6 +403,20 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     expect(mk(t12, join(d, 'm.json')).form({ verdicts: t12.verdicts, early: t12.verdicts, admitted: new Map([[1, t12.a], [2, t12.a]]) }).reason).toMatch(/live re-check left fewer than 2/);
     const t13 = setup();
     expect(mk(t13, join(d, 'n.json')).form({ verdicts: t13.verdicts, early: t13.verdicts, admitted: new Map([[1, t13.a]]) }).reason).toMatch(/live re-check left fewer than 2/);
+    // An open group A reserving the card: new accepted PRs on it never form group B — before planning, and
+    // under the lock when A appeared meanwhile.
+    const groupA = { id: 'aaaa', repo: 'o/r', branch: 'lane/card-group-aaaa', pr: 60, sources: [{ num: 50, headSha: 'f'.repeat(40) }], files: [CARD] };
+    const t14 = setup();
+    const pa = join(d, 'r.json');
+    writeFileSync(pa, JSON.stringify({ groups: [groupA], failed: {} }));
+    expect(mk(t14, pa).form({ verdicts: t14.verdicts, early: t14.verdicts, admitted: admit(t14.verdicts) }).reason).toMatch(/no group of 2\+ sharing a card/);
+    expect(readGroupState(pa).groups.map(g => g.id)).toEqual(['aaaa']);
+    const t15 = setup();
+    const pb = join(d, 's2b.json');
+    const racing = fn => { writeFileSync(pb, JSON.stringify({ groups: [groupA], failed: {} })); return { ran: true, result: fn() }; };
+    expect(mk(t15, pb, { withLock: racing }).form({ verdicts: t15.verdicts, early: t15.verdicts, admitted: admit(t15.verdicts) }).reason).toMatch(/reserved by another open card group/);
+    expect(readGroupState(pb).groups.map(g => g.id)).toEqual(['aaaa']);
+    expect(t15.calls.some(c => c.startsWith('pr create'))).toBe(false);
     // A PR already in a recorded group is never offered again.
     const t7 = setup();
     const sp = join(d, 'e.json');
