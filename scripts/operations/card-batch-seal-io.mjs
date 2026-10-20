@@ -99,20 +99,29 @@ export async function publishBatch(input, opts = {}) {
     if (state.seal?.step === 'label-on-green') { await retire(); return { action: 'sealed', state }; }
     // A started seal whose PR already MERGED (landed by another path) can never finish: every remaining step targets
     // an open PR, and terminal retirement accepts only a finished seal. Live: #5680 merged at step record-sealed and
-    // held the prevention slot (and the pending spool behind it). Record a seal failure naming the merge, then retire
+    // held the prevention slot (and the pending spool behind it). Only on the stuck path (a started seal whose next
+    // step failed or was refused) is the PR re-read; if it MERGED, record a seal failure naming the merge and retire
     // through the fresh-read terminal path, which re-reads the PR and archives the batch, freeing the slot. Its cards
     // are on main, so nothing is re-spooled. CLOSED is deliberately not handled here: it stays held as before.
-    // An unreadable view throws as before.
-    if (state.sealedAt && state.pr) {
+    // Returns null (caller keeps its original failure) when the PR is not a matching MERGED one.
+    const recoverMergedSeal = async () => {
+      if (!state.sealedAt || !state.pr) return null;
       const view = JSON.parse(await gh(['pr', 'view', String(state.pr), '--repo', repo, '--json', 'number,state,headRefName']));
-      if (Number(view?.number) === Number(state.pr) && view.headRefName === state.batchRef && view.state === 'MERGED') {
-        state.sealFailure = { reason: `PR MERGED before the seal finished (step ${state.seal?.step ?? 'none'}); the seal cannot resume`,
-          at: new Date(now()).toISOString(), terminalPrState: 'MERGED' };
-        save();
-        const retired = await retire();
-        return { action: 'held', state, retired: retired?.action === 'retired' };
-      }
-    }
+      if (Number(view?.number) !== Number(state.pr) || view.headRefName !== state.batchRef || view.state !== 'MERGED') return null;
+      state.sealFailure = { reason: `PR MERGED before the seal finished (step ${state.seal?.step ?? 'none'}); the seal cannot resume`,
+        at: new Date(now()).toISOString(), terminalPrState: 'MERGED' };
+      save();
+      const retired = await retire();
+      return { action: 'held', state, retired: retired?.action === 'retired' };
+    };
+    // A failed recovery read never masks the original failure.
+    const orRecoverMerged = async (original) => {
+      let recovered = null;
+      try { recovered = await recoverMergedSeal(); } catch { /* keep the original outcome */ }
+      if (recovered) return recovered;
+      if (original instanceof Error) throw original;
+      return original;
+    };
     const restoreProtection = async () => {
       if (!state.restoreProtection) return;
       await gh(['pr', 'edit', String(state.pr), '--repo', repo, '--add-label', HOLD_LABEL]);
@@ -123,7 +132,7 @@ export async function publishBatch(input, opts = {}) {
       save();
     };
     // Pending protection recovery must run even if a subsequent push is no longer adoptable.
-    await restoreProtection();
+    try { await restoreProtection(); } catch (error) { return orRecoverMerged(error); }
     const advertised = String(await run('git', ['ls-remote', '--refs', remote, `refs/heads/${state.batchRef}`]))
       .trim().split(/\s+/)[0];
     if (advertised && advertised !== state.headSha && resolveAdoptDescendantHead(opts) === 'on') {
@@ -164,7 +173,8 @@ export async function publishBatch(input, opts = {}) {
     }
     await restoreProtection();
     let mismatch = await check();
-    if (mismatch) return refuse(mismatch);
+    // A started seal refused here may be a merged PR whose branch moved or was deleted: the stuck path.
+    if (mismatch) return state.sealedAt && mismatch === 'head-mismatch' ? orRecoverMerged(refuse(mismatch)) : refuse(mismatch);
     const plan = planPublish({ state, kind, policy, now: now() });
     bodyPath = `${statePath}.${lease.token}.body.md`;
     writeFileSync(bodyPath, renderBatchBody(state));

@@ -488,18 +488,37 @@ const terminalFixture = (prState) => {
     ? JSON.stringify({ number: 9, state: prState, headRefName: f.state.batchRef }) : f.exec(cmd, args, options)));
   return { f, exec };
 };
-it('#5680: a started seal whose PR already MERGED is archived as a seal failure and frees the slot, never re-held', async () => {
-  const { f, exec } = terminalFixture('MERGED');
+it('#5680: a stuck seal (protection retry fails) whose PR already MERGED is archived and frees the slot', async () => {
+  const { f, exec: base } = terminalFixture('MERGED');
+  // Live shape: restoring protection on a merged PR fails at `ready --undo`.
+  const exec = vi.fn((cmd, args, options) => { if (args.includes('--undo')) throw new Error('pull request is merged'); return base(cmd, args, options); });
   expect(await publishBatch(f.input, { ...f.opts, exec })).toMatchObject({ action: 'held', retired: true });
   expect(JSON.parse(readFileSync(f.statePath, 'utf8'))).toEqual({ seq: 1, lastSealedState: expect.stringContaining('sealed') });
   expect(f.read()).toMatchObject({ terminalPrState: 'MERGED',
     sealFailure: { terminalPrState: 'MERGED', reason: expect.stringContaining('step record-sealed') } });
-  // Two fresh reads: the seal job's own, then the terminal retirement's.
+  // Two fresh reads: the recovery's own, then the terminal retirement's.
   expect(exec.mock.calls.filter(([, a]) => a.includes('number,state,headRefName'))).toHaveLength(2);
-  expect(exec.mock.calls.some(([, args]) => args[1] === 'edit' || args[1] === 'ready')).toBe(false);
-  // The archived generation is terminal: the next scan launches nothing for it.
   const spawn = vi.fn();
   expect(await sealDueBatches({ now: 1000, stateDir: f.dir, policy: f.opts.policy, spawn })).toEqual([]);
+});
+it('#5680: a stuck seal refused for head-mismatch (merged branch deleted) whose PR MERGED is archived', async () => {
+  const { f, exec: base } = terminalFixture('MERGED');
+  writeFileSync(f.statePath, JSON.stringify({ ...JSON.parse(readFileSync(f.statePath, 'utf8')), restoreProtection: undefined, holdApplied: true }));
+  const exec = vi.fn((cmd, args, options) => (args[0] === 'ls-remote' ? '' : base(cmd, args, options)));
+  expect(await publishBatch(f.input, { ...f.opts, exec })).toMatchObject({ action: 'held', retired: true });
+  expect(exec.mock.calls.some(([, args]) => args[1] === 'edit' || args[1] === 'ready')).toBe(false);
+});
+it('the stuck path keeps the original failure when the PR is not merged or the read fails', async () => {
+  for (const view of [() => JSON.stringify({ number: 9, state: 'OPEN', headRefName: 'lane/card-batch-prevention-1' }), () => { throw new Error('gh down'); }]) {
+    const { f, exec: base } = terminalFixture('MERGED');
+    const exec = vi.fn((cmd, args, options) => {
+      if (args.includes('--undo')) throw new Error('protection unavailable');
+      if (args[1] === 'view' && args.includes('number,state,headRefName')) return view();
+      return base(cmd, args, options);
+    });
+    await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toThrow('protection unavailable');
+    expect(JSON.parse(readFileSync(f.statePath, 'utf8')).sealFailure).toBeUndefined();
+  }
 });
 it('a started seal whose PR is CLOSED is left exactly as today (no failure recorded, no retire)', async () => {
   const { f, exec } = terminalFixture('CLOSED');
@@ -517,6 +536,8 @@ it('a started seal whose PR is still open resumes as before', async () => {
     ? JSON.stringify({ number: 9, state: 'OPEN', headRefName: f.state.batchRef }) : f.exec(cmd, args, options)));
   expect((await publishBatch(f.input, { ...f.opts, exec })).action).toBe('sealed');
   expect(f.read().sealFailure).toBeUndefined();
+  // Not stuck: the PR-state read never runs, so retry order is unchanged.
+  expect(exec.mock.calls.some(([, a]) => a.includes('number,state,headRefName'))).toBe(false);
 });
 it('a MERGED view for a different branch is not trusted', async () => {
   const { f } = terminalFixture('MERGED');
