@@ -15,6 +15,11 @@ import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
 import { parseReviewedSha } from '../lib/review-escalation.mjs';
+import { cascadePolicy } from '../lib/policy-cascade.mjs';
+import { publishAttention } from '../operations/needs-you-feed.mjs';
+import { isUnderTest } from '../lib/under-test.mjs';
+import { createActionStore } from '../operations/action-store.mjs';
+import { actionResource } from '../operations/action-record.mjs';
 
 export const REFERRAL_HOLD_MARKER = 'review paused:';
 export const GH_LIST_COMMENT_CAP = 100;
@@ -214,6 +219,41 @@ export function resolveSameHeadMaxReviews(env = process.env) {
 
 /** Extra automatic review runs allowed on one head when none of the prior runs left a verdict on the PR. */
 export const VERDICT_RETRY_EXTRA = 2;
+/** Missing verdicts get bounded cool-down releases after the immediate retry budget is spent: 1h, 2h, 4h, 8h, 8h, ... */
+export const VERDICT_COOLDOWN_BASE_MS = 60 * 60_000;
+export const VERDICT_COOLDOWN_CAP_MS = 8 * 60 * 60_000;
+/** Hard upper bound on cool-down releases per head, whatever any layer says. */
+export const VERDICT_COOLDOWN_MAX_RELEASES = 6;
+/**
+ * `reviewNoVerdictRetry.cooldownReleases` — how many bounded cool-down releases a head whose verdict never landed gets
+ * after the immediate re-runs are spent. Standard 0 (main's permanent hold); the tool layer
+ * scripts/settings/review-no-verdict-retry.json sets 6 (operator 2026-10-20); env
+ * WE_REVIEW_NO_VERDICT_COOLDOWN_RELEASES beats both. Integer 0..VERDICT_COOLDOWN_MAX_RELEASES; anything else is
+ * ignored (the lower layer / standard applies). Resolves standard → platform → tool → env with policy-cascade source logging.
+ */
+export const NO_VERDICT_RETRY_STANDARD = Object.freeze({ cooldownReleases: 0 });
+export const NO_VERDICT_RETRY_TOOL_FILE = resolve(dirname(fileURLToPath(import.meta.url)), '../settings/review-no-verdict-retry.json');
+const validCooldownReleases = v => Number.isInteger(v) && v >= 0 && v <= VERDICT_COOLDOWN_MAX_RELEASES;
+function readNoVerdictRetryTool(path = NO_VERDICT_RETRY_TOOL_FILE) {
+  try { return JSON.parse(readFileSync(path, 'utf8'))?.reviewNoVerdictRetry; } catch { return undefined; }
+}
+export function resolveNoVerdictRetry(env = process.env, { tool } = {}) {
+  if (!env || typeof env !== 'object') return { cooldownReleases: NO_VERDICT_RETRY_STANDARD.cooldownReleases, source: 'standard' };
+  try {
+    const raw = env.WE_REVIEW_NO_VERDICT_COOLDOWN_RELEASES;
+    const block = tool !== undefined ? tool : readNoVerdictRetryTool();
+    const r = cascadePolicy('reviewNoVerdictRetry', block && typeof block === 'object' && !Array.isArray(block)
+      ? { cooldownReleases: block.cooldownReleases } : undefined, {
+      env, standard: NO_VERDICT_RETRY_STANDARD,
+      envValues: { cooldownReleases: raw == null || String(raw).trim() === '' ? undefined : /^\d+$/.test(String(raw).trim()) ? Number(raw) : raw },
+      valid: { cooldownReleases: validCooldownReleases },
+    });
+    const value = r.value?.cooldownReleases;
+    return validCooldownReleases(value)
+      ? { cooldownReleases: value, source: r.sources?.cooldownReleases ?? 'standard' }
+      : { cooldownReleases: NO_VERDICT_RETRY_STANDARD.cooldownReleases, source: 'standard' };
+  } catch { return { cooldownReleases: NO_VERDICT_RETRY_STANDARD.cooldownReleases, source: 'standard' }; }
+}
 /** A just-finished run gets this long for its verdict write-back to show up in the (cached) PR listing. */
 export const VERDICT_GRACE_MS = 10 * 60_000;
 const VERDICT_LABELS = ['review:accepted', 'review:changes', 'review:human'];
@@ -230,7 +270,7 @@ export function verdictNeverLanded(pr, last, now = Date.now()) {
   return !(head && parseReviewedSha(pr?.comments) === head);
 }
 
-export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Date.now() } = {}) {
+export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Date.now(), retry = resolveNoVerdictRetry(env) } = {}) {
   const max = resolveSameHeadMaxReviews(env);
   if (max === 0) return null;
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid)
@@ -243,14 +283,28 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   // A completed run whose verdict NEVER LANDED on the PR (GitHub refused the comment/label write; live 2026-10-07,
   // #4288: GraphQL error as the review finished, so the PR stayed `review:pending` with no verdict and this hold
   // then silenced it forever, unlogged) did not review the head in any way the PR can see. Re-arm it ourselves,
-  // bounded to VERDICT_RETRY_EXTRA extra runs, and past that keep the hold with an explicit reason.
+  // bounded to VERDICT_RETRY_EXTRA extra runs, then bounded cool-down releases with exponential backoff.
   const noVerdict = verdictNeverLanded(pr, last, now);
   if (noVerdict && count < max + VERDICT_RETRY_EXTRA) return null;
+  let retryAt = null;
+  // Cool-down releases already spent on this head/wake (each release produced one more completed run).
+  const spent = count - (max + VERDICT_RETRY_EXTRA);
+  const releases = validCooldownReleases(retry?.cooldownReleases) ? Math.min(retry.cooldownReleases, VERDICT_COOLDOWN_MAX_RELEASES) : 0;
+  if (noVerdict && spent < releases) {
+    const cooldown = Math.min(VERDICT_COOLDOWN_BASE_MS * 2 ** spent, VERDICT_COOLDOWN_CAP_MS);
+    retryAt = last.completedAt + cooldown;
+    if (now >= retryAt) return null;
+  }
   const head = pr.headRefOid;
+  // Past the last release: the permanent hold main has always had, now also raised to the operator (needs-you).
+  const noVerdictExhausted = noVerdict && retryAt === null;
   const why = `${REFERRAL_HOLD_MARKER} head ${head.slice(0, 9)} was already reviewed ${count} time(s); it resumes on a new push or an explicit re-arm`
-    + (noVerdict ? ` (no verdict ever landed on the PR for those runs, and the ${VERDICT_RETRY_EXTRA} automatic re-runs are spent: a person must look at why the review's write-back fails)` : '');
+    + (noVerdict ? ` (no verdict ever landed on the PR for those runs, and the ${VERDICT_RETRY_EXTRA} automatic re-runs are spent: a person must look at why the review's write-back fails)` : '')
+    + (retryAt !== null ? `; the next automatic re-run is due at ${new Date(retryAt).toISOString()}` : '');
   return { kind: 'same-head', head, episode: hash([repo, pr.number, head, wake, 'same-head']), count,
-    why, retryAt: null, persistenceFailed: false, exhausted: false };
+    why, retryAt, persistenceFailed: false, exhausted: false,
+    ...(noVerdict ? { noVerdict: { exhausted: noVerdictExhausted, releasesSpent: Math.max(0, Math.min(spent, releases)),
+      releases, source: retry?.source ?? 'standard' } } : {}) };
 }
 
 /** Block-ruled referrals on the PR's CURRENT head, once EVERY referral on it is ruled (none pending): the PR is owed a
@@ -293,15 +347,108 @@ export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), readRu
   });
 }
 
+/**
+ * A no-verdict same-head hold past its last cool-down release is permanent (as on main) and must never be silent: raise
+ * a needs-you event per repo+PR+head.
+ *
+ * DELIVERY IS AT-LEAST-ONCE, BY OPERATOR RULING (2026-10-20), NOT A DEFECT: never-silent wins over exactly-once.
+ *
+ * NO HAND-ROLLED LOCKS: the claim is the repo's audited durable per-resource claim ledger
+ * (we:scripts/operations/action-store.mjs — exclusive `wx` attempt allocation, lock-fenced CAS transitions, expiry +
+ * reconciliation), kept in its OWN coordination root (`<notices dir>/needs-you-claims`) so these claims never hold the
+ * review/fix dispatch claims of the same PR. Resource `<repo>#pr:<n>`, kind {@link NO_VERDICT_NEEDS_YOU_KIND}, the head
+ * in `evidence.head`.
+ * - Done (deduped) = a `terminal`/`settled` attempt of this kind for this head.
+ * - Otherwise claim → CAS intent→dispatching (the fenced "I still hold the claim" check, immediately before publishing;
+ *   lost → no publish) → publish → dispatching→observed→terminal(settled).
+ * - Publish failure → terminal(not-started): the next tick claims again.
+ * - A crashed owner's claim expires (store LEASE_MS) and is reconciled by the store at the next claim: never-dispatched
+ *   → abandoned, observed → settled (no re-raise), dispatching → abandoned after the store's absence grace → raised
+ *   again: the accepted at-least-once duplicate. Attempt numbers are unbounded (no counter that can exhaust).
+ * - If the claim ledger itself is unusable (unknown repo, unreadable/corrupt store), the event is published directly —
+ *   never silent; the feed's own open-key state dedupes repeats.
+ * Never throws.
+ */
+export const NO_VERDICT_NEEDS_YOU_KIND = 'needs-you-stalled-review';
+export const needsYouClaimRoot = dir => join(dir, 'needs-you-claims');
+export function raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now = Date.now(), log = line => console.error(line),
+  publish, store, owner = `review-daemon:${process.pid}`, beforePublish = null }) {
+  try {
+    if (!sha(hold?.head)) return false;
+    // The real operator feed is never written from a test run unless the test injects its own publisher.
+    if (!publish) {
+      if (isUnderTest(process.env)) return false;
+      publish = item => publishAttention(item, { now });
+    }
+    const item = { repo, pr: Number(prNumber), head: hold.head, kind: 'review-no-verdict',
+      reason: `review verdict never landed after ${hold.count} runs and ${hold.noVerdict?.releasesSpent ?? 0} cool-down retries; held until a push or re-arm`,
+      pick: `https://github.com/${repo}/pull/${prNumber}` };
+    const announce = () => log(`${repo}#${prNumber} NEEDS-YOU review-no-verdict head ${hold.head.slice(0, 9)}: ${hold.count} runs, `
+      + `${hold.noVerdict?.releasesSpent ?? 0}/${hold.noVerdict?.releases ?? 0} cool-down retries spent `
+      + `(reviewNoVerdictRetry.cooldownReleases source=${hold.noVerdict?.source ?? 'standard'}); permanent hold`);
+    let actions, resource, claimed;
+    try {
+      actions = store ?? createActionStore({ root: needsYouClaimRoot(dir), now: () => now });
+      resource = actionResource(repo, { type: 'pr', id: String(prNumber) });
+      const done = actions.attempts(resource).some(r => r.kind === NO_VERDICT_NEEDS_YOU_KIND && r.evidence?.head === hold.head
+        && r.state === 'terminal' && r.outcome === 'settled');
+      if (done) return false;
+      claimed = actions.claim({ resource, kind: NO_VERDICT_NEEDS_YOU_KIND, owner, evidence: { head: hold.head },
+        reconcile: record => actions.reconcile(record, { listAgents: () => [], findEffect: () => ({ found: false }),
+          postconditionHolds: () => true, owner }) });
+    } catch (e) {
+      // The claim ledger is unusable: never silent — publish directly (the feed dedupes repeats).
+      log(`${repo}#${prNumber} no-verdict needs-you claim ledger unusable (${String(e?.message ?? e).split('\n')[0]}) — publishing unclaimed`);
+      publish(item);
+      announce();
+      return true;
+    }
+    if (!claimed?.ok) return false; // held by a live (or not yet reconcilable) claim: its owner publishes, or it expires
+    let rec = claimed.record;
+    // Claiming may have reconciled an expired attempt for this head into `settled` (it had published): then it is done.
+    try {
+      if (actions.attempts(resource).some(r => r.attempt !== rec.attempt && r.kind === NO_VERDICT_NEEDS_YOU_KIND
+        && r.evidence?.head === hold.head && r.state === 'terminal' && r.outcome === 'settled')) {
+        actions.release(resource, rec.attempt, { token: rec.ownerToken, rev: rec.rev });
+        return false;
+      }
+    } catch { /* fall through: publishing again is the at-least-once side */ }
+    if (typeof beforePublish === 'function') beforePublish(); // TEST-ONLY seam: pause the owner here
+    const go = actions.transition(resource, rec.attempt, { token: rec.ownerToken, rev: rec.rev, from: 'intent', to: 'dispatching',
+      patch: { dispatchingSince: now } });
+    if (!go.ok) { log(`${repo}#${prNumber} no-verdict needs-you: claim lost before publishing (${go.reason}) — not publishing`); return false; }
+    rec = go.record;
+    try { publish(item); }
+    catch (e) {
+      actions.transition(resource, rec.attempt, { token: rec.ownerToken, rev: rec.rev, from: 'dispatching', to: 'terminal', patch: { outcome: 'not-started' } });
+      log(`${repo}#${prNumber} no-verdict needs-you could not be published (retried next tick): ${String(e?.message ?? e).split('\n')[0]}`);
+      return false;
+    }
+    // At-least-once: if these writes fail or the process dies first, the store's expiry/reconcile re-raises it.
+    try {
+      const seen = actions.transition(resource, rec.attempt, { token: rec.ownerToken, rev: rec.rev, from: 'dispatching', to: 'observed', patch: { handle: 'needs-you-feed' } });
+      if (seen.ok) actions.transition(resource, rec.attempt, { token: seen.record.ownerToken, rev: seen.record.rev, from: 'observed', to: 'terminal', patch: { outcome: 'settled' } });
+    } catch (e) { log(`${repo}#${prNumber} no-verdict needs-you claim not settled (may re-raise): ${String(e?.message ?? e).split('\n')[0]}`); }
+    announce();
+    return true;
+  } catch (e) {
+    try { log(`${repo}#${prNumber} no-verdict needs-you not raised this tick (retried next tick): ${String(e?.message ?? e).split('\n')[0]}`); } catch { /* never throws */ }
+    return false;
+  }
+}
+
 /** Reserve before sending: an ambiguous transport failure must not create duplicate comments on every tick.
  * Known pre-send rate-limit failures can retry with bounded backoff; all other failures remain visible locally.
  */
 export function notifyReferralHold({ repo, prNumber, hold, comments = [],
   dir = join(dirname(resolveRunsDir()), 'review-referral-notices'), now = Date.now(),
-  log = line => console.error(line),
+  log = line => console.error(line), publishNeedsYou,
   post = body => execFileSyncThrottled('gh', ['pr', 'comment', String(prNumber), '--repo', repo, '--body', body],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }),
 }) {
+  if (hold.kind === 'same-head' && hold.noVerdict?.exhausted) {
+    raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now, log, publish: publishNeedsYou });
+  }
   if (hold.kind === 'same-head') return;
   const marker = `<!-- review-referral-hold: ${hold.episode} -->`;
   const path = join(dir, `${hash([repo, prNumber, hold.episode])}.json`);
