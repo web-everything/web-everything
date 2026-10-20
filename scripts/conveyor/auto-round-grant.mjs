@@ -35,7 +35,7 @@ export const STANDING_RULING = 'operator 2026-10-19 standing ruling (confirmed 2
 export const AUTO_GRANT_ABSOLUTE_MAX = 3;
 
 export const AUTO_ROUND_GRANT_STANDARD = Object.freeze({
-  enabled: false, maxPerPr: 3, repos: Object.freeze(['web-everything/web-everything']),
+  enabled: false, maxPerPr: 3, repos: Object.freeze([CONSTELLATION_REPOS.we.slug]),
 });
 
 const slugOf = (repo) => CONSTELLATION_REPOS[repo]?.slug ?? repo;

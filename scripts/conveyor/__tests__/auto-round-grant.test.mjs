@@ -13,10 +13,10 @@ import {
   AUTO_GRANT_CHANNEL, autoGrantKey, countAutoRoundGrants, decideAutoGrant, isCardOnlyNetDiff,
   resolveAutoRoundGrantSettings, screenAutoGrantNote, STANDING_RULING,
 } from '../auto-round-grant.mjs';
-import { autoRoundGrant, withPrLedger, redact } from '../auto-round-grant-io.mjs';
+import { autoRoundGrant, withPrLedger, redact, readPrThread } from '../auto-round-grant-io.mjs';
 import { buildRoundExtensionComment, countGrantedRoundExtensions, countStandingRulingGrantRecords, roundExtensionGrants, standingRulingGrantEpisodes } from '../round-extension-mark.mjs';
 import { buildStandingRulingBody, citedGrantHeads, pickStandingRuling, verifyStandingRuling } from '../standing-ruling-mark.mjs';
-import { enrichPrsWithStandingRulingGrants, headIsCardOnly, readStandingRuling, standingRulingScope } from '../standing-ruling-io.mjs';
+import { enrichPrsWithStandingRulingGrants, headIsCardOnly, readStandingRuling, readUneditedCommentIds, standingRulingScope } from '../standing-ruling-io.mjs';
 import { planRoundExtension } from '../../operations/extend-rounds.mjs';
 import { gateRoundCap } from '../../lib/red-team-gate.mjs';
 import { runReconcileNotesAllRepos } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
@@ -39,6 +39,43 @@ const autoGrant = ({ head = HEAD, login = 'web-everything[bot]', ruling = RULING
 });
 const manualGrant = (login = 'chalbert') => ({ author: { login },
   body: buildRoundExtensionComment({ repo: WE, pr: 5654, by: 1, actor: 'chalbert', channel: 'claude-code-chat', reason: 'r', at: '2026-10-20T00:00:00Z' }) });
+
+describe('complete App thread reads', () => {
+  it('includes grants beyond the first page using the same App transport', () => {
+    const grant = autoGrant();
+    const rows = [...Array.from({ length: 100 }, () => 'filler\t2026-10-20T12:00:00Z\tweb-everything[bot]'),
+      `${grant.body.replace(/\n/g, '\\n')}\t${grant.createdAt}\t${grant.author.login}\t${grant.id}`].join('\n');
+    const gh = vi.fn((args) => args[0] === 'pr' ? JSON.stringify({ state: 'OPEN', headRefOid: HEAD }) : rows);
+    const thread = readPrThread(WE, 5654, { gh });
+    expect(thread.comments).toHaveLength(101);
+    expect(thread.comments[100]).toMatchObject(grant);
+    expect(gh.mock.calls[0][0]).toContain('--paginate');
+    expect(gh.mock.calls[0][0]).toContain(`repos/${WE}/issues/5654/comments`);
+    expect(gh.mock.calls[1][0]).toContain('state,headRefOid');
+  });
+
+  it('propagates incomplete comment reads instead of counting zero grants', () => {
+    const gh = () => JSON.stringify({ state: 'OPEN', headRefOid: HEAD });
+    expect(() => readPrThread(WE, 5654, { gh, readComments: () => { throw new Error('page failed'); } })).toThrow('page failed');
+    expect(() => readPrThread(WE, 5654, { gh, readComments: () => null })).toThrow('no array');
+  });
+
+  it('checks edit history across pages and excludes edited comments', () => {
+    const gh = vi.fn((args) => JSON.stringify({ data: { repository: { pullRequest: { comments: {
+      nodes: args.includes('cursor=next')
+        ? [{ id: 'IC_late', lastEditedAt: null }, { id: 'IC_edited', lastEditedAt: '2026-10-20T12:00:00Z' }]
+        : Array.from({ length: 100 }, (_, i) => ({ id: `IC_${i}`, lastEditedAt: null })),
+      pageInfo: { hasNextPage: !args.includes('cursor=next'), endCursor: 'next' },
+    } } } } }));
+    const ids = readUneditedCommentIds({ repo: 'we', number: 5654 }, { gh });
+    expect(ids).toHaveLength(101);
+    expect(ids).toContain('IC_late');
+    expect(ids).not.toContain('IC_edited');
+    expect(gh).toHaveBeenCalledTimes(2);
+    expect(gh.mock.calls[0][0]).toContain('owner=web-everything');
+    expect(gh.mock.calls[1][0]).toContain('cursor=next');
+  });
+});
 
 describe('the operator ruling record', () => {
   it('verifies an open, operator-authored, unedited ruling and returns its bounds', () => {

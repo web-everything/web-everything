@@ -16,6 +16,7 @@ import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { isCardOnlyNetDiff } from './auto-round-grant.mjs';
 import { citedGrantHeads, pickStandingRuling } from './standing-ruling-mark.mjs';
+import { readCompletePrCommentEditHistory } from './pr-comments-complete.mjs';
 
 const slugOf = (repo) => CONSTELLATION_REPOS[repo]?.slug ?? repo;
 /** Credential-shaped strings never reach a log or a reason. */
@@ -31,7 +32,6 @@ export const ghAppRead = (args) => execFileSyncThrottled('gh', args, {
 });
 
 const ISSUES = `query($owner:String!,$name:String!,$by:String!){repository(owner:$owner,name:$name){issues(first:30,filterBy:{createdBy:$by,states:OPEN},orderBy:{field:CREATED_AT,direction:DESC}){nodes{number state body lastEditedAt author{login} editor{login}}}}}`;
-const COMMENTS = `query($owner:String!,$name:String!,$n:Int!){repository(owner:$owner,name:$name){pullRequest(number:$n){comments(last:100){nodes{id lastEditedAt}}}}}`;
 
 /** IO: every OPEN issue each operator login created in `repo` (the ruling candidates). */
 export function readOperatorIssues(repo, { gh = ghAppRead } = {}) {
@@ -49,12 +49,10 @@ export function readStandingRuling(repo, { readIssues = readOperatorIssues, log 
   catch (e) { log(`standing-ruling: read failed for ${slug}: ${firstLine(e)}`); return null; }
 }
 
-/** IO: ids of the PR's comments (last 100) GitHub shows as never edited. */
-export function readUneditedCommentIds({ repo, number }, { gh = ghAppRead } = {}) {
-  const [owner, name] = slugOf(repo).split('/');
-  const raw = gh(['api', 'graphql', '-f', `query=${COMMENTS}`, '-F', `owner=${owner}`, '-F', `name=${name}`, '-F', `n=${number}`]);
-  const nodes = JSON.parse(String(raw))?.data?.repository?.pullRequest?.comments?.nodes ?? [];
-  return nodes.filter((c) => typeof c?.id === 'string' && !c.lastEditedAt).map((c) => c.id);
+/** IO: ids across the complete PR thread that GitHub shows as never edited. */
+export function readUneditedCommentIds({ repo, number }, { gh = ghAppRead, readEdits = readCompletePrCommentEditHistory } = {}) {
+  const nodes = readEdits(number, { repo: slugOf(repo), exec: (_file, args) => gh(args) });
+  return nodes.filter((c) => typeof c?.id === 'string' && c.lastEditedAt === null).map((c) => c.id);
 }
 
 /** IO: does GitHub associate commit `head` with PR `number`? */

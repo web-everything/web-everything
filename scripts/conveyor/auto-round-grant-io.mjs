@@ -28,6 +28,7 @@ import {
   standingRulingGrantEpisodes,
 } from './round-extension-mark.mjs';
 import { readStandingRuling, standingRulingScope, redact } from './standing-ruling-io.mjs';
+import { readCompletePrComments } from './pr-comments-complete.mjs';
 import {
   AUTO_GRANT_ABSOLUTE_MAX, AUTO_GRANT_CHANNEL, autoGrantKey, autoGrantReason, capReachedReason,
   countAutoRoundGrants, decideAutoGrant, formatAutoRoundGrantSettings, resolveAutoRoundGrantSettings, screenAutoGrantNote,
@@ -75,8 +76,12 @@ const ghApp = (args) => execFileSyncThrottled('gh', args, {
   encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, maxBuffer: 64 * 1024 * 1024, throttle: { personalRoute: false },
 });
 /** IO: the PR's state, head and comments (App identity). */
-export function readPrThread(repo, pr, { gh = ghApp } = {}) {
-  return JSON.parse(String(gh(['pr', 'view', String(pr), '--repo', repo, '--json', 'state,headRefOid,comments'])));
+export function readPrThread(repo, pr, { gh = ghApp, readComments = readCompletePrComments } = {}) {
+  const comments = readComments(pr, { repo, exec: (_file, args) => gh(args) });
+  if (!Array.isArray(comments)) throw new Error('complete comments read returned no array');
+  // Keep the expected-head check fresh even when reading a long thread takes several pages.
+  const thread = JSON.parse(String(gh(['pr', 'view', String(pr), '--repo', repo, '--json', 'state,headRefOid'])));
+  return { ...thread, comments };
 }
 /** IO: post one comment (App identity). */
 export function postPrComment(repo, pr, body, { gh = ghApp } = {}) {
