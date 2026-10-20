@@ -1355,6 +1355,19 @@ describe('orphaned accepted panel-seat recovery', () => {
     expect(h.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
     expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
   });
+  // Live gap #5549: the operator accepted a needs-human head, its panel seat errored, and no request was ever filed.
+  const operatorAccepted = { ...stale, recorded: false, untrustedSavedResult: false, loopPayload: { ...panel,
+    verdict: { verdict: 'needs-human', humanRequired: true, blockedReferrals: [{ seat: 'correctness' }] } } };
+  it('recovers an operator-accepted needs-human head with an attempted, unusable pass', () => {
+    expect(staleRedTeamRequestEligibility({ evidence: operatorAccepted, repo: LOCAL, pr: 5549, head: HEAD,
+      labels: ['review:accepted', 'ready-to-merge'], enabled: true, panelSeat: true, reviewAgents: [] }))
+      .toEqual({ eligible: true, reason: 'stale rows with no usable result' });
+  });
+  it('never recovers that head without a live review:accepted label', () => {
+    expect(staleRedTeamRequestEligibility({ evidence: operatorAccepted, repo: LOCAL, pr: 5549, head: HEAD,
+      labels: ['review:human', 'ready-to-merge'], enabled: true, panelSeat: true, reviewAgents: [] }))
+      .toEqual({ eligible: false, reason: 'PR not accepted' });
+  });
   it.each(['requiring send-back', 'saved red-team re-check incomplete'])('does not recover a recorded break: %s', reason => {
     expect(staleRedTeamRequestEligibility({ evidence: stale, repo: LOCAL, pr: 5485, head: HEAD,
       labels: ['review:accepted'], enabled: true, panelSeat: true, reviewAgents: [], reason }).eligible).toBe(false);

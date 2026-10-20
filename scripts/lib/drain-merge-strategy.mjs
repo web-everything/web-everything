@@ -2,7 +2,7 @@ import { listAgentsWithReviewJobs } from '../operations/review-job-store.mjs';
 import { mintSessionSlug } from '../conveyor/session-slug.mjs';
 import { repoKeyForSlug } from './constellation-repos.mjs';
 import { readRedTeamProbes } from './red-team-gate.mjs';
-import { redTeamPanelSeatOwed, redTeamOwedOnHead, redTeamOwedFor } from './review-red-team-policy.mjs';
+import { redTeamPanelSeatOwed, redTeamOwedOnHead, redTeamOwedFor, redTeamOwedForAcceptedPr } from './review-red-team-policy.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 /**
@@ -73,7 +73,9 @@ export function staleRedTeamRequestEligibility({ evidence = {}, repo, pr, head, 
   if (!labels.some(l => (typeof l === 'string' ? l : l.name) === 'review:accepted')) return refuse('PR not accepted');
   if (evidence.loopPayload?.findings?.read?.netBasis?.rev?.toLowerCase() !== head?.toLowerCase())
     return refuse('review payload does not match head');
-  if (!redTeamOwedFor(evidence.loopPayload)
+  // The label check above verified a live accept: an operator-accepted needs-human head owes the red team too,
+  // the same head the hold counts as owed (live gap #5549: held 1680 min with no request ever filed).
+  if (!redTeamOwedForAcceptedPr(evidence.loopPayload)
     || !redTeamOwedOnHead({ read: evidence.loopPayload?.findings?.read,
       evidence: { scheduled: true, skipCardOnly: evidence.skipCardOnly }, skipCardOnly }))
     return refuse('red team not owed');
