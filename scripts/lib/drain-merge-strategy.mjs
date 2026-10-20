@@ -221,7 +221,8 @@ export function createDrainMergeStrategy({
   cardGroupHold = (c) => {
     const path = resolveCardGroupStatePath(env);
     if (!path || !existsSync(path)) return null;
-    return pureCardGroupHold(readGroupState(path), { num: c?.num, repo: c?.repo || localSlug, localSlug });
+    return pureCardGroupHold(readGroupState(path), { num: c?.num, repo: c?.repo || localSlug, localSlug,
+      files: c?.listedFilesComplete === true ? c.listedFiles : null });
   },
 } = {}) {
   const { policy, note } = resolved;

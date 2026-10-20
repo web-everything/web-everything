@@ -436,13 +436,50 @@ export function readGroupState(path, readFile = readFileSync) {
  * PURE: the hold for one candidate, given the state. A source of any recorded group is held; an unreadable
  * state holds everything (we cannot prove the PR is not a source).
  */
-export function cardGroupHold(state, { num, repo, localSlug } = {}) {
+export function cardGroupHold(state, { num, repo, localSlug, files = null } = {}) {
   if (state?.unreadable) return { kind: 'card-grouped', reason: 'card-group state unreadable — holding (fail closed)' };
   const slug = String(repo || localSlug || '').toLowerCase();
+  const paths = Array.isArray(files) ? files.map(f => (typeof f === 'string' ? f : f?.path)).filter(Boolean) : [];
   for (const g of state?.groups ?? []) {
     if (String(g.repo || '').toLowerCase() !== slug) continue;
+    if (Number(g.pr) === Number(num)) continue; // the combined PR itself lands normally
+    const where = g.pr ? `#${g.pr}` : `pending card group ${g.id}`;
     if (g.sources?.some(s => Number(s.num) === Number(num)))
-      return { kind: 'card-grouped', reason: `grouped into ${g.pr ? `#${g.pr}` : `pending card group ${g.id}`} (lands with it; drain.group)` };
+      return { kind: 'card-grouped', reason: `grouped into ${where} (lands with it; drain.group)` };
+    // An open group RESERVES its card files: no other PR touching them may land first (it would make the
+    // combined PR conflict). Unknown file lists cannot be judged here; the group then dissolves on conflict.
+    const shared = paths.filter(p => (g.files ?? []).includes(p));
+    if (shared.length) return { kind: 'card-grouped', reason: `${shared[0]} is reserved by open card group ${where} (drain.group)` };
+  }
+  return null;
+}
+
+/** PURE: is PR `num` (or head ref) a source or the combined PR of a recorded group? Unreadable state → true. */
+export function inCardGroup(state, { num, repo, localSlug, headRef = null } = {}) {
+  if (state?.unreadable) return true;
+  const slug = String(repo || localSlug || '').toLowerCase();
+  if (String(headRef ?? '').startsWith(CARD_GROUP_BRANCH_PREFIX)) return true;
+  return (state?.groups ?? []).some(g => String(g.repo || '').toLowerCase() === slug
+    && (Number(g.pr) === Number(num) || g.sources?.some(s => Number(s.num) === Number(num))));
+}
+
+/** IO: the same membership, read from THE shared state path. No state path / no file → false. */
+export function readInCardGroup({ num, repo, localSlug, headRef = null, env = process.env } = {}) {
+  if (String(headRef ?? '').startsWith(CARD_GROUP_BRANCH_PREFIX)) return true;
+  const path = resolveCardGroupStatePath(env);
+  if (!path || !existsSync(path)) return false;
+  return inCardGroup(readGroupState(path), { num, repo, localSlug, headRef });
+}
+
+/** PURE: a queue read blocks a group when any entry is a source, shares a group file, or has an unknown file list. */
+export function queueBlocksGroup(queue, { sources, files }) {
+  if (!queue || queue.error || !Array.isArray(queue.entries)) return `merge queue unreadable (${queue?.error ?? 'no result'})`;
+  const nums = new Set(sources.map(s => Number(s.num)));
+  for (const e of queue.entries) {
+    if (nums.has(Number(e.num))) return `#${e.num} is already in the merge queue`;
+    if (e.files === null || !Array.isArray(e.files)) return `queued #${e.num} has an unknown file list`;
+    const hit = e.files.find(f => files.includes(f));
+    if (hit) return `queued #${e.num} still shares ${hit} — waiting until it clears`;
   }
   return null;
 }
@@ -458,7 +495,7 @@ export function createCardGrouping({
   // The drain's land-write mutex (`(fn) => ({ran, result})`, the one every enqueue runs inside) and a live
   // merge-queue membership read (`() => ({inQueue:Set, error?})`). Group creation is claimed inside that mutex,
   // after proving no source is queued, so an enqueue can never pass its hold check and then race the claim.
-  withLock = null, readQueue = null,
+  withLock = null, readQueue = null, readQueueFiles = null,
   cardConflictSettings = null,
 } = {}) {
   const say = line => { if (!quiet) log.write(`  card-group: ${line}\n`); };
@@ -483,7 +520,7 @@ export function createCardGrouping({
       return { ok: true, result };
     });
   };
-  const readPr = num => JSON.parse(gh(['pr', 'view', String(num), '--repo', localSlug, '--json', 'number,state,isDraft,headRefOid,headRefName,baseRefName,labels,statusCheckRollup,mergedAt']));
+  const readPr = num => JSON.parse(gh(['pr', 'view', String(num), '--repo', localSlug, '--json', 'number,state,isDraft,headRefOid,headRefName,baseRefName,labels,statusCheckRollup,mergedAt,mergeable']));
   const comment = (num, body) => { try { gh(['pr', 'comment', String(num), '--repo', localSlug, '--body', body]); return true; } catch (e) { say(`comment on #${num} failed (${firstLine(e)})`); return false; } };
   const liveEligible = (pr, headSha) => {
     const names = labelNames(pr?.labels);
@@ -511,7 +548,14 @@ export function createCardGrouping({
     /** Hold for one candidate (sync). */
     holdFor(c) {
       if (!statePath || !existsSync(statePath)) return null;
-      return cardGroupHold(readGroupState(statePath, readFile), { num: c?.num, repo: c?.repo, localSlug });
+      return cardGroupHold(readGroupState(statePath, readFile), { num: c?.num, repo: c?.repo, localSlug,
+        files: c?.listedFilesComplete === true ? c.listedFiles : null });
+    },
+    /** A source or combined PR of a recorded group: the drain's own rebase/repair must not move its head. */
+    inGroup(c) {
+      if (String(c?.headRef ?? '').startsWith(CARD_GROUP_BRANCH_PREFIX)) return true;
+      if (!statePath || !existsSync(statePath)) return false;
+      return inCardGroup(readGroupState(statePath, readFile), { num: c?.num, repo: c?.repo, localSlug, headRef: c?.headRef });
     },
 
     /** Re-read active groups (throttled by reconcileSec). Never throws. */
@@ -573,6 +617,7 @@ export function createCardGrouping({
           if (pr.state === 'CLOSED') why = 'combined PR closed without merging';
           else if (labelNames(pr.labels).some(l => l === 'review:changes' || l === 'review:human')) why = `combined PR sent back (${labelNames(pr.labels).filter(l => l === 'review:changes' || l === 'review:human').join(', ')})`;
           else if (requiredFailed(pr)) why = 'combined PR failed the required check';
+          else if (String(pr.mergeable || '').toUpperCase() === 'CONFLICTING') why = 'combined PR conflicts with main';
           else {
             for (const s of g.sources) {
               let sp;
@@ -680,6 +725,11 @@ export function createCardGrouping({
           p = next;
         }
         const original = p.sources;
+        // Wait (no failure memo) while a queued PR shares a group card: building on main now would conflict
+        // the moment it lands.
+        if (typeof readQueueFiles !== 'function') return { reason: 'no queue file read wired — fail closed' };
+        const waitWhy = queueBlocksGroup(readQueueFiles(), { sources: p.sources, files: p.files });
+        if (waitWhy) { say(`group of ${p.sources.map(x => `#${x.num}`).join(',')} waits: ${waitWhy}`); return { reason: waitWhy, waiting: true }; }
         const leftOut = [];
         let built, proof, id;
         for (;;) {
@@ -711,15 +761,14 @@ export function createCardGrouping({
         const branch = `${CARD_GROUP_BRANCH_PREFIX}${id}`;
         const record = { id, repo: localSlug, branch, pr: null, base, commit: built.commit, createdAt: now(),
           sources: p.sources.map(s => ({ num: s.num, headSha: s.headSha })), files: p.files };
-        if (typeof withLock !== 'function' || typeof readQueue !== 'function') return { reason: 'no land mutex / queue read wired — fail closed' };
+        if (typeof withLock !== 'function' || typeof readQueueFiles !== 'function') return { reason: 'no land mutex / queue read wired — fail closed' };
         // Inside the land mutex every enqueue runs in: prove no source is queued and every source is still at
         // its judged head, then record the group. From here on every enqueue (it re-reads the hold inside the
         // same mutex) sees the group.
         const lock = withLock(() => {
-          const q = readQueue();
-          if (!q || q.error || !(q.inQueue instanceof Set)) return { ok: false, reason: `merge queue unreadable (${q?.error ?? 'no result'})` };
+          const blocked = queueBlocksGroup(readQueueFiles(), { sources: record.sources, files: record.files });
+          if (blocked) return { ok: false, reason: blocked };
           for (const x of record.sources) {
-            if (q.inQueue.has(x.num)) return { ok: false, reason: `#${x.num} is already in the merge queue` };
             let pr;
             try { pr = readPr(x.num); } catch (e) { return { ok: false, reason: `#${x.num} re-read failed (${firstLine(e)})` }; }
             const bad = liveEligible(pr, x.headSha);
