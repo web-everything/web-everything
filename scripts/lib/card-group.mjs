@@ -607,7 +607,10 @@ export function createCardGrouping({
         if (st.unreadable) return { reason: 'state unreadable' };
         const grouped = new Set(st.groups.flatMap(g => g.sources.map(s => Number(s.num))));
         const local = r => !r || String(r).toLowerCase() === String(localSlug).toLowerCase();
-        const deferred = outcomes.filter(o => o.kind === 'queue-file-overlap' && local(o.repo) && overlapReasonIsCardOnly(o.reason) && !grouped.has(Number(o.num)));
+        // Both overlap waits qualify: a queue-file-overlap deferral (its reason must name only card files) and an
+        // overlap-yield hold (its reason names no files). Either way the git card-only check below decides.
+        const waiting = o => (o.kind === 'queue-file-overlap' && overlapReasonIsCardOnly(o.reason)) || o.kind === 'overlap-yield';
+        const deferred = [...new Map(outcomes.filter(o => waiting(o) && local(o.repo) && !grouped.has(Number(o.num))).map(o => [Number(o.num), o])).values()];
         if (deferred.length < 2) return { reason: `${deferred.length} card-only overlap deferral(s)` };
         const base = mainSha();
         if (!base) return { reason: 'main unreadable' };

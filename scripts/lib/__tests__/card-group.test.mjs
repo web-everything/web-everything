@@ -323,6 +323,10 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     const ok = createCardGrouping({ ...opts, statePath: join(d, 'e.json'), withLock, readQueue: () => ({ inQueue: new Set() }) });
     const r = ok.form({ outcomes: t.outcomes, verdicts: t.verdicts });
     expect(r.formed).toMatchObject({ pr: 77 });
+    // overlap-yield holds are a waiting kind too (the git card-only check still decides).
+    const t2 = setup();
+    const y = createCardGrouping({ ...opts, cwd: t2.cwd, run: runIn(t2.cwd, () => t2.base), exec: t2.exec, statePath: join(d, 'y.json'), withLock, readQueue: () => ({ inQueue: new Set() }) });
+    expect(y.form({ outcomes: [1, 2].map(n => ({ num: n, kind: 'overlap-yield', reason: 'overlap-yield:#9' })), verdicts: t2.verdicts }).formed).toMatchObject({ pr: 77 });
     expect(ok.holdFor({ num: 1 })).toMatchObject({ kind: 'card-grouped' });
     expect(t.calls.some(c => c.startsWith('pr create') && c.includes('review:pending'))).toBe(true);
   });
