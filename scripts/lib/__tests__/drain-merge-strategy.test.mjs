@@ -1545,13 +1545,42 @@ describe('live queue file-overlap admission', () => {
     ['disjoint', { ghView: { 43: { files: [{ path: 'scripts/other.mjs' }] } } }],
     ['self excluded', { queueFacts: facts([42]) }],
     ['cards disabled', { env: { WE_DRAIN_QUEUE_FILE_OVERLAP_INCLUDES_CARDS: 'off' } }],
-    ['queue read failed', { viewThrows: [43] }],
     ['queued list capped', { ghView: { 43: { files: Array(100).fill({ path: card }) } } }],
-  ])('continues through existing admission when %s', (label, over) => {
+  ])('continues through existing admission when %s', (_label, over) => {
     const h = setup(over);
     expect(h.s.enqueue(candidate, HEAD, { comments: stampedBy(DRAIN) })).toMatchObject({ enqueued: true });
     expect(h.calls.some(call => call.some(arg => arg.includes('enqueuePullRequest')))).toBe(true);
-    if (label === 'queue read failed') expect(h.logs.join('')).toContain('gh: HTTP 502');
+  });
+  describe('fails closed when the locked live queue read fails', () => {
+    const labels = ['review:accepted', 'ready-to-merge', 'red-team:pending'];
+    const pendingState = () => ({ pending: [], followedUp: [], redTeamPending: {
+      'cwd#42': { headSha: HEAD, firstPendingAt: 0, retryAt: 0, commentCount: 0, checkedAt: 0, reason: 'red team pending' } } });
+    const evidence = { scheduled: false, inFlight: false, recorded: false, attempted: false, loopPayload: { verdict: { verdict: 'accept' } } };
+    const enqueueCalled = h => h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')));
+    const pendingRemoved = h => h.calls.some(call => call.includes('--remove-label') && call.includes('red-team:pending'));
+    it.each([
+      ['queue read errors', { viewThrows: [43] }, 'gh: HTTP 502'],
+      ['queue response malformed', { queueFacts: { data: { repository: { mergeQueue: { entries: { pageInfo: { hasNextPage: false } } } } } } }, 'unreadable merge queue'],
+      ['queue read throws an empty message', { onView: { 43: () => { throw new Error(''); } } }, 'queue read error'],
+    ])('%s: holds with queue-read-failed, keeps red-team:pending and its pending record', (_name, over, detail) => {
+      const h = setup({ ...over, labels, evidence, initial: pendingState() });
+      const result = h.s.enqueue(candidate, HEAD, { comments: stampedBy(DRAIN) });
+      expect(result).toMatchObject({ enqueued: false, deferred: true, kind: 'queue-read-failed' });
+      expect(result.reason).toContain(detail);
+      expect(enqueueCalled(h)).toBe(false);
+      expect(pendingRemoved(h)).toBe(false);
+      expect(h.state().redTeamPending['cwd#42']).toMatchObject({ headSha: HEAD });
+      expect(h.logs.join('')).toContain('holding #42 (queue-read-failed), retried next pass');
+    });
+    it('control: a successful read enqueues, then drops red-team:pending and the pending record', () => {
+      const h = setup({ ghView: { 43: { files: [{ path: 'scripts/other.mjs' }] } }, labels, evidence, initial: pendingState() });
+      expect(h.s.enqueue(candidate, HEAD, { comments: stampedBy(DRAIN) })).toMatchObject({ enqueued: true });
+      expect(enqueueCalled(h)).toBe(true);
+      expect(pendingRemoved(h)).toBe(true);
+      const enqueueAt = h.calls.findIndex(call => call.some(arg => String(arg).includes('enqueuePullRequest')));
+      expect(h.calls.findIndex(call => call.includes('--remove-label'))).toBeGreaterThan(enqueueAt);
+      expect(h.state().redTeamPending?.['cwd#42']).toBeUndefined();
+    });
   });
   it.each([
     ['missing', { num: 42 }],

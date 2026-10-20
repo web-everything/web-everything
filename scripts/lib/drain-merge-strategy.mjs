@@ -700,6 +700,7 @@ export function createDrainMergeStrategy({
         return { enqueued: false, deferred: true, kind: 'sent-back', reason: held };
       }
       // Head-bound file preparation is reusable; authorization evidence is always live.
+      let syncLabelsAfterEnqueue = null;
       if (safety.value.waitForRedTeamBeforeEnqueue) {
         const evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env });
         const pending = before.redTeamPending?.[key];
@@ -725,9 +726,13 @@ export function createDrainMergeStrategy({
         const pages = readThreadPages(c.repo, c.num);
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team admission: unreadable complete comments');
         const reason = enqueueRedTeamReason(c, headSha, evidence, pages.flat(), neverScheduled || (sameHead && pending.requestedAt != null));
-        try { syncRedTeamStatusLabels({ repo: slugOf(c.repo), pr: c.num, head: headSha, evidence, env,
-          live, comments: pages.flat(), provider: statusProvider, dryRun, log: say }); }
-        catch (e) { say(`red-team status labels #${c.num}: ${firstLine(e)}`); }
+        const syncLabels = () => {
+          try { syncRedTeamStatusLabels({ repo: slugOf(c.repo), pr: c.num, head: headSha, evidence, env,
+            live, comments: pages.flat(), provider: statusProvider, dryRun, log: say }); }
+          catch (e) { say(`red-team status labels #${c.num}: ${firstLine(e)}`); }
+        };
+        // A clear red team may drop `red-team:pending`; do that only once the enqueue succeeds, so a later refusal leaves it.
+        if (reason) syncLabels(); else syncLabelsAfterEnqueue = syncLabels;
         if (reason) {
           before.redTeamPending ??= {};
           const wait = { headSha, firstPendingAt: sameHead ? pending.firstPendingAt : now(),
@@ -765,18 +770,19 @@ export function createDrainMergeStrategy({
         }
       }
       if (holdOnly) return null;
-      if (before.redTeamPending?.[key]) {
-        delete before.redTeamPending[key];
-        writeState(statePath, before);
-      }
+      // The red-team pending record is retired only after a successful enqueue (below), so any refusal keeps it.
       const decision = {};
+      const queueReadFailed = detail => {
+        say(`  merge-queue file-overlap: live queue read failed (${detail}) — holding #${c.num} (queue-read-failed), retried next pass`);
+        return { enqueued: false, deferred: true, kind: 'queue-read-failed', reason: `live merge-queue read failed: ${detail}` };
+      };
       try {
         const candidateFiles = candidateFilesOf(c, headSha, decision);
         const queue = candidateFiles === null ? null : readQueueEntryFiles({ repo: slugOf(c.repo), exec, resolveFiles: queueResolver(decision) });
         if (candidateFiles === null) {
           say('  merge-queue file-overlap: candidate files unknown — continuing enqueue');
-        } else if (queue.error) {
-          say(`  merge-queue file-overlap: read failed (${queue.error}) — continuing enqueue`);
+        } else if (!queue || queue.error != null || !Array.isArray(queue.entries)) {
+          return queueReadFailed(queue?.error || (queue?.error != null ? 'queue read error' : 'malformed queue response'));
         } else {
           const includeCards = safety.value.queueFileOverlapIncludesCards ?? true;
           const source = safety.sources?.queueFileOverlapIncludesCards ?? 'standard';
@@ -791,7 +797,7 @@ export function createDrainMergeStrategy({
           }
           dropReserve(c);
         }
-      } catch (e) { say(`  merge-queue file-overlap: read failed (${firstLine(e)}) — continuing enqueue`); }
+      } catch (e) { return queueReadFailed(firstLine(e)); }
       const reserve = priorityReserveHold(c, headSha, true, decision);
       if (reserve) return { enqueued: false, ...reserve };
       let batchingGroupId;
@@ -840,12 +846,14 @@ export function createDrainMergeStrategy({
         throw err;
       }
       dropReserve(c);
+      syncLabelsAfterEnqueue?.();
       try { adaptiveBatching().confirm?.(c.num, batchingGroupId, { already: !!r.already }); } catch { /* batching bookkeeping never blocks an enqueue */ }
       const state = readQueueState(statePath, readFile);
       // The file can break between the pre-check above and here. Writing over it would erase every other pending
       // follow-up, so throw instead: the PR is already queued, and the next pass (file fixed) sees `already` and records it.
       if (state.unreadable) throw new Error(`github-merge-queue: ${keyOf(c.repo, c.num)} is ENQUEUED but follow-up state ${statePath} became unreadable — not recorded (file left untouched), retried next pass; fix or remove the file`);
       if (state.enqueueFailures) delete state.enqueueFailures[key];
+      if (state.redTeamPending?.[key]) delete state.redTeamPending[key];
       const savedStamp = state.pending.some(p => keyOf(p.repo, p.num) === key && p.clearanceHead === headSha);
       // Skip the stamp only for a marker the DRAIN itself posted: a lookup of the drain's identity (made at most once
       // per pass, and only when some marker for this head exists) that fails or finds no match stamps again.
