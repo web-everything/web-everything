@@ -108,7 +108,11 @@ describe('xqz26k1 pure hunk rule', () => {
 
   it('[A3] a hunk whose kept side drops a numeric cap the other carries is never auto-resolved (attempts 1 vs 3)', () => {
     expect(guardDiff(['x = { attempts: 3, runTimeoutMin: 30 }'], ['x = { attempts: 1 }'])).toEqual(['attempts=1']);
-    expect(guardDiff(['v => v <= 120000'], ['v => v <= 60000'])).toEqual(['v<=60000']);
+    expect(guardDiff(['v => v <= 120000'], ['v => v <= 60000'])).toEqual(['cmp:v => v <= 60000']);
+    // whole expressions (never a truncated operand), and == / != are guards too
+    expect(guardDiff(['if (attempts < limit * 3) retry();'], ['if (attempts < limit) retry();'])).toEqual(['cmp:if (attempts < limit) retry();']);
+    expect(guardDiff(['if (mode) go();'], ["if (mode == 'strict') go();"])).toEqual(["cmp:if (mode == 'strict') go();"]);
+    expect(guardDiff(['const f = (x) => x;'], ['const g = (y) => y;'])).toEqual([]); // an arrow is not a comparison
     expect(guardDiff(['  "attempts": 3,'], ['  "attempts": 1,'])).toEqual(['attempts=1']); // JSON settings too
     // a killed merge-file (empty output) is never a resolution
     expect(resolveFileHunks({ diff3: '' })).toMatchObject({ ok: false, hunks: [{ why: 'merge-file-no-conflict-output' }] });
@@ -228,8 +232,10 @@ describe('xqz26k1 — a held clone builds and checks its own refresh candidate',
     const shadow = await rebuild(f);
     expect(shadow.autoRefresh.check.verdict).toBe('would-adopt');
     f.env[AUTO_REFRESH_MODE_ENV] = 'on';
-    const on = await rebuild(f);
+    const smokeOn = passSmoke();
+    const on = await rebuild(f, { runSmoke: smokeOn });
     expect(on.autoRefresh).toMatchObject({ checkDue: true, check: { verdict: 'registered' } });
+    expect(smokeOn).not.toHaveBeenCalled(); // one smoke per candidate sha: the shadow pass is reused
 
     const g = fixture();
     await heldOnGraduation(g);

@@ -67,7 +67,6 @@ export const AUTO_REFRESH_MODES = Object.freeze(['off', 'shadow', 'on']);
 export const AUTO_REFRESH_CHECK_CLAIM_MS = 90 * 60_000;
 /** Upper bound on the touched-tests run (heavy-admission wait included). */
 export const AUTO_REFRESH_TESTS_TIMEOUT_MS = 30 * 60_000;
-const MAX_TESTS = 20;
 const DOCS_CONFIG_RE = /\.(md|json|ya?ml|txt|toml)$/i;
 const REBUILD_COMMITTER = REBUILD_IDENTITY_ENV.GIT_COMMITTER_EMAIL;
 
@@ -168,7 +167,9 @@ export function carriedBy(change, { base, other, otherHistoryRuns = [] }) {
 }
 
 const NUM_FACT_RE = /["']?([A-Za-z_$][\w$-]*)["']?\s*[:=]\s*(-?\d[\d_]*(?:\.\d+)?)(?![\w.])/g;
-const CMP_FACT_RE = /([\w$.?\])]+)\s*(<=|>=|===|!==|<|>)\s*(-?[\w$.]+)/g;
+/** A line holding a comparison (`<`, `<=`, `>`, `>=`, `==`, `===`, `!=`, `!==`; arrows `=>` are not comparisons). */
+const CMP_LINE_RE = /(<=|>=|===|!==|==|!=|<|>)/;
+const ARROW_RE = /=>/g;
 const DOC_FACT_RE = /`([\w.$-]+)`[^.\n`]{0,60}?\b(?:defaults? to|is capped at|capped at|upper bound of|bound of|is|=)\s*`?(-?\d[\d_]*)/gi;
 
 /** PURE: the guard facts in a block of lines — numeric settings, comparisons, documented numeric defaults. */
@@ -176,7 +177,11 @@ export function guardFacts(lines) {
   const facts = new Set();
   const text = lines.join('\n');
   for (const m of text.matchAll(NUM_FACT_RE)) facts.add(`${m[1]}=${m[2]}`);
-  for (const m of text.matchAll(CMP_FACT_RE)) facts.add(`${m[1]}${m[2]}${m[3]}`);
+  // Round-3 audit: a comparison is the WHOLE normalized line, never a truncated operand (`a < limit` and
+  // `a < limit * 3` are different guards), so any change to a comparing line counts as a different guard.
+  for (const l of lines) {
+    if (CMP_LINE_RE.test(l.replace(ARROW_RE, ''))) facts.add(`cmp:${l.trim().replace(/\s+/g, ' ')}`);
+  }
   for (const m of text.matchAll(DOC_FACT_RE)) facts.add(`doc:${m[1]}=${m[2]}`);
   return facts;
 }
@@ -369,7 +374,7 @@ export function touchedTests(git, sha, files) {
       if (b.startsWith(`${stem}.test.`) || b.startsWith(`${stem}-`)) out.add(t);
     }
   }
-  return [...out].sort().slice(0, MAX_TESTS);
+  return [...out].sort(); // round-3 audit: never truncated — every covering test runs
 }
 
 /**
@@ -462,6 +467,11 @@ export function buildRefreshCandidate({
   }
   const summary = files.map((f) => `${f.path}→${f.resolution}`).join(', ');
   const message = `daemon-rebuild: auto-refresh ${headSha} with main ${mainSha}${summary ? ` (resolved: ${summary})` : ''}`;
+  // Round-3 audit: `rebuildCommitEnv` reads a failed date as 0 and carries on; here a failed read is a git failure.
+  for (const sha of [headSha, mainSha]) {
+    const d = git(['log', '-1', '--format=%ct', sha]);
+    if (d.status !== 0 || !(Number(String(d.stdout ?? '').trim()) > 0)) return fail('git-failed: commit-date');
+  }
   const ct = git(['commit-tree', tree, '-p', headSha, '-p', mainSha, '-m', message], { env: rebuildCommitEnv(git, headSha, mainSha) });
   const candidate = String(ct.stdout ?? '').trim();
   if (ct.status !== 0 || !FULL_SHA_RE.test(candidate)) return fail('git-failed: commit-tree');
@@ -513,7 +523,13 @@ export function markersAdded(git, { headSha, mainSha, candidate, paths }) {
   return out;
 }
 
-/** Files both sides changed whose candidate version lost a guard fact one side introduced. Null on a git error. */
+/**
+ * Files whose candidate version lost a guard fact either parent holds. Null on a git error.
+ * OPERATOR RULING (2026-10-20, round-3 finding 1 — BY DESIGN): for a file the overlay does not touch, MAIN is the
+ * authority, exactly as in any normal rebuild (main + overlays): main's own changes there, a relaxed limit included,
+ * are taken as-is and never guard-checked. Guard checks apply to every file the overlay changed (merge-base..last-good)
+ * whose overlay content differs from main's: there each guard either parent holds must survive in the candidate.
+ */
 export function guardsLost(git, { headSha, mainSha, candidate }) {
   const mb = git(['merge-base', headSha, mainSha]);
   const baseSha = String(mb.stdout ?? '').trim();
@@ -525,9 +541,21 @@ export function guardsLost(git, { headSha, mainSha, candidate }) {
   const ov = names(baseSha, headSha);
   const mn = names(baseSha, mainSha);
   if (!ov || !mn) return null;
-  const both = ov.filter((p) => mn.includes(p));
+  const blobAt = (rev, p) => {
+    const r = git(['ls-tree', rev, '--', p]);
+    if (r.status !== 0) return undefined;
+    return String(r.stdout ?? '').trim().split(/\s+/)[2] ?? null;
+  };
   const out = [];
-  for (const p of both) {
+  for (const p of ov) {
+    const hb = blobAt(headSha, p);
+    const mbb = blobAt(mainSha, p);
+    if (hb === undefined || mbb === undefined) return null;
+    if (hb === mbb) continue; // overlay content equals main's: nothing of the overlay's to lose
+    if (!mn.includes(p)) {
+      // only the overlay changed it: a clean merge keeps the overlay's version — still verified, never assumed
+      if (blobAt(candidate, p) === hb) continue;
+    }
     const h = readLines(git, headSha, p);
     const m = readLines(git, mainSha, p);
     const c = readLines(git, candidate, p);
@@ -619,17 +647,23 @@ export function autoRefreshAtHold({
     }
   }
   const claimAge = rec.check?.status === 'running' ? now() - Date.parse(rec.check.startedAt || 0) : 0;
+  const promoteAge = rec.check?.promoting ? now() - Date.parse(rec.check.promoting.startedAt || 0) : Infinity;
+  // Round-3 audit: ONE smoke + tests per candidate sha. A candidate that already passed in shadow is not checked again
+  // when the mode turns on: the recorded pass is REUSED and only the registration step runs (inputs re-verified).
+  const promote = mode === 'on' && rec.check?.status === 'passed' && rec.check.candidate === b.candidate
+    && rec.check.mode !== 'on' && !rec.check.registered && promoteAge > AUTO_REFRESH_CHECK_CLAIM_MS;
   const checkWanted = b.verdict === 'clean' && !!b.candidate
-    && (!rec.check || (rec.check.status === 'running' && claimAge > AUTO_REFRESH_CHECK_CLAIM_MS)
-      // a candidate that passed in SHADOW is checked again once the mode is on (the on-path registers it)
-      || (mode === 'on' && rec.check.status === 'passed' && rec.check.mode !== 'on'));
+    && (!rec.check || (rec.check.status === 'running' && claimAge > AUTO_REFRESH_CHECK_CLAIM_MS) || promote);
   let checkDue = false;
+  let reuse = null;
   if (checkWanted && canCheck) {
-    rec.check = { status: 'running', mode, by: `${process.pid}@${hostname()}`, startedAt: new Date(now()).toISOString() };
-    try { writeAutoRefreshRecord(root, rec, stEnv); checkDue = true; } catch { checkDue = false; }
+    const by = `${process.pid}@${hostname()}`;
+    const startedAt = new Date(now()).toISOString();
+    if (promote) { reuse = { smoke: rec.check.smoke, tests: rec.check.tests, testsSummary: rec.check.testsSummary ?? null }; rec.check = { ...rec.check, promoting: { by, startedAt } }; } else rec.check = { status: 'running', mode, candidate: b.candidate, by, startedAt };
+    try { writeAutoRefreshRecord(root, rec, stEnv); checkDue = true; } catch { checkDue = false; reuse = null; }
   }
   return {
-    mode, source, verdict: b.verdict, candidate: b.candidate, checkWanted, checkDue, tests: b.tests, headSha, mainSha,
+    mode, source, verdict: b.verdict, candidate: b.candidate, checkWanted, checkDue, ...(reuse ? { reuse } : {}), tests: b.tests, headSha, mainSha,
     message: describeBuild(mode, b),
   };
 }
@@ -718,7 +752,8 @@ export async function runAutoRefreshCheck({
     ? posix.basename(posix.dirname(root.replace(/\\/g, '/'))) : posix.basename(root);
   const result = { smoke: 'not-run', tests: 'not-run', testsSummary: null, stale: false };
   const path = candidateWorktreePath(root, env, `auto-refresh-${randomBytes(4).toString('hex')}`);
-  try {
+  if (ar.reuse) Object.assign(result, ar.reuse); // the shadow pass of this exact sha: no second smoke or test run
+  else try {
     const c = materializeCandidate({ root, sha: ar.candidate, run, env, path });
     if (!c.ok) result.smoke = `worktree-failed: ${c.reason}`;
     else {
@@ -753,7 +788,7 @@ export async function runAutoRefreshCheck({
   }
   const rec = readAutoRefreshRecord(root, stEnv);
   if (rec && rec.key === `${ar.headSha}:${ar.mainSha}`) {
-    rec.check = { status: passed ? 'passed' : 'failed', mode: ar.mode, ...result, finishedAt: nowIso(), ...(registered ? { registered } : {}) };
+    rec.check = { status: passed ? 'passed' : 'failed', mode: ar.mode, candidate: ar.candidate, ...result, finishedAt: nowIso(), ...(registered ? { registered } : {}) };
     try { writeAutoRefreshRecord(root, rec, stEnv); } catch { /* best-effort */ }
   }
   const verdict = passed ? (ar.mode === 'on' ? (registered?.ok ? 'registered' : 'register-failed') : 'would-adopt') : 'not-adoptable';
