@@ -11,7 +11,7 @@ it('replay reports before, after, projected and residual strictness without proj
   const argv = process.argv;
   const log = vi.spyOn(console, 'log').mockImplementation(() => {});
   try {
-    // Keep the stored evidence inside the live readiness window as calendar time advances.
+    // Keep the fixture inside the live readiness window regardless of the test run date.
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date('2026-10-13T14:00:00Z'));
     process.argv = ['node', 'ledger-readiness', '--replay', '--json'];

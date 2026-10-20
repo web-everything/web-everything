@@ -2,9 +2,10 @@
 bornAs: xf0q813
 kind: story
 size: 3
-status: open
+status: resolved
 scope: ["we:scripts/operations/land-prevention-card.mjs", "we:scripts/lib/card-dedupe.mjs"]
 dateOpened: "2026-10-18"
+dateResolved: "2026-10-19"
 tags: []
 ---
 
