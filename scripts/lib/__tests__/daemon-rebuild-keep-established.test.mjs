@@ -7,7 +7,7 @@
  *   until they were re-adopted at 20:19Z. These tests replay that sequence through the real rebuild path.
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -40,6 +40,7 @@ function fixture() {
   mkdirSync(clone);
   gitOk(clone, ['init', '-q', '-b', 'main']);
   write(clone, DAEMON, lines());
+  write(clone, 'scripts/worker.mjs', 'old\n');
   gitOk(clone, ['add', '-A']);
   gitOk(clone, ['commit', '-q', '-m', 'init']);
   gitOk(clone, ['remote', 'add', 'origin', origin]);
@@ -85,28 +86,37 @@ describe('x5059uu — rebuild keeps established overlays and parks the conflicti
   it('replays 19:54:32Z: #4658/#4663 stay in HEAD, #4643\'s new head is parked with the conflicting file named', async () => {
     const f = fixture();
     for (const o of f.overlays) addOverlay(f.clone, o, { env: f.env });
-    const first = await rebuildClone({ root: f.clone, env: f.env, runSmoke: passSmoke(), prState: async () => 'OPEN' });
+    const logs = [];
+    const first = await rebuildClone({
+      root: f.clone, env: f.env, runSmoke: passSmoke(), prState: async () => 'OPEN', log: { error: (m) => logs.push(m) },
+    });
     expect(first, JSON.stringify(first.alerts)).toMatchObject({ adopted: true });
     const liveHead = gitOk(f.clone, ['rev-parse', 'HEAD']).trim();
     for (const sha of [f.cOld, f.p, f.h]) expect(isAncestor(f.clone, sha, liveHead)).toBe(true);
 
     const cNew = f.pushNewcomer();
-    const logs = [];
+    const smoke = passSmoke();
     const second = await rebuildClone({
-      root: f.clone, env: f.env, runSmoke: passSmoke(), prState: async () => 'OPEN', log: { error: (m) => logs.push(m) },
+      root: f.clone, env: f.env, runSmoke: smoke, prState: async () => 'OPEN', log: { error: (m) => logs.push(m) },
     });
     const head = gitOk(f.clone, ['rev-parse', 'HEAD']).trim();
     expect(isAncestor(f.clone, f.p, head)).toBe(true);
     expect(isAncestor(f.clone, f.h, head)).toBe(true);
     expect(isAncestor(f.clone, cNew, head)).toBe(false);
     const kinds = second.alerts.map((a) => a.kind);
-    expect(kinds).not.toContain('established-overlay-dropped');
+    expect(kinds).toContain('established-overlay-dropped');
+    // c's old tip is also live: parking its new tip must not erase its already-adopted other.txt change.
+    expect(second).toMatchObject({ moved: false, reason: 'established-overlay-conflict' });
+    expect(head).toBe(liveHead);
+    expect(readFileSync(join(f.clone, 'other.txt'), 'utf8')).toBe('c\n');
+    expect(smoke).not.toHaveBeenCalled();
     const parked = second.alerts.find((a) => a.kind === 'overlay-newcomer-parked');
     expect(parked?.detail).toMatchObject({ ref: 'lane/c', pr: 4643, sha: cNew, files: [DAEMON] });
     expect(parked.detail.collidesWith.map((c) => c.ref)).toEqual(['lane/prepare-launch-stall', 'lane/ruled-hold-release']);
     // the newcomer's PR is woken so its author resolves the conflict (merge the established branches in)
     expect(readOverlayConflictWakes(f.env, { maxAgeMs: Infinity }).get(4643)).toMatchObject({ ref: 'lane/c', files: [DAEMON] });
-    // per-step smoke timings are logged on every smoke, fast or slow
+    expect(logs.some((m) => m.includes('established-overlay-hold'))).toBe(true);
+    // The first build still smoked: per-step timings are logged on every smoke, fast or slow.
     expect(logs.some((m) => m.includes('smoke-timings') && m.includes('reconcile-dry-run:148000ms'))).toBe(true);
   });
 
@@ -173,7 +183,7 @@ describe('x5059uu — rebuild keeps established overlays and parks the conflicti
     const { readOverlays } = await import('../daemon-overlays.mjs');
     expect(readOverlays(f.clone, { env: f.env }).map((o) => o.ref)).toEqual(['lane/prepare-launch-stall', 'lane/ruled-hold-release']);
 
-    // The overlay's author merges main in (its new tip is a newcomer): the next rebuild builds, adopts, clears the hold.
+    // The overlay's author resolves its conflict with main: the next rebuild builds, adopts, clears the hold.
     gitOk(author, ['fetch', '-q', 'origin']);
     gitOk(author, ['checkout', '-q', '-B', 'lane/prepare-launch-stall', 'origin/lane/prepare-launch-stall']);
     spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'merge', '-q', 'origin/main'], { cwd: author });
@@ -184,6 +194,153 @@ describe('x5059uu — rebuild keeps established overlays and parks the conflicti
     const third = await rebuildClone({ root: f.clone, env: f.env, runSmoke: passSmoke(), prState: async () => 'OPEN' });
     expect(third, JSON.stringify(third.alerts)).toMatchObject({ adopted: true });
     expect(readRebuildState(f.clone, f.env).held ?? null).toBeNull();
+  });
+
+  it.each([
+    { tip: 'fast-forward', pr: null, release: 'reconciled' },
+    { tip: 'rewritten', pr: 5004, release: 'reconciled' },
+    { tip: 'fast-forward', pr: 5005, release: 'retired' },
+  ])('keeps the hold after a $tip docs-only push until the hotfix is $release', async ({ tip, pr, release }) => {
+    const f = fixture();
+    const ref = 'lane/live';
+    const worker = 'scripts/worker.mjs';
+    // An ordinary, unpinned overlay: the mechanism pin must not be what saves it.
+    f.push(ref, f.init, { [worker]: 'hotfix\n' });
+    addOverlay(f.clone, { ref, pr }, { env: f.env });
+    const first = await rebuildClone({ root: f.clone, env: f.env, runSmoke: passSmoke(), prState: async () => 'OPEN' });
+    expect(first, JSON.stringify(first.alerts)).toMatchObject({ adopted: true });
+    const liveHead = gitOk(f.clone, ['rev-parse', 'HEAD']).trim();
+    f.push('main', f.init, { [worker]: 'main rewrite\n' });
+    const held = await rebuildClone({ root: f.clone, env: f.env, runSmoke: passSmoke(), prState: async () => 'OPEN' });
+    expect(held.reason).toBe('established-overlay-conflict');
+
+    const author = join(dirname(f.clone), 'author');
+    if (tip === 'fast-forward') {
+      f.push(ref, `origin/${ref}`, { 'README.md': 'documentation only\n' });
+    } else {
+      // A force-pushed replacement has the same live hotfix but no ancestry link to its old tip.
+      gitOk(author, ['checkout', '-q', '-B', ref, f.init]);
+      write(author, worker, 'hotfix\n');
+      write(author, 'README.md', 'documentation only\n');
+      gitOk(author, ['add', '-A']);
+      gitOk(author, ['commit', '-q', '-m', 'rewritten hotfix plus docs']);
+      gitOk(author, ['push', '-q', '--force', 'origin', `HEAD:refs/heads/${ref}`]);
+    }
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    expect(isAncestor(f.clone, `origin/${ref}`, liveHead)).toBe(false);
+    const plan = await planRebuild({ git: f.runGit, headSha: liveHead, mainRef: 'origin/main', overlays: [{ ref, pr }] });
+    expect(plan.decisions).toContainEqual(expect.objectContaining({ ref, action: 'drop', reason: 'conflict' }));
+    expect(plan.establishedLost).toEqual([expect.objectContaining({ ref, pr, files: [worker] })]);
+    const { dryRunRebuild } = await import('../daemon-rebuild.mjs');
+    const dry = await dryRunRebuild({ root: f.clone, env: f.env, prState: async () => 'OPEN' });
+    expect(dry.wouldDo).toBe('hold (established-overlay-conflict)');
+    const smoke = passSmoke();
+    const second = await rebuildClone({ root: f.clone, env: f.env, runSmoke: smoke, prState: async () => 'OPEN' });
+    expect(second).toMatchObject({ moved: false, reason: 'established-overlay-conflict' });
+    expect(smoke).not.toHaveBeenCalled();
+    expect(gitOk(f.clone, ['rev-parse', 'HEAD']).trim()).toBe(liveHead);
+    expect(readFileSync(join(f.clone, worker), 'utf8')).toBe('hotfix\n');
+    const { readRebuildState } = await import('../daemon-rebuild/state.mjs');
+    expect(readRebuildState(f.clone, f.env).held).toMatchObject({ reason: 'established-overlay-conflict', lastGood: liveHead });
+
+    if (release === 'retired') {
+      const { removeOverlay } = await import('../daemon-overlays.mjs');
+      removeOverlay(f.clone, ref, { env: f.env, why: 'operator retired the hotfix' });
+      const retired = await rebuildClone({ root: f.clone, env: f.env, runSmoke: passSmoke(), prState: async () => 'OPEN' });
+      expect(retired, JSON.stringify(retired.alerts)).toMatchObject({ adopted: true });
+      expect(readFileSync(join(f.clone, worker), 'utf8')).toBe('main rewrite\n');
+      expect(readRebuildState(f.clone, f.env).held ?? null).toBeNull();
+      return;
+    }
+
+    // Reconcile the hotfix with main: advancing the tip is insufficient, a clean merge is sufficient.
+    gitOk(author, ['fetch', '-q', 'origin']);
+    gitOk(author, ['checkout', '-q', '-B', ref, `origin/${ref}`]);
+    spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'merge', '-q', 'origin/main'], { cwd: author });
+    write(author, worker, 'hotfix + main rewrite\n');
+    gitOk(author, ['add', '-A']);
+    gitOk(author, ['commit', '-q', '-m', 'reconcile main']);
+    gitOk(author, ['push', '-q', 'origin', `HEAD:refs/heads/${ref}`]);
+    const released = await rebuildClone({ root: f.clone, env: f.env, runSmoke: passSmoke(), prState: async () => 'OPEN' });
+    expect(released, JSON.stringify(released.alerts)).toMatchObject({ adopted: true });
+    expect(readFileSync(join(f.clone, worker), 'utf8')).toBe('hotfix + main rewrite\n');
+    expect(readRebuildState(f.clone, f.env).held ?? null).toBeNull();
+  });
+
+  it('protects only the current build and overlay identity, and permits graduation and explicit retirement', async () => {
+    const f = fixture();
+    const ref = 'lane/live';
+    const worker = 'scripts/worker.mjs';
+    const original = f.push(ref, f.init, { [worker]: 'hotfix\n' });
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const live = await planRebuild({ git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref, pr: 5004 }] });
+    f.push(ref, `origin/${ref}`, { 'README.md': 'docs only\n' });
+    f.push('main', f.init, { [worker]: 'main rewrite\n' });
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const options = { git: f.runGit, headSha: live.finalSha, mainRef: 'origin/main', overlays: [{ ref, pr: 5004 }] };
+    const conflicting = await planRebuild(options);
+    expect(conflicting.establishedLost.map((o) => o.ref)).toEqual([ref]);
+    const unreadable = await planRebuild({ ...options, git: (args, opts) => args[0] === 'log'
+      ? { status: 1, stdout: '', stderr: 'history unavailable' } : f.runGit(args, opts) });
+    expect(unreadable.establishedLost.map((o) => o.ref)).toEqual([ref]);
+
+    // Branch reuse by a new PR and a fresh current build must not inherit a previous build's protection.
+    const reused = await planRebuild({ ...options, overlays: [{ ref, pr: 5006 }] });
+    expect(reused.decisions).toContainEqual(expect.objectContaining({ ref, action: 'drop', reason: 'conflict' }));
+    expect(reused.establishedLost).toEqual([]);
+    gitOk(f.clone, ['update-ref', 'HEAD', live.finalSha]);
+    gitOk(f.clone, ['update-ref', 'HEAD', f.init]);
+    const pastBuild = await planRebuild({ ...options, headSha: f.init });
+    expect(pastBuild.establishedLost).toEqual([]);
+    for (const state of ['MERGED', 'CLOSED']) {
+      const retired = await planRebuild({ ...options, prState: async () => state });
+      expect(retired.decisions).toContainEqual(expect.objectContaining({ ref, action: 'remove' }));
+      expect(retired.establishedLost).toEqual([]);
+    }
+    expect((await planRebuild({ ...options, mainOnly: true })).establishedLost).toEqual([]);
+
+    // Main graduates the old tip, but a later overlay change still conflicts. Only the new change is lost.
+    const graduatedMain = f.push('lane/graduated-main', original, { [worker]: 'main follow-up\n' });
+    const author = join(dirname(f.clone), 'author');
+    gitOk(author, ['checkout', '-q', '-B', ref, `origin/${ref}`]);
+    write(author, worker, 'new unproven hotfix\n');
+    gitOk(author, ['commit', '-q', '-am', 'new conflicting change']);
+    gitOk(author, ['push', '-q', 'origin', `HEAD:refs/heads/${ref}`]);
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const graduated = await planRebuild({ ...options, mainRef: graduatedMain });
+    expect(graduated.decisions).toContainEqual(expect.objectContaining({ ref, action: 'drop', reason: 'conflict' }));
+    expect(graduated.establishedLost).toEqual([]);
+  });
+
+  it('protects a docs-advanced stack base carried only through a retired top, but permits a surviving carrier', async () => {
+    const f = fixture();
+    const ref = 'lane/base';
+    const worker = 'scripts/worker.mjs';
+    const oldBase = f.push(ref, f.init, { [worker]: 'hotfix\n' });
+    f.push('lane/top', oldBase, { 'top.txt': 'top\n' });
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const live = await planRebuild({ git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref }, { ref: 'lane/top' }] });
+    expect(live.decisions).toContainEqual(expect.objectContaining({ ref, action: 'skip', reason: 'stack-contained' }));
+    expect(live.applied.map((o) => o.ref)).toEqual(['lane/top']);
+    f.push(ref, `origin/${ref}`, { 'README.md': 'docs only\n' });
+    const movedMain = f.push('main', f.init, { [worker]: 'main rewrite\n' });
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const options = { git: f.runGit, headSha: live.finalSha, mainRef: 'origin/main', overlays: [{ ref }] };
+    // The operator retires the top, leaving the base registered. The base's carried hotfix must survive.
+    const lost = await planRebuild(options);
+    expect(lost.decisions).toContainEqual(expect.objectContaining({ ref, action: 'drop', reason: 'conflict' }));
+    expect(lost.establishedLost.map((o) => o.ref)).toEqual([ref]);
+
+    // A sibling can preserve the old base while disagreeing with the base's newer change.
+    f.push('lane/carrier', oldBase, { [worker]: 'carrier hotfix\n' });
+    f.push(ref, `origin/${ref}`, { [worker]: 'new base hotfix\n' });
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const survives = await planRebuild({ ...options, mainRef: f.init, overlays: [{ ref: 'lane/carrier' }, { ref }], stackMode: 'independent' });
+    expect(survives.applied.map((o) => o.ref)).toEqual(['lane/carrier']);
+    expect(survives.decisions).toContainEqual(expect.objectContaining({ ref, action: 'drop', reason: 'conflict' }));
+    expect(survives.establishedLost).toEqual([]);
+    expect(isAncestor(f.clone, oldBase, survives.finalSha)).toBe(true);
+    expect(isAncestor(f.clone, movedMain, survives.finalSha)).toBe(false);
   });
 
   // x9diisp — the attributed smoke fallback (set the culprit aside, keep the rest) replans without the culprit. Here the
