@@ -86,9 +86,11 @@ export function dryMergeOnto({ head, tip, cwd = process.cwd(), run = gitRun }) {
 
 /**
  * Decide whether a card-only overlap may enqueue. Returns `{ relieve, line }`; the caller logs `line` and keeps
- * its deferral unless `relieve` is true.
+ * its deferral unless `relieve` is true. `queuedNums` is the queue membership the overlap was computed from; the
+ * tip read must show exactly that membership, or a PR that joined in between (whose files were never compared)
+ * could ride along unchecked.
  */
-export function cardOverlapRelief({ num, headSha, overlap, repo, setting, exec = execFileSync, cwd, run = gitRun, readTip = readQueueTip }) {
+export function cardOverlapRelief({ num, headSha, overlap, queuedNums, repo, setting, exec = execFileSync, cwd, run = gitRun, readTip = readQueueTip }) {
   if (!setting?.enabled || !overlap?.overlap) return { relieve: false, line: null };
   const blockers = (overlap.with ?? []).map(entry => `#${entry.num}`).join(',');
   const tag = `card-overlap clean-merge: #${num} with ${blockers}`;
@@ -99,6 +101,12 @@ export function cardOverlapRelief({ num, headSha, overlap, repo, setting, exec =
   try {
     const tip = readTip({ repo, exec });
     if (tip.error) return { relieve: false, line: `${tag} → skip: queue tip unknown (${tip.error}) — ${src}` };
+    const same = (a, b) => a.length === b.length && a.every(n => b.includes(n));
+    const checked = Array.isArray(queuedNums) ? [...new Set(queuedNums.filter(n => n !== num))] : null;
+    const atTip = Array.isArray(tip.entries) ? [...new Set(tip.entries.filter(n => n !== num))] : null;
+    if (!checked || !atTip || !same(checked, atTip)) {
+      return { relieve: false, line: `${tag} → skip: queue changed between reads — ${src}` };
+    }
     const m = dryMergeOnto({ head: headSha, tip: tip.sha, cwd, run });
     if (m.clean) return { relieve: true, line: `${tag} → enqueue (clean onto queue tip ${tip.sha.slice(0, 10)} after #${tip.num}) — ${src}` };
     if (m.conflict) return { relieve: false, line: `${tag} → skip: conflict (${m.paths.slice(0, 3).join(', ') || 'unnamed paths'}) — ${src}` };

@@ -52,13 +52,17 @@ describe('card-overlap clean-merge', () => {
     const overlap = { overlap: true, with: [{ num: 7, files: ['backlog/1-card.md'] }], unknown: [] };
     const setting = { enabled: true, source: 'tool' };
     try {
-      const ok = cardOverlapRelief({ num: 9, headSha: r.clean, overlap, repo: 'o/r', setting, cwd: r.dir, readTip: () => ({ sha: r.tip, num: 7 }) });
+      const ok = cardOverlapRelief({ num: 9, headSha: r.clean, overlap, repo: 'o/r', setting, cwd: r.dir, queuedNums: [7], readTip: () => ({ sha: r.tip, num: 7, entries: [7] }) });
       expect(ok.relieve).toBe(true);
       expect(ok.line).toMatch(/^card-overlap clean-merge: #9 with #7 → enqueue .*drain\.cardOverlapCleanMerge=on \(tool\)$/);
-      const bad = cardOverlapRelief({ num: 9, headSha: r.conflict, overlap, repo: 'o/r', setting, cwd: r.dir, readTip: () => ({ sha: r.tip, num: 7 }) });
+      const bad = cardOverlapRelief({ num: 9, headSha: r.conflict, overlap, repo: 'o/r', setting, cwd: r.dir, queuedNums: [7], readTip: () => ({ sha: r.tip, num: 7, entries: [7] }) });
       expect(bad).toMatchObject({ relieve: false, line: expect.stringContaining('→ skip: conflict') });
       expect(cardOverlapRelief({ num: 9, headSha: r.clean, overlap, repo: 'o/r', setting, cwd: r.dir, readTip: () => { throw new Error('boom'); } }))
         .toMatchObject({ relieve: false, line: expect.stringContaining('→ skip: error (boom)') });
+      expect(cardOverlapRelief({ num: 9, headSha: r.clean, overlap, queuedNums: [7], repo: 'o/r', setting, cwd: r.dir, readTip: () => ({ sha: r.tip, num: 8, entries: [7, 8] }) }))
+        .toMatchObject({ relieve: false, line: expect.stringContaining('→ skip: queue changed between reads') });
+      expect(cardOverlapRelief({ num: 9, headSha: r.clean, overlap, repo: 'o/r', setting, cwd: r.dir, readTip: () => ({ sha: r.tip, num: 7, entries: [7] }) }))
+        .toMatchObject({ relieve: false, line: expect.stringContaining('→ skip: queue changed between reads') });
       expect(cardOverlapRelief({ num: 9, headSha: r.clean, overlap, repo: 'o/r', setting: { enabled: false }, cwd: r.dir })).toEqual({ relieve: false, line: null });
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
   });

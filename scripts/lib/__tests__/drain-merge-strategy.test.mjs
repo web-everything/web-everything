@@ -1576,7 +1576,7 @@ describe('card-overlap clean-merge relief (drain.cardOverlapCleanMerge)', () => 
   } } } } });
   const mergeRun = status => vi.fn((cmd, args) => args[0] === 'cat-file' ? { status: 0 }
     : args[0] === 'merge-tree' ? { status, stdout: status === 0 ? `${'d'.repeat(40)}\n` : `${'d'.repeat(40)}\n${card}\n` } : { status: 128 });
-  const setup = ({ enabled = true, status = 0, tip = { sha: TIP, num: 43 }, queuedFiles = [card], files = [card] } = {}) => {
+  const setup = ({ enabled = true, status = 0, tip = { sha: TIP, num: 43, entries: [43] }, queuedFiles = [card], files = [card] } = {}) => {
     const readQueueTip = vi.fn(() => tip);
     const cardMergeRun = mergeRun(status);
     const h = harness({ strategy: 'github-merge-queue', queueFacts: facts([43]), ghView: { 43: { files: queuedFiles.map(path => ({ path })) } },
@@ -1600,6 +1600,7 @@ describe('card-overlap clean-merge relief (drain.cardOverlapCleanMerge)', () => 
   it.each([
     ['merge-tree error', { status: 128 }],
     ['queue tip unknown', { tip: { error: 'a queue entry has no merge-group commit yet' } }],
+    ['queue changed between reads', { tip: { sha: TIP, num: 44, entries: [43, 44] } }],
   ])('keeps the deferral on %s', (_name, over) => {
     const h = setup(over);
     expect(h.s.enqueue(h.c, HEAD, { comments: stampedBy(DRAIN) })).toMatchObject({ enqueued: false, kind: 'queue-file-overlap' });

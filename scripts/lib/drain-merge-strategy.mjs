@@ -303,9 +303,9 @@ export function createDrainMergeStrategy({
     catch { cardMergeSetting = { enabled: false, source: 'unreadable' }; }
   }
   /** A card-only overlap that dry-merges cleanly onto the queue tip is not a hold; anything else keeps it. */
-  const cardOverlapEnqueues = (c, headSha, overlap) => {
+  const cardOverlapEnqueues = (c, headSha, overlap, queue) => {
     if (!cardMergeSetting.enabled || !overlap.overlap) return false;
-    const r = cardOverlapRelief({ num: c.num, headSha, overlap, repo: slugOf(c.repo), setting: cardMergeSetting,
+    const r = cardOverlapRelief({ num: c.num, headSha, overlap, queuedNums: queue.entries.map(entry => entry.num), repo: slugOf(c.repo), setting: cardMergeSetting,
       exec, cwd, readTip: readQueueTip, ...(cardMergeRun ? { run: cardMergeRun } : {}) });
     if (r.line) say(`  ${r.line}`);
     return r.relieve === true;
@@ -612,7 +612,7 @@ export function createDrainMergeStrategy({
       const queue = cachedQueue(repo, decision);
       if (queue.error) return null;
       const overlap = pickQueueOverlap(c, candidateFiles, queue);
-      if (overlap.overlap && cardOverlapEnqueues(c, headSha, overlap)) return null;
+      if (overlap.overlap && cardOverlapEnqueues(c, headSha, overlap, queue)) return null;
       if (overlap.overlap) stampReserve(c, headSha, candidateFiles);
       return overlap.overlap ? { kind: 'queue-file-overlap', reason: overlap.reason, deferred: true } : null;
     },
@@ -782,7 +782,7 @@ export function createDrainMergeStrategy({
           const source = safety.sources?.queueFileOverlapIncludesCards ?? 'standard';
           const overlap = pickQueueOverlap(c, candidateFiles, queue);
           if (overlap.unknown.length) say(`  merge-queue file-overlap: unknown files for ${overlap.unknown.map(num => `#${num}`).join(',')} — continuing without those entries`);
-          if (overlap.overlap && !cardOverlapEnqueues(c, headSha, overlap)) {
+          if (overlap.overlap && !cardOverlapEnqueues(c, headSha, overlap, queue)) {
             stampReserve(c, headSha, candidateFiles, true);
             const first = overlap.with[0];
             say(`  merge-queue file-overlap: defer #${c.num} (shares ${first.files[0]} with queued #${first.num}) — includeCards=${includeCards} (${source})`);
