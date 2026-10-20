@@ -236,6 +236,32 @@ export function formatOperatorHoldsRecord({ repo, observedAt, intervalMs, holds 
 const ALWAYS_EXPLAINED_LABEL = 'review:human';
 
 /**
+ * The dispatch order for this tick's owed reviews. Pure, stable. Rank 0: a main-fix PR (the plan marks it
+ * `mainFix`); rank 1: a PR someone is blocked on (`review:human` or `ready-to-merge`); rank 2: the rest.
+ * Within a rank the oldest PR (lowest number) goes first. Only the plan's own review rows move: a red-team
+ * request row (`redTeamRequest` / `carriedAcceptHead`) keeps its slot, since the code that adds those rows already
+ * places them deliberately (the main-fix PR's red-team first).
+ * @param {Array<object>} reviews
+ * @param {{labelsByPr?:Map<number, Array<string|{name:string}>>, plan?:{dispatch?:Array<object>}}} [o]
+ */
+export function orderReviewsForDispatch(reviews, { labelsByPr = new Map(), plan = {} } = {}) {
+  const mainFixPrs = new Set((plan?.dispatch ?? []).filter((d) => d?.mainFix).map((d) => Number(d.prNumber)));
+  const rank = (d) => {
+    const n = Number(d?.prNumber);
+    if (d?.mainFix || mainFixPrs.has(n)) return 0;
+    const names = (labelsByPr.get(n) ?? []).map((l) => (typeof l === 'string' ? l : l?.name));
+    return names.includes('review:human') || names.includes('ready-to-merge') ? 1 : 2;
+  };
+  const movable = (d) => !d?.redTeamRequest && !d?.carriedAcceptHead;
+  const slots = reviews.map((d, i) => (movable(d) ? i : -1)).filter((i) => i >= 0);
+  const sorted = slots.map((i) => ({ d: reviews[i], i, r: rank(reviews[i]), n: Number(reviews[i]?.prNumber) }))
+    .sort((a, b) => a.r - b.r || (Number.isFinite(a.n) && Number.isFinite(b.n) ? a.n - b.n : 0) || a.i - b.i);
+  const out = [...reviews];
+  slots.forEach((slot, k) => { out[slot] = sorted[k].d; });
+  return out;
+}
+
+/**
  * Live-caught 2026-09-26 (WE PRs #2746–#2758 sat `review:pending` for ~an hour while every tick logged only
  * "N owed" — nothing said WHY each parked PR was skipped, so a correct `live-process` refusal (a stale fix /
  * ci-heal session still bound to the PR) looked exactly like a discovery bug). For every open PR carrying
@@ -243,10 +269,10 @@ const ALWAYS_EXPLAINED_LABEL = 'review:human';
  * plan — never re-derived. Pure. `prs` is the tick's own shared `gh pr list` read; `null` (the opt-out
  * no-shared-reads path) returns `[]`, since there is then no label list to scan.
  * @param {{prs:Array<object>|null, plan:{dispatch?:Array<object>, refusals?:Array<object>}, dispatchable:Array<object>,
- *   deferredForLanes?:Array<object>, paused?:boolean}} o
+ *   deferredForLanes?:Array<object>, paused?:boolean, deferReason?:string}} o
  * @returns {Array<{prNumber:number, labels:string[], reasons:string[]}>}
  */
-export function explainPendingNotDispatched({ prs, plan, dispatchable = [], deferredForLanes = [], paused = false }) {
+export function explainPendingNotDispatched({ prs, plan, dispatchable = [], deferredForLanes = [], paused = false, deferReason = null }) {
   if (!Array.isArray(prs)) return [];
   const labelName = (l) => (typeof l === 'string' ? l : l?.name);
   const sent = new Set(dispatchable.map((d) => Number(d.prNumber)));
@@ -267,7 +293,7 @@ export function explainPendingNotDispatched({ prs, plan, dispatchable = [], defe
     const held = (pr?.labels ?? []).map(labelName).filter((l) => EXPLAINED_HOLD_LABELS.includes(l));
     if (held.length === 0) continue;
     const reasons = [];
-    if (deferred.has(n)) reasons.push(paused ? 'review owed, but dispatch is paused (Claude login)' : 'review owed, but no acquirable lane this tick');
+    if (deferred.has(n)) reasons.push(deferReason ?? (paused ? 'review owed, but dispatch is paused (Claude login)' : 'review owed, but no acquirable lane this tick'));
     for (const d of (plan?.dispatch ?? [])) {
       if (Number(d?.prNumber) === n && d.kind !== 'review') reasons.push(`owed a ${d.kind}, not a review — ${d.why ?? ''}`.trim());
     }
@@ -631,14 +657,25 @@ export function runReviewTick({
   // whole block): every review stays owed exactly like a lane-starved tick already does (`reviewsOwed` and
   // `statusCandidates` below are unaffected), so nothing here re-derives a second "was anything dispatched"
   // path — it is the SAME deferred-not-lost shape `deferredForLanes` already models, just for a different cause.
+  // 2026-10-20 — when this tick can dispatch fewer reviews than are owed, the scarce seats go in priority
+  // order (see orderReviewsForDispatch): main-fix first, then PRs a human or the merge queue waits on, oldest first.
+  reviews.splice(0, reviews.length, ...orderReviewsForDispatch(reviews, { labelsByPr, plan }));
   const lanes = paused ? 0 : acquirableLanes({ repo });
   const acquirable = Math.max(0, (Array.isArray(lanes) ? lanes.length : Number(lanes)) || 0);
   const liveCap = liveReviewBudget && Number.isFinite(liveReviewBudget.left) ? Math.max(0, liveReviewBudget.left) : Infinity;
   const dispatchable = reviews.slice(0, Math.min(reviews.length, acquirable, liveCap));
   if (liveReviewBudget && Number.isFinite(liveReviewBudget.left)) liveReviewBudget.left = Math.max(0, liveReviewBudget.left - dispatchable.length);
   if (liveCap < reviews.length && liveReviewBudget?.reason) process.stderr.write(`review-daemon: ${reviews.length - dispatchable.length} owed review(s) queued — ${liveReviewBudget.reason}\n`);
-  const deferredForLanes = paused ? 0 : reviews.length - dispatchable.length;
-  const deferredForAuth = paused ? reviews.length - dispatchable.length : 0;
+  // Which limit held the rest back: the live-review cap (when it is the tighter limit) or the lane pool.
+  // Only a lane shortfall is reported as "no acquirable lane" — health smells read that text as lane starvation.
+  const capBound = !paused && liveCap < acquirable;
+  const deferredTotal = reviews.length - dispatchable.length;
+  const deferredForCap = capBound ? deferredTotal : 0;
+  const deferredForLanes = paused || capBound ? 0 : deferredTotal;
+  const deferredForAuth = paused ? deferredTotal : 0;
+  const deferReason = paused ? 'review owed, but dispatch is paused (Claude login)'
+    : capBound ? `review owed, but held by the live-review cap (${liveReviewBudget?.reason ?? `maxLiveReviewRounds, ${liveCap} left`}; ${acquirable} lane(s) acquirable)`
+      : `review owed, but no acquirable lane this tick (${acquirable} acquirable)`;
   if (poolExhaustion && !paused) {
     try {
       if (acquirable === 0 && deferredForLanes > 0) poolExhaustion.exhausted({ repo, lanePoolRepo: poolExhaustionLanePoolRepo(repo), deferred: deferredForLanes });
@@ -755,9 +792,10 @@ export function runReviewTick({
   return {
     reviewsOwed: reviews.length, dispatched, failed, notStarted, refusals: (plan.refusals ?? []).length,
     pendingNotDispatched: explainPendingNotDispatched({
-      prs: rawPrs, plan, dispatchable, deferredForLanes: reviews.slice(dispatchable.length), paused,
+      prs: rawPrs, plan, dispatchable, deferredForLanes: reviews.slice(dispatchable.length), paused, deferReason,
     }),
-    reconcileError: null, deferredForLanes, deferredForAuth, operatorHolds, staleStatusSwept, staleConflictStatusCleared,
+    reconcileError: null, deferredForLanes, deferredForCap, deferredForCapReason: deferredForCap ? (liveReviewBudget?.reason ?? null) : null,
+    deferredForAuth, operatorHolds, staleStatusSwept, staleConflictStatusCleared,
     authPaused: paused, authPauseReason: paused ? pauseReason : null,
     holdReconcile: holdReconcileResults, holdReconcileError,
     ...(scopeBloatRefreshed.length ? { scopeBloatRefreshed } : {}),
@@ -846,6 +884,8 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
   let reviewsOwed = 0;
   let refusals = 0;
   let deferredForLanes = 0;
+  let deferredForCap = 0;
+  let deferredForCapReason = null;
   let deferredForAuth = 0;
   const liveProcessPrs = [];
   const operatorHoldSnapshots = [];
@@ -864,6 +904,8 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
     reviewsOwed += result.reviewsOwed;
     refusals += result.refusals;
     deferredForLanes += result.deferredForLanes ?? 0;
+    deferredForCap += result.deferredForCap ?? 0;
+    if (result.deferredForCapReason) deferredForCapReason = result.deferredForCapReason;
     deferredForAuth += result.deferredForAuth ?? 0;
     for (const d of result.dispatched) dispatched.push({ ...d, repo });
     for (const k of (result.notStarted ?? [])) notStarted.push({ ...k, repo });
@@ -873,7 +915,7 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
     if (result.operatorHolds) operatorHoldSnapshots.push({ repo, ...result.operatorHolds });
   }
   return {
-    repos: perRepo, perRepoMs, reviewsOwed, dispatched, failed, notStarted, pendingNotDispatched, refusals, reconcileFailed, deferredForLanes,
+    repos: perRepo, perRepoMs, reviewsOwed, dispatched, failed, notStarted, pendingNotDispatched, refusals, reconcileFailed, deferredForLanes, deferredForCap, deferredForCapReason,
     deferredForAuth, authPaused: authGate.paused, authPauseReason: authGate.reason,
     holdReconcile: holdReconcileRemoved, holdReconcileFailed,
     operatorHoldSnapshots,
@@ -1169,6 +1211,34 @@ export function priorityNamesForLiveProcessPrs(liveProcessPrs) {
   return names;
 }
 
+/**
+ * How many review rounds are live in a `ps -A -o command=` listing. A line counts only when the script node RUNS
+ * is the review script itself — never when the name merely appears in an argument. Live-caught 2026-10-20: two
+ * `verify-lane.mjs` runs whose changed-file list named `review-job.mjs` counted as 2 of the 3 allowed rounds, so
+ * the daemon dispatched nothing with 1 real round live. A round is one job or one bare loop (a job runs a loop).
+ * @param {string[]} lines
+ */
+export function countLiveReviewRounds(lines) {
+  // Runtimes that run a script file, and the runtime flags that take their value as the NEXT word (a preload,
+  // a loader): those values are not the script. An unknown runtime still counts when its argv[0] is the script.
+  const RUNTIME = /(^|\/)(node|nodejs|bun|electron)(\.exe)?$/;
+  const VALUE_FLAGS = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader', '--env-file',
+    '-C', '--conditions', '--title', '--input-type', '--experimental-config-file']);
+  const script = (line) => {
+    const tokens = String(line).trim().split(/\s+/);
+    if (!RUNTIME.test(tokens[0] ?? '')) return (tokens[0] ?? '').split('/').pop(); // run directly (shebang)
+    for (let i = 1; i < tokens.length; i++) {
+      const t = tokens[i];
+      if (VALUE_FLAGS.has(t)) { i++; continue; }
+      if (t.startsWith('-')) continue;
+      return t.split('/').pop();
+    }
+    return '';
+  };
+  const names = lines.map(script);
+  return Math.max(names.filter((n) => n === 'review-job.mjs').length, names.filter((n) => n === 'review-loop-cli.mjs').length);
+}
+
 /** EMERGENCY 2026-10-20 — the host-wide cap on live review rounds, from the tool layer
  *  (`scripts/settings/review-concurrency.json`, source logged by the cascade). Counts live `review-job.mjs` /
  *  `review-loop-cli.mjs` processes (a round is one job, or one bare loop). An unreadable `ps` fails closed (no new
@@ -1188,8 +1258,7 @@ export function liveReviewRoundBudget({ env = process.env, listCommands = () => 
   const src = r.sources?.maxLiveReviewRounds ?? 'standard';
   let lines;
   try { lines = String(listCommands()).split('\n'); } catch (e) { return { left: 0, reason: `live review rounds unknown (${String(e?.message ?? e).split('\n')[0]}); maxLiveReviewRounds=${max} (${src})` }; }
-  const count = (re) => lines.filter((l) => re.test(l)).length;
-  const live = Math.max(count(/review-job\.mjs/), count(/review-loop-cli\.mjs/));
+  const live = countLiveReviewRounds(lines);
   return { left: Math.max(0, max - live), live, max, reason: `live review rounds ${live} of maxLiveReviewRounds=${max} (${src})` };
 }
 
@@ -1329,7 +1398,7 @@ export function buildCliDaemonEffects({
       // A `withSelfSync`-skipped tick (`skippedTick`: `repos: []`) used to print as "tick () — 0 owed", which read
       // like discovery had watched NO repo. Say what actually happened.
       if (result?.skipped) { log.error(`review-daemon: tick skipped (${result.reason ?? 'unknown'}) — no repo was read this tick`); return; }
-      log.error(`review-daemon: tick (${result.repos.map((r) => r.repo).join(', ')}) — ${result.reviewsOwed} owed, dispatched ${result.dispatched.length}, failed ${result.failed.length}${result.deferredForLanes ? `, deferred ${result.deferredForLanes} (no acquirable lane this tick, #3383)` : ''}`);
+      log.error(`review-daemon: tick (${result.repos.map((r) => r.repo).join(', ')}) — ${result.reviewsOwed} owed, dispatched ${result.dispatched.length}, failed ${result.failed.length}${result.deferredForLanes ? `, deferred ${result.deferredForLanes} (no acquirable lane this tick, #3383)` : ''}${result.deferredForCap ? `, queued ${result.deferredForCap} (live-review cap: ${result.deferredForCapReason ?? 'maxLiveReviewRounds'})` : ''}`);
       // card x5kagse (epic #4075/#3383) — logged EVERY tick review dispatch stays paused, exact wording
       // required by the card and matched by the soak scenario/live-proof read.
       // One structured record per successfully planned repository; the health watch's `operator-hold-aged` smell reads
