@@ -93,18 +93,50 @@ function fromKey(key) {
   if (!m) throw new Error(`needs-you-feed: invalid state key ${key}`);
   return { repo: m[1], pr: Number(m[2]), head: m[3], was: m[4] };
 }
+const conditionOf = i => `${i.repo}#${i.pr}:${i.kind}`;
+/**
+ * An empty/unknown head is never a distinct key (PR #5716 flapped every pass: a failed head lookup published
+ * `@:at-round-limit` and cleared `@<sha>`, the next good lookup did the reverse). Dedupe per PR+condition:
+ *  - head unknown + that condition already open → keep the open key(s); publish and clear nothing;
+ *  - head unknown + nothing open → hold: publish nothing until a read knows the head;
+ *  - head known + only a legacy head-less key open for that condition → adopt it silently (no repost, no clear).
+ * Distinct KNOWN heads stay distinct keys (a new head is a new event).
+ */
+function resolveCurrent(prev, items) {
+  const prevByCondition = new Map();
+  for (const key of prev) {
+    const k = fromKey(key), condition = conditionOf({ ...k, kind: k.was });
+    prevByCondition.set(condition, [...(prevByCondition.get(condition) ?? []), { key, head: k.head }]);
+  }
+  const current = new Map(), carried = new Set(), adopted = new Set(), retired = new Set();
+  const known = items.filter(i => i.head), unknown = items.filter(i => !i.head);
+  for (const item of known) {
+    const key = keyOf(item), open = prevByCondition.get(conditionOf(item)) ?? [];
+    current.set(key, item);
+    if (!prev.has(key) && open.length && open.every(o => !o.head)) { adopted.add(key); for (const o of open) retired.add(o.key); }
+  }
+  for (const item of unknown) {
+    const condition = conditionOf(item);
+    if (known.some(k => conditionOf(k) === condition)) continue;
+    for (const o of prevByCondition.get(condition) ?? []) carried.add(o.key);
+  }
+  return { current, carried, adopted, retired };
+}
 export function diffFeed(prevOpenKeys, items, now, { incomplete = items.incomplete } = {}) {
-  const at = new Date(now).toISOString(), prev = new Set(prevOpenKeys), current = new Map(items.map(sanitizeItem).map(i => [keyOf(i), i]));
+  const at = new Date(now).toISOString(), prev = new Set(prevOpenKeys);
+  const { current, carried, adopted, retired } = resolveCurrent(prev, items.map(sanitizeItem));
   const lines = [];
-  for (const [key, item] of current) if (!prev.has(key)) {
+  for (const [key, item] of current) if (!prev.has(key) && !adopted.has(key)) {
     const event = { at, ...item };
     lines.push(`NEEDS-YOU ${item.repo}#${item.pr} ${item.kind}: ${item.reason}${item.title ? ` | title (untrusted): ${JSON.stringify(item.title)}` : ''}${item.pick || item.command ? ` | pick: ${item.pick || item.command}` : ''} ${JSON.stringify(event)}`);
   }
-  if (!incomplete) for (const key of prev) if (!current.has(key)) {
+  if (!incomplete) for (const key of prev) if (!current.has(key) && !carried.has(key) && !retired.has(key)) {
     const event = { at, kind: 'cleared', ...sanitizeItem(fromKey(key)) };
     lines.push(`NEEDS-YOU-CLEARED ${event.repo}#${event.pr} left ${event.was} ${JSON.stringify(event)}`);
   }
-  return { lines, openKeys: [...new Set([...(incomplete ? prev : []), ...current.keys()])] };
+  // An adopted legacy head-less key is replaced by its known-head key; a carried key stays open as-is.
+  const kept = [...(incomplete ? prev : []), ...carried].filter(key => !retired.has(key));
+  return { lines, openKeys: [...new Set([...kept, ...current.keys()])] };
 }
 export function parseFeedLine(line) {
   if (!/^NEEDS-YOU(?:-CLEARED)? /.test(line)) return null;
