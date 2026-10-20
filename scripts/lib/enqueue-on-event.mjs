@@ -652,8 +652,10 @@ export function createEnqueueOnEvent({
     const queueCatchUp = (num) => {
       const key = `${localSlug}#${num}`;
       const held = pending.get(key);
-      if (held && stalePending(held)) {
-        pending = new Map(pending).set(key, { ...held, causes: [...new Set([...held.causes, 'catch-up'])], catchUp: true,
+      // Converted to PURE catch-up work (causes ['catch-up']) so the backoff and unchanged-hold guards, which apply
+      // only to catch-up-only work, still hold it; a main fix's own event path is never converted.
+      if (held && stalePending(held) && !ownsFix(held.num, held.repo)) {
+        pending = new Map(pending).set(key, { ...held, causes: ['catch-up'], catchUp: true,
           firstAt: now() + catchUpIndex++, lastAt: Math.min(held.lastAt, now() - s.debounceSeconds * 1000) });
         return true;
       }
