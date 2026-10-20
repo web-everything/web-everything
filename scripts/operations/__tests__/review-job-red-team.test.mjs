@@ -252,22 +252,47 @@ it.each(['missing', 'mismatched', 'valid'])('requires %s existing provenance for
 // 2026-10-20 — live #5729/#5752/#5485: in panel-seat mode a speculative pass the jurors' findings made `stale`
 // was recorded as the red team's ERROR ("the speculative brief could not carry"), so the PR stayed
 // red-team:pending. It must fall back to the sequential pass, exactly as the post-accept path does.
-it.each(['stale', 'superseded'])('a panel-seat speculative %s result runs the sequential red team', status => {
-  const { io, calls } = jobIo(payload());
-  io.redTeamTimingSetting = () => ({ value: { timing: 'panel-seat' }, sources: {}, invalid: [] });
-  io.startSpeculativeRedTeam = () => ({ pid: 123, startedAt: NOW });
-  io.speculativeReadSunk = () => true;
-  io.awaitSpeculativeRedTeam = () => ({ spec: { status: 'speculated', rev: HEAD_1 } });
-  io.finishSpeculativeRedTeam = () => ({ status, reason: 'the jurors raised 1 finding(s) the speculative brief could not carry' });
-  io.recordDiscardedRedTeam = () => ({ status: 'recorded' });
-  io.cleanupSpeculativeRedTeam = () => {};
-  const statuses = [];
-  io.redTeamStatus = (s) => statuses.push(s);
-  io.runRedTeam = (input) => { calls.push(['red-team', input.loopPayload.findings.read.netBasis.rev]);
-    return { status: 'ran', foldedVerdict: 'accept', findings: [], recheckStatus: 'not-needed', comment: { status: 'posted' } }; };
-  const out = runReviewJob({ pr: 4722, repo: REPO, pid: 1 }, io);
-  expect(dispatched(calls)).toEqual([HEAD_1]);
-  expect(out.outcome).not.toBe('blocked-on-infra');
-  expect(statuses.at(-1)).toMatchObject({ status: 'finished', result: expect.objectContaining({ status: 'ran' }) });
-  expect(calls.some(c => c[0] === 'log' && /speculative pass (stale|superseded); sequential pass → ran/.test(c[1]))).toBe(true);
+describe('panel-seat speculative fallback', () => {
+  const RAN = { status: 'ran', foldedVerdict: 'accept', findings: [], recheckStatus: 'not-needed', comment: { status: 'posted' } };
+  const EVIDENCE = { callId: 'prior-call', provider: 'codex', model: 'm', findings: [], recheckStatus: 'ok', foldedVerdict: 'accept', confirmedMissCount: 0 };
+  const panelIo = ({ status, sequential, evidence = null }) => {
+    const { io, calls } = jobIo(payload());
+    io.redTeamTimingSetting = () => ({ value: { timing: 'panel-seat' }, sources: {}, invalid: [] });
+    io.startSpeculativeRedTeam = () => ({ pid: 123, startedAt: NOW });
+    io.speculativeReadSunk = () => true;
+    io.awaitSpeculativeRedTeam = () => ({ spec: { status: 'speculated', rev: HEAD_1 } });
+    io.finishSpeculativeRedTeam = () => ({ status, reason: 'the jurors raised 1 finding(s) the speculative brief could not carry' });
+    io.recordDiscardedRedTeam = () => ({ status: 'recorded' });
+    io.cleanupSpeculativeRedTeam = () => {};
+    io.readPriorRedTeamEvidence = () => evidence;
+    const statuses = [];
+    io.redTeamStatus = (s) => statuses.push(s);
+    io.runRedTeam = (input) => { calls.push(['red-team', input.loopPayload.findings.read.netBasis.rev]); return sequential; };
+    return { io, calls, statuses };
+  };
+
+  it('stale runs the sequential red team and records its result', () => {
+    const { io, calls, statuses } = panelIo({ status: 'stale', sequential: RAN });
+    const out = runReviewJob({ pr: 4722, repo: REPO, pid: 1 }, io);
+    expect(dispatched(calls)).toEqual([HEAD_1]);
+    expect(calls.some(c => c[0] === 'gate')).toBe(true);
+    expect(out.outcome).not.toBe('blocked-on-infra');
+    expect(statuses.at(-1)).toMatchObject({ status: 'finished', result: expect.objectContaining({ status: 'ran' }) });
+    expect(calls.some(c => c[0] === 'log' && /speculative pass stale; sequential pass → ran/.test(c[1]))).toBe(true);
+  });
+
+  it.each(['already-ran', 'resumed'])('superseded + sequential %s folds the verified prior row and runs the gate', seq => {
+    const { io, calls, statuses } = panelIo({ status: 'superseded', sequential: { status: seq, callId: 'prior-call', rev: HEAD_1 }, evidence: EVIDENCE });
+    const out = runReviewJob({ pr: 4722, repo: REPO, pid: 1 }, io);
+    expect(calls.some(c => c[0] === 'gate')).toBe(true);
+    expect(out.outcome).not.toBe('blocked-on-infra');
+    expect(statuses.at(-1)).toMatchObject({ status: 'finished', result: expect.objectContaining({ status: 'ran', recheckStatus: 'ok' }) });
+  });
+
+  it('superseded + sequential already-ran with NO verified row stays an incomplete result (never folds to accept)', () => {
+    const { io, calls } = panelIo({ status: 'superseded', sequential: { status: 'already-ran', callId: 'prior-call', rev: HEAD_1 } });
+    const out = runReviewJob({ pr: 4722, repo: REPO, pid: 1 }, io);
+    expect(calls.some(c => c[0] === 'gate')).toBe(false);
+    expect(out.outcome).toBe('blocked-on-infra');
+  });
 });

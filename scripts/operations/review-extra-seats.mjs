@@ -1028,6 +1028,20 @@ function verifiedPriorRedTeamRow(records, { repo, pr, rev, env }) {
 }
 
 /**
+ * 2026-10-20 — the verified prior red-team row for `(pr, rev)` as the evidence fields a panel seat folds
+ * (findings, re-check, verdict), or null. The same normalisation {@link finishSpeculativeRedTeam}'s prior-row path
+ * applies, for a sequential fallback that came back `resumed` / `already-ran`. Never throws.
+ */
+export function readVerifiedPriorRedTeamEvidence({ repo, pr, rev, env = process.env } = {}, io = createRedTeamIo({ env })) {
+  try {
+    const prior = verifiedPriorRedTeamRow(io.readRecords(), { repo, pr: Number(pr), rev, env });
+    if (!prior) return null;
+    return { callId: prior.callId, provider: prior.provider, model: prior.model, findings: prior.findings ?? [],
+      recheckStatus: prior.recheckStatus, foldedVerdict: prior.foldedVerdict, confirmedMissCount: prior.confirmedMissCount ?? 0 };
+  } catch { return null; }
+}
+
+/**
  * Has this `(pr, head)` already had a red-team pass that ran cleanly? PURE. A clean row only stops the MODEL from
  * running again — the effects after it (miss rows, delegation trial, comment) are re-checked and finished by
  * {@link runRedTeam} on the next run, so a failure between the row and those effects never strands them.
