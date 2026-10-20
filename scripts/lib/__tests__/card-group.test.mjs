@@ -236,12 +236,14 @@ describe('reservation, membership, queue wait', () => {
     expect(cardGroupHold(state, { num: 7, localSlug: 'o/r', files: [{ path: 'backlog/2-b.md' }] })).toBeNull();
     expect(cardGroupHold(state, { num: 9, localSlug: 'o/r', files: ['backlog/1-a.md'] })).toBeNull();
   });
-  it('membership covers sources, the combined PR, card-group branches, and unreadable state', () => {
-    expect(inCardGroup(state, { num: 5, localSlug: 'o/r' })).toBe(true);
-    expect(inCardGroup(state, { num: 9, localSlug: 'o/r' })).toBe(true);
-    expect(inCardGroup(state, { num: 1, localSlug: 'o/r', headRef: 'lane/card-group-abc' })).toBe(true);
-    expect(inCardGroup(state, { num: 1, localSlug: 'o/r', headRef: 'lane/x' })).toBe(false);
-    expect(inCardGroup({ unreadable: true }, { num: 1 })).toBe(true);
+  it('membership (an exemption) needs proof: recorded source, or combined PR number AND recorded branch', () => {
+    const st = { groups: [{ ...state.groups[0], branch: 'lane/card-group-g' }], failed: {} };
+    expect(inCardGroup(st, { num: 5, localSlug: 'o/r' })).toBe(true);
+    expect(inCardGroup(st, { num: 9, localSlug: 'o/r', headRef: 'lane/card-group-g' })).toBe(true);
+    expect(inCardGroup(st, { num: 9, localSlug: 'o/r', headRef: 'lane/other' })).toBe(false);
+    expect(inCardGroup(st, { num: 1, localSlug: 'o/r', headRef: 'lane/card-group-forged' })).toBe(false); // branch name alone
+    expect(inCardGroup({ unreadable: true }, { num: 5, localSlug: 'o/r' })).toBe(false);                 // unreadable never exempts
+    expect(inCardGroup({ groups: [], failed: {} }, { num: 5, localSlug: 'o/r' })).toBe(false);          // dissolved
   });
   it('a queued PR sharing a group card (or unknown files, or a queued source) makes the group wait', () => {
     const g = { sources: [{ num: 5 }], files: ['backlog/1-a.md'] };

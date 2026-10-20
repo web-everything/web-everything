@@ -5492,7 +5492,8 @@ async function runCli() {
       if (v.prestagePendingCi || (!isRebaseDropCandidate(v) && !needsManifestStripBeforeMerge(v))) continue;
       // xym8nt4 — a card group's sources and combined PR are never rebased by the drain while the group is open:
       // a moved source head would dissolve the group (the combined PR carries the source content).
-      if (isLocalRepo(v.repo) && cardGrouping.inGroup(v)) { if (!AS_JSON) process.stderr.write(`  ↻ ${repoTag(v.repo)}${v.num} rebase skipped: in an open card group (drain.group)\n`); continue; }
+      // The manifest strip is never skipped: a member that still carries the transient manifest is rebuilt as before.
+      if (isLocalRepo(v.repo) && !needsManifestStripBeforeMerge(v) && cardGrouping.inGroup(v)) { if (!AS_JSON) process.stderr.write(`  ↻ ${repoTag(v.repo)}${v.num} rebase skipped: in an open card group (drain.group)\n`); continue; }
       if (approvedHeadHold(v)) {
         const pr = (prsByRepo.get(v.repo) || []).find(p => p.number === v.num);
         if (pr && mergeStrategy.queueOwnsFreshness(v.repo) && v.reason?.startsWith('merge state ')
