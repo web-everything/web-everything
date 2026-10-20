@@ -2,6 +2,7 @@
 kind: story
 size: 8
 status: open
+scopeRationale: "Acceptance paths outside scope are synthetic fixture paths in temporary test repositories, except we:scripts/lib/repo-profile.mjs, which is an existing read-only prefix-resolution dependency. The scope lists the implementation and test files to edit; fixture paths are not repository deliverables."
 scope: ["we:scripts/conveyor/fix-scope-fence.mjs", "we:scripts/conveyor/fix-scope-fence-io.mjs", "we:scripts/conveyor/__tests__/fix-scope-fence.test.mjs", "we:scripts/conveyor/await-verify-pass.mjs", "we:scripts/conveyor/__tests__/await-verify-pass.test.mjs", "we:scripts/conveyor/__tests__/await-verify-pass-push-before-gate.test.mjs", "we:scripts/conveyor/fix-context-pack.mjs", "we:scripts/conveyor/reconcile-fix-dispatch.mjs", "we:scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs", "we:scripts/conveyor/__tests__/fix-round-history.test.mjs", "we:scripts/conveyor/stand-down.mjs", "we:scripts/conveyor/soak/breaks/fix-scope-merge-bypass.mjs", "we:scripts/conveyor/soak/breaks/fix-scope-merge-bypass.soak.test.mjs", "we:scripts/operations/operator-queue.mjs", "we:scripts/operations/__tests__/operator-queue.test.mjs", "we:scripts/settings/fix-scope-fence.json", "we:skills-src/conveyor/fix-agent-brief.md", "we:docs/agent/testing.md"]
 dateOpened: "2026-10-20"
 tags: []
