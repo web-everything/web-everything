@@ -336,6 +336,32 @@ describe('landPreventionCard — dedupe before filing', () => {
     } finally { cleanup(); }
   });
 
+  it('a dry run never files, even when an owed-filing obligation exists or the filer is paused', async () => {
+    setup();
+    const stateDir = mkdtempSync(join(tmpdir(), 'owed-dry-run-'));
+    vi.stubEnv('WE_CARD_BATCH_STATE_DIR', stateDir);
+    try {
+      const { owePreventionFiling, owedPreventionRecord } = await import('../../lib/prevention-filing-owed.mjs');
+      owePreventionFiling(input(), { stateDir });
+      const exec = vi.fn();
+      const result = await landPreventionCard({ ...input(), dryRun: true, root: lane }, { exec, write: () => {}, dedupe });
+      expect(result).toMatchObject({ ok: true, step: 'dry-run' });
+      expect(exec).not.toHaveBeenCalled();
+      expect(owedPreventionRecord(input(), { stateDir })).toMatchObject({ status: 'owed' });
+      expect(readRaisedBy('4706', lane)).toEqual([]);
+
+      const pausedDir = mkdtempSync(join(tmpdir(), 'owed-dry-run-paused-'));
+      vi.stubEnv('WE_CARD_BATCH_STATE_DIR', pausedDir);
+      const paused = await landPreventionCard({ ...input(), dryRun: true, root: lane }, {
+        exec, write: () => {}, dedupe, loadFilingSettings: () => ({ filingEnabled: false }),
+      });
+      expect(paused.ok === false && paused.step === 'paused' || paused.step === 'dry-run').toBe(true);
+      expect(exec).not.toHaveBeenCalled();
+      expect(owedPreventionRecord(input(), { stateDir: pausedDir })).toBeNull();
+      rmSync(pausedDir, { recursive: true, force: true });
+    } finally { rmSync(stateDir, { recursive: true, force: true }); cleanup(); }
+  });
+
   it('a partial dedupe keeps the new card and lane-local mention together on the per-card path', async () => {
     const acquire = setup();
     try {
