@@ -3,7 +3,7 @@
  * Persistence failures get three retries (15/30/60 minutes), then the same event-driven hold.
  */
 import { createHash } from 'node:crypto';
-import { linkSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
@@ -18,7 +18,8 @@ import { parseLatestHumanClearedSha, parseReviewedSha } from '../lib/review-esca
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
-import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
+import { createActionStore } from '../operations/action-store.mjs';
+import { actionResource } from '../operations/action-record.mjs';
 
 // Match we:scripts/conveyor/rearm-review.mjs#REARM_COMMENT_MARKER locally: importing it closes a daemon boot cycle.
 // The equality test keeps this first-line matcher tied to the canonical marker.
@@ -473,68 +474,26 @@ export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), readRu
  *
  * DELIVERY IS AT-LEAST-ONCE, BY OPERATOR RULING (2026-10-20), NOT A DEFECT: never-silent wins over exactly-once.
  *
- * DESIGN (atomic files, an expiring owner lease, no attempt counter):
- * - Every file is written to a unique temp file first and moved into place, so no reader ever sees partial bytes: the
- *   receipt by rename (`writeJsonAtomic`), the lease by an exclusive hard link of its complete temp file (fails if a
- *   lease exists).
- * - The lease names its owner (a per-call token) and its timestamp. It is never released: it simply EXPIRES after
- *   NO_VERDICT_NEEDS_YOU_LEASE_EXPIRY_MS, so there is no release race and nothing a crashed owner can leave blocking.
- *   An expired lease is taken over atomically by {@link clearExpiredLease} (rename + post-move verification), however
- *   many have been abandoned before: no counter can exhaust into silence.
- * - The owner re-checks that the lease still names it immediately before publishing; lost ownership (it paused past
- *   expiry and was taken over) → it does not publish.
- * - Only a COMPLETE, VALID `published` receipt ({@link validPublishedReceipt}: version, state, parseable timestamp,
- *   exact repo, PR, head and kind) suppresses the event. Anything else — absent, corrupt, null/false/0/"", another
- *   subject, a bare {"state":"published"} — is stale → publish again once a lease is held.
- * - Normal path deduped: repeated ticks see the valid receipt; concurrent daemons lose the exclusive lease create.
- * - Accepted duplicates (at-least-once): a crash after publishing but before the receipt lands, or an owner stalled
- *   longer than the expiry between its ownership re-check and the publish call itself. A failed publish, or a lost
- *   lease, retries once the lease expires.
+ * NO HAND-ROLLED LOCKS: the claim is the repo's audited durable per-resource claim ledger
+ * (we:scripts/operations/action-store.mjs — exclusive `wx` attempt allocation, lock-fenced CAS transitions, expiry +
+ * reconciliation), kept in its OWN coordination root (`<notices dir>/needs-you-claims`) so these claims never hold the
+ * review/fix dispatch claims of the same PR. Resource `<repo>#pr:<n>`, kind {@link NO_VERDICT_NEEDS_YOU_KIND}, the head
+ * in `evidence.head`.
+ * - Done (deduped) = a `terminal`/`settled` attempt of this kind for this head.
+ * - Otherwise claim → CAS intent→dispatching (the fenced "I still hold the claim" check, immediately before publishing;
+ *   lost → no publish) → publish → dispatching→observed→terminal(settled).
+ * - Publish failure → terminal(not-started): the next tick claims again.
+ * - A crashed owner's claim expires (store LEASE_MS) and is reconciled by the store at the next claim: never-dispatched
+ *   → abandoned, observed → settled (no re-raise), dispatching → abandoned after the store's absence grace → raised
+ *   again: the accepted at-least-once duplicate. Attempt numbers are unbounded (no counter that can exhaust).
+ * - If the claim ledger itself is unusable (unknown repo, unreadable/corrupt store), the event is published directly —
+ *   never silent; the feed's own open-key state dedupes repeats.
  * Never throws.
  */
-export const NO_VERDICT_NEEDS_YOU_KIND = 'review-no-verdict';
-/** The critical section is a few small local file operations; a lease older than this is abandoned. */
-export const NO_VERDICT_NEEDS_YOU_LEASE_EXPIRY_MS = 10 * 60_000;
-export function validPublishedReceipt(receipt, { repo, prNumber, head }) {
-  return !!receipt && typeof receipt === 'object' && !Array.isArray(receipt) && receipt.v === 1
-    && receipt.state === 'published' && typeof receipt.at === 'string' && Number.isFinite(Date.parse(receipt.at))
-    && receipt.repo === repo && receipt.pr === Number(prNumber) && receipt.head === head
-    && receipt.kind === NO_VERDICT_NEEDS_YOU_KIND;
-}
-const tempPath = path => `${path}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
-/** Exclusive create of a COMPLETE lease: write a temp file, then hard-link it into place (EEXIST if a lease exists). */
-export function createLease(leasePath, owner, { clock = Date.now } = {}) {
-  const tmp = tempPath(leasePath);
-  writeFileSync(tmp, JSON.stringify({ v: 1, owner, at: new Date(clock()).toISOString() }));
-  try { linkSync(tmp, leasePath); return true; }
-  catch (e) { if (e.code === 'EEXIST') return false; throw e; }
-  finally { try { unlinkSync(tmp); } catch { /* best-effort */ } }
-}
-export function leaseOwner(leasePath) {
-  try { const lease = JSON.parse(readFileSync(leasePath, 'utf8')); return typeof lease?.owner === 'string' ? lease.owner : null; }
-  catch { return null; }
-}
-/**
- * Take over an EXPIRED lease (mtime older than the expiry), atomically: rename it to a unique name (at most one racer's
- * rename succeeds), then verify what was actually moved. If the moved file is fresh (re-created between our stat and
- * our rename), put it back with an exclusive link; if a newer lease already took the path, the displaced owner fails
- * its pre-publish ownership re-check and does not publish. No counter.
- */
-export function clearExpiredLease(leasePath, { expiryMs = NO_VERDICT_NEEDS_YOU_LEASE_EXPIRY_MS, clock = Date.now } = {}) {
-  let st;
-  try { st = statSync(leasePath); } catch { return false; }
-  if (clock() - st.mtimeMs < expiryMs) return false;
-  const moved = tempPath(`${leasePath}.expired`);
-  try { renameSync(leasePath, moved); } catch { return false; }
-  let fresh = false;
-  try { fresh = clock() - statSync(moved).mtimeMs < expiryMs; } catch { fresh = false; }
-  if (fresh) { try { linkSync(moved, leasePath); } catch { /* a newer lease exists; the re-check protects it */ } }
-  try { unlinkSync(moved); } catch { /* best-effort */ }
-  return !fresh;
-}
+export const NO_VERDICT_NEEDS_YOU_KIND = 'needs-you-stalled-review';
+export const needsYouClaimRoot = dir => join(dir, 'needs-you-claims');
 export function raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now = Date.now(), log = line => console.error(line),
-  publish, leaseExpiryMs = NO_VERDICT_NEEDS_YOU_LEASE_EXPIRY_MS, clock = Date.now,
-  owner = `${process.pid}-${Math.random().toString(36).slice(2)}`, beforePublish = null }) {
+  publish, store, owner = `review-daemon:${process.pid}`, beforePublish = null }) {
   try {
     if (!sha(hold?.head)) return false;
     // The real operator feed is never written from a test run unless the test injects its own publisher.
@@ -542,41 +501,59 @@ export function raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now = Date.n
       if (isUnderTest(process.env)) return false;
       publish = item => publishAttention(item, { now });
     }
-    const subject = { repo, prNumber, head: hold.head };
-    const path = join(dir, `${hash([repo, Number(prNumber), hold.head, 'no-verdict-needs-you'])}.json`);
-    const leasePath = `${path}.lease`;
-    const readReceipt = () => { try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; } };
-    if (validPublishedReceipt(readReceipt(), subject)) return false;
-    mkdirSync(dir, { recursive: true });
-    clearExpiredLease(leasePath, { expiryMs: leaseExpiryMs, clock });
-    if (!createLease(leasePath, owner, { clock })) return false; // a live owner holds it: not this tick
-    if (validPublishedReceipt(readReceipt(), subject)) return false; // published while we were acquiring
-    // TEST-ONLY seam: lets a test pause the owner between acquiring and publishing. A no-op for real callers.
-    if (typeof beforePublish === 'function') beforePublish();
-    // Ownership re-check immediately before publishing.
-    if (leaseOwner(leasePath) !== owner) {
-      log(`${repo}#${prNumber} no-verdict needs-you: lease lost before publishing — not publishing (the current owner will)`);
-      return false;
-    }
-    try {
-      publish({ repo, pr: Number(prNumber), head: hold.head, kind: NO_VERDICT_NEEDS_YOU_KIND,
-        reason: `review verdict never landed after ${hold.count} runs and ${hold.noVerdict?.releasesSpent ?? 0} cool-down retries; held until a push or re-arm`,
-        pick: `https://github.com/${repo}/pull/${prNumber}` });
-    } catch (e) {
-      log(`${repo}#${prNumber} no-verdict needs-you could not be published (retried when the lease expires): ${String(e?.message ?? e).split('\n')[0]}`);
-      return false;
-    }
-    // At-least-once: if this write fails or the process dies first, it is raised again after the lease expires.
-    try {
-      writeJsonAtomic(path, { v: 1, state: 'published', at: new Date(now).toISOString(), repo, pr: Number(prNumber),
-        head: hold.head, kind: NO_VERDICT_NEEDS_YOU_KIND });
-    } catch (e) { log(`${repo}#${prNumber} no-verdict needs-you receipt not recorded (may re-raise): ${String(e?.message ?? e).split('\n')[0]}`); }
-    log(`${repo}#${prNumber} NEEDS-YOU review-no-verdict head ${hold.head.slice(0, 9)}: ${hold.count} runs, `
+    const item = { repo, pr: Number(prNumber), head: hold.head, kind: 'review-no-verdict',
+      reason: `review verdict never landed after ${hold.count} runs and ${hold.noVerdict?.releasesSpent ?? 0} cool-down retries; held until a push or re-arm`,
+      pick: `https://github.com/${repo}/pull/${prNumber}` };
+    const announce = () => log(`${repo}#${prNumber} NEEDS-YOU review-no-verdict head ${hold.head.slice(0, 9)}: ${hold.count} runs, `
       + `${hold.noVerdict?.releasesSpent ?? 0}/${hold.noVerdict?.releases ?? 0} cool-down retries spent `
       + `(reviewNoVerdictRetry.cooldownReleases source=${hold.noVerdict?.source ?? 'standard'}); permanent hold`);
+    let actions, resource, claimed;
+    try {
+      actions = store ?? createActionStore({ root: needsYouClaimRoot(dir), now: () => now });
+      resource = actionResource(repo, { type: 'pr', id: String(prNumber) });
+      const done = actions.attempts(resource).some(r => r.kind === NO_VERDICT_NEEDS_YOU_KIND && r.evidence?.head === hold.head
+        && r.state === 'terminal' && r.outcome === 'settled');
+      if (done) return false;
+      claimed = actions.claim({ resource, kind: NO_VERDICT_NEEDS_YOU_KIND, owner, evidence: { head: hold.head },
+        reconcile: record => actions.reconcile(record, { listAgents: () => [], findEffect: () => ({ found: false }),
+          postconditionHolds: () => true, owner }) });
+    } catch (e) {
+      // The claim ledger is unusable: never silent — publish directly (the feed dedupes repeats).
+      log(`${repo}#${prNumber} no-verdict needs-you claim ledger unusable (${String(e?.message ?? e).split('\n')[0]}) — publishing unclaimed`);
+      publish(item);
+      announce();
+      return true;
+    }
+    if (!claimed?.ok) return false; // held by a live (or not yet reconcilable) claim: its owner publishes, or it expires
+    let rec = claimed.record;
+    // Claiming may have reconciled an expired attempt for this head into `settled` (it had published): then it is done.
+    try {
+      if (actions.attempts(resource).some(r => r.attempt !== rec.attempt && r.kind === NO_VERDICT_NEEDS_YOU_KIND
+        && r.evidence?.head === hold.head && r.state === 'terminal' && r.outcome === 'settled')) {
+        actions.release(resource, rec.attempt, { token: rec.ownerToken, rev: rec.rev });
+        return false;
+      }
+    } catch { /* fall through: publishing again is the at-least-once side */ }
+    if (typeof beforePublish === 'function') beforePublish(); // TEST-ONLY seam: pause the owner here
+    const go = actions.transition(resource, rec.attempt, { token: rec.ownerToken, rev: rec.rev, from: 'intent', to: 'dispatching',
+      patch: { dispatchingSince: now } });
+    if (!go.ok) { log(`${repo}#${prNumber} no-verdict needs-you: claim lost before publishing (${go.reason}) — not publishing`); return false; }
+    rec = go.record;
+    try { publish(item); }
+    catch (e) {
+      actions.transition(resource, rec.attempt, { token: rec.ownerToken, rev: rec.rev, from: 'dispatching', to: 'terminal', patch: { outcome: 'not-started' } });
+      log(`${repo}#${prNumber} no-verdict needs-you could not be published (retried next tick): ${String(e?.message ?? e).split('\n')[0]}`);
+      return false;
+    }
+    // At-least-once: if these writes fail or the process dies first, the store's expiry/reconcile re-raises it.
+    try {
+      const seen = actions.transition(resource, rec.attempt, { token: rec.ownerToken, rev: rec.rev, from: 'dispatching', to: 'observed', patch: { handle: 'needs-you-feed' } });
+      if (seen.ok) actions.transition(resource, rec.attempt, { token: seen.record.ownerToken, rev: seen.record.rev, from: 'observed', to: 'terminal', patch: { outcome: 'settled' } });
+    } catch (e) { log(`${repo}#${prNumber} no-verdict needs-you claim not settled (may re-raise): ${String(e?.message ?? e).split('\n')[0]}`); }
+    announce();
     return true;
   } catch (e) {
-    try { log(`${repo}#${prNumber} no-verdict needs-you not raised this tick (retried later): ${String(e?.message ?? e).split('\n')[0]}`); } catch { /* never throws */ }
+    try { log(`${repo}#${prNumber} no-verdict needs-you not raised this tick (retried next tick): ${String(e?.message ?? e).split('\n')[0]}`); } catch { /* never throws */ }
     return false;
   }
 }

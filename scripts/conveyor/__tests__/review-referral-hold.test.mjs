@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { createActionStore } from '../../operations/action-store.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord, tryReadRun, writeRun } from '../../operations/run-store.mjs';
@@ -15,8 +16,7 @@ import {
   notifyReferralHold, REFERRAL_RETRY_MS, decideSameHeadHold, resolveSameHeadMaxReviews, PENDING_REASON_TOKENS,
   GH_LIST_COMMENT_CAP, findResumableParkedRun, blockRuledReferralsFor, filterFixerReferrals, REFERRAL_REARM_COMMENT_MARKER,
   VERDICT_COOLDOWN_BASE_MS, VERDICT_COOLDOWN_CAP_MS, VERDICT_COOLDOWN_MAX_RELEASES,
-  resolveNoVerdictRetry, NO_VERDICT_RETRY_STANDARD, raiseNoVerdictNeedsYou, NO_VERDICT_NEEDS_YOU_LEASE_EXPIRY_MS, NO_VERDICT_NEEDS_YOU_KIND,
-  createLease, clearExpiredLease, leaseOwner,
+  resolveNoVerdictRetry, NO_VERDICT_RETRY_STANDARD, raiseNoVerdictNeedsYou, NO_VERDICT_NEEDS_YOU_KIND, needsYouClaimRoot,
 } from '../review-referral-hold.mjs';
 
 it('keeps the cycle-free referral matcher equal to the canonical re-arm marker', () => {
@@ -628,94 +628,89 @@ describe('same-head hold never silences a review whose verdict never landed (liv
       expect(publish).not.toHaveBeenCalled();
     });
     const exhausted = t0 => decideSameHeadHold(labelled(['review:pending']), lostRuns(9), { repo, env: {}, now: t0, retry: { cooldownReleases: 6, source: 'tool' } });
-    const T0 = at + 30 * 86400_000, EXP = NO_VERDICT_NEEDS_YOU_LEASE_EXPIRY_MS;
-    const files = dir => readdirSync(dir);
-    const receiptOf = dir => join(dir, files(dir).find(n => n.endsWith('.json')));
-    const ageLease = (dir, ms) => { const l = join(dir, files(dir).find(n => n.endsWith('.lease'))); const t = (Date.now() - ms) / 1000; utimesSync(l, t, t); return l; };
-    it('at-least-once (operator ruling), deduped in the normal path: once across ticks, again for a new head', () => {
+    const T0 = at + 30 * 86400_000, LEASE = 10 * 60_000, GRACE = 15 * 60_000;
+    const res = `${repo}#pr:1`;
+    const storeAt = (dir, t) => createActionStore({ root: needsYouClaimRoot(dir), now: () => t });
+    const raise = (dir, t, o = {}) => raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: o.hold ?? exhausted(T0), dir, now: t, log: o.log ?? vi.fn(), publish: o.publish, store: o.store, beforePublish: o.beforePublish });
+    it('at-least-once (operator ruling), deduped in the normal path: once across ticks, again for a new head; claim settled in the ledger', () => {
       const dir = temp(), log = vi.fn(), post = vi.fn(), publish = vi.fn(), p = labelled(['review:pending']), held = exhausted(T0);
       for (let i = 0; i < 4; i++) notifyReferralHold({ repo, prNumber: p.number, pr: p, hold: held, dir, post, log, now: T0 + i, publishNeedsYou: publish });
       expect(publish).toHaveBeenCalledTimes(1);
-      expect(publish.mock.calls[0][0]).toMatchObject({ repo, pr: p.number, head, kind: NO_VERDICT_NEEDS_YOU_KIND });
+      expect(publish.mock.calls[0][0]).toMatchObject({ repo, pr: p.number, head, kind: 'review-no-verdict' });
       expect(log.mock.calls.flat().filter(l => l.includes('NEEDS-YOU review-no-verdict'))).toHaveLength(1);
       expect(log.mock.calls.flat().find(l => l.includes('NEEDS-YOU'))).toContain('source=tool');
-      expect(JSON.parse(readFileSync(receiptOf(dir), 'utf8'))).toMatchObject({ v: 1, state: 'published', repo, pr: p.number, head, kind: NO_VERDICT_NEEDS_YOU_KIND });
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: p.number, hold: { ...held, head: 'b'.repeat(40) }, dir, log, publish })).toBe(true);
+      const rows = storeAt(dir, T0).attempts(`${repo}#pr:${p.number}`);
+      expect(rows).toEqual([expect.objectContaining({ kind: NO_VERDICT_NEEDS_YOU_KIND, state: 'terminal', outcome: 'settled', evidence: { head } })]);
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: p.number, hold: { ...held, head: 'b'.repeat(40) }, dir, log, publish, now: T0 + 10 })).toBe(true);
       expect(publish).toHaveBeenCalledTimes(2);
-      expect(files(dir).some(n => n.endsWith('.tmp'))).toBe(false); // temp files never left behind
     });
-    it('concurrent reclaim: while one owner holds the lease, a second daemon cannot publish; at least once overall', () => {
-      const dir = temp(), log = vi.fn(), held = exhausted(T0), second = vi.fn();
-      writeFileSync(join(dir, 'placeholder'), ''); // dir exists
-      const first = vi.fn(() => {
-        expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish: second })).toBe(false);
-      });
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish: first })).toBe(true);
-      expect(first).toHaveBeenCalledTimes(1);
-      expect(second).not.toHaveBeenCalled();
-      // Two racers taking over the same EXPIRED lease: exactly one wins.
-      const d2 = temp(), lease = join(d2, 'x.lease');
-      expect(createLease(lease, 'dead-owner')).toBe(true);
-      const t = (Date.now() - EXP - 1000) / 1000; utimesSync(lease, t, t);
-      expect(clearExpiredLease(lease)).toBe(true);
-      expect(clearExpiredLease(lease)).toBe(false);
-      expect(createLease(lease, 'a')).toBe(true);
-      expect(createLease(lease, 'b')).toBe(false);
-      expect(leaseOwner(lease)).toBe('a');
+    it('interleaved concurrent reclaim of an EXPIRED claim: exactly one reclaimer publishes', () => {
+      const dir = temp(), a = vi.fn(), b = vi.fn();
+      // A crashed owner left an intent claim.
+      expect(storeAt(dir, T0).claim({ resource: res, kind: NO_VERDICT_NEEDS_YOU_KIND, owner: 'crashed', evidence: { head } }).ok).toBe(true);
+      const later = T0 + LEASE + 1;
+      // A reclaims and, while it holds the fresh claim (just before publishing), B runs the same reclaim.
+      expect(raise(dir, later, { publish: a, beforePublish: () => expect(raise(dir, later, { publish: b })).toBe(false) })).toBe(true);
+      expect(a).toHaveBeenCalledTimes(1);
+      expect(b).not.toHaveBeenCalled();
+      // Two reconcilers racing on the same stale record: the store's CAS lets only one win.
+      const d2 = temp(), s2 = storeAt(d2, T0);
+      const stale = s2.claim({ resource: res, kind: NO_VERDICT_NEEDS_YOU_KIND, owner: 'crashed', evidence: { head } }).record;
+      const s3 = storeAt(d2, T0 + LEASE + 1);
+      expect(s3.reconcile(stale, {}).ok).toBe(true);
+      expect(s3.reconcile(stale, {}).ok).toBe(false);
     });
-    it('paused-then-resumed owner: its lease expired and was taken over, so it does NOT publish; the new owner does', () => {
-      const dir = temp(), log = vi.fn(), held = exhausted(T0), pausedPublish = vi.fn(), takeoverPublish = vi.fn();
-      const pause = () => {
-        // While "paused", the lease expires and another daemon takes over and publishes.
-        ageLease(dir, EXP + 1000);
-        expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish: takeoverPublish })).toBe(true);
-      };
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish: pausedPublish, beforePublish: pause })).toBe(false);
-      expect(pausedPublish).not.toHaveBeenCalled();
-      expect(takeoverPublish).toHaveBeenCalledTimes(1);
-      expect(log.mock.calls.flat().some(l => l.includes('lease lost before publishing'))).toBe(true);
+    it('paused-then-resumed owner: its claim expired and was taken over, so it does NOT publish; the new owner does', () => {
+      const dir = temp(), paused = vi.fn(), takeover = vi.fn(), log = vi.fn();
+      const pause = () => expect(raise(dir, T0 + LEASE + 1, { publish: takeover })).toBe(true);
+      expect(raise(dir, T0, { publish: paused, beforePublish: pause, log })).toBe(false);
+      expect(paused).not.toHaveBeenCalled();
+      expect(takeover).toHaveBeenCalledTimes(1);
+      expect(log.mock.calls.flat().some(l => l.includes('claim lost before publishing'))).toBe(true);
     });
-    it.each([['null'], ['false'], ['0'], ['""'], ['{bad json'], [''], ['[]'], ['{"state":"published"}'],
-      ['{"v":1,"state":"published","at":"nope","repo":"web-everything/web-everything","pr":1,"head":"' + 'a'.repeat(40) + '","kind":"review-no-verdict"}'],
-      ['{"v":1,"state":"published","at":"2026-10-03T08:00:00Z","repo":"other/repo","pr":1,"head":"' + 'a'.repeat(40) + '","kind":"review-no-verdict"}'],
-      ['{"v":1,"state":"published","at":"2026-10-03T08:00:00Z","repo":"web-everything/web-everything","pr":1,"head":"' + 'a'.repeat(40) + '","kind":"review-no-verd']])(
-      'corrupt/partial/invalid receipt %s never suppresses: it is reclaimed once the lease is free', content => {
-        const dir = temp(), log = vi.fn(), publish = vi.fn(), held = exhausted(T0);
-        expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish })).toBe(true);
-        writeFileSync(receiptOf(dir), content);
-        ageLease(dir, EXP + 1000);
-        expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish })).toBe(true);
-        expect(publish).toHaveBeenCalledTimes(2);
-        expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish })).toBe(false);
-      });
-    it('many abandoned leases (crashes before publishing) never exhaust into silence: each expiry allows a fresh attempt', () => {
-      const dir = temp(), log = vi.fn(), held = exhausted(T0);
-      const crash = vi.fn(() => { throw new Error('killed before publishing'); });
-      for (let i = 0; i < 50; i++) {
-        expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish: crash })).toBe(false);
-        // A live (unexpired) lease blocks only until it expires.
-        expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish: crash })).toBe(false);
-        ageLease(dir, EXP + 1000);
+    it('a corrupt or partial claim-ledger entry never silences: the event is published unclaimed (feed dedupes)', () => {
+      for (const content of ['', '{bad', 'null', '{"version":1}']) {
+        const dir = temp(), publish = vi.fn(), log = vi.fn();
+        const rdir = join(needsYouClaimRoot(dir), 'actions', encodeURIComponent(res));
+        mkdirSync(rdir, { recursive: true });
+        writeFileSync(join(rdir, 'attempt-000001.json'), content);
+        expect(raise(dir, T0, { publish, log })).toBe(true);
+        expect(publish).toHaveBeenCalledTimes(1);
+        expect(log.mock.calls.flat().some(l => l.includes('claim ledger unusable'))).toBe(true);
       }
-      expect(crash).toHaveBeenCalledTimes(50);
-      const ok = vi.fn();
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish: ok })).toBe(true);
-      expect(ok).toHaveBeenCalledTimes(1);
-      // An empty or garbage lease file (crash mid-create of a foreign writer) also expires.
-      const d2 = temp(), held2 = exhausted(T0), pub2 = vi.fn();
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held2, dir: d2, log, publish: crash })).toBe(false);
-      const lease = ageLease(d2, 0); writeFileSync(lease, ''); const t = (Date.now() - EXP - 1000) / 1000; utimesSync(lease, t, t);
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held2, dir: d2, log, publish: pub2 })).toBe(true);
     });
-    it('at-least-once: a crash after publishing but before the receipt lands re-raises after the lease expires (accepted by ruling)', () => {
-      const dir = temp(), log = vi.fn(), held = exhausted(T0), publish = vi.fn();
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish })).toBe(true);
-      rmSync(receiptOf(dir)); // as if the process died before writing it
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish })).toBe(false); // lease still live
-      ageLease(dir, EXP + 1000);
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish })).toBe(true);
-      expect(publish.mock.calls.length).toBeGreaterThanOrEqual(1);
+    it('many abandoned claims (crashes before publishing) never exhaust into silence: each expiry allows a fresh claim', () => {
+      const dir = temp(), crash = () => { throw new Error('killed before publishing'); };
+      let t = T0;
+      for (let i = 0; i < 40; i++) {
+        expect(raise(dir, t, { publish: vi.fn(), beforePublish: crash })).toBe(false);
+        expect(raise(dir, t + 1, { publish: vi.fn() })).toBe(false); // the live claim holds until it expires
+        t += LEASE + 1;
+      }
+      const ok = vi.fn();
+      expect(raise(dir, t, { publish: ok })).toBe(true);
+      expect(ok).toHaveBeenCalledTimes(1);
+      expect(storeAt(dir, t).attempts(res).length).toBe(41);
+    });
+    it('a failed publish retries on the next tick', () => {
+      const dir = temp(), flaky = vi.fn().mockImplementationOnce(() => { throw new Error('feed down'); });
+      expect(raise(dir, T0, { publish: flaky })).toBe(false);
+      expect(raise(dir, T0 + 1, { publish: flaky })).toBe(true);
+      expect(raise(dir, T0 + 2, { publish: flaky })).toBe(false);
+      expect(flaky).toHaveBeenCalledTimes(2);
+    });
+    it('at-least-once: a crash after publishing (claim left dispatching) re-raises after expiry + absence grace; a crash after observed does not', () => {
+      const dir = temp(), publish = vi.fn();
+      const failing = to => ({ ...storeAt(dir, T0), transition(r, n, o) { if (o.to === to) throw new Error('killed'); return storeAt(dir, T0).transition(r, n, o); } });
+      expect(raise(dir, T0, { publish, store: failing('observed') })).toBe(true);
+      expect(raise(dir, T0 + LEASE + 1, { publish })).toBe(false); // expired but inside the absence grace: held
+      expect(raise(dir, T0 + LEASE + GRACE + 1, { publish })).toBe(true); // accepted duplicate
       expect(publish).toHaveBeenCalledTimes(2);
+      const d2 = temp(), p2 = vi.fn();
+      const failing2 = { ...storeAt(d2, T0), transition(r, n, o) { if (o.to === 'terminal' && o.from === 'observed') throw new Error('killed'); return storeAt(d2, T0).transition(r, n, o); } };
+      expect(raise(d2, T0, { publish: p2, store: failing2 })).toBe(true);
+      expect(raise(d2, T0 + LEASE + 1, { publish: p2 })).toBe(false); // reconciled to settled: no re-raise
+      expect(p2).toHaveBeenCalledTimes(1);
     });
     it('never writes the real feed from a test without an injected publisher', () => {
       const dir = temp();
