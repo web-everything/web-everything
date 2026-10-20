@@ -2,7 +2,7 @@
 bornAs: x5wqxb3
 kind: epic
 status: open
-scope: ["we:scripts/operations/run-store.mjs", "we:scripts/lib/drain-red-team-evidence.mjs", "we:scripts/lib/saved-red-team-provenance.mjs", "we:scripts/lib/drain-saved-red-team.mjs", "we:scripts/operations/cli-adapter.mjs"]
+scope: ["we:scripts/operations/run-store.mjs", "we:scripts/lib/drain-red-team-evidence.mjs", "we:scripts/lib/saved-red-team-provenance.mjs", "we:scripts/lib/drain-saved-red-team.mjs", "we:scripts/operations/cli-adapter.mjs", "we:scripts/lib/__tests__/review-run-index.test.mjs", "we:scripts/operations/__tests__/run-store.test.mjs", "we:scripts/lib/__tests__/review-run-index.validation.test.mjs"]
 dateOpened: "2026-10-20"
 tags: []
 ---
@@ -43,7 +43,7 @@ The fallback is built in. An id with no entry (written by an older daemon build,
 - I2: `input.repo` and `input.pr` are immutable per id. This is NOT true today. A fresh invocation with an existing `--run-id` builds a new record and overwrites the old one unchecked (`we:scripts/operations/cli-adapter.mjs:1295`, `we:scripts/operations/review-loop-cli.mjs:659`). Resume already keeps the saved input (`we:scripts/operations/cli-adapter.mjs:460`). Slice 0 makes `writeRun` refuse an identity change: it compares against the claim, or against the existing record when there is no claim yet, BEFORE any entry is published.
 - I3: the reader skips an id only when exactly one well-formed claim and entry name it, they agree, and they name a different PR. No mtime, size, inode or settle window takes part.
 - I4: a missing, duplicate, conflicting, malformed or partial entry means "unknown", and the record is read in full. An entry can make the reader read fewer files only through I3.
-- I5 (writer fence): the indexed reader is enabled only while every live daemon build includes the I2 enforcement. An older build could still reuse a `--run-id`. The reader checks the running build shas, which the daemon-rebuild records; an unknown build means a full scan.
+- I5 (writer fence and history): the indexed reader is enabled only while every writer enforces I2 **and** a durable valid generation proves no incompatible/unknown writer interval since reconciliation. An older build could reuse a `--run-id` and leave an agreeing but stale claim/entry. Current daemon build shas alone cannot prove history. Invalidate before incompatible writer admission, preserve invalidation across restart/re-upgrade, and require complete exclusive reconciliation before skips resume (protocol below). Unknown current builds, history or validity mean full scan. Recheck the fence and generation on every read and before returning indexed results.
 - Run paths that are symlinks are refused, because `writeJsonAtomic` follows them (`we:scripts/lib/atomic-json-file.mjs:74`) and one id could replace another id's target.
 
 ## Failure modes
@@ -51,7 +51,7 @@ The fallback is built in. An id with no entry (written by an older daemon build,
 - Crash between entry and record: an entry with no record. The id is not listed in the run store, so it matches a full scan.
 - Record kept but entry lost (crash or power loss): unknown, so the record is read (I4).
 - `migrateLegacyRuns` (`we:scripts/operations/run-store.mjs:83-98`) renames files in without `writeRun` and has an exists-then-rename overwrite race. Slice 0 routes it through the same identity check, with no overwrite. Until then its files are unindexed and read in full.
-- Backfill: it is correct only under I2 + I5. The identity it records can no longer change, so parse-then-publish has no race.
+- Backfill: it is correct only under I2 + I5 and the exclusive writer barrier. Initial backfill cannot certify an uncertain history; reconciliation must rebuild a complete generation, quarantining stale claims/entries.
 - Two writers on one id: `link()` picks one claim. The loser either matches (no-op) or throws (I2).
 
 ## The decision this needs (operator ruling, before slice 2)
@@ -70,18 +70,43 @@ Codex judged the switched reader **WEAKENED on one point the design cannot remov
 
 0. [xl3mmn5](/backlog/xl3mmn5/) **Identity hardening** (size 3, delivery: pr; correct on its own). `writeRun` refuses a `review-pr` identity change (I2). It refuses symlinked run paths. `migrateLegacyRuns` validates identity and never overwrites. Scope: `we:scripts/operations/run-store.mjs`, `we:scripts/operations/cli-adapter.mjs`, tests.
 1. [xbyg4e4](/backlog/xbyg4e4/) **Writer index + backfill + shadow reader** (size 5, delivery: shadow). `writeRun` publishes entries per I1. A one-shot backfill parses every existing `review-pr-*` record once and creates its entry. A record whose current content has no valid repo/pr gets no entry, so it stays unindexed and is always read. `migrateLegacyRuns` indexes what it moves. The shadow reader runs the indexed reader beside the full scan in `readDrainRedTeamEvidence` and `verifySavedRedTeamProvenance`, returns the full-scan answer, and logs any mismatch plus unindexed-count/timing per pass. Scope: `we:scripts/operations/run-store.mjs`, `we:scripts/lib/review-run-index.mjs` (new), `we:scripts/lib/drain-red-team-evidence.mjs`, `we:scripts/lib/saved-red-team-provenance.mjs`, tests.
-2. [xukmjgl](/backlog/xukmjgl/) **Reader switch behind a cascade setting** (size 3, delivery: prototype; needs Option A ratified plus the I5 fence). `redTeam.reviewRunIndexReader` (standard `shadow`, then `on`), logged with its source each pass. It switches after a mismatch-free shadow soak (for example, 3 days or more and 1,000+ compared calls). Scope: the same two readers, `we:scripts/lib/drain-saved-red-team.mjs`, the settings files.
-3. [x0lckod](/backlog/x0lckod/) **Retire the full scan to fallback only** (size 2, delivery: pr). Delete the shadow comparison. Retain the full scan for a missing/unreadable index directory (I4) and whenever the writer fence (I5) cannot prove every live daemon build enforces slice 0, including older or unknown builds. Check the fence on every evidence/provenance read so a daemon rollback restores full scanning. Missing or invalid per-run entries still require fresh full reads of those records (I4). Optionally move `we:scripts/conveyor/review-referral-hold.mjs:122-150` (which has its own mtime/size projection cache, the same race class) onto the index.
+2. [xukmjgl](/backlog/xukmjgl/) **Reader switch behind a cascade setting** (size 8, delivery: prototype; needs Option A ratified plus the complete I5 fence/history protocol). `redTeam.reviewRunIndexReader` (standard `shadow`, then `on`), logged with its source each pass. Requires at least 3 days and 1,000 successful mismatch/error-free shadow comparisons. Durable invalidation at external writer admission and complete exclusive reconciliation are prerequisites; the estimate includes this expanded safety scope. Do not implement a current-build-only shortcut.
+3. [x0lckod](/backlog/x0lckod/) **Retire the full scan to fallback only** (size 2, delivery: pr). Delete shadow comparison. Retain full scan for missing/unreadable index directories and every I5 failure: older/unknown writers, missing/unreadable history or validity, prior incompatible intervals, and incomplete reconciliation even after re-upgrade. Check the fence/generation on every evidence/provenance read and before return. Missing or invalid per-run entries still require fresh full reads (I4). Optional referral-reader migration requires the same integration coverage; otherwise exclude it.
 
 ## Proof required (each slice)
 
 Before/after on the LIVE store, not only unit tests: per-call ms and per-pass `mergeCascade` seconds; identical evidence/provenance answers for every ready PR; a Codex guard audit verdict of NOT WEAKENED on the slice diff.
 
+### Rollback history is part of index validity
+
+A passing live-build fence alone cannot authorize skips. An incompatible or unknown writer interval durably invalidates the index generation, including identities already claimed before that interval. Returning all writers to a compatible build does not clear invalidation. Until reconciliation has freshly read every record under an exclusive compatible-writer barrier, repaired or quarantined stale claims and entries, and atomically published a new valid generation, every reader uses the authoritative full scan. Missing, unreadable, interrupted or uncertain validity state also means full scan. Reconciliation failure or a writer entering during reconciliation leaves the generation invalid; it must never certify a partial scan. A reader rechecks validity and the writer fence on every read and before returning indexed results, discarding those results if either changed.
+
+Planned regression: `we:scripts/lib/__tests__/review-run-index.test.mjs` → `old_writer_interval_requires_revalidation_before_index_reenable`: index run R for PR A, enter an older/unknown-writer interval, reuse R for PR B, then restore compatible writers. Assert invalidation survives reader/daemon restart and re-upgrade, B's record is freshly read and returned by full scan despite the old agreeing A claim/entry, failed/interrupted reconciliation cannot enable skips, and only complete reconciliation under the writer barrier publishes a valid generation whose B evidence equals the full scan. Writer admission must invalidate durably **before** an incompatible writer can mutate records; an unprovable writer history cannot be certified merely by sampling current daemon builds. Slice 2 must establish this protocol before switching; slice 3 must retain it.
+
+## Planned validation (shared by all four slices)
+
+These are future implementation requirements, not results from this cards-only PR. Planned file: `we:scripts/lib/__tests__/review-run-index.validation.test.mjs`. The live cases require an explicit read-only live-store target and captured before/after receipts; missing receipts are incomplete proof, not a passing skipped test. Run for each slice using `npm run test:unit -- <test-file>` from WE with this file's path after `we:` in its implementation validation environment. Switched-path performance validation uses explicit `on`; after retirement an omitted/default `shadow` setting remains authoritative full scan without comparison (slice 3 A4).
+
+| Acceptance / guarantee | Named case | Observable assertion |
+| --- | --- | --- |
+| A1, live per-call and cascade performance | `live_ready_pr_reads_meet_latency_budget` | Enumerate every ready PR, record store/build/generation identity and baseline/changed per-call ms plus mergeCascade pass seconds. For switched slices 2-3 each measured evidence call is under 1,000 ms; report measured cascade reduction against the same candidate set (10-25 s is an estimate, not a fabricated result). For slices 0-1 record full-scan and shadow timing without claiming the production speedup already exists. |
+| A1, evidence and provenance parity | `live_ready_pr_evidence_matches_full_scan` | For every ready repo/PR/head compare full evidence, provenance and refusal outcomes from full scan versus the new path on an unchanged snapshot under a writer barrier; replay any live concurrent discrepancies under that barrier. Include current/stale heads, saved evidence and absence of evidence. Assert equality on a valid store and on same-PR/unindexed candidate errors; any remaining mismatch blocks promotion. Other-PR corruption under ratified Option A is the explicit exception below. |
+| A2, unknown states and identity refusal | `invalid_index_states_force_fresh_record_reads` / `rejects_identity_change_without_modifying_record` | Planned in `we:scripts/lib/__tests__/review-run-index.test.mjs` and `we:scripts/operations/__tests__/run-store.test.mjs` respectively; assert every unknown record opens on each call and every changed-identity write leaves record/claim bytes unchanged (full matrices in slices 0-1). |
+| A3, each slice's audit | `each_slice_requires_not_weakened_audit` | Parameterize xl3mmn5, xbyg4e4, xukmjgl and x0lckod; require a Codex guard receipt matching that exact slice diff/head and the recorded ruling where applicable, with verdict NOT WEAKENED. Missing/stale receipts or WEAKENED verdicts fail validation. Receipt fixtures must demonstrate each rejection. |
+| Option A exception and alarm | `corruption_alarm_preserves_candidate_refusals` | Planned in `we:scripts/lib/__tests__/review-run-index.test.mjs` (slice 2); other-PR corruption may cease blocking this PR only after Option A is ratified, and must emit a store-health alarm. Same-PR/unindexed corruption still follows base refusal. Option B retains the authoritative full scan and blocks slices 2-3. |
+
+Every slice's A3 references these live/audit cases; each slice also maps its individual behavioral guarantees to repository-qualified named cases and observable assertions. Validate assertion adequacy during preparation, not just the presence of a test name.
+
+## Prevention tracked from PR #5742 advisory
+
+- Coverage/preparation gate: existing card [5360](/backlog/5360/) tracks deterministic refusal of completed preparation with executable Acceptance placeholders or guarantees lacking a repository-qualified planned test, named case and observable assertion, explicitly including omitted-setting defaults. This PR extends that card's executable plan rather than filing duplicate debt.
+- Rollback history: [xukmjgl](/backlog/xukmjgl/) is the prevention implementation card for durable invalidation across incompatible/unknown writer intervals and reconciliation before re-enabling skips. Its A2 is blocked on `old_writer_interval_requires_revalidation_before_index_reenable` and admission/reconciliation regressions; [x0lckod](/backlog/x0lckod/) retains them after shadow retirement. No current-build-only fence may substitute for that work.
+
 ## Acceptance
 
-- [A1] **Executable** — on the live shared run store, a timed `readDrainRedTeamEvidence` call for each ready PR takes under 1 s, where it takes about 9 s today, and returns the same evidence as the full scan.
-- [A2] **Must refuse** — a missing, duplicate, conflicting, malformed or partial index entry falls back to reading that record in full. A `review-pr` identity change is refused at write time.
-- [A3] **Must** — the Codex guard audit returns NOT WEAKENED on each slice diff, given the ruling recorded for Option A.
+- [A1] **Executable** — the named live-performance and parity cases above establish under-1-second reads for every ready PR in switched slices and equal evidence/provenance under the recorded Option A contract. Shadow-only slices still return full-scan results and report both timings.
+- [A2] **Must refuse** — missing, duplicate, conflicting, malformed or partial index state forces fresh record reads; identity-changing writes refuse without mutation. Planned cases above and in slices 0-1 assert this. I5 history gaps force full scans until the named rollback/re-upgrade and reconciliation cases in slice 2 establish safe recovery.
+- [A3] **Must** — `each_slice_requires_not_weakened_audit` requires NOT WEAKENED on each exact slice diff, with the Option A ruling recorded before slices 2-3.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -90,16 +115,16 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 ## Non-goals
 
 - [N1] No metadata-skip cache (mtime/size/inode/settle window) of any kind. The parked `lane/hot-cascade-run-index-v2` is superseded, not revived.
-- [N2] It does not change what counts as red-team evidence for a PR. It only changes which files are opened to find it.
+- [N2] Keep the PR's evidence, provenance and head-selection rules. The only permitted refusal change is the explicit other-PR corruption dependency after Option A is ratified; the alarm and candidate-refusal tests above cover that exception.
 
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — n/a: index entries carry only a run id, a URL-encoded repo and an integer PR. Malformed names are treated as unknown (I4).
+1. **Untrusted text** — malformed run-id/repo/PR encodings and noncanonical names are unknown (I4), tested by slice 1's `invalid_index_states_force_fresh_record_reads`. No HTTP receive endpoint is introduced.
 2. **Truncated reads** — a partial claim cannot be seen, because it is published with temp+link. A torn record that is still read throws, as today.
-3. **Shared state files** — the index is shared across daemons. Claims are exclusive (`link`), and entries are never rewritten.
+3. **Shared state files** — claims are exclusive (`link`); entries are immutable within a generation. Reconciliation quarantines obsolete generations under an exclusive barrier (slice 1 publication/concurrency and slice 2 reconciliation tests).
 4. **Fail closed** — any doubt about an entry means the record is read in full. A missing index means a full scan (today's answer).
 5. **Identity scoping** — the index is keyed by lowercase repo + PR. The head is filtered on record content, so head moves need no index work.
 6. **State over time** — pruning deletes the record, then the entry. An orphan entry is harmless, and an orphan record is read.
-7. **Who wrote it** — the writer fence (I5): the indexed reader runs only while every live daemon build enforces I2.
+7. **Who wrote it** — I5 requires current compatible writers and durable uninterrupted history since reconciliation; re-upgrade cannot clear invalidation (slice 2 admission and rollback/re-upgrade tests).
