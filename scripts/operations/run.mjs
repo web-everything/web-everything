@@ -128,7 +128,7 @@ import { CONTROL_OPS, operatorControlOperation, finishOperatorControl } from './
 import { createOperatorControlsReader, createOperatorControlsSinks } from './operator-controls-io.mjs';
 // The operator's audited auto-repair round extension (cap + granted rounds, read by reconcile-core).
 import { extendRoundsOperation, EXTEND_ROUNDS_OP } from './extend-rounds.mjs';
-import { createExtendRoundsReader, createExtendRoundsSinks } from './extend-rounds-io.mjs';
+import { createExtendRoundsReader, createExtendRoundsSinks, runRedTeamGateForPr } from './extend-rounds-io.mjs';
 // #4979 — the sanctioned writer of an OPERATOR's block/card/not-real ruling on a PR's mandatory referrals.
 import { recordReferralRulingOperation, RECORD_REFERRAL_RULING_OP } from './record-referral-ruling.mjs';
 import { createRecordReferralRulingReader, createRecordReferralRulingSinks } from './record-referral-ruling-io.mjs';
@@ -268,7 +268,7 @@ export const OPERATIONS = Object.freeze({
   // read → plan → write: the operator's audited round extension, read back through the cap's own counter.
   [EXTEND_ROUNDS_OP]: () => ({
     declaration: extendRoundsOperation({ readExtensionContext: createExtendRoundsReader() }),
-    sinks: createExtendRoundsSinks(),
+    sinks: createExtendRoundsSinks({ regate: runRedTeamGateForPr }),
   }),
   // #4979 — read → plan → write: the operator's referral ruling, pinned to the live head, read back through the gate.
   [RECORD_REFERRAL_RULING_OP]: () => ({
