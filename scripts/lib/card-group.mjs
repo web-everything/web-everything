@@ -693,7 +693,11 @@ export function createCardGrouping({
           if (!SHA.test(headSha ?? '')) continue;
           const names = labelNames(v.prLabels);
           if (!names.includes('ready-to-merge') || !names.includes('review:accepted')) continue;
-          if (v.item || v.couple || v.coupleKey) continue; // a PR that resolves an item or is half a couple stays serial
+          // Fail closed: ANY item value (0/NaN/unparseable included), couple, manifest, blockedBy or stackParents keeps
+          // the PR serial — its ordering/dependency holds are the planner's, never grouping's to bypass.
+          const deps = x => Array.isArray(x) ? x.length > 0 : x != null;
+          if (v.item !== undefined && v.item !== null) continue;
+          if (v.couple || v.coupleKey || v.coupleCarrier || v.hasManifest || deps(v.blockedBy) || deps(v.stackParents)) continue;
           cands.push({ num: Number(o.num), headSha, repo: v.repo });
         }
         if (cands.length < 2) return { reason: 'fewer than 2 accepted card candidates' };

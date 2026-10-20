@@ -6773,7 +6773,13 @@ async function runCli() {
     // mutex). Full passes only, like the post-cascade call.
     if (onlyPr == null && mergeStrategy.enqueues(null)) {
       cardGrouping.reconcile();
-      const early = remaining.filter(v => isLocalRepo(v.repo) && v.decision === 'merge' && !v.prestagePendingCi);
+      // Only what the PLANNER marked ready, or deferred on overlap-yield ALONE (the wait grouping replaces); any
+      // dependency/couple/stack wait keeps the PR off the early pool.
+      const earlyPlan = preparedPass.plan;
+      const plannerReady = v => (earlyPlan.ready || []).some(r => Number(r.num) === Number(v.num) && isLocalRepo(r.repo))
+        || (earlyPlan.deferred || []).some(d => Number(d.num) === Number(v.num) && d.overlapYield && isLocalRepo(d.overlapYield.repo)
+          && Array.isArray(d.waitOn) && d.waitOn.length > 0 && d.waitOn.every(w => String(w).startsWith('overlap-yield:')));
+      const early = remaining.filter(v => isLocalRepo(v.repo) && v.decision === 'merge' && !v.prestagePendingCi && plannerReady(v));
       const grouping = cardGrouping.form({ verdicts, early, admitted: await cardGroupAdmission(early) });
       if (grouping?.formed) process.stderr.write(`  card-group: formed #${grouping.formed.pr} before single enqueue (group first)\n`);
       else if (grouping?.reason && !/^(disabled|[01] card-only overlap deferral)/.test(grouping.reason)) process.stderr.write(`  card-group: no early group — ${grouping.reason}\n`);

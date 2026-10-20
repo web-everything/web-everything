@@ -417,6 +417,13 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     expect(mk(t15, pb, { withLock: racing }).form({ verdicts: t15.verdicts, early: t15.verdicts, admitted: admit(t15.verdicts) }).reason).toMatch(/reserved by another open card group/);
     expect(readGroupState(pb).groups.map(g => g.id)).toEqual(['aaaa']);
     expect(t15.calls.some(c => c.startsWith('pr create'))).toBe(false);
+    // Dependency/manifest/couple-bearing candidates stay serial, and an unparseable item (0/NaN) fails closed.
+    for (const [name, extra] of [['blockedBy', { blockedBy: ['x123456'] }], ['stackParents', { stackParents: [7] }], ['item 0', { item: 0 }],
+      ['item NaN', { item: NaN }], ['manifest', { hasManifest: true }], ['couple carrier', { coupleCarrier: { num: 3 } }]]) {
+      const t = setup();
+      const vs = t.verdicts.map(v => (v.num === 2 ? { ...v, ...extra } : v));
+      expect(mk(t, join(d, `dep-${name}.json`)).form({ verdicts: vs, early: vs, admitted: admit(vs) }).reason, name).toMatch(/fewer than 2 accepted card candidates/);
+    }
     // A PR already in a recorded group is never offered again.
     const t7 = setup();
     const sp = join(d, 'e.json');
@@ -465,6 +472,9 @@ describe('drain wiring: group first', () => {
     expect(early).toBeLessThan(src.indexOf('const grouped = cardGrouping.holdFor(c);'));
     expect(early).toBeLessThan(src.indexOf('const memoHold = createHoldMemo('));
     expect(src).toMatch(/liveGate: \(pr\) => \{ const who = attachLiveFixClaim\(/);
+    // The early pool is only what the planner marked ready, or deferred on overlap-yield alone.
+    expect(src).toContain('&& !v.prestagePendingCi && plannerReady(v));');
+    expect(src).toMatch(/d\.waitOn\.every\(w => String\(w\)\.startsWith\('overlap-yield:'\)\)/);
     expect(src).toContain('cardGrouping.form({ outcomes: enqueueOutcomes, verdicts, deferred, admitted: await cardGroupAdmission(');
     // Admission reuses the single path's own gates: the shared pre-enqueue hold (numbering etc.) and revalidateFresh.
     const adm = src.slice(src.indexOf('const cardGroupAdmission = async'), src.indexOf('const cardGroupAdmission = async') + 2000);
