@@ -1,56 +1,64 @@
 /**
  * @file skills-src/conveyor/review-refill.mjs
- * @description Card x3mfxzv (prototype, SHADOW ONLY) — refill review slots when a review job finishes, instead of
+ * @description Card x3mfxzv (prototype, SHADOW ONLY) - refill review slots when a review job finishes, instead of
  *   waiting for the next daemon pass (a pass takes ~11 min; three jobs finished within 6 min of dispatch on
  *   2026-10-20 and five slots sat empty ~15 min).
  *
- *   What it does: it watches the live review-round count. When the count drops (a job exited) it waits ~15 s
- *   (debounce), then asks "what would the pass dispatch right now?" by running the SAME `runReview` the pass runs,
- *   with every side effect replaced by a no-op and the dispatch replaced by a recorder. So eligibility, priority,
- *   lane and cap logic is the pass's own code, never a copy. It logs
- *   `refill-shadow: would dispatch #N now (slot freed at T by <who>)` and NEVER dispatches. Later, when the pass
- *   really dispatches that PR, it logs the idle-slot minutes saved.
+ *   Design (v2, after two audit rounds showed that re-running the pass's planner is not write-free): the refill
+ *   NEVER plans. It keeps the queue the LAST PASS already computed: the pass's own review rows that it did not
+ *   dispatch, put in the pass's own priority order (`orderReviewsForDispatch`, injected - not copied), with each
+ *   PR's head sha at plan time. When the live-round count drops (a job exited) it waits ~15 s, then takes the
+ *   next queued PRs, one per freed seat, after cheap revalidation only:
+ *     - the live-review cap has room (`budget()` = the pass's `liveReviewRoundBudget`, a read-only `ps`),
+ *     - the PR is still OPEN and its head sha is unchanged (ONE read-only `gh pr view` per candidate).
+ *   It logs `refill-shadow: would dispatch #N now (slot freed at T by ...)` and NEVER dispatches. When a later pass
+ *   really dispatches that PR it logs the idle-slot minutes saved. No reconcile, no git, no lane-pool, no file
+ *   writes: the only IO is the injected `budget`, the injected `readPr`, and reading the settings file.
+ *
+ *   Known limits (by design, shadow): the queue is as old as the last pass (dropped after 25 min); red-team rows
+ *   and same-pass promotions are not in it; lane availability is not checked (the cap is the binding limit).
  *
  *   Setting: `review.refillOnCompletion` = off | shadow | on, through the policy cascade (standard off;
  *   `scripts/settings/review-refill.json` sets this repo to shadow; env WE_REVIEW_REFILL_ON_COMPLETION). The source
- *   is logged. `on` is NOT built yet and behaves as shadow.
+ *   is logged. `on` is NOT built and behaves as shadow.
  *
- *   Fail closed: an unreadable process list, a missing cap, no free slot, a busy pass, a failed plan — all do
- *   nothing and wait for the pass.
+ *   Fail closed: unreadable `ps`, missing/zero cap room, stale or missing queue, a busy pass, an unreadable or
+ *   changed PR - each does nothing for that candidate (or at all) and waits for the pass.
  *
- *   Single-flight: `lock` is one mutex shared by the pass and the refill. The refill only ever TRY-acquires (busy =
+ *   Single-flight: `lock` is one mutex shared by the pass and the refill. The refill only TRY-acquires (busy =
  *   skip); the pass waits for it.
  *
- * THE HOOK in `skills-src/conveyor/review-daemon.mjs` (not applied yet: the file is held by open PRs). Exactly 5 lines:
+ * THE HOOK in `skills-src/conveyor/review-daemon.mjs` (not applied yet: the file is held by open PRs). 6 small edits:
  *
  *   1. top of file:
  *        import { createReviewRefill } from './review-refill.mjs';
- *   2. in `buildCliDaemonEffects`, right before `return {` (the object holding `tickOnce`):
- *        const refill = createReviewRefill({ runReview, budget: liveReviewRoundBudget, log: (l) => log.error(l) });
+ *   2. in `buildCliDaemonEffects`, before `return {`:
+ *        const refill = createReviewRefill({ budget: liveReviewRoundBudget, order: orderReviewsForDispatch, log: (l) => log.error(l) });
  *        refill.start();
  *   3. `tickOnce: () => withReviewFetchTick(async () => {`  becomes
  *        `tickOnce: () => refill.guardPass(() => withReviewFetchTick(async () => {`   and its closing `}),` becomes `})),`
- *   4. at the top of `onTick: (result) => {`, add:
+ *   4. in `tickOnce`, wrap the existing plan tap so the refill sees every repo's plan:
+ *        `const onPlan = refill.tapPlan(sharing.reusePlan ? ({ repo, plan, rawPrs }) => plans.set(repo, { plan, rawPrs }) : null);`
+ *   5. at the top of `onTick: (result) => {`:
  *        refill.notePass(result);
- *
- *   (`runReview` there is the `(opts) => runReviewTickAllRepos({...})` effect already defined in the same function;
- *   the refill passes it overrides that win because `...opts` is spread last.)
  */
 import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cascadePolicy } from '../../scripts/lib/policy-cascade.mjs';
-import { runReconcilePass, enrichPrsWithLedgerHolds } from '../../scripts/conveyor/reconcile-pass.mjs';
-import { enrichPrsWithReferralHolds, readReviewRunEvidence } from '../../scripts/conveyor/review-referral-hold.mjs';
-import { ledgerHoldStep } from '../../scripts/conveyor/review-hold-ledger-shadow.mjs';
 
 export const REFILL_MODES = Object.freeze(['off', 'shadow', 'on']);
 export const DEFAULT_DEBOUNCE_MS = 15_000;
 export const DEFAULT_POLL_MS = 5_000;
-/** Never run the (heavy) shadow plan more often than this, however many jobs finish. */
-export const DEFAULT_MIN_PLAN_GAP_MS = 60_000;
+/** Never run the revalidation (gh reads) more often than this, however many jobs finish. */
+export const DEFAULT_MIN_PLAN_GAP_MS = 30_000;
+/** A queue older than this is not trusted. */
+export const QUEUE_MAX_AGE_MS = 25 * 60_000;
 /** A "would dispatch" the pass never confirmed is dropped (and logged) after this long. */
 export const WOULD_TTL_MS = 30 * 60_000;
+/** At most this many PR reads per flush, however many fail revalidation. */
+export const MAX_READS_PER_FLUSH = 6;
 
 const SETTINGS_PATH = join(dirname(fileURLToPath(import.meta.url)), '../../scripts/settings/review-refill.json');
 
@@ -69,6 +77,15 @@ export function resolveRefillMode({ env = process.env, toolPath = SETTINGS_PATH,
     if (!REFILL_MODES.includes(mode)) return { mode: 'off', source: 'standard' };
     return { mode, source: r.sources?.refillOnCompletion ?? 'standard' };
   } catch { return { mode: 'off', source: 'standard' }; }
+}
+
+/** The one outside read: `gh pr view` of one PR (read-only). Returns {state, headRefOid} or throws. */
+export function createGhPrReader({ exec = execFileSync } = {}) {
+  return ({ repo, pr }) => {
+    const out = exec('gh', ['pr', 'view', String(pr), '--repo', repo, '--json', 'state,headRefOid'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, killSignal: 'SIGKILL' });
+    return JSON.parse(out);
+  };
 }
 
 /** One mutex for the pass and the refill. `tryAcquire` never waits; `acquire` waits its turn. Both return a release fn. */
@@ -93,58 +110,32 @@ export function createPassLock() {
   };
 }
 
-/**
- * Side-effect-free option overrides for the pass's own `runReview`: the pass's plan, none of its actions.
- * Beyond the dispatch/tag/notify/refresh no-ops, the plan's own reads are made write-free too (audit round 1):
- * the review-run evidence read skips its disk-cache write, the ledger hold step skips its shadow-journal append,
- * and the lane reader (whose `list --acquirable` reaps dead leases) is replaced by "unbounded" - in shadow the
- * live-round cap, which is the pass's own `liveReviewRoundBudget`, is the binding limit; lane availability is the
- * ONE input the shadow does not check. Everything that decides eligibility (hold enrichers, priority, cap) is the
- * pass's own code, called with the same arguments minus the writes.
- */
-export function shadowOverrides(recorder, { liveReviewBudget, runReconcile = runReconcilePass,
-  referral = enrichPrsWithReferralHolds, readEvidence = readReviewRunEvidence,
-  ledger = enrichPrsWithLedgerHolds, ledgerStep = ledgerHoldStep } = {}) {
-  const noop = () => {};
-  return {
-    liveReviewBudget,
-    dispatch: (o) => { recorder.rows.push({ repo: o.repo, prNumber: o.pr }); return { mode: 'shadow', agentId: null }; },
-    tagRound: noop, tagStatus: noop, notifyReferral: noop, finishRedTeamRequest: noop,
-    holdReconcile: () => [],
-    statusCandidates: () => [],
-    refreshScopeBloat: null, postRefreshMarker: null, promoteDrafts: null, notePromotions: null, onPlan: null,
-    poolExhaustion: null, log: noop,
-    acquirableLanes: () => Infinity,
-    reconcile: (o) => runReconcile({
-      ...o,
-      enrichReferralHolds: (prs, x) => referral(prs, { ...x, readRuns: () => readEvidence({ persist: false }) }),
-      enrichLedgerHolds: (prs, x) => ledger(prs, { ...x, step: (p, s) => ledgerStep(p, { ...s, journal: noop }) }),
-    }),
-  };
-}
-
 const hhmmss = (ms) => new Date(ms).toISOString().slice(11, 19) + 'Z';
+const keyOf = (repo, pr) => `${repo}#${pr}`;
 
 /**
  * @param {object} o
- * @param {(opts:object)=>object} o.runReview the pass's own review run (daemon effect); called with shadow overrides
  * @param {()=>({left:number, live?:number}|null)} o.budget fresh live-round budget (`liveReviewRoundBudget`)
+ * @param {(reviews:object[], ctx:{labelsByPr:Map, plan:object})=>object[]} [o.order] the pass's own priority order
+ * @param {({repo:string, pr:number})=>({state:string, headRefOid:string})} [o.readPr] read-only PR view
  * @param {(line:string)=>void} o.log
- * @param {()=>({mode:string, source:string})} [o.settings] re-read each use
  * @param {(prev:number, live:number)=>string} [o.identify] optional: names the finished job(s), e.g. "#5690"
  */
 export function createReviewRefill({
-  runReview, budget, log = () => {}, settings = () => resolveRefillMode(), identify = null,
+  budget, order = (reviews) => reviews, readPr = createGhPrReader(), log = () => {},
+  settings = () => resolveRefillMode(), identify = null,
   now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout, setPoll = setInterval, clearPoll = clearInterval,
   debounceMs = DEFAULT_DEBOUNCE_MS, pollMs = DEFAULT_POLL_MS, minPlanGapMs = DEFAULT_MIN_PLAN_GAP_MS,
-  lock = createPassLock(), overrideDeps = {},
+  lock = createPassLock(),
 } = {}) {
   let prevLive = null;       // last known live-round count; null = unknown (seed on next good read)
   let freed = [];            // [{at, by}] slots freed and not yet matched to a would-dispatch
   const would = new Map();   // "repo#pr" -> {at, by}
+  let planning = new Map();  // plans seen during the pass now running: repo -> {plan, rawPrs}
+  let queue = null;          // {at, rows:[{repo, prNumber, head}]} from the last finished pass
   let timer = null;
   let pollTimer = null;
-  let lastPlanAt = -Infinity;
+  let lastFlushAt = -Infinity;
   let announcedMode = null;
   let savedMinutes = 0;
   const mode = () => {
@@ -157,6 +148,14 @@ export function createReviewRefill({
 
   function readLive() {
     try { const b = budget(); return b && Number.isFinite(b.live) ? b.live : null; } catch { return null; }
+  }
+
+  /** The pass's `onPlan`, tapped: remember each repo's plan, then call the existing consumer unchanged. */
+  function tapPlan(next = null) {
+    return (info) => {
+      try { if (info?.repo && info.plan) planning.set(info.repo, { plan: info.plan, rawPrs: info.rawPrs }); } catch { /* observation only */ }
+      return typeof next === 'function' ? next(info) : undefined;
+    };
   }
 
   /** One watch step: a drop in live rounds means slot(s) freed. Unreadable = keep the old count, do nothing. */
@@ -180,44 +179,66 @@ export function createReviewRefill({
     timer?.unref?.();
   }
 
-  /** The shadow plan. Does nothing (waits for the pass) on any doubt. Returns the logged rows. */
+  /** Take the next queued PRs, one per freed seat, after revalidation. Does nothing on any doubt. Returns logged rows. */
   function flush() {
     if (mode() === 'off') { freed = []; return []; }
     const t = now();
     for (const [k, w] of would) if (t - w.at > WOULD_TTL_MS) { would.delete(k); log(`refill-shadow: ${k} was never dispatched by a pass within ${WOULD_TTL_MS / 60_000} min - dropped`); }
     if (!freed.length) return [];
-    if (t - lastPlanAt < minPlanGapMs) { schedule(); return []; }
+    if (t - lastFlushAt < minPlanGapMs) { schedule(); return []; }
     const release = lock.tryAcquire('refill');
     if (!release) return []; // a pass is running: it will dispatch
-    let rows = [];
+    const out = [];
     try {
-      lastPlanAt = t;
+      lastFlushAt = t;
+      if (!queue || t - queue.at > QUEUE_MAX_AGE_MS) return []; // no trusted queue: wait for the pass
       const b = budget();
       if (!b || !Number.isFinite(b.left) || b.left <= 0) return []; // unknown or full: fail closed
-      const recorder = { rows: [] };
-      const res = runReview(shadowOverrides(recorder, { liveReviewBudget: b, ...overrideDeps }));
-      // Any repo that failed to plan makes the whole answer partial: discard it and wait for the pass.
-      const partial = !res || typeof res !== 'object' || !Array.isArray(res.repos)
-        || res.repos.some((x) => x?.error) || (res.reconcileFailed?.length ?? 0) > 0 || (res.failed?.length ?? 0) > 0;
-      if (partial) { log('refill-shadow: plan was partial or failed for a repo, waiting for the pass'); return []; }
-      rows = recorder.rows.filter((r) => !would.has(`${r.repo}#${r.prNumber}`)).slice(0, freed.length);
-      for (const r of rows) {
+      const seats = Math.min(freed.length, b.left);
+      let reads = 0;
+      for (const row of queue.rows) {
+        if (out.length >= seats || reads >= MAX_READS_PER_FLUSH) break;
+        if (would.has(keyOf(row.repo, row.prNumber)) || !row.head) continue;
+        reads++;
+        let view;
+        try { view = readPr({ repo: row.repo, pr: row.prNumber }); } catch { continue; } // unreadable: skip it
+        if (!view || String(view.state).toUpperCase() !== 'OPEN') continue;
+        if (String(view.headRefOid ?? '').toLowerCase() !== String(row.head).toLowerCase()) continue;
         const slot = freed.shift();
-        would.set(`${r.repo}#${r.prNumber}`, { at: t, by: slot.by, freedAt: slot.at });
-        log(`refill-shadow: would dispatch #${r.prNumber} now (${r.repo}; slot freed at ${hhmmss(slot.at)} by ${slot.by})`);
+        would.set(keyOf(row.repo, row.prNumber), { at: t, by: slot.by, freedAt: slot.at });
+        out.push(row);
+        log(`refill-shadow: would dispatch #${row.prNumber} now (${row.repo}; slot freed at ${hhmmss(slot.at)} by ${slot.by})`);
       }
     } catch (e) {
-      log(`refill-shadow: plan failed, waiting for the pass: ${String(e?.message ?? e).split('\n')[0]}`);
+      log(`refill-shadow: failed, waiting for the pass: ${String(e?.message ?? e).split('\n')[0]}`);
     } finally { release(); }
+    return out;
+  }
+
+  /** Rebuild the queue from the plans this pass saw: owed reviews it did not dispatch, in the pass's own order. */
+  function buildQueue(result) {
+    const sent = new Set([...(result?.dispatched ?? []), ...(result?.notStarted ?? [])].map((d) => keyOf(d.repo, d.prNumber)));
+    const rows = [];
+    for (const [repo, { plan, rawPrs }] of planning) {
+      const prs = Array.isArray(rawPrs) ? rawPrs : [];
+      const labelsByPr = new Map(prs.map((p) => [Number(p?.number), p?.labels ?? []]));
+      const reviews = (plan?.dispatch ?? []).filter((d) => d && d.kind === 'review');
+      const ordered = order([...reviews], { labelsByPr, plan });
+      for (const d of ordered) {
+        if (sent.has(keyOf(repo, d.prNumber))) continue;
+        const pr = prs.find((p) => Number(p?.number) === Number(d.prNumber));
+        rows.push({ repo, prNumber: d.prNumber, head: pr?.headRefOid ?? null });
+      }
+    }
     return rows;
   }
 
-  /** The pass finished: match what it really dispatched against earlier would-dispatches. */
+  /** The pass finished: match what it dispatched against earlier would-dispatches, and keep its leftover queue. */
   function notePass(result) {
-    if (mode() === 'off') return;
+    if (mode() === 'off') { planning = new Map(); return; }
     const end = now();
     for (const d of (Array.isArray(result?.dispatched) ? result.dispatched : [])) {
-      const k = `${d.repo}#${d.prNumber}`;
+      const k = keyOf(d.repo, d.prNumber);
       const w = would.get(k);
       if (!w) continue;
       would.delete(k);
@@ -226,8 +247,9 @@ export function createReviewRefill({
       savedMinutes += mins;
       log(`refill-shadow: pass dispatched #${d.prNumber} (${d.repo}) ${mins.toFixed(1)} min after the refill would have${Number.isFinite(d.at) ? '' : ' (upper bound: pass end time)'}; idle-slot minutes saved ${mins.toFixed(1)}, total ${savedMinutes.toFixed(1)}`);
     }
-    // anything the pass already settled without dispatching stays until its TTL; a stale slot record would only mislead
-    freed = [];
+    try { queue = planning.size ? { at: end, rows: buildQueue(result) } : null; } catch { queue = null; } // doubt: no queue
+    planning = new Map();
+    freed = []; // the pass just refilled whatever it could
   }
 
   async function guardPass(fn) {
@@ -246,5 +268,6 @@ export function createReviewRefill({
     if (timer !== null) { clearTimer(timer); timer = null; }
   }
 
-  return { poll, flush, notePass, guardPass, start, stop, lock, _state: () => ({ prevLive, freed: [...freed], would: new Map(would), savedMinutes }) };
+  return { poll, flush, notePass, tapPlan, guardPass, start, stop, lock,
+    _state: () => ({ prevLive, freed: [...freed], would: new Map(would), queue, savedMinutes }) };
 }
