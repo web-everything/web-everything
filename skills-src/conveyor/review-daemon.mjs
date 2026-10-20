@@ -74,8 +74,9 @@
 
 import { readFileSync } from 'node:fs';
 import { cascadePolicy } from '../../scripts/lib/policy-cascade.mjs';
-import { resolve } from 'node:path';
+import { resolve, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents, isConflictingPr } from '../../scripts/conveyor/reconcile-pass.mjs';
 import { promoteDraftsThenReplan, promoteDraftsGuarded } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
@@ -344,6 +345,9 @@ export function runReviewTick({
   refreshScopeBloat = null,
   postRefreshMarker = null,
   acquirableLanes = () => Infinity,
+  // EMERGENCY 2026-10-20 — `{left:number}` shared by every repo of one daemon tick (see
+  // {@link liveReviewRoundBudget}); `null` (the default) never caps, so pure-function callers are unchanged.
+  liveReviewBudget = null,
   // Pool-exhaustion reporting: `{exhausted({repo, deferred}), recovered(repo)}` (see
   // `we:scripts/conveyor/pool-exhaustion.mjs`). `null` (the default) keeps every existing test byte-identical;
   // the real daemon wires a logger that says WHY the pool is empty once per episode, never a silent skip.
@@ -539,7 +543,10 @@ export function runReviewTick({
   // path — it is the SAME deferred-not-lost shape `deferredForLanes` already models, just for a different cause.
   const lanes = paused ? 0 : acquirableLanes({ repo });
   const acquirable = Math.max(0, (Array.isArray(lanes) ? lanes.length : Number(lanes)) || 0);
-  const dispatchable = reviews.slice(0, Math.min(reviews.length, acquirable));
+  const liveCap = liveReviewBudget && Number.isFinite(liveReviewBudget.left) ? Math.max(0, liveReviewBudget.left) : Infinity;
+  const dispatchable = reviews.slice(0, Math.min(reviews.length, acquirable, liveCap));
+  if (liveReviewBudget && Number.isFinite(liveReviewBudget.left)) liveReviewBudget.left = Math.max(0, liveReviewBudget.left - dispatchable.length);
+  if (liveCap < reviews.length && liveReviewBudget?.reason) process.stderr.write(`review-daemon: ${reviews.length - dispatchable.length} owed review(s) queued — ${liveReviewBudget.reason}\n`);
   const deferredForLanes = paused ? 0 : reviews.length - dispatchable.length;
   const deferredForAuth = paused ? reviews.length - dispatchable.length : 0;
   if (poolExhaustion && !paused) {
@@ -1068,6 +1075,30 @@ export function priorityNamesForLiveProcessPrs(liveProcessPrs) {
   return names;
 }
 
+/** EMERGENCY 2026-10-20 — the host-wide cap on live review rounds, from the tool layer
+ *  (`scripts/settings/review-concurrency.json`, source logged by the cascade). Counts live `review-job.mjs` /
+ *  `review-loop-cli.mjs` processes (a round is one job, or one bare loop). An unreadable `ps` fails closed (no new
+ *  review this tick). Revert condition: see the settings file's comment. */
+export function liveReviewRoundBudget({ env = process.env, listCommands = () => execFileSync('ps', ['-A', '-o', 'command='], { encoding: 'utf8', timeout: 10_000, maxBuffer: 32 * 1024 * 1024 }),
+  toolPath = join(dirname(fileURLToPath(import.meta.url)), '../../scripts/settings/review-concurrency.json') } = {}) {
+  let tool;
+  try { tool = JSON.parse(readFileSync(toolPath, 'utf8')); } catch { tool = undefined; }
+  const raw = env?.WE_REVIEW_MAX_LIVE_ROUNDS;
+  const r = cascadePolicy('reviewConcurrency', tool && { maxLiveReviewRounds: tool.maxLiveReviewRounds }, {
+    env, standard: { maxLiveReviewRounds: null },
+    envValues: { maxLiveReviewRounds: typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : undefined },
+    valid: { maxLiveReviewRounds: (v) => v === null || (Number.isSafeInteger(v) && v >= 1) },
+  });
+  const max = r.value.maxLiveReviewRounds;
+  if (max == null) return null;
+  const src = r.sources?.maxLiveReviewRounds ?? 'standard';
+  let lines;
+  try { lines = String(listCommands()).split('\n'); } catch (e) { return { left: 0, reason: `live review rounds unknown (${String(e?.message ?? e).split('\n')[0]}); maxLiveReviewRounds=${max} (${src})` }; }
+  const count = (re) => lines.filter((l) => re.test(l)).length;
+  const live = Math.max(count(/review-job\.mjs/), count(/review-loop-cli\.mjs/));
+  return { left: Math.max(0, max - live), live, max, reason: `live review rounds ${live} of maxLiveReviewRounds=${max} (${src})` };
+}
+
 export function buildCliDaemonEffects({
   owner, intervalMs = DEFAULT_INTERVAL_MS, log = console,
   reapSessions = defaultReapSessions,
@@ -1085,6 +1116,7 @@ export function buildCliDaemonEffects({
     return runReviewTickAllRepos({
       log: line => log.error(line),
       acquirableLanes: defaultAcquirableLaneNumbers, readPrs: defaultReadPrs, readAgents: defaultReadAgents,
+      liveReviewBudget: liveReviewRoundBudget(),
       poolExhaustion: DAEMON_POOL_EXHAUSTION,
       refreshScopeBloat: refreshScopeBloatedPr,
       postRefreshMarker: defaultPostRebaseComment,
