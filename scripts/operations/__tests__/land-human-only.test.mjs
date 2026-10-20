@@ -14,7 +14,7 @@ vi.mock('../../lib/marker-authorship.mjs', async (original) => ({
 import {
   evaluateLandGates, planLandHumanOnly, landHumanOnlyOperation, buildLandComment, finishLandOutcome, LAND_HUMAN_ONLY_EFFECT, LAND_HUMAN_ONLY_MARKER,
 } from '../land-human-only.mjs';
-import { cloneFor, createLandHumanOnlySinks, createLandHumanOnlyReader, resolveOperatorCredential, operatorEnv, operatorTerminalPresent } from '../land-human-only-io.mjs';
+import { cloneFor, locateClone, readCanonicalSlug, createLandHumanOnlySinks, createLandHumanOnlyReader, resolveOperatorCredential, operatorEnv, operatorTerminalPresent } from '../land-human-only-io.mjs';
 import { driveRun, renderOutcome } from '../cli-adapter.mjs';
 import { createRegistry } from '../registry.mjs';
 import { startRun } from '../engine.mjs';
@@ -40,7 +40,7 @@ function read(over = {}) {
 const input = (over = {}) => ({ repo, pr: 7, actor: 'chalbert', channel: 'chat', reason: 'land #7 please', 'dry-run': false, ...over });
 
 describe('land-human-only — checkout identity', () => {
-  const find = (origin) => cloneFor(repo, { candidates: ['/clone/nested'],
+  const find = (origin) => cloneFor(repo, { candidates: ['/clone/nested'], canonical: () => null,
     exec: (_bin, args) => args.includes('rev-parse') ? '/clone\n' : origin });
   it.each(['https://github.com/o/r.git', 'git@github.com:o/r.git', 'ssh://git@github.com/o/r.git',
     'https://github.com/O/R/', 'https://github.com/o/r'])('accepts the full GitHub identity in %s', (origin) => {
@@ -51,8 +51,33 @@ describe('land-human-only — checkout identity', () => {
     '/tmp/o/r.git', 'https://github.com/o/r.git?other', 'https://github.com/o/r.git#other'])('refuses %s', (origin) => {
     expect(find(origin)).toBeNull();
   });
+  it('accepts an origin GitHub resolves to the repo (renamed/transferred owner), and says why it refuses otherwise', () => {
+    const opts = (canonical) => ({ candidates: ['/lane'], canonical,
+      exec: (_bin, args) => args.includes('rev-parse') ? '/lane\n' : 'git@github.com:old-owner/r.git' });
+    const asked = [];
+    expect(locateClone(repo, opts((s) => { asked.push(s); return 'o/r'; }))).toEqual({ dir: '/lane', reasons: [] });
+    expect(asked).toEqual(['old-owner/r']);
+    const other = locateClone(repo, opts(() => 'someone/else'));
+    expect(other.dir).toBeNull();
+    expect(other.reasons.join()).toMatch(/old-owner\/r is someone\/else, not o\/r/);
+    // An unreadable resolution fails closed.
+    const unread = locateClone(repo, opts(() => null));
+    expect(unread.dir).toBeNull();
+    expect(unread.reasons.join()).toMatch(/could not be read/);
+  });
+  it('never asks GitHub about a matching or non-GitHub origin', () => {
+    const canonical = () => { throw new Error('must not be called'); };
+    const at = (origin) => locateClone(repo, { candidates: ['/c'], canonical, exec: (_b, a) => a.includes('rev-parse') ? '/c\n' : origin });
+    expect(at('git@github.com:o/r.git').dir).toBe('/c');
+    expect(at('/tmp/o/r.git').reasons.join()).toMatch(/not a github.com owner\/name/);
+  });
+  it('reads the canonical slug from GitHub and refuses an unreadable answer', () => {
+    expect(readCanonicalSlug('old/r', { exec: (bin, args) => { expect([bin, ...args]).toEqual(['gh', 'api', '--hostname', 'github.com', 'repos/old/r', '-q', '.full_name']); return 'O/R\n'; } })).toBe('o/r');
+    expect(readCanonicalSlug('old/r', { exec: () => '' })).toBeNull();
+    expect(readCanonicalSlug('old/r', { exec: () => { throw new Error('404'); } })).toBeNull();
+  });
   it('continues to a matching candidate after a different owner', () => {
-    expect(cloneFor(repo, { candidates: ['/fork', '/correct'], exec: (_bin, args) => {
+    expect(cloneFor(repo, { candidates: ['/fork', '/correct'], canonical: () => null, exec: (_bin, args) => {
       if (args.includes('rev-parse')) return args[1];
       return args[1] === '/fork' ? 'https://github.com/other/r.git' : 'git@github.com:o/r.git';
     } })).toBe('/correct');
@@ -406,6 +431,9 @@ describe('land-human-only — the reader', () => {
     expect(r.labelPresent).toBe(false);
     expect(r.labelDecision.label).toBe(true);
     expect(r.gateRowsError).toMatch(/no checkout/);
+    const r3 = createLandHumanOnlyReader({ exec, credential: cred, requiredChecks: () => ['test'],
+      clone: () => ({ dir: null, reasons: ['/lane: origin x/r is not o/r, and GitHub\'s canonical name for it could not be read'] }) })({ repo, pr: 7 });
+    expect(r3.surface.error).toMatch(/run from a clone whose origin is github\.com\/o\/r\) — checked \/lane: origin x\/r is not o\/r/);
     expect(r.requiredChecks.allowed).toBe(true);
     expect(r).not.toHaveProperty('token');
     const r2 = createLandHumanOnlyReader({ exec, credential: cred, clone: () => '/clone', requiredChecks: () => ['test'],
