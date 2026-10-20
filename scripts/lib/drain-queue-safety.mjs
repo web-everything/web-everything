@@ -32,9 +32,9 @@ export function postAcceptRedTeamOwed(loopPayload, env = process.env, evidence =
   return redTeamOwedOnHead({ read: loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly });
 }
 
-export function redTeamEnqueueHold({ loopPayload, comments, pr, head, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false, skipCardOnly } = {}) {
+export function redTeamEnqueueHold({ loopPayload, comments, pr, head, repo = null, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false, skipCardOnly } = {}) {
   // A recorded break still holds even if the scheduler is now disabled or the payload is unavailable.
-  const disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks });
+  const disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks, repo });
   if (disposition.sendBack.length || disposition.held.length)
     return 'post-accept red team confirmed a break requiring send-back';
   if (!postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded, skipCardOnly }) || disposition.result) return null;

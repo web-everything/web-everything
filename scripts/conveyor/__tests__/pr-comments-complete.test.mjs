@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { enrichPrsWithCompleteComments, readCompletePrComments, LIST_COMMENTS_PAGE_SIZE } from '../pr-comments-complete.mjs';
+import { enrichPrsWithCompleteComments, readCompletePrComments, readCompletePrCommentEditHistory, LIST_COMMENTS_PAGE_SIZE } from '../pr-comments-complete.mjs';
 import { countGrantedRoundExtensions, buildRoundExtensionComment } from '../round-extension-mark.mjs';
 import { countUnresolvedStandDowns } from '../reconcile-core.mjs';
 import { standDownOf } from '../health-smells/stood-down-prs.mjs';
@@ -9,6 +9,29 @@ const repo = 'web-everything/web-everything';
 const filler = (n) => Array.from({ length: n }, (_, i) => ({ author: { login: 'web-everything' }, body: `drain park-reason spam ${i} ${'x'.repeat(10_000)}` }));
 const grant = (by) => ({ author: { login: 'chalbert' }, body: buildRoundExtensionComment({ repo, pr: 4017, by, actor: 'chalbert', channel: 'test', reason: 'more', at: '2026-10-06T10:44:55Z' }) });
 const note = { kind: 'round-cap-exhausted', prNumber: 4017, attempts: 6, cap: 5, text: 'PR #4017: review auto-repair rounds exhausted (6/5)' };
+
+describe('complete comment edit history failures', () => {
+  const page = (nodes, pageInfo) => JSON.stringify({ data: { repository: { pullRequest: { comments: { nodes, pageInfo } } } } });
+  const first = page([{ id: 'IC_1', lastEditedAt: null }], { hasNextPage: true, endCursor: 'next' });
+
+  it.each([
+    '{}',
+    page([{ id: 'IC_2' }], { hasNextPage: false }),
+    page([], {}),
+    page([], { hasNextPage: true, endCursor: null }),
+    page([], { hasNextPage: true, endCursor: 'next' }),
+    JSON.stringify({ errors: [{ message: 'denied' }], data: JSON.parse(first).data }),
+  ])('refuses a partial result when a later page is malformed: %s', (later) => {
+    const exec = vi.fn().mockReturnValueOnce(first).mockReturnValue(later);
+    expect(() => readCompletePrCommentEditHistory(7, { repo, exec })).toThrow();
+    expect(exec).toHaveBeenCalledTimes(2);
+  });
+
+  it('propagates a later page transport failure', () => {
+    const exec = vi.fn().mockReturnValueOnce(first).mockImplementation(() => { throw new Error('page failed'); });
+    expect(() => readCompletePrCommentEditHistory(7, { repo, exec })).toThrow('page failed');
+  });
+});
 
 describe('complete PR comments', () => {
   const firstPage = filler(LIST_COMMENTS_PAGE_SIZE); // >1 MiB, grants are past it
