@@ -350,6 +350,47 @@ describe('ledger head lifecycle red-team regressions', () => {
         ...findings(), verdict('head-moved', head, { fromHead: next, source: 'head-observer' }), verdict('accepted', head)];
       expectHeld(events, head);
     });
+    describe('operator send-back (round 13): a referral of the moved-from head, appended after the move, is fixed by a fresh accept of the new head', () => {
+      const late = (ruled = null) => [event('referral', { headSha: head, findingKeys: [key] }),
+        ...(ruled ? [event('ruling', { findingKey: key, ruling: ruled })] : [])];
+      const moved = verdict('head-moved', next, { fromHead: head, source: 'head-observer' });
+      for (const ruled of [null, 'block']) it(`review of A in flight, push B, head-moved(A→B), referral(A,[K])${ruled ? ', ruling(K,block)' : ''}, fresh accept of B`, () => {
+        const events = [verdict('accepted'), moved, ...late(ruled), verdict('accepted', next)];
+        expect(ledgerView(events, facts(next)).referrals.get(key)).toMatchObject({ state: 'resolved-by-fix', resolvedAtHead: next });
+        expect(codes(events)).not.toContain(ruled ? 'referral-blocked' : 'referral-unruled');
+        expect(derivePrState(events, facts(next)).clears).toBe(true);
+        expect(ledgerReferralsOutstanding(events)).toBe(false);
+        // Before the fresh accept the finding still holds at B.
+        expect(codes([verdict('accepted'), moved, ...late(ruled)])).toContain(ruled ? 'referral-blocked' : 'referral-unruled');
+      });
+      it('variant: the move to B was witnessed by a fresh review of B (no head-moved row)', () => {
+        const events = [verdict('accepted'), verdict('changes', next), ...late('block'), verdict('accepted', next)];
+        expect(ledgerView(events, facts(next)).referrals.get(key).state).toBe('resolved-by-fix');
+        expect(codes(events)).not.toContain('referral-blocked');
+      });
+      it('variant: a carry A→B, then a real move B→C, then a late referral of A; a fresh accept of C fixes it, of B does not', () => {
+        const chain = [verdict('accepted'), verdict('carried', next, { fromHead: head, carryRule: 'tree-identical', source: 'head-observer' }),
+          verdict('head-moved', third, { fromHead: next, source: 'head-observer' }), ...late('block')];
+        expect(ledgerView([...chain, verdict('accepted', third)], facts(third)).referrals.get(key).state).toBe('resolved-by-fix');
+        expect(ledgerView([...chain, verdict('accepted', next)], facts(third)).referrals.get(key).state).toBe('blocking');
+      });
+      it('a delayed transition the fold never applied moves nothing forward', () => {
+        // B was witnessed first; a head-moved(A→C) arriving from a stale snapshot is not applied, so C stays unknown, not newer.
+        const events = [verdict('accepted'), verdict('accepted', next), verdict('head-moved', third, { fromHead: head, source: 'head-observer' }),
+          ...late('block'), verdict('accepted', third)];
+        expect(ledgerView(events, facts(third)).referrals.get(key).state).toBe('blocking');
+      });
+      it('a carry A→B is the same content: a fresh accept of B after a late referral of A is still no fix', () => {
+        const events = [verdict('accepted'), verdict('carried', next, { fromHead: head, carryRule: 'tree-identical', source: 'head-observer' }),
+          ...late('block'), verdict('accepted', next)];
+        expect(ledgerView(events, facts(next)).referrals.get(key).state).toBe('blocking');
+      });
+      it('a head that was older than A stays no fix, even when a later move returns to it', () => {
+        const events = [verdict('accepted', next), verdict('head-moved', head, { fromHead: next, source: 'head-observer' }), verdict('accepted'),
+          verdict('head-moved', next, { fromHead: head, source: 'head-observer' }), ...late('block'), verdict('accepted', next)];
+        expect(ledgerView(events, facts(next)).referrals.get(key).state).toBe('blocking');
+      });
+    });
     it('variant: a chain A→B→C with late accepts of both superseded heads', () => {
       const key3 = [event('referral', { headSha: third, findingKeys: [key] }), event('ruling', { findingKey: key, ruling: 'block' })];
       const events = [verdict('accepted'), verdict('head-moved', next, { fromHead: head, source: 'head-observer' }),
