@@ -101,7 +101,7 @@ describe('#5773: a card-batch hold the seal job still owns is PARKED, not NEEDS 
   const pr = { number: 5773, title: 'Admit card "xn5h9sy"', isDraft: true, state: 'OPEN',
     headRefOid: 'b'.repeat(40), mergeable: 'MERGEABLE', comments: [], statusCheckRollup: [],
     labels: [{ name: 'review:pending' }, { name: 'review-status:draft-withdrawn' }] };
-  const owned = { status: 'owned', kind: 'filing', batchRef: 'lane/card-batch-filing-4', members: 1, dueAt: '2026-10-20T19:46:24.138Z', reason: null };
+  const owned = { status: 'owned', kind: 'filing', batchRef: 'lane/card-batch-filing-4', headSha: 'b'.repeat(40), members: 1, dueAt: '2026-10-20T19:46:24.138Z', reason: null };
 
   it('returns a parked row with no release command for an owned hold', () => {
     const row = needsPersonRow('o/n', pr, { cardBatchHold: () => owned });
@@ -114,6 +114,13 @@ describe('#5773: a card-batch hold the seal job still owns is PARKED, not NEEDS 
     expect(row.parked).toBeUndefined();
     expect(row.detail).toContain(`cause-${status}`);
     expect(row.commands.releaseDraft).toBe('gh pr edit 5773 --repo=o/n --remove-label review-status:draft-withdrawn');
+  });
+
+  it('keeps it in NEEDS YOU when the PR head moved off the batch head (someone else is acting on it)', () => {
+    const row = needsPersonRow('o/n', { ...pr, headRefOid: 'c'.repeat(40) }, { cardBatchHold: () => owned });
+    expect(row.parked).toBeUndefined();
+    expect(row.headline).toContain('(moved)');
+    expect(row.commands.releaseDraft).toContain('--remove-label review-status:draft-withdrawn');
   });
 
   it('keeps an unknown withdrawn draft in NEEDS YOU exactly as before', () => {

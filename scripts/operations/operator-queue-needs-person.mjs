@@ -22,7 +22,11 @@ export function latestUnresolvedPersonNote(comments = []) {
 export function needsPersonRow(repo, pr, { cardBatchHold } = {}) {
   if ((pr.state ?? 'OPEN') === 'OPEN' && pr.isDraft === true
       && pr.labels?.some(l => (typeof l === 'string' ? l : l?.name) === WITHDRAWN_LABEL)) {
-    const hold = cardBatchHold?.(repo, pr.number) ?? null;
+    let hold = cardBatchHold?.(repo, pr.number) ?? null;
+    // A head that moved off the batch head means someone other than the seal job is acting on this PR.
+    if (hold?.status === 'owned' && pr.headRefOid && hold.headSha && pr.headRefOid !== hold.headSha) {
+      hold = { ...hold, status: 'moved', reason: `the PR head ${pr.headRefOid.slice(0, 9)} is not the batch head ${hold.headSha.slice(0, 9)}` };
+    }
     if (hold?.status === 'owned') {
       return { repo, number: pr.number, title: pr.title, kind: 'card-batch-held', parked: true,
         batchRef: hold.batchRef, members: hold.members, dueAt: hold.dueAt,

@@ -13,38 +13,56 @@
  *   - `owned`   — the seal job will release the hold itself. Shown under PARKED, never in NEEDS YOU.
  *   - `failed`  — the seal recorded a failure (verify red or never ran). A person is needed. Stays in NEEDS YOU.
  *   - `overdue` — the seal job should have released it by now and has not. Stays in NEEDS YOU.
- *   - `done`    — the seal finished, yet the hold is still on the PR. Unexpected, so it stays in NEEDS YOU.
+ *   - `done`    — the seal job already let go of its hold, so a withdrawal still on the PR is someone else's.
+ *                 Stays in NEEDS YOU. The same goes for a PR whose head moved off the batch head (the caller checks).
  * A PR the state does not name, or state that cannot be read, keeps the old NEEDS YOU row (fail loud).
  */
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
-/** Extra time past the batch's own age limit before an unsealed hold counts as overdue (one hour). */
-export const SEAL_GRACE_MS = 60 * 60_000;
-/** Time a started seal may run before it counts as overdue. Matches the seal job's own 3-hour lease. */
-export const SEAL_RUN_MS = 3 * 60 * 60_000;
+/** Time the scheduler gets to launch (or relaunch) a seal worker once one is owed, before the hold is overdue. */
+export const SEAL_GRACE_MS = 30 * 60_000;
 const DEFAULT_MAX_AGE_MINUTES = 60;
+const DEFAULT_MAX_CARDS = 10;
+/** Seal steps at or past which the seal job has already let go of the hold (card-batch-seal-io.mjs `holdReleased`). */
+const RELEASED_STEPS = new Set(['remove-hold', 'ready', 'label-on-green']);
 
 const toMs = value => (typeof value === 'number' ? value : Date.parse(value));
 const keyOf = (repo, number) => `${repo}#${Number(number)}`;
 
 /**
  * Pure: classify one batch state for the PR it names.
- * @returns {{status:'owned'|'failed'|'overdue'|'done', kind:string|null, batchRef:string|null, members:number,
- *   dueAt:string|null, reason:string|null}}
+ * `lockExpiresAt` is the expiry of the batch's on-disk lease lock (`<state>.lock`), when one exists: a live lock
+ * means a worker is on the batch right now.
+ * @returns {{status:'owned'|'failed'|'overdue'|'done', kind:string|null, batchRef:string|null, headSha:string|null,
+ *   members:number, dueAt:string|null, reason:string|null}}
  */
-export function classifyCardBatchHold(state, { now = Date.now(), policy = {} } = {}) {
+export function classifyCardBatchHold(state, { now = Date.now(), policy = {}, lockExpiresAt = null } = {}) {
   const kind = state.kind ?? null;
-  const base = { kind, batchRef: state.batchRef ?? null, members: Array.isArray(state.members) ? state.members.length : 0 };
+  const members = Array.isArray(state.members) ? state.members : [];
+  const base = { kind, batchRef: state.batchRef ?? null, headSha: state.headSha ?? null, members: members.length };
   if (state.sealFailure) return { ...base, status: 'failed', dueAt: null, reason: String(state.sealFailure.reason ?? 'seal failed') };
-  if (state.seal?.step === 'label-on-green') return { ...base, status: 'done', dueAt: null, reason: 'seal finished but the hold is still on the PR' };
-  const maxAgeMinutes = Number(policy?.[kind]?.maxAgeMinutes) > 0 ? Number(policy[kind].maxAgeMinutes) : DEFAULT_MAX_AGE_MINUTES;
+  if (RELEASED_STEPS.has(state.seal?.step)) {
+    return { ...base, status: 'done', dueAt: null, reason: `the seal job already released its hold (step ${state.seal.step}); this withdrawal is not the batch's` };
+  }
+  if (state.holdApplied !== true) return { ...base, status: 'overdue', dueAt: null, reason: 'batch state does not record its hold' };
+  const live = Number.isFinite(toMs(lockExpiresAt)) && toMs(lockExpiresAt) > now;
+  const lastLease = Math.max(...[lockExpiresAt, state.lease?.expiresAt].map(toMs).filter(Number.isFinite), -Infinity);
+  const kindPolicy = policy?.[kind] ?? {};
+  const maxAgeMinutes = Number(kindPolicy.maxAgeMinutes) > 0 ? Number(kindPolicy.maxAgeMinutes) : DEFAULT_MAX_AGE_MINUTES;
+  const maxCards = Number(kindPolicy.maxCards) > 0 ? Number(kindPolicy.maxCards) : DEFAULT_MAX_CARDS;
   const sealedAt = toMs(state.sealedAt);
   const openedAt = toMs(state.openedAt);
-  const due = Number.isFinite(sealedAt) ? sealedAt + SEAL_RUN_MS
-    : Number.isFinite(openedAt) ? openedAt + maxAgeMinutes * 60_000 + SEAL_GRACE_MS : NaN;
+  const lastAdmitted = Math.max(...members.map(m => toMs(m?.admittedAt)).filter(Number.isFinite), -Infinity);
+  // When a seal became owed: already started, full (count beats age), or old enough.
+  const owedAt = Number.isFinite(sealedAt) ? sealedAt
+    : members.length >= maxCards ? (Number.isFinite(lastAdmitted) ? lastAdmitted : openedAt)
+      : openedAt + maxAgeMinutes * 60_000;
   // No usable time means the job's progress cannot be judged: keep the operator informed.
-  if (!Number.isFinite(due)) return { ...base, status: 'overdue', dueAt: null, reason: 'batch state has no open or seal time' };
+  if (!Number.isFinite(owedAt)) return { ...base, status: 'overdue', dueAt: null, reason: 'batch state has no open or seal time' };
+  // A live worker owns it until its lease ends; otherwise the scheduler has a grace period after the seal became
+  // owed, or after the last worker's lease ended, to (re)launch one.
+  const due = live ? toMs(lockExpiresAt) : Math.max(owedAt, lastLease) + SEAL_GRACE_MS;
   const dueAt = new Date(due).toISOString();
   if (now > due) return { ...base, status: 'overdue', dueAt, reason: `the seal job has not released the hold (due by ${dueAt})` };
   return { ...base, status: 'owned', dueAt, reason: null };
@@ -67,7 +85,9 @@ export function readCardBatchHolds({ stateDir, now = Date.now(), policy = {}, re
       try { state = JSON.parse(read(join(dir, file), 'utf8')); } catch (error) { errors.push(`${file}: ${error.message}`); continue; }
       if (!state?.pr || !state.repo && !state.members?.[0]?.source?.repo) continue;
       const repo = state.repo ?? state.members[0].source.repo;
-      const hold = classifyCardBatchHold(state, { now, policy });
+      let lockExpiresAt = null;
+      try { lockExpiresAt = JSON.parse(read(join(dir, `${file}.lock`), 'utf8'))?.expiresAt ?? null; } catch { /* no lock */ }
+      const hold = classifyCardBatchHold(state, { now, policy, lockExpiresAt });
       const key = keyOf(repo, state.pr);
       if (!holds.has(key) || rank[hold.status] > rank[holds.get(key).status]) holds.set(key, hold);
     }
