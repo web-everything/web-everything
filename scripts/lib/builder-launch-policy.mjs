@@ -61,6 +61,10 @@ export function formatBuilderLaunchPolicyLine(p) {
 
 /** IO: read the platform file and the tool settings layer. Never throws. */
 export function loadBuilderLaunchPolicy({ platformPath = PLATFORM_PREFERENCES_PATH, toolSettings, env = process.env, readFile = readFileSync } = {}) {
+  return loadBuilderPolicyLayers({ platformPath, toolSettings, env, readFile }, resolveBuilderLaunchPolicy);
+}
+
+function loadBuilderPolicyLayers({ platformPath, toolSettings, env, readFile }, resolvePolicy) {
   const readErrors = [];
   let platform;
   try { platform = JSON.parse(readFile(platformPath, 'utf8'))?.[BUILDER_POLICY_KEY]; }
@@ -68,6 +72,47 @@ export function loadBuilderLaunchPolicy({ platformPath = PLATFORM_PREFERENCES_PA
   let tool;
   try { tool = (toolSettings === undefined ? readSettings() : toolSettings)?.[BUILDER_POLICY_KEY]; }
   catch (e) { readErrors.push(`tool settings unreadable: ${String(e?.message ?? e).split('\n')[0]}`); }
-  const policy = resolveBuilderLaunchPolicy({ platform, tool, env });
+  const policy = resolvePolicy({ platform, tool, env });
   return { ...policy, invalid: [...readErrors, ...policy.invalid] };
+}
+
+/** `builder.pausedPollSec`: standard → platform → tool → env. Invalid values reset to 600. */
+export const STANDARD_PAUSED_POLL_SEC = 600;
+export const PAUSED_POLL_ENV = 'WE_BUILDER_PAUSED_POLL_SEC';
+// Node resets delays above its signed 32-bit millisecond limit to 1ms.
+const MAX_PAUSED_POLL_SEC = Math.floor(2_147_483_647 / 1000);
+
+export function resolveBuilderPausedPollPolicy({ platform, tool, env } = {}) {
+  let pausedPollSec = STANDARD_PAUSED_POLL_SEC;
+  let source = 'standard';
+  const invalid = [];
+  const apply = (value, layer, label) => {
+    if (Number.isSafeInteger(value) && value > 0 && value <= MAX_PAUSED_POLL_SEC) {
+      pausedPollSec = value;
+      source = layer;
+    } else {
+      invalid.push(`${label}=${JSON.stringify(value)}`);
+      pausedPollSec = STANDARD_PAUSED_POLL_SEC;
+      source = 'standard';
+    }
+  };
+  for (const [name, layer] of [['platform', platform], ['tool', tool]]) {
+    if (layer === undefined || layer === null) continue;
+    if (!isObj(layer)) { apply(layer, name, name); continue; }
+    if (Object.hasOwn(layer, 'pausedPollSec')) apply(layer.pausedPollSec, name, `${name}.pausedPollSec`);
+  }
+  const raw = isObj(env) ? env[PAUSED_POLL_ENV] : undefined;
+  if (raw !== undefined && raw !== '') {
+    apply(/^\d+$/.test(String(raw)) ? Number(raw) : raw, 'env', `env.${PAUSED_POLL_ENV}`);
+  }
+  return { pausedPollSec, source, invalid };
+}
+
+export function formatBuilderPausedPollPolicyLine(p) {
+  const bad = p.invalid.length ? ` · invalid setting, fallback to ${STANDARD_PAUSED_POLL_SEC}s: ${p.invalid.join('; ')}` : '';
+  return `builder paused policy: pausedPollSec=${p.pausedPollSec} (${p.source})${bad}`;
+}
+
+export function loadBuilderPausedPollPolicy({ platformPath = PLATFORM_PREFERENCES_PATH, toolSettings, env = process.env, readFile = readFileSync } = {}) {
+  return loadBuilderPolicyLayers({ platformPath, toolSettings, env, readFile }, resolveBuilderPausedPollPolicy);
 }
