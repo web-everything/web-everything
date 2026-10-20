@@ -538,7 +538,8 @@ export function runReviewTick({
   // generic `fixing` — no second `gh` read.
   const mergeConflictedByPr = new Map((Array.isArray(rawPrs) ? rawPrs : [])
     .map((p) => [Number(p?.number), String(p?.mergeStateStatus ?? '').toUpperCase() === 'DIRTY']));
-  const reviews = (plan.dispatch ?? []).filter((d) => d && d.kind === 'review');
+  // Seat order when fewer reviews can go than are owed: see orderReviewsForDispatch (main-fix, then blocked PRs).
+  const reviews = orderReviewsForDispatch((plan.dispatch ?? []).filter((d) => d && d.kind === 'review'), { labelsByPr, plan });
   // Live-caught 2026-09-22, #xli631k: a PR that moved to being owed a FIX (not a review) used to never
   // reach `statusCandidates` at all, so its `review-status:reviewing` label sat stale once its review
   // session finished (PR #2472, ~2 hours stale). `selectStatusCandidates` now takes fix-owed entries as a
@@ -561,10 +562,6 @@ export function runReviewTick({
   // whole block): every review stays owed exactly like a lane-starved tick already does (`reviewsOwed` and
   // `statusCandidates` below are unaffected), so nothing here re-derives a second "was anything dispatched"
   // path — it is the SAME deferred-not-lost shape `deferredForLanes` already models, just for a different cause.
-  // 2026-10-20 — when this tick can dispatch fewer reviews than are owed, the scarce seats go in priority
-  // order: a main-fix PR first, then a PR a human or the merge queue is waiting on (`review:human`,
-  // `ready-to-merge`), then the rest; oldest PR first within a rank, so a busy queue never starves old PRs.
-  reviews.splice(0, reviews.length, ...orderReviewsForDispatch(reviews, { labelsByPr, plan }));
   const lanes = paused ? 0 : acquirableLanes({ repo });
   const acquirable = Math.max(0, (Array.isArray(lanes) ? lanes.length : Number(lanes)) || 0);
   const liveCap = liveReviewBudget && Number.isFinite(liveReviewBudget.left) ? Math.max(0, liveReviewBudget.left) : Infinity;
