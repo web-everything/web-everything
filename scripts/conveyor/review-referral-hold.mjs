@@ -466,19 +466,27 @@ export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), readRu
   });
 }
 
-/** Reserve before sending: an ambiguous transport failure must not create duplicate comments on every tick.
- * Known pre-send rate-limit failures can retry with bounded backoff; all other failures remain visible locally.
- */
 /**
- * A no-verdict same-head hold past its last cool-down release is permanent (as on main) and must never be silent:
- * raise ONE needs-you event per repo+PR+head. A `pending` receipt is reserved (`wx`) before publishing and marked
- * `published` after, so repeated ticks and concurrent daemons do not emit twice; a failed publish drops the receipt so
- * the next tick retries, and a stale `pending` (crash, failed cleanup) or corrupt receipt is reclaimed. Never throws.
+ * A no-verdict same-head hold past its last cool-down release is permanent (as on main) and must never be silent: raise
+ * a needs-you event per repo+PR+head.
+ *
+ * DELIVERY IS AT-LEAST-ONCE, BY OPERATOR RULING (2026-10-20), NOT A DEFECT: never-silent wins over exactly-once.
+ * - Normal path (deduped): a `pending` receipt is reserved with an exclusive create (`wx`) before publishing and marked
+ *   `published` after, so repeated ticks and concurrent daemons emit once.
+ * - A failed publish drops the receipt so the next tick retries.
+ * - A stale `pending` (crash between reserve and publish, failed cleanup, or a crash/failed write AFTER publishing) or a
+ *   corrupt receipt is reclaimed after NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS. In the after-publish case this re-raises
+ *   the event: a rare duplicate after a crash is accepted (the feed's open-key state usually absorbs it).
+ * - Reclaiming is exclusive too: each stale receipt generation (its exact bytes) gets one `wx` reclaim token, so two
+ *   reclaimers that read the same stale receipt can never both publish. Tokens are never deleted (a deleted token would
+ *   let a slow reclaimer win again); a newer stale generation has different bytes, so a token never blocks a later retry.
+ * Never throws.
  */
 /** A `pending` needs-you reservation older than this is treated as abandoned (crash or failed cleanup) and retried. */
 export const NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS = 10 * 60_000;
+const NEEDS_YOU_FS = Object.freeze({ readFileSync, writeFileSync, unlinkSync, mkdirSync });
 export function raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now = Date.now(), log = line => console.error(line),
-  publish }) {
+  publish, fs = NEEDS_YOU_FS }) {
   try {
     if (!sha(hold?.head)) return false;
     // The real operator feed is never written from a test run unless the test injects its own publisher.
@@ -487,30 +495,38 @@ export function raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now = Date.n
       publish = item => publishAttention(item, { now });
     }
     const path = join(dir, `${hash([repo, Number(prNumber), hold.head, 'no-verdict-needs-you'])}.json`);
-    mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(dir, { recursive: true });
     const receipt = state => JSON.stringify({ state, at: new Date(now).toISOString(), repo, pr: Number(prNumber), head: hold.head });
+    let raw = null;
     let prior;
-    try { prior = JSON.parse(readFileSync(path, 'utf8')); }
+    try { raw = String(fs.readFileSync(path, 'utf8')); prior = JSON.parse(raw); }
     catch (e) { if (e.code !== 'ENOENT') prior = { state: 'corrupt' }; }
     if (prior?.state === 'published') return false;
-    // A fresh `pending` reservation belongs to a publish in flight elsewhere. A stale or corrupt one (a crash between
-    // reserve and publish, or a failed publish whose receipt could not be removed) is reclaimed: never silent forever.
+    // A fresh `pending` reservation belongs to a publish in flight elsewhere.
     if (prior?.state === 'pending' && Number.isFinite(Date.parse(prior.at)) && now - Date.parse(prior.at) < NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS) return false;
-    try { writeFileSync(path, receipt('pending'), { flag: prior ? 'w' : 'wx' }); }
-    catch (e) { if (e.code === 'EEXIST') return false; throw e; }
+    if (prior) {
+      // Stale/corrupt: exactly one reclaimer per stale generation wins its exclusive token (see the doc comment).
+      const token = `${path}.reclaim-${createHash('sha256').update(raw ?? '').digest('hex').slice(0, 16)}`;
+      try { fs.writeFileSync(token, JSON.stringify({ at: new Date(now).toISOString() }), { flag: 'wx' }); }
+      catch (e) { if (e.code === 'EEXIST') return false; throw e; }
+      fs.writeFileSync(path, receipt('pending'));
+    } else {
+      try { fs.writeFileSync(path, receipt('pending'), { flag: 'wx' }); }
+      catch (e) { if (e.code === 'EEXIST') return false; throw e; }
+    }
     try {
       publish({ repo, pr: Number(prNumber), head: hold.head, kind: 'review-no-verdict',
         reason: `review verdict never landed after ${hold.count} runs and ${hold.noVerdict?.releasesSpent ?? 0} cool-down retries; held until a push or re-arm`,
         pick: `https://github.com/${repo}/pull/${prNumber}` });
     } catch (e) {
       // Drop the reservation so the next tick retries; if that fails too, the pending receipt goes stale and is reclaimed.
-      try { unlinkSync(path); } catch { /* reclaimed after NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS */ }
+      try { fs.unlinkSync(path); } catch { /* reclaimed after NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS */ }
       log(`${repo}#${prNumber} no-verdict needs-you could not be published: ${String(e?.message ?? e).split('\n')[0]}`);
       return false;
     }
-    // If this write fails the receipt stays pending and the event may be raised again after the stale window: a rare
-    // duplicate is preferred to silence (the feed's own open-key state also dedupes it).
-    try { writeFileSync(path, receipt('published')); } catch { /* see above */ }
+    // At-least-once (operator ruling): if this write fails, or the process dies before it, the receipt stays pending and
+    // the event is raised again after the stale window — a rare accepted duplicate, never silence.
+    try { fs.writeFileSync(path, receipt('published')); } catch { /* see above */ }
     log(`${repo}#${prNumber} NEEDS-YOU review-no-verdict head ${hold.head.slice(0, 9)}: ${hold.count} runs, `
       + `${hold.noVerdict?.releasesSpent ?? 0}/${hold.noVerdict?.releases ?? 0} cool-down retries spent `
       + `(reviewNoVerdictRetry.cooldownReleases source=${hold.noVerdict?.source ?? 'standard'}); permanent hold`);
@@ -521,6 +537,9 @@ export function raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now = Date.n
   }
 }
 
+/** Reserve before sending: an ambiguous transport failure must not create duplicate comments on every tick.
+ * Known pre-send rate-limit failures can retry with bounded backoff; all other failures remain visible locally.
+ */
 export function notifyReferralHold({ repo, prNumber, hold, comments = [], pr,
   dir = join(dirname(resolveRunsDir()), 'review-referral-notices'), now = Date.now(),
   log = line => console.error(line), publishNeedsYou,

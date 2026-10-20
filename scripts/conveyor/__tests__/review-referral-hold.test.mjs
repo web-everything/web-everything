@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord, tryReadRun, writeRun } from '../../operations/run-store.mjs';
@@ -626,7 +626,7 @@ describe('same-head hold never silences a review whose verdict never landed (liv
       notifyReferralHold({ repo, prNumber: p.number, pr: p, hold: cool, dir, post: vi.fn(), log, now: at + 30 * 60_000, publishNeedsYou: publish });
       expect(publish).not.toHaveBeenCalled();
     });
-    it('needs-you is emitted exactly once per PR+head across ticks, again for a new head, and retried after a failed publish', () => {
+    it('needs-you is at-least-once (operator ruling), deduped in the normal path: once across ticks, again for a new head, retried after a failed publish', () => {
       const p = labelled(['review:pending']), retry = { cooldownReleases: 6, source: 'tool' }, dir = temp(), log = vi.fn(), post = vi.fn();
       const held = decideSameHeadHold(p, lostRuns(9), { repo, env: {}, now: at + 30 * 86400_000, retry });
       const publish = vi.fn();
@@ -664,6 +664,37 @@ describe('same-head hold never silences a review whose verdict never landed (liv
       expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 + 2 * NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS })).toBe(false);
       writeFileSync(receiptPath, '{not json');
       expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 })).toBe(true);
+      expect(publish).toHaveBeenCalledTimes(3);
+    });
+    it('at-least-once: a crash AFTER publishing (receipt left pending) re-raises once after the stale window — accepted by ruling', () => {
+      const dir = temp(), log = vi.fn(), publish = vi.fn(), t0 = at + 30 * 86400_000;
+      const held = decideSameHeadHold(labelled(['review:pending']), lostRuns(9), { repo, env: {}, now: t0, retry: { cooldownReleases: 6 } });
+      const real = { readFileSync, writeFileSync, unlinkSync: f => rmSync(f), mkdirSync: (d, o) => mkdirSync(d, o) };
+      // The 'published' write fails (process died right after publishing).
+      const crashing = { ...real, writeFileSync: (f, data, o) => { if (String(data).includes('"published"')) throw new Error('killed'); return writeFileSync(f, data, o); } };
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0, fs: crashing })).toBe(true);
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 + 60_000 })).toBe(false);
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 + NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS })).toBe(true);
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 + 2 * NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS })).toBe(false);
+      expect(publish.mock.calls.length).toBeGreaterThanOrEqual(1);
+      expect(publish).toHaveBeenCalledTimes(2);
+    });
+    it('reclaiming is exclusive: two reclaimers that read the same stale receipt cannot both publish', () => {
+      const dir = temp(), log = vi.fn(), publish = vi.fn(), t0 = at + 30 * 86400_000;
+      const held = decideSameHeadHold(labelled(['review:pending']), lostRuns(9), { repo, env: {}, now: t0, retry: { cooldownReleases: 6 } });
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 })).toBe(true);
+      const receiptPath = join(dir, readdirSync(dir)[0]);
+      const stale = JSON.stringify({ state: 'pending', at: iso(t0), repo, pr: 1, head });
+      writeFileSync(receiptPath, stale);
+      const later = t0 + NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS;
+      // Reclaimer B read the stale bytes before A won, and acts after A: it must lose on the exclusive token.
+      const staleView = { readFileSync: f => (f === receiptPath ? stale : readFileSync(f, 'utf8')), writeFileSync, unlinkSync: f => rmSync(f), mkdirSync: (d, o) => mkdirSync(d, o) };
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: later })).toBe(true);
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: later, fs: staleView })).toBe(false);
+      expect(publish).toHaveBeenCalledTimes(2);
+      // A NEWER stale generation (different bytes) is not blocked by the old token: never silent.
+      writeFileSync(receiptPath, JSON.stringify({ state: 'pending', at: iso(later), repo, pr: 1, head }));
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: later + NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS })).toBe(true);
       expect(publish).toHaveBeenCalledTimes(3);
     });
     it('never writes the real feed from a test without an injected publisher', () => {
