@@ -205,6 +205,7 @@ import { ensureFreshGithubAppEnv } from './lib/github-app-auth-env.mjs';
 // pass's TOTAL ms, no breakdown). See pass-timings.mjs's own header for the full shape/rationale.
 import { buildSkipReasons, classifySkipReason, formatSkipSummary, formatSkipReasonsLine } from './lib/drain-skip-reasons.mjs';
 import { createCardGrouping } from './lib/card-group.mjs';
+import { readQueueFacts } from './lib/merge-queue-adaptive-batching.mjs';
 import { resolveDrainThroughput, createHoldMemo, carryReady, readCarry, writeCarry, orderCarry } from './lib/drain-throughput.mjs';
 import { numberingWithdrawalOwed } from './lib/numbering-carry.mjs';
 import { queueStatePath } from './lib/drain-merge-strategy.mjs';
@@ -4680,7 +4681,9 @@ async function runCli() {
   const mergeStrategy = createDrainMergeStrategy({ requestRedTeam: DRY_RUN ? null : requestDrainRedTeam, resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), priorityReserve: () => ({ enabled: throughput.value.priorityReservesFiles !== false, source: throughput.sources?.priorityReservesFiles || 'default', maxMin: throughput.value.priorityReserveMaxMin, maxMinSource: throughput.sources?.priorityReserveMaxMin || 'standard' }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
   // xym8nt4 — post-approval card grouping: sources of a combined card PR are held; groups form/reconcile after each pass.
-  const cardGrouping = createCardGrouping({ localSlug, dryRun: DRY_RUN, prestage: (c, sha) => mergeStrategy.prestage(c, sha) });
+  const cardGrouping = createCardGrouping({ localSlug, dryRun: DRY_RUN, prestage: (c, sha) => mergeStrategy.prestage(c, sha),
+    withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }),
+    readQueue: () => readQueueFacts({ repo: localSlug, exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, timeout: 60_000 }) }) });
   // PR #5195 — the drain's ledger facts (review-exempt, carried-acceptance restamp, drain-hold release) can clear a
   // head, so they are written per candidate only once an enqueue entry point CONFIRMS its merge or enqueue: the
   // cascade below and the green-event pre-stage shortcut both call this one recorder. The pass-start `decision` is

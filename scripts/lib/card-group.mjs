@@ -51,7 +51,7 @@ import { cascadePolicy } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
 import { gitRun, hashObjectVerified } from './git-run.mjs';
 import { isCardPath, isCardOnlyDiff } from '../ci-card-only.mjs';
-import { resolveRaisedByConflict } from './card-conflict-resolve.mjs';
+import { resolveRaisedByConflict, loadCardConflictSettings } from './card-conflict-resolve.mjs';
 import { mapHashReferences } from '../backlog/id.mjs';
 import { bornAsIndexFromItems } from '../conveyor/queue-store.mjs';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
@@ -65,6 +65,18 @@ const firstLine = e => String(e?.message ?? e ?? '').split('\n')[0];
 const labelNames = labels => (Array.isArray(labels) ? labels : []).map(l => (typeof l === 'string' ? l : l?.name)).filter(Boolean);
 
 export function cardGroupStatePath(env = process.env) { return join(resolveCoordinationRoot({ env }), 'drain-card-groups.json'); }
+export const CARD_GROUP_STATE_ENV = 'WE_DRAIN_CARD_GROUP_STATE';
+/**
+ * THE one state path. Grouping (writes) and every enqueue hold (reads) both resolve it here, so an override
+ * can never split them. `WE_DRAIN_CARD_GROUP_STATE` wins; under test (VITEST / WE_UNDER_TEST) with no override
+ * it is null (no live coordination file is read or written, and grouping is off).
+ */
+export function resolveCardGroupStatePath(env = process.env) {
+  const override = String(env?.[CARD_GROUP_STATE_ENV] ?? '').trim();
+  if (override) return override;
+  if (env?.VITEST || env?.WE_UNDER_TEST) return null;
+  return cardGroupStatePath(env);
+}
 
 const STANDARD = { enabled: false, maxSize: 8, eligibility: 'card-only', reconcileSec: 120, retryMin: 30 };
 const intIn = (lo, hi) => v => Number.isInteger(v) && v >= lo && v <= hi;
@@ -145,9 +157,10 @@ export function readReferenceMap({ base, cwd, run = gitRun }) {
     const match = /^backlog\/(\d+)-[^/]+\.md:bornAs: (x[0-9a-z]{6})$/.exec(line.slice(`${base}:`.length));
     if (match) items.push({ num: match[1], bornAs: match[2] });
   }
-  if (items.some((item, i) => items.some((other, j) => i !== j && item.bornAs === other.bornAs && item.num !== other.num)))
-    return { ok: false, reason: 'ambiguous JIT reference mapping' };
-  return { ok: true, map: bornAsIndexFromItems(items) };
+  // A bornAs claimed by two numbered cards is AMBIGUOUS: it is left out of the map (compared literally) and
+  // returned, so the caller refuses any source whose change mentions it.
+  const ambiguous = new Set(items.filter((item, i) => items.some((other, j) => i !== j && item.bornAs === other.bornAs && item.num !== other.num)).map(i => i.bornAs));
+  return { ok: true, map: bornAsIndexFromItems(items.filter(i => !ambiguous.has(i.bornAs))), ambiguous };
 }
 
 const lines = r => String(r.stdout ?? '').split('\n').map(l => l.trim()).filter(Boolean);
@@ -179,7 +192,7 @@ export const cardOnlyFiles = files => Array.isArray(files) && files.length > 0 &
  * IO (object DB only): apply each source onto `base` in order. Returns { ok, commit, steps } or { ok:false, reason }.
  * Each step is one commit (parent = the previous step) so the combined branch shows which PR added what.
  */
-export function buildCombined({ base, sources, cwd, run = gitRun, env, referenceMap = new Map(), message = s => `card-group: apply #${s.num}` } = {}) {
+export function buildCombined({ base, sources, cwd, run = gitRun, env, referenceMap = new Map(), resolveEnabled = false, message = s => `card-group: apply #${s.num}` } = {}) {
   if (!SHA.test(base ?? '') || !Array.isArray(sources) || sources.length < 2) return { ok: false, reason: 'need a base and 2+ sources' };
   let cur = base;
   const steps = [];
@@ -196,6 +209,8 @@ export function buildCombined({ base, sources, cwd, run = gitRun, env, reference
         if (!paths.length) return { ok: false, reason: `#${s.num}: conflict with no named path` };
         const bad = paths.find(p => !isCardPath(p));
         if (bad) return { ok: false, reason: `#${s.num}: non-card conflict (${bad})` };
+        // cardConflicts.autoResolveRaisedBy is honoured exactly as on the rebase path: disabled → no union, no group.
+        if (resolveEnabled !== true) return { ok: false, reason: `#${s.num}: card conflict and cardConflicts.autoResolveRaisedBy disabled` };
         const index = join(tmp, `index-${s.num}`);
         const ienv = { ...(env ?? {}), GIT_INDEX_FILE: index };
         if (run('git', ['read-tree', tree], { cwd, env: ienv }).status !== 0) return { ok: false, reason: `#${s.num}: read-tree failed` };
@@ -204,7 +219,7 @@ export function buildCombined({ base, sources, cwd, run = gitRun, env, reference
           if (texts.some(r => r.status !== 0)) return { ok: false, reason: `#${s.num}: ${path} missing on one side` };
           const modes = [cur, s.headSha].map(ref => run('git', ['ls-tree', ref, '--', path], { cwd }));
           if (modes.some(r => r.status !== 0 || !String(r.stdout).startsWith('100644 blob '))) return { ok: false, reason: `#${s.num}: ${path} is not a regular file` };
-          const res = resolveRaisedByConflict({ path, merged: String(texts[0].stdout), main: String(texts[1].stdout), pr: String(texts[2].stdout), referenceMap });
+          const res = resolveRaisedByConflict({ path, merged: String(texts[0].stdout), main: String(texts[1].stdout), pr: String(texts[2].stdout), referenceMap, enabled: resolveEnabled === true });
           if (!res.ok) return { ok: false, reason: `#${s.num}: ${path}: ${res.reason}` };
           const blob = hashObjectVerified(run, res.text, { cwd, env, label: path });
           if (!blob.ok) return { ok: false, reason: `#${s.num}: ${blob.reason}` };
@@ -252,66 +267,115 @@ export function parseDiffLines(text) {
   return files;
 }
 
+/** PURE: a file's lines (a trailing newline does not make an extra empty line). */
+const splitLines = text => { const a = String(text ?? '').split('\n'); if (a.length && a.at(-1) === '') a.pop(); return a; };
+const countOf = arr => { const m = new Map(); for (const l of arr) m.set(l, (m.get(l) ?? 0) + 1); return m; };
+/** PURE: `needle` appears in `hay` in the same order (not necessarily adjacent). */
+export const isSubsequence = (needle, hay) => { let i = 0; for (const l of hay) if (i < needle.length && l === needle[i]) i++; return i === needle.length; };
+
 /**
- * IO: prove the combined commit is exactly the union of the sources. Lines are compared after the same JIT
- * reference normalisation the card resolver applies (`xabc123` → its number), per file.
- * Returns { ok, perFile:[{path, sourceAdded, combinedAdded}], missing, extra, resurrected, outside }.
+ * IO: one source's per-file change as ordered line multisets, after JIT reference normalisation.
+ * Per path: `from` (counts at the source's merge base with `onto`), `to` (counts at its head), `addedSeq`
+ * (its net-added lines in head order). A deleted file is reported as `deletedFile`.
+ */
+function sourceChange({ onto, headSha, cwd, run, norm }) {
+  const mb = String(run('git', ['merge-base', onto, headSha], { cwd }).stdout ?? '').trim();
+  if (!SHA.test(mb)) throw new Error('no merge base');
+  const names = run('git', ['diff', '--name-only', '--no-renames', mb, headSha], { cwd });
+  if (names.status !== 0) throw new Error('diff failed');
+  const d = run('git', ['diff', '-U0', '--no-renames', '--no-color', mb, headSha], { cwd });
+  if (d.status !== 0) throw new Error('diff failed');
+  const plus = parseDiffLines(d.stdout);
+  const out = new Map();
+  for (const path of lines(names)) {
+    const at = ref => { const r = run('git', ['show', `${ref}:${path}`], { cwd }); return r.status === 0 ? splitLines(r.stdout).map(norm) : null; };
+    const fromLines = at(mb) ?? [], toLines = at(headSha);
+    if (toLines === null) { out.set(path, { deletedFile: true }); continue; }
+    const from = countOf(fromLines), to = countOf(toLines);
+    const addedSeq = (plus.get(path)?.added ?? []).map(norm).filter(l => (to.get(l) ?? 0) > (from.get(l) ?? 0));
+    out.set(path, { from, to, addedSeq });
+  }
+  return out;
+}
+
+/**
+ * IO: prove the combined commit is exactly the union of the sources, on ORDERED line MULTISETS (counts, not
+ * sets) after the resolver's JIT reference normalisation. Per file and per line `l` (b = count on base,
+ * c = count on combined): when a source raises its count of `l` (to t), c must equal max(b, max t); when a
+ * source lowers it (to t), c must equal min(b, min t); when no source changes it, c must equal b (so ANY
+ * deletion or duplicate no source made — e.g. the union dedup dropping a repeated entry — refuses). A line one
+ * source raises and another lowers refuses. Each source's added lines must appear in the combined file in the
+ * source's order, and base lines that survive must keep their order. A file outside the sources, or a source
+ * that deletes a file, refuses.
  */
 export function verifyUnion({ base, combined, sources, cwd, run = gitRun, referenceMap = new Map() } = {}) {
   const norm = t => mapHashReferences(t, h => referenceMap.get(h) ?? h);
-  const diff = (a, b) => {
-    const r = run('git', ['diff', '-U0', '--no-renames', '--no-color', a, b], { cwd });
-    if (r.status !== 0) throw new Error(`git diff ${a.slice(0, 10)} ${b.slice(0, 10)} failed`);
-    return parseDiffLines(r.stdout);
-  };
-  const missing = [], extra = [], resurrected = [], outside = [];
+  const at = (ref, path) => { const r = run('git', ['show', `${ref}:${path}`], { cwd }); return r.status === 0 ? splitLines(r.stdout).map(norm) : null; };
+  const missing = [], extra = [], deleted = [], resurrected = [], disagree = [], order = [], outside = [], unsupported = [];
   const perFile = [];
-  const want = new Map(); // path -> Set of normalized added lines (union over sources)
-  const gone = new Map(); // path -> Set of normalized removed lines not re-added by that same source
-  const sourcePaths = new Set();
-  for (const s of sources) {
-    const mb = String(run('git', ['merge-base', base, s.headSha], { cwd }).stdout ?? '').trim();
-    if (!SHA.test(mb)) throw new Error(`#${s.num}: no merge base`);
-    for (const [path, { added, removed }] of diff(mb, s.headSha)) {
-      sourcePaths.add(path);
-      const a = new Set(added.map(norm));
-      if (!want.has(path)) want.set(path, new Set());
-      for (const l of a) want.get(path).add(l);
-      if (!gone.has(path)) gone.set(path, new Set());
-      for (const l of removed.map(norm)) if (!a.has(l)) gone.get(path).add(l);
+  const changes = sources.map(s => ({ s, change: sourceChange({ onto: base, headSha: s.headSha, cwd, run, norm }) }));
+  const paths = new Set(changes.flatMap(x => [...x.change.keys()]));
+  const changed = run('git', ['diff', '--name-only', '--no-renames', base, combined], { cwd });
+  if (changed.status !== 0) throw new Error('combined diff failed');
+  for (const p of lines(changed)) if (!paths.has(p)) outside.push(p);
+  for (const path of [...paths].sort()) {
+    if (changes.some(x => x.change.get(path)?.deletedFile)) { unsupported.push(`${path} deleted by a source`); continue; }
+    const B = at(base, path) ?? [], C = at(combined, path);
+    if (C === null) { missing.push({ path, line: '(whole file)' }); continue; }
+    const b = countOf(B), c = countOf(C);
+    const up = new Map(), down = new Map();
+    for (const { change } of changes) {
+      const ch = change.get(path);
+      if (!ch) continue;
+      for (const l of new Set([...ch.from.keys(), ...ch.to.keys()])) {
+        const f = ch.from.get(l) ?? 0, t = ch.to.get(l) ?? 0;
+        if (t > f) up.set(l, Math.max(up.get(l) ?? 0, t));
+        if (t < f) down.set(l, Math.min(down.get(l) ?? Infinity, t));
+      }
+      if (!isSubsequence(ch.addedSeq, C)) order.push({ path, source: changes.find(x => x.change === change).s.num });
     }
+    const keep = new Map();
+    let added = 0, wanted = 0;
+    for (const l of new Set([...b.keys(), ...c.keys(), ...up.keys(), ...down.keys()])) {
+      const bb = b.get(l) ?? 0, cc = c.get(l) ?? 0;
+      if (up.has(l) && down.has(l)) { disagree.push({ path, line: l }); continue; }
+      const exp = up.has(l) ? Math.max(bb, up.get(l)) : down.has(l) ? Math.min(bb, down.get(l)) : bb;
+      wanted += Math.max(0, exp - bb); added += Math.max(0, cc - bb);
+      keep.set(l, Math.min(bb, exp));
+      if (cc === exp) continue;
+      if (cc < exp) (up.has(l) ? missing : deleted).push({ path, line: l, expected: exp, found: cc });
+      else (down.has(l) ? resurrected : extra).push({ path, line: l, expected: exp, found: cc });
+    }
+    const survivors = [];
+    for (const l of B) { const k = keep.get(l) ?? 0; if (k > 0) { survivors.push(l); keep.set(l, k - 1); } }
+    if (!isSubsequence(survivors, C)) order.push({ path, source: 'base' });
+    perFile.push({ path, sourceAdded: wanted, combinedAdded: added });
   }
-  const combinedDiff = diff(base, combined);
-  for (const path of combinedDiff.keys()) if (!sourcePaths.has(path)) outside.push(path);
-  for (const path of sourcePaths) {
-    const show = run('git', ['show', `${combined}:${path}`], { cwd });
-    const baseShow = run('git', ['show', `${base}:${path}`], { cwd });
-    const finalLines = new Set(show.status === 0 ? String(show.stdout).split('\n').map(norm) : []);
-    const baseLines = new Set(baseShow.status === 0 ? String(baseShow.stdout).split('\n').map(norm) : []);
-    const added = new Set((combinedDiff.get(path)?.added ?? []).map(norm));
-    const w = want.get(path) ?? new Set();
-    for (const l of w) if (!finalLines.has(l)) missing.push({ path, line: l });
-    for (const l of added) if (!w.has(l) && !baseLines.has(l)) extra.push({ path, line: l });
-    for (const l of gone.get(path) ?? []) if (finalLines.has(l) && !w.has(l)) resurrected.push({ path, line: l });
-    perFile.push({ path, sourceAdded: [...w].filter(l => !baseLines.has(l)).length, combinedAdded: [...added].filter(l => !baseLines.has(l)).length });
-  }
-  return { ok: !missing.length && !extra.length && !resurrected.length && !outside.length, perFile, missing, extra, resurrected, outside };
+  const ok = [missing, extra, deleted, resurrected, disagree, order, outside, unsupported].every(a => !a.length);
+  return { ok, perFile, missing, extra, deleted, resurrected, disagree, order, outside, unsupported };
 }
 
-/** IO: every line each source adds is present on `ref` (used after the combined PR merged, against new main). */
+/**
+ * IO: `source` (at the head given) is fully on `ref` (new main, after the combined PR merged): every line it
+ * raises is on `ref` at least as often as in its head and in its order, every line it lowers is on `ref` at
+ * most as often as in its head, and no file it deletes is still there.
+ */
 export function sourceLanded({ ref, source, cwd, run = gitRun, referenceMap = new Map() }) {
   const norm = t => mapHashReferences(t, h => referenceMap.get(h) ?? h);
-  const mb = String(run('git', ['merge-base', ref, source.headSha], { cwd }).stdout ?? '').trim();
-  if (!SHA.test(mb)) return { ok: false, reason: 'no merge base' };
-  const d = run('git', ['diff', '-U0', '--no-renames', '--no-color', mb, source.headSha], { cwd });
-  if (d.status !== 0) return { ok: false, reason: 'diff failed' };
-  for (const [path, { added }] of parseDiffLines(d.stdout)) {
-    if (!added.length) continue;
+  let change;
+  try { change = sourceChange({ onto: ref, headSha: source.headSha, cwd, run, norm }); }
+  catch (e) { return { ok: false, reason: firstLine(e) }; }
+  for (const [path, ch] of change) {
     const show = run('git', ['show', `${ref}:${path}`], { cwd });
+    if (ch.deletedFile) { if (show.status === 0) return { ok: false, reason: `${path} still on main` }; continue; }
     if (show.status !== 0) return { ok: false, reason: `${path} missing on main` };
-    const have = new Set(String(show.stdout).split('\n').map(norm));
-    const lost = added.map(norm).filter(l => !have.has(l));
-    if (lost.length) return { ok: false, reason: `${lost.length} line(s) of ${path} not on main` };
+    const R = splitLines(show.stdout).map(norm), r = countOf(R);
+    for (const l of new Set([...ch.from.keys(), ...ch.to.keys()])) {
+      const f = ch.from.get(l) ?? 0, t = ch.to.get(l) ?? 0, have = r.get(l) ?? 0;
+      if (t > f && have < t) return { ok: false, reason: `a line of ${path} is not on main` };
+      if (t < f && have > t) return { ok: false, reason: `a line ${path} removes is still on main` };
+    }
+    if (!isSubsequence(ch.addedSeq, R)) return { ok: false, reason: `lines of ${path} are on main in a different order` };
   }
   return { ok: true };
 }
@@ -373,12 +437,24 @@ export function cardGroupHold(state, { num, repo, localSlug } = {}) {
  */
 export function createCardGrouping({
   localSlug, cwd = process.cwd(), exec = execFileSync, run = gitRun, env = process.env, log = process.stderr,
-  statePath = cardGroupStatePath(env), settings, dryRun = false, now = () => Date.now(), prestage = null,
+  statePath = resolveCardGroupStatePath(env), settings, dryRun = false, now = () => Date.now(), prestage = null,
   readFile = readFileSync, quiet = false,
+  // The drain's land-write mutex (`(fn) => ({ran, result})`, the one every enqueue runs inside) and a live
+  // merge-queue membership read (`() => ({inQueue:Set, error?})`). Group creation is claimed inside that mutex,
+  // after proving no source is queued, so an enqueue can never pass its hold check and then race the claim.
+  withLock = null, readQueue = null,
+  cardConflictSettings = null,
 } = {}) {
   const say = line => { if (!quiet) log.write(`  card-group: ${line}\n`); };
   let setting = settings;
   if (!setting) setting = readCardGroupSettings({ env, log: line => log.write(`  ${line}\n`) });
+  if (!statePath) setting = { ...setting, enabled: false, sources: { ...(setting.sources ?? {}), enabled: 'no state path (test run)' } };
+  const conflictSetting = () => {
+    try {
+      const r = cardConflictSettings ?? loadCardConflictSettings({ env });
+      return { enabled: r?.value?.autoResolveRaisedBy === true, source: r?.sources?.autoResolveRaisedBy ?? 'standard' };
+    } catch (e) { return { enabled: false, source: `unreadable (${firstLine(e)})` }; }
+  };
   const gh = (args, opts = {}) => String(exec('gh', args, { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'], ...opts }));
   const lockPath = `${statePath}.lock`;
   const mutate = fn => {
@@ -418,14 +494,14 @@ export function createCardGrouping({
     setting,
     /** Hold for one candidate (sync). */
     holdFor(c) {
-      if (!existsSync(statePath)) return null;
+      if (!statePath || !existsSync(statePath)) return null;
       return cardGroupHold(readGroupState(statePath, readFile), { num: c?.num, repo: c?.repo, localSlug });
     },
 
     /** Re-read active groups (throttled by reconcileSec). Never throws. */
     reconcile({ force = false } = {}) {
       try {
-        if (!existsSync(statePath)) return { checked: 0 };
+        if (!statePath || !existsSync(statePath)) return { checked: 0 };
         const st = readGroupState(statePath, readFile);
         if (st.unreadable) { say('state unreadable — sources stay held; fix or remove the file'); return { checked: 0 }; }
         if (!st.groups.length) return { checked: 0 };
@@ -447,11 +523,20 @@ export function createCardGrouping({
           try { pr = readPr(g.pr); } catch (e) { say(`${tag}: read failed (${firstLine(e)}) — sources stay held`); continue; }
           if (pr.state === 'MERGED') {
             const base = mainSha();
-            const fetched = base && ensureCommits({ shas: [base, ...g.sources.map(s => s.headSha)], cwd, run });
+            const fetched = base && ensureCommits({ shas: [base], cwd, run });
             if (!base || !fetched?.ok) { say(`${tag}: merged, but main unreadable — retried`); continue; }
             const refs = readReferenceMap({ base, cwd, run });
-            for (const s of g.sources) {
-              const landed = refs.ok ? sourceLanded({ ref: base, source: s, cwd, run, referenceMap: refs.map }) : { ok: false, reason: refs.reason };
+            let retry = false;
+            for (const recorded of g.sources) {
+              // Re-read the source NOW: only its CURRENT head's lines on main may close it.
+              let sp;
+              try { sp = readPr(recorded.num); } catch (e) { say(`${tag}: source #${recorded.num} re-read failed (${firstLine(e)}) — retried`); retry = true; break; }
+              if (sp.state !== 'OPEN') { say(`${tag}: source #${recorded.num} is ${sp.state} — nothing to close`); continue; }
+              const s = { num: recorded.num, headSha: sp.headRefOid };
+              const have = SHA.test(s.headSha ?? '') ? ensureCommits({ shas: [s.headSha], cwd, run }) : { ok: false, reason: 'no head' };
+              const landed = !have.ok ? { ok: false, reason: `current head unreadable (${have.reason})` }
+                : refs.ok ? sourceLanded({ ref: base, source: s, cwd, run, referenceMap: refs.map }) : { ok: false, reason: refs.reason };
+              if (s.headSha !== recorded.headSha) say(`${tag}: source #${s.num} head moved ${recorded.headSha.slice(0, 10)} → ${String(s.headSha).slice(0, 10)}; checking the current head`);
               if (landed.ok) {
                 try {
                   gh(['pr', 'close', String(s.num), '--repo', localSlug, '--comment',
@@ -463,6 +548,7 @@ export function createCardGrouping({
                 say(`${tag}: source #${s.num} NOT closed (${landed.reason}) — released`);
               }
             }
+            if (retry) continue;
             mutate(s => { s.groups = s.groups.filter(y => y.id !== g.id); });
             done.push(g.id);
             continue;
@@ -499,6 +585,7 @@ export function createCardGrouping({
      */
     form({ outcomes = [], verdicts = [] } = {}) {
       if (!setting.enabled) return { reason: 'disabled' };
+      if (!statePath) return { reason: 'no state path' };
       try {
         const st = existsSync(statePath) ? readGroupState(statePath, readFile) : { groups: [], failed: {} };
         if (st.unreadable) return { reason: 'state unreadable' };
@@ -549,44 +636,96 @@ export function createCardGrouping({
           if (!dryRun) mutate(s => { s.failed[sourceSetKey(plan.sources)] = now(); });
           return { reason: 'live re-check left fewer than 2 sharing a card' };
         }
-        const p = plans[0];
         const refs = readReferenceMap({ base, cwd, run });
         if (!refs.ok) return { reason: refs.reason };
-        const id = groupId(p.sources);
-        const failKey = sourceSetKey(p.sources);
-        const fail = reason => {
-          say(`group of ${p.sources.map(s => `#${s.num}`).join(',')} not formed: ${reason} — they stay serial (${formatCardGroupSetting(setting)})`);
-          if (!dryRun) mutate(s => { s.failed[failKey] = now(); for (const [k, at] of Object.entries(s.failed)) if (at < now() - 24 * 3600_000) delete s.failed[k]; });
+        const cc = conflictSetting();
+        const failAll = (sources, reason) => {
+          say(`group of ${sources.map(s => `#${s.num}`).join(',')} not formed: ${reason} — they stay serial (${formatCardGroupSetting(setting)})`);
+          if (!dryRun) mutate(s => { s.failed[sourceSetKey(sources)] = now(); for (const [k, at] of Object.entries(s.failed)) if (at < now() - 24 * 3600_000) delete s.failed[k]; });
           return { reason };
         };
-        const built = buildCombined({ base, sources: p.sources, cwd, run, env,
-          referenceMap: refs.map, message: s => `card-group ${id}: apply #${s.num} (${s.headSha.slice(0, 12)})\n\nPost-approval card grouping (drain.group, card xym8nt4).\n\n${CARD_GROUP_TRAILER}\n` });
-        if (!built.ok) return fail(built.reason);
-        let proof;
-        try { proof = verifyUnion({ base, combined: built.commit, sources: p.sources, cwd, run, referenceMap: refs.map }); }
-        catch (e) { return fail(`union check error (${firstLine(e)})`); }
-        if (!proof.ok) return fail(`union check failed (missing ${proof.missing.length}, extra ${proof.extra.length}, resurrected ${proof.resurrected.length}, outside ${proof.outside.join(',') || 0})`);
+        // Build + prove; a source the build or the proof can pin a failure on is left OUT (it stays serial) and
+        // the rest are re-planned. Anything not attributable to one source refuses the whole group.
+        let p = plans[0];
+        if (refs.ambiguous?.size) {
+          const clear = [];
+          for (const x of p.sources) {
+            const mb = String(run('git', ['merge-base', base, x.headSha], { cwd }).stdout ?? '').trim();
+            const d = SHA.test(mb) ? run('git', ['diff', '--no-color', mb, x.headSha], { cwd }) : { status: 1 };
+            const hit = d.status !== 0 ? 'diff unreadable' : [...refs.ambiguous].find(h => String(d.stdout).includes(h));
+            if (hit) say(`#${x.num} left out of the group (${d.status !== 0 ? hit : `mentions ambiguous JIT reference ${hit}`}) — it stays serial`);
+            else clear.push(x);
+          }
+          const next = planCardGroups({ candidates: clear, maxSize: setting.maxSize })[0];
+          if (!next) return { reason: 'fewer than 2 sources clear of ambiguous JIT references' };
+          p = next;
+        }
+        const original = p.sources;
+        const leftOut = [];
+        let built, proof, id;
+        for (;;) {
+          id = groupId(p.sources);
+          const msg = s => `card-group ${id}: apply #${s.num} (${s.headSha.slice(0, 12)})\n\nPost-approval card grouping (drain.group, card xym8nt4).\n\n${CARD_GROUP_TRAILER}\n`;
+          built = buildCombined({ base, sources: p.sources, cwd, run, env, resolveEnabled: cc.enabled, referenceMap: refs.map, message: msg });
+          let offenders = [];
+          let why;
+          if (!built.ok) {
+            why = `${built.reason} (cardConflicts.autoResolveRaisedBy=${cc.enabled} (${cc.source}))`;
+            const m = /^#(\d+):/.exec(built.reason);
+            if (m && !/autoResolveRaisedBy disabled/.test(built.reason)) offenders = p.sources.filter(x => x.num === Number(m[1]));
+          } else {
+            try { proof = verifyUnion({ base, combined: built.commit, sources: p.sources, cwd, run, referenceMap: refs.map }); }
+            catch (e) { return failAll(original, `union check error (${firstLine(e)})`); }
+            if (proof.ok) break;
+            why = `union check failed (missing ${proof.missing.length}, extra ${proof.extra.length}, unexpected deletions ${proof.deleted.length}, resurrected ${proof.resurrected.length}, disagree ${proof.disagree.length}, order ${proof.order.length}, outside ${proof.outside.join(',') || 0}, unsupported ${proof.unsupported.join(',') || 0})`;
+            offenders = p.sources.filter(x => !sourceLanded({ ref: built.commit, source: x, cwd, run, referenceMap: refs.map }).ok);
+            if (proof.extra.length || proof.deleted.length || proof.outside.length || proof.order.some(o => o.source === 'base')) offenders = [];
+          }
+          if (!offenders.length || offenders.length === p.sources.length) return failAll(original, why);
+          for (const o of offenders) { leftOut.push(o.num); say(`#${o.num} left out of the group (${why}) — it stays serial`); }
+          const next = planCardGroups({ candidates: p.sources.filter(x => !offenders.includes(x)), maxSize: setting.maxSize })[0];
+          if (!next) return failAll(original, `${why}; fewer than 2 left after leaving out ${offenders.map(o => `#${o.num}`).join(',')}`);
+          p = next;
+        }
         const summary = `#${p.sources.map(s => s.num).join(' #')} on ${p.files.length} card file(s) → ${built.commit.slice(0, 12)}; union check ok (${proof.perFile.map(f => `${f.path.split('/').pop().slice(0, 24)} +${f.combinedAdded}/${f.sourceAdded}`).join(', ')})`;
         if (dryRun) { say(`DRY RUN would open: ${summary}`); return { plan: p, built, proof, dryRun: true }; }
         const branch = `${CARD_GROUP_BRANCH_PREFIX}${id}`;
         const record = { id, repo: localSlug, branch, pr: null, base, commit: built.commit, createdAt: now(),
           sources: p.sources.map(s => ({ num: s.num, headSha: s.headSha })), files: p.files };
-        const claimed = mutate(s => {
-          const taken = new Set(s.groups.flatMap(g => g.sources.map(x => Number(x.num))));
-          if (record.sources.some(x => taken.has(x.num))) return false;
-          s.groups.push(record);
-          return true;
+        if (typeof withLock !== 'function' || typeof readQueue !== 'function') return { reason: 'no land mutex / queue read wired — fail closed' };
+        // Inside the land mutex every enqueue runs in: prove no source is queued and every source is still at
+        // its judged head, then record the group. From here on every enqueue (it re-reads the hold inside the
+        // same mutex) sees the group.
+        const lock = withLock(() => {
+          const q = readQueue();
+          if (!q || q.error || !(q.inQueue instanceof Set)) return { ok: false, reason: `merge queue unreadable (${q?.error ?? 'no result'})` };
+          for (const x of record.sources) {
+            if (q.inQueue.has(x.num)) return { ok: false, reason: `#${x.num} is already in the merge queue` };
+            let pr;
+            try { pr = readPr(x.num); } catch (e) { return { ok: false, reason: `#${x.num} re-read failed (${firstLine(e)})` }; }
+            const bad = liveEligible(pr, x.headSha);
+            if (bad) return { ok: false, reason: `#${x.num} ${bad}` };
+          }
+          const claimed = mutate(s => {
+            const taken = new Set(s.groups.flatMap(g => g.sources.map(y => Number(y.num))));
+            if (record.sources.some(y => taken.has(y.num))) return false;
+            s.groups.push(record);
+            return true;
+          });
+          if (!claimed?.ok || claimed.result !== true) return { ok: false, reason: 'a source joined another group meanwhile' };
+          return { ok: true };
         });
-        if (!claimed?.ok || claimed.result !== true) return { reason: 'a source joined another group meanwhile' };
+        if (lock?.ran === false) return { reason: 'land mutex held — retried next pass' };
+        if (!lock?.result?.ok) return { reason: `claim refused: ${lock?.result?.reason ?? 'unknown'}` };
         const remote = run('git', ['ls-remote', 'origin', `refs/heads/${branch}`], { cwd });
         const existing = String(remote.stdout ?? '').split(/\s/)[0];
         if (remote.status !== 0 || (existing && existing !== built.commit)) {
           mutate(s => { s.groups = s.groups.filter(g => g.id !== id); });
-          return fail(existing ? `branch ${branch} already exists at another commit` : 'ls-remote failed');
+          return failAll(p.sources, existing ? `branch ${branch} already exists at another commit` : 'ls-remote failed');
         }
         if (!existing) {
           const push = run('git', ['push', 'origin', `${built.commit}:refs/heads/${branch}`], { cwd, env });
-          if (push.status !== 0) { mutate(s => { s.groups = s.groups.filter(g => g.id !== id); }); return fail(`push failed (${String(push.stderr ?? '').split('\n')[0]})`); }
+          if (push.status !== 0) { mutate(s => { s.groups = s.groups.filter(g => g.id !== id); }); return failAll(p.sources, `push failed (${String(push.stderr ?? '').split('\n')[0]})`); }
         }
         const title = `card group: ${p.sources.length} approved card PRs on ${p.files.map(f => f.split('/').pop().split('-')[0]).join(', ')}`;
         let num = null;

@@ -6,7 +6,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   planCardGroups, overlapReasonIsCardOnly, buildCombined, verifyUnion, sourceLanded, cardGroupHold, readCardGroupSettings,
-  readGroupState, groupId, cardOnlyFiles, createCardGrouping, combinedPrBody, CARD_GROUP_MARKER,
+  readGroupState, groupId, cardOnlyFiles, readReferenceMap, createCardGrouping, combinedPrBody, CARD_GROUP_MARKER,
+  resolveCardGroupStatePath, cardGroupStatePath, isSubsequence,
 } from '../card-group.mjs';
 
 const dirs = [];
@@ -73,14 +74,14 @@ describe('buildCombined + verifyUnion (real git)', () => {
     const b = branch('b', () => writeFileSync(join(cwd, CARD), card([1, 2, 11])));
     const c = branch('c', () => { writeFileSync(join(cwd, CARD), card([1, 2, 12])); writeFileSync(join(cwd, 'backlog/5473-other.md'), card([7, 13])); });
     const sources = [{ num: 10, headSha: a }, { num: 11, headSha: b }, { num: 12, headSha: c }];
-    const built = buildCombined({ base, sources, cwd });
+    const built = buildCombined({ base, sources, cwd, resolveEnabled: true });
     expect(built.ok).toBe(true);
     expect(built.steps.map(s => s.resolved.length)).toEqual([0, 1, 1]);
     const text = git(cwd, 'show', `${built.commit}:${CARD}`);
     for (const n of [1, 2, 10, 11, 12]) expect(text).toContain(entry(n));
     expect(text).not.toMatch(/<<<<<<<|>>>>>>>/);
     const proof = verifyUnion({ base, combined: built.commit, sources, cwd });
-    expect(proof).toMatchObject({ ok: true, missing: [], extra: [], resurrected: [], outside: [] });
+    expect(proof).toMatchObject({ ok: true, missing: [], extra: [], deleted: [], resurrected: [], disagree: [], order: [], outside: [] });
     for (const s of sources) expect(sourceLanded({ ref: built.commit, source: s, cwd }).ok).toBe(true);
   });
 
@@ -88,7 +89,7 @@ describe('buildCombined + verifyUnion (real git)', () => {
     const { cwd, base, branch } = repo();
     const a = branch('a', () => writeFileSync(join(cwd, CARD), card([1, 2], 'active')));
     const b = branch('b', () => writeFileSync(join(cwd, CARD), card([1, 2], 'resolved')));
-    const built = buildCombined({ base, sources: [{ num: 1, headSha: a }, { num: 2, headSha: b }], cwd });
+    const built = buildCombined({ base, sources: [{ num: 1, headSha: a }, { num: 2, headSha: b }], cwd, resolveEnabled: true });
     expect(built.ok).toBe(false);
     expect(built.reason).toMatch(/#2: backlog\/5360-prevention-card\.md: conflict outside Also raised by list/);
   });
@@ -97,9 +98,46 @@ describe('buildCombined + verifyUnion (real git)', () => {
     const { cwd, base, branch } = repo();
     const a = branch('a', () => writeFileSync(join(cwd, 'README.md'), 'one\n'));
     const b = branch('b', () => writeFileSync(join(cwd, 'README.md'), 'two\n'));
-    const built = buildCombined({ base, sources: [{ num: 1, headSha: a }, { num: 2, headSha: b }], cwd });
+    const built = buildCombined({ base, sources: [{ num: 1, headSha: a }, { num: 2, headSha: b }], cwd, resolveEnabled: true });
     expect(built).toMatchObject({ ok: false });
     expect(built.reason).toMatch(/non-card conflict \(README\.md\)/);
+  });
+
+  it('honours cardConflicts.autoResolveRaisedBy: disabled → a card conflict refuses the group', () => {
+    const { cwd, base, branch } = repo();
+    const a = branch('a', () => writeFileSync(join(cwd, CARD), card([1, 2, 10])));
+    const b = branch('b', () => writeFileSync(join(cwd, CARD), card([1, 2, 11])));
+    const built = buildCombined({ base, sources: [{ num: 10, headSha: a }, { num: 11, headSha: b }], cwd, resolveEnabled: false });
+    expect(built.ok).toBe(false);
+    expect(built.reason).toMatch(/autoResolveRaisedBy disabled/);
+    // Default is fail closed too.
+    expect(buildCombined({ base, sources: [{ num: 10, headSha: a }, { num: 11, headSha: b }], cwd }).ok).toBe(false);
+  });
+
+  it('refuses when the union dedup drops a duplicate entry no source deleted (multiset, not set)', () => {
+    const { cwd, branch } = repo();
+    const base2 = branch('dup', () => writeFileSync(join(cwd, CARD), card([1, 1, 2])));
+    git(cwd, 'checkout', '-q', 'dup');
+    const mk = (name, n) => { git(cwd, 'checkout', '-q', '-b', name, base2); writeFileSync(join(cwd, CARD), card([1, 1, 2, n])); git(cwd, 'add', '-A'); git(cwd, 'commit', '-qm', name); const sha = git(cwd, 'rev-parse', 'HEAD'); git(cwd, 'checkout', '-q', 'main'); return sha; };
+    const a = mk('a2', 10), b = mk('b2', 11);
+    const sources = [{ num: 10, headSha: a }, { num: 11, headSha: b }];
+    const built = buildCombined({ base: base2, sources, cwd, resolveEnabled: true });
+    expect(built.ok).toBe(true);
+    const proof = verifyUnion({ base: base2, combined: built.commit, sources, cwd });
+    expect(proof.ok).toBe(false);
+    expect(proof.deleted.map(d => d.line)).toContain(entry(1));
+  });
+
+  it('checks order: a source line moved out of order refuses; isSubsequence is ordered', () => {
+    expect(isSubsequence(['a', 'b'], ['a', 'x', 'b'])).toBe(true);
+    expect(isSubsequence(['b', 'a'], ['a', 'x', 'b'])).toBe(false);
+    const { cwd, base, branch } = repo();
+    const a = branch('a', () => writeFileSync(join(cwd, CARD), card([1, 2, 10, 11])));
+    const swapped = branch('sw', () => writeFileSync(join(cwd, CARD), card([1, 2, 11, 10])));
+    const proof = verifyUnion({ base, combined: swapped, sources: [{ num: 1, headSha: a }], cwd });
+    expect(proof.ok).toBe(false);
+    expect(proof.order.length).toBeGreaterThan(0);
+    expect(sourceLanded({ ref: swapped, source: { num: 1, headSha: a }, cwd }).ok).toBe(false);
   });
 
   it('verifyUnion catches a lost line, an extra line and a resurrected deletion', () => {
@@ -112,6 +150,21 @@ describe('buildCombined + verifyUnion (real git)', () => {
     expect(proof.extra.map(m => m.line)).toContain(entry(99));
     expect(proof.resurrected.map(m => m.line)).toContain(entry(2));
     expect(sourceLanded({ ref: bad, source: { num: 1, headSha: a }, cwd }).ok).toBe(false);
+  });
+});
+
+describe('readReferenceMap', () => {
+  it('leaves an ambiguous bornAs out of the map and reports it', () => {
+    const { cwd } = repo();
+    writeFileSync(join(cwd, 'backlog/7001-a.md'), '---\nbornAs: xaaaaaa\n---\n');
+    writeFileSync(join(cwd, 'backlog/7002-b.md'), '---\nbornAs: xaaaaaa\n---\n');
+    writeFileSync(join(cwd, 'backlog/7003-c.md'), '---\nbornAs: xbbbbbb\n---\n');
+    git(cwd, 'add', '-A'); git(cwd, 'commit', '-qm', 'refs');
+    const r = readReferenceMap({ base: git(cwd, 'rev-parse', 'HEAD'), cwd });
+    expect(r.ok).toBe(true);
+    expect([...r.ambiguous]).toEqual(['xaaaaaa']);
+    expect(r.map.has('xaaaaaa')).toBe(false);
+    expect(r.map.get('xbbbbbb')).toBe('7003');
   });
 });
 
@@ -134,6 +187,20 @@ describe('cardGroupHold / state', () => {
     expect(groupId(s)).toBe(groupId([...s].reverse()));
     const body = combinedPrBody({ id: 'x', sources: s, files: ['backlog/1-a.md'], base: 'c'.repeat(40) });
     expect(body).toContain('#2'); expect(body).toContain('#1'); expect(body).toContain(CARD_GROUP_MARKER);
+  });
+});
+
+describe('resolveCardGroupStatePath (one resolver for grouping and enqueue)', () => {
+  it('override wins everywhere; test runs without an override get no live path; production gets the coordination file', () => {
+    expect(resolveCardGroupStatePath({ WE_DRAIN_CARD_GROUP_STATE: '/x/s.json', VITEST: '1' })).toBe('/x/s.json');
+    expect(resolveCardGroupStatePath({ VITEST: '1' })).toBeNull();
+    const prod = { HOME: '/h' };
+    expect(resolveCardGroupStatePath(prod)).toBe(cardGroupStatePath(prod));
+  });
+  it('grouping with no state path is off', () => {
+    const g = createCardGrouping({ localSlug: 'o/r', env: { VITEST: '1' }, settings: { enabled: true, maxSize: 8, eligibility: 'card-only', reconcileSec: 120, retryMin: 30, sources: {} }, log: { write() {} } });
+    expect(g.form({ outcomes: [] }).reason).toBe('disabled');
+    expect(g.holdFor({ num: 1 })).toBeNull();
   });
 });
 
@@ -183,5 +250,86 @@ describe('createCardGrouping.form (fail closed)', () => {
     expect(r.proof.ok).toBe(true);
     expect(existsSync(join(d, 's2.json'))).toBe(false);
     expect(JSON.parse(readFileSync(join(d, 's.json'), 'utf8')).groups).toEqual([]);
+  });
+});
+
+describe('createCardGrouping — claim under the land mutex, close on current heads', () => {
+  const settings = { enabled: true, maxSize: 8, eligibility: 'card-only', reconcileSec: 120, retryMin: 30, sources: {} };
+  const accepted = [{ name: 'ready-to-merge' }, { name: 'review:accepted' }];
+  const runIn = (cwd, mainSha) => (cmd, args, o = {}) => {
+    if (args[0] === 'ls-remote') return { status: 0, stdout: args.at(-1) === 'refs/heads/main' ? `${mainSha()}\trefs/heads/main\n` : '', stderr: '' };
+    if (args[0] === 'push') return { status: 0, stdout: '', stderr: '' };
+    try { return { status: 0, stdout: execFileSync(cmd, args, { cwd, encoding: 'utf8', env: { ...process.env, ...(o.env ?? {}) }, input: o.input }), stderr: '' }; }
+    catch (e) { return { status: e.status ?? 1, stdout: String(e.stdout ?? ''), stderr: String(e.stderr ?? '') }; }
+  };
+  function setup() {
+    const { cwd, base, branch } = repo();
+    const a = branch('a', () => writeFileSync(join(cwd, CARD), card([1, 2, 10])));
+    const b = branch('b', () => writeFileSync(join(cwd, CARD), card([1, 2, 11])));
+    const heads = { 1: a, 2: b };
+    const calls = [];
+    const exec = (cmd, args) => {
+      calls.push(args.join(' '));
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ state: 'OPEN', isDraft: false, headRefOid: heads[args[2]], headRefName: 'lane/x', baseRefName: 'main', labels: accepted });
+      if (args[0] === 'pr' && args[1] === 'create') return 'https://github.com/o/r/pull/77\n';
+      if (args[0] === 'pr' && ['comment', 'close'].includes(args[1])) return '';
+      throw new Error(`unexpected ${args.join(' ')}`);
+    };
+    const verdicts = [1, 2].map(n => ({ num: n, repo: null, listedHeadSha: heads[n], prLabels: accepted }));
+    const outcomes = [1, 2].map(n => ({ num: n, kind: 'queue-file-overlap', reason: `#9 share ${CARD}` }));
+    return { cwd, base, a, b, heads, calls, exec, verdicts, outcomes };
+  }
+  const cc = { value: { autoResolveRaisedBy: true }, sources: { autoResolveRaisedBy: 'standard' } };
+
+  it('refuses without the land mutex, and when a source is already queued at claim time', () => {
+    const t = setup();
+    const d = tmp();
+    const base = () => t.base;
+    const opts = { localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, base), exec: t.exec, settings, log: { write() {} }, prestage: () => ({ allowed: true }), cardConflictSettings: cc };
+    expect(createCardGrouping({ ...opts, statePath: join(d, 'a.json') }).form({ outcomes: t.outcomes, verdicts: t.verdicts }).reason).toMatch(/no land mutex/);
+    let locked = false;
+    const withLock = fn => { locked = true; try { return { ran: true, result: fn() }; } finally { locked = false; } };
+    const queued = createCardGrouping({ ...opts, statePath: join(d, 'b.json'), withLock, readQueue: () => { expect(locked).toBe(true); return { inQueue: new Set([2]) }; } });
+    expect(queued.form({ outcomes: t.outcomes, verdicts: t.verdicts }).reason).toMatch(/#2 is already in the merge queue/);
+    expect(readGroupState(join(d, 'b.json')).groups ?? []).toEqual([]);
+    const busy = createCardGrouping({ ...opts, statePath: join(d, 'c.json'), withLock: () => ({ ran: false }), readQueue: () => ({ inQueue: new Set() }) });
+    expect(busy.form({ outcomes: t.outcomes, verdicts: t.verdicts }).reason).toMatch(/land mutex held/);
+    // A clean claim records the group inside the lock and opens the PR.
+    const ok = createCardGrouping({ ...opts, statePath: join(d, 'e.json'), withLock, readQueue: () => ({ inQueue: new Set() }) });
+    const r = ok.form({ outcomes: t.outcomes, verdicts: t.verdicts });
+    expect(r.formed).toMatchObject({ pr: 77 });
+    expect(ok.holdFor({ num: 1 })).toMatchObject({ kind: 'card-grouped' });
+    expect(t.calls.some(c => c.startsWith('pr create') && c.includes('review:pending'))).toBe(true);
+  });
+
+  it('after the combined PR merged: closes a source only when its CURRENT head is on main, else releases it', () => {
+    const t = setup();
+    const d = tmp();
+    const statePath = join(d, 's.json');
+    // Main after the merge carries entries 10 and 11 (both sources at their recorded heads).
+    git(t.cwd, 'checkout', '-q', '-b', 'merged', t.base);
+    writeFileSync(join(t.cwd, CARD), card([1, 2, 10, 11])); git(t.cwd, 'add', '-A'); git(t.cwd, 'commit', '-qm', 'merged');
+    const mainAfter = git(t.cwd, 'rev-parse', 'HEAD');
+    // Source 2 was pushed to since grouping: its current head adds 12, which is NOT on main.
+    git(t.cwd, 'checkout', '-q', '-b', 'b-new', t.b);
+    writeFileSync(join(t.cwd, CARD), card([1, 2, 11, 12])); git(t.cwd, 'add', '-A'); git(t.cwd, 'commit', '-qm', 'b-new');
+    const bNew = git(t.cwd, 'rev-parse', 'HEAD');
+    git(t.cwd, 'checkout', '-q', 'main');
+    writeFileSync(statePath, JSON.stringify({ groups: [{ id: 'g', repo: 'o/r', pr: 77, branch: 'lane/card-group-g', sources: [{ num: 1, headSha: t.a }, { num: 2, headSha: t.b }] }], failed: {} }));
+    const heads = { 1: t.a, 2: bNew };
+    const calls = [];
+    const exec = (cmd, args) => {
+      calls.push(args.join(' '));
+      if (args[0] === 'pr' && args[1] === 'view') return args[2] === '77' ? JSON.stringify({ state: 'MERGED', labels: [] })
+        : JSON.stringify({ state: 'OPEN', isDraft: false, headRefOid: heads[args[2]], headRefName: 'lane/x', baseRefName: 'main', labels: accepted });
+      if (args[0] === 'pr' && ['comment', 'close'].includes(args[1])) return '';
+      throw new Error(`unexpected ${args.join(' ')}`);
+    };
+    const g = createCardGrouping({ localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, () => mainAfter), exec, statePath, settings, log: { write() {} } });
+    const r = g.reconcile({ force: true });
+    expect(r.done).toEqual(['g']);
+    expect(calls.filter(c => c.startsWith('pr close'))).toEqual([expect.stringMatching(/^pr close 1 /)]);
+    expect(calls.some(c => c.startsWith('pr comment 2 '))).toBe(true);
+    expect(readGroupState(statePath).groups).toEqual([]);
   });
 });

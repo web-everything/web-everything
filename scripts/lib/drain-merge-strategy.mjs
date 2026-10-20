@@ -59,7 +59,7 @@ import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { createAdaptiveBatching, readQueueFacts } from './merge-queue-adaptive-batching.mjs';
 import { activeReserveBlockers, isPriorityLabels, readReserves, writeReserves } from './priority-reserve.mjs';
 import { cancelObsoleteQueueRuns } from './merge-queue-obsolete-runs.mjs';
-import { cardGroupHold as pureCardGroupHold, readGroupState, cardGroupStatePath } from './card-group.mjs';
+import { cardGroupHold as pureCardGroupHold, readGroupState, resolveCardGroupStatePath } from './card-group.mjs';
 import { existsSync } from 'node:fs';
 
 /** Pure request recovery for historical rows that left no usable exact-head result. Never grants admission. */
@@ -270,9 +270,9 @@ export function createDrainMergeStrategy({
   cwd = process.cwd(), // a clone of the local repo: enqueuePr reads the judged commit's change list from it
   cardOverlapCleanMerge, readQueueTip = defaultReadQueueTip, cardMergeRun,
   // xym8nt4 — a source PR of a post-approval card group never enqueues on its own (the combined PR carries it).
-  // Under test the live coordination file is never read unless WE_DRAIN_CARD_GROUP_STATE names one.
+  // The SAME path resolver grouping writes through (`resolveCardGroupStatePath`), so an override never splits them.
   cardGroupHold = (c) => {
-    const path = env.WE_DRAIN_CARD_GROUP_STATE || (env.VITEST || env.WE_UNDER_TEST ? null : cardGroupStatePath(env));
+    const path = resolveCardGroupStatePath(env);
     if (!path || !existsSync(path)) return null;
     return pureCardGroupHold(readGroupState(path), { num: c?.num, repo: c?.repo || localSlug, localSlug });
   },
