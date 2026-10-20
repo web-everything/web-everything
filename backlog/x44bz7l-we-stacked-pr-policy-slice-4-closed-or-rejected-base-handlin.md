@@ -23,6 +23,7 @@ When a stacked child's base PR is closed or rejected, rebase a low-risk child on
   - `base rejected is handled the same as closed`.
   - `the auto-rebase behaviour follows the setting; turning it off sends every child to the operator`.
   - `an unreadable base state fails closed to the operator`.
+  - `an incomplete diff read fails closed to the operator, never to an automatic rebase`.
 
 ## Non-goals
 

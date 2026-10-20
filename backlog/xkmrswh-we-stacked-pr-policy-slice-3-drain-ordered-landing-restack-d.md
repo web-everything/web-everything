@@ -22,6 +22,12 @@ Make the drain land a policy-stacked child only after its base, restack the chil
   - `re-review: after a restack only the child delta is re-reviewed, never the base's lines`.
   - `hold marker: re-pointed to the new base head only when the delta fingerprint is unchanged and the base's new commits touch no file of the child delta`.
   - `hold marker: left unmoved and the delta re-reviewed when the base's new commits touch a child file`.
+  - `hold marker: left unmoved and the delta re-reviewed when the delta fingerprint changed, even though the base's new commits touch no child file`.
+  - `truncated read: a truncated diff leaves the hold marker unmoved and re-reviews the delta`.
+  - `truncated read: a truncated file list leaves the hold marker unmoved and re-reviews the delta`.
+  - `fail closed: an unknown base head holds the child`.
+  - `fail closed: a failed restack holds the child`.
+  - `fail closed: a missing gate holds the child`.
   - `review:accepted is applied only at collapse through the net-diff carry (gate not weakened)`.
   - `onBaseHeadMove setting set to a different value changes the behaviour (not a constant)`.
 
