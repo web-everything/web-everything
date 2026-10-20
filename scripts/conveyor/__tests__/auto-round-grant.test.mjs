@@ -407,6 +407,13 @@ describe('never silently stuck after a grant (live #5690)', () => {
     expect(stuckAfterGrant({ repo: 'we', pr: p }, { scopeOf: credit, now: () => T + STUCK_AFTER_GRANT_MS + 60_000 })).toMatch(/did not free a round/);
     expect(stuckAfterGrant({ repo: 'we', pr: p }, { scopeOf: () => null, now: () => T + STUCK_AFTER_GRANT_MS + 60_000 })).toMatch(/not credited/);
   });
+  it('an ordinary commenter mentioning the head cannot postpone an uncredited grant\'s alert', () => {
+    const late = T + STUCK_AFTER_GRANT_MS + 60_000;
+    const mention = { id: 'IC_m', author: { login: 'mallory' }, createdAt: new Date(late - 1000).toISOString(), body: `see @${HEAD}: please wait` };
+    const forged = { ...autoGrant(), author: { login: 'mallory' }, createdAt: new Date(late - 1000).toISOString() };
+    const p = pr(['status:at-round-limit'], [autoGrant(), mention, forged]);
+    expect(stuckAfterGrant({ repo: 'we', pr: p }, { scopeOf: () => null, now: () => late })).toMatch(/not credited/);
+  });
   it('is quiet before the grace, off the round limit, or for another head', () => {
     expect(stuckAfterGrant({ repo: 'we', pr: pr(['status:at-round-limit'], [autoGrant()]) }, { scopeOf: credit, now: () => T + 60_000 })).toBeNull();
     expect(stuckAfterGrant({ repo: 'we', pr: pr(['status:awaiting-review'], [autoGrant()]) }, { scopeOf: credit, now: () => T + 3_600_000 })).toBeNull();
