@@ -308,6 +308,33 @@ export async function prepareRebuild({
     }
     return terminal({ moved: false, reason: plan.reason, ...(plan.detail ? { detail: plan.detail } : {}) });
   }
+  // x9diisp (live 2026-10-20T11:51Z) — main graduated hotfixes the running build carries as overlays, so those overlays
+  // (and every stacked overlay above them) now conflict with main. Building without them would smoke-pass and be
+  // adopted, silently dropping live hotfixes. Instead HOLD on the last-good build (dispatch continues from it via
+  // x5wbsbc; `daemon-held-on-last-good` raises needs-you after 15 min) and leave the overlay list untouched, until the
+  // lost overlays are rebased onto main (or retired). Nothing is applied from this plan.
+  if (!mainOnly && plan.establishedLost?.length > 0) {
+    const lost = plan.establishedLost;
+    const detail = {
+      refs: lost.map((l) => l.ref), lost,
+      message: `${lost.length} overlay(s) in the running build would be lost (${lost.map((l) => l.ref).join(', ')}) — holding on the last-good build; rebase them onto main (or merge main into the stack top) and re-register`,
+    };
+    alert('established-overlay-hold', detail);
+    if (state.adopted?.head && state.adopted.head === prevHead) {
+      state.held = {
+        since: state.held?.since ?? nowIso(),
+        reason: 'established-overlay-conflict',
+        failed: `${lost.map((l) => l.ref).join(', ')}: conflict with main`,
+        details: [],
+        lastGood: prevHead,
+        target: null,
+        mainSha: plan.mainSha ?? null,
+        updatedAt: nowIso(),
+      };
+      writeState();
+    }
+    return terminal({ moved: false, reason: 'established-overlay-conflict', detail });
+  }
   for (const d of plan.decisions) {
     if (d.pr != null && (d.action === 'apply' || d.action === 'remove')) clearOverlayConflictWake(env, d.pr);
     if (d.action === 'remove') {
