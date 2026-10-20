@@ -319,12 +319,25 @@ describe('applyRedTeamGate', () => {
       expect(calls.filter(([kind]) => kind === 'sendBack')).toHaveLength(1);
     });
 
-    it('the gate anchors each grant with the gated head and its review time', async () => {
+    // The anchor counts the gated head for a grant only when the thread shows the head reviewed BEFORE that grant: the
+    // first trusted red-team result on it, or a trusted `reviewed-sha` marker naming it. Thread order, never clocks.
+    const reviewedSha = (author = 'web-everything') => ({ author: { login: author }, createdAt: '2026-10-09T00:00:00Z',
+      body: `🔍 review — accepted\n\n${buildReviewedShaMarker(HEAD)}` });
+    const skewed = { ...grant(), createdAt: '2026-01-01T00:00:00Z', body: grant(1, '2026-01-01T00:00:00Z').body };
+    it.each([
+      ['a grant before any review of the head', () => [grant(), comment([F()])], null],
+      ['a grant after the head\'s red-team result', () => [comment([F()]), grant()], HEAD],
+      ['a grant after the first result, though a newer result follows it', () => [comment([F()]), grant(), comment([F()])], HEAD],
+      ['a grant between the published review and the red-team result', () => [reviewedSha(), grant(), comment([F()])], HEAD],
+      ['a grant whose own clock reads earlier than the result', () => [comment([F()]), skewed], HEAD],
+      ['a grant after an untrusted reviewed-sha marker only', () => [reviewedSha('mallory'), grant(), comment([F()])], null],
+      ['a grant after a reviewed-sha marker for another head', () => [{ ...reviewedSha(), body: buildReviewedShaMarker(OTHER) }, grant(), comment([F()])], null],
+    ])('the anchor for %s counts head %s', async (_, thread, expected) => {
       const seen = [];
-      const comments = [grant(1, '2026-10-01T00:00:00Z'), comment([F()])];
-      const { io } = fakeIo({ comments, round: 3, readRoundAsOf: (a) => { seen.push(a); return 1; } });
+      const { io } = fakeIo({ comments: thread(), round: 3, readRoundAsOf: (a) => { seen.push(a); return 1; } });
       expect(await applyRedTeamGate({ repo: REPO, pr: 4722, dryRun: true }, io)).toMatchObject({ status: 'dry-run' });
-      expect(seen).toEqual([expect.objectContaining({ at: '2026-10-01T00:00:00Z', head: HEAD, headReviewedAt: '2026-10-10T02:04:41Z' })]);
+      expect(seen).toHaveLength(1);
+      expect(seen[0].head ?? null).toBe(expected);
     });
 
     it('a round-cap record with no later grant stays already-acted (unchanged)', async () => {

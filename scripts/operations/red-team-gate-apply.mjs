@@ -133,7 +133,7 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
     const head = String(view?.headRefOid ?? '').toLowerCase();
     // The live head's latest result, and only the records that decide THAT result (an earlier same-head result's
     // records never dedup a newer one, PR #5482).
-    const { result: parsed, resultId, resultAt, outcomes: recorded, sendBackOutcome, reopened } = liveResultGateState(view?.comments, pr, head, repo);
+    const { result: parsed, resultId, headReviewIndex, outcomes: recorded, sendBackOutcome, reopened } = liveResultGateState(view?.comments, pr, head, repo);
     if (!parsed) return { status: 'no-red-team-on-head', head };
     const setting = io.readSetting();
     const plan = planRedTeamActions(parsed, setting.value);
@@ -148,10 +148,11 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
     if (!sendPending && !cardPending) return { status: 'already-acted', head, outcome: priorSend ?? GATE_OUTCOMES.CARD_QUEUED, plan };
     const round = sendPending ? io.readRound({ repo, pr, head }) : null;
     // The operator's audited grants raise the cap with the same grant-time anchor fix dispatch uses. The anchor counts
-    // this head like `readRound` does, once its review (the red-team result) was visible at the grant.
+    // this head like `readRound` does when the thread shows its review before the grant (thread order, not clocks).
     const grants = sendPending ? gateRoundGrants(view?.comments, pr, repo) : [];
-    const effectiveCap = gateRoundCap({ cap, grants, roundAt: (at) => {
-      try { return io.readRoundAsOf?.({ repo, pr, at, head, headReviewedAt: resultAt }) ?? null; } catch { return null; }
+    const effectiveCap = gateRoundCap({ cap, grants, roundAt: (at, g) => {
+      const reviewed = Number.isInteger(headReviewIndex) && Number.isInteger(g?.index) && headReviewIndex < g.index;
+      try { return io.readRoundAsOf?.({ repo, pr, at, head: reviewed ? head : null }) ?? null; } catch { return null; }
     } });
     // The round is the only bound on send-backs, so an unreadable one is the cap (the operator rules), never "round 1".
     const capped = sendPending && (!Number.isInteger(round) || round >= effectiveCap);
@@ -240,7 +241,7 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
     }),
     readSetting: () => readConfirmedBreaks({ env }),
     readRound: ({ repo, pr, head }) => readReviewRound({ repo, pr, head }),
-    readRoundAsOf: ({ repo, pr, at, head, headReviewedAt }) => readReviewRoundAsOf({ repo, pr, at, head, headReviewedAt }),
+    readRoundAsOf: ({ repo, pr, at, head }) => readReviewRoundAsOf({ repo, pr, at, head }),
     // The live head, read fresh and alone (the PR view above can be minutes old by the time a slow step finishes).
     readHead: ({ repo, pr }) => String(JSON.parse(gh(['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'])).headRefOid ?? ''),
     sendBack: ({ repo, pr, body }) => {

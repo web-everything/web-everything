@@ -28,7 +28,7 @@ import { resolveCascade, platformPreference, formatCascadeSourcesLine } from './
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 
 import { parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
-import { parseLatestHumanClearedSha } from './review-escalation.mjs';
+import { parseLatestHumanClearedSha, REVIEWED_SHA_MARKER } from './review-escalation.mjs';
 import { roundExtensionGrants } from '../conveyor/round-extension-mark.mjs';
 
 // ── The comment the producer writes ─────────────────────────────────────────────────────────────────────────────
@@ -315,12 +315,12 @@ function resolveSendBackStep(gates, grants) {
  * means `by` more rounds from the round the PR was on when it was granted, so `--by=1` on a PR already past the cap
  * still buys exactly one more round. The additive floor (`cap` + every grant) never lowers the cap. A grant whose
  * round cannot be read (`roundAt` returns null) counts only additively. PURE.
- * @param {{cap:number, grants:Array<{by:number, at:string}>, roundAt?:(at:string)=>number|null}} o
+ * @param {{cap:number, grants:Array<{by:number, at:string, index?:number}>, roundAt?:(at:string, grant:object)=>number|null}} o
  */
 export function gateRoundCap({ cap, grants = [], roundAt = () => null }) {
   const total = grants.reduce((sum, g) => sum + g.by, 0);
   return Math.max(cap + total, ...grants.map(g => {
-    const r = roundAt(g.at);
+    const r = roundAt(g.at, g);
     return Number.isInteger(r) && r > 0 ? r + g.by : 0;
   }));
 }
@@ -428,12 +428,25 @@ export function liveResultGateState(comments, pr, head, repo = null) {
   const live = String(head ?? '').toLowerCase();
   const records = indexedRecords(comments);
   const hit = latestResult(records, pr, live);
-  if (!hit) return { result: null, resultId: null, resultAt: null, outcomes: new Set(), sendBackOutcome: null, reopened: false };
+  if (!hit) return { result: null, resultId: null, headReviewIndex: null, outcomes: new Set(), sendBackOutcome: null, reopened: false };
   const gates = gateRecordsFor(records, pr, live, hit);
   const { outcome, reopened } = sendBackStepState(gates, gateRoundGrants(comments, pr, repo));
-  // `resultAt`: the result comment's own time, never an inherited one (the round anchor counts the head only by then).
-  return { result: hit.parsed, resultId: redTeamResultId(hit.parsed), resultAt: hit.c?.createdAt ?? null,
+  return { result: hit.parsed, resultId: redTeamResultId(hit.parsed), headReviewIndex: firstReviewIndex(records, pr, live),
     outcomes: new Set(gates.map(r => r.gate.outcome)), sendBackOutcome: outcome, reopened };
+}
+
+/**
+ * The thread position of the FIRST trusted sign that this head was reviewed: a red-team result on it, or a
+ * `reviewed-sha` marker naming it in full. A grant after it was made on this head's round, so its anchor counts the
+ * head (in thread order, as fix dispatch does; never by clocks). Null when there is none. PURE.
+ */
+function firstReviewIndex(records, pr, head) {
+  const reviewed = new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:\\s*${head}\\s*-->`, 'i');
+  const first = records.find(r => {
+    const result = parseRedTeamComment(recordBody(r));
+    return (result?.pr === Number(pr) && result.rev === head) || reviewed.test(recordBody(r));
+  });
+  return first ? first.at : null;
 }
 
 /**
