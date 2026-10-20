@@ -1,7 +1,13 @@
 {
+  "$comment": "ghThrottleSlotWait is the tool layer of that cascade (standard → platform → this file → env). callerWaitMs maps a caller regex to its BACKGROUND slot wait in ms (integer 0..120000; invalid values are ignored and the standard backgroundWaitMs of 8000 applies). The caller stays in the background class. Operator 2026-10-20: parked-pr-conflict-watch waits up to 120 s for a slot.",
   "ghThrottle": {
     "maxHoldSeconds": 90,
     "reapGraceSeconds": 15,
     "perCallerMax": 4
+  },
+  "ghThrottleSlotWait": {
+    "callerWaitMs": {
+      "^parked-pr-conflict-watch": 120000
+    }
   }
 }

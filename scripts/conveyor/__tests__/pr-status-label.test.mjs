@@ -22,6 +22,8 @@ import { tagReviewStatus as tagReviewStatusIo, LEGACY_REVIEW_STATUS_DEFAULT } fr
 import { evaluatePr } from '../../operations/operator-queue.mjs';
 import { STAND_DOWN_MARKER } from '../stand-down.mjs';
 import { takeoverMarkerBody } from '../fix-takeover.mjs';
+import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
+import { redTeamGateMarker } from '../../lib/red-team-gate.mjs';
 
 import { resolvePrStatusSettings, loadPrStatusSettings, prStatusSettingValues, PR_STATUS_SETTING_DEFAULTS } from '../pr-status-settings.mjs';
 
@@ -38,6 +40,27 @@ const marker = (h) => ({ author: BOT, createdAt: at(h), body: takeoverMarkerBody
 const advisory = (h) => ({ author: BOT, createdAt: at(h), body: `**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.** x\n\nNet basis: \`${'0'.repeat(40)}..${HEAD}\`` });
 const pr = (labels = [], comments = [], over = {}) => ({ number: 7, headRefOid: HEAD, baseRefName: 'main', labels: labels.map((name) => ({ name })), comments, ...over });
 const derive = (o) => derivePrStatusLabel({ humanAt: 99, ...o });
+
+describe('round-cap red-team ruling status', () => {
+  // Same trusted comment builders as operator-queue-red-team.test.mjs.
+  const redTeam = { author: BOT, createdAt: at(2), body: renderRedTeamComment({
+    pr: 7, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+    findings: [{ summary: 'two writers', category: 'edge-case', impactIfUnfixed: 'broken',
+      file: 'a.mjs', line: 1, confirmedByRecheck: true }],
+  }) };
+  const capped = { author: BOT, createdAt: at(3), body: redTeamGateMarker(7, HEAD, 'round-cap') };
+  const accepted = ['review:accepted', 'ready-to-merge'];
+
+  it('shows a confirmed live-head break held at the round cap as needs-you', () => {
+    expect(derivePrStatusLabel({ pr: pr(accepted, [redTeam, capped]) })).toBe('needs-you');
+  });
+  it('preserves acceptance without the gate record', () => {
+    expect(derivePrStatusLabel({ pr: pr(accepted, [redTeam]) })).toBe('ready-to-merge');
+  });
+  it('does not ask the operator when review:changes is present', () => {
+    expect(derivePrStatusLabel({ pr: pr([...accepted, 'review:changes'], [redTeam, capped]) })).not.toBe('needs-you');
+  });
+});
 
 describe('derivePrStatusLabel', () => {
   it('at the round cap: a planned takeover, a takeover head awaiting its one review, or a capped PR read at-round-limit', () => {
