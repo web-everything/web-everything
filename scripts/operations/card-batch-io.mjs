@@ -179,6 +179,23 @@ function respoolClosed(state, input, stateDir, remote, held) {
   }
 }
 
+/** Shape and freshness check of the seal job's stored landing proof: same merge commit, one entry per recorded
+ * member (same ids, each once), each with a backlog path and a blob id, no path used twice. */
+export function validMergeProof(recorded, mergeOid) {
+  const proof = recorded?.sealFailure?.mergeProof;
+  const members = recorded?.members ?? [];
+  if (!COMMIT_ID.test(String(mergeOid)) || proof?.merge !== mergeOid || !Array.isArray(proof.members)) return false;
+  if (!members.length || proof.members.length !== members.length) return false;
+  const ids = new Set(members.map(member => member?.cardId));
+  const paths = new Set();
+  for (const entry of proof.members) {
+    if (!ids.delete(entry?.cardId) || !/^backlog\/[^/]+\.md$/.test(String(entry.path)) || paths.has(entry.path)
+      || !COMMIT_ID.test(String(entry.blob))) return false;
+    paths.add(entry.path);
+  }
+  return ids.size === 0;
+}
+
 /** A sealed card batch may be retired and replaced only when a fresh GitHub read confirms its PR is MERGED or CLOSED.
  * Retire a terminal sealed generation under the caller's admission lease; unreadable evidence stays held. */
 export async function retireTerminalBatch(recorded, input, {
@@ -198,6 +215,16 @@ export async function retireTerminalBatch(recorded, input, {
     const view = JSON.parse(await gh(['pr', 'view', String(recorded.pr), '--repo', input.source.repo, '--json', 'number,state,headRefName']));
     if (Number(view?.number) === Number(recorded.pr) && view.headRefName === recorded.batchRef
       && ['OPEN', 'CLOSED', 'MERGED'].includes(view.state)) status = view.state;
+    // A seal failure recorded because the PR MERGED mid-seal retires only with a valid stored content proof for this
+    // PR's actual merge commit (written by the seal job after proving every card landed). Absent or stale → held.
+    if (recorded.sealFailure?.terminalPrState === 'MERGED') {
+      const merged = status === 'MERGED'
+        ? JSON.parse(await gh(['pr', 'view', String(recorded.pr), '--repo', input.source.repo, '--json', 'mergeCommit']))?.mergeCommit?.oid : null;
+      if (!validMergeProof(recorded, merged)) {
+        log(`card-batch ${recorded.batchRef} PR ${recorded.pr} GitHub ${status}: no valid landing proof; kept sealed and held`);
+        return refuse('batch-sealed');
+      }
+    }
     if (!stillHeld()) return refuse('lease-held');
     if (status === 'CLOSED') respoolClosed(recorded, input, stateDir, remote, stillHeld);
     if (status === 'MERGED' || status === 'CLOSED') {

@@ -4,6 +4,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { retireTerminalBatch } from '../card-batch-io.mjs';
 import { publishBatch, sealDueBatches, HOLD_LABEL, VERIFY_UNRUN_CAP, resolveAdoptDescendantHead } from '../card-batch-seal-io.mjs';
 import { loadCardBatchPolicy } from '../../lib/card-batch-policy.mjs';
 const dirs = [];
@@ -501,6 +502,7 @@ const terminalFixture = (prState, main = landedMain()) => {
       return JSON.stringify({ number: 9, state: prState, headRefName: f.state.batchRef, mergeCommit: { oid: main.mergeOid } });
     }
     if (args[1] === 'view' && args.includes('number,state,headRefName')) return JSON.stringify({ number: 9, state: prState, headRefName: f.state.batchRef });
+    if (args[1] === 'view' && args.includes('mergeCommit')) return JSON.stringify({ mergeCommit: prState === 'MERGED' ? { oid: main.mergeOid } : null });
     if (args[1] === 'view' && args.includes('isDraft')) return JSON.stringify({ isDraft: false });
     if (cmd === 'git' && args[0] === 'fetch' && args.includes('refs/heads/main')) return '';
     if (cmd === 'git' && args[0] === 'rev-parse' && args[1] === 'FETCH_HEAD^{commit}') return `${MAIN}\n`;
@@ -526,8 +528,9 @@ const terminalFixture = (prState, main = landedMain()) => {
   return { f, exec };
 };
 const undoFired = (exec) => exec.mock.calls.some(([, args]) => args.includes('--undo'));
-const failUndo = (exec, error = new Error('pull request is merged')) => vi.fn((cmd, args, options) => {
-  if (args.includes('--undo')) throw error;
+// An explicit `undefined` is a real thrown value here, not "use the default".
+const failUndo = (exec, ...thrown) => vi.fn((cmd, args, options) => {
+  if (args.includes('--undo')) throw (thrown.length ? thrown[0] : new Error('pull request is merged'));
   return exec(cmd, args, options);
 });
 const quiet = () => vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
@@ -752,4 +755,66 @@ it('#5680: protection re-armed by head adoption that fails on a merged PR takes 
     expect(undoFired(exec)).toBe(true);
     expect(f.read()).toMatchObject({ headSha: advertised, terminalPrState: 'MERGED', sealFailure: { terminalPrState: 'MERGED' } });
   } finally { err.mockRestore(); }
+});
+
+describe('the stored landing proof gates every terminal retirement of a MERGED-mid-seal batch', () => {
+  const proofOf = (oid = MERGE) => ({ merge: oid, members: [{ cardId: '123', path: 'backlog/6597-card.md', blob: 'c'.repeat(40) }] });
+  const recordedState = (f, mergeProof) => {
+    const state = { ...activeSlot(f), restoreProtection: undefined, holdApplied: true,
+      sealFailure: { reason: 'PR MERGED before the seal finished', terminalPrState: 'MERGED', ...(mergeProof ? { mergeProof } : {}) } };
+    writeFileSync(f.statePath, JSON.stringify(state));
+    return state;
+  };
+  const reconcileRetire = (f, exec, state) => retireTerminalBatch(state, { kind: 'prevention', source: { repo: 'org/repo' }, laneDir: f.dir }, {
+    statePath: f.statePath, stateDir: f.dir, gh: args => exec('gh', args), held: () => true, log: () => {} });
+  it('reconcile refuses a MERGED seal failure with no stored proof', async () => {
+    const { f, exec } = terminalFixture('MERGED');
+    expect(await reconcileRetire(f, exec, recordedState(f, null))).toEqual({ action: 'refuse', reason: 'batch-sealed' });
+    expect(activeSlot(f).lastSealedState).toBeUndefined();
+  });
+  it('reconcile refuses a stale proof (a different merge commit)', async () => {
+    const { f, exec } = terminalFixture('MERGED');
+    expect(await reconcileRetire(f, exec, recordedState(f, proofOf('f'.repeat(40))))).toEqual({ action: 'refuse', reason: 'batch-sealed' });
+  });
+  it('reconcile refuses a proof that does not cover every member once', async () => {
+    const { f, exec } = terminalFixture('MERGED');
+    const bad = { merge: MERGE, members: [{ cardId: '999', path: 'backlog/6597-card.md', blob: 'c'.repeat(40) }] };
+    expect(await reconcileRetire(f, exec, recordedState(f, bad))).toEqual({ action: 'refuse', reason: 'batch-sealed' });
+  });
+  it('reconcile retires with a valid stored proof for the actual merge commit', async () => {
+    const { f, exec } = terminalFixture('MERGED');
+    expect(await reconcileRetire(f, exec, recordedState(f, proofOf()))).toMatchObject({ action: 'retired' });
+  });
+  it('the seal job records the terminal state only with the proof it passed', async () => {
+    const { f, exec: base } = terminalFixture('MERGED');
+    const err = quiet();
+    try {
+      expect(await publishBatch(f.input, { ...f.opts, exec: failUndo(base) })).toMatchObject({ action: 'held', retired: true });
+      expect(f.read().sealFailure.mergeProof).toMatchObject({ merge: MERGE, members: [{ cardId: '123', path: 'backlog/6597-card.md' }] });
+    } finally { err.mockRestore(); }
+  });
+  it('an unproven first run records nothing, so no other path can retire it', async () => {
+    const { f, exec: base } = terminalFixture('MERGED', landedMain({ mergeFiles: { 'backlog/6311-old.md': OLD } }));
+    const err = quiet();
+    try {
+      await expect(publishBatch(f.input, { ...f.opts, exec: failUndo(base) })).rejects.toThrow('pull request is merged');
+      expect(activeSlot(f).sealFailure).toBeUndefined();
+      expect(await reconcileRetire(f, base, activeSlot(f))).toEqual({ action: 'refuse', reason: 'batch-sealed' });
+    } finally { err.mockRestore(); }
+  });
+  it('a git failure (not a clean negative) during the retry proof propagates', async () => {
+    const { f, exec: base } = terminalFixture('MERGED');
+    recordedState(f, proofOf());
+    const boom = Object.assign(new Error('fatal: bad object'), { status: 128 });
+    const exec = vi.fn((cmd, args, options) => { if (cmd === 'git' && args[0] === 'merge-base') throw boom; return base(cmd, args, options); });
+    await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toBe(boom);
+    expect(activeSlot(f).lastSealedState).toBeUndefined();
+  });
+  it('a clean negative (merge commit not an ancestor of main) is a refusal on retry', async () => {
+    const { f, exec } = terminalFixture('MERGED', landedMain({ mergeOnMain: false }));
+    recordedState(f, proofOf());
+    const err = quiet();
+    try { expect(await publishBatch(f.input, { ...f.opts, exec })).toEqual({ action: 'refuse', reason: 'cards-not-proven-on-main' }); }
+    finally { err.mockRestore(); }
+  });
 });

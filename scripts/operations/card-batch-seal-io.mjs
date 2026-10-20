@@ -95,7 +95,12 @@ export async function publishBatch(input, opts = {}) {
     // file, minus that one `bornAs:` line, must equal the recorded file after the numbering's own reference rewrites
     // (`backlog/<cardId>` → `backlog/<n>`, taken from those same front-matter facts). Anything unreadable fails the proof.
     const gitText = async args => String(await run('git', args));
-    const gitOk = async args => { try { await run('git', args); return true; } catch { return false; } };
+    // Only a clean negative answer (exit status 1) is false; every other git/IO failure propagates.
+    const gitNo = async args => {
+      try { await run('git', args); return true; }
+      catch (error) { if (error?.status === 1) return false; throw error; }
+    };
+    const hasCommit = sha => gitNo(['rev-parse', '--verify', '--quiet', `${sha}^{commit}`]);
     const frontMatterBornAs = text => {
       const lines = text.split('\n');
       if (lines[0] !== '---') return [];
@@ -111,16 +116,16 @@ export async function publishBatch(input, opts = {}) {
     };
     const cardsNotProvenOnMain = async () => {
       const members = state.members ?? [];
-      if (!members.length) return ['(no members recorded)'];
+      if (!members.length) return { missing: ['(no members recorded)'] };
       const view = JSON.parse(await gh(['pr', 'view', String(state.pr), '--repo', repo, '--json', 'number,state,headRefName,mergeCommit']));
       const merge = view?.mergeCommit?.oid;
       if (Number(view?.number) !== Number(state.pr) || view.headRefName !== state.batchRef || view.state !== 'MERGED'
-        || !/^[0-9a-f]{40}$/.test(String(merge)) || !/^[0-9a-f]{40}$/.test(String(state.headSha))) return ['(PR or heads unreadable)'];
+        || !/^[0-9a-f]{40}$/.test(String(merge)) || !/^[0-9a-f]{40}$/.test(String(state.headSha))) return { missing: ['(PR or heads unreadable)'] };
       await run('git', ['fetch', '--no-tags', remote, 'refs/heads/main']);
       const main = (await gitText(['rev-parse', 'FETCH_HEAD^{commit}'])).trim();
-      if (!await gitOk(['cat-file', '-e', `${state.headSha}^{commit}`])) await gitOk(['fetch', '--no-tags', remote, state.headSha]);
-      if (!await gitOk(['cat-file', '-e', `${merge}^{commit}`])) await gitOk(['fetch', '--no-tags', remote, merge]);
-      if (!await gitOk(['merge-base', '--is-ancestor', merge, main])) return ['(merge commit not on main)'];
+      if (!await hasCommit(state.headSha)) await run('git', ['fetch', '--no-tags', remote, state.headSha]);
+      if (!await hasCommit(merge)) await run('git', ['fetch', '--no-tags', remote, merge]);
+      if (!await gitNo(['merge-base', '--is-ancestor', merge, main])) return { missing: ['(merge commit not on main)'] };
       const recordedTree = (await gitText(['ls-tree', '--name-only', state.headSha, 'backlog/'])).split('\n').filter(Boolean);
       const mergeTree = (await gitText(['ls-tree', '--name-only', merge, 'backlog/'])).split('\n').filter(Boolean);
       let grep = '';
@@ -142,6 +147,7 @@ export async function publishBatch(input, opts = {}) {
         .map(([id, [path]]) => [id, path.match(/^backlog\/(\d+)-/)[1]]);
       const used = new Set();
       const missing = [];
+      const matched = [];
       for (const member of members) {
         const id = String(member?.cardId ?? '');
         if (!/^[a-z0-9]+$/.test(id)) { missing.push(id || '(no id)'); continue; }
@@ -156,19 +162,23 @@ export async function publishBatch(input, opts = {}) {
         for (const [from, to] of renames) recorded = recorded.replace(new RegExp(`(?<![A-Za-z0-9])backlog/${from}(?![A-Za-z0-9])`, 'g'), `backlog/${to}`);
         const landedRaw = contentAt.get(candidates[0]) ?? await gitText(['show', `${merge}:${candidates[0]}`]);
         const landed = candidates[0] === recordedPaths[0] ? landedRaw : removeBornAsLine(landedRaw, id);
-        if (landed !== recorded) missing.push(id);
+        if (landed !== recorded) { missing.push(id); continue; }
+        matched.push({ cardId: id, path: candidates[0], blob: (await gitText(['rev-parse', `${merge}:${candidates[0]}`])).trim() });
       }
-      return missing;
+      // The stored proof: the merge commit and, per member, the landed path and blob. retireTerminalBatch requires it.
+      return { missing, proof: missing.length ? null : { merge, members: matched } };
     };
     // A MERGED-mid-seal batch retires only after the full proof passes — on every attempt, retries included.
     const retireMerged = async () => {
       // A proof that throws propagates (the caller sees the real error); only a completed proof can refuse or retire.
-      const missing = await cardsNotProvenOnMain();
+      const { missing, proof } = await cardsNotProvenOnMain();
       if (missing.length) {
         process.stderr.write(`card-batch ${state.batchRef} PR ${state.pr} MERGED but ${missing.length} card(s) not proven on main `
           + `(${missing.slice(0, 5).join(', ')}): kept held\n`);
         return refuse('cards-not-proven-on-main');
       }
+      state.sealFailure = { ...state.sealFailure, mergeProof: proof };
+      save();
       return retireTerminalBatch(state, { ...input, source: { repo }, kind, laneDir: cwd }, {
         statePath, stateDir, remote, gh, held, log: opts.log,
       });
@@ -200,14 +210,15 @@ export async function publishBatch(input, opts = {}) {
       const view = JSON.parse(await gh(['pr', 'view', String(state.pr), '--repo', repo, '--json', 'number,state,headRefName']));
       if (Number(view?.number) !== Number(state.pr) || view.headRefName !== state.batchRef || view.state !== 'MERGED') return null;
       let missing;
-      try { missing = await cardsNotProvenOnMain(); } catch { return null; }
+      let proof;
+      try { ({ missing, proof } = await cardsNotProvenOnMain()); } catch { return null; }
       if (missing.length) {
         process.stderr.write(`card-batch ${state.batchRef} PR ${state.pr} MERGED but ${missing.length} card(s) not proven on main `
           + `(${missing.slice(0, 5).join(', ')}): kept held\n`);
         return null;
       }
       state.sealFailure = { reason: `PR MERGED before the seal finished (step ${state.seal?.step ?? 'none'}); the seal cannot resume`,
-        at: new Date(now()).toISOString(), terminalPrState: 'MERGED' };
+        at: new Date(now()).toISOString(), terminalPrState: 'MERGED', mergeProof: proof };
       save();
       // retire() re-runs the proof before retiring. Only a completed retirement replaces the original outcome;
       // otherwise the next run retries (proof included) and this run keeps its own failure.
