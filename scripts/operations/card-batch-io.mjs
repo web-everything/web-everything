@@ -226,7 +226,8 @@ export function parseCatFileBatch(buffer, specs) {
     if (!m) throw new Error('cat-file --batch: unparseable header');
     const size = Number(m[2]);
     if (at + size + 1 > buffer.length || buffer[at + size] !== 0x0a) throw new Error('cat-file --batch: bad body framing');
-    out.set(spec, m[1] === 'blob' ? buffer.toString('utf8', at, at + size) : null);
+    // A blob over the old per-read limit (16 MiB) goes back to `git show`, which refuses it exactly as before.
+    out.set(spec, m[1] === 'blob' && size <= 16 * 1024 * 1024 ? buffer.toString('utf8', at, at + size) : null);
     at += size + 1;
   }
   if (at !== buffer.length) throw new Error('cat-file --batch: trailing output');
@@ -263,7 +264,7 @@ export async function provenMergedLanding(recorded, { repo, gh, git, remote = 'o
   if (!await yes(['rev-parse', '--verify', '--quiet', `${recorded.headSha}^{commit}`])) await git(['fetch', '--no-tags', remote, recorded.headSha]);
   if (!await yes(['rev-parse', '--verify', '--quiet', `${merge}^{commit}`])) await git(['fetch', '--no-tags', remote, merge]);
   if (!await yes(['merge-base', '--is-ancestor', merge, main])) return ['(merge commit not on main)'];
-  const memoKey = `${recorded.headSha}|${merge}|${members.map(member => String(member?.cardId ?? '')).join(',')}`;
+  const memoKey = `${recorded.headSha}|${merge}|${JSON.stringify(members.map(member => String(member?.cardId ?? '')))}`;
   if (memo.has(memoKey)) return [...memo.get(memoKey)];
   const recordedTree = (await text(['ls-tree', '--name-only', recorded.headSha, 'backlog/'])).split('\n').filter(Boolean);
   const mergeTree = (await text(['ls-tree', '--name-only', merge, 'backlog/'])).split('\n').filter(Boolean);

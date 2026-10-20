@@ -845,6 +845,17 @@ describe('provenMergedLanding reads blobs through one cat-file process', () => {
     const after = harness(f, batchIO.catFileBatch);
     expect(await after.run()).toEqual(['zzz']);
   });
+  it('does not reuse a proof across member lists that only differ by a comma, and refuses blobs over the old 16 MiB limit', async () => {
+    const f = landing();
+    const memo = new Map();
+    const run = members => batchIO.provenMergedLanding({ ...f.recorded, members }, { repo: 'o/r', gh: f.gh, memo,
+      git: async args => execFileSync('git', args, { cwd: f.repo, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }) });
+    await run([{ cardId: 'aaa' }, { cardId: 'bbb' }]);
+    expect(await run([{ cardId: 'aaa,bbb' }])).toEqual(['aaa,bbb']);
+    const big = Buffer.alloc(16 * 1024 * 1024 + 1, 97);
+    const raw = Buffer.concat([Buffer.from(`${'c'.repeat(40)} blob ${big.length}\n`), big, Buffer.from('\n')]);
+    expect(batchIO.parseCatFileBatch(raw, ['x']).get('x')).toBeNull();
+  });
   it('fails closed when cat-file fails or its output is malformed', async () => {
     const f = landing();
     await expect(harness(f, () => { throw new Error('boom'); }).run()).rejects.toThrow('boom');
