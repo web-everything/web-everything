@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { newRunRecord, tryReadRun, writeRun } from '../../operations/run-store.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, mandatoryReferralState, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
@@ -16,7 +15,8 @@ import {
   notifyReferralHold, REFERRAL_RETRY_MS, decideSameHeadHold, resolveSameHeadMaxReviews, PENDING_REASON_TOKENS,
   GH_LIST_COMMENT_CAP, findResumableParkedRun, blockRuledReferralsFor, filterFixerReferrals, REFERRAL_REARM_COMMENT_MARKER,
   VERDICT_COOLDOWN_BASE_MS, VERDICT_COOLDOWN_CAP_MS, VERDICT_COOLDOWN_MAX_RELEASES,
-  resolveNoVerdictRetry, NO_VERDICT_RETRY_STANDARD, raiseNoVerdictNeedsYou, NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS, takeReclaimLease,
+  resolveNoVerdictRetry, NO_VERDICT_RETRY_STANDARD, raiseNoVerdictNeedsYou, NO_VERDICT_NEEDS_YOU_LEASE_EXPIRY_MS, NO_VERDICT_NEEDS_YOU_KIND,
+  createLease, clearExpiredLease, leaseOwner,
 } from '../review-referral-hold.mjs';
 
 it('keeps the cycle-free referral matcher equal to the canonical re-arm marker', () => {
@@ -627,123 +627,95 @@ describe('same-head hold never silences a review whose verdict never landed (liv
       notifyReferralHold({ repo, prNumber: p.number, pr: p, hold: cool, dir, post: vi.fn(), log, now: at + 30 * 60_000, publishNeedsYou: publish });
       expect(publish).not.toHaveBeenCalled();
     });
-    it('needs-you is at-least-once (operator ruling), deduped in the normal path: once across ticks, again for a new head, retried after a failed publish', () => {
-      const p = labelled(['review:pending']), retry = { cooldownReleases: 6, source: 'tool' }, dir = temp(), log = vi.fn(), post = vi.fn();
-      const held = decideSameHeadHold(p, lostRuns(9), { repo, env: {}, now: at + 30 * 86400_000, retry });
-      const publish = vi.fn();
-      for (let i = 0; i < 4; i++) notifyReferralHold({ repo, prNumber: p.number, pr: p, hold: held, dir, post, log, now: at + i, publishNeedsYou: publish });
+    const exhausted = t0 => decideSameHeadHold(labelled(['review:pending']), lostRuns(9), { repo, env: {}, now: t0, retry: { cooldownReleases: 6 } });
+    const T0 = at + 30 * 86400_000, EXP = NO_VERDICT_NEEDS_YOU_LEASE_EXPIRY_MS;
+    const files = dir => readdirSync(dir);
+    const receiptOf = dir => join(dir, files(dir).find(n => n.endsWith('.json')));
+    const ageLease = (dir, ms) => { const l = join(dir, files(dir).find(n => n.endsWith('.lease'))); const t = (Date.now() - ms) / 1000; utimesSync(l, t, t); return l; };
+    it('at-least-once (operator ruling), deduped in the normal path: once across ticks, again for a new head', () => {
+      const dir = temp(), log = vi.fn(), post = vi.fn(), publish = vi.fn(), p = labelled(['review:pending']), held = exhausted(T0);
+      for (let i = 0; i < 4; i++) notifyReferralHold({ repo, prNumber: p.number, pr: p, hold: held, dir, post, log, now: T0 + i, publishNeedsYou: publish });
       expect(publish).toHaveBeenCalledTimes(1);
-      expect(publish.mock.calls[0][0]).toMatchObject({ repo, pr: p.number, head, kind: 'review-no-verdict' });
+      expect(publish.mock.calls[0][0]).toMatchObject({ repo, pr: p.number, head, kind: NO_VERDICT_NEEDS_YOU_KIND });
       expect(log.mock.calls.flat().filter(l => l.includes('NEEDS-YOU review-no-verdict'))).toHaveLength(1);
       expect(log.mock.calls.flat().find(l => l.includes('NEEDS-YOU'))).toContain('source=tool');
-      // A new head is a new subject.
-      const head2 = 'b'.repeat(40);
-      raiseNoVerdictNeedsYou({ repo, prNumber: p.number, hold: { ...held, head: head2 }, dir, log, publish });
-      raiseNoVerdictNeedsYou({ repo, prNumber: p.number, hold: { ...held, head: head2 }, dir, log, publish });
+      expect(JSON.parse(readFileSync(receiptOf(dir), 'utf8'))).toMatchObject({ v: 1, state: 'published', repo, pr: p.number, head, kind: NO_VERDICT_NEEDS_YOU_KIND });
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: p.number, hold: { ...held, head: 'b'.repeat(40) }, dir, log, publish })).toBe(true);
       expect(publish).toHaveBeenCalledTimes(2);
-      // A failed publish drops the receipt, so the next tick retries and then stops.
-      const flaky = vi.fn().mockImplementationOnce(() => { throw new Error('feed down'); });
-      const d2 = temp();
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: p.number, hold: held, dir: d2, log, publish: flaky })).toBe(false);
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: p.number, hold: held, dir: d2, log, publish: flaky })).toBe(true);
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: p.number, hold: held, dir: d2, log, publish: flaky })).toBe(false);
-      expect(flaky).toHaveBeenCalledTimes(2);
+      expect(files(dir).some(n => n.endsWith('.tmp'))).toBe(false); // temp files never left behind
     });
-    it('a pending receipt left by a crash or a failed cleanup is reclaimed once stale; a fresh one is respected; corrupt is reclaimed', () => {
-      const dir = temp(), log = vi.fn(), publish = vi.fn(), t0 = at + 30 * 86400_000;
-      const held = decideSameHeadHold(labelled(['review:pending']), lostRuns(9), { repo, env: {}, now: t0, retry: { cooldownReleases: 6 } });
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 })).toBe(true);
-      const [name] = readdirSync(dir);
-      const receiptPath = join(dir, name);
-      const pending = ms => writeFileSync(receiptPath, JSON.stringify({ state: 'pending', at: iso(ms), repo, pr: 1, head }));
-      // Same on-disk state as a crash between reserve and publish, or a failed publish whose receipt removal failed.
-      pending(t0);
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 + NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS - 1 })).toBe(false);
-      expect(publish).toHaveBeenCalledTimes(1);
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 + NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS })).toBe(true);
-      expect(publish).toHaveBeenCalledTimes(2);
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 + 2 * NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS })).toBe(false);
-      writeFileSync(receiptPath, '{not json');
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 })).toBe(true);
-      expect(publish).toHaveBeenCalledTimes(3);
-    });
-    it('at-least-once: a crash AFTER publishing (receipt left pending) re-raises once after the stale window — accepted by ruling', () => {
-      const dir = temp(), log = vi.fn(), publish = vi.fn(), t0 = at + 30 * 86400_000;
-      const held = decideSameHeadHold(labelled(['review:pending']), lostRuns(9), { repo, env: {}, now: t0, retry: { cooldownReleases: 6 } });
-      const real = { readFileSync, writeFileSync, unlinkSync: f => rmSync(f), mkdirSync: (d, o) => mkdirSync(d, o) };
-      // The 'published' write fails (process died right after publishing).
-      const crashing = { ...real, writeFileSync: (f, data, o) => { if (String(data).includes('"published"')) throw new Error('killed'); return writeFileSync(f, data, o); } };
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0, fs: crashing })).toBe(true);
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 + 60_000 })).toBe(false);
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 + NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS })).toBe(true);
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 + 2 * NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS })).toBe(false);
-      expect(publish.mock.calls.length).toBeGreaterThanOrEqual(1);
-      expect(publish).toHaveBeenCalledTimes(2);
-    });
-    it('reclaiming is exclusive: two reclaimers that read the same stale receipt cannot both publish', () => {
-      const dir = temp(), log = vi.fn(), publish = vi.fn(), t0 = at + 30 * 86400_000;
-      const held = decideSameHeadHold(labelled(['review:pending']), lostRuns(9), { repo, env: {}, now: t0, retry: { cooldownReleases: 6 } });
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 })).toBe(true);
-      const receiptPath = join(dir, readdirSync(dir)[0]);
-      const stale = JSON.stringify({ state: 'pending', at: iso(t0), repo, pr: 1, head });
-      writeFileSync(receiptPath, stale);
-      const later = t0 + NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS;
-      // Reclaimer B read the stale bytes before A won, and acts after A: it must lose on the exclusive token.
-      const staleView = { readFileSync: f => (f === receiptPath ? stale : readFileSync(f, 'utf8')), writeFileSync, unlinkSync: f => rmSync(f), mkdirSync: (d, o) => mkdirSync(d, o) };
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: later })).toBe(true);
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: later, fs: staleView })).toBe(false);
-      expect(publish).toHaveBeenCalledTimes(2);
-      // A NEWER stale generation (different bytes) is not blocked by the old token: never silent.
-      writeFileSync(receiptPath, JSON.stringify({ state: 'pending', at: iso(later), repo, pr: 1, head }));
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: later + NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS })).toBe(true);
-      expect(publish).toHaveBeenCalledTimes(3);
-    });
-    it('crash case 1: a reclaimer that dies holding its lease (before replacing the receipt) blocks only until the lease expires', () => {
-      const dir = temp(), log = vi.fn(), publish = vi.fn(), t0 = at + 30 * 86400_000, STALE = NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS;
-      const held = decideSameHeadHold(labelled(['review:pending']), lostRuns(9), { repo, env: {}, now: t0, retry: { cooldownReleases: 6 } });
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 })).toBe(true);
-      const receiptPath = join(dir, readdirSync(dir)[0]);
-      const stale = JSON.stringify({ state: 'pending', at: iso(t0), repo, pr: 1, head });
-      writeFileSync(receiptPath, stale);
-      // Reclaimer A takes the lease and crashes before rewriting the receipt.
-      expect(takeReclaimLease({ fs: { readFileSync, writeFileSync }, path: receiptPath, raw: stale, now: t0 + STALE })).toBe(true);
-      // While A's lease is live, nobody reclaims (exclusive)...
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 + STALE + 60_000 })).toBe(false);
-      expect(publish).toHaveBeenCalledTimes(1);
-      // ...and once it expires the next reclaimer takes over with a new exclusive attempt and publishes: never forever.
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 + 2 * STALE })).toBe(true);
-      expect(publish).toHaveBeenCalledTimes(2);
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 + 2 * STALE + 1 })).toBe(false);
-    });
-    it('expired-lease takeover is exclusive too: two takers of the same expired lease cannot both win', () => {
-      const dir = temp(), path = join(dir, 'r.json'), raw = 'x', t = at, fs = { readFileSync, writeFileSync };
-      expect(takeReclaimLease({ fs, path, raw, now: t })).toBe(true);
-      const later = t + NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS;
-      expect(takeReclaimLease({ fs, path, raw, now: later })).toBe(true);
-      expect(takeReclaimLease({ fs, path, raw, now: later })).toBe(false);
-      // An unreadable lease counts as expired, never as a permanent block.
-      const d2 = temp(), p2 = join(d2, 'r.json');
-      writeFileSync(`${p2}.reclaim-${createHash('sha256').update('y').digest('hex').slice(0, 16)}-0`, '{garbage');
-      expect(takeReclaimLease({ fs, path: p2, raw: 'y', now: t })).toBe(true);
-    });
-    it.each([['null'], ['false'], ['0'], ['""'], ['{bad json'], [''], ['[]'], ['{"state":"pending"}'], ['{"state":"weird","at":"2026-10-03T08:00:00Z"}']])(
-      'crash case 2: an invalid receipt %s is treated as stale and reclaimed (never returns forever)', content => {
-        const dir = temp(), log = vi.fn(), publish = vi.fn(), t0 = at + 30 * 86400_000;
-        const held = decideSameHeadHold(labelled(['review:pending']), lostRuns(9), { repo, env: {}, now: t0, retry: { cooldownReleases: 6 } });
-        expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 })).toBe(true);
-        writeFileSync(join(dir, readdirSync(dir)[0]), content);
-        expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 + 1 })).toBe(true);
-        expect(publish).toHaveBeenCalledTimes(2);
-        expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish, now: t0 + 2 })).toBe(false);
+    it('concurrent reclaim: while one owner holds the lease, a second daemon cannot publish; at least once overall', () => {
+      const dir = temp(), log = vi.fn(), held = exhausted(T0), second = vi.fn();
+      writeFileSync(join(dir, 'placeholder'), ''); // dir exists
+      const first = vi.fn(() => {
+        expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish: second })).toBe(false);
       });
-    it('normal path: concurrent fresh reservations dedupe (second daemon sees the fresh pending receipt)', () => {
-      const dir = temp(), log = vi.fn(), t0 = at + 30 * 86400_000;
-      const held = decideSameHeadHold(labelled(['review:pending']), lostRuns(9), { repo, env: {}, now: t0, retry: { cooldownReleases: 6 } });
-      const second = vi.fn();
-      const first = vi.fn(() => { expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish: second, now: t0 })).toBe(false); });
-      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish: first, now: t0 })).toBe(true);
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish: first })).toBe(true);
       expect(first).toHaveBeenCalledTimes(1);
       expect(second).not.toHaveBeenCalled();
+      // Two racers taking over the same EXPIRED lease: exactly one wins.
+      const d2 = temp(), lease = join(d2, 'x.lease');
+      expect(createLease(lease, 'dead-owner')).toBe(true);
+      const t = (Date.now() - EXP - 1000) / 1000; utimesSync(lease, t, t);
+      expect(clearExpiredLease(lease)).toBe(true);
+      expect(clearExpiredLease(lease)).toBe(false);
+      expect(createLease(lease, 'a')).toBe(true);
+      expect(createLease(lease, 'b')).toBe(false);
+      expect(leaseOwner(lease)).toBe('a');
+    });
+    it('paused-then-resumed owner: its lease expired and was taken over, so it does NOT publish; the new owner does', () => {
+      const dir = temp(), log = vi.fn(), held = exhausted(T0), pausedPublish = vi.fn(), takeoverPublish = vi.fn();
+      const pause = () => {
+        // While "paused", the lease expires and another daemon takes over and publishes.
+        ageLease(dir, EXP + 1000);
+        expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish: takeoverPublish })).toBe(true);
+      };
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish: pausedPublish, beforePublish: pause })).toBe(false);
+      expect(pausedPublish).not.toHaveBeenCalled();
+      expect(takeoverPublish).toHaveBeenCalledTimes(1);
+      expect(log.mock.calls.flat().some(l => l.includes('lease lost before publishing'))).toBe(true);
+    });
+    it.each([['null'], ['false'], ['0'], ['""'], ['{bad json'], [''], ['[]'], ['{"state":"published"}'],
+      ['{"v":1,"state":"published","at":"nope","repo":"web-everything/web-everything","pr":1,"head":"' + 'a'.repeat(40) + '","kind":"review-no-verdict"}'],
+      ['{"v":1,"state":"published","at":"2026-10-03T08:00:00Z","repo":"other/repo","pr":1,"head":"' + 'a'.repeat(40) + '","kind":"review-no-verdict"}'],
+      ['{"v":1,"state":"published","at":"2026-10-03T08:00:00Z","repo":"web-everything/web-everything","pr":1,"head":"' + 'a'.repeat(40) + '","kind":"review-no-verd']])(
+      'corrupt/partial/invalid receipt %s never suppresses: it is reclaimed once the lease is free', content => {
+        const dir = temp(), log = vi.fn(), publish = vi.fn(), held = exhausted(T0);
+        expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish })).toBe(true);
+        writeFileSync(receiptOf(dir), content);
+        ageLease(dir, EXP + 1000);
+        expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish })).toBe(true);
+        expect(publish).toHaveBeenCalledTimes(2);
+        expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish })).toBe(false);
+      });
+    it('many abandoned leases (crashes before publishing) never exhaust into silence: each expiry allows a fresh attempt', () => {
+      const dir = temp(), log = vi.fn(), held = exhausted(T0);
+      const crash = vi.fn(() => { throw new Error('killed before publishing'); });
+      for (let i = 0; i < 50; i++) {
+        expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish: crash })).toBe(false);
+        // A live (unexpired) lease blocks only until it expires.
+        expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish: crash })).toBe(false);
+        ageLease(dir, EXP + 1000);
+      }
+      expect(crash).toHaveBeenCalledTimes(50);
+      const ok = vi.fn();
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish: ok })).toBe(true);
+      expect(ok).toHaveBeenCalledTimes(1);
+      // An empty or garbage lease file (crash mid-create of a foreign writer) also expires.
+      const d2 = temp(), held2 = exhausted(T0), pub2 = vi.fn();
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held2, dir: d2, log, publish: crash })).toBe(false);
+      const lease = ageLease(d2, 0); writeFileSync(lease, ''); const t = (Date.now() - EXP - 1000) / 1000; utimesSync(lease, t, t);
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held2, dir: d2, log, publish: pub2 })).toBe(true);
+    });
+    it('at-least-once: a crash after publishing but before the receipt lands re-raises after the lease expires (accepted by ruling)', () => {
+      const dir = temp(), log = vi.fn(), held = exhausted(T0), publish = vi.fn();
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish })).toBe(true);
+      rmSync(receiptOf(dir)); // as if the process died before writing it
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish })).toBe(false); // lease still live
+      ageLease(dir, EXP + 1000);
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log, publish })).toBe(true);
+      expect(publish.mock.calls.length).toBeGreaterThanOrEqual(1);
+      expect(publish).toHaveBeenCalledTimes(2);
     });
     it('never writes the real feed from a test without an injected publisher', () => {
       const dir = temp();

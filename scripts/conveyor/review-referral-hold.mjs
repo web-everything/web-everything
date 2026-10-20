@@ -3,7 +3,7 @@
  * Persistence failures get three retries (15/30/60 minutes), then the same event-driven hold.
  */
 import { createHash } from 'node:crypto';
-import { mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { linkSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
@@ -18,6 +18,7 @@ import { parseLatestHumanClearedSha, parseReviewedSha } from '../lib/review-esca
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
+import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 
 // Match we:scripts/conveyor/rearm-review.mjs#REARM_COMMENT_MARKER locally: importing it closes a daemon boot cycle.
 // The equality test keeps this first-line matcher tied to the canonical marker.
@@ -471,44 +472,69 @@ export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), readRu
  * a needs-you event per repo+PR+head.
  *
  * DELIVERY IS AT-LEAST-ONCE, BY OPERATOR RULING (2026-10-20), NOT A DEFECT: never-silent wins over exactly-once.
- * - Normal path (deduped): a `pending` receipt is reserved with an exclusive create (`wx`) before publishing and marked
- *   `published` after, so repeated ticks and concurrent daemons emit once.
- * - A failed publish drops the receipt so the next tick retries.
- * - A stale `pending` (crash between reserve and publish, failed cleanup, or a crash/failed write AFTER publishing) or a
- *   corrupt receipt is reclaimed after NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS. In the after-publish case this re-raises
- *   the event: a rare duplicate after a crash is accepted (the feed's open-key state usually absorbs it).
- * - Any unreadable or invalid receipt (bad JSON, null, false, 0, "", wrong shape) is treated as stale: reclaimed.
- * - Reclaiming is exclusive AND expiring ({@link takeReclaimLease}): two reclaimers of the same stale generation can
- *   never both publish, and a reclaimer that crashed holding its lease is taken over once the lease expires — so
- *   nothing can block the event forever.
+ *
+ * DESIGN (atomic files, an expiring owner lease, no attempt counter):
+ * - Every file is written to a unique temp file first and moved into place, so no reader ever sees partial bytes: the
+ *   receipt by rename (`writeJsonAtomic`), the lease by an exclusive hard link of its complete temp file (fails if a
+ *   lease exists).
+ * - The lease names its owner (a per-call token) and its timestamp. It is never released: it simply EXPIRES after
+ *   NO_VERDICT_NEEDS_YOU_LEASE_EXPIRY_MS, so there is no release race and nothing a crashed owner can leave blocking.
+ *   An expired lease is taken over atomically by {@link clearExpiredLease} (rename + post-move verification), however
+ *   many have been abandoned before: no counter can exhaust into silence.
+ * - The owner re-checks that the lease still names it immediately before publishing; lost ownership (it paused past
+ *   expiry and was taken over) → it does not publish.
+ * - Only a COMPLETE, VALID `published` receipt ({@link validPublishedReceipt}: version, state, parseable timestamp,
+ *   exact repo, PR, head and kind) suppresses the event. Anything else — absent, corrupt, null/false/0/"", another
+ *   subject, a bare {"state":"published"} — is stale → publish again once a lease is held.
+ * - Normal path deduped: repeated ticks see the valid receipt; concurrent daemons lose the exclusive lease create.
+ * - Accepted duplicates (at-least-once): a crash after publishing but before the receipt lands, or an owner stalled
+ *   longer than the expiry between its ownership re-check and the publish call itself. A failed publish, or a lost
+ *   lease, retries once the lease expires.
  * Never throws.
  */
-/** A `pending` needs-you reservation older than this is treated as abandoned (crash or failed cleanup) and retried. */
-export const NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS = 10 * 60_000;
-const NEEDS_YOU_FS = Object.freeze({ readFileSync, writeFileSync, unlinkSync, mkdirSync });
-/**
- * Exclusive, EXPIRING reclaim lease for one stale receipt generation (its exact bytes). Lease attempt n is the file
- * `<receipt>.reclaim-<generation>-<n>`, created with `wx` and carrying a timestamp. A live lease (younger than
- * NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS) means another reclaimer owns the generation: refuse. An expired or unreadable
- * lease (its holder crashed) is taken over by exclusively creating attempt n+1, so a crashed reclaimer can never block
- * forever and two reclaimers can never both win the same attempt. Returns true only for the winner.
- */
-export function takeReclaimLease({ fs, path, raw, now, maxAttempts = 10_000 }) {
-  const generation = createHash('sha256').update(raw ?? '').digest('hex').slice(0, 16);
-  for (let n = 0; n < maxAttempts; n++) {
-    const lease = `${path}.reclaim-${generation}-${n}`;
-    try { fs.writeFileSync(lease, JSON.stringify({ at: new Date(now).toISOString(), attempt: n }), { flag: 'wx' }); return true; }
-    catch (e) { if (e.code !== 'EEXIST') throw e; }
-    let held = NaN;
-    try { held = Date.parse(JSON.parse(String(fs.readFileSync(lease, 'utf8')))?.at); } catch { held = NaN; }
-    if (Number.isFinite(held) && now - held < NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS) return false;
-    // Expired or unreadable: its holder is gone; compete for the next attempt.
-  }
-  return false;
+export const NO_VERDICT_NEEDS_YOU_KIND = 'review-no-verdict';
+/** The critical section is a few small local file operations; a lease older than this is abandoned. */
+export const NO_VERDICT_NEEDS_YOU_LEASE_EXPIRY_MS = 10 * 60_000;
+export function validPublishedReceipt(receipt, { repo, prNumber, head }) {
+  return !!receipt && typeof receipt === 'object' && !Array.isArray(receipt) && receipt.v === 1
+    && receipt.state === 'published' && typeof receipt.at === 'string' && Number.isFinite(Date.parse(receipt.at))
+    && receipt.repo === repo && receipt.pr === Number(prNumber) && receipt.head === head
+    && receipt.kind === NO_VERDICT_NEEDS_YOU_KIND;
 }
-
+const tempPath = path => `${path}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+/** Exclusive create of a COMPLETE lease: write a temp file, then hard-link it into place (EEXIST if a lease exists). */
+export function createLease(leasePath, owner, { clock = Date.now } = {}) {
+  const tmp = tempPath(leasePath);
+  writeFileSync(tmp, JSON.stringify({ v: 1, owner, at: new Date(clock()).toISOString() }));
+  try { linkSync(tmp, leasePath); return true; }
+  catch (e) { if (e.code === 'EEXIST') return false; throw e; }
+  finally { try { unlinkSync(tmp); } catch { /* best-effort */ } }
+}
+export function leaseOwner(leasePath) {
+  try { const lease = JSON.parse(readFileSync(leasePath, 'utf8')); return typeof lease?.owner === 'string' ? lease.owner : null; }
+  catch { return null; }
+}
+/**
+ * Take over an EXPIRED lease (mtime older than the expiry), atomically: rename it to a unique name (at most one racer's
+ * rename succeeds), then verify what was actually moved. If the moved file is fresh (re-created between our stat and
+ * our rename), put it back with an exclusive link; if a newer lease already took the path, the displaced owner fails
+ * its pre-publish ownership re-check and does not publish. No counter.
+ */
+export function clearExpiredLease(leasePath, { expiryMs = NO_VERDICT_NEEDS_YOU_LEASE_EXPIRY_MS, clock = Date.now } = {}) {
+  let st;
+  try { st = statSync(leasePath); } catch { return false; }
+  if (clock() - st.mtimeMs < expiryMs) return false;
+  const moved = tempPath(`${leasePath}.expired`);
+  try { renameSync(leasePath, moved); } catch { return false; }
+  let fresh = false;
+  try { fresh = clock() - statSync(moved).mtimeMs < expiryMs; } catch { fresh = false; }
+  if (fresh) { try { linkSync(moved, leasePath); } catch { /* a newer lease exists; the re-check protects it */ } }
+  try { unlinkSync(moved); } catch { /* best-effort */ }
+  return !fresh;
+}
 export function raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now = Date.now(), log = line => console.error(line),
-  publish, fs = NEEDS_YOU_FS }) {
+  publish, leaseExpiryMs = NO_VERDICT_NEEDS_YOU_LEASE_EXPIRY_MS, clock = Date.now,
+  owner = `${process.pid}-${Math.random().toString(36).slice(2)}`, beforePublish = null }) {
   try {
     if (!sha(hold?.head)) return false;
     // The real operator feed is never written from a test run unless the test injects its own publisher.
@@ -516,47 +542,41 @@ export function raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now = Date.n
       if (isUnderTest(process.env)) return false;
       publish = item => publishAttention(item, { now });
     }
+    const subject = { repo, prNumber, head: hold.head };
     const path = join(dir, `${hash([repo, Number(prNumber), hold.head, 'no-verdict-needs-you'])}.json`);
-    fs.mkdirSync(dir, { recursive: true });
-    const receipt = state => JSON.stringify({ state, at: new Date(now).toISOString(), repo, pr: Number(prNumber), head: hold.head });
-    let raw = null;
-    try { raw = String(fs.readFileSync(path, 'utf8')); }
-    catch (e) { if (e.code !== 'ENOENT') raw = ''; }
-    if (raw === null) {
-      // No receipt: the normal path, an exclusive reservation.
-      try { fs.writeFileSync(path, receipt('pending'), { flag: 'wx' }); }
-      catch (e) { if (e.code === 'EEXIST') return false; throw e; }
-    } else {
-      let prior = null;
-      try { prior = JSON.parse(raw); } catch { prior = null; }
-      const at = prior && typeof prior === 'object' ? Date.parse(prior.at) : NaN;
-      if (prior && typeof prior === 'object' && prior.state === 'published') return false;
-      // A fresh, well-formed `pending` reservation belongs to a publish in flight elsewhere.
-      if (prior && typeof prior === 'object' && prior.state === 'pending' && Number.isFinite(at)
-        && now - at < NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS) return false;
-      // Everything else (stale pending, unreadable, bad JSON, null/false/0/"", any other shape) is reclaimed.
-      if (!takeReclaimLease({ fs, path, raw, now })) return false;
-      fs.writeFileSync(path, receipt('pending'));
+    const leasePath = `${path}.lease`;
+    const readReceipt = () => { try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; } };
+    if (validPublishedReceipt(readReceipt(), subject)) return false;
+    mkdirSync(dir, { recursive: true });
+    clearExpiredLease(leasePath, { expiryMs: leaseExpiryMs, clock });
+    if (!createLease(leasePath, owner, { clock })) return false; // a live owner holds it: not this tick
+    if (validPublishedReceipt(readReceipt(), subject)) return false; // published while we were acquiring
+    // TEST-ONLY seam: lets a test pause the owner between acquiring and publishing. A no-op for real callers.
+    if (typeof beforePublish === 'function') beforePublish();
+    // Ownership re-check immediately before publishing.
+    if (leaseOwner(leasePath) !== owner) {
+      log(`${repo}#${prNumber} no-verdict needs-you: lease lost before publishing — not publishing (the current owner will)`);
+      return false;
     }
     try {
-      publish({ repo, pr: Number(prNumber), head: hold.head, kind: 'review-no-verdict',
+      publish({ repo, pr: Number(prNumber), head: hold.head, kind: NO_VERDICT_NEEDS_YOU_KIND,
         reason: `review verdict never landed after ${hold.count} runs and ${hold.noVerdict?.releasesSpent ?? 0} cool-down retries; held until a push or re-arm`,
         pick: `https://github.com/${repo}/pull/${prNumber}` });
     } catch (e) {
-      // Drop the reservation so the next tick retries; if that fails too, the pending receipt goes stale and is reclaimed.
-      try { fs.unlinkSync(path); } catch { /* reclaimed after NO_VERDICT_NEEDS_YOU_PENDING_STALE_MS */ }
-      log(`${repo}#${prNumber} no-verdict needs-you could not be published: ${String(e?.message ?? e).split('\n')[0]}`);
+      log(`${repo}#${prNumber} no-verdict needs-you could not be published (retried when the lease expires): ${String(e?.message ?? e).split('\n')[0]}`);
       return false;
     }
-    // At-least-once (operator ruling): if this write fails, or the process dies before it, the receipt stays pending and
-    // the event is raised again after the stale window — a rare accepted duplicate, never silence.
-    try { fs.writeFileSync(path, receipt('published')); } catch { /* see above */ }
+    // At-least-once: if this write fails or the process dies first, it is raised again after the lease expires.
+    try {
+      writeJsonAtomic(path, { v: 1, state: 'published', at: new Date(now).toISOString(), repo, pr: Number(prNumber),
+        head: hold.head, kind: NO_VERDICT_NEEDS_YOU_KIND });
+    } catch (e) { log(`${repo}#${prNumber} no-verdict needs-you receipt not recorded (may re-raise): ${String(e?.message ?? e).split('\n')[0]}`); }
     log(`${repo}#${prNumber} NEEDS-YOU review-no-verdict head ${hold.head.slice(0, 9)}: ${hold.count} runs, `
       + `${hold.noVerdict?.releasesSpent ?? 0}/${hold.noVerdict?.releases ?? 0} cool-down retries spent `
       + `(reviewNoVerdictRetry.cooldownReleases source=${hold.noVerdict?.source ?? 'standard'}); permanent hold`);
     return true;
   } catch (e) {
-    try { log(`${repo}#${prNumber} no-verdict needs-you failed: ${String(e?.message ?? e).split('\n')[0]}`); } catch { /* never throws */ }
+    try { log(`${repo}#${prNumber} no-verdict needs-you not raised this tick (retried later): ${String(e?.message ?? e).split('\n')[0]}`); } catch { /* never throws */ }
     return false;
   }
 }
