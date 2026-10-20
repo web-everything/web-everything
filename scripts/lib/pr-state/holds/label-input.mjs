@@ -30,9 +30,17 @@ function clearanceCovers(row, events, head) {
   return sameHead(witnessed, head);
 }
 
+/** An approval has no head of its own: for a manual review:human hold, an applied carry its writer did not prove under
+ *  the human-clearance policy (`carryHuman`) ends its scope, as such a carry ends a clear-human verdict's. An approval
+ *  whose position in `events` is unknown answers nothing. */
+const approvalCarriedAway = (row, events, applied) => {
+  const at = Array.isArray(events) ? events.indexOf(row) : -1;
+  return at < 0 || events.slice(at + 1).some(e => e.verdict === 'carried' && e.carryHuman !== true && applied.includes(e));
+};
+
 /** Shared by hold evaluation and timeline ingestion: only a fresh answer can discharge a manual hold. */
-export function clearanceAnswersHold(row, { label, head, now, applied }) {
-  return approvalValid(row, now)
+export function clearanceAnswersHold(row, { label, head, now, applied, events }) {
+  return (approvalValid(row, now) && (label !== 'review:human' || !approvalCarriedAway(row, events, applied)))
     || ((row.type === EVENT_TYPES.VERDICT || row.type === undefined) && verdictClears(row.verdict)
       && !['carried', 'restamped'].includes(row.verdict)
       && (label !== 'review:human' || row.verdict === 'clear-human') && clearanceCovers(row, applied, head));
@@ -56,7 +64,7 @@ export default {
       const candidates = e.clearanceBaseline === undefined ? view.events.slice(i + 1)
         : view.events.filter(x => (x.type === EVENT_TYPES.APPROVAL || ((x.type === EVENT_TYPES.VERDICT || x.type === undefined) && verdictClears(x.verdict)))
           && !e.clearanceBaseline.includes(ledgerEventId(x)));
-      const later = candidates.some(x => clearanceAnswersHold(x, { label: e.label, head, now: facts?.now, applied }));
+      const later = candidates.some(x => clearanceAnswersHold(x, { label: e.label, head, now: facts?.now, applied, events: view.events }));
       if (!later && !out.some(h => h.code === `label-input:${e.label}`)) out.push({ code: `label-input:${e.label}`, reason: `${e.label} added by hand (${e.sender})` });
     });
     return out.length ? out : null;

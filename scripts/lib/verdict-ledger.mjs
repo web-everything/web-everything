@@ -811,7 +811,8 @@ export function eventsSinceHeadMove(events, folded) {
 }
 
 /** Does a carry from this PR's witnessed head reuse a human answer? Not only the latest verdict: a manual review:human
- *  hold (never pruned by a head move), or a human park, clearance or human approval since the last head move. The carry
+ *  hold (never pruned by a head move, so once one was added every later carry on the PR is a human carry — with the
+ *  human-clearance carry off, that PR is re-reviewed at each new head, by design), or a human park, clearance or human approval since the last head move. The carry
  *  planner and the append tip both ask this, so a human answer appended after the planner's snapshot still counts. */
 export function ledgerCarriesHumanAnswer(events, folded = foldVerdictLedger(events).get(events.at(-1)?.pr)) {
   const isVerdict = e => e.type === undefined || e.type === EVENT_TYPES.VERDICT;

@@ -219,8 +219,11 @@ describe('open-head ledger observations', () => {
       expect(validateVerdictRecord(human).record.carryHuman).toBe(true);
       expect(ledgerObservationApplies(human, seen)).toBe(true);
     });
-    it('pr-state moves a human clearance only through a carry proved as human', () => {
-      const events = cases['manual review:human answered by clear-human, then an ordinary accept']();
+    // The production clear-human ceremony writes the verdict and its approval row together.
+    for (const shape of ['verdict only', 'verdict and approval', 'approval only']) it(`pr-state moves a human clearance (${shape}) only through a carry proved as human`, () => {
+      const answer = { 'verdict only': [v('clear-human')], 'verdict and approval': [v('clear-human'), approval('clear-human')],
+        'approval only': [approval('judge')] }[shape];
+      const events = [v('accepted'), manual(), ...answer, v('accepted', { at: '2026-10-17T12:03:00.000Z' })];
       const carry = (over = {}) => buildVerdictRecord({ repo, pr: 1, headSha: next, fromHead: head, verdict: 'carried', carryRule: 'tree-identical',
         state: 'accepted', source: 'head-observer', at: now, ...over });
       const ordinary = carry();
