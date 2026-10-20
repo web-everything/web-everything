@@ -50,7 +50,8 @@ describe('PR real files', () => {
     const run = runner();
     gitRealFiles({ pr, repo, run }).push('code.js');
     expect(gitRealFiles({ pr, repo, run })).toEqual([card]); expect(run).toHaveBeenCalledTimes(10);
-    gitRealFiles({ pr, repo, run, cwd: '/other-clone' }); expect(run).toHaveBeenCalledTimes(18);
+    // +1: a proven answer exists for another clone, so one ls-remote is tried first (and misses).
+    gitRealFiles({ pr, repo, run, cwd: '/other-clone' }); expect(run).toHaveBeenCalledTimes(19);
     const other = runner(); gitRealFiles({ pr, repo, run: other }); expect(other).toHaveBeenCalledTimes(8);
   });
   it.each(['fetch', 'diff'])('failed %s cannot prove card-only from a missing GitHub list', fail => {
@@ -132,4 +133,59 @@ it('pins the post-fetch oid for the diff and checks the same oid before caching'
   run.mockClear();
   expect(gitRealFiles({ pr, repo, run })).toEqual([card]);
   expect(run.mock.calls.map(([, args]) => args[0])).toEqual(['rev-parse', 'cat-file']);
+});
+
+describe('proven answers keyed by immutable remote tips (no time expiry)', () => {
+  const B = 'b'.repeat(40);
+  const setup = ({ lsRemote }) => {
+    let files = `${card}\0`;
+    const run = vi.fn((cmd, args) => {
+      if (args[0] === 'rev-parse' && args.includes('--verify')) return { status: 0, stdout: B };
+      if (args[0] === 'ls-remote') return lsRemote();
+      return runner({ files })(cmd, args);
+    });
+    return { run, setFiles: f => { files = f; } };
+  };
+  const tips = (main, branch, extra = '') => ({ status: 0, stdout: `${main}\trefs/heads/main\n${branch}\trefs/heads/lane/cards\n${extra}` });
+  const fetches = run => run.mock.calls.filter(([, a]) => a[0] === 'fetch').length;
+  const later = fn => { vi.useFakeTimers(); try { vi.setSystemTime(Date.now() + 3_600_000); return fn(); } finally { vi.useRealTimers(); } };
+
+  it('reuses the proven answer without fetching when remote main and branch equal its key, past any TTL', () => {
+    const { run, setFiles } = setup({ lsRemote: () => tips(B, pr.headRefOid) });
+    expect(gitRealFiles({ pr, repo, run })).toEqual([card]);
+    setFiles('code.js\0'); run.mockClear();
+    expect(later(() => gitRealFiles({ pr, repo, run }))).toEqual([card]);
+    expect(fetches(run)).toBe(0);
+    expect(run.mock.calls.map(([, a]) => a[0])).toContain('ls-remote');
+  });
+
+  it.each([
+    ['remote main moved', () => tips('c'.repeat(40), 'a'.repeat(40))],
+    ['branch tip moved', () => tips(B, 'd'.repeat(40))],
+    ['ambiguous duplicate ref', () => tips(B, 'a'.repeat(40), `${B}\trefs/heads/main\n`)],
+    ['branch missing', () => ({ status: 0, stdout: `${B}\trefs/heads/main\n` })],
+    ['ls-remote failed', () => ({ status: 128, stdout: '' })],
+    ['ls-remote threw', () => { throw new Error('timeout'); }],
+  ])('%s → fetches as today', (_name, lsRemote) => {
+    let mode = 'ok';
+    const { run, setFiles } = setup({ lsRemote: () => (mode === 'ok' ? tips(B, pr.headRefOid) : lsRemote()) });
+    gitRealFiles({ pr, repo, run });
+    mode = 'test'; setFiles('code.js\0'); run.mockClear();
+    later(() => gitRealFiles({ pr, repo, run }));
+    expect(fetches(run)).toBe(2);
+  });
+
+  it('a null (unverified) answer is never proven or reused', () => {
+    let head = 'b'.repeat(40);
+    const run = vi.fn((cmd, args) => {
+      if (args[0] === 'rev-parse' && args.includes('--verify')) return { status: 0, stdout: B };
+      if (args[0] === 'ls-remote') return tips(B, pr.headRefOid);
+      return runner({ head })(cmd, args);
+    });
+    expect(gitRealFiles({ pr, repo, run })).toBeNull(); // FETCH_HEAD mismatch
+    run.mockClear();
+    later(() => gitRealFiles({ pr, repo, run }));
+    expect(fetches(run)).toBe(2);
+    expect(run.mock.calls.some(([, a]) => a[0] === 'ls-remote')).toBe(false);
+  });
 });

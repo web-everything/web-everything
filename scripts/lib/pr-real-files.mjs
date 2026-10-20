@@ -8,6 +8,24 @@ import { loadCardConflictSettings } from './card-conflict-resolve.mjs';
 // Bound both age and size. Scope by runner/clone as well as repo+head so ownership failures cannot leak
 // across clones, and injected runners never consume real-process evidence.
 const caches = new WeakMap();
+// Answers proven by the full fetch path, keyed only by immutable inputs (repo, clone, branch, head sha, base sha).
+// Never expired by time: a three-dot net diff of two fixed commits cannot change. Reuse still needs the remote's
+// CURRENT main and branch tips (one ls-remote) to equal the key, so the base is exactly as fresh as a fetch makes it.
+const verifiedCaches = new WeakMap();
+// One round trip for both tips. Exactly one line per exact ref name, or null (the caller falls back to fetching).
+function remoteTips({ run, cwd, branch }) {
+  const refs = ['refs/heads/main', `refs/heads/${branch}`];
+  const r = run('git', ['ls-remote', 'origin', ...refs], { cwd });
+  if (r.status !== 0) return null;
+  const tips = {};
+  for (const line of String(r.stdout ?? '').split('\n').filter(Boolean)) {
+    const [oid, ref, extra] = line.split('\t');
+    if (extra !== undefined || !/^[a-f0-9]{40}$/.test(oid ?? '') || !refs.includes(ref)) continue;
+    if (tips[ref] !== undefined) return null; // ambiguous
+    tips[ref] = oid;
+  }
+  return tips[refs[0]] && tips[refs[1]] ? { main: tips[refs[0]], branch: tips[refs[1]] } : null;
+}
 const eligible = pr => pr?.headRefName?.startsWith('lane/') && pr.baseRefName === 'main' && /^[a-f0-9]{40}$/.test(pr.headRefOid ?? '');
 export function gitRealFiles({ pr, repo, cwd = process.cwd(), run = gitRun } = {}) {
   if (!eligible(pr)) return null;
@@ -30,9 +48,24 @@ export function gitRealFiles({ pr, repo, cwd = process.cwd(), run = gitRun } = {
       && run('git', ['cat-file', '-e', `${pr.headRefOid}^{commit}`], { cwd }).status === 0)
       return hit.files?.slice() ?? null;
   } catch { /* Missing local evidence is a cache miss. */ }
+  let verified = verifiedCaches.get(run);
+  if (!verified) verifiedCaches.set(run, verified = new Map());
+  // Fast path: reuse a fetched-and-verified answer only when the remote's current tips are exactly its key.
+  // Any miss, ambiguity or error falls through to the full fetch below, unchanged.
+  let remote = null; // read once; the full path below re-reads it only if this read threw
+  try {
+    if (verified.size) {
+      remote = run('git', ['remote', 'get-url', 'origin'], { cwd });
+      if (remote.status === 0 && repoKeyFromRemoteUrl(remote.stdout) === expected) {
+        const tips = remoteTips({ run, cwd, branch: pr.headRefName });
+        const proven = tips && tips.branch === pr.headRefOid ? verified.get(keyFor(tips.main)) : undefined;
+        if (Array.isArray(proven)) return proven.slice();
+      }
+    }
+  } catch { remote = null; /* fall through to the fetch */ }
   let files = null;
   try {
-    const remote = run('git', ['remote', 'get-url', 'origin'], { cwd });
+    remote ??= run('git', ['remote', 'get-url', 'origin'], { cwd });
     if (remote.status === 0 && repoKeyFromRemoteUrl(remote.stdout) === expected
       && run('git', ['fetch', 'origin', 'main'], { cwd }).status === 0
       && run('git', ['fetch', '--no-tags', 'origin', `refs/heads/${pr.headRefName}`], { cwd }).status === 0) {
@@ -50,6 +83,10 @@ export function gitRealFiles({ pr, repo, cwd = process.cwd(), run = gitRun } = {
   } catch { return null; } // Unverifiable: never cache a failed base recheck.
   if (cache.size >= 128) cache.delete(cache.keys().next().value);
   cache.set(keyFor(baseOid), { at: Date.now(), files });
+  if (Array.isArray(files)) {
+    if (verified.size >= 1024) verified.delete(verified.keys().next().value);
+    verified.set(keyFor(baseOid), files.slice());
+  }
   return files?.slice() ?? null;
 }
 const normalize = files => Array.isArray(files) ? [...new Set(files.map(f => typeof f === 'string' ? f : f?.path ?? f?.filename).filter(Boolean))] : null;
