@@ -24,6 +24,10 @@ When a stacked child's base PR is closed or rejected, rebase a low-risk child on
   - `the auto-rebase behaviour follows the setting; turning it off sends every child to the operator`.
   - `an unreadable base state fails closed to the operator`.
   - `an incomplete diff read fails closed to the operator, never to an automatic rebase`.
+  - `a partial base-state read (fields missing or cut short) fails closed to the operator`.
+  - `a rebase that errors or times out without a conflict goes to the operator`.
+  - `a fingerprint or risk class that cannot be computed goes to the operator`.
+  - `a missing or unreadable auto-rebase setting sends the child to the operator`.
 
 ## Non-goals
 

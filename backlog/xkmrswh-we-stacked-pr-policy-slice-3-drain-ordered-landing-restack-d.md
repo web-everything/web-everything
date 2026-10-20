@@ -27,6 +27,8 @@ Make the drain land a policy-stacked child only after its base, restack the chil
   - `truncated read: a truncated file list leaves the hold marker unmoved and re-reviews the delta`.
   - `fail closed: an unknown base head holds the child`.
   - `fail closed: a failed restack holds the child`.
+  - `fail closed: a restack that fails partway up the stack holds that child and every child above it`.
+  - `fail closed: a restack that hits the round cap holds the child`.
   - `fail closed: a missing gate holds the child`.
   - `review:accepted is applied only at collapse through the net-diff carry (gate not weakened)`.
   - `onBaseHeadMove setting set to a different value changes the behaviour (not a constant)`.
