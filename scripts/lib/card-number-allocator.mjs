@@ -21,7 +21,7 @@ import { mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync } from 
 import { dirname, join } from 'node:path';
 import { homedir, hostname } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { readGit } from './proc-read.mjs';
 import { withNumberingLock } from '../readiness/drain-lock.mjs';
 import { isHash } from '../backlog/id.mjs';
 import { readSettings } from './settings-files.mjs';
@@ -60,8 +60,8 @@ const maximum = (ids) => ids.reduce((max, n) => Number.isSafeInteger(n) ? Math.m
 export function allocateCardNumber({
   id, cwd = process.cwd(), backlogDir = join(cwd, 'backlog'), settings,
   statePath = join(homedir(), '.claude', 'card-number-reservations.json'),
-  lockRoot, waitMs = 2000, log = console.warn, now = Date.now,
-  git = (args, options = {}) => execFileSync('git', args, {
+  lockRoot, waitMs = 2000, log = () => {}, now = Date.now,
+  git = (args, options = {}) => readGit(args, {
     cwd, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 10_000,
     env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, ...options,
   }),

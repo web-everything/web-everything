@@ -730,7 +730,7 @@ function scaffold() {
 
   const existing = files().map((f) => idFromName(f)).filter(Boolean);
   const birthHash = nextHash(existing);
-  const allocation = allocateCardNumber({ id: birthHash, cwd: ROOT, backlogDir: DIR });
+  const allocation = allocateCardNumber({ id: birthHash, cwd: ROOT, backlogDir: DIR, log: console.warn });
   if (!allocation.ok) console.warn(`scaffold: using hash naming: ${allocation.reason}`);
   let finalNum = allocation.ok ? String(allocation.num) : birthHash;
   if (files().some((f) => Number(idFromName(f)) === Number(finalNum) || idFromName(f) === finalNum)) {
