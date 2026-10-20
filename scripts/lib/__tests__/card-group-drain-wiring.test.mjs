@@ -17,7 +17,7 @@ const out = x => { fs.writeSync(1, typeof x === 'string' ? x : JSON.stringify(x)
 const page = ${openPrPageFixture};
 if (a[0] === 'repo') out('main');
 if (a[0] === 'pr' && a[1] === 'list') out(a.includes('--base') ? [] : [pr]);
-if (a[0] === 'pr' && a[1] === 'view') out(pr);
+if (a[0] === 'pr' && a[1] === 'view') out(a[2] === '77' && process.env.GROUP_COMBINED_STATE ? { ...pr, number: 77, state: process.env.GROUP_COMBINED_STATE } : pr);
 if (a[0] === 'api') {
   if (a[1] === 'user') out('chalbert');
   const path = a.find(x => x.startsWith('repos/')) || '';
@@ -65,7 +65,7 @@ function world(fn) {
       commits: [{ oid: sha, messageHeadline: 'Update readme', authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: sha }],
       comments: [{ author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${sha} -->`, createdAt: new Date().toISOString() }], reviews: [] };
-    const run = ({ role = 'source', grouped = true, only = true, queue = true, heal = false, rebase = false, unreadable = false } = {}) => {
+    const run = ({ role = 'source', grouped = true, only = true, queue = true, heal = false, rebase = false, unreadable = false, combinedState = '' } = {}) => {
       const group = { id: 'fixture', repo: slug, pr: role === 'combined' ? 42 : 77,
         branch: role === 'combined' ? pr.headRefName : 'lane/card-group-fixture', createdAt: Date.now(),
         sources: [{ num: role === 'source' ? 42 : 99, headSha: sha }] };
@@ -77,7 +77,7 @@ function world(fn) {
         ...(only ? ['--only=42'] : []), '--no-drain-lease', '--no-red-main-freeze', '--no-overlap-yield',
         ...(!heal ? ['--no-heal-collision'] : []), ...(!rebase ? ['--no-rebase-drop'] : [])], {
         cwd: dir, encoding: 'utf8', timeout: 120_000,
-        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, GROUP_PR: fixture, GROUP_LOG: log,
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, GROUP_PR: fixture, GROUP_LOG: log, GROUP_COMBINED_STATE: combinedState,
           WE_DRAIN_CARD_GROUP_STATE: statePath, WE_DRAIN_GROUP_ENABLED: 'on', WE_COORDINATION_ROOT: join(dir, 'coord'),
           LANE_POOL_ROOT: dir, WE_MERGE_DELIVERY_SETTINGS_FILE: settings, WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE: 'off',
           WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE: 'off', WE_DRAIN_WORKFLOW_EDIT_HUMAN: 'off', WE_REVIEW_LEDGER_MODE: 'off',
@@ -129,10 +129,18 @@ describe('real drain card-group orchestration', () => {
     expect(full.state.lastReconcileAt).toBeGreaterThan(0);
     // A non-card outcome reaches form(), which rejects it without a group or mutation.
     expect(full.state.groups).toHaveLength(1);
-    expect(run({ only: false, queue: false }).state.lastReconcileAt).toBe(0);
+    // Reconcile runs under direct merging too (a group formed under the queue must still release its holds).
+    expect(run({ only: false, queue: false }).state.lastReconcileAt).toBeGreaterThan(0);
     // Malformed state makes form() return a visible reason, even with zero eligible outcomes.
     expect(run({ only: false, unreadable: true }).stderr).toContain('card-group: no group this pass — state unreadable');
     expect(run({ only: true, unreadable: true }).stderr).not.toContain('card-group: no group this pass');
     expect(run({ only: false, queue: false, unreadable: true }).stderr).not.toContain('card-group: no group this pass');
+  }));
+
+  it('after a switch to direct merging, a closed combined PR is dissolved and its source released', () => world(({ run }) => {
+    const r = run({ only: false, queue: false, combinedState: 'CLOSED' });
+    expect(r.state.groups).toEqual([]);
+    expect(r.calls.some(a => a[0] === 'gh' && a[1] === 'pr' && a[2] === 'close' && a[3] === '77')).toBe(false); // already closed
+    expect(r.calls.some(a => a[0] === 'gh' && a[1] === 'pr' && a[2] === 'comment' && a[3] === '42')).toBe(true);
   }));
 });

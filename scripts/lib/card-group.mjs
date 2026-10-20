@@ -494,6 +494,32 @@ export function queueBlocksGroup(queue, { sources, files }) {
  * The drain's card grouping. `exec` runs gh (execFileSync shape), `run` runs git (gitRun shape) in `cwd`
  * (a clone of the local repo). `prestage(c, headSha)` is the strategy's read-only admission check.
  */
+/**
+ * PURE: this pass's grouping inputs — the enqueue outcomes plus every planner deferral whose ONLY wait is an
+ * overlap-yield. Those deferrals (planLabelDrain's `deferred`) never reach the enqueue loop, so they are absent from
+ * the enqueue outcomes. A deferral that also waits on a blocker, a couple or an incomplete context is not one.
+ */
+export function cardGroupCandidates({ enqueueOutcomes = [], deferred = [] } = {}) {
+  const overlapOnly = d => Array.isArray(d?.waitOn) && d.waitOn.length > 0 && d.waitOn.every(w => String(w).startsWith('overlap-yield:'));
+  const waits = (Array.isArray(deferred) ? deferred : []).filter(overlapOnly)
+    .map(d => ({ num: Number(d.num), repo: d.repo ?? d.overlapYield?.repo ?? null, outcome: 'deferred', kind: 'overlap-yield', reason: d.waitOn.join(', ') }));
+  return [...(Array.isArray(enqueueOutcomes) ? enqueueOutcomes : []), ...waits];
+}
+
+/**
+ * The drain's post-pass step. Every whole pass reconciles recorded groups whatever the delivery strategy: a group
+ * formed under the merge queue must still release its holds after a switch to direct merging. A new group forms
+ * only while the local repo merges through the queue. Never throws (reconcile and form both catch).
+ */
+export function runCardGroupPass({ grouping, onlyPr = null, enqueues = false, enqueueOutcomes = [], deferred = [], verdicts = [], log = process.stderr } = {}) {
+  if (onlyPr != null) return { reconciled: null, grouping: null };
+  const reconciled = grouping.reconcile();
+  if (!enqueues) return { reconciled, grouping: null };
+  const result = grouping.form({ outcomes: cardGroupCandidates({ enqueueOutcomes, deferred }), verdicts });
+  if (result?.reason && !/^(disabled|[01] card-only overlap deferral)/.test(result.reason)) log.write(`  card-group: no group this pass — ${result.reason}\n`);
+  return { reconciled, grouping: result };
+}
+
 export function createCardGrouping({
   localSlug, cwd = process.cwd(), exec = execFileSync, run = gitRun, env = process.env, log = process.stderr,
   statePath = resolveCardGroupStatePath(env), settings, dryRun = false, now = () => Date.now(), prestage = null,

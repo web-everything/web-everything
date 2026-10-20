@@ -8,7 +8,10 @@ import {
   planCardGroups, overlapReasonIsCardOnly, buildCombined, verifyUnion, sourceLanded, cardGroupHold, readCardGroupSettings,
   readGroupState, groupId, cardOnlyFiles, readReferenceMap, createCardGrouping, combinedPrBody, CARD_GROUP_MARKER,
   resolveCardGroupStatePath, cardGroupStatePath, isSubsequence, inCardGroup, queueBlocksGroup,
+  cardGroupCandidates, runCardGroupPass,
 } from '../card-group.mjs';
+import { planLabelDrain } from '../../merge-ai-prs.mjs';
+import { overlapRowKey } from '../../conveyor/land-overlap-yield.mjs';
 
 const dirs = [];
 afterEach(() => { while (dirs.length) rmSync(dirs.pop(), { recursive: true, force: true }); });
@@ -402,6 +405,65 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     expect(y.form({ outcomes: [1, 2].map(n => ({ num: n, kind: 'overlap-yield', reason: 'overlap-yield:#9' })), verdicts: t2.verdicts }).formed).toMatchObject({ pr: 77 });
     expect(ok.holdFor({ num: 1 })).toMatchObject({ kind: 'card-grouped' });
     expect(t.calls.some(c => c.startsWith('pr create') && c.includes('review:pending'))).toBe(true);
+  });
+
+  describe('drain pass step (runCardGroupPass)', () => {
+    const lockOpts = { withLock: fn => ({ ran: true, result: fn() }), readQueueFiles: () => ({ entries: [] }) };
+
+    it('the planner\'s overlap-yield deferrals reach form() and form a group with no enqueue outcome', () => {
+      const t = setup();
+      // The real planner: both card PRs yield to #40, so neither is ready and neither reaches the enqueue loop.
+      const octx = new Map([1, 2].map(n => [overlapRowKey({ repo: null, number: n }), { yieldTo: 40, repo: null, files: [CARD], untilMs: 1_000, windowMinutes: 45 }]));
+      const { ready, deferred } = planLabelDrain([1, 2].map(n => ({ num: n, item: null, blockedBy: [], decision: 'merge', repo: null })), { overlapContext: octx });
+      expect(ready).toEqual([]);
+      expect(cardGroupCandidates({ enqueueOutcomes: [], deferred }).map(o => [o.num, o.kind])).toEqual([[1, 'overlap-yield'], [2, 'overlap-yield']]);
+      const g = createCardGrouping({ localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, () => t.base), exec: t.exec, statePath: join(tmp(), 's.json'),
+        settings, log: { write() {} }, prestage: () => ({ allowed: true }), cardConflictSettings: cc, ...lockOpts });
+      const r = runCardGroupPass({ grouping: g, enqueues: true, enqueueOutcomes: [], deferred, verdicts: t.verdicts, log: { write() {} } });
+      expect(r.grouping.formed).toMatchObject({ pr: 77 });
+    });
+
+    it('only a deferral whose every wait is an overlap-yield is a candidate', () => {
+      const deferred = [
+        { num: 1, waitOn: ['overlap-yield:#40'], overlapYield: { pr: 40, repo: 'o/r' } },
+        { num: 2, waitOn: [7, 'overlap-yield:#40'] }, { num: 3, waitOn: ['couple-carrier:9', 'overlap-yield:#40'] },
+        { num: 4, waitOn: ['required-check-read'] }, { num: 5, waitOn: [] }, { num: 6 },
+      ];
+      expect(cardGroupCandidates({ enqueueOutcomes: [{ num: 8, kind: 'merge-lock-held' }], deferred }))
+        .toEqual([{ num: 8, kind: 'merge-lock-held' }, { num: 1, repo: 'o/r', outcome: 'deferred', kind: 'overlap-yield', reason: 'overlap-yield:#40' }]);
+    });
+
+    it('reconciles under any strategy (forms only under the queue); a single-PR pass does neither', () => {
+      const calls = [];
+      const grouping = { reconcile: () => { calls.push('reconcile'); return {}; }, form: () => { calls.push('form'); return { reason: 'disabled' }; } };
+      runCardGroupPass({ grouping, enqueues: false });
+      expect(calls).toEqual(['reconcile']);
+      runCardGroupPass({ grouping, enqueues: true });
+      expect(calls).toEqual(['reconcile', 'reconcile', 'form']);
+      runCardGroupPass({ grouping, onlyPr: 5, enqueues: true });
+      expect(calls).toHaveLength(3);
+    });
+
+    it('after a switch to direct merging, a closed combined PR dissolves its group and releases every hold', () => {
+      const t = setup();
+      const statePath = join(tmp(), 's.json');
+      writeFileSync(statePath, JSON.stringify({ groups: [{ id: 'g', repo: 'o/r', pr: 77, branch: 'lane/card-group-g', files: [CARD],
+        sources: [{ num: 1, headSha: t.a }, { num: 2, headSha: t.b }] }], failed: {} }));
+      const calls = [];
+      const exec = (cmd, args) => {
+        calls.push(args.join(' '));
+        if (args[0] === 'pr' && args[1] === 'view') return args[2] === '77' ? JSON.stringify({ state: 'CLOSED', labels: [] }) : t.exec(cmd, args);
+        return '';
+      };
+      const g = createCardGrouping({ localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, () => t.base), exec, statePath, settings, log: { write() {} } });
+      expect(g.holdFor({ num: 1 })).toMatchObject({ kind: 'card-grouped' });
+      expect(g.holdFor({ num: 9, listedFilesComplete: true, listedFiles: [CARD] })).toMatchObject({ kind: 'card-grouped' });
+      const r = runCardGroupPass({ grouping: g, enqueues: false, log: { write() {} } });
+      expect(r.reconciled.dissolved).toEqual(['g']);
+      expect(r.grouping).toBeNull();
+      expect(g.holdFor({ num: 1 })).toBeNull();
+      expect(g.holdFor({ num: 9, listedFilesComplete: true, listedFiles: [CARD] })).toBeNull();
+    });
   });
 
   it('after the combined PR merged: closes a source only when its CURRENT head is on main, else releases it', () => {
