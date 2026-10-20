@@ -8,7 +8,7 @@ tags: [prepare, readiness, freshness, defer, tooling]
 scope:
   - we:scripts/readiness/
   - we:scripts/check-readiness.mjs
-  - we:.claude/skills/prepare-decision-item/SKILL.md
+  - we:skills-src/prepare-decision-item/SKILL.md
   - we:scripts/backlog.mjs
   - we:scripts/__tests__/backlog-cli-snapshot.test.mjs
 ---
@@ -24,7 +24,7 @@ A `/prepare all` session built its candidate set and read #2444/#2446 from the p
 ## What to change
 
 - **`we:scripts/readiness/engine.mjs` (Tier-B filler gap):** the `isFiller` (`priority === 'low'`) exclusion filters only `tierAopen`; apply an equivalent screen (or an explicit `deferred` surfacing) to the Tier-B decision projection so `check:readiness --select` stops offering defer-parked decisions as prep candidates. Keep them visible under a "deferred" label rather than silently hidden — `priority: low` is "pickable, out of auto-select" by ruling.
-- **`we:.claude/skills/prepare-decision-item/SKILL.md` (step 1):** require a `git fetch origin` + candidate-body reads at the origin/main tip (or inside the freshly-refreshed lane), and add a hard step-1 check: a body carrying a `**Deferred (… operator call)**` block is excluded from the candidate set — an operator defer is binding on prep, not just on ratification.
+- **`we:skills-src/prepare-decision-item/SKILL.md` (step 1):** require a `git fetch origin` + candidate-body reads at the origin/main tip (or inside the freshly-refreshed lane), and add a hard step-1 check: a body carrying a `**Deferred (… operator call)**` block is excluded from the candidate set — an operator defer is binding on prep, not just on ratification.
 - **`prepare-hold` guard (optional hardening):** `node we:scripts/backlog.mjs prepare-hold <NNN>` could warn (not block) when the target's origin-tip body carries a defer block, catching the case where a session bypasses the skill.
 
 ## Grounding
