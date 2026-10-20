@@ -508,6 +508,28 @@ it('#5680: a stuck seal refused for head-mismatch (merged branch deleted) whose 
   expect(await publishBatch(f.input, { ...f.opts, exec })).toMatchObject({ action: 'held', retired: true });
   expect(exec.mock.calls.some(([, args]) => args[1] === 'edit' || args[1] === 'ready')).toBe(false);
 });
+it('the stuck path keeps the original failure when retirement\'s second read fails, then retries retirement without re-holding', async () => {
+  const { f, exec: base } = terminalFixture('MERGED');
+  let reads = 0;
+  const exec = vi.fn((cmd, args, options) => {
+    if (args.includes('--undo')) throw new Error('pull request is merged');
+    if (args[1] === 'view' && args.includes('number,state,headRefName') && ++reads === 2) throw new Error('gh down');
+    return base(cmd, args, options);
+  });
+  const log = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  try {
+    await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toThrow('pull request is merged');
+    const kept = JSON.parse(readFileSync(f.statePath, 'utf8'));
+    expect(kept).toMatchObject({ pr: 9, sealFailure: { terminalPrState: 'MERGED' } });
+    expect(kept.lastSealedState).toBeUndefined();
+    // Confirmed MERGED: the next run retires through the fresh read and never re-adds the hold label.
+    const edits = () => exec.mock.calls.filter(([, args]) => args.includes('--add-label')).length;
+    const before = edits();
+    expect(await publishBatch(f.input, { ...f.opts, exec })).toMatchObject({ action: 'held' });
+    expect(edits()).toBe(before);
+    expect(JSON.parse(readFileSync(f.statePath, 'utf8'))).toEqual({ seq: 1, lastSealedState: expect.stringContaining('sealed') });
+  } finally { log.mockRestore(); }
+});
 it('the stuck path keeps the original failure when the PR is not merged or the read fails', async () => {
   for (const view of [() => JSON.stringify({ number: 9, state: 'OPEN', headRefName: 'lane/card-batch-prevention-1' }), () => { throw new Error('gh down'); }]) {
     const { f, exec: base } = terminalFixture('MERGED');

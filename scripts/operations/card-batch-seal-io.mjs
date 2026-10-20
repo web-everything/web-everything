@@ -111,8 +111,10 @@ export async function publishBatch(input, opts = {}) {
       state.sealFailure = { reason: `PR MERGED before the seal finished (step ${state.seal?.step ?? 'none'}); the seal cannot resume`,
         at: new Date(now()).toISOString(), terminalPrState: 'MERGED' };
       save();
+      // Only a completed retirement replaces the original outcome. Otherwise the recorded failure makes the next run
+      // retry retirement first (and never restore protection on the merged PR again), and this run keeps its own failure.
       const retired = await retire();
-      return { action: 'held', state, retired: retired?.action === 'retired' };
+      return retired?.action === 'retired' ? { action: 'held', state, retired: true } : null;
     };
     // A failed recovery read never masks the original failure.
     const orRecoverMerged = async (original) => {
