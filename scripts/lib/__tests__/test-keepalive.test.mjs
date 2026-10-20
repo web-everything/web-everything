@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import {
   KEEPALIVE_ANCHOR_ENV, KEEPALIVE_MARKER, keepAliveAnchorPid, keepAliveScript, killKeepAlives, spawnKeepAlive,
 } from '../test-keepalive.mjs';
-import { findUnmanagedKeepAlives, EMPTY_TIMER_RE } from '../../check-standards-rules.mjs';
+import { findUnmanagedKeepAlives } from '../../check-standards-rules.mjs';
 
 const HELPER = pathToFileURL(resolve(dirname(fileURLToPath(import.meta.url)), '..', 'test-keepalive.mjs')).href;
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
@@ -24,7 +24,7 @@ describe('keepAliveScript', () => {
   it('starts with the marker, and contains no bare empty-callback timer', () => {
     const src = keepAliveScript({ anchorPid: 4242 });
     expect(src.startsWith(KEEPALIVE_MARKER)).toBe(true);
-    expect(EMPTY_TIMER_RE.test(src)).toBe(false);
+    expect(findUnmanagedKeepAlives([{ file: 'scripts/x.mjs', content: `spawn(n, ['-e', ${JSON.stringify(src)}]);` }])).toEqual([]);
     expect(keepAliveScript({ anchorPid: 4242, prelude: 'A;', postlude: 'B;' })).toMatch(/^\/\*we-keepalive\*\/A;\n\{.*\}\nB;$/s);
   });
   it('refuses a missing anchor or lifetime', () => {
@@ -87,35 +87,72 @@ describe('a keep-alive ends on its own', () => {
   });
 });
 
-describe('check:standards — findUnmanagedKeepAlives', () => {
-  const at = (files) => findUnmanagedKeepAlives(files).map((f) => `${f.file}:${f.line}`);
-  it('flags an idle timer in any spelling — interval or timeout, spaced, unspaced, a space before (, empty function, async, multi-line', () => {
-    const content = [
-      "spawn(process.execPath, ['-e', 'setInterval(() => {}, 1e9)']);", // keepalive-guard: not-a-spawn (scan fixture)
-      'const X = "setInterval(()=>{},1000)";', // keepalive-guard: not-a-spawn (scan fixture)
-      'setInterval (function () {}, 5);', // keepalive-guard: not-a-spawn (scan fixture)
-      'setInterval(() => {',
-      '}, 1000);',
+describe('check:standards — findUnmanagedKeepAlives (parsed, not pattern-matched)', () => {
+  // Each case is a whole FILE handed to the scanner. The fixture strings themselves carry a real exemption
+  // comment in THIS file's source, so this test file never trips the scan it tests.
+  const scan = (content, file = 'scripts/x.mjs') => findUnmanagedKeepAlives([{ file, content }]);
+  const flagged = (content) => scan(content).filter((f) => f.reason === 'idle-timer').map((f) => f.line);
+  it('flags an empty-bodied callback whatever its comments, parameters, async or parentheses', () => {
+    const cases = [
+      'setInterval(() => {}, 1000);', // keepalive-helper-ok: scan fixture
+      'setInterval(()=>{},1e9)', // keepalive-helper-ok: scan fixture
+      'setInterval (function () {}, 5);', // keepalive-helper-ok: scan fixture
+      'setInterval(async () => {}, 1000);', // keepalive-helper-ok: scan fixture
+      'setInterval(async function named(a, b) {}, 1000);', // keepalive-helper-ok: scan fixture
+      'setInterval(_ => {}, 1000);', // keepalive-helper-ok: scan fixture
+      'setInterval(function (unused) {}, 1000);', // keepalive-helper-ok: scan fixture
+      'setInterval(() => {/* idle */}, 1000);', // keepalive-helper-ok: scan fixture
+      'setInterval(/* idle */ () => {}, 1000);', // keepalive-helper-ok: scan fixture (audit 3)
+      'setInterval((x = f()) => {}, 1000);', // keepalive-helper-ok: scan fixture (audit 3)
+      'setInterval((()=>{}),1000);', // keepalive-helper-ok: scan fixture (audit 2)
+      'setInterval/*idle*/(()=>{},1000);', // keepalive-helper-ok: scan fixture (audit 2)
+      'setInterval(() => {\n  // nothing\n}, 1000);', // keepalive-helper-ok: scan fixture (multi-line)
+      'globalThis.setTimeout(() => {}, 60000);', // keepalive-helper-ok: scan fixture
+      'setTimeout(() => {}, 30000);', // keepalive-helper-ok: scan fixture
+    ];
+    for (const c of cases) expect(flagged(c), c).toEqual([1]);
+  });
+  it('flags idle timers inside child source handed over as strings and templates, nested too', () => {
+    const cases = [
+      "spawn(process.execPath, ['-e', 'setInterval(() => {}, 1e9)']);", // keepalive-helper-ok: scan fixture
+      "const s = `require('fs').writeFileSync(${p}, '1'); setTimeout(() => {}, 60000);`;", // keepalive-helper-ok: scan fixture
+      "spawn(node, ['-e', \"require('child_process').spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'])\"]);", // keepalive-helper-ok: scan fixture (nested)
+      'x("setInterval(() => {\\n}, 1000)");', // keepalive-helper-ok: scan fixture (escaped newline in generated source)
+    ];
+    for (const c of cases) expect(flagged(c), c).toEqual([1]);
+  });
+  it('leaves real work alone', () => {
+    const cases = [
       'setInterval(() => tick(), 1000);',
-      'setInterval(async () => {}, 1000);', // keepalive-guard: not-a-spawn (scan fixture)
-      "spawn(node, ['-e', 'setTimeout(() => {}, 60000)']);", // keepalive-guard: not-a-spawn (scan fixture)
-      'setTimeout(()=>{},30000)', // keepalive-guard: not-a-spawn (scan fixture)
+      'setInterval((a, b) => { tick(a, b); }, 1000);',
       'setTimeout(() => process.exit(0), 30000);',
       'await new Promise((r) => setTimeout(r, 50));',
-      'setInterval(_ => {}, 1000);', // keepalive-guard: not-a-spawn (scan fixture)
-      'setInterval(function (unused) {}, 1000);', // keepalive-guard: not-a-spawn (scan fixture)
-      'setInterval(() => {/* idle */}, 1000);', // keepalive-guard: not-a-spawn (scan fixture)
-      String.raw`x("setInterval(() => {\n}, 1000)");`, // keepalive-guard: not-a-spawn (scan fixture)
-      'setInterval((a, b) => { tick(a, b); }, 1000);',
-    ].join('\n');
-    expect(at([{ file: 'scripts/a.mjs', content }])).toEqual(['scripts/a.mjs:1', 'scripts/a.mjs:2', 'scripts/a.mjs:3', 'scripts/a.mjs:4', 'scripts/a.mjs:7', 'scripts/a.mjs:8', 'scripts/a.mjs:9', 'scripts/a.mjs:12', 'scripts/a.mjs:13', 'scripts/a.mjs:14', 'scripts/a.mjs:15']);
+      "const msg = 'use setInterval for polling';",
+      "x('node -e \\'setInterval(()=>{},1000)\\' is a bash string here');",
+    ];
+    for (const c of cases) expect(flagged(c), c).toEqual([]);
   });
-  it('exempts only the helper and a line ENDING in the not-a-spawn comment — not the marker text inside a string', () => {
-    const idle = 'setInterval(()=>{},1000)'; // keepalive-guard: not-a-spawn (scan fixture)
-    expect(at([{ file: 'scripts/lib/test-keepalive.mjs', content: idle }])).toEqual([]);
-    expect(at([{ file: 'scripts/b.mjs', content: `x('${idle}'); // keepalive-guard: not-a-spawn (fixture)` }])).toEqual([]);
-    expect(at([{ file: 'scripts/c.mjs', content: `x('${idle} keepalive-guard: not-a-spawn');` }])).toEqual(['scripts/c.mjs:1']);
-    expect(at([{ file: 'scripts/d.mjs', content: `x("${idle}"); // keepalive-guard: not-a-spawn "quoted"` }])).toEqual(['scripts/d.mjs:1']);
+  it('exempts only a real `// keepalive-helper-ok: <reason>` line comment attached to the call', () => {
+    const idle = 'setInterval(()=>{},1000)'; // keepalive-helper-ok: scan fixture
+    expect(flagged(`${idle}; // keepalive-helper-ok: fixture only, never spawned`)).toEqual([]);
+    expect(flagged(`// keepalive-helper-ok: fixture only, never spawned\n${idle};`)).toEqual([]);
+    expect(flagged(`spawn(n, [\n  '-e',\n  '${idle}', // keepalive-helper-ok: fixture only\n]);`)).toEqual([]);
+    // no reason given
+    expect(flagged(`${idle}; // keepalive-helper-ok:`)).toEqual([1]);
+    // the marker inside a string, a template or a generated child source exempts nothing (audit 2)
+    expect(flagged(`x('${idle} // keepalive-helper-ok: x');`)).toEqual([1]);
+    expect(flagged('const source = `setInterval(()=>{},1000); // keepalive-helper-ok: x\n`;')).toEqual([1]); // keepalive-helper-ok: scan fixture
+    // a block comment is not the exemption, and a comment on an unrelated earlier statement does not carry over
+    expect(flagged(`${idle}; /* keepalive-helper-ok: x */`)).toEqual([1]);
+    expect(flagged(`// keepalive-helper-ok: about the next line only\nfoo();\n${idle};`)).toEqual([3]);
+    // the old line-suffix marker no longer exempts
+    expect(flagged(`${idle}; // keepalive-guard: not-a-spawn`)).toEqual([1]);
+  });
+  it('an unparseable file is a finding (fail loud); the helper itself and non-JS files are not scanned', () => {
+    expect(scan('setInterval(() => {}, 1000')).toMatchObject([{ reason: 'unparseable', line: 1 }]); // keepalive-helper-ok: scan fixture
+    expect(scan('setInterval(() => {}, 1000);', 'scripts/lib/test-keepalive.mjs')).toEqual([]); // keepalive-helper-ok: scan fixture
+    expect(scan('setInterval(() => {}, 1000);', 'scripts/notes.md')).toEqual([]); // keepalive-helper-ok: scan fixture
+    expect(scan('const t: number = 1;\nsetInterval((): void => {}, 1000);', 'scripts/x.ts').map((f) => f.reason)).toEqual(['idle-timer']); // keepalive-helper-ok: scan fixture
   });
 });
 

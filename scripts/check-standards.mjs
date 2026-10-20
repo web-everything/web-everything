@@ -93,7 +93,7 @@ import {
   buildTrackedPathIndex, scopeBasenameMismatches, scopeBasenameMismatchMessage,
   checkLeashPin,
   findRelativeNodeScriptsAfterLaneCd,
-  findUnmanagedKeepAlives, KEEPALIVE_SCAN_DIRS, KEEPALIVE_HELPER_PATH, KEEPALIVE_NOT_A_SPAWN_MARKER,
+  findUnmanagedKeepAlives, KEEPALIVE_SCAN_DIRS, KEEPALIVE_HELPER_PATH, KEEPALIVE_EXEMPT_MARKER,
   scopeMissingTestFile, bodyDeliverablesMissingFromScope, deferredBlockedByFindings,
   dirLevelScopeFinding,
 } from './check-standards-rules.mjs';
@@ -3144,7 +3144,7 @@ mark("19. Unfenced mandate params (#2967b)");
 // ── 19b. Unmanaged keep-alive children (keep-alive leak fix, 2026-10-20) ─────────────────────────────────────
 // A do-nothing empty-callback timer child outlives any test that fails to kill it (154 orphans, up to 19 days
 // old, live-caught). Keep-alives come from scripts/lib/test-keepalive.mjs only — anchored + bounded.
-// The git invocation lives here; the pure filter is `findUnmanagedKeepAlives`. The scan is NEVER skipped: a
+// The git invocation lives here; the pure PARSER-based filter is `findUnmanagedKeepAlives`. The scan is NEVER skipped: a
 // failed or negative work-tree probe, a failed grep, or an unreadable listed file is itself a finding (fail
 // closed, loudly).
 {
@@ -3173,9 +3173,14 @@ mark("19. Unfenced mandate params (#2967b)");
     }
   }
   for (const f of findUnmanagedKeepAlives(files)) {
+    if (f.reason === 'unparseable') {
+      err(`${f.file}:${f.line} could not be parsed by the keep-alive scan (${f.text}) — fix the syntax; an unparsed file is never assumed clean`,
+        { kind: 'unmanaged-keepalive', file: f.file });
+      continue;
+    }
     err(`${f.file}:${f.line} spawns a bare empty-callback timer keep-alive — use spawnKeepAlive()/keepAliveScript() ` +
       `from ${KEEPALIVE_HELPER_PATH} (anchored to the test runner + max lifetime) so it cannot be orphaned. ` +
-      `A line that only mentions the idiom and never runs it may end with a \`// ${KEEPALIVE_NOT_A_SPAWN_MARKER}\` comment.`,
+      `Code that only mentions the idiom and never runs it may carry a \`// ${KEEPALIVE_EXEMPT_MARKER} <reason>\` line comment on that call.`,
       { kind: 'unmanaged-keepalive', file: f.file });
   }
 }
