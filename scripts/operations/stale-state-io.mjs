@@ -71,18 +71,27 @@ export function createStaleStateReader({
         });
       };
       const lanes = laneScan ? cachedLaneScan(scan, { ...laneScan, root, now: now() }) : scan();
-      for (const { lane, ahead } of lanes) {
+      const cachedRow = lanes.find(row => Number.isFinite(row?.cachedAt));
+      if (cachedRow) gaps.push(`lane-lease work safety is from the lane-scan cache (${new Date(cachedRow.cachedAt).toISOString()}): reporting only, never safe; a destructive lane action needs a fresh check (health-watch-lane-scan.mjs#guardLaneAction).`);
+      for (const { lane, ahead, cachedAt } of lanes) {
+        const fromCache = Number.isFinite(cachedAt);
         if (lane.readError) {
           add('lane-lease', lane.path, {}, null, { lane, readError: lane.readError });
           continue;
         }
         if (!lane.lease) continue; // include raw expired leases regardless of `leased`
         const lease = lane.lease;
-        const hasUnsafeWork = lane.clean === false || (ahead !== null && ahead > 0) ? true
+        const computed = lane.clean === false || (ahead !== null && ahead > 0) ? true
           : lane.clean === true && ahead === 0 ? false : null;
+        // A cached row is reporting only: cached unsafe stays unsafe, cached safe/unknown is reported unknown. Acting
+        // on a lane needs health-watch-lane-scan.mjs#guardLaneAction's fresh check, never this field.
+        const hasUnsafeWork = fromCache ? (computed === true ? true : null) : computed;
         add('lane-lease', lane.path, {
           ...lease, owner: lease.workerSession ?? lease.ownerSession ?? lease.session ?? lease.holder,
-        }, lease.acquiredAt, { hasUnsafeWork, lane: { ...lane, ahead }, lease });
+        }, lease.acquiredAt, { hasUnsafeWork,
+          safety: { source: fromCache ? 'cache' : 'fresh', observedAt: fromCache ? new Date(cachedAt).toISOString() : observedAt,
+            cachedHasUnsafeWork: fromCache ? computed : null },
+          lane: { ...lane, ahead }, lease });
       }
     } catch (error) { gaps.push(`lane-lease enumeration failed: ${error.message}`); }
     try {
