@@ -7,6 +7,7 @@ import { readDeclaredSettings } from './settings-files.mjs';
 import { PLATFORM_PREFERENCES_PATH } from './merge-delivery-policy.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { withPathLock } from '../readiness/with-lock.mjs';
+import { readRuntimeLayer, filterRuntimeBlock } from './runtime-settings.mjs';
 
 export const STANDARD_BATCHING_SETTINGS = Object.freeze({
   enabled: false,
@@ -66,12 +67,14 @@ function validValue(key, value) {
   return value >= (key === 'groupFormMinutes' ? 0 : 1);
 }
 
-/** Resolve per-key env > repo > platform > standard. Inject full settings objects
- * with a mergeQueueBatching block; only omitted objects are loaded from disk.
+/** Resolve per-key env > runtime > repo > platform > standard. Inject full settings objects
+ * with a mergeQueueBatching block; only omitted objects are loaded from disk. `runtime` is the runtime-operator
+ * block (`we:scripts/lib/runtime-settings.mjs`: allowlisted, bounded leaves only, read fresh on every call); omitted →
+ * read from the runtime file, `null` → off. Its unreadable/invalid entries are named in `invalid` as `runtime: …`.
  * Under VITEST/WE_UNDER_TEST an omitted repo layer is empty. No caller input is mutated.
  * @returns {object} Effective values, sources for every key, and invalid layer.key entries.
  */
-export function resolveBatchingSettings({ env = process.env, settings, platform } = {}) {
+export function resolveBatchingSettings({ env = process.env, settings, platform, runtime } = {}) {
   const repo = settings === undefined
     ? (env.VITEST || env.WE_UNDER_TEST ? {} : readDeclaredSettings().settings)
     : settings;
@@ -79,6 +82,14 @@ export function resolveBatchingSettings({ env = process.env, settings, platform 
   const values = { ...STANDARD_BATCHING_SETTINGS };
   const sources = Object.fromEntries(Object.keys(values).map(key => [key, 'standard']));
   const invalid = [];
+  let runtimeBlock = runtime ? filterRuntimeBlock('mergeQueueBatching', runtime).block : undefined;
+  if (runtime === undefined) {
+    try {
+      const r = readRuntimeLayer('mergeQueueBatching', { env });
+      runtimeBlock = r.block;
+      invalid.push(...r.warnings.map(w => `runtime: ${w}`));
+    } catch { runtimeBlock = undefined; }
+  }
   const envSettings = {};
   for (const [key, name] of Object.entries(ENV_KEYS)) {
     if (env[name] !== undefined) envSettings[key] = envValue(key, env[name]);
@@ -86,6 +97,7 @@ export function resolveBatchingSettings({ env = process.env, settings, platform 
   for (const [layer, block] of [
     ['platform', platformSettings?.mergeQueueBatching],
     ['repo', repo?.mergeQueueBatching],
+    ['runtime', runtimeBlock],
     ['env', envSettings],
   ]) {
     for (const key of Object.keys(values)) {

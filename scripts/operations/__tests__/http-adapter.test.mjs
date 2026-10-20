@@ -71,6 +71,7 @@ import { RUNNER_ACTIVITY_OP } from '../runner-activity.mjs';
 import { PR_OWNERSHIP_OP } from '../pr-ownership.mjs';
 import { DAEMON_STATUS_OP } from '../daemon-status.mjs';
 import { HEAVY_QUEUE_OP } from '../heavy-queue.mjs';
+import { RUNTIME_SETTING_OP } from '../runtime-setting.mjs';
 import { RESOURCE_STATUS_OP } from '../resource-status.mjs';
 import { PRE_PR_CHECK_OP } from '../pre-pr-check.mjs';
 import { FREE_SCOPE_OP } from '../free-scope.mjs';
@@ -501,6 +502,9 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // Card 105 — NOT read-only: its one `act` step is an effect (pause files, kill file, test session); the
     // declaring module is a leaf and every write lives in `maintenance-io.mjs`, behind the sink `../run.mjs` wires.
     [MAINTENANCE_OP]: 'maintenance.mjs',
+    // Hot-swap operational knobs — NOT read-only: its `write` step is an effect (the atomic runtime-settings write +
+    // audit line, in `../lib/runtime-settings.mjs#writeRuntimeSettings`, bound as a sink by `../run.mjs`).
+    [RUNTIME_SETTING_OP]: 'runtime-setting.mjs',
   });
 
   it('the module map covers every operation the repo declares — a new one cannot slip past this file', () => {
