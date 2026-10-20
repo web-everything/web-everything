@@ -131,7 +131,8 @@ export function locateClone(repo, { candidates = [process.cwd(), REPO_ROOT], exe
       url = String(exec('git', ['-C', top, 'remote', 'get-url', 'origin'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).trim();
     } catch { reasons.push(`${top}: no origin remote`); continue; }
     const slug = originPattern.exec(url)?.[1].toLowerCase();
-    if (!slug) { reasons.push(`${top}: origin ${url} is not a github.com owner/name`); continue; }
+    // An unparsed origin can contain credentials (userinfo, query, or fragment); never echo it into run records.
+    if (!slug) { reasons.push(`${top}: origin is not a github.com owner/name`); continue; }
     if (slug === identity) return { dir: top, reasons };
     const resolved = canonical(slug);
     if (resolved === identity) return { dir: top, reasons };

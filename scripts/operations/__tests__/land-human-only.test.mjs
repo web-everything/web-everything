@@ -71,6 +71,39 @@ describe('land-human-only — checkout identity', () => {
     expect(at('git@github.com:o/r.git').dir).toBe('/c');
     expect(at('/tmp/o/r.git').reasons.join()).toMatch(/not a github.com owner\/name/);
   });
+  it.each([
+    ['HTTPS userinfo', 'https://x-access-token:origin-secret@github.com/o/r.git'],
+    ['HTTP userinfo', 'http://origin-secret@github.com/o/r.git'],
+    ['SSH userinfo', 'ssh://git:origin-secret@github.com/o/r.git'],
+    ['query', 'https://github.com/o/r.git?token=origin-secret'],
+    ['fragment', 'https://github.com/o/r.git#origin-secret'],
+    ['other host', 'https://origin-secret@elsewhere.test/o/r.git'],
+    ['malformed URL', 'https://origin-secret@@github.com/o/r.git'],
+    ['encoded userinfo', 'https://origin%2Dsecret@github.com/o/r.git'],
+    ['local path', '/tmp/origin-secret/o/r.git'],
+    ['control characters', 'origin-secret\n\r\u2028https://github.com/o/r.git'],
+    ['shell punctuation', '--origin-secret/../`command`/"quoted"'],
+    ['Unicode', 'https://origin-secret\u200b@github.com/o/r.git'],
+  ])('omits the rejected origin from diagnostics (%s)', (_shape, origin) => {
+    const canonical = vi.fn();
+    const result = locateClone(repo, { candidates: ['/lane'], canonical,
+      exec: (_bin, args) => args.includes('rev-parse') ? '/lane\n' : origin });
+    expect(result).toEqual({ dir: null, reasons: ['/lane: origin is not a github.com owner/name'] });
+    expect(canonical).not.toHaveBeenCalled();
+  });
+  it('accepts a renamed origin through the default canonical resolver with only exec mocked', () => {
+    const exec = vi.fn((bin, args) => {
+      if (bin === 'git' && args.includes('rev-parse')) return '/lane\n';
+      if (bin === 'git' && args.includes('get-url')) return 'git@github.com:old-owner/r.git';
+      if (bin === 'gh') {
+        expect(args).toEqual(['api', '--hostname', 'github.com', 'repos/old-owner/r', '-q', '.full_name']);
+        return 'O/R\n';
+      }
+      throw new Error(`unexpected ${bin} ${args.join(' ')}`);
+    });
+    expect(locateClone(repo, { candidates: ['/lane'], exec })).toEqual({ dir: '/lane', reasons: [] });
+    expect(exec.mock.calls.map(([bin]) => bin)).toEqual(['git', 'git', 'gh']);
+  });
   it('reads the canonical slug from GitHub and refuses an unreadable answer', () => {
     expect(readCanonicalSlug('old/r', { exec: (bin, args) => { expect([bin, ...args]).toEqual(['gh', 'api', '--hostname', 'github.com', 'repos/old/r', '-q', '.full_name']); return 'O/R\n'; } })).toBe('o/r');
     expect(readCanonicalSlug('old/r', { exec: () => '' })).toBeNull();
@@ -341,6 +374,96 @@ describe('land-human-only — the operator credential', () => {
 });
 
 describe('land-human-only — the reader', () => {
+  // Leave clone and canonical at their factory defaults. No real git/gh process is launched.
+  function checkoutTransport({ origin = 'git@github.com:old-owner/r.git', canonical = repo, missingHead = false } = {}) {
+    return vi.fn((bin, args, opts) => {
+      if (bin === 'git') {
+        if (args[0] === '-C' && args.includes('--show-toplevel')) return '/lane\n';
+        if (args[0] === '-C' && args.includes('get-url')) return origin;
+        expect(opts.cwd).toBe('/lane');
+        if (args[0] === 'fetch') {
+          expect(args).toContain(head);
+          return '';
+        }
+        if (args[0] === 'cat-file') {
+          expect(args).toEqual(['cat-file', '-e', `${head}^{commit}`]);
+          if (missingHead) throw new Error('pinned commit unavailable');
+        }
+        throw new Error(`unexpected git ${args.join(' ')}`);
+      }
+      expect(bin).toBe('gh');
+      if (args[0] === 'pr') return JSON.stringify({ ...read().pr, headRefOid: head, isCrossRepository: false,
+        labels: [{ name: 'ready-to-merge' }] });
+      if (args[0] === 'repo') return JSON.stringify({ defaultBranchRef: { name: 'main' } });
+      if (args.includes('.full_name')) {
+        expect(args).toEqual(['api', '--hostname', 'github.com', 'repos/old-owner/r', '-q', '.full_name']);
+        if (canonical === null) throw new Error('canonical lookup unavailable');
+        return canonical;
+      }
+      if (args.join(' ').includes('isInMergeQueue')) return JSON.stringify({ data: { repository: {
+        pullRequest: { isInMergeQueue: false, headRefOid: head },
+      } } });
+      // The default gatherer also reads a legacy manifest and body history; neither is needed for these refusals.
+      if (args[0] === 'api') return '{}';
+      throw new Error(`unexpected gh ${args.join(' ')}`);
+    });
+  }
+  const localFacts = { loadPolicy: () => null, redMainOf: () => null, mainCiOf: () => null,
+    ledgerConfigOf: () => ({ authority: 'labels' }), blockOnCodeQLOf: () => true, warn: () => {} };
+
+  it('reads the human-only surface and gate rows through the default clone and canonical resolver', () => {
+    const exec = checkoutTransport();
+    const gateRows = [{ id: 'candidate-label', status: 'pass', reason: 'ok' }];
+    const gather = vi.fn(() => ({ gatePaths: { files: ['.github/workflows/ci.yml'] } }));
+    const context = createLandHumanOnlyReader({ exec, credential: cred, requiredChecks: () => [], ...localFacts,
+      gather, evaluate: () => ({ results: gateRows }) })({ repo, pr: 7 });
+    expect(gather).toHaveBeenCalledWith(expect.objectContaining({ cwd: '/lane', exec, expectedHeadSha: head }));
+    expect(exec.mock.calls.some(([bin, args]) => bin === 'git' && args.includes('get-url'))).toBe(true);
+    expect(exec.mock.calls.some(([bin, args]) => bin === 'gh' && args.includes('.full_name'))).toBe(true);
+    expect(context.surface).toMatchObject({ hold: true, humanOnly: true });
+    expect(context.gateRows).toEqual(gateRows);
+    expect(context.gateRowsError).toBeNull();
+  });
+
+  it('reports default clone refusal reasons when the canonical lookup fails', () => {
+    const exec = checkoutTransport({ canonical: null });
+    const gather = vi.fn();
+    const context = createLandHumanOnlyReader({ exec, credential: cred, requiredChecks: () => [], gather })({ repo, pr: 7 });
+    expect(context.surface.error).toContain('origin old-owner/r is not o/r, and GitHub\'s canonical name for it could not be read');
+    expect(context.gateRowsError).toBe(context.surface.error);
+    expect(context.gateRows).toBeNull();
+    expect(gather).not.toHaveBeenCalled();
+  });
+
+  it('keeps a token-bearing origin out of the reader context and rendered refusal', async () => {
+    const exec = checkoutTransport({ origin: 'https://x-access-token:origin-secret@github.com/o/r.git' });
+    const reader = createLandHumanOnlyReader({ exec, credential: cred, requiredChecks: () => [] });
+    const context = reader({ repo, pr: 7 });
+    expect(context.surface.error).toContain('/lane: origin is not a github.com owner/name');
+    expect(context.gateRowsError).toBe(context.surface.error);
+    expect(JSON.stringify(context)).not.toContain('origin-secret');
+    const registry = createRegistry();
+    registry.register(landHumanOnlyOperation({ readLandContext: reader }));
+    const write = vi.fn();
+    const outcome = await driveRun({ registry, store: { write: () => {} }, sinks: { [LAND_HUMAN_ONLY_EFFECT]: write },
+      run: startRun({ op: 'land-human-only', id: 'secret-origin', input: input(), registry }) });
+    expect(String(outcome.error?.message ?? outcome.error)).toContain('origin is not a github.com owner/name');
+    expect(JSON.stringify(outcome)).not.toContain('origin-secret');
+    expect(renderOutcome({ outcome }).lines.join('\n')).not.toContain('origin-secret');
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  it('refuses a resolved legacy-origin checkout when the pinned head is unavailable', () => {
+    const exec = checkoutTransport({ missingHead: true });
+    // Keep the real default gatherer and evaluator, including readPinnedChangedFiles and its cat-file probe.
+    const context = createLandHumanOnlyReader({ exec, credential: cred, requiredChecks: () => [], ...localFacts })({ repo, pr: 7 });
+    expect(exec.mock.calls.some(([bin, args]) => bin === 'gh' && args.includes('.full_name'))).toBe(true);
+    expect(exec.mock.calls.filter(([bin, args]) => bin === 'git' && args[0] === 'cat-file')).toHaveLength(2);
+    expect(context.surface).toMatchObject({ hold: true, humanOnly: false, error: expect.stringContaining('pinned commit unavailable') });
+    expect(context.gateRows.some((row) => row.status === 'fail-closed')).toBe(true);
+    expect(() => planLandHumanOnly(context, input())).toThrow(/change list unreadable/);
+  });
+
   async function runWithCeremony(clearedHead) {
     const live = { number: 7, state: 'OPEN', isDraft: false, baseRefName: 'main', headRefOid: head,
       body: 'Land the approved workflow update.', title: 'Workflow update', headRefName: 'lane/workflow',
