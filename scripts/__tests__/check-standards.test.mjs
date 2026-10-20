@@ -520,10 +520,15 @@ describe('#3337 scope entry basename matches a tracked file at a different path'
     const index = buildTrackedPathIndex(tracked);
     const dir = join(ROOT, 'backlog');
     let total = 0;
+    let checked = 0; // `we:` scope entries on live (non-terminal, un-rationaled) cards — the predicate's input
     for (const file of readdirSync(dir).filter((f) => f.endsWith('.md'))) {
       let data;
       try { data = matter(readFileSync(join(dir, file), 'utf8')).data; } catch { continue; }
       if (data?.scope === undefined) continue;
+      const rationale = typeof data.scopeRationale === 'string' && data.scopeRationale.trim();
+      if (Array.isArray(data.scope) && !['resolved', 'closed'].includes(data.status) && !rationale) {
+        checked += data.scope.filter((e) => typeof e === 'string' && e.startsWith('we:')).length;
+      }
       for (const f of scopeBasenameMismatches(data, index)) {
         total++;
         expect(data.status, `${file} flagged but resolved`).not.toBe('resolved');
@@ -535,8 +540,14 @@ describe('#3337 scope entry basename matches a tracked file at a different path'
       }
     }
     // The rule must stay a needle, not a firehose: a corpus-wide count in the hundreds would drown the
-    // gate's existing warnings rather than add to them. It was 4 when this landed.
-    expect(total).toBeLessThan(30);
+    // gate's existing warnings rather than add to them. It was 4 when this landed. The bound is a RATE over
+    // the entries the predicate checks, not a fixed total: the corpus grew ~12x (626 → 7374 checked entries,
+    // 2026-08-26 → 2026-10-20) while the rate held at 0.4–0.65%, so a fixed `< 30` turned every new card with
+    // one stale scope path into a red merge group for unrelated PRs (2026-10-20, 29 on main). A firehose — the
+    // predicate flagging a real share of entries — still fails at 1%; below 3000 checked entries the bound is
+    // exactly the original `< 30`, so a small corpus is held no looser than before.
+    expect(checked).toBeGreaterThan(0);
+    expect(total, `${total} findings over ${checked} checked scope entries`).toBeLessThan(Math.max(30, checked * 0.01));
   });
 
   // ── #3337 wiring: §6d-septies must call the SHIPPED function, not re-derive it inline ──────────
