@@ -612,9 +612,12 @@ function runInherited(env, reason) {
 
 // \`gh auth status\` also validates every stored account (TokenForUser) and every configured host
 // unless --active and --hostname narrow it. A daemon spending App credentials checks only the active
-// github.com token, which GH_TOKEN supplies. Appended last so a user's --active=false cannot win.
+// github.com token, which GH_TOKEN supplies. Placed after every flag (but before a \`--\`) so a user's
+// --active=false cannot win.
 function appTokenArgv(argv) {
-  return DAEMON && argv[0] === 'auth' && argv[1] === 'status' ? [...argv, '--active', '--hostname', 'github.com'] : argv;
+  if (!DAEMON || argv[0] !== 'auth' || argv[1] !== 'status') return argv;
+  const end = argv.indexOf('--') === -1 ? argv.length : argv.indexOf('--');
+  return [...argv.slice(0, end), '--active', '--hostname', 'github.com', ...argv.slice(end)];
 }
 
 // These Apps and their provenance are scoped to github.com. Enterprise gh selects a different
@@ -632,7 +635,14 @@ function unsupportedTargetHost(argv, env) {
   // Other auth commands read, write or validate stored per-account credentials (git-credential also
   // takes its host from stdin). \`auth status\` is pinned to the active App token by appTokenArgv.
   if (argv[0] === 'auth' && argv[1] !== undefined && !['status', 'token'].includes(argv[1])) return 'auth ' + argv[1] + ' uses stored credentials';
-  if (argv[0] === 'auth' && argv[1] === 'token' && argv.some((a) => a === '--user' || a.startsWith('--user=') || /^-u/.test(a))) return 'stored account token';
+  // \`auth token\` prints the active (App env) token; --user and the hidden --secure-storage read the
+  // keyring instead. Allow only the hostname flag, whose value the scan below checks.
+  if (argv[0] === 'auth' && argv[1] === 'token') {
+    for (let i = 2; i < argv.length; i++) {
+      if (argv[i] === '-h' || argv[i] === '--hostname') i++;
+      else if (!/^-h|^--hostname=/.test(argv[i])) return 'auth token ' + argv[i] + ' reads stored credentials';
+    }
+  }
   const repoHost = (value, api = false) => {
     const s = String(value || '');
     if (/^[a-z][a-z0-9+.-]*:[/][/]/i.test(s)) {
@@ -689,7 +699,7 @@ function unsupportedTargetHost(argv, env) {
   // The positionals gh parses as [HOST/]OWNER/REPO (ghrepo.FromFullName). Every other positional is a
   // local path, branch, tag or name, so a dotted directory like build.v1/app.tar.gz selects no host.
   const repositoryPositionals = (argv[0] === 'repo' && ['archive', 'clone', 'create', 'credits', 'delete', 'edit',
-    'fork', 'rename', 'set-default', 'sync', 'unarchive', 'view'].includes(subcommand))
+    'fork', 'garden', 'rename', 'set-default', 'sync', 'unarchive', 'view'].includes(subcommand))
     || ['label clone', 'extension install', 'ext install', 'issue transfer'].includes(command);
   if (['extension install', 'ext install'].includes(command)) valueFlags.add('--pin');
   // --template is output content elsewhere, but repo create uses it as a source repository.
@@ -738,8 +748,9 @@ function unsupportedTargetHost(argv, env) {
           consumed = true;
           break;
         }
-        // auth -h is --hostname. pflag takes the next argument as its value even when it starts with -.
-        if (argv[0] === 'auth' && flag === '-h') {
+        // auth -h is --hostname and config -h is --host. pflag takes the next argument as its value
+        // even when it starts with -.
+        if ((argv[0] === 'auth' || argv[0] === 'config') && flag === '-h') {
           const host = j + 1 < a.length ? a.slice(j + 1).replace(/^=/, '') : argv[++i];
           if (!publicHost(host ?? '')) return host || 'unknown';
           consumed = true;
