@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import { listRunIds, readRun, sharedRunsDir } from '../operations/run-store.mjs';
 import { isCompletedReviewPr } from '../operations/review-pr-completion.mjs';
+import { readMatchingReviewRuns } from './review-run-index.mjs';
 
 const canonical = value => Array.isArray(value) ? value.map(canonical)
   : value && typeof value === 'object'
@@ -18,8 +19,8 @@ export const matchesSavedRedTeamHead = (row, { repo, pr, head }) => sameRepo(row
 export function verifySavedRedTeamProvenance({ repo, pr, head, path, records, index, env, runsDir = savedRedTeamRunsDir(env) }) {
   let reason = 'no completed matching review-pr run reference';
   try {
-    for (const id of listRunIds(runsDir).filter(id => id.startsWith('review-pr-'))) {
-      const run = readRun(id, runsDir);
+    // Indexed scan: the same review-pr records in the same order, each matching one read fresh (not every run per call).
+    for (const { run } of readMatchingReviewRuns({ runsDir, repo, pr, head, list: listRunIds, read: readRun })) {
       if (run.op !== 'review-pr' || !sameRepo(run.input?.repo, repo) || Number(run.input?.pr) !== Number(pr)
         || run.findings?.read?.netBasis?.rev !== head) continue;
       if (!isCompletedReviewPr(run)) { reason = 'review-pr run incomplete'; continue; }

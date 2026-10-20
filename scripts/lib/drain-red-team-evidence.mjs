@@ -9,6 +9,7 @@ import { readSavedRedTeamResult, attemptedRedTeamRun, sameRepo } from './drain-s
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { redTeamEnabled, redTeamOwedFor, redTeamPanelSeatOwed } from './review-red-team-policy.mjs';
 import { readRedTeamProbes } from './red-team-gate.mjs';
+import { readMatchingReviewRuns } from './review-run-index.mjs';
 
 export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDir(env)), 'red-team-status');
 // Slugs and shas are case-insensitive: the writer and the drain must name one file whatever case each was handed.
@@ -44,7 +45,10 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     && noSavedResult;
   // Runs are immutable in identity but updated in place: choose the latest read of this exact repo/PR/head.
   const latestRun = () => {
-    const hits = list(runsDir).filter(id => id.startsWith('review-pr-')).map(id => ({ id, run: read(id, runsDir) }))
+    // Default IO uses the indexed scan (same records, same errors), not a parse of every review-pr run per call.
+    const scanned = list === listRunIds && read === readRun ? readMatchingReviewRuns({ runsDir, repo, pr, head })
+      : list(runsDir).filter(id => id.startsWith('review-pr-')).map(id => ({ id, run: read(id, runsDir) }));
+    const hits = scanned
       .filter(({ run }) => run?.op === 'review-pr' && sameRepo(run.input?.repo, repo) && Number(run.input?.pr) === Number(pr)
         && String(run.findings?.read?.netBasis?.rev ?? '').toLowerCase() === head)
       .map(hit => ({ ...hit, at: statSync(join(runsDir, `${hit.id}.json`)).mtimeMs }));
