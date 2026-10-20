@@ -18,7 +18,7 @@ describe('the reader supplies exactly what the allocator needs', () => {
   it('collects EVERY card id, including resolved ones', () => {
     // Filtering to open items would let the allocator hand back an id a resolved card already owns, and two
     // cards sharing an id is not a state anything downstream untangles.
-    const read = createScaffoldReader({
+    const read = createScaffoldReader({ allocate: () => ({ ok: false, reason: 'test disabled' }), log: () => {},
       root: '/repo',
       listFiles: () => ['001-a.md', '002-b.md', 'xabc-c.md', 'notes.txt', '3201-resolved.md'],
       today: () => '2026-08-21',
@@ -27,14 +27,14 @@ describe('the reader supplies exactly what the allocator needs', () => {
   });
 
   it('ignores non-markdown entries rather than minting ids from them', () => {
-    const read = createScaffoldReader({
+    const read = createScaffoldReader({ allocate: () => ({ ok: false, reason: 'test disabled' }), log: () => {},
       root: '/repo', listFiles: () => ['README', '.gitkeep', '007-x.md'], today: () => '2026-08-21',
     })();
     expect(read.existingIds).toEqual(['007']);
   });
 
   it('reports the backlog dir so the plan can compute an absolute path', () => {
-    const read = createScaffoldReader({ root: '/repo', listFiles: () => [], today: () => '2026-08-21' })();
+    const read = createScaffoldReader({ allocate: () => ({ ok: false, reason: 'test disabled' }), log: () => {}, root: '/repo', listFiles: () => [], today: () => '2026-08-21' })();
     expect(read.dir).toBe('/repo/backlog');
     expect(read.today).toBe('2026-08-21');
   });
@@ -42,7 +42,7 @@ describe('the reader supplies exactly what the allocator needs', () => {
   it('uses the shared wall-clock helper, not a UTC day-slice (#2747)', () => {
     // A hand-rolled UTC ISO slice stamps a day AHEAD of a UTC-behind operator all evening. `check:standards`
     // scans for that shape and caught `resolve-io.mjs` doing exactly it on its first cut.
-    const read = createScaffoldReader({ root: '/r', listFiles: () => [] })();
+    const read = createScaffoldReader({ allocate: () => ({ ok: false, reason: 'test disabled' }), log: () => {}, root: '/r', listFiles: () => [] })();
     expect(read.today).toMatch(/^\d{4}-\d{2}-\d{2}$/);
   });
 });
@@ -78,4 +78,26 @@ describe('the sink writes through the guarded writer and nothing else', () => {
   // adopt here for convenience — or to let it write to a real path, which is not this suite's business. The
   // property is held by the default argument being written down in one place and by the comment beside it
   // saying a caller must never substitute it in production.
+});
+
+describe('number at birth reader to plan', () => {
+  it('writes the final numeric path with a fresh hash only as bornAs', async () => {
+    const { planScaffold, shapeScaffoldRead } = await import('../scaffold.mjs');
+    const raw = createScaffoldReader({ root: '/repo', listFiles: () => [],
+      allocate: () => ({ ok: true, num: '123' }) })();
+    const plan = planScaffold(shapeScaffoldRead(raw), { title: 'New card', kind: 'task' });
+    expect(plan.rel).toBe('backlog/123-new-card.md');
+    expect(plan.content).toMatch(/^bornAs: x[0-9a-z]{6}$/m);
+    expect(plan.content.match(/\bx[0-9a-z]{6}\b/g)).toHaveLength(1);
+  });
+
+  it('warns with the reason and retains legacy hashes on allocation failure', async () => {
+    const { planScaffold } = await import('../scaffold.mjs'); const logs = [];
+    const raw = createScaffoldReader({ root: '/repo', listFiles: () => [],
+      allocate: () => ({ ok: false, reason: 'lock unavailable' }), log: (s) => logs.push(s) })();
+    const plan = planScaffold(raw, { title: 'New card', kind: 'task' });
+    expect(plan.rel).toMatch(/^backlog\/x[0-9a-z]{6}-new-card.md$/);
+    expect(plan.content).not.toContain('bornAs:');
+    expect(logs.join('')).toContain('lock unavailable');
+  });
 });

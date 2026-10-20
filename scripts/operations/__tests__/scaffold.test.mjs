@@ -270,3 +270,8 @@ describe('the declaration end to end', () => {
     expect(() => scaffoldOperation({})).toThrow(/needs a `readScaffoldContext/);
   });
 });
+
+it('refuses an injected numeric allocation already taken, including zero padding', () => {
+  expect(reasonOf(() => planScaffold(read({ existingIds: ['001'], allocatedId: '001' }),
+    { title: 'New', kind: 'task' }))).toBe('id-exhausted');
+});

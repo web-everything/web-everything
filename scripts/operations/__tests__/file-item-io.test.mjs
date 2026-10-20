@@ -23,7 +23,7 @@ import { withRealRepo } from './helpers/real-repo.mjs';
 
 describe('createFileItemReader is scaffold\'s own reader, not a re-derived copy', () => {
   it('collects existing ids exactly like the scaffold reader does', () => {
-    const read = createFileItemReader({
+    const read = createFileItemReader({ allocate: () => ({ ok: false, reason: 'test disabled' }), log: () => {},
       root: '/repo', listFiles: () => ['001-a.md', 'xabc-b.md'], today: () => '2026-08-21',
     })();
     expect(read.existingIds.sort()).toEqual(['001', 'xabc']);
