@@ -14,7 +14,7 @@ function fixture() {
   const state = { seq: 9, batchRef: 'lane/card-batch-prevention-9', headSha: 'a'.repeat(40),
     repo: 'org/repo', kind: 'prevention', sealedAt: '2026-10-18T12:00:00Z', pr: 272, seal: { step: 'label-on-green' }, members: [] };
   writeFileSync(path, JSON.stringify(state));
-  return { stateDir, path, state, seal: vi.fn(async () => []), drain: vi.fn(), log: () => {}, loadFilingSettings: () => ({ filingEnabled: true }) };
+  return { stateDir, path, state, seal: vi.fn(async () => []), drain: vi.fn(), startDrain: vi.fn(async () => []), log: () => {}, loadFilingSettings: () => ({ filingEnabled: true }) };
 }
 
 describe('reconcileCardBatches', () => {
@@ -53,18 +53,13 @@ describe('reconcileCardBatches', () => {
     expect(JSON.parse(readFileSync(f.path))).toMatchObject({ seq: 9, lastSealedState: expect.any(String) });
     expect(f.seal).toHaveBeenCalledOnce();
   });
-  it('drains an open slot using the scoped state directory and then flushes', async () => {
+  it('launches the background drain for an open slot with the scoped state directory and then flushes', async () => {
     const f = fixture(); writeFileSync(f.path, JSON.stringify({ seq: 9, lastSealedState: 'archive' }));
     mkdirSync(join(f.stateDir, 'pending-prevention')); writeFileSync(join(f.stateDir, 'pending-prevention/card.json'), '{}');
-    const batch = vi.fn();
-    f.drain.mockImplementation(async (input, options) => {
-      expect(input.drainPending).toBe(true);
-      await options.batch({ cardPath: 'backlog/card.md' }, {});
-      expect(f.seal).not.toHaveBeenCalled();
-      return { ok: true };
-    });
-    await reconcileCardBatches({ ...f, batch });
-    expect(batch).toHaveBeenCalledWith({ cardPath: 'backlog/card.md' }, { stateDir: f.stateDir });
+    await reconcileCardBatches(f);
+    expect(f.startDrain).toHaveBeenCalledOnce();
+    expect(f.startDrain.mock.calls[0][0]).toMatchObject({ stateDir: f.stateDir, launch: true });
+    expect(f.drain).not.toHaveBeenCalled();
     expect(f.seal).toHaveBeenCalledOnce();
   });
   it('dry-run leaves state and leases untouched and does not invoke external operations', async () => {
@@ -74,7 +69,7 @@ describe('reconcileCardBatches', () => {
     finally { output.mockRestore(); }
     expect(readFileSync(f.path, 'utf8')).toBe(before);
     expect(existsSync(`${f.path}.lock`)).toBe(false);
-    for (const fn of [gh, f.seal, f.drain]) expect(fn).not.toHaveBeenCalled();
+    for (const fn of [gh, f.seal, f.drain, f.startDrain]) expect(fn).not.toHaveBeenCalled();
   });
 });
 
@@ -84,13 +79,13 @@ it.each([undefined, null, 0, -1, 1.5, '10', 5, 12])('reads interval %s with posi
 });
 
 
-it('reports drain and seal failures independently', async () => {
+it('reports drain-job and seal failures independently', async () => {
   const f = fixture(); writeFileSync(f.path, JSON.stringify({ seq: 9 }));
   mkdirSync(join(f.stateDir, 'pending-prevention')); writeFileSync(join(f.stateDir, 'pending-prevention/card.json'), '{}');
-  f.drain.mockResolvedValue({ ok: false, reason: 'lane unavailable' });
+  f.startDrain.mockResolvedValue([{ action: 'error', step: 'drain', reason: 'drain job failed: lane unavailable' }]);
   f.seal.mockRejectedValue(Error('seal failed'));
   expect(await reconcileCardBatches(f)).toEqual([
-    { action: 'error', step: 'drain', reason: 'lane unavailable' },
+    { action: 'error', step: 'drain', reason: 'drain job failed: lane unavailable' },
     { action: 'error', step: 'seal', reason: 'seal failed' },
   ]);
 });
@@ -99,7 +94,7 @@ it('skips the pending drain while filing is paused and reports a paused state, n
   const f = fixture(); writeFileSync(f.path, JSON.stringify({ seq: 9 }));
   mkdirSync(join(f.stateDir, 'pending-prevention')); writeFileSync(join(f.stateDir, 'pending-prevention/card.json'), '{}');
   const results = await reconcileCardBatches({ ...f, loadFilingSettings: () => ({ filingEnabled: false }) });
-  expect(f.drain).not.toHaveBeenCalled();
+  expect(f.startDrain).toHaveBeenCalledWith(expect.objectContaining({ launch: false }));
   expect(results).toEqual([{ action: 'paused', step: 'drain', reason: 'prevention filing paused by prevention.filingEnabled' }]);
   expect(results.some(result => result.action === 'error')).toBe(false);
   expect(f.seal).toHaveBeenCalledOnce();
@@ -110,11 +105,22 @@ it('stays quiet when filing is paused and nothing is pending', async () => {
   expect(await reconcileCardBatches({ ...f, loadFilingSettings: () => ({ filingEnabled: false }) })).toEqual([]);
 });
 
-it('still reports a real drain failure as an error when filing is enabled', async () => {
+it('reports a startDrain throw as a drain error', async () => {
   const f = fixture(); writeFileSync(f.path, JSON.stringify({ seq: 9 }));
   mkdirSync(join(f.stateDir, 'pending-prevention')); writeFileSync(join(f.stateDir, 'pending-prevention/card.json'), '{}');
-  f.drain.mockRejectedValue(Error('boom'));
+  f.startDrain.mockRejectedValue(Error('boom'));
   expect(await reconcileCardBatches(f)).toEqual([{ action: 'error', step: 'drain', reason: 'boom' }]);
+});
+
+it('never awaits the drain itself: the tick returns while the job is still running', async () => {
+  const f = fixture(); writeFileSync(f.path, JSON.stringify({ seq: 9 }));
+  mkdirSync(join(f.stateDir, 'pending-prevention')); writeFileSync(join(f.stateDir, 'pending-prevention/card.json'), '{}');
+  f.startDrain.mockResolvedValue([{ action: 'running', step: 'drain', reason: 'drain running since T' }]);
+  const started = Date.now();
+  const results = await reconcileCardBatches(f);
+  expect(Date.now() - started).toBeLessThan(2000);
+  expect(results.some(result => result.action === 'error')).toBe(false);
+  expect(f.drain).not.toHaveBeenCalled();
 });
 
 it('defaults the interval when settings cannot be read', () => {

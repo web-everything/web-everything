@@ -9,6 +9,7 @@ import { runApprovalPreventionFiling } from '../../review-set-label.mjs';
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { drainInline } from '../../operations/card-batch-drain-io.mjs';
 import { reconcileCardBatches } from '../../operations/card-batch-reconcile.mjs';
 let stateDir;
 beforeEach(() => { stateDir = mkdtempSync(join(tmpdir(), 'owed-prevention-')); vi.stubEnv('WE_CARD_BATCH_STATE_DIR', stateDir); });
@@ -76,9 +77,9 @@ it('records one durable obligation across pauses, retries failure, and completes
   expect(await landPreventionCard({ ...input, session: 'another' }, options)).toMatchObject({ ok: false, step: 'paused' });
   expect(readFileSync(path, 'utf8')).toBe(original);
   const fileOwed = vi.fn(async () => ({ ok: false, reason: 'unavailable' }));
-  await reconcileCardBatches({ stateDir, fileOwed, loadFilingSettings: paused, seal: async () => [] });
+  await reconcileCardBatches({ stateDir, fileOwed, loadFilingSettings: paused, seal: async () => [], startDrain: drainInline });
   expect(fileOwed).not.toHaveBeenCalled();
-  const tick = { stateDir, fileOwed, loadFilingSettings: () => ({ filingEnabled: true }), seal: async () => [] };
+  const tick = { stateDir, fileOwed, loadFilingSettings: () => ({ filingEnabled: true }), seal: async () => [], startDrain: drainInline };
   await reconcileCardBatches(tick);
   expect(JSON.parse(readFileSync(path)).status).toBe('owed');
   fileOwed.mockResolvedValue({ ok: true, step: 'batched', rel: 'backlog/guard.md' });
@@ -127,7 +128,7 @@ it('carries the original owed identity across CLI text bounding and keeps source
   expect(parsed.owedKey).toMatch(/^[a-f0-9]{64}$/);
   expect(JSON.parse(readFileSync(join(stateDir, 'owed-prevention', `${parsed.owedKey}.json`))).input.retractTo.pr).toBe(42);
   const fileOwed = vi.fn(async () => ({ ok: true }));
-  await reconcileCardBatches({ stateDir, fileOwed, loadFilingSettings: () => ({ filingEnabled: true }), seal: async () => [] });
+  await reconcileCardBatches({ stateDir, fileOwed, loadFilingSettings: () => ({ filingEnabled: true }), seal: async () => [], startDrain: drainInline });
   expect(fileOwed).toHaveBeenCalledWith(expect.objectContaining({
     retract: filing.retractTo, owedKey: parsed.owedKey,
   }), expect.any(Object));

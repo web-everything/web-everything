@@ -10,6 +10,7 @@ import { setTimeout } from 'node:timers/promises';
 import { loadCardBatchPolicy } from '../../lib/card-batch-policy.mjs';
 import { admitCard, gitIn } from '../card-batch-io.mjs';
 import * as batchIO from '../card-batch-io.mjs';
+import { drainInline } from '../card-batch-drain-io.mjs';
 import { reconcileCardBatches } from '../card-batch-reconcile.mjs';
 import { drainPendingPrevention } from '../land-prevention-card.mjs';
 
@@ -750,6 +751,7 @@ describe('periodic terminal batch recovery with real Git', () => {
     let flushed = false;
     const results = await reconcileCardBatches({ ...f.options, laneDir: f.laneDir, now: f.now(),
       gh: async () => JSON.stringify({ number: 5272, headRefName: 'lane/card-batch-prevention-1', state: status }), log: () => {},
+      startDrain: drainInline,
       drain: async (input, options) => {
         expect(input.drainPending).toBe(true);
         expect(f.state()).toMatchObject({ seq: 1, lastSealedState: expect.any(String) });
