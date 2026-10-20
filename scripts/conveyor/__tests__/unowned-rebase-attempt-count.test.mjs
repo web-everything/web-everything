@@ -6,7 +6,8 @@
  */
 import { describe, it, expect } from 'vitest';
 import { rebaseDropManifest } from '../../lib/rebase-drop-manifest.mjs';
-import { UNOWNED_REBASE_INFRA_MARKER, UNOWNED_REBASE_INFRA_RETRY_CAP_DEFAULT, formatUnownedRebaseInfraMarker, shouldCountRebaseInfra, countUnownedRebaseInfraFailures, countUnownedRebaseAttempts, UNOWNED_REBASE_ATTEMPT_MARKER, UNOWNED_REBASE_ATTEMPT_CAP, shouldCountRebaseAttempt, formatUnownedRebaseAttemptMarker, loadUnownedRebaseSettings } from '../unowned-rebase-attempt-count.mjs';
+import { UNOWNED_REBASE_INFRA_MARKER, UNOWNED_REBASE_INFRA_RETRY_CAP_DEFAULT, formatUnownedRebaseInfraMarker, shouldCountRebaseInfra, countUnownedRebaseInfraFailures, countUnownedRebaseAttempts, UNOWNED_REBASE_ATTEMPT_MARKER, UNOWNED_REBASE_ATTEMPT_CAP, shouldCountRebaseAttempt, formatUnownedRebaseAttemptMarker, loadUnownedRebaseSettings, grantedRebaseCap } from '../unowned-rebase-attempt-count.mjs';
+import { buildRoundExtensionComment } from '../round-extension-mark.mjs';
 
 const AUTOMATION = { login: 'web-everything' };
 
@@ -222,5 +223,29 @@ describe('separate infrastructure retry budget', () => {
       env: { WE_UNOWNED_REBASE_INFRA_RETRY_CAP: '1.5' } });
     expect(settings.value.infraRetryCap).toBe(4);
     expect(settings.sources.infraRetryCap).toBe('platform');
+  });
+});
+
+describe('grantedRebaseCap — operator round grants reach the rebase caps (#5716)', () => {
+  const repo = 'web-everything/web-everything';
+  const attempt = { body: `${UNOWNED_REBASE_ATTEMPT_MARKER} outcome=skip:conflict`, author: AUTOMATION };
+  const grant = (login, by = 1) => ({ author: { login }, body: buildRoundExtensionComment({ repo, pr: 5716, by, actor: 'chalbert',
+    channel: 'claude-code-chat', reason: 'one more attempt', at: '2026-10-20T20:58:54Z' }) });
+  const count = (c) => countUnownedRebaseAttempts(c);
+  it('no grant leaves the base cap', () => {
+    expect(grantedRebaseCap(3, [attempt, attempt, attempt], count, { repo, pr: 5716 })).toEqual({ cap: 3, grants: 0 });
+  });
+  it('a grant is "N more from when it was posted", not "N more than the base"', () => {
+    const thread = [...Array(5).fill(attempt), grant('chalbert')];
+    expect(grantedRebaseCap(3, thread, count, { repo, pr: 5716 }).cap).toBe(6);
+    expect(grantedRebaseCap(3, [...thread, attempt, grant('chalbert', 2)], count, { repo, pr: 5716 }).cap).toBe(8);
+  });
+  it('a grant from a non-operator, or for another PR, never counts', () => {
+    expect(grantedRebaseCap(3, [attempt, attempt, attempt, grant('someone')], count, { repo, pr: 5716 }).cap).toBe(3);
+    expect(grantedRebaseCap(3, [attempt, attempt, attempt, grant('chalbert')], count, { repo, pr: 9999 }).cap).toBe(3);
+  });
+  it('an automation-posted grant counts only under a verified standing-ruling scope', () => {
+    const auto = { ...grant('web-everything'), author: AUTOMATION };
+    expect(grantedRebaseCap(3, [attempt, attempt, attempt, auto], count, { repo, pr: 5716, standingRuling: null }).cap).toBe(3);
   });
 });
