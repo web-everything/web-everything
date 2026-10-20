@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, breakClass, gateOutcomeForHead, gateOutcomesForHead, parseRedTeamComment, planRedTeamActions,
-  resolveRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamQueueReason, redTeamRulingNeeded, resolveConfirmedBreaks,
+  resolveRedTeamProbes, redTeamForHead, gateRoundCap, sendBackStepState, redTeamGateMarker, redTeamQueueReason, redTeamRulingNeeded, resolveConfirmedBreaks,
 } from '../red-team-gate.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 
@@ -210,5 +210,30 @@ describe('red-team probe policy cascade', () => {
     expect(resolveRedTeamProbes({ platform: { skipCardOnly: false }, file: { redTeam: { skipCardOnly: 'yes' } },
       env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'maybe' } })).toMatchObject({ value: { skipCardOnly: false }, sources: { skipCardOnly: 'platform' },
       invalid: ['tool.skipCardOnly="yes"', 'env.skipCardOnly="maybe"'] });
+  });
+});
+
+describe('gateRoundCap — operator grants anchored at the grant round (same as fix dispatch)', () => {
+  it('no grant is the base cap', () => expect(gateRoundCap({ cap: 5 })).toBe(5));
+  it('--by=1 at round 12 is round 13; the additive floor never lowers it', () => {
+    expect(gateRoundCap({ cap: 5, grants: [{ by: 1, at: 't' }], roundAt: () => 12 })).toBe(13);
+    expect(gateRoundCap({ cap: 5, grants: [{ by: 1, at: 't' }], roundAt: () => 2 })).toBe(6);
+  });
+  it('an unreadable grant round counts only additively', () => {
+    expect(gateRoundCap({ cap: 5, grants: [{ by: 2, at: 't' }], roundAt: () => null })).toBe(7);
+  });
+});
+
+describe('sendBackStepState — a grant after the cap reopens the send-back step', () => {
+  const rec = (outcome, at) => ({ at, i: at, ts: 0, gate: { outcome } });
+  it('raced records without a grant: the cap wins either way', () => {
+    expect(sendBackStepState([rec('sent-back', 1), rec('round-cap', 2)])).toEqual({ outcome: 'round-cap', reopened: false });
+    expect(sendBackStepState([rec('round-cap', 1), rec('sent-back', 2)])).toEqual({ outcome: 'round-cap', reopened: false });
+  });
+  it('a grant after the cap reopens; a send-back after the grant stands; a later cap closes again', () => {
+    expect(sendBackStepState([rec('round-cap', 1)], [2])).toEqual({ outcome: 'round-cap', reopened: true });
+    expect(sendBackStepState([rec('round-cap', 1), rec('sent-back', 3)], [2])).toEqual({ outcome: 'sent-back', reopened: false });
+    expect(sendBackStepState([rec('round-cap', 1), rec('round-cap', 3)], [2])).toEqual({ outcome: 'round-cap', reopened: false });
+    expect(sendBackStepState([rec('round-cap', 2)], [1])).toEqual({ outcome: 'round-cap', reopened: false });
   });
 });

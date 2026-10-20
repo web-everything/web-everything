@@ -39,15 +39,17 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  GATE_OUTCOMES, liveResultGateState, planRedTeamActions, readConfirmedBreaks, redTeamGateMarker, sendBackStepOutcome,
+  GATE_OUTCOMES, gateRoundCap, liveResultGateState, planRedTeamActions, readConfirmedBreaks, redTeamGateMarker,
 } from '../lib/red-team-gate.mjs';
+import { roundExtensionGrants } from '../conveyor/round-extension-mark.mjs';
+import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 import { cleanFindingFile, qualifyLocusRefs, sanitizeCardField } from '../lib/review-loop-policy.mjs';
 import { IN_REPO_LOCUS } from '../lib/citation-check.mjs';
 import { DEFAULT_ROUND_CAP } from '../lib/jury-core.mjs';
 import { ACTOR_ENV } from '../lib/review-independence.mjs';
 import { EVENT_TYPES, buildLedgerEvent } from '../lib/verdict-ledger.mjs';
 import { spawnPreventionLandingJob } from '../lib/prevention-landing-job.mjs';
-import { readReviewRound } from './review-pr-io.mjs';
+import { readReviewRound, readReviewRoundAsOf } from './review-pr-io.mjs';
 import { appendLedgerEvents } from './record-referral-ruling-io.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 
@@ -98,11 +100,11 @@ export function buildSendBackArgv({ repo, pr, bodyPath }) {
 }
 
 /** The gate's own record for ONE action on the head. PURE. */
-export function buildGateComment({ pr, head, outcome, plan, round, result = null, cardResult = null, sendBackResult = null }) {
+export function buildGateComment({ pr, head, outcome, plan, round, result = null, cardResult = null, sendBackResult = null, cap = DEFAULT_ROUND_CAP }) {
   const lines = [redTeamGateMarker(pr, head, outcome, result),`**Red-team gate** (setting \`redTeam.confirmedBreaks\`, card x1b8hlo) on head \`${String(head).slice(0, 12)}\`:`];
   if (plan.sendBack.length) {
     lines.push(outcome === GATE_OUTCOMES.ROUND_CAP
-      ? `- ${plan.sendBack.length} confirmed break(s) NOT sent back: ${Number.isInteger(round) ? `review round ${round} has reached the round cap (${DEFAULT_ROUND_CAP})` : 'the review round could not be read, which counts as the round cap'}. The operator rules on them (${plan.sendBack.map(f => `#${f.index}`).join(', ')}).`
+      ? `- ${plan.sendBack.length} confirmed break(s) NOT sent back: ${Number.isInteger(round) ? `review round ${round} has reached the round cap (${cap})` : 'the review round could not be read, which counts as the round cap'}. The operator rules on them (${plan.sendBack.map(f => `#${f.index}`).join(', ')}).`
       : `- ${plan.sendBack.length} confirmed break(s) sent back to the fixer (${plan.sendBack.map((f) => `#${f.index}`).join(', ')})${sendBackResult?.already ? ' — the PR was already under review:changes' : ''}.`);
   }
   if (plan.card.length) {
@@ -133,32 +135,42 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
     const head = String(view?.headRefOid ?? '').toLowerCase();
     // The live head's latest result, and only the records that decide THAT result (an earlier same-head result's
     // records never dedup a newer one, PR #5482).
-    const { result: parsed, resultId, outcomes: recorded } = liveResultGateState(view?.comments, pr, head);
+    // Standing-ruling grants count only under the scope verified from GitHub at THIS read (the shared trusted reader).
+    let standingRuling = null;
+    try { standingRuling = io.standingRuling?.({ repo, pr, comments: view?.comments }) ?? null; } catch { standingRuling = null; }
+    const { result: parsed, resultId, outcomes: recorded, sendBackOutcome, reopened } = liveResultGateState(view?.comments, pr, head, repo, standingRuling);
     if (!parsed) return { status: 'no-red-team-on-head', head };
     const setting = io.readSetting();
     const plan = planRedTeamActions(parsed, setting.value);
     if (!plan.sendBack.length && !plan.card.length) return { status: 'advisory-only', head, plan };
     // One record per ACTION (see the header): what is already recorded for this result is not repeated, what is not stays pending.
-    const priorSend = sendBackStepOutcome(recorded);
-    const sendPending = plan.sendBack.length > 0 && !priorSend;
+    const priorSend = sendBackOutcome;
+    // A `round-cap` record is re-decided once when the operator granted rounds after it (extend-rounds): the grant
+    // may cover this round. The re-decision records again, so the same grant never reopens the step twice.
+    const sendPending = plan.sendBack.length > 0 && (!priorSend || reopened);
     const cardPending = plan.card.length > 0 && !recorded.has(GATE_OUTCOMES.CARD_QUEUED);
     if (!dryRun && priorSend === GATE_OUTCOMES.SENT_BACK && sendBackReason(view.labels)) io.dequeueSentBack({ repo, pr, reason: 'post-accept red team sent back to review:changes' });
     if (!sendPending && !cardPending) return { status: 'already-acted', head, outcome: priorSend ?? GATE_OUTCOMES.CARD_QUEUED, plan };
     const round = sendPending ? io.readRound({ repo, pr, head }) : null;
+    // The operator's audited grants raise the cap with the same grant-time anchor fix dispatch uses.
+    const grants = sendPending ? roundExtensionGrants(view?.comments, { repo, pr, standingRuling }) : [];
+    const effectiveCap = gateRoundCap({ cap, grants, roundAt: (at) => {
+      try { return io.readRoundAsOf?.({ repo, pr, at }) ?? null; } catch { return null; }
+    } });
     // The round is the only bound on send-backs, so an unreadable one is the cap (the operator rules), never "round 1".
-    const capped = sendPending && (!Number.isInteger(round) || round >= cap);
+    const capped = sendPending && (!Number.isInteger(round) || round >= effectiveCap);
     const outcome = !plan.sendBack.length ? GATE_OUTCOMES.NOTHING_TO_SEND
       : !sendPending ? priorSend : capped ? GATE_OUTCOMES.ROUND_CAP : GATE_OUTCOMES.SENT_BACK;
     const labels = (view.labels ?? []).map((l) => (typeof l === 'string' ? l : l?.name));
     const sendBody = sendPending && !capped ? buildSendBackBody({ pr, head, findings: plan.sendBack }) : null;
     const cardInput = cardPending ? buildRedTeamCardInput({ repo, pr, head, findings: plan.card }) : null;
     if (dryRun) {
-      return { status: 'dry-run', head, round, outcome, plan, wouldSendBack: sendPending && outcome === GATE_OUTCOMES.SENT_BACK, sendBody, cardInput, setting };
+      return { status: 'dry-run', head, round, cap: sendPending ? effectiveCap : null, reopened, outcome, plan, wouldSendBack: sendPending && outcome === GATE_OUTCOMES.SENT_BACK, sendBody, cardInput, setting };
     }
     let sendBackResult = null;
     let marker = null;
     const record = (recordOutcome, recordPlan, extra = {}) => {
-      try { io.postComment({ repo, pr, body: buildGateComment({ pr, head, outcome: recordOutcome, plan: recordPlan, round, result: resultId, ...extra }) }); return 'posted'; }
+      try { io.postComment({ repo, pr, body: buildGateComment({ pr, head, outcome: recordOutcome, plan: recordPlan, round, result: resultId, cap: effectiveCap, ...extra }) }); return 'posted'; }
       catch (e) { return `error: ${String(e?.message ?? e).slice(0, 200)}`; }
     };
     if (sendPending) {
@@ -219,6 +231,7 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
   };
   const safety = readDrainQueueSafety({ env, log: line => process.stderr.write(`${line}\n`) });
   return {
+    standingRuling: ({ repo, pr, comments }) => standingRulingScope({ repo, pr: { number: Number(pr), comments } }),
     syncStatusLabels: ({ repo, pr, head }) => head ? syncRedTeamStatusLabels({ repo, pr, head, env,
       log: line => process.stderr.write(`${line}\n`) }) : null,
     signalFix: signalFixDispatch,
@@ -230,6 +243,7 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
     }),
     readSetting: () => readConfirmedBreaks({ env }),
     readRound: ({ repo, pr, head }) => readReviewRound({ repo, pr, head }),
+    readRoundAsOf: ({ repo, pr, at }) => readReviewRoundAsOf({ repo, pr, at }),
     // The live head, read fresh and alone (the PR view above can be minutes old by the time a slow step finishes).
     readHead: ({ repo, pr }) => String(JSON.parse(gh(['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'])).headRefOid ?? ''),
     sendBack: ({ repo, pr, body }) => {
