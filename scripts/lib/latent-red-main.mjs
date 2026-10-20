@@ -49,13 +49,24 @@ const MAX_RUN_PAGES = 5;
  * pages (bounded) until `limit` CI rows are collected or the list ends. Throws on an unreadable read and when the
  * page budget runs out first (fail closed: an incomplete sample is never returned as complete).
  */
+/**
+ * PURE: the configured workflow (a file name like `ci.yml`, a full `.github/workflows/ci.yml` path, or a workflow
+ * NAME like `CI`, all of which `gh run list --workflow` accepts) → a REST row matcher.
+ */
+export function workflowMatcher(workflow = CI_WORKFLOW_PATH) {
+  const w = String(workflow ?? '').trim();
+  if (w.startsWith('.github/workflows/')) return (r) => r?.path === w;
+  if (/\.ya?ml$/i.test(w) && !w.includes('/')) return (r) => r?.path === `.github/workflows/${w}`;
+  return (r) => typeof r?.name === 'string' && r.name === w;
+}
 export function listCiRuns({ repo, exec, event, branch, limit = 30, workflowPath = CI_WORKFLOW_PATH }) {
+  const matches = workflowMatcher(workflowPath);
   const rows = [];
   for (let pageNo = 1; ; pageNo += 1) {
     const qs = [`event=${encodeURIComponent(event)}`, `per_page=100`, ...(branch ? [`branch=${encodeURIComponent(branch)}`] : []), ...(pageNo > 1 ? [`page=${pageNo}`] : [])].join('&');
     const page = ghJson(exec, ['api', `repos/${repo}/actions/runs?${qs}`]);
     if (!Array.isArray(page?.workflow_runs)) throw new Error('actions runs read returned no list');
-    rows.push(...page.workflow_runs.filter((r) => r?.path === workflowPath).map(normalizeRun));
+    rows.push(...page.workflow_runs.filter(matches).map(normalizeRun));
     const more = page.workflow_runs.length === 100 && (!Number.isInteger(page.total_count) || pageNo * 100 < page.total_count);
     if (rows.length >= limit || !more) break;
     if (pageNo >= MAX_RUN_PAGES) throw new Error(`only ${rows.length} of ${limit} CI runs within ${MAX_RUN_PAGES} pages`);
@@ -116,11 +127,22 @@ export function detectLatentRedMain({ runs, failuresOf, threshold }) {
 }
 
 export function latentRedMainPath(env = process.env) { return join(resolveCoordinationRoot({ env }), 'latent-red-main.json'); }
-/** `{}` when absent; null when present but unreadable or malformed (callers fail closed: no re-run). */
+const plain = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const RECORD_STATUSES = new Set(['reserved', 'requested', 'failed', 'unknown', 'main-already-red']);
+/** PURE: every field the dedup / retry decisions read has its expected shape. */
+export function validLedger(o) {
+  if (!plain(o)) return false;
+  if (o.lastNoFire !== undefined && !(plain(o.lastNoFire) && typeof o.lastNoFire.head === 'string' && Number.isFinite(o.lastNoFire.at))) return false;
+  if (o.acted === undefined) return true;
+  if (!plain(o.acted)) return false;
+  return Object.values(o.acted).every((r) => plain(r) && RECORD_STATUSES.has(r.status)
+    && (r.attempts === undefined || (Number.isInteger(r.attempts) && r.attempts >= 1 && r.attempts <= MAX_RERUN_ATTEMPTS)));
+}
+/** `{}` when absent; null when present but unreadable or malformed in ANY field (callers fail closed: no re-run). */
 function readLedger(path) {
   let text;
   try { text = readFileSync(path, 'utf8'); } catch (e) { return e?.code === 'ENOENT' ? {} : null; }
-  try { const o = JSON.parse(text); return o && typeof o === 'object' && !Array.isArray(o) ? o : null; } catch { return null; }
+  try { const o = JSON.parse(text); return validLedger(o) ? o : null; } catch { return null; }
 }
 const NO_FIRE_TTL_MS = 30 * 60_000;
 const MAX_RERUN_ATTEMPTS = 3;
@@ -145,7 +167,7 @@ export function runLatentRedMainCheck({ repo, exec, threshold, source = 'standar
     if (!(threshold > 0)) return { fired: false, action: 'off' };
     if (!dryRun) mkdirSync(dirname(ledgerPath), { recursive: true });
     const runs = listMergeGroupCiRuns({ repo, exec, limit: Math.max(MERGE_GROUP_SAMPLE, threshold * 3) });
-    const head = runs.filter((r) => r.status === 'completed').slice(0, threshold * 3)
+    const head = `threshold=${threshold};` + runs.filter((r) => r.status === 'completed').slice(0, threshold * 3)
       .map((r) => `${r.databaseId}:${r.attempt}:${r.status}:${r.conclusion}`).join(',');
     const peek = readLedger(ledgerPath);
     if (!dryRun && peek?.lastNoFire?.head === head && now - peek.lastNoFire.at < NO_FIRE_TTL_MS) return { fired: false, action: 'unchanged' };

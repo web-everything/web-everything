@@ -208,7 +208,7 @@ export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAU
         // Merge-group runs live under a different workflow id than `--workflow ci.yml`, so `gh run list --workflow
         // --event merge_group` returned [] (live 2026-10-20): read the REST runs endpoint filtered by workflow path.
         const groupRuns = listMergeGroupCiRuns({ repo: repoSlug, limit: settings.mainCiRedMergeGroupRunLimit,
-          workflowPath: `.github/workflows/${settings.mainCiRedWorkflow}`,
+          workflowPath: settings.mainCiRedWorkflow, // file name, full path or workflow name (as `--workflow` accepted)
           exec: (bin, argv, opts) => { const out = exec(bin, argv, opts); if (isGhDeferred(out)) throw new Error('gh read deferred (low budget)'); return out; } });
         let groupReads = 0;
         failing.groupEvidence = findMergeGroupFlakeEvidence({ groupRuns, tipSha: tip.sha, failedJobs: failing.jobs, settings,

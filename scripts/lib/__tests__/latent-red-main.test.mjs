@@ -3,7 +3,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { detectLatentRedMain, listMergeGroupCiRuns, runLatentRedMainCheck } from '../latent-red-main.mjs';
+import { detectLatentRedMain, listMergeGroupCiRuns, runLatentRedMainCheck, workflowMatcher, validLedger } from '../latent-red-main.mjs';
 
 const T = 'scripts/lib/__tests__/ledger-readiness-drain-facts.test.mjs > replay reports before, after';
 const TIP = 'f'.repeat(40);
@@ -117,5 +117,27 @@ describe('runLatentRedMainCheck', () => {
     const found = vi.fn((bin, args) => { const p = Number(/[&]page=(\d+)/.exec(args[1])?.[1] ?? 1); return JSON.stringify({ total_count: 10_000, workflow_runs: p === 2 ? [rest(run(5, 'failure')), ...pages(2).slice(1)] : pages(p) }); });
     expect(listMergeGroupCiRuns({ repo: 'o/r', exec: found, limit: 1 }).map((r) => r.databaseId)).toEqual([5]);
     expect(found.mock.calls).toHaveLength(2);
+  });
+  it('fails closed on a structurally malformed ledger (Codex round 3)', () => withDir((ledgerPath) => {
+    for (const bad of [{ acted: { [TIP]: false } }, { acted: { [TIP]: { status: 'failed', attempts: -5 } } }, { acted: [] }, { lastNoFire: 'x' }]) {
+      writeFileSync(ledgerPath, JSON.stringify(bad));
+      const exec = host();
+      expect(runLatentRedMainCheck({ repo: 'o/r', exec, threshold: 3, ledgerPath, publish: () => {}, log: () => {} }).action).toBe('ledger-unreadable');
+      expect(exec.mock.calls.some(([, a]) => a[1] === 'rerun')).toBe(false);
+    }
+    expect(validLedger({})).toBe(true);
+    expect(validLedger({ acted: { [TIP]: { status: 'requested', attempts: 1 } } })).toBe(true);
+  }));
+  it('a threshold change never reuses a cached no-signal', () => withDir((ledgerPath) => {
+    const base = host();
+    const two = vi.fn((bin, args) => (args.join(' ').includes('event=merge_group')
+      ? JSON.stringify({ workflow_runs: [2, 1].map((n) => rest(run(n, 'failure'))).concat([rest(run(0, 'success'))]) }) : base(bin, args)));
+    expect(runLatentRedMainCheck({ repo: 'o/r', exec: two, threshold: 3, ledgerPath, publish: () => {}, log: () => {} }).action).toBe('no-signal');
+    expect(runLatentRedMainCheck({ repo: 'o/r', exec: two, threshold: 2, ledgerPath, publish: () => {}, log: () => {} }).action).toBe('rerun-main');
+  }));
+  it('matches a workflow file name, full path or name like gh run list --workflow', () => {
+    const r = { path: '.github/workflows/ci.yml', name: 'CI' };
+    for (const w of ['ci.yml', '.github/workflows/ci.yml', 'CI']) expect(workflowMatcher(w)(r)).toBe(true);
+    for (const w of ['merge-gate.yml', 'Merge gate', '.github/workflows/.github/workflows/ci.yml']) expect(workflowMatcher(w)(r)).toBe(false);
   });
 });
