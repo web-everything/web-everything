@@ -2934,7 +2934,7 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
       notifyDesktopChecked.mockClear();
       const provider = fakeProvider();
       const pr = { number: 5716, mergeable: 'CONFLICTING', headRefName: 'lane/pa-226-card',
-        headRefOid: 'a36abe60326770912776a49e14e65cc609a9726f', baseRefName: 'main', labels: [] };
+        headRefOid: 'a36abe60326770912776a49e14e65cc609a9726f', labels: [] }; // no baseRefName: skip the card-file git probe
       const thread = [];
       const attempt = vi.fn(() => ({ action: 'error', reason: 'card squash changed the PR net patch; refusing push' }));
       vi.spyOn(provider, 'postComment').mockImplementation((_repo, _pr, body) => {
@@ -2943,7 +2943,7 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
       let replayedNotes = 0;
       const sweep = () => {
         const [entry] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
-          repo: 'web-everything/web-everything', listPrs: () => [pr], provider, postFinding: () => {},
+          repo: 'o/n', listPrs: () => [pr], provider, postFinding: () => {},
           unownedRebaseSettings: { value: { countSince: null, infraRetryCap: 2 }, sources: {} },
           standingRulingFor: () => null,
           computeConflictDisposition: () => 'clean', attemptMechanicalRebase: attempt,
@@ -2954,7 +2954,7 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
         return entry;
       };
       const grant = (login) => ({ author: { login }, createdAt: '2026-10-20T20:58:54Z', body: buildRoundExtensionComment({
-        repo: 'web-everything/web-everything', pr: 5716, by: 1, actor: 'chalbert', channel: 'claude-code-chat',
+        repo: 'o/n', pr: 5716, by: 1, actor: 'chalbert', channel: 'claude-code-chat',
         reason: 'operator 2026-10-20: "Ok" — one more mechanical-rebase attempt', at: '2026-10-20T20:58:54Z' }) });
       for (let i = 0; i < 3; i += 1) sweep();
       expect(attempt).toHaveBeenCalledTimes(2);
