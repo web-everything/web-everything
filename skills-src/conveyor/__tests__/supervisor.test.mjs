@@ -25,6 +25,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { keepAliveScript } from '../../../scripts/lib/test-keepalive.mjs';
 import {
   classifyExit, decideRestart, runSupervisorLoop,
   makeRealSpawnChild, makeJsonlLog,
@@ -482,7 +483,7 @@ describe('makeRealSpawnChild — real node child processes, never runner.mjs its
     // if the kill wiring were broken this test would time out instead of failing fast.
     let liveChild = null;
     const spawnChild = makeRealSpawnChild({
-      runnerPath: '-e', extraArgs: ['setTimeout(() => {}, 60_000)'],
+      runnerPath: '-e', extraArgs: [keepAliveScript({ maxLifetimeMs: 60_000 })],
       onChild: (c) => { liveChild = c; },
     });
     const pending = spawnChild();
