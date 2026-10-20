@@ -801,7 +801,7 @@ describe('provenMergedLanding reads blobs through one cat-file process', () => {
     git(repo, ['add', '-A']);
     git(repo, ['commit', '-qm', 'merge']);
     const merge = git(repo, ['rev-parse', 'HEAD']).trim();
-    git(repo, ['update-ref', 'refs/remotes/origin/main', merge]);
+    git(repo, ['update-ref', 'refs/heads/main', merge]);
     git(repo, ['remote', 'add', 'origin', repo]);
     const recorded = { pr: 7, batchRef: 'lane/b', headSha, members: ids.map(cardId => ({ cardId })) };
     const gh = async () => JSON.stringify({ number: 7, state: 'MERGED', headRefName: 'lane/b', mergeCommit: { oid: merge } });
