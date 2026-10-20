@@ -761,3 +761,25 @@ describe('replay arrival recovery', () => {
     expect(result.projected).toMatchObject({ fullRuns: 5, mergedPrs: 2, isolationRuns: 2, createdCancelled: 1 });
   });
 });
+
+describe('priority slot (live 2026-10-20, #5738 deferred: queue holds 5 group(s) (max 5))', () => {
+  const full = () => ({ ...empty(), strictUntilMs: minute, groups: [1, 2].map(n => group({ id: `s${n}`, prs: [n], mode: 'strict' })) });
+  const s = (o = {}) => settings({ maxGroupsInFlight: 2, ...o });
+  it('admits an operator-priority PR into one reserved slot past the group cap', () => {
+    const r = admit(freeze(full()), 9, 0, { settings: s(), priority: true });
+    expect(r).toMatchObject({ admit: true, prioritySlot: true });
+    expect(r.state.groups.at(-1)).toMatchObject({ prs: [9], priority: true, status: 'queued' });
+    expect(admit(r.state, 10, 0, { settings: s(), priority: true })).toMatchObject({ admit: false, reason: 'queue holds 3 group(s) (max 2); priority slots 1/1 in use' });
+  });
+  it('defers non-priority PRs and honours prioritySlots=0', () => {
+    expect(admit(full(), 9, 0, { settings: s() })).toMatchObject({ admit: false, reason: 'queue holds 2 group(s) (max 2)' });
+    expect(admit(full(), 9, 0, { settings: s({ prioritySlots: 0 }), priority: true }).admit).toBe(false);
+  });
+  it('never bypasses isolation for a priority PR', () => {
+    expect(admit({ ...full(), strictUntilMs: null, isolate: [1] }, 9, 0, { settings: s(), priority: true }).admit).toBe(false);
+  });
+  it('validates prioritySlots', () => {
+    expect(resolveBatchingSettings({ env: { WE_MQ_BATCHING_PRIORITY_SLOTS: '0' }, settings: {}, platform: {} }).prioritySlots).toBe(0);
+    expect(resolveBatchingSettings({ env: {}, settings: { mergeQueueBatching: { prioritySlots: 9 } }, platform: {} }).invalid).toEqual(['repo.prioritySlots']);
+  });
+});

@@ -1866,3 +1866,35 @@ describe('queue overlap catch-up scheduling', () => {
     } finally { f.handle.kill(); }
   });
 });
+
+describe('operator priority in catch-up (live 2026-10-20, #5738 skipped as "already pending")', () => {
+  const now = { value: 'now', byOperator: true };
+  const run = async (override) => {
+    const f = catchUpSetup({ manualFinish: true,
+      resolveThroughput: () => ({ value: { redMainSkipCatchUp: false } }),
+      readPriorities: () => ({ priority: { mode: 'enforce' } }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(43, 100), candidate(44, 200), candidate(42, 900, { override })] }),
+    });
+    f.handle.notePoll({ ok: true, marked: [mark(42)] });
+    f.advance(15_000);
+    const done = f.handle.catchUp();
+    for (let i = 0; i < 30; i++) await new Promise(r => setImmediate(r));
+    const first = f.calls.map(c => c.args.find(a => a.startsWith('--only=')));
+    f.children.forEach(c => c.finish());
+    for (let i = 0; i < 30; i++) { await new Promise(r => setImmediate(r)); f.children.forEach(c => c.finish()); }
+    await done;
+    f.handle.kill();
+    return { f, first };
+  };
+  it('folds an operator-priority PR\'s pending event work into the round and runs it first', async () => {
+    const { f, first } = await run(now);
+    expect(first).toEqual(['--only=42']);
+    expect(f.lines.join('\n')).not.toContain('#42 already pending');
+    expect(f.lines.join('\n')).toContain('catch-up plans operator-priority PR(s) #42 despite pending event work');
+  });
+  it('keeps skipping pending work whose priority label was not operator-set', async () => {
+    const { f, first } = await run({ value: 'now', byOperator: false });
+    expect(first).not.toContain('--only=42');
+    expect(f.lines.join('\n')).toContain('#42 already pending');
+  });
+});

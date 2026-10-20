@@ -13,6 +13,9 @@ export const STANDARD_BATCHING_SETTINGS = Object.freeze({
   groupSize: 3,
   groupFormMinutes: 5,
   maxGroupsInFlight: 1,
+  // Extra in-flight groups only an operator-set priority:now/urgent PR may open once maxGroupsInFlight is reached
+  // (every other admission rule still applies). 0 = no reserved slot (before this setting).
+  prioritySlots: 1,
   failureThreshold: 3,
   failureWindowMinutes: 120,
   strictModeMinutes: 60,
@@ -27,6 +30,7 @@ const ENV_KEYS = Object.freeze({
   groupSize: 'WE_MQ_BATCHING_GROUP_SIZE',
   groupFormMinutes: 'WE_MQ_BATCHING_GROUP_FORM_MINUTES',
   maxGroupsInFlight: 'WE_MQ_BATCHING_MAX_GROUPS_IN_FLIGHT',
+  prioritySlots: 'WE_MQ_BATCHING_PRIORITY_SLOTS',
   failureThreshold: 'WE_MQ_BATCHING_FAILURE_THRESHOLD',
   failureWindowMinutes: 'WE_MQ_BATCHING_FAILURE_WINDOW_MINUTES',
   strictModeMinutes: 'WE_MQ_BATCHING_STRICT_MODE_MINUTES',
@@ -63,6 +67,7 @@ function validValue(key, value) {
   if (!Number.isSafeInteger(value)) return false;
   if (key === 'rulesetId') return true;
   if (key === 'groupSize') return value >= 1 && value <= 5;
+  if (key === 'prioritySlots') return value >= 0 && value <= 5;
   return value >= (key === 'groupFormMinutes' ? 0 : 1);
 }
 
@@ -178,7 +183,7 @@ function openGroup(state, num, nowMs, mode, size) {
  * @param {{state:BatchingState,num:number,nowMs:number,settings:object,inQueue:Set<number>}} input
  * @returns {{admit:boolean,mode:string,groupId:string|null,reason:string|null,state:BatchingState}}
  */
-export function admitEnqueue({ state: input, num, nowMs, settings, inQueue }) {
+export function admitEnqueue({ state: input, num, nowMs, settings, inQueue, priority = false }) {
   const state = structuredClone(input);
   if (settings.enabled) {
     healSoleSurvivors(state, inQueue, nowMs, settings);
@@ -223,7 +228,19 @@ export function admitEnqueue({ state: input, num, nowMs, settings, inQueue }) {
     closeGroup(g, nowMs);
   }
   const count = state.groups.filter(active).length;
-  if (count >= settings.maxGroupsInFlight) return result(false, null, `queue holds ${count} group(s) (max ${settings.maxGroupsInFlight})`);
+  if (count >= settings.maxGroupsInFlight) {
+    // An operator-set priority PR may open one of the reserved priority slots. It never joins a forming group
+    // (above) out of turn and never bypasses isolation or outstanding recovery (both returned earlier).
+    const slots = settings.prioritySlots ?? 0;
+    const used = state.groups.filter(g => active(g) && g.priority).length;
+    if (priority !== true || used >= slots) {
+      const why = priority === true ? `; priority slots ${used}/${slots} in use` : '';
+      return result(false, null, `queue holds ${count} group(s) (max ${settings.maxGroupsInFlight})${why}`);
+    }
+    const g = openGroup(state, num, nowMs, mode, 1);
+    g.priority = true;
+    return { ...result(true, g.id), prioritySlot: true };
+  }
   return result(true, openGroup(state, num, nowMs, mode, mode === 'strict' ? 1 : settings.groupSize).id);
 }
 
@@ -456,7 +473,7 @@ export function createAdaptiveBatching({ repo, exec = execFileSync, statePath = 
         persist(state);
       } catch (e) { warn(e); }
     },
-    gate(num) {
+    gate(num, { priority = false } = {}) {
       if (!settings.enabled) return { admit: true };
       try {
         const facts = readQueueFacts({ repo, exec });
@@ -468,11 +485,11 @@ export function createAdaptiveBatching({ repo, exec = execFileSync, statePath = 
           }
           throw new Error(facts.error);
         }
-        const result = admitEnqueue({ state: load(), num, nowMs: nowMs(), settings, inQueue: facts.inQueue });
+        const result = admitEnqueue({ state: load(), num, nowMs: nowMs(), settings, inQueue: facts.inQueue, priority });
         persist(result.state);
         const g = result.state.groups.find(g => g.id === result.groupId);
         say(`merge-queue batching: ${result.mode} → ${result.admit
-          ? `admit #${num} into group ${result.groupId ?? 'native-queue'} (${g?.prs.length ?? 1}/${result.mode === 'grouped' ? settings.groupSize : 1})`
+          ? `admit #${num} into group ${result.groupId ?? 'native-queue'} (${g?.prs.length ?? 1}/${result.mode === 'grouped' ? settings.groupSize : 1})${result.prioritySlot ? ` via priority slot — mergeQueueBatching.prioritySlots=${settings.prioritySlots} (${settings.sources?.prioritySlots ?? 'standard'})` : ''}`
           : `defer #${num} (${result.reason})`}`);
         return result;
       } catch (e) { warn(e); return { admit: true, error: errorText(e) }; }

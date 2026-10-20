@@ -641,8 +641,18 @@ export function createEnqueueOnEvent({
     const completed = new Set();
     const concurrency = s.catchUp?.concurrency ?? ENQUEUE_ON_EVENT_DEFAULTS.catchUp.concurrency;
     let catchUpIndex = 0;
+    // Operator-set priority:now/urgent PRs from this round's listing. Their event-only pending work is folded into
+    // the catch-up round (in planned order) instead of being skipped as "already pending" — event work never runs
+    // in a catch-up-only round, so the skip starved them behind non-priority catch-up fills.
+    let priorityNums = new Set();
     const queueCatchUp = (num) => {
       const key = `${localSlug}#${num}`;
+      const held = pending.get(key);
+      if (held && !held.catchUp && priorityNums.has(num) && !activeNums.has(num) && !attempted.has(num)) {
+        pending = new Map(pending).set(key, { ...held, causes: [...new Set([...held.causes, 'catch-up'])], catchUp: true,
+          firstAt: now() + catchUpIndex++, lastAt: Math.min(held.lastAt, now() - s.debounceSeconds * 1000) });
+        return true;
+      }
       if (pending.has(key) || activeNums.has(num) || attempted.has(num)) return false;
       pending = new Map(pending).set(key, {
         // Keep the planned priority order through duePending, independently of ready-label churn.
@@ -712,7 +722,11 @@ export function createEnqueueOnEvent({
         catchUpCapacity = capacity;
         const reserved = [...pending.values()].filter((p) => p.catchUp).length;
         const priorities = await readPriorities();
-        const plan = planCatchUp({ ...result, prs: catchUpPrs, capacity: capacity - reserved, ...priorities, mainFix: mainFix ?? priorities.mainFix, repo: localSlug, now: now(), order: s.catchUp.order, pendingNums: [...pending.values()].filter(p => p.catchUp || !ownsFix(p.num, p.repo)).map(p => p.num) });
+        priorityNums = new Set(catchUpPrs.filter(p => p.override?.byOperator === true && ['now', 'urgent'].includes(p.override.value)).map(p => p.num));
+        const foldable = (p) => !p.catchUp && p.repo === localSlug && priorityNums.has(p.num) && !activeNums.has(p.num);
+        const folded = [...pending.values()].filter(foldable).map(p => p.num);
+        if (folded.length) log(`enqueue-on-event: catch-up plans operator-priority PR(s) ${folded.map(n => `#${n}`).join(' ')} despite pending event work (priority:now/urgent label set by the operator)`);
+        const plan = planCatchUp({ ...result, prs: catchUpPrs, capacity: capacity - reserved, ...priorities, mainFix: mainFix ?? priorities.mainFix, repo: localSlug, now: now(), order: s.catchUp.order, pendingNums: [...pending.values()].filter(p => (p.catchUp || !ownsFix(p.num, p.repo)) && !foldable(p)).map(p => p.num) });
         const nums = (ps) => ps.map((n) => `#${n}`).join(' ');
         log(`enqueue-on-event: catch-up listed ${result.prs.length} ready-to-merge PR(s), ${result.queued} in the merge queue, room ${Math.max(0, capacity - result.queued)} (capacity ${capacity} from ${source}) — ${plan.run.length ? `fast drain for ${nums(plan.run.map((p) => p.num))} (${s.catchUp.order ?? 'priority-then-first-accept'})` : 'nothing to run'}${plan.later.length ? `; later: ${nums(plan.later)}` : ''}${plan.skipped.length ? `; skipped: ${plan.skipped.map((p) => `#${p.num} ${p.reason}`).join(', ')}` : ''}`);
         for (const { num } of plan.run) queueCatchUp(num);

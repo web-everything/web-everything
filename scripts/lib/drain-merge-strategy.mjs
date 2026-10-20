@@ -57,7 +57,7 @@ import { cardOverlapRelief, readCardOverlapCleanMerge, readQueueTip as defaultRe
 import { gitRealFiles, resolveRealFiles as defaultResolveRealFiles } from './pr-real-files.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { createAdaptiveBatching, readQueueFacts } from './merge-queue-adaptive-batching.mjs';
-import { activeReserveBlockers, isPriorityLabels, readReserves, writeReserves } from './priority-reserve.mjs';
+import { activeReserveBlockers, isPriorityLabels, readOperatorPriority, readReserves, writeReserves } from './priority-reserve.mjs';
 import { cancelObsoleteQueueRuns } from './merge-queue-obsolete-runs.mjs';
 
 /** Pure request recovery for historical rows that left no usable exact-head result. Never grants admission. */
@@ -267,6 +267,7 @@ export function createDrainMergeStrategy({
   env = process.env, queueSafety, labelProvider, readRedTeamEvidence = readDrainRedTeamEvidence, requestRedTeam = null, readReviewAgents = listAgentsWithReviewJobs,
   cwd = process.cwd(), // a clone of the local repo: enqueuePr reads the judged commit's change list from it
   cardOverlapCleanMerge, readQueueTip = defaultReadQueueTip, cardMergeRun,
+  isOperatorPriority = (c) => readOperatorPriority({ repo: c.repo || localSlug, num: c.num, labels: c.prLabels, exec }),
 } = {}) {
   const { policy, note } = resolved;
   const statusProvider = labelProvider ?? createGhProvider({ exec: (args, opts) => exec('gh', args, opts) });
@@ -802,7 +803,9 @@ export function createDrainMergeStrategy({
       if (reserve) return { enqueued: false, ...reserve };
       let batchingGroupId;
       try {
-        const g = adaptiveBatching().gate(c.num);
+        // Only an operator-set priority:now/urgent label may use a reserved priority slot (read only when labelled).
+        const priority = isPriorityLabels(c.prLabels) && isOperatorPriority(c) === true;
+        const g = adaptiveBatching().gate(c.num, { priority });
         batchingGroupId = g.groupId;
         if (!g.admit) {
           say(`  merge-queue batching: defer #${c.num} (${g.reason})`);

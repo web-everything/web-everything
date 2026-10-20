@@ -3,7 +3,7 @@ import { describe, it, expect } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { activeReserveBlockers, isPriorityLabels, readReserves, writeReserves } from '../priority-reserve.mjs';
+import { activeReserveBlockers, isPriorityLabels, readOperatorPriority, readReserves, writeReserves } from '../priority-reserve.mjs';
 
 const stamp = { num: 1, repo: null, headSha: 'head', files: ['x.mjs', 'backlog/card.md'], at: 1_000 };
 const blockers = (over = {}) => activeReserveBlockers({ candidate: { num: 2, key: 'cwd#2', files: ['x.mjs'] }, reserves: { 'cwd#1': stamp }, now: 2_000, ...over });
@@ -43,5 +43,19 @@ describe('priority reserves', () => {
       writeFileSync(path, '{');
       expect(readReserves(path)).toEqual({});
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('readOperatorPriority', () => {
+  const ev = (login, name = 'priority:now') => ({ event: 'labeled', label: { name }, actor: { login } });
+  const read = (events, labels = ['priority:now']) => readOperatorPriority({ repo: 'o/r', num: 5, labels, exec: () => JSON.stringify(events) });
+  it('is true only when the operator added the label last', () => {
+    expect(read([ev('plateau-merger[bot]'), ev('chalbert')])).toBe(true);
+    expect(read([ev('chalbert'), ev('plateau-merger[bot]')])).toBe(false);
+  });
+  it('fails closed on no label, unreadable or malformed events', () => {
+    expect(read([ev('chalbert')], [])).toBe(false);
+    expect(readOperatorPriority({ repo: 'o/r', num: 5, labels: ['priority:now'], exec: () => { throw new Error('rate'); } })).toBe(false);
+    expect(readOperatorPriority({ repo: 'o/r', num: 5, labels: ['priority:now'], exec: () => 'not json' })).toBe(false);
   });
 });

@@ -73,7 +73,7 @@ function harness({ gitExec, resolveRealFiles, priorityReserve, reservePath, stra
     ...(resolveRealFiles ? { resolveRealFiles } : {}),
     ...(priorityReserve ? { priorityReserve } : {}), ...(reservePath ? { reservePath } : {}),
     dryRun, env, readReviewAgents, readRedTeamEvidence: () => { if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }, requestRedTeam, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
-    cancelObsoleteRuns: () => {}, batching: { gate: () => ({ admit: true }), observe: () => ({}) },
+    cancelObsoleteRuns: () => {}, batching: strategyExtra?.batching ?? { gate: () => ({ admit: true }), observe: () => ({}) },
     postConflictFinding, ...(now ? { now } : {}), resolved: policyOf(strategy), log: { write: (l) => logs.push(l) }, readFile, writeState, ...(withLock ? { withLock } : {}),
   });
   // `peer` = a second drain process writing the same state file (its own enqueue) at any moment, as `onView` does mid-collect.
@@ -100,6 +100,18 @@ describe('drain merge strategy — drain-direct (default) is unchanged', () => {
 });
 
 describe('drain merge strategy — github-merge-queue', () => {
+  it.each([
+    [['priority:now'], true, true], [['priority:now'], false, false], [[], true, false],
+  ])('asks batching for a priority slot only for an operator-set priority label (%j, operator=%s)', (labels, operator, expected) => {
+    const gates = [];
+    const { s } = harness({ strategy: 'github-merge-queue', strategyExtra: {
+      isOperatorPriority: () => operator,
+      batching: { gate: (num, opts) => { gates.push([num, opts]); return { admit: false, reason: 'queue holds 5 group(s) (max 5)' }; }, observe: () => ({}) },
+    } });
+    expect(s.enqueue({ num: 42, repo: null, prLabels: labels.map(name => ({ name })) }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deferred: true });
+    expect(gates).toEqual([[42, { priority: expected }]]);
+  });
+
   it('enqueues only the local repo PRs (sibling-repo impl halves stay direct)', () => {
     const { s } = harness({ strategy: 'github-merge-queue' });
     expect(s.enqueues(null)).toBe(true);
