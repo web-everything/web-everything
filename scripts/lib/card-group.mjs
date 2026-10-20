@@ -715,7 +715,9 @@ export function createCardGrouping({
           const v = verdicts.find(x => Number(x.num) === Number(o.num) && local(x.repo));
           const headSha = v?.listedHeadSha || v?.headSha;
           if (!SHA.test(headSha ?? '')) continue;
-          if (o.yieldTarget && v.decision !== 'merge') continue; // a PR yielded to joins only when it would itself land now
+          // A planner-sourced candidate (a deferral or the PR it yields to) comes from the pass-start plan; it joins only
+          // while its verdict still says it would land now (not since held, not pre-staged with required CI pending).
+          if ((o.outcome === 'deferred' || o.yieldTarget) && (v.decision !== 'merge' || v.prestagePendingCi)) continue;
           const names = labelNames(v.prLabels);
           if (!names.includes('ready-to-merge') || !names.includes('review:accepted')) continue;
           if (v.item || v.couple || v.coupleKey) continue; // a PR that resolves an item or is half a couple stays serial

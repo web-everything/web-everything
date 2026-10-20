@@ -419,8 +419,20 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       expect(cardGroupCandidates({ enqueueOutcomes: [], deferred }).map(o => [o.num, o.kind])).toEqual([[1, 'overlap-yield'], [2, 'overlap-yield']]);
       const g = createCardGrouping({ localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, () => t.base), exec: t.exec, statePath: join(tmp(), 's.json'),
         settings, log: { write() {} }, prestage: () => ({ allowed: true }), cardConflictSettings: cc, ...lockOpts });
-      const r = runCardGroupPass({ grouping: g, enqueues: true, enqueueOutcomes: [], deferred, verdicts: t.verdicts, log: { write() {} } });
+      const verdicts = t.verdicts.map(v => ({ ...v, decision: 'merge' }));
+      const r = runCardGroupPass({ grouping: g, enqueues: true, enqueueOutcomes: [], deferred, verdicts, log: { write() {} } });
       expect(r.grouping.formed).toMatchObject({ pr: 77 });
+    });
+
+    it('a deferral from the pass-start plan whose verdict was since held or pre-staged with CI pending stays out', () => {
+      const deferred = [1, 2].map(n => ({ num: n, item: null, waitOn: ['overlap-yield:#40'], overlapYield: { pr: 40, repo: null } }));
+      for (const late of [{ decision: 'skip' }, { decision: 'merge', prestagePendingCi: true }]) {
+        const t = setup();
+        const verdicts = t.verdicts.map(v => ({ ...v, decision: 'merge', ...(v.num === 2 ? late : {}) }));
+        const g = createCardGrouping({ localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, () => t.base), exec: t.exec, statePath: join(tmp(), 's.json'),
+          settings, log: { write() {} }, prestage: () => ({ allowed: true }), cardConflictSettings: cc, ...lockOpts });
+        expect(runCardGroupPass({ grouping: g, enqueues: true, deferred, verdicts, log: { write() {} } }).grouping.reason).toMatch(/fewer than 2 accepted card candidates/);
+      }
     });
 
     it('the ready PR the others yield to joins the group (two approved card PRs on one card), only when it would land now', () => {
