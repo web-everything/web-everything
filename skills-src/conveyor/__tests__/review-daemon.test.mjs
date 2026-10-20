@@ -622,6 +622,14 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
       'vim scripts/operations/review-loop-cli.mjs',
     ].join('\n');
     expect(liveReviewRoundBudget({ env: {}, listCommands: () => ps })).toMatchObject({ live: 1, max: 3, left: 2 });
+    // a preload / loader value is not the script; other node runtimes and a direct (shebang) run still count
+    const preloaded = [
+      'node --import ./boot.mjs scripts/operations/review-loop-cli.mjs --pr=1',
+      'node -r ./boot.cjs --max-old-space-size=4096 scripts/operations/review-loop-cli.mjs --pr=2',
+      '/usr/bin/nodejs scripts/operations/review-loop-cli.mjs --pr=3',
+      '/clone/scripts/operations/review-loop-cli.mjs --pr=4',
+    ].join('\n');
+    expect(liveReviewRoundBudget({ env: {}, listCommands: () => preloaded })).toMatchObject({ live: 4, left: 0 });
   });
 
   it('a cap-bound tick says the live-review cap held the review, never "no acquirable lane"', async () => {

@@ -222,17 +222,6 @@ export function formatOperatorHoldsRecord({ repo, observedAt, intervalMs, holds 
 const ALWAYS_EXPLAINED_LABEL = 'review:human';
 
 /**
- * Live-caught 2026-09-26 (WE PRs #2746–#2758 sat `review:pending` for ~an hour while every tick logged only
- * "N owed" — nothing said WHY each parked PR was skipped, so a correct `live-process` refusal (a stale fix /
- * ci-heal session still bound to the PR) looked exactly like a discovery bug). For every open PR carrying
- * `review:pending` that this tick did NOT hand to `dispatch`, return the reason(s) straight from the reconcile
- * plan — never re-derived. Pure. `prs` is the tick's own shared `gh pr list` read; `null` (the opt-out
- * no-shared-reads path) returns `[]`, since there is then no label list to scan.
- * @param {{prs:Array<object>|null, plan:{dispatch?:Array<object>, refusals?:Array<object>}, dispatchable:Array<object>,
- *   deferredForLanes?:Array<object>, paused?:boolean, deferReason?:string}} o
- * @returns {Array<{prNumber:number, labels:string[], reasons:string[]}>}
- */
-/**
  * The dispatch order for this tick's owed reviews. Pure, stable. Rank 0: a main-fix PR (the plan marks it
  * `mainFix`); rank 1: a PR someone is blocked on (`review:human` or `ready-to-merge`); rank 2: the rest.
  * Within a rank the oldest PR (lowest number) goes first. Only the plan's own review rows move: a red-team
@@ -258,6 +247,17 @@ export function orderReviewsForDispatch(reviews, { labelsByPr = new Map(), plan 
   return out;
 }
 
+/**
+ * Live-caught 2026-09-26 (WE PRs #2746–#2758 sat `review:pending` for ~an hour while every tick logged only
+ * "N owed" — nothing said WHY each parked PR was skipped, so a correct `live-process` refusal (a stale fix /
+ * ci-heal session still bound to the PR) looked exactly like a discovery bug). For every open PR carrying
+ * `review:pending` that this tick did NOT hand to `dispatch`, return the reason(s) straight from the reconcile
+ * plan — never re-derived. Pure. `prs` is the tick's own shared `gh pr list` read; `null` (the opt-out
+ * no-shared-reads path) returns `[]`, since there is then no label list to scan.
+ * @param {{prs:Array<object>|null, plan:{dispatch?:Array<object>, refusals?:Array<object>}, dispatchable:Array<object>,
+ *   deferredForLanes?:Array<object>, paused?:boolean, deferReason?:string}} o
+ * @returns {Array<{prNumber:number, labels:string[], reasons:string[]}>}
+ */
 export function explainPendingNotDispatched({ prs, plan, dispatchable = [], deferredForLanes = [], paused = false, deferReason = null }) {
   if (!Array.isArray(prs)) return [];
   const labelName = (l) => (typeof l === 'string' ? l : l?.name);
@@ -700,7 +700,8 @@ export function runReviewTick({
     pendingNotDispatched: explainPendingNotDispatched({
       prs: rawPrs, plan, dispatchable, deferredForLanes: reviews.slice(dispatchable.length), paused, deferReason,
     }),
-    reconcileError: null, deferredForLanes, deferredForCap, deferredForAuth, operatorHolds, staleStatusSwept, staleConflictStatusCleared,
+    reconcileError: null, deferredForLanes, deferredForCap, deferredForCapReason: deferredForCap ? (liveReviewBudget?.reason ?? null) : null,
+    deferredForAuth, operatorHolds, staleStatusSwept, staleConflictStatusCleared,
     authPaused: paused, authPauseReason: paused ? pauseReason : null,
     holdReconcile: holdReconcileResults, holdReconcileError,
     ...(scopeBloatRefreshed.length ? { scopeBloatRefreshed } : {}),
@@ -790,6 +791,7 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
   let refusals = 0;
   let deferredForLanes = 0;
   let deferredForCap = 0;
+  let deferredForCapReason = null;
   let deferredForAuth = 0;
   const liveProcessPrs = [];
   const operatorHoldSnapshots = [];
@@ -809,6 +811,7 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
     refusals += result.refusals;
     deferredForLanes += result.deferredForLanes ?? 0;
     deferredForCap += result.deferredForCap ?? 0;
+    if (result.deferredForCapReason) deferredForCapReason = result.deferredForCapReason;
     deferredForAuth += result.deferredForAuth ?? 0;
     for (const d of result.dispatched) dispatched.push({ ...d, repo });
     for (const k of (result.notStarted ?? [])) notStarted.push({ ...k, repo });
@@ -818,7 +821,7 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
     if (result.operatorHolds) operatorHoldSnapshots.push({ repo, ...result.operatorHolds });
   }
   return {
-    repos: perRepo, perRepoMs, reviewsOwed, dispatched, failed, notStarted, pendingNotDispatched, refusals, reconcileFailed, deferredForLanes, deferredForCap,
+    repos: perRepo, perRepoMs, reviewsOwed, dispatched, failed, notStarted, pendingNotDispatched, refusals, reconcileFailed, deferredForLanes, deferredForCap, deferredForCapReason,
     deferredForAuth, authPaused: authGate.paused, authPauseReason: authGate.reason,
     holdReconcile: holdReconcileRemoved, holdReconcileFailed,
     operatorHoldSnapshots,
@@ -1122,10 +1125,21 @@ export function priorityNamesForLiveProcessPrs(liveProcessPrs) {
  * @param {string[]} lines
  */
 export function countLiveReviewRounds(lines) {
+  // Runtimes that run a script file, and the runtime flags that take their value as the NEXT word (a preload,
+  // a loader): those values are not the script. An unknown runtime still counts when its argv[0] is the script.
+  const RUNTIME = /(^|\/)(node|nodejs|bun|electron)(\.exe)?$/;
+  const VALUE_FLAGS = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader', '--env-file',
+    '-C', '--conditions', '--title', '--input-type', '--experimental-config-file']);
   const script = (line) => {
     const tokens = String(line).trim().split(/\s+/);
-    if (!/(^|\/)node(\.exe)?$/.test(tokens[0] ?? '')) return (tokens[0] ?? '').split('/').pop(); // run directly (shebang)
-    return (tokens.slice(1).find((t) => !t.startsWith('-')) ?? '').split('/').pop();
+    if (!RUNTIME.test(tokens[0] ?? '')) return (tokens[0] ?? '').split('/').pop(); // run directly (shebang)
+    for (let i = 1; i < tokens.length; i++) {
+      const t = tokens[i];
+      if (VALUE_FLAGS.has(t)) { i++; continue; }
+      if (t.startsWith('-')) continue;
+      return t.split('/').pop();
+    }
+    return '';
   };
   const names = lines.map(script);
   return Math.max(names.filter((n) => n === 'review-job.mjs').length, names.filter((n) => n === 'review-loop-cli.mjs').length);
@@ -1288,7 +1302,7 @@ export function buildCliDaemonEffects({
       // A `withSelfSync`-skipped tick (`skippedTick`: `repos: []`) used to print as "tick () — 0 owed", which read
       // like discovery had watched NO repo. Say what actually happened.
       if (result?.skipped) { log.error(`review-daemon: tick skipped (${result.reason ?? 'unknown'}) — no repo was read this tick`); return; }
-      log.error(`review-daemon: tick (${result.repos.map((r) => r.repo).join(', ')}) — ${result.reviewsOwed} owed, dispatched ${result.dispatched.length}, failed ${result.failed.length}${result.deferredForLanes ? `, deferred ${result.deferredForLanes} (no acquirable lane this tick, #3383)` : ''}${result.deferredForCap ? `, queued ${result.deferredForCap} (live-review cap maxLiveReviewRounds, scripts/settings/review-concurrency.json)` : ''}`);
+      log.error(`review-daemon: tick (${result.repos.map((r) => r.repo).join(', ')}) — ${result.reviewsOwed} owed, dispatched ${result.dispatched.length}, failed ${result.failed.length}${result.deferredForLanes ? `, deferred ${result.deferredForLanes} (no acquirable lane this tick, #3383)` : ''}${result.deferredForCap ? `, queued ${result.deferredForCap} (live-review cap: ${result.deferredForCapReason ?? 'maxLiveReviewRounds'})` : ''}`);
       // card x5kagse (epic #4075/#3383) — logged EVERY tick review dispatch stays paused, exact wording
       // required by the card and matched by the soak scenario/live-proof read.
       // One structured record per successfully planned repository; the health watch's `operator-hold-aged` smell reads
