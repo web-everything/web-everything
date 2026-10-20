@@ -1,6 +1,7 @@
 /** xux0rs9 — completed reviews awaiting an already-attempted mandatory ruling owe no new panel.
  * Run evidence is local; the PR thread supplies wake-up events and a durable notice marker.
- * Persistence failures get three retries (15/30/60 minutes), then the same event-driven hold.
+ * Persistence failures get three retries (15/30/60 minutes), each resuming the parked run at its referral step
+ * (no new panel), then the same event-driven hold.
  */
 import { createHash } from 'node:crypto';
 import { mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -57,6 +58,9 @@ export function reviewRunEvidence(run) {
     persistenceFailed: pending.includes('referral-persistence-failed'),
     count: pending.includes('referral-persistence-failed') ? Math.max(1, verdict?.referrals?.length ?? 0) : findingKeys.length,
     rulings: (state?.records ?? []).flatMap(r => r.rulings ?? []).map(r => JSON.stringify(r)),
+    // How many times this run was already resumed to retry a failed referral persist (card 5752 below). Each such
+    // resume is one spent slot of the 15/30/60 retry budget, though it stays the same run.
+    persistRetries: Math.max(0, Number(run.resumeOf?.persistRetries) || 0),
   };
 }
 
@@ -153,15 +157,22 @@ function wakeTime(pr, run) {
  * flipped back to `advisory:ruling-needed` and never reached the operator). The rule: the newest run on this PR is
  * parked on mandatory referrals at the PR's CURRENT head, it persisted them, and everything that woke it since it began
  * is a ruling. Any re-arm, send-back or operator reply since asks for a fresh look, so it answers `null`, as does a
- * head that moved (a new push owes a new review) or a persistence failure (the retry budget owns that case). Pure.
+ * head that moved (a new push owes a new review). A parked run whose referral persist FAILED is always resumable
+ * (unless a fresh look was asked): the retry budget picks the time, and the retry re-runs the persist step only. Pure.
  * @returns {{id: string, head: string}|null}
  */
 export function findResumableParkedRun(pr, runs, { repo } = {}) {
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number)).sort((a, b) => b.completedAt - a.completedAt);
   const last = history[0];
-  if (!last?.parked || last.head !== pr.headRefOid || !last.attempted || last.persistenceFailed) return null;
+  if (!last?.parked || last.head !== pr.headRefOid) return null;
   const events = wakeEvents(pr, last).filter(e => e.at > last.startedAt);
   if (events.some(e => e.kind === 'fresh')) return null;
+  // A run whose referral persist failed already holds its panel's verdict; what it owes is the persist step again,
+  // not a new panel (live 2026-10-20, #5752: two ledger-push misses on one head each cost a full panel, and the
+  // operator's Accept was refused until a person noticed). The hold decides WHEN (its 15/30/60 retry budget, or a
+  // ruling); once a review is dispatched at all, it resumes this run at the referral step.
+  if (last.persistenceFailed) return { id: last.id, head: last.head };
+  if (!last.attempted) return null;
   return events.length ? { id: last.id, head: last.head } : null;
 }
 
@@ -182,7 +193,8 @@ function evaluateReferralHold(pr, runs, { repo, now = Date.now(), env = process.
   let streak = 0;
   for (const run of history) {
     if (run.head !== last.head || !run.parked || !run.persistenceFailed || run.startedAt < wake) break;
-    streak++;
+    // A resumed persist retry stays the same run, so its earlier failed passes count from the run itself.
+    streak += 1 + (run.persistRetries ?? 0);
   }
   const retryAt = last.persistenceFailed && streak <= REFERRAL_RETRY_MS.length
     ? last.completedAt + REFERRAL_RETRY_MS[streak - 1] : null;

@@ -505,6 +505,33 @@ describe('runReviewLoopOnce — a ruling on an unchanged head resumes the paused
     expect(store.read('r-1').resumeOf).toMatchObject({ adviseFinishedAt: secondAdvise, attempts: 1 });
   });
 
+  // Live 2026-10-20, #5752: the referral ledger push lost five races in a row, so the run parked as
+  // `referral-persistence-failed`, and the retry started a whole new panel that failed the same way. A persist retry
+  // resumes the parked run at the referral step, and each such resume spends one slot of the hold's retry budget.
+  it('a referral persist that failed is retried by resuming the parked run, counting each retry, never a new panel', async () => {
+    const { declaration, registry } = setup();
+    const store = createMemoryRunStore();
+    let judged = 0;
+    const makeJudge = () => async () => { judged += 1; return judgeOutcome(REFERRAL_ANSWER, {}); };
+    const persistFails = sinksWith({ seen: [], ruled: { value: false } });
+    persistFails[REVIEW_EFFECTS.MANDATORY_REFERRALS] = async () => ({ records: [], pending: ['referral-persistence-failed'],
+      blocked: [], malformed: false, reason: 'mandatory ruling ledger-write-miss: push lost the race' });
+    await runReviewLoopOnce({ declaration, registry, argv, store, sinks: persistFails, makeJudge, mintRunId: () => 'r-1' });
+    const judgedByFirstReview = judged;
+    expect(reviewRunEvidence(store.read('r-1'))).toMatchObject({ persistenceFailed: true, persistRetries: 0 });
+    // Retry 1 fails again: same run, one retry counted.
+    await runReviewLoopOnce({ declaration, registry, argv, store, sinks: persistFails, makeJudge,
+      mintRunId: () => 'must-not-be-minted', findResumableRun: () => 'r-1', now: () => '2026-10-20T15:40:00.000Z' });
+    expect(reviewRunEvidence(store.read('r-1'))).toMatchObject({ id: 'r-1', persistenceFailed: true, persistRetries: 1 });
+    // Retry 2 persists: the run is no longer held on persistence, and no juror ever ran again.
+    const ok = await runReviewLoopOnce({ declaration, registry, argv, store, sinks: sinksWith({ seen: [], ruled: { value: true } }),
+      makeJudge, mintRunId: () => 'must-not-be-minted', findResumableRun: () => 'r-1', now: () => '2026-10-20T16:10:00.000Z' });
+    expect(ok.run.id).toBe('r-1');
+    expect(judged).toBe(judgedByFirstReview);
+    expect(store.read('must-not-be-minted')).toBeFalsy();
+    expect(reviewRunEvidence(store.read('r-1'))).toMatchObject({ persistenceFailed: false, parked: false, persistRetries: 2 });
+  });
+
   it('without a resumable run it starts a fresh review exactly as before (new push, re-arm, send-back)', async () => {
     const { declaration, registry } = setup();
     const store = createMemoryRunStore();

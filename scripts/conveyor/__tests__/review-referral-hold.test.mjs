@@ -399,6 +399,17 @@ describe('same-head review loop regression (live #202)', () => {
     r.findings.mandatoryReferrals.effects[0].result.records = [];
     expect(hold(pr(), [reviewRunEvidence(r)])).toBeNull();
   });
+  // Live #5752: a persist retry resumes the SAME run, so the budget counts the run's own failed resumes.
+  it('counts persist retries that resumed the same run, and is exhausted after the third', () => {
+    const resumed = n => ({ ...run({ failure: true }), resumeOf: { persistRetries: n, attempts: 1 } });
+    for (let n = 0; n < REFERRAL_RETRY_MS.length; n++) {
+      const e = reviewRunEvidence(resumed(n));
+      expect(e).toMatchObject({ persistRetries: n });
+      expect(hold(pr(), [e], at + 1)).toMatchObject({ retryAt: at + REFERRAL_RETRY_MS[n], exhausted: false });
+    }
+    expect(hold(pr(), [reviewRunEvidence(resumed(REFERRAL_RETRY_MS.length))], at + 1))
+      .toMatchObject({ retryAt: null, exhausted: true });
+  });
   // Review round 1, finding 1: the referral hold's deliberate live release must not be re-held by the same-head guard.
   it('does not re-hold a PR whose referrals were ruled in the live thread before the parked run started', () => {
     const r = record();
@@ -535,9 +546,14 @@ describe('a ruling on an unchanged head resumes the parked run (replay of #4361)
     expect(find(pr({ comments: thread([ruling, comment('🔁 review — changes requested', at + 90_000)]) }))).toBeNull();
     expect(find(pr({ comments: thread([ruling, comment('please look again', at + 90_000, 'chalbert')]) }))).toBeNull();
   });
-  it('does not resume a run whose referrals never persisted (the retry budget owns that case)', () => {
+  // Live #5752: a failed referral persist owes the persist step again, not a new panel. The hold's retry budget
+  // decides when a review is dispatched; once one is, it resumes the parked run.
+  it('resumes a run whose referrals failed to persist, with or without a ruling, unless a fresh look was asked', () => {
     const failed = reviewRunEvidence(run({ failure: true }));
-    expect(find(pr({ comments: thread([ruling]) }), [failed])).toBeNull();
+    expect(find(pr({ comments: thread() }), [failed])).toEqual({ id: 'review-pr-parked', head });
+    expect(find(pr({ comments: thread([ruling]) }), [failed])).toEqual({ id: 'review-pr-parked', head });
+    expect(find(pr({ comments: thread([comment(`${REARM_COMMENT_MARKER} round 2`, at + 90_000)]) }), [failed])).toBeNull();
+    expect(find(pr({ headRefOid: 'b'.repeat(40) }), [failed])).toBeNull();
   });
   it('a run that was already resumed does not resume on the ruling it already answered', () => {
     const resumed = reviewRunEvidence({ ...run(), resumedAt: iso(at + 120_000) });

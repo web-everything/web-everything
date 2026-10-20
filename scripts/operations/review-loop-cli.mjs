@@ -78,7 +78,7 @@ import {
 import { unattendedAcceptableVerdict, unattendedAcceptHold, unattendedAcceptPolicy } from '../lib/unattended-review-accept.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { hasUncapturedPrevention } from '../lib/jury-core.mjs';
-import { findResumableParkedRun, readReviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
+import { findResumableParkedRun, readReviewRunEvidence, reviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
@@ -646,10 +646,15 @@ export async function runReviewLoopOnce({
         // finishes. Keep what it set aside (`resumeOf`) so a resume that fails part-way still reads as the parked run
         // it was (`reviewRunEvidence`) and is resumed again, never replaced by a fresh panel. An unfinished earlier
         // resume keeps ITS `resumeOf` (the last parked pass); a finished, re-parked one captures its new parked pass.
+        // A finished pass parked on a FAILED referral persist spends one slot of the hold's retry budget per resume
+        // (`persistRetries`, read back by `reviewRunEvidence`), so a persist that keeps failing still runs out.
+        const persistRetries = Math.max(0, Number(parked.resumeOf?.persistRetries) || 0)
+          + (!unfinishedResume && reviewRunEvidence(parked)?.persistenceFailed ? 1 : 0);
         rewound = { ...rewound, resumeOf: unfinishedResume ? { ...parked.resumeOf, attempts: attempts + 1 }
           : { verdict: parked.findings?.referralVerdict ?? parked.verdict ?? null,
             mandatoryReferrals: parked.findings?.mandatoryReferrals ?? null,
-            adviseFinishedAt: parked.stepTimings?.find((t) => t.step === 'advise')?.finishedAt ?? null, attempts: 1 } };
+            adviseFinishedAt: parked.stepTimings?.find((t) => t.step === 'advise')?.finishedAt ?? null, attempts: 1,
+            ...(persistRetries ? { persistRetries } : {}) } };
       }
     } catch { rewound = null; }
     if (rewound) {
