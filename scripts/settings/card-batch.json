@@ -1,6 +1,7 @@
 {
-  "$comment": "cardBatch.adoptDescendantHead: on|off, default on; WE_CARD_BATCH_ADOPT_DESCENDANT_HEAD=on|off overrides it. Adopt only fast-forward descendants whose individual commits (including merge-parent diffs) touch regular top-level backlog/<id>-<name>.md cards with lowercase alphanumeric IDs and lowercase alphanumeric/hyphen names. Reject symlinks, executable files, other paths and coordinator Card-Batch: trailers; admission's reconcile path owns coordinator commits. Members are unchanged. Adoption invalidates verification and restores the hold label and draft state before checkout or verification, including resumed seals and failed protection recovery. Verify the adopted head before releasing the hold or making ready.",
+  "$comment": "cardBatch.adoptDescendantHead: on|off, default on; WE_CARD_BATCH_ADOPT_DESCENDANT_HEAD=on|off overrides it. Adopt only fast-forward descendants whose individual commits (including merge-parent diffs) touch regular top-level backlog/<id>-<name>.md cards with lowercase alphanumeric IDs and lowercase alphanumeric/hyphen names. Reject symlinks, executable files, other paths and coordinator Card-Batch: trailers; admission's reconcile path owns coordinator commits. Members are unchanged. Adoption invalidates verification and restores the hold label and draft state before checkout or verification, including resumed seals and failed protection recovery. Verify the adopted head before releasing the hold or making ready. cardBatch.reconcileIntervalMin: positive integer minutes, default 5; invalid values fall back to 5. Periodically retire terminal sealed PRs, drain pending prevention cards and flush due batches.",
   "cardBatch": {
-    "adoptDescendantHead": "on"
+    "adoptDescendantHead": "on",
+    "reconcileIntervalMin": 5
   }
 }

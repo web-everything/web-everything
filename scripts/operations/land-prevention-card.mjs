@@ -82,6 +82,7 @@
  *   node scripts/operations/land-prevention-card.mjs --drain-pending
  *   node scripts/operations/land-prevention-card.mjs --fold-open-singles [--json]
  */
+import { owePreventionFiling, fileOwedPrevention } from '../lib/prevention-filing-owed.mjs';
 import { machinePrTitle, preventionCardTitle } from './machine-pr-title.mjs';
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync, readdirSync, renameSync } from 'node:fs';
@@ -92,7 +93,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 
 import { fileIntoBatch, cardIdOf } from './card-batch-file.mjs';
 import { cardBatchStateDir } from './card-batch-io.mjs';
-import { loadPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
+import { loadPreventionBatchSettings, formatPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
 import {
   buildApprovalPreventionRetraction, APPROVAL_PREVENTION_DIGEST_KEY_SEP, APPROVAL_PREVENTION_KEY_PREFIX,
@@ -241,6 +242,7 @@ export function parseLandPreventionCardArgv(argv = []) {
     parent: String(flags.parent ?? ''),
     queue: String(flags.queue),
     session: String(flags.session),
+    ...(flags['owed-key'] ? { owedKey: flags['owed-key'] } : {}),
     retract: retractFlags.every(Boolean)
       ? { repo: retractFlags[0], pr: retractFlags[1], headSha: retractFlags[2] }
       : null,
@@ -468,7 +470,16 @@ export async function foldOpenSingles({ lane }, {
  * @returns {Promise<{ok:boolean, step:string, num:(number|string|null), rel:(string|null), pr:(number|null),
  *   url:(string|null), reason:(string|null)}>}
  */
-export async function landPreventionCard(input, {
+export async function landPreventionCard(input, options = {}) {
+  try {
+    const loadFilingSettings = options.loadFilingSettings ?? loadPreventionBatchSettings;
+    if (loadFilingSettings().filingEnabled === false) return await landPreventionCardImpl(input, options);
+    if (options.owedClaimed) return await landPreventionCardImpl(boundLandPreventionCardInput(input), options);
+    return await fileOwedPrevention(input, filing => landPreventionCardImpl(filing.owedKey ? boundLandPreventionCardInput(filing) : filing, options));
+  } catch (e) { return { ok: false, step: 'owed', reason: e.message, pr: null, url: null }; }
+}
+
+async function landPreventionCardImpl(input, {
   exec = defaultExec,
   pendingDir = pendingPreventionDir(),
   write = (line) => process.stdout.write(line),
@@ -479,8 +490,17 @@ export async function landPreventionCard(input, {
   dedupe = runCardDedupe,
   batch = fileIntoBatch,
   loadPreventionBatchSettings: loadBatchSettings = loadPreventionBatchSettings,
+  loadFilingSettings = loadPreventionBatchSettings,
   sleep: wait = sleep,
 } = {}) {
+  const filing = loadFilingSettings();
+  write(`${formatPreventionBatchSettings(filing)}\n`);
+  if (filing.filingEnabled === false) {
+    const reason = 'prevention filing paused by prevention.filingEnabled';
+    if (input.title) owePreventionFiling(input);
+    write(`${reason}\n`);
+    return { ok: false, skipped: true, step: 'paused', reason, num: null, rel: null, pr: null, url: null };
+  }
   // ONE scratch dir per run, created lazily and removed on every exit path (#4317 advisory review, 2026-09-29 —
   // the first cut made a fresh `mkdtempSync` dir for each file and never removed either, leaking two per filing).
   let scratch = null;

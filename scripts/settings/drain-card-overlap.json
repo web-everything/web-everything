@@ -1,0 +1,4 @@
+{
+  "$comment": "drain.cardOverlapCleanMerge (boolean, standard false; env WE_DRAIN_CARD_OVERLAP_CLEAN_MERGE accepting true/false, 1/0, on/off). When the ONLY overlap between an enqueue candidate and the PRs already in GitHub's merge queue is backlog card files (backlog/<card>.md), the drain dry-merges the candidate head onto the queue tip (the last entry's merge-group commit) with git merge-tree --write-tree, object-DB only, nothing pushed. A clean merge enqueues instead of deferring as queue-file-overlap; any non-card overlap, unknown entry file list, unreadable queue tip, fetch or merge-tree error, or conflict keeps the deferral. Every other enqueue gate still applies, and GitHub's merge queue still tests the combination. Each decision is logged as card-overlap clean-merge: #A with #B -> enqueue / -> skip: <why>, with the setting source. See we:scripts/lib/card-overlap-clean-merge.mjs.",
+  "drain": { "cardOverlapCleanMerge": true }
+}

@@ -35,8 +35,9 @@ export { buildConflictFindingBody, defaultPostConflictFinding };
  * ordinary reviewer finding — via `we:scripts/conveyor/reconcile-finding.mjs` ({@link postConflictFinding}) —
  * Same-line statute conflicts go to a fixer first (live #5017 (2026-10-13)). The declared
  * `conflictWatch.sameLineConflict=stand-down` setting retains the earlier direct stand-down route.
- * This file itself still never resolves a conflict or writes a fix — it only decides which of the two existing downstream pipelines a fresh conflict
- * reaches.
+ * Card-only Also-raised-by conflicts are the narrow mechanical exception: this pass asks the shared
+ * no-checkout rebase helper for a stable union, then re-arms review. All other content conflicts still
+ * reach the existing finding/stand-down pipelines.
  *
  * RESOLVED CONFLICTS OWE A FRESH REVIEW. Once GitHub confirms `mergeable: MERGEABLE` on a previously
  * flagged PR still carrying `review:changes`, hand it to `we:scripts/conveyor/rearm-review.mjs` — the SAME
@@ -118,6 +119,14 @@ import { isGhDeferred } from '../lib/gh-deferred.mjs';
 import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { unlinkSync } from 'node:fs';
+import { gitRun } from '../lib/git-run.mjs';
+import { ownerInstallationToken, recoveryPushCredential } from './missing-run-push.mjs';
+import { MISSING_RUN_CREDENTIAL_REFUSAL } from './main-red-recovery.mjs';
+import { repoKeyFromRemoteUrl } from './fix-procedure.mjs';
+import { isCardOnlyDiff } from '../ci-card-only.mjs';
+import { loadCardConflictSettings } from '../lib/card-conflict-resolve.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
@@ -170,6 +179,7 @@ import { operatorAnswerForStandDown } from './stand-down-answer-core.mjs';
 // module's `CONFLICT_LABEL`/`CONFLICT_LABEL_META` (`reconcile-fix-dispatch.mjs`) needs no edit either. See that
 // leaf's own header for the full reasoning and the original docblock this text used to carry.
 import { CONFLICT_LABEL, CONFLICT_LABEL_META } from './conflict-label.mjs';
+import { readInCardGroup } from '../lib/card-group.mjs';
 import { loadSameLineConflictSetting } from './conflict-watch-same-line.mjs';
 // Card xkugvzd — the idle re-assert for an already-labelled, still-conflicting `review:human` PR (live: #4481).
 import { CONFLICT_REASSERT_OFF, decideConflictReassert, resolveConflictReassertSettings } from './conflict-reassert-rule.mjs';
@@ -402,6 +412,66 @@ export function defaultConflictingFilePaths({ pr, cwd = REPO_ROOT, exec = execFi
  */
 export function defaultAttemptUnownedConflictRebase({ pr, cwd = REPO_ROOT, run } = {}) {
   return rebaseDropManifest({ laneRef: pr?.headRefName, base: 'origin/main', cwd, ...(run ? { run } : {}) });
+}
+
+/** Pin the card resolver push to a validated credential and an isolated Git environment. */
+function recoveryPushContext(repo, {
+  env = process.env, exec = execFileSyncThrottled, readCache, now = Date.now(),
+} = {}) {
+  const ownerToken = ownerInstallationToken(repo, { env, readCache, now });
+  const token = String(ownerToken || env.GH_TOKEN || env.GITHUB_TOKEN || exec('gh', ['auth', 'token', '--hostname', 'github.com'], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000, killSignal: 'SIGKILL', env,
+  })).trim();
+  if (!ownerToken && !recoveryPushCredential(token, env)) return { ok: false, error: MISSING_RUN_CREDENTIAL_REFUSAL };
+  const gitEnv = Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith('GIT_')));
+  return { ok: true, env: { ...gitEnv, WE_CI_PUSH_TOKEN: token,
+    GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
+    args: ['-c', 'http.extraHeader=', '-c', 'credential.helper=',
+      '-c', 'credential.helper=!f() { echo username=x-access-token; printf "password=%s\\n" "$WE_CI_PUSH_TOKEN"; }; f'] };
+}
+
+/** Same trusted fast-forward plumbing, with a fresh main and a private index for the card path. */
+export function defaultAttemptCardConflictRebase({ pr, repo, cwd = REPO_ROOT, run = gitRun, cardConflictSettings, cardRebaseSettings,
+  env = process.env, readCache, now = Date.now(),
+} = {}) {
+  // Establish clone ownership before eligibility checks or any fetch/ref work.
+  if (repo) {
+    const remote = run('git', ['remote', 'get-url', 'origin'], { cwd });
+    const expected = repoKeyForSlug(repo);
+    if (remote.status !== 0 || !expected || repoKeyFromRemoteUrl(remote.stdout) !== expected)
+      return { action: 'skip', reason: 'card conflict clone does not match PR repository' };
+  }
+  if (!pr?.headRefName?.startsWith('lane/') || pr.baseRefName !== 'main' || !/^[a-f0-9]{40}$/.test(pr.headRefOid ?? '')) return { action: 'skip', reason: 'not a main-base PR' };
+  const fetched = run('git', ['fetch', 'origin', 'main', pr.headRefName], { cwd });
+  if (fetched.status !== 0) return { action: 'error', reason: 'card conflict fetch failed' };
+  const headFetch = run('git', ['fetch', '--no-tags', 'origin', `refs/heads/${pr.headRefName}`], { cwd });
+  const head = headFetch.status === 0 ? run('git', ['rev-parse', 'FETCH_HEAD'], { cwd }) : null;
+  if (head?.status !== 0 || String(head.stdout).trim() !== pr.headRefOid)
+    return { action: 'skip', deferred: true, reason: 'branch moved before recovery' };
+  let auth;
+  try {
+    auth = recoveryPushContext(repo, { env, readCache, now, exec: (cmd, args, opts) => {
+      const result = run(cmd, args, opts);
+      if (result.status !== 0) throw new Error('credential unavailable');
+      return result.stdout;
+    } });
+  } catch { return { ok: false, action: 'error', error: 'card recovery credential unavailable' }; }
+  if (!auth.ok) return { ok: false, action: 'error', error: auth.error };
+  // Only the recovery push uses this credential. Preserve the resolver's private index and
+  // claim checks, but never let the Git runner merge inherited GIT_* values back into push.
+  const recoveryRun = (cmd, args, opts) => {
+    if (cmd !== 'git' || args[0] !== 'push') return run(cmd, args, opts);
+    try {
+      const result = run(cmd, [...auth.args, ...args], { ...opts, env: auth.env, inheritEnv: false });
+      return result.status === 0 ? result : { status: 1, stderr: 'recovery push failed' };
+    } catch { return { status: 1, stderr: 'recovery push failed' }; }
+  };
+  const tmpIndex = join(cwd, '.git', `card-conflict-index-${process.pid}-${randomUUID()}`);
+  try {
+    return rebaseDropManifest({ laneRef: pr.headRefName, readRef: pr.headRefOid, base: 'origin/main', cwd, run: recoveryRun, fetch: false, tmpIndex, cardConflictSettings, cardRebaseSettings });
+  } finally {
+    try { unlinkSync(tmpIndex); } catch { /* private index may not have been created */ }
+  }
 }
 
 /**
@@ -1361,6 +1431,7 @@ export function defaultPostConflictRearm({ pr, repo, exec = execFileSync }) {
  */
 export function watchParkedPrConflicts({
   repo = null, listPrs = defaultListParkedPrs, provider = createGhProvider(), dryRun = false,
+  inCardGroupFn = readInCardGroup, // xym8nt4 — open card-group members are the drain grouping's to handle
   sameLineConflict = loadSameLineConflictSetting().value,
   postFinding = defaultPostConflictFinding, postStandDown = defaultPostConflictStandDown,
   postRearm = defaultPostConflictRearm,
@@ -1377,6 +1448,8 @@ export function watchParkedPrConflicts({
   // site below (a probe failure/`null`/empty result falls back to the existing whole-file check, unchanged).
   computeConflictingPaths = defaultConflictingFilePaths,
   attemptMechanicalRebase = defaultAttemptUnownedConflictRebase,
+  attemptCardRebase = defaultAttemptCardConflictRebase,
+  cardConflictSettings = loadCardConflictSettings(),
   listAgents = defaultListAgents,
   now = Date.now(),
   queueScope = {},
@@ -1403,6 +1476,10 @@ export function watchParkedPrConflicts({
   // docblock) and was simply never called here.
   let resolvedRepo = repo;
   for (const pr of Array.isArray(prs) ? prs : []) {
+    // xym8nt4 — a post-approval card group's sources and combined PR belong to the drain's grouping while the
+    // group is open: it dissolves the group on a conflict and returns the sources to the normal path, where
+    // this watch applies again. A send-back here would strip the combined PR's review instead.
+    if (inCardGroupFn({ num: pr?.number, repo: resolvedRepo || repo, headRef: pr?.headRefName })) continue;
     const parked = isParkedConflictTarget(pr);
     const queued = !parked && isQueuedConflictTarget(pr);
     // #xs81oxb — the THIRD population: neither parked nor queued (no review-workflow label at all). Folded into
@@ -1413,6 +1490,61 @@ export function watchParkedPrConflicts({
     const plan = planConflictLabelChange({
       isConflicting, isResolved: String(pr?.mergeable || '').toUpperCase() === 'MERGEABLE', currentLabels: pr?.labels,
     });
+    // This owner sits OUTSIDE fix dispatch's scope queue. The git helper independently proves the full
+    // card-only diff and every hunk; no exemption is granted to code fixers or arbitrary card edits.
+    let cardOnly = false;
+    if ((isConflicting || plan.newlyResolved) && (!pr.baseRefName || pr.baseRefName === 'main')) {
+      try {
+        const files = Array.isArray(pr.files) && pr.files.length < GH_FILES_GRAPHQL_CAP
+          ? pr.files : queued && !plan.add ? [] : listPrFiles({ number: pr.number, repo: resolvedRepo });
+        cardOnly = isCardOnlyDiff(files.map(f => typeof f === 'string' ? f : f.path));
+      } catch { /* unknown file set stays on the normal guarded path */ }
+    }
+    let cardAttempt = null;
+    if (isConflicting && cardOnly && cardConflictSettings.value.autoResolveRaisedBy && !dryRun) {
+      const cardEntry = { num: pr.number, isConflicting, ...plan, commented: false,
+        cardConflictSetting: { value: true, source: cardConflictSettings.sources.autoResolveRaisedBy } };
+      let attempted = false;
+      try {
+        if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
+        const comments = listPrComments({ number: pr.number, repo: resolvedRepo });
+        const status = deriveReviewStatus({ pr: pr.number, agents: listAgents(), repo: repoKeyForSlug(resolvedRepo) || 'we' });
+        if (status?.role === 'fix') {
+          results.push({ ...cardEntry, owner: 'fixer', routedTo: 'card-conflict-deferred (fix agent still live)' });
+          continue;
+        }
+        if (countUnownedRebaseAttempts(comments) < UNOWNED_REBASE_ATTEMPT_CAP) {
+          // Keep the conflict marker until rearm completes. A crash after push is recovered by the
+          // newlyResolved branch, including a formerly accepted/queued or unowned card.
+          provider.ensureLabel(resolvedRepo, CONFLICT_LABEL, CONFLICT_LABEL_META);
+          provider.setLabels(resolvedRepo, pr.number, { add: CONFLICT_LABEL, remove: [] });
+          attempted = true;
+          cardAttempt = attemptCardRebase({ pr, repo: resolvedRepo, cardConflictSettings });
+          cardEntry.mechanicalRebase = cardAttempt;
+          if (cardAttempt?.action === 'rebased' || cardAttempt?.action === 'current') {
+            try {
+              postRearm({ pr, repo: resolvedRepo });
+              provider.setLabels(resolvedRepo, pr.number, { remove: [CONFLICT_LABEL] });
+              cardEntry.owner = 'review';
+              cardEntry.routedTo = 'card-conflict-resolver';
+            } catch {
+              cardEntry.owner = 'conflict-watch';
+              cardEntry.routedTo = 'card-conflict-rearm-pending';
+            }
+            results.push(cardEntry);
+            continue;
+          }
+          // Every unsuccessful attempt spends the cap, including a skipped content conflict.
+          try { provider.postComment(resolvedRepo, pr.number, UNOWNED_REBASE_ATTEMPT_MARKER); }
+          catch { /* same best-effort counter as the existing unowned owner */ }
+        }
+      } catch {
+        cardAttempt = { action: 'error', reason: 'card rebase unavailable; normal conflict owner required' };
+        if (attempted) {
+          try { provider.postComment(resolvedRepo, pr.number, UNOWNED_REBASE_ATTEMPT_MARKER); } catch { /* same best-effort counter as the existing owner */ }
+        }
+      }
+    }
     // An approved PR already flagged on an earlier sweep: bounce it once the drain's grace window has passed.
     const graceDue = queued && !plan.add && hasReviewLabel(pr?.labels, CONFLICT_LABEL);
     // #xu2krte Fork 2 (review-human statute amendment) — a PARKED (not queued) `review:human` PR that is ALREADY
@@ -1446,7 +1578,9 @@ export function watchParkedPrConflicts({
     const sameLineRecovery = sameLineConflict === 'fixer' && isConflicting && !plan.add && !plan.remove.length
       && hasReviewLabel(pr?.labels, CONFLICT_LABEL) && !hasReviewLabel(pr?.labels, REVIEW_LABELS.human);
     if (!plan.add && plan.remove.length === 0 && !graceDue && !recheckCandidate && !idleConflictBounce && !sameLineRecovery) continue;
-    const entry = { num: pr?.number, isConflicting, ...plan, commented: false };
+    const entry = { num: pr?.number, isConflicting, ...plan, commented: false,
+      ...(cardAttempt ? { mechanicalRebase: cardAttempt } : {}),
+      ...(cardOnly ? { cardConflictSetting: { value: cardConflictSettings.value.autoResolveRaisedBy, source: cardConflictSettings.sources.autoResolveRaisedBy } } : {}) };
     // The #2793 idle re-assert, shared with card xkugvzd's `review:human` case (`variant` only names the route).
     // Same round cap, same once-per-round guard, same `postFinding` (which keeps `review:human`). Pushes `entry`.
     const reassertIdleConflict = (comments, variant) => {
@@ -2024,7 +2158,7 @@ export function watchParkedPrConflicts({
         provider.setLabels(resolvedRepo, pr?.number, { add: CONFLICT_LABEL, remove: [] });
       } else if (plan.remove.length) {
         // `planConflictLabelChange` only ever returns a non-empty `remove` alongside `newlyResolved: true`.
-        const needsRearm = hasReviewLabel(pr?.labels, REVIEW_LABELS.changes);
+        const needsRearm = hasReviewLabel(pr?.labels, REVIEW_LABELS.changes) || cardOnly;
         let deferRearm = false;
         if (needsRearm) {
           // #4118 (c) — never hand a repaired bounce back for re-review while a fix agent is STILL actively
@@ -2123,8 +2257,10 @@ if (IS_CLI) {
     process.exitCode = 2;
   } else {
     try {
+      const cardConflictSettings = loadCardConflictSettings();
+      writeLineSync(2, `parked-pr-conflict-watch · cardConflicts.autoResolveRaisedBy=${cardConflictSettings.value.autoResolveRaisedBy} (source: ${cardConflictSettings.sources.autoResolveRaisedBy})`);
       const results = watchParkedPrConflicts({
-        repo, dryRun, ...(prsFile ? { listPrs: () => readPrsFromFile(prsFile) } : {}),
+        repo, dryRun, cardConflictSettings, ...(prsFile ? { listPrs: () => readPrsFromFile(prsFile) } : {}),
         conflictReassertSettings: resolveConflictReassertSettings(),
       });
       for (const r of results) {
