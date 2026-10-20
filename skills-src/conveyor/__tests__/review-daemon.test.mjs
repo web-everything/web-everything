@@ -6,7 +6,7 @@ import { readReviewCiGate } from '../../../scripts/lib/review-ci-gate-io.mjs';
  *   and the per-tick sequence, both with every effect injected (no real gh/claude, no real lease/timer).
  */
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -705,6 +705,17 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     ['script extensions inside spaced directory names', [
       'node /a/Review.mjs/Work Space/review-job.mjs',
     ], 1],
+    ['argument-like text inside spaced checkout names', [
+      'node /a/Review.mjs Work/review-job.mjs run --pr=1',
+      'node /a/Review - Work/review-job.mjs run --pr=2',
+      'node /a/Review -- Work/review-loop-cli.mjs --pr=3',
+    ], 3, path => path === '/a/Review.mjs Work/review-job.mjs'],
+    ['spaced preload paths supplied with equals', [
+      'node --import=/a/Boot Work/boot.mjs /a/review-job.mjs',
+      'node --require=/a/Boot Work/boot.cjs /a/review-loop-cli.mjs',
+      'node --loader="/a/Boot Work/boot.mjs" /a/review-job.mjs',
+      'node --import=/a/Review Work/review-job.mjs /a/verify-lane.mjs',
+    ], 3],
     ['review filenames in other scripts and runtime evaluation arguments', [
       'node /a/Review Work/verify-lane.mjs --files=/a/review-job.mjs',
       'node /a/verify-lane.mjs scripts/operations/review-job.mjs',
@@ -714,12 +725,54 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
       'node -e0 /a/review-job.mjs', 'node -p0 /a/review-loop-cli.mjs',
       '/bin/sh /a/review-job.mjs', 'grep /a/review-job.mjs', 'vim scripts/operations/review-loop-cli.mjs',
       '/usr/bin/grep scripts/operations/review-job.mjs', '/usr/bin/vim scripts/operations/review-loop-cli.mjs',
+      'node tool inspect scripts/operations/review-job.mjs',
     ], 0],
     ['parent cycles terminate and unrelated loops still count', [
       '10 11 node other.mjs', '11 10 node /a/review-loop-cli.mjs',
     ], 1],
-  ])('counts live rounds: %s', (_name, lines, expected) => {
-    expect(countLiveReviewRounds(lines)).toBe(expected);
+  ])('counts live rounds: %s', (_name, lines, expected, isScriptFile) => {
+    expect(countLiveReviewRounds(lines, { isScriptFile })).toBe(expected);
+  });
+
+  it('resolves ambiguous absolute script paths on disk and holds when the listing cannot distinguish them', async () => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const root = mkdtempSync(join(tmpdir(), 'review-paths-'));
+    const prefix = join(root, 'Review.mjs');
+    const script = join(`${prefix} Work`, 'review-job.mjs');
+    try {
+      mkdirSync(`${prefix} Work`);
+      writeFileSync(script, '');
+      const read = () => liveReviewRoundBudget({ env: {}, listCommands: () => `node ${script} run --pr=1` });
+      expect(read()).toMatchObject({ live: 1, left: 2 });
+      // Both argv interpretations now name real files: taking either interpretation could undercount.
+      writeFileSync(prefix, '');
+      expect(read()).toMatchObject({ left: 0, reason: expect.stringContaining('ambiguous script path') });
+      expect(liveReviewRoundBudget({ env: {}, listCommands: () => 'node /missing/Review.mjs Work/review-job.mjs' }))
+        .toMatchObject({ left: 0, reason: expect.stringContaining('ambiguous script path') });
+      expect(liveReviewRoundBudget({ env: {}, listCommands: () => `node ${prefix} inspect scripts/operations/review-job.mjs` }))
+        .toMatchObject({ live: 0, left: 3 });
+      for (const files of ['x'.repeat(1500), Array(150).fill('scripts/some-file.mjs').join(' ')]) {
+        expect(liveReviewRoundBudget({ env: {}, listCommands: () => `node ${prefix} --files=${files} scripts/operations/review-job.mjs` }))
+          .toMatchObject({ live: 0, left: 3 });
+      }
+      const shortPrefix = join(root, 'Review');
+      const otherScript = join(`${shortPrefix} Work`, 'review-loop-cli.mjs');
+      mkdirSync(`${shortPrefix} Work`);
+      writeFileSync(otherScript, '');
+      writeFileSync(shortPrefix, '');
+      expect(liveReviewRoundBudget({ env: {}, listCommands: () => `node ${otherScript} --pr=1` }))
+        .toMatchObject({ left: 0, reason: expect.stringContaining('ambiguous script path') });
+      const dashScript = join(root, 'Review -Work', 'review-job.mjs');
+      mkdirSync(join(root, 'Review -Work'));
+      writeFileSync(dashScript, '');
+      expect(liveReviewRoundBudget({ env: {}, listCommands: () => `node ${dashScript} run --pr=1` }))
+        .toMatchObject({ live: 1, left: 2 });
+      expect(liveReviewRoundBudget({ env: {}, listCommands: () => 'node Review Work/scripts/operations/review-job.mjs run --pr=1' }))
+        .toMatchObject({ left: 0, reason: expect.stringContaining('ambiguous script path') });
+      expect(() => countLiveReviewRounds(['node /a/Review Work/review-job.mjs'], {
+        isScriptFile: () => { throw Object.assign(new Error('unreadable'), { code: 'EACCES' }); },
+      })).toThrow('unreadable');
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   it('a cap-bound tick says the live-review cap held the review, never "no acquirable lane"', async () => {

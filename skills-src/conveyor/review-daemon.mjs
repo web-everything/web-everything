@@ -72,7 +72,7 @@
  * pass in this repo (`runner.mjs`'s `makeCliMechanicalPasses`) — it never fails the review tick itself.
  */
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { cascadePolicy } from '../../scripts/lib/policy-cascade.mjs';
 import { resolve, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1138,8 +1138,10 @@ export function priorityNamesForLiveProcessPrs(liveProcessPrs) {
  * the daemon dispatched nothing with 1 real round live. A round is one job or one bare loop (a job runs a loop).
  * Command-only lines are accepted conservatively: without ancestry every matching process is a round.
  * @param {string[]} lines
+ * @param {{isScriptFile?: function(string): boolean}} options Optional absolute-path classifier. Ambiguous
+ *   or unreadable candidates throw; the live budget holds dispatch. Relative argv uses lexical conventions.
  */
-export function countLiveReviewRounds(lines) {
+export function countLiveReviewRounds(lines, { isScriptFile = null } = {}) {
   // Runtimes that run a script file, and the runtime flags that take their value as the NEXT word (a preload,
   // a loader): those values are not the script. An unknown runtime still counts when its argv[0] is the script.
   const RUNTIME = /(^|\/)(node|nodejs|bun|electron)(\.exe)?$/;
@@ -1152,14 +1154,43 @@ export function countLiveReviewRounds(lines) {
   };
   const path = (text) => {
     if (/^["']/.test(text)) return word(text);
+    const first = word(text);
     // ps prints argv joined by spaces, without shell quoting. Retain the whole path up to its script
     // extension instead of treating a checkout directory's first space as the end of the script.
-    // A following option or a new rooted path starts another argument. Stop at the first complete script
-    // suffix: a later positional argument may itself name another script.
-    const boundary = text.search(/\s+(?=(?:--?|\/|\.{1,2}\/))/);
+    // Flattened ps text can lose a path's boundaries, including extensionless prefixes and option-like
+    // directory fragments. Check every plausible absolute candidate before applying lexical conventions.
+    const candidates = [];
+    const mentionsReview = /review-(?:job|loop-cli)\.mjs(?:\s|$)/.test(text);
+    const boundary = text.search(/\s+(?=(?:--?[A-Za-z0-9]|\/|\.{1,2}\/))/);
     const span = boundary < 0 ? text : text.slice(0, boundary);
-    const match = /^(.*?\.(?:mjs|cjs|js))(?=\s|$)\s*/.exec(span);
-    return match ? { value: match[1], rest: text.slice(match[0].length).trimStart() } : word(text);
+    for (const match of text.matchAll(/\.(?:mjs|cjs|js)(?=\s|$)/g)) {
+      const candidate = text.slice(0, match.index + match[0].length);
+      // No script opened by these POSIX runtimes can exceed Linux's 4096-byte pathname bound (macOS is
+      // tighter). Long changed-file argv must not turn impossible concatenated paths into a cap hold.
+      if (Buffer.byteLength(candidate) >= 4096) break;
+      candidates.push(candidate);
+      // No review filename anywhere in this span: later argument boundaries cannot change its count.
+      if (!mentionsReview) break;
+    }
+    let resolved;
+    if (isScriptFile && mentionsReview && first.value.startsWith('/')) {
+      const files = [...new Set([first.value, ...candidates])].filter(candidate => isScriptFile(candidate));
+      if (files.length > 1) throw new Error('ambiguous script path in process listing');
+      [resolved] = files;
+      const lexicalCandidates = candidates.filter(candidate => candidate.length <= span.length);
+      if (!resolved && lexicalCandidates.length !== 1) throw new Error('ambiguous script path in process listing');
+    }
+    // Relative paths belong to the other process's cwd. Preserve the first complete script convention
+    // (including relative preload values), but never turn an ambiguous extensionless entrypoint into zero.
+    if (!first.value.includes('/') && !/\.(?:mjs|cjs|js)$/.test(first.value)) {
+      if (isScriptFile && mentionsReview) throw new Error('ambiguous script path in process listing');
+      return first;
+    }
+    // Bare '-' / '--' may be directory fragments. A normal option or a rooted path starts a new argument
+    // in the lexical fallback; an existing absolute path above takes precedence over that convention.
+    const match = /^(.*?\.(?:mjs|cjs|js))(?=\s|$)/.exec(span);
+    const value = resolved ?? match?.[1] ?? first.value;
+    return { value, rest: text.slice(value.length).trimStart() };
   };
   const script = (command) => {
     const runtime = word(command);
@@ -1174,6 +1205,11 @@ export function countLiveReviewRounds(lines) {
       if (t.value === '--') return path(t.rest).value.split('/').pop();
       // Evaluation modes never execute a script from the remaining argv.
       if (/^(?:-[ep]|--(?:eval|print)(?:=|$))/.test(t.value)) return '';
+      const equals = rest.indexOf('=');
+      if (equals > 0 && PRELOAD_FLAGS.has(rest.slice(0, equals))) {
+        rest = path(rest.slice(equals + 1)).rest;
+        continue;
+      }
       if (VALUE_FLAGS.has(t.value)) {
         rest = PRELOAD_FLAGS.has(t.value) && /^(?:\/|\.{1,2}\/)/.test(t.rest) ? path(t.rest).rest : word(t.rest).rest;
         continue;
@@ -1224,7 +1260,20 @@ export function liveReviewRoundBudget({ env = process.env, listCommands = () => 
   const src = r.sources?.maxLiveReviewRounds ?? 'standard';
   let lines;
   try { lines = String(listCommands()).split('\n'); } catch (e) { return { left: 0, reason: `live review rounds unknown (${String(e?.message ?? e).split('\n')[0]}); maxLiveReviewRounds=${max} (${src})` }; }
-  const live = countLiveReviewRounds(lines);
+  let live;
+  try {
+    live = countLiveReviewRounds(lines, { isScriptFile: (path) => {
+      // Another process's relative paths must never be resolved against the daemon's cwd.
+      if (!path.startsWith('/')) return false;
+      try { return statSync(path).isFile(); }
+      catch (error) {
+        if (['ENOENT', 'ENOTDIR', 'ENAMETOOLONG'].includes(error?.code)) return false;
+        throw error;
+      }
+    } });
+  } catch {
+    return { left: 0, reason: `live review rounds unknown (ambiguous script path); maxLiveReviewRounds=${max} (${src})` };
+  }
   return { left: Math.max(0, max - live), live, max, reason: `live review rounds ${live} of maxLiveReviewRounds=${max} (${src})` };
 }
 

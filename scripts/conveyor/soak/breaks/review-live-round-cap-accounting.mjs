@@ -1,5 +1,6 @@
 /** PR #5769 red team: declined starts starved healthy repos and command parsing undercounted live rounds. */
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -31,10 +32,35 @@ export default {
       const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () => commands.join('\n') });
       if (budget.live !== expected || budget.left !== 3 - expected) violations.push(`${name}: ${JSON.stringify(budget)}`);
     }
+    const rootDir = mkdtempSync(join(tmpdir(), 'review-cap-paths-'));
+    try {
+      const prefix = join(rootDir, 'Review.mjs');
+      const job = join(`${prefix} Work`, 'review-job.mjs');
+      mkdirSync(`${prefix} Work`);
+      writeFileSync(job, '');
+      const tool = join(rootDir, 'tool');
+      writeFileSync(tool, '');
+      const cases = [
+        ['extension-like checkout name', `node ${job} run --pr=1`, 1],
+        ['dash in checkout name', 'node /a/Review - Work/review-job.mjs run --pr=1', 1],
+        ['equals preload', 'node --import=/a/Boot Work/boot.mjs /a/review-job.mjs', 1],
+        ['extensionless tool argument', `node ${tool} inspect scripts/operations/review-job.mjs`, 0],
+        ['long verifier arguments', `node ${tool} --files=${'x'.repeat(1500)} scripts/operations/review-job.mjs`, 0],
+        ['many verifier arguments', `node ${tool} --files=${Array(150).fill('scripts/some-file.mjs').join(' ')} scripts/operations/review-job.mjs`, 0],
+      ];
+      for (const [name, command, expected] of cases) {
+        const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () => command });
+        if (budget.live !== expected) violations.push(`${name}: ${JSON.stringify(budget)}`);
+      }
+      writeFileSync(prefix, '');
+      const ambiguous = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () => `node ${job} run --pr=1` });
+      if (ambiguous.left !== 0) violations.push('ambiguous process argv admitted new review rounds');
+    } finally { rmSync(rootDir, { recursive: true, force: true }); }
     for (let tick = 1; tick <= 2; tick++) {
       const budget = { left: 3 };
       const result = runReviewTickAllRepos({
         repos: ['web-everything/web-everything', 'frontier-ui/frontierui'], liveReviewBudget: budget,
+        authGateOverride: () => ({ paused: false, reason: null }),
         reconcile: ({ repo }) => ({ dispatch: Array.from({ length: repo === 'web-everything/web-everything' ? 3 : 1 },
           (_, i) => ({ kind: 'review', prNumber: 100 + i })), refusals: [] }),
         dispatch: ({ repo }) => repo === 'web-everything/web-everything'
