@@ -24,6 +24,7 @@ import { writeBacklogMd } from '../backlog/guarded-write.mjs';
 // a day ahead of a UTC-behind operator all evening; `check:standards` scans for that shape and caught the
 // first cut of `resolve-io.mjs` doing exactly it.
 import { localToday } from '../lib/local-date.mjs';
+import { nextHash } from '../backlog/id.mjs';
 import { allocateCardNumber } from '../lib/card-number-allocator.mjs';
 import { SCAFFOLD_EFFECT } from './scaffold.mjs';
 
@@ -54,9 +55,10 @@ export function createScaffoldReader({
       .filter((f) => f.endsWith('.md'))
       .map((f) => idFromName(f))
       .filter(Boolean);
-    const allocation = allocate({ cwd: root, log });
+    const bornAs = nextHash(existingIds);
+    const allocation = allocate({ id: bornAs, cwd: root, log });
     if (!allocation.ok) log(`scaffold: using hash naming: ${allocation.reason}`);
-    return { existingIds, today: today(), dir,
+    return { existingIds, today: today(), dir, bornAs,
       ...(allocation.ok ? { allocatedId: String(allocation.num) } : {}) };
   };
 }

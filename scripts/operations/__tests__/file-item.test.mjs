@@ -99,7 +99,7 @@ describe('the declaration end to end', () => {
   }
 
   it('writes and queues the final number supplied by the reader', async () => {
-    const registry = buildRegistry({ allocatedId: '123' });
+    const registry = buildRegistry({ allocatedId: '123', bornAs: 'xabc123' });
     const written = []; const queued = [];
     const sinks = {
       [SCAFFOLD_EFFECT]: async (p) => { written.push(p); return { written: true }; },
@@ -109,7 +109,7 @@ describe('the declaration end to end', () => {
       input: { title: 'Numbered task', kind: 'task', digest: 'why' }, registry }), { registry });
     run = await runToCompletion(run, { registry, sinks, store: createMemoryRunStore() });
     expect(written[0].rel).toBe('backlog/123-numbered-task.md');
-    expect(written[0].content).toMatch(/^bornAs: x[0-9a-z]{6}$/m);
+    expect(written[0].content).toMatch(/^bornAs: xabc123$/m);
     expect(queued[0].num).toBe('123');
   });
 

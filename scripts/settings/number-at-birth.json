@@ -1,7 +1,9 @@
 {
-  "$comment": "Allocate the final card number before creation (#3732). enabled: on|off; WE_NUMBER_AT_BIRTH=on|off overrides it. remote: best-effort records host-only claims on outage; required falls back to hash naming if the remote claim cannot be made. The drain clash check remains authoritative at main.",
-  "numberAtBirth": {
-    "enabled": "on",
-    "remote": "best-effort"
+  "$comment": "Number cards at creation with a durable birth id record. WE_NUMBER_AT_BIRTH=on|off overrides atBirth. Required remote outages fall back to hash naming; best-effort explicitly permits logged host-only claims.",
+  "backlog": {
+    "cardNumbering": {
+      "atBirth": "on",
+      "atBirthRemote": "required"
+    }
   }
 }

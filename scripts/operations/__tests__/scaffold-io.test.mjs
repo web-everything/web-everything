@@ -101,3 +101,73 @@ describe('number at birth reader to plan', () => {
     expect(logs.join('')).toContain('lock unavailable');
   });
 });
+
+it('passes the allocated birth id unchanged through the reader and pure plan', async () => {
+  const { shapeScaffoldRead, planScaffold } = await import('../scaffold.mjs');
+  let birth;
+  const raw = createScaffoldReader({ root: '/repo', listFiles: () => [], allocate: ({ id }) => {
+    birth = id; return { ok: true, num: '041' };
+  } })();
+  expect(birth).toMatch(/^x[0-9a-z]{6}$/);
+  expect(raw.bornAs).toBe(birth);
+  const plan = planScaffold(shapeScaffoldRead(raw), { title: 'Birth', kind: 'task' });
+  expect(plan.content).toContain(`bornAs: ${birth}`);
+});
+
+it('parallel processes run the real reader and plan with shared host reservations', async () => {
+  const { mkdtempSync, mkdirSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join, resolve } = await import('node:path');
+  const { pathToFileURL } = await import('node:url');
+  const { promisify } = await import('node:util');
+  const { execFile } = await import('node:child_process');
+  const root = mkdtempSync(join(tmpdir(), 'birth-reader-'));
+  try {
+    mkdirSync(join(root, 'backlog'));
+    const url = (p) => JSON.stringify(pathToFileURL(resolve(p)).href);
+    const code = `import { createScaffoldReader } from ${url('scripts/operations/scaffold-io.mjs')};
+      import { shapeScaffoldRead, planScaffold } from ${url('scripts/operations/scaffold.mjs')};
+      import { allocateCardNumber } from ${url('scripts/lib/card-number-allocator.mjs')};
+      const root = process.argv[1];
+      const raw = createScaffoldReader({ root, log: () => {}, allocate: (opts) => allocateCardNumber({ ...opts,
+        statePath: root + '/state.json', lockRoot: root + '/locks', waitMs: 5000,
+        settings: { value: { enabled: 'on', remote: 'best-effort' }, source: 'settings file' },
+        git: () => { throw Error('offline'); } }) })();
+      console.log(JSON.stringify({ raw, plan: planScaffold(shapeScaffoldRead(raw), { title: 'Parallel', kind: 'task' }) }));`;
+    const results = await Promise.all(Array.from({ length: 8 }, () => promisify(execFile)(process.execPath,
+      ['--input-type=module', '-e', code, root])));
+    const rows = results.map((r) => JSON.parse(r.stdout));
+    expect(new Set(rows.map((r) => r.plan.rel)).size).toBe(8);
+    const ids = JSON.parse(readFileSync(join(root, 'state.json'))).ids;
+    for (const { raw, plan } of rows) {
+      expect(plan.rel).toMatch(/^backlog\/\d+-parallel.md$/);
+      expect(raw.bornAs).toMatch(/^x[0-9a-z]{6}$/);
+      expect(plan.content).toContain(`bornAs: ${raw.bornAs}`);
+      expect(ids[raw.bornAs]).toBe(raw.allocatedId);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+it('real allocator outages and held locks give hash filenames without throwing', async () => {
+  const { allocateCardNumber, loadNumberAtBirthSettings } = await import('../../lib/card-number-allocator.mjs');
+  const { tryAcquireNumberingLock } = await import('../../readiness/drain-lock.mjs');
+  const { planScaffold, shapeScaffoldRead } = await import('../scaffold.mjs');
+  const { mkdtempSync, mkdirSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const root = mkdtempSync(join(tmpdir(), 'birth-outage-'));
+  try {
+    mkdirSync(join(root, 'backlog'));
+    for (const held of [false, true]) {
+      const lockRoot = join(root, held ? 'held-lock' : 'free-lock');
+      if (held) tryAcquireNumberingLock(lockRoot, 'test');
+      const raw = createScaffoldReader({ root, log: () => {}, allocate: (opts) => allocateCardNumber({
+        ...opts, statePath: join(root, 'state.json'), lockRoot, waitMs: 0,
+        settings: loadNumberAtBirthSettings({ file: {}, env: {} }), git: () => { throw Error('offline'); },
+      }) })();
+      const plan = planScaffold(shapeScaffoldRead(raw), { title: 'Outage', kind: 'task' });
+      expect(plan.rel).toBe(`backlog/${raw.bornAs}-outage.md`);
+      expect(plan.rel).toMatch(/^backlog\/x[0-9a-z]{6}-outage.md$/);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

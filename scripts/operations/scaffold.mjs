@@ -100,6 +100,7 @@ export function shapeScaffoldRead(raw) {
     existingIds: raw.existingIds.map(String),
     today: String(raw.today || ''),
     dir: String(raw.dir || ''),
+    ...(raw.bornAs ? { bornAs: String(raw.bornAs) } : {}),
     ...(raw.allocatedId ? { allocatedId: String(raw.allocatedId) } : {}),
   };
 }
@@ -133,12 +134,12 @@ export function planScaffold(read, input = {}, { alloc = nextHash } = {}) {
 
   const key = (id) => /^\d+$/.test(id) ? String(Number(id)) : id;
   const taken = new Set(read.existingIds.map(key));
-  let num = String(read.allocatedId || alloc(read.existingIds));
+  let num = String(read.allocatedId || read.bornAs || alloc(read.existingIds));
   if (!read.allocatedId && taken.has(key(num))) num = alloc([...read.existingIds, num]);
   if (taken.has(key(num))) {
     refuse('id-exhausted', `the id allocator returned a taken id (${num}) — refusing`);
   }
-  const bornAs = /^\d+$/.test(num) ? nextHash(read.existingIds) : null;
+  const bornAs = /^\d+$/.test(num) ? (read.bornAs || nextHash(read.existingIds)) : null;
 
   const name = `${num}-${slug}.md`;
   let content = renderItem({

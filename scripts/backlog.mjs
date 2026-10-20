@@ -729,9 +729,9 @@ function scaffold() {
   const scope = (flag('scope') || '').split(',').map((s) => s.trim()).filter(Boolean);
 
   const existing = files().map((f) => idFromName(f)).filter(Boolean);
-  const allocation = allocateCardNumber({ cwd: ROOT, backlogDir: DIR });
-  if (!allocation.ok) console.warn(`scaffold: using hash naming: ${allocation.reason}`);
   const birthHash = nextHash(existing);
+  const allocation = allocateCardNumber({ id: birthHash, cwd: ROOT, backlogDir: DIR });
+  if (!allocation.ok) console.warn(`scaffold: using hash naming: ${allocation.reason}`);
   let finalNum = allocation.ok ? String(allocation.num) : birthHash;
   if (files().some((f) => Number(idFromName(f)) === Number(finalNum) || idFromName(f) === finalNum)) {
     if (allocation.ok) die(`scaffold: allocated id ${finalNum} is already taken`);
