@@ -362,15 +362,29 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     expect(readGroupState(statePath).groups).toEqual([]);
   });
 
-  // Sources on CARD, each `edit` writing the card; every PR live-reads OPEN + accepted at its head unless changed.
-  function formRepo(edits) {
-    const { cwd, base, branch } = repo();
+  // One source per `edits` entry: a string is the new CARD text, an object maps paths to texts. `baseFiles` are
+  // committed on main first. Every PR live-reads OPEN + accepted at its head unless the test changes it.
+  function formRepo(edits, { baseFiles } = {}) {
+    const { cwd } = repo();
+    if (baseFiles) {
+      for (const [p, text] of Object.entries(baseFiles)) writeFileSync(join(cwd, p), text);
+      git(cwd, 'add', '-A'); git(cwd, 'commit', '-qm', 'base2');
+    }
+    const base = git(cwd, 'rev-parse', 'HEAD');
     const heads = {};
-    for (const [n, text] of Object.entries(edits)) heads[n] = branch(`s${n}`, () => writeFileSync(join(cwd, CARD), text));
+    for (const [n, spec] of Object.entries(edits)) {
+      git(cwd, 'checkout', '-q', '-b', `s${n}`, base);
+      for (const [p, text] of Object.entries(typeof spec === 'string' ? { [CARD]: spec } : spec)) writeFileSync(join(cwd, p), text);
+      git(cwd, 'add', '-A'); git(cwd, 'commit', '-qm', `s${n}`);
+      heads[n] = git(cwd, 'rev-parse', 'HEAD');
+      git(cwd, 'checkout', '-q', 'main');
+    }
     const labels = Object.fromEntries(Object.keys(heads).map(n => [n, accepted]));
+    const fails = new Set();
     const calls = [];
     const exec = (cmd, args) => {
       calls.push(args.join(' '));
+      if (args[0] === 'pr' && args[1] === 'view' && fails.has(args[2])) throw new Error('gh: 502');
       if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ state: 'OPEN', isDraft: false, headRefOid: heads[args[2]], headRefName: 'lane/x', baseRefName: 'main', labels: labels[args[2]] });
       if (args[0] === 'pr' && args[1] === 'create') return 'https://github.com/o/r/pull/77\n';
       if (args[0] === 'pr' && ['comment', 'close'].includes(args[1])) return '';
@@ -381,7 +395,7 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     const outcomes = nums.map(n => ({ num: n, kind: 'queue-file-overlap', reason: `#9 share ${CARD}` }));
     const out = [];
     const opts = { localSlug: 'o/r', cwd, run: runIn(cwd, () => base), exec, settings, log: { write: l => out.push(l) }, prestage: () => ({ allowed: true }), cardConflictSettings: cc };
-    return { cwd, base, heads, labels, calls, exec, verdicts, outcomes, out, opts };
+    return { cwd, base, heads, labels, fails, calls, exec, verdicts, outcomes, out, opts };
   }
 
   describe('form: admission and eligibility', () => {
@@ -423,6 +437,7 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       ['head moved', t => { t.heads[2] = 'f'.repeat(40); }, /claim refused: #2 head moved/],
       ['approval gone', t => { t.labels[2] = [{ name: 'ready-to-merge' }]; }, /claim refused: #2 not review:accepted/],
       ['sent back', t => { t.labels[1] = [...accepted, { name: 'review:changes' }]; }, /claim refused: #1 holds review:changes/],
+      ['re-read fails', t => { t.fails.add('2'); }, /claim refused: #2 re-read failed \(gh: 502\)/],
     ])('eligibility that changes between the build and the claim refuses the claim (%s): no group, no push, no PR', (_, change, refused) => {
       const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11]) });
       const statePath = join(tmp(), 's.json');
@@ -444,6 +459,17 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       const r = createCardGrouping({ ...t.opts, statePath, withLock, readQueue: () => ({ error: 'gh down' }) }).form({ outcomes: t.outcomes, verdicts: t.verdicts });
       expect(r.reason).toMatch(/claim refused: merge queue unreadable \(gh down\)/);
       expect(readGroupState(statePath).groups ?? []).toEqual([]);
+    });
+
+    it('a source that joined another group between the build and the claim refuses the claim', () => {
+      const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11]) });
+      const statePath = join(tmp(), 's.json');
+      const other = { id: 'other', repo: 'o/r', pr: 5, branch: 'lane/card-group-other', sources: [{ num: 2, headSha: t.heads[2] }, { num: 9, headSha: 'e'.repeat(40) }] };
+      const withLock = fn => { writeFileSync(statePath, JSON.stringify({ groups: [other], failed: {} })); return { ran: true, result: fn() }; };
+      const r = createCardGrouping({ ...t.opts, statePath, withLock, readQueue: () => ({ inQueue: new Set() }) }).form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      expect(r.reason).toMatch(/claim refused: a source joined another group meanwhile/);
+      expect(readGroupState(statePath).groups.map(g => g.id)).toEqual(['other']);
+      expect(t.calls.some(c => c.startsWith('pr create'))).toBe(false);
     });
   });
 
@@ -474,12 +500,64 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       expect(readGroupState(statePath).groups).toEqual([]);
       expect(g.form({ outcomes: t.outcomes, verdicts: t.verdicts }).reason).toMatch(/retry backoff/);
     });
+
+    it('a proof failure no single source owns (a base duplicate deleted) refuses the whole group, leaving nobody out', () => {
+      // #3 shares only the other card with #1; its list conflict there unions cleanly, so nothing pins on #3.
+      const t = formRepo({
+        1: { [CARD]: card([1, 1, 2, 10]), 'backlog/5473-other.md': card([7, 13]) },
+        2: card([1, 1, 2, 11]),
+        3: { 'backlog/5473-other.md': card([7, 14]) },
+      }, { baseFiles: { [CARD]: card([1, 1, 2]) } });
+      const r = createCardGrouping({ ...t.opts, statePath: join(tmp(), 's.json'), dryRun: true }).form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      expect(r.plan).toBeUndefined();
+      expect(r.reason).toMatch(/^union check failed \(.*unexpected deletions [1-9]/);
+      expect(r.reason).not.toMatch(/fewer than 2 left/);
+      expect(t.out.join('')).not.toMatch(/left out of the group/);
+    });
+
+    it('a proof failure every source shares refuses the whole group, leaving nobody out', () => {
+      const t = formRepo({ 1: card([1, 2, 10, 10]), 2: card([1, 2, 11, 11]) });
+      const r = createCardGrouping({ ...t.opts, statePath: join(tmp(), 's.json'), dryRun: true }).form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      expect(r.plan).toBeUndefined();
+      expect(r.reason).toMatch(/^union check failed \(missing 2/);
+      expect(r.reason).not.toMatch(/fewer than 2 left/);
+      expect(t.out.join('')).not.toMatch(/left out of the group/);
+    });
+
+    it('autoResolveRaisedBy disabled is never blamed on one source: the whole group refuses', () => {
+      const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11]), 3: card([1, 2, 12]) });
+      const off = { value: { autoResolveRaisedBy: false }, sources: { autoResolveRaisedBy: 'tool' } };
+      const r = createCardGrouping({ ...t.opts, statePath: join(tmp(), 's.json'), dryRun: true, cardConflictSettings: off }).form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      expect(r.reason).toMatch(/autoResolveRaisedBy disabled .*autoResolveRaisedBy=false \(tool\)/);
+      expect(r.reason).not.toMatch(/fewer than 2 left/);
+      expect(t.out.join('')).not.toMatch(/left out of the group/);
+    });
+
+    it('a source whose change mentions an ambiguous JIT reference is left out; the rest still group', () => {
+      const t = formRepo({ 1: card([1, 2, 10]).replace('Body.', 'Body. See xaaaaaa.'), 2: card([1, 2, 11]), 3: card([1, 2, 12]) },
+        { baseFiles: { 'backlog/7001-a.md': '---\nbornAs: xaaaaaa\n---\n', 'backlog/7002-b.md': '---\nbornAs: xaaaaaa\n---\n' } });
+      const r = createCardGrouping({ ...t.opts, statePath: join(tmp(), 's.json'), dryRun: true }).form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      expect(r.plan.sources.map(s => s.num)).toEqual([2, 3]);
+      expect(t.out.join('')).toMatch(/#1 left out of the group \(mentions ambiguous JIT reference xaaaaaa\)/);
+    });
+
+    it('a git read error inside the union proof refuses the whole group (never read as "absent")', () => {
+      const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11]) });
+      const statePath = join(tmp(), 's.json');
+      const run = (cmd, args, o) => (args[0] === 'ls-tree' && args[1] === t.base ? { status: 128, stdout: '', stderr: 'fatal: read error' } : t.opts.run(cmd, args, o));
+      const r = createCardGrouping({ ...t.opts, run, statePath }).form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      expect(r.reason).toMatch(/^union check error \(ls-tree /);
+      expect(Object.keys(readGroupState(statePath).failed)).toHaveLength(1);
+      expect(() => verifyUnion({ base: t.base, combined: t.heads[1], sources: [{ num: 1, headSha: t.heads[1] }], cwd: t.cwd, run })).toThrow(/ls-tree/);
+    });
   });
 
   describe('reconcile: dissolve and interrupted creation', () => {
     const A = 'a'.repeat(40), B = 'b'.repeat(40);
     const T0 = 1_000_000;
-    function reconcileCase({ combined = { state: 'OPEN', labels: accepted }, sources = {}, readFails = [], closeFails = false, pr = 77, list = [], listThrows = false, at = T0 } = {}) {
+    // A live combined PR carries ready-to-merge + review:pending (it is re-reviewed); that alone must never dissolve it.
+    const waiting = [{ name: 'ready-to-merge' }, { name: 'review:pending' }];
+    function reconcileCase({ combined = { state: 'OPEN', labels: waiting }, sources = {}, readFails = [], closeFails = false, pr = 77, list = [], listThrows = false, at = T0 } = {}) {
       const statePath = join(tmp(), 's.json');
       writeFileSync(statePath, JSON.stringify({ groups: [{ id: 'g', repo: 'o/r', pr, branch: 'lane/card-group-g', createdAt: T0, sources: [{ num: 1, headSha: A }, { num: 2, headSha: B }] }], failed: {} }));
       const live = { 1: { state: 'OPEN', isDraft: false, headRefOid: A, headRefName: 'lane/x', baseRefName: 'main', labels: accepted, ...sources[1] },
@@ -528,7 +606,9 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     });
 
     it.each([
-      ['the combined PR is healthy', {}],
+      ['the combined PR is waiting for review (ready-to-merge + review:pending)', {}],
+      ['a check that is not required failed', { combined: { state: 'OPEN', labels: waiting, statusCheckRollup: [{ name: 'lint', conclusion: 'FAILURE' }] } }],
+      ['the required check is still running', { combined: { state: 'OPEN', labels: waiting, statusCheckRollup: [{ name: 'test', status: 'IN_PROGRESS', conclusion: '' }] } }],
       ['a source read fails (fail closed: held)', { readFails: [2] }],
       ['closing the combined PR fails (held, retried)', { combined: { state: 'OPEN', labels: [{ name: 'review:changes' }] }, closeFails: true }],
       ['the combined PR read fails', { combined: 'throw' }],
