@@ -88,8 +88,12 @@ export async function publishBatch(input, opts = {}) {
       atomicRecord(statePath, state);
     };
     const retire = async () => {
-      // The existing failed-seal quarantine is outside terminal-PR recovery.
-      if (state.sealFailure) return retireBatch(statePath, state, { repo, kind, held });
+      // The existing failed-seal quarantine is outside terminal-PR recovery, except a failure recorded because the PR
+      // went terminal mid-seal: that one retires only through the fresh-read terminal path, which re-spools a CLOSED
+      // batch's unmerged cards first (respoolClosed) and keeps the batch held when it cannot.
+      if (state.sealFailure && !['MERGED', 'CLOSED'].includes(state.sealFailure.terminalPrState)) {
+        return retireBatch(statePath, state, { repo, kind, held });
+      }
       return retireTerminalBatch(state, { ...input, source: { repo }, kind, laneDir: cwd }, {
         statePath, stateDir, remote, gh, held, log: opts.log,
       });
@@ -99,15 +103,17 @@ export async function publishBatch(input, opts = {}) {
     // A started seal whose PR already MERGED or CLOSED (landed or closed by another path) can never finish: every
     // remaining step targets an open PR, and terminal retirement only accepts a finished seal. Live: #5680 merged at
     // step record-sealed and held the prevention slot from 2026-10-20 on. Record it as a seal failure, so the
-    // existing failed-seal quarantine archives it with the reason and frees the slot. An unreadable view throws as before.
+    // fresh-read terminal retirement archives it with the reason and frees the slot (re-spooling a CLOSED batch's
+    // unmerged cards first; if that fails the batch stays held and the operator queue lists it). An unreadable view
+    // throws as before.
     if (state.sealedAt && state.pr) {
       const view = JSON.parse(await gh(['pr', 'view', String(state.pr), '--repo', repo, '--json', 'number,state,headRefName']));
       if (Number(view?.number) === Number(state.pr) && view.headRefName === state.batchRef && ['MERGED', 'CLOSED'].includes(view.state)) {
         state.sealFailure = { reason: `PR ${view.state} before the seal finished (step ${state.seal?.step ?? 'none'}); the seal cannot resume`,
           at: new Date(now()).toISOString(), terminalPrState: view.state };
         save();
-        await retire();
-        return { action: 'held', state };
+        const retired = await retire();
+        return { action: 'held', state, retired: retired?.action === 'retired' };
       }
     }
     const restoreProtection = async () => {

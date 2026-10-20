@@ -89,19 +89,21 @@ try { ({ needsPersonRow } = await import('./operator-queue-needs-person.mjs')); 
 // Card-batch holds (#5766/#5773): a withdrawn draft whose hold the seal job still owns is PARKED, not NEEDS YOU.
 // Optional like its siblings: without it every withdrawn draft keeps the NEEDS YOU row (fail loud).
 let defaultReadCardBatchHolds = null;
+let closedBatchesNotRespooled = null;
 try {
-  const [{ readCardBatchHolds, cardBatchHoldKey }, { cardBatchStateDir }, { effectiveCardBatchPolicy }] = await Promise.all([
+  const [{ readCardBatchHolds, cardBatchHoldKey, closedBatchesNotRespooled: closedNotRespooled }, { cardBatchStateDir }, { effectiveCardBatchPolicy }] = await Promise.all([
     import('./operator-queue-card-batch-holds.mjs'), import('./card-batch-io.mjs'), import('../lib/card-batch-settings.mjs')]);
+  closedBatchesNotRespooled = closedNotRespooled;
   defaultReadCardBatchHolds = () => ({ ...readCardBatchHolds({ stateDir: cardBatchStateDir(), policy: effectiveCardBatchPolicy() }), keyOf: cardBatchHoldKey });
 } catch { /* staged copies */ }
 // Fixer-withdrawal evidence for a hold the seal job owns: the fix claim ledger, the PR's fix-begin comments, and
 // who put the withdrawal label on. Without these modules nothing parks (the reader is absent → NEEDS YOU).
 export let defaultWithdrawalEvidence = null;
 try {
-  const [{ fixerWithdrawalEvidence }, { fixDispatchClaimRoot, fixDispatchResource }, { lockDirFor, readLockEntry },
-    { OPERATOR_LOGINS }, { WITHDRAWN_LABEL }, { existsSync }] = await Promise.all([
+  const [{ fixerWithdrawalEvidence, readFixClaimEntry }, { fixDispatchClaimRoot, fixDispatchResource }, { lockDirFor, readLockEntry },
+    { OPERATOR_LOGINS }, { WITHDRAWN_LABEL }] = await Promise.all([
     import('./operator-queue-card-batch-holds.mjs'), import('../conveyor/fix-claim-store.mjs'), import('../readiness/file-locks.mjs'),
-    import('../lib/marker-authorship.mjs'), import('../conveyor/draft-promotion-rule.mjs'), import('node:fs')]);
+    import('../lib/marker-authorship.mjs'), import('../conveyor/draft-promotion-rule.mjs')]);
   defaultWithdrawalEvidence = (repo, pr) => {
     const repoKey = repoKeyForSlug(repo);
     if (!repoKey) return `${repo} is not a constellation repo`;
@@ -109,8 +111,7 @@ try {
     // `fixing` is the fix-begin claim (the one that can withdraw); `fix` is the daemon's fixer dispatch claim.
     const claims = ['fixing', 'fix'].map((kind) => {
       const resource = fixDispatchResource({ repo: repoKey, pr: Number(pr.number), kind });
-      if (!existsSync(join(lockDirFor(lockRoot, resource), 'lock.json'))) return { kind, entry: null };
-      return { kind, entry: readLockEntry(lockRoot, resource) ?? 'unreadable' };
+      return { kind, entry: readFixClaimEntry(lockDirFor(lockRoot, resource), { readEntry: () => readLockEntry(lockRoot, resource) }) };
     });
     const out = String(execFileSync('gh', ['api', '--paginate', `repos/${repo}/issues/${Number(pr.number)}/events`, '--jq',
       '.[] | select(.event == "labeled" or .event == "unlabeled") | {event, label: .label.name, actor: .actor.login}'],
@@ -848,6 +849,18 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
       failedRead(repo, error);
     }
   }
+  // A CLOSED card batch whose cards could not be re-spooled stays held in its slot; its PR is closed, so no open-PR
+  // row above shows it. It needs a person: list it under NEEDS YOU.
+  if (readCardBatchHolds && closedBatchesNotRespooled) {
+    cardBatchHold('', 0);
+    for (const hold of closedBatchesNotRespooled(cardBatch.holds)) {
+      if (requested.length && !requested.includes(hold.repo)) continue;
+      report.needsPerson.push({ repo: hold.repo, number: hold.pr, title: `card batch ${hold.batchRef}`, kind: 'card-batch-respool-failed',
+        noteAt: null, headline: 'Closed card batch could not re-queue its cards — it stays held',
+        detail: `${hold.members} card(s); ${hold.reason}. The seal job and the card-batch reconcile retry the re-spool each tick.`,
+        commands: { inspect: 'node scripts/operations/card-batch-reconcile.mjs --dry-run' }, alsoNotReady: [] });
+    }
+  }
   if (readFailures) {
     process.exitCode = 1;
   }
@@ -878,7 +891,7 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
       + (pr.ceremonyOwed ? ` — ${pr.reason}\n    clear-human: node scripts/review-set-label.mjs ${pr.number} --repo=${pr.repo} --to=clear-human --actor=<your login> --reason='<your words>'`
         : (pr.humanHolds ? ` — merge-gate holds only for human review: ${pr.humanHolds.join(', ')}` : ''))).concat((report.needsYouStandDowns ?? []).map((pr) => `${pr.repo}#${pr.number}  ${pr.title}  [stood down ${pr.standDownAt || 'time unknown'} — the fixer asks] ${pr.question}`
       + pr.remaining.map((f) => `\n    - still needs your ruling: ${f.file || '(no file)'}${f.line != null ? `:${f.line}` : ''}  ${f.summary}`).join(''))).concat(report.needsPerson.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}  [conveyor asks since ${pr.noteAt}] ${pr.headline}${pr.detail ? ` — ${pr.detail}` : ''}`
-      + (pr.commands.releaseDraft ? `\n    release draft: ${pr.commands.releaseDraft}`
+      + (pr.commands.inspect ? `\n    inspect: ${pr.commands.inspect}` : pr.commands.releaseDraft ? `\n    release draft: ${pr.commands.releaseDraft}`
         : `\n    extend rounds: ${pr.commands.extendRounds}\n    send back past the cap: ${pr.commands.sendBack}\n    answer the stand-down: ${pr.commands.standDownAnswer}\n    close: ${pr.commands.close}`))).join('\n'));
     console.log('RULING NEEDED — review parked with confirmed findings; each needs your block/card/not-real ruling:');
     printRows(report.rulingNeeded.map((r) => `${r.repo}#${r.number}  ${r.title}  [waiting since ${r.since || 'time unknown'}, head ${r.head.slice(0, 9)}]\n`

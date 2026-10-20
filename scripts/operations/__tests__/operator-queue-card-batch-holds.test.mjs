@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { classifyCardBatchHold, fixerWithdrawalEvidence, FIX_BEGIN_COMMENT_LEAD, readCardBatchHolds, SEAL_GRACE_MS } from '../operator-queue-card-batch-holds.mjs';
+import { classifyCardBatchHold, closedBatchesNotRespooled, readFixClaimEntry, fixerWithdrawalEvidence, FIX_BEGIN_COMMENT_LEAD, readCardBatchHolds, SEAL_GRACE_MS } from '../operator-queue-card-batch-holds.mjs';
 import { FIX_BEGIN_MARKER } from '../../conveyor/fix-procedure.mjs';
 
 const policy = { filing: { maxAgeMinutes: 60, maxCards: 3 } };
@@ -95,5 +95,54 @@ describe('fixerWithdrawalEvidence', () => {
     ['unreadable label history', { labelEvents: null }, 'unreadable'],
   ])('%s is evidence', (_name, override, text) => {
     expect(fixerWithdrawalEvidence({ ...clean, ...override })).toContain(text);
+  });
+});
+
+describe('readFixClaimEntry', () => {
+  const enoent = Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+  const eacces = Object.assign(new Error('EACCES'), { code: 'EACCES' });
+  const statOf = (map) => (path) => { const r = map[path.endsWith('lock.json') ? 'file' : 'dir']; if (r) throw r; return {}; };
+  const entry = { owner: 'fix:x', meta: { who: 'fixer-1' } };
+  it('no lock directory is no claim', () => {
+    expect(readFixClaimEntry('/l/d', { stat: statOf({ dir: enoent }), readEntry: () => entry })).toBeNull();
+  });
+  it('a lock directory that cannot be stat-ed is unreadable, not absent', () => {
+    expect(readFixClaimEntry('/l/d', { stat: statOf({ dir: eacces }), readEntry: () => entry })).toBe('unreadable');
+  });
+  it('a lock directory with no metadata yet is a live claim', () => {
+    expect(readFixClaimEntry('/l/d', { stat: statOf({ file: enoent }), readEntry: () => null })).toMatchObject({ owner: expect.stringContaining('no metadata') });
+  });
+  it('metadata that cannot be stat-ed, parsed, or read is unreadable', () => {
+    expect(readFixClaimEntry('/l/d', { stat: statOf({ file: eacces }), readEntry: () => entry })).toBe('unreadable');
+    expect(readFixClaimEntry('/l/d', { stat: statOf({}), readEntry: () => null })).toBe('unreadable');
+    expect(readFixClaimEntry('/l/d', { stat: statOf({}), readEntry: () => { throw new Error('x'); } })).toBe('unreadable');
+  });
+  it('a readable entry is returned', () => {
+    expect(readFixClaimEntry('/l/d', { stat: statOf({}), readEntry: () => entry })).toBe(entry);
+  });
+  it('end to end on disk: absent, then entry-less dir, then a real entry', () => {
+    const root = mkdtempSync(join(tmpdir(), 'fix-claim-'));
+    const dir = join(root, 'claim');
+    expect(readFixClaimEntry(dir, { readEntry: () => null })).toBeNull();
+    mkdirSync(dir);
+    expect(readFixClaimEntry(dir, { readEntry: () => null })).toMatchObject({ meta: null });
+    writeFileSync(join(dir, 'lock.json'), '{');
+    expect(readFixClaimEntry(dir, { readEntry: () => null })).toBe('unreadable');
+  });
+});
+
+describe('closedBatchesNotRespooled', () => {
+  it('lists only active-slot CLOSED seal failures', () => {
+    const holds = new Map([
+      ['a', { slot: 'active', status: 'failed', terminalPrState: 'CLOSED', pr: 1 }],
+      ['b', { slot: 'sealed', status: 'failed', terminalPrState: 'CLOSED', pr: 2 }],
+      ['c', { slot: 'active', status: 'failed', terminalPrState: 'MERGED', pr: 3 }],
+      ['d', { slot: 'active', status: 'failed', terminalPrState: null, pr: 4 }],
+    ]);
+    expect(closedBatchesNotRespooled(holds).map(h => h.pr)).toEqual([1]);
+  });
+  it('classify carries the terminal state and the PR', () => {
+    expect(classifyCardBatchHold({ ...active, sealFailure: { reason: 'r', terminalPrState: 'CLOSED' } }, { now: opened, policy }))
+      .toMatchObject({ status: 'failed', terminalPrState: 'CLOSED', pr: 5773 });
   });
 });

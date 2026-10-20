@@ -171,3 +171,16 @@ describe('#5773: a card-batch hold the seal job still owns is PARKED, not NEEDS 
     expect(report.errors.join(' ')).toContain('card-batch holds unavailable: EACCES');
   });
 });
+
+it('a CLOSED card batch whose cards could not be re-spooled is listed under NEEDS YOU with an inspect command', () => {
+  execFileSync.mockReturnValue('[]');
+  const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+  const hold = { slot: 'active', status: 'failed', terminalPrState: 'CLOSED', repo: 'o/n', pr: 5690, members: 4,
+    batchRef: 'lane/card-batch-prevention-24', reason: 'PR CLOSED before the seal finished (step record-sealed); the seal cannot resume' };
+  main(['--repo=o/n', '--json'], { readCardBatchHolds: () => ({ holds: new Map([['o/n#5690', hold]]), errors: [] }), withdrawalEvidence: () => null });
+  const report = JSON.parse(log.mock.calls.at(-1)[0]);
+  expect(report.needsPerson).toMatchObject([{ number: 5690, kind: 'card-batch-respool-failed', commands: { inspect: expect.any(String) } }]);
+  log.mockClear();
+  main(['--repo=o/n'], { readCardBatchHolds: () => ({ holds: new Map([['o/n#5690', hold]]), errors: [] }), withdrawalEvidence: () => null });
+  expect(log.mock.calls.map(c => c[0]).join('\n')).toContain('inspect: node scripts/operations/card-batch-reconcile.mjs --dry-run');
+});

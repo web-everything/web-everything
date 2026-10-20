@@ -17,7 +17,7 @@
  *                 Stays in NEEDS YOU. The same goes for a PR whose head moved off the batch head (the caller checks).
  * A PR the state does not name, or state that cannot be read, keeps the old NEEDS YOU row (fail loud).
  */
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 /** Time the scheduler gets to launch (or relaunch) a seal worker once one is owed, before the hold is overdue. */
@@ -40,7 +40,8 @@ const keyOf = (repo, number) => `${repo}#${Number(number)}`;
 export function classifyCardBatchHold(state, { now = Date.now(), policy = {}, lockExpiresAt = null } = {}) {
   const kind = state.kind ?? null;
   const members = Array.isArray(state.members) ? state.members : [];
-  const base = { kind, batchRef: state.batchRef ?? null, headSha: state.headSha ?? null, members: members.length };
+  const base = { kind, batchRef: state.batchRef ?? null, headSha: state.headSha ?? null, members: members.length,
+    pr: Number(state.pr) || null, terminalPrState: state.sealFailure?.terminalPrState ?? null };
   if (state.sealFailure) return { ...base, status: 'failed', dueAt: null, reason: String(state.sealFailure.reason ?? 'seal failed') };
   if (RELEASED_STEPS.has(state.seal?.step)) {
     return { ...base, status: 'done', dueAt: null, reason: `the seal job already released its hold (step ${state.seal.step}); this withdrawal is not the batch's` };
@@ -77,7 +78,7 @@ export function readCardBatchHolds({ stateDir, now = Date.now(), policy = {}, re
   const holds = new Map();
   const errors = [];
   const rank = { owned: 0, done: 1, overdue: 2, failed: 3 };
-  const scan = dir => {
+  const scan = (dir, slot) => {
     let files;
     try { files = list(dir); } catch (error) { if (error.code === 'ENOENT') return; throw error; }
     for (const file of files.filter(name => name.endsWith('.json'))) {
@@ -87,13 +88,13 @@ export function readCardBatchHolds({ stateDir, now = Date.now(), policy = {}, re
       const repo = state.repo ?? state.members[0].source.repo;
       let lockExpiresAt = null;
       try { lockExpiresAt = JSON.parse(read(join(dir, `${file}.lock`), 'utf8'))?.expiresAt ?? null; } catch { /* no lock */ }
-      const hold = classifyCardBatchHold(state, { now, policy, lockExpiresAt });
+      const hold = { ...classifyCardBatchHold(state, { now, policy, lockExpiresAt }), repo, slot };
       const key = keyOf(repo, state.pr);
       if (!holds.has(key) || rank[hold.status] > rank[holds.get(key).status]) holds.set(key, hold);
     }
   };
-  scan(stateDir);
-  scan(join(stateDir, 'sealed'));
+  scan(stateDir, 'active');
+  scan(join(stateDir, 'sealed'), 'sealed');
   return { holds, errors };
 }
 
@@ -127,4 +128,31 @@ export function fixerWithdrawalEvidence({ claims, comments, labelEvents, sealAct
   if (added.length !== 1) return `the withdrawal label was added ${added.length} times`;
   if (!sealActors.includes(added[0].actor)) return `the withdrawal label was added by ${added[0].actor ?? 'an unknown actor'}, not the seal job`;
   return null;
+}
+
+/**
+ * Pure: the CLOSED (unmerged) batches whose cards could not be re-spooled. The seal job and the reconcile both keep
+ * such a batch in the active slot (held) until a re-spool verifies; while it sits there a person is needed, and its
+ * PR is closed, so no open-PR row would ever show it.
+ */
+export function closedBatchesNotRespooled(holds) {
+  return [...holds.values()].filter(h => h.slot === 'active' && h.status === 'failed' && h.terminalPrState === 'CLOSED');
+}
+
+/**
+ * Read one fix claim from the claim ledger, telling "no claim" apart from "cannot tell".
+ * The lock DIRECTORY is the claim (we:scripts/readiness/file-locks.mjs: mkdir wins, metadata is written after), so:
+ *   - directory absent (ENOENT)                → `null` (no claim)
+ *   - directory present, entry readable        → the entry
+ *   - directory present, no `lock.json` yet    → a live claim with no metadata
+ *   - any other stat error, or an unparseable `lock.json` → `'unreadable'`
+ */
+export function readFixClaimEntry(dir, { stat = statSync, readEntry }) {
+  try { stat(dir); } catch (error) { return error?.code === 'ENOENT' ? null : 'unreadable'; }
+  try { stat(join(dir, 'lock.json')); } catch (error) {
+    return error?.code === 'ENOENT' ? { owner: '(claim being taken; no metadata yet)', meta: null } : 'unreadable';
+  }
+  let entry;
+  try { entry = readEntry(); } catch { return 'unreadable'; }
+  return entry ?? 'unreadable';
 }
