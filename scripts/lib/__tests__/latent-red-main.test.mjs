@@ -70,14 +70,19 @@ describe('runLatentRedMainCheck', () => {
     expect(runLatentRedMainCheck({ repo: 'o/r', exec: dry, threshold: 3, ledgerPath: `${ledgerPath}.dry`, dryRun: true, log: () => {} })).toMatchObject({ fired: true, action: 'rerun-main' });
     expect(dry.mock.calls.some(([, a]) => a[1] === 'rerun')).toBe(false);
   }));
-  it('retries a refused re-run at most 3 times in all and never throws on unreadable reads', () => withDir((ledgerPath) => {
+  it('never re-issues a re-run whose outcome is unknown; retries a deferred one at most 3 times', () => withDir((ledgerPath) => {
     const exec = host({ rerunThrows: true });
-    const go = () => runLatentRedMainCheck({ repo: 'o/r', exec, threshold: 3, ledgerPath, publish: () => {}, log: () => {} });
-    expect(go().detail.rerun).toMatch(/^failed/);
-    expect(go().action).toBe('rerun-main');
-    expect(go().action).toBe('rerun-main');
+    const go = (x = exec, path = ledgerPath) => runLatentRedMainCheck({ repo: 'o/r', exec: x, threshold: 3, ledgerPath: path, publish: () => {}, log: () => {} });
+    expect(go().detail.rerun).toMatch(/^outcome unknown/);
     expect(go().action).toBe('already-acted');
-    expect(exec.mock.calls.filter(([, a]) => a[1] === 'rerun')).toHaveLength(3);
+    expect(exec.mock.calls.filter(([, a]) => a[1] === 'rerun')).toHaveLength(1);
+    const base = host();
+    const deferred = vi.fn((bin, args) => (args[1] === 'rerun' ? JSON.stringify({ outcome: 'deferred-low-budget' }) : base(bin, args)));
+    const p2 = `${ledgerPath}.2`;
+    expect(go(deferred, p2).detail.rerun).toMatch(/^failed: deferred/);
+    go(deferred, p2); go(deferred, p2);
+    expect(go(deferred, p2).action).toBe('already-acted');
+    expect(deferred.mock.calls.filter(([, a]) => a[1] === 'rerun')).toHaveLength(3);
     expect(runLatentRedMainCheck({ repo: 'o/r', exec: () => { throw new Error('rate'); }, threshold: 3, ledgerPath, log: () => {} }).action).toBe('error');
     expect(runLatentRedMainCheck({ repo: 'o/r', exec, threshold: 0, ledgerPath, log: () => {} }).action).toBe('off');
   }));
