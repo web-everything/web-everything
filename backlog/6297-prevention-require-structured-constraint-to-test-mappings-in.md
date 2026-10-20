@@ -12,7 +12,7 @@ tags: []
 # Prevention — Require structured constraint-to-test mappings in backlog validation, including a named planned c… (from web-everything/web-everything#5598 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/xbu87uk-host-overload-guard-cap-concurrent-lane-whois-transcript-gre.md:12` — Require structured constraint-to-test mappings in backlog validation, including a named planned case and assertion for every guarded operation and scope; review concurrency assertions for independently executing lanes.
+1. `we:backlog/6292-host-overload-guard-cap-concurrent-lane-whois-transcript-gre.md:12` — Require structured constraint-to-test mappings in backlog validation, including a named planned case and assertion for every guarded operation and scope; review concurrency assertions for independently executing lanes.
 
 Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 1 → #5360, finding 3 → #5668.
 

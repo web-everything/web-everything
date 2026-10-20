@@ -4,7 +4,7 @@ kind: story
 size: 2
 parent: "4075"
 status: open
-scope: ["we:scripts/progress-board.mjs", "we:scripts/progress-board.test.mjs"]
+scope: ["we:scripts/progress-board.mjs", "we:scripts/__tests__/progress-board.test.mjs"]
 dateOpened: "2026-09-26"
 tags: []
 ---

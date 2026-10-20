@@ -4,7 +4,6 @@ kind: story
 size: 5
 parent: "6122"
 status: open
-humanGate: { kind: review, what: "Operator must link approval of the replacement #5057 merge-group invariant in the epic decision note before this switch can dispatch." }
 blockedBy: ["6121", "6124", "6125", "6126"]
 scope: ["we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/lane-drain.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/settings/merge-queue-numbering.json", "we:scripts/settings/card-numbering.json", "we:scripts/check-standards.mjs", "we:scripts/lib/card-number-ledger.mjs", "we:scripts/lib/__tests__/queue-branch-numbering.test.mjs", "we:scripts/__tests__/lane-drain.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/__tests__/check-standards.test.mjs"]
 dateOpened: "2026-10-13"
@@ -13,13 +12,17 @@ tags: [backlog, drain, merge-queue, numbering, ledger]
 
 # Switch the card-numbering mode to rename-after-land (no code path removed)
 
-Slice (d) of epic 6122: make every numbering step obey `backlog.cardNumbering.mode`, then flip the repo to `rename-after-land`. The pre-enqueue rename is turned off for the merge queue, not deleted. This slice stays human-gated until the epic links operator approval of the replacement #5057 invariant.
+Slice (d) of epic 6122: make every numbering step obey `backlog.cardNumbering.mode`, then flip the repo to `rename-after-land` (nightly cadence). The pre-enqueue rename is turned off for the merge queue, not deleted. The humanGate was removed on 2026-10-19: the operator approved the replacement #5057 invariant (see epic 6122, "Ruling 2026-10-19").
 
 ## Design
 
 - Mode-gate, do not delete. Every step below stays in the code and runs only in its mode:
-  The #5057 relaxation and mode flip require linked operator approval first; an unattributed quote does not
-  clear the humanGate.
+  Approved invariant (operator ruling 2026-10-19, point 5, epic 6122): "Every backlog card on `main` has exactly
+  one number, recorded where a reader can find it: in the file name (`NNN-slug`) or in exactly one ledger row
+  (`x<6>-slug`). No `x<6>` card file may be added to `main` without a ledger row, and no id or number is bound
+  to two cards. A merge group that adds an unledgered `x<6>` card, or whose needed ledger is unreadable, is
+  refused." The same PR amends the ratified statute `backlog-ids-numbered-before-publish` to match, and makes
+  the `backlog-ids` check refuse an added `x<6>` path only when it has no ledger row.
   - `rename-before-enqueue`: `prepareBranchBeforeEnqueue` (we:scripts/lib/queue-branch-numbering.mjs:238),
     `sweepQueuedHashCards` (:318), `probeQueuedLand` (:354), `repairHashOnMain` (:200), and the
     `mergeGroupHashRefusals` merge_group refusal (:34-37, called at we:scripts/check-standards.mjs:787-789),
@@ -103,8 +106,8 @@ and each renamed card shows its ledger number and `bornAs`. Paste both listings 
 
 ## Done when
 
-- The epic records an operator approval URL for the exact #5057 replacement invariant and the humanGate
-  is cleared through the human process; this design PR supplies no approval or review verdict.
+- The epic's recorded operator ruling of 2026-10-19 (point 5) is the approval for the exact #5057 replacement
+  invariant; the humanGate is cleared by that ruling.
 - Three consecutive real PRs with new cards land at their judged head with one CI round each.
 - The first real rename batch PR (slice (f)) lands through the merge queue with a single CI run, and a second
   run with no new x-id cards on main opens nothing.

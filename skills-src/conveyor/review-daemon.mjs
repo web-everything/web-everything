@@ -403,6 +403,7 @@ export function runReviewTick({
   readRedTeamRequests = null,
   readReviewEvidence = null,
   redTeamTimingSetting = readRedTeamTiming,
+  // One-line failure causes (status sweep / status tag). The real daemon wires `log.error`; tests inject a spy.
   log = () => {},
   readMainFixPr = readMainFixPriority,
   finishRedTeamRequest = finishDrainRedTeamRequest,

@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/health-smells/build-session-looping.mjs", "we:scripts/conveyor/build-supervision.mjs", "we:scripts/conveyor/health-smells/__tests__/build-session-looping.test.mjs", "we:scripts/conveyor/__tests__/build-supervision.test.mjs"]
+scope: ["we:scripts/conveyor/health-smells/build-session-looping.mjs", "we:scripts/conveyor/build-supervision.mjs", "we:scripts/conveyor/health-smells/__tests__/build-session-looping.test.mjs", "we:scripts/conveyor/health-smells/__tests__/build-supervision.test.mjs"]
 dateOpened: "2026-10-06"
 tags: []
 ---

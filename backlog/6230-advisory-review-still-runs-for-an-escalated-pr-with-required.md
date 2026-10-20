@@ -3,14 +3,14 @@ bornAs: x9kvmnd
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/lib/reconcile-core.mjs"]
+scope: ["we:scripts/conveyor/reconcile-core.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
 # Advisory review still runs for an escalated PR with required CI red under startAfter=fast-checks
 
-[A1] Executable. Priority: expedite. An escalated CI-red PR gets no advisory review under startAfter=fast-checks (we:scripts/lib/reconcile-core.mjs:1536). Scope: we:scripts/lib/reconcile-core.mjs (dispatchReviewRow/dispatchReview/dispatchReviewJob, reviewStartGate) and its tests. Note: build after #5465 lands.
+[A1] Executable. Priority: expedite. An escalated CI-red PR gets no advisory review under startAfter=fast-checks (we:scripts/conveyor/reconcile-core.mjs:1536). Scope: we:scripts/conveyor/reconcile-core.mjs (dispatchReviewRow/dispatchReview/dispatchReviewJob, reviewStartGate) and its tests. Note: build after #5465 lands.
 
 ## Acceptance
 
