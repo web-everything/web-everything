@@ -107,16 +107,18 @@ describe('xqz26k1 pure hunk rule', () => {
   });
 
   it('[A3] a hunk whose kept side drops a numeric cap the other carries is never auto-resolved (attempts 1 vs 3)', () => {
-    expect(guardDiff(['x = { attempts: 3, runTimeoutMin: 30 }'], ['x = { attempts: 1 }'])).toEqual(['attempts=1']);
+    expect(guardDiff(['x = { attempts: 3, runTimeoutMin: 30 }'], ['x = { attempts: 1 }'])).toEqual(['num:x = { attempts: 1 }']);
+    // the full numeric expression, not the first literal
+    expect(guardDiff(['  timeoutMs: 30 * 600_000,'], ['  timeoutMs: 30 * 60_000,'])).toEqual(['num:timeoutMs: 30 * 60_000,']);
     expect(guardDiff(['v => v <= 120000'], ['v => v <= 60000'])).toEqual(['cmp:v => v <= 60000']);
     // whole expressions (never a truncated operand), and == / != are guards too
     expect(guardDiff(['if (attempts < limit * 3) retry();'], ['if (attempts < limit) retry();'])).toEqual(['cmp:if (attempts < limit) retry();']);
     expect(guardDiff(['if (mode) go();'], ["if (mode == 'strict') go();"])).toEqual(["cmp:if (mode == 'strict') go();"]);
     expect(guardDiff(['const f = (x) => x;'], ['const g = (y) => y;'])).toEqual([]); // an arrow is not a comparison
-    expect(guardDiff(['  "attempts": 3,'], ['  "attempts": 1,'])).toEqual(['attempts=1']); // JSON settings too
+    expect(guardDiff(['  "attempts": 3,'], ['  "attempts": 1,'])).toEqual(['num:"attempts": 1,']); // JSON settings too
     // a killed merge-file (empty output) is never a resolution
     expect(resolveFileHunks({ diff3: '' })).toMatchObject({ ok: false, hunks: [{ why: 'merge-file-no-conflict-output' }] });
-    expect(guardDiff(['`attempts` defaults to 3;'], ['`attempts` defaults to 1 and has a hard upper bound of 1.'])).toContain('doc:attempts=1');
+    expect(guardDiff(['`attempts` defaults to 3;'], ['`attempts` defaults to 1 and has a hard upper bound of 1.'])).toEqual(['num:`attempts` defaults to 1 and has a hard upper bound of 1.']);
     const base = ['const D = { attempts: 3 };'];
     const ov = ['const D = { attempts: 1 };'];
     const mn = ['const D = { attempts: 3, runTimeoutMin: 30 };'];
@@ -124,7 +126,7 @@ describe('xqz26k1 pure hunk rule', () => {
     // even if main's history once added the overlay's line, taking main would drop attempts: 1
     const r = resolveFileHunks({ diff3, mainRuns: [['const D = { attempts: 1 };']] });
     expect(r.ok).toBe(false);
-    expect(r.hunks[0].why).toMatch(/^guard-diff: .*attempts=1/);
+    expect(r.hunks[0].why).toMatch(/^guard-diff: .*attempts: 1/);
     // docs/config never resolve without the per-file patch-id match
     expect(resolveFileHunks({ diff3, docsConfig: true }).hunks[0].why).toBe('docs-config-needs-patch-id-match');
   });
@@ -222,7 +224,7 @@ describe('xqz26k1 — a held clone builds and checks its own refresh candidate',
     gitOk(f.clone, ['fetch', '-q', 'origin']);
     const r = await rebuild(f);
     expect(r.autoRefresh).toMatchObject({ verdict: 'needs-human', candidate: null });
-    expect(r.alerts.find((a) => a.kind === 'auto-refresh-candidate').detail.unresolved[0].why).toMatch(/^guard-diff: .*attempts=1/);
+    expect(r.alerts.find((a) => a.kind === 'auto-refresh-candidate').detail.unresolved[0].why).toMatch(/^guard-diff: .*attempts: 1/);
   });
 
   it('an overlay removed from the list voids the recorded candidate; shadow-passed candidates are re-checked once mode is on', async () => {
@@ -262,7 +264,7 @@ describe('xqz26k1 — a held clone builds and checks its own refresh candidate',
     const r = await rebuild(f);
     expect(r.autoRefresh).toMatchObject({ verdict: 'needs-human' });
     const why = r.alerts.find((a) => a.kind === 'auto-refresh-candidate').detail.unresolved;
-    expect(why).toEqual([{ path: CFG, why: expect.stringMatching(/^guard-lost: .*attempts=1/) }]);
+    expect(why).toEqual([{ path: CFG, why: expect.stringMatching(/^guard-lost: .*attempts: 1/) }]);
   });
 
   it('round-2 audit: tests cover cleanly merged files too, and marker lines brought in by the merge keep the hold', async () => {
@@ -282,8 +284,10 @@ describe('xqz26k1 — a held clone builds and checks its own refresh candidate',
     await heldOnGraduation(g);
     g.commit('main', 'origin/main', { 'notes.txt': '<<<<<<< ours\nx\n=======\ny\n>>>>>>> theirs\n' }, 'main commits markers');
     gitOk(g.clone, ['fetch', '-q', 'origin']);
-    // markers main itself carries are not "added" by the refresh: the candidate holds no more than main
-    expect((await rebuild(g, { entries: undefined })).autoRefresh.verdict).toBe('clean');
+    // operator ruling: ANY marker line anywhere in the candidate refuses it, even one main already carries
+    const held = await rebuild(g, { entries: undefined });
+    expect(held.autoRefresh).toMatchObject({ verdict: 'needs-human', candidate: null });
+    expect(held.alerts.find((a) => a.kind === 'auto-refresh-candidate').detail.unresolved).toEqual([{ path: 'notes.txt', why: 'markers-left' }]);
   });
 
   it('mode off: the plain x9diisp hold, no candidate', async () => {

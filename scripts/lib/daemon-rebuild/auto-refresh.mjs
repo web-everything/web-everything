@@ -53,7 +53,7 @@ import {
 import { runLiveSmoke, runLiveSmokeWithRetry, refreshSmokeGithubEnv, decideSmokeVerdict } from '../daemon-live-smoke.mjs';
 import { stateDir, alertsFilePath } from './state.mjs';
 import {
-  verifyRev, rebuildCommitEnv, FULL_SHA_RE, REBUILD_IDENTITY_ENV,
+  verifyRev, FULL_SHA_RE, REBUILD_IDENTITY_ENV,
 } from './shared.mjs';
 import {
   materializeCandidate, removeCandidate, candidateWorktreePath, candidateSmokeEnv,
@@ -166,23 +166,24 @@ export function carriedBy(change, { base, other, otherHistoryRuns = [] }) {
   return true;
 }
 
-const NUM_FACT_RE = /["']?([A-Za-z_$][\w$-]*)["']?\s*[:=]\s*(-?\d[\d_]*(?:\.\d+)?)(?![\w.])/g;
+const NUM_FACT_RE = /["']?([A-Za-z_$][\w$-]*)["']?\s*[:=]\s*(-?\d[\d_]*(?:\.\d+)?)(?![\w.])/;
 /** A line holding a comparison (`<`, `<=`, `>`, `>=`, `==`, `===`, `!=`, `!==`; arrows `=>` are not comparisons). */
 const CMP_LINE_RE = /(<=|>=|===|!==|==|!=|<|>)/;
 const ARROW_RE = /=>/g;
-const DOC_FACT_RE = /`([\w.$-]+)`[^.\n`]{0,60}?\b(?:defaults? to|is capped at|capped at|upper bound of|bound of|is|=)\s*`?(-?\d[\d_]*)/gi;
+const DOC_FACT_RE = /`([\w.$-]+)`[^.\n`]{0,60}?\b(?:defaults? to|is capped at|capped at|upper bound of|bound of|is|=)\s*`?(-?\d[\d_]*)/i;
 
-/** PURE: the guard facts in a block of lines — numeric settings, comparisons, documented numeric defaults. */
+/** PURE: the guard facts in a block of lines — every line holding a numeric setting (`name: 3`, `"name": 3`,
+ *  `name = 30 * 60_000`), a documented numeric default ("`name` defaults to 1") or a comparison. Round-4 audit: a fact is
+ *  the WHOLE normalized line, never just the first literal or a truncated operand — `30 * 60_000` and `30 * 600_000`, or
+ *  `a < limit` and `a < limit * 3`, are different guards, so any edit to such a line counts as a different guard. */
 export function guardFacts(lines) {
   const facts = new Set();
-  const text = lines.join('\n');
-  for (const m of text.matchAll(NUM_FACT_RE)) facts.add(`${m[1]}=${m[2]}`);
-  // Round-3 audit: a comparison is the WHOLE normalized line, never a truncated operand (`a < limit` and
-  // `a < limit * 3` are different guards), so any change to a comparing line counts as a different guard.
   for (const l of lines) {
-    if (CMP_LINE_RE.test(l.replace(ARROW_RE, ''))) facts.add(`cmp:${l.trim().replace(/\s+/g, ' ')}`);
+    const norm = l.trim().replace(/\s+/g, ' ');
+    if (!norm) continue;
+    if (NUM_FACT_RE.test(l) || DOC_FACT_RE.test(l)) facts.add(`num:${norm}`);
+    if (CMP_LINE_RE.test(l.replace(ARROW_RE, ''))) facts.add(`cmp:${norm}`);
   }
-  for (const m of text.matchAll(DOC_FACT_RE)) facts.add(`doc:${m[1]}=${m[2]}`);
   return facts;
 }
 
@@ -467,12 +468,19 @@ export function buildRefreshCandidate({
   }
   const summary = files.map((f) => `${f.path}→${f.resolution}`).join(', ');
   const message = `daemon-rebuild: auto-refresh ${headSha} with main ${mainSha}${summary ? ` (resolved: ${summary})` : ''}`;
-  // Round-3 audit: `rebuildCommitEnv` reads a failed date as 0 and carries on; here a failed read is a git failure.
+  // Round-3/4 audit: the parent dates are read ONCE here, a failed read is a git failure (never a 0 fallback), and the
+  // validated values build the commit env directly — the same identity + "later parent's date" rule as rebuildCommitEnv.
+  const dates = [];
   for (const sha of [headSha, mainSha]) {
     const d = git(['log', '-1', '--format=%ct', sha]);
-    if (d.status !== 0 || !(Number(String(d.stdout ?? '').trim()) > 0)) return fail('git-failed: commit-date');
+    const n = Number(String(d.stdout ?? '').trim());
+    if (d.status !== 0 || !Number.isInteger(n) || n <= 0) return fail('git-failed: commit-date');
+    dates.push(n);
   }
-  const ct = git(['commit-tree', tree, '-p', headSha, '-p', mainSha, '-m', message], { env: rebuildCommitEnv(git, headSha, mainSha) });
+  const date = `@${Math.max(...dates)} +0000`;
+  const ct = git(['commit-tree', tree, '-p', headSha, '-p', mainSha, '-m', message], {
+    env: { ...REBUILD_IDENTITY_ENV, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date },
+  });
   const candidate = String(ct.stdout ?? '').trim();
   if (ct.status !== 0 || !FULL_SHA_RE.test(candidate)) return fail('git-failed: commit-tree');
   const brought = git(['diff', '--name-only', '--no-renames', headSha, candidate]);
@@ -481,7 +489,7 @@ export function buildRefreshCandidate({
   const tests = touchedTests(git, candidate, changed);
   if (tests === null) return fail('git-failed: ls-tree');
   // 4. no conflict markers anywhere the refresh changes: a changed file may not carry more marker lines than either parent.
-  const markers = markersAdded(git, { headSha, mainSha, candidate, paths: changed });
+  const markers = markerFiles(git, candidate);
   if (markers === null) return fail('git-failed: marker-scan');
   if (markers.length > 0) return fail(`markers-left: ${markers.join(', ')}`, { files, unresolved: markers.map((p) => ({ path: p, why: 'markers-left' })), tests });
   // 2. WHOLE-FILE guard check (not only the conflict hunks): in every file BOTH sides changed, each guard fact a side
@@ -508,19 +516,13 @@ function readLines(git, rev, p) {
   return r.status === 0 ? String(r.stdout ?? '').split('\n') : null;
 }
 
-/** Changed paths whose candidate version has more conflict-marker lines than both parents. Null on a git error. */
-export function markersAdded(git, { headSha, mainSha, candidate, paths }) {
-  const out = [];
-  for (const p of paths) {
-    const counts = [];
-    for (const rev of [candidate, headSha, mainSha]) {
-      const lines = readLines(git, rev, p);
-      if (!lines) return null;
-      counts.push(lines.filter((l) => MARKER_RE.test(l)).length);
-    }
-    if (counts[0] > Math.max(counts[1], counts[2])) out.push(p);
-  }
-  return out;
+/** OPERATOR RULING (2026-10-20, round-4 finding 2): ANY conflict-marker line ANYWHERE in the candidate tree refuses the
+ *  refresh — even one main itself already carries. Returns the files holding one, or null on a git error. */
+export function markerFiles(git, candidate) {
+  const r = git(['grep', '-I', '-l', '-E', '^(<{7}|[|]{7}|={7}|>{7})( |$)', candidate, '--']);
+  if (r.status === 1) return [];
+  if (r.status !== 0) return null;
+  return String(r.stdout ?? '').split('\n').filter(Boolean).map((l) => l.slice(l.indexOf(':') + 1)).sort();
 }
 
 /**
