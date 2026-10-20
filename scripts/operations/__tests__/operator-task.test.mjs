@@ -72,7 +72,7 @@ describe('operator task filing', () => {
       expect(() => planFileItem({ ...context, sessionRole }, input)).toThrow(/session role/);
     }
     expect(() => planScaffold({ existingIds: [], today: '2026-10-13', dir: '' }, input)).toThrow(/session role/);
-    const worker = createFileItemReader({ root: process.cwd(), listFiles: () => [], readPolicy: () => context.operatorTask, readTip: () => context.originMainSha, env: { WE_CONVEYOR_WORKER: '1' } })();
+    const worker = createFileItemReader({ allocate: () => ({ ok: false, reason: 'test disabled' }), log: () => {}, root: process.cwd(), listFiles: () => [], readPolicy: () => context.operatorTask, readTip: () => context.originMainSha, env: { WE_CONVEYOR_WORKER: '1' } })();
     expect(worker.sessionRole).toBe('worker');
     expect(() => planFileItem(worker, input)).toThrow(/session role "worker"/);
   });
@@ -135,7 +135,7 @@ describe('operator filing IO', () => {
       vi.useFakeTimers();
       vi.setSystemTime(new Date('2026-10-14T02:00:00Z'));
       try {
-        const read = createFileItemReader({ root, listFiles: () => [], readPolicy: () => context.operatorTask, env: {} })();
+        const read = createFileItemReader({ allocate: () => ({ ok: false, reason: 'test disabled' }), log: () => {}, root, listFiles: () => [], readPolicy: () => context.operatorTask, env: {} })();
         expect(read.today).toBe('2026-10-13');
         expect(read.originMainSha).toBe(tip);
         expect(readField(planFileItem(read, input).content, 'preparedAgainstSha')).toBe(tip);
