@@ -13,6 +13,7 @@ import { buildReviewedShaMarker, buildClearedHumanMarker } from '../../lib/revie
 import { buildVerdictCarriedMarker } from '../../lib/review-verdict-carried-marker.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 import { runReviewLabelCli } from '../../review-set-label.mjs';
+import { readReviewRound, readReviewRoundAsOf } from '../review-pr-io.mjs';
 
 const REPO = 'web-everything/web-everything';
 const HEAD = 'ea117e881164c3b6366b0bb78a3660c9a00503b1';
@@ -301,6 +302,29 @@ describe('applyRedTeamGate', () => {
       expect(hold()).toMatch(/confirmed a break requiring send-back/);
       comments.push(readerShapes[shape](clearance, comments.length));
       expect(hold()).toBeNull();
+    });
+
+    // PR #5744 round 4: 12 heads are in the ledger, the gated head's own row missed. The gate read round 13 and capped;
+    // the operator's +1 must anchor at that same round 13, not at the 12 recorded heads.
+    it('a +1 grant buys a round when the gated head has no ledger row', async () => {
+      const rows = Array.from({ length: 12 }, (_, i) => ({ type: 'review-run', pr: 4722,
+        headSha: createHash('sha1').update(String(i)).digest('hex'), at: `2026-10-0${1 + (i % 9)}T00:00:00Z` }));
+      const readLedgerRows = () => rows;
+      const comments = [comment([F()]), capRecord(13), grant()];
+      const { io, calls } = fakeIo({ comments,
+        readRound: ({ repo, pr, head }) => readReviewRound({ repo, pr, head, readLedgerRows }),
+        readRoundAsOf: (a) => readReviewRoundAsOf({ ...a, readLedgerRows }) });
+      expect(readReviewRound({ repo: REPO, pr: 4722, head: HEAD, readLedgerRows })).toBe(13);
+      expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'applied', outcome: 'sent-back' });
+      expect(calls.filter(([kind]) => kind === 'sendBack')).toHaveLength(1);
+    });
+
+    it('the gate anchors each grant with the gated head and its review time', async () => {
+      const seen = [];
+      const comments = [grant(1, '2026-10-01T00:00:00Z'), comment([F()])];
+      const { io } = fakeIo({ comments, round: 3, readRoundAsOf: (a) => { seen.push(a); return 1; } });
+      expect(await applyRedTeamGate({ repo: REPO, pr: 4722, dryRun: true }, io)).toMatchObject({ status: 'dry-run' });
+      expect(seen).toEqual([expect.objectContaining({ at: '2026-10-01T00:00:00Z', head: HEAD, headReviewedAt: '2026-10-10T02:04:41Z' })]);
     });
 
     it('a round-cap record with no later grant stays already-acted (unchanged)', async () => {

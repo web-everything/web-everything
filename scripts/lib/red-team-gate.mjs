@@ -428,11 +428,12 @@ export function liveResultGateState(comments, pr, head, repo = null) {
   const live = String(head ?? '').toLowerCase();
   const records = indexedRecords(comments);
   const hit = latestResult(records, pr, live);
-  if (!hit) return { result: null, resultId: null, outcomes: new Set(), sendBackOutcome: null, reopened: false };
+  if (!hit) return { result: null, resultId: null, resultAt: null, outcomes: new Set(), sendBackOutcome: null, reopened: false };
   const gates = gateRecordsFor(records, pr, live, hit);
   const { outcome, reopened } = sendBackStepState(gates, gateRoundGrants(comments, pr, repo));
-  return { result: hit.parsed, resultId: redTeamResultId(hit.parsed), outcomes: new Set(gates.map(r => r.gate.outcome)),
-    sendBackOutcome: outcome, reopened };
+  // `resultAt`: the result comment's own time, never an inherited one (the round anchor counts the head only by then).
+  return { result: hit.parsed, resultId: redTeamResultId(hit.parsed), resultAt: hit.c?.createdAt ?? null,
+    outcomes: new Set(gates.map(r => r.gate.outcome)), sendBackOutcome: outcome, reopened };
 }
 
 /**

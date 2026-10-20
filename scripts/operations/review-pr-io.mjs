@@ -411,16 +411,19 @@ export function readReviewRound({ repo, pr, head, readLedgerRows = defaultReadLe
  * THIS PR'S REVIEW ROUND AS OF a moment (an operator round grant's `at`): the distinct heads reviewed by then, the last
  * of them being that moment's round. Same rows as {@link readReviewRound}. Rows without a readable time are left out,
  * so a doubt lowers the anchored cap, never raises it. An unreadable ledger, a bad time, or no reviewed head is `null`.
- * @param {{repo: string, pr: number, at: string, readLedgerRows?: Function}} o
+ * `head` is the head being decided, the one {@link readReviewRound} always counts: its own ledger row can miss while
+ * its review is published, so it counts here too when `headReviewedAt` (its published review's time) is by `at`.
+ * @param {{repo: string, pr: number, at: string, head?: string|null, headReviewedAt?: string|null, readLedgerRows?: Function}} o
  * @returns {number|null}
  */
-export function readReviewRoundAsOf({ repo, pr, at, readLedgerRows = defaultReadLedgerRows }) {
+export function readReviewRoundAsOf({ repo, pr, at, head = null, headReviewedAt = null, readLedgerRows = defaultReadLedgerRows }) {
   const t = Date.parse(at);
   if (!Number.isFinite(t)) return null;
   try {
     const heads = new Set((readLedgerRows(repo) ?? []).filter((r) => Number(r?.pr) === Number(pr)
       && (r.type === EVENT_TYPES.REVIEW_RUN || r.type === EVENT_TYPES.FINDING) && Date.parse(r.at) <= t
       && typeof r.headSha === 'string' && r.headSha).map((r) => r.headSha.toLowerCase()));
+    if (typeof head === 'string' && /^[0-9a-f]{40}$/i.test(head) && Date.parse(headReviewedAt) <= t) heads.add(head.toLowerCase());
     return heads.size > 0 ? heads.size : null;
   } catch { return null; }
 }
