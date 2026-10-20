@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/__tests__/test-tmp-root.test.mjs", "we:scripts/lib/test-tmp-root.mjs", "we:scripts/lib/__tests__/test-tmp-root.test.mjs"]
+scope: ["we:scripts/__tests__/test-tmp-root.test.mjs", "we:scripts/lib/test-tmp-root.mjs", "we:scripts/__tests__/test-tmp-root.test.mjs"]
 dateOpened: "2026-10-04"
 tags: []
 ---
