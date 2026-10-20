@@ -20,7 +20,8 @@ export const CARD_ONLY_PREFIXES = Object.freeze(['backlog/']);
 export function isCardPath(path) {
   if (typeof path !== 'string' || !path || path.includes('\0')) return false;
   if (path.split('/').includes('..')) return false;
-  return CARD_ONLY_PREFIXES.some((p) => path.startsWith(p) && path.length > p.length);
+  if (/^backlog\/raised-by\/(?:\d{1,5}|x[a-z0-9]{6})\/\d+-[a-f0-9]{24}\.md$/.test(path)) return true;
+  return /^backlog\/[^/\\\s]+\.md$/.test(path);
 }
 
 /**

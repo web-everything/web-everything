@@ -201,7 +201,7 @@ export const OPERATIONS = Object.freeze({
   // invocation with no `--cwd` is byte-identical to before.
   // `review.seatsByTouchSet` — `securitySeat` is the CALLER's choice, made before the run starts (the review
   // daemon's `review-loop-cli.mjs#chooseSecuritySeat`) or read off a saved run on `--resume` (below); default: seated.
-  [REVIEW_PR_OP]: ({ json = false, cwd = null, securitySeat = true, resumeId = null } = {}) => {
+  [REVIEW_PR_OP]: ({ json = false, cwd = null, securitySeat = true, cardOnlyLight = false, resumeId = null } = {}) => {
     // A bad id or torn record falls back to the live roster, so the adapter's own resume read refuses it
     // normally instead of this builder aborting resolveOperation with the root usage.
     let savedRun = null;
@@ -211,7 +211,7 @@ export const OPERATIONS = Object.freeze({
       antigravityReview: antigravityReviewFromEnv() };
     // A saved run keeps the roster it started with at every cursor position (`reviewSeatOptionsForRun`).
     const seats = savedRun?.op === REVIEW_PR_OP
-      ? reviewSeatOptionsForRun(savedRun, seatSettings, live) : { securitySeat, ...live, seatSettings };
+      ? reviewSeatOptionsForRun(savedRun, seatSettings, live) : { securitySeat, cardOnlyLight, ...live, seatSettings };
     return {
       declaration: reviewPrOperation({
         ...seats,

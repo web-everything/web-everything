@@ -5,8 +5,8 @@ size: 3
 status: open
 scope: ["we:skills-src/conveyor/pass-daemon.mjs", "we:skills-src/conveyor/__tests__/pass-daemon.test.mjs", "we:scripts/conveyor/health-watch.mjs", "we:scripts/conveyor/__tests__/health-watch.test.mjs", "we:scripts/conveyor/health-smells/daemon-process-before-adoption.mjs", "we:scripts/conveyor/health-smells/__tests__/daemon-process-before-adoption.test.mjs", "we:scripts/conveyor/__tests__/health-watch-core.test.mjs"]
 dateOpened: "2026-10-12"
-preparedDate: "2026-10-16"
-preparedAgainstSha: "46b9880e86929783bfd477c59f33188b4f4f9913"
+preparedDate: "2026-10-19"
+preparedAgainstSha: "7726acb517073a2f4e0de4ccc8da0177a104c2b9"
 tags: []
 ---
 
@@ -73,3 +73,7 @@ Use an isolated disposable daemon clone and a harmless fixture pass, with fake/i
 ## Follow-ups
 
 After implementation proof, the operator must bootstrap existing old processes onto the delivered version once: code that never self-syncs cannot load its own fix without a restart. Observe subsequent relevant adoptions and the new health episodes before claiming fleet convergence. Any expansion of notification policy, automatic remediation, or authentication fallback changes is separate work and is not needed to complete this item.
+
+revalidated: The added temp sweep, disk-space reporting, and nightly coroner wiring do not change the preparation’s self-sync policy, process/adoption probe design, scope, or test/proof requirements.
+
+revalidated: The nightly coroner alert and probe-failure changes do not alter the self-sync policy, process/adoption probe design, seven-file scope, or test/proof plan.

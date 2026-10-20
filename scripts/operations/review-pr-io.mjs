@@ -1,3 +1,7 @@
+import { basisLineOf, isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
+import { rereviewMode, reviewMustVoid } from '../lib/review-timing.mjs';
+import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
+import { readReviewCiGate, readReviewHead } from '../lib/review-ci-gate-io.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
@@ -58,6 +62,9 @@ import { createReferralGhProvider } from '../lib/review-comment-edit.mjs';
 import { ADVISORY_LABEL_META, advisoryCoversHead, labelNames, planAdvisoryLabels } from '../lib/advisory-labels.mjs';
 // #3007 — the real verdict ledger, behind the reserved `verdict-ledger.append` seam. See the LEDGER sink.
 import { EVENT_TYPES, appendVerdict, buildLedgerEvent, buildVerdictRecord, foldRepo, parseLedgerEvents, verdictForLabelTarget, verdictLedgerPath } from '../lib/verdict-ledger.mjs';
+import { ledgerFindingKey, REFERRAL_RETIRED_CHANNEL } from '../lib/pr-state/referrals.mjs';
+// Re-read passes the mandatory ruling ledger sync may take before a still-moving thread parks the run.
+const MANDATORY_LEDGER_SYNC_PASSES = 3;
 // Card 5469 — the scoped re-review shadow: the declared setting and the pure round rules.
 import { isValidRoundBudget, resolveReviewSettings, resolveReviewSettingSource, SCOPED_REREVIEW_MODES, ROUND_BUDGET_OFF } from '../lib/review-settings.mjs';
 import { acceptanceIds, enclosingSymbol, foldFindingStatuses, lastReviewedHead, reviewRoundOf, reviewScope, shadowRound,
@@ -73,7 +80,7 @@ import { siblingsFor } from '../bootstrap-session.mjs';
 // behind it) into a CI job. Re-exported below: every existing importer of this module is unchanged.
 import { PR_VIEW_FIELDS, prViewFileName } from '../lib/pr-view-transport.mjs';
 import { defaultOriginRepo } from './record-verdict-io.mjs';
-import { REVIEW_EFFECTS } from './review-pr.mjs';
+import { REVIEW_EFFECTS, FULL_REVIEW_ANCHOR } from './review-pr.mjs';
 import { canonicalizeSlug } from '../lib/constellation-repos.mjs';
 import { isValidRunId } from './run-record.mjs';
 // mechanical-dispatcher — the `AWAITING_ADVISORY_CLEAR` sink's own label name, imported rather than restated.
@@ -83,6 +90,8 @@ export { PR_VIEW_FIELDS, prViewFileName };
 
 /** The PR head moved while a referral pass was mid-run — a routine push race, never a reason to park for a human. */
 class HeadChangedError extends Error {}
+// A read that failed after durable writes: the idempotent effect is left pending for a resume, never parked for a human.
+class RetryableReferralError extends Error {}
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 /** The repo root, resolved by SCRIPT LOCATION and never by cwd — same reason `run-store.mjs` does it. */
@@ -211,7 +220,7 @@ export function readPr({
   // an operator sees WHERE it looked rather than only that it failed. Message-only; decides nothing.
   probed = null,
   // Card 5469 — the declared `scopedRereview` mode (we:scripts/review-settings.json); injectable for tests.
-  scopedRereview = null,
+  scopedRereview = null, timingPolicy = resolveTimingPolicy().review,
   // Card 5471 — the declared `roundBudget` K, and the ledger reader the round count comes from; injectable for tests.
   roundBudget = null,
   readLedgerRows = defaultReadLedgerRows,
@@ -308,6 +317,32 @@ export function readPr({
       } catch { stackBase = null; }
     }
   }
+  const latestFix = readLatestFixRange({ exec: gitExec, comments: view.comments, head: revSha });
+  let deltaReview = null;
+  if (latestFix.priorHead && !latestFix.error && latestFix.head === revSha && !outstandingVerdictSince(view.comments, latestFix.priorHead)) {
+    try {
+      const text = String(gitExec('git', ['diff', '--no-ext-diff', '--no-color', '--no-renames', latestFix.priorHead, revSha],
+        { encoding: 'utf8', maxBuffer: LATEST_FIX_DIFF_MAX_BUFFER }));
+      const sizeSince = from => {
+        const stat = String(gitExec('git', ['diff', '--numstat', '-z', '--no-renames', from, revSha],
+          { encoding: 'utf8', maxBuffer: LATEST_FIX_DIFF_MAX_BUFFER })).split('\0').filter(Boolean);
+        return { files: stat.length, lines: stat.reduce((sum, row) => {
+          const [a, d] = row.split('\t');
+          return /^\d+$/.test(a) && /^\d+$/.test(d) ? sum + Number(a) + Number(d) : NaN;
+        }, 0) };
+      };
+      const { lines, files } = sizeSince(latestFix.priorHead);
+      // The caps bound the TOTAL change since the last full review too, so small rounds cannot add up unreviewed.
+      const anchor = fullReviewAnchor(view.comments, latestFix.priorHead);
+      const total = anchor === latestFix.priorHead ? { lines, files } : anchor ? sizeSince(anchor) : null;
+      const delta = size => rereviewMode({ priorHead: latestFix.priorHead, head: revSha, ...size, policy: timingPolicy }) === 'delta';
+      if (total && delta({ lines, files }) && delta(total)) {
+        // Retain the FULL net basis/fingerprint for acceptance and roster checks. Only the juror diff is narrowed.
+        deltaReview = { priorHead: latestFix.priorHead, head: revSha, lines, files, anchor, totalLines: total.lines, totalFiles: total.files, text,
+          priorFindings: (view.comments ?? []).filter(c => isTrustedMarkerAuthor(c) && reviewedHeadsOf(c).includes(latestFix.priorHead)).map(c => c.body).join('\n\n') };
+      }
+    } catch { /* unreadable delta requires full review */ }
+  }
   const scopedMode = resolveScopedRereviewMode(scopedRereview);
   const budget = resolveRoundBudget(roundBudget);
 
@@ -339,7 +374,7 @@ export function readPr({
     // recording it would pin the basis to a tree that was never read.
     comments: view.comments,
     net: { ...netPaths, revSha },
-    latestFix: readLatestFixRange({ exec: gitExec, comments: view.comments, head: revSha }),
+    latestFix, deltaReview,
     diff: netText,
     ...(stackBase ? { stackBase } : {}),
     // Card 5469 — carried only when the shadow is on (or `on`, card 5470), so an `off` read is byte-identical to before.
@@ -482,6 +517,38 @@ export function resolveScopedRereviewMode(explicit = null, { settings = resolveR
   try { return SCOPED_REREVIEW_MODES.includes(settings().scopedRereview) ? settings().scopedRereview : 'off'; } catch { return 'off'; }
 }
 
+const CHANGES_HEADING_RE = /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+changes requested/i;
+/**
+ * Is a review verdict newer than the prior head's own review still outstanding? A post-accept red-team bounce (or any
+ * changes / advisory verdict) carries no reviewed-head marker for `priorHead`, so a delta review would drop its
+ * findings and the unchanged code they cite. Unreadable chronology, or a thread at the `gh pr view` comment page cap
+ * (the newest bounce may be cut off), counts as outstanding. Pure.
+ */
+export function outstandingVerdictSince(comments, priorHead) {
+  if (Array.isArray(comments) && comments.length >= PR_COMMENTS_PAGE_SIZE) return true;
+  const trusted = (Array.isArray(comments) ? comments : []).filter(c => isTrustedMarkerAuthor(c) && typeof c.body === 'string');
+  const tied = c => reviewedHeadsOf(c).includes(priorHead);
+  const others = trusted.filter(c => !tied(c) && (isReviewVerdictComment(c) || CHANGES_HEADING_RE.test(c.body)));
+  if (!others.length) return false;
+  const at = c => Date.parse(c.createdAt ?? '');
+  const reviewedAt = Math.max(...trusted.filter(tied).map(at));
+  return !Number.isFinite(reviewedAt) || others.some(c => !(at(c) < reviewedAt));
+}
+
+/**
+ * The head of the last FULL review in `priorHead`'s chain, read ONLY from the producer's `Net basis` slot line of the
+ * trusted verdicts that judged `priorHead` (juror text cannot reach that slot). `null` forces a full review: no anchor
+ * at all (a verdict that predates the anchor, a degraded basis, or a restamp / carry / clear-human record that judged
+ * nothing), or two different anchors. Pure.
+ */
+export function fullReviewAnchor(comments, priorHead) {
+  const anchors = new Set((Array.isArray(comments) ? comments : [])
+    .filter(c => isTrustedMarkerAuthor(c) && typeof c.body === 'string' && reviewedHeadsOf(c).includes(priorHead))
+    .map(basisLineOf).filter(b => b && priorHead.startsWith(b.sha))
+    .map(b => FULL_REVIEW_ANCHOR.exec(b.line)?.[1]).filter(Boolean));
+  return anchors.size === 1 ? [...anchors][0] : null;
+}
+
 /** #5135 — output cap for the latest-fix `git diff`; past it the read fails and the scope falls back to `all`. */
 export const LATEST_FIX_DIFF_MAX_BUFFER = 64 * 1024 * 1024;
 
@@ -497,9 +564,8 @@ export function readLatestFixRange(options = {}) {
     const current = typeof head === 'string' && /^[0-9a-f]+$/i.test(head) ? head.toLowerCase() : null;
     for (const comment of (Array.isArray(comments) ? comments : []).slice().reverse()) {
       if (!isTrustedMarkerAuthor(comment) || typeof comment.body !== 'string') continue;
-      // The LAST line-anchored match: the renderer emits the real `Net basis:` line after the juror text, so a line
-      // forged above it by a PR author must not choose the prior head.
-      const reviewed = [...comment.body.matchAll(/^Net basis: `([0-9a-f]+)\.\.([0-9a-f]+)`/gim)].at(-1)?.[2]?.toLowerCase();
+      // The producer-validated footer names the reviewed head; quoted or forged juror text cannot select a basis.
+      const reviewed = reviewedHeadsOf(comment).at(-1)?.toLowerCase();
       if (reviewed && (!current || (!reviewed.startsWith(current) && !current.startsWith(reviewed)))) {
         priorHead = reviewed;
         break;
@@ -840,6 +906,8 @@ export function createReviewPrSinks({
   root = REPO_ROOT,
   env = process.env,
   referralJudge = judgeSpawn,
+  publishGate = readReviewCiGate,
+  readPublishHead = readReviewHead,
   readChangedLines,
   mirrorReferral = (record) => appendJuryEvent(`${record.repo}#${record.pr}`, { type: 'mandatory-referrals', round: 0, record }, { root }),
   cardReadable = (ref) => referralCardReadable(ref, root),
@@ -876,7 +944,45 @@ export function createReviewPrSinks({
   readLedgerRows = defaultReadLedgerRows,
   appendLedgerRow = (row) => appendVerdict(row),
   appendShadowJournal = (entry) => appendScopedRereviewJournal(entry, { env }),
-} = {}) {
+ } = {}) {
+  const assertPublishable = async payload => {
+    // shapeReadFinding deliberately records netBasis.rev === null for an unpinned read.
+    // Such a verdict still has to publish its DEGRADED BASIS / UNPINNED result; there
+    // is no reviewed commit against which to apply head/CI cancellation. Never
+    // authorize an acceptance this way: the label writer would stamp the live head.
+    // An omitted field remains a malformed publish request.
+    if (payload.reviewedHead === null && payload.to !== 'accepted') return;
+    if (!payload.reviewedHead) throw notApplied('review void: missing reviewed head');
+    const policy = resolveTimingPolicy({ env }).review;
+    const args = { repo: payload.repo, pr: payload.pr, expectedHead: payload.reviewedHead };
+    const assertHead = async () => {
+      let currentHead;
+      try { currentHead = await readPublishHead(args); } catch { /* An unreadable head cannot authorize publication. */ }
+      if (reviewMustVoid({ reviewedHead: payload.reviewedHead, currentHead }))
+        throw notApplied('review void: head moved or current head could not be read');
+    };
+    await assertHead();
+    if (!policy.cancelOnCiRed) return;
+    let ci;
+    try { ci = await publishGate({ ...args, policy, expectedHead: payload.reviewedHead }); }
+    catch { /* CI read faults do not void a completed review. The head is checked independently. */ }
+    if (ci?.reason === 'head-changed' || (ci?.headSha && ci.headSha !== payload.reviewedHead)
+      || reviewMustVoid({ reviewedHead: payload.reviewedHead, currentHead: payload.reviewedHead, checks: ci?.checks,
+        requiredChecks: ci?.requiredChecks, policy }))
+      throw notApplied('review void: head moved or CI became red');
+    await assertHead();
+  };
+  // Both publication steps must derive authority from a complete, pinned thread.
+  const readReferralState = (repo, pr, head, { pinned = true } = {}) => {
+    const state = labelProvider.readPrState(repo, pr);
+    if (pinned && state.headRefOid !== head) throw new HeadChangedError('mandatory referral: reviewed head changed; hold retained');
+    if (state.comments?.length >= PR_COMMENTS_PAGE_SIZE) {
+      if (!labelProvider.readComments) throw new Error('mandatory referral: complete comments unavailable; hold retained');
+      state.comments = labelProvider.readComments(repo, pr);
+    }
+    if (!Array.isArray(state.comments)) throw new Error('mandatory referral: comments unavailable; hold retained');
+    return state;
+  };
   return {
     [REVIEW_EFFECTS.MANDATORY_REFERRALS]: async (payload, ctx) => {
       const { read } = payload;
@@ -893,15 +999,7 @@ export function createReviewPrSinks({
         return comparisons.get(key);
       };
       const commentBudget = 60_000;
-      const fresh = () => {
-        const state = labelProvider.readPrState(read.repo, read.pr);
-        if (state.headRefOid !== read.netBasis.rev) throw new HeadChangedError('mandatory referral: reviewed head changed; hold retained');
-        if (state.comments?.length >= PR_COMMENTS_PAGE_SIZE && labelProvider.readComments) {
-          state.comments = labelProvider.readComments(read.repo, read.pr);
-        }
-        if (!Array.isArray(state.comments)) throw new Error('mandatory referral: comments unavailable; hold retained');
-        return state;
-      };
+      const fresh = () => readReferralState(read.repo, read.pr, read.netBasis.rev);
       const context = (state) => ({ repo: read.repo, pr: read.pr, head: state.headRefOid,
         body: typeof state.body === 'string' ? state.body : '', createdAt: state.createdAt, cardReadable });
       const park = (state) => {
@@ -956,12 +1054,16 @@ export function createReviewPrSinks({
         if (prior.malformed) { park(state); return mandatoryReferralState(state.comments, context(state)); }
         // Retire only persisted findings, before merging this run's fresh referrals. Keep the source bytes
         // and a durable reason so every acceptance reader sees the same decision, including after a restart.
+        const priorOperatorRulings = readOperatorRulings(state.comments, context(state)).rulings;
         for (let i = 0; i < prior.records.length; i++) {
           const record = prior.records[i];
           if (record.repo !== read.repo || record.pr !== read.pr) continue;
-          // Never retire a finding that already has a ruling: it would silently clear a standing `block`.
+          // Never retire a finding that already has a ruling (the reviewer's or the operator's): it would silently
+          // clear a standing `block`.
           const dropped = activeReferrals(record).filter(f => referralSeatDisabled(f.seat, env)
-            && !record.rulings.some(r => r.key === f.key))
+            && !record.rulings.some(r => r.key === f.key)
+            && !priorOperatorRulings.some(o => o.repo === record.repo && o.pr === record.pr
+              && o.head === record.head && o.runId === record.runId && o.key === f.key))
             .map(f => ({ key: f.key, reason: REFERRAL_DROP_REASON }));
           if (!dropped.length) continue;
           const updated = { ...record, dropped: [...(record.dropped ?? []), ...dropped] };
@@ -1217,7 +1319,7 @@ export function createReviewPrSinks({
           // Hold before dispatch too: an exhausted or interrupted worker must leave a visible owner.
           if (!labelNames(state.labels).includes('review:human')) {
             labelProvider.setLabels(read.repo, read.pr, { add: 'review:pending',
-              remove: ['review:accepted', 'review:changes'].filter(l => labelNames(state.labels).includes(l)) });
+              remove: ['review:accepted', 'review:changes', 'ready-to-merge'].filter(l => labelNames(state.labels).includes(l)) });
           }
           try {
             const request = buildReviewJudgeRequest({ read, lens: 'correctness' });
@@ -1298,11 +1400,83 @@ export function createReviewPrSinks({
         }
         if (result.pending.length) park(state);
         for (const record of result.records) mirrorReferral(record);
+        // The label mirror reads the verdict ledger, not jury snapshots. Publish only rulings the
+        // trusted, read-back thread actually counts (independence, supersession and readable cards
+        // included). Reconcile historical completed records too: a crash after posting or a missed
+        // ledger append must recover without spending another mandatory-review attempt.
+        // Every row is for the reviewed head, even when a push lands during the sync: its records stay authoritative.
+        const reviewed = read.netBasis.rev;
+        const ledgerRulings = (live, settled) => {
+          const ruled = new Map(), retired = new Map();
+          // The parsed thread only grows, so its state names each ruling's moment: a ruling that changes and then
+          // comes back (a linked block overruled, an operator re-ruling) is a new row, never a duplicate id.
+          const thread = createHash('sha256').update(JSON.stringify([settled.records, settled.operatorRulings])).digest('hex');
+          const rulingRow =(record, key, ruling, channel, id) => ({ ...buildLedgerEvent({ type: EVENT_TYPES.RULING,
+            repo: read.repo, pr: read.pr, at: new Date().toISOString(), source: 'review-pr', session: record.reviewer.id,
+            channel, findingKey: ledgerFindingKey(key), ruling }), id });
+          for (const record of settled.records) {
+            if (record.repo !== read.repo || record.pr !== read.pr || record.head !== reviewed) continue;
+            const effective = referralRecordState(record, { ...context(live), head: reviewed, records: settled.records,
+              operatorRulings: settled.operatorRulings });
+            const operatorOn = key => (settled.operatorRulings ?? []).filter(o => o.repo === record.repo && o.pr === record.pr
+              && o.head === record.head && o.runId === record.runId && o.key === key);
+            const active = activeReferrals(record);
+            for (const f of active) {
+              const blocked = settled.blocked.includes(f.key);
+              if (!blocked && settled.pending.includes(f.key)) continue;
+              const backing = effective.rulings.filter(r => r.key === f.key);
+              const ruling = blocked ? 'block' : backing.at(-1)?.result
+                ?? (record.carried ?? []).find(c => c.key === f.key)?.result
+                ?? ((record.superseded ?? []).some(s => s.key === f.key) ? 'not-real' : null);
+              if (!ruling) continue;
+              // Stable identity belongs to the counted ruling and thread state, never to wall time or the retrying run.
+              ruled.set(f.key, rulingRow(record, f.key, ruling, 'mandatory-referral', `mandatory-ruling:${createHash('sha256').update(JSON.stringify([
+                record.repo, record.pr, record.head, record.runId, f.key, ruling,
+                effective.rulings, record.carried, record.superseded, thread,
+              ])).digest('hex')}`));
+            }
+            // A retired finding no longer counts in the thread, so close its ledger referral too. The retirement
+            // channel keeps it reopenable: the same finding referred again must ask for a ruling again. A finding
+            // anyone ruled on is never retired here, so a standing operator word is never replaced.
+            for (const f of record.referrals) {
+              if (active.some(a => a.key === f.key) || settled.blocked.includes(f.key) || settled.pending.includes(f.key)
+                || operatorOn(f.key).length) continue;
+              retired.set(f.key, rulingRow(record, f.key, 'not-real', REFERRAL_RETIRED_CHANNEL, `mandatory-retire:${createHash('sha256')
+                .update(JSON.stringify([record.repo, record.pr, record.head, record.runId, f.key, thread])).digest('hex')}`));
+            }
+          }
+          for (const [key, row] of retired) if (!ruled.has(key)) ruled.set(key, row);
+          return ruled;
+        };
+        // An operator ruling can land during these appends. Its holding row follows its readable comment, so a
+        // re-read after the last append sees any ruling a stale row overtook; append the corrected row and settle.
+        // A correction is also identified by the row it follows, so a concurrent writer's equal row cannot swallow it.
+        const writtenFor = new Map();
+        let live = state, settled = result;
+        for (let pass = 0; ; pass++) {
+          const due = [...ledgerRulings(live, settled)].filter(([key, row]) => writtenFor.get(key) !== row.id);
+          if (!due.length) break;
+          if (pass === MANDATORY_LEDGER_SYNC_PASSES) throw new Error('mandatory ruling ledger sync did not settle: rulings kept changing during the sync');
+          for (const [key, row] of due) {
+            const previous = writtenFor.get(key);
+            const appended = await appendLedgerRow(previous === undefined ? row
+              : { ...row, id: `${row.id}:after:${createHash('sha256').update(previous).digest('hex').slice(0, 16)}` });
+            if (!appended?.ok || appended.ledgerWriteMiss) {
+              throw new Error(`mandatory ruling ledger-write-miss: ${(appended?.errors ?? []).join('; ') || 'append refused'}`);
+            }
+            writtenFor.set(key, row.id);
+          }
+          // Unpinned: a push during the sync must not leave a stale row last on the reviewed head. An unreadable
+          // thread leaves the idempotent effect pending for a resume, never parked: the appends above already landed.
+          try { live = readReferralState(read.repo, read.pr, reviewed, { pinned: false }); }
+          catch (readError) { throw new RetryableReferralError(`mandatory ruling ledger sync could not re-read the thread: ${readError.message}`); }
+          settled = mandatoryReferralState(live.comments, { ...context(live), head: reviewed });
+        }
         return result;
       } catch (error) {
         // A push that lands mid-run is a routine race, not a persistence refusal: rethrow so the hold the earlier
         // pass left stays as-is and the effect is retried against the new head, never parked for a human.
-        if (error instanceof HeadChangedError) throw error;
+        if (error instanceof HeadChangedError || error instanceof RetryableReferralError) throw error;
         // A persistence refusal is terminal for automation, including a failed failure snapshot.
         // Re-read labels without the head guard so the park lands on the PR's live labels.
         let live = state;
@@ -1332,6 +1506,7 @@ export function createReviewPrSinks({
     // It posts the staged write-up (with the markers) AND applies the label, in the #2964 order it owns. This
     // sink adds no policy of its own: it builds argv, runs it, and reports.
     [REVIEW_EFFECTS.LABEL]: async (payload, ctx) => {
+      await assertPublishable(payload);
       // The SAME run-scoped path effect 0 wrote — both sinks derive it from `ctx.runId`, which is one run's id
       // for every effect in that run, so 1 always posts the write-up 0 staged and never a sibling run's.
       const bodyPath = reviewBodyPath({ root, runId: ctx?.runId, bodyFile: payload.bodyFile });
@@ -1456,6 +1631,9 @@ export function createReviewPrSinks({
     // ADDITIVE: it changes no comment, label or decision. Both events are NON-CLEARING (holding), so the
     // statute write-miss posture (#verdict-ledger-pr-state-store rule 4) is: a failed append never blocks or
     // throws; it prints a loud `ledger-write-miss` line and the run goes on with its label hold unchanged.
+    // Block-sync is best effort under the same additive contract. A stale/unreadable authority skips
+    // only those rows; an append miss never suppresses the referral or visit counter. No clearing row
+    // is synthesized from a partial thread. Stable row identities keep explicit retries safe.
     [REVIEW_EFFECTS.LEDGER_EVENTS]: async (payload, ctx) => {
       // #xrw21vx — each row's identity is THIS EFFECT (ctx.key) plus the row type, never the row's own bytes.
       // `ledgerEventId` otherwise hashes the whole row, `at` included: two distinct runs in one millisecond then
@@ -1466,20 +1644,42 @@ export function createReviewPrSinks({
         : `review-pr:rand:${randomUUID()}`);
       const base = { repo: payload.repo, pr: payload.pr, source: 'review-pr', session: currentActorId(), channel: 'review-pr' };
       const rows = [];
+      const written = []; const missed = [];
       const keys = Array.isArray(payload.referralKeys) ? payload.referralKeys : [];
       if (payload.headSha && keys.length) {
         rows.push({ type: EVENT_TYPES.REFERRAL, headSha: payload.headSha, findingKeys: keys.map((k) => `sha256:${referralHash(String(k))}`) });
+      }
+      // A later review visit has a new referral event identity but reuses the mandatory record.
+      // Its counted block must follow that referral too; otherwise the stable ruling row dedupes
+      // and the new referral reopens it. Re-read authority here so an intervening operator ruling
+      // wins. Clearing rulings are already sticky across referrals in deriveReferrals.
+      if (payload.syncMandatoryRulings && payload.headSha && keys.length) {
+        try {
+          const live = readReferralState(payload.repo, payload.pr, payload.headSha);
+          const settled = mandatoryReferralState(live.comments, { repo: payload.repo, pr: payload.pr,
+            head: live.headRefOid, body: live.body ?? '', createdAt: live.createdAt, cardReadable });
+          for (const key of settled.blocked) {
+            if (keys.includes(key)) rows.push({ type: EVENT_TYPES.RULING, findingKey: ledgerFindingKey(key), ruling: 'block' });
+          }
+        } catch (e) {
+          const reason = String(e?.message ?? e).split('\n')[0];
+          missed.push(`block-sync: ${reason}`);
+          out(`ledger-write-skip: ${payload.repo}#${payload.pr} block-sync skipped (${reason}); referral and review-run rows will still be recorded`);
+        }
       }
       if (payload.headSha) rows.push({ type: EVENT_TYPES.REVIEW_RUN, headSha: payload.headSha, phase: 'completed', posted: payload.posted === true });
       // An unpinned or degraded read names no head, so there is nothing to key a row on. That is a skipped write,
       // not a quiet success: say so loudly, the same way a write miss does, so the undercount is never silent.
       if (!payload.headSha) out(`ledger-write-skip: ${payload.repo}#${payload.pr} no pinned head, so no review-run row was recorded for this run (it will not count toward the visit cap); comments, labels and decisions are unaffected`);
-      const written = []; const missed = [];
       for (const row of rows) {
         try {
-          const res = appendVerdict({ ...buildLedgerEvent({ ...base, ...row, at: new Date().toISOString() }), id: rowId(row.type) });
-          if (res.ok && !res.ledgerWriteMiss) written.push(row.type); else missed.push(`${row.type}: ${(res.errors ?? []).join('; ') || 'git write miss'}`);
-        } catch (e) { missed.push(`${row.type}: ${String(e?.message ?? e).split('\n')[0]}`); }
+          const res = await appendLedgerRow({ ...buildLedgerEvent({ ...base, ...row, at: new Date().toISOString() }),
+            id: rowId(row.type === EVENT_TYPES.RULING ? `${row.type}:${row.findingKey}` : row.type) });
+          if (!res?.ok || res.ledgerWriteMiss) throw new Error((res?.errors ?? []).join('; ') || 'git write miss');
+          written.push(row.type);
+        } catch (e) {
+          missed.push(`${row.type}: ${String(e?.message ?? e).split('\n')[0]}`);
+        }
       }
       if (missed.length) out(`ledger-write-miss: ${payload.repo}#${payload.pr} review events not fully recorded (${missed.join(' | ')}); comments, labels and decisions are unaffected`);
       return { written, missed };
@@ -1497,6 +1697,7 @@ export function createReviewPrSinks({
     // No label is touched (the same reason `ADVISORY_NOTE` avoids the single home): the accept must not become
     // `review:accepted` while the bottom PR is open. `review-job.mjs` reads the marker back to hold or carry.
     [REVIEW_EFFECTS.STACK_HOLD]: async (payload, ctx) => {
+      await assertPublishable(payload);
       const bodyPath = reviewBodyPath({ root, runId: ctx?.runId, bodyFile: payload.bodyFile });
       let staged = '';
       try { staged = readFileSync(bodyPath, 'utf8'); } catch { staged = ''; }
@@ -1521,6 +1722,7 @@ export function createReviewPrSinks({
     // `postComment` is the exact primitive that single home itself calls for its own comment write, so this
     // reuses it directly rather than re-implementing a `gh pr comment` invocation a third time.
     [REVIEW_EFFECTS.ADVISORY_NOTE]: async (payload) => {
+      await assertPublishable(payload);
       postComment(payload.repo, payload.pr, String(payload.body));
       return { posted: true };
     },

@@ -373,8 +373,8 @@ describe('settings', () => {
     writeFileSync(join(d, FEED_SETTINGS_FILE), JSON.stringify({ prEventFeed: { drain: { mode: 'yes' } } }));
     expect(resolveFeedSettings({ role: 'drain', root: d, env: {} })).toMatchObject({ mode: 'off', error: expect.stringMatching(/unknown mode/) });
   });
-  it('the shipped settings start the drain in shadow', () => {
+  it('the shipped settings run the drain event-driven (operator 2026-10-19)', () => {
     const repoRoot = join(import.meta.dirname, '..', '..', '..');
-    expect(resolveFeedSettings({ role: 'drain', root: repoRoot, env: {} }).mode).toBe('shadow');
+    expect(resolveFeedSettings({ role: 'drain', root: repoRoot, env: {} }).mode).toBe('on');
   });
 });

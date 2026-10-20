@@ -31,6 +31,7 @@
  *   and are unit-tested in we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs.
  */
 
+import { planPrepareBatches, prepareAheadNums } from '../../scripts/conveyor/build-dispatch-policy.mjs';
 import { isLanePreparePrFor, isPreparePrFor, prepareLaunchRefusal, recentMergedPrepare } from '../../scripts/conveyor/prepare-pr-match.mjs';
 import { readBuilderPrCapSettings } from '../../scripts/lib/open-pr-cap-scope.mjs';
 import { readPreparePolicy } from '../../scripts/conveyor/prepare-policy-settings.mjs';
@@ -55,7 +56,7 @@ import { admitLaunch, costAdmissionOn, freezeHolds, lightCapFor, summarizeCostAd
 import { readCostAdmissionSettings, readCostFacts } from '../../scripts/lib/cost-admission-facts.mjs';
 import { builderExecutorFor } from '../../scripts/lib/fix-slot-borrow.mjs';
 import { startDetachedLaunch, settleLaunches, PENDING_LAUNCHES_DIRNAME } from '../../scripts/conveyor/pending-launches.mjs';
-import { loadBuilderLaunchPolicy, formatBuilderLaunchPolicyLine, FREE_SLOTS } from '../../scripts/lib/builder-launch-policy.mjs';
+import { loadBuilderLaunchPolicy, formatBuilderLaunchPolicyLine, FREE_SLOTS, loadBuilderPausedPollPolicy, formatBuilderPausedPollPolicyLine, STANDARD_PAUSED_POLL_SEC } from '../../scripts/lib/builder-launch-policy.mjs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -107,7 +108,7 @@ const PREPARE_HANDLED_OUTCOMES = ['prepare-already-done', 'prepare-needs-you'];
 export function prepareRouteFallback(records = [], releases = []) {
   const attempts = records.filter(r => r.dispatchKind === 'probation-launch' && r.taskType === 'prepare' && r.repo === CONSTELLATION_REPOS.we.slug)
     .sort((a, b) => String(a.scoredAt).localeCompare(String(b.scoredAt)));
-  const failures = attempts.filter(r => !r.pr && r.launchOutcome !== 'opened-pr' && !PREPARE_HANDLED_OUTCOMES.includes(r.launchOutcome));
+  const failures = attempts.filter(r => !r.pr && r.launchOutcome !== 'opened-pr' && r.launchOutcome !== 'prepared-commit' && !PREPARE_HANDLED_OUTCOMES.includes(r.launchOutcome));
   return failures.length >= 2 && failures.some(r => !releasedAttempt(releases, 'route:prepare', `${r.handle}:${r.scoredAt}`));
 }
 
@@ -129,6 +130,14 @@ export const PAUSED_SYNC_MS_ENV = 'WE_BUILD_DAEMON_PAUSED_SYNC_MS';
 export const DEFAULT_PAUSED_SYNC_MS = 30 * 60 * 1000;
 
 // ── PURE CORE ────────────────────────────────────────────────────────────────────────────────────────────────
+
+/** Stretch only the interval when both build caps are zero; every tick keeps its full behavior. */
+export function effectiveTickIntervalMs({ policy = {}, flagIntervalMs, defaultMs = DEFAULT_INTERVAL_MS, pausedPollSec = STANDARD_PAUSED_POLL_SEC } = {}) {
+  const configuredMs = Number(flagIntervalMs) > 0 ? Number(flagIntervalMs) : defaultMs;
+  return policy.maxConcurrentBuilds === 0 && policy.maxConcurrentExternalBuilds === 0
+    ? Math.max(configuredMs, pausedPollSec * 1000)
+    : configuredMs;
+}
 
 /** Is the kill switch engaged? Pure over its two inputs. */
 export function readKillSwitch({ env = {}, killFileExists = false, killFilePath = '' } = {}) {
@@ -208,18 +217,19 @@ export function readDispatchOutcome(text) {
     }
     return { dispatching: false, reason: 'no verdict in dispatch-lane output' };
   }
-  const result = { dispatching: false, reason: verdict.reason ?? verdict.why ?? null,
+  const reason = verdict.reason ?? verdict.why;
+  const result = { dispatching: false, reason: reason == null ? null : redactSpawnText(reason),
     lane: verdict.lane ?? null, sessionSlug: verdict.sessionSlug ?? null };
   // A planner declining to launch (lane cap, plan re-read race, freeze) is a typed refusal, not a failed
   // prepare: the caller retries next tick instead of holding. Only launch/parse failures fall through untyped.
   if (!verdict.dispatching) return { ...result, refused: true };
   const effect = run.effects?.find(e => e.type === 'conveyor.dispatch-delivery-agent');
-  if (effect?.error) return { ...result, reason: effect.error };
+  if (effect?.error) return { ...result, reason: redactSpawnText(effect.error) };
   if (!effect || !['in-flight', 'applied'].includes(effect.status)
     || typeof effect.handle !== 'string' || !effect.handle.trim()) {
     return { ...result, reason: `dispatch launch not confirmed (${effect?.status ?? 'missing effect'}; no running session)` };
   }
-  return { ...result, dispatching: true, handle: effect.handle };
+  return { ...result, dispatching: true, handle: redactSpawnText(effect.handle) };
 }
 
 /**
@@ -486,6 +496,14 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // 78b — settle detached launches from earlier ticks BEFORE planning: a launched one keeps its claim (the run-store
   // row owns it from here); a failed one releases its claim and records the failure the same way a blocking launch did.
   // A still-pending one keeps its claim and keeps the item busy. Optional-chained for older effects stubs.
+  // A failed launch is charged BEFORE its claim is released, keyed by that claim: if the release throws, orphan
+  // adoption later charges the same dead claim under the same key and the ledger dedupes it (PR #5472 red team).
+  // Expired claims are read too, as orphan adoption reads them. Only the LEAD claim names the attempt: a member claim
+  // can outlive its launch (orphan adoption leaves members), and its stale key would dedupe a later, real failure.
+  const readClaimsForKeys = () => {
+    try { return effects.listClaims?.({ ignoreExpiry: true }) ?? []; } catch { return []; } // unkeyed charge, as before
+  };
+  const leadClaimKeys = (claimList, num) => claimAttemptKeys(claimList, num).filter(k => k.startsWith('orphan:'));
   const pendingLaunch = { build: new Set(), prepare: new Set() };
   const launchSettlement = { settled: [], pending: [] };
   const deferredLaunchFailures = [];
@@ -494,28 +512,38 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       const r = await effects.settleLaunches();
       for (const p of r.pending ?? []) (p.kind === 'prepare-item' ? pendingLaunch.prepare : pendingLaunch.build).add(normNum(p.num));
       launchSettlement.pending = r.pending ?? [];
+      let settleClaims = [];
+      if ((r.settled ?? []).some(st => !st.outcome?.dispatching && st.kind !== 'prepare-item')) settleClaims = readClaimsForKeys();
       for (const st of r.settled ?? []) {
         const num = normNum(st.num);
         const isPrepare = st.kind === 'prepare-item';
         launchSettlement.settled.push({ num, kind: st.kind, launched: Boolean(st.outcome?.dispatching), reason: st.outcome?.reason ?? null });
         if (st.outcome?.dispatching) continue;
-        // The claim goes NOW (so this tick's own claim read already sees it freed); the failure record waits for
-        // `failPrepare`/`failures`, declared further down.
+        // Persist before planning/launching again: the threshold must suppress this tick's retry too.
+        const attemptKey = isPrepare ? [] : leadClaimKeys(settleClaims, num);
+        const failureRecord = !isPrepare ? effects.recordBuildFailure?.({ num, reason: st.outcome?.reason ?? 'not dispatched', output: st.outcome?.output ?? st.outcome?.reason, base: st.base,
+          ...(attemptKey.length ? { attemptKey } : {}) }) : null;
         if (isPrepare) effects.releasePrepareClaim({ num }); else effects.releaseClaim({ num });
-        deferredLaunchFailures.push({ num, isPrepare, outcome: st.outcome, attempt: st.attempt });
+        deferredLaunchFailures.push({ num, isPrepare, outcome: st.outcome, attempt: st.attempt, failureRecord });
       }
     } catch (e) { launchSettlement.error = String(e?.message || e).split('\n')[0]; }
   }
   // Card 80 — the just-in-time prepare settings ride to tick-core as config (window) and on to dispatch-plan
   // (max age + scope drift → `prepare-stale`).
   const preparePolicy = effects.preparePolicy?.() ?? readPreparePolicy();
-  let out = await effects.planTick(tickBookkeeping, { config: planConfigFrom(policy) });
+  // Explicit daemon controls beat the prepare cascade, including null (off). Older direct callers
+  // without provenance still override the cascade when they change the declared default.
+  const effectivePrepareAheadWindow = (policy.prepareAheadWindowExplicit
+    ?? (policy.prepareAheadWindow !== BUILD_DISPATCH_POLICY.prepareAheadWindow))
+    ? policy.prepareAheadWindow : (preparePolicy.aheadCount ?? policy.prepareAheadWindow);
+  const planConfig = planConfigFrom({ ...policy, prepareAheadWindow: effectivePrepareAheadWindow });
+  let out = await effects.planTick(tickBookkeeping, { config: planConfig });
   const planningSkips = [];
   // The refusal record a planning skip persists (`prepareRefusals`), exactly as the launch guard would write it.
   const planningSkipDetail = new Map();
   // Inspect actual picks, then refill skipped slots. Never scan the entire held backlog: each card costs up to
-  // three synchronous listings from the same 128-call budget the final launch guard needs. Eight observations
-  // bound this lookahead (including selected group members below) to 24 calls; picks beyond that window still
+  // four synchronous listings from the same 128-call budget the final launch guard needs. Eight observations
+  // bound this lookahead (including selected group members below) to 32 calls; picks beyond that window still
   // pass the ordinary fail-closed launch guard.
   const inspectedPrepares = new Set();
   const inspectPrepareCooldown = async candidate => {
@@ -555,7 +583,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     for (const candidate of candidates) await inspectPrepareCooldown(candidate);
     if (planningSkips.length === previousSkips) break;
     tickBookkeeping.prepareHeldNums = [...new Set([...(tickBookkeeping.prepareHeldNums ?? []), ...planningSkips.map(r => r.num)])];
-    out = await effects.planTick(tickBookkeeping, { config: planConfigFrom(policy) });
+    out = await effects.planTick(tickBookkeeping, { config: planConfig });
   }
   // The plan's age is what dispatch-lane's freshness bound must measure, so stamp it here, once, right after
   // planning — never at each (possibly much later) dispatch.
@@ -823,6 +851,13 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // a cooldown: the failure ledger withholds it at once, the card is HELD with the step and reason (the hold
   // router records it in the findings ledger), and it is listed under `needsYou` on the tick line for the operator.
   const needsYou = [];
+  const surfaceUnconfirmed = (num, rec) => {
+    if (!rec?.unconfirmedCooldown) return;
+    if (needsYou.some(n => n.num === normNum(num) && n.step === 'launch-confirmation')) return;
+    needsYou.push({ num: normNum(num), step: 'launch-confirmation',
+      reason: `unconfirmed-launch-cooldown: #${normNum(num)} on base ${rec.base ?? 'unknown'} after ${rec.unconfirmedLaunches} unconfirmed launches; retry after ${rec.retryAfter}; last launch evidence: ${rec.output}` });
+  };
+  for (const rec of buildBackoffs) surfaceUnconfirmed(rec.num, rec);
   for (const [num, reason] of ledgerHoldReason) if (!completedPrepares.has(num) && !released.has(normNum(num))) needsYou.push({ num, step: 'prepare', reason });
   const surfaceCardRefusal = (num, rec, outcome) => {
     if (!rec || rec.reasonCode !== CARD_REFUSAL_CODE) return;
@@ -967,10 +1002,15 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
           if (groupMembers.length) console.error(`build-dispatch-daemon: grouped build #${pick.num} members ${groupMembers.map(num => `#${num}`).join(',')} (related: ${groupMembers.map(num => `${num}=${group.related[num]}`).join(',')})`);
           // Launch confirmation is not delivery: retain prior failures until a PR is observed.
         } else {
+          // Charge first, keyed by the claim (see `leadClaimKeys`): a crash or throw in the releases below then
+          // leaves a charged attempt orphan adoption dedupes, never an uncharged one.
+          const attemptKey = leadClaimKeys(readClaimsForKeys(), pick.num);
+          const rec = effects.recordBuildFailure?.({ num: pick.num, reason: res?.reason ?? 'not dispatched', output: res?.output ?? res?.reason, base: res?.base,
+            ...(attemptKey.length ? { attemptKey } : {}) });
           claimed = false;
           effects.releaseClaim({ num: pick.num });
           releaseMembers();
-          const rec = effects.recordBuildFailure?.({ num: pick.num, reason: res?.reason ?? 'not dispatched', output: res?.output ?? res?.reason });
+          surfaceUnconfirmed(pick.num, rec);
           if (live) surfaceCardRefusal(pick.num, rec, res);
           failures.push({ num: pick.num, stage: 'dispatch', reason: res?.reason ?? 'not dispatched', ...(res?.stepRefused ? { step: res.stepRefused.step } : {}), ...(rec ? { reasonCode: rec.reasonCode, attempts: rec.attempts, retryAfter: rec.retryAfter, output: rec.output } : {}) });
         }
@@ -1008,14 +1048,14 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const runner = preparePolicy.runner;
   const runnerSource = preparePolicy.sources.runner;
   const fallback = runner === 'claude' || (configuredPrepare ? configuredPrepare.provider === 'claude' : prepareRouteFallback(probationRecords, releases));
-  prepareRunnerNote = ` · runner=${fallback ? 'claude' : runner} (prepare.runner=${runner} from ${runnerSource}) · mergedGuardHours=${preparePolicy.mergedGuardHours} (from ${preparePolicy.sources.mergedGuardHours})`;
+  prepareRunnerNote = ` · runner=${fallback ? 'claude' : runner} (prepare.runner=${runner} from ${runnerSource}) · batchSize=${preparePolicy.batchSize ?? 6} (from ${preparePolicy.sources.batchSize ?? 'standard'}) · batchParallel=${preparePolicy.batchParallel ?? true} (from ${preparePolicy.sources.batchParallel ?? 'standard'}) · batchMaxParallel=${preparePolicy.batchMaxParallel ?? 3} (from ${preparePolicy.sources.batchMaxParallel ?? 'standard'}) · aheadCount=${effectivePrepareAheadWindow} (from ${policy.prepareAheadWindowExplicit ? 'daemon override' : preparePolicy.sources.aheadCount ?? 'standard'}) · mergedGuardHours=${preparePolicy.mergedGuardHours} (from ${preparePolicy.sources.mergedGuardHours})`;
   // Card x60i0ie — item prepares are LIGHT: with the rule ON they run under the light cap (else today's two workers).
   const prepareCap = lightCapFor('prepare-item', costSettings, 2);
-  const prepare = { runner, runnerSource, policyRoute: configuredPrepare, route: fallback ? 'prepare-route-fallback' : 'probation', enabled: prepareEnabled, cap: prepareCap, planned: [], launched: [], refused: [], inFlight: [], failures: [], retired: [], held: [], handled: [], stamping: [] };
+  const prepare = { runner, runnerSource, batchSize: preparePolicy.batchSize ?? 6, aheadCount: effectivePrepareAheadWindow, sources: preparePolicy.sources, policyRoute: configuredPrepare, route: fallback ? 'prepare-route-fallback' : 'probation', enabled: prepareEnabled, cap: prepareCap, planned: [], launched: [], refused: [], inFlight: [], failures: [], retired: [], held: [], handled: [], stamping: [] };
   prepare.skippedInPlanning = planningSkips;
   prepare.launchOrder = preparesFirst ? 'prepare-first' : 'build-first';
   prepare.refusalHeld = freshRefusals.map(r => ({ num: normNum(r.num), reason: r.reason, since: r.at }));
-  prepare.routeFailures = probationRecords.filter(r => r.taskType === 'prepare' && !r.pr && r.launchOutcome !== 'opened-pr' && !PREPARE_HANDLED_OUTCOMES.includes(r.launchOutcome))
+  prepare.routeFailures = probationRecords.filter(r => r.taskType === 'prepare' && !r.pr && r.launchOutcome !== 'opened-pr' && r.launchOutcome !== 'prepared-commit' && !PREPARE_HANDLED_OUTCOMES.includes(r.launchOutcome))
     .map(r => ({ item: r.item, attempt: `${r.handle}:${r.scoredAt}`, cause: classifyPrepareFailure(r.evidence), evidence: r.evidence ?? { reason: r.launchOutcome } }));
   const finishedPrepares = new Set(completedPrepares);
   const itemPrepareAttempts = { ...out?.nextState?.itemPrepareAttempts };
@@ -1075,7 +1115,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   for (const f of deferredLaunchFailures) {
     if (f.isPrepare) await failPrepare(f.num, f.outcome?.refused ? 'dispatch-refused' : 'dispatch', f.outcome?.reason ?? 'not dispatched', f.outcome?.evidence ?? {}, f.attempt ?? new Date().toISOString());
     else {
-      const rec = live ? effects.recordBuildFailure?.({ num: f.num, reason: f.outcome?.reason ?? 'not dispatched', output: f.outcome?.output ?? f.outcome?.reason }) : null;
+      const rec = f.failureRecord;
+      surfaceUnconfirmed(f.num, rec);
       if (live) surfaceCardRefusal(f.num, rec, f.outcome);
       failures.push({ num: f.num, stage: 'dispatch', reason: f.outcome?.reason ?? 'not dispatched', ...(f.outcome?.stepRefused ? { step: f.outcome.stepRefused.step } : {}), ...(rec ? { reasonCode: rec.reasonCode, attempts: rec.attempts, retryAfter: rec.retryAfter, output: rec.output } : {}) });
     }
@@ -1091,6 +1132,15 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     // settled by its own branch below, so it must not also be read as an unstamped prepare.
     const currentSettled = settled && settled.outcome !== 'prepare-session-dead'
       && (!claim?.meta?.claimedAt || settled.startedAt >= claim.meta.claimedAt);
+    if (currentSettled && settled.deferredToNextBatch?.map(normNum).includes(num)) {
+      if (claim) {
+        if (live) effects.releasePrepareClaim({ num });
+        prepare.retired.push({ num, why: 'deferred-to-next-batch', released: live });
+        finishedPrepares.add(num); // Wait until the next tick, without spending a failure attempt.
+      }
+      prepareBusy.delete(num);
+      continue;
+    }
     const wasHeld = holds.some((h) => normNum(h.num) === num && isPrepareHold(h));
     const tracked = Boolean(claim) || prepareBusy.has(num);
     // A bare candidate (no claim, no in-flight row, no hold, no current settled attempt) has no evidence of a
@@ -1250,7 +1300,25 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     const replaced = status?.preparedDate && (claim.meta.replacesStamp === undefined
       || stampCoversClaim(status.preparedDate, claim.meta.claimedAt,
         { replaces: claim.meta.replacesStamp, preparedAgainstSha: status.preparedAgainstSha }));
-    const why = replaced ? 'prepared on main' : !leadTracked ? 'group-lead-gone' : null;
+    const settled = settledPrepares.get(lead);
+    const deferred = settled?.deferredToNextBatch?.map(normNum).includes(num)
+      && (!claim.meta.claimedAt || settled.startedAt >= claim.meta.claimedAt);
+    const dropped = settled?.groupDropped?.map(normNum).includes(num)
+      && (!claim.meta.claimedAt || settled.startedAt >= claim.meta.claimedAt);
+    const failed = dropped && !deferred && !replaced;
+    if (failed) {
+      // A dropped member is its own failed attempt, even when the lead opened the batch PR.
+      // Hold before releasing ownership, as the single-card retirement path does.
+      const priorFailure = failureRecords.findLast(f => f.num === num && f.held && !f.completed && !releasedAttempt(releases, num, f.attempt));
+      const failure = priorFailure ?? await failPrepare(num, 'result', 'prepare-unstamped',
+        { reason: settled.groupDropReasons?.[num] ?? 'batch member preparation failed' }, settled.source);
+      if (failure.held) prepare.held.push({ num, reason: failure.holdReason ?? 'prepare-unstamped' });
+    }
+    // A failed lead can still publish its successful members. Their verified stamped PR owns the
+    // remaining lifecycle even after the original lead's claim has been retired.
+    const awaitingStampedPr = status?.pr?.state === 'OPEN' && status.pr.preparedDate;
+    const why = deferred ? 'deferred-to-next-batch' : replaced ? 'prepared on main' : failed ? 'prepare-unstamped'
+      : !leadTracked && !awaitingStampedPr ? 'group-lead-gone' : null;
     if (why) {
       if (live) effects.releasePrepareClaim({ num });
       prepare.retired.push({ num, why, released: live });
@@ -1304,23 +1372,33 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const needsPrepare = new Set((admission.held ?? [])
     .filter(h => ['needs-prepare', 'prepare-stale'].includes(h.reason)).map(h => normNum(h.num)));
   const otherPrepareHolds = new Set((admission.held ?? [])
-    .filter(h => !['needs-prepare', 'prepare-stale'].includes(h.reason)).map(h => normNum(h.num)));
+    .filter(h => !['needs-prepare', 'prepare-stale', ...(preparePolicy.autoSize ? ['no-size'] : [])].includes(h.reason)).map(h => normNum(h.num)));
+  // Scope-only stale cards run individually so a light verdict never stamps unchecked group members.
+  const lightRevalidateCandidate = num => preparePolicy.lightRevalidate !== false && (admission.held ?? [])
+    .some(h => normNum(h.num) === normNum(num) && h.reason === 'prepare-stale'
+      && h.detail?.startsWith('scope changed since '));
+  const windowNums = prepareAheadNums({ queue: admission.queue, launch: admission.planned ?? admission.launch,
+    held: (admission.held ?? []).map(h => h.reason === 'no-size' && preparePolicy.autoSize ? { ...h, reason: 'needs-prepare' } : h),
+    // With the window off, every queued card is eligible for batching. The shared helper uses
+    // non-finite windows as its "no filter" sentinel, so give it the complete queue's size here.
+    window: effectivePrepareAheadWindow ?? admission.queue?.length ?? 0, skip: bookkeeping.prepareHeldNums ?? [] });
+  const windowOrder = new Map([...(windowNums ?? [])].map((num, i) => [num, i]));
+  prepareSpawns.sort((a, b) => (windowOrder.get(normNum(a.num)) ?? Infinity) - (windowOrder.get(normNum(b.num)) ?? Infinity));
+  const preparePool = [...(windowNums ?? [])].map(num => groupRowsByNum.get(num))
+    .filter(r => r && (needsPrepare.has(normNum(r.num)) || (preparePolicy.autoSize && (admission.held ?? []).some(h => normNum(h.num) === normNum(r.num) && h.reason === 'no-size')))
+      && !otherPrepareHolds.has(normNum(r.num)) && !lightRevalidateCandidate(r.num)
+      && !groupDropped.has(normNum(r.num)) && prepareAvailable(r.num));
   const prepareGroupPicks = [];
-  if (!fallback && groupingSettings.groupSmallFindings && groupingCardsLoaded && groupingSettings.groupPrepare === 'per-group') {
-    for (const pick of prepareSpawns.filter(p => prepareAvailable(p.num) && !otherPrepareHolds.has(normNum(p.num)))) {
-      try {
-        const route = await effects.predictRoute?.(normNum(pick.num), scopeByNum.get(normNum(pick.num)) ?? [], 'prepare-item');
-        if (!effects.predictRoute || (!route?.error && route?.groupCapable === true)) prepareGroupPicks.push(pick);
-      } catch { /* An unknown prepare route cannot own grouped members. */ }
-    }
+  if (!fallback && groupingSettings.groupSmallFindings && groupingCardsLoaded && groupingSettings.groupPrepare === 'per-group') for (const row of preparePool) {
+    try {
+      const route = await effects.predictRoute?.(normNum(row.num), scopeByNum.get(normNum(row.num)) ?? [], 'prepare-item');
+      if (!effects.predictRoute || (!route?.error && route?.groupCapable === true)) prepareGroupPicks.push(row);
+    } catch { /* Unknown routes cannot own batch members. */ }
   }
-  const planPrepareGroups = () => planBuildGroups({
-    picks: prepareGroupPicks,
-    pool: [...groupRowsByNum.values()].filter(r => needsPrepare.has(normNum(r.num))
-      && !otherPrepareHolds.has(normNum(r.num)) && prepareAvailable(r.num)),
-    rowsByNum: groupRowsByNum,
-    settings: { ...groupingSettings, groupSmallFindings: groupingSettings.groupSmallFindings
-      && groupingCardsLoaded && groupingSettings.groupPrepare === 'per-group' }, exclude: groupDropped,
+  const batchNums = new Set(prepareGroupPicks.map(r => normNum(r.num)));
+  const planPrepareGroups = () => planPrepareBatches({
+    picks: prepareSpawns.filter(p => batchNums.has(normNum(p.num))),
+    pool: prepareGroupPicks.filter(r => prepareAvailable(r.num)), batchSize: preparePolicy.batchSize ?? 6,
   });
   let prepareGroupPlan = planPrepareGroups();
   // Group members are actual launch candidates too. Inspect only selected members, sharing the lead lookahead
@@ -1396,9 +1474,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
             if (memberClaim.ok) groupMembers.push(member);
           } catch (e) { await failPrepare(member, 'claim', String(e?.message || e)); }
         }
-        if (groupMembers.length && groupMembers.length + 1 < groupingSettings.groupMin) releasePrepareMembers();
         let res;
-        try { res = await effects.dispatch({ num, ...(groupMembers.length ? { groupMembers } : {}), bookkeeping, launchKind: 'prepare-item', prepareFallback: fallback, tick: out, tickBookkeeping, tickAt }); }
+        try { res = await effects.dispatch({ num, ...(groupMembers.length ? { groupMembers } : {}), bookkeeping, launchKind: 'prepare-item', lightRevalidate: lightRevalidateCandidate(num), prepareFallback: fallback, batchExternalCap: policy.maxConcurrentExternalBuilds, tick: out, tickBookkeeping, tickAt }); }
         catch (e) { res = { dispatching: false, reason: String(e?.message || e) }; }
         if (res?.pending) startedThisTick += 1;
         prepareClaimed = false;
@@ -1731,7 +1808,7 @@ export async function cliListSettledBuilds({ launchKind = 'build', records = nul
       const outcome = e.result?.outcome ?? (e.status === 'failed' ? 'wrapper-failed' : launchKind === 'prepare-item' ? 'prepare-ended' : null);
       if (!outcome) continue;
       const startedAt = typeof e.startedAt === 'string' ? e.startedAt : '';
-      rows.push({ num: normNum(e.payload.num), outcome, source: `run ${id}`, startedAt, ...(Array.isArray(e.result?.groupMembers) ? { groupMembers: e.result.groupMembers } : {}), ...(Array.isArray(e.result?.groupDropped) ? { groupDropped: e.result.groupDropped } : {}), ...(launchKind === 'prepare-item' ? { evidence: cliPrepareFailureEvidence(e) } : {}) });
+      rows.push({ num: normNum(e.payload.num), outcome, source: `run ${id}`, startedAt, ...(Array.isArray(e.result?.groupMembers) ? { groupMembers: e.result.groupMembers } : {}), ...(Array.isArray(e.result?.groupDropped) ? { groupDropped: e.result.groupDropped } : {}), ...(Array.isArray(e.result?.deferredToNextBatch) ? { deferredToNextBatch: e.result.deferredToNextBatch } : {}), ...(launchKind === 'prepare-item' ? { evidence: cliPrepareFailureEvidence(e) } : {}) });
     }
   }
   return rows;
@@ -1834,7 +1911,7 @@ export function cliListHolds() {
 }
 
 /** The dispatch-lane argv + env for one launch, with its bookkeeping/tick handoff files written under `dir`. */
-function prepareDispatchLaunch({ num, bookkeeping, launchKind = 'build', prepareFallback = false, groupMembers, tick, tickBookkeeping, tickAt }, dir) {
+function prepareDispatchLaunch({ num, bookkeeping, launchKind = 'build', prepareFallback = false, lightRevalidate = false, groupMembers, batchExternalCap, tick, tickBookkeeping, tickAt }, dir) {
   const file = join(dir, 'bookkeeping.json');
   // dispatch-lane reuses the supplied tick, falling back to a re-read if the handoff is invalid.
   // Keep that re-read under the same lane-cap policy as cliPlanTick; otherwise a planned
@@ -1854,20 +1931,21 @@ function prepareDispatchLaunch({ num, bookkeeping, launchKind = 'build', prepare
     }), { mode: 0o600 });
     argv.push(`--tickFile=${tickFile}`);
   }
-  const env = { ...process.env, ...routingPolicyEnv(), ...(launchKind === 'prepare-item' && prepareFallback ? { WE_PROBATION_LAUNCH: 'off' } : {}), [MAX_CONCURRENT_LANES_ENV]: BUILD_DAEMON_LANE_CAP_EXEMPT_VALUE, WE_DISPATCH_RESERVE_LANE: '1' /* x87v3ed: lease the lane before the session launches */, WE_BUILD_DISPATCH_MODE: process.env.WE_BUILD_DISPATCH_MODE || 'mechanical' };
+  const env = { ...process.env, ...routingPolicyEnv(), WE_PREPARE_LIGHT_REVALIDATE_ITEM: lightRevalidate ? String(num) : '', ...(batchExternalCap != null ? { WE_BUILD_DAEMON_MAX_CONCURRENT_EXTERNAL: String(batchExternalCap) } : {}), ...(launchKind === 'prepare-item' && prepareFallback ? { WE_PROBATION_LAUNCH: 'off' } : {}), [MAX_CONCURRENT_LANES_ENV]: BUILD_DAEMON_LANE_CAP_EXEMPT_VALUE, WE_DISPATCH_RESERVE_LANE: '1' /* x87v3ed: lease the lane before the session launches */, WE_BUILD_DISPATCH_MODE: process.env.WE_BUILD_DISPATCH_MODE || 'mechanical' };
   return { argv, env };
 }
 
 export function cliDispatch(args, { exec = execFileSync } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'build-dispatch-daemon-'));
+  const base = launchBase();
   try {
     const { argv, env } = prepareDispatchLaunch(args, dir);
     const text = exec('node', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, cwd: REPO_ROOT, env });
-    return readDispatchOutcome(text);
+    return { ...readDispatchOutcome(text), base };
   } catch (e) {
     if (e?.stdout) {
       const outcome = readDispatchOutcome(e.stdout);
-      if (!outcome.dispatching && outcome.reason && !['unparseable dispatch-lane output', 'no verdict in dispatch-lane output'].includes(outcome.reason)) return outcome;
+      if (!outcome.dispatching && outcome.reason && !['unparseable dispatch-lane output', 'no verdict in dispatch-lane output'].includes(outcome.reason)) return { ...outcome, base };
     }
     // Redact BEFORE cutting (a cut inside `--settings {"env":{"GH_TOKEN":"…` leaves a credential no pattern can match):
     // this reason is persisted in the failure ledgers and printed in the tick result.
@@ -1879,16 +1957,21 @@ export function cliDispatch(args, { exec = execFileSync } = {}) {
 
 const pendingLaunchesRoot = () => join(resolveCoordinationRoot(), PENDING_LAUNCHES_DIRNAME);
 
+function launchBase() {
+  try { return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT, encoding: 'utf8', timeout: 5000, maxBuffer: 4096 }).trim(); }
+  catch { return null; } // unknown bases share a conservative bucket
+}
+
 /**
  * 78b — the NON-BLOCKING launch: spawn `dispatch-lane` detached, record it, return at once. The caller's claim stays
  * held; a later tick settles the launch ({@link cliSettleLaunches}). `pending: true` marks the result as "started,
  * not yet confirmed" — never a failure.
  */
-export function cliDispatchDetached(args, { spawn, root = pendingLaunchesRoot() } = {}) {
+export function cliDispatchDetached(args, { spawn, root = pendingLaunchesRoot(), readBase = launchBase } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'build-dispatch-daemon-'));
   try {
     const { argv, env } = prepareDispatchLaunch(args, dir);
-    const record = startDetachedLaunch({ root, num: args.num, kind: args.launchKind ?? 'build', argv, env, cwd: REPO_ROOT, workDir: dir, ...(spawn ? { spawn } : {}) });
+    const record = startDetachedLaunch({ root, num: args.num, kind: args.launchKind ?? 'build', base: readBase(), argv, env, cwd: REPO_ROOT, workDir: dir, ...(spawn ? { spawn } : {}) });
     return { dispatching: true, pending: true, lane: null, sessionSlug: null, attempt: record.attempt };
   } catch (e) {
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
@@ -1902,12 +1985,12 @@ export async function cliSettleLaunches({ root = pendingLaunchesRoot(), isPidAli
   for (const s of settled) {
     if (!s.outcome.dispatching && /launch not confirmed/.test(s.outcome.reason ?? '') && confirmed) {
       try {
-        if (await confirmed({ num: s.record.num, kind: s.record.kind })) s.outcome = { ...s.outcome, dispatching: true, confirmedBy: 'live-session' };
+        if (await confirmed({ num: s.record.num, kind: s.record.kind })) s.outcome = { ...s.outcome, dispatching: true, reason: null, confirmedBy: 'live-session' };
       } catch { /* an unreadable liveness stays a failure the next attempt retries */ }
     }
   }
   return { pending: pending.map((r) => ({ num: r.num, kind: r.kind, pid: r.pid, startedAt: r.startedAt })),
-    settled: settled.map((s) => ({ num: s.record.num, kind: s.record.kind, attempt: s.record.attempt, outcome: s.outcome })) };
+    settled: settled.map((s) => ({ num: s.record.num, kind: s.record.kind, base: s.record.base ?? null, attempt: s.record.attempt, outcome: s.outcome })) };
 }
 
 /** A launch whose result file said "not confirmed" still counts as launched when a live run-store row exists for it. */
@@ -2177,12 +2260,16 @@ export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAs
     if (!Array.isArray(result.list)) throw new Error('prepare PR listing unavailable');
     return result.list;
   }
-  /** Per-card branch and title searches. Every component must be complete; saturation fails closed. */
+  /**
+   * Per-card branch and title searches. Every component must be complete; saturation fails closed.
+   * Titles are searched under every alias: a batch published before numbering names only the bornAs id, and its
+   * `lane/prepare-batch-<lead>-<n>` branch never matches a per-id head search.
+   */
   function itemQuery(num, bornAs) {
     const ids = [...new Set([normNum(num), normNum(bornAs)].filter(Boolean))];
     if (!ids.length || ids.some(id => !/^[a-z0-9._-]+$/.test(id))) throw new Error('invalid prepare PR search identity');
     return { key: JSON.stringify(ids), searches: [
-      ...ids.map(id => `head:lane/${id}`), `in:title "WE #${normNum(num)}: prepare"`,
+      ...ids.map(id => `head:lane/${id}`), ...ids.map(id => `in:title "prepare" "${id}"`),
     ] };
   }
   const uniquePrs = prs => [...new Map(prs.map(pr => [pr.number ?? pr.headRefName, pr])).values()];
@@ -2622,7 +2709,7 @@ export function cliEffects() {
     planTick: (payload, { config } = {}) => cliPlanTick(payload, { config }),
     predictRoute: cliPredictRoute,
     fetchOpenPrs: cliFetchOpenPrs,
-    listClaims: () => listBuildDispatchClaims(),
+    listClaims: ({ ignoreExpiry = false } = {}) => listBuildDispatchClaims({ ignoreExpiry }),
     listFixClaims: () => liveFixInFlight(),
     listBorrowedFixes: () => liveBorrowedFixInFlight(),
     releaseClaim: ({ num }) => releaseBuildDispatchClaim({ num }),
@@ -2721,7 +2808,8 @@ export function policyFrom(flags, env = process.env) {
     maxOpenPrs: n(flags['max-open-prs'], BUILD_DISPATCH_POLICY.maxOpenPrs),
     maxOpenItems: n(flags['max-open-items'], BUILD_DISPATCH_POLICY.maxOpenItems),
     // Card 80 — declared settings; `off` (or a negative value) disables the window / the staleness gate.
-    prepareAheadWindow: offOr(flags['prepare-ahead-window'] ?? env.WE_BUILD_DAEMON_PREPARE_AHEAD_WINDOW, BUILD_DISPATCH_POLICY.prepareAheadWindow),
+    prepareAheadWindow: offOr(flags['prepare-ahead-window'] ?? env.WE_BUILD_DAEMON_PREPARE_AHEAD_WINDOW, readPreparePolicy({ env }).aheadCount),
+    prepareAheadWindowExplicit: offOr(flags['prepare-ahead-window'] ?? env.WE_BUILD_DAEMON_PREPARE_AHEAD_WINDOW, undefined) !== undefined,
     preparedMaxAgeDays: offOr(flags['prepared-max-age-days'] ?? env.WE_BUILD_DAEMON_PREPARED_MAX_AGE_DAYS, BUILD_DISPATCH_POLICY.preparedMaxAgeDays),
     // Card x60i0ie — declared cost-class admission settings (env + dispatch-settings.json); built-in `off`.
     costAdmission: readCostAdmissionSettings({ env }),
@@ -2963,9 +3051,11 @@ async function live(flags) {
       : null,
     killSwitch: cliKillSwitch,
   });
-  const intervalMs = Number(flags['interval-ms']) > 0 ? Number(flags['interval-ms']) : DEFAULT_INTERVAL_MS;
+  const pausedPollPolicy = loadBuilderPausedPollPolicy();
+  const intervalMs = effectiveTickIntervalMs({ policy, flagIntervalMs: flags['interval-ms'], pausedPollSec: pausedPollPolicy.pausedPollSec });
   console.error(`build-dispatch-daemon: live on ${hostname()}:${process.pid}, caps Claude ${policy.maxConcurrentBuilds} / external ${policy.maxConcurrentExternalBuilds}, tick every ${intervalMs}ms${flags['self-sync'] ? ', self-sync ON' : ''}.`);
   console.error(`build-dispatch-daemon: ${formatBuilderLaunchPolicyLine({ maxLaunchesPerTick: policy.maxLaunchesPerTick, source: policy.maxLaunchesPerTickSource, invalid: policy.maxLaunchesPerTickInvalid })}`);
+  console.error(`build-dispatch-daemon: tick intervalMs=${intervalMs}, paused-stretched=${policy.maxConcurrentBuilds === 0 && policy.maxConcurrentExternalBuilds === 0}; ${formatBuilderPausedPollPolicyLine(pausedPollPolicy)}`);
   const { stoppedReason } = await runDaemonLoop({
     tickOnce, sleep: realSleep, isAlive, intervalMs, fixedCadence: true, maxTicks: flags.once ? 1 : Infinity,
     onTick: (r, _tick, loop) => {
