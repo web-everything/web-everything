@@ -723,7 +723,9 @@ export function createEnqueueOnEvent({
         const reserved = [...pending.values()].filter((p) => p.catchUp).length;
         const priorities = await readPriorities();
         priorityNums = new Set(catchUpPrs.filter(p => p.override?.byOperator === true && ['now', 'urgent'].includes(p.override.value)).map(p => p.num));
-        const foldable = (p) => !p.catchUp && p.repo === localSlug && priorityNums.has(p.num) && !activeNums.has(p.num);
+        // A published main fix keeps precedence: the fold applies only while no main-fix PR is outstanding.
+        const fixOpen = !!(mainFix ?? priorities.mainFix);
+        const foldable = (p) => !fixOpen && !p.catchUp && p.repo === localSlug && priorityNums.has(p.num) && !activeNums.has(p.num);
         const folded = [...pending.values()].filter(foldable).map(p => p.num);
         if (folded.length) log(`enqueue-on-event: catch-up plans operator-priority PR(s) ${folded.map(n => `#${n}`).join(' ')} despite pending event work (priority:now/urgent label set by the operator)`);
         const plan = planCatchUp({ ...result, prs: catchUpPrs, capacity: capacity - reserved, ...priorities, mainFix: mainFix ?? priorities.mainFix, repo: localSlug, now: now(), order: s.catchUp.order, pendingNums: [...pending.values()].filter(p => (p.catchUp || !ownsFix(p.num, p.repo)) && !foldable(p)).map(p => p.num) });

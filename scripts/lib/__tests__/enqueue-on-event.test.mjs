@@ -1892,6 +1892,23 @@ describe('operator priority in catch-up (live 2026-10-20, #5738 skipped as "alre
     expect(f.lines.join('\n')).not.toContain('#42 already pending');
     expect(f.lines.join('\n')).toContain('catch-up plans operator-priority PR(s) #42 despite pending event work');
   });
+  it('never folds ahead of a published main fix (Codex audit: one-slot main-fix bypass)', async () => {
+    const f = catchUpSetup({ manualFinish: true,
+      resolveThroughput: () => ({ value: { redMainSkipCatchUp: false } }),
+      readMainFixPr: () => ({ repo: 'we', pr: 99, prs: [99], expiresAt: 1e15 }),
+      readCapacity: () => ({ capacity: 1, source: 'test' }),
+      readPriorities: () => ({ priority: { mode: 'enforce' } }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(99, 900), candidate(42, 100, { override: { value: 'urgent', byOperator: true } })] }),
+    });
+    f.handle.notePoll({ ok: true, marked: [mark(42)] });
+    f.advance(15_000);
+    const done = f.handle.catchUp();
+    for (let i = 0; i < 30; i++) await new Promise(r => setImmediate(r));
+    expect(f.calls.map(c => c.args.find(a => a.startsWith('--only=')))).toEqual(['--only=99']);
+    for (let i = 0; i < 30; i++) { f.children.forEach(c => c.finish()); await new Promise(r => setImmediate(r)); }
+    await done;
+    f.handle.kill();
+  });
   it('keeps skipping pending work whose priority label was not operator-set', async () => {
     const { f, first } = await run({ value: 'now', byOperator: false });
     expect(first).not.toContain('--only=42');
