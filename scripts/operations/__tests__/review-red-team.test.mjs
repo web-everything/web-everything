@@ -148,6 +148,15 @@ describe('x00g3tt — the red team fires on ACCEPT only', () => {
     expect(calls.some((c) => ['seat', 'reserve', 'scratch'].includes(c[0]))).toBe(false);
   });
 
+  it('a needs-human head the drain consumer stamped as live-accepted IS dispatched and posts (live gap #5549)', async () => {
+    const { io, calls } = fakeIo();
+    const p = payload('needs-human');
+    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: { ...p, acceptedPrHead: p.findings.read.netBasis.rev },
+      env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io);
+    expect(r.status).toBe('ran');
+    expect(calls.some((c) => c[0] === 'seat')).toBe(true);
+  });
+
   it('its own kill switch, and the added-seats one, each turn it off before anything is read', async () => {
     expect(redTeamEnabled({})).toBe(true);
     expect(redTeamEnabled({ [RED_TEAM_ENV]: '0' })).toBe(false);

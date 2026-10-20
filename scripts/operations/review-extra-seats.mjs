@@ -73,7 +73,7 @@ import {
   findingCorroboratedBy, foldRedTeamVerdict, IMPACT_LEVELS, normalizeFinding,
 } from '../lib/jury-core.mjs';
 import { renameSourcePaths } from './review-pr.mjs';
-import { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTeamOwedFor, redTeamPanelSeatOwed } from '../lib/review-red-team-policy.mjs';
+import { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTeamOwedFor, redTeamOwedForPass, redTeamPanelSeatOwed } from '../lib/review-red-team-policy.mjs';
 export { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTeamOwedFor, redTeamPanelSeatOwed } from '../lib/review-red-team-policy.mjs';
 import { expectationForLens, huntBriefForLens } from '../lib/review-core.mjs';
 import { verifySavedRedTeamProvenance } from '../lib/saved-red-team-provenance.mjs';
@@ -1390,7 +1390,7 @@ async function resumeRedTeam({ pr, repo, rev, title, prior, records, post, recor
 export async function runRedTeam({ pr, repo, lanePath, loopPayload, env = process.env, post = true, record = true } = {}, io = createRedTeamIo({ env })) {
   try {
     if (!redTeamEnabled(env)) return { status: 'disabled', reason: `${RED_TEAM_ENV}=${env?.[RED_TEAM_ENV] ?? ''} ${EXTRA_SEATS_ENV}=${env?.[EXTRA_SEATS_ENV] ?? ''}`.trim() };
-    if (!redTeamOwedFor(loopPayload)) return { status: 'not-owed', reason: notOwedReason(loopPayload) };
+    if (!redTeamOwedForPass(loopPayload)) return { status: 'not-owed', reason: notOwedReason(loopPayload) };
     const read = loopPayload?.findings?.read;
     const recording = record !== false && loopPayload?.replay !== true;
     const pass = await speculateRedTeam({ pr, repo, lanePath, read, claudeFindings: claudeFindingsFromLoop(loopPayload), env, post, record: recording }, io);
@@ -1601,7 +1601,7 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
     let rowsWritten = 0;
     let delegationTrial = 'not-delegated';
     let comment = { status: 'not-posted', reason: 'the red team did not run cleanly' };
-    if (ran && redTeamOwedFor(loopPayload)) {
+    if (ran && redTeamOwedForPass(loopPayload)) {
       ({ rowsWritten, delegationTrial, comment } = await finishRedTeamEffects({
         pr, repo, rev, title: pass.title, callId, provider, model, findings, recheckStatus, foldedVerdict, builder, records, seatRow: row, post, record,
       }, io));
@@ -1610,7 +1610,7 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
       try { io.append(row); rowsWritten = 1; } catch (e) { io.log(`red team: evidence row (${row.seat}) NOT written — ${e.message}`); }
     }
 
-    if (record && post && redTeamOwedFor(loopPayload)) {
+    if (record && post && redTeamOwedForPass(loopPayload)) {
       try { io.redTeamStatus?.({ repo, pr, loopPayload, status: 'finished', result: 'ran' }); }
       catch (e) { io.log(`red-team status: ${e.message}`); }
     }
