@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, existsSync
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 import { EventEmitter } from 'node:events';
 import { coronerNightDue, runNightlyCoronerJob, extractNightlyCoroner, runNightlyCoronerEntry, CHILD_STOP_GRACE_MS, RELEASE_TIMEOUT_MS, CORONER_LANE_SESSION, coronerLaneSession, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed, NIGHTLY_DEFAULTS, coronerDeadline, publishCoronerFailure } from '../nightly-coroner-job.mjs';
 import { createJobStore, enqueueJob, reattachTick, runJob, JOB_ID_ENV, JOB_ATTEMPT_ENV } from '../../lib/daemon-jobs-runtime.mjs';
@@ -346,7 +347,7 @@ it('on SIGTERM stops the running extractor subprocess and releases the lane befo
   // The extractor takes a moment to exit on SIGTERM: the lane must not be released while it still runs.
   writeFileSync(join(lane.path, 'scripts/operations/coroner-extract.mjs'),
     `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(pidFile)}, String(process.pid));\n` +
-    `process.on('SIGTERM', () => setTimeout(() => process.exit(0), 400));\nsetInterval(() => {}, 1000);\n`);
+    `process.on('SIGTERM', () => setTimeout(() => process.exit(0), 400));\n${keepAliveScript()}\n`);
   delete io.run; // the real subprocess runner, so the extractor is a live child process
   let aliveAtRelease = null;
   io.release.mockImplementation(async () => { aliveAtRelease = alive(); });

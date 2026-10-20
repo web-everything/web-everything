@@ -93,6 +93,7 @@ import {
   buildTrackedPathIndex, scopeBasenameMismatches, scopeBasenameMismatchMessage,
   checkLeashPin,
   findRelativeNodeScriptsAfterLaneCd,
+  findUnmanagedKeepAlives, KEEPALIVE_SCAN_DIRS, KEEPALIVE_HELPER_PATH, KEEPALIVE_NOT_A_SPAWN_MARKER,
   scopeMissingTestFile, bodyDeliverablesMissingFromScope, deferredBlockedByFindings,
   dirLevelScopeFinding,
 } from './check-standards-rules.mjs';
@@ -3140,6 +3141,36 @@ else {
 }
 
 mark("19. Unfenced mandate params (#2967b)");
+// ── 19b. Unmanaged keep-alive children (keep-alive leak fix, 2026-10-20) ─────────────────────────────────────
+// A do-nothing empty-callback timer child outlives any test that fails to kill it (154 orphans, up to 19 days
+// old, live-caught). Keep-alives come from scripts/lib/test-keepalive.mjs only — anchored + bounded.
+// The git invocation lives here; the pure filter is `findUnmanagedKeepAlives`. Only a non-git environment
+// skips the scan; a failed grep or an unreadable listed file is itself a finding (fail closed).
+{
+  let listed = null;
+  try {
+    // --untracked: a brand-new file must be caught before it is ever committed.
+    listed = execFileSync('git', ['grep', '-l', '--untracked', '-E', 'set(Interval|Timeout)', '--', ...KEEPALIVE_SCAN_DIRS], { cwd: ROOT, encoding: 'utf8' });
+  } catch (e) {
+    if (e.status === 1) listed = ''; // exit 1 = no match
+    else if (e.code === 'ENOENT' || e.status === 128) listed = null; // no git / not a repo: skip like the other git-backed sections
+    else err(`keep-alive scan could not list files (${String(e.message).split('\n')[0]}) — the scan did not run`, { kind: 'unmanaged-keepalive' });
+  }
+  const files = [];
+  for (const file of (listed ?? '').split('\n').filter(Boolean)) {
+    try { files.push({ file, content: readFileSync(join(ROOT, file), 'utf8') }); } catch (e) {
+      err(`keep-alive scan could not read ${file} (${e.code || e.message})`, { kind: 'unmanaged-keepalive', file });
+    }
+  }
+  for (const f of findUnmanagedKeepAlives(files)) {
+    err(`${f.file}:${f.line} spawns a bare empty-callback timer keep-alive — use spawnKeepAlive()/keepAliveScript() ` +
+      `from ${KEEPALIVE_HELPER_PATH} (anchored to the test runner + max lifetime) so it cannot be orphaned. ` +
+      `A line that only mentions the idiom and never runs it may end with a \`// ${KEEPALIVE_NOT_A_SPAWN_MARKER}\` comment.`,
+      { kind: 'unmanaged-keepalive', file: f.file });
+  }
+}
+
+mark("19b. Unmanaged keep-alive children (keep-alive leak fix, 2026-10-20)");
 // ── Scope attribution (#952, ratified #949 Fork 3-A) ───────────────────────────
 // `--scope=<session>` (alias `--mine=<session>`) partitions errors by ownership: an error on a file THIS
 // session dirtied (per its claim-time baseline, #949 Fork 2-A) BLOCKS; a concurrent/pre-existing red is
