@@ -17,15 +17,24 @@ export function latestUnresolvedPersonNote(comments = []) {
 /**
  * @param {{cardBatchHold?: ((repo:string, number:number) => ReturnType<typeof import('./operator-queue-card-batch-holds.mjs').classifyCardBatchHold>|null)}} [opts]
  *   `cardBatchHold` looks up the card-batch seal job's hold on this PR (we:scripts/operations/operator-queue-card-batch-holds.mjs).
- *   A hold the seal job still owns returns a `parked: true` row: the caller shows it under PARKED, never NEEDS YOU.
+ *   `withdrawalEvidence(repo, pr)` returns why someone other than the seal job may have withdrawn the PR, or null.
+ *   Only a hold the seal job owns AND a null evidence read returns a `parked: true` row (PARKED, never NEEDS YOU).
  */
-export function needsPersonRow(repo, pr, { cardBatchHold } = {}) {
+export function needsPersonRow(repo, pr, { cardBatchHold, withdrawalEvidence } = {}) {
   if ((pr.state ?? 'OPEN') === 'OPEN' && pr.isDraft === true
       && pr.labels?.some(l => (typeof l === 'string' ? l : l?.name) === WITHDRAWN_LABEL)) {
     let hold = cardBatchHold?.(repo, pr.number) ?? null;
     // A head that moved off the batch head means someone other than the seal job is acting on this PR.
     if (hold?.status === 'owned' && pr.headRefOid && hold.headSha && pr.headRefOid !== hold.headSha) {
       hold = { ...hold, status: 'moved', reason: `the PR head ${pr.headRefOid.slice(0, 9)} is not the batch head ${hold.headSha.slice(0, 9)}` };
+    }
+    // Owned by the seal job is not enough: a fixer may have withdrawn the same PR. Park only when a clean read finds
+    // no sign of that; no reader, a throwing reader, or any sign keeps the PR in NEEDS YOU.
+    if (hold?.status === 'owned') {
+      let evidence;
+      try { evidence = withdrawalEvidence ? withdrawalEvidence(repo, pr) : 'no fixer-withdrawal check available'; }
+      catch (error) { evidence = `fixer-withdrawal check failed: ${String(error?.message ?? error).split('\n')[0]}`; }
+      if (evidence) hold = { ...hold, status: 'fixer-evidence', reason: evidence };
     }
     if (hold?.status === 'owned') {
       return { repo, number: pr.number, title: pr.title, kind: 'card-batch-held', parked: true,

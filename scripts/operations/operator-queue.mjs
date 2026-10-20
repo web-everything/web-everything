@@ -94,6 +94,32 @@ try {
     import('./operator-queue-card-batch-holds.mjs'), import('./card-batch-io.mjs'), import('../lib/card-batch-settings.mjs')]);
   defaultReadCardBatchHolds = () => ({ ...readCardBatchHolds({ stateDir: cardBatchStateDir(), policy: effectiveCardBatchPolicy() }), keyOf: cardBatchHoldKey });
 } catch { /* staged copies */ }
+// Fixer-withdrawal evidence for a hold the seal job owns: the fix claim ledger, the PR's fix-begin comments, and
+// who put the withdrawal label on. Without these modules nothing parks (the reader is absent → NEEDS YOU).
+export let defaultWithdrawalEvidence = null;
+try {
+  const [{ fixerWithdrawalEvidence }, { fixDispatchClaimRoot, fixDispatchResource }, { lockDirFor, readLockEntry },
+    { OPERATOR_LOGINS }, { WITHDRAWN_LABEL }, { existsSync }] = await Promise.all([
+    import('./operator-queue-card-batch-holds.mjs'), import('../conveyor/fix-claim-store.mjs'), import('../readiness/file-locks.mjs'),
+    import('../lib/marker-authorship.mjs'), import('../conveyor/draft-promotion-rule.mjs'), import('node:fs')]);
+  defaultWithdrawalEvidence = (repo, pr) => {
+    const repoKey = repoKeyForSlug(repo);
+    if (!repoKey) return `${repo} is not a constellation repo`;
+    const lockRoot = fixDispatchClaimRoot();
+    // `fixing` is the fix-begin claim (the one that can withdraw); `fix` is the daemon's fixer dispatch claim.
+    const claims = ['fixing', 'fix'].map((kind) => {
+      const resource = fixDispatchResource({ repo: repoKey, pr: Number(pr.number), kind });
+      if (!existsSync(join(lockDirFor(lockRoot, resource), 'lock.json'))) return { kind, entry: null };
+      return { kind, entry: readLockEntry(lockRoot, resource) ?? 'unreadable' };
+    });
+    const out = String(execFileSync('gh', ['api', '--paginate', `repos/${repo}/issues/${Number(pr.number)}/events`, '--jq',
+      '.[] | select(.event == "labeled" or .event == "unlabeled") | {event, label: .label.name, actor: .actor.login}'],
+    { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }));
+    const labelEvents = out.split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    return fixerWithdrawalEvidence({ claims, comments: Array.isArray(pr.comments) ? pr.comments : null, labelEvents,
+      sealActors: [...OPERATOR_LOGINS], label: WITHDRAWN_LABEL });
+  };
+} catch { /* staged copies */ }
 
 // The optional ledger also pulls in a graph that staged CLI copies may omit.
 let pausedReferrals = null;
@@ -612,7 +638,7 @@ function readPrJson(args, { attempts, sleep, valid }) {
   }, { attempts, sleep });
 }
 
-export function main(args = process.argv.slice(2), { sleep = blockingSleep, pollAttempts, pollDelayMs, unsupportedPath, readCardBatchHolds = defaultReadCardBatchHolds } = {}) {
+export function main(args = process.argv.slice(2), { sleep = blockingSleep, pollAttempts, pollDelayMs, unsupportedPath, readCardBatchHolds = defaultReadCardBatchHolds, withdrawalEvidence = defaultWithdrawalEvidence } = {}) {
   const standDownQueueSection = reviewSettings?.resolveReviewSettings().standDownQueueSection ?? 'needs-you';
   console.error(`operator-queue: standDownQueueSection=${standDownQueueSection} (source: ${reviewSettings ? reviewSettings.resolveReviewSettingSource('standDownQueueSection') : 'built-in'})`);
   const readAttempts = resolveReadAttempts({ env: process.env, file: readSettings() });
@@ -777,7 +803,7 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
       }
       for (const pr of prs) {
         if (readyNumbersThisRepo.has(pr.number)) continue;
-        const row = needsPersonRow?.(repo, pr, { cardBatchHold });
+        const row = needsPersonRow?.(repo, pr, { cardBatchHold, withdrawalEvidence });
         if (!row) continue;
         if (row.parked) { (report.parked ??= []).push(row); continue; }
         const notReady = report.notReady.findIndex(r => r.repo === repo && r.number === pr.number);

@@ -98,3 +98,33 @@ export function readCardBatchHolds({ stateDir, now = Date.now(), policy = {}, re
 }
 
 export const cardBatchHoldKey = keyOf;
+
+/** The leading line of every `fix-begin` claim comment (we:scripts/conveyor/fix-procedure.mjs FIX_BEGIN_MARKER). */
+export const FIX_BEGIN_COMMENT_LEAD = '🔒 conveyor fix-begin — fix claim held';
+
+/**
+ * Pure: is there any sign that someone other than the seal job withdrew this PR? A fixer may run
+ * `fix-begin --draft --reason=withdrawn` on a batch PR without moving its head, so the seal job's ownership of the
+ * batch is not enough to park it. Any sign, or any input that could not be read, returns a reason: the PR then
+ * stays in NEEDS YOU. Only a clean read with no sign returns null.
+ * @param {{claims: Array<{kind:string, entry:object|'unreadable'|null}>|null, comments: Array<{body?:string}>|null,
+ *   labelEvents: Array<{event:string, label:string, actor:string|null}>|null, sealActors: string[], label: string}} input
+ */
+export function fixerWithdrawalEvidence({ claims, comments, labelEvents, sealActors, label }) {
+  if (!Array.isArray(claims)) return 'fix claim state unreadable';
+  for (const { kind, entry } of claims) {
+    if (entry === 'unreadable') return `fix claim state unreadable (${kind})`;
+    if (entry) return `a fix claim (${kind}) exists for this PR, held by ${entry.meta?.who ?? entry.owner ?? 'unknown'}`;
+  }
+  if (!Array.isArray(comments)) return 'PR comments unreadable';
+  if (comments.some(c => typeof c?.body === 'string' && c.body.trimStart().startsWith(FIX_BEGIN_COMMENT_LEAD))) {
+    return 'a fix-begin claim comment is on this PR';
+  }
+  if (!Array.isArray(labelEvents)) return 'label history unreadable';
+  const events = labelEvents.filter(e => e?.label === label);
+  const added = events.filter(e => e.event === 'labeled');
+  if (events.some(e => e.event === 'unlabeled')) return 'the withdrawal label was removed and re-added';
+  if (added.length !== 1) return `the withdrawal label was added ${added.length} times`;
+  if (!sealActors.includes(added[0].actor)) return `the withdrawal label was added by ${added[0].actor ?? 'an unknown actor'}, not the seal job`;
+  return null;
+}

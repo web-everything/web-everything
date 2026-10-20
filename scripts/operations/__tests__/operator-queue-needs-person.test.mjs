@@ -104,7 +104,7 @@ describe('#5773: a card-batch hold the seal job still owns is PARKED, not NEEDS 
   const owned = { status: 'owned', kind: 'filing', batchRef: 'lane/card-batch-filing-4', headSha: 'b'.repeat(40), members: 1, dueAt: '2026-10-20T19:46:24.138Z', reason: null };
 
   it('returns a parked row with no release command for an owned hold', () => {
-    const row = needsPersonRow('o/n', pr, { cardBatchHold: () => owned });
+    const row = needsPersonRow('o/n', pr, { cardBatchHold: () => owned, withdrawalEvidence: () => null });
     expect(row).toMatchObject({ parked: true, kind: 'card-batch-held', number: 5773, batchRef: 'lane/card-batch-filing-4' });
     expect(row.commands).toBeUndefined();
   });
@@ -123,6 +123,28 @@ describe('#5773: a card-batch hold the seal job still owns is PARKED, not NEEDS 
     expect(row.commands.releaseDraft).toContain('--remove-label review-status:draft-withdrawn');
   });
 
+  it.each([
+    ['fixer evidence', () => 'a fix claim (fixing) exists for this PR, held by fixer-1'],
+    ['a failing evidence read', () => { throw new Error('EIO'); }],
+    ['no evidence reader', undefined],
+  ])('keeps an owned hold in NEEDS YOU on %s', (_name, withdrawalEvidence) => {
+    const row = needsPersonRow('o/n', pr, { cardBatchHold: () => owned, withdrawalEvidence });
+    expect(row.parked).toBeUndefined();
+    expect(row.headline).toContain('(fixer-evidence)');
+    expect(row.commands.releaseDraft).toContain('--remove-label review-status:draft-withdrawn');
+  });
+
+  it('main keeps an owned hold in NEEDS YOU when the evidence read finds a fixer withdrawal', () => {
+    execFileSync.mockReturnValue(JSON.stringify([pr]));
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    main(['--repo=o/n', '--json'], { readCardBatchHolds: () => ({ holds: new Map([['o/n#5773', owned]]), errors: [] }),
+      withdrawalEvidence: () => 'a fix-begin claim comment is on this PR' });
+    const report = JSON.parse(log.mock.calls.at(-1)[0]);
+    expect(report.parked ?? []).toEqual([]);
+    expect(report.needsPerson).toMatchObject([{ number: 5773, kind: 'draft-withdrawn' }]);
+    expect(report.needsPerson[0].detail).toContain('fix-begin claim comment');
+  });
+
   it('keeps an unknown withdrawn draft in NEEDS YOU exactly as before', () => {
     const row = needsPersonRow('o/n', pr, { cardBatchHold: () => null });
     expect(row).toMatchObject({ kind: 'draft-withdrawn', headline: 'Withdrawn draft — explicit operator release required' });
@@ -132,7 +154,7 @@ describe('#5773: a card-batch hold the seal job still owns is PARKED, not NEEDS 
     execFileSync.mockReturnValue(JSON.stringify([pr]));
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const readCardBatchHolds = vi.fn(() => ({ holds: new Map([['o/n#5773', owned]]), errors: [] }));
-    main(['--repo=o/n', '--json'], { readCardBatchHolds });
+    main(['--repo=o/n', '--json'], { readCardBatchHolds, withdrawalEvidence: () => null });
     const report = JSON.parse(log.mock.calls.at(-1)[0]);
     expect(report.needsPerson).toEqual([]);
     expect(report.parked).toMatchObject([{ number: 5773, kind: 'card-batch-held' }]);

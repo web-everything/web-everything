@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { classifyCardBatchHold, readCardBatchHolds, SEAL_GRACE_MS } from '../operator-queue-card-batch-holds.mjs';
+import { classifyCardBatchHold, fixerWithdrawalEvidence, FIX_BEGIN_COMMENT_LEAD, readCardBatchHolds, SEAL_GRACE_MS } from '../operator-queue-card-batch-holds.mjs';
+import { FIX_BEGIN_MARKER } from '../../conveyor/fix-procedure.mjs';
 
 const policy = { filing: { maxAgeMinutes: 60, maxCards: 3 } };
 const openedAt = '2026-10-20T17:46:24.138Z';
@@ -70,5 +71,29 @@ describe('readCardBatchHolds', () => {
   });
   it('a missing state directory is empty, not an error', () => {
     expect(readCardBatchHolds({ stateDir: join(tmpdir(), 'no-such-card-batch-dir-x'), policy }).holds.size).toBe(0);
+  });
+});
+
+describe('fixerWithdrawalEvidence', () => {
+  const label = 'review-status:draft-withdrawn';
+  const clean = { claims: [{ kind: 'fixing', entry: null }, { kind: 'fix', entry: null }], comments: [],
+    labelEvents: [{ event: 'labeled', label: 'review:pending', actor: 'bot' }, { event: 'labeled', label, actor: 'chalbert' }],
+    sealActors: ['chalbert'], label };
+  it('a clean read (one seal-actor label event, no claim, no fix-begin comment) is no evidence', () => {
+    expect(fixerWithdrawalEvidence(clean)).toBeNull();
+  });
+  it('keeps the comment lead in step with fix-procedure', () => { expect(FIX_BEGIN_COMMENT_LEAD).toBe(FIX_BEGIN_MARKER); });
+  it.each([
+    ['a fix claim', { claims: [{ kind: 'fixing', entry: { owner: 'fix:x', meta: { who: 'fixer-1', draft: true, reason: 'withdrawn' } } }] }, 'fixer-1'],
+    ['an unreadable claim', { claims: [{ kind: 'fixing', entry: 'unreadable' }] }, 'unreadable'],
+    ['an unreadable claim ledger', { claims: null }, 'unreadable'],
+    ['a fix-begin --draft --reason=withdrawn comment', { comments: [{ body: `${FIX_BEGIN_MARKER}\n\nThe PR is now **draft** (\`withdrawn\`)` }] }, 'fix-begin'],
+    ['unreadable comments', { comments: null }, 'comments unreadable'],
+    ['a non-seal actor on the label', { labelEvents: [{ event: 'labeled', label, actor: 'plateau-worker[bot]' }] }, 'plateau-worker[bot]'],
+    ['a removed-and-re-added label', { labelEvents: [...clean.labelEvents, { event: 'unlabeled', label, actor: 'chalbert' }, { event: 'labeled', label, actor: 'chalbert' }] }, 're-added'],
+    ['no label event', { labelEvents: [] }, '0 times'],
+    ['unreadable label history', { labelEvents: null }, 'unreadable'],
+  ])('%s is evidence', (_name, override, text) => {
+    expect(fixerWithdrawalEvidence({ ...clean, ...override })).toContain(text);
   });
 });
