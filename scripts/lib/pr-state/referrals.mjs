@@ -11,7 +11,7 @@
  * counted for the current head, so it cannot be the fix.
  */
 import { createHash } from 'node:crypto';
-import { EVENT_TYPES, verdictClears, appliedVerdictHistory } from '../verdict-ledger.mjs';
+import { EVENT_TYPES, verdictBears, verdictClears, appliedVerdictHistory } from '../verdict-ledger.mjs';
 
 const HASHED_KEY = /^sha256:[0-9a-f]{64}$/;
 /**
@@ -56,15 +56,23 @@ const rowHeads = e => [verdictHead(e), e?.fromHead, e?.headSha].filter(isSha);
  */
 export function deriveReferrals(events, { applied = appliedVerdictRows(events), history = events, liveHead = null } = {}) {
   const position = new Map((history ?? []).map((e, i) => [e, i]));
-  const sightings = (history ?? []).flatMap((e, i) => rowHeads(e).map(h => [i, h]));
+  const sightings = (history ?? []).flatMap((e, i) => rowHeads(e).map(h => [i, h, e]));
   const referralRow = new Map(); // key → the referral row that last (re)opened it
+  const referredAt = new Map(); // key → every head a referral named it at: the finding was reproduced there, so none is its fix
   const resolvedFrom = new Map(); // key → { state before a fix resolved it, every head that qualified as the fix }
   // Heads the witness moved on to FROM the finding's head before its referral landed (review of A in flight, push B,
   // head-moved(A→B), then referral(A)): newer code, not an older head. A sighting at or after that move is no evidence
   // of an older head; one before it still is. Only moves the fold applied count (a head-moved row, or a fresh review
   // that moved the witness). A carry or a restamp re-witnesses the same content: its head is never newer code, though a
-  // later move from it is. A head first sighted by a non-bearing first-seen row stays unknown (it may be older), never newer.
+  // later move from it is. A head sighted by any row before the finding's head was first sighted stays unknown (it may be
+  // older), never newer.
+  const movedMemo = new Map();
   const movedOnFrom = (findingHead, row) => {
+    const memoKey = `${position.get(row) ?? -1}:${normSha(findingHead)}`;
+    if (!movedMemo.has(memoKey)) movedMemo.set(memoKey, movedOnFromUncached(findingHead, row));
+    return movedMemo.get(memoKey);
+  };
+  const movedOnFromUncached = (findingHead, row) => {
     const at = position.get(row) ?? -1;
     const chain = [findingHead], since = [];
     let witness = null;
@@ -80,11 +88,17 @@ export function deriveReferrals(events, { applied = appliedVerdictRows(events), 
     });
     return since;
   };
+  // Once the finding's head was sighted, a row that orders no heads (a review run, a referral or ruling, a non-bearing
+  // `observed` row) naming a head the witness later moved on to is no evidence that head is older: an abstain review of
+  // the pushed head writes no label, so the observer records the move only after it. A bearing verdict still is.
+  const ordersHeads = e => (e?.type === EVENT_TYPES.VERDICT || e?.type === undefined) && verdictBears(e?.verdict);
   const seenBefore = (head, row, findingHead = null) => {
     const at = position.get(row) ?? -1;
     const moved = isSha(findingHead) ? movedOnFrom(findingHead, row).find(([h]) => sameHead(h, head)) : null;
-    return sightings.some(([i, h]) => i < at && i < (moved ? moved[1] : Infinity) && sameHead(h, head));
+    const rootAt = moved ? (sightings.find(([, h]) => sameHead(h, findingHead))?.[0] ?? -1) : Infinity;
+    return sightings.some(([i, h, e]) => i < at && sameHead(h, head) && (!moved || (i < moved[1] && (i < rootAt || ordersHeads(e)))));
   };
+  const reproducedAt = (key, head) => (referredAt.get(key) ?? []).some(h => sameHead(h, head));
   const keys = new Map();
   // A public referral can be ruled on while review-pr is parked before its final ledger step.
   // Retain the latest valid ruling until the FIRST referral supplies the finding's head. Do not
@@ -96,6 +110,7 @@ export function deriveReferrals(events, { applied = appliedVerdictRows(events), 
         // An overruled finding (not-real, card) coming back is not new news (live plateau-app #202); a `block` that
         // comes back, or a fix that did not hold, re-opens the key.
         if (keys.get(key)?.state === 'ruled') continue;
+        if (isSha(e.headSha)) referredAt.set(key, [...(referredAt.get(key) ?? []), e.headSha]);
         const early = earlyRulings.get(key);
         earlyRulings.delete(key);
         keys.set(key, { key, state: early?.state ?? 'open', head: e.headSha,
@@ -120,7 +135,7 @@ export function deriveReferrals(events, { applied = appliedVerdictRows(events), 
     } else if ((e.type === EVENT_TYPES.VERDICT || e.type === undefined) && verdictClears(e.verdict) && applied.has(e)) {
       const head = verdictHead(e);
       for (const [key, k] of keys) {
-        if (!(isSha(head) && isSha(k.head) && !sameHead(head, k.head) && !seenBefore(head, referralRow.get(key), k.head))) continue;
+        if (!(isSha(head) && isSha(k.head) && !sameHead(head, k.head) && !reproducedAt(key, head) && !seenBefore(head, referralRow.get(key), k.head))) continue;
         if (k.state === 'open' || k.state === 'blocking') {
           resolvedFrom.set(key, { state: k.state, heads: [head] });
           keys.set(key, { ...k, state: 'resolved-by-fix', resolvedAtHead: head });
@@ -134,7 +149,7 @@ export function deriveReferrals(events, { applied = appliedVerdictRows(events), 
       if (k?.state !== 'resolved-by-fix') continue;
       // A path back through the finding's own head, or any head named before the referral, proves no fix: a carry
       // there is the same content the finding was raised on.
-      const stale = h => sameHead(h, k.head) || seenBefore(h, referralRow.get(key), k.head);
+      const stale = h => sameHead(h, k.head) || reproducedAt(key, h) || seenBefore(h, referralRow.get(key), k.head);
       const fix = heads.find(h => leadsTo(history ?? [], h, liveHead, stale));
       keys.set(key, fix ? { ...k, resolvedAtHead: fix } : { ...k, state, resolvedAtHead: null });
     }

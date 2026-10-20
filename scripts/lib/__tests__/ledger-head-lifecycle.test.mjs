@@ -396,6 +396,30 @@ describe('ledger head lifecycle red-team regressions', () => {
           expect(codes(events, third)).not.toContain(ruled ? 'referral-blocked' : 'referral-unruled');
         }
       });
+      for (const ruled of [null, 'block']) it(`a run that moves no head, naming B before head-moved(A→B), does not make B older${ruled ? ' (block)' : ''}`, () => {
+        // An abstain review of B writes a review-run row but no label, so the observer records the move only later.
+        const run = sha => event('review-run', { headSha: sha, phase: 'completed', posted: false });
+        const other = `sha256:${'9'.repeat(64)}`; // another finding, ruled not-real, so it holds nothing itself
+        for (const early of [[run(next)], [verdict('observed', next)], [event('referral', { headSha: next, findingKeys: [other] }), event('ruling', { findingKey: other, ruling: 'not-real' })]]) {
+          const events = [verdict('changes'), run(head), ...early, moved, verdict('accepted'), ...late(ruled), run(head), verdict('accepted', next), run(next)];
+          expect(ledgerView(events, facts(next)).referrals.get(key).state).toBe('resolved-by-fix');
+          expect(codes(events)).not.toContain(ruled ? 'referral-blocked' : 'referral-unruled');
+        }
+        // A bearing verdict of B before A was ever sighted still makes B an older head.
+        const older = [verdict('changes', next), verdict('changes'), run(next), moved, ...late(ruled), verdict('accepted', next)];
+        expect(ledgerView(older, facts(next)).referrals.get(key).state).toBe(ruled ? 'blocking' : 'open');
+      });
+      for (const ruled of [null, 'block']) it(`a head the finding was reproduced at is never its fix, even after a late referral of A${ruled ? ' (block)' : ''}`, () => {
+        const atB = event('referral', { headSha: next, findingKeys: [key] });
+        const events = [verdict('changes'), moved, verdict('accepted', next), atB, ...(ruled ? [event('ruling', { findingKey: key, ruling: ruled })] : []),
+          verdict('accepted'), event('referral', { headSha: head, findingKeys: [key] }), verdict('accepted', next)];
+        // The late re-referral re-opens a block-ruled key (a finding that comes back is unruled again); either way it holds.
+        expect(ledgerView(events, facts(next)).referrals.get(key).state).toBe('open');
+        expect(codes(events)).toContain('referral-unruled');
+        // A push to C after it is newer code: a fresh accept of C fixes it.
+        const pushed = [...events, verdict('head-moved', third, { fromHead: next, source: 'head-observer' }), verdict('accepted', third)];
+        expect(ledgerView(pushed, facts(third)).referrals.get(key).state).toBe('resolved-by-fix');
+      });
       it('a head that was older than A stays no fix, even when a later move returns to it', () => {
         const events = [verdict('accepted', next), verdict('head-moved', head, { fromHead: next, source: 'head-observer' }), verdict('accepted'),
           verdict('head-moved', next, { fromHead: head, source: 'head-observer' }), ...late('block'), verdict('accepted', next)];
