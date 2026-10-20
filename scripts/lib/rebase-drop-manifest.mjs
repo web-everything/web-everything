@@ -18,13 +18,15 @@
  *   2. if the ONLY conflicted path is the manifest (or the merge is clean): read that tree into a TEMP index
  *      (`GIT_INDEX_FILE`, never touching HEAD/the working tree), `git rm --cached` the manifest,
  *      `git write-tree` → a resolved, manifest-free tree.
+ *   Card-only resolved trees default to one commit on a pinned base, with preserved co-authors,
+ *   a net-patch equality proof and an expected-head lease. Other trees use the legacy steps:
  *   3. `git commit-tree <tree> -p <base> -p <laneRef>` — `<base>` is the FIRST parent, so GitHub sees the
  *      branch as up-to-date (not BEHIND) and manifest-free (not CONFLICTING).
  *   4. push that commit to the `lane/*` ref (a fast-forward — the new commit has `<laneRef>` as an ancestor).
  *   → the caller then `gh pr merge`s the now-CLEAN PR.
  *
- * If `merge-tree` reports ANY conflict beyond the manifest, this returns `{ action: 'skip' }` — a real
- * conflict needs a human; the lander never force-resolves code.
+ * Beyond the transient paths, only a proven card-only PR whose conflicts are entirely inside Also raised by
+ * lists can use the stable union resolver. Every other content conflict returns `{ action: 'skip' }`.
  *
  * Repo-root fix-evidence markdown files are transient like the manifest: fixer agents share these
  * scratch paths, so drop them from the rebuilt tree and accept conflicts confined to either kind.
@@ -37,6 +39,11 @@ import { gitRun as gitRunner, ensureFullHistory } from './git-run.mjs';
 import { applyCollisionHealToIndex } from './nnn-collision-heal.mjs';
 import { isFixEvidencePath, isDrainTransientPath } from './transient-paths.mjs';
 import { refuseHeldPush } from '../conveyor/fix-procedure.mjs';
+import { applyRaisedByConflictsToIndex, loadCardConflictSettings } from './card-conflict-resolve.mjs';
+import { isCardPath } from '../ci-card-only.mjs';
+
+import { loadCardRebaseSettings, cardTreeOnly, pinCardInputs, dirtyCardStack, cardSquashRebuild } from './card-squash-rebuild.mjs';
+export { loadCardRebaseSettings } from './card-squash-rebuild.mjs';
 
 export const LANE_MANIFEST = '.lane-manifest.json';
 
@@ -124,6 +131,8 @@ export { gitRunner };
  * @param {boolean} [o.fetch=true]      fetch `<laneRef>` from `<remote>` first so `<remote>/<laneRef>` is current (#2231).
  * @param {string} [o.manifest='.lane-manifest.json']
  * @param {string} [o.message]          commit-tree message (defaults to a "drain: rebase … drop manifest" line).
+ * @param {boolean} [o.dryRun=false] create/prove the commit without pushing.
+ * @param {object} [o.cardRebaseSettings] source-logged squash policy cascade.
  * @param {string} [o.tmpIndex]         temp index path for GIT_INDEX_FILE (default `.git/rebase-drop-index`).
  * @param {boolean}[o.healCollision=false] #2276 — ALSO renumber a colliding new backlog item in the SAME rebuilt
  *                                       tip (reusing #2222's `applyCollisionHealToIndex`), so the rebuild that
@@ -145,9 +154,14 @@ export function rebaseDropManifest({
   message,
   tmpIndex = '.git/rebase-drop-index',
   healCollision = false,
+  cardConflictSettings = loadCardConflictSettings(),
+  cardRebaseSettings = loadCardRebaseSettings(),
+  dryRun = false,
   cwd,
   run = gitRunner,
 } = {}) {
+  const cardRebaseSetting = { value: cardRebaseSettings.value.squashToSingleCommit, source: cardRebaseSettings.sources.squashToSingleCommit };
+  const displayBase = base;
   if (!laneRef) return { action: 'error', reason: 'no laneRef given' };
 
   // #2231 — in the isolated-clone drain model (#2197) the lane branch exists ONLY as the remote-tracking ref
@@ -155,7 +169,7 @@ export function rebaseDropManifest({
   // bare name fail with "not something we can merge" and the whole auto-rebase is inert. Fetch the lane ref
   // first (so the remote-tracking ref is current), then feed the RESOLVED `<remote>/<laneRef>` to the merge
   // inputs. The PUSH still targets the bare `refs/heads/<laneRef>` (that part was always correct).
-  const mergeRef = readRef || `${remote}/${laneRef}`;
+  let mergeRef = readRef || `${remote}/${laneRef}`;
   if (fetch) {
     const f = run('git', ['fetch', remote, laneRef], { cwd });
     if (f.status !== 0) return { action: 'error', reason: `fetch ${laneRef} failed (${(f.stderr || '').split('\n')[0]})` };
@@ -197,13 +211,43 @@ export function rebaseDropManifest({
     }
   }
 
-  const disp = manifestConflictDisposition(parsed, manifest);
-  if (disp === 'real') return { action: 'skip', reason: `real conflict beyond ${manifest}`, conflictPaths: parsed.conflictPaths };
+  let disp = manifestConflictDisposition(parsed, manifest);
+  const cardConflictSetting = { value: cardConflictSettings.value.autoResolveRaisedBy,
+    source: cardConflictSettings.sources.autoResolveRaisedBy };
+  let cardConflict = disp === 'real' && parsed.conflictPaths.length > 0 && parsed.conflictPaths.every(isCardPath);
+  if (disp === 'real' && (!cardConflict || !cardConflictSetting.value)) return { action: 'skip',
+    reason: !cardConflictSetting.value ? 'cardConflicts.autoResolveRaisedBy disabled' : `real conflict beyond ${manifest}`,
+    conflictPaths: parsed.conflictPaths, cardConflictSetting };
+
+  if (cardConflict) {
+    // Other watchers may fetch into this clone while the probe runs. Freeze BOTH inputs and recompute
+    // before reading either list: a tree from main A must never be committed with main B as its parent.
+    const inputs = [base, mergeRef].map(ref => run('git', ['rev-parse', '--verify', `${ref}^{commit}`], { cwd }));
+    const ids = inputs.map(r => String(r.stdout || '').trim());
+    if (inputs.some(r => r.status !== 0) || ids.some(id => !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(id)))
+      return { action: 'skip', reason: 'cannot pin card conflict inputs', cardConflictSetting };
+    [base, mergeRef] = ids;
+    const pinned = run('git', ['merge-tree', '--write-tree', base, mergeRef], { cwd });
+    parsed = parseMergeTree(pinned.stdout, pinned.status);
+    if (!parsed.tree || (!parsed.clean && !parsed.conflictPaths.length))
+      return { action: 'skip', reason: 'cannot prove pinned card conflict', cardConflictSetting };
+    disp = manifestConflictDisposition(parsed, manifest);
+    cardConflict = disp === 'real' && parsed.conflictPaths.every(isCardPath);
+    if (disp === 'real' && !cardConflict) return { action: 'skip', reason: 'pinned merge has a non-card conflict',
+      conflictPaths: parsed.conflictPaths, cardConflictSetting };
+  }
 
   // Build a resolved, manifest-free tree in a TEMP index — never touches HEAD or the working tree.
   const env = { GIT_INDEX_FILE: tmpIndex };
   const read = run('git', ['read-tree', parsed.tree], { env, cwd });
   if (read.status !== 0) return { action: 'error', reason: `read-tree failed (${(read.stderr || '').split('\n')[0]})` };
+  let resolvedRaisedBy = [];
+  if (cardConflict) {
+    const resolution = applyRaisedByConflictsToIndex({ run, cwd, env, tree: parsed.tree, base, mergeRef,
+      conflictPaths: parsed.conflictPaths, enabled: cardConflictSetting.value });
+    if (!resolution.ok) return { action: 'skip', reason: resolution.reason, conflictPaths: parsed.conflictPaths, cardConflictSetting };
+    resolvedRaisedBy = resolution.resolved;
+  }
   // Drop the manifest if present (--ignore-unmatch: a clean merge with no manifest in the tree is fine).
   run('git', ['rm', '--cached', '--ignore-unmatch', manifest], { env, cwd });
   const rootEntries = run('git', ['ls-tree', '--name-only', parsed.tree], { env, cwd });
@@ -226,6 +270,21 @@ export function rebaseDropManifest({
   const resolvedTree = String(wt.stdout || '').trim();
   if (wt.status !== 0 || !resolvedTree) return { action: 'error', reason: `write-tree failed (${(wt.stderr || '').split('\n')[0]})` };
 
+  const healTag = healed.length ? `, renumber ${healed.map((r) => `#${r.oldNum}→#${r.newNum}`).join('/')}` : '';
+  const evidenceTag = droppedEvidence.length ? `, drop fix evidence ${droppedEvidence.join(', ')}` : '';
+  const msg = message || `drain: rebase ${laneRef} onto ${displayBase}, drop transient ${manifest}${evidenceTag}${healTag}`;
+  const squash = cardRebaseSetting.value && cardTreeOnly({ run, cwd, base, tree: resolvedTree });
+  if (squash) {
+    const pinned = pinCardInputs({ run, cwd, base, mergeRef });
+    if (!pinned) return { action: 'error', reason: 'cannot pin card squash inputs' };
+    // Recompute the merge and all resolutions against the frozen commits before using the tree.
+    if (base !== pinned[0] || mergeRef !== pinned[1]) return rebaseDropManifest({
+      laneRef, base: pinned[0], readRef: pinned[1], remote, fetch: false, manifest,
+      message: msg,
+      tmpIndex, healCollision, cardConflictSettings, cardRebaseSettings, dryRun, cwd, run,
+    });
+  }
+
   // IDEMPOTENCY SHORT-CIRCUIT (drain re-push churn bug). `rebaseDropManifest` used to ALWAYS `commit-tree` (minting a fresh SHA)
   // and force-push the rebuilt tip — even when the tip is ALREADY rebased on `base` AND already manifest-free.
   // The drain reads `hasManifest` from the PR *body* and fires this every pass, so a green, on-main,
@@ -237,12 +296,13 @@ export function rebaseDropManifest({
   // — so it still gets rebuilt to drop it). Over-conservative direction: when uncertain, rebuild.
   const curTreeOid = String(run('git', ['rev-parse', `${mergeRef}^{tree}`], { cwd }).stdout || '').trim();
   const isAncestor = run('git', ['merge-base', '--is-ancestor', base, mergeRef], { cwd }).status === 0;
-  if (isAncestor && curTreeOid && curTreeOid === resolvedTree) {
+  if (isAncestor && curTreeOid && curTreeOid === resolvedTree
+    && (!squash || !dirtyCardStack({ run, cwd, base, mergeRef }))) {
     const curCommit = String(run('git', ['rev-parse', mergeRef], { cwd }).stdout || '').trim();
     // Guard: only claim 'current' if we can actually resolve the tip's commit sha; otherwise fall through to
     // the normal rebuild rather than return a bogus result.
     if (curCommit) {
-      return { action: 'current', reason: 'tip already up-to-date on base and manifest-free — no rebuild needed', base, laneRef, newCommit: curCommit, droppedEvidence };
+      return { action: 'current', reason: 'tip already up-to-date on base and manifest-free — no rebuild needed', base, laneRef, newCommit: curCommit, droppedEvidence, cardRebaseSetting };
     }
   }
 
@@ -255,16 +315,19 @@ export function rebaseDropManifest({
     return r.status === 0 ? String(r.stdout || '').split('\n').filter(Boolean).length : null;
   };
   const jump = scopeJumpVerdict(countFiles([`${base}...${mergeRef}`]), countFiles([base, resolvedTree]));
-  if (!jump.ok) {
+  if (!jump.ok && !squash) {
     return { action: 'error', guard: 'scope-jump', prevFiles: jump.prev, postFiles: jump.post, reason: `refusing to push ${laneRef}: ${jump.reason}` };
   }
 
-  const healTag = healed.length ? `, renumber ${healed.map((r) => `#${r.oldNum}→#${r.newNum}`).join('/')}` : '';
-  const evidenceTag = droppedEvidence.length ? `, drop fix evidence ${droppedEvidence.join(', ')}` : '';
-  const msg = message || `drain: rebase ${laneRef} onto ${base}, drop transient ${manifest}${evidenceTag}${healTag}`;
-  const ct = run('git', ['commit-tree', resolvedTree, '-p', base, '-p', mergeRef, '-m', msg], { cwd });
+  const built = squash ? cardSquashRebuild({ run, cwd, base, mergeRef, tree: resolvedTree, message: msg }) : null;
+  if (built?.action === 'error') return built;
+  const ct = built ? { status: 0, stdout: built.newCommit } : run('git', ['commit-tree', resolvedTree, '-p', base, '-p', mergeRef, '-m', msg], { cwd });
   const newCommit = String(ct.stdout || '').trim();
   if (ct.status !== 0 || !newCommit) return { action: 'error', reason: `commit-tree failed (${(ct.stderr || '').split('\n')[0]})` };
+
+  const proof = built?.proof;
+  if (dryRun) return { action: 'dry-run', newCommit, oldHead: mergeRef, base, laneRef, proof,
+    wouldPush: squash ? 'lease' : 'fast-forward', cardRebaseSetting };
 
   // #4293 — refuse this mechanical push too if another fixer holds the LIVE fix claim on the PR this laneRef
   // belongs to (see `refuseHeldPush`'s own header for why the check lives here, not at each caller — this
@@ -272,9 +335,10 @@ export function rebaseDropManifest({
   const refusal = refuseHeldPush({ run, cwd, remote, branch: laneRef });
   if (refusal) return { action: 'error', reason: refusal.message };
 
-  // Fast-forward push (newCommit descends from laneRef) to the guard-safe lane/* ref — no checkout.
-  const push = run('git', ['push', remote, `${newCommit}:refs/heads/${laneRef}`], { cwd });
+  // Card squash replaces the old tip under an exact lease; other trees retain the legacy fast-forward push.
+  const push = run('git', ['push', ...(squash ? [`--force-with-lease=refs/heads/${laneRef}:${mergeRef}`] : []), remote, `${newCommit}:refs/heads/${laneRef}`], { cwd });
   if (push.status !== 0) return { action: 'error', reason: `push to ${laneRef} failed (${(push.stderr || '').split('\n')[0]})` };
 
-  return { action: 'rebased', newCommit, dropped: disp === 'manifest-only', droppedEvidence, healed, base, laneRef };
+  return { action: 'rebased', newCommit, cardRebaseSetting, ...(proof ? { proof } : {}), dropped: disp === 'manifest-only', droppedEvidence, healed, base, laneRef,
+    ...(resolvedRaisedBy.length ? { resolvedRaisedBy, cardConflictSetting } : {}) };
 }

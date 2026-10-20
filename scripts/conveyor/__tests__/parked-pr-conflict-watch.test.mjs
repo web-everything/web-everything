@@ -121,6 +121,17 @@ describe('the real incident that motivated this pass — WE PR #1920, captured l
     expect(calls[2]).toEqual(['setLabels', 'web-everything/web-everything', 1920, { add: CONFLICT_LABEL, remove: [] }]);
   });
 
+  it('xym8nt4: an open card-group member (source or combined PR) is left to the drain grouping — no label, comment or send-back', () => {
+    const calls = [];
+    const provider = { ensureLabel: (...a) => calls.push(a), setLabels: (...a) => calls.push(a), postComment: (...a) => calls.push(a) };
+    const seen = [];
+    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down', repo: 'web-everything/web-everything', listPrs: () => [REAL_1920_SNAPSHOT], provider, ...noopRouting(),
+      inCardGroupFn: q => { seen.push(q); return true; } });
+    expect(results).toEqual([]);
+    expect(calls).toEqual([]);
+    expect(seen[0]).toMatchObject({ num: 1920, headRef: REAL_1920_SNAPSHOT.headRefName });
+  });
+
   it('once the PR is rebased clean (as #1920 actually was, mid-investigation) the label self-clears', () => {
     const healed = { ...REAL_1920_SNAPSHOT, mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', labels: [...REAL_1920_SNAPSHOT.labels, { name: CONFLICT_LABEL }] };
     const calls = [];
