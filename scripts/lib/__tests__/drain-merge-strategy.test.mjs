@@ -25,7 +25,7 @@ const policyOf = (strategy) => ({ policy: resolveMergeDeliveryPolicy({ tool: str
 
 const DRAIN = 'drain-bot';
 
-function harness({ gitExec, resolveRealFiles, priorityReserve, reservePath, strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = { ...process.env, WE_RED_TEAM_TIMING: 'post-accept' }, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, readReviewAgents = () => [], baseTip = () => BASE_TIP } = {}) {
+function harness({ gitExec, resolveRealFiles, priorityReserve, reservePath, strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = { ...process.env, WE_RED_TEAM_TIMING: 'post-accept' }, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, readReviewAgents = () => [], baseTip = () => BASE_TIP, strategyExtra = {} } = {}) {
   const calls = [];
   const logs = [];
   let stored = initial;
@@ -69,6 +69,7 @@ function harness({ gitExec, resolveRealFiles, priorityReserve, reservePath, stra
   const readFile = () => { if (stored == null) { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; } return JSON.stringify(stored); };
   const writeState = (_p, s) => { stored = JSON.parse(JSON.stringify(s)); };
   const s = createDrainMergeStrategy({
+    ...strategyExtra,
     ...(resolveRealFiles ? { resolveRealFiles } : {}),
     ...(priorityReserve ? { priorityReserve } : {}), ...(reservePath ? { reservePath } : {}),
     dryRun, env, readReviewAgents, readRedTeamEvidence: () => { if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }, requestRedTeam, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
@@ -1565,6 +1566,59 @@ describe('live queue file-overlap admission', () => {
   });
 });
 
+
+describe('card-overlap clean-merge relief (drain.cardOverlapCleanMerge)', () => {
+  const card = 'backlog/123-card.md';
+  const TIP = 'c'.repeat(40);
+  const candidate = { num: 42, listedFiles: [card], listedFilesComplete: true };
+  const facts = numbers => ({ data: { repository: { mergeQueue: { entries: {
+    pageInfo: { hasNextPage: false }, nodes: numbers.map(number => ({ pullRequest: { number } })),
+  } } } } });
+  const mergeRun = status => vi.fn((cmd, args) => args[0] === 'cat-file' ? { status: 0 }
+    : args[0] === 'merge-tree' ? { status, stdout: status === 0 ? `${'d'.repeat(40)}\n` : `${'d'.repeat(40)}\n${card}\n` } : { status: 128 });
+  const setup = ({ enabled = true, status = 0, tip = { sha: TIP, num: 43 }, queuedFiles = [card], files = [card] } = {}) => {
+    const readQueueTip = vi.fn(() => tip);
+    const cardMergeRun = mergeRun(status);
+    const h = harness({ strategy: 'github-merge-queue', queueFacts: facts([43]), ghView: { 43: { files: queuedFiles.map(path => ({ path })) } },
+      strategyExtra: { cardOverlapCleanMerge: { enabled, source: 'tool' }, readQueueTip, cardMergeRun } });
+    return { ...h, readQueueTip, cardMergeRun, c: { ...candidate, listedFiles: files } };
+  };
+  it('enqueues a card-only overlap that merges cleanly onto the queue tip', () => {
+    const h = setup();
+    expect(h.s.queueOverlapHold(h.c, HEAD)).toBeNull();
+    expect(h.s.enqueue(h.c, HEAD, { comments: stampedBy(DRAIN) })).toMatchObject({ enqueued: true });
+    expect(h.cardMergeRun).toHaveBeenCalledWith('git', ['merge-tree', '--write-tree', '--name-only', '--no-messages', TIP, HEAD], expect.anything());
+    expect(h.logs.join('')).toContain('card-overlap clean-merge: #42 with #43 → enqueue');
+    expect(h.logs.join('')).toContain('drain.cardOverlapCleanMerge=on (tool)');
+  });
+  it('keeps the deferral on a conflict', () => {
+    const h = setup({ status: 1 });
+    expect(h.s.queueOverlapHold(h.c, HEAD)?.kind).toBe('queue-file-overlap');
+    expect(h.s.enqueue(h.c, HEAD, { comments: stampedBy(DRAIN) })).toMatchObject({ enqueued: false, kind: 'queue-file-overlap' });
+    expect(h.logs.join('')).toContain(`card-overlap clean-merge: #42 with #43 → skip: conflict (${card})`);
+  });
+  it.each([
+    ['merge-tree error', { status: 128 }],
+    ['queue tip unknown', { tip: { error: 'a queue entry has no merge-group commit yet' } }],
+  ])('keeps the deferral on %s', (_name, over) => {
+    const h = setup(over);
+    expect(h.s.enqueue(h.c, HEAD, { comments: stampedBy(DRAIN) })).toMatchObject({ enqueued: false, kind: 'queue-file-overlap' });
+    expect(h.logs.join('')).toMatch(/card-overlap clean-merge: #42 with #43 → skip: /);
+  });
+  it('keeps the deferral, without a dry merge, when any shared path is not a card', () => {
+    const h = setup({ files: [card, 'scripts/x.mjs'], queuedFiles: [card, 'scripts/x.mjs'] });
+    expect(h.s.enqueue(h.c, HEAD, { comments: stampedBy(DRAIN) })).toMatchObject({ enqueued: false, kind: 'queue-file-overlap' });
+    expect(h.readQueueTip).not.toHaveBeenCalled();
+    expect(h.cardMergeRun).not.toHaveBeenCalled();
+    expect(h.logs.join('')).toContain('→ skip: non-card overlap');
+  });
+  it('does nothing new when the setting is off', () => {
+    const h = setup({ enabled: false });
+    expect(h.s.enqueue(h.c, HEAD, { comments: stampedBy(DRAIN) })).toMatchObject({ enqueued: false, kind: 'queue-file-overlap' });
+    expect(h.readQueueTip).not.toHaveBeenCalled();
+    expect(h.logs.join('')).not.toContain('card-overlap clean-merge');
+  });
+});
 
 describe('red-team requests while queue-file-overlap deferred', () => {
   const c = { num: 42, listedFiles: ['scripts/x.mjs'], listedFilesComplete: true };

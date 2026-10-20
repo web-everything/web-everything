@@ -53,6 +53,7 @@ import { getRequiredStatusChecks } from './required-status-checks.mjs';
 import { readSettings } from './settings-files.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { queueFileOverlap, readQueueEntryFiles, completeListedFiles } from './queue-file-overlap.mjs';
+import { cardOverlapRelief, readCardOverlapCleanMerge, readQueueTip as defaultReadQueueTip } from './card-overlap-clean-merge.mjs';
 import { gitRealFiles, resolveRealFiles as defaultResolveRealFiles } from './pr-real-files.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { createAdaptiveBatching, readQueueFacts } from './merge-queue-adaptive-batching.mjs';
@@ -265,6 +266,7 @@ export function createDrainMergeStrategy({
   cancelObsoleteRuns = cancelObsoleteQueueRuns, batching, resolveRealFiles = defaultResolveRealFiles,
   env = process.env, queueSafety, labelProvider, readRedTeamEvidence = readDrainRedTeamEvidence, requestRedTeam = null, readReviewAgents = listAgentsWithReviewJobs,
   cwd = process.cwd(), // a clone of the local repo: enqueuePr reads the judged commit's change list from it
+  cardOverlapCleanMerge, readQueueTip = defaultReadQueueTip, cardMergeRun,
 } = {}) {
   const { policy, note } = resolved;
   const statusProvider = labelProvider ?? createGhProvider({ exec: (args, opts) => exec('gh', args, opts) });
@@ -295,6 +297,19 @@ export function createDrainMergeStrategy({
   log.write(`  ${formatMergeDeliverySourcesLine(policy)}${dryRun ? ' [dry run]' : ''}\n`);
   if (note) log.write(`  ⚠ merge-delivery: ${note}\n`);
   const safety = queueSafety ?? readDrainQueueSafety({ env, log: line => log.write(`  ${line}\n`) });
+  let cardMergeSetting = cardOverlapCleanMerge;
+  if (!cardMergeSetting) {
+    try { cardMergeSetting = readCardOverlapCleanMerge({ env, log: line => log.write(`  ${line}\n`) }); }
+    catch { cardMergeSetting = { enabled: false, source: 'unreadable' }; }
+  }
+  /** A card-only overlap that dry-merges cleanly onto the queue tip is not a hold; anything else keeps it. */
+  const cardOverlapEnqueues = (c, headSha, overlap) => {
+    if (!cardMergeSetting.enabled || !overlap.overlap) return false;
+    const r = cardOverlapRelief({ num: c.num, headSha, overlap, repo: slugOf(c.repo), setting: cardMergeSetting,
+      exec, cwd, readTip: readQueueTip, ...(cardMergeRun ? { run: cardMergeRun } : {}) });
+    if (r.line) say(`  ${r.line}`);
+    return r.relieve === true;
+  };
   const pendingOutcome = (c, pending, quiet = false) => {
     const maxMin = safety.value.redTeamPendingMaxMin ?? 45;
     const healthSmell = now() - pending.firstPendingAt >= maxMin * 60_000;
@@ -597,6 +612,7 @@ export function createDrainMergeStrategy({
       const queue = cachedQueue(repo, decision);
       if (queue.error) return null;
       const overlap = pickQueueOverlap(c, candidateFiles, queue);
+      if (overlap.overlap && cardOverlapEnqueues(c, headSha, overlap)) return null;
       if (overlap.overlap) stampReserve(c, headSha, candidateFiles);
       return overlap.overlap ? { kind: 'queue-file-overlap', reason: overlap.reason, deferred: true } : null;
     },
@@ -766,7 +782,7 @@ export function createDrainMergeStrategy({
           const source = safety.sources?.queueFileOverlapIncludesCards ?? 'standard';
           const overlap = pickQueueOverlap(c, candidateFiles, queue);
           if (overlap.unknown.length) say(`  merge-queue file-overlap: unknown files for ${overlap.unknown.map(num => `#${num}`).join(',')} — continuing without those entries`);
-          if (overlap.overlap) {
+          if (overlap.overlap && !cardOverlapEnqueues(c, headSha, overlap)) {
             stampReserve(c, headSha, candidateFiles, true);
             const first = overlap.with[0];
             say(`  merge-queue file-overlap: defer #${c.num} (shares ${first.files[0]} with queued #${first.num}) — includeCards=${includeCards} (${source})`);
