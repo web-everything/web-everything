@@ -472,6 +472,9 @@ export async function foldOpenSingles({ lane }, {
  */
 export async function landPreventionCard(input, options = {}) {
   try {
+    // A dry run never files: it reports only, BEFORE any owed-filing obligation can substitute its stored input
+    // (which drops `dryRun`/`root`) or a paused filer records a new one (operator ruling 2026-10-20).
+    if (input?.dryRun) return await landPreventionCardImpl(input, options);
     const loadFilingSettings = options.loadFilingSettings ?? loadPreventionBatchSettings;
     if (loadFilingSettings().filingEnabled === false) return await landPreventionCardImpl(input, options);
     if (options.owedClaimed) return await landPreventionCardImpl(boundLandPreventionCardInput(input), options);
@@ -497,7 +500,7 @@ async function landPreventionCardImpl(input, {
   write(`${formatPreventionBatchSettings(filing)}\n`);
   if (filing.filingEnabled === false) {
     const reason = 'prevention filing paused by prevention.filingEnabled';
-    if (input.title) owePreventionFiling(input);
+    if (input.title && !input.dryRun) owePreventionFiling(input);
     write(`${reason}\n`);
     return { ok: false, skipped: true, step: 'paused', reason, num: null, rel: null, pr: null, url: null };
   }
