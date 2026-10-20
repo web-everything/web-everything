@@ -929,6 +929,23 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it('log:false silences every provenance line (build cascade, route, usage) and still runs the task', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-codex-nolog-'));
+    const { fn: spawnFn, seen } = fakeSpawn('{"type":"thread.started","thread_id":"t"}\n{"type":"turn.completed"}\n');
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const report = await codexDirectTask({ task: 'fix a typo', dir, gate: 'none', selfReview: false, log: false,
+        model: 'x', tier: 'haiku', stream: false, spawnFn,
+        execFn: (_bin, args) => args.includes('--absolute-git-dir') ? join(dir, 'metadata') : args.includes('rev-parse') ? 'sha' : '',
+        clearRolloutAfterRun: true,
+        collectQuotaFn: () => ({ quota: { raw: { limit_id: 'observed-bucket', primary: { used_percent: 9 } } }, deleted: true }),
+      });
+      expect(seen.argv).toBeDefined();
+      expect(report.events.threadId).toBe('t');
+      expect(errSpy).not.toHaveBeenCalled();
+    } finally { errSpy.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('codexDirectTask: with an explicit --dir, does NOT create a scratch clone, and captures a real diff via execFn', async () => {
     const stdout = '{"type":"thread.started","thread_id":"t1"}\n{"type":"turn.completed","usage":{}}\n';
     const { fn: spawnFn } = fakeSpawn(stdout);

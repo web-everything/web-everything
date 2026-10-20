@@ -851,7 +851,9 @@ export async function codexDirectTask({
     policy.selfReview = { ...policy.selfReview, enabled: selfReviewEnabled };
     policy.sources['selfReview.enabled'] = 'argument';
   }
-  (log ?? (line => console.error(line)))(formatCascadeSourcesLine('build', { value: policy, sources: policy.sources }));
+  // `log: false` silences provenance lines (the route resolver honours the same contract); `??` alone keeps `false`.
+  const emit = log === false ? () => {} : (log ?? (line => console.error(line)));
+  emit(formatCascadeSourcesLine('build', { value: policy, sources: policy.sources }));
   gate ??= review ? 'none' : policy.finalGate;
   if (!['none', 'related', 'standards', 'full'].includes(gate)) throw new Error('invalid build gate');
   if (!review && ephemeral && policy.selfReview.enabled) throw new Error('--ephemeral requires self-review off (--no-self-review or build.selfReview.enabled=false): a repair must resume the original builder');
@@ -939,7 +941,7 @@ export async function codexDirectTask({
       const observed = parseRolloutUsageBucket(quota?.raw
         ? JSON.stringify({ type: 'event_msg', payload: { type: 'token_count', rate_limits: quota.raw } })
         : quotaRolloutFile ? readFileSync(quotaRolloutFile, 'utf8') : '');
-      if (observed && log !== false) (log ?? (l => console.error(l)))(`codex-usage · bucket=${observed.limit_id} primary.used_percent=${observed.used_percent}`);
+      if (observed) emit(`codex-usage · bucket=${observed.limit_id} primary.used_percent=${observed.used_percent}`);
     } catch { /* rollout/diagnostic lookup is best-effort */ }
 
   }
