@@ -43,7 +43,8 @@ import { applyTransition, applySettle, readField, setFrontmatterField, removeFro
 import { planEpicResolveOnLand, hasBlockedBy } from './backlog/epic-resolve.mjs';
 import { parseCostTokens, formatCostTokens } from './backlog/cost-rates.mjs';
 import { nextNum, slugify, renderItem, sizeRefusal, parseSize } from './backlog/scaffold.mjs';
-import { nextHash, normalizeId, idFromName, isHash, slugFromName } from './backlog/id.mjs';
+import { allocateCardNumber } from './lib/card-number-allocator.mjs';
+import { nextHash, stampBornAs, normalizeId, idFromName, isHash, slugFromName } from './backlog/id.mjs';
 import { parseReservations, emptyState, addHolds, removeBySession, removeNums, pruneExpired, serialize, sessionForNum } from './readiness/reservations.mjs';
 // #2803 resolve-time scope reconciliation. Every one of these graphs is light and adds no measurable startup
 // cost to this CLI (which every hook and the conveyor shell out to): render-check imports only
@@ -727,24 +728,24 @@ function scaffold() {
   // Optional predicted touch-set (#x53zzf9) — comma-separated repo-relative path prefixes for the dispatcher.
   const scope = (flag('scope') || '').split(',').map((s) => s.trim()).filter(Boolean);
 
-  // JIT numbering (#2288): a new item is born with a collision-free HASH id, NOT `max+1`. Parallel lanes
-  // can no longer race on the next number — the drain (sole serial writer to main, #2290) rewrites the
-  // hash to the real sequential NNN at land. The re-glob guards the astronomically-unlikely hash clash.
   const existing = files().map((f) => idFromName(f)).filter(Boolean);
-  let finalNum = nextHash(existing);
-  let finalName = `${finalNum}-${slug}.md`;
-  let finalAbs = join(DIR, finalName);
-  if (files().some((f) => f.startsWith(`${finalNum}-`))) {
+  const birthHash = nextHash(existing);
+  const allocation = allocateCardNumber({ id: birthHash, cwd: ROOT, backlogDir: DIR, log: console.warn });
+  if (!allocation.ok) console.warn(`scaffold: using hash naming: ${allocation.reason}`);
+  let finalNum = allocation.ok ? String(allocation.num) : birthHash;
+  if (files().some((f) => Number(idFromName(f)) === Number(finalNum) || idFromName(f) === finalNum)) {
+    if (allocation.ok) die(`scaffold: allocated id ${finalNum} is already taken`);
     finalNum = nextHash([...existing, finalNum]);
-    finalName = `${finalNum}-${slug}.md`;
-    finalAbs = join(DIR, finalName);
   }
+  const finalName = `${finalNum}-${slug}.md`;
+  const finalAbs = join(DIR, finalName);
   // Born-active when a creating session owns it (#670): `scaffold --session=<slug>` stamps the item
   // `status: active` + `scaffoldedBy`, so it is excluded from every OTHER session's batch pool until the
   // author `settle`s it (closes the born-public, half-authored-item race). Without `--session` (ad-hoc /
   // hand / non-batch callers) it stays born-open, the long-standing default.
   const session = flag('session');
-  const content = renderItem({ kind, size, slug, title, today: today(), blockedBy, parent, scope, digest: flag('digest'), scaffoldedBy: session });
+  let content = renderItem({ kind, size, slug, title, today: today(), blockedBy, parent, scope, digest: flag('digest'), scaffoldedBy: session });
+  if (allocation.ok) content = stampBornAs(content, birthHash);
   writeBacklogMd(finalAbs, `backlog/${finalName}`, content);
   const id = finalName.replace(/\.md$/, '');
   const filled = !!flag('digest');

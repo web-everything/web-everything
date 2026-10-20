@@ -31,8 +31,30 @@ import { readGit } from '../lib/proc-read.mjs';
 import { readOperatorTaskSettings } from '../lib/operator-task-settings.mjs';
 import { classifySession } from './session-role.mjs';
 import { localDateString } from '../lib/local-date.mjs';
+import { existsSync } from 'node:fs';
+import { isAbsolute, join, resolve } from 'node:path';
 
 export { REPO_ROOT };
+
+/**
+ * THE EXPLICIT TARGET-CHECKOUT KNOB (card xx7o40x follow-up). `file-item` writes into the checkout its own code
+ * lives in (`scaffold-io.mjs#REPO_ROOT`, resolved by script location). A caller that must run ONE checkout's code
+ * against ANOTHER checkout's tree — the detached prevention-card landing job, which runs the code of the clone
+ * that spawned it (where daemon overlays such as number-at-birth are adopted) but must write into the lane it
+ * acquired — names the target here. Unset → `REPO_ROOT`, exactly as before. Set but not an absolute git checkout
+ * with a `backlog/` directory → THROWS: falling back to `REPO_ROOT` would write the card into the caller's own
+ * checkout, the #4317 bug.
+ */
+export const FILE_ITEM_ROOT_ENV = 'WE_FILE_ITEM_ROOT';
+export function fileItemRoot(env = process.env, { exists = existsSync } = {}) {
+  const raw = env?.[FILE_ITEM_ROOT_ENV];
+  if (raw === undefined || raw === '') return REPO_ROOT;
+  const root = resolve(String(raw));
+  if (!isAbsolute(String(raw)) || !exists(join(root, 'backlog')) || !exists(join(root, '.git'))) {
+    throw new Error(`file-item: ${FILE_ITEM_ROOT_ENV}=${raw} is not an absolute checkout with a backlog/ directory`);
+  }
+  return root;
+}
 
 /** Scaffold facts plus the operator admission policy and origin/main preparation baseline. */
 export function createFileItemReader({ root = REPO_ROOT,

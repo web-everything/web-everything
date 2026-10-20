@@ -2890,6 +2890,21 @@ describe('cards 5471 + 5470: the io read resolves the round settings and the led
     expect(readReviewRound({ repo: 'o/r', pr: 7, head: null, readLedgerRows: () => rows })).toBeNull();
   });
 
+  it('the round as of a grant time counts only heads reviewed by then; doubt is null (red-team gate grant anchor)', async () => {
+    const { readReviewRoundAsOf } = await import('../review-pr-io.mjs');
+    const timed = [
+      { type: 'review-run', pr: 7, headSha: 'a'.repeat(40), at: '2026-10-01T00:00:00Z' },
+      { type: 'review-run', pr: 7, headSha: 'b'.repeat(40), at: '2026-10-02T00:00:00Z' },
+      { type: 'review-run', pr: 7, headSha: H, at: '2026-10-03T00:00:00Z' },
+      { type: 'review-run', pr: 7, headSha: 'c'.repeat(40) },
+    ];
+    expect(readReviewRoundAsOf({ repo: 'o/r', pr: 7, at: '2026-10-02T12:00:00Z', readLedgerRows: () => timed })).toBe(2);
+    expect(readReviewRoundAsOf({ repo: 'o/r', pr: 7, at: '2026-10-09T00:00:00Z', readLedgerRows: () => timed })).toBe(3);
+    expect(readReviewRoundAsOf({ repo: 'o/r', pr: 7, at: '2026-09-01T00:00:00Z', readLedgerRows: () => timed })).toBeNull();
+    expect(readReviewRoundAsOf({ repo: 'o/r', pr: 7, at: 'nope', readLedgerRows: () => timed })).toBeNull();
+    expect(readReviewRoundAsOf({ repo: 'o/r', pr: 7, at: '2026-10-09T00:00:00Z', readLedgerRows: () => { throw new Error('gone'); } })).toBeNull();
+  });
+
   it('the round budget resolves from an explicit value, else the setting; any doubt is off', () => {
     expect(resolveRoundBudget(2)).toBe(2);
     expect(resolveRoundBudget(null, { settings: () => ({ roundBudget: 3 }) })).toBe(3);
