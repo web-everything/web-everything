@@ -41,7 +41,7 @@ import {
   // #4464 builder-cap-machine-wide
   cliPlanTick, BUILD_DAEMON_LANE_CAP_EXEMPT_VALUE,
   // #4517 — infra-retry call bound
-  INFRA_RETRY_TIMEOUT_MS, DEFAULT_INTERVAL_MS,
+  INFRA_RETRY_TIMEOUT_MS, DEFAULT_INTERVAL_MS, effectiveTickIntervalMs,
   // #4465 build-dispatch-hold-router
   cliRouteHeldItems, cliSpawnHoldLand, cliStampPrepare, cliReadStampFailure, STAMP_RECOVERY_LEASE_MINUTES, cliPrepareFailureEvidence,
   // xovjhwh — the shared attribution derivation `runBuildDispatchTick` and `dryRun` both call
@@ -66,6 +66,48 @@ import {
 import { BUILD_DISPATCH_POLICY } from '../../../scripts/conveyor/build-dispatch-policy.mjs';
 import { createFileRunStore, newRunRecord } from '../../../scripts/operations/run-store.mjs';
 import { DISPATCH_EFFECT } from '../../../scripts/operations/dispatch-lane.mjs';
+import { loadBuilderPausedPollPolicy, PAUSED_POLL_ENV } from '../../../scripts/lib/builder-launch-policy.mjs';
+
+describe('effectiveTickIntervalMs', () => {
+  const paused = { maxConcurrentBuilds: 0, maxConcurrentExternalBuilds: 0 };
+
+  it('stretches both zero caps to the standard 600-second interval', () => {
+    expect(effectiveTickIntervalMs({ policy: paused, flagIntervalMs: '120000' })).toBe(600_000);
+  });
+
+  it.each([
+    { maxConcurrentBuilds: 1, maxConcurrentExternalBuilds: 0 },
+    { maxConcurrentBuilds: 0, maxConcurrentExternalBuilds: 1 },
+  ])('keeps the configured interval when one cap is nonzero: %j', policy => {
+    expect(effectiveTickIntervalMs({ policy, flagIntervalMs: '30000' })).toBe(30_000);
+  });
+
+  it('keeps an explicit interval larger than the paused interval', () => {
+    expect(effectiveTickIntervalMs({ policy: paused, flagIntervalMs: '900000' })).toBe(900_000);
+  });
+
+  it.each([undefined, '0', '-1', 'invalid'])('uses the default interval for flag %s', flagIntervalMs => {
+    expect(effectiveTickIntervalMs({ policy: { maxConcurrentBuilds: 1 }, flagIntervalMs })).toBe(DEFAULT_INTERVAL_MS);
+    expect(effectiveTickIntervalMs({ policy: paused, flagIntervalMs })).toBe(600_000);
+  });
+
+  it('uses supplied defaults and paused poll settings', () => {
+    expect(effectiveTickIntervalMs({ policy: paused, defaultMs: 700_000 })).toBe(700_000);
+    expect(effectiveTickIntervalMs({ policy: paused, pausedPollSec: 300 })).toBe(300_000);
+    expect(effectiveTickIntervalMs()).toBe(DEFAULT_INTERVAL_MS);
+  });
+
+  it.each([
+    ['2147483', 2_147_483_000],
+    ['2147484', 600_000],
+  ])('keeps the loaded paused setting %s within Node timer bounds', (value, expectedMs) => {
+    const pausedPollPolicy = loadBuilderPausedPollPolicy({
+      readFile: () => '{}', toolSettings: {}, env: { [PAUSED_POLL_ENV]: value },
+    });
+    expect(effectiveTickIntervalMs({ policy: paused, pausedPollSec: pausedPollPolicy.pausedPollSec }))
+      .toBe(expectedMs);
+  });
+});
 
 describe('build.priority tick log', () => {
   const priority = { ids: ['5754', '5762', '5745', '5749', '5757', '5759'], source: 'tool' };
