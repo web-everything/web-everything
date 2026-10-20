@@ -10,7 +10,7 @@
  *
  *   Ruling id: `<owner>/<repo>#<issue number>`.
  */
-import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
+import { isTrustedMarkerAuthor, OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 
 export const STANDING_RULING_MARKER = '🧭 standing ruling — automatic review round grant';
 export const STANDING_RULING_KIND = 'auto-round-grant';
@@ -72,6 +72,7 @@ export function pickStandingRuling(issues, { repo }) {
 export function citedGrantHeads(comments) {
   const heads = new Set();
   for (const c of Array.isArray(comments) ? comments : []) {
+    if (!isTrustedMarkerAuthor(c)) continue;
     const body = typeof c?.body === 'string' ? c.body : '';
     if (!body.includes('"standingRuling"')) continue;
     for (const m of body.matchAll(/^<!-- round-extension: (.+) -->$/gm)) {

@@ -99,6 +99,25 @@ describe('the operator ruling record', () => {
 });
 
 describe('trust rule for grants (round-extension-mark)', () => {
+  it('ignores untrusted and missing authors before reading candidate heads or reserving grant room', () => {
+    const grant = autoGrant();
+    for (const untrusted of [
+      { ...grant, author: { login: 'mallory' } },
+      { ...grant, author: undefined },
+      grant.body, null,
+    ]) {
+      expect(citedGrantHeads([untrusted])).toEqual([]);
+      expect(countStandingRulingGrantRecords([untrusted], { repo: WE, pr: 5654 })).toBe(0);
+      expect(standingRulingGrantEpisodes([untrusted], { repo: WE, pr: 5654 })).toEqual({ episodes: [], unrecoverable: 0 });
+    }
+    expect(citedGrantHeads([grant])).toEqual([HEAD]);
+    expect(countStandingRulingGrantRecords([grant], { repo: WE, pr: 5654 })).toBe(1);
+    expect(standingRulingGrantEpisodes([grant], { repo: WE, pr: 5654 }).episodes).toHaveLength(1);
+    const operator = { ...grant, author: { login: 'chalbert' } };
+    expect(citedGrantHeads([operator])).toEqual([HEAD]);
+    expect(countStandingRulingGrantRecords([operator], { repo: WE, pr: 5654 })).toBe(0);
+    expect(standingRulingGrantEpisodes([operator], { repo: WE, pr: 5654 })).toEqual({ episodes: [], unrecoverable: 0 });
+  });
   it('without a verified scope an automation-posted grant never counts; manual operator grants still do', () => {
     expect(countGrantedRoundExtensions([autoGrant(), manualGrant()], { repo: WE, pr: 5654 })).toBe(1);
   });
