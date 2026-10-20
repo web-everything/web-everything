@@ -25,7 +25,8 @@ export const BUILTIN_PLACEHOLDERS = Object.freeze({
     'root', 'name', 'your name', 'yourname', 'unknown', 'nobody', 'changeme', 'placeholder', 'none', 'null']),
   emails: Object.freeze(['you@example.com', 'your@email.com', 'email@example.com']),
   // `*@<domain>` and `*@*.<domain>`. `test`/`example`/`invalid`/`localhost` are the RFC 2606 reserved names.
-  emailDomains: Object.freeze(['test.com', 'example.com', 'example.org', 'example.net', 'email.com',
+  // NOT `email.com` — that is a real mail provider (audit finding); only its exact `your@email.com` is listed above.
+  emailDomains: Object.freeze(['test.com', 'example.com', 'example.org', 'example.net',
     'localhost', 'localhost.localdomain', 'test', 'example', 'invalid']),
 });
 
@@ -88,14 +89,14 @@ export function checkGitIdentity({ name, email } = {}, lists = BUILTIN_PLACEHOLD
   const reasons = [];
   if (names.has(n)) reasons.push(`name "${String(name).trim()}" is a placeholder`);
   const at = e.lastIndexOf('@');
+  // Reasons never echo the whole address — only the (placeholder) domain — so a report can't leak a real email.
+  // The local part is NOT matched against the names list: `bar@realcorp.io` is a real address (audit finding).
   if (at <= 0 || at === e.length - 1) {
-    reasons.push(`email "${String(email).trim()}" is not an address`);
+    reasons.push('email is not an address');
   } else {
-    const local = e.slice(0, at);
     const domain = e.slice(at + 1);
-    if (emails.has(e)) reasons.push(`email "${e}" is a placeholder`);
+    if (emails.has(e)) reasons.push('email is a listed placeholder address');
     else if (domains.some((d) => domain === d || domain.endsWith(`.${d}`))) reasons.push(`email domain "@${domain}" is a placeholder`);
-    else if (names.has(local)) reasons.push(`email "${e}" has a placeholder local part`);
   }
   return reasons.length ? { status: 'placeholder', reasons } : { status: 'ok', reasons: [] };
 }
@@ -106,18 +107,31 @@ export function parseIdent(line) {
   return m ? { name: m[1], email: m[2] } : { name: '', email: '' };
 }
 
+/** PURE: is this `git var` failure git saying "no identity" (→ missing), rather than git itself failing? */
+export function isIdentityUnknownError(e) {
+  const text = `${e?.stderr ?? ''}\n${e?.message ?? ''}`;
+  return /identity unknown|empty ident|unable to auto-detect email|name consists only of disallowed characters/i.test(text);
+}
+
 /**
  * IO: the effective author and committer git would use in `dir` (config + env, exactly what a commit gets).
- * A `git var` failure ("identity unknown") reads as an empty identity, i.e. `missing`. Never throws.
- * @returns {{author:{name:string,email:string}, committer:{name:string,email:string}}}
+ * Git's own "identity unknown" refusal reads as an empty identity (→ `missing`). ANY OTHER failure (timeout,
+ * EMFILE, no git) is returned as `error`, never as `missing`: a check that cannot run must not be mistaken for a
+ * missing identity (the guard allows on `error`; audit finding). Never throws.
+ * @returns {{author:{name:string,email:string}, committer:{name:string,email:string}, error?:string}}
  */
 export function readGitIdentity(dir = process.cwd(), { env = process.env, run = execFileSync } = {}) {
+  let error;
   const read = (v) => {
     try {
-      return parseIdent(run('git', ['var', v], { cwd: dir, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 }));
-    } catch { return { name: '', email: '' }; }
+      return parseIdent(run('git', ['var', v], { cwd: dir, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000 }));
+    } catch (e) {
+      if (!isIdentityUnknownError(e)) error = String(e?.message ?? e).split('\n')[0];
+      return { name: '', email: '' };
+    }
   };
-  return { author: read('GIT_AUTHOR_IDENT'), committer: read('GIT_COMMITTER_IDENT') };
+  const out = { author: read('GIT_AUTHOR_IDENT'), committer: read('GIT_COMMITTER_IDENT') };
+  return error ? { ...out, error } : out;
 }
 
 /** The operator-facing fix line, shared by every surface. Never names a real identity. */
@@ -125,14 +139,23 @@ export const GIT_IDENTITY_FIX_HINT =
   'fix: git config --global user.name "<Your Name>" && git config --global user.email "<you@your-domain>" '
   + '(and check no lane .git/config or GIT_AUTHOR_*/GIT_COMMITTER_* env overrides it)';
 
-/** PURE: does a `.git/config` text carry its own `[user]` name/email (a per-lane override)? */
+/**
+ * PURE: could a `.git/config` text change the identity for its lane? True for a `[user]`, `[author]` or
+ * `[committer]` name/email, and for ANY `[include]` / `[includeIf …]` (its target may set one — reading it is
+ * cheaper than proving it doesn't; audit finding). Conservative on purpose: a false positive costs one `git var`.
+ */
 export function configHasUserOverride(text) {
-  let inUser = false;
+  let inIdent = false;
   for (const raw of String(text ?? '').split('\n')) {
     const line = raw.trim();
     const sec = /^\[([^\]\s"]+)/.exec(line);
-    if (sec) { inUser = sec[1].toLowerCase() === 'user'; continue; }
-    if (inUser && /^(name|email)\s*=/i.test(line)) return true;
+    if (sec) {
+      const name = sec[1].toLowerCase();
+      if (name === 'include' || name === 'includeif') return true;
+      inIdent = name === 'user' || name === 'author' || name === 'committer';
+      continue;
+    }
+    if (inIdent && /^(name|email)\s*(=|$)/i.test(line)) return true;
   }
   return false;
 }
@@ -153,17 +176,18 @@ export function laneIdentityReport({ lanes, readIn, hasOverride, lists = BUILTIN
     const own = hasOverride(dir);
     if (!own && !ambient) ambient = identityVerdict(readIn(dir), lists);
     const v = own ? identityVerdict(readIn(dir), lists) : ambient;
-    if (v.status !== 'ok') bad.push({ lane, status: v.status, detail: v.detail });
+    if (v.status !== 'ok' && v.status !== 'error') bad.push({ lane, status: v.status, detail: v.detail });
   }
   const status = bad.some((b) => b.status === 'missing') ? 'missing' : bad.length ? 'placeholder' : 'ok';
   return { status, bad };
 }
 
 /**
- * PURE: the combined verdict for author + committer — worst of the two.
- * @returns {{status:'ok'|'placeholder'|'missing', detail:string}}
+ * PURE: the combined verdict for author + committer — worst of the two. `error` = the read itself failed.
+ * @returns {{status:'ok'|'placeholder'|'missing'|'error', detail:string}}
  */
-export function identityVerdict({ author, committer }, lists = BUILTIN_PLACEHOLDERS) {
+export function identityVerdict({ author, committer, error }, lists = BUILTIN_PLACEHOLDERS) {
+  if (error) return { status: 'error', detail: `could not read the git identity (${error})` };
   const a = checkGitIdentity(author, lists);
   const c = checkGitIdentity(committer, lists);
   const rank = { ok: 0, placeholder: 1, missing: 2 };

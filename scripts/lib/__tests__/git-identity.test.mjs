@@ -20,7 +20,6 @@ describe('checkGitIdentity', () => {
     ['Real Person', 'anyone@example.com'],
     ['Real Person', 'dev@mail.example.org'],
     ['Real Person', 'me@localhost'],
-    ['Real Person', 'user@realcorp.io'],
     ['ROOT', 'admin@realcorp.io'],
     ['Real Person', 'not-an-address'],
     ['  Example  ', 'x@realcorp.io'],
@@ -42,6 +41,8 @@ describe('checkGitIdentity', () => {
     ['web-everything[bot]', '123+bot@users.noreply.github.com'],
     ['Testa Rossa', 'testa@realcorp.io'],          // contains "test", is not "test"
     ['Real Person', 'someone@contest.com'],       // ends with "test.com" but is not that domain
+    ['Real Person', 'bar@realcorp.io'],           // a placeholder NAME as a local part is still a real address
+    ['Real Person', 'someone@email.com'],         // mail.com's real provider domain (audit finding)
   ])('ok: %s <%s>', (name, email) => {
     expect(checkGitIdentity({ name, email })).toEqual({ status: 'ok', reasons: [] });
   });
@@ -68,10 +69,22 @@ describe('parseIdent / readGitIdentity', () => {
     expect(parseIdent('Ada Lovelace <ada@x.io> 1700000000 +0000\n')).toEqual({ name: 'Ada Lovelace', email: 'ada@x.io' });
     expect(parseIdent('garbage')).toEqual({ name: '', email: '' });
   });
-  it('a failing `git var` (identity unknown) reads as missing, never throws', () => {
-    const run = () => { throw new Error('Author identity unknown'); };
+  it('git\'s own "identity unknown" refusal reads as missing, never throws', () => {
+    const run = () => { const e = new Error('Command failed: git var'); e.stderr = '*** Please tell me who you are.\nfatal: unable to auto-detect email address'; throw e; };
     const id = readGitIdentity('/nowhere', { run });
+    expect(id.error).toBeUndefined();
     expect(identityVerdict(id).status).toBe('missing');
+  });
+  it('any OTHER git failure (timeout, EMFILE) is error, not missing', () => {
+    const run = () => { const e = new Error('spawnSync git ETIMEDOUT'); e.code = 'ETIMEDOUT'; throw e; };
+    const id = readGitIdentity('/nowhere', { run });
+    expect(id.error).toMatch(/ETIMEDOUT/);
+    expect(identityVerdict(id).status).toBe('error');
+  });
+  it('reasons never echo the full address', () => {
+    const v = identityVerdict({ author: { name: 'Ada', email: 'you@example.com' }, committer: { name: 'Ada', email: 'you@example.com' } });
+    expect(v.status).toBe('placeholder');
+    expect(v.detail).not.toMatch(/you@/);
   });
   it('asks git for both author and committer', () => {
     const asked = [];
@@ -86,6 +99,10 @@ describe('configHasUserOverride / laneIdentityReport (lane-pool status)', () => 
     expect(configHasUserOverride('[core]\n\tbare = false\n[user]\n\tname = test\n')).toBe(true);
     expect(configHasUserOverride('[core]\n\tname = x\n[remote "origin"]\n\turl = u\n')).toBe(false);
     expect(configHasUserOverride('')).toBe(false);
+    expect(configHasUserOverride('[author]\n\tname = test\n')).toBe(true);
+    expect(configHasUserOverride('[committer]\n\temail = x@test.com\n')).toBe(true);
+    expect(configHasUserOverride('[includeIf "gitdir:~/w/"]\n\tpath = id.inc\n')).toBe(true);
+    expect(configHasUserOverride('[include]\n\tpath = x\n')).toBe(true);
   });
   const real = { author: { name: 'Ada', email: 'ada@x.io' }, committer: { name: 'Ada', email: 'ada@x.io' } };
   const fake = { author: { name: 'test', email: 'test@test.com' }, committer: { name: 'test', email: 'test@test.com' } };
@@ -100,6 +117,9 @@ describe('configHasUserOverride / laneIdentityReport (lane-pool status)', () => 
   it('a lane whose own config overrides to a placeholder is singled out', () => {
     const r = laneIdentityReport({ lanes, readIn: (d) => (d.endsWith('2') ? fake : real), hasOverride: (d) => d.endsWith('2') });
     expect(r.bad.map((b) => b.lane)).toEqual([2]);
+  });
+  it('an unreadable identity is not reported as a placeholder lane', () => {
+    expect(laneIdentityReport({ lanes, readIn: () => ({ ...real, error: 'ETIMEDOUT' }), hasOverride: () => false }).bad).toEqual([]);
   });
   it('all real → ok', () => {
     expect(laneIdentityReport({ lanes, readIn: () => real, hasOverride: () => false })).toEqual({ status: 'ok', bad: [] });

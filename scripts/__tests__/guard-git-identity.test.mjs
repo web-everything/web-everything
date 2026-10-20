@@ -29,6 +29,10 @@ describe('guardDecision (pure)', () => {
     expect(d.allow).toBe(false);
     expect(d.message).toMatch(/MISSING/);
   });
+  it('the guard\'s own read failure never blocks a commit', () => {
+    const blank = { name: '', email: '' };
+    expect(guardDecision({ root: '/w/.lanes/p/lane-1', identity: { author: blank, committer: blank, error: 'ETIMEDOUT' } })).toEqual({ allow: true });
+  });
   it('passes a real identity in a lane', () => {
     expect(guardDecision({ root: '/w/.lanes/p/lane-1', identity: { author: real, committer: real } })).toEqual({ allow: true });
   });

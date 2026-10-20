@@ -32,7 +32,8 @@ export function isLaneRoot(root, sepChar = sep) {
 export function guardDecision({ root, identity, lists }) {
   if (!isLaneRoot(root)) return { allow: true };
   const v = identityVerdict(identity, lists);
-  if (v.status === 'ok') return { allow: true };
+  // `error` = the check could not run (git timed out, EMFILE, …): never wedge a commit over the guard's own fault.
+  if (v.status === 'ok' || v.status === 'error') return { allow: true };
   return {
     allow: false,
     message: [
