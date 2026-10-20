@@ -677,6 +677,30 @@ describe('recorded hold read-only admission', () => {
         queueSafety: { value: { waitForRedTeamBeforeEnqueue: true } }, log: { write: () => {} }, readFile: () => '{not json' });
       expect(() => s.yieldTargetHold({ num: 5283 }, HEAD)).toThrow(/unreadable/);
     });
+    it('never runs git (no fetch): card-only relief comes from the listed files', () => {
+      const gitCalls = [];
+      const s = createDrainMergeStrategy({ localSlug: LOCAL, statePath: 'x', resolved: policyOf('github-merge-queue'),
+        env: { WE_RED_TEAM_TIMING: 'post-accept' }, queueSafety: { value: { waitForRedTeamBeforeEnqueue: true } }, log: { write: () => {} },
+        readFile: () => JSON.stringify(initial()), writeState: () => { throw new Error('write'); },
+        readRedTeamEvidence: () => ({ scheduled: false, loopPayload: { verdict: { verdict: 'accept' } } }),
+        exec: (cmd, args) => {
+          if (cmd === 'git') { gitCalls.push(args); throw new Error('git must not run'); }
+          if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefOid: HEAD, labels: ['review:accepted', 'ready-to-merge'] });
+          if (args.includes('--slurp')) return '[[]]';
+          return '{}';
+        } });
+      const c = { num: 5283, headRef: 'lane/x', listedFiles: ['scripts/merge-ai-prs.mjs'], listedFilesComplete: true };
+      expect(() => s.yieldTargetHold(c, HEAD)).not.toThrow();
+      expect(gitCalls).toEqual([]);
+    });
+    it.each([['cwd#5283', LOCAL], [`${LOCAL}#5283`, null]])('uses the MATCHED pending record (alias %s) for request state', (stored, repoArg) => {
+      const rec = { ...initial().redTeamPending[key], requestedAt: 500 };
+      const r = run({ state: { pending: [], followedUp: [], redTeamPending: { [stored]: rec } },
+        evidence: { scheduled: false, loopPayload: { verdict: { verdict: 'accept' } } } });
+      const out = r.h.s.yieldTargetHold({ num: 5283, repo: repoArg, listedFiles: ['scripts/a.mjs'], listedFilesComplete: true }, HEAD);
+      expect(out).toMatchObject({ kind: 'red-team-pending' });
+      expect(r.writes).toEqual([]);
+    });
     it('a sent-back target is blocked (sent-back)', () => {
       const r = run({ labels: ['review:changes'], evidence: { scheduled: true, inFlight: true } });
       expect(r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toMatchObject({ kind: 'sent-back' });

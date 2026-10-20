@@ -689,7 +689,8 @@ export function createDrainMergeStrategy({
     /** Read-only: is a would-be overlap-yield TARGET held by the post-accept red-team gate on this exact head?
      * `{kind, reason}` = held; `null` = no recorded red-team hold on this head (it may still enqueue, so waiters
      * keep yielding). Throws when it cannot tell; the caller then keeps today's yield (fail closed).
-     * Never writes state, labels or requests: it only reads what enqueue's own gate would read. */
+     * Never writes state, labels, refs or requests: it runs enqueue's own red-team rule on GitHub reads only.
+     * The card-only relief comes from the listed files (no git fetch); when that cannot settle the answer, it throws. */
     yieldTargetHold(c, headSha) {
       if (!enqueues(c.repo) || !safety.value.waitForRedTeamBeforeEnqueue) return null;
       if (!headSha) throw new Error('yield target has no head sha');
@@ -703,7 +704,24 @@ export function createDrainMergeStrategy({
       if (live.headRefOid !== headSha || !Array.isArray(live.labels)) throw new Error('live head or labels do not match the listed state');
       const sent = sendBackReason(live.labels);
       if (sent) return { kind: 'sent-back', reason: sent };
-      const reason = reserveRedTeamReason(c, headSha, live);
+      const evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env });
+      const pages = readThreadPages(c.repo, c.num);
+      if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team comments unreadable');
+      const { sameHead, neverScheduled } = redTeamRequestEligibility(c, headSha, live, evidence, pending);
+      const requestPending = neverScheduled || (sameHead && pending.requestedAt != null);
+      const reasonWith = (realFilesCardOnly) => redTeamEnqueueHold({ ...evidence, realFilesCardOnly, requestPending,
+        comments: pages.flat(), repo: slugOf(c.repo), pr: c.num, head: headSha, env });
+      // restampCardOnly's own short-circuit: with this evidence the git read never happens and the value is false.
+      const settled = evidence.recorded || evidence.attempted || evidence.inFlight || evidence.queued
+        || evidence.loopPayload?.findings?.read?.netBasis?.rev?.toLowerCase() === headSha.toLowerCase();
+      const listed = c.listedFilesComplete === true && Array.isArray(c.listedFiles) && c.listedFiles.length > 0 ? c.listedFiles : null;
+      let reason;
+      if (settled || (listed && !isCardOnlyDiff(listed))) reason = reasonWith(false);
+      else {
+        const a = reasonWith(false); const b = reasonWith(true);
+        if (!!a !== !!b) throw new Error('card-only relief needs a git read');
+        reason = a;
+      }
       return reason ? { kind: 'red-team-pending', reason } : null;
     },
     enqueue(c, headSha, { comments = null, prepared = null, holdOnly = false } = {}) {

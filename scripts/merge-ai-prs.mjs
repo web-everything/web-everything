@@ -6431,7 +6431,9 @@ async function runCli() {
       if (hasUnclearedReviewLabel(labels, { allowPending })) hold = { kind: 'review-hold', reason: 'unsatisfied review hold (review:pending/review:human/review:changes)' };
       else if (numberingWithdrawalOwed(row.repo || localSlug, row.number)) hold = { kind: 'numbering', reason: 'numbering re-stamp withdrawal owed' };
       else {
-        const c = v ? { ...v } : { num: Number(row.number), repo: isLocalRepo(row.repo) ? null : row.repo, prLabels: labels, baseRefName: row.baseRefName };
+        const listedFiles = (Array.isArray(row.files) ? row.files : []).map((f) => String(typeof f === 'string' ? f : f?.path ?? '')).filter(Boolean);
+        const c = v ? { ...v } : { num: Number(row.number), repo: isLocalRepo(row.repo) ? null : row.repo, prLabels: labels, baseRefName: row.baseRefName,
+          listedFiles, listedFilesComplete: row.filesComplete === true && listedFiles.length === (row.files || []).length };
         hold = mergeStrategy.yieldTargetHold(c, row.headSha) || null;
       }
     } catch (e) {

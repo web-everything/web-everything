@@ -114,14 +114,15 @@ export function formatOverlapYieldSkipsBlockedTargetSetting({ value, source }) {
  * recomputed, so a waiter can still yield to the next eligible target. Every waiter keeps all of its own gates.
  * @returns {{ctx:object, skipped:Array<{pr:number, repo:(string|null), kind:string, reason:string, waiters:string[]}>, unknown:Array<{pr:number, repo:(string|null), error:string}>}}
  */
-export function planOverlapYieldAroundBlockedTargets({ openPrRows = [], compute, blockOf, enabled = true, maxRounds = 8 } = {}) {
+export function planOverlapYieldAroundBlockedTargets({ openPrRows = [], compute, blockOf, enabled = true } = {}) {
   let rows = Array.isArray(openPrRows) ? openPrRows : [];
   let ctx = compute(rows);
   const skipped = [];
   const unknown = [];
   if (!enabled || typeof blockOf !== 'function') return { ctx, skipped, unknown };
   const decided = new Map();
-  for (let round = 0; round < maxRounds; round += 1) {
+  // Every productive round removes at least one row, so this ends within rows.length + 1 rounds.
+  for (let round = 0; round <= rows.length; round += 1) {
     const blockedKeys = new Set();
     for (const [waiterKey, w] of (ctx?.waits instanceof Map ? ctx.waits : new Map())) {
       const key = overlapRowKey({ repo: w.repo, number: w.yieldTo });

@@ -195,6 +195,16 @@ describe('planOverlapYieldAroundBlockedTargets — a blocked target never makes 
     expect(blockOf.mock.calls.filter(([x]) => x.number === 5485)).toHaveLength(1); // decided once per pass
   });
 
+  it('keeps going past many blocked targets (no round cap leaves a blocked target in place)', async () => {
+    const { planOverlapYieldAroundBlockedTargets } = await load();
+    const big = Array.from({ length: 12 }, (_, i) => row(6000 + i, 1000 - i));
+    const all = [...xs, ...big];
+    const comp = (openPrRows) => ({ waits: overlapYieldWaits({ candidates: xs, openPrs: openPrRows, nowMs: 0, ignoreBudget: true }), skips: new Map() });
+    const r = planOverlapYieldAroundBlockedTargets({ openPrRows: all, compute: comp, blockOf: (x) => (x.number >= 6000 ? { kind: 'red-team-pending', reason: 'x' } : null) });
+    expect([...r.ctx.waits.values()].some((w) => w.yieldTo >= 6000)).toBe(false);
+    expect(r.skipped).toHaveLength(12);
+  });
+
   it('when every target is blocked, nobody waits', async () => {
     const { planOverlapYieldAroundBlockedTargets } = await load();
     const r = planOverlapYieldAroundBlockedTargets({ openPrRows: ys, compute, blockOf: () => ({ kind: 'review-hold', reason: 'x' }) });
