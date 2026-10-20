@@ -2,10 +2,13 @@
  * Post-approval card grouping (card xym8nt4).
  *
  * Problem: approved card-only PRs that edit the same card file wait behind each other in the drain
- * (`queue-file-overlap`). Each one takes a full merge-queue cycle, and each re-merge costs a review round.
+ * (the planner's `overlap-yield` deferrals). Each one takes a full merge-queue cycle, and each re-merge costs a
+ * review round.
  *
- * What this does, once per drain pass:
- *   1. FORM. From this pass's `queue-file-overlap` deferrals, take PRs whose WHOLE diff is backlog cards
+ * What this does, once per drain pass, BEFORE the cascade enqueues anything (so the PR the others yield to can
+ * still join the group instead of being queued ahead of it):
+ *   1. FORM. From this pass's overlap waits (`cardGroupCandidates`: the planner's overlap-yield-only deferrals,
+ *      the PRs they yield to, and any `queue-file-overlap` outcome), take PRs whose WHOLE diff is backlog cards
  *      (`isCardOnlyDiff` and every path `isCardPath`), that are open, non-draft, at the judged head,
  *      `ready-to-merge` + `review:accepted`, with no review hold, and that the strategy's own read-only
  *      admission check (`prestage`: live head, send-back, workflow surface, red-team hold) allows. PRs that
@@ -495,21 +498,32 @@ export function queueBlocksGroup(queue, { sources, files }) {
  * (a clone of the local repo). `prestage(c, headSha)` is the strategy's read-only admission check.
  */
 /**
- * PURE: this pass's grouping inputs — the enqueue outcomes plus every planner deferral whose ONLY wait is an
- * overlap-yield. Those deferrals (planLabelDrain's `deferred`) never reach the enqueue loop, so they are absent from
- * the enqueue outcomes. A deferral that also waits on a blocker, a couple or an incomplete context is not one.
+ * PURE: this pass's grouping inputs — the enqueue outcomes, every planner deferral whose ONLY wait is an
+ * overlap-yield, and the PR each such deferral yields to. Those deferrals (planLabelDrain's `deferred`) never reach
+ * the enqueue loop, so they are absent from the enqueue outcomes; the PR they yield to is READY, and would be
+ * queued ahead of the group (blocking it) unless it can join. A yield target is marked `yieldTarget`: form() takes
+ * it only when it is itself a merge-decided local candidate (the planner's yield is always within one repository).
+ * A deferral that also waits on a blocker, a couple or an incomplete context is not a candidate.
  */
 export function cardGroupCandidates({ enqueueOutcomes = [], deferred = [] } = {}) {
   const overlapOnly = d => Array.isArray(d?.waitOn) && d.waitOn.length > 0 && d.waitOn.every(w => String(w).startsWith('overlap-yield:'));
-  const waits = (Array.isArray(deferred) ? deferred : []).filter(overlapOnly)
-    .map(d => ({ num: Number(d.num), repo: d.repo ?? d.overlapYield?.repo ?? null, outcome: 'deferred', kind: 'overlap-yield', reason: d.waitOn.join(', ') }));
-  return [...(Array.isArray(enqueueOutcomes) ? enqueueOutcomes : []), ...waits];
+  const waits = (Array.isArray(deferred) ? deferred : []).filter(overlapOnly);
+  const repoOf = d => d.repo ?? d.overlapYield?.repo ?? null;
+  const deferrals = waits.map(d => ({ num: Number(d.num), repo: repoOf(d), outcome: 'deferred', kind: 'overlap-yield', reason: d.waitOn.join(', ') }));
+  const targets = new Map();
+  for (const d of waits) {
+    const pr = Number(d.overlapYield?.pr);
+    if (!Number.isInteger(pr) || targets.has(pr) || waits.some(x => Number(x.num) === pr)) continue;
+    targets.set(pr, { num: pr, repo: repoOf(d), outcome: 'yield-target', kind: 'overlap-yield', reason: `yielded to by #${d.num}`, yieldTarget: true });
+  }
+  return [...(Array.isArray(enqueueOutcomes) ? enqueueOutcomes : []), ...deferrals, ...targets.values()];
 }
 
 /**
- * The drain's post-pass step. Every whole pass reconciles recorded groups whatever the delivery strategy: a group
- * formed under the merge queue must still release its holds after a switch to direct merging. A new group forms
- * only while the local repo merges through the queue. Never throws (reconcile and form both catch).
+ * The drain's grouping step, run once per whole pass BEFORE the cascade. Every whole pass reconciles recorded
+ * groups whatever the delivery strategy: a group formed under the merge queue must still release its holds after a
+ * switch to direct merging. A new group forms only while the local repo merges through the queue; the cascade's
+ * hold then keeps every source (the yield target included) out of the queue this same pass. Never throws.
  */
 export function runCardGroupPass({ grouping, onlyPr = null, enqueues = false, enqueueOutcomes = [], deferred = [], verdicts = [], log = process.stderr } = {}) {
   if (onlyPr != null) return { reconciled: null, grouping: null };
@@ -701,6 +715,7 @@ export function createCardGrouping({
           const v = verdicts.find(x => Number(x.num) === Number(o.num) && local(x.repo));
           const headSha = v?.listedHeadSha || v?.headSha;
           if (!SHA.test(headSha ?? '')) continue;
+          if (o.yieldTarget && v.decision !== 'merge') continue; // a PR yielded to joins only when it would itself land now
           const names = labelNames(v.prLabels);
           if (!names.includes('ready-to-merge') || !names.includes('review:accepted')) continue;
           if (v.item || v.couple || v.coupleKey) continue; // a PR that resolves an item or is half a couple stays serial
@@ -712,7 +727,11 @@ export function createCardGrouping({
         const withFiles = [];
         for (const c of cands) {
           const sf = sourceFiles({ base, headSha: c.headSha, cwd, run });
-          if (sf && cardOnlyFiles(sf.files)) withFiles.push({ ...c, files: sf.files });
+          if (!sf || !cardOnlyFiles(sf.files)) continue;
+          // Formation runs before the cascade's hold: a PR touching a card an open group reserves stays out.
+          const held = cardGroupHold(st, { num: c.num, repo: c.repo, localSlug, files: sf.files });
+          if (held) { say(`#${c.num} left out (${held.reason})`); continue; }
+          withFiles.push({ ...c, files: sf.files });
         }
         let plans = planCardGroups({ candidates: withFiles, maxSize: setting.maxSize })
           .filter(p => !(st.failed?.[sourceSetKey(p.sources)] > now() - setting.retryMin * 60_000));

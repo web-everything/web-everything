@@ -6547,6 +6547,11 @@ async function runCli() {
     c.decision = 'skip'; c.reason = 'pre-staged while required CI is pending — no enqueue';
     if (!skipped.includes(c)) skipped.push(c);
   }
+  // xym8nt4 — post-approval card grouping, BEFORE the cascade enqueues anything: every whole pass re-reads active
+  // groups (under any delivery strategy, so a switch to direct merging never strands a hold), then, under the merge
+  // queue, forms at most one new group from the planner's overlap waits and the PRs they yield to. The cascade's
+  // hold below then keeps every source out of the queue this same pass. Never throws.
+  runCardGroupPass({ grouping: cardGrouping, onlyPr, enqueues: mergeStrategy.enqueues(null), enqueueOutcomes, deferred: preparedPass.plan.deferred, verdicts });
   let deferred = [];
   if (DRY_RUN) {
     // Report the planned first-pass order (blockedBy + #2393 stackParents-honoured) without merging. Nothing has
@@ -7287,10 +7292,6 @@ async function runCli() {
   process.stderr.write(`merge-ai-prs · pass timings: ${formatTimingsSummary(timingSteps, { total: passTotalMs, order: PASS_STEP_ORDER })} (considered ${verdicts.length}, merged ${merged.length}, ${formatSkipSummary(skipReasons)}; ${formatConcurrencySources(resolvedMergePolicy.policy)})\n`);
   // Card 122 slice 1 — logging only: the machine-readable twin of the summary above (coroner / perf-snapshot read it).
   process.stderr.write(`${formatSkipReasonsLine(skipReasons)}\n`);
-  // xym8nt4 — post-approval card grouping: every whole pass re-reads active groups (under any delivery strategy, so
-  // a switch to direct merging never strands a hold), then, under the merge queue, forms at most one new group from
-  // this pass's overlap waits (the planner's overlap-yield deferrals and the enqueue outcomes). Never throws.
-  runCardGroupPass({ grouping: cardGrouping, onlyPr, enqueues: mergeStrategy.enqueues(null), enqueueOutcomes, deferred, verdicts });
   const result = { ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, skipReasons, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text, retryable: !!l.err.retryable })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
   if (enqueueOutcomes.length) result.enqueueOutcomes = enqueueOutcomes;
   if (followup.mode === 'job' || followup.job) result.followupJob = { handedOff: followup.handedOff, job: followup.job ?? null, actions: followup.actions ?? [], ...(followup.handedOff ? {} : { reason: followup.reason }) }; // x4y74wj — a launch-failed job rides along (handedOff:false) so the fallback to inline is visible

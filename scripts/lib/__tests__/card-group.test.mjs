@@ -423,6 +423,36 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       expect(r.grouping.formed).toMatchObject({ pr: 77 });
     });
 
+    it('the ready PR the others yield to joins the group (two approved card PRs on one card), only when it would land now', () => {
+      // #1 yields to #2; #2 is READY, so without joining it would be queued ahead and the group would never form.
+      const octx = new Map([[overlapRowKey({ repo: null, number: 1 }), { yieldTo: 2, repo: null, files: [CARD], untilMs: 1_000, windowMinutes: 45 }]]);
+      const { ready, deferred } = planLabelDrain([1, 2].map(n => ({ num: n, item: null, blockedBy: [], decision: 'merge', repo: null })), { overlapContext: octx });
+      expect(ready.map(c => c.num)).toEqual([2]);
+      expect(cardGroupCandidates({ deferred }).map(o => [o.num, o.outcome])).toEqual([[1, 'deferred'], [2, 'yield-target']]);
+      for (const [decision, formed] of [['merge', true], ['skip', false]]) {
+        const t = setup();
+        const verdicts = t.verdicts.map(v => ({ ...v, decision: v.num === 2 ? decision : 'merge' }));
+        const g = createCardGrouping({ localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, () => t.base), exec: t.exec, statePath: join(tmp(), 's.json'),
+          settings, log: { write() {} }, prestage: () => ({ allowed: true }), cardConflictSettings: cc, ...lockOpts });
+        const r = runCardGroupPass({ grouping: g, enqueues: true, deferred, verdicts, log: { write() {} } });
+        if (formed) {
+          expect(r.grouping.formed.sources.map(s => s.num)).toEqual([1, 2]);
+          // The cascade's hold (run right after formation) now keeps the yield target out of the queue.
+          expect(g.holdFor({ num: 2 })).toMatchObject({ kind: 'card-grouped' });
+        } else expect(r.grouping.reason).toMatch(/fewer than 2 accepted card candidates/);
+      }
+    });
+
+    it('a candidate touching a card an open group reserves is left out (formation runs before the cascade hold)', () => {
+      const t = setup();
+      const statePath = join(tmp(), 's.json');
+      writeFileSync(statePath, JSON.stringify({ groups: [{ id: 'old', repo: 'o/r', pr: 70, branch: 'lane/card-group-old', files: [CARD], sources: [{ num: 5, headSha: 'c'.repeat(40) }] }], failed: {} }));
+      const g = createCardGrouping({ localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, () => t.base), exec: t.exec, statePath,
+        settings, log: { write() {} }, prestage: () => ({ allowed: true }), cardConflictSettings: cc, ...lockOpts });
+      expect(g.form({ outcomes: t.outcomes, verdicts: t.verdicts }).reason).toMatch(/no group of 2\+ sharing a card/);
+      expect(readGroupState(statePath).groups.map(x => x.id)).toEqual(['old']);
+    });
+
     it('only a deferral whose every wait is an overlap-yield is a candidate', () => {
       const deferred = [
         { num: 1, waitOn: ['overlap-yield:#40'], overlapYield: { pr: 40, repo: 'o/r' } },
@@ -430,7 +460,8 @@ describe('createCardGrouping — claim under the land mutex, close on current he
         { num: 4, waitOn: ['required-check-read'] }, { num: 5, waitOn: [] }, { num: 6 },
       ];
       expect(cardGroupCandidates({ enqueueOutcomes: [{ num: 8, kind: 'merge-lock-held' }], deferred }))
-        .toEqual([{ num: 8, kind: 'merge-lock-held' }, { num: 1, repo: 'o/r', outcome: 'deferred', kind: 'overlap-yield', reason: 'overlap-yield:#40' }]);
+        .toEqual([{ num: 8, kind: 'merge-lock-held' }, { num: 1, repo: 'o/r', outcome: 'deferred', kind: 'overlap-yield', reason: 'overlap-yield:#40' },
+          { num: 40, repo: 'o/r', outcome: 'yield-target', kind: 'overlap-yield', reason: 'yielded to by #1', yieldTarget: true }]);
     });
 
     it('reconciles under any strategy (forms only under the queue); a single-PR pass does neither', () => {
