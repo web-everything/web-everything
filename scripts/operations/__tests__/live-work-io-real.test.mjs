@@ -10,6 +10,7 @@
 import { spawn } from 'node:child_process';
 import { writeFileSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
+import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 import { it, expect } from 'vitest';
 import { withRealRepo } from './helpers/real-repo.mjs';
 import { statMtimeMs, createLiveWorkCollector } from '../live-work-io.mjs';
@@ -38,7 +39,7 @@ it('createLiveWorkCollector composes readActivity + heavy-queue + a REAL pid pro
     const p = join(root, 'sess.jsonl');
     writeFileSync(p, '{}\n');
     // A real, short-lived child left running just long enough for a real `kill(pid, 0)` probe to see it alive.
-    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 5000)'], { stdio: 'ignore' });
+    const child = spawn(process.execPath, ['-e', keepAliveScript({ maxLifetimeMs: 5000 })], { stdio: 'ignore' });
     try {
       const collect = createLiveWorkCollector({
         now: () => Date.parse('2026-09-26T12:00:00.000Z'),

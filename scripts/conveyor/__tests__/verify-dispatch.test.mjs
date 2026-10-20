@@ -12,6 +12,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawnSync, spawn as spawnProcess, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
+import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 import { tmpdir } from 'node:os';
 import { resolveGateCeiling, runLaneGate, laneNeedsVerifyDispatch, inFlightSuperseded, sameVerifyRequest, resolveSupersedePolicy, resolveMaxInFlight, laneIndicesIn, spawnGateBounded, runVerifyDispatch, recordKilledVerification, GATE_STARTED_MARKER, GATE_QUEUED_MARKER, processGroupMayExist, killOrphanGroup, dispatchedRunState, killAdoptedGroup } from '../verify-dispatch.mjs';
 import { heldSlots, admissionLockRoot } from '../../readiness/heavy-admission.mjs';
@@ -881,7 +882,7 @@ describe('runVerifyDispatch — run identity wiring (a fake spawnGate, a real ma
 describe('2026-10-05 hung gate starvation', () => {
   it('detects the marker before truncating a single large stderr write', async () => {
     const script = join(base, 'chatty-gate.mjs');
-    writeFileSync(script, `process.stderr.write(${JSON.stringify(GATE_STARTED_MARKER)} + 'x'.repeat(9000)); setTimeout(() => {}, 30000);`);
+    writeFileSync(script, `process.stderr.write(${JSON.stringify(GATE_STARTED_MARKER)} + 'x'.repeat(9000)); ${keepAliveScript({ maxLifetimeMs: 30_000 })}`);
     let started = 0;
     const pids = [];
     await expect(spawnGateBounded([script], {
@@ -986,7 +987,7 @@ it('settles a superseded run in the background without overwriting the newer req
 
 it('detects a gate marker split across stderr chunks', async () => {
   const script = join(base, 'split-marker.mjs');
-  writeFileSync(script, `process.stderr.write('gate execution '); setTimeout(() => process.stderr.write('starting' + 'x'.repeat(9000)), 100); setTimeout(() => {}, 30000);`);
+  writeFileSync(script, `process.stderr.write('gate execution '); setTimeout(() => process.stderr.write('starting' + 'x'.repeat(9000)), 100); ${keepAliveScript({ maxLifetimeMs: 30_000 })}`);
   let started = 0;
   await expect(spawnGateBounded([script], { queueCeilingMs: 2000, gateCeilingMs: 100,
     onGateStarted: () => { started += 1; },
@@ -1223,7 +1224,7 @@ describe('#4135 — job mode: a pending lane is handed to launchGate, never spaw
   it('in-process (rollback) gate: when its leader settles while its process group lives on, the lane stays in flight (PR 4764 round 7)', async () => {
     expect(runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true', '--json'], laneDir).code).toBe(0);
     // A real process group standing in for test runners that outlive their verify-lane leader.
-    const runners = spawnProcess(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { detached: true, stdio: 'ignore' });
+    const runners = spawnProcess(process.execPath, ['-e', keepAliveScript({ maxLifetimeMs: 60_000 })], { detached: true, stdio: 'ignore' });
     try {
       const inFlight = new Map();
       await runVerifyDispatch({ poolRoot, inFlight, awaitSettle: true,
