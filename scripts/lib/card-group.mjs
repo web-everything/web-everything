@@ -502,6 +502,9 @@ export function createCardGrouping({
   // after proving no source is queued, so an enqueue can never pass its hold check and then race the claim.
   withLock = null, readQueue = null, readQueueFiles = null,
   cardConflictSettings = null,
+  // `liveGate(pr)` → refusal reason | null: the drain's own live land refusals that the labels do not carry
+  // (production: the live fix claim). Required: unwired, every member is left out (fail closed).
+  liveGate = null,
 } = {}) {
   const say = line => { if (!quiet) log.write(`  card-group: ${line}\n`); };
   let setting = settings;
@@ -539,6 +542,14 @@ export function createCardGrouping({
     if (hold) return `holds ${hold}`;
     if (String(pr.headRefName || '').startsWith(CARD_GROUP_BRANCH_PREFIX)) return 'is a combined PR';
     return null;
+  };
+  // Admission-time eligibility = labels/head (liveEligible) AND the drain's live gate. Reconcile keeps using
+  // liveEligible alone (a dissolve must never depend on an extra read).
+  const admissible = (pr, headSha) => {
+    const bad = liveEligible(pr, headSha);
+    if (bad) return bad;
+    if (typeof liveGate !== 'function') return 'no live gate wired (fail closed)';
+    try { return liveGate(pr) || null; } catch (e) { return `live gate unreadable (${firstLine(e)})`; }
   };
   const mainSha = () => {
     const r = run('git', ['ls-remote', 'origin', 'refs/heads/main'], { cwd });
@@ -663,10 +674,12 @@ export function createCardGrouping({
         // (group first). Whatever the source, every check below (labels, git card-only, live state, admission,
         // queue, union proof, land mutex) still decides.
         const waiting = o => (o.kind === 'queue-file-overlap' && overlapReasonIsCardOnly(o.reason)) || o.kind === 'overlap-yield';
-        const yielding = d => d?.overlapYield || (Array.isArray(d?.waitOn) && d.waitOn.length > 0 && d.waitOn.every(w => String(w).startsWith('overlap-yield:')));
+        // A planner deferral qualifies only when EVERY wait is an overlap-yield (a blockedBy/couple/stack wait
+        // keeps it serial) and it names its repo (the planner row's own `num` has no repo; its overlapYield does).
+        const yielding = d => d?.overlapYield && Array.isArray(d.waitOn) && d.waitOn.length > 0 && d.waitOn.every(w => String(w).startsWith('overlap-yield:'));
         const offered = [
           ...outcomes.filter(waiting),
-          ...(Array.isArray(planDeferred) ? planDeferred : []).filter(yielding),
+          ...(Array.isArray(planDeferred) ? planDeferred : []).filter(yielding).map(d => ({ num: d.num, repo: d.overlapYield.repo ?? null })),
           ...(Array.isArray(early) ? early : []),
         ].filter(o => Number.isInteger(Number(o?.num)) && local(o.repo) && !grouped.has(Number(o.num)));
         const deferred = [...new Map(offered.map(o => [Number(o.num), o])).values()];
@@ -700,7 +713,7 @@ export function createCardGrouping({
         for (const s of plan.sources) {
           let pr;
           try { pr = readPr(s.num); } catch (e) { say(`#${s.num} live read failed (${firstLine(e)}) — left out`); continue; }
-          const bad = liveEligible(pr, s.headSha);
+          const bad = admissible(pr, s.headSha);
           if (bad) { say(`#${s.num} left out (${bad})`); continue; }
           if (typeof prestage === 'function') {
             const adm = prestage({ num: s.num, repo: null, baseRefName: 'main' }, s.headSha);
@@ -785,7 +798,7 @@ export function createCardGrouping({
           for (const x of record.sources) {
             let pr;
             try { pr = readPr(x.num); } catch (e) { return { ok: false, reason: `#${x.num} re-read failed (${firstLine(e)})` }; }
-            const bad = liveEligible(pr, x.headSha);
+            const bad = admissible(pr, x.headSha);
             if (bad) return { ok: false, reason: `#${x.num} ${bad}` };
           }
           const claimed = mutate(s => {

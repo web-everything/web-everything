@@ -4688,6 +4688,8 @@ async function runCli() {
   const prestageCache = createPrestageCache();
   // xym8nt4 — post-approval card grouping: sources of a combined card PR are held; groups form/reconcile after each pass.
   const cardGrouping = createCardGrouping({ localSlug, dryRun: DRY_RUN, prestage: (c, sha) => mergeStrategy.prestage(c, sha),
+    // The live fix claim the merge site refuses on (classifyPr); an unreadable store attaches a placeholder → refused.
+    liveGate: (pr) => { const who = attachLiveFixClaim({ number: Number(pr?.number) }, { claimKey: repoKeyForSlug(localSlug), readClaim: readLiveFixClaim }).fixClaim?.who; return who ? `fix claim held by ${who}` : null; },
     withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }),
     readQueue: () => readQueueFacts({ repo: localSlug, exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, timeout: 60_000 }) }),
     readQueueFiles: () => readQueueEntryFiles({ repo: localSlug, exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, timeout: 60_000 }) }) });
@@ -5454,20 +5456,6 @@ async function runCli() {
   // (base vs lane backlog names) and, only on a real collision, rebuild the lane tip with the new item
   // renumbered to a free GAP id — CI re-runs green and it lands on a later pass. Local-repo candidates only
   // (pure git plumbing needs the local clone); best-effort, never fatal. Dry-run annotates without pushing.
-  // xym8nt4 — GROUP FIRST. Same-card PRs used to reach grouping only as post-cascade `queue-file-overlap`
-  // deferrals, so they were enqueued singly, yielded (`overlap-yield`, a PLANNER deferral grouping never saw),
-  // or rebased one by one (each rebase resets review) before any group could form. Offer this pass's landable
-  // or rebase-blocked local candidates here, before the heal/rebase below and before the cascade; a group
-  // formed now is held by `holdFor` in the cascade and skipped by both rebuilds. Every safety check lives in
-  // `form` (card-only by git, accepted, live head, red-team admission, no queue entry on the cards, union proof,
-  // land mutex). Full passes only, like the post-cascade call.
-  if (onlyPr == null && mergeStrategy.enqueues(null)) {
-    cardGrouping.reconcile();
-    const early = verdicts.filter(v => isLocalRepo(v.repo) && !v.prestagePendingCi && (v.decision === 'merge' || isRebaseDropCandidate(v)));
-    const grouping = cardGrouping.form({ verdicts, early });
-    if (grouping?.formed) process.stderr.write(`  card-group: formed #${grouping.formed.pr} before single enqueue (group first)\n`);
-    else if (grouping?.reason && !/^(disabled|[01] card-only overlap deferral)/.test(grouping.reason)) process.stderr.write(`  card-group: no early group — ${grouping.reason}\n`);
-  }
   const __rebaseDropT0 = __t.mark(); // covers BOTH the id-collision heal and the rebase-drop rebuild below — one
   // git-plumbing phase from the operator's point of view ("rebase-drop-manifest"), even though it's two loops.
   const healed = [];
@@ -6720,6 +6708,20 @@ async function runCli() {
     // dependents next pass (mirrors the lane-drain cascade). A merge FAILURE (red/behind) marks the PR `skip`
     // so it keeps blocking its dependents — never land past a broken blocker.
     let remaining = verdicts.map((v) => ({ ...v }));
+    // xym8nt4 — GROUP FIRST. Same-card PRs used to reach grouping only as post-cascade `queue-file-overlap`
+    // deferrals, so they were enqueued singly or yielded (`overlap-yield` is a PLANNER deferral grouping never saw)
+    // before any group could form. Here — after the review gate, before any single enqueue or overlap-yield hold —
+    // offer this pass's landable local candidates (`decision === 'merge'`: every drain gate up to the cascade
+    // passed); a group formed now is held by `holdFor` just below. Every safety check stays in `form` (card-only by
+    // git, accepted, live head, live fix claim, red-team admission, no queue entry on the cards, union proof, land
+    // mutex). Full passes only, like the post-cascade call.
+    if (onlyPr == null && mergeStrategy.enqueues(null)) {
+      cardGrouping.reconcile();
+      const early = remaining.filter(v => isLocalRepo(v.repo) && v.decision === 'merge' && !v.prestagePendingCi);
+      const grouping = cardGrouping.form({ verdicts, early });
+      if (grouping?.formed) process.stderr.write(`  card-group: formed #${grouping.formed.pr} before single enqueue (group first)\n`);
+      else if (grouping?.reason && !/^(disabled|[01] card-only overlap deferral)/.test(grouping.reason)) process.stderr.write(`  card-group: no early group — ${grouping.reason}\n`);
+    }
     // xym8nt4 — a source PR of a card group lands only through the combined PR (independent of holdFirst).
     for (const c of remaining.filter(v => v.decision === 'merge')) {
       const grouped = cardGrouping.holdFor(c);

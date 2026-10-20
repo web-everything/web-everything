@@ -295,7 +295,7 @@ describe('createCardGrouping.form (fail closed)', () => {
     const outcomes = [1, 2].map(n => ({ num: n, kind: 'queue-file-overlap', reason: `#9 share ${CARD}` }));
     expect(g.form({ outcomes, verdicts }).reason).toMatch(/live re-check left fewer than 2/);
     // Dry run with an admission check: builds and proves, pushes nothing, writes no group.
-    const dry = createCardGrouping({ localSlug: 'o/r', cwd, run, exec, statePath: join(d, 's2.json'), settings, log: { write() {} }, dryRun: true, prestage: () => ({ allowed: true }), readQueueFiles: () => ({ entries: [] }) });
+    const dry = createCardGrouping({ localSlug: 'o/r', cwd, run, exec, statePath: join(d, 's2.json'), settings, log: { write() {} }, dryRun: true, prestage: () => ({ allowed: true }), readQueueFiles: () => ({ entries: [] }), liveGate: () => null });
     const r = dry.form({ outcomes, verdicts });
     expect(r.dryRun).toBe(true);
     expect(r.proof.ok).toBe(true);
@@ -321,7 +321,7 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     const calls = [];
     const exec = (cmd, args) => {
       calls.push(args.join(' '));
-      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ state: 'OPEN', isDraft: false, headRefOid: heads[args[2]], headRefName: 'lane/x', baseRefName: 'main', labels: accepted });
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ number: Number(args[2]), state: 'OPEN', isDraft: false, headRefOid: heads[args[2]], headRefName: 'lane/x', baseRefName: 'main', labels: accepted });
       if (args[0] === 'pr' && args[1] === 'create') return 'https://github.com/o/r/pull/77\n';
       if (args[0] === 'pr' && ['comment', 'close'].includes(args[1])) return '';
       throw new Error(`unexpected ${args.join(' ')}`);
@@ -336,7 +336,7 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     const t = setup();
     const d = tmp();
     const base = () => t.base;
-    const opts = { localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, base), exec: t.exec, settings, log: { write() {} }, prestage: () => ({ allowed: true }), cardConflictSettings: cc };
+    const opts = { localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, base), exec: t.exec, settings, log: { write() {} }, prestage: () => ({ allowed: true }), cardConflictSettings: cc, liveGate: () => null };
     expect(createCardGrouping({ ...opts, statePath: join(d, 'a.json') }).form({ outcomes: t.outcomes, verdicts: t.verdicts }).reason).toMatch(/no queue file read wired/);
     expect(createCardGrouping({ ...opts, statePath: join(d, 'a2.json'), readQueueFiles: () => ({ entries: [] }) }).form({ outcomes: t.outcomes, verdicts: t.verdicts }).reason).toMatch(/no land mutex/);
     // A queued PR still sharing the card: wait, build nothing, memo nothing.
@@ -366,13 +366,16 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     const d = tmp();
     const withLock = fn => ({ ran: true, result: fn() });
     const mk = (t, statePath, extra = {}) => createCardGrouping({ localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, () => t.base), exec: t.exec, settings, log: { write() {} },
-      prestage: () => ({ allowed: true }), cardConflictSettings: cc, withLock, readQueueFiles: () => ({ entries: [] }), statePath, ...extra });
+      prestage: () => ({ allowed: true }), cardConflictSettings: cc, withLock, readQueueFiles: () => ({ entries: [] }), liveGate: () => null, statePath, ...extra });
     // A PLANNER deferral (waitOn overlap-yield, never an enqueue outcome) is offered.
     const t1 = setup();
-    expect(mk(t1, join(d, 'p.json')).form({ verdicts: t1.verdicts, deferred: [1, 2].map(n => ({ num: n, repo: null, waitOn: ['overlap-yield:#9'] })) }).formed).toMatchObject({ pr: 77 });
-    // A planner deferral on anything else (blockedBy) is not.
+    expect(mk(t1, join(d, 'p.json')).form({ verdicts: t1.verdicts, deferred: [1, 2].map(n => ({ num: n, waitOn: ['overlap-yield:#9'], overlapYield: { pr: 9, repo: null } })) }).formed).toMatchObject({ pr: 77 });
+    // A planner deferral on anything else (blockedBy), or mixed with another wait, or of another repo, is not.
     const t2 = setup();
-    expect(mk(t2, join(d, 'q.json')).form({ verdicts: t2.verdicts, deferred: [1, 2].map(n => ({ num: n, repo: null, waitOn: ['#123'] })) }).reason).toMatch(/0 card-only overlap deferral/);
+    const g2 = mk(t2, join(d, 'q.json'));
+    expect(g2.form({ verdicts: t2.verdicts, deferred: [1, 2].map(n => ({ num: n, waitOn: ['#123'] })) }).reason).toMatch(/0 card-only overlap deferral/);
+    expect(g2.form({ verdicts: t2.verdicts, deferred: [1, 2].map(n => ({ num: n, waitOn: ['overlap-yield:#9', '#123'], overlapYield: { pr: 9, repo: null } })) }).reason).toMatch(/0 card-only overlap deferral/);
+    expect(g2.form({ verdicts: t2.verdicts, deferred: [1, 2].map(n => ({ num: n, waitOn: ['overlap-yield:#9'], overlapYield: { pr: 9, repo: 'o/other' } })) }).reason).toMatch(/0 card-only overlap deferral/);
     // Early candidates (the drain's pre-cascade offer) form a group before any single enqueue.
     const t3 = setup();
     expect(mk(t3, join(d, 'e.json')).form({ verdicts: t3.verdicts, early: t3.verdicts }).formed).toMatchObject({ pr: 77 });
@@ -385,6 +388,13 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     expect(mk(t5, join(d, 'g.json'), { prestage: (c) => ({ allowed: c.num !== 2, reason: 'red team pending' }) }).form({ verdicts: t5.verdicts, early: t5.verdicts }).reason).toMatch(/live re-check left fewer than 2/);
     const t6 = setup();
     expect(mk(t6, join(d, 'h.json'), { readQueueFiles: () => ({ entries: [{ num: 99, files: [CARD] }] }) }).form({ verdicts: t6.verdicts, early: t6.verdicts })).toMatchObject({ waiting: true });
+    // The live gate (production: the live fix claim) leaves a member out; unwired or throwing fails closed.
+    const t8 = setup();
+    expect(mk(t8, join(d, 'i.json'), { liveGate: pr => (Number(pr.number) === 2 ? 'fix claim held by x' : null) }).form({ verdicts: t8.verdicts, early: t8.verdicts }).reason).toMatch(/live re-check left fewer than 2/);
+    const t9 = setup();
+    expect(mk(t9, join(d, 'j.json'), { liveGate: null }).form({ verdicts: t9.verdicts, early: t9.verdicts }).reason).toMatch(/live re-check left fewer than 2/);
+    const t10 = setup();
+    expect(mk(t10, join(d, 'k.json'), { liveGate: () => { throw new Error('store down'); } }).form({ verdicts: t10.verdicts, early: t10.verdicts }).reason).toMatch(/live re-check left fewer than 2/);
     // A PR already in a recorded group is never offered again.
     const t7 = setup();
     const sp = join(d, 'e.json');
@@ -428,8 +438,11 @@ describe('drain wiring: group first', () => {
     const src = readFileSync(new URL('../../merge-ai-prs.mjs', import.meta.url), 'utf8');
     const early = src.indexOf('cardGrouping.form({ verdicts, early })');
     expect(early).toBeGreaterThan(0);
-    expect(early).toBeLessThan(src.indexOf('const __rebaseDropT0'));
+    // After the review gate (decision === 'merge' already judged), before the source hold and any single enqueue.
+    expect(early).toBeGreaterThan(src.indexOf('let remaining = verdicts.map('));
+    expect(early).toBeLessThan(src.indexOf('const grouped = cardGrouping.holdFor(c);'));
     expect(early).toBeLessThan(src.indexOf('const memoHold = createHoldMemo('));
+    expect(src).toMatch(/liveGate: \(pr\) => \{ const who = attachLiveFixClaim\(/);
     expect(src).toContain('cardGrouping.form({ outcomes: enqueueOutcomes, verdicts, deferred })');
   });
 });
