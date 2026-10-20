@@ -402,9 +402,13 @@ export function evaluateNeedsYourMerge(pr, { files, changedFiles } = {}) {
   return { owed: false, paths: [], reasons: [hold.hold ? hold.error : 'touches no workflow or action file — the drain lands it'] };
 }
 
-/** Card 334 — the one command the operator runs for a needs-your-merge row. Pure. */
+/**
+ * Card 334 — the one command the operator runs for a needs-your-merge row. Pure. It goes through
+ * `we:scripts/run-fresh.mjs`, which runs it from a fresh lane at origin/main, so it works from any checkout of the
+ * repo however far behind origin/main that checkout is.
+ */
 export function needsYourMergeCommand({ repo, number }) {
-  return `node scripts/operations/run.mjs land-human-only --pr=${number} --repo=${repo} --actor=<your login> `
+  return `node scripts/run-fresh.mjs land-human-only --pr=${number} --repo=${repo} --actor=<your login> `
     + "--channel=<where you said it> --reason='<your words>'";
 }
 

@@ -628,7 +628,9 @@ export function resolveOperation(name, opts = {}) {
   const build = Object.hasOwn(OPERATIONS, String(name ?? '')) ? OPERATIONS[name] : undefined;
   if (typeof build !== 'function') {
     throw new Error(
-      `operations: no operation named ${JSON.stringify(name)} (known: ${Object.keys(OPERATIONS).sort().join(', ')})`,
+      `operations: no operation named ${JSON.stringify(name)} (known: ${Object.keys(OPERATIONS).sort().join(', ')})`
+      + ' — if this checkout is behind origin/main, update it, or run the operation from a fresh lane at origin/main:'
+      + ` node scripts/run-fresh.mjs ${JSON.stringify(String(name ?? ''))} …`,
     );
   }
   // `finish` is OPTIONAL (most builders omit it): a per-operation post-process over `runOperationCli`'s

@@ -18,7 +18,7 @@ const pr = (over = {}) => ({ number: 5298, title: 'fix red main: CI caps', headR
   labels: ['ready-to-merge', 'review:accepted'].map((name) => ({ name })), comments: [],
   statusCheckRollup: [green('test'), green('merge-gate'), { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' }], ...over });
 const WF = [{ filename: '.github/workflows/ci.yml' }, { filename: 'scripts/x.mjs' }];
-const COMMAND = `node scripts/operations/run.mjs land-human-only --pr=5298 --repo=${REPO} --actor=<your login> --channel=<where you said it> --reason='<your words>'`;
+const COMMAND = `node scripts/run-fresh.mjs land-human-only --pr=5298 --repo=${REPO} --actor=<your login> --channel=<where you said it> --reason='<your words>'`;
 
 const originalExitCode = process.exitCode;
 beforeEach(() => { execFileSync.mockReset(); });
