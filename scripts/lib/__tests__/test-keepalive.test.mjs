@@ -108,6 +108,12 @@ describe('check:standards — findUnmanagedKeepAlives (parsed, not pattern-match
       'setInterval/*idle*/(()=>{},1000);', // keepalive-helper-ok: scan fixture (audit 2)
       'setInterval(() => {\n  // nothing\n}, 1000);', // keepalive-helper-ok: scan fixture (multi-line)
       'globalThis.setTimeout(() => {}, 60000);', // keepalive-helper-ok: scan fixture
+      "globalThis['setInterval'](() => {}, 1000);", // keepalive-helper-ok: scan fixture (audit 4)
+      'window["setTimeout"](() => {}, 1000);', // keepalive-helper-ok: scan fixture (audit 4)
+      'timers()[`setInterval`](() => {}, 1000);', // keepalive-helper-ok: scan fixture (audit 4)
+      '(setInterval)(() => {}, 1000);', // keepalive-helper-ok: scan fixture (audit 4)
+      '((globalThis.setInterval))(() => {}, 1000);', // keepalive-helper-ok: scan fixture (audit 4)
+      'globalThis?.setInterval(() => {}, 1000);', // keepalive-helper-ok: scan fixture
       'setTimeout(() => {}, 30000);', // keepalive-helper-ok: scan fixture
     ];
     for (const c of cases) expect(flagged(c), c).toEqual([1]);
@@ -128,6 +134,7 @@ describe('check:standards — findUnmanagedKeepAlives (parsed, not pattern-match
       'setTimeout(() => process.exit(0), 30000);',
       'await new Promise((r) => setTimeout(r, 50));',
       "const msg = 'use setInterval for polling';",
+      "obj['setIntervalX'](() => {}, 1000);",
       "x('node -e \\'setInterval(()=>{},1000)\\' is a bash string here');",
     ];
     for (const c of cases) expect(flagged(c), c).toEqual([]);

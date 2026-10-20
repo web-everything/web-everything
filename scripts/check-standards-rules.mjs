@@ -4662,9 +4662,15 @@ function literalSource(ts, node) {
 
 /** Is `call` an idle timer: setInterval/setTimeout whose callback is a function/arrow with an empty body? */
 function isIdleTimerCall(ts, call) {
-  const callee = call.expression;
+  // Callee shapes: `setInterval`, `(setInterval)`, `<expr>.setInterval`, `<expr>['setInterval']` (string-literal key),
+  // through any parentheses / optional chaining. Deliberately obfuscated forms (eval, computed non-literal keys,
+  // aliases via variables) are out of scope by operator ruling: the guard targets accidental leaks.
+  let callee = call.expression;
+  while (ts.isParenthesizedExpression(callee)) callee = callee.expression;
   const name = ts.isIdentifier(callee) ? callee.text
-    : ts.isPropertyAccessExpression(callee) ? callee.name.text : null;
+    : ts.isPropertyAccessExpression(callee) ? callee.name.text
+      : ts.isElementAccessExpression(callee) && (ts.isStringLiteral(callee.argumentExpression) || ts.isNoSubstitutionTemplateLiteral(callee.argumentExpression))
+        ? callee.argumentExpression.text : null;
   if (!TIMER_NAMES.has(name)) return false;
   let cb = call.arguments[0];
   while (cb && ts.isParenthesizedExpression(cb)) cb = cb.expression;
