@@ -18,7 +18,7 @@ const DENIED = [
   'sleep 31',
   'sleep 1m',
   'sleep infinity',
-  "node -e 'setTimeout(()=>{},60000)'",
+  "node -e 'setTimeout(()=>{},60000)'", // keepalive-helper-ok: a bash command string under test, never run
   "for i in 1 2; do node -e 'setTimeout(r=>r,1000)'; done",
   "python3 -c 'import time; time.sleep(90)'",
   'while read -t 5 l; do echo $l; done',
@@ -47,7 +47,7 @@ const DENIED = [
   "perl -e 'while(1){sleep 1}'",
   "python3 -c 'import time\nwhile 1: time.sleep(1)'",
   "ruby -e 'loop { sleep 1 }'",
-  "node -e 'setInterval(()=>{},1000)'",
+  "node -e 'setInterval(()=>{},1000)'", // keepalive-helper-ok: a bash command string under test, never run
   "php -r 'while(1){sleep(1);}'",
   // — other interpreters / nested carriers
   "ruby -e 'sleep 100'",
@@ -58,7 +58,7 @@ const DENIED = [
   "bash <<'EOF'\nwhile ! grep -q done x.log; do sleep 60; done\nEOF",
   "python3 - <<'EOF'\nimport time\ntime.sleep(600)\nEOF",
   "sh <<EOF\nsleep 100\nEOF",
-  "node - <<'EOF'\nsetTimeout(()=>{},120000)\nEOF",
+  "node - <<'EOF'\nsetTimeout(()=>{},120000)\nEOF", // keepalive-helper-ok: a bash command string under test, never run
   // — a standalone timed read blocks as long as a sleep
   'read -t 120 value',
   'read -t $N value',

@@ -23,6 +23,7 @@ import { describe, it, expect } from 'vitest';
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
+import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 
 import { withRealRepo } from './helpers/real-repo.mjs';
 import {
@@ -45,7 +46,7 @@ describe('scanPsForSession — the REAL process table on this platform', () => {
     // longer matches, by design: that used to be indistinguishable from this OPERATION's own
     // `--session=<id>` invocation, which is the #3383 bug this file's sibling suite fixes.
     const marker = '11112222-3333-4444-5555-666677778888';
-    const child = spawn(process.execPath, ['-e', `/*--resume=${marker}*/ setTimeout(() => {}, 5000)`], { stdio: 'ignore' });
+    const child = spawn(process.execPath, ['-e', keepAliveScript({ prelude: `/*--resume=${marker}*/`, maxLifetimeMs: 5000 })], { stdio: 'ignore' });
     try {
       // Real `ps aux`, no injected exec — give the OS a moment to make the child visible in the table.
       const seen = await (async () => {
