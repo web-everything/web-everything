@@ -627,7 +627,7 @@ describe('same-head hold never silences a review whose verdict never landed (liv
       notifyReferralHold({ repo, prNumber: p.number, pr: p, hold: cool, dir, post: vi.fn(), log, now: at + 30 * 60_000, publishNeedsYou: publish });
       expect(publish).not.toHaveBeenCalled();
     });
-    const exhausted = t0 => decideSameHeadHold(labelled(['review:pending']), lostRuns(9), { repo, env: {}, now: t0, retry: { cooldownReleases: 6 } });
+    const exhausted = t0 => decideSameHeadHold(labelled(['review:pending']), lostRuns(9), { repo, env: {}, now: t0, retry: { cooldownReleases: 6, source: 'tool' } });
     const T0 = at + 30 * 86400_000, EXP = NO_VERDICT_NEEDS_YOU_LEASE_EXPIRY_MS;
     const files = dir => readdirSync(dir);
     const receiptOf = dir => join(dir, files(dir).find(n => n.endsWith('.json')));
