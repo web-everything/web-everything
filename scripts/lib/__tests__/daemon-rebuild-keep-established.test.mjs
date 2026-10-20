@@ -157,6 +157,9 @@ describe('x5059uu — rebuild keeps established overlays and parks the conflicti
     gitOk(author, ['commit', '-q', '-am', 'graduate']);
     gitOk(author, ['push', '-q', 'origin', 'HEAD:refs/heads/main']);
 
+    const { dryRunRebuild } = await import('../daemon-rebuild.mjs');
+    const dry = await dryRunRebuild({ root: f.clone, env: f.env, prState: async () => 'OPEN' });
+    expect(dry.wouldDo).toBe('hold (established-overlay-conflict)');
     const smoke = passSmoke();
     const second = await rebuildClone({ root: f.clone, env: f.env, runSmoke: smoke, prState: async () => 'OPEN' });
     expect(second.moved).toBe(false);
