@@ -67,6 +67,7 @@ import {
   STAND_DOWN_MARKER, WATCHER_STAND_DOWN_ACTOR, SUPERSEDE_STAND_DOWN_MARKER, buildStandDownComment,
 } from '../stand-down.mjs';
 import { mintSessionSlug } from '../session-slug.mjs';
+import { buildRoundExtensionComment } from '../round-extension-mark.mjs';
 import { UNOWNED_REBASE_INFRA_MARKER, countUnownedRebaseInfraFailures, formatUnownedRebaseInfraMarker, UNOWNED_REBASE_ATTEMPT_MARKER, UNOWNED_REBASE_ATTEMPT_CAP, countUnownedRebaseAttempts } from '../unowned-rebase-attempt-count.mjs';
 import { NOTE_COMMENT_MARKER, postNoteComment } from '../reconcile-note-comment.mjs';
 import { CARD_CONFLICT_PRECONDITION_REASONS } from '../../lib/card-conflict-resolve.mjs';
@@ -2926,6 +2927,54 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
       expect(postNoteComment).toHaveBeenCalledTimes(1);
       expect(postNoteComment.mock.calls[0][0].body).toContain('unowned-mechanical-rebase-infra:3/3');
       expect(notifyDesktopChecked).toHaveBeenCalledTimes(1);
+    });
+
+    it('LIVE #5716 — an operator round grant buys exactly one more attempt past the infra cap; a forged grant buys none', () => {
+      postNoteComment.mockClear();
+      notifyDesktopChecked.mockClear();
+      const provider = fakeProvider();
+      const pr = { number: 5716, mergeable: 'CONFLICTING', headRefName: 'lane/pa-226-card',
+        headRefOid: 'a36abe60326770912776a49e14e65cc609a9726f', baseRefName: 'main', labels: [] };
+      const thread = [];
+      const attempt = vi.fn(() => ({ action: 'error', reason: 'card squash changed the PR net patch; refusing push' }));
+      vi.spyOn(provider, 'postComment').mockImplementation((_repo, _pr, body) => {
+        thread.push({ body, author: { login: 'web-everything' } });
+      });
+      let replayedNotes = 0;
+      const sweep = () => {
+        const [entry] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+          repo: 'web-everything/web-everything', listPrs: () => [pr], provider, postFinding: () => {},
+          unownedRebaseSettings: { value: { countSince: null, infraRetryCap: 2 }, sources: {} },
+          standingRulingFor: () => null,
+          computeConflictDisposition: () => 'clean', attemptMechanicalRebase: attempt,
+          listPrComments: () => thread,
+        });
+        for (const [note] of postNoteComment.mock.calls.slice(replayedNotes)) thread.push({ body: note.body, author: { login: 'web-everything' } });
+        replayedNotes = postNoteComment.mock.calls.length;
+        return entry;
+      };
+      const grant = (login) => ({ author: { login }, createdAt: '2026-10-20T20:58:54Z', body: buildRoundExtensionComment({
+        repo: 'web-everything/web-everything', pr: 5716, by: 1, actor: 'chalbert', channel: 'claude-code-chat',
+        reason: 'operator 2026-10-20: "Ok" — one more mechanical-rebase attempt', at: '2026-10-20T20:58:54Z' }) });
+      for (let i = 0; i < 3; i += 1) sweep();
+      expect(attempt).toHaveBeenCalledTimes(2);
+      expect(sweep().unownedRebaseInfraCapExhausted).toBe(true);
+      // A grant body posted by a non-operator login is not an operator grant: still capped, no attempt.
+      thread.push(grant('random-user'));
+      expect(sweep().unownedRebaseInfraCapExhausted).toBe(true);
+      expect(attempt).toHaveBeenCalledTimes(2);
+      // The operator's own grant: one more attempt from now, then capped again at 3/3 and surfaced once.
+      thread.push(grant('chalbert'));
+      const granted = sweep();
+      expect(granted.unownedRebaseInfraCapExhausted).toBeFalsy();
+      expect(attempt).toHaveBeenCalledTimes(3);
+      const again = sweep();
+      expect(again.unownedRebaseInfraCapExhausted).toBe(true);
+      expect(again.unownedRebaseInfraCap).toBe(3);
+      expect(sweep().unownedRebaseInfraCapExhausted).toBe(true);
+      expect(attempt).toHaveBeenCalledTimes(3);
+      expect(postNoteComment.mock.calls.map(([n]) => n.body.match(/unowned-mechanical-rebase-infra:\d+\/\d+/)?.[0]))
+        .toEqual(['unowned-mechanical-rebase-infra:2/2', 'unowned-mechanical-rebase-infra:3/3']);
     });
 
     it('REPLAY — real PR #2709 shape: persistent content-conflict skips are capped at 3 attempts and surfaced exactly once', () => {

@@ -28,6 +28,7 @@
 import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { roundExtensionGrants } from './round-extension-mark.mjs';
 
 /**
  * we:scripts/conveyor/unowned-rebase-attempt-count.mjs#UNOWNED_REBASE_ATTEMPT_MARKER — the stable first-line PREFIX of
@@ -128,4 +129,25 @@ export function countUnownedRebaseInfraFailures(comments, { countSince, headSha 
     const markerHead = metadata.match(/(?:^|\s)head=(\S+)/)?.[1];
     return !headSha || !markerHead || markerHead === headSha;
   }).length;
+}
+
+/**
+ * we:scripts/conveyor/unowned-rebase-attempt-count.mjs#grantedRebaseCap — the cap after operator round grants.
+ * PR #5716 stayed at "unowned-mechanical-rebase-infra auto-repair rounds exhausted (10/10)" after the operator
+ * granted +1 with `extend-rounds`: these two caps never read the grant. Each audited grant (operator-authored, or
+ * an automation-posted standing-ruling grant inside the scope the IO shell verified — the SAME reader and
+ * ten-round ceiling `reconcile-core.mjs` uses) means "N more attempts from the moment it was posted":
+ * cap' = max(cap, attemptsBeforeGrant + by). Bounded: no grant → the base cap, and every grant is a visible,
+ * authenticated PR comment. `count` is the cap's own counter, run over the thread prefix before the grant.
+ * @param {number} cap
+ * @param {Array<object>} comments - chronological, as the conflict watch lists them
+ * @param {(prefix:Array<object>) => number} count
+ * @param {{repo:string, pr:number, standingRuling?:object|null}} scope
+ * @returns {{cap:number, grants:number}}
+ */
+export function grantedRebaseCap(cap, comments, count, { repo, pr, standingRuling = null }) {
+  if (!Array.isArray(comments)) return { cap, grants: 0 };
+  const grants = roundExtensionGrants(comments, { repo, pr, standingRuling });
+  return { cap: Math.max(cap, ...grants.map(g => count(comments.slice(0, g.index)) + g.by)),
+    grants: grants.reduce((sum, g) => sum + g.by, 0) };
 }
