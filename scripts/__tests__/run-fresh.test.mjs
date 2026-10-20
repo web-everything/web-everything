@@ -10,6 +10,7 @@ import { spawn as spawnChild } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { keepAliveScript } from '../lib/test-keepalive.mjs';
 import { parseAcquire, runFresh, withSignalsDeferred } from '../run-fresh.mjs';
 
 const SHA = 'a'.repeat(40);
@@ -197,8 +198,7 @@ describe('run-fresh', () => {
     };
     try {
       await mkdir(join(dir, 'scripts', 'operations'), { recursive: true });
-      const operation = `
-        setInterval(() => {}, 1000);
+      const operation = `${keepAliveScript()}
         const continued = setTimeout(() => {
           console.log('OPERATION CONTINUED AFTER SIGNAL');
           process.exit(0);
