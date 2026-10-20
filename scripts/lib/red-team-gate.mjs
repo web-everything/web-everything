@@ -200,15 +200,17 @@ export const RED_TEAM_GATE_MARKER = '<!-- we:red-team-gate';
  */
 export const GATE_OUTCOMES = Object.freeze({ SENT_BACK: 'sent-back', ROUND_CAP: 'round-cap', NOTHING_TO_SEND: 'no-send-back', CARD_QUEUED: 'card-queued' });
 
-/** `result` ({@link redTeamResultId}) names the red-team result the decision was made on; older records omit it. */
-export function redTeamGateMarker(pr, rev, outcome, result = null) {
-  return `${RED_TEAM_GATE_MARKER} pr=${Number(pr)} rev=${String(rev).toLowerCase()} outcome=${outcome}${result ? ` result=${result}` : ''} -->`;
+/** `result` names the decided result ({@link redTeamResultId}). `grantIds` records the send-back step's grant
+ * snapshot, not its POST time. Older records omit these fields. */
+export function redTeamGateMarker(pr, rev, outcome, result = null, grantIds = null) {
+  return `${RED_TEAM_GATE_MARKER} pr=${Number(pr)} rev=${String(rev).toLowerCase()} outcome=${outcome}${result ? ` result=${result}` : ''}${grantIds ? ` grants=${grantIds.join(',') || 'none'}` : ''} -->`;
 }
 
 /** PURE: parse the anchored gate marker, shared by gate reads and verdict carry. */
 export function parseRedTeamGateMarker(body) {
-  const m = /^<!-- we:red-team-gate pr=(\d+) rev=([0-9a-f]{40}) outcome=([a-z-]+)(?: result=([0-9a-f]{16}))? -->/.exec(String(body ?? '').trimStart());
-  return m ? { pr: Number(m[1]), rev: m[2], outcome: m[3], ...(m[4] ? { result: m[4] } : {}) } : null;
+  const m = /^<!-- we:red-team-gate pr=(\d+) rev=([0-9a-f]{40}) outcome=([a-z-]+)(?: result=([0-9a-f]{16}))?(?: grants=(none|[0-9a-f]{16}(?:,[0-9a-f]{16}){0,9}))? -->/.exec(String(body ?? '').trimStart());
+  return m ? { pr: Number(m[1]), rev: m[2], outcome: m[3], ...(m[4] ? { result: m[4] } : {}),
+    ...(m[5] ? { grantIds: m[5] === 'none' ? [] : m[5].split(',') } : {}) } : null;
 }
 
 /** Every outcome the gate recorded for this head (trusted authors only). PURE. */
@@ -238,31 +240,71 @@ export function sendBackStepOutcome(found) {
 }
 
 /**
- * Thread positions of the operator's audited round grants on this PR (`extend-rounds`), scoped to the PR's own repo.
+ * The operator's audited round grants on this PR (`extend-rounds`), scoped to the PR's own repo, with stable identities.
  * No repo means no grant credit: a reader that cannot name the repo keeps the cap (fail closed). PURE.
  */
-function grantPositions(comments, pr, repo = null) {
+export function gateRoundGrants(comments, pr, repo = null) {
   if (!repo) return [];
-  return roundExtensionGrants(comments, { repo, pr }).map(g => g.index);
+  const copies = new Map();
+  return roundExtensionGrants(comments, { repo, pr }).map(g => {
+    const c = comments[g.index];
+    // REST and GraphQL expose the same node id. Include content so editing a grant invalid cannot hide a replacement;
+    // fixtures / older readers without ids still distinguish different grants without relying on shifting indices.
+    const key = JSON.stringify([c.id ?? null, c.createdAt ?? null, c.body]);
+    const copy = (copies.get(key) ?? 0) + 1;
+    copies.set(key, copy);
+    return { ...g, id: createHash('sha256').update(JSON.stringify([key, copy])).digest('hex').slice(0, 16) };
+  });
 }
 
 /**
  * The send-back step's outcome from ONE result's gate records, in thread order. Without a grant this is exactly
- * {@link sendBackStepOutcome} (raced records: the cap wins). An operator round grant posted AFTER the latest
- * `round-cap` record reopens the step (`reopened`), and a `sent-back` record posted after such a grant supersedes the
- * cap: the operator gave the fixer another round, and the gate used it. PURE.
+ * {@link sendBackStepOutcome} (raced records: the cap wins). A grant the cap decision did not see reopens the step,
+ * even if the cap's POST landed after the grant. A send-back after that grant supersedes the stale cap in either
+ * posting order. Legacy cap records use their thread position as the snapshot. PURE.
  */
 export function sendBackStepState(gates, grants = []) {
+  const { outcome, reopened } = resolveSendBackStep(gates, grants);
+  return { outcome, reopened };
+}
+
+function resolveSendBackStep(gates, grants) {
   const step = [...gates].filter(r => r.gate.outcome === GATE_OUTCOMES.ROUND_CAP || r.gate.outcome === GATE_OUTCOMES.SENT_BACK)
     .sort((a, b) => a.at - b.at || threadOrder(a, b));
-  let outcome = null, capAt = null;
+  const position = g => typeof g === 'number' ? g : g.index;
+  const identity = g => typeof g === 'number' ? String(g) : g.id;
+  const eligible = new Set(grants.map(identity));
+  let outcome = null, sentGrants = [], sentSnapshot = false, capSnapshot = false;
+  const capGrants = new Set();
+  const supersededCaps = new Set();
   for (const r of step) {
-    if (r.gate.outcome === GATE_OUTCOMES.ROUND_CAP) { outcome = GATE_OUTCOMES.ROUND_CAP; capAt = r.at; continue; }
-    if (outcome !== GATE_OUTCOMES.ROUND_CAP) outcome = GATE_OUTCOMES.SENT_BACK;
-    else if (grants.some(g => g > capAt && g < r.at)) { outcome = GATE_OUTCOMES.SENT_BACK; capAt = null; }
+    const before = grants.filter(g => position(g) < r.at).map(identity);
+    if (r.gate.outcome === GATE_OUTCOMES.ROUND_CAP) {
+      const seen = new Set(r.gate.grantIds ?? before);
+      if (outcome === GATE_OUTCOMES.SENT_BACK && (sentSnapshot || r.gate.grantIds == null)
+        && sentGrants.some(id => !seen.has(id))) { supersededCaps.add(r); continue; }
+      outcome = GATE_OUTCOMES.ROUND_CAP;
+      capSnapshot ||= r.gate.grantIds != null;
+      // A slower, older cap decision must not undo a newer cap's consumption of a grant either.
+      for (const id of seen) capGrants.add(id);
+      continue;
+    }
+    // Snapshot both decisions: a later grant edit must not be attributed to a historical sender. Without a repo,
+    // even recorded identities receive no credit. Legacy senders cannot veto a newer, explicit cap snapshot.
+    const used = (r.gate.grantIds ?? before).filter(id => eligible.has(id));
+    if (outcome !== GATE_OUTCOMES.ROUND_CAP || ((!capSnapshot || r.gate.grantIds != null)
+      && used.some(id => !capGrants.has(id)))) {
+      // A duplicate or slower sender must not erase already-proven grant usage. Do not add inferred legacy
+      // identities once an explicit sender snapshot exists, or carry inferred identities into a proven snapshot.
+      const explicit = r.gate.grantIds != null;
+      if (outcome !== GATE_OUTCOMES.SENT_BACK || (explicit && !sentSnapshot)) sentGrants = used;
+      else if (explicit || !sentSnapshot) sentGrants = [...new Set([...sentGrants, ...used])];
+      sentSnapshot = outcome === GATE_OUTCOMES.SENT_BACK ? sentSnapshot || explicit : explicit;
+      outcome = GATE_OUTCOMES.SENT_BACK;
+    }
   }
-  const reopened = outcome === GATE_OUTCOMES.ROUND_CAP && grants.some(g => g > capAt);
-  return { outcome, reopened };
+  const reopened = outcome === GATE_OUTCOMES.ROUND_CAP && grants.some(g => !capGrants.has(identity(g)));
+  return { outcome, reopened, supersededCaps };
 }
 
 /**
@@ -320,7 +362,7 @@ const CLEAR_HUMAN_RULING_RE = /^✅ review — `review:human` cleared via the sa
 function threadRecords(comments) {
   // Every reader below counts trusted records only, so untrusted comments are dropped before any parse.
   // `at` is the comment's position in the WHOLE thread, so it compares directly with an operator grant's index
-  // ({@link roundExtensionGrants}); every reader below only compares positions, never counts them.
+  // ({@link roundExtensionGrants}); grant snapshots additionally retain stable identities across thread edits.
   return (Array.isArray(comments) ? comments : []).flatMap((c, at) => {
     if (!isTrustedMarkerAuthor(c)) return [];
     const body = typeof c === 'string' ? c : c?.body;
@@ -386,7 +428,7 @@ export function liveResultGateState(comments, pr, head, repo = null) {
   const hit = latestResult(records, pr, live);
   if (!hit) return { result: null, resultId: null, outcomes: new Set(), sendBackOutcome: null, reopened: false };
   const gates = gateRecordsFor(records, pr, live, hit);
-  const { outcome, reopened } = sendBackStepState(gates, grantPositions(comments, pr, repo));
+  const { outcome, reopened } = sendBackStepState(gates, gateRoundGrants(comments, pr, repo));
   return { result: hit.parsed, resultId: redTeamResultId(hit.parsed), outcomes: new Set(gates.map(r => r.gate.outcome)),
     sendBackOutcome: outcome, reopened };
 }
@@ -458,6 +500,7 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
   const result = latestResult(records, pr, live)?.parsed ?? null;
   const plan = planRedTeamActions(result, setting ?? readConfirmedBreaks({ env }).value);
   const actions = new Map();
+  const grants = gateRoundGrants(comments, pr, repo);
   let legacyHeld = false, liveGates = [];
   // Each carry removes its own comment and every later record, so even a cyclic head chain terminates.
   for (let sha = live, rs = records, first = true, want = null; sha && rs.length; first = false) {
@@ -467,11 +510,16 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     want = redTeamResultId(hit.parsed);
     const gates = gateRecordsFor(rs, pr, sha, hit);
     if (first) liveGates = gates;
+    const { supersededCaps } = resolveSendBackStep(gates, grants);
     const own = new Map();
     for (const r of gates) {
       for (const { action, indices } of gateActionLines(recordBody(r))) {
         if (action === 'held' && !indices.length) legacyHeld = true;
-        for (const index of indices) own.set(index, action);
+        for (const index of indices) {
+          // A stale cap POST cannot overwrite the per-finding send-back that superseded its decision.
+          if (action === 'held' && own.get(index) === 'send-back' && supersededCaps.has(r)) continue;
+          own.set(index, action);
+        }
       }
     }
     for (const [index, action] of own) if (!actions.has(index)) actions.set(index, action);
@@ -480,9 +528,9 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     sha = hit.from;
   }
   const capRecord = liveGates.filter(r => r.gate.outcome === GATE_OUTCOMES.ROUND_CAP).sort(threadOrder).at(-1)?.c ?? null;
-  // An operator round grant (for THIS repo's PR) between the cap record and a later `sent-back` record lets that
-  // send-back stand. Without a repo there is no grant credit and the cap keeps winning.
-  const outcome = sendBackStepState(liveGates, grantPositions(comments, pr, repo)).outcome;
+  // Audited grants unseen by the cap decision let a later send-back stand, even if the cap POST arrives last.
+  // Without a repo there is no grant credit and the cap keeps winning.
+  const outcome = sendBackStepState(liveGates, grants).outcome;
   const ruled = operatorRuled(records, pr, live);
   const sendBack = [], held = [];
   for (const f of result?.findings ?? []) {

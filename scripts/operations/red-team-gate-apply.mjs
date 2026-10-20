@@ -39,9 +39,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  GATE_OUTCOMES, gateRoundCap, liveResultGateState, planRedTeamActions, readConfirmedBreaks, redTeamGateMarker,
+  GATE_OUTCOMES, gateRoundCap, gateRoundGrants, liveResultGateState, planRedTeamActions, readConfirmedBreaks, redTeamGateMarker,
 } from '../lib/red-team-gate.mjs';
-import { roundExtensionGrants } from '../conveyor/round-extension-mark.mjs';
 import { cleanFindingFile, qualifyLocusRefs, sanitizeCardField } from '../lib/review-loop-policy.mjs';
 import { IN_REPO_LOCUS } from '../lib/citation-check.mjs';
 import { DEFAULT_ROUND_CAP } from '../lib/jury-core.mjs';
@@ -99,8 +98,8 @@ export function buildSendBackArgv({ repo, pr, bodyPath }) {
 }
 
 /** The gate's own record for ONE action on the head. PURE. */
-export function buildGateComment({ pr, head, outcome, plan, round, result = null, cardResult = null, sendBackResult = null, cap = DEFAULT_ROUND_CAP }) {
-  const lines = [redTeamGateMarker(pr, head, outcome, result),`**Red-team gate** (setting \`redTeam.confirmedBreaks\`, card x1b8hlo) on head \`${String(head).slice(0, 12)}\`:`];
+export function buildGateComment({ pr, head, outcome, plan, round, result = null, grantIds = null, cardResult = null, sendBackResult = null, cap = DEFAULT_ROUND_CAP }) {
+  const lines = [redTeamGateMarker(pr, head, outcome, result, grantIds),`**Red-team gate** (setting \`redTeam.confirmedBreaks\`, card x1b8hlo) on head \`${String(head).slice(0, 12)}\`:`];
   if (plan.sendBack.length) {
     lines.push(outcome === GATE_OUTCOMES.ROUND_CAP
       ? `- ${plan.sendBack.length} confirmed break(s) NOT sent back: ${Number.isInteger(round) ? `review round ${round} has reached the round cap (${cap})` : 'the review round could not be read, which counts as the round cap'}. The operator rules on them (${plan.sendBack.map(f => `#${f.index}`).join(', ')}).`
@@ -141,15 +140,15 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
     if (!plan.sendBack.length && !plan.card.length) return { status: 'advisory-only', head, plan };
     // One record per ACTION (see the header): what is already recorded for this result is not repeated, what is not stays pending.
     const priorSend = sendBackOutcome;
-    // A `round-cap` record is re-decided once when the operator granted rounds after it (extend-rounds): the grant
-    // may cover this round. The re-decision records again, so the same grant never reopens the step twice.
+    // A `round-cap` record is re-decided once for a grant its decision did not see (extend-rounds), including one
+    // posted during the cap POST. The re-decision snapshots its grants so the same grant cannot reopen it twice.
     const sendPending = plan.sendBack.length > 0 && (!priorSend || reopened);
     const cardPending = plan.card.length > 0 && !recorded.has(GATE_OUTCOMES.CARD_QUEUED);
     if (!dryRun && priorSend === GATE_OUTCOMES.SENT_BACK && sendBackReason(view.labels)) io.dequeueSentBack({ repo, pr, reason: 'post-accept red team sent back to review:changes' });
     if (!sendPending && !cardPending) return { status: 'already-acted', head, outcome: priorSend ?? GATE_OUTCOMES.CARD_QUEUED, plan };
     const round = sendPending ? io.readRound({ repo, pr, head }) : null;
     // The operator's audited grants raise the cap with the same grant-time anchor fix dispatch uses.
-    const grants = sendPending ? roundExtensionGrants(view?.comments, { repo, pr }) : [];
+    const grants = sendPending ? gateRoundGrants(view?.comments, pr, repo) : [];
     const effectiveCap = gateRoundCap({ cap, grants, roundAt: (at) => {
       try { return io.readRoundAsOf?.({ repo, pr, at }) ?? null; } catch { return null; }
     } });
@@ -166,7 +165,9 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
     let sendBackResult = null;
     let marker = null;
     const record = (recordOutcome, recordPlan, extra = {}) => {
-      try { io.postComment({ repo, pr, body: buildGateComment({ pr, head, outcome: recordOutcome, plan: recordPlan, round, result: resultId, cap: effectiveCap, ...extra }) }); return 'posted'; }
+      try { io.postComment({ repo, pr, body: buildGateComment({ pr, head, outcome: recordOutcome, plan: recordPlan, round, result: resultId,
+        grantIds: recordOutcome === GATE_OUTCOMES.ROUND_CAP || recordOutcome === GATE_OUTCOMES.SENT_BACK ? grants.map(g => g.id) : null,
+        cap: effectiveCap, ...extra }) }); return 'posted'; }
       catch (e) { return `error: ${String(e?.message ?? e).slice(0, 200)}`; }
     };
     if (sendPending) {
