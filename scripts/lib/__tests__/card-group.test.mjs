@@ -425,7 +425,7 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     const verdicts = nums.map(n => ({ num: n, repo: null, listedHeadSha: heads[n], prLabels: accepted }));
     const outcomes = nums.map(n => ({ num: n, kind: 'queue-file-overlap', reason: `#9 share ${CARD}` }));
     const out = [];
-    const opts = { localSlug: 'o/r', cwd, run: runIn(cwd, () => base), exec, settings, log: { write: l => out.push(l) }, prestage: () => ({ allowed: true }), cardConflictSettings: cc };
+    const opts = { localSlug: 'o/r', cwd, run: runIn(cwd, () => base), exec, settings, log: { write: l => out.push(l) }, prestage: () => ({ allowed: true }), cardConflictSettings: cc, readQueueFiles: () => ({ entries: [] }) };
     return { cwd, base, heads, labels, fails, calls, exec, verdicts, outcomes, out, opts };
   }
 
@@ -475,7 +475,7 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       const pushes = [];
       const run = (cmd, args, o) => { if (args[0] === 'push') pushes.push(args); return t.opts.run(cmd, args, o); };
       const withLock = fn => { change(t); return { ran: true, result: fn() }; };
-      const r = createCardGrouping({ ...t.opts, run, statePath, withLock, readQueue: () => ({ inQueue: new Set() }) }).form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      const r = createCardGrouping({ ...t.opts, run, statePath, withLock, readQueueFiles: () => ({ entries: [] }) }).form({ outcomes: t.outcomes, verdicts: t.verdicts });
       expect(r.reason).toMatch(refused);
       expect(r.formed).toBeUndefined();
       expect(readGroupState(statePath).groups ?? []).toEqual([]);
@@ -486,8 +486,10 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     it('an unreadable merge queue at claim time refuses (fail closed)', () => {
       const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11]) });
       const statePath = join(tmp(), 's.json');
-      const withLock = fn => ({ ran: true, result: fn() });
-      const r = createCardGrouping({ ...t.opts, statePath, withLock, readQueue: () => ({ error: 'gh down' }) }).form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      let locked = false;
+      const withLock = fn => { locked = true; try { return { ran: true, result: fn() }; } finally { locked = false; } };
+      // Readable before the build (no wait), unreadable inside the land mutex at claim time.
+      const r = createCardGrouping({ ...t.opts, statePath, withLock, readQueueFiles: () => (locked ? { entries: [], error: 'gh down' } : { entries: [] }) }).form({ outcomes: t.outcomes, verdicts: t.verdicts });
       expect(r.reason).toMatch(/claim refused: merge queue unreadable \(gh down\)/);
       expect(readGroupState(statePath).groups ?? []).toEqual([]);
     });
@@ -497,7 +499,7 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       const statePath = join(tmp(), 's.json');
       const other = { id: 'other', repo: 'o/r', pr: 5, branch: 'lane/card-group-other', sources: [{ num: 2, headSha: t.heads[2] }, { num: 9, headSha: 'e'.repeat(40) }] };
       const withLock = fn => { writeFileSync(statePath, JSON.stringify({ groups: [other], failed: {} })); return { ran: true, result: fn() }; };
-      const r = createCardGrouping({ ...t.opts, statePath, withLock, readQueue: () => ({ inQueue: new Set() }) }).form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      const r = createCardGrouping({ ...t.opts, statePath, withLock, readQueueFiles: () => ({ entries: [] }) }).form({ outcomes: t.outcomes, verdicts: t.verdicts });
       expect(r.reason).toMatch(/claim refused: a source joined another group meanwhile/);
       expect(readGroupState(statePath).groups.map(g => g.id)).toEqual(['other']);
       expect(t.calls.some(c => c.startsWith('pr create'))).toBe(false);
@@ -524,7 +526,7 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     it('leaving out the only offender of two forms nothing, memos the original set, and backs off', () => {
       const t = formRepo({ 1: card([1, 2, 10], 'active'), 2: card([1, 2, 11], 'resolved') });
       const statePath = join(tmp(), 's.json');
-      const g = createCardGrouping({ ...t.opts, statePath, withLock: fn => ({ ran: true, result: fn() }), readQueue: () => ({ inQueue: new Set() }) });
+      const g = createCardGrouping({ ...t.opts, statePath, withLock: fn => ({ ran: true, result: fn() }), readQueueFiles: () => ({ entries: [] }) });
       const r = g.form({ outcomes: t.outcomes, verdicts: t.verdicts });
       expect(r.reason).toMatch(/fewer than 2 left after leaving out #2/);
       expect(Object.keys(readGroupState(statePath).failed)).toEqual([`1@${t.heads[1]},2@${t.heads[2]}`]);
