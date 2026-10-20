@@ -1,7 +1,7 @@
 // Runtime-operator settings layer (operator 2026-10-20: hot-swap operational knobs with no rebuild).
 // Precedence env > runtime > tool > platform > standard; allowlist + bounds; read fresh each call; never throws.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -51,6 +51,13 @@ describe('runtime settings path', () => {
     const dotdot = `${join(dir, 'links', 'deep')}/../../workspace/.operations/settings/runtime.json`;
     expect(isLiveRuntimeFile(dotdot, { home: fakeHome })).toBe(true);
     expect(runtimeSettingsPath({ env: { [RUNTIME_SETTINGS_ENV]: dotdot }, home: fakeHome })).toBeNull();
+    // …and through a HARD LINK (a different path to the same inode): matched by identity (dev + ino).
+    linkSync(join(fakeHome, 'workspace', '.operations', 'settings', 'runtime.json'), join(dir, 'hard.json'));
+    expect(isLiveRuntimeFile(join(dir, 'hard.json'), { home: fakeHome })).toBe(true);
+    expect(runtimeSettingsPath({ env: { [RUNTIME_SETTINGS_ENV]: join(dir, 'hard.json') }, home: fakeHome })).toBeNull();
+    // A copy (same contents, different inode) is not the live file.
+    writeFileSync(join(dir, 'copy.json'), '{}');
+    expect(isLiveRuntimeFile(join(dir, 'copy.json'), { home: fakeHome })).toBe(false);
     // A `..` that cannot be placed without resolving fails closed; an ordinary temp path is not the live file.
     expect(isLiveRuntimeFile(join(dir, 'nope') + '/missing/../x.json', { home: fakeHome })).toBe(true);
     expect(isLiveRuntimeFile(path, { home: fakeHome })).toBe(false);

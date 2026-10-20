@@ -92,10 +92,14 @@ export function realPathOf(p) {
 }
 const testing = (env) => isUnderTest(env) || isUnderTest(process.env);
 /** True when `p` is (by real path, through any symlink) the host's LIVE runtime file. */
+/** Same file by IDENTITY (device + inode, following symlinks) — catches hard-link aliases a path compare cannot. */
+const sameFile = (a, b) => {
+  try { const x = statSync(a); const y = statSync(b); return x.dev === y.dev && x.ino === y.ino; } catch { return false; }
+};
 export function isLiveRuntimeFile(p, { home = homedir() } = {}) {
   const real = realPathOf(p);
   if (real === null) return true; // unplaceable without resolving — fail closed
-  return [livePath(home), livePath(homedir())].some((l) => realPathOf(l) === real);
+  return [livePath(home), livePath(homedir())].some((l) => realPathOf(l) === real || sameFile(l, p));
 }
 /** Under test, refuse ANY path (env override or explicit argument) that is the live file. */
 const testSafe = (p, env) => (p && testing(env) && isLiveRuntimeFile(p) ? null : p);
