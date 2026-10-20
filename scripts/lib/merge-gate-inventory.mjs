@@ -59,6 +59,8 @@ export const DRAIN_GATES = Object.freeze([
     note: 'manifest-less PR: vacuous (same as the drain); a manifest couple/blockedBy PR needs the drain enqueue clearance → fail closed until wired' },
   { id: 'blocked-by', where: 'merge-gate', input: 'github', signals: [], skipKinds: ['blocked-by'], card: DRAIN_ENQUEUE_WIRING_CARD },
   { id: 'overlap-yield', where: 'enqueue', input: 'github', signals: ['computeOverlapContext'], skipKinds: ['overlap-yield'] },
+  { id: 'card-group', where: 'enqueue', input: 'local-only', signals: [], skipKinds: ['card-grouped'], card: '6532',
+    note: 'open card-group sources and reserved files wait for their combined PR; the combined PR passes every normal landing gate' },
   { id: 'pass-cap', where: 'enqueue', input: 'github', signals: [], skipKinds: ['cap', 'ready-not-reached'] },
   { id: 'ledger', where: 'merge-gate', input: 'ledger', signals: [], skipKinds: [], extra: true,
     note: 'decideLedgerGate (pr-merge-gate.mjs), mode mergeGate.reviewAuthority; `labels` (default) = ledger not consulted, as in the drain' },

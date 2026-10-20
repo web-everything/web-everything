@@ -1391,7 +1391,7 @@ export function watchParkedPrConflicts({
   if (isGhDeferred(listed)) return []; // throttle already logged the skipped pass
   const prs = scopePrsToQueue(listed, { label: 'parked-pr-conflict-watch', ...queueScope });
   const results = [];
-  // xoh8fkw — resolved LAZILY, only once, only when a real write is about to happen (the common empty-sweep tick
+  // xoh8fkw — resolved LAZILY, only once, before the first ownership read or write (the common empty-sweep tick
   // never pays for the extra `gh repo view` call). `defaultListParkedPrs` above works fine with a null `repo`
   // (`gh pr list` derives it from cwd when `--repo` is omitted), but `review-label-provider.mjs`'s own
   // `GH_ARGV.ensureLabel`/`setLabels`/`postComment` always splice `'--repo', repo` into their argv
@@ -1405,10 +1405,11 @@ export function watchParkedPrConflicts({
   // docblock) and was simply never called here.
   let resolvedRepo = repo;
   for (const pr of Array.isArray(prs) ? prs : []) {
+    resolvedRepo ??= provider.currentRepo(); // group ownership needs the default repo before any routing
     // xym8nt4 — a post-approval card group's sources and combined PR belong to the drain's grouping while the
     // group is open: it dissolves the group on a conflict and returns the sources to the normal path, where
     // this watch applies again. A send-back here would strip the combined PR's review instead.
-    if (inCardGroupFn({ num: pr?.number, repo: resolvedRepo || repo, headRef: pr?.headRefName })) continue;
+    if (inCardGroupFn({ num: pr?.number, repo: resolvedRepo, headRef: pr?.headRefName })) continue;
     const parked = isParkedConflictTarget(pr);
     const queued = !parked && isQueuedConflictTarget(pr);
     // #xs81oxb — the THIRD population: neither parked nor queued (no review-workflow label at all). Folded into

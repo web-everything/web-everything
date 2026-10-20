@@ -2,7 +2,8 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync, readdirSync } from 'node:fs';
 import { DRAIN_GATES, GATE_IDS, gateShapedCalls, classifiedCalls, classifiedSkipKinds } from '../merge-gate-inventory.mjs';
-import { SKIP_KINDS } from '../drain-skip-reasons.mjs';
+import { SKIP_KINDS, buildSkipReasons } from '../drain-skip-reasons.mjs';
+import { cardGroupHold } from '../card-group.mjs';
 import { evaluatePrGates } from '../merge-gate-ci.mjs';
 
 describe('drain gate inventory', () => {
@@ -19,6 +20,17 @@ describe('drain gate inventory', () => {
 
   it('exactly classifies every drain skip kind', () => {
     expect([...SKIP_KINDS].sort()).toEqual(classifiedSkipKinds());
+  });
+
+  it('classifies card-group source, reserved-file and unreadable-state holds as enqueue scheduling', () => {
+    const state = { groups: [{ repo: 'o/r', pr: 77, sources: [{ num: 1 }], files: ['backlog/1-card.md'] }] };
+    for (const [s, candidate] of [[state, { num: 1, repo: 'o/r' }],
+      [state, { num: 2, repo: 'o/r', files: ['backlog/1-card.md'] }], [{ unreadable: true }, { num: 3 }]]) {
+      const hold = cardGroupHold(s, candidate);
+      expect(hold.kind).toBe('card-grouped');
+      expect(buildSkipReasons({ verdicts: [{ ...candidate, decision: 'skip', reason: hold.reason }] })[0].kind).toBe(hold.kind);
+    }
+    expect(DRAIN_GATES.find(g => g.skipKinds.includes('card-grouped'))).toMatchObject({ where: 'enqueue', card: '6532' });
   });
 
   it('has unique ids, valid ownership and inputs, and existing tracking cards', () => {

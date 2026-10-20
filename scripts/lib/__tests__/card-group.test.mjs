@@ -430,6 +430,28 @@ describe('createCardGrouping — claim under the land mutex, close on current he
   }
 
   describe('form: admission and eligibility', () => {
+    it.each(['item', 'couple', 'coupleKey'])('keeps an item-resolving or coupled candidate serial (%s)', field => {
+      const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11]), 3: card([1, 2, 12]) });
+      t.verdicts[1][field] = 'xabc123';
+      const r = createCardGrouping({ ...t.opts, statePath: join(tmp(), 's.json'), dryRun: true })
+        .form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      expect(r.plan.sources.map(s => s.num)).toEqual([1, 3]);
+      expect(t.calls.some(c => c.startsWith('pr view 2 '))).toBe(false);
+    });
+
+    it.each(['outcome', 'verdict'])('excludes a sibling repo with a colliding PR number (%s)', foreign => {
+      const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11]), 3: card([1, 2, 12]) });
+      if (foreign === 'outcome') t.outcomes[1].repo = 'sibling/repo';
+      else t.verdicts[1].repo = 'sibling/repo';
+      // A foreign verdict comes first: it must never lend labels/head to the local outcome.
+      t.verdicts.unshift({ ...t.verdicts[0], repo: 'sibling/repo', listedHeadSha: 'f'.repeat(40) });
+      const r = createCardGrouping({ ...t.opts, statePath: join(tmp(), 's.json'), dryRun: true })
+        .form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      expect(r.plan.sources.map(s => s.num)).toEqual([1, 3]);
+      expect(r.plan.sources[0].headSha).toBe(t.heads[1]);
+      expect(t.calls.some(c => c.startsWith('pr view 2 '))).toBe(false);
+    });
+
     it('leaves out a source the admission check refuses, and passes it the judged head', () => {
       const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11]), 3: card([1, 2, 12]) });
       const seen = [];
@@ -616,6 +638,7 @@ describe('createCardGrouping — claim under the land mutex, close on current he
 
     it.each([
       ['combined PR closed unmerged', { combined: { state: 'CLOSED', labels: [] } }, /combined PR closed without merging/, false],
+      ['combined PR conflicts with main', { combined: { state: 'OPEN', labels: waiting, mergeable: 'CONFLICTING' } }, /combined PR conflicts/, true],
       ['sent back: review:changes', { combined: { state: 'OPEN', labels: [{ name: 'review:changes' }] } }, /combined PR sent back \(review:changes\)/, true],
       ['sent back: review:human', { combined: { state: 'OPEN', labels: [{ name: 'review:human' }] } }, /combined PR sent back \(review:human\)/, true],
       ['required check failed', { combined: { state: 'OPEN', labels: accepted, statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }] } }, /combined PR failed the required check/, true],
