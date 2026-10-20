@@ -344,7 +344,7 @@ export function verifyStartBody({ sha, suites, startedAt, treeHash, runId }) {
  *  explicitly and wins. `prev` supplies only `startedAt`/`suites` (audit fields); `base.sha` is a fallback for
  *  legacy callers that pass their own start body as `prev`. */
 /** Classify process termination without inventing an OOM/host-load diagnosis from a signal alone. */
-export function verificationInfrastructureFailure({ exitCode, signal, timedOutPhase, ceilingMs } = {}) {
+export function verificationInfrastructureFailure({ exitCode, signal, timedOutPhase, ceilingMs, killer = 'dispatcher' } = {}) {
   const inferred = Number.isInteger(exitCode) && exitCode > 128
     ? Object.entries(constants.signals).find(([, n]) => n === exitCode - 128)?.[0] : null;
   const killedBy = signal || inferred;
@@ -354,7 +354,7 @@ export function verificationInfrastructureFailure({ exitCode, signal, timedOutPh
     signal: killedBy || 'SIGKILL',
     ...(timedOutPhase ? { phase: timedOutPhase, ceilingMs } : {}),
     detail: timedOutPhase
-      ? `verification infrastructure failure: dispatcher killed the process tree with SIGKILL after the ${ceilingMs}ms ${timedOutPhase}-phase ceiling; no test verdict. Inspect the verify-daemon log before explicitly retrying.`
+      ? `verification infrastructure failure: ${killer} killed the process tree with SIGKILL after the ${ceilingMs}ms ${timedOutPhase}-phase ceiling; no test verdict. Inspect the verify-daemon log before explicitly retrying.`
       : `verification infrastructure failure: ${killedBy}${signal ? '' : ` (shell exit ${exitCode})`}; sender/cause unknown (not proof of OOM or a timeout); no test verdict. Inspect host and verify-daemon logs before explicitly retrying.`,
   };
 }

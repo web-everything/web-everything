@@ -16,7 +16,7 @@
  * LIMIT, stated plainly: a parent killed with SIGKILL runs no handler at all, so its detached children survive.
  * Nothing in-process can cover that case. The timeout still bounds how long they can run.
  */
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 
 /** Default hard ceiling for one child call — generous against a slow real pool, but never "forever". */
 export const DEFAULT_CHILD_TIMEOUT_MS = 5 * 60 * 1000;
@@ -147,4 +147,50 @@ export function runBounded(cmd, args, { timeoutMs = DEFAULT_CHILD_TIMEOUT_MS, en
       else resolvePromise(Buffer.concat(chunks).toString('utf8'));
     });
   });
+}
+
+/**
+ * Every descendant of `rootPid` in a `ps -A -o pid=,ppid=` listing, deepest first (so a kill in this order never
+ * lets a parent respawn a child it has not seen die). Pure. `rootPid` itself is excluded.
+ * @param {number} rootPid
+ * @param {string} psText  `pid ppid` per line
+ * @returns {number[]}
+ */
+export function descendantPids(rootPid, psText) {
+  const children = new Map();
+  for (const line of String(psText || '').split('\n')) {
+    const [pid, ppid] = line.trim().split(/\s+/).map(Number);
+    if (!Number.isInteger(pid) || !Number.isInteger(ppid) || pid === ppid) continue;
+    if (!children.has(ppid)) children.set(ppid, []);
+    children.get(ppid).push(pid);
+  }
+  const out = [];
+  const seen = new Set([rootPid]);
+  const walk = (pid) => {
+    for (const c of children.get(pid) ?? []) {
+      if (seen.has(c)) continue;
+      seen.add(c);
+      walk(c);
+      out.push(c);
+    }
+  };
+  walk(rootPid);
+  return out;
+}
+
+/**
+ * Kill `rootPid` and its whole process TREE (not its process group). For a child that must stay in its parent's
+ * group (so a supervisor's group kill of the parent still reaches it) but must also be killable on its own, e.g.
+ * verify-lane's gate phases (`shell → npm exec → node vitest → esbuild`). Best-effort and synchronous.
+ * @returns {number[]} the pids signalled
+ */
+export function killProcessTree(rootPid, signal = 'SIGKILL', { listProcesses = () => execFileSync('ps', ['-A', '-o', 'pid=,ppid='], { encoding: 'utf8', timeout: 10_000 }), kill = process.kill.bind(process) } = {}) {
+  if (!Number.isInteger(rootPid) || rootPid <= 0) return [];
+  let tree = [];
+  try { tree = descendantPids(rootPid, listProcesses()); } catch { /* ps unavailable: still kill the root */ }
+  const signalled = [];
+  for (const pid of [...tree, rootPid]) {
+    try { kill(pid, signal); signalled.push(pid); } catch { /* already gone */ }
+  }
+  return signalled;
 }

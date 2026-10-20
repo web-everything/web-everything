@@ -108,6 +108,29 @@ describe('verify-lane writer — overlapping-runs race (#2833 finding 1)', () =>
   });
 });
 
+describe('verify-lane — hard per-phase timeout (verify-admission, 2026-10-20)', () => {
+  it('kills a hung gate phase and its whole process tree at phaseTimeoutMs, recording a timeout (never green)', () => {
+    // The gate forks a grandchild that would outlive a plain kill of the shell, then hangs (the 8h42m vitest case).
+    const pidFile = join(dir, 'grandchild.pid');
+    const gateScript = join(dir, 'hang.mjs');
+    writeFileSync(gateScript, `import { spawn } from 'node:child_process';\nimport { writeFileSync } from 'node:fs';\nconst g = spawn('sleep', ['120'], { stdio: 'ignore' });\nwriteFileSync(${JSON.stringify(pidFile)}, String(g.pid));\nsetInterval(() => {}, 1000);\n`);
+    const started = Date.now();
+    const r = spawnSync('node', [VERIFY_LANE, `--gate=node ${gateScript}`, '--json'], { cwd: dir, encoding: 'utf8', timeout: 60_000,
+      env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_PHASE_TIMEOUT_MS: '2000' } });
+    expect(Date.now() - started).toBeLessThan(45_000);
+    expect(r.stderr).toContain('phase timeout 2000ms (phaseTimeoutMs, env)');
+    expect(r.stderr).toMatch(/phase exceeded phaseTimeoutMs=2000 \(env\)/);
+    const json = JSON.parse(r.stdout.trim().split('\n').pop());
+    expect(json.status).not.toBe('green');
+    const onDisk = JSON.parse(readFileSync(marker(), 'utf8'));
+    expect(onDisk.status).not.toBe('green');
+    expect(onDisk.infrastructure).toMatchObject({ reason: 'verify-timeout', ceilingMs: 2000, signal: 'SIGKILL' });
+    expect(onDisk.infrastructure.detail).toContain('verify-lane killed the process tree');
+    const grandchild = Number(readFileSync(pidFile, 'utf8'));
+    expect(() => process.kill(grandchild, 0)).toThrow();
+  }, 70_000);
+});
+
 describe('verify-lane — card-only diff skips the local gate (skipLocalForCardOnly)', () => {
   const git = (...a) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' });
   const verify = (extra = []) => spawnSync('node', [VERIFY_LANE, 'verify', '--json', ...extra], { cwd: dir, encoding: 'utf8', env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot } });

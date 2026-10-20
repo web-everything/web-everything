@@ -89,6 +89,8 @@ import { recordScopeBloatRefresh, noteScopeBloatMarkerFailure } from '../../scri
 // path reachable. The jurors review-loop-cli spawns are the fresh, independent reviewers either way.
 import { parseEscalationReason } from '../../scripts/review-detail.mjs';
 import { dispatchReviewByMode } from '../../scripts/operations/review-job.mjs';
+import { hostLoadAdmission } from '../../scripts/lib/host-load.mjs';
+import { loadHostOverloadSettings } from '../../scripts/lib/host-overload-settings.mjs';
 import { tagReviewRound } from '../../scripts/conveyor/review-round-tag.mjs';
 import { tagReviewStatus } from '../../scripts/conveyor/review-status-tag.mjs';
 import { PR_STATUS_LABEL_RE } from '../../scripts/conveyor/pr-status-label.mjs';
@@ -344,6 +346,11 @@ export function runReviewTick({
   refreshScopeBloat = null,
   postRefreshMarker = null,
   acquirableLanes = () => Infinity,
+  // verify-admission (2026-10-20) — host-level admission for new review sessions: `() => {admitted, reason,
+  // maxPerTick?}`. Not admitted ⇒ nothing is dispatched this tick (every review stays owed: queued, never dropped);
+  // admitted ⇒ at most `maxPerTick` new sessions. The default admits everything so pure-function callers are unchanged;
+  // the real daemon wires {@link defaultReviewHostAdmission} (host load + memory headroom, cascade-sourced).
+  hostAdmission = () => ({ admitted: true, reason: 'not checked', maxPerTick: Infinity }),
   // Pool-exhaustion reporting: `{exhausted({repo, deferred}), recovered(repo)}` (see
   // `we:scripts/conveyor/pool-exhaustion.mjs`). `null` (the default) keeps every existing test byte-identical;
   // the real daemon wires a logger that says WHY the pool is empty once per episode, never a silent skip.
@@ -539,8 +546,15 @@ export function runReviewTick({
   // path — it is the SAME deferred-not-lost shape `deferredForLanes` already models, just for a different cause.
   const lanes = paused ? 0 : acquirableLanes({ repo });
   const acquirable = Math.max(0, (Array.isArray(lanes) ? lanes.length : Number(lanes)) || 0);
-  const dispatchable = reviews.slice(0, Math.min(reviews.length, acquirable));
-  const deferredForLanes = paused ? 0 : reviews.length - dispatchable.length;
+  let host = { admitted: true, maxPerTick: Infinity };
+  if (!paused && reviews.length) {
+    try { host = hostAdmission() ?? host; } catch (e) { host = { admitted: false, reason: `host admission unknown: ${String(e?.message ?? e).split('\n')[0]}` }; }
+  }
+  const hostLimit = host.admitted ? (Number.isFinite(host.maxPerTick) && host.maxPerTick >= 1 ? host.maxPerTick : Infinity) : 0;
+  const dispatchable = reviews.slice(0, Math.min(reviews.length, acquirable, hostLimit));
+  const deferredForHost = !paused && !host.admitted ? reviews.length : 0;
+  if (deferredForHost) process.stderr.write(`review-daemon: ${deferredForHost} owed review(s) queued, not dispatched — ${host.reason}\n`);
+  const deferredForLanes = paused || deferredForHost ? 0 : reviews.length - dispatchable.length;
   const deferredForAuth = paused ? reviews.length - dispatchable.length : 0;
   if (poolExhaustion && !paused) {
     try {
@@ -656,7 +670,7 @@ export function runReviewTick({
     pendingNotDispatched: explainPendingNotDispatched({
       prs: rawPrs, plan, dispatchable, deferredForLanes: reviews.slice(dispatchable.length), paused,
     }),
-    reconcileError: null, deferredForLanes, deferredForAuth, operatorHolds, staleStatusSwept, staleConflictStatusCleared,
+    reconcileError: null, deferredForLanes, deferredForAuth, deferredForHost, operatorHolds, staleStatusSwept, staleConflictStatusCleared,
     authPaused: paused, authPauseReason: paused ? pauseReason : null,
     holdReconcile: holdReconcileResults, holdReconcileError,
     ...(scopeBloatRefreshed.length ? { scopeBloatRefreshed } : {}),
@@ -1068,6 +1082,17 @@ export function priorityNamesForLiveProcessPrs(liveProcessPrs) {
   return names;
 }
 
+/** verify-admission (2026-10-20) — the real daemon's review host admission: the shared background-work check
+ *  (we:scripts/lib/host-load.mjs — host load per core, then free memory + swap headroom) plus the per-tick
+ *  dispatch cap, all from the host-overload cascade (sources logged by the loader). Fails closed: an unreadable
+ *  policy or host reading admits nothing, so owed reviews wait for the next tick. */
+export function defaultReviewHostAdmission({ env = process.env, admission = hostLoadAdmission, loadPolicy = loadHostOverloadSettings } = {}) {
+  let policy;
+  try { policy = loadPolicy({ env }); } catch (e) { return { admitted: false, reason: `host policy unreadable: ${String(e?.message ?? e).split('\n')[0]}` }; }
+  const verdict = admission({ policy, env, interactive: false });
+  return { ...verdict, maxPerTick: policy.settings.host.maxReviewDispatchPerTick };
+}
+
 export function buildCliDaemonEffects({
   owner, intervalMs = DEFAULT_INTERVAL_MS, log = console,
   reapSessions = defaultReapSessions,
@@ -1085,6 +1110,7 @@ export function buildCliDaemonEffects({
     return runReviewTickAllRepos({
       log: line => log.error(line),
       acquirableLanes: defaultAcquirableLaneNumbers, readPrs: defaultReadPrs, readAgents: defaultReadAgents,
+      hostAdmission: defaultReviewHostAdmission,
       poolExhaustion: DAEMON_POOL_EXHAUSTION,
       refreshScopeBloat: refreshScopeBloatedPr,
       postRefreshMarker: defaultPostRebaseComment,

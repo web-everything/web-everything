@@ -1,4 +1,4 @@
-import { it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -197,9 +197,9 @@ it('host policy regression: preference files merge per leaf and canonical confli
     lanes: { transcripts: { explicitScan: false }, gc: { schedule: 60000 } } },
   { host: { maxWaitMs: 250 }, lanes: { gc: { schedule: 120000 } } });
   const policy = loadHostOverloadSettings(opts);
-  expect(policy.settings).toEqual({ host: { maxLoadPerCore: 0.5, maxWaitMs: 250 },
+  expect(policy.settings).toEqual({ host: { maxLoadPerCore: 0.5, maxWaitMs: 250, minMemoryHeadroomMb: 2048, maxReviewDispatchPerTick: 2 },
     lanes: { transcripts: { explicitScan: false }, gc: { schedule: 120000 } } });
-  expect(Object.values(policy.sources)).toEqual(['platform', 'platform', 'platform', 'platform']);
+  expect(Object.values(policy.sources)).toEqual(['platform', 'platform', 'standard', 'standard', 'platform', 'platform']);
   expect(hostLoadAdmission({ ...opts, interactive: false, load: () => [1], cores: () => 1 }).admitted).toBe(false);
 });
 
@@ -361,4 +361,33 @@ it('gc refuses concurrent passes and host overload before spawning git', async (
   } });
   expect(nested.reason).toMatch(/busy/);
   expect(exec).not.toHaveBeenCalled();
+});
+
+describe('memory-aware host admission (verify-admission, 2026-10-20)', () => {
+  const policy = { settings: { host: { maxLoadPerCore: 2, minMemoryHeadroomMb: 2048 } }, sources: { 'host.maxLoadPerCore': 'standard', 'host.minMemoryHeadroomMb': 'standard' } };
+  it('waits (not admitted) when free memory + swap headroom is below host.minMemoryHeadroomMb, and logs the source', async () => {
+    const { hostLoadAdmission } = await import('../lib/host-load.mjs');
+    const low = hostLoadAdmission({ policy, interactive: false, load: () => [1], cores: () => 12, memory: () => 1785 });
+    expect(low).toMatchObject({ admitted: false });
+    expect(low.reason).toContain('host memory headroom 1785MB (free+swap); host.minMemoryHeadroomMb=2048 (standard)');
+    expect(hostLoadAdmission({ policy, interactive: false, load: () => [1], cores: () => 12, memory: () => 4096 }).admitted).toBe(true);
+    // Unknown memory fails closed.
+    expect(hostLoadAdmission({ policy, interactive: false, load: () => [1], cores: () => 12, memory: () => { throw Error('no vm_stat'); } }).admitted).toBe(false);
+    expect(hostLoadAdmission({ policy, interactive: false, load: () => [1], cores: () => 12, memory: () => NaN }).admitted).toBe(false);
+  });
+  it('parses macOS vm_stat + swapusage without counting the inactive file cache', async () => {
+    const { parseDarwinMemoryHeadroomMb } = await import('../lib/host-load.mjs');
+    const vm = 'Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                   39424.\nPages active:  1.\nPages inactive:                               793701.\nPages speculative:                             0.\nPages purgeable:                                0.\n';
+    expect(Math.round(parseDarwinMemoryHeadroomMb(vm, 'vm.swapusage: total = 6144.00M  used = 4974.94M  free = 1169.06M  (encrypted)'))).toBe(616 + 1169);
+    expect(() => parseDarwinMemoryHeadroomMb('garbage', '')).toThrow();
+  });
+  it('the cascade carries both new leaves with sources, and rejects a 0 (cannot switch the check off)', async () => {
+    const { resolveHostOverloadSettings } = await import('../lib/host-overload-settings.mjs');
+    const log = vi.fn();
+    const p = resolveHostOverloadSettings({ env: { WE_HOST_MIN_MEMORY_HEADROOM_MB: '3000' }, log });
+    expect(p.settings.host).toMatchObject({ minMemoryHeadroomMb: 3000, maxReviewDispatchPerTick: 2 });
+    expect(log.mock.calls.flat().join(' ')).toMatch(/host\.minMemoryHeadroomMb=3000 \(env/);
+    expect(() => resolveHostOverloadSettings({ env: { WE_HOST_MIN_MEMORY_HEADROOM_MB: '0' }, log })).toThrow();
+    expect(() => resolveHostOverloadSettings({ env: { WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK: '0' }, log })).toThrow();
+  });
 });

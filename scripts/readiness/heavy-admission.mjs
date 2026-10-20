@@ -145,7 +145,7 @@ import { DEFAULT_HOST_MAX_WAIT_MS, loadHostOverloadSettings } from '../lib/host-
 import { LEGACY_SETTINGS_PATH, readDeclaredSettings } from '../lib/settings-files.mjs';
 import { cutoverDecision, loadResourceGateSettings } from '../lib/resource-gate.mjs';
 import { LEASE_FILENAME, isLeaseStale } from '../lib/lane-lease.mjs';
-import { reserve, releaseLockDir, readLockEntry } from './file-locks.mjs';
+import { reserve, releaseLockDir, readLockEntry, heartbeatOwn } from './file-locks.mjs';
 import { defaultPoolRoot, guardedPoolRoot, workspaceFor } from '../lib/lane-pool-paths.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
@@ -826,6 +826,25 @@ export function releaseOwnedSlot({ lockRoot, cap, owner, pid = process.pid, fast
     return { released: true, slot: ownerOnlyFallback };
   }
   return { released: false, slot: null };
+}
+
+/**
+ * Refresh the lease of the slot THIS process holds (verify-admission). The slot lease (ADMISSION_LEASE_MINUTES)
+ * used to be a fixed TTL with no refresh, so a gate still running past it lost its slot to the next waiter
+ * (`reclaimDecision` reclaims an expired lease even when the holder is alive) and kept running UNSLOTTED and
+ * invisible to `heavy-queue` - the cap stopped holding. An async holder (verify-lane spawns its gate with
+ * `spawn`, not `execSync`) can heartbeat; its run is bounded separately by verify-lane's per-phase timeout, so a
+ * refreshed lease can never keep a hung run's slot forever. Only a slot whose entry names this owner AND this
+ * pid is refreshed (a sibling same-owner process's slot is never touched). Uses `heartbeatOwn`, which never
+ * rewrites `lock.json`. Returns the refreshed slot index, or null when this process holds none.
+ */
+export function heartbeatOwnedSlot({ lockRoot, cap, owner, pid = process.pid, nowIso = new Date().toISOString(), fastSlots = resolveSlotSpan({ ...loadAdmissionPolicy({ env: process.env }).settings, cap }) - cap }) {
+  for (let i = 0; i < cap + fastSlots; i++) {
+    const entry = readLockEntry(lockRoot, slotPath(i));
+    if (!entry || entry.owner !== owner || entry.pid !== pid) continue;
+    return heartbeatOwn(lockRoot, slotPath(i), owner, nowIso) ? i : null;
+  }
+  return null;
 }
 
 /** Read-only snapshot of every slot's holder, for `status` / observability. */

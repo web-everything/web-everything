@@ -186,6 +186,11 @@ export function verifySetting(key, env, fileConfig = defaultFileConfig) {
   return resolveVerifySettings({ fileConfig, env }).values[key];
 }
 
+/** Where {@link verifySetting}'s value came from: 'env' | 'file' | 'default' (for the logged-source lines). */
+export function verifySettingSource(key, env, fileConfig = defaultFileConfig) {
+  return resolveVerifySettings({ fileConfig, env }).sources[key];
+}
+
 /** The timeout factor a stamped gate command was composed with (`--testTimeout=N`), or 1 when it carries none. */
 export function stampedTimeoutFactor(gate) {
   const match = /--testTimeout=(\d+)(?:\s|$)/.exec(String(gate ?? ''));
