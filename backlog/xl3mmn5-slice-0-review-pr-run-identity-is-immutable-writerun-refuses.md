@@ -1,18 +1,17 @@
 ---
-bornAs: xukmjgl
+bornAs: xl3mmn5
 kind: story
 size: 3
-parent: "6629"
+parent: "x5wqxb3"
 status: open
-blockedBy: ["6631"]
-scope: ["we:scripts/lib/drain-red-team-evidence.mjs", "we:scripts/lib/saved-red-team-provenance.mjs", "we:scripts/lib/drain-saved-red-team.mjs", "we:scripts/lib/review-run-index.mjs"]
+scope: ["we:scripts/operations/run-store.mjs", "we:scripts/operations/cli-adapter.mjs", "we:scripts/operations/review-loop-cli.mjs", "we:scripts/operations/__tests__/run-store.test.mjs"]
 dateOpened: "2026-10-20"
 tags: []
 ---
 
-# Slice 2: switch the red-team evidence reader to the identity index behind a cascade setting
+# Slice 0: review-pr run identity is immutable (writeRun refuses a repo/PR change, no symlinked runs, safe legacy migration)
 
-Epic 6629. Blocked on an operator ruling (Option A on the epic): a PR's red-team evidence depends only on that PR's records, with a loud store-health alarm on any corrupt review-pr record. Adds the cascade setting redTeam.reviewRunIndexReader (standard shadow, then on), logged with its source each pass, plus the writer fence: it falls back to a full scan unless every live daemon build includes slice 0. It switches only after a mismatch-free shadow soak. Proof: live mergeCascade pass seconds before/after and a Codex guard verdict. Delivery mode: prototype.
+Prerequisite for the identity index (epic x5wqxb3), correct on its own. Today a fresh invocation with an existing --run-id overwrites a review-pr record with a different repo/PR unchecked, migrateLegacyRuns renames records in without writeRun (exists-then-rename overwrite race), and writeJsonAtomic follows symlinked run paths. Make writeRun refuse an input.repo/input.pr change for an existing review-pr id, refuse symlinked run paths, and route migration through the same check with no overwrite. Delivery mode: pr.
 
 ## Acceptance
 

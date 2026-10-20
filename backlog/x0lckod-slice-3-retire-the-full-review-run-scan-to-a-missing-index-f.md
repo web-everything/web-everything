@@ -1,18 +1,18 @@
 ---
-bornAs: xbyg4e4
+bornAs: x0lckod
 kind: story
-size: 5
-parent: "6629"
+size: 2
+parent: "x5wqxb3"
 status: open
-blockedBy: ["6630"]
-scope: ["we:scripts/operations/run-store.mjs", "we:scripts/lib/review-run-index.mjs", "we:scripts/lib/drain-red-team-evidence.mjs", "we:scripts/lib/saved-red-team-provenance.mjs", "we:scripts/lib/__tests__/review-run-index.test.mjs"]
+blockedBy: ["xukmjgl"]
+scope: ["we:scripts/lib/drain-red-team-evidence.mjs", "we:scripts/lib/saved-red-team-provenance.mjs", "we:scripts/lib/review-run-index.mjs", "we:scripts/conveyor/review-referral-hold.mjs"]
 dateOpened: "2026-10-20"
 tags: []
 ---
 
-# Slice 1: writer publishes review-run identity entries, backfill, and a shadow indexed reader
+# Slice 3: retire the full review-run scan to a missing-index fallback only
 
-Epic 6629. writeRun publishes a per-run identity entry (claim via temp+link, fsynced, before the record's first rename). A one-shot backfill indexes existing review-pr records. A shadow indexed reader runs beside the full scan in readDrainRedTeamEvidence and verifySavedRedTeamProvenance: the full-scan answer stays authoritative, and each pass logs mismatches, unindexed count and timing. Shadow errors are isolated. Proof: live per-call ms and zero mismatches across every ready PR. Delivery mode: shadow.
+Epic x5wqxb3. Delete the shadow comparison. The full scan stays only for a missing or unreadable index directory. Optionally move review-referral-hold's own mtime/size projection cache (same race class) onto the index. Delivery mode: pr.
 
 ## Acceptance
 
