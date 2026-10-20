@@ -195,7 +195,7 @@ import { readGithubAuthPolicy, personalAllowed } from './github-auth-policy.mjs'
 export { isGhDeferred, isGhThrottled } from './gh-deferred.mjs';
 import { markPrSnapshotDirty, repoFromGhArgs } from './pr-snapshot-store.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
-import { readDeclaredSettings } from './settings-files.mjs';
+import { SETTINGS_DIR } from './settings-files.mjs';
 import { resolveFinishedCiCacheSettings, finishedCiAuthScope, classifyFinishedCiRead, finishedCiCacheable, finishedCiStorable, finishedCiProofArgs, recordFinishedCiProof, finishedCiCacheGeneration, lookupFinishedCi, storeFinishedCi, invalidateForWrite } from './finished-ci-cache.mjs';
 
 // ── TUNING (env-overridable, mirroring heavy-admission.mjs's own resolve*() convention) ────────────────────
@@ -570,24 +570,26 @@ export const GH_SLOT_WAIT_STANDARD = Object.freeze({
 export const GH_SLOT_WAIT_MAX_MS = 120000;
 const validSlotWaitMs = n => Number.isInteger(n) && n >= 0 && n <= GH_SLOT_WAIT_MAX_MS;
 
-// The tool layer (scripts/settings/*.json → ghThrottleSlotWait) is read at most every 30 s per process: this resolver
-// runs on every gh call.
-const SLOT_WAIT_TOOL_TTL_MS = 30_000;
-let slotWaitToolCache = null;
-function slotWaitToolBlock() {
-  const now = Date.now();
-  if (!slotWaitToolCache || now - slotWaitToolCache.at > SLOT_WAIT_TOOL_TTL_MS) {
-    let block;
-    try { block = readDeclaredSettings().settings?.ghThrottleSlotWait; } catch { block = undefined; }
-    slotWaitToolCache = { at: now, block };
-  }
-  return slotWaitToolCache.block;
+// The TOOL layer contributes ONLY `callerWaitMs`, read fresh from scripts/settings/gh-throttle.json on each resolve
+// (one small file, like the platform file the cascade already reads per call). Every other ghThrottleSlotWait leaf
+// (class lists, onSlotTimeout, backgroundWaitMs) stays standard/platform/env exactly as on main.
+export const GH_SLOT_WAIT_TOOL_FILE = join(SETTINGS_DIR, 'gh-throttle.json');
+function slotWaitToolBlock(path = GH_SLOT_WAIT_TOOL_FILE) {
+  try {
+    const block = JSON.parse(readFileSync(path, 'utf8'))?.ghThrottleSlotWait;
+    return pickToolCallerWait(block);
+  } catch { return undefined; }
 }
+const pickToolCallerWait = block => (block && typeof block === 'object' && !Array.isArray(block) && block.callerWaitMs !== undefined
+  ? { callerWaitMs: block.callerWaitMs } : undefined);
+const allStandardSources = () => Object.fromEntries(Object.keys(GH_SLOT_WAIT_STANDARD).map(k => [k, 'standard']));
 
 export function resolveGhSlotWait(env = process.env, { tool } = {}) {
+  // A null / non-object input names no configuration at all: the pure standard, no file layers.
+  if (!env || typeof env !== 'object') return { ...GH_SLOT_WAIT_STANDARD, source: allStandardSources() };
   try {
     const raw = env?.WE_GH_THROTTLE_BACKGROUND_WAIT_MS;
-    const r = cascadePolicy('ghThrottleSlotWait', tool !== undefined ? tool : slotWaitToolBlock(), {
+    const r = cascadePolicy('ghThrottleSlotWait', tool !== undefined ? pickToolCallerWait(tool) : slotWaitToolBlock(), {
       env, standard: GH_SLOT_WAIT_STANDARD,
       envValues: {
         backgroundWaitMs: raw != null && String(raw).trim() !== '' ? Number(raw) : undefined,
@@ -603,13 +605,13 @@ export function resolveGhSlotWait(env = process.env, { tool } = {}) {
     });
     return { ...GH_SLOT_WAIT_STANDARD, ...(r.value || {}), source: r.sources || {} };
   } catch {
-    return { ...GH_SLOT_WAIT_STANDARD, source: Object.fromEntries(Object.keys(GH_SLOT_WAIT_STANDARD).map(k => [k, 'standard'])) };
+    return { ...GH_SLOT_WAIT_STANDARD, source: allStandardSources() };
   }
 }
 
 /**
  * PURE: the slot wait (ms) for one call, with the layer it came from. Priority calls keep `acquireTimeoutMs`; a
- * background call takes the first matching `callerWaitMs` entry (valid leaves only — the cascade already dropped
+ * background call takes an env `WE_GH_THROTTLE_BACKGROUND_WAIT_MS` when set, else the first matching `callerWaitMs` entry (valid leaves only — the cascade already dropped
  * invalid ones; a non-object block or a malformed regex is skipped), else `backgroundWaitMs`.
  * @returns {{waitMs:number, source:string, key:string}}
  */
@@ -617,7 +619,9 @@ export function ghSlotWaitMs({ caller, waitClass, settings = GH_SLOT_WAIT_STANDA
   if (waitClass !== 'background') return { waitMs: acquireTimeoutMs, source: 'acquireTimeoutMs', key: 'acquireTimeoutMs' };
   const name = normalizeGhCaller(caller);
   const map = settings?.callerWaitMs;
-  if (map && typeof map === 'object' && !Array.isArray(map)) {
+  // The env override (highest layer) of backgroundWaitMs wins over every lower-layer per-caller wait.
+  const envWins = settings?.source?.backgroundWaitMs === 'env';
+  if (!envWins && map && typeof map === 'object' && !Array.isArray(map)) {
     for (const [pattern, ms] of Object.entries(map)) {
       if (!validSlotWaitMs(ms)) continue;
       let hit = false;

@@ -136,10 +136,28 @@ describe('per-caller background slot wait (callerWaitMs cascade, operator 2026-1
     const settings = resolveGhSlotWait(absent(), { tool: { callerWaitMs: { '.*': 0 } } });
     expect(ghSlotWaitMs({ caller: 'review-daemon.mjs', waitClass: 'priority', settings, acquireTimeoutMs: 120000 }).waitMs).toBe(120000);
   });
-  it('null input still resolves (no throw) and keeps every standard leaf', () => {
-    expect(() => resolveGhSlotWait(null, { tool: null })).not.toThrow();
-    expect(resolveGhSlotWait(null, { tool: null })).toMatchObject(GH_SLOT_WAIT_STANDARD);
+  it('null input is exactly the standard (no file layers): no caller override survives', () => {
+    const standardSources = Object.fromEntries(Object.keys(GH_SLOT_WAIT_STANDARD).map(k => [k, 'standard']));
+    for (const input of [null, 'x', 0]) {
+      expect(resolveGhSlotWait(input)).toEqual({ ...GH_SLOT_WAIT_STANDARD, source: standardSources });
+    }
+    expect(resolveGhSlotWait(null).callerWaitMs).toEqual({});
+    expect(ghSlotWaitMs({ caller: CONFLICT, waitClass: 'background', settings: resolveGhSlotWait(null) }).waitMs).toBe(8000);
     expect(ghSlotWaitMs({ caller: null, waitClass: 'background', settings: null })).toEqual({ waitMs: 8000, source: 'standard', key: 'backgroundWaitMs' });
+  });
+  it('the env background wait (highest layer) still wins over the tool caller wait', () => {
+    for (const [raw, ms] of [['0', 0], ['5000', 5000]]) {
+      const settings = resolveGhSlotWait({ ...absent(), WE_GH_THROTTLE_BACKGROUND_WAIT_MS: raw });
+      expect(ghSlotWaitMs({ caller: CONFLICT, waitClass: 'background', settings })).toEqual({ waitMs: ms, source: 'env', key: 'backgroundWaitMs' });
+    }
+  });
+  it('the tool layer contributes ONLY callerWaitMs: class lists, onSlotTimeout and backgroundWaitMs stay as on main', () => {
+    const settings = resolveGhSlotWait(absent(), { tool: { onSlotTimeout: 'ungated', backgroundWaitMs: 120000,
+      priorityCallers: ['^lane-pool-health-watch'], backgroundCallers: [], callerWaitMs: { '^parked-pr-conflict-watch': 120000 } } });
+    expect(settings).toMatchObject({ onSlotTimeout: 'throttled', backgroundWaitMs: 8000,
+      priorityCallers: GH_SLOT_WAIT_STANDARD.priorityCallers, backgroundCallers: GH_SLOT_WAIT_STANDARD.backgroundCallers });
+    expect(settings.source).toMatchObject({ onSlotTimeout: 'standard', backgroundWaitMs: 'standard', priorityCallers: 'standard', backgroundCallers: 'standard' });
+    expect(ghSlotWaitClass({ caller: 'lane-pool-health-watch-we', args: READ, settings })).toBe('background');
   });
   it('a full pool makes the conflict watch wait its 120 s tool budget and records the wait source', () => {
     const f = fullPool(CONFLICT);
