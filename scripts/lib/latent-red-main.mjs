@@ -21,7 +21,7 @@ import { readFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { parseVitestFailures } from '../conveyor/main-ci-red-core.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
-import { writeJsonAtomic } from './atomic-json-file.mjs';
+import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { isGhDeferred } from './gh-deferred.mjs';
 
 export const CI_WORKFLOW_PATH = '.github/workflows/ci.yml';
@@ -43,13 +43,24 @@ export function normalizeRun(r) {
     headBranch: r.head_branch, headSha: r.head_sha, event: r.event, attempt: r.run_attempt, workflowName: r.name, path: r.path };
 }
 
-/** IO: CI runs for one event (newest first), filtered to the workflow path. Throws on an unreadable read. */
+const MAX_RUN_PAGES = 5;
+/**
+ * IO: CI runs for one event (newest first), filtered to the workflow path. The REST list spans every workflow, so it
+ * pages (bounded) until `limit` CI rows are collected or the list ends. Throws on an unreadable read and when the
+ * page budget runs out first (fail closed: an incomplete sample is never returned as complete).
+ */
 export function listCiRuns({ repo, exec, event, branch, limit = 30, workflowPath = CI_WORKFLOW_PATH }) {
-  const qs = [`event=${encodeURIComponent(event)}`, `per_page=100`, ...(branch ? [`branch=${encodeURIComponent(branch)}`] : [])].join('&');
-  const page = ghJson(exec, ['api', `repos/${repo}/actions/runs?${qs}`]);
-  if (!Array.isArray(page?.workflow_runs)) throw new Error('actions runs read returned no list');
-  return page.workflow_runs.filter((r) => r?.path === workflowPath).map(normalizeRun)
-    .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)).slice(0, limit);
+  const rows = [];
+  for (let pageNo = 1; ; pageNo += 1) {
+    const qs = [`event=${encodeURIComponent(event)}`, `per_page=100`, ...(branch ? [`branch=${encodeURIComponent(branch)}`] : []), ...(pageNo > 1 ? [`page=${pageNo}`] : [])].join('&');
+    const page = ghJson(exec, ['api', `repos/${repo}/actions/runs?${qs}`]);
+    if (!Array.isArray(page?.workflow_runs)) throw new Error('actions runs read returned no list');
+    rows.push(...page.workflow_runs.filter((r) => r?.path === workflowPath).map(normalizeRun));
+    const more = page.workflow_runs.length === 100 && (!Number.isInteger(page.total_count) || pageNo * 100 < page.total_count);
+    if (rows.length >= limit || !more) break;
+    if (pageNo >= MAX_RUN_PAGES) throw new Error(`only ${rows.length} of ${limit} CI runs within ${MAX_RUN_PAGES} pages`);
+  }
+  return rows.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)).slice(0, limit);
 }
 
 /** IO: merge-group CI runs (newest first). The fix for the empty `gh run list --workflow --event merge_group`. */
@@ -96,7 +107,7 @@ export function detectLatentRedMain({ runs, failuresOf, threshold }) {
   let common = null;
   for (const r of streak) {
     const tests = failuresOf(r);
-    if (!Array.isArray(tests) || !tests.length) return { fire: false, reason: `run ${r.databaseId} has no readable failing test` };
+    if (!Array.isArray(tests) || !tests.length) return { fire: false, unknown: true, reason: `run ${r.databaseId} has no readable failing test` };
     common = common ? common.filter((t) => tests.includes(t)) : [...new Set(tests)];
     if (!common.length) return { fire: false, reason: 'the failed merge-group runs share no failing test' };
   }
@@ -105,58 +116,115 @@ export function detectLatentRedMain({ runs, failuresOf, threshold }) {
 }
 
 export function latentRedMainPath(env = process.env) { return join(resolveCoordinationRoot({ env }), 'latent-red-main.json'); }
+/** `{}` when absent; null when present but unreadable or malformed (callers fail closed: no re-run). */
 function readLedger(path) {
-  try { const o = JSON.parse(readFileSync(path, 'utf8')); return o && typeof o === 'object' && !Array.isArray(o) ? o : {}; } catch { return {}; }
+  let text;
+  try { text = readFileSync(path, 'utf8'); } catch (e) { return e?.code === 'ENOENT' ? {} : null; }
+  try { const o = JSON.parse(text); return o && typeof o === 'object' && !Array.isArray(o) ? o : null; } catch { return null; }
 }
+const NO_FIRE_TTL_MS = 30 * 60_000;
+const MAX_RERUN_ATTEMPTS = 3;
+const MERGE_GROUP_SAMPLE = 15;
 
 /**
- * IO shell. Never throws. Once per main tip sha: re-run main tip's GREEN CI push run (a completed red / running run
- * is already the red-main machinery's) and publish one needs-you event.
+ * IO shell. Never throws. Once per main tip sha (durable record under a file lock): re-run main tip's GREEN CI push
+ * run and publish one needs-you event. An unreadable ledger never re-runs (needs-you only). A re-run is recorded as
+ * done only after the request succeeds; a refused request is retried at most MAX_RERUN_ATTEMPTS times in all; a
+ * reservation whose outcome is unknown (process died mid-request) is never re-issued.
  * @returns {{fired:boolean, action:string, detail?:object}}
  */
 export function runLatentRedMainCheck({ repo, exec, threshold, source = 'standard', dryRun = false, now = Date.now(),
-  ledgerPath = latentRedMainPath(), publish = null, log = (l) => process.stderr.write(`${l}\n`) }) {
+  ledgerPath = latentRedMainPath(), publish = null, log = (l) => process.stderr.write(`${l}\n`), lock = withFileLock }) {
+  const say = (line) => { try { log(line); } catch { /* logging never breaks a drain pass */ } };
   const setting = `drain.latentRedMainRuns=${threshold} (${source})`;
+  const publishOnce = (item) => {
+    try { (publish ?? defaultPublish)(item); return true; }
+    catch (e) { say(`latent-red-main: needs-you publish failed (${String(e?.message || e).split('\n')[0]})`); return false; }
+  };
   try {
     if (!(threshold > 0)) return { fired: false, action: 'off' };
-    const runs = listMergeGroupCiRuns({ repo, exec });
-    const ledger = readLedger(ledgerPath);
-    const head = runs.filter((r) => r.status === 'completed').slice(0, threshold * 3).map((r) => r.databaseId).join(',');
-    if (!dryRun && ledger.lastNoFire?.head === head) return { fired: false, action: 'unchanged' };
+    if (!dryRun) mkdirSync(dirname(ledgerPath), { recursive: true });
+    const runs = listMergeGroupCiRuns({ repo, exec, limit: Math.max(MERGE_GROUP_SAMPLE, threshold * 3) });
+    const head = runs.filter((r) => r.status === 'completed').slice(0, threshold * 3)
+      .map((r) => `${r.databaseId}:${r.attempt}:${r.status}:${r.conclusion}`).join(',');
+    const peek = readLedger(ledgerPath);
+    if (!dryRun && peek?.lastNoFire?.head === head && now - peek.lastNoFire.at < NO_FIRE_TTL_MS) return { fired: false, action: 'unchanged' };
     const det = detectLatentRedMain({ runs, threshold, failuresOf: (r) => readRunFailingTests({ repo, exec, runId: r.databaseId }) });
     if (!det.fire) {
-      if (!dryRun) { mkdirSync(dirname(ledgerPath), { recursive: true }); writeJsonAtomic(ledgerPath, { ...ledger, lastNoFire: { head, at: now, reason: det.reason } }); }
+      // Only a definitive answer is cached; unreadable evidence is re-read next pass.
+      if (!dryRun && !det.unknown && peek) {
+        lock(`${ledgerPath}.lock`, () => {
+          const cur = readLedger(ledgerPath);
+          if (cur) { mkdirSync(dirname(ledgerPath), { recursive: true }); writeJsonAtomic(ledgerPath, { ...cur, lastNoFire: { head, at: now, reason: det.reason } }); }
+        });
+      }
       return { fired: false, action: 'no-signal', detail: det };
     }
     const tipSha = ghText(exec, ['api', `repos/${repo}/commits/main`, '--jq', '.sha']).trim();
     if (!/^[0-9a-f]{40}$/.test(tipSha)) throw new Error('main tip unreadable');
     const what = `${det.reason} (runs ${det.runIds.join(', ')}; groups ${det.prs.map((n) => `#${n}`).join(' ')}): ${det.tests.slice(0, 3).join(' | ')}`;
-    if (ledger.acted?.[tipSha]) return { fired: true, action: 'already-acted', detail: { ...det, tipSha } };
     const tipRun = listCiRuns({ repo, exec, event: 'push', branch: 'main', limit: 10 }).find((r) => r.headSha === tipSha) ?? null;
     let action;
     if (!tipRun) action = 'no-main-run';
     else if (tipRun.status !== 'completed') action = 'main-run-in-progress';
     else if (tipRun.conclusion !== 'success') action = 'main-already-red';
     else action = 'rerun-main';
-    log(`latent-red-main: ${what} — main tip ${tipSha.slice(0, 9)} CI run ${tipRun?.databaseId ?? 'none'} is ${tipRun ? `${tipRun.status}/${tipRun.conclusion}` : 'missing'} → ${dryRun ? 'DRY RUN, would ' : ''}${action} — ${setting}`);
-    if (dryRun) return { fired: true, action, detail: { ...det, tipSha, tipRun: tipRun?.databaseId ?? null } };
-    let rerun = null;
-    if (action === 'rerun-main') {
-      try { ghText(exec, ['run', 'rerun', String(tipRun.databaseId), '--repo', repo]); rerun = 'requested'; }
-      catch (e) { rerun = `failed: ${String(e?.message || e).split('\n')[0].slice(0, 200)}`; }
-      log(`latent-red-main: re-run of main CI run ${tipRun.databaseId} ${rerun} (source: merge-group failure streak; ${setting})`);
+    const item = (rerun) => ({ repo, pr: 0, head: `latent-red-main:${tipSha}`, kind: 'latent-red-main',
+      reason: `main ${tipSha.slice(0, 9)} looks latently red: ${what}; main CI re-run ${rerun}` });
+    if (dryRun) {
+      say(`latent-red-main: ${what} — main tip ${tipSha.slice(0, 9)} CI run ${tipRun?.databaseId ?? 'none'} is ${tipRun ? `${tipRun.status}/${tipRun.conclusion}` : 'missing'} → DRY RUN, would ${action} — ${setting}`);
+      return { fired: true, action, detail: { ...det, tipSha, tipRun: tipRun?.databaseId ?? null } };
     }
-    try {
-      (publish ?? defaultPublish)({ repo, pr: 0, head: `latent-red-main:${tipSha}`, kind: 'latent-red-main',
-        reason: `main ${tipSha.slice(0, 9)} looks latently red: ${what}; main CI re-run ${rerun ?? `not issued (${action})`}` });
-    } catch (e) { log(`latent-red-main: needs-you publish failed (${String(e?.message || e).split('\n')[0]})`); }
-    // A failed re-run request is retried on the next pass (the needs-you feed dedups the event by its key).
-    if (rerun?.startsWith('failed')) return { fired: true, action, detail: { ...det, tipSha, rerun } };
-    mkdirSync(dirname(ledgerPath), { recursive: true });
-    writeJsonAtomic(ledgerPath, { ...ledger, acted: { ...(ledger.acted || {}), [tipSha]: { at: now, action, rerun, runIds: det.runIds, tests: det.tests.slice(0, 5), mainRun: tipRun?.databaseId ?? null } } });
+    // Nothing to probe yet (no run / still running): decide again next pass, record nothing.
+    if (action === 'no-main-run' || action === 'main-run-in-progress') {
+      say(`latent-red-main: ${what} — main tip ${tipSha.slice(0, 9)} CI ${action}; re-checked next pass — ${setting}`);
+      return { fired: true, action, detail: { ...det, tipSha } };
+    }
+    // Reserve the attempt durably under the lock BEFORE any re-run request.
+    const reserved = lock(`${ledgerPath}.lock`, () => {
+      const cur = readLedger(ledgerPath);
+      if (!cur) return { go: false, why: 'ledger-unreadable' };
+      const prev = cur.acted?.[tipSha];
+      if (prev && !(prev.status === 'failed' && (prev.attempts ?? 1) < MAX_RERUN_ATTEMPTS)) return { go: false, why: 'already-acted', prev };
+      if (action !== 'rerun-main') {
+        mkdirSync(dirname(ledgerPath), { recursive: true });
+        writeJsonAtomic(ledgerPath, { ...cur, acted: { ...(cur.acted || {}), [tipSha]: { at: now, status: action, runIds: det.runIds, tests: det.tests.slice(0, 5), mainRun: tipRun.databaseId, published: false } } });
+        return { go: false, why: action, record: true };
+      }
+      const attempts = (prev?.attempts ?? 0) + 1;
+      mkdirSync(dirname(ledgerPath), { recursive: true });
+      writeJsonAtomic(ledgerPath, { ...cur, acted: { ...(cur.acted || {}), [tipSha]: { at: now, status: 'reserved', attempts, runIds: det.runIds, tests: det.tests.slice(0, 5), mainRun: tipRun.databaseId, published: prev?.published === true } } });
+      return { go: true, attempts };
+    });
+    const update = (patch) => lock(`${ledgerPath}.lock`, () => {
+      const cur = readLedger(ledgerPath);
+      if (!cur?.acted?.[tipSha]) return;
+      writeJsonAtomic(ledgerPath, { ...cur, acted: { ...cur.acted, [tipSha]: { ...cur.acted[tipSha], ...patch } } });
+    });
+    if (!reserved.go) {
+      if (reserved.why === 'ledger-unreadable') {
+        say(`latent-red-main: ${what} — ledger ${ledgerPath} unreadable: NO re-run, needs-you only — ${setting}`);
+        publishOnce(item('not issued (latent-red-main ledger unreadable)'));
+        return { fired: true, action: 'ledger-unreadable', detail: { ...det, tipSha } };
+      }
+      if (reserved.why === 'already-acted') {
+        if (reserved.prev?.published !== true && publishOnce(item(`${reserved.prev?.status ?? 'recorded'} earlier`))) update({ published: true });
+        return { fired: true, action: 'already-acted', detail: { ...det, tipSha } };
+      }
+      say(`latent-red-main: ${what} — main tip ${tipSha.slice(0, 9)} CI run ${tipRun.databaseId} is ${tipRun.status}/${tipRun.conclusion} → ${action} (left to the red-main machinery) — ${setting}`);
+      if (publishOnce(item(`not issued (${action})`))) update({ published: true });
+      return { fired: true, action, detail: { ...det, tipSha } };
+    }
+    say(`latent-red-main: ${what} — main tip ${tipSha.slice(0, 9)} CI run ${tipRun.databaseId} is completed/success → re-running it (attempt ${reserved.attempts}/${MAX_RERUN_ATTEMPTS}; source: merge-group failure streak) — ${setting}`);
+    let rerun;
+    try { ghText(exec, ['run', 'rerun', String(tipRun.databaseId), '--repo', repo]); rerun = 'requested'; }
+    catch (e) { rerun = `failed: ${String(e?.message || e).split('\n')[0].slice(0, 200)}`; }
+    update({ status: rerun === 'requested' ? 'requested' : 'failed', rerun, at: now });
+    say(`latent-red-main: re-run of main CI run ${tipRun.databaseId} ${rerun} — ${setting}`);
+    if (publishOnce(item(rerun))) update({ published: true });
     return { fired: true, action, detail: { ...det, tipSha, rerun } };
   } catch (e) {
-    log(`latent-red-main: check skipped (${String(e?.message || e).split('\n')[0].slice(0, 200)}) — ${setting}`);
+    say(`latent-red-main: check skipped (${String(e?.message || e).split('\n')[0].slice(0, 200)}) — ${setting}`);
     return { fired: false, action: 'error' };
   }
 }

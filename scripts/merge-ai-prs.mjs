@@ -5101,10 +5101,12 @@ async function runCli() {
   // Latent red main: a full pass (never a single-PR fast drain) checks whether the newest merge groups all fail on
   // the same test; if so it re-runs main tip's green CI once, so the existing red-main machinery can see it.
   if (onlyPr == null && localSlug && !process.env.VITEST && !process.env.WE_UNDER_TEST) {
-    await loadNeedsYouPublisher();
-    runLatentRedMainCheck({ repo: localSlug, dryRun: DRY_RUN, threshold: throughput.value.latentRedMainRuns,
+    try {
+      await loadNeedsYouPublisher();
+      runLatentRedMainCheck({ repo: localSlug, dryRun: DRY_RUN, threshold: throughput.value.latentRedMainRuns,
       source: throughput.sources?.latentRedMainRuns || 'standard',
       exec: (cmd, args, opts) => execFileSyncThrottled(cmd, args, { ...opts, throttle: { op: 'latent-red-main' } }) });
+    } catch { /* the detector is advisory: it never breaks a drain pass */ }
   }
   const prestageSetting = resolvePrestageSettings({ log: line => process.stderr.write(`${line}\n`) });
   // Prepared admission is still a candidate selection: honor the same resolved repo set and
