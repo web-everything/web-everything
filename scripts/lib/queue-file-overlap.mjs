@@ -34,7 +34,8 @@ export function readQueueEntryFiles({ repo, exec = execFileSync, resolveFiles })
       const pr = node?.pullRequest;
       if (!Number.isInteger(pr?.number)) throw new Error('invalid merge queue entry');
       const view = JSON.parse(exec('gh', ['pr', 'view', String(pr.number), '--repo', repo, '--json', resolveFiles ? 'files,headRefName,baseRefName,headRefOid' : 'files'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }));
-      return { num: pr.number, files: resolveFiles ? resolveFiles({ num: pr.number, repo, view }) : completeListedFiles(view.files) };
+      return { num: pr.number, files: resolveFiles ? resolveFiles({ num: pr.number, repo, view }) : completeListedFiles(view.files),
+        ...(typeof view.headRefOid === 'string' ? { headSha: view.headRefOid } : {}) };
     });
     return { entries };
   } catch (e) { return { entries: [], error: String(e?.message ?? e).split('\n')[0] }; }

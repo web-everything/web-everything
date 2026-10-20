@@ -305,7 +305,7 @@ export function createDrainMergeStrategy({
   /** A card-only overlap that dry-merges cleanly onto the queue tip is not a hold; anything else keeps it. */
   const cardOverlapEnqueues = (c, headSha, overlap, queue) => {
     if (!cardMergeSetting.enabled || !overlap.overlap) return false;
-    const r = cardOverlapRelief({ num: c.num, headSha, overlap, queuedNums: queue.entries.map(entry => entry.num), repo: slugOf(c.repo), setting: cardMergeSetting,
+    const r = cardOverlapRelief({ num: c.num, headSha, overlap, queued: queue.entries.map(entry => ({ num: entry.num, headSha: entry.headSha ?? null })), repo: slugOf(c.repo), setting: cardMergeSetting,
       exec, cwd, readTip: readQueueTip, ...(cardMergeRun ? { run: cardMergeRun } : {}) });
     if (r.line) say(`  ${r.line}`);
     return r.relieve === true;

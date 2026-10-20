@@ -51,17 +51,18 @@ describe('card-overlap clean-merge', () => {
     const r = repoWith();
     const overlap = { overlap: true, with: [{ num: 7, files: ['backlog/1-card.md'] }], unknown: [] };
     const setting = { enabled: true, source: 'tool' };
+    const QH = 'e'.repeat(40);
     try {
-      const ok = cardOverlapRelief({ num: 9, headSha: r.clean, overlap, repo: 'o/r', setting, cwd: r.dir, queuedNums: [7], readTip: () => ({ sha: r.tip, num: 7, entries: [7] }) });
+      const ok = cardOverlapRelief({ num: 9, headSha: r.clean, overlap, repo: 'o/r', setting, cwd: r.dir, queued: [{ num: 7, headSha: QH }], readTip: () => ({ sha: r.tip, num: 7, entries: [{ num: 7, headSha: QH }] }) });
       expect(ok.relieve).toBe(true);
       expect(ok.line).toMatch(/^card-overlap clean-merge: #9 with #7 → enqueue .*drain\.cardOverlapCleanMerge=on \(tool\)$/);
-      const bad = cardOverlapRelief({ num: 9, headSha: r.conflict, overlap, repo: 'o/r', setting, cwd: r.dir, queuedNums: [7], readTip: () => ({ sha: r.tip, num: 7, entries: [7] }) });
+      const bad = cardOverlapRelief({ num: 9, headSha: r.conflict, overlap, repo: 'o/r', setting, cwd: r.dir, queued: [{ num: 7, headSha: QH }], readTip: () => ({ sha: r.tip, num: 7, entries: [{ num: 7, headSha: QH }] }) });
       expect(bad).toMatchObject({ relieve: false, line: expect.stringContaining('→ skip: conflict') });
       expect(cardOverlapRelief({ num: 9, headSha: r.clean, overlap, repo: 'o/r', setting, cwd: r.dir, readTip: () => { throw new Error('boom'); } }))
         .toMatchObject({ relieve: false, line: expect.stringContaining('→ skip: error (boom)') });
-      expect(cardOverlapRelief({ num: 9, headSha: r.clean, overlap, queuedNums: [7], repo: 'o/r', setting, cwd: r.dir, readTip: () => ({ sha: r.tip, num: 8, entries: [7, 8] }) }))
+      expect(cardOverlapRelief({ num: 9, headSha: r.clean, overlap, queued: [{ num: 7, headSha: QH }], repo: 'o/r', setting, cwd: r.dir, readTip: () => ({ sha: r.tip, num: 8, entries: [{ num: 7, headSha: QH }, { num: 8, headSha: QH }] }) }))
         .toMatchObject({ relieve: false, line: expect.stringContaining('→ skip: queue changed between reads') });
-      expect(cardOverlapRelief({ num: 9, headSha: r.clean, overlap, repo: 'o/r', setting, cwd: r.dir, readTip: () => ({ sha: r.tip, num: 7, entries: [7] }) }))
+      expect(cardOverlapRelief({ num: 9, headSha: r.clean, overlap, repo: 'o/r', setting, cwd: r.dir, readTip: () => ({ sha: r.tip, num: 7, entries: [{ num: 7, headSha: QH }] }) }))
         .toMatchObject({ relieve: false, line: expect.stringContaining('→ skip: queue changed between reads') });
       expect(cardOverlapRelief({ num: 9, headSha: r.clean, overlap, repo: 'o/r', setting: { enabled: false }, cwd: r.dir })).toEqual({ relieve: false, line: null });
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
@@ -70,7 +71,7 @@ describe('card-overlap clean-merge', () => {
     const body = nodes => JSON.stringify({ data: { repository: { mergeQueue: { entries: { pageInfo: { hasNextPage: false }, nodes } } } } });
     const a = 'a'.repeat(40), b = 'b'.repeat(40);
     expect(readQueueTip({ repo: 'o/r', exec: () => body([{ position: 2, headCommit: { oid: b }, pullRequest: { number: 2 } }, { position: 1, headCommit: { oid: a }, pullRequest: { number: 1 } }]) }))
-      .toMatchObject({ sha: b, num: 2 });
+      .toMatchObject({ sha: b, num: 2, entries: [{ num: 2, headSha: null }, { num: 1, headSha: null }] });
     expect(readQueueTip({ repo: 'o/r', exec: () => body([{ position: 1, headCommit: null, pullRequest: { number: 1 } }]) })).toHaveProperty('error');
     expect(readQueueTip({ repo: 'o/r', exec: () => body([]) })).toHaveProperty('error');
   });

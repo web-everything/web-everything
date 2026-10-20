@@ -47,7 +47,7 @@ describe('read queue entry files', () => {
       : JSON.stringify({ data: { repository: { mergeQueue: { entries: {
         nodes: [{ pullRequest: { number: 42 } }], pageInfo: { hasNextPage: false },
       } } } } }));
-    expect(readQueueEntryFiles({ repo: 'owner/repo', exec, resolveFiles })).toEqual({ entries: [{ num: 42, files }] });
+    expect(readQueueEntryFiles({ repo: 'owner/repo', exec, resolveFiles })).toEqual({ entries: [{ num: 42, files, headSha: 'a'.repeat(40) }] });
     expect(resolveFiles).toHaveBeenCalledTimes(1);
     expect(resolveFiles).toHaveBeenCalledWith({ num: 42, repo: 'owner/repo', view });
     expect(exec.mock.calls[1][1]).toEqual(['pr', 'view', '42', '--repo', 'owner/repo', '--json', 'files,headRefName,baseRefName,headRefOid']);

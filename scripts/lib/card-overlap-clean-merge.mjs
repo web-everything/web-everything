@@ -52,7 +52,7 @@ export function cardOnlyOverlap(overlap) {
 export function readQueueTip({ repo, exec = execFileSync }) {
   try {
     const [owner, name] = repo.split('/');
-    const data = graphql(exec, 'query($owner:String!,$name:String!){repository(owner:$owner,name:$name){mergeQueue(branch:"main"){entries(first:100){pageInfo{hasNextPage} nodes{position headCommit{oid} pullRequest{number}}}}}}', [`owner=${owner}`, `name=${name}`]);
+    const data = graphql(exec, 'query($owner:String!,$name:String!){repository(owner:$owner,name:$name){mergeQueue(branch:"main"){entries(first:100){pageInfo{hasNextPage} nodes{position headCommit{oid} pullRequest{number headRefOid}}}}}}', [`owner=${owner}`, `name=${name}`]);
     const page = data.repository?.mergeQueue?.entries;
     if (!Array.isArray(page?.nodes) || !page.nodes.length) return { error: 'merge queue empty or unreadable' };
     if (page.pageInfo?.hasNextPage) return { error: 'merge queue has more than 100 entries' };
@@ -60,7 +60,8 @@ export function readQueueTip({ repo, exec = execFileSync }) {
       return { error: 'a queue entry has no merge-group commit yet' };
     }
     const last = [...page.nodes].sort((a, b) => a.position - b.position).at(-1);
-    return { sha: last.headCommit.oid, num: last.pullRequest?.number ?? null, entries: page.nodes.map(n => n.pullRequest?.number) };
+    return { sha: last.headCommit.oid, num: last.pullRequest?.number ?? null,
+      entries: page.nodes.map(n => ({ num: n.pullRequest?.number, headSha: n.pullRequest?.headRefOid ?? null })) };
   } catch (e) { return { error: String(e?.message ?? e).split('\n')[0] }; }
 }
 
@@ -86,11 +87,11 @@ export function dryMergeOnto({ head, tip, cwd = process.cwd(), run = gitRun }) {
 
 /**
  * Decide whether a card-only overlap may enqueue. Returns `{ relieve, line }`; the caller logs `line` and keeps
- * its deferral unless `relieve` is true. `queuedNums` is the queue membership the overlap was computed from; the
- * tip read must show exactly that membership, or a PR that joined in between (whose files were never compared)
- * could ride along unchecked.
+ * its deferral unless `relieve` is true. `queued` ([{num, headSha}]) is the queue membership, with the head each
+ * file list was read at, that the overlap was computed from. The tip read must show exactly those PRs at exactly
+ * those heads, or a PR that joined or was re-queued in between (whose files were never compared) could ride along.
  */
-export function cardOverlapRelief({ num, headSha, overlap, queuedNums, repo, setting, exec = execFileSync, cwd, run = gitRun, readTip = readQueueTip }) {
+export function cardOverlapRelief({ num, headSha, overlap, queued, repo, setting, exec = execFileSync, cwd, run = gitRun, readTip = readQueueTip }) {
   if (!setting?.enabled || !overlap?.overlap) return { relieve: false, line: null };
   const blockers = (overlap.with ?? []).map(entry => `#${entry.num}`).join(',');
   const tag = `card-overlap clean-merge: #${num} with ${blockers}`;
@@ -101,10 +102,11 @@ export function cardOverlapRelief({ num, headSha, overlap, queuedNums, repo, set
   try {
     const tip = readTip({ repo, exec });
     if (tip.error) return { relieve: false, line: `${tag} → skip: queue tip unknown (${tip.error}) — ${src}` };
-    const same = (a, b) => a.length === b.length && a.every(n => b.includes(n));
-    const checked = Array.isArray(queuedNums) ? [...new Set(queuedNums.filter(n => n !== num))] : null;
-    const atTip = Array.isArray(tip.entries) ? [...new Set(tip.entries.filter(n => n !== num))] : null;
-    if (!checked || !atTip || !same(checked, atTip)) {
+    const ids = list => Array.isArray(list) && list.every(e => Number.isInteger(e?.num) && SHA.test(e?.headSha ?? ''))
+      ? [...new Set(list.filter(e => e.num !== num).map(e => `${e.num}@${e.headSha}`))] : null;
+    const checked = ids(queued);
+    const atTip = ids(tip.entries);
+    if (!checked || !atTip || checked.length !== atTip.length || !checked.every(id => atTip.includes(id))) {
       return { relieve: false, line: `${tag} → skip: queue changed between reads — ${src}` };
     }
     const m = dryMergeOnto({ head: headSha, tip: tip.sha, cwd, run });
