@@ -815,7 +815,7 @@ describe('provenMergedLanding reads blobs through one cat-file process', () => {
       catch (error) { throw error; }
     };
     const counting = (dir, specs) => { calls.spawn++; return catFile(dir, specs); };
-    return { calls, run: () => batchIO.provenMergedLanding(f.recorded, { repo: 'o/r', gh: f.gh, git: gitRun, catFile: counting, memo: new Map() }) };
+    return { calls, run: () => batchIO.provenMergedLanding(f.recorded, { repo: 'o/r', gh: f.gh, git: gitRun, catFile: counting }) };
   }
   // The old reader: every blob is "missing" to cat-file, so each one is read by `git show`, as before.
   const oldReader = (dir, specs) => Buffer.from(specs.map(spec => `${spec} missing\n`).join(''));
@@ -845,13 +845,7 @@ describe('provenMergedLanding reads blobs through one cat-file process', () => {
     const after = harness(f, batchIO.catFileBatch);
     expect(await after.run()).toEqual(['zzz']);
   });
-  it('does not reuse a proof across member lists that only differ by a comma, and refuses blobs over the old 16 MiB limit', async () => {
-    const f = landing();
-    const memo = new Map();
-    const run = members => batchIO.provenMergedLanding({ ...f.recorded, members }, { repo: 'o/r', gh: f.gh, memo,
-      git: async args => execFileSync('git', args, { cwd: f.repo, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }) });
-    await run([{ cardId: 'aaa' }, { cardId: 'bbb' }]);
-    expect(await run([{ cardId: 'aaa,bbb' }])).toEqual(['aaa,bbb']);
+  it('refuses blobs over the old 16 MiB limit (falls back to git show)', () => {
     const big = Buffer.alloc(16 * 1024 * 1024 + 1, 97);
     const raw = Buffer.concat([Buffer.from(`${'c'.repeat(40)} blob ${big.length}\n`), big, Buffer.from('\n')]);
     expect(batchIO.parseCatFileBatch(raw, ['x']).get('x')).toBeNull();
@@ -862,17 +856,16 @@ describe('provenMergedLanding reads blobs through one cat-file process', () => {
     await expect(harness(f, () => Buffer.from('garbage\n')).run()).rejects.toThrow(/cat-file/);
     expect(() => batchIO.parseCatFileBatch(Buffer.from('a'.repeat(40) + ' blob 9\nshort\n'), ['x'])).toThrow(/framing|truncated/);
   });
-  it('computes the proof once per sha+members within a run, and never stores it', async () => {
+  it('recomputes the proof on every call: nothing is cached or stored', async () => {
     const f = landing();
-    const h = (memo, counter) => batchIO.provenMergedLanding(f.recorded, { repo: 'o/r', gh: f.gh,
+    let spawns = 0;
+    const run = () => batchIO.provenMergedLanding(f.recorded, { repo: 'o/r', gh: f.gh,
       git: async args => execFileSync('git', args, { cwd: f.repo, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }),
-      catFile: (dir, specs) => { counter.n++; return batchIO.catFileBatch(dir, specs); }, memo });
-    const counter = { n: 0 };
-    const memo = new Map();
-    expect(await h(memo, counter)).toEqual([]);
-    expect(await h(memo, counter)).toEqual([]);
-    expect(counter.n).toBe(1);
-    expect(await h(new Map(), counter)).toEqual([]); // a new run recomputes
-    expect(counter.n).toBe(2);
-  });
+      catFile: (dir, specs) => { spawns++; return batchIO.catFileBatch(dir, specs); } });
+    expect(await run()).toEqual([]);
+    expect(await run()).toEqual([]);
+    expect(spawns).toBe(2);
+    expect(await run()).toEqual([]);
+    expect(spawns).toBe(3);
+});
 });

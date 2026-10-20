@@ -234,10 +234,6 @@ export function parseCatFileBatch(buffer, specs) {
   return out;
 }
 
-// Per-process memo of the blob-derived proof (immutable commits, so the key is sound). Lives only as long as this
-// process: never written anywhere, never read by a later run, which always recomputes.
-const landingProofMemo = new Map();
-
 /**
  * Prove, from scratch, that a MERGED batch's cards landed on main — by content, never by names, commit messages or
  * anything stored. Re-reads the PR's merge commit (which must be an ancestor of main). Recorded side: the batch's
@@ -248,7 +244,7 @@ const landingProofMemo = new Map();
  * Returns the unproven members (empty = proven). Only a clean git exit-1 "no" is a negative; every other git or
  * GitHub failure throws.
  */
-export async function provenMergedLanding(recorded, { repo, gh, git, remote = 'origin', catFile = catFileBatch, memo = landingProofMemo }) {
+export async function provenMergedLanding(recorded, { repo, gh, git, remote = 'origin', catFile = catFileBatch }) {
   const text = async args => String(await git(args));
   const yes = async args => {
     try { await git(args); return true; } catch (error) { if (error?.status === 1) return false; throw error; }
@@ -264,8 +260,6 @@ export async function provenMergedLanding(recorded, { repo, gh, git, remote = 'o
   if (!await yes(['rev-parse', '--verify', '--quiet', `${recorded.headSha}^{commit}`])) await git(['fetch', '--no-tags', remote, recorded.headSha]);
   if (!await yes(['rev-parse', '--verify', '--quiet', `${merge}^{commit}`])) await git(['fetch', '--no-tags', remote, merge]);
   if (!await yes(['merge-base', '--is-ancestor', merge, main])) return ['(merge commit not on main)'];
-  const memoKey = `${recorded.headSha}|${merge}|${JSON.stringify(members.map(member => String(member?.cardId ?? '')))}`;
-  if (memo.has(memoKey)) return [...memo.get(memoKey)];
   const recordedTree = (await text(['ls-tree', '--name-only', recorded.headSha, 'backlog/'])).split('\n').filter(Boolean);
   const mergeTree = (await text(['ls-tree', '--name-only', merge, 'backlog/'])).split('\n').filter(Boolean);
   let grep = '';
@@ -318,7 +312,6 @@ export async function provenMergedLanding(recorded, { repo, gh, git, remote = 'o
     const landed = candidates[0] === recordedPaths[0] ? landedRaw : removeBornAsLine(landedRaw, id);
     if (landed !== expected) missing.push(id);
   }
-  memo.set(memoKey, [...missing]);
   return missing;
 }
 
