@@ -1,7 +1,7 @@
 import { redTeamCardOnly, redTeamOwedForAcceptedPr } from './review-red-team-policy.mjs';
 
 /** Internal review-job branch: use a completed review's pinned read, never manufacture a verdict. */
-export function runDrainRedTeamJob({ pr, repo, drainRedTeamRequest: request, preferLane = null }, io, plan) {
+export function runDrainRedTeamJob({ pr, repo, drainRedTeamRequest: request, preferLane = null, laneWaitMs = 60_000 }, io, plan) {
   if (Number(pr) !== request.pr || repo?.toLowerCase() !== request.repo?.toLowerCase()
     || !/^[a-f0-9]{40}$/i.test(request.head ?? '')) throw Error('drain red-team request identity mismatch');
   const planned = plan({ pr, repo });
@@ -32,10 +32,20 @@ export function runDrainRedTeamJob({ pr, repo, drainRedTeamRequest: request, pre
       || !redTeamOwedForAcceptedPr(loopPayload)) return result({ outcome: 'deferred-no-review-evidence' });
     if (io.skipCardOnly?.() && redTeamCardOnly(loopPayload.findings.read)) return result({ outcome: 'card-only' });
     const actorId = io.newActorId?.();
-    const acquired = io.acquireLane({ laneRepo: planned.laneRepo, slug, actorId,
-      lane: preferLane, waitMs: 0 });
+    // 2026-10-20 — live #5485: the preferred lane was refused on every dispatch and this job returned
+    // `deferred-no-lane` with no reason, four times. Same shape as the review arc: try the preferred lane
+    // without waiting, then auto-pick with a bounded wait, and log why each attempt failed.
+    let acquired = null;
+    if (Number.isInteger(preferLane) && preferLane > 0) {
+      acquired = io.acquireLane({ laneRepo: planned.laneRepo, slug, actorId, lane: preferLane, waitMs: 0 });
+      if (!acquired?.lanePath) io.log?.(`review-job ${slug}: red team — preferred lane-${preferLane} not taken (${acquired?.error || 'unavailable'}) — falling back to auto-pick`);
+    }
+    if (!acquired?.lanePath) acquired = io.acquireLane({ laneRepo: planned.laneRepo, slug, actorId, waitMs: laneWaitMs });
     lanePath = acquired?.lanePath;
-    if (!lanePath) return result({ outcome: 'deferred-no-lane' });
+    if (!lanePath) {
+      io.log?.(`review-job ${slug}: red team — no lane (${acquired?.error || 'pool full'}); the request stays open and the next tick retries`);
+      return result({ outcome: 'deferred-no-lane', ...(acquired?.error ? { reason: String(acquired.error).slice(0, 300) } : {}) });
+    }
     io.updateRecord?.({ ...record, cwd: lanePath, actorId });
     if (!ready()) return result({ outcome: 'deferred' });
     // ready() just read a live review:accepted on request.head: the pass owes this accepted head (redTeamOwedForPass).

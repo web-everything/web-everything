@@ -113,7 +113,7 @@ import { ACTOR_ENV } from '../lib/review-independence.mjs';
 import { INFRA_RETRY_COOLOFF_MS } from '../conveyor/reconcile-core.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import {
-  createRedTeamIo, extraSeatsEnabled, recordDiscardedRedTeam, redTeamEnabled, redTeamOwedFor, resolveSeatTimeoutMs,
+  createRedTeamIo, extraSeatsEnabled, readVerifiedPriorRedTeamEvidence, recordDiscardedRedTeam, redTeamEnabled, redTeamOwedFor, resolveSeatTimeoutMs,
 } from './review-extra-seats.mjs';
 import {
   decideSpeculativeOutcome, formatSpeculativeRedTeamSourceLine, loadSpeculativeRedTeam, READ_SINK_ENV,
@@ -492,6 +492,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     },
     speculativeReadSunk: (handle) => existsSync(handle.readSink),
     recordDiscardedRedTeam: (o) => recordDiscardedRedTeam(o, createRedTeamIo({ env })),
+    readPriorRedTeamEvidence: ({ repo, pr, rev }) => readVerifiedPriorRedTeamEvidence({ repo, pr, rev, env }, createRedTeamIo({ env })),
     cleanupSpeculativeRedTeam: (handle) => {
       for (const f of [handle.readSink, handle.passFile, handle.reservedFile]) { try { rmSync(f, { force: true }); } catch { /* best effort */ } }
     },
@@ -919,6 +920,22 @@ function runReviewArc({
               out: seatOut, input: seatsBox.input }, io)
           : { result: { status: 'error', reason: 'panel red-team seat did not start' } };
       } catch (e) { settled = { result: { status: 'error', reason: tail(e?.message ?? e, 300) } }; }
+      // 2026-10-20 — `stale` / `superseded` / `sequential` mean "run the sequential pass", exactly as on the
+      // non-panel path. The panel seat used to record them as an error instead (live #5729/#5752/#5485: "the
+      // jurors raised N finding(s) the speculative brief could not carry"), which left the PR red-team:pending.
+      if (!settled.result && panelAccepted && ['stale', 'superseded', 'sequential'].includes(settled.decision)
+        && typeof io.runRedTeam === 'function') {
+        try { settled.result = io.runRedTeam(seatsBox.input); } catch (e) { settled.result = { status: 'error', reason: tail(e?.message ?? e, 300) }; }
+        // A clean row already existed (`superseded`): the sequential runner only finishes its effects and reports
+        // `resumed` / `already-ran` without the evidence. Fold the verified row's evidence in, exactly as the
+        // speculative prior-row path does; with no verified row (or a different call) the result stays as it is.
+        if (['resumed', 'already-ran'].includes(settled.result?.status)) {
+          let ev = null;
+          try { ev = io.readPriorRedTeamEvidence?.({ repo: seatsBox.input.repo, pr: seatsBox.input.pr, rev: seatsBox.input.loopPayload?.findings?.read?.netBasis?.rev }) ?? null; } catch { ev = null; }
+          if (ev && (!settled.result.callId || ev.callId === settled.result.callId)) settled.result = { ...settled.result, ...ev, status: 'ran' };
+        }
+        io.log(`review-job ${slug}: red team (panel seat) — speculative pass ${settled.decision}; sequential pass → ${settled.result?.status ?? 'none'}`);
+      }
       const redTeam = settled.result ?? { status: 'error', reason: settled.reason ?? 'panel red-team seat has no result' };
       attestSavedRedTeam(io, classified.runId, seatsBox.input, redTeam);
       delete settled.result;

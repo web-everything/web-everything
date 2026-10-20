@@ -289,7 +289,7 @@ describe('runReviewTick — the per-tick sequence', () => {
     expect(tagRound).toHaveBeenCalledWith({ pr: 10, repo: expect.any(String), round: 2 }); // attempts+1
     expect(out).toEqual({
       reviewsOwed: 1, dispatched: [{ prNumber: 10, agentId: 'agent-10' }], failed: [], notStarted: [], refusals: 0,
-      pendingNotDispatched: [], reconcileError: null, deferredForLanes: 0, deferredForAuth: 0, authPaused: false, authPauseReason: null,
+      pendingNotDispatched: [], reconcileError: null, deferredForLanes: 0, deferredForCap: 0, deferredForCapReason: null, deferredForAuth: 0, authPaused: false, authPauseReason: null,
       staleStatusSwept: [], staleConflictStatusCleared: [],
       holdReconcile: [], holdReconcileError: null, liveProcessPrs: [], operatorHolds: { observedAt: 7, holds: [] },
     });
@@ -621,6 +621,59 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     const closed = liveReviewRoundBudget({ env: {}, listCommands: () => { throw Error('ps failed'); } });
     expect(closed.left).toBe(0);
     expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '5' }, listCommands: () => '' })).toMatchObject({ max: 5, left: 5 });
+  });
+
+  it('live-review cap counts only processes RUNNING a review script, never one that names it in an argument (live 2026-10-20)', async () => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const ps = [
+      'node /snap/scripts/verify-lane.mjs --repo=/x --files=scripts/operations/review-job.mjs,scripts/operations/review-loop-cli.mjs',
+      'node /snap/scripts/verify-lane.mjs --files=["scripts/operations/review-job.mjs"]',
+      '/usr/local/bin/node /clone/scripts/operations/review-job.mjs run --pr=5766',
+      'node scripts/operations/review-loop-cli.mjs --pr=5766 --repo=a/b',
+      'grep review-job.mjs',
+      'vim scripts/operations/review-loop-cli.mjs',
+    ].join('\n');
+    expect(liveReviewRoundBudget({ env: {}, listCommands: () => ps })).toMatchObject({ live: 1, max: 3, left: 2 });
+    // a preload / loader value is not the script; other node runtimes and a direct (shebang) run still count
+    const preloaded = [
+      'node --import ./boot.mjs scripts/operations/review-loop-cli.mjs --pr=1',
+      'node -r ./boot.cjs --max-old-space-size=4096 scripts/operations/review-loop-cli.mjs --pr=2',
+      '/usr/bin/nodejs scripts/operations/review-loop-cli.mjs --pr=3',
+      '/clone/scripts/operations/review-loop-cli.mjs --pr=4',
+    ].join('\n');
+    expect(liveReviewRoundBudget({ env: {}, listCommands: () => preloaded })).toMatchObject({ live: 4, left: 0 });
+  });
+
+  it('a cap-bound tick says the live-review cap held the review, never "no acquirable lane"', async () => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const budget = liveReviewRoundBudget({ env: {}, listCommands: () => 'node a/review-job.mjs run\nnode b/review-job.mjs run\nnode c/review-job.mjs run' });
+    const prs = [100, 101].map((number) => ({ number, labels: [{ name: 'review:human' }] }));
+    const out = runReviewTick({ reconcile: () => reviewsPlan(2), readPrs: () => prs, readAgents: () => [], dispatch: vi.fn(),
+      tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 40, liveReviewBudget: budget });
+    expect(out.deferredForLanes).toBe(0);
+    expect(out.deferredForCap).toBe(2);
+    const reasons = out.pendingNotDispatched.flatMap((p) => p.reasons).join('\n');
+    expect(reasons).toMatch(/held by the live-review cap \(live review rounds 3 of maxLiveReviewRounds=3 \(tool\); 40 lane\(s\) acquirable\)/);
+    expect(reasons).not.toMatch(/no acquirable lane/);
+    const starved = runReviewTick({ reconcile: () => reviewsPlan(2), readPrs: () => prs, readAgents: () => [], dispatch: vi.fn(),
+      tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 0 });
+    expect(starved.deferredForLanes).toBe(2);
+    expect(starved.pendingNotDispatched[0].reasons.join('\n')).toMatch(/no acquirable lane this tick \(0 acquirable\)/);
+  });
+
+  it('scarce review seats go main-fix first, then review:human / ready-to-merge, oldest first', async () => {
+    const { orderReviewsForDispatch } = await import('../review-daemon.mjs');
+    const reviews = [{ prNumber: 9 }, { prNumber: 8 }, { prNumber: 7 }, { prNumber: 6, mainFix: true }, { prNumber: 5 }];
+    const labelsByPr = new Map([[8, [{ name: 'review:human' }]], [9, ['ready-to-merge']]]);
+    expect(orderReviewsForDispatch(reviews, { labelsByPr }).map((r) => r.prNumber)).toEqual([6, 8, 9, 5, 7]);
+    // red-team request rows keep their slots (the main-fix red-team is placed first on purpose)
+    const withRedTeam = [{ prNumber: 20, redTeamRequest: {} }, { prNumber: 9 }, { prNumber: 8 }, { prNumber: 3, carriedAcceptHead: 'a' }];
+    expect(orderReviewsForDispatch(withRedTeam, { labelsByPr }).map((r) => r.prNumber)).toEqual([20, 8, 9, 3]);
+    const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+    runReviewTick({ reconcile: () => ({ dispatch: reviews.map((r) => ({ kind: 'review', ...r })), refusals: [] }),
+      readPrs: () => [5, 6, 7, 8, 9].map((number) => ({ number, labels: labelsByPr.get(number) ?? [] })), readAgents: () => [],
+      dispatch, tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 2 });
+    expect(dispatch.mock.calls.map(([o]) => o.pr)).toEqual([6, 8]);
   });
 
   it('deferred reviews still feed statusCandidates (the whole owed list, not just what got dispatched)', () => {
@@ -2108,4 +2161,80 @@ it.each(['allowed', 'refused', 'foreign', 'unreadable'])('main-fix red-team requ
   });
   expect(dispatch).toHaveBeenCalledTimes(1);
   expect(dispatch.mock.calls[0][0].pr).toBe(mode === 'allowed' ? 42 : 44);
+});
+
+// 2026-10-20 — live: 12 drain red-team requests sat for hours with no log line. Red-team rows were appended after
+// ~17 owed reviews under a 3-seat live-review cap, and merged PRs' requests were read every tick forever.
+describe('red-team requests are never held silently', () => {
+  const REPO = 'web-everything/web-everything';
+  const req = (pr, c = 'a') => ({ repo: REPO, pr, head: c.repeat(40) });
+  const accepted = (pr, c = 'a', extra = []) => ({ number: pr, headRefOid: c.repeat(40), isDraft: false,
+    labels: ['review:accepted', 'ready-to-merge', ...extra] });
+  const base = (o) => ({ repo: REPO, readAgents: () => [], dispatch: vi.fn(() => ({ mode: 'job' })),
+    tagRound: () => {}, tagStatus: () => {}, holdReconcile: () => [], notifyReferral: () => {}, ...o });
+
+  it('expires a merged or closed PR\'s request and keeps an open-but-unlisted one with a reason', async () => {
+    const { reserveRedTeamSeats } = await import('../review-daemon.mjs');
+    expect(typeof reserveRedTeamSeats).toBe('function');
+    const finish = vi.fn();
+    const log = vi.fn();
+    const states = { 5549: 'MERGED', 5600: 'CLOSED', 5601: 'OPEN' };
+    runReviewTick(base({ reconcile: () => ({ dispatch: [], refusals: [] }), readPrs: () => [],
+      readRedTeamRequests: () => [req(5549), req(5600), req(5601)], readPrState: ({ pr }) => ({ state: states[pr] }),
+      finishRedTeamRequest: finish, log }));
+    expect(finish.mock.calls).toEqual([[req(5549), { status: 'expired' }], [req(5600), { status: 'expired' }]]);
+    const lines = log.mock.calls.map(([l]) => l);
+    expect(lines).toContain('review-daemon: red-team request #5549 @aaaaaaaa held — PR is MERGED; request finished as expired');
+    expect(lines).toContain('review-daemon: red-team request #5601 @aaaaaaaa held — absent from the open-PR listing (state OPEN)');
+  });
+
+  it('logs the refusing branch for a plan hold, a label hold and a draft', () => {
+    const log = vi.fn();
+    runReviewTick(base({
+      reconcile: () => ({ dispatch: [], refusals: [{ prNumber: 1, kind: 'review-referrals-pending', why: 'review paused' }] }),
+      readPrs: () => [accepted(1), accepted(2, 'a', ['review:human']), { ...accepted(3), isDraft: true }],
+      readRedTeamRequests: () => [req(1), req(2), req(3)], finishRedTeamRequest: vi.fn(), log }));
+    const lines = log.mock.calls.map(([l]) => l);
+    expect(lines).toContain('review-daemon: red-team request #1 @aaaaaaaa held — the review plan holds this PR (review-referrals-pending: review paused)');
+    expect(lines).toContain('review-daemon: red-team request #2 @aaaaaaaa held — carries review:human');
+    expect(lines).toContain('review-daemon: red-team request #3 @aaaaaaaa held — PR is a draft');
+  });
+
+  it('gives a red-team row a reserved seat under the live-review cap, and logs every queued one', () => {
+    const owed = Array.from({ length: 5 }, (_, i) => ({ kind: 'review', prNumber: 100 + i }));
+    const log = vi.fn();
+    const dispatch = vi.fn(() => ({ mode: 'job' }));
+    const tick = runReviewTick(base({ dispatch, log,
+      reconcile: () => ({ dispatch: owed, refusals: [] }),
+      readPrs: () => [...owed.map(d => ({ number: d.prNumber, headRefOid: 'c'.repeat(40), labels: ['review:pending'] })), accepted(5485), accepted(5729, 'b')],
+      readRedTeamRequests: () => [req(5485), req(5729, 'b')], finishRedTeamRequest: vi.fn(),
+      acquirableLanes: () => 10, liveReviewBudget: { left: 2, reason: 'live review rounds 1 of maxLiveReviewRounds=3 (tool)' },
+      redTeamSeatShare: { reserved: 1, source: 'standard' } }));
+    expect(dispatch.mock.calls.map(([o]) => o.pr)).toEqual([100, 5485]);
+    expect(dispatch.mock.calls[1][0].drainRedTeamRequest).toEqual(req(5485));
+    expect(tick.dispatched).toHaveLength(2);
+    const lines = log.mock.calls.map(([l]) => l);
+    expect(lines).toContain('review-daemon: red-team seat share — moved #5485 into this tick\'s 2 seat(s): redTeamReservedSeats=1 (standard)');
+    expect(lines.some(l => l.startsWith('review-daemon: red-team request #5729 @bbbbbbbb held — no dispatch seat this tick: review owed, but held by the live-review cap'))).toBe(true);
+  });
+
+  it('reserveRedTeamSeats keeps every row, never displaces a main-fix row, and is a no-op with room', async () => {
+    const { reserveRedTeamSeats } = await import('../review-daemon.mjs');
+    const rows = [{ prNumber: 1, mainFix: true }, { prNumber: 2 }, { prNumber: 3 }, { prNumber: 9, redTeamRequest: {} }, { prNumber: 8, carriedAcceptHead: 'x' }];
+    const out = reserveRedTeamSeats(rows, { seats: 2, reserved: 1 });
+    expect(out.reviews.map(r => r.prNumber)).toEqual([1, 9, 2, 3, 8]);
+    expect(out.moved).toEqual([9]);
+    expect(reserveRedTeamSeats(rows, { seats: 1, reserved: 1 }).moved).toEqual([]);
+    expect(reserveRedTeamSeats(rows, { seats: 5, reserved: 1 }).reviews).toBe(rows);
+    expect(reserveRedTeamSeats(rows, { seats: 3, reserved: 0 }).reviews).toBe(rows);
+    expect(reserveRedTeamSeats(rows, { seats: 0, reserved: 1 }).moved).toEqual([]);
+  });
+
+  it('resolves redTeamReservedSeats through the cascade (standard 1, env override, invalid ignored)', async () => {
+    const { resolveRedTeamSeatShare } = await import('../review-daemon.mjs');
+    const none = join(tmpdir(), 'no-such-review-concurrency.json');
+    expect(resolveRedTeamSeatShare({ env: {}, toolPath: none })).toEqual({ reserved: 1, source: 'standard' });
+    expect(resolveRedTeamSeatShare({ env: { WE_REVIEW_RED_TEAM_RESERVED_SEATS: '2' }, toolPath: none })).toEqual({ reserved: 2, source: 'env' });
+    expect(resolveRedTeamSeatShare({ env: { WE_REVIEW_RED_TEAM_RESERVED_SEATS: 'x' }, toolPath: none }).reserved).toBe(1);
+  });
 });

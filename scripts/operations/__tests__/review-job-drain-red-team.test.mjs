@@ -104,3 +104,15 @@ it('consumes the durable request only after its saved evidence is admissible to 
     expect(readDrainRedTeamRequests({ env })).toEqual([]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+it('falls back from a refused preferred lane to auto-pick and logs every lane refusal (live #5485)', () => {
+    const { io } = fixture();
+    io.acquireLane.mockReturnValueOnce({ lanePath: null, error: 'lane-hold: a verify gate is running' });
+    const result = runReviewJob({ ...request, drainRedTeamRequest: request, preferLane: 21 }, io);
+    expect(io.acquireLane.mock.calls.map(([o]) => [o.lane ?? null, o.waitMs])).toEqual([[21, 0], [null, 60_000]]);
+    expect(result.outcome).toBe('ran');
+    expect(io.log.mock.calls.some(([l]) => l.includes('preferred lane-21 not taken (lane-hold: a verify gate is running)'))).toBe(true);
+    const { io: io2 } = fixture();
+    io2.acquireLane.mockReturnValue({ lanePath: null, error: 'pool full' });
+    expect(runReviewJob({ ...request, drainRedTeamRequest: request }, io2)).toMatchObject({ outcome: 'deferred-no-lane', reason: 'pool full' });
+    expect(io2.log.mock.calls.some(([l]) => l.includes('red team — no lane (pool full)'))).toBe(true);
+  });
