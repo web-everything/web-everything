@@ -7,7 +7,7 @@
  *   until they were re-adopted at 20:19Z. These tests replay that sequence through the real rebuild path.
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -74,7 +74,7 @@ function fixture() {
   const pushNewcomer = () => push('lane/c', 'origin/lane/c', { [DAEMON]: lines({ 2: 'c2', 5: 'c5', 8: 'c8' }) });
   gitOk(clone, ['fetch', '-q', 'origin']);
   const runGit = (args, opts = {}) => gitRun(args, { cwd: clone, env: { ...env, ...opts.env } });
-  return { clone, env, init, cOld, p, h, overlays, pushNewcomer, runGit };
+  return { clone, env, init, cOld, p, h, overlays, pushNewcomer, runGit, push };
 }
 
 const passSmoke = () => vi.fn(async () => ({
@@ -184,5 +184,42 @@ describe('x5059uu — rebuild keeps established overlays and parks the conflicti
     const third = await rebuildClone({ root: f.clone, env: f.env, runSmoke: passSmoke(), prState: async () => 'OPEN' });
     expect(third, JSON.stringify(third.alerts)).toMatchObject({ adopted: true });
     expect(readRebuildState(f.clone, f.env).held ?? null).toBeNull();
+  });
+
+  // x9diisp — the attributed smoke fallback (set the culprit aside, keep the rest) replans without the culprit. Here the
+  // culprit's change is what let the LIVE overlay apply (main moved onto the overlay's block; the culprit carries the
+  // resolution), so replanning without it would drop that live overlay, smoke clean and adopt the tree without it.
+  it('attributed smoke fallback is refused when setting the culprit aside would lose an established overlay', async () => {
+    const f = fixture();
+    const BAD = 'scripts/conveyor/bad.mjs';
+    f.push('lane/live-y', f.init, { [DAEMON]: lines({ 2: 'Y2', 5: 'Y5' }) });
+    f.push('lane/good', f.init, { 'good.txt': 'good\n' });
+    for (const ref of ['lane/live-y', 'lane/good']) addOverlay(f.clone, { ref, pr: ref === 'lane/live-y' ? 5001 : 5002 }, { env: f.env });
+    const first = await rebuildClone({ root: f.clone, env: f.env, runSmoke: passSmoke(), prState: async () => 'OPEN' });
+    expect(first, JSON.stringify(first.alerts)).toMatchObject({ adopted: true });
+
+    // main moves onto the live overlay's block; the culprit (registered after) carries the resolution of line 2
+    const author = join(dirname(f.clone), 'author');
+    gitOk(author, ['fetch', '-q', 'origin']);
+    gitOk(author, ['checkout', '-q', '-B', 'main', 'origin/main']);
+    write(author, DAEMON, lines({ 2: 'M2' }));
+    gitOk(author, ['commit', '-q', '-am', 'main moved']);
+    gitOk(author, ['push', '-q', 'origin', 'HEAD:refs/heads/main']);
+    f.push('lane/culprit', 'origin/main', { [DAEMON]: lines({ 2: 'Y2' }), [BAD]: 'bad\n' });
+    addOverlay(f.clone, { ref: 'lane/culprit', pr: 5003 }, { env: f.env });
+
+    const runSmoke = vi.fn(async ({ root }) => (existsSync(join(root, BAD))
+      ? { verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'x', mayBeTransient: false, detail: `exited 1: file://${root}/${BAD}:20` }] } }
+      : { verdict: 'pass', attempts: 1, smoke: { results: [] } }));
+    const second = await rebuildClone({ root: f.clone, env: f.env, runSmoke, prState: async () => 'OPEN' });
+
+    expect(second.reason).not.toBe('overlay-set-aside');
+    const kinds = second.alerts.map((a) => a.kind);
+    expect(kinds).not.toContain('overlay-set-aside-attributed');
+    const refused = second.alerts.find((a) => a.kind === 'overlay-set-aside-failed');
+    expect(refused?.detail.failed).toBe('established-overlay-conflict: lane/live-y');
+    expect(refused.detail.culprits.map((c) => c.ref)).toEqual(['lane/culprit']);
+    // only the failed candidate (A) and the later plain-main comparison were smoked — never the culprit-less tree
+    expect(runSmoke).toHaveBeenCalledTimes(2);
   });
 });
