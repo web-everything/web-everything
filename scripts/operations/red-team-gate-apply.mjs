@@ -42,6 +42,7 @@ import {
   GATE_OUTCOMES, gateRoundCap, liveResultGateState, planRedTeamActions, readConfirmedBreaks, redTeamGateMarker,
 } from '../lib/red-team-gate.mjs';
 import { roundExtensionGrants } from '../conveyor/round-extension-mark.mjs';
+import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 import { cleanFindingFile, qualifyLocusRefs, sanitizeCardField } from '../lib/review-loop-policy.mjs';
 import { IN_REPO_LOCUS } from '../lib/citation-check.mjs';
 import { DEFAULT_ROUND_CAP } from '../lib/jury-core.mjs';
@@ -134,7 +135,10 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
     const head = String(view?.headRefOid ?? '').toLowerCase();
     // The live head's latest result, and only the records that decide THAT result (an earlier same-head result's
     // records never dedup a newer one, PR #5482).
-    const { result: parsed, resultId, outcomes: recorded, sendBackOutcome, reopened } = liveResultGateState(view?.comments, pr, head, repo);
+    // Standing-ruling grants count only under the scope verified from GitHub at THIS read (the shared trusted reader).
+    let standingRuling = null;
+    try { standingRuling = io.standingRuling?.({ repo, pr, comments: view?.comments }) ?? null; } catch { standingRuling = null; }
+    const { result: parsed, resultId, outcomes: recorded, sendBackOutcome, reopened } = liveResultGateState(view?.comments, pr, head, repo, standingRuling);
     if (!parsed) return { status: 'no-red-team-on-head', head };
     const setting = io.readSetting();
     const plan = planRedTeamActions(parsed, setting.value);
@@ -149,7 +153,7 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
     if (!sendPending && !cardPending) return { status: 'already-acted', head, outcome: priorSend ?? GATE_OUTCOMES.CARD_QUEUED, plan };
     const round = sendPending ? io.readRound({ repo, pr, head }) : null;
     // The operator's audited grants raise the cap with the same grant-time anchor fix dispatch uses.
-    const grants = sendPending ? roundExtensionGrants(view?.comments, { repo, pr }) : [];
+    const grants = sendPending ? roundExtensionGrants(view?.comments, { repo, pr, standingRuling }) : [];
     const effectiveCap = gateRoundCap({ cap, grants, roundAt: (at) => {
       try { return io.readRoundAsOf?.({ repo, pr, at }) ?? null; } catch { return null; }
     } });
@@ -227,6 +231,7 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
   };
   const safety = readDrainQueueSafety({ env, log: line => process.stderr.write(`${line}\n`) });
   return {
+    standingRuling: ({ repo, pr, comments }) => standingRulingScope({ repo, pr: { number: Number(pr), comments } }),
     syncStatusLabels: ({ repo, pr, head }) => head ? syncRedTeamStatusLabels({ repo, pr, head, env,
       log: line => process.stderr.write(`${line}\n`) }) : null,
     signalFix: signalFixDispatch,

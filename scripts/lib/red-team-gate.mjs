@@ -238,12 +238,14 @@ export function sendBackStepOutcome(found) {
 }
 
 /**
- * Thread positions of the operator's audited round grants on this PR (`extend-rounds`), scoped to the PR's own repo.
+ * Thread positions of the audited round grants on this PR, scoped to the PR's own repo — THE shared trusted-grant
+ * reader ({@link roundExtensionGrants}): operator `extend-rounds` grants, plus standing-ruling grants only when the
+ * caller passes the read-time-verified `standingRuling` scope (`we:scripts/conveyor/standing-ruling-io.mjs`).
  * No repo means no grant credit: a reader that cannot name the repo keeps the cap (fail closed). PURE.
  */
-function grantPositions(comments, pr, repo = null) {
+function grantPositions(comments, pr, repo = null, standingRuling = null) {
   if (!repo) return [];
-  return roundExtensionGrants(comments, { repo, pr }).map(g => g.index);
+  return roundExtensionGrants(comments, { repo, pr, standingRuling }).map(g => g.index);
 }
 
 /**
@@ -289,7 +291,8 @@ export function gateRoundCap({ cap, grants = [], roundAt = () => null }) {
  * same head is never held behind an actor that is not there. A new head, or the `round-cap` record, releases it too.
  */
 export function redTeamQueueReason(pr, setting = CONFIRMED_BREAKS_DEFAULTS, { repo = pr?.repo ?? null } = {}) {
-  const disposition = readRedTeamDisposition({ comments: pr?.comments, pr: pr?.number, head: pr?.headRefOid, setting, repo });
+  const disposition = readRedTeamDisposition({ comments: pr?.comments, pr: pr?.number, head: pr?.headRefOid, setting, repo,
+    standingRuling: pr?.standingRuling ?? null });
   const sendBack = disposition.sendBack;
   if (!sendBack.length || disposition.outcome !== GATE_OUTCOMES.SENT_BACK) return null;
   const labels = (Array.isArray(pr?.labels) ? pr.labels : []).map((l) => (typeof l === 'string' ? l : l?.name));
@@ -300,7 +303,8 @@ export function redTeamQueueReason(pr, setting = CONFIRMED_BREAKS_DEFAULTS, { re
 
 /** Confirmed send-back findings parked at the round cap on the live head, awaiting an operator ruling. PURE. */
 export function redTeamRulingNeeded(pr, setting = CONFIRMED_BREAKS_DEFAULTS, { repo = pr?.repo ?? null } = {}) {
-  const disposition = readRedTeamDisposition({ comments: pr?.comments, pr: pr?.number, head: pr?.headRefOid, setting, repo });
+  const disposition = readRedTeamDisposition({ comments: pr?.comments, pr: pr?.number, head: pr?.headRefOid, setting, repo,
+    standingRuling: pr?.standingRuling ?? null });
   if (!disposition.held.length) return null;
   const labels = (pr?.labels ?? []).map(l => typeof l === 'string' ? l : l?.name);
   if (labels.includes('review:changes')) return null;
@@ -380,13 +384,13 @@ function gateRecordsFor(records, pr, sha, hit) {
  * The live head's latest red-team result (carried ones included) and the outcomes the gate recorded for THAT result.
  * The gate dedups on this, so a record for an earlier same-head result never stops it deciding a newer one. PURE.
  */
-export function liveResultGateState(comments, pr, head, repo = null) {
+export function liveResultGateState(comments, pr, head, repo = null, standingRuling = null) {
   const live = String(head ?? '').toLowerCase();
   const records = indexedRecords(comments);
   const hit = latestResult(records, pr, live);
   if (!hit) return { result: null, resultId: null, outcomes: new Set(), sendBackOutcome: null, reopened: false };
   const gates = gateRecordsFor(records, pr, live, hit);
-  const { outcome, reopened } = sendBackStepState(gates, grantPositions(comments, pr, repo));
+  const { outcome, reopened } = sendBackStepState(gates, grantPositions(comments, pr, repo, standingRuling));
   return { result: hit.parsed, resultId: redTeamResultId(hit.parsed), outcomes: new Set(gates.map(r => r.gate.outcome)),
     sendBackOutcome: outcome, reopened };
 }
@@ -452,7 +456,7 @@ function gateActionLines(body) {
  * finding. A carried result also keeps the actions bound to the result it was carried from (the same findings,
  * re-keyed); the newer head's own records win. An operator ruling releases only what the gate handed over (`held`).
  */
-export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env, repo = null } = {}) {
+export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env, repo = null, standingRuling = null } = {}) {
   const live = String(head ?? '').toLowerCase();
   const records = indexedRecords(comments);
   const result = latestResult(records, pr, live)?.parsed ?? null;
@@ -482,7 +486,7 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
   const capRecord = liveGates.filter(r => r.gate.outcome === GATE_OUTCOMES.ROUND_CAP).sort(threadOrder).at(-1)?.c ?? null;
   // An operator round grant (for THIS repo's PR) between the cap record and a later `sent-back` record lets that
   // send-back stand. Without a repo there is no grant credit and the cap keeps winning.
-  const outcome = sendBackStepState(liveGates, grantPositions(comments, pr, repo)).outcome;
+  const outcome = sendBackStepState(liveGates, grantPositions(comments, pr, repo, standingRuling)).outcome;
   const ruled = operatorRuled(records, pr, live);
   const sendBack = [], held = [];
   for (const f of result?.findings ?? []) {

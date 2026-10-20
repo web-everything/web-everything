@@ -198,6 +198,25 @@ describe('applyRedTeamGate', () => {
       body: buildGateComment({ pr: 4722, head: HEAD, outcome: GATE_OUTCOMES.ROUND_CAP, plan: { sendBack: [{ index: 1 }], card: [], advisory: [] },
         round, result: redTeamResultId(parseRedTeamComment(comment([F()]).body)) }) });
 
+    // Standing-ruling grants (operator option B): the gate uses the SAME trusted reader, so an App-posted grant
+    // counts only when the io hands it the scope verified from GitHub at this read.
+    const autoGrant = (at = '2026-10-19T12:00:00Z') => ({ id: 'IC_auto', author: { login: 'web-everything' }, createdAt: at,
+      body: buildRoundExtensionComment({ repo: REPO, pr: 4722, by: 1, actor: 'chalbert', channel: 'standing-ruling-auto', reason: 'ruling', at,
+        standingRuling: `${REPO}#5751`, head: HEAD, episode: `${REPO}#4722@${HEAD}:review:12/12` }) });
+    const verified = { id: `${REPO}#5751`, author: 'chalbert', by: 1, maxPerPr: 3, repos: [REPO], cardOnlyHeads: { [HEAD]: true }, uneditedComments: ['IC_auto'] };
+    it('a standing-ruling grant reopens the send-back only under the verified scope', async () => {
+      const comments = [comment([F()]), capRecord(), autoGrant()];
+      const without = fakeIo({ comments, round: 12, readRoundAsOf: () => 12 });
+      expect(await applyRedTeamGate({ repo: REPO, pr: 4722, dryRun: true }, without.io)).toMatchObject({ status: 'already-acted', outcome: 'round-cap' });
+      const unverified = fakeIo({ comments, round: 12, readRoundAsOf: () => 12, standingRuling: () => ({ ...verified, cardOnlyHeads: { [HEAD]: false } }) });
+      expect(await applyRedTeamGate({ repo: REPO, pr: 4722, dryRun: true }, unverified.io)).toMatchObject({ status: 'already-acted', outcome: 'round-cap' });
+      const ok = fakeIo({ comments, round: 12, readRoundAsOf: () => 12, standingRuling: () => verified });
+      expect(await applyRedTeamGate({ repo: REPO, pr: 4722, dryRun: true }, ok.io)).toMatchObject({ status: 'dry-run', reopened: true, cap: 13, outcome: 'sent-back' });
+      const pr = { number: 4722, repo: REPO, headRefOid: HEAD, labels: ['review:accepted'], comments };
+      expect(redTeamRulingNeeded(pr)).not.toBeNull();
+      expect(redTeamRulingNeeded({ ...pr, standingRuling: verified })).toBeNull();
+    });
+
     it('a round-cap record with no later grant stays already-acted (unchanged)', async () => {
       const { io, calls } = fakeIo({ comments: [comment([F()]), capRecord()], round: 12, readRoundAsOf: () => 12 });
       expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'already-acted', outcome: 'round-cap' });

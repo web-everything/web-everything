@@ -23,7 +23,10 @@ import { readHumanSurfaceNetFiles } from '../lib/human-surface-net-diff.mjs';
 import { REVIEW_SETTINGS_FILE } from '../lib/review-seat-settings.mjs';
 import { platformPreference } from '../lib/policy-cascade.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
-import { buildRoundExtensionComment, countGrantedRoundExtensions, countStandingRulingGrantRecords, MAX_TOTAL_ROUND_EXTENSIONS } from './round-extension-mark.mjs';
+import {
+  buildRoundExtensionComment, countGrantedRoundExtensions, countStandingRulingGrantRecords, MAX_TOTAL_ROUND_EXTENSIONS,
+  standingRulingGrantEpisodes,
+} from './round-extension-mark.mjs';
 import { readStandingRuling, standingRulingScope, redact } from './standing-ruling-io.mjs';
 import {
   AUTO_GRANT_ABSOLUTE_MAX, AUTO_GRANT_CHANNEL, autoGrantKey, autoGrantReason, capReachedReason,
@@ -106,18 +109,26 @@ export function autoRoundGrant({ repo, note, pr }, {
   const trustedTotal = (comments) => countGrantedRoundExtensions(comments, { repo: slug, pr: note.prNumber,
     standingRuling: scopeOf({ repo: slug, pr: { number: note.prNumber, comments }, ruling }) });
   try {
-    return ledger(slug, note.prNumber, ({ seeded, baseline, entries, save }) => {
-      if (entries.some((e) => e.key === key)) return { action: 'skip', why: `already claimed: ${key}` };
+    return ledger(slug, note.prNumber, ({ seeded, baseline, entries: ledgerEntries, save }) => {
       let thread;
       try { thread = readThread(slug, note.prNumber); } catch (e) { return { action: 'skip', why: `thread unreadable: ${firstLine(e)}` }; }
       const comments = thread?.comments ?? [];
+      let entries = ledgerEntries;
+      const recordsNow = countStandingRulingGrantRecords(comments, { repo: slug, pr: note.prNumber });
+      if (!seeded) {
+        // Seed from the grants already on the PR, keyed by the limit hit each one answered, so a historical grant
+        // for THIS hit blocks a second one. A record whose key cannot be recovered fails closed (no grant, no seed).
+        const { episodes, unrecoverable } = standingRulingGrantEpisodes(comments, { repo: slug, pr: note.prNumber });
+        if (unrecoverable > 0) return { action: 'skip', why: `${unrecoverable} existing grant record(s) without a recoverable limit-hit key` };
+        entries = episodes.map((episode) => ({ key: episode, outcome: 'historical' }));
+        save({ baseline: 0, entries });
+      }
+      const seed = seeded ? baseline : 0;
+      if (entries.some((e) => e.key === key)) return { action: 'skip', why: `already claimed: ${key}` };
       const scope = scopeOf({ repo: slug, pr: { number: note.prNumber, comments }, ruling });
       const onGitHub = countAutoRoundGrants(comments, { repo: slug, pr: note.prNumber, standingRuling: scope });
-      // Conservative: every automation grant record on the thread NOW (verified or not), the ledger's seed plus
-      // every reservation since, and the verified count — the largest wins.
-      const recordsNow = countStandingRulingGrantRecords(comments, { repo: slug, pr: note.prNumber });
-      const seed = seeded ? baseline : recordsNow;
-      if (!seeded) save({ baseline: seed, entries });
+      // Conservative: every automation grant record on the thread NOW (verified or not), the ledger (seeded from
+      // historical grants) plus every reservation since, and the verified count — the largest wins.
       const used = Math.max(onGitHub, recordsNow, seed + entries.length);
       const verdict = decideAutoGrant({ netRead, used, max, state: thread?.state });
       if (verdict.action === 'skip') return verdict;
@@ -138,9 +149,15 @@ export function autoRoundGrant({ repo, note, pr }, {
           return { action: 'skip', why: 'head moved or PR closed right before the post' };
         }
         const record = { repo: slug, pr: note.prNumber, by: ruling.by, actor: ruling.author, channel: AUTO_GRANT_CHANNEL,
-          reason: autoGrantReason({ note, head, count: verdict.count, max, rulingId: ruling.id }), at: now(), standingRuling: ruling.id, head };
+          reason: autoGrantReason({ note, head, count: verdict.count, max, rulingId: ruling.id }), at: now(), standingRuling: ruling.id, head, episode: key };
         const body = buildRoundExtensionComment(record);
         const trustedBefore = trustedTotal(fresh.comments ?? []);
+        // Re-read head + state IMMEDIATELY before the post (the verification above is slow); refusal keeps the slot.
+        const last = readThread(slug, note.prNumber);
+        if (last?.headRefOid !== head || String(last?.state).toUpperCase() !== 'OPEN') {
+          finish({ outcome: 'aborted', why: 'head moved or PR closed right before the post' });
+          return { action: 'skip', why: 'head moved or PR closed right before the post' };
+        }
         post(slug, note.prNumber, body);
         const after = readThread(slug, note.prNumber);
         // Proof: the thread's whole trusted total rose by exactly the grant (re-verified from GitHub), so a grant
