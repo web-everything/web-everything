@@ -993,6 +993,7 @@ describe('daemon personal-auth fallback guard', () => {
     const dir = mkdtempSync(join(tmpdir(), 'gh-daemon-refuse-'));
     const gh = join(dir, 'real-gh');
     const invoked = join(dir, 'invoked');
+    const argvLog = join(dir, 'argv');
     const cache = join(dir, 'worker.123.json');
     const cacheBase = join(dir, 'worker.json');
     const shim = join(dir, 'shim.cjs');
@@ -1001,7 +1002,7 @@ describe('daemon personal-auth fallback guard', () => {
     // Only synthetic fixture credentials are used by the fake CLI.
     const entry = { v: 2, installationId: '123', appId: '2', token: 'fixture-role', expiresAt: new Date(Date.now() + (fresh ? 3600e3 : 60e3)).toISOString() };
     writeFileSync(cache, JSON.stringify(entry));
-    writeFileSync(gh, `#!${process.execPath}\nrequire('node:fs').appendFileSync(${JSON.stringify(invoked)}, 'called\\n');\n${reject ? "process.stderr.write('HTTP 401: Bad credentials'); process.exitCode = 1;" : "process.stdout.write(process.env.GH_TOKEN === 'fixture-role' ? 'role' : 'personal');"}\n`);
+    writeFileSync(gh, `#!${process.execPath}\nrequire('node:fs').appendFileSync(${JSON.stringify(invoked)}, 'called\\n');\nrequire('node:fs').writeFileSync(${JSON.stringify(argvLog)}, JSON.stringify(process.argv.slice(2)));\n${reject ? "process.stderr.write('HTTP 401: Bad credentials'); process.exitCode = 1;" : "process.stdout.write(process.env.GH_TOKEN === 'fixture-role' ? 'role' : 'personal');"}\n`);
     chmodSync(gh, 0o755);
     if (refresh !== 'missing') writeFileSync(refreshCliPath, `require('node:fs').appendFileSync(${JSON.stringify(calls)}, 'once\\n');\n${refresh === 'success' ? `require('node:fs').writeFileSync(${JSON.stringify(cache)}, ${JSON.stringify(JSON.stringify({ ...entry, expiresAt: new Date(Date.now() + 3600e3).toISOString() }))});` : 'process.exitCode = 1;'}\n`);
     writeFileSync(shim, renderGhShimScript({ realGhPath: gh, cachePath: join(dir, 'legacy.json'), ghThrottleCliPath: join(dir, 'missing-throttle'), refreshCliPath,
@@ -1022,7 +1023,8 @@ require(${JSON.stringify(shim)});
     const run = (extra = {}, argv = ['pr', 'list', '-R', 'chalbert/web-everything']) => spawnSync(process.execPath, [entryPoint, ...argv], {
       cwd: dir, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: dir, WE_GH_DAEMON_CALLER: 'test-daemon', ...extra },
     });
-    return { dir, cache, run, invoked, calls };
+    const argvSeen = () => JSON.parse(readFileSync(argvLog, 'utf8'));
+    return { dir, cache, run, invoked, calls, argvSeen };
   }
 
   it.each(['missing', 'failure'])('refuses stale caches when refresh is %s, without invoking gh', (refresh) => {
@@ -1353,6 +1355,96 @@ require(${JSON.stringify(shim)});
       const r = f.run({ GH_REPO: 'web-everything/repo' }, argv);
       expect(r.status, r.stderr).toBe(0);
       expect(r.stdout).toBe('role');
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  // PR #5729 red team: `auth status` checks every stored account unless --active narrows it.
+  it.each([
+    [['auth', 'status']],
+    [['auth', 'status', '-t']],
+    [['auth', 'status', '--active=false']],
+    [['auth', 'status', '-ah', 'github.com']],
+  ])('pins auth status to the active App token on a fresh App cache (%j)', (argv) => {
+    const f = fixture({ fresh: true });
+    try {
+      const r = f.run({ GH_REPO: 'web-everything/repo' }, argv);
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stdout).toBe('role');
+      expect(f.argvSeen()).toEqual([...argv, '--active', '--hostname', 'github.com']);
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  it('pins auth status under inherited App provenance, but not under an allowed personal fallback', async () => {
+    const { createHash } = await import('node:crypto');
+    const f = fixture();
+    try {
+      const inherited = f.run({ GH_TOKEN: 'fixture-role', WE_GH_AUTH_TOKEN_HASH: createHash('sha256').update('fixture-role').digest('hex') }, ['auth', 'status']);
+      expect(inherited.status, inherited.stderr).toBe(0);
+      expect(f.argvSeen()).toEqual(['auth', 'status', '--active', '--hostname', 'github.com']);
+      const allowed = f.run({ WE_GH_AUTH_PERSONAL_FALLBACK: 'allow' }, ['auth', 'status']);
+      expect(allowed.status, allowed.stderr).toBe(0);
+      expect(f.argvSeen()).toEqual(['auth', 'status']);
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    [{}, ['auth', 'login']],
+    [{}, ['auth', 'logout', '-u', 'operator']],
+    [{}, ['auth', 'switch']],
+    [{}, ['auth', 'refresh']],
+    [{}, ['auth', 'setup-git']],
+    [{}, ['auth', 'git-credential', 'get']],
+    [{}, ['auth', '--hostname', 'github.com', 'status']],
+    [{}, ['auth', 'token', '-u', 'operator']],
+    [{}, ['auth', 'token', '-uoperator']],
+    [{}, ['auth', 'token', '--user', 'operator']],
+    [{}, ['auth', 'token', '--user=operator']],
+    [{ GH_HOST: 'github.com' }, ['auth', 'status', '-ahgithub.corp.example']],
+    [{ GH_HOST: 'github.com' }, ['auth', 'status', '-ah', 'github.corp.example']],
+    [{ GH_HOST: 'github.com' }, ['auth', 'status', '-ah=github.corp.example']],
+    [{ GH_HOST: 'github.com' }, ['auth', 'status', '-tahgithub.corp.example']],
+    [{ GH_HOST: 'github.com' }, ['auth', 'status', '-at', '-h', 'github.corp.example']],
+    [{ GH_HOST: 'github.com' }, ['auth', 'status', '--hostname', '-corp']],
+    [{ GH_HOST: 'github.com' }, ['auth', 'token', '-h=github.corp.example']],
+    [{}, ['extension', 'install', 'github.corp.example/owner/gh-ext']],
+    [{}, ['ext', 'install', '--pin', 'v1', 'enterprise/owner/gh-ext']],
+    [{}, ['issue', 'transfer', '123', 'github.corp.example/owner/repo']],
+    [{}, ['repo', 'credits', 'enterprise/owner/repo']],
+    [{}, ['issue', 'develop', '123', '--branch-repo', 'github.corp.example/owner/repo']],
+    [{}, ['issue', 'develop', '123', '--branch-repo=enterprise/owner/repo']],
+    [{}, ['secret', 'set', 'FOO', '-o', 'org', '--repos', 'web-everything/repo,enterprise/owner/repo']],
+    [{}, ['secret', 'set', 'FOO', '-urenterprise/owner/repo']],
+    [{}, ['variable', 'set', 'FOO', '-o', 'org', '-r', 'enterprise/owner/repo']],
+  ])('refuses stored or enterprise credentials before using a fresh App cache (%j, %j)', (extra, argv) => {
+    const f = fixture({ fresh: true });
+    try {
+      // GH_REPO selects the owner whose fresh App token would otherwise be used for this call.
+      const r = f.run({ GH_REPO: 'web-everything/repo', GH_ENTERPRISE_TOKEN: 'fixture-personal-enterprise', ...extra }, argv);
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('REFUSING');
+      expect(r.stderr).not.toContain('no fresh token cached');
+      expect(existsSync(f.invoked)).toBe(false);
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  // PR #5729 red team: a dotted local directory is not a host; only repository slots take HOST/OWNER/REPO.
+  it.each([
+    ['release', 'upload', 'v1', 'build.v1/linux/app.tar.gz', '-R', 'web-everything/repo'],
+    ['release', 'create', 'v1', 'build.v1/linux/app.tar.gz'],
+    ['repo', 'clone', 'web-everything/repo', 'build.v1/linux/repo'],
+    ['gist', 'create', 'build.v1/notes/a.md'],
+    ['browse', 'docs.v1/guide/index.md'],
+    ['pr', 'view', 'release.v1/foo/bar'],
+    ['pr', 'checkout', 'release.v1/foo/bar'],
+    ['auth', 'token', '-h', 'github.com'],
+    ['auth', 'token'],
+  ])('lets local paths and branch names with dots through on a public call: %j', (...argv) => {
+    const f = fixture({ fresh: true });
+    try {
+      const r = f.run({ GH_REPO: 'web-everything/repo' }, argv);
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stdout).toBe('role');
+      expect(f.argvSeen()).toEqual(argv);
     } finally { rmSync(f.dir, { recursive: true, force: true }); }
   });
 

@@ -581,8 +581,8 @@ function invalidateSharedCache() {
 // process down before it drains, silently truncating whatever \`gh\` printed. Setting \`exitCode\` and letting the
 // script fall off the end instead keeps the event loop alive until every queued write really lands.
 function runInherited(env, reason) {
+  const inheritedApp = DAEMON && !unsupportedHost && env.GH_TOKEN && env.WE_GH_AUTH_TOKEN_HASH === createHash('sha256').update(env.GH_TOKEN).digest('hex');
   if (DAEMON) {
-    const inheritedApp = !unsupportedHost && env.GH_TOKEN && env.WE_GH_AUTH_TOKEN_HASH === createHash('sha256').update(env.GH_TOKEN).digest('hex');
     if (!inheritedApp) {
       const detail = ' for daemon caller "' + DAEMON_CALLER + '" (role ' + requestedRole(env)
         + ', owner ' + (targetOwner(process.argv.slice(2), env) || 'unknown') + '): '
@@ -599,7 +599,7 @@ function runInherited(env, reason) {
   // #4064: was a direct \`spawnSync(REAL_GH, ..., {stdio:'inherit'})\` — now routed through the SAME throttled
   // hop as the tokened path below (stdout/stderr captured then relayed, never \`process.exit()\`'d past — see
   // the block comment above), so the concurrency cap still applies on the no-cached-token fallback too.
-  const result = runThrottled(process.argv.slice(2), env);
+  const result = runThrottled(inheritedApp ? appTokenArgv(process.argv.slice(2)) : process.argv.slice(2), env);
   if (result.error) {
     process.stderr.write(String(result.error && result.error.message || result.error) + '\\n');
     process.exitCode = 1;
@@ -608,6 +608,13 @@ function runInherited(env, reason) {
   if (result.stdout && result.stdout.length) process.stdout.write(result.stdout);
   if (result.stderr && result.stderr.length) process.stderr.write(result.stderr);
   process.exitCode = result.status == null ? 1 : result.status;
+}
+
+// \`gh auth status\` also validates every stored account (TokenForUser) and every configured host
+// unless --active and --hostname narrow it. A daemon spending App credentials checks only the active
+// github.com token, which GH_TOKEN supplies. Appended last so a user's --active=false cannot win.
+function appTokenArgv(argv) {
+  return DAEMON && argv[0] === 'auth' && argv[1] === 'status' ? [...argv, '--active', '--hostname', 'github.com'] : argv;
 }
 
 // These Apps and their provenance are scoped to github.com. Enterprise gh selects a different
@@ -622,6 +629,10 @@ function unsupportedTargetHost(argv, env) {
   if (argv[0] && !argv[0].startsWith('-') && !nativeCommands.includes(argv[0])) return 'unknown command or alias';
   if (argv[0]?.startsWith('-') && argv.length > 1) return 'ambiguous command';
   if (['extension', 'ext'].includes(argv[0]) && argv[1] === 'exec') return 'extension execution';
+  // Other auth commands read, write or validate stored per-account credentials (git-credential also
+  // takes its host from stdin). \`auth status\` is pinned to the active App token by appTokenArgv.
+  if (argv[0] === 'auth' && argv[1] !== undefined && !['status', 'token'].includes(argv[1])) return 'auth ' + argv[1] + ' uses stored credentials';
+  if (argv[0] === 'auth' && argv[1] === 'token' && argv.some((a) => a === '--user' || a.startsWith('--user=') || /^-u/.test(a))) return 'stored account token';
   const repoHost = (value, api = false) => {
     const s = String(value || '');
     if (/^[a-z][a-z0-9+.-]*:[/][/]/i.test(s)) {
@@ -675,10 +686,19 @@ function unsupportedTargetHost(argv, env) {
     'repo view': ['-b', '--branch'],
   }[command] || [];
   for (const flag of repositoryContentFlags) valueFlags.add(flag);
-  const repositoryPositionals = (argv[0] === 'repo' && ['archive', 'clone', 'create', 'delete', 'edit',
-    'fork', 'rename', 'set-default', 'sync', 'unarchive', 'view'].includes(subcommand)) || command === 'label clone';
+  // The positionals gh parses as [HOST/]OWNER/REPO (ghrepo.FromFullName). Every other positional is a
+  // local path, branch, tag or name, so a dotted directory like build.v1/app.tar.gz selects no host.
+  const repositoryPositionals = (argv[0] === 'repo' && ['archive', 'clone', 'create', 'credits', 'delete', 'edit',
+    'fork', 'rename', 'set-default', 'sync', 'unarchive', 'view'].includes(subcommand))
+    || ['label clone', 'extension install', 'ext install', 'issue transfer'].includes(command);
+  if (['extension install', 'ext install'].includes(command)) valueFlags.add('--pin');
   // --template is output content elsewhere, but repo create uses it as a source repository.
-  const repositoryFlags = command === 'repo create' ? ['--template', '-p'] : command === 'repo sync' ? ['--source', '-s'] : [];
+  const repositoryFlags = {
+    'repo create': ['--template', '-p'], 'repo sync': ['--source', '-s'], 'issue develop': ['--branch-repo'],
+    'secret set': ['--repos', '-r'], 'variable set': ['--repos', '-r'],
+  }[command] || [];
+  // --repos takes a comma-separated list; each entry may name its own host.
+  const repoValueHost = (value) => String(value ?? '').split(',').map((part) => repoHost(part.trim())).find(Boolean) || null;
   // Only advance over known boolean shorthands. An unknown shorthand may consume the
   // rest of the argument as content (-fR=... is a workflow field, not a repo selector).
   const booleanShorthands = {
@@ -700,11 +720,12 @@ function unsupportedTargetHost(argv, env) {
     'codespace delete': 'f', 'codespace list': 'w', 'codespace logs': 'f', 'codespace ssh': 'd',
     'secret set': 'u', 'secret list': 'u', 'secret delete': 'u',
     'search code': 'w', 'search commits': 'w', 'search issues': 'w', 'search prs': 'w', 'search repos': 'w',
+    'auth status': 'at',
   }[command] || (argv[0] === 'browse' ? 'anprsw' : '');
   let cloneSourceSeen = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    // pflag permits boolean bundles before a value flag: -cRhost/o/r, -fsHOST/o/r.
+    // pflag permits boolean bundles before a value flag: -cRhost/o/r, -fsHOST/o/r, -ahHOST.
     // A known content flag consumes the remainder, so -bRhost/o/r stays body text.
     if (a.startsWith('-') && !a.startsWith('--')) {
       let consumed = false;
@@ -712,8 +733,15 @@ function unsupportedTargetHost(argv, env) {
         const flag = '-' + a[j];
         if (flag === '-R' || repositoryFlags.includes(flag)) {
           const value = j + 1 < a.length ? a.slice(j + 1).replace(/^=/, '') : argv[++i];
-          const host = repoHost(value);
+          const host = repoValueHost(value);
           if (host) return host;
+          consumed = true;
+          break;
+        }
+        // auth -h is --hostname. pflag takes the next argument as its value even when it starts with -.
+        if (argv[0] === 'auth' && flag === '-h') {
+          const host = j + 1 < a.length ? a.slice(j + 1).replace(/^=/, '') : argv[++i];
+          if (!publicHost(host ?? '')) return host || 'unknown';
           consumed = true;
           break;
         }
@@ -729,14 +757,14 @@ function unsupportedTargetHost(argv, env) {
     const repositoryFlag = repositoryFlags.find((flag) => a === flag || a.startsWith(flag + '='));
     if (repositoryFlag) {
       const value = a === repositoryFlag ? argv[++i] : a.slice(repositoryFlag.length).replace(/^=/, '');
-      const host = repoHost(value);
+      const host = repoValueHost(value);
       if (host) return host;
       continue;
     }
     if (valueFlags.has(a)) { i++; continue; }
-    if (a === '--hostname' || a === '--host' || (argv[0] === 'auth' && a === '-h')) {
-      const host = argv[i + 1];
-      if (host && !host.startsWith('-')) { if (!publicHost(host)) return host; i++; }
+    if (a === '--hostname' || a === '--host') {
+      const host = argv[++i];
+      if (!publicHost(host ?? '')) return host || 'unknown';
       continue;
     }
     if (a.startsWith('--hostname=') || a.startsWith('--host=')) {
@@ -744,16 +772,15 @@ function unsupportedTargetHost(argv, env) {
       if (!publicHost(host)) return host || 'unknown';
       continue;
     }
-    if (argv[0] === 'auth' && a.startsWith('-h') && a.length > 2) { if (!publicHost(a.slice(2))) return a.slice(2); continue; }
     if (a === '--repo') { const host = repoHost(argv[++i]); if (host) return host; continue; }
     if (a.startsWith('--repo=')) { const host = repoHost(a.slice(7)); if (host) return host; continue; }
     // Repository arguments also accept single-label host/owner/repo and SCP syntax. A
-    // clone's second positional is a local directory; asset paths and relative API
-    // endpoints likewise do not select a host. Keep scanning URLs after unknown flags.
+    // clone's second positional is a local directory; asset paths, branch names and relative
+    // API endpoints likewise do not select a host. Keep scanning URLs after unknown flags.
     const repositoryTarget = repositoryPositionals && i > 1 && !a.startsWith('-')
       && (command !== 'repo clone' || !cloneSourceSeen);
     if (repositoryTarget && command === 'repo clone') cloneSourceSeen = true;
-    if (targetCommand && !a.startsWith('-') && (repositoryTarget || /^[a-z][a-z0-9+.-]*:[/][/]/i.test(a) || /^[^/]+[.][^/]+[/]/.test(a))) {
+    if (targetCommand && !a.startsWith('-') && (repositoryTarget || /^[a-z][a-z0-9+.-]*:[/][/]/i.test(a))) {
       const host = repoHost(a, argv[0] === 'api');
       if (host) return host;
     }
@@ -796,9 +823,9 @@ if (!token && DAEMON && !unsupportedHost) {
 process.stdout.on('error', () => {});
 process.stderr.on('error', () => {});
 if (!token) {
-  runInherited(process.env, unsupportedHost ? 'unsupported GitHub host' : undefined);
+  runInherited(process.env, unsupportedHost ? 'unsupported GitHub host (' + unsupportedHost + ')' : undefined);
 } else {
-  const withToken = runThrottled(process.argv.slice(2), Object.assign({}, process.env, { GH_TOKEN: token }));
+  const withToken = runThrottled(appTokenArgv(process.argv.slice(2)), Object.assign({}, process.env, { GH_TOKEN: token }));
   if (withToken.error) {
     process.stderr.write(String(withToken.error.message || withToken.error) + '\\n');
     process.exitCode = 1;
