@@ -109,6 +109,9 @@ describe('xqz26k1 pure hunk rule', () => {
   it('[A3] a hunk whose kept side drops a numeric cap the other carries is never auto-resolved (attempts 1 vs 3)', () => {
     expect(guardDiff(['x = { attempts: 3, runTimeoutMin: 30 }'], ['x = { attempts: 1 }'])).toEqual(['attempts=1']);
     expect(guardDiff(['v => v <= 120000'], ['v => v <= 60000'])).toEqual(['v<=60000']);
+    expect(guardDiff(['  "attempts": 3,'], ['  "attempts": 1,'])).toEqual(['attempts=1']); // JSON settings too
+    // a killed merge-file (empty output) is never a resolution
+    expect(resolveFileHunks({ diff3: '' })).toMatchObject({ ok: false, hunks: [{ why: 'merge-file-no-conflict-output' }] });
     expect(guardDiff(['`attempts` defaults to 3;'], ['`attempts` defaults to 1 and has a hard upper bound of 1.'])).toContain('doc:attempts=1');
     const base = ['const D = { attempts: 3 };'];
     const ov = ['const D = { attempts: 1 };'];
@@ -216,6 +219,26 @@ describe('xqz26k1 — a held clone builds and checks its own refresh candidate',
     const r = await rebuild(f);
     expect(r.autoRefresh).toMatchObject({ verdict: 'needs-human', candidate: null });
     expect(r.alerts.find((a) => a.kind === 'auto-refresh-candidate').detail.unresolved[0].why).toMatch(/^guard-diff: .*attempts=1/);
+  });
+
+  it('an overlay removed from the list voids the recorded candidate; shadow-passed candidates are re-checked once mode is on', async () => {
+    const f = fixture();
+    await heldOnGraduation(f);
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const shadow = await rebuild(f);
+    expect(shadow.autoRefresh.check.verdict).toBe('would-adopt');
+    f.env[AUTO_REFRESH_MODE_ENV] = 'on';
+    const on = await rebuild(f);
+    expect(on.autoRefresh).toMatchObject({ checkDue: true, check: { verdict: 'registered' } });
+
+    const g = fixture();
+    await heldOnGraduation(g);
+    gitOk(g.clone, ['fetch', '-q', 'origin']);
+    expect((await rebuild(g, { entries: undefined })).autoRefresh.verdict).toBe('clean');
+    addOverlay(g.clone, { ref: 'lane/feat', pr: 77 }, { env: g.env }); // same branch name, now another PR
+    const voided = await rebuild(g);
+    expect(voided.autoRefresh).toMatchObject({ verdict: 'needs-human', checkDue: false });
+    expect(voided.alerts.find((a) => a.kind === 'auto-refresh-candidate-voided')?.detail.reason).toMatch(/overlay-no-longer-registered: lane\/feat/);
   });
 
   it('mode off: the plain x9diisp hold, no candidate', async () => {

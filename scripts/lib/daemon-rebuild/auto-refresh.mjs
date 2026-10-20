@@ -47,7 +47,7 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { cascadePolicy } from '../policy-cascade.mjs';
-import { cloneKey, addOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
+import { cloneKey, addOverlay, appendOverlayEvent, readOverlayState } from '../daemon-overlays.mjs';
 import { stateDir, alertsFilePath } from './state.mjs';
 import {
   verifyRev, rebuildCommitEnv, FULL_SHA_RE, REBUILD_IDENTITY_ENV,
@@ -164,7 +164,7 @@ export function carriedBy(change, { base, other, otherHistoryRuns = [] }) {
   return true;
 }
 
-const NUM_FACT_RE = /([A-Za-z_$][\w$]*)\s*[:=]\s*(-?\d[\d_]*(?:\.\d+)?)(?![\w.])/g;
+const NUM_FACT_RE = /["']?([A-Za-z_$][\w$-]*)["']?\s*[:=]\s*(-?\d[\d_]*(?:\.\d+)?)(?![\w.])/g;
 const CMP_FACT_RE = /([\w$.?\])]+)\s*(<=|>=|===|!==|<|>)\s*(-?[\w$.]+)/g;
 const DOC_FACT_RE = /`([\w.$-]+)`[^.\n`]{0,60}?\b(?:defaults? to|is capped at|capped at|upper bound of|bound of|is|=)\s*`?(-?\d[\d_]*)/gi;
 
@@ -225,6 +225,8 @@ export function parseDiff3(text) {
 export function resolveFileHunks({ diff3, overlayRuns = [], mainRuns = [], docsConfig = false, patchIdCarried = false }) {
   const segs = parseDiff3(diff3);
   if (!segs) return { ok: false, hunks: [{ line: 0, why: 'unparseable-conflict-markers' }] };
+  // merge-tree said this file conflicts: output without a conflict hunk (a killed or failed merge-file) is never a resolution.
+  if (!segs.some((x) => !x.text)) return { ok: false, hunks: [{ line: 0, why: 'merge-file-no-conflict-output' }] };
   const out = [];
   const hunks = [];
   let ok = true;
@@ -279,6 +281,20 @@ export function overlaysMergedBy(git, build, mainSha) {
   return merged;
 }
 
+const prKey = (pr) => (pr == null || pr === '' ? null : Number(pr));
+/**
+ * Identity scoping (edge case 5): the overlays `headSha` carries that are no longer registered on this clone, matched on
+ * ref AND PR (a branch name reused by another PR is a different overlay). Null on a git error (fail closed).
+ * @param {Iterable<string|{ref:string, pr?:number|null}>} registered
+ */
+export function unregisteredCarried(git, headSha, mainSha, registered) {
+  const merged = overlaysMergedBy(git, headSha, mainSha);
+  if (!merged) return null;
+  const reg = [...registered].map((r) => (typeof r === 'string' ? { ref: r, pr: null } : { ref: r?.ref, pr: r?.pr ?? null }));
+  const gone = merged.filter((m) => !reg.some((r) => r.ref === m.ref && prKey(r.pr) === prKey(m.pr)));
+  return { merged, gone: [...new Set(gone.map((m) => (m.pr != null ? `${m.ref} (PR #${m.pr})` : m.ref)))] };
+}
+
 /** Runs of lines each non-merge commit in `from --not notIn` added to `path` (`-U0` hunks). Null on a git error. */
 function historyRuns(git, from, notIn, path) {
   const r = git(['log', '--no-merges', '-p', '-U0', '--no-color', '--no-ext-diff', '--format=%x01', from, '--not', notIn, '--', path]);
@@ -325,7 +341,7 @@ function conflictStages(stdout) {
 /** Test files in `sha`'s tree that cover the given source files (same stem in an `__tests__` dir), capped. */
 export function touchedTests(git, sha, files) {
   const ls = git(['ls-tree', '-r', '--name-only', sha]);
-  if (ls.status !== 0) return [];
+  if (ls.status !== 0 || !String(ls.stdout ?? '').trim()) return null;
   const all = String(ls.stdout ?? '').split('\n').filter((p) => /\/__tests__\/[^/]+\.test\.m?[jt]s$/.test(p));
   const out = new Set();
   for (const f of files) {
@@ -358,12 +374,10 @@ export function buildRefreshCandidate({
   const fail = (reason, extra = {}) => ({ ...base, ...extra, reason });
   if (!FULL_SHA_RE.test(String(headSha)) || !FULL_SHA_RE.test(String(mainSha))) return fail('bad-input');
   // Identity scoping (edge case 5): the candidate may only carry overlays still registered on THIS clone.
-  const merged = overlaysMergedBy(git, headSha, mainSha);
-  if (!merged) return fail('git-failed: log');
-  const registered = new Set(registeredRefs);
-  const carried = [...new Set(merged.map((m) => m.ref))];
-  const gone = carried.filter((r) => !registered.has(r));
-  if (gone.length > 0) return fail(`overlay-no-longer-registered: ${gone.join(', ')}`, { carried });
+  const scope = unregisteredCarried(git, headSha, mainSha, registeredRefs);
+  if (!scope) return fail('git-failed: log');
+  const carried = [...new Set(scope.merged.map((m) => m.ref))];
+  if (scope.gone.length > 0) return fail(`overlay-no-longer-registered: ${scope.gone.join(', ')}`, { carried });
   base.carried = carried;
 
   const mt = git(['merge-tree', '--write-tree', '--no-messages', headSha, mainSha]);
@@ -408,7 +422,7 @@ export function buildRefreshCandidate({
   }
   base.files = files;
   base.unresolved = unresolved;
-  base.tests = touchedTests(git, mainSha, [...stages.keys()]);
+  base.tests = touchedTests(git, mainSha, [...stages.keys()]) ?? [];
   if (unresolved.length > 0) return { ...base, reason: `unresolved: ${unresolved.map((u) => u.path).join(', ')}` };
 
   let tree = mergedTree;
@@ -435,9 +449,49 @@ export function buildRefreshCandidate({
   const ct = git(['commit-tree', tree, '-p', headSha, '-p', mainSha, '-m', message], { env: rebuildCommitEnv(git, headSha, mainSha) });
   const candidate = String(ct.stdout ?? '').trim();
   if (ct.status !== 0 || !FULL_SHA_RE.test(candidate)) return fail('git-failed: commit-tree');
+  const tests = touchedTests(git, candidate, [...stages.keys()]);
+  if (tests === null) return fail('git-failed: ls-tree');
+  // 2. WHOLE-FILE guard check (not only the conflict hunks): in every file BOTH sides changed, each guard fact a side
+  //    INTRODUCED (absent from the merge base) must survive in the candidate — git's clean merge of the other hunks
+  //    included. A side's own change is never silently relaxed by the other side.
+  const lost = guardsLost(git, { headSha, mainSha, candidate });
+  if (lost === null) return fail('git-failed: guard-check');
+  if (lost.length > 0) {
+    return fail(`guard-lost: ${lost.map((l) => `${l.path} (${l.facts.slice(0, 3).join(', ')})`).join('; ')}`, {
+      files, unresolved: lost.map((l) => ({ path: l.path, why: `guard-lost: ${l.facts.slice(0, 4).join(', ')}` })), tests,
+    });
+  }
   return {
-    ...base, verdict: 'clean', candidate, tests: touchedTests(git, candidate, [...stages.keys()]),
+    ...base, verdict: 'clean', candidate, tests,
   };
+}
+
+/** Files both sides changed whose candidate version lost a guard fact one side introduced. Null on a git error. */
+export function guardsLost(git, { headSha, mainSha, candidate }) {
+  const mb = git(['merge-base', headSha, mainSha]);
+  const baseSha = String(mb.stdout ?? '').trim();
+  if (mb.status !== 0 || !FULL_SHA_RE.test(baseSha)) return null;
+  const names = (a, b) => {
+    const d = git(['diff', '--name-only', '--no-renames', a, b]);
+    return d.status === 0 ? String(d.stdout ?? '').split('\n').filter(Boolean) : null;
+  };
+  const ov = names(baseSha, headSha);
+  const mn = names(baseSha, mainSha);
+  if (!ov || !mn) return null;
+  const both = ov.filter((p) => mn.includes(p));
+  const read = (rev, p) => {
+    const r = git(['cat-file', '-p', `${rev}:${p}`]);
+    return r.status === 0 ? String(r.stdout ?? '').split('\n') : [];
+  };
+  const out = [];
+  for (const p of both) {
+    const b = guardFacts(read(baseSha, p));
+    const c = guardFacts(read(candidate, p));
+    const introduced = [...guardFacts(read(headSha, p)), ...guardFacts(read(mainSha, p))].filter((f) => !b.has(f));
+    const facts = [...new Set(introduced.filter((f) => !c.has(f)))];
+    if (facts.length > 0) out.push({ path: p, facts });
+  }
+  return out;
 }
 
 // ── record (one build per key, one check per candidate) ────────────────────────────────────────────────────────
@@ -502,12 +556,29 @@ export function autoRefreshAtHold({
     try { writeAutoRefreshRecord(root, rec, stEnv); } catch { /* best-effort: the next tick rebuilds the same candidate */ }
   }
   const b = rec.build;
+  // A cached build is re-scoped every tick: an overlay removed since it was built voids it (fail closed).
+  if (b.verdict === 'clean') {
+    let scope = null;
+    try { scope = unregisteredCarried(gitIO({ run, cwd: root, env }), headSha, mainSha, registeredRefs); } catch { scope = null; }
+    if (!scope || scope.gone.length > 0) {
+      const reason = scope ? `overlay-no-longer-registered: ${scope.gone.join(', ')}` : 'git-failed: log';
+      alert('auto-refresh-candidate-voided', { candidate: b.candidate, reason });
+      rec.build = { ...b, verdict: 'needs-human', reason };
+      try { writeAutoRefreshRecord(root, rec, stEnv); } catch { /* best-effort */ }
+      return {
+        mode, source, verdict: 'needs-human', candidate: b.candidate, checkWanted: false, checkDue: false, tests: b.tests, headSha, mainSha,
+        message: describeBuild(mode, rec.build),
+      };
+    }
+  }
   const claimAge = rec.check?.status === 'running' ? now() - Date.parse(rec.check.startedAt || 0) : 0;
   const checkWanted = b.verdict === 'clean' && !!b.candidate
-    && (!rec.check || (rec.check.status === 'running' && claimAge > AUTO_REFRESH_CHECK_CLAIM_MS));
+    && (!rec.check || (rec.check.status === 'running' && claimAge > AUTO_REFRESH_CHECK_CLAIM_MS)
+      // a candidate that passed in SHADOW is checked again once the mode is on (the on-path registers it)
+      || (mode === 'on' && rec.check.status === 'passed' && rec.check.mode !== 'on'));
   let checkDue = false;
   if (checkWanted && canCheck) {
-    rec.check = { status: 'running', by: `${process.pid}@${hostname()}`, startedAt: new Date(now()).toISOString() };
+    rec.check = { status: 'running', mode, by: `${process.pid}@${hostname()}`, startedAt: new Date(now()).toISOString() };
     try { writeAutoRefreshRecord(root, rec, stEnv); checkDue = true; } catch { checkDue = false; }
   }
   return {
@@ -587,7 +658,7 @@ export async function runAutoRefreshCheck({
       try {
         const smokeEnv = candidateSmokeEnv({ root, env });
         let s;
-        try { s = await runSmoke({ root: c.path, env: smokeEnv, changedFiles: null }); } catch (e) { s = { verdict: 'error', error: String(e?.message ?? e) }; }
+        try { s = await runSmoke({ root: c.path, env: smokeEnv, changedFiles: null, retries: 0 }); } catch (e) { s = { verdict: 'error', error: String(e?.message ?? e) }; }
         result.smoke = s?.verdict === 'pass' ? 'pass' : `fail${s?.smoke?.results ? `: ${s.smoke.results.filter((x) => !x.ok).map((x) => x.name).join(',')}` : ''}`;
         if (result.smoke === 'pass' && ar.tests.length > 0) {
           const t = await runTests({ cwd: c.path, files: ar.tests, env: smokeEnv });
@@ -606,11 +677,16 @@ export async function runAutoRefreshCheck({
   const passed = result.smoke === 'pass' && ['passed', 'none'].includes(result.tests) && !result.stale;
   let registered = null;
   if (passed && ar.mode === 'on') {
+    // Re-scope right before publishing: an overlay removed during the off-lock check must never come back.
+    const scope = unregisteredCarried(git, ar.headSha, ar.mainSha, readOverlayState(root, { env }).overlays || []);
+    if (!scope || scope.gone.length > 0) registered = { ok: false, reason: scope ? `overlay-no-longer-registered: ${scope.gone.join(', ')}` : 'git-failed: log' };
+  }
+  if (passed && ar.mode === 'on' && !registered) {
     try { registered = register({ run, root, env, candidate: ar.candidate, headSha: ar.headSha, mainSha: ar.mainSha, cloneKind }); } catch (e) { registered = { ok: false, reason: String(e?.message ?? e) }; }
   }
   const rec = readAutoRefreshRecord(root, stEnv);
   if (rec && rec.key === `${ar.headSha}:${ar.mainSha}`) {
-    rec.check = { status: passed ? 'passed' : 'failed', ...result, finishedAt: nowIso(), ...(registered ? { registered } : {}) };
+    rec.check = { status: passed ? 'passed' : 'failed', mode: ar.mode, ...result, finishedAt: nowIso(), ...(registered ? { registered } : {}) };
     try { writeAutoRefreshRecord(root, rec, stEnv); } catch { /* best-effort */ }
   }
   const verdict = passed ? (ar.mode === 'on' ? (registered?.ok ? 'registered' : 'register-failed') : 'would-adopt') : 'not-adoptable';

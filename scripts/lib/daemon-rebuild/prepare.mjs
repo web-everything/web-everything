@@ -340,7 +340,7 @@ export async function prepareRebuild({
     const autoRefresh = state.adopted?.head === prevHead && plan.mainSha
       ? autoRefreshAtHold({
         run, root, env, stEnv, headSha: prevHead, mainSha: plan.mainSha, alert, now: nowMs, canCheck: !!canAutoRefreshCheck,
-        registeredRefs: (overlaysBefore || []).map((o) => o?.ref).filter(Boolean),
+        registeredRefs: (overlaysBefore || []).filter((o) => o?.ref).map((o) => ({ ref: o.ref, pr: o.pr ?? null })),
       })
       : null;
     return terminal({ moved: false, reason: 'established-overlay-conflict', detail, ...(autoRefresh ? { autoRefresh } : {}) });
