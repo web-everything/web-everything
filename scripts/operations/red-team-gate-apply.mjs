@@ -137,8 +137,8 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
     const view = io.readPr({ repo, pr });
     const head = String(view?.headRefOid ?? '').toLowerCase();
     // Verify once for this read; both the retry decision and the cap must use the same trusted grant scope.
-    let standingRuling = null;
-    try { standingRuling = io.standingRuling?.({ repo, pr: { ...view, number: pr } }) ?? null; } catch { standingRuling = null; }
+    // Verify once for this read; a failed verification is an error status (no write), never a silent fallback.
+    const standingRuling = io.standingRuling?.({ repo, pr: { ...view, number: pr } }) ?? null;
     // The live head's latest result, and only the records that decide THAT result (an earlier same-head result's
     // records never dedup a newer one, PR #5482).
     const posted = liveResultGateState(view?.comments, pr, head, null, repo, standingRuling);

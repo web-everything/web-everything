@@ -252,31 +252,8 @@ describe('applyRedTeamGate', () => {
       expect(redTeamRulingNeeded(pr)).toEqual(redTeamRulingNeeded(none));
     });
 
-    it('snapshots the verified grant once, survives a delayed cap record, and re-verifies on retry', async () => {
-      const comments = [comment([F()]), capRecord(12, []), autoGrant()];
-      let scope = verified;
-      const reads = [];
-      const { io, calls } = fakeIo({ comments, round: 12, readRoundAsOf: () => 12,
-        standingRuling: (args) => { reads.push(args); return scope; } });
-      expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'applied', outcome: 'sent-back' });
-      expect(reads).toHaveLength(1);
-      expect(reads[0]).toMatchObject({ repo: REPO, pr: { number: 4722, headRefOid: HEAD, comments } });
-      const sent = parseRedTeamGateMarker(comments.at(-1).body);
-      expect(sent).toMatchObject({ outcome: 'sent-back', grantIds: [expect.any(String)] });
-      comments.push(capRecord(12, [])); // an older decision whose POST arrived after the send-back
-      const pr = { number: 4722, repo: REPO, headRefOid: HEAD, labels: ['review:changes'], comments, standingRuling: verified };
-      expect(redTeamQueueReason(pr)).toMatch(/^red team:/);
-      expect(redTeamQueueReason({ ...pr, standingRuling: null })).toBeNull();
-      expect(redTeamRulingNeeded({ ...pr, labels: ['review:accepted'] })).toBeNull();
-      expect(redTeamRulingNeeded({ ...pr, labels: ['review:accepted'], standingRuling: null })).not.toBeNull();
-      calls.length = 0;
-      expect(await applyRedTeamGate({ repo: REPO, pr: 4722, dryRun: true }, io)).toMatchObject({ status: 'already-acted', outcome: 'sent-back' });
-      scope = null; // ruling revoked between reads
-      expect(await applyRedTeamGate({ repo: REPO, pr: 4722, dryRun: true }, io)).toMatchObject({ status: 'already-acted', outcome: 'round-cap' });
-      expect(reads).toHaveLength(3);
-      expect(calls).toEqual([]);
-    });
-
+    // (review-daemon stack: the grant-identity snapshot test from 79a6671c8b is not carried — this stack's gate
+    // records grant POSITIONS, not grantIds; PR #5744/#5758 keep it on the main line.)
     it('a failed standing-ruling verification stops before any write', async () => {
       const { io, calls } = fakeIo({ comments: [comment([F()]), capRecord(), autoGrant()], round: 12,
         standingRuling: () => { throw new Error('verification unavailable'); } });
