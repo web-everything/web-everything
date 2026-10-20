@@ -362,6 +362,35 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     expect(t.calls.some(c => c.startsWith('pr create') && c.includes('review:pending'))).toBe(true);
   });
 
+  it('group first: planner overlap-yield deferrals and early (pre-enqueue) candidates reach form; safety checks still decide', () => {
+    const d = tmp();
+    const withLock = fn => ({ ran: true, result: fn() });
+    const mk = (t, statePath, extra = {}) => createCardGrouping({ localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, () => t.base), exec: t.exec, settings, log: { write() {} },
+      prestage: () => ({ allowed: true }), cardConflictSettings: cc, withLock, readQueueFiles: () => ({ entries: [] }), statePath, ...extra });
+    // A PLANNER deferral (waitOn overlap-yield, never an enqueue outcome) is offered.
+    const t1 = setup();
+    expect(mk(t1, join(d, 'p.json')).form({ verdicts: t1.verdicts, deferred: [1, 2].map(n => ({ num: n, repo: null, waitOn: ['overlap-yield:#9'] })) }).formed).toMatchObject({ pr: 77 });
+    // A planner deferral on anything else (blockedBy) is not.
+    const t2 = setup();
+    expect(mk(t2, join(d, 'q.json')).form({ verdicts: t2.verdicts, deferred: [1, 2].map(n => ({ num: n, repo: null, waitOn: ['#123'] })) }).reason).toMatch(/0 card-only overlap deferral/);
+    // Early candidates (the drain's pre-cascade offer) form a group before any single enqueue.
+    const t3 = setup();
+    expect(mk(t3, join(d, 'e.json')).form({ verdicts: t3.verdicts, early: t3.verdicts }).formed).toMatchObject({ pr: 77 });
+    // Early offer does not bypass the label gate: a not-accepted sibling is left out, leaving < 2.
+    const t4 = setup();
+    const v4 = t4.verdicts.map(v => (v.num === 2 ? { ...v, prLabels: [{ name: 'ready-to-merge' }, { name: 'review:pending' }] } : v));
+    expect(mk(t4, join(d, 'f.json')).form({ verdicts: v4, early: v4 }).reason).toMatch(/fewer than 2 accepted card candidates/);
+    // Nor the red-team admission, nor the queue wait.
+    const t5 = setup();
+    expect(mk(t5, join(d, 'g.json'), { prestage: (c) => ({ allowed: c.num !== 2, reason: 'red team pending' }) }).form({ verdicts: t5.verdicts, early: t5.verdicts }).reason).toMatch(/live re-check left fewer than 2/);
+    const t6 = setup();
+    expect(mk(t6, join(d, 'h.json'), { readQueueFiles: () => ({ entries: [{ num: 99, files: [CARD] }] }) }).form({ verdicts: t6.verdicts, early: t6.verdicts })).toMatchObject({ waiting: true });
+    // A PR already in a recorded group is never offered again.
+    const t7 = setup();
+    const sp = join(d, 'e.json');
+    expect(mk(t7, sp).form({ verdicts: t7.verdicts, early: t7.verdicts }).reason).toMatch(/0 card-only overlap deferral/);
+  });
+
   it('after the combined PR merged: closes a source only when its CURRENT head is on main, else releases it', () => {
     const t = setup();
     const d = tmp();
@@ -391,5 +420,16 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     expect(calls.filter(c => c.startsWith('pr close'))).toEqual([expect.stringMatching(/^pr close 1 /)]);
     expect(calls.some(c => c.startsWith('pr comment 2 '))).toBe(true);
     expect(readGroupState(statePath).groups).toEqual([]);
+  });
+});
+
+describe('drain wiring: group first', () => {
+  it('the drain offers its candidates to form BEFORE the heal/rebase rebuilds and the cascade, and passes planner deferrals after', () => {
+    const src = readFileSync(new URL('../../merge-ai-prs.mjs', import.meta.url), 'utf8');
+    const early = src.indexOf('cardGrouping.form({ verdicts, early })');
+    expect(early).toBeGreaterThan(0);
+    expect(early).toBeLessThan(src.indexOf('const __rebaseDropT0'));
+    expect(early).toBeLessThan(src.indexOf('const memoHold = createHoldMemo('));
+    expect(src).toContain('cardGrouping.form({ outcomes: enqueueOutcomes, verdicts, deferred })');
   });
 });

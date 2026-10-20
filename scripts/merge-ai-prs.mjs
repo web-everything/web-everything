@@ -5454,6 +5454,20 @@ async function runCli() {
   // (base vs lane backlog names) and, only on a real collision, rebuild the lane tip with the new item
   // renumbered to a free GAP id — CI re-runs green and it lands on a later pass. Local-repo candidates only
   // (pure git plumbing needs the local clone); best-effort, never fatal. Dry-run annotates without pushing.
+  // xym8nt4 — GROUP FIRST. Same-card PRs used to reach grouping only as post-cascade `queue-file-overlap`
+  // deferrals, so they were enqueued singly, yielded (`overlap-yield`, a PLANNER deferral grouping never saw),
+  // or rebased one by one (each rebase resets review) before any group could form. Offer this pass's landable
+  // or rebase-blocked local candidates here, before the heal/rebase below and before the cascade; a group
+  // formed now is held by `holdFor` in the cascade and skipped by both rebuilds. Every safety check lives in
+  // `form` (card-only by git, accepted, live head, red-team admission, no queue entry on the cards, union proof,
+  // land mutex). Full passes only, like the post-cascade call.
+  if (onlyPr == null && mergeStrategy.enqueues(null)) {
+    cardGrouping.reconcile();
+    const early = verdicts.filter(v => isLocalRepo(v.repo) && !v.prestagePendingCi && (v.decision === 'merge' || isRebaseDropCandidate(v)));
+    const grouping = cardGrouping.form({ verdicts, early });
+    if (grouping?.formed) process.stderr.write(`  card-group: formed #${grouping.formed.pr} before single enqueue (group first)\n`);
+    else if (grouping?.reason && !/^(disabled|[01] card-only overlap deferral)/.test(grouping.reason)) process.stderr.write(`  card-group: no early group — ${grouping.reason}\n`);
+  }
   const __rebaseDropT0 = __t.mark(); // covers BOTH the id-collision heal and the rebase-drop rebuild below — one
   // git-plumbing phase from the operator's point of view ("rebase-drop-manifest"), even though it's two loops.
   const healed = [];
@@ -7472,7 +7486,7 @@ async function runCli() {
   // pass's card-only queue-file-overlap deferrals. Never throws; a failure leaves every PR on the serial path.
   if (onlyPr == null && mergeStrategy.enqueues(null)) {
     cardGrouping.reconcile();
-    const grouping = cardGrouping.form({ outcomes: enqueueOutcomes, verdicts });
+    const grouping = cardGrouping.form({ outcomes: enqueueOutcomes, verdicts, deferred });
     if (grouping?.reason && !/^(disabled|[01] card-only overlap deferral)/.test(grouping.reason)) process.stderr.write(`  card-group: no group this pass — ${grouping.reason}\n`);
   }
   const result = { ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, skipReasons, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text, retryable: !!l.err.retryable })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };

@@ -5,7 +5,9 @@
  * (`queue-file-overlap`). Each one takes a full merge-queue cycle, and each re-merge costs a review round.
  *
  * What this does, once per drain pass:
- *   1. FORM. From this pass's `queue-file-overlap` deferrals, take PRs whose WHOLE diff is backlog cards
+ *   1. FORM. From this pass's candidates (the drain offers its accepted local candidates FIRST, before any
+ *      single enqueue, overlap-yield or rebase moves them; then its `queue-file-overlap` / overlap-yield
+ *      deferrals after the cascade), take PRs whose WHOLE diff is backlog cards
  *      (`isCardOnlyDiff` and every path `isCardPath`), that are open, non-draft, at the judged head,
  *      `ready-to-merge` + `review:accepted`, with no review hold, and that the strategy's own read-only
  *      admission check (`prestage`: live head, send-back, workflow surface, red-team hold) allows. PRs that
@@ -646,7 +648,7 @@ export function createCardGrouping({
      * Form at most one new group from this pass's deferrals. `outcomes` = enqueueOutcomes, `verdicts` = the pass
      * candidates (for labels / listed head). Returns { formed?, plan?, reason }.
      */
-    form({ outcomes = [], verdicts = [] } = {}) {
+    form({ outcomes = [], verdicts = [], deferred: planDeferred = [], early = [] } = {}) {
       if (!setting.enabled) return { reason: 'disabled' };
       if (!statePath) return { reason: 'no state path' };
       try {
@@ -654,10 +656,20 @@ export function createCardGrouping({
         if (st.unreadable) return { reason: 'state unreadable' };
         const grouped = new Set(st.groups.flatMap(g => g.sources.map(s => Number(s.num))));
         const local = r => !r || String(r).toLowerCase() === String(localSlug).toLowerCase();
-        // Both overlap waits qualify: a queue-file-overlap deferral (its reason must name only card files) and an
-        // overlap-yield hold (its reason names no files). Either way the git card-only check below decides.
+        // Every overlap wait qualifies: a queue-file-overlap deferral (its reason must name only card files), an
+        // overlap-yield hold from the enqueue loop, and an overlap-yield wait the PLANNER deferred (`deferred`,
+        // `waitOn: ['overlap-yield:#N']` — it never reaches the enqueue loop, so it is not in `outcomes`).
+        // `early` = verdicts the caller offers BEFORE any single enqueue / overlap-yield / rebase of this pass
+        // (group first). Whatever the source, every check below (labels, git card-only, live state, admission,
+        // queue, union proof, land mutex) still decides.
         const waiting = o => (o.kind === 'queue-file-overlap' && overlapReasonIsCardOnly(o.reason)) || o.kind === 'overlap-yield';
-        const deferred = [...new Map(outcomes.filter(o => waiting(o) && local(o.repo) && !grouped.has(Number(o.num))).map(o => [Number(o.num), o])).values()];
+        const yielding = d => d?.overlapYield || (Array.isArray(d?.waitOn) && d.waitOn.length > 0 && d.waitOn.every(w => String(w).startsWith('overlap-yield:')));
+        const offered = [
+          ...outcomes.filter(waiting),
+          ...(Array.isArray(planDeferred) ? planDeferred : []).filter(yielding),
+          ...(Array.isArray(early) ? early : []),
+        ].filter(o => Number.isInteger(Number(o?.num)) && local(o.repo) && !grouped.has(Number(o.num)));
+        const deferred = [...new Map(offered.map(o => [Number(o.num), o])).values()];
         if (deferred.length < 2) return { reason: `${deferred.length} card-only overlap deferral(s)` };
         const base = mainSha();
         if (!base) return { reason: 'main unreadable' };
