@@ -146,21 +146,24 @@ export async function publishBatch(input, opts = {}) {
         const id = String(member?.cardId ?? '');
         if (!/^[a-z0-9]+$/.test(id)) { missing.push(id || '(no id)'); continue; }
         const recordedPaths = recordedTree.filter(path => path.startsWith(`backlog/${id}-`));
-        const candidates = [...mergeTree.filter(path => path.startsWith(`backlog/${id}-`)), ...(bornAs.get(id) ?? [])];
+        // Only the SAME path, or a file whose front matter says `bornAs: <id>`; never any other file, whatever its content.
+        const candidates = [...(recordedPaths.length === 1 && mergeTree.includes(recordedPaths[0]) ? [recordedPaths[0]] : []),
+          ...(bornAs.get(id) ?? [])];
         if (recordedPaths.length !== 1 || candidates.length !== 1 || used.has(candidates[0])) { missing.push(id); continue; }
         used.add(candidates[0]);
         let recorded = await gitText(['show', `${state.headSha}:${recordedPaths[0]}`]);
-        for (const [from, to] of renames) recorded = recorded.split(`backlog/${from}`).join(`backlog/${to}`);
+        // Whole tokens only: `backlog/<id>` followed by a non-alphanumeric (or the end), never inside a longer id.
+        for (const [from, to] of renames) recorded = recorded.replace(new RegExp(`(?<![A-Za-z0-9])backlog/${from}(?![A-Za-z0-9])`, 'g'), `backlog/${to}`);
         const landedRaw = contentAt.get(candidates[0]) ?? await gitText(['show', `${merge}:${candidates[0]}`]);
-        const landed = candidates[0].startsWith(`backlog/${id}-`) ? landedRaw : removeBornAsLine(landedRaw, id);
+        const landed = candidates[0] === recordedPaths[0] ? landedRaw : removeBornAsLine(landedRaw, id);
         if (landed !== recorded) missing.push(id);
       }
       return missing;
     };
     // A MERGED-mid-seal batch retires only after the full proof passes — on every attempt, retries included.
     const retireMerged = async () => {
-      let missing;
-      try { missing = await cardsNotProvenOnMain(); } catch (error) { missing = [`(proof unreadable: ${String(error?.message ?? error).split('\n')[0]})`]; }
+      // A proof that throws propagates (the caller sees the real error); only a completed proof can refuse or retire.
+      const missing = await cardsNotProvenOnMain();
       if (missing.length) {
         process.stderr.write(`card-batch ${state.batchRef} PR ${state.pr} MERGED but ${missing.length} card(s) not proven on main `
           + `(${missing.slice(0, 5).join(', ')}): kept held\n`);
@@ -211,13 +214,13 @@ export async function publishBatch(input, opts = {}) {
       const retired = await retire();
       return retired?.action === 'retired' ? { action: 'held', state, retired: true } : null;
     };
-    // Recovery replaces the original outcome only when it completed. Otherwise a thrown original is rethrown (as an
-    // Error), and a returned refusal is returned; a failing recovery never fulfils in their place.
+    // Recovery replaces the original outcome only when it completed. Otherwise a thrown original is rethrown
+    // unchanged (whatever was thrown), and a returned refusal is returned; a failing recovery never fulfils in their place.
     const orRecoverMerged = async ({ threw = false, thrown, returned }) => {
       let recovered = null;
       try { recovered = await recoverMergedSeal(); } catch { /* keep the original outcome */ }
       if (recovered) return recovered;
-      if (threw) throw thrown instanceof Error ? thrown : new Error(String(thrown?.message ?? thrown ?? 'stuck seal step failed'));
+      if (threw) throw thrown;
       return returned;
     };
     const restoreProtection = async () => {

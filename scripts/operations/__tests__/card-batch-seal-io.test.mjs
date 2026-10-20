@@ -664,12 +664,50 @@ it('the stuck path keeps the original failure when the PR is not merged or the r
   }
 });
 it.each([['a string', 'boom'], ['a plain object', { message: 'obj boom' }], ['undefined', undefined]])(
-  'a stuck step that throws %s is rethrown as an Error when recovery does not complete', async (_name, value) => {
+  'a stuck step that throws %s is rethrown unchanged (same value) when recovery does not complete', async (_name, value) => {
     const { f, exec: base } = terminalFixture('OPEN');
     const outcome = await publishBatch(f.input, { ...f.opts, exec: failUndo(base, value) }).then(v => ({ fulfilled: v }), e => ({ rejected: e }));
-    expect(outcome.fulfilled).toBeUndefined();
-    expect(outcome.rejected).toBeInstanceOf(Error);
+    expect('fulfilled' in outcome).toBe(false);
+    expect(Object.is(outcome.rejected, value)).toBe(true);
   });
+it('ID-rewrite tolerance replaces whole tokens only: backlog/xold001extra is not rewritten by xold001→#6311', async () => {
+  const recorded = '---\nkind: story\n---\n\nSee backlog/xold001extra.\n';
+  // If the rewrite reached inside the longer id, the recorded text would read backlog/6311extra and match this spoof.
+  const spoof = '---\nbornAs: 123\nkind: story\n---\n\nSee backlog/6311extra.\n';
+  const { f, exec: base } = terminalFixture('MERGED', landedMain({ recordedFiles: { 'backlog/123-card.md': recorded },
+    mergeFiles: { 'backlog/6597-card.md': spoof, 'backlog/6311-old.md': '---\nbornAs: xold001\n---\n' } }));
+  const err = quiet();
+  try {
+    await expect(publishBatch(f.input, { ...f.opts, exec: failUndo(base) })).rejects.toThrow('pull request is merged');
+    expect(activeSlot(f).sealFailure).toBeUndefined();
+  } finally { err.mockRestore(); }
+});
+it('whole-token rewrite still applies at a token boundary (backlog/xold001 followed by punctuation)', async () => {
+  const recorded = '---\nkind: story\n---\n\nSee backlog/xold001, backlog/xold001-slug.md.\n';
+  const landed = '---\nbornAs: 123\nkind: story\n---\n\nSee backlog/6311, backlog/6311-slug.md.\n';
+  const { f, exec: base } = terminalFixture('MERGED', landedMain({ recordedFiles: { 'backlog/123-card.md': recorded },
+    mergeFiles: { 'backlog/6597-card.md': landed, 'backlog/6311-old.md': '---\nbornAs: xold001\n---\n' } }));
+  const err = quiet();
+  try { expect(await publishBatch(f.input, { ...f.opts, exec: failUndo(base) })).toMatchObject({ action: 'held', retired: true }); }
+  finally { err.mockRestore(); }
+});
+it('a same-content file at a different path without bornAs never matches', async () => {
+  const { f, exec: base } = terminalFixture('MERGED', landedMain({ mergeFiles: { 'backlog/123-other-slug.md': RECORDED, 'backlog/6311-old.md': OLD } }));
+  const err = quiet();
+  try {
+    await expect(publishBatch(f.input, { ...f.opts, exec: failUndo(base) })).rejects.toThrow('pull request is merged');
+    expect(activeSlot(f).sealFailure).toBeUndefined();
+  } finally { err.mockRestore(); }
+});
+it('a proof exception on retry propagates instead of becoming a refusal', async () => {
+  const { f, exec: base } = terminalFixture('MERGED');
+  writeFileSync(f.statePath, JSON.stringify({ ...activeSlot(f), restoreProtection: undefined, holdApplied: true,
+    sealFailure: { reason: 'PR MERGED before the seal finished', terminalPrState: 'MERGED' } }));
+  const boom = new Error('git ls-tree failed');
+  const exec = vi.fn((cmd, args, options) => { if (cmd === 'git' && args[0] === 'ls-tree') throw boom; return base(cmd, args, options); });
+  await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toBe(boom);
+  expect(activeSlot(f).lastSealedState).toBeUndefined();
+});
 it('a started seal whose PR is CLOSED is left exactly as today (no failure recorded, no retire)', async () => {
   const { f, exec } = terminalFixture('CLOSED');
   await publishBatch(f.input, { ...f.opts, exec: failUndo(exec) }).catch(() => {});
