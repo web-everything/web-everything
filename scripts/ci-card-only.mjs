@@ -45,6 +45,32 @@ export function isCardOnlyDiff(files) {
   return classifyCardOnly({ event: 'pull_request', files: files ?? undefined }).light;
 }
 
+/** The fetched main ref the workflow refreshes before this runs (fixed refspec; nothing PR-supplied reaches it). */
+export const FRESH_MAIN_REF = 'refs/remotes/origin/main';
+
+/**
+ * Pick the diff basis for the card-only check. FRESH MAIN BASIS (PR #5619, same idea as the soak gate's #5939):
+ * the event's `base.sha` can be FROZEN hours behind main. Once the drain merges a newer main into the lane, a
+ * diff from that stale sha counts main's own commits as the PR's, so a one-card PR read as 47 files of code and
+ * ran the full suite. For a main-targeted PR the basis is `git merge-base <fresh main> <head>`: only what the
+ * PR itself changes against main. Any failure falls back to the event base — the old, wider diff, so the error
+ * direction is always "more files, full suite", never "fewer files".
+ * @param {{exec: (cmd: string, args: string[]) => string, base?: string, head?: string, baseRef?: string}} o
+ * @returns {{diffBase: string, basis: 'fresh-main-merge-base'|'event-base', note?: string}}
+ */
+export function resolveCardOnlyBase({ exec, base, head = 'HEAD', baseRef } = {}) {
+  const eventBase = { diffBase: String(base), basis: 'event-base' };
+  if (baseRef !== 'main') return eventBase;
+  try {
+    const tip = exec('git', ['rev-parse', '--verify', '--end-of-options', `${FRESH_MAIN_REF}^{commit}`]).trim();
+    const mb = exec('git', ['merge-base', '--end-of-options', tip, String(head)]).split('\n')[0].trim();
+    if (/^[0-9a-f]{40,64}$/i.test(mb)) return { diffBase: mb, basis: 'fresh-main-merge-base' };
+    return { ...eventBase, note: 'merge-base with fresh main was empty' };
+  } catch (e) {
+    return { ...eventBase, note: `fresh main unavailable (${String(e?.message || e).split('\n')[0]})` };
+  }
+}
+
 function main() {
   const flags = Object.fromEntries(process.argv.slice(2).filter((a) => a.startsWith('--')).map((a) => {
     const i = a.indexOf('=');
@@ -53,8 +79,12 @@ function main() {
   let files = [];
   if (flags.event === 'pull_request') {
     try {
+      const head = String(flags.head || 'HEAD');
+      const exec = (cmd, args) => execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      const { diffBase, basis, note } = resolveCardOnlyBase({ exec, base: flags.base, head, baseRef: flags['base-ref'] });
+      process.stderr.write(`ci-card-only: diff basis ${basis} ${diffBase} (event base ${flags.base})${note ? ` — ${note}` : ''}\n`);
       // --no-renames lists BOTH sides of a rename, so a move out of backlog/ is never hidden.
-      files = execFileSync('git', ['diff', '--name-only', '--no-renames', String(flags.base), String(flags.head || 'HEAD')],
+      files = execFileSync('git', ['diff', '--name-only', '--no-renames', diffBase, head],
         { encoding: 'utf8' }).split('\n').filter(Boolean);
     } catch (e) {
       process.stderr.write(`ci-card-only: git diff failed (${String(e.message).split('\n')[0]}); full suite\n`);

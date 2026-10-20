@@ -84,7 +84,11 @@ jobs:
           fetch-depth: 0
       - name: Is this a card-only PR?
         id: detect
-        run: node scripts/ci-card-only.mjs --event='${{ github.event_name }}' --base='${{ github.event.pull_request.base.sha }}' --head=HEAD >> "$GITHUB_OUTPUT"
+        # FRESH MAIN BASIS (#5619): the event's base.sha can be frozen far behind main; the script diffs from the
+        # merge-base with the main tip fetched NOW. A failed fetch leaves the event base (wider diff, full suite).
+        run: |
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main' || echo "ci-card-only: main fetch failed; event base is the basis" >&2
+          node scripts/ci-card-only.mjs --event='${{ github.event_name }}' --base='${{ github.event.pull_request.base.sha }}' --base-ref='${{ github.event.pull_request.base.ref }}' --head=HEAD >> "$GITHUB_OUTPUT"
 
   # Sharded unit suite (#2682). The 2000+ vitest suite runs split across N parallel runners
   # (`vitest run --shard=i/N`) to cut the `test` gate's wall-clock. Each shard runs WITH coverage but

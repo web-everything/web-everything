@@ -1,7 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
-import { classifyCardOnly, isCardPath, isCardOnlyDiff } from '../ci-card-only.mjs';
+import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { resolve, join, dirname } from 'node:path';
+import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
+import { classifyCardOnly, isCardPath, isCardOnlyDiff, resolveCardOnlyBase } from '../ci-card-only.mjs';
 import { REVIEW_HOLD_LABELS } from '../lib/review-escalation.mjs';
 
 describe('ci-card-only detection', () => {
@@ -25,6 +27,67 @@ describe('ci-card-only detection', () => {
     expect(isCardPath('backlog/')).toBe(false);
     expect(isCardPath('backlog/tool.mjs')).toBe(false);
     expect(isCardPath('backlog/nested/card.md')).toBe(false);
+  });
+});
+
+describe('fresh main basis (#5619: frozen event base.sha after the drain merged newer main in)', () => {
+  const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const exec = (cwd) => (cmd, args) => execFileSync(cmd, args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const write = (cwd, rel, body) => { mkdirSync(dirname(join(cwd, rel)), { recursive: true }); writeFileSync(join(cwd, rel), body); };
+  const commit = (cwd, msg) => { git(cwd, 'add', '-A'); git(cwd, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', msg); return git(cwd, 'rev-parse', 'HEAD'); };
+  const merge = (cwd, ref) => { git(cwd, '-c', 'user.name=t', '-c', 'user.email=t@t', 'merge', '-q', '--no-ff', '--no-edit', ref); return git(cwd, 'rev-parse', 'HEAD'); };
+  const diff = (cwd, base, head) => git(cwd, 'diff', '--name-only', '--no-renames', base, head).split('\n').filter(Boolean);
+  // main: m0 → staleBase (event base.sha) → code change; lane: card, merges staleBase, later merges newer main.
+  function fixture() {
+    const cwd = mkdtempSync(join(tmpdir(), 'ci-card-only-'));
+    git(cwd, 'init', '-q', '-b', 'main');
+    write(cwd, 'README.md', 'x'); commit(cwd, 'm0');
+    git(cwd, 'checkout', '-q', '-b', 'lane');
+    write(cwd, 'backlog/x1-card.md', 'card'); commit(cwd, 'card');
+    git(cwd, 'checkout', '-q', 'main');
+    write(cwd, 'scripts/a.mjs', 'a'); const staleBase = commit(cwd, 'main code 1');
+    git(cwd, 'checkout', '-q', 'lane'); merge(cwd, 'main');
+    git(cwd, 'checkout', '-q', 'main');
+    write(cwd, 'scripts/lane-pool.mjs', 'b'); commit(cwd, 'main code 2');
+    git(cwd, 'checkout', '-q', 'lane'); const head = merge(cwd, 'main');
+    git(cwd, 'update-ref', 'refs/remotes/origin/main', 'main');
+    return { cwd, staleBase, head };
+  }
+  it('replays the live shape: the stale event base reads main code as the PR\'s; fresh main sees only the card', () => {
+    const { cwd, staleBase, head } = fixture();
+    try {
+      expect(diff(cwd, staleBase, head)).toContain('scripts/lane-pool.mjs'); // the bug: full suite for a card PR
+      const r = resolveCardOnlyBase({ exec: exec(cwd), base: staleBase, head, baseRef: 'main' });
+      expect(r.basis).toBe('fresh-main-merge-base');
+      expect(diff(cwd, r.diffBase, head)).toEqual(['backlog/x1-card.md']);
+      expect(isCardOnlyDiff(diff(cwd, r.diffBase, head))).toBe(true);
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+  it('a PR that really changes code still reads as code on the fresh basis', () => {
+    const { cwd, staleBase } = fixture();
+    try {
+      write(cwd, 'scripts/own.mjs', 'mine'); const head = commit(cwd, 'own code');
+      const r = resolveCardOnlyBase({ exec: exec(cwd), base: staleBase, head, baseRef: 'main' });
+      expect(diff(cwd, r.diffBase, head).sort()).toEqual(['backlog/x1-card.md', 'scripts/own.mjs']);
+      expect(isCardOnlyDiff(diff(cwd, r.diffBase, head))).toBe(false);
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+  it('falls back to the event base (wider diff) when fresh main is missing or the PR is not main-targeted', () => {
+    const { cwd, staleBase, head } = fixture();
+    try {
+      expect(resolveCardOnlyBase({ exec: exec(cwd), base: staleBase, head, baseRef: 'lane/x' })).toEqual({ diffBase: staleBase, basis: 'event-base' });
+      expect(resolveCardOnlyBase({ exec: exec(cwd), base: staleBase, head })).toEqual({ diffBase: staleBase, basis: 'event-base' });
+      git(cwd, 'update-ref', '-d', 'refs/remotes/origin/main');
+      const r = resolveCardOnlyBase({ exec: exec(cwd), base: staleBase, head, baseRef: 'main' });
+      expect(r.basis).toBe('event-base');
+      expect(r.diffBase).toBe(staleBase);
+      expect(r.note).toMatch(/fresh main unavailable/);
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+  it('ci.yml refreshes main and passes the base ref to the detector', () => {
+    const yml = readFileSync(resolve(import.meta.dirname, '../../.github/workflows/ci.yml'), 'utf8');
+    expect(yml).toContain("git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'");
+    expect(yml).toMatch(/ci-card-only\.mjs[^\n]*--base-ref='\$\{\{ github\.event\.pull_request\.base\.ref \}\}'/);
   });
 });
 
