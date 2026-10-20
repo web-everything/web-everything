@@ -531,12 +531,13 @@ describe('same-head hold never silences a review whose verdict never landed (liv
       .toMatchObject({ retryAt: at + 7200_000 });
     expect(decideSameHeadHold(p, runs, { repo, env: {}, now: at + 7200_000 })).toBeNull();
   });
-  it('charges pre-advise crashes to growing cooldowns and refuses a seventh release through reconciliation', () => {
+  it.each([true, false])('charges pre-advise crashes to growing cooldowns and refuses a seventh release through reconciliation (initial panels completed: %s)', initialCompleted => {
     const dir = temp(); vi.stubEnv('OPERATION_RUNS_DIR', dir);
     vi.stubEnv('WE_REVIEW_NO_VERDICT_COOLDOWN_RELEASES', '6');
     for (let i = 0; i < 3; i++) {
-      const r = run({ id: `review-pr-complete-${i}`, time: at - i * 120_000 });
+      const r = run({ id: `review-pr-initial-${i}`, time: at - i * 120_000 + (initialCompleted ? 0 : 60_000) });
       r.findings.referralVerdict = r.verdict = { verdict: 'accept', pendingReferrals: [] };
+      if (!initialCompleted) r.stepTimings.pop();
       writeRun(r, dir);
     }
     const p = labelled(['review:pending']);
@@ -548,6 +549,8 @@ describe('same-head hold never silences a review whose verdict never landed (liv
       resolveMainSha: () => null, readRequiredChecks: () => ({ checks: ['test'] }),
       enrichReferralHolds: () => [decide(now)],
     }).dispatch.filter(d => d.kind === 'review');
+    expect(decide(at + 30 * 60_000).referralHold).toMatchObject({ count: 3, retryAt: at + VERDICT_COOLDOWN_BASE_MS });
+    expect(planned(at + 30 * 60_000)).toEqual([]);
     let due = at + VERDICT_COOLDOWN_BASE_MS;
     for (let release = 1; release <= 6; release++) {
       expect(planned(due)).toHaveLength(1);
@@ -568,6 +571,37 @@ describe('same-head hold never silences a review whose verdict never landed (liv
         expect(planned(due + 365 * 86400_000)).toEqual([]);
       }
     }
+    const publish = vi.fn();
+    for (let tick = 0; tick < 3; tick++) raiseNoVerdictNeedsYou({ repo, prNumber: p.number,
+      hold: decide(due + 365 * 86400_000).referralHold, dir, now: due + tick, publish, log: () => {} });
+    expect(publish).toHaveBeenCalledTimes(1);
+  });
+  it.each([3, 9, 20])('bounds %s attempts on a fresh head even if none reach advise', count => {
+    const p = labelled(['review:pending']);
+    const rows = lostRuns(count).map(r => ({ ...r, completedAt: null, incomplete: true }));
+    const opts = { repo, env: {}, now: at, retry: { cooldownReleases: 6, source: 'tool' } };
+    expect(decideSameHeadHold(p, rows, opts)).toMatchObject({ count,
+      retryAt: count === 3 ? at - 60_000 + VERDICT_COOLDOWN_BASE_MS : null,
+      noVerdict: { exhausted: count >= 9, releasesSpent: Math.min(count - 3, 6) } });
+    expect(decideSameHeadHold(p, rows, { ...opts, retry: { cooldownReleases: 0 } }))
+      .toMatchObject({ retryAt: null, noVerdict: { exhausted: true } });
+    expect(decideSameHeadHold({ ...p, comments: [comment(REARM_COMMENT_MARKER, at + 1)] }, rows, opts)).toBeNull();
+    expect(decideSameHeadHold({ ...p, headRefOid: 'b'.repeat(40) }, rows, opts)).toBeNull();
+    expect(decideSameHeadHold(p, rows, { ...opts, env: { WE_REVIEW_SAME_HEAD_MAX_REVIEWS: '0' } })).toBeNull();
+    for (const landed of [labelled(['review:accepted']), labelled(['review:pending', 'review:changes']),
+      labelled(['review:pending'], { comments: [comment(`✅ review — accepted\n<!-- reviewed-sha: ${head} -->`)] })]) {
+      expect(decideSameHeadHold(landed, rows, opts)).toBeNull();
+    }
+  });
+  it('preserves the cooldown baseline when a pre-wake review completes after post-wake crashes', () => {
+    const minute = 60_000;
+    const p = labelled(['review:pending'], { comments: [comment(REARM_COMMENT_MARKER, at + 10 * minute)] });
+    const completed = lost({ startedAt: at, completedAt: at + 100 * minute });
+    const crashes = [20, 30, 40].map(n => ({ ...completed, id: `crash-${n}`,
+      startedAt: at + n * minute, completedAt: null, incomplete: true }));
+    expect(decideSameHeadHold(p, [completed, ...crashes], { repo, env: {}, now: at + 111 * minute,
+      retry: { cooldownReleases: 6, source: 'tool' } }))
+      .toMatchObject({ count: 3, retryAt: at + 160 * minute, noVerdict: { releasesSpent: 0 } });
   });
   it('counts incomplete immediate retries once, replaces them on completion, and scopes them to the head and wake', () => {
     const dir = temp(), p = labelled(['review:pending']);

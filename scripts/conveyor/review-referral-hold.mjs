@@ -268,11 +268,16 @@ export const VERDICT_GRACE_MS = 10 * 60_000;
 const VERDICT_LABELS = ['review:accepted', 'review:changes', 'review:human'];
 
 /**
- * True when `last` (a completed review run on the PR's current head) left NO visible verdict: the PR still holds
+ * True when `last` (a review attempt on the PR's current head) left NO visible verdict: the PR still holds
  * only `review:pending`, and no `reviewed-sha` accept marker names this head. Pure.
  */
 export function verdictNeverLanded(pr, last, now = Date.now()) {
-  if (!last || !Number.isFinite(last.completedAt) || now - last.completedAt < VERDICT_GRACE_MS) return false;
+  if (!last) return false;
+  if (Number.isFinite(last.completedAt)) {
+    if (now - last.completedAt < VERDICT_GRACE_MS) return false;
+  } else if (!last.incomplete || !Number.isFinite(last.startedAt)) return false;
+  // An incomplete attempt spends its budget as soon as read pins the head. There is no finished
+  // verdict write-back to wait for; renewing grace on each crash would allow unlimited retries.
   const names = (pr?.labels ?? []).map(l => (typeof l === 'string' ? l : l?.name));
   if (!names.includes('review:pending') || names.some(n => VERDICT_LABELS.includes(n))) return false;
   const head = typeof pr?.headRefOid === 'string' ? pr.headRefOid.trim().toLowerCase() : '';
@@ -284,7 +289,10 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   if (max === 0) return null;
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid)
     .sort((a, b) => b.completedAt - a.completedAt);
-  const last = history.find(r => Number.isFinite(r.completedAt));
+  // Keep completed-panel semantics when one exists, but a fresh head can crash on EVERY attempt.
+  // Such a history must still reach the no-verdict cooldown and exhausted needs-you hold.
+  const last = history.find(r => Number.isFinite(r.completedAt))
+    ?? history.filter(r => r.incomplete && Number.isFinite(r.startedAt)).sort((a, b) => b.startedAt - a.startedAt)[0];
   if (!last || last.persistenceFailed) return null;
   const wake = wakeTime(pr, last);
   // A completed run whose verdict NEVER LANDED on the PR (GitHub refused the comment/label write; live 2026-10-07,
@@ -305,7 +313,7 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   if (noVerdict && spent < releases) {
     const cooldown = Math.min(VERDICT_COOLDOWN_BASE_MS * 2 ** spent, VERDICT_COOLDOWN_CAP_MS);
     const latestAttemptAt = attempts.reduce((latest, r) => Math.max(latest,
-      Number.isFinite(r.completedAt) ? r.completedAt : r.startedAt), last.completedAt);
+      Number.isFinite(r.completedAt) ? r.completedAt : r.startedAt), Number.isFinite(last.completedAt) ? last.completedAt : 0);
     retryAt = latestAttemptAt + cooldown;
     if (now >= retryAt) return null;
   }

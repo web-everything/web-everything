@@ -16,6 +16,14 @@ export default {
   fixedBy: { sha: 'HEAD', where: 'lane/grad-stalled-review-claim-2026-10-20', paths: [SOURCE] },
   fixPresent(root) { return readFileSync(join(root, SOURCE), 'utf8').includes('incomplete: true'); },
   async run() {
+    const reports = [];
+    for (const initialCompleted of [true, false]) reports.push(await runCase(initialCompleted));
+    return { reports, violations: reports.flatMap(r => r.violations.map(v => `initialCompleted=${r.initialCompleted}: ${v}`)) };
+  },
+  judge(report) { return report.violations; },
+};
+
+async function runCase(initialCompleted) {
     const dir = mkdtempSync(join(tmpdir(), 'soak-pre-advise-crash-'));
     try {
       const repo = ghRepoSlug('we'), head = 'a'.repeat(40), at = Date.parse('2026-10-20T12:00:00Z');
@@ -30,13 +38,14 @@ export default {
         if (complete) r.stepTimings.push({ step: 'advise', stepIndex: 8, startedAt: iso(start + 59_999), finishedAt: iso(start + 60_000), durationMs: 1 });
         writeRun(r, dir);
       };
-      for (let i = 0; i < 3; i++) save(`complete-${i}`, at - 60_000 - i * 120_000, true);
+      for (let i = 0; i < 3; i++) save(`initial-${i}`, at - (initialCompleted ? 60_000 : 0) - i * 120_000, initialCompleted);
       const violations = [], cooldowns = [];
       const enriched = now => enrichPrsWithReferralHolds([pr], { repo, now,
         env: { WE_REVIEW_NO_VERDICT_COOLDOWN_RELEASES: '6' },
         readRuns: () => readReviewRunEvidence({ dir, memo: new Map() }) })[0];
       const reviews = now => planReconcile({ repo: 'we', prs: [enriched(now)], agents: [], now,
         requiredChecks: ['test'], reviewTiming: { startAfter: 'ci-green' } }).dispatch.filter(d => d.kind === 'review').length;
+      if (reviews(at + 30 * 60_000)) violations.push('initial attempts bypassed the first cooldown');
       let due = at + HOUR;
       for (let release = 1; release <= 6; release++) {
         if (reviews(due) !== 1) violations.push(`release ${release}: due retry was not dispatched`);
@@ -59,8 +68,6 @@ export default {
       for (let tick = 0; tick < 3; tick++) raiseNoVerdictNeedsYou({ repo, prNumber: pr.number, hold: held, dir,
         now: due + tick, log: () => {}, publish: () => { alerts++; } });
       if (alerts !== 1) violations.push(`exhausted crashed retries published ${alerts} alerts, expected 1`);
-      return { cooldowns, alerts, violations };
+      return { initialCompleted, cooldowns, alerts, violations };
     } finally { rmSync(dir, { recursive: true, force: true }); }
-  },
-  judge(report) { return report.violations; },
-};
+}
