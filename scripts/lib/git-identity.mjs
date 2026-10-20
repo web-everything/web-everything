@@ -142,7 +142,7 @@ export function readGitIdentity(dir = process.cwd(), { env = process.env, run = 
   let error;
   const read = (v) => {
     try {
-      return parseIdent(run('git', ['var', v], { cwd: dir, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000 }));
+      return parseIdent(run('git', ['var', v], { cwd: dir, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000, maxBuffer: 1024 * 1024 }));
     } catch (e) {
       if (!isIdentityUnknownError(e)) error = String(e?.message ?? e).split('\n')[0];
       return { name: '', email: '' };
@@ -215,7 +215,7 @@ export function withoutGitConfigEnv(env = process.env) {
 export function ensureLaneHooksPath(dir, {
   write = true,
   exists = existsSync,
-  run = (args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000, env: withoutGitConfigEnv(process.env) }),
+  run = (args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000, maxBuffer: 1024 * 1024, env: withoutGitConfigEnv(process.env) }),
   log = () => {},
 } = {}) {
   try {

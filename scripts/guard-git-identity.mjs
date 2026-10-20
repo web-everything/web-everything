@@ -66,7 +66,7 @@ export function main({ cwd = process.cwd(), env = process.env, err = (s) => proc
   const { exec = execFileSync, readIdentity = readGitIdentity, resolveLists = resolveGitIdentityPlaceholders } = deps;
   let decision;
   try {
-    const top = String(exec('git', ['rev-parse', '--show-toplevel'], { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })).trim();
+    const top = String(exec('git', ['rev-parse', '--show-toplevel'], { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 1024 * 1024 })).trim();
     let root = top;
     try { root = realpathSync(top); } catch { /* keep the git answer */ }
     if (!isLaneRoot(root) && !isLaneRoot(top)) return 0;
