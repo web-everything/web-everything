@@ -414,6 +414,17 @@ export function createDrainMergeStrategy({
     if (!queue.error && queue !== cached?.queue) overlapCache.set(repo, { at, queue });
     return queue;
   };
+  // The early (pre-lock) overlap HOLD reads the merge queue once per pass (one strategy per pass) instead of again
+  // on every 30 s expiry. It only ever holds or falls through: a clear here authorizes nothing, because enqueue
+  // re-reads the queue live under the land mutex right before the write, and priorityReserveHold keeps cachedQueue.
+  // A failed read is not kept, so the next candidate reads again.
+  const passQueue = new Map();
+  const passQueueFor = (repo, decision) => {
+    if (passQueue.has(repo)) return passQueue.get(repo);
+    const queue = readQueueEntryFiles({ repo, exec, resolveFiles: queueResolver(decision) });
+    if (!queue.error) passQueue.set(repo, queue);
+    return queue;
+  };
   const mutateReserves = (fn, locked = false) => {
     try {
       const write = () => {
@@ -609,7 +620,7 @@ export function createDrainMergeStrategy({
       const candidateFiles = candidateFilesOf(c, headSha, decision);
       if (candidateFiles === null) return null;
       const repo = slugOf(c.repo);
-      const queue = cachedQueue(repo, decision);
+      const queue = passQueueFor(repo, decision);
       if (queue.error) return null;
       const overlap = pickQueueOverlap(c, candidateFiles, queue);
       if (overlap.overlap && cardOverlapEnqueues(c, headSha, overlap, queue)) return null;

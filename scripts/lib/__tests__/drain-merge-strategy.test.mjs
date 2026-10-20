@@ -1477,7 +1477,7 @@ describe('live queue file-overlap admission', () => {
     expect(h.s.queueOverlapHold(candidate, HEAD)?.kind).toBe('queue-file-overlap');
     expect(h.s.enqueue(candidate, HEAD).kind).toBe('queue-file-overlap');
   });
-  it('pre-check shares the enqueue reason, caches only its own reads and expires after 30s', () => {
+  it('pre-check shares the enqueue reason and reads the queue once per pass (no 30 s re-read); enqueue always reads live', () => {
     let time = 1_000;
     const h = setup({ now: () => time });
     const hold = h.s.queueOverlapHold(candidate, HEAD);
@@ -1489,7 +1489,17 @@ describe('live queue file-overlap admission', () => {
     expect(h.calls.filter(c => c.includes('files,headRefName,baseRefName,headRefOid'))).toHaveLength(2); // enqueue read fresh
     time += 30_000;
     expect(h.s.queueOverlapHold(candidate, HEAD)).toEqual(hold);
-    expect(h.calls.filter(c => c.includes('files,headRefName,baseRefName,headRefOid'))).toHaveLength(3);
+    expect(h.calls.filter(c => c.includes('files,headRefName,baseRefName,headRefOid'))).toHaveLength(2); // pass snapshot reused
+    expect(h.s.enqueue(candidate, HEAD, { comments: stampedBy(DRAIN) })).toEqual({ enqueued: false, ...hold });
+    expect(h.calls.filter(c => c.includes('files,headRefName,baseRefName,headRefOid'))).toHaveLength(3); // enqueue live again
+  });
+  it('fails closed on a queue that grew after the pass snapshot: the pre-check clears, the live enqueue read holds', () => {
+    const queueFacts = facts([]);
+    const h = setup({ queueFacts });
+    expect(h.s.queueOverlapHold(candidate, HEAD)).toBeNull(); // snapshot: empty queue
+    queueFacts.data.repository.mergeQueue.entries.nodes.push({ pullRequest: { number: 43 } }); // #43 enqueued meanwhile
+    expect(h.s.queueOverlapHold(candidate, HEAD)).toBeNull(); // the hint still uses the snapshot
+    expect(h.s.enqueue(candidate, HEAD, { comments: stampedBy(DRAIN) })).toMatchObject({ enqueued: false, kind: 'queue-file-overlap', reason: `#43 share ${card}` });
   });
   it.each([
     ['missing', { num: 42 }],
