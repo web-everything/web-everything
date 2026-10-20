@@ -56,7 +56,7 @@ export const GIT_RUN_TIMEOUT_MS = Number.isFinite(envTimeoutMs) && envTimeoutMs 
 export function gitRun(cmd, args, { env, input, cwd, encoding = 'utf8', inheritEnv = true, timeoutMs = GIT_RUN_TIMEOUT_MS } = {}) {
   const r = spawnSync(cmd, args, { encoding, input, timeout: timeoutMs, killSignal: 'SIGKILL', env: inheritEnv ? (env ? { ...process.env, ...env } : process.env) : env, ...(cwd ? { cwd } : {}) });
   const empty = encoding === 'buffer' ? Buffer.alloc(0) : '';
-  const timedOut = r.error?.code === 'ETIMEDOUT';
+  const timedOut = r.error?.code === 'ETIMEDOUT' || (r.signal && r.status == null);
   const stderr = r.stderr == null ? '' : String(r.stderr);
   const failure = r.error || r.signal
     ? `git ${args[0]} failed to run: ${r.error?.code || r.signal} ${r.error?.message || `terminated by signal ${r.signal}`}` : '';
