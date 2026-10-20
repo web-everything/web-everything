@@ -5145,9 +5145,11 @@ async function runCli() {
   const carryPath = join(dirname(queueStatePath()), 'drain-ready-carry.json');
   const carry = throughput.value.carryOverReadyFirst && onlyPr == null ? readCarry(carryPath) : [];
   const prStateSetting = resolveDrainPrState();
-  process.stderr.write(`policy · drain.prState.batched=${prStateSetting.value.batched} (${prStateSetting.sources.batched})\n`);
+  process.stderr.write(`policy · drain.prState.batched=${prStateSetting.value.batched} (${prStateSetting.sources.batched}) pageSize=${prStateSetting.value.pageSize} (${prStateSetting.sources.pageSize}) commitsPerPr=${prStateSetting.value.commitsPerPr} (${prStateSetting.sources.commitsPerPr})\n`);
   passPrState = prStateSetting.value.batched
-    ? await readDrainPrStateBatch({ repos: (RECONCILE ? CONTEXT_REPOS : REPOS).map(repo => repo || localSlug), exec: execFileP })
+    ? await readDrainPrStateBatch({ repos: (RECONCILE ? CONTEXT_REPOS : REPOS).map(repo => repo || localSlug), exec: execFileP,
+      pageSize: prStateSetting.value.pageSize, commitsPerPr: prStateSetting.value.commitsPerPr,
+      report: o => process.stderr.write(`drain.prState batch · ${o.repo}: ${o.ok ? `${o.rows} PRs in ${o.pages} page(s)${o.overflow ? `, ${o.overflow} over the caps → per-PR read` : ''}` : `unavailable (${o.error}) → per-PR reads`}\n`) })
     : new Map();
   // Keep listing, bare-loop and review-escalation policy on one fresh snapshot per pass.
   const workflowEditSetting = resolveDrainWorkflowEditHuman();
