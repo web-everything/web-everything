@@ -44,5 +44,5 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Also raised by
 
-- Also raised by web-everything/web-everything#5549 (finding 2: `we:backlog/xt96sbx-we-operator-override-slice-3-guard-floor-confirm-and-flag-on.md:15` — Card-lint: each numbered edge-case line that claims handling not 'n/a' must map to a test name in A1.)
+- Also raised by web-everything/web-everything#5549 (finding 2: `we:backlog/6269-we-operator-override-slice-3-guard-floor-confirm-and-flag-on.md:15` — Card-lint: each numbered edge-case line that claims handling not 'n/a' must map to a test name in A1.)
 - Also raised by web-everything/web-everything#5525 (finding 1: `we:backlog/6240-overlap-yield-known-holds.md:38` — Add a card-lint rule in check:standards: every numbered 'Edge cases' item must be referenced by an Acceptance ID or marked n/a.)
