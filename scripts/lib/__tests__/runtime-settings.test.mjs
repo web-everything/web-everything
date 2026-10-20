@@ -42,10 +42,25 @@ describe('runtime settings path', () => {
     symlinkSync(join(fakeHome, 'workspace', '.operations', 'settings', 'runtime.json'), join(dir, 'link.json'));
     expect(isLiveRuntimeFile(join(dir, 'link.json'), { home: fakeHome })).toBe(true);
     expect(runtimeSettingsPath({ env: { [RUNTIME_SETTINGS_ENV]: join(dir, 'link.json') }, home: fakeHome })).toBeNull();
+    // …and through `..` AFTER a symlink (resolve the symlink first; never normalise `..` textually). From
+    // <dir>/links/deep -> <fakeHome>/a/b, `deep/../../workspace/...` is the live file; textual normalisation would
+    // instead produce <dir>/workspace/... and miss it.
+    mkdirSync(join(fakeHome, 'a', 'b'), { recursive: true });
+    mkdirSync(join(dir, 'links'), { recursive: true });
+    symlinkSync(join(fakeHome, 'a', 'b'), join(dir, 'links', 'deep'));
+    const dotdot = `${join(dir, 'links', 'deep')}/../../workspace/.operations/settings/runtime.json`;
+    expect(isLiveRuntimeFile(dotdot, { home: fakeHome })).toBe(true);
+    expect(runtimeSettingsPath({ env: { [RUNTIME_SETTINGS_ENV]: dotdot }, home: fakeHome })).toBeNull();
+    // A `..` that cannot be placed without resolving fails closed; an ordinary temp path is not the live file.
+    expect(isLiveRuntimeFile(join(dir, 'nope') + '/missing/../x.json', { home: fakeHome })).toBe(true);
+    expect(isLiveRuntimeFile(path, { home: fakeHome })).toBe(false);
     // …and for an explicit `path` argument naming the host's real live file (refused before any read or write).
     const live = join(homedir(), 'workspace', '.operations', 'settings', 'runtime.json');
     expect(readRuntimeFile({ path: live }).path).toBeNull();
     expect(() => writeRuntimeSettings({ path: live, next: { settings: {} }, audit: {} })).toThrow(/refusing to write the live/);
+    const liveViaDotdot = `${join(homedir(), 'workspace')}/.operations/../.operations/settings/runtime.json`;
+    expect(readRuntimeFile({ path: liveViaDotdot }).path).toBeNull();
+    expect(() => writeRuntimeSettings({ path: liveViaDotdot, next: { settings: {} }, audit: {} })).toThrow(/refusing to write the live/);
   });
 });
 

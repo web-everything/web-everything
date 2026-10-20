@@ -27,7 +27,7 @@
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, sep } from 'node:path';
 import { withPathLock } from '../readiness/with-lock.mjs';
 import { isUnderTest } from './under-test.mjs';
 
@@ -67,20 +67,34 @@ export const RUNTIME_SETTINGS_ALLOWLIST = Object.freeze({
 });
 
 const livePath = (home) => join(home, 'workspace', '.operations', 'settings', 'runtime.json');
-/** The real (symlink-resolved) form of a path that may not exist yet: realpath its longest existing ancestor. */
+/**
+ * The real (symlink-resolved) form of a path that may not exist yet. NEVER normalises `..` before resolving (that
+ * changes meaning across a symlink): the raw path goes to `realpathSync` (the kernel follows symlinks, then `..`);
+ * when it does not exist, the raw string's last segment is peeled off textually and the existing parent is resolved
+ * the same way, then the peeled segments are re-appended. A peeled segment that is `.`/`..`/empty cannot be placed
+ * without resolving it, so the result is `null` (callers treat that as "may be the live file").
+ * @returns {string|null}
+ */
 export function realPathOf(p) {
-  let head = resolve(p); const rest = [];
+  const raw = String(p);
+  let head = isAbsolute(raw) ? raw : `${process.cwd()}${sep}${raw}`;
+  const rest = [];
   for (;;) {
-    try { return join(realpathSync.native(head), ...rest); } catch { /* walk up */ }
-    const parent = dirname(head);
-    if (parent === head) return resolve(p);
-    rest.unshift(basename(head)); head = parent;
+    try { return rest.length ? join(realpathSync.native(head), ...rest) : realpathSync.native(head); } catch { /* peel one */ }
+    const cut = head.replace(/\/+$/, '');
+    const i = cut.lastIndexOf(sep);
+    if (i <= 0) return null;
+    const seg = cut.slice(i + 1);
+    if (!seg || seg === '.' || seg === '..') return null;
+    rest.unshift(seg);
+    head = cut.slice(0, i) || sep;
   }
 }
 const testing = (env) => isUnderTest(env) || isUnderTest(process.env);
 /** True when `p` is (by real path, through any symlink) the host's LIVE runtime file. */
 export function isLiveRuntimeFile(p, { home = homedir() } = {}) {
   const real = realPathOf(p);
+  if (real === null) return true; // unplaceable without resolving — fail closed
   return [livePath(home), livePath(homedir())].some((l) => realPathOf(l) === real);
 }
 /** Under test, refuse ANY path (env override or explicit argument) that is the live file. */
