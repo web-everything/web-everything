@@ -610,6 +610,19 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     expect(out.deferredForLanes).toBe(3);
   });
 
+  it('EMERGENCY live-review cap: a shared budget bounds new reviews across repos; 0 left dispatches nothing', async () => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const budget = liveReviewRoundBudget({ env: {}, listCommands: () => 'node scripts/operations/review-job.mjs --pr=1\nnode x/review-loop-cli.mjs\nnode other.mjs\n' });
+    expect(budget).toMatchObject({ live: 1, max: 3, left: 2 });
+    const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+    for (let i = 0; i < 2; i++) runReviewTick({ reconcile: () => reviewsPlan(3), dispatch, tagRound: () => {}, tagStatus: () => {},
+      statusCandidates: () => [], acquirableLanes: () => 10, liveReviewBudget: budget });
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    const closed = liveReviewRoundBudget({ env: {}, listCommands: () => { throw Error('ps failed'); } });
+    expect(closed.left).toBe(0);
+    expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '5' }, listCommands: () => '' })).toMatchObject({ max: 5, left: 5 });
+  });
+
   it('deferred reviews still feed statusCandidates (the whole owed list, not just what got dispatched)', () => {
     const statusCandidates = vi.fn(() => []);
     runReviewTick({
