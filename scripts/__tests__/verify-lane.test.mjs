@@ -165,12 +165,14 @@ await new Promise((r) => setTimeout(r, 2_600));
 const second = held();
 writeFileSync(${JSON.stringify(samples)}, JSON.stringify({ first: first?.heartbeatAt ?? null, second: second?.heartbeatAt ?? null }));
 `);
-    const r = spawnSync('node', [VERIFY_LANE, `--gate=node ${gateScript}`, '--json'], { cwd: dir, encoding: 'utf8', timeout: 60_000,
+    // Replace the gate shell so process.ppid identifies verify-lane on shells that do not exec the last command.
+    const r = spawnSync('node', [VERIFY_LANE, `--gate=exec node ${gateScript}`, '--json'], { cwd: dir, encoding: 'utf8', timeout: 60_000,
       env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, LANE_POOL_ROOT: join(dir, '.git', 'pool'),
         WE_VERIFY_SLOT_HEARTBEAT_MS: '1000' } });
     expect(r.stderr).toContain('slot heartbeat every 1000ms (slotHeartbeatMs, env)');
     const { first, second } = JSON.parse(readFileSync(samples, 'utf8'));
     expect(first).toEqual(expect.any(String));
+    expect(second).toEqual(expect.any(String));
     expect(Date.parse(second)).toBeGreaterThan(Date.parse(first));
   }, 70_000);
 });
