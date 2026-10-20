@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 import { hostname } from 'node:os';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operations/run-store.mjs';
+import { readFilteredInOrder } from './stream-filter-runs.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { redTeamEnabled, redTeamOwedFor } from './review-red-team-policy.mjs';
@@ -31,9 +32,10 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     && row.repo === repo && Number(row.pr) === Number(pr) && row.rev === head);
   // Runs are immutable in identity but updated in place: choose the latest read of this exact repo/PR/head.
   const latestRun = () => {
-    const hits = list(runsDir).filter(id => id.startsWith('review-pr-')).map(id => ({ id, run: read(id, runsDir) }))
-      .filter(({ run }) => run?.op === 'review-pr' && run.input?.repo === repo && Number(run.input?.pr) === Number(pr)
-        && run.findings?.read?.netBasis?.rev === head)
+    // Read, test and drop one run at a time (xwu9oxh S1a): same reads, order and errors as map-then-filter.
+    const hits = readFilteredInOrder(list(runsDir).filter(id => id.startsWith('review-pr-')), id => read(id, runsDir),
+      run => run?.op === 'review-pr' && run.input?.repo === repo && Number(run.input?.pr) === Number(pr)
+        && run.findings?.read?.netBasis?.rev === head, (run, id) => ({ id, run }))
       .map(hit => ({ ...hit, at: statSync(join(runsDir, `${hit.id}.json`)).mtimeMs }));
     hits.sort((a, b) => b.at - a.at);
     return { run: hits[0]?.run ?? null, at: hits[0]?.at ?? 0 };
