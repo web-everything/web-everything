@@ -1112,6 +1112,28 @@ export function defaultReviewHostAdmission({ env = process.env, admission = host
   return { ...verdict, maxPerTick: policy.settings.host.maxReviewDispatchPerTick };
 }
 
+/** The real effects the CLI daemon's review pass runs with (the default `runReview` of {@link buildCliDaemonEffects}
+ *  spreads these under its per-tick opts). Builds nothing that does IO until a tick calls it. */
+export function cliReviewTickOpts({ log = console } = {}) {
+  const factsProvider = withFactsLabels(createGhProvider());
+  return {
+    log: line => log.error(line),
+    acquirableLanes: defaultAcquirableLaneNumbers, readPrs: defaultReadPrs, readAgents: defaultReadAgents,
+    hostAdmission: defaultReviewHostAdmission,
+    poolExhaustion: DAEMON_POOL_EXHAUSTION,
+    refreshScopeBloat: refreshScopeBloatedPr,
+    postRefreshMarker: defaultPostRebaseComment,
+    promoteDrafts: promoteDraftsGuarded,
+    notePromotions: ({ repo, promotions, replanError }) => {
+      for (const r of promotions) log.error(`review-daemon: ${repo}#${r.pr} same-pass promote ${r.action} — ${String(r.why ?? '').replace(/\s+/g, ' ').slice(0, 300)}`);
+      if (replanError) log.error(`review-daemon: ${repo} same-pass re-plan failed (review goes out next pass): ${replanError}`);
+    },
+    dispatch: (o) => dispatchReviewByMode({ ...o, ciGate: readReviewCiGateFactsFirst }),
+    tagRound: (o) => tagReviewRound({ ...o, provider: factsProvider }),
+    tagStatus: (o) => tagReviewStatus({ ...o, provider: factsProvider }),
+  };
+}
+
 export function buildCliDaemonEffects({
   owner, intervalMs = DEFAULT_INTERVAL_MS, log = console,
   reapSessions = defaultReapSessions,
@@ -1124,26 +1146,7 @@ export function buildCliDaemonEffects({
   // C1c — PR facts (head SHA, labels, completed checks) come from the shared store first (`WE_REVIEW_FACTS=0`
   // turns that off). The dispatch gate re-reads the live head after its checks and falls back to GitHub when the
   // store is stale or partial; label READS try the store, label WRITES and the drain/merge path never do.
-  runReview = (opts) => {
-    const factsProvider = withFactsLabels(createGhProvider());
-    return runReviewTickAllRepos({
-      log: line => log.error(line),
-      acquirableLanes: defaultAcquirableLaneNumbers, readPrs: defaultReadPrs, readAgents: defaultReadAgents,
-      hostAdmission: defaultReviewHostAdmission,
-      poolExhaustion: DAEMON_POOL_EXHAUSTION,
-      refreshScopeBloat: refreshScopeBloatedPr,
-      postRefreshMarker: defaultPostRebaseComment,
-      promoteDrafts: promoteDraftsGuarded,
-      notePromotions: ({ repo, promotions, replanError }) => {
-        for (const r of promotions) log.error(`review-daemon: ${repo}#${r.pr} same-pass promote ${r.action} — ${String(r.why ?? '').replace(/\s+/g, ' ').slice(0, 300)}`);
-        if (replanError) log.error(`review-daemon: ${repo} same-pass re-plan failed (review goes out next pass): ${replanError}`);
-      },
-      dispatch: (o) => dispatchReviewByMode({ ...o, ciGate: readReviewCiGateFactsFirst }),
-      tagRound: (o) => tagReviewRound({ ...o, provider: factsProvider }),
-      tagStatus: (o) => tagReviewStatus({ ...o, provider: factsProvider }),
-      ...opts,
-    });
-  },
+  runReview = (opts) => runReviewTickAllRepos({ ...cliReviewTickOpts({ log }), ...opts }),
   // #xconv1 — the SAME shared-reads optimization `runReview` above opts into, wired the same way for its own
   // separate, additive async stage (see `runConvertAdvisoryTick`'s own doc for why this is not folded into
   // `runReview`/`runReviewTick`).

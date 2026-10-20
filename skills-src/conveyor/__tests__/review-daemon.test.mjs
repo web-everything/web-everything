@@ -641,6 +641,49 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     expect(check).toHaveBeenCalledTimes(1);
   });
 
+  it('host admission (verify-admission): runReviewTickAllRepos wraps one check into a host-wide budget across every repo', () => {
+    const check = vi.fn(() => ({ admitted: true, reason: 'ok', maxPerTick: 2 }));
+    const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+    const tick = (opts) => runReviewTick({ reconcile: () => reviewsPlan(3), dispatch, tagRound: () => {}, tagStatus: () => {},
+      statusCandidates: () => [], acquirableLanes: () => 10, ...opts });
+    runReviewTickAllRepos({ repos: ['repo-a', 'repo-b', 'repo-c'], tick, hostAdmission: check,
+      authGateOverride: () => ({ paused: false, reason: null }) });
+    expect(check).toHaveBeenCalledTimes(1);
+    expect(dispatch).toHaveBeenCalledTimes(2);
+  });
+
+  it('defaultReviewHostAdmission (verify-admission): host verdict + the cascade per-tick cap, non-interactive; fails closed on an unreadable policy', async () => {
+    const { defaultReviewHostAdmission } = await import('../review-daemon.mjs');
+    const { loadHostOverloadSettings } = await import('../../../scripts/lib/host-overload-settings.mjs');
+    const env = { ...process.env, WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK: '3' };
+    const admission = vi.fn(() => ({ admitted: true, reason: 'host load ok' }));
+    expect(defaultReviewHostAdmission({ env, admission, loadPolicy: loadHostOverloadSettings }))
+      .toEqual({ admitted: true, reason: 'host load ok', maxPerTick: 3 });
+    expect(admission).toHaveBeenCalledWith({ env, interactive: false,
+      policy: expect.objectContaining({ sources: expect.objectContaining({ 'host.maxReviewDispatchPerTick': 'env' }) }) });
+    // A not-admitted host verdict flows through the tick: nothing dispatched, every review stays owed.
+    const low = () => defaultReviewHostAdmission({ env, loadPolicy: loadHostOverloadSettings,
+      admission: () => ({ admitted: false, reason: 'host memory headroom 900MB (free+swap)' }) });
+    expect(low()).toMatchObject({ admitted: false, maxPerTick: 3 });
+    const dispatch = vi.fn();
+    const out = runReviewTick({ reconcile: () => reviewsPlan(2), dispatch, tagRound: () => {}, tagStatus: () => {},
+      statusCandidates: () => [], acquirableLanes: () => 10, hostAdmission: low });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(out.deferredForHost).toBe(2);
+    // An unreadable policy admits nothing, and the host is never sampled.
+    const sampled = vi.fn();
+    expect(defaultReviewHostAdmission({ env, admission: sampled, loadPolicy: () => { throw Error('host-overload: bad json\nmore'); } }))
+      .toEqual({ admitted: false, reason: 'host policy unreadable: host-overload: bad json' });
+    expect(sampled).not.toHaveBeenCalled();
+  });
+
+  it('host admission (verify-admission): the CLI daemon\'s review pass is wired to defaultReviewHostAdmission', async () => {
+    const { cliReviewTickOpts, defaultReviewHostAdmission } = await import('../review-daemon.mjs');
+    const opts = cliReviewTickOpts({ log: { error: () => {} } });
+    expect(typeof defaultReviewHostAdmission).toBe('function');
+    expect(opts.hostAdmission).toBe(defaultReviewHostAdmission);
+  });
+
   it('deferred reviews still feed statusCandidates (the whole owed list, not just what got dispatched)', () => {
     const statusCandidates = vi.fn(() => []);
     runReviewTick({

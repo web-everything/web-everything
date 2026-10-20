@@ -147,6 +147,34 @@ describe('verify-lane — hard per-phase timeout (verify-admission, 2026-10-20)'
   }, 70_000);
 });
 
+describe('verify-lane — slot heartbeat while the gate runs (verify-admission, 2026-10-20)', () => {
+  it('refreshes the held admission slot every slotHeartbeatMs, so a long gate keeps its slot', () => {
+    // The gate itself samples the slot verify-lane holds for it: once at start, once after ~2.5 heartbeats.
+    // Before: no refresh, so heartbeatAt stayed at acquire time and the lease expired under a long gate.
+    const samples = join(dir, 'samples.json');
+    const gateScript = join(dir, 'sample.mjs');
+    const admissionModule = resolve(process.cwd(), 'scripts/readiness/heavy-admission.mjs');
+    const locksModule = resolve(process.cwd(), 'scripts/readiness/file-locks.mjs');
+    writeFileSync(gateScript, `import { writeFileSync } from 'node:fs';
+import { admissionLockRoot, slotPath } from ${JSON.stringify(admissionModule)};
+import { readLockEntry } from ${JSON.stringify(locksModule)};
+const lockRoot = admissionLockRoot(process.cwd());
+const held = () => [0, 1, 2, 3].map((i) => readLockEntry(lockRoot, slotPath(i))).find((e) => e && e.pid === process.ppid);
+const first = held();
+await new Promise((r) => setTimeout(r, 2_600));
+const second = held();
+writeFileSync(${JSON.stringify(samples)}, JSON.stringify({ first: first?.heartbeatAt ?? null, second: second?.heartbeatAt ?? null }));
+`);
+    const r = spawnSync('node', [VERIFY_LANE, `--gate=node ${gateScript}`, '--json'], { cwd: dir, encoding: 'utf8', timeout: 60_000,
+      env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, LANE_POOL_ROOT: join(dir, '.git', 'pool'), WE_HEAVY_ADMISSION_CAP: '1',
+        WE_VERIFY_SLOT_HEARTBEAT_MS: '1000' } });
+    expect(r.stderr).toContain('slot heartbeat every 1000ms (slotHeartbeatMs, env)');
+    const { first, second } = JSON.parse(readFileSync(samples, 'utf8'));
+    expect(first).toEqual(expect.any(String));
+    expect(Date.parse(second)).toBeGreaterThan(Date.parse(first));
+  }, 70_000);
+});
+
 describe('verify-lane — card-only diff skips the local gate (skipLocalForCardOnly)', () => {
   const git = (...a) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' });
   const verify = (extra = []) => spawnSync('node', [VERIFY_LANE, 'verify', '--json', ...extra], { cwd: dir, encoding: 'utf8', env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot } });

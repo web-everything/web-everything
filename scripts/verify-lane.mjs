@@ -575,7 +575,8 @@ let firstPhaseAdmission = phaseAdmission ? admission : null;
 // had no refresh, so a gate past ADMISSION_LEASE_MINUTES lost its slot to the next waiter and kept running
 // unslotted (12 concurrent verify-lanes, `heavy-queue` showing 0 held). The per-phase timeout below bounds how
 // long a refreshed slot can be kept. Unref'd: never keeps this process alive by itself.
-const SLOT_HEARTBEAT_MS = 5 * 60_000;
+const SLOT_HEARTBEAT_MS = verifySetting('slotHeartbeatMs', process.env);
+process.stderr.write(`verify-lane: slot heartbeat every ${SLOT_HEARTBEAT_MS}ms (slotHeartbeatMs, ${verifySettingSource('slotHeartbeatMs', process.env)})\n`);
 const slotHeartbeat = setInterval(() => {
   try { heartbeatOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO }); } catch { /* best-effort */ }
 }, SLOT_HEARTBEAT_MS);

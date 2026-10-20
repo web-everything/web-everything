@@ -17,6 +17,7 @@
   "revertRedMaxFiles": 40,
   "selection": "since-last-green",
   "phaseTimeoutMs": 1800000,
+  "slotHeartbeatMs": 300000,
   "alwaysRunTests": [
     "skills-src/conveyor/__tests__/runner-pass-coverage.test.mjs",
     "skills-src/conveyor/__tests__/launchd-templates.test.mjs",
