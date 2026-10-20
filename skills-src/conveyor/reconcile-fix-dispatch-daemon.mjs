@@ -45,7 +45,7 @@
 
 import { createFixHandoffSleep, createFixHandoffProbe } from '../../scripts/lib/fix-handoff.mjs';
 import { publishAttention } from '../../scripts/operations/needs-you-feed.mjs';
-import { autoRoundGrant as defaultAutoRoundGrant, firstLine as redactedFirstLine } from '../../scripts/conveyor/auto-round-grant-io.mjs';
+import { autoRoundGrant as defaultAutoRoundGrant, firstLine as redactedFirstLine, stuckAfterGrant as defaultStuckAfterGrant } from '../../scripts/conveyor/auto-round-grant-io.mjs';
 import { resolveFixSafety } from '../../scripts/conveyor/repeated-finding-reset.mjs';
 import { execFileSync } from 'node:child_process';
 import { resolveChildTimeoutMs } from '../../scripts/lib/bounded-child.mjs';
@@ -384,7 +384,7 @@ let loggedNeedsHumanVoidSetting = false;
 
 export function runReconcileNotesAllRepos({
   repos = FIX_DISPATCH_DAEMON_REPOS, tick = defaultReadNotesForRepo, postComment = postNoteComment, parkToHuman = defaultParkToHuman,
-  publish = publishAttention, safety = resolveFixSafety(), autoRoundGrant = defaultAutoRoundGrant,
+  publish = publishAttention, safety = resolveFixSafety(), autoRoundGrant = defaultAutoRoundGrant, stuckAfterGrant = defaultStuckAfterGrant,
   dryRun = defaultNoteCommentDryRun(), verdictSettings = resolveCiHealVerdictSettings(), readRequiredChecks = defaultReadRequiredChecks,
   ...tickOpts
 } = {}) {
@@ -405,6 +405,21 @@ export function runReconcileNotesAllRepos({
     }
     const { repo, result } = entry;
     const prsByNumber = result?.prsByNumber ?? new Map();
+    // Never silently stuck after an automatic grant: a PR still at its round limit well after one gets its
+    // needs-you event (published even though the grant's own pass suppressed it; the feed dedups per head).
+    if (!dryRun && safety.value.alertAtRoundCap) {
+      const noted = new Set((result?.notes ?? []).map((n) => n.prNumber));
+      for (const pr of prsByNumber.values()) {
+        if (noted.has(pr?.number)) continue;
+        let reason = null;
+        try { reason = stuckAfterGrant({ repo, pr }); } catch (e) { reason = null; process.stderr.write(`auto-round-grant stuck check ${repo}#${pr?.number}: ${redactedFirstLine(e)}\n`); }
+        if (!reason) continue;
+        autoGrants.push({ repo, prNumber: pr.number, action: 'stuck', why: reason });
+        process.stderr.write(`auto-round-grant ${repo}#${pr.number}: stuck — ${reason}\n`);
+        try { publish({ repo: CONSTELLATION_REPOS[repo]?.slug ?? repo, pr: pr.number, head: pr.headRefOid ?? '', kind: 'at-round-limit', reason }); }
+        catch (e) { process.stderr.write(`needs-you publication failed: ${redactedFirstLine(e)}\n`); }
+      }
+    }
     for (const n of (result?.notes ?? [])) {
       const tagged = { ...n, repo };
       notes.push(tagged);
