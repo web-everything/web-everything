@@ -565,7 +565,7 @@ describe('half-configured App auth (2026-10-09 drain incident)', () => {
   });
 
   it.each([true, false])('reports absent configuration only for a daemon (daemon=%s)', async (daemon) => {
-    const opts = { ...options(`absent-config-${daemon}.mjs`, {}), daemon };
+    const opts = { ...options(`absent-config-${daemon}.mjs`, {}), daemon, installShim: async () => ({ ok: true }) };
     expect(await ensureFreshGithubAppEnv(opts)).toEqual({ applied: false, reason: 'not-configured' });
     expect(opts.mint).not.toHaveBeenCalled();
     expect(opts.writeStatus).not.toHaveBeenCalled();
@@ -637,6 +637,41 @@ describe('half-configured App auth (2026-10-09 drain incident)', () => {
 });
 
 describe('daemon refresh lookahead and legacy fallback liveness', () => {
+  it('installs the daemon refusal shim before a failed early refresh and before the tick', async () => {
+    const { resolveDeliveryIdentity } = await import('../github-app-identity.mjs');
+    const now = Date.now();
+    const identity = resolveDeliveryIdentity({ tool: { worker: { appId: '2', installations: { 'web-everything': '22' }, key: { file: '/fixture/worker-key' } } } });
+    const events = [];
+    const env = { GITHUB_TOKEN: 'fixture-personal' };
+    const wrapped = withGithubAppAuth({ tickOnce: () => { events.push('tick'); } }, {
+      ...NOOP_STATUS, env, identity, role: 'worker', daemon: true, perOwner: true, now,
+      cachePath: '/fixture/cache.json',
+      readCache: () => ({ v: CACHE_VERSION, appId: '2', installationId: '22', token: 'fixture-worker', expiresAt: new Date(now + 20 * 60e3).toISOString() }),
+      canReadKey: () => true,
+      installShim: async () => { events.push('shim'); return { ok: true }; },
+      mint: async () => { events.push('mint'); throw Error('fixture network unavailable'); },
+      log: { error() {} },
+    });
+    await wrapped.tickOnce();
+    expect(events).toEqual(['shim', 'mint', 'tick']);
+  });
+
+  it.each(['returned failure', 'thrown failure'])('does not mint or tick if the daemon guard cannot be installed (%s)', async (failure) => {
+    const tickOnce = vi.fn();
+    const mint = vi.fn();
+    const wrapped = withGithubAppAuth({ tickOnce }, {
+      ...NOOP_STATUS, env: { ...CONFIGURED_ENV }, daemon: true, perOwner: true, mint,
+      installShim: async () => {
+        if (failure === 'thrown failure') throw Error('fixture unwritable shim');
+        return { ok: false };
+      },
+      log: { error() {} },
+    });
+    await expect(wrapped.tickOnce()).rejects.toThrow('refusing to run daemon without the gh auth guard');
+    expect(mint).not.toHaveBeenCalled();
+    expect(tickOnce).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])('uses the correct primary AND per-installation buffer (daemon=%s)', async (daemon) => {
     const { DAEMON_REFRESH_BUFFER_MS } = await import('../github-app-auth-env.mjs');
     expect(DAEMON_REFRESH_BUFFER_MS).toBe(30 * 60 * 1000);
@@ -670,7 +705,7 @@ describe('daemon refresh lookahead and legacy fallback liveness', () => {
       ...NOOP_STATUS, env, identity, role: 'worker', daemon: true, now, cachePath: '/fixture/cache.json',
       readCache: () => null, writeCache, mint, canReadKey: () => true,
       getInstallationInfo: async () => ({ repositorySelection: 'all' }), required: { permissions: {}, repos: [] },
-      extraInstallations: false, setEnv, log: { error() {} },
+      extraInstallations: false, setEnv, installShim: async () => ({ ok: true }), log: { error() {} },
     });
     expect(result).toMatchObject({ applied: true, role: 'worker', appId: '2' });
     expect(mint.mock.calls.map(([a]) => a.appId)).toEqual(['2', CONFIGURED_ENV.WE_GITHUB_APP_ID]);

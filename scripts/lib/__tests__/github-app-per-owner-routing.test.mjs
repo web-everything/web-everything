@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { OWNER_INSTALLATIONS } from '../github-app-installations.mjs';
 import { renderGhShimScript } from '../gh-app-shim.mjs';
-import { ensureFreshGithubAppEnv } from '../github-app-auth-env.mjs';
+import { ensureFreshGithubAppEnv, withGithubAppAuth, CACHE_VERSION } from '../github-app-auth-env.mjs';
 
 const PERMS = { metadata: 'read', pull_requests: 'write', issues: 'write', contents: 'write', workflows: 'write', checks: 'read', statuses: 'read', actions: 'read' };
 const baseEnv = () => ({ WE_GITHUB_APP_ID: '1', WE_GITHUB_APP_INSTALLATION_ID: OWNER_INSTALLATIONS['web-everything'], WE_GITHUB_APP_PRIVATE_KEY_PATH: '/k', PATH: '/usr/bin' });
@@ -106,6 +106,40 @@ describe('ensureFreshGithubAppEnv({ perOwner: true })', () => {
 
 
 describe('canonical owner routes to the worker App installation', () => {
+  it('a first daemon tick refuses personal auth after an early role refresh fails', async () => {
+    const { resolveDeliveryIdentity, shimRoleTable } = await import('../github-app-identity.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'gh-first-tick-'));
+    try {
+      const identity = resolveDeliveryIdentity({ tool: { worker: { appId: '2', installations: { 'web-everything': '222' }, key: { file: '/fixture/key' } } } });
+      const cachePath = join(dir, 'cache.json');
+      const invoked = join(dir, 'invoked');
+      const fakeGh = join(dir, 'fake-gh');
+      writeFileSync(fakeGh, `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(invoked)}, 'personal');\n`);
+      chmodSync(fakeGh, 0o755);
+      const shim = join(dir, 'shim.cjs');
+      const env = { PATH: process.env.PATH, HOME: dir, GITHUB_TOKEN: 'fixture-personal' };
+      const now = Date.now();
+      let tickResult;
+      const wrapped = withGithubAppAuth({ tickOnce: () => {
+        tickResult = spawnSync(process.execPath, [existsSync(shim) ? shim : fakeGh, 'auth', 'token'], { cwd: dir, env, encoding: 'utf8' });
+      } }, {
+        env, identity, role: 'worker', daemon: true, perOwner: true, cachePath, now, writeStatus() {},
+        readCache: () => ({ v: CACHE_VERSION, appId: '2', installationId: '222', token: 'fixture-app', expiresAt: new Date(now + 20 * 60e3).toISOString() }),
+        canReadKey: () => true, mint: async () => { throw Error('fixture network failure'); }, log: { error() {} },
+        installShim: async () => {
+          writeFileSync(shim, renderGhShimScript({ realGhPath: fakeGh, cachePath, roleTable: shimRoleTable({ identity, cachePath }),
+            ghThrottleCliPath: join(dir, 'absent-throttle'), refreshCliPath: join(dir, 'absent-refresh'),
+          }));
+          return { ok: true };
+        },
+      });
+      await wrapped.tickOnce();
+      expect(tickResult.status).toBe(1);
+      expect(tickResult.stderr).toContain('REFUSING');
+      expect(existsSync(invoked)).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it.each([
     ['repo flag', ['pr', 'list', '-R', 'chalbert/web-everything']],
     ['REST repo path', ['api', 'repos/chalbert/web-everything/issues']],

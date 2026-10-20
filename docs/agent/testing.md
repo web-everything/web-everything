@@ -1921,11 +1921,24 @@ refresh must not change the selected role, applied token provenance, or recorded
 The standalone gh shim recognizes `WE_GH_DAEMON_CALLER` and launchd labels under
 `com.we.` / `com.plateau.`. A daemon cache miss gets one synchronous refresh CLI attempt
 (90-second timeout), then refuses personal auth by default, including after an App 401.
-Only an inherited `GH_TOKEN` with matching `WE_GH_AUTH_TOKEN_HASH` is trusted as App auth.
+Install the daemon refusal shim before reading keys/caches or refreshing tokens, including
+when no App is configured. If installation fails, stop before the daemon tick runs.
+Only an inherited `GH_TOKEN` with matching `WE_GH_AUTH_TOKEN_HASH` is trusted as App auth
+for github.com. Host flags, repository/URL arguments, `GH_HOST`, `GH_REPO`, and git
+remotes or implicit gh configuration naming other hosts refuse by default, even with a fresh public-host App cache;
+enterprise credentials and stored logins have no validated provenance here. Conflicting
+host hints are handled conservatively. Explicit personal-fallback allows still apply.
+URL text in bodies, titles, and API fields is content rather than a target host.
+Unknown aliases, extension execution, and ambiguous URL-valued options refuse by default;
+their command expansion cannot prove which credential gh will select. Short flag arity
+must be resolved per command (for example checkout `-q` is boolean, API `-q` consumes jq).
 `ghAuth.personalFallback` resolves default → platform → tool →
 `WE_GH_AUTH_PERSONAL_FALLBACK`; refusals and explicit allows name the effective source.
 Interactive shells retain their inherited-auth behavior. Dispatched shim settings carry
-the daemon marker even when session spawning does not inherit the parent environment.
+the daemon marker even for XPC-only parents and when session spawning does not inherit
+the parent environment.
+Daemon settings construction must throw on a missing binary or failed shim write;
+returning no settings would leave the dispatched session outside the refusal boundary.
 
 Exercise these paths with synthetic cache entries, fake gh/refresh executables, isolated
 homes and ledgers, and injected minters. Cover `chalbert/web-everything` via `-R`, REST

@@ -40,13 +40,15 @@
  * The wrapper needs no `WE_GITHUB_APP_*` var and never touches the private key itself — only the cache file's
  * already-minted, short-lived token, exactly the credential `GH_TOKEN` was always meant to carry.
  *
- * OPT-IN, SAME GATE AS THE REST OF THIS EPIC (#3866). {@link buildGhShimSettingsEnv} returns `null` — no fs
+ * INTERACTIVE OPT-IN (#3866). {@link buildGhShimSettingsEnv} returns `null` — no fs
  * write, no PATH override, a dispatch byte-identical to before this file existed — unless
  * `we:scripts/lib/github-app-auth-env.mjs#resolveGithubAppEnvConfig` says the CALLING process has actually
  * opted into App auth. This is not only architectural tidiness: a process (or a test) that has not configured
  * `WE_GITHUB_APP_*` has no cache worth shadowing `gh` for, so shimming would be pure overhead for zero benefit
  * — and, live-caught the same day on this same item's own status-file follow-up, an unconditional real-fs
  * default is exactly how an unrelated test run ends up writing into a developer's actual home directory.
+ * Daemon callers always need a refusal shim, including when App configuration is unavailable; inability
+ * to install it throws instead of letting a dispatch omit the auth boundary.
  *
  * NEVER TOUCHES THE PRIVATE KEY. The generated shim only ever reads the shared token CACHE (a short-lived,
  * already-minted installation token). Daemon cache misses delegate minting to the bounded refresh CLI.
@@ -580,7 +582,7 @@ function invalidateSharedCache() {
 // script fall off the end instead keeps the event loop alive until every queued write really lands.
 function runInherited(env, reason) {
   if (DAEMON) {
-    const inheritedApp = env.GH_TOKEN && env.WE_GH_AUTH_TOKEN_HASH === createHash('sha256').update(env.GH_TOKEN).digest('hex');
+    const inheritedApp = !unsupportedHost && env.GH_TOKEN && env.WE_GH_AUTH_TOKEN_HASH === createHash('sha256').update(env.GH_TOKEN).digest('hex');
     if (!inheritedApp) {
       const detail = ' for daemon caller "' + DAEMON_CALLER + '" (role ' + requestedRole(env)
         + ', owner ' + (targetOwner(process.argv.slice(2), env) || 'unknown') + '): '
@@ -608,8 +610,105 @@ function runInherited(env, reason) {
   process.exitCode = result.status == null ? 1 : result.status;
 }
 
-let token = freshCachedToken();
-if (!token && DAEMON) {
+// These Apps and their provenance are scoped to github.com. Enterprise gh selects a different
+// credential family (or a stored login), so a GH_TOKEN hash cannot authorize that execution.
+// Check every host hint conservatively, including remotes and URLs, before using ANY App cache.
+function unsupportedTargetHost(argv, env) {
+  const publicHost = (host) => String(host).toLowerCase() === 'github.com';
+  // gh expands aliases/extensions after our check. Their hidden flags cannot establish App provenance.
+  const nativeCommands = ['alias', 'api', 'attestation', 'auth', 'browse', 'cache', 'codespace', 'cs', 'completion',
+    'config', 'extension', 'ext', 'gist', 'gpg-key', 'help', 'issue', 'label', 'org', 'pr', 'project', 'release',
+    'repo', 'ruleset', 'run', 'search', 'secret', 'ssh-key', 'status', 'variable', 'workflow'];
+  if (argv[0] && !argv[0].startsWith('-') && !nativeCommands.includes(argv[0])) return 'unknown command or alias';
+  if (argv[0]?.startsWith('-') && argv.length > 1) return 'ambiguous command';
+  if (['extension', 'ext'].includes(argv[0]) && argv[1] === 'exec') return 'extension execution';
+  const repoHost = (value, api = false) => {
+    const s = String(value || '');
+    if (/^[a-z][a-z0-9+.-]*:[/][/]/i.test(s)) {
+      try {
+        const host = new URL(s).hostname.toLowerCase();
+        // WHATWG URLs normalize Unicode/percent encodings and default ports; gh's host-keyed
+        // credential lookup need not. Only a literal public authority proves the same host.
+        const authority = s.slice(s.indexOf('://') + 3).split('/')[0].split('?')[0].split('#')[0].toLowerCase();
+        if (authority !== host) return 'ambiguous URL host';
+        return (publicHost(host) || (api && host === 'api.github.com')) ? null : host;
+      } catch { return 'invalid URL'; }
+    }
+    const scp = /^(?:[^@/]+@)?([^/:]+):[^/]/.exec(s);
+    if (scp) return publicHost(scp[1]) ? null : scp[1];
+    const parts = s.split('/');
+    if (parts.length >= 3) return publicHost(parts[0]) ? null : parts[0];
+    return null;
+  };
+  if (env.GH_HOST && !publicHost(env.GH_HOST)) return String(env.GH_HOST);
+  if (env.GH_REPO) { const host = repoHost(env.GH_REPO); if (host) return host; }
+  // Only target-bearing positions are URLs. A comment body/title/header may contain any URL.
+  const targetCommand = argv[0] !== 'search'; // native search positionals are query text
+  const valueFlags = new Set(['--body', '--body-file', '--title', '--template', '--json', '--jq',
+    '--field', '--raw-field', '--header', '--method', '--cache', '--input', '--search', '--label',
+    '--assignee', '--reviewer', '--milestone', '--project', '--base', '--head', '--author', '--owner', '--limit', '--state']);
+  // Short names change arity between commands: checkout -q/-f and merge -m/-s/-a are booleans.
+  // Exempt content values only where their consuming option is known; uncertain URL arguments refuse.
+  const command = argv[0] + ' ' + argv[1];
+  if (argv[0] === 'api') for (const flag of ['-F', '-f', '-H', '-X', '-q', '-t']) valueFlags.add(flag);
+  if (['pr create', 'pr edit', 'pr merge', 'issue create', 'issue edit'].includes(command)) {
+    for (const flag of ['-b', '-F', '-t']) valueFlags.add(flag);
+  }
+  if (['pr comment', 'pr review', 'issue comment'].includes(command)) {
+    for (const flag of ['-b', '-F']) valueFlags.add(flag);
+  }
+  if (['pr view', 'pr list', 'pr status', 'pr checks', 'issue view', 'issue list', 'issue status', 'repo view'].includes(command)) {
+    for (const flag of ['-q', '-t']) valueFlags.add(flag);
+  }
+  if (command === 'repo create') for (const flag of ['-d', '-h']) valueFlags.add(flag);
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (valueFlags.has(a)) { i++; continue; }
+    if (a === '--hostname' || a === '--host' || (argv[0] === 'auth' && a === '-h')) {
+      const host = argv[i + 1];
+      if (host && !host.startsWith('-')) { if (!publicHost(host)) return host; i++; }
+      continue;
+    }
+    if (a.startsWith('--hostname=') || a.startsWith('--host=')) {
+      const host = a.slice(a.indexOf('=') + 1);
+      if (!publicHost(host)) return host || 'unknown';
+      continue;
+    }
+    if (argv[0] === 'auth' && a.startsWith('-h') && a.length > 2) { if (!publicHost(a.slice(2))) return a.slice(2); continue; }
+    if (a === '--repo' || a === '-R') { const host = repoHost(argv[++i]); if (host) return host; continue; }
+    if (a.startsWith('--repo=')) { const host = repoHost(a.slice(7)); if (host) return host; continue; }
+    if (a.startsWith('-R') && a.length > 2) { const host = repoHost(a.slice(2)); if (host) return host; continue; }
+    // Inspect all remaining target-shaped positionals. Unknown option arity must never hide
+    // a later enterprise URL; ambiguous URL-valued options fail closed.
+    if (targetCommand && !a.startsWith('-') && (/^[a-z][a-z0-9+.-]*:[/][/]/i.test(a) || /^[^/]+[.][^/]+[/]/.test(a))) {
+      const host = repoHost(a, argv[0] === 'api');
+      if (host) return host;
+    }
+  }
+  try {
+    const remotes = spawnSync('/usr/bin/git', ['remote', '-v'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000 });
+    if (remotes.error) return 'unreadable git remotes';
+    for (const line of String(remotes.stdout || '').split('\\n')) {
+      const url = line.trim().split(/\\s+/)[1];
+      if (url) { const host = repoHost(url); if (host) return host; }
+    }
+  } catch { return 'unreadable git remotes'; }
+  // gh may use a configured enterprise host as its implicit default. Parse only the simple
+  // public-host-only shape; ambiguous YAML or unreadable config cannot prove public provenance.
+  if (!env.GH_HOST) {
+    const configDir = env.GH_CONFIG_DIR || join(env.XDG_CONFIG_HOME || join(env.HOME || homedir(), '.config'), 'gh');
+    try {
+      const hosts = readFileSync(join(configDir, 'hosts.yml'), 'utf8');
+      const keys = hosts.split('\\n').filter((line) => line.trim() && !/^\\s|^#|^---\\s*$/.test(line));
+      if (!keys.length && hosts.split('\\n').some((line) => line.trim() && !/^\\s*(?:#.*|---)?$/.test(line))) return 'ambiguous gh hosts';
+      if (keys.some((line) => !/^(?:github[.]com|"github[.]com"|'github[.]com'):\\s*(?:#.*)?$/.test(line))) return 'unsupported configured host';
+    } catch (e) { if (e.code !== 'ENOENT') return 'unreadable gh hosts'; }
+  }
+  return null;
+}
+const unsupportedHost = DAEMON ? unsupportedTargetHost(process.argv.slice(2), process.env) : null;
+let token = unsupportedHost ? null : freshCachedToken();
+if (!token && DAEMON && !unsupportedHost) {
   // One bounded synchronous mint attempt, then one cache re-read. CLI output never reaches the caller.
   try {
     if (existsSync(APP_REFRESH_CLI)) {
@@ -624,7 +723,7 @@ if (!token && DAEMON) {
 process.stdout.on('error', () => {});
 process.stderr.on('error', () => {});
 if (!token) {
-  runInherited(process.env); // no cached App token — same bytes/exit code as before (#4064: now also throttled)
+  runInherited(process.env, unsupportedHost ? 'unsupported GitHub host' : undefined);
 } else {
   const withToken = runThrottled(process.argv.slice(2), Object.assign({}, process.env, { GH_TOKEN: token }));
   if (withToken.error) {
@@ -847,9 +946,8 @@ export function sanitizeSpawnEnv(env = process.env) {
  * skip (see the module header). That second write's own success/failure never changes this function's return
  * value; it is purely additional insurance.
  *
- * NEVER THROWS. Every real effect below it is wrapped or already non-throwing; this function additionally
- * treats a MISSING real `gh` binary or a failed shim write as "skip it", never as a reason to fail a dispatch
- * that would otherwise have gone out fine on personal auth, exactly as it always has.
+ * Daemon callers throw on a missing real `gh` or a failed shim write: omitting the settings would
+ * lose the refusal boundary. Interactive callers retain the best-effort null result.
  * @param {{env?:NodeJS.ProcessEnv, pathEnv?:string, cachePath?:string, dir?:string, ghThrottleCliPath?:string, cwd?:string,
  *   exists?:Function, writeFile?:Function, chmod?:Function, mkdir?:Function, readFile?:Function}} [o]
  * @returns {Record<string,string>|null}
@@ -861,18 +959,24 @@ export function buildGhShimSettingsEnv({
   // Per-role Apps: the shim bakes every configured role's cache + installations (empty when none is configured).
   let id = identity;
   if (!id) { try { id = readDeliveryIdentity({ env }); } catch { id = null; } }
-  if (!resolveGithubAppEnvConfig(env) && !id?.anyConfigured) return null; // opt-in — see the module header
+  if (!resolveGithubAppEnvConfig(env) && !id?.anyConfigured && !isDaemonCaller(env)) return null;
   const roleTable = shimRoleTable({ identity: id, cachePath });
   // #4044: THIS checkout's own shim dir by default — never the one machine-wide file every dispatcher rewrote.
   const dir = dirOpt ?? checkoutShimDir({ ghThrottleCliPath });
   const realGhPath = resolveRealGhBinary({ pathEnv, shimDir: dir, exists });
-  if (!realGhPath) return null;
+  if (!realGhPath) {
+    if (isDaemonCaller(env)) throw new Error('gh-shim: refusing daemon dispatch without a real gh binary');
+    return null;
+  }
   const written = ensureGhShim({ dir, realGhPath, cachePath, ghThrottleCliPath, writeFile, chmod, mkdir, roleTable, callerRoles: id?.callerRoles, personalFallbackPolicy: readGhAuthPolicy({ daemon: true, env }) });
-  if (!written.ok) return null;
+  if (!written.ok) {
+    if (isDaemonCaller(env)) throw new Error('gh-shim: refusing daemon dispatch without the gh auth guard');
+    return null;
+  }
   const settingsEnv = { PATH: ghShimPathOverride({ dir, currentPath: pathEnv }) };
   // A dispatched session plays its dispatcher's role (a review session = reviewer) — only once roles are configured.
   if (Object.keys(roleTable).length && env?.[ROLE_ENV]) settingsEnv[ROLE_ENV] = String(env[ROLE_ENV]);
-  if (env.WE_GH_DAEMON_CALLER) settingsEnv.WE_GH_DAEMON_CALLER = String(env.WE_GH_DAEMON_CALLER);
+  if (isDaemonCaller(env)) settingsEnv.WE_GH_DAEMON_CALLER = String(env.WE_GH_DAEMON_CALLER || env.XPC_SERVICE_NAME);
   if (cwd) ensureSettingsFileEnv({ cwd, env: settingsEnv, readFile, writeFile, mkdir }); // best-effort, see above
   return settingsEnv;
 }
