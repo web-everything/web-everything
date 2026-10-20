@@ -60,3 +60,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5633 (finding 1: `we:backlog/6365-we-6265-slice-4-a-crash-after-an-active-override-publish-mus.md:12` — Require each promised recovery transition to map to a named planned test and observable assertions; add a card-validation gate rejecting unmapped behavior entries.) · key `approval-prevention-key:web-everything/web-everything#5633@3c27e493c120cc24e8e93f6861763d4791cdc363`

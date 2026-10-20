@@ -9,11 +9,39 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
-  runBounded, resolveChildTimeoutMs, DEFAULT_CHILD_TIMEOUT_MS, CHILD_TIMEOUT_ENV,
+  runBounded, summarizeStderr, resolveChildTimeoutMs, DEFAULT_CHILD_TIMEOUT_MS, CHILD_TIMEOUT_ENV,
 } from '../bounded-child.mjs';
 
 const LIB = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '..', 'bounded-child.mjs')).href;
 const NODE = process.execPath;
+const SHIM_WARNING = 'gh-shim: GitHub App role "worker" unavailable (worker: no fresh token cached) - using the legacy App for this call';
+const THROTTLE_ERROR = 'gh-throttle: GitHub core API rate limit exceeded for this identity — shared backoff until 2026-10-18T12:00:00Z, call not sent';
+
+describe('summarizeStderr', () => {
+  it('puts the real error first while retaining the skipped shim warning', () => {
+    expect(summarizeStderr(`${SHIM_WARNING}\n${THROTTLE_ERROR}\n`))
+      .toBe(`${THROTTLE_ERROR} [warning: ${SHIM_WARNING}]`);
+  });
+
+  it('skips multiple shim warnings and retains the first warning', () => {
+    expect(summarizeStderr(`${SHIM_WARNING}\ngh-shim: using personal auth for this call\n${THROTTLE_ERROR}\n`))
+      .toBe(`${THROTTLE_ERROR} [warning: ${SHIM_WARNING}]`);
+  });
+
+  it('keeps the first line when stderr contains only shim warnings', () => {
+    expect(summarizeStderr(`${SHIM_WARNING}\n`)).toBe(SHIM_WARNING);
+    expect(summarizeStderr(`${SHIM_WARNING}\ngh-shim: no GitHub App installation is configured\n`)).toBe(SHIM_WARNING);
+  });
+
+  it('preserves a normal first error line', () => {
+    expect(summarizeStderr(`boom\n${SHIM_WARNING}\nmore\n`)).toBe('boom');
+  });
+
+  it('preserves the empty-stderr fallback', () => {
+    expect(summarizeStderr('')).toBe('(no stderr)');
+    expect(summarizeStderr(' \n\t')).toBe('(no stderr)');
+  });
+});
 
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 const waitFor = async (pred, ms = 5000) => {
@@ -46,6 +74,15 @@ describe('runBounded', () => {
 
   it('rejects a non-zero exit with the first stderr line', async () => {
     await expect(runBounded(NODE, ['-e', 'console.error("boom\\nmore"); process.exit(3)'])).rejects.toThrow(/exited 3: boom/);
+  });
+
+  it.each([
+    [`${SHIM_WARNING}\n${THROTTLE_ERROR}\n`, `exited 1: ${THROTTLE_ERROR} [warning: ${SHIM_WARNING}]`],
+    [`${SHIM_WARNING}\n`, `exited 1: ${SHIM_WARNING}`],
+    ['boom\nmore\n', 'exited 1: boom'],
+  ])('rejects exit 1 with the expected stderr summary for %s', async (stderr, message) => {
+    const script = `process.stderr.write(${JSON.stringify(stderr)}); process.exitCode = 1;`;
+    await expect(runBounded(NODE, ['-e', script])).rejects.toMatchObject({ message, stderr, status: 1 });
   });
 
   it('on timeout kills the child AND the processes it started', async () => {

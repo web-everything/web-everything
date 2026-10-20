@@ -13,7 +13,7 @@ import {
   decideSelfSync, selfSyncCheckout, withSelfSync, readHeadSha, readOriginRefSha,
   DAEMON_SELF_SYNC_BRANCH_ENV, resolvePocSyncBranch, decidePocSelfSync, selfSyncCheckoutPoc,
   isSafeBranchName, decideRestart, collectImportClosure, changedFilesBetween, resolveRestartMinIntervalMs,
-  DEFAULT_RESTART_MIN_INTERVAL_MS,
+  DEFAULT_RESTART_MIN_INTERVAL_MS, resolveMaxAdoptWaitTicks,
 } from '../daemon-self-sync.mjs';
 import { assertMainNotStale, isStaleMainRefusalMessage } from '../main-staleness.mjs';
 
@@ -302,6 +302,103 @@ describe('withSelfSync — DEFAULT path: rebuild-driven (#4044 Module E)', () =>
       rmSync(lockRoot, { recursive: true, force: true });
       rmSync(stateDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('resolveMaxAdoptWaitTicks — policy sources', () => {
+  it.each([
+    [{ WE_DAEMON_REBUILD_MAX_ADOPT_WAIT_TICKS: '0' }, { rebuild: { maxAdoptWaitTicks: 7 } }, 0, 'env'],
+    [{ WE_DAEMON_REBUILD_MAX_ADOPT_WAIT_TICKS: '3' }, {}, 3, 'env'],
+    [{}, { rebuild: { maxAdoptWaitTicks: 4 } }, 4, 'settings'],
+    [{}, { rebuild: { maxAdoptWaitTicks: 0 } }, 0, 'settings'],
+    [{}, {}, 2, 'default'],
+    ...['', '-1', '1.5', '2x', 'Infinity', '1e2'].map((raw) => [
+      { WE_DAEMON_REBUILD_MAX_ADOPT_WAIT_TICKS: raw }, { rebuild: { maxAdoptWaitTicks: 5 } }, 5, 'settings',
+    ]),
+    ...[-1, 1.5, '3', null].map((value) => [{}, { rebuild: { maxAdoptWaitTicks: value } }, 2, 'default']),
+  ])('resolves %j over %j to %s (%s)', (env, settings, value, source) => {
+    expect(resolveMaxAdoptWaitTicks(env, settings)).toEqual({ value, source });
+  });
+});
+
+describe('withSelfSync — ready rebuild adoption cannot be starved', () => {
+  const candidate = { prevHead: 'old', adopt: { finalSha: 'new' }, passedAt: 'first' };
+  function setup(maxAdoptWaitTicks = 2) {
+    let ready = candidate;
+    let head = 'old';
+    const tick = vi.fn(() => 'ticked');
+    const log = { error: vi.fn() };
+    // A refused first read, then a successful same-tick priority retry.
+    const acquireRead = vi.fn((_root, opts) => opts.trackStarvation === false
+      ? { ok: true } : { ok: false, reason: 'writer-active', starved: 5 });
+    const readReady = vi.fn(() => ready);
+    const rebuild = vi.fn(async () => ({ moved: false, reason: 'up-to-date' }));
+    const w = withSelfSync({ tickOnce: tick }, {
+      root: '/x', env: {}, versions: null, log, onRestart: vi.fn(), rebuild,
+      readReady, readHead: () => head, readState: () => ({}),
+      diffFiles: () => [], importClosure: () => null,
+      acquireRead, releaseRead: vi.fn(), readerPriorityAfter: 1, priorityWaitMs: 1000,
+      sleep: async () => {}, maxAdoptWaitTicks,
+    });
+    return { w, tick, log, acquireRead, readReady, rebuild,
+      setReady: (value) => { ready = value; }, setHead: (value) => { head = value; } };
+  }
+
+  it('waiting <= N ticks keeps reader priority; waiting > N skips without claiming it', async () => {
+    const { w, tick, log, acquireRead, readReady } = setup();
+    await expect(w.tickOnce()).resolves.toBe('ticked');
+    await expect(w.tickOnce()).resolves.toBe('ticked');
+    expect(log.error.mock.calls.filter(([line]) => line.includes('claiming reader priority'))).toHaveLength(2);
+    acquireRead.mockClear();
+    await expect(w.tickOnce()).resolves.toMatchObject({ skipped: true, reason: 'writer-active' });
+    expect(acquireRead).toHaveBeenCalledTimes(1);
+    expect(tick).toHaveBeenCalledTimes(2);
+    expect(readReady).toHaveBeenCalledWith('/x', {});
+    expect(log.error).toHaveBeenCalledWith(expect.stringMatching(/yielding this tick.*ready.*3.*2/));
+    expect(log.error.mock.calls.filter(([line]) => line.includes('maxAdoptWaitTicks = 2 (source option)'))).toHaveLength(1);
+  });
+
+  it('no ready candidate preserves reader priority indefinitely', async () => {
+    const { w, setReady, tick } = setup(0);
+    setReady(null);
+    for (let i = 0; i < 4; i++) await expect(w.tickOnce()).resolves.toBe('ticked');
+    expect(tick).toHaveBeenCalledTimes(4);
+  });
+
+  it.each(['removed', 'replaced', 'moved'])('resets the waiting count when the candidate is %s', async (change) => {
+    const { w, setReady, setHead } = setup(1);
+    await expect(w.tickOnce()).resolves.toBe('ticked');
+    await expect(w.tickOnce()).resolves.toMatchObject({ skipped: true });
+    if (change === 'removed') setReady(null);
+    if (change === 'replaced') setReady({ ...candidate, passedAt: 'second' });
+    if (change === 'moved') setHead('new');
+    await expect(w.tickOnce()).resolves.toBe('ticked');
+    if (change === 'removed') {
+      setReady(candidate);
+      await expect(w.tickOnce()).resolves.toBe('ticked');
+    }
+  });
+
+  it('keeps granted reads and writer-priority refusals unchanged even with an overdue candidate', async () => {
+    const { w, acquireRead, tick } = setup(0);
+    acquireRead.mockReturnValueOnce({ ok: true });
+    await expect(w.tickOnce()).resolves.toBe('ticked');
+    acquireRead.mockClear();
+    acquireRead.mockReturnValueOnce({ ok: false, reason: 'writer-priority', starved: 5 });
+    await expect(w.tickOnce()).resolves.toMatchObject({ skipped: true, reason: 'writer-priority' });
+    expect(acquireRead).toHaveBeenCalledTimes(1);
+    expect(tick).toHaveBeenCalledTimes(1);
+  });
+
+  it('counts only candidates present at tick entry', async () => {
+    const { w, setReady, rebuild } = setup(0);
+    setReady(null);
+    rebuild.mockImplementation(async () => {
+      setReady(candidate);
+      return { moved: false, reason: 'up-to-date' };
+    });
+    await expect(w.tickOnce()).resolves.toBe('ticked');
+    await expect(w.tickOnce()).resolves.toMatchObject({ skipped: true });
   });
 });
 

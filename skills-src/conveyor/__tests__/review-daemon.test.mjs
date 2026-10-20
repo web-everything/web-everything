@@ -120,6 +120,133 @@ describe('runDaemonLoop — the pure control flow', () => {
   });
 });
 
+describe('runReviewTick — stale status sweep', () => {
+  const repo = 'web-everything/web-everything';
+  const cleanPr = { number: 10, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
+    labels: [{ name: 'status:conflict' }, { name: 'review:accepted' }] };
+  const plan = { dispatch: [{ kind: 'review', prNumber: 11 }], refusals: [],
+    notes: [{ kind: 'nothing-owed', prNumber: 10 }] };
+  const base = {
+    repo, reconcile: () => plan, readPrs: () => [cleanPr], readAgents: () => [],
+    holdReconcile: () => [], tagRound: () => {}, statusCandidates: () => [],
+  };
+
+  it('tags a resolved conflict before dispatch, forwards planner facts, and does not write twice', () => {
+    const order = [];
+    const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(() => order.push('write')) };
+    const tagStatus = vi.fn(opts => {
+      order.push('tag');
+      return tagReviewStatus({ ...opts, provider, readFixClaim: () => null,
+        requiredChecks: [], prStatusSettings: {}, signalFix: () => {} });
+    });
+    const out = runReviewTick({ ...base, tagStatus,
+      dispatch: () => { order.push('dispatch'); return { agentId: 'review-11' }; } });
+    expect(order).toEqual(['tag', 'write', 'dispatch']);
+    expect(tagStatus.mock.calls[0][0]).toMatchObject({ pr: 10, repo, agents: [],
+      defaultBranch: 'main', prState: cleanPr, currentLabels: cleanPr.labels,
+      isDraft: false, mergeConflicted: false, planRows: plan.notes });
+    expect(out.staleStatusSwept).toEqual([10]);
+    expect(out.staleConflictStatusCleared).toEqual([10]);
+    expect(provider.setLabels).toHaveBeenCalledTimes(1);
+    expect(provider.setLabels).toHaveBeenCalledWith(repo, 10, {
+      add: 'status:ready-to-merge', remove: ['status:conflict'],
+    });
+    // PR 10 was swept and not dispatched, so the end-of-tick pass skips it: tagged once per tick.
+    expect(tagStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['status:ready-to-merge', ['review:changes'], 'status:sent-back-review'],
+    ['status:awaiting-base', ['review:accepted'], 'status:ready-to-merge'],
+  ])('refreshes stale %s before dispatch', (stale, reviewLabels, desired) => {
+    const prState = { ...cleanPr, labels: [stale, ...reviewLabels] };
+    const provider = { ensureLabel: vi.fn(), setLabels: vi.fn() };
+    const tagStatus = opts => tagReviewStatus({ ...opts, provider, readFixClaim: () => null,
+      requiredChecks: [], prStatusSettings: {}, signalFix: () => {} });
+    const out = runReviewTick({ ...base, readPrs: () => [prState], tagStatus,
+      dispatch: () => {
+        expect(provider.setLabels).toHaveBeenCalledTimes(1);
+        expect(provider.setLabels).toHaveBeenCalledWith(repo, 10, {
+          add: desired, remove: [stale],
+        });
+        return { agentId: 'review-11' };
+      } });
+    expect(out.failed).toEqual([]);
+    expect(provider.setLabels).toHaveBeenCalledTimes(1);
+    expect(out.staleStatusSwept).toEqual([10]);
+    expect(out.staleConflictStatusCleared).toEqual([]);
+  });
+
+  it('does not write or report an already-correct status', () => {
+    const prState = { ...cleanPr, labels: ['review:changes', 'status:sent-back-review'] };
+    const provider = { ensureLabel: vi.fn(), setLabels: vi.fn() };
+    const tagStatus = vi.fn(opts => tagReviewStatus({ ...opts, provider, readFixClaim: () => null,
+      requiredChecks: [], prStatusSettings: {}, signalFix: () => {} }));
+    const out = runReviewTick({ ...base, readPrs: () => [prState], tagStatus,
+      dispatch: () => {
+        expect(tagStatus).toHaveBeenCalledOnce();
+        expect(provider.setLabels).not.toHaveBeenCalled();
+        return {};
+      } });
+    expect(out.failed).toEqual([]);
+    expect(provider.setLabels).not.toHaveBeenCalled();
+    expect(out.staleStatusSwept).toEqual([]);
+    expect(out.staleConflictStatusCleared).toEqual([]);
+  });
+
+  it.each([
+    { mergeStateStatus: 'DIRTY' },
+    { mergeable: 'CONFLICTING' },
+    { labels: ['status:conflict', 'merge-status:conflicting'] },
+  ])('leaves a still-conflicting PR to the later loop: %j', conflict => {
+    const order = [];
+    const tagStatus = vi.fn(() => { order.push('tag'); });
+    const out = runReviewTick({ ...base, readPrs: () => [{ ...cleanPr, ...conflict }], tagStatus,
+      dispatch: () => { order.push('dispatch'); return {}; } });
+    expect(out.staleStatusSwept).toEqual([]);
+    expect(out.staleConflictStatusCleared).toEqual([]);
+    expect(order).toEqual(['dispatch', 'tag']);
+    expect(tagStatus).toHaveBeenCalledOnce();
+  });
+
+  it('logs a one-line cause for both sweep and later-loop failures without failing the tick', () => {
+    const log = vi.fn();
+    const dispatch = vi.fn(() => ({}));
+    const out = runReviewTick({ ...base, dispatch, log,
+      tagStatus: () => { throw new Error('label API down\nextra details'); } });
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(out.reconcileError).toBeNull();
+    expect(out.staleStatusSwept).toEqual([]);
+    expect(out.staleConflictStatusCleared).toEqual([]);
+    expect(log.mock.calls).toEqual([
+      [`review-daemon: ${repo}#10 status sweep skipped: label API down`],
+      [`review-daemon: ${repo}#10 status tag failed: label API down`],
+    ]);
+  });
+
+  it('preserves malformed entries and still sweeps the other PRs without throwing', () => {
+    const malformed = [null, { number: 1, labels: null }];
+    const otherPr = { ...cleanPr, number: 12 };
+    const log = vi.fn();
+    const onPlan = vi.fn();
+    const tagStatus = vi.fn(() => ({ removed: ['status:conflict'], prStatus: 'status:ready-to-merge' }));
+    let out;
+    expect(() => {
+      out = runReviewTick({ ...base, reconcile: () => ({ dispatch: [], refusals: [], notes: [] }),
+        readPrs: () => [cleanPr, ...malformed, otherPr], tagStatus, log, onPlan });
+    }).not.toThrow();
+    expect(out.staleStatusSwept).toEqual([10, 12]);
+    expect(tagStatus.mock.calls.map(([opts]) => opts.pr)).toEqual([10, 12]);
+    const snapshot = onPlan.mock.calls[0][0].rawPrs;
+    expect(snapshot[1]).toBe(malformed[0]);
+    expect(snapshot[2]).toBe(malformed[1]);
+    expect(log.mock.calls.map(([line]) => line)).toEqual([
+      expect.stringMatching(/^review-daemon: web-everything\/web-everything#\? status sweep skipped: .+/),
+      expect.stringMatching(/^review-daemon: web-everything\/web-everything#1 status sweep skipped: .+/),
+    ]);
+  });
+});
+
 describe('runReviewTick — the per-tick sequence', () => {
   const owedPlan = (entries, refusals = []) => ({ dispatch: entries, refusals });
 
@@ -151,6 +278,7 @@ describe('runReviewTick — the per-tick sequence', () => {
     expect(out).toEqual({
       reviewsOwed: 1, dispatched: [{ prNumber: 10, agentId: 'agent-10' }], failed: [], notStarted: [], refusals: 0,
       pendingNotDispatched: [], reconcileError: null, deferredForLanes: 0, deferredForAuth: 0, authPaused: false, authPauseReason: null,
+      staleStatusSwept: [], staleConflictStatusCleared: [],
       holdReconcile: [], holdReconcileError: null, liveProcessPrs: [], operatorHolds: { observedAt: 7, holds: [] },
     });
   });
@@ -645,6 +773,7 @@ describe('runReviewTick — reconcile itself is isolated (regression, #xvzwiew l
     const out = runReviewTick({ reconcile, dispatch, tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [] });
     expect(out).toEqual({
       reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, reconcileError: 'spawnSync claude ENOENT', deferredForLanes: 0,
+      staleStatusSwept: [], staleConflictStatusCleared: [],
       holdReconcile: [], holdReconcileError: null,
     });
     expect(dispatch).not.toHaveBeenCalled(); // reconcile crashed before any PR was identified

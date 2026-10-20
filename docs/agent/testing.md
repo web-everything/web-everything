@@ -1373,7 +1373,8 @@ remain active, including concurrency 1. Re-read live queue depth/capacity before
 reserve room for active siblings; retain the round attempt budget for ambiguous outcomes.
 A batching deferral stops new starts but lets existing children finish their locked admission checks.
 Probe busy scheduling from round completion with room and an unqueued runnable PR, and full-interval
-scheduling with a full queue or backed-off work. Suppress duplicate event wakes for active PRs;
+scheduling with a full queue or backed-off work. Never start a second drain for an active PR; a
+wake that arrives during its run stays pending until the run ends, unless that run verified the enqueue;
 shutdown must kill every child and prevent further starts. Inject all GitHub reads in these tests.
 
 ## Referral rulings answering stand-downs
@@ -1628,9 +1629,30 @@ The health log records each effective value and source. Fixture and dry-run tick
 A stable `nightly-coroner-YYYY-MM-DD` job ID and retained daily records enforce one job per ET night
 without depending on health `state.json`. The next live tick catches up the most recent due night,
 including before tonight's deadline after a restart; multiple missed nights coalesce into one extraction.
-There is one attempt per night: a failed/crashed attempt is exposed as a health probe failure, and the
-next night's extraction still starts at the last successfully published cursor. This avoids a second
-extraction for the same night. Never prune daily job records without preserving the once-per-night ledger.
+`coroner.nightly.laneWaitMs` defaults to 600000 and is passed to lane-pool's normal `--wait-ms`.
+`attempts` defaults to 3; the daemon retries the whole run with exponential backoff starting at
+`retryBackoffMin` (10 minutes). `deadlineEt` defaults to `03:30` on the following ET calendar date;
+no attempts launch after that deadline, including late catch-up. DST uses New York wall time:
+nonexistent deadlines expire at the first valid instant after the spring-forward gap; ambiguous
+deadlines use the first occurrence. Pin ordinary, gap (multiple configured minutes), and repeated
+wall times to explicit UTC instants in the named deadline tests.
+Exhaustion or a missed deadline emits a deduplicated needs-you event and the `nightly-coroner-failed`
+health smell, naming the job, last error and attempts. `alertAfterProbeFailures` (default 3) also
+alerts on consecutive `nightlyCoronerJob` probe errors, including exceptions before a record exists.
+This smell notifies in shadow mode. A successful probe resets the streak.
+Only the currently due night's job contributes to `alerts` and `failures`; retained failed nights
+remain historical ledger entries and feed events. Advancing to the next night clears their health
+episodes. A terminal job failure does not count as a supervisor probe error or emit a second probe
+failure event. Test this through the real job ledger and health tick, across a failed then successful
+night and repeated later ticks; the `nightly-coroner-retained-failure` soak break preserves the incident.
+Failure feed fields are scrubbed, sanitized and bounded before append; test the raw line with a
+credential-shaped token, oversized text, line separators and bidi controls. Every configurable
+behavior needs a valid nondefault value test asserting its observable effect, alongside fallback
+tests. The named lane-wait and retry-backoff tests pin exact arguments and persisted retry times;
+the fresh late-catch-up test asserts zero launches and lane acquisitions plus a deadline alert.
+For alerts sourced from any persistent ledger, define and test when the active alert clears.
+The next night's extraction still starts at the last successfully published cursor; retries recover
+an existing report through its receipt rather than extracting twice. Never prune daily job records without preserving the once-per-night ledger.
 
 The child leases a lane via the lane-pool CLI, runs its `coroner-extract.mjs` (which imports
 `coroner-rounds.mjs`) with explicit `--since`/`--until`, `--json`, `--no-save`, and releases the lane in
@@ -1639,6 +1661,8 @@ Resolve both extractor filenames to physical paths before invoking Node: CLI ent
 compare argv with Node's canonical module URL, so a symlinked lane or script can otherwise exit
 successfully without output. The `nightly-coroner-symlinked-lane` soak break exercises both CLIs
 through real subprocesses, including report publication, lane release, and receipt recovery.
+Extraction fixtures must inject `sweep` alongside `acquire` and `release` so orphan-lease cleanup
+cannot invoke the real lane pool or be counted as an extractor subprocess.
 The first window is 24 hours; subsequent windows begin at `nightly-coroner-cursor.json`'s `lastEnd`
 beside health `state.json`. Cursor writes are atomic and follow atomic publication of the dated
 `coroner-YYYY-MM-DD.md` in `handoffHome()`. The report carries a recovery receipt, so direct re-entry
@@ -1780,6 +1804,63 @@ critical miss on its exact provider/model/prepare triple, an active provider quo
 or an unreadable trial history skips it for full preparation by the dispatched worker.
 Prompt evidence uses the shared `fenceUntrusted` helper and `FENCED_DATA_RULE`; test
 closing-tag injection in both the card and diff, including mixed case and whitespace.
+
+## Drain CI pre-stage
+
+The drain caches non-CI gate dispositions for accepted pending heads carrying `ready-to-merge` in coordination storage,
+bound to repo, PR and head. Green check events may consume this preparation before listing;
+head, label, body/base changes and TTL expiry require the full fast drain. So do the live fields the full
+classifier reads that move no cached signature: a `CHANGES_REQUESTED`/`REVIEW_REQUIRED` review decision,
+`mergeable` other than `MERGEABLE`, and a merge state other than `CLEAN`, `UNSTABLE` or `BLOCKED`. The required
+set is GitHub's queue-required checks plus the drain's own `--check` (`prestageRequiredChecks`): a failed selected
+check is never prepared, and the green event re-checks the `--check` it was invoked with. It reads that check
+through the same full read as the listing (`resolveRequiredCheck`, past gh's 100-context rollup cap); a failed
+full read falls back. Every required
+context needs its own successful row before enqueue; missing, pending, cancelled and red
+contexts never authorize enqueue. A newly failed optional CodeQL check also vetoes admission when
+`drainBlocksOnCodeQL` is enabled. Red-team evidence and the complete comment thread are re-read at enqueue;
+the cache never substitutes for live release-label or red-team authorization. `checking` alone is ineligible,
+including at the event wake boundary. Cached admission also reads the live fix claim before admission and
+again inside the locked enqueue callback: a claim acquired while waiting for the lock must still veto enqueue.
+`enqueuePrestage` owns that in-lock re-read (`fixClaimHeld`), the cascade's pre-landing steps (`beforeEnqueue`:
+the review-coverage notice and the stacked-PR retarget) and the post-enqueue ledger facts (`recordLanded`,
+the same recorder the cascade calls after a confirmed enqueue: exemption, restamp, drain-hold release); it
+refuses the shortcut when any of them is not wired.
+Check-event marks lack required-context identity and head SHA: preserve pending wakes on non-success marks,
+then let the live required-check read drop red preparation. Coupled candidates, manifest-carrying heads and branches requiring preparation
+keep the full cascade. Keep pre-stage tests separate from ordinary classification tests:
+preparation may evaluate the remaining gates while CI is pending, but must leave the real
+merge cascade before any enqueue. Regression home: `scripts/lib/__tests__/drain-prestage.test.mjs`.
+
+Pre-stage regression contracts (PR #5480): every enqueue entry point must cover throwing mutations
+(including required-workflow, conflict and unreadable-state failures). A shortcut refusal drops its cache
+and falls back without installing backoff that hides the error from ordinary cascade recovery. Keep
+table-driven coverage of every GitHub check conclusion at the `enqueuePrestage` boundary (not only at
+preparation), missing release labels, evidence added after
+preparation, optional CodeQL failures, coupled candidates and branch preparation. Include claims acquired
+after preparation, unreadable claim readers, and exceptions propagated through an async lock. The CLI fixture must
+assert pending manifest candidates cause no head writes or review writes, including a stale acceptance.
+The provisional `merge` disposition is used only to evaluate gates: collision healing, manifest rebuilding,
+review-label provisioning, clearance carry, baseline/ledger writes, parking and skip comments must suppress
+writes for `prestagePendingCi`; the actual merge set excludes these candidates.
+
+Source-contract tests for review writes must follow `candidateDryRun` and assert that it includes both
+`DRY_RUN` and `prestagePendingCi`. Queue fixtures must record membership only after a successful enqueue
+response; recording a refused mutation as queued masks the ordinary recovery attempt with an idempotent success.
+
+Prevention follow-up owed by this review: add an enqueue-call lint that recognizes both enclosing
+try/catch and callbacks protected by `enqueuePrestage`. It must flag unprotected `mergeStrategy.enqueue`
+calls without treating the protected callback as an uncaught call. The throwing-entry-point regression
+contracts above are the immediate guard; the repository-wide lint remains separate tooling work.
+
+The green-event shortcut must honor the full drain's resolved `--repos` / `--this-repo`
+selection and exact `--label` / `--base` filters before consuming preparation. The listing and the
+shortcut share one selection predicate (`operatorSelects`), so a new filter cannot reach only one path.
+CLI regressions must pair excluded scopes (WE#42 under `--repos=frontier-ui/frontierui`, including the short
+repo alias, cached main preparation under `--this-repo --base=release`, and cached `ready-to-merge`
+preparation under `--label=other`) with matching scopes that still enqueue without listing. Excluded
+repo/label/base scopes preserve preparation. A green mark that arrives while its PR's fast drain runs
+must wake it again after that run (`enqueue-on-event.test.mjs`, "pre-staged green events").
 
 ## Review scratch disk retention
 

@@ -30,6 +30,14 @@ export function resolveChildTimeoutMs(env = process.env) {
   return Number.isInteger(n) && n > 0 ? n : DEFAULT_CHILD_TIMEOUT_MS;
 }
 
+/** Summarize stderr with the first non-shim line, retaining the first skipped informational warning. */
+export function summarizeStderr(stderr) {
+  const lines = stderr.trim().split('\n');
+  const primary = lines.findIndex((line) => !line.startsWith('gh-shim:'));
+  if (primary <= 0) return lines[0] || '(no stderr)';
+  return `${lines[primary]} [warning: ${lines[0]}]`;
+}
+
 /** Budget for one real `npm ci`/`npm install` (`we:scripts/lane-pool.mjs`'s `ensureDeps`) — the ONE source of it. */
 export const NPM_INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -135,7 +143,7 @@ export function runBounded(cmd, args, { timeoutMs = DEFAULT_CHILD_TIMEOUT_MS, en
       const failure = message => Object.assign(new Error(message), { stdout: Buffer.concat(chunks).toString('utf8'), stderr: err, status: code, signal });
       if (overBudget) reject(failure(`output exceeded ${maxBytes} bytes (process group killed)`));
       else if (timedOut) reject(failure(`timed out after ${timeoutMs}ms (process group killed)`));
-      else if (code !== 0) reject(failure(`exited ${code ?? signal}: ${err.trim().split('\n')[0] || '(no stderr)'}`));
+      else if (code !== 0) reject(failure(`exited ${code ?? signal}: ${summarizeStderr(err)}`));
       else resolvePromise(Buffer.concat(chunks).toString('utf8'));
     });
   });
