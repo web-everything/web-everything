@@ -108,6 +108,14 @@ export async function publishBatch(input, opts = {}) {
       if (!state.sealedAt || !state.pr) return null;
       const view = JSON.parse(await gh(['pr', 'view', String(state.pr), '--repo', repo, '--json', 'number,state,headRefName']));
       if (Number(view?.number) !== Number(state.pr) || view.headRefName !== state.batchRef || view.state !== 'MERGED') return null;
+      // MERGED alone does not prove the cards landed (the branch may have been rewritten). Every recorded member must
+      // be on main; otherwise the batch stays held with its original failure.
+      const missing = await membersMissingFromMain();
+      if (missing.length) {
+        process.stderr.write(`card-batch ${state.batchRef} PR ${state.pr} MERGED but ${missing.length} card(s) not on main `
+          + `(${missing.slice(0, 5).join(', ')}): kept held\n`);
+        return null;
+      }
       state.sealFailure = { reason: `PR MERGED before the seal finished (step ${state.seal?.step ?? 'none'}); the seal cannot resume`,
         at: new Date(now()).toISOString(), terminalPrState: 'MERGED' };
       save();
@@ -116,13 +124,32 @@ export async function publishBatch(input, opts = {}) {
       const retired = await retire();
       return retired?.action === 'retired' ? { action: 'held', state, retired: true } : null;
     };
-    // A failed recovery read never masks the original failure.
-    const orRecoverMerged = async (original) => {
+    // A card is on main when its admitted file is there (`backlog/<cardId>-…`), or the land-time JIT numbering commit
+    // on main renamed it (`<cardId>→#<n>`) and `backlog/<n>-…` is there. Unreadable evidence counts as missing.
+    const membersMissingFromMain = async () => {
+      await run('git', ['fetch', '--no-tags', remote, 'refs/heads/main']);
+      const tree = String(await run('git', ['ls-tree', '--name-only', 'FETCH_HEAD', 'backlog/'])).split('\n');
+      const has = prefix => tree.some(path => path.startsWith(prefix));
+      const missing = [];
+      for (const member of state.members ?? []) {
+        const id = String(member?.cardId ?? '');
+        if (!/^[a-z0-9]+$/.test(id)) { missing.push(id || '(no id)'); continue; }
+        if (has(`backlog/${id}-`)) continue;
+        const message = String(await run('git', ['log', '-1', '--format=%B', '--fixed-strings', `--grep=${id}→#`, 'FETCH_HEAD']));
+        const number = message.match(new RegExp(`(?:^|[\\s,])${id}→#(\\d+)`))?.[1];
+        if (!number || !has(`backlog/${number}-`)) missing.push(id);
+      }
+      if (!(state.members ?? []).length) missing.push('(no members recorded)');
+      return missing;
+    };
+    // Recovery replaces the original outcome only when it completed. Otherwise a thrown original is rethrown (as an
+    // Error), and a returned refusal is returned; a failing recovery never fulfils in their place.
+    const orRecoverMerged = async ({ threw = false, thrown, returned }) => {
       let recovered = null;
       try { recovered = await recoverMergedSeal(); } catch { /* keep the original outcome */ }
       if (recovered) return recovered;
-      if (original instanceof Error) throw original;
-      return original;
+      if (threw) throw thrown instanceof Error ? thrown : new Error(String(thrown?.message ?? thrown ?? 'stuck seal step failed'));
+      return returned;
     };
     const restoreProtection = async () => {
       if (!state.restoreProtection) return;
@@ -134,7 +161,7 @@ export async function publishBatch(input, opts = {}) {
       save();
     };
     // Pending protection recovery must run even if a subsequent push is no longer adoptable.
-    try { await restoreProtection(); } catch (error) { return await orRecoverMerged(error); }
+    try { await restoreProtection(); } catch (error) { return await orRecoverMerged({ threw: true, thrown: error }); }
     const advertised = String(await run('git', ['ls-remote', '--refs', remote, `refs/heads/${state.batchRef}`]))
       .trim().split(/\s+/)[0];
     if (advertised && advertised !== state.headSha && resolveAdoptDescendantHead(opts) === 'on') {
@@ -174,10 +201,10 @@ export async function publishBatch(input, opts = {}) {
       }
     }
     // Adoption above can re-arm protection; a failure restoring it on a merged PR is the same stuck path.
-    try { await restoreProtection(); } catch (error) { return await orRecoverMerged(error); }
+    try { await restoreProtection(); } catch (error) { return await orRecoverMerged({ threw: true, thrown: error }); }
     let mismatch = await check();
     // A started seal refused here may be a merged PR whose branch moved or was deleted: the stuck path.
-    if (mismatch) return state.sealedAt && mismatch === 'head-mismatch' ? await orRecoverMerged(refuse(mismatch)) : refuse(mismatch);
+    if (mismatch) return state.sealedAt && mismatch === 'head-mismatch' ? await orRecoverMerged({ returned: refuse(mismatch) }) : refuse(mismatch);
     const plan = planPublish({ state, kind, policy, now: now() });
     bodyPath = `${statePath}.${lease.token}.body.md`;
     writeFileSync(bodyPath, renderBatchBody(state));

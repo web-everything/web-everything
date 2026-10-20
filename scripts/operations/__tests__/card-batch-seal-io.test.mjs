@@ -485,9 +485,11 @@ const terminalFixture = (prState) => {
   writeFileSync(f.statePath, JSON.stringify({ ...f.state, pr: 9, kind: 'prevention', repo: 'org/repo', holdApplied: false,
     restoreProtection: true, sealedAt: new Date(500).toISOString(), seal: { reason: 'count', step: 'record-sealed' } }));
   // The PR reads as ready (not draft), so restoring protection really runs `ready --undo` — the step that fails live.
+  // Main carries the member card (fixture member `123`), so the cards-landed check passes unless a test overrides it.
   const exec = vi.fn((cmd, args, options) => (args[1] === 'view' && args.includes('number,state,headRefName')
     ? JSON.stringify({ number: 9, state: prState, headRefName: f.state.batchRef })
-    : args[1] === 'view' && args.includes('isDraft') ? JSON.stringify({ isDraft: false }) : f.exec(cmd, args, options)));
+    : args[1] === 'view' && args.includes('isDraft') ? JSON.stringify({ isDraft: false })
+      : args[0] === 'ls-tree' ? 'backlog/123-card.md\nbacklog/77-other.md\n' : f.exec(cmd, args, options)));
   return { f, exec };
 };
 const undoFired = (exec) => exec.mock.calls.some(([, args]) => args.includes('--undo'));
@@ -590,6 +592,7 @@ it('#5680: protection re-armed by head adoption that fails on a merged PR takes 
     if (args[1] === 'view' && args.includes('number,state,headRefName')) return JSON.stringify({ number: 9, state: 'MERGED', headRefName: f.state.batchRef });
     if (args[1] === 'view' && args.includes('isDraft')) return JSON.stringify({ isDraft: false });
     if (args.includes('--undo')) throw new Error('pull request is merged');
+    if (args[0] === 'ls-tree') return 'backlog/123-card.md\n';
     return f.exec(cmd, args, options);
   });
   const log = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
@@ -598,4 +601,60 @@ it('#5680: protection re-armed by head adoption that fails on a merged PR takes 
     expect(undoFired(exec)).toBe(true);
     expect(f.read()).toMatchObject({ terminalPrState: 'MERGED', sealFailure: { terminalPrState: 'MERGED' } });
   } finally { log.mockRestore(); }
+});
+
+describe('stuck-seal recovery: cards must be on main, and failures are never fulfilled', () => {
+  const withMain = (base, { tree, log = '' }) => vi.fn((cmd, args, options) => {
+    if (args.includes('--undo')) throw new Error('pull request is merged');
+    if (args[0] === 'ls-tree') return tree;
+    if (args[0] === 'log' && args.includes('--fixed-strings')) return log;
+    return base(cmd, args, options);
+  });
+  it('a merged PR whose cards are not on main (rewritten branch) stays held with its original failure', async () => {
+    const { f, exec: base } = terminalFixture('MERGED');
+    const exec = withMain(base, { tree: 'backlog/77-other.md\n' });
+    const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toThrow('pull request is merged');
+      expect(undoFired(exec)).toBe(true);
+      const kept = JSON.parse(readFileSync(f.statePath, 'utf8'));
+      expect(kept.sealFailure).toBeUndefined();
+      expect(kept.lastSealedState).toBeUndefined();
+      expect(err.mock.calls.map(c => String(c[0])).join('')).toContain('not on main');
+    } finally { err.mockRestore(); }
+  });
+  it('the head-mismatch path also requires the cards on main', async () => {
+    const { f, exec: base } = terminalFixture('MERGED');
+    writeFileSync(f.statePath, JSON.stringify({ ...JSON.parse(readFileSync(f.statePath, 'utf8')), restoreProtection: undefined, holdApplied: true }));
+    const exec = vi.fn((cmd, args, options) => (args[0] === 'ls-remote' ? '' : args[0] === 'ls-tree' ? 'backlog/77-other.md\n' : base(cmd, args, options)));
+    const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      expect(await publishBatch(f.input, { ...f.opts, exec })).toEqual({ action: 'refuse', reason: 'head-mismatch' });
+      expect(JSON.parse(readFileSync(f.statePath, 'utf8')).sealFailure).toBeUndefined();
+    } finally { err.mockRestore(); }
+  });
+  it('a card renamed by the land-time JIT numbering counts as on main', async () => {
+    const { f, exec: base } = terminalFixture('MERGED');
+    const exec = withMain(base, { tree: 'backlog/6597-card.md\n', log: 'drain: JIT-number x2sfbjr→#6595, 123→#6597 at land (#2288)\n' });
+    const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      expect(await publishBatch(f.input, { ...f.opts, exec })).toMatchObject({ action: 'held', retired: true });
+    } finally { err.mockRestore(); }
+  });
+  it('a JIT message naming a number whose file is not on main does not count', async () => {
+    const { f, exec: base } = terminalFixture('MERGED');
+    const exec = withMain(base, { tree: 'backlog/77-other.md\n', log: 'drain: JIT-number 123→#6597 at land (#2288)\n' });
+    const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toThrow('pull request is merged');
+    } finally { err.mockRestore(); }
+  });
+  it.each([['a string', 'boom'], ['a plain object', { message: 'obj boom' }], ['undefined', undefined]])(
+    'a stuck step that throws %s is rethrown as an Error when recovery does not complete', async (_name, value) => {
+      const { f, exec: base } = terminalFixture('OPEN');
+      const exec = vi.fn((cmd, args, options) => { if (args.includes('--undo')) throw value; return base(cmd, args, options); });
+      const outcome = await publishBatch(f.input, { ...f.opts, exec }).then(v => ({ fulfilled: v }), e => ({ rejected: e }));
+      expect(outcome.fulfilled).toBeUndefined();
+      expect(outcome.rejected).toBeInstanceOf(Error);
+    });
 });
