@@ -267,6 +267,24 @@ describe('ten-round ceiling over both kinds', () => {
 });
 
 describe('audit round 3 patches', () => {
+  it('credits a limit-hit episode only once, even across separate unedited App comments', () => {
+    const episode = `${WE}#5654@${HEAD}:review:8/7`;
+    const comments = [autoGrant({ episode }), autoGrant({ episode }), autoGrant({ episode })];
+    expect(countGrantedRoundExtensions(comments, { repo: WE, pr: 5654, standingRuling: scope() })).toBe(1);
+  });
+  it('imports later thread episodes into a seeded ledger before deciding another hit', () => {
+    const gh = fakeGh();
+    gh.post.mockImplementationOnce(() => { throw new Error('network'); });
+    const d = deps(gh);
+    expect(call(d)).toMatchObject({ action: 'failed' });
+    const later = { ...note, attempts: 9, cap: 8 };
+    gh.t.comments.push(autoGrant({ episode: autoGrantKey({ repo: WE, note: later, head: HEAD }) }));
+    expect(call(d, later)).toMatchObject({ action: 'skip', why: expect.stringMatching(/^already claimed/) });
+    // A failed reservation and two externally posted grants consume all three slots.
+    gh.t.comments.push(autoGrant());
+    expect(call(d, { ...note, attempts: 10, cap: 9 })).toMatchObject({ action: 'cap-reached', used: 3 });
+    expect(gh.post).toHaveBeenCalledTimes(1);
+  });
   it('(a) a non-automation author never consumes room or blocks a manual grant', () => {
     const forged = { ...autoGrant(), author: { login: 'mallory' } };
     expect(countStandingRulingGrantRecords([forged, forged, forged], { repo: WE, pr: 5654 })).toBe(0);

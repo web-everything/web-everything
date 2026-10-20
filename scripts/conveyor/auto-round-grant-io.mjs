@@ -115,13 +115,21 @@ export function autoRoundGrant({ repo, note, pr }, {
       const comments = thread?.comments ?? [];
       let entries = ledgerEntries;
       const recordsNow = countStandingRulingGrantRecords(comments, { repo: slug, pr: note.prNumber });
+      const { episodes, unrecoverable } = standingRulingGrantEpisodes(comments, { repo: slug, pr: note.prNumber });
+      if (unrecoverable > 0) return { action: 'skip', why: `${unrecoverable} existing grant record(s) without a recoverable limit-hit key` };
       if (!seeded) {
         // Seed from the grants already on the PR, keyed by the limit hit each one answered, so a historical grant
         // for THIS hit blocks a second one. A record whose key cannot be recovered fails closed (no grant, no seed).
-        const { episodes, unrecoverable } = standingRulingGrantEpisodes(comments, { repo: slug, pr: note.prNumber });
-        if (unrecoverable > 0) return { action: 'skip', why: `${unrecoverable} existing grant record(s) without a recoverable limit-hit key` };
         entries = episodes.map((episode) => ({ key: episode, outcome: 'historical' }));
         save({ baseline: 0, entries });
+      } else {
+        // Comments can arrive outside this ledger. Retain every reservation AND newly observed episode.
+        const known = new Set(entries.map((e) => e.key));
+        const added = episodes.filter((episode) => !known.has(episode));
+        if (added.length) {
+          entries = [...entries, ...added.map((key) => ({ key, outcome: 'historical' }))];
+          save({ baseline, entries });
+        }
       }
       const seed = seeded ? baseline : 0;
       if (entries.some((e) => e.key === key)) return { action: 'skip', why: `already claimed: ${key}` };

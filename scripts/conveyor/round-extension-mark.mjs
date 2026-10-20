@@ -68,6 +68,7 @@ export function roundExtensionGrants(comments, { repo, pr, standingRuling = null
   const slug = (value) => CONSTELLATION_REPOS[value]?.slug ?? value;
   let remaining = MAX_TOTAL_ROUND_EXTENSIONS;
   let autoSoFar = 0;
+  const autoEpisodes = new Set();
   return (Array.isArray(comments) ? comments : []).flatMap((comment, index) => {
     const operator = isOperatorAuthored(comment);
     const automation = !operator && standingRuling && isAutomationAuthored(comment);
@@ -85,6 +86,8 @@ export function roundExtensionGrants(comments, { repo, pr, standingRuling = null
         || typeof r.at !== 'string' || !r.at.trim()) return [];
       if (automation) {
         if (!withinStandingRuling(r, { repo, slug }, standingRuling, autoSoFar, comment.id)) return [];
+        if (autoEpisodes.has(r.episode)) return [];
+        autoEpisodes.add(r.episode);
         autoSoFar += 1;
       }
       const by = Math.min(r.by, remaining);
