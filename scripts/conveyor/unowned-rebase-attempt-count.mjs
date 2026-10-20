@@ -129,3 +129,14 @@ export function countUnownedRebaseInfraFailures(comments, { countSince, headSha 
     return !headSha || !markerHead || markerHead === headSha;
   }).length;
 }
+
+/**
+ * The aggregate ceiling main has always enforced: content skips AND infrastructure failures (errors, throws) share
+ * ONE {@link UNOWNED_REBASE_ATTEMPT_CAP}, counted over the PR's whole history (no `countSince` cutoff, every head).
+ * The separate infra budget above may only surface earlier, never let more attempts run than this.
+ * @param {Array<{body?:string,createdAt?:string}|string>|null|undefined} comments
+ * @returns {number}
+ */
+export function countUnownedRebaseAggregateAttempts(comments) {
+  return countUnownedRebaseAttempts(comments) + countUnownedRebaseInfraFailures(comments);
+}

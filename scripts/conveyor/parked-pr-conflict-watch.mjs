@@ -155,7 +155,7 @@ import { parseMergeTree, manifestConflictDisposition, rebaseDropManifest } from 
 // best-effort macOS notify (never throws; a delivery failure must never break the sweep).
 import { planNoteComment, postNoteComment } from './reconcile-note-comment.mjs';
 import { notifyDesktopChecked } from './branch-sync.mjs';
-import { UNOWNED_REBASE_INFRA_RETRY_CAP_DEFAULT, countUnownedRebaseInfraFailures, shouldCountRebaseInfra, formatUnownedRebaseInfraMarker, UNOWNED_REBASE_ATTEMPT_CAP, countUnownedRebaseAttempts, loadUnownedRebaseSettings, shouldCountRebaseAttempt, formatUnownedRebaseAttemptMarker } from './unowned-rebase-attempt-count.mjs';
+import { UNOWNED_REBASE_INFRA_RETRY_CAP_DEFAULT, countUnownedRebaseAggregateAttempts, countUnownedRebaseInfraFailures, shouldCountRebaseInfra, formatUnownedRebaseInfraMarker, UNOWNED_REBASE_ATTEMPT_CAP, loadUnownedRebaseSettings, shouldCountRebaseAttempt, formatUnownedRebaseAttemptMarker } from './unowned-rebase-attempt-count.mjs';
 import { countConflictFixComments, CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
 // #4118 (c) — the SAME name-based, gh-agents-truth liveness check `review-status-tag.mjs` already uses, and for
 // the identical reason its own docblock states: staying independent of `reconcile-core.mjs#assessLiveness`'s
@@ -1602,7 +1602,7 @@ export function watchParkedPrConflicts({
         const infraFailures = countUnownedRebaseInfraFailures(comments, { ...unownedRebaseSettings.value, headSha: pr.headRefOid });
         if (infraFailures >= infraRetryCap) {
           surfaceInfraCap(cardInfraState, pr, comments, infraFailures);
-        } else if (countUnownedRebaseAttempts(comments, unownedRebaseSettings.value) < UNOWNED_REBASE_ATTEMPT_CAP) {
+        } else if (countUnownedRebaseAggregateAttempts(comments) < UNOWNED_REBASE_ATTEMPT_CAP) {
           // Keep the conflict marker until rearm completes. A crash after push is recovered by the
           // newlyResolved branch, including a formerly accepted/queued or unowned card.
           provider.ensureLabel(resolvedRepo, CONFLICT_LABEL, CONFLICT_LABEL_META);
@@ -2125,9 +2125,10 @@ export function watchParkedPrConflicts({
           const disposition = computeConflictDisposition({ pr, repo: resolvedRepo });
           entry.conflictDisposition = disposition;
           if (disposition === 'clean' || disposition === 'manifest-only') {
-            // Only content-conflict skips spend this population's durable attempt cap. Infrastructure
-            // failures still fall through to the ordinary conflict owner without spending a round.
-            const attemptsSoFar = countUnownedRebaseAttempts(existingComments, unownedRebaseSettings.value);
+            // Infrastructure failures also have their own (earlier-surfacing) budget, but never more runs than the
+            // shared aggregate cap below allows.
+            // Main's aggregate ceiling: content skips + infra failures share one cap over the whole history.
+            const attemptsSoFar = countUnownedRebaseAggregateAttempts(existingComments);
             const infraFailures = countUnownedRebaseInfraFailures(existingComments, { ...unownedRebaseSettings.value, headSha: pr.headRefOid });
             if (infraFailures >= infraRetryCap) {
               // A card-only unowned PR may already have surfaced this same snapshot above.

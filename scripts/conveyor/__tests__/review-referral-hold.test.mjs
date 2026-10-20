@@ -554,8 +554,10 @@ describe('same-head hold never silences a review whose verdict never landed (liv
   }));
   const oldWhy = count => `review paused: head ${head.slice(0, 9)} was already reviewed ${count} time(s); it resumes on a new push or an explicit re-arm`
     + " (no verdict ever landed on the PR for those runs, and the 2 automatic re-runs are spent: a person must look at why the review's write-back fails)";
+  // The cool-down mechanism, exercised at its maximum allowance; the shipped tool layer is 0 (main's permanent hold).
+  const SIX = { cooldownReleases: 6, source: 'tool' };
   it('holds three no-verdict runs under one hour with retryAt and the due-time text', () => {
-    const held = decideSameHeadHold(labelled(['review:pending']), lostRuns(3), { repo, env: {}, now: at + 30 * 60_000 });
+    const held = decideSameHeadHold(labelled(['review:pending']), lostRuns(3), { repo, env: {}, retry: SIX, now: at + 30 * 60_000 });
     expect(VERDICT_COOLDOWN_BASE_MS).toBe(3600_000);
     expect(held).toMatchObject({ kind: 'same-head', count: 3, retryAt: at + 3600_000,
       why: `${oldWhy(3)}; the next automatic re-run is due at ${iso(at + 3600_000)}` });
@@ -563,23 +565,23 @@ describe('same-head hold never silences a review whose verdict never landed (liv
   it('releases three no-verdict runs once the one-hour cool-down is due', () => {
     const p = labelled(['review:pending']), runs = lostRuns(3);
     for (const elapsed of [3600_000, 3600_001]) {
-      expect(decideSameHeadHold(p, runs, { repo, env: {}, now: at + elapsed })).toBeNull();
+      expect(decideSameHeadHold(p, runs, { repo, env: {}, retry: SIX, now: at + elapsed })).toBeNull();
     }
   });
   it('requires two hours after one cool-down release (four no-verdict runs)', () => {
     const p = labelled(['review:pending']), runs = lostRuns(4);
-    expect(decideSameHeadHold(p, runs, { repo, env: {}, now: at + 7200_000 - 1 }))
+    expect(decideSameHeadHold(p, runs, { repo, env: {}, retry: SIX, now: at + 7200_000 - 1 }))
       .toMatchObject({ retryAt: at + 7200_000 });
-    expect(decideSameHeadHold(p, runs, { repo, env: {}, now: at + 7200_000 })).toBeNull();
+    expect(decideSameHeadHold(p, runs, { repo, env: {}, retry: SIX, now: at + 7200_000 })).toBeNull();
   });
   it('caps cool-down backoff at eight hours while releases remain', () => {
     expect(VERDICT_COOLDOWN_CAP_MS).toBe(8 * 3600_000);
     const p = labelled(['review:pending']);
     for (const count of [6, 7, 8]) {
       const runs = lostRuns(count);
-      expect(decideSameHeadHold(p, runs, { repo, env: {}, now: at + 8 * 3600_000 - 1 }))
+      expect(decideSameHeadHold(p, runs, { repo, env: {}, retry: SIX, now: at + 8 * 3600_000 - 1 }))
         .toMatchObject({ retryAt: at + 8 * 3600_000 });
-      expect(decideSameHeadHold(p, runs, { repo, env: {}, now: at + 8 * 3600_000 })).toBeNull();
+      expect(decideSameHeadHold(p, runs, { repo, env: {}, retry: SIX, now: at + 8 * 3600_000 })).toBeNull();
     }
   });
   it('keeps the permanent hold and old wording after six cool-down releases', () => {
@@ -606,7 +608,7 @@ describe('same-head hold never silences a review whose verdict never landed (liv
   });
   it('posts no repeated same-head notice when a cool-down retryAt is present', () => {
     const p = labelled(['review:pending']), runs = lostRuns(3), post = vi.fn(), log = vi.fn(), dir = temp();
-    const held = decideSameHeadHold(p, runs, { repo, env: {}, now: at + 30 * 60_000 });
+    const held = decideSameHeadHold(p, runs, { repo, env: {}, retry: SIX, now: at + 30 * 60_000 });
     for (const now of [at + 30 * 60_000, held.retryAt, held.retryAt + 1]) {
       notifyReferralHold({ repo, prNumber: p.number, pr: p, hold: held, dir, post, log, now });
     }
@@ -615,10 +617,10 @@ describe('same-head hold never silences a review whose verdict never landed (liv
   });
   describe('reviewNoVerdictRetry cascade setting (operator 2026-10-20)', () => {
     const absent = () => ({ WE_PLATFORM_PREFERENCES_FILE: join(temp(), 'absent.json') });
-    it('standard is 0 (main: permanent hold at the third no-verdict run); tool layer sets 6, source logged', () => {
+    it('standard is 0 (main: permanent hold at the third no-verdict run); tool layer sets 0 (1020c unfreeze: stricter side wins), source logged', () => {
       expect(NO_VERDICT_RETRY_STANDARD.cooldownReleases).toBe(0);
       expect(resolveNoVerdictRetry(absent(), { tool: {} })).toEqual({ cooldownReleases: 0, source: 'standard' });
-      expect(resolveNoVerdictRetry(absent())).toEqual({ cooldownReleases: 6, source: 'tool' });
+      expect(resolveNoVerdictRetry(absent())).toEqual({ cooldownReleases: 0, source: 'tool' });
       const retry = resolveNoVerdictRetry(absent(), { tool: {} });
       expect(decideSameHeadHold(labelled(['review:pending']), lostRuns(3), { repo, env: {}, now: at + 30 * 86400_000, retry }))
         .toMatchObject({ kind: 'same-head', count: 3, retryAt: null, why: oldWhy(3), noVerdict: { exhausted: true, releases: 0, source: 'standard' } });
@@ -630,7 +632,7 @@ describe('same-head hold never silences a review whose verdict never landed (liv
       }
       for (const tool of [6, [6], 'x', null]) expect(resolveNoVerdictRetry(absent(), { tool })).toEqual({ cooldownReleases: 0, source: 'standard' });
       expect(resolveNoVerdictRetry({ ...absent(), WE_REVIEW_NO_VERDICT_COOLDOWN_RELEASES: '2' })).toEqual({ cooldownReleases: 2, source: 'env' });
-      for (const bad of ['7', '-1', 'x']) expect(resolveNoVerdictRetry({ ...absent(), WE_REVIEW_NO_VERDICT_COOLDOWN_RELEASES: bad })).toEqual({ cooldownReleases: 6, source: 'tool' });
+      for (const bad of ['7', '-1', 'x']) expect(resolveNoVerdictRetry({ ...absent(), WE_REVIEW_NO_VERDICT_COOLDOWN_RELEASES: bad })).toEqual({ cooldownReleases: 0, source: 'tool' });
       expect(resolveNoVerdictRetry(null)).toEqual({ cooldownReleases: 0, source: 'standard' });
     });
     it('the 6th cool-down release is allowed and the 7th attempt is refused (permanent hold), even past any wait', () => {

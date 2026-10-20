@@ -3942,12 +3942,21 @@ describe('attempt marker writes and operator cutoff in both populations', () => 
       if (population === 'card') expect(read.attempt).not.toHaveBeenCalled();
     });
 
-    it(`${population}: applies the loaded cutoff before enforcing the cap`, () => {
+    // 1020c unfreeze (stricter side wins): main's cap counts the whole history, so a cutoff never reopens it.
+    it(`${population}: a loaded cutoff never reopens the aggregate cap`, () => {
       const comments = Array.from({ length: UNOWNED_REBASE_ATTEMPT_CAP }, () => ({
         body: UNOWNED_REBASE_ATTEMPT_MARKER, author: { login: 'web-everything' }, createdAt: '2026-10-01T00:00:00Z',
       }));
       expect(sweep(population, { result: { action: 'current' }, comments }).attempt).not.toHaveBeenCalled();
-      expect(sweep(population, { result: { action: 'current' }, comments, countSince: '2026-10-02T00:00:00Z' }).attempt).toHaveBeenCalledTimes(1);
+      expect(sweep(population, { result: { action: 'current' }, comments, countSince: '2026-10-02T00:00:00Z' }).attempt).not.toHaveBeenCalled();
+    });
+
+    it(`${population}: content skips and infrastructure failures share one aggregate cap`, () => {
+      const by = { author: { login: 'web-everything' }, createdAt: '2026-10-01T00:00:00Z' };
+      const comments = [{ body: UNOWNED_REBASE_ATTEMPT_MARKER, ...by }, { body: `${UNOWNED_REBASE_INFRA_MARKER} head=old outcome=infra:x`, ...by },
+        { body: `${UNOWNED_REBASE_INFRA_MARKER} head=older outcome=infra:y`, ...by }];
+      expect(sweep(population, { result: { action: 'current' }, comments }).attempt).not.toHaveBeenCalled();
+      expect(sweep(population, { result: { action: 'current' }, comments: comments.slice(0, 2) }).attempt).toHaveBeenCalledTimes(1);
     });
   }
 });
