@@ -14,8 +14,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir, hostname } from 'node:os';
-import { spawnSync, spawn } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
+import { spawnKeepAlive } from '../../../scripts/lib/test-keepalive.mjs';
 import { readLockEntry, reserve as reserveLockDirect } from '../../../scripts/readiness/file-locks.mjs';
 import {
   RUNNER_LEASE_PATH,
@@ -148,7 +149,7 @@ describe('acquireRunnerLease — #3952 dead-lease fast reclaim (real processes, 
 
   /** A real pid that stays alive for the test — killed in afterEach. */
   function livePid() {
-    liveChild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)']);
+    liveChild = spawnKeepAlive({ stdio: 'pipe' });
     return liveChild.pid;
   }
 

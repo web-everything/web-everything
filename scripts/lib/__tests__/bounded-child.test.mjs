@@ -7,6 +7,7 @@ import { spawn } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
+import { keepAliveScript } from '../test-keepalive.mjs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   runBounded, summarizeStderr, resolveChildTimeoutMs, DEFAULT_CHILD_TIMEOUT_MS, CHILD_TIMEOUT_ENV,
@@ -91,9 +92,9 @@ describe('runBounded', () => {
     // The child starts a long-lived grandchild, records its pid, then hangs.
     const script = `
       const { spawn } = require('node:child_process');
-      const g = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
+      const g = spawn(process.execPath, ['-e', ${JSON.stringify(keepAliveScript({ maxLifetimeMs: 60_000 }))}], { stdio: 'ignore' });
       require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(g.pid));
-      setTimeout(() => {}, 60000);
+      ${keepAliveScript({ maxLifetimeMs: 60_000 })}
     `;
     const started = Date.now();
     await expect(runBounded(NODE, ['-e', script], { timeoutMs: 1500 })).rejects.toThrow(/timed out after 1500ms/);
@@ -109,7 +110,7 @@ describe('runBounded', () => {
   it('on maxBytes overflow kills the child and rejects, without waiting for the timeout', async () => {
     const started = Date.now();
     await expect(
-      runBounded(NODE, ['-e', 'process.stdout.write("x".repeat(1000)); setTimeout(() => {}, 60000)'], { timeoutMs: 20_000, maxBytes: 100 }),
+      runBounded(NODE, ['-e', keepAliveScript({ prelude: 'process.stdout.write("x".repeat(1000));', maxLifetimeMs: 60_000 })], { timeoutMs: 20_000, maxBytes: 100 }),
     ).rejects.toThrow(/output exceeded 100 bytes/);
     expect(Date.now() - started).toBeLessThan(10_000);
   }, 20_000);
@@ -150,10 +151,10 @@ describe('installChildReaper', () => {
       import { runBounded, installChildReaper } from ${JSON.stringify(LIB)};
       installChildReaper({ pollMs: 100 });
       writeFileSync(${JSON.stringify(reaperPidFile)}, String(process.pid));
-      runBounded(process.execPath, ['-e', "require('node:fs').writeFileSync(${JSON.stringify(childPidFile).replace(/"/g, '\\"')}, String(process.pid)); setTimeout(() => {}, 60000)"], { timeoutMs: 60000 }).catch(() => {});
+      runBounded(process.execPath, ['-e', ${JSON.stringify(keepAliveScript({ prelude: `require('node:fs').writeFileSync(${JSON.stringify(childPidFile)}, String(process.pid));`, maxLifetimeMs: 60_000 }))}], { timeoutMs: 60000 }).catch(() => {});
     `);
     // A: the parent that will die. It starts B and waits.
-    const a = spawn(NODE, ['-e', `require('node:child_process').spawn(process.execPath, [${JSON.stringify(reaper)}], { stdio: 'ignore' }); setTimeout(() => {}, 60000)`], { stdio: 'ignore' });
+    const a = spawn(NODE, ['-e', `require('node:child_process').spawn(process.execPath, [${JSON.stringify(reaper)}], { stdio: 'ignore' }); ${keepAliveScript({ maxLifetimeMs: 60_000 })}`], { stdio: 'ignore' });
     leftover.push(a.pid);
     expect(await waitFor(() => existsSync(childPidFile) && existsSync(reaperPidFile), 10_000)).toBe(true);
     const child = Number(readFileSync(childPidFile, 'utf8'));

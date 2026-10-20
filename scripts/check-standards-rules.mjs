@@ -4616,3 +4616,128 @@ export function findUnjournaledLaneMutations(files) {
   }
   return findings;
 }
+
+// ── Unmanaged keep-alive children (keep-alive leak fix, 2026-10-20) ────────────────────────────────────────
+// Live-caught: 154 orphaned `node -e` empty-callback setInterval processes (1e9 and 1000 ms), up to 19 days old,
+// ~864 MB. A child built from an empty-callback timer does nothing but stay alive, so it outlives any test or
+// soak run that fails to kill it: forever for an interval, up to its delay for a timeout.
+// `scripts/lib/test-keepalive.mjs` is the one home: its children watch an anchor pid and have a hard max
+// lifetime. This scan flags the idiom anywhere else under scripts/, skills-src/ or tools/.
+//
+// It PARSES every file (the TypeScript compiler, a direct dependency — JS and TS alike), never regex-matches:
+//   - a `setInterval`/`setTimeout` call (bare, or as a property such as `globalThis.setTimeout`) whose first
+//     argument — through any parentheses — is a function or arrow with an EMPTY body is flagged, whatever its
+//     comments, parameters (defaults included) or `async`;
+//   - child source handed over as a string or template literal is parsed too (templates with `${…}` holes get
+//     a placeholder identifier), recursively; a literal that does not parse as JS is not code and is skipped;
+//   - an unparseable FILE is itself a finding (fail loud);
+//   - the only exemption is a `// keepalive-helper-ok: <reason>` LINE comment in the file's own source attached
+//     to the flagged call (or to the string literal holding it): leading on its statement/list element, or
+//     trailing on that element's line. Comments are taken from the compiler's scanner, so text inside a string
+//     or template — including inside a generated child source — can never exempt anything.
+
+export const KEEPALIVE_HELPER_PATH = 'scripts/lib/test-keepalive.mjs';
+export const KEEPALIVE_SCAN_DIRS = ['scripts', 'skills-src', 'tools'];
+export const KEEPALIVE_SCAN_EXTENSIONS = ['.mjs', '.js', '.cjs', '.ts', '.mts', '.cts'];
+export const KEEPALIVE_EXEMPT_MARKER = 'keepalive-helper-ok:';
+const EXEMPT_COMMENT = /^\/\/\s*keepalive-helper-ok:\s*\S/;
+const TIMER_NAMES = new Set(['setInterval', 'setTimeout']);
+const MAX_STRING_DEPTH = 6;
+
+let tsModule = null;
+const loadTs = () => (tsModule ??= createRequire(import.meta.url)('typescript'));
+
+function parse(ts, name, text, ext) {
+  const kind = /\.(c|m)?ts$/.test(ext) ? ts.ScriptKind.TS : ts.ScriptKind.JS;
+  const sf = ts.createSourceFile(name, text, ts.ScriptTarget.Latest, true, kind);
+  return { sf, ok: (sf.parseDiagnostics?.length ?? 0) === 0, diagnostics: sf.parseDiagnostics ?? [] };
+}
+
+/** The source text a string/template literal hands over at run time (template holes → a placeholder). */
+function literalSource(ts, node) {
+  if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
+  if (ts.isTemplateExpression(node)) return node.head.text + node.templateSpans.map((s) => ` __we_hole__ ${s.literal.text}`).join('');
+  return null;
+}
+
+/** Is `call` an idle timer: setInterval/setTimeout whose callback is a function/arrow with an empty body? */
+function isIdleTimerCall(ts, call) {
+  // Callee shapes: `setInterval`, `(setInterval)`, `<expr>.setInterval`, `<expr>['setInterval']` (string-literal key),
+  // through any parentheses / optional chaining. Deliberately obfuscated forms (eval, computed non-literal keys,
+  // aliases via variables) are out of scope by operator ruling: the guard targets accidental leaks.
+  let callee = call.expression;
+  while (ts.isParenthesizedExpression(callee)) callee = callee.expression;
+  const name = ts.isIdentifier(callee) ? callee.text
+    : ts.isPropertyAccessExpression(callee) ? callee.name.text
+      : ts.isElementAccessExpression(callee) && (ts.isStringLiteral(callee.argumentExpression) || ts.isNoSubstitutionTemplateLiteral(callee.argumentExpression))
+        ? callee.argumentExpression.text : null;
+  if (!TIMER_NAMES.has(name)) return false;
+  let cb = call.arguments[0];
+  while (cb && ts.isParenthesizedExpression(cb)) cb = cb.expression;
+  if (!cb || !(ts.isArrowFunction(cb) || ts.isFunctionExpression(cb))) return false;
+  return !!cb.body && ts.isBlock(cb.body) && cb.body.statements.length === 0;
+}
+
+/** A `// keepalive-helper-ok: <reason>` line comment attached to `node` in the OUTER file's own source. */
+function isExempt(ts, text, node) {
+  const comments = [];
+  for (let n = node; n; n = n.parent) {
+    for (const r of ts.getLeadingCommentRanges(text, n.pos) ?? []) comments.push(r);
+    let end = n.end;
+    while (end < text.length && /[ \t,;)\]}]/.test(text[end]) && text[end] !== '\n') {
+      for (const r of ts.getTrailingCommentRanges(text, end) ?? []) comments.push(r);
+      end++;
+    }
+    for (const r of ts.getTrailingCommentRanges(text, end) ?? []) comments.push(r);
+    // Stop at the element that owns this line: its statement, or an element of an array/object literal.
+    const p = n.parent;
+    if (!p || ts.isSourceFile(p) || ts.isBlock(p) || ts.isArrayLiteralExpression(p)
+      || ts.isPropertyAssignment(p) || ts.isObjectLiteralExpression(p) || /Statement$|Declaration$/.test(ts.SyntaxKind[n.kind] ?? '')) break;
+  }
+  return comments.some((r) => r.kind === ts.SyntaxKind.SingleLineCommentTrivia && EXEMPT_COMMENT.test(text.slice(r.pos, r.end)));
+}
+
+/**
+ * PURE (no fs): `files` = [{ file, content }] → findings `{ file, line, text, reason }`. `reason` is
+ * 'idle-timer' (an unmanaged keep-alive) or 'unparseable' (the file did not parse — fail loud).
+ */
+export function findUnmanagedKeepAlives(files) {
+  const ts = loadTs();
+  const findings = [];
+  for (const { file, content } of files ?? []) {
+    if (file === KEEPALIVE_HELPER_PATH) continue;
+    const ext = (/\.[^./]+$/.exec(file) ?? [''])[0];
+    if (!KEEPALIVE_SCAN_EXTENSIONS.includes(ext)) continue;
+    const text = String(content ?? '');
+    const outer = parse(ts, file, text, ext);
+    if (!outer.ok) {
+      const d = outer.diagnostics[0];
+      const line = d?.start != null ? outer.sf.getLineAndCharacterOfPosition(d.start).line + 1 : 1;
+      findings.push({ file, line, reason: 'unparseable', text: ts.flattenDiagnosticMessageText(d?.messageText ?? 'parse error', ' ') });
+      continue;
+    }
+    const lineOf = (node) => outer.sf.getLineAndCharacterOfPosition(node.getStart(outer.sf)).line + 1;
+    const lineText = (line) => text.split('\n')[line - 1]?.trim() ?? '';
+    const seen = new Set();
+    const report = (anchor) => {
+      if (isExempt(ts, text, anchor)) return;
+      const line = lineOf(anchor);
+      const key = `${line}:${anchor.pos}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      findings.push({ file, line, reason: 'idle-timer', text: lineText(line) });
+    };
+    // `anchor` = the OUTER-file node a finding is reported at (the call itself, or the literal holding it).
+    const walk = (node, anchor, depth) => {
+      if (ts.isCallExpression(node) && isIdleTimerCall(ts, node)) report(anchor ?? node);
+      const src = depth < MAX_STRING_DEPTH ? literalSource(ts, node) : null;
+      if (src && /set(?:Interval|Timeout)/.test(src)) {
+        const inner = parse(ts, `${file}#literal`, src, '.js');
+        if (inner.ok) walk(inner.sf, anchor ?? node, depth + 1);
+      }
+      ts.forEachChild(node, (child) => walk(child, anchor, depth));
+    };
+    walk(outer.sf, null, 0);
+  }
+  return findings;
+}
