@@ -17,6 +17,9 @@
  *     shared the operator's own bucket and broke the drain on 2026-10-09 13:21Z ("rate limit exceeded for user ID
  *     760299").
  *   - `main-push`: informational. `git push` to protected `main` uses the operator's SSH key, not a gh token.
+ *   - `standing-ruling-round-grant`: the automated card-only round grant (`we:scripts/conveyor/auto-round-grant-io.mjs`)
+ *     posts its one `extend-rounds` comment under the operator's login — a grant counts only when GitHub records an
+ *     operator as its author. Unlisted, the automation posts nothing and the needs-you event stays for a person.
  *
  * Never throws: unreadable settings fall back to the default.
  */

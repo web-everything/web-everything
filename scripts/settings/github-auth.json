@@ -2,7 +2,8 @@
   "github": {
     "auth": "app",
     "personalExceptions": {
-      "main-push": "git push to protected main (drain numbering / derived-regen commits) goes over the operator's SSH key, never a gh token: main's classic branch protection requires a PR + green checks and only an admin can bypass it; the App has no admin by design."
+      "main-push": "git push to protected main (drain numbering / derived-regen commits) goes over the operator's SSH key, never a gh token: main's classic branch protection requires a PR + green checks and only an admin can bypass it; the App has no admin by design.",
+      "standing-ruling-round-grant": "The automated card-only round grant (scripts/conveyor/auto-round-grant-io.mjs; operator 2026-10-19 standing ruling, confirmed 2026-10-20 \"automate, capped at 3 per PR\") posts its extend-rounds comment under the operator's login: a round grant counts only when GitHub records an operator as its author (round-extension-mark.mjs), so the App cannot make it. Only that one comment write; capped at 3 automatic grants per PR."
     }
   }
 }
