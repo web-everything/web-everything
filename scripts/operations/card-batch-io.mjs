@@ -179,41 +179,106 @@ function respoolClosed(state, input, stateDir, remote, held) {
   }
 }
 
-/** Shape and freshness check of the seal job's stored landing proof: same merge commit, one entry per recorded
- * member (same ids, each once), each with a backlog path and a blob id, no path used twice. */
-export function validMergeProof(recorded, mergeOid) {
-  const proof = recorded?.sealFailure?.mergeProof;
+/** Front matter `bornAs:` ids of a card text (only inside the leading `---` block). */
+const frontMatterBornAs = text => {
+  const lines = text.split('\n');
+  if (lines[0] !== '---') return [];
+  const close = lines.indexOf('---', 1);
+  if (close < 0) return [];
+  return lines.slice(1, close).map(line => line.match(/^bornAs: ([a-z0-9]+)$/)?.[1]).filter(Boolean);
+};
+const removeBornAsLine = (text, id) => {
+  const lines = text.split('\n');
+  const close = lines.indexOf('---', 1);
+  const at = lines.findIndex((line, i) => i > 0 && i < close && line === `bornAs: ${id}`);
+  return at < 0 ? null : [...lines.slice(0, at), ...lines.slice(at + 1)].join('\n');
+};
+
+/**
+ * Prove, from scratch, that a MERGED batch's cards landed on main — by content, never by names, commit messages or
+ * anything stored. Re-reads the PR's merge commit (which must be an ancestor of main). Recorded side: the batch's
+ * recorded head holds exactly one file `backlog/<cardId>-…` per member. Landed side: in the merge commit each member
+ * matches exactly one file — the same path, or a file whose front matter says `bornAs: <cardId>` — one-to-one across
+ * members; the landed file minus that `bornAs:` line must equal the recorded file after whole-token
+ * `backlog/<id>` → `backlog/<n>` rewrites (taken from the merge tree's front-matter facts).
+ * Returns the unproven members (empty = proven). Only a clean git exit-1 "no" is a negative; every other git or
+ * GitHub failure throws.
+ */
+export async function provenMergedLanding(recorded, { repo, gh, git, remote = 'origin' }) {
+  const text = async args => String(await git(args));
+  const yes = async args => {
+    try { await git(args); return true; } catch (error) { if (error?.status === 1) return false; throw error; }
+  };
   const members = recorded?.members ?? [];
-  if (!COMMIT_ID.test(String(mergeOid)) || proof?.merge !== mergeOid || !Array.isArray(proof.members)) return false;
-  if (!members.length || proof.members.length !== members.length) return false;
-  const ids = new Set(members.map(member => member?.cardId));
-  const paths = new Set();
-  for (const entry of proof.members) {
-    if (!ids.delete(entry?.cardId) || !/^backlog\/[^/]+\.md$/.test(String(entry.path)) || paths.has(entry.path)
-      || !COMMIT_ID.test(String(entry.blob))) return false;
-    paths.add(entry.path);
+  if (!members.length) return ['(no members recorded)'];
+  const view = JSON.parse(await gh(['pr', 'view', String(recorded.pr), '--repo', repo, '--json', 'number,state,headRefName,mergeCommit']));
+  const merge = view?.mergeCommit?.oid;
+  if (Number(view?.number) !== Number(recorded.pr) || view.headRefName !== recorded.batchRef || view.state !== 'MERGED'
+    || !/^[0-9a-f]{40}$/.test(String(merge)) || !/^[0-9a-f]{40}$/.test(String(recorded.headSha))) return ['(PR not a matching MERGED one)'];
+  await git(['fetch', '--no-tags', remote, 'refs/heads/main']);
+  const main = (await text(['rev-parse', 'FETCH_HEAD^{commit}'])).trim();
+  if (!await yes(['rev-parse', '--verify', '--quiet', `${recorded.headSha}^{commit}`])) await git(['fetch', '--no-tags', remote, recorded.headSha]);
+  if (!await yes(['rev-parse', '--verify', '--quiet', `${merge}^{commit}`])) await git(['fetch', '--no-tags', remote, merge]);
+  if (!await yes(['merge-base', '--is-ancestor', merge, main])) return ['(merge commit not on main)'];
+  const recordedTree = (await text(['ls-tree', '--name-only', recorded.headSha, 'backlog/'])).split('\n').filter(Boolean);
+  const mergeTree = (await text(['ls-tree', '--name-only', merge, 'backlog/'])).split('\n').filter(Boolean);
+  let grep = '';
+  try { grep = await text(['grep', '-l', '-E', '^bornAs: [a-z0-9]+$', merge, '--', 'backlog/']); }
+  catch (error) { if (error?.status !== 1) throw error; }
+  const bornAs = new Map();
+  const contentAt = new Map();
+  for (const line of grep.split('\n').filter(Boolean)) {
+    const path = line.slice(merge.length + 1);
+    if (!/^backlog\/\d+-[^/]+\.md$/.test(path)) continue;
+    const body = await text(['show', `${merge}:${path}`]);
+    contentAt.set(path, body);
+    const ids = frontMatterBornAs(body);
+    if (ids.length !== 1) continue;
+    bornAs.set(ids[0], [...(bornAs.get(ids[0]) ?? []), path]);
   }
-  return ids.size === 0;
+  const renames = [...bornAs].filter(([, paths]) => paths.length === 1).map(([id, [path]]) => [id, path.match(/^backlog\/(\d+)-/)[1]]);
+  const used = new Set();
+  const missing = [];
+  for (const member of members) {
+    const id = String(member?.cardId ?? '');
+    if (!/^[a-z0-9]+$/.test(id)) { missing.push(id || '(no id)'); continue; }
+    const recordedPaths = recordedTree.filter(path => path.startsWith(`backlog/${id}-`));
+    // Only the SAME path, or a file whose front matter says `bornAs: <id>`; never any other file, whatever its content.
+    const candidates = [...(recordedPaths.length === 1 && mergeTree.includes(recordedPaths[0]) ? [recordedPaths[0]] : []),
+      ...(bornAs.get(id) ?? [])];
+    if (recordedPaths.length !== 1 || candidates.length !== 1 || used.has(candidates[0])) { missing.push(id); continue; }
+    used.add(candidates[0]);
+    let expected = await text(['show', `${recorded.headSha}:${recordedPaths[0]}`]);
+    for (const [from, to] of renames) expected = expected.replace(new RegExp(`(?<![A-Za-z0-9])backlog/${from}(?![A-Za-z0-9])`, 'g'), `backlog/${to}`);
+    const landedRaw = contentAt.get(candidates[0]) ?? await text(['show', `${merge}:${candidates[0]}`]);
+    const landed = candidates[0] === recordedPaths[0] ? landedRaw : removeBornAsLine(landedRaw, id);
+    if (landed !== expected) missing.push(id);
+  }
+  return missing;
 }
 
-/** Never trust the stored proof's content: re-verify it against git. The merge commit must be an ancestor of main,
- * and `git ls-tree <merge> -- <path>` must return exactly the stored blob for every member. A mismatch or a clean
- * negative is false; any other git failure throws (the caller keeps the batch held). */
-export async function verifyMergeProof(recorded, mergeOid, { git, remote = 'origin' }) {
-  if (!validMergeProof(recorded, mergeOid)) return false;
-  const no = async args => {
-    try { await git(args); return false; } catch (error) { if (error?.status === 1) return true; throw error; }
-  };
-  await git(['fetch', '--no-tags', remote, 'refs/heads/main']);
-  const main = String(await git(['rev-parse', 'FETCH_HEAD^{commit}'])).trim();
-  if (await no(['rev-parse', '--verify', '--quiet', `${mergeOid}^{commit}`])) await git(['fetch', '--no-tags', remote, mergeOid]);
-  if (await no(['merge-base', '--is-ancestor', mergeOid, main])) return false;
-  for (const entry of recorded.sealFailure.mergeProof.members) {
-    const out = String(await git(['ls-tree', mergeOid, '--', entry.path])).replace(/\n$/, '');
-    const match = out.match(/^\d{6} blob ([0-9a-f]{40}(?:[0-9a-f]{24})?)\t([^\n]+)$/);
-    if (!match || match[1] !== entry.blob || match[2] !== entry.path) return false;
+/**
+ * Terminal retirement of a batch whose seal failed because its PR MERGED mid-seal. Every attempt recomputes the
+ * landing proof from scratch; nothing stored is evidence. No broad catch: only a clean "no" (identity mismatch, PR not
+ * a matching MERGED one, a card not proven) is a refusal, and every other error propagates to the caller.
+ */
+async function retireMergedMidSeal(recorded, input, { statePath, remote, gh, held: stillHeld, log, git }) {
+  if (!Number.isSafeInteger(recorded.seq) || recorded.seq < 1 || !COMMIT_ID.test(String(recorded.headSha))
+    || !Number.isSafeInteger(Number(recorded.pr)) || Number(recorded.pr) <= 0
+    || recorded.repo && recorded.repo !== input.source.repo
+    || recorded.kind && recorded.kind !== input.kind
+    || recorded.batchRef !== `lane/card-batch-${input.kind}-${recorded.seq}`) return refuse('batch-sealed');
+  const missing = await provenMergedLanding(recorded, { repo: input.source.repo, gh, git, remote });
+  if (missing.length) {
+    log(`card-batch ${recorded.batchRef} PR ${recorded.pr} MERGED mid-seal but ${missing.length} card(s) not proven on main `
+      + `(${missing.slice(0, 5).join(', ')}): kept held`);
+    return refuse('cards-not-proven-on-main');
   }
-  return true;
+  if (!stillHeld()) return refuse('lease-held');
+  const retired = recorded;
+  const state = retireBatch(statePath, recorded, { repo: input.source.repo, kind: input.kind, held: stillHeld, terminalPrState: 'MERGED', authorization: terminalRetirement });
+  log(`card-batch ${retired.batchRef} PR ${retired.pr} GitHub MERGED: retired (cards proven on main)`);
+  return { action: 'retired', state };
 }
 
 /** A sealed card batch may be retired and replaced only when a fresh GitHub read confirms its PR is MERGED or CLOSED.
@@ -222,6 +287,12 @@ export async function retireTerminalBatch(recorded, input, {
   statePath, stateDir = dirname(statePath), remote = 'origin', gh = defaultGh,
   held: stillHeld, log = line => process.stderr.write(`${line}\n`), git = null,
 }) {
+  // A MERGED-mid-seal failure has its own path: the full proof on every attempt, and no catch-all (see below).
+  if (recorded?.sealFailure?.terminalPrState === 'MERGED' && recorded.batchRef && recorded.sealedAt && recorded.pr
+    && basename(dirname(statePath)) !== 'sealed') {
+    return retireMergedMidSeal(recorded, input, { statePath, remote, gh, held: stillHeld, log,
+      git: git ?? recoveryGitIn(input.laneDir ?? ROOT) });
+  }
   if ((!recorded?.sealFailure && recorded?.seal?.step !== 'label-on-green')
     || !recorded?.batchRef || !recorded.sealedAt || !recorded.pr
     || basename(dirname(statePath)) === 'sealed') return refuse('batch-sealed');
@@ -235,16 +306,6 @@ export async function retireTerminalBatch(recorded, input, {
     const view = JSON.parse(await gh(['pr', 'view', String(recorded.pr), '--repo', input.source.repo, '--json', 'number,state,headRefName']));
     if (Number(view?.number) === Number(recorded.pr) && view.headRefName === recorded.batchRef
       && ['OPEN', 'CLOSED', 'MERGED'].includes(view.state)) status = view.state;
-    // A seal failure recorded because the PR MERGED mid-seal retires only with a valid stored content proof for this
-    // PR's actual merge commit (written by the seal job after proving every card landed). Absent or stale → held.
-    if (recorded.sealFailure?.terminalPrState === 'MERGED') {
-      const merged = status === 'MERGED'
-        ? JSON.parse(await gh(['pr', 'view', String(recorded.pr), '--repo', input.source.repo, '--json', 'mergeCommit']))?.mergeCommit?.oid : null;
-      if (!await verifyMergeProof(recorded, merged, { git: git ?? recoveryGitIn(input.laneDir ?? ROOT), remote })) {
-        log(`card-batch ${recorded.batchRef} PR ${recorded.pr} GitHub ${status}: no valid landing proof; kept sealed and held`);
-        return refuse('batch-sealed');
-      }
-    }
     if (!stillHeld()) return refuse('lease-held');
     if (status === 'CLOSED') respoolClosed(recorded, input, stateDir, remote, stillHeld);
     if (status === 'MERGED' || status === 'CLOSED') {
