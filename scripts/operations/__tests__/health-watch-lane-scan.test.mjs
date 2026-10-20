@@ -135,6 +135,35 @@ describe('fresh per-lane safety check before any destructive action', () => {
     expect(freshLaneSafety({ path: '/l', exec: git({ status: '', stash: 'stash@{0}: x', 'rev-list': '0' }) })).toMatchObject({ hasUnsafeWork: true });
     expect(freshLaneSafety({ path: '/l', exec: git({ status: '', stash: '', 'rev-list': '3' }) })).toMatchObject({ hasUnsafeWork: true });
   });
+  it('pins the exact git argv: untracked files listed in full, unpushed counted against origin refs only', () => {
+    const exec = git({ status: '', stash: '', 'rev-list': '0\n' });
+    freshLaneSafety({ path: '/l', exec });
+    expect(exec.mock.calls.map(([bin, argv]) => [bin, argv])).toEqual([
+      ['git', ['status', '--porcelain', '--untracked-files=all']],
+      ['git', ['stash', 'list']],
+      ['git', ['rev-list', '--count', 'HEAD', '--not', '--remotes=origin']],
+    ]);
+    for (const [, , options] of exec.mock.calls) {
+      expect(options).toMatchObject({ cwd: '/l', encoding: 'utf8', timeout: 30_000 });
+      expect(options.env.GIT_OPTIONAL_LOCKS).toBe('0');
+    }
+  });
+  it('a lane whose only unpushed work is an untracked file or a commit missing from origin is unsafe via the pinned argv', () => {
+    // Behaves like real git: a flag-less status hides untracked-directory contents, and a rev-list without the
+    // origin exclusion counts nothing as unpushed. Only the pinned argv sees the work.
+    const realistic = ({ status, count }) => vi.fn((bin, argv) => {
+      const line = argv.join(' ');
+      if (line === 'status --porcelain --untracked-files=all') return status;
+      if (line.startsWith('status')) return '';
+      if (line === 'stash list') return '';
+      if (line === 'rev-list --count HEAD --not --remotes=origin') return count;
+      return '0\n';
+    });
+    expect(freshLaneSafety({ path: '/l', exec: realistic({ status: '?? dir/new.mjs\n', count: '0\n' }) }))
+      .toMatchObject({ hasUnsafeWork: true, reason: 'worktree has changes' });
+    expect(freshLaneSafety({ path: '/l', exec: realistic({ status: '', count: '2\n' }) }))
+      .toMatchObject({ hasUnsafeWork: true, reason: '2 unpushed commit(s)' });
+  });
   it('any error, timeout or unparseable output is unsafe', () => {
     for (const outputs of [{ status: new Error('timeout') }, { status: '', stash: new Error('locked') },
       { status: '', stash: '', 'rev-list': new Error('bad object') }, { status: '', stash: '', 'rev-list': 'nope' }]) {
