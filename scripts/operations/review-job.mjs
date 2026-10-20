@@ -919,6 +919,14 @@ function runReviewArc({
               out: seatOut, input: seatsBox.input }, io)
           : { result: { status: 'error', reason: 'panel red-team seat did not start' } };
       } catch (e) { settled = { result: { status: 'error', reason: tail(e?.message ?? e, 300) } }; }
+      // 2026-10-20 — `stale` / `superseded` / `sequential` mean "run the sequential pass", exactly as on the
+      // non-panel path. The panel seat used to record them as an error instead (live #5729/#5752/#5485: "the
+      // jurors raised N finding(s) the speculative brief could not carry"), which left the PR red-team:pending.
+      if (!settled.result && panelAccepted && ['stale', 'superseded', 'sequential'].includes(settled.decision)
+        && typeof io.runRedTeam === 'function') {
+        try { settled.result = io.runRedTeam(seatsBox.input); } catch (e) { settled.result = { status: 'error', reason: tail(e?.message ?? e, 300) }; }
+        io.log(`review-job ${slug}: red team (panel seat) — speculative pass ${settled.decision}; sequential pass → ${settled.result?.status ?? 'none'}`);
+      }
       const redTeam = settled.result ?? { status: 'error', reason: settled.reason ?? 'panel red-team seat has no result' };
       attestSavedRedTeam(io, classified.runId, seatsBox.input, redTeam);
       delete settled.result;

@@ -84,6 +84,7 @@ import { cascadePolicy } from '../../scripts/lib/policy-cascade.mjs';
 import { resolve, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
+import { execFileSyncThrottled } from '../../scripts/lib/gh-throttle.mjs';
 import { hostname } from 'node:os';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents, isConflictingPr } from '../../scripts/conveyor/reconcile-pass.mjs';
 import { promoteDraftsThenReplan, promoteDraftsGuarded } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
@@ -360,6 +361,50 @@ export const headBoundRedTeamCiGate = (gate, head) => input => {
     ? { ...facts, allowed: false, reason: 'head-changed' } : facts;
 };
 
+/**
+ * 2026-10-20 — the red team's fair share of a tick's dispatch seats. When the tick has fewer seats than owed rows,
+ * at least `min(reserved, seats, red-team rows)` of those seats go to red-team rows (`redTeamRequest` /
+ * `carriedAcceptHead`). Each red-team row moved in displaces the LAST non-red-team, non-main-fix row inside the
+ * seats, which moves to just after them (no row is dropped; order is otherwise kept). PURE.
+ * @returns {{reviews:Array<object>, moved:number[]}}
+ */
+export function reserveRedTeamSeats(reviews, { seats, reserved }) {
+  const isRedTeam = (d) => !!(d?.redTeamRequest || d?.carriedAcceptHead);
+  const n = Math.max(0, Math.min(Number(seats) || 0, reviews.length));
+  if (!(reserved > 0) || n >= reviews.length || n === 0) return { reviews, moved: [] };
+  const inside = reviews.slice(0, n);
+  const outside = reviews.slice(n);
+  const want = Math.min(reserved, n, reviews.filter(isRedTeam).length) - inside.filter(isRedTeam).length;
+  if (want <= 0) return { reviews, moved: [] };
+  const victims = [];
+  for (let i = inside.length - 1; i >= 0 && victims.length < want; i--) {
+    if (!isRedTeam(inside[i]) && !inside[i]?.mainFix) victims.unshift(i);
+  }
+  const picked = outside.filter(isRedTeam).slice(0, victims.length);
+  if (!picked.length) return { reviews, moved: [] };
+  const used = victims.slice(victims.length - picked.length);
+  const displaced = used.map((i) => inside[i]);
+  const keptInside = inside.filter((_, i) => !used.includes(i));
+  const keptOutside = outside.filter((d) => !picked.includes(d));
+  return { reviews: [...keptInside, ...picked, ...displaced, ...keptOutside], moved: picked.map((d) => Number(d.prNumber)) };
+}
+
+/** The red team's reserved dispatch seats, through the policy cascade (env > review-concurrency.json > standard 1). */
+export function resolveRedTeamSeatShare({ env = process.env,
+  toolPath = join(dirname(fileURLToPath(import.meta.url)), '../../scripts/settings/review-concurrency.json') } = {}) {
+  let tool;
+  try { tool = JSON.parse(readFileSync(toolPath, 'utf8')); } catch { tool = undefined; }
+  const raw = env?.WE_REVIEW_RED_TEAM_RESERVED_SEATS;
+  try {
+    const r = cascadePolicy('reviewConcurrency', tool && tool.redTeamReservedSeats !== undefined ? { redTeamReservedSeats: tool.redTeamReservedSeats } : undefined, {
+      env, standard: { redTeamReservedSeats: 1 },
+      envValues: { redTeamReservedSeats: typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : undefined },
+      valid: { redTeamReservedSeats: (v) => Number.isSafeInteger(v) && v >= 0 && v <= 8 },
+    });
+    return { reserved: r.value.redTeamReservedSeats, source: r.sources?.redTeamReservedSeats ?? 'standard' };
+  } catch { return { reserved: 1, source: 'standard' }; }
+}
+
 /** Pure plan for an otherwise eligible drain request; reason is also its dry-run explanation. */
 export function planRedTeamRequestAction({ request, subject, evidence, setting, atRoundCap }) {
   if (!subject || subject.headRefOid?.toLowerCase() !== request.head.toLowerCase())
@@ -438,6 +483,12 @@ export function runReviewTick({
   notePromotions = null,
   onPlan = null,
   readRedTeamRequests = null,
+  // `({repo, pr}) => {state}` — read only for a request whose PR is absent from the open listing, to expire a
+  // merged/closed PR's request. `null` (the default) never expires; the request is held with a logged reason.
+  readPrState = null,
+  // `{reserved:number, source:string}` — the red team's guaranteed share of this tick's dispatch seats (see
+  // {@link reserveRedTeamSeats}). `null` (the default) reserves nothing, so existing callers are unchanged.
+  redTeamSeatShare = null,
   readReviewEvidence = null,
   redTeamTimingSetting = readRedTeamTiming,
   // One-line failure causes (status sweep / status tag). The real daemon wires `log.error`; tests inject a spy.
@@ -594,18 +645,50 @@ export function runReviewTick({
       && [mainFix.pr, ...(mainFix.prs || [])].includes(request.pr);
     const requests = [...readRedTeamRequests()].sort((a, b) => Number(ownsFix(b)) - Number(ownsFix(a)));
     const fixReviews = [];
+    // 2026-10-20 — every request this loop does not turn into a dispatch row says why (live: 12 requests sat for
+    // hours with no log line at all). `hold` writes the one-line reason; nothing here changes which branch holds.
+    const hold = (request, reason) => log(`review-daemon: red-team request #${request.pr} @${request.head.slice(0, 8)} held — ${reason}`);
     for (const request of requests) {
       if (request.repo.toLowerCase() !== repo.toLowerCase()) continue;
       const subject = rawPrs.find(p => Number(p.number) === request.pr);
       if (subject?.headRefOid && subject.headRefOid.toLowerCase() !== request.head.toLowerCase()) {
         finishRedTeamRequest(request, { status: 'stale' });
+        hold(request, `head moved to ${subject.headRefOid.slice(0, 8)}; request finished as stale`);
         continue;
       }
-      if (blocked.has(request.pr) || !redTeamEnabled()) continue;
+      if (!subject) {
+        // Not in the open-PR listing: a merged/closed PR owes no red team, so its request is finished (expired)
+        // rather than read again every tick. Only a confirmed MERGED/CLOSED state expires it.
+        let state = null;
+        try { state = readPrState ? readPrState({ repo, pr: request.pr }) : null; } catch (e) {
+          hold(request, `absent from the open-PR listing; state read failed (${String(e?.message ?? e).split('\n')[0]})`);
+          continue;
+        }
+        const st = String(state?.state ?? '').toUpperCase();
+        if (st === 'MERGED' || st === 'CLOSED') {
+          try {
+            finishRedTeamRequest(request, { status: 'expired' });
+            hold(request, `PR is ${st}; request finished as expired`);
+          } catch (e) { hold(request, `PR is ${st}; expiring the request failed (${String(e?.message ?? e).split('\n')[0]})`); }
+        } else hold(request, `absent from the open-PR listing (state ${st || 'unknown'})`);
+        continue;
+      }
+      if (blocked.has(request.pr)) {
+        const rows = [...(plan.refusals ?? []), ...(plan.dispatch ?? [])].filter(d => Number(d.prNumber) === request.pr
+          && !(d.kind === 'nothing-owed' && d.phase === 'queued'));
+        hold(request, `the review plan holds this PR (${rows.map(d => `${d.kind}${d.why ? `: ${String(d.why).slice(0, 160)}` : ''}`).join('; ') || 'already has a dispatch row this tick'})`);
+        continue;
+      }
+      if (!redTeamEnabled()) { hold(request, 'the red team is disabled (review-red-team-policy)'); continue; }
       const labels = (subject?.labels ?? []).map(l => typeof l === 'string' ? l : l.name);
-      if (subject?.headRefOid?.toLowerCase() !== request.head || subject.isDraft
-        || !labels.includes('review:accepted') || !labels.includes('ready-to-merge')
-        || labels.some(l => ['review:changes', 'review:human', 'review:pending'].includes(l))) continue;
+      const missing = ['review:accepted', 'ready-to-merge'].filter(l => !labels.includes(l));
+      const blocking = labels.filter(l => ['review:changes', 'review:human', 'review:pending'].includes(l));
+      const headKnown = subject.headRefOid?.toLowerCase() === request.head.toLowerCase();
+      if (!headKnown || subject.isDraft || missing.length || blocking.length) {
+        hold(request, [headKnown ? null : 'the listing carries no head for this PR', subject.isDraft ? 'PR is a draft' : null, missing.length ? `missing ${missing.join(', ')}` : null,
+          blocking.length ? `carries ${blocking.join(', ')}` : null].filter(Boolean).join('; '));
+        continue;
+      }
       let freshReview = false;
       let attempts = 0;
       if (readReviewEvidence) {
@@ -620,11 +703,13 @@ export function runReviewTick({
           setting: setting.value.carriedAcceptTriggersReview, atRoundCap: budgetKnown && attempts >= planned.cap });
         if (action.action === 'skip') {
           log(`review-daemon: ${action.reason}`);
+          hold(request, action.reason);
           continue;
         }
         freshReview = action.action === 'fresh-review';
         if (freshReview && !budgetKnown) {
           log(`review-daemon: skipping fresh review for #${request.pr}: exact reconcile attempts/cap unavailable`);
+          hold(request, 'fresh review needs the exact reconcile attempts/cap, which the plan did not carry');
           continue;
         }
       }
@@ -663,7 +748,17 @@ export function runReviewTick({
   const lanes = paused ? 0 : acquirableLanes({ repo });
   const acquirable = Math.max(0, (Array.isArray(lanes) ? lanes.length : Number(lanes)) || 0);
   const liveCap = liveReviewBudget && Number.isFinite(liveReviewBudget.left) ? Math.max(0, liveReviewBudget.left) : Infinity;
-  const dispatchable = reviews.slice(0, Math.min(reviews.length, acquirable, liveCap));
+  const seats = Math.min(reviews.length, acquirable, liveCap);
+  // 2026-10-20 — red-team rows were appended after every owed review, so under the live-review cap (3 seats,
+  // ~17 owed) they never reached a seat. They now get a reserved share of whatever seats this tick has.
+  if (redTeamSeatShare && redTeamSeatShare.reserved > 0) {
+    const share = reserveRedTeamSeats(reviews, { seats, reserved: redTeamSeatShare.reserved });
+    if (share.moved.length) {
+      reviews.splice(0, reviews.length, ...share.reviews);
+      log(`review-daemon: red-team seat share — moved #${share.moved.join(', #')} into this tick's ${seats} seat(s): redTeamReservedSeats=${redTeamSeatShare.reserved} (${redTeamSeatShare.source ?? 'standard'})`);
+    }
+  }
+  const dispatchable = reviews.slice(0, seats);
   if (liveReviewBudget && Number.isFinite(liveReviewBudget.left)) liveReviewBudget.left = Math.max(0, liveReviewBudget.left - dispatchable.length);
   if (liveCap < reviews.length && liveReviewBudget?.reason) process.stderr.write(`review-daemon: ${reviews.length - dispatchable.length} owed review(s) queued — ${liveReviewBudget.reason}\n`);
   // Which limit held the rest back: the live-review cap (when it is the tighter limit) or the lane pool.
@@ -676,6 +771,13 @@ export function runReviewTick({
   const deferReason = paused ? 'review owed, but dispatch is paused (Claude login)'
     : capBound ? `review owed, but held by the live-review cap (${liveReviewBudget?.reason ?? `maxLiveReviewRounds, ${liveCap} left`}; ${acquirable} lane(s) acquirable)`
       : `review owed, but no acquirable lane this tick (${acquirable} acquirable)`;
+  // A queued red-team row has no hold label, so `explainPendingNotDispatched` never names it — say it here.
+  for (const d of reviews.slice(dispatchable.length)) {
+    const head = d.redTeamRequest?.head ?? d.carriedAcceptHead;
+    if (!head) continue;
+    try { log(`review-daemon: red-team request #${d.prNumber} @${head.slice(0, 8)} held — no dispatch seat this tick: ${deferReason}${redTeamSeatShare ? `; redTeamReservedSeats=${redTeamSeatShare.reserved} (${redTeamSeatShare.source ?? 'standard'})` : ''}`); }
+    catch { /* diagnostics never abort the tick */ }
+  }
   if (poolExhaustion && !paused) {
     try {
       if (acquirable === 0 && deferredForLanes > 0) poolExhaustion.exhausted({ repo, lanePoolRepo: poolExhaustionLanePoolRepo(repo), deferred: deferredForLanes });
@@ -1278,6 +1380,9 @@ export function buildCliDaemonEffects({
     const factsProvider = withFactsLabels(createGhProvider());
     return runReviewTickAllRepos({
       readRedTeamRequests: readDrainRedTeamRequests,
+      readPrState: ({ repo, pr }) => JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), '--repo', repo, '--json', 'state'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, killSignal: 'SIGKILL' })),
+      redTeamSeatShare: resolveRedTeamSeatShare(),
       readReviewEvidence: readReviewEvidenceAtHead,
       log: line => log.error(line),
       acquirableLanes: defaultAcquirableLaneNumbers, readPrs: defaultReadPrs, readAgents: defaultReadAgents,
