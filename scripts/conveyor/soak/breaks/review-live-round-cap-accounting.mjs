@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const SOURCE = 'skills-src/conveyor/review-daemon.mjs';
+const DECLINING_REPO = 'review-cap-fixture/declining';
+const HEALTHY_REPO = 'review-cap-fixture/healthy';
 
 export default {
   id: 'review-live-round-cap-accounting',
@@ -59,15 +61,15 @@ export default {
     for (let tick = 1; tick <= 2; tick++) {
       const budget = { left: 3 };
       const result = runReviewTickAllRepos({
-        repos: ['web-everything/web-everything', 'frontier-ui/frontierui'], liveReviewBudget: budget,
+        repos: [DECLINING_REPO, HEALTHY_REPO], liveReviewBudget: budget,
         authGateOverride: () => ({ paused: false, reason: null }),
-        reconcile: ({ repo }) => ({ dispatch: Array.from({ length: repo === 'web-everything/web-everything' ? 3 : 1 },
+        reconcile: ({ repo }) => ({ dispatch: Array.from({ length: repo === DECLINING_REPO ? 3 : 1 },
           (_, i) => ({ kind: 'review', prNumber: 100 + i })), refusals: [] }),
-        dispatch: ({ repo }) => repo === 'web-everything/web-everything'
+        dispatch: ({ repo }) => repo === DECLINING_REPO
           ? { skipped: 'review-ci: unreadable-ci' } : { agentId: 'healthy-review' },
         holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 40,
       });
-      if (result.dispatched.length !== 1 || result.dispatched[0]?.repo !== 'frontier-ui/frontierui'
+      if (result.dispatched.length !== 1 || result.dispatched[0]?.repo !== HEALTHY_REPO
         || result.deferredForCap !== 0 || budget.left !== 2) {
         violations.push(`tick ${tick}: healthy repo starved; dispatched=${result.dispatched.length}, deferred=${result.deferredForCap}, left=${budget.left}`);
       }

@@ -783,6 +783,11 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
       const dashScript = join(root, 'Review -Work', 'review-job.mjs');
       mkdirSync(join(root, 'Review -Work'));
       writeFileSync(dashScript, '');
+      // The extensionless prefix from the previous case makes this command ambiguous too.
+      expect(liveReviewRoundBudget({ env: {}, listCommands: () => `node ${dashScript} run --pr=1` }))
+        .toMatchObject({ left: 0, reason: expect.stringContaining('ambiguous script path') });
+      rmSync(shortPrefix);
+      // Once only the full script exists, the option-like directory fragment must not hide it.
       expect(liveReviewRoundBudget({ env: {}, listCommands: () => `node ${dashScript} run --pr=1` }))
         .toMatchObject({ live: 1, left: Math.max(0, LIVE_CAP - 1) });
       expect(liveReviewRoundBudget({ env: {}, listCommands: () => 'node Review Work/scripts/operations/review-job.mjs run --pr=1' }))
