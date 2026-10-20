@@ -79,8 +79,8 @@ describe('content-conflict attempt policy', () => {
   it.each([
     [undefined, false],
     [{ action: 'skip', reason: 'content conflict' }, true],
-    [{ action: 'skip', precondition: true }, false],
-    [{ action: 'skip', deferred: true }, false],
+    [{ action: 'skip', precondition: true }, true],
+    [{ action: 'skip', deferred: true }, true],
     [{ action: 'error', reason: 'no gh slot' }, false],
     [{ action: 'error', reason: 'rate limit' }, false],
     [{ action: 'error', reason: 'read failed' }, false],

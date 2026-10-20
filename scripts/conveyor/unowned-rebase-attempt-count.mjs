@@ -64,9 +64,10 @@ export function loadUnownedRebaseSettings({ env = process.env, platform = platfo
       && Number.isFinite(Date.parse(v)) } });
 }
 
-/** Only a rebase that ran and stopped on content spends the attempt cap. */
+/** Every unsuccessful `skip` spends the attempt cap, precondition and deferred skips included (main's rule, kept by the
+ *  1020c unfreeze: an excluded skip could retry forever). Errors and throws are counted by the infra markers below. */
 export function shouldCountRebaseAttempt(result) {
-  return result?.action === 'skip' && !result.precondition && !result.deferred;
+  return result?.action === 'skip';
 }
 
 /** Stable prefix plus a single-line, bounded outcome for operator inspection. */

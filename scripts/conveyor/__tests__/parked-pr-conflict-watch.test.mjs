@@ -67,7 +67,7 @@ import {
   STAND_DOWN_MARKER, WATCHER_STAND_DOWN_ACTOR, SUPERSEDE_STAND_DOWN_MARKER, buildStandDownComment,
 } from '../stand-down.mjs';
 import { mintSessionSlug } from '../session-slug.mjs';
-import { UNOWNED_REBASE_INFRA_MARKER, countUnownedRebaseInfraFailures, formatUnownedRebaseInfraMarker, UNOWNED_REBASE_ATTEMPT_MARKER, UNOWNED_REBASE_ATTEMPT_CAP, countUnownedRebaseAttempts } from '../unowned-rebase-attempt-count.mjs';
+import { UNOWNED_REBASE_INFRA_MARKER, countUnownedRebaseInfraFailures, formatUnownedRebaseInfraMarker, formatUnownedRebaseAttemptMarker, UNOWNED_REBASE_ATTEMPT_MARKER, UNOWNED_REBASE_ATTEMPT_CAP, countUnownedRebaseAttempts } from '../unowned-rebase-attempt-count.mjs';
 import { NOTE_COMMENT_MARKER, postNoteComment } from '../reconcile-note-comment.mjs';
 import { CARD_CONFLICT_PRECONDITION_REASONS } from '../../lib/card-conflict-resolve.mjs';
 import { notifyDesktopChecked } from '../branch-sync.mjs';
@@ -3720,7 +3720,7 @@ describe('conflict watch diagnostics', () => {
       expect(postRearm).toHaveBeenCalledTimes(resolved && owesRearm ? 1 : 0);
       const idle = labels.includes('review:pending') && !labels.includes('review:changes');
       expect(postFinding).toHaveBeenCalledTimes(!resolved && idle ? 1 : 0);
-      expect(postComment.mock.calls.some(call => call[2].startsWith(UNOWNED_REBASE_ATTEMPT_MARKER))).toBe(false);
+      expect(postComment.mock.calls.some(call => call[2].startsWith(UNOWNED_REBASE_ATTEMPT_MARKER))).toBe(outcome.action === 'skip');
     });
   }
 
@@ -3903,15 +3903,21 @@ describe('attempt marker writes and operator cutoff in both populations', () => 
       { action: 'error', reason: 'no gh slot' },
       { action: 'error', reason: 'gh throttle / rate limit' },
       { action: 'error', reason: 'read failed' },
+      { action: 'current' },
+      { action: 'rebased' },
+    ])(`${population}: does not mark %j`, result => {
+      expect(sweep(population, { result }).markers).toEqual([]);
+    });
+
+    // 1020c unfreeze: main counts every unsuccessful skip, precondition and deferred ones included.
+    it.each([
       { action: 'skip', precondition: true, reason: 'card conflict clone does not match PR repository' },
       { action: 'skip', precondition: true, reason: 'not a main-base PR' },
       ...CARD_CONFLICT_PRECONDITION_REASONS.map(reason => ({ action: 'skip', precondition: true, reason })),
       { action: 'skip', precondition: true, deferred: true, reason: 'branch moved before recovery' },
       { action: 'skip', deferred: true, reason: 'deferred' },
-      { action: 'current' },
-      { action: 'rebased' },
-    ])(`${population}: does not mark %j`, result => {
-      expect(sweep(population, { result }).markers).toEqual([]);
+    ])(`${population}: marks precondition/deferred skip %j`, result => {
+      expect(sweep(population, { result }).markers).toEqual([formatUnownedRebaseAttemptMarker(result)]);
     });
 
     it(`${population}: marks only content conflicts with a sanitized outcome`, () => {
