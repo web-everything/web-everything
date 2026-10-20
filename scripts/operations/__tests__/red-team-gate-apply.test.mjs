@@ -242,6 +242,38 @@ describe('applyRedTeamGate', () => {
       expect(ids([{ author: first.author, body: 'unrelated' }, first])).toEqual(original);
     });
 
+    // PR #5744 review: the parser accepted at most 10 grant ids while the writer records every grant, so an 11th grant
+    // made the gate's own record unreadable: the send-back repeated and its enqueue hold vanished (fail-open).
+    it.each([0, 1, 10, 11, 200])('a gate marker naming %i grant ids round-trips', n => {
+      const grantIds = Array.from({ length: n }, (_, i) => createHash('sha256').update(String(i)).digest('hex').slice(0, 16));
+      for (const outcome of [GATE_OUTCOMES.SENT_BACK, GATE_OUTCOMES.ROUND_CAP]) {
+        const body = buildGateComment({ pr: 4722, head: HEAD, outcome, round: 12, grantIds,
+          result: redTeamResultId(parseRedTeamComment(comment([F()]).body)), plan: { sendBack: [{ index: 1 }], card: [], advisory: [] } });
+        expect(parseRedTeamGateMarker(body)).toMatchObject({ pr: 4722, rev: HEAD, outcome, grantIds });
+      }
+    });
+
+    // The writer records whatever the grant reader returns; the parser must not encode that reader's ceiling. Edited
+    // grants leave stale ids in an older snapshot, so a record can name more ids than the thread now credits.
+    it.each([11, 40])('a send-back record naming %i grant ids is seen again: no repeat, and its enqueue hold stays', async n => {
+      const grants = [0, 1, 2].map(i => ({ ...grant(1, `2026-10-19T12:0${i}:00Z`), id: `IC_grant${i}` }));
+      const live = gateRoundGrants(grants, 4722, REPO).map(g => g.id);
+      const stale = Array.from({ length: n - live.length }, (_, i) => createHash('sha256').update(`edited-${i}`).digest('hex').slice(0, 16));
+      const sender = { author: { login: 'web-everything' }, body: buildGateComment({ pr: 4722, head: HEAD,
+        outcome: GATE_OUTCOMES.SENT_BACK, round: 12, grantIds: [...stale, ...live],
+        result: redTeamResultId(parseRedTeamComment(comment([F()]).body)),
+        plan: { sendBack: [{ index: 1 }], card: [], advisory: [] } }) };
+      const comments = [comment([F()]), capRecord(), ...grants, sender];
+      expect(parseRedTeamGateMarker(sender.body)?.grantIds).toHaveLength(n);
+      expect(redTeamEnqueueHold({ comments, pr: 4722, head: HEAD, repo: REPO, confirmedBreaks: CONFIRMED_BREAKS_DEFAULTS, env: {} }))
+        .toMatch(/confirmed a break requiring send-back/);
+      expect(redTeamQueueReason({ number: 4722, repo: REPO, headRefOid: HEAD, labels: ['review:changes'], comments }))
+        .toMatch(/the fixer owns them/);
+      const { io, calls } = fakeIo({ comments, round: 12, readRoundAsOf: () => 12 });
+      expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'already-acted', outcome: 'sent-back' });
+      expect(calls.filter(([kind]) => kind === 'sendBack')).toHaveLength(0);
+    });
+
     it.each(Object.keys(readerShapes).flatMap(shape => [false, true].map(carried => [shape, carried])))(
       'an existing grant snapshot keeps its enqueue hold through the %s reader until a newer clearance (carried: %s)', (shape, carried) => {
       const extension = { ...grant(), id: 'IC_grant' };
