@@ -660,11 +660,13 @@ export async function runReviewLoopOnce({
         // finishes. Keep what it set aside (`resumeOf`) so a resume that fails part-way still reads as the parked run
         // it was (`reviewRunEvidence`) and is resumed again, never replaced by a fresh panel. An unfinished earlier
         // resume keeps ITS `resumeOf` (the last parked pass); a finished, re-parked one captures its new parked pass.
-        // A finished pass parked on a FAILED referral persist spends one slot of the hold's retry budget per resume
-        // (`persistRetries`, read back by `reviewRunEvidence`), so a persist that keeps failing still runs out.
+        // A pass parked on a FAILED referral persist spends one slot of the hold's retry budget per resume, finished or
+        // not (`persistRetries`, read back by `reviewRunEvidence`): a resume that keeps dying part-way must exhaust the
+        // budget too, never reach the RESUME_MAX_ATTEMPTS fresh-panel fallback with the budget unspent.
         const persistRetries = Math.max(0, Number(parked.resumeOf?.persistRetries) || 0)
-          + (!unfinishedResume && reviewRunEvidence(parked)?.persistenceFailed ? 1 : 0);
-        rewound = { ...rewound, resumeOf: unfinishedResume ? { ...parked.resumeOf, attempts: attempts + 1 }
+          + (reviewRunEvidence(parked)?.persistenceFailed ? 1 : 0);
+        rewound = { ...rewound, resumeOf: unfinishedResume
+          ? { ...parked.resumeOf, attempts: attempts + 1, ...(persistRetries ? { persistRetries } : {}) }
           : { verdict: parked.findings?.referralVerdict ?? parked.verdict ?? null,
             mandatoryReferrals: parked.findings?.mandatoryReferrals ?? null,
             adviseFinishedAt: parked.stepTimings?.find((t) => t.step === 'advise')?.finishedAt ?? null, attempts: 1,

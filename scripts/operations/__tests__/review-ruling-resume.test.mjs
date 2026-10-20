@@ -28,7 +28,7 @@ import { advance, advanceWhileRunning, startRun } from '../engine.mjs';
 import { resolveOperation } from '../run.mjs';
 import { advanceReviewPrToWriteUp } from '../record-verdict-io.mjs';
 import { loadReviewSeatSettings } from '../../lib/review-seat-provider.mjs';
-import { reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
+import { decideReferralHold, REFERRAL_RETRY_MS, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 
 const HEAD_1 = 'a'.repeat(40);
 const HEAD_2 = 'b'.repeat(40);
@@ -530,6 +530,27 @@ describe('runReviewLoopOnce — a ruling on an unchanged head resumes the paused
     expect(judged).toBe(judgedByFirstReview);
     expect(store.read('must-not-be-minted')).toBeFalsy();
     expect(reviewRunEvidence(store.read('r-1'))).toMatchObject({ persistenceFailed: false, parked: false, persistRetries: 2 });
+  });
+
+  // Codex audit of the fix above: resumes that die part-way must spend the budget too, or three of them reach the
+  // RESUME_MAX_ATTEMPTS fresh-panel fallback with the budget unspent and the retries never run out.
+  it('a persist retry that dies part-way still spends a slot, so the hold is exhausted before the fresh-panel fallback', async () => {
+    const { declaration, registry } = setup();
+    const store = createMemoryRunStore();
+    const makeJudge = () => async () => judgeOutcome(REFERRAL_ANSWER, {});
+    const persistFails = sinksWith({ seen: [], ruled: { value: false } });
+    persistFails[REVIEW_EFFECTS.MANDATORY_REFERRALS] = async () => ({ records: [], pending: ['referral-persistence-failed'],
+      blocked: [], malformed: false, reason: 'ledger-write-miss' });
+    await runReviewLoopOnce({ declaration, registry, argv, store, sinks: persistFails, makeJudge, mintRunId: () => 'r-1' });
+    const dies = sinksWith({ seen: [], ruled: { value: false } });
+    dies[REVIEW_EFFECTS.MANDATORY_REFERRALS] = async () => { throw new Error('gh: 502'); };
+    for (let n = 1; n <= REFERRAL_RETRY_MS.length; n++) {
+      await runReviewLoopOnce({ declaration, registry, argv, store, sinks: dies, makeJudge, mintRunId: () => 'must-not-be-minted', findResumableRun: () => 'r-1' });
+      expect(reviewRunEvidence(store.read('r-1'))).toMatchObject({ id: 'r-1', persistenceFailed: true, persistRetries: n });
+    }
+    const p = { number: 4361, headRefOid: reviewRunEvidence(store.read('r-1')).head, comments: [], labels: [] };
+    expect(decideReferralHold(p, [reviewRunEvidence(store.read('r-1'))], { repo: 'o/n', now: Date.now() + 86_400_000 }))
+      .toMatchObject({ exhausted: true, retryAt: null });
   });
 
   it('without a resumable run it starts a fresh review exactly as before (new push, re-arm, send-back)', async () => {
