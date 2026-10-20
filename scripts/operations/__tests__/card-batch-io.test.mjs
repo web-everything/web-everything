@@ -380,15 +380,18 @@ describe('durable card batch IO', () => {
   });
 
   it.each([
-    ['GitHub timeout', 'timeout: 30_000, maxBuffer: 1024 * 1024', 'maxBuffer: 1024 * 1024', 'gh', 'timeout'],
+    ['GitHub timeout', 'timeout: 30_000, maxBuffer: 1024 * 1024, stdio', 'maxBuffer: 1024 * 1024, stdio', 'gh', 'timeout'],
     ['GitHub output limit', 'maxBuffer: 1024 * 1024, stdio:', 'stdio:', 'gh', 'maxBuffer'],
     ['Git timeout', '...options, timeout: 30_000', '...options', 'git', 'timeout'],
     ['Git output limit', '...options, maxBuffer: 16 * 1024 * 1024', '...options', 'git', 'maxBuffer'],
+    ['cat-file timeout', "timeout: 30_000, maxBuffer: 1024 * 1024 * 1024, stdio", "maxBuffer: 1024 * 1024 * 1024, stdio", 'catfile', 'timeout'],
   ])('mutation gate detects removal of %s', (_name, before, after, runner, key) => {
     const f = fixture();
     const options = mutantProbe(f, [[before, after]], `
       const exec = (_command, _args, options) => JSON.stringify(options);
-      const result = ${runner === 'gh' ? 'io.defaultGh([], exec)' : "io.recoveryGitIn('/fixture', exec)([])"};
+      const result = ${runner === 'gh' ? 'io.defaultGh([], exec)' : runner === 'catfile'
+        ? "(io.catFileBatch('/fixture', ['a:b'], (_c, _a, options) => ({ status: 0, stdout: Buffer.from(JSON.stringify(options)) })).toString())"
+        : "io.recoveryGitIn('/fixture', exec)([])"};
       console.log(result);`);
     expect(options[key]).toBeUndefined();
   });
