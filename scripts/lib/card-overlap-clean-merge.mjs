@@ -35,8 +35,8 @@ export function readCardOverlapCleanMerge({ env = process.env, tool, platform, l
   return { enabled: r.value.cardOverlapCleanMerge === true, source: r.sources?.cardOverlapCleanMerge ?? 'standard' };
 }
 
-/** A backlog card file: exactly `backlog/<name>.md`, no subdirectory. */
-export const isCardFile = path => typeof path === 'string' && /^backlog\/[^/]+\.md$/.test(path);
+/** A backlog card file: exactly `backlog/<name>.md`, no subdirectory, no control characters (JS `$` without /m is end of input). */
+export const isCardFile = path => typeof path === 'string' && /^backlog\/[^/\x00-\x1f]+\.md$/.test(path);
 
 /** True only when there is an overlap, no entry file list is unknown, and every shared path is a card file. */
 export function cardOnlyOverlap(overlap) {
@@ -65,7 +65,7 @@ export function readQueueTip({ repo, exec = execFileSync }) {
   } catch (e) { return { error: String(e?.message ?? e).split('\n')[0] }; }
 }
 
-/** Dry merge `head` onto `tip` in the object DB. Never writes a ref; a fetch only fills FETCH_HEAD. */
+/** Dry merge `head` onto `tip` in the object DB. Never writes a ref; a missing commit is fetched by sha with no ref or FETCH_HEAD write. */
 export function dryMergeOnto({ head, tip, cwd = process.cwd(), run = gitRun }) {
   if (!SHA.test(head ?? '') || !SHA.test(tip ?? '')) return { clean: false, error: 'missing or invalid sha' };
   const have = sha => run('git', ['cat-file', '-e', `${sha}^{commit}`], { cwd }).status === 0;

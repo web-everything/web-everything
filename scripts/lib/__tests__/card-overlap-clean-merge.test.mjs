@@ -29,6 +29,8 @@ describe('card-overlap clean-merge', () => {
     expect(isCardFile('backlog/sub/x.md')).toBe(false);
     expect(isCardFile('backlog/x.json')).toBe(false);
     expect(isCardFile('docs/backlog/x.md')).toBe(false);
+    expect(isCardFile('backlog/x.md\n')).toBe(false);
+    expect(isCardFile('backlog/x.md\nscripts/y.mjs')).toBe(false);
   });
   it('treats an overlap as card-only only when every shared path is a card and no list is unknown', () => {
     expect(cardOnlyOverlap({ overlap: true, with: [{ num: 1, files: ['backlog/a.md'] }], unknown: [] })).toBe(true);
