@@ -361,4 +361,249 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     expect(calls.some(c => c.startsWith('pr comment 2 '))).toBe(true);
     expect(readGroupState(statePath).groups).toEqual([]);
   });
+
+  // Sources on CARD, each `edit` writing the card; every PR live-reads OPEN + accepted at its head unless changed.
+  function formRepo(edits) {
+    const { cwd, base, branch } = repo();
+    const heads = {};
+    for (const [n, text] of Object.entries(edits)) heads[n] = branch(`s${n}`, () => writeFileSync(join(cwd, CARD), text));
+    const labels = Object.fromEntries(Object.keys(heads).map(n => [n, accepted]));
+    const calls = [];
+    const exec = (cmd, args) => {
+      calls.push(args.join(' '));
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ state: 'OPEN', isDraft: false, headRefOid: heads[args[2]], headRefName: 'lane/x', baseRefName: 'main', labels: labels[args[2]] });
+      if (args[0] === 'pr' && args[1] === 'create') return 'https://github.com/o/r/pull/77\n';
+      if (args[0] === 'pr' && ['comment', 'close'].includes(args[1])) return '';
+      throw new Error(`unexpected ${args.join(' ')}`);
+    };
+    const nums = Object.keys(heads).map(Number);
+    const verdicts = nums.map(n => ({ num: n, repo: null, listedHeadSha: heads[n], prLabels: accepted }));
+    const outcomes = nums.map(n => ({ num: n, kind: 'queue-file-overlap', reason: `#9 share ${CARD}` }));
+    const out = [];
+    const opts = { localSlug: 'o/r', cwd, run: runIn(cwd, () => base), exec, settings, log: { write: l => out.push(l) }, prestage: () => ({ allowed: true }), cardConflictSettings: cc };
+    return { cwd, base, heads, labels, calls, exec, verdicts, outcomes, out, opts };
+  }
+
+  describe('form: admission and eligibility', () => {
+    it('leaves out a source the admission check refuses, and passes it the judged head', () => {
+      const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11]), 3: card([1, 2, 12]) });
+      const seen = [];
+      const prestage = (c, headSha) => { seen.push([c.num, headSha]); return c.num === 2 ? { allowed: false, reason: 'red-team hold' } : { allowed: true }; };
+      const r = createCardGrouping({ ...t.opts, statePath: join(tmp(), 's.json'), prestage, dryRun: true }).form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      expect(r.plan.sources.map(s => s.num)).toEqual([1, 3]);
+      expect(r.proof.ok).toBe(true);
+      expect(seen).toEqual([[1, t.heads[1]], [2, t.heads[2]], [3, t.heads[3]]]);
+      expect(t.out.join('')).toMatch(/#2 left out \(admission: red-team hold\)/);
+    });
+
+    it('a refused admission that leaves fewer than 2 forms nothing and memos the set (retry backoff)', () => {
+      const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11]) });
+      const statePath = join(tmp(), 's.json');
+      const g = createCardGrouping({ ...t.opts, statePath, prestage: c => (c.num === 1 ? { allowed: false } : { allowed: true }) });
+      expect(g.form({ outcomes: t.outcomes, verdicts: t.verdicts }).reason).toMatch(/live re-check left fewer than 2/);
+      expect(t.out.join('')).toMatch(/#1 left out \(admission: refused\)/);
+      expect(Object.keys(readGroupState(statePath).failed)).toHaveLength(1);
+      expect(g.form({ outcomes: t.outcomes, verdicts: t.verdicts }).reason).toMatch(/retry backoff/);
+      expect(t.calls.some(c => c.startsWith('pr create'))).toBe(false);
+    });
+
+    it.each([
+      ['head moved', t => { t.heads[2] = 'f'.repeat(40); }, /#2 left out \(head moved\)/],
+      ['review hold', t => { t.labels[2] = [...accepted, { name: 'review:pending' }]; }, /#2 left out \(holds review:pending\)/],
+      ['approval gone', t => { t.labels[2] = [{ name: 'ready-to-merge' }]; }, /#2 left out \(not review:accepted\)/],
+    ])('live re-check before building leaves out a source whose eligibility changed (%s)', (_, change, logged) => {
+      const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11]), 3: card([1, 2, 12]) });
+      change(t);
+      const r = createCardGrouping({ ...t.opts, statePath: join(tmp(), 's.json'), dryRun: true }).form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      expect(r.plan.sources.map(s => s.num)).toEqual([1, 3]);
+      expect(t.out.join('')).toMatch(logged);
+    });
+
+    it.each([
+      ['head moved', t => { t.heads[2] = 'f'.repeat(40); }, /claim refused: #2 head moved/],
+      ['approval gone', t => { t.labels[2] = [{ name: 'ready-to-merge' }]; }, /claim refused: #2 not review:accepted/],
+      ['sent back', t => { t.labels[1] = [...accepted, { name: 'review:changes' }]; }, /claim refused: #1 holds review:changes/],
+    ])('eligibility that changes between the build and the claim refuses the claim (%s): no group, no push, no PR', (_, change, refused) => {
+      const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11]) });
+      const statePath = join(tmp(), 's.json');
+      const pushes = [];
+      const run = (cmd, args, o) => { if (args[0] === 'push') pushes.push(args); return t.opts.run(cmd, args, o); };
+      const withLock = fn => { change(t); return { ran: true, result: fn() }; };
+      const r = createCardGrouping({ ...t.opts, run, statePath, withLock, readQueue: () => ({ inQueue: new Set() }) }).form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      expect(r.reason).toMatch(refused);
+      expect(r.formed).toBeUndefined();
+      expect(readGroupState(statePath).groups ?? []).toEqual([]);
+      expect(pushes).toEqual([]);
+      expect(t.calls.some(c => c.startsWith('pr create') || c.startsWith('pr comment'))).toBe(false);
+    });
+
+    it('an unreadable merge queue at claim time refuses (fail closed)', () => {
+      const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11]) });
+      const statePath = join(tmp(), 's.json');
+      const withLock = fn => ({ ran: true, result: fn() });
+      const r = createCardGrouping({ ...t.opts, statePath, withLock, readQueue: () => ({ error: 'gh down' }) }).form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      expect(r.reason).toMatch(/claim refused: merge queue unreadable \(gh down\)/);
+      expect(readGroupState(statePath).groups ?? []).toEqual([]);
+    });
+  });
+
+  describe('form: leave-out of a source the build or the proof pins a failure on', () => {
+    it('a source whose build conflicts outside the list is left out; the rest still group', () => {
+      const t = formRepo({ 1: card([1, 2, 10], 'active'), 2: card([1, 2, 11]), 3: card([1, 2, 12], 'resolved') });
+      const r = createCardGrouping({ ...t.opts, statePath: join(tmp(), 's.json'), dryRun: true }).form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      expect(r.plan.sources.map(s => s.num)).toEqual([1, 2]);
+      expect(r.proof.ok).toBe(true);
+      expect(t.out.join('')).toMatch(/#3 left out of the group \(#3: backlog\/5360-prevention-card\.md: conflict outside Also raised by list/);
+    });
+
+    it('a source the union proof fails on (its duplicate entry deduped away) is left out; the rest still group', () => {
+      const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11, 11]), 3: card([1, 2, 12]) });
+      const r = createCardGrouping({ ...t.opts, statePath: join(tmp(), 's.json'), dryRun: true }).form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      expect(r.plan.sources.map(s => s.num)).toEqual([1, 3]);
+      expect(r.proof.ok).toBe(true);
+      expect(t.out.join('')).toMatch(/#2 left out of the group \(union check failed \(missing 1/);
+    });
+
+    it('leaving out the only offender of two forms nothing, memos the original set, and backs off', () => {
+      const t = formRepo({ 1: card([1, 2, 10], 'active'), 2: card([1, 2, 11], 'resolved') });
+      const statePath = join(tmp(), 's.json');
+      const g = createCardGrouping({ ...t.opts, statePath, withLock: fn => ({ ran: true, result: fn() }), readQueue: () => ({ inQueue: new Set() }) });
+      const r = g.form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      expect(r.reason).toMatch(/fewer than 2 left after leaving out #2/);
+      expect(Object.keys(readGroupState(statePath).failed)).toEqual([`1@${t.heads[1]},2@${t.heads[2]}`]);
+      expect(readGroupState(statePath).groups).toEqual([]);
+      expect(g.form({ outcomes: t.outcomes, verdicts: t.verdicts }).reason).toMatch(/retry backoff/);
+    });
+  });
+
+  describe('reconcile: dissolve and interrupted creation', () => {
+    const A = 'a'.repeat(40), B = 'b'.repeat(40);
+    const T0 = 1_000_000;
+    function reconcileCase({ combined = { state: 'OPEN', labels: accepted }, sources = {}, readFails = [], closeFails = false, pr = 77, list = [], listThrows = false, at = T0 } = {}) {
+      const statePath = join(tmp(), 's.json');
+      writeFileSync(statePath, JSON.stringify({ groups: [{ id: 'g', repo: 'o/r', pr, branch: 'lane/card-group-g', createdAt: T0, sources: [{ num: 1, headSha: A }, { num: 2, headSha: B }] }], failed: {} }));
+      const live = { 1: { state: 'OPEN', isDraft: false, headRefOid: A, headRefName: 'lane/x', baseRefName: 'main', labels: accepted, ...sources[1] },
+        2: { state: 'OPEN', isDraft: false, headRefOid: B, headRefName: 'lane/x', baseRefName: 'main', labels: accepted, ...sources[2] } };
+      const calls = [];
+      const exec = (cmd, args) => {
+        calls.push(args.join(' '));
+        if (args[0] === 'pr' && args[1] === 'view') {
+          if (args[2] === '77') { if (combined === 'throw') throw new Error('gh: 502'); return JSON.stringify(combined); }
+          if (readFails.includes(Number(args[2]))) throw new Error('gh: 502');
+          return JSON.stringify(live[args[2]]);
+        }
+        if (args[0] === 'pr' && args[1] === 'list') { if (listThrows) throw new Error('gh: 502'); return JSON.stringify(list); }
+        if (args[0] === 'pr' && args[1] === 'close' && closeFails) throw new Error('gh: 502');
+        if (args[0] === 'pr' && ['comment', 'close'].includes(args[1])) return '';
+        throw new Error(`unexpected ${args.join(' ')}`);
+      };
+      const out = [];
+      const g = createCardGrouping({ localSlug: 'o/r', cwd: tmp(), run: () => { throw new Error('no git on this path'); }, exec, statePath, settings, log: { write: l => out.push(l) }, now: () => at });
+      const r = g.reconcile({ force: true });
+      return { r, calls, out: out.join(''), state: readGroupState(statePath), g };
+    }
+
+    it.each([
+      ['combined PR closed unmerged', { combined: { state: 'CLOSED', labels: [] } }, /combined PR closed without merging/, false],
+      ['sent back: review:changes', { combined: { state: 'OPEN', labels: [{ name: 'review:changes' }] } }, /combined PR sent back \(review:changes\)/, true],
+      ['sent back: review:human', { combined: { state: 'OPEN', labels: [{ name: 'review:human' }] } }, /combined PR sent back \(review:human\)/, true],
+      ['required check failed', { combined: { state: 'OPEN', labels: accepted, statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }] } }, /combined PR failed the required check/, true],
+      ['required check timed out (status context)', { combined: { state: 'OPEN', labels: accepted, statusCheckRollup: [{ context: 'test', state: 'TIMED_OUT' }] } }, /combined PR failed the required check/, true],
+      ['source head moved', { sources: { 2: { headRefOid: 'c'.repeat(40) } } }, /source #2 changed \(head moved\)/, true],
+      ['source lost its approval', { sources: { 1: { labels: [{ name: 'ready-to-merge' }] } } }, /source #1 changed \(not review:accepted\)/, true],
+      ['source sent back', { sources: { 2: { labels: [...accepted, { name: 'review:human' }] } } }, /source #2 changed \(holds review:human\)/, true],
+      ['source closed', { sources: { 1: { state: 'CLOSED' } } }, /source #1 changed \(not open\)/, true],
+      ['source made draft', { sources: { 2: { isDraft: true } } }, /source #2 changed \(draft\)/, true],
+    ])('dissolves when %s: drain closes only its own combined PR, every source is released with its approval untouched', (_, c, why, closesCombined) => {
+      const { r, calls, out, state, g } = reconcileCase(c);
+      expect(r.dissolved).toEqual(['g']);
+      expect(out).toMatch(why);
+      expect(state.groups).toEqual([]);
+      expect(g.holdFor({ num: 1 })).toBeNull();
+      expect(g.holdFor({ num: 2 })).toBeNull();
+      const closes = calls.filter(x => x.startsWith('pr close'));
+      expect(closes).toEqual(closesCombined ? [expect.stringMatching(/^pr close 77 .*Card group dissolved/)] : []);
+      for (const n of [1, 2]) expect(calls.some(x => x.startsWith(`pr comment ${n} `) && why.test(x))).toBe(true);
+      expect(calls.some(x => /^pr (edit|close [12] )/.test(x))).toBe(false);
+    });
+
+    it.each([
+      ['the combined PR is healthy', {}],
+      ['a source read fails (fail closed: held)', { readFails: [2] }],
+      ['closing the combined PR fails (held, retried)', { combined: { state: 'OPEN', labels: [{ name: 'review:changes' }] }, closeFails: true }],
+      ['the combined PR read fails', { combined: 'throw' }],
+    ])('keeps the group (sources stay held) when %s', (_, c) => {
+      const { r, calls, state, g } = reconcileCase(c);
+      expect(r.dissolved ?? []).toEqual([]);
+      expect(state.groups.map(x => x.id)).toEqual(['g']);
+      expect(g.holdFor({ num: 1 })).toMatchObject({ kind: 'card-grouped' });
+      expect(calls.some(x => x.startsWith('pr comment'))).toBe(false);
+    });
+
+    it('interrupted creation: adopts the PR opened for the branch', () => {
+      const { r, calls, state } = reconcileCase({ pr: null, list: [{ number: 88, state: 'OPEN' }], at: T0 + 20 * 60_000 });
+      expect(r.dissolved).toEqual([]);
+      expect(state.groups[0].pr).toBe(88);
+      expect(calls).toContainEqual(expect.stringMatching(/^pr list --repo o\/r --head lane\/card-group-g --state all/));
+    });
+
+    it('interrupted creation: no PR after 15 minutes drops the record and releases the sources', () => {
+      const { r, state, g, out } = reconcileCase({ pr: null, list: [], at: T0 + 16 * 60_000 });
+      expect(r.dissolved).toEqual(['g']);
+      expect(state.groups).toEqual([]);
+      expect(g.holdFor({ num: 1 })).toBeNull();
+      expect(out).toMatch(/no PR was opened — record dropped/);
+    });
+
+    it.each([
+      ['no PR yet but inside the 15-minute window', { list: [], at: T0 + 5 * 60_000 }],
+      ['the PR list read fails', { listThrows: true, at: T0 + 60 * 60_000 }],
+    ])('interrupted creation: keeps holding when %s', (_, c) => {
+      const { r, state, g } = reconcileCase({ pr: null, ...c });
+      expect(r.dissolved ?? []).toEqual([]);
+      expect(state.groups).toHaveLength(1);
+      expect(state.groups[0].pr).toBeNull();
+      expect(g.holdFor({ num: 2 })).toMatchObject({ kind: 'card-grouped' });
+    });
+  });
+});
+
+describe('verifyUnion refusals (real git)', () => {
+  it('refuses a file the combined commit changes that no source changes', () => {
+    const { cwd, base, branch } = repo();
+    const a = branch('a', () => writeFileSync(join(cwd, CARD), card([1, 2, 10])));
+    const combined = branch('c', () => { writeFileSync(join(cwd, CARD), card([1, 2, 10])); writeFileSync(join(cwd, 'backlog/5473-other.md'), card([7, 99])); });
+    const proof = verifyUnion({ base, combined, sources: [{ num: 1, headSha: a }], cwd });
+    expect(proof.ok).toBe(false);
+    expect(proof.outside).toEqual(['backlog/5473-other.md']);
+    expect(proof).toMatchObject({ missing: [], extra: [], deleted: [], resurrected: [], disagree: [] });
+  });
+
+  it('refuses a line one source raises and another lowers (disagree)', () => {
+    const { cwd, base, branch } = repo();
+    const up = branch('up', () => writeFileSync(join(cwd, CARD), card([1, 2, 2])));
+    const down = branch('down', () => writeFileSync(join(cwd, CARD), card([1])));
+    const proof = verifyUnion({ base, combined: up, sources: [{ num: 1, headSha: up }, { num: 2, headSha: down }], cwd });
+    expect(proof.ok).toBe(false);
+    expect(proof.disagree).toEqual([{ path: CARD, line: entry(2) }]);
+  });
+
+  it('refuses a source that deletes a file (unsupported), even when the combined commit matches it', () => {
+    const { cwd, base, branch } = repo();
+    const del = branch('del', () => rmSync(join(cwd, 'backlog/5473-other.md')));
+    const b = branch('b', () => writeFileSync(join(cwd, CARD), card([1, 2, 11])));
+    const combined = branch('c', () => { rmSync(join(cwd, 'backlog/5473-other.md')); writeFileSync(join(cwd, CARD), card([1, 2, 11])); });
+    const proof = verifyUnion({ base, combined, sources: [{ num: 1, headSha: del }, { num: 2, headSha: b }], cwd });
+    expect(proof.ok).toBe(false);
+    expect(proof.unsupported).toEqual(['backlog/5473-other.md deleted by a source']);
+    expect(proof.outside).toEqual([]);
+  });
+
+  it('refuses a combined commit that lost a whole source file', () => {
+    const { cwd, base, branch } = repo();
+    const a = branch('a', () => writeFileSync(join(cwd, 'backlog/5474-new.md'), card([3])));
+    const proof = verifyUnion({ base, combined: base, sources: [{ num: 1, headSha: a }], cwd });
+    expect(proof.ok).toBe(false);
+    expect(proof.missing).toEqual([{ path: 'backlog/5474-new.md', line: '(whole file)' }]);
+  });
 });
