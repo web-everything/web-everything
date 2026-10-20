@@ -19,12 +19,11 @@ function rig({ mode = 'shadow', lives = [], owed = [{ repo: 'o/r', prNumber: 7 }
   let live = lives[0] ?? 8;
   let liveThrows = false;
   let budgetNull = false;
-  const dispatchSpy = vi.fn();
   const runReview = vi.fn((opts) => {
     if (plan) return plan(opts);
     // stand-in for the pass: dispatch every owed row through the injected dispatch
     for (const o of owed) opts.dispatch({ repo: o.repo, pr: o.prNumber });
-    return {};
+    return { repos: [], failed: [], reconcileFailed: [] };
   });
   const r = createReviewRefill({
     runReview,
@@ -36,7 +35,7 @@ function rig({ mode = 'shadow', lives = [], owed = [{ repo: 'o/r', prNumber: 7 }
     clearTimer: () => {}, setPoll: () => ({ unref() {} }), clearPoll: () => {},
   });
   return {
-    r, logs, timers, runReview, dispatchSpy,
+    r, logs, timers, runReview,
     setLive: (n) => { live = n; }, advance: (ms) => { t += ms; }, setThrow: (b) => { liveThrows = b; }, setBudgetNull: (b) => { budgetNull = b; },
     fire: () => { const h = timers.shift(); h.fn(); },
   };
@@ -156,6 +155,45 @@ describe('fail closed', () => {
   });
 });
 
+describe('write-free plan and partial answers', () => {
+  it('a repo that failed to plan discards the whole answer', () => {
+    const h = rig({ plan: (opts) => { opts.dispatch({ repo: 'o/r', pr: 7 }); return { repos: [{ repo: 'x/y', error: 'boom' }], failed: [], reconcileFailed: [] }; } });
+    h.r.poll(); h.setLive(7); h.r.poll(); h.fire();
+    expect(h.logs.some((l) => l.includes('would dispatch'))).toBe(false);
+    expect(h.logs.some((l) => /partial or failed/.test(l))).toBe(true);
+    expect(h.r.lock.holder()).toBeNull();
+  });
+  it.each([
+    ['reconcileFailed', { repos: [], failed: [], reconcileFailed: [{ repo: 'x', error: 'e' }] }],
+    ['failed', { repos: [], failed: [{ error: 'e' }], reconcileFailed: [] }],
+    ['a non-object result', undefined],
+    ['a result without repos', {}],
+  ])('discards on %s', (_n, res) => {
+    const h = rig({ plan: (opts) => { opts.dispatch({ repo: 'o/r', pr: 7 }); return res; } });
+    h.r.poll(); h.setLive(7); h.r.poll(); h.fire();
+    expect(h.logs.some((l) => l.includes('would dispatch'))).toBe(false);
+  });
+  it('the reconcile override strips the evidence-cache write and the ledger journal, and keeps the lane reader off', () => {
+    const calls = {};
+    const rec = { rows: [] };
+    const o = shadowOverrides(rec, {
+      liveReviewBudget: { left: 1 },
+      runReconcile: (x) => { calls.reconcile = x; return { dispatch: [] }; },
+      readEvidence: (a) => { calls.evidence = a; return []; },
+      referral: (prs, x) => { calls.referral = x.readRuns(); return prs; },
+      ledgerStep: (prs, s) => { calls.step = s; return { prs, summary: null }; },
+      ledger: (prs, x) => x.step(prs, { repo: 'o/r' }),
+    });
+    o.reconcile({ repo: 'o/r', defaultBranch: 'main' });
+    expect(calls.reconcile.repo).toBe('o/r');
+    calls.reconcile.enrichReferralHolds([], { repo: 'o/r' });
+    expect(calls.evidence).toEqual({ persist: false });
+    calls.reconcile.enrichLedgerHolds([], { repo: 'o/r' });
+    expect(calls.step.journal()).toBeUndefined();
+    expect(o.acquirableLanes()).toBe(Infinity);
+  });
+});
+
 describe('single-flight with the pass', () => {
   it('the refill skips while a pass holds the lock and never plans', async () => {
     const h = rig();
@@ -192,7 +230,6 @@ describe('single-flight with the pass', () => {
     h.r.poll(); h.setLive(7); h.r.poll(); h.fire();
     await h.r.guardPass(async () => { passDispatch('o/r#7'); });
     expect(passDispatch).toHaveBeenCalledTimes(1);
-    expect(h.dispatchSpy).not.toHaveBeenCalled();
   });
 });
 

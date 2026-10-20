@@ -40,6 +40,9 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cascadePolicy } from '../../scripts/lib/policy-cascade.mjs';
+import { runReconcilePass, enrichPrsWithLedgerHolds } from '../../scripts/conveyor/reconcile-pass.mjs';
+import { enrichPrsWithReferralHolds, readReviewRunEvidence } from '../../scripts/conveyor/review-referral-hold.mjs';
+import { ledgerHoldStep } from '../../scripts/conveyor/review-hold-ledger-shadow.mjs';
 
 export const REFILL_MODES = Object.freeze(['off', 'shadow', 'on']);
 export const DEFAULT_DEBOUNCE_MS = 15_000;
@@ -90,8 +93,18 @@ export function createPassLock() {
   };
 }
 
-/** Side-effect-free option overrides for the pass's own `runReview`: the pass's plan, none of its actions. */
-export function shadowOverrides(recorder, { liveReviewBudget }) {
+/**
+ * Side-effect-free option overrides for the pass's own `runReview`: the pass's plan, none of its actions.
+ * Beyond the dispatch/tag/notify/refresh no-ops, the plan's own reads are made write-free too (audit round 1):
+ * the review-run evidence read skips its disk-cache write, the ledger hold step skips its shadow-journal append,
+ * and the lane reader (whose `list --acquirable` reaps dead leases) is replaced by "unbounded" - in shadow the
+ * live-round cap, which is the pass's own `liveReviewRoundBudget`, is the binding limit; lane availability is the
+ * ONE input the shadow does not check. Everything that decides eligibility (hold enrichers, priority, cap) is the
+ * pass's own code, called with the same arguments minus the writes.
+ */
+export function shadowOverrides(recorder, { liveReviewBudget, runReconcile = runReconcilePass,
+  referral = enrichPrsWithReferralHolds, readEvidence = readReviewRunEvidence,
+  ledger = enrichPrsWithLedgerHolds, ledgerStep = ledgerHoldStep } = {}) {
   const noop = () => {};
   return {
     liveReviewBudget,
@@ -101,6 +114,12 @@ export function shadowOverrides(recorder, { liveReviewBudget }) {
     statusCandidates: () => [],
     refreshScopeBloat: null, postRefreshMarker: null, promoteDrafts: null, notePromotions: null, onPlan: null,
     poolExhaustion: null, log: noop,
+    acquirableLanes: () => Infinity,
+    reconcile: (o) => runReconcile({
+      ...o,
+      enrichReferralHolds: (prs, x) => referral(prs, { ...x, readRuns: () => readEvidence({ persist: false }) }),
+      enrichLedgerHolds: (prs, x) => ledger(prs, { ...x, step: (p, s) => ledgerStep(p, { ...s, journal: noop }) }),
+    }),
   };
 }
 
@@ -118,7 +137,7 @@ export function createReviewRefill({
   runReview, budget, log = () => {}, settings = () => resolveRefillMode(), identify = null,
   now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout, setPoll = setInterval, clearPoll = clearInterval,
   debounceMs = DEFAULT_DEBOUNCE_MS, pollMs = DEFAULT_POLL_MS, minPlanGapMs = DEFAULT_MIN_PLAN_GAP_MS,
-  lock = createPassLock(),
+  lock = createPassLock(), overrideDeps = {},
 } = {}) {
   let prevLive = null;       // last known live-round count; null = unknown (seed on next good read)
   let freed = [];            // [{at, by}] slots freed and not yet matched to a would-dispatch
@@ -176,7 +195,11 @@ export function createReviewRefill({
       const b = budget();
       if (!b || !Number.isFinite(b.left) || b.left <= 0) return []; // unknown or full: fail closed
       const recorder = { rows: [] };
-      runReview(shadowOverrides(recorder, { liveReviewBudget: b }));
+      const res = runReview(shadowOverrides(recorder, { liveReviewBudget: b, ...overrideDeps }));
+      // Any repo that failed to plan makes the whole answer partial: discard it and wait for the pass.
+      const partial = !res || typeof res !== 'object' || !Array.isArray(res.repos)
+        || res.repos.some((x) => x?.error) || (res.reconcileFailed?.length ?? 0) > 0 || (res.failed?.length ?? 0) > 0;
+      if (partial) { log('refill-shadow: plan was partial or failed for a repo, waiting for the pass'); return []; }
       rows = recorder.rows.filter((r) => !would.has(`${r.repo}#${r.prNumber}`)).slice(0, freed.length);
       for (const r of rows) {
         const slot = freed.shift();
