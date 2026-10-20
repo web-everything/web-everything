@@ -140,6 +140,31 @@ describe('buildCombined + verifyUnion (real git)', () => {
     expect(sourceLanded({ ref: swapped, source: { num: 1, headSha: a }, cwd }).ok).toBe(false);
   });
 
+  it('a reorder a source made is protected: the union keeping the old order refuses', () => {
+    const { cwd, base, branch } = repo();
+    const a = branch('a', () => writeFileSync(join(cwd, CARD), card([2, 1])));          // reorders existing entries
+    const b = branch('b', () => writeFileSync(join(cwd, CARD), card([1, 2, 11])));
+    const sources = [{ num: 1, headSha: a }, { num: 2, headSha: b }];
+    const built = buildCombined({ base, sources, cwd, resolveEnabled: true });
+    if (built.ok) expect(verifyUnion({ base, combined: built.commit, sources, cwd }).ok).toBe(false);
+    const undone = branch('undone', () => writeFileSync(join(cwd, CARD), card([1, 2, 11])));  // keeps the old order
+    expect(verifyUnion({ base, combined: undone, sources, cwd }).order.length).toBeGreaterThan(0);
+    expect(sourceLanded({ ref: undone, source: { num: 1, headSha: a }, cwd }).ok).toBe(false);
+  });
+
+  it('a git read error is never read as "file absent" (deleted-file source is not declared landed)', () => {
+    const { cwd, base, branch } = repo();
+    const del = branch('del', () => { rmSync(join(cwd, 'backlog/5473-other.md')); });
+    const run = (cmd, args, o = {}) => {
+      if (args[0] === 'ls-tree' && args[1] === base) return { status: 128, stdout: '', stderr: 'fatal: read error' };
+      try { return { status: 0, stdout: execFileSync(cmd, args, { cwd, encoding: 'utf8', input: o.input }), stderr: '' }; }
+      catch (e) { return { status: e.status ?? 1, stdout: String(e.stdout ?? ''), stderr: String(e.stderr ?? '') }; }
+    };
+    expect(sourceLanded({ ref: base, source: { num: 1, headSha: del }, cwd, run })).toMatchObject({ ok: false });
+    expect(sourceLanded({ ref: base, source: { num: 1, headSha: del }, cwd })).toMatchObject({ ok: false, reason: expect.stringMatching(/still on main/) });
+    expect(sourceLanded({ ref: del, source: { num: 1, headSha: del }, cwd }).ok).toBe(true);
+  });
+
   it('verifyUnion catches a lost line, an extra line and a resurrected deletion', () => {
     const { cwd, base, branch } = repo();
     const a = branch('a', () => writeFileSync(join(cwd, CARD), card([1, 10])));      // deletes 2, adds 10

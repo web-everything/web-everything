@@ -272,6 +272,20 @@ const splitLines = text => { const a = String(text ?? '').split('\n'); if (a.len
 const countOf = arr => { const m = new Map(); for (const l of arr) m.set(l, (m.get(l) ?? 0) + 1); return m; };
 /** PURE: `needle` appears in `hay` in the same order (not necessarily adjacent). */
 export const isSubsequence = (needle, hay) => { let i = 0; for (const l of hay) if (i < needle.length && l === needle[i]) i++; return i === needle.length; };
+/**
+ * IO: a file's normalized lines at `ref`, or null when the path is ABSENT there. Absence is proven by an
+ * empty `ls-tree`; any git failure (ls-tree or show) THROWS, so a read error can never pass as "absent".
+ */
+function readAt({ ref, path, cwd, run, norm }) {
+  const ls = run('git', ['ls-tree', ref, '--', path], { cwd });
+  if (ls.status !== 0) throw new Error(`ls-tree ${String(ref).slice(0, 10)} ${path} failed`);
+  if (!String(ls.stdout ?? '').trim()) return null;
+  const r = run('git', ['show', `${ref}:${path}`], { cwd });
+  if (r.status !== 0) throw new Error(`show ${String(ref).slice(0, 10)}:${path} failed`);
+  return splitLines(r.stdout).map(norm);
+}
+/** PURE: `head`'s lines (in order) that `target` still has — the order a source wants kept. */
+const keptOrder = (head, target) => { const have = new Set(target); return head.filter(l => have.has(l)); };
 
 /**
  * IO: one source's per-file change as ordered line multisets, after JIT reference normalisation.
@@ -288,12 +302,11 @@ function sourceChange({ onto, headSha, cwd, run, norm }) {
   const plus = parseDiffLines(d.stdout);
   const out = new Map();
   for (const path of lines(names)) {
-    const at = ref => { const r = run('git', ['show', `${ref}:${path}`], { cwd }); return r.status === 0 ? splitLines(r.stdout).map(norm) : null; };
-    const fromLines = at(mb) ?? [], toLines = at(headSha);
+    const fromLines = readAt({ ref: mb, path, cwd, run, norm }) ?? [], toLines = readAt({ ref: headSha, path, cwd, run, norm });
     if (toLines === null) { out.set(path, { deletedFile: true }); continue; }
     const from = countOf(fromLines), to = countOf(toLines);
     const addedSeq = (plus.get(path)?.added ?? []).map(norm).filter(l => (to.get(l) ?? 0) > (from.get(l) ?? 0));
-    out.set(path, { from, to, addedSeq });
+    out.set(path, { from, to, addedSeq, head: toLines });
   }
   return out;
 }
@@ -310,7 +323,7 @@ function sourceChange({ onto, headSha, cwd, run, norm }) {
  */
 export function verifyUnion({ base, combined, sources, cwd, run = gitRun, referenceMap = new Map() } = {}) {
   const norm = t => mapHashReferences(t, h => referenceMap.get(h) ?? h);
-  const at = (ref, path) => { const r = run('git', ['show', `${ref}:${path}`], { cwd }); return r.status === 0 ? splitLines(r.stdout).map(norm) : null; };
+  const at = (ref, path) => readAt({ ref, path, cwd, run, norm });
   const missing = [], extra = [], deleted = [], resurrected = [], disagree = [], order = [], outside = [], unsupported = [];
   const perFile = [];
   const changes = sources.map(s => ({ s, change: sourceChange({ onto: base, headSha: s.headSha, cwd, run, norm }) }));
@@ -332,7 +345,9 @@ export function verifyUnion({ base, combined, sources, cwd, run = gitRun, refere
         if (t > f) up.set(l, Math.max(up.get(l) ?? 0, t));
         if (t < f) down.set(l, Math.min(down.get(l) ?? Infinity, t));
       }
-      if (!isSubsequence(ch.addedSeq, C)) order.push({ path, source: changes.find(x => x.change === change).s.num });
+      // Order: the source's WHOLE head order (not only its added lines) must survive, so a reorder it made, or
+      // one the union undid, refuses.
+      if (!isSubsequence(ch.addedSeq, C) || !isSubsequence(keptOrder(ch.head, C), C)) order.push({ path, source: changes.find(x => x.change === change).s.num });
     }
     const keep = new Map();
     let added = 0, wanted = 0;
@@ -366,16 +381,17 @@ export function sourceLanded({ ref, source, cwd, run = gitRun, referenceMap = ne
   try { change = sourceChange({ onto: ref, headSha: source.headSha, cwd, run, norm }); }
   catch (e) { return { ok: false, reason: firstLine(e) }; }
   for (const [path, ch] of change) {
-    const show = run('git', ['show', `${ref}:${path}`], { cwd });
-    if (ch.deletedFile) { if (show.status === 0) return { ok: false, reason: `${path} still on main` }; continue; }
-    if (show.status !== 0) return { ok: false, reason: `${path} missing on main` };
-    const R = splitLines(show.stdout).map(norm), r = countOf(R);
+    let R;
+    try { R = readAt({ ref, path, cwd, run, norm }); } catch (e) { return { ok: false, reason: firstLine(e) }; }
+    if (ch.deletedFile) { if (R !== null) return { ok: false, reason: `${path} still on main` }; continue; }
+    if (R === null) return { ok: false, reason: `${path} missing on main` };
+    const r = countOf(R);
     for (const l of new Set([...ch.from.keys(), ...ch.to.keys()])) {
       const f = ch.from.get(l) ?? 0, t = ch.to.get(l) ?? 0, have = r.get(l) ?? 0;
       if (t > f && have < t) return { ok: false, reason: `a line of ${path} is not on main` };
       if (t < f && have > t) return { ok: false, reason: `a line ${path} removes is still on main` };
     }
-    if (!isSubsequence(ch.addedSeq, R)) return { ok: false, reason: `lines of ${path} are on main in a different order` };
+    if (!isSubsequence(ch.addedSeq, R) || !isSubsequence(keptOrder(ch.head, R), R)) return { ok: false, reason: `lines of ${path} are on main in a different order` };
   }
   return { ok: true };
 }
