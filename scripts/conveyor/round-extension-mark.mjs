@@ -11,7 +11,7 @@
  * listed repo, a head proven card-only, and at most `maxPerPr` such grants per PR (later ones never count). With no
  * `standingRuling` (every caller that does not verify one), an automation-posted grant is never trusted.
  */
-import { isAutomationAuthored, isOperatorAuthored, OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
+import { isAutomationAuthored, isOperatorAuthored, isTrustedMarkerAuthor, OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 
 export const ROUND_EXTENSION_MARKER = '➕ conveyor — review round extension granted';
@@ -113,6 +113,7 @@ export function countStandingRulingGrantRecords(comments, { repo, pr }) {
   const slug = (value) => CONSTELLATION_REPOS[value]?.slug ?? value;
   let total = 0;
   for (const comment of Array.isArray(comments) ? comments : []) {
+    if (!isTrustedMarkerAuthor(comment)) continue;
     // Only the automation's own comments can ever become standing-ruling grants; anyone else's never consumes room.
     if (isOperatorAuthored(comment) || !isAutomationAuthored(comment)
       || typeof comment?.body !== 'string' || !comment.body.startsWith(ROUND_EXTENSION_MARKER + '\n')) continue;
@@ -135,6 +136,7 @@ export function standingRulingGrantEpisodes(comments, { repo, pr }) {
   const episodes = [];
   let unrecoverable = 0;
   for (const comment of Array.isArray(comments) ? comments : []) {
+    if (!isTrustedMarkerAuthor(comment)) continue;
     if (isOperatorAuthored(comment) || !isAutomationAuthored(comment)
       || typeof comment?.body !== 'string' || !comment.body.startsWith(ROUND_EXTENSION_MARKER + '\n')) continue;
     for (const m of comment.body.matchAll(/^<!-- round-extension: (.+) -->$/gm)) {
