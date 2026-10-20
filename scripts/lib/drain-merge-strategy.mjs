@@ -690,7 +690,7 @@ export function createDrainMergeStrategy({
      * `{kind, reason}` = held; `null` = no recorded red-team hold on this head (it may still enqueue, so waiters
      * keep yielding). Throws when it cannot tell; the caller then keeps today's yield (fail closed).
      * Never writes state, labels, refs or requests: it runs enqueue's own red-team rule on GitHub reads only.
-     * The card-only relief comes from the listed files (no git fetch); when that cannot settle the answer, it throws. */
+     * Card-only relief and request state are tried both ways; a split answer throws (keeps the yield). */
     yieldTargetHold(c, headSha) {
       if (!enqueues(c.repo) || !safety.value.waitForRedTeamBeforeEnqueue) return null;
       if (!headSha) throw new Error('yield target has no head sha');
@@ -698,8 +698,8 @@ export function createDrainMergeStrategy({
       if (state.unreadable) throw new Error(`follow-up state ${statePath} is unreadable`);
       const rows = state.redTeamPending || {};
       const keys = [keyOf(c.repo, c.num), keyOf(null, c.num), keyOf(localSlug, c.num)];
-      const pending = keys.map(k => rows[k]).find(p => p?.headSha === headSha);
-      if (!pending) return null;
+      const onHead = keys.map(k => rows[k]).filter(p => p?.headSha === headSha);
+      if (!onHead.length) return null;
       const live = readLive(c.repo, c.num);
       if (live.headRefOid !== headSha || !Array.isArray(live.labels)) throw new Error('live head or labels do not match the listed state');
       const sent = sendBackReason(live.labels);
@@ -707,22 +707,32 @@ export function createDrainMergeStrategy({
       const evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env });
       const pages = readThreadPages(c.repo, c.num);
       if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team comments unreadable');
-      const { sameHead, neverScheduled } = redTeamRequestEligibility(c, headSha, live, evidence, pending);
-      const requestPending = neverScheduled || (sameHead && pending.requestedAt != null);
-      const reasonWith = (realFilesCardOnly) => redTeamEnqueueHold({ ...evidence, realFilesCardOnly, requestPending,
-        comments: pages.flat(), repo: slugOf(c.repo), pr: c.num, head: headSha, env });
-      // restampCardOnly's own short-circuit: with this evidence the git read never happens and the value is false.
+      // No agent/job listing here: those readers prune records and write caches. Instead every input the probe
+      // cannot read for free is tried both ways, and the target counts as blocked only when EVERY variant holds.
+      // A split answer is unknown and throws, so the caller keeps the yield (fail closed).
+      // Every record enqueue might read (cwd# or owner/name#) must agree before the request state counts as settled.
+      const requestFixed = onHead.every(p => p.requestedAt != null);
       const settled = evidence.recorded || evidence.attempted || evidence.inFlight || evidence.queued
         || evidence.loopPayload?.findings?.read?.netBasis?.rev?.toLowerCase() === headSha.toLowerCase();
-      const listed = c.listedFilesComplete === true && Array.isArray(c.listedFiles) && c.listedFiles.length > 0 ? c.listedFiles : null;
-      let reason;
-      if (settled || (listed && !isCardOnlyDiff(listed))) reason = reasonWith(false);
-      else {
-        const a = reasonWith(false); const b = reasonWith(true);
-        if (!!a !== !!b) throw new Error('card-only relief needs a git read');
-        reason = a;
+      const variants = [];
+      for (const requestPending of requestFixed ? [true] : [false, true]) {
+        for (const realFilesCardOnly of settled ? [false] : [false, true]) {
+          variants.push(redTeamEnqueueHold({ ...evidence, realFilesCardOnly, requestPending,
+            comments: pages.flat(), repo: slugOf(c.repo), pr: c.num, head: headSha, env }));
+        }
       }
-      return reason ? { kind: 'red-team-pending', reason } : null;
+      const held = variants.filter(Boolean).length;
+      if (held && held !== variants.length) throw new Error('red-team hold depends on state this read-only probe cannot settle');
+      const reason = held ? variants[0] : null;
+      if (!reason) return null;
+      // Blocked only where enqueue's own path certainly stops: a send-back class reason, a request already made,
+      // a saved/attempted/untrusted result, or the never-scheduled escape switched off. Any other held reason can
+      // still reach that escape and enqueue, so it is unknown (keep the yield).
+      const stops = reason.includes('requiring send-back') || reason.includes('saved red-team re-check incomplete')
+        || requestFixed || evidence.untrustedSavedResult || evidence.recorded || evidence.attempted
+        || safety.value.enqueueWhenRedTeamNeverScheduled === false;
+      if (!stops) throw new Error('red-team hold may still take the never-scheduled enqueue escape');
+      return { kind: 'red-team-pending', reason };
     },
     enqueue(c, headSha, { comments = null, prepared = null, holdOnly = false } = {}) {
       if (!enqueues(c.repo)) throw new Error('enqueue called for a repo outside github-merge-queue');

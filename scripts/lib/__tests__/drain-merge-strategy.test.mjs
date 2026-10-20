@@ -647,29 +647,40 @@ describe('recorded hold read-only admission', () => {
   });
 
   describe('yieldTargetHold (overlap-yield target eligibility, read-only)', () => {
+    const requested = (k = key, extra = {}) => ({ pending: [], followedUp: [], redTeamPending: { [k]: { ...initial().redTeamPending[key], requestedAt: 500, ...extra } } });
     const run = (opts) => {
-      let stored = opts.state ?? initial();
+      let stored = opts.state ?? requested();
       const writes = []; const requests = [];
       const h = reader({ state: () => stored, write: value => { writes.push(value); stored = value; },
         request: value => { requests.push(value); return { requested: true }; }, ...opts });
-      return { h, writes, requests, stored: () => stored };
+      return { h, writes, requests };
     };
-    it('a recorded red-team wait on the live head with no result is a blocking hold — and nothing is written', () => {
-      const r = run({ evidence: { scheduled: true, inFlight: true } });
-      // even an expired backoff (retryAt 0) still reports the hold: eligibility, not the refresh schedule
+    const inFlight = { scheduled: true, inFlight: true };
+    it('a requested red-team wait on the live head with no result is a blocking hold — and nothing is written', () => {
+      const r = run({ evidence: inFlight });
       expect(r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toMatchObject({ kind: 'red-team-pending' });
       expect(r.writes).toEqual([]); expect(r.requests).toEqual([]); expect(r.h.mutations).toEqual([]);
     });
-    it('the wait is found under the slug key too (cwd vs owner/name keys both occur)', () => {
-      const r = run({ state: { pending: [], followedUp: [], redTeamPending: { [`${LOCAL}#5283`]: initial().redTeamPending[key] } }, evidence: { scheduled: true, inFlight: true } });
-      expect(r.h.s.yieldTargetHold({ num: 5283, repo: LOCAL }, HEAD)).toMatchObject({ kind: 'red-team-pending' });
+    it.each([[`${LOCAL}#5283`, LOCAL], [`${LOCAL}#5283`, null], ['cwd#5283', LOCAL]])('finds the wait under alias %s (repo %s)', (k, repoArg) => {
+      const r = run({ state: requested(k), evidence: inFlight });
+      expect(r.h.s.yieldTargetHold({ num: 5283, repo: repoArg }, HEAD)).toMatchObject({ kind: 'red-team-pending' });
     });
-    it('no recorded wait on THIS head ⇒ not blocked (the target may still enqueue, so waiters keep yielding)', () => {
-      const r = run({ state: { pending: [], followedUp: [], redTeamPending: { [key]: { ...initial().redTeamPending[key], headSha: 'f'.repeat(40) } } }, evidence: { scheduled: true, inFlight: true } });
+    it('aliases that disagree on the request state are unknown (throws — keep yielding)', () => {
+      const st = requested();
+      st.redTeamPending[`${LOCAL}#5283`] = { ...initial().redTeamPending[key] }; // no requestedAt
+      const r = run({ state: st, evidence: { scheduled: false, loopPayload: { verdict: { verdict: 'accept' } } } });
+      expect(() => r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toThrow();
+    });
+    it('a held reason that could still take the never-scheduled enqueue escape is unknown (throws)', () => {
+      const r = run({ state: { pending: [], followedUp: [], redTeamPending: initial().redTeamPending }, evidence: inFlight });
+      expect(() => r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toThrow(/never-scheduled/);
+    });
+    it('no recorded wait on THIS head ⇒ not blocked (waiters keep yielding)', () => {
+      const r = run({ state: requested(key, { headSha: 'f'.repeat(40) }), evidence: inFlight });
       expect(r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toBeNull();
     });
-    it('a live head that moved is unknown — it throws so the caller keeps the yield (fail closed)', () => {
-      const r = run({ head: 'a'.repeat(40), evidence: { scheduled: true, inFlight: true } });
+    it('a live head that moved is unknown — it throws so the caller keeps the yield', () => {
+      const r = run({ head: 'a'.repeat(40), evidence: inFlight });
       expect(() => r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toThrow(/live head/);
     });
     it('an unreadable follow-up state throws (fail closed)', () => {
@@ -677,11 +688,16 @@ describe('recorded hold read-only admission', () => {
         queueSafety: { value: { waitForRedTeamBeforeEnqueue: true } }, log: { write: () => {} }, readFile: () => '{not json' });
       expect(() => s.yieldTargetHold({ num: 5283 }, HEAD)).toThrow(/unreadable/);
     });
-    it('never runs git (no fetch): card-only relief comes from the listed files', () => {
-      const gitCalls = [];
+    it('a sent-back target is blocked (sent-back)', () => {
+      const r = run({ labels: ['review:changes'], evidence: inFlight });
+      expect(r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toMatchObject({ kind: 'sent-back' });
+    });
+    it('strictly read-only: never runs git, never lists agents/jobs, and an unsettled card-only answer is unknown, not blocked', () => {
+      const gitCalls = []; const agentReads = [];
       const s = createDrainMergeStrategy({ localSlug: LOCAL, statePath: 'x', resolved: policyOf('github-merge-queue'),
         env: { WE_RED_TEAM_TIMING: 'post-accept' }, queueSafety: { value: { waitForRedTeamBeforeEnqueue: true } }, log: { write: () => {} },
-        readFile: () => JSON.stringify(initial()), writeState: () => { throw new Error('write'); },
+        readFile: () => JSON.stringify(requested()), writeState: () => { throw new Error('write'); },
+        readReviewAgents: () => { agentReads.push(1); return []; },
         readRedTeamEvidence: () => ({ scheduled: false, loopPayload: { verdict: { verdict: 'accept' } } }),
         exec: (cmd, args) => {
           if (cmd === 'git') { gitCalls.push(args); throw new Error('git must not run'); }
@@ -689,21 +705,12 @@ describe('recorded hold read-only admission', () => {
           if (args.includes('--slurp')) return '[[]]';
           return '{}';
         } });
-      const c = { num: 5283, headRef: 'lane/x', listedFiles: ['scripts/merge-ai-prs.mjs'], listedFilesComplete: true };
-      expect(() => s.yieldTargetHold(c, HEAD)).not.toThrow();
+      let out; let threw = null;
+      try { out = s.yieldTargetHold({ num: 5283, headRef: 'lane/x' }, HEAD); } catch (e) { threw = e; }
       expect(gitCalls).toEqual([]);
-    });
-    it.each([['cwd#5283', LOCAL], [`${LOCAL}#5283`, null]])('uses the MATCHED pending record (alias %s) for request state', (stored, repoArg) => {
-      const rec = { ...initial().redTeamPending[key], requestedAt: 500 };
-      const r = run({ state: { pending: [], followedUp: [], redTeamPending: { [stored]: rec } },
-        evidence: { scheduled: false, loopPayload: { verdict: { verdict: 'accept' } } } });
-      const out = r.h.s.yieldTargetHold({ num: 5283, repo: repoArg, listedFiles: ['scripts/a.mjs'], listedFilesComplete: true }, HEAD);
-      expect(out).toMatchObject({ kind: 'red-team-pending' });
-      expect(r.writes).toEqual([]);
-    });
-    it('a sent-back target is blocked (sent-back)', () => {
-      const r = run({ labels: ['review:changes'], evidence: { scheduled: true, inFlight: true } });
-      expect(r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toMatchObject({ kind: 'sent-back' });
+      expect(agentReads).toEqual([]);
+      // Either every variant agrees on a definite stop, or the probe says it cannot tell. Never a guessed "blocked".
+      if (!threw) expect(out === null || out.kind === 'red-team-pending').toBe(true);
     });
   });
 

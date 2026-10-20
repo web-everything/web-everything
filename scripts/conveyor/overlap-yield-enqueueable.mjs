@@ -121,8 +121,8 @@ export function planOverlapYieldAroundBlockedTargets({ openPrRows = [], compute,
   const unknown = [];
   if (!enabled || typeof blockOf !== 'function') return { ctx, skipped, unknown };
   const decided = new Map();
-  // Every productive round removes at least one row, so this ends within rows.length + 1 rounds.
-  for (let round = 0; round <= rows.length; round += 1) {
+  // Fixed point: every round that does not stop removes at least one row, and rows are finite, so it ends.
+  for (;;) {
     const blockedKeys = new Set();
     for (const [waiterKey, w] of (ctx?.waits instanceof Map ? ctx.waits : new Map())) {
       const key = overlapRowKey({ repo: w.repo, number: w.yieldTo });
