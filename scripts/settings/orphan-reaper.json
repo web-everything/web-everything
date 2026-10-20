@@ -1,0 +1,15 @@
+{
+  "$comment": "Orphan-process reaper (scripts/conveyor/orphan-process-reaper.mjs), a health-watch pass. Reaps ONLY orphaned (ppid 1) processes of this user that match its closed allowlist of our own job signatures and are older than that signature's max age (minutes). Ships in dry-run: it logs what it would reap to <health dir>/orphan-reaper.jsonl. Set dryRun to false to let it signal (SIGTERM, then SIGKILL after termGraceSeconds). Env override: WE_ORPHAN_REAPER_<KEY>, e.g. WE_ORPHAN_REAPER_DRY_RUN=0.",
+  "orphanReaper": {
+    "enabled": true,
+    "dryRun": true,
+    "intervalMinutes": 10,
+    "termGraceSeconds": 5,
+    "keepAliveMaxAgeMinutes": 10,
+    "vitestFixtureMaxAgeMinutes": 30,
+    "vitestMaxAgeMinutes": 120,
+    "verifyLaneMaxAgeMinutes": 120,
+    "codexTaskMaxAgeMinutes": 120,
+    "reviewJobMaxAgeMinutes": 180
+  }
+}

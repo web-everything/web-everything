@@ -47,7 +47,7 @@ const DENIED = [
   "perl -e 'while(1){sleep 1}'",
   "python3 -c 'import time\nwhile 1: time.sleep(1)'",
   "ruby -e 'loop { sleep 1 }'",
-  "node -e 'setInterval(()=>{},1000)'",
+  "node -e 'setInterval(()=>{},1000)'", // keepalive-guard: not-a-spawn (a bash command string under test)
   "php -r 'while(1){sleep(1);}'",
   // — other interpreters / nested carriers
   "ruby -e 'sleep 100'",

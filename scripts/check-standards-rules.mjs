@@ -4616,3 +4616,36 @@ export function findUnjournaledLaneMutations(files) {
   }
   return findings;
 }
+
+// ── Unmanaged keep-alive children (keep-alive leak fix, 2026-10-20) ────────────────────────────────────────
+// Live-caught: 154 orphaned `node -e` empty-callback setInterval processes (1e9 and 1000 ms), up to 19 days old,
+// ~864 MB. A bare empty-callback interval never exits on its own, so a child built from one outlives any
+// test or soak run that fails to kill it. `scripts/lib/test-keepalive.mjs` is the one home: its children watch
+// an anchor pid and have a hard max lifetime. This scan flags the idiom anywhere else under scripts/,
+// skills-src/ or tools/. A line that only MENTIONS the idiom (e.g. a bash command string under test, never
+// run) carries the `keepalive-guard: not-a-spawn` marker on the same line.
+export const KEEPALIVE_HELPER_PATH = 'scripts/lib/test-keepalive.mjs';
+export const KEEPALIVE_SCAN_DIRS = ['scripts', 'skills-src', 'tools'];
+export const KEEPALIVE_NOT_A_SPAWN_MARKER = 'keepalive-guard: not-a-spawn';
+/** An idle interval: `setInterval` (optional space) whose callback is an empty arrow or an empty function,
+ *  across line breaks too. Matched on whole file contents, never line by line. */
+export const EMPTY_INTERVAL_RE = /setInterval\s*\(\s*(?:\(\s*\)\s*=>\s*\{\s*\}|(?:async\s+)?function\s*\w*\s*\(\s*\)\s*\{\s*\})\s*,/g;
+/** The exemption: a `//` line comment ENDING the line the match starts on (not text anywhere in the line). */
+const NOT_A_SPAWN_COMMENT = /\/\/\s*keepalive-guard: not-a-spawn\b[^'"`]*$/;
+
+/** PURE: `files` = [{ file, content }] → the idle-interval keep-alives outside the helper, with line numbers. */
+export function findUnmanagedKeepAlives(files) {
+  const findings = [];
+  for (const { file, content } of files ?? []) {
+    if (file === KEEPALIVE_HELPER_PATH) continue;
+    const text = String(content ?? '');
+    for (const m of text.matchAll(new RegExp(EMPTY_INTERVAL_RE.source, 'g'))) {
+      const lineStart = text.lastIndexOf('\n', m.index) + 1;
+      const lineEnd = text.indexOf('\n', m.index);
+      const lineText = text.slice(lineStart, lineEnd === -1 ? undefined : lineEnd);
+      if (NOT_A_SPAWN_COMMENT.test(lineText)) continue;
+      findings.push({ file, line: text.slice(0, m.index).split('\n').length, text: lineText.trim() });
+    }
+  }
+  return findings;
+}

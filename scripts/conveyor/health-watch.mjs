@@ -42,6 +42,7 @@
  *   node scripts/conveyor/health-watch.mjs unsilence --smell=ID [--subject=S]
  */
 import { sweepReviewTmp, probeDiskSpace } from './review-tmp-health.mjs';
+import { runOrphanReaperPass, resolveOrphanReaperSettings, orphanReaperTickAllowed } from './orphan-process-reaper.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { superviseNeedsYouFeed } from './needs-you-feed-job.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
@@ -1119,6 +1120,18 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     ? await attempt('claudeJobsArchive', () => archiveClaudeJobs(archiveOptions(config, flags, now)))
     : null;
 
+  // Orphan-process reaper (2026-10-20: 154 orphaned test keep-alives, up to 19 days old) — lost processes our own
+  // jobs left behind, closed allowlist only; its own cadence + dry-run live in scripts/settings/orphan-reaper.json.
+  let orphanReaper = null;
+  if (orphanReaperTickAllowed(flags, { injected: !!deps.runOrphanReaperPass })) {
+    orphanReaper = await attempt('orphanReaper', async () => {
+      const settings = resolveOrphanReaperSettings({ config });
+      if (settings.errors.length) probeErrors.orphanReaperConfig = scrubText(settings.errors.join('; '));
+      return (deps.runOrphanReaperPass ?? runOrphanReaperPass)({ now, state: prev.orphanReaper, settings,
+        forceDryRun: !!flags['dry-run'], logPath: join(dir, 'orphan-reaper.jsonl') });
+    });
+  }
+
   // Card 335 — queue movement reads beside the archive cadence; never block a health tick.
   const prSweepSettings = resolvePrSweepSettings({ config });
   const prSweepJob = prSweepTickAllowed(flags, prSweepSettings.value)
@@ -1364,6 +1377,8 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   const state = scrubDeep(result.state);
   if (claudeJobsArchive) state.claudeJobsArchive = { at: now, ...(claudeJobsArchive.complete ? { completedAt: now } : {}), ...claudeJobsArchive };
   else if (prev.claudeJobsArchive) state.claudeJobsArchive = prev.claudeJobsArchive;
+  if (orphanReaper?.result) state.orphanReaper = orphanReaper.state;
+  else if (prev.orphanReaper) state.orphanReaper = prev.orphanReaper;
   if (prSweepJob) state.prSweep = prSweepJob.state;
   else if (prev.prSweep) state.prSweep = prev.prSweep;
   if (!flags['state-root'] && !flags['dry-run']) {
