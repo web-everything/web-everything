@@ -277,7 +277,7 @@ describe('runReviewTick — the per-tick sequence', () => {
     expect(tagRound).toHaveBeenCalledWith({ pr: 10, repo: expect.any(String), round: 2 }); // attempts+1
     expect(out).toEqual({
       reviewsOwed: 1, dispatched: [{ prNumber: 10, agentId: 'agent-10' }], failed: [], notStarted: [], refusals: 0,
-      pendingNotDispatched: [], reconcileError: null, deferredForLanes: 0, deferredForAuth: 0, authPaused: false, authPauseReason: null,
+      pendingNotDispatched: [], reconcileError: null, deferredForLanes: 0, deferredForCap: 0, deferredForCapReason: null, deferredForAuth: 0, authPaused: false, authPauseReason: null,
       staleStatusSwept: [], staleConflictStatusCleared: [],
       holdReconcile: [], holdReconcileError: null, liveProcessPrs: [], operatorHolds: { observedAt: 7, holds: [] },
     });
