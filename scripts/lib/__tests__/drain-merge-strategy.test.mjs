@@ -650,11 +650,12 @@ describe('recorded hold read-only admission', () => {
     const rec = (extra = {}) => ({ ...initial().redTeamPending[key], requestedAt: 500, ...extra });
     // A local target: enqueue may read either cwd# or owner/name#, so a settled answer needs both.
     const requested = (extra = {}) => ({ pending: [], followedUp: [], redTeamPending: { [key]: rec(extra), [`${LOCAL}#5283`]: rec(extra) } });
-    const run = (opts) => {
-      let stored = opts.state ?? requested();
+    // `state` is the stored OBJECT here; reader() wants a getter, so it must not be spread over the getter.
+    const run = ({ state: initialState, ...opts }) => {
+      let stored = initialState ?? requested();
       const writes = []; const requests = [];
-      const h = reader({ state: () => stored, write: value => { writes.push(value); stored = value; },
-        request: value => { requests.push(value); return { requested: true }; }, ...opts });
+      const h = reader({ ...opts, state: () => stored, write: value => { writes.push(value); stored = value; },
+        request: value => { requests.push(value); return { requested: true }; } });
       return { h, writes, requests };
     };
     const inFlight = { scheduled: true, inFlight: true };
@@ -675,13 +676,15 @@ describe('recorded hold read-only admission', () => {
     });
     it('reads red-team evidence with an explicit, migration-free runs dir', () => {
       const seen = [];
+      vi.stubEnv('OPERATION_RUNS_DIR', '/tmp/we-yield-probe-runs');
       const s2 = createDrainMergeStrategy({ localSlug: LOCAL, statePath: 'x', resolved: policyOf('github-merge-queue'),
         env: { WE_RED_TEAM_TIMING: 'post-accept' }, queueSafety: { value: { waitForRedTeamBeforeEnqueue: true } }, log: { write: () => {} },
         readFile: () => JSON.stringify(requested()), readRedTeamEvidence: (a) => { seen.push(a); return inFlight; },
-        exec: (_c, args) => (args[0] === 'pr' ? JSON.stringify({ headRefOid: HEAD, labels: ['review:accepted'] }) : args.includes('--slurp') ? '[[]]' : '{}') });
+        exec: (_c, args) => (args[0] === 'pr' ? JSON.stringify({ headRefOid: HEAD, labels: ['review:accepted', 'ready-to-merge'] }) : args.includes('--slurp') ? '[[]]' : '{}') });
       s2.yieldTargetHold({ num: 5283 }, HEAD);
       expect(seen).toHaveLength(1);
-      expect(typeof seen[0].runsDir).toBe('string');
+      expect(seen[0].runsDir).toBe('/tmp/we-yield-probe-runs');
+      vi.unstubAllEnvs();
     });
     it('aliases that disagree on the request state are unknown (throws — keep yielding)', () => {
       const st = requested();
