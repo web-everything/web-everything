@@ -44,7 +44,7 @@ export default {
         const cycle = async () => {
           work++;
           // Only work after the failed refresh is unsafe. The earlier successful cycle is a control.
-          if (refreshes >= failAt) spawnSync('gh', ['repo', 'view'], { env, timeout: 2000 });
+          if (refreshes >= failAt) spawnSync('gh', ['repo', 'view'], { env, timeout: 2000, stdio: 'ignore' });
           return { code: 0 };
         };
         try {
