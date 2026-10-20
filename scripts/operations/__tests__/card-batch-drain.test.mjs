@@ -153,6 +153,8 @@ describe('runDrainJob (the detached job)', () => {
 
   it('runs the owed filings with the scoped state dir', async () => {
     const f = fixture({ pending: false });
+    mkdirSync(join(f.stateDir, 'owed-prevention'));
+    writeFileSync(join(f.stateDir, 'owed-prevention', `${'b'.repeat(64)}.json`), JSON.stringify({ status: 'owed' }));
     const fileOwed = vi.fn(async () => ({ ok: true }));
     const owedStep = vi.fn(async ({ file }) => [await file({ title: 't' })]);
     await runDrainJob({ stateDir: f.stateDir, fileOwed, owedStep, loadFilingSettings: settings, log: () => {} });
