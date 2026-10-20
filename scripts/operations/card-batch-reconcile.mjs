@@ -33,7 +33,6 @@ export async function reconcileCardBatches({
   let files;
   try { files = readdirSync(stateDir, { withFileTypes: true }); }
   catch (error) { if (error.code === 'ENOENT') files = []; else throw error; }
-  let drainNeeded = false;
   if (basename(resolve(stateDir)) === 'sealed') return results;
   for (const file of files.filter(file => file.isFile() && file.name.endsWith('.json'))) {
     const statePath = join(stateDir, file.name);
@@ -45,7 +44,6 @@ export async function reconcileCardBatches({
         if (!lease) { results.push({ statePath, action: 'refuse', reason: 'lease-held' }); continue; }
       }
       const state = JSON.parse(readFileSync(statePath, 'utf8'));
-      if (!state.batchRef || !state.sealedAt) drainNeeded = true;
       if (!state.batchRef || !state.sealedAt || !state.pr) continue;
       if (dryRun) { results.push({ statePath, action: 'dry-run' }); continue; }
       const kind = state.kind ?? CARD_BATCH_KINDS.find(kind => file.name.endsWith(`-${kind}.json`));
@@ -57,7 +55,6 @@ export async function reconcileCardBatches({
         held: () => tokenOf(lockPath) === lease.token && clock() < lease.expiresAt,
       });
       results.push({ statePath, ...result });
-      if (result.action === 'retired') drainNeeded = true;
     } catch (error) { results.push({ statePath, action: 'error', reason: error.message }); }
     finally {
       try { if (lease && tokenOf(lockPath) === lease.token) rmSync(lockPath, { force: true }); }
@@ -65,17 +62,19 @@ export async function reconcileCardBatches({
     }
   }
   // The tick never drains: each card is a 30-60s lane acquire + batch. It starts (or reports) a detached single-flight
-  // job that drains within its own budget; the next tick starts another while work remains (card-batch-drain-io.mjs).
+  // job that drains within its own budget; the next tick starts another whenever work remains (card-batch-drain-io.mjs).
+  // Sealing below does not wait for the job: the batch admission lease serialises them, and a card the job admits after
+  // a seal lands in the next batch rather than being lost.
   if (!dryRun) {
     try {
-      const filingEnabled = loadFilingSettings().filingEnabled !== false;
       const work = drainWorkPending(stateDir);
-      // An empty state directory is also an open slot: recover a spool even before its first admission.
-      const pending = work.pending && (drainNeeded || !files.some(file => file.isFile() && file.name.endsWith('.json')));
-      // Filing paused by the operator is a visible state, not a failure.
-      if (pending && !filingEnabled) results.push({ action: 'paused', step: 'drain', reason: 'prevention filing paused by prevention.filingEnabled' });
-      results.push(...await startDrain({ stateDir, clock, launch: filingEnabled && (pending || work.owed),
-        deps: { drain, fileOwed, batch, loadFilingSettings, log } }));
+      if (loadFilingSettings().filingEnabled === false) {
+        // Filing paused by the operator is a visible state, not a failure: no job is launched, inspected or reported.
+        if (work.pending) results.push({ action: 'paused', step: 'drain', reason: 'prevention filing paused by prevention.filingEnabled' });
+      } else {
+        results.push(...await startDrain({ stateDir, clock, launch: work.pending || work.owed,
+          deps: { drain, fileOwed, batch, loadFilingSettings, log } }));
+      }
     } catch (error) { results.push({ action: 'error', step: 'drain', reason: error.message }); }
   }
   if (!dryRun) {

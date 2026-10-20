@@ -110,11 +110,13 @@ describe('prevention.* batch settings cascade', () => {
       .toMatchObject({ batchWindowMinutes: 25, sources: { batchWindowMinutes: 'platform' } });
   });
   it('ships the operator window in declared repo settings and logs the sources', () => {
-    const settings = loadPreventionBatchSettings({ env: {}, read: () => '{}' });
+    // An explicit fixture of the declared block, not the host's live settings: the value is flipped on purpose later.
+    const declared = { batchFiling: true, batchWindowMinutes: 60, batchMaxCards: 25, batchLeaseWaitMinutes: 15, filingEnabled: false };
+    const settings = loadPreventionBatchSettings({ env: {}, read: () => '{}', repo: declared });
     expect(settings).toMatchObject({ batchFiling: true, batchWindowMinutes: 60, batchMaxCards: 25, batchLeaseWaitMinutes: 15, filingEnabled: false,
       sources: { batchFiling: 'repo', batchWindowMinutes: 'repo', batchMaxCards: 'repo', batchLeaseWaitMinutes: 'repo', filingEnabled: 'repo' } });
     expect(formatPreventionBatchSettings(settings)).toBe('prevention-batch settings: prevention.batchFiling=true (repo), prevention.batchWindowMinutes=60 (repo), prevention.batchMaxCards=25 (repo), prevention.batchLeaseWaitMinutes=15 (repo), prevention.filingEnabled=false (repo)');
-    expect(effectiveCardBatchPolicy().prevention.maxAgeMinutes).toBe(60);
+    expect(effectiveCardBatchPolicy(undefined, settings).prevention.maxAgeMinutes).toBe(60);
   });
   it('overlays prevention independently of filing and retains bypass policy', () => {
     const filing = resolveCardBatchSettings({ standard: loadCardBatchPolicy().filing });

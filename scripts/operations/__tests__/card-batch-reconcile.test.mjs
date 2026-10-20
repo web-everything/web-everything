@@ -94,10 +94,25 @@ it('skips the pending drain while filing is paused and reports a paused state, n
   const f = fixture(); writeFileSync(f.path, JSON.stringify({ seq: 9 }));
   mkdirSync(join(f.stateDir, 'pending-prevention')); writeFileSync(join(f.stateDir, 'pending-prevention/card.json'), '{}');
   const results = await reconcileCardBatches({ ...f, loadFilingSettings: () => ({ filingEnabled: false }) });
-  expect(f.startDrain).toHaveBeenCalledWith(expect.objectContaining({ launch: false }));
+  expect(f.startDrain).not.toHaveBeenCalled();
   expect(results).toEqual([{ action: 'paused', step: 'drain', reason: 'prevention filing paused by prevention.filingEnabled' }]);
   expect(results.some(result => result.action === 'error')).toBe(false);
   expect(f.seal).toHaveBeenCalledOnce();
+});
+
+it('paused stays error-free even after an earlier job failure: the job record is not inspected', async () => {
+  const f = fixture(); writeFileSync(f.path, JSON.stringify({ seq: 9 }));
+  mkdirSync(join(f.stateDir, 'pending-prevention')); writeFileSync(join(f.stateDir, 'pending-prevention/card.json'), '{}');
+  writeFileSync(join(f.stateDir, 'prevention-drain.state'), JSON.stringify({ status: 'failed', error: 'old', reported: false }));
+  const results = await reconcileCardBatches({ ...f, loadFilingSettings: () => ({ filingEnabled: false }), startDrain: () => { throw Error('must not be called'); } });
+  expect(results).toEqual([{ action: 'paused', step: 'drain', reason: 'prevention filing paused by prevention.filingEnabled' }]);
+});
+
+it('relaunches whenever the spool is non-empty, even when no batch slot needs recovery', async () => {
+  const f = fixture();
+  mkdirSync(join(f.stateDir, 'pending-prevention')); writeFileSync(join(f.stateDir, 'pending-prevention/card.json'), '{}');
+  await reconcileCardBatches({ ...f, gh: async () => { throw Error('offline'); } });
+  expect(f.startDrain).toHaveBeenCalledWith(expect.objectContaining({ launch: true }));
 });
 
 it('stays quiet when filing is paused and nothing is pending', async () => {
