@@ -381,6 +381,26 @@ describe('memory-aware host admission (verify-admission, 2026-10-20)', () => {
     expect(Math.round(parseDarwinMemoryHeadroomMb(vm, 'vm.swapusage: total = 6144.00M  used = 4974.94M  free = 1169.06M  (encrypted)'))).toBe(616 + 1169);
     expect(() => parseDarwinMemoryHeadroomMb('garbage', '')).toThrow();
   });
+  it('readHostMemoryHeadroomMb: darwin reads vm_stat + swapusage (bounded), others use freemem; the Vitest seam is validated', async () => {
+    const { readHostMemoryHeadroomMb } = await import('../lib/host-load.mjs');
+    const vm = 'Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                   39424.\nPages inactive: 1.\nPages speculative: 0.\nPages purgeable: 0.\n';
+    const exec = vi.fn((cmd) => (cmd === 'vm_stat' ? vm : 'vm.swapusage: total = 2048.00M  used = 1024.00M  free = 1024.00M'));
+    const real = { VITEST: 'false' };
+    expect(Math.round(readHostMemoryHeadroomMb({ env: real, platform: 'darwin', exec }))).toBe(616 + 1024);
+    expect(exec.mock.calls).toEqual([['vm_stat', [], { encoding: 'utf8', timeout: 5000 }], ['sysctl', ['vm.swapusage'], { encoding: 'utf8', timeout: 5000 }]]);
+    const free = vi.fn(() => 3 * 1048576);
+    expect(readHostMemoryHeadroomMb({ env: real, platform: 'linux', exec, free })).toBe(3);
+    expect(exec).toHaveBeenCalledTimes(2);
+    // A hung vm_stat surfaces as a throw, which hostLoadAdmission turns into a closed (not admitted) verdict.
+    expect(() => readHostMemoryHeadroomMb({ env: real, platform: 'darwin', exec: () => { throw Error('ETIMEDOUT'); } })).toThrow('ETIMEDOUT');
+    expect(readHostMemoryHeadroomMb({ env: { VITEST: 'true', WE_TEST_HOST_MEMORY_MB: '512' }, platform: 'darwin', exec })).toBe(512);
+    expect(exec).toHaveBeenCalledTimes(2);
+    for (const bad of ['', ' ', '-1', 'x']) {
+      expect(() => readHostMemoryHeadroomMb({ env: { VITEST: 'true', WE_TEST_HOST_MEMORY_MB: bad } })).toThrow('invalid test host memory');
+    }
+    // The seam is Vitest-only: outside Vitest the value is ignored and the host is read.
+    expect(readHostMemoryHeadroomMb({ env: { WE_TEST_HOST_MEMORY_MB: '512' }, platform: 'linux', free })).toBe(3);
+  });
   it('the cascade carries both new leaves with sources, and rejects a 0 (cannot switch the check off)', async () => {
     const { resolveHostOverloadSettings } = await import('../lib/host-overload-settings.mjs');
     const log = vi.fn();

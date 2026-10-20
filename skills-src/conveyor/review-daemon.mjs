@@ -1146,7 +1146,9 @@ export function buildCliDaemonEffects({
   // C1c — PR facts (head SHA, labels, completed checks) come from the shared store first (`WE_REVIEW_FACTS=0`
   // turns that off). The dispatch gate re-reads the live head after its checks and falls back to GitHub when the
   // store is stale or partial; label READS try the store, label WRITES and the drain/merge path never do.
-  runReview = (opts) => runReviewTickAllRepos({ ...cliReviewTickOpts({ log }), ...opts }),
+  // The real review-pass effects ({@link cliReviewTickOpts}); injectable so a test can drive this default `runReview`.
+  reviewTickOpts = cliReviewTickOpts,
+  runReview = (opts) => runReviewTickAllRepos({ ...reviewTickOpts({ log }), ...opts }),
   // #xconv1 — the SAME shared-reads optimization `runReview` above opts into, wired the same way for its own
   // separate, additive async stage (see `runConvertAdvisoryTick`'s own doc for why this is not folded into
   // `runReview`/`runReviewTick`).

@@ -682,6 +682,25 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     const opts = cliReviewTickOpts({ log: { error: () => {} } });
     expect(typeof defaultReviewHostAdmission).toBe('function');
     expect(opts.hostAdmission).toBe(defaultReviewHostAdmission);
+    // The default runReview of buildCliDaemonEffects runs with those opts, and the host check it hands every repo's
+    // tick is the real one (real host-load + memory readers; the Vitest host seams stand in for the machine).
+    vi.stubEnv('WE_REVIEW_FACTS', '0');
+    try {
+      const seen = [];
+      const tick = vi.fn((o) => { seen.push(o); return { reviewsOwed: 0, dispatched: [], failed: [], refusals: 0 }; });
+      const effects = buildCliDaemonEffects({ owner: 'test', log: { error: () => {} }, reapSessions: () => null,
+        runPrepReview: noPrepReview, convertAdvisoryEnabled: false,
+        reviewTickOpts: (args) => ({ ...cliReviewTickOpts(args), tick, repos: ['repo-a'], authGateOverride: () => ({ paused: false, reason: null }) }) });
+      await effects.tickOnce();
+      expect(tick).toHaveBeenCalledTimes(1);
+      expect(seen[0].hostAdmission()).toMatchObject({ admitted: true, maxPerTick: 2 });
+      vi.stubEnv('WE_TEST_HOST_LOAD1', '999');
+      await effects.tickOnce();
+      expect(seen[1].hostAdmission()).toMatchObject({ admitted: false, reason: expect.stringContaining('host load 999.00/') });
+      vi.stubEnv('WE_TEST_HOST_LOAD1', '0');
+      vi.stubEnv('WE_TEST_HOST_MEMORY_MB', '10');
+      expect(defaultReviewHostAdmission()).toMatchObject({ admitted: false, reason: expect.stringContaining('host memory headroom 10MB') });
+    } finally { vi.unstubAllEnvs(); }
   });
 
   it('deferred reviews still feed statusCandidates (the whole owed list, not just what got dispatched)', () => {

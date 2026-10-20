@@ -124,6 +124,13 @@ describe('verify settings', () => {
     for (const bad of [0, null, 'x', 999, 1.5]) expect(validateVerifySettings({ slotHeartbeatMs: bad }).slotHeartbeatMs).toBe(5 * 60_000);
   });
 
+  it('slotHeartbeatMs: the largest accepted interval is at most half the heavy-admission slot lease', async () => {
+    const { ADMISSION_LEASE_MINUTES } = await import('../../readiness/heavy-admission.mjs');
+    expect(validateVerifySettings({ slotHeartbeatMs: 30 * 60_000 }).slotHeartbeatMs).toBe(30 * 60_000);
+    expect(validateVerifySettings({ slotHeartbeatMs: 30 * 60_000 + 1 }).slotHeartbeatMs).toBe(5 * 60_000);
+    expect(30 * 60_000).toBeLessThanOrEqual(ADMISSION_LEASE_MINUTES * 60_000 / 2);
+  });
+
   it('ignores invalid env values, falling back to file then built-ins', () => {
     const env = { WE_VERIFY_RELATED: 'bad', WE_VERIFY_TEST_TIMEOUT_FACTOR: 'Infinity', WE_VERIFY_STANDARDS: '',
       WE_VERIFY_PHASE_ADMISSION: 'false', WE_VERIFY_FAST_TARGETS: '2.5', WE_VERIFY_MATCH_REQUEST_VARIANTS: 'yes',
