@@ -177,8 +177,23 @@ describe('feed', () => {
     // A real head change still posts + clears; the condition going away still clears.
     expect(diffFeed(first.openKeys, [{ ...live, head: 'b47' }], at).lines.map(l => l.split(' ')[0])).toEqual(['NEEDS-YOU', 'NEEDS-YOU-CLEARED']);
     expect(diffFeed(first.openKeys, [], at).lines[0]).toMatch(/^NEEDS-YOU-CLEARED /);
+    // Two distinct known heads with only a legacy key open are two real events: both post, the legacy key clears.
+    const two = diffFeed([legacy], [live, { ...live, head: 'b47' }], at);
+    expect(two.lines.map(l => l.split(' ')[0])).toEqual(['NEEDS-YOU', 'NEEDS-YOU', 'NEEDS-YOU-CLEARED']);
     // Same condition reported twice (known + unknown) is one key.
     expect(diffFeed([], [unknown, live], at).openKeys).toEqual([`${item.repo}#12@a36:at-round-limit`]);
+  });
+  it('replay closes a legacy head-less opening when the adopted known-head key clears (#5716)', () => {
+    const path = join(temp(), 'events');
+    const live = { ...item, kind: 'at-round-limit', head: 'a36' };
+    const legacy = diffFeed([], [{ ...live, head: '' }], at, { incomplete: false });
+    expect(legacy.lines).toEqual([]); // the new producer never opens one; write an old producer's line by hand
+    appendLines(path, [`NEEDS-YOU ${item.repo}#12 at-round-limit: ready ${JSON.stringify({ at, ...live, head: '' })}`]);
+    const adopted = diffFeed([`${item.repo}#12@:at-round-limit`], [live], at);
+    appendLines(path, adopted.lines);
+    expect(unacknowledged({ path, ackPath: join(temp(), 'ack') })).toHaveLength(1);
+    appendLines(path, diffFeed(adopted.openKeys, [], at).lines);
+    expect(unacknowledged({ path, ackPath: join(temp(), 'ack') })).toEqual([]);
   });
   it('appends without replacing bytes and replays and acknowledges open events', () => {
     const path = join(temp(), 'events'); writeFileSync(path, 'existing\n');

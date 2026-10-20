@@ -113,7 +113,9 @@ function resolveCurrent(prev, items) {
   for (const item of known) {
     const key = keyOf(item), open = prevByCondition.get(conditionOf(item)) ?? [];
     current.set(key, item);
-    if (!prev.has(key) && open.length && open.every(o => !o.head)) { adopted.add(key); for (const o of open) retired.add(o.key); }
+    // Adopt only when this is the condition's ONLY known head this read; two known heads are two real events.
+    const sole = known.filter(k => conditionOf(k) === conditionOf(item)).length === 1;
+    if (!prev.has(key) && sole && open.length && open.every(o => !o.head)) { adopted.add(key); for (const o of open) retired.add(o.key); }
   }
   for (const item of unknown) {
     const condition = conditionOf(item);
@@ -185,7 +187,9 @@ export function unacknowledged({ path = feedPath(), ackPath = sidecarsOf(path).a
   const open = new Map();
   for (const [index, event] of replay({ path }).entries()) {
     const key = keyOf(event.kind === 'cleared' ? { ...event, kind: event.was } : event);
-    if (event.kind === 'cleared') open.delete(key); else open.set(key, { event, index });
+    // A clear also closes a legacy head-less opening of the same condition (adopted silently by the producer).
+    if (event.kind === 'cleared') { open.delete(key); open.delete(keyOf({ ...event, kind: event.was, head: '' })); }
+    else open.set(key, { event, index });
   }
   return [...open.values()].filter(({ event, index }) => cursor === null ? Date.parse(event.at) > Date.parse(ack) : index >= cursor).map(({ event }) => event);
 }
