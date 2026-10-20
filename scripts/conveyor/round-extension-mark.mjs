@@ -86,13 +86,16 @@ export function roundExtensionGrants(comments, { repo, pr, standingRuling = null
         || typeof r.at !== 'string' || !r.at.trim()) return [];
       if (automation) {
         if (!withinStandingRuling(r, { repo, slug }, standingRuling, autoSoFar, comment.id)) return [];
+        // The anchor time of an automatic grant is GitHub's own record of when the comment was posted, never the
+        // body's `at` (which the automation writes): a missing or invalid `createdAt` is not trusted.
+        if (typeof comment.createdAt !== 'string' || !Number.isFinite(Date.parse(comment.createdAt))) return [];
         if (autoEpisodes.has(r.episode)) return [];
         autoEpisodes.add(r.episode);
         autoSoFar += 1;
       }
       const by = Math.min(r.by, remaining);
       remaining -= by;
-      return by > 0 ? [{ index, by, at: r.at, ...(automation ? { standingRuling: r.standingRuling, head: r.head } : {}) }] : [];
+      return by > 0 ? [{ index, by, at: automation ? comment.createdAt : r.at, ...(automation ? { standingRuling: r.standingRuling, head: r.head } : {}) }] : [];
     } catch { return []; }
   });
 }
