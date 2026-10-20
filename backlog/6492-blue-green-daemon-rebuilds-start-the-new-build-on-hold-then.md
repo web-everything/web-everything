@@ -58,7 +58,7 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Delivery mode (operator 2026-10-19)
 
-The field `deliveryMode` has its home in card xbamp05 (deliveryMode per card). This card is `prototype`.
+The field `deliveryMode` has its home in card 6626 (deliveryMode per card). This card is `prototype`.
 
 - Prototype first, then shadow, on ONE daemon (review) first.
 - Shadow: build and smoke into the idle clone, with "dry" switches that only log.
