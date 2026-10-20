@@ -111,9 +111,9 @@ describe('prevention.* batch settings cascade', () => {
   });
   it('ships the operator window in declared repo settings and logs the sources', () => {
     const settings = loadPreventionBatchSettings({ env: {}, read: () => '{}' });
-    expect(settings).toMatchObject({ batchFiling: true, batchWindowMinutes: 60, batchMaxCards: 25, batchLeaseWaitMinutes: 15, filingEnabled: false,
+    expect(settings).toMatchObject({ batchFiling: true, batchWindowMinutes: 60, batchMaxCards: 25, batchLeaseWaitMinutes: 15, filingEnabled: true,
       sources: { batchFiling: 'repo', batchWindowMinutes: 'repo', batchMaxCards: 'repo', batchLeaseWaitMinutes: 'repo', filingEnabled: 'repo' } });
-    expect(formatPreventionBatchSettings(settings)).toBe('prevention-batch settings: prevention.batchFiling=true (repo), prevention.batchWindowMinutes=60 (repo), prevention.batchMaxCards=25 (repo), prevention.batchLeaseWaitMinutes=15 (repo), prevention.filingEnabled=false (repo)');
+    expect(formatPreventionBatchSettings(settings)).toBe('prevention-batch settings: prevention.batchFiling=true (repo), prevention.batchWindowMinutes=60 (repo), prevention.batchMaxCards=25 (repo), prevention.batchLeaseWaitMinutes=15 (repo), prevention.filingEnabled=true (repo)');
     expect(effectiveCardBatchPolicy().prevention.maxAgeMinutes).toBe(60);
   });
   it('overlays prevention independently of filing and retains bypass policy', () => {
