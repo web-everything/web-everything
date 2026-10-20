@@ -9,7 +9,6 @@ relatedTo: ["2450", "2901", "2912", "2914", "2326"]
 scope:
   - we:scripts/merge-ai-prs.mjs
   - we:skills-src/review/SKILL.md
-  - we:.claude/skills/review/SKILL.md
 tags: [review, net-diff, drain, gate]
 ---
 
