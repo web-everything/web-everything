@@ -7,8 +7,8 @@ import { createGhProvider } from './review-label-provider.mjs';
 import { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-status-label-meta.mjs';
 export { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-status-label-meta.mjs';
 
-export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head, evidence = {}, env = {}, savedResult } = {}) {
-  const disposition = readRedTeamDisposition({ comments, pr, head, env, savedResult });
+export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head, evidence = {}, env = {}, savedResult, standingRuling = null } = {}) {
+  const disposition = readRedTeamDisposition({ comments, pr, head, env, savedResult, repo, standingRuling });
   const desired = disposition.sendBack.length || disposition.held.length ? 'red-team:blocked'
     : disposition.result?.recheckIncomplete ? 'red-team:pending'
       : disposition.result ? 'red-team:clear'
@@ -20,16 +20,16 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
 
 /** Uses the existing label provider/writer, including the known-label metadata provisioning path. */
 export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = process.env,
-  provider = createGhProvider(), log = () => {}, live, comments, savedResult, dryRun = false } = {}) {
+  provider = createGhProvider(), log = () => {}, live, comments, savedResult, standingRuling = null, dryRun = false } = {}) {
   if (!readRedTeamProbes({ env, log }).value.statusLabels) return { add: null, remove: [] };
   const state = live ?? provider.readPrState(repo, pr);
   if (state.headRefOid !== head) return { add: null, remove: [], skipped: 'head-moved' };
   const thread = comments ?? provider.readComments(repo, pr);
-  if (savedResult === undefined && !readRedTeamDisposition({ comments: thread, pr, head, env }).result) {
+  if (savedResult === undefined && !readRedTeamDisposition({ comments: thread, pr, head, env, repo, standingRuling }).result) {
     try { savedResult = savedRedTeamFallback({ repo, pr, head, env })(); }
     catch (error) { log(`red-team-status-labels: saved result unavailable: ${error.message}`); }
   }
-  const plan = planRedTeamStatusLabels({ ...state, repo, pr, head, evidence, env, comments: thread, savedResult });
+  const plan = planRedTeamStatusLabels({ ...state, repo, pr, head, evidence, env, comments: thread, savedResult, standingRuling });
   if (!dryRun && (plan.add || plan.remove.length)) {
     if (plan.add) provider.ensureLabel(repo, plan.add, RED_TEAM_STATUS_LABEL_META[plan.add]);
     provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });
