@@ -17,6 +17,7 @@
 import { execFileSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { sep } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { readGitIdentity, identityVerdict, resolveGitIdentityPlaceholders, GIT_IDENTITY_FIX_HINT } from './lib/git-identity.mjs';
 
 /** PURE: is this checkout root a lane clone? Same locus test as `guard-lane.mjs#isLaneLocus`. */
@@ -62,4 +63,8 @@ export function main({ cwd = process.cwd(), env = process.env, err = (s) => proc
   return 1;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) process.exitCode = main();
+// `pathToFileURL`, not a `file://${argv[1]}` template: import.meta.url is percent-ENCODED, so a checkout path with a
+// space never matched and the guard silently skipped itself (audit finding).
+// Through realpath too: Node resolves the main module's symlinks, so a symlinked checkout would also never match.
+const invokedUrl = (p) => { try { return pathToFileURL(realpathSync(p)).href; } catch { return pathToFileURL(p).href; } };
+if (process.argv[1] && invokedUrl(process.argv[1]) === import.meta.url) process.exitCode = main();

@@ -181,7 +181,7 @@ import { VERIFY_FILENAME, keepMarkerAfterReset, readVerifyMarker } from './lib/l
 import { checkLaneHold, laneHoldJournalFields, clearLaneAwaitRecords } from './lib/lane-hold-io.mjs';
 import { resolveLaneHoldSettings } from './lib/lane-lease.mjs';
 import { laneGitHardeningEnv, scrubRiskyLaneConfig } from './lib/lane-git-hardening.mjs';
-import { readGitIdentity, laneIdentityReport, resolveGitIdentityPlaceholders, GIT_IDENTITY_FIX_HINT } from './lib/git-identity.mjs';
+import { readGitIdentity, laneIdentityReport, ensureLaneHooksPath, resolveGitIdentityPlaceholders, GIT_IDENTITY_FIX_HINT } from './lib/git-identity.mjs';
 
 // #2560 — `--scope=a,b,c` → a normalized, repo-qualified array (empty when the flag is absent/blank).
 const parseScopeFlag = (v) => (typeof v === 'string' && v ? normScope(v.split(',')) : []);
@@ -384,6 +384,9 @@ function laneEnvLocal(repo, n) {
 // Write AFTER refreshLane's `git clean -fd` (which would otherwise remove this untracked file). `.env.local`
 // is git-ignored so a lane never commits it.
 function writeLaneEnv(repo, n) {
+  // Rides every provision/refresh/acquire call site: point the lane at the tracked hooks so the pre-commit guards
+  // (incl. the placeholder-author guard) run even when npm `prepare` never did (`--no-install`, `--reference` clone).
+  ensureLaneHooksPath(laneDir(repo, n), { log, run: (args) => execFileSync('git', args, { cwd: laneDir(repo, n), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000, env: laneGitHardeningEnv(process.env) }) });
   const contents = laneEnvLocal(repo, n);
   if (contents === null) return;
   writeFileSync(join(laneDir(repo, n), '.env.local'), contents);
@@ -2832,6 +2835,9 @@ function printStatus(repo) {
 function warnPlaceholderIdentity(lanes) {
   try {
     const env = laneGitHardeningEnv({ ...process.env, GIT_OPTIONAL_LOCKS: '0' });
+    // REPORT-only here: `status` writes no state (stale-state and other readers pin that); provision/refresh/acquire set it.
+    const unhooked = lanes.filter(({ dir }) => ensureLaneHooksPath(dir, { write: false }).status === 'unset').map((l) => `lane-${l.lane}`);
+    if (unhooked.length) log(`⚠ core.hooksPath is not .githooks in ${unhooked.length} lane(s) (${unhooked.slice(0, 5).join(', ')}${unhooked.length > 5 ? ', …' : ''}) — the pre-commit guards do not run there; \`provision\`/\`refresh\`/\`acquire\` sets it.`);
     const r = laneIdentityReport({ lanes, readIn: (dir) => readGitIdentity(dir, { env }), lists: resolveGitIdentityPlaceholders() });
     if (r.status === 'ok') return;
     const shown = r.bad.slice(0, 3).map((b) => `lane-${b.lane}: ${b.detail}`).join(' | ');

@@ -114,6 +114,19 @@ describe('end to end: real git commit through the hook', () => {
     expect(r.status).toBe('placeholder');
   });
 
+  it('a checkout path WITH A SPACE still runs the guard (run-as-script check uses pathToFileURL)', () => {
+    const lane = makeRepo('has space/.lanes/web-everything/lane-6');
+    setIdent(lane, placeholder);
+    // A copy of the guard and its import chain inside the spaced path, so argv[1] really contains the space.
+    for (const rel of ['guard-git-identity.mjs', 'lib/git-identity.mjs', 'lib/policy-cascade.mjs', 'lib/settings-files.mjs', 'lib/under-test.mjs', 'lib/under-test.cjs']) {
+      mkdirSync(dirname(join(lane, 'scripts', rel)), { recursive: true });
+      writeFileSync(join(lane, 'scripts', rel), readFileSync(join(REPO, 'scripts', rel)));
+    }
+    const r = spawnSync(process.execPath, [join(lane, 'scripts/guard-git-identity.mjs')], { cwd: lane, env, encoding: 'utf8' });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/commit refused/);
+  });
+
   it('outside a lane the guard never blocks', () => {
     const dir = makeRepo('plain/checkout');
     setIdent(dir, placeholder);

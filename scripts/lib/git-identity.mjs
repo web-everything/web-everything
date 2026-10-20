@@ -13,6 +13,8 @@
  *   to the built-in one: the built-in list is the guard's floor, so a setting can widen it but never weaken it.
  */
 import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 
@@ -172,4 +174,35 @@ export function identityVerdict({ author, committer, error }, lists = BUILTIN_PL
   if (a.status !== 'ok') parts.push(`author: ${a.reasons.join('; ')}`);
   if (c.status !== 'ok') parts.push(`committer: ${c.reasons.join('; ')}`);
   return { status, detail: parts.join(' · ') };
+}
+
+/** The tracked hooks dir every lane must point `core.hooksPath` at (so the identity guard actually runs). */
+export const LANE_HOOKS_PATH = '.githooks';
+
+/**
+ * IO (injected): make a lane's `core.hooksPath` point at the tracked `.githooks`. The `prepare` npm script used to be
+ * the ONLY thing that set it — `provision --no-install` skips npm, and a `--reference` clone does not inherit it, so
+ * the pre-commit guard silently never ran there (audit finding). Idempotent: reads first, writes only on a
+ * difference, logs the change. Skipped when the checkout has no `.githooks/pre-commit` (another pool's convention).
+ * `write: false` only REPORTS (for read-only callers like `status`). Never throws.
+ * @returns {{status:'ok'|'set'|'unset'|'skipped'|'error', was?:string|null, detail?:string}}
+ */
+export function ensureLaneHooksPath(dir, {
+  write = true,
+  exists = existsSync,
+  run = (args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000 }),
+  log = () => {},
+} = {}) {
+  try {
+    if (!exists(join(dir, LANE_HOOKS_PATH, 'pre-commit'))) return { status: 'skipped' };
+    let was = null;
+    try { was = String(run(['config', '--local', '--get', 'core.hooksPath'])).trim() || null; } catch { was = null; }
+    if (was === LANE_HOOKS_PATH) return { status: 'ok', was };
+    if (!write) return { status: 'unset', was };
+    run(['config', '--local', 'core.hooksPath', LANE_HOOKS_PATH]);
+    try { log(`  ${dir}: core.hooksPath ${was ?? '(unset)'} → ${LANE_HOOKS_PATH} (lane pre-commit guards now run)`); } catch { /* log only */ }
+    return { status: 'set', was };
+  } catch (e) {
+    return { status: 'error', detail: String(e?.message ?? e).split('\n')[0] };
+  }
 }
