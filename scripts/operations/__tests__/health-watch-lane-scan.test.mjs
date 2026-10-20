@@ -122,12 +122,29 @@ describe('cached lane safety is reporting only (operator ruling 2026-10-20)', ()
 });
 
 describe('fresh per-lane safety check before any destructive action', () => {
-  const git = outputs => vi.fn((bin, argv) => {
-    const key = argv[0];
-    const out = outputs[key];
-    if (out instanceof Error) throw out;
-    return out;
+  const commands = [
+    ['git', ['status', '--porcelain', '--untracked-files=all']],
+    ['git', ['stash', 'list']],
+    ['git', ['rev-list', '--count', 'HEAD', '--not', '--remotes=origin']],
+  ];
+  const gitMocks = [];
+  // Assert outside the checker: it catches exec errors, including failed assertions inside a mock.
+  afterEach(() => {
+    for (const exec of gitMocks.splice(0)) {
+      for (const [bin, argv] of exec.mock.calls) expect(commands).toContainEqual([bin, argv]);
+    }
   });
+  const git = outputs => {
+    const replies = new Map(commands.map((command, i) => [JSON.stringify(command),
+      [outputs.status, outputs.stash, outputs['rev-list']][i]]));
+    const exec = vi.fn((bin, argv) => {
+      const out = replies.get(JSON.stringify([bin, argv]));
+      if (out instanceof Error) throw out;
+      return out;
+    });
+    gitMocks.push(exec);
+    return exec;
+  };
   it('safe only when clean, no stash and nothing unpushed', () => {
     expect(freshLaneSafety({ path: '/l', exec: git({ status: '', stash: '', 'rev-list': '0\n' }) })).toMatchObject({ hasUnsafeWork: false, fresh: true });
     expect(freshLaneSafety({ path: '/l', exec: git({ status: ' M a.mjs\n', stash: '', 'rev-list': '0' }) })).toMatchObject({ hasUnsafeWork: true });
@@ -148,21 +165,21 @@ describe('fresh per-lane safety check before any destructive action', () => {
       expect(options.env.GIT_OPTIONAL_LOCKS).toBe('0');
     }
   });
-  it('a lane whose only unpushed work is an untracked file or a commit missing from origin is unsafe via the pinned argv', () => {
-    // Behaves like real git: a flag-less status hides untracked-directory contents, and a rev-list without the
-    // origin exclusion counts nothing as unpushed. Only the pinned argv sees the work.
-    const realistic = ({ status, count }) => vi.fn((bin, argv) => {
-      const line = argv.join(' ');
-      if (line === 'status --porcelain --untracked-files=all') return status;
-      if (line.startsWith('status')) return '';
-      if (line === 'stash list') return '';
-      if (line === 'rev-list --count HEAD --not --remotes=origin') return count;
+  it.each([
+    { work: 'only an untracked file', status: '?? dir/new.mjs\n', count: '0\n', reason: 'worktree has changes' },
+    { work: 'only commits missing from origin', status: '', count: '2\n', reason: '2 unpushed commit(s)' },
+  ])('reports a lane with $work unsafe using the full git argv', ({ status, count, reason }) => {
+    // Deliberately return clean results for other argv so a missing flag cannot pass by triggering an exec error.
+    const exec = vi.fn((bin, argv) => {
+      const command = JSON.stringify([bin, argv]);
+      if (command === JSON.stringify(['git', ['status', '--porcelain', '--untracked-files=all']])) return status;
+      if (command === JSON.stringify(['git', ['stash', 'list']])) return '';
+      if (command === JSON.stringify(['git', ['rev-list', '--count', 'HEAD', '--not', '--remotes=origin']])) return count;
+      if (argv.includes('status')) return '';
       return '0\n';
     });
-    expect(freshLaneSafety({ path: '/l', exec: realistic({ status: '?? dir/new.mjs\n', count: '0\n' }) }))
-      .toMatchObject({ hasUnsafeWork: true, reason: 'worktree has changes' });
-    expect(freshLaneSafety({ path: '/l', exec: realistic({ status: '', count: '2\n' }) }))
-      .toMatchObject({ hasUnsafeWork: true, reason: '2 unpushed commit(s)' });
+    gitMocks.push(exec);
+    expect(freshLaneSafety({ path: '/l', exec })).toMatchObject({ hasUnsafeWork: true, reason });
   });
   it('any error, timeout or unparseable output is unsafe', () => {
     for (const outputs of [{ status: new Error('timeout') }, { status: '', stash: new Error('locked') },
