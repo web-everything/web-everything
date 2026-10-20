@@ -1960,7 +1960,8 @@ describe('drain red-team request consumption', () => {
     });
     expect(dispatch).not.toHaveBeenCalled();
     expect(tick.reviewsOwed).toBe(0);
-    expect(log).toHaveBeenCalledWith('review-daemon: skipping fresh review for #5616: exact reconcile attempts/cap unavailable');
+    // main's reconcile now reports the exact operator-fix budget (5/5), so the gate refuses on the cap itself.
+    expect(log).toHaveBeenCalledWith('review-daemon: review round cap reached for #5616');
   });
 
   it.each([{ cap: 5 }, { attempts: 0 }, { attempts: NaN, cap: 5 }, { attempts: 0, cap: 0 }])(
