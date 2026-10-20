@@ -249,9 +249,10 @@ export function gateRoundGrants(comments, pr, repo = null, standingRuling = null
   const copies = new Map();
   return roundExtensionGrants(comments, { repo, pr, standingRuling }).map(g => {
     const c = comments[g.index];
-    // REST and GraphQL expose the same node id. Include content so editing a grant invalid cannot hide a replacement;
-    // fixtures / older readers without ids still distinguish different grants without relying on shifting indices.
-    const key = JSON.stringify([c.id ?? null, c.createdAt ?? null, c.body]);
+    // All readers retain the body, but ids/timestamps vary (node id, REST numeric id, or omitted metadata).
+    // Authenticate first, then identify by exact content and copy number: edits invalidate snapshots, duplicate
+    // grants remain distinct, and unrelated comments cannot shift an identity.
+    const key = c.body;
     const copy = (copies.get(key) ?? 0) + 1;
     copies.set(key, copy);
     return { ...g, id: createHash('sha256').update(JSON.stringify([key, copy])).digest('hex').slice(0, 16) };
@@ -436,7 +437,7 @@ export function liveResultGateState(comments, pr, head, repo = null, standingRul
 
 /**
  * Did the operator rule on the head's confirmed breaks? The gate handed THIS result over (a `round-cap` record that
- * decides it), and a trusted clear-human ceremony for that head came after both the round-cap record and the result.
+ * decides it), and a trusted clear-human ceremony for that head came after the result and every send-back/cap record.
  * Only the ceremony's own comment counts: a restamp repeats the cleared-human marker for a ruling made on another
  * head. A carried result defers to the ruling on the head it was carried from, read from the thread before the carry.
  * PURE.
@@ -451,10 +452,16 @@ function operatorRuled(records, pr, head) {
     // A carry hop counts only when the prior head's result is the one that was carried (same id).
     if (!result || (want && redTeamResultId(result.parsed) !== want)) return false;
     want = redTeamResultId(result.parsed);
-    const cap = gateRecordsFor(rs, pr, sha, result).filter(r => r.gate.outcome === GATE_OUTCOMES.ROUND_CAP).sort(threadOrder).at(-1);
+    const gates = gateRecordsFor(rs, pr, sha, result);
+    const cap = gates.filter(r => r.gate.outcome === GATE_OUTCOMES.ROUND_CAP).sort(threadOrder).at(-1);
     const cleared = lastAt(rs, r => !r.from && CLEAR_HUMAN_RULING_RE.test(recordBody(r).replace(/\r\n/g, '\n').trimStart())
       && parseLatestHumanClearedSha([r.c]) === sha);
-    if (cap && cleared && cleared.at > cap.at && cleared.at > result.at) return true;
+    // A clearance cannot approve a later send-back, even if an older/unknown grant snapshot leaves the cap winning.
+    // This also keeps existing send-backs held while persisted grant identities migrate to a reader-independent key.
+    if (cap && cleared && cleared.at > result.at && gates.every(r =>
+      ![GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK].includes(r.gate.outcome) || cleared.at > r.at)) return true;
+    // A ruling inherited through a carry cannot approve this head's own later gate decisions.
+    if (gates.some(r => !r.from && [GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK].includes(r.gate.outcome))) return false;
     if (!result.from) return false;
     rs = rs.filter(r => r.at < result.at);
     sha = result.from;
