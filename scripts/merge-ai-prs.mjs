@@ -218,7 +218,7 @@ export { mapWithConcurrency } from './lib/drain-concurrency.mjs';
 import { runLedgerShadow, formatShadowLine } from './lib/drain-ledger-shadow.mjs'; // #5444 — ledger gate in SHADOW beside the labels; journals, never decides
 import { drainReviewGateFact, readDrainLedgerSnapshot, recordDrainLedgerFacts } from './lib/drain-ledger-facts.mjs';
 import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overlapRowKey, readyToMergeLabelTimeMs } from './conveyor/land-overlap-yield.mjs'; // + readyToMergeLabelTimeMs: the drain order's ready-at (same cached label read) // #4308 — the land-time overlap-yield planner (see planLabelDrain's own `overlapContext` param)
-import { filterEnqueueableOverlapRows, resolveOverlapYieldOnlyToEnqueueableSetting, formatOverlapYieldOnlyToEnqueueableSetting, resolveOverlapYieldRequiresLandableSetting, formatOverlapYieldRequiresLandableSetting } from './conveyor/overlap-yield-enqueueable.mjs';
+import { filterEnqueueableOverlapRows, resolveOverlapYieldOnlyToEnqueueableSetting, formatOverlapYieldOnlyToEnqueueableSetting, resolveOverlapYieldRequiresLandableSetting, formatOverlapYieldRequiresLandableSetting, resolveOverlapYieldSkipsBlockedTargetSetting, formatOverlapYieldSkipsBlockedTargetSetting, planOverlapYieldAroundBlockedTargets, formatBlockedYieldTargetLine } from './conveyor/overlap-yield-enqueueable.mjs';
 import { rankByDeliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES } from './lib/delivery-priority.mjs'; // drain order (2026-10-10): the shared P0-P4 class rule
 import { readDeliveryPrioritySettings } from './conveyor/delivery-priority-shadow.mjs'; // drain order: the shared aging/cap settings (platform preference `deliveryPriority`)
 import { execFileSyncThrottled } from './lib/gh-throttle.mjs'; // drain order: the operator-override labeler read
@@ -2344,6 +2344,9 @@ export function buildLiveListingsByRepo(listings) {
  *  row level, so a PR whose `files` array is AT this conservative cap is read as "maybe truncated ⇒ unknown"
  *  (rule 2 — an unknown file list never yields, the safe direction), never trusted as complete. */
 const OVERLAP_FILES_PAGE_CAP = 100;
+
+/** Holds recorded this pass that stop a PR from being an overlap-yield target (drain.overlapYieldSkipsBlockedTarget). */
+const YIELD_TARGET_BLOCKING_HOLDS = new Set(['red-team-pending', 'review-hold', 'numbering', 'sent-back']);
 
 /**
  * #4308 — build the pure `land-overlap-yield.mjs` module's row shape for both the X side (`candidates`, this
@@ -4488,6 +4491,8 @@ async function runCli() {
   const overlapYieldOverrides = parseOverlapYieldOverrides({ argv, env: process.env });
   process.stderr.write(`${formatOverlapYieldOnlyToEnqueueableSetting(resolveOverlapYieldOnlyToEnqueueableSetting({ argv, env: process.env }))}\n`);
   process.stderr.write(`${formatOverlapYieldRequiresLandableSetting(resolveOverlapYieldRequiresLandableSetting({ argv, env: process.env }))}\n`);
+  const overlapYieldSkipsBlockedTarget = resolveOverlapYieldSkipsBlockedTargetSetting({ argv, env: process.env });
+  process.stderr.write(`${formatOverlapYieldSkipsBlockedTargetSetting(overlapYieldSkipsBlockedTarget)}\n`);
   const AS_JSON = !!flags.json;
   const DRY_RUN = !!flags['dry-run'];
   const REQUIRED = typeof flags.check === 'string' ? flags.check : 'test';
@@ -6403,8 +6408,64 @@ async function runCli() {
     lastDrainOrderLog = sig;
     process.stderr.write(`${lines.join('\n')}\n`);
   };
+  // A yield target must itself be enqueue-eligible this pass (drain.overlapYieldSkipsBlockedTarget). Holds already
+  // recorded this pass win first (no IO); otherwise the same label/numbering/red-team reads enqueue would make.
+  // A target whose state cannot be read keeps today's yield. Memoised per target head for the whole pass.
+  const passHoldByKey = new Map();
+  const yieldTargetBlockMemo = new Map();
+  const yieldTargetBlockOf = (row) => {
+    const key = overlapRowKey(row);
+    const recorded = passHoldByKey.get(key);
+    if (recorded) return recorded;
+    const memoKey = `${key}@${row.headSha || ''}`;
+    if (yieldTargetBlockMemo.has(memoKey)) {
+      const m = yieldTargetBlockMemo.get(memoKey);
+      if (m.error) throw new Error(m.error);
+      return m.hold;
+    }
+    const v = verdicts.find((x) => overlapRowKey({ repo: x.repo || localSlug, number: x.num }) === key) || null;
+    const labels = (Array.isArray(row.labels) ? row.labels : []).map((l) => (typeof l === 'string' ? l : l?.name)).filter(Boolean);
+    let hold = null;
+    try {
+      const allowPending = (escalationRelief.prs || []).includes(Number(row.number)) || (!!escalationRelief.passWide && !!label);
+      if (hasUnclearedReviewLabel(labels, { allowPending })) hold = { kind: 'review-hold', reason: 'unsatisfied review hold (review:pending/review:human/review:changes)' };
+      else if (numberingWithdrawalOwed(row.repo || localSlug, row.number)) hold = { kind: 'numbering', reason: 'numbering re-stamp withdrawal owed' };
+      else {
+        const c = v ? { ...v } : { num: Number(row.number), repo: isLocalRepo(row.repo) ? null : row.repo, prLabels: labels, baseRefName: row.baseRefName };
+        hold = mergeStrategy.yieldTargetHold(c, row.headSha) || null;
+      }
+    } catch (e) {
+      const error = String(e?.message || e).split('\n')[0].slice(0, 200);
+      yieldTargetBlockMemo.set(memoKey, { error });
+      throw new Error(error);
+    }
+    yieldTargetBlockMemo.set(memoKey, { hold });
+    return hold;
+  };
+  const loggedBlockedTargets = new Set();
+  const computeOverlapAroundBlocked = (rows) => {
+    const r = planOverlapYieldAroundBlockedTargets({
+      openPrRows: rows.openPrRows, enabled: overlapYieldSkipsBlockedTarget.value, blockOf: yieldTargetBlockOf,
+      compute: (openPrRows) => computeOverlapContext({ candidateRows: rows.candidateRows, openPrRows, overrides: overlapYieldOverrides }),
+    });
+    if (!AS_JSON) {
+      for (const s of r.skipped) {
+        const sig = `${s.repo}#${s.pr}:${s.kind}:${s.waiters.join(',')}`;
+        if (loggedBlockedTargets.has(sig)) continue;
+        loggedBlockedTargets.add(sig);
+        process.stderr.write(`  ⏭ ${formatBlockedYieldTargetLine(s)} (drain.overlapYieldSkipsBlockedTarget=on, ${overlapYieldSkipsBlockedTarget.source})\n`);
+      }
+      for (const u of r.unknown) {
+        const sig = `${u.repo}#${u.pr}:unknown`;
+        if (loggedBlockedTargets.has(sig)) continue;
+        loggedBlockedTargets.add(sig);
+        process.stderr.write(`  ⓘ overlap-yield kept: #${u.pr} eligibility unknown (${u.error}) — waiters still yield (fail closed)\n`);
+      }
+    }
+    return r.ctx;
+  };
   const overlapRows0 = buildOverlapRows({ candidates: verdicts, verdicts, openPrContext, mergedPrKeys: new Set(), localSlug, requiredCheck: REQUIRED });
-  const overlapCtx0 = computeOverlapContext({ candidateRows: overlapRows0.candidateRows, openPrRows: overlapRows0.openPrRows, overrides: overlapYieldOverrides });
+  const overlapCtx0 = computeOverlapAroundBlocked(overlapRows0);
   logOverlapYields(overlapCtx0);
   const preparedPass = planDrainPass({
     verdicts,
@@ -6435,7 +6496,7 @@ async function runCli() {
     // the same staleness #3004 documents elsewhere in this cascade).
     const mergedPrKeys = new Set(merged.map((m) => overlapRowKey({ repo: m.repo || localSlug, number: m.num })));
     const rows = buildOverlapRows({ candidates: cands, verdicts, openPrContext, mergedPrKeys, localSlug, requiredCheck: REQUIRED });
-    const octx = computeOverlapContext({ candidateRows: rows.candidateRows, openPrRows: rows.openPrRows, overrides: overlapYieldOverrides });
+    const octx = computeOverlapAroundBlocked(rows);
     logOverlapYields(octx);
     const p = planLabelDrain(cands, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: orderExtraOpenItems, contextComplete: !!openPrContext.contextComplete, strictAbsentHashDependencies: onlyPr != null, isWeRepo: isLocalRepo, overlapContext: octx.waits, overlapSkips: octx.skips, overlapLocalSlug: localSlug, readyOrder: readyOrderCtx() });
     logDrainOrder(p);
@@ -6688,6 +6749,7 @@ async function runCli() {
         if (!hold) continue;
         c.decision = 'skip'; c.reason = hold.reason;
         enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', ...hold });
+        if (YIELD_TARGET_BLOCKING_HOLDS.has(hold.kind)) passHoldByKey.set(overlapRowKey({ repo: c.repo || localSlug, number: c.num }), { kind: hold.kind, reason: hold.reason });
       }
     }
     // #2257 — an item is unique per (repo, PR#): match/remove candidates on both so a WE #10 and a FUI #10 never

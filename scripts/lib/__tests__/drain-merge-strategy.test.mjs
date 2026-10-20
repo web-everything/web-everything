@@ -646,6 +646,43 @@ describe('recorded hold read-only admission', () => {
     expect(requests).toEqual([]);
   });
 
+  describe('yieldTargetHold (overlap-yield target eligibility, read-only)', () => {
+    const run = (opts) => {
+      let stored = opts.state ?? initial();
+      const writes = []; const requests = [];
+      const h = reader({ state: () => stored, write: value => { writes.push(value); stored = value; },
+        request: value => { requests.push(value); return { requested: true }; }, ...opts });
+      return { h, writes, requests, stored: () => stored };
+    };
+    it('a recorded red-team wait on the live head with no result is a blocking hold — and nothing is written', () => {
+      const r = run({ evidence: { scheduled: true, inFlight: true } });
+      // even an expired backoff (retryAt 0) still reports the hold: eligibility, not the refresh schedule
+      expect(r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toMatchObject({ kind: 'red-team-pending' });
+      expect(r.writes).toEqual([]); expect(r.requests).toEqual([]); expect(r.h.mutations).toEqual([]);
+    });
+    it('the wait is found under the slug key too (cwd vs owner/name keys both occur)', () => {
+      const r = run({ state: { pending: [], followedUp: [], redTeamPending: { [`${LOCAL}#5283`]: initial().redTeamPending[key] } }, evidence: { scheduled: true, inFlight: true } });
+      expect(r.h.s.yieldTargetHold({ num: 5283, repo: LOCAL }, HEAD)).toMatchObject({ kind: 'red-team-pending' });
+    });
+    it('no recorded wait on THIS head ⇒ not blocked (the target may still enqueue, so waiters keep yielding)', () => {
+      const r = run({ state: { pending: [], followedUp: [], redTeamPending: { [key]: { ...initial().redTeamPending[key], headSha: 'f'.repeat(40) } } }, evidence: { scheduled: true, inFlight: true } });
+      expect(r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toBeNull();
+    });
+    it('a live head that moved is unknown — it throws so the caller keeps the yield (fail closed)', () => {
+      const r = run({ head: 'a'.repeat(40), evidence: { scheduled: true, inFlight: true } });
+      expect(() => r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toThrow(/live head/);
+    });
+    it('an unreadable follow-up state throws (fail closed)', () => {
+      const s = createDrainMergeStrategy({ localSlug: LOCAL, statePath: 'x', resolved: policyOf('github-merge-queue'),
+        queueSafety: { value: { waitForRedTeamBeforeEnqueue: true } }, log: { write: () => {} }, readFile: () => '{not json' });
+      expect(() => s.yieldTargetHold({ num: 5283 }, HEAD)).toThrow(/unreadable/);
+    });
+    it('a sent-back target is blocked (sent-back)', () => {
+      const r = run({ labels: ['review:changes'], evidence: { scheduled: true, inFlight: true } });
+      expect(r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toMatchObject({ kind: 'sent-back' });
+    });
+  });
+
   it('keeps a cached hold and refreshes an expired hold only on ordinary locked enqueue', () => {
     const root = mkdtempSync(join(tmpdir(), 'hold-refresh-lock-'));
     try {

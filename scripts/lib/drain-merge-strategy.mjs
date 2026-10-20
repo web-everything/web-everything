@@ -686,6 +686,26 @@ export function createDrainMergeStrategy({
       if (state.redTeamPending?.[keyOf(c.repo, c.num)]?.headSha !== headSha) return null;
       return this.enqueue(c, headSha, { holdOnly: true });
     },
+    /** Read-only: is a would-be overlap-yield TARGET held by the post-accept red-team gate on this exact head?
+     * `{kind, reason}` = held; `null` = no recorded red-team hold on this head (it may still enqueue, so waiters
+     * keep yielding). Throws when it cannot tell; the caller then keeps today's yield (fail closed).
+     * Never writes state, labels or requests: it only reads what enqueue's own gate would read. */
+    yieldTargetHold(c, headSha) {
+      if (!enqueues(c.repo) || !safety.value.waitForRedTeamBeforeEnqueue) return null;
+      if (!headSha) throw new Error('yield target has no head sha');
+      const state = readQueueState(statePath, readFile);
+      if (state.unreadable) throw new Error(`follow-up state ${statePath} is unreadable`);
+      const rows = state.redTeamPending || {};
+      const keys = [keyOf(c.repo, c.num), keyOf(null, c.num), keyOf(localSlug, c.num)];
+      const pending = keys.map(k => rows[k]).find(p => p?.headSha === headSha);
+      if (!pending) return null;
+      const live = readLive(c.repo, c.num);
+      if (live.headRefOid !== headSha || !Array.isArray(live.labels)) throw new Error('live head or labels do not match the listed state');
+      const sent = sendBackReason(live.labels);
+      if (sent) return { kind: 'sent-back', reason: sent };
+      const reason = reserveRedTeamReason(c, headSha, live);
+      return reason ? { kind: 'red-team-pending', reason } : null;
+    },
     enqueue(c, headSha, { comments = null, prepared = null, holdOnly = false } = {}) {
       if (!enqueues(c.repo)) throw new Error('enqueue called for a repo outside github-merge-queue');
       if (dryRun) throw new Error('enqueue refused in dry run');
