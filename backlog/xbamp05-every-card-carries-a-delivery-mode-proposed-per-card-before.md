@@ -1,5 +1,4 @@
 ---
-bornAs: xbamp05
 kind: story
 size: 5
 parent: "6469"
