@@ -929,12 +929,17 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it('log:false silences every provenance line (build cascade, route, usage) and still runs the task', async () => {
+  it.each([
+    ['false (silenced)', false, false],
+    ['a non-function value (stderr fallback)', true, true],
+    ['a throwing logger (swallowed)', () => { throw new Error('logger down'); }, false],
+  ])('log %s never aborts the run, and provenance reaches stderr only when it should', async (_name, log, expectStderr) => {
     const dir = mkdtempSync(join(tmpdir(), 'we-codex-nolog-'));
     const { fn: spawnFn, seen } = fakeSpawn('{"type":"thread.started","thread_id":"t"}\n{"type":"turn.completed"}\n');
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const provenance = () => errSpy.mock.calls.map(c => String(c[0])).filter(l => /^(policy-cascade|codex-usage) ·/.test(l));
     try {
-      const report = await codexDirectTask({ task: 'fix a typo', dir, gate: 'none', selfReview: false, log: false,
+      const report = await codexDirectTask({ task: 'fix a typo', dir, gate: 'none', selfReview: false, log,
         model: 'x', tier: 'haiku', stream: false, spawnFn,
         execFn: (_bin, args) => args.includes('--absolute-git-dir') ? join(dir, 'metadata') : args.includes('rev-parse') ? 'sha' : '',
         clearRolloutAfterRun: true,
@@ -942,7 +947,8 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       });
       expect(seen.argv).toBeDefined();
       expect(report.events.threadId).toBe('t');
-      expect(errSpy).not.toHaveBeenCalled();
+      if (expectStderr) expect(provenance()).toContain('codex-usage · bucket=observed-bucket primary.used_percent=9');
+      else expect(provenance()).toEqual([]);
     } finally { errSpy.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
   });
 

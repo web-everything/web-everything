@@ -851,8 +851,10 @@ export async function codexDirectTask({
     policy.selfReview = { ...policy.selfReview, enabled: selfReviewEnabled };
     policy.sources['selfReview.enabled'] = 'argument';
   }
-  // `log: false` silences provenance lines (the route resolver honours the same contract); `??` alone keeps `false`.
-  const emit = log === false ? () => {} : (log ?? (line => console.error(line)));
+  // `log: false` silences provenance lines (the route resolver honours the same contract); any other non-function
+  // falls back to stderr, and a throwing logger is swallowed — logging must never break a launch.
+  const sink = typeof log === 'function' ? log : log === false ? null : line => console.error(line);
+  const emit = line => { if (sink) try { sink(line); } catch { /* best-effort */ } };
   emit(formatCascadeSourcesLine('build', { value: policy, sources: policy.sources }));
   gate ??= review ? 'none' : policy.finalGate;
   if (!['none', 'related', 'standards', 'full'].includes(gate)) throw new Error('invalid build gate');
