@@ -96,3 +96,49 @@ it('main moves a review:human PR to NEEDS YOU, retaining its reasons; also lists
   for (const label of ['extend rounds', 'send back past the cap', 'answer the stand-down', 'close']) expect(needsYou).toContain(`    ${label}: `);
   expect(text.split('NOT READY')[1].split('STOOD DOWN')[0]).not.toContain('o/n#5270');
 });
+
+describe('#5773: a card-batch hold the seal job still owns is PARKED, not NEEDS YOU', () => {
+  const pr = { number: 5773, title: 'Admit card "xn5h9sy"', isDraft: true, state: 'OPEN',
+    headRefOid: 'b'.repeat(40), mergeable: 'MERGEABLE', comments: [], statusCheckRollup: [],
+    labels: [{ name: 'review:pending' }, { name: 'review-status:draft-withdrawn' }] };
+  const owned = { status: 'owned', kind: 'filing', batchRef: 'lane/card-batch-filing-4', members: 1, dueAt: '2026-10-20T19:46:24.138Z', reason: null };
+
+  it('returns a parked row with no release command for an owned hold', () => {
+    const row = needsPersonRow('o/n', pr, { cardBatchHold: () => owned });
+    expect(row).toMatchObject({ parked: true, kind: 'card-batch-held', number: 5773, batchRef: 'lane/card-batch-filing-4' });
+    expect(row.commands).toBeUndefined();
+  });
+
+  it.each(['failed', 'overdue', 'done'])('keeps a %s hold in NEEDS YOU with the release command and the cause', (status) => {
+    const row = needsPersonRow('o/n', pr, { cardBatchHold: () => ({ ...owned, status, reason: `cause-${status}` }) });
+    expect(row.parked).toBeUndefined();
+    expect(row.detail).toContain(`cause-${status}`);
+    expect(row.commands.releaseDraft).toBe('gh pr edit 5773 --repo=o/n --remove-label review-status:draft-withdrawn');
+  });
+
+  it('keeps an unknown withdrawn draft in NEEDS YOU exactly as before', () => {
+    const row = needsPersonRow('o/n', pr, { cardBatchHold: () => null });
+    expect(row).toMatchObject({ kind: 'draft-withdrawn', headline: 'Withdrawn draft — explicit operator release required' });
+  });
+
+  it('main lists the owned hold under PARKED, not NEEDS YOU, and never edits the PR', () => {
+    execFileSync.mockReturnValue(JSON.stringify([pr]));
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const readCardBatchHolds = vi.fn(() => ({ holds: new Map([['o/n#5773', owned]]), errors: [] }));
+    main(['--repo=o/n', '--json'], { readCardBatchHolds });
+    const report = JSON.parse(log.mock.calls.at(-1)[0]);
+    expect(report.needsPerson).toEqual([]);
+    expect(report.parked).toMatchObject([{ number: 5773, kind: 'card-batch-held' }]);
+    expect(readCardBatchHolds).toHaveBeenCalledTimes(1);
+    expect(execFileSync.mock.calls.some(([, args]) => args.includes('edit') || args.includes('ready'))).toBe(false);
+  });
+
+  it('main keeps the row in NEEDS YOU and reports the error when the batch state cannot be read', () => {
+    execFileSync.mockReturnValue(JSON.stringify([pr]));
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    main(['--repo=o/n', '--json'], { readCardBatchHolds: () => { throw new Error('EACCES'); } });
+    const report = JSON.parse(log.mock.calls.at(-1)[0]);
+    expect(report.needsPerson).toMatchObject([{ number: 5773, kind: 'draft-withdrawn' }]);
+    expect(report.errors.join(' ')).toContain('card-batch holds unavailable: EACCES');
+  });
+});

@@ -86,6 +86,14 @@ try { ({ remainingStandDownFindings } = await import('../conveyor/ruling-resolve
 catch { /* Staged copies still surface the question without remaining findings. */ }
 let needsPersonRow;
 try { ({ needsPersonRow } = await import('./operator-queue-needs-person.mjs')); } catch { /* optional in staged copies */ }
+// Card-batch holds (#5766/#5773): a withdrawn draft whose hold the seal job still owns is PARKED, not NEEDS YOU.
+// Optional like its siblings: without it every withdrawn draft keeps the NEEDS YOU row (fail loud).
+let defaultReadCardBatchHolds = null;
+try {
+  const [{ readCardBatchHolds, cardBatchHoldKey }, { cardBatchStateDir }, { effectiveCardBatchPolicy }] = await Promise.all([
+    import('./operator-queue-card-batch-holds.mjs'), import('./card-batch-io.mjs'), import('../lib/card-batch-settings.mjs')]);
+  defaultReadCardBatchHolds = () => ({ ...readCardBatchHolds({ stateDir: cardBatchStateDir(), policy: effectiveCardBatchPolicy() }), keyOf: cardBatchHoldKey });
+} catch { /* staged copies */ }
 
 // The optional ledger also pulls in a graph that staged CLI copies may omit.
 let pausedReferrals = null;
@@ -604,7 +612,7 @@ function readPrJson(args, { attempts, sleep, valid }) {
   }, { attempts, sleep });
 }
 
-export function main(args = process.argv.slice(2), { sleep = blockingSleep, pollAttempts, pollDelayMs, unsupportedPath } = {}) {
+export function main(args = process.argv.slice(2), { sleep = blockingSleep, pollAttempts, pollDelayMs, unsupportedPath, readCardBatchHolds = defaultReadCardBatchHolds } = {}) {
   const standDownQueueSection = reviewSettings?.resolveReviewSettings().standDownQueueSection ?? 'needs-you';
   console.error(`operator-queue: standDownQueueSection=${standDownQueueSection} (source: ${reviewSettings ? reviewSettings.resolveReviewSettingSource('standDownQueueSection') : 'built-in'})`);
   const readAttempts = resolveReadAttempts({ env: process.env, file: readSettings() });
@@ -639,6 +647,21 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
     ready: [], rulingNeeded: [], needsPerson: [], pending: [], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported, laneDecisions, backpressure, reconcileNotes, ...(health ? { health } : {}),
   };
   if (rulingLedgerError) report.errors.push(`ruling-needed section unavailable: ${rulingLedgerError}`);
+  // Read lazily, once, and only when a withdrawn draft asks: most runs have none and must not touch the state.
+  let cardBatch;
+  const cardBatchHold = (repo, number) => {
+    if (!readCardBatchHolds) return null;
+    if (!cardBatch) {
+      try {
+        cardBatch = readCardBatchHolds();
+        for (const error of cardBatch.errors ?? []) report.errors.push(`card-batch state unreadable: ${error}`);
+      } catch (error) {
+        cardBatch = { holds: new Map() };
+        report.errors.push(`card-batch holds unavailable: ${String(error?.message ?? error).split('\n')[0]}`);
+      }
+    }
+    return cardBatch.holds.get(cardBatch.keyOf ? cardBatch.keyOf(repo, number) : `${repo}#${Number(number)}`) ?? null;
+  };
   if (sendBackLedgerError) report.errors.push(`operator send-back check unavailable: ${sendBackLedgerError}`);
   if (savedRedTeamError) report.errors.push(`saved red-team ruling check unavailable: ${savedRedTeamError}`);
   let readFailures = 0;
@@ -754,8 +777,9 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
       }
       for (const pr of prs) {
         if (readyNumbersThisRepo.has(pr.number)) continue;
-        const row = needsPersonRow?.(repo, pr);
+        const row = needsPersonRow?.(repo, pr, { cardBatchHold });
         if (!row) continue;
+        if (row.parked) { (report.parked ??= []).push(row); continue; }
         const notReady = report.notReady.findIndex(r => r.repo === repo && r.number === pr.number);
         report.needsPerson.push({ ...row, alsoNotReady: notReady < 0 ? [] : report.notReady.splice(notReady, 1)[0].reasons });
       }
@@ -840,6 +864,10 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
     printRows(report.unsupported.map((row) => `${row.repo}#${row.prNumber}  ${row.action}  ${row.why}`).join('\n'));
     console.log('NOT READY — agent work (review:human but gates fail):');
     printRows(report.notReady.map((pr) => `${pr.repo}#${pr.number}  ${pr.reasons.join('; ')}`).join('\n'));
+    if (report.parked?.length) {
+      console.log('PARKED — held on purpose; the conveyor releases these itself (no action needed):');
+      printRows(report.parked.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}  ${pr.headline} — ${pr.detail}`).join('\n'));
+    }
     console.log('STOOD DOWN — needs your judgment (a fix agent asked a question; no label changed):');
     printRows(report.stoodDown.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}  `
       + `[stood down ${pr.standDownAt || 'time unknown'}] ${pr.reason || '(no reason recorded)'}`

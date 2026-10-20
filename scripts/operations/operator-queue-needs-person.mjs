@@ -14,13 +14,27 @@ export function latestUnresolvedPersonNote(comments = []) {
   return { createdAt: note.createdAt, headline, detail, key, kind: key?.split(':')[0] ?? null };
 }
 
-export function needsPersonRow(repo, pr) {
+/**
+ * @param {{cardBatchHold?: ((repo:string, number:number) => ReturnType<typeof import('./operator-queue-card-batch-holds.mjs').classifyCardBatchHold>|null)}} [opts]
+ *   `cardBatchHold` looks up the card-batch seal job's hold on this PR (we:scripts/operations/operator-queue-card-batch-holds.mjs).
+ *   A hold the seal job still owns returns a `parked: true` row: the caller shows it under PARKED, never NEEDS YOU.
+ */
+export function needsPersonRow(repo, pr, { cardBatchHold } = {}) {
   if ((pr.state ?? 'OPEN') === 'OPEN' && pr.isDraft === true
       && pr.labels?.some(l => (typeof l === 'string' ? l : l?.name) === WITHDRAWN_LABEL)) {
+    const hold = cardBatchHold?.(repo, pr.number) ?? null;
+    if (hold?.status === 'owned') {
+      return { repo, number: pr.number, title: pr.title, kind: 'card-batch-held', parked: true,
+        batchRef: hold.batchRef, members: hold.members, dueAt: hold.dueAt,
+        headline: 'Card batch still collecting cards — the seal job releases this hold itself',
+        detail: `${hold.members} card(s) in ${hold.batchRef ?? 'the batch'}; release expected by ${hold.dueAt}` };
+    }
     const command = `gh pr edit ${pr.number} --repo=${repo} --remove-label ${WITHDRAWN_LABEL}`;
     return { repo, number: pr.number, title: pr.title, kind: 'draft-withdrawn',
-      noteAt: pr.updatedAt ?? null, headline: 'Withdrawn draft — explicit operator release required',
-      detail: 'Release the withdrawal only when this PR should return to the guarded promotion and review path.',
+      noteAt: pr.updatedAt ?? null, headline: hold ? `Card batch hold not released (${hold.status})`
+        : 'Withdrawn draft — explicit operator release required',
+      detail: hold ? `${hold.reason}. Fix the cause, then release the withdrawal only when this PR should return to the guarded promotion and review path.`
+        : 'Release the withdrawal only when this PR should return to the guarded promotion and review path.',
       command, commands: { releaseDraft: command } };
   }
   const note = latestUnresolvedPersonNote(pr.comments);
