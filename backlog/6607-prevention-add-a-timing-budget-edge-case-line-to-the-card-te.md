@@ -17,8 +17,8 @@ Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outsta
 2. `we:backlog/6266-we-operator-override-slice-1-host-wide-store-and-operator-on.md:9` — The x3g7q2m lint should also reject cards whose body names another card's export as a dependency (`slice N's <symbol>`) without a matching blockedBy edge, and reject blockedBy cycles.
 3. `we:backlog/6266-we-operator-override-slice-1-host-wide-store-and-operator-on.md:30` — Add a card-lint review-checklist item: every limit stated for a write path needs a named read-path test, because the log is directly writable. Where possible, enforce invariants in the shared view function.
 4. `we:backlog/6265-we-operator-override-slice-4-needs-you-flag-for-confirmed-lo.md:75` — Extend the planned acceptance-mapping lint in x3g7q2m to require structured mappings for each failure condition and each persisted-state guarantee; map invalid identity to an explicit cursor-preservation assertion.
-5. `we:backlog/6265-we-operator-override-slice-4-needs-you-flag-for-confirmed-lo.md:29` — Extend the already-filed acceptance-coverage gate in backlog/x3g7q2m to require explicit default, initial-state and pagination-continuation test references for cursor-based consumers.
-6. `we:backlog/6265-we-operator-override-slice-4-needs-you-flag-for-confirmed-lo.md:75` — Extend the already-filed acceptance-coverage work in backlog/x3g7q2m with structured mappings from each error condition to assertions on persistent state and recovery.
+5. `we:backlog/6265-we-operator-override-slice-4-needs-you-flag-for-confirmed-lo.md:29` — Extend the already-filed acceptance-coverage gate in backlog/6311 to require explicit default, initial-state and pagination-continuation test references for cursor-based consumers.
+6. `we:backlog/6265-we-operator-override-slice-4-needs-you-flag-for-confirmed-lo.md:75` — Extend the already-filed acceptance-coverage work in backlog/6311 with structured mappings from each error condition to assertions on persistent state and recovery.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5549@aa45975818769155a9798e6522b04eaf9600f7ff
 
