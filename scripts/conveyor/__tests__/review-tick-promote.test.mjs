@@ -323,4 +323,18 @@ describe('stale-accept hold vs guarded re-arm share one coverage verdict (#5771 
       replan: () => ({ dispatch: [row], refusals: [] }) });
     expect(r.plan.dispatch).toEqual([row]);
   });
+  it('provider (#5771 live): a trusted fix-run "repair unproductive" note after the accept does not supersede it; a forged one does', () => {
+    const note = (extra) => ({ body: '**fix-run: codex repair unproductive on bb9e8137d**\n\n```text\n- failed\n```\n\nThe next repair falls back to Claude.', ...extra });
+    expect(provider(DIFF, undefined, { prOverride: { comments: [...pr.comments, note({ viewerDidAuthor: true })] } }).fn()).toEqual(expect.objectContaining({ ok: false, covers: true }));
+    expect(provider(DIFF, undefined, { prOverride: { comments: [...pr.comments, note({ author: { login: 'random-user' } })] } }).fn().covers).toBeUndefined();
+  });
+  it('daemon wiring: runReviewTick passes a covers refusal to noteRearms as released and drops the hold', () => {
+    const noteRearms = vi.fn();
+    const prs = [{ number: 5771, state: 'OPEN', isDraft: false, headRefName: 'lane/x-5771', headRefOid: B, labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }], isCrossRepository: false }];
+    const reconcile = vi.fn(() => ({ dispatch: [row], refusals: [] }));
+    const out = runReviewTick({ repo: REPO, readPrs: () => prs, readAgents: () => [], reconcile, dispatch: vi.fn(), tagRound: vi.fn(), tagStatus: vi.fn(),
+      statusCandidates: () => [], holdReconcile: () => [], rearmStaleAccepts: () => ({ ok: false, covers: true, coveredHead: B, reason: 'x' }), noteRearms });
+    expect(noteRearms).toHaveBeenCalledWith(expect.objectContaining({ rearms: [expect.objectContaining({ pr: 5771, released: true })] }));
+    expect(out).toBeDefined();
+  });
 });

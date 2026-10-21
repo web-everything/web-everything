@@ -156,7 +156,14 @@ export function isKnownMachineBody(body, comment = undefined) {
   if (isLaterVerdictBody(text)) return false;
   if (MECHANICAL_PARK_RE.test(text)) return true;
   if (ADVISORY_NOTE_RE.test(text)) return !ADVISORY_CHANGES_RE.test(text);
-  return isApprovalPreventionNotice(text, comment) || KNOWN_MACHINE_SHAPE_RES.some((re) => re.test(text));
+  return isApprovalPreventionNotice(text, comment) || isTrustedFixRunNote(text, comment) || KNOWN_MACHINE_SHAPE_RES.some((re) => re.test(text));
+}
+
+/** `fix-run.mjs`'s "codex repair unproductive" note (#5771 live): a mechanical status line that says nothing about the clearance.
+ * Needs the comment's metadata and a TRUSTED author, so a body-only caller and a forged lookalike both stay on the safe side. */
+const FIX_RUN_UNPRODUCTIVE_RE = /^\s*\*\*fix-run: codex repair unproductive on [0-9a-f]{7,40}\*\*\s*\n/;
+function isTrustedFixRunNote(text, comment) {
+  return comment !== undefined && isTrustedMarkerAuthor(comment) && FIX_RUN_UNPRODUCTIVE_RE.test(text);
 }
 
 /**
