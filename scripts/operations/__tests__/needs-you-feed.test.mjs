@@ -390,7 +390,7 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     const { kept } = await gateReadyItems(withFlag, report, { gh: gate({ headRefOid: head, labels: [] }, []), log: () => {} });
     expect(kept.incomplete).toBe(true);
   });
-
+});
 
 it('a silent same-head pause reaches the feed with unattempted referrals and deduplicates by head/kind', async () => {
   const { rulingNeededRow } = await import('../operator-queue.mjs');
