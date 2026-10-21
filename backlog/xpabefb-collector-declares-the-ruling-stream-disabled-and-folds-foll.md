@@ -30,16 +30,16 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] No filer routes to ruling and the stream ships disabled; x7nf3f5 wires and enables it.
 
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — n/a: the inputs are the policy JSON and the origin field set by filers; an unknown origin routes as it does today.
+2. **Truncated reads** — an invalid or partial policy is refused `invalid-policy`, as today.
+3. **Shared state files** — n/a: the policy is read-only config.
+4. **Fail closed** — a disabled stream refuses `kind-disabled`, distinct from an unknown kind (case `disabled ruling refuses kind-disabled, not unknown kind`).
+5. **Identity scoping** — each stream has its own policy block; routing is by the card's origin.
+6. **State over time** — n/a: no stored state.
+7. **Who wrote it** — n/a: config and routing only; who may file a ruling card is x7nf3f5's.

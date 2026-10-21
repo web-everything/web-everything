@@ -16,6 +16,7 @@ Found at PR #5492 (head fa23a3d), operator-carded as expedite under decision xug
 - [A1] **Executable** — `node --test we:scripts/__tests__/merge-ai-prs-observation-snapshot.test.mjs` fails before this item lands and passes after. Planned cases:
   - `head-moved and carried observations update same-pass holds and verdicts` (we:scripts/__tests__/merge-ai-prs-observation-snapshot.test.mjs) — both the hold and the verdict read the rows appended in this pass.
   - `snapshot refresh reads only the appended rows` (we:scripts/__tests__/merge-ai-prs-observation-snapshot.test.mjs) — the refresh reads the ledger from the pre-append offset, never the whole file.
+  - `failed snapshot refresh holds PRs with rows appended this pass` (we:scripts/__tests__/merge-ai-prs-observation-snapshot.test.mjs) — fault injection: the refresh read fails, and every PR with a row appended this pass is held, not merged.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -23,16 +24,16 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] No change to what the ledger records; only when the pass reads it.
 
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — appended rows are parsed by the existing ledger reader; a malformed row is handled as it is today.
+2. **Truncated reads** — the refresh reads from the pre-append offset; a short or failed read counts as a failed refresh (see Fail closed).
+3. **Shared state files** — the ledger is append-only and the drain pass is its writer; the refresh reads only the range this pass appended.
+4. **Fail closed** — if the refresh fails, every PR with a row appended this pass is held for this pass, never merged on the stale snapshot (case `failed snapshot refresh holds PRs with rows appended this pass`).
+5. **Identity scoping** — rows are matched by repo and PR number.
+6. **State over time** — the core of this card: rows written in a pass are visible to that pass's holds and verdicts.
+7. **Who wrote it** — n/a: only the drain writes the ledger.

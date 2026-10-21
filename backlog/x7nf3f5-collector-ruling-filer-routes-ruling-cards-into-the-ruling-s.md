@@ -13,7 +13,11 @@ tags: []
 
 # Collector ruling filer routes ruling cards into the ruling stream and enables it
 
-Decision x5ioz96 fork 1 skeptic amendment: a card must wire the ruling filer to the collector, otherwise ruling stays declared and unused and rulings keep being hand-batched (lane/rulings-1018-cards). After xpabefb declares ruling disabled, add the ruling-card filer and flip the shipped default to enabled. No ruling filer exists today (rulings are hand-batched), so this card creates one: we:scripts/operations/land-ruling-card.mjs, the caller that files a ruling card through we:scripts/operations/card-batch-file.mjs with kind ruling. Flipping the default changes xpabefb's disabled-default case, so this card updates that case in we:scripts/lib/__tests__/card-batch-policy.test.mjs to assert enabled with 8 / 60.
+Decision x5ioz96 fork 1 skeptic amendment: a card must wire the ruling filer to the collector, otherwise ruling stays declared and unused and rulings keep being hand-batched (lane/rulings-1018-cards). After xpabefb declares ruling disabled, add the ruling-card filer and flip the shipped default to enabled. No ruling filer exists today (rulings are hand-batched), so this card creates one: we:scripts/operations/land-ruling-card.mjs, the caller that files a ruling card through we:scripts/operations/card-batch-file.mjs with kind ruling. Flipping the default changes two of xpabefb's planned cases that assert the shipped defaults, and this card replaces both:
+- `ruling is declared with disabled 8/60 defaults` (we:scripts/lib/__tests__/card-batch-policy.test.mjs) becomes `ruling ships enabled with 8/60 defaults`.
+- `disabled ruling refuses kind-disabled, not unknown kind` (we:scripts/operations/__tests__/card-batch-file.test.mjs) keeps its assertion but sets `enabled: false` through an explicit setting override, so the disabled-stream refusal stays covered.
+
+A ruling card records a human decision, so the filer only accepts one with operator provenance: a `kind: decision` card with `status: resolved` and a `## Ruling` section that quotes the operator. Anything else is refused before it reaches the collector.
 
 ## Acceptance
 
@@ -22,6 +26,8 @@ Decision x5ioz96 fork 1 skeptic amendment: a card must wire the ruling filer to 
   - `ruling cards are admitted into the ruling batch, not filing` (we:scripts/operations/__tests__/card-batch-file.test.mjs).
   - `high and urgent ruling cards bypass the collector` (we:scripts/operations/__tests__/card-batch-file.test.mjs).
   - `ruling ships enabled with 8/60 defaults` (we:scripts/lib/__tests__/card-batch-policy.test.mjs) — replaces xpabefb's disabled-default case.
+  - `disabled ruling refuses kind-disabled, not unknown kind` (we:scripts/operations/__tests__/card-batch-file.test.mjs) — rewritten to disable ruling through an explicit override, since the shipped default is now enabled.
+  - `ruling card without operator provenance is refused` (we:scripts/operations/__tests__/land-ruling-card.test.mjs) — a card that is not a resolved decision with a `## Ruling` section quoting the operator is refused, and nothing is admitted.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -29,16 +35,17 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] No change to how rulings are made or ratified; this only batches already-resolved ruling cards.
+- [N2] No new collector mechanics: admission, sealing and retirement are the other slices'.
 
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — the card's frontmatter and Ruling section are parsed; a card that fails to parse is refused, never filed (case `ruling card without operator provenance is refused`).
+2. **Truncated reads** — an unreadable or partial card file is refused, never filed.
+3. **Shared state files** — the filer goes through `card-batch-file`, so the existing per-kind lease covers the collector state; the filer itself keeps no state.
+4. **Fail closed** — no provenance, a parse error or a coordinator refusal leaves the card unfiled and reported, never admitted.
+5. **Identity scoping** — the ruling stream is its own kind, keyed by repo; a ruling card never lands in the filing batch (case `ruling cards are admitted into the ruling batch, not filing`).
+6. **State over time** — n/a: the filer is stateless; batch lifecycle is x5nmdnt's.
+7. **Who wrote it** — only a resolved decision card whose `## Ruling` section quotes the operator is accepted; a mechanical caller cannot file a ruling without one.

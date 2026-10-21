@@ -154,5 +154,5 @@ Screen: flagged(impl) -> tooling ownership, invisible across the WE-FUI boundary
 3. **Shared state files** - the collector state file is shared; retirement runs under the existing lease (the carved child, x5nmdnt).
 4. **Fail closed** - an unreadable PR state keeps the batch sealed and holds, never retires.
 5. **Identity scoping** - state is keyed by repo and kind.
-6. **State over time** - the stuck state is exactly this class; GitHub is the truth source. Merged: retire. Closed by a split: retire (the survivors are on the remainder PR). Closed otherwise: archive with its members, retire, and surface the members as needs-you. Unreadable: stay sealed and held. Each row has a named case in x5nmdnt.
+6. **State over time** - the stuck state is exactly this class; GitHub is the truth source. Open: stays sealed. Merged: retire. Closed by a split: retire (the survivors are on the remainder PR). Closed otherwise: archive with its members, retire, and surface the members as needs-you. Unreadable: stay sealed and held. Each row has a named case in x5nmdnt.
 7. **Who wrote it** - n/a: mechanical filers only.

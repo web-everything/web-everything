@@ -26,16 +26,16 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] No change to the numbering operation itself or to the land-time uniqueness check (statute backlog-ids-numbered-before-publish rule 1).
 
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — card bodies are rewritten only by the declared numbering operation; the seal step does no text substitution of its own.
+2. **Truncated reads** — numbering output that does not cover every member counts as a failure; the batch stays held.
+3. **Shared state files** — the step runs under the seal lease on the collector branch; the rewritten head is recorded before verify runs on it.
+4. **Fail closed** — any numbering failure keeps the batch held and never reaches ready (case `numbering failure retains the hold and never reaches ready`).
+5. **Identity scoping** — numbers are allocated per repo through the declared operation.
+6. **State over time** — a re-run after a timeout must not renumber (x245i7o's case `timeout during number-members then resume leaves each member numbered exactly once`).
+7. **Who wrote it** — the numbering commit is not an admit commit; if the batch is later closed, x5nmdnt surfaces it through the PR link.

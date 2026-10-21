@@ -13,7 +13,7 @@ Build the ruling of decision x5ioz96 (we:docs/agent/platform-decisions.md#collec
 
 ## Acceptance
 
-- [A1] **Executable** — every planned case named in the [A1] of x5nmdnt, x1mmp60, x245i7o, xf1z2w3, xpabefb and x7nf3f5 exists and passes. Passing the suites alone is not enough: each named case must assert its behaviour.
+- [A1] **Executable** — every planned case named in the [A1] of x5nmdnt, x1mmp60, x245i7o, xf1z2w3, xpabefb and x7nf3f5 exists and passes. Passing the suites alone is not enough: each named case must assert its behaviour. Cases where slices interact are owned by the later slice and listed here so they are tested together: `timeout during number-members then resume leaves each member numbered exactly once` (x245i7o over x1mmp60), `aged-hold archive is never relaunched by the seal scan and keeps its hold label` (xf1z2w3 over x5nmdnt's scan), and the two xpabefb default cases that x7nf3f5 replaces.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -21,16 +21,16 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] Code PRs never join a collector; the shared-rule-file conflicts stay with card 6250.
 
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — n/a: an epic; each slice states its own handling (x5nmdnt, x1mmp60, x245i7o, xf1z2w3, xpabefb, x7nf3f5).
+2. **Truncated reads** — n/a: an epic; see the slices.
+3. **Shared state files** — n/a: an epic; see the slices.
+4. **Fail closed** — n/a: an epic; see the slices.
+5. **Identity scoping** — n/a: an epic; see the slices.
+6. **State over time** — n/a: an epic; the cross-slice cases are listed in [A1].
+7. **Who wrote it** — n/a: an epic; see the slices.
