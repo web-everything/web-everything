@@ -19,6 +19,7 @@ import { join, resolve } from 'node:path';
 import { acquireRunnerLease, makeOwner, heartbeatRunnerLease, RUNNER_LEASE_MINUTES } from '../../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY } from '../../skills-src/conveyor/verify-daemon.mjs';
 import { LEASE_FILENAME } from '../lib/lane-lease.mjs';
+import { keepAliveScript } from '../lib/test-keepalive.mjs';
 import { verifyFinishBody } from '../lib/lane-verify.mjs';
 import { GATE_STARTED_MARKER, GATE_QUEUED_MARKER } from '../conveyor/verify-dispatch.mjs';
 
@@ -113,7 +114,7 @@ describe('verify-lane — hard per-phase timeout (verify-admission, 2026-10-20)'
     // The gate forks a grandchild that would outlive a plain kill of the shell, then hangs (the 8h42m vitest case).
     const pidFile = join(dir, 'grandchild.pid');
     const gateScript = join(dir, 'hang.mjs');
-    writeFileSync(gateScript, `import { spawn } from 'node:child_process';\nimport { writeFileSync } from 'node:fs';\nconst g = spawn('sleep', ['120'], { stdio: 'ignore' });\nwriteFileSync(${JSON.stringify(pidFile)}, String(g.pid));\nsetInterval(() => {}, 1000);\n`);
+    writeFileSync(gateScript, `import { spawn } from 'node:child_process';\nimport { writeFileSync } from 'node:fs';\nconst g = spawn('sleep', ['120'], { stdio: 'ignore' });\nwriteFileSync(${JSON.stringify(pidFile)}, String(g.pid));\n${keepAliveScript()}\n`);
     const started = Date.now();
     const r = spawnSync('node', [VERIFY_LANE, `--gate=node ${gateScript}`, '--json'], { cwd: dir, encoding: 'utf8', timeout: 60_000,
       env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_PHASE_TIMEOUT_MS: '2000' } });
