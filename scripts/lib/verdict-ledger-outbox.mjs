@@ -53,8 +53,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { retryTransientGit } from './git-fetch-retry.mjs';
 import { assertPushRef, trackingRefspec, withGitError, worktreeGitEnv } from './git-transport-branch.mjs';
 import { parseLedgerEvents, ledgerEventId } from './verdict-ledger.mjs';
-// A cycle by design (the io-shell imports this module); used only at call time, never during module evaluation.
-import { ledgerGitPath } from './verdict-ledger-io.mjs';
+import { ledgerGitPath } from './verdict-ledger-path.mjs';
 import { workspaceFor } from './lane-pool-paths.mjs';
 import { readSettings } from './settings-files.mjs';
 import { reserve, readLockEntry, releaseLockDirIf, heartbeatOwn } from '../readiness/file-locks.mjs';
