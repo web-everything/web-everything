@@ -362,6 +362,39 @@ describe('x5059uu — rebuild keeps established overlays and parks the conflicti
     expect(isAncestor(f.clone, movedMain, survives.finalSha)).toBe(false);
   });
 
+  // x9diisp (Codex finding on #5757) — an ESTABLISHED current tip entered the build through a stack top that was then
+  // retired. Another carrier preserves only the OLDER recorded tip of the same overlay. That must not clear the hold:
+  // the newer tip's live changes would be dropped.
+  it('keeps the hold for an established newer tip carried through a retired top when a carrier keeps only the older tip', async () => {
+    const f = fixture();
+    const ref = 'lane/base';
+    const worker = 'scripts/worker.mjs';
+    const oldBase = f.push(ref, f.init, { 'a.txt': 'older hotfix\n' });
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    // The running build recorded the base at its OLDER tip.
+    const recorded = await planRebuild({ git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref, pr: 5004 }] });
+    expect(recorded.applied.map((o) => o.ref)).toEqual([ref]);
+    // The base's NEWER tip then entered the build only through a top (since retired).
+    const newBase = f.push(ref, `origin/${ref}`, { [worker]: 'newer live hotfix\n' });
+    const top = f.push('lane/top', newBase, { 'top.txt': 'top\n' });
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const tree = gitOk(f.clone, ['merge-tree', '--write-tree', recorded.finalSha, top]).split('\n')[0].trim();
+    const head = gitOk(f.clone, ['commit-tree', tree, '-p', recorded.finalSha, '-p', top, '-m', 'merge top']).trim();
+    expect(isAncestor(f.clone, newBase, head)).toBe(true);
+    // Another carrier keeps the older tip only; main now rewrites the file the newer tip changed.
+    f.push('lane/carrier', oldBase, { 'c.txt': 'carrier\n' });
+    f.push('main', f.init, { [worker]: 'main rewrite\n' });
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const plan = await planRebuild({
+      git: f.runGit, headSha: head, mainRef: 'origin/main', overlays: [{ ref: 'lane/carrier' }, { ref, pr: 5004 }],
+    });
+    expect(plan.applied.map((o) => o.ref)).toEqual(['lane/carrier']);
+    expect(plan.decisions).toContainEqual(expect.objectContaining({ ref, action: 'drop', reason: 'conflict' }));
+    expect(isAncestor(f.clone, oldBase, plan.finalSha)).toBe(true);
+    expect(isAncestor(f.clone, newBase, plan.finalSha)).toBe(false);
+    expect(plan.establishedLost).toEqual([expect.objectContaining({ ref, pr: 5004, reason: 'conflict' })]);
+  });
+
   // x9diisp — the attributed smoke fallback (set the culprit aside, keep the rest) replans without the culprit. Here the
   // culprit's change is what let the LIVE overlay apply (main moved onto the overlay's block; the culprit carries the
   // resolution), so replanning without it would drop that live overlay, smoke clean and adopt the tree without it.
