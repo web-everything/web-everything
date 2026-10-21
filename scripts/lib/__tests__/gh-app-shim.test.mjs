@@ -1399,6 +1399,13 @@ require(${JSON.stringify(shim)});
     ['secret', 'set', 'NAME', '-zr', 'enterprise/owner/repo'],
     ['auth', 'status', '-xh', 'github.corp.example'],
     ['auth', 'status', '-xhgithub.corp.example'],
+    // browse -c has an optional value (--commit[=last]): it takes neither the rest nor the next argument.
+    ['browse', '-c', '-R', 'github.corp.example/owner/repo'],
+    ['browse', '-c', '--repo', 'github.corp.example/owner/repo'],
+    ['browse', '-c', '-R=github.corp.example/owner/repo'],
+    ['browse', '-nc', '-R', 'github.corp.example/owner/repo'],
+    ['browse', '-cRgithub.corp.example/owner/repo'],
+    ['browse', '-wcR', 'github.corp.example/owner/repo'],
   ])('refuses enterprise hosts before using a fresh public App cache: %j', (...argv) => {
     const f = fixture({ fresh: true });
     try {

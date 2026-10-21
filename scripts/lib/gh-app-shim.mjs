@@ -759,6 +759,8 @@ function unsupportedTargetHost(argv, env) {
   }[command] || (argv[0] === 'browse' ? 'anprsw' : '');
   // Value shorthands from gh 2.95 help: inside a bundle they take the rest as content
   // (-BRelease/a/b is a base branch). Any shorthand in neither table is uncertain.
+  // Optional-value shorthands (browse -c, \`--commit[=last]\`) never take the rest or the
+  // next argument, so they stay out of this table and are scanned as uncertain.
   const valueShorthands = {
     'pr list': 'aABHlLSs', 'issue list': 'aAlLmSs', 'pr create': 'aBbFHlmprTt', 'issue create': 'abFlmpTt',
     'pr checks': 'i', 'pr checkout': 'b', 'pr merge': 'AbFt', 'pr close': 'c', 'pr diff': 'e', 'pr review': 'bF',
@@ -769,7 +771,7 @@ function unsupportedTargetHost(argv, env) {
     'workflow view': 'r', 'workflow run': 'r', 'cache delete': 'r', 'cache list': 'kLOrS', 'label create': 'cd',
     'label list': 'LS', 'label edit': 'cdn', 'ruleset list': 'Lo', 'ruleset view': 'o', 'secret set': 'abefov',
     'secret list': 'aeo', 'variable set': 'befov', 'codespace create': 'bdlm', 'codespace cp': 'cp',
-  }[command] || (argv[0] === 'browse' ? 'bc' : '');
+  }[command] || (argv[0] === 'browse' ? 'b' : '');
   // After \`--\` gh reads -x/o/r as a repository argument, unless pflag took the \`--\` as the value of an
   // option (\`pr list --app -- -R x/o/r\` still parses -R). Check both readings: every later argument is
   // a positional here, and the option scan below still runs over all of them.
