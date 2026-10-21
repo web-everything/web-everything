@@ -274,10 +274,20 @@ describe('stale-accept hold vs guarded re-arm share one coverage verdict (#5771 
     const r = defaultRearmStaleAcceptance({ repoSlug: REPO_SLUG, prNumber: 5771, headSha: B, readPr: () => pr, rearm: vi.fn(), readReviews: () => [], readNetDiff: () => ({ scored: false }) });
     expect(r.ok).toBe(false); expect(r.covers).toBeUndefined();
   });
-  it('tick: the #5771 shape (planner holds, re-arm proves cover) releases the row, keeps other rows, and says why', () => {
-    const r = rearmStaleAcceptsThenReplan({ plan: { dispatch: [row, other], refusals: [] }, rawPrs: [pr], repo: REPO, rearm: provider(DIFF).fn, replan: () => { throw new Error('unreached'); } });
-    expect(r.plan.dispatch).toEqual([other]);
+  it('tick: the #5771 shape (planner holds, re-arm proves cover) re-plans with the head-bound release key and uses the planner\'s normal rows', () => {
+    const normal = { kind: 'nothing-owed', phase: 'queued', prNumber: 5771, attempts: 1, cap: 3 };
+    const replan = vi.fn((prs, opts) => ((opts?.staleAcceptReleased ?? []).includes(`5771@${B}`)
+      ? { dispatch: [other], refusals: [normal] } : { dispatch: [row, other], refusals: [] }));
+    const r = rearmStaleAcceptsThenReplan({ plan: { dispatch: [row, other], refusals: [] }, rawPrs: [pr], repo: REPO, rearm: provider(DIFF).fn, replan });
+    expect(replan).toHaveBeenCalledWith(null, { staleAcceptReleased: [`5771@${B}`] });
+    expect(r.plan.refusals).toEqual([normal]);
+    expect(r.plan.dispatch.some((d) => d.variant === 'stale-accept')).toBe(false);
     expect(r.rearms).toEqual([expect.objectContaining({ pr: 5771, ok: false, released: true, why: expect.stringContaining('hold released') })]);
+  });
+  it('tick: a failed re-plan after a proven cover keeps the ORIGINAL plan (still held, never released blind)', () => {
+    const r = rearmStaleAcceptsThenReplan({ plan: { dispatch: [row], refusals: [] }, rawPrs: [pr], repo: REPO, rearm: provider(DIFF).fn, replan: () => { throw new Error('down'); } });
+    expect(r.plan.dispatch).toEqual([row]);
+    expect(r.replanError).toBe('down');
   });
   it('tick: a refusal WITHOUT a proven cover (state moved, unreadable) keeps the hold', () => {
     const r = rearmStaleAcceptsThenReplan({ plan: { dispatch: [row], refusals: [] }, rawPrs: [pr], repo: REPO, rearm: () => ({ ok: false, reason: 'live acceptance coverage unreadable' }), replan: () => { throw new Error('unreached'); } });
@@ -289,10 +299,12 @@ describe('stale-accept hold vs guarded re-arm share one coverage verdict (#5771 
     expect(r.rearms[0].ok).toBe(true);
     expect(r.plan.dispatch[0].kind).toBe('review');
   });
-  it('tick: a released PR is no longer blocked, so its red-team request is not held by the plan', () => {
-    const rearm = provider(DIFF).fn;
-    const r = rearmStaleAcceptsThenReplan({ plan: { dispatch: [row], refusals: [] }, rawPrs: [pr], repo: REPO, rearm, replan: () => null });
-    expect([...r.plan.dispatch, ...r.plan.refusals].some((d) => d.prNumber === 5771)).toBe(false);
+  it('tick: a head mismatch between the proof and the re-planned row re-holds (the planner keeps the stale-accept row)', () => {
+    const C = 'd'.repeat(40);
+    const movedRow = { ...row, headRefOid: C };
+    const replan = vi.fn((prs, opts) => ((opts?.staleAcceptReleased ?? []).includes(`5771@${C}`) ? { dispatch: [], refusals: [] } : { dispatch: [movedRow], refusals: [] }));
+    const r = rearmStaleAcceptsThenReplan({ plan: { dispatch: [row], refusals: [] }, rawPrs: [pr], repo: REPO, rearm: provider(DIFF).fn, replan });
+    expect(r.plan.dispatch).toEqual([movedRow]);
   });
   it('provider (audit): a later hold comment, a pending review label, unreadable reviews, a standing changes-requested review, or a full comment page never prove a cover', () => {
     const hold = { viewerDidAuthor: true, body: 'review paused: independent review required' };
@@ -359,5 +371,35 @@ describe('stale-accept hold vs guarded re-arm share one coverage verdict (#5771 
     const a = defaultRearmStaleAcceptance({ repoSlug: REPO_SLUG, prNumber: 5771, headSha: B, readPr: boom, rearm: vi.fn() });
     const b = defaultRearmStaleAcceptance({ repoSlug: REPO_SLUG, prNumber: 5771, headSha: B, readPr: () => pr, readReviews: boom, rearm: vi.fn(), readNetDiff: () => ({ scored: true, rev: B, text: DIFF }) });
     for (const r of [a, b]) { expect(r.ok).toBe(false); expect(r.covers).toBeUndefined(); expect(r.reason).not.toMatch(/TOPSECRET|FORGED|\r/); }
+  });
+  describe('whole tick: release -> normal rows -> red-team request carries attempts/cap (#5771 live shape)', () => {
+    const request = { repo: REPO, pr: 5771, head: B };
+    const subject = { ...pr, labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }, { name: 'review-round:3' }], isCrossRepository: false, headRefName: 'lane/x-5771' };
+    const normal = { prNumber: 5771, kind: 'nothing-owed', phase: 'queued', attempts: 3, cap: 5 };
+    const tick = (rearmResult) => {
+      const dispatch = vi.fn(() => ({ mode: 'job', jobPid: 4242 }));
+      const log = vi.fn();
+      const reconcile = vi.fn((o = {}) => ((o.staleAcceptReleased ?? []).includes(`5771@${B}`)
+        ? { dispatch: [], refusals: [normal] } : { dispatch: [row], refusals: [] }));
+      const noteRearms = vi.fn();
+      runReviewTick({ repo: REPO, reconcile, readPrs: () => [subject], readAgents: () => [], readRedTeamRequests: () => [request],
+        readReviewEvidence: () => null, redTeamTimingSetting: () => ({ value: { carriedAcceptTriggersReview: true }, sources: { carriedAcceptTriggersReview: 'standard' } }),
+        rearmStaleAccepts: () => rearmResult, noteRearms, log, finishRedTeamRequest: vi.fn(), dispatch, tagRound: vi.fn(), tagStatus: vi.fn(), statusCandidates: () => [], holdReconcile: () => [] });
+      return { dispatch, log, reconcile, noteRearms };
+    };
+    it('a proven cover releases the hold and the red-team request is dispatched with the planner\'s attempts', () => {
+      const t = tick({ ok: false, covers: true, coveredHead: B, reason: 'covers' });
+      expect(t.reconcile).toHaveBeenCalledWith(expect.objectContaining({ staleAcceptReleased: [`5771@${B}`] }));
+      expect(t.dispatch).toHaveBeenCalledTimes(1);
+      expect(t.dispatch.mock.calls[0][0]).toEqual(expect.objectContaining({ pr: 5771 }));
+      expect(t.noteRearms).toHaveBeenCalledWith(expect.objectContaining({ rearms: [expect.objectContaining({ released: true })] }));
+    });
+    it('without a proven cover (or for another head) the request stays held and nothing is dispatched', () => {
+      for (const res of [{ ok: false, reason: 'live acceptance coverage unreadable' }, { ok: false, covers: true, coveredHead: 'e'.repeat(40), reason: 'x' }]) {
+        const t = tick(res);
+        expect(t.dispatch).not.toHaveBeenCalled();
+        expect(t.log.mock.calls.some(([l]) => /red-team request #5771 .* held/.test(l))).toBe(true);
+      }
+    });
   });
 });

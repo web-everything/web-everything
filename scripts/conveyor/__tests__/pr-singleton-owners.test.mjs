@@ -119,6 +119,22 @@ describe('PR sweep: named singleton owners', () => {
     ]);
   });
 
+  it('#5771: a PROVED-covered stale accept (pr@head key) skips the stale-accept row and gets its normal rows, attempts/cap included; any other head re-holds', () => {
+    const p = pr(5771, { labels: labels('ready-to-merge', 'review:accepted'), statusCheckRollup: [check('SUCCESS')],
+      comments: [{ author: { login: 'web-everything' }, createdAt: '2026-10-18T18:00:00Z',
+        body: `✅ review — accepted\n\n<!-- reviewed-sha: ${oldHead} -->` }] });
+    expect(plan(p).dispatch).toEqual([expect.objectContaining({ variant: 'stale-accept' })]);
+    const released = plan(p, { staleAcceptReleased: [`5771@${head.toLowerCase()}`] });
+    expect(released.dispatch.some(d => d.variant === 'stale-accept')).toBe(false);
+    const row = [...released.refusals, ...released.dispatch].find(d => d.prNumber === 5771);
+    expect(row, JSON.stringify(released)).toBeDefined();
+    expect(Number.isInteger(row.attempts) && Number.isInteger(row.cap) && row.cap > 0).toBe(true);
+    // Bound to the proved head: a key for another head (or another PR) changes nothing.
+    for (const key of [`5771@${oldHead}`, `5772@${head}`, '5771']) {
+      expect(plan(p, { staleAcceptReleased: [key] }).dispatch).toEqual([expect.objectContaining({ variant: 'stale-accept' })]);
+    }
+  });
+
   it.each(['same-head', 'human'])('#5628: preserves %s acceptances', mode => {
     const p = pr(5628, { labels: labels('review:accepted'), statusCheckRollup: [check('SUCCESS')],
       comments: [{ author: { login: 'web-everything' },

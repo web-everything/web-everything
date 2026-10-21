@@ -620,9 +620,9 @@ export function runReviewTick({
   if (typeof rearmStaleAccepts === 'function') {
     const out = rearmStaleAcceptsThenReplan({
       plan, rawPrs, repo, rearm: rearmStaleAccepts,
-      replan: (prs) => (sharedReads && prs
-        ? reconcile({ repo, defaultBranch, readPrs: () => prs, readAgents: () => rawAgents })
-        : reconcile({ repo, defaultBranch })),
+      replan: (prs, opts) => (sharedReads && prs
+        ? reconcile({ repo, defaultBranch, readPrs: () => prs, readAgents: () => rawAgents, ...opts })
+        : reconcile({ repo, defaultBranch, ...opts })),
     });
     ({ plan, rawPrs } = out);
     replanError = replanError ?? out.replanError ?? null;
