@@ -24,9 +24,9 @@ describe('ensureLaneHooksPath (injected IO) — the EFFECTIVE value, every scope
       calls.push(args);
       if (args.join(' ') === GET.join(' ')) {
         for (const sc of ['worktree', 'local', 'global']) if (cfg[sc]) return `${sc}\t${cfg[sc]}\n`;
-        throw new Error('exit 1');
+        throw Object.assign(new Error('exit 1'), { status: 1 });
       }
-      if (args[1] === '--local') { cfg.local = args[3]; return ''; }
+      if (args[1] === '--local') { cfg.local = args[args.indexOf('core.hooksPath') + 1]; return ''; }
       if (args[1] === '--worktree' && args[2] === '--unset-all') { delete cfg.worktree; return ''; }
       throw new Error(`unexpected ${args.join(' ')}`);
     };
@@ -121,5 +121,30 @@ describe('provision --no-install sets core.hooksPath in the lane (real git)', ()
     const r = runPool(['status', ...poolArgs()]);
     expect(r.err).toMatch(/core\.hooksPath is not \.githooks in 1 lane\(s\) \(lane-1\)/);
     expect(() => git(['config', '--local', '--get', 'core.hooksPath'], lane)).toThrow();
+  });
+
+  it('repairs duplicate local hooksPath values instead of silently leaving guards disabled', () => {
+    const lane = join(base, 'pool', 'hookspath', 'lane-1');
+    git(['config', '--local', '--add', 'core.hooksPath', '/dev/null'], lane);
+    git(['config', '--local', '--add', 'core.hooksPath', '/other-hooks'], lane);
+    const r = runPool(['provision', '--count=1', ...poolArgs()]);
+    expect(r.code).toBe(0);
+    expect(git(['config', '--local', '--get-all', 'core.hooksPath'], lane)).toBe('.githooks');
+    expect(r.err).toMatch(/lane pre-commit guards now run/);
+  });
+
+  it('reports a real config lock failure without claiming that guards were repaired', () => {
+    const lane = join(base, 'pool', 'hookspath', 'lane-1');
+    git(['config', '--local', 'core.hooksPath', '/dev/null'], lane);
+    const lock = join(lane, '.git', 'config.lock');
+    writeFileSync(lock, 'held');
+    const logs = [];
+    try {
+      expect(ensureLaneHooksPath(lane, { log: (line) => logs.push(line) }).status).toBe('error');
+      expect(logs.join('\n')).toMatch(/core\.hooksPath could not be verified or repaired.*pre-commit guards/);
+      expect(git(['config', '--get', 'core.hooksPath'], lane)).toBe('/dev/null');
+    } finally {
+      rmSync(lock, { force: true });
+    }
   });
 });

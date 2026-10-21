@@ -388,7 +388,11 @@ function writeLaneEnv(repo, n) {
   // (incl. the placeholder-author guard) run even when npm `prepare` never did (`--no-install`, `--reference` clone).
   // Default runner on purpose: NOT laneGitHardeningEnv, which pins core.hooksPath=/dev/null and would hide the value
   // an agent's own commit resolves. `git config` reads/writes execute nothing.
-  ensureLaneHooksPath(laneDir(repo, n), { log });
+  const hooks = ensureLaneHooksPath(laneDir(repo, n), { log });
+  if (!['ok', 'set', 'skipped'].includes(hooks.status)) {
+    // Throw so acquire's existing refused-claim handler restores/releases the lease before trying again.
+    throw new Error(`lane-${n}: core.hooksPath could not be secured (${hooks.detail ?? hooks.status}) — pre-commit guards are not verified; refusing to provision this lane`);
+  }
   const contents = laneEnvLocal(repo, n);
   if (contents === null) return;
   writeFileSync(join(laneDir(repo, n), '.env.local'), contents);
@@ -2838,7 +2842,7 @@ function warnPlaceholderIdentity(lanes) {
   try {
     const env = laneGitHardeningEnv({ ...process.env, GIT_OPTIONAL_LOCKS: '0' });
     // REPORT-only here: `status` writes no state (stale-state and other readers pin that); provision/refresh/acquire set it.
-    const unhooked = lanes.filter(({ dir }) => ['unset', 'override'].includes(ensureLaneHooksPath(dir, { write: false }).status)).map((l) => `lane-${l.lane}`);
+    const unhooked = lanes.filter(({ dir }) => ['unset', 'override', 'error'].includes(ensureLaneHooksPath(dir, { write: false, log }).status)).map((l) => `lane-${l.lane}`);
     if (unhooked.length) log(`⚠ core.hooksPath is not .githooks in ${unhooked.length} lane(s) (${unhooked.slice(0, 5).join(', ')}${unhooked.length > 5 ? ', …' : ''}) — the pre-commit guards do not run there; \`provision\`/\`refresh\`/\`acquire\` sets it.`);
     const r = laneIdentityReport({ lanes, readIn: (dir) => readGitIdentity(dir, { env }), lists: resolveGitIdentityPlaceholders() });
     if (r.status === 'ok') return;

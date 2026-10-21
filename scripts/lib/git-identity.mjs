@@ -207,7 +207,7 @@ export function withoutGitConfigEnv(env = process.env) {
  * config) the tracked `.githooks`. The `prepare` npm script used to be the only thing that set it — `provision
  * --no-install` skips npm and a `--reference` clone does not inherit it — so the pre-commit guard silently never
  * ran there; a worktree-scope `core.hooksPath=/dev/null` also beat a correct local value (audit findings).
- * Repair: set `--local`, drop a lane-owned `--worktree` override, re-read. A global/system override is NOT ours to
+ * Repair: replace all `--local` values, drop a lane-owned `--worktree` override, re-read. A global/system override is NOT ours to
  * change — reported as `override`. Idempotent (reads first, writes only on a difference), logged. Skipped when the
  * checkout has no `.githooks/pre-commit`. `write: false` only reports (read-only callers like `status`). Never throws.
  * @returns {{status:'ok'|'set'|'unset'|'override'|'skipped'|'error', was?:string|null, scope?:string, detail?:string}}
@@ -216,7 +216,7 @@ export function ensureLaneHooksPath(dir, {
   write = true,
   exists = existsSync,
   run = (args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000, maxBuffer: 1024 * 1024, env: withoutGitConfigEnv(process.env) }),
-  log = () => {},
+  log = defaultWarn,
 } = {}) {
   try {
     if (!exists(join(dir, LANE_HOOKS_PATH, 'pre-commit'))) return { status: 'skipped' };
@@ -224,12 +224,17 @@ export function ensureLaneHooksPath(dir, {
       try {
         const [scope, ...rest] = String(run(['config', '--show-scope', '--get', 'core.hooksPath'])).trim().split('\t');
         return { scope, value: rest.join('\t') || null };
-      } catch { return { scope: null, value: null }; }
+      } catch (e) {
+        // `git config --get` exits 1 only when the key is absent. A timeout, unreadable config, etc. must
+        // remain an error, including on the verification read and for read-only status callers.
+        if (e?.status !== 1) throw e;
+        return { scope: null, value: null };
+      }
     };
     const before = effective();
     if (before.value === LANE_HOOKS_PATH) return { status: 'ok', was: before.value, scope: before.scope };
     if (!write) return { status: before.value ? 'override' : 'unset', was: before.value, scope: before.scope };
-    run(['config', '--local', 'core.hooksPath', LANE_HOOKS_PATH]);
+    run(['config', '--local', '--replace-all', 'core.hooksPath', LANE_HOOKS_PATH]);
     if (before.scope === 'worktree') { try { run(['config', '--worktree', '--unset-all', 'core.hooksPath']); } catch { /* re-read decides */ } }
     const after = effective();
     if (after.value !== LANE_HOOKS_PATH) {
@@ -239,6 +244,8 @@ export function ensureLaneHooksPath(dir, {
     try { log(`  ${dir}: core.hooksPath ${before.value ?? '(unset)'}${before.scope ? ` (${before.scope})` : ''} → ${LANE_HOOKS_PATH} (lane pre-commit guards now run)`); } catch { /* log only */ }
     return { status: 'set', was: before.value, scope: before.scope };
   } catch (e) {
-    return { status: 'error', detail: String(e?.message ?? e).split('\n')[0] };
+    const detail = String(e?.message ?? e).split('\n')[0];
+    try { log(`  ⚠ ${dir}: core.hooksPath could not be verified or repaired: ${detail} — the pre-commit guards may NOT run; fix the git config before using this lane`); } catch { /* log only */ }
+    return { status: 'error', detail };
   }
 }

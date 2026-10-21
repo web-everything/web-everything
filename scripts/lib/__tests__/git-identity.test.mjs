@@ -3,10 +3,111 @@
  *   Incident: 2026-10-05..20 the global git config said `test` / `test@test.com` and nothing flagged it.
  */
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { runInNewContext } from 'node:vm';
 import {
   checkGitIdentity, identityVerdict, parseIdent, readGitIdentity, resolveGitIdentityPlaceholders, BUILTIN_PLACEHOLDERS,
-  laneIdentityReport,
+  laneIdentityReport, ensureLaneHooksPath,
 } from '../git-identity.mjs';
+
+describe('hook repair failures cannot silently disable commit guards', () => {
+  const get = ['config', '--show-scope', '--get', 'core.hooksPath'];
+  it('replaces all duplicate local values before verifying the effective value', () => {
+    let values = ['/dev/null', '/other-hooks'];
+    const result = ensureLaneHooksPath('/lane', {
+      exists: () => true,
+      run: (args) => {
+        if (args.join(' ') === get.join(' ')) return `local\t${values.at(-1)}\n`;
+        if (args.join(' ') !== 'config --local --replace-all core.hooksPath .githooks') {
+          throw new Error('cannot overwrite multiple values with a single value');
+        }
+        values = ['.githooks'];
+        return '';
+      },
+    });
+    expect(result.status).toBe('set');
+    expect(values).toEqual(['.githooks']);
+  });
+  it('logs write errors with the lane, failure and guard consequence', () => {
+    const logs = [];
+    const result = ensureLaneHooksPath('/lane', {
+      exists: () => true,
+      run: (args) => {
+        if (args.join(' ') === get.join(' ')) return 'local\t/dev/null\n';
+        throw new Error('could not lock config file\nmore detail');
+      },
+      log: (line) => logs.push(line),
+    });
+    expect(result).toMatchObject({ status: 'error', detail: 'could not lock config file' });
+    expect(logs.join('\n')).toMatch(/\/lane:.*could not lock config file.*pre-commit guards/);
+  });
+  it.each([true, false])('reports a failed read as error (write=%s)', (write) => {
+    const logs = [];
+    let calls = 0;
+    const result = ensureLaneHooksPath('/lane', {
+      write, exists: () => true,
+      run: () => { calls++; throw Object.assign(new Error('git config timed out'), { code: 'ETIMEDOUT' }); },
+      log: (line) => logs.push(line),
+    });
+    expect(result.status).toBe('error');
+    expect(calls).toBe(1);
+    expect(logs.join('\n')).toMatch(/git config timed out/);
+  });
+  it('only an absent key (git exit 1) is treated as unset', () => {
+    const result = ensureLaneHooksPath('/lane', {
+      write: false, exists: () => true,
+      run: () => { throw Object.assign(new Error('key absent'), { status: 1 }); },
+    });
+    expect(result).toMatchObject({ status: 'unset', was: null });
+  });
+  it('a failed verification read cannot report successful repair', () => {
+    let reads = 0;
+    const logs = [];
+    const result = ensureLaneHooksPath('/lane', {
+      exists: () => true,
+      run: (args) => {
+        if (args.join(' ') !== get.join(' ')) return '';
+        if (++reads === 1) return 'local\t/dev/null\n';
+        throw Object.assign(new Error('cannot read repaired config'), { status: 128 });
+      },
+      log: (line) => logs.push(line),
+    });
+    expect(result.status).toBe('error');
+    expect(logs.join('\n')).toMatch(/cannot read repaired config/);
+  });
+  it('still returns an error if its logger throws', () => {
+    expect(ensureLaneHooksPath('/lane', {
+      exists: () => { throw new Error('unreadable hooks'); },
+      log: () => { throw new Error('logger failed'); },
+    })).toMatchObject({ status: 'error', detail: 'unreadable hooks' });
+  });
+  // Exercise the actual shared provision/refresh/acquire function without starting the pool CLI or writing Git state.
+  const pool = readFileSync(resolve(process.cwd(), 'scripts/lane-pool.mjs'), 'utf8');
+  const start = pool.indexOf('function writeLaneEnv(');
+  const body = pool.slice(start, pool.indexOf('\n}', start) + 2);
+  it.each(['error', 'override', 'unset'])('the pool refuses a lane when hook repair returns %s', (status) => {
+    let writes = 0;
+    const invoke = () => runInNewContext(`${body}\nwriteLaneEnv({}, 7);`, {
+      ensureLaneHooksPath: () => ({ status, detail: 'repair failed' }),
+      laneDir: () => '/lane', log: () => {},
+      laneEnvLocal: () => 'PORT=1234',
+      writeFileSync: () => { writes++; }, join: (...parts) => parts.join('/'),
+    });
+    expect(invoke).toThrow(/core\.hooksPath.*pre-commit guards/);
+    expect(writes).toBe(0);
+  });
+  it.each(['ok', 'set', 'skipped'])('the pool still proceeds when hook repair returns %s', (status) => {
+    let writes = 0;
+    runInNewContext(`${body}\nwriteLaneEnv({}, 7);`, {
+      ensureLaneHooksPath: () => ({ status }),
+      laneDir: () => '/lane', log: () => {},
+      laneEnvLocal: () => 'PORT=1234',
+      writeFileSync: () => { writes++; }, join: (...parts) => parts.join('/'),
+    });
+    expect(writes).toBe(1);
+  });
+});
 
 describe('checkGitIdentity', () => {
   it('flags the exact incident identity', () => {
