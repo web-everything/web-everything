@@ -240,10 +240,16 @@ describe('file-item related-card gate', () => {
     expect(highFloor.matches.length).toBeGreaterThan(0);
     expect(formatRelatedItemsPolicy(policy())).toMatch(/floor=.*limit=.*queryTerms=.*weights=text:/);
     // past the display cap: 201 qualifying cards, naming the 201st still satisfies the gate
-    const many = Array.from({ length: 201 }, (_, i) => ({ ...cards.find((c) => c.id === '5743'), id: String(7000 + i), rel: `backlog/${7000 + i}-x.md` }));
-    const g201 = planRelatedCheck({ cards: many, policy: policy({ fileItem: 'refuse' }), today: TODAY }, { ...filing, related: '7200' });
-    expect(g201.above.length).toBeLessThan(201);
+    // (copies of 5743 inside the real fixture corpus, so IDF still separates them from the rest)
+    const many = [...cards, ...Array.from({ length: 201 }, (_, i) => ({ ...cards.find((c) => c.id === '5743'), id: String(7000 + i), rel: `backlog/${7000 + i}-x.md` }))];
+    const strict = policy({ fileItem: 'refuse', threshold: 0.2 });
+    const ranked = rankRelatedItems({ query: { text: `${filing.title}\n${filing.digest}` }, cards: many, policy: strict, today: TODAY });
+    expect(ranked.aboveThreshold).toBeGreaterThanOrEqual(202);
+    expect(ranked.aboveIds).toHaveLength(200);
+    expect(ranked.aboveIds).not.toContain('7200');
+    const g201 = planRelatedCheck({ cards: many, policy: strict, today: TODAY }, { ...filing, related: '7200' });
     expect(g201.refuse).toBe(false);
+    expect(planRelatedCheck({ cards: many, policy: strict, today: TODAY }, filing).refuse).toBe(true);
   });
 
   it('an unrelated filing produces no lines even in refuse mode', () => {
