@@ -151,7 +151,7 @@ function respoolClosed(state, input, stateDir, remote, held) {
       || data.source?.repo !== input.source.repo || data.batchRef !== state.batchRef
       // A raised-by sidecar ("also raised" note) is keyed by its own `rb-…` id; a card by its `<id>-` prefix.
       || (raisedBySidecarId(data.cardPath) ? raisedBySidecarId(data.cardPath) !== member.cardId
-        : (!/^backlog\/[a-z0-9]+-[a-z0-9-]+\.md$/.test(data.cardPath)
+        : (!/^[a-z0-9]+$/.test(member.cardId) || !/^backlog\/[a-z0-9]+-[a-z0-9-]+\.md$/.test(data.cardPath)
           || !data.cardPath.startsWith(`backlog/${member.cardId}-`)))) throw new Error('invalid member evidence');
     if (git(['ls-tree', main, '--', data.cardPath]).trim()) return null;
     if (!git(['ls-tree', member.commitSha, '--', data.cardPath]).startsWith('100644 blob ')) throw new Error('invalid card mode');
