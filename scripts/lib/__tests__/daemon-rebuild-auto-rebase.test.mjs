@@ -433,4 +433,35 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     expect(plan.decisions[0]).toMatchObject({ action: 'drop', reason: 'conflict' });
     expect(plan.alerts.map((a) => a.kind)).toContain('overlay-set-aside');
   });
+
+  it('round 12: an overlay that merged newer main after X (then reverted part of it) is never rebased with X as base', async () => {
+    const f = fixture({ mode: 'on' });
+    const author = `${dirname(f.clone)}/author`;
+    const x1 = f.push('lane/standing-ruling', f.init, { [GATE]: lines({ 2: 'grant v1', 7: 'flag off' }) });
+    // main moves the flag on
+    gitOk(author, ['fetch', '-q', 'origin']);
+    gitOk(author, ['checkout', '-q', '-B', 'main', 'origin/main']);
+    write(author, GATE, lines({ 7: 'flag on' }));
+    gitOk(author, ['commit', '-q', '-am', 'main: flag on']);
+    gitOk(author, ['push', '-q', 'origin', 'HEAD:refs/heads/main']);
+    const mainB = gitOk(author, ['rev-parse', 'HEAD']).trim();
+    // the container builds on X, merges that main, then deliberately turns the flag back off
+    gitOk(author, ['checkout', '-q', '-B', 'lane/container', x1]);
+    spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'merge', '-q', '--no-edit', mainB], { cwd: author });
+    write(author, GATE, lines({ 2: 'grant v1', 7: 'flag off', 10: 'own' }));
+    gitOk(author, ['add', '-A']);
+    gitOk(author, ['commit', '-q', '-m', 'container: merge main, keep flag off']);
+    gitOk(author, ['push', '-q', 'origin', '+HEAD:refs/heads/lane/container']);
+    const x2 = f.push('lane/standing-ruling', 'origin/main', { [GATE]: lines({ 2: 'grant v2', 7: 'flag on' }) });
+    f.mergePr(PR, x2, 'lane/standing-ruling');
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const plan = await planRebuild({
+      git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref: 'lane/container', pr: 5801 }],
+      prMerge: f.prMerge, commitPulls: async () => [PR], adoptedHeads: [{ pr: PR, sha: x1 }], autoRebase: { mode: 'on', source: 'test' },
+    });
+    expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-auto-rebased');
+    const d = plan.decisions[0];
+    if (d.action === 'apply') expect(gitOk(f.clone, ['show', `${plan.finalSha}:${GATE}`])).toContain('flag off');
+    else expect(d).toMatchObject({ action: 'drop', reason: 'conflict' });
+  });
 });

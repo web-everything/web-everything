@@ -118,7 +118,15 @@ export async function mergedPrOldHeads({
  */
 export function tryAutoRebase({ git, cur, ovSha, candidates }) {
   const curTree = verifyRev(git, `${cur}^{tree}`);
+  // X may only REFINE the real merge base, never replace a newer one (Codex round 12): if the overlay merged history
+  // the build shares that X lacks (e.g. a later main commit, then reverted part of it), forcing X as base would read the
+  // overlay's own later change as "unchanged since X" and silently take the build's side. So every real merge base of
+  // (cur, overlay) must be an ancestor of X; any doubt refuses.
+  const realBases = git(['merge-base', '--all', cur, ovSha]);
+  if (realBases.status !== 0) return { ok: false };
+  const bases = String(realBases.stdout ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
   for (const c of candidates) {
+    if (bases.length === 0 || !bases.every((b) => git(['merge-base', '--is-ancestor', b, c.sha]).status === 0)) continue;
     const mt = git(['merge-tree', '--write-tree', '--no-messages', `--merge-base=${c.sha}`, cur, ovSha]);
     const tree = String(mt.stdout ?? '').split('\n')[0].trim();
     if (mt.status === 0 && tree && tree !== curTree) return { ok: true, tree, base: c };
