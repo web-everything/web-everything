@@ -32,6 +32,7 @@ import {
   ADMISSION_DEFERRED_EXIT, ADMISSION_POLICY_STANDARD, resolveAdmissionPolicy, formatAdmissionPolicy,
   resolveEffectiveFastSlots, resolveFastSlots, resolveSlotSpan, loadAdmissionPolicy, privateAdmissionPool,
   classifyWaiterPriority, slotOrderFor, recordHoldDuration, readHoldDurations, validRepairPatterns, DEFAULT_REPAIR_PATTERNS,
+  isValidRunWaitMs, MAX_RUN_WAIT_MS, RUN_WAIT_PROGRESS_MS, RUN_WAIT_HOST_POLL_MS,
 } from '../heavy-admission.mjs';
 import { utcDayKey } from '../../operations/telemetry-summary-io.mjs';
 import { readLockEntry } from '../file-locks.mjs';
@@ -2021,4 +2022,144 @@ describe('main-fix queue priority — red-main repair waiters are class P0 (deli
     expect(rows[0]).toMatchObject({ priority: 'P0' });
     expect(rows[1].priority).toBeUndefined();
   });
+});
+
+// ── heavy-run-wait: `run --wait-ms` re-tries admission itself instead of exiting 75 at once ────────────────────
+// Live 2026-10-21: subagents cannot use Monitor and guard-bash denies shell retry loops, so every agent that got an
+// immediate exit 75 (host over host.maxLoadPerCore, or the queue full) gave up after ~3 tries. A bounded wait budget
+// inside the wrapper is the one call that fits under the 600s Bash cap.
+describe('heavy-run-wait — a wait budget re-tries the load gate and the slot queue, then defers exactly as before', () => {
+  const pol = (extra = {}) => ({ settings: { ...ADMISSION_POLICY_STANDARD, ...extra }, sources: { onTimeout: 'tool' }, invalid: [], ignored: [] });
+  const overloaded = { admitted: false, reason: 'host load 40.00/10=4.00; host.maxLoadPerCore=2 (standard)' };
+
+  it('budget 0 (the standard) keeps today\'s behavior: host overload defers at once, no sleep', async () => {
+    const r = await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'B', canDefer: true, policy: pol(), now: () => T0,
+      hostAdmission: () => overloaded, log: () => {}, sleep: async () => { throw new Error('must not wait'); } });
+    expect(r).toMatchObject({ ok: false, deferred: true, waitedMs: 0 });
+    expect(ADMISSION_POLICY_STANDARD.runWaitMs).toBe(0);
+  });
+
+  it('waits out host load with jittered sleeps, HOLDING its queue marker, then takes a real slot', async () => {
+    let clock = T0; const sleeps = []; const logs = []; let checks = 0; const markerSeen = [];
+    const r = await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'B', canDefer: true, policy: pol(), waitMs: 540_000, waitSource: 'flag --wait-ms',
+      now: () => clock, log: (m) => logs.push(m), random: () => 0.5,
+      hostAdmission: () => (++checks <= 30 ? overloaded : { admitted: true }),
+      sleep: async (ms) => { sleeps.push(ms); markerSeen.push(listWaiting(lockRoot).some((w) => w.owner === 'B')); clock += ms; } });
+    expect(r).toMatchObject({ ok: true, slot: 0 });
+    expect(sleeps).toHaveLength(30);
+    for (const ms of sleeps) { expect(ms).toBeGreaterThanOrEqual(RUN_WAIT_HOST_POLL_MS); expect(ms).toBeLessThan(2 * RUN_WAIT_HOST_POLL_MS); }
+    expect(markerSeen.every(Boolean)).toBe(true); // FCFS position held the whole time
+    const progress = logs.filter((m) => /waiting for host load after/.test(m));
+    expect(progress.length).toBe(Math.floor((r.waitedMs - 1) / RUN_WAIT_PROGRESS_MS)); // one line per minute, not per poll
+    expect(progress[0]).toMatch(/flag --wait-ms/);
+    expect(listWaiting(lockRoot)).toHaveLength(0);
+  });
+
+  it('host load that never clears defers (exit-75 shape) once the budget elapses — never bypasses the load gate', async () => {
+    let clock = T0; const logs = [];
+    const r = await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'B', canDefer: true, policy: pol(), waitMs: 120_000,
+      now: () => clock, log: (m) => logs.push(m), hostAdmission: () => overloaded, sleep: async (ms) => { clock += ms; } });
+    expect(r).toMatchObject({ ok: false, slot: null, deferred: true });
+    expect(r.waitedMs).toBe(120_000); // the last sleep is clipped to the budget
+    expect(logs.join('')).toMatch(/admission deferred: host load .* gave up after waiting 120s/);
+    expect(logs.join('')).not.toMatch(/proceeding despite host load|proceeding unslotted/);
+    expect(heldSlots({ lockRoot, cap: 1 })).toHaveLength(0);
+    expect(listWaiting(lockRoot)).toHaveLength(0);
+  });
+
+  it('a full slot queue defers at the budget even with onTimeout=run and a later ceiling — never unslotted', async () => {
+    tryAcquireSlot({ lockRoot, cap: 1, owner: 'HOLDER', nowMs: T0, nowIso: iso(T0) });
+    let clock = T0; const logs = [];
+    const r = await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'B', canDefer: true, policy: pol({ onTimeout: 'run', fastSlots: 0 }),
+      waitMs: 10_000, pollMs: 1000, ceilingMs: 120 * 60_000, now: () => clock, log: (m) => logs.push(m),
+      hostAdmission: () => ({ admitted: true }), sleep: async (ms) => { clock += ms; } });
+    expect(r).toMatchObject({ ok: false, deferred: true, waitBudgetHit: true });
+    expect(r.waitedMs).toBe(10_000);
+    expect(logs.join('')).toMatch(/admission-deferred: no slot after waiting 10s/);
+    expect(logs.join('')).not.toMatch(/proceeding unslotted/);
+  });
+
+  it('a slot freed inside the budget is taken; a budget never cuts in front of an older live waiter', async () => {
+    tryAcquireSlot({ lockRoot, cap: 1, owner: 'HOLDER', nowMs: T0, nowIso: iso(T0) });
+    let clock = T0; let polls = 0;
+    const sleep = async (ms) => { clock += ms; if (++polls === 5) releaseOwnedSlot({ lockRoot, cap: 1, owner: 'HOLDER' }); };
+    const r = await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'B', canDefer: true, policy: pol({ fastSlots: 0 }), waitMs: 60_000,
+      pollMs: 1000, now: () => clock, log: () => {}, hostAdmission: () => ({ admitted: true }), sleep });
+    expect(r).toMatchObject({ ok: true, slot: 0 });
+    releaseOwnedSlot({ lockRoot, cap: 1, owner: 'B' });
+    // An older live waiter (this process) is ahead: B waits its budget out and defers rather than cutting in.
+    markWaiting({ lockRoot, owner: 'OLDER', nowIso: iso(T0 - 60_000), pid: process.pid });
+    clock = T0;
+    const r2 = await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'B', canDefer: true, policy: pol({ fastSlots: 0 }), waitMs: 5_000,
+      pollMs: 1000, now: () => clock, log: () => {}, hostAdmission: () => ({ admitted: true }), sleep: async (ms) => { clock += ms; } });
+    expect(r2).toMatchObject({ ok: false, deferred: true, waitBudgetHit: true });
+    expect(heldSlots({ lockRoot, cap: 1 })).toHaveLength(0);
+  });
+
+  it('a mandatory (non-deferring) caller ignores the budget — its existing wait is unchanged', async () => {
+    let clock = T0; let checks = 0;
+    const r = await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'B', canDefer: false, policy: pol(), waitMs: 1000, pollMs: 1000,
+      now: () => clock, log: () => {}, hostAdmission: () => (++checks <= 3 ? overloaded : { admitted: true }),
+      sleep: async (ms) => { clock += ms; } });
+    expect(r).toMatchObject({ ok: true, slot: 0 });
+  });
+
+  it('heavyAdmission.runWaitMs resolves through the cascade as a per-caller leaf (tool and env honoured on the shared pool)', () => {
+    expect(isValidRunWaitMs(0)).toBe(true);
+    expect(isValidRunWaitMs(540_000)).toBe(true);
+    for (const bad of [-1, 1.5, MAX_RUN_WAIT_MS + 1, '540000', NaN]) expect(isValidRunWaitMs(bad)).toBe(false);
+    const fromTool = resolveAdmissionPolicy({ platform: { runWaitMs: 1000 }, tool: { runWaitMs: 2000 }, env: {} });
+    expect(fromTool.settings.runWaitMs).toBe(2000);
+    expect(fromTool.sources.runWaitMs).toBe('tool');
+    expect(fromTool.ignored).toEqual([]);
+    const fromEnv = resolveAdmissionPolicy({ platform: { runWaitMs: 1000 }, env: { WE_HEAVY_ADMISSION_RUN_WAIT_MS: '3000' } });
+    expect(fromEnv.settings.runWaitMs).toBe(3000);
+    expect(fromEnv.sources.runWaitMs).toBe('env WE_HEAVY_ADMISSION_RUN_WAIT_MS');
+    const invalid = resolveAdmissionPolicy({ platform: { runWaitMs: -5 }, env: {} });
+    expect(invalid.settings.runWaitMs).toBe(0);
+    expect(invalid.invalid.join(' ')).toMatch(/platform\.runWaitMs/);
+  });
+
+  it('the `run` CLI: --wait-ms is logged with its source, re-tries host load, and still exits 75 without running', () => {
+    const pool = join(lockRoot, '.lanes');
+    mkdirSync(join(pool, '.admission', 'heavy'), { recursive: true });
+    const t0 = Date.now();
+    const r = spawnSync(process.execPath, [CLI, 'run', '--wait-ms=1500', '--', process.execPath, '-e', 'process.stdout.write("ran")'],
+      { cwd: lockRoot, env: cliEnv(pool, { VITEST: 'true', WE_TEST_HOST_LOAD1: '9999' }), encoding: 'utf8', timeout: 30_000 });
+    expect(r.status).toBe(75);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(1400);
+    expect(r.stdout).not.toMatch(/ran/);
+    expect(r.stderr).toMatch(/wait budget 1500ms from flag --wait-ms/);
+    expect(r.stderr).toMatch(/gave up after waiting/);
+  }, 30_000);
+
+  it('the `run` CLI: the budget comes from WE_HEAVY_ADMISSION_RUN_WAIT_MS when no flag is given; a bad flag is a usage error', () => {
+    const pool = join(lockRoot, '.lanes');
+    mkdirSync(join(pool, '.admission', 'heavy'), { recursive: true });
+    const r = spawnSync(process.execPath, [CLI, 'run', '--', process.execPath, '-e', '0'],
+      { cwd: lockRoot, env: cliEnv(pool, { VITEST: 'true', WE_TEST_HOST_LOAD1: '9999', WE_HEAVY_ADMISSION_RUN_WAIT_MS: '1000' }), encoding: 'utf8', timeout: 30_000 });
+    expect(r.status).toBe(75);
+    expect(r.stderr).toMatch(/wait budget 1000ms from heavyAdmission\.runWaitMs \(env WE_HEAVY_ADMISSION_RUN_WAIT_MS\)/);
+    const bad = spawnSync(process.execPath, [CLI, 'run', '--wait-ms=soon', '--', process.execPath, '-e', '0'],
+      { cwd: lockRoot, env: cliEnv(pool), encoding: 'utf8', timeout: 30_000 });
+    expect(bad.status).toBe(3);
+    expect(bad.stderr).toMatch(/--wait-ms=soon must be a whole number/);
+  }, 30_000);
+
+  it('the `run` CLI: a slot freed by a holder that exits mid-wait is taken and the command runs', () => {
+    const pool = join(lockRoot, '.lanes');
+    const root = join(pool, '.admission', 'heavy');
+    mkdirSync(root, { recursive: true });
+    // A detached grandchild, so its exit is reaped by init (a direct child would linger as a zombie, still "alive",
+    // while this test process sits blocked in spawnSync).
+    const pid = Number(execFileSync(process.execPath, ['-e',
+      "const c = require('node:child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 1500)'], { detached: true, stdio: 'ignore' }); c.unref(); process.stdout.write(String(c.pid));"],
+    { encoding: 'utf8' }));
+    tryAcquireSlot({ lockRoot: root, cap: 2, owner: 'H0', nowMs: Date.now(), nowIso: new Date().toISOString(), pid, slots: [0] });
+    tryAcquireSlot({ lockRoot: root, cap: 2, owner: 'H1', nowMs: Date.now(), nowIso: new Date().toISOString(), pid, slots: [1] });
+    const r = spawnSync(process.execPath, [CLI, 'run', '--wait-ms=20000', '--', process.execPath, '-e', 'process.stdout.write("ran")'],
+      { cwd: lockRoot, env: cliEnv(pool, { WE_HEAVY_ADMISSION_FAST_SLOTS: '0' }), encoding: 'utf8', timeout: 30_000 });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe('ran');
+  }, 30_000);
 });
