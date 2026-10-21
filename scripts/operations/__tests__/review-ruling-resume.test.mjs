@@ -559,6 +559,43 @@ describe('runReviewLoopOnce — a ruling on an unchanged head resumes the paused
     expect(store.read('must-not-be-minted')).toBeFalsy();
   });
 
+  it.each([REVIEW_EFFECTS.MANDATORY_REFERRALS, REVIEW_EFFECTS.ADVISORY_NOTE])(
+    'an interrupted persist retry at %s starts its next backoff at the latest resume, even after a long outage', async (failurePoint) => {
+      const { declaration, registry } = setup();
+      const store = createMemoryRunStore();
+      const makeJudge = vi.fn(() => async () => judgeOutcome(REFERRAL_ANSWER, {}));
+      const persistFails = sinksWith({ seen: [], ruled: { value: false } });
+      persistFails[REVIEW_EFFECTS.MANDATORY_REFERRALS] = async () => ({ records: [], pending: ['referral-persistence-failed'],
+        blocked: [], malformed: false, reason: 'ledger-write-miss' });
+      await runReviewLoopOnce({ declaration, registry, argv, store, sinks: persistFails, makeJudge, mintRunId: () => 'r-1' });
+      const original = reviewRunEvidence(store.read('r-1'));
+      const p = { number: 4361, headRefOid: original.head, comments: [], labels: [] };
+      const judged = makeJudge.mock.calls.length;
+      const dies = { ...persistFails, [failurePoint]: async () => { throw new Error('gh: 502'); } };
+      let resumedAt = original.completedAt + 2 * 3600_000;
+      for (let n = 1; n <= REFERRAL_RETRY_MS.length; n++) {
+        expect(decideReferralHold(p, [reviewRunEvidence(store.read('r-1'))], { repo: 'o/n', now: resumedAt })).toBeNull();
+        await runReviewLoopOnce({ declaration, registry, argv, store, sinks: dies, makeJudge,
+          mintRunId: () => 'must-not-be-minted', findResumableRun: () => 'r-1', now: () => new Date(resumedAt).toISOString() });
+        const current = reviewRunEvidence(store.read('r-1'));
+        expect(current).toMatchObject({ id: 'r-1', parked: true, persistenceFailed: true, persistRetries: n });
+        expect(makeJudge).toHaveBeenCalledTimes(judged);
+        if (n < REFERRAL_RETRY_MS.length) {
+          const retryAt = resumedAt + REFERRAL_RETRY_MS[n];
+          for (const tick of [resumedAt + 60_000, retryAt - 1]) {
+            expect(decideReferralHold(p, [current], { repo: 'o/n', now: tick }))
+              .toMatchObject({ exhausted: false, retryAt });
+          }
+          expect(decideReferralHold(p, [current], { repo: 'o/n', now: retryAt })).toBeNull();
+          resumedAt = retryAt;
+        } else {
+          expect(decideReferralHold(p, [current], { repo: 'o/n', now: resumedAt + 60_000 }))
+            .toMatchObject({ exhausted: true, retryAt: null });
+        }
+      }
+      expect(store.read('must-not-be-minted')).toBeFalsy();
+    });
+
   it('without a resumable run it starts a fresh review exactly as before (new push, re-arm, send-back)', async () => {
     const { declaration, registry } = setup();
     const store = createMemoryRunStore();

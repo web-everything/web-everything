@@ -43,7 +43,10 @@ export function reviewRunEvidence(run) {
   // though: an unfinished resume has answered nothing yet, and must stay wakeable by the ruling that started it.
   const startedAt = Math.max(Date.parse(run.stepTimings?.find(t => t.step === 'read')?.startedAt),
     resuming ? 0 : Date.parse(run.resumedAt ?? '') || 0);
-  const completedAt = Date.parse(finish);
+  // An interrupted persist retry still spends a slot. Start its next backoff at the latest resume, rather than
+  // the original parked pass: after an outage that old deadline could spend every remaining slot on adjacent ticks.
+  const completedAt = Math.max(Date.parse(finish),
+    resuming && verdict?.pendingReferrals?.includes('referral-persistence-failed') ? Date.parse(run.resumedAt ?? '') || 0 : 0);
   if (!sha(head) || !Number.isFinite(completedAt) || !Number.isFinite(startedAt)) return null;
   const state = (resuming ? run.resumeOf.mandatoryReferrals : run.findings?.mandatoryReferrals)?.effects?.find(e => e.type === 'review.mandatory-referrals')?.result;
   const pending = verdict?.pendingReferrals ?? [];
