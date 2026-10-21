@@ -7,7 +7,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
+import { buildCliDaemonEffects, runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
 import { promoteDraftsGuarded, promoteDraftsThenReplan, rearmStaleAcceptanceGuarded, rearmStaleAcceptsThenReplan } from '../review-tick-promote.mjs';
 
 // The stale-accept provider's `defaultRearmStaleAcceptance` export, swapped per test through a getter: the production default
@@ -27,6 +27,40 @@ const draftRow = (n, extra = {}) => ({
 const planFrom = (prs) => ({
   dispatch: prs.map((p) => ({ kind: p.isDraft ? 'promote-draft' : 'review', prNumber: p.number, attempts: 0 })),
   refusals: [],
+});
+
+describe('buildCliDaemonEffects — production executor wiring (#5793)', () => {
+  afterEach(() => { vi.unstubAllEnvs(); providerBinding.fn = undefined; });
+
+  it('passes both guarded executors and re-arm reporting through the real multi-repo tick', async () => {
+    // Keep the default runReview closure and real runReviewTickAllRepos. Replace only the per-repo tick,
+    // so this observes the production bindings without any GitHub, model or facts-store IO.
+    vi.stubEnv('WE_REVIEW_FACTS', '0');
+    const log = { error: vi.fn() };
+    const tick = vi.fn(() => ({ reviewsOwed: 0, refusals: 0, dispatched: [], failed: [] }));
+    const effects = buildCliDaemonEffects({
+      owner: 'wiring-test', log, tick, reapSessions: () => null,
+      convertAdvisoryEnabled: false, runPrepReview: () => null,
+    });
+    await effects.tickOnce();
+    expect(tick).toHaveBeenCalled();
+    for (const [opts] of tick.mock.calls) {
+      expect(typeof opts.promoteDrafts).toBe('function');
+      expect(opts.promoteDrafts).toBe(promoteDraftsGuarded);
+      expect(typeof opts.rearmStaleAccepts).toBe('function');
+      expect(opts.rearmStaleAccepts).toBe(rearmStaleAcceptanceGuarded);
+      expect(typeof opts.noteRearms).toBe('function');
+      opts.noteRearms({ repo: opts.repo, rearms: [{ pr: 5771, ok: false, why: 'already\nhandled' }], replanError: 'retry next pass' });
+      expect(log.error).toHaveBeenCalledWith(`review-daemon: ${opts.repo}#5771 stale-accept re-arm refused — already handled`);
+      expect(log.error).toHaveBeenCalledWith('review-daemon: ' + opts.repo + ' post-re-arm re-plan failed (review goes out next pass): retry next pass');
+    }
+    const provider = vi.fn(() => ({ ok: false, reason: 'already handled' }));
+    providerBinding.fn = provider;
+    const opts = tick.mock.calls[0][0];
+    expect(opts.rearmStaleAccepts({ repo: opts.repo, pr: 5771, headSha: HEAD })).toEqual({ ok: false, reason: 'already handled' });
+    expect(provider).toHaveBeenCalledTimes(1);
+    expect(provider).toHaveBeenCalledWith({ repoSlug: opts.repo, prNumber: 5771, headSha: HEAD });
+  });
 });
 
 function tick({ promoteDrafts, prs = [draftRow(42)] }) {
@@ -250,6 +284,36 @@ describe('review daemon: same-pass stale-accept re-arm + review (#5771)', () => 
     });
     expect(r.rearms).toEqual([{ pr: 7, ok: false, why: 'boom' }]);
     expect(r.plan.dispatch[0].kind).toBe('restore-review-label');
+  });
+
+  it.each([undefined, null, '', 'abc', 'a'.repeat(39), 'a'.repeat(41), 'g'.repeat(40), `${HEAD}\n`])(
+    'refuses a stale-accept row with invalid head %j without calling the executor or re-planning', (headRefOid) => {
+      const original = plan([accepted(7, { headRefOid })]);
+      const rearm = vi.fn(() => ({ ok: true }));
+      const replan = vi.fn(() => ({ dispatch: [] }));
+      const r = rearmStaleAcceptsThenReplan({ plan: original, repo: REPO, rearm, replan });
+      expect(rearm).not.toHaveBeenCalled();
+      expect(replan).not.toHaveBeenCalled();
+      expect(r.plan).toBe(original);
+      expect(r.rearms).toEqual([{ pr: 7, ok: false, why: 'stale-accept row requires a 40-hex head SHA' }]);
+    },
+  );
+
+  it('executes a valid row alongside an invalid row and reports both outcomes', () => {
+    const rearm = vi.fn(() => ({ ok: true }));
+    const replan = vi.fn(() => ({ dispatch: [] }));
+    const r = rearmStaleAcceptsThenReplan({
+      plan: plan([accepted(7, { headRefOid: undefined }), accepted(8, { headRefOid: HEAD.toUpperCase() })]),
+      repo: REPO, rearm, replan,
+    });
+    expect(rearm).toHaveBeenCalledTimes(1);
+    expect(rearm).toHaveBeenCalledWith({ repo: REPO, pr: 8, headSha: HEAD.toUpperCase() });
+    expect(replan).toHaveBeenCalledTimes(1);
+    expect(replan).toHaveBeenCalledWith(null);
+    expect(r.rearms).toEqual([
+      { pr: 7, ok: false, why: 'stale-accept row requires a 40-hex head SHA' },
+      { pr: 8, ok: true, why: 're-armed review of the moved head' },
+    ]);
   });
 
   it('ignores plans with no stale-accept row, and rows of other variants', () => {

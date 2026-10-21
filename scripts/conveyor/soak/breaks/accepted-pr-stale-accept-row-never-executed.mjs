@@ -19,7 +19,31 @@ export default {
   fixPresent(root) { return readFileSync(join(root, 'scripts/conveyor/review-tick-promote.mjs'), 'utf8').includes('rearmStaleAcceptsThenReplan'); },
   async run() {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
-    const { runReviewTick } = await import(pathToFileURL(join(root, 'skills-src/conveyor/review-daemon.mjs')).href);
+    const { buildCliDaemonEffects, runReviewTick } = await import(pathToFileURL(join(root, 'skills-src/conveyor/review-daemon.mjs')).href);
+    const { promoteDraftsGuarded, rearmStaleAcceptanceGuarded, rearmStaleAcceptsThenReplan } = await import(pathToFileURL(join(root, 'scripts/conveyor/review-tick-promote.mjs')).href);
+    const violations = [];
+    // Observe the real factory's executor bindings as well as exercising the transaction below. Injecting
+    // executors straight into runReviewTick alone missed a dropped production binding in review #5793.
+    let ticks = 0;
+    const priorFacts = process.env.WE_REVIEW_FACTS;
+    process.env.WE_REVIEW_FACTS = '0';
+    try {
+      await buildCliDaemonEffects({
+        owner: 'soak-wiring', log: { error() {} }, reapSessions: () => null,
+        convertAdvisoryEnabled: false, runPrepReview: () => null,
+        tick: (opts) => {
+          ticks += 1;
+          if (typeof opts.promoteDrafts !== 'function' || opts.promoteDrafts !== promoteDraftsGuarded) violations.push('production draft promoter is not wired');
+          if (typeof opts.rearmStaleAccepts !== 'function' || opts.rearmStaleAccepts !== rearmStaleAcceptanceGuarded) violations.push('production stale-accept executor is not wired');
+          if (typeof opts.noteRearms !== 'function') violations.push('production stale-accept reporting is not wired');
+          return { reviewsOwed: 0, refusals: 0, dispatched: [], failed: [] };
+        },
+      }).tickOnce();
+    } finally {
+      if (priorFacts === undefined) delete process.env.WE_REVIEW_FACTS;
+      else process.env.WE_REVIEW_FACTS = priorFacts;
+    }
+    if (!ticks) violations.push('production effects did not reach the per-repo tick');
     const pr = { number: 5771, state: 'OPEN', isDraft: false, headRefName: 'lane/x-5771', headRefOid: HEAD, isCrossRepository: false,
       labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }] };
     let live = [pr];
@@ -33,8 +57,13 @@ export default {
       tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], holdReconcile: () => [] };
     // The daemon wires its executor exactly as the real tick does; an old tree has no such parameter and ignores it.
     runReviewTick({ ...args, rearmStaleAccepts: () => { live = [{ ...pr, labels: [{ name: 'review:pending' }] }]; return { ok: true }; }, noteRearms: () => {} });
-    const violations = [];
     if (!dispatched.includes(5771)) violations.push('the stale-accept row was planned but the pass dispatched no review of the moved head');
+    let invalidWrites = 0;
+    rearmStaleAcceptsThenReplan({
+      plan: plan([{ ...pr, headRefOid: undefined }]), repo: REPO,
+      rearm: () => { invalidWrites += 1; return { ok: true }; },
+    });
+    if (invalidWrites) violations.push('a stale-accept row without a head reached the re-arm writer');
     return { violations };
   },
   judge(report) { return report.violations; },
