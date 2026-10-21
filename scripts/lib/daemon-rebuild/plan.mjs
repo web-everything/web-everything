@@ -695,7 +695,9 @@ export async function planRebuild({
     const files = conflictFiles.get(d.ref) ?? [];
     const carriedSurvives = carriedHeads.has(d.ref)
       && carriedHeads.get(d.ref).every((sha) => git(['merge-base', '--is-ancestor', sha, cur]).status === 0);
-    if (carriedRefs.has(d.ref) && !carriedSurvives) {
+    // An ESTABLISHED current tip always holds: another carrier preserving only an OLDER recorded tip says nothing
+    // about the newer live changes. The carriedSurvives exception applies only to changed-tip newcomers.
+    if (establishedRefs.has(d.ref) || (carriedRefs.has(d.ref) && !carriedSurvives)) {
       establishedLost.push({ ref: d.ref, pr: d.pr, sha: d.sha, reason: 'conflict', files });
       alerts.push({
         kind: 'established-overlay-dropped',

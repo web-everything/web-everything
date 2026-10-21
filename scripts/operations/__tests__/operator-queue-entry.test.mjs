@@ -74,6 +74,9 @@ const stage = (root) => {
   copyFileSync(join(dirname(LEAF), 'red-team-gate.mjs'), join(root, 'lib/red-team-gate.mjs'));
   copyFileSync(join(dirname(LEAF), 'review-verdict-carried-marker.mjs'), join(root, 'lib/review-verdict-carried-marker.mjs'));
   symlinkSync(join(dirname(LEAF), 'review-escalation.mjs'), join(root, 'lib/review-escalation.mjs'));
+  // The disposition reader also reads the operator's round grants (a grant after a round-cap record reopens the
+  // send-back step); its own imports (marker-authorship, constellation-repos) are already staged above.
+  copyFileSync(join(dirname(LEAF), '../conveyor/round-extension-mark.mjs'), join(root, 'conveyor/round-extension-mark.mjs'));
 };
 
 let dir;

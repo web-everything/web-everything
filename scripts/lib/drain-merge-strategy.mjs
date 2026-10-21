@@ -330,7 +330,7 @@ export function createDrainMergeStrategy({
         const comments = pages.flat();
         if (!safety.value.waitForRedTeamBeforeEnqueue) return { allowed: true, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
         const evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env });
-        const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, env });
+        const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env });
         return { allowed: !reason, reason, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
       } catch { return { allowed: false, reason: 'red-team evidence unreadable' }; }
     },
