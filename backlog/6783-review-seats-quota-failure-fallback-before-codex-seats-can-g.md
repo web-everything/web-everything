@@ -1,4 +1,5 @@
 ---
+bornAs: xuybrvq
 kind: story
 size: 3
 status: open
@@ -9,7 +10,7 @@ tags: []
 
 # Review seats: quota-failure fallback before Codex seats can gate verdicts
 
-The daily cap is 80/provider/day (`PROVIDER_CAP_DEFAULT` in `we:scripts/operations/review-extra-seats.mjs`) against ~280 calls/day. Once Codex seats are verdict seats (decision xviqirz), a quota hit must not stall verdicts.
+The daily cap is 80/provider/day (`PROVIDER_CAP_DEFAULT` in `we:scripts/operations/review-extra-seats.mjs`) against ~280 calls/day. Once Codex seats are verdict seats (decision 6784), a quota hit must not stall verdicts.
 
 ## Acceptance
 
@@ -19,7 +20,7 @@ The daily cap is 80/provider/day (`PROVIDER_CAP_DEFAULT` in `we:scripts/operatio
 ## Non-goals
 
 - [N1] Does not raise the cap or change cap accounting.
-- [N2] Does not promote any seat; that is decision xviqirz.
+- [N2] Does not promote any seat; that is decision 6784.
 
 ## Edge cases this change must handle
 

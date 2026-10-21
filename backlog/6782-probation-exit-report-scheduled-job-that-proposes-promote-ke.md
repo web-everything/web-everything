@@ -1,4 +1,5 @@
 ---
+bornAs: xov32df
 kind: story
 size: 3
 status: open

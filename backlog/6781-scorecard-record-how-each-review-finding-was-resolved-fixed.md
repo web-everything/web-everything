@@ -1,4 +1,5 @@
 ---
+bornAs: x9ipr5i
 kind: story
 size: 3
 status: open
@@ -19,7 +20,7 @@ Today a finding that mandatory seats did not corroborate is not necessarily wron
 ## Non-goals
 
 - [N1] No backfill of old rows.
-- [N2] Does not change any seat's gating; that is decision xviqirz.
+- [N2] Does not change any seat's gating; that is decision 6784.
 
 ## Edge cases this change must handle
 

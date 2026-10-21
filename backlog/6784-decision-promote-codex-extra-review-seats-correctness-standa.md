@@ -1,8 +1,9 @@
 ---
+bornAs: xviqirz
 kind: decision
 status: open
-blockedBy: ["xuybrvq", "x9ipr5i", "xov32df"]
-scope: ["we:backlog/xviqirz-decision-promote-codex-extra-review-seats-correctness-standa.md", "we:docs/agent/platform-decisions.md"]
+blockedBy: ["6783", "6781", "6782"]
+scope: ["we:backlog/6784-decision-promote-codex-extra-review-seats-correctness-standa.md", "we:docs/agent/platform-decisions.md"]
 dateOpened: "2026-10-21"
 tags: []
 ---
@@ -51,9 +52,9 @@ claim-accuracy is 17% corroborated. Keep paying for it while a precision filter 
 
 ## Prerequisites (blockedBy)
 
-- xuybrvq: quota-failure fallback (cap is 80/provider/day vs ~280 calls/day).
-- x9ipr5i: scorecard resolution field (precision per lens).
-- xov32df: probation-exit report job (Part 2).
+- 6783: quota-failure fallback (cap is 80/provider/day vs ~280 calls/day).
+- 6781: scorecard resolution field (precision per lens).
+- 6782: probation-exit report job (Part 2).
 
 ## Acceptance
 
