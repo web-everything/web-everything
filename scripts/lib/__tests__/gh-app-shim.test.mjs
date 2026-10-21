@@ -27,6 +27,7 @@ import {
   buildGhShimSettingsEnv, looksLikeAppTokenAuthFailure, ensureSettingsFileEnv, ensureSettingsFilePermissions, sanitizeSpawnEnv,
   defaultGhThrottleCliPath, checkoutShimDir, shimCallerScriptFromCommand, isDaemonCaller, defaultGithubAppRefreshCliPath,
 } from '../gh-app-shim.mjs';
+import { readGhAuthPolicy } from '../github-auth-policy.mjs';
 
 const CONFIGURED_ENV = {
   WE_GITHUB_APP_ID: '5037855',
@@ -1186,6 +1187,29 @@ require(${JSON.stringify(shim)});
     });
     expect(env.WE_GH_DAEMON_CALLER).toBe('com.we.review');
     expect(env.PATH).toContain('/fixture/shim');
+  });
+
+  // PR #5729 red team: every daemon of a checkout runs the same shim file. One caller's process-local
+  // WE_GH_AUTH_PERSONAL_FALLBACK must not be written into it; the shim reads that variable per call.
+  it.each(['allow', 'refuse'])('does not bake a caller WE_GH_AUTH_PERSONAL_FALLBACK=%s into the shared shim', (override) => {
+    const writeFile = vi.fn();
+    const callerEnv = { WE_GH_DAEMON_CALLER: 'caller-b', HOME: '/fixture/home' };
+    buildGhShimSettingsEnv({ env: { ...callerEnv, WE_GH_AUTH_PERSONAL_FALLBACK: override },
+      identity: { anyConfigured: false, roles: {} }, pathEnv: '/usr/bin', dir: '/fixture/shim',
+      exists: () => true, writeFile, chmod() {}, mkdir() {},
+    });
+    const src = writeFile.mock.calls.find(([path]) => path === '/fixture/shim/gh')[1];
+    const baked = JSON.parse(/const PERSONAL_FALLBACK_POLICY = (.*);/.exec(src)[1]);
+    expect(baked.source.personalFallback).not.toBe('env');
+    expect(baked).toEqual(readGhAuthPolicy({ daemon: true, env: callerEnv }));
+  });
+
+  it('does not bake the rendering process WE_GH_AUTH_PERSONAL_FALLBACK by default', () => {
+    vi.stubEnv('WE_GH_AUTH_PERSONAL_FALLBACK', 'allow');
+    try {
+      const src = renderGhShimScript({ realGhPath: '/fixture/real-gh', cachePath: '/fixture/cache.json' });
+      expect(JSON.parse(/const PERSONAL_FALLBACK_POLICY = (.*);/.exec(src)[1]).source.personalFallback).not.toBe('env');
+    } finally { vi.unstubAllEnvs(); }
   });
 
   it.each([

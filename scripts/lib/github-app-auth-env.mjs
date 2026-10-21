@@ -629,12 +629,14 @@ export async function ensureFreshGithubAppEnv({
  * Default per-owner routing: write this checkout's `gh` shim and prepend its dir to `env.PATH` (idempotent).
  * Dynamic import: `gh-app-shim.mjs` imports this module.
  */
-async function defaultInstallOwnerShim(env, { cachePath, identity }) {
+export async function defaultInstallOwnerShim(env, { cachePath, identity, ...shimEffects }) {
   const { buildGhShimSettingsEnv } = await import('./gh-app-shim.mjs');
-  const settings = buildGhShimSettingsEnv({ env, pathEnv: env.PATH || '', cachePath, identity });
+  const settings = buildGhShimSettingsEnv({ env, pathEnv: env.PATH || '', cachePath, identity, ...shimEffects });
   if (!settings || !settings.PATH) return { ok: false, reason: 'no-real-gh-or-write-failed' };
   const dir = settings.PATH.split(':')[0];
-  if (!(env.PATH || '').split(':').includes(dir)) env.PATH = settings.PATH;
+  // The shim guards only as the FIRST gh on PATH: a copy of its dir later in an inherited PATH still
+  // leaves the real gh in front.
+  if ((env.PATH || '').split(':')[0] !== dir) env.PATH = settings.PATH;
   return { ok: true, dir };
 }
 

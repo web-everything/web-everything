@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import {
   resolveGithubAppEnvConfig, isCacheFresh, ensureFreshGithubAppEnv, withGithubAppAuth,
   REFRESH_BUFFER_MS, defaultCachePath, findInstallationGaps, CACHE_VERSION, REQUIRED_APP_PERMISSIONS, REQUIRED_APP_REPOS,
-  defaultStatusPath, readGithubAppStatus,
+  defaultStatusPath, readGithubAppStatus, defaultInstallOwnerShim,
 } from '../github-app-auth-env.mjs';
 
 // NEVER THE REAL HOME DIR (#x8mpubm follow-up, live-caught: before this existed, this suite's own pre-existing
@@ -734,5 +734,26 @@ describe('daemon refresh lookahead and legacy fallback liveness', () => {
     expect(setEnv).toHaveBeenCalledWith('fixture-worker');
     expect(env.WE_GH_AUTH_INSTALLATION).toBe('22');
     if (!failLegacy) expect(writeCache).toHaveBeenCalledWith('/fixture/cache.json', expect.objectContaining({ token: 'fixture-legacy' }));
+  });
+});
+
+// PR #5729 red team: the shim only guards a daemon while it is the FIRST gh on PATH. A shim dir that
+// already appears later (an inherited PATH) must still be moved in front of the real gh.
+describe('defaultInstallOwnerShim PATH precedence', () => {
+  const dir = '/fixture/checkout/.gh-shim';
+  const opts = { cachePath: '/fixture/cache.json', identity: { anyConfigured: false, roles: {} }, dir,
+    exists: (path) => path === '/opt/homebrew/bin/gh', writeFile() {}, chmod() {}, mkdir() {} };
+
+  it.each([
+    ['later on PATH', `/opt/homebrew/bin:${dir}:/usr/bin`],
+    ['absent from PATH', '/opt/homebrew/bin:/usr/bin'],
+    ['already first', `${dir}:/opt/homebrew/bin:/usr/bin`],
+  ])('puts the shim dir first when it is %s', async (_, path) => {
+    const env = { WE_GH_DAEMON_CALLER: 'test-daemon', PATH: path };
+    expect(await defaultInstallOwnerShim(env, opts)).toEqual({ ok: true, dir });
+    expect(env.PATH.split(':')[0]).toBe(dir);
+    const once = env.PATH;
+    await defaultInstallOwnerShim(env, opts);
+    expect(env.PATH).toBe(once); // idempotent across ticks
   });
 });

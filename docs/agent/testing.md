@@ -1949,6 +1949,9 @@ their command expansion cannot prove which credential gh will select. Short flag
 must be resolved per command (for example checkout `-q` is boolean, API `-q` consumes jq).
 `ghAuth.personalFallback` resolves default → platform → tool →
 `WE_GH_AUTH_PERSONAL_FALLBACK`; refusals and explicit allows name the effective source.
+The shim file is shared by every caller of a checkout, so it carries only the file policy;
+the shim reads `WE_GH_AUTH_PERSONAL_FALLBACK` from each caller at run time. A daemon's shim
+directory must be the first `PATH` entry, even when an inherited `PATH` lists it later.
 Interactive shells retain their inherited-auth behavior. Dispatched shim settings carry
 the daemon marker even for XPC-only parents and when session spawning does not inherit
 the parent environment.
