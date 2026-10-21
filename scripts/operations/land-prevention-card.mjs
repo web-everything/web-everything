@@ -559,12 +559,14 @@ async function landPreventionCardImpl(input, {
     const generic = /^File the prevention guard\(s\) owed by (\S+)#(\d+)'s/i.exec(input.title ?? '');
     if (generic) input = { ...input, title: preventionCardTitle({ repo: generic[1], pr: generic[2], digest: input.digest }) };
     let acquired;
+    // Declared OUTSIDE the try: the catch below classifies against it (a block-scoped const there was a ReferenceError).
+    let waitMs;
     try {
       write(`land-prevention-card: acquiring a lane (session ${input.session})…\n`);
       // Inside the health-watch tick the acquire may wait only as long as the drain budget has left (`drainLimit.acquireWaitMs`
       // for the spool drain, `acquireWait()` for an owed filing, read right before the acquire), plus slack for the pool scan;
       // otherwise it can alone outlast the tick's watchdog.
-      const waitMs = input.drainPending ? drainLimit.acquireWaitMs : acquireWait?.();
+      waitMs = input.drainPending ? drainLimit.acquireWaitMs : acquireWait?.();
       acquired = parseRunJsonTail(exec('node', [
         LANE_POOL_CLI, 'acquire', '--purpose=prevention-card', `--session=${input.session}`, '--json',
         ...(waitMs === undefined ? [] : [`--wait-ms=${Math.max(0, Math.floor(waitMs))}`]),
