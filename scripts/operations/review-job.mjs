@@ -316,7 +316,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     // The second, stricter proof the shared carry requires (paths, modes, changed bytes, positions); see identical-net-patch.mjs.
     proveIdenticalNetPatch: ({ fromSha, toSha, repo }) => proveIdenticalNetPatch({ fromSha, toSha,
       cwd: planReviewDispatch({ pr: 1, repo }).laneRepo, exec: (f, a, o) => execFileSync(f, a, { ...o, env }) }),
-    readCitedLine: ({ sha, file, line, repo }) => gitCitedLineReader((f, a, o) => execRead(f, a, { ...o, cwd: planReviewDispatch({ pr: 1, repo }).laneRepo, env }))({ sha, file, line }),
+    readCitedLine: ({ sha, file, line, repo }) => gitCitedLineReader({ cwd: planReviewDispatch({ pr: 1, repo }).laneRepo, env })({ sha, file, line }),
     restampVerdict: ({ pr, repo, newHead, reason }) => {
       const r = spawnSync(process.execPath, [join(root, 'scripts', 'review-set-label.mjs'), String(pr), `--repo=${repo}`,
         '--to=restamp', '--actor=review-carry', `--new-head=${newHead}`, `--reason=${reason}`],

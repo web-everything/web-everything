@@ -70,7 +70,7 @@ function carry(comments, toSha, extra = {}) {
     proveIdenticalNetPatch: ({ fromSha, toSha: t }) => proveIdenticalNetPatch({ exec, fromSha, toSha: t }),
     restampVerdict: vi.fn(() => ({ ok: true })),
     postCarryComment: ({ body: b }) => posted.push(bot(b, '2026-10-21T21:30:00Z')),
-    readCitedLine: ({ sha, file, line }) => gitCitedLineReader(exec)({ sha, file, line }),
+    readCitedLine: ({ sha, file, line }) => gitCitedLineReader({ cwd: dir, env })({ sha, file, line }),
     ...extra,
   };
   return { out: attemptVerdictCarry(io, { pr: P, repo: 'web-everything/web-everything' }), posted };
@@ -115,18 +115,20 @@ describe('operator red-team rulings across a rebase (#5502 shape)', () => {
     expect(disp(comments, edited).result).toBeNull();
   });
   it('bytes are compared undecoded: two invalid UTF-8 lines never compare equal', () => {
-    const fake = (bytes) => (f, a, o) => (a[0] === 'cat-file' && a[1] === '-t' ? 'blob\n' : Buffer.from(bytes));
-    const x = gitCitedLineReader(fake([0xff, 0x0a]))({ sha: rebased, file: FILE, line: 1 });
-    const y = gitCitedLineReader(fake([0xfe, 0x0a]))({ sha: rebased, file: FILE, line: 1 });
+    const fake = (bytes) => (f, a) => (a[1] === '-t' ? 'blob\n' : bytes);
+    const x = gitCitedLineReader({ exec: fake(Buffer.from([0xff, 0x0a])) })({ sha: rebased, file: FILE, line: 1 });
+    const y = gitCitedLineReader({ exec: fake(Buffer.from([0xfe, 0x0a])) })({ sha: rebased, file: FILE, line: 1 });
     expect(x).not.toBe(y);
-    expect(gitCitedLineReader(() => 'tree\n')({ sha: rebased, file: 'scripts', line: 2 })).toBeNull();
+    // A decoded (string) blob is refused: it may already have collapsed bytes.
+    expect(gitCitedLineReader({ exec: fake('\ufffd\n') })({ sha: rebased, file: FILE, line: 1 })).toBeNull();
+    expect(gitCitedLineReader({ exec: () => 'tree\n' })({ sha: rebased, file: 'scripts', line: 2 })).toBeNull();
   });
   it('unchangedCitedLines reads real blobs: a changed line or a missing file is never "unchanged"', () => {
-    const readLine = (sha, file, line) => gitCitedLineReader(exec)({ sha, file, line });
+    const readLine = (sha, file, line) => gitCitedLineReader({ cwd: dir, env })({ sha, file, line });
     const fs = [F(159, 'broken'), F(127, 'degraded'), { ...F(5, 'degraded'), file: 'nope.mjs' }, { ...F(1, 'degraded'), line: null }].map((f, i) => ({ ...f, index: i + 1 }));
     expect(unchangedCitedLines(fs, { fromSha: rebased, toSha: edited, readLine })).toEqual([2]);
-    expect(gitCitedLineReader(exec)({ sha: rebased, file: '../etc/passwd', line: 1 })).toBeNull();
-    const r = gitCitedLineReader(exec);
+    expect(gitCitedLineReader({ cwd: dir, env })({ sha: rebased, file: '../etc/passwd', line: 1 })).toBeNull();
+    const r = gitCitedLineReader({ cwd: dir, env });
     expect(r({ sha: rebased, file: '.', line: 1 })).toBeNull();
     expect(r({ sha: rebased, file: FILE, line: 171 })).toBeNull(); // the trailing newline adds no line
     expect(r({ sha: rebased, file: FILE, line: 170 })).toBe(Buffer.from('line 170').toString('hex'));

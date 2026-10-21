@@ -71,7 +71,7 @@ export async function carryAcceptedPush({ repo, pr, head, lanePath, weRoot, run 
     readCarryEvidence: () => ({ headSha: view.headRefOid, comments }),
     contributionPatchId: ({ sha }) => contributionPatchId({ sha, exec: laneGit }),
     proveIdenticalNetPatch: ({ fromSha, toSha }) => proveIdenticalNetPatch({ fromSha, toSha, cwd: lanePath, exec: execFileSync }),
-    readCitedLine: ({ sha, file, line }) => gitCitedLineReader(laneGit)({ sha, file, line }),
+    readCitedLine: ({ sha, file, line }) => gitCitedLineReader({ cwd: lanePath })({ sha, file, line }),
     restampVerdict: ({ newHead, reason }) => {
       try {
         run('node', [resolve(weRoot, 'scripts', 'review-set-label.mjs'), String(pr), ...(repo ? [`--repo=${repo}`] : []), '--to=restamp',

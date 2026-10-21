@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { ensureCommitReadable } from './carry-equivalence.mjs';
@@ -207,16 +208,17 @@ export function resolveCarryAcrossRebase({ env = process.env, readFile = readFil
 /** `readCitedLine` for the carry: the RAW BYTES (hex) of line `line` (1-based) of the BLOB `file` at `sha`, or null.
  *  The object must be a blob (never a tree), the line must exist (a trailing newline adds no line), and bytes are
  *  compared undecoded, so different bytes never compare equal. The path must be a plain repo-relative path (no `..`,
- *  no leading `/`, no `:`). */
-export function gitCitedLineReader(exec) {
+ *  no leading `/`, no `:`). It runs git ITSELF (`execFileSync`, Buffer output) in `cwd`: a caller's string-decoding
+ *  exec wrapper would collapse distinct bytes, so only a Buffer is accepted; anything else is unreadable (null). */
+export function gitCitedLineReader({ cwd, env = process.env, exec = execFileSync } = {}) {
   return ({ sha, file, line }) => {
     if (!HEX.test(String(sha ?? '')) || typeof file !== 'string' || !file || file.startsWith('/') || file.includes(':')
       || file.split('/').includes('..') || !Number.isInteger(line) || line < 1) return null;
     const spec = `${sha}:${file}`;
-    try { if (String(exec('git', ['cat-file', '-t', spec], { encoding: 'utf8' })).trim() !== 'blob') return null; } catch { return null; }
+    try { if (String(exec('git', ['cat-file', '-t', spec], { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })).trim() !== 'blob') return null; } catch { return null; }
     let buf;
-    try { buf = exec('git', ['cat-file', 'blob', spec], { encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 }); } catch { return null; }
-    if (!Buffer.isBuffer(buf)) buf = Buffer.from(buf ?? '');
+    try { buf = exec('git', ['cat-file', 'blob', spec], { cwd, env, maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }); } catch { return null; }
+    if (!Buffer.isBuffer(buf)) return null;
     const lines = [];
     let start = 0;
     for (let i = 0; i < buf.length; i++) if (buf[i] === 0x0a) { lines.push(buf.subarray(start, i)); start = i + 1; }
