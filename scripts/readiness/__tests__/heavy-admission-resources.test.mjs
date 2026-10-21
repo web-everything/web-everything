@@ -26,11 +26,12 @@ async function run({ gate, host = LEGACY_DEFER, snapshot = snap(), cap = 3, preh
     tryAcquireSlot({ lockRoot, cap, owner: `/x/.lanes/web-everything/lane-${i + 20}`, nowMs: NOW, nowIso: new Date(NOW).toISOString(), pid: process.pid });
   }
   const logs = [];
+  let t = NOW; // fake clock: the fake sleep advances it, so the 1 ms ceiling is reached and nothing waits for real
   const policy = resolveAdmissionPolicy({ tool: { gate }, env: { LANE_POOL_ROOT: lockRoot } });
   const r = await acquireSlotBlocking({
     lockRoot, cap, owner: '/x/.lanes/web-everything/lane-3', policy, canDefer: true, interactive: false, env: {},
-    hostAdmission: () => host, readResourceSnapshot: () => snapshot, log: (m) => logs.push(m), now: () => NOW, ceilingMs: 1,
-    sleep: async () => {}, pollMs: 1,
+    hostAdmission: () => host, readResourceSnapshot: () => snapshot, log: (m) => logs.push(m), now: () => t, ceilingMs: 5,
+    sleep: async (ms) => { t += Math.max(1, ms); }, pollMs: 1, stillWaitingLogMs: 1e12,
   });
   return { r, logs };
 }
