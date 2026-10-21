@@ -115,6 +115,10 @@ describe('operator ruling at the round cap', () => {
     expect(hold({ comments: carried })).toBeNull();
     expect(hold({ comments: [...carried, accept(head), restamp(head)] })).toMatch(/requiring send-back/);
   });
+  it('a superseded ruling stays superseded when a bot restamp carries it to a new head', () => {
+    const ruledOnPrior = [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true), accept(prior)];
+    expect(hold({ comments: [...ruledOnPrior, restamp(head), carry({ findings: broken, gates: ['round-cap'] })] })).toMatch(/requiring send-back/);
+  });
   it('a ruling survives a chain of carries (H0 → H1 → head)', () => {
     const h0 = 'e'.repeat(40);
     const ruledOnH0 = [clean(h0, 'web-everything', broken), gate(h0, 'round-cap'), accept(h0, true)];

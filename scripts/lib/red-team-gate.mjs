@@ -518,6 +518,7 @@ function operatorRuled(records, pr, head) {
   if (parseLatestHumanClearedSha(trusted.filter(r => !r.from).map(r => r.c)) !== head) return false;
   const lastAt = (rs, test) => rs.reduce((found, r) => (test(r) ? r : found), null);
   // Each carry removes its own comment and every later record, so even a cyclic head chain terminates.
+  const chain = [head]; // every head the carry traversal has visited, live head first
   for (let sha = head, rs = trusted, want = null; sha && rs.length;) {
     const result = latestResult(rs, pr, sha);
     // A carry hop counts only when the prior head's result is the one that was carried (same id).
@@ -534,9 +535,9 @@ function operatorRuled(records, pr, head) {
     const named = cap?.gate.result === want && Number.isFinite(result.at);
     // A clearance cannot approve a later send-back, even if an older/unknown grant snapshot leaves the cap winning.
     // This also keeps existing send-backs held while persisted grant identities migrate to a reader-independent key.
-    // A plain accept of the LIVE head (even across carries) after the human ceremony supersedes it; a bot-posted cleared-human marker cannot revive it.
+    // A plain accept of ANY head on the carry chain (live head to the ruled head) after the human ceremony supersedes it; a bot-posted cleared-human marker cannot revive it.
     const reaccepted = cleared && trusted.some(r => !r.from && r.at > cleared.at && parseLatestHumanClearedSha([r.c]) === null
-      && new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:\\s*${head}\\s*-->`, 'i').test(recordBody(r)));
+      && chain.some(h => new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:\\s*${h}\\s*-->`, 'i').test(recordBody(r))));
     if (cap && cleared && !reaccepted && cleared.at > cap.at && (cleared.at > result.at || named) && gates.every(r =>
       ![GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK].includes(r.gate.outcome) || cleared.at > r.at)) return true;
     // A ruling inherited through a carry cannot approve this head's own later gate decisions.
@@ -544,6 +545,7 @@ function operatorRuled(records, pr, head) {
     if (!result.from) return false;
     rs = rs.filter(r => r.at < result.at);
     sha = result.from;
+    chain.push(sha);
   }
   return false;
 }
