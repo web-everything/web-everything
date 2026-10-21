@@ -17,7 +17,7 @@ Decision x5ioz96 fork 1 skeptic amendment: a card must wire the ruling filer to 
 
 ## Acceptance
 
-- [A1] **Executable** — `node --test we:scripts/operations/__tests__/card-batch-file.test.mjs` fails before this item lands and passes after. Planned cases:
+- [A1] **Executable** — `node --test we:scripts/operations/__tests__/land-ruling-card.test.mjs we:scripts/operations/__tests__/card-batch-file.test.mjs we:scripts/lib/__tests__/card-batch-policy.test.mjs` fails before this item lands and passes after. Planned cases:
   - `land-ruling-card files through the collector with kind ruling` (we:scripts/operations/__tests__/land-ruling-card.test.mjs).
   - `ruling cards are admitted into the ruling batch, not filing` (we:scripts/operations/__tests__/card-batch-file.test.mjs).
   - `high and urgent ruling cards bypass the collector` (we:scripts/operations/__tests__/card-batch-file.test.mjs).

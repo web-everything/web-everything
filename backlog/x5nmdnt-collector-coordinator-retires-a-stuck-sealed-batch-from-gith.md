@@ -15,11 +15,13 @@ Priority: top (unblocking). Live: the prevention collector has been stuck since 
 | PR state on GitHub | State file | Members |
 | --- | --- | --- |
 | merged | retired; the next admission opens a fresh batch | nothing to do: the merge landed them |
-| closed by a split (a `sealed/` remainder records `extractedFrom.pr` equal to this PR, or the extract journal for it is done) | retired | nothing to do: the survivors are on the remainder PR and the rejected card on its standalone PR |
+| closed by a split (a `sealed/` remainder records `extractedFrom.pr` equal to this PR, or the extract journal for it has `closed` set) | retired | nothing to do: the survivors are on the remainder PR and the rejected card on its standalone PR |
 | closed otherwise, not merged | archived whole to `sealed/` with a `closedUnmerged` record, then the active slot is retired so admission unblocks | surfaced as needs-you, naming the PR and every recorded member |
 | unreadable (API error, unknown state, missing PR number) | stays sealed and held | untouched |
 
 Members of a batch closed without a merge are surfaced, never re-admitted automatically. Who closed it decides what the cards should become, and the coordinator cannot tell: an operator disposition such as close-superseded discards them on purpose, and commits adopted onto the branch at seal (numbering, fix-loop edits) never entered the recorded members. The PR link in the escalation covers those adopted commits. The escalation is driven from the `closedUnmerged` archive and is idempotent: a failed post retries on the next scan and never re-blocks the kind.
+
+Every retired archive gets a terminal marker naming its row (merged, split, or `closedUnmerged` once the escalation is posted). The seal scan honours it: no seal-job relaunch and no further GitHub read. Today the scan relaunches any `sealed/` archive with `sealedAt` unless it has `sealFailure` or step `label-on-green` (`sealDueBatches` in we:scripts/operations/card-batch-seal-io.mjs), so a retired batch 9 archived at step `ready` would be relaunched against its merged PR on every tick. The `sealFailure` / `label-on-green` skip changes too: such an archive without a terminal marker gets its PR state read (a person may close it later), but never a seal-job launch.
 
 Proof required: before/after on the live 327-card spool draining into a fresh batch. Operator 2026-10-18 verbatim: All ok.
 
@@ -30,7 +32,8 @@ Proof required: before/after on the live 327-card spool draining into a fresh ba
   - `split-closed batch retires and surfaces nothing` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — with a remainder manifest whose `extractedFrom.pr` is this PR, the state retires and no escalation is written.
   - `closed-unmerged batch is archived, retired and surfaced` (we:scripts/operations/__tests__/card-batch-io.test.mjs) — the `sealed/` archive holds the full member list and a `closedUnmerged` record, the next admission opens a fresh batch, and the escalation names the PR and every member.
   - `closed-unmerged escalation retries without re-blocking admission` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — a failed post leaves the archive pending, the next scan posts once, and admission is never refused `batch-sealed` meanwhile.
-  - `archived sealed batch closed later is surfaced by the seal scan` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — a `sealed/` manifest whose PR closes unmerged after it left the active slot gets the same `closedUnmerged` record and escalation.
+  - `archived sealed batch closed later is surfaced by the seal scan` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — a `sealed/` manifest (including one at `label-on-green` or with `sealFailure`) whose PR closes unmerged after it left the active slot gets the same `closedUnmerged` record and escalation, and no seal job is launched for it.
+  - `terminal archive is not spawned and makes no gh call` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — a retired archive at step `ready` with a terminal marker produces no seal-job spawn and no GitHub read on the next scan.
   - `unreadable PR state stays sealed and held` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — no retirement, no member change.
   - `retirement is refused while another owner holds the lease` (we:scripts/operations/__tests__/card-batch.test.mjs) — a concurrent admission gets `lease-held`, and no card lands on the retired batch.
 - [A2] **Live** — the 327-card prevention spool drains into a fresh batch: before/after spool count on the real host.
