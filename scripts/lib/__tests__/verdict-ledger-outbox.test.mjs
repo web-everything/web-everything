@@ -270,3 +270,31 @@ describe('real git: outbox + plumbing flush', () => {
     });
   });
 });
+
+describe('review-daemon tick: the outbox backstop', () => {
+  it('flushes each distinct ledger board once', async () => {
+    const { defaultFlushLedgerOutboxes } = await import('../../../skills-src/conveyor/review-daemon.mjs');
+    const flushed = [];
+    const out = defaultFlushLedgerOutboxes({
+      repos: ['a/one', 'a/two', 'b/three'], resolveBoard: (r) => (r.startsWith('a/') ? '/board-a' : null),
+      flush: ({ board }) => { flushed.push(board); return { ok: true, flushed: 0 }; },
+    });
+    expect(flushed).toEqual(['/board-a']);
+    expect(out).toHaveLength(1);
+  });
+
+  it('every tick runs the backstop, logs what it flushed or failed, and survives a throw', async () => {
+    const { buildCliDaemonEffects } = await import('../../../skills-src/conveyor/review-daemon.mjs');
+    const deps = { reapSessions: () => null, runReview: () => ({}), runConvertAdvisories: () => null, runPrepReview: () => null };
+    const lines = [];
+    const log = { error: (l) => lines.push(l) };
+    let calls = 0;
+    await buildCliDaemonEffects({ owner: 't', log, ...deps, flushLedgerOutboxes: () => { calls += 1; return [{ ok: true, flushed: 2, dir: '/ob' }, { ok: false, flushed: 0, dir: '/ob2', error: 'boom' }]; } }).tickOnce();
+    expect(calls).toBe(1);
+    expect(lines.join('\n')).toMatch(/ledger outbox backstop flushed 2 entries \(\/ob\)/);
+    expect(lines.join('\n')).toMatch(/ledger outbox backstop FAILED 0 entries \(\/ob2\): boom/);
+    const r = await buildCliDaemonEffects({ owner: 't', log, ...deps, flushLedgerOutboxes: () => { throw new Error('disk gone'); } }).tickOnce();
+    expect(r).toBeTruthy();
+    expect(lines.join('\n')).toMatch(/ledger outbox backstop failed \(non-fatal\): disk gone/);
+  });
+});

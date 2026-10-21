@@ -104,15 +104,23 @@ export function assertPushRef(branch, allowRef = null) {
 }
 
 
-/** Keep git's actual diagnostic on the first line, which callers retain in their write-miss messages. */
+/**
+ * Keep git's actual diagnostic on the first line, which callers retain in their write-miss messages.
+ * A REJECTED PUSH KEEPS ITS WHY (live 2026-10-21): git prints `! [rejected] HEAD -> <ref> (fetch first)` and then
+ * `error: failed to push some refs`. Keeping only the last `error:` line dropped the one line that says it was a
+ * lost race (and any `remote:` explanation), so every ledger-write-miss read the same. Those lines now lead.
+ */
 const wrappedRunners = new WeakSet();
-function withGitError(run) {
+const KEEP_LINE_RE = /^(!\s*\[(rejected|remote rejected)\]|remote:)/;
+export function withGitError(run) {
   if (wrappedRunners.has(run)) return run;
   const wrapped = (args, opts) => {
     try { return run(args, opts); } catch (cause) {
       const lines = String(cause?.stderr ?? '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-      const reason = lines.filter((line) => /^(fatal:|error:)/.test(line)).at(-1)
+      const last = lines.filter((line) => /^(fatal:|error:)/.test(line)).at(-1)
         || lines.at(-1) || String(cause?.message ?? cause).split('\n')[0];
+      const kept = lines.filter((line) => KEEP_LINE_RE.test(line) && line !== last).slice(0, 4).map((line) => line.slice(0, 300));
+      const reason = [...kept, last].join(' | ');
       const error = new Error(`git ${args.join(' ')} failed: ${reason}`, { cause });
       error.status = cause?.status;
       error.stderr = cause?.stderr;
@@ -122,6 +130,8 @@ function withGitError(run) {
   wrappedRunners.add(wrapped);
   return wrapped;
 }
+/** Test-facing name for {@link withGitError}. */
+export const withGitErrorForTest = withGitError;
 
 const stderrLog = (line) => process.stderr.write(`${line}\n`);
 

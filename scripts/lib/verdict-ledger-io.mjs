@@ -34,6 +34,7 @@ import {
 } from './git-transport-branch.mjs';
 import { parseVerdictLog, parseLedgerEvents, ledgerEventId, checkLedgerAppendRows } from './verdict-ledger.mjs';
 import { registerLedgerStore } from './verdict-ledger-store.mjs';
+import { appendViaOutbox, outboxDirFor, resolveOutboxSettings, formatOutboxSettings, OutboxFlushError } from './verdict-ledger-outbox.mjs';
 
 export const LEDGER_TRANSPORT_BRANCH = 'ops/review-requests';
 export const LEDGER_DIR = 'verdict-ledger';
@@ -157,8 +158,10 @@ export function readLedgerFromGit({
  * Append records to one repo's ledger on the git transport, retrying on a lost push race.
  * Validates every record first; an invalid one refuses the whole call and writes nothing.
  *
- * @returns {{status: 'appended', attempts: number, rows: number, duplicates: number} }
- * @throws {LedgerAppendExhaustedError} when every attempt failed (LOUD by design).
+ * @returns {{status: 'appended', attempts: number, rows: number, duplicates: number, queued?: boolean, outboxDir?: string} }
+ *   `queued: true` (outbox path) = durably queued on this host; the current flusher pushes it.
+ * @throws {LedgerAppendExhaustedError} when every attempt failed (LOUD by design) — on the outbox path: the flush
+ *   this call ran failed (its own entry withdrawn, so thrown still means not recorded), or the outbox is stale.
  */
 export function appendLedgerRows({
   board,
@@ -177,6 +180,29 @@ export function appendLedgerRows({
   if (!check.ok) throw new TypeError(`verdict-ledger-io: ${check.error}`);
   const { lines, ids } = check;
   const path = ledgerGitPath(repo);
+
+  // THE OUTBOX PATH (live 2026-10-21, `we:scripts/lib/verdict-ledger-outbox.mjs`): rows are queued host-locally and
+  // ONE flusher pushes them as one plumbing commit. Chosen by the settings cascade (off in CI); an explicit
+  // `outbox` wins; injected TRANSPORT seams (`run`/`mkdir`/`write`/`read`/`rm`) mean a unit test of the direct
+  // path below, which stays exactly as it was for CI and for those seams.
+  const { outbox, outboxDir, gitRun, log, env = process.env, settings, removeEntry, random, ...transport } = seams;
+  const directSeam = ['run', 'mkdir', 'write', 'read', 'rm'].some((k) => transport[k] !== undefined);
+  const cascade = resolveOutboxSettings({ repo: settings ?? readSettings(), env });
+  const settingsLine = formatOutboxSettings(cascade);
+  if (!loggedCaps.has(settingsLine)) { loggedCaps.add(settingsLine); (log ?? defaultLog)(settingsLine); }
+  if (outbox ?? (cascade.enabled && !directSeam)) {
+    try {
+      const dir = outboxDir ?? outboxDirFor({ board, env, ...(gitRun ? { run: gitRun } : {}) });
+      return appendViaOutbox({
+        board, branch, dir, repo, path, lines, ids, message, settings: cascade, allowRef: LEDGER_PUSH_REF,
+        run: gitRun ?? transport.run, now: transport.now, sleep, random, log, onRetry, removeEntry,
+      });
+    } catch (e) {
+      if (e instanceof OutboxFlushError) throw new LedgerAppendExhaustedError({ repo, attempts: e.attempts, errors: e.errors });
+      throw e;
+    }
+  }
+
   const errors = [];
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
@@ -202,7 +228,8 @@ export function appendLedgerRows({
             return `${base}${base && !base.endsWith('\n') ? '\n' : ''}${fresh.join('\n')}\n`;
           },
         }],
-        ...seams,
+        ...transport,
+        ...(log ? { log } : {}),
         allowRef: LEDGER_PUSH_REF, // after the seams: a caller cannot loosen it
       });
       return { status: 'appended', attempts: attempt, rows: written, duplicates };

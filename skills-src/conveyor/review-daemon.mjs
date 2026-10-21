@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import { readMainFixPriority } from '../../scripts/lib/merge-queue-hook.mjs';
+import { flushBoardLedgerOutbox } from '../../scripts/lib/verdict-ledger-outbox.mjs';
+import { resolveLedgerBoard } from '../../scripts/lib/verdict-ledger.mjs';
 import { repoKeyFromSlug } from '../../scripts/readiness/lane-manifest.mjs';
 import { redTeamEnabled } from '../../scripts/lib/review-red-team-policy.mjs';
 import { readDrainRedTeamRequests, finishDrainRedTeamRequest } from '../../scripts/lib/drain-red-team-requests.mjs';
@@ -1292,6 +1294,16 @@ export function realSleep(ms) { return new Promise((resolve) => { setTimeout(res
  *   function's own env-resolved defaults — see its own doc — so this daemon is bounded with no extra wiring
  *   here). `null`/omitted (every pre-existing caller) reaps in the plan's own existing order, unchanged.
  */
+/**
+ * The ledger OUTBOX BACKSTOP (live 2026-10-21, `we:scripts/lib/verdict-ledger-outbox.mjs`). Every append already
+ * flushes the queue it joins; this pushes what a crashed or failed flusher left behind when no new append comes.
+ * One flush per distinct ledger board; a held flusher lock is a quiet no-op.
+ */
+export function defaultFlushLedgerOutboxes({ repos = REVIEW_DAEMON_REPOS, resolveBoard = resolveLedgerBoard, flush = flushBoardLedgerOutbox } = {}) {
+  const boards = [...new Set(repos.map((r) => resolveBoard(r)).filter(Boolean))];
+  return boards.map((board) => flush({ board }));
+}
+
 export function defaultReapSessions({ priorityNames = null } = {}) {
   return runSessionReaperPass({
     allowedCwd: SESSION_REAPER_REPO_ROOT,
@@ -1702,6 +1714,7 @@ export function liveReviewRoundBudget({ env = process.env, listCommands = () => 
 export function buildCliDaemonEffects({
   owner, intervalMs = DEFAULT_INTERVAL_MS, log = console,
   reapSessions = defaultReapSessions,
+  flushLedgerOutboxes = defaultFlushLedgerOutboxes,
   // #3383 bug 3 — the real daemon wires the real `acquirableLanes` effect through by default, so production
   // dispatch is bounded by lane reality; `runReviewTick`'s OWN default stays unbounded (`() => Infinity`) so
   // every pre-existing test of it (which fakes reconcile/dispatch directly, never this) is unaffected.
@@ -1795,6 +1808,17 @@ export function buildCliDaemonEffects({
         log.error(`review-daemon: session-reap failed (non-fatal): ${String((e && e.message) || e).split('\n')[0]}`);
       }
       phaseMs.reap = Date.now() - phaseStarted;
+      phaseStarted = Date.now();
+      // Best-effort like the reap: a ledger-outbox backstop failure is logged (the flush itself logs a stale
+      // outbox as ledger-write-miss) and never takes down the tick.
+      try {
+        for (const f of flushLedgerOutboxes() ?? []) {
+          if (f && (f.flushed || f.ok === false)) log.error(`review-daemon: ledger outbox backstop ${f.ok === false ? 'FAILED' : 'flushed'} ${f.flushed ?? 0} entr${f.flushed === 1 ? 'y' : 'ies'} (${f.dir ?? '?'})${f.error ? `: ${f.error}` : ''}`);
+        }
+      } catch (e) {
+        log.error(`review-daemon: ledger outbox backstop failed (non-fatal): ${String((e && e.message) || e).split('\n')[0]}`);
+      }
+      phaseMs.ledgerOutbox = Date.now() - phaseStarted;
       phaseStarted = Date.now();
       const warm = await warmReviewFacts(REVIEW_DAEMON_REPOS); // once a tick: refresh the facts mirror from the Worker (not GitHub)
       log.error(`review-daemon: pr-facts ${warm.skipped ? `off (${warm.skipped})` : (warm.warmed ?? []).map((w) => `${w.repo.split('/')[1]}=${w.ok ? 'store' : `github (${w.reason})`}`).join(' ')}`);
