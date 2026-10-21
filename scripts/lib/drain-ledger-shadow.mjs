@@ -216,7 +216,11 @@ export async function runLedgerShadow({ verdicts = [], localSlug = null, dryRun 
   bindingBudgetMs = BINDING_PASS_BUDGET_MS } = {}) {
   try {
     const at = now();
-    const bindingDeadline = Date.now() + (Number.isFinite(bindingBudgetMs) ? bindingBudgetMs : BINDING_PASS_BUDGET_MS);
+    // The budget covers the FOLDS only: its clock starts at the first fold, after the store read (a 17k-row git read
+    // alone outlasted a 2 s budget started here, so every pass skipped every PR — live drain, 2026-10-21).
+    const budgetMs = Number.isFinite(bindingBudgetMs) ? bindingBudgetMs : BINDING_PASS_BUDGET_MS;
+    let bindingDeadline = null;
+    const foldAllowed = () => Date.now() < (bindingDeadline ??= Date.now() + budgetMs);
     const byRepo = new Map();
     for (const v of verdicts) {
       if (!v || !Number.isInteger(Number(v.num))) continue;
@@ -234,7 +238,7 @@ export async function runLedgerShadow({ verdicts = [], localSlug = null, dryRun 
       stores[repo] = events ? { status: 'ok', name: read.store?.name ?? null, shared: read.store?.shared === true, rows: events.length }
         : { status: 'unreadable', name: read?.store?.name ?? null, reason: read?.reason ?? 'unknown', error: String(read?.error ?? '').slice(0, 200) };
       // Slice 3: the binding folds share ONE wall-clock budget per pass; PRs past it are journaled `skipped`, never folded.
-      for (const v of vs) rows.push(shadowRow({ verdict: v, repo, events, now: at, binding: Date.now() < bindingDeadline }));
+      for (const v of vs) rows.push(shadowRow({ verdict: v, repo, events, now: at, binding: foldAllowed() }));
     }
     const summary = summarizeShadow(rows);
     if (dryRun) return { ok: true, written: false, summary, rows, stores };
