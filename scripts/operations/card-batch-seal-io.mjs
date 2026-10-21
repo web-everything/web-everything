@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'nod
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { acquireLease, atomicRecord, cardBatchStateDir, tokenOf } from './card-batch-io.mjs';
+import { acquireLease, atomicRecord, cardBatchStateDir, provenMergedLanding, retireBatch, retireTerminalBatch, tokenOf } from './card-batch-io.mjs';
 import { planPublish, planSeal, renderBatchBody } from './card-batch-seal.mjs';
 import { CARD_BATCH_KINDS } from '../lib/card-batch-policy.mjs';
 import { effectiveCardBatchPolicy } from '../lib/card-batch-settings.mjs';
@@ -61,10 +61,22 @@ export async function publishBatch(input, opts = {}) {
     // A terminal generation is archived before its active slot becomes a sequence-only successor seed.
     if (!state.batchRef && state.lastSealedState) {
       state = readState(state.lastSealedState);
-      return { action: state.sealFailure ? 'held' : 'sealed', state };
+      if (!['MERGED', 'CLOSED'].includes(state.terminalPrState)) return { action: state.sealFailure ? 'held' : 'sealed', state };
     }
     const kind = input.kind ?? kindOf(state, statePath);
     const repo = state.repo ?? state.members[0]?.source.repo;
+    if (['MERGED', 'CLOSED'].includes(state.terminalPrState)) {
+      // An archive hint cannot bypass seal checks or authorize a stale terminal state.
+      if (state.seal?.step !== 'label-on-green') return refuse('batch-sealed');
+      let view;
+      try { view = JSON.parse(await gh(['pr', 'view', String(state.pr), '--repo', repo, '--json', 'number,state,headRefName'])); }
+      catch { return refuse('batch-sealed'); }
+      if (!held()) return refuse('lease-held');
+      if (Number(view?.number) !== Number(state.pr) || view?.headRefName !== state.batchRef
+        || !['MERGED', 'CLOSED'].includes(view.state)) return refuse('batch-sealed');
+      if (basename(dirname(statePath)) === 'sealed' || readState(statePath).lastSealedState) return { action: 'sealed', state };
+      // Active slots retire through the common fresh-read path below.
+    }
     const check = async () => {
       if (!held()) return 'lease-held';
       const advertised = String(await run('git', ['ls-remote', '--refs', remote, `refs/heads/${state.batchRef}`])).trim().split(/\s+/)[0];
@@ -75,17 +87,64 @@ export async function publishBatch(input, opts = {}) {
       state.lease = { owner: lease.owner, expiresAt: lease.expiresAt };
       atomicRecord(statePath, state);
     };
-    const retire = () => {
-      if (basename(dirname(statePath)) === 'sealed') return;
-      if (!held()) throw new Error('lease-held');
-      const archiveDir = join(dirname(statePath), 'sealed');
-      mkdirSync(archiveDir, { recursive: true });
-      const archivePath = join(archiveDir, `${repo.replaceAll('/', '-')}-${state.seq}-${kind}.json`);
-      atomicRecord(archivePath, { ...state, kind, repo });
-      atomicRecord(statePath, { seq: state.seq, lastSealedState: archivePath });
+    // A MERGED-mid-seal batch retires only through retireTerminalBatch, which recomputes the full content proof
+    // (provenMergedLanding, card-batch-io.mjs) from scratch on every attempt; nothing stored is ever evidence.
+    const gitRun = args => run('git', args);
+    const retireMerged = () => retireTerminalBatch(state, { ...input, source: { repo }, kind, laneDir: cwd }, {
+      statePath, stateDir, remote, gh, held, log: opts.log, git: gitRun,
+    });
+    const retire = async () => {
+      // The existing failed-seal quarantine is outside terminal-PR recovery, except a failure recorded because the PR
+      // MERGED mid-seal (below): that one retires only through the proof and the fresh-read terminal path.
+      if (state.sealFailure?.terminalPrState === 'MERGED') return retireMerged();
+      if (state.sealFailure) return retireBatch(statePath, state, { repo, kind, held });
+      return retireTerminalBatch(state, { ...input, source: { repo }, kind, laneDir: cwd }, {
+        statePath, stateDir, remote, gh, held, log: opts.log,
+      });
     };
-    if (state.sealFailure) { retire(); return { action: 'held', state }; }
-    if (state.seal?.step === 'label-on-green') { retire(); return { action: 'sealed', state }; }
+    if (state.sealFailure?.terminalPrState === 'MERGED') {
+      // Retry: re-run the proof and retirement; a refusal is reported as itself, never as held.
+      const retried = await retire();
+      return retried?.action === 'retired' ? { action: 'held', state, retired: true } : retried;
+    }
+    if (state.sealFailure) { await retire(); return { action: 'held', state }; }
+    if (state.seal?.step === 'label-on-green') { await retire(); return { action: 'sealed', state }; }
+    // A started seal whose PR already MERGED (landed by another path) can never finish: every remaining step targets
+    // an open PR, and terminal retirement accepts only a finished seal. Live: #5680 merged at step record-sealed and
+    // held the prevention slot (and the pending spool behind it). Only on the stuck path (a started seal whose next
+    // step failed or was refused) is the PR re-read; if it MERGED, the cards are proven on main by content (above)
+    // before anything is recorded. CLOSED is deliberately not handled here: it stays held as before.
+    // Returns null (caller keeps its original failure) unless the batch was retired.
+    const recoverMergedSeal = async () => {
+      if (!state.sealedAt || !state.pr) return null;
+      const view = JSON.parse(await gh(['pr', 'view', String(state.pr), '--repo', repo, '--json', 'number,state,headRefName']));
+      if (Number(view?.number) !== Number(state.pr) || view.headRefName !== state.batchRef || view.state !== 'MERGED') return null;
+      let missing;
+      // Every error inside recovery (GitHub read, bad JSON, git/IO, save, retirement) propagates unchanged; only the
+      // documented clean negatives (not a matching MERGED PR, a card not proven, a retirement refusal) return null.
+      missing = await provenMergedLanding(state, { repo, gh, git: gitRun, remote });
+      if (missing.length) {
+        process.stderr.write(`card-batch ${state.batchRef} PR ${state.pr} MERGED but ${missing.length} card(s) not proven on main `
+          + `(${missing.slice(0, 5).join(', ')}): kept held\n`);
+        return null;
+      }
+      state.sealFailure = { reason: `PR MERGED before the seal finished (step ${state.seal?.step ?? 'none'}); the seal cannot resume`,
+        at: new Date(now()).toISOString(), terminalPrState: 'MERGED' };
+      save();
+      // retire() recomputes the proof before retiring. Only a completed retirement replaces the original outcome;
+      // otherwise the next run retries (proof included) and this run keeps its own failure.
+      const retired = await retire();
+      return retired?.action === 'retired' ? { action: 'held', state, retired: true } : null;
+    };
+    // Recovery replaces the original outcome only when it completed; an error inside recovery propagates as itself.
+    // On a clean negative, a thrown original is rethrown unchanged (whatever was thrown) and a returned refusal is
+    // returned; a failing recovery never fulfils in their place.
+    const orRecoverMerged = async ({ threw = false, thrown, returned }) => {
+      const recovered = await recoverMergedSeal();
+      if (recovered) return recovered;
+      if (threw) throw thrown;
+      return returned;
+    };
     const restoreProtection = async () => {
       if (!state.restoreProtection) return;
       await gh(['pr', 'edit', String(state.pr), '--repo', repo, '--add-label', HOLD_LABEL]);
@@ -96,7 +155,7 @@ export async function publishBatch(input, opts = {}) {
       save();
     };
     // Pending protection recovery must run even if a subsequent push is no longer adoptable.
-    await restoreProtection();
+    try { await restoreProtection(); } catch (error) { return await orRecoverMerged({ threw: true, thrown: error }); }
     const advertised = String(await run('git', ['ls-remote', '--refs', remote, `refs/heads/${state.batchRef}`]))
       .trim().split(/\s+/)[0];
     if (advertised && advertised !== state.headSha && resolveAdoptDescendantHead(opts) === 'on') {
@@ -135,9 +194,11 @@ export async function publishBatch(input, opts = {}) {
         process.stderr.write(`card-batch adopted head ${state.batchRef}: ${from}→${advertised}\n`);
       }
     }
-    await restoreProtection();
+    // Adoption above can re-arm protection; a failure restoring it on a merged PR is the same stuck path.
+    try { await restoreProtection(); } catch (error) { return await orRecoverMerged({ threw: true, thrown: error }); }
     let mismatch = await check();
-    if (mismatch) return refuse(mismatch);
+    // A started seal refused here may be a merged PR whose branch moved or was deleted: the stuck path.
+    if (mismatch) return state.sealedAt && mismatch === 'head-mismatch' ? await orRecoverMerged({ returned: refuse(mismatch) }) : refuse(mismatch);
     const plan = planPublish({ state, kind, policy, now: now() });
     bodyPath = `${statePath}.${lease.token}.body.md`;
     writeFileSync(bodyPath, renderBatchBody(state));
@@ -223,13 +284,13 @@ export async function publishBatch(input, opts = {}) {
           if (state.verifyUnrun < VERIFY_UNRUN_CAP) { save(); throw new Error(`verify unrun: ${detail}`); }
           state.sealFailure = { reason: `verify did not run ${state.verifyUnrun} times: ${detail}`, at: new Date(now()).toISOString() };
           save();
-          retire();
+          await retire();
           return { action: 'held', state };
         }
         if (!verdict.ok) {
           state.sealFailure = { reason: JSON.stringify(verdict.blocking ?? 'verify red'), at: new Date(now()).toISOString() };
           save();
-          retire();
+          await retire();
           return { action: 'held', state };
         }
         const marker = readVerifyMarker(gitDir);
@@ -248,7 +309,7 @@ export async function publishBatch(input, opts = {}) {
       save();
       checkpoint(step);
     }
-    retire();
+    await retire();
     return { action: 'sealed', state };
   } finally {
     try {
@@ -279,7 +340,8 @@ export async function sealDueBatches({ now = Date.now(), stateDir = CARD_BATCH_S
       const path = resolve(stateDir, file);
       const state = readState(path);
       if (!state.batchRef) continue;
-      if (basename(stateDir) === 'sealed' && (state.sealFailure || state.seal?.step === 'label-on-green')) continue;
+      if (basename(stateDir) === 'sealed' && (state.sealFailure || state.seal?.step === 'label-on-green'
+        || ['MERGED', 'CLOSED'].includes(state.terminalPrState))) continue;
       const kind = kindOf(state, path);
       // Any seal reason launches (count beats age in shouldSeal); the lease serialises the worker against inline sealing.
       // A PR whose hold was never confirmed relaunches too, so the unheld-draft window closes without waiting for a seal.

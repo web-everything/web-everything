@@ -35,6 +35,7 @@
  * that label back to decide anything; the comment stays the one durable record. And a concurrent-author stop is
  * no longer a stand-down at all — see {@link CONCURRENT_AUTHOR_PAUSE_MARKER}.)
  */
+import { ensureLabelCached } from '../lib/label-cache.mjs';
 import { resolve, dirname, join } from 'node:path';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -812,8 +813,8 @@ if (IS_CLI) {
   let labeled = false;
   if (!concurrent && !loadHold && !redispatch) {
     try {
-      gh(['label', 'create', STAND_DOWN_LABEL, ...repoArgs, '--color', 'b60205', '--description', 'a fixer stood down; a person is the next step (auto-managed)', '--force']);
-      if (supersededBy) gh(['label', 'create', SUPERSEDED_LABEL, ...repoArgs, '--color', '6e7781', '--description', 'a merged PR declares it supersedes this one; closing needs an operator decision (auto-managed)', '--force']);
+      ensureLabelCached(['label', 'create', STAND_DOWN_LABEL, ...repoArgs, '--color', 'b60205', '--description', 'a fixer stood down; a person is the next step (auto-managed)'], { exec: args => execFileSync('gh', args, { encoding: 'utf8', timeout: resolveChildTimeoutMs(), stdio: ['ignore', 'pipe', 'pipe'] }) });
+      if (supersededBy) ensureLabelCached(['label', 'create', SUPERSEDED_LABEL, ...repoArgs, '--color', '6e7781', '--description', 'a merged PR declares it supersedes this one; closing needs an operator decision (auto-managed)'], { exec: args => execFileSync('gh', args, { encoding: 'utf8', timeout: resolveChildTimeoutMs(), stdio: ['ignore', 'pipe', 'pipe'] }) });
       gh(['pr', 'edit', String(pr), ...repoArgs, '--add-label', supersededBy ? `${STAND_DOWN_LABEL},${SUPERSEDED_LABEL}` : STAND_DOWN_LABEL]);
       labeled = true;
     } catch (e) {
