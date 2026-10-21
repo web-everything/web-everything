@@ -28,7 +28,7 @@ import { advance, advanceWhileRunning, startRun } from '../engine.mjs';
 import { resolveOperation } from '../run.mjs';
 import { advanceReviewPrToWriteUp } from '../record-verdict-io.mjs';
 import { loadReviewSeatSettings } from '../../lib/review-seat-provider.mjs';
-import { reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
+import { decideReferralHold, REFERRAL_RETRY_MS, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 
 const HEAD_1 = 'a'.repeat(40);
 const HEAD_2 = 'b'.repeat(40);
@@ -504,6 +504,100 @@ describe('runReviewLoopOnce — a ruling on an unchanged head resumes the paused
     await runReviewLoopOnce({ declaration, registry, argv, store, sinks: failing, makeJudge, mintRunId: () => 'x', findResumableRun: () => 'r-1' });
     expect(store.read('r-1').resumeOf).toMatchObject({ adviseFinishedAt: secondAdvise, attempts: 1 });
   });
+
+  // Live 2026-10-20, #5752: the referral ledger push lost five races in a row, so the run parked as
+  // `referral-persistence-failed`, and the retry started a whole new panel that failed the same way. A persist retry
+  // resumes the parked run at the referral step, and each such resume spends one slot of the hold's retry budget.
+  it('a referral persist that failed is retried by resuming the parked run, counting each retry, never a new panel', async () => {
+    const { declaration, registry } = setup();
+    const store = createMemoryRunStore();
+    let judged = 0;
+    const makeJudge = () => async () => { judged += 1; return judgeOutcome(REFERRAL_ANSWER, {}); };
+    const persistFails = sinksWith({ seen: [], ruled: { value: false } });
+    persistFails[REVIEW_EFFECTS.MANDATORY_REFERRALS] = async () => ({ records: [], pending: ['referral-persistence-failed'],
+      blocked: [], malformed: false, reason: 'mandatory ruling ledger-write-miss: push lost the race' });
+    await runReviewLoopOnce({ declaration, registry, argv, store, sinks: persistFails, makeJudge, mintRunId: () => 'r-1' });
+    const judgedByFirstReview = judged;
+    expect(reviewRunEvidence(store.read('r-1'))).toMatchObject({ persistenceFailed: true, persistRetries: 0 });
+    // Retry 1 fails again: same run, one retry counted.
+    await runReviewLoopOnce({ declaration, registry, argv, store, sinks: persistFails, makeJudge,
+      mintRunId: () => 'must-not-be-minted', findResumableRun: () => 'r-1', now: () => '2026-10-20T15:40:00.000Z' });
+    expect(reviewRunEvidence(store.read('r-1'))).toMatchObject({ id: 'r-1', persistenceFailed: true, persistRetries: 1 });
+    // Retry 2 persists: the run is no longer held on persistence, and no juror ever ran again.
+    const ok = await runReviewLoopOnce({ declaration, registry, argv, store, sinks: sinksWith({ seen: [], ruled: { value: true } }),
+      makeJudge, mintRunId: () => 'must-not-be-minted', findResumableRun: () => 'r-1', now: () => '2026-10-20T16:10:00.000Z' });
+    expect(ok.run.id).toBe('r-1');
+    expect(judged).toBe(judgedByFirstReview);
+    expect(store.read('must-not-be-minted')).toBeFalsy();
+    expect(reviewRunEvidence(store.read('r-1'))).toMatchObject({ persistenceFailed: false, parked: false, persistRetries: 2 });
+  });
+
+  // Codex audit of the fix above: resumes that die part-way must spend the budget too, or three of them reach the
+  // RESUME_MAX_ATTEMPTS fresh-panel fallback with the budget unspent and the retries never run out.
+  it('a persist retry that dies part-way still spends a slot, so the hold is exhausted before the fresh-panel fallback', async () => {
+    const { declaration, registry } = setup();
+    const store = createMemoryRunStore();
+    const makeJudge = () => async () => judgeOutcome(REFERRAL_ANSWER, {});
+    const persistFails = sinksWith({ seen: [], ruled: { value: false } });
+    persistFails[REVIEW_EFFECTS.MANDATORY_REFERRALS] = async () => ({ records: [], pending: ['referral-persistence-failed'],
+      blocked: [], malformed: false, reason: 'ledger-write-miss' });
+    await runReviewLoopOnce({ declaration, registry, argv, store, sinks: persistFails, makeJudge, mintRunId: () => 'r-1' });
+    const dies = sinksWith({ seen: [], ruled: { value: false } });
+    dies[REVIEW_EFFECTS.MANDATORY_REFERRALS] = async () => { throw new Error('gh: 502'); };
+    for (let n = 1; n <= REFERRAL_RETRY_MS.length; n++) {
+      await runReviewLoopOnce({ declaration, registry, argv, store, sinks: dies, makeJudge, mintRunId: () => 'must-not-be-minted', findResumableRun: () => 'r-1' });
+      expect(reviewRunEvidence(store.read('r-1'))).toMatchObject({ id: 'r-1', persistenceFailed: true, persistRetries: n });
+    }
+    const p = { number: 4361, headRefOid: reviewRunEvidence(store.read('r-1')).head, comments: [], labels: [] };
+    expect(decideReferralHold(p, [reviewRunEvidence(store.read('r-1'))], { repo: 'o/n', now: Date.now() + 86_400_000 }))
+      .toMatchObject({ exhausted: true, retryAt: null });
+    // Spent: even if a review is dispatched anyway, it never falls back to a fresh panel; the round refuses.
+    const refused = await runReviewLoopOnce({ declaration, registry, argv, store, sinks: dies, makeJudge,
+      mintRunId: () => 'must-not-be-minted', findResumableRun: () => 'r-1' });
+    expect(refused).toMatchObject({ code: 2, stopped: 'refused' });
+    expect(refused.lines.join('\n')).toMatch(/persist retries are spent/);
+    expect(store.read('must-not-be-minted')).toBeFalsy();
+  });
+
+  it.each([REVIEW_EFFECTS.MANDATORY_REFERRALS, REVIEW_EFFECTS.ADVISORY_NOTE])(
+    'an interrupted persist retry at %s starts its next backoff at the latest resume, even after a long outage', async (failurePoint) => {
+      const { declaration, registry } = setup();
+      const store = createMemoryRunStore();
+      // The adapter factory runs on every invocation; only calling the judge executes a juror.
+      const judge = vi.fn(async () => judgeOutcome(REFERRAL_ANSWER, {}));
+      const makeJudge = () => judge;
+      const persistFails = sinksWith({ seen: [], ruled: { value: false } });
+      persistFails[REVIEW_EFFECTS.MANDATORY_REFERRALS] = async () => ({ records: [], pending: ['referral-persistence-failed'],
+        blocked: [], malformed: false, reason: 'ledger-write-miss' });
+      await runReviewLoopOnce({ declaration, registry, argv, store, sinks: persistFails, makeJudge, mintRunId: () => 'r-1' });
+      const original = reviewRunEvidence(store.read('r-1'));
+      const p = { number: 4361, headRefOid: original.head, comments: [], labels: [] };
+      const judged = judge.mock.calls.length;
+      expect(judged).toBeGreaterThan(0);
+      const dies = { ...persistFails, [failurePoint]: async () => { throw new Error('gh: 502'); } };
+      let resumedAt = original.completedAt + 2 * 3600_000;
+      for (let n = 1; n <= REFERRAL_RETRY_MS.length; n++) {
+        expect(decideReferralHold(p, [reviewRunEvidence(store.read('r-1'))], { repo: 'o/n', now: resumedAt })).toBeNull();
+        await runReviewLoopOnce({ declaration, registry, argv, store, sinks: dies, makeJudge,
+          mintRunId: () => 'must-not-be-minted', findResumableRun: () => 'r-1', now: () => new Date(resumedAt).toISOString() });
+        const current = reviewRunEvidence(store.read('r-1'));
+        expect(current).toMatchObject({ id: 'r-1', parked: true, persistenceFailed: true, persistRetries: n });
+        expect(judge).toHaveBeenCalledTimes(judged);
+        if (n < REFERRAL_RETRY_MS.length) {
+          const retryAt = resumedAt + REFERRAL_RETRY_MS[n];
+          for (const tick of [resumedAt + 60_000, retryAt - 1]) {
+            expect(decideReferralHold(p, [current], { repo: 'o/n', now: tick }))
+              .toMatchObject({ exhausted: false, retryAt });
+          }
+          expect(decideReferralHold(p, [current], { repo: 'o/n', now: retryAt })).toBeNull();
+          resumedAt = retryAt;
+        } else {
+          expect(decideReferralHold(p, [current], { repo: 'o/n', now: resumedAt + 60_000 }))
+            .toMatchObject({ exhausted: true, retryAt: null });
+        }
+      }
+      expect(store.read('must-not-be-minted')).toBeFalsy();
+    });
 
   it('without a resumable run it starts a fresh review exactly as before (new push, re-arm, send-back)', async () => {
     const { declaration, registry } = setup();
