@@ -237,7 +237,9 @@ const SHIM_CAPTURE_MAX_BUFFER = 1024 * 1024 * 1024;
  * (command, option) pair listed here skips its value, so a switch of the same name in another command
  * (`repo edit --template <repo>`, `pr view --comments <url>`) keeps its next argument a target, and an
  * option a newer gh adds is scanned conservatively: drift can cause a refusal, never a missed host.
- * Selectors (-R/--repo, --hostname, --host) and optional-value options (browse -c/--commit) are absent.
+ * Selectors (-R/--repo, -h/--hostname, the repository flags below) and optional-value options (browse
+ * -c/--commit) are absent. Each pair was confirmed by gh's own parser (`<cmd> --<name>=x --unknown`
+ * fails on the unknown flag, not ParseBool): help shows some switches with a backquoted placeholder.
  */
 export const GH_VALUE_OPTIONS = {
   'agent-task create': ['baF', 'base custom-agent from-file'],
@@ -249,15 +251,14 @@ export const GH_VALUE_OPTIONS = {
   'attestation verify': ['bidqLot', 'bundle cert-identity cert-identity-regex cert-oidc-issuer ' +
     'custom-trusted-root digest-alg format jq limit owner predicate-type signer-digest signer-repo ' +
     'signer-workflow source-digest source-ref template'],
-  'auth login': ['phs', 'git-protocol scopes'],
-  'auth logout': ['hu', 'user'],
-  'auth refresh': ['hrs', 'remove-scopes scopes'],
-  'auth setup-git': ['fh', 'force'],
-  'auth status': ['h', 'jq json template'],
-  'auth switch': ['hu', 'user'],
-  'auth token': ['hu', 'user'],
+  'auth login': ['ps', 'git-protocol scopes'],
+  'auth logout': ['u', 'user'],
+  'auth refresh': ['rs', 'remove-scopes scopes'],
+  'auth status': ['', 'jq json template'],
+  'auth switch': ['u', 'user'],
+  'auth token': ['u', 'user'],
   browse: ['b', 'branch'],
-  'cache delete': ['r', 'ref succeed-on-no-caches'],
+  'cache delete': ['r', 'ref'],
   'cache list': ['qkLOrSt', 'jq json key limit order ref sort template'],
   'codespace code': ['c', 'codespace repo-owner'],
   'codespace cp': ['cp', 'codespace profile repo-owner'],
@@ -291,7 +292,7 @@ export const GH_VALUE_OPTIONS = {
   'issue comment': ['bF', 'body body-file'],
   'issue create': ['abFlmpTt', 'assignee blocked-by blocking body body-file label milestone parent project ' +
     'recover template title type'],
-  'issue develop': ['bn', 'base branch-repo name'],
+  'issue develop': ['bn', 'base name'],
   'issue edit': ['bFmt', 'add-assignee add-blocked-by add-blocking add-label add-project add-sub-issue body ' +
     'body-file milestone parent remove-assignee remove-blocked-by remove-blocking remove-label remove-project ' +
     'remove-sub-issue title type'],
@@ -352,7 +353,7 @@ export const GH_VALUE_OPTIONS = {
   'repo autolink list': ['qt', 'jq json template'],
   'repo autolink view': ['qt', 'jq json template'],
   'repo clone': ['u', 'upstream-remote-name'],
-  'repo create': ['dghlrstp', 'description gitignore homepage license remote source team template'],
+  'repo create': ['dghlrst', 'description gitignore homepage license remote source team'],
   'repo deploy-key add': ['t', 'title'],
   'repo deploy-key list': ['qt', 'jq json template'],
   'repo edit': ['dh', 'add-topic default-branch description homepage remove-topic squash-merge-commit-message ' +
@@ -361,7 +362,7 @@ export const GH_VALUE_OPTIONS = {
   'repo list': ['qlLt', 'jq json language limit template topic visibility'],
   'repo read-dir': ['qt', 'jq json ref template'],
   'repo read-file': ['qot', 'jq json output ref template'],
-  'repo sync': ['bs', 'branch source'],
+  'repo sync': ['b', 'branch'],
   'repo view': ['bqt', 'branch jq json template'],
   'ruleset list': ['Lo', 'limit org'],
   'ruleset view': ['o', 'org'],
@@ -383,7 +384,7 @@ export const GH_VALUE_OPTIONS = {
     'language license limit match number-topics order owner size sort stars template topic updated visibility'],
   'secret delete': ['aeo', 'app env org'],
   'secret list': ['aeqot', 'app env jq json org template'],
-  'secret set': ['abeforv', 'app body env env-file org visibility'],
+  'secret set': ['abefov', 'app body env env-file org visibility'],
   'skill install': ['', 'agent dir pin scope'],
   'skill list': ['qt', 'agent dir jq json scope template'],
   'skill publish': ['', 'tag'],
@@ -394,7 +395,7 @@ export const GH_VALUE_OPTIONS = {
   'variable delete': ['eo', 'env org'],
   'variable get': ['eqot', 'env jq json org template'],
   'variable list': ['eqot', 'env jq json org template'],
-  'variable set': ['beforv', 'body env env-file org visibility'],
+  'variable set': ['befov', 'body env env-file org visibility'],
   'workflow list': ['qLt', 'jq json limit template'],
   'workflow run': ['Ffr', 'field raw-field ref'],
   'workflow view': ['r', 'ref'],

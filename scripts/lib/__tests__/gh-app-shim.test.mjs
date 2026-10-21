@@ -32,9 +32,16 @@ import {
 // PR #5729: a selector listed as a value option would be skipped as content, so a host it names would never be read.
 describe('GH_VALUE_OPTIONS never lists a host or repository selector', () => {
   it('has no selector long names, no -R shorthand and no optional-value browse -c', () => {
-    for (const [shorts, longs] of Object.values(GH_VALUE_OPTIONS)) {
+    for (const [command, [shorts, longs]] of Object.entries(GH_VALUE_OPTIONS)) {
       expect(shorts).not.toContain('R');
-      for (const name of ['repo', 'repos', 'hostname', 'host']) expect(longs.split(' ')).not.toContain(name);
+      if (/^(auth|config) /.test(command)) expect(shorts, command).not.toContain('h');
+      for (const name of ['repo', 'repos', 'hostname', 'host', 'branch-repo']) expect(longs.split(' ')).not.toContain(name);
+    }
+    // The per-command repository selectors the guard reads as hosts.
+    for (const [command, letter, name] of [['repo create', 'p', 'template'], ['repo sync', 's', 'source'],
+      ['secret set', 'r', 'repos'], ['variable set', 'r', 'repos']]) {
+      expect(GH_VALUE_OPTIONS[command][0], command).not.toContain(letter);
+      expect(GH_VALUE_OPTIONS[command][1].split(' '), command).not.toContain(name);
     }
     expect(GH_VALUE_OPTIONS.browse).toEqual(['b', 'branch']);
   });
@@ -43,6 +50,8 @@ describe('GH_VALUE_OPTIONS never lists a host or repository selector', () => {
   it.each([
     ['pr view', 'comments'], ['pr review', 'comment'], ['pr checkout', 'force'], ['extension install', 'force'],
     ['repo edit', 'template'], ['repo fork', 'remote'], ['workflow run', 'json'], ['label clone', 'force'],
+    // Help prints these switches with a backquoted placeholder (`--succeed-on-no-caches --all`).
+    ['cache delete', 'succeed-on-no-caches'], ['auth setup-git', 'force'],
   ])('lists no switch as a value option (%s --%s)', (command, name) => {
     expect((GH_VALUE_OPTIONS[command]?.[1] ?? '').split(' ')).not.toContain(name);
   });
@@ -1439,6 +1448,8 @@ require(${JSON.stringify(shim)});
     ['ext', 'install', '--force', 'https://github.corp.example/owner/gh-x'],
     ['extension', 'install', '--force', 'enterprise/owner/gh-x'],
     ['ext', 'upgrade', '--force', 'https://github.corp.example/owner/gh-x'],
+    ['cache', 'delete', '--all', '--succeed-on-no-caches', '-R', 'github.corp.example/o/r'],
+    ['cache', 'delete', '--all', '--succeed-on-no-caches', '--repo', 'github.corp.example/o/r'],
     // A value option of another command is not this command's: --notes is release content, not pr view's.
     ['pr', 'view', '--notes', 'https://github.corp.example/o/r/pull/1'],
   ])('refuses enterprise hosts before using a fresh public App cache: %j', (...argv) => {
