@@ -271,6 +271,17 @@ it.each([
   const calls = f.calls.length;
   expect((await publishBatch(f.input, { ...f.opts, exec })).action).toBe('deferred');
   expect(f.calls.length).toBe(calls);
+  // Even after the pause passes, only the capacity-checked re-arm may clear it.
+  expect((await publishBatch(f.input, { ...f.opts, exec, clock: () => 10 * 60 * 60_000 })).action).toBe('deferred');
+  expect(f.calls.length).toBe(calls);
+});
+it('re-arm leaves a pause that was renewed after the scan', async () => {
+  const f = fixture({ maxCards: 1 }); const spawn = vi.fn(fakeChild);
+  unrunPausedState(f, 10_000);
+  const renewed = new Date(900_000).toISOString();
+  const racing = async () => { writeFileSync(f.statePath, JSON.stringify({ ...JSON.parse(readFileSync(f.statePath, 'utf8')), verifyRetryAfter: renewed })); return { freeCount: 1 }; };
+  expect(await sealDueBatches({ now: 20_000, stateDir: f.dir, policy: f.opts.policy, spawn, readHeavyQueue: racing })).toEqual([]);
+  expect(JSON.parse(readFileSync(f.statePath, 'utf8')).verifyRetryAfter).toBe(renewed);
 });
 const unrunPausedState = (f, retryAfter) => writeFileSync(f.statePath, JSON.stringify({ ...f.state, sealedAt: 500,
   seal: { step: 'record-sealed' }, verifyUnrun: VERIFY_UNRUN_CAP, verifyRetryAfter: new Date(retryAfter).toISOString() }));

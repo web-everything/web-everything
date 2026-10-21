@@ -762,9 +762,10 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
       }
       for (const pr of prs) {
         if (readyNumbersThisRepo.has(pr.number)) continue;
-        if (pr.isDraft === true && isCollectingBatchPr(repo, pr.number)) continue;
         const row = needsPersonRow?.(repo, pr);
         if (!row) continue;
+        // Only the withdrawn-draft notice is expected for a collecting batch; any other person-note still raises.
+        if (row.kind === 'draft-withdrawn' && pr.isDraft === true && isCollectingBatchPr(repo, pr.number)) continue;
         const notReady = report.notReady.findIndex(r => r.repo === repo && r.number === pr.number);
         report.needsPerson.push({ ...row, alsoNotReady: notReady < 0 ? [] : report.notReady.splice(notReady, 1)[0].reasons });
       }
