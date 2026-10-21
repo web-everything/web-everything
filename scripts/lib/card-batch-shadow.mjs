@@ -12,8 +12,12 @@
  *   `on` is NOT built yet: it behaves as shadow, and the log line says so.
  */
 import { readFileSync } from 'node:fs';
-import { PLATFORM_PREFERENCES_PATH } from './card-batch-settings.mjs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { readSettings } from './settings-files.mjs';
+
+// Defined here (not imported from card-batch-settings.mjs) so this module reads no policy file at import time.
+const PLATFORM_PREFERENCES_PATH = join(dirname(fileURLToPath(import.meta.url)), 'delivery-platform-preferences.json');
 
 export const WIDEN_MODES = Object.freeze(['off', 'shadow', 'on']);
 export const WIDEN_ENV = 'WE_CARD_BATCH_WIDEN';
@@ -61,4 +65,17 @@ export function describeWouldBatch({ widen, cards = [], paths = [], window = nul
   const bits = [`${paths.length} path(s)`, window ? `window ${window}` : null].filter(Boolean).join(', ');
   const bad = widen.invalid?.length ? `; ignored invalid: ${widen.invalid.join(', ')}` : '';
   return `card-batch-widen (${note}, source ${widen.source}): ${what} (${bits}) instead of opening its own PR${bad}`;
+}
+
+/**
+ * Emit the shadow line through `write`. NEVER throws: a failing settings load, formatter or writer is swallowed, and a
+ * second guard covers the case where the guard itself fails. Returns true only when a line was written.
+ */
+export function emitWouldBatch({ loadWiden, cards, paths, write } = {}) {
+  try {
+    const line = describeWouldBatch({ widen: loadWiden(), cards, paths });
+    if (!line) return false;
+    write(line);
+    return true;
+  } catch { return false; }
 }

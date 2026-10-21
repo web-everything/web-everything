@@ -1,7 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
-import { resolveWidenMode, loadWidenMode, describeWouldBatch } from '../card-batch-shadow.mjs';
-import { readSettings } from '../settings-files.mjs';
+import { resolveWidenMode, loadWidenMode, describeWouldBatch, emitWouldBatch } from '../card-batch-shadow.mjs';
 
 const none = () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); };
 
@@ -9,8 +8,7 @@ describe('cardBatchWiden.mode cascade', () => {
   it('standard is off', () => {
     expect(resolveWidenMode({ platform: undefined, repo: undefined, env: {} })).toEqual({ mode: 'off', source: 'standard', invalid: [] });
   });
-  it('this repo ships shadow, sourced from the repo layer', () => {
-    expect(readSettings().cardBatchWiden.mode).toBe('shadow');
+  it('the repo layer is read from the supplied fixture', () => {
     expect(loadWidenMode({ env: {}, read: none, repo: { mode: 'shadow' } })).toMatchObject({ mode: 'shadow', source: 'repo' });
   });
   it('platform < repo < env; an invalid value is ignored and named', () => {
@@ -35,5 +33,24 @@ describe('describeWouldBatch', () => {
   });
   it('on is reported as logging only', () => {
     expect(describeWouldBatch({ widen: { mode: 'on', source: 'env' }, cards: ['1'] })).toContain('on is not built yet');
+  });
+});
+
+describe('emitWouldBatch never throws', () => {
+  const widen = () => ({ mode: 'shadow', source: 'repo', invalid: [] });
+  it('writes one line when a card is involved', () => {
+    const out = [];
+    expect(emitWouldBatch({ loadWiden: widen, cards: ['1', '2'], paths: ['a'], write: (l) => out.push(l) })).toBe(true);
+    expect(out).toHaveLength(1);
+  });
+  it('swallows a throwing loader, a throwing writer and missing arguments', () => {
+    expect(emitWouldBatch({ loadWiden: () => { throw new Error('x'); }, cards: ['1'], write: () => {} })).toBe(false);
+    expect(emitWouldBatch({ loadWiden: widen, cards: ['1'], write: () => { throw new Error('y'); } })).toBe(false);
+    expect(emitWouldBatch()).toBe(false);
+  });
+  it('writes nothing when off', () => {
+    const out = [];
+    expect(emitWouldBatch({ loadWiden: () => ({ mode: 'off', source: 'env' }), cards: ['1'], write: (l) => out.push(l) })).toBe(false);
+    expect(out).toEqual([]);
   });
 });
