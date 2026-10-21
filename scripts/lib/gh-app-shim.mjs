@@ -231,6 +231,83 @@ const SHIM_REFRESH_BUFFER_MS = 10 * 60 * 1000;
 const SHIM_CAPTURE_MAX_BUFFER = 1024 * 1024 * 1024;
 
 /**
+ * The value-taking options of gh 2.95, read from every native command's `--help`. The host guard only
+ * reads repository selectors and target positionals as hosts; an option value (`--comment <url>`,
+ * `-n <notes>`) is content. `long` names take a value wherever gh defines them, except the commands in
+ * `longSwitchIn`, where the same name is a switch and the next argument stays a positional. `short` maps
+ * a command to its value shorthands. Selectors (-R/--repo, --hostname, --host) are deliberately absent;
+ * optional-value options (browse -c/--commit) are switches here. An option missing from this table is
+ * scanned conservatively, so a newer gh can only cause a refusal, never a missed host.
+ */
+export const GH_VALUE_OPTIONS = {
+  long: [
+    'add', 'add-assignee', 'add-blocked-by', 'add-blocking', 'add-label', 'add-project', 'add-reviewer',
+    'add-sub-issue', 'add-topic', 'after', 'agent', 'app', 'archive', 'assignee', 'attempt', 'author', 'author-date',
+    'author-email', 'author-name', 'base', 'blocked-by', 'blocking', 'body', 'body-file', 'branch', 'branch-repo',
+    'bundle', 'cache', 'category', 'cert-identity', 'cert-identity-regex', 'cert-oidc-issuer', 'checks', 'closed',
+    'codespace', 'color', 'comment', 'commenter', 'comments', 'commit', 'committer', 'committer-date',
+    'committer-email', 'committer-name', 'created', 'custom-agent', 'custom-trusted-root', 'data-type', 'date',
+    'days', 'debug-file', 'default-branch', 'desc', 'description', 'devcontainer-path', 'digest-alg', 'dir',
+    'discussion-category', 'display-name', 'duplicate-of', 'env', 'env-file', 'event', 'exclude', 'extension',
+    'field', 'field-id', 'filename', 'filter', 'followers', 'force', 'fork-name', 'forks', 'format', 'from-file',
+    'git-protocol', 'gitignore', 'good-first-issues', 'hash', 'head', 'header', 'help-wanted-issues', 'homepage',
+    'id', 'idle-timeout', 'include-forks', 'input', 'interactions', 'interval', 'involves', 'iteration-id', 'job',
+    'jq', 'json', 'key', 'label', 'language', 'license', 'limit', 'location', 'machine', 'match', 'match-head-commit',
+    'mention', 'mentions', 'merged-at', 'method', 'milestone', 'name', 'notes', 'notes-file', 'notes-start-tag',
+    'number', 'number-topics', 'order', 'org', 'output', 'owner', 'page', 'parent', 'pattern', 'pin', 'precompiled',
+    'predicate-type', 'preview', 'profile', 'project', 'project-id', 'query', 'raw-field', 'reactions', 'readme',
+    'reason', 'recover', 'ref', 'remote', 'remote-name', 'remove', 'remove-assignee', 'remove-blocked-by',
+    'remove-blocking', 'remove-label', 'remove-project', 'remove-reviewer', 'remove-scopes', 'remove-sub-issue',
+    'remove-topic', 'repo-owner', 'retention-period', 'review', 'review-requested', 'reviewed-by', 'reviewer',
+    'scope', 'scopes', 'search', 'server-port', 'shell', 'signer-digest', 'signer-repo', 'signer-workflow',
+    'single-select-option-id', 'single-select-options', 'size', 'sort', 'source', 'source-digest', 'source-owner',
+    'source-ref', 'squash-merge-commit-message', 'stars', 'state', 'status', 'subject', 'succeed-on-no-caches', 'tag',
+    'target', 'target-owner', 'team', 'team-mentions', 'template', 'text', 'title', 'topic', 'tree', 'tuf-root',
+    'tuf-url', 'type', 'updated', 'upstream-remote-name', 'url', 'user', 'visibility', 'workflow',
+  ],
+  longSwitchIn: {
+    closed: ['project list'], comment: ['pr review'], comments: ['discussion view', 'issue view', 'pr view'],
+    commit: ['browse'], force: ['codespace delete', 'extension install', 'extension upgrade', 'label clone',
+      'label create', 'pr checkout', 'repo sync', 'run cancel', 'skill install', 'skill update'],
+    json: ['workflow run'], remote: ['repo fork'], remove: ['copilot'], shell: ['alias set'], source: ['repo list'],
+    status: ['codespace create'], template: ['repo edit'], user: ['secret delete', 'secret list', 'secret set'],
+  },
+  short: {
+    'agent-task create': 'baF', 'agent-task list': 'qLt', 'agent-task view': 'qt', 'api': 'FHqXpft',
+    'attestation download': 'dLo', 'attestation verify': 'bidqLot', 'auth login': 'phs', 'auth logout': 'hu',
+    'auth refresh': 'hrs', 'auth setup-git': 'fh', 'auth status': 'h', 'auth switch': 'hu', 'auth token': 'hu',
+    'browse': 'b', 'cache delete': 'r', 'cache list': 'qkLOrSt', 'codespace code': 'c',
+    'codespace cp': 'cp', 'codespace create': 'bdlm', 'codespace delete': 'cou', 'codespace edit': 'cdm',
+    'codespace jupyter': 'c', 'codespace list': 'qLotu', 'codespace logs': 'c', 'codespace ports': 'cqt',
+    'codespace rebuild': 'c', 'codespace ssh': 'c', 'codespace stop': 'cou', 'codespace view': 'cqt',
+    'completion': 's', 'config get': 'h', 'config list': 'h', 'config set': 'h', 'discussion comment': 'bF',
+    'discussion create': 'bFclt', 'discussion edit': 'bFct', 'discussion list': 'AcqlLSst', 'discussion view': 'qLt',
+    'extension search': 'qLt', 'gist create': 'df', 'gist edit': 'adfr', 'gist list': 'L', 'gist view': 'f',
+    'gpg-key add': 't', 'issue close': 'cr', 'issue comment': 'bF', 'issue create': 'abFlmpTt', 'issue develop': 'bn',
+    'issue edit': 'bFmt', 'issue list': 'aAqlLmSst', 'issue lock': 'r', 'issue reopen': 'c', 'issue status': 'qt',
+    'issue view': 'qt', 'label create': 'cd', 'label edit': 'cdn', 'label list': 'qLSt', 'org list': 'L',
+    'pr checkout': 'b', 'pr checks': 'iqt', 'pr close': 'c', 'pr comment': 'bF', 'pr create': 'aBbFHlmprTt',
+    'pr diff': 'e', 'pr edit': 'BbFmt', 'pr list': 'aABHqlLSst', 'pr lock': 'r', 'pr merge': 'AbFt', 'pr reopen': 'c',
+    'pr revert': 'bFt', 'pr review': 'bF', 'pr status': 'qt', 'pr view': 'qt', 'project close': 'qt',
+    'project copy': 'qt', 'project create': 'qt', 'project delete': 'qt', 'project edit': 'dqt',
+    'project field-create': 'qt', 'project field-delete': 'qt', 'project field-list': 'qLt', 'project item-add': 'qt',
+    'project item-archive': 'qt', 'project item-create': 'qt', 'project item-delete': 'qt', 'project item-edit': 'qt',
+    'project item-list': 'qLt', 'project link': 'T', 'project list': 'qLt', 'project mark-template': 'qt',
+    'project unlink': 'T', 'project view': 'qt', 'release create': 'nFt', 'release download': 'ADOp',
+    'release edit': 'nFt', 'release list': 'qLOt', 'release verify': 'qt', 'release verify-asset': 'qt',
+    'release view': 'qt', 'repo autolink list': 'qt', 'repo autolink view': 'qt', 'repo clone': 'u',
+    'repo create': 'dghlrstp', 'repo deploy-key add': 't', 'repo deploy-key list': 'qt', 'repo edit': 'dh',
+    'repo list': 'qlLt', 'repo read-dir': 'qt', 'repo read-file': 'qot', 'repo sync': 'bs', 'repo view': 'bqt',
+    'ruleset list': 'Lo', 'ruleset view': 'o', 'run download': 'Dnp', 'run list': 'bceqLstuw', 'run rerun': 'j',
+    'run view': 'ajqt', 'run watch': 'i', 'search code': 'qLt', 'search commits': 'qLt', 'search issues': 'qLt',
+    'search prs': 'BHqLt', 'search repos': 'qLt', 'secret delete': 'aeo', 'secret list': 'aeqot',
+    'secret set': 'abeforv', 'skill list': 'qt', 'skill search': 'qLt', 'ssh-key add': 't', 'status': 'eo',
+    'variable delete': 'eo', 'variable get': 'eqot', 'variable list': 'eqot', 'variable set': 'beforv',
+    'workflow list': 'qLt', 'workflow run': 'Ffr', 'workflow view': 'r',
+  },
+};
+
+/**
  * PURE: the pattern the shim script tests a FAILED App-token `gh` call's stderr against to tell "this token
  * itself was rejected" apart from every other reason `gh` can fail (a bad flag, a genuinely missing PR, a
  * network hiccup) — never retry-and-mask those, only a credential GitHub itself refused. Exported so the
@@ -357,6 +434,7 @@ ${installationCachePath.toString()}
 // Per-role Apps: {role: {cachePath, installations}} for each CONFIGURED role; empty = today's App only.
 const ROLE_IDENTITIES = ${JSON.stringify(roleTable ?? {})};
 const CALLER_ROLES = ${JSON.stringify(callerRoles ?? {})};
+const GH_VALUE_OPTIONS = ${JSON.stringify(GH_VALUE_OPTIONS)};
 ${roleForCaller.toString()}
 const REFRESH_BUFFER_MS = ${JSON.stringify(SHIM_REFRESH_BUFFER_MS)};
 const GH_THROTTLE_CLI = ${JSON.stringify(ghThrottleCliPath)};
@@ -689,7 +767,7 @@ function unsupportedTargetHost(argv, env) {
   if (env.GH_REPO) { const host = repoHost(env.GH_REPO); if (host) return host; }
   // Only target-bearing positions are URLs. A comment body/title/header may contain any URL.
   const targetCommand = argv[0] !== 'search'; // native search positionals are query text
-  const valueFlags = new Set(['--body', '--body-file', '--title', '--template', '--json', '--jq',
+  const valueFlags = new Set(['--body', '--body-file', '--title', '--jq',
     '--field', '--raw-field', '--header', '--method', '--cache', '--input', '--search', '--label',
     '--assignee', '--reviewer', '--milestone', '--project', '--base', '--head', '--author', '--owner', '--limit', '--state']);
   // Short names change arity between commands: checkout -q/-f and merge -m/-s/-a are booleans.
@@ -698,6 +776,12 @@ function unsupportedTargetHost(argv, env) {
   const subcommand = ({ new: 'create', ls: 'list', co: 'checkout', uninstall: 'remove' })[argv[1]]
     || (['secret', 'variable'].includes(argv[0]) && argv[1] === 'remove' ? 'delete' : argv[1]);
   const command = (argv[0] === 'cs' ? 'codespace' : argv[0]) + ' ' + subcommand;
+  // Option values are content, never targets (--comment <url>, --notes, --description). A name that is
+  // a switch in this command keeps its next argument a positional (repo edit --template <repo>).
+  const commandKeys = [command + ' ' + argv[2], command, argv[0]];
+  for (const name of GH_VALUE_OPTIONS.long) {
+    if (!(GH_VALUE_OPTIONS.longSwitchIn[name] || []).some((c) => commandKeys.includes(c))) valueFlags.add('--' + name);
+  }
   if (argv[0] === 'api') for (const flag of ['-F', '-f', '-H', '-X', '-q', '-t']) valueFlags.add(flag);
   if (['pr create', 'pr edit', 'pr merge', 'issue create', 'issue edit'].includes(command)) {
     for (const flag of ['-b', '-F', '-t']) valueFlags.add(flag);
@@ -757,21 +841,11 @@ function unsupportedTargetHost(argv, env) {
     'search code': 'w', 'search commits': 'w', 'search issues': 'w', 'search prs': 'w', 'search repos': 'w',
     'auth status': 'at',
   }[command] || (argv[0] === 'browse' ? 'anprsw' : '');
-  // Value shorthands from gh 2.95 help: inside a bundle they take the rest as content
+  // Value shorthands (GH_VALUE_OPTIONS.short): inside a bundle they take the rest as content
   // (-BRelease/a/b is a base branch). Any shorthand in neither table is uncertain.
   // Optional-value shorthands (browse -c, \`--commit[=last]\`) never take the rest or the
-  // next argument, so they stay out of this table and are scanned as uncertain.
-  const valueShorthands = {
-    'pr list': 'aABHlLSs', 'issue list': 'aAlLmSs', 'pr create': 'aBbFHlmprTt', 'issue create': 'abFlmpTt',
-    'pr checks': 'i', 'pr checkout': 'b', 'pr merge': 'AbFt', 'pr close': 'c', 'pr diff': 'e', 'pr review': 'bF',
-    'pr revert': 'bFt', 'pr edit': 'BbFmt', 'issue edit': 'bFmt', 'issue close': 'cr', 'issue reopen': 'c',
-    'pr reopen': 'c', 'issue develop': 'bn', 'repo create': 'dghlrst', 'repo sync': 'b', 'repo edit': 'dh',
-    'release create': 'nFt', 'release list': 'LO', 'release download': 'ADOp', 'release edit': 'nFt',
-    'run list': 'bceLsuw', 'run view': 'aj', 'run rerun': 'j', 'run download': 'Dnp', 'workflow list': 'L',
-    'workflow view': 'r', 'workflow run': 'r', 'cache delete': 'r', 'cache list': 'kLOrS', 'label create': 'cd',
-    'label list': 'LS', 'label edit': 'cdn', 'ruleset list': 'Lo', 'ruleset view': 'o', 'secret set': 'abefov',
-    'secret list': 'aeo', 'variable set': 'befov', 'codespace create': 'bdlm', 'codespace cp': 'cp',
-  }[command] || (argv[0] === 'browse' ? 'b' : '');
+  // next argument, so they are absent from that table and scanned as uncertain.
+  const valueShorthands = commandKeys.map((key) => GH_VALUE_OPTIONS.short[key]).find((v) => v !== undefined) || '';
   // After \`--\` gh reads -x/o/r as a repository argument, unless pflag took the \`--\` as the value of an
   // option (\`pr list --app -- -R x/o/r\` still parses -R). Check both readings: every later argument is
   // a positional here, and the option scan below still runs over all of them.

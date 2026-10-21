@@ -26,7 +26,18 @@ import {
   defaultShimDir, shimGhPath, resolveRealGhBinary, renderGhShimScript, ensureGhShim, ghShimPathOverride,
   buildGhShimSettingsEnv, looksLikeAppTokenAuthFailure, ensureSettingsFileEnv, ensureSettingsFilePermissions, sanitizeSpawnEnv,
   defaultGhThrottleCliPath, checkoutShimDir, shimCallerScriptFromCommand, isDaemonCaller, defaultGithubAppRefreshCliPath,
+  GH_VALUE_OPTIONS,
 } from '../gh-app-shim.mjs';
+
+// PR #5729: a selector listed as a value option would be skipped as content, so a host it names would never be read.
+describe('GH_VALUE_OPTIONS never lists a host or repository selector', () => {
+  it('has no selector long names, no -R shorthand and no optional-value browse -c', () => {
+    for (const name of ['repo', 'repos', 'hostname', 'host']) expect(GH_VALUE_OPTIONS.long).not.toContain(name);
+    for (const letters of Object.values(GH_VALUE_OPTIONS.short)) expect(letters).not.toContain('R');
+    expect(GH_VALUE_OPTIONS.short.browse).not.toContain('c');
+    expect(GH_VALUE_OPTIONS.longSwitchIn.commit).toContain('browse');
+  });
+});
 
 const CONFIGURED_ENV = {
   WE_GITHUB_APP_ID: '5037855',
@@ -1406,6 +1417,14 @@ require(${JSON.stringify(shim)});
     ['browse', '-nc', '-R', 'github.corp.example/owner/repo'],
     ['browse', '-cRgithub.corp.example/owner/repo'],
     ['browse', '-wcR', 'github.corp.example/owner/repo'],
+    // PR #5729 operator ruling: selectors are still read after any option value or bundle.
+    ['pr', 'checkout', '-qR', 'other.host/owner/repo', '1'],
+    ['pr', 'close', '123', '--comment', 'https://docs.example.com', '-R', 'other.host/owner/repo'],
+    // A name that takes a value elsewhere is a switch here, so the next argument is still the target.
+    ['pr', 'view', '--comments', 'https://github.corp.example/o/r/pull/1'],
+    ['pr', 'review', '--comment', 'https://github.corp.example/o/r/pull/1'],
+    ['pr', 'checkout', '--force', 'https://github.corp.example/o/r/pull/1'],
+    ['repo', 'edit', '--template', 'enterprise/owner/repo'],
   ])('refuses enterprise hosts before using a fresh public App cache: %j', (...argv) => {
     const f = fixture({ fresh: true });
     try {
@@ -1498,6 +1517,20 @@ require(${JSON.stringify(shim)});
     ['pr', 'checkout', '-fb', 'Release/October/2026', '1'],
     ['run', 'list', '-LRelease/October/2026'],
     ['label', 'edit', 'bug', '-nRelease/October/2026'],
+    // PR #5729 red team: free-text option values are content, long or short, attached or not.
+    ['pr', 'close', '123', '--comment', 'https://docs.example.com'],
+    ['pr', 'close', '123', '-c', 'https://docs.example.com'],
+    ['pr', 'reopen', '123', '--comment', 'https://docs.example.com'],
+    ['issue', 'close', '123', '--comment', 'https://docs.example.com'],
+    ['release', 'create', 'v1', '--notes', 'https://docs.example.com'],
+    ['release', 'create', 'v1', '-n', 'https://docs.example.com'],
+    ['label', 'create', 'bug', '--description', 'https://docs.example.com'],
+    ['label', 'create', 'bug', '-d', 'https://docs.example.com'],
+    ['pr', 'create', '--body', 'https://github.corp.example/owner/repo'],
+    ['pr', 'create', '--title', 'https://github.corp.example/owner/repo', '--body', 'x'],
+    ['pr', 'merge', '123', '--subject', 'https://docs.example.com'],
+    ['issue', 'edit', '123', '--milestone', 'https://docs.example.com'],
+    ['pr', 'create', '--template', 'https://docs.example.com'],
   ])('keeps URLs and host-like option values in content for public calls: %j', (...argv) => {
     const f = fixture({ fresh: true });
     try {
