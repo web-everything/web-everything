@@ -35,7 +35,7 @@ import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { pidAlive as defaultPidAlive } from '../lib/pid-alive.mjs';
 import { dispatchScratchRoot } from '../operations/dispatch-lane-io.mjs';
-import { FIXING_KIND, isLiveFixClaim, repoKeyOf } from './fix-procedure.mjs';
+import { FIXING_KIND, repoKeyOf } from './fix-procedure.mjs';
 import { fixDispatchClaimRoot, fixDispatchResource } from './fix-claim-store.mjs';
 import { lockDirFor, readLockEntry } from '../readiness/file-locks.mjs';
 import { stopSessionWithRetry } from './session-reaper.mjs';
@@ -83,19 +83,22 @@ export function resolveFinishedSessionReapSettings({ env = process.env, file = n
 }
 
 /**
- * IO, STRICT: the PR's live fix claim, `null` ONLY when confirmed absent or expired. `readLiveFixClaim` maps an
- * unreadable or corrupt `lock.json` to `null` (absent), which would fail OPEN here; this throws instead, so the
- * caller holds. Absent = `lock.json` reports ENOENT; any other read error, or a file that does not parse, throws.
+ * IO, STRICT: is there ANY fix-claim lock on this PR? Returns `null` ONLY when `lock.json` is confirmed absent
+ * (ENOENT). A released claim's lock dir is removed (`fix-procedure.mjs#releaseFixClaim` → `releaseLockDir`), so a
+ * finished session has none. Any lock that exists — live, expired, unparseable, odd timestamps, unreadable
+ * heartbeat — is returned (or throws) and the caller HOLDS: lease interpretation is never trusted to prove
+ * absence here (`readLiveFixClaim` maps corrupt/unreadable/expired-looking entries to `null`, which fails open).
  */
-export function readLiveFixClaimStrict({ repo, pr, nowMs = Date.now(), lockRoot = fixDispatchClaimRoot(), readFile = readFileSync, readEntry = readLockEntry }) {
+export function readLiveFixClaimStrict({ repo, pr, lockRoot = fixDispatchClaimRoot(), readFile = readFileSync, readEntry = readLockEntry }) {
   const resource = fixDispatchResource({ repo: repoKeyOf(repo), pr: Number(pr), kind: FIXING_KIND });
   try { readFile(join(lockDirFor(lockRoot, resource), 'lock.json'), 'utf8'); } catch (e) {
     if (e?.code === 'ENOENT') return null;
     throw new Error(`claim lock unreadable: ${e?.code ?? String(e?.message ?? e).split('\n')[0]}`);
   }
-  const entry = readEntry(lockRoot, resource);
+  let entry = null;
+  try { entry = readEntry(lockRoot, resource); } catch { entry = null; }
   if (!entry) throw new Error('claim lock present but unparseable');
-  return isLiveFixClaim(entry, nowMs) ? entry : null;
+  return entry; // present at all = held for this purpose, expired or not
 }
 
 /** Is `cwd` a direct-or-deeper child of `root` (never `root` itself)? */
@@ -121,7 +124,7 @@ export function planFinishedSessionReap({ note, nowMs, afterMs, dispatchRoot, li
   if (!Number.isInteger(note.pid)) return hold('no pid');
   if (!isUnderRoot(note.cwd, dispatchRoot)) return hold(`cwd ${note.cwd ?? '?'} is not a dispatch dir under ${dispatchRoot}`);
   if (claimReadError) return hold(`fix-claim store unreadable (${claimReadError}) — held`);
-  if (liveClaim) return hold(`a live fix claim is held on this PR (${liveClaim.meta?.who ?? liveClaim.meta?.sessionId ?? 'unknown holder'})`);
+  if (liveClaim) return hold(`a fix claim lock exists on this PR (${liveClaim.meta?.who ?? liveClaim.meta?.sessionId ?? 'unknown holder'})`);
   if (pidAlive !== true) return hold(pidAlive === false ? 'pid already exited' : 'pid could not be probed');
   const ageMs = nowMs - note.releasedAtMs;
   if (!(ageMs >= afterMs)) return hold(`alive ${Math.max(0, Math.round(ageMs / MINUTE))}m after fix-end (< ${Math.round(afterMs / MINUTE)}m)`);
@@ -136,7 +139,7 @@ export function runFinishedSessionReap({
   notes = [], nowMs = Date.now(), dryRun = false, env = process.env,
   settings = resolveFinishedSessionReapSettings({ env }),
   dispatchRoot = null,
-  readClaim = ({ repo, pr }) => readLiveFixClaimStrict({ repo, pr, nowMs }),
+  readClaim = ({ repo, pr }) => readLiveFixClaimStrict({ repo, pr }),
   probePid = (pid) => { try { return defaultPidAlive(pid); } catch { return null; } },
   stop = stopSessionWithRetry,
 } = {}) {

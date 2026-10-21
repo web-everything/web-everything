@@ -30,7 +30,7 @@ describe('planFinishedSessionReap', () => {
     expect(plan()).toMatchObject({ decision: 'reap' });
   });
   it.each([
-    ['a live fix claim on the PR', {}, { liveClaim: { meta: { who: 'fix-5758' } } }, /live fix claim/],
+    ['a live fix claim on the PR', {}, { liveClaim: { meta: { who: 'fix-5758' } } }, /fix claim lock exists/],
     ['the claim store unreadable', {}, { claimReadError: 'EACCES' }, /unreadable/],
     ['no fix-end time', { releasedAtMs: undefined }, {}, /no fix-end/],
     ['no handle', { handle: null }, {}, /no session handle/],
@@ -118,9 +118,21 @@ describe('readLiveFixClaimStrict — fails closed, unlike readLiveFixClaim (Code
     expect(() => readLiveFixClaimStrict({ repo: 'we', pr: 5758, lockRoot })).toThrow(/unparseable/);
     const stop = vi.fn();
     const out = runFinishedSessionReap({ notes: [note()], nowMs: NOW, settings, dispatchRoot: ROOT, probePid: () => true, stop,
-      readClaim: ({ repo, pr }) => readLiveFixClaimStrict({ repo, pr, lockRoot, nowMs: NOW }) });
+      readClaim: ({ repo, pr }) => readLiveFixClaimStrict({ repo, pr, lockRoot }) });
     expect(stop).not.toHaveBeenCalled();
     expect(out.rows[0]).toMatchObject({ decision: 'hold', reason: expect.stringMatching(/unreadable/) });
+  });
+  it('an EXPIRED or odd-timestamp lock still counts as present → held (Codex audit round 2)', () => {
+    const { lockRoot, dir } = setup();
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'lock.json'), JSON.stringify({ owner: 'fix-5758', acquiredAt: '2020-01-01T00:00:00Z', heartbeatAt: 'not-a-date', meta: { kind: 'fixing', repo: 'we', pr: 5758 } }));
+    let got; let threw = false;
+    try { got = readLiveFixClaimStrict({ repo: 'we', pr: 5758, lockRoot }); } catch { threw = true; }
+    expect(threw || got != null).toBe(true);
+    const stop = vi.fn();
+    runFinishedSessionReap({ notes: [note()], nowMs: NOW, settings, dispatchRoot: ROOT, probePid: () => true, stop,
+      readClaim: ({ repo, pr }) => readLiveFixClaimStrict({ repo, pr, lockRoot }) });
+    expect(stop).not.toHaveBeenCalled();
   });
   it('a read error other than ENOENT → throws', () => {
     const { lockRoot } = setup();
