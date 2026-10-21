@@ -10,7 +10,7 @@ import { MAX_TOTAL_ROUND_EXTENSIONS } from '../round-extension-mark.mjs';
 
 const REPO = 'web-everything/web-everything';
 const HEAD = 'ABCDEF0123456789ABCDEF0123456789ABCDEF01';
-const ACTOR = { 'system:ledger-write-miss': 'system', 'system:stale-hold': 'system', 'red-team-sent-back-cleared': 'nobody',
+const ACTOR = { 'system:fix-stood-down': 'system', 'system:ledger-write-miss': 'system', 'system:stale-hold': 'system', 'red-team-sent-back-cleared': 'nobody',
   'awaiting-review': 'reviewer', 'human-review-pending-advisory': 'reviewer', 'red-team-pending': 'red-team', 'drain-skip:red-team-pending': 'red-team',
   fixing: 'fixer', 'sent-back-red-team': 'fixer', draft: 'fixer', 'ci-failed': 'fixer', 'awaiting-ci': 'ci', 'ready-to-merge': 'drain',
   'in-merge-queue': 'drain', 'drain-skip:queue-file-overlap': 'drain', 'drain-skip:overlap-yield': 'drain', 'drain-skip:ready-not-reached': 'drain' };
@@ -38,6 +38,7 @@ const at = (state, o = {}) => classifyStall({ head: HEAD, files: ['scripts/foo.m
 // Non-judged states: the verdict never changes the answer.
 const FIXED = {
   'system:ledger-write-miss': ['system', 'await-ledger-outbox'],
+  'system:fix-stood-down': ['system', 'tooling-card'],
   'system:stale-hold': ['operator', 'stale-hold'],
   'red-team-sent-back-cleared': ['system', 'rerun-red-team-gate'],
   'awaiting-review': ['system', 'ask-review-daemon'],
@@ -341,5 +342,123 @@ describe('every policy is a setting, and settings only make it stricter', () => 
     [{ stateLanes: Object.defineProperty({}, 'fixing', { get: () => 'operator', enumerable: true }) }],
 [null], [JSON.parse('{"__proto__":null}')], [JSON.parse('{"stateLanes":{"__proto__":"operator"}}')]])('an unreadable setting %# fails closed', (settings) => {
     expect(at('fixing', { settings })).toMatchObject({ lane: 'operator', action: 'unclassified' });
+  });
+});
+
+describe('stand-down detection (live #5768 shape)', async () => {
+  const { assessPrSweep } = await import('../../operations/pr-sweep-core.mjs');
+  const { buildStandDownComment } = await import('../stand-down.mjs');
+  const { AUTOMATION_LOGINS } = await import('../../lib/marker-authorship.mjs');
+  const bot = AUTOMATION_LOGINS[0];
+  const head = 'c'.repeat(40);
+  const standDown = { author: { login: bot }, createdAt: '2026-10-21T18:01:00Z', body: buildStandDownComment({ reason: 'gate-red', detail: 'verify red' }) };
+  const pr = (o = {}) => ({ repo: REPO, number: 5768, title: 'x', headRefOid: head, headCommittedAt: '2026-10-21T17:30:00Z', updatedAt: '2026-10-21T21:30:00Z',
+    isDraft: false, labels: [{ name: 'review:changes' }], labelEvents: [], statusCheckRollup: [], comments: [standDown], ...o });
+  const sweep = (p, o = {}) => assessPrSweep({ now: Date.parse('2026-10-21T22:05:00Z'), prs: [p], liveJobs: [], drainSkips: [], standDownLapse: 'on', ...o }).prs[0];
+  it('a fixer that stood down on the live head is system:fix-stood-down, stalled, never "fixing"', () => {
+    const row = sweep(pr());
+    expect(row).toMatchObject({ waitingOn: 'system:fix-stood-down', actor: 'system', stalled: true });
+    expect(row.why).toMatch(/reason=gate-red/);
+    const c = classifyStall({ row, head, files: ['a.mjs'] });
+    expect(c).toMatchObject({ lane: 'system', action: 'tooling-card', smell: 'stood-down-prs' });
+    expect(c.reason).toMatch(/gate-red/);
+  });
+  it('the settings route it to the operator digest instead', () => {
+    const c = classifyStall({ row: sweep(pr()), head, settings: { stateLanes: { 'system:fix-stood-down': 'operator' } } });
+    expect(c).toMatchObject({ lane: 'operator', action: 'tooling-card' }); expect(typeof c.command).toBe('string');
+  });
+  it('a stand-down right now is stalled at once (terminal), not after the threshold', () => {
+    expect(sweep(pr(), { now: Date.parse('2026-10-21T18:02:00Z') }).stalled).toBe(true);
+  });
+  it('a later fix claim, a live job, or a push (with the lapse setting on) means it is moving again', () => {
+    const claim = { author: { login: bot }, createdAt: '2026-10-21T19:00:00Z', body: 'conveyor fix-begin — fix claim held by x' };
+    expect(sweep(pr({ comments: [standDown, claim] }), { now: Date.parse('2026-10-21T19:10:00Z') }).waitingOn).toBe('fixing');
+    expect(sweep(pr(), { liveJobs: [{ kind: 'fix-run', pr: 5768, repo: REPO, startedAt: Date.parse('2026-10-21T19:00:00Z') }] }).waitingOn).toBe('fixing');
+    expect(sweep(pr({ headCommittedAt: '2026-10-21T20:00:00Z' })).waitingOn).toBe('fixing');
+  });
+  it('a fix claim from BEFORE the stand-down is not liveness', () => {
+    const early = { author: { login: bot }, createdAt: '2026-10-21T17:55:00Z', body: 'conveyor fix-begin — fix claim held by x' };
+    expect(sweep(pr({ comments: [early, standDown] }), { now: Date.parse('2026-10-21T19:30:00Z') })).toMatchObject({ waitingOn: 'system:fix-stood-down', stalled: true, liveJob: null });
+  });
+  it('labels do not hide it: a stood-down PR still reading review:pending is stood down', () => {
+    expect(sweep(pr({ labels: [{ name: 'review:pending' }] })).waitingOn).toBe('system:fix-stood-down');
+  });
+  it('the reason is the end-anchored trailer, not a quoted one in the detail', () => {
+    const body = buildStandDownComment({ reason: 'gate-red', detail: 'quoting <!-- stand-down reason=conflict --> here' });
+    expect(sweep(pr({ comments: [{ ...standDown, body }] })).why).toMatch(/reason=gate-red/);
+  });
+  it('it outranks a cleared red-team send-back (a gate re-run cannot revive a stood-down fixer)', () => {
+    const gate = { author: { login: bot }, createdAt: '2026-10-21T17:40:00Z', body: `<!-- we:red-team-gate pr=5768 rev=${head} outcome=sent-back -->` };
+    expect(sweep(pr({ labels: [{ name: 'ready-to-merge' }], comments: [gate, standDown] })).waitingOn).toBe('system:fix-stood-down');
+  });
+  it('a stand-down the daemon annotated as lapsed is not terminal', () => {
+    expect(sweep(pr({ comments: [{ ...standDown, standDownLapsed: { fromHead: null, toHead: head } }] })).waitingOn).toBe('fixing');
+  });
+  it('an orphaned fix claim older than the threshold is not liveness', () => {
+    const claim = { author: { login: bot }, createdAt: '2026-10-21T20:00:00Z', body: 'conveyor fix-begin — fix claim held by x' };
+    const row = sweep(pr({ comments: [claim], labelEvents: [{ label: 'review:changes', at: '2026-10-21T19:00:00Z' }] }), { now: Date.parse('2026-10-21T21:35:00Z') });
+    expect(row).toMatchObject({ waitingOn: 'fixing', stalled: true, liveJob: null });
+  });
+  it('a reviewer job, or a fixer process from before the marker, does not revive it', () => {
+    expect(sweep(pr(), { liveJobs: [{ kind: 'review-job', pr: 5768, repo: REPO, startedAt: Date.parse('2026-10-21T19:00:00Z') }] }).waitingOn).toBe('system:fix-stood-down');
+    expect(sweep(pr(), { liveJobs: [{ kind: 'fix-run', pr: 5768, repo: REPO, startedAt: Date.parse('2026-10-21T17:00:00Z') }] }).waitingOn).toBe('system:fix-stood-down');
+  });
+  it('a reviewer process is not liveness for a fixer or CI-heal wait', () => {
+    const row = sweep(pr({ comments: [], labelEvents: [{ label: 'review:changes', at: '2026-10-21T18:00:00Z' }] }), { liveJobs: [{ kind: 'review-job', pr: 5768, repo: REPO }] });
+    expect(row).toMatchObject({ waitingOn: 'fixing', stalled: true, liveJob: null });
+  });
+  it('the owed human review keeps its operator priority over a stand-down', () => {
+    expect(sweep(pr({ labels: [{ name: 'review:human' }, { name: 'advisory:accepted' }] })).waitingOn).toBe('human-review');
+  });
+  it('a repair state outranks the human-review exemption', () => {
+    expect(sweep(pr({ labels: [{ name: 'review:human' }, { name: 'advisory:accepted' }, { name: 'review:changes' }] })).waitingOn).toBe('system:fix-stood-down');
+  });
+  it('the human-review exemption does not hide a stand-down behind a CI-failure wait', () => {
+    const p = pr({ labels: [{ name: 'review:human' }, { name: 'advisory:accepted' }, { name: 'ci:failed' }] });
+    expect(sweep(p).waitingOn).toBe('system:fix-stood-down');
+  });
+  it('an undated trusted stand-down still counts', () => {
+    expect(sweep(pr({ comments: [{ ...standDown, createdAt: undefined }] }), { liveJobs: [{ kind: 'fix-run', pr: 5768, repo: REPO, startedAt: 1 }] })).toMatchObject({ waitingOn: 'system:fix-stood-down', stalled: true });
+  });
+  it.each([['> conveyor fix-begin — fix claim held by x'], ['>🔒 conveyor fix-begin — fix claim held']])('a markdown quote %j is not a claim', (body) => {
+    expect(sweep(pr({ comments: [standDown, { author: { login: bot }, createdAt: '2026-10-21T19:00:00Z', body }] })).waitingOn).toBe('system:fix-stood-down');
+  });
+  it('a later comment that only QUOTES a claim is not renewed work', () => {
+    const quote = { author: { login: bot }, createdAt: '2026-10-21T19:00:00Z', body: '> 🔒 conveyor fix-begin — fix claim held by x\nthat was earlier' };
+    expect(sweep(pr({ comments: [standDown, quote] })).waitingOn).toBe('system:fix-stood-down');
+  });
+  it('a newer push advances a draft wait dated by an old claim', () => {
+    const claim = { author: { login: bot }, createdAt: '2026-10-21T17:00:00Z', body: '🔒 conveyor fix-begin — fix claim held by x' };
+    expect(sweep(pr({ isDraft: true, labels: [], comments: [claim], headCommittedAt: '2026-10-21T22:04:00Z' })).stalled).toBe(false);
+  });
+  it('an expired draft claim still dates the wait', () => {
+    const claim = { author: { login: bot }, createdAt: '2026-10-21T17:00:00Z', body: 'conveyor fix-begin — fix claim held by x' };
+    const outsider = { author: { login: 'x' }, createdAt: '2026-10-21T22:04:00Z', body: 'hi' };
+    expect(sweep(pr({ isDraft: true, labels: [], updatedAt: '2026-10-21T22:04:00Z', comments: [claim, outsider] }))).toMatchObject({ waitingOn: 'draft', stalled: true });
+  });
+  it('a CI failure is aged from the failed check, not from a fresh comment', () => {
+    const p = pr({ comments: [{ author: { login: 'x' }, createdAt: '2026-10-21T22:04:00Z', body: 'hi' }], labels: [], updatedAt: '2026-10-21T22:04:00Z',
+      statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-21T18:00:00Z' }] });
+    expect(sweep(p)).toMatchObject({ waitingOn: 'ci-failed', stalled: true });
+  });
+  it('the human-review exemption does not hide a stand-down behind a cleared send-back', () => {
+    const gate = { author: { login: bot }, createdAt: '2026-10-21T17:40:00Z', body: `<!-- we:red-team-gate pr=5768 rev=${head} outcome=sent-back -->` };
+    expect(sweep(pr({ labels: [{ name: 'review:human' }, { name: 'advisory:accepted' }], comments: [gate, standDown] })).waitingOn).toBe('system:fix-stood-down');
+  });
+  it('an expired claim does not outweigh a fresh push on a fixer wait', () => {
+    const claim = { author: { login: bot }, createdAt: '2026-10-21T17:00:00Z', body: '🔒 conveyor fix-begin — fix claim held by x' };
+    expect(sweep(pr({ comments: [claim], headCommittedAt: '2026-10-21T22:04:00Z' })).stalled).toBe(false);
+  });
+  it('a legacy failed status context is aged from its createdAt', () => {
+    const p = pr({ comments: [], labels: [], updatedAt: '2026-10-21T22:04:00Z', statusCheckRollup: [{ context: 'ci/legacy', state: 'FAILURE', createdAt: '2026-10-21T17:00:00Z' }] });
+    expect(sweep(p)).toMatchObject({ waitingOn: 'ci-failed', stalled: true });
+  });
+  it('an untrusted author cannot fake a stand-down', () => {
+    expect(sweep(pr({ comments: [{ ...standDown, author: { login: 'someone-else' } }] })).waitingOn).toBe('fixing');
+  });
+  it('a fixer wait with no live job past the threshold is stalled to the system, not moving', () => {
+    const row = sweep(pr({ comments: [], labelEvents: [{ label: 'review:changes', at: '2026-10-21T18:00:00Z' }] }));
+    expect(row).toMatchObject({ waitingOn: 'fixing', stalled: true });
+    expect(classifyStall({ row, head }).lane).toBe('system');
   });
 });

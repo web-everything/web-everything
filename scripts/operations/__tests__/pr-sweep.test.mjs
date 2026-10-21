@@ -321,10 +321,13 @@ describe('fix claim comment expiration', () => {
     const pr = mkPr({ labels: L('review:pending'), updatedAt: new Date(started).toISOString(), comments: [claim] });
     for (const offset of [-1, 0, 1]) {
       const now = NOW + offset;
-      const r = assessPrSweep({ now, prs: [pr] }).prs[0];
-      expect(r.stalled).toBe(offset > 0);
+      // With a threshold longer than the claim lease, the lease alone decides liveness.
+      const r = assessPrSweep({ now, prs: [pr], stalledAfterMinutes: 24 * 60 }).prs[0];
       expect(r.liveJob).toBe(offset > 0 ? null : 'fix');
       expect(humanReviewHold(pr, now)).toEqual(offset > 0 ? [] : ['a fix claim is open']);
+      // Past the stall threshold a claim COMMENT with no process is not a fixer at work (live #5768): STALLED.
+      const d = assessPrSweep({ now, prs: [pr] }).prs[0];
+      expect([d.stalled, d.liveJob]).toEqual([true, null]);
     }
   });
 });
