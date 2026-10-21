@@ -145,17 +145,21 @@ export function loadPreventionBatchSettings({
  * the keys above (standard 15 → platform → repo → env `WE_CARDS_BATCH_VERIFY_RETRY_MINUTES`); invalid layers are skipped.
  */
 export const DEFAULT_VERIFY_RETRY_MINUTES = 15;
-export function resolveVerifyRetryMinutes({ platform, repo, env } = {}) {
+export function resolveVerifyRetryMinutes({ platform, repo, env, now = Date.now() } = {}) {
   let minutes = DEFAULT_VERIFY_RETRY_MINUTES;
   const raw = env?.WE_CARDS_BATCH_VERIFY_RETRY_MINUTES;
   for (const layer of [platform, repo, raw === undefined || raw === '' ? undefined : { batchVerifyRetryMinutes: /^\d+$/.test(String(raw)) ? Number(raw) : raw }]) {
-    if (isObject(layer) && validValue('batchVerifyRetryMinutes', layer.batchVerifyRetryMinutes)) minutes = layer.batchVerifyRetryMinutes;
+    if (!isObject(layer)) continue;
+    const candidate = layer.batchVerifyRetryMinutes;
+    // A safe integer in minutes can still overflow Date's range after conversion and addition.
+    if (validValue('batchVerifyRetryMinutes', candidate)
+      && Number.isFinite(new Date(now + candidate * 60_000).getTime())) minutes = candidate;
   }
   return minutes;
 }
-export function loadVerifyRetryMinutes({ env = process.env, read = readFileSync, platformPath = PLATFORM_PREFERENCES_PATH,
+export function loadVerifyRetryMinutes({ env = process.env, read = readFileSync, platformPath = PLATFORM_PREFERENCES_PATH, now = Date.now(),
   repo = (() => { try { return readSettings()?.cards; } catch { return undefined; } })() } = {}) {
-  return resolveVerifyRetryMinutes({ platform: readCards(platformPath, read), repo, env });
+  return resolveVerifyRetryMinutes({ platform: readCards(platformPath, read), repo, env, now });
 }
 
 /** The full policy with independent filing and prevention settings overlays. */

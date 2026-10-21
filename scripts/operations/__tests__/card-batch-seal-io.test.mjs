@@ -6,7 +6,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { publishBatch, sealDueBatches, HOLD_LABEL, VERIFY_UNRUN_CAP, resolveAdoptDescendantHead } from '../card-batch-seal-io.mjs';
 import { loadCardBatchPolicy } from '../../lib/card-batch-policy.mjs';
+import { resolveVerifyRetryMinutes } from '../../lib/card-batch-settings.mjs';
+import { admissionLockRoot, admissionStatus, tryAcquireSlot } from '../../readiness/heavy-admission.mjs';
 const dirs = [];
+afterEach(() => vi.unstubAllEnvs());
 afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
 function fixture({ maxCards = 2, red = false, descendant = false, descendantMessages = 'Repair CI\n',
   descendantChanges = ':100644 100644 abc def M\0backlog/123-card.md\0' } = {}) {
@@ -271,6 +274,60 @@ it('re-arm leaves a pause that was renewed after the scan', async () => {
 });
 const unrunPausedState = (f, retryAfter) => writeFileSync(f.statePath, JSON.stringify({ ...f.state, sealedAt: 500,
   seal: { step: 'record-sealed' }, verifyUnrun: VERIFY_UNRUN_CAP, verifyRetryAfter: new Date(retryAfter).toISOString() }));
+it.each([
+  ['all expired', [0, 1, 2], true],
+  ['only fast slot expired', [2], true],
+  ['all live', [], false],
+])('default admission probe: %s', async (_name, expiredSlots, launches) => {
+  const f = fixture({ maxCards: 1 });
+  vi.stubEnv('LANE_POOL_ROOT', f.dir);
+  vi.stubEnv('WE_HEAVY_ADMISSION_CAP', '2');
+  vi.stubEnv('WE_HEAVY_ADMISSION_FAST_SLOTS', '1');
+  const lockRoot = admissionLockRoot(f.dir);
+  const now = 61 * 60_000;
+  for (let slot = 0; slot < 3; slot++) {
+    const acquiredAt = expiredSlots.includes(slot) ? 0 : now;
+    expect(tryAcquireSlot({ lockRoot, cap: 2, slots: [slot], owner: `holder-${slot}`, pid: process.pid,
+      nowMs: acquiredAt, nowIso: new Date(acquiredAt).toISOString() }).ok).toBe(true);
+  }
+  expect(admissionStatus({ lockRoot, cap: 2, fastSlots: 1, nowMs: now }).freeCount).toBe(0);
+  unrunPausedState(f, 10_000);
+  const spawn = vi.fn(fakeChild);
+  expect(await sealDueBatches({ now, stateDir: f.dir, policy: f.opts.policy, spawn })).toEqual(launches ? [f.statePath] : []);
+  expect(spawn).toHaveBeenCalledTimes(launches ? 1 : 0);
+  expect(f.read().verifyRetryAfter).toBe(launches ? undefined : new Date(10_000).toISOString());
+  const status = admissionStatus({ lockRoot, cap: 2, fastSlots: 1, nowMs: now });
+  expect(status.held.every(holder => holder.owner.startsWith('holder-'))).toBe(true);
+  expect(status.freeCount).toBe(launches ? 1 : 0);
+});
+it.each(['platform', 'repo', 'env'])('rejects an overflowing retry duration in the %s layer and retains the lower layer', layer => {
+  const layers = { now: 1000, platform: { batchVerifyRetryMinutes: 7 }, repo: { batchVerifyRetryMinutes: 9 } };
+  if (layer === 'platform') { layers.platform.batchVerifyRetryMinutes = 144000000000; delete layers.repo; }
+  if (layer === 'repo') layers.repo.batchVerifyRetryMinutes = 144000000000;
+  if (layer === 'env') layers.env = { WE_CARDS_BATCH_VERIFY_RETRY_MINUTES: '144000000000' };
+  expect(resolveVerifyRetryMinutes(layers)).toBe({ platform: 15, repo: 7, env: 9 }[layer]);
+});
+it.each([0, -1, 1.5, true, '7', Number.MAX_SAFE_INTEGER, Infinity])('retains a valid lower retry layer for invalid duration %s', value => {
+  expect(resolveVerifyRetryMinutes({ now: 1000, platform: { batchVerifyRetryMinutes: 7 },
+    repo: { batchVerifyRetryMinutes: value } })).toBe(7);
+});
+it('accepts the last representable whole-minute duration and rejects the next minute', () => {
+  const now = 1000;
+  const lastMinutes = Math.floor((8_640_000_000_000_000 - now) / 60_000);
+  expect(resolveVerifyRetryMinutes({ now, repo: { batchVerifyRetryMinutes: lastMinutes } })).toBe(lastMinutes);
+  expect(resolveVerifyRetryMinutes({ now, platform: { batchVerifyRetryMinutes: 7 },
+    repo: { batchVerifyRetryMinutes: lastMinutes + 1 } })).toBe(7);
+});
+it('records a durable pause on the third unrun verify despite an overflowing env setting', async () => {
+  const f = fixture({ maxCards: 1 });
+  vi.stubEnv('WE_CARDS_BATCH_VERIFY_RETRY_MINUTES', '144000000000');
+  writeFileSync(f.statePath, JSON.stringify({ ...f.state, verifyUnrun: VERIFY_UNRUN_CAP - 1 }));
+  const exec = (cmd, args, options) => args[1] === 'verify'
+    ? JSON.stringify({ verdict: { ok: false, unrun: 1 } }) : f.exec(cmd, args, options);
+  expect((await publishBatch(f.input, { ...f.opts, exec })).action).toBe('deferred');
+  expect(f.read()).toMatchObject({ verifyUnrun: VERIFY_UNRUN_CAP, verifyRetryAfter: new Date(1000 + 15 * 60_000).toISOString() });
+  expect(f.read().sealFailure).toBeUndefined();
+});
 it('re-arms a capacity-paused seal only after the pause and with a free heavy slot', async () => {
   const f = fixture({ maxCards: 1 }); const spawn = vi.fn(fakeChild);
   unrunPausedState(f, 10_000);

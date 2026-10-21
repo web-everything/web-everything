@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { acquireLease, atomicRecord, cardBatchStateDir, tokenOf } from './card-batch-io.mjs';
 import { planPublish, planSeal, renderBatchBody } from './card-batch-seal.mjs';
 import { CARD_BATCH_KINDS } from '../lib/card-batch-policy.mjs';
-import { effectiveCardBatchPolicy, loadVerifyRetryMinutes } from '../lib/card-batch-settings.mjs';
+import { effectiveCardBatchPolicy, loadVerifyRetryMinutes, resolveVerifyRetryMinutes } from '../lib/card-batch-settings.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { readVerifyMarker, VERIFY_FILENAME } from '../lib/lane-verify.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
@@ -41,7 +41,7 @@ export function resolveAdoptDescendantHead({ env = process.env, read = readSetti
 /** Call after admission. All commands, including lane acquisition, pass through the injected runner. */
 export async function publishBatch(input, opts = {}) {
   const { stateDir = CARD_BATCH_STATE_DIR, exec = batchExec, clock = Date.now, remote = 'origin',
-    policy = effectiveCardBatchPolicy(), leaseMs = 3 * 60 * 60_000, crashAt, verifyRetryMinutes = loadVerifyRetryMinutes() } = opts;
+    policy = effectiveCardBatchPolicy(), leaseMs = 3 * 60 * 60_000, crashAt, verifyRetryMinutes } = opts;
   const now = () => new Date(clock()).getTime();
   const statePath = resolve(input.statePath ?? join(stateDir, `${input.source.repo.replaceAll('/', '-')}-${input.kind}.json`));
   mkdirSync(dirname(statePath), { recursive: true });
@@ -224,7 +224,11 @@ export async function publishBatch(input, opts = {}) {
           const detail = JSON.stringify(verdict?.blocking ?? verified?.error ?? 'no verdict');
           if (state.verifyUnrun < VERIFY_UNRUN_CAP) { save(); throw new Error(`verify unrun: ${detail}`); }
           // Capacity, not a verdict: keep the batch and re-arm after a pause (`sealDueBatches` resets the count).
-          state.verifyRetryAfter = new Date(now() + verifyRetryMinutes * 60_000).toISOString();
+          const retryAt = now();
+          const retryMinutes = resolveVerifyRetryMinutes({ now: retryAt,
+            platform: { batchVerifyRetryMinutes: loadVerifyRetryMinutes({ now: retryAt }) },
+            repo: { batchVerifyRetryMinutes: verifyRetryMinutes } });
+          state.verifyRetryAfter = new Date(retryAt + retryMinutes * 60_000).toISOString();
           state.verifyUnrunReason = `verify did not run ${state.verifyUnrun} times: ${detail}`.slice(0, 500);
           save();
           return { action: 'deferred', state };
@@ -264,10 +268,22 @@ export async function publishBatch(input, opts = {}) {
   }
 }
 
-const defaultHeavyQueue = async () => (await import('./heavy-queue-io.mjs')).collectHeavyQueue();
-/** A free heavy slot per the heavy-queue reader; an unreadable queue counts as full (retry next tick). */
-async function heavyQueueFree(read) {
-  try { return (await read())?.freeCount > 0; } catch { return false; }
+/** Probe through admission itself so crashed/expired holders can be reclaimed without an unrelated job. */
+const defaultHeavyQueue = async ({ now }) => {
+  const { admissionLockRoot, resolveCap, resolveFastSlots, tryAcquireSlot, releaseOwnedSlot } = await import('../readiness/heavy-admission.mjs');
+  const lockRoot = admissionLockRoot(ROOT);
+  const cap = resolveCap();
+  const fastSlots = resolveFastSlots();
+  const owner = `card-batch-capacity:${process.pid}:${randomUUID()}`;
+  const slots = Array.from({ length: cap + fastSlots }, (_, i) => i);
+  const acquired = tryAcquireSlot({ lockRoot, cap, owner, nowMs: now, nowIso: new Date(now).toISOString(), pid: process.pid, slots });
+  if (!acquired.ok) return { freeCount: 0 };
+  try { return { freeCount: 1 }; }
+  finally { releaseOwnedSlot({ lockRoot, cap, owner, fastSlots }); }
+};
+/** An unreadable admission pool counts as full (retry next tick). The worker acquires its own slot. */
+async function heavyQueueFree(read, now) {
+  try { return (await read({ now }))?.freeCount > 0; } catch { return false; }
 }
 /** Clear the unrun count and pause under the batch lease so a running worker is never raced. */
 function rearmVerify(path, now, seen) {
@@ -306,7 +322,7 @@ export async function sealDueBatches({ now = Date.now(), stateDir = CARD_BATCH_S
       const kind = kindOf(state, path);
       if (state.verifyRetryAfter && !state.sealFailure) {
         // Verify could not run (capacity): wait out the pause, then re-arm only when the heavy queue has a free slot.
-        if (now < Date.parse(state.verifyRetryAfter) || !(await heavyQueueFree(readHeavyQueue))) continue;
+        if (now < Date.parse(state.verifyRetryAfter) || !(await heavyQueueFree(readHeavyQueue, now))) continue;
         if (!rearmVerify(path, now, state)) continue;
       }
       // Any seal reason launches (count beats age in shouldSeal); the lease serialises the worker against inline sealing.
