@@ -104,6 +104,8 @@ export function readyBuildVerified({
     if (!self || !prev || ov !== a.sha || extra.length > 0) return false;
     // The overlay sha is still on its ref — or, once the branch is gone (merged + auto-deleted), on main.
     const tip = verifyRev(git, `refs/remotes/origin/${a.ref}^{commit}`);
+    // overlay-pin: a PINNED head that was force-pushed off its ref fails this on purpose (fail closed): the ready
+    // record is not trusted to prove its own provenance, so that candidate is simply smoked again.
     if (tip ? !isAncestor(a.sha, tip) : !isAncestor(a.sha, mainTip)) return false;
     // The merge's tree is exactly what planRebuild mints for (prev, overlay) — never an arbitrary tree.
     let minted;

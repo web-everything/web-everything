@@ -268,7 +268,18 @@ export async function prepareRebuild({
   if (chainOf.fresh?.size > 0) {
     try { persistStackBases(root, chainOf.fresh, { env }); } catch (e) { alert('stack-bases-not-recorded', { error: String(e?.message ?? e) }); }
   }
+  // overlay-pin — `overlay-pinned` is logged ONCE per (ref, new tip), not every tick the pin holds; the record
+  // (`state.pinnedNotified`: ref → the new tip last reported) is pruned to the refs still pinned this plan.
+  const pinnedBefore = state.pinnedNotified && typeof state.pinnedNotified === 'object' ? state.pinnedNotified : {};
+  const pinnedNow = {};
   for (const event of plan.alerts || []) {
+    if (event.kind === 'overlay-pinned') {
+      const { ref, pr, newTip, files } = event.detail;
+      pinnedNow[ref] = newTip;
+      // The branch's own fixer still learns its new head conflicts (the wake keeps its first `at`).
+      if (pr != null) markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
+      if (pinnedBefore[ref] === newTip) continue;
+    }
     alert(event.kind, event.detail);
     if (event.kind === 'overlay-conflict-unresolved' && event.detail.pr != null) {
       const { pr, ref, files } = event.detail;
@@ -279,6 +290,10 @@ export async function prepareRebuild({
       const { pr, ref, files, collidesWith } = event.detail;
       markOverlayConflictWake(env, { pr, ref, files, collidesWith, at: nowIso(), clone: root });
     }
+  }
+  if (plan.ok && JSON.stringify(pinnedBefore) !== JSON.stringify(pinnedNow)) {
+    state.pinnedNotified = Object.keys(pinnedNow).length ? pinnedNow : null;
+    writeState();
   }
   for (const [pr, wake] of readOverlayConflictWakes(env, { maxAgeMs: Infinity })) {
     if (wake.clone === root && !overlaysBefore.some((o) => o.pr === pr && o.ref === wake.ref)) {
@@ -336,7 +351,7 @@ export async function prepareRebuild({
     return terminal({ moved: false, reason: 'established-overlay-conflict', detail });
   }
   for (const d of plan.decisions) {
-    if (d.pr != null && (d.action === 'apply' || d.action === 'remove')) clearOverlayConflictWake(env, d.pr);
+    if (d.pr != null && (d.action === 'apply' || d.action === 'remove') && !d.pinned) clearOverlayConflictWake(env, d.pr);
     if (d.action === 'remove') {
       removeOverlay(root, d.ref, { env, why: d.reason });
       appendOverlayEvent(root, { kind: 'auto-dropped', ref: d.ref, pr: d.pr, reason: d.reason }, { env });
