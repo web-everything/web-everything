@@ -1,4 +1,5 @@
 import { defineConfig } from 'vitest/config';
+import StallWatchdogReporter from './scripts/lib/vitest-stall-watchdog.mjs';
 import { hermeticGitEnv, maxTestWorkers, weAlias } from './vitest.shared';
 import { liveSuiteFiles, loadHermeticSettings } from './scripts/lib/hermetic-tests.mjs';
 
@@ -44,6 +45,9 @@ const LIVE_SUITE = new Set(liveSuiteFiles(loadHermeticSettings()));
  */
 export default defineConfig({
   test: {
+    // Fail a hung run loudly (no activity for WE_VITEST_STALL_MS, floor testTimeout+hookTimeout+60s) — see
+    // scripts/lib/vitest-stall-watchdog.mjs.
+    reporters: ['default', new StallWatchdogReporter()],
     globals: true,
     environment: 'node',
     // #3383 bugfix: same default-telemetry-off setup as `vitest.config.ts` — several of these files spawn

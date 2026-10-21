@@ -4,6 +4,7 @@ import { TRUST_CHAIN_TIER_FILES } from './scripts/lib/trust-chain-tier.mjs';
 import { cacheEnabled as testCacheEnabled } from './scripts/lib/test-result-cache.mjs';
 import { traceEnabled as testTraceEnabled } from './scripts/lib/test-cache-trace.mjs';
 import ShadowReporter from './scripts/test-cache/shadow-reporter.mjs';
+import StallWatchdogReporter from './scripts/lib/vitest-stall-watchdog.mjs';
 import { liveSuiteFiles, loadHermeticSettings } from './scripts/lib/hermetic-tests.mjs';
 
 // Card xcu4cqf: the scheduled live suite's files (scripts/hermetic-tests.settings.json → liveSuite.tests) never run
@@ -34,7 +35,10 @@ export default defineConfig({
     // prepare-124 S2: SHADOW-ONLY test-result cache. The reporter never skips or changes a test; it records "would
     // skip" next to the real outcome in ~/.cache/we-vitest-results. Absent under CI / GITHUB_ACTIONS / WE_TEST_CACHE=0
     // (no reporter is even constructed). A CLI `--reporter=...` replaces this list, so such runs are not logged.
-    reporters: ['default', ...(testCacheEnabled(process.env) ? [new ShadowReporter()] : [])],
+    // Test hygiene: a run with no activity for WE_VITEST_STALL_MS (15 min) and files unfinished is hung (a file stuck
+    // importing, or a pool worker that never reports back) — fail it loudly, naming the stuck files, instead of holding
+    // a heavy-queue slot for hours. See scripts/lib/vitest-stall-watchdog.mjs.
+    reporters: ['default', new StallWatchdogReporter(), ...(testCacheEnabled(process.env) ? [new ShadowReporter()] : [])],
     // tmp-leak fix: one private temp root per run, leak count reported + root removed at teardown
     // (scripts/lib/test-tmp-root.mjs; WE_TMP_LEAK_MODE / WE_TMP_LEAK_MAX).
     globalSetup: ['./vitest.globalSetup.mjs'],

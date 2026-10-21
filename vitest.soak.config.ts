@@ -1,4 +1,5 @@
 import { defineConfig } from 'vitest/config';
+import StallWatchdogReporter from './scripts/lib/vitest-stall-watchdog.mjs';
 import { maxTestWorkers } from './vitest.shared';
 
 /**
@@ -15,6 +16,9 @@ import { maxTestWorkers } from './vitest.shared';
  */
 export default defineConfig({
   test: {
+    // Fail a hung run loudly (no activity for WE_VITEST_STALL_MS, floor testTimeout+hookTimeout+60s) — see
+    // scripts/lib/vitest-stall-watchdog.mjs.
+    reporters: ['default', new StallWatchdogReporter()],
     globals: true,
     environment: 'node',
     setupFiles: ['./vitest.setup.ts'],
