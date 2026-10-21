@@ -140,7 +140,8 @@ export function rearmStaleAcceptsThenReplan({ plan, rawPrs = null, repo, rearm, 
     // A FRESH read, never the old snapshot with a synthesized label swap: the real swap's exact label result is GitHub's.
     const next = replan(null);
     if (!next || !Array.isArray(next.dispatch)) throw new Error('re-plan returned no dispatch list');
-    return { plan: unhold(next), rawPrs: nextPrs ?? rawPrs, rearms, replanError: null };
+    // A FRESH plan is never unheld from an earlier proof (audit): its rows are re-proved next pass.
+    return { plan: next, rawPrs: nextPrs ?? rawPrs, rearms, replanError: null };
   } catch (e) {
     return { plan: unhold(plan), rawPrs: nextPrs ?? rawPrs, rearms, replanError: oneLine(e) };
   }

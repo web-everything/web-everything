@@ -285,4 +285,12 @@ describe('stale-accept hold vs guarded re-arm share one coverage verdict (#5771 
     expect(r.plan.dispatch).toEqual([row]);
     expect(r.rearms[0].released).toBeUndefined();
   });
+  it('tick (audit): a fresh re-plan is never unheld from an earlier proof (same-head new obligation survives)', () => {
+    const other2 = { ...accepted(8) };
+    const rows2 = (n) => ({ ...row, prNumber: n });
+    const rearm = ({ pr: n }) => (n === 5771 ? { ok: false, covers: true, coveredHead: B, reason: 'x' } : { ok: true });
+    const r = rearmStaleAcceptsThenReplan({ plan: { dispatch: [row, rows2(8)], refusals: [] }, rawPrs: [pr, other2], repo: REPO, rearm,
+      replan: () => ({ dispatch: [row], refusals: [] }) });
+    expect(r.plan.dispatch).toEqual([row]);
+  });
 });
