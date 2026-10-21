@@ -651,6 +651,38 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     expect(liveReviewRoundBudget({ env: {}, listCommands: () => preloaded })).toMatchObject({ live: 4, left: Math.max(0, LIVE_CAP - 4) });
   });
 
+  it.each(['-r ./package.json', '--require ./package.json', '--require=./package.json',
+    '-r "./package.json"', "-r './package.json'", '-r ../Boot Work/package.json',
+    '-r ./bootstrap.hook', '-r ./native.node', '-r ./package', '--require=./package',
+    '-r ./bootstrap/', '-r ./package.json -r ./boot.cjs',
+    '-r ./Boot.v1 Work/boot.cjs', '--require=./Boot.v1 Work/boot.cjs',
+    '-r "./Boot.json Work/boot.cjs"', '-r "./Boot Work/bootstrap"',
+    `-r ${join(process.cwd(), 'package.json')}`])('JSON and other preload files preserve the cap: %s', async preload => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const commands = [1, 2, 3].map(pr =>
+      `node ${preload} scripts/operations/review-loop-cli.mjs --pr=${pr} --repo=web-everything/web-everything`);
+    const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () => commands.join('\n') });
+    expect(budget).toMatchObject({ live: 3, max: 3, left: 0 });
+    const dispatch = vi.fn(() => ({ agentId: 'unexpected-review' }));
+    runReviewTick({ reconcile: () => reviewsPlan(3), dispatch, liveReviewBudget: budget,
+      tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 40 });
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it.each(['-r ./package.json', '--require=./package.json'])('preloaded verifiers still exclude review script arguments: %s', async preload => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const command = `node ${preload} scripts/verify-lane.mjs scripts/operations/review-loop-cli.mjs`;
+    expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () => command }))
+      .toMatchObject({ live: 0, left: 3 });
+  });
+
+  it.each(['-r ./package', '--require=./package', '-r ./bootstrap.hook'])('holds ambiguous spaced review paths after extensionless preloads: %s', async preload => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const command = `node ${preload} scripts/Review Work/review-loop-cli.mjs --pr=1`;
+    expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () => command }))
+      .toMatchObject({ left: 0, reason: expect.stringContaining('ambiguous script path') });
+  });
+
   it('confirmed non-starts leave capacity for healthy repos on every tick', () => {
     for (let tick = 0; tick < 2; tick++) {
       const budget = { left: 3 };
