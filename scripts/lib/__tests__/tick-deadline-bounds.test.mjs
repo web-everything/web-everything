@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { STEP_MIN_MS, boundExec, isBudgetError, makeDeadline, DRAIN_HARD_DEADLINE_MS } from '../tick-deadline.mjs';
 import { fileIntoBatch } from '../../operations/card-batch-file.mjs';
 import { gitIn } from '../../operations/card-batch-io.mjs';
-import { drainPendingPrevention, landPreventionCard } from '../../operations/land-prevention-card.mjs';
+import { boundedGhExec, drainPendingPrevention, landPreventionCard } from '../../operations/land-prevention-card.mjs';
 import { readDrainCursor } from '../prevention-drain-cursor.mjs';
 import { reconcileOwedPrevention } from '../prevention-filing-owed.mjs';
 import { reconcileCardBatches } from '../../operations/card-batch-reconcile.mjs';
@@ -100,6 +100,28 @@ describe('round-2 bounds', () => {
     expect(drain.mock.calls[0][1].drainLimit.hardDeadlineAt).toBe(90_000 + DRAIN_HARD_DEADLINE_MS);
     await reconcileCardBatches({ ...common, clock: () => 500_000, now: 90_000 }); // a stale sample is not trusted
     expect(drain.mock.calls[1][1].drainLimit.hardDeadlineAt).toBe(500_000 + DRAIN_HARD_DEADLINE_MS);
+  });
+});
+
+describe('round-4 bounds', () => {
+  it('the dedupe\'s gh runner makes ONE attempt per call, capped at the time left with SIGKILL, and is refused once the budget is gone', () => {
+    let t = 0; const seen = []; const deadline = makeDeadline(40_000, () => t);
+    const run = (cmd, args, options) => { seen.push(options); return 'out'; };
+    const gh = boundedGhExec(deadline, run);
+    expect(gh('gh', ['pr', 'list'], { timeout: 999_000 })).toBe('out');
+    expect(seen[0]).toMatchObject({ timeout: 40_000, killSignal: 'SIGKILL', throttle: { maxAttempts: 1 } });
+    expect(seen[0].throttle.acquireTimeoutMs).toBeLessThanOrEqual(5_000);
+    t = 39_500;
+    expect(() => gh('gh', ['api', 'x'])).toThrow(/tick budget exhausted/);
+    expect(seen).toHaveLength(1);
+  });
+  it('the acquire-cleanup release runs only inside a tick', async () => {
+    const calls = [];
+    const exec = (cmd, args) => { calls.push(args); if (args[1] === 'acquire') throw Object.assign(new Error('x'), { killed: true }); return ''; };
+    const settings = resolvePreventionBatchSettings({ standard: loadCardBatchPolicy().prevention, repo: { filingEnabled: true }, env: {} });
+    await landPreventionCard({ title: 't', session: 'sess-uncapped' }, { owedClaimed: true, exec, write: () => {}, pendingDir: tmp(), skipPendingDrain: true,
+      loadFilingSettings: () => settings, loadPreventionBatchSettings: () => settings, acquireWait: () => 5_000 });
+    expect(calls.some(args => args[1] === 'release')).toBe(false);
   });
 });
 
