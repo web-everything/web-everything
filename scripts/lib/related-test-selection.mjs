@@ -29,9 +29,15 @@ const SPECIFIER_RE = /\bfrom\s*['"]([^'"\n]+)['"]|\bimport\s*\(\s*['"]([^'"\n]+)
 const SOURCE_EXT_RE = /\.(?:mjs|cjs|js|jsx|ts|tsx|mts|cts)$/;
 const RESOLVE_SUFFIXES = ['', '.mjs', '.js', '.ts', '.tsx', '.cjs', '.mts', '.jsx', '/index.mjs', '/index.js', '/index.ts', '/index.tsx', '/index.cjs', '/index.mts', '/index.jsx'];
 
-/** Is this path a vitest test file (`*.test.<js-ish>`)? */
+/** Trees whose `*.test.*` files are NOT vitest tests: `bun-trial/` holds native `bun:test` copies of real suites
+ *  (run only by the bun trial; `vitest.config.ts`'s include never matches them). Selecting them for a gate only
+ *  pads the command line and the related-test budget, and makes a hung sibling show up under a bun-trial name. */
+export const NON_VITEST_TEST_ROOTS = Object.freeze(['bun-trial/']);
+
+/** Is this path a vitest test file (`*.test.<js-ish>`, outside {@link NON_VITEST_TEST_ROOTS})? */
 export function isVitestTestFile(path) {
-  return /\.test\.(?:mjs|cjs|js|jsx|ts|tsx|mts|cts)$/.test(String(path));
+  const p = String(path);
+  return /\.test\.(?:mjs|cjs|js|jsx|ts|tsx|mts|cts)$/.test(p) && !NON_VITEST_TEST_ROOTS.some((root) => p.startsWith(root));
 }
 
 /** Is this path a source file the graph should read? */

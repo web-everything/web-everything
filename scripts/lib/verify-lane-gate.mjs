@@ -68,7 +68,7 @@ import { isAllowlistedLitterPath } from './lane-litter.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { queueLaneOf } from '../readiness/heavy-queue-projection.mjs';
 import { scanCommands } from './repo-scan-tests.mjs';
-import { buildReverseImportGraph, selectRelatedTests } from './related-test-selection.mjs';
+import { buildReverseImportGraph, selectRelatedTests, isVitestTestFile } from './related-test-selection.mjs';
 
 const defaultFileConfig = loadVerifySettingsFile();
 
@@ -676,7 +676,7 @@ export function testsNaming(needles, runGit) {
   // constellation `.spec.*` files are Playwright specs, which vitest's own `include` never runs.
   args.push('--', ...VITEST_TEST_PATHSPECS);
   try {
-    return String(runGit(args)).split('\n').map((s) => s.trim()).filter(Boolean).sort();
+    return String(runGit(args)).split('\n').map((s) => s.trim()).filter(isVitestTestFile).sort();
   } catch {
     return [];
   }

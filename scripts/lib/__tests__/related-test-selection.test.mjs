@@ -58,6 +58,17 @@ describe('#5128 — related import graph', () => {
     for (const ext of ['mjs', 'cjs', 'js', 'jsx', 'ts', 'tsx', 'mts', 'cts']) expect(isVitestTestFile(`x.test.${ext}`)).toBe(true);
     for (const path of ['__tests__/helper.mjs', 'x.spec.ts', 'x.test.json']) expect(isVitestTestFile(path)).toBe(false);
   });
+
+  it('never selects the bun:test copies under bun-trial/ (vitest never runs them)', () => {
+    expect(isVitestTestFile('bun-trial/scripts/__tests__/lane-drain-numbering.test.mjs')).toBe(false);
+    expect(isVitestTestFile('scripts/__tests__/lane-drain-numbering.test.mjs')).toBe(true);
+    const reverse = graph({ 'scripts/lib/a.mjs': '', 'scripts/lib/__tests__/a.test.mjs': "import '../a.mjs'",
+      'bun-trial/scripts/lib/__tests__/a.test.mjs': "import '../../../../scripts/lib/a.mjs'" });
+    expect([...testDepths(['scripts/lib/a.mjs'], reverse).keys()]).toEqual(['scripts/lib/__tests__/a.test.mjs']);
+    // The bun copy no longer spends the related-test budget: one real test fits a limit of one.
+    expect(selectRelatedTests({ changedFiles: ['scripts/lib/a.mjs'], reverse, maxTests: 1, maxDepth: 3 }))
+      .toMatchObject({ status: 'complete', fullTestCount: 1 });
+  });
 });
 
 describe('#5128 — bounded related-test selection', () => {
