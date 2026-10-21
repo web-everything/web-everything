@@ -160,6 +160,16 @@ function wakeTime(pr, run) {
   return Math.max(0, ...wakeEvents(pr, run).map(e => e.at));
 }
 
+/** A later attempt consumes a parked run's release even if it dies before advise. Keep completed
+ * panel ordering, but never let an older park hide a newer incomplete attempt on that history. */
+function latestReviewAttempt(history) {
+  const completed = history.filter(r => Number.isFinite(r.completedAt))
+    .sort((a, b) => b.completedAt - a.completedAt)[0];
+  return history.filter(r => r.incomplete && Number.isFinite(r.startedAt)
+    && (!completed || r.startedAt >= completed.startedAt))
+    .sort((a, b) => b.startedAt - a.startedAt)[0] ?? completed;
+}
+
 /**
  * The parked run an operator's ruling should RESUME instead of starting a fresh panel (card xq1xbsl; live 2026-10-08,
  * #4361 and #4388: a ruling on an unchanged head was followed by a full new review that raised NEW referrals, so the PR
@@ -170,9 +180,8 @@ function wakeTime(pr, run) {
  * @returns {{id: string, head: string}|null}
  */
 export function findResumableParkedRun(pr, runs, { repo } = {}) {
-  const history = runs.filter(r => Number.isFinite(r.completedAt) && r.repo === repo && r.pr === Number(pr.number))
-    .sort((a, b) => b.completedAt - a.completedAt);
-  const last = history[0];
+  const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number));
+  const last = latestReviewAttempt(history);
   if (!last?.parked || last.head !== pr.headRefOid || !last.attempted || last.persistenceFailed) return null;
   const events = wakeEvents(pr, last).filter(e => e.at > last.startedAt);
   if (events.some(e => e.kind === 'fresh')) return null;
@@ -187,9 +196,10 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 function evaluateReferralHold(pr, runs, { repo, now = Date.now(), env = process.env,
   // The SAME reader the review gate uses, so a `card` ruling naming a card that does not exist yet keeps the hold.
   cardReadable = ref => referralCardReadable(ref, REPO_ROOT) } = {}) {
-  const history = runs.filter(r => Number.isFinite(r.completedAt) && r.repo === repo && r.pr === Number(pr.number))
+  const attempts = runs.filter(r => r.repo === repo && r.pr === Number(pr.number));
+  const last = latestReviewAttempt(attempts);
+  const history = attempts.filter(r => Number.isFinite(r.completedAt))
     .sort((a, b) => b.completedAt - a.completedAt);
-  const last = history[0];
   if (!last?.parked || last.head !== pr.headRefOid || (!last.attempted && !last.persistenceFailed)) return { hold: null, released: null };
   const wake = wakeTime(pr, last);
   if (wake > last.startedAt) return { hold: null, released: 'wake' };
@@ -287,12 +297,10 @@ export function verdictNeverLanded(pr, last, now = Date.now()) {
 export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Date.now(), retry = resolveNoVerdictRetry(env) } = {}) {
   const max = resolveSameHeadMaxReviews(env);
   if (max === 0) return null;
-  const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid)
-    .sort((a, b) => b.completedAt - a.completedAt);
-  // Keep completed-panel semantics when one exists, but a fresh head can crash on EVERY attempt.
-  // Such a history must still reach the no-verdict cooldown and exhausted needs-you hold.
-  const last = history.find(r => Number.isFinite(r.completedAt))
-    ?? history.filter(r => r.incomplete && Number.isFinite(r.startedAt)).sort((a, b) => b.startedAt - a.startedAt)[0];
+  const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid);
+  // Newer incomplete attempts own retry accounting, including after an older parked review was released.
+  // A fresh head can also crash on EVERY attempt and must still reach the exhausted needs-you hold.
+  const last = latestReviewAttempt(history);
   if (!last || last.persistenceFailed) return null;
   const wake = wakeTime(pr, last);
   // A completed run whose verdict NEVER LANDED on the PR (GitHub refused the comment/label write; live 2026-10-07,
@@ -312,8 +320,11 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   const releases = validCooldownReleases(retry?.cooldownReleases) ? Math.min(retry.cooldownReleases, VERDICT_COOLDOWN_MAX_RELEASES) : 0;
   if (noVerdict && spent < releases) {
     const cooldown = Math.min(VERDICT_COOLDOWN_BASE_MS * 2 ** spent, VERDICT_COOLDOWN_CAP_MS);
+    // A pre-wake panel may finish after the newer crashes; its write-back still sets the cooldown floor.
+    const latestCompletedAt = history.reduce((latest, r) => Math.max(latest,
+      Number.isFinite(r.completedAt) ? r.completedAt : 0), 0);
     const latestAttemptAt = attempts.reduce((latest, r) => Math.max(latest,
-      Number.isFinite(r.completedAt) ? r.completedAt : r.startedAt), Number.isFinite(last.completedAt) ? last.completedAt : 0);
+      Number.isFinite(r.completedAt) ? r.completedAt : r.startedAt), latestCompletedAt);
     retryAt = latestAttemptAt + cooldown;
     if (now >= retryAt) return null;
   }

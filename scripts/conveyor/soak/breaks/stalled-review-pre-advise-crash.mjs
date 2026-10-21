@@ -17,7 +17,7 @@ export default {
   fixPresent(root) { return readFileSync(join(root, SOURCE), 'utf8').includes('incomplete: true'); },
   async run() {
     const reports = [];
-    for (const initialCompleted of [true, false]) reports.push(await runCase(initialCompleted));
+    for (const initialCompleted of [true, false, 'parked-wake']) reports.push(await runCase(initialCompleted));
     return { reports, violations: reports.flatMap(r => r.violations.map(v => `initialCompleted=${r.initialCompleted}: ${v}`)) };
   },
   judge(report) { return report.violations; },
@@ -31,14 +31,24 @@ async function runCase(initialCompleted) {
       const pr = { number: 5765, headRefOid: head, headRefName: 'lane/stalled-review',
         body: '<!-- authored-by-actor: author -->', labels: [{ name: 'review:pending' }], comments: [],
         mergeStateStatus: 'CLEAN', statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
-      const save = (id, start, complete) => {
+      const save = (id, start, complete, parked = false) => {
         const r = newRunRecord({ id: `review-pr-${id}`, op: 'review-pr', input: { repo, pr: pr.number } });
         r.findings.read = { repo, pr: pr.number, netBasis: { rev: head } };
         r.stepTimings = [{ step: 'read', stepIndex: 0, startedAt: iso(start), finishedAt: iso(start + 1), durationMs: 1 }];
         if (complete) r.stepTimings.push({ step: 'advise', stepIndex: 8, startedAt: iso(start + 59_999), finishedAt: iso(start + 60_000), durationMs: 1 });
+        if (parked) {
+          r.findings.referralVerdict = { verdict: 'needs-human', pendingReferrals: ['parked-finding'] };
+          r.findings.mandatoryReferrals = { effects: [{ type: 'review.mandatory-referrals', result: { records: [
+            { repo, pr: pr.number, head, attempted: true, referrals: [{ key: 'parked-finding' }], rulings: [] },
+          ] } }] };
+        }
         writeRun(r, dir);
       };
-      for (let i = 0; i < 3; i++) save(`initial-${i}`, at - (initialCompleted ? 60_000 : 0) - i * 120_000, initialCompleted);
+      if (initialCompleted === 'parked-wake') {
+        save('parked', at - HOUR, true, true);
+        pr.comments.push({ body: 'Please review again.', createdAt: iso(at - 10 * 60_000), author: { login: 'chalbert' } });
+      }
+      for (let i = 0; i < 3; i++) save(`initial-${i}`, at - (initialCompleted === true ? 60_000 : 0) - i * 120_000, initialCompleted === true);
       const violations = [], cooldowns = [];
       const enriched = now => enrichPrsWithReferralHolds([pr], { repo, now,
         env: { WE_REVIEW_NO_VERDICT_COOLDOWN_RELEASES: '6' },

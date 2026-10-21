@@ -10,7 +10,7 @@ import { referralCardReadable } from '../../lib/referral-card-readable.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { runReconcilePass as runReconcilePassWithTiming } from '../reconcile-pass.mjs';
 const runReconcilePass = (options = {}) => runReconcilePassWithTiming({ ...options, env: { WE_REVIEW_START_AFTER: 'ci-green', WE_FIX_JOIN_CI_AND_REVIEW: 'false', ...options.env } });
-import { countFindings } from '../reconcile-core.mjs';
+import { countFindings, planReconcile } from '../reconcile-core.mjs';
 import {
   reviewRunEvidence, readReviewRunEvidence, decideReferralHold, enrichPrsWithReferralHolds,
   notifyReferralHold, REFERRAL_RETRY_MS, decideSameHeadHold, resolveSameHeadMaxReviews, PENDING_REASON_TOKENS,
@@ -132,6 +132,28 @@ describe('attempted mandatory referrals', () => {
     expect(hold(pr(), [partial])).toBeNull();
     expect(findResumableParkedRun(pr(), [partial], { repo })).toBeNull();
     expect(decideSameHeadHold(pr(), [partial], { repo })).toBeNull();
+  });
+  it('only newer attempts on the same PR supersede a parked review', () => {
+    const parked = evidence();
+    const crashed = { ...parked, id: 'crashed', incomplete: true, parked: false, attempted: false,
+      completedAt: null, startedAt: at + 1 };
+    for (const unrelated of [{ ...crashed, pr: 99 }, { ...crashed, repo: 'other/repo' },
+      { ...crashed, startedAt: parked.startedAt - 1 }]) {
+      expect(hold(pr(), [parked, unrelated])).not.toBeNull();
+    }
+    for (const startedAt of [parked.startedAt, at + 1]) {
+      expect(hold(pr(), [parked, { ...crashed, startedAt }])).toBeNull();
+    }
+    // Completing the newer attempt with referrals restores its own referral hold.
+    expect(hold(pr(), [parked, evidence({ id: 'crashed', time: at + 120_000 })])).not.toBeNull();
+    // An older panel finishing late cannot reclaim the release consumed by the newer attempt.
+    const latePark = { ...parked, completedAt: at + 120_000 };
+    const ruled = record();
+    ruled.rulings = [{ id: 'r1', key, reviewerId: ruled.reviewer.id, lens: ruled.reviewer.lens,
+      result: 'not-real', rationale: 'checked', evidence: ['diff'] }];
+    const p = pr({ comments: [comment(renderReferralRecord(ruled), at + 180_000)] });
+    expect(findResumableParkedRun(p, [latePark], { repo })).toEqual({ id: parked.id, head });
+    expect(findResumableParkedRun(p, [latePark, crashed], { repo })).toBeNull();
   });
   // Live 2026-10-10: 3,303 review-pr records (0.8 GB) were re-read and JSON-parsed by EVERY reconcile-pass process —
   // minutes under host load, which timed out the drain rebuild's reconcile/dispatch smoke checks. The projection
@@ -530,6 +552,43 @@ describe('same-head hold never silences a review whose verdict never landed (liv
     expect(decideSameHeadHold(p, runs, { repo, env: {}, now: at + 7200_000 - 1 }))
       .toMatchObject({ retryAt: at + 7200_000 });
     expect(decideSameHeadHold(p, runs, { repo, env: {}, now: at + 7200_000 })).toBeNull();
+  });
+  it.each(['operator', 'rearm', 'ruling', 'live-release', 'persistence-retry'])('does not reuse a parked review %s release after pre-advise crashes', release => {
+    const parked = evidence({ failure: release === 'persistence-retry' });
+    const ruled = record();
+    ruled.rulings = [{ id: 'r1', key, reviewerId: ruled.reviewer.id, lens: ruled.reviewer.lens,
+      result: 'not-real', rationale: 'checked', evidence: ['diff'] }];
+    const comments = {
+      operator: [comment('Please review again.', at + 1, 'chalbert')],
+      rearm: [comment(REARM_COMMENT_MARKER, at + 1)],
+      ruling: [comment(renderReferralRecord(ruled), at + 1)],
+      'live-release': [comment(renderReferralRecord(ruled), at - 120_000)],
+      'persistence-retry': [],
+    }[release];
+    const p = labelled(['review:pending'], { comments });
+    const rows = [parked];
+    const decide = now => enrichPrsWithReferralHolds([p], { repo, now,
+      env: { WE_REVIEW_NO_VERDICT_COOLDOWN_RELEASES: '6' }, readRuns: () => rows })[0];
+    expect(decide(at + 30 * 60_000).referralHold).toBeNull(); // the initial release is still owed
+    for (let i = 0; i < 20; i++) {
+      const crashed = run({ id: `review-pr-after-release-${i}`, time: at + (31 + i) * 60_000 });
+      crashed.stepTimings.pop();
+      rows.push(reviewRunEvidence(crashed));
+      if (i === 2) {
+        expect(decide(at + 33 * 60_000).referralHold).toMatchObject({ kind: 'same-head',
+          noVerdict: { exhausted: false } });
+      }
+    }
+    const enriched = decide(at + 365 * 86400_000);
+    expect(enriched.referralHold).toMatchObject({ kind: 'same-head', retryAt: null,
+      noVerdict: { exhausted: true, releasesSpent: 6 } });
+    expect(planReconcile({ repo: 'we', prs: [enriched], agents: [], now: at + 365 * 86400_000,
+      requiredChecks: ['test'], reviewTiming: { startAfter: 'ci-green' } }).dispatch.filter(d => d.kind === 'review')).toEqual([]);
+    expect(findResumableParkedRun(p, rows, { repo })).toBeNull();
+    expect(decideReferralHold(p, rows, { repo })).toBeNull();
+    const wokeAgain = { ...p, comments: [...comments, comment('Try once more.', at + 366 * 86400_000, 'chalbert')] };
+    expect(enrichPrsWithReferralHolds([wokeAgain], { repo, now: at + 367 * 86400_000,
+      readRuns: () => rows })[0].referralHold).toBeNull();
   });
   it.each([true, false])('charges pre-advise crashes to growing cooldowns and refuses a seventh release through reconciliation (initial panels completed: %s)', initialCompleted => {
     const dir = temp(); vi.stubEnv('OPERATION_RUNS_DIR', dir);
