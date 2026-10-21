@@ -105,8 +105,13 @@ export function findCarriableVerdict({ comments, headSha, pr, sha: candidate } =
     all.forEach((c, i) => { if (isTrustedMarkerAuthor(c) && reviewedShasIn(c?.body).at(-1) === sha) lastOwn = i; });
     if (lastOwn < 0) return null;
   }
-  const scoped = sha === latest ? all
-    : all.filter((c, i) => i <= lastOwn || !(isTrustedMarkerAuthor(c) && reviewedShasIn(c?.body).length));
+  // Only a positively recognised acceptance record is set aside — a trusted comment whose leading line is an accept or
+  // a re-stamp heading and that carries no later-verdict line. Any other marker-bearing comment (a hold or a red-team
+  // break quoting a marker) stays and refuses the carry (Codex audit 2026-10-21, finding 1).
+  const isLaterRecord = c => isTrustedMarkerAuthor(c) && reviewedShasIn(c?.body).length > 0
+    && /^(?:✅ review — accepted|📌 review — acceptance re-stamped)/.test(String(c?.body ?? '').trimStart())
+    && !String(c?.body ?? '').split('\n').some(isLaterVerdictBody);
+  const scoped = sha === latest ? all : all.filter((c, i) => i <= lastOwn || !isLaterRecord(c));
   return findCarriableVerdictFor({ comments: scoped, trusted: scoped.filter(isTrustedMarkerAuthor), sha, headSha, pr });
 }
 
@@ -132,7 +137,8 @@ function findCarriableVerdictFor({ comments, trusted, sha, headSha, pr }) {
     return !informationalProvenance(c?.body, sha, number);
   });
   const record = latestAcceptRecord(verdictComments);
-  if (!HEX.test(sha ?? '') || sha === headSha || !record || record.laterVerdict || record.laterBodyDerivedHold) return null;
+  // The record judged must be the candidate's own: a later record left in place means holds after the candidate were not read.
+  if (!HEX.test(sha ?? '') || sha === headSha || !record || record.sha !== sha || record.laterVerdict || record.laterBodyDerivedHold) return null;
   return { ...record, ...findAcceptVerdictComment(trusted, sha), sha,
     gateOutcomes: [...gateOutcomesForHead(trusted, number, sha)], advisory: advisory?.parsed ?? null, advisoryBody: advisory?.body ?? null };
 }

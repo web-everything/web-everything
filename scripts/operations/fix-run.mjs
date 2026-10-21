@@ -107,9 +107,11 @@ export const defaultPendingRearm = (dir = pendingRearmDir()) => ({
       return v && typeof v.sha === 'string' && now - Number(v.at) < PENDING_REARM_MAX_AGE_MS ? v : null;
     } catch { return null; }
   },
-  write(repo, pr, sha, now = Date.now()) {
+  // `conflictRound` survives a crash so a retried hand-back keeps its round class (a conflict round never carries
+  // and never spends an ordinary round).
+  write(repo, pr, sha, now = Date.now(), { conflictRound = false } = {}) {
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, pendingKey(repo, pr)), JSON.stringify({ sha, at: now }), { mode: 0o600 });
+    writeFileSync(join(dir, pendingKey(repo, pr)), JSON.stringify({ sha, at: now, ...(conflictRound ? { conflictRound: true } : {}) }), { mode: 0o600 });
   },
   clear(repo, pr) { try { unlinkSync(join(dir, pendingKey(repo, pr))); } catch { /* already gone */ } },
 });
@@ -707,8 +709,9 @@ export async function runFixCli(argv = [], {
     };
     // A prior run pushed this exact tip and then failed to re-arm (this lane opened AT that tip): finish the hand-back
     // now, before spending a whole agent run on it.
-    if (pendingRearm.read(launch.repo, pr)?.sha === before) {
-      await rearm(before);
+    const pending = pendingRearm.read(launch.repo, pr);
+    if (pending?.sha === before) {
+      await rearm(before, { conflictRound: pending.conflictRound === true });
       pendingRearm.clear(launch.repo, pr);
       const result = `PR #${pr} (already pushed ${before.slice(0, 9)}; re-armed review:pending after a failed earlier re-arm)`;
       outcome = 'pushed'; reason = 'finished an earlier push';
@@ -931,7 +934,7 @@ export async function runFixCli(argv = [], {
         throw new LauncherError('lane git config changed while the agent ran; refusing to push');
       }
       // Record the owed re-arm BEFORE the push (best effort): a crash anywhere after the push must not lose it.
-      try { pendingRearm.write(launch.repo, pr, after); } catch (e) { writeErr(`fix-run: could not record the pending re-arm: ${String(e?.message ?? e)}\n`); }
+      try { pendingRearm.write(launch.repo, pr, after, undefined, { conflictRound }); } catch (e) { writeErr(`fix-run: could not record the pending re-arm: ${String(e?.message ?? e)}\n`); }
       run('git', [...HARDENED_GIT_ARGS, 'push', '--no-verify', 'origin', `HEAD:refs/heads/${ref}`], { cwd: lanePath, env: gitEnv }); // never --force
       const handBack = await rearm(after, { conflictRound });
       pendingRearm.clear(launch.repo, pr);

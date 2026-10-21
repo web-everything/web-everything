@@ -109,6 +109,15 @@ describe('accept carry across an identical net change', () => {
     // An older candidate never skips a hold posted after it, even when a later re-stamp sits in between.
     const held = [accept(rebased), redTeam(rebased), trusted('please hold'), restamp(jit)];
     expect(findCarriableVerdict({ comments: held, headSha: restored, pr: 7, sha: rebased })).toBeNull();
+    // A hold or a red-team break that quotes a reviewed-sha marker is never set aside as a "later record" (audit finding 1).
+    for (const quoting of [trusted(`please hold <!-- reviewed-sha: ${jit} -->`),
+      trusted(`🔁 review — changes requested\n\nRecorded by x.\n<!-- reviewed-sha: ${jit} -->`),
+      trusted(`✅ review — accepted\n🔁 review — changes requested\n<!-- reviewed-sha: ${jit} -->`),
+      trusted(`<!-- we:red-team-advisory pr=7 rev=${rebased} -->\n1. [**confirmed**] (correctness, broken) — Breaks it\n<!-- reviewed-sha: ${jit} -->`)]) {
+      const thread = [accept(rebased), redTeam(rebased), quoting, restamp(jit), acceptedRearm()];
+      expect(findCarriableVerdict({ comments: thread, headSha: restored, pr: 7, sha: rebased }), quoting.body).toBeNull();
+      expect(attemptVerdictCarry(io(thread, restored), { pr: 7 }).carried, quoting.body).toBe(false);
+    }
   });
   it('fails closed: no proof reader, setting off, a pushed head GitHub does not show yet, a refused restamp', () => {
     const comments = [accept(accepted), redTeam(accepted)];
