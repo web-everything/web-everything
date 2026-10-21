@@ -63,6 +63,7 @@ describe('fix-run hand-back: carry, conflict round, or ordinary re-arm', () => {
     const carryVerdict = vi.fn(async () => ({ carried: true }));
     expect((await runFixCli([...argv, '--merge-onto=lane/base'], { ...m.io, carryVerdict, readComments: async () => [] })).code).toBe(0);
     expect(rearmCall(m)).toContain('--round=conflict');
+    expect(rearmCall(m)).toContain('--main-ref=lane/base'); // records the target it resolved against
     expect(carryVerdict).not.toHaveBeenCalled();
   });
   it('a retried hand-back keeps its conflict-round class (audit finding 2)', async () => {

@@ -1432,7 +1432,8 @@ export function isWatcherConflictBounce(comments) {
  */
 export function defaultPostConflictRearm({ pr, repo, exec = execFileSync, conflictRound = false }) {
   const argv = [join(REPO_ROOT, 'scripts', 'conveyor', 'rearm-review.mjs'), String(pr?.number),
-    '--actor=parked-pr-conflict-watch (conflict resolved)', ...(conflictRound ? ['--round=conflict'] : [])];
+    '--actor=parked-pr-conflict-watch (conflict resolved)',
+    ...(conflictRound ? ['--round=conflict', `--main-ref=${String(pr?.baseRefName ?? '').trim() || 'main'}`] : [])];
   if (repo) argv.push(`--repo=${repo}`);
   // #x5n4zn3 — was bare (no timeout).
   exec('node', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });

@@ -697,7 +697,9 @@ export async function runFixCli(argv = [], {
       }
       try {
         return run('node', [resolve(weRoot, 'scripts', 'conveyor', 'rearm-review.mjs'), pr, ...(launch.repo ? [`--repo=${launch.repo}`] : []),
-          ...(conflictRound ? ['--round=conflict'] : [])], { cwd: weRoot });
+          // A conflict round records what it resolved against: the merge target, read in the lane that just fetched it.
+          ...(conflictRound ? ['--round=conflict', `--main-ref=${target || String(prHead.baseRefName ?? '').trim() || 'main'}`] : [])],
+        { cwd: conflictRound ? lanePath : weRoot });
       } catch (e) {
         const policy = resolveRearmRefusalPolicy();
         if (policy.mode === 'noop' && isNothingToRearmRefusal(e)) {

@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { ensureCommitReadable } from './carry-equivalence.mjs';
 import { parseReviewedSha, findAcceptVerdictComment } from './review-escalation.mjs';
-import { latestAcceptRecord, isLaterVerdictBody, isKnownMachineBody } from './accept-carry-forward.mjs';
+import { latestAcceptRecord, isLaterVerdictBody } from './accept-carry-forward.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { gateOutcomesForHead, parseRedTeamGateMarker, parseRedTeamComment, breakClass, RED_TEAM_COMMENT_MARKER,
   liveResultGateState, redTeamGateMarker, redTeamMarker, redTeamResultId } from './red-team-gate.mjs';
@@ -75,69 +75,17 @@ const ACCEPTED_REARM_RE = /^🔧 conveyor fix — re-armed for re-review\n\nThe 
 export function isAcceptedRearmBody(body) {
   return ACCEPTED_REARM_RE.test(String(body ?? '').replace(/\r\n?/g, '\n').trim());
 }
-// The exact layouts `review-set-label.mjs#buildVerdictComment` writes for an accept / a restamp: heading, blank,
-// `Recorded by … .`, then free write-up (accept) or one reason line (restamp), then only marker lines. No later-verdict line.
-const MARKER_LINE_RE = /^<!--\s*(?:reviewed-(?:sha|diff|contribution):\s*[0-9a-f]{40,64}|cleared-by-actor:\s*[0-9a-f-]{36})\s*-->$/;
-export function isExactRestampShape(body) {
-  const lines = String(body ?? '').replace(/\r\n?/g, '\n').trim().split('\n');
-  if (lines[0] !== '📌 review — acceptance re-stamped after a rebase (no new review)' || lines[1] !== ''
-    || !/^Recorded by [^\n]{1,200}\.$/.test(lines[2] ?? '') || lines[3] !== '') return false;
-  const rest = lines.slice(4).filter(l => l !== '');
-  return rest.length >= 2 && !MARKER_LINE_RE.test(rest[0]) && !/[🔁]|<!--/.test(rest[0]) && rest.slice(1).every(l => MARKER_LINE_RE.test(l));
-}
-export function isExactRecordShape(body) {
-  const text = String(body ?? '').replace(/\r\n?/g, '\n').trim();
-  if (text.split('\n').some(isLaterVerdictBody)) return false;
-  if (isExactRestampShape(text)) return true;
-  const lines = text.split('\n');
-  return lines[0] === '✅ review — accepted' && lines[1] === '' && /^Recorded by [^\n]{1,200}\.$/.test(lines[2] ?? '')
-    && MARKER_LINE_RE.test(lines.at(-1)) && !text.includes('cleared-human');
-}
-const reviewedShasIn = body => [...String(body ?? '').matchAll(/<!--\s*reviewed-sha:\s*([0-9a-f]{40})\s*-->/gi)].map(m => m[1].toLowerCase());
-
-/**
- * PURE: the trusted reviewed heads a carry may start from, newest first, distinct, at most `limit`. The newest is
- * today's only candidate. An older one matters when the drain re-stamped its accept onto a head with DIFFERENT content
- * (e.g. its JIT-numbering commit) and a repair then restored the accepted content (live #5779, 2026-10-21): the live head
- * equals what was reviewed, not what was re-stamped. {@link findCarriableVerdict} still decides each one.
- */
-export function carryCandidateShas(comments, { limit = 4 } = {}) {
-  const out = [];
-  for (const c of (Array.isArray(comments) ? comments : []).filter(isTrustedMarkerAuthor).reverse()) {
-    for (const sha of reviewedShasIn(c?.body).reverse()) if (!out.includes(sha)) out.push(sha);
-  }
-  return out.slice(0, limit);
-}
-
 /** PURE: a trusted accept survives only without a superseding verdict or unknown hold. */
-export function findCarriableVerdict({ comments, headSha, pr, sha: candidate } = {}) {
+// Only the LATEST reviewed head is a candidate. An older-candidate path (carry from the reviewed head when the drain
+// re-stamped onto different content, live #5779) was built and withdrawn on 2026-10-21: three Codex audits showed a
+// trusted comment shaped like an accept or a restamp could reset the hold boundary. Not worth the residual.
+export function findCarriableVerdict({ comments, headSha, pr } = {}) {
   if (!HEX.test(headSha ?? '')) return null;
   const all = Array.isArray(comments) ? comments : [];
   const trusted = all.filter(isTrustedMarkerAuthor);
-  const latest = parseReviewedSha(trusted);
-  const sha = candidate === undefined ? latest : candidate;
+  const sha = parseReviewedSha(trusted);
   if (!HEX.test(sha ?? '')) return null;
-  if (sha === latest) return findCarriableVerdictFor({ comments: all, trusted, sha, headSha, pr });
-  // An OLDER candidate (Codex audits 2026-10-21) is accepted only on a thread whose every comment after the candidate's
-  // first record is positively known: (a) a record naming the candidate in the exact accept/restamp layout, (b) a later
-  // drain re-stamp in its exact layout (set aside so the candidate's record is the one judged), (c) a known machine
-  // shape, (d) this candidate's own red-team/carry provenance, or (e) the exact accepted-rearm. Anything else — a hold
-  // or break quoting any marker, a later accept, an untrusted comment — refuses. Fail-closed by enumeration.
-  const own = c => isTrustedMarkerAuthor(c) && reviewedShasIn(c?.body).at(-1) === sha;
-  const first = all.findIndex(own);
-  if (first < 0) return null;
-  const later = [];
-  for (const c of all.slice(first)) {
-    const body = String(c?.body ?? '');
-    const marked = reviewedShasIn(body).length > 0;
-    if (own(c)) { if (!isExactRecordShape(body)) return null; continue; }
-    if (marked) { if (isTrustedMarkerAuthor(c) && isExactRestampShape(body)) { later.push(c); continue; } return null; }
-    if (!isTrustedMarkerAuthor(c)) return null;
-    if (isAcceptedRearmBody(body) || informationalProvenance(body, sha, pr) || isKnownMachineBody(body, c)) continue;
-    return null;
-  }
-  const scoped = all.filter(c => !later.includes(c));
-  return findCarriableVerdictFor({ comments: scoped, trusted: scoped.filter(isTrustedMarkerAuthor), sha, headSha, pr });
+  return findCarriableVerdictFor({ comments: all, trusted, sha, headSha, pr });
 }
 
 function findCarriableVerdictFor({ comments, trusted, sha, headSha, pr }) {
@@ -199,9 +147,8 @@ export function attemptVerdictCarry(io, { pr, repo, expectHead = null } = {}) {
     if (!HEX.test(evidence?.headSha ?? '') || !Array.isArray(evidence?.comments)) throw Error('carry evidence unreadable');
     if (expectHead && evidence.headSha !== expectHead) return { carried: false, reason: `live head ${evidence.headSha.slice(0, 9)} is not the pushed head` };
     let why = 'no carriable trusted accept';
-    for (const sha of carryCandidateShas(evidence.comments)) {
-      const prior = findCarriableVerdict({ ...evidence, pr, sha });
-      if (!prior) continue;
+    for (const prior of [findCarriableVerdict({ ...evidence, pr })].filter(Boolean)) {
+      const sha = prior.sha;
       // A gate decision made on SAVED evidence has no posted result to re-key onto the new head (PR #5551 red team).
       if (!prior.advisory && prior.gateOutcomes.length && (!io.readSavedResult || io.readSavedResult({ pr, repo, head: prior.sha }))) {
         why = `the red-team result on ${sha.slice(0, 9)} is saved, not posted`; continue;

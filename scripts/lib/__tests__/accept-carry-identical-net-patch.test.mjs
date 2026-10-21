@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { attemptVerdictCarry, contributionPatchId, carryCandidateShas, findCarriableVerdict, isAcceptedRearmBody,
+import { attemptVerdictCarry, contributionPatchId, findCarriableVerdict, isAcceptedRearmBody,
   parseVerdictCarriedMarker } from '../rebase-verdict-carry.mjs';
 import { proveIdenticalNetPatch } from '../identical-net-patch.mjs';
 import { buildRearmComment, countRearmComments } from '../../conveyor/rearm-review.mjs';
@@ -93,11 +93,10 @@ describe('accept carry across an identical net change', () => {
     expect(out.carried).toBe(false);
     expect(fake.restampVerdict).not.toHaveBeenCalled();
   });
-  it('live #5779 shape: accept re-stamped onto a JIT head, repair restores the reviewed tree → carried from the REVIEWED head', () => {
-    const comments = [accept(rebased), redTeam(rebased), restamp(jit), acceptedRearm()];
-    expect(carryCandidateShas(comments)).toEqual([jit, rebased]);
-    const fake = io(comments, restored);
-    expect(attemptVerdictCarry(fake, { pr: 7, repo: 'o/r' })).toMatchObject({ carried: true, fromSha: rebased, headSha: restored });
+  it('live #5779 shape (accept re-stamped onto a JIT head, repair restores the reviewed tree) is NOT carried: latest head only', () => {
+    const fake = io([accept(rebased), redTeam(rebased), restamp(jit), acceptedRearm()], restored);
+    expect(attemptVerdictCarry(fake, { pr: 7, repo: 'o/r' }).carried).toBe(false);
+    expect(fake.restampVerdict).not.toHaveBeenCalled();
   });
   it('never carries over a bounce re-arm, a changes verdict, an unknown comment, or without a red-team record', () => {
     for (const later of [bounceRearm(), trusted('🔁 review — changes requested\n\nRecorded by x.'), trusted('please hold'),
@@ -106,33 +105,11 @@ describe('accept carry across an identical net change', () => {
       expect(attemptVerdictCarry(fake, { pr: 7, repo: 'o/r' }).carried, later.body).toBe(false);
     }
     expect(attemptVerdictCarry(io([accept(accepted)], rebased), { pr: 7, repo: 'o/r' }).carried).toBe(false);
-    // An older candidate never skips a hold posted after it, even when a later re-stamp sits in between.
-    const held = [accept(rebased), redTeam(rebased), trusted('please hold'), restamp(jit)];
-    expect(findCarriableVerdict({ comments: held, headSha: restored, pr: 7, sha: rebased })).toBeNull();
-    // A hold or a red-team break that quotes a reviewed-sha marker is never set aside as a "later record" (audit finding 1).
-    for (const quoting of [trusted(`please hold <!-- reviewed-sha: ${jit} -->`),
-      trusted(`🔁 review — changes requested\n\nRecorded by x.\n<!-- reviewed-sha: ${jit} -->`),
-      trusted(`✅ review — accepted\n🔁 review — changes requested\n<!-- reviewed-sha: ${jit} -->`),
-      trusted(`<!-- we:red-team-advisory pr=7 rev=${rebased} -->\n1. [**confirmed**] (correctness, broken) — Breaks it\n<!-- reviewed-sha: ${jit} -->`)]) {
-      const thread = [accept(rebased), redTeam(rebased), quoting, restamp(jit), acceptedRearm()];
-      expect(findCarriableVerdict({ comments: thread, headSha: restored, pr: 7, sha: rebased }), quoting.body).toBeNull();
-      expect(attemptVerdictCarry(io(thread, restored), { pr: 7 }).carried, quoting.body).toBe(false);
-    }
   });
-  it('re-audit: holds quoting the CANDIDATE marker, accept-prefixed holds, and inexact records all refuse the older path', () => {
-    for (const bad of [trusted(`please hold <!-- reviewed-sha: ${rebased} -->`),
-      trusted(`🔁 review — changes requested\n\nRecorded by x.\n<!-- reviewed-sha: ${rebased} -->`),
-      trusted(`✅ review — accepted (quoted prior verdict; please hold)\n<!-- reviewed-sha: ${jit} -->`),
-      trusted(`<!-- we:red-team-advisory pr=7 rev=${rebased} -->\n1. [**confirmed**] (correctness, broken) — Breaks it\n<!-- reviewed-sha: ${rebased} -->`)]) {
-      const thread = [accept(rebased), redTeam(rebased), bad, restamp(jit), acceptedRearm()];
-      expect(findCarriableVerdict({ comments: thread, headSha: restored, pr: 7, sha: rebased }), bad.body).toBeNull();
-    }
-  });
-  it('a real red-team advisory with its `Files read` sub-line is the candidate\'s provenance, not a hold (live #5779)', () => {
+  it('a real red-team advisory with its `Files read` sub-line is provenance, not a hold (live #5779)', () => {
     const advisory = trusted(`<!-- we:red-team-advisory pr=7 rev=${accepted} -->\n### Post-accept red team — 1 possible break(s), 0 confirmed by Claude's re-check\n\n1. [not confirmed] (edge-case, degraded) \`a.txt:2\` — maybe\n   - Scenario: ran it\n   - Re-check: refuted\n   - Files read: a.txt, card.md`);
     expect(findCarriableVerdict({ comments: [accept(accepted), advisory], headSha: rebased, pr: 7 })?.sha).toBe(accepted);
-    const withHold = trusted(`${advisory.body}\nplease hold`);
-    expect(findCarriableVerdict({ comments: [accept(accepted), withHold], headSha: rebased, pr: 7 })).toBeNull();
+    expect(findCarriableVerdict({ comments: [accept(accepted), trusted(`${advisory.body}\nplease hold`)], headSha: rebased, pr: 7 })).toBeNull();
   });
   it('fails closed: no proof reader, setting off, a pushed head GitHub does not show yet, a refused restamp', () => {
     const comments = [accept(accepted), redTeam(accepted)];

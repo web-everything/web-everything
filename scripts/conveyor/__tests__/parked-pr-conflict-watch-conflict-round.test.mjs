@@ -20,9 +20,10 @@ describe('isWatcherConflictBounce', () => {
   });
   it('the rearm argv adds --round=conflict only for the watch\'s own bounce', () => {
     const exec = vi.fn();
-    defaultPostConflictRearm({ pr: { number: 9 }, repo: 'o/r', exec, conflictRound: true });
+    defaultPostConflictRearm({ pr: { number: 9, baseRefName: 'develop' }, repo: 'o/r', exec, conflictRound: true });
     defaultPostConflictRearm({ pr: { number: 9 }, repo: 'o/r', exec });
     expect(exec.mock.calls[0][1]).toContain('--round=conflict');
+    expect(exec.mock.calls[0][1]).toContain('--main-ref=develop');
     expect(exec.mock.calls[1][1]).not.toContain('--round=conflict');
   });
 });
