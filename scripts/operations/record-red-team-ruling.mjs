@@ -44,8 +44,8 @@ import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import { createHash } from 'node:crypto';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
-import { assertHumanOperator, operatorBoundComments } from '../lib/operator-identity.mjs';
-import { GATE_OUTCOMES, OPERATOR_RULINGS_DEFAULTS, liveResultGateState, operatorRulingsOnLiveResult, readRedTeamDisposition } from '../lib/red-team-gate.mjs';
+import { assertHumanOperator, isHumanOperatorComment, operatorBoundComments } from '../lib/operator-identity.mjs';
+import { GATE_OUTCOMES, OPERATOR_RULINGS_DEFAULTS, liveResultGateState, operatorRulingsOnLiveResult, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
 import { FALSE_FINDING_CAUSES } from '../lib/false-finding-causes.mjs';
 import { sanitizeCardField } from '../lib/review-loop-policy.mjs';
 import { buildRedTeamCardInput, buildSendBackBody } from './red-team-gate-apply.mjs';
@@ -147,6 +147,27 @@ export function rulableBreaks({ comments, labels, pr, head, setting, scope, ruli
   return { state, atCap, anyState, rulable, noun: `confirmed and not already ruled \`${ruling}\` on the live head` };
 }
 
+/**
+ * Card jobs another invocation already started for this result (the bare `card-pending` intent a human operator
+ * posted before the spawn) whose break set overlaps `indices` under a DIFFERENT job key. A retry with an overlapping
+ * but different selection would spawn a second filing for the same break, so it is refused; re-running the exact same
+ * selection reconciles that job instead. PURE.
+ */
+export function conflictingPendingCardJobs(comments, { pr, head, resultId, jobKey, indices }) {
+  const marker = redTeamGateMarker(pr, head, CARD_PENDING_OUTCOME, resultId);
+  const out = [];
+  for (const c of Array.isArray(comments) ? comments : []) {
+    const body = String(c?.body ?? '').trimStart();
+    if (!body.startsWith(marker) || !isHumanOperatorComment(c)) continue;
+    const m = /Operator card ruling pending \(job ([0-9a-f]{12}), break\(s\) (#\d+(?:, #\d+)*)\)/.exec(body);
+    if (!m || m[1] === jobKey) continue;
+    const theirs = m[2].split(', ').map((x) => Number(x.slice(1)));
+    const overlap = indices.filter((i) => theirs.includes(i));
+    if (overlap.length) out.push({ jobKey: m[1], indices: theirs, overlap });
+  }
+  return out;
+}
+
 /** The gate action line each ruling records (`gateActionLines` in red-team-gate.mjs reads them back). */
 const RULING_ACTION = Object.freeze({ card: 'card', 'not-real': 'advisory', block: 'send-back' });
 
@@ -188,6 +209,11 @@ export function planRedTeamRuling(read, input) {
     const cardInput = buildRedTeamCardInput({ repo: input.repo, pr, head, findings: selected });
     cardInput.digest += `\n\nOperator ruling (${base.actor} via ${base.channel}): carded. Reason: ${sanitizeCardField(reason, 600)}`;
     const jobKey = cardJobKey(base);
+    const pending = conflictingPendingCardJobs(comments, { pr, head, resultId: state.resultId, jobKey, indices: base.indices });
+    if (pending.length) {
+      throw new Error(`a card job is already pending for ${pending.map((j) => `break(s) ${j.indices.map((i) => `#${i}`).join(', ')} (job ${j.jobKey})`).join('; ')}; `
+        + 're-run with exactly that --break selection to finish it (a different overlapping selection would file the same break twice)');
+    }
     return { ...base, effect: RED_TEAM_RULING_CARD_EFFECT, cardInput, jobKey, session: `red-team-ruling-card-${jobKey}` };
   }
   if (ruling === 'block') {

@@ -497,3 +497,22 @@ describe('audit round 2', () => {
     await expect(f.sinks[RED_TEAM_RULING_BLOCK_EFFECT](payloadFor({ ruling: 'block' }))).rejects.toThrow(/not in the read-back/);
   });
 });
+
+describe('audit round 3: an interrupted multi-break card filing never spawns a second filing on an overlapping retry', () => {
+  const two = () => [redTeam(HEAD, [
+    { summary: 'one', category: 'edge-case', impactIfUnfixed: 'broken', file: 'a.mjs', line: 1, confirmedByRecheck: true },
+    { summary: 'two', category: 'edge-case', impactIfUnfixed: 'broken', file: 'b.mjs', line: 2, confirmedByRecheck: true }]), capped()];
+  it('spawn ok, release record fails, retry with --break=1 is refused; the exact retry reconciles without a respawn', () => {
+    let failRecord = true;
+    const f = fake({ initial: two(), postFails: (b) => failRecord && b.includes('outcome=operator-card') });
+    const both = planRedTeamRuling(read({ comments: f.comments }), input({ break: '#1,#2' }));
+    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](both)).toThrow(/gh down/);
+    expect(f.cards).toHaveLength(1);
+    expect(() => planRedTeamRuling(read({ comments: f.comments }), input({ break: '1' }))).toThrow(/already pending for break\(s\) #1, #2/);
+    const one = { ...both, indices: [1], findings: both.findings.slice(0, 1), jobKey: 'ffffffffffff', session: 'x' };
+    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](one)).toThrow(/already pending for an overlapping break/);
+    failRecord = false;
+    expect(f.sinks[RED_TEAM_RULING_CARD_EFFECT](planRedTeamRuling(read({ comments: f.comments }), input({ break: '#1,#2' })))).toMatchObject({ card: { reconciled: true } });
+    expect(f.cards).toHaveLength(1);
+  });
+});

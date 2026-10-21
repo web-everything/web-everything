@@ -23,7 +23,7 @@ import { buildGateComment } from './red-team-gate-apply.mjs';
 import { appendLedgerEvents } from './record-referral-ruling-io.mjs';
 import {
   CARD_PENDING_OUTCOME, OPERATOR_BLOCK_OUTCOME, OPERATOR_CARD_OUTCOME, OPERATOR_NOT_REAL_OUTCOME, RED_TEAM_RULING_BLOCK_EFFECT, RED_TEAM_RULING_CARD_EFFECT, RED_TEAM_RULING_NOT_REAL_EFFECT,
-  buildRuleReasonComment, recordRedTeamRulingOperation, rulableBreaks,
+  buildRuleReasonComment, conflictingPendingCardJobs, recordRedTeamRulingOperation, rulableBreaks,
 } from './record-red-team-ruling.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -184,6 +184,10 @@ export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_
   return {
     [RED_TEAM_RULING_CARD_EFFECT]: (p) => {
       const { comments } = recheck(p);
+      if (!p.cardRef) {
+        const pending = conflictingPendingCardJobs(comments, p);
+        if (pending.length) throw new Error(`a different card job (${pending.map((j) => j.jobKey).join(', ')}) is already pending for an overlapping break; nothing written — re-run with that exact selection`);
+      }
       if (p.cardRef) {
         // An EXISTING card: one release record citing it, then the reason. Nothing is filed.
         if (!/^we:backlog\/[A-Za-z0-9][A-Za-z0-9._-]*\.md(?:@pr[1-9]\d{0,8})?$/.test(p.cardRef)) throw new Error(`--card resolved to an unsafe reference ${JSON.stringify(p.cardRef)}; nothing written`);
