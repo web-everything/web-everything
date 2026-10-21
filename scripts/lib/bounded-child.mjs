@@ -361,8 +361,13 @@ export function startTreeWatchdog({ pid, timeoutMs, kill = {}, heartbeat = null,
     fired: () => Atomics.load(flag, 0) >= 1,
     // After a fire, the kill is complete only once the escape sweeps ran: a caller must await this before it
     // reports the phase done or exits (an exit, or `stop()`, would cut the sweeps short). Bounded by `maxWaitMs`.
-    settled: (maxWaitMs = 60_000) => (Atomics.load(flag, 0) === 0 ? Promise.resolve()
-      : Promise.race([swept, new Promise((r) => setTimeout(r, maxWaitMs).unref())])),
+    // The wait timer is REF'd on purpose: the child has closed and the worker is unref'd, so without it nothing keeps
+    // the caller's event loop alive and Node would exit mid-await, before the caller records its result.
+    settled: (maxWaitMs = 60_000) => {
+      if (Atomics.load(flag, 0) === 0) return Promise.resolve();
+      let hold = null;
+      return Promise.race([swept, new Promise((r) => { hold = setTimeout(r, maxWaitMs); })]).finally(() => clearTimeout(hold));
+    },
     // Disarms an unfired ceiling. A fired worker is left to finish its sweeps and exit on its own.
     stop: () => { stopped = true; clearTimeout(fallback); if (Atomics.load(flag, 0) === 0) worker?.terminate().catch(() => {}); },
   };

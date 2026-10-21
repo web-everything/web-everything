@@ -3,7 +3,7 @@
  * per-phase timeout must kill the whole gate tree (shell → npm exec → vitest → esbuild), not just the shell.
  */
 import { describe, it, expect } from 'vitest';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -98,24 +98,32 @@ describe('startTreeWatchdog (PR #5768)', () => {
     } finally {
       try { child.kill('SIGKILL'); } catch { /* gone */ }
     }
-    // A copy of this module, loaded, then overwritten on disk: the watchdog must still run the loaded code.
+    // A copy of this module, loaded by a plain node process, then overwritten on disk: the watchdog must still run the
+    // loaded code. (A plain process: vitest's loader cannot import a module from outside the project root.)
     const dir = mkdtempSync(join(tmpdir(), 'tree-watchdog-swap-'));
-    const copy = join(dir, 'bounded-child.mjs');
-    writeFileSync(copy, readFileSync(resolve(process.cwd(), 'scripts/lib/bounded-child.mjs')));
-    const loaded = await import(pathToFileURL(copy).href);
-    writeFileSync(copy, 'export const broken = true;\n');
-    const victim = spawn(process.execPath, ['-e', keepAliveScript()], { stdio: 'ignore' });
-    const victimExited = new Promise((r) => victim.once('exit', (code, signal) => r(signal)));
-    const swapWarned = [];
     try {
-      const watchdog = loaded.startTreeWatchdog({ pid: victim.pid, timeoutMs: 400, warn: (m) => swapWarned.push(m) });
-      const blockUntil = Date.now() + 1_200;
-      while (Date.now() < blockUntil) { /* a blocked event loop: only the watchdog thread can fire */ }
-      expect(watchdog.fired()).toBe(true);
-      expect(await victimExited).toBe('SIGKILL');
-      expect(swapWarned).toEqual([]);
+      const copy = join(dir, 'bounded-child.mjs');
+      writeFileSync(copy, readFileSync(resolve(process.cwd(), 'scripts/lib/bounded-child.mjs')));
+      const probe = join(dir, 'probe.mjs');
+      writeFileSync(probe, `import { spawn } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
+const loaded = await import(${JSON.stringify(pathToFileURL(copy).href)});
+writeFileSync(${JSON.stringify(copy)}, 'export const broken = true;\\n');
+const victim = spawn(process.execPath, ['-e', ${JSON.stringify(keepAliveScript())}], { stdio: 'ignore' });
+const exited = new Promise((r) => victim.once('exit', (code, signal) => r(signal)));
+const warned = [];
+const watchdog = loaded.startTreeWatchdog({ pid: victim.pid, timeoutMs: 400, warn: (m) => warned.push(m) });
+const blockUntil = Date.now() + 1_200;
+while (Date.now() < blockUntil) { /* a blocked event loop: only the watchdog thread can fire */ }
+const fired = watchdog.fired();
+const signal = await Promise.race([exited, new Promise((r) => setTimeout(() => r('alive'), 5_000))]);
+if (signal === 'alive') victim.kill('SIGKILL');
+console.log(JSON.stringify({ fired, signal, warned }));
+`);
+      const r = spawnSync(process.execPath, [probe], { encoding: 'utf8', timeout: 30_000 });
+      expect(r.status, r.stderr).toBe(0);
+      expect(JSON.parse(r.stdout.trim())).toEqual({ fired: true, signal: 'SIGKILL', warned: [] });
     } finally {
-      try { victim.kill('SIGKILL'); } catch { /* gone */ }
       rmSync(dir, { recursive: true, force: true });
     }
   });
