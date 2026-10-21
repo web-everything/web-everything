@@ -1,0 +1,272 @@
+/**
+ * @file verdict-ledger-outbox.test.mjs - the ledger OUTBOX + PLUMBING flush (live 2026-10-21: 3+ same-host writers
+ *   raced 9-second worktree pushes to `ops/review-requests`, the losers exhausted 5 short retries and referral holds
+ *   and rulings never persisted, #5502 #5530 #5773 #5742 #5768).
+ *
+ * The append writes its rows to a host-local outbox first, then ONE writer at a time (a host-wide flusher lock)
+ * pushes everything queued as ONE plumbing commit. These tests pin the invariants: every row lands exactly once,
+ * a crash between push and delete never duplicates, an off-host (CI) writer's push is retried on the new tip,
+ * nothing is ever forced, and a failure still surfaces.
+ */
+import { describe, it, expect } from 'vitest';
+import { spawn, execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { pathToFileURL, fileURLToPath } from 'node:url';
+import {
+  appendLedgerRows, ledgerGitPath, readLedgerFromGit, LedgerAppendExhaustedError, LEDGER_TRANSPORT_BRANCH,
+} from '../verdict-ledger-io.mjs';
+import {
+  flushLedgerOutbox, listOutboxEntries, outboxLockRoot, OUTBOX_LOCK_PATH, resolveOutboxSettings, formatOutboxSettings,
+  OUTBOX_ENV, OUTBOX_DIR_ENV,
+} from '../verdict-ledger-outbox.mjs';
+import { withGitErrorForTest } from '../git-transport-branch.mjs';
+import { reserve, makeLockEntry } from '../../readiness/file-locks.mjs';
+import { buildVerdictRecord } from '../verdict-ledger.mjs';
+import { withBareOrigin, git, writeLocalIdentity } from '../../operations/__tests__/helpers/real-repo.mjs';
+
+const REPO = 'web-everything/web-everything';
+const IO_MODULE = resolve(fileURLToPath(new URL('..', import.meta.url)), 'verdict-ledger-io.mjs');
+const row = (pr) => buildVerdictRecord({ repo: REPO, pr, verdict: 'accepted', at: '2026-10-21T12:00:00.000Z', source: 'test' });
+const noSleep = () => {};
+const quiet = () => {};
+
+const cloneOf = (ctx, name) => {
+  const dir = join(ctx.tmp, name);
+  git(['clone', '--quiet', ctx.origin, dir], { cwd: ctx.tmp });
+  writeLocalIdentity(dir);
+  return dir;
+};
+const originRows = (ctx) => ctx.showOnOrigin(LEDGER_TRANSPORT_BRANCH, ledgerGitPath(REPO)).trim().split('\n').filter(Boolean)
+  .map((l) => JSON.parse(l).pr);
+const originCommits = (ctx) => Number(git(['rev-list', '--count', LEDGER_TRANSPORT_BRANCH], { cwd: ctx.origin }).trim());
+const realGit = (args, opts = {}) => execFileSync('git', args, { encoding: 'utf8', stdio: [opts.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'], ...opts });
+
+describe('outbox settings: a cascade, logged with its source', () => {
+  it('defaults on, with a time budget and a stale age, sources named', () => {
+    const s = resolveOutboxSettings({ repo: {}, env: {} });
+    expect(s.enabled).toBe(true);
+    expect(s.flushBudgetMs).toBeGreaterThan(10_000);
+    expect(s.staleMs).toBeGreaterThan(s.flushBudgetMs);
+    expect(s.sources).toEqual({ enabled: 'standard', flushBudgetMs: 'standard', staleMs: 'standard' });
+  });
+
+  it('is OFF in CI (an ephemeral runner would lose its outbox) unless the env forces it', () => {
+    expect(resolveOutboxSettings({ repo: {}, env: { GITHUB_ACTIONS: 'true' } })).toMatchObject({ enabled: false, sources: { enabled: 'ci' } });
+    expect(resolveOutboxSettings({ repo: {}, env: { GITHUB_ACTIONS: 'true', [OUTBOX_ENV]: '1' } })).toMatchObject({ enabled: true, sources: { enabled: 'env' } });
+  });
+
+  it('repo overrides standard, env overrides repo, invalid layers are ignored and named', () => {
+    const s = resolveOutboxSettings({ repo: { verdictLedger: { outbox: false, flushBudgetMs: 30_000, outboxStaleMs: 'x' } }, env: {} });
+    expect(s).toMatchObject({ enabled: false, flushBudgetMs: 30_000, sources: { enabled: 'repo', flushBudgetMs: 'repo', staleMs: 'standard' } });
+    expect(s.invalid).toEqual(['repo.verdictLedger.outboxStaleMs']);
+    expect(formatOutboxSettings(s)).toMatch(/verdictLedger\.flushBudgetMs=30000 \(repo\)/);
+  });
+});
+
+describe('withGitError keeps the push rejection, not only the last error line', () => {
+  it('a rejected push names [rejected] and the remote: lines in its message', () => {
+    const run = () => {
+      const e = new Error('Command failed');
+      e.stderr = 'To github.com:x/y.git\n ! [rejected]        HEAD -> ops/review-requests (fetch first)\n'
+        + 'remote: something the remote said\nerror: failed to push some refs to \'github.com:x/y.git\'\n';
+      e.status = 1;
+      throw e;
+    };
+    let err;
+    try { withGitErrorForTest(run)(['push', 'origin', 'x'], {}); } catch (e) { err = e; }
+    expect(err.message).toMatch(/\[rejected\].*fetch first/);
+    expect(err.message).toMatch(/remote: something the remote said/);
+    expect(err.message).toMatch(/failed to push some refs/);
+  });
+});
+
+describe('real git: outbox + plumbing flush', () => {
+  it('a single append lands as ONE plumbing commit: no worktree, no local branch moved, never forced', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const outboxDir = join(ctx.tmp, 'outbox');
+      const calls = [];
+      const run = (args, opts) => { calls.push(args); return realGit(args, opts); };
+      const before = originCommits(ctx);
+      const r = appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(1), row(2)], outbox: true, outboxDir, gitRun: run, log: quiet });
+      expect(r).toMatchObject({ status: 'appended', rows: 2, duplicates: 0, queued: false });
+      expect(originRows(ctx)).toEqual([1, 2]);
+      expect(originCommits(ctx)).toBe(before + 1);
+      expect(calls.some((a) => a[0] === 'worktree')).toBe(false);
+      expect(calls.some((a) => a[0] === 'checkout' || a[0] === 'update-ref' || a[0] === 'branch')).toBe(false);
+      const pushes = calls.filter((a) => a[0] === 'push');
+      expect(pushes).toHaveLength(1);
+      expect(pushes[0].at(-1)).toMatch(/^[0-9a-f]{40}:refs\/heads\/ops\/review-requests$/);
+      for (const a of pushes.flat()) expect(a).not.toMatch(/^(-f|--force.*|\+.*)$/);
+      expect(git(['for-each-ref', 'refs/heads/'], { cwd: ctx.clone })).not.toMatch(/ops\/review-requests/);
+      expect(listOutboxEntries(outboxDir)).toEqual([]);
+      expect(existsSync(join(ctx.clone, '.operations', 'transport'))).toBe(false);
+    });
+  });
+
+  it('CONCURRENT APPENDERS (6 processes, 2 boards) all land, each row exactly once', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const boards = [ctx.clone, cloneOf(ctx, 'board-b')];
+      const outboxDir = join(ctx.tmp, 'outbox');
+      const script = join(ctx.tmp, 'append-one.mjs');
+      writeFileSync(script, `
+        import { appendLedgerRows } from ${JSON.stringify(pathToFileURL(IO_MODULE).href)};
+        import { buildVerdictRecord } from ${JSON.stringify(pathToFileURL(resolve(IO_MODULE, '..', 'verdict-ledger.mjs')).href)};
+        const [board, pr, outboxDir] = process.argv.slice(2);
+        const rec = buildVerdictRecord({ repo: ${JSON.stringify(REPO)}, pr: Number(pr), verdict: 'accepted', at: '2026-10-21T12:00:00.000Z', source: 'test' });
+        const r = appendLedgerRows({ board, repo: ${JSON.stringify(REPO)}, records: [rec], outbox: true, outboxDir, log: () => {} });
+        process.stdout.write(JSON.stringify(r));
+      `);
+      const runChild = (board, pr) => new Promise((done) => {
+        const child = spawn(process.execPath, [script, board, String(pr), outboxDir], { stdio: ['ignore', 'pipe', 'pipe'] });
+        let out = ''; let err = '';
+        child.stdout.on('data', (d) => { out += d; });
+        child.stderr.on('data', (d) => { err += d; });
+        child.on('close', (code) => done({ code, out, err }));
+      });
+      const prs = [11, 12, 13, 14, 15, 16];
+      const results = await Promise.all(prs.map((pr, i) => runChild(boards[i % 2], pr)));
+      for (const r of results) expect(r.code, r.err).toBe(0);
+      // Whatever a lock-loser queued, the flusher's post-release recheck pushed before it exited.
+      expect(listOutboxEntries(outboxDir)).toEqual([]);
+      expect(originRows(ctx).sort((a, b) => a - b)).toEqual(prs);
+      const third = cloneOf(ctx, 'third');
+      expect(readLedgerFromGit({ board: third, repo: REPO, log: quiet }).records.map((x) => x.pr).sort((a, b) => a - b)).toEqual(prs);
+    });
+  }, 60_000);
+
+  it('CRASH AFTER PUSH, BEFORE DELETE: the next flush pushes nothing and the row stays single', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const outboxDir = join(ctx.tmp, 'outbox');
+      // The crash: the process dies right after a successful push, before it removes the flushed entry.
+      const crash = () => { throw new Error('simulated crash after push'); };
+      expect(() => appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(7)], outbox: true, outboxDir, log: quiet, removeEntry: crash }))
+        .toThrow(/simulated crash/);
+      expect(originRows(ctx)).toEqual([7]);
+      expect(listOutboxEntries(outboxDir)).toHaveLength(1);
+      const commits = originCommits(ctx);
+      const pushes = [];
+      const run = (args, opts) => { if (args[0] === 'push') pushes.push(args); return realGit(args, opts); };
+      const f = flushLedgerOutbox({ board: ctx.clone, dir: outboxDir, run, log: quiet });
+      expect(f).toMatchObject({ ok: true, flushed: 1, pushed: false });
+      expect(pushes).toEqual([]);
+      expect(originRows(ctx)).toEqual([7]);
+      expect(originCommits(ctx)).toBe(commits);
+      expect(listOutboxEntries(outboxDir)).toEqual([]);
+    });
+  });
+
+  it('CI COLLISION: an off-host writer lands first, the push is rejected, refetched and retried on the new tip', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const ci = cloneOf(ctx, 'ci-runner');
+      const outboxDir = join(ctx.tmp, 'outbox');
+      let rivalDone = false;
+      let rejected = 0;
+      const run = (args, opts) => {
+        if (args[0] === 'push' && !rivalDone) {
+          rivalDone = true;
+          // The CI applier's own (direct, non-outbox) append lands between our fetch and our push.
+          appendLedgerRows({ board: ci, repo: REPO, records: [row(100)], outbox: false, sleep: noSleep });
+        }
+        try { return realGit(args, opts); } catch (e) { if (args[0] === 'push') rejected += 1; throw e; }
+      };
+      const retries = [];
+      const logs = [];
+      const r = appendLedgerRows({
+        board: ctx.clone, repo: REPO, records: [row(200)], outbox: true, outboxDir, gitRun: run, sleep: noSleep,
+        onRetry: (x) => retries.push(x), log: (l) => logs.push(l),
+      });
+      expect(rejected).toBe(1);
+      expect(retries).toHaveLength(1);
+      expect(String(retries[0].error.message)).toMatch(/\[rejected\]/);
+      expect(r).toMatchObject({ status: 'appended', rows: 1, attempts: 2 });
+      expect(originRows(ctx).sort((a, b) => a - b)).toEqual([100, 200]);
+    });
+  });
+
+  it('a held flusher lock QUEUES the rows (durable) and returns; the holder flushes them later', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const outboxDir = join(ctx.tmp, 'outbox');
+      const lockRoot = outboxLockRoot(outboxDir);
+      mkdirSync(lockRoot, { recursive: true });
+      const now = Date.now();
+      // A LIVE holder: this very process's pid, a different owner string, a fresh heartbeat.
+      expect(reserve(lockRoot, OUTBOX_LOCK_PATH, 'someone-else', now, new Date(now).toISOString(), process.pid).ok).toBe(true);
+      const pushes = [];
+      const run = (args, opts) => { if (args[0] === 'push') pushes.push(args); return realGit(args, opts); };
+      const r = appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(3)], outbox: true, outboxDir, gitRun: run, log: quiet });
+      expect(r).toMatchObject({ status: 'appended', queued: true, rows: 1 });
+      expect(pushes).toEqual([]);
+      expect(listOutboxEntries(outboxDir)).toHaveLength(1);
+      // The holder (here: released, then the backstop) flushes what was queued.
+      execFileSync('rm', ['-rf', lockRoot]);
+      expect(flushLedgerOutbox({ board: ctx.clone, dir: outboxDir, log: quiet })).toMatchObject({ ok: true, flushed: 1, pushed: true });
+      expect(originRows(ctx)).toEqual([3]);
+    });
+  });
+
+  it('a STALE outbox behind a held lock surfaces as a write miss and does not enqueue', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const outboxDir = join(ctx.tmp, 'outbox');
+      const lockRoot = outboxLockRoot(outboxDir);
+      mkdirSync(lockRoot, { recursive: true });
+      const now = Date.now();
+      expect(reserve(lockRoot, OUTBOX_LOCK_PATH, 'wedged', now, new Date(now).toISOString(), process.pid).ok).toBe(true);
+      // An entry left by a writer 20 minutes ago that nobody has managed to flush.
+      appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(4)], outbox: true, outboxDir, log: quiet, now: () => now - 20 * 60_000 });
+      expect(listOutboxEntries(outboxDir)).toHaveLength(1);
+      const logs = [];
+      expect(() => appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(5)], outbox: true, outboxDir, log: (l) => logs.push(l), env: {} }))
+        .toThrow(LedgerAppendExhaustedError);
+      expect(logs.join('\n')).toMatch(/ledger-write-miss: verdict-ledger outbox .* oldest/);
+      expect(listOutboxEntries(outboxDir)).toHaveLength(1);
+    });
+  });
+
+  it('an unreachable transport: the flusher withdraws its OWN entry and throws loudly (thrown means not recorded)', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      git(['remote', 'set-url', 'origin', join(ctx.tmp, 'does-not-exist.git')], { cwd: ctx.clone });
+      const outboxDir = join(ctx.tmp, 'outbox');
+      expect(() => appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(1)], outbox: true, outboxDir, log: quiet, sleep: noSleep }))
+        .toThrow(LedgerAppendExhaustedError);
+      expect(listOutboxEntries(outboxDir)).toEqual([]);
+    });
+  });
+
+  it('a dead holder\'s lock is reclaimed at once (pid fast path), and its queued rows are pushed', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const outboxDir = join(ctx.tmp, 'outbox');
+      const lockRoot = outboxLockRoot(outboxDir);
+      mkdirSync(join(lockRoot), { recursive: true });
+      const dead = spawn(process.execPath, ['-e', '0']);
+      await new Promise((d) => dead.on('close', d));
+      const now = Date.now();
+      expect(reserve(lockRoot, OUTBOX_LOCK_PATH, 'dead-writer', now, new Date(now).toISOString(), dead.pid).ok).toBe(true);
+      const r = appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(9)], outbox: true, outboxDir, log: quiet });
+      expect(r).toMatchObject({ status: 'appended', queued: false, rows: 1 });
+      expect(originRows(ctx)).toEqual([9]);
+      expect(readdirSync(lockRoot)).toEqual([]);
+      void makeLockEntry;
+    });
+  });
+
+  it('the outbox lives under the host-shared workspace .operations, not inside the clone', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const r = appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(1)], outbox: true, log: quiet, env: {} });
+      expect(r.outboxDir.startsWith(join(ctx.tmp, '.operations', 'verdict-ledger-outbox'))).toBe(true);
+      expect(r.outboxDir.startsWith(ctx.clone)).toBe(false);
+      const overridden = appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(2)], outbox: true, log: quiet, env: { [OUTBOX_DIR_ENV]: join(ctx.tmp, 'o2') } });
+      expect(overridden.outboxDir).toBe(join(ctx.tmp, 'o2'));
+      expect(originRows(ctx)).toEqual([1, 2]);
+    });
+  });
+});
