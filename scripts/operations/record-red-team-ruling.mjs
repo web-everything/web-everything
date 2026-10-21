@@ -25,6 +25,8 @@
  *
  * WHAT IT REFUSES (every refusal is a thrown error naming why; nothing is posted):
  *   - an actor that is not a registered operator login, a blank `--reason`, a blank or multi-line `--channel`;
+ *   - a posting identity (`gh api user` under the operator channel) that is not a HUMAN operator login equal to `--actor`
+ *     (an App or bot, another login, or an unreadable identity), so the ruling is bound to who really posts it;
  *   - a PR with no red-team result on the LIVE head, or whose result was not parked at the round cap by a trusted
  *     gate record (`round-cap`), or that is already under `review:changes` (the fixer owns it);
  *   - a `--break` that names nothing, is ambiguous, is not CONFIRMED, or is not still held (already carded, ruled, or
@@ -35,7 +37,9 @@
  */
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
+import { createHash } from 'node:crypto';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
+import { assertHumanOperator, operatorBoundComments } from '../lib/operator-identity.mjs';
 import { GATE_OUTCOMES, liveResultGateState, readRedTeamDisposition } from '../lib/red-team-gate.mjs';
 import { sanitizeCardField } from '../lib/review-loop-policy.mjs';
 import { buildRedTeamCardInput, buildSendBackBody } from './red-team-gate-apply.mjs';
@@ -45,8 +49,17 @@ export const RED_TEAM_RULINGS = Object.freeze(['card', 'block', 'not-real']);
 export const RED_TEAM_RULING_CARD_EFFECT = 'github.red-team-ruling-card';
 export const RED_TEAM_RULING_BLOCK_EFFECT = 'github.red-team-ruling-block';
 export const RED_TEAM_RULING_NOT_REAL_EFFECT = 'github.red-team-ruling-not-real';
-/** The gate-record outcome for an operator's `not-real` ruling (the per-finding line, not the outcome, releases the hold). */
+/** The gate-record outcomes for an operator's `not-real` / `card` ruling (the per-finding line releases the hold; the
+ *  `operator-` outcome is what lets a reader accept the record only from a human operator account). */
 export const OPERATOR_NOT_REAL_OUTCOME = 'operator-not-real';
+export const OPERATOR_CARD_OUTCOME = 'operator-card';
+/** The bare intent marker written BEFORE the card job is spawned: it has no action line, so the break stays held. */
+export const CARD_PENDING_OUTCOME = 'card-pending';
+
+/** The stable key one card ruling spawns under: same PR, head, result and breaks always map to the same job. PURE. */
+export function cardJobKey({ repo, pr, head, resultId, indices }) {
+  return createHash('sha256').update(JSON.stringify(['v1', repo, Number(pr), head, resultId, [...indices].sort((a, b) => a - b)])).digest('hex').slice(0, 12);
+}
 
 const labelNames = (labels) => (Array.isArray(labels) ? labels : []).map((l) => (typeof l === 'string' ? l : l?.name));
 const where = (f) => `${f.file ?? '(no file cited)'}${f.line ? `:${f.line}` : ''}`;
@@ -95,9 +108,12 @@ export function planRedTeamRuling(read, input) {
   }
   if (!String(reason ?? '').trim()) throw new Error("--reason is required: the operator's words, verbatim");
   if (!String(channel ?? '').trim() || /[\r\n]/.test(channel)) throw new Error('--channel is required and must be one line');
+  // Bind to who actually posts: the authenticated gh identity must be a human operator and equal --actor.
+  assertHumanOperator(read.identity, actor);
   const head = String(read.head ?? '').toLowerCase();
   if (!/^[0-9a-f]{40}$/.test(head)) throw new Error('the PR head could not be read; nothing to rule on');
-  const state = liveResultGateState(read.comments, pr, head);
+  const comments = operatorBoundComments(read.comments);
+  const state = liveResultGateState(comments, pr, head);
   if (!state.result) throw new Error(`no red-team result on the live head ${head.slice(0, 9)} — nothing to rule on`);
   if (!state.outcomes.has(GATE_OUTCOMES.ROUND_CAP)) {
     throw new Error(`the red-team result on head ${head.slice(0, 9)} was not parked at the round cap (no trusted \`round-cap\` gate record decides it); `
@@ -106,7 +122,7 @@ export function planRedTeamRuling(read, input) {
   if (labelNames(read.labels).includes('review:changes')) {
     throw new Error('the PR is under review:changes: the fixer owns the breaks, so there is nothing for the operator to rule on');
   }
-  const disposition = readRedTeamDisposition({ comments: read.comments, pr, head, setting: read.setting });
+  const disposition = readRedTeamDisposition({ comments, pr, head, setting: read.setting });
   const held = disposition.held;
   if (!held.length) throw new Error('no red-team break is held for the operator on the live head (already carded, ruled or cleared)');
   const selected = selectBreaks(held, input.break);
@@ -118,7 +134,8 @@ export function planRedTeamRuling(read, input) {
   if (ruling === 'card') {
     const cardInput = buildRedTeamCardInput({ repo: input.repo, pr, head, findings: selected });
     cardInput.digest += `\n\nOperator ruling (${base.actor} via ${base.channel}): carded at the round cap. Reason: ${sanitizeCardField(reason, 600)}`;
-    return { ...base, effect: RED_TEAM_RULING_CARD_EFFECT, cardInput };
+    const jobKey = cardJobKey(base);
+    return { ...base, effect: RED_TEAM_RULING_CARD_EFFECT, cardInput, jobKey, session: `red-team-ruling-card-${jobKey}` };
   }
   if (ruling === 'block') {
     const body = `${buildSendBackBody({ pr, head, findings: selected })}\n\nOperator ruling: block (${base.actor} via ${base.channel}). Reason: ${sanitizeCardField(reason, 600)}`;
@@ -162,7 +179,7 @@ export function recordRedTeamRulingOperation({ readRulingContext } = {}) {
           repo: view.verdict.repo, pr: view.verdict.pr, head: view.verdict.head, ruling: view.verdict.ruling,
           actor: view.verdict.actor, channel: view.verdict.channel, reason: view.verdict.reason, at: view.verdict.at,
           resultId: view.verdict.resultId, findings: view.verdict.findings, indices: view.verdict.indices,
-          setting: view.verdict.setting, cardInput: view.verdict.cardInput, sendBackBody: view.verdict.sendBackBody,
+          setting: view.verdict.setting, cardInput: view.verdict.cardInput, jobKey: view.verdict.jobKey, session: view.verdict.session, sendBackBody: view.verdict.sendBackBody,
         },
       }]),
     }),

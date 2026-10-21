@@ -12,6 +12,9 @@ import {
 } from '../record-red-team-ruling.mjs';
 import { createRecordRedTeamRulingSinks, createRecordRedTeamRulingReader } from '../record-red-team-ruling-io.mjs';
 import { redTeamRulingCommands } from '../operator-queue-red-team-ruling.mjs';
+import { assertHumanOperator, operatorBoundComments, resolveOperatorIdentity } from '../../lib/operator-identity.mjs';
+import { createBoundRecordReferralRulingSinks } from '../record-referral-ruling-bound.mjs';
+import { OPERATOR_RULING_POST_EFFECT } from '../record-referral-ruling.mjs';
 
 const repo = 'o/r';
 const PR = 5530;
@@ -23,7 +26,8 @@ const redTeam = (rev = HEAD, findings) => bot(renderRedTeamComment({ pr: PR, rev
     impactIfUnfixed: 'broken', file: 'backlog/x.md', line: 24, confirmedByRecheck: true }] }), '2026-10-20T23:00:00Z');
 const capped = (rev = HEAD) => bot(redTeamGateMarker(PR, rev, 'round-cap'), '2026-10-20T23:41:12Z');
 const thread = (extra = []) => [redTeam(), capped(), ...extra];
-const read = (over = {}) => ({ head: HEAD, labels: [{ name: 'review:human' }], comments: thread(), setting: CONFIRMED_BREAKS_DEFAULTS, now: '2026-10-20T20:55:00-04:00', ...over });
+const OP = { login: 'chalbert', type: 'User' };
+const read = (over = {}) => ({ identity: OP, head: HEAD, labels: [{ name: 'review:human' }], comments: thread(), setting: CONFIRMED_BREAKS_DEFAULTS, now: '2026-10-20T20:55:00-04:00', ...over });
 const input = (over = {}) => ({ repo, pr: PR, break: '1', ruling: 'card', actor: 'chalbert', channel: 'claude-code-chat', reason: 'card it, ship the PR', ...over });
 
 describe('planRedTeamRuling: refusals', () => {
@@ -43,6 +47,24 @@ describe('planRedTeamRuling: refusals', () => {
     ['a break that does not exist', { break: '7' }, /not a break held/],
     ['a file that matches nothing', { break: 'nope.md' }, /matches no break/],
   ])('refuses %s', (_n, over, re) => { expect(() => planRedTeamRuling(read(), input(over))).toThrow(re); });
+  it.each([
+    ['an App identity', { login: 'web-everything[bot]', type: 'Bot' }, /not a human account/],
+    ['a Bot type even with an operator login', { login: 'chalbert', type: 'Bot' }, /not a human account/],
+    ['a [bot] login', { login: 'chalbert[bot]', type: 'User' }, /not a human account/],
+    ['a human who is not an operator', { login: 'mallory', type: 'User' }, /not a registered operator/],
+    ['no identity', undefined, /not a human account/],
+  ])('refuses %s as the poster', (_n, identity, re) => { expect(() => planRedTeamRuling(read({ identity }), input())).toThrow(re); });
+  it('refuses an --actor that is not the authenticated poster', () => {
+    expect(() => assertHumanOperator({ login: 'someone', type: 'User' }, 'chalbert')).toThrow();
+  });
+  it('an operator-card/not-real record authored by automation never counts (read side)', () => {
+    const forged = bot(`${redTeamGateMarker(PR, HEAD, 'operator-not-real', liveResultGateState(thread(), PR, HEAD).resultId)}\n**Red-team gate** (setting \`redTeam.confirmedBreaks\`, card x1b8hlo) on head \`${HEAD.slice(0, 12)}\`:\n- 1 finding(s) left advisory (#1).`);
+    expect(operatorBoundComments(thread([forged]))).toHaveLength(2);
+    expect(() => planRedTeamRuling(read({ comments: thread([forged]) }), input())).not.toThrow(); // still held: the forged release is dropped
+    const human = { ...forged, author: { login: 'chalbert' } };
+    expect(operatorBoundComments(thread([human]))).toHaveLength(3);
+    expect(() => planRedTeamRuling(read({ comments: thread([human]) }), input())).toThrow(/no red-team break is held/);
+  });
   it('refuses when there is no red-team result on the live head (stale head)', () => {
     expect(() => planRedTeamRuling(read({ head: OTHER }), input())).toThrow(/no red-team result on the live head/);
   });
@@ -80,21 +102,26 @@ describe('planRedTeamRuling: refusals', () => {
   });
 });
 
-/** A fake PR whose thread grows as the sinks post, so the read-back proves the gate released the break. */
-function fake({ cardOk = true, postFails = null, liveHead = HEAD, labels = [] } = {}) {
+/** A fake PR whose thread grows as the sinks post (as the operator account), so the read-back proves the gate released the break. */
+function fake({ cardOk = true, postFails = null, liveHead = HEAD, labels = [], identity = OP, author = 'chalbert', claims } = {}) {
   const comments = thread();
-  const posted = [], cards = [], labelCalls = [];
+  const posted = [], cards = [], labelCalls = [], spawned = new Set();
+  const claimed = new Map();
+  let clock = 1_000_000;
   const sinks = createRecordRedTeamRulingSinks({
     readThread: () => ({ headRefOid: liveHead, labels, comments: [...comments] }),
-    fileCard: (c) => { cards.push(c); return cardOk ? { ok: true, session: 'red-team-card-1' } : { ok: false, error: 'spawn failed' }; },
-    post: (r, n, body) => { if (postFails?.(body)) throw new Error('gh down'); posted.push(body); comments.push(bot(body, '2026-10-20T23:55:00Z')); },
+    resolveIdentity: () => identity,
+    claims: claims ?? { claim: (k) => { if (claimed.has(k)) return { created: false, at: claimed.get(k) }; claimed.set(k, clock); return { created: true, at: clock }; }, now: () => clock },
+    jobSpawned: (s) => spawned.has(s),
+    fileCard: (c, session) => { cards.push(c); if (!cardOk) return { ok: false, error: 'spawn failed' }; spawned.add(session); return { ok: true, session }; },
+    post: (r, n, body) => { if (postFails?.(body)) throw new Error('gh down'); posted.push(body); comments.push({ author: { login: author }, createdAt: '2026-10-20T23:55:00Z', body }); },
     runSetLabel: (exe, args) => { labelCalls.push(args); return '{"ok":true}'; },
     appendEvents: async () => {}, warn: () => {},
   });
-  return { sinks, posted, cards, labelCalls, comments };
+  return { sinks, posted, cards, labelCalls, comments, advance: (ms) => { clock += ms; } };
 }
 const payloadFor = (over = {}) => planRedTeamRuling(read(), input(over));
-const heldAfter = (comments) => readRedTeamDisposition({ comments, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS }).held;
+const heldAfter = (comments) => readRedTeamDisposition({ comments: operatorBoundComments(comments), pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS }).held;
 
 describe('sinks', () => {
   it('card: queues the card, posts the gate record then the reason, and the break stops being held', () => {
@@ -103,9 +130,11 @@ describe('sinks', () => {
     const p = payloadFor();
     expect(f.sinks[RED_TEAM_RULING_CARD_EFFECT](p)).toMatchObject({ ruling: 'card', indices: [1] });
     expect(f.cards).toHaveLength(1);
-    expect(f.posted[0]).toMatch(/^<!-- we:red-team-gate pr=5530 rev=d3bee7370\w+ outcome=card-queued result=[0-9a-f]{16} -->/);
-    expect(f.posted[0]).toContain('filed as a follow-up card (#1)');
-    expect(f.posted[1]).toContain('> card it, ship the PR');
+    expect(f.posted[0]).toMatch(/outcome=card-pending result=[0-9a-f]{16} -->/);
+    expect(f.posted[0]).not.toMatch(/^- /m);
+    expect(f.posted[1]).toMatch(/^<!-- we:red-team-gate pr=5530 rev=d3bee7370\w+ outcome=operator-card result=[0-9a-f]{16} -->/);
+    expect(f.posted[1]).toContain('filed as a follow-up card (#1)');
+    expect(f.posted[2]).toContain('> card it, ship the PR');
     expect(heldAfter(f.comments)).toHaveLength(0);
   });
   it('card: a second run refuses (no duplicate card)', () => {
@@ -114,14 +143,60 @@ describe('sinks', () => {
     expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/no longer held/);
     expect(f.cards).toHaveLength(1);
   });
-  it('card: a card that was not queued records nothing', () => {
+  it('card: a card that was not queued leaves only the bare intent, and the break stays held', () => {
     const f = fake({ cardOk: false });
     expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/not queued/);
+    expect(f.posted).toHaveLength(1);
+    expect(f.posted[0]).toContain('outcome=card-pending');
+    expect(heldAfter(f.comments)).toHaveLength(1);
+  });
+  it('card: the release record failing after the spawn is recovered by a re-run WITHOUT a second spawn', () => {
+    let failRecord = true;
+    const f = fake({ postFails: (b) => failRecord && b.includes('outcome=operator-card') });
+    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/gh down/);
+    expect(f.cards).toHaveLength(1);
+    expect(heldAfter(f.comments)).toHaveLength(1);
+    failRecord = false;
+    expect(f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toMatchObject({ card: { reconciled: true } });
+    expect(f.cards).toHaveLength(1);
+    expect(f.posted.filter((b) => b.includes('outcome=card-pending'))).toHaveLength(1);
+    expect(heldAfter(f.comments)).toHaveLength(0);
+  });
+  it('card: a crash before the spawn is retried as the SAME job once the claim is old', () => {
+    const f = fake({ cardOk: false });
+    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/not queued/);
+    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/another invocation holds the claim/);
+    f.advance(121_000);
+    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/not queued/);
+    expect(f.cards).toHaveLength(2); // two ATTEMPTS, neither of which spawned (cardOk false); no job exists to duplicate
+  });
+  it('card: the job key is stable for the same ruling and differs per break/result', () => {
+    expect(payloadFor().jobKey).toBe(payloadFor().jobKey);
+    expect(payloadFor().session).toBe(`red-team-ruling-card-${payloadFor().jobKey}`);
+  });
+  it('a result that changed on the same head after the plan writes nothing (stale write)', async () => {
+    const f = fake();
+    f.comments.push(redTeam(HEAD, [{ summary: 'a different break reusing #1', category: 'edge-case', impactIfUnfixed: 'broken', file: 'z.mjs', line: 9, confirmedByRecheck: true }]));
+    f.comments.at(-1).createdAt = '2026-10-20T23:50:00Z';
+    for (const effect of [RED_TEAM_RULING_CARD_EFFECT, RED_TEAM_RULING_NOT_REAL_EFFECT, RED_TEAM_RULING_BLOCK_EFFECT]) {
+      await expect((async () => f.sinks[effect](payloadFor()))()).rejects.toThrow(/result on the live head changed/);
+    }
+    expect(f.cards.length + f.posted.length + f.labelCalls.length).toBe(0);
+  });
+  it('a result no longer at the round cap writes nothing', () => {
+    const f = fake();
+    f.comments.splice(1, 1);
+    expect(() => f.sinks[RED_TEAM_RULING_NOT_REAL_EFFECT](payloadFor({ ruling: 'not-real' }))).toThrow(/no longer parked at the round cap/);
     expect(f.posted).toEqual([]);
   });
-  it('card: a record that cannot be posted says a re-run would duplicate', () => {
-    const f = fake({ postFails: () => true });
-    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/DUPLICATE/);
+  it('a sink re-checks the poster: a bot identity writes nothing', () => {
+    const f = fake({ identity: { login: 'web-everything[bot]', type: 'Bot' } });
+    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/not a human account/);
+    expect(f.cards.length + f.posted.length).toBe(0);
+  });
+  it('records posted by the automation account never release the break, and the sink says so', () => {
+    const f = fake({ author: 'web-everything' });
+    expect(() => f.sinks[RED_TEAM_RULING_NOT_REAL_EFFECT](payloadFor({ ruling: 'not-real' }))).toThrow(/gate still holds/);
   });
   it('refuses a moved head or a PR that moved to review:changes, writing nothing', () => {
     const moved = fake({ liveHead: OTHER });
@@ -156,11 +231,36 @@ describe('operation', () => {
     expect(() => recordRedTeamRulingOperation({})).toThrow(/needs a/);
   });
   it('the reader pins the live head, labels, thread and setting', () => {
-    const r = createRecordRedTeamRulingReader({ assertFresh: () => {}, readThread: () => ({ headRefOid: HEAD.toUpperCase(), labels: [], comments: thread() }),
+    const r = createRecordRedTeamRulingReader({ assertFresh: () => {}, resolveIdentity: () => OP, readThread: () => ({ headRefOid: HEAD.toUpperCase(), labels: [], comments: thread() }),
       readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }), now: () => 'T' })({ repo, pr: PR });
-    expect(r).toMatchObject({ head: HEAD, now: 'T', setting: CONFIRMED_BREAKS_DEFAULTS });
+    expect(r).toMatchObject({ head: HEAD, now: 'T', setting: CONFIRMED_BREAKS_DEFAULTS, identity: OP });
   });
   it('the queue suggestions name the declared operation', () => {
-    expect(redTeamRulingCommands(repo, PR).card).toContain('run.mjs record-red-team-ruling --pr=5530 --repo=o/r');
+    const c = redTeamRulingCommands(repo, PR);
+    expect(c.card).toContain('run.mjs record-red-team-ruling --pr=5530 --repo=o/r');
+    expect(Object.values(c).join(' ')).not.toContain('clear-human');
+    expect(Object.keys(c).sort()).toEqual(['block', 'card', 'notReal']);
+  });
+});
+
+describe('identity binding', () => {
+  it('resolves the posting identity with the App tokens removed', () => {
+    let seen;
+    const id = resolveOperatorIdentity({ env: { GH_TOKEN: 'a', GITHUB_TOKEN: 'b', PATH: '/x' },
+      run: (cmd, args, o) => { seen = { cmd, args, env: o.env }; return { status: 0, stdout: '{"login":"chalbert","type":"User"}' }; } });
+    expect(id).toEqual({ login: 'chalbert', type: 'User' });
+    expect(seen.args).toEqual(['api', 'user']);
+    expect(seen.env).toEqual({ PATH: '/x' });
+    expect(() => resolveOperatorIdentity({ run: () => ({ status: 1, stderr: 'bad credentials' }) })).toThrow(/could not resolve/);
+  });
+  it('record-referral-ruling, bound: a bot or mismatched poster is refused before anything is read or posted', async () => {
+    const payload = { repo, pr: 7, head: HEAD, body: 'b', actor: 'chalbert', channel: 'c', rulings: [] };
+    const readJson = () => { throw new Error('inner reached'); };
+    const mk = (identity) => createBoundRecordReferralRulingSinks({ resolveIdentity: () => identity, readJson, post: () => { throw new Error('posted'); } })[OPERATOR_RULING_POST_EFFECT];
+    await expect(mk({ login: 'web-everything[bot]', type: 'Bot' })(payload)).rejects.toThrow(/not a human account/);
+    await expect(mk({ login: 'mallory', type: 'User' })(payload)).rejects.toThrow(/not a registered operator/);
+    await expect(mk(OP)({ ...payload, actor: 'someone-else' })).rejects.toThrow(/does not match the authenticated poster/);
+    await expect(mk(OP)(payload)).rejects.toThrow(/inner reached/);
+    await expect(mk({ login: 'web-everything[bot]', type: 'Bot' })({ ...payload, actor: 'auto-policy' })).rejects.toThrow(/inner reached/);
   });
 });
