@@ -1,6 +1,5 @@
 ---
 bornAs: xchfioc
-size: 13
 kind: task
 status: open
 scope: ["we:scripts/lib/daemon-overlay-proofs.mjs", "we:scripts/lib/__tests__/daemon-overlay-proofs.test.mjs", "we:scripts/daemon-overlay.mjs", "we:scripts/__tests__/daemon-overlay.test.mjs", "we:scripts/lib/daemon-load-overlay.mjs", "we:scripts/lib/__tests__/daemon-load-overlay.test.mjs", "we:scripts/lib/daemon-rebuild/plan.mjs", "we:scripts/lib/daemon-rebuild/prepare.mjs", "we:scripts/lib/daemon-rebuild/adopt.mjs", "we:scripts/lib/__tests__/daemon-rebuild.test.mjs", "we:scripts/lib/daemon-self-sync.mjs", "we:scripts/lib/daemon-version-runtime.mjs", "we:scripts/worker-brief.mjs", "we:scripts/__tests__/worker-brief.test.mjs"]

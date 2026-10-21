@@ -1,6 +1,5 @@
 ---
 bornAs: xnornk1
-size: 3
 kind: task
 status: open
 scope: ["we:scripts/lib/build-self-review.mjs", "we:scripts/lib/__tests__/build-self-review.test.mjs"]

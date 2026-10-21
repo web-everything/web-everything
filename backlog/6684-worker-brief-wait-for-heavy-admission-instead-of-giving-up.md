@@ -1,6 +1,5 @@
 ---
 bornAs: xttbqyt
-size: 3
 kind: task
 status: open
 scope: ["we:scripts/worker-brief.mjs", "we:scripts/__tests__/worker-brief.test.mjs", "we:scripts/readiness/__tests__/heavy-admission.test.mjs"]
