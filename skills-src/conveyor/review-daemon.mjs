@@ -1144,7 +1144,8 @@ export function priorityNamesForLiveProcessPrs(liveProcessPrs) {
  * Command-only lines are accepted conservatively: without ancestry every matching process is a round.
  * @param {string[]} lines
  * @param {{isScriptFile?: function(string): boolean}} options Optional absolute-path classifier. Ambiguous
- *   or unreadable candidates throw; the live budget holds dispatch. Relative argv uses lexical conventions.
+ *   or unreadable candidates throw; the live budget holds dispatch. Relative suffix boundaries remain
+ *   uncertain when multiple paths fit the flattened argv; uncertainty must not classify a review as absent.
  *   isOptionPath additionally recognizes directories used as runtime option values.
  */
 export function countLiveReviewRounds(lines, { isScriptFile = null, isOptionPath = isScriptFile, countedJobPids = null } = {}) {
@@ -1238,8 +1239,9 @@ export function countLiveReviewRounds(lines, { isScriptFile = null, isOptionPath
       const lexicalCandidates = candidates.filter(candidate => candidate.length <= span.length);
       if (!resolved && lexicalCandidates.length !== 1) throw new Error('ambiguous script path in process listing');
     }
-    // Relative paths belong to the other process's cwd. Preserve the first complete script convention
-    // (including relative preload values), but never turn an ambiguous extensionless entrypoint into zero.
+    // Relative paths belong to the other process's cwd. A suffix can end either an argument or a
+    // directory fragment (./Review.mjs Work/review-loop-cli.mjs). Preserve that uncertainty through
+    // preload parsing too: treating ./Boot.json as complete can hide the real entrypoint behind boot.cjs.
     if (!first.value.includes('/') && !new RegExp(`${extension}$`).test(first.value)) {
       if (isScriptFile && mentionsReview) throw new Error('ambiguous script path in process listing');
       return first;
@@ -1248,7 +1250,10 @@ export function countLiveReviewRounds(lines, { isScriptFile = null, isOptionPath
     // in the lexical fallback; an existing absolute path above takes precedence over that convention.
     const match = new RegExp(`^(.*?${extension})(?=\\s|$)`).exec(span);
     const value = resolved ?? match?.[1] ?? first.value;
-    return { value, rest: text.slice(value.length).trimStart() };
+    // Include candidates beyond lexical option/root boundaries: '-Work', '--files=Work', and './Work'
+    // can all be directory fragments after the space. Only filesystem resolution can rule them out.
+    const ambiguous = !first.value.startsWith('/') && mentionsReview && candidates.length > 1;
+    return { value, rest: text.slice(value.length).trimStart(), ambiguous };
   };
   const optionValue = (text, flag) => {
     const first = word(text);
@@ -1292,20 +1297,27 @@ export function countLiveReviewRounds(lines, { isScriptFile = null, isOptionPath
       }
       return name;
     };
+    const finishPath = (text) => {
+      const entry = path(text);
+      ambiguousValue ||= Boolean(entry.ambiguous);
+      return finish(entry.value.split('/').pop());
+    };
     while (rest) {
       const t = word(rest);
       const flag = t.value.replaceAll('_', '-');
-      if (t.value === '--') return finish(path(t.rest).value.split('/').pop());
+      if (t.value === '--') return finishPath(t.rest);
       // Evaluation modes never execute a script from the remaining argv.
       if (/^(?:-[ep]|--(?:eval|print)(?:=|$))/.test(t.value)) return finish('');
       const equals = rest.indexOf('=');
       if (equals > 0 && PRELOAD_FLAGS.has(rest.slice(0, equals).replaceAll('_', '-'))) {
-        rest = path(rest.slice(equals + 1), { preload: true }).rest;
+        const value = path(rest.slice(equals + 1), { preload: true });
+        ambiguousValue ||= Boolean(value.ambiguous);
+        rest = value.rest;
         continue;
       }
       if (VALUE_FLAGS.has(flag)) {
         const value = PRELOAD_FLAGS.has(flag)
-          ? (/^(?:\/|\.{1,2}\/)/.test(t.rest) ? path(t.rest, { preload: true }) : word(t.rest))
+          ? path(t.rest, { preload: true })
           : optionValue(t.rest, flag);
         ambiguousValue ||= Boolean(value.ambiguous);
         rest = value.rest;
@@ -1325,13 +1337,13 @@ export function countLiveReviewRounds(lines, { isScriptFile = null, isOptionPath
         rest = t.rest;
         continue;
       }
-      return finish(path(rest).value.split('/').pop());
+      return finishPath(rest);
     }
     return finish('');
   };
   const processes = lines.map((line) => {
     const text = String(line).trim();
-    const ids = /^(\d+)\s+(\d+)\s+(.+)$/.exec(text);
+    const ids = /^(\d+)\s+(\d+)\s+([\s\S]+)$/.exec(text);
     return { pid: ids?.[1], ppid: ids?.[2], name: script(ids ? ids[3] : text) };
   });
   const byPid = new Map(processes.filter(p => p.pid).map(p => [p.pid, p]));

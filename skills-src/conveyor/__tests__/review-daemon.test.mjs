@@ -65,6 +65,46 @@ const reviewStatusCalls = (calls) => calls.filter((c) => !(String(c.spec?.add ??
   || (!c.spec?.add && (c.spec?.remove ?? []).length && c.spec.remove.every((r) => r.startsWith('status:')))));
 
 describe('live review cap with Node configuration options', () => {
+  it.each([
+    './Review.mjs Work/scripts/operations/review-loop-cli.mjs',
+    '../Review.cjs Work/scripts/operations/review-job.mjs',
+    'Review.js Work/scripts/operations/review-loop-cli.mjs',
+    './Review.mjs\tWork/scripts/operations/review-loop-cli.mjs',
+    './Review.mjs\rWork/scripts/operations/review-loop-cli.mjs',
+    './Review.mjs\u2028Work/scripts/operations/review-loop-cli.mjs',
+    './Review.mjs\u2029Work/scripts/operations/review-loop-cli.mjs',
+    './Review.mjs Wörk/scripts/operations/review-loop-cli.mjs',
+    './Review.mjs -Work/scripts/operations/review-loop-cli.mjs',
+    './Review.mjs --files=Work/scripts/operations/review-loop-cli.mjs',
+    './Review.mjs ./Work/scripts/operations/review-loop-cli.mjs',
+    './Review.mjs ../Work/scripts/operations/review-loop-cli.mjs',
+    '-r ./Boot.json Work/boot.cjs scripts/operations/review-loop-cli.mjs',
+    '--require=../Boot.node Work/boot.cjs scripts/operations/review-loop-cli.mjs',
+    '--import=./Boot.mjs Work/boot.mjs scripts/operations/review-loop-cli.mjs',
+    '-r ./Boot.json Work/boot.cjs -- scripts/operations/review-loop-cli.mjs',
+    '-r ./Boot.json Work/boot.cjs -r ./second.cjs scripts/operations/review-loop-cli.mjs',
+    '-r ./Boot.json -Work/boot.cjs scripts/operations/review-loop-cli.mjs',
+    '--require=./Boot.json ./Work/boot.cjs scripts/operations/review-loop-cli.mjs',
+    '-r Boot.json Work/boot.hook ./scripts/operations/review-loop-cli.mjs',
+    '--import Boot.mjs Work/boot.mjs ./scripts/operations/review-loop-cli.mjs',
+    './review-loop-cli.mjs Work/scripts/operations/review-job.mjs',
+    './review-job.mjs Work/scripts/operations/review-loop-cli.mjs',
+  ])('holds dispatch for flattened relative paths with extension-like directories: %s', async argv => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' },
+      listCommands: () => [1, 2, 3].map(pr => `${100 + pr} 1 node ${argv} --pr=${pr}`).join('\n') });
+    const leftBeforeTick = budget.left;
+    const dispatch = vi.fn(() => ({ agentId: 'unexpected-review' }));
+    const tick = runReviewTickAllRepos({ repos: ['review-cap-fixture/healthy'], liveReviewBudget: budget,
+      authGateOverride: () => ({ paused: false, reason: null }),
+      reconcile: () => ({ dispatch: [1, 2, 3].map(prNumber => ({ kind: 'review', prNumber })), refusals: [] }),
+      dispatch, holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+      acquirableLanes: () => 40 });
+    expect({ left: leftBeforeTick, dispatched: tick.dispatched.length, deferred: tick.deferredForCap })
+      .toEqual({ left: 0, dispatched: 0, deferred: 3 });
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
   it.each(['--openssl-config', '--icu-data-dir', '--redirect-warnings', '--diagnostic-dir'])
   ('skips the value of %s before locating the entrypoint', async flag => {
     const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
@@ -82,7 +122,7 @@ describe('live review cap with Node configuration options', () => {
         // a script-looking fragment inside the value. Explicit quotes can disambiguate either kind.
         const ambiguousOutput = ['--redirect-warnings', '--diagnostic-dir'].includes(flag) && !/["']/.test(option);
         expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' },
-          listCommands: () => `node ${option} scripts/verify-lane.mjs scripts/operations/review-loop-cli.mjs` }),
+          listCommands: () => `node ${option} ${join(process.cwd(), 'scripts/verify-lane.mjs')} --files=scripts/operations/review-loop-cli.mjs` }),
         option).toMatchObject(ambiguousOutput ? { left: 0, reason: expect.stringContaining('unknown') } : { live: 0, left: 3 });
       }
     } finally { rmSync(root, { recursive: true, force: true }); }
@@ -104,7 +144,7 @@ describe('live review cap with Node configuration options', () => {
     const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
     for (const [entry, live] of [['scripts/operations/review-job.mjs', 1], ['scripts/verify-lane.mjs', 0]]) {
       expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' },
-        listCommands: () => `node ${option} ${entry} scripts/operations/review-loop-cli.mjs` }))
+        listCommands: () => `node ${option} ${join(process.cwd(), entry)} --files=scripts/operations/review-loop-cli.mjs` }))
         .toMatchObject({ live, left: 3 - live });
     }
   });
@@ -734,10 +774,14 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     expect(dispatch).not.toHaveBeenCalled();
   });
 
-  it.each(['-r ./package.json', '--require=./package.json'])('preloaded verifiers still exclude review script arguments: %s', async preload => {
+  it.each(['-r ./package.json', '--require=./package.json'])('holds ambiguous preloaded verifier listings: %s', async preload => {
     const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
     const command = `node ${preload} scripts/verify-lane.mjs scripts/operations/review-loop-cli.mjs`;
     expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () => command }))
+      .toMatchObject({ left: 0, reason: expect.stringContaining('unknown') });
+    // Explicit quoted argv still excludes a verifier's changed-file arguments.
+    expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' },
+      listCommands: () => `node ${preload.replace('./package.json', '"./package.json"')} -- "scripts/verify-lane.mjs" --files=scripts/operations/review-loop-cli.mjs` }))
       .toMatchObject({ live: 0, left: 3 });
   });
 
@@ -859,7 +903,7 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     ['review filenames in other scripts and runtime evaluation arguments', [
       'node /a/Review Work/verify-lane.mjs --files=/a/review-job.mjs',
       'node /a/verify-lane.mjs scripts/operations/review-job.mjs',
-      'node scripts/tool.mjs inspect scripts/operations/review-loop-cli.mjs',
+      'node "scripts/tool.mjs" inspect scripts/operations/review-loop-cli.mjs',
       'node --import /a/review-job.mjs /a/verify-lane.mjs',
       'node -e "text" /a/review-job.mjs', 'node --print "text" /a/review-loop-cli.mjs',
       'node -e0 /a/review-job.mjs', 'node -p0 /a/review-loop-cli.mjs',

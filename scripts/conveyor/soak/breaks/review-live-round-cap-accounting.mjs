@@ -21,6 +21,34 @@ export default {
     const root = process.env.SOAK_TREE_ROOT || fileURLToPath(new URL('../../../../', import.meta.url));
     const { runReviewTickAllRepos, liveReviewRoundBudget } = await import(pathToFileURL(join(root, SOURCE)).href);
     const violations = [];
+    // ps loses the argv boundary after an extension-like directory fragment. Exercise the budget
+    // through the all-repository tick so an undercount cannot silently admit three more rounds.
+    for (const argv of ['./Review.mjs Work/scripts/operations/review-loop-cli.mjs',
+      '../Review.cjs Work/scripts/operations/review-job.mjs',
+      'Review.js Work/scripts/operations/review-loop-cli.mjs',
+      './Review.mjs\rWork/scripts/operations/review-loop-cli.mjs',
+      './Review.mjs\u2028Work/scripts/operations/review-loop-cli.mjs',
+      './Review.mjs -Work/scripts/operations/review-loop-cli.mjs',
+      './Review.mjs --files=Work/scripts/operations/review-loop-cli.mjs',
+      './Review.mjs ./Work/scripts/operations/review-loop-cli.mjs',
+      '-r ./Boot.json Work/boot.cjs scripts/operations/review-loop-cli.mjs',
+      '--require=../Boot.node Work/boot.cjs scripts/operations/review-loop-cli.mjs',
+      '--import=./Boot.mjs Work/boot.mjs scripts/operations/review-loop-cli.mjs',
+      '-r ./Boot.json -Work/boot.cjs scripts/operations/review-loop-cli.mjs',
+      '-r Boot.json Work/boot.hook ./scripts/operations/review-loop-cli.mjs']) {
+      const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () =>
+        [1, 2, 3].map(pr => `${100 + pr} 1 node ${argv} --pr=${pr}`).join('\n') });
+      const held = runReviewTickAllRepos({
+        repos: [HEALTHY_REPO], liveReviewBudget: budget,
+        authGateOverride: () => ({ paused: false, reason: null }),
+        reconcile: () => ({ dispatch: [1, 2, 3].map(prNumber => ({ kind: 'review', prNumber })), refusals: [] }),
+        dispatch: () => ({ agentId: 'unexpected-review' }),
+        holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 40,
+      });
+      if (held.dispatched.length !== 0 || held.deferredForCap !== 3) {
+        violations.push(`flattened relative argv ${argv}: dispatched=${held.dispatched.length}, deferred=${held.deferredForCap}`);
+      }
+    }
     const independent = [
       'node /a/review-job.mjs run --pr=1',
       'node /a/review-job.mjs run --pr=2',
