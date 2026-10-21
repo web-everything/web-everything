@@ -13,12 +13,12 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this PR's latest advisory review named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/x5wqxb3-per-pr-review-run-identity-index-so-the-drain-s-red-team-evi.md:44` — Preparation review should diff the procedure steps against the invariants they must satisfy. The existing planned card 5360 does not cover procedure/invariant consistency, so it needs a review-lens note.
-2. `we:backlog/x0lckod-slice-3-retire-the-full-review-run-scan-to-a-missing-index-f.md:19` — Extend planned gate 5360 so that a retirement or replacement card must map every guarantee of the card it supersedes to a named case or an explicit drop.
-3. `we:backlog/xl3mmn5-slice-0-review-pr-run-identity-is-immutable-writerun-refuses.md:43` — The planned 5360 rule (per-guarantee file/case/assertion mapping) would catch it if it also checks that edge-case claims appear in the mapped assertion text.
-4. `we:backlog/x5wqxb3-per-pr-review-run-identity-index-so-the-drain-s-red-team-evi.md:119` — Preparation review lens: each stated lifecycle step must name the owning file in some slice's scope.
-5. `we:backlog/x0lckod-slice-3-retire-the-full-review-run-scan-to-a-missing-index-f.md:18` — Make 5360's `requires_omitted_setting_default_case` rule also require that a retirement or follow-on slice's regression list is a superset of its predecessor's named cases, or states an explicit exemption for each one dropped.
-6. `we:backlog/xukmjgl-slice-2-switch-the-red-team-evidence-reader-to-the-identity.md:30` — Add a preparation-review lens item: any 'requires operator ruling X' gate must name the exact artifact and reader, with a missing-artifact test case. Ideally a check:standards rule would catch a 'ruling'/'soak' precondition in Acceptance that has no artifact path.
+1. `we:backlog/6786-per-pr-review-run-identity-index-so-the-drain-s-red-team-evi.md:44` — Preparation review should diff the procedure steps against the invariants they must satisfy. The existing planned card 5360 does not cover procedure/invariant consistency, so it needs a review-lens note.
+2. `we:backlog/6790-slice-3-retire-the-full-review-run-scan-to-a-missing-index-f.md:19` — Extend planned gate 5360 so that a retirement or replacement card must map every guarantee of the card it supersedes to a named case or an explicit drop.
+3. `we:backlog/6787-slice-0-review-pr-run-identity-is-immutable-writerun-refuses.md:43` — The planned 5360 rule (per-guarantee file/case/assertion mapping) would catch it if it also checks that edge-case claims appear in the mapped assertion text.
+4. `we:backlog/6786-per-pr-review-run-identity-index-so-the-drain-s-red-team-evi.md:119` — Preparation review lens: each stated lifecycle step must name the owning file in some slice's scope.
+5. `we:backlog/6790-slice-3-retire-the-full-review-run-scan-to-a-missing-index-f.md:18` — Make 5360's `requires_omitted_setting_default_case` rule also require that a retirement or follow-on slice's regression list is a superset of its predecessor's named cases, or states an explicit exemption for each one dropped.
+6. `we:backlog/6789-slice-2-switch-the-red-team-evidence-reader-to-the-identity.md:30` — Add a preparation-review lens item: any 'requires operator ruling X' gate must name the exact artifact and reader, with a missing-artifact test case. Ideally a check:standards rule would catch a 'ruling'/'soak' precondition in Acceptance that has no artifact path.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5742@4b622bedb38d84e5735029c84d07d2637f7957ba
 
