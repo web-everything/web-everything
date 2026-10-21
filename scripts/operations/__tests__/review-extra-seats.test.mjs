@@ -5,7 +5,7 @@ import { readRoutingPolicy } from '../../lib/dispatch-routing-policy-io.mjs';
  * #4194 — ADDED NON-CLAUDE REVIEW SEATS: advisory lenses + one extra juror routed to Codex/Gemini through the
  * direct-task scripts, BESIDE Claude's mandatory seats. No real codex/agy/git/GitHub process: every effect is a fake.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -34,6 +34,12 @@ import {
   buildAgyPrompt, buildAgyDirectTaskArgv, runAgyDirectExec, parseFlags as parseAgyFlags,
 } from '../../gemini-direct-task.mjs';
 import { EventEmitter } from 'node:events';
+
+// Hermetic: the repo's own review.json pauses claim-accuracy (operator 2026-10-21); these tests assert the standard routing, so read no settings file.
+vi.mock('../../lib/review-seat-settings.mjs', async (orig) => {
+  const real = await orig();
+  return { ...real, resolveExtraSeatsPausedLenses: (o = {}) => real.resolveExtraSeatsPausedLenses({ ...o, file: '/nonexistent/review.json' }) };
+});
 
 const REPO = 'web-everything/web-everything';
 const NOW = Date.parse('2026-09-26T15:00:00Z');
@@ -965,5 +971,32 @@ describe('red-team replay resolves inflated GitHub file evidence', () => {
   it('explicit realFiles, including null, override view.files', () => {
     expect(replayPayload({ view, realFiles: ['backlog/123-card.md'] }).findings.read.netChangedFiles).toEqual(['backlog/123-card.md']);
     expect(replayPayload({ view, realFiles: null }).findings.read.netChangedFiles).toBeNull();
+  });
+});
+
+describe('review.extraSeats.pausedLenses — a paused lens gets no seat, no reservation, no row', () => {
+  it('reviewSeatRoutes drops the paused advisory lens and keeps the extra juror and the other lenses', () => {
+    const { routes, skipped } = reviewSeatRoutes({ pausedLenses: ['claim-accuracy'] });
+    expect(routes.map((r) => r.lens)).not.toContain('claim-accuracy');
+    expect(skipped.map((r) => r.lens)).not.toContain('claim-accuracy');
+    expect(routes.some((r) => r.seat === 'extra-juror')).toBe(true);
+    expect(routes.filter((r) => r.seat === 'advisory-lens')).toHaveLength(ROUTED_ADVISORY_LENSES.length - 1);
+  });
+
+  it('runExtraSeats logs the paused line, calls no claim-accuracy seat, writes no claim-accuracy row', async () => {
+    const { io, calls, rows } = fakeSeatIo();
+    const r = await runExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: LOOP_PAYLOAD, env: { WE_REVIEW_EXTRA_SEATS_PAUSED_LENSES: '["claim-accuracy"]' } }, io);
+    expect(r.status).toBe('ran');
+    expect(calls).toContainEqual(['log', 'extra-seats: lens claim-accuracy paused (env)']);
+    expect(rows.some((row) => JSON.stringify(row).includes('claim-accuracy'))).toBe(false);
+    expect(rows).toHaveLength(2);
+    expect(rows.some((row) => JSON.stringify(row).includes('correctness'))).toBe(true);
+  });
+
+  it('the repo settings file pauses claim-accuracy, and the standard is empty', async () => {
+    const real = await vi.importActual('../../lib/review-seat-settings.mjs');
+    expect(real.resolveExtraSeatsPausedLenses({ env: {} })).toEqual({ value: ['claim-accuracy'], source: 'setting' });
+    expect(real.resolveExtraSeatsPausedLenses({ env: {}, file: '/nonexistent' })).toEqual({ value: [], source: 'standard' });
+    expect(real.resolveExtraSeatsPausedLenses({ env: { WE_REVIEW_EXTRA_SEATS_PAUSED_LENSES: 'a, b' } }).value).toEqual(['a', 'b']);
   });
 });

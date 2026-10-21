@@ -65,7 +65,8 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { reviewSeatRoutes, reviewSeatKey, REVIEW_SEAT_MODELS } from './review-dispatch.mjs';
+import { reviewSeatRoutes, reviewSeatKey, REVIEW_SEAT_MODELS, ROUTED_ADVISORY_LENSES } from './review-dispatch.mjs';
+import { resolveExtraSeatsPausedLenses } from '../lib/review-seat-settings.mjs';
 import {
   REVIEW_SEAT_DISPATCH_KIND, REVIEW_SEAT_PROVIDERS, reviewSeatTaskType, selectReviewSeatProvider,
 } from '../lib/provider-routing.mjs';
@@ -519,6 +520,8 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
     if (!isPinnedRev(rev)) {
       return { status: 'skipped', reason: 'the review loop printed no pinned head commit (netBasis.rev) — the released lane\'s HEAD is not safe to review' };
     }
+    const paused = resolveExtraSeatsPausedLenses({ env });
+    for (const lens of ROUTED_ADVISORY_LENSES) if (paused.value.includes(lens)) io.log(`extra-seats: lens ${lens} paused (${paused.source})`);
     const now = io.now();
     let records = [];
     try { records = io.readRecords(); } catch (e) { io.log(`added seats: could not read the scorecard store (${e.message}) — treating it as empty`); }
@@ -548,7 +551,7 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
     }
     for (const u of unavailable) io.log(`added seats: skipping ${u.provider} — ${u.reason}`);
     const remainingCalls = (list) => list.reduce((sum, p) => sum + Math.max(0, caps[p] - usedByProvider[p]), 0);
-    let plan = reviewSeatRoutes({ available, scorecards: records, callsRemaining: remainingCalls(available), routingPolicy });
+    let plan = reviewSeatRoutes({ available, scorecards: records, callsRemaining: remainingCalls(available), routingPolicy, pausedLenses: paused.value });
 
     // RESERVE each distinct provider's ONE call under ITS OWN cap, before launching anything, so concurrent
     // reviews can never together overspend any one provider's budget. A provider that cannot be granted (another
@@ -576,7 +579,7 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
         if (reservation.callIds.length === reservation.models.length) { callIdOf.set(p, new Map(reservation.models.map((model, index) => [model, reservation.callIds[index]]))); } else { anyDenied = true; available = available.filter((x) => x !== p); }
       }
       if (!anyDenied) break;
-      plan = reviewSeatRoutes({ available, scorecards: records, callsRemaining: remainingCalls(available), routingPolicy });
+      plan = reviewSeatRoutes({ available, scorecards: records, callsRemaining: remainingCalls(available), routingPolicy, pausedLenses: paused.value });
     }
     const providerUsage = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p, { usedToday: usedByProvider[p] + (callIdOf.get(p)?.size ?? 0), cap: caps[p] }]));
     const totalUsedToday = Object.values(providerUsage).reduce((sum, u) => sum + u.usedToday, 0);

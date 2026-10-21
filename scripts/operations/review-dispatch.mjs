@@ -228,14 +228,15 @@ export function reviewSeatKey(seat) {
  * `callsRemaining` is the day's remaining non-Claude call budget. One provider is one call (its seats share a
  * prompt), so with 0 left every seat is skipped (`daily-cap`) and with 1 left every seat goes to the provider
  * the first seat picked.
- * @param {{available?: string[], scorecards?: Array<object>, callsRemaining?: number}} [o]
+ * `pausedLenses` (`review.extraSeats.pausedLenses`) drops those advisory lenses' seats: no route, no skip row.
+ * @param {{available?: string[], scorecards?: Array<object>, callsRemaining?: number, pausedLenses?: string[]}} [o]
  * @returns {{routes: Array<{seat:string, lens:string, key:string, provider:string, model:string, effort:string, reasoning:string}>,
  *   skipped: Array<{seat:string, lens:string, key:string, reason:string}>}}
  */
-export function reviewSeatRoutes({ available = REVIEW_SEAT_PROVIDERS, scorecards = [], callsRemaining = Infinity, routingPolicy = readRoutingPolicy() } = {}) {
+export function reviewSeatRoutes({ available = REVIEW_SEAT_PROVIDERS, scorecards = [], callsRemaining = Infinity, routingPolicy = readRoutingPolicy(), pausedLenses = [] } = {}) {
   const seats = [
     { seat: 'extra-juror', lens: EXTRA_JUROR_MANDATE },
-    ...ROUTED_ADVISORY_LENSES.map((lens) => ({ seat: 'advisory-lens', lens })),
+    ...ROUTED_ADVISORY_LENSES.filter((lens) => !pausedLenses.includes(lens)).map((lens) => ({ seat: 'advisory-lens', lens })),
   ].map((s) => ({ ...s, key: reviewSeatKey(s) }));
   const routes = [];
   const skipped = [];
