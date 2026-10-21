@@ -160,6 +160,10 @@ describe('planReconcile — the escalation path', () => {
     const settledNow = entry({ status: 'cleared', stopSettledAt: NOW });
     expect(planReconcile([settledNow], { clones: [], now: NOW, overrideFor: () => ({ ref: 'lane/x' }) })[0].escalate).toBe('conflict-override-used');
   });
+  it('round 6: a repaired entry whose stop only succeeded on the retry tick still escalates the overrun', () => {
+    const r = entry({ status: 'repaired', stopSettledAt: NOW, deadlineAt: NOW - MIN });
+    expect(planReconcile([r], { clones: [{ ...c, held: null }], now: NOW })[0]).toMatchObject({ status: 'cleared', escalate: 'wall-time' });
+  });
   it('round 5: a stop that only succeeded on the retry tick still escalates the wall-time overrun', () => {
     const settledNow = entry({ status: 'cleared', stopSettledAt: NOW, deadlineAt: NOW - MIN });
     expect(planReconcile([settledNow], { clones: [{ ...c, held: null }], now: NOW })[0]).toMatchObject({ escalate: 'wall-time' });
@@ -321,6 +325,18 @@ describe('runBundleRepairs (IO shell, every seam injected)', () => {
     expect(dispatched).toEqual([]);
   });
 
+  it('round 6: an indeterminate late launch on a settled entry is a pending stop, not forgotten', async () => {
+    const { dir, seams } = setup();
+    await runBundleRepairs({
+      ...seams, ...settings(),
+      dispatch: async () => {
+        const l = readLedger(dir); l[0].status = 'cleared'; writeFileSync(ledgerPath(dir), JSON.stringify(l));
+        throw new Error('spawn outcome unknown');
+      },
+    });
+    expect(readLedger(dir)[0]).toMatchObject({ status: 'cleared', stopPending: true });
+  });
+
   it('round 5: a reservation settled by another pass mid-launch gets its late session stopped; the clone stays blocked meanwhile', async () => {
     const { dir, stopped, seams } = setup();
     const s = await runBundleRepairs({
@@ -332,9 +348,16 @@ describe('runBundleRepairs (IO shell, every seam injected)', () => {
       },
     });
     expect(s.dispatched).toHaveLength(1);
-    expect(stopped).toEqual([readLedger(dir)[0].holdId]);
-    expect(readLedger(dir)[0]).toMatchObject({ handle: 'late', status: 'cleared' });
+    expect(readLedger(dir)[0]).toMatchObject({ handle: 'late', status: 'cleared', stopPending: true });
     expect(readLedger(dir)[0].launching).toBeUndefined();
+    // next pass: the pending stop runs, then the audit trail is re-read after it
+    let stoppedYet = false;
+    const next = await runBundleRepairs({
+      ...seams, now: NOW + MIN, ...settings(), selfSync: [{ cloneKey: KEY, rebuild: { held: null } }],
+      stop: (e) => { stoppedYet = true; stopped.push(e.holdId); }, overrideFor: () => (stoppedYet ? { ref: 'lane/late' } : null),
+    });
+    expect(stopped).toEqual([readLedger(dir)[0].holdId]);
+    expect(next.escalated).toEqual([{ holdId: readLedger(dir)[0].holdId, reason: 'conflict-override-used' }]);
     // while a reservation is launching, the clone is live for planning
     const c = clone(60);
     const launching = [{ cloneKey: KEY, holdId: 'x', status: 'cleared', launching: true, deadlineAt: NOW + MIN }];

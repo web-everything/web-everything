@@ -409,12 +409,14 @@ export async function runBundleRepairs({
       const entry = ledger.find((x) => x.holdId === t.holdId);
       if (!entry) return;
       delete entry.launching;
-      if (patch.handle !== undefined) {
-        entry.handle = patch.handle;
-        delete entry.indeterminate;
-        // Another pass settled this reservation while the launch was in flight: the session it started is no longer
-        // supervised as a running repair, so stop it now (a failed stop stays pending and keeps the clone blocked).
-        if (entry.status !== 'running') { tryStop(entry); log(`bundle-repair: stopped late-launched ${entry.session} (entry already ${entry.status})`); }
+      if (patch.handle !== undefined) { entry.handle = patch.handle; delete entry.indeterminate; }
+      // Another pass settled this reservation while the launch was in flight (handle known OR indeterminate): the
+      // session may be live but is no longer supervised as running. Mark its stop PENDING — that keeps the clone
+      // blocked, and the next pass stops it (by handle or by name) and re-reads the audit trail after the stop,
+      // exactly like any other stop.
+      if (entry.status !== 'running' && !patch.failedNotApplied) {
+        entry.stopPending = true;
+        log(`bundle-repair: late-launched ${entry.session} on a settled entry (${entry.status}) — stop pending`);
       }
       else if (patch.failedNotApplied) {
         Object.assign(entry, { status: 'dispatch-failed', endedAt: now, endReason: patch.failedNotApplied });

@@ -171,8 +171,10 @@ export function planReconcile(ledger, { clones = [], now, outcomeFor = () => nul
     if (!watched && !e.stopPending && e.stopSettledAt !== now) continue;
     const raised = new Set(e.escalations || []);
     const sessionLive = e.status === 'running';
-    const mayRun = sessionLive || !!e.stopPending;
-    const act = (status, escalate, detail, stop = mayRun) => out.push({ holdId: e.holdId, stop, status, escalate, detail });
+    // The session may have run up to now: live, its stop still pending, or its stop only succeeded THIS tick.
+    const mayRun = sessionLive || !!e.stopPending || e.stopSettledAt === now;
+    // Stop only what may still run; a stop that already succeeded this tick is not repeated.
+    const act = (status, escalate, detail, stop = sessionLive || !!e.stopPending) => out.push({ holdId: e.holdId, stop, status, escalate, detail });
     const pastDeadline = now >= e.deadlineAt;
     const override = overrideFor(e);
     if (override && !raised.has('conflict-override-used')) {
