@@ -119,6 +119,11 @@ describe('operator ruling at the round cap', () => {
     const ruledOnPrior = [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true), accept(prior)];
     expect(hold({ comments: [...ruledOnPrior, restamp(head), carry({ findings: broken, gates: ['round-cap'] })] })).toMatch(/requiring send-back/);
   });
+  it('an abbreviated reviewed-sha plain accept also keeps a superseded ruling superseded', () => {
+    const abbrev = { ...bot, body: ['\u2705 review \u2014 accepted', '', buildReviewedShaMarker(prior.slice(0, 7))].join('\n') };
+    const ruledOnPrior = [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true), abbrev];
+    expect(hold({ comments: [...ruledOnPrior, restamp(head), carry({ findings: broken, gates: ['round-cap'] })] })).toMatch(/requiring send-back/);
+  });
   it('a ruling survives a chain of carries (H0 → H1 → head)', () => {
     const h0 = 'e'.repeat(40);
     const ruledOnH0 = [clean(h0, 'web-everything', broken), gate(h0, 'round-cap'), accept(h0, true)];

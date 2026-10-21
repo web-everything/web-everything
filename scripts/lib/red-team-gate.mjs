@@ -506,6 +506,9 @@ function firstReviewIndex(records, pr, head) {
   return first ? first.at : null;
 }
 
+/** Every `reviewed-sha` marker in a body, lowercased (the marker supports 7-40 hex chars, so callers match by prefix). PURE. */
+const reviewedShaPrefixes = body => [...String(body ?? '').matchAll(new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:\\s*([0-9a-f]{7,40})\\s*-->`, 'gi'))].map(m => m[1].toLowerCase());
+
 /**
  * Did the operator rule on the head's confirmed breaks? The gate handed THIS result over (a `round-cap` record that
  * decides it), and a trusted clear-human ceremony for that head came after the result and every send-back/cap record.
@@ -537,7 +540,7 @@ function operatorRuled(records, pr, head) {
     // This also keeps existing send-backs held while persisted grant identities migrate to a reader-independent key.
     // A plain accept of ANY head on the carry chain (live head to the ruled head) after the human ceremony supersedes it; a bot-posted cleared-human marker cannot revive it.
     const reaccepted = cleared && trusted.some(r => !r.from && r.at > cleared.at && parseLatestHumanClearedSha([r.c]) === null
-      && chain.some(h => new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:\\s*${h}\\s*-->`, 'i').test(recordBody(r))));
+      && reviewedShaPrefixes(recordBody(r)).some(m => chain.some(h => h.startsWith(m) || m.startsWith(h))));
     if (cap && cleared && !reaccepted && cleared.at > cap.at && (cleared.at > result.at || named) && gates.every(r =>
       ![GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK].includes(r.gate.outcome) || cleared.at > r.at)) return true;
     // A ruling inherited through a carry cannot approve this head's own later gate decisions.
