@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { STEP_MIN_MS, boundExec, isBudgetError, makeDeadline, DRAIN_HARD_DEADLINE_MS } from '../tick-deadline.mjs';
 import { fileIntoBatch } from '../../operations/card-batch-file.mjs';
 import { gitIn } from '../../operations/card-batch-io.mjs';
-import { boundedGhExec, drainPendingPrevention, landPreventionCard } from '../../operations/land-prevention-card.mjs';
+import { drainPendingPrevention, landPreventionCard } from '../../operations/land-prevention-card.mjs';
 import { readDrainCursor } from '../prevention-drain-cursor.mjs';
 import { reconcileOwedPrevention } from '../prevention-filing-owed.mjs';
 import { reconcileCardBatches } from '../../operations/card-batch-reconcile.mjs';
@@ -104,16 +104,17 @@ describe('round-2 bounds', () => {
 });
 
 describe('round-4 bounds', () => {
-  it('the dedupe\'s gh runner makes ONE attempt per call, capped at the time left with SIGKILL, and is refused once the budget is gone', () => {
-    let t = 0; const seen = []; const deadline = makeDeadline(40_000, () => t);
-    const run = (cmd, args, options) => { seen.push(options); return 'out'; };
-    const gh = boundedGhExec(deadline, run);
-    expect(gh('gh', ['pr', 'list'], { timeout: 999_000 })).toBe('out');
-    expect(seen[0]).toMatchObject({ timeout: 40_000, killSignal: 'SIGKILL', throttle: { maxAttempts: 1 } });
-    expect(seen[0].throttle.acquireTimeoutMs).toBeLessThanOrEqual(5_000);
-    t = 39_500;
-    expect(() => gh('gh', ['api', 'x'])).toThrow(/tick budget exhausted/);
-    expect(seen).toHaveLength(1);
+  it('inside the tick the dedupe reads NO hosted-PR cards (no gh-throttle subprocess to escape the deadline); outside it still does', async () => {
+    const seen = [];
+    const settings = resolvePreventionBatchSettings({ standard: loadCardBatchPolicy().prevention, repo: { filingEnabled: true }, env: {} });
+    const exec = (cmd, args) => (args[1] === 'acquire' ? JSON.stringify({ lane: 3, path: '/lane' }) : args[1] === 'file-item' ? JSON.stringify({ verdict: { num: 'x1abcde', rel: 'backlog/x1abcde-card.md' } }) : '');
+    const common = { owedClaimed: true, exec, write: () => {}, pendingDir: tmp(), skipPendingDrain: true, batch: vi.fn(async () => ({ batched: true, batchRef: 'r' })), readFile: () => '#',
+      loadFilingSettings: () => settings, loadPreventionBatchSettings: () => settings, acquireWait: () => 5_000,
+      dedupe: (input, o) => { seen.push(o.readPrCards ? o.readPrCards('/lane') : 'default'); return null; } };
+    const input = { title: 't', kind: 'task', size: '1', digest: 'd', scope: 's', queue: 'q', session: 's1' };
+    await landPreventionCard(input, { ...common, drainLimit: { deadlineAt: 10 ** 9, hardDeadlineAt: 10 ** 9, now: () => 0 } });
+    await landPreventionCard(input, common);
+    expect(seen).toEqual([[], 'default']);
   });
   it('the acquire-cleanup release runs only inside a tick', async () => {
     const calls = [];
