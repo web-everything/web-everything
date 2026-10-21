@@ -2,10 +2,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { cachedLaneScan, resolveLaneScanPolicy, freshLaneSafety, guardLaneAction } from '../../lib/health-watch-lane-scan.mjs';
 import { createStaleStateReader } from '../stale-state-io.mjs';
 import { OPERATIONS } from '../run.mjs';
-import { laneGitEnv, worktreeGitEnv } from '../../lib/git-transport-branch.mjs';
+import { DIRTY_PROBE_ARGS, laneGitEnv, worktreeGitEnv } from '../../lib/git-transport-branch.mjs';
 
 vi.mock('../stale-state-io.mjs', async original => {
   const real = await original();
@@ -158,7 +159,7 @@ describe('shared lane Git environment', () => {
 
 describe('fresh per-lane safety check before any destructive action', () => {
   const commands = [
-    ['git', ['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none']],
+    ['git', ['status', '--porcelain', '--untracked-files=all', '--ignored=traditional', '--ignore-submodules=none']],
     ['git', ['ls-files', '-v']],
     ['git', ['stash', 'list']],
     ['git', ['rev-list', '--count', 'HEAD', '--not', '--remotes=origin']],
@@ -188,11 +189,26 @@ describe('fresh per-lane safety check before any destructive action', () => {
     expect(freshLaneSafety({ path: '/l', exec: git({ status: '', stash: 'stash@{0}: x', 'rev-list': '0' }) })).toMatchObject({ hasUnsafeWork: true });
     expect(freshLaneSafety({ path: '/l', exec: git({ status: '', stash: '', 'rev-list': '3' }) })).toMatchObject({ hasUnsafeWork: true });
   });
+  it.each(['!! ignored.txt\n', '!! local-data/\n'])(
+    'refuses every destructive action for ignored work reported as %s', status => {
+      const exec = vi.fn((bin, argv) => {
+        if (argv[0] === 'status') return argv.includes('--ignored=traditional') ? status : '';
+        if (argv[0] === 'ls-files') return 'H tracked.txt\n';
+        if (argv[0] === 'stash') return '';
+        if (argv[0] === 'rev-list') return '0\n';
+        throw new Error(`unexpected command: ${bin} ${argv.join(' ')}`);
+      });
+      for (const action of ['reclaim', 'reset', 'reuse', 'release-on-behalf']) {
+        expect(guardLaneAction({ path: '/l', action, exec, log: vi.fn() })).toMatchObject({
+          act: false, fresh: { hasUnsafeWork: true, reason: 'worktree has changes' },
+        });
+      }
+    });
   it('pins the exact git argv: untracked files listed in full, unpushed counted against origin refs only', () => {
     const exec = git({ status: '', stash: '', 'rev-list': '0\n' });
     freshLaneSafety({ path: '/l', exec });
     expect(exec.mock.calls.map(([bin, argv]) => [bin, argv])).toEqual([
-      ['git', ['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none']],
+      ['git', ['status', '--porcelain', '--untracked-files=all', '--ignored=traditional', '--ignore-submodules=none']],
       ['git', ['ls-files', '-v']],
       ['git', ['stash', 'list']],
       ['git', ['rev-list', '--count', 'HEAD', '--not', '--remotes=origin']],
@@ -201,6 +217,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
       expect(options).toMatchObject({ cwd: '/l', encoding: 'utf8', timeout: 30_000 });
       expect(options.env.GIT_OPTIONAL_LOCKS).toBe('0');
     }
+    expect(exec.mock.calls[0][1]).toEqual([...DIRTY_PROBE_ARGS]);
   });
   it.each(['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY'])(
     'ignores inherited %s so a clean foreign repository cannot authorize a dirty lane', variable => {
@@ -247,7 +264,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
     // Deliberately return clean results for other argv so a missing flag cannot pass by triggering an exec error.
     const exec = vi.fn((bin, argv) => {
       const command = JSON.stringify([bin, argv]);
-      if (command === JSON.stringify(['git', ['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none']])) return status;
+      if (command === JSON.stringify(['git', ['status', '--porcelain', '--untracked-files=all', '--ignored=traditional', '--ignore-submodules=none']])) return status;
       if (command === JSON.stringify(['git', ['ls-files', '-v']])) return 'H tracked.txt\n';
       if (command === JSON.stringify(['git', ['stash', 'list']])) return '';
       if (command === JSON.stringify(['git', ['rev-list', '--count', 'HEAD', '--not', '--remotes=origin']])) return count;
@@ -317,6 +334,60 @@ describe('fresh per-lane safety check before any destructive action', () => {
     expect(guardLaneAction({ path: '/l', action: 'reset', check: () => { throw new Error('boom'); }, log }).act).toBe(false);
     expect(guardLaneAction({ path: '/l', action: 'reset', check: () => ({ hasUnsafeWork: false }), log }).act).toBe(false);
     expect(guardLaneAction({ path: '/l', action: 'reset', exec: git({ status: '', stash: '', 'rev-list': '0' }), log }).act).toBe(true);
+  });
+});
+
+describe('lane action guard with real Git', () => {
+  const actions = ['reclaim', 'reset', 'reuse', 'release-on-behalf'];
+  const fixture = () => {
+    const path = temp();
+    const git = argv => execFileSync('git', argv, {
+      cwd: path, encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...laneGitEnv(path), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
+    });
+    // All Git writes stay inside this disposable fixture, never the lane checkout.
+    git(['init', '--quiet']);
+    writeFileSync(join(path, 'tracked.txt'), 'committed content\n');
+    writeFileSync(join(path, '.gitignore'), 'ignored.txt\nlocal-data/\n');
+    git(['add', 'tracked.txt', '.gitignore']);
+    git(['-c', 'user.name=Guard Fixture', '-c', 'user.email=guard@example.invalid',
+      '-c', 'commit.gpgSign=false', '-c', 'core.hooksPath=/dev/null', 'commit', '--quiet', '-m', 'fixture']);
+    // Model an already-pushed HEAD using a local ref; no network or remote is needed.
+    git(['update-ref', 'refs/remotes/origin/fixture', 'HEAD']);
+    for (const action of actions) {
+      expect(guardLaneAction({ path, action, log: vi.fn() })).toMatchObject({
+        act: true, fresh: { hasUnsafeWork: false },
+      });
+    }
+    return { path, git };
+  };
+
+  it.each(['--assume-unchanged', '--skip-worktree'])(
+    'refuses every destructive action when real Git %s hides a tracked edit', flag => {
+      const { path, git } = fixture();
+      git(['update-index', flag, 'tracked.txt']);
+      writeFileSync(join(path, 'tracked.txt'), 'uncommitted local edit\n');
+      expect(git([...DIRTY_PROBE_ARGS])).toBe('');
+      expect(git(['ls-files', '-v', 'tracked.txt'])).toBe(`${flag === '--assume-unchanged' ? 'h' : 'S'} tracked.txt\n`);
+      for (const action of actions) {
+        expect(guardLaneAction({ path, action, log: vi.fn() })).toMatchObject({
+          act: false, fresh: { hasUnsafeWork: true, reason: 'index flags may hide worktree changes' },
+        });
+      }
+      expect(readFileSync(join(path, 'tracked.txt'), 'utf8')).toBe('uncommitted local edit\n');
+    });
+
+  it('refuses every destructive action for a real ignored file hidden from ordinary status', () => {
+    const { path, git } = fixture();
+    writeFileSync(join(path, 'ignored.txt'), 'local data\n');
+    expect(git(['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none'])).toBe('');
+    expect(git([...DIRTY_PROBE_ARGS])).toBe('!! ignored.txt\n');
+    for (const action of actions) {
+      expect(guardLaneAction({ path, action, log: vi.fn() })).toMatchObject({
+        act: false, fresh: { hasUnsafeWork: true, reason: 'worktree has changes' },
+      });
+    }
+    expect(readFileSync(join(path, 'ignored.txt'), 'utf8')).toBe('local data\n');
   });
 });
 

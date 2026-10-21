@@ -12,7 +12,7 @@ import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { platformPreference, resolveCascade } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
-import { hasHiddenIndexFlags, laneGitEnv } from './git-transport-branch.mjs';
+import { DIRTY_PROBE_ARGS, hasHiddenIndexFlags, laneGitEnv } from './git-transport-branch.mjs';
 
 export function resolveLaneScanPolicy({ env = process.env,
   platform = platformPreference('healthWatch', { env }), tool = readDeclaredSettings().settings?.healthWatch,
@@ -62,7 +62,7 @@ export function cachedLaneScan(scan, { dir, root, now = Date.now(), write = true
 
 /**
  * FRESH safety read of ONE lane, right now (never the cache). Unsafe when the worktree has any change (tracked or
- * untracked), index flags that may hide edits, any stash, or any commit absent from local origin refs. Any git error,
+ * untracked or ignored), index flags that may hide edits, any stash, or any commit absent from local origin refs. Any git error,
  * timeout or unparseable output is UNSAFE: this answers "may I destroy this lane's state?", so not knowing is no.
  * @returns {{hasUnsafeWork:boolean, fresh:true, observedAt:string, reason:string, error?:string}}
  */
@@ -73,8 +73,8 @@ export function freshLaneSafety({ path, exec = execFileSync, now = Date.now } = 
   const git = argv => String(exec('git', argv, { cwd: path, encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024,
     env: { ...laneGitEnv(path), GIT_OPTIONAL_LOCKS: '0' }, stdio: ['ignore', 'pipe', 'pipe'] }));
   try {
-    // Override Git config and .gitmodules ignore settings: submodule work must remain visible.
-    const status = git(['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none']);
+    // Share destructive cleanup's probe: ignored files and submodule work must remain visible.
+    const status = git([...DIRTY_PROBE_ARGS]);
     if (typeof status !== 'string') return unsafe('status unreadable');
     if (status.trim()) return unsafe('worktree has changes');
     if (hasHiddenIndexFlags(git)) return unsafe('index flags may hide worktree changes');
