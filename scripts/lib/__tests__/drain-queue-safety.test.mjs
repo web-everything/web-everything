@@ -141,6 +141,22 @@ describe('operator ruling at the round cap', () => {
     expect(hold({ comments })).toMatch(/requiring send-back/);
     expect(hold({ comments: [...comments, gate(head, 'round-cap'), accept(head, true)] })).toBeNull();
   });
+  // The marker builder/parser accept abbreviated SHAs (7–40 hex), so an abbreviated plain accept supersedes too.
+  it.each([
+    ['7-char', 7], ['12-char', 12], ['39-char', 39], ['upper-case 12-char', 12, true],
+  ])('an abbreviated (%s) plain accept supersedes the ruling; a bot restamp cannot revive it', (_name, len, upper) => {
+    const short = sha => (upper ? sha.slice(0, len).toUpperCase() : sha.slice(0, len));
+    const ruled = [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true)];
+    expect(hold({ comments: [...ruled, accept(short(head))] })).toMatch(/requiring send-back/);
+    expect(hold({ comments: [...ruled, accept(short(head)), restamp(head)] })).toMatch(/requiring send-back/);
+    const carried = [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true), accept(short(prior)),
+      restamp(head), carry({ findings: broken, gates: ['round-cap'] }), restamp(head)];
+    expect(hold({ comments: carried })).toMatch(/requiring send-back/);
+  });
+  it('an abbreviated plain accept of an unrelated head does not supersede a ruling', () => {
+    const comments = [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true), accept('f'.repeat(12)), restamp(head)];
+    expect(hold({ comments })).toBeNull();
+  });
   it('a plain accept on an unrelated head does not supersede a carried ruling', () => {
     const comments = [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true),
       accept('f'.repeat(40)), restamp(head), carry({ findings: broken, gates: ['round-cap'] })];

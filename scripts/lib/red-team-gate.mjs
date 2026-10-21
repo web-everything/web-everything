@@ -49,6 +49,8 @@ export function redTeamMarker(pr, rev) {
 const MARKER_RE = /^<!-- we:red-team-advisory pr=(\d+) rev=([0-9a-f]{7,64}) -->/i;
 const FINDING_RE = /^(\d+)\. \[(\*\*confirmed\*\*|not confirmed|unverifiable)\] \(([^,()]+), ([^()]+?)\)(?: `([^`]+)`)? — (.*)$/;
 const SUB_RE = /^ {3}- (Scenario|Re-check): (.*)$/;
+// Same accepted shape as review-escalation's own reviewed-sha parser (full or abbreviated, any case).
+const REVIEWED_SHA_ANY_RE = new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:\\s*([0-9a-fA-F]{7,40})\\s*-->`, 'g');
 
 /**
  * Parse ONE red-team comment body. PURE. Returns null for anything that is not one (no leading marker).
@@ -480,9 +482,11 @@ function operatorRuled(records, pr, head) {
     // This also keeps existing send-backs held while persisted grant identities migrate to a reader-independent key.
     // A plain accept of ANY head in this proven carry chain after the ceremony supersedes it.
     // Scan the whole thread: accepts before or after a carry must survive its historical truncation.
-    const reviewed = new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:\\s*(?:${[...rulingHeads].join('|')})\\s*-->`, 'i');
+    // The marker may name a head abbreviated (7–40 hex, any case), as its builder and parser allow: a prefix match supersedes.
+    const reviewed = body => [...body.matchAll(REVIEWED_SHA_ANY_RE)]
+      .some(([, s]) => [...rulingHeads].some(h => h.startsWith(s.toLowerCase())));
     const reaccepted = cleared && trusted.some(r => !r.from && r.at > cleared.at && parseLatestHumanClearedSha([r.c]) === null
-      && reviewed.test(recordBody(r)));
+      && reviewed(recordBody(r)));
     if (cap && cleared && !reaccepted && cleared.at > result.at && gates.every(r =>
       ![GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK].includes(r.gate.outcome) || cleared.at > r.at)) return true;
     // A ruling inherited through a carry cannot approve this head's own later gate decisions.
