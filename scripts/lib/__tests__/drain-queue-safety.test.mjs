@@ -153,6 +153,11 @@ describe('operator ruling at the round cap', () => {
       restamp(head), carry({ findings: broken, gates: ['round-cap'] }), restamp(head)];
     expect(hold({ comments: carried })).toMatch(/requiring send-back/);
   });
+  it('a plain accept with an upper-case marker name still supersedes the ruling', () => {
+    const upperName = { ...bot, body: `✅ review — accepted\n\n<!-- REVIEWED-SHA: ${head} -->` };
+    expect(hold({ comments: [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true), upperName, restamp(head)] }))
+      .toMatch(/requiring send-back/);
+  });
   it('an abbreviated plain accept of an unrelated head does not supersede a ruling', () => {
     const comments = [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true), accept('f'.repeat(12)), restamp(head)];
     expect(hold({ comments })).toBeNull();

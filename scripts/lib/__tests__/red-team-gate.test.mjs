@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import {
   CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, breakClass, gateOutcomeForHead, gateOutcomesForHead, parseRedTeamComment, planRedTeamActions,
   resolveRedTeamProbes, redTeamForHead, gateRoundCap, sendBackStepState, redTeamGateMarker, redTeamQueueReason, redTeamRulingNeeded, resolveConfirmedBreaks, readRedTeamDisposition,
+  liveResultGateState,
 } from '../red-team-gate.mjs';
 import { buildReviewedShaMarker, buildClearedHumanMarker } from '../review-escalation.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
@@ -62,6 +63,19 @@ describe('parseRedTeamComment', () => {
     const body = renderRedTeamComment({ pr: 9, rev: HEAD, provider: 'codex', model: 'm', findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' });
     expect(parseRedTeamComment(body).findings).toEqual([]);
     expect(parseRedTeamComment('hello')).toBeNull();
+  });
+});
+
+describe('liveResultGateState: a reviewed-sha marker anchors the head only in the shape the shared parser reads', () => {
+  const anchor = marker => liveResultGateState([bot(`✅ review — accepted\n\n${marker}`), bot(BODY_4722)], 4722, HEAD).headReviewIndex;
+  const resultOnly = liveResultGateState([bot('hello'), bot(BODY_4722)], 4722, HEAD).headReviewIndex;
+  it('a full marker (either SHA case) anchors at the accept', () => {
+    expect(anchor(buildReviewedShaMarker(HEAD))).toBeLessThan(resultOnly);
+    expect(anchor(`<!-- reviewed-sha: ${HEAD.toUpperCase()} -->`)).toBeLessThan(resultOnly);
+  });
+  it('an upper-case marker name or an abbreviated marker never moves the anchor earlier', () => {
+    expect(anchor(`<!-- REVIEWED-SHA: ${HEAD} -->`)).toBe(resultOnly);
+    expect(anchor(buildReviewedShaMarker(HEAD.slice(0, 12)))).toBe(resultOnly);
   });
 });
 

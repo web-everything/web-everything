@@ -49,8 +49,10 @@ export function redTeamMarker(pr, rev) {
 const MARKER_RE = /^<!-- we:red-team-advisory pr=(\d+) rev=([0-9a-f]{7,64}) -->/i;
 const FINDING_RE = /^(\d+)\. \[(\*\*confirmed\*\*|not confirmed|unverifiable)\] \(([^,()]+), ([^()]+?)\)(?: `([^`]+)`)? — (.*)$/;
 const SUB_RE = /^ {3}- (Scenario|Re-check): (.*)$/;
-// Same accepted shape as review-escalation's own reviewed-sha parser (full or abbreviated, any case).
-const REVIEWED_SHA_ANY_RE = new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:\\s*([0-9a-fA-F]{7,40})\\s*-->`, 'g');
+// Any reviewed-sha marker the shared parser reads (full or abbreviated, any case), and a case variant of the marker
+// name too: only used to SUPERSEDE a ruling, where reading more holds more.
+const REVIEWED_SHA_ANY_RE = new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:\\s*([0-9a-f]{7,40})\\s*-->`, 'gi');
+const REVIEWED_SHA_FULL_RE = new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:\\s*([0-9a-fA-F]{40})\\s*-->`, 'g');
 
 /**
  * Parse ONE red-team comment body. PURE. Returns null for anything that is not one (no leading marker).
@@ -446,10 +448,12 @@ export function liveResultGateState(comments, pr, head, repo = null, standingRul
  * head (in thread order, as fix dispatch does; never by clocks). Null when there is none. PURE.
  */
 function firstReviewIndex(records, pr, head) {
-  const reviewed = new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:\\s*${head}\\s*-->`, 'i');
+  // Only the marker name the shared parser reads counts (an earlier anchor raises the cap); an abbreviated marker
+  // does not anchor, which only lowers it.
+  const reviewed = body => [...body.matchAll(REVIEWED_SHA_FULL_RE)].some(([, s]) => s.toLowerCase() === head);
   const first = records.find(r => {
     const result = parseRedTeamComment(recordBody(r));
-    return (result?.pr === Number(pr) && result.rev === head) || reviewed.test(recordBody(r));
+    return (result?.pr === Number(pr) && result.rev === head) || reviewed(recordBody(r));
   });
   return first ? first.at : null;
 }
