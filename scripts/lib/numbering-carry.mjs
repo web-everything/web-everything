@@ -36,6 +36,26 @@ export function resolveNumberingHumanClearanceSetting({ env = process.env, platf
   return { value: resolved.value[key], source: resolved.sources[key] };
 }
 
+/** Shared shape: one boolean review key, standard true, env override on/off/true/false/1/0, source logged by the cascade. */
+function resolveNumberingBoolean(key, envKey, { env = process.env, platform, tool = readSettings()?.review } = {}) {
+  const raw = env?.[envKey];
+  const parsed = raw === undefined ? undefined : /^(true|on|1)$/i.test(raw) ? true : /^(false|off|0)$/i.test(raw) ? false : raw;
+  const preference = platform === undefined ? platformPreference('review', { env }) : platform;
+  const resolved = cascadePolicy('review', tool && { [key]: tool[key] }, {
+    standard: { [key]: true }, platform: { [key]: preference?.[key] }, env,
+    envValues: { [key]: parsed }, valid: v => typeof v === 'boolean',
+  });
+  return { value: resolved.value[key], source: resolved.sources[key] };
+}
+
+/** review.carryAcceptAcrossNumbering: an automated accept re-stamps across a proven numbering-only move. false = today's
+ *  pre-#5025 behavior (the numbered head needs a fresh review). The human clearance has its own key above. */
+export const resolveNumberingAcceptSetting = (o) => resolveNumberingBoolean('carryAcceptAcrossNumbering', 'WE_REVIEW_CARRY_ACCEPT_ACROSS_NUMBERING', o);
+
+/** review.carryRedTeamAcrossNumbering (#5742): the drain's red-team admission reads the proven numbering ancestor's
+ *  red-team evidence. false = exact-head evidence only (a renumbered head requests its own red team, as before). */
+export const resolveNumberingRedTeamSetting = (o) => resolveNumberingBoolean('carryRedTeamAcrossNumbering', 'WE_REVIEW_CARRY_RED_TEAM_ACROSS_NUMBERING', o);
+
 /** Carry referral evidence only after the exact numbering move has been proven. */
 export function resolveNumberingCarryReferralEvidenceSetting({ env = process.env, platform, tool = readSettings()?.review } = {}) {
   const key = 'numberingCarryReferralEvidence';
@@ -642,7 +662,8 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   readNetDiff, readLiveState, dryRun = false, writer = 'review-daemon', prove = proveNumberingOnlyMove,
   numberingSetting = resolveNumberingHumanClearanceSetting(), netPatchSetting = resolveIdenticalNetPatchSetting(),
   enabled = resolveHumanClearanceCarrySetting().value, acceptCarry = resolveAcceptCarryForward().value,
-  guardReferrals = refuseWithoutReferralGuard, referralEvidenceSetting = resolveNumberingCarryReferralEvidenceSetting() } = {}) {
+  guardReferrals = refuseWithoutReferralGuard, referralEvidenceSetting = resolveNumberingCarryReferralEvidenceSetting(),
+  acceptSetting = resolveNumberingAcceptSetting() } = {}) {
   const key = `${repo}#${pr}@${state?.headRefOid}`;
   const plan = planNumberingRestamp({ labels: state?.labels, headSha: state?.headRefOid, comments: state?.comments, reviews });
   // A record an earlier pass left on the thread (its withdrawal failed, or the process died after the post) is
@@ -664,7 +685,7 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   if (!plan.candidate) return plan.retryable ? { action: 'retry', reason: plan.reason } : null;
   if (plan.human && !numberingSetting.value && !netPatchSetting.value) return null;
   logNumberingCarryReferralEvidenceSetting(referralEvidenceSetting);
-  const numberingOff = plan.human && !numberingSetting.value;
+  const numberingOff = plan.human ? !numberingSetting.value : !acceptSetting.value;
   const proveMove = (p) => {
     if (numberingOff) return { ok: false, reason: 'numbering carry disabled' };
     try { return prove({ exec, cwd, fromSha: p.from, toSha: p.to }); }

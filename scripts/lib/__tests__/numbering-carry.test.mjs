@@ -639,6 +639,15 @@ describe('numbering acceptance restamp', () => {
     if (human) { expect(result).toBeNull(); expect(calls).toEqual([]); }
     else { expect(result).toMatchObject({ action: 'restamped', human: false }); expect(calls).toHaveLength(2); }
   });
+  it('kill switch review.carryAcceptAcrossNumbering=false: an automated accept is not re-stamped across numbering', () => {
+    const rec = accept();
+    rec.body = rec.body.replace('✅ review — human cleared', '✅ review — accepted').replace('<!-- cleared-human: chalbert -->', '');
+    const { calls, provider } = recording();
+    const result = run({ state: { labels: ['review:pending'], headRefOid: TO, comments: [rec] }, provider,
+      acceptSetting: { value: false, source: 'env' }, prove: () => ({ ok: true, reason: 'verified' }) });
+    expect(result?.action).not.toBe('restamped');
+    expect(calls).toEqual([]);
+  });
   describe('a hold that arrives while the proof runs (red team #5233)', () => {
     const ok = () => ({ ok: true, reason: 'verified' });
     // A live thread with comment node ids: every post and edit lands on it, and every re-read copies it.

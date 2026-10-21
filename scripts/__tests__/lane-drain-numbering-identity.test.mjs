@@ -76,3 +76,10 @@ it('live replay #5779: the capped read distrusted the drain identity; the uncapp
   expect(numberingCommitIdentityArgs(repo, { git: fresh })).toEqual(['-c', `user.name=${real(['log', '-1', '--grep=^drain: JIT-number ', '--format=%an', MAIN])}`,
     '-c', `user.email=${real(['log', '-1', '--grep=^drain: JIT-number ', '--format=%ae', MAIN])}`]);
 });
+
+it('kill switch drain.numberingCommitIdentity=clone keeps the clone identity (today\'s behavior)', () => {
+  const lines = 'Real\0r@x\0drain: JIT-number xaaaaaa→#1 at land (#2288)';
+  const git = (a) => (a[0] === 'log' ? lines : a[1] === 'user.name' ? 'Clone' : 'c@x');
+  expect(numberingCommitIdentityArgs('/nowhere', { git, setting: { value: 'clone', source: 'env' } })).toEqual([]);
+  expect(numberingCommitIdentityArgs('/nowhere', { git, setting: { value: 'trusted', source: 'standard' } })).toEqual(['-c', 'user.name=Real', '-c', 'user.email=r@x']);
+});

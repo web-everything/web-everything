@@ -88,6 +88,8 @@ import { writeAllSync } from './lib/write-all-sync.mjs';
 // the write, rather than silently landing on `main` and auto-closing whatever #N happens to name. See that
 // module's own docstring for the full incident account.
 import { assertNoClosingKeywordRef } from './lib/commit-message-safety.mjs';
+import { readSettings } from './lib/settings-files.mjs';
+import { cascadePolicy } from './lib/policy-cascade.mjs';
 import { withNumberingLock, lockResultOr, acquireDrainLease, heartbeatDrainLease, releaseDrainLease, drainLeaseStatus, drainOwner, DRAIN_LOCK_ROOT, localRepoSlug } from './readiness/drain-lock.mjs'; // #2391 dual-lock: numbering mutex + whole-process drain lease (#3440 localRepoSlug keys it per-repo); lockResultOr (#xuqk1vp) safely reads a lock outcome that may have refused to run
 
 // ── flag parsing (mirrors pr-land.mjs / lane-review.mjs) ──────────────────────────────────────────────
@@ -571,6 +573,17 @@ function quietGit(CWD, a) {
   catch { return null; }
 }
 
+/** drain.numberingCommitIdentity: `trusted` (standard) = author as an identity main already trusts when the clone's own
+ *  is not; `clone` = the clone's git config, as before (kill switch). Env WE_DRAIN_NUMBERING_COMMIT_IDENTITY. */
+export function resolveNumberingCommitIdentitySetting({ env = process.env, tool = readSettings()?.drain } = {}) {
+  const key = 'numberingCommitIdentity';
+  const resolved = cascadePolicy('drain', tool && { [key]: tool[key] }, {
+    standard: { [key]: 'trusted' }, env, envValues: { [key]: env?.WE_DRAIN_NUMBERING_COMMIT_IDENTITY },
+    valid: (v) => v === 'trusted' || v === 'clone',
+  });
+  return { value: resolved.value[key], source: resolved.sources[key] };
+}
+
 /**
  * The identity a `drain: JIT-number` commit is authored with. CI trusts a numbering commit only when its
  * author already authored such a commit on accepted `origin/main` (queue-branch-numbering.mjs
@@ -581,7 +594,8 @@ function quietGit(CWD, a) {
  * otherwise use the identity of main's most recent numbering commit. No such commit → clone identity (today).
  * Trust still comes only from main: this only picks an identity main already accepts, never adds one.
  */
-export function numberingCommitIdentityArgs(CWD, { git = (a) => quietGit(CWD, a) } = {}) {
+export function numberingCommitIdentityArgs(CWD, { git = (a) => quietGit(CWD, a), setting = resolveNumberingCommitIdentitySetting() } = {}) {
+  if (setting.value === 'clone') return [];
   const subject = /^drain: JIT-number .+ at land \(#2288\)$/;
   const trusted = String(git(['log', '--grep=^drain: JIT-number ', '--format=%an%x00%ae%x00%s', 'origin/main']) ?? '')
     .split('\n').map((line) => line.split('\0')).filter(([name, email, s]) => name && email && subject.test(s ?? ''));
@@ -1211,7 +1225,10 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1 } = {}) {
   quietGit(CWD, ['add', '--', ...new Set(toAdd)]); // stage rewrites + new renamed files (deletions already staged by git rm; ledger stays untracked)
   const paths = [...new Set(commitPaths)];
   const summary = [...assigned.map((a) => `${a.hash}→#${a.nnn}`), ...dupDropped.map((d) => `${d.hash} duplicate dropped (already ${d.existing.replace(/^backlog\//, '')})`)].join(', ');
-  const committed = quietGit(CWD, [...numberingCommitIdentityArgs(CWD), 'commit', '-m', assertNoClosingKeywordRef(`drain: JIT-number ${summary} at land (#2288)`, 'JIT-number commit message'), '--', ...paths]) != null;
+  const identitySetting = resolveNumberingCommitIdentitySetting();
+  const identityArgs = numberingCommitIdentityArgs(CWD, { setting: identitySetting });
+  process.stderr.write(`policy · drain.numberingCommitIdentity=${identitySetting.value} (${identitySetting.source})${identityArgs.length ? ` → ${identityArgs[1].slice(10)}` : ''}\n`);
+  const committed = quietGit(CWD, [...identityArgs, 'commit', '-m', assertNoClosingKeywordRef(`drain: JIT-number ${summary} at land (#2288)`, 'JIT-number commit message'), '--', ...paths]) != null;
   return finish({ assigned, held, committed, unresolvedReferences, droppedDuplicates: dupDropped, renamed: [...renames, ...livePathRenames].map((r) => r.to), changedPaths: paths });
 }
 

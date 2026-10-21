@@ -25,7 +25,7 @@ const policyOf = (strategy) => ({ policy: resolveMergeDeliveryPolicy({ tool: str
 
 const DRAIN = 'drain-bot';
 
-function harness({ gitExec, resolveRealFiles, priorityReserve, reservePath, strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = { ...process.env, WE_RED_TEAM_TIMING: 'post-accept' }, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, readReviewAgents = () => [], baseTip = () => BASE_TIP, strategyExtra = {} } = {}) {
+function harness({ gitExec, resolveRealFiles, priorityReserve, reservePath, strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = { ...process.env, WE_RED_TEAM_TIMING: 'post-accept' }, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, readReviewAgents = () => [], baseTip = () => BASE_TIP, strategyExtra = {}, evidenceFor = null } = {}) {
   const calls = [];
   const logs = [];
   let stored = initial;
@@ -72,7 +72,7 @@ function harness({ gitExec, resolveRealFiles, priorityReserve, reservePath, stra
     ...strategyExtra,
     ...(resolveRealFiles ? { resolveRealFiles } : {}),
     ...(priorityReserve ? { priorityReserve } : {}), ...(reservePath ? { reservePath } : {}),
-    dryRun, env, readReviewAgents, readRedTeamEvidence: () => { if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }, requestRedTeam, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
+    dryRun, env, readReviewAgents, readRedTeamEvidence: (o) => { if (evidenceFor) return evidenceFor(o); if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }, requestRedTeam, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
     cancelObsoleteRuns: () => {}, batching: { gate: () => ({ admit: true }), observe: () => ({}) },
     postConflictFinding, ...(now ? { now } : {}), resolved: policyOf(strategy), log: { write: (l) => logs.push(l) }, readFile, writeState, ...(withLock ? { withLock } : {}),
   });
@@ -2326,5 +2326,103 @@ describe('card-only restamped head with no review run', () => {
     const h = setup(['backlog/123-card.md'], null, { evidence: { ...evidence, ...over } });
     expect(h.s.enqueue(candidate, HEAD)).toMatchObject({ kind: 'red-team-pending' });
     expect(h.calls.some(call => call[0] === 'git')).toBe(false);
+  });
+});
+
+describe('#5742: a head moved only by the drain numbering commit reads red-team evidence from the accepted head', () => {
+  const setup = () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'rt-alias-strategy-'));
+    const git = (...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' }).trim();
+    git('init', '-q'); git('config', 'commit.gpgsign', 'false'); git('config', 'user.name', 'Drain'); git('config', 'user.email', 'd@x');
+    mkdirSync(join(cwd, 'backlog'));
+    writeFileSync(join(cwd, 'backlog/010-old.md'), '---\nstatus: resolved\n---\n');
+    git('add', '.'); git('commit', '-qm', 'base'); git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+    writeFileSync(join(cwd, 'backlog/xabc123-foo.md'), '---\nstatus: open\n---\n\n# Foo\n');
+    git('add', '.'); git('commit', '-qm', 'card');
+    const accepted = git('rev-parse', 'HEAD');
+    git('mv', 'backlog/xabc123-foo.md', 'backlog/011-foo.md');
+    writeFileSync(join(cwd, 'backlog/011-foo.md'), '---\nbornAs: xabc123\nstatus: open\n---\n\n# Foo\n');
+    git('add', '.'); git('commit', '-qm', 'drain: JIT-number xabc123→#011 at land (#2288)');
+    const real = new Set(['cat-file', 'rev-list', 'log', 'diff-tree', 'ls-tree', 'grep']);
+    const gitExec = (args, opts) => {
+      if (real.has(args[0]) || (args[0] === 'rev-parse' && args.some((a) => a.endsWith('^{commit}'))))
+        return execFileSync('git', args, { ...opts, cwd });
+      if (args[0] === 'rev-parse') return `${BASE_TIP}\n`;
+      if (args[0] === 'ls-remote') return `${BASE_TIP}\t${args.at(-1)}\n`;
+      return args[0] === 'diff' ? 'scripts/x.mjs\0' : '';
+    };
+    return { cwd, git, accepted, head: git('rev-parse', 'HEAD'), gitExec };
+  };
+  const pendingOn = (sha) => ({ head }) => (head === sha
+    ? { scheduled: true, recorded: false, inFlight: true, loopPayload: { verdict: { verdict: 'accept' } } }
+    : { scheduled: false, recorded: false, inFlight: false, loopPayload: null });
+  const run = ({ head, gitExec, evidenceFor, setting }) => {
+    const requests = [];
+    const labels = ['review:accepted', 'ready-to-merge'];
+    const h = harness({ strategy: 'github-merge-queue', labels, gitExec, evidenceFor, ...(setting ? { strategyExtra: { numberingRedTeamSetting: () => setting } } : {}), ghView: { 5742: { headRefOid: head, labels, isDraft: false } },
+      liveComments: [], requestRedTeam: (input) => { requests.push(input); return { requested: true }; } });
+    return { outcome: h.s.enqueue({ num: 5742 }, head), requests, logs: h.logs.join('') };
+  };
+  it('no red-team request for the numbered head: the accepted head\'s evidence decides', () => {
+    const t = setup();
+    try {
+      const r = run({ ...t, evidenceFor: pendingOn(t.accepted) });
+      expect(r.requests).toEqual([]);
+      expect(r.outcome).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+      expect(r.logs).toContain('no red-team request for');
+      expect(r.logs).toContain('moved only by drain numbering');
+      expect(r.logs).toContain('xabc123→#011');
+    } finally { rmSync(t.cwd, { recursive: true, force: true }); }
+  });
+  it('the accepted head\'s saved clean red team admits the numbered head: enqueued, no new red team', () => {
+    const t = setup();
+    const root = mkdtempSync(join(tmpdir(), 'drain-alias-saved-'));
+    try {
+      const env = { WE_RED_TEAM_TIMING: 'post-accept', CONVEYOR_STATE_ROOT: root, WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_DRAIN_READS_SAVED_RESULT: 'on' };
+      const path = resolveScorecardStorePath(env);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, JSON.stringify({ version: 1, records: [{ dispatchKind: 'review-seat', seat: 'red-team',
+        repo: LOCAL, pr: 5742, rev: t.accepted, status: 'ok', seatVerdict: 'accept', recheckStatus: 'ok', confirmedMissCount: 0, findings: [] }] }));
+      saveProvenanceFixtures(env);
+      const requests = [];
+      const labels = ['review:accepted', 'ready-to-merge'];
+      const evidenceFor = ({ head }) => (head === t.accepted
+        ? { scheduled: true, recorded: true, inFlight: false, loopPayload: { verdict: { verdict: 'accept' } } }
+        : { scheduled: false, recorded: false, inFlight: false, loopPayload: null });
+      const mk = () => harness({ strategy: 'github-merge-queue', env, labels, gitExec: t.gitExec, evidenceFor, liveComments: [],
+        ghView: { 5742: { headRefOid: t.head, labels, isDraft: false } }, requestRedTeam: (i) => { requests.push(i); return { requested: true }; } });
+      const h = mk();
+      expect(h.s.enqueue({ num: 5742, repo: LOCAL }, t.head, { comments: [] })).toMatchObject({ enqueued: true });
+      expect(requests).toEqual([]);
+    } finally { rmSync(t.cwd, { recursive: true, force: true }); rmSync(root, { recursive: true, force: true }); }
+  });
+  it('NOT WEAKENED: a smuggled edit in the numbering commit requests a red team for the exact head, as today', () => {
+    const t = setup();
+    try {
+      writeFileSync(join(t.cwd, 'backlog/011-foo.md'), '---\nbornAs: xabc123\nstatus: open\n---\n\n# Foo, edited\n');
+      t.git('add', '.'); t.git('commit', '-q', '--amend', '--no-edit');
+      const head = t.git('rev-parse', 'HEAD');
+      const r = run({ ...t, head, evidenceFor: pendingOn(t.accepted) });
+      expect(r.requests).toEqual([expect.objectContaining({ pr: 5742, head })]);
+      expect(r.logs).not.toContain('moved only by drain numbering');
+    } finally { rmSync(t.cwd, { recursive: true, force: true }); }
+  });
+  it('kill switch review.carryRedTeamAcrossNumbering=false requests a red team for the exact head (today\'s behavior), logged', () => {
+    const t = setup();
+    try {
+      const r = run({ ...t, evidenceFor: pendingOn(t.accepted), setting: { value: false, source: 'env' } });
+      expect(r.requests).toEqual([expect.objectContaining({ pr: 5742, head: t.head })]);
+      expect(r.logs).toContain('review.carryRedTeamAcrossNumbering=false (env)');
+      expect(r.logs).not.toContain('moved only by drain numbering');
+    } finally { rmSync(t.cwd, { recursive: true, force: true }); }
+  });
+  it('the head\'s own evidence always wins over an ancestor', () => {
+    const t = setup();
+    try {
+      const reads = [];
+      const r = run({ ...t, evidenceFor: (o) => { reads.push(o.head); return pendingOn(t.head)(o); } });
+      expect(r.requests).toEqual([]);
+      expect(new Set(reads)).toEqual(new Set([t.head]));
+    } finally { rmSync(t.cwd, { recursive: true, force: true }); }
   });
 });

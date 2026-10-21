@@ -41,7 +41,9 @@ import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { labelSignature } from './drain-prestage.mjs';
 import { readDrainRedTeamEvidence } from './drain-red-team-evidence.mjs';
 import { redTeamEnabled } from './review-red-team-policy.mjs';
-import { readDrainQueueSafety, postAcceptRedTeamOwed, redTeamEnqueueHold, dequeueSentBack, sendBackReason } from './drain-queue-safety.mjs';
+import { readDrainQueueSafety, postAcceptRedTeamOwed, redTeamEnqueueHold as redTeamEnqueueHoldAtHead, dequeueSentBack, sendBackReason } from './drain-queue-safety.mjs';
+import { numberingRedTeamAlias, hasRedTeamEvidence } from './numbering-red-team-alias.mjs';
+import { resolveNumberingRedTeamSetting } from './numbering-carry.mjs';
 import { defaultPostConflictFinding } from './conflict-finding.mjs';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { createHash } from 'node:crypto';
@@ -267,7 +269,7 @@ export function createDrainMergeStrategy({
   readFile = readFileSync, writeState = writeQueueState, withLock = (fn) => ({ ran: true, result: fn() }),
   postConflictFinding = defaultPostConflictFinding, now = () => Date.now(),
   cancelObsoleteRuns = cancelObsoleteQueueRuns, batching, resolveRealFiles = defaultResolveRealFiles,
-  env = process.env, queueSafety, labelProvider, readRedTeamEvidence = readDrainRedTeamEvidence, requestRedTeam = null, readReviewAgents = listAgentsWithReviewJobs,
+  env = process.env, queueSafety, labelProvider, readRedTeamEvidence = readDrainRedTeamEvidence, numberingRedTeamSetting = () => resolveNumberingRedTeamSetting({ env }), requestRedTeam = null, readReviewAgents = listAgentsWithReviewJobs,
   cwd = process.cwd(), // a clone of the local repo: enqueuePr reads the judged commit's change list from it
   cardOverlapCleanMerge, readQueueTip = defaultReadQueueTip, cardMergeRun,
   // xym8nt4 — a source PR of a post-approval card group never enqueues on its own (the combined PR carries it).
@@ -282,6 +284,56 @@ export function createDrainMergeStrategy({
   const { policy, note } = resolved;
   const statusProvider = labelProvider ?? createGhProvider({ exec: (args, opts) => exec('gh', args, opts) });
   const say = (line) => { if (!quiet) log.write(`${line}\n`); };
+  // #5742: when the exact head's red-team hold would hold or request, and the head moved only by the drain's own
+  // numbering commit(s) over an ancestor with red-team evidence (numbering-red-team-alias.mjs), that ancestor's
+  // evidence and gate records decide instead, so a pure renumber never requests a red team or a fresh review.
+  // A clear exact-head answer, the head's own evidence, or a failed proof all keep today's exact-head behavior.
+  const readRedTeamEvidenceAtHead = readRedTeamEvidence;
+  let numberingRedTeam = { value: false, source: 'unresolved' };
+  try { numberingRedTeam = numberingRedTeamSetting(); } catch (e) { say(`  ⚠ review.carryRedTeamAcrossNumbering unreadable (${firstLine(e)}) — exact-head red-team evidence only`); }
+  let numberingRedTeamLogged = false;
+  const redTeamAliases = new Map();
+  // Read-only probes (recordedHold, yieldTargetHold) never run git; they reuse an alias this pass already proved.
+  // recordedHold's clear answer is never authorization, so there an unproven alias falls through (null) to the
+  // ordinary enqueue, which may prove it, instead of answering a hold from the exact head.
+  let redTeamAliasReadOnly = false;
+  const ALIAS_UNPROVEN = Symbol('numbering alias unproven in a read-only probe');
+  const readOnlyRedTeam = (fn, { fallThrough = false } = {}) => {
+    const was = redTeamAliasReadOnly; redTeamAliasReadOnly = fallThrough ? 'fall-through' : true;
+    try { return fn(); } catch (e) { if (e === ALIAS_UNPROVEN) return null; throw e; } finally { redTeamAliasReadOnly = was; }
+  };
+  const redTeamAliasFor = ({ repo, pr, head, env: e = env }) => {
+    const key = `${repo}#${pr}@${head}`;
+    if (redTeamAliases.has(key)) return redTeamAliases.get(key);
+    if (redTeamAliasReadOnly === true) return null;
+    if (hasRedTeamEvidence(readRedTeamEvidenceAtHead({ repo, pr, head, env: e }))) { redTeamAliases.set(key, null); return null; }
+    if (!numberingRedTeamLogged) { numberingRedTeamLogged = true; say(`  policy · review.carryRedTeamAcrossNumbering=${numberingRedTeam.value} (${numberingRedTeam.source})`); }
+    if (!numberingRedTeam.value) { redTeamAliases.set(key, null); return null; }
+    if (redTeamAliasReadOnly === 'fall-through') throw ALIAS_UNPROVEN;
+    const found = numberingRedTeamAlias({ exec, cwd, head,
+      hasEvidence: (sha) => hasRedTeamEvidence(readRedTeamEvidenceAtHead({ repo, pr, head: sha, env: e })) });
+    if (found) say(`  merge-queue: #${pr} head ${String(head).slice(0, 9)} moved only by drain numbering over ${found.head.slice(0, 9)} (${found.reason}); red-team evidence read from ${found.head.slice(0, 9)} — no new red team or review`);
+    redTeamAliases.set(key, found?.head ?? null);
+    return found?.head ?? null;
+  };
+  // The ancestor's red team is the one owed (still pending there): never request a second one for the renumbered head.
+  // `requested: true` keeps the gate waiting on that ancestor's result (no never-scheduled escape opens).
+  const requestRedTeamAtHead = requestRedTeam;
+  if (typeof requestRedTeamAtHead === 'function') requestRedTeam = (o) => {
+    const alias = redTeamAliases.get(`${o.repo}#${o.pr}@${o.head}`);
+    if (!alias) return requestRedTeamAtHead(o);
+    say(`  merge-queue: #${o.pr} no red-team request for ${String(o.head).slice(0, 9)} — drain numbering over ${alias.slice(0, 9)}, whose red team decides`);
+    return { requested: true, numberingAlias: alias };
+  };
+  const redTeamEnqueueHold = (o) => {
+    const reason = redTeamEnqueueHoldAtHead(o);
+    if (!reason) return reason;
+    const alias = redTeamAliasFor(o);
+    if (!alias) return reason;
+    const evidence = readRedTeamEvidenceAtHead({ repo: o.repo, pr: o.pr, head: alias, env: o.env ?? env });
+    return redTeamEnqueueHoldAtHead({ ...o, requestPending: false, scheduled: false, inFlight: false, recorded: false, attempted: false,
+      queued: false, loopPayload: undefined, skipCardOnly: undefined, ...evidence, head: alias });
+  };
   /**
    * Read-modify-write of the shared follow-up state file: under the land lock, RE-READ the file (so an enqueue by
    * another drain process that landed since this pass first read it is kept), apply `fn`, write. A refused lock
@@ -686,14 +738,15 @@ export function createDrainMergeStrategy({
       if (!enqueues(c.repo) || !headSha) return null;
       const state = readQueueState(statePath, readFile);
       if (state.redTeamPending?.[keyOf(c.repo, c.num)]?.headSha !== headSha) return null;
-      return this.enqueue(c, headSha, { holdOnly: true });
+      return readOnlyRedTeam(() => this.enqueue(c, headSha, { holdOnly: true }), { fallThrough: true });
     },
     /** Read-only: is a would-be overlap-yield TARGET held by the post-accept red-team gate on this exact head?
      * `{kind, reason}` = held; `null` = no recorded red-team hold on this head (it may still enqueue, so waiters
      * keep yielding). Throws when it cannot tell; the caller then keeps today's yield (fail closed).
      * Never writes state, labels, refs or requests: it runs enqueue's own red-team rule on GitHub reads only.
      * Card-only relief and request state are tried both ways; a split answer throws (keeps the yield). */
-    yieldTargetHold(c, headSha) {
+    yieldTargetHold(c, headSha) { return readOnlyRedTeam(() => this.yieldTargetHoldAtHead(c, headSha)); },
+    yieldTargetHoldAtHead(c, headSha) {
       if (!enqueues(c.repo) || !safety.value.waitForRedTeamBeforeEnqueue) return null;
       if (!headSha) throw new Error('yield target has no head sha');
       const state = readQueueState(statePath, readFile);
