@@ -6,7 +6,8 @@
 import { describe, expect, it } from 'vitest';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { CONFIRMED_BREAKS_DEFAULTS, liveResultGateState, operatorRulingsOnLiveResult, readRedTeamDisposition,
-  redTeamGateMarker, resolveOperatorRulings } from '../red-team-gate.mjs';
+  redTeamGateMarker, resolveOperatorRulings, unknownOperatorOutcomes } from '../red-team-gate.mjs';
+import { syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 
 const H = '61782334289124cd4fcb51d0bdadb6ef3c795e82';
 const P = 5502;
@@ -66,5 +67,19 @@ describe('operator ruling in any state (shared reader)', () => {
     expect(resolveOperatorRulings({ file: { redTeam: { operatorRulings: { anyState: false } } } }).value.anyState).toBe(false);
     expect(resolveOperatorRulings({ file: { redTeam: { operatorRulings: { anyState: true } } }, env: { WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE: '0' } }).value.anyState).toBe(false);
     expect(resolveOperatorRulings({ env: { WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE: 'banana' } }).value.anyState).toBe(true);
+  });
+});
+
+describe('label writers never re-derive over an operator ruling they cannot read', () => {
+  it('a trusted operator-* outcome this reader does not know skips the sync (no label write)', () => {
+    const future = gate(human, 'operator-defer', '- 1 finding(s) left advisory (#1).', '2026-10-21T20:30:00Z');
+    expect(unknownOperatorOutcomes([...live, future], P, H)).toEqual(['operator-defer']);
+    expect(unknownOperatorOutcomes([...live, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z')], P, H)).toEqual([]);
+    const writes = [];
+    const provider = { readPrState: () => ({ headRefOid: H, labels: [{ name: 'red-team:clear' }] }), readComments: () => [...live, future],
+      ensureLabel: () => {}, setLabels: (...a) => writes.push(a) };
+    const out = syncRedTeamStatusLabels({ repo: 'web-everything/web-everything', pr: P, head: H, env: {}, provider, standingRuling: null, savedResult: null });
+    expect(out.skipped).toBe('unknown-operator-outcome');
+    expect(writes).toEqual([]);
   });
 });

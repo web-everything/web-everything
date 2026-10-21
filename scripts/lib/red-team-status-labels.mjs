@@ -1,6 +1,6 @@
 /** Derived operator labels; head-bound scheduling and recorded dispositions remain authoritative. */
 import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
-import { readRedTeamDisposition, readRedTeamProbes } from './red-team-gate.mjs';
+import { readRedTeamDisposition, readRedTeamProbes, unknownOperatorOutcomes } from './red-team-gate.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 
@@ -24,6 +24,12 @@ export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = p
   const state = live ?? provider.readPrState(repo, pr);
   if (state.headRefOid !== head) return { add: null, remove: [], skipped: 'head-moved' };
   const thread = comments ?? provider.readComments(repo, pr);
+  // A newer reader's operator ruling this code cannot read: leave the label to that reader (never re-derive over it).
+  const unknown = unknownOperatorOutcomes(thread, pr, head);
+  if (unknown.length) {
+    log(`red-team-status-labels: ${repo}#${pr} skipped — operator ruling outcome(s) ${unknown.join(', ')} unknown to this reader (older code)`);
+    return { add: null, remove: [], skipped: 'unknown-operator-outcome' };
+  }
   // The verified standing-ruling scope (PR #5758): given by the caller, else read fresh; unreadable = no automatic credit.
   let scope = standingRuling ?? null;
   if (standingRuling === undefined) {
