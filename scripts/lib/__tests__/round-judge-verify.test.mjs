@@ -27,7 +27,7 @@ describe('verifyFinding', () => {
   });
   it('coverage claim: the subject identifier in a test refutes', () => {
     const r = verifyFinding({ file: 'a.mjs', line: 1, summary: 'WE_VERIFY_SLOT_HEARTBEAT_MS is untested.' }, repo());
-    expect(r).toMatchObject({ status: 'refuted', evidence: expect.stringContaining('mentions WE_VERIFY_SLOT_HEARTBEAT_MS') });
+    expect(r).toMatchObject({ status: 'refuted', evidence: expect.stringContaining('uses WE_VERIFY_SLOT_HEARTBEAT_MS') });
   });
   it('coverage claim: a stem-word-only match is NOT evidence', () => {
     const r = verifyFinding({ file: 'scripts/lib/git-identity.mjs', line: 1, summary: 'The git identity retry has no test.' }, repo());
@@ -38,7 +38,7 @@ describe('verifyFinding', () => {
   });
   it('silent-failure claim: a log and an error-status return near the line refute', () => {
     const r = verifyFinding({ file: 'scripts/lib/git-identity.mjs', line: 2, summary: 'Hook-repair errors are silently discarded.' }, repo());
-    expect(r).toEqual({ status: 'refuted', evidence: 'scripts/lib/git-identity.mjs:3 logs/throws and scripts/lib/git-identity.mjs:4 returns an error status' });
+    expect(r).toEqual({ status: 'refuted', evidence: 'scripts/lib/git-identity.mjs:3 logs/throws and scripts/lib/git-identity.mjs:4 returns an error status, in the function holding line 2' });
   });
   it('silent-failure claim with only a log -> inconclusive', () => {
     const r = verifyFinding({ file: 'b.mjs', line: 1, summary: 'errors are silently ignored' }, { read: () => 'console.error(1)\n', tests: () => [] });

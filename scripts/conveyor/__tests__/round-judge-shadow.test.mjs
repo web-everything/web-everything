@@ -39,6 +39,16 @@ describe('resolveRoundJudgeMode', () => {
   });
 });
 
+describe('maxGrants setting', () => {
+  it('standard 20; the file can lower it; junk is ignored', () => {
+    expect(resolveRoundJudgeMode({ env: {}, path: '/nonexistent', platform: null }).maxGrants).toBe(20);
+    const d = tmp(); const p = join(d, 's.json'); writeFileSync(p, JSON.stringify({ rounds: { judge: { mode: 'shadow', maxGrants: 6 } } }));
+    expect(resolveRoundJudgeMode({ env: {}, path: p, platform: null }).maxGrants).toBe(6);
+    writeFileSync(p, JSON.stringify({ rounds: { judge: { mode: 'shadow', maxGrants: 'lots' } } }));
+    expect(resolveRoundJudgeMode({ env: {}, path: p, platform: null }).maxGrants).toBe(20);
+  });
+});
+
 describe('observeRoundCap', () => {
   const env = (extra = {}) => ({ WE_ROUNDS_JUDGE_MODE: 'shadow', ...extra });
   it('off writes nothing', () => {

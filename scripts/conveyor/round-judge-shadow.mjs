@@ -25,6 +25,7 @@ import { isUnderTest } from '../lib/under-test.mjs';
 
 export const ROUND_JUDGE_MODES = Object.freeze(['off', 'shadow', 'on']);
 export const ROUND_JUDGE_MODE_ENV = 'WE_ROUNDS_JUDGE_MODE';
+export const ROUND_JUDGE_MAX_GRANTS_STANDARD = 20;
 export const ROUND_JUDGE_DIR_ENV = 'WE_ROUND_JUDGE_SHADOW_DIR';
 export const ROUND_JUDGE_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'round-judge.json');
 
@@ -36,15 +37,17 @@ export function resolveRoundJudgeMode({ env = process.env, path = ROUND_JUDGE_SE
   try { file = JSON.parse(readFileSync(path, 'utf8')); } catch { file = {}; }
   let plat = platform;
   if (plat === undefined) { try { plat = platformPreference('rounds', { env }); } catch { plat = undefined; } }
-  const resolved = resolveCascade({ standard: { judge: { mode: 'off' } }, platform: plat, tool: file?.rounds ?? file,
-    valid: { judge: (v) => normMode(v?.mode ?? v) !== null } });
+  const resolved = resolveCascade({ standard: { judge: { mode: 'off', maxGrants: ROUND_JUDGE_MAX_GRANTS_STANDARD } }, platform: plat, tool: file?.rounds ?? file,
+    valid: { judge: (v) => (typeof v === 'number' ? Number.isInteger(v) && v >= 1 && v <= 100 : normMode(v?.mode ?? v) !== null) } });
   logCascadeSources('rounds', resolved, { env, ...(log ? { log } : {}) });
   let mode = normMode(resolved.leafValues?.['judge.mode']) ?? 'off';
   let source = resolved.sources?.['judge.mode'] ?? 'standard';
   // env is the top layer; an unusable value never overrides a lower one.
   const fromEnv = normMode(env?.[ROUND_JUDGE_MODE_ENV]);
   if (fromEnv) { mode = fromEnv; source = 'env'; }
-  return { mode, source, line: `${formatCascadeSourcesLine('rounds', resolved)}${source === 'env' ? ` · env ${ROUND_JUDGE_MODE_ENV}=${mode}` : ''}` };
+  const mg = resolved.leafValues?.['judge.maxGrants'];
+  const maxGrants = Number.isInteger(mg) && mg >= 1 ? mg : ROUND_JUDGE_MAX_GRANTS_STANDARD;
+  return { mode, source, maxGrants, line: `${formatCascadeSourcesLine('rounds', resolved)}${source === 'env' ? ` · env ${ROUND_JUDGE_MODE_ENV}=${mode}` : ''}` };
 }
 
 const DIR_NAME = 'round-judge-shadow';
@@ -130,7 +133,7 @@ export function observeRoundCap({ pr, repo = null, state = null, subject = {}, e
       : (Number.isFinite(subject?.additions) ? subject.additions + (subject.deletions ?? 0) : null);
     const vrepo = verifyRepo ?? makeGitRepo({ head, cwd: repoRoot });
     const result = judgeRound({ pr, repo, head, trigger: cap.trigger, comments, files, diff: { size, prevSize: lastSize(outDir, pr) },
-      setting: setting ?? readConfirmedBreaks({ env }).value, verify: (f) => verifyFinding(f, vrepo) });
+      setting: setting ?? readConfirmedBreaks({ env }).value, verify: (f) => verifyFinding(f, vrepo), maxGrants: cfg.maxGrants });
 
     const line = formatJudgeLine(pr, result);
     const record = write({ ts: new Date(now).toISOString(), pr: Number(pr), repo, head, trigger: cap.trigger, key: cap.key,

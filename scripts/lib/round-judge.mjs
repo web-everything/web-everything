@@ -28,8 +28,8 @@ import { isTrustChainPath, isPolicyCorePath, isEngineTierPath, isPolicySpecPath,
 
 export const VERDICTS = Object.freeze(['grant', 'send-back', 'card-the-rest', 'suggest-split', 'escalate', 'not-real-verified']);
 export const TRIGGERS = Object.freeze(['red-team-cap', 'review-cap', 'referral-hold']);
-/** Most grants the judge will recommend on one PR (matches the standing card-only grant cap of 3 per PR). */
-export const MAX_JUDGE_GRANTS = 3;
+/** Hard backstop on total grants per PR (operator 2026-10-21: progress decides, this only stops a runaway). Setting `rounds.judge.maxGrants`. */
+export const MAX_JUDGE_GRANTS = 20;
 /** Diff growth that reads as "keeps growing": at least this ratio AND this many lines since the prior observation. */
 export const SPLIT_GROWTH_RATIO = 1.3;
 export const SPLIT_GROWTH_LINES = 150;
@@ -186,7 +186,7 @@ export function validateVerdict(v) {
   if (!VERDICTS.includes(v.verdict)) return bad(`verdict ${JSON.stringify(v.verdict)} is not one of ${VERDICTS.join('|')}`);
   if (v.verdict === 'not-real-verified' && (!Array.isArray(v.proof) || !v.proof.length || v.proof.some((x) => typeof x !== 'string' || !x.trim()))) return bad('not-real-verified needs non-empty proof');
   if (v.verdict === 'grant') {
-    if (!Number.isInteger(v.k) || v.k < 1 || v.k > MAX_JUDGE_GRANTS) return bad('grant needs an integer k in 1..3');
+    if (!Number.isInteger(v.k) || v.k < 1 || v.k > MAX_JUDGE_GRANTS) return bad('grant needs an integer k in 1..20');
   } else if (v.k !== undefined && v.k !== null) return bad('k is only valid on grant');
   if (!Array.isArray(v.reasons) || !v.reasons.length || v.reasons.some((r) => typeof r !== 'string' || !r.trim())) return bad('reasons must be a non-empty list of strings');
   return { ok: true };
@@ -229,7 +229,7 @@ export function judgeRound(o) {
 const STRICT_ORDER = ['not-real-verified', 'grant', 'card-the-rest', 'send-back', 'suggest-split', 'escalate'];
 const strictness = (v) => STRICT_ORDER.indexOf(v);
 
-function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = [], diff = {}, setting = CONFIRMED_BREAKS_DEFAULTS, verify = null }) {
+function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = [], diff = {}, setting = CONFIRMED_BREAKS_DEFAULTS, verify = null, maxGrants = MAX_JUDGE_GRANTS }) {
   if (!TRIGGERS.includes(trigger)) throw new Error(`unknown trigger ${JSON.stringify(trigger)}`);
   const rounds = extractRounds(comments, pr);
   const sourceOf = { 'red-team-cap': 'red-team', 'review-cap': 'review', 'referral-hold': 'referral' }[trigger];
@@ -278,6 +278,9 @@ function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = []
   const proof = refuted.map((c) => `${c.f.file}:${c.f.line} -> ${c.r.evidence}`);
 
   const guardFiles = [...new Set([...fileList, ...annotated.map((f) => f.file).filter(Boolean)])].filter(isGuardPath);
+  // Operator 2026-10-21: a guard file ALONE never escalates. Only a finding IN guard code that the judge would rule
+  // not-real or card (below) escalates; otherwise the usual rules apply (unsure -> send-back).
+  const guardFindings = annotated.filter((f) => f.file && isGuardPath(f.file));
   const weakening = brokenOpen.filter((f) => WEAKENING.test(f.summary));
 
   const size = Number.isFinite(diff?.size) ? diff.size : null;
@@ -313,17 +316,18 @@ function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = []
 
   if (annotated.length && refuted.length === annotated.length && crossBroken.length) reasons.push(`not-real-blocked-by-open-break-in-other-source:${crossBroken[0].file}:${crossBroken[0].line}`);
   if (annotated.length && refuted.length === annotated.length && !crossBroken.length) {
-    return done('not-real-verified', [`all-${annotated.length}-findings-mechanically-refuted`, ...(guardFiles.length ? [`guard-file-touched-but-refuted:${guardFiles[0]}`] : [])], undefined, proof);
+    if (guardFindings.length) return done('escalate', [`not-real-on-guard-code:${guardFindings[0].file}:${guardFindings[0].line}`, `all-${annotated.length}-findings-mechanically-refuted`]);
+    return done('not-real-verified', [`all-${annotated.length}-findings-mechanically-refuted`], undefined, proof);
   }
   if (refuted.length) reasons.push(`partially-refuted:${refuted.length}-of-${annotated.length}`);
 
-  if (guardFiles.length) return done('escalate', [`guard-file-touched:${guardFiles.slice(0, 3).join(',')}`]);
+  if (guardFiles.length) reasons.push(`guard-file-touched-noted:${guardFiles[0]}`);
   if (unfixedAfterSendBacks.length) return done('escalate', [`same-finding-unfixed-after-${unfixedAfterSendBacks[0].priorAppearances}-send-backs:${unfixedAfterSendBacks[0].file}:${unfixedAfterSendBacks[0].line}`]);
-  if (weakening.length) return done('escalate', [`possible-guard-weakening:${weakening[0].file}:${weakening[0].line}`]);
+  if (weakening.length) return done('send-back', [`possible-guard-weakening:${weakening[0].file}:${weakening[0].line}`]);
   if (!latest && trigger === 'review-cap') {
     const m = mechanicalSpend(comments);
     if (m.latestAccepted && m.pushes >= 2) {
-      if (grantsSoFar >= MAX_JUDGE_GRANTS) return done('escalate', [`mechanical-cap-but-${grantsSoFar}-grants-already-spent`]);
+      if (grantsSoFar >= maxGrants) return done('escalate', [`mechanical-cap-but-${grantsSoFar}-grants-already-spent-ceiling-${maxGrants}`]);
       const blocked = noGrant();
       if (blocked) return done('send-back', [blocked]);
       const cardOnly = fileList.length > 0 && fileList.every((f) => /^backlog\//.test(f));
@@ -335,15 +339,16 @@ function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = []
   if (surfaceWidening) return done('suggest-split', [`finding-surface-widening:${newFiles.slice(0, 3).join(',')}`]);
 
   if (annotated.length && !brokenOpen.length && !crossBroken.length && annotated.every((f) => planKeys.card.has(keyOf(f)) || !planKeys.sendBack.has(keyOf(f)))) {
+    if (guardFindings.length) return done('escalate', [`card-on-guard-code:${guardFindings[0].file}:${guardFindings[0].line}`]);
     return done('card-the-rest', ['only-coverage-or-degraded-findings-open', `cards=${plan.card.length}`]);
   }
   if (!annotated.length) return done(crossBroken.length ? 'send-back' : 'card-the-rest', [crossBroken.length ? 'open-break-in-other-source' : 'no-confirmed-findings-open']);
   if (trend === 'first-round') return done('send-back', ['first-round-nothing-to-compare']);
   if (trend === 'shrinking' && !repeated.length) {
-    if (grantsSoFar >= MAX_JUDGE_GRANTS) return done('escalate', [`converging-but-${grantsSoFar}-grants-already-spent`]);
+    if (grantsSoFar >= maxGrants) return done('escalate', [`converging-but-${grantsSoFar}-grants-already-spent-ceiling-${maxGrants}`]);
     const blocked = noGrant();
     if (blocked) return done('send-back', [blocked]);
-    const k = Math.min(MAX_JUDGE_GRANTS - grantsSoFar, annotated.length <= 2 && annotated.length * 2 <= prevOpen.length ? 2 : 1);
+    const k = Math.min(maxGrants - grantsSoFar, annotated.length <= 2 && annotated.length * 2 <= prevOpen.length ? 2 : 1);
     return done('grant', [`findings-shrinking-${prevOpen.length}-to-${annotated.length}`, 'none-repeated'], k);
   }
   if (trend === 'repeating') return done('send-back', [`repeating-${repeated.length}-of-${annotated.length}-re-raised`]);

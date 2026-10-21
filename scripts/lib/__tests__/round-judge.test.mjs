@@ -86,10 +86,17 @@ describe('verdict paths', () => {
     ]);
     expect(r.verdict).toBe('suggest-split');
   });
-  it('escalate: a guard / gate file is touched', () => {
+  it('a guard file alone never escalates: the normal rules apply, the touch is only noted', () => {
     const r = judge([rt(H(1), [['a.mjs', 1, 'alpha failure parser']]), rt(H(9), [['b.mjs', 2, 'beta failure cache']])], { files: ['scripts/lib/red-team-gate.mjs'] });
+    expect(r.verdict).toBe('send-back');
+    expect(r.reasons.join(';')).toMatch(/guard-file-touched-noted/);
+    const g = judge([rt(H(1), [['a.mjs', 1, 'one aaaa broke'], ['b.mjs', 2, 'two bbbb broke'], ['c.mjs', 3, 'three cccc broke']]), rt(H(9), [['z.mjs', 9, 'brand new zzzz problem']])], { files: ['scripts/lib/red-team-gate.mjs'] });
+    expect(g.verdict).toBe('grant');
+  });
+  it('escalate: card on a finding IN guard code', () => {
+    const r = judge([rt(H(1), [['scripts/lib/red-team-gate.mjs', 1, 'alpha minor gap', 'degraded']]), rt(H(9), [['scripts/lib/red-team-gate.mjs', 2, 'beta minor gap', 'degraded']])]);
     expect(r.verdict).toBe('escalate');
-    expect(r.reasons[0]).toMatch(/guard-file-touched/);
+    expect(r.reasons[0]).toMatch(/card-on-guard-code/);
   });
   it('escalate: the same finding came back unfixed after more than one send-back', () => {
     const f = ['a.mjs', 7, 'alpha failure in parser'];
@@ -97,19 +104,23 @@ describe('verdict paths', () => {
     expect(r.verdict).toBe('escalate');
     expect(r.reasons[0]).toMatch(/unfixed-after-2-send-backs/);
   });
-  it('escalate: a broken finding reads like a guard being weakened', () => {
+  it('a broken finding that reads like a guard being weakened is send-back (unsure), noted', () => {
     const r = judge([rt(H(1), [['a.mjs', 1, 'alpha failure parser']]), rt(H(9), [['b.mjs', 2, 'the new check is fail-open when the ledger is unreadable']])]);
-    expect(r.verdict).toBe('escalate');
+    expect(r.verdict).toBe('send-back');
     expect(r.reasons[0]).toMatch(/possible-guard-weakening/);
   });
-  it('escalate: converging but the grant allowance is already spent', () => {
-    const r = judge([
-      grantComment(), grantComment(), grantComment(),
+  it('no cap at 3: a PR with many grants still gets a progress-based grant', () => {
+    const r = judge([grantComment(), grantComment(), grantComment(), grantComment(), grantComment(),
       rt(H(1), [['a.mjs', 1, 'one aaaa broke'], ['b.mjs', 2, 'two bbbb broke'], ['c.mjs', 3, 'three cccc broke']]),
-      rt(H(9), [['z.mjs', 9, 'brand new zzzz problem']]),
-    ]);
+      rt(H(9), [['z.mjs', 9, 'brand new zzzz problem']])]);
+    expect(r.verdict).toBe('grant');
+  });
+  it('escalate only at the hard ceiling (setting, standard 20)', () => {
+    const r = judge([grantComment(), grantComment(),
+      rt(H(1), [['a.mjs', 1, 'one aaaa broke'], ['b.mjs', 2, 'two bbbb broke'], ['c.mjs', 3, 'three cccc broke']]),
+      rt(H(9), [['z.mjs', 9, 'brand new zzzz problem']])], { maxGrants: 2 });
     expect(r.verdict).toBe('escalate');
-    expect(r.reasons[0]).toMatch(/3-grants-already-spent/);
+    expect(r.reasons[0]).toMatch(/2-grants-already-spent-ceiling-2/);
   });
   it('notes red-team edge-case drift as a reason', () => {
     const r = judge([
@@ -155,10 +166,9 @@ describe('stricter after audit', () => {
     expect(judge(shrinking, { files: ['docs/agent/platform-decisions.md'] }).reasons[0]).toMatch(/statute-file-uncertain-no-grant/);
     expect(judge(shrinking, { files: ['src/q.mjs'] }).verdict).toBe('grant');
   });
-  it('a grant never takes the PR past 3 total', () => {
-    const r = judge([grantComment(), grantComment(),
-      rt(H(1), [['a.mjs', 1, 'one aaaa broke'], ['b.mjs', 2, 'two bbbb broke'], ['c.mjs', 3, 'three cccc broke'], ['d.mjs', 4, 'four dddd broke']]),
-      rt(H(9), [['z.mjs', 9, 'brand new zzzz problem']])], { files: ['src/q.mjs'] });
+  it('k is clipped to the ceiling headroom', () => {
+    const r = judge([grantComment(), rt(H(1), [['a.mjs', 1, 'one aaaa broke'], ['b.mjs', 2, 'two bbbb broke'], ['c.mjs', 3, 'three cccc broke'], ['d.mjs', 4, 'four dddd broke']]),
+      rt(H(9), [['z.mjs', 9, 'brand new zzzz problem']])], { maxGrants: 2 });
     expect(r).toMatchObject({ verdict: 'grant', k: 1 });
   });
   it('the mechanical-spend grant also respects the allowance and file evidence', () => {
@@ -166,7 +176,7 @@ describe('stricter after audit', () => {
     const repush = () => bot('🔧 conveyor fix — re-armed for re-review\n\nThe previously accepted PR was re-pushed', at());
     const base = [repush(), accepted(), repush(), accepted()];
     expect(judgeRound({ pr: PR, repo: REPO, head: H(9), trigger: 'review-cap', comments: base, files: [] }).reasons).toEqual(['no-file-evidence-no-grant']);
-    expect(judgeRound({ pr: PR, repo: REPO, head: H(9), trigger: 'review-cap', files: ['backlog/1.md'], comments: [grantComment(), grantComment(), grantComment(), ...base] }).verdict).toBe('escalate');
+    expect(judgeRound({ pr: PR, repo: REPO, head: H(9), trigger: 'review-cap', files: ['backlog/1.md'], comments: [grantComment(), grantComment(), ...base], maxGrants: 2 }).verdict).toBe('escalate');
   });
 });
 
@@ -175,6 +185,11 @@ describe('not-real-verified', () => {
   const refute = (ok) => (f) => (ok(f) ? { status: 'refuted', evidence: `t.test.mjs:1 covers ${f.line}` } : { status: 'inconclusive', evidence: null });
   const run = (verify, bullets = ['- `src/a.mjs:5` — no test for alpha', '- `src/b.mjs:7` — no test for beta']) =>
     judgeRound({ pr: PR, repo: REPO, head: H(9), trigger: 'referral-hold', comments: [hold(...bullets)], files: ['src/a.mjs'], verify });
+  it('a refuted finding in guard code escalates instead of not-real', () => {
+    const r = judgeRound({ pr: PR, repo: REPO, head: H(9), trigger: 'referral-hold', files: ['x.mjs'], verify: refute(() => true), comments: [hold('- `scripts/lib/red-team-gate.mjs:5` — no test for alpha')] });
+    expect(r.verdict).toBe('escalate');
+    expect(r.reasons[0]).toMatch(/not-real-on-guard-code/);
+  });
   it('every open finding refuted with evidence -> not-real-verified, evidence in the proof and the line', () => {
     const r = run(refute(() => true));
     expect(r.verdict).toBe('not-real-verified');
