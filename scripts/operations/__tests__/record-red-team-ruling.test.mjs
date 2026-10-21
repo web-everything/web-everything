@@ -105,15 +105,17 @@ describe('planRedTeamRuling: refusals', () => {
 });
 
 /** A fake PR whose thread grows as the sinks post (as the operator account), so the read-back proves the gate released the break. */
-function fake({ cardOk = true, postFails = null, liveHead = HEAD, labels = [], identity = OP, author = 'chalbert', claims, noPid = false, initial, sharedBreaks } = {}) {
+function fake({ cardOk = true, postFails = null, liveHead = HEAD, labels = [], identity = OP, author = 'chalbert', claims, noPid = false, initial, sharedBreaks, attemptFails = false, receiptFails = false } = {}) {
   const comments = initial ? [...initial] : thread();
   const posted = [], cards = [], labelCalls = [], labelSyncs = [];
+  const attempts = new Set();
   const gens = new Map(), receipts = new Set(), breakOwners = sharedBreaks ?? new Map();
   let clock = 1_000_000;
   const memClaims = {
     claim: (k) => { if (!gens.has(k)) { gens.set(k, { gen: 0, at: clock }); return { created: true, gen: 0, at: clock }; } return { created: false, ...gens.get(k) }; },
     reclaim: (k, g) => { if (gens.get(k).gen !== g) return false; gens.set(k, { gen: g + 1, at: clock }); return true; },
-    spawned: (k) => receipts.has(k), markSpawned: (k) => receipts.add(k), now: () => clock,
+    spawned: (k) => receipts.has(k), markSpawned: (k) => { if (receiptFails) throw new Error('receipt write failed'); receipts.add(k); }, now: () => clock,
+    attempted: (k) => attempts.has(k), markAttempt: (k) => { if (attemptFails) throw new Error('disk full'); attempts.add(k); }, clearAttempt: (k) => attempts.delete(k),
     claimBreak: (k, job) => { if (!breakOwners.has(k)) breakOwners.set(k, job); return breakOwners.get(k); },
   };
   const sinks = createRecordRedTeamRulingSinks({
@@ -183,8 +185,8 @@ describe('sinks', () => {
     expect(f.memClaims.spawned(payloadFor().jobKey)).toBe(false);
     expect(heldAfter(f.comments)).toHaveLength(1);
     f.advance(121_000);
-    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/no confirmed child start/);
-    expect(f.cards).toHaveLength(2);
+    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/may have started its landing job/);
+    expect(f.cards).toHaveLength(1); // at most once: an unconfirmed start is never re-spawned
   });
   it('card: two retries on one expired claim spawn at most once (atomic re-claim)', () => {
     const f = fake();
@@ -545,5 +547,20 @@ describe('audit round 4: concurrent overlapping card selections', () => {
       expect(c.claimBreak('b1', 'jobB')).toBe('jobA');
       expect(c.claimBreak('b1', 'jobA')).toBe('jobA');
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('audit round 5: at most one spawn per card job', () => {
+  it('spawn ok, receipt write fails, exact retry after the claim expires refuses instead of spawning again', () => {
+    const f = fake({ receiptFails: true });
+    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/receipt write failed/);
+    f.advance(121_000);
+    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/may have started its landing job/);
+    expect(f.cards).toHaveLength(1);
+  });
+  it('an attempt marker that cannot be written spawns nothing', () => {
+    const f = fake({ attemptFails: true });
+    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/disk full/);
+    expect(f.cards).toHaveLength(0);
   });
 });

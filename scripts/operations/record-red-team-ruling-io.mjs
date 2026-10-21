@@ -109,6 +109,9 @@ export function createFileClaims({ dir = join(automationStateRoot(), 'red-team-r
       }
     },
     spawned(key) { return existsSync(join(dir, `${key}.spawned`)); },
+    attempted(key) { return existsSync(join(dir, `${key}.attempt`)); },
+    markAttempt(key) { mkdirSync(dir, { recursive: true }); writeFileSync(join(dir, `${key}.attempt`), JSON.stringify({ at: nowMs() })); },
+    clearAttempt(key) { rmSync(join(dir, `${key}.attempt`), { force: true }); },
     markSpawned(key, info) { writeFileSync(join(dir, `${key}.spawned`), JSON.stringify({ ...info, at: nowMs() })); },
     now: nowMs,
   };
@@ -234,10 +237,21 @@ export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_
       // 3. Spawn exactly once: a job whose log already exists is reconciled, never spawned again.
       let card = { ok: true, session };
       if (!spawned) {
+        // AT MOST ONCE: an attempt marker is written BEFORE the spawn and cleared only when the spawn reported that it
+        // did not start. A marker with no receipt means a child MAY be running (a crash between the spawn and the
+        // receipt), so a re-run refuses instead of spawning a second filing.
+        if (claims.attempted(p.jobKey)) {
+          throw new Error(`an earlier attempt of card job ${p.jobKey} may have started its landing job (no spawn receipt was recorded); nothing written. `
+            + `Check the landing log for session ${session}; the job is owed, not lost`);
+        }
+        claims.markAttempt(p.jobKey);
         card = fileCard(p.cardInput, session);
-        if (!card?.ok) throw new Error(`the follow-up card was not queued (${card?.error ?? 'unknown'}); the intent is recorded and a re-run retries the same job`);
+        if (!card?.ok) {
+          claims.clearAttempt(p.jobKey); // the spawn itself reported no child
+          throw new Error(`the follow-up card was not queued (${card?.error ?? 'unknown'}); the intent is recorded and a re-run retries the same job`);
+        }
         // The proof of a spawn is the child's confirmed start (a pid), recorded durably; the job's log file proves nothing.
-        if (!/^pid:\d+$/.test(String(card.handle ?? ''))) throw new Error('the landing job reported no confirmed child start; not recorded as spawned, a re-run retries');
+        if (!/^pid:\d+$/.test(String(card.handle ?? ''))) throw new Error('the landing job reported no confirmed child start; not recorded as spawned, and not retried automatically (a child may be running)');
         claims.markSpawned(p.jobKey, { session, handle: card.handle });
       }
       // 4. The release record, only now that the job is accepted. Its failure is retry-safe: the next run sees the spawned job.
