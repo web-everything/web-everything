@@ -713,9 +713,11 @@ export async function runFixCli(argv = [], {
     // now, before spending a whole agent run on it.
     const pending = pendingRearm.read(launch.repo, pr);
     if (pending?.sha === before) {
-      await rearm(before, { conflictRound: pending.conflictRound === true, mainRef: typeof pending.mainRef === 'string' ? pending.mainRef : null });
+      const handBack = await rearm(before, { conflictRound: pending.conflictRound === true, mainRef: typeof pending.mainRef === 'string' ? pending.mainRef : null });
       pendingRearm.clear(launch.repo, pr);
-      const result = `PR #${pr} (already pushed ${before.slice(0, 9)}; re-armed review:pending after a failed earlier re-arm)`;
+      const result = handBack === 'carried'
+        ? `PR #${pr} (already pushed ${before.slice(0, 9)}; accept carried — identical net patch — after a failed earlier hand-back)`
+        : `PR #${pr} (already pushed ${before.slice(0, 9)}; re-armed review:pending after a failed earlier re-arm)`;
       outcome = 'pushed'; reason = 'finished an earlier push';
       write(`fix-run: PR #${pr} finished - ${result}\n`);
       return { code: 0, result };
