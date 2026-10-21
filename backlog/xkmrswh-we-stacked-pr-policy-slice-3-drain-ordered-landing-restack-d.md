@@ -16,7 +16,7 @@ Make the drain land a policy-stacked child only after its base, restack the chil
 ## Acceptance
 
 - [A1] **Executable** — `node --test` on we:scripts/conveyor/__tests__/pr-stack-policy.test.mjs and we:scripts/__tests__/merge-ai-prs-stack-order.test.mjs fails before and passes after. Named tests, one per guarantee:
-  - `drain: a policy-stacked child is held until its base is proven landed, then lands`.
+  - `drain: a policy-stacked child is held until its base is proven landed, then lands` (through the real `classifyPr` and `planLabelDrain`, never a candidate with a preset `decision`: once the base merges, the existing `retargetStackedPrs` moves the child to the default branch and `classifyPr` returns `merge`. Control: the same child left on the base's `lane/*` branch is skipped with `base is not main (lane/…)`).
   - `drain: the base lands first when both are ready in the same pass`.
   - `restack: a moved base head restacks the child, bottom first, under the round cap`.
   - `re-review: after a restack only the child delta is re-reviewed, never the base's lines`.
