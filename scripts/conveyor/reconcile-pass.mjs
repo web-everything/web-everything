@@ -55,6 +55,7 @@ import { enrichPrsWithOwedMainRule, resolveRefreshSettings } from '../lib/rename
 import { excusePrMergeGateHolds, readMergeGateVerdict as defaultReadMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { readMainRedPriority } from '../lib/main-red-priority.mjs'; // card xu1nixv
+import { reviewExecFileSync } from '../lib/review-fetch.mjs';
 import { fetchPrCommits } from '../lib/pr-limit.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { FAILING_CONCLUSIONS, NON_BLOCKING_CONCLUSIONS, reduceCheckState } from '../operations/pr-status.mjs';
@@ -882,7 +883,7 @@ const GIT_LITERAL = ['--literal-pathspecs'];
  * @param {number} prNumber
  * @param {{exec?:Function, remote?:string}} [o]
  */
-export function defaultFetchRef(prNumber, { exec = execFileSync, remote = 'origin' } = {}) {
+export function defaultFetchRef(prNumber, { exec = reviewExecFileSync, remote = 'origin' } = {}) {
   const n = Number(prNumber);
   if (!Number.isInteger(n) || n <= 0 || String(n) !== String(prNumber)) return;
   try {
@@ -1440,6 +1441,7 @@ export function enrichPrsWithLedgerHolds(prs, { repo, now = Date.now(), env = pr
  * @returns {{dispatch:Array<object>, refusals:Array<object>, notes:Array<object>, prs:number, agents:number}}
  */
 export function runReconcilePass({
+  staleAcceptReleased = null, // #5771 - `pr@head` keys of proven-covered stale accepts, passed to planReconcile
   readPrs = defaultReadPrs, readAgents = defaultReadAgents, enrich = enrichAgents,
   excuseMergeGateHolds = excusePrMergeGateHolds, readMergeGateVerdict = defaultReadMergeGateVerdict,
   readFreeze = readSharedFreeze, mergeGateSetting,
@@ -1577,6 +1579,7 @@ export function runReconcilePass({
     ...prOwnershipSettings(loadPrOwnership, env),
     // Card xu1nixv — the red-main fix PR's fast lane (published by the health watch; absent/expired = null).
     mainRedPriority: readPriority(),
+    ...(Array.isArray(staleAcceptReleased) && staleAcceptReleased.length ? { staleAcceptReleased } : {}),
   });
   return { ...plan, owedTriggers: hydrated.owedTriggers, notes: [...hydrated.notes, ...plan.notes], refusals: [...hydrated.refusals, ...plan.refusals], prs: rawPrs.length, agents: agents.length,
     openPrFiles: rawPrs.map((pr) => ({ pr: pr.number, files: Array.isArray(pr.files) && pr.files.length < 100

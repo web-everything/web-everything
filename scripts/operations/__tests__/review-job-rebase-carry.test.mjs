@@ -9,7 +9,8 @@ function fixture() {
     readPrevCompletion: () => null, newActorId: () => 'actor', acquireLane: () => ({ lanePath: 'fake-lane' }), updateRecord: vi.fn(), releaseLane: vi.fn(),
     carryAcrossRebaseSetting: () => ({ value: 'on', source: 'test' }),
     readCarryEvidence: () => ({ headSha: b, comments: [trusted(`<!-- reviewed-sha: ${a} -->`), trusted(`<!-- we:red-team-gate pr=1 rev=${a} outcome=card-queued -->`)] }),
-    contributionPatchId: () => p, restampVerdict: vi.fn(() => ({ ok: true })), postCarryComment: vi.fn(),
+    readSavedResult: vi.fn(() => null),
+    contributionPatchId: () => p, proveIdenticalNetPatch: () => ({ ok: true, reason: 'test proof' }), restampVerdict: vi.fn(() => ({ ok: true })), postCarryComment: vi.fn(),
     runLoop: vi.fn(() => ({ status: 0, stdout: JSON.stringify({ stopped: 'complete', verdict: { verdict: 'accept', loop: { outcome: 'converged' } } }) })),
     runExtraSeats: vi.fn(), runRedTeam: vi.fn(), startSpeculativeRedTeam: vi.fn(), speculativeRedTeamSetting: () => ({ enabled: true }),
   };
@@ -25,8 +26,12 @@ describe('review job rebase carry', () => {
     for (const key of ['runLoop', 'runExtraSeats', 'runRedTeam', 'startSpeculativeRedTeam']) expect(io[key]).not.toHaveBeenCalled();
     expect(io.restampVerdict.mock.invocationCallOrder[0]).toBeLessThan(io.postCarryComment.mock.invocationCallOrder[0]);
   });
-  it.each(['off', 'unequal', 'unreadable', 'restamp-failed', 'red-team-pending', 'gate-with-hold'])('%s runs the normal arc without a carry comment', mode => {
+  it.each(['off', 'unequal', 'unreadable', 'restamp-failed', 'red-team-pending', 'gate-with-hold', 'saved-only', 'saved-unreadable', 'no-saved-reader'])('%s runs the normal arc without a carry comment', mode => {
     const io = fixture();
+    // PR #5551 red team: a gate decision on saved (unposted) evidence has no result to re-key, so it is never carried.
+    if (mode === 'saved-only') io.readSavedResult = vi.fn(({ head }) => head === a ? { pr: 1, rev: a, findings: [] } : null);
+    if (mode === 'saved-unreadable') io.readSavedResult = () => { throw Error('saved red-team evidence malformed'); };
+    if (mode === 'no-saved-reader') delete io.readSavedResult;
     if (mode === 'off') io.carryAcrossRebaseSetting = () => ({ value: 'off' });
     if (mode === 'unequal') io.contributionPatchId = ({ sha }) => sha === a ? p : a;
     if (mode === 'unreadable') io.readCarryEvidence = () => { throw Error('read failed'); };
@@ -36,7 +41,7 @@ describe('review job rebase carry', () => {
       trusted(`<!-- we:red-team-gate pr=1 rev=${a} outcome=card-queued -->\nunknown hold`)] });
     const out = runReviewJob({ pr: 1, repo: 'web-everything/web-everything' }, io);
     expect(out.outcome).not.toBe('carried'); expect(io.runLoop).toHaveBeenCalledTimes(1); expect(io.postCarryComment).not.toHaveBeenCalled();
-    if (['red-team-pending', 'gate-with-hold'].includes(mode)) expect(io.restampVerdict).not.toHaveBeenCalled();
+    if (['red-team-pending', 'gate-with-hold', 'saved-only', 'saved-unreadable', 'no-saved-reader'].includes(mode)) expect(io.restampVerdict).not.toHaveBeenCalled();
   });
 });
 

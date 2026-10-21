@@ -33,6 +33,7 @@ import { readSettings } from '../lib/settings-files.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
+import { readPinnedPrContext, readSnapshotPrView } from '../lib/review-pr-snapshot.mjs';
 
 export const CONTEXT_PACK_DEFAULTS = Object.freeze({
   contextPack: true, contextLines: 30, contextMaxBytes: 8000, localTests: 'proof-only',
@@ -236,7 +237,7 @@ function filesSection(files = [], budget) {
   let used = bytes(head);
   for (const f of files) {
     const r = `- \`${f.path}\` (+${f.additions ?? 0} −${f.deletions ?? 0})`;
-    if (used + bytes(r) + 1 > budget - 40) { rows.push(`- … ${files.length - rows.length} more (gh pr view --json files)`); break; }
+    if (used + bytes(r) + 1 > budget - 80) { rows.push(`- … ${files.length - rows.length} more (shared scripts/pr-context.mjs read)`); break; }
     rows.push(r);
     used += bytes(r) + 1;
   }
@@ -394,9 +395,12 @@ const GH_OPTS = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 
 
 /** IO: the fix pack's inputs — the complete (paginated) comment thread, one `gh pr view` (files, head, labels), and one
  *  raw-contents read per named file. Only a trusted author's (automation / operator) finding comment is staged. */
-export function readFixPackInputs({ repoSlug, pr, exec, maxRefs = 4, readComments = readCompletePrComments, isTrusted = isTrustedMarkerAuthor }) {
-  const pv = JSON.parse(String(exec('gh', ['pr', 'view', String(pr), '--repo', repoSlug, '--json', 'files,headRefOid,labels'], GH_OPTS)));
-  const comments = readComments(pr, { repo: repoSlug, exec });
+export function readFixPackInputs({ repoSlug, pr, headSha, exec, maxRefs = 4, readComments = readCompletePrComments, isTrusted = isTrustedMarkerAuthor, snapshotOptions = {} }) {
+  const run = args => exec('gh', args, GH_OPTS);
+  const pv = headSha
+    ? readPinnedPrContext({ ...snapshotOptions, repo: repoSlug, pr, headSha, exec: run, readComments })
+    : readSnapshotPrView({ ...snapshotOptions, repo: repoSlug, pr, fields: ['files', 'headRefOid', 'labels'], exec: run });
+  const comments = headSha ? pv.comments : readComments(pr, { repo: repoSlug, exec });
   const { findings, advisory } = extractFindings(comments ?? [], { labels: pv.labels ?? null, isTrusted });
   const files = (pv.files ?? []).map((f) => ({ path: f.path, additions: f.additions, deletions: f.deletions }));
   const refs = extractFileRefs(findings.map((f) => f.body).join('\n'), { changedPaths: files.map((f) => f.path), max: maxRefs });
@@ -416,7 +420,7 @@ export function readFixPackInputs({ repoSlug, pr, exec, maxRefs = 4, readComment
 }
 
 /** IO: the ci-heal pack's inputs — the failing checks, the first failing job's failed log, the changed files. */
-export function readCiPackInputs({ repoSlug, pr, exec }) {
+export function readCiPackInputs({ repoSlug, pr, headSha, exec, snapshotOptions = {} }) {
   let checks = [];
   try {
     checks = JSON.parse(String(exec('gh', ['pr', 'checks', String(pr), '--repo', repoSlug, '--json', 'name,bucket,link'], GH_OPTS)));
@@ -435,7 +439,10 @@ export function readCiPackInputs({ repoSlug, pr, exec }) {
   }
   let files = [];
   try {
-    const pv = JSON.parse(String(exec('gh', ['pr', 'view', String(pr), '--repo', repoSlug, '--json', 'files'], GH_OPTS)));
+    const run = args => exec('gh', args, GH_OPTS);
+    const pv = headSha
+      ? readPinnedPrContext({ ...snapshotOptions, repo: repoSlug, pr, headSha, exec: run })
+      : readSnapshotPrView({ ...snapshotOptions, repo: repoSlug, pr, fields: ['files'], exec: run });
     files = (pv.files ?? []).map((f) => ({ path: f.path, additions: f.additions, deletions: f.deletions }));
   } catch { files = []; }
   return { checks: failing, failedTests: extractFailedTests(logTail), logTail, files };
@@ -447,7 +454,7 @@ export function readCiPackInputs({ repoSlug, pr, exec }) {
  * @param {string} brief the filled brief
  * @param {{kind:'fix'|'ci-heal', repoSlug:string, pr:number, exec:Function, readInputs?:Function, settings?:object, env?:object}} o
  */
-export function briefWithContextPack(brief, { kind = 'fix', repoSlug: slug, repo, toSlug, pr, exec, readInputs, settings, env = process.env } = {}) {
+export function briefWithContextPack(brief, { kind = 'fix', repoSlug: slug, repo, toSlug, pr, headSha, exec, readInputs, settings, env = process.env } = {}) {
   // Hermetic under a test runner: a test that wants the pack injects its settings or its reader.
   if (isUnderTest(env) && !settings && !readInputs) return brief;
   let repoSlug = slug;
@@ -458,7 +465,7 @@ export function briefWithContextPack(brief, { kind = 'fix', repoSlug: slug, repo
   let inputs = null;
   if (resolved.value.contextPack) {
     const read = readInputs ?? (isUnderTest(env) ? null : (o) => (kind === 'ci-heal' ? readCiPackInputs(o) : readFixPackInputs(o)));
-    try { inputs = read && (repoSlug || readInputs) ? read({ repoSlug, pr, exec }) : null; } catch { inputs = null; }
+    try { inputs = read && (repoSlug || readInputs) ? read({ repoSlug, pr, headSha, exec }) : null; } catch { inputs = null; }
   }
   try { return applyContextPack(brief, { kind, settings: resolved.value, inputs }); } catch { return brief; }
 }

@@ -3,7 +3,7 @@
  * @description THE IO SHELL of the `scaffold` declaration (#xrrpfo7) — the reader its `read` step is
  *   injected with, and the sink its `write` effect is applied through.
  *
- * IT READS TWO FACTS AND NOTHING ELSE: the existing id set (the allocator's whole input) and today's date.
+ * Reads the existing id set and today's date, and reserves the final id through the shared allocator.
  * Everything the item becomes is decided in the pure plan, so the sink writes bytes it did not choose — which
  * is what makes the #2288 collision retry testable with no filesystem.
  *
@@ -24,6 +24,8 @@ import { writeBacklogMd } from '../backlog/guarded-write.mjs';
 // a day ahead of a UTC-behind operator all evening; `check:standards` scans for that shape and caught the
 // first cut of `resolve-io.mjs` doing exactly it.
 import { localToday } from '../lib/local-date.mjs';
+import { nextHash } from '../backlog/id.mjs';
+import { allocateCardNumber } from '../lib/card-number-allocator.mjs';
 import { SCAFFOLD_EFFECT } from './scaffold.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -44,6 +46,8 @@ export function createScaffoldReader({
   root = REPO_ROOT,
   listFiles = (dir) => readdirSync(dir),
   today = localToday,
+  allocate = allocateCardNumber,
+  log = console.warn,
 } = {}) {
   return () => {
     const dir = backlogDir(root);
@@ -51,7 +55,11 @@ export function createScaffoldReader({
       .filter((f) => f.endsWith('.md'))
       .map((f) => idFromName(f))
       .filter(Boolean);
-    return { existingIds, today: today(), dir };
+    const bornAs = nextHash(existingIds);
+    const allocation = allocate({ id: bornAs, cwd: root, log });
+    if (!allocation.ok) log(`scaffold: using hash naming: ${allocation.reason}`);
+    return { existingIds, today: today(), dir, bornAs,
+      ...(allocation.ok ? { allocatedId: String(allocation.num) } : {}) };
   };
 }
 
