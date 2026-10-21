@@ -534,7 +534,10 @@ function operatorRuled(records, pr, head) {
     const named = cap?.gate.result === want && Number.isFinite(result.at);
     // A clearance cannot approve a later send-back, even if an older/unknown grant snapshot leaves the cap winning.
     // This also keeps existing send-backs held while persisted grant identities migrate to a reader-independent key.
-    if (cap && cleared && cleared.at > cap.at && (cleared.at > result.at || named) && gates.every(r =>
+    // A plain accept of the LIVE head (even across carries) after the human ceremony supersedes it; a bot-posted cleared-human marker cannot revive it.
+    const reaccepted = cleared && trusted.some(r => !r.from && r.at > cleared.at && parseLatestHumanClearedSha([r.c]) === null
+      && new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:\\s*${head}\\s*-->`, 'i').test(recordBody(r)));
+    if (cap && cleared && !reaccepted && cleared.at > cap.at && (cleared.at > result.at || named) && gates.every(r =>
       ![GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK].includes(r.gate.outcome) || cleared.at > r.at)) return true;
     // A ruling inherited through a carry cannot approve this head's own later gate decisions.
     if (gates.some(r => !r.from && [GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK].includes(r.gate.outcome))) return false;

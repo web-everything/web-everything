@@ -67,6 +67,8 @@ describe('operator ruling at the round cap', () => {
     ['clearance before the round-cap record', [clean(head, 'web-everything', broken), accept(head, true), gate(head, 'round-cap')]],
     ['clearance on another head', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(prior, true)]],
     ['a clear-human posted by automation (forged ruling)', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true, bot)]],
+    ['a bot-posted cleared-human marker reviving a superseded human clearance', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true), accept(head), restamp(head)]],
+    ['a clear-human by an operator login typed Bot', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true, { author: { login: 'chalbert', type: 'Bot' } })]],
     ['untrusted clearance', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), { ...accept(head, true), author: { login: 'attacker' } }]],
     ['a later plain accept supersedes it', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true), accept(head)]],
     ['no round-cap record (the gate never handed it over)', [clean(head, 'web-everything', broken), accept(head, true)]],
