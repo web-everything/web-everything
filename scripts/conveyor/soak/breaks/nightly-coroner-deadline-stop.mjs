@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { keepAliveScript } from '../../../lib/test-keepalive.mjs';
 import { createJobStore, enqueueJob, reattachTick, JOB_ID_ENV, JOB_ATTEMPT_ENV } from '../../../lib/daemon-jobs-runtime.mjs';
 import { markLaunching } from '../../../lib/daemon-jobs.mjs';
 import { HEALTH_NIGHTLY_CORONER_KIND, HEALTH_WATCH_JOB_KINDS } from '../../../../skills-src/conveyor/daemon-manifest.mjs';
@@ -28,7 +29,7 @@ export default {
       mkdirSync(join(lane.path, 'scripts/operations'), { recursive: true });
       const pidFile = join(root, 'extractor.pid'), released = join(root, 'released');
       writeFileSync(join(lane.path, 'scripts/operations/coroner-extract.mjs'),
-        `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetInterval(() => {}, 1000);\n`);
+        `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(pidFile)}, String(process.pid));\n${keepAliveScript()}\n`);
       const input = { night: '2026-10-16', until: '2026-10-17T02:17:00.000Z', dir: join(root, 'state'), sourceRoot: root };
       const io = { home: join(root, 'handoff'), statusFeed: join(root, 'feed.jsonl'), lane, released };
       // The job child as the daemon launches it: detached, running the job's own entry (or, before the fix, the
