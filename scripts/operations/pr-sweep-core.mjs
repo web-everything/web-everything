@@ -92,10 +92,8 @@ export function referralHoldOpen(comments, { headCommittedAt = null } = {}) {
 // A failed save is recognised only in the shapes the reviewer itself writes: the hold comment's own words, or the
 // reviewer's "parked" / advisory notice. A trusted comment that merely MENTIONS a ledger miss (another PR, telemetry)
 // must never excuse the operator.
-const PERSISTENCE_FAILED_RE = /referral persistence failed|referral-persistence-failed/i;
+const PERSISTENCE_FAILED_RE = /(?:^|\n)\s*Referral persistence failed; the next bounded retry is at \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z\.?(?:\n|$)/;
 const PARKED_FAILURE_RE = /^\s*Mandatory referral review parked to review:human: mandatory ruling ledger-write-miss/i;
-const failureComment = (body) => PERSISTENCE_FAILED_RE.test(body) || PARKED_FAILURE_RE.test(body);
-const holdCount = (hold) => hold.count ?? ((hold.body.match(/^\s*- `/gm) ?? []).length || null);
 
 /**
  * EVIDENCE BEHIND AN OPEN REFERRAL HOLD. A hold comment says "N referrals need a ruling", but that count can be stale:
@@ -106,7 +104,7 @@ const holdCount = (hold) => hold.count ?? ((hold.body.match(/^\s*- `/gm) ?? []).
  */
 export function holdEvidence(pr, hold, { cardReadable = (ref) => referralCardReadable(ref) } = {}) {
   const persistenceFailed = PERSISTENCE_FAILED_RE.test(hold.body ?? '')
-    || sorted(pr.comments).some((e) => e.at !== null && e.at >= hold.at && trusted(e) && failureComment(bodyOf(e.c)));
+    || sorted(pr.comments).some((e) => e.at !== null && e.at >= hold.at && trusted(e) && PARKED_FAILURE_RE.test(bodyOf(e.c)));
   try {
     const r = openReferralFindings({ comments: pr.comments ?? [], repo: pr.repo, pr: pr.number, head: String(pr.headRefOid ?? '').toLowerCase(),
       body: pr.body ?? '', createdAt: pr.createdAt ?? '', cardReadable });
@@ -223,12 +221,9 @@ export function deriveWaitingOn(pr, ctx) {
     if (!ev.unreadable && ev.persistenceFailed) return done('system:ledger-write-miss', 'system', hold.at,
       `the review is paused but the reviewer's referral save failed (ledger-write-miss); ${ev.open.length} finding(s) open on the live head${keys.length ? ` (${keys.join(', ')})` : ''}`,
       NO_ASK, ['review-referral-hold comment', 'referral persistence failed']);
-    // STALE needs PROOF: the hold names N referrals, none is open, and at least N findings carry a standing ruling. A
-    // thread with no (or fewer) saved records proves nothing: a failed save leaves exactly that (live #5485), and an
-    // older ruled run must not hide newer unsaved referrals. An unknown N is never proof.
-    const named = holdCount(hold);
-    if (!ev.unreadable && ev.open.length === 0 && named !== null && ev.ruled >= named) return done('system:stale-hold', 'system', hold.at,
-      'the hold is stale: every finding on the live head already has a standing ruling', NO_ASK, ['review-referral-hold comment', '0 open findings']);
+    // Existing hold notices have no runId/key subjects linking them to saved referrals. Even equal counts and zero
+    // open records cannot prove that a newer hold names the older ruled findings: its save may have failed. Leave
+    // the operator request visible until referralHoldOpen observes a dated closer or a later push.
     return done('ruling-needed:referral-hold', 'operator', hold.at,
       `review paused: ${ev.open.length || hold.count || 'some'} open referral(s) need an operator ruling${keys.length ? ` [${keys.join(', ')}]` : ''}${ev.unreadable ? ` (evidence unreadable: ${ev.unreadable})` : ''} (${hold.text})`,
       actions.referralRuling, ['review-referral-hold comment', ...(keys.length ? [`open: ${keys.join(', ')}`] : [])]);
