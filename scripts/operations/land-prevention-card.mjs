@@ -82,6 +82,7 @@
  *   node scripts/operations/land-prevention-card.mjs --drain-pending
  *   node scripts/operations/land-prevention-card.mjs --fold-open-singles [--json]
  */
+import { owePreventionFiling, fileOwedPrevention } from '../lib/prevention-filing-owed.mjs';
 import { machinePrTitle, preventionCardTitle } from './machine-pr-title.mjs';
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync, readdirSync, renameSync } from 'node:fs';
@@ -92,7 +93,8 @@ import { setTimeout as sleep } from 'node:timers/promises';
 
 import { fileIntoBatch, cardIdOf } from './card-batch-file.mjs';
 import { cardBatchStateDir } from './card-batch-io.mjs';
-import { loadPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
+import { loadPreventionBatchSettings, formatPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
+import { loadWidenMode, emitWouldBatch } from '../lib/card-batch-shadow.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
 import {
   buildApprovalPreventionRetraction, APPROVAL_PREVENTION_DIGEST_KEY_SEP, APPROVAL_PREVENTION_KEY_PREFIX,
@@ -104,6 +106,8 @@ import {
   remainingAfter,
 } from '../lib/card-dedupe.mjs';
 
+import { STEP_MIN_MS, boundExec, isBudgetError, makeDeadline } from '../lib/tick-deadline.mjs';
+import { cursorSeed, readDrainCursor, rotateAfter, writeDrainCursor } from '../lib/prevention-drain-cursor.mjs';
 import { raisedByFile, readRaisedBy, parseRaisedBy, raisedByKey } from '../lib/raised-by.mjs';
 
 const HERE = resolve(fileURLToPath(import.meta.url), '..');
@@ -241,6 +245,7 @@ export function parseLandPreventionCardArgv(argv = []) {
     parent: String(flags.parent ?? ''),
     queue: String(flags.queue),
     session: String(flags.session),
+    ...(flags['owed-key'] ? { owedKey: flags['owed-key'] } : {}),
     retract: retractFlags.every(Boolean)
       ? { repo: retractFlags[0], pr: retractFlags[1], headSha: retractFlags[2] }
       : null,
@@ -303,6 +308,15 @@ export function parseRunJsonTail(out) {
  *  eventually rather than hold a lane and a pool slot forever. Mirrors `verify-io.mjs#verifySpawnTimeoutMs`'s
  *  own reasoning (heavy-admission queueing + the suites themselves can legitimately run long). */
 export const ACQUIRE_TIMEOUT_MS = 3 * 60_000;
+/** Extra time past a capped acquire's wait for the pool scan itself. */
+export const ACQUIRE_SCAN_SLACK_MS = 10_000;
+/**
+ * Did a capped acquire merely run out of time / find every lane busy? Matches lane-pool's own diagnostics: "no lane within
+ * Nms" (shared-scan lock contention), "(N all held/dirty)", and a timeout. A "failed to provision" pool is an operational
+ * failure and stays an error.
+ */
+export const isNoLaneInTime = text => !/failed to provision/i.test(text)
+  && /no lane within|no free lane|all held\/dirty|timed out|ETIMEDOUT/i.test(text);
 export const FILE_ITEM_TIMEOUT_MS = 2 * 60_000;
 export const VERIFY_TIMEOUT_MS = 70 * 60_000;
 export const OPEN_PR_TIMEOUT_MS = 45 * 60_000;
@@ -378,6 +392,13 @@ async function withRecoveryCard(lane, rel, content, admit) {
 export async function drainPendingPrevention({ lane }, {
   pendingDir = pendingPreventionDir(), exec = defaultExec, batch = fileIntoBatch,
   write = (line) => process.stdout.write(line), batchOptions = {},
+  // Optional per-tick cap (the health-watch probe): at most `maxCards` cards are STARTED, none once `deadlineAt` has
+  // passed, and `cursorPath` makes each call resume after the last card handled so a card that keeps failing goes
+  // behind the others instead of blocking the head. Unset = the whole spool in order, as before.
+  // `counter` ({left}) is one card allowance shared with the other drain steps of the same tick.
+  maxCards = Infinity, deadlineAt = Infinity, now = Date.now, cursorPath, counter,
+  // The HARD deadline of the tick's drain: no card is started with too little time left to finish it.
+  hardDeadlineAt = Infinity,
 } = {}) {
   let entries;
   try { entries = readdirSync(pendingDir).filter(name => name.endsWith('.json')).sort(); }
@@ -385,14 +406,28 @@ export async function drainPendingPrevention({ lane }, {
     if (error.code !== 'ENOENT') write(`land-prevention-card: pending spool read failed — ${errorReason(error)}\n`);
     return;
   }
+  if (cursorPath) entries = rotateAfter(entries, readDrainCursor(cursorPath).pending, cursorSeed(cursorPath));
+  let started = 0;
   for (const name of entries) {
+    if (now() >= deadlineAt) break;
+    if (hardDeadlineAt - now() < STEP_MIN_MS.pendingCard) break;
+    // The allowance is spent BEFORE any per-card work (parse, ls-tree, admission): a lookup that throws still counts as an attempt,
+    // so a failing spool cannot be walked card by card past the cap.
+    if (counter ? counter.left-- <= 0 : started++ >= maxCards) break;
     const path = join(pendingDir, name);
     try {
       const entry = JSON.parse(readFileSync(path, 'utf8'));
       if (!/^backlog\/x?[a-z0-9]+-[^/]+\.md$/.test(entry.rel)) throw new Error('invalid pending card path');
       if (String(exec('git', ['-C', lane, 'ls-tree', 'origin/main', '--', entry.rel], {})).trim()) {
         rmSync(path);
+        if (cursorPath) writeDrainCursor(cursorPath, { pending: name });
         continue;
+      }
+      // Re-checked right before the admission: the ls-tree above can itself take long.
+      if (now() >= deadlineAt) {
+        // The lookup ate the deadline: this card WAS attempted, so the next tick resumes after it (it stays in the spool).
+        if (cursorPath) writeDrainCursor(cursorPath, { pending: name });
+        break;
       }
       const result = await withRecoveryCard(lane, entry.rel, entry.content, () => batch({
         laneDir: lane, cardPath: entry.rel, kind: 'prevention', actor: 'mechanical',
@@ -402,7 +437,15 @@ export async function drainPendingPrevention({ lane }, {
         rmSync(path);
         write(`land-prevention-card: batched ${entry.rel} into ${result.batchRef} (from the pending spool)\n`);
       }
-    } catch (error) { write(`land-prevention-card: pending ${name} retained — ${errorReason(error)}\n`); }
+    } catch (error) {
+      write(`land-prevention-card: pending ${name} retained — ${errorReason(error)}\n`);
+      if (isBudgetError(error)) { // out of tick time mid-card: it stays in the spool; the cursor still moves on so the head is not retried forever
+        if (cursorPath) writeDrainCursor(cursorPath, { pending: name });
+        break;
+      }
+    }
+    // Handled, landed or not: the next tick resumes after it, so a refused card is behind every other one.
+    if (cursorPath) writeDrainCursor(cursorPath, { pending: name });
   }
 }
 
@@ -468,8 +511,20 @@ export async function foldOpenSingles({ lane }, {
  * @returns {Promise<{ok:boolean, step:string, num:(number|string|null), rel:(string|null), pr:(number|null),
  *   url:(string|null), reason:(string|null)}>}
  */
-export async function landPreventionCard(input, {
-  exec = defaultExec,
+export async function landPreventionCard(input, options = {}) {
+  try {
+    // A dry run never files: it reports only, BEFORE any owed-filing obligation can substitute its stored input
+    // (which drops `dryRun`/`root`) or a paused filer records a new one (operator ruling 2026-10-20).
+    if (input?.dryRun) return await landPreventionCardImpl(input, options);
+    const loadFilingSettings = options.loadFilingSettings ?? loadPreventionBatchSettings;
+    if (loadFilingSettings().filingEnabled === false) return await landPreventionCardImpl(input, options);
+    if (options.owedClaimed) return await landPreventionCardImpl(boundLandPreventionCardInput(input), options);
+    return await fileOwedPrevention(input, filing => landPreventionCardImpl(filing.owedKey ? boundLandPreventionCardInput(filing) : filing, options));
+  } catch (e) { return { ok: false, step: 'owed', reason: e.message, pr: null, url: null }; }
+}
+
+async function landPreventionCardImpl(input, {
+  exec: execRaw = defaultExec,
   pendingDir = pendingPreventionDir(),
   write = (line) => process.stdout.write(line),
   mkTmp = () => mkdtempSync(join(tmpdir(), 'land-prevention-card-')),
@@ -479,8 +534,31 @@ export async function landPreventionCard(input, {
   dedupe = runCardDedupe,
   batch = fileIntoBatch,
   loadPreventionBatchSettings: loadBatchSettings = loadPreventionBatchSettings,
+  loadFilingSettings = loadPreventionBatchSettings,
+  loadWidenMode: loadWiden = loadWidenMode,
   sleep: wait = sleep,
+  drainLimit = {},
+  acquireWait,
+  skipPendingDrain = false,
 } = {}) {
+  // Inside the health-watch tick (`drainLimit.hardDeadlineAt`) EVERY wait and subprocess below is capped at the time left, and a
+  // step the remaining time cannot cover is deferred (card stays in the spool / owed) rather than started.
+  const inTick = drainLimit.hardDeadlineAt !== undefined;
+  const deadline = inTick ? makeDeadline(drainLimit.hardDeadlineAt, drainLimit.now ?? Date.now) : undefined;
+  const exec = boundExec(execRaw, deadline);
+  const outOfBudget = (error) => inTick && (isBudgetError(error) || deadline.left() <= 0);
+  const deferTick = (step, why) => {
+    write(`land-prevention-card: ${why}; deferred to the next tick\n`);
+    return { ok: true, skipped: true, deferred: true, step, pr: null };
+  };
+  const filing = loadFilingSettings();
+  write(`${formatPreventionBatchSettings(filing)}\n`);
+  if (filing.filingEnabled === false) {
+    const reason = 'prevention filing paused by prevention.filingEnabled';
+    if (input.title && !input.dryRun) owePreventionFiling(input);
+    write(`${reason}\n`);
+    return { ok: false, skipped: true, step: 'paused', reason, num: null, rel: null, pr: null, url: null };
+  }
   // ONE scratch dir per run, created lazily and removed on every exit path (#4317 advisory review, 2026-09-29 —
   // the first cut made a fresh `mkdtempSync` dir for each file and never removed either, leaking two per filing).
   let scratch = null;
@@ -519,13 +597,32 @@ export async function landPreventionCard(input, {
     const generic = /^File the prevention guard\(s\) owed by (\S+)#(\d+)'s/i.exec(input.title ?? '');
     if (generic) input = { ...input, title: preventionCardTitle({ repo: generic[1], pr: generic[2], digest: input.digest }) };
     let acquired;
+    // Declared OUTSIDE the try: the catch below classifies against it (a block-scoped const there was a ReferenceError).
+    let waitMs;
     try {
       write(`land-prevention-card: acquiring a lane (session ${input.session})…\n`);
+      // Inside the health-watch tick the acquire may wait only as long as the drain budget has left (`drainLimit.acquireWaitMs`
+      // for the spool drain, `acquireWait()` for an owed filing, read right before the acquire), plus slack for the pool scan;
+      // otherwise it can alone outlast the tick's watchdog.
+      // Both are read HERE, at the acquire, so the wait is the live remaining budget, never a snapshot from earlier in the tick.
+      waitMs = input.drainPending ? (drainLimit.acquireWait?.() ?? drainLimit.acquireWaitMs) : acquireWait?.();
       acquired = parseRunJsonTail(exec('node', [
         LANE_POOL_CLI, 'acquire', '--purpose=prevention-card', `--session=${input.session}`, '--json',
-      ], { cwd: REPO_ROOT, timeout: ACQUIRE_TIMEOUT_MS }));
+        ...(waitMs === undefined ? [] : [`--wait-ms=${Math.max(0, Math.floor(waitMs))}`]),
+      ], { cwd: REPO_ROOT, timeout: waitMs === undefined ? ACQUIRE_TIMEOUT_MS : Math.max(0, Math.floor(waitMs)) + ACQUIRE_SCAN_SLACK_MS }));
     } catch (e) {
-      return fail('acquire', String(e?.message || e).split('\n')[0]);
+      const reason = String(e?.message || e).split('\n')[0];
+      // A real child failure carries the pool's diagnostic on stderr, after the `Command failed:` line.
+      const text = [e?.message, e?.stderr, e?.stdout].map(part => String(part ?? '')).join('\n');
+      // A capped acquire that found no lane in time ends this tick's drain: the cards stay put (an owed filing stays owed), no error.
+      if (waitMs !== undefined && (e?.killed || e?.code === 'ETIMEDOUT' || isNoLaneInTime(text) || outOfBudget(e))) {
+        // A killed acquire may already have claimed a lane it never reported: release by this run's UNIQUE session (a no-op when none).
+        // In-tick only: callers without a hard deadline keep the parent behaviour.
+        if (inTick) try { execRaw('node', [LANE_POOL_CLI, 'release', '--all', `--session=${input.session}`], { cwd: REPO_ROOT, timeout: 10_000, killSignal: 'SIGKILL' }); } catch { /* ages out on its TTL */ }
+        write(`land-prevention-card: no lane within ${waitMs}ms; deferred to the next tick\n`);
+        return { ok: true, skipped: true, deferred: true, step: 'acquire-deferred', pr: null };
+      }
+      return fail('acquire', reason);
     }
     const lane = acquired?.path ?? null;
     laneNum = acquired?.lane ?? null;
@@ -538,7 +635,18 @@ export async function landPreventionCard(input, {
     // one hop further out. A real delivery agent avoids this by `cd $LANE` + a RELATIVE `scripts/...` path; this
     // does the equivalent by building the lane's own absolute path explicitly.
     const laneRunMjs = join(lane, 'scripts', 'operations', 'run.mjs');
-    await drainPendingPrevention({ lane }, { pendingDir, exec, batch, write });
+    // Inside the health-watch tick `drainLimit` caps this drain (shared card allowance, deadline, cursor).
+    // Operator ruling 2026-10-20: inside the tick an OWED filing does NOT drain the spool itself (`skipPendingDrain`); the
+    // probe drains the spool in its own capped, round-robin slice, so nothing is lost and the tick stays bounded.
+    // An owed filing whose acquire used up the tick's deadline is deferred (it stays owed), never run past it.
+    if (!input.drainPending && drainLimit.deadlineAt !== undefined && (drainLimit.now ?? Date.now)() >= drainLimit.deadlineAt) {
+      write('land-prevention-card: tick deadline reached after the lane acquire; deferred to the next tick\n');
+      return { ok: true, skipped: true, deferred: true, step: 'deadline-deferred', pr: null };
+    }
+    if (!skipPendingDrain) {
+      await drainPendingPrevention({ lane }, { pendingDir, exec, batch, write, batchOptions: inTick ? { deadline } : {}, ...drainLimit,
+        hardDeadlineAt: inTick ? drainLimit.hardDeadlineAt : Infinity });
+    }
     if (input.foldOpenSingles) {
       const summary = await foldOpenSingles({ lane }, { exec, batch, write });
       return { ok: true, step: 'folded', ...summary };
@@ -547,10 +655,19 @@ export async function landPreventionCard(input, {
 
 
     // DEDUPE BEFORE FILING. A failure here never blocks the filing: it files exactly as before.
+    if (inTick && deadline.left() < STEP_MIN_MS.dedupe + STEP_MIN_MS.fileItem + STEP_MIN_MS.admit) {
+      return deferTick('budget-deferred', 'not enough tick time left for dedupe + file-item + admission');
+    }
     let plan = null;
     try {
-      plan = dedupe(input, { lane, write });
+      // The dedupe's gh reads go through the SAME bounded exec: after expiry each further request is refused at once (no fresh
+      // one-second floor per call) and a child that ignores SIGTERM is killed.
+      // In-tick the dedupe reads NO hosted-PR cards: that path goes through gh-throttle, whose transient retries, rate-limit retries and
+      // personal-token lookup each start their own subprocess and cannot share the tick's deadline. Local open cards still dedupe; a
+      // finding that matches only a card on an open PR is filed instead of mentioned (the same as an unreadable PR list: fewer candidates).
+      plan = dedupe(input, { lane, write, ...(inTick ? { readPrCards: () => [] } : {}) });
     } catch (e) {
+      if (outOfBudget(e)) return deferTick('budget-deferred', 'tick time ran out during dedupe');
       write(`land-prevention-card: dedupe failed, filing as before — ${String(e?.message || e).split('\n')[0]}\n`);
     }
     const mentioned = []; // mentions appended to a card in THIS lane (landed by the PR below)
@@ -606,9 +723,11 @@ export async function landPreventionCard(input, {
       ];
       let filed;
       try {
+        if (inTick && deadline.left() < STEP_MIN_MS.fileItem + STEP_MIN_MS.admit) return deferTick('budget-deferred', 'not enough tick time left for file-item + admission');
         filed = parseRunJsonTail(exec('node', fileArgv, { cwd: lane, timeout: FILE_ITEM_TIMEOUT_MS }));
       } catch (e) {
         filed = parseRunJsonTail(e?.stdout);
+        if (!filed && outOfBudget(e)) return deferTick('budget-deferred', 'tick time ran out during file-item');
         if (!filed) return fail('file-item', String(e?.message || e).split('\n')[0]);
       }
       num = filed?.verdict?.num ?? null;
@@ -630,7 +749,9 @@ export async function landPreventionCard(input, {
         const preventionSettings = loadBatchSettings();
         const retries = Math.ceil(preventionSettings.batchLeaseWaitMinutes * 60 / 30);
         result = await batch({ laneDir: lane, cardPath: rel, kind: 'prevention', actor: 'mechanical', idemKey, source },
-          { preventionSettings, retries, pause: () => wait(30_000) });
+          { preventionSettings, retries, ...(inTick ? { deadline } : {}),
+            // The lease wait is min(configured, time left): never a 30 s sleep that outlasts the tick.
+            pause: () => wait(inTick ? Math.max(0, Math.min(30_000, deadline.left() - STEP_MIN_MS.admit - 1_000)) : 30_000) });
       } catch (error) { result = { batched: false, reason: `admission failed: ${errorReason(error)}` }; }
       if (result?.batched) {
         write(`land-prevention-card: batched ${rel} into ${result.batchRef}\n`);
@@ -643,6 +764,19 @@ export async function landPreventionCard(input, {
         write(`land-prevention-card: held ${rel} for the next batch window — ${reason}\n`);
         return { ok: true, step: 'held', num, rel, pr: null, url: null, reason };
       }
+    }
+
+    // The commit / verify gate / open-PR path takes up to 70 + 45 minutes: it never runs inside a tick. The card stays owed / in the spool.
+    if (inTick) return deferTick('tick-deferred', 'this filing needs its own PR (batching disabled or sidecar mentions), which cannot run inside the tick');
+
+    if (mentioned.length) {
+      // SHADOW (card xafcvmh): this filing adds sidecars to existing cards, so it still opens its own PR. Log what a
+      // widened batch would have held. Never throws, never changes what happens next.
+      try { emitWouldBatch({
+        loadWiden, cards: [rel ? (num ?? cardIdOf(rel)) : null, ...mentioned.map((m) => m.card.id)],
+        paths: [rel, ...mentioned.flatMap((m) => m.paths)].filter(Boolean),
+        write: (line) => write(`land-prevention-card: ${line}\n`),
+      }); } catch { /* argument building must not affect landing either */ }
     }
 
     write(`land-prevention-card: committing ${[rel, ...mentioned.flatMap((m) => m.paths)].filter(Boolean).join(', ')}…\n`);
@@ -705,11 +839,14 @@ export async function landPreventionCard(input, {
       ...(recorded.length ? { mentions: recorded.length } : {}),
     };
   } catch (e) {
+    if (outOfBudget(e)) return deferTick('budget-deferred', 'tick time ran out');
     return fail('unexpected', String(e?.message || e));
   } finally {
     if (laneNum != null) {
       try {
-        exec('node', [LANE_POOL_CLI, 'release', `--lane=${laneNum}`, `--session=${input.session}`], { cwd: REPO_ROOT, timeout: ACQUIRE_TIMEOUT_MS });
+        // Release is not skipped when the budget is gone (the lane would leak until its TTL), but it is bounded: 5-30 s in a tick.
+        execRaw('node', [LANE_POOL_CLI, 'release', `--lane=${laneNum}`, `--session=${input.session}`],
+          { cwd: REPO_ROOT, timeout: inTick ? Math.min(30_000, Math.max(5_000, deadline.left())) : ACQUIRE_TIMEOUT_MS, ...(inTick ? { killSignal: 'SIGKILL' } : {}) });
       } catch (e) {
         write(`land-prevention-card: lane-${laneNum} release failed (non-fatal, will age out on its own TTL) — ${String(e?.message || e)}\n`);
       }

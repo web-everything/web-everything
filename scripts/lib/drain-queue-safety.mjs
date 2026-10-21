@@ -1,9 +1,10 @@
 /** Queue admission and removal share this policy and head-bound red-team evidence. */
-import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
+import { redTeamOwedOnHead, redTeamPanelSeatOwed } from './review-red-team-policy.mjs';
 import { execFileSync } from 'node:child_process';
 import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
 import { readMergeQueueState } from './merge-queue-enqueue.mjs';
+import { savedRedTeamFallback } from './drain-saved-red-team.mjs';
 import { readRedTeamDisposition, readRedTeamProbes } from './red-team-gate.mjs';
 
 export function readDrainQueueSafety({ env = process.env, tool, platform, log = () => {} } = {}) {
@@ -12,9 +13,9 @@ export function readDrainQueueSafety({ env = process.env, tool, platform, log = 
   const numberEnv = key => env[key] === undefined ? undefined : Number(env[key]);
   const positive = v => typeof v === 'number' && Number.isFinite(v) && v > 0;
   const r = cascadePolicy('drain', tool ?? (env.VITEST || env.WE_UNDER_TEST ? {} : readSettings().drain), {
-    env, platform, standard: { waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true, redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45, enqueueWhenRedTeamNeverScheduled: true },
-    valid: { enqueueWhenRedTeamNeverScheduled: v => typeof v === 'boolean', waitForRedTeamBeforeEnqueue: v => typeof v === 'boolean', dequeueOnSendBack: v => typeof v === 'boolean', redTeamPendingBackoffSec: positive, redTeamPendingMaxMin: positive },
-    envValues: { enqueueWhenRedTeamNeverScheduled: booleanEnv('WE_DRAIN_ENQUEUE_WHEN_RED_TEAM_NEVER_SCHEDULED'), waitForRedTeamBeforeEnqueue: booleanEnv('WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE'), dequeueOnSendBack: booleanEnv('WE_DRAIN_DEQUEUE_ON_SEND_BACK'), redTeamPendingBackoffSec: numberEnv('WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC'), redTeamPendingMaxMin: numberEnv('WE_DRAIN_RED_TEAM_PENDING_MAX_MIN') },
+    env, platform, standard: { waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true, redTeamRequestCooldownMin: 5, redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45, enqueueWhenRedTeamNeverScheduled: true },
+    valid: { enqueueWhenRedTeamNeverScheduled: v => typeof v === 'boolean', waitForRedTeamBeforeEnqueue: v => typeof v === 'boolean', dequeueOnSendBack: v => typeof v === 'boolean', redTeamRequestCooldownMin: positive, redTeamPendingBackoffSec: positive, redTeamPendingMaxMin: positive },
+    envValues: { enqueueWhenRedTeamNeverScheduled: booleanEnv('WE_DRAIN_ENQUEUE_WHEN_RED_TEAM_NEVER_SCHEDULED'), waitForRedTeamBeforeEnqueue: booleanEnv('WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE'), dequeueOnSendBack: booleanEnv('WE_DRAIN_DEQUEUE_ON_SEND_BACK'), redTeamRequestCooldownMin: numberEnv('WE_DRAIN_RED_TEAM_REQUEST_COOLDOWN_MIN'), redTeamPendingBackoffSec: numberEnv('WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC'), redTeamPendingMaxMin: numberEnv('WE_DRAIN_RED_TEAM_PENDING_MAX_MIN') },
   });
   log(formatCascadeSourcesLine('drain', r));
   return r;
@@ -29,15 +30,21 @@ export function sendBackReason(labels) {
 
 /** Only head-bound scheduled work is owed; acceptance and status labels cannot invent a run. */
 export function postAcceptRedTeamOwed(loopPayload, env = process.env, evidence = {}) {
-  return redTeamOwedOnHead({ read: loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly });
+  return redTeamPanelSeatOwed(loopPayload, env) || redTeamOwedOnHead({ read: loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly });
 }
 
-export function redTeamEnqueueHold({ loopPayload, comments, pr, head, repo = null, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false, skipCardOnly } = {}) {
+export function redTeamEnqueueHold({ loopPayload, comments, repo = null, pr, head, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false, attempted = false, requestPending = false, skipCardOnly } = {}) {
   // A recorded break still holds even if the scheduler is now disabled or the payload is unavailable.
-  const disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks, repo });
+  let disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks, repo });
+  if (!disposition.result) {
+    const savedResult = savedRedTeamFallback({ repo, pr, head, env })();
+    if (savedResult) disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks, savedResult, repo });
+  }
   if (disposition.sendBack.length || disposition.held.length)
     return 'post-accept red team confirmed a break requiring send-back';
-  if (!postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded, skipCardOnly }) || disposition.result) return null;
+  if (disposition.result?.recheckIncomplete) return 'post-accept red team pending: saved red-team re-check incomplete';
+  if (disposition.result) return null;
+  if (!requestPending && !postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded: recorded || attempted, skipCardOnly })) return null;
   return 'post-accept red team has no recorded result on the live head';
 }
 

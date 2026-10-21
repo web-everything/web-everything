@@ -61,8 +61,20 @@ describe('prevention.* batch settings cascade', () => {
   const standard = loadCardBatchPolicy().prevention;
   it('uses standard defaults without optional preferences', () => {
     const settings = loadPreventionBatchSettings({ env: {}, repo: {}, read: () => { throw new Error('missing'); } });
-    expect(settings).toEqual({ batchFiling: true, batchWindowMinutes: 120, batchMaxCards: 10, batchLeaseWaitMinutes: 15,
-      sources: { batchFiling: 'standard', batchWindowMinutes: 'standard', batchMaxCards: 'standard', batchLeaseWaitMinutes: 'standard' }, invalid: [] });
+    expect(settings).toEqual({ batchFiling: true, batchWindowMinutes: 120, batchMaxCards: 10, batchLeaseWaitMinutes: 15, filingEnabled: true, drainCardsPerTick: 1,
+      sources: { batchFiling: 'standard', batchWindowMinutes: 'standard', batchMaxCards: 'standard', batchLeaseWaitMinutes: 'standard', filingEnabled: 'standard', drainCardsPerTick: 'standard' }, invalid: [] });
+  });
+  it('drainCardsPerTick: standard 1, repo then env override, invalid value ignored with the layer below answering', () => {
+    expect(resolvePreventionBatchSettings({ standard, env: {} })).toMatchObject({ drainCardsPerTick: 1, sources: { drainCardsPerTick: 'standard' } });
+    expect(resolvePreventionBatchSettings({ standard, repo: { drainCardsPerTick: 2 }, env: {} })).toMatchObject({ drainCardsPerTick: 2, sources: { drainCardsPerTick: 'repo' } });
+    expect(resolvePreventionBatchSettings({ standard, repo: { drainCardsPerTick: 2 }, env: { WE_PREVENTION_DRAIN_CARDS_PER_TICK: '3' } }))
+      .toMatchObject({ drainCardsPerTick: 3, sources: { drainCardsPerTick: 'env' } });
+    for (const bad of [0, -1, 1.5, '2', true]) {
+      expect(resolvePreventionBatchSettings({ standard, repo: { drainCardsPerTick: bad }, env: {} }))
+        .toMatchObject({ drainCardsPerTick: 1, sources: { drainCardsPerTick: 'standard' }, invalid: ['repo.drainCardsPerTick'] });
+    }
+    expect(resolvePreventionBatchSettings({ standard, repo: { drainCardsPerTick: 2 }, env: { WE_PREVENTION_DRAIN_CARDS_PER_TICK: 'many' } }))
+      .toMatchObject({ drainCardsPerTick: 2, sources: { drainCardsPerTick: 'repo' }, invalid: ['env.drainCardsPerTick'] });
   });
   it.each(['platform', 'repo', 'env'])('%s wins for each key', (layer) => {
     const layers = { standard, platform: { batchFiling: false, batchWindowMinutes: 30, batchMaxCards: 3, batchLeaseWaitMinutes: 3 } };
@@ -110,11 +122,13 @@ describe('prevention.* batch settings cascade', () => {
       .toMatchObject({ batchWindowMinutes: 25, sources: { batchWindowMinutes: 'platform' } });
   });
   it('ships the operator window in declared repo settings and logs the sources', () => {
-    const settings = loadPreventionBatchSettings({ env: {}, read: () => '{}' });
-    expect(settings).toMatchObject({ batchFiling: true, batchWindowMinutes: 60, batchMaxCards: 25, batchLeaseWaitMinutes: 15,
-      sources: { batchFiling: 'repo', batchWindowMinutes: 'repo', batchMaxCards: 'repo', batchLeaseWaitMinutes: 'repo' } });
-    expect(formatPreventionBatchSettings(settings)).toBe('prevention-batch settings: prevention.batchFiling=true (repo), prevention.batchWindowMinutes=60 (repo), prevention.batchMaxCards=25 (repo), prevention.batchLeaseWaitMinutes=15 (repo)');
-    expect(effectiveCardBatchPolicy().prevention.maxAgeMinutes).toBe(60);
+    // An explicit fixture of the declared block, not the host's live settings: the value is flipped on purpose later.
+    const declared = { batchFiling: true, batchWindowMinutes: 60, batchMaxCards: 25, batchLeaseWaitMinutes: 15, filingEnabled: false };
+    const settings = loadPreventionBatchSettings({ env: {}, read: () => '{}', repo: declared });
+    expect(settings).toMatchObject({ batchFiling: true, batchWindowMinutes: 60, batchMaxCards: 25, batchLeaseWaitMinutes: 15, filingEnabled: false,
+      sources: { batchFiling: 'repo', batchWindowMinutes: 'repo', batchMaxCards: 'repo', batchLeaseWaitMinutes: 'repo', filingEnabled: 'repo' } });
+    expect(formatPreventionBatchSettings(settings)).toBe('prevention-batch settings: prevention.batchFiling=true (repo), prevention.batchWindowMinutes=60 (repo), prevention.batchMaxCards=25 (repo), prevention.batchLeaseWaitMinutes=15 (repo), prevention.filingEnabled=false (repo), prevention.drainCardsPerTick=1 (standard)');
+    expect(effectiveCardBatchPolicy(undefined, settings).prevention.maxAgeMinutes).toBe(60);
   });
   it('overlays prevention independently of filing and retains bypass policy', () => {
     const filing = resolveCardBatchSettings({ standard: loadCardBatchPolicy().filing });
