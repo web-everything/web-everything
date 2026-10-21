@@ -2,7 +2,7 @@
 kind: decision
 status: open
 blockedBy: ["xuybrvq", "x9ipr5i", "xov32df"]
-scope: ["we:scripts/operations/review-extra-seats.mjs", "we:scripts/lib/model-probation.mjs"]
+scope: ["we:backlog/xviqirz-decision-promote-codex-extra-review-seats-correctness-standa.md", "we:docs/agent/platform-decisions.md"]
 dateOpened: "2026-10-21"
 tags: []
 ---
@@ -57,7 +57,11 @@ claim-accuracy is 17% corroborated. Keep paying for it while a precision filter 
 
 ## Acceptance
 
-- [A1] **Executable** — the backlog tool (`we:scripts/backlog.mjs`) shows this card ratified (`status: resolved`, `codifiedIn` set, `preparedDate` set before the ruling), and `we:docs/agent/platform-decisions.md` records the amended #2310 lens rules.
+- [A1] **Executable** — the backlog tool shows this card ratified (`status: resolved`, `codifiedIn` set, `preparedDate` set before the ruling), and `we:docs/agent/platform-decisions.md` records the amended #2310 lens rules.
+
+## Test plan
+
+Verify the ratified card with the backlog tool (`we:scripts/backlog.mjs`); the tool is used for verification and does not need modification.
 
 ## Non-goals
 
