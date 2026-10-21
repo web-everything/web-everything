@@ -24,6 +24,37 @@ export function readCompletePrComments(number, { repo = null, exec = execRead } 
   return defaultListPrComments({ number, repo, exec: (file, args, opts) => exec(file, args, opts) });
 }
 
+/** Complete edit history metadata: REST updated_at cannot prove a comment was never edited. Throws on any
+ * failed, malformed or incomplete GraphQL page, so callers never trust a partial thread. */
+export function readCompletePrCommentEditHistory(number, { repo, exec = execRead } = {}) {
+  const [owner, name] = String(repo ?? '').split('/');
+  if (!owner || !name) throw new Error('comment edit history requires an explicit repository');
+  const query = `query($owner:String!,$name:String!,$n:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$n){comments(first:100,after:$cursor){nodes{id lastEditedAt} pageInfo{hasNextPage endCursor}}}}}`;
+  const comments = [];
+  const cursors = new Set();
+  let cursor;
+  for (;;) {
+    const args = ['api', 'graphql', '-f', `query=${query}`, '-F', `owner=${owner}`, '-F', `name=${name}`, '-F', `n=${number}`,
+      ...(cursor ? ['-f', `cursor=${cursor}`] : [])];
+    const page = JSON.parse(String(exec('gh', args, {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, maxBuffer: 64 * 1024 * 1024,
+    })));
+    const connection = page?.data?.repository?.pullRequest?.comments;
+    const info = connection?.pageInfo;
+    if (page?.errors?.length || !Array.isArray(connection?.nodes) || typeof info?.hasNextPage !== 'boolean'
+      || connection.nodes.some((c) => typeof c?.id !== 'string' || !(c.lastEditedAt === null || typeof c.lastEditedAt === 'string'))) {
+      throw new Error('comment edit history returned an invalid page');
+    }
+    comments.push(...connection.nodes);
+    if (!info.hasNextPage) return comments;
+    if (typeof info.endCursor !== 'string' || !info.endCursor || cursors.has(info.endCursor)) {
+      throw new Error('comment edit history pagination did not advance');
+    }
+    cursor = info.endCursor;
+    cursors.add(cursor);
+  }
+}
+
 /** Read commits per PR only for a legacy unbound hold. A matching current-head commit date proves a later head. */
 export function enrichStandDownHeadChange(pr, { repo = null, exec = execRead } = {}) {
   if (!/^[0-9a-f]{7,40}$/i.test(pr?.headRefOid ?? '') || standDownHeadChangeAt(pr)

@@ -95,6 +95,10 @@ let LIST_COMMENTS_PAGE_SIZE = 100;
 let completeCommentsImportError;
 try { ({ readCompletePrComments, enrichStandDownHeadChange, LIST_COMMENTS_PAGE_SIZE = 100 } = await import('../conveyor/pr-comments-complete.mjs')); }
 catch (error) { completeCommentsImportError = error; }
+// Standing-ruling round grants (PR #5758): the red-team rows credit an automatic grant only with this verified scope.
+// A staged copy without the reader credits none (fail closed), as before.
+let enrichPrsWithStandingRulingGrants = (prs) => prs;
+try { ({ enrichPrsWithStandingRulingGrants } = await import('../conveyor/standing-ruling-io.mjs')); } catch { /* no automatic grant credit */ }
 const hasLabel = (pr, name) => (pr.labels ?? []).some((label) => label.name === name);
 
 /** Both GraphQL rollup variants, in the CheckRun shape used by every queue classifier. */
@@ -671,7 +675,7 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
         prs = prs.flatMap(completePr);
       }
       // The repo travels with each PR: the red-team readers credit an operator round grant only for the PR's own repo.
-      prs = prs.map(pr => ({ ...(enrichStandDownHeadChange?.(pr, { repo, exec: execFileSync }) ?? pr), repo: pr.repo ?? repo }));
+      prs = enrichPrsWithStandingRulingGrants(prs.map(pr => ({ ...(enrichStandDownHeadChange?.(pr, { repo, exec: execFileSync }) ?? pr), repo: pr.repo ?? repo })), { repo });
       const readyNumbersThisRepo = new Set();
       const redTeamSetting = readConfirmedBreaks().value;
       for (const listed of prs.filter((candidate) => hasLabel(candidate, 'review:human'))) {
