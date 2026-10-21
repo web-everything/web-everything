@@ -59,17 +59,18 @@ function parseBlocks(diffText) {
     if (h < 0) return null; // mode-only, binary or empty block
     const meta = lines.slice(1, h);
     let added = false; let deleted = false; let minus = null; let plus = null;
+    if (new Set(meta).size !== meta.length) return null; // a repeated header line could shadow an earlier one
     for (const l of meta) {
       if (/^index [0-9a-f]+\.\.[0-9a-f]+(?: 100644)?$/.test(l)) continue;
       if (l === 'new file mode 100644') { added = true; continue; }
       if (l === 'deleted file mode 100644') { deleted = true; continue; }
-      if (l.startsWith('--- ')) { minus = l.slice(4); continue; }
-      if (l.startsWith('+++ ')) { plus = l.slice(4); continue; }
+      if (l.startsWith('--- ')) { if (minus !== null) return null; minus = l.slice(4); continue; }
+      if (l.startsWith('+++ ')) { if (plus !== null) return null; plus = l.slice(4); continue; }
       return null; // old/new mode, similarity, rename/copy, binary, anything unknown
     }
     if (minus !== (added ? '/dev/null' : `a/${path}`) || plus !== (deleted ? '/dev/null' : `b/${path}`)) return null;
     if (added && deleted) return null;
-    if (!hunksExact(lines.slice(h))) return null;
+    if (!hunksExact(lines.slice(h), { added, deleted })) return null;
     blocks.push({ path, added, deleted, lines: lines.slice(h) });
   }
   return blocks;
@@ -80,14 +81,25 @@ function parseBlocks(diffText) {
  * after that only another hunk header, a `\ No newline` marker, or the block's final empty line may follow. So no
  * text (an appended `--- a/code` / `+++ b/code` patch included) can hide inside or between hunks.
  */
-function hunksExact(lines) {
-  let i = 0;
+function hunksExact(lines, { added = false, deleted = false } = {}) {
+  let i = 0; let hunks = 0;
+  // Hunks must be in order and must not overlap on either side (an overlapping second hunk could restate lines the
+  // first one already proved). An added file is exactly one `-0,0` hunk; a deleted one exactly one `+0,0` hunk.
+  const end = { old: 0, new: 0 };
   while (i < lines.length) {
     const l = lines[i];
-    if (l === '' && i === lines.length - 1) return true;
-    const hm = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@(?: .*)?$/.exec(l);
+    if (l === '' && i === lines.length - 1) break;
+    const hm = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$/.exec(l);
     if (!hm) return false;
-    let o = hm[1] === undefined ? 1 : Number(hm[1]); let n = hm[2] === undefined ? 1 : Number(hm[2]);
+    let o = hm[2] === undefined ? 1 : Number(hm[2]); let n = hm[4] === undefined ? 1 : Number(hm[4]);
+    const a = Number(hm[1]); const c = Number(hm[3]);
+    for (const [start, count, side] of [[a, o, 'old'], [c, n, 'new']]) {
+      if (count > 0 ? start < 1 || start <= end[side] : start < end[side]) return false;
+      end[side] = count > 0 ? start + count - 1 : start;
+    }
+    if ((added && (a !== 0 || o !== 0)) || (deleted && (c !== 0 || n !== 0)) || (!added && o === 0 && a === 0) || (!deleted && n === 0 && c === 0)) return false;
+    hunks++;
+    if ((added || deleted) && hunks > 1) return false;
     i++;
     while (o > 0 || n > 0) {
       const x = lines[i];
@@ -99,7 +111,7 @@ function hunksExact(lines) {
     }
     while (lines[i] !== undefined && lines[i].startsWith('\\')) i++;
   }
-  return true;
+  return hunks > 0;
 }
 
 /**

@@ -81,6 +81,15 @@ describe('card review class', () => {
     expect(cls(read([A], newCard(A) + code, { cardFrontmatter: { [A]: { old: null, new: 'title: x\nkind: story' } } }))).toBe('full');
     expect(cls(read([A], newCard(A).replace('+body', '+body\n+extra')))).toBe('full'); // count mismatch
   });
+  it('sixth-round audit: repeated headers and overlapping or out-of-order hunks → full', () => {
+    expect(cls(read([A], newCard(A).replace(`+++ b/${A}`, `+++ b/scripts/x.mjs\n+++ b/${A}`)))).toBe('full');
+    expect(cls(read([A], `${newCard(A)}@@ -0,0 +1,3 @@\n+---\n+kind: "deci\\u0073ion"\n+---\n`))).toBe('full');
+    const two = (h2) => [`diff --git a/${A} b/${A}`, `--- a/${A}`, `+++ b/${A}`, '@@ -10,1 +10,1 @@', '-a', '+b', h2, '-c', '+d', ''].join('\n');
+    const git = { cardFrontmatter: { [A]: { old: 'kind: story', new: 'kind: story' } } };
+    expect(cls(read([A], two('@@ -20,1 +20,1 @@'), git))).toBe('card');
+    expect(cls(read([A], two('@@ -10,1 +10,1 @@'), git))).toBe('full');
+    expect(cls(read([A], two('@@ -5,1 +5,1 @@'), git))).toBe('full');
+  });
   it('post-accept timing: the card-class red-team mode does not apply (skipCardOnly rule unchanged)', async () => {
     const { cardClassRedTeamMode } = await import('../review-red-team-policy.mjs');
     expect(cardClassRedTeamMode(read([A], newCard(A)), { WE_RED_TEAM_TIMING: 'post-accept' })).toBeNull();

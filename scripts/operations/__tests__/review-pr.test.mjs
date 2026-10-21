@@ -4861,7 +4861,7 @@ describe('card-only light review', () => {
   describe('card review class: test-plan COVERAGE becomes a card suggestion', () => {
     const CARD = 'backlog/1-card.md';
     const cardDiff = (front) => [`diff --git a/${CARD} b/${CARD}`, 'new file mode 100644', '--- /dev/null', `+++ b/${CARD}`,
-      '@@ -0,0 +1,5 @@', '+---', ...front.map((l) => `+${l}`), '+---', '+body', ''].join('\n');
+      `@@ -0,0 +1,${front.length + 3} @@`, '+---', ...front.map((l) => `+${l}`), '+---', '+body', ''].join('\n');
     function cardRegistry({ front = ['kind: story'], coverageRoute = 'card-suggestion', settings } = {}) {
       const readPr = input => {
         const r = stubReader({ netRev: 'c'.repeat(40) })(input);
