@@ -1399,8 +1399,33 @@ export function acceptLabelDropped({ labels, comments, headSha, now, graceMs = A
  */
 function refuseReferralHold({ pr, refuse, withPhase, extra = {} }) {
   if (!pr?.referralHold) return false;
+  // stale-hold-resume — `review-referral-hold.mjs#decideReferralHoldAutoResolve` read every live-head finding as ruled.
+  let auto = pr.referralHoldAutoResolve && pr.referralHoldAutoResolve.head === pr.headRefOid ? pr.referralHoldAutoResolve : null;
+  if (auto?.outcome === 'resume') {
+    // All card / not-real: no ruling is owed, so the pause is over and the PR moves to its next step. On a
+    // `review:human` PR whose live head already has its advisory, that step is the human /review, never another panel
+    // (the same-head guard still stands) and never an accept: refuse as the nothing-owed `already-reviewed-head`, which
+    // is not an operator referral hold and posts no "waiting on your ruling" notice. Anything else stays paused.
+    // "Complete" = a same-head pause (a review run FINISHED on this exact head after its last wake, and rulings are
+    // wakes, so it ran with every ruling in front of it) or a current advisory on the head.
+    const human = withPhase?.phase === 'needs-human' || (withPhase?.labels ?? []).includes(REVIEW_LABELS.human);
+    const sameHead = pr.referralHold.kind === 'same-head' && pr.referralHold.head === pr.headRefOid && !pr.referralHold.noVerdict;
+    const { advisoryIsCurrent } = advisoryHeadState(pr);
+    if (human && (sameHead || advisoryIsCurrent)) {
+      refuse('already-reviewed-head', {
+        ...withPhase, ...extra, headSha: pr.headRefOid, referralHoldAutoResolve: { ...auto, next: 'human-review' },
+        why: `referral hold auto-resolved — ${auto.why}; this head's review already ran with those rulings, so `
+          + 'the next step is the human /review (`review:human` kept); no new panel on an unchanged head',
+      });
+      return true;
+    }
+    auto = { ...auto, outcome: 'stay', why: human ? 'no finished review of the live head is on record yet' : 'not a review:human PR, so a re-review of this head would be a second verdict' };
+  }
+  // A `stay` keeps the pause's own words (the daemon logs why it stayed, once per reason).
+  const note = auto?.outcome === 'send-back' ? ` (auto-resolve: ${auto.why}; sending back to the fixer)` : '';
   refuse('review-referrals-pending', {
-    ...withPhase, ...extra, referralHold: pr.referralHold, why: pr.referralHold.why,
+    ...withPhase, ...extra, referralHold: pr.referralHold, why: `${pr.referralHold.why}${note}`,
+    ...(auto ? { referralHoldAutoResolve: auto } : {}),
   });
   return true;
 }
