@@ -34,6 +34,7 @@ const stage = (root) => {
   copyFileSync(join(dirname(LEAF), '../conveyor/stuck-pr-dispatch-marker.mjs'), join(root, 'conveyor/stuck-pr-dispatch-marker.mjs'));
   // #x5n4zn3 — `stand-down.mjs` now imports `../lib/bounded-child.mjs` (the shared per-child timeout budget its
   // own `gh` call reuses) — stage it too, same reason as every other transitive dependency above.
+  copyFileSync(join(dirname(LEAF), 'label-cache.mjs'), join(root, 'lib/label-cache.mjs'));
   copyFileSync(join(dirname(LEAF), 'bounded-child.mjs'), join(root, 'lib/bounded-child.mjs'));
   symlinkSync(join(dirname(LEAF), 'gh-throttle.mjs'), join(root, 'lib/gh-throttle.mjs'));
   // #3383 — `stand-down.mjs` now also imports `../lib/marker-authorship.mjs` (the shared trusted-author gate
@@ -134,6 +135,8 @@ describe('operator-queue CLI entry guard', () => {
     expect(result.status, result.stderr).toBe(0);
     const report = JSON.parse(result.stdout);
     expect(report.errors).toContainEqual(expect.stringMatching(/operator send-back check unavailable:.*operator-send-backs\.mjs/));
+    // PR #5551: a missing saved red-team reader is reported, never a silent gap in RULING NEEDED.
+    expect(report.errors).toContainEqual(expect.stringMatching(/saved red-team ruling check unavailable:.*drain-saved-red-team\.mjs/));
     expect(report.ready).toEqual([]);
     expect(report.notReady.map(row => row.number)).toEqual([1, 2]);
     for (const row of report.notReady) {

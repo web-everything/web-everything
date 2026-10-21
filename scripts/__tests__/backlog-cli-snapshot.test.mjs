@@ -63,7 +63,7 @@ const read = (rel) => readFileSync(backlogPath(rel), 'utf8');
  * `hostLocalDay()` above computes. `overrides` pins it for the zone-pinned cases at the bottom of the file.
  */
 function childEnv(overrides = {}) {
-  const env = { ...process.env, ...overrides };
+  const env = { ...process.env, WE_NUMBER_AT_BIRTH: 'off', ...overrides };
   if (!overrides.BACKLOG_TZ) delete env.BACKLOG_TZ;
   return env;
 }

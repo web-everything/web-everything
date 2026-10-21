@@ -98,6 +98,21 @@ describe('the declaration end to end', () => {
     return run;
   }
 
+  it('writes and queues the final number supplied by the reader', async () => {
+    const registry = buildRegistry({ allocatedId: '123', bornAs: 'xabc123' });
+    const written = []; const queued = [];
+    const sinks = {
+      [SCAFFOLD_EFFECT]: async (p) => { written.push(p); return { written: true }; },
+      [FILE_ITEM_QUEUE_EFFECT]: async (p) => { queued.push(p); return { queued: true }; },
+    };
+    let run = advanceWhileRunning(startRun({ op: FILE_ITEM_OP, id: 'born-numbered',
+      input: { title: 'Numbered task', kind: 'task', digest: 'why' }, registry }), { registry });
+    run = await runToCompletion(run, { registry, sinks, store: createMemoryRunStore() });
+    expect(written[0].rel).toBe('backlog/123-numbered-task.md');
+    expect(written[0].content).toMatch(/^bornAs: xabc123$/m);
+    expect(queued[0].num).toBe('123');
+  });
+
   it('drives read → plan → queuePlan → write + queueAdd, hitting BOTH sinks for a plain task', async () => {
     const registry = buildRegistry();
     const written = [];

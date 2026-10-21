@@ -1,8 +1,11 @@
 /** @file The `advisory:*` staleness sweep — labels come off a PR whose head moved, and only those. No `gh`. */
 import { describe, expect, it } from 'vitest';
+import { redTeamGateMarker, redTeamResultId, parseRedTeamComment } from '../../lib/red-team-gate.mjs';
+import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
+import { buildRoundExtensionComment } from '../round-extension-mark.mjs';
 
 import {
-  LIST_COMMENTS_CAP, carriesAdvisoryLabel, commentsMayBeTruncated, defaultReadPr, sweepAdvisoryLabels as rawSweep,
+  LIST_COMMENTS_CAP, redTeamRegateOwed, carriesAdvisoryLabel, commentsMayBeTruncated, defaultReadPr, sweepAdvisoryLabels as rawSweep,
 } from '../advisory-label-sweep.mjs';
 
 const HEAD = 'fd37ce270'.padEnd(40, 'a');
@@ -299,3 +302,55 @@ describe('PR #4708 — a cut-off comment list never removes a label, and the liv
     expect(out).toEqual([{ num: 42, add: null, remove: ['red-team:clear'] }]);
     expect(writes).toEqual([['o/n', 42, { add: null, remove: ['red-team:clear'] }]]);
   });
+
+describe('red-team re-gate after a round grant (live PR #5485)', () => {
+  const REPO = 'web-everything/web-everything';
+  const RT_HEAD = 'c'.repeat(40);
+  const finding = { summary: 'log:false crashes', category: 'edge-case', impactIfUnfixed: 'broken', file: 'scripts/x.mjs', line: 8,
+    failure_scenario: 'run it', confirmedByRecheck: true, recheckReason: 'reproduced' };
+  const bodyRt = renderRedTeamComment({ pr: 5485, rev: RT_HEAD, provider: 'codex', model: 'm', findings: [finding], recheckStatus: 'ok', foldedVerdict: 'changes' });
+  const rid = redTeamResultId(parseRedTeamComment(bodyRt));
+  const bot = (body, createdAt) => ({ author: { login: 'web-everything' }, body, createdAt });
+  const gateRec = (outcome, createdAt) => bot(`${redTeamGateMarker(5485, RT_HEAD, outcome, rid)}\n**Red-team gate** x`, createdAt);
+  const grant = (createdAt) => ({ author: { login: 'chalbert' }, createdAt,
+    body: buildRoundExtensionComment({ repo: REPO, pr: 5485, by: 1, actor: 'chalbert', channel: 'chat', reason: 'Block', at: createdAt }) });
+  const t = (n) => `2026-10-20T22:${String(n).padStart(2, '0')}:00Z`;
+  const capped = [bot(bodyRt, t(34)), gateRec('round-cap', t(35))];
+  const prOf = (comments) => ({ number: 5485, headRefOid: RT_HEAD, comments, labels: [{ name: 'red-team:blocked' }, { name: 'review:human' }] });
+
+  it('owed when a grant follows the round-cap record; not before, not once the gate has recorded again', () => {
+    expect(redTeamRegateOwed(prOf(capped), REPO)).toBe(false);
+    expect(redTeamRegateOwed(prOf([...capped, grant(t(47))]), REPO)).toBe(true);
+    expect(redTeamRegateOwed(prOf([...capped, grant(t(47)), gateRec('sent-back', t(48))]), REPO)).toBe(false);
+    expect(redTeamRegateOwed(prOf([...capped, grant(t(47)), gateRec('round-cap', t(48))]), REPO)).toBe(false);
+    expect(redTeamRegateOwed({ ...prOf([...capped, grant(t(47))]), headRefOid: 'd'.repeat(40) }, REPO)).toBe(false);
+    expect(redTeamRegateOwed(prOf([...capped, grant(t(47))]), null)).toBe(false);
+  });
+
+  it('a grant from a non-operator does not owe a re-gate', () => {
+    const forged = { ...grant(t(47)), author: { login: 'someone-else' } };
+    expect(redTeamRegateOwed(prOf([...capped, forged]), REPO)).toBe(false);
+  });
+
+  const sweep = (comments, o = {}) => {
+    const calls = [];
+    const p = prOf(comments);
+    const results = rawSweep({ repo: REPO, listPrs: () => [p], readPr: () => ({ ...p, state: 'OPEN' }),
+      readStatusEvidence: () => ({ scheduled: false, recorded: true, inFlight: false }), log: () => {},
+      provider: { setLabels: () => {}, ensureLabel: () => {}, readPrState: () => p, readComments: () => comments, currentRepo: () => REPO },
+      regate: (a) => { calls.push(a); return { status: 'applied', outcome: 'sent-back' }; }, ...o });
+    return { calls, results };
+  };
+
+  it('the sweep re-runs the gate once for the reopened PR and reports the gate status', () => {
+    const { calls, results } = sweep([...capped, grant(t(47))]);
+    expect(calls).toEqual([{ repo: REPO, pr: 5485 }]);
+    expect(results.find((r) => r.regate)).toMatchObject({ num: 5485, regate: 'applied', outcome: 'sent-back' });
+  });
+
+  it('no re-run without a grant, on a dry run, or without a regate hook', () => {
+    expect(sweep(capped).calls).toEqual([]);
+    expect(sweep([...capped, grant(t(47))], { dryRun: true }).calls).toEqual([]);
+    expect(() => sweep([...capped, grant(t(47))], { regate: null })).not.toThrow();
+  });
+});

@@ -65,7 +65,7 @@ export async function buildVersion({ clone, home, sha = 'HEAD', settings, force 
   fs.mkdirSync(temp);
   const alert = deps.alert ?? (() => {});
   try {
-    checked(git, ['clone', '--shared', '--no-checkout', '--quiet', '--', objects, temp]);
+    checked(git, ['clone', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '--shared', '--no-checkout', '--quiet', '--', objects, temp]);
     const versionGit = gitAt(temp);
     if (repo) {
       // The version borrows objects from repo.git but must look like the real clone: tools derive the repo name

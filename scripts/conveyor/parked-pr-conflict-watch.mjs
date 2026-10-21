@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { postCardSquashMarker } from '../lib/card-squash-marker.mjs';
 import { buildConflictFindingBody, defaultPostConflictFinding } from '../lib/conflict-finding.mjs';
 export { buildConflictFindingBody, defaultPostConflictFinding };
 /**
@@ -35,8 +36,9 @@ export { buildConflictFindingBody, defaultPostConflictFinding };
  * ordinary reviewer finding — via `we:scripts/conveyor/reconcile-finding.mjs` ({@link postConflictFinding}) —
  * Same-line statute conflicts go to a fixer first (live #5017 (2026-10-13)). The declared
  * `conflictWatch.sameLineConflict=stand-down` setting retains the earlier direct stand-down route.
- * This file itself still never resolves a conflict or writes a fix — it only decides which of the two existing downstream pipelines a fresh conflict
- * reaches.
+ * Card-only Also-raised-by conflicts are the narrow mechanical exception: this pass asks the shared
+ * no-checkout rebase helper for a stable union, then re-arms review. All other content conflicts still
+ * reach the existing finding/stand-down pipelines.
  *
  * RESOLVED CONFLICTS OWE A FRESH REVIEW. Once GitHub confirms `mergeable: MERGEABLE` on a previously
  * flagged PR still carrying `review:changes`, hand it to `we:scripts/conveyor/rearm-review.mjs` — the SAME
@@ -118,6 +120,16 @@ import { isGhDeferred } from '../lib/gh-deferred.mjs';
 import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { unlinkSync } from 'node:fs';
+import { gitRun } from '../lib/git-run.mjs';
+import { ownerInstallationToken, recoveryPushCredential } from './missing-run-push.mjs';
+import { MISSING_RUN_CREDENTIAL_REFUSAL } from './main-red-recovery.mjs';
+import { repoKeyFromRemoteUrl } from './fix-procedure.mjs';
+import { gitRealFiles, resolveRealFiles } from '../lib/pr-real-files.mjs';
+import { loadCardRebaseSettings } from '../lib/card-squash-rebuild.mjs';
+import { isCardOnlyDiff } from '../ci-card-only.mjs';
+import { loadCardConflictSettings } from '../lib/card-conflict-resolve.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
@@ -143,7 +155,9 @@ import { parseMergeTree, manifestConflictDisposition, rebaseDropManifest } from 
 // best-effort macOS notify (never throws; a delivery failure must never break the sweep).
 import { planNoteComment, postNoteComment } from './reconcile-note-comment.mjs';
 import { notifyDesktopChecked } from './branch-sync.mjs';
-import { UNOWNED_REBASE_ATTEMPT_MARKER, UNOWNED_REBASE_ATTEMPT_CAP, countUnownedRebaseAttempts } from './unowned-rebase-attempt-count.mjs';
+import { UNOWNED_REBASE_INFRA_RETRY_CAP_DEFAULT, countUnownedRebaseAggregateAttempts, countUnownedRebaseInfraFailures, shouldCountRebaseInfra, formatUnownedRebaseInfraMarker, UNOWNED_REBASE_ATTEMPT_CAP, loadUnownedRebaseSettings, shouldCountRebaseAttempt, formatUnownedRebaseAttemptMarker, grantedRebaseCap } from './unowned-rebase-attempt-count.mjs';
+import { standingRulingScope } from './standing-ruling-io.mjs';
+import { ROUND_EXTENSION_MARKER } from './round-extension-mark.mjs';
 import { countConflictFixComments, CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
 // #4118 (c) — the SAME name-based, gh-agents-truth liveness check `review-status-tag.mjs` already uses, and for
 // the identical reason its own docblock states: staying independent of `reconcile-core.mjs#assessLiveness`'s
@@ -199,6 +213,11 @@ export function isParkedConflictTarget(pr) {
   const mergeable = String(pr?.mergeable || '').toUpperCase();
   if (mergeable !== 'CONFLICTING') return false;
   return hasUnclearedReviewLabel(pr?.labels, { allowPending: false });
+}
+
+/** Pure: rearm-review requires a live changes or accepted review label. */
+export function rearmIsOwed(labels) {
+  return hasReviewLabel(labels, REVIEW_LABELS.changes) || hasReviewLabel(labels, REVIEW_LABELS.accepted);
 }
 
 /** How long an APPROVED/queued PR may sit conflicting before it is bounced to a fix agent. The drain runs every
@@ -402,6 +421,71 @@ export function defaultConflictingFilePaths({ pr, cwd = REPO_ROOT, exec = execFi
  */
 export function defaultAttemptUnownedConflictRebase({ pr, cwd = REPO_ROOT, run } = {}) {
   return rebaseDropManifest({ laneRef: pr?.headRefName, base: 'origin/main', cwd, ...(run ? { run } : {}) });
+}
+
+/** Pin the card resolver push to a validated credential and an isolated Git environment. */
+function recoveryPushContext(repo, {
+  env = process.env, exec = execFileSyncThrottled, readCache, now = Date.now(),
+} = {}) {
+  const ownerToken = ownerInstallationToken(repo, { env, readCache, now });
+  const token = String(ownerToken || env.GH_TOKEN || env.GITHUB_TOKEN || exec('gh', ['auth', 'token', '--hostname', 'github.com'], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000, killSignal: 'SIGKILL', env,
+  })).trim();
+  if (!ownerToken && !recoveryPushCredential(token, env)) return { ok: false, error: MISSING_RUN_CREDENTIAL_REFUSAL };
+  const gitEnv = Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith('GIT_')));
+  return { ok: true, env: { ...gitEnv, WE_CI_PUSH_TOKEN: token,
+    GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
+    args: ['-c', 'http.extraHeader=', '-c', 'credential.helper=',
+      '-c', 'credential.helper=!f() { echo username=x-access-token; printf "password=%s\\n" "$WE_CI_PUSH_TOKEN"; }; f'] };
+}
+
+/** Fresh file evidence for routing only; the resolver still proves the full diff and hunks. */
+export function gitCardOnlyRecheck({ pr, repo, cwd = REPO_ROOT, run = gitRun } = {}) {
+  return isCardOnlyDiff(gitRealFiles({ pr, repo, cwd, run }));
+}
+
+/** Same trusted fast-forward plumbing, with a fresh main and a private index for the card path. */
+export function defaultAttemptCardConflictRebase({ pr, repo, cwd = REPO_ROOT, run = gitRun, cardConflictSettings, cardRebaseSettings,
+  env = process.env, readCache, now = Date.now(),
+} = {}) {
+  // Establish clone ownership before eligibility checks or any fetch/ref work.
+  if (repo) {
+    const remote = run('git', ['remote', 'get-url', 'origin'], { cwd });
+    const expected = repoKeyForSlug(repo);
+    if (remote.status !== 0 || !expected || repoKeyFromRemoteUrl(remote.stdout) !== expected)
+      return { action: 'skip', precondition: true, reason: 'card conflict clone does not match PR repository' };
+  }
+  if (!pr?.headRefName?.startsWith('lane/') || pr.baseRefName !== 'main' || !/^[a-f0-9]{40}$/.test(pr.headRefOid ?? '')) return { action: 'skip', precondition: true, reason: 'not a main-base PR' };
+  const fetched = run('git', ['fetch', 'origin', 'main', pr.headRefName], { cwd });
+  if (fetched.status !== 0) return { action: 'error', reason: 'card conflict fetch failed' };
+  const headFetch = run('git', ['fetch', '--no-tags', 'origin', `refs/heads/${pr.headRefName}`], { cwd });
+  const head = headFetch.status === 0 ? run('git', ['rev-parse', 'FETCH_HEAD'], { cwd }) : null;
+  if (head?.status !== 0 || String(head.stdout).trim() !== pr.headRefOid)
+    return { action: 'skip', precondition: true, deferred: true, reason: 'branch moved before recovery' };
+  let auth;
+  try {
+    auth = recoveryPushContext(repo, { env, readCache, now, exec: (cmd, args, opts) => {
+      const result = run(cmd, args, opts);
+      if (result.status !== 0) throw new Error('credential unavailable');
+      return result.stdout;
+    } });
+  } catch { return { ok: false, action: 'error', error: 'card recovery credential unavailable' }; }
+  if (!auth.ok) return { ok: false, action: 'error', error: auth.error };
+  // Only the recovery push uses this credential. Preserve the resolver's private index and
+  // claim checks, but never let the Git runner merge inherited GIT_* values back into push.
+  const recoveryRun = (cmd, args, opts) => {
+    if (cmd !== 'git' || args[0] !== 'push') return run(cmd, args, opts);
+    try {
+      const result = run(cmd, [...auth.args, ...args], { ...opts, env: auth.env, inheritEnv: false });
+      return result.status === 0 ? result : { status: 1, stderr: 'recovery push failed' };
+    } catch { return { status: 1, stderr: 'recovery push failed' }; }
+  };
+  const tmpIndex = join(cwd, '.git', `card-conflict-index-${process.pid}-${randomUUID()}`);
+  try {
+    return rebaseDropManifest({ laneRef: pr.headRefName, readRef: pr.headRefOid, base: 'origin/main', cwd, run: recoveryRun, fetch: false, tmpIndex, cardConflictSettings, cardRebaseSettings });
+  } finally {
+    try { unlinkSync(tmpIndex); } catch { /* private index may not have been created */ }
+  }
 }
 
 /**
@@ -1284,12 +1368,12 @@ function classifyStatuteConflict(files, {
 export function defaultListParkedPrs({ exec = execFileSyncThrottled, repo = null } = {}) {
   // #gh-graphql-budget — read the host-shared open-PR snapshot (one right-sized list per repo per TTL for the
   // whole fleet) instead of a private `gh pr list`; null = not applicable (tests, cwd repo) → the direct read below.
-  if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: 'number,headRefName,baseRefName,mergeable,mergeStateStatus,labels,files', allowDeferred: true }); if (shared) return shared; }
+  if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: 'number,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,labels,files', allowDeferred: true }); if (shared) return shared; }
   // `baseRefName` (#3383) — the queued-grace routing below reads it to tell a STACKED PR (base isn't `main`, the
   // drain will never land it regardless of labels) apart from an ordinary conflict against `main`; costs nothing
   // extra since it comes off the same `gh pr list` call this pass already makes.
   const argv = ['pr', 'list', '--state', 'open', '--limit', String(PR_LIST_LIMIT),
-    '--json', 'number,headRefName,baseRefName,mergeable,mergeStateStatus,labels,files'];
+    '--json', 'number,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,labels,files'];
   if (repo) argv.push('--repo', repo);
   // #x5n4zn3 — was bare (no timeout).
   const out = exec('gh', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', throttle: { deferrable: true } });
@@ -1336,6 +1420,34 @@ export function defaultPostConflictRearm({ pr, repo, exec = execFileSync }) {
   exec('node', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
 }
 
+// Prefer captured command diagnostics over the generic "Command failed" message.
+function conflictWatchCause(error) {
+  for (const value of [error?.stderr, error?.stdout, error?.message, error]) {
+    if (value == null) continue;
+    const line = String(value).split(/\r?\n/).map(line => line.trim())
+      .find(line => line && !/gh-shim|(?:shim.*warn|warn.*shim)/i.test(line));
+    if (line) return line.slice(0, 300);
+  }
+  return 'unknown error';
+}
+
+/** Pure human-readable diagnostics. Counts may overlap (an error can still route to the fixer).
+ * Optional listed PRs include unchanged/skipped PRs without altering the machine result array.
+ */
+export function formatConflictWatchSummary(results, prs = results) {
+  const byNumber = new Map(results.map(result => [result.num, result]));
+  const entries = prs.map(pr => byNumber.get(pr.num ?? pr.number) ?? {
+    num: pr.num ?? pr.number,
+    isConflicting: isParkedConflictTarget(pr) || isQueuedConflictTarget(pr) || isUnownedConflictTarget(pr),
+  });
+  const text = value => String(value ?? '-').replace(/[\r\n]+/g, ' ');
+  const lines = entries.map(entry => `PR #${entry.num}: conflicting=${entry.isConflicting ? 'yes' : 'no'} owner=${text(entry.owner)} routedTo=${text(entry.routedTo)} mechanicalRebase=${text(entry.mechanicalRebase?.action)} reason=${text(entry.mechanicalRebase?.reason)} cause=${text(entry.mechanicalRebase?.cause)}`);
+  const count = predicate => entries.filter(predicate).length;
+  const newlyResolvedSuccess = entry => (entry.newlyResolved || entry.remove?.length > 0) && !entry.error;
+  lines.push(`Counts: considered=${entries.length} resolved by card resolver=${count(entry => entry.routedTo === 'card-conflict-resolver')} sent to fixer=${count(entry => entry.routedTo?.startsWith('reconcile-finding'))} resolved=${count(newlyResolvedSuccess)} errors=${count(entry => !newlyResolvedSuccess(entry) && (entry.error || entry.mechanicalRebase?.action === 'error'))} skipped=${count(entry => !entry.routedTo && !entry.error && !entry.mechanicalRebase)}`);
+  return lines.join('\n');
+}
+
 /**
  * THE IO SHELL. Lists open PRs, classifies each, applies the label change + posts the one-time comment when a
  * PR newly transitions into conflict, and reports what happened. Never throws on a per-PR write failure — one
@@ -1377,6 +1489,13 @@ export function watchParkedPrConflicts({
   // site below (a probe failure/`null`/empty result falls back to the existing whole-file check, unchanged).
   computeConflictingPaths = defaultConflictingFilePaths,
   attemptMechanicalRebase = defaultAttemptUnownedConflictRebase,
+  attemptCardRebase = defaultAttemptCardConflictRebase,
+  gitCardOnlyRecheck: recheckCardOnly = gitCardOnlyRecheck,
+  resolveRealFiles: readRealFiles = resolveRealFiles,
+  cardConflictSettings = loadCardConflictSettings(),
+  unownedRebaseSettings = loadUnownedRebaseSettings(),
+  // The verified standing-ruling scope for one PR's grant reader (null → automation-posted grants never count).
+  standingRulingFor = standingRulingScope,
   listAgents = defaultListAgents,
   now = Date.now(),
   queueScope = {},
@@ -1385,8 +1504,17 @@ export function watchParkedPrConflicts({
   // `off`, exactly the behaviour before this card.
   conflictReassertSettings = CONFLICT_REASSERT_OFF,
 } = {}) {
-  const listed = listPrs({ repo });
-  if (isGhDeferred(listed)) return []; // throttle already logged the skipped pass
+  let listed;
+  try { listed = listPrs({ repo }); }
+  catch (error) {
+    console.error(`parked-pr-conflict-watch: run skipped: open-PR listing failed: ${conflictWatchCause(error)}`);
+    throw error;
+  }
+  if (isGhDeferred(listed)) {
+    const deferred = typeof listed === 'string' || Buffer.isBuffer(listed) ? JSON.parse(String(listed)) : listed;
+    console.error(`parked-pr-conflict-watch: run skipped: open-PR listing unavailable: ${conflictWatchCause(deferred.reason ?? 'deferred-low-budget (no gh slot or budget)')}`);
+    return [];
+  }
   const prs = scopePrsToQueue(listed, { label: 'parked-pr-conflict-watch', ...queueScope });
   const results = [];
   // xoh8fkw — resolved LAZILY, only once, only when a real write is about to happen (the common empty-sweep tick
@@ -1402,6 +1530,48 @@ export function watchParkedPrConflicts({
   // the provider's `currentRepo()` exists exactly for this ("fires only when `--repo` was omitted", its own
   // docblock) and was simply never called here.
   let resolvedRepo = repo;
+  const infraRetryCap = unownedRebaseSettings.value.infraRetryCap ?? UNOWNED_REBASE_INFRA_RETRY_CAP_DEFAULT;
+  const markInfraFailure = (pr, result) => {
+    if (!shouldCountRebaseInfra(result)) return;
+    try { provider.postComment(resolvedRepo, pr.number, formatUnownedRebaseInfraMarker(result, pr.headRefOid)); }
+    catch { /* best-effort counter */ }
+  };
+  // Operator round grants (`extend-rounds`, and verified standing-ruling grants) reach these two caps too, each as
+  // "one more attempt from when it was posted" (`grantedRebaseCap`). Read only AT the base cap: below it a grant
+  // cannot change the decision, so the healthy path pays no standing-ruling read.
+  const grantedCap = (pr, comments, baseCap, used, count) => {
+    if (!(used >= baseCap)) return baseCap;
+    // Reuse the repo the caller supplied (the daemon always passes --repo); never a currentRepo() read here.
+    const grantRepo = resolvedRepo ?? repo;
+    if (grantRepo == null) return baseCap;
+    // No grant comment on the thread → nothing can raise the cap; skip the injected scope reader entirely.
+    if (!Array.isArray(comments) || !comments.some(c => typeof c?.body === 'string' && c.body.startsWith(ROUND_EXTENSION_MARKER))) return baseCap;
+    let standingRuling = null;
+    try { standingRuling = standingRulingFor({ repo: grantRepo, pr: { number: pr.number, comments } }) ?? null; }
+    catch { standingRuling = null; }
+    return grantedRebaseCap(baseCap, comments, count, { repo: grantRepo, pr: Number(pr.number), standingRuling }).cap;
+  };
+  const infraCountFor = pr => prefix => countUnownedRebaseInfraFailures(prefix, { ...unownedRebaseSettings.value, headSha: pr.headRefOid });
+  // The top's aggregate counter (content + infra, whole history, no cutoff): grants never loosen it beyond +by.
+  const attemptCount = prefix => countUnownedRebaseAggregateAttempts(prefix);
+  const surfaceInfraCap = (entry, pr, comments, failures, cap = infraRetryCap) => {
+    entry.unownedRebaseInfraCapExhausted = true;
+    entry.unownedRebaseInfraFailures = failures;
+    if (cap !== infraRetryCap) entry.unownedRebaseInfraCap = cap;
+    const note = {
+      kind: 'round-cap-exhausted', prNumber: pr.number, attempts: failures, cap,
+      capKind: 'unowned-mechanical-rebase-infra',
+      text: `PR #${pr.number}: unowned-mechanical-rebase-infra auto-repair rounds exhausted (${failures}/${cap}) — a person must take it over`,
+    };
+    const notePlan = planNoteComment(note, comments);
+    if (!notePlan.alreadyPosted) {
+      try { postNoteComment({ repo: resolvedRepo, pr: pr.number, body: notePlan.body }); }
+      catch { /* failed escalation must still fall through to the conflict owner */ }
+      try { notifyDesktopChecked({ title: 'Conveyor: unowned rebase infra cap exhausted', body: note.text }); }
+      catch { /* best-effort notification */ }
+    }
+    entry.roundCapNote = notePlan.alreadyPosted ? null : notePlan.key;
+  };
   for (const pr of Array.isArray(prs) ? prs : []) {
     const parked = isParkedConflictTarget(pr);
     const queued = !parked && isQueuedConflictTarget(pr);
@@ -1413,6 +1583,88 @@ export function watchParkedPrConflicts({
     const plan = planConflictLabelChange({
       isConflicting, isResolved: String(pr?.mergeable || '').toUpperCase() === 'MERGEABLE', currentLabels: pr?.labels,
     });
+    // This owner sits OUTSIDE fix dispatch's scope queue. The git helper independently proves the full
+    // card-only diff and every hunk; no exemption is granted to code fixers or arbitrary card edits.
+    let cardOnly = false;
+    let cardAttempt = null;
+    const cardInfraState = {};
+    if ((isConflicting || plan.newlyResolved) && (!pr.baseRefName || pr.baseRefName === 'main')) {
+      let files = null;
+      try {
+        files = Array.isArray(pr.files) && pr.files.length < GH_FILES_GRAPHQL_CAP
+          ? pr.files : queued && !plan.add && !pr.baseRefName ? [] : listPrFiles({ number: pr.number, repo: resolvedRepo });
+      } catch (error) {
+        console.error(`parked-pr-conflict-watch: PR #${pr.number}: card file list unavailable; normal conflict owner required: ${conflictWatchCause(error)}`);
+      }
+      try {
+        if (resolvedRepo == null && cardConflictSettings.value.gitRecheckFiles === true) resolvedRepo = provider.currentRepo();
+        const evidence = readRealFiles({ pr, repo: resolvedRepo, ghFiles: files,
+          enabled: cardConflictSettings.value.gitRecheckFiles === true && recheckCardOnly === gitCardOnlyRecheck });
+        cardOnly = isCardOnlyDiff(evidence.files);
+        if (evidence.source === 'git' && evidence.disagreed)
+          console.error(`parked-pr-conflict-watch: PR #${pr.number}: git overrode GitHub files; cardConflicts.gitRecheckFiles=true (source: ${cardConflictSettings.sources.gitRecheckFiles})`);
+        // Historical injectable boolean seam, used only by callers that explicitly replace the wrapper.
+        if (recheckCardOnly !== gitCardOnlyRecheck && cardConflictSettings.value.gitRecheckFiles
+          && pr.baseRefName === 'main' && /^[a-f0-9]{40}$/.test(pr.headRefOid ?? '') && pr.headRefName?.startsWith('lane/')) {
+          cardOnly = recheckCardOnly({ pr, repo: resolvedRepo }) === true;
+          if (cardOnly) console.error(`parked-pr-conflict-watch: PR #${pr.number}: git recheck proved card-only; cardConflicts.gitRecheckFiles=true (source: ${cardConflictSettings.sources.gitRecheckFiles})`);
+        }
+      } catch { cardOnly = false; }
+    }
+    if (isConflicting && cardOnly && cardConflictSettings.value.autoResolveRaisedBy && !dryRun) {
+      const cardEntry = { num: pr.number, isConflicting, ...plan, commented: false,
+        cardConflictSetting: { value: true, source: cardConflictSettings.sources.autoResolveRaisedBy } };
+      try {
+        if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
+        const comments = listPrComments({ number: pr.number, repo: resolvedRepo });
+        const status = deriveReviewStatus({ pr: pr.number, agents: listAgents(), repo: repoKeyForSlug(resolvedRepo) || 'we' });
+        if (status?.role === 'fix') {
+          results.push({ ...cardEntry, owner: 'fixer', routedTo: 'card-conflict-deferred (fix agent still live)' });
+          continue;
+        }
+        const infraFailures = infraCountFor(pr)(comments);
+        const infraCap = grantedCap(pr, comments, infraRetryCap, infraFailures, infraCountFor(pr));
+        const cardAttempts = infraFailures >= infraCap ? 0 : attemptCount(comments);
+        if (infraFailures >= infraCap) {
+          surfaceInfraCap(cardInfraState, pr, comments, infraFailures, infraCap);
+        } else if (cardAttempts < grantedCap(pr, comments, UNOWNED_REBASE_ATTEMPT_CAP, cardAttempts, attemptCount)) {
+          // Keep the conflict marker until rearm completes. A crash after push is recovered by the
+          // newlyResolved branch, including a formerly accepted/queued or unowned card.
+          provider.ensureLabel(resolvedRepo, CONFLICT_LABEL, CONFLICT_LABEL_META);
+          provider.setLabels(resolvedRepo, pr.number, { add: CONFLICT_LABEL, remove: [] });
+          const cardRebaseSettings = loadCardRebaseSettings();
+          console.error(`parked-pr-conflict-watch: PR #${pr.number}: cardRebase.squashToSingleCommit=${cardRebaseSettings.value.squashToSingleCommit} (source: ${cardRebaseSettings.sources.squashToSingleCommit})`);
+          cardAttempt = attemptCardRebase({ pr, repo: resolvedRepo, cardConflictSettings, cardRebaseSettings });
+          postCardSquashMarker({ result: cardAttempt, comments,
+            postComment: body => provider.postComment(resolvedRepo, pr.number, body) });
+          markInfraFailure(pr, cardAttempt);
+          cardEntry.mechanicalRebase = cardAttempt;
+          if (cardAttempt?.action === 'rebased' || cardAttempt?.action === 'current') {
+            try {
+              if (rearmIsOwed(pr.labels)) postRearm({ pr, repo: resolvedRepo });
+              provider.setLabels(resolvedRepo, pr.number, { remove: [CONFLICT_LABEL] });
+              cardEntry.owner = 'review';
+              cardEntry.routedTo = 'card-conflict-resolver';
+            } catch (err) {
+              cardEntry.error = cardEntry.rearmCause = conflictWatchCause(err);
+              console.error(`parked-pr-conflict-watch: PR #${pr.number}: card rearm failed: ${cardEntry.rearmCause}`);
+              cardEntry.owner = 'conflict-watch';
+              cardEntry.routedTo = 'card-conflict-rearm-pending';
+            }
+            results.push(cardEntry);
+            continue;
+          }
+          if (shouldCountRebaseAttempt(cardAttempt)) {
+            try { provider.postComment(resolvedRepo, pr.number, formatUnownedRebaseAttemptMarker(cardAttempt)); }
+            catch { /* best-effort counter */ }
+          }
+        }
+      } catch (error) {
+        cardAttempt = { action: 'error', reason: 'card rebase unavailable; normal conflict owner required', cause: conflictWatchCause(error) };
+        markInfraFailure(pr, cardAttempt);
+        console.error(`parked-pr-conflict-watch: PR #${pr.number}: ${cardAttempt.reason}: ${cardAttempt.cause}`);
+      }
+    }
     // An approved PR already flagged on an earlier sweep: bounce it once the drain's grace window has passed.
     const graceDue = queued && !plan.add && hasReviewLabel(pr?.labels, CONFLICT_LABEL);
     // #xu2krte Fork 2 (review-human statute amendment) — a PARKED (not queued) `review:human` PR that is ALREADY
@@ -1445,8 +1697,20 @@ export function watchParkedPrConflicts({
     // Recover live #5017 (2026-10-13), including an existing review:changes bounce.
     const sameLineRecovery = sameLineConflict === 'fixer' && isConflicting && !plan.add && !plan.remove.length
       && hasReviewLabel(pr?.labels, CONFLICT_LABEL) && !hasReviewLabel(pr?.labels, REVIEW_LABELS.human);
-    if (!plan.add && plan.remove.length === 0 && !graceDue && !recheckCandidate && !idleConflictBounce && !sameLineRecovery) continue;
-    const entry = { num: pr?.number, isConflicting, ...plan, commented: false };
+    const entry = { num: pr?.number, isConflicting, ...plan, commented: false, ...cardInfraState,
+      ...(cardAttempt ? { mechanicalRebase: cardAttempt } : {}),
+      ...(cardOnly ? { cardConflictSetting: { value: cardConflictSettings.value.autoResolveRaisedBy, source: cardConflictSettings.sources.autoResolveRaisedBy } } : {}) };
+    // Keep card attempts visible even when normal routing exits without reporting a change.
+    // Routing keeps mutating this same entry; report it only once.
+    let reported = false;
+    const reportEntry = () => {
+      if (!reported) { results.push(entry); reported = true; }
+    };
+    if (cardAttempt) reportEntry();
+    if (!plan.add && plan.remove.length === 0 && !graceDue && !recheckCandidate && !idleConflictBounce && !sameLineRecovery) {
+      if (cardAttempt || cardInfraState.unownedRebaseInfraCapExhausted) reportEntry();
+      continue;
+    }
     // The #2793 idle re-assert, shared with card xkugvzd's `review:human` case (`variant` only names the route).
     // Same round cap, same once-per-round guard, same `postFinding` (which keeps `review:human`). Pushes `entry`.
     const reassertIdleConflict = (comments, variant) => {
@@ -1468,7 +1732,7 @@ export function watchParkedPrConflicts({
           }
           entry.routedTo = `cap-exhausted (conflict-fix, idle${variant ? `, ${variant}` : ''})`;
           entry.conflictFixRoundsSpent = conflictFixRoundsSpent;
-          results.push(entry);
+          reportEntry();
           return;
         }
         // The episode boundary for THIS narrow population is the last completed conflict-fix round (if any) —
@@ -1481,7 +1745,7 @@ export function watchParkedPrConflicts({
         if (hasRecentConflictFindingComment(comments, { now, sinceMs })) {
           // Already re-asserted for this round within the retry window — avoid reposting every tick.
           entry.routedTo = `reconcile-finding (idle conflict-bounce${variant ? `, ${variant}` : ''}, already re-asserted this round)`;
-          results.push(entry);
+          reportEntry();
           return;
         }
         if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
@@ -1490,10 +1754,10 @@ export function watchParkedPrConflicts({
           ? `reconcile-finding (idle conflict-bounce re-asserted, ${variant} — xkugvzd)`
           : 'reconcile-finding (idle conflict-bounce re-asserted — #2793)';
         entry.conflictFixRoundsSpent = conflictFixRoundsSpent;
-        results.push(entry);
+        reportEntry();
       } catch (e) {
         entry.error = String((e && e.message) || e).split('\n')[0];
-        results.push(entry);
+        reportEntry();
       }
     };
     let recoveryComments = null;
@@ -1510,12 +1774,12 @@ export function watchParkedPrConflicts({
           }
           entry.supersededStandDown = true;
           entry.routedTo = 'reconcile-finding (same-line conflict → fixer, marker superseded)';
-          results.push(entry);
+          reportEntry();
           continue;
         }
       } catch (e) {
         entry.error = String(e?.message ?? e).split('\n')[0];
-        results.push(entry);
+        reportEntry();
         continue;
       }
       if (!graceDue && !idleConflictBounce) continue;
@@ -1599,7 +1863,7 @@ export function watchParkedPrConflicts({
           } else {
             entry.routedTo = 'stand-down (unchanged)';
           }
-          results.push(entry);
+          reportEntry();
           continue;
         }
         // #xconflres1 — `!isStatuteTier` (the narrower conflict-path check found the real same-line conflict sits
@@ -1627,10 +1891,10 @@ export function watchParkedPrConflicts({
           : appendOnlyStatute
           ? 'reconcile-finding (append-only statute, marker superseded)'
           : 'reconcile-finding (review-human statute amendment, marker superseded)';
-        results.push(entry);
+        reportEntry();
       } catch (e) {
         entry.error = String((e && e.message) || e).split('\n')[0];
-        results.push(entry);
+        reportEntry();
       }
       continue;
     }
@@ -1690,7 +1954,7 @@ export function watchParkedPrConflicts({
         const baseRefName = pr?.baseRefName ?? null;
         if (baseRefName && baseRefName !== 'main') {
           entry.routedTo = 'deferred-to-reconcile (stacked base — see reconcile-core.mjs#3383, review labels untouched)';
-          results.push(entry);
+          reportEntry();
           continue;
         }
 
@@ -1832,14 +2096,14 @@ export function watchParkedPrConflicts({
             ? 'reconcile-finding (no longer statute-tier — #xconflres1, marker superseded, after drain grace)'
             : 'reconcile-finding (after drain grace)';
         }
-        results.push(entry);
+        reportEntry();
       } catch (e) {
         entry.error = String((e && e.message) || e).split('\n')[0];
-        results.push(entry);
+        reportEntry();
       }
       continue;
     }
-    if (dryRun) { results.push(entry); continue; }
+    if (dryRun) { reportEntry(); continue; }
     try {
       if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
       if (plan.add) {
@@ -1855,7 +2119,7 @@ export function watchParkedPrConflicts({
           provider.ensureLabel(resolvedRepo, CONFLICT_LABEL, CONFLICT_LABEL_META);
           provider.setLabels(resolvedRepo, pr?.number, { add: CONFLICT_LABEL, remove: [] });
           entry.routedTo = 'deferred-to-reconcile (stacked base — see reconcile-core.mjs#3383, review labels untouched)';
-          results.push(entry);
+          reportEntry();
           continue;
         }
 
@@ -1886,26 +2150,26 @@ export function watchParkedPrConflicts({
           const disposition = computeConflictDisposition({ pr, repo: resolvedRepo });
           entry.conflictDisposition = disposition;
           if (disposition === 'clean' || disposition === 'manifest-only') {
-            // #xu38vlf (epic #4075/#3383) — CAP THE RETRY. Before this fix, an `action:'skip'`/`'error'` result
-            // fell through to the ordinary bounce below in the SAME sweep, which already exits this population
-            // (CONFLICT_LABEL applies before the sweep ends) — but a THROW from the git-level attempt itself (a
-            // stale lock, a corrupted ref, a protected-branch push denial) aborted the WHOLE per-PR handler
-            // before any label ever applied, so the PR stayed unowned and this same attempt retried again next
-            // sweep — unbounded, forever, with nothing durable recording it. `countUnownedRebaseAttempts` reads
-            // this population's OWN durable per-attempt marker (posted below, the MOMENT the outcome is known
-            // to be a retry-worthy one — `'skip'`/`'error'`, INCLUDING a caught throw — never on a clean
-            // `rebased`/`current` success, so the common healthy path stays exactly as quiet as before this
-            // fix) — once it reaches the cap, this file stops attempting the rebase and surfaces it once via
-            // the reconcile-notes channel + a desktop notify, then falls through to the ordinary bounce, exactly
-            // like a `skip`/`error` disposition already does.
-            const attemptsSoFar = countUnownedRebaseAttempts(existingComments);
-            if (attemptsSoFar >= UNOWNED_REBASE_ATTEMPT_CAP) {
+            // Infrastructure failures also have their own (earlier-surfacing) budget, but never more runs than the
+            // shared aggregate cap below allows.
+            // Main's aggregate ceiling: content skips + infra failures share one cap over the whole history.
+            // Operator round grants raise each cap only as "N more attempts from when the grant was posted".
+            const attemptsSoFar = attemptCount(existingComments);
+            const infraFailures = infraCountFor(pr)(existingComments);
+            const infraCap = grantedCap(pr, existingComments, infraRetryCap, infraFailures, infraCountFor(pr));
+            const attemptCap = infraFailures >= infraCap ? UNOWNED_REBASE_ATTEMPT_CAP
+              : grantedCap(pr, existingComments, UNOWNED_REBASE_ATTEMPT_CAP, attemptsSoFar, attemptCount);
+            if (infraFailures >= infraCap) {
+              // A card-only unowned PR may already have surfaced this same snapshot above.
+              if (!entry.unownedRebaseInfraCapExhausted) surfaceInfraCap(entry, pr, existingComments, infraFailures, infraCap);
+            } else if (attemptsSoFar >= attemptCap) {
               entry.unownedRebaseAttempts = attemptsSoFar;
               entry.unownedRebaseCapExhausted = true;
+              if (attemptCap !== UNOWNED_REBASE_ATTEMPT_CAP) entry.unownedRebaseAttemptCap = attemptCap;
               const note = {
-                kind: 'round-cap-exhausted', prNumber: pr?.number, attempts: attemptsSoFar, cap: UNOWNED_REBASE_ATTEMPT_CAP,
+                kind: 'round-cap-exhausted', prNumber: pr?.number, attempts: attemptsSoFar, cap: attemptCap,
                 capKind: 'unowned-mechanical-rebase',
-                text: `PR #${pr?.number}: unowned-mechanical-rebase auto-repair rounds exhausted (${attemptsSoFar}/${UNOWNED_REBASE_ATTEMPT_CAP}) — a person must take it over`,
+                text: `PR #${pr?.number}: unowned-mechanical-rebase auto-repair rounds exhausted (${attemptsSoFar}/${attemptCap}) — a person must take it over`,
               };
               const notePlan = planNoteComment(note, existingComments);
               if (!notePlan.alreadyPosted) {
@@ -1918,20 +2182,19 @@ export function watchParkedPrConflicts({
               let result;
               try { result = attemptMechanicalRebase({ pr, repo: resolvedRepo }); }
               catch (eAttempt) { result = { action: 'error', reason: String((eAttempt && eAttempt.message) || eAttempt) }; }
-              entry.mechanicalRebase = { action: result?.action, reason: result?.reason ?? null };
+              markInfraFailure(pr, result);
+              entry.mechanicalRebase = cardAttempt ?? { action: result?.action, reason: result?.reason ?? null };
               if (result?.action === 'rebased' || result?.action === 'current') {
                 // Resolved mechanically — no label, no bounce, no fix agent spent on a conflict a rebuild already
                 // cleared. GitHub's own `mergeable` flips on the next read of the PR once the push is seen.
                 entry.routedTo = 'mechanical-rebase';
-                results.push(entry);
+                reportEntry();
                 continue;
               }
-              // `action === 'skip'` (a REAL, non-manifest conflict the read-only probe missed — e.g. `main`
-              // moved between the probe and the attempt), `'error'` (a plumbing failure), or the caught-throw
-              // above — durably record this attempt BEFORE falling through, so the count advances even if the
-              // fall-through below (the comment/dispatch/label writes) itself then throws.
-              try { provider.postComment(resolvedRepo, pr?.number, UNOWNED_REBASE_ATTEMPT_MARKER); }
-              catch { /* best-effort — worst case this ONE attempt goes uncounted, same exposure as before this fix */ }
+              if (shouldCountRebaseAttempt(result)) {
+                try { provider.postComment(resolvedRepo, pr?.number, formatUnownedRebaseAttemptMarker(result)); }
+                catch { /* best-effort counter */ }
+              }
             }
           }
         }
@@ -2024,7 +2287,7 @@ export function watchParkedPrConflicts({
         provider.setLabels(resolvedRepo, pr?.number, { add: CONFLICT_LABEL, remove: [] });
       } else if (plan.remove.length) {
         // `planConflictLabelChange` only ever returns a non-empty `remove` alongside `newlyResolved: true`.
-        const needsRearm = hasReviewLabel(pr?.labels, REVIEW_LABELS.changes);
+        const needsRearm = hasReviewLabel(pr?.labels, REVIEW_LABELS.changes) || (cardOnly && rearmIsOwed(pr.labels));
         let deferRearm = false;
         if (needsRearm) {
           // #4118 (c) — never hand a repaired bounce back for re-review while a fix agent is STILL actively
@@ -2096,7 +2359,7 @@ export function watchParkedPrConflicts({
               postRearm({ pr, repo: resolvedRepo });
               entry.routedTo = 'rearm-review';
             } catch (e2) {
-              entry.error = String((e2 && e2.message) || e2).split('\n')[0];
+              entry.error = conflictWatchCause(e2);
             }
           }
           if (!entry.error) provider.setLabels(resolvedRepo, pr?.number, { add: undefined, remove: plan.remove });
@@ -2105,7 +2368,7 @@ export function watchParkedPrConflicts({
     } catch (e) {
       entry.error = String((e && e.message) || e).split('\n')[0];
     }
-    results.push(entry);
+    reportEntry();
   }
   return results;
 }
@@ -2123,8 +2386,20 @@ if (IS_CLI) {
     process.exitCode = 2;
   } else {
     try {
+      const cardConflictSettings = loadCardConflictSettings();
+      writeLineSync(2, `parked-pr-conflict-watch · cardConflicts.autoResolveRaisedBy=${cardConflictSettings.value.autoResolveRaisedBy} (source: ${cardConflictSettings.sources.autoResolveRaisedBy})`);
+      let listedPrs = [];
+      const unownedRebaseSettings = loadUnownedRebaseSettings();
+      writeLineSync(2, `parked-pr-conflict-watch · unownedRebase.infraRetryCap=${unownedRebaseSettings.value.infraRetryCap} (source: ${unownedRebaseSettings.sources.infraRetryCap})`);
+      writeLineSync(2, `parked-pr-conflict-watch · unownedRebase.countSince=${unownedRebaseSettings.value.countSince ?? 'unset'} (source: ${unownedRebaseSettings.sources.countSince})`);
       const results = watchParkedPrConflicts({
-        repo, dryRun, ...(prsFile ? { listPrs: () => readPrsFromFile(prsFile) } : {}),
+        unownedRebaseSettings,
+        repo, dryRun, cardConflictSettings,
+        listPrs: options => {
+          const listed = prsFile ? readPrsFromFile(prsFile) : defaultListParkedPrs(options);
+          if (Array.isArray(listed)) listedPrs = listed;
+          return listed;
+        },
         conflictReassertSettings: resolveConflictReassertSettings(),
       });
       for (const r of results) {
@@ -2133,6 +2408,7 @@ if (IS_CLI) {
         writeLineSync(2, `  ⚠ PR #${r.num}: ${verb2} ${what}${r.error ? ` (${r.error})` : ''}`);
       }
       writeAllSync(1, `${JSON.stringify({ checked: true, changed: results.length, results })}\n`);
+      writeLineSync(2, formatConflictWatchSummary(results, listedPrs));
     } catch (e) {
       writeLineSync(2, `error: ${String(e?.message ?? e)}`);
       process.exitCode = 1;

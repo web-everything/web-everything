@@ -67,6 +67,12 @@ catch (error) { sendBackLedgerError = String(error?.message ?? error).split('\n'
 const operatorSendBackHoldReasons = (pr) => sendBackLedger
   ? sendBackLedger.operatorSendBackHoldReasons(pr)
   : [`operator send-back check unavailable: ${sendBackLedgerError}`];
+// Partial copies may also lack the saved red-team reader (and its store graph). The queue still runs, but says that a
+// round-cap break the gate decided on saved evidence could be missing from RULING NEEDED.
+let savedRedTeamFallback = null;
+let savedRedTeamError = null;
+try { ({ savedRedTeamFallback } = await import('../lib/drain-saved-red-team.mjs')); }
+catch (error) { savedRedTeamError = String(error?.message ?? error).split('\n')[0]; }
 // Staged CLI copies may omit this transitive graph. Without the canonical answer reader,
 // keep stand-downs visible as unanswered so the operator can still act on them.
 let standDownAnswers = null;
@@ -82,6 +88,8 @@ let needsPersonRow;
 try { ({ needsPersonRow } = await import('./operator-queue-needs-person.mjs')); } catch { /* optional in staged copies */ }
 
 // The optional ledger also pulls in a graph that staged CLI copies may omit.
+let pausedReferrals = null;
+try { pausedReferrals = await import('../conveyor/review-referral-hold.mjs'); } catch { /* staged copies */ }
 let rulingLedger = null;
 let rulingLedgerError = null;
 try { rulingLedger = await import('../lib/ruling-ledger.mjs'); } catch (e) { rulingLedgerError = String(e?.message ?? e).split('\n')[0]; }
@@ -112,19 +120,20 @@ function queueChecks(pr) {
  * alert anywhere). Derived from the PR thread alone, for ANY open PR (the park is the signal, whatever the labels
  * say), so it shows until a ruling or a new head clears it. `findings` is one line each plus the file.
  */
-export function rulingNeededRow(repo, pr) {
-  const need = rulingLedger?.rulingNeeded(pr, rulingHumanAt === undefined ? {} : { humanAt: rulingHumanAt });
+export function rulingNeededRow(repo, pr, options = {}) {
+  const paused = pausedReferrals?.pausedReviewRulingNeeded(pr, { repo, ...options });
+  const need = paused ?? rulingLedger?.rulingNeeded(pr, rulingHumanAt === undefined ? {} : { humanAt: rulingHumanAt });
   if (!need) return null;
   return {
     repo, number: pr.number, title: pr.title, head: need.head,
     since: need.since === null ? null : new Date(need.since).toISOString(),
-    findings: need.findings.map((f) => ({ file: f.file, line: f.line, summary: f.summary, reason: f.reason })),
+    findings: need.findings.map((f) => ({ ...(paused ? { key: f.key } : {}), file: f.file, line: f.line, summary: f.summary, reason: f.reason })),
   };
 }
 
 /** A red-team round-cap ruling and its read-only operator command suggestions. PURE. */
-export function redTeamRulingRow(repo, pr, setting = CONFIRMED_BREAKS_DEFAULTS) {
-  const need = redTeamRulingNeeded(pr, setting, { repo: repo || pr?.repo || null });
+export function redTeamRulingRow(repo, pr, setting = CONFIRMED_BREAKS_DEFAULTS, { readSaved = null } = {}) {
+  const need = redTeamRulingNeeded(pr, setting, { readSaved, repo: repo || pr?.repo || null });
   if (!need) return null;
   const command = `node scripts/review-set-label.mjs ${pr.number} --repo=${repo}`;
   return {
@@ -635,6 +644,7 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
   };
   if (rulingLedgerError) report.errors.push(`ruling-needed section unavailable: ${rulingLedgerError}`);
   if (sendBackLedgerError) report.errors.push(`operator send-back check unavailable: ${sendBackLedgerError}`);
+  if (savedRedTeamError) report.errors.push(`saved red-team ruling check unavailable: ${savedRedTeamError}`);
   let readFailures = 0;
   const failedRead = (subject, error) => {
     readFailures += 1;
@@ -739,9 +749,13 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
         readyNumbersThisRepo.add(pr.number);
       }
       for (const pr of prs) {
-        report.rulingNeeded.push(...mergeRulingRows(
-          rulingNeededRow(repo, pr), redTeamRulingRow(repo, pr, redTeamSetting),
-        ));
+        // The gate can hold a break decided on saved evidence (its comment withheld); unreadable evidence is a visible error.
+        let redTeamRow = null;
+        try {
+          redTeamRow = redTeamRulingRow(repo, pr, redTeamSetting,
+            { readSaved: savedRedTeamFallback?.({ repo, pr: pr.number, head: pr.headRefOid }) ?? null });
+        } catch (error) { failedRead(`${repo}#${pr.number} red-team ruling`, error); }
+        report.rulingNeeded.push(...mergeRulingRows(rulingNeededRow(repo, pr), redTeamRow));
       }
       for (const pr of prs) {
         if (readyNumbersThisRepo.has(pr.number)) continue;
@@ -819,7 +833,8 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
       + (pr.ceremonyOwed ? ` — ${pr.reason}\n    clear-human: node scripts/review-set-label.mjs ${pr.number} --repo=${pr.repo} --to=clear-human --actor=<your login> --reason='<your words>'`
         : (pr.humanHolds ? ` — merge-gate holds only for human review: ${pr.humanHolds.join(', ')}` : ''))).concat((report.needsYouStandDowns ?? []).map((pr) => `${pr.repo}#${pr.number}  ${pr.title}  [stood down ${pr.standDownAt || 'time unknown'} — the fixer asks] ${pr.question}`
       + pr.remaining.map((f) => `\n    - still needs your ruling: ${f.file || '(no file)'}${f.line != null ? `:${f.line}` : ''}  ${f.summary}`).join(''))).concat(report.needsPerson.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}  [conveyor asks since ${pr.noteAt}] ${pr.headline}${pr.detail ? ` — ${pr.detail}` : ''}`
-      + `\n    extend rounds: ${pr.commands.extendRounds}\n    send back past the cap: ${pr.commands.sendBack}\n    answer the stand-down: ${pr.commands.standDownAnswer}\n    close: ${pr.commands.close}`)).join('\n'));
+      + (pr.commands.releaseDraft ? `\n    release draft: ${pr.commands.releaseDraft}`
+        : `\n    extend rounds: ${pr.commands.extendRounds}\n    send back past the cap: ${pr.commands.sendBack}\n    answer the stand-down: ${pr.commands.standDownAnswer}\n    close: ${pr.commands.close}`))).join('\n'));
     console.log('RULING NEEDED — review parked with confirmed findings; each needs your block/card/not-real ruling:');
     printRows(report.rulingNeeded.map((r) => `${r.repo}#${r.number}  ${r.title}  [waiting since ${r.since || 'time unknown'}, head ${r.head.slice(0, 9)}]\n`
       + r.findings.map((f) => `    - ${f.file ?? '(no file)'}${f.line ? `:${f.line}` : ''}  ${f.summary}${f.reason === 'dispute' ? '  [came back after your block ruling; the fixer and reviewer disagree]' : f.reason === 'red-team-round-cap' ? '  [red team confirmed break; round cap reached, not sent back]' : ''}`).join('\n')
