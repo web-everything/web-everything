@@ -22,7 +22,7 @@
  * or `.lanes/we-drain-daemon`. Git runs with GIT_DIR-style overrides scrubbed and the lane hardening pins applied.
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, hostname, tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -86,13 +86,16 @@ function borrowerMap() {
   return map;
 }
 const BORROWERS = borrowerMap();
+// Every path the cleanup writes through (config, refs, HEAD, reflogs, the lease marker) — none may be a symlink.
+const GIT_WRITE_PATHS = ['config', 'config.worktree', 'packed-refs', 'refs', 'refs/remotes', 'refs/remotes/origin', 'refs/remotes/origin/ops', 'logs', 'logs/refs', 'logs/refs/remotes', 'logs/refs/remotes/origin', 'logs/refs/remotes/origin/ops', 'HEAD', 'objects', 'objects/pack', 'objects/info', LEASE_FILENAME];
+const symlinkedGitPaths = (dir) => GIT_WRITE_PATHS.filter((p) => { try { return lstatSync(join(dir, '.git', p)).isSymbolicLink(); } catch { return false; } });
 const commonDir = (dir) => { try { return real(resolve(dir, git(dir, ['rev-parse', '--git-common-dir']).trim())); } catch { return null; } };
 
 const eligible = (dir) => {
   const realGitDir = real(join(dir, '.git'));
   const objects = realGitDir ? real(join(realGitDir, 'objects')) : null;
   return cleanupEligibility({
-    dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir, realCommonDir: realGitDir ? commonDir(dir) : undefined, realObjectsDir: objects ?? undefined,
+    dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir, realCommonDir: realGitDir ? commonDir(dir) : undefined, realObjectsDir: objects ?? undefined, symlinkedGitPaths: symlinkedGitPaths(dir),
     lease: readLease(dir), nowMs: Date.now(), locks: locksIn(dir),
     borrowers: (objects && BORROWERS.get(objects)) || [], gcHooks: realGitDir ? gcHooks(dir) : [],
   });
@@ -133,7 +136,7 @@ for (const n of lanes) {
     const holder = claim(dir);
     if (!holder) { rows.push({ lane: n, skipped: 'lost the claim race (someone took the lane)' }); continue; }
     try {
-      const recheck = cleanupEligibility({ dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir: real(join(dir, '.git')), realCommonDir: commonDir(dir), realObjectsDir: real(join(dir, '.git', 'objects')), lease: null, nowMs: Date.now(), locks: locksIn(dir) });
+      const recheck = cleanupEligibility({ dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir: real(join(dir, '.git')), realCommonDir: commonDir(dir), realObjectsDir: real(join(dir, '.git', 'objects')), symlinkedGitPaths: symlinkedGitPaths(dir), lease: null, nowMs: Date.now(), locks: locksIn(dir) });
       if (!recheck.ok) { rows.push({ lane: n, skipped: recheck.reason }); continue; }
       const before = duBytes(join(dir, '.git'));
       const applied = applyLaneDietConfig((args) => git(dir, args));

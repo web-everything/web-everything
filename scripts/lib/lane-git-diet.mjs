@@ -105,11 +105,11 @@ export const CLEANUP_POOLS = Object.freeze(['web-everything', 'frontierui', 'pla
  * delete objects the borrower needs), and any lane with a `gc.recentObjectsHook` (gc would execute it).
  * @param {{dir: string, poolRoot: string, realDir?: string, realGitDir?: string, lease?: object|null, nowMs: number,
  *   realCommonDir?: string, realObjectsDir?: string, ttlMs?: number, locks?: string[], borrowers?: string[],
- *   gcHooks?: string[]}} o  `realCommonDir`/`realObjectsDir` = resolved `git rev-parse --git-common-dir` and
+ *   gcHooks?: string[], symlinkedGitPaths?: string[]}} o  `realCommonDir`/`realObjectsDir` = resolved `git rev-parse --git-common-dir` and
  *   `<git dir>/objects`: a `commondir` file or symlinked object store would redirect the cleanup into another repo.
  * @returns {{ok: true} | {ok: false, reason: string}}
  */
-export function cleanupEligibility({ dir, poolRoot, realDir, realGitDir, realCommonDir, realObjectsDir, lease = null, nowMs, ttlMs, locks = [], borrowers = [], gcHooks = [] }) {
+export function cleanupEligibility({ dir, poolRoot, realDir, realGitDir, realCommonDir, realObjectsDir, symlinkedGitPaths = [], lease = null, nowMs, ttlMs, locks = [], borrowers = [], gcHooks = [] }) {
   const root = String(poolRoot || '').replace(/\/+$/, '');
   const rel = String(dir || '').startsWith(`${root}/`) ? String(dir).slice(root.length + 1) : null;
   const m = rel && /^([^/]+)\/lane-(\d+)\/?$/.exec(rel);
@@ -120,6 +120,8 @@ export function cleanupEligibility({ dir, poolRoot, realDir, realGitDir, realCom
   if (realGitDir !== undefined && realGitDir !== `${clean}/.git`) return { ok: false, reason: `.git is not the lane's own directory (resolves to ${realGitDir})` };
   if (realCommonDir !== undefined && realCommonDir !== `${clean}/.git`) return { ok: false, reason: `git common dir is redirected (${realCommonDir})` };
   if (realObjectsDir !== undefined && realObjectsDir !== `${clean}/.git/objects`) return { ok: false, reason: `object store is redirected (${realObjectsDir})` };
+  // git's config/ref writers follow symlinks, so a symlinked .git/config (or refs store) would write into another repo.
+  if (symlinkedGitPaths.length) return { ok: false, reason: `symlinked git paths (${symlinkedGitPaths.join(', ')})` };
   if (lease && !isLeaseStale(lease, nowMs, ttlMs)) {
     return { ok: false, reason: lease.reserved ? 'reserved lease' : `live lease (${lease.purpose || lease.holder || lease.ownerSession || 'unknown holder'})` };
   }

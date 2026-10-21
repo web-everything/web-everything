@@ -239,6 +239,18 @@ describe('real git: negative refspec + explicit reader fetch + cleanup CLI', () 
     expect(existsSync(join(lane(1), '.git'))).toBe(true);
   }, 60_000);
 
+  it('a lane whose .git/config symlinks into another repo is refused and the target config is untouched', () => {
+    const primary = join(root, 'primary');
+    git(root, 'clone', '-q', up, primary);
+    git(root, 'clone', '-q', up, lane(6));
+    rmSync(join(lane(6), '.git', 'config'));
+    symlinkSync(join(primary, '.git', 'config'), join(lane(6), '.git', 'config'));
+    const before = readFileSync(join(primary, '.git', 'config'), 'utf8');
+    const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--prune-expire=now', '--apply', '--lanes=6', '--json'], { env, encoding: 'utf8' }));
+    expect(out.rows[0].skipped).toMatch(/symlinked git paths \(config\)/);
+    expect(readFileSync(join(primary, '.git', 'config'), 'utf8')).toBe(before);
+  }, 60_000);
+
   it('a borrower that appears after the startup scan stops gc on that lane (pre-gc rescan)', () => {
     git(root, 'clone', '-q', up, lane(5));
     git(lane(5), 'config', 'fetch.unpackLimit', '100');
