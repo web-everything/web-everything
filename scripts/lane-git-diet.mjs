@@ -22,7 +22,7 @@
  * or `.lanes/we-drain-daemon`. Git runs with GIT_DIR-style overrides scrubbed and the lane hardening pins applied.
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, hostname, tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -139,6 +139,16 @@ for (const n of lanes) {
       const applied = applyLaneDietConfig((args) => git(dir, args));
       const refsNow = opsRefs(dir);
       for (const ref of refsNow) git(dir, ['update-ref', '--no-deref', '-d', ref]);
+      // Re-scan borrowers right before pruning: a repo that started borrowing this lane's objects since startup
+      // would lose them to gc. (Lane-pool clones `--reference` the primary, never a lane, so this is the anomaly path.)
+      // TEST SEAM (honoured only under vitest): simulate a borrower appearing mid-run, after the startup scan.
+      if (process.env.VITEST && process.env.LANE_GIT_DIET_TEST_LATE_BORROWER) {
+        const borrowerObjects = process.env.LANE_GIT_DIET_TEST_LATE_BORROWER;
+        mkdirSync(join(borrowerObjects, 'info'), { recursive: true });
+        writeFileSync(join(borrowerObjects, 'info', 'alternates'), `${join(dir, '.git', 'objects')}\n`);
+      }
+      const lateBorrowers = borrowerMap().get(real(join(dir, '.git', 'objects'))) || [];
+      if (lateBorrowers.length) { rows.push({ lane: n, skipped: `objects borrowed by ${lateBorrowers.join(', ')} (config + ref cleanup done, gc skipped)` }); continue; }
       git(dir, ['-c', 'gc.autoDetach=false', '-c', 'gc.reflogExpire=never', '-c', 'gc.reflogExpireUnreachable=never', '-c', 'gc.worktreePruneExpire=never', '-c', 'gc.rerereResolved=36500', '-c', 'gc.rerereUnresolved=36500', 'gc', `--prune=${PRUNE_EXPIRE}`, '--quiet'], GC_TIMEOUT_MS);
       const after = duBytes(join(dir, '.git'));
       const freed = before - after;

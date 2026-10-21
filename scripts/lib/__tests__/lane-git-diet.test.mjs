@@ -238,4 +238,20 @@ describe('real git: negative refspec + explicit reader fetch + cleanup CLI', () 
     expect(again.rows[0]).toMatchObject({ configOps: 0, opsRefsDeleted: 0 });
     expect(existsSync(join(lane(1), '.git'))).toBe(true);
   }, 60_000);
+
+  it('a borrower that appears after the startup scan stops gc on that lane (pre-gc rescan)', () => {
+    git(root, 'clone', '-q', up, lane(5));
+    git(lane(5), 'config', 'fetch.unpackLimit', '100');
+    pushLedgerTip();
+    git(lane(5), 'fetch', '-q', 'origin');
+    const looseBefore = parseCountObjects(git(lane(5), 'count-objects', '-v')).count;
+    expect(looseBefore).toBeGreaterThan(0);
+    const late = join(root, 'late-borrower', 'objects');
+    const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--prune-expire=now', '--apply', '--lanes=5', '--json'], {
+      env: { ...env, VITEST: 'true', LANE_GIT_DIET_TEST_LATE_BORROWER: late }, encoding: 'utf8',
+    }));
+    expect(out.rows[0].skipped).toMatch(/borrowed by .*late-borrower.*gc skipped/);
+    expect(parseCountObjects(git(lane(5), 'count-objects', '-v')).count).toBe(looseBefore); // gc never ran
+    expect(existsSync(join(lane(5), '.git', '.lane-lease'))).toBe(false);
+  }, 60_000);
 });
