@@ -1406,7 +1406,7 @@ export function runReviewLabelCli({
   };
   const redTeamRulingHold = to === 'clear-human' && hasReviewLabel(currentLabels, REVIEW_LABELS.accepted)
     && !hasReviewLabel(currentLabels, REVIEW_LABELS.human) && !hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical)
-    && redTeamRulingNeeded({ number: Number(pr), headRefOid: headSha, labels: currentLabels, comments: fullThread() }, readConfirmedBreaks().value) !== null;
+    && redTeamRulingNeeded({ number: Number(pr), headRefOid: headSha, labels: currentLabels, comments: fullThread() }, readConfirmedBreaks().value, { repo }) !== null;
   let decision = decideSetLabel({
     to,
     currentLabels,
