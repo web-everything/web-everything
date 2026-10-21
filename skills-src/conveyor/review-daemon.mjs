@@ -463,6 +463,8 @@ export function handleReferralHoldAutoResolve({ repo, row, auto, rawPrs = null, 
   const labels = (live?.labels ?? row?.labels ?? []).map(l => (typeof l === 'string' ? l : l?.name));
   const blocked = (auto.blocked ?? []).map(b => `${b.file ?? 'no file'}${Number.isInteger(b.line) ? `:${b.line}` : ''}`);
   const resolved = { ...record, blocked };
+  // Already sent back by this process (a stale listing can still lack the label): never twice.
+  if (seen.has(key)) return { resolved };
   if (labels.includes('review:changes')) {
     if (!seen.has(key)) { seen.add(key); log(`review-daemon: ${REFERRAL_HOLD_AUTO_RESOLVED} ${JSON.stringify({ ...resolved, sentBack: 'already review:changes' })}`); }
     return { resolved };
@@ -857,6 +859,14 @@ export function runReviewTick({
   const dispatched = [];
   const failed = [];
   const referralHoldAutoResolved = [];
+  // A pause the plan itself lifted (its head's one finished review left no advisory): the advisory review goes out.
+  for (const n of plan.notes ?? []) {
+    if (n?.kind !== 'referral-hold-auto-resolved') continue;
+    const resolved = { repo, pr: n.prNumber, head: n.head, outcome: n.outcome, ...(n.counts ? { counts: n.counts } : {}), next: n.next };
+    const key = `${repo}#${n.prNumber}@${n.head}:${n.outcome}:${n.next}`;
+    if (!autoResolveSeen.has(key)) { autoResolveSeen.add(key); log(`review-daemon: ${REFERRAL_HOLD_AUTO_RESOLVED} ${JSON.stringify(resolved)}`); }
+    referralHoldAutoResolved.push(resolved);
+  }
   for (const row of plan.refusals ?? []) {
     // stale-hold-resume — a pause whose every live-head finding already carries a ruling resolves itself.
     const auto = row.referralHoldAutoResolve ?? row.reviewRefusal?.referralHoldAutoResolve;

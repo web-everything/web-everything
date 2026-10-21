@@ -8,10 +8,12 @@ import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { buildOperatorRulingComment, readReferralRecords } from '../../lib/jury-core.mjs';
+import { buildOperatorRulingComment, readReferralRecords, REFERRAL_SUPERSEDE_REASON } from '../../lib/jury-core.mjs';
+import { liveReferralState } from '../../lib/referral-live-context.mjs';
 import { openReferralFindings } from '../../operations/record-referral-ruling.mjs';
 import {
-  decideReferralHoldAutoResolve, enrichPrsWithReferralHoldAutoResolve, enrichPrsWithReferralHolds,
+  decideReferralHoldAutoResolve, enrichPrsWithReferralHoldAutoResolve, enrichPrsWithReferralHolds, resolveReferralHoldAutoResolve,
+  REFERRAL_HOLD_AUTO_RESOLVE_STANDARD,
   referralHoldSendBackBody, REFERRAL_HOLD_AUTO_RESOLVED,
 } from '../review-referral-hold.mjs';
 import { planReconcile as planReconcileWithTiming } from '../reconcile-core.mjs';
@@ -105,7 +107,36 @@ describe('live replays: each PR is paused today, and every live-head finding is 
     // … but the live head's own rulings are all not-real, so no block is sent back.
     const pr = enrich(fx);
     expect(pr.referralHoldAutoResolve).toMatchObject({ outcome: 'resume', counts: { 'not-real': 3 } });
-    expect(plan(pr).refusals.map(r => r.kind)).toEqual(['already-reviewed-head']);
+  });
+
+  it('#5773: its one finished review left NO advisory on the PR (write-up to a local file, label swap refused), so the review resumes once', () => {
+    const p = plan(enrich(FX[5773]));
+    expect(p.refusals).toEqual([]);
+    expect(p.dispatch.map(d => d.kind)).toEqual(['review']);
+    expect(p.notes.filter(n => n.kind === 'referral-hold-auto-resolved')).toEqual([expect.objectContaining({
+      prNumber: 5773, head: FX[5773].headRefOid, outcome: 'resume', next: 'advisory-review', counts: { 'not-real': 3 } })]);
+    // The tick logs it once.
+    const log = vi.fn(), seen = new Set();
+    for (let t = 0; t < 2; t++) {
+      runReviewTick({ repo, reconcile: () => ({ dispatch: [], refusals: [], notes: p.notes }), dispatch: vi.fn(), readPrs: () => [], readAgents: () => [],
+        holdReconcile: () => [], tagRound: vi.fn(), tagStatus: vi.fn(), autoResolveSeen: seen, log });
+    }
+    expect(log.mock.calls.map(c => c[0]).filter(l => l.includes(REFERRAL_HOLD_AUTO_RESOLVED)))
+      .toEqual([`review-daemon: referral-hold auto-resolved {"repo":"${repo}","pr":5773,"head":"${FX[5773].headRefOid}","outcome":"resume","counts":{"not-real":3},"next":"advisory-review"}`]);
+  });
+
+  it('#5773: a SECOND finished review that still leaves no advisory keeps the pause (no panel per tick)', () => {
+    const fx = FX[5773];
+    const last = fx.runs.filter(r => r.head === fx.headRefOid).sort((x, y) => x.completedAt - y.completedAt).at(-1);
+    const again = { ...last, id: `${last.id}-2`, startedAt: last.completedAt + 60_000, completedAt: last.completedAt + 600_000 };
+    const [held] = enrichPrsWithReferralHolds([asPr(fx)], { repo, readRuns: () => [...fx.runs, again], now: Date.parse(fx.capturedAt), env: {} });
+    expect(held.referralHold).toMatchObject({ kind: 'same-head', count: 2 });
+    const [pr] = enrichPrsWithReferralHoldAutoResolve([held], { repo, env: {}, decide: (q, h) => decide(q, h) });
+    const p = plan(pr);
+    expect(p.dispatch).toEqual([]);
+    expect(p.refusals.map(r => r.kind)).toEqual(['review-referrals-pending']);
+    expect(p.refusals[0].referralHoldAutoResolve).toMatchObject({ outcome: 'stay', why: expect.stringMatching(/reviewed 2 time\(s\) and the PR still carries no advisory/) });
+    expect(operatorHoldsFromPlan(p)).toEqual([{ prNumber: 5773, kind: 'review-referrals-pending' }]);
   });
 
   it('#5800 (one finding carried not-real from an earlier head, one ruled on the live head) resumes', () => {
@@ -153,6 +184,10 @@ describe('send-back: a block ruling on the live head owes a fix, never a ruling'
     expect(send.mock.calls[0][0].body).toContain('scripts/lib/git-identity.mjs:241');
     expect(out.resolved).toMatchObject({ pr: 5775, head: fx.headRefOid, outcome: 'send-back', sentBack: true });
     expect(log.mock.calls.map(c => c[0])).toEqual([expect.stringMatching(new RegExp(`^review-daemon: ${REFERRAL_HOLD_AUTO_RESOLVED} \\{"repo":"${repo}","pr":5775,"head":"${fx.headRefOid}","outcome":"send-back"`))]);
+    // A stale listing that still lacks the label: this process already sent it, so nothing is sent again.
+    handleReferralHoldAutoResolve({ repo, row, auto: row.referralHoldAutoResolve, rawPrs, send, seen, log });
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledTimes(1);
     // Next tick the label is review:changes: nothing is sent again.
     handleReferralHoldAutoResolve({ repo, row, auto: row.referralHoldAutoResolve,
       rawPrs: [{ number: 5775, labels: [{ name: 'review:human' }, { name: 'review:changes' }] }], send, seen, log });
@@ -250,6 +285,55 @@ describe('fail closed: anything unproven keeps the pause, and says why', () => {
     expect(decide(prOther, { ...hold, head: other })).toMatchObject({ outcome: 'stay', why: 'no referral record names the live head' });
     expect(r.head).toBe(f.headRefOid);
   });
+  it('an operator carry the gate backs (source ruling on an older head) counts; the same ruling without the carry does not', () => {
+    const f = FX[5800];
+    const rec = liveRecord(f);
+    const carry = rec.carried[0];
+    const source = readReferralRecords(f.comments, { head: f.headRefOid }).records.find(r => r.head === carry.from.head && r.runId === carry.from.runId);
+    expect(source).toBeTruthy();
+    // The operator's not-real on the SOURCE head, and the carry rewritten as an operator-backed one (no rulingId).
+    const opAt = '2026-10-21T15:45:00.000Z';
+    const op = operatorRuling({ ...f, headRefOid: carry.from.head }, { key: carry.from.key, runId: carry.from.runId, result: 'not-real', at: opAt });
+    const rewrite = (c, mutate) => {
+      const m = /<!-- mandatory-referrals-v1: (\S+) -->/.exec(c.body);
+      if (!m) return c;
+      const record = JSON.parse(decodeURIComponent(m[1]));
+      if (record.head !== f.headRefOid) return c;
+      return { ...c, body: c.body.replace(m[1], encodeURIComponent(JSON.stringify(mutate(record)))) };
+    };
+    const at = f.comments.findIndex(c => c.createdAt > opAt);
+    const base = [...f.comments.slice(0, at), op, ...f.comments.slice(at)];
+    const withCarry = base.map(c => rewrite(c, r => ({ ...r, carried: r.carried.map(x => ({ ...x, from: { head: x.from.head, runId: x.from.runId, key: x.from.key } })) })));
+    const hold = { kind: 'same-head', head: f.headRefOid, count: 1 };
+    const gate = liveReferralState(asPr(f, withCarry), { repo, pr: 5800, cardReadable: noCards });
+    expect(gate).toMatchObject({ pending: [], blocked: [], malformed: false });
+    expect(decide(asPr(f, withCarry), hold)).toMatchObject({ outcome: 'resume', counts: { 'not-real': 2 } });
+    // Without the carry entry, the older-head operator ruling proves nothing about the live head.
+    const noCarry = base.map(c => rewrite(c, r => { const { carried, ...rest } = r; return rest; }));
+    expect(decide(asPr(f, noCarry), hold).outcome).toBe('stay');
+  });
+
+  it('a superseded advisory duplicate the gate backs reads as the not-real that replaced it', () => {
+    const rec = liveRecord(fx);
+    const orig = rec.referrals[0];
+    const ruling = rec.rulings.find(r => r.key === orig.key);
+    const dupKey = JSON.stringify(['judgeAdvisory', orig.finding.file, orig.finding.line, `${orig.finding.summary} (duplicate wording)`]);
+    const comments = fx.comments.map(c => {
+      const m = /<!-- mandatory-referrals-v1: (\S+) -->/.exec(c.body);
+      if (!m) return c;
+      const record = JSON.parse(decodeURIComponent(m[1]));
+      if (record.head !== fx.headRefOid) return c;
+      const next = { ...record, referrals: [...record.referrals, { key: dupKey, seat: 'judgeAdvisory', finding: { ...orig.finding, summary: `${orig.finding.summary} (duplicate wording)` },
+          original: { ...orig.original, summary: `${orig.finding.summary} (duplicate wording)` } }],
+        superseded: [{ key: dupKey, reason: REFERRAL_SUPERSEDE_REASON, by: { runId: record.runId, key: orig.key, rulingId: ruling.id } }] };
+      return { ...c, body: c.body.replace(m[1], encodeURIComponent(JSON.stringify(next))) };
+    });
+    const gate = liveReferralState(asPr(fx, comments), { repo, pr: 5775, cardReadable: noCards });
+    expect(gate).toMatchObject({ pending: [], blocked: [], malformed: false });
+    expect(liveRecord({ ...fx, comments }).referrals.map(r => r.key)).toContain(dupKey);
+    expect(decide(asPr(fx, comments), hold)).toMatchObject({ outcome: 'resume', counts: { 'not-real': 2 } });
+  });
+
   it('the kill switch turns it off', () => {
     expect(decide(pr, hold, { env: { WE_REFERRAL_HOLD_AUTO_RESOLVE: '0' } })).toBeNull();
   });
@@ -268,5 +352,43 @@ describe('fail closed: anything unproven keeps the pause, and says why', () => {
     expect(p.dispatch.filter(d => d.kind === 'review')).toEqual([]);
     const row = p.refusals.find(r => r.kind === 'review-referrals-pending');
     expect(row?.referralHoldAutoResolve).toMatchObject({ outcome: 'stay' });
+  });
+});
+
+describe('policy: referralHoldAutoResolve is a setting (value and source logged), with a kill switch to the pause', () => {
+  const fx = FX[5775];
+  const hold = { kind: 'same-head', head: fx.headRefOid, count: 1 };
+  it('standard: on, block → send-back, clean → resume; the tool file ships the same values', () => {
+    expect(REFERRAL_HOLD_AUTO_RESOLVE_STANDARD).toEqual({ enabled: true, onBlock: 'send-back', onClean: 'resume' });
+    const r = resolveReferralHoldAutoResolve({}, { log: () => {} });
+    expect(r.value).toEqual({ enabled: true, onBlock: 'send-back', onClean: 'resume' });
+    expect(Object.values(r.sources).every(v => ['standard', 'tool', 'platform'].includes(v))).toBe(true);
+  });
+  it('env beats the tool layer and is named as the source; invalid values are ignored', () => {
+    const r = resolveReferralHoldAutoResolve({ WE_REFERRAL_HOLD_AUTO_RESOLVE: '0', WE_REFERRAL_HOLD_AUTO_RESOLVE_ON_BLOCK: 'pause',
+      WE_REFERRAL_HOLD_AUTO_RESOLVE_ON_CLEAN: 'accept' }, { tool: { enabled: true, onBlock: 'send-back', onClean: 'resume' }, log: () => {} });
+    expect(r.value).toEqual({ enabled: false, onBlock: 'pause', onClean: 'resume' });
+    expect(r.sources).toMatchObject({ enabled: 'env', onBlock: 'env' });
+    expect(r.sources.onClean).not.toBe('env');
+  });
+  it('enabled=false is today\'s pause exactly: no answer, the plan refuses review-referrals-pending as before', () => {
+    const settings = { value: { enabled: false, onBlock: 'send-back', onClean: 'resume' }, sources: { enabled: 'env' } };
+    expect(decide(asPr(fx), hold, { settings })).toBeNull();
+    const [held] = enrichPrsWithReferralHolds([asPr(fx)], { repo, readRuns: () => fx.runs, now: Date.parse(fx.capturedAt), env: {} });
+    const [pr] = enrichPrsWithReferralHoldAutoResolve([held], { repo, settings, decide: (p, h, o) => decide(p, h, o) });
+    expect(pr.referralHoldAutoResolve).toBeUndefined();
+    expect(plan(pr).refusals.map(r => r.kind)).toEqual(['review-referrals-pending']);
+  });
+  it('onClean=pause keeps an all-not-real pause and says which setting and source did it', () => {
+    const settings = { value: { enabled: true, onBlock: 'send-back', onClean: 'pause' }, sources: { onClean: 'tool' } };
+    expect(decide(asPr(fx), hold, { settings })).toMatchObject({ outcome: 'stay',
+      why: expect.stringMatching(/referralHoldAutoResolve\.onClean=pause \(source: tool\) keeps the pause/) });
+  });
+  it('onBlock=pause keeps a live-head block paused', () => {
+    const rec = liveRecord(fx);
+    const block = operatorRuling(fx, { key: rec.referrals[0].key, runId: rec.runId, result: 'block', at: '2026-10-21T10:58:00.000Z' });
+    const settings = { value: { enabled: true, onBlock: 'pause', onClean: 'resume' }, sources: { onBlock: 'env' } };
+    expect(decide(asPr(fx, [...fx.comments, block]), hold, { settings })).toMatchObject({ outcome: 'stay',
+      why: expect.stringMatching(/onBlock=pause \(source: env\)/) });
   });
 });

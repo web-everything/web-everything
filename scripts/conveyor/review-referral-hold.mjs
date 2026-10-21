@@ -524,6 +524,51 @@ export function filterFixerReferrals(pr, findings, { repo,
 
 /** The daemon's log prefix for a pause it resolved on its own (stale-hold-resume). */
 export const REFERRAL_HOLD_AUTO_RESOLVED = 'referral-hold auto-resolved';
+
+/**
+ * `referralHoldAutoResolve` — the stale-hold-resume policy, resolved standard → platform → tool → env with
+ * policy-cascade source logging (operator rule 2026-10-21: every policy is a setting, logged with value and source).
+ * - `enabled` (standard true): false is the kill switch back to today's pause, byte-identical (no answer at all).
+ *   Env `WE_REFERRAL_HOLD_AUTO_RESOLVE=0|1`.
+ * - `onBlock` (standard `send-back`): a live-head block sends the PR back to the fixer; `pause` keeps the pause.
+ *   Env `WE_REFERRAL_HOLD_AUTO_RESOLVE_ON_BLOCK`.
+ * - `onClean` (standard `resume`): all card / not-real resumes the PR to its next step; `pause` keeps the pause.
+ *   Env `WE_REFERRAL_HOLD_AUTO_RESOLVE_ON_CLEAN`.
+ * Anything invalid in a layer is ignored (the layer below applies).
+ */
+export const REFERRAL_HOLD_AUTO_RESOLVE_STANDARD = Object.freeze({ enabled: true, onBlock: 'send-back', onClean: 'resume' });
+export const REFERRAL_HOLD_AUTO_RESOLVE_TOOL_FILE = resolve(dirname(fileURLToPath(import.meta.url)), '../settings/referral-hold-auto-resolve.json');
+const AUTO_RESOLVE_VALID = Object.freeze({
+  enabled: v => typeof v === 'boolean',
+  onBlock: v => v === 'send-back' || v === 'pause',
+  onClean: v => v === 'resume' || v === 'pause',
+});
+export function resolveReferralHoldAutoResolve(env = process.env, { tool, log } = {}) {
+  const standard = { value: { ...REFERRAL_HOLD_AUTO_RESOLVE_STANDARD },
+    sources: { enabled: 'standard', onBlock: 'standard', onClean: 'standard' } };
+  try {
+    let block = tool;
+    if (block === undefined) {
+      try { block = JSON.parse(readFileSync(REFERRAL_HOLD_AUTO_RESOLVE_TOOL_FILE, 'utf8'))?.referralHoldAutoResolve; } catch { block = undefined; }
+    }
+    const raw = name => { const v = env?.[name]; return v == null || String(v).trim() === '' ? undefined : String(v).trim(); };
+    const enabledRaw = raw('WE_REFERRAL_HOLD_AUTO_RESOLVE');
+    const r = cascadePolicy('referralHoldAutoResolve', block && typeof block === 'object' && !Array.isArray(block)
+      ? { enabled: block.enabled, onBlock: block.onBlock, onClean: block.onClean } : undefined, {
+      env: env ?? {}, standard: REFERRAL_HOLD_AUTO_RESOLVE_STANDARD, valid: AUTO_RESOLVE_VALID, ...(log ? { log } : {}),
+      envValues: { enabled: enabledRaw === '0' ? false : enabledRaw === '1' ? true : enabledRaw,
+        onBlock: raw('WE_REFERRAL_HOLD_AUTO_RESOLVE_ON_BLOCK'), onClean: raw('WE_REFERRAL_HOLD_AUTO_RESOLVE_ON_CLEAN') },
+    });
+    const value = {};
+    const sources = {};
+    for (const k of Object.keys(AUTO_RESOLVE_VALID)) {
+      const ok = AUTO_RESOLVE_VALID[k](r.value?.[k]);
+      value[k] = ok ? r.value[k] : REFERRAL_HOLD_AUTO_RESOLVE_STANDARD[k];
+      sources[k] = ok ? r.sources?.[k] ?? 'standard' : 'standard';
+    }
+    return { value, sources };
+  } catch { return standard; }
+}
 const RULING_RESULTS = new Set(['block', 'card', 'not-real']);
 const findingLoc = f => `${f?.file ?? 'no file'}${Number.isInteger(f?.line) ? `:${f.line}` : ''}`;
 
@@ -536,7 +581,9 @@ const findingLoc = f => `${f?.file ?? 'no file'}${Number.isInteger(f?.line) ? `:
  * A finding counts as ruled only when the gate itself reads a ruling for it on the LIVE head's own record
  * (`referralRecordState`: the record's counted ruling, the operator's ruling pinned to this head, or a carry the gate
  * backs). A ruling that exists only in the verdict ledger (a ledger-write-miss leaves exactly that) or only on an
- * older head is not readable here, so it never counts. Outcomes:
+ * older head is not readable here, so it never counts. Like the hold's own live release, the read omits the gate's
+ * `seatDisabled` (importing the seat policy closes a cycle): an unruled finding of a since-disabled seat keeps the
+ * pause, the conservative side. Outcomes:
  * - `send-back`: some live-head finding is ruled `block` (operator or policy or reviewer) and none is pending.
  * - `resume`: every live-head finding is ruled `card` or `not-real`.
  * - `stay` (fail closed, with `why`): anything unreadable, pending, missing, malformed, or not on the live head.
@@ -545,8 +592,11 @@ const findingLoc = f => `${f?.file ?? 'no file'}${Number.isInteger(f?.line) ? `:
  *   findings?:Array<object>, blocked?:Array<object>, counts?:Record<string, number>}}
  */
 export function decideReferralHoldAutoResolve(pr, hold, { repo,
-  cardReadable = ref => referralCardReadable(ref, REPO_ROOT), env = process.env } = {}) {
-  if (!hold || env?.WE_REFERRAL_HOLD_AUTO_RESOLVE === '0') return null;
+  cardReadable = ref => referralCardReadable(ref, REPO_ROOT), env = process.env,
+  settings = resolveReferralHoldAutoResolve(env) } = {}) {
+  if (!hold || settings?.value?.enabled === false) return null;
+  const policy = settings?.value ?? REFERRAL_HOLD_AUTO_RESOLVE_STANDARD;
+  const source = k => settings?.sources?.[k] ?? 'standard';
   const head = sha(pr?.headRefOid) ? pr.headRefOid : null;
   const stay = why => ({ outcome: 'stay', head, why });
   if (!head || hold.head !== head) return stay('the pause is not on the live head');
@@ -570,12 +620,19 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
       createdAt: pr.createdAt, cardReadable, records: live.records, operatorRulings: live.operatorRulings });
     if (state.pending.length) return stay(`the live-head record ${record.runId} still holds ${state.pending.length} finding(s) pending`);
     for (const f of activeReferrals(record)) {
-      const ruling = state.rulings.filter(r => r.key === f.key).at(-1);
+      let ruling = state.rulings.filter(r => r.key === f.key).at(-1);
       const where = { file: f.finding?.file ?? null, line: Number.isInteger(f.finding?.line) ? f.finding.line : null };
+      // A `superseded` entry the gate backed (a same-head not-real on the finding that replaced it) clears the finding
+      // without adding a ruling of its own: it reads as that not-real. The gate already refused an unbacked one.
+      if (!ruling && !(record.rulings ?? []).some(r => r.key === f.key) && (record.superseded ?? []).some(s => s.key === f.key)) {
+        ruling = { key: f.key, result: 'not-real', superseded: true };
+      }
       if (!ruling) return stay(`finding ${findingLoc(where)} has no readable ruling on the live head`);
       if (!RULING_RESULTS.has(ruling.result)) return stay(`finding ${findingLoc(where)} carries an unknown ruling (${ruling.result})`);
-      // An operator ruling counts only on the exact head it names (the gate pins it; re-checked so no reader drift).
-      if (ruling.operator && ruling.head !== head) return stay(`finding ${findingLoc(where)} is ruled for a different head (${String(ruling.head).slice(0, 9)})`);
+      // An operator ruling counts only on the exact head it names, unless it is the backing of a carry the gate
+      // accepted onto THIS head's record (the carry entry is the live-head proof; the backing names its source head).
+      const carried = (record.carried ?? []).some(c => c.key === f.key);
+      if (ruling.operator && ruling.head !== head && !carried) return stay(`finding ${findingLoc(where)} is ruled for a different head (${String(ruling.head).slice(0, 9)})`);
       findings.push({ runId: record.runId, key: f.key, seat: f.seat ?? null, ...where,
         summary: String(f.finding?.summary ?? '').replace(/\s+/g, ' ').trim(), result: ruling.result,
         actor: ruling.operator ? ruling.actor : 'reviewer', rationale: ruling.rationale ?? ruling.reason ?? '' });
@@ -587,10 +644,12 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
   const blocked = findings.filter(f => f.result === 'block');
   const tally = Object.entries(counts).map(([k, n]) => `${n} ${k}`).join(', ');
   if (blocked.length) {
-    return { outcome: 'send-back', head, findings, blocked, counts,
+    if (policy.onBlock !== 'send-back') return { ...stay(`every finding is ruled (${tally}), but referralHoldAutoResolve.onBlock=${policy.onBlock} (source: ${source('onBlock')}) keeps the pause`), counts };
+    return { outcome: 'send-back', head, findings, blocked, counts, policy: `onBlock=send-back (source: ${source('onBlock')})`,
       why: `every referral finding on head ${head.slice(0, 9)} is ruled (${tally}); ${blocked.length} block ruling(s) owe a fix` };
   }
-  return { outcome: 'resume', head, findings, counts,
+  if (policy.onClean !== 'resume') return { ...stay(`every finding is ruled (${tally}), but referralHoldAutoResolve.onClean=${policy.onClean} (source: ${source('onClean')}) keeps the pause`), counts };
+  return { outcome: 'resume', head, findings, counts, policy: `onClean=resume (source: ${source('onClean')})`,
     why: `every referral finding on head ${head.slice(0, 9)} is ruled (${tally}); no ruling is owed` };
 }
 
@@ -609,12 +668,15 @@ export function referralHoldSendBackBody({ head, blocked }) {
 
 /** Attach {@link decideReferralHoldAutoResolve}'s answer to every PR still paused after every hold enrichment (the
  *  ledger step can replace the pause, so this runs last). Never throws: a failure is a `stay`. */
-export function enrichPrsWithReferralHoldAutoResolve(prs, { repo, env = process.env, decide = decideReferralHoldAutoResolve } = {}) {
+export function enrichPrsWithReferralHoldAutoResolve(prs, { repo, env = process.env, decide = decideReferralHoldAutoResolve,
+  settings } = {}) {
   if (!Array.isArray(prs)) return prs;
+  // Resolved once per pass (the cascade logs its value and source once per process).
+  if (!settings && prs.some(pr => pr?.referralHold)) settings = resolveReferralHoldAutoResolve(env);
   return prs.map(pr => {
     if (!pr?.referralHold) return pr;
     let auto;
-    try { auto = decide(pr, pr.referralHold, { repo, env }); }
+    try { auto = decide(pr, pr.referralHold, { repo, env, ...(settings ? { settings } : {}) }); }
     catch (e) { auto = { outcome: 'stay', head: pr.headRefOid ?? null, why: `auto-resolve failed (${String(e?.message ?? e).split('\n')[0]})` }; }
     return auto ? { ...pr, referralHoldAutoResolve: auto } : pr;
   });
