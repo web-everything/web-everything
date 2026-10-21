@@ -123,7 +123,9 @@ describe('feed', () => {
     expect(items[2].command).toBe('human merge');
     expect(items[4].command).toBeUndefined();
     expect(items.every(i => i.title === row.title)).toBe(true);
-    const line = diffFeed([], [items[0]], at).lines[0];
+    // A head-less row is held, never published (#5716); the same row once its head is known posts.
+    expect(diffFeed([], [items[0]], at).lines).toEqual([]);
+    const line = diffFeed([], [{ ...items[0], head: 'abc' }], at).lines[0];
     expect(line.slice(0, line.indexOf(' {"at":'))).toContain(row.title);
     expect(line).toContain(`| pick: ${review}`);
     expect(parseFeedLine(line)).toMatchObject({ title: row.title, reason: items[0].reason });
@@ -154,10 +156,50 @@ describe('feed', () => {
     }).mockReturnValue(JSON.stringify({ headRefOid: 'second' }));
     const log = vi.fn();
     const result = await runOnce({ exec, gh, home, checkoutRoot, env: {}, now: at, log });
-    expect(result.openKeys).toEqual(['r#1@:needs-you', 'r#2@second:needs-you']);
-    expect(parseFeedLine(result.lines[0]).head).toBe('');
+    // An unknown head is held, never published as its own `@:` key (#5716 flap).
+    expect(result.openKeys).toEqual(['r#2@second:needs-you']);
+    expect(result.lines.map(l => parseFeedLine(l).pr)).toEqual([2]);
     expect(log).toHaveBeenCalledWith(expect.stringMatching(/r#1.*head lookup failed/));
     expect(gh).toHaveBeenCalledTimes(2);
+  });
+  it('never flaps a condition across head-unknown reads (#5716)', () => {
+    const live = { ...item, kind: 'at-round-limit', head: 'a36' }, unknown = { ...live, head: '' };
+    const first = diffFeed([], [live], at);
+    expect(first.lines).toHaveLength(1);
+    // A failed head lookup keeps the open key: nothing posted, nothing cleared.
+    const blind = diffFeed(first.openKeys, [unknown], at);
+    expect(blind).toEqual({ lines: [], openKeys: first.openKeys });
+    expect(diffFeed(blind.openKeys, [live], at)).toEqual({ lines: [], openKeys: first.openKeys });
+    // Nothing open + head unknown → hold until known.
+    expect(diffFeed([], [unknown], at)).toEqual({ lines: [], openKeys: [] });
+    // A legacy head-less open key is adopted by the known head silently.
+    const legacy = `${item.repo}#12@:at-round-limit`;
+    expect(diffFeed([legacy], [live], at)).toEqual({ lines: [], openKeys: [`${item.repo}#12@a36:at-round-limit`] });
+    expect(diffFeed([legacy], [unknown], at)).toEqual({ lines: [], openKeys: [legacy] });
+    // A real head change still posts + clears; the condition going away still clears.
+    expect(diffFeed(first.openKeys, [{ ...live, head: 'b47' }], at).lines.map(l => l.split(' ')[0])).toEqual(['NEEDS-YOU', 'NEEDS-YOU-CLEARED']);
+    expect(diffFeed(first.openKeys, [], at).lines[0]).toMatch(/^NEEDS-YOU-CLEARED /);
+    // Two distinct known heads with only a legacy key open are two real events: both post, the legacy key clears.
+    const two = diffFeed([legacy], [live, { ...live, head: 'b47' }], at);
+    expect(two.lines.map(l => l.split(' ')[0])).toEqual(['NEEDS-YOU', 'NEEDS-YOU', 'NEEDS-YOU-CLEARED']);
+    // Duplicate rows of ONE known head still adopt the legacy key silently.
+    expect(diffFeed([legacy], [live, { ...live }], at)).toEqual({ lines: [], openKeys: [`${item.repo}#12@a36:at-round-limit`] });
+    // A genuinely new head still posts (and clears the old head's key).
+    expect(diffFeed([`${item.repo}#12@a36:at-round-limit`], [{ ...live, head: 'c58' }], at).lines.map(l => l.split(' ')[0])).toEqual(['NEEDS-YOU', 'NEEDS-YOU-CLEARED']);
+    // Same condition reported twice (known + unknown) is one key.
+    expect(diffFeed([], [unknown, live], at).openKeys).toEqual([`${item.repo}#12@a36:at-round-limit`]);
+  });
+  it('replay closes a legacy head-less opening when the adopted known-head key clears (#5716)', () => {
+    const path = join(temp(), 'events');
+    const live = { ...item, kind: 'at-round-limit', head: 'a36' };
+    const legacy = diffFeed([], [{ ...live, head: '' }], at, { incomplete: false });
+    expect(legacy.lines).toEqual([]); // the new producer never opens one; write an old producer's line by hand
+    appendLines(path, [`NEEDS-YOU ${item.repo}#12 at-round-limit: ready ${JSON.stringify({ at, ...live, head: '' })}`]);
+    const adopted = diffFeed([`${item.repo}#12@:at-round-limit`], [live], at);
+    appendLines(path, adopted.lines);
+    expect(unacknowledged({ path, ackPath: join(temp(), 'ack') })).toHaveLength(1);
+    appendLines(path, diffFeed(adopted.openKeys, [], at).lines);
+    expect(unacknowledged({ path, ackPath: join(temp(), 'ack') })).toEqual([]);
   });
   it('appends without replacing bytes and replays and acknowledges open events', () => {
     const path = join(temp(), 'events'); writeFileSync(path, 'existing\n');

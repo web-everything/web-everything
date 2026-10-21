@@ -1,5 +1,5 @@
 /** Durable card admission: exclusive lease, isolated Git objects, remote recovery, atomic membership. */
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import {
   closeSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync,
   realpathSync, renameSync, rmSync, statSync, writeFileSync,
@@ -195,6 +195,46 @@ const removeBornAsLine = (text, id) => {
 };
 
 /**
+ * Reads many `<rev>:<path>` blobs through ONE `git cat-file --batch` process. Returns the raw stdout; a failure to
+ * spawn, a non-zero exit or a signal throws (fail closed). `gitDir` is passed explicitly so no cwd is needed.
+ */
+export const catFileBatch = (gitDir, specs, spawn = spawnSync) => {
+  const result = spawn('git', ['--git-dir', gitDir, 'cat-file', '--batch'], {
+    input: `${specs.join('\n')}\n`, timeout: 30_000, maxBuffer: 1024 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(`git cat-file --batch failed (${result.status ?? result.signal})`);
+  return result.stdout;
+};
+
+/**
+ * Parses `cat-file --batch` output for `specs` (in order). A plain blob maps to its utf8 text, exactly what
+ * `git show <spec>` yields; a missing object or a non-blob maps to null so the caller falls back to `git show`
+ * (same verdict or same error as before). Any framing error throws.
+ */
+export function parseCatFileBatch(buffer, specs) {
+  const out = new Map();
+  let at = 0;
+  for (const spec of specs) {
+    const eol = buffer.indexOf(0x0a, at);
+    if (eol < 0) throw new Error('cat-file --batch: truncated output');
+    const header = buffer.toString('utf8', at, eol);
+    at = eol + 1;
+    if (header === `${spec} missing` || header.endsWith(' missing')) { out.set(spec, null); continue; }
+    const m = /^[0-9a-f]{40,64} (\w+) (\d+)$/.exec(header);
+    if (!m) throw new Error('cat-file --batch: unparseable header');
+    const size = Number(m[2]);
+    if (at + size + 1 > buffer.length || buffer[at + size] !== 0x0a) throw new Error('cat-file --batch: bad body framing');
+    // A blob over the old per-read limit (16 MiB) goes back to `git show`, which refuses it exactly as before.
+    out.set(spec, m[1] === 'blob' && size <= 16 * 1024 * 1024 ? buffer.toString('utf8', at, at + size) : null);
+    at += size + 1;
+  }
+  if (at !== buffer.length) throw new Error('cat-file --batch: trailing output');
+  return out;
+}
+
+/**
  * Prove, from scratch, that a MERGED batch's cards landed on main — by content, never by names, commit messages or
  * anything stored. Re-reads the PR's merge commit (which must be an ancestor of main). Recorded side: the batch's
  * recorded head holds exactly one file `backlog/<cardId>-…` per member. Landed side: in the merge commit each member
@@ -204,7 +244,7 @@ const removeBornAsLine = (text, id) => {
  * Returns the unproven members (empty = proven). Only a clean git exit-1 "no" is a negative; every other git or
  * GitHub failure throws.
  */
-export async function provenMergedLanding(recorded, { repo, gh, git, remote = 'origin' }) {
+export async function provenMergedLanding(recorded, { repo, gh, git, remote = 'origin', catFile = catFileBatch }) {
   const text = async args => String(await git(args));
   const yes = async args => {
     try { await git(args); return true; } catch (error) { if (error?.status === 1) return false; throw error; }
@@ -225,12 +265,31 @@ export async function provenMergedLanding(recorded, { repo, gh, git, remote = 'o
   let grep = '';
   try { grep = await text(['grep', '-l', '-E', '^bornAs: [a-z0-9]+$', merge, '--', 'backlog/']); }
   catch (error) { if (error?.status !== 1) throw error; }
+  const grepPaths = grep.split('\n').filter(Boolean).map(line => line.slice(merge.length + 1))
+    .filter(path => /^backlog\/\d+-[^/]+\.md$/.test(path));
+  // Every blob this proof can need, read through one cat-file process. Anything it cannot serve (missing, not a
+  // blob, odd spec) falls back to the original `git show`, which keeps the verdict (or the error) identical.
+  const wanted = new Set(grepPaths.map(path => `${merge}:${path}`));
+  for (const member of members) {
+    const id = String(member?.cardId ?? '');
+    if (!/^[a-z0-9]+$/.test(id)) continue;
+    const recordedPaths = recordedTree.filter(path => path.startsWith(`backlog/${id}-`));
+    if (recordedPaths.length !== 1) continue;
+    wanted.add(`${recorded.headSha}:${recordedPaths[0]}`);
+    if (mergeTree.includes(recordedPaths[0])) wanted.add(`${merge}:${recordedPaths[0]}`);
+  }
+  // A spec with any control character (CR, LF, ...) is not safe on the line protocol: it stays on `git show`.
+  const specs = [...wanted].filter(spec => !/[\x00-\x1f\x7f]/.test(spec));
+  let blobs = new Map();
+  if (specs.length) {
+    const gitDir = (await text(['rev-parse', '--absolute-git-dir'])).trim();
+    blobs = parseCatFileBatch(await catFile(gitDir, specs), specs);
+  }
+  const blobAt = async spec => blobs.get(spec) ?? await text(['show', spec]);
   const bornAs = new Map();
   const contentAt = new Map();
-  for (const line of grep.split('\n').filter(Boolean)) {
-    const path = line.slice(merge.length + 1);
-    if (!/^backlog\/\d+-[^/]+\.md$/.test(path)) continue;
-    const body = await text(['show', `${merge}:${path}`]);
+  for (const path of grepPaths) {
+    const body = await blobAt(`${merge}:${path}`);
     contentAt.set(path, body);
     const ids = frontMatterBornAs(body);
     if (ids.length !== 1) continue;
@@ -248,9 +307,9 @@ export async function provenMergedLanding(recorded, { repo, gh, git, remote = 'o
       ...(bornAs.get(id) ?? [])];
     if (recordedPaths.length !== 1 || candidates.length !== 1 || used.has(candidates[0])) { missing.push(id); continue; }
     used.add(candidates[0]);
-    let expected = await text(['show', `${recorded.headSha}:${recordedPaths[0]}`]);
+    let expected = await blobAt(`${recorded.headSha}:${recordedPaths[0]}`);
     for (const [from, to] of renames) expected = expected.replace(new RegExp(`(?<![A-Za-z0-9])backlog/${from}(?![A-Za-z0-9])`, 'g'), `backlog/${to}`);
-    const landedRaw = contentAt.get(candidates[0]) ?? await text(['show', `${merge}:${candidates[0]}`]);
+    const landedRaw = contentAt.get(candidates[0]) ?? await blobAt(`${merge}:${candidates[0]}`);
     const landed = candidates[0] === recordedPaths[0] ? landedRaw : removeBornAsLine(landedRaw, id);
     if (landed !== expected) missing.push(id);
   }
@@ -262,13 +321,13 @@ export async function provenMergedLanding(recorded, { repo, gh, git, remote = 'o
  * landing proof from scratch; nothing stored is evidence. No broad catch: only a clean "no" (identity mismatch, PR not
  * a matching MERGED one, a card not proven) is a refusal, and every other error propagates to the caller.
  */
-async function retireMergedMidSeal(recorded, input, { statePath, remote, gh, held: stillHeld, log, git }) {
+async function retireMergedMidSeal(recorded, input, { statePath, remote, gh, held: stillHeld, log, git, catFile }) {
   if (!Number.isSafeInteger(recorded.seq) || recorded.seq < 1 || !COMMIT_ID.test(String(recorded.headSha))
     || !Number.isSafeInteger(Number(recorded.pr)) || Number(recorded.pr) <= 0
     || recorded.repo && recorded.repo !== input.source.repo
     || recorded.kind && recorded.kind !== input.kind
     || recorded.batchRef !== `lane/card-batch-${input.kind}-${recorded.seq}`) return refuse('batch-sealed');
-  const missing = await provenMergedLanding(recorded, { repo: input.source.repo, gh, git, remote });
+  const missing = await provenMergedLanding(recorded, { repo: input.source.repo, gh, git, remote, catFile });
   if (missing.length) {
     log(`card-batch MERGED-mid-seal ${recorded.batchRef} PR ${recorded.pr}: but ${missing.length} card(s) not proven on main `
       + `(${missing.slice(0, 5).join(', ')}): kept held`);
@@ -285,13 +344,13 @@ async function retireMergedMidSeal(recorded, input, { statePath, remote, gh, hel
  * Retire a terminal sealed generation under the caller's admission lease; unreadable evidence stays held. */
 export async function retireTerminalBatch(recorded, input, {
   statePath, stateDir = dirname(statePath), remote = 'origin', gh = defaultGh,
-  held: stillHeld, log = line => process.stderr.write(`${line}\n`), git = null,
+  held: stillHeld, log = line => process.stderr.write(`${line}\n`), git = null, catFile = catFileBatch,
 }) {
   // A MERGED-mid-seal failure has its own path: the full proof on every attempt, and no catch-all (see below).
   if (recorded?.sealFailure?.terminalPrState === 'MERGED' && recorded.batchRef && recorded.sealedAt && recorded.pr
     && basename(dirname(statePath)) !== 'sealed') {
     return retireMergedMidSeal(recorded, input, { statePath, remote, gh, held: stillHeld, log,
-      git: git ?? recoveryGitIn(input.laneDir ?? ROOT) });
+      git: git ?? recoveryGitIn(input.laneDir ?? ROOT), catFile });
   }
   if ((!recorded?.sealFailure && recorded?.seal?.step !== 'label-on-green')
     || !recorded?.batchRef || !recorded.sealedAt || !recorded.pr

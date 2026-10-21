@@ -380,15 +380,18 @@ describe('durable card batch IO', () => {
   });
 
   it.each([
-    ['GitHub timeout', 'timeout: 30_000, maxBuffer: 1024 * 1024', 'maxBuffer: 1024 * 1024', 'gh', 'timeout'],
+    ['GitHub timeout', 'timeout: 30_000, maxBuffer: 1024 * 1024, stdio', 'maxBuffer: 1024 * 1024, stdio', 'gh', 'timeout'],
     ['GitHub output limit', 'maxBuffer: 1024 * 1024, stdio:', 'stdio:', 'gh', 'maxBuffer'],
     ['Git timeout', '...options, timeout: 30_000', '...options', 'git', 'timeout'],
     ['Git output limit', '...options, maxBuffer: 16 * 1024 * 1024', '...options', 'git', 'maxBuffer'],
+    ['cat-file timeout', "timeout: 30_000, maxBuffer: 1024 * 1024 * 1024, stdio", "maxBuffer: 1024 * 1024 * 1024, stdio", 'catfile', 'timeout'],
   ])('mutation gate detects removal of %s', (_name, before, after, runner, key) => {
     const f = fixture();
     const options = mutantProbe(f, [[before, after]], `
       const exec = (_command, _args, options) => JSON.stringify(options);
-      const result = ${runner === 'gh' ? 'io.defaultGh([], exec)' : "io.recoveryGitIn('/fixture', exec)([])"};
+      const result = ${runner === 'gh' ? 'io.defaultGh([], exec)' : runner === 'catfile'
+        ? "(io.catFileBatch('/fixture', ['a:b'], (_c, _a, options) => ({ status: 0, stdout: Buffer.from(JSON.stringify(options)) })).toString())"
+        : "io.recoveryGitIn('/fixture', exec)([])"};
       console.log(result);`);
     expect(options[key]).toBeUndefined();
   });
@@ -748,8 +751,10 @@ describe('periodic terminal batch recovery with real Git', () => {
     }
     let drained = 0;
     let flushed = false;
+    // Pin filing ON: this asserts the drain after retirement, not the operator's live prevention.filingEnabled pause.
     const results = await reconcileCardBatches({ ...f.options, laneDir: f.laneDir, now: f.now(),
-      gh: async () => JSON.stringify({ number: 5272, headRefName: 'lane/card-batch-prevention-1', state: status }), log: () => {}, loadFilingSettings: () => ({ filingEnabled: true }),
+      loadFilingSettings: () => ({ filingEnabled: true }),
+      gh: async () => JSON.stringify({ number: 5272, headRefName: 'lane/card-batch-prevention-1', state: status }), log: () => {},
       drain: async (input, options) => {
         expect(input.drainPending).toBe(true);
         expect(f.state()).toMatchObject({ seq: 1, lastSealedState: expect.any(String) });
@@ -774,4 +779,111 @@ describe('periodic terminal batch recovery with real Git', () => {
     expect(flushed).toBe(true);
     expect(existsSync(`${f.statePath}.lock`)).toBe(false);
   });
+});
+
+describe('provenMergedLanding reads blobs through one cat-file process', () => {
+  const card = (id, extra = '') => `---\ntitle: ${id}\n${extra}---\nbody of ${id}\n`;
+  /** Recorded head H holds backlog/<id>-*.md; merge commit M renames to numbered files with `bornAs:`. */
+  function landing({ landed = {}, deleted = [], extraBornAs = 3 } = {}) {
+    const root = mkdtempSync(join(tmpdir(), 'card-batch-proof-'));
+    roots.push(root);
+    const repo = join(root, 'repo');
+    mkdirSync(join(repo, 'backlog'), { recursive: true });
+    git(repo, ['init', '-q']);
+    const ids = ['aaa', 'bbb', 'ccc'];
+    for (const id of ids) writeFileSync(join(repo, 'backlog', `${id}-t.md`), card(id));
+    git(repo, ['add', '.']);
+    git(repo, ['commit', '-qm', 'recorded']);
+    const headSha = git(repo, ['rev-parse', 'HEAD']).trim();
+    ids.forEach((id, i) => {
+      git(repo, ['mv', `backlog/${id}-t.md`, `backlog/${100 + i}-t.md`]);
+      writeFileSync(join(repo, 'backlog', `${100 + i}-t.md`), card(id, `bornAs: ${id}\n`));
+    });
+    // Unrelated bornAs cards widen the grep set; one binary-ish blob exercises non-text bytes.
+    for (let i = 0; i < extraBornAs; i++) writeFileSync(join(repo, 'backlog', `${200 + i}-o.md`), card(`o${i}`, `bornAs: o${i}\n`));
+    for (const [id, text] of Object.entries(landed)) writeFileSync(join(repo, 'backlog', `${100 + ids.indexOf(id)}-t.md`), text);
+    for (const id of deleted) rmSync(join(repo, 'backlog', `${100 + ids.indexOf(id)}-t.md`));
+    git(repo, ['add', '-A']);
+    git(repo, ['commit', '-qm', 'merge']);
+    const merge = git(repo, ['rev-parse', 'HEAD']).trim();
+    git(repo, ['update-ref', 'refs/heads/main', merge]);
+    git(repo, ['remote', 'add', 'origin', repo]);
+    const recorded = { pr: 7, batchRef: 'lane/b', headSha, members: ids.map(cardId => ({ cardId })) };
+    const gh = async () => JSON.stringify({ number: 7, state: 'MERGED', headRefName: 'lane/b', mergeCommit: { oid: merge } });
+    return { repo, recorded, gh };
+  }
+  function harness(f, catFile) {
+    const calls = { show: 0, spawn: 0 };
+    const gitRun = async args => {
+      if (args[0] === 'show') calls.show++;
+      try { return execFileSync('git', args, { cwd: f.repo, encoding: 'utf8', maxBuffer: 1 << 28, stdio: ['pipe', 'pipe', 'pipe'] }); }
+      catch (error) { throw error; }
+    };
+    const counting = (dir, specs) => { calls.spawn++; return catFile(dir, specs); };
+    return { calls, run: () => batchIO.provenMergedLanding(f.recorded, { repo: 'o/r', gh: f.gh, git: gitRun, catFile: counting }) };
+  }
+  // The old reader: every blob is "missing" to cat-file, so each one is read by `git show`, as before.
+  const oldReader = (dir, specs) => Buffer.from(specs.map(spec => `${spec} missing\n`).join(''));
+  const scenarios = {
+    proven: {},
+    changedContent: { landed: { bbb: card('bbb', 'bornAs: bbb\n') + 'tampered\n' } },
+    deletedPath: { deleted: ['ccc'] },
+    binaryBytes: { landed: { aaa: Buffer.concat([Buffer.from(card('aaa', 'bornAs: aaa\n')), Buffer.from([0xff, 0xfe, 0x00, 0x80])]) } },
+  };
+  for (const [name, spec] of Object.entries(scenarios)) {
+    it(`gives the old verdict for ${name}, with one spawn instead of N shows`, async () => {
+      const f = landing(spec);
+      const before = harness(f, oldReader);
+      const after = harness(f, batchIO.catFileBatch);
+      const [oldVerdict, newVerdict] = [await before.run(), await after.run()];
+      expect(newVerdict).toEqual(oldVerdict);
+      expect(before.calls.show).toBeGreaterThan(3);
+      expect(after.calls.show).toBe(0);
+      expect(after.calls.spawn).toBe(1);
+      if (name === 'proven') expect(newVerdict).toEqual([]);
+      else expect(newVerdict.length).toBeGreaterThan(0);
+    });
+  }
+  it('treats a recorded path missing from the recorded head the same as before (not proven)', async () => {
+    const f = landing();
+    f.recorded.members.push({ cardId: 'zzz' });
+    const after = harness(f, batchIO.catFileBatch);
+    expect(await after.run()).toEqual(['zzz']);
+  });
+  it('refuses blobs over the old 16 MiB limit (falls back to git show)', () => {
+    const big = Buffer.alloc(16 * 1024 * 1024 + 1, 97);
+    const raw = Buffer.concat([Buffer.from(`${'c'.repeat(40)} blob ${big.length}\n`), big, Buffer.from('\n')]);
+    expect(batchIO.parseCatFileBatch(raw, ['x']).get('x')).toBeNull();
+  });
+  it('gives cat-file a 30 s deadline, and keeps control-character specs off the batch protocol', async () => {
+    let options;
+    batchIO.catFileBatch('/nope', ['a:b'], (cmd, args, opts) => { options = opts; return { status: 0, stdout: Buffer.alloc(0) }; });
+    expect(options.timeout).toBe(30_000);
+    const f = landing();
+    const seen = [];
+    const run = (members, catFile) => batchIO.provenMergedLanding({ ...f.recorded, members }, { repo: 'o/r', gh: f.gh,
+      git: async args => execFileSync('git', args, { cwd: f.repo, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }),
+      catFile: (dir, specs) => { seen.push(...specs); return catFile(dir, specs); } });
+    await run(f.recorded.members, batchIO.catFileBatch);
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.some(spec => /[\x00-\x1f\x7f]/.test(spec))).toBe(false);
+  });
+  it('fails closed when cat-file fails or its output is malformed', async () => {
+    const f = landing();
+    await expect(harness(f, () => { throw new Error('boom'); }).run()).rejects.toThrow('boom');
+    await expect(harness(f, () => Buffer.from('garbage\n')).run()).rejects.toThrow(/cat-file/);
+    expect(() => batchIO.parseCatFileBatch(Buffer.from('a'.repeat(40) + ' blob 9\nshort\n'), ['x'])).toThrow(/framing|truncated/);
+  });
+  it('recomputes the proof on every call: nothing is cached or stored', async () => {
+    const f = landing();
+    let spawns = 0;
+    const run = () => batchIO.provenMergedLanding(f.recorded, { repo: 'o/r', gh: f.gh,
+      git: async args => execFileSync('git', args, { cwd: f.repo, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }),
+      catFile: (dir, specs) => { spawns++; return batchIO.catFileBatch(dir, specs); } });
+    expect(await run()).toEqual([]);
+    expect(await run()).toEqual([]);
+    expect(spawns).toBe(2);
+    expect(await run()).toEqual([]);
+    expect(spawns).toBe(3);
+});
 });

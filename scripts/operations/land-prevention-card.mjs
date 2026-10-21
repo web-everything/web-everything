@@ -94,6 +94,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { fileIntoBatch, cardIdOf } from './card-batch-file.mjs';
 import { cardBatchStateDir } from './card-batch-io.mjs';
 import { loadPreventionBatchSettings, formatPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
+import { loadWidenMode, emitWouldBatch } from '../lib/card-batch-shadow.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
 import {
   buildApprovalPreventionRetraction, APPROVAL_PREVENTION_DIGEST_KEY_SEP, APPROVAL_PREVENTION_KEY_PREFIX,
@@ -524,6 +525,7 @@ async function landPreventionCardImpl(input, {
   batch = fileIntoBatch,
   loadPreventionBatchSettings: loadBatchSettings = loadPreventionBatchSettings,
   loadFilingSettings = loadPreventionBatchSettings,
+  loadWidenMode: loadWiden = loadWidenMode,
   sleep: wait = sleep,
   drainLimit = {},
   acquireWait,
@@ -723,6 +725,16 @@ async function landPreventionCardImpl(input, {
         write(`land-prevention-card: held ${rel} for the next batch window — ${reason}\n`);
         return { ok: true, step: 'held', num, rel, pr: null, url: null, reason };
       }
+    }
+
+    if (mentioned.length) {
+      // SHADOW (card xafcvmh): this filing adds sidecars to existing cards, so it still opens its own PR. Log what a
+      // widened batch would have held. Never throws, never changes what happens next.
+      try { emitWouldBatch({
+        loadWiden, cards: [rel ? (num ?? cardIdOf(rel)) : null, ...mentioned.map((m) => m.card.id)],
+        paths: [rel, ...mentioned.flatMap((m) => m.paths)].filter(Boolean),
+        write: (line) => write(`land-prevention-card: ${line}\n`),
+      }); } catch { /* argument building must not affect landing either */ }
     }
 
     write(`land-prevention-card: committing ${[rel, ...mentioned.flatMap((m) => m.paths)].filter(Boolean).join(', ')}…\n`);

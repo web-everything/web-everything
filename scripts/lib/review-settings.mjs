@@ -12,7 +12,8 @@ import { fileURLToPath } from 'node:url';
  * review.noFixerOnClearedRuled defaults on: dispatch omits exact operator card/not-real rulings and
  * auto-only blocks on a human-cleared live head. False restores dispatch; gate results never change.
  *
- * review.autoBlockYieldsToReviewerNotReal defaults on; false restores policy-block precedence.
+ * review.autoBlockYieldsToReviewerNotReal defaults OFF in this health-watch build (main's policy-block precedence,
+ * coordinator ruling 2026-10-21; operator to revisit); true opts in to the reviewer not-real yield.
  * Only a later, evidenced, independent mandatory-reviewer ruling on the exact live head/run/key qualifies. */
 export const REFERRAL_DEFAULTS = Object.freeze(['operator', 'auto-block']);
 /**
@@ -50,7 +51,7 @@ export const TAKEOVER_REVIEW_ATTEMPTS_MAX = 5;
  * `review.standDownQueueSection` — `needs-you` (built-in) surfaces unresolved needs-judgment questions
  * under NEEDS YOU. `stood-down` keeps the legacy section. Env: WE_REVIEW_STAND_DOWN_QUEUE_SECTION.
  */
-export const BUILT_IN_REVIEW_SETTINGS = Object.freeze({ referralDefault: 'operator', recheckCarriedReferrals: true, autoPolicyRespectsNotReal: true, autoBlockYieldsToReviewerNotReal: true, noFixerOnClearedRuled: true, scopedRereview: 'off', roundBudget: ROUND_BUDGET_OFF,
+export const BUILT_IN_REVIEW_SETTINGS = Object.freeze({ referralDefault: 'operator', recheckCarriedReferrals: true, autoPolicyRespectsNotReal: true, autoBlockYieldsToReviewerNotReal: false, noFixerOnClearedRuled: true, scopedRereview: 'off', roundBudget: ROUND_BUDGET_OFF,
   takeoverReviewAttempts: 1, rulingResolvesStandDown: 'on', standDownQueueSection: 'needs-you' });
 export const REVIEW_SETTINGS_ENV = Object.freeze({ referralDefault: 'WE_REVIEW_REFERRAL_DEFAULT', recheckCarriedReferrals: 'WE_REVIEW_RECHECK_CARRIED_REFERRALS',
   autoPolicyRespectsNotReal: 'WE_REVIEW_AUTO_POLICY_RESPECTS_NOT_REAL', autoBlockYieldsToReviewerNotReal: 'WE_REVIEW_AUTO_BLOCK_YIELDS_TO_REVIEWER_NOT_REAL', noFixerOnClearedRuled: 'WE_REVIEW_NO_FIXER_ON_CLEARED_RULED', scopedRereview: 'WE_REVIEW_SCOPED_REREVIEW',
@@ -101,7 +102,7 @@ const REFERRAL_SAFETY_KEYS = ['recheckCarriedReferrals', 'autoPolicyRespectsNotR
 export function resolveReferralSafetySettings({ fileConfig = rawReviewSettings(), platform, env = process.env, log } = {}) {
   const pick = value => Object.fromEntries(REFERRAL_SAFETY_KEYS.filter(key => value?.[key] !== undefined).map(key => [key, value[key]]));
   return cascadePolicy('review', pick(fileConfig), {
-    standard: { recheckCarriedReferrals: true, autoPolicyRespectsNotReal: true, autoBlockYieldsToReviewerNotReal: true, noFixerOnClearedRuled: true },
+    standard: { recheckCarriedReferrals: true, autoPolicyRespectsNotReal: true, autoBlockYieldsToReviewerNotReal: false, noFixerOnClearedRuled: true },
     platform: pick(platform === undefined ? platformPreference('review', { env }) : platform), env, log,
     valid: Object.fromEntries(REFERRAL_SAFETY_KEYS.map(key => [key, value => typeof value === 'boolean'])),
     envValues: Object.fromEntries(REFERRAL_SAFETY_KEYS.map(key => [key, parseBoolean(env?.[REVIEW_SETTINGS_ENV[key]], { fromEnv: true })])),

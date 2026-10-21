@@ -2,7 +2,7 @@
  * @file referral-auto-block.test.mjs — review.referralDefault=auto-block (operator ruling 2026-10-08).
  *   Red on the old code: no auto-policy actor, no sweep, no structured-block dispute.
  */
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { planAutoBlock, sweepAutoBlock, AUTO_BLOCK_REASON } from '../referral-auto-block.mjs';
 import { decideReferralHold, blockRuledReferralsFor } from '../review-referral-hold.mjs';
 import { sweepReviewHoldLabels } from '../review-hold-reconcile.mjs';
@@ -379,6 +379,16 @@ function replay5514({ actor = AUTO_POLICY_ACTOR, evidence = ['policy/pointer.md:
 }
 
 describe('auto-policy supersession', () => {
+  // This health-watch build defaults review.autoBlockYieldsToReviewerNotReal OFF (main's policy-block precedence,
+  // unfreeze-healthwatch-top-1021e); these cases exercise the opt-in yield, so they opt in explicitly.
+  beforeEach(() => vi.stubEnv('WE_REVIEW_AUTO_BLOCK_YIELDS_TO_REVIEWER_NOT_REAL', 'true'));
+  afterEach(() => vi.unstubAllEnvs());
+  it('by default (no opt-in) the auto-policy block is retained over a later reviewer not-real', () => {
+    vi.unstubAllEnvs();
+    const { pr } = replay5514();
+    expect(resolveReferralSafetySettings({ fileConfig: null, platform: {}, env: {} }).value.autoBlockYieldsToReviewerNotReal).toBe(false);
+    expect(mandatoryReferralState(pr.comments, { head: H1, log: () => {} }).blocked).toHaveLength(1);
+  });
   it('an auto-policy block is superseded by a later mandatory-reviewer not-real that carries evidence', () => {
     const { pr } = replay5514();
     const state = mandatoryReferralState(pr.comments, { head: H1 });

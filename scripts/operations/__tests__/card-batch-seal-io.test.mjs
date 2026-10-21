@@ -10,6 +10,9 @@ import { loadCardBatchPolicy } from '../../lib/card-batch-policy.mjs';
 // Every git/gh call in this file is stubbed (no network); a bounded per-test timeout turns any hang into a failure.
 vi.setConfig({ testTimeout: 30_000 });
 const dirs = [];
+// git is stubbed through `exec`, so the proof's cat-file reader reports every blob missing: each read then takes the
+// proof's `git show` fallback through the same stub (identical verdicts and errors; no real git on the fake .git).
+const catFileAllMissing = (gitDir, specs) => Buffer.from(specs.map(spec => `${spec} missing\n`).join(''));
 afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
 function fixture({ maxCards = 2, red = false, descendant = false, descendantMessages = 'Repair CI\n',
   descendantChanges = ':100644 100644 abc def M\0backlog/123-card.md\0' } = {}) {
@@ -39,7 +42,7 @@ function fixture({ maxCards = 2, red = false, descendant = false, descendantMess
   });
   const policy = loadCardBatchPolicy({ prevention: { maxCards, maxAgeMinutes: 1 } });
   return { dir, statePath, state, calls, exec, input: { statePath, laneDir: dir },
-    opts: { exec, clock: () => 1000, policy, env: {} }, read: () => { const saved = JSON.parse(readFileSync(statePath, 'utf8')); return saved.lastSealedState ? JSON.parse(readFileSync(saved.lastSealedState, 'utf8')) : saved; } };
+    opts: { exec, clock: () => 1000, policy, env: {}, catFile: catFileAllMissing }, read: () => { const saved = JSON.parse(readFileSync(statePath, 'utf8')); return saved.lastSealedState ? JSON.parse(readFileSync(saved.lastSealedState, 'utf8')) : saved; } };
 }
 it('opens through park then immediately holds, and refreshes the body on later publication', async () => {
   const f = fixture();
@@ -801,7 +804,8 @@ describe('every terminal retirement of a MERGED-mid-seal batch recomputes the pr
     return state;
   };
   const reconcileRetire = (f, exec, state) => retireTerminalBatch(state, { kind: 'prevention', source: { repo: 'org/repo' }, laneDir: f.dir }, {
-    statePath: f.statePath, stateDir: f.dir, gh: args => exec('gh', args), git: args => exec('git', args), held: () => true, log: () => {} });
+    statePath: f.statePath, stateDir: f.dir, gh: args => exec('gh', args), git: args => exec('git', args), held: () => true, log: () => {},
+    catFile: catFileAllMissing });
   const forged = { mergeProof: { merge: MERGE, members: [{ cardId: '123', path: 'backlog/6597-card.md', blob: 'a'.repeat(40) }] }, proven: true };
   it('reconcile retires when the cards are proven from scratch', async () => {
     const { f, exec } = terminalFixture('MERGED');

@@ -4,7 +4,7 @@ import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, writ
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { acquireLease, atomicRecord, cardBatchStateDir, provenMergedLanding, retireBatch, retireTerminalBatch, tokenOf } from './card-batch-io.mjs';
+import { acquireLease, atomicRecord, cardBatchStateDir, catFileBatch, provenMergedLanding, retireBatch, retireTerminalBatch, tokenOf } from './card-batch-io.mjs';
 import { planPublish, planSeal, renderBatchBody } from './card-batch-seal.mjs';
 import { CARD_BATCH_KINDS } from '../lib/card-batch-policy.mjs';
 import { effectiveCardBatchPolicy } from '../lib/card-batch-settings.mjs';
@@ -90,8 +90,10 @@ export async function publishBatch(input, opts = {}) {
     // A MERGED-mid-seal batch retires only through retireTerminalBatch, which recomputes the full content proof
     // (provenMergedLanding, card-batch-io.mjs) from scratch on every attempt; nothing stored is ever evidence.
     const gitRun = args => run('git', args);
+    // The proof's blob reader (one `git cat-file --batch`); injectable beside `exec`, default the real reader.
+    const catFile = opts.catFile ?? catFileBatch;
     const retireMerged = () => retireTerminalBatch(state, { ...input, source: { repo }, kind, laneDir: cwd }, {
-      statePath, stateDir, remote, gh, held, log: opts.log, git: gitRun,
+      statePath, stateDir, remote, gh, held, log: opts.log, git: gitRun, catFile,
     });
     const retire = async () => {
       // The existing failed-seal quarantine is outside terminal-PR recovery, except a failure recorded because the PR
@@ -122,7 +124,7 @@ export async function publishBatch(input, opts = {}) {
       let missing;
       // Every error inside recovery (GitHub read, bad JSON, git/IO, save, retirement) propagates unchanged; only the
       // documented clean negatives (not a matching MERGED PR, a card not proven, a retirement refusal) return null.
-      missing = await provenMergedLanding(state, { repo, gh, git: gitRun, remote });
+      missing = await provenMergedLanding(state, { repo, gh, git: gitRun, remote, catFile });
       if (missing.length) {
         process.stderr.write(`card-batch ${state.batchRef} PR ${state.pr} MERGED but ${missing.length} card(s) not proven on main `
           + `(${missing.slice(0, 5).join(', ')}): kept held\n`);

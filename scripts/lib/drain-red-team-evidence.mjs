@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 import { hostname } from 'node:os';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operations/run-store.mjs';
+import { readFilteredInOrder } from './stream-filter-runs.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { readSavedRedTeamResult, attemptedRedTeamRun, sameRepo } from './drain-saved-red-team.mjs';
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
@@ -42,9 +43,10 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     && readSavedRedTeamResult({ repo, pr, head, env, runsDir }) === null;
   // Runs are immutable in identity but updated in place: choose the latest read of this exact repo/PR/head.
   const latestRun = () => {
-    const hits = list(runsDir).filter(id => id.startsWith('review-pr-')).map(id => ({ id, run: read(id, runsDir) }))
-      .filter(({ run }) => run?.op === 'review-pr' && sameRepo(run.input?.repo, repo) && Number(run.input?.pr) === Number(pr)
-        && String(run.findings?.read?.netBasis?.rev ?? '').toLowerCase() === head)
+    // Read, test and drop one run at a time (xwu9oxh S1a): same reads, order and errors as map-then-filter.
+    const hits = readFilteredInOrder(list(runsDir).filter(id => id.startsWith('review-pr-')), id => read(id, runsDir),
+      run => run?.op === 'review-pr' && sameRepo(run.input?.repo, repo) && Number(run.input?.pr) === Number(pr)
+        && String(run.findings?.read?.netBasis?.rev ?? '').toLowerCase() === head, (run, id) => ({ id, run }))
       .map(hit => ({ ...hit, at: statSync(join(runsDir, `${hit.id}.json`)).mtimeMs }));
     hits.sort((a, b) => b.at - a.at);
     return { run: hits[0]?.run ?? null, at: hits[0]?.at ?? 0 };
@@ -68,7 +70,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     // of an unchanged head labels its accept before its job writes `queued`).
     if (!['queued', 'running'].includes(status.status)) {
       const latest = latestRun();
-      if (latest.at > statusAt && owes(latest.run)) return { ...(untrustedSavedResult ? { untrustedSavedResult: true } : {}), loopPayload: latest.run, inFlight: false, scheduled: true, recorded, attempted };
+      if (latest.at > statusAt && owes(latest.run)) return { ...(untrustedSavedResult ? { untrustedSavedResult: true } : {}), loopPayload: latest.run, inFlight: false, scheduled: true, recorded, attempted, skipCardOnly: false };
     }
     // A local pid probe says nothing about another host or namespace: keep that pass held for its result.
     // For local records, a changed birth time proves pid reuse. An unavailable birth time is unknown,
@@ -94,5 +96,5 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   // A pass that already ran (even unusably) is scheduled, never "never scheduled".
   const ran = attempted || attemptedRedTeamRun([], { repo, pr, head }, loopPayload?.redTeam);
   return { ...(untrustedSavedResult ? { untrustedSavedResult: true } : {}), loopPayload, inFlight: false, scheduled: recorded || ran || owes(loopPayload),
-    recorded, attempted: ran };
+    recorded, attempted: ran, ...(owes(loopPayload) ? { skipCardOnly: false } : {}) };
 }

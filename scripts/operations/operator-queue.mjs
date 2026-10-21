@@ -133,7 +133,7 @@ export function rulingNeededRow(repo, pr, options = {}) {
 
 /** A red-team round-cap ruling and its read-only operator command suggestions. PURE. */
 export function redTeamRulingRow(repo, pr, setting = CONFIRMED_BREAKS_DEFAULTS, { readSaved = null } = {}) {
-  const need = redTeamRulingNeeded(pr, setting, { readSaved });
+  const need = redTeamRulingNeeded(pr, setting, { readSaved, repo: repo || pr?.repo || null });
   if (!need) return null;
   const command = `node scripts/review-set-label.mjs ${pr.number} --repo=${repo}`;
   return {
@@ -411,9 +411,13 @@ export function evaluateNeedsYourMerge(pr, { files, changedFiles } = {}) {
   return { owed: false, paths: [], reasons: [hold.hold ? hold.error : 'touches no workflow or action file — the drain lands it'] };
 }
 
-/** Card 334 — the one command the operator runs for a needs-your-merge row. Pure. */
+/**
+ * Card 334 — the one command the operator runs for a needs-your-merge row. Pure. It goes through
+ * an explicit fast-forward update so even a checkout predating `we:scripts/run-fresh.mjs` gets the launcher.
+ * The launcher then runs it from a fresh lane at origin/main. A failed update stops before the operation runs.
+ */
 export function needsYourMergeCommand({ repo, number }) {
-  return `node scripts/operations/run.mjs land-human-only --pr=${number} --repo=${repo} --actor=<your login> `
+  return `git pull --ff-only origin main && node scripts/run-fresh.mjs land-human-only --pr=${number} --repo=${repo} --actor=<your login> `
     + "--channel=<where you said it> --reason='<your words>'";
 }
 
@@ -676,7 +680,8 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
         prs = read([...listing, fields], Array.isArray);
         prs = prs.flatMap(completePr);
       }
-      prs = prs.map(pr => enrichStandDownHeadChange?.(pr, { repo, exec: execFileSync }) ?? pr);
+      // The repo travels with each PR: the red-team readers credit an operator round grant only for the PR's own repo.
+      prs = prs.map(pr => ({ ...(enrichStandDownHeadChange?.(pr, { repo, exec: execFileSync }) ?? pr), repo: pr.repo ?? repo }));
       const readyNumbersThisRepo = new Set();
       const redTeamSetting = readConfirmedBreaks().value;
       for (const listed of prs.filter((candidate) => hasLabel(candidate, 'review:human'))) {
