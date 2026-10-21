@@ -1436,7 +1436,8 @@ export function defaultPostConflictRearm({ pr, repo, exec = execFileSync, confli
     ...(conflictRound ? ['--round=conflict', `--main-ref=${String(pr?.baseRefName ?? '').trim() || 'main'}`] : [])];
   if (repo) argv.push(`--repo=${repo}`);
   // #x5n4zn3 — was bare (no timeout).
-  exec('node', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
+  // A conflict receipt reads origin/<base> locally: pin it to this WE checkout (re-audit #4).
+  exec('node', argv, { ...(conflictRound ? { cwd: REPO_ROOT } : {}), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
 }
 
 // Prefer captured command diagnostics over the generic "Command failed" message.
