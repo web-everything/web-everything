@@ -1,4 +1,5 @@
 /** The pusher hands its exact new head to CI immediately; the existing missing-run watch repairs missed triggers. */
+import { ensureLabelCached } from '../lib/label-cache.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { recordFixPush } from './fix-push-state.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
@@ -70,8 +71,8 @@ export function markFixPushAwaitingCi({ repo, pr, head }, { run = defaultRun, re
     return false;
   }
   // Like fix-end, provision both labels before applying them: a repository may not have either yet.
-  run('gh', ['label', 'create', 'checking', ...repoArgs, '--color', 'fbca04', '--description', 'Waiting for CI', '--force']);
-  run('gh', ['label', 'create', 'status:awaiting-ci', ...repoArgs, '--color', 'fbca04', '--description', 'Waiting for CI — auto-managed', '--force']);
+  ensureLabelCached(['label', 'create', 'checking', ...repoArgs, '--color', 'fbca04', '--description', 'Waiting for CI'], { exec: args => run('gh', args) });
+  ensureLabelCached(['label', 'create', 'status:awaiting-ci', ...repoArgs, '--color', 'fbca04', '--description', 'Waiting for CI — auto-managed'], { exec: args => run('gh', args) });
   run('gh', ['pr', 'edit', String(pr), ...repoArgs, '--add-label', 'checking', '--add-label', 'status:awaiting-ci', ...plan.remove.flatMap(l => ['--remove-label', l])]);
   return true;
 }

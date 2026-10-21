@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join, dirname } from 'node:path';
-import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, assertProducerCheckout, monitorCommand, main } from '../needs-you-feed.mjs';
+import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, gateReadyItems, assertProducerCheckout, monitorCommand, main } from '../needs-you-feed.mjs';
 import { isReadOnlyOperation } from '../registry.mjs';
 import { operatorSessionBootstrapOperation } from '../operator-session-bootstrap.mjs';
 import { bootstrapPlan } from '../operator-session-bootstrap-io.mjs';
@@ -37,7 +37,7 @@ describe('feed', () => {
   it('changing feed filename publishes open items with independent state and acknowledgement cursors', async () => {
     const home = temp(), checkoutRoot = join(home, 'workspace/.lanes/we/lane-1');
     const first = feedPath({ home, env: {} }), second = join(dirname(first), 'other-events.jsonl');
-    const opts = { home, checkoutRoot, now: at, log: vi.fn(),
+    const opts = { home, checkoutRoot, now: at, log: vi.fn(), liveGate: false,
       exec: () => JSON.stringify({ ready: [{ repo: item.repo, number: item.pr, head: item.head }] }) };
     const poll = path => runOnce({ ...opts, env: { WE_NEEDS_YOU_FEED: path } });
     expect((await poll(first)).lines).toHaveLength(1);
@@ -123,7 +123,9 @@ describe('feed', () => {
     expect(items[2].command).toBe('human merge');
     expect(items[4].command).toBeUndefined();
     expect(items.every(i => i.title === row.title)).toBe(true);
-    const line = diffFeed([], [items[0]], at).lines[0];
+    // A head-less row is held, never published (#5716); the same row once its head is known posts.
+    expect(diffFeed([], [items[0]], at).lines).toEqual([]);
+    const line = diffFeed([], [{ ...items[0], head: 'abc' }], at).lines[0];
     expect(line.slice(0, line.indexOf(' {"at":'))).toContain(row.title);
     expect(line).toContain(`| pick: ${review}`);
     expect(parseFeedLine(line)).toMatchObject({ title: row.title, reason: items[0].reason });
@@ -134,7 +136,7 @@ describe('feed', () => {
       { repo: 'r', number: 1, title: 'Lookup' }, { repo: 'r', number: 2, head: 'supplied' },
     ] }));
     const gh = vi.fn(() => JSON.stringify({ headRefOid: 'resolved' }));
-    const opts = { exec, gh, home, checkoutRoot, env: {}, now: at, log: vi.fn() };
+    const opts = { exec, gh, home, checkoutRoot, env: {}, now: at, log: vi.fn(), liveGate: false };
     const first = await runOnce(opts);
     expect(gh).toHaveBeenCalledTimes(1);
     expect(gh).toHaveBeenCalledWith('gh', ['pr', 'view', '1', '--repo', 'r', '--json', 'headRefOid'],
@@ -153,11 +155,51 @@ describe('feed', () => {
       return failure === 'invalid JSON' ? 'invalid' : '{}';
     }).mockReturnValue(JSON.stringify({ headRefOid: 'second' }));
     const log = vi.fn();
-    const result = await runOnce({ exec, gh, home, checkoutRoot, env: {}, now: at, log });
-    expect(result.openKeys).toEqual(['r#1@:needs-you', 'r#2@second:needs-you']);
-    expect(parseFeedLine(result.lines[0]).head).toBe('');
+    const result = await runOnce({ exec, gh, home, checkoutRoot, env: {}, now: at, log, liveGate: false });
+    // An unknown head is held, never published as its own `@:` key (#5716 flap).
+    expect(result.openKeys).toEqual(['r#2@second:needs-you']);
+    expect(result.lines.map(l => parseFeedLine(l).pr)).toEqual([2]);
     expect(log).toHaveBeenCalledWith(expect.stringMatching(/r#1.*head lookup failed/));
     expect(gh).toHaveBeenCalledTimes(2);
+  });
+  it('never flaps a condition across head-unknown reads (#5716)', () => {
+    const live = { ...item, kind: 'at-round-limit', head: 'a36' }, unknown = { ...live, head: '' };
+    const first = diffFeed([], [live], at);
+    expect(first.lines).toHaveLength(1);
+    // A failed head lookup keeps the open key: nothing posted, nothing cleared.
+    const blind = diffFeed(first.openKeys, [unknown], at);
+    expect(blind).toEqual({ lines: [], openKeys: first.openKeys });
+    expect(diffFeed(blind.openKeys, [live], at)).toEqual({ lines: [], openKeys: first.openKeys });
+    // Nothing open + head unknown → hold until known.
+    expect(diffFeed([], [unknown], at)).toEqual({ lines: [], openKeys: [] });
+    // A legacy head-less open key is adopted by the known head silently.
+    const legacy = `${item.repo}#12@:at-round-limit`;
+    expect(diffFeed([legacy], [live], at)).toEqual({ lines: [], openKeys: [`${item.repo}#12@a36:at-round-limit`] });
+    expect(diffFeed([legacy], [unknown], at)).toEqual({ lines: [], openKeys: [legacy] });
+    // A real head change still posts + clears; the condition going away still clears.
+    expect(diffFeed(first.openKeys, [{ ...live, head: 'b47' }], at).lines.map(l => l.split(' ')[0])).toEqual(['NEEDS-YOU', 'NEEDS-YOU-CLEARED']);
+    expect(diffFeed(first.openKeys, [], at).lines[0]).toMatch(/^NEEDS-YOU-CLEARED /);
+    // Two distinct known heads with only a legacy key open are two real events: both post, the legacy key clears.
+    const two = diffFeed([legacy], [live, { ...live, head: 'b47' }], at);
+    expect(two.lines.map(l => l.split(' ')[0])).toEqual(['NEEDS-YOU', 'NEEDS-YOU', 'NEEDS-YOU-CLEARED']);
+    // Duplicate rows of ONE known head still adopt the legacy key silently.
+    expect(diffFeed([legacy], [live, { ...live }], at)).toEqual({ lines: [], openKeys: [`${item.repo}#12@a36:at-round-limit`] });
+    // A genuinely new head still posts (and clears the old head's key).
+    expect(diffFeed([`${item.repo}#12@a36:at-round-limit`], [{ ...live, head: 'c58' }], at).lines.map(l => l.split(' ')[0])).toEqual(['NEEDS-YOU', 'NEEDS-YOU-CLEARED']);
+    // Same condition reported twice (known + unknown) is one key.
+    expect(diffFeed([], [unknown, live], at).openKeys).toEqual([`${item.repo}#12@a36:at-round-limit`]);
+  });
+  it('replay closes a legacy head-less opening when the adopted known-head key clears (#5716)', () => {
+    const path = join(temp(), 'events');
+    const live = { ...item, kind: 'at-round-limit', head: 'a36' };
+    const legacy = diffFeed([], [{ ...live, head: '' }], at, { incomplete: false });
+    expect(legacy.lines).toEqual([]); // the new producer never opens one; write an old producer's line by hand
+    appendLines(path, [`NEEDS-YOU ${item.repo}#12 at-round-limit: ready ${JSON.stringify({ at, ...live, head: '' })}`]);
+    const adopted = diffFeed([`${item.repo}#12@:at-round-limit`], [live], at);
+    appendLines(path, adopted.lines);
+    expect(unacknowledged({ path, ackPath: join(temp(), 'ack') })).toHaveLength(1);
+    appendLines(path, diffFeed(adopted.openKeys, [], at).lines);
+    expect(unacknowledged({ path, ackPath: join(temp(), 'ack') })).toEqual([]);
   });
   it('appends without replacing bytes and replays and acknowledges open events', () => {
     const path = join(temp(), 'events'); writeFileSync(path, 'existing\n');
@@ -182,7 +224,7 @@ describe('feed', () => {
     const path = feedPath({ home, env: {} });
     vi.stubEnv('WE_NEEDS_YOU_FEED', path);
     const existing = { repo: item.repo, number: item.pr, head: item.head };
-    const opts = { home, checkoutRoot, env: {}, now: at, log: vi.fn() };
+    const opts = { home, checkoutRoot, env: {}, now: at, log: vi.fn(), liveGate: false };
     await runOnce({ ...opts, exec: () => JSON.stringify({ ready: [existing] }) });
     let resume, entered;
     const paused = new Promise(resolve => { resume = resolve; });
@@ -247,7 +289,7 @@ describe('feed', () => {
   it('runs queue from producer checkout, consumes exit-1 JSON and persists partial state', async () => {
     const home = temp(), checkoutRoot = join(home, 'workspace/.lanes/we/lane-1');
     const exec = vi.fn(() => JSON.stringify({ ready: [{ repo: 'r', number: 1, head: 'h' }] }));
-    const opts = { exec, home, checkoutRoot, env: {}, now: at, log: vi.fn() };
+    const opts = { exec, home, checkoutRoot, env: {}, now: at, log: vi.fn(), liveGate: false };
     await runOnce(opts);
     expect(exec.mock.calls[0][1]).toEqual([join(checkoutRoot, 'scripts/operations/operator-queue.mjs'), '--json']);
     expect(exec.mock.calls[0][2].cwd).toBe(checkoutRoot);
@@ -284,4 +326,102 @@ describe('feed', () => {
 it('keeps round-cap operator notes in the feed while the cap still needs a person', () => {
   expect(Array.from(itemsFromReport({ needsPerson: [{ repo: 'o/r', number: 5403, kind: 'round-cap-exhausted', detail: 'round cap exhausted' }] })))
     .toEqual([expect.objectContaining({ pr: 5403, kind: 'at-round-limit', reason: 'round cap exhausted' })]);
+});
+
+describe('gateReadyItems: "your review" is re-checked against the live PR (#5768)', () => {
+  const repo = 'o/r';
+  const head = '18088fcad0000000000000000000000000000000';
+  const report = { ready: [{ repo, number: 5768, title: 't' }], needsYourMerge: [{ repo, number: 9, title: 'm' }] };
+  const gate = (view, comments) => async (_f, args) => (args[0] === 'api' ? JSON.stringify([comments]) : JSON.stringify(view));
+  const items = () => itemsFromReport(report);
+
+  it('drops a ready item whose live PR is red-team:blocked + review:changes, and says why', async () => {
+    const gh = gate({ headRefOid: head, labels: [{ name: 'review:changes' }, { name: 'red-team:blocked' }] }, []);
+    const { kept, held } = await gateReadyItems(items(), report, { gh, log: () => {} });
+    expect(kept.map((i) => i.pr)).toEqual([9]);
+    expect(held[0].reasons).toEqual(expect.arrayContaining(['the red team blocked the live head', 'it was sent back (review:changes)']));
+  });
+  it('keeps a ready item whose live PR is clean, and never judges needs-your-merge rows', async () => {
+    const gh = gate({ headRefOid: head, labels: [{ name: 'red-team:clear' }] }, []);
+    const { kept, held } = await gateReadyItems(items(), report, { gh, log: () => {} });
+    expect(kept.map((i) => i.pr).sort((a, b) => a - b)).toEqual([9, 5768]);
+    expect(held).toEqual([]);
+  });
+  it('keeps the item (never suppresses an alert) when the live PR cannot be read, and logs it', async () => {
+    const logs = [];
+    const { kept } = await gateReadyItems(items(), report, { gh: async () => { throw new Error('rate limited'); }, log: (l) => logs.push(l) });
+    expect(kept.map((i) => i.pr).sort((a, b) => a - b)).toEqual([9, 5768]);
+    expect(logs.join()).toMatch(/live gate unreadable, keeping: rate limited/);
+  });
+  it('runOnce applies the gate by default and logs what it held back', async () => {
+    const home = temp(), checkoutRoot = join(home, 'workspace/.lanes/we/lane-1');
+    const exec = () => JSON.stringify({ ready: [{ repo: 'r', number: 5768, head, title: 't' }] });
+    const gh = async (_f, args) => (args[0] === 'api' ? '[[]]' : JSON.stringify({ headRefOid: head, labels: [{ name: 'red-team:blocked' }] }));
+    const log = vi.fn();
+    const result = await runOnce({ exec, gh, home, checkoutRoot, env: {}, now: at, log });
+    expect(result.openKeys).toEqual([]);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('r#5768 held back from your review: the red team blocked the live head'));
+  });
+  it('publishes the head it CHECKED, not a stale one from the report or a later lookup', async () => {
+    const stale = [{ repo, number: 5768, head: 'stale' }];
+    const r2 = { ready: stale };
+    const { kept } = await gateReadyItems(itemsFromReport(r2), r2, { gh: gate({ headRefOid: head, labels: [] }, []), log: () => {} });
+    expect(kept[0].head).toBe(head);
+  });
+  it('the real fix-claim lease overrides the comment heuristic (expired lease = not claimed; live lease = claimed)', async () => {
+    const created_at = new Date(Date.now() - 600000).toISOString();
+    const body = '🔒 conveyor fix-begin — fix claim held';
+    const gh = async (_f, args) => (args[0] === 'api' ? JSON.stringify([[{ user: { login: 'plateau-worker[bot]' }, body, created_at }]]) : JSON.stringify({ headRefOid: head, labels: [] }));
+    const live = await gateReadyItems(items(), report, { gh, log: () => {}, fixClaimLive: () => true });
+    expect(live.held[0].reasons).toEqual(['a fix claim is open']);
+    const expired = await gateReadyItems(items(), report, { gh, log: () => {}, fixClaimLive: () => false });
+    expect(expired.held).toEqual([]);
+  });
+  it('a pass-wide deadline keeps (never drops) the items it could not judge in time', async () => {
+    const logs = [];
+    const gh = async () => JSON.stringify({ headRefOid: head, labels: [{ name: 'red-team:blocked' }] });
+    const { kept, held } = await gateReadyItems(items(), report, { gh, log: (l) => logs.push(l), deadlineMs: -1 });
+    expect(held).toEqual([]);
+    expect(kept.map((i) => i.pr).sort((a, b) => a - b)).toEqual([9, 5768]);
+    expect(logs.join()).toMatch(/gate deadline/);
+  });
+  it('keeps the incomplete flag the diff uses', async () => {
+    const withFlag = Object.assign(items(), { incomplete: true });
+    const { kept } = await gateReadyItems(withFlag, report, { gh: gate({ headRefOid: head, labels: [] }, []), log: () => {} });
+    expect(kept.incomplete).toBe(true);
+  });
+
+});
+
+
+it('a silent same-head pause reaches the feed with unattempted referrals and deduplicates by head/kind', async () => {
+  const { rulingNeededRow } = await import('../operator-queue.mjs');
+  const { rulingNeeded } = await import('../../lib/ruling-ledger.mjs');
+  const { record, recordComment, H1, repo, SUMMARY } = await import('../../conveyor/__tests__/ruling-fixtures.mjs');
+  const rec = record({ head: H1, runId: 'run-1' }); rec.attempted = false;
+  const p = { number: 3794, headRefOid: H1, labels: [{ name: 'review:human' }], comments: [recordComment(rec, 5)] };
+  expect(rulingNeeded(p)).toBeNull();
+  const runs = [{ repo, pr: p.number, head: H1, startedAt: 1, completedAt: 2, rulings: [], parked: false }];
+  const row = rulingNeededRow(repo, p, { readRuns: () => runs });
+  expect(row).not.toBeNull();
+  const items = itemsFromReport({ rulingNeeded: [row, row] });
+  expect(items[0]).toMatchObject({ kind: 'ruling-needed', findings: [{ key: rec.referrals[0].key,
+    file: 'policy/pointer.md', line: 12, summary: SUMMARY }] });
+  const out = diffFeed([], items, at);
+  expect(out.lines).toHaveLength(1);
+  expect(parseFeedLine(out.lines[0]).findings).toEqual(items[0].findings);
+});
+
+
+it('a second pause with all referrals ruled still raises through the report source', async () => {
+  const { rulingNeededRow } = await import('../operator-queue.mjs');
+  const { REARM_COMMENT_MARKER } = await import('../../conveyor/rearm-review.mjs');
+  const { record, recordComment, H1, repo, BLOCK } = await import('../../conveyor/__tests__/ruling-fixtures.mjs');
+  const p = { number: 3794, headRefOid: H1, body: '<!-- authored-by-actor: author -->', createdAt: '2026-10-03T07:00:00Z',
+    comments: [recordComment(record({ head: H1, runId: 'run-1', rulings: [BLOCK] }), 5),
+    { body: `${REARM_COMMENT_MARKER}\n<!-- paused-review-auto-rearm: ${H1} -->`, author: { login: 'web-everything' }, createdAt: '2026-10-03T08:06:00Z' }] };
+  const runs = [{ repo, pr: p.number, head: H1, startedAt: Date.parse('2026-10-03T08:07:00Z'),
+    completedAt: Date.parse('2026-10-03T08:08:00Z'), rulings: [], parked: false }];
+  const row = rulingNeededRow(repo, p, { readRuns: () => runs });
+  expect(itemsFromReport({ rulingNeeded: [row] })[0]).toMatchObject({ kind: 'ruling-needed', findings: [{ key: record({ head: H1, runId: 'run-1' }).referrals[0].key }] });
 });

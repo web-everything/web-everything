@@ -1,3 +1,4 @@
+import { readLivePrContext, readPinnedPrContext } from './lib/review-pr-snapshot.mjs';
 /**
  * review-detail.mjs — assemble a PARKED PR's review context as one JSON object (#2470, increment 1 of 2).
  *
@@ -172,10 +173,18 @@ export function assembleReviewDetail({ view } = {}) {
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
 if (IS_CLI) runCli();
 
+/** Explicit heads opt into contextual sharing; an unpinned console read stays live. */
+export function readReviewDetailView({ repo, pr, headSha, exec = args => execFileSync('gh', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }), snapshotOptions = {} }) {
+  return headSha
+    ? readPinnedPrContext({ ...snapshotOptions, repo, pr, headSha, exec })
+    : readLivePrContext({ ...snapshotOptions, repo, pr, exec });
+}
+
 function runCli() {
   const args = process.argv.slice(2);
   const asJson = args.includes('--json');
   const repo = (args.find((a) => a.startsWith('--repo=')) || '').slice('--repo='.length);
+  const headSha = args.find(a => a.startsWith('--head='))?.slice('--head='.length);
   const pr = args.find((a) => /^\d+$/.test(a));
 
   if (!pr || !repo) {
@@ -185,10 +194,7 @@ function runCli() {
 
   let view;
   try {
-    const out = execFileSync('gh', [
-      'pr', 'view', pr, '--repo', repo, '--json', 'number,title,url,body,labels,comments,files',
-    ], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-    view = JSON.parse(out);
+    view = readReviewDetailView({ repo, pr, headSha });
   } catch (e) {
     const msg = String((e && (e.stderr || e.message)) || e).split('\n').filter(Boolean).pop() || 'gh pr view failed';
     writeAllSync(1, `${JSON.stringify({ error: msg })}\n`);

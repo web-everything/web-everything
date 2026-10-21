@@ -37,6 +37,8 @@
  *
  * Pure, unit-tested through `review-core.mjs`'s re-exports in `we:scripts/lib/__tests__/review-core.test.mjs`.
  */
+import { canonicalizeSlug } from './constellation-repos.mjs';
+import { resolveReferralSafetySettings } from './review-settings.mjs';
 import { FALSE_FINDING_CAUSES } from './false-finding-causes.mjs';
 import { createHash } from 'node:crypto';
 import { CARD_REF_RE } from './referral-card-readable.mjs';
@@ -3046,6 +3048,9 @@ export function knownVerificationReasons(rows, head) {
   return reasons;
 }
 
+// Compare repo aliases without rewriting authored referral or ruling records.
+export const sameRepo = (a, b) => canonicalizeSlug(a) === canonicalizeSlug(b);
+
 const supersededRulings = (ruling) => ruling.supersedes == null ? []
   : Array.isArray(ruling.supersedes) ? ruling.supersedes : [ruling.supersedes];
 
@@ -3093,15 +3098,15 @@ export function findSupersedingNotReal(referral, { records = [], operatorRulings
     return summary(finding.summary) === summary(target.summary) || wordOverlap(finding.summary, target.summary) >= 0.5;
   };
   for (const record of records) {
-    if (record.head !== head || record.repo !== repo || record.pr !== pr) continue;
+    if (record.head !== head || !sameRepo(record.repo, repo) || record.pr !== pr) continue;
     for (const ruling of record.rulings) {
       if (ruling.result === 'not-real' && !record.rulings.some(next => supersededRulings(next).includes(ruling.id))
         && matches(record, ruling.key)) return { runId: record.runId, key: ruling.key, rulingId: ruling.id };
     }
   }
   for (const ruling of operatorRulings) {
-    if (ruling.result !== 'not-real' || ruling.head !== head || ruling.repo !== repo || ruling.pr !== pr) continue;
-    const record = records.find(r => r.runId === ruling.runId && r.head === head && r.repo === repo && r.pr === pr);
+    if (ruling.result !== 'not-real' || ruling.head !== head || !sameRepo(ruling.repo, repo) || ruling.pr !== pr) continue;
+    const record = records.find(r => r.runId === ruling.runId && r.head === head && sameRepo(r.repo, repo) && r.pr === pr);
     if (record && matches(record, ruling.key)) return { runId: ruling.runId, key: ruling.key, operator: true };
   }
   return null;
@@ -3117,7 +3122,7 @@ export const CARRY_SEVERITY_FIELDS = Object.freeze(['verdict', 'impactIfUnfixed'
  * ignored-ruling ledger (`ruling-ledger.mjs#ignoredRulings`), so they cannot disagree on whether a carry stands.
  */
 export function carriedBackingHolds(carried, { repo, pr, operatorRulings = [] }) {
-  const backing = operatorRulings.filter(o => o.repo === repo && o.pr === pr
+  const backing = operatorRulings.filter(o => sameRepo(o.repo, repo) && o.pr === pr
     && o.head === carried.from.head && o.runId === carried.from.runId && o.key === carried.from.key).at(-1);
   return backing && backing.result === carried.result && backing.card === carried.card ? backing : null;
 }
@@ -3132,7 +3137,7 @@ function operatorCarryBacking(carried, target, { repo, pr, operatorRulings, reco
   const backing = carriedBackingHolds(carried, { repo, pr, operatorRulings });
   if (!backing) return null;
   const source = (Array.isArray(records) ? records : []).find(r => r.head === carried.from.head
-    && r.runId === carried.from.runId && r.repo === repo && r.pr === pr);
+    && r.runId === carried.from.runId && sameRepo(r.repo, repo) && r.pr === pr);
   const from = source?.referrals.find(x => x.key === carried.from.key);
   return source && (!from || !sameFindingForClearing(from.finding, target.finding)) ? null : backing;
 }
@@ -3141,8 +3146,8 @@ function operatorCarryBacking(carried, target, { repo, pr, operatorRulings, reco
 export function findCarriedOperatorRuling(referral, { records = [], operatorRulings = [], head, repo, pr }) {
   const target = referral.finding;
   for (const o of [...operatorRulings].reverse()) {
-    if (o.head === head || o.repo !== repo || o.pr !== pr) continue;
-    const record = records.find(r => r.runId === o.runId && r.head === o.head && r.repo === repo && r.pr === pr);
+    if (o.head === head || !sameRepo(o.repo, repo) || o.pr !== pr) continue;
+    const record = records.find(r => r.runId === o.runId && r.head === o.head && sameRepo(r.repo, repo) && r.pr === pr);
     const finding = record?.referrals.find(f => f.key === o.key)?.finding;
     // Clearing a mandatory referral is stricter than merging duplicates (exact path, line window, symmetric word
     // overlap, same severity): see `sameFindingForClearing`, the one definition the ledger's overrule shares.
@@ -3190,7 +3195,7 @@ export function reviewerCarryBacking(carried, { records = [], operatorRulings = 
   const from = carried?.from;
   if (!from || typeof from.rulingId !== 'string' || !['not-real', 'card'].includes(carried.result)) return null;
   const list = Array.isArray(records) ? records : [];
-  const index = list.findIndex(r => r.head === from.head && r.runId === from.runId && r.repo === repo && r.pr === pr);
+  const index = list.findIndex(r => r.head === from.head && r.runId === from.runId && sameRepo(r.repo, repo) && r.pr === pr);
   const source = list[index];
   const ruling = source?.rulings.find(x => x.id === from.rulingId && x.key === from.key);
   if (!ruling || ruling.result !== carried.result || (ruling.result === 'card' && ruling.card !== carried.card)) return null;
@@ -3223,7 +3228,7 @@ export function reviewerCarryBacking(carried, { records = [], operatorRulings = 
   // that cannot be read is not yet a clearance, so it does not replace the block it names.
   const cardOk = typeof options.cardReadable === 'function' ? options.cardReadable : () => false;
   for (const [at, other] of list.entries()) {
-    if (other.repo !== repo || other.pr !== pr || (at < index && other.head !== source.head)) continue;
+    if (!sameRepo(other.repo, repo) || other.pr !== pr || (at < index && other.head !== source.head)) continue;
     if (other.referrals.some(f => sameId(other.head, other.runId, f.key)
       && other.rulings.some(x => x.key === f.key && x.result === 'block'
         && !other.rulings.some(next => supersededRulings(next).includes(x.id)
@@ -3231,7 +3236,7 @@ export function reviewerCarryBacking(carried, { records = [], operatorRulings = 
   }
   // An operator ruling is decided by the LATEST one on its (head, run, finding): a block the operator later re-ruled
   // is no longer standing (the same rule `carriedBackingHolds` applies to an operator carry).
-  const ops = (Array.isArray(operatorRulings) ? operatorRulings : []).filter(o => o.repo === repo && o.pr === pr);
+  const ops = (Array.isArray(operatorRulings) ? operatorRulings : []).filter(o => sameRepo(o.repo, repo) && o.pr === pr);
   if (ops.some(o => o.result === 'block' && sameId(o.head, o.runId, o.key)
     && ops.filter(p => p.head === o.head && p.runId === o.runId && p.key === o.key).at(-1) === o)) return null;
   return ruling;
@@ -3249,7 +3254,7 @@ export function findCarriedReviewerRuling(referral, { records = [], operatorRuli
   const identityTable = findingIdentityTable(list);
   for (let i = list.length - 1; i >= 0; i--) {
     const r = list[i];
-    if (r.head === head || r.repo !== repo || r.pr !== pr) continue;
+    if (r.head === head || !sameRepo(r.repo, repo) || r.pr !== pr) continue;
     for (const ruling of [...r.rulings].reverse()) {
       const g = r.referrals.find(f => f.key === ruling.key);
       if (!g || !sameFindingIdentity(normalizeFindingIdentity(g.original ?? g.finding), target)) continue;
@@ -3377,9 +3382,9 @@ export function referralRecordState(record, options = {}) {
     // #4979 — the operator's ruling on THIS exact (repo, PR, head, run, finding) is the explicit, authorized
     // supersession: the latest one decides, over the reviewer's. It is pinned to the record's head, so a new
     // head (or an unreadable card) leaves the finding pending exactly like a reviewer ruling would.
-    const operator = (Array.isArray(operatorRulings) ? operatorRulings : []).filter(o => o.repo === record.repo
+    const operator = (Array.isArray(operatorRulings) ? operatorRulings : []).filter(o => sameRepo(o.repo, record.repo)
       && o.pr === record.pr && o.head === record.head && o.runId === record.runId && o.key === f.key).at(-1);
-    if (operator) {
+    if (operator && !reviewerSupersedesAutoBlock(record, f.key, operator, { ...options, head, operatorRulings })) {
       if (head !== record.head || (operator.result === 'card' && !cardReadable(operator.card))) pending.push(f.key);
       else { rulings.push(operator); if (operator.result === 'block') blocked.push(f.key); }
       continue;
@@ -3414,7 +3419,7 @@ export function referralRecordState(record, options = {}) {
     const superseded = (record.superseded ?? []).find(s => s.key === f.key);
     if (!recorded.length && superseded) {
       const { by } = superseded;
-      const sameSubject = r => r.runId === by.runId && r.repo === record.repo && r.pr === record.pr && r.head === record.head;
+      const sameSubject = r => r.runId === by.runId && sameRepo(r.repo, record.repo) && r.pr === record.pr && r.head === record.head;
       const backed = by.operator
         ? operatorRulings.some(r => sameSubject(r) && r.key === by.key && r.result === 'not-real')
         : records.some(r => sameSubject(r) && r.rulings.some(x => x.id === by.rulingId && x.key === by.key && x.result === 'not-real'));
@@ -3437,7 +3442,7 @@ export function referralRecordState(record, options = {}) {
     table ??= findingIdentityTable(allRecords);
     const linked = linkedBlocked ?? linkedBlockedFindingIds(allRecords, { ...options, head, identityTable: table });
     for (const f of linked.size ? activeReferrals(record) : []) {
-      if (blocked.includes(f.key) || (Array.isArray(operatorRulings) ? operatorRulings : []).some(o => o.repo === record.repo
+      if (blocked.includes(f.key) || (Array.isArray(operatorRulings) ? operatorRulings : []).some(o => sameRepo(o.repo, record.repo)
         && o.pr === record.pr && o.head === record.head && o.runId === record.runId && o.key === f.key)) continue;
       const findingId = findingIdOf(table, { head: record.head, runId: record.runId, key: f.key });
       const from = findingId ? linked.get(findingId) : undefined;
@@ -3473,7 +3478,7 @@ export function linkedBlockedFindingIds(records = [], options = {}) {
   const list = Array.isArray(records) ? records : [];
   const table = options.identityTable ?? findingIdentityTable(list);
   for (const r of list) {
-    if (r?.head !== head || (repo && (r.repo !== repo || r.pr !== Number(pr)))) continue;
+    if (r?.head !== head || (repo && (!sameRepo(r.repo, repo) || r.pr !== Number(pr)))) continue;
     const state = referralRecordState(r, { ...options, head, records: list, identityTable: table, linkedBlocked: null });
     for (const key of state.blocked) {
       const findingId = findingIdOf(table, { head: r.head, runId: r.runId, key });
@@ -3521,6 +3526,32 @@ export function renderReferralRecord(record, { operatorRulings = [] } = {}) {
     + `\nAttempt recorded: ${record.attempted}. Reason: ${record.failure ?? (referralRecordState(record).pending.length ? 'mandatory finding-specific review required' : 'finding-specific rulings recorded')}. Rulings: ${JSON.stringify(record.rulings)}\n`
     + `Record any missing finding-specific rulings with the mandatory reviewer identified above, retaining prior rulings and explicit supersedes IDs. Then start a fresh review-pr --pr=${record.pr} --repo=${record.repo}; it reuses this PR record without another automated attempt. card requires a readable backlog reference.\n`
     + `<!-- ${REFERRAL_RECORD_MARKER}: ${encodeURIComponent(JSON.stringify(record))} -->`;
+}
+
+// Observation times stay outside the authored/append-only record. Missing chronology never clears a block.
+const referralObservations = new WeakMap();
+const malformedRulingReads = new WeakSet();
+
+/** A policy block can yield only to this run's own counted, later not-real on the exact live finding. */
+function reviewerSupersedesAutoBlock(record, key, block, options = {}) {
+  if (block?.actor !== AUTO_POLICY_ACTOR || block.result !== 'block' || (options.head ?? record.head) !== record.head
+    || block.head !== record.head || !sameRepo(block.repo, record.repo) || block.pr !== record.pr
+    || block.runId !== record.runId || block.key !== key || malformedRulingReads.has(options.operatorRulings)) return false;
+  const observation = referralObservations.get(record);
+  if (!observation || observation.malformed) return false;
+  const decision = decideClearerIndependence({ authorId: parseAuthorActorId(options.body ?? record.authorBody),
+    clearerId: record.reviewer.id, prCreatedAt: options.createdAt ?? '' });
+  if (decision.independent !== true) return false;
+  const history = record.rulings.filter(r => r.key === key);
+  const active = history.filter(r => !history.some(next => supersededRulings(next).includes(r.id)));
+  if (!active.length || active.some(r => r.result !== 'not-real' || !r.evidence?.some(e => typeof e === 'string' && e.trim())
+    || !(observation.times.get(r.id) > Date.parse(block.at)))) return false;
+  const policy = resolveReferralSafetySettings();
+  const enabled = options.autoBlockYieldsToReviewerNotReal ?? policy.value.autoBlockYieldsToReviewerNotReal;
+  const source = options.autoBlockYieldsToReviewerNotReal === undefined ? policy.sources.autoBlockYieldsToReviewerNotReal : 'context';
+  // Log both the clearance and the rollback's decision to retain an otherwise supersedable block.
+  (options.log ?? console.error)(`review.autoBlockYieldsToReviewerNotReal=${enabled} (${source}): auto-policy block ${enabled ? 'superseded' : 'retained'} on ${record.head.slice(0, 9)} run ${record.runId}`);
+  return enabled === true;
 }
 
 /**
@@ -3581,10 +3612,16 @@ export function readReferralRecords(comments, { head } = {}) {
           || JSON.stringify(r.rulings.slice(0, previous.rulings.length)) !== JSON.stringify(previous.rulings))) {
           malformed ||= holdsHead(r); continue;
         }
+        const times = new Map(referralObservations.get(previous)?.times ?? []);
+        for (const ruling of r.rulings) if (!times.has(ruling.id)) {
+          times.set(ruling.id, Date.parse(comment?.updatedAt ?? comment?.createdAt));
+        }
+        referralObservations.set(r, { times, malformed: false });
         records.set(id, r);
       } catch { malformed = true; }
     }
   }
+  for (const record of records.values()) referralObservations.get(record).malformed = malformed;
   return { records: [...records.values()], malformed };
 }
 
@@ -3691,7 +3728,11 @@ export function operatorRulingId(o) {
   return `operator:${String(o.head).slice(0, 9)}:${h}`;
 }
 
-/** Every valid operator ruling in thread order, flattened to one entry per (run, finding). */
+/** Every valid operator ruling in thread order, flattened to one entry per (run, finding).
+ * Canonicalize known org-move aliases only AFTER validating the exact authored comment. PR #5514's first
+ * operator not-real named chalbert/web-everything; its referral named web-everything/web-everything.
+ * Keep the signed-off body/record unchanged; unrelated repositories still never match.
+ */
 export function readOperatorRulings(comments, { head } = {}) {
   const rulings = [];
   let malformed = false;
@@ -3703,11 +3744,12 @@ export function readOperatorRulings(comments, { head } = {}) {
     if (parsed.malformed) { malformed ||= !(current && parsed.head && parsed.head !== current); continue; }
     const r = parsed.record;
     for (const x of r.rulings) {
-      rulings.push(Object.freeze({ operator: true, repo: r.repo, pr: r.pr, head: r.head, runId: x.runId, key: x.key,
+      rulings.push(Object.freeze({ operator: true, repo: canonicalizeSlug(r.repo), pr: r.pr, head: r.head, runId: x.runId, key: x.key,
         result: x.result, ...(x.cause ? { cause: x.cause } : {}), ...(x.lens ? { lens: x.lens } : {}), ...(x.card ? { card: x.card } : {}), ...(x.supersedes ? { supersedes: [...x.supersedes] } : {}), actor: r.actor, channel: r.channel, reason: r.reason,
         at: r.at, clearerId: r.clearerId }));
     }
   }
+  if (malformed) malformedRulingReads.add(rulings);
   return { rulings, malformed };
 }
 
@@ -3735,7 +3777,7 @@ export function mandatoryReferralState(comments, context = {}) {
   // clearance carry forward implicitly; explicit carried entries require operator backing.
   for (const r of records) {
     if (/^[a-f0-9]{40}$/.test(context.head ?? '') && r.head !== context.head) continue;
-    if (context.repo && (r.repo !== context.repo || r.pr !== Number(context.pr))) { pending.push('wrong-subject'); continue; }
+    if (context.repo && (!sameRepo(r.repo, context.repo) || r.pr !== Number(context.pr))) { pending.push('wrong-subject'); continue; }
     const recordHead = context.head ?? r.head;
     const state = referralRecordState(r, { ...context, records, identityTable,
       ...(recordHead === r.head ? { linkedBlocked: linkedFor(r.head) } : {}) });

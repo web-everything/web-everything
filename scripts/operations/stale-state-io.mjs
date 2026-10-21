@@ -11,6 +11,7 @@ import { createClaimReader, REPO_ROOT } from './claim-io.mjs';
 import { createFileRunStore } from './run-store.mjs';
 import { idFromName } from '../backlog/id.mjs';
 import { readField } from '../backlog/frontmatter.mjs';
+import { cachedLaneScan } from '../lib/health-watch-lane-scan.mjs';
 import { probePid } from '../conveyor/reconcile-pass.mjs';
 
 /** Bind external reads, including subprocesses and clock, for fixture-only tests. */
@@ -19,7 +20,7 @@ export function createStaleStateReader({
   listFiles = (dir) => readdirSync(dir),
   readText = (path) => readFileSync(path, 'utf8'),
   readClaim, runStore = createFileRunStore(), probe = probePid,
-  now = Date.now, host = hostname(),
+  now = Date.now, host = hostname(), laneScan,
 } = {}) {
   // Propagates to lane-pool's git children too: status must not refresh the index.
   const exec = (bin, argv, opts = {}) => run(bin, argv, {
@@ -54,26 +55,43 @@ export function createStaleStateReader({
       });
     };
     try {
-      const status = JSON.parse(exec(process.execPath, [join(root, 'scripts/lane-pool.mjs'), 'status', '--json'], { cwd: root }));
-      if (!Array.isArray(status.lanes)) throw new Error('status returned no lanes array');
-      for (const lane of status.lanes) {
+      const scan = () => {
+        const status = JSON.parse(exec(process.execPath, [join(root, 'scripts/lane-pool.mjs'), 'status', '--json'], { cwd: root }));
+        if (!Array.isArray(status.lanes)) throw new Error('status returned no lanes array');
+        return status.lanes.map(lane => {
+          let ahead = null;
+          if (!lane.readError && lane.lease) {
+            try {
+              // Behind cannot detect unpushed commits. Count commits absent from local origin refs.
+              const raw = String(exec('git', ['rev-list', '--count', 'HEAD', '--not', '--remotes=origin'], { cwd: lane.path })).trim();
+              if (/^\d+$/.test(raw)) ahead = Number(raw);
+            } catch { /* unknown, never zero */ }
+          }
+          return { lane, ahead };
+        });
+      };
+      const lanes = laneScan ? cachedLaneScan(scan, { ...laneScan, root, now: now() }) : scan();
+      const cachedRow = lanes.find(row => Number.isFinite(row?.cachedAt));
+      if (cachedRow) gaps.push(`lane-lease work safety is from the lane-scan cache (${new Date(cachedRow.cachedAt).toISOString()}): reporting only, never safe; a destructive lane action needs a fresh check (health-watch-lane-scan.mjs#guardLaneAction).`);
+      for (const { lane, ahead, cachedAt } of lanes) {
+        const fromCache = Number.isFinite(cachedAt);
         if (lane.readError) {
           add('lane-lease', lane.path, {}, null, { lane, readError: lane.readError });
           continue;
         }
         if (!lane.lease) continue; // include raw expired leases regardless of `leased`
         const lease = lane.lease;
-        let ahead = null;
-        try {
-          // Behind cannot detect unpushed commits. Count commits absent from local origin refs.
-          const raw = String(exec('git', ['rev-list', '--count', 'HEAD', '--not', '--remotes=origin'], { cwd: lane.path })).trim();
-          if (/^\d+$/.test(raw)) ahead = Number(raw);
-        } catch { /* unknown, never zero */ }
-        const hasUnsafeWork = lane.clean === false || (ahead !== null && ahead > 0) ? true
+        const computed = lane.clean === false || (ahead !== null && ahead > 0) ? true
           : lane.clean === true && ahead === 0 ? false : null;
+        // A cached row is reporting only: cached unsafe stays unsafe, cached safe/unknown is reported unknown. Acting
+        // on a lane needs health-watch-lane-scan.mjs#guardLaneAction's fresh check, never this field.
+        const hasUnsafeWork = fromCache ? (computed === true ? true : null) : computed;
         add('lane-lease', lane.path, {
           ...lease, owner: lease.workerSession ?? lease.ownerSession ?? lease.session ?? lease.holder,
-        }, lease.acquiredAt, { hasUnsafeWork, lane: { ...lane, ahead }, lease });
+        }, lease.acquiredAt, { hasUnsafeWork,
+          safety: { source: fromCache ? 'cache' : 'fresh', observedAt: fromCache ? new Date(cachedAt).toISOString() : observedAt,
+            cachedHasUnsafeWork: fromCache ? computed : null },
+          lane: { ...lane, ahead }, lease });
       }
     } catch (error) { gaps.push(`lane-lease enumeration failed: ${error.message}`); }
     try {

@@ -231,9 +231,12 @@ describe('projectAvoidedRounds', () => {
 
 describe('resolveReviewSettings', () => {
   it('preserves the built-in defaults and allows file shadow mode', () => {
+    // Merged defaults (unfreeze-healthwatch-top-1021f): the referral-safety cascade also returns
+    // noFixerOnClearedRuled (merged side) and autoBlockYieldsToReviewerNotReal, which this health-watch build
+    // defaults OFF (main's auto-policy block precedence, coordinator ruling 2026-10-21).
     expect(resolveReviewSettings({ fileConfig: null, env: {} }))
       .toEqual({ recheckCarriedReferrals: true, autoPolicyRespectsNotReal: true, scopedRereview: 'off', referralDefault: 'operator', roundBudget: 'off', takeoverReviewAttempts: 1,
-        rulingResolvesStandDown: 'on', standDownQueueSection: 'needs-you' });
+        rulingResolvesStandDown: 'on', standDownQueueSection: 'needs-you', autoBlockYieldsToReviewerNotReal: false, noFixerOnClearedRuled: true });
     expect(resolveReviewSettings({ fileConfig: { scopedRereview: 'shadow' }, env: {} }).scopedRereview).toBe('shadow');
   });
   it('lets an explicit off environment override the file', () => {

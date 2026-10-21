@@ -2,7 +2,7 @@
  * review-label → review-extra-seats → review-dispatch → review-label initialization cycle.
  */
 import { REFERRAL_SEAT_PROVIDERS } from '../lib/jury-core.mjs';
-import { antigravityReviewFromEnv } from './review-pr.mjs';
+import { antigravityReviewFromEnv } from './review-antigravity-policy.mjs';
 
 /** LEGACY — the old SHARED per-day cap on non-Claude seat CALLS, counted across every provider together. Card
  *  xn2wf9t (2026-09-27) replaced it with a cap PER PROVIDER ({@link PROVIDER_CAP_ENV}): Codex's own weekly

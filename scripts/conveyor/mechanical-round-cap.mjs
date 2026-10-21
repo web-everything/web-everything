@@ -345,8 +345,6 @@ export function readMechanicalRoundFacts({ pr, defaultBranch = 'main', remote = 
   try {
     git(['fetch', '--quiet', '--no-tags', '--end-of-options', remote, `+${base}:refs/remotes/${remote}/${base}`,
       ...(headRef ? [`+${headRef}:refs/remotes/${remote}/${headRef}`] : [])]);
-  } catch { /* a failed fetch degrades to what is cached; the reads below are the real probe */ }
-  try {
     const parents = git(['rev-list', '--parents', '-n', '1', '--end-of-options', head]).trim().split(/\s+/);
     if (parents.length !== 3) return fail('not-a-merge');
     const [, priorHead, merged] = parents;

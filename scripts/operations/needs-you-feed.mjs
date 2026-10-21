@@ -8,6 +8,8 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handoffHome } from './handoff-home.mjs';
+import { humanReviewHold } from './pr-sweep-core.mjs';
+import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { isLaneLocus, workspaceRootOf } from '../guard-lane.mjs';
 import { daemonCloneRoots, isDaemonCloneRealpath } from '../lib/daemon-clone-registry.mjs';
@@ -78,7 +80,7 @@ export function itemsFromReport(report) {
       const command = row.command || (field === 'ready' || field === 'rulingNeeded'
         ? `node scripts/operations/run.mjs review-pr --pr=${shellArg(pr)} --repo=${shellArg(row.repo)}` : undefined);
       items.push({ pr, repo: row.repo, head: row.head ?? row.headRefOid ?? '', kind, reason, title: row.title ?? '',
-        ...(row.pick ? { pick: row.pick } : {}), ...(command ? { command } : {}) });
+        ...(row.findings ? { findings: row.findings } : {}), ...(row.pick ? { pick: row.pick } : {}), ...(command ? { command } : {}) });
     }
   }
   items.incomplete = !!report.incomplete;
@@ -97,19 +99,55 @@ function fromKey(key) {
   if (!m) throw new Error(`needs-you-feed: invalid state key ${key}`);
   return { repo: m[1], pr: Number(m[2]), head: m[3], was: m[4] };
 }
+const conditionOf = i => `${i.repo}#${i.pr}:${i.kind}`;
+/**
+ * An empty/unknown head is never a distinct key (PR #5716 flapped every pass: a failed head lookup published
+ * `@:at-round-limit` and cleared `@<sha>`, the next good lookup did the reverse). Dedupe per PR+condition:
+ *  - head unknown + that condition already open → keep the open key(s); publish and clear nothing;
+ *  - head unknown + nothing open → hold: publish nothing until a read knows the head;
+ *  - head known + only a legacy head-less key open for that condition → adopt it silently (no repost, no clear).
+ * Distinct KNOWN heads stay distinct keys (a new head is a new event).
+ */
+function resolveCurrent(prev, items) {
+  const prevByCondition = new Map();
+  for (const key of prev) {
+    const k = fromKey(key), condition = conditionOf({ ...k, kind: k.was });
+    prevByCondition.set(condition, [...(prevByCondition.get(condition) ?? []), { key, head: k.head }]);
+  }
+  const current = new Map(), carried = new Set(), adopted = new Set(), retired = new Set();
+  const known = items.filter(i => i.head), unknown = items.filter(i => !i.head);
+  for (const item of known) {
+    const key = keyOf(item), open = prevByCondition.get(conditionOf(item)) ?? [];
+    current.set(key, item);
+    // Adopt only when this read names ONE distinct known head for the condition (duplicate rows of it are one head);
+    // two distinct known heads are two real events.
+    const sole = new Set(known.filter(k => conditionOf(k) === conditionOf(item)).map(k => k.head)).size === 1;
+    if (!prev.has(key) && sole && open.length && open.every(o => !o.head)) { adopted.add(key); for (const o of open) retired.add(o.key); }
+  }
+  for (const item of unknown) {
+    const condition = conditionOf(item);
+    if (known.some(k => conditionOf(k) === condition)) continue;
+    for (const o of prevByCondition.get(condition) ?? []) carried.add(o.key);
+  }
+  return { current, carried, adopted, retired };
+}
 export function diffFeed(prevOpenKeys, items, now, { incomplete = items.incomplete, clearKinds = null } = {}) {
-  const at = new Date(now).toISOString(), prev = new Set(prevOpenKeys), current = new Map(items.map(sanitizeItem).map(i => [keyOf(i), i]));
+  const at = new Date(now).toISOString(), prev = new Set(prevOpenKeys);
+  const { current, carried, adopted, retired } = resolveCurrent(prev, items.map(sanitizeItem));
+  // A partial-scope publisher (clearKinds) never clears kinds it does not own; an incomplete read clears nothing.
   const retained = new Set([...prev].filter(key => incomplete || (clearKinds && !clearKinds.has(fromKey(key).was))));
   const lines = [];
-  for (const [key, item] of current) if (!prev.has(key)) {
+  for (const [key, item] of current) if (!prev.has(key) && !adopted.has(key)) {
     const event = { at, ...item };
     lines.push(`NEEDS-YOU ${item.repo}#${item.pr} ${item.kind}: ${item.reason}${item.title ? ` | title (untrusted): ${JSON.stringify(item.title)}` : ''}${item.pick || item.command ? ` | pick: ${item.pick || item.command}` : ''} ${JSON.stringify(event)}`);
   }
-  for (const key of prev) if (!retained.has(key) && !current.has(key)) {
+  for (const key of prev) if (!retained.has(key) && !current.has(key) && !carried.has(key) && !retired.has(key)) {
     const event = { at, kind: 'cleared', ...sanitizeItem(fromKey(key)) };
     lines.push(`NEEDS-YOU-CLEARED ${event.repo}#${event.pr} left ${event.was} ${JSON.stringify(event)}`);
   }
-  return { lines, openKeys: [...new Set([...retained, ...current.keys()])] };
+  // An adopted legacy head-less key is replaced by its known-head key; retained and carried keys stay open as-is.
+  const kept = [...retained, ...carried].filter(key => !retired.has(key));
+  return { lines, openKeys: [...new Set([...kept, ...current.keys()])] };
 }
 export function parseFeedLine(line) {
   if (!/^NEEDS-YOU(?:-CLEARED)? /.test(line)) return null;
@@ -158,7 +196,9 @@ export function unacknowledged({ path = feedPath(), ackPath = sidecarsOf(path).a
   const open = new Map();
   for (const [index, event] of replay({ path }).entries()) {
     const key = keyOf(event.kind === 'cleared' ? { ...event, kind: event.was } : event);
-    if (event.kind === 'cleared') open.delete(key); else open.set(key, { event, index });
+    // A clear also closes a legacy head-less opening of the same condition (adopted silently by the producer).
+    if (event.kind === 'cleared') { open.delete(key); open.delete(keyOf({ ...event, kind: event.was, head: '' })); }
+    else open.set(key, { event, index });
   }
   return [...open.values()].filter(({ event, index }) => cursor === null ? Date.parse(event.at) > Date.parse(ack) : index >= cursor).map(({ event }) => event);
 }
@@ -166,8 +206,44 @@ export function monitorCommand(path = feedPath()) {
   path = checkedFeedPath(path);
   return `tail -n 0 -F '${path.replace(/'/g, "'\\''")}' | grep --line-buffered NEEDS-YOU`;
 }
+/**
+ * Drop "your review" items whose LIVE PR no longer qualifies (red team not clear on the live head, sent back, a fix
+ * claim open): operator-queue's report can lag the labels by a tick, and a notification cannot be taken back. A PR
+ * that cannot be read is KEPT (an alert is never suppressed on missing evidence); the failure is logged. Only items
+ * that came from the queue's `ready` section are judged. Returns `{kept, held}`.
+ */
+export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(), log = console.error, deadlineMs = 120000, concurrency = 4,
+  fixClaimLive = (repo, pr) => { try { return readLiveFixClaim({ repo, pr }) !== null; } catch { return null; } } } = {}) {
+  const ready = new Set((report.ready ?? []).map((r) => `${r.repo}#${r.number ?? r.pr}`));
+  const deadline = Date.now() + deadlineMs;
+  const out = new Array(items.length); const held = [];
+  const judge = async (index) => {
+    const item = items[index];
+    if (item.kind !== 'needs-you' || !ready.has(`${item.repo}#${item.pr}`)) { out[index] = item; return; }
+    // Bounded work: past the pass deadline an item is KEPT unjudged, never dropped on missing evidence.
+    if (Date.now() >= deadline) { log(`needs-you-feed ${item.repo}#${item.pr} gate deadline reached, keeping`); out[index] = item; return; }
+    try {
+      const opts = { cwd, encoding: 'utf8', timeout: 60000, killSignal: 'SIGKILL', maxBuffer: 256 * 1024 * 1024 };
+      const view = JSON.parse(String(await gh('gh', ['pr', 'view', String(item.pr), '--repo', item.repo, '--json', 'labels,headRefOid'], opts)));
+      const pages = JSON.parse(String(await gh('gh', ['api', '--paginate', '--slurp', `repos/${item.repo}/issues/${item.pr}/comments?per_page=100`], opts)));
+      if (!Array.isArray(pages) || !view || typeof view.headRefOid !== 'string' || !view.headRefOid.trim()) throw new Error('unreadable live PR');
+      const comments = pages.flat().map((c) => ({ author: { login: c.user?.login ?? '' }, body: c.body ?? '', createdAt: c.created_at }));
+      const reasons = humanReviewHold({ number: item.pr, headRefOid: view.headRefOid, labels: view.labels ?? [], comments }, now,
+        { fixClaimLive: fixClaimLive(item.repo, item.pr) });
+      if (reasons.length) { held.push({ item, reasons }); return; }
+      // Publish the head that was actually checked, not a stale one from the report or a later lookup.
+      out[index] = { ...item, head: view.headRefOid };
+    } catch (error) { log(`needs-you-feed ${item.repo}#${item.pr} live gate unreadable, keeping: ${error.message}`); out[index] = item; }
+  };
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.max(1, concurrency) }, async () => { while (next < items.length) await judge(next++); }));
+  const kept = out.filter(Boolean);
+  kept.incomplete = items.incomplete;
+  return { kept, held };
+}
 export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled, home = homedir(), now = new Date(), checkoutRoot = CHECKOUT_ROOT,
-  env = process.env, settings = resolveSettings({ env, home, file: readSettings(checkoutRoot) }), log = console.error, owns = () => true } = {}) {
+  env = process.env, settings = resolveSettings({ env, home, file: readSettings(checkoutRoot) }), log = console.error, owns = () => true,
+  liveGate = true } = {}) {
   logSettings(settings, log);
   assertProducerCheckout(checkoutRoot, { env, settings });
   let stdout, failedRead = false;
@@ -180,7 +256,9 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
   const report = JSON.parse(String(stdout));
   if (!report || typeof report !== 'object' || !Array.isArray(report.ready)) throw new Error('needs-you-feed: invalid operator-queue report');
   if (failedRead) report.incomplete = true;
-  const items = itemsFromReport(report);
+  const gated = !liveGate ? { kept: itemsFromReport(report), held: [] } : await gateReadyItems(itemsFromReport(report), report, { gh, cwd: checkoutRoot, now: new Date(now).getTime(), log });
+  for (const { item, reasons } of gated.held) log(`needs-you-feed ${item.repo}#${item.pr} held back from your review: ${reasons.join('; ')}`);
+  const items = gated.kept;
   // Resolve before locking: gh admission/network waits must not hold the feed-state lock.
   for (const item of items) if (!item.head) {
     try {
