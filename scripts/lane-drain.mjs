@@ -571,6 +571,27 @@ function quietGit(CWD, a) {
   catch { return null; }
 }
 
+/**
+ * The identity a `drain: JIT-number` commit is authored with. CI trusts a numbering commit only when its
+ * author already authored such a commit on accepted `origin/main` (queue-branch-numbering.mjs
+ * trustedDrainAuthors). Committing with whatever the clone's git config says broke that on 2026-10-21:
+ * the drain clone's identity changed (test → Nicolas Gilbert), the new one had no numbering commit on main
+ * yet, so `handNumberedNewItems` failed every freshly numbered PR (#5777, #5779), ci-heal reverted the
+ * numbering, and the drain renumbered again. Keep the clone's own identity when main already trusts it;
+ * otherwise use the identity of main's most recent numbering commit. No such commit → clone identity (today).
+ * Trust still comes only from main: this only picks an identity main already accepts, never adds one.
+ */
+export function numberingCommitIdentityArgs(CWD, { git = (a) => quietGit(CWD, a) } = {}) {
+  const subject = /^drain: JIT-number .+ at land \(#2288\)$/;
+  const trusted = String(git(['log', '--grep=^drain: JIT-number ', '--format=%an%x00%ae%x00%s', 'origin/main']) ?? '')
+    .split('\n').map((line) => line.split('\0')).filter(([name, email, s]) => name && email && subject.test(s ?? ''));
+  if (!trusted.length) return [];
+  const own = [git(['config', 'user.name']), git(['config', 'user.email'])];
+  if (trusted.some(([name, email]) => name === own[0] && email === own[1])) return [];
+  const [name, email] = trusted[0];
+  return ['-c', `user.name=${name}`, '-c', `user.email=${email}`];
+}
+
 /** #2225 — the post-land heal/regen/numbering dirty-probe. These steps `git checkout --detach origin/main`
  *  and operate on POST-MERGE main, so untracked / git-ignored noise is irrelevant to their correctness — but
  *  a deps-symlinked lane clone (#2123, now the default solo-lane path) always carries an untracked
@@ -1190,7 +1211,7 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1 } = {}) {
   quietGit(CWD, ['add', '--', ...new Set(toAdd)]); // stage rewrites + new renamed files (deletions already staged by git rm; ledger stays untracked)
   const paths = [...new Set(commitPaths)];
   const summary = [...assigned.map((a) => `${a.hash}→#${a.nnn}`), ...dupDropped.map((d) => `${d.hash} duplicate dropped (already ${d.existing.replace(/^backlog\//, '')})`)].join(', ');
-  const committed = quietGit(CWD, ['commit', '-m', assertNoClosingKeywordRef(`drain: JIT-number ${summary} at land (#2288)`, 'JIT-number commit message'), '--', ...paths]) != null;
+  const committed = quietGit(CWD, [...numberingCommitIdentityArgs(CWD), 'commit', '-m', assertNoClosingKeywordRef(`drain: JIT-number ${summary} at land (#2288)`, 'JIT-number commit message'), '--', ...paths]) != null;
   return finish({ assigned, held, committed, unresolvedReferences, droppedDuplicates: dupDropped, renamed: [...renames, ...livePathRenames].map((r) => r.to), changedPaths: paths });
 }
 
