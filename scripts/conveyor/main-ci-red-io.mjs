@@ -291,14 +291,23 @@ async function defaultGates() {
 
 /**
  * The ci-heal owner session OPENS a repair PR, so it must play the worker App role. health-watch runs as the read-only
- * `observer` and exports WE_GITHUB_APP_ROLE=observer; a `--bg` session reads its env only from the `--settings` env
- * the sink writes, and the shim copies the dispatcher's role there (gh-app-shim.mjs ~874), so the owner would
- * otherwise write PRs as observer ("Resource not accessible by integration").
+ * `observer` and exports WE_GITHUB_APP_ROLE=observer into process.env, and that one ambient value feeds EVERY channel a
+ * dispatched session reads its identity from: the durable `<sessionCwd>/.claude/settings.local.json` and the `--settings`
+ * env (gh-app-shim.mjs ~874 copies it), the `claude --bg` spawn env, and the detached worker wrapper's env
+ * (`workerSpawnEnv()`). Overriding only one channel leaves the others observer, so the role is swapped in process.env for
+ * the duration of the dispatch and restored in `finally`. Nothing awaits between the swap and the first read except the
+ * dispatch itself, which is exactly the code that must see the worker role.
  */
-export const workerRoleSettings = (resolve) => (cwd) => ({ ...(resolve(cwd) || {}), WE_GITHUB_APP_ROLE: 'worker' });
+export async function withWorkerRole(fn, env = process.env) {
+  const had = Object.prototype.hasOwnProperty.call(env, 'WE_GITHUB_APP_ROLE');
+  const prior = env.WE_GITHUB_APP_ROLE;
+  env.WE_GITHUB_APP_ROLE = 'worker';
+  try { return await fn(); } finally { if (had) env.WE_GITHUB_APP_ROLE = prior; else delete env.WE_GITHUB_APP_ROLE; }
+}
 
 /** Start the owner session through the declared dispatch-lane sink. */
-export async function defaultDispatchOwner({ prompt, sessionSlug }) {
+export const defaultDispatchOwner = (request) => withWorkerRole(() => dispatchOwner(request));
+async function dispatchOwner({ prompt, sessionSlug }) {
   const io = await import('../operations/dispatch-lane-io.mjs');
   const { DISPATCH_EFFECT } = await import('../operations/dispatch-lane.mjs');
   const { dispatchModesFromEnv } = await import('../operations/dispatch-provider-registry.mjs');
@@ -306,8 +315,7 @@ export async function defaultDispatchOwner({ prompt, sessionSlug }) {
   const route = routeAvailableCiHeal({ scope: [], reason: 'main-red' });
   if (route?.outcome === 'refused') return { held: true, reason: route.refusal ?? 'route refused' };
   // A main fix has no PR: force the `claude --bg` brief path (the mechanical ci-heal wrapper needs a PR) and no probation worker.
-  const sinks = io.createDispatchSinks({ root: io.REPO_ROOT, modes: { ...dispatchModesFromEnv(), 'ci-heal': 'agent' }, extraArgs: io.agentArgsFromEnv(),
-    resolveSettingsEnv: workerRoleSettings(io.resolveDispatchSettingsEnv) });
+  const sinks = io.createDispatchSinks({ root: io.REPO_ROOT, modes: { ...dispatchModesFromEnv(), 'ci-heal': 'agent' }, extraArgs: io.agentArgsFromEnv() });
   const out = await sinks[DISPATCH_EFFECT]({
     launchKind: 'ci-heal', prompt, sessionSlug, lane: null, scope: [], pr: null, reason: 'main-red', repo: 'we',
     probationWorker: null, routing: route ? { ...route, probationWorker: null } : null,
