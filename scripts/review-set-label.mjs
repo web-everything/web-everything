@@ -131,6 +131,7 @@ import { logDelegationTrial } from './conveyor/log-delegation-trial.mjs';
 // than silently producing the row Fork 2 forbids.
 const FORBIDDEN_DELEGATION_TASK_TYPES = Object.freeze(['self-fix', 'other']);
 import { createGhProvider, writeOrder, PR_COMMENTS_PAGE_SIZE } from './lib/review-label-provider.mjs';
+import { isHumanOperatorComment } from './lib/operator-identity.mjs';
 // #x01u7az — the advisory:* label pair `clear-human` must strip: an advisory only means something on a
 // `review:human` PR (its own header), so a gate-self clearance that drops `review:human` must drop whichever
 // advisory label is still riding along, or the label reads as if an independent advisory endorsed a head
@@ -1252,6 +1253,15 @@ export function runReviewLabelCli({
     }
     if (!REPO_RE.test(repo)) {
       fail('invalid --repo — expected <owner/name>');
+    }
+  }
+
+  if (to === 'clear-human') {
+    let identity;
+    try { identity = provider.readPostingIdentity(repo); }
+    catch (e) { fail(`--to=clear-human could not read the posting identity: ${ghErr(e, 'identity unavailable')}; nothing was changed`); }
+    if (!isHumanOperatorComment({ author: identity })) {
+      fail('--to=clear-human requires the posting identity to be an allowlisted human operator; authenticate gh as the operator and remove automation GH_TOKEN/GITHUB_TOKEN overrides; nothing was changed');
     }
   }
 
