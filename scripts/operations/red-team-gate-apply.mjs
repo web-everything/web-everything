@@ -32,6 +32,7 @@ import { signalFixDispatch } from '../lib/fix-handoff.mjs';
  *     node scripts/operations/red-team-gate-apply.mjs --pr=<n> --repo=<owner/repo> [--dry-run]
  */
 import { readDrainQueueSafety, dequeueSentBack, sendBackReason } from '../lib/drain-queue-safety.mjs';
+import { readSavedRedTeamResult } from '../lib/drain-saved-red-team.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -39,6 +40,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  withholdUnpublishableFindings,
   GATE_OUTCOMES, gateRoundCap, gateRoundGrants, liveResultGateState, planRedTeamActions, readConfirmedBreaks, redTeamGateMarker,
 } from '../lib/red-team-gate.mjs';
 import { cleanFindingFile, qualifyLocusRefs, sanitizeCardField } from '../lib/review-loop-policy.mjs';
@@ -138,8 +140,19 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
     try { standingRuling = io.readGrantScope?.({ repo, pr, head, comments: view?.comments }) ?? null; } catch { standingRuling = null; }
     // The live head's latest result, and only the records that decide THAT result (an earlier same-head result's
     // records never dedup a newer one, PR #5482).
-    const { result: parsed, resultId, headReviewIndex, outcomes: recorded, sendBackOutcome, reopened } = liveResultGateState(view?.comments, pr, head, repo, standingRuling);
+    const posted = liveResultGateState(view?.comments, pr, head, null, repo, standingRuling);
+    const saved = posted.result ? null : (io.readSavedResult ?? readSavedRedTeamResult)({ repo, pr, head });
+    const { result, resultId, headReviewIndex, outcomes: recorded, sendBackOutcome, reopened } = saved ? liveResultGateState(view?.comments, pr, head, saved, repo, standingRuling) : posted;
+    let parsed = result;
     if (!parsed) return { status: 'no-red-team-on-head', head };
+    // Saved evidence may be precisely the result whose comment failed this scrub. Check raw fields
+    // before clipping, plus the composed comment/card (including scope) before any publication.
+    if (!posted.result) {
+      parsed = { ...parsed, findings: withholdUnpublishableFindings(parsed.findings, [
+        buildSendBackBody({ pr, head, findings: parsed.findings }),
+        ...Object.values(buildRedTeamCardInput({ repo, pr, head, findings: parsed.findings })),
+      ]) };
+    }
     const setting = io.readSetting();
     const plan = planRedTeamActions(parsed, setting.value);
     if (!plan.sendBack.length && !plan.card.length) return { status: 'advisory-only', head, plan };
@@ -247,6 +260,7 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
     // Fresh per run on the App identity: a closed or edited ruling stops crediting automatic grants at the next run.
     readGrantScope: ({ repo, pr, head, comments }) => standingRulingScope({ repo, pr: { number: Number(pr), headRefOid: head, comments } }),
     readSetting: () => readConfirmedBreaks({ env }),
+    readSavedResult: args => readSavedRedTeamResult({ ...args, env }),
     readRound: ({ repo, pr, head }) => readReviewRound({ repo, pr, head }),
     readRoundAsOf: ({ repo, pr, at, head }) => readReviewRoundAsOf({ repo, pr, at, head }),
     // The live head, read fresh and alone (the PR view above can be minutes old by the time a slow step finishes).

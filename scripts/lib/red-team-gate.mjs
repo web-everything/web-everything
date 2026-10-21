@@ -29,6 +29,7 @@ import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 
 import { parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
 import { parseLatestHumanClearedSha, REVIEWED_SHA_MARKER } from './review-escalation.mjs';
+import { scrubPublish } from './secret-scrub.mjs';
 import { roundExtensionGrants } from '../conveyor/round-extension-mark.mjs';
 
 // ── The comment the producer writes ─────────────────────────────────────────────────────────────────────────────
@@ -101,7 +102,7 @@ export function redTeamForHead(comments, pr, head) {
   const hits = (Array.isArray(comments) ? comments : [])
     .map((c, i) => ({ c, i, parsed: isTrustedMarkerAuthor(c) ? parseRedTeamComment(typeof c === 'string' ? c : c?.body) : null }))
     .filter((x) => x.parsed && x.parsed.pr === Number(pr) && x.parsed.rev === live)
-    .sort((a, b) => (Date.parse(a.c?.createdAt) || 0) - (Date.parse(b.c?.createdAt) || 0) || a.i - b.i);
+    .sort((a, b) => (commentTime(a.c) || 0) - (commentTime(b.c) || 0) || a.i - b.i);
   return hits.at(-1)?.parsed ?? null;
 }
 
@@ -344,6 +345,18 @@ export function redTeamQueueReason(pr, setting = CONFIRMED_BREAKS_DEFAULTS, { re
 }
 
 
+/**
+ * Saved (never-posted) findings publish only if every raw field, the extra composed outputs, and their NFKC forms pass
+ * the secret scrub; otherwise ALL their text is withheld, keeping index, confirmation and class. PURE.
+ */
+export const WITHHELD_FINDING_SUMMARY = '[finding text withheld: failed the secret scrub]';
+export function withholdUnpublishableFindings(findings, composed = []) {
+  const texts = [findings.flatMap(f => Object.values(f)).join('\n'), ...composed].map(String);
+  if (!texts.some(t => scrubPublish(t).length || scrubPublish(t.normalize('NFKC')).length)) return findings;
+  return findings.map(f => ({ index: f.index, confirmed: f.confirmed, impact: breakClass(f), category: 'withheld',
+    file: null, line: null, summary: WITHHELD_FINDING_SUMMARY }));
+}
+
 /** Confirmed send-back findings parked at the round cap on the live head, awaiting an operator ruling. PURE. */
 export function redTeamRulingNeeded(pr, setting = CONFIRMED_BREAKS_DEFAULTS, { repo = pr?.repo ?? null, standingRuling = pr?.standingRuling ?? null } = {}) {
   const disposition = readRedTeamDisposition({ comments: pr?.comments, pr: pr?.number, head: pr?.headRefOid, setting, repo, standingRuling });
@@ -389,19 +402,31 @@ const recordBody = r => String((typeof r.c === 'string' ? r.c : r.c?.body) ?? ''
 /** Thread order: creation time, then thread position. A record without a time takes the time of the record before it,
  * so the key is total (a sort never meets a contradiction). PURE. */
 const threadOrder = (a, b) => a.ts - b.ts || a.i - b.i;
-const indexedRecords = comments => {
+/** A comment's creation time in either read shape: GraphQL/`gh pr view` (`createdAt`) or the REST thread the drain reads (`created_at`). */
+export const commentTime = c => Date.parse(c?.createdAt ?? c?.created_at);
+const indexedRecords = (comments, savedResult = null) => {
   let ts = 0;
-  return threadRecords(comments).map((r, i) => {
-    const t = Date.parse(r.c?.createdAt);
+  const records = threadRecords(comments).map((r, i) => {
+    const t = commentTime(r.c);
     if (Number.isFinite(t)) ts = t;
     return { ...r, i, ts };
   });
+  if (savedResult) {
+    const savedAt = Date.parse(savedResult.scoredAt);
+    const times = records.map(r => commentTime(r.c));
+    const ordered = Number.isFinite(savedAt) && times.every((t, i) => Number.isFinite(t) && (!i || t >= times[i - 1]));
+    // Internal evidence is not a posted comment. Unknown chronology cannot establish a later operator ruling
+    // or bind a legacy marker; an explicit result id can still dedup the gate's own action.
+    const at = ordered ? records.reduce((at, r, i) => times[i] <= savedAt ? r.at : at, -1) + 0.5 : Infinity;
+    records.push({ c: null, at, i: at, ts: ordered ? savedAt : Infinity, parsed: savedResult, saved: true });
+  }
+  return records;
 };
 
 /** The newest trusted red-team result for this PR and head among the records, or null. PURE. */
 function latestResult(records, pr, sha) {
   if (!/^[0-9a-f]{40}$/.test(sha)) return null;
-  return records.map(r => ({ ...r, parsed: parseRedTeamComment(recordBody(r)) }))
+  return records.map(r => ({ ...r, parsed: r.parsed ?? parseRedTeamComment(recordBody(r)) }))
     .filter(r => r.parsed?.pr === Number(pr) && r.parsed.rev === sha).sort(threadOrder).at(-1) ?? null;
 }
 
@@ -426,9 +451,9 @@ function gateRecordsFor(records, pr, sha, hit) {
  * The live head's latest red-team result (carried ones included) and the outcomes the gate recorded for THAT result.
  * The gate dedups on this, so a record for an earlier same-head result never stops it deciding a newer one. PURE.
  */
-export function liveResultGateState(comments, pr, head, repo = null, standingRuling = null) {
+export function liveResultGateState(comments, pr, head, savedResult = null, repo = null, standingRuling = null) {
   const live = String(head ?? '').toLowerCase();
-  const records = indexedRecords(comments);
+  const records = indexedRecords(comments, savedResult);
   const hit = latestResult(records, pr, live);
   if (!hit) return { result: null, resultId: null, headReviewIndex: null, outcomes: new Set(), sendBackOutcome: null, reopened: false };
   const gates = gateRecordsFor(records, pr, live, hit);
@@ -459,7 +484,7 @@ function firstReviewIndex(records, pr, head) {
  * PURE.
  */
 function operatorRuled(records, pr, head) {
-  const trusted = records.filter(r => isTrustedMarkerAuthor(r.c));
+  const trusted = records.filter(r => r.saved || isTrustedMarkerAuthor(r.c));
   if (parseLatestHumanClearedSha(trusted.filter(r => !r.from).map(r => r.c)) !== head) return false;
   const lastAt = (rs, test) => rs.reduce((found, r) => (test(r) ? r : found), null);
   // Each carry removes its own comment and every later record, so even a cyclic head chain terminates.
@@ -474,6 +499,8 @@ function operatorRuled(records, pr, head) {
       && parseLatestHumanClearedSha([r.c]) === sha);
     // A clearance cannot approve a later send-back, even if an older/unknown grant snapshot leaves the cap winning.
     // This also keeps existing send-backs held while persisted grant identities migrate to a reader-independent key.
+    // (unfreeze-review-top-1021: the stack's `named` exception — a ruling standing before a later identical copy of a
+    // saved result — is dropped; the stricter rule wins, so such a copy needs the ruling again.)
     if (cap && cleared && cleared.at > result.at && gates.every(r =>
       ![GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK].includes(r.gate.outcome) || cleared.at > r.at)) return true;
     // A ruling inherited through a carry cannot approve this head's own later gate decisions.
@@ -518,9 +545,9 @@ function gateActionLines(body) {
  * finding. A carried result also keeps the actions bound to the result it was carried from (the same findings,
  * re-keyed); the newer head's own records win. An operator ruling releases only what the gate handed over (`held`).
  */
-export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env, repo = null, standingRuling = null } = {}) {
+export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env, savedResult = null, repo = null, standingRuling = null } = {}) {
   const live = String(head ?? '').toLowerCase();
-  const records = indexedRecords(comments);
+  const records = indexedRecords(comments, savedResult);
   const result = latestResult(records, pr, live)?.parsed ?? null;
   const plan = planRedTeamActions(result, setting ?? readConfirmedBreaks({ env }).value);
   const actions = new Map();
@@ -566,5 +593,5 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     if (action === 'held' && !ruled) held.push(f);
     if (action === 'send-back') sendBack.push(f);
   }
-  return { result, sendBack, held, since: capRecord?.createdAt ?? null, outcome };
+  return { result, sendBack, held, since: capRecord?.createdAt ?? capRecord?.created_at ?? null, outcome };
 }

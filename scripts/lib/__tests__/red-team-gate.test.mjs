@@ -4,9 +4,11 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  liveResultGateState, readRedTeamDisposition, redTeamResultId,
   CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, breakClass, gateOutcomeForHead, gateOutcomesForHead, parseRedTeamComment, planRedTeamActions,
   resolveRedTeamProbes, redTeamForHead, gateRoundCap, sendBackStepState, redTeamGateMarker, redTeamQueueReason, redTeamRulingNeeded, resolveConfirmedBreaks,
 } from '../red-team-gate.mjs';
+import { buildReviewedShaMarker, buildClearedHumanMarker } from '../review-escalation.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 
 const HEAD = 'ea117e881164c3b6366b0bb78a3660c9a00503b1';
@@ -261,5 +263,42 @@ describe('sendBackStepState — a grant after the cap reopens the send-back step
       .toEqual({ outcome: 'sent-back', reopened: false });
     expect(sendBackStepState([sent(2), rec('sent-back', 3), cap(4, [])], [1]))
       .toEqual({ outcome: 'sent-back', reopened: false });
+  });
+});
+
+
+describe('saved-result chronology', () => {
+  const pr = 7001, head = 'b'.repeat(40);
+  const saved = { pr, rev: head, scoredAt: '2026-10-17T10:00:00Z', findings: [
+    { index: 1, confirmed: true, impact: 'broken', summary: 'break' },
+  ] };
+  const cap = { author: { login: 'web-everything' }, createdAt: '2026-10-17T10:01:00Z', body: redTeamGateMarker(pr, head, 'round-cap') };
+  const cleared = { author: { login: 'web-everything' }, createdAt: '2026-10-17T10:02:00Z', body: [
+    '✅ review — `review:human` cleared via the sanctioned path', '',
+    'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '',
+    buildReviewedShaMarker(head), buildClearedHumanMarker('operator'),
+  ].join('\n') };
+  const rest = c => ({ user: c.author, created_at: c.createdAt, body: c.body });
+  it('reads REST timestamps for saved decisions and operator clearance', () => {
+    const read = comments => readRedTeamDisposition({ comments: comments.map(rest), pr, head, savedResult: saved, env: {} });
+    expect(read([cap])).toMatchObject({ held: [expect.objectContaining({ index: 1 })], since: cap.createdAt });
+    expect(read([cap, cleared]).held).toEqual([]);
+    expect(read([cap, { ...cleared, createdAt: '2026-10-17T09:00:00Z' }]).sendBack).toHaveLength(1);
+    expect(liveResultGateState([rest(cap)], pr, head, saved).sendBackOutcome).toBe('round-cap');
+  });
+  it('requires a new ruling for a later posted copy of the saved result', () => {
+    const posted = { author: { login: 'web-everything' }, createdAt: '2026-10-17T10:03:00Z',
+      body: renderRedTeamComment({ pr, rev: head, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+        findings: [{ summary: 'break', impactIfUnfixed: 'broken', confirmedByRecheck: true }] }) };
+    const identicalSaved = { ...parseRedTeamComment(posted.body), scoredAt: saved.scoredAt };
+    const namedCap = { ...cap, body: redTeamGateMarker(pr, head, 'round-cap', redTeamResultId(identicalSaved)) };
+    expect(readRedTeamDisposition({ comments: [namedCap, cleared], pr, head, savedResult: identicalSaved, env: {} }).held).toEqual([]);
+    expect(readRedTeamDisposition({ comments: [namedCap, cleared, posted], pr, head, env: {} }).held).toHaveLength(1);
+  });
+  it('sorts posted REST results by created_at', () => {
+    const comment = (at, summary) => rest({ ...cap, createdAt: at,
+      body: renderRedTeamComment({ pr, rev: head, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+        findings: [{ summary, impactIfUnfixed: 'broken', confirmedByRecheck: true }] }) });
+    expect(redTeamForHead([comment('2026-10-17T12:00:00Z', 'newer'), comment('2026-10-17T11:00:00Z', 'older')], pr, head).findings[0].summary).toBe('newer');
   });
 });

@@ -32,6 +32,7 @@ function fakeIo({ comments, labels = ['review:accepted'], head = HEAD, liveHead 
   const io = {
     readPr: () => ({ headRefOid: head, labels: labels.map((name) => ({ name })), comments }),
     readHead: () => liveHead,
+    readSavedResult: () => null,
     readSetting: () => ({ value: setting }),
     readRound: () => round,
     dequeueSentBack: () => ({ dequeued: false }),
@@ -49,6 +50,17 @@ const kinds = (calls) => calls.map((c) => c[0]);
 const namedGate = (outcome) => redTeamGateMarker(4722, HEAD, outcome).replace(/ -->$/, ' result=');
 
 describe('applyRedTeamGate', () => {
+  it('uses posted evidence without reading saved evidence', async () => {
+    const { io } = fakeIo({ comments: [comment([F()])], readSavedResult: () => { throw new Error('must not read saved'); } });
+    expect(await applyRedTeamGate({ repo: REPO, pr: 4722, dryRun: true }, io)).toMatchObject({ status: 'dry-run', outcome: 'sent-back' });
+  });
+
+  it('surfaces unreadable saved evidence before any write', async () => {
+    const { io, calls } = fakeIo({ comments: [], readSavedResult: () => { throw new Error('saved red-team evidence malformed'); } });
+    expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'error', reason: 'saved red-team evidence malformed' });
+    expect(calls).toEqual([]);
+  });
+
   it('broken → send-back through review-set-label + ledger event + gate record', async () => {
     const { io, calls } = fakeIo({ comments: [comment([F({ summary: 'two writers' })])] });
     const r = await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
