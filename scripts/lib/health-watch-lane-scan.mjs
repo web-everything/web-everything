@@ -12,7 +12,7 @@ import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { platformPreference, resolveCascade } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
-import { hasHiddenIndexFlags } from './git-transport-branch.mjs';
+import { hasHiddenIndexFlags, laneGitEnv } from './git-transport-branch.mjs';
 
 export function resolveLaneScanPolicy({ env = process.env,
   platform = platformPreference('healthWatch', { env }), tool = readDeclaredSettings().settings?.healthWatch,
@@ -71,7 +71,7 @@ export function freshLaneSafety({ path, exec = execFileSync, now = Date.now } = 
   const unsafe = (reason, error) => ({ hasUnsafeWork: true, fresh: true, observedAt, reason, ...(error ? { error } : {}) });
   if (typeof path !== 'string' || !path) return unsafe('no lane path');
   const git = argv => String(exec('git', argv, { cwd: path, encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024,
-    env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' }, stdio: ['ignore', 'pipe', 'pipe'] }));
+    env: { ...laneGitEnv(path), GIT_OPTIONAL_LOCKS: '0' }, stdio: ['ignore', 'pipe', 'pipe'] }));
   try {
     // Override Git config and .gitmodules ignore settings: submodule work must remain visible.
     const status = git(['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none']);

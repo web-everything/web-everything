@@ -12,6 +12,7 @@ import { createFileRunStore } from './run-store.mjs';
 import { idFromName } from '../backlog/id.mjs';
 import { readField } from '../backlog/frontmatter.mjs';
 import { cachedLaneScan } from '../lib/health-watch-lane-scan.mjs';
+import { laneGitEnv } from '../lib/git-transport-branch.mjs';
 import { probePid } from '../conveyor/reconcile-pass.mjs';
 
 /** Bind external reads, including subprocesses and clock, for fixture-only tests. */
@@ -24,7 +25,7 @@ export function createStaleStateReader({
 } = {}) {
   // Propagates to lane-pool's git children too: status must not refresh the index.
   const exec = (bin, argv, opts = {}) => run(bin, argv, {
-    ...opts, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+    ...opts, env: { ...laneGitEnv(opts.cwd ?? root), GIT_OPTIONAL_LOCKS: '0' },
     encoding: 'utf8', timeout: 120_000, maxBuffer: 32 * 1024 * 1024,
   });
   return () => {

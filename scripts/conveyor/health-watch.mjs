@@ -1089,6 +1089,13 @@ function archiveOptions(config, flags, now) {
     maxMoves: config.claudeJobsArchiveMaxMovesPerRun, timeBudgetMs: config.claudeJobsArchiveTimeBudgetMs };
 }
 
+/** Fixtures and bare dry runs cannot read or write the host lane-scan cache. */
+export function resolveLaneScanTarget(flags, dir, fixtureTick) {
+  const laneScanDir = flags['state-root'] ? dir
+    : (fixtureTick || flags['dry-run'] || Object.keys(flags).some(key => key.endsWith('-fixture'))) ? null : dir;
+  return { laneScanDir, laneScanWrite: !!laneScanDir };
+}
+
 /** One tick: probe, evaluate, diagnose, and persist. Returns the CLI summary. */
 export async function tick(flags = {}, { collectInventory = collectCredentialInventory, tmpSweepRun, ...deps } = {}) {
   const started = Date.now();
@@ -1301,8 +1308,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // this tick only consumes a finished job's result; otherwise it runs inline, exactly as before. A dry run or a
   // fixture tick never touches the host job store (a test supplies its own store through `deps.ghJobs`).
   // Fixtures without a state root and bare dry runs must never write the host cache.
-  const laneScanDir = flags['state-root'] ? dir : (fixtureTick || flags['dry-run'] || Object.keys(flags).some(key => key.endsWith('-fixture'))) ? null : dir;
-  const laneScanWrite = !!laneScanDir;
+  const { laneScanDir, laneScanWrite } = resolveLaneScanTarget(flags, dir, fixtureTick);
   const jobsAllowed = (!fixtureTick || !!deps.ghJobs) && !flags['dry-run'] && !flags['no-gh'];
   const ghJobsOn = jobsAllowed && resolveHealthJobSwitches(config).ghProbes;
   // Switched off with job state left behind (a rollback): still reconcile — reattach, consume, never queue — so an

@@ -4,6 +4,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { cachedLaneScan, resolveLaneScanPolicy, freshLaneSafety, guardLaneAction } from '../../lib/health-watch-lane-scan.mjs';
 import { createStaleStateReader } from '../stale-state-io.mjs';
+import { OPERATIONS } from '../run.mjs';
+import { laneGitEnv, worktreeGitEnv } from '../../lib/git-transport-branch.mjs';
+
+vi.mock('../stale-state-io.mjs', async original => {
+  const real = await original();
+  return { ...real, createStaleStateReader: vi.fn(real.createStaleStateReader) };
+});
 
 const dirs = [];
 const temp = () => { const dir = mkdtempSync(join(tmpdir(), 'health-lane-scan-')); dirs.push(dir); return dir; };
@@ -119,6 +126,34 @@ describe('cached lane safety is reporting only (operator ruling 2026-10-20)', ()
     expect(cached.map(row => row.ahead)).toEqual([null, null]);
     expect(cached[1].lane.clean).toBe(false);
   });
+  it('isolates both the lane-pool child and per-lane git reporting reads from inherited Git selectors', () => {
+    vi.stubEnv('GIT_DIR', '/foreign/clean');
+    const r = reader(temp(), [{ path: '/fixture/lane-1', clean: true, lease }], '0');
+    try {
+      r.read();
+      expect(r.run.mock.calls.map(([bin, , options]) => [bin === 'git', options.cwd, options.env.GIT_CEILING_DIRECTORIES]))
+        .toEqual([[false, '/fixture', '/'], [true, '/fixture/lane-1', '/fixture']]);
+      for (const [, , options] of r.run.mock.calls) {
+        expect(options.env).not.toHaveProperty('GIT_DIR');
+        expect(options.env.GIT_OPTIONAL_LOCKS).toBe('0');
+      }
+    } finally { vi.unstubAllEnvs(); }
+  });
+});
+
+describe('shared lane Git environment', () => {
+  it('strips every repository selector without changing the base or the transport credential role', () => {
+    const selectors = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY'];
+    const base = { ...Object.fromEntries(selectors.map(key => [key, '/foreign/clean'])),
+      GIT_CEILING_DIRECTORIES: '/foreign', WE_GITHUB_APP_ROLE: 'reader', PATH: '/bin' };
+    const env = laneGitEnv('/fixture/lane', base);
+    for (const key of selectors) {
+      expect(env).not.toHaveProperty(key);
+      expect(base[key]).toBe('/foreign/clean');
+    }
+    expect(env).toMatchObject({ GIT_CEILING_DIRECTORIES: '/fixture', WE_GITHUB_APP_ROLE: 'reader', PATH: '/bin' });
+    expect(worktreeGitEnv('/fixture/lane', base)).toEqual({ ...env, WE_GITHUB_APP_ROLE: 'ledger' });
+  });
 });
 
 describe('fresh per-lane safety check before any destructive action', () => {
@@ -166,6 +201,44 @@ describe('fresh per-lane safety check before any destructive action', () => {
       expect(options).toMatchObject({ cwd: '/l', encoding: 'utf8', timeout: 30_000 });
       expect(options.env.GIT_OPTIONAL_LOCKS).toBe('0');
     }
+  });
+  it.each(['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY'])(
+    'ignores inherited %s so a clean foreign repository cannot authorize a dirty lane', variable => {
+      vi.stubEnv(variable, '/foreign/clean');
+      const exec = vi.fn((bin, argv, options) => {
+        // Model a clean foreign repo masking edits in the lane selected by cwd.
+        if (argv[0] === 'status') return options.env[variable] ? '' : ' M tracked.txt\n';
+        if (argv[0] === 'ls-files') return 'H tracked.txt\n';
+        if (argv[0] === 'stash') return '';
+        if (argv[0] === 'rev-list') return '0\n';
+        throw new Error(`unexpected command: ${bin} ${argv.join(' ')}`);
+      });
+      gitMocks.push(exec);
+      try {
+        expect(freshLaneSafety({ path: '/l', exec })).toMatchObject({ hasUnsafeWork: true, reason: 'worktree has changes' });
+        for (const action of ['reclaim', 'reset', 'reuse', 'release-on-behalf']) {
+          expect(guardLaneAction({ path: '/l', action, exec, log: vi.fn() }).act).toBe(false);
+        }
+        for (const [, , options] of exec.mock.calls) {
+          expect(options.cwd).toBe('/l');
+          expect(options.env).not.toHaveProperty(variable);
+          expect(options.env.GIT_CEILING_DIRECTORIES).toBe('/');
+        }
+      } finally { vi.unstubAllEnvs(); }
+    });
+  it('sanitizes the environment of every git probe in a clean lane', () => {
+    const selectors = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY'];
+    for (const key of selectors) vi.stubEnv(key, '/foreign/clean');
+    const exec = git({ status: '', stash: '', 'rev-list': '0' });
+    try {
+      expect(freshLaneSafety({ path: '/fixture/lane', exec }).hasUnsafeWork).toBe(false);
+      expect(exec).toHaveBeenCalledTimes(commands.length);
+      for (const [, , options] of exec.mock.calls) {
+        for (const key of selectors) expect(options.env).not.toHaveProperty(key);
+        expect(options.env.GIT_CEILING_DIRECTORIES).toBe('/fixture');
+        expect(options.env.GIT_OPTIONAL_LOCKS).toBe('0');
+      }
+    } finally { vi.unstubAllEnvs(); }
   });
   it.each([
     { work: 'only an untracked file', status: '?? dir/new.mjs\n', count: '0\n', reason: 'worktree has changes' },
@@ -244,6 +317,34 @@ describe('fresh per-lane safety check before any destructive action', () => {
     expect(guardLaneAction({ path: '/l', action: 'reset', check: () => { throw new Error('boom'); }, log }).act).toBe(false);
     expect(guardLaneAction({ path: '/l', action: 'reset', check: () => ({ hasUnsafeWork: false }), log }).act).toBe(false);
     expect(guardLaneAction({ path: '/l', action: 'reset', exec: git({ status: '', stash: '', 'rev-list': '0' }), log }).act).toBe(true);
+  });
+});
+
+describe('stale-state operation factory cache opt-in', () => {
+  it.each([
+    { enabled: undefined, dir: '/cache', write: '1', laneScan: undefined },
+    { enabled: '', dir: '/cache', write: '1', laneScan: undefined },
+    { enabled: '0', dir: '/cache', write: '1', laneScan: undefined },
+    { enabled: 'true', dir: '/cache', write: '1', laneScan: undefined },
+    { enabled: '1', dir: '/cache', write: '1', laneScan: { dir: '/cache', write: true } },
+    { enabled: '1', dir: '', write: '', laneScan: { dir: undefined, write: false } },
+    { enabled: '1', dir: undefined, write: undefined, laneScan: { dir: undefined, write: false } },
+    { enabled: '1', dir: '/cache', write: '0', laneScan: { dir: '/cache', write: false } },
+  ])('passes laneScan=$laneScan for enabled=$enabled, dir=$dir, write=$write', ({ enabled, dir, write, laneScan }) => {
+    for (const [key, value] of Object.entries({
+      WE_HEALTH_WATCH_LANE_SCAN: enabled,
+      WE_HEALTH_WATCH_LANE_SCAN_DIR: dir,
+      WE_HEALTH_WATCH_LANE_SCAN_WRITE: write,
+    })) {
+      vi.stubEnv(key, value ?? '');
+      if (value === undefined) delete process.env[key];
+    }
+    createStaleStateReader.mockClear();
+    try {
+      OPERATIONS['stale-state']();
+      expect(createStaleStateReader).toHaveBeenCalledTimes(1);
+      expect(createStaleStateReader).toHaveBeenCalledWith({ laneScan });
+    } finally { vi.unstubAllEnvs(); }
   });
 });
 
