@@ -581,7 +581,6 @@ export function resolveReferralHoldAutoResolve(env = process.env, { tool, log } 
     return { value, sources };
   } catch { return standard; }
 }
-const RULING_RESULTS = new Set(['block', 'card', 'not-real']);
 const findingLoc = f => `${f?.file ?? 'no file'}${Number.isInteger(f?.line) ? `:${f.line}` : ''}`;
 
 /**
@@ -631,36 +630,25 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
     const state = referralRecordState(record, { repo, pr: Number(pr.number), head, body: typeof pr.body === 'string' ? pr.body : '',
       createdAt: pr.createdAt, cardReadable, records: live.records, operatorRulings: live.operatorRulings });
     if (state.pending.length) return stay(`the live-head record ${record.runId} still holds ${state.pending.length} finding(s) pending`);
+    // THE GATE DECIDES. `referralRecordState` (the acceptance gate's own reader) has already settled every active
+    // referral of this live-head record: pending (returned above), blocked, or cleared by a ruling it counted (the
+    // record's own, the operator's pinned to this head, a carry it backed, or a backed supersession). Its flattened
+    // `rulings` list cannot be mapped back to findings (a carry backing is keyed by its SOURCE finding, which can
+    // collide with a live finding), so it is read only to NAME the kind and who ruled; it never decides.
+    const blockedKeys = new Set(state.blocked);
     for (const f of activeReferrals(record)) {
-      let ruling = state.rulings.filter(r => r.key === f.key).at(-1);
-      // A carry the gate backed returns the SOURCE finding's ruling, keyed by the source key (`carried.from.key`).
-      const carry = (record.carried ?? []).find(c => c.key === f.key);
-      // Like the gate, an UNCOUNTED local ruling (say an unreadable card) leaves the carry deciding.
-      if (!ruling && carry) {
-        ruling = state.rulings.filter(r => r.key === carry.from?.key).at(-1);
-      }
       const where = { file: f.finding?.file ?? null, line: Number.isInteger(f.finding?.line) ? f.finding.line : null };
-      // A `superseded` entry the gate backed (a same-head not-real on the finding that replaced it) clears the finding
-      // without adding a ruling of its own: it reads as that not-real. The gate already refused an unbacked one.
-      if (!ruling && !(record.rulings ?? []).some(r => r.key === f.key) && (record.superseded ?? []).some(s => s.key === f.key)) {
-        ruling = { key: f.key, result: 'not-real', superseded: true };
-      }
-      // The gate's own `blocked` list decides block-or-clear (flattened ruling keys can collide: a carry backing is keyed
-      // by its SOURCE finding, which may also be a live-head finding). The ruling found above only names the clearing
-      // kind (card / not-real) and who ruled; a disagreement with the gate is never resolved, it stays paused.
-      const gateBlocked = state.blocked.includes(f.key);
-      if (gateBlocked) {
-        ruling = state.rulings.filter(r => r.key === f.key && r.result === 'block').at(-1) ?? { key: f.key, result: 'block' };
-      }
-      if (!ruling) return stay(`finding ${findingLoc(where)} has no readable ruling on the live head`);
-      if (!RULING_RESULTS.has(ruling.result)) return stay(`finding ${findingLoc(where)} carries an unknown ruling (${ruling.result})`);
-      if (!gateBlocked && ruling.result === 'block') return stay(`finding ${findingLoc(where)}: the gate clears it but its ruling reads block (reader disagreement)`);
-      // An operator ruling counts only on the exact head it names, unless it is the backing of a carry the gate
-      // accepted onto THIS head's record (the carry entry is the live-head proof; the backing names its source head).
-      if (ruling.operator && ruling.head !== head && !carry) return stay(`finding ${findingLoc(where)} is ruled for a different head (${String(ruling.head).slice(0, 9)})`);
+      const own = state.rulings.filter(r => r.key === f.key);
+      const carry = (record.carried ?? []).find(c => c.key === f.key);
+      const named = blockedKeys.has(f.key)
+        ? own.filter(r => r.result === 'block').at(-1) ?? { result: 'block' }
+        : own.filter(r => r.result === 'card' || r.result === 'not-real').at(-1)
+          ?? (carry && (carry.result === 'card' || carry.result === 'not-real') ? { result: carry.result, carried: true } : null)
+          ?? ((record.superseded ?? []).some(x => x.key === f.key) ? { result: 'not-real', superseded: true } : null)
+          ?? { result: 'cleared' };
       findings.push({ runId: record.runId, key: f.key, seat: f.seat ?? null, ...where,
-        summary: String(f.finding?.summary ?? '').replace(/\s+/g, ' ').trim(), result: ruling.result,
-        actor: ruling.operator ? ruling.actor : 'reviewer', rationale: ruling.rationale ?? ruling.reason ?? '' });
+        summary: String(f.finding?.summary ?? '').replace(/\s+/g, ' ').trim(), result: blockedKeys.has(f.key) ? 'block' : named.result,
+        actor: named.operator ? named.actor : 'reviewer', rationale: named.rationale ?? named.reason ?? '' });
     }
   }
   if (!findings.length) return stay('the live-head records name no active referral');
