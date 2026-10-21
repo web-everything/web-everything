@@ -1260,6 +1260,7 @@ require(${JSON.stringify(shim)});
     [{}, ['corp-alias']],
     [{}, ['extension', 'exec', 'corp-tool']],
     [{}, ['pr', '-Rgithub.corp.example/web-everything/repo', 'list']],
+    [{ GH_HOST: 'github.com', GH_REPO: 'web-everything/repo' }, ['repo', '--json', 'name', 'view', 'enterprise/owner/repo']],
     [{}, ['pr', 'list', '--repo=https://api.github.com/web-everything/repo']],
     [{}, ['pr', 'list', '--repo=https://github.com:443/web-everything/repo']],
     [{}, ['pr', 'list', '--repo=https://%67ithub.com/web-everything/repo']],
@@ -1279,6 +1280,14 @@ require(${JSON.stringify(shim)});
     ['pr', 'list', '-Rgithub.corp.example/web-everything/repo'],
     ['repo', 'view', 'enterprise/owner/repo'],
     ['repo', 'view', 'git@enterprise:owner/repo'],
+    // PR #5729 red team: cobra finds the subcommand after skipping options and empty arguments.
+    ['repo', '--json', 'name', 'view', 'enterprise/owner/repo'],
+    ['repo', '-q', '.name', 'view', 'enterprise/owner/repo'],
+    ['repo', '', 'view', 'enterprise/owner/repo'],
+    ['', 'repo', 'view', 'enterprise/owner/repo'],
+    ['label', '--json', 'name', 'clone', 'enterprise/owner/repo'],
+    ['issue', '--json', 'number', 'transfer', '1', 'enterprise/owner/repo'],
+    ['repo', 'view', '--', '-enterprise/owner/repo'],
   ])('refuses enterprise hosts before using a fresh public App cache: %j', (...argv) => {
     const f = fixture({ fresh: true });
     try {
@@ -1352,6 +1361,8 @@ require(${JSON.stringify(shim)});
     ['pr', 'comment', '123', '-bRenterprise/owner/repo'],
     ['pr', 'comment', '123', '-ebRenterprise/owner/repo'],
     ['api', 'repos/web-everything/repo/issues'],
+    ['api', '-X', 'GET', 'repos/web-everything/repo'],
+    ['browse', '-n', '-R', 'web-everything/repo'],
     ['pr', 'comment', '123', '--body', 'enterprise/owner/repo'],
     ['pr', 'comment', '123', '--body', 'git@enterprise:owner/repo'],
     ['pr', 'comment', '123', '-R', 'web-everything/web-everything', '--body', 'https://docs.example.com'],

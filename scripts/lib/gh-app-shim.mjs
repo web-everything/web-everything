@@ -630,7 +630,12 @@ function unsupportedTargetHost(argv, env) {
     'config', 'extension', 'ext', 'gist', 'gpg-key', 'help', 'issue', 'label', 'org', 'pr', 'project', 'release',
     'repo', 'ruleset', 'run', 'search', 'secret', 'ssh-key', 'status', 'variable', 'workflow'];
   if (argv[0] && !argv[0].startsWith('-') && !nativeCommands.includes(argv[0])) return 'unknown command or alias';
-  if (argv[0]?.startsWith('-') && argv.length > 1) return 'ambiguous command';
+  // cobra finds each command level after skipping options (and the next argument of an option it does
+  // not know) and empty arguments: \`repo --json name view x\` and \`'' repo view x\` both run repo view.
+  // The checks below read the command from fixed positions, so only a leading command word classifies it.
+  if ((argv[0] === '' || argv[0]?.startsWith('-')) && argv.length > 1) return 'ambiguous command';
+  if (!['api', 'browse', 'completion', 'help', 'status'].includes(argv[0]) && argv.length > 1
+    && (argv[1] === '' || argv[1].startsWith('-'))) return 'ambiguous command';
   if (['extension', 'ext'].includes(argv[0]) && argv[1] === 'exec') return 'extension execution';
   // Other auth commands read, write or validate stored per-account credentials (git-credential also
   // takes its host from stdin). \`auth status\` is pinned to the active App token by appTokenArgv.
@@ -733,8 +738,19 @@ function unsupportedTargetHost(argv, env) {
     'auth status': 'at',
   }[command] || (argv[0] === 'browse' ? 'anprsw' : '');
   let cloneSourceSeen = false;
+  let positionalsOnly = false; // after \`--\`, gh reads -x/o/r as a repository argument, not an option
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
+    if (!positionalsOnly && a === '--') { positionalsOnly = true; continue; }
+    if (positionalsOnly) {
+      const repositoryTarget = repositoryPositionals && (command !== 'repo clone' || !cloneSourceSeen);
+      if (repositoryTarget && command === 'repo clone') cloneSourceSeen = true;
+      if (targetCommand && (repositoryTarget || /^[a-z][a-z0-9+.-]*:[/][/]/i.test(a))) {
+        const host = repoHost(a, argv[0] === 'api');
+        if (host) return host;
+      }
+      continue;
+    }
     // pflag permits boolean bundles before a value flag: -cRhost/o/r, -fsHOST/o/r, -ahHOST.
     // A known content flag consumes the remainder, so -bRhost/o/r stays body text.
     if (a.startsWith('-') && !a.startsWith('--')) {
