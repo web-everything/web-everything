@@ -4,13 +4,81 @@
  */
 import { describe, it, expect } from 'vitest';
 import { spawn } from 'node:child_process';
-import { descendantPids, killProcessTree } from '../bounded-child.mjs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { descendantPids, killProcessTree, markedPidsFromPs, peerHolderPids, startTreeWatchdog } from '../bounded-child.mjs';
+import { keepAliveScript } from '../test-keepalive.mjs';
 
 describe('descendantPids', () => {
   it('returns every descendant, deepest first, excluding the root and unrelated processes', () => {
     const ps = ['1 0', '10 1', '11 10', '12 11', '13 10', '20 1', ' 14   12 ', 'junk', '15 15'].join('\n');
     expect(descendantPids(10, ps)).toEqual([14, 12, 11, 13]);
     expect(descendantPids(99, ps)).toEqual([]);
+  });
+});
+
+describe('escaped-descendant listings (PR #5768)', () => {
+  it('markedPidsFromPs matches the exact NAME=value word, never self, init, or a longer value', () => {
+    const ps = ['  1 launchd M_1=abc', '42 node x.js PATH=/bin M_1=abc HOME=/h', '43 node M_1=abcd', '44 grep M_1=ab',
+      '50 node M_1=abc', '45 sleep 120', 'junk', '46 node M_1=abc'].join('\n');
+    expect(markedPidsFromPs(ps, 'M_1=abc', { selfPid: 50 })).toEqual([42, 46]);
+  });
+
+  it('peerHolderPids returns the holders of the peer ends of the given fds only', () => {
+    // Self (50) holds fd 15 → peer 0xaa and fd 17 → peer 0xbb; fd 20 → 0xcc is not asked for.
+    const lsof = ['p50', 'f15', 'd0xF0', 'n->0xAA', 'f17', 'd0xf1', 'n->0xbb', 'f20', 'd0xf2', 'n->0xcc',
+      'p60', 'f1', 'd0xaa', 'n->0xf0', 'f2', 'd0xbb', 'n->0xf1',
+      'p61', 'f2', 'd0xbb', 'n->0xf1',
+      'p62', 'f1', 'd0xcc', 'n->0xf2',
+      'p63', 'f4', 'd0xdd', 'n->(none)',
+      'p1', 'f9', 'd0xaa', 'n->0xf0'].join('\n');
+    expect(peerHolderPids(lsof, { selfPid: 50, fds: [15, 17] })).toEqual([60, 61]);
+    expect(peerHolderPids(lsof, { selfPid: 50, fds: [] })).toEqual([]);
+    expect(peerHolderPids('', { selfPid: 50, fds: [15] })).toEqual([]);
+  });
+});
+
+describe('startTreeWatchdog (PR #5768)', () => {
+  it('kills the tree from its own thread while the main thread is blocked, and heartbeats only until then', async () => {
+    const child = spawn(process.execPath, ['-e', keepAliveScript()], { stdio: 'ignore' });
+    const exited = new Promise((r) => child.once('exit', (code, signal) => r(signal)));
+    const dir = mkdtempSync(join(tmpdir(), 'tree-watchdog-'));
+    const beats = join(dir, 'beats.log');
+    const beatModule = join(dir, 'beat.mjs');
+    writeFileSync(beatModule, `import { appendFileSync } from 'node:fs';\nexport const beat = ({ file }) => appendFileSync(file, 'b');\n`);
+    try {
+      const fired = [];
+      const watchdog = startTreeWatchdog({ pid: child.pid, timeoutMs: 600, onFire: () => fired.push(Date.now()),
+        heartbeat: { module: pathToFileURL(beatModule).href, exportName: 'beat', args: { file: beats }, everyMs: 100 } });
+      const blockUntil = Date.now() + 1_500;
+      while (Date.now() < blockUntil) { /* a blocked event loop: no main-thread timer can run */ }
+      expect(watchdog.fired()).toBe(true);
+      expect(await exited).toBe('SIGKILL');
+      const beatsAtKill = readFileSync(beats, 'utf8').length;
+      expect(beatsAtKill).toBeGreaterThan(0);
+      await new Promise((r) => setTimeout(r, 400));
+      expect(fired).toHaveLength(1);
+      expect(readFileSync(beats, 'utf8').length).toBe(beatsAtKill);
+      watchdog.stop();
+    } finally {
+      try { child.kill('SIGKILL'); } catch { /* gone */ }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('stop() before the ceiling disarms it', async () => {
+    const child = spawn(process.execPath, ['-e', keepAliveScript()], { stdio: 'ignore' });
+    try {
+      const watchdog = startTreeWatchdog({ pid: child.pid, timeoutMs: 300 });
+      watchdog.stop();
+      await new Promise((r) => setTimeout(r, 700));
+      expect(watchdog.fired()).toBe(false);
+      expect(() => process.kill(child.pid, 0)).not.toThrow();
+    } finally {
+      child.kill('SIGKILL');
+    }
   });
 });
 
@@ -28,6 +96,18 @@ describe('killProcessTree', () => {
     const ps = ['10 5 77', '11 10 77', '40 1 77', '41 1 99', '77 1 77', '50 1 77'].join('\n');
     killProcessTree(10, 'SIGKILL', { orphansOfGroup: 77, selfPid: 50, listProcesses: () => ps, kill: (pid) => sent.push(pid) });
     expect(sent).toEqual([40, 11, 10]);
+  });
+
+  it('also kills escaped descendants found by the env marker and by the caller output pipes, never self or init', () => {
+    const sent = [];
+    const asked = {};
+    killProcessTree(10, 'SIGKILL', { selfPid: 50, marker: 'M_1=abc', outputFds: [15],
+      listProcesses: () => '10 5 77\n11 10 77\n',
+      listMarked: (m) => { asked.marker = m; return [60, 50, 1, 11]; },
+      listPeerHolders: (fds) => { asked.fds = fds; return [61, 60]; },
+      kill: (pid) => sent.push(pid) });
+    expect(asked).toEqual({ marker: 'M_1=abc', fds: [15] });
+    expect(sent).toEqual([11, 10, 60, 61]); // the tree first: the escape listings are slow
   });
 
   it('kills a real grandchild that a plain child.kill() would orphan', async () => {

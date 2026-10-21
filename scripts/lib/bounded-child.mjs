@@ -17,6 +17,8 @@
  * Nothing in-process can cover that case. The timeout still bounds how long they can run.
  */
 import { spawn, execFileSync } from 'node:child_process';
+import { readdirSync, readFileSync } from 'node:fs';
+import { Worker } from 'node:worker_threads';
 
 /** Default hard ceiling for one child call — generous against a slow real pool, but never "forever". */
 export const DEFAULT_CHILD_TIMEOUT_MS = 5 * 60 * 1000;
@@ -188,8 +190,10 @@ export function descendantPids(rootPid, psText) {
  * unless it is the group's launchd-started leader, which is excluded along with the caller.
  * @returns {number[]} the pids signalled
  */
-export function killProcessTree(rootPid, signal = 'SIGKILL', { orphansOfGroup = null, selfPid = process.pid,
-  listProcesses = () => execFileSync('ps', ['-A', '-o', 'pid=,ppid=,pgid='], { encoding: 'utf8', timeout: 10_000 }), kill = process.kill.bind(process) } = {}) {
+export function killProcessTree(rootPid, signal = 'SIGKILL', { orphansOfGroup = null, selfPid = process.pid, marker = null, outputFds = [],
+  listProcesses = () => execFileSync('ps', ['-A', '-o', 'pid=,ppid=,pgid='], { encoding: 'utf8', timeout: 10_000 }),
+  listMarked = (m) => listMarkedPids(m, { selfPid }), listPeerHolders = (fds) => listPeerHolderPids(fds, { selfPid }),
+  kill = process.kill.bind(process) } = {}) {
   if (!Number.isInteger(rootPid) || rootPid <= 0) return [];
   let tree = [];
   let orphans = [];
@@ -204,10 +208,136 @@ export function killProcessTree(rootPid, signal = 'SIGKILL', { orphansOfGroup = 
     }
   } catch { /* ps unavailable: still kill the root */ }
   const signalled = [];
-  for (const pid of [...orphans, ...tree, rootPid]) {
+  const send = (pid) => {
+    if (signalled.includes(pid) || (pid !== rootPid && (!Number.isInteger(pid) || pid <= 1 || pid === selfPid))) return;
     try { kill(pid, signal); signalled.push(pid); } catch { /* already gone */ }
-  }
+  };
+  for (const pid of [...orphans, ...tree, rootPid]) send(pid);
+  // PR #5768 — a descendant that left BOTH the tree and the group (detached into its own session, reparented to init)
+  // is still provably ours by what it inherited: the per-run env `marker`, or the caller's output pipes (`outputFds`).
+  // Swept AFTER the tree is down: these listings are slow (`lsof`, `ps -E`), and the tree must not wait for them.
+  if (typeof marker === 'string' && marker.includes('=')) { try { listMarked(marker).forEach(send); } catch { /* best-effort */ } }
+  if (outputFds.length) { try { listPeerHolders(outputFds).forEach(send); } catch { /* best-effort */ } }
   return signalled;
+}
+
+/**
+ * Pids whose environment carries `marker` (`NAME=value`), from a darwin `ps -A -ww -E -o pid=,command=` listing (the
+ * environment is printed after the arguments). Pure. LIMIT: macOS hides a platform binary's environment (`/bin/sleep`),
+ * so such a process is only found here on Linux; on darwin it is found by its inherited output pipe, if it kept one.
+ */
+export function markedPidsFromPs(psText, marker, { selfPid = process.pid } = {}) {
+  const out = [];
+  for (const line of String(psText || '').split('\n')) {
+    const m = /^\s*(\d+)\s(.*)$/.exec(line);
+    const pid = m ? Number(m[1]) : NaN;
+    if (pid > 1 && pid !== selfPid && ` ${m[2]} `.includes(` ${marker} `)) out.push(pid);
+  }
+  return out;
+}
+
+/** Every live pid (not `selfPid`, never init) whose environment carries `marker`: `/proc/<pid>/environ` on Linux, `ps -E` on darwin. */
+export function listMarkedPids(marker, { selfPid = process.pid, platform = process.platform } = {}) {
+  if (platform === 'darwin') {
+    return markedPidsFromPs(execFileSync('ps', ['-A', '-ww', '-E', '-o', 'pid=,command='], { encoding: 'utf8', timeout: 10_000, maxBuffer: 256 << 20 }), marker, { selfPid });
+  }
+  if (platform !== 'linux') return [];
+  const out = [];
+  for (const name of readdirSync('/proc')) {
+    const pid = /^\d+$/.test(name) ? Number(name) : NaN;
+    if (!(pid > 1) || pid === selfPid) continue;
+    try { if (readFileSync(`/proc/${name}/environ`, 'latin1').split('\0').includes(marker)) out.push(pid); } catch { /* gone or not ours */ }
+  }
+  return out;
+}
+
+/**
+ * Pids other than `selfPid` holding the PEER end of one of `fds` (this process's ends of the socket pairs a child's
+ * stdio was created on), from an `lsof -U -F pfdn` listing: `p<pid>`, then per fd `f<fd>`, `d<this end>`, `n-><peer end>`.
+ * A process holding that peer end can write into the caller's output pipe — it inherited it. Pure.
+ */
+export function peerHolderPids(lsofText, { selfPid = process.pid, fds = [] } = {}) {
+  const wanted = new Set(fds.map(Number));
+  const entries = [];
+  let pid = null;
+  let cur = null;
+  for (const line of String(lsofText || '').split('\n')) {
+    const value = line.slice(1);
+    if (line[0] === 'p') { pid = Number(value); cur = null; }
+    else if (line[0] === 'f') { cur = { pid, fd: Number(value), dev: null, peer: null }; entries.push(cur); }
+    else if (line[0] === 'd' && cur) cur.dev = value.toLowerCase();
+    else if (line[0] === 'n' && cur) cur.peer = /^->0x[0-9a-f]+$/i.test(value) ? value.slice(2).toLowerCase() : null;
+  }
+  const peers = new Set(entries.filter((e) => e.pid === selfPid && wanted.has(e.fd) && e.peer).map((e) => e.peer));
+  return [...new Set(entries.filter((e) => e.pid > 1 && e.pid !== selfPid && peers.has(e.dev)).map((e) => e.pid))];
+}
+
+/** darwin: the holders of the peer ends of `fds` (an `lsof -U` scan of this user's processes, ~1s). Elsewhere: none —
+ *  Linux shows no socket peers there, and the env marker already finds every descendant on Linux. */
+export function listPeerHolderPids(fds, { selfPid = process.pid, platform = process.platform } = {}) {
+  if (platform !== 'darwin' || !fds.length) return [];
+  const uid = process.getuid?.();
+  let text;
+  // lsof exits 1 when one process could not be read; its listing of the rest is still valid.
+  try { text = execFileSync('lsof', ['-n', '-P', '-w', '-U', ...(Number.isInteger(uid) ? ['-a', '-u', String(uid)] : []), '-F', 'pfdn'], { encoding: 'utf8', timeout: 20_000, maxBuffer: 256 << 20 }); }
+  catch (e) { text = typeof e?.stdout === 'string' ? e.stdout : ''; }
+  return peerHolderPids(text, { selfPid, fds });
+}
+
+const WATCHDOG_SOURCE = `const { workerData, parentPort } = require('node:worker_threads');
+import(workerData.module).then((m) => m.runTreeWatchdog(workerData, parentPort));`;
+
+function fireTreeKill({ pid, kill, flag }) {
+  Atomics.store(flag, 0, 1);
+  const pgid = kill.orphansOfOwnGroup ? ownProcessGroup() : null;
+  // Orphans of this group only when this process LEADS it (every member is then provably ours).
+  killProcessTree(pid, 'SIGKILL', { orphansOfGroup: pgid === process.pid ? pgid : null, marker: kill.marker ?? null, outputFds: kill.outputFds ?? [] });
+}
+
+/** Worker entry of {@link startTreeWatchdog}. Not for direct use. */
+export async function runTreeWatchdog({ pid, deadline, kill, heartbeat, flag }, port) {
+  let beat = null;
+  setTimeout(() => {
+    clearInterval(beat);
+    fireTreeKill({ pid, kill, flag });
+    port.postMessage('fired');
+  }, Math.max(0, deadline - Date.now()));
+  if (heartbeat) {
+    const fn = (await import(heartbeat.module))[heartbeat.exportName];
+    if (Atomics.load(flag, 0) === 0) beat = setInterval(() => { try { fn(heartbeat.args); } catch { /* best-effort */ } }, heartbeat.everyMs);
+  }
+}
+
+/**
+ * Arm a hard ceiling for child `pid` on its OWN thread (PR #5768). The caller forwards the child's output with
+ * synchronous writes, so a reader that stops reading blocks the caller's event loop, and a main-thread timer (or slot
+ * heartbeat) would never run. At the ceiling the worker kills the tree (with `kill`: `{ orphansOfOwnGroup, marker,
+ * outputFds }`, see {@link killProcessTree}), sets `fired()`, and posts to `onFire` (which runs once the caller's loop
+ * is free). `heartbeat` (`{ module, exportName, args, everyMs }`) is called on that thread until the ceiling, then
+ * stops, so a caller still stuck after the kill no longer keeps its slot. If the worker cannot run, the same ceiling
+ * falls back to a main-thread timer. Unref'd; `stop()` ends it.
+ * @returns {{ fired: () => boolean, stop: () => void }}
+ */
+export function startTreeWatchdog({ pid, timeoutMs, kill = {}, heartbeat = null, onFire = () => {} }) {
+  const flag = new Int32Array(new SharedArrayBuffer(4));
+  const deadline = Date.now() + timeoutMs;
+  let fallback = null;
+  let stopped = false;
+  const fire = () => { if (!stopped && Atomics.load(flag, 0) === 0) { fireTreeKill({ pid, kill, flag }); onFire(); } };
+  let worker = null;
+  try {
+    worker = new Worker(WATCHDOG_SOURCE, { eval: true, workerData: { module: import.meta.url, pid, deadline, kill, heartbeat, flag } });
+    worker.on('message', (m) => { if (m === 'fired' && !stopped) onFire(); });
+    worker.on('error', () => { if (!stopped && !fallback) { fallback = setTimeout(fire, Math.max(0, deadline - Date.now())); fallback.unref(); } });
+    worker.unref();
+  } catch {
+    fallback = setTimeout(fire, timeoutMs);
+    fallback.unref();
+  }
+  return {
+    fired: () => Atomics.load(flag, 0) === 1,
+    stop: () => { stopped = true; clearTimeout(fallback); worker?.terminate().catch(() => {}); },
+  };
 }
 
 /** This process's process-group id (null when `ps` cannot say). */

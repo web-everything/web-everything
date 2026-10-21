@@ -86,7 +86,8 @@ import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRe
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
-import { killProcessTree, ownProcessGroup } from './lib/bounded-child.mjs';
+import { startTreeWatchdog } from './lib/bounded-child.mjs';
+import { randomBytes } from 'node:crypto';
 import { summarizeSelection, selectionNotice, verdictNotice } from './lib/verify-selection-log.mjs';
 
 // ── tiny arg parsing (matches push-if-green.mjs / lane-pool.mjs) ─────────────────────────────────────
@@ -586,6 +587,9 @@ const PHASE_TIMEOUT_MS = verifySetting('phaseTimeoutMs', process.env);
 const PHASE_TIMEOUT_SOURCE = verifySettingSource('phaseTimeoutMs', process.env);
 process.stderr.write(`verify-lane: phase timeout ${PHASE_TIMEOUT_MS}ms (phaseTimeoutMs, ${PHASE_TIMEOUT_SOURCE})\n`);
 let phaseTimeout = null;
+// Named per verify-lane process, so a nested verify-lane (a test of this file) adds its own marker instead of replacing ours.
+const GATE_PHASE_MARKER_ENV = `WE_VERIFY_GATE_PHASE_${process.pid}`;
+const HEAVY_ADMISSION_MODULE = new URL('./readiness/heavy-admission.mjs', import.meta.url).href;
 
 // 3. Run the gate in the FOREGROUND, waiting until it exits (forwarded stdio — the agent sees the output live).
 // #3383 (Skeptic review, 2026-09-14) — an UNCONDITIONAL marker, unlike the two admission log lines above
@@ -614,8 +618,12 @@ async function runGate(command, args) {
   let bytes = 0;
   // xaipsbs — the gate's own `npm run test:unit` / `check:standards` are wrapped in `heavy-admission.mjs run`;
   // this flag makes those nested wrappers pass through instead of asking for a second slot for the same work.
+  // PR #5768 — a per-phase env marker every descendant inherits: the watchdog finds one that left the tree AND the group by it.
+  const phaseToken = randomBytes(8).toString('hex');
+  const phaseMarker = `${GATE_PHASE_MARKER_ENV}=${phaseToken}`;
   const result = await new Promise((resolveGate, reject) => {
-    const child = spawn(command, args ?? [], { shell: !args, cwd: REPO, stdio: ['inherit', 'pipe', 'pipe'], env: { ...process.env, [ADMISSION_HELD_ENV]: '1' } });
+    const child = spawn(command, args ?? [], { shell: !args, cwd: REPO, stdio: ['inherit', 'pipe', 'pipe'],
+      env: { ...process.env, [ADMISSION_HELD_ENV]: '1', [GATE_PHASE_MARKER_ENV]: phaseToken } });
     for (const [name, fd] of [['stdout', 1], ['stderr', 2]]) {
       child[name].setEncoding('utf8');
       child[name].on('data', chunk => {
@@ -628,34 +636,44 @@ async function runGate(command, args) {
     }
     // verify-admission — kill the phase's whole process TREE on the ceiling (shell → npm exec → vitest → esbuild).
     // The child stays in this process's group, so a supervisor's group kill of verify-lane still reaches it.
-    let timedOut = false;
+    // PR #5768 — the ceiling runs on a watchdog THREAD: the output forwarding above writes synchronously, so a reader
+    // that stops reading blocks this event loop, and a timer here would never fire. The slot heartbeat rides the same
+    // thread until the ceiling. The kill also reaches orphans of this group (only when this process LEADS it, so every
+    // member is provably ours), and descendants that left tree and group, found by `phaseMarker` or the output pipes.
     let settled = false;
     let exited = null;
     let grace = null;
+    let announced = false;
+    const announce = () => {
+      if (announced) return;
+      announced = true;
+      process.stderr.write(`\n✗ verify-lane: phase exceeded phaseTimeoutMs=${PHASE_TIMEOUT_MS} (${PHASE_TIMEOUT_SOURCE}) — killed its process tree (pid ${child.pid}); recorded as a timeout, not a test verdict\n`);
+    };
     const finish = (code, closeSignal) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      watchdog?.stop();
       clearTimeout(grace);
+      const timedOut = Boolean(watchdog?.fired());
+      if (timedOut) announce();
       resolveGate({ exitCode: Number.isFinite(code) ? code : 2, signal: timedOut ? 'SIGKILL' : closeSignal || null, ...(timedOut ? { timedOut: true } : {}) });
     };
-    const timer = setTimeout(() => {
-      timedOut = true;
-      process.stderr.write(`\n✗ verify-lane: phase exceeded phaseTimeoutMs=${PHASE_TIMEOUT_MS} (${PHASE_TIMEOUT_SOURCE}) — killing its process tree (pid ${child.pid}); recorded as a timeout, not a test verdict\n`);
-      // Orphans of this group too (a descendant whose shell already exited is reparented out of the tree) — ONLY when
-      // this process leads its own group (the verify daemon spawns it detached), so every member is provably ours.
-      // Run inside someone else's group (an agent shell), the orphan sweep is skipped; the grace below still settles.
-      const pgid = ownProcessGroup();
-      killProcessTree(child.pid, 'SIGKILL', { orphansOfGroup: pgid === process.pid ? pgid : null });
-      // A survivor still holding the output pipes would keep 'close' pending forever: settle on exit, or after a grace.
-      grace = setTimeout(() => {
-        child.stdout?.destroy(); child.stderr?.destroy();
-        finish(exited?.code ?? null, exited?.signal ?? 'SIGKILL');
-      }, 10_000);
-      grace.unref();
-    }, PHASE_TIMEOUT_MS);
-    timer.unref();
-    child.on('error', (e) => { clearTimeout(timer); clearTimeout(grace); if (!settled) { settled = true; reject(e); } });
+    const watchdog = Number.isInteger(child.pid) ? startTreeWatchdog({
+      pid: child.pid, timeoutMs: PHASE_TIMEOUT_MS,
+      kill: { orphansOfOwnGroup: true, marker: phaseMarker, outputFds: [child.stdout?._handle?.fd, child.stderr?._handle?.fd].filter((fd) => Number.isInteger(fd) && fd > 2) },
+      heartbeat: { module: HEAVY_ADMISSION_MODULE, exportName: 'heartbeatOwnedSlot', args: { lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO }, everyMs: SLOT_HEARTBEAT_MS },
+      onFire: () => {
+        if (settled) return;
+        announce();
+        // A survivor still holding the output pipes would keep 'close' pending forever: settle on exit, or after a grace.
+        grace = setTimeout(() => {
+          child.stdout?.destroy(); child.stderr?.destroy();
+          finish(exited?.code ?? null, exited?.signal ?? 'SIGKILL');
+        }, 10_000);
+        grace.unref();
+      },
+    }) : null;
+    child.on('error', (e) => { watchdog?.stop(); clearTimeout(grace); if (!settled) { settled = true; reject(e); } });
     child.on('exit', (code, sig) => { exited = { code, signal: sig }; });
     child.on('close', (code, closeSignal) => finish(code, closeSignal));
   });
