@@ -2,7 +2,7 @@
 bornAs: xl3mmn5
 kind: story
 size: 3
-parent: "x5wqxb3"
+parent: "6786"
 status: open
 scope: ["we:scripts/operations/run-store.mjs", "we:scripts/operations/cli-adapter.mjs", "we:scripts/operations/review-loop-cli.mjs", "we:scripts/operations/__tests__/run-store.test.mjs", "we:scripts/lib/__tests__/review-run-index.validation.test.mjs"]
 dateOpened: "2026-10-20"
@@ -11,13 +11,13 @@ tags: []
 
 # Slice 0: review-pr run identity is immutable (writeRun refuses a repo/PR change, no symlinked runs, safe legacy migration)
 
-Prerequisite for the identity index (epic x5wqxb3), correct on its own. Today a fresh invocation with an existing --run-id overwrites a review-pr record with a different repo/PR unchecked, migrateLegacyRuns renames records in without writeRun (exists-then-rename overwrite race), and writeJsonAtomic follows symlinked run paths. Make writeRun refuse an input.repo/input.pr change for an existing review-pr id, refuse symlinked run paths, and route migration through the same check with no overwrite. Delivery mode: pr.
+Prerequisite for the identity index (epic 6786), correct on its own. Today a fresh invocation with an existing --run-id overwrites a review-pr record with a different repo/PR unchecked, migrateLegacyRuns renames records in without writeRun (exists-then-rename overwrite race), and writeJsonAtomic follows symlinked run paths. Make writeRun refuse an input.repo/input.pr change for an existing review-pr id, refuse symlinked run paths, and route migration through the same check with no overwrite. Delivery mode: pr.
 
 ## Acceptance
 
 - [A1] **Executable** — planned `we:scripts/operations/__tests__/run-store.test.mjs` cases below pass via `npm run test:unit -- <test-file>` from WE using the path after `we:`; refusal preserves existing bytes and safe same-identity rewrites still succeed.
 - [A2] **Must refuse** — identity changes, symlink destinations and migration collisions cannot modify an existing record, its symlink target or its identity claim; the tests below assert each protected surface.
-- [A3] **Executable** — the epic's shared live-parity and per-slice audit validation cases pass for xl3mmn5; attach the measured results and audit receipt before advancing the next slice.
+- [A3] **Executable** — the epic's shared live-parity and per-slice audit validation cases pass for 6787; attach the measured results and audit receipt before advancing the next slice.
 
 ## Planned tests
 

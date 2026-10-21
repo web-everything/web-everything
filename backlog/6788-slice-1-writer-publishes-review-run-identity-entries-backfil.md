@@ -2,9 +2,9 @@
 bornAs: xbyg4e4
 kind: story
 size: 5
-parent: "x5wqxb3"
+parent: "6786"
 status: open
-blockedBy: ["xl3mmn5"]
+blockedBy: ["6787"]
 scope: ["we:scripts/operations/run-store.mjs", "we:scripts/lib/review-run-index.mjs", "we:scripts/lib/drain-red-team-evidence.mjs", "we:scripts/lib/saved-red-team-provenance.mjs", "we:scripts/lib/__tests__/review-run-index.test.mjs", "we:scripts/lib/__tests__/review-run-index.validation.test.mjs"]
 dateOpened: "2026-10-20"
 tags: []
@@ -12,13 +12,13 @@ tags: []
 
 # Slice 1: writer publishes review-run identity entries, backfill, and a shadow indexed reader
 
-Epic x5wqxb3. writeRun publishes a per-run identity entry (claim via temp+link, fsynced, before the record's first rename). A one-shot backfill indexes existing review-pr records. A shadow indexed reader runs beside the full scan in readDrainRedTeamEvidence and verifySavedRedTeamProvenance: the full-scan answer stays authoritative, and each pass logs mismatches, unindexed count and timing. Shadow errors are isolated. Proof: live per-call ms and zero mismatches across every ready PR. Delivery mode: shadow.
+Epic 6786. writeRun publishes a per-run identity entry (claim via temp+link, fsynced, before the record's first rename). A one-shot backfill indexes existing review-pr records. A shadow indexed reader runs beside the full scan in readDrainRedTeamEvidence and verifySavedRedTeamProvenance: the full-scan answer stays authoritative, and each pass logs mismatches, unindexed count and timing. Shadow errors are isolated. Proof: live per-call ms and zero mismatches across every ready PR. Delivery mode: shadow.
 
 ## Acceptance
 
 - [A1] **Executable** — planned `we:scripts/lib/__tests__/review-run-index.test.mjs` cases below pass via `npm run test:unit -- <test-file>` from WE using the path after `we:`; entries become usable only after durable publication before the record rename.
 - [A2] **Must refuse** — ambiguous index state never authorizes a skip; read each such record freshly. A shadow failure cannot alter the authoritative full-scan result or refusal.
-- [A3] **Executable** — run the epic's shared live-parity, live-timing and per-slice audit validation cases for xbyg4e4; record compared calls, mismatches, unindexed counts and both timings. The production answer remains the full scan throughout shadow delivery.
+- [A3] **Executable** — run the epic's shared live-parity, live-timing and per-slice audit validation cases for 6788; record compared calls, mismatches, unindexed counts and both timings. The production answer remains the full scan throughout shadow delivery.
 
 ## Planned tests
 

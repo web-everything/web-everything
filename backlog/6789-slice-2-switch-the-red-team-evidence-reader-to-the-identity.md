@@ -2,9 +2,9 @@
 bornAs: xukmjgl
 kind: story
 size: 8
-parent: "x5wqxb3"
+parent: "6786"
 status: open
-blockedBy: ["xbyg4e4"]
+blockedBy: ["6788"]
 scope: ["we:scripts/lib/drain-red-team-evidence.mjs", "we:scripts/lib/saved-red-team-provenance.mjs", "we:scripts/lib/drain-saved-red-team.mjs", "we:scripts/lib/review-run-index.mjs", "we:scripts/operations/run-store.mjs", "we:scripts/operations/cli-adapter.mjs", "we:scripts/operations/review-loop-cli.mjs", "we:scripts/lib/daemon-rebuild/", "we:scripts/settings/red-team.json", "we:scripts/lib/__tests__/review-run-index.test.mjs", "we:scripts/lib/__tests__/review-run-index.validation.test.mjs"]
 dateOpened: "2026-10-20"
 tags: []
@@ -12,7 +12,7 @@ tags: []
 
 # Slice 2: switch the red-team evidence reader to the identity index behind a cascade setting
 
-Epic x5wqxb3. Blocked on an operator ruling (Option A on the epic): a PR's red-team evidence depends only on that PR's records, with a loud store-health alarm on any corrupt review-pr record. Adds the cascade setting redTeam.reviewRunIndexReader (standard shadow, then on), logged with its source each pass, plus the writer fence: it falls back to a full scan unless every live daemon build includes slice 0. It switches only after a mismatch-free shadow soak. Proof: live mergeCascade pass seconds before/after and a Codex guard verdict. Delivery mode: prototype.
+Epic 6786. Blocked on an operator ruling (Option A on the epic): a PR's red-team evidence depends only on that PR's records, with a loud store-health alarm on any corrupt review-pr record. Adds the cascade setting redTeam.reviewRunIndexReader (standard shadow, then on), logged with its source each pass, plus the writer fence: it falls back to a full scan unless every live daemon build includes slice 0. It switches only after a mismatch-free shadow soak. Proof: live mergeCascade pass seconds before/after and a Codex guard verdict. Delivery mode: prototype.
 
 The writer fence also includes the epic's durable writer-history validity protocol. A trusted writer-admission/deployment boundary outside the old binary must invalidate the generation before an incompatible/unknown writer can mutate records. If that boundary or continuous history cannot be proved for every writing path (including fresh CLIs and migration), use the full scan. Re-upgrade never clears invalidation. Reconciliation stops all writers under an exclusive barrier, freshly reads the complete store, rebuilds claims/entries into a new generation and atomically certifies it only while the barrier still holds. Conflicting historical claims are quarantined with the old generation, never silently accepted as immutable facts for the new one. Failed, interrupted or raced reconciliation remains invalid. Check the fence and generation on every evidence/provenance call and before returning indexed results. This protocol and its regression tests are prerequisites to enabling skips, not later cleanup.
 
@@ -26,7 +26,7 @@ Prevention implementation card for PR #5742's historical writer-fence finding: t
 
 - [A1] **Executable** — planned cases below in `we:scripts/lib/__tests__/review-run-index.test.mjs` pass via `npm run test:unit -- <test-file>` from WE using the path after `we:`, including omitted settings, rollback and re-upgrade.
 - [A2] **Must refuse** — no indexed production answer without Option A's recorded ruling, the completed soak, a passing current writer fence and a valid reconciled generation. Unknown settings, writer history, invalidation state or reconciliation outcome use the authoritative full scan; corrupt same-PR/unindexed records still refuse.
-- [A3] **Executable** — epic live validation records under-1-second evidence calls, parity under the ratified Option A contract, before/after cascade seconds and a NOT WEAKENED slice audit receipt for xukmjgl.
+- [A3] **Executable** — epic live validation records under-1-second evidence calls, parity under the ratified Option A contract, before/after cascade seconds and a NOT WEAKENED slice audit receipt for 6789.
 
 ## Planned tests
 
