@@ -32,7 +32,8 @@ export const REFERRAL_RETRY_MS = [15, 30, 60].map(n => n * 60_000);
 const sha = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
-/** A run suspended at human confirmation has completed its panel, although the operation is pending. */
+/** Completed-panel evidence, or an incomplete attempt that can spend a no-verdict retry but prove no verdict.
+ * A run suspended at human confirmation has completed its panel, although the operation is pending. */
 export function reviewRunEvidence(run) {
   if (run?.op !== 'review-pr') return null;
   const read = run.findings?.read;
@@ -52,7 +53,14 @@ export function reviewRunEvidence(run) {
   const startedAt = Math.max(Date.parse(run.stepTimings?.find(t => t.step === 'read')?.startedAt),
     resuming ? 0 : Date.parse(run.resumedAt ?? '') || 0);
   const completedAt = Date.parse(finish);
-  if (!sha(head) || !Number.isFinite(completedAt) || !Number.isFinite(startedAt)) return null;
+  if (!sha(head) || !Number.isFinite(startedAt)) return null;
+  if (!Number.isFinite(completedAt)) {
+    // Crashes before/during advise still consumed a retry. Keep them in the cached projection, without
+    // inventing a completed panel or clean referral evidence for acceptance/carry readers.
+    return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt: null,
+      incomplete: true, parked: false, attempted: false, persistenceFailed: false, count: 0,
+      pending: ['review-incomplete'], rulings: [] };
+  }
   const state = (resuming ? run.resumeOf.mandatoryReferrals : run.findings?.mandatoryReferrals)?.effects?.find(e => e.type === 'review.mandatory-referrals')?.result;
   const pending = verdict?.pendingReferrals ?? [];
   const findingKeys = pending.filter(key => !PENDING_REASON_TOKENS.has(key));
@@ -95,6 +103,8 @@ const headCache = new Map();
  *  so a change to {@link reviewRunEvidence} never serves a stale projection. */
 export const REVIEW_EVIDENCE_CACHE_FILE = '.review-run-evidence.cache';
 export const REVIEW_HEAD_CACHE_FILE = '.review-run-heads.cache';
+/** A warm process with at most this many changed records parses them directly instead of the whole on-disk file. */
+export const EVIDENCE_DISK_MIN_MISSES = 32;
 const projectionCode = project => createHash('sha256').update(String(project)).digest('hex').slice(0, 16);
 function readEvidenceDiskCache(file, code) {
   try {
@@ -136,12 +146,25 @@ function readRunProjections({ dir, readRun, memo, persist, project, cacheFile, m
   let disk = null;
   let dirty = false;
   const kept = {};
-  const out = names.filter(n => n.startsWith(REVIEW_RUN_ID_PREFIX) && n.endsWith('.json')).flatMap(name => {
+  // xwu9oxh S6 — the on-disk projection (~45 MB of JSON at ~6.6k records) is for a COLD process. Live 2026-10-20 the
+  // long-lived fix daemon parsed it on every reconcile pass (always once at the end, and again whenever the review
+  // daemon had written even one new record) — ~140 MB of transient heap per pass, several passes per tick. A warm
+  // process now parses its few missed records directly and leaves the file alone; the file is read (and rewritten)
+  // only when this call misses every record or more than EVIDENCE_DISK_MIN_MISSES of them. Same evidence either way.
+  const rows = names.filter(n => n.startsWith(REVIEW_RUN_ID_PREFIX) && n.endsWith('.json')).map(name => {
     const path = join(dir, name);
+    const stat = statSync(path);
+    return { name, path, key: `${stat.mtimeMs}:${stat.size}` };
+  });
+  const misses = rows.filter(r => memo.get(r.path)?.key !== r.key).length;
+  const useDisk = persist && misses > 0 && (misses === rows.length || misses > EVIDENCE_DISK_MIN_MISSES);
+  const out = rows.flatMap(({ name, path }) => {
+    // Re-stat right before use (the count above is only a hint), so each record's key is read at the same moment
+    // relative to its parse as before this change.
     const stat = statSync(path);
     const key = `${stat.mtimeMs}:${stat.size}`;
     let cached = memo.get(path);
-    if (cached?.key !== key && persist) {
+    if (cached?.key !== key && useDisk) {
       disk ??= readEvidenceDiskCache(file, code);
       const hit = disk[name];
       if (hit?.key === key) cached = { key, evidence: hit.evidence ?? null };
@@ -155,7 +178,7 @@ function readRunProjections({ dir, readRun, memo, persist, project, cacheFile, m
     if (!cached.evidence) return [];
     return [isMintedReviewRunId(name.slice(0, -5)) ? cached.evidence : { ...cached.evidence, custom: true }];
   });
-  if (persist) {
+  if (useDisk) {
     disk ??= readEvidenceDiskCache(file, code);
     if (dirty || Object.keys(disk).some(n => !kept[n])) writeEvidenceDiskCache(file, code, kept);
   }
@@ -209,6 +232,16 @@ export function persistRetryBudgetSpent(run) {
   return Boolean(run?.persistenceFailed) && 1 + (Number(run.persistRetries) || 0) > REFERRAL_RETRY_MS.length;
 }
 
+/** A later attempt consumes a parked run's release even if it dies before advise. Keep completed
+ * panel ordering, but never let an older park hide a newer incomplete attempt on that history. */
+function latestReviewAttempt(history) {
+  const completed = history.filter(r => Number.isFinite(r.completedAt))
+    .sort((a, b) => b.completedAt - a.completedAt)[0];
+  return history.filter(r => r.incomplete && Number.isFinite(r.startedAt)
+    && (!completed || r.startedAt >= completed.startedAt))
+    .sort((a, b) => b.startedAt - a.startedAt)[0] ?? completed;
+}
+
 /**
  * The parked run an operator's ruling should RESUME instead of starting a fresh panel (card xq1xbsl; live 2026-10-08,
  * #4361 and #4388: a ruling on an unchanged head was followed by a full new review that raised NEW referrals, so the PR
@@ -220,8 +253,8 @@ export function persistRetryBudgetSpent(run) {
  * @returns {{id: string, head: string}|null}
  */
 export function findResumableParkedRun(pr, runs, { repo } = {}) {
-  const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number)).sort((a, b) => b.completedAt - a.completedAt);
-  const last = history[0];
+  const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number));
+  const last = latestReviewAttempt(history);
   if (!last?.parked || last.head !== pr.headRefOid) return null;
   // A run whose referral persist failed already holds its panel's verdict; what it owes is the persist step again,
   // not a new panel (live 2026-10-20, #5752: two ledger-push misses on one head each cost a full panel, and the
@@ -243,9 +276,10 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 function evaluateReferralHold(pr, runs, { repo, now = Date.now(), env = process.env,
   // The SAME reader the review gate uses, so a `card` ruling naming a card that does not exist yet keeps the hold.
   cardReadable = ref => referralCardReadable(ref, REPO_ROOT) } = {}) {
-  const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number))
+  const attempts = runs.filter(r => r.repo === repo && r.pr === Number(pr.number));
+  const last = latestReviewAttempt(attempts);
+  const history = attempts.filter(r => Number.isFinite(r.completedAt))
     .sort((a, b) => b.completedAt - a.completedAt);
-  const last = history[0];
   if (!last?.parked || last.head !== pr.headRefOid || (!last.attempted && !last.persistenceFailed)) return { hold: null, released: null };
   // A failed persist checks its retry budget BEFORE any wake (card 5752): a ruling or an automated re-arm cannot fix a
   // persist, so it neither skips the backoff nor revives a spent budget. Only the operator in person (the needs-you
@@ -332,11 +366,16 @@ export const VERDICT_GRACE_MS = 10 * 60_000;
 const VERDICT_LABELS = ['review:accepted', 'review:changes', 'review:human'];
 
 /**
- * True when `last` (a completed review run on the PR's current head) left NO visible verdict: the PR still holds
+ * True when `last` (a review attempt on the PR's current head) left NO visible verdict: the PR still holds
  * only `review:pending`, and no `reviewed-sha` accept marker names this head. Pure.
  */
 export function verdictNeverLanded(pr, last, now = Date.now()) {
-  if (!last || !Number.isFinite(last.completedAt) || now - last.completedAt < VERDICT_GRACE_MS) return false;
+  if (!last) return false;
+  if (Number.isFinite(last.completedAt)) {
+    if (now - last.completedAt < VERDICT_GRACE_MS) return false;
+  } else if (!last.incomplete || !Number.isFinite(last.startedAt)) return false;
+  // An incomplete attempt spends its budget as soon as read pins the head. There is no finished
+  // verdict write-back to wait for; renewing grace on each crash would allow unlimited retries.
   const names = (pr?.labels ?? []).map(l => (typeof l === 'string' ? l : l?.name));
   if (!names.includes('review:pending') || names.some(n => VERDICT_LABELS.includes(n))) return false;
   const head = typeof pr?.headRefOid === 'string' ? pr.headRefOid.trim().toLowerCase() : '';
@@ -346,26 +385,35 @@ export function verdictNeverLanded(pr, last, now = Date.now()) {
 export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Date.now(), retry = resolveNoVerdictRetry(env) } = {}) {
   const max = resolveSameHeadMaxReviews(env);
   if (max === 0) return null;
-  const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid)
-    .sort((a, b) => b.completedAt - a.completedAt);
-  const last = history[0];
+  const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid);
+  // Newer incomplete attempts own retry accounting, including after an older parked review was released.
+  // A fresh head can also crash on EVERY attempt and must still reach the exhausted needs-you hold.
+  const last = latestReviewAttempt(history);
   if (!last || last.persistenceFailed) return null;
   const wake = wakeTime(pr, last);
-  const count = history.filter(r => r.startedAt >= wake).length;
-  if (count < max) return null;
   // A completed run whose verdict NEVER LANDED on the PR (GitHub refused the comment/label write; live 2026-10-07,
   // #4288: GraphQL error as the review finished, so the PR stayed `review:pending` with no verdict and this hold
   // then silenced it forever, unlogged) did not review the head in any way the PR can see. Re-arm it ourselves,
   // bounded to VERDICT_RETRY_EXTRA extra runs, then bounded cool-down releases with exponential backoff.
   const noVerdict = verdictNeverLanded(pr, last, now);
+  // Normal same-head and referral holds still require completed panels. A no-verdict retry spends its
+  // budget as soon as read identifies the head, even if the process dies before advise can finish.
+  const attempts = history.filter(r => r.startedAt >= wake && (noVerdict || Number.isFinite(r.completedAt)));
+  const count = attempts.length;
+  if (count < max) return null;
   if (noVerdict && count < max + VERDICT_RETRY_EXTRA) return null;
   let retryAt = null;
-  // Cool-down releases already spent on this head/wake (each release produced one more completed run).
+  // Cool-down releases already spent on this head/wake, including unfinished retries.
   const spent = count - (max + VERDICT_RETRY_EXTRA);
   const releases = validCooldownReleases(retry?.cooldownReleases) ? Math.min(retry.cooldownReleases, VERDICT_COOLDOWN_MAX_RELEASES) : 0;
   if (noVerdict && spent < releases) {
     const cooldown = Math.min(VERDICT_COOLDOWN_BASE_MS * 2 ** spent, VERDICT_COOLDOWN_CAP_MS);
-    retryAt = last.completedAt + cooldown;
+    // A pre-wake panel may finish after the newer crashes; its write-back still sets the cooldown floor.
+    const latestCompletedAt = history.reduce((latest, r) => Math.max(latest,
+      Number.isFinite(r.completedAt) ? r.completedAt : 0), 0);
+    const latestAttemptAt = attempts.reduce((latest, r) => Math.max(latest,
+      Number.isFinite(r.completedAt) ? r.completedAt : r.startedAt), latestCompletedAt);
+    retryAt = latestAttemptAt + cooldown;
     if (now >= retryAt) return null;
   }
   const head = pr.headRefOid;
@@ -478,7 +526,7 @@ function defaultReadComments({ repo, number }) {
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 32 * 1024 * 1024 })).comments;
 }
 
-export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), readRuns = readReviewRunEvidence,
+export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), env = process.env, readRuns = readReviewRunEvidence,
   readComments = defaultReadComments } = {}) {
   const runs = readRuns();
   return prs.map(pr => {
@@ -492,10 +540,10 @@ export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), readRu
       catch { /* Keep the list snapshot when the full thread is unavailable. */ }
     }
     // A deliberate release (ruling cleared, new event, retry due) owes a fresh review: the same-head guard stays out.
-    const { hold, released } = evaluateReferralHold(pr, runs, { repo, now });
+    const { hold, released } = evaluateReferralHold(pr, runs, { repo, now, env });
     const blockRuledReferrals = blockRuledReferralsFor(pr, { repo });
     return { ...pr, blockRuledReferrals,
-      referralHold: hold ?? (released ? null : decideSameHeadHold(pr, runs, { repo })) };
+      referralHold: hold ?? (released ? null : decideSameHeadHold(pr, runs, { repo, now, env })) };
   });
 }
 
