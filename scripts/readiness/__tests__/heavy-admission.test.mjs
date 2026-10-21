@@ -143,10 +143,14 @@ describe('CLI relative --repo', () => {
 });
 
 describe('resolveCap — env override (private pools only), clamped sane', () => {
-  const priv = (cap) => ({ LANE_POOL_ROOT: '/tmp/private-pool', WE_HEAVY_ADMISSION_CAP: cap });
-  it('defaults when unset', () => expect(resolveCap({})).toBe(DEFAULT_ADMISSION_CAP));
+  // Test hygiene: these calls pass an EXPLICIT env, and loadAdmissionPolicy reads WE_PLATFORM_PREFERENCES from that
+  // env only — so the file-level process.env stub above never reached them and they read the operator's real
+  // ~/.claude/platform-preferences.json (cap 3 on the live host). Carry the hermetic path into each literal env.
+  const iso = (env = {}) => ({ WE_PLATFORM_PREFERENCES: process.env.WE_PLATFORM_PREFERENCES, ...env });
+  const priv = (cap) => iso({ LANE_POOL_ROOT: '/tmp/private-pool', WE_HEAVY_ADMISSION_CAP: cap });
+  it('defaults when unset', () => expect(resolveCap(iso())).toBe(DEFAULT_ADMISSION_CAP));
   it('reads WE_HEAVY_ADMISSION_CAP for a private pool', () => expect(resolveCap(priv('5'))).toBe(5));
-  it('ignores WE_HEAVY_ADMISSION_CAP on the shared host pool', () => expect(resolveCap({ WE_HEAVY_ADMISSION_CAP: '5' })).toBe(DEFAULT_ADMISSION_CAP));
+  it('ignores WE_HEAVY_ADMISSION_CAP on the shared host pool', () => expect(resolveCap(iso({ WE_HEAVY_ADMISSION_CAP: '5' }))).toBe(DEFAULT_ADMISSION_CAP));
   it('falls back on a non-finite or sub-1 value', () => {
     expect(resolveCap(priv('nope'))).toBe(DEFAULT_ADMISSION_CAP);
     expect(resolveCap(priv('0'))).toBe(DEFAULT_ADMISSION_CAP);
