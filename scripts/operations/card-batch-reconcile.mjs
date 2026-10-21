@@ -1,4 +1,5 @@
 /** Periodic terminal-PR recovery, pending-card drain and due-batch flush. */
+import { drainCursorPath, readDrainCursor, writeDrainCursor } from '../lib/prevention-drain-cursor.mjs';
 import { reconcileOwedPrevention } from '../lib/prevention-filing-owed.mjs';
 import { loadPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
 import { readFileSync, readdirSync, rmSync } from 'node:fs';
@@ -11,6 +12,9 @@ import { landPreventionCard } from './land-prevention-card.mjs';
 import { fileIntoBatch } from './card-batch-file.mjs';
 import { CARD_BATCH_KINDS } from '../lib/card-batch-policy.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
+
+/** How much of the tick the inline drain may use before it stops STARTING cards (the tick watchdog is 180s). */
+export const DRAIN_TICK_BUDGET_MS = 60_000;
 
 export function resolveReconcileIntervalMin({ read = readSettings } = {}) {
   try {
@@ -25,7 +29,7 @@ export async function reconcileCardBatches({
   log = line => process.stderr.write(`${line}\n`), remote = 'origin', laneDir,
   leaseMs = 60_000, owner = `reconcile:${process.pid}:${randomUUID()}`,
   seal = sealDueBatches, drain = landPreventionCard, batch = fileIntoBatch,
-  dryRun = false, fileOwed = landPreventionCard, loadFilingSettings = loadPreventionBatchSettings,
+  dryRun = false, drainBudgetMs = DRAIN_TICK_BUDGET_MS, fileOwed = landPreventionCard, loadFilingSettings = loadPreventionBatchSettings,
 } = {}) {
   if (!Number.isFinite(leaseMs) || leaseMs <= 0) throw new TypeError('leaseMs must be positive');
   // `now` is the cadence/flush sample; lease expiry must follow elapsed wall time during GitHub/Git IO.
@@ -65,17 +69,26 @@ export async function reconcileCardBatches({
     }
   }
   const pendingDir = join(stateDir, 'pending-prevention');
-  // An empty state directory is also an open slot: recover a spool even before its first admission.
-  if (!dryRun && (drainNeeded || !files.some(file => file.isFile() && file.name.endsWith('.json')))) {
+  // The tick drains INLINE but capped: it stops before STARTING a card once `drainBudgetMs` of the tick is spent or
+  // `prevention.drainCardsPerTick` cards are started, and the cursor makes the next tick resume after the last card
+  // handled (a failing card goes behind the others). Pending cards and owed filings take turns going first, so a
+  // permanently busy spool cannot starve the owed filings (or the reverse).
+  const cursorPath = drainCursorPath(stateDir);
+  const deadlineAt = clock() + drainBudgetMs;
+  const perTick = () => { const n = loadFilingSettings().drainCardsPerTick; return Number.isSafeInteger(n) && n > 0 ? n : 1; };
+  const drainPendingStep = async () => {
+    // An empty state directory is also an open slot: recover a spool even before its first admission.
+    if (!(drainNeeded || !files.some(file => file.isFile() && file.name.endsWith('.json')))) return;
     try {
       if (readdirSync(pendingDir).some(name => name.endsWith('.json'))) {
         // Filing paused by the operator is a visible state, not a failure (matches the owed step below).
         if (loadFilingSettings().filingEnabled === false) {
           results.push({ action: 'paused', step: 'drain', reason: 'prevention filing paused by prevention.filingEnabled' });
-        } else {
+        } else if (clock() < deadlineAt) {
           const result = await drain({ drainPending: true, session: `card-batch-reconcile-${randomUUID()}` }, {
             pendingDir, write: line => log(line.trimEnd()),
             batch: (input, options) => batch(input, { ...options, stateDir }),
+            drainLimit: { maxCards: perTick(), deadlineAt, now: clock, cursorPath },
           });
           if (!result.ok) throw new Error(result.reason ?? 'pending drain failed');
         }
@@ -83,15 +96,21 @@ export async function reconcileCardBatches({
     } catch (error) {
       if (error.code !== 'ENOENT') results.push({ action: 'error', step: 'drain', reason: error.message });
     }
-  }
-  if (!dryRun && loadFilingSettings().filingEnabled !== false) {
+  };
+  const drainOwedStep = async () => {
+    if (loadFilingSettings().filingEnabled === false || clock() >= deadlineAt) return;
     try {
-      const owed = await reconcileOwedPrevention({ stateDir,
-        file: input => fileOwed(input, { owedClaimed: true, loadFilingSettings, pendingDir,
+      const owed = await reconcileOwedPrevention({ stateDir, maxFilings: perTick(), deadlineAt, now: clock, cursorPath,
+        file: input => fileOwed(input, { owedClaimed: true, loadFilingSettings, pendingDir, skipPendingDrain: true,
           batch: (card, options) => batch(card, { ...options, stateDir }), write: line => log(line.trimEnd()) }),
       });
       for (const result of owed) if (!result.ok) results.push({ action: 'error', step: 'owed', reason: result.reason });
     } catch (error) { results.push({ action: 'error', step: 'owed', reason: error.message }); }
+  };
+  if (!dryRun) {
+    const owedFirst = readDrainCursor(cursorPath).next === 'owed';
+    for (const step of owedFirst ? [drainOwedStep, drainPendingStep] : [drainPendingStep, drainOwedStep]) await step();
+    writeDrainCursor(cursorPath, { next: owedFirst ? 'pending' : 'owed' });
   }
   if (!dryRun) {
     try { await seal({ stateDir, now }); }

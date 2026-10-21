@@ -2,6 +2,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, readdirSync, readFileSync, linkSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { readDrainCursor, rotateAfter, writeDrainCursor } from './prevention-drain-cursor.mjs';
 import { acquireLease, atomicRecord, cardBatchStateDir, tokenOf } from '../operations/card-batch-io.mjs';
 
 const directory = stateDir => join(stateDir, 'owed-prevention');
@@ -47,16 +48,25 @@ export async function fileOwedPrevention(input, file, { stateDir = cardBatchStat
   } finally { if (tokenOf(lock) === lease.token) rmSync(lock, { force: true }); }
 }
 
-export async function reconcileOwedPrevention({ stateDir = cardBatchStateDir(), file } = {}) {
+// `maxFilings`/`deadlineAt`/`cursorPath` are the health-watch tick's cap: at most `maxFilings` filings are STARTED, none
+// once the deadline has passed, and the cursor makes the next call resume after the last one handled (round-robin).
+export async function reconcileOwedPrevention({ stateDir = cardBatchStateDir(), file,
+  maxFilings = Infinity, deadlineAt = Infinity, now = Date.now, cursorPath } = {}) {
   let names;
   try { names = readdirSync(directory(stateDir)); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
+  names = names.filter(name => /^[a-f0-9]{64}\.json$/.test(name)).sort();
+  if (cursorPath) names = rotateAfter(names, readDrainCursor(cursorPath).owed);
   const results = [];
-  for (const name of names.filter(name => /^[a-f0-9]{64}\.json$/.test(name))) {
+  let started = 0;
+  for (const name of names) {
     const record = read(join(directory(stateDir), name));
     if (record.status === 'done') continue;
+    if (started >= maxFilings || now() >= deadlineAt) break;
     if (`${preventionFilingKey(record.input)}.json` !== name) throw Error('owed filing identity mismatch');
+    started++;
     try { results.push(await fileOwedPrevention(record.input, file, { stateDir })); }
     catch (e) { results.push({ ok: false, step: 'owed', reason: e.message }); }
+    if (cursorPath) writeDrainCursor(cursorPath, { owed: name });
   }
   return results;
 }

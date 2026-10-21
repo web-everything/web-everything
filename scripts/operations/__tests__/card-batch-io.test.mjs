@@ -749,7 +749,7 @@ describe('periodic terminal batch recovery with real Git', () => {
     let drained = 0;
     let flushed = false;
     const results = await reconcileCardBatches({ ...f.options, laneDir: f.laneDir, now: f.now(),
-      gh: async () => JSON.stringify({ number: 5272, headRefName: 'lane/card-batch-prevention-1', state: status }), log: () => {},
+      gh: async () => JSON.stringify({ number: 5272, headRefName: 'lane/card-batch-prevention-1', state: status }), log: () => {}, loadFilingSettings: () => ({ filingEnabled: true }),
       drain: async (input, options) => {
         expect(input.drainPending).toBe(true);
         expect(f.state()).toMatchObject({ seq: 1, lastSealedState: expect.any(String) });

@@ -33,7 +33,7 @@ describe('independent prevention filing pause', () => {
     expect(formatPreventionBatchSettings(paused())).toContain('prevention.filingEnabled=false (repo)');
   });
   it('prototype declared settings pause the actual filer', () => {
-    expect(loadPreventionBatchSettings({ env: {}, read: () => '{}' }))
+    expect(loadPreventionBatchSettings({ env: {}, read: () => '{}', repo: { filingEnabled: false } }))
       .toMatchObject({ filingEnabled: false, sources: { filingEnabled: 'repo' } });
   });
   it('paused spawn reports an unmet obligation, without even resolving credentials', () => {

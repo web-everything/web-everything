@@ -105,6 +105,7 @@ import {
   remainingAfter,
 } from '../lib/card-dedupe.mjs';
 
+import { readDrainCursor, rotateAfter, writeDrainCursor } from '../lib/prevention-drain-cursor.mjs';
 import { raisedByFile, readRaisedBy, parseRaisedBy, raisedByKey } from '../lib/raised-by.mjs';
 
 const HERE = resolve(fileURLToPath(import.meta.url), '..');
@@ -380,6 +381,10 @@ async function withRecoveryCard(lane, rel, content, admit) {
 export async function drainPendingPrevention({ lane }, {
   pendingDir = pendingPreventionDir(), exec = defaultExec, batch = fileIntoBatch,
   write = (line) => process.stdout.write(line), batchOptions = {},
+  // Optional per-tick cap (the health-watch probe): at most `maxCards` cards are STARTED, none once `deadlineAt` has
+  // passed, and `cursorPath` makes each call resume after the last card handled so a card that keeps failing goes
+  // behind the others instead of blocking the head. Unset = the whole spool in order, as before.
+  maxCards = Infinity, deadlineAt = Infinity, now = Date.now, cursorPath,
 } = {}) {
   let entries;
   try { entries = readdirSync(pendingDir).filter(name => name.endsWith('.json')).sort(); }
@@ -387,15 +392,21 @@ export async function drainPendingPrevention({ lane }, {
     if (error.code !== 'ENOENT') write(`land-prevention-card: pending spool read failed — ${errorReason(error)}\n`);
     return;
   }
+  if (cursorPath) entries = rotateAfter(entries, readDrainCursor(cursorPath).pending);
+  let started = 0;
   for (const name of entries) {
+    if (now() >= deadlineAt) break;
     const path = join(pendingDir, name);
     try {
       const entry = JSON.parse(readFileSync(path, 'utf8'));
       if (!/^backlog\/x?[a-z0-9]+-[^/]+\.md$/.test(entry.rel)) throw new Error('invalid pending card path');
       if (String(exec('git', ['-C', lane, 'ls-tree', 'origin/main', '--', entry.rel], {})).trim()) {
         rmSync(path);
+        if (cursorPath) writeDrainCursor(cursorPath, { pending: name });
         continue;
       }
+      if (started >= maxCards) break;
+      started++;
       const result = await withRecoveryCard(lane, entry.rel, entry.content, () => batch({
         laneDir: lane, cardPath: entry.rel, kind: 'prevention', actor: 'mechanical',
         idemKey: entry.idemKey, source: entry.source,
@@ -405,6 +416,8 @@ export async function drainPendingPrevention({ lane }, {
         write(`land-prevention-card: batched ${entry.rel} into ${result.batchRef} (from the pending spool)\n`);
       }
     } catch (error) { write(`land-prevention-card: pending ${name} retained — ${errorReason(error)}\n`); }
+    // Handled, landed or not: the next tick resumes after it, so a refused card is behind every other one.
+    if (cursorPath) writeDrainCursor(cursorPath, { pending: name });
   }
 }
 
@@ -495,6 +508,8 @@ async function landPreventionCardImpl(input, {
   loadPreventionBatchSettings: loadBatchSettings = loadPreventionBatchSettings,
   loadFilingSettings = loadPreventionBatchSettings,
   sleep: wait = sleep,
+  drainLimit = {},
+  skipPendingDrain = false,
 } = {}) {
   const filing = loadFilingSettings();
   write(`${formatPreventionBatchSettings(filing)}\n`);
@@ -561,7 +576,8 @@ async function landPreventionCardImpl(input, {
     // one hop further out. A real delivery agent avoids this by `cd $LANE` + a RELATIVE `scripts/...` path; this
     // does the equivalent by building the lane's own absolute path explicitly.
     const laneRunMjs = join(lane, 'scripts', 'operations', 'run.mjs');
-    await drainPendingPrevention({ lane }, { pendingDir, exec, batch, write });
+    // Inside the health-watch tick (`drainLimit`/`skipPendingDrain`) the spool is drained in capped slices by the probe itself.
+    if (!skipPendingDrain) await drainPendingPrevention({ lane }, { pendingDir, exec, batch, write, ...(input.drainPending ? drainLimit : {}) });
     if (input.foldOpenSingles) {
       const summary = await foldOpenSingles({ lane }, { exec, batch, write });
       return { ok: true, step: 'folded', ...summary };
