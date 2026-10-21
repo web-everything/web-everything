@@ -8,7 +8,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const REPO = 'web-everything/web-everything';
+const REPO = 'example-org/example-repo';
 const HEAD = 'b'.repeat(40);
 
 export default {
