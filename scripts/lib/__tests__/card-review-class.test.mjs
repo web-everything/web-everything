@@ -75,6 +75,12 @@ describe('card review class', () => {
     expect(cls(read([A], newCard(A).replace(/\n/g, '\r\n')))).toBe('full');
     expect(frontmatterText('---\nkind: story\r\n---\n')).toBe('kind: story\r');
   });
+  it('fifth-round audit: an appended traditional code patch after a card hunk → full', () => {
+    const code = ['--- a/scripts/ci-card-only.mjs', '+++ b/scripts/ci-card-only.mjs', '@@ -17,1 +17,1 @@', '-a', '+b', ''].join('\n');
+    expect(cls(read([A], newCard(A) + code))).toBe('full');
+    expect(cls(read([A], newCard(A) + code, { cardFrontmatter: { [A]: { old: null, new: 'title: x\nkind: story' } } }))).toBe('full');
+    expect(cls(read([A], newCard(A).replace('+body', '+body\n+extra')))).toBe('full'); // count mismatch
+  });
   it('post-accept timing: the card-class red-team mode does not apply (skipCardOnly rule unchanged)', async () => {
     const { cardClassRedTeamMode } = await import('../review-red-team-policy.mjs');
     expect(cardClassRedTeamMode(read([A], newCard(A)), { WE_RED_TEAM_TIMING: 'post-accept' })).toBeNull();

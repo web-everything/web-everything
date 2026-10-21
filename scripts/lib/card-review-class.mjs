@@ -69,11 +69,37 @@ function parseBlocks(diffText) {
     }
     if (minus !== (added ? '/dev/null' : `a/${path}`) || plus !== (deleted ? '/dev/null' : `b/${path}`)) return null;
     if (added && deleted) return null;
-    // Inside the hunks only hunk headers, context, +/- lines, "\ No newline" and the final empty line may appear.
-    if (lines.slice(h).some((l, i, a) => !(l === '' && i === a.length - 1) && !/^(?:@@ | |\+|-|\\)/.test(l))) return null;
+    if (!hunksExact(lines.slice(h))) return null;
     blocks.push({ path, added, deleted, lines: lines.slice(h) });
   }
   return blocks;
+}
+
+/**
+ * EXACT hunk accounting: each `@@ -a,b +c,d @@` consumes exactly b old and d new lines (context counts on both);
+ * after that only another hunk header, a `\ No newline` marker, or the block's final empty line may follow. So no
+ * text (an appended `--- a/code` / `+++ b/code` patch included) can hide inside or between hunks.
+ */
+function hunksExact(lines) {
+  let i = 0;
+  while (i < lines.length) {
+    const l = lines[i];
+    if (l === '' && i === lines.length - 1) return true;
+    const hm = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@(?: .*)?$/.exec(l);
+    if (!hm) return false;
+    let o = hm[1] === undefined ? 1 : Number(hm[1]); let n = hm[2] === undefined ? 1 : Number(hm[2]);
+    i++;
+    while (o > 0 || n > 0) {
+      const x = lines[i];
+      if (x === undefined) return false;
+      const mark = x[0];
+      if (mark === ' ' && o > 0 && n > 0) { o--; n--; } else if (mark === '-' && o > 0) o--; else if (mark === '+' && n > 0) n--;
+      else if (mark === '\\') { /* no-newline marker */ } else return false;
+      i++;
+    }
+    while (lines[i] !== undefined && lines[i].startsWith('\\')) i++;
+  }
+  return true;
 }
 
 /**

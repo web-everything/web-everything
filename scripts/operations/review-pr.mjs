@@ -1608,9 +1608,11 @@ export function buildReviewJudgeRequest({ read, lens, aim = '', seatProvider = n
 }
 
 /** The single blocking Codex correctness seat for a verified card-only net diff. */
-export function buildCardOnlyJudgeRequest(read, aim = '') {
+export function buildCardOnlyJudgeRequest(read, aim = '', cardClassSettings = null) {
   const { allowedTools, model, seatProvider, ...request } = buildReviewJudgeRequest({ read, lens: 'correctness', aim });
-  const focus = read?.cardReview?.class === CARD_REVIEW_CLASS.CARD && read.cardReview.coverageRoute === 'card-suggestion'
+  // The live settings too (kill switch + route), so a resumed run under `enabled: false` gets today's mandate.
+  const focus = cardClassSettings?.enabled === true && cardClassSettings.coverageRoute === 'card-suggestion'
+    && read?.cardReview?.class === CARD_REVIEW_CLASS.CARD && read.cardReview.coverageRoute === 'card-suggestion'
     ? '\n\nCARD TEXT ONLY: this diff is backlog card text. Spend your attention on contradictions (with itself, other cards, '
       + 'or ratified rules) and on missing or unstated decisions. A test-plan gap is still worth reporting as COVERAGE; '
       + 'on card text it is filed as a card suggestion, not a blocker.'
@@ -2658,7 +2660,7 @@ export function reviewPrOperation({
     // `buildReviewJudgeRequest`, shared with the `judgeSecurity` seat below so the two differ in one field.
     judge: judgeStep({
       reads: ['input.lens', 'input.aim', 'findings.read'],
-      request: (view) => cardOnlyLight ? buildCardOnlyJudgeRequest(view.findings.read, view.input.aim) : buildReviewJudgeRequest({
+      request: (view) => cardOnlyLight ? buildCardOnlyJudgeRequest(view.findings.read, view.input.aim, cardClassSettings) : buildReviewJudgeRequest({
         read: view.findings.read,
         lens: view.input.lens,
         // #3094 — the caller's aim rides in the MANDATE, beside the goal. `input.aim` is DECLARED in `reads`

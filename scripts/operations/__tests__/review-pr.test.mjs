@@ -4895,9 +4895,10 @@ describe('card-only light review', () => {
     });
     it('coverageRoute: referral, the kill switch, and no resolved settings all keep today routing', () => {
       for (const registry of [cardRegistry({ coverageRoute: 'referral' }), cardRegistry({ settings: { ...CARD_CLASS_STANDARD, enabled: false } }), cardRegistry({ settings: null })]) {
-        const { run } = atConfirm({ registry, input: BASE_INPUT, answer: answer(finding('COVERAGE')) });
+        const { run, requests } = atConfirm({ registry, input: BASE_INPUT, answer: answer(finding('COVERAGE')) });
         expect(run.findings.reduce.verdict).toBe('changes');
         expect(run.findings.reduce.deferredAdvisory ?? []).toHaveLength(0);
+        expect(requests.judge.mandate).not.toMatch(/CARD TEXT ONLY/);
       }
     });
     it('a run classified card but reduced under the kill switch (resume after enabled:false) keeps today routing', () => {
