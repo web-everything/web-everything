@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { drainPendingPrevention } from '../../operations/land-prevention-card.mjs';
 import { reconcileOwedPrevention } from '../prevention-filing-owed.mjs';
+import { landPreventionCard } from '../../operations/land-prevention-card.mjs';
 import { reconcileCardBatches } from '../../operations/card-batch-reconcile.mjs';
 import { drainCursorPath, readDrainCursor, rotateAfter } from '../prevention-drain-cursor.mjs';
 import { resolvePreventionBatchSettings } from '../card-batch-settings.mjs';
@@ -71,6 +72,39 @@ describe('capped, round-robin pending drain', () => {
   it('rotateAfter resumes behind the last handled name', () => {
     expect(rotateAfter(['a.json', 'b.json', 'c.json'], 'b.json')).toEqual(['c.json', 'a.json', 'b.json']);
     expect(rotateAfter(['a.json', 'b.json'], undefined)).toEqual(['a.json', 'b.json']);
+  });
+});
+
+describe('lane acquire under the cap', () => {
+  const input = { drainPending: true, session: 's' };
+  const options = (f, exec, acquireWaitMs) => ({ pendingDir: f.pendingDir, exec, write: () => {}, loadFilingSettings: () => ({ filingEnabled: true }),
+    loadPreventionBatchSettings: () => ({ filingEnabled: true }), drainLimit: { acquireWaitMs, maxCards: 1 } });
+  it('waits no longer than the remaining budget and bounds the child with it', async () => {
+    const f = fixture(); const exec = vi.fn(() => { throw Object.assign(new Error('no free lane after 5000ms'), {}); });
+    const result = await landPreventionCard(input, options(f, exec, 5000));
+    const [, args, execOptions] = exec.mock.calls[0];
+    expect(args).toContain('--wait-ms=5000');
+    expect(execOptions.timeout).toBeLessThan(20_000); // wait + slack, never the 3-minute default
+    expect(result).toMatchObject({ ok: true, deferred: true, step: 'acquire-deferred' });
+  });
+  it('a killed (timed out) acquire leaves every card in the spool and is not an error', async () => {
+    const f = fixture(); const exec = vi.fn(() => { throw Object.assign(new Error('spawnSync node ETIMEDOUT'), { killed: true, code: 'ETIMEDOUT' }); });
+    const result = await landPreventionCard(input, options(f, exec, 1000));
+    expect(result.ok).toBe(true);
+    expect(f.left()).toEqual(['a', 'b', 'c']);
+  });
+  it('any other acquire failure is still an error', async () => {
+    const f = fixture(); const exec = () => { throw new Error('lane-pool crashed'); };
+    expect(await landPreventionCard(input, options(f, exec, 1000))).toMatchObject({ ok: false, step: 'acquire' });
+  });
+  it('the probe passes min(remaining budget, 30s) as the acquire wait', async () => {
+    const f = fixture(['a']); writeFileSync(join(f.stateDir, 'org-repo-prevention.json'), JSON.stringify({ seq: 9 }));
+    const drain = vi.fn(async () => ({ ok: true }));
+    const common = { stateDir: f.stateDir, seal: async () => [], log: () => {}, drain, loadFilingSettings: () => ({ filingEnabled: true }) };
+    await reconcileCardBatches({ ...common, clock: () => 0, drainBudgetMs: 60_000 });
+    expect(drain.mock.calls[0][1].drainLimit.acquireWaitMs).toBe(30_000);
+    await reconcileCardBatches({ ...common, clock: () => 0, drainBudgetMs: 12_000 });
+    expect(drain.mock.calls[1][1].drainLimit.acquireWaitMs).toBe(12_000);
   });
 });
 

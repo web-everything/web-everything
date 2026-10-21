@@ -15,6 +15,8 @@ import { readSettings } from '../lib/settings-files.mjs';
 
 /** How much of the tick the inline drain may use before it stops STARTING cards (the tick watchdog is 180s). */
 export const DRAIN_TICK_BUDGET_MS = 60_000;
+/** The most a capped drain waits for a lane (also bounded by what is left of the drain budget). */
+export const DRAIN_ACQUIRE_WAIT_MS = 30_000;
 
 export function resolveReconcileIntervalMin({ read = readSettings } = {}) {
   try {
@@ -88,7 +90,8 @@ export async function reconcileCardBatches({
           const result = await drain({ drainPending: true, session: `card-batch-reconcile-${randomUUID()}` }, {
             pendingDir, write: line => log(line.trimEnd()),
             batch: (input, options) => batch(input, { ...options, stateDir }),
-            drainLimit: { maxCards: perTick(), deadlineAt, now: clock, cursorPath },
+            drainLimit: { maxCards: perTick(), deadlineAt, now: clock, cursorPath,
+              acquireWaitMs: Math.min(DRAIN_ACQUIRE_WAIT_MS, Math.max(0, deadlineAt - clock())) },
           });
           if (!result.ok) throw new Error(result.reason ?? 'pending drain failed');
         }

@@ -306,6 +306,8 @@ export function parseRunJsonTail(out) {
  *  eventually rather than hold a lane and a pool slot forever. Mirrors `verify-io.mjs#verifySpawnTimeoutMs`'s
  *  own reasoning (heavy-admission queueing + the suites themselves can legitimately run long). */
 export const ACQUIRE_TIMEOUT_MS = 3 * 60_000;
+/** Extra time past a capped acquire's wait for the pool scan itself. */
+export const ACQUIRE_SCAN_SLACK_MS = 10_000;
 export const FILE_ITEM_TIMEOUT_MS = 2 * 60_000;
 export const VERIFY_TIMEOUT_MS = 70 * 60_000;
 export const OPEN_PR_TIMEOUT_MS = 45 * 60_000;
@@ -559,11 +561,21 @@ async function landPreventionCardImpl(input, {
     let acquired;
     try {
       write(`land-prevention-card: acquiring a lane (session ${input.session})…\n`);
+      // Inside the health-watch tick (`drainLimit.acquireWaitMs`) the acquire may wait only as long as the drain budget has left,
+      // plus slack for the pool scan; otherwise it can alone outlast the tick's watchdog.
+      const waitMs = input.drainPending ? drainLimit.acquireWaitMs : undefined;
       acquired = parseRunJsonTail(exec('node', [
         LANE_POOL_CLI, 'acquire', '--purpose=prevention-card', `--session=${input.session}`, '--json',
-      ], { cwd: REPO_ROOT, timeout: ACQUIRE_TIMEOUT_MS }));
+        ...(waitMs === undefined ? [] : [`--wait-ms=${Math.max(0, Math.floor(waitMs))}`]),
+      ], { cwd: REPO_ROOT, timeout: waitMs === undefined ? ACQUIRE_TIMEOUT_MS : Math.max(0, Math.floor(waitMs)) + ACQUIRE_SCAN_SLACK_MS }));
     } catch (e) {
-      return fail('acquire', String(e?.message || e).split('\n')[0]);
+      const reason = String(e?.message || e).split('\n')[0];
+      // A capped drain that simply found no lane in time ends this tick's drain: the cards stay in the spool, no error.
+      if (input.drainPending && drainLimit.acquireWaitMs !== undefined && (e?.killed || e?.code === 'ETIMEDOUT' || /no free lane|timed out|ETIMEDOUT/i.test(reason))) {
+        write(`land-prevention-card: no lane within ${drainLimit.acquireWaitMs}ms; pending drain deferred to the next tick\n`);
+        return { ok: true, step: 'acquire-deferred', deferred: true, pr: null };
+      }
+      return fail('acquire', reason);
     }
     const lane = acquired?.path ?? null;
     laneNum = acquired?.lane ?? null;
