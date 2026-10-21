@@ -1288,6 +1288,12 @@ require(${JSON.stringify(shim)});
     ['label', '--json', 'name', 'clone', 'enterprise/owner/repo'],
     ['issue', '--json', 'number', 'transfer', '1', 'enterprise/owner/repo'],
     ['repo', 'view', '--', '-enterprise/owner/repo'],
+    // pflag may take `--` as an unknown option's value and keep parsing options after it.
+    ['pr', 'list', '--app', '--', '-R', 'enterprise/owner/repo'],
+    ['pr', 'list', '-l', '--', '-Renterprise/owner/repo'],
+    ['pr', 'edit', '1', '--add-label', '--', '--repo', 'enterprise/owner/repo'],
+    ['run', 'list', '-w', '--', '--repo=enterprise/owner/repo'],
+    ['secret', 'remove', 'NAME', '-uRenterprise/owner/repo'],
   ])('refuses enterprise hosts before using a fresh public App cache: %j', (...argv) => {
     const f = fixture({ fresh: true });
     try {

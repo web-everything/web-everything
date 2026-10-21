@@ -676,7 +676,8 @@ function unsupportedTargetHost(argv, env) {
   // Short names change arity between commands: checkout -q/-f and merge -m/-s/-a are booleans.
   // Exempt content values only where their consuming option is known; uncertain URL arguments refuse.
   // Built-in aliases have the same argument arity and target positions as their commands.
-  const subcommand = ({ new: 'create', ls: 'list', co: 'checkout' })[argv[1]] || argv[1];
+  const subcommand = ({ new: 'create', ls: 'list', co: 'checkout', uninstall: 'remove' })[argv[1]]
+    || (['secret', 'variable'].includes(argv[0]) && argv[1] === 'remove' ? 'delete' : argv[1]);
   const command = (argv[0] === 'cs' ? 'codespace' : argv[0]) + ' ' + subcommand;
   if (argv[0] === 'api') for (const flag of ['-F', '-f', '-H', '-X', '-q', '-t']) valueFlags.add(flag);
   if (['pr create', 'pr edit', 'pr merge', 'issue create', 'issue edit'].includes(command)) {
@@ -737,20 +738,21 @@ function unsupportedTargetHost(argv, env) {
     'search code': 'w', 'search commits': 'w', 'search issues': 'w', 'search prs': 'w', 'search repos': 'w',
     'auth status': 'at',
   }[command] || (argv[0] === 'browse' ? 'anprsw' : '');
-  let cloneSourceSeen = false;
-  let positionalsOnly = false; // after \`--\`, gh reads -x/o/r as a repository argument, not an option
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (!positionalsOnly && a === '--') { positionalsOnly = true; continue; }
-    if (positionalsOnly) {
-      const repositoryTarget = repositoryPositionals && (command !== 'repo clone' || !cloneSourceSeen);
-      if (repositoryTarget && command === 'repo clone') cloneSourceSeen = true;
-      if (targetCommand && (repositoryTarget || /^[a-z][a-z0-9+.-]*:[/][/]/i.test(a))) {
+  // After \`--\` gh reads -x/o/r as a repository argument, unless pflag took the \`--\` as the value of an
+  // option (\`pr list --app -- -R x/o/r\` still parses -R). Check both readings: every later argument is
+  // a positional here, and the option scan below still runs over all of them.
+  const dashDash = argv.indexOf('--');
+  if (targetCommand && dashDash !== -1) {
+    for (const a of argv.slice(dashDash + 1)) {
+      if (repositoryPositionals || /^[a-z][a-z0-9+.-]*:[/][/]/i.test(a)) {
         const host = repoHost(a, argv[0] === 'api');
         if (host) return host;
       }
-      continue;
     }
+  }
+  let cloneSourceSeen = false;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
     // pflag permits boolean bundles before a value flag: -cRhost/o/r, -fsHOST/o/r, -ahHOST.
     // A known content flag consumes the remainder, so -bRhost/o/r stays body text.
     if (a.startsWith('-') && !a.startsWith('--')) {
