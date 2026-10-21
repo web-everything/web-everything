@@ -1712,7 +1712,6 @@ export function liveReviewRoundBudget({ env = process.env, listCommands = () => 
 export function buildCliDaemonEffects({
   owner, intervalMs = DEFAULT_INTERVAL_MS, log = console,
   reapSessions = defaultReapSessions,
-  flushLedgerOutboxes = defaultFlushLedgerOutboxes,
   // #3383 bug 3 — the real daemon wires the real `acquirableLanes` effect through by default, so production
   // dispatch is bounded by lane reality; `runReviewTick`'s OWN default stays unbounded (`() => Infinity`) so
   // every pre-existing test of it (which fakes reconcile/dispatch directly, never this) is unaffected.
@@ -1766,6 +1765,8 @@ export function buildCliDaemonEffects({
   // card x5f2daz — the light prep review. ON by default in `advise` (it only ever posts a note + `review:prep`);
   // `WE_PREP_REVIEW_MODE=off` turns it off. Injectable so the daemon tests never spawn a model.
   runPrepReview = () => runPrepReviewStage(),
+  // The ledger outbox backstop (we:scripts/lib/verdict-ledger-outbox.mjs): injectable so tests never spawn.
+  flushLedgerOutboxes = defaultFlushLedgerOutboxes,
 } = {}) {
   // #3383 follow-up (live-caught 2026-09-26) — carries the LAST tick's own `liveProcessPrs` across the
   // `await`/closure boundary into the NEXT tick's `reapSessions()` call, below. A plain closure variable is
