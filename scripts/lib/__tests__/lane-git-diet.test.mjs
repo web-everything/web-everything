@@ -102,6 +102,7 @@ describe('ops-ref reader inventory', () => {
     'scripts/operations/stage-pr-view.mjs': 'compares provenance against TRANSPORT_REF; the read is the injected stage-pr-view-io reader',
     'scripts/lib/lane-git-diet.mjs': 'this inventory',
     'scripts/lane-pool.mjs': 'drops stale tracking refs after clone',
+    'scripts/conveyor/soak/breaks/lane-reset-symbolic-ops-proof.mjs': 'disposable real-git regression fixture, not a production reader',
   };
   const OPS_IN_CODE = /['"`](?:refs\/remotes\/origin\/)?ops\/|origin\/ops\/|\b(?:TRANSPORT_BRANCH|LEDGER_TRANSPORT_BRANCH|PRECEDENT_TRANSPORT_BRANCH|QUARANTINE_BRANCH|HANDOFF_BRANCH|redMainFreezeBranch|TRANSPORT_REF)\b/;
   const walk = (dir) => readdirSync(dir).flatMap((n) => {

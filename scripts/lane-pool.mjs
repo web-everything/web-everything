@@ -1197,10 +1197,18 @@ function liveRemoteShas(dir) {
 function localRemoteShas(dir) {
   // lane-git-diet — `refs/remotes/origin/ops/*` is excluded from the default fetch (negative refspec), so an ops
   // tracking ref a reader fetched by name earlier is NOT refreshed by the fetch this relies on. Leave it out of the
-  // "fresh after fetch" set: fewer proofs only ever makes a reset MORE conservative.
-  const out = tryGit(['for-each-ref', '--format=%(objectname) %(refname)', 'refs/remotes/origin'], dir);
+  // "fresh after fetch" set: fewer proofs only ever makes a reset MORE conservative. Symbolic refs are not
+  // independently refreshed either: an innocent-looking alias (including origin/HEAD or a multi-hop alias)
+  // can resolve to an excluded ops ref or a ref outside origin. Only direct non-ops tracking refs are proofs.
+  const out = tryGit(['for-each-ref', '--format=%(objectname) %(refname) %(symref)', 'refs/remotes/origin/'], dir);
   if (out === null) return new Set();
-  return new Set(out.split('\n').filter(Boolean).filter((l) => !l.includes(' refs/remotes/origin/ops/')).map((l) => l.split(' ')[0]));
+  const shas = new Set();
+  for (const line of out.split('\n').filter(Boolean)) {
+    const [sha, ref, symref] = line.split(' ');
+    if (symref || ref.startsWith('refs/remotes/origin/ops/')) continue;
+    shas.add(sha);
+  }
+  return shas;
 }
 
 // Returns { skipped: boolean, dirty, uncommitted, ahead } so callers can tell an actually-reset lane

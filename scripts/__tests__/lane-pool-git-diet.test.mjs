@@ -74,9 +74,10 @@ it('provision + acquire keep ops/* out of a lane while explicit reader fetches s
 // at pick time, because the default fetch cannot refresh or prune it.
 const staleOpsCases = ['explicit', 'auto'].flatMap((mode) =>
   ['exact tip', 'ancestor'].flatMap((containment) =>
-    ['deleted', 'moved'].map((change) => ({ mode, containment, change }))));
+    ['deleted', 'moved'].flatMap((change) =>
+      ['none', 'direct', 'chained', 'HEAD', 'external'].map((alias) => ({ mode, containment, change, alias })))));
 
-it.each(staleOpsCases)('$mode acquire protects $containment work when its only ops proof was $change', ({ mode, containment, change }) => {
+it.each(staleOpsCases)('$mode acquire protects $containment work when its only ops proof was $change (alias: $alias)', ({ mode, containment, change, alias }) => {
   withContainmentLane(({ base, origin, reference, lane, git, run }) => {
     const head = git(['rev-parse', 'HEAD'], lane);
     const content = readFileSync(join(lane, 'file.txt'), 'utf8');
@@ -95,6 +96,19 @@ it.each(staleOpsCases)('$mode acquire protects $containment work when its only o
     expect(git(['merge-base', '--is-ancestor', head, staleTip], lane)).toBe('');
     expect(git(['for-each-ref', '--contains=HEAD', '--format=%(refname)', 'refs/remotes/origin/'], lane))
       .toBe('refs/remotes/origin/ops/review-requests');
+
+    // Symbolic refs have their own innocent-looking names, but resolve to tips the default
+    // fetch does not refresh. Include multi-hop aliases and targets outside origin entirely.
+    const opsTracking = 'refs/remotes/origin/ops/review-requests';
+    if (alias === 'direct' || alias === 'chained') {
+      git(['symbolic-ref', 'refs/remotes/origin/saved', opsTracking], lane);
+      if (alias === 'chained') git(['symbolic-ref', 'refs/remotes/origin/backup', 'refs/remotes/origin/saved'], lane);
+    } else if (alias === 'HEAD') {
+      git(['symbolic-ref', 'refs/remotes/origin/HEAD', opsTracking], lane);
+    } else if (alias === 'external') {
+      git(['update-ref', 'refs/saved/proof', staleTip], lane);
+      git(['symbolic-ref', 'refs/remotes/origin/saved', 'refs/saved/proof'], lane);
+    }
 
     const mutation = change === 'deleted'
       ? ['update-ref', '-d', ops]
