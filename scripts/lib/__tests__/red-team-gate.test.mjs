@@ -7,6 +7,7 @@ import {
   CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, breakClass, gateOutcomeForHead, gateOutcomesForHead, parseRedTeamComment, planRedTeamActions,
   resolveRedTeamProbes, redTeamForHead, gateRoundCap, sendBackStepState, redTeamGateMarker, redTeamQueueReason, redTeamRulingNeeded, resolveConfirmedBreaks, readRedTeamDisposition,
 } from '../red-team-gate.mjs';
+import { buildReviewedShaMarker, buildClearedHumanMarker } from '../review-escalation.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 
 const HEAD = 'ea117e881164c3b6366b0bb78a3660c9a00503b1';
@@ -303,5 +304,15 @@ describe('readRedTeamDisposition: only a human operator releases a break held at
   it('a human-authored operator-card / operator-not-real record releases', () => {
     expect(heldBy(record(human, 'operator-card', CARD))).toBe(0);
     expect(heldBy(record(human, 'operator-not-real', ADVISORY))).toBe(0);
+  });
+  describe('a clear-human ruling comment', () => {
+    const clearBody = ['\u2705 review \u2014 `review:human` cleared via the sanctioned path', '', 'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '',
+      buildReviewedShaMarker(head), buildClearedHumanMarker('operator')].join('\n');
+    const clear = who => ({ ...who, body: clearBody });
+    it('posted by automation never releases the held break', () => {
+      expect(heldBy(clear(automation))).toBe(1);
+      expect(heldBy(clear({ author: { login: 'chalbert[bot]' } }))).toBe(1);
+    });
+    it('posted by a human operator releases it', () => expect(heldBy(clear(human))).toBe(0));
   });
 });

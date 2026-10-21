@@ -525,7 +525,8 @@ function operatorRuled(records, pr, head) {
     want = redTeamResultId(result.parsed);
     const gates = gateRecordsFor(rs, pr, sha, result);
     const cap = gates.filter(r => r.gate.outcome === GATE_OUTCOMES.ROUND_CAP).sort(threadOrder).at(-1);
-    const cleared = lastAt(rs, r => !r.from && CLEAR_HUMAN_RULING_RE.test(recordBody(r).replace(/\r\n/g, '\n').trimStart())
+    // Only a human operator's own clear-human comment is a ruling; an automation-posted copy (even by a trusted bot) is not.
+    const cleared = lastAt(rs, r => !r.from && isHumanOperatorComment(r.c) && CLEAR_HUMAN_RULING_RE.test(recordBody(r).replace(/\r\n/g, '\n').trimStart())
       && parseLatestHumanClearedSha([r.c]) === sha);
     // A cap that names this result id already decided it: posting an identical copy later (a saved result's comment)
     // keeps the ruling. A legacy cap without a name, or a saved result of unknown chronology, needs the ruling after
