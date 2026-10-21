@@ -17,7 +17,6 @@
 import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { withFileLock, writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { readHumanSurfaceNetFiles } from '../lib/human-surface-net-diff.mjs';
 import { REVIEW_SETTINGS_FILE } from '../lib/review-seat-settings.mjs';
@@ -29,7 +28,7 @@ import {
 } from './round-extension-mark.mjs';
 import { isAutomationAuthored, isOperatorAuthored } from '../lib/marker-authorship.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
-import { readStandingRuling, standingRulingScope, redact } from './standing-ruling-io.mjs';
+import { ghApp, readStandingRuling, standingRulingScope, redact } from './standing-ruling-io.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 import {
   AUTO_GRANT_ABSOLUTE_MAX, AUTO_GRANT_CHANNEL, autoGrantKey, autoGrantReason, capReachedReason,
@@ -74,9 +73,6 @@ export function withPrLedger(slug, pr, fn, { dir = claimDir(), lock = withFileLo
   });
 }
 
-const ghApp = (args) => execFileSyncThrottled('gh', args, {
-  encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, maxBuffer: 64 * 1024 * 1024, throttle: { personalRoute: false },
-});
 /** IO: the PR's state, head and comments (App identity). */
 export function readPrThread(repo, pr, { gh = ghApp, readComments = readCompletePrComments } = {}) {
   const comments = readComments(pr, { repo, exec: (_file, args) => gh(args) });
@@ -113,8 +109,8 @@ export function autoRoundGrant({ repo, note, pr }, {
   // The git net read takes seconds and judges this pinned head only, so it runs outside the lock.
   const netRead = readNet({ repo: slug, number: note.prNumber, headRefOid: head }, { log: (l) => process.stderr.write(`${redact(l)}\n`) });
   /** Every trusted grant (manual + standing-ruling) on a thread, the ruling scope re-verified from GitHub. */
-  const trustedTotal = (comments) => countGrantedRoundExtensions(comments, { repo: slug, pr: note.prNumber,
-    standingRuling: scopeOf({ repo: slug, pr: { number: note.prNumber, comments }, ruling }) });
+  const trustedTotal = ({ comments = [], headRefOid } = {}) => countGrantedRoundExtensions(comments, { repo: slug, pr: note.prNumber,
+    standingRuling: scopeOf({ repo: slug, pr: { number: note.prNumber, headRefOid, comments }, ruling }) });
   try {
     return ledger(slug, note.prNumber, ({ seeded, baseline, entries: ledgerEntries, save }) => {
       let thread;
@@ -140,7 +136,7 @@ export function autoRoundGrant({ repo, note, pr }, {
       }
       const seed = seeded ? baseline : 0;
       if (entries.some((e) => e.key === key)) return { action: 'skip', why: `already claimed: ${key}` };
-      const scope = scopeOf({ repo: slug, pr: { number: note.prNumber, comments }, ruling });
+      const scope = scopeOf({ repo: slug, pr: { number: note.prNumber, headRefOid: thread?.headRefOid, comments }, ruling });
       const onGitHub = countAutoRoundGrants(comments, { repo: slug, pr: note.prNumber, standingRuling: scope });
       // Conservative: every automation grant record on the thread NOW (verified or not), the ledger (seeded from
       // historical grants) plus every reservation since, and the verified count — the largest wins.
@@ -166,7 +162,7 @@ export function autoRoundGrant({ repo, note, pr }, {
         const record = { repo: slug, pr: note.prNumber, by: ruling.by, actor: ruling.author, channel: AUTO_GRANT_CHANNEL,
           reason: autoGrantReason({ note, head, count: verdict.count, max, rulingId: ruling.id }), at: now(), standingRuling: ruling.id, head, episode: key };
         const body = buildRoundExtensionComment(record);
-        const trustedBefore = trustedTotal(fresh.comments ?? []);
+        const trustedBefore = trustedTotal(fresh);
         // Re-read head + state IMMEDIATELY before the post (the verification above is slow); refusal keeps the slot.
         const last = readThread(slug, note.prNumber);
         if (last?.headRefOid !== head || String(last?.state).toUpperCase() !== 'OPEN') {
@@ -178,7 +174,7 @@ export function autoRoundGrant({ repo, note, pr }, {
         // Proof: the thread's whole trusted total rose by exactly the grant (re-verified from GitHub), so a grant
         // that adds no effective round is never reported as granted.
         if ((after?.comments ?? []).filter((c) => c?.body === body).length !== 1
-          || trustedTotal(after?.comments ?? []) !== trustedBefore + ruling.by) {
+          || trustedTotal(after ?? {}) !== trustedBefore + ruling.by) {
           throw new Error('could not prove the posted grant raised the trusted round count');
         }
         finish({ outcome: 'granted' });
@@ -211,7 +207,7 @@ export function stuckAfterGrant({ repo, pr }, { scopeOf = standingRulingScope, n
   const comments = pr?.comments ?? [];
   if (!standingRulingGrantEpisodes(comments, { repo: slug, pr: pr.number }).episodes.some((e) => e.includes(`@${head}:`))) return null;
   let scope = null;
-  try { scope = scopeOf({ repo: slug, pr: { number: pr.number, comments } }); } catch { scope = null; }
+  try { scope = scopeOf({ repo: slug, pr: { number: pr.number, headRefOid: head, comments } }); } catch { scope = null; }
   const mine = roundExtensionGrants(comments, { repo: slug, pr: pr.number, standingRuling: scope }).filter((g) => g.standingRuling && g.head === head);
   const at = mine.length ? Math.max(...mine.map((g) => Date.parse(g.at))) : NaN;
   // An uncredited grant (no scope / not trusted) is stuck by definition once it exists on the thread.

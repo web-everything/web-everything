@@ -26,19 +26,38 @@ export function redact(text) {
 const firstLine = (e) => redact(String(e?.stderr || e?.message || e).trim().split('\n')[0]).slice(0, 300);
 const quietLog = (line) => { try { process.stderr.write(`${redact(line)}\n`); } catch { /* never fails a read */ } };
 
-/** App-identity gh read: personal read routing off, so the verdict never rests on the operator's login. */
-export const ghAppRead = (args) => execFileSyncThrottled('gh', args, {
+/**
+ * The ONE App-identity gh exec every standing-ruling read and every automatic-grant read or post uses: personal read
+ * routing off, so the verdict never rests on the operator's login.
+ */
+export const ghApp = (args) => execFileSyncThrottled('gh', args, {
   encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, maxBuffer: 64 * 1024 * 1024, throttle: { personalRoute: false },
 });
 
-const ISSUES = `query($owner:String!,$name:String!,$by:String!){repository(owner:$owner,name:$name){issues(first:30,filterBy:{createdBy:$by,states:OPEN},orderBy:{field:CREATED_AT,direction:DESC}){nodes{number state body lastEditedAt author{login} editor{login}}}}}`;
+const ISSUES = `query($owner:String!,$name:String!,$by:String!,$after:String){repository(owner:$owner,name:$name){issues(first:100,after:$after,filterBy:{createdBy:$by,states:OPEN},orderBy:{field:CREATED_AT,direction:DESC}){nodes{number state body lastEditedAt author{login} editor{login}}pageInfo{hasNextPage endCursor}}}}`;
+/** Pages read per operator login before the read fails (100 issues each): bounded, never silently truncated. */
+export const OPERATOR_ISSUE_MAX_PAGES = 50;
 
-/** IO: every OPEN issue each operator login created in `repo` (the ruling candidates). */
-export function readOperatorIssues(repo, { gh = ghAppRead } = {}) {
+/**
+ * IO: EVERY open issue each operator login created in `repo` (the ruling candidates), paginated to the end. A ruling
+ * issue older than any number of newer operator issues is still found (PR #5758). A read that cannot reach the last
+ * page throws, so the caller logs it and credits no automatic grant (fail closed, never a silently partial list).
+ */
+export function readOperatorIssues(repo, { gh = ghApp, maxPages = OPERATOR_ISSUE_MAX_PAGES } = {}) {
   const [owner, name] = repo.split('/');
   return OPERATOR_LOGINS.flatMap((login) => {
-    const raw = gh(['api', 'graphql', '-f', `query=${ISSUES}`, '-F', `owner=${owner}`, '-F', `name=${name}`, '-F', `by=${login}`]);
-    return JSON.parse(String(raw))?.data?.repository?.issues?.nodes ?? [];
+    const nodes = [];
+    for (let page = 0, after = null; ; page++) {
+      if (page >= maxPages) throw new Error(`operator issues of ${login} exceed ${maxPages} pages`);
+      const raw = gh(['api', 'graphql', '-f', `query=${ISSUES}`, '-F', `owner=${owner}`, '-F', `name=${name}`, '-F', `by=${login}`,
+        ...(after ? ['-f', `after=${after}`] : [])]);
+      const issues = JSON.parse(String(raw))?.data?.repository?.issues;
+      if (!issues || !Array.isArray(issues.nodes)) throw new Error(`operator issues of ${login}: unexpected response`);
+      nodes.push(...issues.nodes);
+      if (!issues.pageInfo?.hasNextPage) return nodes;
+      after = issues.pageInfo.endCursor;
+      if (typeof after !== 'string' || !after) throw new Error(`operator issues of ${login}: next page without a cursor`);
+    }
   });
 }
 
@@ -50,13 +69,13 @@ export function readStandingRuling(repo, { readIssues = readOperatorIssues, log 
 }
 
 /** IO: ids across the complete PR thread that GitHub shows as never edited. */
-export function readUneditedCommentIds({ repo, number }, { gh = ghAppRead, readEdits = readCompletePrCommentEditHistory } = {}) {
+export function readUneditedCommentIds({ repo, number }, { gh = ghApp, readEdits = readCompletePrCommentEditHistory } = {}) {
   const nodes = readEdits(number, { repo: slugOf(repo), exec: (_file, args) => gh(args) });
   return nodes.filter((c) => typeof c?.id === 'string' && c.lastEditedAt === null).map((c) => c.id);
 }
 
 /** IO: does GitHub associate commit `head` with PR `number`? */
-export function headBelongsToPr({ repo, number, head }, { gh = ghAppRead } = {}) {
+export function headBelongsToPr({ repo, number, head }, { gh = ghApp } = {}) {
   const raw = gh(['api', `repos/${slugOf(repo)}/commits/${head}/pulls`, '--jq', '[.[].number]']);
   const numbers = JSON.parse(String(raw));
   return Array.isArray(numbers) && numbers.includes(Number(number));
@@ -73,19 +92,29 @@ export function headIsCardOnly({ repo, number, head }, { readNet = readHumanSurf
 
 /**
  * IO: the `standingRuling` scope for one PR's grant reader, or null when the thread cites no ruling grant (no
- * reads made) or no valid ruling exists. Every cited head is re-judged; edited comments are excluded.
- * @param {{repo:string, pr:{number:number, comments:Array}, ruling?:object|null, extraHeads?:Record<string,boolean>}} o
+ * reads made), no valid ruling exists, or the PR's CURRENT head is unknown or not card-only. The ruling covers
+ * card-only PRs only: a PR that later gains code keeps no automatic round (PR #5758), whatever head a grant cited.
+ * Every cited head is re-judged too; edited comments are excluded.
+ * @param {{repo:string, pr:{number:number, headRefOid:string, comments:Array}, ruling?:object|null}} o
  */
 export function standingRulingScope({ repo, pr, ruling: given }, {
   readRuling = readStandingRuling, cardOnly = headIsCardOnly, unedited = readUneditedCommentIds,
 } = {}) {
   const heads = citedGrantHeads(pr?.comments);
   if (!heads.length) return null;
+  const current = String(pr?.headRefOid ?? '').toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(current)) return null;
   const ruling = given === undefined ? readRuling(repo) : given;
   if (!ruling) return null;
+  const judged = new Map();
+  const isCardOnly = (head) => {
+    if (!judged.has(head)) judged.set(head, cardOnly({ repo, number: pr.number, head }) === true);
+    return judged.get(head);
+  };
+  if (!isCardOnly(current)) return null;
   let uneditedComments = [];
   try { uneditedComments = unedited({ repo, number: pr.number }); } catch { uneditedComments = []; }
-  const cardOnlyHeads = Object.fromEntries(heads.map((head) => [head, cardOnly({ repo, number: pr.number, head }) === true]));
+  const cardOnlyHeads = Object.fromEntries(heads.map((head) => [head, isCardOnly(head)]));
   return { ...ruling, cardOnlyHeads, uneditedComments };
 }
 

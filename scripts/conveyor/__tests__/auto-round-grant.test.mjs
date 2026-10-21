@@ -13,13 +13,17 @@ import {
   AUTO_GRANT_CHANNEL, autoGrantKey, countAutoRoundGrants, decideAutoGrant, isCardOnlyNetDiff,
   resolveAutoRoundGrantSettings, screenAutoGrantNote, STANDING_RULING,
 } from '../auto-round-grant.mjs';
-import { autoRoundGrant, withPrLedger, redact, readPrThread, stuckAfterGrant, STUCK_AFTER_GRANT_MS } from '../auto-round-grant-io.mjs';
+import { autoRoundGrant, withPrLedger, redact, readPrThread, postPrComment, stuckAfterGrant, STUCK_AFTER_GRANT_MS } from '../auto-round-grant-io.mjs';
 import { buildRoundExtensionComment, countGrantedRoundExtensions, countStandingRulingGrantRecords, roundExtensionGrants, standingRulingGrantEpisodes } from '../round-extension-mark.mjs';
 import { buildStandingRulingBody, citedGrantHeads, pickStandingRuling, verifyStandingRuling } from '../standing-ruling-mark.mjs';
-import { enrichPrsWithStandingRulingGrants, headIsCardOnly, readStandingRuling, readUneditedCommentIds, standingRulingScope } from '../standing-ruling-io.mjs';
+import { enrichPrsWithStandingRulingGrants, headBelongsToPr, headIsCardOnly, readOperatorIssues, readStandingRuling, readUneditedCommentIds, standingRulingScope } from '../standing-ruling-io.mjs';
+import { execFileSyncThrottled } from '../../lib/gh-throttle.mjs';
 import { planRoundExtension } from '../../operations/extend-rounds.mjs';
 import { gateRoundCap } from '../../lib/red-team-gate.mjs';
 import { runReconcileNotesAllRepos } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
+
+// The real transport, mocked only to read the options every default App-identity call passes (no test reaches GitHub).
+vi.mock('../../lib/gh-throttle.mjs', async (importOriginal) => ({ ...(await importOriginal()), execFileSyncThrottled: vi.fn() }));
 
 const WE = 'web-everything/web-everything';
 const HEAD = 'a'.repeat(40);
@@ -39,6 +43,31 @@ const autoGrant = ({ head = HEAD, login = 'web-everything[bot]', ruling = RULING
 });
 const manualGrant = (login = 'chalbert') => ({ author: { login },
   body: buildRoundExtensionComment({ repo: WE, pr: 5654, by: 1, actor: 'chalbert', channel: 'claude-code-chat', reason: 'r', at: '2026-10-20T00:00:00Z' }) });
+
+// PR #5758 review: every test injected its own gh, so dropping `personalRoute: false` reddened nothing.
+describe('App identity only, personal read routing off', () => {
+  it('every default standing-ruling read and automatic-grant read or post passes throttle.personalRoute=false', () => {
+    execFileSyncThrottled.mockReset();
+    execFileSyncThrottled.mockImplementation((_file, args) => {
+      if (String(args[1]).endsWith('/pulls')) return '[5654]';
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ state: 'OPEN', headRefOid: HEAD });
+      if (args[0] === 'api' && args[1] === 'graphql') return JSON.stringify({ data: { repository: { issues: { nodes: [], pageInfo: { hasNextPage: false } } } } });
+      return '';
+    });
+    readOperatorIssues(WE);
+    expect(headBelongsToPr({ repo: WE, number: 5654, head: HEAD })).toBe(true);
+    readUneditedCommentIds({ repo: WE, number: 5654 }, { readEdits: (_n, { exec }) => { exec('gh', ['api', 'graphql', '-f', 'query=x']); return []; } });
+    readPrThread(WE, 5654, { readComments: (_n, { exec }) => { exec('gh', ['api', `repos/${WE}/issues/5654/comments`]); return []; } });
+    postPrComment(WE, 5654, 'body');
+    const calls = execFileSyncThrottled.mock.calls;
+    expect(calls.map(([, args]) => args[0] === 'pr' ? `pr ${args[1]}` : args[1])).toEqual(expect.arrayContaining(
+      ['graphql', `repos/${WE}/commits/${HEAD}/pulls`, `repos/${WE}/issues/5654/comments`, 'pr view', 'pr comment']));
+    for (const [file, , opts] of calls) {
+      expect(file).toBe('gh');
+      expect(opts.throttle).toEqual({ personalRoute: false });
+    }
+  });
+});
 
 describe('complete App thread reads', () => {
   it('includes grants beyond the first page using the same App transport', () => {
@@ -153,10 +182,57 @@ describe('read-time scope (standing-ruling-io)', () => {
     const cardOnly = vi.fn(({ head }) => head === HEAD);
     expect(standingRulingScope({ repo: WE, pr: { number: 5654, comments: [manualGrant()] } }, { readRuling, cardOnly })).toBeNull();
     expect(readRuling).not.toHaveBeenCalled();
-    const s = standingRulingScope({ repo: WE, pr: { number: 5654, comments: [autoGrant(), autoGrant({ head: HEAD2 })] } }, { readRuling, cardOnly, unedited: () => ['IC_x'] });
+    const s = standingRulingScope({ repo: WE, pr: { number: 5654, headRefOid: HEAD, comments: [autoGrant(), autoGrant({ head: HEAD2 })] } }, { readRuling, cardOnly, unedited: () => ['IC_x'] });
     expect(s.cardOnlyHeads).toEqual({ [HEAD]: true, [HEAD2]: false });
     expect(s.uneditedComments).toEqual(['IC_x']);
+    expect(cardOnly.mock.calls.filter(([a]) => a.head === HEAD)).toHaveLength(1);
     expect(citedGrantHeads([autoGrant()])).toEqual([HEAD]);
+  });
+  // PR #5758 review: a grant cited a card-only head, then the author pushed code. The ruling covers card-only PRs only.
+  it('a grant on a card-only head does not count once the current head carries non-card files', () => {
+    const readRuling = () => RULING;
+    const cardOnly = ({ head }) => head === HEAD;
+    const comments = [autoGrant({ head: HEAD })];
+    const on = (headRefOid) => standingRulingScope({ repo: WE, pr: { number: 5654, headRefOid, comments } }, { readRuling, cardOnly, unedited: () => [comments[0].id] });
+    expect(countGrantedRoundExtensions(comments, { repo: WE, pr: 5654, standingRuling: on(HEAD) })).toBe(1);
+    expect(on(HEAD2)).toBeNull();
+    expect(countGrantedRoundExtensions(comments, { repo: WE, pr: 5654, standingRuling: on(HEAD2) })).toBe(0);
+    for (const unknown of [undefined, '', 'not-a-sha', HEAD.slice(0, 12)]) expect(on(unknown)).toBeNull();
+    // A current-head judgement that throws is not card-only (fail closed).
+    expect(standingRulingScope({ repo: WE, pr: { number: 5654, headRefOid: HEAD2, comments } },
+      { readRuling, cardOnly: ({ head }) => { if (head === HEAD2) throw new Error('git'); return true; }, unedited: () => [] })).toBeNull();
+  });
+  it('stuckAfterGrant and the hook judge the PR\'s current head, not only the cited one', () => {
+    const scopeOf = vi.fn(() => null);
+    const p = { number: 5654, headRefOid: HEAD, labels: [{ name: 'status:at-round-limit' }], comments: [autoGrant()] };
+    stuckAfterGrant({ repo: 'we', pr: p }, { scopeOf, now: () => Date.now() });
+    expect(scopeOf.mock.calls[0][0].pr).toMatchObject({ number: 5654, headRefOid: HEAD });
+  });
+  // PR #5758 review: the ruling lookup read only the 30 newest open operator issues.
+  it('finds the ruling behind any number of newer operator issues (pagination), and fails closed at the page bound', () => {
+    const newer = Array.from({ length: 250 }, (_, i) => ({ number: 7000 + i, state: 'OPEN', body: 'x', author: { login: 'chalbert' } }));
+    const all = [...newer, rulingIssue()];
+    const calls = [];
+    const gh = (args) => {
+      calls.push(args);
+      const after = args.find((a) => a.startsWith('after='))?.slice(6);
+      const by = args.find((a) => a.startsWith('by='))?.slice(3);
+      const mine = by === 'chalbert' ? all : [];
+      const start = after ? Number(after) : 0;
+      const nodes = mine.slice(start, start + 100);
+      const hasNextPage = start + 100 < mine.length;
+      return JSON.stringify({ data: { repository: { issues: { nodes, pageInfo: { hasNextPage, endCursor: hasNextPage ? String(start + 100) : null } } } } });
+    };
+    const issues = readOperatorIssues(WE, { gh });
+    expect(issues).toHaveLength(251);
+    expect(calls.filter((a) => a.includes('by=chalbert'))).toHaveLength(3);
+    expect(readStandingRuling(WE, { readIssues: (repo) => readOperatorIssues(repo, { gh }) })).toMatchObject({ id: RULING_ID });
+    const log = vi.fn();
+    expect(readStandingRuling(WE, { log, readIssues: (repo) => readOperatorIssues(repo, { gh, maxPages: 2 }) })).toBeNull();
+    expect(log.mock.calls[0][0]).toMatch(/exceed 2 pages/);
+    const noCursor = () => JSON.stringify({ data: { repository: { issues: { nodes: [], pageInfo: { hasNextPage: true, endCursor: null } } } } });
+    expect(() => readOperatorIssues(WE, { gh: noCursor })).toThrow(/without a cursor/);
+    expect(() => readOperatorIssues(WE, { gh: () => JSON.stringify({ errors: [{ message: 'x' }] }) })).toThrow(/unexpected response/);
   });
   it('a ruling read failure fails closed and logs redacted', () => {
     const log = vi.fn();

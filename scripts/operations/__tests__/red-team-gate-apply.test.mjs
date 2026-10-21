@@ -451,6 +451,39 @@ describe('applyRedTeamGate', () => {
       expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'already-acted', outcome: 'round-cap' });
       expect(calls).toEqual([]);
     });
+
+    // PR #5758 review: the gate read grants with no standing-ruling scope, so an automatic grant never reopened its cap.
+    describe('automatic standing-ruling grant', () => {
+      const RULING_ID = `${REPO}#6000`;
+      const autoGrant = { id: 'IC_auto', author: { login: 'web-everything[bot]' }, createdAt: '2026-10-19T12:00:00Z',
+        body: buildRoundExtensionComment({ repo: REPO, pr: 4722, by: 1, actor: 'chalbert', channel: 'auto-round-grant', reason: 'r',
+          at: '2026-10-19T12:00:00Z', standingRuling: RULING_ID, head: HEAD, episode: `${REPO}#4722@${HEAD}:review:12/12` }) };
+      const scope = { ok: true, id: RULING_ID, author: 'chalbert', by: 1, maxPerPr: 3, repos: [REPO],
+        cardOnlyHeads: { [HEAD]: true }, uneditedComments: ['IC_auto'] };
+
+      it('reopens a capped red-team send-back once, and every red-team reader credits it', async () => {
+        const comments = [comment([F()]), capRecord(), autoGrant];
+        const scopes = [];
+        const { io, calls } = fakeIo({ comments, round: 12, readRoundAsOf: () => 12,
+          readGrantScope: (a) => { scopes.push(a); return scope; } });
+        expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'applied', outcome: 'sent-back' });
+        expect(scopes[0]).toMatchObject({ repo: REPO, pr: 4722, head: HEAD, comments });
+        expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'already-acted', outcome: 'sent-back' });
+        expect(calls.filter(([kind]) => kind === 'sendBack')).toHaveLength(1);
+        expect(gateRoundGrants(comments, 4722, REPO, scope)).toEqual([expect.objectContaining({ by: 1, standingRuling: RULING_ID })]);
+        const pr = { number: 4722, repo: REPO, headRefOid: HEAD, labels: ['review:changes'], comments, standingRuling: scope };
+        expect(redTeamQueueReason(pr)).toMatch(/the fixer owns them/);
+        expect(redTeamRulingNeeded({ ...pr, labels: ['review:accepted'] })).toBeNull();
+      });
+
+      it('without a verified scope the same grant reopens nothing (fail closed)', async () => {
+        for (const readGrantScope of [() => null, () => { throw new Error('gh down'); }]) {
+          const { io, calls } = fakeIo({ comments: [comment([F()]), capRecord(), autoGrant], round: 12, readRoundAsOf: () => 12, readGrantScope });
+          expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'already-acted', outcome: 'round-cap' });
+          expect(calls).toEqual([]);
+        }
+      });
+    });
   });
 
   it('acts once per head: the gate record dedups', async () => {
