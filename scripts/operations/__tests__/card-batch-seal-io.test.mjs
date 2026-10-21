@@ -931,3 +931,12 @@ it('a first-attempt proof git failure (not a clean no) propagates instead of the
   await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toBe(boom);
   expect(activeSlot(f).sealFailure).toBeUndefined();
 });
+
+it('launches the seal worker as the worker App role even when the caller is the read-only observer', async () => {
+  const f = fixture(); const spawn = vi.fn(fakeChild);
+  const prior = process.env.WE_GITHUB_APP_ROLE; process.env.WE_GITHUB_APP_ROLE = 'observer';
+  try { expect(await sealDueBatches({ now: 60000, stateDir: f.dir, policy: f.opts.policy, spawn })).toEqual([f.statePath]); }
+  finally { if (prior === undefined) delete process.env.WE_GITHUB_APP_ROLE; else process.env.WE_GITHUB_APP_ROLE = prior; }
+  expect(spawn.mock.calls[0][2].env.WE_GITHUB_APP_ROLE).toBe('worker');
+  expect(spawn.mock.calls[0][2].env.PATH).toBe(process.env.PATH);
+});
