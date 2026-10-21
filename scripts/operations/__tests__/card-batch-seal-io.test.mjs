@@ -255,15 +255,45 @@ it.each([
   ['unrun checks', { ok: false, failed: 0, unrun: 1, blocking: [{ why: 'did-not-run' }] }],
   ['an empty suite', { ok: false, failed: 0, unrun: 0, emptySuite: true, blocking: [] }],
   ['a did-not-run blocker', { ok: false, blocking: [{ why: 'did-not-run' }] }],
-])('treats a parsed verdict with %s as retryable, and holds only after the cap', async (_name, verdict) => {
+])('treats a parsed verdict with %s as retryable, and defers (never holds) after the cap', async (_name, verdict) => {
   const f = fixture({ maxCards: 1 });
   const exec = (cmd, args, options) => (args[1] === 'verify' ? JSON.stringify({ verdict }) : f.exec(cmd, args, options));
   for (let attempt = 1; attempt < VERIFY_UNRUN_CAP; attempt++) {
     await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toThrow('verify unrun');
     expect(JSON.parse(readFileSync(f.statePath, 'utf8')).sealFailure).toBeUndefined();
   }
+  expect((await publishBatch(f.input, { ...f.opts, exec })).action).toBe('deferred');
+  const saved = JSON.parse(readFileSync(f.statePath, 'utf8'));
+  expect(saved.sealFailure).toBeUndefined();
+  expect(saved.batchRef).toBeDefined();
+  expect(Date.parse(saved.verifyRetryAfter)).toBe(1000 + 15 * 60_000);
+  // Every caller honours the pause until it passes.
+  const calls = f.calls.length;
+  expect((await publishBatch(f.input, { ...f.opts, exec })).action).toBe('deferred');
+  expect(f.calls.length).toBe(calls);
+});
+const unrunPausedState = (f, retryAfter) => writeFileSync(f.statePath, JSON.stringify({ ...f.state, sealedAt: 500,
+  seal: { step: 'record-sealed' }, verifyUnrun: VERIFY_UNRUN_CAP, verifyRetryAfter: new Date(retryAfter).toISOString() }));
+it('re-arms a capacity-paused seal only after the pause and with a free heavy slot', async () => {
+  const f = fixture({ maxCards: 1 }); const spawn = vi.fn(fakeChild);
+  unrunPausedState(f, 10_000);
+  const free = vi.fn(async () => ({ freeCount: 1 }));
+  expect(await sealDueBatches({ now: 5000, stateDir: f.dir, policy: f.opts.policy, spawn, readHeavyQueue: free })).toEqual([]);
+  expect(await sealDueBatches({ now: 20_000, stateDir: f.dir, policy: f.opts.policy, spawn, readHeavyQueue: async () => ({ freeCount: 0 }) })).toEqual([]);
+  expect(JSON.parse(readFileSync(f.statePath, 'utf8')).verifyUnrun).toBe(VERIFY_UNRUN_CAP);
+  expect(await sealDueBatches({ now: 20_000, stateDir: f.dir, policy: f.opts.policy, spawn, readHeavyQueue: async () => { throw new Error('unreadable'); } })).toEqual([]);
+  expect(await sealDueBatches({ now: 20_000, stateDir: f.dir, policy: f.opts.policy, spawn, readHeavyQueue: free })).toEqual([f.statePath]);
+  const saved = JSON.parse(readFileSync(f.statePath, 'utf8'));
+  expect(saved.verifyUnrun).toBeUndefined();
+  expect(saved.verifyRetryAfter).toBeUndefined();
+  expect(saved.sealedAt).toBe(500);
+});
+it('a verify that RAN and failed still holds permanently', async () => {
+  const f = fixture({ maxCards: 1 });
+  const exec = (cmd, args, options) => (args[1] === 'verify' ? JSON.stringify({ verdict: { ok: false, failed: 2, blocking: [{ why: 'failed' }] } }) : f.exec(cmd, args, options));
   expect((await publishBatch(f.input, { ...f.opts, exec })).action).toBe('held');
-  expect(f.read().sealFailure.reason).toContain(`${VERIFY_UNRUN_CAP} times`);
+  expect(f.read().sealFailure).toBeDefined();
+  expect(f.read().verifyRetryAfter).toBeUndefined();
 });
 it('still records a verdict that names a real failure as terminal at once, even alongside unrun checks', async () => {
   const f = fixture({ maxCards: 1 });

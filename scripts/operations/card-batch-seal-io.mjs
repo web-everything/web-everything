@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { acquireLease, atomicRecord, cardBatchStateDir, catFileBatch, provenMergedLanding, retireBatch, retireTerminalBatch, tokenOf } from './card-batch-io.mjs';
 import { planPublish, planSeal, renderBatchBody } from './card-batch-seal.mjs';
 import { CARD_BATCH_KINDS } from '../lib/card-batch-policy.mjs';
-import { effectiveCardBatchPolicy } from '../lib/card-batch-settings.mjs';
+import { effectiveCardBatchPolicy, loadVerifyRetryMinutes } from '../lib/card-batch-settings.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { readVerifyMarker, VERIFY_FILENAME } from '../lib/lane-verify.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
@@ -41,7 +41,7 @@ export function resolveAdoptDescendantHead({ env = process.env, read = readSetti
 /** Call after admission. All commands, including lane acquisition, pass through the injected runner. */
 export async function publishBatch(input, opts = {}) {
   const { stateDir = CARD_BATCH_STATE_DIR, exec = batchExec, clock = Date.now, remote = 'origin',
-    policy = effectiveCardBatchPolicy(), leaseMs = 3 * 60 * 60_000, crashAt } = opts;
+    policy = effectiveCardBatchPolicy(), leaseMs = 3 * 60 * 60_000, crashAt, verifyRetryMinutes = loadVerifyRetryMinutes() } = opts;
   const now = () => new Date(clock()).getTime();
   const statePath = resolve(input.statePath ?? join(stateDir, `${input.source.repo.replaceAll('/', '-')}-${input.kind}.json`));
   mkdirSync(dirname(statePath), { recursive: true });
@@ -147,6 +147,8 @@ export async function publishBatch(input, opts = {}) {
       if (threw) throw thrown;
       return returned;
     };
+    // A capacity pause is honoured by every caller until `sealDueBatches` re-arms it (that is where the free-slot check lives).
+    if (state.verifyRetryAfter) return { action: 'deferred', state };
     const restoreProtection = async () => {
       if (!state.restoreProtection) return;
       await gh(['pr', 'edit', String(state.pr), '--repo', repo, '--add-label', HOLD_LABEL]);
@@ -284,10 +286,11 @@ export async function publishBatch(input, opts = {}) {
           state.verifyUnrun = (state.verifyUnrun ?? 0) + 1;
           const detail = JSON.stringify(verdict?.blocking ?? verified?.error ?? 'no verdict');
           if (state.verifyUnrun < VERIFY_UNRUN_CAP) { save(); throw new Error(`verify unrun: ${detail}`); }
-          state.sealFailure = { reason: `verify did not run ${state.verifyUnrun} times: ${detail}`, at: new Date(now()).toISOString() };
+          // Capacity, not a verdict: keep the batch and re-arm after a pause (`sealDueBatches` resets the count).
+          state.verifyRetryAfter = new Date(now() + verifyRetryMinutes * 60_000).toISOString();
+          state.verifyUnrunReason = `verify did not run ${state.verifyUnrun} times: ${detail}`.slice(0, 500);
           save();
-          await retire();
-          return { action: 'held', state };
+          return { action: 'deferred', state };
         }
         if (!verdict.ok) {
           state.sealFailure = { reason: JSON.stringify(verdict.blocking ?? 'verify red'), at: new Date(now()).toISOString() };
@@ -324,16 +327,34 @@ export async function publishBatch(input, opts = {}) {
   }
 }
 
+const defaultHeavyQueue = async () => (await import('./heavy-queue-io.mjs')).collectHeavyQueue();
+/** A free heavy slot per the heavy-queue reader; an unreadable queue counts as full (retry next tick). */
+async function heavyQueueFree(read) {
+  try { return (await read())?.freeCount > 0; } catch { return false; }
+}
+/** Clear the unrun count and pause under the batch lease so a running worker is never raced. */
+function rearmVerify(path, now) {
+  const lockPath = `${path}.lock`;
+  const lease = acquireLease(lockPath, `rearm:${process.pid}:${randomUUID()}`, now, 60_000);
+  if (!lease) return false;
+  try {
+    const state = readState(path);
+    delete state.verifyUnrun; delete state.verifyRetryAfter; delete state.verifyUnrunReason;
+    atomicRecord(path, state);
+    return true;
+  } finally { if (tokenOf(lockPath) === lease.token) rmSync(lockPath, { force: true }); }
+}
+
 /** Tick only scans and launches; the detached worker owns verification and the admission lease. */
 export async function sealDueBatches({ now = Date.now(), stateDir = CARD_BATCH_STATE_DIR,
-  policy = effectiveCardBatchPolicy(), spawn = spawnChild, open = openSync } = {}) {
+  policy = effectiveCardBatchPolicy(), spawn = spawnChild, open = openSync, readHeavyQueue = defaultHeavyQueue } = {}) {
   let files;
   try { files = readdirSync(stateDir); } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
   const jobs = [];
   const errors = [];
   if (files.includes('sealed')) {
     // A broken archive must not stop the active batches below from launching; its error joins the aggregate.
-    try { jobs.push(...await sealDueBatches({ now, stateDir: join(stateDir, 'sealed'), policy, spawn, open })); }
+    try { jobs.push(...await sealDueBatches({ now, stateDir: join(stateDir, 'sealed'), policy, spawn, open, readHeavyQueue })); }
     catch (error) { jobs.push(...(error.launched ?? [])); errors.push(error); }
   }
   for (const file of files.filter(file => file.endsWith('.json'))) {
@@ -345,6 +366,11 @@ export async function sealDueBatches({ now = Date.now(), stateDir = CARD_BATCH_S
       if (basename(stateDir) === 'sealed' && (state.sealFailure || state.seal?.step === 'label-on-green'
         || ['MERGED', 'CLOSED'].includes(state.terminalPrState))) continue;
       const kind = kindOf(state, path);
+      if (state.verifyRetryAfter && !state.sealFailure) {
+        // Verify could not run (capacity): wait out the pause, then re-arm only when the heavy queue has a free slot.
+        if (now < Date.parse(state.verifyRetryAfter) || !(await heavyQueueFree(readHeavyQueue))) continue;
+        if (!rearmVerify(path, now)) continue;
+      }
       // Any seal reason launches (count beats age in shouldSeal); the lease serialises the worker against inline sealing.
       // A PR whose hold was never confirmed relaunches too, so the unheld-draft window closes without waiting for a seal.
       // `now` was sampled at tick start; a batch admitted since has openedAt after it. Its age is zero, not an error.
