@@ -9,9 +9,14 @@ export { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-s
 
 export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head, evidence = {}, env = {}, savedResult } = {}) {
   const disposition = readRedTeamDisposition({ comments, pr, head, env, savedResult, repo });
+  const names0 = labels.map(l => typeof l === 'string' ? l : l?.name);
+  // #5608 — a red-team record that is provably over and never owed (`overNotOwed`, see the evidence reader) shows no
+  // pending label on a PR that is not accepted. An accepted PR keeps its pending label: the drain still holds it.
+  const overNotOwed = evidence.overNotOwed === true && !names0.includes('review:accepted');
   const desired = disposition.sendBack.length || disposition.held.length ? 'red-team:blocked'
     : disposition.result?.recheckIncomplete ? 'red-team:pending'
       : disposition.result ? 'red-team:clear'
+      : overNotOwed ? null
       : redTeamOwedOnHead({ read: evidence.loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly }) ? 'red-team:pending' : null;
   const names = labels.map(l => typeof l === 'string' ? l : l?.name);
   return { add: desired && !names.includes(desired) ? desired : null,

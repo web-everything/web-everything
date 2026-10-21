@@ -17,6 +17,13 @@ export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDi
 const statusPath = ({ repo, pr, head }, env) => join(redTeamStatusDir(env),
   `${encodeURIComponent(String(repo).toLowerCase())}-${Number(pr)}-${String(head).toLowerCase()}.json`);
 
+/** How long a local `running` record with a dead pid is kept as "attempted" before it is read as over. Env override in minutes. */
+export const STALE_RUNNING_TTL_MIN = 30;
+export function staleRunningTtlMs(env = process.env) {
+  const min = Number(env?.WE_RED_TEAM_STALE_RUNNING_TTL_MIN);
+  return (Number.isFinite(min) && min > 0 ? min : STALE_RUNNING_TTL_MIN) * 60_000;
+}
+
 /** A status is written before settling speculation or starting the sequential pass; crashes leave a dead pid. */
 export function recordRedTeamStatus({ repo, pr, loopPayload, status, result = null }, { env = process.env, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime } = {}) {
   const head = loopPayload?.findings?.read?.netBasis?.rev;
@@ -31,7 +38,7 @@ export function recordRedTeamStatus({ repo, pr, loopPayload, status, result = nu
 /** Absence of a review payload is not an accept. Labels alone never schedule a post-accept pass. */
 export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   runsDir = resolveRunsDir(), list = listRunIds, read = readRun, isAlive = pidAlive, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
-  readScorecards } = {}) {
+  readScorecards, now = Date.now } = {}) {
   const legacyStatusPath = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
   head = String(head ?? '').toLowerCase();
   // One scorecard read for this whole call, shared with the saved-result check below (xwu9oxh S2, per operation).
@@ -91,7 +98,15 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
       }
     }
     const resultStatus = typeof status.result === 'string' ? status.result : status.result?.status;
-    return withUsability({ ...(untrustedSavedResult ? { untrustedSavedResult: true } : {}), loopPayload: status.loopPayload, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
+    // A pass that is provably over and was never owed: a `not-owed` finish (the review did not accept), or a LOCAL
+    // `running` record whose pid has been dead past the TTL (a speculative pass called off before its record was
+    // finished; live #5608), on a head whose newest review does not owe a post-accept pass. This is DISPLAY evidence
+    // only (`overNotOwed`, read by the status-label planner): every scheduling/attempt field below is unchanged, so the
+    // drain's merge hold is exactly as before (a human accept over a non-accepting run still needs a result).
+    const staleRunning = status.status === 'running' && !live && now() - statusAt >= staleRunningTtlMs(env);
+    const notOwedFinish = status.status === 'finished' && resultStatus === 'not-owed';
+    const overNotOwed = (staleRunning || notOwedFinish) && !redTeamOwedFor(latestRun().run ?? status.loopPayload);
+    return withUsability({ ...(overNotOwed ? { overNotOwed: true } : {}), ...(untrustedSavedResult ? { untrustedSavedResult: true } : {}), loopPayload: status.loopPayload, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
       ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: redTeamPanelSeatOwed(status.loopPayload, env) || ['queued', 'running'].includes(status.status) || ['ran', 'error'].includes(resultStatus),
       recorded: recorded || resultStatus === 'ran',
       // A pass whose job died while running started and left no usable result, like one that errored.

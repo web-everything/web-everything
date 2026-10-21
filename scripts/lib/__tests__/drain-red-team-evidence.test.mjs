@@ -13,6 +13,7 @@ import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
 import { readDrainRedTeamEvidence, recordRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { pidStartTime } from '../pid-alive.mjs';
+import { planRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -208,4 +209,77 @@ it('replays #5461 saved and posted old-head breaks without treating them as live
   const comments = [{ author: { login: 'web-everything' }, body: renderRedTeamComment({ pr: f.pr, rev: oldHead, findings, recheckStatus: 'ok' }) }];
   expect(redTeamEnqueueHold({ ...f, ...evidence, comments, requestPending: true })).toBe('post-accept red team has no recorded result on the live head');
   expect(redTeamEnqueueHold({ ...f, ...evidence, comments, head: oldHead })).toContain('requiring send-back');
+});
+
+// Live #5608: a speculative red team wrote `running`, the review never accepted (prevention-outstanding), and the
+// pass was discarded without finishing its record. The dead record read as an attempted pass forever and kept
+// `red-team:pending` on a PR no red team was owed on. The reader now marks such a record `overNotOwed` for the label
+// planner ONLY; every scheduling/attempt field the drain's merge hold reads is unchanged.
+describe('a red-team record that is provably over and never owed clears the label, never the merge hold', () => {
+  const timed = (f, timing) => ({ ...f, env: { ...f.env, WE_RED_TEAM_TIMING: timing } });
+  const notAccepted = head => ({ verdict: { verdict: 'prevention-outstanding' }, findings: { read: { netBasis: { rev: head } } } });
+  const statusFileOf = f => join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
+  function seed(f, verdictPayload, { status = 'running', result = null, ageMin = 120 } = {}) {
+    writeRun({ ...newRunRecord({ id: 'review-pr-5608', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), ...verdictPayload }, f.runsDir);
+    const runAt = new Date(Date.now() - (ageMin + 1) * 60_000);
+    utimesSync(join(f.runsDir, 'review-pr-5608.json'), runAt, runAt);
+    recordRedTeamStatus({ ...f, loopPayload: { findings: { read: { netBasis: { rev: f.head } } } }, status, result }, f);
+    const at = new Date(Date.now() - ageMin * 60_000);
+    utimesSync(statusFileOf(f), at, at);
+  }
+  const plan = (f, evidence, labels) => planRedTeamStatusLabels({ labels, comments: [], repo: f.repo, pr: f.pr, head: f.head, evidence, env: f.env, savedResult: null });
+  it.each(['panel-seat', 'post-accept'])('#5608 shape (%s): a dead `running` past the TTL on a non-accepting head drops red-team:pending', timing => {
+    const f = timed(fixture(), timing);
+    seed(f, notAccepted(f.head));
+    const evidence = readDrainRedTeamEvidence({ ...f, isAlive: () => false });
+    expect(evidence).toMatchObject({ overNotOwed: true, inFlight: false, attempted: true });
+    expect(plan(f, evidence, ['red-team:pending'])).toEqual({ add: null, remove: ['red-team:pending'] });
+  });
+  it('a dead `running` younger than the TTL is not marked over (unchanged)', () => {
+    const f = timed(fixture(), 'panel-seat');
+    seed(f, notAccepted(f.head), { ageMin: 5 });
+    const evidence = readDrainRedTeamEvidence({ ...f, isAlive: () => false });
+    expect(evidence.overNotOwed).toBeUndefined();
+    expect(plan(f, evidence, []).add).toBe('red-team:pending');
+  });
+  it.each(['panel-seat', 'post-accept'])('(%s) a human-accepted head over a non-accepting run keeps its merge hold and its pending label', timing => {
+    const f = timed(fixture(), timing);
+    seed(f, notAccepted(f.head));
+    const before = readDrainRedTeamEvidence({ ...f, isAlive: () => false, now: () => 0 });
+    const evidence = readDrainRedTeamEvidence({ ...f, isAlive: () => false });
+    // Merge-relevant fields are identical with and without the TTL having passed.
+    const { overNotOwed, ...rest } = evidence;
+    expect(rest).toEqual(before);
+    expect(redTeamEnqueueHold({ ...f, ...evidence, labels: ['review:accepted'], comments: [] })).toMatch(/no recorded result/);
+    expect(plan(f, evidence, ['review:accepted', 'red-team:pending']).remove).not.toContain('red-team:pending');
+  });
+  it('a dead `running` past the TTL on an ACCEPTING head is not marked over and keeps every hold', () => {
+    const f = timed(fixture(), 'panel-seat');
+    seed(f, payload(f.head));
+    const evidence = readDrainRedTeamEvidence({ ...f, isAlive: () => false });
+    expect(evidence.overNotOwed).toBeUndefined();
+    expect(evidence).toMatchObject({ attempted: true, scheduled: true });
+    expect(redTeamEnqueueHold({ ...f, ...evidence, comments: [] })).toMatch(/no recorded result/);
+  });
+  it('a LIVE `running` pass past the TTL still counts as running and is not marked over', () => {
+    const f = timed(fixture(), 'panel-seat');
+    seed(f, notAccepted(f.head));
+    const evidence = readDrainRedTeamEvidence({ ...f, isAlive: () => true, readPidStart: () => pidStartTime(process.pid) });
+    expect(evidence).toMatchObject({ inFlight: true, scheduled: true });
+    expect(evidence.overNotOwed).toBeUndefined();
+  });
+  it('a `running` record from another host past the TTL still counts as running', () => {
+    const f = timed(fixture(), 'panel-seat');
+    seed(f, notAccepted(f.head));
+    const evidence = readDrainRedTeamEvidence({ ...f, host: 'some-other-host', isAlive: () => false });
+    expect(evidence).toMatchObject({ inFlight: true });
+    expect(evidence.overNotOwed).toBeUndefined();
+  });
+  it('a `not-owed` finish on a non-accepting head under panel-seat timing drops the pending label', () => {
+    const f = timed(fixture(), 'panel-seat');
+    seed(f, notAccepted(f.head), { status: 'finished', result: 'not-owed', ageMin: 0 });
+    const evidence = readDrainRedTeamEvidence({ ...f, isAlive: () => false });
+    expect(evidence.overNotOwed).toBe(true);
+    expect(plan(f, evidence, ['red-team:pending'])).toEqual({ add: null, remove: ['red-team:pending'] });
+  });
 });

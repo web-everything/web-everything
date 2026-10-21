@@ -75,9 +75,11 @@ import {
   acceptResumeCommand, buildAcceptQueueEntry, buildPreventionFilingInput, buildPreventionQueueEntry, preventionHeadMarker,
   cardCoversGuard, isPreventionOutstandingClear, isPreventionOutstandingParked, isQueuedAcceptStop, reviewLoopAutoConfirm,
   buildRoundCardsFilingInput, isRoundCardsParked, roundCardsAcceptReason, roundCardsDecision, roundCardsFindingsFingerprint,
-  roundCardsFindingsMarker, roundCardsHeadMarker,
+  roundCardsFindingsMarker, roundCardsHeadMarker, unrulableBrokenSendBackReason,
 } from '../lib/review-loop-policy.mjs';
-import { unattendedAcceptableVerdict, unattendedAcceptHold, unattendedAcceptPolicy } from '../lib/unattended-review-accept.mjs';
+import { BROKEN_UNRULED_HOLD, unattendedAcceptableVerdict, unattendedAcceptHold, unattendedAcceptPolicy,
+  unrulableBrokenFindings } from '../lib/unattended-review-accept.mjs';
+import { CONFIRM_ACTORS } from './review-pr-constants.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { hasUncapturedPrevention } from '../lib/jury-core.mjs';
 import { findResumableParkedRun, persistRetryBudgetSpent, readReviewRunEvidence, reviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
@@ -592,6 +594,14 @@ export async function runReviewLoopOnce({
         expectedHead: run.findings?.read?.netBasis?.rev, roundCards, cardReadable });
     } catch (error) { return `live referrals unavailable: ${error.message}`; }
   };
+  // The broken findings no referral could ever rule, read against the LIVE thread (null on any doubt: then it parks).
+  const unrulableBrokenFor = (run) => {
+    try {
+      const live = readAcceptancePr(run.input);
+      return unrulableBrokenFindings({ ...run.input, verdict: run.verdict, ...live, head: live.headRefOid,
+        expectedHead: run.findings?.read?.netBasis?.rev, cardReadable });
+    } catch { return null; }
+  };
   const drive = (o) => {
     const guardedConfirm = (pending, current) => {
       const answer = o.autoConfirm?.(pending, current);
@@ -732,6 +742,25 @@ export async function runReviewLoopOnce({
 
   if (outcome.stopped === 'confirm') {
     const hold = acceptHold(outcome.run);
+    // A `broken` finding with NO referral that could rule it never lifts this hold by itself (live #5608: the same head
+    // parked 7 times with no verdict). On the agent-addressed tier, send it back with those findings instead of parking.
+    // Never an accept, and only when no referral record, operator ruling or verdict referral exists; otherwise unchanged.
+    const unrulable = hold === BROKEN_UNRULED_HOLD && outcome.run?.pending?.of === CONFIRM_ACTORS.AGENT
+      ? unrulableBrokenFor(outcome.run) : null;
+    if (unrulable) {
+      const sending = { ...outcome.run, input: { ...outcome.run.input, reason: unrulableBrokenSendBackReason(unrulable) } };
+      store.write(sending);
+      const sentBack = await drive({
+        run: sending, registry, store, sinks, judge: activeJudge, resume: { step: outcome.run.pending.step, value: 'changes' },
+        autoConfirm, attemptedBy: 'agent',
+      });
+      const rendered = renderOutcome({ outcome: sentBack, json: parsed.control.json, declaration });
+      const line = `Unattended accept held (${hold}) with no referral to rule it — sent back as \`changes\` with `
+        + `${unrulable.length} broken finding(s).`;
+      return { ...rendered, lines: parsed.control.json
+        ? [JSON.stringify({ ...JSON.parse(rendered.lines[0]), unrulableBrokenSendBack: unrulable.length })]
+        : [...rendered.lines, '', line], run: sentBack.run, stopped: sentBack.stopped };
+    }
     if (hold) {
       const rendered = renderOutcome({ outcome, json: parsed.control.json, declaration });
       return { ...rendered, lines: parsed.control.json ? rendered.lines
