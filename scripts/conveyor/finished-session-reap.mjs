@@ -28,13 +28,16 @@
  *
  * PURE core: {@link planFinishedSessionReap}. IO shell: {@link runFinishedSessionReap}.
  */
-import { resolve, sep } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { join, resolve, sep } from 'node:path';
 
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { pidAlive as defaultPidAlive } from '../lib/pid-alive.mjs';
 import { dispatchScratchRoot } from '../operations/dispatch-lane-io.mjs';
-import { readLiveFixClaim } from './fix-procedure.mjs';
+import { FIXING_KIND, isLiveFixClaim, repoKeyOf } from './fix-procedure.mjs';
+import { fixDispatchClaimRoot, fixDispatchResource } from './fix-claim-store.mjs';
+import { lockDirFor, readLockEntry } from '../readiness/file-locks.mjs';
 import { stopSessionWithRetry } from './session-reaper.mjs';
 
 export const FINISHED_SESSION_REAP_POLICY = 'finishedSessionReap';
@@ -79,6 +82,22 @@ export function resolveFinishedSessionReapSettings({ env = process.env, file = n
   return { enabled: v.enabled !== false, afterMinutes, afterMs: afterMinutes * MINUTE, sources: r.sources ?? {} };
 }
 
+/**
+ * IO, STRICT: the PR's live fix claim, `null` ONLY when confirmed absent or expired. `readLiveFixClaim` maps an
+ * unreadable or corrupt `lock.json` to `null` (absent), which would fail OPEN here; this throws instead, so the
+ * caller holds. Absent = `lock.json` reports ENOENT; any other read error, or a file that does not parse, throws.
+ */
+export function readLiveFixClaimStrict({ repo, pr, nowMs = Date.now(), lockRoot = fixDispatchClaimRoot(), readFile = readFileSync, readEntry = readLockEntry }) {
+  const resource = fixDispatchResource({ repo: repoKeyOf(repo), pr: Number(pr), kind: FIXING_KIND });
+  try { readFile(join(lockDirFor(lockRoot, resource), 'lock.json'), 'utf8'); } catch (e) {
+    if (e?.code === 'ENOENT') return null;
+    throw new Error(`claim lock unreadable: ${e?.code ?? String(e?.message ?? e).split('\n')[0]}`);
+  }
+  const entry = readEntry(lockRoot, resource);
+  if (!entry) throw new Error('claim lock present but unparseable');
+  return isLiveFixClaim(entry, nowMs) ? entry : null;
+}
+
 /** Is `cwd` a direct-or-deeper child of `root` (never `root` itself)? */
 export function isUnderRoot(cwd, root) {
   if (!cwd || !root) return false;
@@ -117,7 +136,7 @@ export function runFinishedSessionReap({
   notes = [], nowMs = Date.now(), dryRun = false, env = process.env,
   settings = resolveFinishedSessionReapSettings({ env }),
   dispatchRoot = null,
-  readClaim = ({ repo, pr }) => readLiveFixClaim({ repo, pr, nowMs }),
+  readClaim = ({ repo, pr }) => readLiveFixClaimStrict({ repo, pr, nowMs }),
   probePid = (pid) => { try { return defaultPidAlive(pid); } catch { return null; } },
   stop = stopSessionWithRetry,
 } = {}) {

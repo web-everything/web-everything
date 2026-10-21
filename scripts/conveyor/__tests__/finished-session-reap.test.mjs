@@ -7,8 +7,13 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   planFinishedSessionReap, runFinishedSessionReap, resolveFinishedSessionReapSettings, isUnderRoot,
-  formatFinishedSessionReapLines, FINISHED_SESSION_REAP_STANDARD,
+  formatFinishedSessionReapLines, FINISHED_SESSION_REAP_STANDARD, readLiveFixClaimStrict,
 } from '../finished-session-reap.mjs';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fixDispatchResource } from '../fix-claim-store.mjs';
+import { lockDirFor } from '../../readiness/file-locks.mjs';
 
 const ROOT = '/ws/.operations/dispatch';
 const RELEASED = Date.parse('2026-10-21T13:00:00Z');
@@ -94,5 +99,32 @@ describe('resolveFinishedSessionReapSettings — cascade with sources', () => {
     expect(resolveFinishedSessionReapSettings({ env: { ...quiet, WE_FINISHED_SESSION_REAP_MINUTES: '30', WE_FINISHED_SESSION_REAP: '0' }, file: { finishedSessionReap: { afterMinutes: 20 } } }))
       .toMatchObject({ afterMinutes: 30, enabled: false, sources: { afterMinutes: 'env', enabled: 'env' } });
     expect(resolveFinishedSessionReapSettings({ env: { ...quiet, WE_FINISHED_SESSION_REAP_MINUTES: '0' }, file: {} })).toMatchObject({ afterMinutes: 10 });
+  });
+});
+
+describe('readLiveFixClaimStrict — fails closed, unlike readLiveFixClaim (Codex audit, 2026-10-21)', () => {
+  const setup = () => {
+    const lockRoot = mkdtempSync(join(tmpdir(), 'fsr-claim-'));
+    const dir = lockDirFor(lockRoot, fixDispatchResource({ repo: 'we', pr: 5758, kind: 'fixing' }));
+    return { lockRoot, dir };
+  };
+  it('absent lock → null', () => {
+    expect(readLiveFixClaimStrict({ repo: 'we', pr: 5758, lockRoot: setup().lockRoot })).toBeNull();
+  });
+  it('corrupt lock → throws, and the run holds (never stops)', () => {
+    const { lockRoot, dir } = setup();
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'lock.json'), '{not json');
+    expect(() => readLiveFixClaimStrict({ repo: 'we', pr: 5758, lockRoot })).toThrow(/unparseable/);
+    const stop = vi.fn();
+    const out = runFinishedSessionReap({ notes: [note()], nowMs: NOW, settings, dispatchRoot: ROOT, probePid: () => true, stop,
+      readClaim: ({ repo, pr }) => readLiveFixClaimStrict({ repo, pr, lockRoot, nowMs: NOW }) });
+    expect(stop).not.toHaveBeenCalled();
+    expect(out.rows[0]).toMatchObject({ decision: 'hold', reason: expect.stringMatching(/unreadable/) });
+  });
+  it('a read error other than ENOENT → throws', () => {
+    const { lockRoot } = setup();
+    const readFile = () => { const e = new Error('denied'); e.code = 'EACCES'; throw e; };
+    expect(() => readLiveFixClaimStrict({ repo: 'we', pr: 5758, lockRoot, readFile })).toThrow(/EACCES/);
   });
 });

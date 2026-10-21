@@ -94,3 +94,11 @@ describe('an INFO-kind 🔔 comment is never an open question (live #5758, 2026-
     expect(latestUnresolvedPersonNote([note(), note('2026-10-21T13:24:00Z', infoBody)])).toMatchObject({ kind: 'round-cap-exhausted' });
   });
 });
+
+describe('an INFO comment posted with operator credentials is not an answer (Codex audit, 2026-10-21)', () => {
+  it('the earlier real question stays open', () => {
+    const infoBody = `${NOTE_COMMENT_MARKER}\n\nneeds your decision: released-claim-session-ignored\n\nx\n\n<!-- conveyor-note-key: released-claim-session-ignored:5270:x -->`;
+    expect(latestUnresolvedPersonNote([note(), operator('2026-10-21T13:24:00Z', infoBody)])).toMatchObject({ kind: 'round-cap-exhausted' });
+    expect(latestUnresolvedPersonNote([note(), operator('2026-10-21T13:24:00Z')])).toBeNull();
+  });
+});
