@@ -85,7 +85,8 @@ let remainingStandDownFindings;
 try { ({ remainingStandDownFindings } = await import('../conveyor/ruling-resolved-stand-down.mjs')); }
 catch { /* Staged copies still surface the question without remaining findings. */ }
 let needsPersonRow;
-try { ({ needsPersonRow } = await import('./operator-queue-needs-person.mjs')); } catch { /* optional in staged copies */ }
+let latestUnresolvedPersonNote = () => null;
+try { ({ needsPersonRow, latestUnresolvedPersonNote } = await import('./operator-queue-needs-person.mjs')); } catch { /* optional in staged copies */ }
 // An open, still-collecting card batch is held on purpose; staged copies without the module keep alerting.
 let isCollectingBatchPr = () => false;
 try { ({ isCollectingBatchPr } = await import('./card-batch-hold-state.mjs')); } catch { /* optional in staged copies */ }
@@ -769,7 +770,11 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
         const row = needsPersonRow?.(repo, pr);
         if (!row) continue;
         // Only the withdrawn-draft notice is expected for a collecting batch; any other person-note still raises.
-        if (row.kind === 'draft-withdrawn' && pr.isDraft === true && isCollectingBatchPr(repo, pr.number)) continue;
+        // (1021c) the withdrawn-label row takes precedence in needsPersonRow, so a DIFFERENT outstanding person-note on the
+        // same collecting-batch PR is read here and keeps it raised.
+        const otherNote = latestUnresolvedPersonNote(pr.comments);
+        if (row.kind === 'draft-withdrawn' && pr.isDraft === true && isCollectingBatchPr(repo, pr.number)
+          && !(otherNote && otherNote.kind !== 'draft-withdrawn')) continue;
         const notReady = report.notReady.findIndex(r => r.repo === repo && r.number === pr.number);
         report.needsPerson.push({ ...row, alsoNotReady: notReady < 0 ? [] : report.notReady.splice(notReady, 1)[0].reasons });
       }
