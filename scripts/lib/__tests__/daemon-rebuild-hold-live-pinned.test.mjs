@@ -126,16 +126,24 @@ describe('matchReadyCandidate — superseded never drops a live overlay (fail cl
     const m = matchReadyCandidate({
       ...base, ready: ready([{ ref: 'lane/overlay-pin', sha: 'p' }]),
       liveApplied: [{ ref: 'lane/overlay-pin', sha: 'p' }, { ref: 'lane/unfreeze-review-top-1021c', sha: 't' }],
+      carries: (sha) => sha === 'p',
     });
     expect(m.adopt).toBeNull();
     expect(m.reason).toMatch(/superseded-omits-live-overlay: lane\/unfreeze-review-top-1021c/);
+  });
+  it('the same ref at an OLDER head is not carrying it (content, not labels)', () => {
+    const m = matchReadyCandidate({
+      ...base, ready: ready([{ ref: 'lane/overlay-pin', sha: 'p-old' }]), liveApplied: [{ ref: 'lane/overlay-pin', sha: 'p-new' }],
+      carries: (sha) => sha === 'p-old',
+    });
+    expect(m.adopt).toBeNull();
   });
   it('refuses when the live set is unknown; accepts when every live overlay is carried, by ref or by content', () => {
     expect(matchReadyCandidate({ ...base, ready: ready([]) }).reason).toBe('superseded-live-set-unknown');
     const ok = matchReadyCandidate({
       ...base, ready: ready([{ ref: 'lane/overlay-pin', sha: 'p' }, { ref: 'lane/1021d', sha: 'd' }]),
       liveApplied: [{ ref: 'lane/overlay-pin', sha: 'p' }, { ref: 'lane/1021c', sha: 't' }],
-      carries: (sha) => sha === 't', // 1021c's live head is inside the candidate (1021d was built on it)
+      carries: (sha) => sha === 't' || sha === 'p', // 1021c's live head is inside the candidate (1021d was built on it)
     });
     expect(ok.match).toBe('superseded');
     const left = matchReadyCandidate({
