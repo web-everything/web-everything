@@ -30,7 +30,7 @@ import { LEASE_FILENAME } from './lib/lane-lease.mjs';
 import { laneGitHardeningEnv } from './lib/lane-git-hardening.mjs';
 import { applyLaneDietConfig } from './lib/lane-git-diet.mjs';
 import {
-  cleanupEligibility, CLEANUP_POOLS, formatBytes, parseCountObjects, projectedFreedBytes,
+  cleanupEligibility, CLEANUP_POOLS, formatBytes, parseCountObjects, parseGitAlternates, projectedFreedBytes,
 } from './lib/lane-git-diet-cleanup.mjs';
 
 const flags = Object.fromEntries(process.argv.slice(2).map((a) => {
@@ -75,8 +75,8 @@ function borrowerMap() {
   for (const repo of candidates) {
     for (const objects of [join(repo, '.git', 'objects'), join(repo, 'objects')]) {
       let text;
-      try { text = readFileSync(join(objects, 'info', 'alternates'), 'utf8'); } catch { continue; }
-      for (const line of text.split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'))) {
+      try { text = readFileSync(join(objects, 'info', 'alternates')); } catch (err) { if (['ENOENT', 'ENOTDIR'].includes(err.code)) continue; throw err; }
+      for (const line of parseGitAlternates(text)) {
         const target = real(isAbsolute(line) ? line : resolve(objects, line));
         if (!target) continue;
         if (!map.has(target)) map.set(target, []);
@@ -88,8 +88,18 @@ function borrowerMap() {
 }
 const BORROWERS = borrowerMap();
 // Every path the cleanup writes through (config, refs, HEAD, reflogs, the lease marker) — none may be a symlink.
-const GIT_WRITE_PATHS = ['config', 'config.worktree', 'packed-refs', 'refs', 'refs/remotes', 'refs/remotes/origin', 'refs/remotes/origin/ops', 'logs', 'logs/refs', 'logs/refs/remotes', 'logs/refs/remotes/origin', 'logs/refs/remotes/origin/ops', 'HEAD', 'objects', 'objects/pack', 'objects/info', LEASE_FILENAME];
-const symlinkedGitPaths = (dir) => GIT_WRITE_PATHS.filter((p) => { try { return lstatSync(join(dir, '.git', p)).isSymbolicLink(); } catch { return false; } });
+const GIT_WRITE_PATHS = ['config', 'config.worktree', 'packed-refs', 'refs', 'logs', 'HEAD', 'objects', LEASE_FILENAME];
+const symlinkedGitPaths = (dir) => {
+  const links = [];
+  const visit = (path) => {
+    let entry;
+    try { entry = lstatSync(join(dir, '.git', path)); } catch (err) { if (err.code === 'ENOENT') return; throw err; }
+    if (entry.isSymbolicLink()) { links.push(path); return; } // Never traverse even a dangling link.
+    if (entry.isDirectory()) for (const name of readdirSync(join(dir, '.git', path))) visit(join(path, name));
+  };
+  GIT_WRITE_PATHS.forEach(visit);
+  return links;
+};
 const commonDir = (dir) => { try { return real(resolve(dir, git(dir, ['rev-parse', '--git-common-dir']).trim())); } catch { return null; } };
 
 const eligible = (dir) => {
@@ -149,7 +159,8 @@ for (const n of lanes) {
       if (process.env.VITEST && process.env.LANE_GIT_DIET_TEST_LATE_BORROWER) {
         const borrowerObjects = process.env.LANE_GIT_DIET_TEST_LATE_BORROWER;
         mkdirSync(join(borrowerObjects, 'info'), { recursive: true });
-        writeFileSync(join(borrowerObjects, 'info', 'alternates'), `${join(dir, '.git', 'objects')}\n`);
+        const alternate = join(dir, '.git', 'objects');
+        writeFileSync(join(borrowerObjects, 'info', 'alternates'), `${process.env.LANE_GIT_DIET_TEST_QUOTED_ALTERNATE ? JSON.stringify(alternate) : alternate}\n`);
       }
       const lateBorrowers = borrowerMap().get(real(join(dir, '.git', 'objects'))) || [];
       if (lateBorrowers.length) { rows.push({ lane: n, skipped: `objects borrowed by ${lateBorrowers.join(', ')} (config + ref cleanup done, gc skipped)` }); continue; }

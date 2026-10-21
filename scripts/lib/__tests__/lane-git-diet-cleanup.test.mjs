@@ -154,7 +154,9 @@ describe('real git: cleanup CLI', () => {
     expect(readFileSync(join(primary, '.git', 'config'), 'utf8')).toBe(before);
   }, 60_000);
 
-  it('a borrower that appears after the startup scan stops gc on that lane (pre-gc rescan)', () => {
+  it.each([false, true])('a borrower that appears after startup stops gc (quoted alternate: %s)', (quoted) => {
+    rmSync(lane(5), { recursive: true, force: true });
+    rmSync(join(root, 'late-borrower'), { recursive: true, force: true });
     git(root, 'clone', '-q', up, lane(5));
     git(lane(5), 'config', 'fetch.unpackLimit', '100');
     pushLedgerTip();
@@ -163,10 +165,68 @@ describe('real git: cleanup CLI', () => {
     expect(looseBefore).toBeGreaterThan(0);
     const late = join(root, 'late-borrower', 'objects');
     const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--prune-expire=now', '--apply', '--lanes=5', '--json'], {
-      env: { ...env, VITEST: 'true', LANE_GIT_DIET_TEST_LATE_BORROWER: late }, encoding: 'utf8',
+      env: { ...env, VITEST: 'true', LANE_GIT_DIET_TEST_LATE_BORROWER: late, LANE_GIT_DIET_TEST_QUOTED_ALTERNATE: quoted ? '1' : '' }, encoding: 'utf8',
     }));
     expect(out.rows[0].skipped).toMatch(/borrowed by .*late-borrower.*gc skipped/);
     expect(parseCountObjects(git(lane(5), 'count-objects', '-v')).count).toBe(looseBefore); // gc never ran
     expect(existsSync(join(lane(5), '.git', '.lane-lease'))).toBe(false);
+  }, 60_000);
+
+  it.each(['logs/refs/remotes/origin/ops/sub', 'logs/refs/remotes/origin/ops/sub/important.txt', 'refs/remotes/origin/ops/sub'])('refuses a nested symlink at %s without deleting an outside file', (path) => {
+    const dir = lane(7);
+    git(root, 'clone', '-q', up, dir);
+    const ref = 'refs/remotes/origin/ops/sub/important.txt';
+    git(dir, 'update-ref', ref, 'HEAD');
+    const outside = join(root, 'outside');
+    mkdirSync(outside, { recursive: true });
+    const victim = join(outside, 'important.txt');
+    const contents = `${git(dir, 'rev-parse', 'HEAD')}\n`;
+    writeFileSync(victim, contents);
+    const link = join(dir, '.git', path);
+    rmSync(link, { recursive: true, force: true });
+    mkdirSync(join(link, '..'), { recursive: true });
+    symlinkSync(path.endsWith('important.txt') ? victim : outside, link);
+    const configBefore = readFileSync(join(dir, '.git', 'config'), 'utf8');
+    try {
+      const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--apply', '--lanes=7', '--json'], { env, encoding: 'utf8' }));
+      // Check the real victim first: Git's reflog deletion follows intermediate symlinks.
+      expect(existsSync(victim)).toBe(true);
+      expect(readFileSync(victim, 'utf8')).toBe(contents);
+      expect(out.rows[0].skipped).toMatch(/symlinked git paths/);
+      expect(readFileSync(join(dir, '.git', 'config'), 'utf8')).toBe(configBefore);
+      expect(existsSync(join(dir, '.git', '.lane-lease'))).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it.each(['quoted absolute', 'quoted relative', 'octal', 'escaped', 'unicode', 'unquoted spaces', 'quoted BOM', 'unquoted BOM'])('protects objects borrowed via %s alternates', (variant) => {
+    const dir = lane(8);
+    const borrower = join(root, 'quoted-borrower');
+    git(root, 'clone', '-q', up, dir);
+    git(root, 'clone', '-q', up, borrower);
+    const objects = join(dir, '.git', 'objects');
+    const alias = variant.endsWith('BOM') ? join(borrower, '.git', 'objects', '\uFEFFalias') : join(root, variant === 'escaped' ? 'objects "\\\t\n' : variant === 'unicode' ? 'objects-é' : 'objects with spaces');
+    if (['escaped', 'unicode', 'unquoted spaces', 'quoted BOM', 'unquoted BOM'].includes(variant)) symlinkSync(objects, alias);
+    let line = `"${objects}"`;
+    if (variant === 'quoted relative') line = '"../../../.lanes/web-everything/lane-8/.git/objects"';
+    if (variant === 'octal') line = `"${objects.replaceAll('/', '\\057')}"`;
+    if (variant === 'escaped') line = `"${alias.replaceAll('\\', '\\\\').replaceAll('"', '\\"').replaceAll('\t', '\\t').replaceAll('\n', '\\n')}"`;
+    if (variant === 'unicode') line = `"${alias.replace('é', '\\303\\251')}"`;
+    if (variant === 'unquoted spaces') line = alias;
+    if (variant === 'quoted BOM') line = '"\\357\\273\\277alias"';
+    if (variant === 'unquoted BOM') line = '\uFEFFalias';
+    writeFileSync(join(borrower, '.git', 'objects', 'info', 'alternates'), `${line}\n`);
+    const blob = execFileSync('git', ['hash-object', '-w', '--stdin'], { cwd: dir, env, input: 'borrower-only object', encoding: 'utf8' }).trim();
+    git(borrower, 'update-ref', 'refs/keep/borrowed', blob);
+    try {
+      expect(git(borrower, 'cat-file', '-p', blob)).toBe('borrower-only object'); // Git accepts this spelling.
+      const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--prune-expire=now', '--apply', '--lanes=8', '--json'], { env, encoding: 'utf8' }));
+      expect(out.rows[0].skipped).toMatch(/borrowed by .*quoted-borrower/);
+      expect(git(borrower, 'cat-file', '-p', blob)).toBe('borrower-only object');
+      expect(refs(dir)).toContain('refs/remotes/origin/ops/review-requests');
+    } finally {
+      rmSync(borrower, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(alias, { force: true });
+    }
   }, 60_000);
 });

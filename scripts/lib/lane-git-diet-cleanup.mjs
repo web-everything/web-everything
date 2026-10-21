@@ -8,6 +8,30 @@ import { isLeaseStale } from './lane-lease.mjs';
 /** Pools whose `lane-N` dirs the cleanup may touch. `we-drain-daemon` (and any daemon clone) is never one. */
 export const CLEANUP_POOLS = Object.freeze(['web-everything', 'frontierui', 'plateau-app']);
 
+/** Decode Git's line-delimited, optionally C-quoted alternates; octal escapes encode bytes, not Unicode. */
+export function parseGitAlternates(text) {
+  const decode = (bytes) => new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Buffer.from(bytes)).split('\0')[0];
+  const escapes = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '\\': 92, '"': 34 };
+  return Buffer.from(text).toString('latin1').split('\n').filter((line) => line && !line.startsWith('#')).map((line) => {
+    const source = Buffer.from(line, 'latin1');
+    if (source[0] !== 34) return decode(source); // Unquoted spaces and CR are literal path bytes.
+    const bytes = [];
+    for (let i = 1; i < source.length; i++) {
+      if (source[i] === 34) return decode(bytes);
+      if (source[i] !== 92) { bytes.push(source[i]); continue; }
+      const escaped = String.fromCharCode(source[++i]);
+      if (Object.hasOwn(escapes, escaped)) bytes.push(escapes[escaped]);
+      else {
+        const octal = source.subarray(i, i + 3).toString('ascii');
+        if (!/^[0-3][0-7]{2}$/.test(octal)) throw new Error('unrecognized C-quoted alternate; cleanup refused');
+        bytes.push(parseInt(octal, 8));
+        i += 2;
+      }
+    }
+    throw new Error('unterminated C-quoted alternate; cleanup refused');
+  });
+}
+
 /**
  * May the cleanup touch this lane? Pure. Refuses anything that is not `<poolRoot>/<allowed pool>/lane-N`,
  * any path that is a symlink alias (`realDir`/`realGitDir` must be the lane's own `dir` and `dir/.git`), any lane
