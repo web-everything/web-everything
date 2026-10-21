@@ -635,7 +635,8 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
       let ruling = state.rulings.filter(r => r.key === f.key).at(-1);
       // A carry the gate backed returns the SOURCE finding's ruling, keyed by the source key (`carried.from.key`).
       const carry = (record.carried ?? []).find(c => c.key === f.key);
-      if (!ruling && carry && !(record.rulings ?? []).some(r => r.key === f.key)) {
+      // Like the gate, an UNCOUNTED local ruling (say an unreadable card) leaves the carry deciding.
+      if (!ruling && carry) {
         ruling = state.rulings.filter(r => r.key === carry.from?.key).at(-1);
       }
       const where = { file: f.finding?.file ?? null, line: Number.isInteger(f.finding?.line) ? f.finding.line : null };

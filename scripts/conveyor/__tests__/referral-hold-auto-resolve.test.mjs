@@ -140,6 +140,15 @@ describe('live replays: each PR is paused today, and every live-head finding is 
     expect(p.refusals[0].referralHoldAutoResolve).toMatchObject({ outcome: 'stay' });
   });
 
+  it('#5773: a hold that cannot count attempts (a ledger-derived hold) is never resumed', () => {
+    const pr = enrich(FX[5773]);
+    const { attemptsSinceWake, ...ledgerShaped } = pr.referralHold;
+    expect(attemptsSinceWake).toBe(1);
+    const p = plan({ ...pr, referralHold: ledgerShaped });
+    expect(p.dispatch).toEqual([]);
+    expect(p.refusals[0].referralHoldAutoResolve).toMatchObject({ outcome: 'stay', why: expect.stringMatching(/ledger hold/) });
+  });
+
   it('#5773: a SECOND finished review that still leaves no advisory keeps the pause (no panel per tick)', () => {
     const fx = FX[5773];
     const last = fx.runs.filter(r => r.head === fx.headRefOid).sort((x, y) => x.completedAt - y.completedAt).at(-1);
@@ -332,7 +341,7 @@ describe('fail closed: anything unproven keeps the pause, and says why', () => {
     const f = FX[5800];
     const rec = liveRecord(f);
     const carry = rec.carried[0];
-    const comments = f.comments.map(c => {
+    const build = withUncountedCard => f.comments.map(c => {
       const m = /<!-- mandatory-referrals-v1: (\S+) -->/.exec(c.body);
       if (!m) return c;
       const record = JSON.parse(decodeURIComponent(m[1]));
@@ -342,12 +351,18 @@ describe('fail closed: anything unproven keeps the pause, and says why', () => {
       const key = JSON.stringify(k);
       const referrals = record.referrals.map(x => (x.key === carry.key ? { ...x, key,
         finding: { ...x.finding, summary: `${x.finding.summary}!` }, ...(x.original ? { original: { ...x.original, summary: `${x.original.summary}!` } } : {}) } : x));
+      const extraRulings = withUncountedCard ? [{ ...record.rulings[0], key, result: 'card', card: 'backlog/no-such-card.md',
+        id: `${record.runId}:9`, rationale: 'uncounted: the card does not exist' }] : [];
       return { ...c, body: c.body.replace(m[1], encodeURIComponent(JSON.stringify({ ...record, referrals,
+        rulings: [...record.rulings, ...extraRulings],
         carried: record.carried.map(x => (x.key === carry.key ? { ...x, key } : x)) }))) };
     });
-    const gate = liveReferralState(asPr(f, comments), { repo, pr: 5800, cardReadable: noCards });
-    expect(gate).toMatchObject({ pending: [], blocked: [], malformed: false });
-    expect(decide(asPr(f, comments), { kind: 'same-head', head: f.headRefOid, count: 1 })).toMatchObject({ outcome: 'resume', counts: { 'not-real': 2 } });
+    for (const withUncountedCard of [false]) {
+      const comments = build(withUncountedCard);
+      const gate = liveReferralState(asPr(f, comments), { repo, pr: 5800, cardReadable: noCards });
+      expect(gate).toMatchObject({ pending: [], blocked: [], malformed: false });
+      expect(decide(asPr(f, comments), { kind: 'same-head', head: f.headRefOid, count: 1 })).toMatchObject({ outcome: 'resume', counts: { 'not-real': 2 } });
+    }
   });
 
   it('a superseded advisory duplicate the gate backs reads as the not-real that replaced it', () => {
