@@ -2475,6 +2475,23 @@ describe('#5742: a head moved only by the drain numbering commit reads red-team 
       expect(requests).toEqual([expect.objectContaining({ pr: 5742, head: t.head })]);
     } finally { rmSync(t.cwd, { recursive: true, force: true }); }
   });
+  it('Codex re-audit 2 #2: a confirmed break recorded on the ancestor is the numbered head\'s disposition too (send-back, no new review)', () => {
+    const t = setup();
+    try {
+      const labels = ['review:accepted', 'ready-to-merge'];
+      const comment = { user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({ pr: 5742, rev: t.accepted,
+        findings: [{ summary: 'break on the accepted head', category: 'security', impactIfUnfixed: 'broken', confirmedByRecheck: true }], recheckStatus: 'ok' }) };
+      const done = { scheduled: true, recorded: true, inFlight: false, attempted: true, loopPayload: { verdict: { verdict: 'accept' } } };
+      const requests = [];
+      const h = harness({ strategy: 'github-merge-queue', labels, gitExec: t.gitExec, liveComments: [comment],
+        evidenceFor: ({ head }) => (head === t.accepted ? done : { scheduled: false, recorded: false, inFlight: false, loopPayload: null }),
+        ghView: { 5742: { headRefOid: t.head, labels, isDraft: false } }, requestRedTeam: (i) => { requests.push(i); return { requested: true }; } });
+      const outcome = h.s.enqueue({ num: 5742 }, t.head);
+      expect(outcome.enqueued).toBeFalsy();
+      expect(outcome.reason).toContain('requiring send-back');
+      expect(requests).toEqual([]);
+    } finally { rmSync(t.cwd, { recursive: true, force: true }); }
+  });
   it('Codex audit #2: evidence that arrives on the numbered head later in the pass wins over a cached alias', () => {
     const t = setup();
     try {

@@ -344,6 +344,8 @@ export function createDrainMergeStrategy({
     const aliased = redTeamEnqueueHoldAtHead({ ...o, requestPending: false, scheduled: false, inFlight: false, recorded: false, attempted: false,
       queued: false, loopPayload: undefined, skipCardOnly: undefined, ...alias.evidence, head: alias.head });
     if (!aliased) return null;
+    // The ancestor's own disposition on identical content (a break, an incomplete re-check) stands as is.
+    if (aliased.includes('requiring send-back') || aliased.includes('saved red-team re-check incomplete')) return aliased;
     if (alias.evidence.inFlight || alias.evidence.queued) return `${NUMBERING_ALIAS_WAIT} ${alias.head.slice(0, 9)} (${aliased})`;
     return reason;
   };

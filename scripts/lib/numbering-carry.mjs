@@ -684,6 +684,7 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   if (settledRestamps.has(key)) return null;
   if (!plan.candidate) return plan.retryable ? { action: 'retry', reason: plan.reason } : null;
   if (plan.human && !numberingSetting.value && !netPatchSetting.value) return null;
+  if (!plan.human && !acceptSetting.value && !netPatchSetting.value) return null;
   logNumberingCarryReferralEvidenceSetting(referralEvidenceSetting);
   const numberingOff = plan.human ? !numberingSetting.value : !acceptSetting.value;
   const proveMove = (p) => {
