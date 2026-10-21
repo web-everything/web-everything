@@ -84,7 +84,24 @@ jobs:
           fetch-depth: 0
       - name: Is this a card-only PR?
         id: detect
-        run: node scripts/ci-card-only.mjs --event='${{ github.event_name }}' --base='${{ github.event.pull_request.base.sha }}' --head=HEAD >> "$GITHUB_OUTPUT"
+        # FRESH MAIN BASIS (#5619): the event's base.sha can be frozen far behind main, so for a main-targeted PR
+        # the detector diffs from the merge base with the main tip fetched IN THIS RUN. Event values arrive via
+        # env (never interpolated into the script) and are quoted. Any doubt (fetch failed, sha unconfirmed,
+        # odd ref name, several merge bases) leaves FRESH_MAIN_SHA empty or is refused by the script: full suite.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          FRESH_MAIN_SHA=""
+          if [ "$BASE_REF" = "main" ]; then
+            if git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'; then
+              FRESH_MAIN_SHA=$(git rev-parse --verify --end-of-options 'refs/remotes/origin/main^{commit}') || FRESH_MAIN_SHA=""
+            else
+              echo "ci-card-only: main fetch failed; full suite" >&2
+            fi
+          fi
+          node scripts/ci-card-only.mjs --event="$EVENT_NAME" --base="$BASE_SHA" --base-ref="$BASE_REF" --fresh-main-sha="$FRESH_MAIN_SHA" --head=HEAD >> "$GITHUB_OUTPUT"
 
   # Sharded unit suite (#2682). The 2000+ vitest suite runs split across N parallel runners
   # (`vitest run --shard=i/N`) to cut the `test` gate's wall-clock. Each shard runs WITH coverage but

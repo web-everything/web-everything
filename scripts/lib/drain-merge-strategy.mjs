@@ -35,6 +35,7 @@ import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { labelSignature } from './drain-prestage.mjs';
 import { readDrainRedTeamEvidence } from './drain-red-team-evidence.mjs';
 import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason } from './drain-queue-safety.mjs';
+import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 import { defaultPostConflictFinding } from './conflict-finding.mjs';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -226,8 +227,13 @@ export function createDrainMergeStrategy({
     return pureCardGroupHold(readGroupState(path), { num: c?.num, repo: c?.repo || localSlug, localSlug,
       files: c?.listedFilesComplete === true ? c.listedFiles : null, mainFix: isMainFix(c) === true });
   },
+  readGrantScope = standingRulingScope, // PR #5758: the verified standing-ruling scope the red-team gate also reads
 } = {}) {
   const { policy, note } = resolved;
+  // The red-team readers credit an automatic round grant exactly as the gate does; unreadable = no automatic credit.
+  const grantScopeFor = (c, headSha, comments) => {
+    try { return readGrantScope({ repo: slugOf(c.repo), pr: { number: c.num, headRefOid: headSha, comments } }) ?? null; } catch { return null; }
+  };
   const statusProvider = labelProvider ?? createGhProvider({ exec: (args, opts) => exec('gh', args, opts) });
   const say = (line) => { if (!quiet) log.write(`${line}\n`); };
   /**
@@ -333,7 +339,8 @@ export function createDrainMergeStrategy({
         const comments = pages.flat();
         if (!safety.value.waitForRedTeamBeforeEnqueue) return { allowed: true, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
         const evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env });
-        const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, env });
+        const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env,
+          standingRuling: grantScopeFor(c, headSha, pages.flat()) });
         return { allowed: !reason, reason, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
       } catch { return { allowed: false, reason: 'red-team evidence unreadable' }; }
     },
@@ -379,8 +386,9 @@ export function createDrainMergeStrategy({
         }
         const pages = readThreadPages(c.repo, c.num);
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team admission: unreadable complete comments');
-        const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, env });
-        try { syncRedTeamStatusLabels({ repo: slugOf(c.repo), pr: c.num, head: headSha, evidence, env,
+        const standingRuling = grantScopeFor(c, headSha, pages.flat());
+        const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env, standingRuling });
+        try { syncRedTeamStatusLabels({ repo: slugOf(c.repo), pr: c.num, head: headSha, evidence, env, standingRuling,
           live, comments: pages.flat(), provider: statusProvider, dryRun, log: say }); }
         catch (e) { say(`red-team status labels #${c.num}: ${firstLine(e)}`); }
         if (reason) {

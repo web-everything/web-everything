@@ -13,7 +13,7 @@ import { isClaimSessionLive, releaseFixDispatchClaim } from '../conveyor/fix-dis
 import { releaseOwnPrepareHolds } from '../../skills-src/conveyor/build-dispatch-daemon.mjs';
 import { refreshOntoMain } from '../conveyor/ci-red-recovery-watch.mjs';
 import { recordRefreshed, refreshedStatePath, requiredCheckFact, loadMergeQueueSettings } from '../lib/merge-queue-hook.mjs';
-import { createExtendRoundsSinks } from './extend-rounds-io.mjs';
+import { createExtendRoundsSinks, runRedTeamGateForPr } from './extend-rounds-io.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { planOperatorControl, validateControlInput, controlFingerprint, parseOperatorActions, buildOperatorActionComment, isPrepareHold, OPERATOR_CONTROL_EFFECT } from './operator-controls.mjs';
 
@@ -92,7 +92,7 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
   releaseHold = releaseBuildDispatchHold, clearFailure = clearBuildFailure, releaseClaim = releaseFixDispatchClaim,
   releasePrepare = releaseOwnPrepareHolds, refresh = refreshOntoMain, rememberRefresh = recordRefreshed,
   refreshStatePath = refreshedStatePath,
-  extensionSink = createExtendRoundsSinks({ readThread: (repo, pr) => readContext('grant-rounds', { repo, pr }) })['github.round-extension'],
+  extensionSink = createExtendRoundsSinks({ readThread: (repo, pr) => readContext('grant-rounds', { repo, pr }), regate: runRedTeamGateForPr })['github.round-extension'],
   readRecords, writeRecord, mutate, verify,
 } = {}) {
   const actionPath = join(coord, 'operator-actions.jsonl');

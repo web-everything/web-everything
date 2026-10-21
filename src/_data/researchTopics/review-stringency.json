@@ -1,0 +1,14 @@
+{
+  "id": "review-stringency",
+  "title": "Review stringency — classified findings, per-level outcomes and a debt register",
+  "status": "open",
+  "summary": "Grounds the decision on how strict review should be. A 14-day record of 5,971 findings on 869 PRs shows one bar for everything: missing tests top the list (794) and cost the most fix rounds, about a third of ruled findings were not real, and the auto-block policy overrode a reviewer not-real 126 times, while no security finding stalled delivery. Outside models (ASVS levels, CVSS environmental scoring, SRE error budgets, SQALE, the Fowler debt quadrant, new-code quality gates, AI-code failure modes) support a table of class by release level with four outcomes: block, expedite, debt, advisory.",
+  "dateOpened": "2026-10-17",
+  "lastReviewed": "2026-10-17",
+  "reviewHorizon": "P12M",
+  "tags": ["review", "stringency", "technical-debt", "release-gates", "settings"],
+  "relatedBlocks": [],
+  "relatedPlugs": [],
+  "relatedProject": "webcomponents",
+  "relatedReport": "reports/2026-10-17-review-stringency.md"
+}

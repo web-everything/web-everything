@@ -45,6 +45,49 @@ export function isCardOnlyDiff(files) {
   return classifyCardOnly({ event: 'pull_request', files: files ?? undefined }).light;
 }
 
+/** The fetched main ref the workflow refreshes before this runs (fixed refspec; nothing PR-supplied reaches it). */
+export const FRESH_MAIN_REF = 'refs/remotes/origin/main';
+
+/** A base branch name this detector will act on. Anything else (quotes, spaces, `..`, a leading `-`) → full suite. */
+export const SAFE_BASE_REF = /^(?!.*\.\.)(?!.*\/\/)[A-Za-z0-9][A-Za-z0-9._\/-]{0,199}$/;
+const FULL_SHA = /^[0-9a-f]{40}([0-9a-f]{24})?$/i;
+
+/**
+ * Pick the diff basis for the card-only check. FRESH MAIN BASIS (PR #5619, same idea as the soak gate's #5939):
+ * the event's `base.sha` can be FROZEN hours behind main. Once the drain merges a newer main into the lane, a
+ * diff from that stale sha counts main's own commits as the PR's, so a one-card PR read as 47 files of code and
+ * ran the full suite. For a main-targeted PR the basis is the ONE merge base of the main tip fetched in THIS run
+ * and the head: only what the PR itself changes against main.
+ *
+ * ANY DOUBT → FULL SUITE (`diffBase: null`), never a guess:
+ *   - a base ref that fails SAFE_BASE_REF;
+ *   - no fresh main sha from this run's fetch, or the ref no longer resolves to exactly that sha;
+ *   - a fresh main that does not descend from the event base (not the main this PR targets);
+ *   - zero or MORE THAN ONE merge base (criss-cross history: git's pick among several is unspecified).
+ * A valid non-main base (a stacked PR) and a caller that passes no base ref keep the prior event-base diff.
+ * @param {{exec: (cmd: string, args: string[]) => string, base?: string, head?: string, baseRef?: string, freshMainSha?: string}} o
+ * @returns {{diffBase: string|null, basis: 'fresh-main-merge-base'|'event-base'|'full-suite', note?: string}}
+ */
+export function resolveCardOnlyBase({ exec, base, head = 'HEAD', baseRef, freshMainSha } = {}) {
+  const full = (note) => ({ diffBase: null, basis: 'full-suite', note });
+  if (baseRef === undefined) return { diffBase: String(base), basis: 'event-base' };
+  if (typeof baseRef !== 'string' || !SAFE_BASE_REF.test(baseRef)) return full('base ref is not a plain branch name');
+  if (baseRef !== 'main') return { diffBase: String(base), basis: 'event-base' };
+  if (typeof freshMainSha !== 'string' || !FULL_SHA.test(freshMainSha)) return full('no fresh main sha from this run');
+  if (typeof base !== 'string' || !FULL_SHA.test(base)) return full('event base is not a full sha');
+  try {
+    const tip = exec('git', ['rev-parse', '--verify', '--end-of-options', `${FRESH_MAIN_REF}^{commit}`]).trim();
+    if (tip.toLowerCase() !== freshMainSha.toLowerCase()) return full(`fetched main ${tip} is not the confirmed ${freshMainSha}`);
+    exec('git', ['merge-base', '--is-ancestor', '--end-of-options', base, tip]); // throws when base is not on main
+    const bases = exec('git', ['merge-base', '--all', '--end-of-options', tip, String(head)]).split('\n').map((l) => l.trim()).filter(Boolean);
+    if (bases.length !== 1) return full(`${bases.length} merge bases with fresh main`);
+    if (!FULL_SHA.test(bases[0])) return full('merge base is not a sha');
+    return { diffBase: bases[0], basis: 'fresh-main-merge-base' };
+  } catch (e) {
+    return full(`fresh main check failed (${String(e?.message || e).split('\n')[0]})`);
+  }
+}
+
 function main() {
   const flags = Object.fromEntries(process.argv.slice(2).filter((a) => a.startsWith('--')).map((a) => {
     const i = a.indexOf('=');
@@ -53,11 +96,17 @@ function main() {
   let files = [];
   if (flags.event === 'pull_request') {
     try {
+      const head = String(flags.head || 'HEAD');
+      const exec = (cmd, args) => execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      const { diffBase, basis, note } = resolveCardOnlyBase({ exec, base: flags.base, head, baseRef: flags['base-ref'],
+        freshMainSha: flags['fresh-main-sha'] });
+      process.stderr.write(`ci-card-only: diff basis ${basis} ${diffBase ?? '-'} (event base ${flags.base})${note ? ` — ${note}` : ''}\n`);
+      if (diffBase === null) throw new Error(`no trusted diff basis: ${note}`);
       // --no-renames lists BOTH sides of a rename, so a move out of backlog/ is never hidden.
-      files = execFileSync('git', ['diff', '--name-only', '--no-renames', String(flags.base), String(flags.head || 'HEAD')],
+      files = execFileSync('git', ['diff', '--name-only', '--no-renames', diffBase, head],
         { encoding: 'utf8' }).split('\n').filter(Boolean);
     } catch (e) {
-      process.stderr.write(`ci-card-only: git diff failed (${String(e.message).split('\n')[0]}); full suite\n`);
+      process.stderr.write(`ci-card-only: ${String(e.message).split('\n')[0]}; full suite\n`);
     }
   }
   const { light, reason } = classifyCardOnly({ event: flags.event, files });

@@ -2,7 +2,10 @@
 bornAs: xghfadk
 kind: story
 size: 5
-status: open
+status: closed
+closedReason: duplicate
+closedInto: "6637"
+dateClosed: "2026-10-20"
 scope: ["we:scripts/conveyor/fix-scope-fence.mjs", "we:scripts/conveyor/fix-scope-fence-io.mjs", "we:scripts/conveyor/__tests__/"]
 dateOpened: "2026-10-17"
 tags: []

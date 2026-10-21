@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { FAKE_GH_DIR_ENV, lazyTmpPath, writeFakeGhShim } from './scripts/lib/test-tmp-root.mjs';
 import { HERMETIC_ENV, isHermetic } from './scripts/lib/hermetic-tests.mjs';
 import { setupHermeticTestFile } from './scripts/lib/hermetic-tests-vitest.mjs';
+import { KEEPALIVE_ANCHOR_ENV, killKeepAlives } from './scripts/lib/test-keepalive.mjs';
 
 const REPO_ROOT = dirname(fileURLToPath(import.meta.url));
 // Captured BEFORE the sandbox strip below, so the hermetic guard also covers a state root the LAUNCHING shell
@@ -140,6 +141,14 @@ if (hermetic) {
 }
 
 process.env.WE_UNDER_TEST = '1';
+
+// keep-alive leak fix (2026-10-20: 154 orphaned `node -e setInterval(() => {}, …)` children, up to 19 days old).
+// Every keep-alive from scripts/lib/test-keepalive.mjs watches this anchor pid and exits once it is gone, so a
+// killed or timed-out runner leaves nothing behind; the ones this file's tests spawned directly are killed here.
+// Set AFTER the sandbox strip above (it removes every WE_* key), and unconditionally: an outer runner's anchor
+// must not outlive this one's.
+process.env[KEEPALIVE_ANCHOR_ENV] = String(process.pid);
+afterAll(() => killKeepAlives());
 
 // Admission tests and their child CLIs must not wait on the machine running the suite.
 // Tests of overload set their own reading; production ignores this Vitest-only seam.

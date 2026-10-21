@@ -7,6 +7,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
+import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 import { tmpdir } from 'node:os';
 
 import {
@@ -447,7 +448,7 @@ describe('a gate is its whole process group, not just its leader (PR 4764 round 
   });
 
   it('real processes: the leader dies while its test-runner child runs on — not dead until the whole group is gone', async () => {
-    const childJs = "setTimeout(() => {}, 60000)";
+    const childJs = keepAliveScript({ maxLifetimeMs: 60_000 });
     const leader = spawn(process.execPath, ['-e',
       `require('child_process').spawn(process.execPath, ['-e', ${JSON.stringify(childJs)}], { stdio: 'ignore' }); ${childJs}`],
     { detached: true, stdio: 'ignore' });
@@ -1111,8 +1112,8 @@ describe('findLaneGatePidsDefault (real processes)', () => {
   it('findLaneGatePidsDefault finds a real gate by its exact --repo token (with a --run-id), and nothing else', async () => {
     const lane = join(dir, 'lane 7'); // a space in the path must still match exactly
     // `--` ends node's own options: without it node rejects `--repo=` as a bad flag and exits at once.
-    const child = spawn(process.execPath, ['-e', 'setTimeout(()=>{},30000)', '--', `--repo=${lane}`, '--json', '--run-id=r-x'], { stdio: 'ignore' });
-    const decoy = spawn(process.execPath, ['-e', 'setTimeout(()=>{},30000)', '--', `--repo=${lane}`, 'request'], { stdio: 'ignore' });
+    const child = spawn(process.execPath, ['-e', keepAliveScript({ maxLifetimeMs: 30_000 }), '--', `--repo=${lane}`, '--json', '--run-id=r-x'], { stdio: 'ignore' });
+    const decoy = spawn(process.execPath, ['-e', keepAliveScript({ maxLifetimeMs: 30_000 }), '--', `--repo=${lane}`, 'request'], { stdio: 'ignore' });
     try {
       // Bounded by time, not by a poll count: under host load a `ps` alone can take seconds.
       for (const end = Date.now() + 20_000; Date.now() < end && !gateJob.findLaneGatePidsDefault(lane).includes(child.pid);) {

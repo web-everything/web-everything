@@ -559,19 +559,47 @@ export const GH_SLOT_WAIT_STANDARD = Object.freeze({
   onSlotTimeout: 'throttled',
   priorityCallers: Object.freeze(['^(ci-red-recovery|main-ci-red|red-main|main-red|enqueue)']),
   backgroundCallers: Object.freeze(['^(lane-pool-health-watch|parked-pr-|load-flake-reverify|advisory-label-sweep|merge-orphan-sweep|health-watch|build-dispatch-daemon|already-done-refresh|lease-reaper|rebuild-smoke|reconcile-fix-dispatch-daemon)']),
+  // Per-caller BACKGROUND slot wait: caller regex -> wait ms (0..120000). The standard sets none, so every background
+  // caller waits backgroundWaitMs; a layer (e.g. the tool file scripts/settings/gh-throttle.json) may lengthen one
+  // caller's wait without promoting it to the priority class. Invalid values are ignored (standard applies).
+  callerWaitMs: Object.freeze({}),
 });
 
-export function resolveGhSlotWait(env = process.env) {
+/** Upper bound for any slot wait set through the cascade (equals the priority DEFAULT_ACQUIRE_TIMEOUT_MS). */
+export const GH_SLOT_WAIT_MAX_MS = 120000;
+const validSlotWaitMs = n => Number.isInteger(n) && n >= 0 && n <= GH_SLOT_WAIT_MAX_MS;
+
+// The TOOL layer contributes ONLY `callerWaitMs`, read fresh from scripts/settings/gh-throttle.json on each resolve
+// (one small file, like the platform file the cascade already reads per call). Every other ghThrottleSlotWait leaf
+// (class lists, onSlotTimeout, backgroundWaitMs) stays standard/platform/env exactly as on main.
+// Resolved from this module's own location, NOT imported from settings-files.mjs: gh-throttle is imported by nearly
+// every script, and a test that stubs settings-files.mjs with a partial factory would otherwise throw on a missing export.
+// NodeURL, not the global URL: happy-dom (the unit-test environment) replaces the global, and fileURLToPath rejects its instances.
+export const GH_SLOT_WAIT_TOOL_FILE = fileURLToPath(new NodeURL('../settings/gh-throttle.json', import.meta.url));
+function slotWaitToolBlock(path = GH_SLOT_WAIT_TOOL_FILE) {
+  try {
+    const block = JSON.parse(readFileSync(path, 'utf8'))?.ghThrottleSlotWait;
+    return pickToolCallerWait(block);
+  } catch { return undefined; }
+}
+const pickToolCallerWait = block => (block && typeof block === 'object' && !Array.isArray(block) && block.callerWaitMs !== undefined
+  ? { callerWaitMs: block.callerWaitMs } : undefined);
+const allStandardSources = () => Object.fromEntries(Object.keys(GH_SLOT_WAIT_STANDARD).map(k => [k, 'standard']));
+
+export function resolveGhSlotWait(env = process.env, { tool } = {}) {
+  // A null / non-object input names no configuration at all: the pure standard, no file layers.
+  if (!env || typeof env !== 'object') return { ...GH_SLOT_WAIT_STANDARD, source: allStandardSources() };
   try {
     const raw = env?.WE_GH_THROTTLE_BACKGROUND_WAIT_MS;
-    const r = cascadePolicy('ghThrottleSlotWait', undefined, {
+    const r = cascadePolicy('ghThrottleSlotWait', tool !== undefined ? pickToolCallerWait(tool) : slotWaitToolBlock(), {
       env, standard: GH_SLOT_WAIT_STANDARD,
       envValues: {
         backgroundWaitMs: raw != null && String(raw).trim() !== '' ? Number(raw) : undefined,
         onSlotTimeout: env?.WE_GH_THROTTLE_ON_SLOT_TIMEOUT,
       },
       valid: {
-        backgroundWaitMs: n => Number.isInteger(n) && n >= 0 && n <= 120000,
+        backgroundWaitMs: validSlotWaitMs,
+        callerWaitMs: validSlotWaitMs,
         onSlotTimeout: v => v === 'throttled' || v === 'ungated',
         backgroundCallers: v => Array.isArray(v) && v.every(x => typeof x === 'string'),
         priorityCallers: v => Array.isArray(v) && v.every(x => typeof x === 'string'),
@@ -579,8 +607,32 @@ export function resolveGhSlotWait(env = process.env) {
     });
     return { ...GH_SLOT_WAIT_STANDARD, ...(r.value || {}), source: r.sources || {} };
   } catch {
-    return { ...GH_SLOT_WAIT_STANDARD, source: Object.fromEntries(Object.keys(GH_SLOT_WAIT_STANDARD).map(k => [k, 'standard'])) };
+    return { ...GH_SLOT_WAIT_STANDARD, source: allStandardSources() };
   }
+}
+
+/**
+ * PURE: the slot wait (ms) for one call, with the layer it came from. Priority calls keep `acquireTimeoutMs`; a
+ * background call takes an env `WE_GH_THROTTLE_BACKGROUND_WAIT_MS` when set, else the first matching `callerWaitMs` entry (valid leaves only — the cascade already dropped
+ * invalid ones; a non-object block or a malformed regex is skipped), else `backgroundWaitMs`.
+ * @returns {{waitMs:number, source:string, key:string}}
+ */
+export function ghSlotWaitMs({ caller, waitClass, settings = GH_SLOT_WAIT_STANDARD, acquireTimeoutMs = DEFAULT_ACQUIRE_TIMEOUT_MS }) {
+  if (waitClass !== 'background') return { waitMs: acquireTimeoutMs, source: 'acquireTimeoutMs', key: 'acquireTimeoutMs' };
+  const name = normalizeGhCaller(caller);
+  const map = settings?.callerWaitMs;
+  // The env override (highest layer) of backgroundWaitMs wins over every lower-layer per-caller wait.
+  const envWins = settings?.source?.backgroundWaitMs === 'env';
+  if (!envWins && map && typeof map === 'object' && !Array.isArray(map)) {
+    for (const [pattern, ms] of Object.entries(map)) {
+      if (!validSlotWaitMs(ms)) continue;
+      let hit = false;
+      try { hit = new RegExp(pattern).test(name); } catch { hit = false; }
+      if (hit) return { waitMs: ms, source: settings.source?.[`callerWaitMs.${pattern}`] ?? 'standard', key: `callerWaitMs.${pattern}` };
+    }
+  }
+  const ms = validSlotWaitMs(settings?.backgroundWaitMs) ? settings.backgroundWaitMs : GH_SLOT_WAIT_STANDARD.backgroundWaitMs;
+  return { waitMs: ms, source: settings?.source?.backgroundWaitMs ?? 'standard', key: 'backgroundWaitMs' };
 }
 
 /** PURE slot-wait classification; malformed regex entries never interrupt a caller. */
@@ -1581,14 +1633,15 @@ export function noteSlotTimeout(logPath, acq, entry, warn) {
 }
 
 /** Card 308: refuse a timed-out slot before entering the subprocess retry loop. */
-function slotTimeoutMessage(logPath, acq, entry, settings, waitClass, warn) {
+function slotTimeoutMessage(logPath, acq, entry, settings, waitClass, warn, pick) {
   if (!acq?.timedOut) return null;
   if (settings.onSlotTimeout === 'ungated') {
     noteSlotTimeout(logPath, acq, entry, warn);
     return null;
   }
   const waitedMs = acq.waitedMs ?? 0;
-  recordGhCallLogEntry(logPath, { ...entry, points: 0, outcome: 'slot_throttled', waitedMs, class: waitClass });
+  const waitFrom = pick ? { waitMs: pick.waitMs, waitSource: `${pick.key}:${pick.source}` } : {};
+  recordGhCallLogEntry(logPath, { ...entry, points: 0, outcome: 'slot_throttled', waitedMs, class: waitClass, ...waitFrom });
   const message = `gh-throttle: throttled — no gh slot within ${waitedMs / 1000}s (class=${waitClass}); retry next tick\n`;
   try { (warn || (m => process.stderr.write(m)))(message); } catch { /* best-effort */ }
   return message;
@@ -1895,8 +1948,10 @@ function runGhSyncUnmemoized(args, opts = {}) {
   const caller = deriveGhCaller(throttle, env);
   const slotWait = resolveGhSlotWait(env);
   const waitClass = ghSlotWaitClass({ caller, args: args, isWrite, settings: slotWait });
-  const slotTimeoutMs = throttle.acquireTimeoutMs != null ? throttle.acquireTimeoutMs
-    : waitClass === 'background' ? slotWait.backgroundWaitMs : acquireTimeoutMs;
+  const slotWaitPick = throttle.acquireTimeoutMs != null
+    ? { waitMs: throttle.acquireTimeoutMs, source: 'explicit', key: 'acquireTimeoutMs' }
+    : ghSlotWaitMs({ caller, waitClass, settings: slotWait, acquireTimeoutMs });
+  const slotTimeoutMs = slotWaitPick.waitMs;
   // #gh-graphql-budget — the shared primary-budget backoff (see that section above).
   const resource = classifyGhResource(args);
   // The credential the child really uses: the caller's explicit env, else — a config-only `throttle.env` carries
@@ -1952,7 +2007,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
       acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
       return isGhWatch(args) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args, pid, nowMs: now(), timeoutMs: ghExecOptions(execOpts, args, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
     }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
-    const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, slotWait, waitClass, throttle.warn);
+    const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, slotWait, waitClass, throttle.warn, slotWaitPick);
     if (throttledMessage) {
       const error = new Error(throttledMessage);
       Object.assign(error, { status: 1, stdout: '', stderr: throttledMessage, ghThrottled: { class: waitClass, waitedMs: acq.waitedMs ?? 0 } });
@@ -2153,8 +2208,10 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
   const caller = deriveGhCaller(throttle, env);
   const slotWait = resolveGhSlotWait(env);
   const waitClass = ghSlotWaitClass({ caller, args: argv, isWrite, settings: slotWait });
-  const slotTimeoutMs = throttle.acquireTimeoutMs != null ? throttle.acquireTimeoutMs
-    : waitClass === 'background' ? slotWait.backgroundWaitMs : acquireTimeoutMs;
+  const slotWaitPick = throttle.acquireTimeoutMs != null
+    ? { waitMs: throttle.acquireTimeoutMs, source: 'explicit', key: 'acquireTimeoutMs' }
+    : ghSlotWaitMs({ caller, waitClass, settings: slotWait, acquireTimeoutMs });
+  const slotTimeoutMs = slotWaitPick.waitMs;
   // #gh-graphql-budget — the shared primary-budget backoff (see runGhSync's identical wiring).
   const resource = classifyGhResource(argv);
 
@@ -2221,7 +2278,7 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
       acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
       return isGhWatch(argv) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args: argv, pid, nowMs: now(), timeoutMs: ghExecOptions(spawnOpts, argv, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
     }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
-    const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv, ...(outer ? { outer } : {}) }, slotWait, waitClass, throttle.warn);
+    const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv, ...(outer ? { outer } : {}) }, slotWait, waitClass, throttle.warn, slotWaitPick);
     if (throttledMessage) return { status: 1, throttled: true, stdout: Buffer.alloc(0), stderr: Buffer.from(throttledMessage) };
     let r;
     try {

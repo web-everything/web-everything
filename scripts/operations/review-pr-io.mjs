@@ -408,6 +408,28 @@ export function readReviewRound({ repo, pr, head, readLedgerRows = defaultReadLe
 }
 
 /**
+ * THIS PR'S REVIEW ROUND AS OF a moment (an operator round grant's `at`): the distinct heads reviewed by then, the last
+ * of them being that moment's round. Same rows as {@link readReviewRound}. Rows without a readable time are left out,
+ * so a doubt lowers the anchored cap, never raises it. An unreadable ledger, a bad time, or no reviewed head is `null`.
+ * `head` is a head the caller knows was already reviewed at `at` (the thread shows its review before the grant). It is
+ * counted the way {@link readReviewRound} counts the live head, since its own ledger row can miss while its review is
+ * published.
+ * @param {{repo: string, pr: number, at: string, head?: string|null, readLedgerRows?: Function}} o
+ * @returns {number|null}
+ */
+export function readReviewRoundAsOf({ repo, pr, at, head = null, readLedgerRows = defaultReadLedgerRows }) {
+  const t = Date.parse(at);
+  if (!Number.isFinite(t)) return null;
+  try {
+    const heads = new Set((readLedgerRows(repo) ?? []).filter((r) => Number(r?.pr) === Number(pr)
+      && (r.type === EVENT_TYPES.REVIEW_RUN || r.type === EVENT_TYPES.FINDING) && Date.parse(r.at) <= t
+      && typeof r.headSha === 'string' && r.headSha).map((r) => r.headSha.toLowerCase()));
+    if (typeof head === 'string' && /^[0-9a-f]{40}$/i.test(head)) heads.add(head.toLowerCase());
+    return heads.size > 0 ? heads.size : null;
+  } catch { return null; }
+}
+
+/**
  * Card 5471 — the round budget: an explicit value, else the declared setting. Any doubt is `off`. An explicit `off` is
  * an override too (a caller disabling the budget beats an enabled setting), same as `resolveScopedRereviewMode`.
  */

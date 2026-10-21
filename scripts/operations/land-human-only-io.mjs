@@ -91,19 +91,60 @@ export function operatorEnv(token, env = process.env) {
   return out;
 }
 
-/** A checkout of `repo` to run the pinned git reads in: the cwd's repo, else this repo's root. */
-export function cloneFor(repo, { candidates = [process.cwd(), REPO_ROOT], exec = execFileSync } = {}) {
+/**
+ * GitHub's canonical `owner/name` for a slug, following renames/transfers (an origin still spelled with a repo's
+ * old owner, e.g. `chalbert/web-everything` → `web-everything/web-everything`). Asked of github.com explicitly, never
+ * a `GH_HOST`-selected server: the origin was parsed as a github.com slug. Lower-cased; null when unreadable.
+ */
+export function readCanonicalSlug(slug, { exec = execFileSync } = {}) {
+  try {
+    const out = String(exec('gh', ['api', '--hostname', 'github.com', `repos/${slug}`, '-q', '.full_name'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 }) || '').trim().toLowerCase();
+    return /^[a-z0-9_-][a-z0-9_.-]*\/[a-z0-9_.-]+$/.test(out) ? out : null;
+  } catch { return null; }
+}
+
+/**
+ * A checkout of `repo` to run the pinned git reads in: the cwd's repo, else this repo's root. `{dir, reasons}` —
+ * `dir` null when no candidate qualifies, `reasons` naming why each candidate was refused (for the operator).
+ * A candidate qualifies when its github.com `origin` slug IS `repo`, or GitHub resolves that slug to `repo` (a
+ * renamed/transferred repo whose clones keep the old spelling). An unreadable resolution refuses (fail closed).
+ * Whether the checkout can actually see the PR's pinned head is checked downstream by the pinned-diff read
+ * (`fetch` + `cat-file -e <head>`), which also fails closed.
+ */
+export function locateClone(repo, { candidates = [process.cwd(), REPO_ROOT], exec = execFileSync,
+  canonical = (slug) => readCanonicalSlug(slug, { exec }) } = {}) {
   const identity = String(repo).trim().toLowerCase();
   // These operations address github.com owner/name slugs. Local paths and other hosts cannot establish that identity.
   const originPattern = /^(?:https?:\/\/github\.com\/|git:\/\/github\.com\/|ssh:\/\/(?:git@)?github\.com(?::22)?\/|git@github\.com:)([a-z0-9_-][a-z0-9_.-]*\/[a-z0-9_-][a-z0-9_.-]*?)(?:\.git)?\/?$/i;
+  const reasons = [];
+  const seen = new Set();
   for (const dir of candidates) {
+    let top;
     try {
-      const top = String(exec('git', ['-C', dir, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).trim();
-      const url = String(exec('git', ['-C', top, 'remote', 'get-url', 'origin'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).trim();
-      if (originPattern.exec(url)?.[1].toLowerCase() === identity) return top;
-    } catch { /* try the next candidate */ }
+      top = String(exec('git', ['-C', dir, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).trim();
+    } catch { reasons.push(`${dir}: not a git checkout`); continue; }
+    if (seen.has(top)) continue;
+    seen.add(top);
+    let url;
+    try {
+      url = String(exec('git', ['-C', top, 'remote', 'get-url', 'origin'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).trim();
+    } catch { reasons.push(`${top}: no origin remote`); continue; }
+    const slug = originPattern.exec(url)?.[1].toLowerCase();
+    // An unparsed origin can contain credentials (userinfo, query, or fragment); never echo it into run records.
+    if (!slug) { reasons.push(`${top}: origin is not a github.com owner/name`); continue; }
+    if (slug === identity) return { dir: top, reasons };
+    const resolved = canonical(slug);
+    if (resolved === identity) return { dir: top, reasons };
+    reasons.push(resolved ? `${top}: origin ${slug} is ${resolved}, not ${identity}`
+      : `${top}: origin ${slug} is not ${identity}, and GitHub's canonical name for it could not be read`);
   }
-  return null;
+  return { dir: null, reasons };
+}
+
+/** `locateClone`'s checkout path alone (null when none qualifies). */
+export function cloneFor(repo, options = {}) {
+  return locateClone(repo, options).dir;
 }
 
 const labelNames = (pr) => (pr?.labels ?? []).map((l) => (typeof l === 'string' ? l : l?.name));
@@ -112,7 +153,7 @@ const labelNames = (pr) => (pr?.labels ?? []).map((l) => (typeof l === 'string' 
  * The `read` finding. Every gate's facts, read on the head the PR shows at read time. IO is injectable.
  */
 export function createLandHumanOnlyReader({ exec = execFileSync, credential = () => resolveOperatorCredential(),
-  clone = (repo) => cloneFor(repo), gather = fromMergeGate('gatherPrFacts'), evaluate = fromMergeGate('evaluatePrGates'),
+  clone = (repo) => locateClone(repo, { exec }), gather = fromMergeGate('gatherPrFacts'), evaluate = fromMergeGate('evaluatePrGates'),
   requiredChecks = readQueueRequiredChecks, warn = (m) => process.stderr.write(`${m}\n`),
   // The merge-gate CLI's own fact sources, injectable so tests never reach git or GitHub through them.
   loadPolicy = () => loadMergeDeliveryPolicy({ toolSettings: readSettings(), knownGates: GATE_IDS }),
@@ -131,9 +172,11 @@ export function createLandHumanOnlyReader({ exec = execFileSync, credential = ()
     const labelPresent = labelNames(live).includes(READY_LABEL);
     const labelDecision = labelPresent ? { label: false, reason: null } : labelOnGreenVerdict(live, { requiredCheck: 'test', label: READY_LABEL });
 
-    const cwd = clone(repo);
+    const located = clone(repo);
+    const cwd = typeof located === 'string' ? located : located?.dir ?? null;
+    const why = Array.isArray(located?.reasons) && located.reasons.length ? ` — checked ${located.reasons.join('; ')}` : '';
     let gateRows = null, gateRowsError = null, surface = { hold: true, humanOnly: false, error: 'not read' };
-    if (!cwd) gateRowsError = surface.error = `no checkout of ${repo} to read the pinned diff from (run from one)`;
+    if (!cwd) gateRowsError = surface.error = `no checkout of ${repo} to read the pinned diff from (run from a clone whose origin is github.com/${repo})${why}`;
     else {
       const policy = loadPolicy();
       const facts = gather({ repo, num, cwd, defaultBranch, ledgerConfig: ledgerConfigOf(),
