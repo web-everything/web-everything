@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { ensureCommitReadable } from './carry-equivalence.mjs';
 import { parseReviewedSha, findAcceptVerdictComment } from './review-escalation.mjs';
-import { latestAcceptRecord, isLaterVerdictBody } from './accept-carry-forward.mjs';
+import { latestAcceptRecord, isLaterVerdictBody, isKnownMachineBody } from './accept-carry-forward.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { gateOutcomesForHead, parseRedTeamGateMarker, parseRedTeamComment, breakClass, RED_TEAM_COMMENT_MARKER,
   liveResultGateState, redTeamGateMarker, redTeamMarker, redTeamResultId } from './red-team-gate.mjs';
@@ -12,7 +12,7 @@ const HEX = /^[0-9a-f]{40}$/;
 
 // Only consume complete, known provenance shapes. A marker proves where a
 // record belongs; it does not make arbitrary surrounding text informational.
-function informationalProvenance(body, sha, pr) {
+export function informationalProvenance(body, sha, pr) {
   let rest = String(body ?? '').replace(/\r\n?|\u2028|\u2029/g, '\n').trim();
   const sameRecord = record => record?.rev === sha && record.pr === Number(pr);
   const gate = parseRedTeamGateMarker(rest);
@@ -47,7 +47,9 @@ function informationalProvenance(body, sha, pr) {
     || line === 'The red team tried to break this change and reported nothing.'
     || line === "A confirmed break is recorded as a miss for the accepting review and for the builder's model."
     || parseRedTeamComment(`${rest.slice(0, rest.indexOf('-->') + 3)}\n${line}`)?.findings.length === 1
-    || /^ {3}- (?:Scenario|Re-check): [^\n]*$/.test(line));
+    // review-extra-seats.mjs#renderRedTeamComment's three sub-lines; `Files read` was missing, so every real advisory
+    // read as a hold and no carry could ever fire after a red team (live #5779, 2026-10-21).
+    || /^ {3}- (?:Scenario|Re-check|Files read): [^\n]*$/.test(line));
 }
 
 /** IO: compare whitespace-sensitive net patches; missing objects get one fetch. Never throws. */
@@ -73,6 +75,24 @@ const ACCEPTED_REARM_RE = /^🔧 conveyor fix — re-armed for re-review\n\nThe 
 export function isAcceptedRearmBody(body) {
   return ACCEPTED_REARM_RE.test(String(body ?? '').replace(/\r\n?/g, '\n').trim());
 }
+// The exact layouts `review-set-label.mjs#buildVerdictComment` writes for an accept / a restamp: heading, blank,
+// `Recorded by … .`, then free write-up (accept) or one reason line (restamp), then only marker lines. No later-verdict line.
+const MARKER_LINE_RE = /^<!--\s*(?:reviewed-(?:sha|diff|contribution):\s*[0-9a-f]{40,64}|cleared-by-actor:\s*[0-9a-f-]{36})\s*-->$/;
+export function isExactRestampShape(body) {
+  const lines = String(body ?? '').replace(/\r\n?/g, '\n').trim().split('\n');
+  if (lines[0] !== '📌 review — acceptance re-stamped after a rebase (no new review)' || lines[1] !== ''
+    || !/^Recorded by [^\n]{1,200}\.$/.test(lines[2] ?? '') || lines[3] !== '') return false;
+  const rest = lines.slice(4).filter(l => l !== '');
+  return rest.length >= 2 && !MARKER_LINE_RE.test(rest[0]) && !/[🔁]|<!--/.test(rest[0]) && rest.slice(1).every(l => MARKER_LINE_RE.test(l));
+}
+export function isExactRecordShape(body) {
+  const text = String(body ?? '').replace(/\r\n?/g, '\n').trim();
+  if (text.split('\n').some(isLaterVerdictBody)) return false;
+  if (isExactRestampShape(text)) return true;
+  const lines = text.split('\n');
+  return lines[0] === '✅ review — accepted' && lines[1] === '' && /^Recorded by [^\n]{1,200}\.$/.test(lines[2] ?? '')
+    && MARKER_LINE_RE.test(lines.at(-1)) && !text.includes('cleared-human');
+}
 const reviewedShasIn = body => [...String(body ?? '').matchAll(/<!--\s*reviewed-sha:\s*([0-9a-f]{40})\s*-->/gi)].map(m => m[1].toLowerCase());
 
 /**
@@ -97,21 +117,26 @@ export function findCarriableVerdict({ comments, headSha, pr, sha: candidate } =
   const latest = parseReviewedSha(trusted);
   const sha = candidate === undefined ? latest : candidate;
   if (!HEX.test(sha ?? '')) return null;
-  // An older candidate is judged as if it were the latest record: every later reviewed-sha record (a re-stamp or a
-  // later accept) is set aside, so the inverted hold rule below reads EVERY comment after the candidate's own record.
-  // Anything there that is not a known machine shape — a red-team record on a later head included — refuses the carry.
-  let lastOwn = -1;
-  if (sha !== latest) {
-    all.forEach((c, i) => { if (isTrustedMarkerAuthor(c) && reviewedShasIn(c?.body).at(-1) === sha) lastOwn = i; });
-    if (lastOwn < 0) return null;
+  if (sha === latest) return findCarriableVerdictFor({ comments: all, trusted, sha, headSha, pr });
+  // An OLDER candidate (Codex audits 2026-10-21) is accepted only on a thread whose every comment after the candidate's
+  // first record is positively known: (a) a record naming the candidate in the exact accept/restamp layout, (b) a later
+  // drain re-stamp in its exact layout (set aside so the candidate's record is the one judged), (c) a known machine
+  // shape, (d) this candidate's own red-team/carry provenance, or (e) the exact accepted-rearm. Anything else — a hold
+  // or break quoting any marker, a later accept, an untrusted comment — refuses. Fail-closed by enumeration.
+  const own = c => isTrustedMarkerAuthor(c) && reviewedShasIn(c?.body).at(-1) === sha;
+  const first = all.findIndex(own);
+  if (first < 0) return null;
+  const later = [];
+  for (const c of all.slice(first)) {
+    const body = String(c?.body ?? '');
+    const marked = reviewedShasIn(body).length > 0;
+    if (own(c)) { if (!isExactRecordShape(body)) return null; continue; }
+    if (marked) { if (isTrustedMarkerAuthor(c) && isExactRestampShape(body)) { later.push(c); continue; } return null; }
+    if (!isTrustedMarkerAuthor(c)) return null;
+    if (isAcceptedRearmBody(body) || informationalProvenance(body, sha, pr) || isKnownMachineBody(body, c)) continue;
+    return null;
   }
-  // Only a positively recognised acceptance record is set aside — a trusted comment whose leading line is an accept or
-  // a re-stamp heading and that carries no later-verdict line. Any other marker-bearing comment (a hold or a red-team
-  // break quoting a marker) stays and refuses the carry (Codex audit 2026-10-21, finding 1).
-  const isLaterRecord = c => isTrustedMarkerAuthor(c) && reviewedShasIn(c?.body).length > 0
-    && /^(?:✅ review — accepted|📌 review — acceptance re-stamped)/.test(String(c?.body ?? '').trimStart())
-    && !String(c?.body ?? '').split('\n').some(isLaterVerdictBody);
-  const scoped = sha === latest ? all : all.filter((c, i) => i <= lastOwn || !isLaterRecord(c));
+  const scoped = all.filter(c => !later.includes(c));
   return findCarriableVerdictFor({ comments: scoped, trusted: scoped.filter(isTrustedMarkerAuthor), sha, headSha, pr });
 }
 

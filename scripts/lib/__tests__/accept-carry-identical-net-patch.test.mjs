@@ -25,8 +25,8 @@ const commit = (files, msg, { mode } = {}) => {
 };
 const exec = (f, a, o) => execFileSync(f, a, { ...o, cwd: dir, env });
 const trusted = body => ({ author: { login: 'chalbert' }, body, createdAt: '2026-10-21T00:00:00Z' });
-const accept = sha => trusted(`✅ review — accepted\n\nRecorded by agent.\n<!-- reviewed-sha: ${sha} -->`);
-const restamp = sha => trusted(`📌 review — acceptance re-stamped after a rebase (no new review)\n\nRecorded by drain via drain-rebase.\n<!-- reviewed-sha: ${sha} -->`);
+const accept = sha => trusted(`✅ review — accepted\n\nRecorded by agent.\n\nwrite-up\n<!-- reviewed-sha: ${sha} -->`);
+const restamp = sha => trusted(`📌 review — acceptance re-stamped after a rebase (no new review)\n\nRecorded by drain via drain-rebase.\n\nhead moved to ${sha} by this drain's own content-preserving rebase\n\n<!-- reviewed-sha: ${sha} -->`);
 const redTeam = sha => trusted(`<!-- we:red-team-advisory pr=7 rev=${sha} -->\nNo confirmed breaks.`);
 const acceptedRearm = () => trusted(buildRearmComment({ actor: 'conveyor fix agent', decision: { rearmFrom: 'review:accepted', keepsHuman: false } }));
 const bounceRearm = () => trusted(buildRearmComment({ actor: 'conveyor fix agent', decision: { rearmFrom: 'review:changes', keepsHuman: false } }));
@@ -118,6 +118,21 @@ describe('accept carry across an identical net change', () => {
       expect(findCarriableVerdict({ comments: thread, headSha: restored, pr: 7, sha: rebased }), quoting.body).toBeNull();
       expect(attemptVerdictCarry(io(thread, restored), { pr: 7 }).carried, quoting.body).toBe(false);
     }
+  });
+  it('re-audit: holds quoting the CANDIDATE marker, accept-prefixed holds, and inexact records all refuse the older path', () => {
+    for (const bad of [trusted(`please hold <!-- reviewed-sha: ${rebased} -->`),
+      trusted(`🔁 review — changes requested\n\nRecorded by x.\n<!-- reviewed-sha: ${rebased} -->`),
+      trusted(`✅ review — accepted (quoted prior verdict; please hold)\n<!-- reviewed-sha: ${jit} -->`),
+      trusted(`<!-- we:red-team-advisory pr=7 rev=${rebased} -->\n1. [**confirmed**] (correctness, broken) — Breaks it\n<!-- reviewed-sha: ${rebased} -->`)]) {
+      const thread = [accept(rebased), redTeam(rebased), bad, restamp(jit), acceptedRearm()];
+      expect(findCarriableVerdict({ comments: thread, headSha: restored, pr: 7, sha: rebased }), bad.body).toBeNull();
+    }
+  });
+  it('a real red-team advisory with its `Files read` sub-line is the candidate\'s provenance, not a hold (live #5779)', () => {
+    const advisory = trusted(`<!-- we:red-team-advisory pr=7 rev=${accepted} -->\n### Post-accept red team — 1 possible break(s), 0 confirmed by Claude's re-check\n\n1. [not confirmed] (edge-case, degraded) \`a.txt:2\` — maybe\n   - Scenario: ran it\n   - Re-check: refuted\n   - Files read: a.txt, card.md`);
+    expect(findCarriableVerdict({ comments: [accept(accepted), advisory], headSha: rebased, pr: 7 })?.sha).toBe(accepted);
+    const withHold = trusted(`${advisory.body}\nplease hold`);
+    expect(findCarriableVerdict({ comments: [accept(accepted), withHold], headSha: rebased, pr: 7 })).toBeNull();
   });
   it('fails closed: no proof reader, setting off, a pushed head GitHub does not show yet, a refused restamp', () => {
     const comments = [accept(accepted), redTeam(accepted)];
