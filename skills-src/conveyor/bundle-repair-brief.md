@@ -44,8 +44,10 @@ the outcome, stop.
    inside the lane it prints.
 2. **Read the registered list (the base).** `node {{WE_ROOT}}/scripts/daemon-overlay.mjs list --clone={{CLONE_ROOT}} --json`.
    This list, in order, is what the clone runs. `{{HELD_REFS}}` are the ones the rebuild says conflict with main.
-3. **Build the new top.** `git fetch origin`, branch `lane/unfreeze-{{CLONE_NAME}}-top-<MMDD><n>` from `origin/main`,
-   then merge every registered overlay ref in list order (`git merge --no-ff origin/<ref>`).
+3. **Build the new top.** Name it `lane/unfreeze-{{CLONE_NAME}}-top-<MMDD><n>` (a name never pushed before). In
+   your lane: `git fetch origin`, then `LANE_SESSION=<your lane slug> git reset --hard origin/main` (alone on the
+   line; lanes stay on a detached HEAD — never create or switch a local branch), then merge every registered
+   overlay ref in list order (`git merge --no-ff origin/<ref>`).
 4. **Resolve each conflicted hunk keeping both sides:** main's version for content main now carries; the overlay's
    behaviour layered on top. Never drop an overlay's behaviour to make a hunk merge; never revert main's. If a hunk
    cannot keep both faithfully, stop at step 9 with reason `unresolvable-conflict`.
@@ -57,13 +59,21 @@ the outcome, stop.
    `node {{WE_ROOT}}/scripts/codex-direct-task.mjs` with a read-only prompt asking for exactly one verdict line,
    `NOT WEAKENED` or `WEAKENED`, judged on (a) every overlay behaviour still present, (b) faithful to main. On
    WEAKENED: fix what it names and audit again. **A second WEAKENED → stop at step 9 with `weakened-twice`.**
-7. **Push and register.** `git push origin HEAD:refs/heads/<your new branch>`. Then
+7. **Push and register — keep the originals registered.** Save the step-2 list JSON first (it is the rollback
+   baseline). `git push origin HEAD:refs/heads/<your new branch>`. Then
    `node {{WE_ROOT}}/scripts/daemon-overlay.mjs add --clone={{CLONE_ROOT}} --ref=<your new branch> --allow-no-pr --by={{BOT}} --reason="bundle repair {{HOLD_ID}}"`.
-   Then remove every ref the new top now contains:
-   `node {{WE_ROOT}}/scripts/daemon-overlay.mjs remove --clone={{CLONE_ROOT}} --ref=<ref> --by={{BOT}} --reason="folded into <your new branch>"`.
+   **Do not remove any original overlay yet.** Each original's tip is an ancestor of the new top, so the rebuild sets
+   it aside as contained in the top; nothing is lost if the new top fails its smoke.
 8. **Load and confirm.** From a fresh lane at origin/main:
-   `node {{WE_ROOT}}/scripts/lib/daemon-load-overlay.mjs --clone={{CLONE_ROOT}} --ref=<your new branch> --wait --json`. Check `git merge-base --is-ancestor origin/main <top>` and that every
-   removed ref is an ancestor of the top. Confirm the clone's hold cleared (its `rebuild.json` `held` is null).
+   `node {{WE_ROOT}}/scripts/lib/daemon-load-overlay.mjs --clone={{CLONE_ROOT}} --ref=<your new branch> --wait --json`.
+   Check `git merge-base --is-ancestor origin/main <top>` and that every original ref is an ancestor of the top.
+   Confirm the clone ADOPTED the top and its hold cleared (its `rebuild.json` `held` is null).
+   - **Only after that**, remove each original the top contains:
+     `node {{WE_ROOT}}/scripts/daemon-overlay.mjs remove --clone={{CLONE_ROOT}} --ref=<ref> --by={{BOT}} --reason="folded into <your new branch>"`.
+   - If the load does not adopt the top, or the hold stays: **remove nothing**. Remove only your own new top
+     (`… remove --clone={{CLONE_ROOT}} --ref=<your new branch> --by={{BOT}}`), so the registered list equals the saved
+     baseline again, and stop at step 9 with reason `other` and the load output as detail. (A PINNED original is
+     never set aside as contained, so with one in the list expect this branch.)
 9. **Record ONE outcome and stop.**
    `node {{WE_ROOT}}/scripts/conveyor/bundle-repair-dispatch.mjs record --hold={{HOLD_ID}} --session={{SESSION_SLUG}} < outcome.json`
    - repaired: `{"outcome":"repaired","top":"<your new branch>","audits":[{"verdict":"NOT WEAKENED"}],"detail":"<one line>"}`

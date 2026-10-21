@@ -174,8 +174,12 @@ async function defaultStop(entry) {
   let handle = entry.handle;
   if (!handle && entry.session) {
     const { readAgentsStrict } = await import('../lib/lane-salvage.mjs');
-    const row = (readAgentsStrict() || []).find((a) => a?.name === entry.session && !FINISHED.has(a.state));
+    const agents = readAgentsStrict();
+    // An unreadable listing is UNKNOWN: throw so the stop stays pending, never "nothing to stop".
+    if (!Array.isArray(agents)) throw new Error('bundle-repair: could not list claude agents to resolve the session by name');
+    const row = agents.find((a) => a?.name === entry.session && !FINISHED.has(a.state));
     handle = row?.id ?? row?.sessionId ?? null;
+    if (row && !handle) throw new Error('bundle-repair: the session is listed but exposes no id to stop');
   }
   if (handle) stopSessionWithRetry({ handle });
 }
@@ -261,7 +265,7 @@ export async function runBundleRepairs({
     // 1. reconcile
     const outcomes = new Map();
     const overrides = new Map();
-    for (const e of ledger.filter((x) => x.status === 'running' || x.status === 'repaired')) {
+    for (const e of ledger.filter((x) => x.status === 'running' || x.status === 'repaired' || x.stopPending)) {
       outcomes.set(e.holdId, readJson(outcomePath(dir, e.holdId), null));
       try { overrides.set(e.holdId, await overrideFor(e)); } catch { overrides.set(e.holdId, null); }
     }
@@ -272,7 +276,7 @@ export async function runBundleRepairs({
       if (dryRun) continue;
       if (a.stop) await tryStop(entry);
       entry.status = a.status;
-      entry.endedAt = now;
+      entry.endedAt ??= now;
       entry.endReason = a.escalate ?? a.detail;
       if (a.escalate) {
         entry.escalationPending = { reason: a.escalate, detail: a.detail };

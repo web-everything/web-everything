@@ -87,6 +87,17 @@ describe('the brief never carries a forbidden command', () => {
     expect(session).toBe('bundle-repair-review-206df80e-x');
   });
 
+  it('removes the original overlays only AFTER the new top is adopted (the rollback baseline survives a failed load)', async () => {
+    const { prompt } = await fillRepairBrief(target);
+    const add = prompt.indexOf('daemon-overlay.mjs add');
+    const load = prompt.indexOf('daemon-load-overlay.mjs --clone=');
+    const removeOriginal = prompt.indexOf('--ref=<ref> --by=');
+    expect(add).toBeGreaterThan(0);
+    expect(load).toBeGreaterThan(add);
+    expect(removeOriginal).toBeGreaterThan(load);
+    expect(prompt).toMatch(/remove nothing/);
+  });
+
   it('refuses a brief that carries one', async () => {
     expect(() => assertBriefSafe('node daemon-overlay.mjs add --ref=x --allow-conflict --reason=y')).toThrow(/conflict override/);
     expect(() => assertBriefSafe('LANE_SESSION=s git push --force origin HEAD')).toThrow(/force push/);
@@ -129,6 +140,20 @@ describe('planReconcile — the escalation path', () => {
     expect(planReconcile([entry()], { clones: gone, now: NOW, outcomeFor: () => ({ outcome: 'escalate', reason: 'weakened-twice', detail: 'd' }) })[0].escalate).toBe('weakened-twice');
     expect(planReconcile([entry()], { clones: [], now: NOW })).toEqual([]);
     expect(planReconcile([entry({ deadlineAt: NOW })], { clones: [], now: NOW })[0].escalate).toBe('wall-time');
+  });
+  it('the wall time is never suppressed by a cleared hold or a repaired outcome', () => {
+    const late = entry({ deadlineAt: NOW });
+    expect(planReconcile([late], { clones: [{ ...c, held: null }], now: NOW })[0]).toMatchObject({ status: 'cleared', escalate: 'wall-time' });
+    expect(planReconcile([late], { clones: [c], now: NOW, outcomeFor: () => ({ outcome: 'repaired', top: 'lane/x' }) })[0]).toMatchObject({ escalate: 'hold-not-cleared', stop: true });
+    // cleared before the deadline is a clean success
+    expect(planReconcile([entry()], { clones: [{ ...c, held: null }], now: NOW })[0].escalate).toBeNull();
+  });
+  it('a settled entry whose stop is still pending is still watched for a conflict override (once)', () => {
+    const settled = entry({ status: 'cleared', stopPending: true, endReason: 'the clone left this overlay hold' });
+    const a = planReconcile([settled], { clones: [{ ...c, held: null }], now: NOW, overrideFor: () => ({ ref: 'lane/x' }) });
+    expect(a[0]).toMatchObject({ escalate: 'conflict-override-used', stop: true });
+    expect(planReconcile([{ ...settled, endReason: 'conflict-override-used' }], { clones: [], now: NOW, overrideFor: () => ({ ref: 'lane/x' }) })).toEqual([]);
+    expect(planReconcile([{ ...settled, stopPending: false }], { clones: [], now: NOW, overrideFor: () => ({ ref: 'lane/x' }) })).toEqual([]);
   });
   it('wall time → escalate; repaired but still held at the wall time → hold-not-cleared', () => {
     expect(planReconcile([entry({ deadlineAt: NOW })], { clones: [c], now: NOW })[0].escalate).toBe('wall-time');

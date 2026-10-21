@@ -146,11 +146,13 @@ export function planBundleRepairs({ clones = [], ledger = [], settings = BUNDLE_
 /**
  * PURE: what to do with every RUNNING (or `repaired`, awaiting the hold to clear) ledger entry this tick.
  * Order of precedence, first match wins:
- *   1. a registration by the bot carried a conflict override → escalate `conflict-override-used`;
+ *   1. a registration by the bot carried a conflict override → escalate `conflict-override-used` (also for a settled
+ *      entry whose stop is still pending — its session may still be running);
  *   2. the session recorded `escalate` → escalate with its reason (both outrank a cleared hold);
- *   3. the clone's hold is gone (or a different hold) → `cleared`. A clone MISSING from the probe is unknown, not cleared;
- *   4. the session recorded `repaired` → stop it; status `repaired` (still watched until the hold clears);
- *   5. the wall time is reached → escalate `wall-time` (`hold-not-cleared` when the session had said repaired).
+ *   3. the clone's hold is gone → `cleared` (escalating `wall-time` if the session overran without an outcome). A
+ *      clone MISSING from the probe is unknown, not cleared;
+ *   4. the wall time is reached → escalate `wall-time` (`hold-not-cleared` when the session said repaired);
+ *   5. the session recorded `repaired` → stop it; status `repaired` (still watched until the hold clears).
  * @param {Array<object>} ledger
  * @param {{clones:Array<object>, now:number, outcomeFor:(holdId:string)=>object|null,
  *   overrideFor:(entry:object)=>object|null}} o
@@ -160,24 +162,34 @@ export function planReconcile(ledger, { clones = [], now, outcomeFor = () => nul
   const byKey = new Map(clones.map((c) => [c.cloneKey, c]));
   const out = [];
   for (const e of Array.isArray(ledger) ? ledger : []) {
-    if (e.status !== 'running' && e.status !== 'repaired') continue;
+    const watched = e.status === 'running' || e.status === 'repaired';
+    // A settled entry whose stop failed may still have a live session: keep watching it for a conflict override.
+    if (!watched && !e.stopPending) continue;
     const sessionLive = e.status === 'running';
-    const c = byKey.get(e.cloneKey);
     const act = (status, escalate, detail, stop = sessionLive) => out.push({ holdId: e.holdId, stop, status, escalate, detail });
-    // A mandatory alert outranks a cleared hold: an override or a session escalation is raised even if the clone
-    // has since left the hold.
     const override = overrideFor(e);
-    if (override) { act('escalated', 'conflict-override-used', `a registration by ${BUNDLE_REPAIR_BOT} carried a conflict override (${override.ref ?? '?'})`); continue; }
+    if (override && e.endReason !== 'conflict-override-used') {
+      act('escalated', 'conflict-override-used', `a registration by ${BUNDLE_REPAIR_BOT} carried a conflict override (${override.ref ?? '?'})`, sessionLive || !!e.stopPending);
+      continue;
+    }
+    if (!watched) continue;
     const outcome = outcomeFor(e.holdId);
     if (outcome?.outcome === 'escalate' && sessionLive) { act('escalated', outcome.reason, outcome.detail); continue; }
+    const pastDeadline = now >= e.deadlineAt;
+    const saidRepaired = e.status === 'repaired' || (sessionLive && outcome?.outcome === 'repaired');
+    const c = byKey.get(e.cloneKey);
     // A clone missing from this tick's probe is UNKNOWN, never "cleared" — only the wall time applies to it.
-    const stillHeld = !c || (isOverlayHold(c.held) && holdIdFor(c, c.held) === e.holdId);
-    if (!stillHeld) { act('cleared', null, 'the clone left this overlay hold'); continue; }
-    if (c && outcome?.outcome === 'repaired' && sessionLive) { act('repaired', null, `registered ${outcome.top}; waiting for the hold to clear`); continue; }
-    if (now >= e.deadlineAt) {
-      act('escalated', e.status === 'repaired' ? 'hold-not-cleared' : 'wall-time',
-        e.status === 'repaired' ? 'the session said repaired but the clone is still held at the wall time' : 'the repair session reached its wall time without recording an outcome');
+    if (c && !(isOverlayHold(c.held) && holdIdFor(c, c.held) === e.holdId)) {
+      if (sessionLive && !outcome && pastDeadline) act('cleared', 'wall-time', 'the hold cleared, but the session ran past its wall time without recording an outcome');
+      else act('cleared', null, 'the clone left this overlay hold');
+      continue;
     }
+    if (pastDeadline) {
+      act('escalated', saidRepaired ? 'hold-not-cleared' : 'wall-time',
+        saidRepaired ? 'the session said repaired but the clone is still held at the wall time' : 'the repair session reached its wall time without recording an outcome');
+      continue;
+    }
+    if (c && sessionLive && outcome?.outcome === 'repaired') act('repaired', null, `registered ${outcome.top}; waiting for the hold to clear`);
   }
   return out;
 }
