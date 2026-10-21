@@ -55,6 +55,30 @@ describe('verifyFinding', () => {
   });
 });
 
+describe('false-refutation probes (audit round 2)', () => {
+  const R = (map) => ({ read: (p) => map[p] ?? null, tests: () => Object.keys(map).filter((p) => /test/.test(p)) });
+  it('an unused import of the subject is not coverage', () => {
+    const r = verifyFinding({ file: 'pay.mjs', line: 1, summary: 'retryPayment is untested.' },
+      R({ 'pay.test.mjs': "import { retryPayment } from './pay.mjs';\ndescribe('x', () => { it('adds', () => { expect(1 + 1).toBe(2) }) })\n" }));
+    expect(r.status).toBe('inconclusive');
+  });
+  it('terms match whole words only (backoffice is not backoff)', () => {
+    const r = verifyFinding({ file: 'b.mjs', line: 1, summary: 'The retry backoff has no test.' }, R({ 'b.test.mjs': "it('retry button renders backoffice label', () => {})\n" }));
+    expect(r.status).toBe('inconclusive');
+  });
+  it('a log and an error return in a DIFFERENT function do not refute a swallowed error', () => {
+    const src = "function payment() { try { throw Error('payment'); } catch {} }\nfunction unrelated() {\n  console.error('unrelated'); return { status: 'error' };\n}\n";
+    expect(verifyFinding({ file: 'p.mjs', line: 1, summary: 'Payment errors are silently discarded.' }, R({ 'p.mjs': src })).status).toBe('inconclusive');
+  });
+  it('a bare empty catch inside the cited function blocks the refutation', () => {
+    const src = "function f() {\n  try { a() } catch (e) { console.error(e); return { status: 'error' } }\n  try { b() } catch {}\n}\n";
+    expect(verifyFinding({ file: 'p.mjs', line: 2, summary: 'errors are silently discarded' }, R({ 'p.mjs': src })).status).toBe('inconclusive');
+  });
+  it('an absence claim is not refuted by the identifier being absent', () => {
+    expect(verifyFinding({ file: 'r.mjs', line: 1, summary: 'The response omits required requestId.' }, R({ 'r.mjs': 'export function response() { return {}; }' })).status).toBe('inconclusive');
+  });
+});
+
 describe('makeGitRepo', () => {
   const HEAD = 'a'.repeat(40);
   it('reads via git show of the head only; refuses odd paths and a bad head', () => {
@@ -70,6 +94,15 @@ describe('makeGitRepo', () => {
     const r = makeGitRepo({ head: HEAD, run: () => { throw new Error('bad object'); } });
     expect(r.read('a.mjs')).toBeNull();
     expect(r.tests('a')).toEqual([]);
+  });
+  it('an identifier that looks like a git option is never passed as one', () => {
+    const calls = [];
+    const r = makeGitRepo({ head: HEAD, run: (a) => { calls.push(a); return ''; } });
+    r.tests('a', ['--files-without-match', 'good_id']);
+    const grepCalls = calls.filter((a) => a[0] === 'grep');
+    expect(grepCalls).toHaveLength(1);
+    expect(grepCalls[0]).toContain('-e');
+    expect(grepCalls[0][grepCalls[0].indexOf('-e') + 1]).toBe('good_id');
   });
   it('tests(): name-based test files first, then tests that contain the identifier; only read-only git verbs', () => {
     const calls = [];

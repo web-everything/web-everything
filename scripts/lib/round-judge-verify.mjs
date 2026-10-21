@@ -56,6 +56,10 @@ function titlesOf(text) {
 }
 const words = (s) => new Set(String(s).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean));
 
+const IMPORTISH = /^\s*(?:import\b|export\s*\{|export\s+\*|\/\/|\*|\/\*)|\brequire\(/;
+const esc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const wordSet = (l) => new Set(String(l).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean));
+
 function checkCoverage(f, repo) {
   const ids = claimIdentifiers(f.summary).filter((x) => x.length >= 6).slice(0, 1); // the subject only
   const stem = stemOf(f.file);
@@ -65,41 +69,54 @@ function checkCoverage(f, repo) {
     const text = repo.read(path);
     if (text == null) continue;
     const lines = text.split('\n');
-    // 1. a named identifier of the claim appears in the test file.
+    const firstTitle = lines.findIndex((l) => TITLE.test(l));
+    // 1. the subject identifier is USED inside a test body: whole word, after a test title, not an import / comment line.
     for (const id of ids) {
-      const at = lines.findIndex((l) => l.includes(id));
-      if (at >= 0) return { status: 'refuted', evidence: `${path}:${at + 1} mentions ${id}` };
+      const re = new RegExp(`(?<![\\w$])${esc(id)}(?![\\w$])`);
+      const at = lines.findIndex((l, i) => firstTitle >= 0 && i > firstTitle && re.test(l) && !IMPORTISH.test(l));
+      if (at >= 0) return { status: 'refuted', evidence: `${path}:${at + 1} uses ${id}` };
     }
-    // 2. a test title, then any line, carries at least two distinctive terms of the claim (stem words excluded).
-    const norm = (l) => l.toLowerCase().replace(/[_-]+/g, ' ');
-    for (const t of titlesOf(text)) {
-      const w = norm(t.title);
-      if (terms.filter((x) => w.includes(x)).length >= 2) return { status: 'refuted', evidence: `${path}:${t.line} "${t.title.slice(0, 80)}"` };
-    }
+    // 2. a test title, then a line inside a test, carries at least two whole-word distinctive terms (stem words excluded).
+    const hits = (l) => { const w = wordSet(l); return terms.filter((x) => w.has(x)).length; };
+    for (const t of titlesOf(text)) if (hits(t.title) >= 2) return { status: 'refuted', evidence: `${path}:${t.line} "${t.title.slice(0, 80)}"` };
     if (terms.length >= 2) {
-      const at = lines.findIndex((l) => terms.filter((x) => norm(l).includes(x)).length >= 2);
+      const at = lines.findIndex((l, i) => firstTitle >= 0 && i > firstTitle && !IMPORTISH.test(l) && hits(l) >= 2);
       if (at >= 0) return { status: 'refuted', evidence: `${path}:${at + 1} ${lines[at].trim().slice(0, 80)}` };
     }
   }
   return { status: 'inconclusive', evidence: null };
 }
 
+const FN_DECL = /^(?:export\s+)?(?:async\s+)?function\b|^(?:export\s+)?(?:const|let)\s+\w+\s*=\s*(?:async\s*)?(?:\([^)]*\)|\w+)\s*=>/; // top-level only
+// A bare empty catch is a real swallow. One that carries a comment (`catch { /* log only */ }`) is a documented best-effort
+// step and does not by itself decide the claim.
+const EMPTY_CATCH = /catch\s*(?:\([^)]*\))?\s*\{\s*\}/;
+
 function checkSilent(f, repo) {
   const text = repo.read(f.file);
   if (text == null || !Number.isInteger(f.line)) return { status: 'inconclusive', evidence: null };
   const lines = text.split('\n');
-  const lo = Math.max(0, f.line - 51), hi = Math.min(lines.length, f.line + 50);
-  let logAt = -1, statusAt = -1;
-  for (let i = lo; i < hi; i += 1) {
-    if (logAt < 0 && /\b(?:console\.(?:error|warn|log)|throw\b|log(?:ger)?\.(?:error|warn))/.test(lines[i])) logAt = i;
-    if (statusAt < 0 && /status\s*:\s*['"]error['"]|\bexitCode\s*=\s*[1-9]|return\s*\{[^}]*\berror\b/.test(lines[i])) statusAt = i;
-  }
+  let at = Math.min(Math.max(f.line - 1, 0), lines.length - 1);
+  // A cited line that has drifted into a doc comment means the function right below it.
+  while (at < lines.length - 1 && /^\s*(?:\/\*|\*|\/\/|$)/.test(lines[at])) at += 1;
+  // Only the function that CONTAINS the cited line counts: a log or error return in another function proves nothing.
+  let lo = at; while (lo > 0 && !FN_DECL.test(lines[lo])) lo -= 1;
+  let hi = at + 1; while (hi < lines.length && !FN_DECL.test(lines[hi])) hi += 1;
+  if (hi - lo > 120) return { status: 'inconclusive', evidence: null };
+  const scope = lines.slice(lo, hi);
+  if (scope.some((l) => EMPTY_CATCH.test(l))) return { status: 'inconclusive', evidence: null }; // a real swallow is in there
+  const logAt = scope.findIndex((l) => /\b(?:console\.(?:error|warn|log)|throw\b|log(?:ger)?\.(?:error|warn))/.test(l));
+  const statusAt = scope.findIndex((l) => /status\s*:\s*['"]error['"]|\bexitCode\s*=\s*[1-9]|return\s*\{[^}]*\berror\b/.test(l));
   return logAt >= 0 && statusAt >= 0
-    ? { status: 'refuted', evidence: `${f.file}:${logAt + 1} logs/throws and ${f.file}:${statusAt + 1} returns an error status` }
+    ? { status: 'refuted', evidence: `${f.file}:${lo + logAt + 1} logs/throws and ${f.file}:${lo + statusAt + 1} returns an error status, in the function holding line ${f.line}` }
     : { status: 'inconclusive', evidence: null };
 }
 
+/** A claim about something ABSENT ("omits", "never", "missing") is not refuted by an identifier being absent. */
+const NEGATIVE = /\b(?:omit(?:s|ted)?|missing|lacks?|without|never|not|no|fails? to|doesn'?t|isn'?t|cannot|can'?t|skips?|ignores?)\b/i;
+
 function checkBehaviour(f, repo) {
+  if (NEGATIVE.test(f.summary)) return { status: 'inconclusive', evidence: null };
   const ids = claimIdentifiers(f.summary);
   if (!ids.length || !f.file) return { status: 'inconclusive', evidence: null };
   const text = repo.read(f.file);
@@ -155,9 +172,9 @@ export function makeGitRepo({ head, cwd = process.cwd(), run } = {}) {
         for (const p of tree) if (TEST_PATH.test(p) && p.split('/').pop().startsWith(stem)) out.push(p);
       } catch { /* fall through to identifiers */ }
       for (const id of ids.slice(0, 4)) {
-        if (!/^[\w.$-]+$/.test(id)) continue;
+        if (!/^[A-Za-z_$][\w$]*$/.test(id)) continue;
         try {
-          const hits = exec(['grep', '-l', '-F', '--no-color', id, head, '--']);
+          const hits = exec(['grep', '-l', '-F', '--no-color', '-e', id, head, '--']);
           for (const l of hits.split('\n')) { const p = l.replace(`${head}:`, '').trim(); if (p && TEST_PATH.test(p)) out.push(p); }
         } catch { /* no hit */ }
       }

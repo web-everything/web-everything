@@ -97,7 +97,7 @@ export function replayPr(data, { withoutGuardFiles = false, repoFor = () => null
     const until = Math.min(events[i + 1]?.at ?? Infinity, ev.at + WINDOW_MS);
     const upTo = comments.filter((c) => timeOf(c) <= ev.at);
     const vrepo = repoFor(data, ev);
-    const j = judgeRound({ pr, repo: REPO, head: ev.head, trigger: ev.trigger, comments: upTo, files,
+    const j = judgeRound({ pr, repo: REPO, head: ev.head || String(data.headRefOid ?? '').toLowerCase(), trigger: ev.trigger, comments: upTo, files,
       ...(vrepo ? { verify: (f) => verifyFinding(f, vrepo) } : {}) });
     let actual = actualAfter(comments, ev.at, until);
     if (!actual && HANDOFF_ACTIONS[pr] && i === events.length - 1) actual = { action: HANDOFF_ACTIONS[pr], at: 0, note: 'handoff note' };

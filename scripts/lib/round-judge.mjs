@@ -150,7 +150,7 @@ export function detectRoundCap({ comments, pr, head, state = null, repo = null }
   }
   // referral-hold: the review paused waiting for a block / card / not-real ruling, and none has been recorded since.
   const hold = list.filter((c) => isTrustedMarkerAuthor(c) && /^review paused:/.test(bodyOf(c).trimStart()) && /Waiting on your ruling/.test(bodyOf(c))).at(-1);
-  if (hold && !list.some((c) => timeOf(c) > timeOf(hold) && /^## (?:Operator|Automatic policy) ruling on mandatory referrals/.test(bodyOf(c).trimStart()))) {
+  if (hold && !list.some((c) => timeOf(c) > timeOf(hold) && isTrustedMarkerAuthor(c) && /^## (?:Operator|Automatic policy) ruling on mandatory referrals/.test(bodyOf(c).trimStart()))) {
     const h = /review-referral-hold: ([0-9a-f]{8,})/.exec(bodyOf(hold))?.[1] ?? String(timeOf(hold));
     return { trigger: 'referral-hold', at: timeOf(hold), key: `${pr}:${live}:referral-hold:${h}` };
   }
@@ -311,7 +311,8 @@ function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = []
     : statuteTouched.length ? `statute-file-uncertain-no-grant:${statuteTouched[0]}`
       : crossBroken.length ? `open-break-in-other-source-no-grant:${crossBroken[0].file}:${crossBroken[0].line}` : null);
 
-  if (annotated.length && refuted.length === annotated.length) {
+  if (annotated.length && refuted.length === annotated.length && crossBroken.length) reasons.push(`not-real-blocked-by-open-break-in-other-source:${crossBroken[0].file}:${crossBroken[0].line}`);
+  if (annotated.length && refuted.length === annotated.length && !crossBroken.length) {
     return done('not-real-verified', [`all-${annotated.length}-findings-mechanically-refuted`, ...(guardFiles.length ? [`guard-file-touched-but-refuted:${guardFiles[0]}`] : [])], undefined, proof);
   }
   if (refuted.length) reasons.push(`partially-refuted:${refuted.length}-of-${annotated.length}`);
