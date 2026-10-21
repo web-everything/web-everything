@@ -1,7 +1,8 @@
 ---
+bornAs: xcq5jb9
 kind: story
 size: 5
-parent: "xejcrh1"
+parent: "6899"
 status: open
 scope: ["we:scripts/settings/stack.json", "we:scripts/lib/policy-cascade.mjs", "we:scripts/lib/stack-policy.mjs"]
 dateOpened: "2026-10-17"
@@ -10,7 +11,7 @@ tags: []
 
 # we: stacked PR policy slice 1 - policy settings and evaluator
 
-Add every stacking value as a cascade setting with its source logged in we:scripts/settings/stack.json (matrix cells, safety floor, urgent classes, smallChildMaxLines 50, lowRiskClasses, maxDepth 1, onBaseHeadMove, base-closed handling) and a pure evaluator in we:scripts/lib/stack-policy.mjs that returns stack or no-stack for a base state and child class (plus the two PRs' actor and lane-trust facts for the identity rule). Ruled in xv85eqi.
+Add every stacking value as a cascade setting with its source logged in we:scripts/settings/stack.json (matrix cells, safety floor, urgent classes, smallChildMaxLines 50, lowRiskClasses, maxDepth 1, onBaseHeadMove, base-closed handling) and a pure evaluator in we:scripts/lib/stack-policy.mjs that returns stack or no-stack for a base state and child class (plus the two PRs' actor and lane-trust facts for the identity rule). Ruled in 6903.
 
 ## Acceptance
 

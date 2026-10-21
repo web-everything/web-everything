@@ -1,9 +1,10 @@
 ---
+bornAs: xkmrswh
 kind: story
 size: 8
-parent: "xejcrh1"
+parent: "6899"
 status: open
-blockedBy: ["xcq5jb9", "xdqe5hm"]
+blockedBy: ["6896", "6898"]
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/conveyor/pr-stack.mjs", "we:scripts/conveyor/review-stack-base.mjs", "we:scripts/settings/pr-stack.json"]
 dateOpened: "2026-10-17"
 tags: []
@@ -11,7 +12,7 @@ tags: []
 
 # we: stacked PR policy slice 3 - drain ordered landing, restack, delta re-review
 
-Make the drain land a policy-stacked child only after its base, restack the child when the base head moves (stack.onBaseHeadMove), and re-review only the child delta. The hold marker moves only when the delta fingerprint is unchanged and the base's new commits touch none of the child's files. Ruled in xv85eqi.
+Make the drain land a policy-stacked child only after its base, restack the child when the base head moves (stack.onBaseHeadMove), and re-review only the child delta. The hold marker moves only when the delta fingerprint is unchanged and the base's new commits touch none of the child's files. Ruled in 6903.
 
 ## Acceptance
 

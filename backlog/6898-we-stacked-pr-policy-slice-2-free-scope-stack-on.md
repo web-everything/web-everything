@@ -1,9 +1,10 @@
 ---
+bornAs: xdqe5hm
 kind: story
 size: 5
-parent: "xejcrh1"
+parent: "6899"
 status: open
-blockedBy: ["xcq5jb9"]
+blockedBy: ["6896"]
 scope: ["we:scripts/operations/free-scope.mjs", "we:scripts/operations/free-scope-cli.mjs", "we:scripts/operations/__tests__/free-scope.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
@@ -11,7 +12,7 @@ tags: []
 
 # we: stacked PR policy slice 2 - free-scope --stack-on
 
-Add --stack-on=<n> to free-scope: derive the base PR chain, ask the stack policy for the cell, and exclude only PR holders in that chain (never agent-registry holders). excludePr becomes a list. A cell that may not stack still reports OCCUPIED. Ruled in xv85eqi.
+Add --stack-on=<n> to free-scope: derive the base PR chain, ask the stack policy for the cell, and exclude only PR holders in that chain (never agent-registry holders). excludePr becomes a list. A cell that may not stack still reports OCCUPIED. Ruled in 6903.
 
 ## Acceptance
 

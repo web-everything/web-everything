@@ -6281,7 +6281,7 @@ Codex-authored PRs get an Opus judge, same fallback dimension). Declared in `we:
 (`#6268`).** The operator's words: *"we should have the option to use a db for settings instead of in code, at least as
 override"*, then "Ok" to defaults (a), (a), (a). Composes with [config-extends-platform-default](#config-extends-platform-default)
 (the new layer is one more cascade layer, each value with its source logged) and the settings-edit authority decision
-`#xugqjw1` (cited by id).
+`#6239` (cited by id).
 
 **The rule:**
 1. **One new top layer, `operator-override`.** Order: standard < platform < tool < env < operator-override (Fork 2 = a).
@@ -6432,7 +6432,7 @@ as implementation destinations.
 ### Stacking a PR on another PR is a configurable cascade policy; a fixed safety floor protects guard and merge-path code {#stacked-pr-policy-configurable}
 
 **Ratified 2026-10-17 by the operator (Nicolas Gilbert), in conversation, both forks at the card's default
-(`#xv85eqi`).** The operator's words: *"Ok, make sure the stacking is a configurable policy"*. Composes with
+(`#6903`).** The operator's words: *"Ok, make sure the stacking is a configurable policy"*. Composes with
 [review-stringency-classified-outcomes](#review-stringency-classified-outcomes) (the guard and low-risk classes are read
 from its class list) and the drain's existing proof-of-land gate (base lands first).
 
@@ -6473,4 +6473,4 @@ from its class list) and the drain's existing proof-of-land gate (base lands fir
 6. **Free-scope.** The caller names the intended base PR (`--stack-on=<n>`); free-scope applies the matrix and excludes
    only PR holders in that chain, never agent-registry holders. A cell that may not stack still reports OCCUPIED.
 
-**Lineage:** `#xv85eqi` (ruled 2026-10-17). Instance of [config-extends-platform-default](#config-extends-platform-default).
+**Lineage:** `#6903` (ruled 2026-10-17). Instance of [config-extends-platform-default](#config-extends-platform-default).

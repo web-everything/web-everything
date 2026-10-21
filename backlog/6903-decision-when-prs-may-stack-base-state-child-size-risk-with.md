@@ -11,7 +11,7 @@ dateResolved: "2026-10-17"
 codifiedIn: "docs/agent/platform-decisions.md#stacked-pr-policy-configurable"
 preparedDate: "2026-10-17"
 preparedAgainstSha: "2fd013ac53894e9f955069bce0d82a08f6e0ac8d"
-relatedTo: ["2387", "2393", "2394", "4631", "xugqjw1", "xrlwbd7"]
+relatedTo: ["2387", "2393", "2394", "4631", "6239", "6236"]
 tags: [stacked-prs, drain, free-scope, decision-prep]
 ---
 
@@ -27,7 +27,7 @@ The prepared text below is kept as the lineage; where it differs from this secti
 - **Fork 2 = (a).** A low-risk child rebases onto main only on a clean rebase with an unchanged delta fingerprint; all else goes to the operator. The cascade default enables this handling; an unset repo layer uses that default, while an unreadable or absent resolved cascade value goes to the operator. Rebase grants no approval and preserves review, CI and proof-of-land gates for the new head (slice 4's named `base closed:` and `auto-rebase setting:` tests). The auto-rebase also clears both drain holds on the old base: it retargets the child PR to its repo's default branch (GitHub retargets only when a base merges, so `classifyPr` would keep skipping a child left on the closed base's branch), and it removes the closed base from the child's `stackParents` edge in every lane manifest the drain reads. Otherwise the drain waits forever on a parent that never lands. A child sent to the operator keeps its edge and is never left targeting the default branch on its edge alone (slice 4's operator-route test).
 - **Amendment.** The WHOLE policy is a configurable cascade policy, each value with its source logged: every matrix cell (base state x child class), the safety floor (default: guard or merge-path never stacks on an in-review or fixing base; changeable only by an operator-sourced setting, never by an agent), the urgent classes, `stack.smallChildMaxLines` (50), `stack.lowRiskClasses`, `stack.maxDepth` (1), `stack.onBaseHeadMove` (restack + delta re-review) and the closed or rejected base handling.
 
-**Build slices:** the four children of epic xejcrh1 (`parent: "xejcrh1"`): xcq5jb9 (policy settings and evaluator), xdqe5hm (free-scope `--stack-on`), xkmrswh (drain ordered landing, restack and delta re-review), and x44bz7l (base-closed handling). The epic implements this decision; the slices are not children of this decision.
+**Build slices:** the four children of epic 6899 (`parent: "6899"`): 6896 (policy settings and evaluator), 6898 (free-scope `--stack-on`), 6900 (drain ordered landing, restack and delta re-review), and 6901 (base-closed handling). The epic implements this decision; the slices are not children of this decision.
 
 Operator ask, 2026-10-17: "We'll need to normalise when we can use stacked pr, both in circumstance and timing, like a pr waiting for drain could probably be stacked on with little cost or risk, and in some cases it might be cheaper to use stacked pr for urgent things" … "Or when little change or risk maybe". Operator go ("Yes") to file and prepare one card.
 
@@ -131,4 +131,4 @@ Screen: clear.
 
 ## Non-goals
 
-- [N1] This card ratifies the policy only. Epic xejcrh1 owns the four build slices: policy settings and evaluator; free-scope; drain ordered landing, restack and delta re-review; closed or rejected base handling.
+- [N1] This card ratifies the policy only. Epic 6899 owns the four build slices: policy settings and evaluator; free-scope; drain ordered landing, restack and delta re-review; closed or rejected base handling.

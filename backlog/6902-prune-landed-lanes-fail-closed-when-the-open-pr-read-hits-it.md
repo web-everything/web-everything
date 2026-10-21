@@ -1,4 +1,5 @@
 ---
+bornAs: xp1e7k6
 kind: story
 size: 2
 status: open
@@ -11,7 +12,7 @@ tags: []
 
 # prune-landed-lanes: fail closed when the open-PR read hits its --limit 200 cap
 
-The prune keeps any lane branch an open PR targets (or heads), but its open-PR read uses `gh pr list --limit 200` with no truncation check. With more than 200 open PRs, a branch an open stacked PR targets can be missed and deleted. GitHub then closes that PR and refuses both a retarget and a reopen (#2578). Found while repairing web-everything/web-everything#5530 (stacked-PR policy slice 4, x44bz7l).
+The prune keeps any lane branch an open PR targets (or heads), but its open-PR read uses `gh pr list --limit 200` with no truncation check. With more than 200 open PRs, a branch an open stacked PR targets can be missed and deleted. GitHub then closes that PR and refuses both a retarget and a reopen (#2578). Found while repairing web-everything/web-everything#5530 (stacked-PR policy slice 4, 6901).
 
 ## Acceptance
 

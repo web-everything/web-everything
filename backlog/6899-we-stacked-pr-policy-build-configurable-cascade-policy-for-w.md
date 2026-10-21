@@ -1,4 +1,5 @@
 ---
+bornAs: xejcrh1
 kind: epic
 parent: "3383"
 status: open
@@ -9,7 +10,7 @@ tags: []
 
 # we: stacked PR policy build - configurable cascade policy for when PRs may stack
 
-Build the ruling of decision xv85eqi (we:docs/agent/platform-decisions.md#stacked-pr-policy-configurable): a configurable cascade stacking policy (matrix, safety floor, urgent classes, size, risk classes, depth, base-move and base-closed handling), a free-scope --stack-on flag, drain ordered landing with restack and delta re-review, and base-closed handling. Four slices, in order.
+Build the ruling of decision 6903 (we:docs/agent/platform-decisions.md#stacked-pr-policy-configurable): a configurable cascade stacking policy (matrix, safety floor, urgent classes, size, risk classes, depth, base-move and base-closed handling), a free-scope --stack-on flag, drain ordered landing with restack and delta re-review, and base-closed handling. Four slices, in order.
 
 ## Acceptance
 

@@ -1,9 +1,10 @@
 ---
+bornAs: x44bz7l
 kind: story
 size: 5
-parent: "xejcrh1"
+parent: "6899"
 status: open
-blockedBy: ["xcq5jb9", "xkmrswh"]
+blockedBy: ["6896", "6900"]
 scope: ["we:scripts/lib/pr-merge-gate.mjs", "we:scripts/conveyor/pr-stack.mjs", "we:scripts/merge-ai-prs.mjs"]
 dateOpened: "2026-10-17"
 tags: []
@@ -11,7 +12,7 @@ tags: []
 
 # we: stacked PR policy slice 4 - closed or rejected base handling
 
-When a stacked child's base PR is closed or rejected, rebase a low-risk child onto main only on a clean rebase with an unchanged delta fingerprint (a setting); every other child goes to the operator as needs-you. Ruled in xv85eqi.
+When a stacked child's base PR is closed or rejected, rebase a low-risk child onto main only on a clean rebase with an unchanged delta fingerprint (a setting); every other child goes to the operator as needs-you. Ruled in 6903.
 
 A Git rebase moves only the child's commits. The drain holds a child on its base through two other things, and the recovery must clear both, or the rebased child never lands:
 - **The PR's base branch.** The child PR still targets the closed base's `lane/*` branch. `classifyPr` skips any PR whose `baseRefName` is not the repo's default branch (`base is not main (lane/…)`). GitHub retargets a child only when its base merges (through `retargetStackedPrs`, which runs before the base lands); a base closed without merging never reaches that call. So the recovery retargets the child PR to its own repo's resolved default branch, with the existing `buildRetargetArgs` argv. It never uses a literal `main`, and a default branch that cannot be resolved sends the child to the operator (existing callers fall back to `'main'`; this handler does not).
