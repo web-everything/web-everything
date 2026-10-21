@@ -23,10 +23,12 @@ describe('send-back recovery when a head observation append was missed', () => {
       // Such an event is a send-back witness, not an authoritative lifecycle observation for the planner.
       expect(observedLedgerHead(events)).toBe(old);
     });
-    it(`ignores a delayed ${type} for a known superseded head`, () => {
+    it(`a ${type} for a superseded head binds the send-back to it as well, never instead of the witness`, () => {
       const events = [verdict('accepted', old), verdict('head-moved', head, { fromHead: old }),
         event(type, { headSha: old, ...extra }), event('send-back', { cause: 'changes' })];
       expect(held(events, head)).toBe(true);
+      // It cannot be told from a fresh review after a force-push back to that head, so it holds there too.
+      expect(held(events, old)).toBe(true);
       expect(held(events, next)).toBe(false);
     });
   }

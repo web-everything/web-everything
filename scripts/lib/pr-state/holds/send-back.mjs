@@ -2,10 +2,12 @@ import { EVENT_TYPES, sendBackCandidateHeads } from '../../verdict-ledger.mjs';
 import { sameHead, isSha } from '../referrals.mjs';
 
 /**
- * A send-back holds the PR until the head SHA differs from every head that may have been sent back: the latest
- * applied witness before the send-back, and each head a review or other non-transition row named before it. A fresh
- * row for a superseded head (a force-push back whose observation append missed) cannot be told from a delayed one,
- * so both bind it. A commit timestamp never releases it (the pusher sets it); a send-back with no recorded head
+ * A send-back holds the PR until the head SHA differs from every head that may have been sent back: the head its
+ * writer recorded on the row, the latest applied witness before the send-back, and each head a review or other
+ * non-transition row named before it. A fresh row for a superseded head (a force-push back whose observation append
+ * missed) cannot be told from a delayed one, so both bind it, and a revert to any earlier reviewed head stays held
+ * until a new head is pushed. The recorded head binds even when the observation of that head arrives only after
+ * the send-back. A commit timestamp never releases it (the pusher sets it); a send-back with no recorded head
  * (a later event on the current head proves nothing), or a PR whose current head is unknown, stays held.
  */
 export default {
@@ -16,7 +18,7 @@ export default {
     const at = events.map(e => e.type).lastIndexOf(EVENT_TYPES.SEND_BACK);
     if (at < 0) return null;
     const sb = events[at];
-    const sentHeads = sendBackCandidateHeads(events.slice(0, at));
+    const sentHeads = sendBackCandidateHeads(events.slice(0, at + 1));
     const head = facts?.head?.sha ?? null;
     // only real SHAs can differ; a garbage or short head is an unknown head
     if (sentHeads.length && isSha(head) && !sentHeads.some(sent => sameHead(head, sent))) return null;

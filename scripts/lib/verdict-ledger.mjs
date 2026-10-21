@@ -625,6 +625,8 @@ const EVENT_PAYLOAD = Object.freeze({
   ],
   [EVENT_TYPES.SEND_BACK]: [
     ['cause', oneOf(SEND_BACK_CAUSES), (v) => v],
+    // Optional for legacy rows: the head the writer sent back, so a missed or late observation of it cannot release it.
+    ['headSha', (v) => v == null || shaOrNull(v) !== null, (v) => (v == null ? undefined : shaOrNull(v))],
   ],
   [EVENT_TYPES.AUTHOR]: [
     ['author', isStr, (v) => oneLine(v, 200)],
@@ -778,14 +780,15 @@ export function ledgerEventId(row) {
 }
 
 /** Every head a send-back appended after `events` may have rejected: the latest lifecycle head, plus each head a
- * review, referral, exemption or other non-transition row named. A fresh row naming a superseded head (a force-push
- * back to it whose observation append missed) reads exactly like a delayed one, so the send-back holds at all of
- * them, fail closed. A transition records a push, never a review, so its heads are not candidates. */
+ * review, referral, exemption, earlier send-back or other non-transition row named. A fresh row naming a superseded
+ * head (a force-push back to it whose observation append missed) reads exactly like a delayed one, so the send-back
+ * holds at all of them, fail closed: a revert to any earlier reviewed head stays held until a new head is pushed.
+ * A transition records a push, never a review, so its heads are not candidates. */
 export function sendBackCandidateHeads(events) {
   const pr = events.at(-1)?.pr;
   const heads = [observedLedgerHead(events)];
   for (const e of events) {
-    if (e.pr !== pr || e.type === EVENT_TYPES.SEND_BACK) continue;
+    if (e.pr !== pr) continue;
     const verdict = e.type === undefined || e.type === EVENT_TYPES.VERDICT;
     if (verdict && ['head-moved', 'carried'].includes(e.verdict)) continue;
     heads.push(verdict ? e.coverage?.headSha : e.headSha);

@@ -20,10 +20,12 @@ describe('send-back binds to the applied head before its append', () => {
     ['delayed transition', verdict('head-moved', next, { fromHead: old })],
     ['headless park', verdict('human', null)],
   ];
-  for (const [name, delayed] of delayedRows) it(`ignores a ${name} when binding a new send-back`, () => {
+  for (const [name, delayed] of delayedRows) it(`a ${name} never moves the binding of a new send-back off B`, () => {
     const events = [verdict('accepted', old), verdict('head-moved', head, { fromHead: old }), delayed, sentBack()];
-    // The delayed row must not make a send-back of B bind to A (or C) and release immediately.
+    // The delayed row must not make a send-back of B bind to A (or C) instead of B and release immediately.
     expect(codes(events, head)).toContain('send-back');
+    // A was reviewed before the send-back, and a row naming it may be a fresh review after a force-push back, so A is held too.
+    expect(codes(events, old)).toContain('send-back');
     const moved = [...events, verdict('head-moved', next, { fromHead: head })];
     expect(codes(moved, next)).not.toContain('send-back');
     expect(derivePrState([...moved, verdict('accepted', next)], {
@@ -55,11 +57,41 @@ describe('send-back after a force-push back to a superseded head whose observati
     expect(codes(events, old)).toContain('send-back');
     expect(codes(events, next)).toContain('send-back');
   });
+  it('a revert to an earlier reviewed head after a send-back stays held until a new head is pushed', () => {
+    const events = [verdict('accepted', old), verdict('head-moved', head, { fromHead: old }), verdict('changes', head), sentBack(),
+      verdict('head-moved', old, { fromHead: head }), verdict('accepted', old)];
+    expect(codes(events, old)).toContain('send-back');
+    expect(codes([...events, verdict('head-moved', next, { fromHead: old })], next)).not.toContain('send-back');
+  });
   it('a review-run naming the superseded head binds the send-back to it too', () => {
     const events = [verdict('accepted', old), verdict('head-moved', head, { fromHead: old }),
       buildLedgerEvent({ repo, pr, at, source: 'test', type: 'review-run', phase: 'completed', posted: false, headSha: old }), sentBack()];
     expect(codes(events, old)).toContain('send-back');
     expect(codes(events, head)).toContain('send-back');
     expect(codes(events, next)).not.toContain('send-back');
+  });
+});
+
+describe('send-back that records the head its writer sent back', () => {
+  const recorded = sha => buildLedgerEvent({ repo, pr, at, source: 'test', type: 'send-back', cause: 'changes', headSha: sha });
+  const state = (events, sha) => derivePrState(events, {
+    repo, pr, now: at, head: { sha }, state: 'OPEN', requiredChecks: [], sessions: [], handoffs: [], refusals: [],
+  });
+  it('binds to the recorded head when its observation arrives only after the send-back', () => {
+    // B was pushed and sent back before any ledger row named it; the late head-moved and acceptance of B do not release it.
+    const events = [verdict('accepted', old), recorded(head), verdict('head-moved', head, { fromHead: old }), verdict('accepted', head)];
+    const s = state(events, head);
+    expect(s.holds.map(h => h.code)).toContain('send-back');
+    expect(s.clears).toBe(false);
+    expect(codes([...events, verdict('head-moved', next, { fromHead: head })], next)).not.toContain('send-back');
+  });
+  it('binds to the recorded head when the only later row is a fresh acceptance of it', () => {
+    const events = [verdict('accepted', old), recorded(head), verdict('accepted', head)];
+    expect(state(events, head).clears).toBe(false);
+  });
+  it('a recorded head is normalized, a legacy row records none, and a non-SHA head is refused', () => {
+    expect(recorded(` ${head.toUpperCase()} `).headSha).toBe(head);
+    expect(sentBack().headSha).toBeUndefined();
+    expect(() => recorded('not-a-sha')).toThrow(/invalid send-back event/);
   });
 });
