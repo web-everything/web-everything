@@ -37,8 +37,12 @@ import { parseVerdictLog, parseLedgerEvents, ledgerEventId, checkLedgerAppendRow
 import { registerLedgerStore } from './verdict-ledger-store.mjs';
 import { LEDGER_DIR, ledgerGitPath } from './verdict-ledger-path.mjs';
 import { appendDirect, appendViaOutbox, outboxDirFor, resolveOutboxSettings, formatOutboxSettings, OutboxFlushError } from './verdict-ledger-outbox.mjs';
+import {
+  LEGACY_LEDGER_BRANCH, resolveLedgerRefSettings, formatLedgerRefSettings, ledgerReadPlan, ledgerPushRefFor, unionLedgerTexts,
+} from './verdict-ledger-ref.mjs';
 
-export const LEDGER_TRANSPORT_BRANCH = 'ops/review-requests';
+/** The LEGACY ledger ref (and still the default for reads and writes: see `we:scripts/lib/verdict-ledger-ref.mjs`). */
+export const LEDGER_TRANSPORT_BRANCH = LEGACY_LEDGER_BRANCH;
 export { LEDGER_DIR, ledgerGitPath };
 export const DEFAULT_APPEND_ATTEMPTS = 5;
 /** The ONLY ref the ledger push path may write (operator decision 2026-10-08): never main, never a lane, never a force. */
@@ -129,28 +133,86 @@ export class LedgerAppendExhaustedError extends Error {
  * Read one repo's ledger from the git transport.
  * NEVER THROWS. `unreadable` means "we do not know"; callers must hold, never treat it as empty.
  *
- * @returns {{status: 'ok', records: object[], text: string} | {status: 'unreadable', reason: string, error: string}}
+ * WHICH REF: an explicit `branch` reads exactly that ref (unit seams, tools). Otherwise the ledger-ref cascade decides
+ * (`we:scripts/lib/verdict-ledger-ref.mjs`): by default the old ref only, exactly as before; with `dualRead` the UNION
+ * of the ledger-only ref and the old ref, where an absent ref adds nothing and an existing-but-unreadable one makes the
+ * whole read `unreadable`.
+ *
+ * @returns {{status: 'ok', records: object[], text: string, refs?: object[]} | {status: 'unreadable', reason: string, error: string}}
  */
 export function readLedgerFromGit({
-  board, repo, branch = LEDGER_TRANSPORT_BRANCH, run, exec, env = process.env, settings, log = defaultLog,
+  board, repo, branch, run, exec, env = process.env, settings, log = defaultLog,
 } = {}) {
   const path = ledgerGitPath(repo);
-  let files;
+  let repoSettings;
+  try { repoSettings = settings ?? readSettings(); } catch { repoSettings = {}; }
+  let plan = { branches: [branch], union: false };
+  if (branch === undefined) {
+    const refs = resolveLedgerRefSettings({ repo: repoSettings, env });
+    logOnce(formatLedgerRefSettings(refs), log);
+    plan = ledgerReadPlan(refs);
+  }
   try {
     // An injected `run` keeps full control (unit seams). The default sizes the blob read to the blob (see header).
     if (!run) {
-      const cap = resolveLedgerReadSettings({ repo: settings ?? readSettings(), env });
-      const line = formatLedgerReadSettings(cap);
-      if (!loggedCaps.has(line)) { loggedCaps.add(line); log(line); }
+      const cap = resolveLedgerReadSettings({ repo: repoSettings, env });
+      logOnce(formatLedgerReadSettings(cap), log);
       run = sizedLedgerRun({ maxBytes: cap.maxBytes, source: cap.sources.maxBytes, ...(exec ? { exec } : {}) });
     }
-    files = readFromTransportBranch({ board, branch, paths: [path], run });
   } catch (e) {
-    const reason = e?.code === READ_CAP_CODE ? 'ledger-exceeds-read-cap' : 'transport-read-failed';
-    return { status: 'unreadable', reason, error: String(e?.message ?? e) };
+    return { status: 'unreadable', reason: 'transport-read-failed', error: String(e?.message ?? e) };
   }
-  const text = files[path] ?? '';
-  return { status: 'ok', records: parseVerdictLog(text), text };
+  if (!plan.union) {
+    let files;
+    try {
+      files = readFromTransportBranch({ board, branch: plan.branches[0], paths: [path], run });
+    } catch (e) {
+      return { status: 'unreadable', reason: readFailureReason(e), error: String(e?.message ?? e) };
+    }
+    const text = files[path] ?? '';
+    return { status: 'ok', records: parseVerdictLog(text), text };
+  }
+  // DUAL READ. Each ref is probed first: a definitive empty `ls-remote` is ABSENT (skipped); anything else is read,
+  // and a read that fails fails the whole union. Never a partial answer.
+  const got = [];
+  for (const b of plan.branches) {
+    let present;
+    try {
+      present = Boolean(String(run(['ls-remote', '--heads', 'origin', `refs/heads/${b}`], { cwd: board })).trim());
+    } catch (e) {
+      return { status: 'unreadable', reason: 'transport-read-failed', error: `ls-remote ${b}: ${String(e?.message ?? e)}` };
+    }
+    if (!present) {
+      if (plan.required?.includes(b)) {
+        return { status: 'unreadable', reason: 'required-ledger-ref-absent', error: `${b} is the ledger write ref (cutover on) but does not exist on origin` };
+      }
+      got.push({ branch: b, status: 'absent' });
+      continue;
+    }
+    try {
+      const files = readFromTransportBranch({ board, branch: b, paths: [path], run });
+      got.push({ branch: b, status: 'read', text: files[path] ?? '' });
+    } catch (e) {
+      return { status: 'unreadable', reason: readFailureReason(e), error: `${b}: ${String(e?.message ?? e)}` };
+    }
+  }
+  const read = got.filter((g) => g.status === 'read');
+  if (!read.length) {
+    return { status: 'unreadable', reason: 'no-ledger-ref', error: `none of ${plan.branches.join(', ')} exists on origin` };
+  }
+  const [newRef, oldRef] = got; // plan order: [ledger-only ref, old ref]
+  const merged = unionLedgerTexts(oldRef.text ?? '', newRef.text ?? '', { idOf: ledgerEventId });
+  return {
+    status: 'ok', records: parseVerdictLog(merged.text), text: merged.text,
+    refs: got.map(({ branch: b, status }) => ({ branch: b, status })),
+  };
+}
+
+function readFailureReason(e) { return e?.code === READ_CAP_CODE ? 'ledger-exceeds-read-cap' : 'transport-read-failed'; }
+function logOnce(line, log) {
+  if (loggedCaps.has(line)) return;
+  loggedCaps.add(line);
+  try { log(line); } catch { /* a log sink never decides an outcome */ }
 }
 
 /**
@@ -166,7 +228,7 @@ export function appendLedgerRows({
   board,
   repo,
   records,
-  branch = LEDGER_TRANSPORT_BRANCH,
+  branch,
   attempts = DEFAULT_APPEND_ATTEMPTS,
   message = `verdict-ledger: append ${repo}`,
   sleep = defaultSleep,
@@ -174,7 +236,18 @@ export function appendLedgerRows({
   ...seams // run / mkdir / write / read / rm / now, passed through to the transport
 } = {}) {
   if (!Array.isArray(records) || !records.length) throw new TypeError('verdict-ledger-io: `records` must be a non-empty array');
-  assertPushRef(branch, LEDGER_PUSH_REF); // before any record is serialized or any git call: a wrong ref writes nothing
+  // WHICH REF: an explicit `branch` wins; otherwise the ledger-ref cascade (cutover off = the old ref, as before).
+  // Either way it must be an allow-listed ledger ref, checked before any record is serialized or any git call.
+  const { settings: refSettingsLayer, env: refEnv = process.env, log: refLog } = seams;
+  if (branch === undefined) {
+    let repoLayer;
+    try { repoLayer = refSettingsLayer ?? readSettings(); } catch { repoLayer = {}; }
+    const refs = resolveLedgerRefSettings({ repo: repoLayer, env: refEnv });
+    logOnce(formatLedgerRefSettings(refs), refLog ?? defaultLog);
+    branch = refs.writeBranch;
+  }
+  const pushRef = ledgerPushRefFor(branch);
+  assertPushRef(branch, pushRef); // a wrong ref writes nothing
   const check = checkLedgerAppendRows(records, repo);
   if (!check.ok) throw new TypeError(`verdict-ledger-io: ${check.error}`);
   const { lines, ids } = check;
@@ -193,7 +266,7 @@ export function appendLedgerRows({
     try {
       const dir = outboxDir ?? outboxDirFor({ board, env, ...(gitRun ? { run: gitRun } : {}) });
       return appendViaOutbox({
-        board, branch, dir, repo, path, lines, ids, message, settings: cascade, allowRef: LEDGER_PUSH_REF,
+        board, branch, dir, repo, path, lines, ids, message, settings: cascade, allowRef: pushRef,
         run: gitRun ?? transport.run, now: transport.now, sleep, random, log, onRetry, removeEntry,
       });
     } catch (e) {
@@ -206,7 +279,7 @@ export function appendLedgerRows({
   // call's rows only. Still computed against the tip it races, still never forced, still loud on exhaustion.
   try {
     return appendDirect({
-      board, branch, repo, path, lines, ids, message, attempts, allowRef: LEDGER_PUSH_REF, settings: cascade,
+      board, branch, repo, path, lines, ids, message, attempts, allowRef: pushRef, settings: cascade,
       run: transport.run ?? gitRun, sleep, random, log, onRetry,
     });
   } catch (e) {

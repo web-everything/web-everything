@@ -126,6 +126,12 @@ jobs:
           # this path writes says so.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AFTER: ${{ github.sha }}
+          # THE LEDGER REF (`we:scripts/lib/verdict-ledger-ref.mjs`). The canonical switch is the checked-in repo setting
+          # `verdictLedger.{ref,cutover,dualRead}` on main, which this job already reads; these repo variables are the
+          # CI-side override (and kill switch) of the same cascade. Unset variables arrive empty and change nothing.
+          WE_VERDICT_LEDGER_REF: ${{ vars.VERDICT_LEDGER_REF }}
+          WE_VERDICT_LEDGER_CUTOVER: ${{ vars.VERDICT_LEDGER_CUTOVER }}
+          WE_VERDICT_LEDGER_DUAL_READ: ${{ vars.VERDICT_LEDGER_DUAL_READ }}
         run: |
           set -uo pipefail
           # The git credential for the ledger push, held in THIS step's environment only (the checkout does not

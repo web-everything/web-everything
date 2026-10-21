@@ -30,7 +30,7 @@ import { join } from 'node:path';
 import { daemonRebuildSettingsPath } from './skip-unrelated.mjs';
 
 export const WRONG_BRANCH_HEAL_DEFAULTS = Object.freeze({
-  branches: Object.freeze(['ops/review-requests']),
+  branches: Object.freeze(['ops/review-requests', 'ops/verdict-ledger']), // ops/verdict-ledger: the ledger-only ref (verdict-ledger-ref.mjs)
   pathPrefixes: Object.freeze(['verdict-ledger/']),
 });
 

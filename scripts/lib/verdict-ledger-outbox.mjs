@@ -54,6 +54,7 @@ import { retryTransientGit } from './git-fetch-retry.mjs';
 import { assertPushRef, trackingRefspec, withGitError, worktreeGitEnv } from './git-transport-branch.mjs';
 import { parseLedgerEvents, ledgerEventId } from './verdict-ledger.mjs';
 import { ledgerGitPath } from './verdict-ledger-path.mjs';
+import { LEGACY_LEDGER_BRANCH, resolveLedgerRefSettings, ledgerPushRefFor } from './verdict-ledger-ref.mjs';
 import { workspaceFor } from './lane-pool-paths.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { readSettings } from './settings-files.mjs';
@@ -666,7 +667,7 @@ function common(o) {
  * @returns {{ok: boolean, held?: boolean, flushed: number, pushed: boolean, attempts: number, error?: string}}
  */
 export function flushLedgerOutbox(o = {}) {
-  const c = common({ branch: 'ops/review-requests', ...o });
+  const c = common({ branch: LEGACY_LEDGER_BRANCH, ...o });
   let flushed = 0;
   let pushed = false;
   let attempts = 0;
@@ -714,10 +715,15 @@ export function flushBoardLedgerOutbox({ board, env = process.env, log: rawLog =
   if (!board) return { ok: true, flushed: 0, pushed: false, attempts: 0, skipped: 'no-board' };
   let dir = null;
   try {
-    const settings = resolveOutboxSettings({ repo: readSettings(), env });
+    const repoLayer = readSettings();
+    const settings = resolveOutboxSettings({ repo: repoLayer, env });
+    // The flusher pushes to the CURRENT write ref (`we:scripts/lib/verdict-ledger-ref.mjs`), whatever ref was current
+    // when an entry was queued: the current readers always read the current write ref, so that is where a queued row
+    // is guaranteed to be seen (during a cutover the readers union both refs anyway).
+    const branch = resolveLedgerRefSettings({ repo: repoLayer, env }).writeBranch;
     dir = outboxDirFor({ board, env, ...(run ? { run } : {}) });
     if (!listOutboxEntries(dir).length) return { ok: true, flushed: 0, pushed: false, attempts: 0, dir };
-    return { ...flushLedgerOutbox({ board, dir, settings, log, run, allowRef: 'refs/heads/ops/review-requests' }), dir };
+    return { ...flushLedgerOutbox({ board, dir, settings, log, run, branch, allowRef: ledgerPushRefFor(branch) }), dir };
   } catch (e) {
     const msg = `ledger-write-miss: verdict-ledger outbox backstop for ${board} failed: ${String(e?.message ?? e).split('\n')[0]}`;
     log(msg);
