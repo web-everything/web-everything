@@ -55,6 +55,7 @@ import { assertPushRef, trackingRefspec, withGitError, worktreeGitEnv } from './
 import { parseLedgerEvents, ledgerEventId } from './verdict-ledger.mjs';
 import { ledgerGitPath } from './verdict-ledger-path.mjs';
 import { workspaceFor } from './lane-pool-paths.mjs';
+import { isUnderTest } from './under-test.mjs';
 import { readSettings } from './settings-files.mjs';
 import { reserve, readLockEntry, releaseLockDirIf, heartbeatOwn } from '../readiness/file-locks.mjs';
 
@@ -731,7 +732,10 @@ export function flushBoardLedgerOutbox({ board, env = process.env, log: rawLog =
  */
 export const DEFAULT_BACKSTOP_INTERVAL_MS = 5 * 60_000;
 let lastBackstopAt = -Infinity;
-export function spawnLedgerOutboxBackstop({ repos = [], intervalMs = DEFAULT_BACKSTOP_INTERVAL_MS, now = Date.now, spawnFn = spawn, log = defaultLog, env = process.env } = {}) {
+export function spawnLedgerOutboxBackstop({ repos = [], intervalMs = DEFAULT_BACKSTOP_INTERVAL_MS, now = Date.now, spawnFn, log = defaultLog, env = process.env } = {}) {
+  // Never a REAL detached process from a test run (a daemon-tick test would otherwise spawn one per tick).
+  if (!spawnFn && isUnderTest(env)) return { ok: true, flushed: 0, skipped: 'under-test' };
+  spawnFn = spawnFn ?? spawn;
   const t = now();
   if (t - lastBackstopAt < intervalMs) return { ok: true, flushed: 0, skipped: 'throttled' };
   lastBackstopAt = t;
