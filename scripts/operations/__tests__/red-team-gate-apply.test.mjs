@@ -12,7 +12,8 @@ import { redTeamEnqueueHold } from '../../lib/drain-queue-safety.mjs';
 import { planRedTeamStatusLabels, syncRedTeamStatusLabels } from '../../lib/red-team-status-labels.mjs';
 import { buildReviewedShaMarker, buildClearedHumanMarker } from '../../lib/review-escalation.mjs';
 import { buildVerdictCarriedMarker } from '../../lib/review-verdict-carried-marker.mjs';
-import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
+import { buildRoundExtensionComment, countGrantedRoundExtensions } from '../../conveyor/round-extension-mark.mjs';
+import { createGhProvider, GH_ARGV } from '../../lib/review-label-provider.mjs';
 import { redTeamRulingHeld, runReviewLabelCli } from '../../review-set-label.mjs';
 import { readReviewRound, readReviewRoundAsOf } from '../review-pr-io.mjs';
 
@@ -501,6 +502,47 @@ describe('applyRedTeamGate', () => {
         expect(asked[0]).toMatchObject({ repo: REPO, pr: { number: 4722, headRefOid: HEAD, comments } });
         expect(held(() => null)).toBe(true);
         expect(held(() => { throw new Error('gh down'); })).toBe(true);
+      });
+
+      // Operator send-back on PR #5758: the drain reads raw REST comments (numeric `id`, `node_id`, `user`,
+      // `created_at`) and the label provider its own projection; a verified grant credited 0 in both, so a card-only
+      // PR stayed at its cap. Every production shape credits it; every trust check stays as strict.
+      const graphql = (c) => c;
+      const rest = (c, i) => ({ id: 3400000000 + i, node_id: c.id ?? `IC_rest_${i}`, user: c.author, created_at: c.createdAt,
+        updated_at: c.createdAt, body: c.body, html_url: `https://github.com/${REPO}/pull/4722#issuecomment-${3400000000 + i}` });
+      const labelProvider = (c, i) => ({ id: c.id ?? `IC_lp_${i}`, author: c.author, body: c.body, createdAt: c.createdAt });
+      it.each([['GraphQL', graphql], ['raw REST', rest], ['label-provider', labelProvider]])(
+        'one valid unedited grant credits +1 in the %s shape, and the send-back resolver no longer returns round-cap', (_, shape) => {
+          const comments = [comment([F()]), capRecord(), autoGrant].map(shape);
+          expect(countGrantedRoundExtensions(comments, { repo: REPO, pr: 4722, standingRuling: scope })).toBe(1);
+          expect(gateRoundGrants(comments, 4722, REPO, scope)).toEqual([expect.objectContaining({ by: 1, standingRuling: RULING_ID, at: autoGrant.createdAt })]);
+          const read = standingRuling => readRedTeamDisposition({ comments, pr: 4722, head: HEAD, repo: REPO, setting: CONFIRMED_BREAKS_DEFAULTS, env: {}, standingRuling });
+          expect(read(scope).outcome).toBe('sent-back');
+          expect(read(null).outcome).toBe('round-cap');
+        });
+      it('no trust check is loosened in the REST shape', () => {
+        const thread = (grant) => [comment([F()]), capRecord(), grant].map(rest);
+        const credited = (comments) => countGrantedRoundExtensions(comments, { repo: REPO, pr: 4722, standingRuling: scope });
+        const restGrant = rest(autoGrant, 2);
+        expect(credited([restGrant])).toBe(1);
+        // A numeric id alone never matches the unedited node ids; an edited comment (id not in the list) never counts.
+        expect(credited([{ ...restGrant, node_id: undefined }])).toBe(0);
+        expect(credited([{ ...restGrant, node_id: 'IC_edited' }])).toBe(0);
+        // No GitHub creation time, a forged author, another ruling, or a non-card-only head: never credited.
+        expect(credited([{ ...restGrant, created_at: undefined }])).toBe(0);
+        expect(credited([{ ...restGrant, created_at: 'not a date' }])).toBe(0);
+        expect(credited([{ ...restGrant, user: { login: 'mallory' } }])).toBe(0);
+        expect(countGrantedRoundExtensions([restGrant], { repo: REPO, pr: 4722, standingRuling: { ...scope, id: `${REPO}#6001` } })).toBe(0);
+        expect(countGrantedRoundExtensions([restGrant], { repo: REPO, pr: 4722, standingRuling: { ...scope, cardOnlyHeads: { [HEAD]: false } } })).toBe(0);
+        // Per episode and the per-PR cap hold across shapes too.
+        expect(credited([restGrant, rest(autoGrant, 3)])).toBe(1);
+        expect(readRedTeamDisposition({ comments: thread(restGrant), pr: 4722, head: HEAD, repo: REPO, setting: CONFIRMED_BREAKS_DEFAULTS, env: {}, standingRuling: scope }).outcome).toBe('sent-back');
+      });
+      it('the label provider keeps the comment id (the node id the unedited read returns)', () => {
+        expect(GH_ARGV.readComments(REPO, 4722).join(' ')).toMatch(/\{id: \.node_id, author: \{login: \.user\.login\}, body, createdAt: \.created_at\}/);
+        const line = JSON.stringify(labelProvider(autoGrant, 2));
+        const comments = [comment([F()]), capRecord(), ...createGhProvider({ exec: () => `${line}\n` }).readComments(REPO, 4722)];
+        expect(countGrantedRoundExtensions(comments, { repo: REPO, pr: 4722, standingRuling: scope })).toBe(1);
       });
 
       it('without a verified scope the same grant reopens nothing (fail closed)', async () => {

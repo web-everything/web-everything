@@ -24,7 +24,7 @@ import { REVIEW_SETTINGS_FILE } from '../lib/review-seat-settings.mjs';
 import { platformPreference } from '../lib/policy-cascade.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import {
-  buildRoundExtensionComment, countGrantedRoundExtensions, countStandingRulingGrantRecords, MAX_TOTAL_ROUND_EXTENSIONS,
+  buildRoundExtensionComment, commentCreatedAt, countGrantedRoundExtensions, countStandingRulingGrantRecords, MAX_TOTAL_ROUND_EXTENSIONS,
   ROUND_EXTENSION_MARKER, roundExtensionGrants, standingRulingGrantEpisodes,
 } from './round-extension-mark.mjs';
 import { isAutomationAuthored, isOperatorAuthored } from '../lib/marker-authorship.mjs';
@@ -262,7 +262,7 @@ export function stuckAfterGrant({ repo, pr }, { scopeOf = standingRulingScope, n
       const r = JSON.parse(m[0][1]);
       return !!r?.standingRuling && (CONSTELLATION_REPOS[r.repo]?.slug ?? r.repo) === slug && r.pr === Number(pr.number) && r.head === head;
     } catch { return false; }
-  }).map((c) => Date.parse(c?.createdAt)).filter(Number.isFinite), Infinity);
+  }).map((c) => Date.parse(commentCreatedAt(c))).filter(Number.isFinite), Infinity);
   if (!Number.isFinite(postedAt) || now() - postedAt < minAgeMs) return null;
   const minutes = Math.round((now() - postedAt) / 60_000);
   return `auto-grant did not free a round: still at the round limit ${minutes} min after it${mine.length ? '' : ' (grant not credited)'} — a person must check`;

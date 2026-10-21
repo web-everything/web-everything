@@ -42,6 +42,15 @@ export function buildRoundExtensionComment({ repo, pr, by, actor, channel, reaso
 }
 
 /**
+ * The comment fields the grant trust checks read, from either production shape (PR #5758 operator send-back): GraphQL
+ * and `gh pr view` / the label provider (`id` = node id, `createdAt`), or raw REST as the drain reads it (`id`
+ * numeric, `node_id`, `created_at`). The node id is what GitHub's edit-history read returns, so a numeric id alone
+ * never matches it. Only the field NAMES are reconciled; every check on the values is unchanged. PURE.
+ */
+export function commentNodeId(c) { return typeof c?.node_id === 'string' ? c.node_id : c?.id; }
+export function commentCreatedAt(c) { return c?.createdAt ?? c?.created_at; }
+
+/**
  * PURE: does an automation-posted record sit inside the verified standing ruling's bounds?
  * @param {object} r - the parsed grant record
  * @param {{id:string, author:string, by:number, maxPerPr:number, repos:string[], cardOnlyHeads:Record<string,boolean>,
@@ -84,18 +93,19 @@ export function roundExtensionGrants(comments, { repo, pr, standingRuling = null
         || typeof r.reason !== 'string' || !r.reason.trim()
         || typeof r.channel !== 'string' || !r.channel.trim() || /[\r\n\u{2028}\u{2029}]/u.test(r.channel)
         || typeof r.at !== 'string' || !r.at.trim()) return [];
+      const createdAt = commentCreatedAt(comment);
       if (automation) {
-        if (!withinStandingRuling(r, { repo, slug }, standingRuling, autoSoFar, comment.id)) return [];
+        if (!withinStandingRuling(r, { repo, slug }, standingRuling, autoSoFar, commentNodeId(comment))) return [];
         // The anchor time of an automatic grant is GitHub's own record of when the comment was posted, never the
-        // body's `at` (which the automation writes): a missing or invalid `createdAt` is not trusted.
-        if (typeof comment.createdAt !== 'string' || !Number.isFinite(Date.parse(comment.createdAt))) return [];
+        // body's `at` (which the automation writes): a missing or invalid creation time is not trusted.
+        if (typeof createdAt !== 'string' || !Number.isFinite(Date.parse(createdAt))) return [];
         if (autoEpisodes.has(r.episode)) return [];
         autoEpisodes.add(r.episode);
         autoSoFar += 1;
       }
       const by = Math.min(r.by, remaining);
       remaining -= by;
-      return by > 0 ? [{ index, by, at: automation ? comment.createdAt : r.at, ...(automation ? { standingRuling: r.standingRuling, head: r.head } : {}) }] : [];
+      return by > 0 ? [{ index, by, at: automation ? createdAt : r.at, ...(automation ? { standingRuling: r.standingRuling, head: r.head } : {}) }] : [];
     } catch { return []; }
   });
 }

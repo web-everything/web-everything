@@ -29,7 +29,7 @@ import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 
 import { parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
 import { parseLatestHumanClearedSha, REVIEWED_SHA_MARKER } from './review-escalation.mjs';
-import { roundExtensionGrants } from '../conveyor/round-extension-mark.mjs';
+import { commentCreatedAt, roundExtensionGrants } from '../conveyor/round-extension-mark.mjs';
 
 // ── The comment the producer writes ─────────────────────────────────────────────────────────────────────────────
 
@@ -101,7 +101,7 @@ export function redTeamForHead(comments, pr, head) {
   const hits = (Array.isArray(comments) ? comments : [])
     .map((c, i) => ({ c, i, parsed: isTrustedMarkerAuthor(c) ? parseRedTeamComment(typeof c === 'string' ? c : c?.body) : null }))
     .filter((x) => x.parsed && x.parsed.pr === Number(pr) && x.parsed.rev === live)
-    .sort((a, b) => (Date.parse(a.c?.createdAt) || 0) - (Date.parse(b.c?.createdAt) || 0) || a.i - b.i);
+    .sort((a, b) => (Date.parse(commentCreatedAt(a.c)) || 0) - (Date.parse(commentCreatedAt(b.c)) || 0) || a.i - b.i);
   return hits.at(-1)?.parsed ?? null;
 }
 
@@ -392,7 +392,7 @@ const threadOrder = (a, b) => a.ts - b.ts || a.i - b.i;
 const indexedRecords = comments => {
   let ts = 0;
   return threadRecords(comments).map((r, i) => {
-    const t = Date.parse(r.c?.createdAt);
+    const t = Date.parse(commentCreatedAt(r.c)); // GraphQL `createdAt` or raw REST `created_at` (the drain's read)
     if (Number.isFinite(t)) ts = t;
     return { ...r, i, ts };
   });
@@ -566,5 +566,5 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     if (action === 'held' && !ruled) held.push(f);
     if (action === 'send-back') sendBack.push(f);
   }
-  return { result, sendBack, held, since: capRecord?.createdAt ?? null, outcome };
+  return { result, sendBack, held, since: commentCreatedAt(capRecord) ?? null, outcome };
 }
