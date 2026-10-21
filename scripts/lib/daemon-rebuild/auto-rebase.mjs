@@ -55,9 +55,12 @@ export async function mergedPrOldHeads({
   const isAnc = (a, b) => git(['merge-base', '--is-ancestor', a, b]).status === 0;
   // Another overlay's work inside X (a registered tip, or a head this clone adopted for a DIFFERENT PR, sharing
   // history with X beyond main) is not this PR's content: a merge with X as base could drop it, so X is refused.
-  // ANY other PR's head that shares history with X beyond main blocks — even one built ON X (Codex round 6: a stack whose
-  // base H sits inside X and whose branch later advanced past X). Only heads of X's own PR and of the overlay being
-  // rebased are exempt. Conservative by design: a wrong block only sets the overlay aside, loudly.
+  // Who may share history with X beyond main:
+  //   - heads of X's own PR: that history IS the PR;
+  //   - heads of the overlay being rebased only when built ON X (X + its own work after X); one of its heads INSIDE or
+  //     beside X (its own earlier work H with X built on H — Codex round 7) blocks;
+  //   - any other head blocks, even one built on X (Codex round 6: a stack whose base sits inside X).
+  // Conservative by design: a wrong block only sets the overlay aside, loudly.
   // FAIL CLOSED: a head git cannot answer for (object gone, e.g. collected after a force-push) counts as foreign — the
   // overlay is then set aside, never rebased over work that can no longer be ruled out.
   const ancStrict = (a, b) => {
@@ -66,8 +69,13 @@ export async function mergedPrOldHeads({
   };
   const foreign = (sha, pr) => otherHeads.some((h) => {
     if (h?.unresolved || (h && !h.sha)) return true; // a head we could not even resolve: fail closed
-    if (!h || Number(h.pr) === pr || (ovPr != null && Number(h.pr) === Number(ovPr)) || h.sha === sha) return false;
+    if (!h || Number(h.pr) === pr || h.sha === sha) return false;
     if (!FULL_SHA_RE.test(h.sha) || git(['cat-file', '-e', `${h.sha}^{commit}`]).status !== 0) return true;
+    if (ovPr != null && Number(h.pr) === Number(ovPr)) {
+      const built = ancStrict(sha, h.sha);
+      if (built === null) return true;
+      if (built) return false;
+    }
     const mb = git(['merge-base', '--all', sha, h.sha]);
     if (mb.status === 1 && !String(mb.stdout ?? '').trim()) return false; // unrelated histories: nothing shared
     if (mb.status !== 0) return true;

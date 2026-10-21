@@ -344,4 +344,42 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     expect(plan.alerts.find((a) => a.kind === 'overlay-auto-rebased')?.detail.ref).not.toBe('lane/container');
     expect(plan.decisions.find((d) => d.ref === 'lane/container')).toMatchObject({ action: 'drop', reason: 'conflict' });
   });
+
+  it('the rebased overlay\'s OWN earlier head inside X blocks it: its earlier feature would be erased (Codex round 7)', async () => {
+    const f = fixture({ mode: 'on' });
+    const hq = f.push('lane/container', f.init, { 'feature.txt': 'container feature\n' }); // Q adopted here first
+    const x1 = f.push('lane/standing-ruling', hq, { [GATE]: lines({ 2: 'grant v1' }) }); // the PR was built ON Q's head
+    f.push('lane/container', x1, { [GATE]: lines({ 2: 'grant v1', 10: 'own' }) }); // Q advances on X
+    const x2 = f.push('lane/standing-ruling', f.init, { [GATE]: lines({ 2: 'grant v2' }) });
+    f.mergePr(PR, x2, 'lane/standing-ruling');
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const plan = await planRebuild({
+      git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref: 'lane/container', pr: 5801 }],
+      adoptedHeads: [{ pr: 5801, sha: hq }],
+      prState: async (pr) => (pr === PR ? 'MERGED' : 'OPEN'), prForcePushes: async (pr) => (pr === PR ? [{ before: x1 }] : []),
+      autoRebase: { mode: 'on', source: 'test' },
+    });
+    expect(plan.decisions[0]).toMatchObject({ action: 'drop', reason: 'conflict' });
+    expect(plan.alerts.map((a) => a.kind)).toContain('overlay-set-aside');
+  });
+
+  it('a registered stack BASE the adopted build carried is remembered, so it still blocks after its branch is rewritten (Codex round 7)', async () => {
+    const f = fixture({ mode: 'on' });
+    const h = f.push('lane/foreign', f.init, { 'foreign.txt': 'foreign behaviour\n' });
+    const x1 = f.push('lane/standing-ruling', h, { [GATE]: lines({ 2: 'grant v1' }) });
+    addOverlay(f.clone, { ref: 'lane/foreign', pr: 5790 }, { env: f.env });
+    addOverlay(f.clone, { ref: 'lane/standing-ruling', pr: PR }, { env: f.env });
+    expect(await f.tick()).toMatchObject({ adopted: true }); // the foreign base is stack-contained: not in `applied`
+    await f.tick(); // the next tick remembers every registered tip the adopted build carries
+    expect(readRebuildState(f.clone, f.env).adoptedHeads).toEqual(expect.arrayContaining([expect.objectContaining({ pr: 5790, sha: h })]));
+    f.push('lane/foreign', f.init, { 'foreign.txt': 'rewritten\n' }); // the foreign branch is rewritten away from h
+    f.push('lane/container', x1, { [GATE]: lines({ 2: 'grant v1', 10: 'own' }) });
+    addOverlay(f.clone, { ref: 'lane/container', pr: 5801 }, { env: f.env });
+    const x2 = f.push('lane/standing-ruling', f.init, { [GATE]: lines({ 2: 'grant v2' }) });
+    f.mergePr(PR, x2, 'lane/standing-ruling');
+    f.merged.add(PR);
+    const r = await f.tick();
+    expect(r.alerts.map((a) => a.kind)).not.toContain('overlay-auto-rebased');
+    expect(r.alerts.map((a) => a.kind)).not.toContain('established-overlay-hold');
+  });
 });

@@ -264,9 +264,18 @@ export async function prepareRebuild({
   const adoptedHeads = (() => {
     const prev = Array.isArray(state.adoptedHeads) ? state.adoptedHeads : [];
     const add = (state.adopted?.applied ?? []).flatMap((a) => [
-      ...(a?.pr != null && typeof a.sha === 'string' ? [{ pr: Number(a.pr), sha: a.sha }] : []),
+      // a PR-less overlay is remembered as pr 0: never anyone's "own PR", so it always counts as foreign
+      ...(typeof a?.sha === 'string' ? [{ pr: a.pr != null ? Number(a.pr) : 0, sha: a.sha }] : []),
       ...(a?.mergedPr != null && typeof a.rebaseBase === 'string' ? [{ pr: Number(a.mergedPr), sha: a.rebaseBase }] : []),
     ]);
+    // …and every REGISTERED overlay whose tip the running adopted build carries — stack bases included, which never
+    // appear in `applied` (Codex round 7): their work inside a merged PR's old head must stay visible as foreign.
+    if (state.adopted?.head && state.adopted.head === prevHead) {
+      for (const o of overlaysBefore || []) {
+        const tip = o?.ref ? verifyRev(git, `refs/remotes/origin/${o.ref}^{commit}`) : null;
+        if (tip && git(['merge-base', '--is-ancestor', tip, prevHead]).status === 0) add.push({ pr: o.pr != null ? Number(o.pr) : 0, sha: tip });
+      }
+    }
     const seen = new Set();
     const next = [...add, ...prev].filter((h) => Number.isInteger(h.pr) && /^[0-9a-f]{40}$/.test(h.sha)
       && !seen.has(`${h.pr}:${h.sha}`) && seen.add(`${h.pr}:${h.sha}`)
