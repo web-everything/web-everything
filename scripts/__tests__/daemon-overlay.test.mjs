@@ -78,6 +78,13 @@ function makeFixture() {
   return { originDir, cloneDir, overlayDir, env };
 }
 
+/** `env` whose `gh` answers `gh api user` as `login` (the credential the --allow-conflict gate reads). */
+function asGhLogin(env, login) {
+  const bin = mkdtempSync(join(tmpdir(), 'we-overlay-cli-gh-'));
+  writeFileSync(join(bin, 'gh'), `#!/bin/sh\nif [ "$1" = api ] && [ "$2" = user ]; then echo ${JSON.stringify(login)}; exit 0; fi\necho "gh stub" >&2\nexit 1\n`, { mode: 0o755 });
+  return { ...env, PATH: `${bin}:${env.PATH ?? ''}`, GH_TOKEN: 'stub', WE_OPERATOR_LOGINS: 'chalbert' };
+}
+
 function runCli(args, env) {
   return spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', env });
 }
@@ -193,8 +200,8 @@ describe('daemon-overlay.mjs add — the overlay-conflict guard', () => {
 
     const r = runCli([
       'add', `--clone=${cloneDir}`, '--ref=lane/promote-stale-green', '--pr=2826',
-      '--allow-conflict', '--reason=operator-approved override', '--operator-instruction=yes register 2826 despite the conflict', '--actor=operator',
-    ], env);
+      '--allow-conflict', '--reason=operator-approved override', '--operator-instruction=yes register 2826 despite the conflict',
+    ], asGhLogin(env, 'chalbert'));
     expect(r.status).toBe(0);
     expect(r.stderr).toMatch(/registering DESPITE a known conflict/);
     expect(r.stderr).toMatch(/shared\.mjs/);
@@ -203,16 +210,17 @@ describe('daemon-overlay.mjs add — the overlay-conflict guard', () => {
     expect(state.overlays.map((o) => o.ref).sort()).toEqual(['lane/fix-procedure', 'lane/promote-stale-green']);
     // the operator's own words are stored on the registration
     expect(state.overlays.find((o) => o.ref === 'lane/promote-stale-green').conflictOverride).toMatchObject({
-      instruction: 'yes register 2826 despite the conflict', actor: 'operator', files: ['shared.mjs'],
+      instruction: 'yes register 2826 despite the conflict', actor: 'chalbert', files: ['shared.mjs'],
     });
   });
 
   it.each([
-    ['no operator instruction', []],
-    ['an instruction but no --actor=operator', ['--operator-instruction=yes register 2826 despite the conflict']],
-    ['an agent actor', ['--operator-instruction=yes register 2826 despite the conflict', '--actor=claude']],
-    ['a one-word instruction', ['--operator-instruction=ok', '--actor=operator']],
-  ])('--allow-conflict with %s is refused (exit 2) and registers nothing', (_label, extra) => {
+    ['no operator instruction', [], 'chalbert'],
+    ['an agent-typed --actor=operator under the App/bot credential', ['--operator-instruction=yes register 2826 despite the conflict', '--actor=operator'], 'web-everything-bot[bot]'],
+    ['an agent-typed --actor=operator under another human credential', ['--operator-instruction=yes register 2826 despite the conflict', '--actor=operator', '--by=chalbert'], 'someone-else'],
+    ['an agent-typed --actor=operator when no credential can be read', ['--operator-instruction=yes register 2826 despite the conflict', '--actor=operator'], null],
+    ['a one-word instruction', ['--operator-instruction=ok'], 'chalbert'],
+  ])('--allow-conflict with %s is refused (exit 2) and registers nothing', (_label, extra, login) => {
     const { originDir, cloneDir, overlayDir, env } = makeFixture();
     advanceMain(originDir, (dir) => writeFile(dir, 'shared.mjs', 'export const X = 1;\n'));
     pushBranch(originDir, 'lane/fix-procedure', (dir) => writeFile(dir, 'shared.mjs', 'export const X = 2;\n'));
@@ -220,7 +228,7 @@ describe('daemon-overlay.mjs add — the overlay-conflict guard', () => {
     runCli(['add', `--clone=${cloneDir}`, '--ref=lane/fix-procedure', '--pr=2821'], env);
     const r = runCli([
       'add', `--clone=${cloneDir}`, '--ref=lane/promote-stale-green', '--pr=2826', '--allow-conflict', '--reason=agent thinks it is fine', ...extra,
-    ], env);
+    ], login ? asGhLogin(env, login) : { ...env, PATH: '/nonexistent', WE_OPERATOR_LOGINS: 'chalbert' });
     expect(r.status).toBe(2);
     expect(r.stderr).toMatch(/operator/);
     expect(overlayStateFile(overlayDir, cloneDir).overlays.map((o) => o.ref)).toEqual(['lane/fix-procedure']);
@@ -340,7 +348,7 @@ describe('daemon-overlay.mjs add — the overlay-conflict guard', () => {
     gitOk(dir, ['commit', '-q', '-m', 'orphan']);
     gitOk(dir, ['push', '-q', 'origin', 'HEAD:refs/heads/lane/unrelated']);
 
-    const r = runCli(['add', `--clone=${cloneDir}`, '--ref=lane/unrelated', '--allow-conflict', '--reason=try it', '--operator-instruction=yes register 2826 despite the conflict', '--actor=operator'], env);
+    const r = runCli(['add', `--clone=${cloneDir}`, '--ref=lane/unrelated', '--allow-conflict', '--reason=try it', '--operator-instruction=yes register 2826 despite the conflict'], asGhLogin(env, 'chalbert'));
     expect(r.status).toBe(1);
     expect(r.stderr).toMatch(/merge-tree-failed/);
     expect(overlayStateFile(overlayDir, cloneDir)?.overlays ?? []).toEqual([]);

@@ -55,7 +55,11 @@ describe('runDaemonLoadOverlay — wiring (injected addOverlayFn/rebuild/dryRunR
   it('--allow-conflict without the operator\'s words + --actor=operator is refused before anything is registered', async () => {
     const addOverlayFn = vi.fn();
     const rebuild = vi.fn();
-    for (const extra of [{}, { operatorInstruction: 'load it anyway please' }, { operatorInstruction: 'load it anyway please', actor: 'agent' }]) {
+    for (const extra of [
+      { readViewer: async () => 'chalbert' }, // no operator words
+      { operatorInstruction: 'load it anyway please', actor: 'operator', readViewer: async () => 'web-everything-bot[bot]' }, // typed actor, bot credential
+      { operatorInstruction: 'load it anyway please', actor: 'operator', readViewer: async () => null }, // credential unreadable
+    ]) {
       const result = await runDaemonLoadOverlay({
         clone: '/some/clone', ref: 'lane/x', allowConflict: true, ...extra, addOverlayFn, rebuild, log: { error: () => {} },
       });
@@ -69,10 +73,10 @@ describe('runDaemonLoadOverlay — wiring (injected addOverlayFn/rebuild/dryRunR
     const addOverlayFn = vi.fn();
     const rebuild = vi.fn(async () => ({ moved: false, reason: 'up-to-date' }));
     await runDaemonLoadOverlay({
-      clone: '/some/clone', ref: 'lane/x', allowConflict: true, operatorInstruction: 'load it anyway please', actor: 'operator',
+      clone: '/some/clone', ref: 'lane/x', allowConflict: true, operatorInstruction: 'load it anyway please', readViewer: async () => 'chalbert',
       installed: () => ({ inHead: true, tip: 'abc', head: 'deadbeef', reason: 'in-head' }), addOverlayFn, rebuild,
     });
-    expect(addOverlayFn.mock.calls[0][1].conflictOverride).toMatchObject({ instruction: 'load it anyway please', actor: 'operator' });
+    expect(addOverlayFn.mock.calls[0][1].conflictOverride).toMatchObject({ instruction: 'load it anyway please', actor: 'chalbert' });
   });
 
   it('an ADOPTED rebuild is reported adopted:true, with the new head', async () => {

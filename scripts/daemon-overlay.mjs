@@ -43,7 +43,7 @@
  *
  * USAGE:
  *   node scripts/daemon-overlay.mjs add    --clone=<path> --ref=<branch> [--pr=N] [--pinned|--unpinned] [--reason=..] [--by=..] [--json]
- *                                          [--check] [--allow-conflict --reason=.. --operator-instruction="<quote>" --actor=operator]
+ *                                          [--check] [--allow-conflict --reason=.. --operator-instruction="<quote>"]  (operator's gh credential)
  *                                          [--allow-no-pr --reason=..]
  *   node scripts/daemon-overlay.mjs remove --clone=<path> --ref=<branch> [--reason=..] [--by=..] [--json]
  *   node scripts/daemon-overlay.mjs list   --clone=<path> [--json]
@@ -74,7 +74,8 @@
  * index, working tree are never touched). A conflict REFUSES the add (exit 3, naming the conflicting overlay(s)
  * and file(s)) unless the caller passes `--allow-conflict --reason=<why registering it anyway is safe>`, which
  * still prints the conflict before registering. The override is the operator's call only (2026-10-21): it also needs
- * `--operator-instruction="<the operator's own words>"` and `--actor=operator`, and that quote is stored on the
+ * `--operator-instruction="<the operator's own words>"` AND must run under the operator's own GitHub credential
+ * (checked like extend-rounds: `gh api user` is an OPERATOR_LOGINS login; --actor is not trusted), and that quote is stored on the
  * registration (`conflictOverride`) and its `added` event (`daemon-overlays.mjs#allowConflictGate`). `--check` runs ONLY this guard and reports the verdict —
  * `addOverlay`/`appendOverlayEvent` are never called — so a preview against a live clone's real overlay config
  * never mutates anything (exit 3 on a would-be-refused conflict, exit 1 if the guard itself could not resolve
@@ -97,6 +98,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync, writeFileSync, readFileSync, statSync, rmSync, renameSync } from 'node:fs';
 import {
   addOverlay, removeOverlay, readOverlayState, appendOverlayEvent, overlayFilePath, recordEdgeResolution, allowConflictGate,
+  readOverrideViewerLogin,
 } from './lib/daemon-overlays.mjs';
 import { previewOverlayConflict } from './lib/daemon-rebuild.mjs';
 import { overlaySafetySettings } from './lib/daemon-load-overlay.mjs';
@@ -436,7 +438,8 @@ async function main() {
       return fail('--allow-conflict requires --reason=<why registering it anyway is safe>');
     }
     const gate = allowConflictGate({
-      allowConflict, operatorInstruction: flags['operator-instruction'], actor: flags.actor,
+      allowConflict, operatorInstruction: flags['operator-instruction'],
+      viewerLogin: allowConflict ? await readOverrideViewerLogin() : null,
     });
     if (!gate.ok) return fail(gate.error);
     // A corrupt store gets no guard run (it would waste a real git fetch): `--check` reports it as a failure
