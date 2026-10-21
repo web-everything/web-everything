@@ -233,6 +233,8 @@ describe('x5059uu — rebuild keeps established overlays and parks the conflicti
     expect(plan.establishedLost).toEqual([expect.objectContaining({ ref, pr, files: [worker] })]);
     const { dryRunRebuild } = await import('../daemon-rebuild.mjs');
     const dry = await dryRunRebuild({ root: f.clone, env: f.env, prState: async () => 'OPEN' });
+    expect(dry.unsafe.safe).toBe(true);
+    expect(dry.plan.establishedLost).toEqual([expect.objectContaining({ ref, pr, files: [worker] })]);
     expect(dry.wouldDo).toBe('hold (established-overlay-conflict)');
     const smoke = passSmoke();
     const second = await rebuildClone({ root: f.clone, env: f.env, runSmoke: smoke, prState: async () => 'OPEN' });
@@ -265,6 +267,23 @@ describe('x5059uu — rebuild keeps established overlays and parks the conflicti
     expect(released, JSON.stringify(released.alerts)).toMatchObject({ adopted: true });
     expect(readFileSync(join(f.clone, worker), 'utf8')).toBe('hotfix + main rewrite\n');
     expect(readRebuildState(f.clone, f.env).held ?? null).toBeNull();
+  });
+
+  it('dry run still refuses unpublished local work above a recorded adopted build', async () => {
+    const f = fixture();
+    addOverlay(f.clone, f.overlays[1], { env: f.env });
+    const first = await rebuildClone({ root: f.clone, env: f.env, runSmoke: passSmoke(), prState: async () => 'OPEN' });
+    expect(first, JSON.stringify(first.alerts)).toMatchObject({ adopted: true });
+    write(f.clone, 'local.txt', 'unpublished work\n');
+    gitOk(f.clone, ['add', 'local.txt']);
+    gitOk(f.clone, ['commit', '-q', '-m', 'local work']);
+    const localHead = gitOk(f.clone, ['rev-parse', 'HEAD']).trim();
+
+    const { dryRunRebuild } = await import('../daemon-rebuild.mjs');
+    const dry = await dryRunRebuild({ root: f.clone, env: f.env, prState: async () => 'OPEN' });
+    expect(dry.unsafe).toMatchObject({ safe: false, reason: 'local-commits', detail: [localHead] });
+    expect(dry.wouldDo).toBe('refuse');
+    expect(gitOk(f.clone, ['rev-parse', 'HEAD']).trim()).toBe(localHead);
   });
 
   it('protects only the current build and overlay identity, and permits graduation and explicit retirement', async () => {
