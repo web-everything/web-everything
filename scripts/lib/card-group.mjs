@@ -311,7 +311,7 @@ function readEntry({ ref, path, cwd, run, norm }) {
   catch { throw new Error(`${path} at ${String(ref).slice(0, 10)} is not valid UTF-8 text`); }
   // A leading BOM is a property of the file like its mode, not part of line 1 (that would make the first line
   // a different line and upset the order proof); `bom` carries it.
-  const bom = text.startsWith('﻿');
+  const bom = text.startsWith('\ufeff');
   const body = bom ? text.slice(1) : text;
   return { lines: splitLines(body).map(norm), mode, eol: body === '' || body.endsWith('\n'), bom };
 }
