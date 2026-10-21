@@ -5,6 +5,7 @@
  *   not-real). Every collaborator is injectable so the tests run with no network.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -96,11 +97,25 @@ export function createFileClaims({ dir = join(automationStateRoot(), 'red-team-r
     },
     /** Take over the claim observed at `gen`. Exactly one caller wins generation gen+1. */
     reclaim(key, gen) { return make(key, gen + 1); },
+    /** Bind one BREAK to one card job, atomically (`wx`): the first job to claim a break owns it for good, so two
+     *  concurrent invocations with overlapping selections can never both file it. Returns the owning job key. */
+    claimBreak(breakKey, jobKey) {
+      mkdirSync(dir, { recursive: true });
+      const f = join(dir, `${breakKey}.break`);
+      try { writeFileSync(f, JSON.stringify({ jobKey, at: nowMs() }), { flag: 'wx' }); return jobKey; }
+      catch (e) {
+        if (e?.code !== 'EEXIST') throw e;
+        try { return String(JSON.parse(readFileSync(f, 'utf8')).jobKey ?? ''); } catch { return ''; }
+      }
+    },
     spawned(key) { return existsSync(join(dir, `${key}.spawned`)); },
     markSpawned(key, info) { writeFileSync(join(dir, `${key}.spawned`), JSON.stringify({ ...info, at: nowMs() })); },
     now: nowMs,
   };
 }
+
+/** The claim key binding ONE break of one result to its card job. PURE. */
+export const breakClaimKey = (p, index) => createHash('sha256').update(JSON.stringify(['break-v1', p.repo, Number(p.pr), p.head, p.resultId, Number(index)])).digest('hex').slice(0, 16);
 
 /** How long a claim with no spawned job counts as another invocation still working. */
 export const CLAIM_IN_PROGRESS_MS = 120_000;
@@ -198,6 +213,12 @@ export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_
         return { ruling: 'card', head: p.head, indices: p.indices, card: { ref: p.cardRef }, labels: resync(p) };
       }
       const session = p.session;
+      // 0. Each selected BREAK belongs to at most one card job (atomic, local): an overlapping concurrent selection loses.
+      const owners = p.indices.map((i) => ({ i, owner: claims.claimBreak(breakClaimKey(p, i), p.jobKey) })).filter((o) => o.owner !== p.jobKey);
+      if (owners.length) {
+        throw new Error(`break(s) ${owners.map((o) => `#${o.i}`).join(', ')} already belong to another card job (${[...new Set(owners.map((o) => o.owner || 'unreadable'))].join(', ')}); `
+          + 'nothing written — re-run with that job\'s exact --break selection');
+      }
       // 1. Serialize: one atomic claim per (PR, head, result, breaks); taking over an expired one is atomic too.
       const claim = claims.claim(p.jobKey);
       const spawned = claims.spawned(p.jobKey);

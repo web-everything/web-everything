@@ -105,15 +105,16 @@ describe('planRedTeamRuling: refusals', () => {
 });
 
 /** A fake PR whose thread grows as the sinks post (as the operator account), so the read-back proves the gate released the break. */
-function fake({ cardOk = true, postFails = null, liveHead = HEAD, labels = [], identity = OP, author = 'chalbert', claims, noPid = false, initial } = {}) {
+function fake({ cardOk = true, postFails = null, liveHead = HEAD, labels = [], identity = OP, author = 'chalbert', claims, noPid = false, initial, sharedBreaks } = {}) {
   const comments = initial ? [...initial] : thread();
   const posted = [], cards = [], labelCalls = [], labelSyncs = [];
-  const gens = new Map(), receipts = new Set();
+  const gens = new Map(), receipts = new Set(), breakOwners = sharedBreaks ?? new Map();
   let clock = 1_000_000;
   const memClaims = {
     claim: (k) => { if (!gens.has(k)) { gens.set(k, { gen: 0, at: clock }); return { created: true, gen: 0, at: clock }; } return { created: false, ...gens.get(k) }; },
     reclaim: (k, g) => { if (gens.get(k).gen !== g) return false; gens.set(k, { gen: g + 1, at: clock }); return true; },
     spawned: (k) => receipts.has(k), markSpawned: (k) => receipts.add(k), now: () => clock,
+    claimBreak: (k, job) => { if (!breakOwners.has(k)) breakOwners.set(k, job); return breakOwners.get(k); },
   };
   const sinks = createRecordRedTeamRulingSinks({
     readThread: () => ({ headRefOid: liveHead, labels, comments: [...comments] }),
@@ -514,5 +515,35 @@ describe('audit round 3: an interrupted multi-break card filing never spawns a s
     failRecord = false;
     expect(f.sinks[RED_TEAM_RULING_CARD_EFFECT](planRedTeamRuling(read({ comments: f.comments }), input({ break: '#1,#2' })))).toMatchObject({ card: { reconciled: true } });
     expect(f.cards).toHaveLength(1);
+  });
+});
+
+describe('audit round 4: concurrent overlapping card selections', () => {
+  const two = () => [redTeam(HEAD, [
+    { summary: 'one', category: 'edge-case', impactIfUnfixed: 'broken', file: 'a.mjs', line: 1, confirmedByRecheck: true },
+    { summary: 'two', category: 'edge-case', impactIfUnfixed: 'broken', file: 'b.mjs', line: 2, confirmedByRecheck: true }]), capped()];
+  it('the second of two interleaved invocations (#1,#2 then #1) is refused before anything is written', () => {
+    const shared = new Map();
+    const a = fake({ initial: two(), sharedBreaks: shared });
+    const b = fake({ initial: two(), sharedBreaks: shared });
+    const pa = planRedTeamRuling(read({ comments: two() }), input({ break: '#1,#2' }));
+    const pb = planRedTeamRuling(read({ comments: two() }), input({ break: '1' }));
+    a.sinks[RED_TEAM_RULING_CARD_EFFECT](pa);
+    expect(() => b.sinks[RED_TEAM_RULING_CARD_EFFECT](pb)).toThrow(/already belong to another card job/);
+    expect(a.cards.length + b.cards.length).toBe(1);
+    expect(b.posted).toEqual([]);
+  });
+  it('file claims: a break is owned by the first job, atomically', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { createFileClaims } = await import('../record-red-team-ruling-io.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'claims-'));
+    try {
+      const c = createFileClaims({ dir });
+      expect(c.claimBreak('b1', 'jobA')).toBe('jobA');
+      expect(c.claimBreak('b1', 'jobB')).toBe('jobA');
+      expect(c.claimBreak('b1', 'jobA')).toBe('jobA');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
