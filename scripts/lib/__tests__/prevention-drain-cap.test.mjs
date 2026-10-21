@@ -315,19 +315,45 @@ describe('the probe tick', () => {
     expect(await drain.mock.results[0].value).toMatchObject({ live: 15_000 }); // the live value after time passed
   });
 
-  it('owed work opens the standalone spool slice even when every top-level slot is sealed (the retry the skipped nested drain used to give)', async () => {
-    const f = tickFixture(); owedPending(f);
-    writeFileSync(join(f.stateDir, 'org-repo-prevention.json'), JSON.stringify({ seq: 9, batchRef: 'lane/card-batch-prevention-9', sealedAt: '2026-10-18T12:00:00Z', pr: 0 }));
-    const drain = vi.fn(async () => ({ ok: true }));
-    await reconcileCardBatches({ ...base(f), drain, fileOwed: vi.fn(async () => ({ ok: true, skipped: true })), loadFilingSettings: settings() });
-    expect(drain).toHaveBeenCalledOnce();
-  });
-  it('without owed work a sealed-only state still does not open the slice (unchanged from base)', async () => {
-    const f = tickFixture();
-    writeFileSync(join(f.stateDir, 'org-repo-prevention.json'), JSON.stringify({ seq: 9, batchRef: 'lane/card-batch-prevention-9', sealedAt: '2026-10-18T12:00:00Z', pr: 0 }));
+  const sealedOnly = f => writeFileSync(join(f.stateDir, 'org-repo-prevention.json'), JSON.stringify({ seq: 9, batchRef: 'lane/card-batch-prevention-9', sealedAt: '2026-10-18T12:00:00Z', pr: 0 }));
+
+  it('the spool slice is eligible whenever the spool is non-empty (operator ruling 2026-10-20: base reach, new bounds), even with every slot sealed and no owed work', async () => {
+    const f = tickFixture(); sealedOnly(f);
     const drain = vi.fn(async () => ({ ok: true }));
     await reconcileCardBatches({ ...base(f), drain, loadFilingSettings: settings() });
+    expect(drain).toHaveBeenCalledOnce();
+    expect(drain.mock.calls[0][1].drainLimit).toMatchObject({ deadlineAt: expect.any(Number), cursorPath: f.cursorPath });
+  });
+
+  it('keeps draining on later ticks after the LAST owed filing completed (no lost pending retry)', async () => {
+    const f = tickFixture(); sealedOnly(f); owedPending(f);
+    writeFileSync(f.cursorPath, JSON.stringify({ next: 'owed' }));
+    const drain = vi.fn(async () => ({ ok: true }));
+    const fileOwed = vi.fn(async () => ({ ok: true })); // completes the obligation
+    const tick = () => reconcileCardBatches({ ...base(f), drain, fileOwed, loadFilingSettings: settings() });
+    await tick(); await tick(); await tick();
+    expect(drain.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('paused: the pause is checked before any owed scan, so a corrupt owed record cannot abort sealing', async () => {
+    const f = tickFixture(); sealedOnly(f);
+    const dir = join(f.stateDir, 'owed-prevention'); mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${'c'.repeat(64)}.json`), '{ not json');
+    const seal = vi.fn(async () => []); const drain = vi.fn();
+    const results = await reconcileCardBatches({ ...base(f), seal, drain, loadFilingSettings: () => ({ filingEnabled: false }) });
+    expect(results).toEqual([{ action: 'paused', step: 'drain', reason: 'prevention filing paused by prevention.filingEnabled' }]);
+    expect(seal).toHaveBeenCalledOnce();
     expect(drain).not.toHaveBeenCalled();
+  });
+
+  it('enabled: a corrupt owed record is an owed error, and sealing still runs', async () => {
+    const f = tickFixture();
+    const dir = join(f.stateDir, 'owed-prevention'); mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${'c'.repeat(64)}.json`), '{ not json');
+    const seal = vi.fn(async () => []);
+    const results = await reconcileCardBatches({ ...base(f), seal, drain: vi.fn(async () => ({ ok: true })), loadFilingSettings: settings() });
+    expect(results.some(result => result.step === 'owed' && result.action === 'error')).toBe(true);
+    expect(seal).toHaveBeenCalledOnce();
   });
 
   it('the budget counts from the START of the tick: terminal-PR recovery that used it leaves no drain', async () => {

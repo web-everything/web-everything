@@ -74,11 +74,4 @@ export async function reconcileOwedPrevention({ stateDir = cardBatchStateDir(), 
   return results;
 }
 
-/** Cheap read-only: is any owed filing not yet done? */
-export function hasOwedWork(stateDir = cardBatchStateDir()) {
-  try {
-    return readdirSync(directory(stateDir)).some(name => /^[a-f0-9]{64}\.json$/.test(name) && read(join(directory(stateDir), name))?.status !== 'done');
-  } catch (e) { if (e.code === 'ENOENT') return false; throw e; }
-}
-
 export function owedPreventionRecord(input, { stateDir = cardBatchStateDir() } = {}) { return read(pathOf(input, stateDir)); }

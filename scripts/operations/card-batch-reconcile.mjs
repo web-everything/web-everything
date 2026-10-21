@@ -1,6 +1,6 @@
 /** Periodic terminal-PR recovery, pending-card drain and due-batch flush. */
 import { drainCursorPath, readDrainCursor, writeDrainCursor } from '../lib/prevention-drain-cursor.mjs';
-import { hasOwedWork, reconcileOwedPrevention } from '../lib/prevention-filing-owed.mjs';
+import { reconcileOwedPrevention } from '../lib/prevention-filing-owed.mjs';
 import { loadPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
 import { readFileSync, readdirSync, rmSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
@@ -40,7 +40,6 @@ export async function reconcileCardBatches({
   let files;
   try { files = readdirSync(stateDir, { withFileTypes: true }); }
   catch (error) { if (error.code === 'ENOENT') files = []; else throw error; }
-  let drainNeeded = false;
   if (basename(resolve(stateDir)) === 'sealed') return results;
   for (const file of files.filter(file => file.isFile() && file.name.endsWith('.json'))) {
     const statePath = join(stateDir, file.name);
@@ -52,7 +51,6 @@ export async function reconcileCardBatches({
         if (!lease) { results.push({ statePath, action: 'refuse', reason: 'lease-held' }); continue; }
       }
       const state = JSON.parse(readFileSync(statePath, 'utf8'));
-      if (!state.batchRef || !state.sealedAt) drainNeeded = true;
       if (!state.batchRef || !state.sealedAt || !state.pr) continue;
       if (dryRun) { results.push({ statePath, action: 'dry-run' }); continue; }
       const kind = state.kind ?? CARD_BATCH_KINDS.find(kind => file.name.endsWith(`-${kind}.json`));
@@ -64,7 +62,6 @@ export async function reconcileCardBatches({
         held: () => tokenOf(lockPath) === lease.token && clock() < lease.expiresAt,
       });
       results.push({ statePath, ...result });
-      if (result.action === 'retired') drainNeeded = true;
     } catch (error) { results.push({ statePath, action: 'error', reason: error.message }); }
     finally {
       try { if (lease && tokenOf(lockPath) === lease.token) rmSync(lockPath, { force: true }); }
@@ -84,10 +81,10 @@ export async function reconcileCardBatches({
   let drainDeferred = false;
   const perTick = () => { const n = loadFilingSettings().drainCardsPerTick; return Number.isSafeInteger(n) && n > 0 ? n : 1; };
   const drainPendingStep = async () => {
-    // An empty state directory is also an open slot: recover a spool even before its first admission.
-    // Owed work also opens the slice: the owed filing used to drain the spool itself after its acquire (base), and now that the
-    // nested drain is skipped this slice is the spool's retry, so it must not hinge on a recovered or empty batch slot.
-    if (!(drainNeeded || hasOwedWork(stateDir) || !files.some(file => file.isFile() && file.name.endsWith('.json')))) return;
+    // Operator ruling 2026-10-20 (restore base reach, keep the new bounds): the pending slice is eligible WHENEVER the spool is
+    // non-empty, independent of slot recovery or owed work. The base drained the spool in every state where a filing ran;
+    // gating it on a recovered/empty slot lost that once the nested drain was skipped. The per-tick cap, deadline and
+    // round-robin below are what bound it now.
     // An owed-first deferral (no lane) ends the tick's drain; an exhausted allowance must not even acquire.
     if (drainDeferred || counter.left <= 0) return;
     try {
