@@ -168,9 +168,10 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
 
 describe('xym8nt4 — a card group never deadlocks the published main-red repair PR (real drain CLI)', () => {
   it('control: on green main the group reservation holds the PR touching its card', () => {
-    const { attempts, stderr } = runCli({ cardGroup: true });
+    const { attempts, stderr, result } = runCli({ cardGroup: true });
     expect(attempts, stderr).toEqual([OTHER]);
-    expect(stderr).toMatch(/reserved by open card group #4000/);
+    expect(result.enqueueOutcomes).toContainEqual(expect.objectContaining({ num: FIX, outcome: 'not-enqueued', kind: 'card-grouped',
+      reason: expect.stringMatching(/reserved by open card group #4000/) }));
   }, 30000);
 
   it('main red: the published fix PR lands although the group reserves its card; the unrelated PR stays held', () => {
