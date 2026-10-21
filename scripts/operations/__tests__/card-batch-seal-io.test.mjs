@@ -1,7 +1,7 @@
 // @vitest-environment node
 /** Batch IO ordering, refusal and durable retry boundaries using injected transports. */
 import { afterEach, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { retireTerminalBatch } from '../card-batch-io.mjs';
@@ -167,10 +167,18 @@ it('age jobs are detached, unrefed and never awaited; unfinished seals are retri
   const f = fixture(); const child = { once: vi.fn((event, callback) => { if (event === 'spawn') queueMicrotask(callback); }), unref: vi.fn(), then: () => { throw Error('awaited'); } };
   const spawn = vi.fn(() => child);
   expect(await sealDueBatches({ now: 60000, stateDir: f.dir, policy: f.opts.policy, spawn })).toEqual([f.statePath]);
-  expect(spawn.mock.calls[0][2]).toMatchObject({ detached: true, stdio: 'ignore' });
+  const [, out, err] = spawn.mock.calls[0][2].stdio;
+  expect(spawn.mock.calls[0][2]).toMatchObject({ detached: true, stdio: ['ignore', expect.any(Number), expect.any(Number)] });
+  expect(out).toBe(err);
+  expect(existsSync(`${f.statePath}.seal.log`)).toBe(true);
   expect(child.unref).toHaveBeenCalledOnce();
   writeFileSync(f.statePath, JSON.stringify({ ...f.state, sealedAt: 500, seal: { step: 'verify' } }));
   expect(await sealDueBatches({ now: 1000, stateDir: f.dir, policy: f.opts.policy, spawn })).toEqual([f.statePath]);
+});
+it('an unopenable seal log never blocks the launch', async () => {
+  const f = fixture(); const spawn = vi.fn(fakeChild);
+  expect(await sealDueBatches({ now: 60000, stateDir: f.dir, policy: f.opts.policy, spawn, open: () => { throw Error('EACCES'); } })).toEqual([f.statePath]);
+  expect(spawn.mock.calls[0][2].stdio).toEqual(['ignore', 'ignore', 'ignore']);
 });
 it('rechecks the remote after verification and refuses drift without releasing the hold', async () => {
   const f = fixture({ maxCards: 1 });

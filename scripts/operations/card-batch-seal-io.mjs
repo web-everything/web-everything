@@ -1,6 +1,6 @@
 /** Durable batch publication and resumable sealing under the admission lock (#4703). */
 import { execFileSync, spawn as spawnChild } from 'node:child_process';
-import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
@@ -324,14 +324,14 @@ export async function publishBatch(input, opts = {}) {
 
 /** Tick only scans and launches; the detached worker owns verification and the admission lease. */
 export async function sealDueBatches({ now = Date.now(), stateDir = CARD_BATCH_STATE_DIR,
-  policy = effectiveCardBatchPolicy(), spawn = spawnChild } = {}) {
+  policy = effectiveCardBatchPolicy(), spawn = spawnChild, open = openSync } = {}) {
   let files;
   try { files = readdirSync(stateDir); } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
   const jobs = [];
   const errors = [];
   if (files.includes('sealed')) {
     // A broken archive must not stop the active batches below from launching; its error joins the aggregate.
-    try { jobs.push(...await sealDueBatches({ now, stateDir: join(stateDir, 'sealed'), policy, spawn })); }
+    try { jobs.push(...await sealDueBatches({ now, stateDir: join(stateDir, 'sealed'), policy, spawn, open })); }
     catch (error) { jobs.push(...(error.launched ?? [])); errors.push(error); }
   }
   for (const file of files.filter(file => file.endsWith('.json'))) {
@@ -349,8 +349,14 @@ export async function sealDueBatches({ now = Date.now(), stateDir = CARD_BATCH_S
       const opened = typeof state.openedAt === 'number' ? state.openedAt : Date.parse(state.openedAt);
       const at = Number.isFinite(opened) ? Math.max(now, opened) : now;
       if (!kind || (!state.sealedAt && !planPublish({ state, kind, policy, now: at }).reason && !holdPending(state))) continue;
-      const child = spawn(process.execPath, [join(ROOT, 'scripts/operations/card-batch-seal-job.mjs'), `--state=${path}`],
-        { cwd: ROOT, detached: true, stdio: 'ignore' });
+      // The job's stdout/stderr go to `<state>.seal.log` (as card-batch-file does): a detached failure must leave a trace.
+      let log = 'ignore';
+      try { log = open(`${path}.seal.log`, 'a'); } catch { /* no log; the job still runs */ }
+      let child;
+      try {
+        child = spawn(process.execPath, [join(ROOT, 'scripts/operations/card-batch-seal-job.mjs'), `--state=${path}`],
+          { cwd: ROOT, detached: true, stdio: ['ignore', log, log] });
+      } finally { if (typeof log === 'number') { try { closeSync(log); } catch { /* the child holds its own copy */ } } }
       // Wait only for OS launch, never child completion/verification. Launch failures reach probeErrors.
       await new Promise((resolve, reject) => {
         child.once('error', reject);
