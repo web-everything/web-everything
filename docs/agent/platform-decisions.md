@@ -6461,8 +6461,9 @@ from its class list) and the drain's existing proof-of-land gate (base lands fir
    unreadable cascade result, goes to the operator. Gate-feeding settings and mixed guard children remain guard class
    here too. Rebase grants no `review:accepted` label or carried approval; review, CI and proof-of-land gates must
    still pass for the new head. The auto-rebase also removes the closed base from the child's `stackParents` edge in
-   every lane manifest the drain reads (the PR body, and the legacy head-ref file when the body has none). If that
-   removal fails, the child goes to the operator. A child sent to the operator keeps its edge.
+   every lane manifest the drain reads (the PR body, and the legacy head-ref file when the body has none), only after
+   the rebased head is confirmed on the remote. If that removal fails, the child goes to the operator. A child sent to
+   the operator keeps its edge. A later pass finishes or escalates a removal that a crash interrupted.
 6. **Free-scope.** The caller names the intended base PR (`--stack-on=<n>`); free-scope applies the matrix and excludes
    only PR holders in that chain, never agent-registry holders. A cell that may not stack still reports OCCUPIED.
 

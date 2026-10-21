@@ -13,7 +13,13 @@ tags: []
 
 When a stacked child's base PR is closed or rejected, rebase a low-risk child onto main only on a clean rebase with an unchanged delta fingerprint (a setting); every other child goes to the operator as needs-you. Ruled in xv85eqi.
 
-The auto-rebase also removes the closed base from the child's durable stack edge. A Git rebase does not touch it: the edge is the `stackParents` entry in the child's lane manifest, and the drain (`planLabelDrain`) keeps waiting on a parent that never lands. So the recovery removes the closed base from every manifest source the drain reads. That means the PR-body lane manifest (rewritten with the existing `embedManifestInBody`) and, when the body carries none, the legacy head-ref `we:.lane-manifest.json`.
+The auto-rebase also removes the closed base from the child's durable stack edge. A Git rebase does not touch it: the edge is the `stackParents` entry in the child's lane manifest, and the drain (`planLabelDrain`) keeps waiting on a parent that never lands. So the recovery removes the closed base from every manifest source the drain reads. That means the PR-body lane manifest (rewritten with the existing `embedManifestInBody`) and, when the body carries none, the legacy head-ref `we:.lane-manifest.json`. Writing the cleaned manifest into the body is enough for a legacy child too, because the drain reads the body first.
+
+How the edge is removed:
+- **Which id.** The trigger is a base PR number, but `stackParents` holds item ids. Map the closed base PR to its item id by reading that PR's own manifest (it is closed, so the drain's open-PR read does not have it). If that read fails or gives no item, the child goes to the operator.
+- **Write order.** Remove the edge only after the remote head of the child equals the rebased sha. Never remove it first: a child that still carries the closed base's commits must keep waiting.
+- **Couples.** An impl PR inherits `stackParents` from its WE carrier's manifest. The edge is removed in the carrier's manifest, and only when every half of the couple is auto-rebased. If any half goes to the operator, every half does, and the carrier keeps the edge.
+- **Re-entrant sweep.** A crash between the push and the manifest edit leaves a child on main that still names the closed base, and the close trigger will not fire again. So every pass, the slice-4 handler also checks each open child whose `stackParents` names an item whose PR was closed without merging. Such a child finishes the removal if its head is already the clean rebase onto main, else it goes to the operator. This lives in the slice-4 files, not in `planLabelDrain` (the proof-of-land gate is unchanged).
 
 ## Acceptance
 
@@ -24,11 +30,15 @@ The auto-rebase also removes the closed base from the child's durable stack edge
   - `base closed: a normal or guard child always goes to the operator`.
   - `base closed: gate-feeding settings and mixed docs-plus-guard children go to the operator even when settings and docs are in lowRiskClasses` (reuse slice 1's path-derived class precedence).
   - `base closed: an auto-rebased child receives no review:accepted label or carried approval from the rebase and must pass review, CI and proof-of-land gates for its new head` (integration through the rebase handler and drain, with a clean rebase and unchanged fingerprint; stale acceptance on the old head cannot authorize the new head).
-  - `base closed: an auto-rebased child has the closed base removed from stackParents in every manifest source the drain reads, and planLabelDrain no longer defers it on that base` (integration through the rebase handler and the real `planLabelDrain`, with a clean rebase and unchanged fingerprint. Cover the PR-body manifest and the legacy head-ref manifest. The plan's `deferred` entry for the child names no `waitOn` on the closed base, on either `stackParents` or `blockedBy`).
+  - `base closed: an auto-rebased child has the closed base removed from stackParents in every manifest source the drain reads, and planLabelDrain then puts it in ready` (integration through the rebase handler and the real `planLabelDrain`, with a clean rebase and unchanged fingerprint. Use a hash parent id such as `xbase01`, never a numeric one, and a child candidate with `decision: 'merge'` and every other gate green. Read the manifest back through the exported readers (`extractManifestFromBody`, `readLegacyLocalManifestAt`, `readRemoteManifestViaApi`), for a body-manifest child and for a legacy head-ref child. Assert the child is in `ready`. Control: the same fixture with the edge kept has the child in `deferred` with `xbase01` in `waitOn`).
+  - `base closed: the closed base PR number is mapped to its item id through that PR's own manifest; an unreadable or item-less base manifest sends the child to the operator`.
+  - `base closed: the edge is removed only after the child's remote head equals the rebased sha; a push that is not confirmed leaves the edge in place and sends the child to the operator`.
+  - `base closed: for a couple, the edge is removed from the carrier's manifest only when every half is auto-rebased; if any half goes to the operator, every half does and the carrier keeps the edge`.
+  - `base closed: a pass after a crash between the rebase push and the manifest edit finds the open child still naming the closed base and finishes the removal or sends it to the operator`.
   - `base closed: only the closed base's edge is removed; every other stackParents and blockedBy edge of the child is kept`.
   - `base closed: a child whose blockedBy also names the closed base's item goes to the operator, never an automatic edge removal`.
   - `base closed: a child sent to the operator keeps its stack edge, so the drain never lands it until the operator acts`.
-  - `base closed: a manifest update that fails, is partial, or does not land with the rebase push sends the child to the operator, never leaving a rebased child that still waits on the closed base`.
+  - `base closed: a manifest update that fails or is partial sends the child to the operator, never leaving a rebased child that silently waits on the closed base`.
   - `base rejected is handled the same as closed`.
   - `the auto-rebase behaviour follows the setting; turning it off sends every child to the operator`.
   - `an unreadable base state fails closed to the operator`.
@@ -56,7 +66,7 @@ One line per class: either the handling, or `n/a: <why>`.
 
 1. **Untrusted text** — class and fingerprint come from the diff and paths, not PR text.
 2. **Truncated reads** — an incomplete diff or state read goes to the operator.
-3. **Shared state files** — adds no new shared file; the operator route uses the existing needs-you channel. The only durable write is removing the closed base from the child's lane manifest (PR body, and the legacy head-ref file when the body has none). The removal lands with the rebase push or the child goes to the operator.
+3. **Shared state files** — adds no new shared file; the operator route uses the existing needs-you channel. The only durable write is removing the closed base from the child's lane manifest (the PR body, or the carrier's body for a couple). It happens only after the rebased head is confirmed on the remote. A crash between the push and the edit is caught by the per-pass sweep.
 4. **Fail closed** — any unknown goes to the operator, never to an automatic rebase. A failed or partial stack-edge removal also goes to the operator, and a child routed there keeps its edge.
 5. **Identity scoping** — only trusted same-actor lane PRs are handled automatically.
 6. **State over time** — evaluated when the base closes; a later reopen re-evaluates.
