@@ -3,35 +3,35 @@ bornAs: xq2bksy
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/operations/review-extra-seats.mjs", "we:scripts/lib/review-speculative-red-team.mjs", "we:scripts/settings/review.json"]
+scope: ["we:scripts/operations/review-extra-seats.mjs", "we:scripts/lib/review-speculative-red-team.mjs", "we:scripts/settings/review.json", "we:scripts/operations/__tests__/review-red-team.test.mjs", "we:scripts/operations/__tests__/review-job-speculative-red-team.test.mjs", "we:scripts/lib/__tests__/review-speculative-red-team.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
 # Red team setting redTeam.speculativeBrief=independent: speculative brief from diff and card only
 
-Build after #5482 land (it holds we:scripts/operations/review-extra-seats.mjs). 412 of 788 accept-path speculative red-team passes (52%) were thrown away as stale ('the jurors raised N finding(s) the speculative brief could not carry') and re-run: about 412 wasted calls and 1,650 codex minutes per 7 days; only 38% of accepts got the zero-wait benefit. Spec: redTeam.speculativeBrief = independent (default). The speculative start uses a brief built only from the diff and the card, never from juror findings, so a later juror change does not invalidate it. The result is keyed to the head and reused when that head is accepted. A head move still invalidates it. Operator 2026-10-17: Ok. Never weaken a hold. Tests first, run red, one per setting. A cascade setting with its source logged.
+Make redTeam.speculativeBrief=independent the default: build the speculative brief from the pinned diff and card, without juror findings, and reuse it on acceptance of the same input. Juror findings arriving later must not alone invalidate it. Keep head/input freshness, independent recheck and confirmed-break routing. Operator approved 2026-10-17. Historical #5482 is not the local boundary-guard card and supplies no dependency edge.
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
-
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
-
-Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+- [A1] `q=we:scripts/readiness/heavy-admission.mjs; t=we:scripts/operations/__tests__/review-red-team.test.mjs; node "${q#we:}" run -- npx vitest run "${t#we:}"` — add an accepted review with later juror findings: the independent brief contains only diff/card context, the same-input speculative pass is reused rather than returning stale, and its findings still pass independent recheck. The current juror-findings stale branch must fail this case.
+- [A2] `q=we:scripts/readiness/heavy-admission.mjs; t=we:scripts/operations/__tests__/review-job-speculative-red-team.test.mjs; node "${q#we:}" run -- npx vitest run "${t#we:}"` — prove a moved head or changed diff/card discards the pass, rejected review publishes no result, and valid JSON falsely claiming a clean outcome cannot bypass confirmed recheck breaks; cover source/docs/config/data inputs without widening scheduling exemptions.
+- [A3] `q=we:scripts/readiness/heavy-admission.mjs; t=we:scripts/lib/__tests__/review-speculative-red-team.test.mjs; node "${q#we:}" run -- npx vitest run "${t#we:}"` — add independent-default cascade cases, env/tool/platform precedence and source logging; unavailable or invalid settings retain the safe default. Preserve the existing speculation on/off switch.
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] No head-only reuse of changed input, no removal of rechecks or send-back guards, no new receiving/writing HTTP endpoint (body/rate/CSRF controls do not apply).
 
 ## Edge cases this change must handle
 
-One line per class: either the handling, or `n/a: <why>`.
+1. **Untrusted text** — Treat diff/card text as untrusted prompt data, never instructions to alter the review protocol.
+2. **Truncated reads** — Incomplete diff/card reads cannot establish a reusable fingerprint; fall back to the sequential path without claiming clean evidence.
+3. **Shared state files** — Reuse the existing atomic read sink and result effects; superseded passes cannot duplicate published results.
+4. **Fail closed** — Failed or semantically wrong model output cannot become acceptance; retain the hold for all scheduled content kinds.
+5. **Identity scoping** — Bind reuse to repo/PR/head and the exact diff/card fingerprint, never another session’s pass.
+6. **State over time** — Late juror findings alone do not invalidate; head/input movement does, and non-accept cancels/discards speculation.
+7. **Who wrote it** — Preserve provider/model/call provenance and independent recheck authorship when completing a reused pass.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+## Grounding
+
+`we:scripts/operations/review-extra-seats.mjs:1073` injects juror findings into briefs; `we:scripts/operations/review-extra-seats.mjs:1628` checks the fingerprint and `we:scripts/operations/review-extra-seats.mjs:1634` rejects later juror findings. `we:scripts/lib/review-speculative-red-team.mjs:61` implements the existing on/off cascade.

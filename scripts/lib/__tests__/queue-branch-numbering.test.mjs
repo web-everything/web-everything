@@ -68,6 +68,45 @@ describe('queue branch numbering', () => {
       ].join('\n'));
     expect(drainNumberedPairs({ cwd: '/clone', exec })).toEqual(new Set(['xaaaaaa→10']));
   });
+  it('keeps an accepted drain author trusted after more than 100 newer numbering commits', () => {
+    const history = [
+      ...Array.from({ length: 101 }, () => 'Newer\0newer@example.test\0drain: JIT-number xbbbbbb→#20 at land (#2288)'),
+      'Established\0established@example.test\0drain: JIT-number xaaaaaa→#10 at land (#2288)',
+    ];
+    const exec = vi.fn((_cmd, args) => {
+      if (!args.includes('--grep=^drain: JIT-number ')) return [
+        'Established\0established@example.test\0drain: JIT-number xwfgsk7→#6678 at land (#2288)',
+        'Forger\0forger@example.test\0drain: JIT-number xcccccc→#6679 at land (#2288)',
+      ].join('\n');
+      const limit = args.find(arg => arg.startsWith('--max-count='));
+      return history.slice(0, limit ? Number(limit.split('=')[1]) : history.length).join('\n');
+    });
+    const pairs = drainNumberedPairs({ cwd: '/clone', exec });
+    expect(pairs).toEqual(new Set(['xwfgsk7→6678']));
+    expect(handNumberedNewItems(exemptDrainNumberedItems([
+      { id: '6678-admission', num: '6678', bornAs: 'xwfgsk7' },
+    ], { drainNumbered: pairs }), [])).toEqual([]);
+  });
+  it('retains an accepted drain author after 100 newer numbering commits by another author', () => {
+    const main = [
+      ...Array.from({ length: 100 }, () => 'Recent\0recent@example.test\0drain: JIT-number xbbbbbb→#20 at land (#2288)'),
+      'Established\0established@example.test\0drain: JIT-number xaaaaaa→#10 at land (#2288)',
+    ];
+    const exec = vi.fn((_cmd, args) => {
+      if (args.at(-1) !== 'origin/main') return [
+        'Established\0established@example.test\0drain: JIT-number xabc123→#30 at land (#2288)',
+        'Forger\0forger@example.test\0drain: JIT-number xdef456→#31 at land (#2288)',
+      ].join('\n');
+      const limit = args.find(arg => arg.startsWith('--max-count='));
+      return (limit ? main.slice(0, Number(limit.split('=')[1])) : main).join('\n');
+    });
+    const pairs = drainNumberedPairs({ cwd: '/clone', exec });
+    expect(pairs).toEqual(new Set(['xabc123→30']));
+    expect(handNumberedNewItems(exemptDrainNumberedItems([
+      { id: '30-drained', num: '30', bornAs: 'xabc123' },
+      { id: '31-forged', num: '31', bornAs: 'xdef456' },
+    ], { drainNumbered: pairs }), [])).toEqual([expect.stringContaining('31-forged')]);
+  });
   it('refuses hash cards in merge groups even when drain numbering is off', () => {
     const env = { GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'merge_group', WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE: 'off' };
     expect(mergeGroupHashRefusals({ env, files: ['backlog/xabc123-foo.md', 'backlog/5970-bar.md'] })).toEqual([
@@ -159,10 +198,36 @@ describe('queue branch numbering', () => {
     expect(pairs).toEqual(new Set());
     expect(handNumberedNewItems(exemptDrainNumberedItems([{ id: '5986-picked', num: '5986', bornAs: 'xabc123' }], { drainNumbered: pairs }), [])).toHaveLength(1);
   });
-  it('bounds the trusted identity read to recent drain subjects', () => {
+  it('retains accepted drain identities after more than 100 newer numbering commits', () => {
+    const accepted = [
+      ...Array.from({ length: 100 }, () => 'Current\0current@example.test\0drain: JIT-number xaaaaaa→#10 at land (#2288)'),
+      'Returning\0returning@example.test\0drain: JIT-number xbbbbbb→#20 at land (#2288)',
+    ];
+    const exec = vi.fn((_cmd, args) => {
+      if (args.at(-1) === 'origin/main') {
+        const limit = args.find(arg => arg.startsWith('--max-count='));
+        return accepted.slice(0, limit ? Number(limit.split('=')[1]) : undefined).join('\n');
+      }
+      return [
+        'Returning\0returning@example.test\0drain: JIT-number xabc123→#6672 at land (#2288)',
+        'Forger\0forger@example.test\0drain: JIT-number xdef456→#6673 at land (#2288)',
+      ].join('\n');
+    });
+    const pairs = drainNumberedPairs({ cwd: '/clone', exec });
+    expect(pairs).toEqual(new Set(['xabc123→6672']));
+    const items = [
+      { id: '6672-drained', num: '6672', bornAs: 'xabc123' },
+      { id: '6673-forged', num: '6673', bornAs: 'xdef456' },
+    ];
+    const errors = handNumberedNewItems(exemptDrainNumberedItems(items, { drainNumbered: pairs }), []);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain('6673-forged');
+  });
+  it('bounds the trusted identity read by time and output size', () => {
     const exec = vi.fn(() => 'Trusted\0drain@example.test\0drain: JIT-number xabc123→#42 at land (#2288)\n');
     expect(trustedDrainAuthors({ cwd: '/clone', exec })).toEqual(new Set(['Trusted\0drain@example.test']));
-    expect(exec).toHaveBeenCalledWith('git', expect.arrayContaining(['--max-count=100', '--grep=^drain: JIT-number ']), expect.objectContaining({ timeout: 60000, maxBuffer: 4 * 1024 * 1024 }));
+    expect(exec).toHaveBeenCalledWith('git', ['log', '--grep=^drain: JIT-number ', '--format=%an%x00%ae%x00%s', 'origin/main'], expect.objectContaining({ timeout: 60000, maxBuffer: 4 * 1024 * 1024 }));
+    expect(trustedDrainAuthors({ exec: () => { throw new Error('history unavailable'); } })).toEqual(new Set());
   });
   it('returns final without locking or pushing when nothing needs doing', () => {
     const x = setup({ pending: false });

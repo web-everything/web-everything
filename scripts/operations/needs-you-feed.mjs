@@ -60,6 +60,10 @@ const sectionReasons = {
   rulingNeeded: 'review parked with confirmed findings — your block/card/not-real ruling',
   stoodDown: 'fix agent asked a question — your judgment; no label changed',
 };
+// Only these kinds can be represented (and therefore resolved by absence) in itemsFromReport.
+// Event-only escalations such as review-no-verdict and disk-space remain until acknowledged;
+// a successful queue read supplies no evidence that their independently owned condition resolved.
+const REPORT_KINDS = new Set(['needs-you', 'ruling-needed', 'at-round-limit', 'escalated', 'stood-down']);
 const shellArg = value => /^[\w/.:=-]+$/.test(String(value)) ? String(value) : `'${String(value).replace(/'/g, "'\\''")}'`;
 export function itemsFromReport(report) {
   const items = [];
@@ -125,20 +129,22 @@ function resolveCurrent(prev, items) {
   }
   return { current, carried, adopted, retired };
 }
-export function diffFeed(prevOpenKeys, items, now, { incomplete = items.incomplete } = {}) {
+export function diffFeed(prevOpenKeys, items, now, { incomplete = items.incomplete, clearKinds = null } = {}) {
   const at = new Date(now).toISOString(), prev = new Set(prevOpenKeys);
   const { current, carried, adopted, retired } = resolveCurrent(prev, items.map(sanitizeItem));
+  // A partial-scope publisher (clearKinds) never clears kinds it does not own; an incomplete read clears nothing.
+  const retained = new Set([...prev].filter(key => incomplete || (clearKinds && !clearKinds.has(fromKey(key).was))));
   const lines = [];
   for (const [key, item] of current) if (!prev.has(key) && !adopted.has(key)) {
     const event = { at, ...item };
     lines.push(`NEEDS-YOU ${item.repo}#${item.pr} ${item.kind}: ${item.reason}${item.title ? ` | title (untrusted): ${JSON.stringify(item.title)}` : ''}${item.pick || item.command ? ` | pick: ${item.pick || item.command}` : ''} ${JSON.stringify(event)}`);
   }
-  if (!incomplete) for (const key of prev) if (!current.has(key) && !carried.has(key) && !retired.has(key)) {
+  for (const key of prev) if (!retained.has(key) && !current.has(key) && !carried.has(key) && !retired.has(key)) {
     const event = { at, kind: 'cleared', ...sanitizeItem(fromKey(key)) };
     lines.push(`NEEDS-YOU-CLEARED ${event.repo}#${event.pr} left ${event.was} ${JSON.stringify(event)}`);
   }
-  // An adopted legacy head-less key is replaced by its known-head key; a carried key stays open as-is.
-  const kept = [...(incomplete ? prev : []), ...carried].filter(key => !retired.has(key));
+  // An adopted legacy head-less key is replaced by its known-head key; retained and carried keys stay open as-is.
+  const kept = [...retained, ...carried].filter(key => !retired.has(key));
   return { lines, openKeys: [...new Set([...kept, ...current.keys()])] };
 }
 export function parseFeedLine(line) {
@@ -231,7 +237,7 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
   return withFileLock(`${statePath}.lock`, () => {
     if (!owns()) return { lines: [], superseded: true };
     const prev = JSON.parse(readOptional(statePath, '{"openKeys":[]}'));
-    const result = diffFeed(prev.openKeys, items, now);
+    const result = diffFeed(prev.openKeys, items, now, { clearKinds: REPORT_KINDS });
     appendLines(path, result.lines);
     writeJsonAtomic(statePath, { openKeys: result.openKeys, lastRunAt: new Date(now).toISOString() });
     return result;

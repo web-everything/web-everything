@@ -5,36 +5,47 @@ size: 5
 priority: high
 parent: "5712"
 status: open
-blockedBy: ["5713"]
-scope: ["we:scripts/conveyor/load-flake-reverify.mjs", "we:scripts/conveyor/__tests__/load-flake-reverify.test.mjs", "we:scripts/lib/daemon-live-smoke.mjs", "we:scripts/lib/__tests__/daemon-live-smoke.test.mjs", "we:scripts/lib/daemon-rebuild/smoke.mjs", "we:scripts/lib/daemon-rebuild/smoke-classify/load-shaped.mjs", "we:skills-src/conveyor/daemon-manifest.mjs", "we:skills-src/conveyor/__tests__/daemon-manifest.test.mjs"]
+scope: ["we:scripts/conveyor/load-flake-reverify.mjs", "we:scripts/conveyor/__tests__/load-flake-reverify.test.mjs", "we:scripts/lib/daemon-live-smoke.mjs", "we:scripts/lib/__tests__/daemon-live-smoke.test.mjs", "we:scripts/lib/daemon-rebuild/smoke.mjs", "we:scripts/lib/daemon-rebuild/smoke-classify/load-shaped.mjs", "we:scripts/lib/__tests__/daemon-rebuild.test.mjs", "we:skills-src/conveyor/daemon-manifest.mjs", "we:skills-src/conveyor/__tests__/daemon-manifest.test.mjs", "we:scripts/conveyor/resource-sampler-daemon.mjs", "we:scripts/conveyor/__tests__/resource-sampler-daemon.test.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
 # Resource service slice 2: cut load-flake re-arm and daemon rebuild smoke over to admit()
 
-After slice 1's shadow log shows the new verdict is right, the load-flake reverify pass (we:scripts/conveyor/load-flake-reverify.mjs planLoadFlakeReverify 'host-load' deferral, today load average per core vs maxLoadPerCore) first gains its shadow call (its file was held by PR #4700 during slice 1), then decides through admit({kind:'load-flake-rearm'}); the rebuild smoke's hostLooksBusy and load-scaled budgets (we:scripts/lib/daemon-live-smoke.mjs) and the load-shaped env hold (we:scripts/lib/daemon-rebuild/smoke.mjs, held by PR #4712 during slice 1) decide through admit({kind:'rebuild-smoke'}). Register the sampler supervisor as a managed daemon in we:skills-src/conveyor/daemon-manifest.mjs (held by PR #4691 during slice 1). Old load-average branches stay only as the logged comparison until slice 4. Done when: tests pin the cut-over; LIVE proof — at load average above 9 with CPU idle above the policy floor, the reverify pass and a rebuild smoke proceed, with the log line naming the admit verdict.
+The load-flake and smoke admission cutover is already present, including high-load tests and rollback behavior. Finish the remaining managed-sampler registration and end-to-end proof, preserving the distinction between resource admission and smoke failure attribution: an unavailable sampler cannot itself excuse a failed smoke. Keep old load calculations as comparisons/explicit fallback, and retain the same-run differential before blaming an overlay. #5713 is resolved; no dependency edge is needed.
 
-## Acceptance
+## Done when
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+Commands use the Bash helper `we() { command "${@#we:}"; }` to strip repository prefixes from arguments.
 
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
-
-Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+- [A1] **Executable** — `we node we:scripts/readiness/heavy-admission.mjs run -- npx vitest run we:skills-src/conveyor/__tests__/daemon-manifest.test.mjs we:scripts/conveyor/__tests__/resource-sampler-daemon.test.mjs`: add a managed resource-sampler supervisor entry and a launch-contract test through the manifest. It fails while that entry is absent. Verify singleton/job recovery and that restarting the launcher does not create two active samplers; register the supervisor, not its resident job as a periodic independent pass.
+- [A2] `we node we:scripts/readiness/heavy-admission.mjs run -- npx vitest run we:scripts/conveyor/__tests__/load-flake-reverify.test.mjs we:scripts/lib/__tests__/daemon-live-smoke.test.mjs`: retain the already-present high-load/admit and quiet-load/hold regressions, log the actual verdict and kind, cover shadow disabled and explicit rollback. Missing/stale admission holds re-arm without writes; smoke unknown/error retains its established conservative fallback rather than treating unknown as proof of environmental failure.
+- [A3] `we node we:scripts/readiness/heavy-admission.mjs run -- npx vitest run we:scripts/lib/__tests__/daemon-rebuild.test.mjs`: pin that resource admission permits running a smoke, never adopting a failed tree. A load-shaped failure still uses the candidate/plain-main differential and backoff; source, docs, config and data failures cannot be waived just because load is high.
+- [A4] Capture a real reverify pass and rebuild smoke with load above 9, CPU idle above their configured floors and fresh snapshots; each proceeds and logs its admit verdict. Include sampler identity, snapshot age, relevant thresholds and actual outcomes. If those host conditions are unavailable, record the missing live proof rather than manufacturing load or claiming fixture output as live evidence.
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] No slice-4 removal of legacy comparison/fallback, threshold retuning, or changes to unrelated dispatch gates.
+- [N2] No bypass of smoke success, overlay differential or PR review authority.
 
 ## Edge cases this change must handle
 
-One line per class: either the handling, or `n/a: <why>`.
+1. **Untrusted text** — Keep PR/log text as data; verdict reasons cannot become commands or override flags.
+2. **Truncated reads** — Incomplete sampler JSON is unknown; failed/truncated smoke or forge reads remain failures, not permission to re-arm.
+3. **Shared state files** — Reuse sampler snapshot and job ownership/lease mechanisms; prevent duplicate supervisors from racing updates.
+4. **Fail closed** — Missing/stale data cannot release re-arm. Unknown host state cannot by itself excuse smoke failures or adopt an unproven tree.
+5. **Identity scoping** — Scope sampler to host/coordination root, re-arm to repo/PR/head, and smoke proof to candidate tree and harness.
+6. **State over time** — Re-read freshness at action time; restart reuses/reconciles sampler jobs and respects backoff and explicit rollback.
+7. **Who wrote it** — Only the managed sampler provides resource evidence; preserve existing provenance checks on PR holds and smoke outputs. No new HTTP receive endpoint is introduced.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+## Grounding
+
+- we:scripts/conveyor/load-flake-reverify.mjs:307 already resolves load-flake-rearm admission and respects cutover mode at line 311.
+- we:scripts/conveyor/__tests__/load-flake-reverify.test.mjs:442 covers high-load admission; line 458 covers wait/unknown without writes.
+- we:scripts/lib/daemon-live-smoke.mjs:179 reads admission with fallback; line 318 preserves legacy busy classification for unknown snapshots.
+- we:scripts/lib/__tests__/daemon-live-smoke.test.mjs:94 explicitly protects unknown-data fallback from laundering a hung probe into a skip.
+- we:scripts/lib/daemon-rebuild/smoke-classify/load-shaped.mjs:47 classifies failed rows; we:scripts/lib/daemon-rebuild/smoke.mjs:54 requires a full successful table for durable proof.
+- we:scripts/conveyor/resource-sampler-daemon.mjs:15 registers the resource-sample job; we:skills-src/conveyor/daemon-manifest.mjs:16 documents resident-singleton defaultLaunch handling. No resource-sampler entry is present in that manifest.
+- Commit `0cfeb71887` implements the resource slice-2 cutover; remaining work must preserve its existing behavior.
+
+Size 5: retain the existing cutover and finish managed-supervisor wiring plus focused integration and live evidence.
