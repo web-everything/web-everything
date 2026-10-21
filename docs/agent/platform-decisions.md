@@ -6463,10 +6463,13 @@ from its class list) and the drain's existing proof-of-land gate (base lands fir
    still pass for the new head. The auto-rebase clears both drain holds on the old base. It retargets the child PR to
    its repo's default branch (GitHub retargets only when a base merges), and it removes the closed base from the
    child's `stackParents` edge in every lane manifest the drain reads (the PR body, and the legacy head-ref file when
-   the body has none). The order is retarget, then push, so the new head's CI runs against the default branch; the
-   edge removal is last, only after the new base and the rebased head are both confirmed on the remote. If the
-   retarget or the removal fails, the child goes to the operator. A child sent to the operator is not retargeted and
-   keeps its edge. A later pass finishes or escalates a recovery that a crash interrupted.
+   the body has none). The handler holds the child's fix claim for the whole recovery, so the drain skips it
+   throughout. The order is retarget, then a push leased on the old head, so the new head's CI runs against the
+   default branch; the edge removal is last, only after the new base and the rebased head are both confirmed on the
+   remote. If the retarget, the push or the removal fails, the child goes to the operator. A child sent to the
+   operator keeps its edge and is never left targeting the default branch on its edge alone: it stays on, or is
+   retargeted back to, the closed base's branch, or is parked `review:human`. A later pass finishes or escalates a
+   recovery that a crash interrupted.
 6. **Free-scope.** The caller names the intended base PR (`--stack-on=<n>`); free-scope applies the matrix and excludes
    only PR holders in that chain, never agent-registry holders. A cell that may not stack still reports OCCUPIED.
 
