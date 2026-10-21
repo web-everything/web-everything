@@ -1,5 +1,4 @@
 ---
-bornAs: xqz26k1
 kind: story
 size: 5
 parent: "6386"
