@@ -170,7 +170,7 @@ import { operatorAnswerForStandDown } from './stand-down-answer-core.mjs';
 // module's `CONFLICT_LABEL`/`CONFLICT_LABEL_META` (`reconcile-fix-dispatch.mjs`) needs no edit either. See that
 // leaf's own header for the full reasoning and the original docblock this text used to carry.
 import { CONFLICT_LABEL, CONFLICT_LABEL_META } from './conflict-label.mjs';
-import { readInCardGroup } from '../lib/card-group.mjs';
+import { readInCardGroup, readCardGroupStateUnreadable } from '../lib/card-group.mjs';
 import { loadSameLineConflictSetting } from './conflict-watch-same-line.mjs';
 // Card xkugvzd — the idle re-assert for an already-labelled, still-conflicting `review:human` PR (live: #4481).
 import { CONFLICT_REASSERT_OFF, decideConflictReassert, resolveConflictReassertSettings } from './conflict-reassert-rule.mjs';
@@ -1363,6 +1363,7 @@ export function defaultPostConflictRearm({ pr, repo, exec = execFileSync }) {
 export function watchParkedPrConflicts({
   repo = null, listPrs = defaultListParkedPrs, provider = createGhProvider(), dryRun = false,
   inCardGroupFn = readInCardGroup, // xym8nt4 — open card-group members are the drain grouping's to handle
+  cardGroupStateUnreadable = () => readCardGroupStateUnreadable(), // membership unknown → hold (fail closed)
   sameLineConflict = loadSameLineConflictSetting().value,
   postFinding = defaultPostConflictFinding, postStandDown = defaultPostConflictStandDown,
   postRearm = defaultPostConflictRearm,
@@ -1404,15 +1405,21 @@ export function watchParkedPrConflicts({
   // the provider's `currentRepo()` exists exactly for this ("fires only when `--repo` was omitted", its own
   // docblock) and was simply never called here.
   let resolvedRepo = repo;
-  let resolveTried = false;
+  let membershipChecked = false;
+  let membershipUnknown = null;
   for (const pr of Array.isArray(prs) ? prs : []) {
-    // Group ownership needs the default repo before any routing. Resolved once per sweep; an empty, null or failed
-    // resolution FAILS CLOSED: the PR is held this sweep (an empty repo would read every PR as "not a group member").
-    if (!resolvedRepo && !resolveTried) {
-      resolveTried = true;
-      try { resolvedRepo = provider.currentRepo() || null; } catch { resolvedRepo = null; }
+    // Group ownership needs the default repo and a readable group state before any routing. Both are checked once
+    // per sweep; an empty, null or failed repo resolution, or an unreadable state, FAILS CLOSED: every PR is held
+    // this sweep (either would read every PR as "not a group member" and route an open group's PRs).
+    if (!membershipChecked) {
+      membershipChecked = true;
+      if (!resolvedRepo) { try { resolvedRepo = provider.currentRepo?.() || null; } catch { resolvedRepo = null; } }
+      let unreadable = true;
+      try { unreadable = cardGroupStateUnreadable() === true; } catch { /* unreadable */ }
+      membershipUnknown = !resolvedRepo ? 'repository unresolved' : unreadable ? 'card-group state unreadable' : null;
+      if (membershipUnknown) process.stderr.write(`parked-pr-conflict-watch: ${prs.length} PR(s) held — ${membershipUnknown}, card-group membership unknown (fail closed)\n`);
     }
-    if (!resolvedRepo) { process.stderr.write(`parked-pr-conflict-watch: #${pr?.number} held — repository unresolved, card-group membership unknown (fail closed)\n`); continue; }
+    if (membershipUnknown) continue;
     // xym8nt4 — a post-approval card group's sources and combined PR belong to the drain's grouping while the
     // group is open: it dissolves the group on a conflict and returns the sources to the normal path, where
     // this watch applies again. A send-back here would strip the combined PR's review instead.

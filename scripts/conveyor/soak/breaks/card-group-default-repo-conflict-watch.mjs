@@ -15,7 +15,7 @@ export default {
     // The original line, or its fail-closed successor (card-group-unresolved-repo-conflict-watch).
     const text = readFileSync(join(root, this.fixedBy.paths[0]), 'utf8');
     return text.includes('resolvedRepo ??= provider.currentRepo(); // group ownership')
-      || text.includes('resolvedRepo = provider.currentRepo() || null;');
+      || text.includes('card-group membership unknown (fail closed)');
   },
   async run({ sourceRoot } = {}) {
     const root = sourceRoot ?? resolve(fileURLToPath(import.meta.url), '../../../../..');

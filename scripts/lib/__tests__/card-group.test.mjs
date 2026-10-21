@@ -275,6 +275,20 @@ describe('cardGroupHold / state', () => {
   });
 
   const state = { groups: [{ id: 'g1', repo: 'o/r', pr: 9, sources: [{ num: 5, headSha: 'a'.repeat(40) }] }], failed: {} };
+  it.each([
+    ['a URL', 'https://github.com/O/R.git'], ['an ssh remote', 'git@github.com:o/r.git'], ['a host prefix', 'github.com/o/r'],
+    ['a trailing slash and case', ' O/R/ '],
+  ])('one repository spelled as %s is the same repository (membership and hold)', (_, spelling) => {
+    const st = { groups: [{ id: 'g', repo: 'o/r', pr: 9, branch: 'lane/card-group-g', sources: [{ num: 5, headSha: 'a'.repeat(40) }] }] };
+    expect(inCardGroup(st, { num: 5, repo: spelling })).toBe(true);
+    expect(cardGroupHold(st, { num: 5, repo: spelling })).toMatchObject({ kind: 'card-grouped' });
+  });
+  it('a legacy owner or a repo key reaches the current slug', () => {
+    const st = { groups: [{ id: 'g', repo: 'web-everything/web-everything', pr: 9, sources: [{ num: 5 }] }] };
+    for (const spelling of ['chalbert/webeverything', 'we', 'https://github.com/chalbert/webeverything.git'])
+      expect(inCardGroup(st, { num: 5, repo: spelling }), spelling).toBe(true);
+    expect(inCardGroup(st, { num: 5, repo: 'web-everything/frontierui' })).toBe(false);
+  });
   it('holds a source, not a stranger, not another repo', () => {
     expect(cardGroupHold(state, { num: 5, repo: null, localSlug: 'o/r' })).toMatchObject({ kind: 'card-grouped', reason: expect.stringContaining('#9') });
     expect(cardGroupHold(state, { num: 6, repo: null, localSlug: 'o/r' })).toBeNull();
@@ -815,6 +829,24 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       expect(r.plan.sources.map(s => s.num)).toEqual([1, 3]);
       expect(r.proof.ok).toBe(true);
       expect(t.out.join('')).toMatch(/#2 left out of the group \(union check failed \(missing 1/);
+    });
+
+    it('a dissolved group formed from a TRIMMED plan is not rebuilt from the wider plan (memo checked per built set)', () => {
+      // #3 conflicts outside the list, so the plan {1,2,3} forms {1,2}. After {1,2} dissolves, the next form()
+      // plans {1,2,3} again: the memo for {1,2} must still stop the rebuild.
+      const t = formRepo({ 1: card([1, 2, 10], 'active'), 2: card([1, 2, 11]), 3: card([1, 2, 12], 'resolved') });
+      const statePath = join(tmp(), 's.json');
+      let closed = false;
+      const exec = (cmd, args) => (closed && args[0] === 'pr' && args[1] === 'view' && args[2] === '77' ? JSON.stringify({ state: 'CLOSED', labels: [] }) : t.exec(cmd, args));
+      const g = createCardGrouping({ ...t.opts, exec, statePath, withLock: fn => ({ ran: true, result: fn() }) });
+      const first = g.form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      expect(first.formed?.sources.map(s => s.num)).toEqual([1, 2]);
+      closed = true;
+      expect(g.reconcile({ force: true }).dissolved).toHaveLength(1);
+      const creates = t.calls.filter(c => c.startsWith('pr create')).length;
+      expect(g.form({ outcomes: t.outcomes, verdicts: t.verdicts }).reason).toMatch(/#1,#2 is in retry backoff/);
+      expect(t.calls.filter(c => c.startsWith('pr create'))).toHaveLength(creates);
+      expect(readGroupState(statePath).groups).toEqual([]);
     });
 
     it('leaving out the only offender of two forms nothing, memos the original set, and backs off', () => {

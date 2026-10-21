@@ -177,6 +177,30 @@ describe('the real incident that motivated this pass — WE PR #1920, captured l
     expect(provider.currentRepo).toHaveBeenCalledTimes(1);
   });
 
+  it('xym8nt4: an unreadable card-group state (membership unknown) holds every PR — fail closed, no effect', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'conflict-watch-group-'));
+    const statePath = join(dir, 'groups.json');
+    writeFileSync(statePath, '{broken');
+    vi.stubEnv('WE_DRAIN_CARD_GROUP_STATE', statePath);
+    try {
+      const provider = { currentRepo: vi.fn(() => 'resolved/repo'), ensureLabel: vi.fn(), setLabels: vi.fn(), postComment: vi.fn() };
+      const postFinding = vi.fn(), postStandDown = vi.fn();
+      const results = watchParkedPrConflicts({ repo: 'web-everything/web-everything', sameLineConflict: 'stand-down', provider, postFinding, postStandDown,
+        listPrs: () => [REAL_1920_SNAPSHOT] });
+      expect(results).toEqual([]);
+      for (const effect of [provider.ensureLabel, provider.setLabels, provider.postComment, postFinding, postStandDown])
+        expect(effect).not.toHaveBeenCalled();
+      // A readable state with no group lets the same PR through (the hold is only for "unknown").
+      writeFileSync(statePath, JSON.stringify({ groups: [], failed: {} }));
+      watchParkedPrConflicts({ repo: 'web-everything/web-everything', sameLineConflict: 'stand-down', provider, postFinding, postStandDown, ...noopRouting(),
+        listPrs: () => [REAL_1920_SNAPSHOT] });
+      expect(provider.setLabels).toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('once the PR is rebased clean (as #1920 actually was, mid-investigation) the label self-clears', () => {
     const healed = { ...REAL_1920_SNAPSHOT, mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', labels: [...REAL_1920_SNAPSHOT.labels, { name: CONFLICT_LABEL }] };
     const calls = [];

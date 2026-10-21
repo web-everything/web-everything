@@ -57,6 +57,7 @@ import { isCardPath, isCardOnlyDiff } from '../ci-card-only.mjs';
 import { resolveRaisedByConflict, loadCardConflictSettings } from './card-conflict-resolve.mjs';
 import { mapHashReferences } from '../backlog/id.mjs';
 import { bornAsIndexFromItems } from '../conveyor/queue-store.mjs';
+import { CONSTELLATION_REPOS, canonicalizeSlug, repoKeyForSlug } from './constellation-repos.mjs';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 
@@ -66,7 +67,14 @@ export const CARD_GROUP_TRAILER = 'Co-Authored-By: Claude Opus 5.5 (1M context) 
 const SHA = /^[0-9a-f]{40}$/;
 const firstLine = e => String(e?.message ?? e ?? '').split('\n')[0];
 const labelNames = labels => (Array.isArray(labels) ? labels : []).map(l => (typeof l === 'string' ? l : l?.name)).filter(Boolean);
-const repoIdentity = repo => String(repo ?? '').trim().toLowerCase();
+// One spelling per repository: a URL/host prefix and `.git` are dropped, a known key (`we`) or a legacy
+// `chalbert/<repo>` maps to the current slug, and case is folded. Otherwise the same repo reads as a different one.
+const repoIdentity = repo => {
+  const s = String(repo ?? '').trim()
+    .replace(/^(?:[a-z+]+:\/\/)?(?:[^@/]+@)?github\.com[/:]/i, '').replace(/\.git$/i, '').replace(/\/+$/, '');
+  const key = s ? repoKeyForSlug(s) : null;
+  return (key ? CONSTELLATION_REPOS[key].slug : canonicalizeSlug(s)).toLowerCase();
+};
 const sameRepo = (a, b) => !!repoIdentity(a) && repoIdentity(a) === repoIdentity(b);
 
 export function cardGroupStatePath(env = process.env) { return join(resolveCoordinationRoot({ env }), 'drain-card-groups.json'); }
@@ -516,6 +524,15 @@ export function readInCardGroup({ num, repo, localSlug, headRef = null, env = pr
   return inCardGroup(readGroupState(path), { num, repo, localSlug, headRef });
 }
 
+/**
+ * IO: the shared state exists but cannot be read, so membership is UNKNOWN. A caller whose wrong guess would act on
+ * a group member (the conflict watch's send-back) holds on this; a missing file or no state path is not unknown.
+ */
+export function readCardGroupStateUnreadable({ env = process.env } = {}) {
+  const path = resolveCardGroupStatePath(env);
+  return !!path && existsSync(path) && readGroupState(path).unreadable === true;
+}
+
 /** PURE: a queue read blocks a group when any entry is a source, shares a group file, or has an unknown file list. */
 export function queueBlocksGroup(queue, { sources, files }) {
   if (!queue || queue.error || !Array.isArray(queue.entries)) return `merge queue unreadable (${queue?.error ?? 'no result'})`;
@@ -869,6 +886,10 @@ export function createCardGrouping({
         const leftOut = [];
         let built, proof, id;
         for (;;) {
+          // The memo is written for the set that actually formed (or failed); a trimmed or re-planned set must be
+          // checked too, or a dissolved {A,B} would be rebuilt every pass from the wider plan {A,B,C}.
+          if (st.failed?.[sourceSetKey(p.sources)] > now() - setting.retryMin * 60_000)
+            return { reason: `group of ${p.sources.map(x => `#${x.num}`).join(',')} is in retry backoff (dissolved or failed recently)` };
           id = groupId(p.sources);
           const msg = s => `card-group ${id}: apply #${s.num} (${s.headSha.slice(0, 12)})\n\nPost-approval card grouping (drain.group, card xym8nt4).\n\n${CARD_GROUP_TRAILER}\n`;
           built = buildCombined({ base, sources: p.sources, cwd, run, env, resolveEnabled: cc.enabled, referenceMap: refs.map, message: msg });
