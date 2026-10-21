@@ -225,7 +225,9 @@ describe('numbering carry referral evidence', () => {
       const warm = readReviewRunHeads({ dir, memo: new Map(), readRun: () => { throw Error('cache miss'); } });
       expect(cold).toEqual([{ id: LIVE_RUN, repo, pr, head: TO }]);
       expect(warm).toEqual(cold);
-      expect(evidence).toEqual([]);
+      // Main (#5765): an unfinished run is evidence only as an INCOMPLETE, pending attempt — never a clean review.
+      expect(evidence).toEqual([expect.objectContaining({ id: LIVE_RUN, head: TO, incomplete: true, completedAt: null,
+        attempted: false, pending: ['review-incomplete'] })]);
       expect(readdirSync(dir).filter(n => n.endsWith('.cache')).sort())
         .toEqual(['.review-run-evidence.cache', '.review-run-heads.cache']);
     });
@@ -337,7 +339,10 @@ describe('numbering carry referral evidence', () => {
       expect(byId(readReviewRunHeads({ dir, memo: new Map(), persist: false }))).toEqual({
         [LIVE_RUN]: undefined, 'review-pr-custom-live': true, [PRIOR_RUN]: undefined, 'review-pr-custom-prior': true });
       expect(byId(readReviewRunEvidence({ dir, memo: new Map(), persist: false })))
-        .toEqual({ [PRIOR_RUN]: undefined, 'review-pr-custom-prior': true });
+        .toEqual({ [PRIOR_RUN]: undefined, 'review-pr-custom-prior': true, [LIVE_RUN]: undefined, 'review-pr-custom-live': true });
+      // Main (#5765): the unfinished runs appear only as incomplete, pending attempts — never clean evidence.
+      expect(readReviewRunEvidence({ dir, memo: new Map(), persist: false }).filter(r => r.head === TO)
+        .every(r => r.incomplete && r.pending.includes('review-incomplete'))).toBe(true);
       expect(isMintedReviewRunId(newRunId('review-pr'))).toBe(true);
     });
     it('still carries numbering evidence when no run reviewed the live head', () => {
