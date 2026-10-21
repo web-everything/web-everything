@@ -5,6 +5,8 @@
  * projections) as captured at 2026-10-21T17:30Z.
  */
 import { describe, expect, it, vi } from 'vitest';
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -123,6 +125,19 @@ describe('live replays: each PR is paused today, and every live-head finding is 
     }
     expect(log.mock.calls.map(c => c[0]).filter(l => l.includes(REFERRAL_HOLD_AUTO_RESOLVED)))
       .toEqual([`review-daemon: referral-hold auto-resolved {"repo":"${repo}","pr":5773,"head":"${FX[5773].headRefOid}","outcome":"resume","counts":{"not-real":3},"next":"advisory-review"}`]);
+  });
+
+  it('#5773: a resumed review that DIES before advise (no finished run, no advisory) is not resumed again', () => {
+    const fx = FX[5773];
+    const last = fx.runs.filter(r => r.head === fx.headRefOid).sort((x, y) => x.completedAt - y.completedAt).at(-1);
+    const died = { id: `${last.id}-died`, repo, pr: 5773, head: fx.headRefOid, startedAt: last.completedAt + 60_000, completedAt: null,
+      incomplete: true, parked: false, attempted: false, persistenceFailed: false, count: 0, pending: ['review-incomplete'], rulings: [] };
+    const [held] = enrichPrsWithReferralHolds([asPr(fx)], { repo, readRuns: () => [...fx.runs, died], now: Date.parse(fx.capturedAt), env: {} });
+    expect(held.referralHold).toMatchObject({ kind: 'same-head', count: 1, attemptsSinceWake: 2 });
+    const [pr] = enrichPrsWithReferralHoldAutoResolve([held], { repo, env: {}, decide: (q, h) => decide(q, h) });
+    const p = plan(pr);
+    expect(p.dispatch).toEqual([]);
+    expect(p.refusals[0].referralHoldAutoResolve).toMatchObject({ outcome: 'stay' });
   });
 
   it('#5773: a SECOND finished review that still leaves no advisory keeps the pause (no panel per tick)', () => {
@@ -313,6 +328,28 @@ describe('fail closed: anything unproven keeps the pause, and says why', () => {
     expect(decide(asPr(f, noCarry), hold).outcome).toBe('stay');
   });
 
+  it('a carry whose live-head key differs from its source key still counts (the backing is keyed by the source)', () => {
+    const f = FX[5800];
+    const rec = liveRecord(f);
+    const carry = rec.carried[0];
+    const comments = f.comments.map(c => {
+      const m = /<!-- mandatory-referrals-v1: (\S+) -->/.exec(c.body);
+      if (!m) return c;
+      const record = JSON.parse(decodeURIComponent(m[1]));
+      if (record.head !== f.headRefOid) return c;
+      const ref = record.referrals.find(x => x.key === carry.key);
+      const k = JSON.parse(ref.key); k[3] = `${k[3]}!`;
+      const key = JSON.stringify(k);
+      const referrals = record.referrals.map(x => (x.key === carry.key ? { ...x, key,
+        finding: { ...x.finding, summary: `${x.finding.summary}!` }, ...(x.original ? { original: { ...x.original, summary: `${x.original.summary}!` } } : {}) } : x));
+      return { ...c, body: c.body.replace(m[1], encodeURIComponent(JSON.stringify({ ...record, referrals,
+        carried: record.carried.map(x => (x.key === carry.key ? { ...x, key } : x)) }))) };
+    });
+    const gate = liveReferralState(asPr(f, comments), { repo, pr: 5800, cardReadable: noCards });
+    expect(gate).toMatchObject({ pending: [], blocked: [], malformed: false });
+    expect(decide(asPr(f, comments), { kind: 'same-head', head: f.headRefOid, count: 1 })).toMatchObject({ outcome: 'resume', counts: { 'not-real': 2 } });
+  });
+
   it('a superseded advisory duplicate the gate backs reads as the not-real that replaced it', () => {
     const rec = liveRecord(fx);
     const orig = rec.referrals[0];
@@ -371,6 +408,20 @@ describe('policy: referralHoldAutoResolve is a setting (value and source logged)
     expect(r.sources).toMatchObject({ enabled: 'env', onBlock: 'env' });
     expect(r.sources.onClean).not.toBe('env');
   });
+  it('a malformed (object) value in the tool layer never overrides a valid platform kill switch', () => {
+    const { mkdtempSync, writeFileSync, rmSync } = require('node:fs');
+    const { tmpdir } = require('node:os');
+    const dir = mkdtempSync(join(tmpdir(), 'rhar-'));
+    try {
+      const file = join(dir, 'platform-preferences.json');
+      writeFileSync(file, JSON.stringify({ referralHoldAutoResolve: { enabled: false, onClean: 'pause' } }));
+      const r = resolveReferralHoldAutoResolve({ WE_PLATFORM_PREFERENCES_FILE: file },
+        { tool: { enabled: { nested: true }, onClean: { nested: 'resume' } }, log: () => {} });
+      expect(r.value).toMatchObject({ enabled: false, onClean: 'pause' });
+      expect(r.sources).toMatchObject({ enabled: 'platform', onClean: 'platform' });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('enabled=false is today\'s pause exactly: no answer, the plan refuses review-referrals-pending as before', () => {
     const settings = { value: { enabled: false, onBlock: 'send-back', onClean: 'resume' }, sources: { enabled: 'env' } };
     expect(decide(asPr(fx), hold, { settings })).toBeNull();

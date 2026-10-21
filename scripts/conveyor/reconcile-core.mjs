@@ -2105,9 +2105,11 @@ export function planReconcile({
     if (auto?.outcome !== 'resume' || !hold || auto.head !== pr.headRefOid || hold.kind !== 'same-head'
       || hold.head !== pr.headRefOid || hold.noVerdict || !labelNames(pr.labels).includes(REVIEW_LABELS.human)
       || advisoryHeadState(pr).advisoryIsCurrent) return pr;
-    if (hold.count !== 1) {
+    // Every attempt since the wake counts, finished or not (a review that dies before `advise` is an attempt too).
+    const attempts = Number.isInteger(hold.attemptsSinceWake) ? hold.attemptsSinceWake : hold.count;
+    if (hold.count !== 1 || attempts !== 1) {
       return { ...pr, referralHoldAutoResolve: { ...auto, outcome: 'stay',
-        why: `head reviewed ${hold.count} time(s) and the PR still carries no advisory for it: the review's write-back fails` } };
+        why: `head reviewed ${attempts} time(s) and the PR still carries no advisory for it: the review's write-back fails` } };
     }
     const resolved = { ...auto, next: 'advisory-review' };
     notes.push({ kind: 'referral-hold-auto-resolved', prNumber: Number(pr.number), head: pr.headRefOid, outcome: 'resume',

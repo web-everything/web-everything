@@ -17,7 +17,7 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
 import { resolveReferralSafetySettings } from '../lib/review-settings.mjs';
 import { parseLatestHumanClearedSha, parseReviewedSha } from '../lib/review-escalation.mjs';
-import { cascadePolicy } from '../lib/policy-cascade.mjs';
+import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { createActionStore } from '../operations/action-store.mjs';
@@ -423,7 +423,10 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   const why = `${REFERRAL_HOLD_MARKER} head ${head.slice(0, 9)} was already reviewed ${count} time(s); it resumes on a new push or an explicit re-arm`
     + (noVerdict ? ` (no verdict ever landed on the PR for those runs, and the ${VERDICT_RETRY_EXTRA} automatic re-runs are spent: a person must look at why the review's write-back fails)` : '')
     + (retryAt !== null ? `; the next automatic re-run is due at ${new Date(retryAt).toISOString()}` : '');
-  return { kind: 'same-head', head, episode: hash([repo, pr.number, head, wake, 'same-head']), count,
+  // stale-hold-resume — every attempt since the wake, finished or not: the resume-once bound must count a review that
+  // died before `advise` too, or a failing review would be resumed every tick.
+  const attemptsSinceWake = history.filter(r => Number.isFinite(r.startedAt) && r.startedAt >= wake).length;
+  return { kind: 'same-head', head, episode: hash([repo, pr.number, head, wake, 'same-head']), count, attemptsSinceWake,
     why, retryAt, persistenceFailed: false, exhausted: false,
     ...(noVerdict ? { noVerdict: { exhausted: noVerdictExhausted, releasesSpent: Math.max(0, Math.min(spent, releases)),
       releases, source: retry?.source ?? 'standard' } } : {}) };
@@ -553,8 +556,17 @@ export function resolveReferralHoldAutoResolve(env = process.env, { tool, log } 
     }
     const raw = name => { const v = env?.[name]; return v == null || String(v).trim() === '' ? undefined : String(v).trim(); };
     const enabledRaw = raw('WE_REFERRAL_HOLD_AUTO_RESOLVE');
-    const r = cascadePolicy('referralHoldAutoResolve', block && typeof block === 'object' && !Array.isArray(block)
-      ? { enabled: block.enabled, onBlock: block.onBlock, onClean: block.onClean } : undefined, {
+    // Only valid scalar leaves enter the cascade: a malformed value (an object, a typo) in one layer is dropped there,
+    // so the layer below still decides — and the cascade log names exactly what decided.
+    const clean = layer => {
+      if (!layer || typeof layer !== 'object' || Array.isArray(layer)) return undefined;
+      const out = {};
+      for (const k of Object.keys(AUTO_RESOLVE_VALID)) if (AUTO_RESOLVE_VALID[k](layer[k])) out[k] = layer[k];
+      return Object.keys(out).length ? out : undefined;
+    };
+    let platform;
+    try { platform = platformPreference('referralHoldAutoResolve', { env: env ?? {} }); } catch { platform = undefined; }
+    const r = cascadePolicy('referralHoldAutoResolve', clean(block), { platform: clean(platform) ?? {},
       env: env ?? {}, standard: REFERRAL_HOLD_AUTO_RESOLVE_STANDARD, valid: AUTO_RESOLVE_VALID, ...(log ? { log } : {}),
       envValues: { enabled: enabledRaw === '0' ? false : enabledRaw === '1' ? true : enabledRaw,
         onBlock: raw('WE_REFERRAL_HOLD_AUTO_RESOLVE_ON_BLOCK'), onClean: raw('WE_REFERRAL_HOLD_AUTO_RESOLVE_ON_CLEAN') },
@@ -621,6 +633,11 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
     if (state.pending.length) return stay(`the live-head record ${record.runId} still holds ${state.pending.length} finding(s) pending`);
     for (const f of activeReferrals(record)) {
       let ruling = state.rulings.filter(r => r.key === f.key).at(-1);
+      // A carry the gate backed returns the SOURCE finding's ruling, keyed by the source key (`carried.from.key`).
+      const carry = (record.carried ?? []).find(c => c.key === f.key);
+      if (!ruling && carry && !(record.rulings ?? []).some(r => r.key === f.key)) {
+        ruling = state.rulings.filter(r => r.key === carry.from?.key).at(-1);
+      }
       const where = { file: f.finding?.file ?? null, line: Number.isInteger(f.finding?.line) ? f.finding.line : null };
       // A `superseded` entry the gate backed (a same-head not-real on the finding that replaced it) clears the finding
       // without adding a ruling of its own: it reads as that not-real. The gate already refused an unbacked one.
@@ -631,8 +648,7 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
       if (!RULING_RESULTS.has(ruling.result)) return stay(`finding ${findingLoc(where)} carries an unknown ruling (${ruling.result})`);
       // An operator ruling counts only on the exact head it names, unless it is the backing of a carry the gate
       // accepted onto THIS head's record (the carry entry is the live-head proof; the backing names its source head).
-      const carried = (record.carried ?? []).some(c => c.key === f.key);
-      if (ruling.operator && ruling.head !== head && !carried) return stay(`finding ${findingLoc(where)} is ruled for a different head (${String(ruling.head).slice(0, 9)})`);
+      if (ruling.operator && ruling.head !== head && !carry) return stay(`finding ${findingLoc(where)} is ruled for a different head (${String(ruling.head).slice(0, 9)})`);
       findings.push({ runId: record.runId, key: f.key, seat: f.seat ?? null, ...where,
         summary: String(f.finding?.summary ?? '').replace(/\s+/g, ' ').trim(), result: ruling.result,
         actor: ruling.operator ? ruling.actor : 'reviewer', rationale: ruling.rationale ?? ruling.reason ?? '' });
