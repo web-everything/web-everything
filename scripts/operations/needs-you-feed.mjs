@@ -60,6 +60,10 @@ const sectionReasons = {
   rulingNeeded: 'review parked with confirmed findings — your block/card/not-real ruling',
   stoodDown: 'fix agent asked a question — your judgment; no label changed',
 };
+// Only these kinds can be represented (and therefore resolved by absence) in itemsFromReport.
+// Event-only escalations such as review-no-verdict and disk-space remain until acknowledged;
+// a successful queue read supplies no evidence that their independently owned condition resolved.
+const REPORT_KINDS = new Set(['needs-you', 'ruling-needed', 'at-round-limit', 'escalated', 'stood-down']);
 const shellArg = value => /^[\w/.:=-]+$/.test(String(value)) ? String(value) : `'${String(value).replace(/'/g, "'\\''")}'`;
 export function itemsFromReport(report) {
   const items = [];
@@ -93,18 +97,19 @@ function fromKey(key) {
   if (!m) throw new Error(`needs-you-feed: invalid state key ${key}`);
   return { repo: m[1], pr: Number(m[2]), head: m[3], was: m[4] };
 }
-export function diffFeed(prevOpenKeys, items, now, { incomplete = items.incomplete } = {}) {
+export function diffFeed(prevOpenKeys, items, now, { incomplete = items.incomplete, clearKinds = null } = {}) {
   const at = new Date(now).toISOString(), prev = new Set(prevOpenKeys), current = new Map(items.map(sanitizeItem).map(i => [keyOf(i), i]));
+  const retained = new Set([...prev].filter(key => incomplete || (clearKinds && !clearKinds.has(fromKey(key).was))));
   const lines = [];
   for (const [key, item] of current) if (!prev.has(key)) {
     const event = { at, ...item };
     lines.push(`NEEDS-YOU ${item.repo}#${item.pr} ${item.kind}: ${item.reason}${item.title ? ` | title (untrusted): ${JSON.stringify(item.title)}` : ''}${item.pick || item.command ? ` | pick: ${item.pick || item.command}` : ''} ${JSON.stringify(event)}`);
   }
-  if (!incomplete) for (const key of prev) if (!current.has(key)) {
+  for (const key of prev) if (!retained.has(key) && !current.has(key)) {
     const event = { at, kind: 'cleared', ...sanitizeItem(fromKey(key)) };
     lines.push(`NEEDS-YOU-CLEARED ${event.repo}#${event.pr} left ${event.was} ${JSON.stringify(event)}`);
   }
-  return { lines, openKeys: [...new Set([...(incomplete ? prev : []), ...current.keys()])] };
+  return { lines, openKeys: [...new Set([...retained, ...current.keys()])] };
 }
 export function parseFeedLine(line) {
   if (!/^NEEDS-YOU(?:-CLEARED)? /.test(line)) return null;
@@ -194,7 +199,7 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
   return withFileLock(`${statePath}.lock`, () => {
     if (!owns()) return { lines: [], superseded: true };
     const prev = JSON.parse(readOptional(statePath, '{"openKeys":[]}'));
-    const result = diffFeed(prev.openKeys, items, now);
+    const result = diffFeed(prev.openKeys, items, now, { clearKinds: REPORT_KINDS });
     appendLines(path, result.lines);
     writeJsonAtomic(statePath, { openKeys: result.openKeys, lastRunAt: new Date(now).toISOString() });
     return result;
