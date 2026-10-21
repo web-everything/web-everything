@@ -6462,9 +6462,9 @@ from its class list) and the drain's existing proof-of-land gate (base lands fir
    here too. Rebase grants no `review:accepted` label or carried approval; review, CI and proof-of-land gates must
    still pass for the new head. The auto-rebase clears both drain holds on the old base. It retargets the child PR to
    its repo's default branch (GitHub retargets only when a base merges), and it removes the closed base from the
-   child's `stackParents` edge in every lane manifest the drain reads (the PR body, and the legacy head-ref file when
-   the body has none). The handler holds the child's fix claim for the whole recovery, so the drain skips it
-   throughout. The order is retarget, then a push leased on the old head, so the new head's CI runs against the
+   child's `stackParents` edge in the PR-body lane manifest, after first copying a legacy head-ref manifest into the
+   body with the edge intact (the drain reads the body first). The handler holds the child's fix claim for the whole
+   recovery, and the edge it keeps until last stops the drain landing the child mid-recovery. The order is retarget, then a push leased on the old head, so the new head's CI runs against the
    default branch; the edge removal is last, only after the new base and the rebased head are both confirmed on the
    remote. If the retarget, the push or the removal fails, the child goes to the operator. A child sent to the
    operator keeps its edge and is never left targeting the default branch on its edge alone: it stays on, or is

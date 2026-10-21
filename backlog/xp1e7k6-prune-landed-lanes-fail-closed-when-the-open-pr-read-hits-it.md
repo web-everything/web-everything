@@ -1,7 +1,7 @@
 ---
 kind: story
 size: 2
-status: active
+status: open
 scaffoldedBy: "fix-5530"
 dateScaffolded: "2026-10-21"
 scope: ["we:scripts/prune-landed-lanes.mjs"]
@@ -11,28 +11,27 @@ tags: []
 
 # prune-landed-lanes: fail closed when the open-PR read hits its --limit 200 cap
 
-The prune keeps any lane branch an open PR targets (or heads), but its open-PR read uses gh pr list --limit 200 with no truncation check. With more than 200 open PRs, a branch an open stacked PR targets can be missed and deleted, and GitHub then closes that PR and refuses retarget or reopen (#2578). Slice 4 of the stacked-PR policy (x44bz7l, PR #5530) relies on this protection for a closed base's branch. Fix: treat a read that returns exactly the limit as truncated and withhold every delete that pass (fail closed), with a test.
+The prune keeps any lane branch an open PR targets (or heads), but its open-PR read uses `gh pr list --limit 200` with no truncation check. With more than 200 open PRs, a branch an open stacked PR targets can be missed and deleted. GitHub then closes that PR and refuses both a retarget and a reopen (#2578). Found while repairing web-everything/web-everything#5530 (stacked-PR policy slice 4, x44bz7l).
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
-
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
-
-Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+- [A1] **Executable** — `npm run test:unit -- we:scripts/__tests__/prune-landed-lanes.test.mjs` fails before and passes after. Named tests:
+  - `open-PR read: a listing that returns exactly the limit is treated as truncated and every delete that pass is withheld`.
+  - `open-PR read: a listing below the limit keeps today's behaviour (a branch no open PR heads or targets is deleted)`.
+  - `open-PR read: a failed listing withholds every delete that pass` (today's fail-closed path, pinned).
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] Does not change which branches count as landed (the content check) or the near-miss comment.
 
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — n/a: the read uses PR numbers and ref names from the API, not PR text.
+2. **Truncated reads** — a listing at the limit is truncated: withhold every delete that pass.
+3. **Shared state files** — n/a: adds no file; the only write stays the ref delete.
+4. **Fail closed** — a truncated or failed read deletes nothing.
+5. **Identity scoping** — n/a: unchanged; the read stays scoped to the repo being pruned.
+6. **State over time** — the pre-delete re-read is checked the same way as the sweep-start read.
+7. **Who wrote it** — n/a: no comment or label is read.
