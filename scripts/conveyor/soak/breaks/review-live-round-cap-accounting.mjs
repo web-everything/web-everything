@@ -15,7 +15,7 @@ export default {
   fixedBy: { sha: 'HEAD', where: 'lane/review-live-round-count-argv', paths: [SOURCE] },
   fixPresent(root) {
     const source = readFileSync(join(root, SOURCE), 'utf8');
-    return source.includes('remainingReviewCapacity') && source.includes('hasJobAncestor');
+    return source.includes('remainingReviewCapacity') && source.includes('jobAncestorOf');
   },
   async run() {
     const root = process.env.SOAK_TREE_ROOT || fileURLToPath(new URL('../../../../', import.meta.url));
