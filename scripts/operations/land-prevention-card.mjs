@@ -406,6 +406,9 @@ export async function drainPendingPrevention({ lane }, {
   let started = 0;
   for (const name of entries) {
     if (now() >= deadlineAt) break;
+    // The allowance is spent BEFORE any per-card work (parse, ls-tree, admission): a lookup that throws still counts as an attempt,
+    // so a failing spool cannot be walked card by card past the cap.
+    if (counter ? counter.left-- <= 0 : started++ >= maxCards) break;
     const path = join(pendingDir, name);
     try {
       const entry = JSON.parse(readFileSync(path, 'utf8'));
@@ -415,9 +418,8 @@ export async function drainPendingPrevention({ lane }, {
         if (cursorPath) writeDrainCursor(cursorPath, { pending: name });
         continue;
       }
-      // Re-checked right before the admission: the ls-tree above can itself take long. No allowance is spent past it.
+      // Re-checked right before the admission: the ls-tree above can itself take long.
       if (now() >= deadlineAt) break;
-      if (counter ? counter.left-- <= 0 : started++ >= maxCards) break;
       const result = await withRecoveryCard(lane, entry.rel, entry.content, () => batch({
         laneDir: lane, cardPath: entry.rel, kind: 'prevention', actor: 'mechanical',
         idemKey: entry.idemKey, source: entry.source,

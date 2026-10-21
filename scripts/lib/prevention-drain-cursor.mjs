@@ -1,35 +1,40 @@
 /** Round-robin cursor for the per-tick prevention drain: one small non-JSON-named record beside the batch states. */
 import { accessSync, constants, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 
 export const drainCursorPath = stateDir => join(stateDir, 'prevention-drain-cursor.state');
 
-// A cursor that could not be persisted lives here for the rest of the process, so a refused card still goes behind the
-// others on the next tick instead of being retried at the head forever.
+// A cursor that cannot be written beside the batch states falls back to a file in the OS temp dir (keyed by the primary
+// path), which the NEXT tick's fresh process reads; the process-local copy covers an unwritable temp dir too. Each value
+// carries a monotonic `at`, and a read takes whichever of the three copies is newest, so a stale readable primary never
+// wins over a newer fallback.
 const memory = new Map();
 let ticks = 0;
+export const fallbackCursorPath = path => join(tmpdir(), `we-drain-cursor-${createHash('sha256').update(path).digest('hex').slice(0, 24)}.state`);
+
+const parse = file => { try { const value = JSON.parse(readFileSync(file, 'utf8')); return value && typeof value === 'object' ? value : undefined; } catch { return undefined; } };
 
 export function readDrainCursor(path) {
-  const held = memory.get(path);
-  if (held && !held.persisted) return held.value;
-  try { const value = JSON.parse(readFileSync(path, 'utf8')); return value && typeof value === 'object' ? value : {}; } catch { return held?.value ?? {}; }
+  const candidates = [parse(path), parse(fallbackCursorPath(path)), memory.get(path)?.value].filter(Boolean);
+  return candidates.reduce((best, value) => (Number(value.at) || 0) >= (Number(best.at) || 0) ? value : best, {});
 }
 
-/** Merge `patch` into the cursor. Best-effort: a failed write keeps the cursor in memory, never raises. Returns whether it persisted. */
+function persist(file, value) {
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  try { writeFileSync(temporary, `${JSON.stringify(value)}\n`); renameSync(temporary, file); return true; }
+  catch { try { rmSync(temporary, { force: true }); } catch { /* nothing more to clean */ } return false; }
+}
+
+/** Merge `patch` into the cursor. Best-effort, never raises. Returns whether it persisted beside the batch states. */
 export function writeDrainCursor(path, patch) {
-  const value = { ...readDrainCursor(path), ...patch };
-  const temporary = `${path}.${randomUUID()}.tmp`;
-  try {
-    writeFileSync(temporary, `${JSON.stringify(value)}\n`);
-    renameSync(temporary, path);
-    memory.set(path, { value, persisted: true });
-    return true;
-  } catch {
-    try { rmSync(temporary, { force: true }); } catch { /* nothing more to clean */ }
-    memory.set(path, { value, persisted: false });
-    return false;
-  }
+  const previous = readDrainCursor(path);
+  const value = { ...previous, ...patch, at: Math.max((Number(previous.at) || 0) + 1, Date.now()) };
+  memory.set(path, { value });
+  if (persist(path, value)) return true;
+  persist(fallbackCursorPath(path), value);
+  return false;
 }
 
 /** Test seam: forget the in-memory cursors. */
@@ -41,10 +46,9 @@ export const resetDrainCursorMemory = () => { memory.clear(); ticks = 0; };
  * tick period; a persistable cursor needs no seed (head-first, then it advances).
  */
 export function cursorSeed(path) {
-  const held = memory.get(path);
   let writable = true;
   try { accessSync(dirname(path), constants.W_OK); } catch { writable = false; }
-  if (writable && !(held && !held.persisted)) return undefined;
+  if (writable && !memory.get(path)) return undefined;
   return createHash('sha256').update(`${process.pid}:${++ticks}`).digest().readUInt32BE(0);
 }
 

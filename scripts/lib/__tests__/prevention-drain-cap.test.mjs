@@ -7,12 +7,14 @@ import { drainPendingPrevention } from '../../operations/land-prevention-card.mj
 import { reconcileOwedPrevention } from '../prevention-filing-owed.mjs';
 import { isNoLaneInTime, landPreventionCard } from '../../operations/land-prevention-card.mjs';
 import { reconcileCardBatches } from '../../operations/card-batch-reconcile.mjs';
-import { cursorSeed, drainCursorPath, readDrainCursor, resetDrainCursorMemory, rotateAfter } from '../prevention-drain-cursor.mjs';
+import { chmodSync } from 'node:fs';
+import { cursorSeed, drainCursorPath, fallbackCursorPath, writeDrainCursor, readDrainCursor, resetDrainCursorMemory, rotateAfter } from '../prevention-drain-cursor.mjs';
 import { resolvePreventionBatchSettings } from '../card-batch-settings.mjs';
 import { loadCardBatchPolicy } from '../card-batch-policy.mjs';
 
 const roots = [];
-afterEach(() => { resetDrainCursorMemory(); roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })); });
+const fallbacks = [];
+afterEach(() => { resetDrainCursorMemory(); fallbacks.splice(0).forEach(file => rmSync(file, { force: true })); roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })); });
 function fixture(names = ['a', 'b', 'c']) {
   const root = mkdtempSync(join(tmpdir(), 'drain-cap-')); roots.push(root);
   const stateDir = join(root, 'state'); const lane = join(root, 'lane'); const pendingDir = join(stateDir, 'pending-prevention');
@@ -136,7 +138,7 @@ describe('fairness without a writable cursor, and the shared allowance', () => {
   it('a cursor that cannot be persisted still rotates the start (time-seeded), so a refused head cannot starve the rest', async () => {
     const f = fixture(); const seen = [];
     const batch = async input => { const id = input.cardPath.split('/')[1][0]; seen.push(id); if (id === 'a') throw new Error('refused'); return { batched: true }; };
-    const cursorPath = join(f.root, 'no-such-dir', 'cursor.state');
+    const cursorPath = join(f.root, 'no-such-dir', 'cursor.state'); fallbacks.push(fallbackCursorPath(cursorPath));
     for (const now of [0, 60_000, 120_000]) {
       await drainPendingPrevention({ lane: f.lane }, { pendingDir: f.pendingDir, exec, batch, write: () => {}, maxCards: 1, cursorPath, now: () => now });
     }
@@ -147,7 +149,7 @@ describe('fairness without a writable cursor, and the shared allowance', () => {
     const f = fixture(); const seen = [];
     const batch = async input => { const id = input.cardPath.split('/')[1][0]; seen.push(id); if (id === 'a') throw new Error('refused'); return { batched: true }; };
     mkdirSync(join(f.root, 'cursor.state')); // renaming a file over a directory fails: every write errors, the directory stays writable
-    const cursorPath = join(f.root, 'cursor.state');
+    const cursorPath = join(f.root, 'cursor.state'); fallbacks.push(fallbackCursorPath(cursorPath));
     resetDrainCursorMemory();
     for (let tick = 0; tick < 3; tick++) await drainPendingPrevention({ lane: f.lane }, { pendingDir: f.pendingDir, exec, batch, write: () => {}, maxCards: 1, cursorPath });
     expect(seen).toContain('b');
@@ -174,6 +176,44 @@ describe('fairness without a writable cursor, and the shared allowance', () => {
       loadFilingSettings: () => ({ filingEnabled: true }), drainLimit: { deadlineAt: 60_000, now: () => t }, acquireWait: () => 30_000 });
     expect(result).toMatchObject({ ok: true, skipped: true, deferred: true });
     expect(calls).toEqual(['acquire', 'release']);
+  });
+  /** Run each tick as a FRESH process would: the process-local cursor memory is gone, only files survive. */
+  const freshTick = (f, cursorPath, batch) => { resetDrainCursorMemory();
+    return drainPendingPrevention({ lane: f.lane }, { pendingDir: f.pendingDir, exec, batch, write: () => {}, maxCards: 1, cursorPath }); };
+  const refuseA = seen => async input => { const id = input.cardPath.split('/')[1][0]; seen.push(id); if (id === 'a') throw new Error('refused'); return { batched: true }; };
+
+  it('fresh workers, MISSING primary cursor and unwritable directory: the fallback file carries the position across ticks', async () => {
+    const f = fixture(); const seen = []; const cursorPath = join(f.root, 'no-such-dir', 'cursor.state'); fallbacks.push(fallbackCursorPath(cursorPath));
+    for (let tick = 0; tick < 3; tick++) await freshTick(f, cursorPath, refuseA(seen));
+    expect(seen.slice(-2)).not.toEqual(['a', 'a']);
+    expect(f.left()).not.toContain('b');
+  });
+  it('fresh workers, STALE readable primary cursor that cannot be rewritten: the newer fallback wins over it', async () => {
+    const f = fixture(); const seen = []; const dir = join(f.root, 'cur'); mkdirSync(dir);
+    const cursorPath = join(dir, 'cursor.state'); fallbacks.push(fallbackCursorPath(cursorPath));
+    writeFileSync(cursorPath, JSON.stringify({ pending: 'zzz.json', at: 1 })); // stale: would restart at the head forever
+    chmodSync(dir, 0o500);
+    try { for (let tick = 0; tick < 3; tick++) await freshTick(f, cursorPath, refuseA(seen)); }
+    finally { chmodSync(dir, 0o700); }
+    expect(seen).toContain('b');
+    expect(f.left()).not.toContain('b');
+  });
+  it('fresh workers keep the pending/owed turn too when the primary cursor is unwritable', () => {
+    const f = fixture([]); const cursorPath = join(f.root, 'no-such-dir', 'cursor.state'); fallbacks.push(fallbackCursorPath(cursorPath));
+    writeDrainCursor(cursorPath, { next: 'owed' });
+    resetDrainCursorMemory();
+    expect(readDrainCursor(cursorPath).next).toBe('owed');
+  });
+  it('a lookup that throws still spends the allowance: the rest of the spool is not walked', async () => {
+    const f = fixture(['a', 'b']); const counter = { left: 1 }; const lookups = [];
+    const failing = (cmd, args) => { lookups.push(args[4]); throw new Error('git unavailable'); };
+    await drainPendingPrevention({ lane: f.lane }, { pendingDir: f.pendingDir, exec: failing, write: () => {}, counter, batch: vi.fn() });
+    expect(lookups).toHaveLength(1);
+  });
+  it('an exhausted allowance starts no lookup at all', async () => {
+    const f = fixture(['a']); const exec = vi.fn(() => '');
+    await drainPendingPrevention({ lane: f.lane }, { pendingDir: f.pendingDir, exec, write: () => {}, counter: { left: 0 }, batch: vi.fn() });
+    expect(exec).not.toHaveBeenCalled();
   });
   it('rotateAfter: a seed rotates only when there is no cursor value', () => {
     expect(rotateAfter(['a', 'b', 'c'], undefined, 1)).toEqual(['b', 'c', 'a']);
