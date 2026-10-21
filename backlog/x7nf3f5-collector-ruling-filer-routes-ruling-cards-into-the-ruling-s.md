@@ -19,6 +19,10 @@ Decision x5ioz96 fork 1 skeptic amendment: a card must wire the ruling filer to 
 
 The cards in the ruling stream are ordinary cards (for example `kind: story`, `status: open`) filed as the outcome of an operator ruling; the hand-batched ruling PRs carry exactly such cards. Provenance therefore lives in the filing call, not in the card: the caller passes the id of the decision the card comes from, and the filer accepts the card only when that decision card exists on main with `status: resolved` and a `## Ruling` section quoting the operator. A missing, unknown or unresolved decision id is refused before the card reaches the collector.
 
+Both requirements are checked mechanically:
+- **Exists on main.** The filer reads the decision card from the `origin/main` tree (`git show origin/main:backlog/<id>-*.md`), never from the working tree or the caller's branch. A decision that is resolved only in a lane, an unmerged branch or an uncommitted edit is refused, even when the local copy looks resolved. When main and the working tree disagree, main wins.
+- **Quotes the operator.** The `## Ruling` section must hold a verbatim operator quote: a non-empty quoted string (straight `"…"` or curly `“…”` quotes) on a line that names the operator. A Ruling that only summarises the outcome, that quotes nobody, that holds an empty quote, or that quotes someone other than the operator is refused. Text inside a code fence does not count as a quote.
+
 ## Acceptance
 
 - [A1] **Executable** — `node --test we:scripts/operations/__tests__/land-ruling-card.test.mjs we:scripts/operations/__tests__/card-batch-file.test.mjs we:scripts/lib/__tests__/card-batch-policy.test.mjs` fails before this item lands and passes after. Planned cases:
@@ -27,8 +31,10 @@ The cards in the ruling stream are ordinary cards (for example `kind: story`, `s
   - `high and urgent ruling cards bypass the collector` (we:scripts/operations/__tests__/card-batch-file.test.mjs).
   - `ruling ships enabled with 8/60 defaults` (we:scripts/lib/__tests__/card-batch-policy.test.mjs) — replaces xpabefb's disabled-default case.
   - `disabled ruling refuses kind-disabled, not unknown kind` (we:scripts/operations/__tests__/card-batch-file.test.mjs) — rewritten to disable ruling through an explicit override, since the shipped default is now enabled.
-  - `story card citing a resolved ruling is filed into the ruling batch` (we:scripts/operations/__tests__/land-ruling-card.test.mjs) — a `kind: story`, `status: open` card whose cited decision is resolved with a `## Ruling` section is admitted.
+  - `story card citing a resolved ruling is filed into the ruling batch` (we:scripts/operations/__tests__/land-ruling-card.test.mjs) — a `kind: story`, `status: open` card whose cited decision is resolved on `origin/main` with a `## Ruling` section quoting the operator is admitted.
   - `ruling card without operator provenance is refused` (we:scripts/operations/__tests__/land-ruling-card.test.mjs) — a missing decision id, an unknown one, and one whose decision is not resolved or has no `## Ruling` section are each refused, and nothing is admitted.
+  - `decision not on main is refused` (we:scripts/operations/__tests__/land-ruling-card.test.mjs) — the test repo has a decision resolved with an operator quote that exists only (a) in an unmerged branch, (b) as an uncommitted working-tree edit, and (c) resolved in the working tree while `origin/main` still has it `status: open`. Each is refused, and nothing is admitted.
+  - `ruling without an operator quote is refused` (we:scripts/operations/__tests__/land-ruling-card.test.mjs) — a decision resolved on `origin/main` whose `## Ruling` section (a) only summarises the outcome, (b) holds an empty quote `""`, (c) quotes someone other than the operator, or (d) holds the operator quote only inside a code fence. Each is refused, and nothing is admitted. The same Ruling with a curly-quoted operator line is admitted, so the check accepts both quote styles.
   - `unparseable or partial card is refused` (we:scripts/operations/__tests__/land-ruling-card.test.mjs) — a card with broken frontmatter, and a read that returns a partial file, are each refused and nothing is admitted.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
@@ -50,4 +56,4 @@ One line per class: either the handling, or `n/a: <why>`.
 4. **Fail closed** — no provenance, a parse error or a coordinator refusal leaves the card unfiled and reported, never admitted (cases `ruling card without operator provenance is refused`, `unparseable or partial card is refused`).
 5. **Identity scoping** — the ruling stream is its own kind, keyed by repo; a ruling card never lands in the filing batch (case `ruling cards are admitted into the ruling batch, not filing`).
 6. **State over time** — n/a: the filer is stateless; batch lifecycle is x5nmdnt's.
-7. **Who wrote it** — a card is accepted only when it cites a resolved decision whose `## Ruling` section quotes the operator; a mechanical caller cannot file into the ruling stream without one.
+7. **Who wrote it** — a card is accepted only when it cites a decision resolved on `origin/main` whose `## Ruling` section quotes the operator; a mechanical caller cannot file into the ruling stream without one, and cannot supply one from its own branch or working tree (cases `decision not on main is refused`, `ruling without an operator quote is refused`).
