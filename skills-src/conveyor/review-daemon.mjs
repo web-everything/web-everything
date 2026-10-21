@@ -89,7 +89,8 @@ import { hostname } from 'node:os';
 import { spawnLedgerOutboxBackstop } from '../../scripts/lib/verdict-ledger-outbox.mjs';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents, isConflictingPr } from '../../scripts/conveyor/reconcile-pass.mjs';
 import { promoteDraftsThenReplan, promoteDraftsGuarded, rearmStaleAcceptanceGuarded, rearmStaleAcceptsThenReplan } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
-import { notifyReferralHold } from '../../scripts/conveyor/review-referral-hold.mjs';
+import { notifyReferralHold, referralHoldSendBackBody, REFERRAL_HOLD_AUTO_RESOLVED } from '../../scripts/conveyor/review-referral-hold.mjs';
+import { AUTO_POLICY_ACTOR } from '../../scripts/lib/jury-core.mjs';
 // card x29vm8a — a scope-bloated PR (stale base) is refreshed onto main through the SAME mechanical path the ci-red
 // recovery watch uses, once per head, before any review reads its diff.
 import { refreshOntoMain, defaultPostRebaseComment } from '../../scripts/conveyor/ci-red-recovery-watch.mjs';
@@ -433,6 +434,78 @@ export function planRedTeamRequestAction({ request, subject, evidence, setting, 
  * pre-existing caller/test of this pure function is unaffected unless it opts in.
  * @returns {{staleStatusSwept:number[], staleConflictStatusCleared:number[], reviewsOwed:number, dispatched:Array<{prNumber:number, agentId:string|null}>, failed:Array<{prNumber:number, error:string}>, refusals:number, reconcileError:string|null, deferredForLanes:number, holdReconcile:Array<object>, holdReconcileError:string|null, operatorHolds:({observedAt:number, holds:Array<{prNumber:number, kind:string}>}|null)}}
  */
+/** Once-per-process memo of the auto-resolve lines already logged (`<repo>#<pr>@<head>:<outcome>[:<why>]`). */
+export const AUTO_RESOLVE_SEEN = new Set();
+
+/**
+ * stale-hold-resume — act on one plan row's {@link decideReferralHoldAutoResolve} answer. Logs
+ * `referral-hold auto-resolved {pr, head, outcome}` once per PR/head/outcome; a `stay` logs why, once per reason.
+ * `send-back` sends the PR back to the fixer exactly as a block ruling's follow-up does (skipped when the PR already
+ * carries `review:changes`); a failed send is retried next tick. Never accepts, never touches `review:human`.
+ * @returns {{resolved?:object, error?:string}|null}
+ */
+export function handleReferralHoldAutoResolve({ repo, row, auto, rawPrs = null, send = null, seen = AUTO_RESOLVE_SEEN, log = () => {} }) {
+  const pr = Number(row?.prNumber);
+  const head = auto?.head ?? null;
+  const record = { repo, pr, head, outcome: auto?.outcome, ...(auto?.counts ? { counts: auto.counts } : {}) };
+  if (auto?.outcome === 'stay') {
+    const key = `${repo}#${pr}@${head}:stay:${auto.why}`;
+    if (!seen.has(key)) { seen.add(key); log(`review-daemon: referral-hold auto-resolve kept the pause ${JSON.stringify({ ...record, why: auto.why })}`); }
+    return null;
+  }
+  const key = `${repo}#${pr}@${head}:${auto?.outcome}`;
+  if (auto?.outcome === 'resume') {
+    const resolved = { ...record, next: auto.next ?? 'human-review' };
+    if (!seen.has(key)) { seen.add(key); log(`review-daemon: ${REFERRAL_HOLD_AUTO_RESOLVED} ${JSON.stringify(resolved)}`); }
+    return { resolved };
+  }
+  if (auto?.outcome !== 'send-back') return null;
+  const live = Array.isArray(rawPrs) ? rawPrs.find(p => Number(p?.number) === pr) : null;
+  const labels = (live?.labels ?? row?.labels ?? []).map(l => (typeof l === 'string' ? l : l?.name));
+  const blocked = (auto.blocked ?? []).map(b => `${b.file ?? 'no file'}${Number.isInteger(b.line) ? `:${b.line}` : ''}`);
+  const resolved = { ...record, blocked };
+  // Already sent back by this process (a stale listing can still lack the label): never twice.
+  if (seen.has(key)) return { resolved };
+  if (labels.includes('review:changes')) {
+    if (!seen.has(key)) { seen.add(key); log(`review-daemon: ${REFERRAL_HOLD_AUTO_RESOLVED} ${JSON.stringify({ ...resolved, sentBack: 'already review:changes' })}`); }
+    return { resolved };
+  }
+  if (typeof send !== 'function') {
+    const k = `${key}:no-sender`;
+    if (!seen.has(k)) { seen.add(k); log(`review-daemon: referral-hold auto-resolve owes a send-back but no sender is wired ${JSON.stringify(resolved)}`); }
+    return null;
+  }
+  const actors = [...new Set((auto.blocked ?? []).map(b => String(b.actor ?? '')))];
+  try {
+    const out = send({ repo, pr, head, body: referralHoldSendBackBody({ head, blocked: auto.blocked ?? [] }),
+      actor: actors.length === 1 && actors[0] && actors[0] !== 'reviewer' ? actors[0] : AUTO_POLICY_ACTOR,
+      channel: 'review-daemon referral-hold auto-resolve' });
+    seen.add(key);
+    log(`review-daemon: ${REFERRAL_HOLD_AUTO_RESOLVED} ${JSON.stringify({ ...resolved, sentBack: out?.sentBack === true })}`);
+    return { resolved: { ...resolved, sentBack: out?.sentBack === true } };
+  } catch (e) {
+    const error = `referral-hold auto-resolve send-back: ${String(e?.message ?? e).split('\n')[0]}`;
+    log(`review-daemon: ${repo}#${pr} ${error} (retried next tick)`);
+    return { error };
+  }
+}
+
+/** The real send-back: the SAME follow-up effect `record-referral-ruling` runs for a block ruling
+ *  (`record-referral-ruling-io.mjs#createRecordReferralRulingSinks`, head re-check + `review-set-label --to=changes` +
+ *  the ledger send-back row). That effect is async and the tick is not, so it runs in a short child process. */
+export function defaultSendBackReferralHold(args, { exec = execFileSync } = {}) {
+  const io = new URL('../../scripts/operations/record-referral-ruling-io.mjs', import.meta.url).href;
+  const rr = new URL('../../scripts/operations/record-referral-ruling.mjs', import.meta.url).href;
+  const code = `const { createRecordReferralRulingSinks } = await import(${JSON.stringify(io)});
+const { OPERATOR_RULING_FOLLOW_UP_EFFECT } = await import(${JSON.stringify(rr)});
+const a = JSON.parse(process.env.WE_AUTO_RESOLVE_SEND_BACK);
+const r = await createRecordReferralRulingSinks()[OPERATOR_RULING_FOLLOW_UP_EFFECT]({ ...a, action: 'send-back' });
+process.stdout.write(JSON.stringify(r) + '\\n');`;
+  const out = exec(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8', timeout: 180_000,
+    env: { ...process.env, WE_AUTO_RESOLVE_SEND_BACK: JSON.stringify(args) }, stdio: ['ignore', 'pipe', 'pipe'] });
+  return JSON.parse(String(out).trim().split('\n').filter(Boolean).at(-1) ?? '{}');
+}
+
 export function runReviewTick({
   defaultBranch = 'main',
   reconcile = runReconcilePass,
@@ -442,6 +515,11 @@ export function runReviewTick({
   statusCandidates = selectStatusCandidates,
   holdReconcile = sweepReviewHolds,
   notifyReferral = notifyReferralHold,
+  // stale-hold-resume — `({repo, pr, head, body, actor, channel}) => {sentBack}`: the send-back a block ruling's own
+  // follow-up performs (`review-set-label --to=changes`). `null` (the default) sends nothing and logs that it is owed.
+  sendBackReferralHold = null,
+  // Once-per-process memo for the auto-resolve log lines (injectable so tests stay independent).
+  autoResolveSeen = AUTO_RESOLVE_SEEN,
   // card x29vm8a - `({repo, prNumber, headRefName, headRefOid, defaultBranch}) => {ok, action, error?}`; `null` (the default) never
   // refreshes, so every existing caller of this function is unchanged. The real daemon passes {@link refreshScopeBloatedPr}.
   refreshScopeBloat = null,
@@ -783,7 +861,25 @@ export function runReviewTick({
   let occupiedLanes = 0;
   const dispatched = [];
   const failed = [];
+  const referralHoldAutoResolved = [];
+  // A pause the plan itself lifted (its head's one finished review left no advisory): the advisory review goes out.
+  for (const n of plan.notes ?? []) {
+    if (n?.kind !== 'referral-hold-auto-resolved') continue;
+    const resolved = { repo, pr: n.prNumber, head: n.head, outcome: n.outcome, ...(n.counts ? { counts: n.counts } : {}), next: n.next };
+    const key = `${repo}#${n.prNumber}@${n.head}:${n.outcome}:${n.next}`;
+    if (!autoResolveSeen.has(key)) { autoResolveSeen.add(key); log(`review-daemon: ${REFERRAL_HOLD_AUTO_RESOLVED} ${JSON.stringify(resolved)}`); }
+    referralHoldAutoResolved.push(resolved);
+  }
   for (const row of plan.refusals ?? []) {
+    // stale-hold-resume — a pause whose every live-head finding already carries a ruling resolves itself.
+    const auto = row.referralHoldAutoResolve ?? row.reviewRefusal?.referralHoldAutoResolve;
+    if (auto) {
+      const r = handleReferralHoldAutoResolve({ repo, row, auto, rawPrs, send: sendBackReferralHold, seen: autoResolveSeen, log });
+      if (r?.resolved) referralHoldAutoResolved.push(r.resolved);
+      if (r?.error) failed.push({ prNumber: row.prNumber, error: r.error });
+      // A resolved pause owes no "waiting on your ruling" notice: every finding is ruled.
+      if (auto.outcome !== 'stay') continue;
+    }
     const hold = row.referralHold ?? row.reviewRefusal?.referralHold;
     if (!hold) continue;
     try {
@@ -941,6 +1037,7 @@ export function runReviewTick({
     authPaused: paused, authPauseReason: paused ? pauseReason : null,
     holdReconcile: holdReconcileResults, holdReconcileError,
     ...(scopeBloatRefreshed.length ? { scopeBloatRefreshed } : {}),
+    ...(referralHoldAutoResolved.length ? { referralHoldAutoResolved } : {}),
     // #3383 follow-up (live-caught 2026-09-26) — the PR numbers THIS tick's own reconcile refused
     // `live-process` (`we:scripts/conveyor/reconcile-core.mjs#assessLiveness`: "a bound session has a LIVE
     // pid — something is already working this PR, however stale its transcript looks"). Fed into the NEXT
@@ -1738,6 +1835,7 @@ export function buildCliDaemonEffects({
       liveReviewBudget: liveReviewRoundBudget(),
       poolExhaustion: DAEMON_POOL_EXHAUSTION,
       refreshScopeBloat: refreshScopeBloatedPr,
+      sendBackReferralHold: defaultSendBackReferralHold,
       postRefreshMarker: defaultPostRebaseComment,
       promoteDrafts: promoteDraftsGuarded,
       rearmStaleAccepts: rearmStaleAcceptanceGuarded,
