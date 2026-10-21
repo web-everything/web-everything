@@ -206,7 +206,7 @@ export function appendLedgerRows({
   // call's rows only. Still computed against the tip it races, still never forced, still loud on exhaustion.
   try {
     return appendDirect({
-      board, branch, repo, path, lines, ids, message, attempts, allowRef: LEDGER_PUSH_REF,
+      board, branch, repo, path, lines, ids, message, attempts, allowRef: LEDGER_PUSH_REF, settings: cascade,
       run: transport.run ?? gitRun, sleep, random, log, onRetry,
     });
   } catch (e) {

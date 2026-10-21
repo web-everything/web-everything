@@ -87,6 +87,9 @@ export function classifyPushFailure(e, ref = 'refs/heads/ops/review-requests') {
     const m = /^([ +\-*=!])\t([^\t]*):([^\t]+)\t(.*)$/.exec(line);
     if (!m || m[3] !== ref) continue;
     if (m[1] !== '!') return 'unknown'; // a non-rejected record for our ref beside a failed exit: never "not landed"
+    // Round 6: only an EXPLICIT `[rejected]` / `[remote rejected]` summary is a verdict. `[remote failure]` (the
+    // remote never confirmed: it may have updated the ref) and anything unrecognised stay UNKNOWN.
+    if (!/^\[(rejected|remote rejected)\]/.test(m[4].trim())) return 'unknown';
     return RACE_REASON_RE.test(m[4]) ? 'race' : 'refused';
   }
   return 'unknown';
@@ -153,7 +156,7 @@ const leaseMinutesFor = (budgetMs) => Math.max(5, Math.ceil((2 * budgetMs) / 60_
 export function originKeyFor({ board, run = defaultGit } = {}) {
   const url = String(withGitError(run)(['remote', 'get-url', 'origin'], { cwd: board, env: boardEnv(board), timeout: ORIGIN_LOOKUP_TIMEOUT_MS })).trim();
   if (!url) throw new Error(`verdict-ledger-outbox: ${board} has no origin URL`);
-  return createHash('sha256').update(canonicalRemote(url)).digest('hex').slice(0, 16);
+  return createHash('sha256').update(canonicalRemote(url, resolve(board))).digest('hex').slice(0, 16);
 }
 
 /** Bounded: the origin lookup runs before any flush deadline exists. */
@@ -164,16 +167,26 @@ export const ORIGIN_LOOKUP_TIMEOUT_MS = 5_000;
  * must share one outbox, or the backstop never visits one of them). host lowercased, user/port/protocol, `.git` and
  * trailing slashes dropped. A local path stays a resolved path.
  */
-export function canonicalRemote(url) {
+export function canonicalRemote(url, base = process.cwd()) {
+  // Round 6: merge ONLY spellings of the same endpoint — protocol, user, the scheme's default port, a trailing slash
+  // and a trailing `.git` on a HOSTED path. The host is case-folded (DNS); the path keeps its case; a non-default port
+  // stays part of the identity; a LOCAL path is resolved against the board and kept exactly (no `.git` folding).
   const u = String(url ?? '').trim();
-  let host = null;
-  let path = null;
+  const proto = /^([a-z][a-z0-9+.-]*):\/\/(?:[^@/]+@)?(\[[^\]]+\]|[^/:]+)(?::(\d+))?\/(.+)$/i.exec(u);
   const scp = /^(?:[^@/]+@)?([^:/]+):(?!\/)(.+)$/.exec(u);
-  const proto = /^[a-z][a-z0-9+.-]*:\/\/(?:[^@/]+@)?([^/:]+)(?::\d+)?\/(.+)$/i.exec(u);
-  if (proto) { host = proto[1]; path = proto[2]; }
-  else if (scp && !/^[a-zA-Z]:[\\/]/.test(u)) { host = scp[1]; path = scp[2]; }
-  if (!host) return `file:${resolve(u.replace(/^file:\/\//, ''))}`.replace(/\.git$/, '').replace(/\/+$/, '');
-  return `${host.toLowerCase()}/${path.replace(/\/+$/, '').replace(/\.git$/, '')}`.toLowerCase();
+  let host = null;
+  let port = null;
+  let path = null;
+  if (proto && proto[1].toLowerCase() !== 'file') {
+    const scheme = proto[1].toLowerCase();
+    host = proto[2]; path = proto[4];
+    const defaults = { ssh: '22', 'git+ssh': '22', 'ssh+git': '22', https: '443', http: '80', git: '9418' };
+    port = proto[3] && proto[3] !== defaults[scheme] ? proto[3] : null;
+  } else if (!proto && scp && !/^[a-zA-Z]:[\\/]/.test(u)) {
+    host = scp[1]; path = scp[2];
+  }
+  if (!host) return `file:${resolve(base, u.replace(/^file:\/\//, '')).replace(/\/+$/, '')}`;
+  return `${host.toLowerCase()}${port ? `:${port}` : ''}/${path.replace(/\/+$/, '').replace(/\.git$/, '')}`;
 }
 
 /**
@@ -478,22 +491,7 @@ function flushHeldInner({ board, branch, dir, owner, run: rawRun, now, sleep, ra
   // ONE absolute deadline bounds every git call and every retry (audit round 4): no call starts once it has passed,
   // and none may run past it.
   const hardDeadline = Date.now() + budgetMs;
-  const run = (args, opts = {}) => {
-    const left = hardDeadline - Date.now();
-    if (left <= 0) {
-      const e = new Error(`verdict-ledger-outbox: flush budget ${budgetMs}ms spent before git ${args[0]}`);
-      e.budget = true;
-      throw e;
-    }
-    try {
-      return rawRun(args, { timeout: Math.max(1, Math.min(GIT_CALL_TIMEOUT_MS, left)), ...opts });
-    } catch (e) {
-      // A call cut off by (or ending past) the deadline is a SPENT BUDGET, not a verdict on the remote.
-      if (Date.now() >= hardDeadline && e && typeof e === 'object' && e.phase !== 'publish') { try { e.budget = true; } catch { /* frozen */ } }
-      throw e;
-    }
-  };
-  const clampedSleep = (ms) => sleep(Math.max(0, Math.min(ms, hardDeadline - Date.now())));
+  const { run, clampedSleep } = deadlineBound(rawRun, sleep, hardDeadline, budgetMs);
   const errors = [];
   let attempts = 0;
   let pushed = false;
@@ -866,15 +864,16 @@ export function appendDirect(o) {
   const errors = [];
   let unresolved = false; // ANY earlier push without an answer keeps the outcome indeterminate, whatever follows
   const directDeadline = Date.now() + c.budgetMs;
+  const { run, clampedSleep } = deadlineBound(c.run, c.sleep, directDeadline, c.budgetMs);
   for (let attempt = 1; ; attempt += 1) {
     try {
-      const out = pushBatch({ board: c.board, branch: c.branch, entries: [{ name: 'direct', entry }], run: c.run, allowRef: c.allowRef });
+      const out = pushBatch({ board: c.board, branch: c.branch, entries: [{ name: 'direct', entry }], run, allowRef: c.allowRef, sleep: clampedSleep });
       const mine = out.counts.get('direct');
       return { status: 'appended', attempts: attempt, rows: mine.rows, duplicates: mine.duplicates };
     } catch (e) {
       errors.push(e);
       if (e?.phase === 'publish' && classifyPushFailure(e, assertPushRef(c.branch, c.allowRef)) === 'unknown') {
-        if (reconcilePush({ board: c.board, branch: c.branch, run: c.run, commit: e.commit }) === true) {
+        if (reconcilePush({ board: c.board, branch: c.branch, run, commit: e.commit }) === true) {
           c.log(`verdict-ledger: push reported failure but ${e.commit} is on the remote; counted as landed`);
           return { status: 'appended', attempts: attempt, rows: entry.lines.length, duplicates: 0 };
         }
@@ -888,9 +887,37 @@ export function appendDirect(o) {
           { errors, attempts: attempt, kind: unknown ? 'ambiguous' : 'flush' });
       }
       if (c.onRetry) c.onRetry({ attempt, error: e });
-      c.sleep(Math.min(250 * 2 ** (attempt - 1), 4000) + Math.floor(c.random() * 500));
+      clampedSleep(Math.min(250 * 2 ** (attempt - 1), 4000) + Math.floor(c.random() * 500));
+      if (Date.now() >= directDeadline) {
+        throw new OutboxFlushError(`verdict-ledger: direct append budget ${c.budgetMs}ms spent after ${attempt} attempts${unresolved ? ' (push outcome UNKNOWN: the remote may hold it)' : ''}`,
+          { errors, attempts: attempt, kind: unresolved ? 'ambiguous' : 'flush' });
+      }
     }
   }
+}
+
+/**
+ * ONE absolute deadline for a run of git calls: none starts after it (it throws `budget`), none is given a timeout
+ * past it, and sleeps never cross it. A call cut off by the deadline is a SPENT BUDGET, not a verdict on the remote
+ * (a push it cut off is still classified as UNKNOWN by its caller).
+ */
+function deadlineBound(rawRun, sleep, hardDeadline, budgetMs) {
+  const run = (args, opts = {}) => {
+    const left = hardDeadline - Date.now();
+    if (left <= 0) {
+      const e = new Error(`verdict-ledger-outbox: budget ${budgetMs}ms spent before git ${args[0]}`);
+      e.budget = true;
+      throw e;
+    }
+    try {
+      return rawRun(args, { timeout: Math.max(1, Math.min(GIT_CALL_TIMEOUT_MS, left)), ...opts });
+    } catch (e) {
+      if (Date.now() >= hardDeadline && e && typeof e === 'object') { try { e.budget = true; } catch { /* frozen */ } }
+      throw e;
+    }
+  };
+  const clampedSleep = (ms) => sleep(Math.max(0, Math.min(ms, hardDeadline - Date.now())));
+  return { run, clampedSleep };
 }
 
 /** Every git call is bounded (audit 2026-10-21): a hung push must not hold the flusher lock or the daemon tick. */
@@ -923,7 +950,10 @@ async function runBackstopCli(argv) {
     }
   } catch (e) { defaultLog(`ledger-write-miss: verdict-ledger outbox backstop could not resolve its boards (${e?.message ?? e})`); }
   const visited = new Set();
-  const roots = new Set();
+  // Roots known independently of board resolution: this checkout's workspace and the env override's parent.
+  const roots = new Set([join(workspaceFor(dirname(THIS_FILE)), '.operations', 'verdict-ledger-outbox')]);
+  if (process.env[OUTBOX_DIR_ENV]) roots.add(dirname(resolve(process.env[OUTBOX_DIR_ENV])));
+  if (!boards.length) defaultLog(`verdict-ledger-outbox: backstop resolved NO ledger board${argv[2] === 'flush-repos' ? ` for ${arg('repos') || '(no repos)'}` : ''}; reporting queued outboxes only`);
   for (const board of boards) {
     const r = flushBoardLedgerOutbox({ board });
     if (r.dir) { visited.add(resolve(r.dir)); roots.add(dirname(resolve(r.dir))); }

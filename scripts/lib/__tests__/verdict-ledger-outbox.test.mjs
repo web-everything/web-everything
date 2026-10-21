@@ -330,9 +330,16 @@ describe('real git: outbox + plumbing flush', () => {
     expect(classifyPushFailure(err('', 'remote: notice: ! [remote rejected] diagnostic -> another-ref (hook declined)\nfatal: the remote end hung up unexpectedly\n'), REF)).toBe('unknown');
     expect(classifyPushFailure(err(`!\tabc:refs/heads/other\t[rejected] (fetch first)\n`), REF)).toBe('unknown');
     expect(classifyPushFailure(err('', 'fatal: unable to access remote\n'), REF)).toBe('unknown');
-    // One identity per remote, however it is spelled.
-    expect(canonicalRemote('https://github.com/Web-Everything/web-everything.git')).toBe(canonicalRemote('git@github.com:web-everything/web-everything'));
+    // `[remote failure]` = the remote never confirmed: UNKNOWN, never a refusal (round 6).
+    expect(classifyPushFailure(err(`!\tabc:${REF}\t[remote failure] (remote failed to report status)\n`), REF)).toBe('unknown');
+    // One identity per remote endpoint, however it is spelled...
+    expect(canonicalRemote('https://GitHub.com/web-everything/web-everything.git')).toBe(canonicalRemote('git@github.com:web-everything/web-everything'));
     expect(canonicalRemote('ssh://git@github.com:22/web-everything/web-everything/')).toBe(canonicalRemote('https://github.com/web-everything/web-everything'));
+    // ...and never two different endpoints as one (round 6).
+    expect(canonicalRemote('ssh://git@host:2222/team/repo.git')).not.toBe(canonicalRemote('ssh://git@host:3333/team/repo.git'));
+    expect(canonicalRemote('ssh://git@host/team/Repo.git')).not.toBe(canonicalRemote('ssh://git@host/team/repo.git'));
+    expect(canonicalRemote('/srv/repos/example')).not.toBe(canonicalRemote('/srv/repos/example.git'));
+    expect(canonicalRemote('../origin.git', '/a/board')).toBe(canonicalRemote('/a/origin.git'));
   });
 
   it('an unanswered push whose noise mentions "cannot lock ref" is still UNKNOWN: kept queued, never thrown', async () => {
@@ -348,6 +355,25 @@ describe('real git: outbox + plumbing flush', () => {
       const r = appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(12)], outbox: true, outboxDir, gitRun: run, log: quiet });
       expect(r).toMatchObject({ status: 'appended', queued: true });
       expect(listOutboxEntries(outboxDir)).toHaveLength(1);
+    });
+  });
+
+  it('the direct path never starts a git call or sleeps past its budget (round 6)', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const timeouts = [];
+      const slept = [];
+      const run = (args, opts) => {
+        timeouts.push(opts?.timeout);
+        if (args[0] === 'push') throw Object.assign(new Error('Command failed'), { stdout: `!\tx:refs/heads/ops/review-requests\t[rejected] (fetch first)\n`, status: 1 });
+        return realGit(args, opts);
+      };
+      const t0 = Date.now();
+      expect(() => appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(13)], outbox: false, run, attempts: 50, settings: { verdictLedger: { flushBudgetMs: 1500 } }, sleep: (ms) => { slept.push(ms); const until = Date.now() + ms; while (Date.now() < until) { /* spin */ } } }))
+        .toThrow(LedgerAppendExhaustedError);
+      expect(Date.now() - t0).toBeLessThan(1500 + 2_000);
+      for (const t of timeouts) expect(t).toBeLessThanOrEqual(1500);
+      for (const ms of slept) expect(ms).toBeLessThanOrEqual(1500);
     });
   });
 
