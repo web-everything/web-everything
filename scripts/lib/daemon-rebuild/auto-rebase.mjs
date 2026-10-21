@@ -28,16 +28,16 @@ const lines = (r) => (r.status === 0 ? String(r.stdout ?? '').split('\n').filter
 
 /**
  * X's own history beyond main is only the PR's own work: every merge commit in main..X merges main-reachable history in
- * (its other parents are all ancestors of main). A PR head that merged ANOTHER branch carries that branch's content,
- * which a merge with X as base could silently drop — such an X is never a candidate (fail closed: set aside instead).
+ * — every parent after the FIRST (the branch the merge was made on) is an ancestor of main. A PR head that merged
+ * ANOTHER branch (even onto a main-based first parent) carries that branch's content, which a merge with X as base
+ * could silently drop — such an X is never a candidate (fail closed: set aside instead).
  */
 function onlyPrOwnHistory(git, mainSha, sha) {
   const merges = git(['rev-list', '--merges', '--parents', sha, '--not', mainSha]);
   if (merges.status !== 0) return false;
   for (const l of lines(merges)) {
-    const [, ...parents] = l.split(' ');
-    const offMain = parents.filter((p) => git(['merge-base', '--is-ancestor', p, mainSha]).status !== 0);
-    if (offMain.length > 1) return false;
+    const [, , ...merged] = l.split(' ');
+    if (merged.some((p) => git(['merge-base', '--is-ancestor', p, mainSha]).status !== 0)) return false;
   }
   return true;
 }

@@ -258,7 +258,9 @@ export async function prepareRebuild({
   // The PR base chains come from gh, else from each entry's recorded `stackBases`, else ancestry alone.
   const stack = resolveOverlayStackMode(env);
   // overlay-rebase-on-merge — the overlay heads this clone's ADOPTED builds applied ({pr, sha}), accumulated from the
-  // rebuild state's own `adopted.applied` (written only at adoption, never read from commit text). Bounded, newest kept.
+  // rebuild state's own `adopted.applied` (written only at adoption, never read from commit text). NEVER truncated by
+  // count (a forgotten head would turn "foreign work inside X" into permission): an entry leaves only once main itself
+  // contains it, when it can no longer be content beyond main.
   const adoptedHeads = (() => {
     const prev = Array.isArray(state.adoptedHeads) ? state.adoptedHeads : [];
     const add = (state.adopted?.applied ?? []).flatMap((a) => [
@@ -267,7 +269,8 @@ export async function prepareRebuild({
     ]);
     const seen = new Set();
     const next = [...add, ...prev].filter((h) => Number.isInteger(h.pr) && /^[0-9a-f]{40}$/.test(h.sha)
-      && !seen.has(`${h.pr}:${h.sha}`) && seen.add(`${h.pr}:${h.sha}`)).slice(0, 500);
+      && !seen.has(`${h.pr}:${h.sha}`) && seen.add(`${h.pr}:${h.sha}`)
+      && !(fetchedMainSha && git(['merge-base', '--is-ancestor', h.sha, fetchedMainSha]).status === 0));
     if (JSON.stringify(next) !== JSON.stringify(prev)) { state.adoptedHeads = next; writeState(); }
     return next;
   })();

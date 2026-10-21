@@ -283,4 +283,25 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     expect(plan.decisions[0]).toMatchObject({ action: 'drop', reason: 'conflict' });
     expect(plan.alerts.map((a) => a.kind)).toContain('overlay-set-aside');
   });
+
+  it('a PR head that --no-ff merged a foreign branch onto a main-based parent is refused too (Codex round 3)', async () => {
+    const f = fixture({ mode: 'on' });
+    const author = `${dirname(f.clone)}/author`;
+    const hotfix = f.push('lane/hotfix', f.init, { 'hotfix.txt': 'live hotfix\n' });
+    gitOk(author, ['checkout', '-q', '-B', 'lane/standing-ruling', f.init]);
+    gitOk(author, ['merge', '-q', '--no-ff', '-m', 'merge hotfix', hotfix]); // first parent is ON main, second is foreign
+    const x1 = f.push('lane/standing-ruling', 'HEAD', { [GATE]: lines({ 2: 'grant v1' }) });
+    f.push('lane/container', x1, { [GATE]: lines({ 2: 'grant v1', 10: 'own' }) });
+    const x2 = f.push('lane/standing-ruling', f.init, { [GATE]: lines({ 2: 'grant v2' }) });
+    f.mergePr(PR, x2, 'lane/standing-ruling');
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const plan = await planRebuild({
+      git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref: 'lane/container', pr: 5801 }],
+      prState: async (pr) => (pr === PR ? 'MERGED' : 'OPEN'), prForcePushes: async (pr) => (pr === PR ? [{ before: x1 }] : []),
+      autoRebase: { mode: 'on', source: 'test' },
+    });
+    expect(plan.decisions[0]).toMatchObject({ action: 'drop', reason: 'conflict' });
+    expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-auto-rebased');
+    expect(plan.alerts.find((a) => a.kind === 'overlay-set-aside')?.detail).toMatchObject({ ref: 'lane/container' });
+  });
 });
