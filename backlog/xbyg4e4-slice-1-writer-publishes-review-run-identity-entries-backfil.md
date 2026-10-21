@@ -27,6 +27,7 @@ All cases below are planned in `we:scripts/lib/__tests__/review-run-index.test.m
 | Guarantee | Named case | Observable assertion |
 | --- | --- | --- |
 | I1 durable atomic publication | `publication_precedes_record_rename` | Trace claim temp-write/fsync/link, entry publication, directory fsyncs and first record rename; all durability steps precede rename. Crash/error injection at each boundary leaves no record visible with a usable partial identity; next read uses a fresh record/full scan whenever proof is incomplete. |
+| Bounded index names | `index_names_stay_bounded_for_max_valid_identity` | Through public `writeRun` and both public readers: runId `review-pr-` + 118 characters (128, the `isValidRunId` maximum), repo `o`×39 + `/` + `n`×100, PR 1; also a 2,000-character repo and PR `Number.MAX_SAFE_INTEGER`. The record persists (no `ENAMETOOLONG`), every name created under the index (entry, claim, temps) is at most 255 bytes, neither the repo nor the PR text appears in any name, and the readers return that record for its PR and skip it for another PR. A run id over 128 characters is refused by `writeRun` before any write. |
 | Exclusive claims | `concurrent_claims_have_one_identity_winner` | Race two writers on one id: exactly one conflicting identity publishes, the loser throws without changing winner bytes; matching writers share one complete claim/entry. No observer reads a partial claim. |
 | I3/I4 exact agreement and unknown fallback | `invalid_index_states_force_fresh_record_reads` | Table-drive absent, duplicate, conflicting, malformed, truncated and partial claims/entries, including missing claim, extra entry and claim/entry repo/PR disagreement. Spy reads through both public readers: every affected record opens on each call, and corrupt candidates preserve full-scan refusal. Only one valid agreeing other-PR pair permits a skip. |
 | Fresh candidates and content/head filtering | `candidate_reads_are_fresh_and_head_filtered` | Rewrite same-PR and unindexed records between calls with equal byte lengths and preserved timestamps; both readers return the new contents, filter op/repo/PR/head exactly as full scan, and observe a head move without index rewrite. Same PR in another repo cannot match. |
@@ -48,7 +49,7 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — malformed index identities are unknown (`invalid_index_states_force_fresh_record_reads`), not path authority. No HTTP endpoint is added.
+1. **Untrusted text** — malformed index identities are unknown (`invalid_index_states_force_fresh_record_reads`), not path authority. Repo/PR text never reaches a file name; names stay within 255 bytes for every valid run (`index_names_stay_bounded_for_max_valid_identity`). No HTTP endpoint is added.
 2. **Truncated reads** — partial claims/entries cannot authorize skips; partial records preserve full-scan refusal (publication and invalid-state cases).
 3. **Shared state files** — atomic durable publication and exclusive claims are tested at crashes and concurrent writers (A1 cases).
 4. **Fail closed** — directory failure uses the full scan; shadow failure preserves its result/error (A2 cases).
