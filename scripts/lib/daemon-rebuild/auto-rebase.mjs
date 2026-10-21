@@ -8,7 +8,8 @@
  * a PR that has since merged: X is an ancestor of the overlay tip, not of main, and X is
  *   - a head of that PR a build this clone ADOPTED applied (its own rebuild state, `state.adoptedHeads` — never commit
  *     text, which anyone can write), or a base an earlier adopted auto-rebase proved;
- *   - and GitHub says PR #N is MERGED into `main` with a merge commit that is on this main.
+ *   - and GitHub says PR #N is MERGED into `main` with a merge commit that is on this main, AND GitHub links X itself to
+ *     PR #N (`commits/{X}/pulls`).
  * Then the overlay is merged onto the build with X as the merge base (`git merge-tree --merge-base=X`). That keeps EVERY
  * change the overlay made after X (its own behaviour) and lets main's side win only for what X itself carried — the
  * merged PR's own older content. If no candidate merges cleanly, nothing is resolved: the caller sets the overlay aside.
@@ -49,7 +50,7 @@ function onlyPrOwnHistory(git, mainSha, sha) {
  * @returns {Promise<{candidates:Array<{sha:string, pr:number, evidence:string}>, mergedPrs:number[]}>}
  */
 export async function mergedPrOldHeads({
-  git, mainSha, ovSha, ovPr = null, prMerge = null, adoptedHeads = [], otherHeads = [],
+  git, mainSha, ovSha, ovPr = null, prMerge = null, commitPulls = null, adoptedHeads = [], otherHeads = [],
 }) {
   const isAnc = (a, b) => git(['merge-base', '--is-ancestor', a, b]).status === 0;
   const ancStrict = (a, b) => {
@@ -90,12 +91,20 @@ export async function mergedPrOldHeads({
     return verdicts.get(pr);
   };
 
+  // X ITSELF must be linked to PR N by GitHub (`commits/{X}/pulls` lists N — Codex round 10: a branch label on this clone
+  // is not proof; the branch may have advanced after the merge under the old number). No reader or any doubt = no.
+  const xIsThePrs = async (sha, pr) => {
+    if (typeof commitPulls !== 'function') return false;
+    let prs = null;
+    try { prs = await commitPulls(sha); } catch { prs = null; }
+    return Array.isArray(prs) && prs.map(Number).includes(pr);
+  };
   const found = new Map();
   for (const h of Array.isArray(adoptedHeads) ? adoptedHeads : []) {
     const pr = Number(h?.pr);
     if (!Number.isInteger(pr) || pr <= 0 || typeof h?.sha !== 'string' || found.has(h.sha) || !keep(h.sha, pr)) continue;
     if (h.proven === true) { found.set(h.sha, { sha: h.sha, pr, evidence: h.evidence ?? 'proven' }); continue; }
-    if (await mergedIntoThisMain(pr)) found.set(h.sha, { sha: h.sha, pr, evidence: 'adopted-head' });
+    if (await mergedIntoThisMain(pr) && await xIsThePrs(h.sha, pr)) found.set(h.sha, { sha: h.sha, pr, evidence: 'adopted-head' });
   }
 
   const candidates = [...found.values()];

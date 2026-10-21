@@ -126,6 +126,24 @@ export function defaultPrMerge({ pr, root }) {
   }
 }
 
+/** overlay-rebase-on-merge: the PR numbers GitHub links to commit `sha` (`commits/{sha}/pulls`), or null on failure. */
+export function defaultCommitPulls({ sha, root }) {
+  if (!/^[0-9a-f]{40}$/.test(String(sha))) return null;
+  try {
+    const urlRes = spawnSync('git', ['remote', 'get-url', 'origin'], { cwd: root, encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL' });
+    const slug = urlRes.status === 0 ? slugFromOriginUrl(urlRes.stdout) : null;
+    if (!slug) return null;
+    const ghRes = spawnSync('gh', ['api', `repos/${slug}/commits/${sha}/pulls`, '--jq', '[.[].number]'], {
+      encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL',
+    });
+    if (ghRes.status !== 0) return null;
+    const j = JSON.parse(String(ghRes.stdout || 'null'));
+    return Array.isArray(j) ? j : null;
+  } catch {
+    return null;
+  }
+}
+
 export function defaultPrState({ pr, root }) {
   if (pr == null) return null;
   try {

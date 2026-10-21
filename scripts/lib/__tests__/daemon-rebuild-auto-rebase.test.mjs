@@ -82,11 +82,14 @@ function fixture({ mode = 'on' } = {}) {
     ? { state: 'MERGED', baseRefName: 'main', mergeCommit: mergeCommits.get(pr) } : { state: 'OPEN', baseRefName: 'main', mergeCommit: null });
   const logs = [];
   const smoke = vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [{ name: 'reconcile-dry-run', ok: true, ms: 10 }] } }));
-  const tick = () => rebuildClone({ root: clone, env, runSmoke: smoke, prState, prMerge, log: { error: (m) => logs.push(m) } });
+  /** GitHub's commit→PR link: every PR-branch commit pushed in this fixture is linked to the PR whose branch it was on. */
+  const linked = new Map();
+  const commitPulls = async (sha) => (linked.has(sha) ? [linked.get(sha)] : []);
+  const tick = () => rebuildClone({ root: clone, env, runSmoke: smoke, prState, prMerge, commitPulls, log: { error: (m) => logs.push(m) } });
   const head = () => gitOk(clone, ['rev-parse', 'HEAD']).trim();
   const file = (f) => readFileSync(join(clone, f), 'utf8');
   const runGit = (args, opts = {}) => gitRun(args, { cwd: clone, env: { ...env, ...opts.env } });
-  return { clone, env, init, push, mergePr, merged, prState, prMerge, tick, head, file, logs, smoke, runGit };
+  return { clone, env, init, push, mergePr, merged, prState, prMerge, commitPulls, linked, tick, head, file, logs, smoke, runGit };
 }
 
 /**
@@ -96,6 +99,7 @@ function fixture({ mode = 'on' } = {}) {
  */
 async function liveThenMerge(f, { ownOnPrLines = false, registerPr = true } = {}) {
   const x1 = f.push('lane/standing-ruling', f.init, { [GATE]: lines({ 2: 'grant v1', 3: 'scope v1', 4: 'read v1' }) });
+  f.linked.set(x1, PR); // GitHub links the PR's (old) head commit to the PR
   const own = { [GATE]: lines({ 2: 'grant v1', 3: ownOnPrLines ? 'scope v1 + container tweak' : 'scope v1', 4: 'read v1', 10: 'container own' }), 'container.txt': 'own\n' };
   const container = f.push('lane/container', x1, own);
   const u = f.push('lane/unrelated', f.init, { 'unrelated.txt': 'u\n' });
@@ -197,7 +201,7 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     gitOk(f.clone, ['fetch', '-q', 'origin']);
     const plan = await planRebuild({
       git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref: 'lane/container', pr: 5801 }],
-      prMerge: f.prMerge, adoptedHeads: [{ pr: PR, sha: x1 }],
+      prMerge: f.prMerge, commitPulls: async () => [PR], adoptedHeads: [{ pr: PR, sha: x1 }],
       autoRebase: { mode: 'on', source: 'test' },
     });
     expect(plan.ok).toBe(true);
@@ -217,7 +221,7 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     gitOk(f.clone, ['fetch', '-q', 'origin']);
     const overlays = [{ ref: 'lane/container', pr: 5801 }];
     const plan = await planRebuild({
-      git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays, prMerge: f.prMerge, adoptedHeads: [{ pr: PR, sha: x1 }],
+      git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays, prMerge: f.prMerge, commitPulls: async () => [PR], adoptedHeads: [{ pr: PR, sha: x1 }],
       autoRebase: { mode: 'on', source: 'test' },
     });
     expect(plan.autoRebaseCtx.adoptedHeads).toEqual(expect.arrayContaining([expect.objectContaining({ pr: PR, sha: x1, proven: true })]));
@@ -242,7 +246,7 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     gitOk(f.clone, ['fetch', '-q', 'origin']);
     const plan = await planRebuild({
       git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref: 'lane/container', pr: 5801 }],
-      prMerge: f.prMerge, adoptedHeads: [{ pr: PR, sha: x1h }, { pr: PR, sha: x1 }],
+      prMerge: f.prMerge, commitPulls: async () => [PR], adoptedHeads: [{ pr: PR, sha: x1h }, { pr: PR, sha: x1 }],
       autoRebase: { mode: 'on', source: 'test' },
     });
     expect(plan.ok).toBe(true);
@@ -267,7 +271,7 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     const plan = await planRebuild({
       git: f.runGit, headSha: f.init, mainRef: 'origin/main',
       overlays: [{ ref: 'lane/foreign', pr: 5790 }, { ref: 'lane/container', pr: 5801 }], stackMode: 'independent',
-      prMerge: f.prMerge, adoptedHeads: [{ pr: PR, sha: x1 }],
+      prMerge: f.prMerge, commitPulls: async () => [PR], adoptedHeads: [{ pr: PR, sha: x1 }],
       autoRebase: { mode: 'on', source: 'test' },
     });
     expect(plan.decisions.find((d) => d.ref === 'lane/container')).toMatchObject({ action: 'drop', reason: 'conflict' });
@@ -306,7 +310,7 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     gitOk(f.clone, ['fetch', '-q', 'origin']);
     const plan = await planRebuild({
       git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref: 'lane/container', pr: 5801 }],
-      prMerge: f.prMerge, adoptedHeads: [{ pr: PR, sha: x1 }],
+      prMerge: f.prMerge, commitPulls: async () => [PR], adoptedHeads: [{ pr: PR, sha: x1 }],
       autoRebase: { mode: 'on', source: 'test' },
     });
     expect(plan.decisions[0]).toMatchObject({ action: 'drop', reason: 'conflict' });
@@ -323,7 +327,7 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     gitOk(f.clone, ['fetch', '-q', 'origin']);
     const base = {
       git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref: 'lane/container', pr: 5801 }],
-      prMerge: f.prMerge, adoptedHeads: [{ pr: PR, sha: x1 }],
+      prMerge: f.prMerge, commitPulls: async () => [PR], adoptedHeads: [{ pr: PR, sha: x1 }],
       autoRebase: { mode: 'on', source: 'test' },
     };
     expect((await planRebuild(base)).decisions[0]).toMatchObject({ reason: 'applied-auto-rebased' });
@@ -347,7 +351,7 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     const plan = await planRebuild({
       git: f.runGit, headSha: f.init, mainRef: 'origin/main', stackMode: 'independent',
       overlays: [{ ref: 'lane/foreign', pr: 5790 }, { ref: 'lane/container', pr: 5801 }],
-      prMerge: f.prMerge, adoptedHeads: [{ pr: PR, sha: x1 }],
+      prMerge: f.prMerge, commitPulls: async () => [PR], adoptedHeads: [{ pr: PR, sha: x1 }],
       autoRebase: { mode: 'on', source: 'test' },
     });
     expect(plan.alerts.find((a) => a.kind === 'overlay-auto-rebased')?.detail.ref).not.toBe('lane/container');
@@ -365,7 +369,7 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     const plan = await planRebuild({
       git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref: 'lane/container', pr: 5801 }],
       seenHeads: [{ pr: 5801, sha: hq }],
-      prMerge: f.prMerge, adoptedHeads: [{ pr: PR, sha: x1 }],
+      prMerge: f.prMerge, commitPulls: async () => [PR], adoptedHeads: [{ pr: PR, sha: x1 }],
       autoRebase: { mode: 'on', source: 'test' },
     });
     expect(plan.decisions[0]).toMatchObject({ action: 'drop', reason: 'conflict' });
@@ -401,7 +405,7 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     gitOk(f.clone, ['fetch', '-q', 'origin']);
     const base = {
       git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref: 'lane/container', pr: 5801 }],
-      prMerge: f.prMerge, autoRebase: { mode: 'on', source: 'test' },
+      prMerge: f.prMerge, commitPulls: async () => [PR], autoRebase: { mode: 'on', source: 'test' },
     };
     expect((await planRebuild({ ...base, adoptedHeads: [{ pr: PR, sha: x1 }] })).decisions[0]).toMatchObject({ reason: 'applied-auto-rebased' });
     // the container itself once sat exactly at x1 (its own feature could be x1's content) → blocks
@@ -413,5 +417,20 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     // GitHub unreachable → no proof → set aside
     const noGh = await planRebuild({ ...base, prMerge: async () => null, adoptedHeads: [{ pr: PR, sha: x1 }] });
     expect(noGh.decisions[0]).toMatchObject({ action: 'drop', reason: 'conflict' });
+  });
+
+  it('round 10: X not linked to the PR by GitHub (a branch label alone) is no proof — set aside', async () => {
+    const f = fixture({ mode: 'on' });
+    const x1 = f.push('lane/standing-ruling', f.init, { [GATE]: lines({ 2: 'grant v1' }) });
+    f.push('lane/container', x1, { [GATE]: lines({ 2: 'grant v1', 10: 'own' }) });
+    const x2 = f.push('lane/standing-ruling', f.init, { [GATE]: lines({ 2: 'grant v2' }) });
+    f.mergePr(PR, x2, 'lane/standing-ruling');
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const plan = await planRebuild({
+      git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref: 'lane/container', pr: 5801 }],
+      prMerge: f.prMerge, commitPulls: async () => [], adoptedHeads: [{ pr: PR, sha: x1 }], autoRebase: { mode: 'on', source: 'test' },
+    });
+    expect(plan.decisions[0]).toMatchObject({ action: 'drop', reason: 'conflict' });
+    expect(plan.alerts.map((a) => a.kind)).toContain('overlay-set-aside');
   });
 });

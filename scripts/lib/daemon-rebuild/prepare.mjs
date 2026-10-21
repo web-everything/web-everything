@@ -23,7 +23,7 @@ import {
   readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, makePrBaseChain, resolveOverlayStackMode, persistStackBases,
   resolveOverlayAutoRebase,
 } from '../daemon-overlays.mjs';
-import { fetchMainAndOverlays, recordedEdgeSha, defaultPrMerge } from './edge-fetch.mjs';
+import { fetchMainAndOverlays, recordedEdgeSha, defaultPrMerge, defaultCommitPulls } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
 import { repairCloneRefs, holdsCloneWriteLock } from '../lane-repair.mjs';
@@ -40,7 +40,7 @@ import {
  */
 export async function prepareRebuild({
   root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes,
-  prMerge = (pr) => defaultPrMerge({ pr, root }),
+  prMerge = (pr) => defaultPrMerge({ pr, root }), commitPulls = (sha) => defaultCommitPulls({ sha, root }),
 }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
@@ -309,7 +309,7 @@ export async function prepareRebuild({
     git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysBefore, prState, mainOnly, edgeResolve,
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
-    autoRebase: resolveOverlayAutoRebase(env), adoptedHeads: adoptedHeads.adopted, seenHeads: adoptedHeads.seen, prMerge,
+    autoRebase: resolveOverlayAutoRebase(env), adoptedHeads: adoptedHeads.adopted, seenHeads: adoptedHeads.seen, prMerge, commitPulls,
   });
   // The chains gh answered completely are written back onto the entries (only when they changed), so a rebuild that
   // cannot reach gh later still knows the stacks. Best effort: a busy or unwritable list never fails the rebuild.
