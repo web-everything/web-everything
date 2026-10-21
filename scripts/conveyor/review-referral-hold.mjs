@@ -39,21 +39,23 @@ export function reviewRunEvidence(run) {
   if (run?.op !== 'review-pr') return null;
   const read = run.findings?.read;
   const head = read?.netBasis?.rev;
-  // A run rewound to resume (card xq1xbsl) has dropped its verdict and its referral step. Until the resumed pass has
-  // run `advise` (the last step before it parks again), `resumeOf` (what the rewind set aside) stands in for them, so a
-  // resume that dies or throws anywhere part-way still reads as the parked run it was and the next tick resumes it
-  // again instead of starting a fresh panel that would raise the new referrals this card exists to stop.
+  // A rewind drops the referral result. Use the saved pass until this pass finishes referralVerdict; an unrelated
+  // advisory failure must not hide a successful persist behind the saved persistence failure (PR #5771).
   const ownAdvise = run.stepTimings?.find(t => t.step === 'advise')?.finishedAt;
   const resuming = Boolean(run.resumeOf) && !ownAdvise;
-  const ownVerdict = resuming ? undefined : run.findings?.referralVerdict ?? run.verdict;
-  const verdict = resuming ? run.resumeOf.verdict : ownVerdict;
-  // `advise` runs AFTER the referral step, so the rewind drops its timing too; the parked pass's finish time stands in.
-  const finish = ownAdvise ?? run.resumeOf?.adviseFinishedAt;
+  const ownReferral = resuming && run.findings?.referralVerdict
+    ? run.stepTimings?.find(t => t.step === 'referralVerdict')?.finishedAt : undefined;
+  const savedReferral = resuming && !ownReferral;
+  const verdict = savedReferral ? run.resumeOf.verdict : run.findings?.referralVerdict ?? run.verdict;
+  const finish = ownAdvise ?? ownReferral ?? run.resumeOf?.adviseFinishedAt;
   // A resumed run starts again at the resume: the rulings that woke it are answered. Only once the pass is finished,
   // though: an unfinished resume has answered nothing yet, and must stay wakeable by the ruling that started it.
   const startedAt = Math.max(Date.parse(run.stepTimings?.find(t => t.step === 'read')?.startedAt),
     resuming ? 0 : Date.parse(run.resumedAt ?? '') || 0);
-  const completedAt = Date.parse(finish);
+  // An interrupted persist retry still spends a slot. Start its next backoff at the latest resume, rather than
+  // the original parked pass: after an outage that old deadline could spend every remaining slot on adjacent ticks.
+  const completedAt = Math.max(Date.parse(finish),
+    resuming && verdict?.pendingReferrals?.includes('referral-persistence-failed') ? Date.parse(run.resumedAt ?? '') || 0 : 0);
   if (!sha(head) || !Number.isFinite(startedAt)) return null;
   if (!Number.isFinite(completedAt)) {
     // Crashes before/during advise still consumed a retry. Keep them in the cached projection, without
@@ -62,8 +64,9 @@ export function reviewRunEvidence(run) {
       incomplete: true, parked: false, attempted: false, persistenceFailed: false, count: 0,
       pending: ['review-incomplete'], rulings: [] };
   }
-  const state = (resuming ? run.resumeOf.mandatoryReferrals : run.findings?.mandatoryReferrals)?.effects?.find(e => e.type === 'review.mandatory-referrals')?.result;
+  const state = (savedReferral ? run.resumeOf.mandatoryReferrals : run.findings?.mandatoryReferrals)?.effects?.find(e => e.type === 'review.mandatory-referrals')?.result;
   const pending = verdict?.pendingReferrals ?? [];
+  const resumeAdvise = Boolean(resuming && ownReferral && !pending.includes('referral-persistence-failed'));
   const findingKeys = pending.filter(key => !PENDING_REASON_TOKENS.has(key));
   const attempted = new Set((state?.records ?? [])
     .filter(r => r.repo === read.repo && r.pr === Number(read.pr) && r.head === head && r.attempted)
@@ -72,6 +75,7 @@ export function reviewRunEvidence(run) {
   // Inline, not a helper: the disk cache is keyed by this function's source.
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
     ...(run.idChosen === true ? { custom: true } : {}),
+    ...(resumeAdvise ? { resumeAdvise: true } : {}),
     parked: verdict?.verdict === 'needs-human' && pending.length > 0,
     // A list of only reason tokens names no referral, so it was never "attempted" (not vacuously true).
     pending, attempted: findingKeys.length > 0 && findingKeys.every(key => attempted.has(key)),
@@ -250,19 +254,20 @@ function latestReviewAttempt(history) {
  * parked on mandatory referrals at the PR's CURRENT head, it persisted them, and everything that woke it since it began
  * is a ruling. Any re-arm, send-back or operator reply since asks for a fresh look, so it answers `null`, as does a
  * head that moved (a new push owes a new review). A parked run whose referral persist FAILED is always resumable
- * (unless a fresh look was asked): the retry budget picks the time, and the retry re-runs the persist step only. Pure.
+ * (unless the operator in person asked for a fresh look): the retry budget picks the time, and the retry re-runs the persist step only. Pure.
  * @returns {{id: string, head: string}|null}
  */
 export function findResumableParkedRun(pr, runs, { repo } = {}) {
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number));
   const last = latestReviewAttempt(history);
-  if (!last?.parked || last.head !== pr.headRefOid) return null;
+  if ((!last?.parked && !last?.resumeAdvise) || last.head !== pr.headRefOid) return null;
   // A run whose referral persist failed already holds its panel's verdict; what it owes is the persist step again,
   // not a new panel (live 2026-10-20, #5752: two ledger-push misses on one head each cost a full panel, and the
   // operator's Accept was refused until a person noticed). The hold decides WHEN (its 15/30/60 retry budget); once a
   // review is dispatched at all, it resumes this run at the referral step. Only the operator in person asks for a
   // fresh look here: an automated re-arm or a ruling cannot turn a persist retry into a new panel.
-  if (last.persistenceFailed) return operatorWakeTime(pr, last) > last.startedAt ? null : { id: last.id, head: last.head };
+  // An automated wake that was ignored during persistence must not start a panel when only its advisory is left.
+  if (last.persistenceFailed || last.resumeAdvise) return operatorWakeTime(pr, last) > last.startedAt ? null : { id: last.id, head: last.head };
   const events = wakeEvents(pr, last).filter(e => e.at > last.startedAt);
   if (events.some(e => e.kind === 'fresh')) return null;
   if (!last.attempted) return null;
@@ -281,6 +286,9 @@ function evaluateReferralHold(pr, runs, { repo, now = Date.now(), env = process.
   const last = latestReviewAttempt(attempts);
   const history = attempts.filter(r => Number.isFinite(r.completedAt))
     .sort((a, b) => b.completedAt - a.completedAt);
+  // The referral step succeeded but publication is still owed. This release also keeps the same-head hold from
+  // replacing the obsolete persistence hold while the existing run retries its advisory step.
+  if (last?.resumeAdvise && last.head === pr.headRefOid) return { hold: null, released: 'advisory-retry' };
   if (!last?.parked || last.head !== pr.headRefOid || (!last.attempted && !last.persistenceFailed)) return { hold: null, released: null };
   // A failed persist checks its retry budget BEFORE any wake (card 5752): a ruling or an automated re-arm cannot fix a
   // persist, so it neither skips the backoff nor revives a spent budget. Only the operator in person (the needs-you
