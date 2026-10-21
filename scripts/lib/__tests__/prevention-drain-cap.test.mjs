@@ -215,6 +215,43 @@ describe('fairness without a writable cursor, and the shared allowance', () => {
     await drainPendingPrevention({ lane: f.lane }, { pendingDir: f.pendingDir, exec, write: () => {}, counter: { left: 0 }, batch: vi.fn() });
     expect(exec).not.toHaveBeenCalled();
   });
+  it('a lookup that eats the deadline moves the cursor past that card across ticks (fresh workers): its successors are reached', async () => {
+    const f = fixture(['a', 'b']); let t = 0; const admitted = []; const lookups = [];
+    const batch = async input => { admitted.push(input.cardPath.split('/')[1][0]); return { batched: true }; };
+    const exec = (cmd, args) => { const id = args[5].split('/')[1][0]; lookups.push(id); if (id === 'a') t += 61_000; else t = 0; return ''; };
+    for (let tick = 0; tick < 3; tick++) {
+      resetDrainCursorMemory(); t = 0;
+      await drainPendingPrevention({ lane: f.lane }, { pendingDir: f.pendingDir, exec, batch, write: () => {}, maxCards: 1,
+        deadlineAt: 60_000, now: () => t, cursorPath: f.cursorPath });
+    }
+    expect(lookups.slice(0, 2)).toEqual(['a', 'b']);
+    expect(admitted).toContain('b');
+  });
+  it('a malformed or mis-keyed owed record is a failed attempt: reported, kept, and the records behind it are still reached over ticks', async () => {
+    const f = fixture([]); const dir = join(f.stateDir, 'owed-prevention'); mkdirSync(dir, { recursive: true });
+    const bad = '1'.repeat(64); const good = '2'.repeat(64);
+    writeFileSync(join(dir, `${bad}.json`), '{ not json');
+    writeFileSync(join(dir, `${good}.json`), JSON.stringify({ key: good, status: 'owed', input: { owedKey: good, title: 'good' } }));
+    const filed = []; const results = [];
+    for (let tick = 0; tick < 3; tick++) {
+      resetDrainCursorMemory();
+      results.push(...await reconcileOwedPrevention({ stateDir: f.stateDir, maxFilings: 1, cursorPath: f.cursorPath,
+        file: async input => { filed.push(input.title); return { ok: true, skipped: true }; } }));
+    }
+    expect(filed).toContain('good');
+    expect(results.some(result => result.ok === false && /unreadable/.test(result.reason))).toBe(true);
+    expect(existsSync(join(dir, `${bad}.json`))).toBe(true);
+  });
+  it('a mis-keyed owed record does not abort the round either', async () => {
+    const f = fixture([]); const dir = join(f.stateDir, 'owed-prevention'); mkdirSync(dir, { recursive: true });
+    const wrong = '3'.repeat(64); const good = '4'.repeat(64);
+    writeFileSync(join(dir, `${wrong}.json`), JSON.stringify({ key: wrong, status: 'owed', input: { owedKey: good, title: 'x' } }));
+    writeFileSync(join(dir, `${good}.json`), JSON.stringify({ key: good, status: 'owed', input: { owedKey: good, title: 'good' } }));
+    const filed = [];
+    const results = await reconcileOwedPrevention({ stateDir: f.stateDir, file: async input => { filed.push(input.title); return { ok: true, skipped: true }; } });
+    expect(filed).toEqual(['good']);
+    expect(results.some(result => result.ok === false && /identity mismatch/.test(result.reason))).toBe(true);
+  });
   it('rotateAfter: a seed rotates only when there is no cursor value', () => {
     expect(rotateAfter(['a', 'b', 'c'], undefined, 1)).toEqual(['b', 'c', 'a']);
     expect(rotateAfter(['a', 'b', 'c'], undefined, undefined)).toEqual(['a', 'b', 'c']);

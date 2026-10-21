@@ -419,7 +419,11 @@ export async function drainPendingPrevention({ lane }, {
         continue;
       }
       // Re-checked right before the admission: the ls-tree above can itself take long.
-      if (now() >= deadlineAt) break;
+      if (now() >= deadlineAt) {
+        // The lookup ate the deadline: this card WAS attempted, so the next tick resumes after it (it stays in the spool).
+        if (cursorPath) writeDrainCursor(cursorPath, { pending: name });
+        break;
+      }
       const result = await withRecoveryCard(lane, entry.rel, entry.content, () => batch({
         laneDir: lane, cardPath: entry.rel, kind: 'prevention', actor: 'mechanical',
         idemKey: entry.idemKey, source: entry.source,

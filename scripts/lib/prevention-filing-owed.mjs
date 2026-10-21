@@ -59,14 +59,27 @@ export async function reconcileOwedPrevention({ stateDir = cardBatchStateDir(), 
   const results = [];
   let started = 0;
   for (const name of names) {
-    const record = read(join(directory(stateDir), name));
-    if (record.status === 'done') continue;
+    // Every record is judged on its own: an unreadable, malformed or mis-keyed one is a failed ATTEMPT (it spends the allowance,
+    // is reported, stays on disk and the cursor moves past it) and must never stop the records behind it.
+    let record;
+    try {
+      record = read(join(directory(stateDir), name));
+      if (!record) continue;
+      if (record.status === 'done') continue;
+    } catch (e) {
+      if (now() >= deadlineAt || (counter ? counter.left <= 0 : started >= maxFilings)) break;
+      started++; if (counter) counter.left--;
+      results.push({ ok: false, step: 'owed', reason: `owed record ${name.slice(0, 12)} unreadable: ${e.message}` });
+      if (cursorPath) writeDrainCursor(cursorPath, { owed: name });
+      continue;
+    }
     if (now() >= deadlineAt || (counter ? counter.left <= 0 : started >= maxFilings)) break;
-    if (`${preventionFilingKey(record.input)}.json` !== name) throw Error('owed filing identity mismatch');
     started++;
     if (counter) counter.left--;
-    try { results.push(await fileOwedPrevention(record.input, file, { stateDir })); }
-    catch (e) { results.push({ ok: false, step: 'owed', reason: e.message }); }
+    try {
+      if (`${preventionFilingKey(record.input)}.json` !== name) throw Error('owed filing identity mismatch');
+      results.push(await fileOwedPrevention(record.input, file, { stateDir }));
+    } catch (e) { results.push({ ok: false, step: 'owed', reason: e.message }); }
     // A filing deferred for want of a lane was never attempted: it keeps its place, and the rest wait for the next tick.
     if (results.at(-1)?.deferred) break;
     if (cursorPath) writeDrainCursor(cursorPath, { owed: name });
