@@ -1,4 +1,5 @@
 ---
+bornAs: x3ij600
 kind: story
 size: 2
 status: open
@@ -11,8 +12,8 @@ tags: []
 
 Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5647 (reviewed head `3091c68ac79560cb67f6d5a36f93db237cc8b7b3`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:backlog/xh2689e-prevention-add-a-deterministic-card-lint-gate-requiring-each.md:6` — (edge-case, degraded) Stale provisional scope misses overlap with the existing numbered card
-   - Scenario: The scope names nonexistent we:backlog/xmokcam-prevention-card-lint-plus-review-lens-when-prose-enumerates.md. That card already exists as we:backlog/6262-prevention-card-lint-plus-review-lens-when-prose-enumerates.md, with bornAs: xmokcam. Probe: pass the authored scope to overlapAtLaunch with an active lease covering the numbered file. It returns outcome='launch' and no overlaps; editing the numbered file also registers as a scope breach. Replacing the stale scope with the current path returns outcome='wait' on that lease and eliminates the breach. Normalize the scope and corresponding body citati
+1. `we:backlog/6589-prevention-add-a-deterministic-card-lint-gate-requiring-each.md:6` — (edge-case, degraded) Stale provisional scope misses overlap with the existing numbered card
+   - Scenario: The scope names nonexistent we:backlog/6262-prevention-card-lint-plus-review-lens-when-prose-enumerates.md. That card already exists as we:backlog/6262-prevention-card-lint-plus-review-lens-when-prose-enumerates.md, with bornAs: xmokcam. Probe: pass the authored scope to overlapAtLaunch with an active lease covering the numbered file. It returns outcome='launch' and no overlaps; editing the numbered file also registers as a scope breach. Replacing the stale scope with the current path returns outcome='wait' on that lease and eliminates the breach. Normalize the scope and corresponding body citati
    - Claude's re-check: demonstrated break
 
 ## Acceptance

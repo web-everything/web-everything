@@ -1,4 +1,5 @@
 ---
+bornAs: x4kqidu
 kind: story
 size: 2
 status: open
@@ -11,7 +12,7 @@ tags: []
 
 Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5674 (reviewed head `808420d8ed083a026be7537e103ca633d91eb554`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:backlog/x9jn692-red-team-follow-ups-from-web-everything-web-everything-5551.md:14` — (edge-case, degraded) x9jn692 duplicates existing open card #6295 for the same finding.
+1. `we:backlog/6412-red-team-follow-ups-from-web-everything-web-everything-5551.md:14` — (edge-case, degraded) x9jn692 duplicates existing open card #6295 for the same finding.
    - Scenario: Admit this card while we:backlog/6295-saved-and-posted-red-team-results-share-one-finding-id.md remains open. Both track the same PR #5551 finding at we:drain-saved-red-team.mjs:58 and require saved/posted representations to share an identity. A read-only Node probe passed both cards' actual metadata to orderQueue; it returned [6295, x9jn692], totaling four points for one two-point fix. The cards have independent identities and no supersession relationship, leaving duplicate outstanding work. Extend #6295 with the replay scenario instead of admitting a second open card.
    - Claude's re-check: demonstrated break
 
