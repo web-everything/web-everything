@@ -2000,8 +2000,8 @@ process.exit(0);
     expect(r.status).not.toBe(0);
     const payload = JSON.parse(r.stdout.trim().split('\n').filter(Boolean).pop());
     expect(payload.error).toMatch(/no review:human label/);
-    // Refused by the PURE decider, so nothing was written.
-    expect(ghCalls()).toEqual(['pr view']);
+    // The posting identity is checked first; the pure decider then refuses without a write.
+    expect(ghCalls()).toEqual(['api user', 'pr view']);
     expect(existsSync(join(dir, 'comment.md'))).toBe(false);
   });
 
