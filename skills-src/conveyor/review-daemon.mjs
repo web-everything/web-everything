@@ -725,7 +725,9 @@ export function runReviewTick({
         freshReview = action.action === 'fresh-review';
         if (freshReview && !budgetKnown) {
           log(`review-daemon: skipping fresh review for #${request.pr}: exact reconcile attempts/cap unavailable`);
-          hold(request, 'fresh review needs the exact reconcile attempts/cap, which the plan did not carry');
+          const seen = [...(plan.refusals ?? []), ...(plan.dispatch ?? [])].filter(d => Number(d.prNumber) === request.pr)
+            .map(d => `${String(d.kind).slice(0, 40)}${d.variant ? `/${String(d.variant).slice(0, 20)}` : ''} attempts=${d.attempts ?? '-'} cap=${d.cap ?? '-'}`).join('; ');
+          hold(request, `fresh review needs the exact reconcile attempts/cap, which the plan did not carry (plan rows for this PR: ${seen || 'none'})`);
           continue;
         }
       }

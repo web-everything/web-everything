@@ -8,7 +8,8 @@ import { execFileSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { buildCliDaemonEffects, runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
-import { defaultRearmStaleAcceptance } from '../../operations/promote-draft-pr-dispatch.mjs';
+// The REAL provider function: another suite in this file may vi.mock this module's namespace, so never read it off a static import.
+const { defaultRearmStaleAcceptance: realRearmProvider } = await vi.importActual('../../operations/promote-draft-pr-dispatch.mjs');
 import { normalizeDiffFingerprint } from '../../lib/review-escalation.mjs';
 import { promoteDraftsGuarded, promoteDraftsThenReplan, rearmStaleAcceptanceGuarded, rearmStaleAcceptsThenReplan } from '../review-tick-promote.mjs';
 
@@ -348,7 +349,7 @@ describe('stale-accept hold vs guarded re-arm share one coverage verdict (#5771 
   };
   const row = { kind: 'restore-review-label', variant: 'stale-accept', prNumber: 5771, headRefOid: B, label: 'review:pending' };
   const other = { kind: 'review', prNumber: 9, attempts: 0 };
-  const provider = (text, rearm = vi.fn(() => ({ ok: true })), { prOverride = {}, reviews = [] } = {}) => ({ rearm, fn: () => defaultRearmStaleAcceptance({
+  const provider = (text, rearm = vi.fn(() => ({ ok: true })), { prOverride = {}, reviews = [] } = {}) => ({ rearm, fn: () => realRearmProvider({
     repoSlug: REPO_SLUG, prNumber: 5771, headSha: B, readPr: () => ({ ...pr, ...prOverride }), rearm, readReviews: () => reviews,
     readNetDiff: () => ({ scored: true, rev: B, text }) }) });
 
@@ -363,7 +364,7 @@ describe('stale-accept hold vs guarded re-arm share one coverage verdict (#5771 
     expect(p.rearm).toHaveBeenCalledTimes(1);
   });
   it('provider: an unreadable live diff is a plain refusal, never a cover', () => {
-    const r = defaultRearmStaleAcceptance({ repoSlug: REPO_SLUG, prNumber: 5771, headSha: B, readPr: () => pr, rearm: vi.fn(), readReviews: () => [], readNetDiff: () => ({ scored: false }) });
+    const r = realRearmProvider({ repoSlug: REPO_SLUG, prNumber: 5771, headSha: B, readPr: () => pr, rearm: vi.fn(), readReviews: () => [], readNetDiff: () => ({ scored: false }) });
     expect(r.ok).toBe(false); expect(r.covers).toBeUndefined();
   });
   it('tick: the #5771 shape (planner holds, re-arm proves cover) re-plans with the head-bound release key and uses the planner\'s normal rows', () => {
@@ -460,8 +461,8 @@ describe('stale-accept hold vs guarded re-arm share one coverage verdict (#5771 
   });
   it('provider (audit): exception text never reaches the refusal reason (secret / CR injection)', () => {
     const boom = () => { throw new Error('GH_TOKEN=TOPSECRET\rFORGED'); };
-    const a = defaultRearmStaleAcceptance({ repoSlug: REPO_SLUG, prNumber: 5771, headSha: B, readPr: boom, rearm: vi.fn() });
-    const b = defaultRearmStaleAcceptance({ repoSlug: REPO_SLUG, prNumber: 5771, headSha: B, readPr: () => pr, readReviews: boom, rearm: vi.fn(), readNetDiff: () => ({ scored: true, rev: B, text: DIFF }) });
+    const a = realRearmProvider({ repoSlug: REPO_SLUG, prNumber: 5771, headSha: B, readPr: boom, rearm: vi.fn() });
+    const b = realRearmProvider({ repoSlug: REPO_SLUG, prNumber: 5771, headSha: B, readPr: () => pr, readReviews: boom, rearm: vi.fn(), readNetDiff: () => ({ scored: true, rev: B, text: DIFF }) });
     for (const r of [a, b]) { expect(r.ok).toBe(false); expect(r.covers).toBeUndefined(); expect(r.reason).not.toMatch(/TOPSECRET|FORGED|\r/); }
   });
   describe('whole tick: release -> normal rows -> red-team request carries attempts/cap (#5771 live shape)', () => {

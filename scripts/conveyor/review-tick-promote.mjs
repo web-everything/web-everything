@@ -153,7 +153,7 @@ export function rearmStaleAcceptsThenReplan({ plan, rawPrs = null, repo, rearm, 
     : null;
   try {
     // A FRESH read, never the old snapshot with a synthesized label swap: the real swap's exact label result is GitHub's.
-    const next = replan(null, releasedKeys.length ? { staleAcceptReleased: releasedKeys } : undefined);
+    const next = (releasedKeys.length ? replan(null, { staleAcceptReleased: releasedKeys }) : replan(null));
     if (!next || !Array.isArray(next.dispatch)) throw new Error('re-plan returned no dispatch list');
     // Re-prove right after the re-plan (formal reviews and the full thread are re-read): a cover that does not hold AGAIN, for the
     // same head and accept evidence, keeps the ORIGINAL (held) plan. This closes the proof -> re-plan window the planner cannot see.
