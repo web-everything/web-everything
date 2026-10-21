@@ -395,6 +395,11 @@ describe('ignoredRulings — an older-head block the current-head reviewer ruled
       const reblock = { ...block, supersedes: ['r0'] };
       expect(ignoredRulings({ headRefOid: H3, comments: [...history, comment(r2([fixed]), 10), comment(r2([fixed, reblock]), 12), h3] })?.matches).toHaveLength(1);
     });
+    it('an auto-policy block on the current head re-check keeps the ladder (Codex audit control)', () => {
+      const r3 = recheck(H2, record({ head: H3, runId: 'run-3' }));
+      const ig = ignoredRulings({ headRefOid: H3, comments: [...history, comment(r2([]), 10), comment(r2([fixed]), 12), comment(r3, 20), autoBlock(r3, 22)] });
+      expect(ig?.matches).toHaveLength(1);
+    });
     it('replay #5762 @5eba5a13: no false dispute; the re-checked finding is pending', () => {
       const fx = fixture('pr-5762-5eba5a13-recheck-after-not-real.json');
       const pr = { number: fx.pr, headRefOid: fx.headRefOid, body: fx.body, createdAt: fx.createdAt, comments: fx.comments };
