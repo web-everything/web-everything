@@ -103,22 +103,26 @@ describe('planRedTeamRuling: refusals', () => {
 });
 
 /** A fake PR whose thread grows as the sinks post (as the operator account), so the read-back proves the gate released the break. */
-function fake({ cardOk = true, postFails = null, liveHead = HEAD, labels = [], identity = OP, author = 'chalbert', claims } = {}) {
+function fake({ cardOk = true, postFails = null, liveHead = HEAD, labels = [], identity = OP, author = 'chalbert', claims, noPid = false } = {}) {
   const comments = thread();
-  const posted = [], cards = [], labelCalls = [], spawned = new Set();
-  const claimed = new Map();
+  const posted = [], cards = [], labelCalls = [];
+  const gens = new Map(), receipts = new Set();
   let clock = 1_000_000;
+  const memClaims = {
+    claim: (k) => { if (!gens.has(k)) { gens.set(k, { gen: 0, at: clock }); return { created: true, gen: 0, at: clock }; } return { created: false, ...gens.get(k) }; },
+    reclaim: (k, g) => { if (gens.get(k).gen !== g) return false; gens.set(k, { gen: g + 1, at: clock }); return true; },
+    spawned: (k) => receipts.has(k), markSpawned: (k) => receipts.add(k), now: () => clock,
+  };
   const sinks = createRecordRedTeamRulingSinks({
     readThread: () => ({ headRefOid: liveHead, labels, comments: [...comments] }),
     resolveIdentity: () => identity,
-    claims: claims ?? { claim: (k) => { if (claimed.has(k)) return { created: false, at: claimed.get(k) }; claimed.set(k, clock); return { created: true, at: clock }; }, now: () => clock },
-    jobSpawned: (s) => spawned.has(s),
-    fileCard: (c, session) => { cards.push(c); if (!cardOk) return { ok: false, error: 'spawn failed' }; spawned.add(session); return { ok: true, session }; },
+    claims: claims ?? memClaims,
+    fileCard: (c, session) => { cards.push(c); if (!cardOk) return { ok: false, error: 'spawn failed' }; return { ok: true, session, handle: noPid ? undefined : 'pid:4242' }; },
     post: (r, n, body) => { if (postFails?.(body)) throw new Error('gh down'); posted.push(body); comments.push({ author: { login: author }, createdAt: '2026-10-20T23:55:00Z', body }); },
     runSetLabel: (exe, args) => { labelCalls.push(args); return '{"ok":true}'; },
     appendEvents: async () => {}, warn: () => {},
   });
-  return { sinks, posted, cards, labelCalls, comments, advance: (ms) => { clock += ms; } };
+  return { sinks, posted, cards, labelCalls, comments, memClaims, advance: (ms) => { clock += ms; } };
 }
 const payloadFor = (over = {}) => planRedTeamRuling(read(), input(over));
 const heldAfter = (comments) => readRedTeamDisposition({ comments: operatorBoundComments(comments), pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS }).held;
@@ -169,6 +173,45 @@ describe('sinks', () => {
     f.advance(121_000);
     expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/not queued/);
     expect(f.cards).toHaveLength(2); // two ATTEMPTS, neither of which spawned (cardOk false); no job exists to duplicate
+  });
+  it('card: a failed spawn that left a log behind is NOT proof of a queued job (no confirmed child start)', () => {
+    const f = fake({ noPid: true });
+    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/no confirmed child start/);
+    expect(f.memClaims.spawned(payloadFor().jobKey)).toBe(false);
+    expect(heldAfter(f.comments)).toHaveLength(1);
+    f.advance(121_000);
+    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/no confirmed child start/);
+    expect(f.cards).toHaveLength(2);
+  });
+  it('card: two retries on one expired claim spawn at most once (atomic re-claim)', () => {
+    const f = fake();
+    f.memClaims.claim(payloadFor().jobKey); // an earlier invocation claimed and died before spawning
+    f.advance(121_000);
+    const realReclaim = f.memClaims.reclaim;
+    // the rival wins generation 1 between our observation and our takeover
+    f.memClaims.reclaim = (k, g) => { realReclaim(k, g); return realReclaim(k, g); };
+    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/just took over/);
+    expect(f.cards).toHaveLength(0);
+  });
+  it('file claims: generations are atomic and a receipt, not a log, proves the spawn', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { createFileClaims } = await import('../record-red-team-ruling-io.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'claims-'));
+    try {
+      let t = 1000;
+      const c = createFileClaims({ dir, nowMs: () => t });
+      expect(c.claim('k')).toMatchObject({ created: true, gen: 0 });
+      expect(c.claim('k')).toMatchObject({ created: false, gen: 0, at: 1000 });
+      expect(c.reclaim('k', 0)).toBe(true);
+      expect(c.reclaim('k', 0)).toBe(false);
+      expect(c.claim('k')).toMatchObject({ created: false, gen: 1 });
+      expect(c.spawned('k')).toBe(false);
+      c.markSpawned('k', { session: 's', handle: 'pid:1' });
+      expect(c.spawned('k')).toBe(true);
+      expect(c.spawned('other')).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('card: the job key is stable for the same ruling and differs per break/result', () => {
     expect(payloadFor().jobKey).toBe(payloadFor().jobKey);

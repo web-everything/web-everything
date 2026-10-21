@@ -5,7 +5,7 @@
  *   not-real). Every collaborator is injectable so the tests run with no network.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -51,20 +51,37 @@ export function createRecordRedTeamRulingReader({ env = process.env, readThread 
   };
 }
 
-/** A local, atomic claim per card job (a `wx` file): the serialization point GitHub comments cannot be. */
+/**
+ * A local, atomic claim per card job, in numbered GENERATIONS (`<key>.<n>.claim`, each made with `wx`). Taking over an
+ * expired claim means creating generation n+1, which only one caller can do. The spawn PROOF is a separate receipt
+ * (`<key>.spawned`) written only after the child's start was confirmed (a pid), never the landing job's log file
+ * (that is opened before the spawn, so it proves nothing).
+ */
 export function createFileClaims({ dir = join(automationStateRoot(), 'red-team-ruling-claims'), nowMs = Date.now } = {}) {
+  const latest = (key) => {
+    let gen = -1, at = 0;
+    for (const f of readdirSync(dir)) {
+      const m = f.startsWith(`${key}.`) ? /\.(\d+)\.claim$/.exec(f) : null;
+      if (m && Number(m[1]) > gen) { gen = Number(m[1]); try { at = Number(JSON.parse(readFileSync(join(dir, f), 'utf8')).at) || 0; } catch { at = 0; } }
+    }
+    return { gen, at };
+  };
+  const make = (key, gen) => {
+    try { writeFileSync(join(dir, `${key}.${gen}.claim`), JSON.stringify({ at: nowMs() }), { flag: 'wx' }); return true; }
+    catch (e) { if (e?.code === 'EEXIST') return false; throw e; }
+  };
   return {
     claim(key) {
       mkdirSync(dir, { recursive: true });
-      const path = join(dir, `${key}.json`);
-      try { writeFileSync(path, JSON.stringify({ at: nowMs() }), { flag: 'wx' }); return { created: true, at: nowMs() }; }
-      catch (e) {
-        if (e?.code !== 'EEXIST') throw e;
-        let at = 0;
-        try { at = Number(JSON.parse(readFileSync(path, 'utf8')).at) || 0; } catch { /* unreadable claim: treated as old */ }
-        return { created: false, at };
-      }
+      const cur = latest(key);
+      if (cur.gen < 0 && make(key, 0)) return { created: true, gen: 0, at: nowMs() };
+      const seen = latest(key);
+      return { created: false, gen: seen.gen, at: seen.at };
     },
+    /** Take over the claim observed at `gen`. Exactly one caller wins generation gen+1. */
+    reclaim(key, gen) { return make(key, gen + 1); },
+    spawned(key) { return existsSync(join(dir, `${key}.spawned`)); },
+    markSpawned(key, info) { writeFileSync(join(dir, `${key}.spawned`), JSON.stringify({ ...info, at: nowMs() })); },
     now: nowMs,
   };
 }
@@ -83,8 +100,6 @@ const spawnStableCardJob = (input, session) => {
 export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_ROOT, readThread = readLiveThread,
   resolveIdentity = () => resolveOperatorIdentity({ env }), claims = createFileClaims(),
   fileCard = spawnStableCardJob,
-  /** Was the stable job already spawned? Its log file is opened before the process starts. */
-  jobSpawned = (session) => existsSync(preventionCardLandingLogPath(session)),
   post = (repo, pr, body) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body, env),
   runSetLabel = execFileSync, appendEvents = appendLedgerEvents,
   warn = (m) => process.stderr.write(`${m}\n`), now = () => new Date().toISOString() } = {}) {
@@ -120,11 +135,14 @@ export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_
     [RED_TEAM_RULING_CARD_EFFECT]: (p) => {
       const comments = recheck(p);
       const session = p.session;
-      // 1. Serialize: one atomic local claim per (PR, head, result, breaks). A second run reconciles instead of re-spawning.
+      // 1. Serialize: one atomic claim per (PR, head, result, breaks); taking over an expired one is atomic too.
       const claim = claims.claim(p.jobKey);
-      let spawned = jobSpawned(session);
-      if (!claim.created && !spawned && claims.now() - claim.at < CLAIM_IN_PROGRESS_MS) {
-        throw new Error(`another invocation holds the claim for job ${p.jobKey} and has not spawned it yet; wait ${Math.round(CLAIM_IN_PROGRESS_MS / 1000)}s and re-run`);
+      const spawned = claims.spawned(p.jobKey);
+      if (!claim.created && !spawned) {
+        if (claims.now() - claim.at < CLAIM_IN_PROGRESS_MS) {
+          throw new Error(`another invocation holds the claim for job ${p.jobKey} and has not spawned it yet; wait ${Math.round(CLAIM_IN_PROGRESS_MS / 1000)}s and re-run`);
+        }
+        if (!claims.reclaim(p.jobKey, claim.gen)) throw new Error(`another invocation just took over the claim for job ${p.jobKey}; re-run later`);
       }
       // 2. The bare intent marker, BEFORE the spawn (no action line, so the hold stands). Written once per job.
       const hasIntent = comments.some((c) => String(c?.body ?? '').includes(`outcome=${CARD_PENDING_OUTCOME} result=${p.resultId}`) && String(c?.body ?? '').includes(`job ${p.jobKey}`));
@@ -134,6 +152,9 @@ export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_
       if (!spawned) {
         card = fileCard(p.cardInput, session);
         if (!card?.ok) throw new Error(`the follow-up card was not queued (${card?.error ?? 'unknown'}); the intent is recorded and a re-run retries the same job`);
+        // The proof of a spawn is the child's confirmed start (a pid), recorded durably; the job's log file proves nothing.
+        if (!/^pid:\d+$/.test(String(card.handle ?? ''))) throw new Error('the landing job reported no confirmed child start; not recorded as spawned, a re-run retries');
+        claims.markSpawned(p.jobKey, { session, handle: card.handle });
       }
       // 4. The release record, only now that the job is accepted. Its failure is retry-safe: the next run sees the spawned job.
       const record = buildGateComment({ pr: p.pr, head: p.head, outcome: OPERATOR_CARD_OUTCOME, round: null, result: p.resultId,
