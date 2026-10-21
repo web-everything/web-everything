@@ -159,6 +159,7 @@ import { UNOWNED_REBASE_INFRA_RETRY_CAP_DEFAULT, countUnownedRebaseAggregateAtte
 import { standingRulingScope } from './standing-ruling-io.mjs';
 import { ROUND_EXTENSION_MARKER } from './round-extension-mark.mjs';
 import { countConflictFixComments, CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
+import { isMechanicalBounce, BOUNCE_PREFIX } from './mechanical-round-cap.mjs';
 // #4118 (c) — the SAME name-based, gh-agents-truth liveness check `review-status-tag.mjs` already uses, and for
 // the identical reason its own docblock states: staying independent of `reconcile-core.mjs#assessLiveness`'s
 // much heavier transitive import graph (`rearm-review.mjs` → `review-set-label.mjs` → `merge-ai-prs.mjs`, which
@@ -1409,12 +1410,29 @@ export function defaultPostConflictStandDown({ pr, repo, exec = execFileSync }) 
 }
 
 /**
+ * PURE (#xkmu3gv cap path, 2026-10-21 operator brief). Is the bounce this rearm hands back the watch's OWN mechanical
+ * conflict bounce? True only when the latest trusted `changes` heading on the thread is a mechanical bounce
+ * (`mechanical-round-cap.mjs#isMechanicalBounce`, the exact reconcile-finding layout). Then the rearm counts against the
+ * conflict cap (`rearm-review.mjs --round=conflict`), not the ordinary review round: no review finding was answered.
+ * A reviewer's bounce, an unreadable thread, or no bounce at all → false (an ordinary round, today's behaviour).
+ * @param {Array<{body?:string}>|null|undefined} comments
+ */
+export function isWatcherConflictBounce(comments) {
+  if (!Array.isArray(comments)) return false;
+  // Every changes heading counts as a bounce (a human one included), so a later reviewer bounce is never skipped over.
+  const bounces = comments.filter((c) => typeof c?.body === 'string'
+    && (c.body.trimStart().startsWith(BOUNCE_PREFIX) || /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+changes requested/i.test(c.body)));
+  if (!bounces.length || !isTrustedMarkerAuthor(bounces.at(-1))) return false;
+  return isMechanicalBounce(bounces.at(-1));
+}
+
+/**
  * Hand a resolved conflict back through the existing repaired-bounce CLI for a fresh independent review.
  * @param {{pr:object, repo:string|null, exec?:Function}} o
  */
-export function defaultPostConflictRearm({ pr, repo, exec = execFileSync }) {
+export function defaultPostConflictRearm({ pr, repo, exec = execFileSync, conflictRound = false }) {
   const argv = [join(REPO_ROOT, 'scripts', 'conveyor', 'rearm-review.mjs'), String(pr?.number),
-    '--actor=parked-pr-conflict-watch (conflict resolved)'];
+    '--actor=parked-pr-conflict-watch (conflict resolved)', ...(conflictRound ? ['--round=conflict'] : [])];
   if (repo) argv.push(`--repo=${repo}`);
   // #x5n4zn3 — was bare (no timeout).
   exec('node', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
@@ -2355,8 +2373,12 @@ export function watchParkedPrConflicts({
           // Known cost: a rearm that posts its comment but then fails the label swap is retried, posting a second
           // rearm comment (one extra negotiation round) — rare, and better than losing the rearm.
           if (needsRearm) {
+            let conflictRound = false;
+            try { conflictRound = isWatcherConflictBounce(listPrComments({ number: pr?.number, repo: resolvedRepo })); }
+            catch { conflictRound = false; } // unreadable thread → an ordinary round (the fail-safe direction)
             try {
-              postRearm({ pr, repo: resolvedRepo });
+              postRearm({ pr, repo: resolvedRepo, conflictRound });
+              if (conflictRound) entry.conflictRound = true;
               entry.routedTo = 'rearm-review';
             } catch (e2) {
               entry.error = conflictWatchCause(e2);
