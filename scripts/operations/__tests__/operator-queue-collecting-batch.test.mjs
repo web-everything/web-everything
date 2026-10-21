@@ -48,6 +48,13 @@ it('suppresses only the draft-withdrawn row of a collecting batch; every other p
   ])).toEqual([5791, 5792, 5793]);
 });
 
+it('does not let another repo\'s collecting batch with the same PR number suppress the row', () => {
+  writeFileSync(join(dir, 'x-y-5794.json'), JSON.stringify({
+    batchRef: 'lane/card-batch-filing-5794', seq: 1, headSha: 'f'.repeat(40), openedAt: new Date().toISOString(),
+    members: [{ cardId: 'c1', source: { repo: 'x/y', pr: '1' } }], pr: 5794, kind: 'filing', repo: 'x/y', holdApplied: true }));
+  expect(needsPersonNumbers([pr(5794)])).toEqual([5794]);
+});
+
 it('raises the withdrawn draft once its batch is no longer collecting (sealed or failed)', () => {
   writeFileSync(join(dir, 'o-n-5790.json'), JSON.stringify({
     batchRef: 'lane/card-batch-filing-5790', seq: 1, headSha: 'f'.repeat(40), openedAt: new Date().toISOString(),
