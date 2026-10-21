@@ -1,20 +1,21 @@
 ---
+bornAs: x89xwmh
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/xpwakvl-operator-controls-tie-actor-to-the-authenticated-identity.md"]
-dateOpened: "2026-10-15"
+scope: ["we:backlog/xzlh2ts-prevention-require-structured-guarantee-to-test-mappings-thr.md"]
+dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Prevention — Add a check:standards rule that resolves "card N" and "#N" references in backlog card bodies to a… (from web-everything/web-everything#5397 review)
+# Prevention — Add a filer self-check, or a check:standards rule: every card ID named in a filed card's "Already… (from web-everything/web-everything#5532 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/xpwakvl-operator-controls-tie-actor-to-the-authenticated-identity.md:10` — Add a check:standards rule that resolves "card N" and "#N" references in backlog card bodies to an existing card. It should warn when the target is resolved and its title shares no terms with the surrounding sentence. File this as a future backlog item.
+1. `we:backlog/6245-prevention-require-structured-guarantee-to-test-mappings-thr.md:18` — Add a filer self-check, or a check:standards rule: every card ID named in a filed card's "Already tracked on open cards" line must contain that PR's idempotency key or PR reference. Not verified against the existing gates.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5397@051b61d65f3d515b5a8e0c55ad8598e49fdfa614
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5532@3061f9d862c36418bca3228a1fade5bd3b7b0207
 
 ## Acceptance
 

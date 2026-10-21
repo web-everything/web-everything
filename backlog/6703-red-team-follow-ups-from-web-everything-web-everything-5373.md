@@ -1,19 +1,20 @@
 ---
+bornAs: x920b18
 kind: story
 size: 2
 status: open
 scope: ["we:scripts/conveyor/reconcile-core.mjs"]
-dateOpened: "2026-10-17"
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5465 (head d3c0c02fd)
+# Red-team follow-ups from web-everything/web-everything#5373 (head 74f8b9bf9)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5465 (reviewed head `d3c0c02fd8a06bd85dcc2fcc08252aa03f3a4ec7`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5373 (reviewed head `74f8b9bf913ef19ecb52fbc237c903355e270ee9`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/conveyor/reconcile-core.mjs:2386` — (edge-case, degraded) An optional CI failure bypasses reviewer liveness and permits duplicate session reviews.
-   - Scenario: Use a review:pending PR with green standards, test-shard (1), and required test; an optional-lint failure completed 20 minutes ago; and a working review-7 agent with pidAlive=true. Default joining removes that live reviewer from the liveness guard and emits another review. With joining disabled, the same input correctly returns live-process. Driving two successive plans through the session dispatcher with mocked spawn effects produced two additional launches while the original reviewer remained live. Restrict the liveness exception to an actually owed CI repair, preserving protection against d
-   - Claude's re-check: demonstrated break
+1. `we:scripts/conveyor/reconcile-core.mjs:2072` — (failing-input, degraded) Consecutive grants lose authorized repair rounds
+   - Scenario: With roundCap=6 and eight trusted rearm comments, post two authenticated +1 grants before another repair runs. Both grants validate through planRoundExtension, but anchoredCap computes max(6+2, 8+1, 8+1)=9. After one repair adds its rearm, planReconcile refuses the next fix as cap-exhausted at 9/9. The two additive grants should permit two repairs, producing cap 10; the second grant currently consumes grant budget without increasing the available repairs.
+   - Claude's re-check: The diff shows anchoredCap = max(cap+sum, count(prefix)+by per grant). With 8 rearms and two consecutive +1 grants, both prefixes count 8, so the cap is 9, not 10. The second grant adds nothing.
 
 ## Acceptance
 

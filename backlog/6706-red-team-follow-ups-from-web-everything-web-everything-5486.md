@@ -1,18 +1,19 @@
 ---
+bornAs: xb3siu1
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/operations/prepare-batch.mjs"]
+scope: ["we:skills-src/conveyor/build-dispatch-daemon.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5486 (head dfb22d51c)
+# Red-team follow-ups from web-everything/web-everything#5486 (head be5c87d25)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5486 (reviewed head `dfb22d51c23bf2ba4c870bace7f350f985799949`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5486 (reviewed head `be5c87d2596c6f0fb8b356cf66cd6d65d20767aa`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/operations/prepare-batch.mjs:7` — (edge-case, degraded) Concurrent batches each spend the full external concurrency allowance.
-   - Scenario: Start two batches with at least three cards each, batchMaxParallel=3 and batchExternalCap=4. The daemon permits two prepare coordinators, but each independently launches three workers. A read-only probe invoking both coordinators concurrently measured peak=6 with cap=4; both completed successfully. No shared reservation accounts for workers in the other batch or existing external builds. Reserve shared external capacity before launching card workers so overlapping batches cannot exceed the configured allowance.
+1. `we:skills-src/conveyor/build-dispatch-daemon.mjs:1270` — (edge-case, degraded) Batch member failures lose their evidence and receive the wrong retry policy.
+   - Scenario: Let lead 7201 succeed and member 7202 fail with 'HTTP 429 Too Many Requests'. The batch records that diagnostic in groupDropReasons, but cliListSettledBuilds drops that field. Furthermore, the member failure passes its diagnostic as evidence.reason, which failPrepare overwrites with 'prepare-unstamped'. A probe through the production settlement reader and daemon captured ledger evidence containing only that generic reason: classification changed from infra-transient to unknown. This spends the unknown-failure retry allowance, files an unnecessary diagnosis, and can park recurring transient fai
    - Claude's re-check: demonstrated break
 
 ## Acceptance

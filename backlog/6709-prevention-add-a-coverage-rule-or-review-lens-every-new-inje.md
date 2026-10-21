@@ -1,21 +1,23 @@
 ---
+bornAs: xcdpii1
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/probation-build-run.mjs", "we:scripts/operations/deliver-item-wrapper.mjs", "we:scripts/operations/__tests__/probation-build-run.test.mjs", "we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs"]
-dateOpened: "2026-10-14"
+scope: ["we:scripts/conveyor/__tests__/review-status-tag.test.mjs", "we:scripts/conveyor/ci-red-recovery-watch.mjs", "we:scripts/lib/handoff-settings.mjs", "we:scripts/conveyor/__tests__/ci-red-recovery-watch.test.mjs", "we:scripts/lib/__tests__/handoff-settings.test.mjs"]
+dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Prevention — Export one sanitizeAgentReasonForPublication helper and use it for every agent-authored string th… (from web-everything/web-everything#5187 review)
+# Prevention — Add a coverage rule or review lens: every new injected side-effect seam needs a test that asserts… (from web-everything/web-everything#5462 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/probation-build-run.mjs:1100` — Export one `sanitizeAgentReasonForPublication` helper and use it for every agent-authored string that reaches a PR body or commit message. Add a lint or standards check that `writePrBody` templates take only helper-sanitized fields, plus a table test that feeds `@x`, `[l](u)` and a backtick through both paths.
-2. `we:scripts/operations/deliver-item-wrapper.mjs:775` — Read agent-authored marker files through a shared helper that lstat-checks for a regular file inside the lane and size-caps it, and make error messages carry only the line number or a fixed string. Add a symlink-marker case to the processGroupDrops tests.
+1. `we:scripts/conveyor/__tests__/review-status-tag.test.mjs:10` — Add a coverage rule or review lens: every new injected side-effect seam needs a test that asserts it is called, not only one that stubs it.
+2. `we:scripts/conveyor/ci-red-recovery-watch.mjs:1247` — Give each cascade leaf a consumer-level test that moves the value through the platform, tool and env layers and asserts the consumer's behaviour changes.
+3. `we:scripts/lib/handoff-settings.mjs:14` — Add a table-driven test over every key in `handoff-settings` that asserts each cascade layer, env included, moves the resolved value.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5187@8031184cdb8c7536017c931cffe769fac6f6b3da
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5462@9e20c5e5c0217cc978e8ea190ce8c48194026f73
 
 ## Acceptance
 

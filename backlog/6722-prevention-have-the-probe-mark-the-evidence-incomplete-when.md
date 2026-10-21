@@ -1,21 +1,22 @@
 ---
+bornAs: xf477yw
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5954-lazy-restacking-for-stacked-prs-stack-restack-eager-lazy.md"]
-dateOpened: "2026-10-18"
+scope: ["we:scripts/conveyor/main-ci-red-io.mjs", "we:scripts/conveyor/__tests__/main-ci-red-io.test.mjs"]
+dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — Require a parameterized boundary-test matrix covering absent, malformed, lazy, and eager modes fo… (from web-everything/web-everything#5601 review)
+# Prevention — Have the probe mark the evidence incomplete when any non-summary failed job returns zero parsed f… (from web-everything/web-everything#5271 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/5954-lazy-restacking-for-stacked-prs-stack-restack-eager-lazy.md` — Require a parameterized boundary-test matrix covering absent, malformed, lazy, and eager modes for each independently callable consumer.
-2. `we:backlog/5954-lazy-restacking-for-stacked-prs-stack-restack-eager-lazy.md` — Require a parameterized recovery regression crossing timing mode, listed base, and live base, with assertions on mutation calls.
+1. `we:scripts/conveyor/main-ci-red-io.mjs:186` — Have the probe mark the evidence incomplete when any non-summary failed job returns zero parsed failures, or when more than two jobs failed, and make `classifyFlakeRun` require complete evidence. Add a regression test for the mixed-jobs case.
+2. `we:scripts/conveyor/main-ci-red-io.mjs:190` — Add a deterministic probe regression test with three failed non-summary jobs, placing a non-flaky failure last and asserting flake eligibility is false; require complete evidence or decline signature-based eligibility.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5601@a4172413d1ad05700806b600d9532e06d7e52e3a
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5271@3db991e9d6b63b34631c9c89363b5f38603d60be
 
 ## Acceptance
 

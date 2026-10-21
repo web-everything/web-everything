@@ -1,4 +1,5 @@
 ---
+bornAs: xcdacup
 kind: story
 size: 2
 status: open
@@ -11,7 +12,7 @@ tags: []
 
 Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5245 (reviewed head `a503a16bd5038546ec4c4249a5e24bf62c3f5486`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:backlog/xg7whui-card-number-rename-after-land-batch.md:70` — (edge-case, degraded) The rename plan does not preserve the previously published full canonical URL.
+1. `we:backlog/6126-card-number-rename-after-land-batch.md:70` — (edge-case, degraded) The rename plan does not preserve the previously published full canonical URL.
    - Scenario: Publish x7k2q9a-slug with ledger number 5301, bookmark /backlog/x7k2q9a-slug/, then apply the planned rename. An in-memory probe of the reused applyLedger core produces 5301-slug and stamps bornAs, but adds no formerSlugs entry. The existing backlogAliases loader consequently produces no old-stem redirect. Slice (b) specifies bare-number and bare-x-id redirects only, and leaves numeric cards unchanged. Thus the bookmarked full URL loses its page despite the epic's preservation guarantee. Record the old full stem in formerSlugs during materialization or explicitly generate equivalent redirects,
    - Claude's re-check: The epic promises that old /backlog/x7k2q9a-slug/ routes redirect after a rename. Slice (b) only adds /backlog/&lt;displayNum&gt;/ and /backlog/&lt;x-id&gt;/ redirects and leaves numeric cards unchanged. Slice (f) relies on those and specifies no formerSlugs entry or old-stem redirect, so the full old URL is lost.
 

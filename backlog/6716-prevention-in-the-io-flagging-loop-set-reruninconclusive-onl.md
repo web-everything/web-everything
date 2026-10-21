@@ -1,4 +1,5 @@
 ---
+bornAs: xe1lmc0
 kind: story
 size: 3
 parent: "4075"
@@ -8,14 +9,15 @@ dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — Have the probe mark the evidence incomplete when any non-summary failed job returns zero parsed f… (from web-everything/web-everything#5271 review)
+# Prevention — In the IO flagging loop, set rerunInconclusive only when classifyRun(run)==='ignore' for a comple… (from web-everything/web-everything#5271 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/main-ci-red-io.mjs:186` — Have the probe mark the evidence incomplete when any non-summary failed job returns zero parsed failures, or when more than two jobs failed, and make `classifyFlakeRun` require complete evidence. Add a regression test for the mixed-jobs case.
-2. `we:scripts/conveyor/main-ci-red-io.mjs:190` — Add a deterministic probe regression test with three failed non-summary jobs, placing a non-flaky failure last and asserting flake eligibility is false; require complete evidence or decline signature-based eligibility.
+1. `we:scripts/conveyor/main-ci-red-io.mjs:300` — In the IO flagging loop, set `rerunInconclusive` only when `classifyRun(run)==='ignore'` for a completed run (cancelled, skipped or infraOnly). Add a test that a failed or successful attempt-2 run plans no retry. A table-driven test over conclusions for the `again` branch would catch this class.
+2. `we:scripts/conveyor/main-ci-red-io.mjs:59` — Add a check:standards lint that flags `gh api .../compare/` or list-returning `gh api` calls without --paginate, or require readChangedFiles to compare the file count to the reported total and return null when truncated.
+3. `we:scripts/conveyor/main-ci-red-io.mjs:307` — Add a deterministic outcome-matrix test covering success, ordinary failure, cancellation, skipped, and infrastructure-only completion, asserting both rerun count and dispatch suppression.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5271@3db991e9d6b63b34631c9c89363b5f38603d60be
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5271@6628c9cd927788d20c99a7d772e5aec46ed26ad8
 
 ## Acceptance
 

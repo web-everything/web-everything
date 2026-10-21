@@ -1,20 +1,22 @@
 ---
+bornAs: x7qkje4
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/xzlh2ts-prevention-require-structured-guarantee-to-test-mappings-thr.md"]
-dateOpened: "2026-10-17"
+scope: ["we:backlog/5954-lazy-restacking-for-stacked-prs-stack-restack-eager-lazy.md"]
+dateOpened: "2026-10-18"
 tags: []
 ---
 
-# Prevention — Add a filer self-check, or a check:standards rule: every card ID named in a filed card's "Already… (from web-everything/web-everything#5532 review)
+# Prevention — Require a parameterized boundary-test matrix covering absent, malformed, lazy, and eager modes fo… (from web-everything/web-everything#5601 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/xzlh2ts-prevention-require-structured-guarantee-to-test-mappings-thr.md:18` — Add a filer self-check, or a check:standards rule: every card ID named in a filed card's "Already tracked on open cards" line must contain that PR's idempotency key or PR reference. Not verified against the existing gates.
+1. `we:backlog/5954-lazy-restacking-for-stacked-prs-stack-restack-eager-lazy.md` — Require a parameterized boundary-test matrix covering absent, malformed, lazy, and eager modes for each independently callable consumer.
+2. `we:backlog/5954-lazy-restacking-for-stacked-prs-stack-restack-eager-lazy.md` — Require a parameterized recovery regression crossing timing mode, listed base, and live base, with assertions on mutation calls.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5532@3061f9d862c36418bca3228a1fade5bd3b7b0207
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5601@a4172413d1ad05700806b600d9532e06d7e52e3a
 
 ## Acceptance
 
