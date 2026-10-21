@@ -8,6 +8,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import {
   resolveGithubAppEnvConfig, isCacheFresh, ensureFreshGithubAppEnv, withGithubAppAuth,
   REFRESH_BUFFER_MS, defaultCachePath, findInstallationGaps, CACHE_VERSION, REQUIRED_APP_PERMISSIONS, REQUIRED_APP_REPOS,
@@ -633,5 +634,62 @@ describe('half-configured App auth (2026-10-09 drain incident)', () => {
     expect(warnGithubAppConfigAtStart({ env: halfEnv, policy: { auth: 'personal' }, log, caller: 'startup-personal-test.mjs' }).state)
       .toBe('policy-personal');
     expect(log.error).not.toHaveBeenCalled();
+  });
+});
+
+describe('daemon refresh lookahead and legacy fallback liveness', () => {
+  it('refresh CLI emits just a safe one-line failure with no configured App', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gh-refresh-cli-'));
+    try {
+      const r = spawnSync(process.execPath, [join(process.cwd(), 'scripts/lib/github-app-refresh-cli.mjs'), '--role=worker'], {
+        encoding: 'utf8', env: { PATH: process.env.PATH, HOME: dir, WE_DELIVERY_IDENTITY: 'none', WE_POLICY_CASCADE_LOG: '1' },
+      });
+      expect(r.status).toBe(1);
+      expect(r.stdout).toBe('applied=false reason=not-configured role=unknown\n');
+      expect(r.stderr).toBe('');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each([false, true])('uses the correct primary AND per-installation buffer (daemon=%s)', async (daemon) => {
+    const { DAEMON_REFRESH_BUFFER_MS } = await import('../github-app-auth-env.mjs');
+    expect(DAEMON_REFRESH_BUFFER_MS).toBe(30 * 60 * 1000);
+    const now = Date.now();
+    const env = { WE_GITHUB_APP_ID: '1', WE_GITHUB_APP_INSTALLATION_ID: '11', WE_GITHUB_APP_PRIVATE_KEY_PATH: '/fixture/key', WE_GITHUB_APP_INSTALLATIONS: JSON.stringify({ 'web-everything': '11', 'frontier-ui': '22', plateauapp: '11' }) };
+    const mint = vi.fn(async ({ installationId }) => ({ token: 'fixture-minted', expiresAt: new Date(now + 3600e3).toISOString(), permissions: FULL_PERMS }));
+    const result = await ensureFreshGithubAppEnv({
+      ...NOOP_STATUS, env, daemon, caller: 'buffer-probe', cachePath: '/fixture/cache.json', now,
+      readCache: (path) => ({ v: CACHE_VERSION, appId: '1', installationId: path.includes('.22.') ? '22' : '11', token: 'fixture-cached', expiresAt: new Date(now + 20 * 60e3).toISOString() }),
+      writeCache: vi.fn(), mint, getInstallationInfo: async () => ({ repositorySelection: 'all' }),
+      perOwner: true, installShim: async () => ({ ok: true }), required: { permissions: {}, repos: [] },
+      log: { error() {} },
+    });
+    expect(result.applied).toBe(true);
+    expect(mint.mock.calls.map(([args]) => args.installationId)).toEqual(daemon ? ['11', '22'] : []);
+    expect(env.WE_GH_DAEMON_CALLER).toBe(daemon ? 'buffer-probe' : undefined);
+  });
+
+  it.each([false, true])('refreshes legacy after the role applies, without replacing role outcome (legacy failure=%s)', async (failLegacy) => {
+    const { resolveDeliveryIdentity } = await import('../github-app-identity.mjs');
+    const now = Date.now();
+    const identity = resolveDeliveryIdentity({ tool: { worker: { appId: '2', installations: { 'web-everything': '22' }, key: { file: '/fixture/worker-key' } } } });
+    const env = { ...CONFIGURED_ENV };
+    const setEnv = vi.fn();
+    const mint = vi.fn(async ({ appId }) => {
+      if (failLegacy && appId === CONFIGURED_ENV.WE_GITHUB_APP_ID) throw Error('fixture unavailable');
+      return { token: appId === '2' ? 'fixture-worker' : 'fixture-legacy', expiresAt: new Date(now + 3600e3).toISOString(), permissions: FULL_PERMS };
+    });
+    const writeCache = vi.fn();
+    const result = await ensureFreshGithubAppEnv({
+      ...NOOP_STATUS, env, identity, role: 'worker', daemon: true, now, cachePath: '/fixture/cache.json',
+      readCache: () => null, writeCache, mint, canReadKey: () => true,
+      getInstallationInfo: async () => ({ repositorySelection: 'all' }), required: { permissions: {}, repos: [] },
+      extraInstallations: false, setEnv, log: { error() {} },
+    });
+    expect(result).toMatchObject({ applied: true, role: 'worker', appId: '2' });
+    expect(mint.mock.calls.map(([a]) => a.appId)).toEqual(['2', CONFIGURED_ENV.WE_GITHUB_APP_ID]);
+    expect(setEnv).toHaveBeenCalledTimes(1);
+    expect(setEnv).toHaveBeenCalledWith('fixture-worker');
+    expect(env.WE_GH_AUTH_INSTALLATION).toBe('22');
+    if (!failLegacy) expect(writeCache).toHaveBeenCalledWith('/fixture/cache.json', expect.objectContaining({ token: 'fixture-legacy' }));
   });
 });
