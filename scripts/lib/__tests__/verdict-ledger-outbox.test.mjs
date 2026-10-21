@@ -10,7 +10,8 @@
  */
 import { describe, it, expect } from 'vitest';
 import { spawn, execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import {
@@ -18,7 +19,7 @@ import {
 } from '../verdict-ledger-io.mjs';
 import {
   flushLedgerOutbox, listOutboxEntries, outboxLockRoot, OUTBOX_LOCK_PATH, resolveOutboxSettings, formatOutboxSettings,
-  OUTBOX_ENV, OUTBOX_DIR_ENV, enqueueOutboxEntry,
+  OUTBOX_ENV, OUTBOX_DIR_ENV, enqueueOutboxEntry, spawnBoardLedgerOutboxFlush,
 } from '../verdict-ledger-outbox.mjs';
 import { withGitErrorForTest } from '../git-transport-branch.mjs';
 import { reserve, makeLockEntry } from '../../readiness/file-locks.mjs';
@@ -230,7 +231,7 @@ describe('real git: outbox + plumbing flush', () => {
     });
   });
 
-  it('an unreachable transport: the flusher withdraws its OWN entry and throws loudly (thrown means not recorded)', async () => {
+  it('an unreachable transport, lock held from before the entry: withdrawn and thrown (thrown means not recorded)', async () => {
     await withBareOrigin(async (ctx) => {
       ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
       git(['remote', 'set-url', 'origin', join(ctx.tmp, 'does-not-exist.git')], { cwd: ctx.clone });
@@ -238,6 +239,61 @@ describe('real git: outbox + plumbing flush', () => {
       expect(() => appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(1)], outbox: true, outboxDir, log: quiet, sleep: noSleep }))
         .toThrow(LedgerAppendExhaustedError);
       expect(listOutboxEntries(outboxDir)).toEqual([]);
+    });
+  });
+
+  it('an UNKNOWN push outcome (no answer, not on the remote yet) is never withdrawn: the row stays queued, then lands once', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const outboxDir = join(ctx.tmp, 'outbox');
+      let hang = true;
+      const run = (args, opts) => {
+        if (args[0] === 'push' && hang) { hang = false; const e = new Error('Command failed'); e.stderr = 'fatal: the remote end hung up unexpectedly\n'; e.status = 128; throw e; }
+        return realGit(args, opts);
+      };
+      const logs = [];
+      const r = appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(5)], outbox: true, outboxDir, gitRun: run, log: (l) => logs.push(l) });
+      expect(r).toMatchObject({ status: 'appended', queued: true });
+      expect(logs.join('\n')).toMatch(/push outcome UNKNOWN/);
+      // Not withdrawn: the post-release re-check (the remote answers again) lands it, exactly once.
+      expect(listOutboxEntries(outboxDir)).toEqual([]);
+      expect(originRows(ctx)).toEqual([5]);
+      expect(flushLedgerOutbox({ board: ctx.clone, dir: outboxDir, log: quiet })).toMatchObject({ ok: true, flushed: 0 });
+      expect(originRows(ctx)).toEqual([5]);
+    });
+  });
+
+  it('the plumbing push never follows tags', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const pushes = [];
+      const run = (args, opts) => { if (args[0] === 'push') pushes.push(args); return realGit(args, opts); };
+      appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(2)], outbox: true, outboxDir: join(ctx.tmp, 'ob'), gitRun: run, log: quiet });
+      expect(pushes[0]).toContain('--no-follow-tags');
+    });
+  });
+
+  it('a short or corrupt entry write throws BEFORE anything is queued (read-back check)', () => {
+    const dir = join(mkdtempSync(join(tmpdir(), 'ob-')), 'outbox');
+    const bad = { path: ledgerGitPath(REPO), repo: REPO, message: 'm', lines: ['{"not":"an event"}'], ids: ['x'] };
+    expect(() => enqueueOutboxEntry(dir, bad)).toThrow(/write check/);
+    expect(listOutboxEntries(dir)).toEqual([]);
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  it('the tick-side backstop never flushes inline: it starts one detached flusher only when entries are queued', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const env = { [OUTBOX_DIR_ENV]: join(ctx.tmp, 'ob') };
+      const spawned = [];
+      const spawnFn = (cmd, args, opts) => { spawned.push({ args, opts }); return { pid: 4242, unref() {} }; };
+      expect(spawnBoardLedgerOutboxFlush({ board: ctx.clone, env, spawnFn })).toMatchObject({ ok: true, flushed: 0 });
+      expect(spawned).toEqual([]);
+      enqueueOutboxEntry(env[OUTBOX_DIR_ENV], { path: ledgerGitPath(REPO), repo: REPO, message: 'm', ...checkLedgerAppendRows([row(3)], REPO) });
+      const r = spawnBoardLedgerOutboxFlush({ board: ctx.clone, env, spawnFn });
+      expect(r).toMatchObject({ ok: true, spawned: true, pending: 1, pid: 4242 });
+      expect(spawned[0].args.slice(1)).toEqual(['flush', `--board=${ctx.clone}`]);
+      expect(spawned[0].opts.detached).toBe(true);
     });
   });
 

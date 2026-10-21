@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { readMainFixPriority } from '../../scripts/lib/merge-queue-hook.mjs';
-import { flushBoardLedgerOutbox } from '../../scripts/lib/verdict-ledger-outbox.mjs';
+import { spawnBoardLedgerOutboxFlush } from '../../scripts/lib/verdict-ledger-outbox.mjs';
 import { resolveLedgerBoard } from '../../scripts/lib/verdict-ledger.mjs';
 import { repoKeyFromSlug } from '../../scripts/readiness/lane-manifest.mjs';
 import { redTeamEnabled } from '../../scripts/lib/review-red-team-policy.mjs';
@@ -1297,9 +1297,10 @@ export function realSleep(ms) { return new Promise((resolve) => { setTimeout(res
 /**
  * The ledger OUTBOX BACKSTOP (live 2026-10-21, `we:scripts/lib/verdict-ledger-outbox.mjs`). Every append already
  * flushes the queue it joins; this pushes what a crashed or failed flusher left behind when no new append comes.
- * One flush per distinct ledger board; a held flusher lock is a quiet no-op.
+ * One check per distinct ledger board; a non-empty outbox starts ONE detached flusher process, so the tick never
+ * waits on git (a held flusher lock makes that process a quiet no-op).
  */
-export function defaultFlushLedgerOutboxes({ repos = REVIEW_DAEMON_REPOS, resolveBoard = resolveLedgerBoard, flush = flushBoardLedgerOutbox } = {}) {
+export function defaultFlushLedgerOutboxes({ repos = REVIEW_DAEMON_REPOS, resolveBoard = resolveLedgerBoard, flush = spawnBoardLedgerOutboxFlush } = {}) {
   const boards = [...new Set(repos.map((r) => resolveBoard(r)).filter(Boolean))];
   return boards.map((board) => flush({ board }));
 }
@@ -1813,7 +1814,8 @@ export function buildCliDaemonEffects({
       // outbox as ledger-write-miss) and never takes down the tick.
       try {
         for (const f of flushLedgerOutboxes() ?? []) {
-          if (f && (f.flushed || f.ok === false)) log.error(`review-daemon: ledger outbox backstop ${f.ok === false ? 'FAILED' : 'flushed'} ${f.flushed ?? 0} entr${f.flushed === 1 ? 'y' : 'ies'} (${f.dir ?? '?'})${f.error ? `: ${f.error}` : ''}`);
+          if (f?.spawned) log.error(`review-daemon: ledger outbox backstop started flusher pid ${f.pid ?? '?'} for ${f.pending} queued entr${f.pending === 1 ? 'y' : 'ies'} (${f.dir ?? '?'})`);
+          else if (f && (f.flushed || f.ok === false)) log.error(`review-daemon: ledger outbox backstop ${f.ok === false ? 'FAILED' : 'flushed'} ${f.flushed ?? 0} entr${f.flushed === 1 ? 'y' : 'ies'} (${f.dir ?? '?'})${f.error ? `: ${f.error}` : ''}`);
         }
       } catch (e) {
         log.error(`review-daemon: ledger outbox backstop failed (non-fatal): ${String((e && e.message) || e).split('\n')[0]}`);

@@ -108,7 +108,7 @@ describe('appendLedgerRows: bounded retry, loud on exhaustion', () => {
       appendLedgerRows(base({ run }));
       const push = calls.find((a) => a[0] === 'push');
       // A plumbing commit pushed by its object id to the ONE full ref (2026-10-21); no local branch, no worktree.
-      expect(push).toEqual(['push', '--quiet', 'origin', `${'a'.repeat(40)}:refs/heads/ops/review-requests`]);
+      expect(push).toEqual(['push', '--quiet', '--no-follow-tags', 'origin', `${'a'.repeat(40)}:refs/heads/ops/review-requests`]);
       expect(calls.some((a) => a[0] === 'worktree' || a[0] === 'checkout')).toBe(false);
       for (const a of calls.filter((c) => c[0] === 'push').flat()) expect(a).not.toMatch(/^(-f|--force.*|\+.*)$/);
     });
@@ -195,7 +195,8 @@ describe('real git', () => {
   it('an unreachable transport makes append throw loudly', async () => {
     await withBareOrigin(async (ctx) => {
       git(['remote', 'set-url', 'origin', join(ctx.tmp, 'does-not-exist.git')], { cwd: ctx.clone });
-      expect(() => appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(1)], attempts: 2, sleep: noSleep }))
+      // The DIRECT path (CI) throws; the outbox path keeps the row durably queued instead (verdict-ledger-outbox.test).
+      expect(() => appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(1)], attempts: 2, sleep: noSleep, outbox: false }))
         .toThrow(LedgerAppendExhaustedError);
     });
   });
