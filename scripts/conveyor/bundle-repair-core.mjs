@@ -168,7 +168,7 @@ export function planReconcile(ledger, { clones = [], now, outcomeFor = () => nul
     const watched = e.status === 'running' || e.status === 'repaired';
     // A settled entry whose stop failed may still have a live session: keep watching it — including the tick its
     // stop retry finally succeeded (`stopSettledAt === now`).
-    if (!watched && !e.stopPending && e.stopSettledAt !== now) continue;
+    if (!watched && !e.stopPending && !e.auditCheckPending && e.stopSettledAt !== now) continue;
     const raised = new Set(e.escalations || []);
     const sessionLive = e.status === 'running';
     // The session may have run up to now: live, its stop still pending, or its stop only succeeded THIS tick.
@@ -257,7 +257,9 @@ export function assertBriefSafe(text) {
 /** PURE: the needs-you item for one escalation (feed limits: reason ≤ 100 chars, head ≤ 128). */
 export function escalationItem(entry, { reason, detail, host, weRoot }) {
   return {
-    repo: `host/${host}`, pr: 0, head: `bundle-repair:${entry.holdId}`.slice(0, 128), kind: 'bundle-repair',
+    // One feed identity PER REASON: the feed de-duplicates by identity, so a later reason on the same hold (an
+    // override found after an escalation) must not collapse into the first.
+    repo: `host/${host}`, pr: 0, head: `bundle-repair:${entry.holdId}:${reason}`.slice(0, 128), kind: 'bundle-repair',
     reason: `${entry.name}: bundle repair stopped (${reason}) — ${detail ?? ''}`.slice(0, 100),
     episode: entry.holdId,
     pick: `node ${weRoot}/scripts/conveyor/bundle-repair-dispatch.mjs show --hold=${entry.holdId}`,
@@ -267,5 +269,5 @@ export function escalationItem(entry, { reason, detail, host, weRoot }) {
 /** PURE: drop settled entries older than 7 days; never a running/repaired one, never the current hold's tombstone. */
 export function pruneLedger(ledger, { now, liveHoldIds = new Set() }) {
   return (Array.isArray(ledger) ? ledger : []).filter((e) => ['running', 'repaired'].includes(e.status)
-    || e.stopPending || e.launching || e.escalationPending?.length || liveHoldIds.has(e.holdId) || now - (e.startedAt ?? 0) < 7 * 24 * 60 * MINUTE);
+    || e.stopPending || e.launching || e.auditCheckPending || e.escalationPending?.length || liveHoldIds.has(e.holdId) || now - (e.startedAt ?? 0) < 7 * 24 * 60 * MINUTE);
 }

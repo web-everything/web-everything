@@ -123,7 +123,10 @@ export async function cloneRootsByKey({ root = WE_ROOT, env = process.env } = {}
  *  `eventsFilePath` is `daemon-overlays.mjs#eventsFilePath` (preloaded by the pass). */
 export function readConflictOverride(entry, { env = process.env, readFile = readFileSync, eventsFilePath }) {
   let text = '';
-  try { text = String(readFile(eventsFilePath(entry.root, env), 'utf8')); } catch { return null; }
+  try { text = String(readFile(eventsFilePath(entry.root, env), 'utf8')); } catch (e) {
+    if (e?.code === 'ENOENT') return null; // no overlay was ever registered on this clone
+    throw e; // unreadable → UNKNOWN: the caller keeps the audit check pending
+  }
   for (const line of text.split('\n').slice(-2000)) {
     let ev; try { ev = JSON.parse(line); } catch { continue; }
     if (ev?.kind === 'added' && ev.by === BUNDLE_REPAIR_BOT && ev.conflictOverride && Date.parse(ev.at) >= entry.startedAt) return ev;
@@ -326,12 +329,14 @@ export async function runBundleRepairs({
       for (const e of ledger.filter((x) => x.escalationPending?.length)) flush(e);
     }
     // 1. reconcile
-    const watch = (x) => x.status === 'running' || x.status === 'repaired' || x.stopPending || x.stopSettledAt === now;
+    const watch = (x) => x.status === 'running' || x.status === 'repaired' || x.stopPending || x.auditCheckPending || x.stopSettledAt === now;
     const outcomes = new Map();
     const overrides = new Map();
+    const auditRead = new Set();
     for (const e of ledger.filter(watch)) {
       outcomes.set(e.holdId, readJson(outcomePath(dir, e.holdId), null));
-      try { overrides.set(e.holdId, overrideFor(e)); } catch { overrides.set(e.holdId, null); }
+      try { overrides.set(e.holdId, overrideFor(e)); auditRead.add(e.holdId); }
+      catch { overrides.set(e.holdId, null); if (!dryRun) e.auditCheckPending = true; }
     }
     const actions = planReconcile(ledger, { clones, now, outcomeFor: (id) => outcomes.get(id), overrideFor: (e) => overrides.get(e.holdId) });
     for (const a of actions) {
@@ -344,15 +349,27 @@ export async function runBundleRepairs({
       entry.endReason = a.escalate ?? a.detail;
       if (a.escalate) escalate(entry, a.escalate, a.detail);
     }
-    // 1b. the audit trail is re-read AFTER a session is stopped: a registration made between the first read and the
-    //     stop is still caught (once).
+    // The trail was read this tick and planReconcile has acted on it: the pending audit check is done.
+    if (!dryRun) for (const id of auditRead) { const x = ledger.find((y) => y.holdId === id); if (x) delete x.auditCheckPending; }
+    // 1b. AFTER a session is stopped, re-read both things it could have written in the meantime: the overlay audit
+    //     trail (a registration with a conflict override) and its outcome file (an escalation). Raised once each.
+    //     An unreadable trail keeps the audit check PENDING, so a later tick still reads it.
     if (!dryRun) {
       for (const id of stoppedNow) {
         const entry = ledger.find((x) => x.holdId === id);
-        if (!entry || (entry.escalations || []).includes('conflict-override-used')) continue;
+        if (!entry) continue;
+        const raised = new Set(entry.escalations || []);
         let ov = null;
-        try { ov = overrideFor(entry); } catch { ov = null; }
-        if (ov) { entry.status = 'escalated'; entry.endReason = 'conflict-override-used'; escalate(entry, 'conflict-override-used', `a registration by ${BUNDLE_REPAIR_BOT} carried a conflict override (${ov.ref ?? '?'})`); }
+        try { ov = overrideFor(entry); delete entry.auditCheckPending; } catch { entry.auditCheckPending = true; }
+        if (ov && !raised.has('conflict-override-used')) {
+          entry.status = 'escalated'; entry.endReason = 'conflict-override-used';
+          escalate(entry, 'conflict-override-used', `a registration by ${BUNDLE_REPAIR_BOT} carried a conflict override (${ov.ref ?? '?'})`);
+        }
+        const outcome = readJson(outcomePath(dir, entry.holdId), null);
+        if (outcome?.outcome === 'escalate' && !raised.has(outcome.reason) && outcomes.get(id)?.outcome !== 'escalate') {
+          entry.status = 'escalated'; entry.endReason = outcome.reason;
+          escalate(entry, outcome.reason, outcome.detail);
+        }
       }
     }
     // 2. plan + reserve
@@ -431,20 +448,30 @@ export async function runBundleRepairs({
 
 // ── the session's verb + operator reads ──────────────────────────────────────────────────────────────────────
 
-/** `record`: the session's ONE write — only its own running hold, with its capability token, once. */
-export function recordOutcome({ dir, holdId, session, input, token, now = Date.now(), scrub }) {
+/** `record`: the session's ONE write — only its own running hold, with its capability token, once. Taken under the
+ *  ledger lock, so a record can never land between a pass's last read and its settling of the entry: either the
+ *  pass sees it, or the record sees the settled status and is refused. A held lock is retried for up to ~60 s. */
+export function recordOutcome({ dir, holdId, session, input, token, now = Date.now(), scrub, lock = defaultLock, attempts = 60, waitMs = 1000 }) {
   const path = outcomePath(dir, holdId);
-  const entry = readLedger(dir).find((x) => x.holdId === holdId);
-  if (!entry) throw new Error(`bundle-repair: no repair is on the ledger for hold ${holdId}`);
-  const given = Buffer.from(sha256(token ?? ''), 'hex');
-  const want = Buffer.from(String(entry.tokenHash ?? ''), 'hex');
-  if (!token || given.length !== want.length || !timingSafeEqual(given, want)) throw new Error(`bundle-repair: record for ${holdId} refused — missing or wrong session capability`);
-  if (entry.session !== session) throw new Error(`bundle-repair: hold ${holdId} belongs to session ${entry.session}, not ${session}`);
-  if (entry.status !== 'running') throw new Error(`bundle-repair: the repair of ${holdId} is ${entry.status} — nothing more can be recorded`);
-  const outcome = { ...validateOutcome(input, scrub ? { scrub } : {}), recordedAt: new Date(now).toISOString(), session };
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(outcome, null, 2)}\n`, { flag: 'wx' }); // once: a second record fails EEXIST
-  return { path, outcome };
+  const write = () => {
+    const entry = readLedger(dir).find((x) => x.holdId === holdId);
+    if (!entry) throw new Error(`bundle-repair: no repair is on the ledger for hold ${holdId}`);
+    const given = Buffer.from(sha256(token ?? ''), 'hex');
+    const want = Buffer.from(String(entry.tokenHash ?? ''), 'hex');
+    if (!token || given.length !== want.length || !timingSafeEqual(given, want)) throw new Error(`bundle-repair: record for ${holdId} refused — missing or wrong session capability`);
+    if (entry.session !== session) throw new Error(`bundle-repair: hold ${holdId} belongs to session ${entry.session}, not ${session}`);
+    if (entry.status !== 'running') throw new Error(`bundle-repair: the repair of ${holdId} is ${entry.status} — nothing more can be recorded`);
+    const outcome = { ...validateOutcome(input, scrub ? { scrub } : {}), recordedAt: new Date(now).toISOString(), session };
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, `${JSON.stringify(outcome, null, 2)}\n`, { flag: 'wx' }); // once: a second record fails EEXIST
+    return { path, outcome };
+  };
+  for (let i = 1; ; i++) {
+    try { return lock(dir, write); } catch (e) {
+      if (!/ledger lock (is held|was taken)/.test(String(e?.message)) || i >= attempts) throw e;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waitMs);
+    }
+  }
 }
 
 function parseFlags(argv) {

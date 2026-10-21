@@ -387,6 +387,43 @@ describe('runBundleRepairs (IO shell, every seam injected)', () => {
     expect(readLedger(dir)[0].status).toBe('escalated');
   });
 
+  it('round 7: an outcome recorded while the session is being stopped is still escalated', async () => {
+    const { dir, seams } = setup();
+    await runBundleRepairs({ ...seams, ...settings() });
+    const e = readLedger(dir)[0];
+    const s = await runBundleRepairs({
+      ...seams, now: NOW + MIN, ...settings(), selfSync: [{ cloneKey: KEY, rebuild: { held: null } }],
+      stop: () => {
+        mkdirSync(join(dir, 'bundle-repair', 'outcomes'), { recursive: true });
+        writeFileSync(outcomePath(dir, e.holdId), JSON.stringify({ outcome: 'escalate', reason: 'weakened-twice', detail: 'late' }));
+      },
+    });
+    expect(s.escalated).toEqual([{ holdId: e.holdId, reason: 'weakened-twice' }]);
+    expect(readLedger(dir)[0].status).toBe('escalated');
+  });
+
+  it('round 7: an unreadable audit trail keeps the check pending until it can be read', async () => {
+    const { dir, seams } = setup();
+    await runBundleRepairs({ ...seams, ...settings() });
+    const gone = [{ cloneKey: KEY, rebuild: { held: null } }];
+    await runBundleRepairs({ ...seams, now: NOW + MIN, ...settings(), selfSync: gone, overrideFor: () => { throw new Error('EACCES'); } });
+    expect(readLedger(dir)[0]).toMatchObject({ status: 'cleared', auditCheckPending: true });
+    const s = await runBundleRepairs({ ...seams, now: NOW + 2 * MIN, ...settings(), selfSync: gone, overrideFor: () => ({ ref: 'lane/x' }) });
+    expect(s.escalated.map((x) => x.reason)).toEqual(['conflict-override-used']);
+    expect(readLedger(dir)[0].auditCheckPending).toBeUndefined();
+  });
+
+  it('round 7: each escalation reason has its own feed identity (the feed de-duplicates by identity)', async () => {
+    const { escalationItem } = await import('../bundle-repair-core.mjs');
+    const { diffFeed } = await import('../../operations/needs-you-feed.mjs');
+    const entry = { holdId: 'review-206df80e-x', name: 'review' };
+    const a = escalationItem(entry, { reason: 'unresolvable-conflict', detail: 'd', host: 'h', weRoot: '/we' });
+    const b = escalationItem(entry, { reason: 'conflict-override-used', detail: 'd', host: 'h', weRoot: '/we' });
+    expect(a.head).not.toBe(b.head);
+    const first = diffFeed([], [a], NOW, { incomplete: true });
+    expect(diffFeed(first.openKeys, [b], NOW, { incomplete: true }).lines).toHaveLength(1);
+  });
+
   it('record: only the session holding the capability, once', async () => {
     const { dir, seams } = setup();
     let token;
