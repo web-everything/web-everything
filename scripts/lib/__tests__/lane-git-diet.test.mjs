@@ -80,6 +80,7 @@ describe('ops-ref reader inventory', () => {
     'scripts/merge-ai-prs.mjs': 'message text',
     'scripts/operations/stage-pr-view.mjs': 'compares provenance against TRANSPORT_REF; the read is the injected stage-pr-view-io reader',
     'scripts/lib/lane-git-diet.mjs': 'this inventory',
+    'scripts/lane-git-diet.mjs': 'the one-time cleanup (deletes stale tracking refs)',
     'scripts/lane-pool.mjs': 'drops stale tracking refs after clone',
   };
   const OPS_IN_CODE = /['"`](?:refs\/remotes\/origin\/)?ops\/|origin\/ops\/|\b(?:TRANSPORT_BRANCH|LEDGER_TRANSPORT_BRANCH|PRECEDENT_TRANSPORT_BRANCH|QUARANTINE_BRANCH|HANDOFF_BRANCH|redMainFreezeBranch|TRANSPORT_REF)\b/;
