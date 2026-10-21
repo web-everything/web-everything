@@ -12,7 +12,7 @@ vi.hoisted(() => { process.env.WE_AUTOMATION_LOGINS = 'web-everything,plateau-wo
 import { isReadOnlyOperation } from '../registry.mjs';
 import {
   assessPrSweep, finishPrSweep, humanReviewHold, needsDecisionOpen, openFixClaim, referralHoldOpen, renderSweepTable,
-  FIX_CLAIM_LIVE_MS,
+  FIX_CLAIM_LIVE_MS, jobsFor,
 } from '../pr-sweep-core.mjs';
 import { parseOperationArgv } from '../cli-adapter.mjs';
 import { prSweepOperation, PR_SWEEP_OP } from '../pr-sweep.mjs';
@@ -211,6 +211,30 @@ describe('ruling dispute (#5784)', () => {
   });
 });
 
+describe.each([
+  ['referral hold', referralHoldOpen, hold, 'ruling-needed:referral-hold'],
+  ['decision dispute', needsDecisionOpen, c('plateau-worker[bot]', '2026-10-21T05:25:58Z',
+    '🔔 conveyor — needs your decision\n\nfixer and reviewer disagree about a ruling'), 'ruling-needed:dispute'],
+  ['decision note', needsDecisionOpen, c('plateau-worker[bot]', '2026-10-21T05:25:58Z',
+    '🔔 conveyor — needs your decision\n\npermission prompt'), 'needs-decision:note'],
+])('%s closure lifecycle', (_name, reader, note, state) => {
+  it.each(['push', 'operator reply'])('only a later %s closes the item; earlier and equal timestamps preserve it', (kind) => {
+    const at = Date.parse(note.createdAt);
+    for (const offset of [-1, 0, 1]) {
+      const timestamp = new Date(at + offset).toISOString();
+      const comments = kind === 'push' ? [note] : [c('chalbert', timestamp, 'proceed'), note];
+      const options = kind === 'push' ? { headCommittedAt: timestamp } : {};
+      const open = reader(comments, options);
+      if (offset > 0) expect(open).toBeNull();
+      else expect(open).toMatchObject({ at });
+      const result = sweep([mkPr({ labels: L('review:pending'), comments, ...options })]).prs[0];
+      expect(result).toMatchObject(offset > 0
+        ? { waitingOn: 'awaiting-review', actor: 'reviewer', stalled: false }
+        : { waitingOn: state, actor: 'operator', stalled: true });
+    }
+  });
+});
+
 describe('draft-withdrawn (#5787)', () => {
   it('a draft with the withdrawn hold waits on the operator with a release command', () => {
     const r = row(sweep([mkPr({ number: 5787, isDraft: true, labels: L('review-status:draft-withdrawn') })]), 5787);
@@ -234,8 +258,45 @@ describe('red-team request held (#5771)', () => {
   it('a live review-job for the PR clears the stall', () => {
     expect(row(sweep([pr], { drainSkips: skips, liveJobs: [{ kind: 'review-job', pr: 5771, repo: REPO }] }), 5771)).toMatchObject({ stalled: false, liveJob: 'review-job' });
   });
-  it('a job for another repo\'s PR with the same number does not count', () => {
-    expect(row(sweep([pr], { drainSkips: skips, liveJobs: [{ kind: 'review-job', pr: 5771, repo: 'o/other' }] }), 5771).stalled).toBe(true);
+  it.each([
+    ['matching repo', REPO, 5771, true],
+    ['another repo', 'o/other', 5771, false],
+    ['null repo', null, 5771, false],
+    ['missing repo', undefined, 5771, false],
+    ['another PR', REPO, 5772, false],
+  ])('jobsFor requires the same repo and PR: %s', (_name, repo, number, matches) => {
+    const job = { kind: 'review-job', pr: number, repo };
+    expect(jobsFor(pr, [job], NOW)).toEqual(matches ? [job] : []);
+    expect(row(sweep([pr], { drainSkips: skips, liveJobs: [job] }), 5771))
+      .toMatchObject({ stalled: !matches, liveJob: matches ? 'review-job' : null });
+  });
+  it('jobs without --repo do not suppress STALLED for same-numbered PRs in another repo', () => {
+    const liveJobs = parseLiveJobs('11915 node /w/scripts/operations/review-job.mjs run --pr=5771');
+    const other = { ...pr, repo: 'o/other' };
+    expect(sweep([pr, other], { liveJobs }).prs.map((r) => ({ repo: r.repo, stalled: r.stalled, liveJob: r.liveJob })))
+      .toEqual([REPO, 'o/other'].map((repo) => ({ repo, stalled: true, liveJob: null })));
+  });
+});
+
+describe('enqueue comment trust', () => {
+  const pr = mkPr({ labels: L('ready-to-merge', 'review:accepted'),
+    labelEvents: [{ label: 'review:accepted', at: '2026-10-21T08:00:00Z' }] });
+  const marker = `<!-- we-drain-enqueue-clearance head=${HEAD} -->`;
+  it.each([false, true])('untrusted enqueue comments cannot suppress STALLED (existing trusted enqueue: %s)', (existing) => {
+    const comments = existing ? [c('plateau-merger[bot]', '2026-10-21T09:00:00Z', marker)] : [];
+    const before = sweep([{ ...pr, comments }]).prs[0];
+    expect(before).toMatchObject({ waitingOn: existing ? 'in-merge-queue' : 'ready-to-merge',
+      since: existing ? '2026-10-21T09:00:00.000Z' : '2026-10-21T08:00:00.000Z', stalled: true });
+    const after = sweep([{ ...pr, comments: [...comments, c('mallory', '2026-10-21T11:14:00Z', marker)] }]).prs[0];
+    expect(after).toEqual(before);
+  });
+  it.each(['plateau-merger[bot]', 'chalbert'])('a matching enqueue from %s legitimately restarts the clock', (login) => {
+    expect(sweep([{ ...pr, comments: [c(login, '2026-10-21T11:14:00Z', marker)] }]).prs[0])
+      .toMatchObject({ waitingOn: 'in-merge-queue', since: '2026-10-21T11:14:00.000Z', stalled: false });
+  });
+  it('a trusted enqueue for an earlier head does not restart the clock', () => {
+    expect(sweep([{ ...pr, comments: [c('plateau-merger[bot]', '2026-10-21T11:14:00Z', marker.replace(HEAD, 'f'.repeat(40)))] }]).prs[0])
+      .toMatchObject({ waitingOn: 'ready-to-merge', since: '2026-10-21T08:00:00.000Z', stalled: true });
   });
 });
 
@@ -282,13 +343,29 @@ describe('thresholds, drain, ci', () => {
     const p = mkPr({ number: 4, labels: L('ready-to-merge') });
     expect(row(sweep([p], { drainSkips: [{ num: 4, repo: REPO, kind: 'not-certified', reason: 'x' }] }), 4)).toMatchObject({ actor: 'operator', stalled: true });
   });
+  it.each(['not-certified', 'red-team-pending'])('a %s drain skip requires the same repo and PR', (kind) => {
+    const p = mkPr({ number: 4, labels: L('ready-to-merge') });
+    const baseline = sweep([p]).prs[0];
+    for (const skip of [
+      { num: 4, repo: null }, { num: 4 }, { num: 4, repo: 'o/other' }, { num: 5, repo: REPO },
+    ]) {
+      expect(sweep([p], { drainSkips: [{ ...skip, kind, reason: 'x' }] }).prs[0]).toEqual(baseline);
+    }
+    expect(sweep([p], { drainSkips: [{ num: 4, repo: REPO, kind, reason: 'x' }] }).prs[0])
+      .toMatchObject({ waitingOn: kind === 'red-team-pending' ? kind : `drain-skip:${kind}` });
+  });
   it('an unreadable PR list is an error, never an empty sweep', () => {
     expect(() => assessPrSweep({ now: NOW })).toThrow(/unreadable/);
   });
   it('orders STALLED first, oldest first', () => {
-    const r = sweep([mkPr({ number: 7, labels: L('ready-to-merge'), updatedAt: '2026-10-21T11:10:00Z' }), mkPr({ number: 8, labels: L('review:human', 'advisory:accepted') })]);
-    expect(r.prs.map((x) => x.number)).toEqual([8, 7]);
-    expect(r.stalledCount).toBe(1);
+    const r = sweep([
+      mkPr({ number: 6, labels: L('ready-to-merge'), updatedAt: '2026-10-21T11:12:00Z' }),
+      mkPr({ number: 9, labels: L('review:human', 'advisory:accepted'), updatedAt: '2026-10-21T11:10:00Z' }),
+      mkPr({ number: 8, labels: L('review:human', 'advisory:accepted'), updatedAt: '2026-10-21T10:00:00Z' }),
+      mkPr({ number: 7, labels: L('review:pending'), updatedAt: '2026-10-21T08:00:00Z' }),
+    ], { liveJobs: [{ kind: 'review-job', pr: 7, repo: REPO }] });
+    expect(r.prs.map((x) => [x.number, x.stalled])).toEqual([[8, true], [9, true], [7, false], [6, false]]);
+    expect(r.stalledCount).toBe(2);
   });
 });
 
@@ -366,14 +443,19 @@ describe('io helpers', () => {
     expect(out.unreadable).toEqual([`${REPO}#1: ${endpoint} failed`]);
     expect(out.prs.map((p) => p.number)).toEqual([2]);
   });
-  it('parses the latest drain skip row and live review/fix processes', () => {
+  it('parses the latest drain skip row', () => {
     const log = 'x\nmerge-ai-prs · skip-reasons: [{"num":1,"repo":"a/b","kind":"k","reason":"old"}]\nmerge-ai-prs · skip-reasons: [{"num":5771,"repo":"web-everything/web-everything","kind":"red-team-pending","reason":"r"}]\nnoise';
     expect(parseDrainSkips(log)).toEqual({ rows: [{ num: 5771, repo: REPO, kind: 'red-team-pending', reason: 'r' }], error: null });
     expect(parseDrainSkips('nothing')).toEqual({ rows: [], error: null });
     expect(parseDrainSkips('merge-ai-prs · skip-reasons: {bad}').error).toMatch(/not valid JSON/);
     expect(parseDrainSkips('merge-ai-prs · skip-reasons: {"a":1}').error).toMatch(/not a list/);
-    const ps = ' 11915 06:55 /bin/node /w/scripts/operations/review-job.mjs run --pr=5786 --repo=web-everything/web-everything --prefer-lane=13\n 2 1 vim x';
-    expect(parseLiveJobs(ps)).toEqual([{ kind: 'review-job', pr: 5786, repo: REPO, source: 'ps' }]);
+  });
+  it.each(['review-job', 'review-extra-seats', 'fix-run', 'ci-heal', 'deliver-item-run', 'red-team-gate-apply'])
+  ('recognizes live %s processes with PR and repo', (kind) => {
+    for (const separator of ['=', ' ']) {
+      const ps = ` 11915 06:55 /bin/node /w/scripts/operations/${kind}.mjs run --pr${separator}5786 --repo${separator}${REPO} --prefer-lane=13\n 2 1 vim x`;
+      expect(parseLiveJobs(ps)).toEqual([{ kind, pr: 5786, repo: REPO, source: 'ps' }]);
+    }
   });
   it('threshold cascade: flag > env > setting > 45', () => {
     expect(resolveStalledAfter({ flag: 10, env: { WE_PR_SWEEP_STALLED_AFTER_MINUTES: '20' }, settings: { prSweep: { stalledAfterMinutes: 30 } } })).toBe(10);
