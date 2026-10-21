@@ -242,6 +242,17 @@ export async function prepareRebuild({
     const tip = o?.ref ? verifyRev(git, `refs/remotes/origin/${o.ref}^{commit}`) : null;
     return tip ? [{ pr: o.pr != null ? Number(o.pr) : 0, sha: tip }] : [];
   });
+  // …persisted BEFORE the fetch, so no early return below (fetch or status failure) can forget them (Codex round 11).
+  {
+    const prevS = Array.isArray(state.seenHeads) ? state.seenHeads : [];
+    const keys = new Set(prevS.map((h) => `${h.pr}:${h.sha}`));
+    const fresh = preFetchTips.filter((h) => !keys.has(`${h.pr}:${h.sha}`));
+    if (fresh.length > 0) {
+      state.seenHeads = [...fresh, ...prevS];
+      writeState();
+      for (const h of fresh) git(['update-ref', `refs/we-adopted-heads/${h.sha}`, h.sha]);
+    }
+  }
   const fetchResult = fetchMainAndOverlays({ git, overlays: overlaysBefore, edgeResolve });
   if (!fetchResult.ok) {
     if (unsafe.untracked.length > 0) alert('untracked-kept', { paths: unsafe.untracked });
