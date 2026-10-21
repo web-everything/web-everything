@@ -25,16 +25,22 @@ Live case 2026-10-20: review clone held on 71d837a67 from 19:54Z and drain clone
   - `A2 conflict hunk main does not carry` — keeps held / established-overlay-conflict.
   - `A3 main weaker: overlay attempts<=1, main attempts 3, candidate carries 3` — refused although 3 matches main exactly.
   - `A3 overlay weaker: main stricter than the top` — a candidate carrying the top's weaker value is refused.
+  - `A3 higher is stricter: backoff` — the top's backoff is longer than main's; a candidate carrying main's shorter backoff is refused.
   - `A3 strictest of three parents` — two stack tops and main; a candidate carrying the middle value is refused; one carrying the strictest value passes guard-diff.
   - `A3 guard in one parent only` — a dropped guard is refused; the same or a stricter value passes guard-diff.
   - `A3 undeclared direction` — a guard with no declared strictness direction keeps the hold.
   - `A3 indirect weakening` — one case each: settings JSON default, env override, positiveInt relaxed to nonNegativeInt, widened regex, unit change under the same name.
   - `A3 strictness unknown` — non-numeric change, different units, changed comparison operator.
-  - `A3 docs/config patch-ID only` — a docs or settings JSON hunk matched only by patch ID is refused.
+  - `A3 docs/config patch-ID only` — one case each for a docs hunk, a config hunk and a settings JSON hunk matched only by patch ID; each is refused.
+  - `A3 guard-diff never picks a side` — the stricter side exists but the exact-content proof fails; the hold stays.
+  - `Proof rule unprovable` — one case each: rename conflict, binary conflict, mode conflict, ambiguous context mapping; each keeps the hold.
+  - `A5 siblings` — one case each: meaningful tab, CRLF vs LF line ending, whitespace inside a code string literal, a historical exact match later reverted on main, one later altered on main.
   - `E2 git failure or timeout` — a stubbed failing and a timing-out git call during the proof both keep the hold.
-  - `E4 smoke or guard-diff fails` — each keeps the last-good build and the needs-you.
-  - `E5 removed overlay` — an overlay unregistered after the hold is absent from the candidate.
-  - `E6 main or top moves during smoke` — the candidate is discarded and re-planned, never adopted.
+  - `E3 locked finalize` — the candidate is built in the job scratch tree; the clone and rebuild state change only inside the locked finalize.
+  - `E4 any failure` — one case each: smoke fails, guard-diff fails, a touched test fails, the candidate merge or build throws; each keeps the last-good build and the needs-you.
+  - `E5 removed overlay` — an overlay unregistered after the hold is absent from the candidate (the candidate built without it may still be adopted).
+  - `E6 moves during smoke` — one case where main moves and one where the top moves; each discards the candidate and re-plans, never adopts.
+  - `E7 attribution` — the adopted merge commit is attributed to the daemon rebuild and the log names both parent shas.
 
 ## Non-goals
 
