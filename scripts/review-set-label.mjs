@@ -1410,6 +1410,7 @@ export function runReviewLabelCli({
     && !hasReviewLabel(currentLabels, REVIEW_LABELS.human) && !hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical)
     && redTeamRulingNeeded({ number: Number(pr), headRefOid: headSha, labels: currentLabels, comments: fullThread() }, readConfirmedBreaks().value, {
       // The gate holds a break decided on saved evidence when its comment was withheld; the ruling clears that too.
+      repo,
       readSaved: () => {
         try { return savedRedTeamFallback({ repo, pr, head: headSha })(); }
         catch (e) { return fail(`saved red-team evidence unreadable — nothing was changed: ${e.message}`, 1); }

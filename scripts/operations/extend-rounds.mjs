@@ -1,4 +1,10 @@
-/** Operator-only audited round grant. --preview plans without posting; IO lives in extend-rounds-io.mjs. */
+/**
+ * Operator-only audited round grant. --preview plans without posting; IO lives in extend-rounds-io.mjs.
+ * `--by=<n>` means n MORE rounds from the round the PR is on now, even past the cap: fix dispatch and the red-team gate
+ * both anchor a grant at the round it was posted on (`reconcile-core.mjs#resolveRoundExtensionAnchor`,
+ * `red-team-gate.mjs#gateRoundCap`). After a proven grant the red-team gate re-runs on the PR, so a break it parked at
+ * the cap is sent back to the fixer when the grant covers the current round.
+ */
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
