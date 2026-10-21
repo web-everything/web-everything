@@ -80,7 +80,7 @@ export function isHumanGated(pr) {
  */
 export function redTeamRegateOwed(pr, repo) {
   if (!repo || !pr?.headRefOid || !Array.isArray(pr?.comments)) return false;
-  try { return liveResultGateState(pr.comments, pr.number, String(pr.headRefOid).toLowerCase(), null, repo, null).reopened === true; }
+  try { return liveResultGateState(pr.comments, pr.number, String(pr.headRefOid).toLowerCase(), repo, null).reopened === true; }
   catch { return false; }
 }
 

@@ -567,8 +567,8 @@ describe('applyRedTeamGate', () => {
           const comments = thread();
           expect(countGrantedRoundExtensions(comments, { repo: REPO, pr: 4722, standingRuling: scope })).toBe(1);
           expect(gateRoundGrants(comments, 4722, REPO, scope)).toEqual([expect.objectContaining({ by: 1, standingRuling: RULING_ID, at: autoGrant.createdAt })]);
-          expect(liveResultGateState(comments, 4722, HEAD, null, REPO, scope)).toMatchObject({ sendBackOutcome: 'round-cap', reopened: true });
-          expect(liveResultGateState(comments, 4722, HEAD, null, REPO, null)).toMatchObject({ sendBackOutcome: 'round-cap', reopened: false });
+          expect(liveResultGateState(comments, 4722, HEAD, REPO, scope)).toMatchObject({ sendBackOutcome: 'round-cap', reopened: true });
+          expect(liveResultGateState(comments, 4722, HEAD, REPO, null)).toMatchObject({ sendBackOutcome: 'round-cap', reopened: false });
           const gate = (readGrantScope) => applyRedTeamGate({ repo: REPO, pr: 4722 },
             fakeIo({ comments: thread(), round: 12, readRoundAsOf: () => 12, readGrantScope }).io);
           expect(await gate(() => scope)).toMatchObject({ status: 'applied', outcome: 'sent-back' });
@@ -595,8 +595,8 @@ describe('applyRedTeamGate', () => {
         const four = [1, 2, 3, 4].map(nth);
         expect(countGrantedRoundExtensions(four, { repo: REPO, pr: 4722, standingRuling: { ...scope, uneditedComments: ['IC_auto1', 'IC_auto2', 'IC_auto3', 'IC_auto4'] } })).toBe(3);
         // `thread` maps every comment to the REST shape itself, so it takes the GraphQL-shaped grant.
-        expect(liveResultGateState(thread(autoGrant), 4722, HEAD, null, REPO, scope).reopened).toBe(true);
-        expect(liveResultGateState(thread({ ...autoGrant, id: 'IC_edited' }), 4722, HEAD, null, REPO, scope).reopened).toBe(false);
+        expect(liveResultGateState(thread(autoGrant), 4722, HEAD, REPO, scope).reopened).toBe(true);
+        expect(liveResultGateState(thread({ ...autoGrant, id: 'IC_edited' }), 4722, HEAD, REPO, scope).reopened).toBe(false);
       });
       it('the label provider keeps the comment id (the node id the unedited read returns)', () => {
         expect(GH_ARGV.readComments(REPO, 4722).join(' ')).toMatch(/\{id: \.node_id, url: \.html_url, author: \{login: \.user\.login\}, body, createdAt: \.created_at\}/);

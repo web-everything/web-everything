@@ -43,7 +43,6 @@ import {
   GATE_OUTCOMES, gateRoundCap, gateRoundGrants, liveResultGateState, planRedTeamActions, readConfirmedBreaks, redTeamGateMarker,
   withholdUnpublishableFindings,
 } from '../lib/red-team-gate.mjs';
-import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 import { cleanFindingFile, qualifyLocusRefs, sanitizeCardField } from '../lib/review-loop-policy.mjs';
 import { IN_REPO_LOCUS } from '../lib/citation-check.mjs';
 import { DEFAULT_ROUND_CAP } from '../lib/jury-core.mjs';
@@ -53,6 +52,7 @@ import { spawnPreventionLandingJob } from '../lib/prevention-landing-job.mjs';
 import { readReviewRound, readReviewRoundAsOf } from './review-pr-io.mjs';
 import { appendLedgerEvents } from './record-referral-ruling-io.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
+import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 
 const THIS_FILE = fileURLToPath(import.meta.url);
 const REPO_ROOT = resolve(dirname(THIS_FILE), '..', '..');
@@ -143,9 +143,9 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
     try { standingRuling = io.readGrantScope?.({ repo, pr, head, comments: view?.comments }) ?? null; } catch { standingRuling = null; }
     // The live head's latest result, and only the records that decide THAT result (an earlier same-head result's
     // records never dedup a newer one, PR #5482).
-    const posted = liveResultGateState(view?.comments, pr, head, null, repo, standingRuling);
+    const posted = liveResultGateState(view?.comments, pr, head, repo, standingRuling);
     const saved = posted.result ? null : (io.readSavedResult ?? readSavedRedTeamResult)({ repo, pr, head });
-    const { result, resultId, headReviewIndex, outcomes: recorded, sendBackOutcome, reopened } = saved ? liveResultGateState(view?.comments, pr, head, saved, repo, standingRuling) : posted;
+    const { result, resultId, headReviewIndex, outcomes: recorded, sendBackOutcome, reopened } = saved ? liveResultGateState(view?.comments, pr, head, repo, standingRuling, saved) : posted;
     let parsed = result;
     if (!parsed) return { status: 'no-red-team-on-head', head };
     // Saved evidence may be precisely the result whose comment failed this scrub. Check raw fields

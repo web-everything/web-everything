@@ -393,8 +393,7 @@ export function withholdUnpublishableFindings(findings, composed = []) {
 export function redTeamRulingNeeded(pr, setting = CONFIRMED_BREAKS_DEFAULTS, { readSaved = null, repo = pr?.repo ?? null, standingRuling = pr?.standingRuling ?? null } = {}) {
   const labels = (pr?.labels ?? []).map(l => typeof l === 'string' ? l : l?.name);
   if (labels.includes('review:changes')) return null;
-  const read = savedResult => readRedTeamDisposition({ comments: pr?.comments, pr: pr?.number, head: pr?.headRefOid, setting, savedResult, repo,
-    standingRuling });
+  const read = savedResult => readRedTeamDisposition({ comments: pr?.comments, pr: pr?.number, head: pr?.headRefOid, setting, savedResult, repo, standingRuling });
   let disposition = read(null);
   // A held break needs a trusted gate record on this head, so a thread without one never pays for the store read.
   const savedResult = !disposition.result && readSaved && gateOutcomesForHead(pr?.comments, pr?.number, pr?.headRefOid).size
@@ -444,7 +443,7 @@ const recordBody = r => String((typeof r.c === 'string' ? r.c : r.c?.body) ?? ''
  * so the key is total (a sort never meets a contradiction). PURE. */
 const threadOrder = (a, b) => a.ts - b.ts || a.i - b.i;
 /** A comment's creation time in either read shape: GraphQL/`gh pr view` (`createdAt`) or the REST thread the drain reads (`created_at`). */
-export const commentTime = c => Date.parse(commentCreatedAt(c));
+export const commentTime = c => Date.parse(c?.createdAt ?? c?.created_at);
 const indexedRecords = (comments, savedResult = null) => {
   let ts = 0;
   const records = threadRecords(comments).map((r, i) => {
@@ -492,7 +491,7 @@ function gateRecordsFor(records, pr, sha, hit) {
  * The live head's latest red-team result (carried ones included) and the outcomes the gate recorded for THAT result.
  * The gate dedups on this, so a record for an earlier same-head result never stops it deciding a newer one. PURE.
  */
-export function liveResultGateState(comments, pr, head, savedResult = null, repo = null, standingRuling = null) {
+export function liveResultGateState(comments, pr, head, repo = null, standingRuling = null, savedResult = null) {
   const live = String(head ?? '').toLowerCase();
   const records = indexedRecords(comments, savedResult);
   const hit = latestResult(records, pr, live);
