@@ -1,5 +1,6 @@
 import { RED_TEAM_STATUS_LABELS } from './lib/red-team-status-label-meta.mjs';
 import { readConfirmedBreaks, redTeamRulingNeeded } from './lib/red-team-gate.mjs';
+import { standingRulingScope } from './conveyor/standing-ruling-io.mjs';
 import { signalFixDispatch } from './lib/fix-handoff.mjs';
 import { mandatoryReferralState, readReferralRecords, referralRecordState } from './lib/jury-core.mjs';
 import { referralSeatDisabled } from './operations/review-seat-policy.mjs';
@@ -983,6 +984,17 @@ export function runApprovalPreventionFiling({
 }
 
 /**
+ * Is a red-team break held at the round cap on this head, awaiting the operator's ruling? Reads the verified
+ * standing-ruling scope (PR #5758), so an automatic grant that reopened the send-back counts exactly as it does in the
+ * gate: the fixer then owns the break and there is no ruling to clear. Unreadable scope = no automatic credit.
+ */
+export function redTeamRulingHeld({ repo, pr, headSha, labels, comments, setting, readGrantScope = standingRulingScope }) {
+  let standingRuling = null;
+  try { standingRuling = readGrantScope({ repo, pr: { number: Number(pr), headRefOid: headSha, comments } }) ?? null; } catch { standingRuling = null; }
+  return redTeamRulingNeeded({ number: Number(pr), headRefOid: headSha, labels, comments }, setting, { repo, standingRuling }) !== null;
+}
+
+/**
  * we:scripts/review-set-label.mjs#runReviewLabelCli — the SHARED review-label CLI harness (#2644). Both this
  * file's reviewer-verdict CLI and the conveyor `rearm-review.mjs` run this SAME observe→decide→write→re-read arc
  * against `gh`; only three things differ and they arrive as config (exactly the deltas #2644 names):
@@ -1067,6 +1079,9 @@ export function runReviewLabelCli({
   appendApproval = appendVerdict,
   // The fix daemon's wake signal after a `review:changes` write; injected by tests so no run touches a real mailbox.
   signalFix = signalFixDispatch,
+  // PR #5758 — the read-time verified standing-ruling scope, so the red-team ruling check credits an automatic round
+  // grant exactly as the gate does. Unreadable = no automatic grant credit (the operator grants still count).
+  readGrantScope = standingRulingScope,
 } = {}) {
   // Shadows the module-level `fail` so EVERY refusal inside this function goes to the
   // injected emitter too. Without this the guards print past an in-process caller's collector (#3061); the
@@ -1406,7 +1421,7 @@ export function runReviewLabelCli({
   };
   const redTeamRulingHold = to === 'clear-human' && hasReviewLabel(currentLabels, REVIEW_LABELS.accepted)
     && !hasReviewLabel(currentLabels, REVIEW_LABELS.human) && !hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical)
-    && redTeamRulingNeeded({ number: Number(pr), headRefOid: headSha, labels: currentLabels, comments: fullThread() }, readConfirmedBreaks().value, { repo }) !== null;
+    && redTeamRulingHeld({ repo, pr, headSha, labels: currentLabels, comments: fullThread(), setting: readConfirmedBreaks().value, readGrantScope });
   let decision = decideSetLabel({
     to,
     currentLabels,

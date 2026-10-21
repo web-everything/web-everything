@@ -7,12 +7,13 @@ import { createHash } from 'node:crypto';
 import { applyRedTeamGate, buildGateComment, buildRedTeamCardInput, buildSendBackArgv, buildSendBackBody, gateExitCode, renderGateSummary, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
 import { runReviewJob } from '../review-job.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, gateRoundGrants, parseRedTeamComment, parseRedTeamGateMarker, redTeamGateMarker, redTeamQueueReason, redTeamResultId, redTeamRulingNeeded } from '../../lib/red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, gateRoundGrants, parseRedTeamComment, parseRedTeamGateMarker, readRedTeamDisposition, redTeamGateMarker, redTeamQueueReason, redTeamResultId, redTeamRulingNeeded } from '../../lib/red-team-gate.mjs';
 import { redTeamEnqueueHold } from '../../lib/drain-queue-safety.mjs';
+import { planRedTeamStatusLabels } from '../../lib/red-team-status-labels.mjs';
 import { buildReviewedShaMarker, buildClearedHumanMarker } from '../../lib/review-escalation.mjs';
 import { buildVerdictCarriedMarker } from '../../lib/review-verdict-carried-marker.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
-import { runReviewLabelCli } from '../../review-set-label.mjs';
+import { redTeamRulingHeld, runReviewLabelCli } from '../../review-set-label.mjs';
 import { readReviewRound, readReviewRoundAsOf } from '../review-pr-io.mjs';
 
 const REPO = 'web-everything/web-everything';
@@ -474,6 +475,20 @@ describe('applyRedTeamGate', () => {
         const pr = { number: 4722, repo: REPO, headRefOid: HEAD, labels: ['review:changes'], comments, standingRuling: scope };
         expect(redTeamQueueReason(pr)).toMatch(/the fixer owns them/);
         expect(redTeamRulingNeeded({ ...pr, labels: ['review:accepted'] })).toBeNull();
+        // The drain hold, the status labels and the clear-human ruling check read the same disposition with the scope.
+        const read = standingRuling => readRedTeamDisposition({ comments, pr: 4722, head: HEAD, repo: REPO, setting: CONFIRMED_BREAKS_DEFAULTS, env: {}, standingRuling });
+        expect(read(scope)).toMatchObject({ outcome: 'sent-back', sendBack: [expect.objectContaining({ index: 1 })], held: [] });
+        expect(read(null)).toMatchObject({ outcome: 'round-cap', sendBack: [] });
+        expect(redTeamEnqueueHold({ comments, pr: 4722, head: HEAD, repo: REPO, standingRuling: scope, confirmedBreaks: CONFIRMED_BREAKS_DEFAULTS, env: {} }))
+          .toMatch(/confirmed a break requiring send-back/);
+        expect(planRedTeamStatusLabels({ labels: [], comments, repo: REPO, pr: 4722, head: HEAD, env: {}, standingRuling: scope }).add).toBe('red-team:blocked');
+        const asked = [];
+        const held = readGrantScope => redTeamRulingHeld({ repo: REPO, pr: 4722, headSha: HEAD, labels: ['review:accepted'], comments,
+          setting: CONFIRMED_BREAKS_DEFAULTS, readGrantScope: a => { asked.push(a); return readGrantScope(); } });
+        expect(held(() => scope)).toBe(false);
+        expect(asked[0]).toMatchObject({ repo: REPO, pr: { number: 4722, headRefOid: HEAD, comments } });
+        expect(held(() => null)).toBe(true);
+        expect(held(() => { throw new Error('gh down'); })).toBe(true);
       });
 
       it('without a verified scope the same grant reopens nothing (fail closed)', async () => {

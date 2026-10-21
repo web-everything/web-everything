@@ -76,9 +76,9 @@ export function readUneditedCommentIds({ repo, number }, { gh = ghApp, readEdits
 
 /** IO: does GitHub associate commit `head` with PR `number`? */
 export function headBelongsToPr({ repo, number, head }, { gh = ghApp } = {}) {
-  const raw = gh(['api', `repos/${slugOf(repo)}/commits/${head}/pulls`, '--jq', '[.[].number]']);
-  const numbers = JSON.parse(String(raw));
-  return Array.isArray(numbers) && numbers.includes(Number(number));
+  // Every page (one number per line): a commit shared by more than one page of PRs is still found (PR #5758).
+  const raw = gh(['api', '--paginate', `repos/${slugOf(repo)}/commits/${head}/pulls`, '--jq', '.[].number']);
+  return String(raw).split(/\s+/).filter(Boolean).map(Number).includes(Number(number));
 }
 
 /** IO: is `head` a commit of this PR whose net diff vs current main is entirely cards? false on any doubt. */

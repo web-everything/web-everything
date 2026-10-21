@@ -49,7 +49,7 @@ describe('App identity only, personal read routing off', () => {
   it('every default standing-ruling read and automatic-grant read or post passes throttle.personalRoute=false', () => {
     execFileSyncThrottled.mockReset();
     execFileSyncThrottled.mockImplementation((_file, args) => {
-      if (String(args[1]).endsWith('/pulls')) return '[5654]';
+      if (String(args[2]).endsWith('/pulls')) return '5654\n';
       if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ state: 'OPEN', headRefOid: HEAD });
       if (args[0] === 'api' && args[1] === 'graphql') return JSON.stringify({ data: { repository: { issues: { nodes: [], pageInfo: { hasNextPage: false } } } } });
       return '';
@@ -60,12 +60,14 @@ describe('App identity only, personal read routing off', () => {
     readPrThread(WE, 5654, { readComments: (_n, { exec }) => { exec('gh', ['api', `repos/${WE}/issues/5654/comments`]); return []; } });
     postPrComment(WE, 5654, 'body');
     const calls = execFileSyncThrottled.mock.calls;
-    expect(calls.map(([, args]) => args[0] === 'pr' ? `pr ${args[1]}` : args[1])).toEqual(expect.arrayContaining(
+    expect(calls.map(([, args]) => args[0] === 'pr' ? `pr ${args[1]}` : args.find((a) => a === 'graphql' || a.startsWith('repos/')))).toEqual(expect.arrayContaining(
       ['graphql', `repos/${WE}/commits/${HEAD}/pulls`, `repos/${WE}/issues/5654/comments`, 'pr view', 'pr comment']));
     for (const [file, , opts] of calls) {
       expect(file).toBe('gh');
       expect(opts.throttle).toEqual({ personalRoute: false });
     }
+    // No later test may fall through to canned data: the default transport is an empty mock again.
+    execFileSyncThrottled.mockReset();
   });
 });
 
@@ -245,6 +247,12 @@ describe('read-time scope (standing-ruling-io)', () => {
     expect(readStandingRuling(WE, { readIssues })).not.toBeNull();
     state = 'CLOSED';
     expect(readStandingRuling(WE, { readIssues })).toBeNull();
+  });
+  it('reads every page of a commit\'s PRs (the PR may be past the first page)', () => {
+    const gh = vi.fn(() => `${Array.from({ length: 30 }, (_, i) => 9000 + i).join('\n')}\n5654\n`);
+    expect(headBelongsToPr({ repo: WE, number: 5654, head: HEAD }, { gh })).toBe(true);
+    expect(gh.mock.calls[0][0]).toContain('--paginate');
+    expect(headBelongsToPr({ repo: WE, number: 5654, head: HEAD }, { gh: () => '' })).toBe(false);
   });
   it('a cited head of another PR is not card-only for this PR', () => {
     const readNet = vi.fn(() => ({ ok: true, files: ['backlog/x.md'] }));
