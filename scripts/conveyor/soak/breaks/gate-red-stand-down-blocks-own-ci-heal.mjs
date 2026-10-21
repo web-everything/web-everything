@@ -25,7 +25,7 @@ export default {
   id: 'gate-red-stand-down-blocks-own-ci-heal',
   title: 'a gate-red stand-down was read as a question for a person and blocked the PR\'s own owed ci-heal forever',
   card: 'gate-red stand-down terminal — live PR #5768, 2026-10-21',
-  fixedBy: { sha: 'lane-gate-red-standdown', where: 'lane/gate-red-standdown', paths: ['scripts/conveyor/reconcile-core.mjs'] },
+  fixedBy: { sha: '4da8f6869', where: 'lane/gate-red-standdown', paths: ['scripts/conveyor/reconcile-core.mjs'] },
   fixPresent(root) {
     const p = join(root, 'scripts/conveyor/reconcile-core.mjs');
     return existsSync(p) && readFileSync(p, 'utf8').includes('gateRedRetryState');
