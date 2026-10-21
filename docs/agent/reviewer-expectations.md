@@ -1,6 +1,6 @@
 # Reviewer expectations
 
-This living checklist applies to builders and fixers. The nightly coroner adds recurring themes with concrete examples; keep rules actionable.
+This living checklist applies to builders and fixers. The nightly coroner proposes recurring themes with concrete examples by PR, never by a direct edit; keep rules actionable.
 
 - **Fail closed.** Every new check refuses unknown, unreadable or incomplete evidence. Name a test for the closed path. Example: a failed label read blocks admission instead of treating the PR as unlabelled.
 - **Give bounds an explicit fallback.** Every new fail-closed bound names an operator-visible fallback or escalation and tests oversized input. Example: a net diff over the self-review size limit opens with an incomplete-review note requiring human review of the full diff; it never counts as a clear review.

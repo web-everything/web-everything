@@ -9,7 +9,7 @@
 import { EventEmitter } from 'node:events';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -1180,6 +1180,44 @@ describe('direct CLI flags reach the actual spawn and JSON result', () => {
       expect(report.route).toMatchObject({ kind, model, effort, sources: { model: modelSource, effort: effortSource } });
       expect(flagValue(report.argv, '-m')).toBe(model);
       expect(report.argv).toContain(`model_reasoning_effort=${effort}`);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  // Text mode exits 1 on a red gate, and `--no-self-review` reaches codexDirectTask: with self-review forced on by
+  // the environment, `--ephemeral` is refused (exit 1) unless the flag turns it off.
+  it.each([
+    ['a green gate with --no-self-review exits 0', true, ['--no-self-review'], 0],
+    ['a red gate in text mode exits 1', false, ['--no-self-review'], 1],
+    ['--ephemeral without --no-self-review is refused while self-review is on', true, [], 1],
+  ])('%s', (_name, gateGreen, flags, status) => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-direct-cli-exit-'));
+    weCheckout(dir);
+    const preload = `import cp from 'node:child_process';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { EventEmitter } from 'node:events';
+      cp.execFileSync = (bin, args) => {
+        if (bin === 'npm' && args.includes('check:standards') && !${gateGreen}) throw Object.assign(new Error('standards red'), { status: 1 });
+        return args.includes('--absolute-git-dir') ? ${JSON.stringify(join(dir, 'metadata'))} : args.includes('rev-parse') ? 'sha' : '';
+      };
+      cp.spawn = () => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+        child.stdin = { on() {}, end() { setTimeout(() => {
+          child.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'turn.completed' }) + '\\n'));
+          child.emit('close', 0);
+        }, 0); } };
+        child.kill = () => {};
+        return child;
+      };
+      syncBuiltinESMExports();`;
+    try {
+      const run = spawnSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`,
+        'scripts/codex-direct-task.mjs', '--task=fixture', `--dir=${dir}`, '--no-stream', '--ephemeral', '--gate=standards', ...flags],
+      { encoding: 'utf8', env: { ...process.env, WE_CODEX_MODEL_BY_TASK: '{}', WE_BUILD_SELF_REVIEW_ENABLED: 'true' } });
+      expect(run.status, run.stderr).toBe(status);
+      if (status === 0) expect(run.stdout).toContain('gate (standards): PASS');
+      else if (flags.length) expect(run.stdout).toContain('gate (standards): FAIL');
+      else expect(run.stderr).toContain('--ephemeral requires self-review off');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

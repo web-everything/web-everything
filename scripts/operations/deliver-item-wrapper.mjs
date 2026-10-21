@@ -620,7 +620,9 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
         if (!updated || updated.status !== 'done' || !['done', 'needs-human-judgment'].includes(updated.outcome)) {
           throw new Error('self-review builder did not complete its repair');
         }
-        report = updated;
+        // The repair turn reports only what IT changed; keep every earlier turn's files so the park decision
+        // (statute / policy-core) and the PR body still see them.
+        report = { ...updated, filesTouched: [...new Set([...(report.filesTouched ?? []), ...(updated.filesTouched ?? [])])] };
         commitBuildTurn({ lane: gate.lanePath, item, provider, phase: 'self-review' });
       },
       gate: () => runVerifyOperation(gate.lanePath).outcome === 'pass',
@@ -2597,14 +2599,15 @@ export function computeLaneDiffStats(lanePath, { run: runFn = run, baseRef = 'or
  * so every existing caller (every test that does not pass it) is byte-identical — this is additive-only.
  */
 export function decideParkMode({ report, convergeVerdict, filesTouched, lanePath, crossRepo = false, executedVendor = 'claude' }, { run: runFn = run } = {}) {
-  const touchesStatute = (filesTouched || []).some((f) => isStatutePath(f) || isPolicyCorePath(f));
+  // The statute check reads the lane's net diff too: an agent's self-reported file list can omit a path.
+  const diffStats = lanePath ? computeLaneDiffStats(lanePath, { run: runFn }) : { changedFiles: filesTouched || [], diffLines: 0 };
+  const touchesStatute = [...(filesTouched || []), ...diffStats.changedFiles].some((f) => isStatutePath(f) || isPolicyCorePath(f));
   if (touchesStatute) return { mode: 'park', label: 'review:human', reason: 'statute/policy-core path touched' };
   if (report.outcome === 'needs-human-judgment') return { mode: 'park', label: 'review:human', reason: report.reason };
   if (convergeVerdict.verdict === 'escalate') return { mode: 'park', label: 'review:human', reason: convergeVerdict.reason };
   if (convergeVerdict.selfReview) return { mode: 'park', label: 'review:pending', reason: 'pre-review self-check complete; independent review required' };
 
   const dismissedFindings = Array.isArray(convergeVerdict.dismissed) ? convergeVerdict.dismissed.length : 0;
-  const diffStats = lanePath ? computeLaneDiffStats(lanePath, { run: runFn }) : { changedFiles: filesTouched || [], diffLines: 0 };
   const score = scoreEscalation({
     changedFiles: diffStats.changedFiles, diffLines: diffStats.diffLines, dismissedFindings, crossRepo,
   });

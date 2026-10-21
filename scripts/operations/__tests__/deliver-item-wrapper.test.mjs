@@ -2379,6 +2379,15 @@ describe('decideParkMode (#3627 gap 4 — the real scoreEscalation rubric)', () 
     expect(result).toEqual({ mode: 'park', label: 'review:human', reason: 'statute/policy-core path touched' });
   });
 
+  it('parks review:human on a statute path in the lane\'s net diff even when the agent\'s report omits it', () => {
+    const runFn = (_bin, args) => (args.includes('merge-base') ? 'base\n' : '3\t1\tdocs/agent/platform-decisions.md\n');
+    const result = decideParkMode({
+      report: { outcome: 'done' }, convergeVerdict: { verdict: 'land', selfReview: { notes: [] } },
+      filesTouched: ['a.mjs'], lanePath: '/lane',
+    }, { run: runFn });
+    expect(result).toEqual({ mode: 'park', label: 'review:human', reason: 'statute/policy-core path touched' });
+  });
+
   it('still parks review:human on the agent\'s own needs-human-judgment outcome', () => {
     const result = decideParkMode({
       report: { outcome: 'needs-human-judgment', reason: 'a genuine taste call' }, convergeVerdict: noVerdict,
@@ -3588,6 +3597,24 @@ describe('deliverItem (#3627 bug 13 — the success-path result string names the
     expect(reviewBuild).toHaveBeenCalledOnce();
     expect(provider.spawn).toHaveBeenCalledOnce();
     expect(execFileSync.mock.calls.some(([, args]) => args?.[0] === 'scripts/converge-cli.mjs')).toBe(false);
+  });
+
+  // A self-review repair turn reports only the files IT changed; a statute path the builder touched in turn 1 must
+  // still park review:human, never be dropped from the park decision by the repair's narrower report.
+  it('parks review:human when turn 1 touched a statute path and the self-review repair touched only another file', async () => {
+    vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'true');
+    const provider = { spawn: vi.fn(), vendor: 'claude' };
+    tryReadDeliveryReport.mockImplementation(() => (provider.spawn.mock.calls.length > 1
+      ? { status: 'done', outcome: 'done', filesTouched: ['a.mjs'], reason: 'repaired' }
+      : { status: 'done', outcome: 'done', filesTouched: ['docs/agent/platform-decisions.md'], reason: 'did it' }));
+    const reviewBuild = vi.fn().mockResolvedValueOnce(['a.mjs:1 defect']).mockResolvedValue([]);
+    const result = await deliverItem(
+      { item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999', attemptTag: '', runId: 'dispatch-lane-fixture', effectKey: 'dispatch:0:0' },
+      provider, { newSessionId: () => 'uuid-fixed', reviewBuild },
+    );
+    expect(provider.spawn).toHaveBeenCalledTimes(2);
+    expect(result.result).toBe('PR #4321 (review:human)');
+    expect(readFileSync(join(lane, '.pr-body.md'), 'utf8')).toContain('- docs/agent/platform-decisions.md');
   });
 
   it.each([
