@@ -777,22 +777,26 @@ export function ledgerEventId(row) {
   return `sha256:${createHash('sha256').update(JSON.stringify(canonical(record))).digest('hex')}`;
 }
 
-/** Latest lifecycle head. Send-backs may also bind to a later event head when its observation append missed;
- * known superseded heads never rewind that witness. Other callers require lifecycle evidence only. */
-export function observedLedgerHead(events, { includeEventHeads = false } = {}) {
+/** Every head a send-back appended after `events` may have rejected: the latest lifecycle head, plus each head a
+ * review, referral, exemption or other non-transition row named. A fresh row naming a superseded head (a force-push
+ * back to it whose observation append missed) reads exactly like a delayed one, so the send-back holds at all of
+ * them, fail closed. A transition records a push, never a review, so its heads are not candidates. */
+export function sendBackCandidateHeads(events) {
   const pr = events.at(-1)?.pr;
-  const { byPr, witnessedHeads, witnessRows, supersededHeads } = foldWithWitness(events);
-  if (includeEventHeads) {
-    const boundary = events.lastIndexOf(witnessRows.get(pr));
-    const superseded = [...(supersededHeads.get(pr) ?? [])];
-    for (let i = events.length - 1; i > boundary; i--) {
-      const e = events[i];
-      if (e.pr !== pr || e.type === undefined || e.type === EVENT_TYPES.VERDICT || !isSha(e.headSha)) continue;
-      if (superseded.some(old => sameHead(old, e.headSha))) continue;
-      const witnessed = witnessedHeads.get(pr);
-      return sameHead(witnessed, e.headSha) && witnessed.length > e.headSha.length ? witnessed : e.headSha;
-    }
+  const heads = [observedLedgerHead(events)];
+  for (const e of events) {
+    if (e.pr !== pr || e.type === EVENT_TYPES.SEND_BACK) continue;
+    const verdict = e.type === undefined || e.type === EVENT_TYPES.VERDICT;
+    if (verdict && ['head-moved', 'carried'].includes(e.verdict)) continue;
+    heads.push(verdict ? e.coverage?.headSha : e.headSha);
   }
+  return [...new Set(heads.filter(isSha))];
+}
+
+/** Latest lifecycle head. */
+export function observedLedgerHead(events) {
+  const pr = events.at(-1)?.pr;
+  const { byPr, witnessedHeads } = foldWithWitness(events);
   return witnessedHeads.get(pr) || byPr.get(pr)?.current?.coverage?.headSha
     || events.filter(e => e.source === 'first-seen').at(-1)?.coverage?.headSha
     || events.filter(e => e.type === EVENT_TYPES.REVIEW_EXEMPT).at(-1)?.headSha
