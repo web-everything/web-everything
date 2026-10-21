@@ -15,7 +15,6 @@ import { defaultListPrComments } from '../conveyor/pr-comments-list.mjs';
 import { readFixLoopRows, fixLoopLedgerPath } from '../conveyor/fix-loop-ledger.mjs';
 import { buildPrRounds, normalizeComment, classifyEvent, headsOf, parseCard, cardIdOf } from './coroner-rounds.mjs';
 import { falseFindingsForPr } from './coroner-false-findings.mjs';
-import { readBounded } from './coroner-extract.mjs';
 import { parseLedgerEvents } from '../lib/verdict-ledger.mjs';
 import { ledgerGitPath, LEDGER_TRANSPORT_BRANCH } from '../lib/verdict-ledger-io.mjs';
 import { parseVerdictCarriedMarker } from '../lib/review-verdict-carried-marker.mjs';
@@ -206,16 +205,53 @@ export function renderPostmortem(r) {
     '## Evidence and limitations', '', ...r.warnings.map(w => `- ${w}`), '',
     'Full structured evidence (false findings, carry observations, scope, prepares, checks and drain skips):', '', '```json', JSON.stringify(r,null,2), '```', ''].join('\n');
 }
+/** Read every receipt under the publication lock; only an unterminated final
+ * fragment may be discarded. Keep byte offsets so UTF-8 and blank lines survive.
+ */
+function readPublicationJournal(path) {
+  let fd;
+  try { fd = fs.openSync(path,'r+'); }
+  catch (e) { if (e.code === 'ENOENT') return []; throw e; }
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) throw Error('incidents journal unreadable');
+    if (stat.size > 64*1024*1024) throw Error('incidents journal exceeds read cap; refusing incomplete deduplication');
+    const data = Buffer.alloc(stat.size);
+    for (let offset = 0; offset < data.length;) {
+      const n = fs.readSync(fd,data,offset,Math.min(64*1024,data.length-offset),offset);
+      if (!n) throw Error('incidents journal incomplete read; refusing recovery');
+      offset += n;
+    }
+    const rows = [];
+    let start = 0;
+    for (let end = data.indexOf(10); end !== -1; end = data.indexOf(10,start)) {
+      if (end > start) rows.push(JSON.parse(data.toString('utf8',start,end)));
+      start = end+1;
+    }
+    if (start < data.length) {
+      let tail;
+      try { tail = JSON.parse(data.toString('utf8',start)); }
+      catch {
+        // A failed append can leave complete receipts followed by a JSON prefix.
+        // Truncation is repeatable after a crash and never rewrites valid receipts.
+        fs.ftruncateSync(fd,start);
+        return rows;
+      }
+      rows.push(tail);
+      // A complete receipt may have landed without its newline. Retain it for
+      // deduplication and finish the delimiter before appending another record.
+      if (fs.writeSync(fd,'\n',data.length,'utf8') !== 1) throw Error('incidents journal delimiter write incomplete');
+    }
+    return rows;
+  } finally { fs.closeSync(fd); }
+}
 /** Journal-first publication: event IDs deduplicate partial publication after process death.
  * The caller serializes publication with withCoronerLock. Direct CLI does the same.
  */
 export function publishPostmortem(r, { dir = coronerStateDir() } = {}) {
   fs.mkdirSync(dir,{recursive:true});
   const path = join(dir,'incidents.jsonl');
-  const read = readBounded(path, { cap: 64*1024*1024 });
-  if (!read.found && fs.existsSync(path)) throw Error('incidents journal unreadable');
-  if (read.truncated) throw Error('incidents journal exceeds read cap; refusing incomplete deduplication');
-  const rows = read.lines.filter(Boolean).map(line => JSON.parse(line));
+  const rows = readPublicationJournal(path);
   const key = `${r.repo}#${r.pr}`;
   const grouped = new Map();
   for (const c of r.causes) { const g = grouped.get(c.cause) ?? []; g.push(c); grouped.set(c.cause,g); }

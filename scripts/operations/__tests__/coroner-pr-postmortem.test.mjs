@@ -175,6 +175,110 @@ describe('per PR postmortem', () => {
       expect(fs.readdirSync(dir)).toEqual(['incidents.jsonl']);
     } finally { fs.rmSync(dir,{recursive:true,force:true}); }
   });
+  it.each(['first record','later record','missing newline'])('recovers an ENOSPC append through the merge pass: %s', async cut => {
+    const dir = temp(), reference = temp();
+    const journal = join(dir,'incidents.jsonl'), cursor = join(dir,'merge-cursor-example%2Frepo.json');
+    const args = {repo:'example/repo',dir,settings,now:at(700),listMerged:() => [{number:3},{number:4}],collect:(_repo,pr) => fixture(pr)};
+    try {
+      for (const target of [dir,reference]) for (const pr of [1,2]) publishPostmortem(buildPostmortem(fixture(pr)),{dir:target});
+      const prefix = fs.readFileSync(journal,'utf8');
+      const initial = {cursor:at(650),done:[1,2],failures:{},quarantined:[]};
+      fs.writeFileSync(cursor,JSON.stringify(initial));
+      const append = fs.appendFileSync;
+      const spy = vi.spyOn(fs,'appendFileSync').mockImplementationOnce((file,data) => {
+        expect(file).toBe(journal);
+        const length = cut === 'first record' ? 12 : cut === 'later record' ? data.indexOf('\n')+13 : data.length-1;
+        append(file,data.slice(0,length));
+        throw Object.assign(Error('disk full'),{code:'ENOSPC'});
+      });
+      try { await expect(runPostmortemPass(args)).rejects.toThrow('disk full'); }
+      finally { spy.mockRestore(); }
+      expect(JSON.parse(fs.readFileSync(cursor))).toEqual(initial);
+      expect(fs.readFileSync(journal,'utf8').startsWith(prefix)).toBe(true);
+      await runPostmortemPass({...args,now:at(701)});
+      for (const pr of [3,4]) publishPostmortem(buildPostmortem(fixture(pr)),{dir:reference});
+      expect(fs.readFileSync(journal,'utf8')).toBe(fs.readFileSync(join(reference,'incidents.jsonl'),'utf8'));
+      expect(JSON.parse(fs.readFileSync(cursor))).toMatchObject({cursor:at(701),done:[1,2,3,4],quarantined:[]});
+      const beforeRetry = fs.readFileSync(journal,'utf8');
+      await runPostmortemPass({...args,now:at(702)});
+      expect(fs.readFileSync(journal,'utf8')).toBe(beforeRetry);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); fs.rmSync(reference,{recursive:true,force:true}); }
+  });
+  it('recovers a partial UTF-8 tail for another PR without losing valid receipt bytes', () => {
+    const dir = temp(), journal = join(dir,'incidents.jsonl');
+    try {
+      publishPostmortem(buildPostmortem(fixture(1)),{dir});
+      // Include blank lines and multibyte text so character counts cannot be used as byte offsets.
+      fs.appendFileSync(journal,'\n'+JSON.stringify({id:'preserved',evidence:['café 🐈']})+'\n');
+      const prefix = fs.readFileSync(journal);
+      const tail = Buffer.from('{"id":"interrupted 🐈');
+      fs.appendFileSync(journal,tail.subarray(0,tail.length-1));
+      publishPostmortem(buildPostmortem(fixture(2)),{dir});
+      const recovered = fs.readFileSync(journal);
+      expect(recovered.subarray(0,prefix.length)).toEqual(prefix);
+      const rows = recovered.toString('utf8').split('\n').filter(Boolean).map(JSON.parse);
+      expect(rows.some(row => row.pr === 2)).toBe(true);
+      expect(rows.filter(row => row.id === 'preserved')).toEqual([{id:'preserved',evidence:['café 🐈']}]);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+  it.each(['{"id":"broken\n','{"id":"broken\n{"id":"valid"}\n'])('refuses completed corrupt journal lines without changing receipts: %j', suffix => {
+    const dir = temp(), journal = join(dir,'incidents.jsonl');
+    try {
+      publishPostmortem(buildPostmortem(fixture(1)),{dir});
+      fs.appendFileSync(journal,suffix);
+      const before = fs.readFileSync(journal);
+      expect(() => publishPostmortem(buildPostmortem(fixture(2)),{dir})).toThrow();
+      expect(fs.readFileSync(journal)).toEqual(before);
+      expect(fs.existsSync(join(dir,'postmortem-example%2Frepo-2.md'))).toBe(false);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+  it('recovers an interrupted first-ever receipt without omitting long valid receipts', () => {
+    const dir = temp(), journal = join(dir,'incidents.jsonl');
+    try {
+      fs.writeFileSync(journal,'{"id":"');
+      const report = buildPostmortem(fixture(1));
+      report.causes[0].evidence.push('x'.repeat(300*1024));
+      publishPostmortem(report,{dir});
+      const before = fs.readFileSync(journal);
+      publishPostmortem(report,{dir});
+      expect(fs.readFileSync(journal)).toEqual(before);
+      expect(before.toString('utf8').split('\n').filter(Boolean).map(JSON.parse).some(row => row.evidence.includes('x'.repeat(300*1024)))).toBe(true);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+  it.each(['ftruncateSync','writeSync'])('keeps journal recovery retryable when %s fails', operation => {
+    const dir = temp(), journal = join(dir,'incidents.jsonl');
+    try {
+      publishPostmortem(buildPostmortem(fixture(1)),{dir});
+      const prefix = fs.readFileSync(journal,'utf8');
+      const suffix = operation === 'ftruncateSync' ? '{"id":"' : '{"id":"preserved"}';
+      fs.appendFileSync(journal,suffix);
+      const spy = vi.spyOn(fs,operation).mockImplementationOnce(() => { throw Object.assign(Error('disk unavailable'),{code:'EIO'}); });
+      try { expect(() => publishPostmortem(buildPostmortem(fixture(2)),{dir})).toThrow('disk unavailable'); }
+      finally { spy.mockRestore(); }
+      expect(fs.readFileSync(journal,'utf8')).toBe(prefix+suffix);
+      expect(fs.existsSync(join(dir,'postmortem-example%2Frepo-2.md'))).toBe(false);
+      publishPostmortem(buildPostmortem(fixture(2)),{dir});
+      const recovered = fs.readFileSync(journal,'utf8');
+      expect(recovered.startsWith(prefix)).toBe(true);
+      expect(recovered.trim().split('\n').map(JSON.parse).some(row => row.pr === 2)).toBe(true);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+  it.each(['readSync','writeSync'])('refuses a zero-byte %s during journal recovery', operation => {
+    const dir = temp(), journal = join(dir,'incidents.jsonl');
+    try {
+      publishPostmortem(buildPostmortem(fixture(1)),{dir});
+      const before = fs.readFileSync(journal,'utf8').slice(0,-1);
+      fs.writeFileSync(journal,before);
+      const report = buildPostmortem(fixture(2));
+      const spy = vi.spyOn(fs,operation).mockReturnValueOnce(0);
+      try { expect(() => publishPostmortem(report,{dir})).toThrow(/incomplete/); }
+      finally { spy.mockRestore(); }
+      expect(fs.readFileSync(journal,'utf8')).toBe(before);
+      expect(fs.existsSync(join(dir,'postmortem-example%2Frepo-2.md'))).toBe(false);
+      publishPostmortem(report,{dir});
+      expect(fs.readFileSync(journal,'utf8').trim().split('\n').map(JSON.parse).some(row => row.pr === 2)).toBe(true);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
   it.each(['journal','report'])('retains cursor and retries publication failures without quarantine: %s', async target => {
     const dir = temp(); const cursor = join(dir,'merge-cursor-example%2Frepo.json');
     const report = join(dir,'postmortem-example%2Frepo-2.md');
