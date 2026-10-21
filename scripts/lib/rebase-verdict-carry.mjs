@@ -48,8 +48,42 @@ export function informationalProvenance(body, sha, pr) {
   if (!rest) return !!gate || !!carried;
   const advisory = parseRedTeamComment(rest);
   if (!sameRecord(advisory) || advisory.findings.some(f => breakClass(f) === 'broken')) return false;
-  // parseRedTeamComment deliberately ignores prose. Here every nonblank line
-  // must belong to the producer's format so an appended hold cannot disappear.
+  return advisoryLinesValid(rest);
+}
+
+/** Gate outcomes a verdict carry re-keys onto the new head (bare markers, no action lines). */
+const CARRIED_GATE_OUTCOMES = new Set(['sent-back', 'round-cap', 'card-queued', 'card-pending', 'operator-card', 'operator-not-real', 'operator-block']);
+
+/**
+ * THIS carry's own comment for a carry ONTO `sha`, in exactly the shape attemptVerdictCarry renders: bare gate markers
+ * (rev=sha, this PR, named by the carried result), the carried marker (to=sha), the fixed prose line, and the re-keyed
+ * advisory (rev=sha) whose every line is the producer's format. It restates records that already preceded the accept on
+ * the carried-from head, so a SECOND identical rebase must not read it as a later verdict. A confirmed broken finding
+ * in it is allowed here only because its hold is enforced by the red-team disposition (the gate records it carries),
+ * never by the accept; anything appended, any other marker, or another head makes it a later verdict as before. PURE.
+ */
+export function isOwnVerdictCarryComment(body, sha, pr) {
+  const text = String(body ?? '').replace(/\r\n?|\u2028|\u2029/g, '\n').trim();
+  const lines = text.split('\n');
+  const k = lines.findIndex(l => l.startsWith('<!-- review-verdict-carried '));
+  if (k < 0) return false;
+  const carried = parseVerdictCarriedMarker(lines[k]);
+  if (!carried || carried.toSha !== sha || lines[k] !== buildVerdictCarriedMarker(carried)) return false;
+  if (lines[k + 1] !== 'Review verdict carried across an identical contribution.') return false;
+  const advisoryText = lines.slice(k + 2).join('\n').trim();
+  const advisory = advisoryText ? parseRedTeamComment(advisoryText) : null;
+  if (advisoryText && (advisory?.rev !== sha || advisory.pr !== Number(pr) || !advisoryLinesValid(advisoryText))) return false;
+  const result = advisory ? redTeamResultId(advisory) : null;
+  return lines.slice(0, k).every(l => {
+    const g = parseRedTeamGateMarker(l);
+    return g && g.pr === Number(pr) && g.rev === sha && CARRIED_GATE_OUTCOMES.has(g.outcome) && !g.grantIds
+      && (g.result ?? null) === (g.result ? result : null) && l === redTeamGateMarker(pr, sha, g.outcome, g.result ?? null);
+  });
+}
+
+/** parseRedTeamComment deliberately ignores prose: here every nonblank line must belong to the producer's format, so an
+ *  appended hold cannot disappear. PURE. */
+function advisoryLinesValid(rest) {
   const lines = rest.slice(rest.indexOf('-->') + 3).split('\n');
   return lines.every(line => !line.trim()
     || line === 'No confirmed breaks.'
@@ -118,7 +152,7 @@ function findCarriableVerdictFor({ comments, trusted, sha, headSha, pr }) {
     // The proof below (identical net patch) is exactly what this re-arm asked for; see ACCEPTED_REARM_RE.
     if (isTrustedMarkerAuthor(c) && isAcceptedRearmBody(c?.body)) return false;
     if (!isTrustedMarkerAuthor(c) || String(c?.body ?? '').split('\n').some(isLaterVerdictBody)) return true;
-    return !informationalProvenance(c?.body, sha, number);
+    return !informationalProvenance(c?.body, sha, number) && !isOwnVerdictCarryComment(c?.body, sha, number);
   });
   const record = latestAcceptRecord(verdictComments);
   // A body-derived hold anywhere after the accept counts on the UNFILTERED thread: neutral shapes are never a way to

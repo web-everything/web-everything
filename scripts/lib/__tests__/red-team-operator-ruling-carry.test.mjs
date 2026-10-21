@@ -32,7 +32,7 @@ const human = (b, createdAt) => ({ author: { login: 'chalbert' }, body: b, creat
 const F = (line, impact) => ({ summary: `break at ${line}`, category: 'edge-case', impactIfUnfixed: impact, file: FILE, line, confirmedByRecheck: true });
 const accept = (sha) => bot(`✅ review — accepted\n\nRecorded by agent.\n\nwrite-up\n<!-- reviewed-sha: ${sha} -->`, '2026-10-21T17:00:00Z');
 
-let base, accepted, rebased, edited;
+let base, accepted, rebased, edited, rebased2, edited2;
 beforeAll(() => {
   dir = mkdtempSync(join(tmpdir(), 'rt-ruling-carry-'));
   git('init', '-q', '-b', 'main');
@@ -45,6 +45,13 @@ beforeAll(() => {
   git('checkout', '-q', '-b', 'rebased', mainNext);
   rebased = commit({ [FILE]: body(170, { 127: 'PR 127', 159: 'PR 159', 166: 'PR 166' }) }, 'pr (rebased, same patch)');
   edited = commit({ [FILE]: body(170, { 127: 'PR 127', 159: 'PR 159 FIXED', 166: 'PR 166' }) }, 'content change at :159');
+  // A SECOND identical rebase: main advances again, the same patch is replayed.
+  git('checkout', '-q', 'refs/remotes/origin/main');
+  const mainNext2 = commit({ 'other.txt': 'z\n' }, 'main advance 2');
+  git('update-ref', 'refs/remotes/origin/main', mainNext2);
+  git('checkout', '-q', '-b', 'rebased2', mainNext2);
+  rebased2 = commit({ [FILE]: body(170, { 127: 'PR 127', 159: 'PR 159', 166: 'PR 166' }) }, 'pr (rebased twice, same patch)');
+  edited2 = commit({ [FILE]: body(170, { 127: 'PR 127', 159: 'PR 159', 166: 'PR 166 changed' }) }, 'content change at :166');
 });
 afterAll(() => { if (dir) rmSync(dir, { recursive: true, force: true }); });
 
@@ -155,5 +162,34 @@ describe('operator red-team rulings across a rebase (#5502 shape)', () => {
     expect(informationalProvenance(`${rec.body}\nplease hold`, rebased, P)).toBe(false);
     expect(informationalProvenance(rec.body, accepted, P)).toBe(false);
     expect(carryLinesBody(parseRedTeamCarryLinesMarker(rec.body))).toBe(rec.body);
+  });
+  it('two successive identical rebases: the verdict AND the rulings carry both times; a content change still drops them', () => {
+    const { comments } = thread5502(accepted);
+    const first = carry(comments, rebased);
+    expect(first.out).toMatchObject({ carried: true, fromSha: accepted, headSha: rebased });
+    // What the real restamp posts: the reviewed-sha moves to the carried head (before the carry comment).
+    const restamp = bot(`📌 review — acceptance re-stamped after a rebase (no new review)\n\nRecorded by review-carry via restamp.\n\ncarried\n\n<!-- reviewed-sha: ${rebased} -->`, '2026-10-21T21:29:59Z');
+    const after1 = [...comments, restamp, ...first.posted];
+    expect(blocking(disp(after1, rebased))).toEqual([]);
+    const second = carry(after1, rebased2);
+    expect(second.out).toMatchObject({ carried: true, fromSha: rebased, headSha: rebased2 });
+    const restamp2 = bot(restamp.body.replace(rebased, rebased2), '2026-10-21T22:29:59Z');
+    const after2 = [...after1, restamp2, ...second.posted.map((c) => ({ ...c, createdAt: '2026-10-21T22:30:00Z' }))];
+    expect(disp(after2, rebased2).result?.rev).toBe(rebased2);
+    expect(blocking(disp(after2, rebased2))).toEqual([]);
+    // A content change after the second carry: no carry, the new head is re-evaluated.
+    const third = carry(after2, edited2);
+    expect(third.out.carried).toBe(false);
+    expect(disp(after2, edited2).result).toBeNull();
+  });
+  it('the own-carry recognizer is exact: an appended line, another head, or a foreign marker is a later verdict', async () => {
+    const { isOwnVerdictCarryComment } = await import('../rebase-verdict-carry.mjs');
+    const { comments } = thread5502(accepted);
+    const c = carry(comments, rebased).posted.find((x) => !parseRedTeamCarryLinesMarker(x.body));
+    expect(isOwnVerdictCarryComment(c.body, rebased, P)).toBe(true);
+    expect(isOwnVerdictCarryComment(`${c.body}\nplease hold`, rebased, P)).toBe(false);
+    expect(isOwnVerdictCarryComment(c.body, accepted, P)).toBe(false);
+    expect(isOwnVerdictCarryComment(c.body, rebased, P + 1)).toBe(false);
+    expect(isOwnVerdictCarryComment(`<!-- review-hold -->\n${c.body}`, rebased, P)).toBe(false);
   });
 });
