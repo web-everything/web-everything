@@ -544,7 +544,8 @@ describe('applyRedTeamGate', () => {
           channel: 'auto-round-grant', reason: 'r', at: autoGrant.createdAt, standingRuling: RULING_ID, head: HEAD, episode: `${REPO}#4722@${HEAD}:review:${11 + n}/${11 + n}` }) }, n);
         const four = [1, 2, 3, 4].map(nth);
         expect(countGrantedRoundExtensions(four, { repo: REPO, pr: 4722, standingRuling: { ...scope, uneditedComments: ['IC_auto1', 'IC_auto2', 'IC_auto3', 'IC_auto4'] } })).toBe(3);
-        expect(liveResultGateState(thread(restGrant), 4722, HEAD, REPO, scope).reopened).toBe(true);
+        // `thread` maps every comment to the REST shape itself, so it takes the GraphQL-shaped grant.
+        expect(liveResultGateState(thread(autoGrant), 4722, HEAD, REPO, scope).reopened).toBe(true);
         expect(liveResultGateState(thread({ ...autoGrant, id: 'IC_edited' }), 4722, HEAD, REPO, scope).reopened).toBe(false);
       });
       it('the label provider keeps the comment id (the node id the unedited read returns)', () => {
