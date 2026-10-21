@@ -20,7 +20,7 @@ export default {
   },
   async run({ root = REPO_ROOT } = {}) {
     const base = mkdtempSync(join(tmpdir(), 'soak-symbolic-ops-'));
-    const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024 }).trim();
     try {
       const origin = join(base, 'origin.git'), reference = join(base, 'reference'), pool = join(base, 'pool');
       git(['init', '--quiet', '--bare', '--initial-branch=trunk', origin]);
