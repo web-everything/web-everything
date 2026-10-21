@@ -66,7 +66,7 @@ import {
 import { redactDetail } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
 import { readRoutingPolicy, resolvePolicyModel } from './dispatch-routing-policy-io.mjs';
 import { repairCloneRefs } from './lane-repair.mjs';
-import { addOverlay, removeOverlay, appendOverlayEvent } from './daemon-overlays.mjs';
+import { addOverlay, removeOverlay, appendOverlayEvent, allowConflictGate } from './daemon-overlays.mjs';
 import { rebuildClone, dryRunRebuild } from './daemon-rebuild.mjs';
 import { DEFAULT_REBUILD_LOCK_WAIT_MS, REBUILD_LOCK_WAIT_ENV } from './daemon-rebuild/lease.mjs';
 import { runLiveSmokeWithRetry } from './daemon-live-smoke.mjs';
@@ -630,7 +630,7 @@ export function withDispatchSmoke({
  */
 export async function runDaemonLoadOverlay({
   clone, ref, pr = null, base = 'main', dryRun = false, env = process.env, log = console,
-  addedBy, reason = null, now,
+  addedBy, reason = null, now, allowConflict = false, operatorInstruction = null, actor = null,
   addOverlayFn = addOverlay, rebuild = rebuildClone, dryRunRebuildFn = dryRunRebuild,
   wait = false, waitMs, versions, submit = submitRequest, waitFor = waitForResult, rollbackVersionFn = rollbackVersionIfCurrent,
   settings, baseSmoke = runLiveSmokeWithRetry, dispatchSmoke = runRealDispatchSmoke, inspect = overlayDispatchFiles,
@@ -641,6 +641,14 @@ export async function runDaemonLoadOverlay({
   if (!ref || typeof ref !== 'string') throw new TypeError('daemon-load-overlay: --ref=<branch to overlay> is required');
   const root = resolve(clone);
   const by = addedBy ?? (typeof env?.USER === 'string' && env.USER ? env.USER : null);
+
+  // allow-conflict gate (2026-10-21) — refused before anything, dry-run included, unless the operator's own words
+  // and --actor=operator come with it; the quote is stored on the registration.
+  const gate = allowConflictGate({ allowConflict, operatorInstruction, actor, now });
+  if (!gate.ok) {
+    log.error?.(`daemon-load-overlay: REFUSED — ${gate.error}`);
+    return { root, ref, homeBranch: base, registered: false, refused: true, reason: 'allow-conflict-needs-operator-instruction' };
+  }
 
   if (dryRun) {
     const preview = await dryRunRebuildFn({ root, env, extraOverlays: [{ ref, pr }] });
@@ -660,7 +668,7 @@ export async function runDaemonLoadOverlay({
   }
 
   addOverlayFn(root, {
-    ref, pr, addedBy: by, reason, now,
+    ref, pr, addedBy: by, reason, now, ...(gate.override ? { conflictOverride: gate.override } : {}),
   }, { env });
   // Card 89 S5: a versioned clone has no lock to take and is never rebuilt from this CLI. The request file is
   // the daemon's in-tick updater's input; `--wait` blocks on its result file instead of on a clone lock.
@@ -882,6 +890,9 @@ if (IS_CLI) {
   const waitMs = flags['wait-ms'] !== undefined && Number(flags['wait-ms']) > 0 ? Number(flags['wait-ms']) : undefined;
   runDaemonLoadOverlay({
     clone, ref, pr, base, dryRun, addedBy, reason, wait, waitMs,
+    allowConflict: !!flags['allow-conflict'],
+    operatorInstruction: typeof flags['operator-instruction'] === 'string' ? flags['operator-instruction'] : null,
+    actor: typeof flags.actor === 'string' ? flags.actor : null,
   })
     .then((result) => {
       if (flags.json) {

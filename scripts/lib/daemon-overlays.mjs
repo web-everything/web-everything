@@ -209,8 +209,27 @@ export function writeOverlays(root, list, { env = process.env } = {}) {
  * @param {{env?:NodeJS.ProcessEnv}} [o]
  * @returns {Array<object>} the new list
  */
+/**
+ * allow-conflict gate (live 2026-10-21: two agents registered with `--allow-conflict` on the review clone in one
+ * afternoon, which the operator forbids). A conflict override is the OPERATOR's call only: it needs the operator's
+ * own words (`--operator-instruction="<quote>"`, at least three words) and `--actor=operator`. Shared by
+ * `daemon-overlay add` and `daemon-load-overlay`. Returns the record to store on the registration, or an error.
+ * @returns {{ok:true, override:null|{instruction:string, actor:'operator', at:string}}|{ok:false, error:string}}
+ */
+export function allowConflictGate({ allowConflict, operatorInstruction, actor, now } = {}) {
+  if (!allowConflict) return { ok: true, override: null };
+  const quote = typeof operatorInstruction === 'string' ? operatorInstruction.trim() : '';
+  if (quote.split(/\s+/).filter(Boolean).length < 3 || quote.length > 1000) {
+    return { ok: false, error: '--allow-conflict is the operator\'s call only: pass --operator-instruction="<the operator\'s own words authorising this override>" (3+ words) and --actor=operator' };
+  }
+  if (actor !== 'operator') {
+    return { ok: false, error: '--allow-conflict requires --actor=operator (the override is recorded as the operator\'s instruction)' };
+  }
+  return { ok: true, override: { instruction: quote, actor: 'operator', at: now || new Date().toISOString() } };
+}
+
 export function addOverlay(root, {
-  ref, pr = null, addedBy = null, reason = null, now, pinned, stackBases,
+  ref, pr = null, addedBy = null, reason = null, now, pinned, stackBases, conflictOverride,
 } = {}, { env = process.env } = {}) {
   if (!isSafeBranchName(ref)) {
     throw new TypeError(`daemon-overlays: ref ${JSON.stringify(ref)} is not a safe branch name — refusing to add it`);
@@ -225,12 +244,14 @@ export function addOverlay(root, {
         ref, pr: pr ?? null, addedAt: now || new Date().toISOString(), addedBy: addedBy ?? null, reason: reason ?? null,
         ...(pinned === true ? { pinned: true } : {}),
         ...(bases ? { stackBases: bases } : {}),
+        ...(conflictOverride ? { conflictOverride } : {}),
       });
     } else {
       const next = { ...list[idx], pr: pr ?? null, reason: reason ?? null };
       if (pinned === true) next.pinned = true;
       else if (pinned === false) delete next.pinned;
       if (bases) next.stackBases = bases;
+      if (conflictOverride) next.conflictOverride = conflictOverride;
       list[idx] = next;
     }
     return writeOverlays(root, list, { env });

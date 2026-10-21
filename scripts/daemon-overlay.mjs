@@ -43,7 +43,8 @@
  *
  * USAGE:
  *   node scripts/daemon-overlay.mjs add    --clone=<path> --ref=<branch> [--pr=N] [--pinned|--unpinned] [--reason=..] [--by=..] [--json]
- *                                          [--check] [--allow-conflict --reason=..] [--allow-no-pr --reason=..]
+ *                                          [--check] [--allow-conflict --reason=.. --operator-instruction="<quote>" --actor=operator]
+ *                                          [--allow-no-pr --reason=..]
  *   node scripts/daemon-overlay.mjs remove --clone=<path> --ref=<branch> [--reason=..] [--by=..] [--json]
  *   node scripts/daemon-overlay.mjs list   --clone=<path> [--json]
  *   node scripts/daemon-overlay.mjs approve-edge --clone=<path> --ref=<branch> --sha=<40-hex> [--by=..] [--reason=..] [--json]
@@ -72,7 +73,9 @@
  * read-only, the same scratch-repo-with-alternates isolation `dryRunRebuild` already uses; `root`'s own refs,
  * index, working tree are never touched). A conflict REFUSES the add (exit 3, naming the conflicting overlay(s)
  * and file(s)) unless the caller passes `--allow-conflict --reason=<why registering it anyway is safe>`, which
- * still prints the conflict before registering. `--check` runs ONLY this guard and reports the verdict —
+ * still prints the conflict before registering. The override is the operator's call only (2026-10-21): it also needs
+ * `--operator-instruction="<the operator's own words>"` and `--actor=operator`, and that quote is stored on the
+ * registration (`conflictOverride`) and its `added` event (`daemon-overlays.mjs#allowConflictGate`). `--check` runs ONLY this guard and reports the verdict —
  * `addOverlay`/`appendOverlayEvent` are never called — so a preview against a live clone's real overlay config
  * never mutates anything (exit 3 on a would-be-refused conflict, exit 1 if the guard itself could not resolve
  * something — a corrupt store included — 0 otherwise; `--json` gives the full `{check, wouldRegister}` shape).
@@ -93,7 +96,7 @@ import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, writeFileSync, readFileSync, statSync, rmSync, renameSync } from 'node:fs';
 import {
-  addOverlay, removeOverlay, readOverlayState, appendOverlayEvent, overlayFilePath, recordEdgeResolution,
+  addOverlay, removeOverlay, readOverlayState, appendOverlayEvent, overlayFilePath, recordEdgeResolution, allowConflictGate,
 } from './lib/daemon-overlays.mjs';
 import { previewOverlayConflict } from './lib/daemon-rebuild.mjs';
 import { overlaySafetySettings } from './lib/daemon-load-overlay.mjs';
@@ -432,6 +435,10 @@ async function main() {
     if (allowConflict && !reason) {
       return fail('--allow-conflict requires --reason=<why registering it anyway is safe>');
     }
+    const gate = allowConflictGate({
+      allowConflict, operatorInstruction: flags['operator-instruction'], actor: flags.actor,
+    });
+    if (!gate.ok) return fail(gate.error);
     // A corrupt store gets no guard run (it would waste a real git fetch): `--check` reports it as a failure
     // (exit 1, `wouldRegister:false` — never a false "would register", PR #2827 review), and a real add falls
     // straight through to `addOverlay`, whose own refusal throws rather than overwrite a damaged file.
@@ -512,13 +519,14 @@ async function main() {
       // file header for why that lock was dropped here.
       const list = addOverlay(root, {
         ref: flags.ref, pr, addedBy: by, reason, pinned,
+        ...(!check.clean && gate.override ? { conflictOverride: { ...gate.override, files: check.files } } : {}),
       }, { env });
       appendOverlayEvent(root, {
         kind: 'added', ref: flags.ref, pr, by, reason, ...(pinned !== undefined ? { pinned } : {}),
         ...(pr == null ? { noPr: true } : {}),
         ...(check.stackBases?.length ? { stackBases: check.stackBases } : {}),
         ...(check.stackConflictIgnored ? { stackConflictIgnored: check.stackConflictIgnored } : {}),
-        ...(!check.clean ? { conflictOverride: { files: check.files, conflicting: check.conflicting } } : {}),
+        ...(!check.clean ? { conflictOverride: { files: check.files, conflicting: check.conflicting, ...gate.override } } : {}),
       }, { env });
       return { list, check };
     });

@@ -357,6 +357,10 @@ export async function planRebuild({
   // an early overlay in a large running stack needs the same protection as its last overlay.
   const carriedRefs = new Set(establishedRefs);
   const carriedHeads = new Map();
+  // overlay-pin (live 2026-10-21 11:59 ET, review clone) — the head each overlay was last ADOPTED at: the second parent of
+  // the newest rebuild-committed merge record for that ref (same ref AND PR) on the running build's first-parent line.
+  // Hard evidence only (no merge-base inference), so a pin always names content this exact clone already smoked + adopted.
+  const adoptedTips = new Map();
   if (headSha && listed.some((o) => o?.ref && !establishedRefs.has(o.ref))) {
     const prKey = (pr) => (pr == null || pr === '' ? null : Number(pr));
     const registered = new Map(listed.filter((o) => o?.ref).map((o) => [o.ref, prKey(o.pr)]));
@@ -377,6 +381,7 @@ export async function planRebuild({
         if (git(['merge-base', '--is-ancestor', ps[1], mainSha]).status === 0) continue;
         carriedRefs.add(hit[1]);
         carriedHeads.set(hit[1], [...(carriedHeads.get(hit[1]) ?? []), ps[1]]);
+        if (!adoptedTips.has(hit[1])) adoptedTips.set(hit[1], ps[1]);
       }
       // A stack base may have entered the build only through its top, with no merge record of its own.
       // Shared ancestry outside main proves a carried part of its old tip even after a docs-only advance.
@@ -567,11 +572,48 @@ export async function planRebuild({
       if (edgeResolve) resolution = resolveOverlayConflict({ git, cur, ovSha, ref, approvedEdgeSha: recordedEdgeSha(raw) });
       if (resolution?.ok) tree = resolution.tree;
       else {
+        const files = resolution?.files ?? conflictFilesOf(mt.stdout);
+        // overlay-pin — a moving branch whose NEW tip conflicts with the stack keeps the head this clone last adopted
+        // it at, instead of dropping out of the build (which x9diisp then turns into a whole-clone hold). Only when
+        // that adopted head itself still merges cleanly onto the stack, with no conflict resolution at all: pinned
+        // content is exactly what already passed smoke here, and the build it lands in is still smoked as usual.
+        // A ref with no adopted head (a brand-new registration) falls through to the plain drop below, as before.
+        const adoptedTip = adoptedTips.get(ref);
+        if (adoptedTip && adoptedTip !== ovSha && !establishedRefs.has(ref)) {
+          const pmt = git(['merge-tree', '--write-tree', '--no-messages', cur, adoptedTip]);
+          const ptree = String(pmt.stdout ?? '').split('\n')[0].trim();
+          if (pmt.status === 0 && ptree) {
+            const pin = { ref, pr, adopted: adoptedTip, newTip: ovSha, files };
+            alerts.push({
+              kind: 'overlay-pinned',
+              detail: {
+                ...pin,
+                message: `overlay ${ref}${pr != null ? ` (PR #${pr})` : ''} pinned at its adopted head ${adoptedTip.slice(0, 10)}: new tip ${ovSha.slice(0, 10)} conflicts on ${files.join(', ') || '?'} — the rest of the stack still builds; merge the conflicting overlays (or main) into the branch to advance it`,
+              },
+            });
+            if (ptree === verifyRev(git, `${cur}^{tree}`)) {
+              decisions.push({ ref, pr, action: 'skip', reason: 'overlay-pinned-contained', sha: adoptedTip, pinned: pin });
+              continue;
+            }
+            const pct = git(['commit-tree', ptree, '-p', cur, '-p', adoptedTip, '-m',
+              `daemon-rebuild: merge overlay ${ref}${pr != null ? ` (PR #${pr})` : ''} onto ${cur} (pinned at adopted head; new tip ${ovSha} conflicts)`], {
+              env: rebuildCommitEnv(git, cur, adoptedTip),
+            });
+            const pSha = String(pct.stdout ?? '').trim();
+            if (pct.status === 0 && pSha) {
+              cur = pSha;
+              applied.push({ ref, pr, sha: adoptedTip, pinnedFrom: ovSha });
+              decisions.push({ ref, pr, action: 'apply', reason: 'applied-pinned', sha: adoptedTip, pinned: pin });
+              continue;
+            }
+            alerts.pop(); // the pin could not be minted: fall through to the plain drop (and its x9diisp hold)
+          }
+        }
         if (resolution) alerts.push({
           kind: 'overlay-conflict-unresolved',
           detail: { ref, pr, sha: ovSha, files: resolution.files, tried: resolution.tried },
         });
-        conflictFiles.set(ref, resolution?.files ?? conflictFilesOf(mt.stdout));
+        conflictFiles.set(ref, files);
         const refused = dropOrRefuse('conflict', resolution ? { files: resolution.files } : {});
         if (refused) return refused;
         continue;
