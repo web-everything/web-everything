@@ -1152,6 +1152,8 @@ export function releasedFixClaim(pr) {
   if (!markers.length || markers.some((m) => !Number.isFinite(m.at))) return null;
   markers.sort((a, b) => a.at - b.at);
   const last = markers.at(-1);
+  // Equal timestamps are ambiguous ordering: array order must never decide, so fail closed.
+  if (markers.length > 1 && markers.at(-2).at === last.at) return null;
   if (!last.body.startsWith(FIX_END_MARKER)) return null; // a later fix-begin = claim held again
   const named = /at `([0-9a-f]{7,40})`/.exec(last.body)?.[1];
   if (!named || !sameHeadSha(named, head)) return null;
@@ -1167,8 +1169,9 @@ export function releasedFixClaim(pr) {
  */
 export function isReleasedClaimSession(agent, claimRelease) {
   if (!claimRelease || !Number.isFinite(claimRelease.releasedAtMs)) return false;
-  if (!agent || isAwaitingPermission(agent)) return false;
-  if (/^review-/.test(String(agent.name ?? agent.sessionSlug ?? ''))) return false;
+  if (!agent || agent.pidAlive !== true) return false; // only a PROBED-live pid is exempted; unknown stays liveness-unknown
+  if (isAwaitingPermission(agent) || agent.permissionBlocked === true) return false;
+  if (/^review-/.test(String(agent.name ?? '')) || /^review-/.test(String(agent.sessionSlug ?? ''))) return false;
   const started = startedAtMs(agent.startedAt);
   return Number.isFinite(started) && started < claimRelease.releasedAtMs;
 }

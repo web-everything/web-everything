@@ -4110,6 +4110,17 @@ describe('released fix claim + live pid is not live work (PR #5492 replay)', () 
     expect(run([begin, end], [spare({ status: 'waiting', waitingFor: 'permission prompt' })]).refusals[0].kind).toBe('awaiting-permission');
   });
 
+  it('audit holes stay live: unknown pid, tied timestamps, permissionBlocked flag, reviewer via sessionSlug with empty name', () => {
+    const tied = { ...begin, createdAt: RELEASED_AT };
+    expect(releasedFixClaim(pr1563({ comments: [tied, end] }))).toBeNull();
+    expect(releasedFixClaim(pr1563({ comments: [end, tied] }))).toBeNull();
+    const rel = releasedFixClaim(pr1563({ comments: [begin, end] }));
+    expect(isReleasedClaimSession(spare({ pidAlive: undefined }), rel)).toBe(false);
+    expect(isReleasedClaimSession(spare({ permissionBlocked: true }), rel)).toBe(false);
+    expect(isReleasedClaimSession(spare({ name: '', sessionSlug: 'review-1563' }), rel)).toBe(false);
+    expect(isReleasedClaimSession(spare(), rel)).toBe(true);
+  });
+
   it('helpers: releasedFixClaim reads only the latest marker; assessLiveness without a release is unchanged', () => {
     expect(releasedFixClaim(pr1563({ comments: [begin, end] }))).toMatchObject({ releasedAtMs: Date.parse(RELEASED_AT) });
     expect(releasedFixClaim(pr1563({ comments: [end, { ...begin, createdAt: '2026-10-20T23:00:00Z' }] }))).toBeNull(); // ordered by createdAt, not array position
