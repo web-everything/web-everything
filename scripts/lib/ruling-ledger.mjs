@@ -329,7 +329,12 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
       // the fixer the rungs that re-ruling bought instead of counting heads from the first ruling.
       let b = null;
       const clearedAt = notRealClearanceAt(record, f.key);
-      const recheckClearedAt = rulingsHere(f.key).length ? null : recheckClearanceAt(f);
+      // Only while the finding is still merely PENDING on this head: any ruling here (a reviewer's, or a structured
+      // auto-policy block outside `record.rulings`) means it was looked at again, and the ladder counts as before.
+      const hereState = gateState(record);
+      const stillPending = !rulingsHere(f.key).length && !!hereState && hereState.pending.includes(f.key) && !hereState.blocked.includes(f.key)
+        && !operatorRulings.some((o) => o.head === head && o.runId === record.runId && o.key === f.key);
+      const recheckClearedAt = stillPending ? recheckClearanceAt(f) : null;
       for (const c of blocks.values()) {
         if (c.index > firstIndex) continue; // written after this head's record: a fresh ruling on it
         if (!matchesBlock(g, c)) continue;
