@@ -55,7 +55,7 @@ export async function reconcileOwedPrevention({ stateDir = cardBatchStateDir(), 
   let names;
   try { names = readdirSync(directory(stateDir)); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
   names = names.filter(name => /^[a-f0-9]{64}\.json$/.test(name)).sort();
-  if (cursorPath) names = rotateAfter(names, readDrainCursor(cursorPath).owed, cursorSeed(cursorPath, now));
+  if (cursorPath) names = rotateAfter(names, readDrainCursor(cursorPath).owed, cursorSeed(cursorPath));
   const results = [];
   let started = 0;
   for (const name of names) {

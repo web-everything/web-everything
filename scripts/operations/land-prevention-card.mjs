@@ -395,7 +395,7 @@ export async function drainPendingPrevention({ lane }, {
     if (error.code !== 'ENOENT') write(`land-prevention-card: pending spool read failed — ${errorReason(error)}\n`);
     return;
   }
-  if (cursorPath) entries = rotateAfter(entries, readDrainCursor(cursorPath).pending, cursorSeed(cursorPath, now));
+  if (cursorPath) entries = rotateAfter(entries, readDrainCursor(cursorPath).pending, cursorSeed(cursorPath));
   let started = 0;
   for (const name of entries) {
     if (now() >= deadlineAt) break;
@@ -408,6 +408,8 @@ export async function drainPendingPrevention({ lane }, {
         if (cursorPath) writeDrainCursor(cursorPath, { pending: name });
         continue;
       }
+      // Re-checked right before the admission: the ls-tree above can itself take long. No allowance is spent past it.
+      if (now() >= deadlineAt) break;
       if (counter ? counter.left-- <= 0 : started++ >= maxCards) break;
       const result = await withRecoveryCard(lane, entry.rel, entry.content, () => batch({
         laneDir: lane, cardPath: entry.rel, kind: 'prevention', actor: 'mechanical',
@@ -512,6 +514,7 @@ async function landPreventionCardImpl(input, {
   sleep: wait = sleep,
   drainLimit = {},
   acquireWait,
+  skipPendingDrain = false,
 } = {}) {
   const filing = loadFilingSettings();
   write(`${formatPreventionBatchSettings(filing)}\n`);
@@ -566,7 +569,8 @@ async function landPreventionCardImpl(input, {
       // Inside the health-watch tick the acquire may wait only as long as the drain budget has left (`drainLimit.acquireWaitMs`
       // for the spool drain, `acquireWait()` for an owed filing, read right before the acquire), plus slack for the pool scan;
       // otherwise it can alone outlast the tick's watchdog.
-      waitMs = input.drainPending ? drainLimit.acquireWaitMs : acquireWait?.();
+      // Both are read HERE, at the acquire, so the wait is the live remaining budget, never a snapshot from earlier in the tick.
+      waitMs = input.drainPending ? (drainLimit.acquireWait?.() ?? drainLimit.acquireWaitMs) : acquireWait?.();
       acquired = parseRunJsonTail(exec('node', [
         LANE_POOL_CLI, 'acquire', '--purpose=prevention-card', `--session=${input.session}`, '--json',
         ...(waitMs === undefined ? [] : [`--wait-ms=${Math.max(0, Math.floor(waitMs))}`]),
@@ -594,7 +598,14 @@ async function landPreventionCardImpl(input, {
     // does the equivalent by building the lane's own absolute path explicitly.
     const laneRunMjs = join(lane, 'scripts', 'operations', 'run.mjs');
     // Inside the health-watch tick `drainLimit` caps this drain (shared card allowance, deadline, cursor).
-    await drainPendingPrevention({ lane }, { pendingDir, exec, batch, write, ...drainLimit });
+    // Operator ruling 2026-10-20: inside the tick an OWED filing does NOT drain the spool itself (`skipPendingDrain`); the
+    // probe drains the spool in its own capped, round-robin slice, so nothing is lost and the tick stays bounded.
+    // An owed filing whose acquire used up the tick's deadline is deferred (it stays owed), never run past it.
+    if (!input.drainPending && drainLimit.deadlineAt !== undefined && (drainLimit.now ?? Date.now)() >= drainLimit.deadlineAt) {
+      write('land-prevention-card: tick deadline reached after the lane acquire; deferred to the next tick\n');
+      return { ok: true, skipped: true, deferred: true, step: 'deadline-deferred', pr: null };
+    }
+    if (!skipPendingDrain) await drainPendingPrevention({ lane }, { pendingDir, exec, batch, write, ...drainLimit });
     if (input.foldOpenSingles) {
       const summary = await foldOpenSingles({ lane }, { exec, batch, write });
       return { ok: true, step: 'folded', ...summary };

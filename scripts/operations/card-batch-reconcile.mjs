@@ -1,5 +1,5 @@
 /** Periodic terminal-PR recovery, pending-card drain and due-batch flush. */
-import { cursorUsable, drainCursorPath, readDrainCursor, writeDrainCursor } from '../lib/prevention-drain-cursor.mjs';
+import { drainCursorPath, readDrainCursor, writeDrainCursor } from '../lib/prevention-drain-cursor.mjs';
 import { reconcileOwedPrevention } from '../lib/prevention-filing-owed.mjs';
 import { loadPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
 import { readFileSync, readdirSync, rmSync } from 'node:fs';
@@ -86,6 +86,8 @@ export async function reconcileCardBatches({
   const drainPendingStep = async () => {
     // An empty state directory is also an open slot: recover a spool even before its first admission.
     if (!(drainNeeded || !files.some(file => file.isFile() && file.name.endsWith('.json')))) return;
+    // An owed-first deferral (no lane) ends the tick's drain; an exhausted allowance must not even acquire.
+    if (drainDeferred || counter.left <= 0) return;
     try {
       if (readdirSync(pendingDir).some(name => name.endsWith('.json'))) {
         // Filing paused by the operator is a visible state, not a failure (matches the owed step below).
@@ -95,7 +97,7 @@ export async function reconcileCardBatches({
           const result = await drain({ drainPending: true, session: `card-batch-reconcile-${randomUUID()}` }, {
             pendingDir, write: line => log(line.trimEnd()),
             batch: (input, options) => batch(input, { ...options, stateDir }),
-            drainLimit: { counter, deadlineAt, now: clock, cursorPath, acquireWaitMs: acquireWaitMs() },
+            drainLimit: { counter, deadlineAt, now: clock, cursorPath, acquireWaitMs: acquireWaitMs(), acquireWait: acquireWaitMs },
           });
           if (!result.ok) throw new Error(result.reason ?? 'pending drain failed');
           // No lane in time: this tick's drain is over (the owed step would only wait for the same pool).
@@ -107,11 +109,11 @@ export async function reconcileCardBatches({
     }
   };
   const drainOwedStep = async () => {
-    if (loadFilingSettings().filingEnabled === false || clock() >= deadlineAt || drainDeferred) return;
+    if (loadFilingSettings().filingEnabled === false || clock() >= deadlineAt || drainDeferred || counter.left <= 0) return;
     try {
       const owed = await reconcileOwedPrevention({ stateDir, deadlineAt, now: clock, cursorPath, counter,
-        file: input => fileOwed(input, { owedClaimed: true, loadFilingSettings, pendingDir,
-          drainLimit: { counter, deadlineAt, now: clock, cursorPath }, acquireWait: acquireWaitMs,
+        file: input => fileOwed(input, { owedClaimed: true, loadFilingSettings, pendingDir, skipPendingDrain: true,
+          drainLimit: { deadlineAt, now: clock }, acquireWait: acquireWaitMs,
           batch: (card, options) => batch(card, { ...options, stateDir }), write: line => log(line.trimEnd()) }),
       });
       for (const result of owed) {
@@ -122,8 +124,8 @@ export async function reconcileCardBatches({
   };
   if (!dryRun) {
     counter.left = perTick();
-    // Who goes first alternates by the persisted turn; with no persistable cursor, by the minute, so neither is starved.
-    const owedFirst = cursorUsable(cursorPath) ? readDrainCursor(cursorPath).next === 'owed' : Math.floor(clock() / 60_000) % 2 === 1;
+    // Who goes first alternates by the stored turn (held in memory when it cannot be persisted), so neither is starved.
+    const owedFirst = readDrainCursor(cursorPath).next === 'owed';
     for (const step of owedFirst ? [drainOwedStep, drainPendingStep] : [drainPendingStep, drainOwedStep]) await step();
     writeDrainCursor(cursorPath, { next: owedFirst ? 'pending' : 'owed' });
   }

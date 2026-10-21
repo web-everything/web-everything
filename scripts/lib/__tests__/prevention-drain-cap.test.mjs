@@ -7,12 +7,12 @@ import { drainPendingPrevention } from '../../operations/land-prevention-card.mj
 import { reconcileOwedPrevention } from '../prevention-filing-owed.mjs';
 import { landPreventionCard } from '../../operations/land-prevention-card.mjs';
 import { reconcileCardBatches } from '../../operations/card-batch-reconcile.mjs';
-import { drainCursorPath, readDrainCursor, rotateAfter } from '../prevention-drain-cursor.mjs';
+import { cursorSeed, drainCursorPath, readDrainCursor, resetDrainCursorMemory, rotateAfter } from '../prevention-drain-cursor.mjs';
 import { resolvePreventionBatchSettings } from '../card-batch-settings.mjs';
 import { loadCardBatchPolicy } from '../card-batch-policy.mjs';
 
 const roots = [];
-afterEach(() => roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })));
+afterEach(() => { resetDrainCursorMemory(); roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })); });
 function fixture(names = ['a', 'b', 'c']) {
   const root = mkdtempSync(join(tmpdir(), 'drain-cap-')); roots.push(root);
   const stateDir = join(root, 'state'); const lane = join(root, 'lane'); const pendingDir = join(stateDir, 'pending-prevention');
@@ -130,6 +130,38 @@ describe('fairness without a writable cursor, and the shared allowance', () => {
     expect(seen).toContain('b');
     expect(f.left()).not.toContain('b');
   });
+  it('a cursor WRITE that fails (directory writable) still advances past the refused card, in memory', async () => {
+    const f = fixture(); const seen = [];
+    const batch = async input => { const id = input.cardPath.split('/')[1][0]; seen.push(id); if (id === 'a') throw new Error('refused'); return { batched: true }; };
+    mkdirSync(join(f.root, 'cursor.state')); // renaming a file over a directory fails: every write errors, the directory stays writable
+    const cursorPath = join(f.root, 'cursor.state');
+    resetDrainCursorMemory();
+    for (let tick = 0; tick < 3; tick++) await drainPendingPrevention({ lane: f.lane }, { pendingDir: f.pendingDir, exec, batch, write: () => {}, maxCards: 1, cursorPath });
+    expect(seen).toContain('b');
+    expect(f.left()).not.toContain('b');
+    expect(readdirSync(f.root).filter(name => name.endsWith('.tmp'))).toEqual([]); // failed temporaries are cleaned up
+  });
+  it('the unpersistable-cursor start does not align with the tick period', () => {
+    resetDrainCursorMemory();
+    const starts = new Set();
+    for (let tick = 0; tick < 12; tick++) starts.add(cursorSeed(join(tmpdir(), 'no-such-dir-x', 'cursor.state')) % 5);
+    expect(starts.size).toBeGreaterThan(1);
+  });
+  it('a card admission is not started when the deadline passed during the ls-tree', async () => {
+    const f = fixture(['a']); let t = 0; const batch = vi.fn(async () => ({ batched: true }));
+    await drainPendingPrevention({ lane: f.lane }, { pendingDir: f.pendingDir, batch, write: () => {}, deadlineAt: 60_000, now: () => t,
+      exec: () => { t = 61_000; return ''; } });
+    expect(batch).not.toHaveBeenCalled();
+    expect(f.left()).toEqual(['a']);
+  });
+  it('an owed filing whose acquire used up the deadline is deferred, not run, and its lane is released', async () => {
+    const f = fixture([]); let t = 0; const calls = [];
+    const exec = (cmd, args) => { calls.push(args[1]); if (args[1] === 'acquire') { t = 61_000; return JSON.stringify({ lane: 3, path: f.lane }); } return ''; };
+    const result = await landPreventionCard({ title: 't', session: 's' }, { owedClaimed: true, exec, write: () => {}, skipPendingDrain: true,
+      loadFilingSettings: () => ({ filingEnabled: true }), drainLimit: { deadlineAt: 60_000, now: () => t }, acquireWait: () => 30_000 });
+    expect(result).toMatchObject({ ok: true, skipped: true, deferred: true });
+    expect(calls).toEqual(['acquire', 'release']);
+  });
   it('rotateAfter: a seed rotates only when there is no cursor value', () => {
     expect(rotateAfter(['a', 'b', 'c'], undefined, 1)).toEqual(['b', 'c', 'a']);
     expect(rotateAfter(['a', 'b', 'c'], undefined, undefined)).toEqual(['a', 'b', 'c']);
@@ -235,22 +267,39 @@ describe('the probe tick', () => {
     expect(readDrainCursor(f.cursorPath).next).toBe('pending');
   });
 
-  it('the owed filing\'s own spool drain shares the tick\'s allowance and deadline instead of being skipped', async () => {
+  it('an owed filing does NOT drain the spool itself inside the tick (operator ruling 2026-10-20): the probe drains it in its own slice', async () => {
     const f = tickFixture(); owedPending(f); const fileOwed = vi.fn(async () => ({ ok: true, skipped: true }));
     await reconcileCardBatches({ ...base(f), drain: vi.fn(async () => ({ ok: true })), fileOwed, loadFilingSettings: settings(), clock: () => 0 });
     const options = fileOwed.mock.calls[0][1];
-    expect(options.skipPendingDrain).toBeUndefined();
-    expect(options.drainLimit).toMatchObject({ deadlineAt: 60_000, cursorPath: f.cursorPath });
+    expect(options.skipPendingDrain).toBe(true);
+    expect(options.drainLimit).toMatchObject({ deadlineAt: 60_000 });
     expect(options.acquireWait()).toBe(30_000); // an owed filing's acquire is bounded too
   });
 
-  it('ONE allowance per tick across both steps: an owed filing that took it leaves the spool drain none', async () => {
+  it('ONE allowance per tick across both steps: an owed filing that took it leaves the spool drain none, and it does not even acquire', async () => {
     const f = tickFixture(); owedPending(f);
     writeFileSync(f.cursorPath, JSON.stringify({ next: 'owed' }));
-    const seen = [];
-    const drain = vi.fn(async (input, options) => { seen.push(options.drainLimit.counter.left); return { ok: true }; });
+    const drain = vi.fn(async () => ({ ok: true }));
     await reconcileCardBatches({ ...base(f), drain, fileOwed: vi.fn(async () => ({ ok: true, skipped: true })), loadFilingSettings: settings() });
-    expect(seen).toEqual([0]);
+    expect(drain).not.toHaveBeenCalled();
+  });
+
+  it('an owed-first deferral (no lane) ends the tick: the pending drain does not acquire', async () => {
+    const f = tickFixture(); owedPending(f);
+    writeFileSync(f.cursorPath, JSON.stringify({ next: 'owed' }));
+    const drain = vi.fn(async () => ({ ok: true }));
+    const results = await reconcileCardBatches({ ...base(f), drain, loadFilingSettings: settings(),
+      fileOwed: vi.fn(async () => ({ ok: true, skipped: true, deferred: true })) });
+    expect(drain).not.toHaveBeenCalled();
+    expect(results.some(result => result.action === 'error')).toBe(false);
+  });
+
+  it('the pending acquire wait is the LIVE remaining budget, read at the acquire', async () => {
+    const f = tickFixture(); let t = 0;
+    const drain = vi.fn(async (input, options) => { t = 45_000; return { ok: true, live: options.drainLimit.acquireWait() }; });
+    await reconcileCardBatches({ ...base(f), drain, loadFilingSettings: settings(), clock: () => t });
+    expect(drain.mock.calls[0][1].drainLimit.acquireWaitMs).toBe(30_000); // the snapshot
+    expect(await drain.mock.results[0].value).toMatchObject({ live: 15_000 }); // the live value after time passed
   });
 
   it('the budget counts from the START of the tick: terminal-PR recovery that used it leaves no drain', async () => {
