@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import { platformPreference, resolveCascade } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { DIRTY_PROBE_ARGS, hasHiddenIndexFlags, laneGitEnv } from './git-transport-branch.mjs';
+import { hardenLaneGitArgs, laneGitHardeningEnv, laneFilterDrivers, LANE_CONFIG_LIST_ARGS } from './lane-git-hardening.mjs';
 
 export function resolveLaneScanPolicy({ env = process.env,
   platform = platformPreference('healthWatch', { env }), tool = readDeclaredSettings().settings?.healthWatch,
@@ -70,9 +71,16 @@ export function freshLaneSafety({ path, exec = execFileSync, now = Date.now } = 
   const observedAt = new Date(now()).toISOString();
   const unsafe = (reason, error) => ({ hasUnsafeWork: true, fresh: true, observedAt, reason, ...(error ? { error } : {}) });
   if (typeof path !== 'string' || !path) return unsafe('no lane path');
-  const git = argv => String(exec('git', argv, { cwd: path, encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024,
-    env: { ...laneGitEnv(path), GIT_OPTIONAL_LOCKS: '0' }, stdio: ['ignore', 'pipe', 'pipe'] }));
+  const git = argv => String(exec('git', hardenLaneGitArgs(argv), { cwd: path, encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024,
+    env: { ...laneGitHardeningEnv(laneGitEnv(path)), GIT_CONFIG_NOSYSTEM: '1', GIT_PAGER: 'cat',
+      GIT_OPTIONAL_LOCKS: '0' }, stdio: ['ignore', 'pipe', 'pipe'] }));
   try {
+    // Config reads execute no drivers. Refuse lane-owned filters before status can run a clean filter.
+    if (laneFilterDrivers(git([...LANE_CONFIG_LIST_ARGS])).length) return unsafe('lane Git filter drivers present');
+    // Status can enter submodules with their own untrusted filter config. Do not run that recursive probe.
+    if (git(['ls-files', '--stage', '-z']).split('\0').some(entry => entry.startsWith('160000 '))) {
+      return unsafe('submodule safety requires separate inspection');
+    }
     // Share destructive cleanup's probe: ignored files and submodule work must remain visible.
     const status = git([...DIRTY_PROBE_ARGS]);
     if (typeof status !== 'string') return unsafe('status unreadable');

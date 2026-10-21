@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -7,6 +7,7 @@ import { cachedLaneScan, resolveLaneScanPolicy, freshLaneSafety, guardLaneAction
 import { createStaleStateReader } from '../stale-state-io.mjs';
 import { OPERATIONS } from '../run.mjs';
 import { DIRTY_PROBE_ARGS, laneGitEnv, worktreeGitEnv } from '../../lib/git-transport-branch.mjs';
+import { LANE_CONFIG_LIST_ARGS, LANE_GIT_CONFIG_PINS } from '../../lib/lane-git-hardening.mjs';
 
 vi.mock('../stale-state-io.mjs', async original => {
   const real = await original();
@@ -159,6 +160,8 @@ describe('shared lane Git environment', () => {
 
 describe('fresh per-lane safety check before any destructive action', () => {
   const commands = [
+    ['git', [...LANE_CONFIG_LIST_ARGS]],
+    ['git', ['ls-files', '--stage', '-z']],
     ['git', ['status', '--porcelain', '--untracked-files=all', '--ignored=traditional', '--ignore-submodules=none']],
     ['git', ['ls-files', '-v']],
     ['git', ['stash', 'list']],
@@ -173,7 +176,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
   });
   const git = outputs => {
     const replies = new Map(commands.map((command, i) => [JSON.stringify(command),
-      [outputs.status, outputs['ls-files'] ?? 'H tracked.txt\n', outputs.stash, outputs['rev-list']][i]]));
+      [outputs.config ?? '', outputs.stage ?? '', outputs.status, outputs['ls-files'] ?? 'H tracked.txt\n', outputs.stash, outputs['rev-list']][i]]));
     const exec = vi.fn((bin, argv) => {
       const out = replies.get(JSON.stringify([bin, argv]));
       if (out instanceof Error) throw out;
@@ -192,6 +195,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
   it.each(['!! ignored.txt\n', '!! local-data/\n'])(
     'refuses every destructive action for ignored work reported as %s', status => {
       const exec = vi.fn((bin, argv) => {
+        if (argv[0] === 'config') return '';
         if (argv[0] === 'status') return argv.includes('--ignored=traditional') ? status : '';
         if (argv[0] === 'ls-files') return 'H tracked.txt\n';
         if (argv[0] === 'stash') return '';
@@ -209,6 +213,8 @@ describe('fresh per-lane safety check before any destructive action', () => {
     const exec = git({ status: '', stash: '', 'rev-list': '0\n' });
     freshLaneSafety({ path: '/l', exec });
     expect(exec.mock.calls.map(([bin, argv]) => [bin, argv])).toEqual([
+      ['git', [...LANE_CONFIG_LIST_ARGS]],
+      ['git', ['ls-files', '--stage', '-z']],
       ['git', ['status', '--porcelain', '--untracked-files=all', '--ignored=traditional', '--ignore-submodules=none']],
       ['git', ['ls-files', '-v']],
       ['git', ['stash', 'list']],
@@ -218,12 +224,13 @@ describe('fresh per-lane safety check before any destructive action', () => {
       expect(options).toMatchObject({ cwd: '/l', encoding: 'utf8', timeout: 30_000 });
       expect(options.env.GIT_OPTIONAL_LOCKS).toBe('0');
     }
-    expect(exec.mock.calls[0][1]).toEqual([...DIRTY_PROBE_ARGS]);
+    expect(exec.mock.calls[2][1]).toEqual([...DIRTY_PROBE_ARGS]);
   });
   it.each(['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY'])(
     'ignores inherited %s so a clean foreign repository cannot authorize a dirty lane', variable => {
       vi.stubEnv(variable, '/foreign/clean');
       const exec = vi.fn((bin, argv, options) => {
+        if (argv[0] === 'config') return '';
         // Model a clean foreign repo masking edits in the lane selected by cwd.
         if (argv[0] === 'status') return options.env[variable] ? '' : ' M tracked.txt\n';
         if (argv[0] === 'ls-files') return 'H tracked.txt\n';
@@ -264,6 +271,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
   ])('reports a lane with $work unsafe using the full git argv', ({ status, count, reason }) => {
     // Deliberately return clean results for other argv so a missing flag cannot pass by triggering an exec error.
     const exec = vi.fn((bin, argv) => {
+      if (argv[0] === 'config') return '';
       const command = JSON.stringify([bin, argv]);
       if (command === JSON.stringify(['git', ['status', '--porcelain', '--untracked-files=all', '--ignored=traditional', '--ignore-submodules=none']])) return status;
       if (command === JSON.stringify(['git', ['ls-files', '-v']])) return 'H tracked.txt\n';
@@ -279,6 +287,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
     // Model Git hiding submodule dirt unless the command explicitly overrides ignore settings.
     // The fallback is clean (not an error), so omission must fail by authorizing the action.
     const exec = vi.fn((bin, argv) => {
+      if (argv[0] === 'config') return '';
       if (argv[0] === 'status') return argv.includes('--ignore-submodules=none') ? ' M child\n' : '';
       if (argv[0] === 'ls-files') return 'H child\n';
       if (argv[0] === 'stash') return '';
@@ -311,7 +320,8 @@ describe('fresh per-lane safety check before any destructive action', () => {
     });
   });
   it('any error, timeout or unparseable output is unsafe', () => {
-    for (const outputs of [{ status: new Error('timeout') }, { status: '', stash: new Error('locked') },
+    for (const outputs of [{ config: new Error('config unreadable') }, { stage: new Error('index unreadable') },
+      { status: new Error('timeout') }, { status: '', stash: new Error('locked') },
       { status: '', stash: '', 'rev-list': new Error('bad object') }, { status: '', stash: '', 'rev-list': 'nope' }]) {
       expect(freshLaneSafety({ path: '/l', exec: git(outputs) })).toMatchObject({ hasUnsafeWork: true, fresh: true });
     }
@@ -346,6 +356,55 @@ describe('fresh per-lane safety check before any destructive action', () => {
   });
 });
 
+describe('untrusted lane Git configuration', () => {
+  it('does not execute fsmonitor or external diff from configuration overrides (read-only Git)', () => {
+    const marker = join(temp(), 'executed');
+    const command = `echo executed >> '${marker}'`;
+    vi.stubEnv('GIT_CONFIG_COUNT', '2');
+    vi.stubEnv('GIT_CONFIG_KEY_0', 'core.fsmonitor');
+    vi.stubEnv('GIT_CONFIG_VALUE_0', command);
+    vi.stubEnv('GIT_CONFIG_KEY_1', 'diff.external');
+    vi.stubEnv('GIT_CONFIG_VALUE_1', command);
+    try {
+      // Exercise the actual guard and Git without writing any repository metadata.
+      const exec = vi.fn(execFileSync);
+      guardLaneAction({ path: process.cwd(), action: 'reclaim', exec, log: vi.fn() });
+      expect(exec.mock.calls.some(([, argv]) => argv[0] === 'status')).toBe(true);
+      expect(existsSync(marker)).toBe(false);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('hardens every probe and reads filter configuration before examining the worktree', () => {
+    const exec = vi.fn((bin, argv) => argv[0] === 'rev-list' ? '0\n' : '');
+    expect(freshLaneSafety({ path: '/fixture/lane', exec }).hasUnsafeWork).toBe(false);
+    expect(exec.mock.calls.map(([, argv]) => argv)).toEqual([
+      [...LANE_CONFIG_LIST_ARGS], ['ls-files', '--stage', '-z'], [...DIRTY_PROBE_ARGS], ['ls-files', '-v'], ['stash', 'list'],
+      ['rev-list', '--count', '--all', 'HEAD', '--not', '--remotes=origin'],
+    ]);
+    for (const [, , { env }] of exec.mock.calls) {
+      const config = Object.fromEntries(Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) =>
+        [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]));
+      expect(config).toMatchObject(Object.fromEntries(LANE_GIT_CONFIG_PINS));
+      expect(env).toMatchObject({ GIT_CONFIG_NOSYSTEM: '1', GIT_PAGER: 'cat', GIT_OPTIONAL_LOCKS: '0' });
+      expect(env).not.toHaveProperty('GIT_EXTERNAL_DIFF');
+    }
+  });
+
+  it.each(['local', 'worktree'])('refuses %s clean filters before status can execute them', scope => {
+    const exec = vi.fn(() => `${scope}\0filter.marker.clean\nmarker-command\0`);
+    expect(guardLaneAction({ path: '/fixture/lane', action: 'reset', exec, log: vi.fn() }))
+      .toMatchObject({ act: false, fresh: { reason: 'lane Git filter drivers present' } });
+    expect(exec.mock.calls.map(([, argv]) => argv)).toEqual([[...LANE_CONFIG_LIST_ARGS]]);
+  });
+
+  it('refuses submodules before status can enter their untrusted configuration', () => {
+    const exec = vi.fn((bin, argv) => argv[0] === 'config' ? '' : `160000 ${'a'.repeat(40)} 0\tchild\0`);
+    expect(guardLaneAction({ path: '/fixture/lane', action: 'reset', exec, log: vi.fn() }))
+      .toMatchObject({ act: false, fresh: { reason: 'submodule safety requires separate inspection' } });
+    expect(exec.mock.calls.map(([, argv]) => argv)).toEqual([[...LANE_CONFIG_LIST_ARGS], ['ls-files', '--stage', '-z']]);
+  });
+});
+
 describe('lane action guard with real Git', () => {
   const actions = ['reclaim', 'reset', 'reuse', 'release-on-behalf'];
   const fixture = () => {
@@ -372,6 +431,52 @@ describe('lane action guard with real Git', () => {
     return { path, git, commit };
   };
 
+  it('never runs marker scripts from lane-local fsmonitor or diff configuration', () => {
+    const { path, git } = fixture();
+    const scripts = temp();
+    const marker = join(scripts, 'executed');
+    const script = join(scripts, 'marker.sh');
+    writeFileSync(script, `#!/bin/sh\necho executed >> '${marker}'\n`, { mode: 0o700 });
+    const command = `'${script}'`;
+    git(['config', 'core.fsmonitor', command]);
+    git(['config', 'diff.external', command]);
+    for (const action of actions) {
+      expect(guardLaneAction({ path, action, log: vi.fn() }).act).toBe(true);
+      expect(existsSync(marker)).toBe(false);
+    }
+    writeFileSync(join(path, 'tracked.txt'), 'modified content\n');
+    expect(guardLaneAction({ path, action: 'reclaim', log: vi.fn() }).act).toBe(false);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it.each(['clean', 'smudge', 'process'])('refuses a lane-local %s filter without executing it', driver => {
+    const { path, git } = fixture();
+    const marker = join(temp(), 'executed');
+    writeFileSync(join(path, '.gitattributes'), 'tracked.txt filter=marker\n');
+    writeFileSync(join(path, 'tracked.txt'), 'modified content\n');
+    git(['config', `filter.marker.${driver}`, `echo executed >> '${marker}'`]);
+    expect(guardLaneAction({ path, action: 'reclaim', log: vi.fn() }))
+      .toMatchObject({ act: false, fresh: { reason: 'lane Git filter drivers present' } });
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it('never enters a submodule with a lane-local clean filter', () => {
+    const { path, git, commit } = fixture();
+    const child = fixture();
+    git(['-c', 'protocol.file.allow=always', 'submodule', 'add', '--quiet', child.path, 'child']);
+    commit();
+    git(['update-ref', 'refs/remotes/origin/fixture', 'HEAD']);
+    const marker = join(temp(), 'executed');
+    git(['-C', join(path, 'child'), 'config', 'filter.marker.clean', `echo executed >> '${marker}'`]);
+    writeFileSync(join(path, 'child', '.gitattributes'), 'tracked.txt filter=marker\n');
+    writeFileSync(join(path, 'child', 'tracked.txt'), 'modified content\n');
+    for (const action of actions) {
+      expect(guardLaneAction({ path, action, log: vi.fn() }))
+        .toMatchObject({ act: false, fresh: { reason: 'submodule safety requires separate inspection' } });
+      expect(existsSync(marker)).toBe(false);
+    }
+  });
+
   it.each([
     { work: 'untracked file', reason: 'worktree has changes', prepare: ({ path, git }) => {
       writeFileSync(join(path, 'untracked.txt'), 'local data\n');
@@ -393,14 +498,14 @@ describe('lane action guard with real Git', () => {
         return 'tracked.txt';
       },
     })),
-    { work: 'modified submodule hidden by Git configuration', reason: 'worktree has changes', prepare: ({ path, git, commit }) => {
+    { work: 'modified submodule hidden by Git configuration', reason: 'submodule safety requires separate inspection', prepare: ({ path, git, commit }) => {
       const child = fixture();
       git(['-c', 'protocol.file.allow=always', 'submodule', 'add', '--quiet', child.path, 'child']);
       commit();
       git(['update-ref', 'refs/remotes/origin/fixture', 'HEAD']);
       git(['config', 'diff.ignoreSubmodules', 'all']);
       git(['config', 'submodule.child.ignore', 'all']);
-      expect(freshLaneSafety({ path })).toMatchObject({ hasUnsafeWork: false });
+      expect(freshLaneSafety({ path })).toMatchObject({ hasUnsafeWork: true, reason: 'submodule safety requires separate inspection' });
       writeFileSync(join(path, 'child', 'tracked.txt'), 'local data\n');
       expect(git(['status', '--porcelain', '--untracked-files=all'])).toBe('');
       expect(git([...DIRTY_PROBE_ARGS])).toBe(' M child\n');
