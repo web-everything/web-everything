@@ -90,7 +90,7 @@ describe('runReviewJob under review.speculativeRedTeam', () => {
     const { io, calls } = jobIo({ over: {
       carryAcrossRebaseSetting: () => ({ value: 'on', source: 'test' }),
       readCarryEvidence: () => ({ headSha: head, comments }),
-      contributionPatchId: () => 'c'.repeat(40),
+      contributionPatchId: () => 'c'.repeat(40), proveIdenticalNetPatch: () => ({ ok: true, reason: 'test proof' }),
       restampVerdict: () => ({ ok: true }),
       postCarryComment: ({ body }) => comments.push({ user: { login: 'web-everything[bot]' }, body }),
     } });
@@ -109,7 +109,7 @@ describe('runReviewJob under review.speculativeRedTeam', () => {
       const { io } = jobIo({ over: {
         carryAcrossRebaseSetting: () => ({ value: 'on', source: 'test' }),
         readCarryEvidence: () => ({ headSha: head, comments }),
-        contributionPatchId: () => 'c'.repeat(40),
+        contributionPatchId: () => 'c'.repeat(40), proveIdenticalNetPatch: () => ({ ok: true, reason: 'test proof' }),
         restampVerdict: () => ({ ok: true }),
         postCarryComment: ({ body }) => comments.push(bot(body)),
       } });
@@ -136,7 +136,7 @@ describe('runReviewJob under review.speculativeRedTeam', () => {
       const { io } = jobIo({ over: {
         carryAcrossRebaseSetting: () => ({ value: 'on', source: 'test' }),
         readCarryEvidence: () => ({ headSha: head, comments }),
-        contributionPatchId: () => 'c'.repeat(40),
+        contributionPatchId: () => 'c'.repeat(40), proveIdenticalNetPatch: () => ({ ok: true, reason: 'test proof' }),
         restampVerdict: () => ({ ok: true }),
         postCarryComment: a => posted.push(a),
       } });

@@ -85,11 +85,12 @@ import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.m
  * IMPURE, but every effect goes through an injected `io` so the whole arc is unit-tested with fakes.
  */
 
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { execRead } from '../lib/proc-read.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
-import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
-import { liveResultGateState, redTeamGateMarker, redTeamMarker, redTeamResultId, readRedTeamTiming, readRedTeamProbes, readConfirmedBreaks, planRedTeamActions } from '../lib/red-team-gate.mjs';
+import { contributionPatchId, attemptVerdictCarry, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
+import { proveIdenticalNetPatch } from '../lib/identical-net-patch.mjs';
+import { readRedTeamTiming, readRedTeamProbes, readConfirmedBreaks, planRedTeamActions } from '../lib/red-team-gate.mjs';
 import { savedRedTeamFallback } from '../lib/drain-saved-red-team.mjs';
 
 import { randomUUID } from 'node:crypto';
@@ -311,6 +312,9 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     readSavedResult: ({ pr, repo, head }) => savedRedTeamFallback({ repo, pr, head, env })(),
     contributionPatchId: ({ sha, repo }) => contributionPatchId({ sha,
       exec: (f, a, o) => execRead(f, a, { ...o, cwd: planReviewDispatch({ pr: 1, repo }).laneRepo, env }) }),
+    // The second, stricter proof the shared carry requires (paths, modes, changed bytes, positions); see identical-net-patch.mjs.
+    proveIdenticalNetPatch: ({ fromSha, toSha, repo }) => proveIdenticalNetPatch({ fromSha, toSha,
+      cwd: planReviewDispatch({ pr: 1, repo }).laneRepo, exec: (f, a, o) => execFileSync(f, a, { ...o, env }) }),
     restampVerdict: ({ pr, repo, newHead, reason }) => {
       const r = spawnSync(process.execPath, [join(root, 'scripts', 'review-set-label.mjs'), String(pr), `--repo=${repo}`,
         '--to=restamp', '--actor=review-carry', `--new-head=${newHead}`, `--reason=${reason}`],
@@ -801,42 +805,14 @@ function runReviewArc({
     const prev = io.readPrevCompletion(slug);
     io.report({ session: slug, kind: 'review', pr: String(planned.pr), repo: planned.repo, status: 'started', timeoutMs: loopTimeoutMs });
     if (typeof io.carryAcrossRebaseSetting === 'function') {
-      try {
-        const setting = io.carryAcrossRebaseSetting();
-        io.log(`review-job: carryAcrossRebase=${setting.value} (${setting.source})`);
-        if (setting.value === 'on') {
-          const evidence = io.readCarryEvidence({ pr: planned.pr, repo: planned.repo });
-          if (!/^[0-9a-f]{40}$/.test(evidence?.headSha ?? '') || !Array.isArray(evidence?.comments)) throw Error('carry evidence unreadable');
-          const prior = findCarriableVerdict({ ...evidence, pr: planned.pr });
-          // A gate decision made on SAVED evidence has no posted result to re-key onto the new head, so carrying its
-          // bare markers would drop a held break (PR #5551 red team). Such a head is reviewed afresh; unreadable evidence too.
-          if (prior && !prior.advisory && prior.gateOutcomes.length
-            && (!io.readSavedResult || io.readSavedResult({ pr: planned.pr, repo: planned.repo, head: prior.sha }))) {
-            throw Error('the carried head\'s red-team result is saved, not posted');
-          }
-          if (prior) {
-            const priorPatchId = io.contributionPatchId({ sha: prior.sha, repo: planned.repo });
-            const headPatchId = io.contributionPatchId({ sha: evidence.headSha, repo: planned.repo });
-            const decision = decideRebaseVerdictCarry({ setting: setting.value, prior, priorPatchId, headPatchId });
-            if (decision.carry) {
-              const stamped = io.restampVerdict({ pr: planned.pr, repo: planned.repo, newHead: evidence.headSha,
-                reason: `${decision.reason}; from ${prior.sha}; patch-id ${headPatchId}` });
-              if (!stamped?.ok) throw Error(`restamp refused: ${stamped?.reason ?? 'unknown error'}`);
-              // Carry only the gate decisions made on the result being carried, named by that result (PR #5482).
-              const decided = prior.advisory ? liveResultGateState(evidence.comments, planned.pr, prior.sha) : null;
-              const gate = !decided ? prior.gateOutcomes.map(outcome => redTeamGateMarker(planned.pr, evidence.headSha, outcome))
-                : decided.resultId !== redTeamResultId(prior.advisory) ? []
-                  : [...decided.outcomes].map(outcome => redTeamGateMarker(planned.pr, evidence.headSha, outcome, decided.resultId));
-              const body = [...gate, buildVerdictCarriedMarker({ fromSha: prior.sha, toSha: evidence.headSha, patchId: headPatchId }),
-                'Review verdict carried across an identical contribution.',
-                ...(prior.advisoryBody ? [prior.advisoryBody.replace(redTeamMarker(planned.pr, prior.sha), redTeamMarker(planned.pr, evidence.headSha))] : [])].join('\n');
-              io.postCarryComment({ pr: planned.pr, repo: planned.repo, body });
-              classified = { outcome: 'carried', fromSha: prior.sha, headSha: evidence.headSha, patchId: headPatchId };
-              return result(classified);
-            }
-          }
-        }
-      } catch (e) { io.log(`review-job ${slug}: verdict carry unavailable (${tail(e?.message ?? e, 300)}) — normal review`); }
+      // One shared carry (we:scripts/lib/rebase-verdict-carry.mjs#attemptVerdictCarry): the fix launcher runs the
+      // same one before it re-arms an accepted PR, so both seams decide and write a carry identically.
+      const carry = attemptVerdictCarry({ ...io, log: line => io.log(line) }, { pr: planned.pr, repo: planned.repo });
+      if (carry.carried) {
+        classified = { outcome: 'carried', fromSha: carry.fromSha, headSha: carry.headSha, patchId: carry.patchId };
+        return result(classified);
+      }
+      io.log(`review-job ${slug}: verdict carry unavailable (${tail(carry.reason, 300)}) — normal review`);
     }
 
     // NO pre-release of this slug's lease. The job slot above proves no live JOB owns the slug, but not that no

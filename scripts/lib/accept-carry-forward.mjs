@@ -140,8 +140,10 @@ function isApprovalPreventionNotice(text, comment) {
     if (!job || job.index !== 1) return false;
     rest = rest.slice(1 + job[0].length);
   }
-  // Both filer outcomes: an existing backlog card, or a detached landing job's tracking handle.
-  const fixedText = /^\nFiled the prevention guard\(s\) owed by [A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#[1-9][0-9]*'s independent review, mechanically, on approval \(operator rule, 2026-09-27\) — (?:backlog\/[A-Za-z0-9._-]+\.md \(#(?:[1-9][0-9]*|\?)\)|queued for landing via a lane \(tracking (?:pid:[1-9][0-9]*|an untracked job)\))\./;
+  // Every filer outcome: an existing backlog card, a detached landing job's tracking handle, or (filing paused) the
+  // owed record `review-set-label.mjs` writes. The paused form followed every accept while filing was paused and,
+  // unrecognised, read as a hold that refused every carry (live #5777/#5779, 2026-10-21).
+  const fixedText = /^\n(?:Filed the prevention guard\(s\) owed by [A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#[1-9][0-9]*'s independent review, mechanically, on approval \(operator rule, 2026-09-27\) — (?:backlog\/[A-Za-z0-9._-]+\.md \(#(?:[1-9][0-9]*|\?)\)|queued for landing via a lane \(tracking (?:pid:[1-9][0-9]*|an untracked job)\))|Recorded the prevention filing owed by [A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#[1-9][0-9]*'s independent review, mechanically, on approval \(operator rule, 2026-09-27\) — recorded, owed; filing paused and will resume automatically)\./;
   return fixedText.exec(rest)?.[0] === rest;
 }
 
