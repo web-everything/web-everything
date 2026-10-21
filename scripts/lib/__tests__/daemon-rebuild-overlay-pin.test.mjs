@@ -80,6 +80,45 @@ function fixture() {
 }
 
 describe('overlay-pin — a moving overlay whose new tip conflicts stays at its adopted head', () => {
+  it.each([
+    { name: 'retryable pin first', order: ['lane/a', 'lane/b', 'lane/c'], joint: false },
+    { name: 'blocked pin first', order: ['lane/b', 'lane/a', 'lane/c'], joint: false },
+    { name: 'two tips must retry together', order: ['lane/a', 'lane/d', 'lane/b', 'lane/c'], joint: true },
+    { name: 'all tips advance but still lose C', order: ['lane/b', 'lane/a', 'lane/d', 'lane/c'], joint: true, shadow: true },
+  ])('retries moving overlays while retaining a blocked pin: $name (PR #5809)', async ({ order, joint, shadow }) => {
+    const f = fixture();
+    f.env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '0';
+    f.env.WE_DAEMON_OVERLAY_STACK_MODE = 'tops';
+    // The reported order is A, B, C, R; also cover reversed pins and a mutually dependent retry subgroup.
+    const { removeOverlay } = await import('../daemon-overlays.mjs');
+    for (const ref of ['lane/moving', 'lane/fix-a', 'lane/fix-b']) removeOverlay(f.clone, ref, { env: f.env });
+    const base = f.push('main', f.init, { 'shared.txt': 'base\n', 'blocked.txt': 'base\n', 'c.txt': 'base\n', ...(joint ? { 'shared-d.txt': 'base\n' } : {}), ...(shadow ? { 'shared-c.txt': 'base\n' } : {}) });
+    const a0 = f.push('lane/a', base, { 'a.txt': 'old-A\n' });
+    const b0 = f.push('lane/b', base, { 'b.txt': 'B\n' });
+    const c0 = f.push('lane/c', base, { 'c.txt': 'old-C\n' });
+    const d0 = joint ? f.push('lane/d', base, { 'd.txt': 'old-D\n' }) : null;
+    for (const [i, ref] of order.entries()) addOverlay(f.clone, { ref, pr: 5900 + i }, { env: f.env });
+    expect(await f.tick()).toMatchObject({ adopted: true });
+    for (const sha of [a0, b0, c0]) expect(isAncestor(f.clone, sha, f.head())).toBe(true);
+
+    const main = f.push('main', base, { 'shared.txt': 'main\n', 'blocked.txt': 'main\n', 'c.txt': 'main-C\n', ...(joint ? { 'shared-d.txt': 'main\n' } : {}), ...(shadow ? { 'shared-c.txt': 'main\n' } : {}) });
+    const a1 = f.push('lane/a', a0, { 'shared.txt': 'new-A\n', 'a.txt': 'new-A\n', ...(joint ? { 'd.txt': 'new-D\n' } : {}) });
+    const b1 = f.push('lane/b', b0, { 'blocked.txt': 'new-B\n', ...(shadow ? { 'z.txt': 'bad\n' } : {}) });
+    const d1 = joint ? f.push('lane/d', d0, { 'shared-d.txt': 'new-D\n', 'd.txt': 'new-D\n', 'a.txt': 'new-A\n' }) : null;
+    const c1 = f.push('lane/c', c0, { 'c.txt': 'main-C\n', 'a.txt': 'new-A\n', 'c-extra.txt': 'C\n', ...(joint ? { 'd.txt': 'new-D\n' } : {}), ...(shadow ? { 'shared-c.txt': 'new-C\n', 'z.txt': 'good\n' } : {}) });
+    const repair = f.push('lane/repair', main, { 'shared.txt': 'base\n', 'repair.txt': 'R\n', ...(joint ? { 'shared-d.txt': 'base\n' } : {}), ...(shadow ? { 'blocked.txt': 'base\n', 'shared-c.txt': 'base\n' } : {}) });
+    addOverlay(f.clone, { ref: 'lane/repair', pr: 5910 }, { env: f.env });
+    const result = await f.tick();
+    expect(result, JSON.stringify(result.alerts)).toMatchObject({ adopted: true });
+    expect(result.alerts.map(row => row.kind)).not.toContain('established-overlay-hold');
+    for (const sha of [a1, b0, c1, repair]) expect(isAncestor(f.clone, sha, f.head())).toBe(true);
+    if (joint) expect(isAncestor(f.clone, d1, f.head())).toBe(true);
+    expect(isAncestor(f.clone, b1, f.head())).toBe(false);
+    expect(readRebuildState(f.clone, f.env).adopted.applied.find(row => row.ref === 'lane/b')).toMatchObject({ sha: b0, pinnedFrom: b1 });
+    expect(readFileSync(join(f.clone, 'a.txt'), 'utf8')).toBe('new-A\n');
+    expect(f.smoke).toHaveBeenCalledTimes(2);
+  }, 120_000);
+
   it('replays 11:59 ET: the conflicting new tip is pinned, an unrelated new overlay still adopts, the clone never holds', async () => {
     const f = fixture();
     expect(await f.tick()).toMatchObject({ adopted: true });

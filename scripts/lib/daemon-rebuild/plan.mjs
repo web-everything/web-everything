@@ -770,29 +770,53 @@ export async function planRebuild({
     });
   }
 
-  // overlay-pin vs the retry pass — a pin is taken in place, so the retry pass above never offers the NEW tip a second
-  // chance once later overlays applied. Plan once more with pinning off for the pinned refs (exactly the pre-pin rules)
-  // and take that plan only when it is no worse: every pinned ref now applies at its new tip, nothing the pinned plan
-  // applied is missing, and nothing live is lost. Otherwise the pins stand.
-  const pinnedRefs = decisions.filter((d) => d.pinned).map((d) => d.ref);
-  if (pinnedRefs.length > 0 && noPin.size === 0) {
-    const alt = await planRebuild({
-      git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
-      keepIndependent, noPin: new Set(pinnedRefs),
-    });
-    const altApplied = new Set((alt.applied ?? []).map((a) => a.ref));
-    if (alt.ok && (alt.establishedLost?.length ?? 0) === 0
-      && pinnedRefs.every((r) => (alt.applied ?? []).some((a) => a.ref === r && !a.pinnedFrom))
-      && applied.every((a) => altApplied.has(a.ref))) return alt;
-  }
-
   const inputsKey = createHash('sha256')
     .update(JSON.stringify({ main: mainSha, overlays: applied.map((a) => a.resolvedVia
       ? [a.ref, a.sha, a.resolvedVia, a.edgeSha ?? null] : [a.ref, a.sha]) }))
     .digest('hex')
     .slice(0, 16);
 
-  return {
+  const plan = {
     ok: true, mainSha, finalSha: cur, applied, decisions, alerts, inputsKey, upToDate: cur === headSha, establishedLost,
   };
+  // A pin is applied in place, so the ordinary retry never offers its NEW tip a second chance after later overlays.
+  // Keep the combined retry and give every pin an independent retry while retaining its siblings. Also consider
+  // joint subsets: two new tips can need each other while a third overlay must remain pinned. Always compare to
+  // the original plan; accepting an intermediate held plan can lock in a new tip that blocks a carried overlay.
+  const pinnedRefs = decisions.filter((d) => d.pinned).map((d) => d.ref);
+  if (pinnedRefs.length > 0 && noPin.size === 0) {
+    function* retryPinGroups() {
+      yield pinnedRefs;
+      if (pinnedRefs.length === 1) return;
+      for (const ref of pinnedRefs) yield [ref];
+      // Lazy, deterministic combinations; never build a powerset or recursively branch through planners.
+      // All pins and every singleton are always tried. Limit extra joint subsets to 64 replans per tick;
+      // exhaustion conservatively retains the original pins/hold. This exhausts all subsets for <=6 pins.
+      let remaining = 64;
+      for (let size = 2; size < pinnedRefs.length; size++) {
+        const indices = Array.from({ length: size }, (_, i) => i);
+        for (;;) {
+          if (remaining-- === 0) return;
+          yield indices.map((i) => pinnedRefs[i]);
+          let i = size - 1;
+          while (i >= 0 && indices[i] === pinnedRefs.length - size + i) i--;
+          if (i < 0) break;
+          indices[i]++;
+          for (let j = i + 1; j < size; j++) indices[j] = indices[j - 1] + 1;
+        }
+      }
+    }
+    for (const refs of retryPinGroups()) {
+      const alt = await planRebuild({
+        git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
+        keepIndependent, noPin: new Set(refs),
+      });
+      if (!alt.ok || alt.establishedLost.length > 0) continue;
+      const altApplied = new Map(alt.applied.map((a) => [a.ref, a]));
+      if (refs.every((ref) => altApplied.has(ref) && !altApplied.get(ref).pinnedFrom)
+        && applied.every((a) => altApplied.has(a.ref)
+          && (a.pinnedFrom || (!altApplied.get(a.ref).pinnedFrom && altApplied.get(a.ref).sha === a.sha)))) return alt;
+    }
+  }
+  return plan;
 }
