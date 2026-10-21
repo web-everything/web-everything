@@ -3,12 +3,20 @@
  * green draft AND dispatches its review; a not-green draft is never promoted; a PR already promoted elsewhere is
  * not promoted twice.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
 import { promoteDraftsGuarded, promoteDraftsThenReplan, rearmStaleAcceptanceGuarded, rearmStaleAcceptsThenReplan } from '../review-tick-promote.mjs';
+
+// The stale-accept provider's `defaultRearmStaleAcceptance` export, swapped per test through a getter: the production default
+// in `rearmStaleAcceptanceGuarded` reads it off the real module namespace at call time. Everything else on the module is real.
+const providerBinding = vi.hoisted(() => ({ fn: undefined }));
+vi.mock('../../operations/promote-draft-pr-dispatch.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, get defaultRearmStaleAcceptance() { return providerBinding.fn; } };
+});
 
 const REPO = 'web-everything/web-everything';
 const HEAD = 'a'.repeat(40);
@@ -152,6 +160,26 @@ describe('review daemon: same-pass stale-accept re-arm + review (#5771)', () => 
     expect(rearmStaleAcceptanceGuarded({ repo: REPO, pr: 5771, headSha: HEAD, rearm })).toBe(result);
     expect(rearm).toHaveBeenCalledTimes(1);
     expect(rearm).toHaveBeenCalledWith({ repoSlug: REPO, prNumber: 5771, headSha: HEAD });
+  });
+
+  // The production binding: with no `rearm` override, the guarded wrapper reads `defaultRearmStaleAcceptance` off the real
+  // `promote-draft-pr-dispatch.mjs` namespace. Every other test here injects `rearm`, so a rename, a dropped export or a
+  // wrong argument shape in the default would pass them all. The module is mocked so no live `gh` call can happen.
+  describe('default provider binding (production path, no `rearm` injected)', () => {
+    afterEach(() => { providerBinding.fn = undefined; });
+
+    it.each([{ ok: true }, { ok: false, reason: 'acceptance still covers the head' }])('defaults to promote-draft-pr-dispatch#defaultRearmStaleAcceptance and maps repo/pr/headSha to repoSlug/prNumber/headSha (%j)', (result) => {
+      const provider = vi.fn(() => result);
+      providerBinding.fn = provider;
+      expect(rearmStaleAcceptanceGuarded({ repo: REPO, pr: 5771, headSha: HEAD })).toBe(result);
+      expect(provider).toHaveBeenCalledTimes(1);
+      expect(provider).toHaveBeenCalledWith({ repoSlug: REPO, prNumber: 5771, headSha: HEAD });
+    });
+
+    it('holds the PR (a refusal, no throw) when the provider export is absent', () => {
+      providerBinding.fn = undefined;
+      expect(rearmStaleAcceptanceGuarded({ repo: REPO, pr: 5771, headSha: HEAD })).toEqual({ ok: false, reason: 'guarded stale-accept re-arm is unavailable in this checkout' });
+    });
   });
 
   const accepted = (n, extra = {}) => ({
