@@ -1534,6 +1534,11 @@ export function createDispatchSinks({
   // (`isolateDispatchSession`); the two seams stay so existing tests can assert each half independently.
   resolveWorktreeIsolation = () => DISPATCH_WORKTREE_SETTINGS.worktree,
   ensureWorktreeIsolation = (cwd) => isolateDispatchSession(cwd).write,
+  // ci-heal-worker-role — an EXPLICIT env this dispatch's session reads its identity from (the durable settings
+  // file + `--settings` env, the `claude --bg` spawn env, the worker-wrapper env), instead of this process's own.
+  // A read-only dispatcher (health-watch is `observer`) passes `{ ...process.env, WE_GITHUB_APP_ROLE: 'worker' }`
+  // for a session that must write; process.env itself is never touched. `null` keeps every path byte-identical.
+  spawnEnv = null,
 } = {}) {
   return {
     // #4349 — `ctx` (`{key, runId, ...}`, from `effect-executor.mjs#applyPendingEffects`'s per-sink call) was
@@ -1628,7 +1633,8 @@ export function createDispatchSinks({
           // session ACTUALLY starts in now, not `root`'s. Writing it to `root` would (a) no longer be where the
           // session looks for it, and (b) be one more write into the dispatching checkout this whole card exists
           // to stop.
-          settingsEnv: resolveSettingsEnv(sessionCwd),
+          settingsEnv: spawnEnv ? resolveSettingsEnv(sessionCwd, { env: spawnEnv }) : resolveSettingsEnv(sessionCwd),
+          ...(spawnEnv ? { spawnEnv } : {}),
           // #x9fbg1x — folds `{"worktree":{"bgIsolation":"none"}}` into the SAME `--settings` argument, and
           // (via `ensureWorktreeIsolation` above) the same durable settings.local.json this dispatch's cwd
           // already carries the gh-shim env/lane-grant overrides in.
@@ -1981,14 +1987,14 @@ export function defaultClaudeProvider(request, {
   const kind = String(request.launchKind || 'build');
   if (wrapKind(kind)) {
     const launched = launchWrapped({
-      role: kind, session: request.sessionSlug, bgArgv: argv, cwd: request.cwd, env: workerSpawnEnv(), pr: request.pr ?? null,
+      role: kind, session: request.sessionSlug, bgArgv: argv, cwd: request.cwd, env: workerSpawnEnv(request.spawnEnv ?? process.env), pr: request.pr ?? null,
       item: request.num ?? null, model: launchedModel, sessionId: request.sessionId,
     });
     request.reportWrapped?.(launched.wrapperPid);
     // `pid:<wrapper>` is the detached-handle shape the run store and liveness already read (route `detached`).
     return launched.handle || request.sessionId;
   }
-  const stdout = String(spawnAgent(argv, { cwd: request.cwd }) ?? '');
+  const stdout = String(spawnAgent(argv, request.spawnEnv ? { cwd: request.cwd, env: request.spawnEnv } : { cwd: request.cwd }) ?? '');
   return parseBackgroundedId(stdout) || request.sessionId;
 }
 
@@ -2156,8 +2162,8 @@ export const DISPATCHED_AGENT_SYSTEM_PROMPT_FILE = join(dirname(fileURLToPath(im
  * @param {string} [cwd]
  * @returns {Record<string,string>|null}
  */
-export function resolveGhShimSettingsEnv(cwd) {
-  try { return buildGhShimSettingsEnv({ cwd }); } catch { return null; }
+export function resolveGhShimSettingsEnv(cwd, { env } = {}) {
+  try { return buildGhShimSettingsEnv(env ? { cwd, env } : { cwd }); } catch { return null; }
 }
 
 /**
@@ -2173,8 +2179,8 @@ export const DISPATCH_BASH_TIMEOUT_ENV = Object.freeze({ BASH_DEFAULT_TIMEOUT_MS
 
 /** The dispatched session's `--settings` env: the gh-App shim override (when this host opted in) plus the
  *  #x36vidg Bash timeouts (always). Never throws. */
-export function resolveDispatchSettingsEnv(cwd) {
-  return { ...(resolveGhShimSettingsEnv(cwd) || {}), ...DISPATCH_BASH_TIMEOUT_ENV };
+export function resolveDispatchSettingsEnv(cwd, opts) {
+  return { ...(resolveGhShimSettingsEnv(cwd, opts) || {}), ...DISPATCH_BASH_TIMEOUT_ENV };
 }
 
 /** Test/override hook for {@link dispatchSessionCwd} — mirrors `explore-io.mjs`'s `REPORT_DIR_ENV`. */
