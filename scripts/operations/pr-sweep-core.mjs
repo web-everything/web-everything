@@ -313,9 +313,11 @@ const GATE_HOLD_LABELS = Object.freeze({
  * the reasons it is NOT ready (empty = ready). A send-back is answered by a LATER operator comment. PURE.
  * @param {object} pr {number, headRefOid, labels, comments}
  * @param {number} now epoch ms
+ * @param {{fixClaimLive?: (boolean|null)}} [o] the REAL claim lease when the caller can read it (heartbeat + TTL); only
+ *   without it is the begin/end comment pair used, as a fallback
  * @returns {string[]}
  */
-export function humanReviewHold(pr, now) {
+export function humanReviewHold(pr, now, { fixClaimLive = null } = {}) {
   const reasons = new Set(labelNames(pr).filter((l) => GATE_HOLD_LABELS[l]).map((l) => GATE_HOLD_LABELS[l]));
   const head = String(pr?.headRefOid ?? '').toLowerCase();
   const list = sorted(pr?.comments);
@@ -327,7 +329,7 @@ export function humanReviewHold(pr, now) {
   if (sentBackAt !== null && !list.some((e) => e.at !== null && e.at > sentBackAt && isOperatorAuthored(e.c))) {
     reasons.add('an unanswered red-team send-back on the live head');
   }
-  if (openFixClaim(pr?.comments, now)) reasons.add('a fix claim is open');
+  if (fixClaimLive === null ? openFixClaim(pr?.comments, now) : fixClaimLive) reasons.add('a fix claim is open');
   return [...reasons];
 }
 

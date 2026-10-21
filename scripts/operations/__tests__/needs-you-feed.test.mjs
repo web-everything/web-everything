@@ -37,7 +37,7 @@ describe('feed', () => {
   it('changing feed filename publishes open items with independent state and acknowledgement cursors', async () => {
     const home = temp(), checkoutRoot = join(home, 'workspace/.lanes/we/lane-1');
     const first = feedPath({ home, env: {} }), second = join(dirname(first), 'other-events.jsonl');
-    const opts = { home, checkoutRoot, now: at, log: vi.fn(),
+    const opts = { home, checkoutRoot, now: at, log: vi.fn(), liveGate: false,
       exec: () => JSON.stringify({ ready: [{ repo: item.repo, number: item.pr, head: item.head }] }) };
     const poll = path => runOnce({ ...opts, env: { WE_NEEDS_YOU_FEED: path } });
     expect((await poll(first)).lines).toHaveLength(1);
@@ -182,7 +182,7 @@ describe('feed', () => {
     const path = feedPath({ home, env: {} });
     vi.stubEnv('WE_NEEDS_YOU_FEED', path);
     const existing = { repo: item.repo, number: item.pr, head: item.head };
-    const opts = { home, checkoutRoot, env: {}, now: at, log: vi.fn() };
+    const opts = { home, checkoutRoot, env: {}, now: at, log: vi.fn(), liveGate: false };
     await runOnce({ ...opts, exec: () => JSON.stringify({ ready: [existing] }) });
     let resume, entered;
     const paused = new Promise(resolve => { resume = resolve; });
@@ -319,6 +319,29 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     const result = await runOnce({ exec, gh, home, checkoutRoot, env: {}, now: at, log });
     expect(result.openKeys).toEqual([]);
     expect(log).toHaveBeenCalledWith(expect.stringContaining('r#5768 held back from your review: the red team blocked the live head'));
+  });
+  it('publishes the head it CHECKED, not a stale one from the report or a later lookup', async () => {
+    const stale = [{ repo, number: 5768, head: 'stale' }];
+    const r2 = { ready: stale };
+    const { kept } = await gateReadyItems(itemsFromReport(r2), r2, { gh: gate({ headRefOid: head, labels: [] }, []), log: () => {} });
+    expect(kept[0].head).toBe(head);
+  });
+  it('the real fix-claim lease overrides the comment heuristic (expired lease = not claimed; live lease = claimed)', async () => {
+    const created_at = new Date(Date.now() - 600000).toISOString();
+    const body = '🔒 conveyor fix-begin — fix claim held';
+    const gh = async (_f, args) => (args[0] === 'api' ? JSON.stringify([[{ user: { login: 'plateau-worker[bot]' }, body, created_at }]]) : JSON.stringify({ headRefOid: head, labels: [] }));
+    const live = await gateReadyItems(items(), report, { gh, log: () => {}, fixClaimLive: () => true });
+    expect(live.held[0].reasons).toEqual(['a fix claim is open']);
+    const expired = await gateReadyItems(items(), report, { gh, log: () => {}, fixClaimLive: () => false });
+    expect(expired.held).toEqual([]);
+  });
+  it('a pass-wide deadline keeps (never drops) the items it could not judge in time', async () => {
+    const logs = [];
+    const gh = async () => JSON.stringify({ headRefOid: head, labels: [{ name: 'red-team:blocked' }] });
+    const { kept, held } = await gateReadyItems(items(), report, { gh, log: (l) => logs.push(l), deadlineMs: -1 });
+    expect(held).toEqual([]);
+    expect(kept.map((i) => i.pr).sort((a, b) => a - b)).toEqual([9, 5768]);
+    expect(logs.join()).toMatch(/gate deadline/);
   });
   it('keeps the incomplete flag the diff uses', async () => {
     const withFlag = Object.assign(items(), { incomplete: true });

@@ -9,6 +9,7 @@ import { dirname, join, resolve, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handoffHome } from './handoff-home.mjs';
 import { humanReviewHold } from './pr-sweep-core.mjs';
+import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { isLaneLocus, workspaceRootOf } from '../guard-lane.mjs';
 import { daemonCloneRoots, isDaemonCloneRealpath } from '../lib/daemon-clone-registry.mjs';
@@ -173,22 +174,32 @@ export function monitorCommand(path = feedPath()) {
  * that cannot be read is KEPT (an alert is never suppressed on missing evidence); the failure is logged. Only items
  * that came from the queue's `ready` section are judged. Returns `{kept, held}`.
  */
-export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(), log = console.error } = {}) {
+export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(), log = console.error, deadlineMs = 120000, concurrency = 4,
+  fixClaimLive = (repo, pr) => { try { return readLiveFixClaim({ repo, pr }) !== null; } catch { return null; } } } = {}) {
   const ready = new Set((report.ready ?? []).map((r) => `${r.repo}#${r.number ?? r.pr}`));
-  const kept = []; const held = [];
-  for (const item of items) {
-    if (item.kind !== 'needs-you' || !ready.has(`${item.repo}#${item.pr}`)) { kept.push(item); continue; }
+  const deadline = Date.now() + deadlineMs;
+  const out = new Array(items.length); const held = [];
+  const judge = async (index) => {
+    const item = items[index];
+    if (item.kind !== 'needs-you' || !ready.has(`${item.repo}#${item.pr}`)) { out[index] = item; return; }
+    // Bounded work: past the pass deadline an item is KEPT unjudged, never dropped on missing evidence.
+    if (Date.now() >= deadline) { log(`needs-you-feed ${item.repo}#${item.pr} gate deadline reached, keeping`); out[index] = item; return; }
     try {
       const opts = { cwd, encoding: 'utf8', timeout: 60000, killSignal: 'SIGKILL', maxBuffer: 256 * 1024 * 1024 };
       const view = JSON.parse(String(await gh('gh', ['pr', 'view', String(item.pr), '--repo', item.repo, '--json', 'labels,headRefOid'], opts)));
       const pages = JSON.parse(String(await gh('gh', ['api', '--paginate', '--slurp', `repos/${item.repo}/issues/${item.pr}/comments?per_page=100`], opts)));
-      if (!Array.isArray(pages) || !view || typeof view.headRefOid !== 'string') throw new Error('unreadable live PR');
+      if (!Array.isArray(pages) || !view || typeof view.headRefOid !== 'string' || !view.headRefOid.trim()) throw new Error('unreadable live PR');
       const comments = pages.flat().map((c) => ({ author: { login: c.user?.login ?? '' }, body: c.body ?? '', createdAt: c.created_at }));
-      const reasons = humanReviewHold({ number: item.pr, headRefOid: view.headRefOid, labels: view.labels ?? [], comments }, now);
-      if (reasons.length) { held.push({ item, reasons }); continue; }
-    } catch (error) { log(`needs-you-feed ${item.repo}#${item.pr} live gate unreadable, keeping: ${error.message}`); }
-    kept.push(item);
-  }
+      const reasons = humanReviewHold({ number: item.pr, headRefOid: view.headRefOid, labels: view.labels ?? [], comments }, now,
+        { fixClaimLive: fixClaimLive(item.repo, item.pr) });
+      if (reasons.length) { held.push({ item, reasons }); return; }
+      // Publish the head that was actually checked, not a stale one from the report or a later lookup.
+      out[index] = { ...item, head: view.headRefOid };
+    } catch (error) { log(`needs-you-feed ${item.repo}#${item.pr} live gate unreadable, keeping: ${error.message}`); out[index] = item; }
+  };
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.max(1, concurrency) }, async () => { while (next < items.length) await judge(next++); }));
+  const kept = out.filter(Boolean);
   kept.incomplete = items.incomplete;
   return { kept, held };
 }
