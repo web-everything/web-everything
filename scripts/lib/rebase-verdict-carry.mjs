@@ -6,7 +6,7 @@ import { parseReviewedSha, findAcceptVerdictComment } from './review-escalation.
 import { latestAcceptRecord, isLaterVerdictBody } from './accept-carry-forward.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { gateOutcomesForHead, parseRedTeamGateMarker, parseRedTeamComment, breakClass, RED_TEAM_COMMENT_MARKER,
-  liveResultGateState, redTeamGateMarker, redTeamMarker, redTeamResultId } from './red-team-gate.mjs';
+  liveResultGateState, redTeamGateMarker, redTeamMarker, redTeamResultId, redTeamCarryLinesMarker, unchangedCitedLines } from './red-team-gate.mjs';
 import { parseVerdictCarriedMarker, buildVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
 const HEX = /^[0-9a-f]{40}$/;
 
@@ -174,6 +174,16 @@ export function attemptVerdictCarry(io, { pr, repo, expectHead = null } = {}) {
         'Review verdict carried across an identical contribution.',
         ...(prior.advisoryBody ? [prior.advisoryBody.replace(redTeamMarker(pr, prior.sha), redTeamMarker(pr, evidence.headSha))] : [])].join('\n');
       io.postCarryComment({ pr, repo, body });
+      // Operator red-team rulings follow the carry only for breaks whose cited line is byte-identical on both heads
+      // (red-team-gate.mjs#redTeamCarryLinesMarker). No reader, or any failure: no record, so no operator release carries.
+      if (decided && decided.resultId === redTeamResultId(prior.advisory) && typeof io.readCitedLine === 'function') {
+        try {
+          const unchanged = unchangedCitedLines((prior.advisory.findings ?? []).filter(f => f.confirmed), { fromSha: prior.sha, toSha: evidence.headSha,
+            readLine: (sha, file, line) => io.readCitedLine({ sha, file, line, repo }) });
+          io.postCarryComment({ pr, repo, body: `${redTeamCarryLinesMarker({ pr, from: prior.sha, to: evidence.headSha, result: decided.resultId, unchanged })}\n`
+            + `Red-team cited lines unchanged across the carry: ${unchanged.length ? unchanged.map(i => `#${i}`).join(', ') : 'none'} (operator rulings on these breaks carry; the others are re-ruled).` });
+        } catch (e) { log(`verdict-carry: PR #${pr} cited-line record not posted (${String(e?.message ?? e).slice(0, 200)}); operator red-team rulings will not carry`); }
+      }
       log(`verdict-carry: PR #${pr} carried ${prior.sha} → ${evidence.headSha} (patch-id ${headPatchId}); no round consumed`);
       return { carried: true, reason: decision.reason, fromSha: prior.sha, headSha: evidence.headSha, patchId: headPatchId };
     }
@@ -193,3 +203,17 @@ export function resolveCarryAcrossRebase({ env = process.env, readFile = readFil
   } catch { /* default */ }
   return { value: 'off', source: 'default' };
 }
+
+/** `readCitedLine` for the carry: line `line` (1-based) of `file` at `sha` via `git show`, or null. The path must be a
+ *  plain repo-relative path (no `..`, no leading `/`, no `:`), so it can only name a blob at that commit. */
+export function gitCitedLineReader(exec) {
+  return ({ sha, file, line }) => {
+    if (!HEX.test(String(sha ?? '')) || typeof file !== 'string' || !file || file.startsWith('/') || file.includes(':')
+      || file.split('/').includes('..') || !Number.isInteger(line) || line < 1) return null;
+    let text;
+    try { text = String(exec('git', ['show', `${sha}:${file}`], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })); } catch { return null; }
+    const lines = text.split('\n');
+    return line <= lines.length ? lines[line - 1] : null;
+  };
+}
+
