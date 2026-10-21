@@ -354,4 +354,10 @@ describe('stale-accept hold vs guarded re-arm share one coverage verdict (#5771 
     expect(reason({ prOverride: { comments: [...pr.comments, ...Array.from({ length: 99 }, () => ({ viewerDidAuthor: true, body: '🔔 conveyor — note' }))] } })).toMatch(/thread truncated \(100 comments/);
     expect(provider(DIFF).fn().reason).toMatch(/still covers the head \(live diff match, accept unsuperseded\)/);
   });
+  it('provider (audit): exception text never reaches the refusal reason (secret / CR injection)', () => {
+    const boom = () => { throw new Error('GH_TOKEN=TOPSECRET\rFORGED'); };
+    const a = defaultRearmStaleAcceptance({ repoSlug: REPO_SLUG, prNumber: 5771, headSha: B, readPr: boom, rearm: vi.fn() });
+    const b = defaultRearmStaleAcceptance({ repoSlug: REPO_SLUG, prNumber: 5771, headSha: B, readPr: () => pr, readReviews: boom, rearm: vi.fn(), readNetDiff: () => ({ scored: true, rev: B, text: DIFF }) });
+    for (const r of [a, b]) { expect(r.ok).toBe(false); expect(r.covers).toBeUndefined(); expect(r.reason).not.toMatch(/TOPSECRET|FORGED|\r/); }
+  });
 });
