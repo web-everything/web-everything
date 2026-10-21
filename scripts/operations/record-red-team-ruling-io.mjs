@@ -155,6 +155,20 @@ export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_
       + '(not authored by the operator account, or an altered body); inspect the thread before retrying');
     return after;
   };
+  /** After a block: same head and result, our record is in the thread, and the gate now holds or sends back EVERY selected break. */
+  const proveHeld = (p, record) => {
+    const after = readThread({ repo: p.repo, pr: p.pr });
+    const head = String(after.headRefOid ?? '').toLowerCase();
+    if (head !== p.head) throw new Error(`the operator-block record was posted but PR #${p.pr}'s head moved to ${head}; inspect the thread`);
+    const comments = operatorBoundComments(after.comments);
+    if (liveResultGateState(comments, p.pr, head).resultId !== p.resultId) throw new Error('the operator-block record was posted but the live red-team result changed; inspect the thread');
+    if (!comments.some((c) => String(c?.body ?? '').trim() === record.trim() && isHumanOperatorComment(c))) {
+      throw new Error("the operator-block record is not in the read-back as a human operator's comment; inspect the thread before retrying");
+    }
+    const d = disposition(p, after.comments);
+    const free = p.indices.filter((i) => !d.held.some((f) => f.index === i) && !d.sendBack.some((f) => f.index === i));
+    if (free.length) throw new Error(`the operator-block record was posted but the gate does not hold break(s) ${free.map((i) => `#${i}`).join(', ')}; inspect the thread`);
+  };
   /** The derived `red-team:*` label follows the disposition; a failed sync is reported, never fatal (the record is what counts). */
   const resync = (p) => {
     try { return syncLabels({ repo: p.repo, pr: p.pr, head: p.head }); }
@@ -221,8 +235,10 @@ export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_
     [RED_TEAM_RULING_BLOCK_EFFECT]: async (p) => {
       const { labels } = recheck(p);
       // The hold first (adding a hold is always safe): the send-back line re-holds a break an earlier ruling released.
-      post(p.repo, p.pr, operatorRecord(p, OPERATOR_BLOCK_OUTCOME, `- ${p.indices.length} confirmed break(s) sent back to the fixer ${indexList(p)}.`));
+      const record = operatorRecord(p, OPERATOR_BLOCK_OUTCOME, `- ${p.indices.length} confirmed break(s) sent back to the fixer ${indexList(p)}.`);
+      post(p.repo, p.pr, record);
       post(p.repo, p.pr, reasonBody(p, 'Blocked: the break(s) go back to the fixer.'));
+      proveHeld(p, record);
       if (labelNames(labels).includes('review:changes')) {
         return { ruling: 'block', head: p.head, indices: p.indices, sentBack: true, alreadyUnderChanges: true, labels: resync(p) };
       }

@@ -468,3 +468,32 @@ describe('audit fixes (Codex read-only audit of 952397690)', () => {
     }
   });
 });
+
+describe('audit round 2', () => {
+  const rid = () => liveResultGateState(thread(), PR, HEAD).resultId;
+  const d = (comments) => readRedTeamDisposition({ comments: operatorBoundComments(comments), pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } });
+  it('block after a clear-human ceremony re-holds the break (the ceremony no longer covers it), and the sink proves it', async () => {
+    const { buildReviewedShaMarker, buildClearedHumanMarker } = await import('../../lib/review-escalation.mjs');
+    const clearance = bot(['✅ review — `review:human` cleared via the sanctioned path', '',
+      'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '',
+      buildReviewedShaMarker(HEAD), buildClearedHumanMarker('operator')].join('\n'), '2026-10-20T23:50:00Z');
+    const f = fake({ initial: thread([clearance]) });
+    expect(d(f.comments).held).toEqual([]); // the ceremony ruled on the cap
+    const b = planRedTeamRuling(read({ comments: f.comments }), input({ ruling: 'block' }));
+    await f.sinks[RED_TEAM_RULING_BLOCK_EFFECT](b);
+    expect(d(f.comments).held.map((x) => x.index)).toEqual([1]);
+  });
+  it('kill switch off: no second filing for a gate-carded break re-held by a block', () => {
+    const carded = bot(`${redTeamGateMarker(PR, HEAD, 'card-queued', rid())}\n**Red-team gate** x:\n- 1 finding(s) filed as a follow-up card (#1) — landing job j.`, '2026-10-20T23:50:00Z');
+    const block = { author: { login: 'chalbert' }, createdAt: '2026-10-21T00:10:00Z', body: `${redTeamGateMarker(PR, HEAD, 'operator-block', rid())}\n**Red-team gate** x:\n- 1 confirmed break(s) sent back to the fixer (#1).` };
+    const comments = thread([carded, block]);
+    expect(d(comments).held.map((x) => x.index)).toEqual([1]);
+    expect(() => planRedTeamRuling(read({ scope: OFF, comments }), input())).toThrow(/no red-team break is held/);
+    const ref = 'we:backlog/x.md';
+    expect(planRedTeamRuling(read({ scope: OFF, comments, card: { requested: ref, ref, readable: true } }), input({ card: ref }))).toMatchObject({ cardRef: ref });
+  });
+  it('a block whose record does not re-hold (posted as another account) fails its proof', async () => {
+    const f = fake({ author: 'web-everything' });
+    await expect(f.sinks[RED_TEAM_RULING_BLOCK_EFFECT](payloadFor({ ruling: 'block' }))).rejects.toThrow(/not in the read-back/);
+  });
+});

@@ -130,7 +130,10 @@ export function rulableBreaks({ comments, labels, pr, head, setting, scope, ruli
     if (labelNames(labels).includes('review:changes')) {
       throw new Error('the PR is under review:changes: the fixer owns the breaks, so there is nothing for the operator to rule on (redTeam.operatorRulings.anyState is off)');
     }
-    const held = readRedTeamDisposition({ comments, pr, head, setting, operatorRulings: scope }).held;
+    const { carded } = operatorRulingsOnLiveResult(comments, pr, head);
+    // A NEW card filing is never made for a break already carded by anyone, in either mode.
+    const held = readRedTeamDisposition({ comments, pr, head, setting, operatorRulings: scope }).held
+      .filter((f) => !(ruling === 'card' && !citesCard && carded.has(f.index)));
     if (!held.length) throw new Error('no red-team break is held for the operator on the live head (already carded, ruled or cleared)');
     return { state, atCap, anyState, rulable: held, noun: 'held for the operator' };
   }
