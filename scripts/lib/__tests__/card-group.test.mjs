@@ -246,6 +246,19 @@ describe('reservation, membership, queue wait', () => {
     expect(cardGroupHold(state, { num: 7, localSlug: 'o/r', files: [{ path: 'backlog/2-b.md' }] })).toBeNull();
     expect(cardGroupHold(state, { num: 9, localSlug: 'o/r', files: ['backlog/1-a.md'] })).toBeNull();
   });
+  it('never holds the published main-red repair PR: not for a reserved card, not as a source, not on unreadable state', () => {
+    // Red main holds the combined PR, so a group hold on the repair would deadlock both (red team, PR 5762).
+    expect(cardGroupHold(state, { num: 7, localSlug: 'o/r', files: ['backlog/1-a.md'], mainFix: true })).toBeNull();
+    expect(cardGroupHold(state, { num: 5, localSlug: 'o/r', mainFix: true })).toBeNull();
+    expect(cardGroupHold({ unreadable: true }, { num: 7, localSlug: 'o/r', mainFix: true })).toBeNull();
+    // Only a real `true` exempts.
+    expect(cardGroupHold(state, { num: 7, localSlug: 'o/r', files: ['backlog/1-a.md'], mainFix: 'yes' })).toMatchObject({ kind: 'card-grouped' });
+    const dir = tmp(), statePath = join(dir, 's.json');
+    writeFileSync(statePath, JSON.stringify(state));
+    const g = createCardGrouping({ localSlug: 'o/r', cwd: dir, statePath, settings: { enabled: true, maxSize: 8, eligibility: 'card-only', reconcileSec: 120, retryMin: 30, sources: {} }, quiet: true });
+    expect(g.holdFor({ num: 7, listedFilesComplete: true, listedFiles: ['backlog/1-a.md'], redMainFixPr: true })).toBeNull();
+    expect(g.holdFor({ num: 7, listedFilesComplete: true, listedFiles: ['backlog/1-a.md'] })).toMatchObject({ kind: 'card-grouped' });
+  });
   it('membership (an exemption) needs proof: recorded source, or combined PR number AND recorded branch', () => {
     const st = { groups: [{ ...state.groups[0], branch: 'lane/card-group-g' }], failed: {} };
     expect(inCardGroup(st, { num: 5, localSlug: 'o/r' })).toBe(true);
@@ -772,9 +785,10 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     // A live combined PR carries ready-to-merge + review:pending (it is re-reviewed); that alone must never dissolve it.
     const waiting = [{ name: 'ready-to-merge' }, { name: 'review:pending' }];
     function reconcileCase({ combined = { state: 'OPEN', labels: waiting }, sources = {}, readFails = [], closeFails = false, pr = 77, list = [], listThrows = false, at = T0,
-      repo = 'o/r', localSlug = 'o/r', extraGroups = [] } = {}) {
+      repo = 'o/r', localSlug = 'o/r', extraGroups = [], files = undefined, mainFixPrs = undefined, force = true, stamp = undefined } = {}) {
       const statePath = join(tmp(), 's.json');
-      writeFileSync(statePath, JSON.stringify({ groups: [{ id: 'g', repo, pr, branch: 'lane/card-group-g', createdAt: T0, sources: [{ num: 1, headSha: A }, { num: 2, headSha: B }] }, ...extraGroups], failed: {} }));
+      writeFileSync(statePath, JSON.stringify({ groups: [{ id: 'g', repo, pr, branch: 'lane/card-group-g', createdAt: T0, ...(files ? { files } : {}), sources: [{ num: 1, headSha: A }, { num: 2, headSha: B }] }, ...extraGroups], failed: {},
+        ...(stamp ? { lastReconcileAt: { [String(localSlug).toLowerCase()]: stamp } } : {}) }));
       const before = readFileSync(statePath, 'utf8');
       const live = { 1: { state: 'OPEN', isDraft: false, headRefOid: A, headRefName: 'lane/x', baseRefName: 'main', labels: accepted, ...sources[1] },
         2: { state: 'OPEN', isDraft: false, headRefOid: B, headRefName: 'lane/x', baseRefName: 'main', labels: accepted, ...sources[2] } };
@@ -793,9 +807,53 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       };
       const out = [];
       const g = createCardGrouping({ localSlug, cwd: tmp(), run: () => { throw new Error('no git on this path'); }, exec, statePath, settings, log: { write: l => out.push(l) }, now: () => at });
-      const r = g.reconcile({ force: true });
+      const r = g.reconcile({ force, ...(mainFixPrs ? { mainFixPrs } : {}) });
       return { r, calls, out: out.join(''), state: readGroupState(statePath), g, unchanged: readFileSync(statePath, 'utf8') === before };
     }
+
+    describe('a published main-red repair PR the group would block', () => {
+      // Healthy group (#77 awaiting review, checks green): red main holds #77, so the group must give way to the repair.
+      it.each([
+        ['needs a reserved card', { files: [CARD], mainFixPrs: [{ num: 99, files: [CARD] }] }, /main-red repair PR #99 needs reserved backlog\/5360-prevention-card\.md/],
+        ['needs a reserved card (object file rows)', { files: [CARD], mainFixPrs: [{ num: 99, files: [{ path: CARD }] }] }, /repair PR #99 needs reserved/],
+        ['is itself a source', { files: [CARD], mainFixPrs: [{ num: 2, files: null }] }, /main-red repair PR #2 is a source/],
+        ['arrives inside the throttle window', { files: [CARD], mainFixPrs: [{ num: 99, files: [CARD] }], force: false, stamp: T0 - 1_000 }, /repair PR #99 needs reserved/],
+      ])('dissolves the group when the repair %s', (_, c, why) => {
+        const t = reconcileCase(c);
+        expect(t.r).toMatchObject({ dissolved: ['g'] });
+        expect(t.state.groups).toEqual([]);
+        expect(t.calls.some(x => x.startsWith('pr close 77 --repo o/r ') && why.test(x))).toBe(true);
+        expect(t.out).toMatch(why);
+        expect(t.calls.filter(x => x.startsWith('pr comment '))).toHaveLength(2);
+      });
+      it.each([
+        ['touches no reserved card', { files: [CARD], mainFixPrs: [{ num: 99, files: ['scripts/x.mjs'] }] }],
+        ['has an unknown file list', { files: [CARD], mainFixPrs: [{ num: 99, files: null }] }],
+        ['is absent (main green)', { files: [CARD], mainFixPrs: [] }],
+        ['is the combined PR itself', { files: [CARD], mainFixPrs: [{ num: 77, files: [CARD] }] }],
+      ])('keeps the group when the repair %s', (_, c) => {
+        const t = reconcileCase(c);
+        expect(t.r).toMatchObject({ checked: 1, dissolved: [] });
+        expect(t.state.groups).toHaveLength(1);
+        expect(t.calls.some(x => x.startsWith('pr close') || x.startsWith('pr comment'))).toBe(false);
+      });
+      it('a foreign repository\'s repair never dissolves this repo\'s group', () => {
+        const t = reconcileCase({ files: [CARD], mainFixPrs: [{ num: 99, repo: 'o/foreign', files: [CARD] }] });
+        expect(t.state.groups).toHaveLength(1);
+      });
+      it('runCardGroupPass hands the pass\'s repair PRs to reconcile and forms no group while one is published', () => {
+        const seen = [];
+        const grouping = { reconcile: a => { seen.push(['reconcile', a]); return { checked: 0 }; }, form: () => { seen.push(['form']); return { reason: 'x' }; } };
+        const verdicts = [{ num: 99, decision: 'merge', redMainFixPr: true, listedFilesComplete: true, listedFiles: [CARD] },
+          { num: 98, decision: 'merge', redMainFixPr: true, listedFilesComplete: false, listedFiles: [CARD] }, { num: 5, decision: 'merge' }];
+        const r = runCardGroupPass({ grouping, enqueues: true, verdicts, log: { write: () => {} } });
+        expect(seen).toEqual([['reconcile', { mainFixPrs: [{ num: 99, repo: null, files: [CARD] }, { num: 98, repo: null, files: null }] }]]);
+        expect(r.grouping).toMatchObject({ reason: expect.stringMatching(/main is red/) });
+        seen.length = 0;
+        runCardGroupPass({ grouping, enqueues: true, verdicts: [{ num: 5, decision: 'merge' }], log: { write: () => {} } });
+        expect(seen).toEqual([['reconcile', { mainFixPrs: [] }], ['form']]);
+      });
+    });
 
     it.each([
       ['merged', { combined: { state: 'MERGED' } }],

@@ -102,6 +102,20 @@ describe('drain merge strategy — github-merge-queue', () => {
     expect(calls).toEqual([]);
   });
 
+  it('xym8nt4: the published main-red repair PR is never deferred by a card group (the real default hold)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dms-card-group-'));
+    try {
+      const statePath = join(dir, 'groups.json');
+      writeFileSync(statePath, JSON.stringify({ groups: [{ id: 'g', repo: LOCAL, pr: 77, files: ['backlog/5360-prevention-card.md'], sources: [{ num: 5, headSha: HEAD }] }], failed: {} }));
+      const env = { ...process.env, WE_DRAIN_CARD_GROUP_STATE: statePath };
+      const repair = { num: 99, repo: null, listedFilesComplete: true, listedFiles: ['backlog/5360-prevention-card.md'] };
+      const held = harness({ strategy: 'github-merge-queue', env });
+      expect(held.s.enqueue(repair, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deferred: true, kind: 'card-grouped' });
+      const fix = harness({ strategy: 'github-merge-queue', env });
+      expect(fix.s.enqueue({ ...repair, redMainFixPr: true }, HEAD, { comments: [] })).not.toMatchObject({ kind: 'card-grouped' });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('enqueues only the local repo PRs (sibling-repo impl halves stay direct)', () => {
     const { s } = harness({ strategy: 'github-merge-queue' });
     expect(s.enqueues(null)).toBe(true);

@@ -442,9 +442,12 @@ export function readGroupState(path, readFile = readFileSync) {
 
 /**
  * PURE: the hold for one candidate, given the state. A source of any recorded group is held; an unreadable
- * state holds everything (we cannot prove the PR is not a source).
+ * state holds everything (we cannot prove the PR is not a source). The published main-red repair PR (`mainFix`,
+ * set by the drain's own red-main gate) is never held: red main already holds the combined PR, so a group hold
+ * on the repair would deadlock both. Reconcile dissolves the group the repair needs.
  */
-export function cardGroupHold(state, { num, repo, localSlug, files = null } = {}) {
+export function cardGroupHold(state, { num, repo, localSlug, files = null, mainFix = false } = {}) {
+  if (mainFix === true) return null;
   if (state?.unreadable) return { kind: 'card-grouped', reason: 'card-group state unreadable — holding (fail closed)' };
   const slug = repoIdentity(repo || localSlug);
   if (!slug) return { kind: 'card-grouped', reason: 'card-group repository identity missing — holding (fail closed)' };
@@ -528,12 +531,17 @@ export function cardGroupCandidates({ enqueueOutcomes = [], deferred = [] } = {}
  * The drain's grouping step, run once per whole pass BEFORE the cascade. Every whole pass reconciles recorded
  * groups whatever the delivery strategy: a group formed under the merge queue must still release its holds after a
  * switch to direct merging. A new group forms only while the local repo merges through the queue; the cascade's
- * hold then keeps every source (the yield target included) out of the queue this same pass. Never throws.
+ * hold then keeps every source (the yield target included) out of the queue this same pass. While main is red the
+ * pass's published repair PRs (`redMainFixPr`, set by the red-main gate) go to reconcile, which dissolves any group
+ * they need, and no new group forms (only the repair may land). Never throws.
  */
 export function runCardGroupPass({ grouping, onlyPr = null, enqueues = false, enqueueOutcomes = [], deferred = [], verdicts = [], log = process.stderr } = {}) {
   if (onlyPr != null) return { reconciled: null, grouping: null };
-  const reconciled = grouping.reconcile();
+  const mainFixPrs = (Array.isArray(verdicts) ? verdicts : []).filter(v => v?.redMainFixPr === true)
+    .map(v => ({ num: Number(v.num), repo: v.repo ?? null, files: v.listedFilesComplete === true ? v.listedFiles : null }));
+  const reconciled = grouping.reconcile({ mainFixPrs });
   if (!enqueues) return { reconciled, grouping: null };
+  if (mainFixPrs.length) return { reconciled, grouping: { reason: `main is red — only the repair PR(s) ${mainFixPrs.map(f => `#${f.num}`).join(', ')} land; no group forms` } };
   const result = grouping.form({ outcomes: cardGroupCandidates({ enqueueOutcomes, deferred }), verdicts });
   if (result?.reason && !/^(disabled|[01] card-only overlap deferral)/.test(result.reason)) log.write(`  card-group: no group this pass — ${result.reason}\n`);
   return { reconciled, grouping: result };
@@ -602,7 +610,7 @@ export function createCardGrouping({
     holdFor(c) {
       if (!statePath || !existsSync(statePath)) return null;
       return cardGroupHold(readGroupState(statePath, readFile), { num: c?.num, repo: c?.repo, localSlug,
-        files: c?.listedFilesComplete === true ? c.listedFiles : null });
+        files: c?.listedFilesComplete === true ? c.listedFiles : null, mainFix: c?.redMainFixPr === true });
     },
     /** A source or combined PR of a recorded group: the drain's own rebase/repair must not move its head. */
     inGroup(c) {
@@ -610,8 +618,12 @@ export function createCardGrouping({
       return inCardGroup(readGroupState(statePath, readFile), { num: c?.num, repo: c?.repo, localSlug, headRef: c?.headRef });
     },
 
-    /** Re-read active groups (throttled by reconcileSec). Never throws. */
-    reconcile({ force = false } = {}) {
+    /**
+     * Re-read active groups (throttled by reconcileSec). Never throws. `mainFixPrs` ([{num, repo?, files}]) are the
+     * pass's published main-red repair PRs: a group one of them is a source of, or whose reserved card it touches,
+     * is dissolved at once (red main holds the combined PR, so the group could only block the repair).
+     */
+    reconcile({ force = false, mainFixPrs = [] } = {}) {
       try {
         if (!repoIdentity(localSlug)) return { checked: 0, reason: 'repository identity missing' };
         if (!statePath || !existsSync(statePath)) return { checked: 0 };
@@ -620,11 +632,23 @@ export function createCardGrouping({
         // PR numbers and group IDs are repository-local, even when coordination state is shared.
         const groups = st.groups.filter(isLocalGroup);
         if (!groups.length) return { checked: 0 };
+        const fixes = (Array.isArray(mainFixPrs) ? mainFixPrs : [])
+          .filter(f => Number.isInteger(Number(f?.num)) && Number(f.num) > 0 && (!f.repo || sameRepo(f.repo, localSlug)));
+        const repairNeeds = g => {
+          for (const f of fixes) {
+            if (Number(f.num) === Number(g.pr)) continue; // the combined PR itself is never blocked by its group
+            if (g.sources?.some(s => Number(s.num) === Number(f.num))) return `published main-red repair PR #${f.num} is a source`;
+            const paths = (Array.isArray(f.files) ? f.files : []).map(p => (typeof p === 'string' ? p : p?.path)).filter(Boolean);
+            const shared = paths.find(p => (g.files ?? []).includes(p));
+            if (shared) return `published main-red repair PR #${f.num} needs reserved ${shared}`;
+          }
+          return null;
+        };
         const stampKey = repoIdentity(localSlug);
         // A stamp that is not a past time (corrupt file, clock stepped back) must not throttle forever.
         const stamp = Number(st.lastReconcileAt?.[stampKey] ?? 0);
         const fresh = Number.isFinite(stamp) && stamp <= now() && now() - stamp < setting.reconcileSec * 1000;
-        if (!force && fresh) return { checked: 0, throttled: true };
+        if (!force && fresh && !groups.some(repairNeeds)) return { checked: 0, throttled: true };
         if (dryRun) return { checked: 0, dryRun: true };
         mutate(s => { s.lastReconcileAt = { ...s.lastReconcileAt, [stampKey]: now() }; });
         const done = [], dissolved = [];
@@ -672,8 +696,9 @@ export function createCardGrouping({
             done.push(g.id);
             continue;
           }
-          let why = null;
-          if (pr.state === 'CLOSED') why = 'combined PR closed without merging';
+          let why = repairNeeds(g);
+          if (why) { /* the repair outranks the group */ }
+          else if (pr.state === 'CLOSED') why = 'combined PR closed without merging';
           else if (labelNames(pr.labels).some(l => l === 'review:changes' || l === 'review:human')) why = `combined PR sent back (${labelNames(pr.labels).filter(l => l === 'review:changes' || l === 'review:human').join(', ')})`;
           else if (requiredFailed(pr)) why = 'combined PR failed the required check';
           else if (String(pr.mergeable || '').toUpperCase() === 'CONFLICTING') why = 'combined PR conflicts with main';

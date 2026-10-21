@@ -222,7 +222,7 @@ export function createDrainMergeStrategy({
     const path = resolveCardGroupStatePath(env);
     if (!path || !existsSync(path)) return null;
     return pureCardGroupHold(readGroupState(path), { num: c?.num, repo: c?.repo || localSlug, localSlug,
-      files: c?.listedFilesComplete === true ? c.listedFiles : null });
+      files: c?.listedFilesComplete === true ? c.listedFiles : null, mainFix: c?.redMainFixPr === true });
   },
 } = {}) {
   const { policy, note } = resolved;

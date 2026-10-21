@@ -6236,6 +6236,9 @@ async function runCli() {
             ? decideQuarantineHold({ num: v.num, files: filesOf(v.num), signal: sig, list: qList, fixFiles, now: Date.now() })
             : decideRedMainHold({ num: v.num, isLocal: isLocalRepo(v.repo), signal: sig, setting: 'on' });
           if (d.hold) { v.decision = 'skip'; v.reason = freeze.frozen ? `${RED_MAIN_HOLD_REASON}: ${freeze.reason}; ${d.reason}` : d.reason; v.redMainHold = true; held++; }
+          // xym8nt4 — the published repair PR is never held by a card group (red main holds the combined PR, so a
+          // group hold would deadlock both); runCardGroupPass dissolves any group it needs.
+          else if (isLocalRepo(v.repo) && sig.fixPrs.includes(Number(v.num))) v.redMainFixPr = true;
         }
         if (!AS_JSON) process.stderr.write(`  🛑 ${RED_MAIN_HOLD_REASON}: main red [${sig.sources.join('+')}] mode ${mode.value} — fix PR(s) ${sig.fixPrs.map((n) => `#${n}`).join(', ') || '(none published)'} allowed, ${held} other PR(s) held (setting ${holdSetting.value} via ${holdSetting.source})\n`);
       }
