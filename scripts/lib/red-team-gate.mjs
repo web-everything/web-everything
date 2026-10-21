@@ -539,13 +539,11 @@ function operatorRuled(records, pr, head) {
     const cap = gates.filter(r => r.gate.outcome === GATE_OUTCOMES.ROUND_CAP).sort(threadOrder).at(-1);
     const cleared = lastAt(rs, r => !r.from && CLEAR_HUMAN_RULING_RE.test(recordBody(r).replace(/\r\n/g, '\n').trimStart())
       && parseLatestHumanClearedSha([r.c]) === sha);
-    // A cap that names this result id already decided it: posting an identical copy later (a saved result's comment)
-    // keeps the ruling. A legacy cap without a name, or a saved result of unknown chronology, needs the ruling after
-    // the result itself.
-    const named = cap?.gate.result === want && Number.isFinite(result.at);
     // A clearance cannot approve a later send-back, even if an older/unknown grant snapshot leaves the cap winning.
     // This also keeps existing send-backs held while persisted grant identities migrate to a reader-independent key.
-    if (cap && cleared && (cleared.at > result.at || named) && gates.every(r =>
+    // (unfreeze-review-top-1021: the stack's `named` exception — a ruling standing before a later identical copy of a
+    // saved result — is dropped; the stricter rule wins, so such a copy needs the ruling again.)
+    if (cap && cleared && cleared.at > result.at && gates.every(r =>
       ![GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK].includes(r.gate.outcome) || cleared.at > r.at)) return true;
     // A ruling inherited through a carry cannot approve this head's own later gate decisions.
     if (gates.some(r => !r.from && [GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK].includes(r.gate.outcome))) return false;
