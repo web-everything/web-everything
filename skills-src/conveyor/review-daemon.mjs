@@ -78,8 +78,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { hostname } from 'node:os';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents, isConflictingPr } from '../../scripts/conveyor/reconcile-pass.mjs';
-import { promoteDraftsThenReplan, promoteDraftsGuarded, rearmStaleAcceptsThenReplan } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
-import { defaultRearmStaleAcceptance } from '../../scripts/operations/promote-draft-pr-dispatch.mjs'; // #5771: the daemon that plans a stale-accept re-arm executes it
+import { promoteDraftsThenReplan, promoteDraftsGuarded, rearmStaleAcceptanceGuarded, rearmStaleAcceptsThenReplan } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
 import { notifyReferralHold } from '../../scripts/conveyor/review-referral-hold.mjs';
 // card x29vm8a — a scope-bloated PR (stale base) is refreshed onto main through the SAME mechanical path the ci-red
 // recovery watch uses, once per head, before any review reads its diff.
@@ -379,7 +378,7 @@ export function runReviewTick({
   notePromotions = null,
   // #5771 — `({repo, pr, headSha}) => {ok, reason}`: execute this pass's `restore-review-label` stale-accept rows through
   // the guarded re-arm, then re-plan so the new head's review goes out THIS pass. `null` (the default) keeps every
-  // existing caller unchanged; the real daemon wires `defaultRearmStaleAcceptance`. `noteRearms` reports the rows.
+  // existing caller unchanged; the real daemon wires `rearmStaleAcceptanceGuarded`. `noteRearms` reports the rows.
   rearmStaleAccepts = null,
   noteRearms = null,
   onPlan = null,
@@ -1106,7 +1105,7 @@ export function buildCliDaemonEffects({
       refreshScopeBloat: refreshScopeBloatedPr,
       postRefreshMarker: defaultPostRebaseComment,
       promoteDrafts: promoteDraftsGuarded,
-      rearmStaleAccepts: ({ repo, pr, headSha }) => defaultRearmStaleAcceptance({ repoSlug: repo, prNumber: pr, headSha }),
+      rearmStaleAccepts: rearmStaleAcceptanceGuarded,
       noteRearms: ({ repo, rearms, replanError }) => {
         for (const r of rearms) log.error(`review-daemon: ${repo}#${r.pr} stale-accept re-arm ${r.ok ? 'done' : 'refused'} — ${String(r.why ?? '').replace(/\s+/g, ' ').slice(0, 300)}`);
         if (replanError) log.error(`review-daemon: ${repo} post-re-arm re-plan failed (review goes out next pass): ${replanError}`);
