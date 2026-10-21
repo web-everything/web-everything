@@ -104,13 +104,9 @@ export function resolveGhAuthPolicy({ daemon = false, platform = {}, tool = {}, 
   return { personalFallback, source: { personalFallback: source } };
 }
 
-/**
- * Resolve the separate ghAuth namespace; existing github.* policy remains unchanged.
- * `envOverride: false` leaves out WE_GH_AUTH_PERSONAL_FALLBACK, for a policy written into a file that
- * other processes run (the gh shim reads that variable from each caller at run time).
- */
-export function readGhAuthPolicy({ daemon = false, env = process.env, read = readSettings, envOverride = true } = {}) {
+/** Resolve the separate ghAuth namespace; existing github.* policy remains unchanged. */
+export function readGhAuthPolicy({ daemon = false, env = process.env, read = readSettings } = {}) {
   let tool = {};
   try { tool = read()?.ghAuth ?? {}; } catch { /* default */ }
-  return resolveGhAuthPolicy({ daemon, platform: platformPreference('ghAuth', { env }) ?? {}, tool, env: envOverride ? env : {} });
+  return resolveGhAuthPolicy({ daemon, platform: platformPreference('ghAuth', { env }) ?? {}, tool, env });
 }

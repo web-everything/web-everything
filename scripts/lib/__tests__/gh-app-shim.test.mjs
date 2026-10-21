@@ -27,7 +27,6 @@ import {
   buildGhShimSettingsEnv, looksLikeAppTokenAuthFailure, ensureSettingsFileEnv, ensureSettingsFilePermissions, sanitizeSpawnEnv,
   defaultGhThrottleCliPath, checkoutShimDir, shimCallerScriptFromCommand, isDaemonCaller, defaultGithubAppRefreshCliPath,
 } from '../gh-app-shim.mjs';
-import { readGhAuthPolicy } from '../github-auth-policy.mjs';
 
 const CONFIGURED_ENV = {
   WE_GITHUB_APP_ID: '5037855',
@@ -1189,27 +1188,56 @@ require(${JSON.stringify(shim)});
     expect(env.PATH).toContain('/fixture/shim');
   });
 
-  // PR #5729 red team: every daemon of a checkout runs the same shim file. One caller's process-local
-  // WE_GH_AUTH_PERSONAL_FALLBACK must not be written into it; the shim reads that variable per call.
-  it.each(['allow', 'refuse'])('does not bake a caller WE_GH_AUTH_PERSONAL_FALLBACK=%s into the shared shim', (override) => {
-    const writeFile = vi.fn();
-    const callerEnv = { WE_GH_DAEMON_CALLER: 'caller-b', HOME: '/fixture/home' };
-    buildGhShimSettingsEnv({ env: { ...callerEnv, WE_GH_AUTH_PERSONAL_FALLBACK: override },
-      identity: { anyConfigured: false, roles: {} }, pathEnv: '/usr/bin', dir: '/fixture/shim',
-      exists: () => true, writeFile, chmod() {}, mkdir() {},
+  // PR #5729 red team: many processes write one shim dir (keyed by the throttle path), so a writer's own env or
+  // checkout must not decide the fallback policy every other daemon then runs. The shim reads
+  // WE_GH_AUTH_PERSONAL_FALLBACK from each caller at run time instead.
+  describe('shared shim fallback policy', () => {
+    const owner = (ghAuth) => {
+      const root = mkdtempSync(join(tmpdir(), 'gh-shim-owner-'));
+      mkdirSync(join(root, 'scripts', 'settings'), { recursive: true });
+      if (ghAuth) writeFileSync(join(root, 'scripts', 'settings', 'github-auth.json'), JSON.stringify({ ghAuth }));
+      const prefs = join(root, 'caller-prefs.json');
+      writeFileSync(prefs, JSON.stringify({ ghAuth: { personalFallback: 'allow' } }));
+      return { root, prefs, ghThrottleCliPath: join(root, 'scripts', 'lib', 'gh-throttle.mjs') };
+    };
+    const bake = (env, ghThrottleCliPath) => {
+      const writeFile = vi.fn();
+      buildGhShimSettingsEnv({ env: { WE_GH_DAEMON_CALLER: 'caller', ...env }, identity: { anyConfigured: false, roles: {} },
+        pathEnv: '/usr/bin', dir: '/fixture/shim', ghThrottleCliPath, exists: () => true, writeFile, chmod() {}, mkdir() {} });
+      return writeFile.mock.calls.find(([path]) => path === '/fixture/shim/gh')[1];
+    };
+    const policyOf = (src) => JSON.parse(/const PERSONAL_FALLBACK_POLICY = (.*);/.exec(src)[1]);
+
+    it('bakes the same shim for callers whose fallback env differs', () => {
+      const o = owner({ personalFallback: 'refuse' });
+      try {
+        const plain = bake({}, o.ghThrottleCliPath);
+        expect(bake({ WE_GH_AUTH_PERSONAL_FALLBACK: 'allow' }, o.ghThrottleCliPath)).toBe(plain);
+        expect(bake({ WE_PLATFORM_PREFERENCES_FILE: o.prefs }, o.ghThrottleCliPath)).toBe(plain);
+        expect(policyOf(plain)).toEqual({ personalFallback: 'refuse', source: { personalFallback: 'tool' } });
+      } finally { rmSync(o.root, { recursive: true, force: true }); }
     });
-    const src = writeFile.mock.calls.find(([path]) => path === '/fixture/shim/gh')[1];
-    const baked = JSON.parse(/const PERSONAL_FALLBACK_POLICY = (.*);/.exec(src)[1]);
-    expect(baked.source.personalFallback).not.toBe('env');
-    expect(baked).toEqual(readGhAuthPolicy({ daemon: true, env: callerEnv }));
+
+    it.each(['allow', 'refuse'])('takes the tool policy from the checkout that owns the shim (%s), not the writer', (value) => {
+      const o = owner({ personalFallback: value });
+      try {
+        expect(policyOf(bake({}, o.ghThrottleCliPath))).toEqual({ personalFallback: value, source: { personalFallback: 'tool' } });
+      } finally { rmSync(o.root, { recursive: true, force: true }); }
+    });
+
+    it('does not bake the rendering process env by default', () => {
+      const o = owner({ personalFallback: 'refuse' });
+      vi.stubEnv('WE_GH_AUTH_PERSONAL_FALLBACK', 'allow');
+      vi.stubEnv('WE_PLATFORM_PREFERENCES_FILE', o.prefs);
+      try {
+        const src = renderGhShimScript({ realGhPath: '/fixture/real-gh', cachePath: '/fixture/cache.json', ghThrottleCliPath: o.ghThrottleCliPath });
+        expect(policyOf(src)).toEqual({ personalFallback: 'refuse', source: { personalFallback: 'tool' } });
+      } finally { vi.unstubAllEnvs(); rmSync(o.root, { recursive: true, force: true }); }
+    });
   });
 
-  it('does not bake the rendering process WE_GH_AUTH_PERSONAL_FALLBACK by default', () => {
-    vi.stubEnv('WE_GH_AUTH_PERSONAL_FALLBACK', 'allow');
-    try {
-      const src = renderGhShimScript({ realGhPath: '/fixture/real-gh', cachePath: '/fixture/cache.json' });
-      expect(JSON.parse(/const PERSONAL_FALLBACK_POLICY = (.*);/.exec(src)[1]).source.personalFallback).not.toBe('env');
-    } finally { vi.unstubAllEnvs(); }
+  it('never resolves the real gh through a relative PATH entry', () => {
+    expect(resolveRealGhBinary({ pathEnv: '.:bin:~/bin:/usr/bin', shimDir: '/fixture/shim', exists: () => true })).toBe('/usr/bin/gh');
   });
 
   it.each([
