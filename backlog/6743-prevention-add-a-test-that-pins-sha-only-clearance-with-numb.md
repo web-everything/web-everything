@@ -1,20 +1,22 @@
 ---
+bornAs: xku9oc9
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/land-human-only-io.mjs", "we:scripts/operations/__tests__/land-human-only-io.test.mjs"]
-dateOpened: "2026-10-20"
+scope: ["we:scripts/lib/__tests__/human-clearance-carry.test.mjs", "we:scripts/lib/human-clearance-carry.mjs"]
+dateOpened: "2026-10-16"
 tags: []
 ---
 
-# Prevention — Add a branch-coverage threshold for scripts/operations/*-io.mjs in the vitest config. Alternative… (from web-everything/web-everything#5752 review)
+# Prevention — Add a test that pins SHA-only clearance with numberingOnly=false to zero proveNumbering calls and… (from web-everything/web-everything#5425 review)
 
-Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this PR's latest advisory review named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/land-human-only-io.mjs:126` — Add a branch-coverage threshold for `scripts/operations/*-io.mjs` in the vitest config. Alternatively, have the review lens require one assertion per `reasons.push` site.
+1. `we:scripts/lib/__tests__/human-clearance-carry.test.mjs:607` — Add a test that pins SHA-only clearance with `numberingOnly=false` to zero `proveNumbering` calls and a refusal. Track mutation-survivor checks for deleted tests as a review-lens item.
+2. `we:scripts/lib/human-clearance-carry.mjs:378` — Add a lint or standards rule that settings policy logs go through a once-only helper. Add a `workflowOnly` test asserting the writer call count.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5752@3c3cda0db97e6cc665630fa31a6055617f8699a4
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5425@8a45cd4aa830398ad281dded7272843df284ef75
 
 ## Acceptance
 

@@ -1,20 +1,21 @@
 ---
+bornAs: xkjei87
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/xzlh2ts-prevention-require-structured-guarantee-to-test-mappings-thr.md"]
-dateOpened: "2026-10-17"
+scope: ["we:scripts/operations/land-human-only-io.mjs", "we:scripts/operations/__tests__/land-human-only-io.test.mjs"]
+dateOpened: "2026-10-20"
 tags: []
 ---
 
-# Prevention — Make the prevention filer's dedupe compare semantic class, for example the same 'card-validation… (from web-everything/web-everything#5532 review)
+# Prevention — Add a branch-coverage threshold for scripts/operations/*-io.mjs in the vitest config. Alternative… (from web-everything/web-everything#5752 review)
 
-Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this PR's latest advisory review named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/xzlh2ts-prevention-require-structured-guarantee-to-test-mappings-thr.md:1` — Make the prevention filer's dedupe compare semantic class, for example the same 'card-validation gate for guarantee-to-test mapping' tag. Or let it fold into the nearest open prevention card above a similarity threshold.
+1. `we:scripts/operations/land-human-only-io.mjs:126` — Add a branch-coverage threshold for `scripts/operations/*-io.mjs` in the vitest config. Alternatively, have the review lens require one assertion per `reasons.push` site.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5532@17512d6a3a0be57dbcad8d4b461207f84f63bb18
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5752@3c3cda0db97e6cc665630fa31a6055617f8699a4
 
 ## Acceptance
 

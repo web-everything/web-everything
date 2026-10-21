@@ -1,20 +1,21 @@
 ---
+bornAs: xjrohrj
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/record-referral-ruling-io.mjs", "we:scripts/operations/__tests__/record-referral-ruling-io.test.mjs"]
+scope: ["we:agent-memory-src/reference-ai-subscription-plans.md"]
 dateOpened: "2026-10-16"
 tags: []
 ---
 
-# Prevention — For each new boolean setting, add a table-driven test that flips it and asserts the guarded behav… (from web-everything/web-everything#5448 review)
+# Prevention — Add a check:standards rule that every [\[name]\] wikilink in agent-memory-src resolves to an existi… (from web-everything/web-everything#5445 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/record-referral-ruling-io.mjs:134` — For each new boolean setting, add a table-driven test that flips it and asserts the guarded behaviour reverses, at the consumer rather than at the resolver.
+1. `we:agent-memory-src/reference-ai-subscription-plans.md:14` — Add a check:standards rule that every `[\[name]\]` wikilink in agent-memory-src resolves to an existing agent-memory-src/<name>.md.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5448@6277fc7dfc4b7fc6b1341d46060f2a902bd05eab
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5445@896c800b65a75b7822bec2383930c63b569c5b0b
 
 ## Acceptance
 

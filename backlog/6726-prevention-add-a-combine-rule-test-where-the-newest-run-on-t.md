@@ -1,21 +1,21 @@
 ---
+bornAs: xi69zea
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/__tests__/human-clearance-carry.test.mjs", "we:scripts/lib/human-clearance-carry.mjs"]
-dateOpened: "2026-10-16"
+scope: ["we:scripts/conveyor/main-ci-red-io.mjs", "we:scripts/conveyor/__tests__/main-ci-red-io.test.mjs"]
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Add a test that pins SHA-only clearance with numberingOnly=false to zero proveNumbering calls and… (from web-everything/web-everything#5425 review)
+# Prevention — Add a combine-rule test where the newest run on the head is cancelled and an earlier run on the s… (from web-everything/web-everything#5281 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/__tests__/human-clearance-carry.test.mjs:607` — Add a test that pins SHA-only clearance with `numberingOnly=false` to zero `proveNumbering` calls and a refusal. Track mutation-survivor checks for deleted tests as a review-lens item.
-2. `we:scripts/lib/human-clearance-carry.mjs:378` — Add a lint or standards rule that settings policy logs go through a once-only helper. Add a `workflowOnly` test asserting the writer call count.
+1. `we:scripts/conveyor/main-ci-red-io.mjs:232` — Add a combine-rule test where the newest run on the head is cancelled and an earlier run on the same head is red. Assert the PR still counts as red.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5425@8a45cd4aa830398ad281dded7272843df284ef75
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5281@e12bbd7ad5516fcc3269ec46c7e7ee66b01945aa
 
 ## Acceptance
 

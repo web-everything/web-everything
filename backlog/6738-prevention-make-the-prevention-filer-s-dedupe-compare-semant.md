@@ -1,19 +1,21 @@
 ---
+bornAs: xkf7hy1
 kind: story
-size: 2
+size: 3
+parent: "4075"
 status: open
-scope: ["we:scripts/lib/review-ci-gate-io.mjs"]
+scope: ["we:backlog/xzlh2ts-prevention-require-structured-guarantee-to-test-mappings-thr.md"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5465 (head 097ab835d)
+# Prevention — Make the prevention filer's dedupe compare semantic class, for example the same 'card-validation… (from web-everything/web-everything#5532 review)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5465 (reviewed head `097ab835da433354400cca9f5e7cd3b58f44b367`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/review-ci-gate-io.mjs:62` — (edge-case, degraded) Lazy required-check discovery overlooks a required merge-gate failure.
-   - Scenario: Both fast checks succeed, and the only red check is a required merge-gate with a genuine failure rather than a review hold. The initial ciRedOnHead call has no required set, so it excludes merge-gate and never calls readRequired. Probed result: allowed=true, requiredChecks=[], and zero required-set reads despite an available live reader naming merge-gate. With WE_REVIEW_CANCEL_ON_CI_RED=true, the publication sink also posts the verdict. Discover requirements for potentially required gate failures, then block review and void publication for a healable required red.
-   - Claude's re-check: demonstrated break
+1. `we:backlog/6245-prevention-require-structured-guarantee-to-test-mappings-thr.md:1` — Make the prevention filer's dedupe compare semantic class, for example the same 'card-validation gate for guarantee-to-test mapping' tag. Or let it fold into the nearest open prevention card above a similarity threshold.
+
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5532@17512d6a3a0be57dbcad8d4b461207f84f63bb18
 
 ## Acceptance
 

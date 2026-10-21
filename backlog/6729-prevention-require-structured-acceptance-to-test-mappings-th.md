@@ -1,4 +1,5 @@
 ---
+bornAs: xinx54f
 kind: story
 size: 3
 parent: "4075"
@@ -11,8 +12,8 @@ tags: []
 # Prevention — Require structured acceptance-to-test mappings through a deterministic card check. For this card,… (from web-everything/web-everything#5522 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/x5e50t3-dispatch-smoke-launcher-diagnostics-path-has-a-real-run-test.md:12` — Require structured acceptance-to-test mappings through a deterministic card check. For this card, plan `real_launcher_failure_writes_private_diagnostics` in `we:scripts/lib/dispatch-smoke-launch.real-run.test.mjs`, explicitly asserting real subprocess failure, allow-listed summary output, and stderr-file mode 0600, with the Vitest command recorded.
-2. `we:backlog/xh6o4xy-tighter-redaction-of-the-local-stderr-diagnostics-file.md:12` — Require structured acceptance-to-test mappings through a deterministic card check. Plan `redacts_generic_key_assignments`, `redacts_multiline_quoted_credentials`, and `redacts_tail_inside_credential` in `we:scripts/lib/daemon-rebuild/smoke-classify/redact-detail.test.mjs`, each asserting credential bytes are absent; also name a repository-qualified test exercising worker-wrapper compaction and asserting its output excludes credential bytes.
+1. `we:backlog/6214-dispatch-smoke-launcher-diagnostics-path-has-a-real-run-test.md:12` — Require structured acceptance-to-test mappings through a deterministic card check. For this card, plan `real_launcher_failure_writes_private_diagnostics` in `we:scripts/lib/dispatch-smoke-launch.real-run.test.mjs`, explicitly asserting real subprocess failure, allow-listed summary output, and stderr-file mode 0600, with the Vitest command recorded.
+2. `we:backlog/6215-tighter-redaction-of-the-local-stderr-diagnostics-file.md:12` — Require structured acceptance-to-test mappings through a deterministic card check. Plan `redacts_generic_key_assignments`, `redacts_multiline_quoted_credentials`, and `redacts_tail_inside_credential` in `we:scripts/lib/daemon-rebuild/smoke-classify/redact-detail.test.mjs`, each asserting credential bytes are absent; also name a repository-qualified test exercising worker-wrapper compaction and asserting its output excludes credential bytes.
 
 Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 3 → #5360, finding 4 → #5360.
 

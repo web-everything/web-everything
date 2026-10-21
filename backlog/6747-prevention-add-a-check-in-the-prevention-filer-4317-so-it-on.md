@@ -1,20 +1,21 @@
 ---
+bornAs: xlc1ctk
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:agent-memory-src/reference-ai-subscription-plans.md"]
-dateOpened: "2026-10-16"
+scope: ["we:backlog/6216-prevention-a-pr-description-vs-diff-claim-check-on-behaviour.md"]
+dateOpened: "2026-10-18"
 tags: []
 ---
 
-# Prevention — Add a check:standards rule that every [\[name]\] wikilink in agent-memory-src resolves to an existi… (from web-everything/web-everything#5445 review)
+# Prevention — Add a check in the prevention filer (#4317) so it only dedupes onto an existing card when the pro… (from web-everything/web-everything#5581 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:agent-memory-src/reference-ai-subscription-plans.md:14` — Add a check:standards rule that every `[\[name]\]` wikilink in agent-memory-src resolves to an existing agent-memory-src/<name>.md.
+1. `we:backlog/6216-prevention-a-pr-description-vs-diff-claim-check-on-behaviour.md:56` — Add a check in the prevention filer (#4317) so it only dedupes onto an existing card when the proposed guard's target file or rule name appears in that card's scope or Acceptance. Otherwise it files a new card. Add a test with a non-matching card to confirm it files rather than dedupes.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5445@896c800b65a75b7822bec2383930c63b569c5b0b
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5581@cd61e54db45b52079b25f13a9bca498fb17dec16
 
 ## Acceptance
 

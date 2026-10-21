@@ -1,22 +1,22 @@
 ---
+bornAs: xkrewbv
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/ruling-resolved-stand-down.mjs", "we:skills-src/conveyor/fix-agent-brief.md", "we:scripts/conveyor/__tests__/ruling-resolved-stand-down.test.mjs"]
-dateOpened: "2026-10-14"
+scope: ["we:scripts/operations/review-loop-cli.mjs", "we:scripts/operations/review-pr-io.mjs", "we:scripts/operations/__tests__/review-loop-cli.test.mjs", "we:scripts/operations/__tests__/review-pr-io.test.mjs"]
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Add a replay test of the real legacy #5246 marker with a stated expected outcome. Reword the PR d… (from web-everything/web-everything#5309 review)
+# Prevention — Run the existing review-loop text-output tests under the production default policy. This is the 6… (from web-everything/web-everything#5393 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/ruling-resolved-stand-down.mjs:36` — Add a replay test of the real legacy #5246 marker with a stated expected outcome. Reword the PR description to match.
-2. `we:scripts/conveyor/ruling-resolved-stand-down.mjs:33` — Run the resolver and `pr-status-label` over lapse-annotated comments, or add a lapse-aware variant of `latestUnresolvedStandDown`. Add a test with an older head-bound hold that has lapsed.
-3. `we:skills-src/conveyor/fix-agent-brief.md:177` — Give the brief two command blocks (bound and unbound). Make the brief test require `--finding-refs` only in the bound block.
+1. `we:scripts/operations/review-loop-cli.mjs:691` — Run the existing review-loop text-output tests under the production default policy. This is the 6167 check:standards rule, which refuses a suite-wide acceptPolicy=false override in review-loop tests.
+2. `we:scripts/operations/review-pr-io.mjs:922` — Restrict editComment targets to the automation login. A unit test should give a trusted operator-authored previous comment and expect postComment instead of editComment.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5309@7129c4501ffb44b3fdfbe32e85ea87744782ff49
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5393@f66c26236653b85615d7e463190b7947cacc520d
 
 ## Acceptance
 

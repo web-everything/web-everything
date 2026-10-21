@@ -1,20 +1,21 @@
 ---
+bornAs: xkw3a9h
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/daemon-rebuild/rebuild.mjs", "we:scripts/lib/daemon-rebuild/__tests__/rebuild.test.mjs"]
-dateOpened: "2026-10-15"
+scope: ["we:scripts/lib/bounded-child.mjs", "we:scripts/lib/__tests__/bounded-child.test.mjs"]
+dateOpened: "2026-10-18"
 tags: []
 ---
 
-# Prevention — Add a deterministic regression in we:scripts/lib/__tests__/daemon-load-overlay.test.mjs covering… (from web-everything/web-everything#5381 review)
+# Prevention — Filter out empty lines before picking the primary line, and add a summarizeStderr case with inter… (from web-everything/web-everything#5694 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/daemon-rebuild/rebuild.mjs:104` — Add a deterministic regression in we:scripts/lib/__tests__/daemon-load-overlay.test.mjs covering an already-ready candidate; verify that replacing the readyOnHead finalize options with admission options makes that named test fail.
+1. `we:scripts/lib/bounded-child.mjs:35` — Filter out empty lines before picking the primary line, and add a `summarizeStderr` case with interior blank lines. A table-driven stderr-shape test would cover this class.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5381@ad29f999f92cf3bcc51e258ded7b3b11eaca4063
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5694@8bb9acb109f6ed0e5475106e8f4581d831714e8a
 
 ## Acceptance
 

@@ -1,20 +1,21 @@
 ---
+bornAs: xlteslo
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/main-ci-red-io.mjs", "we:scripts/conveyor/__tests__/main-ci-red-io.test.mjs"]
-dateOpened: "2026-10-15"
+scope: ["we:backlog/5028-drain-and-lander-must-not-resolve-a-landed-card-whose-blocke.md"]
+dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — Add a combine-rule test where the newest run on the head is cancelled and an earlier run on the s… (from web-everything/web-everything#5281 review)
+# Prevention — Add a prepared-card lint that flags a changed user-visible message string or status guarantee whe… (from web-everything/web-everything#5327 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/main-ci-red-io.mjs:232` — Add a combine-rule test where the newest run on the head is cancelled and an earlier run on the same head is red. Assert the PR still counts as red.
+1. `we:backlog/5028-drain-and-lander-must-not-resolve-a-landed-card-whose-blocke.md:20` — Add a prepared-card lint that flags a changed user-visible message string or status guarantee when an older section of the same card still states the previous wording.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5281@e12bbd7ad5516fcc3269ec46c7e7ee66b01945aa
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5327@e2102490fe2c1f13ec07a04ea9fc2d7b854a09e7
 
 ## Acceptance
 

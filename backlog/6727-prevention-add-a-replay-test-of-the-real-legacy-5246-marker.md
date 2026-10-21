@@ -1,22 +1,23 @@
 ---
+bornAs: xij069m
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/operator-send-backs.mjs", "we:scripts/lib/__tests__/operator-send-backs.test.mjs"]
-dateOpened: "2026-10-15"
+scope: ["we:scripts/conveyor/ruling-resolved-stand-down.mjs", "we:skills-src/conveyor/fix-agent-brief.md", "we:scripts/conveyor/__tests__/ruling-resolved-stand-down.test.mjs"]
+dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — Share one canonical parseOperatorSendBackHeader between operatorFixBudget and the ledger (or deri… (from web-everything/web-everything#5356 review)
+# Prevention — Add a replay test of the real legacy #5246 marker with a stated expected outcome. Reword the PR d… (from web-everything/web-everything#5309 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/operator-send-backs.mjs:23` — Share one canonical `parseOperatorSendBackHeader` between operatorFixBudget and the ledger (or derive both from the producer), and add a table-driven test over both producer shapes.
-2. `we:scripts/lib/operator-send-backs.mjs:28` — Fall back to the head at comment time, or accept operator-authored evidence without a head comparison, and add a test that an unknown-head send-back is clearable.
-3. `we:scripts/lib/operator-send-backs.mjs:62` — Require a recorded evidence head, or another immutable association with that head, and gate resolution with a regression that advances the PR head without adding evidence.
+1. `we:scripts/conveyor/ruling-resolved-stand-down.mjs:36` — Add a replay test of the real legacy #5246 marker with a stated expected outcome. Reword the PR description to match.
+2. `we:scripts/conveyor/ruling-resolved-stand-down.mjs:33` — Run the resolver and `pr-status-label` over lapse-annotated comments, or add a lapse-aware variant of `latestUnresolvedStandDown`. Add a test with an older head-bound hold that has lapsed.
+3. `we:skills-src/conveyor/fix-agent-brief.md:177` — Give the brief two command blocks (bound and unbound). Make the brief test require `--finding-refs` only in the bound block.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5356@a33991e277ae244aea07b170bfd2caec71e89981
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5309@7129c4501ffb44b3fdfbe32e85ea87744782ff49
 
 ## Acceptance
 

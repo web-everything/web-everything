@@ -1,20 +1,21 @@
 ---
+bornAs: xj006fu
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/verify-dispatch.mjs", "we:scripts/conveyor/__tests__/verify-dispatch.test.mjs"]
-dateOpened: "2026-10-15"
+scope: ["we:backlog/5694-prevention-add-a-check-standards-rule-that-every-assertmainn.md"]
+dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Prevention — Mark superseded exports @deprecated and add a check:standards rule that flags new imports of them… (from web-everything/web-everything#5378 review)
+# Prevention — Preparation check that every normative "must/preserve/retain" sentence in Design maps to a named… (from web-everything/web-everything#5517 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/verify-dispatch.mjs:151` — Mark superseded exports `@deprecated` and add a check:standards rule that flags new imports of them. Or have the gate-ceiling resolver take the admission decision that rebuild smoke already uses.
+1. `we:backlog/5694-prevention-add-a-check-standards-rule-that-every-assertmainn.md:79` — Preparation check that every normative "must/preserve/retain" sentence in Design maps to a named test case ID in Acceptance or Test plan, failing the card stamp if a sentence is unmapped.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5378@4f538e23c3f4a33b5d80754ca0320304ddfe1b95
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5517@c1be98a2daebd90fd77afcf63f36f7520e19fc91
 
 ## Acceptance
 

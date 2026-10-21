@@ -1,20 +1,23 @@
 ---
+bornAs: xllkd2p
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/bounded-child.mjs", "we:scripts/lib/__tests__/bounded-child.test.mjs"]
+scope: ["we:backlog/6247-we-ci-artifact-uploads-never-fail-a-merge-group-run.md"]
 dateOpened: "2026-10-18"
 tags: []
 ---
 
-# Prevention — Filter out empty lines before picking the primary line, and add a summarizeStderr case with inter… (from web-everything/web-everything#5694 review)
+# Prevention — Add a card-template lens or checklist item: when a card changes a producer step, name the consume… (from web-everything/web-everything#5552 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+1. `we:backlog/6247-we-ci-artifact-uploads-never-fail-a-merge-group-run.md:14` — Add a card-template lens or checklist item: when a card changes a producer step, name the consumer steps and state their behaviour on a missing input. A deterministic gate is not practical for this class.
+2. `we:backlog/6247-we-ci-artifact-uploads-never-fail-a-merge-group-run.md:17` — Add a deterministic workflow check that rejects retry-only upload handling unless exhausted retries are explicitly nonfatal.
 
-1. `we:scripts/lib/bounded-child.mjs:35` — Filter out empty lines before picking the primary line, and add a `summarizeStderr` case with interior blank lines. A table-driven stderr-shape test would cover this class.
+Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 2 → #6023, finding 3 → #5360, finding 5 → #5360.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5694@8bb9acb109f6ed0e5475106e8f4581d831714e8a
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5552@d42b624fb216d196b21e8dff9c931dd6e00107da
 
 ## Acceptance
 

@@ -1,20 +1,21 @@
 ---
+bornAs: xl5acsz
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/6216-prevention-a-pr-description-vs-diff-claim-check-on-behaviour.md"]
-dateOpened: "2026-10-18"
+scope: ["we:scripts/conveyor/verify-dispatch.mjs", "we:scripts/conveyor/__tests__/verify-dispatch.test.mjs"]
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Add a check in the prevention filer (#4317) so it only dedupes onto an existing card when the pro… (from web-everything/web-everything#5581 review)
+# Prevention — Mark superseded exports @deprecated and add a check:standards rule that flags new imports of them… (from web-everything/web-everything#5378 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/6216-prevention-a-pr-description-vs-diff-claim-check-on-behaviour.md:56` — Add a check in the prevention filer (#4317) so it only dedupes onto an existing card when the proposed guard's target file or rule name appears in that card's scope or Acceptance. Otherwise it files a new card. Add a test with a non-matching card to confirm it files rather than dedupes.
+1. `we:scripts/conveyor/verify-dispatch.mjs:151` — Mark superseded exports `@deprecated` and add a check:standards rule that flags new imports of them. Or have the gate-ceiling resolver take the admission decision that rebuild smoke already uses.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5581@cd61e54db45b52079b25f13a9bca498fb17dec16
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5378@4f538e23c3f4a33b5d80754ca0320304ddfe1b95
 
 ## Acceptance
 

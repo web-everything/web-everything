@@ -1,20 +1,21 @@
 ---
+bornAs: xkqltfx
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5694-prevention-add-a-check-standards-rule-that-every-assertmainn.md"]
-dateOpened: "2026-10-17"
+scope: ["we:scripts/lib/daemon-rebuild/rebuild.mjs", "we:scripts/lib/daemon-rebuild/__tests__/rebuild.test.mjs"]
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Preparation check that every normative "must/preserve/retain" sentence in Design maps to a named… (from web-everything/web-everything#5517 review)
+# Prevention — Add a deterministic regression in we:scripts/lib/__tests__/daemon-load-overlay.test.mjs covering… (from web-everything/web-everything#5381 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/5694-prevention-add-a-check-standards-rule-that-every-assertmainn.md:79` — Preparation check that every normative "must/preserve/retain" sentence in Design maps to a named test case ID in Acceptance or Test plan, failing the card stamp if a sentence is unmapped.
+1. `we:scripts/lib/daemon-rebuild/rebuild.mjs:104` — Add a deterministic regression in we:scripts/lib/__tests__/daemon-load-overlay.test.mjs covering an already-ready candidate; verify that replacing the readyOnHead finalize options with admission options makes that named test fail.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5517@c1be98a2daebd90fd77afcf63f36f7520e19fc91
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5381@ad29f999f92cf3bcc51e258ded7b3b11eaca4063
 
 ## Acceptance
 
