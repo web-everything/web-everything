@@ -6220,6 +6220,11 @@ and #4284. Full reasoning: [#3216](/backlog/3216-revisit-the-ledger-write-miss-p
 These are already enforced/written elsewhere; listed here so the platform's rules are findable from
 one place:
 
+- **Standing ruling — automatic +1 review round for card-only PRs** (operator 2026-10-19, confirmed 2026-10-20,
+  capped at 3 per PR) → recorded as operator-authored issue
+  [web-everything/web-everything#5751](https://github.com/web-everything/web-everything/issues/5751); enforced by
+  `scripts/conveyor/standing-ruling-mark.mjs` + `round-extension-mark.mjs` (close the issue to revoke).
+
 - **Design-first / materialization** → [design-first.md](design-first.md): document in JSON/njk
   before implementing; plan → discrete homes (reports + JSON + research topics).
 - **Native-first default; config extends a platform default** → [conventions.md](conventions.md),

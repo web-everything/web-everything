@@ -35,12 +35,13 @@ export function postAcceptRedTeamOwed(loopPayload, env = process.env, evidence =
     evidence: { ...evidence, scheduled: evidence.scheduled || panel }, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly });
 }
 
-export function redTeamEnqueueHold({ loopPayload, comments, repo, pr, head, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false, attempted = false, requestPending = false, skipCardOnly, realFilesCardOnly = false, queued = false } = {}) {
+export function redTeamEnqueueHold({ loopPayload, comments, repo, pr, head, standingRuling = null, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false, attempted = false, requestPending = false, skipCardOnly, realFilesCardOnly = false, queued = false } = {}) {
   // A recorded break still holds even if the scheduler is now disabled or the payload is unavailable.
-  let disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks, repo });
+  // `standingRuling`: the verified scope, so an automatic grant counts here exactly as in the gate (PR #5758).
+  let disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks, repo, standingRuling });
   if (!disposition.result) {
     const savedResult = savedRedTeamFallback({ repo, pr, head, env })();
-    if (savedResult) disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks, savedResult, repo });
+    if (savedResult) disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks, savedResult, repo, standingRuling });
   }
   if (disposition.sendBack.length || disposition.held.length)
     return 'post-accept red team confirmed a break requiring send-back';
