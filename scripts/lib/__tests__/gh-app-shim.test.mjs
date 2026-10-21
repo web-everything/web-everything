@@ -1209,12 +1209,13 @@ require(${JSON.stringify(shim)});
     const policyOf = (src) => JSON.parse(/const PERSONAL_FALLBACK_POLICY = (.*);/.exec(src)[1]);
 
     it('bakes the same shim for callers whose fallback env differs', () => {
-      const o = owner({ personalFallback: 'refuse' });
+      // No tool setting: a writer's env or platform file would otherwise outrank the default and leak in.
+      const o = owner(null);
       try {
         const plain = bake({}, o.ghThrottleCliPath);
         expect(bake({ WE_GH_AUTH_PERSONAL_FALLBACK: 'allow' }, o.ghThrottleCliPath)).toBe(plain);
         expect(bake({ WE_PLATFORM_PREFERENCES_FILE: o.prefs }, o.ghThrottleCliPath)).toBe(plain);
-        expect(policyOf(plain)).toEqual({ personalFallback: 'refuse', source: { personalFallback: 'tool' } });
+        expect(policyOf(plain)).toEqual({ personalFallback: 'refuse', source: { personalFallback: 'default' } });
       } finally { rmSync(o.root, { recursive: true, force: true }); }
     });
 
@@ -1236,14 +1237,22 @@ require(${JSON.stringify(shim)});
       } finally { rmSync(o.root, { recursive: true, force: true }); }
     });
 
-    it('does not bake the rendering process env by default', () => {
-      const o = owner({ personalFallback: 'refuse' });
-      vi.stubEnv('WE_GH_AUTH_PERSONAL_FALLBACK', 'allow');
-      vi.stubEnv('WE_PLATFORM_PREFERENCES_FILE', o.prefs);
+    // No tool setting in the owner, so a leaked env or platform layer would win and change the baked policy.
+    it.each(['WE_GH_AUTH_PERSONAL_FALLBACK', 'WE_PLATFORM_PREFERENCES_FILE'])('does not bake the rendering process %s by default', (name) => {
+      const o = owner(null);
+      vi.stubEnv(name, name === 'WE_PLATFORM_PREFERENCES_FILE' ? o.prefs : 'allow');
       try {
         const src = renderGhShimScript({ realGhPath: '/fixture/real-gh', cachePath: '/fixture/cache.json', ghThrottleCliPath: o.ghThrottleCliPath });
-        expect(policyOf(src)).toEqual({ personalFallback: 'refuse', source: { personalFallback: 'tool' } });
+        expect(policyOf(src)).toEqual({ personalFallback: 'refuse', source: { personalFallback: 'default' } });
       } finally { vi.unstubAllEnvs(); rmSync(o.root, { recursive: true, force: true }); }
+    });
+
+    it('bakes the refresh CLI of the checkout that owns the shim, not the writer', () => {
+      const o = owner(null);
+      try {
+        const src = renderGhShimScript({ realGhPath: '/fixture/real-gh', cachePath: '/fixture/cache.json', ghThrottleCliPath: o.ghThrottleCliPath });
+        expect(JSON.parse(/const APP_REFRESH_CLI = (.*);/.exec(src)[1])).toBe(join(o.root, 'scripts', 'lib', 'github-app-refresh-cli.mjs'));
+      } finally { rmSync(o.root, { recursive: true, force: true }); }
     });
   });
 
