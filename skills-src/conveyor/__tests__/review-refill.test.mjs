@@ -112,6 +112,17 @@ describe('aborted and skipped passes', () => {
     freeSlot(h); h.fire();
     expect(h.reads).toEqual([]);
   });
+  it('a successful pass followed by an aborted pass leaves no queue and no would-dispatch', async () => {
+    const h = rig();
+    await runPass(h);
+    expect(h.r._state().queue).not.toBeNull();
+    await expect(h.r.guardPass(async () => { throw new Error('abort'); })).rejects.toThrow('abort');
+    expect(h.r._state().queue).toBeNull();
+    freeSlot(h); h.fire();
+    expect(h.reads).toEqual([]);
+    expect(h.logs.some((l) => l.includes('would dispatch'))).toBe(false);
+    expect(h.r.lock.holder()).toBeNull();
+  });
   it('plans captured before a pass starts are dropped when the next pass begins', async () => {
     const h = rig();
     h.r.tapPlan(null)({ repo: 'o/r', plan: { dispatch: [{ kind: 'review', prNumber: 2 }] }, rawPrs: [{ number: 2, headRefOid: HEAD(2) }] });

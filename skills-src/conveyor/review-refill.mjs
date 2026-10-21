@@ -269,6 +269,9 @@ export function createReviewRefill({
       // HERE, while the plans are still held, so a successful pass always leaves its queue behind.
       try { notePass(out); } catch { /* doubt: no queue */ }
       return out;
+    } catch (e) {
+      queue = null; // an aborted pass is doubt: an older queue is not trusted either
+      throw e;
     } finally { planning = new Map(); release(); } // an aborted pass leaves nothing behind
   }
 
