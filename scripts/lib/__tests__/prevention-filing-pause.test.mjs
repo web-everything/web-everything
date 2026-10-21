@@ -18,6 +18,10 @@ const standard = { enabled: true, maxCards: 10, maxAgeMinutes: 120 };
 const paused = () => resolvePreventionBatchSettings({ standard, repo: { filingEnabled: false } });
 const input = { title: 'Guard', kind: 'story', size: '1', digest: 'guard', scope: 'we:scripts/', queue: 'true', session: 'unit' };
 describe('independent prevention filing pause', () => {
+  it('ships filingEnabled=true in the declared repo settings (operator 2026-10-21, capped drain live)', () => {
+    const shipped = JSON.parse(readFileSync(new URL('../../settings/prevention-batch.json', import.meta.url), 'utf8'));
+    expect(shipped.prevention.filingEnabled).toBe(true);
+  });
   it('defaults on without changing the independent batch switch', () => {
     expect(resolvePreventionBatchSettings({ standard, repo: { batchFiling: false } }))
       .toMatchObject({ filingEnabled: true, batchFiling: false, sources: { filingEnabled: 'standard' } });
