@@ -69,9 +69,21 @@ export const OUTBOX_LOCK_PATH = 'verdict-ledger-flusher';
 /** Same blob cap as the reader (`verdict-ledger-io.mjs#DEFAULT_LEDGER_READ_MAX_BYTES`). */
 const BLOB_MAX_BYTES = 64 * 1024 * 1024;
 const ENTRY_RE = /^\d{15}-\d+-[0-9a-f]+\.json$/;
-const CONTENTION_RE = /fetch first|non-fast-forward|cannot lock ref|incorrect old value|stale info/i;
-/** The remote ANSWERED and refused this push: proof it did not land (a lost race, a hook, protection, permissions). */
-const DEFINITIVE_REJECTION_RE = /\[(remote )?rejected\]/i;
+/**
+ * What a FAILED push proves, read ONLY from git's own per-ref status line (`! [rejected] … (fetch first)`,
+ * `! [remote rejected] … (hook declined)`); our push names exactly one ref, so any status line is about it. Free text
+ * anywhere else (a `remote:` line that happens to say "cannot lock ref") proves nothing (audit round 4).
+ *   'race'    — refused because the tip moved: provably not landed; refetch and retry.
+ *   'refused' — refused for another reason (hook, protection, permissions): provably not landed; do not retry.
+ *   'unknown' — no status line: the remote may or may not hold it.
+ */
+const STATUS_LINE_RE = /!\s*\[(remote rejected|rejected)\]([^\n|]*)/i;
+const RACE_REASON_RE = /fetch first|non-fast-forward|stale info|cannot lock ref|incorrect old value/i;
+export function classifyPushFailure(e) {
+  const m = STATUS_LINE_RE.exec(`${e?.stderr ?? ''}\n${e?.message ?? ''}`);
+  if (!m) return 'unknown';
+  return RACE_REASON_RE.test(m[2]) ? 'race' : 'refused';
+}
 
 /** A push-phase failure of the flush. `results` holds the entries that DID land before it. */
 export class OutboxFlushError extends Error {
@@ -202,7 +214,10 @@ export function enqueueOutboxEntry(dir, entry, { now = Date.now, log = defaultLo
   }
   // Visible to flushers from the rename on, so it can no longer be reported "not queued"; a crash before the next
   // flush could still lose it, which is a write miss and is said so.
-  try { fsyncDir(dir); } catch (e) { log(`ledger-write-miss: verdict-ledger outbox directory fsync of ${dir} failed after queuing ${name} (${e?.message ?? e}); the entry is queued but may not survive a host crash`); }
+  // EVERY enqueue syncs the entry's directory AND its two ancestors (audit round 4: another writer may have created
+  // the hierarchy and not synced it yet; existence proves nothing about durability).
+  try { for (const d of [dir, dirname(dir), dirname(dirname(dir))]) fsyncDir(d); }
+  catch (e) { log(`ledger-write-miss: verdict-ledger outbox directory fsync under ${dir} failed after queuing ${name} (${e?.message ?? e}); the entry is queued but may not survive a host crash`); }
   return name;
 }
 
@@ -426,9 +441,18 @@ function flushHeld(o) {
 }
 
 function flushHeldInner({ board, branch, dir, owner, run: rawRun, now, sleep, random, log, budgetMs, onRetry, removeEntry, allowRef, originKey, results, inMemory = [] }) {
-  // ONE deadline bounds every git call too: no single fetch or push may outlive the flush budget.
+  // ONE absolute deadline bounds every git call and every retry (audit round 4): no call starts once it has passed,
+  // and none may run past it.
   const hardDeadline = Date.now() + budgetMs;
-  const run = (args, opts = {}) => rawRun(args, { timeout: Math.max(5_000, Math.min(GIT_CALL_TIMEOUT_MS, hardDeadline - Date.now())), ...opts });
+  const run = (args, opts = {}) => {
+    const left = hardDeadline - Date.now();
+    if (left <= 0) {
+      const e = new Error(`verdict-ledger-outbox: flush budget ${budgetMs}ms spent before git ${args[0]}`);
+      e.budget = true;
+      throw e;
+    }
+    return rawRun(args, { timeout: Math.max(1_000, Math.min(GIT_CALL_TIMEOUT_MS, left)), ...opts });
+  };
   const errors = [];
   let attempts = 0;
   let pushed = false;
@@ -468,9 +492,12 @@ function flushHeldInner({ board, branch, dir, owner, run: rawRun, now, sleep, ra
         break;
       } catch (e) {
         errors.push(e);
-        const text = `${e?.message ?? e}\n${e?.stderr ?? ''}`;
-        const race = CONTENTION_RE.test(text);
-        if (!race && e?.phase === 'publish' && !DEFINITIVE_REJECTION_RE.test(text)) {
+        const verdictOf = e?.phase === 'publish' ? classifyPushFailure(e) : 'pre-push';
+        const race = verdictOf === 'race';
+        if (e?.budget) {
+          throw new OutboxFlushError(String(e.message), { errors, attempts, results, kind: 'budget' });
+        }
+        if (verdictOf === 'unknown') {
           // A TRANSPORT failure during the push (no answer from the remote): it may have landed, or may still land
           // (audit round 2: a negative reconcile right now proves nothing). Only a positive reconcile is a verdict.
           const verdict = reconcilePush({ board, branch, run, commit: e.commit });
@@ -482,14 +509,19 @@ function flushHeldInner({ board, branch, dir, owner, run: rawRun, now, sleep, ra
           throw new OutboxFlushError(`verdict-ledger-outbox: push outcome UNKNOWN (no answer from the remote): ${String(e?.message ?? e).split('\n')[0]}`,
             { errors, attempts, results, kind: 'ambiguous' });
         }
-        if (!race || now() >= deadline) {
-          const why = race ? `flush budget ${budgetMs}ms exhausted` : 'non-retryable';
+        const spent = now() >= deadline || Date.now() >= hardDeadline;
+        if (!race || spent) {
+          const why = race ? `flush budget ${budgetMs}ms exhausted` : (verdictOf === 'refused' ? 'refused by the remote' : 'non-retryable');
           throw new OutboxFlushError(`verdict-ledger-outbox: flush of ${entries.length} entr${entries.length === 1 ? 'y' : 'ies'} failed (${why}): ${String(e?.message ?? e).split('\n')[0]}`,
-            { errors, attempts, results });
+            { errors, attempts, results, kind: race ? 'budget' : 'flush' });
         }
         if (onRetry) onRetry({ attempt: attempts, error: e });
         log(`verdict-ledger-outbox: push lost a race, refetching (${String(e?.message ?? e).split('\n')[0].slice(0, 300)})`);
-        sleep(Math.min(250 * 2 ** (retry - 1), 4000) + Math.floor(random() * 500));
+        const pause = Math.min(250 * 2 ** (retry - 1), 4000) + Math.floor(random() * 500);
+        sleep(Math.max(0, Math.min(pause, hardDeadline - Date.now())));
+        if (now() >= deadline || Date.now() >= hardDeadline) {
+          throw new OutboxFlushError(`verdict-ledger-outbox: flush budget ${budgetMs}ms exhausted after a lost race`, { errors, attempts, results, kind: 'budget' });
+        }
       }
     }
     pushed = pushed || landed.pushed;
@@ -596,6 +628,33 @@ export function flushBoardLedgerOutbox({ board, env = process.env, log = default
   }
 }
 
+/**
+ * THE DAEMON TICK BACKSTOP (audit round 4: board discovery itself probed git synchronously in the tick). The tick does
+ * NO git and NO discovery: at most once per `intervalMs` it starts ONE detached child that resolves the ledger boards
+ * and flushes each board's outbox. Overlapping children are harmless (the flusher lock is non-blocking). Never throws.
+ */
+export const DEFAULT_BACKSTOP_INTERVAL_MS = 5 * 60_000;
+let lastBackstopAt = -Infinity;
+export function spawnLedgerOutboxBackstop({ repos = [], intervalMs = DEFAULT_BACKSTOP_INTERVAL_MS, now = Date.now, spawnFn = spawn, log = defaultLog, env = process.env } = {}) {
+  const t = now();
+  if (t - lastBackstopAt < intervalMs) return { ok: true, flushed: 0, skipped: 'throttled' };
+  lastBackstopAt = t;
+  try {
+    const child = spawnFn(process.execPath, [THIS_FILE, 'flush-repos', `--repos=${repos.join(',')}`], { detached: true, stdio: ['ignore', 'ignore', 'inherit'], env });
+    child.on?.('error', (e) => {
+      try { log(`ledger-write-miss: verdict-ledger outbox backstop failed to start (${e?.message ?? e}); queued entries wait for the next append or tick`); } catch { /* never throws */ }
+    });
+    child.unref?.();
+    return { ok: true, flushed: 0, spawned: true, pid: child.pid ?? null, repos: repos.length };
+  } catch (e) {
+    const msg = `ledger-write-miss: verdict-ledger outbox backstop could not start (${String(e?.message ?? e).split('\n')[0]})`;
+    try { log(msg); } catch { /* never throws */ }
+    return { ok: false, flushed: 0, error: msg };
+  }
+}
+/** Test seam: forget the throttle. */
+export function resetLedgerOutboxBackstopThrottle() { lastBackstopAt = -Infinity; }
+
 /** The tick's origin lookup: memoized per board, and bounded to a few seconds (audit round 3: it ran every tick). */
 const tickDirMemo = new Map();
 export const TICK_ORIGIN_TIMEOUT_MS = 5_000;
@@ -681,7 +740,7 @@ export function appendViaOutbox(o) {
     if (mine) {
       if (failure) c.log(`${String(failure?.message ?? failure).split('\n')[0]} (this append's own rows had already landed)`);
       outcome = { status: 'appended', queued: false, rows: mine.rows, duplicates: mine.duplicates, attempts, outboxDir: c.dir };
-    } else if (failure && failure?.kind !== 'ambiguous') {
+    } else if (failure && failure?.kind !== 'ambiguous' && failure?.kind !== 'budget') {
       // Refused, or failed before any push: provably not on the remote, and never visible to anyone else.
       toThrow = failure instanceof OutboxFlushError ? failure : new OutboxFlushError(String(failure?.message ?? failure).split('\n')[0], { errors: [failure], attempts });
     } else {
@@ -769,8 +828,7 @@ export function appendDirect(o) {
       return { status: 'appended', attempts: attempt, rows: mine.rows, duplicates: mine.duplicates };
     } catch (e) {
       errors.push(e);
-      const etext = `${e?.message ?? e}\n${e?.stderr ?? ''}`;
-      if (e?.phase === 'publish' && !CONTENTION_RE.test(etext) && !DEFINITIVE_REJECTION_RE.test(etext)) {
+      if (e?.phase === 'publish' && classifyPushFailure(e) === 'unknown') {
         if (reconcilePush({ board: c.board, branch: c.branch, run: c.run, commit: e.commit }) === true) {
           c.log(`verdict-ledger: push reported failure but ${e.commit} is on the remote; counted as landed`);
           return { status: 'appended', attempts: attempt, rows: entry.lines.length, duplicates: 0 };
@@ -804,11 +862,29 @@ function defaultGit(args, opts = {}) {
 }
 const THIS_FILE = fileURLToPath(import.meta.url);
 
-/** `node verdict-ledger-outbox.mjs flush --board=<checkout>` — the detached backstop flusher. Always exits 0. */
-if (process.argv[1] && resolve(process.argv[1]) === THIS_FILE && process.argv[2] === 'flush') {
-  const board = (process.argv.find((a) => a.startsWith('--board=')) ?? '').slice('--board='.length);
-  const r = flushBoardLedgerOutbox({ board });
-  if (r.flushed || r.ok === false) defaultLog(`verdict-ledger-outbox: backstop flush ${JSON.stringify(r)}`);
+/**
+ * The detached backstop flusher. Always exits 0.
+ *   `node verdict-ledger-outbox.mjs flush --board=<checkout>`
+ *   `node verdict-ledger-outbox.mjs flush-repos --repos=<owner/name,…>` (resolves each repo's ledger board first)
+ */
+async function runBackstopCli(argv) {
+  const arg = (k) => (argv.find((a) => a.startsWith(`--${k}=`)) ?? '').slice(k.length + 3);
+  let boards = [];
+  try {
+    if (argv[2] === 'flush') boards = [arg('board')].filter(Boolean);
+    else {
+      const { resolveLedgerBoard } = await import('./verdict-ledger.mjs');
+      boards = [...new Set(arg('repos').split(',').filter(Boolean).map((r) => { try { return resolveLedgerBoard(r); } catch { return null; } }).filter(Boolean))];
+    }
+  } catch (e) { defaultLog(`ledger-write-miss: verdict-ledger outbox backstop could not resolve its boards (${e?.message ?? e})`); }
+  for (const board of boards) {
+    const r = flushBoardLedgerOutbox({ board });
+    if (r.flushed || r.ok === false) defaultLog(`verdict-ledger-outbox: backstop flush ${JSON.stringify(r)}`);
+  }
+}
+// No top-level await: this module is imported by the io-shell, and must stay a plain synchronous module.
+if (process.argv[1] && resolve(process.argv[1]) === THIS_FILE && ['flush', 'flush-repos'].includes(process.argv[2])) {
+  runBackstopCli(process.argv).catch((e) => defaultLog(`ledger-write-miss: verdict-ledger outbox backstop crashed (${e?.message ?? e})`));
 }
 
 function defaultLog(line) { try { process.stderr.write(`${line}\n`); } catch { /* never fails a write */ } }

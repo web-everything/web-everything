@@ -19,7 +19,8 @@ import {
 } from '../verdict-ledger-io.mjs';
 import {
   flushLedgerOutbox, listOutboxEntries, outboxLockRoot, OUTBOX_LOCK_PATH, resolveOutboxSettings, formatOutboxSettings,
-  OUTBOX_ENV, OUTBOX_DIR_ENV, enqueueOutboxEntry, spawnBoardLedgerOutboxFlush,
+  OUTBOX_ENV, OUTBOX_DIR_ENV, enqueueOutboxEntry, spawnBoardLedgerOutboxFlush, spawnLedgerOutboxBackstop,
+  resetLedgerOutboxBackstopThrottle, classifyPushFailure,
 } from '../verdict-ledger-outbox.mjs';
 import { withGitErrorForTest } from '../git-transport-branch.mjs';
 import { reserve, makeLockEntry } from '../../readiness/file-locks.mjs';
@@ -320,6 +321,30 @@ describe('real git: outbox + plumbing flush', () => {
     expect(logs.join('\n')).toMatch(/ledger-write-miss: .*failed to start \(spawn EAGAIN\)/);
   });
 
+  it('only git\'s per-ref status line classifies a failed push; incidental text proves nothing (round 4)', () => {
+    const err = (stderr) => Object.assign(new Error('git push failed'), { stderr });
+    expect(classifyPushFailure(err(' ! [rejected]        abc -> ops/review-requests (fetch first)\nerror: failed to push some refs\n'))).toBe('race');
+    expect(classifyPushFailure(err(' ! [remote rejected] abc -> ops/review-requests (pre-receive hook declined)\n'))).toBe('refused');
+    expect(classifyPushFailure(err('remote: error: cannot lock ref \'refs/heads/other\'\nfatal: the remote end hung up unexpectedly\n'))).toBe('unknown');
+    expect(classifyPushFailure(err('fatal: unable to access remote\n'))).toBe('unknown');
+  });
+
+  it('an unanswered push whose noise mentions "cannot lock ref" is still UNKNOWN: kept queued, never thrown', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const outboxDir = join(ctx.tmp, 'outbox');
+      let first = true;
+      const run = (args, opts) => {
+        if (args[0] === 'push' && first) { first = false; const e = new Error('Command failed'); e.stderr = 'remote: error: cannot lock ref x\nfatal: the remote end hung up unexpectedly\n'; e.status = 128; throw e; }
+        if (args[0] === 'fetch' && !first) { const e = new Error('Command failed'); e.stderr = 'fatal: unable to access remote\n'; e.status = 128; throw e; }
+        return realGit(args, opts);
+      };
+      const r = appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(12)], outbox: true, outboxDir, gitRun: run, log: quiet });
+      expect(r).toMatchObject({ status: 'appended', queued: true });
+      expect(listOutboxEntries(outboxDir)).toHaveLength(1);
+    });
+  });
+
   it('the plumbing push never follows tags', async () => {
     await withBareOrigin(async (ctx) => {
       ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
@@ -386,15 +411,33 @@ describe('real git: outbox + plumbing flush', () => {
 });
 
 describe('review-daemon tick: the outbox backstop', () => {
-  it('flushes each distinct ledger board once', async () => {
+  it('the tick does no git and no discovery: it hands the repos to ONE throttled detached backstop', async () => {
     const { defaultFlushLedgerOutboxes } = await import('../../../skills-src/conveyor/review-daemon.mjs');
-    const flushed = [];
-    const out = defaultFlushLedgerOutboxes({
-      repos: ['a/one', 'a/two', 'b/three'], resolveBoard: (r) => (r.startsWith('a/') ? '/board-a' : null),
-      flush: ({ board }) => { flushed.push(board); return { ok: true, flushed: 0 }; },
-    });
-    expect(flushed).toEqual(['/board-a']);
-    expect(out).toHaveLength(1);
+    const calls = [];
+    const out = defaultFlushLedgerOutboxes({ repos: ['a/one', 'b/two'], spawnBackstop: (o) => { calls.push(o); return { ok: true, spawned: true, pid: 7 }; } });
+    expect(calls).toEqual([{ repos: ['a/one', 'b/two'] }]);
+    expect(out).toEqual([{ ok: true, spawned: true, pid: 7 }]);
+  });
+
+  it('the backstop spawns at most once per interval, detached, with an error listener', () => {
+    resetLedgerOutboxBackstopThrottle();
+    let t = 1_000_000;
+    const spawned = [];
+    const handlers = [];
+    const spawnFn = (cmd, args, opts) => { spawned.push({ args, opts }); return { pid: 9, on: (ev, fn) => handlers.push([ev, fn]), unref() {} }; };
+    const logs = [];
+    const go = () => spawnLedgerOutboxBackstop({ repos: ['a/one'], intervalMs: 60_000, now: () => t, spawnFn, log: (l) => logs.push(l) });
+    expect(go()).toMatchObject({ spawned: true, pid: 9 });
+    t += 59_000;
+    expect(go()).toMatchObject({ skipped: 'throttled' });
+    t += 2_000;
+    expect(go()).toMatchObject({ spawned: true });
+    expect(spawned).toHaveLength(2);
+    expect(spawned[0].args.slice(1)).toEqual(['flush-repos', '--repos=a/one']);
+    expect(spawned[0].opts.detached).toBe(true);
+    expect(handlers.map(([ev]) => ev)).toEqual(['error', 'error']);
+    handlers[0][1](new Error('spawn EAGAIN'));
+    expect(logs.join('\n')).toMatch(/ledger-write-miss: .*backstop failed to start \(spawn EAGAIN\)/);
   });
 
   it('every tick runs the backstop, logs what it flushed or failed, and survives a throw', async () => {
