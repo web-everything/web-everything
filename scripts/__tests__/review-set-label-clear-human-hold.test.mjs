@@ -131,7 +131,7 @@ describe('clear-human CLI hold ceremony', () => {
         const r = run(false, labels, [savedCapped]);
         expect(r.exitCode).toBe(0);
         expect(r.provider.setLabels).toHaveBeenCalled();
-        const ruling = { ...bot, createdAt: '2026-10-18T03:00:00Z', body: r.provider.postComment.mock.calls[0][2] };
+        const ruling = { author: { login: 'chalbert' }, createdAt: '2026-10-18T03:00:00Z', body: r.provider.postComment.mock.calls[0][2] };
         expect(redTeamRulingNeeded(pr([savedCapped, ruling]), CONFIRMED_BREAKS_DEFAULTS, { readSaved })).toBeNull();
       });
       it('refuses without writing when the saved evidence is unreadable', () => {
