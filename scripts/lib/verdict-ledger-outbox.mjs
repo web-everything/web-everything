@@ -28,9 +28,14 @@
  *   · No row is duplicated: each flush dedups against the tip it builds on, by event id, exactly as the old append
  *     did; a crash between push and delete is therefore a no-op replay on the next flush.
  *   · Never forced: the remote arbitrates every push; the lock is an efficiency, not the correctness mechanism.
- *   · A failure surfaces: a flusher whose push fails withdraws ITS OWN entry and throws (thrown still means "not
- *     recorded", as before); an outbox whose oldest entry is older than `outboxStaleMs` logs a loud
- *     `ledger-write-miss` line and refuses new rows while the lock is held, so callers raise their existing miss.
+ *   · A failure surfaces: a flusher whose push provably failed withdraws ITS OWN entry under a freshly refreshed
+ *     lease and throws (thrown still means "not recorded"); when it cannot prove that (push outcome unknown, lease
+ *     lost, withdrawal failed) the entry stays durably queued and the call says `queued`. An outbox whose oldest
+ *     entry is older than `outboxStaleMs` logs a loud `ledger-write-miss` line (on every append that meets it and on
+ *     every backstop flush, lock held or not) and refuses new rows while the lock is held.
+ *   · Entries carry an integrity sum and their origin key: a corrupt entry is set aside loudly, never pushed; an
+ *     entry for another remote is never pushed by this board. Entry files and their directory are fsynced.
+ *   · Bounded: one overall deadline per flush, every git call has a timeout, the daemon backstop never throws.
  *
  * Settings cascade (standard → repo `verdictLedger.*` → env), logged once per process with each value's source:
  *   outbox (on; OFF in CI — an ephemeral runner would lose its outbox), flushBudgetMs, outboxStaleMs.
@@ -38,13 +43,17 @@
  * IMPURE (git, fs); every side effect is a parameter.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  closeSync, existsSync, fsyncSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync,
+} from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import { retryTransientGit } from './git-fetch-retry.mjs';
 import { assertPushRef, trackingRefspec, withGitError, worktreeGitEnv } from './git-transport-branch.mjs';
 import { parseLedgerEvents, ledgerEventId } from './verdict-ledger.mjs';
+// A cycle by design (the io-shell imports this module); used only at call time, never during module evaluation.
+import { ledgerGitPath } from './verdict-ledger-io.mjs';
 import { workspaceFor } from './lane-pool-paths.mjs';
 import { readSettings } from './settings-files.mjs';
 import { reserve, readLockEntry, releaseLockDirIf, heartbeatOwn } from '../readiness/file-locks.mjs';
@@ -119,17 +128,22 @@ export function outboxLockRoot(dir) { return join(dir, '.locks'); }
 /** Lease long enough to outlast a full flush budget between heartbeats (heartbeat runs every attempt). */
 const leaseMinutesFor = (budgetMs) => Math.max(5, Math.ceil((2 * budgetMs) / 60_000));
 
+/** The origin key of `board`: its origin URL, hashed. Run with repo selectors scrubbed, so cwd alone decides. */
+export function originKeyFor({ board, run = defaultGit } = {}) {
+  const url = String(withGitError(run)(['remote', 'get-url', 'origin'], { cwd: board, env: boardEnv(board) })).trim();
+  if (!url) throw new Error(`verdict-ledger-outbox: ${board} has no origin URL`);
+  return createHash('sha256').update(url).digest('hex').slice(0, 16);
+}
+
 /**
  * The outbox directory for `board`: env override, else `<workspace>/.operations/verdict-ledger-outbox/<origin-key>`.
- * Keyed by the board's ORIGIN URL so two clones of the same remote share one outbox (and one flusher), and two
- * different remotes never mix rows.
+ * Keyed by the board's ORIGIN URL so two clones of the same remote share one outbox (and one flusher). Each entry
+ * ALSO records its origin key, and a flusher pushes only entries whose key matches its own board, so a row can never
+ * reach a different remote even through a misconfigured override or an inherited `GIT_DIR` (audit 2026-10-21).
  */
 export function outboxDirFor({ board, env = process.env, run = defaultGit } = {}) {
   if (env?.[OUTBOX_DIR_ENV]) return resolve(env[OUTBOX_DIR_ENV]);
-  const url = String(withGitError(run)(['remote', 'get-url', 'origin'], { cwd: board })).trim();
-  if (!url) throw new Error(`verdict-ledger-outbox: ${board} has no origin URL`);
-  const key = createHash('sha256').update(url).digest('hex').slice(0, 16);
-  return join(workspaceFor(resolve(board)), '.operations', 'verdict-ledger-outbox', key);
+  return join(workspaceFor(resolve(board)), '.operations', 'verdict-ledger-outbox', originKeyFor({ board, run }));
 }
 
 /** Queued entry names, oldest first. A missing dir is an empty outbox. */
@@ -138,18 +152,31 @@ export function listOutboxEntries(dir) {
   catch (e) { if (e?.code === 'ENOENT') return []; throw e; }
 }
 
-/** Write one entry atomically (tmp + rename). Returns its name. */
+/** fsync a directory so a rename/create in it survives a host crash. Best effort where the platform refuses. */
+function fsyncDir(dir) {
+  let fd = null;
+  try { fd = openSync(dir, 'r'); fsyncSync(fd); } catch { /* not supported here: the rename is still atomic */ }
+  finally { if (fd !== null) try { closeSync(fd); } catch { /* closed */ } }
+}
+
+/** The integrity sum an entry carries over its payload: a flipped id, line, path or repo fails it. */
+const entrySum = (e) => createHash('sha256').update(JSON.stringify([e.path, e.repo, e.originKey ?? null, e.lines, e.ids])).digest('hex');
+
+/** Write one entry DURABLY and atomically: tmp file fsynced, renamed, directory fsynced. Returns its name. */
 export function enqueueOutboxEntry(dir, entry, { now = Date.now } = {}) {
-  mkdirSync(dir, { recursive: true });
+  if (!existsSync(dir)) { mkdirSync(dir, { recursive: true }); fsyncDir(dirname(dir)); }
   const t = now();
   const name = `${String(Math.max(0, Math.trunc(t))).padStart(15, '0')}-${process.pid}-${randomBytes(6).toString('hex')}.json`;
   const tmp = join(dir, `.tmp-${name}`);
-  writeFileSync(tmp, `${JSON.stringify({ v: 1, createdAt: t, pid: process.pid, host: hostname(), ...entry })}\n`, { flag: 'wx' });
+  const text = `${JSON.stringify({ v: 1, createdAt: t, pid: process.pid, host: hostname(), ...entry, sum: entrySum(entry) })}\n`;
+  const fd = openSync(tmp, 'wx');
+  try { writeSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
   renameSync(tmp, join(dir, name));
+  fsyncDir(dir);
   return name;
 }
 
-/** Age of the oldest queued entry (its own recorded `createdAt`), or 0 for an empty outbox. */
+/** Age of the oldest queued entry (from its name's timestamp), or 0 for an empty outbox. */
 function oldestAgeMs(dir, nowMs) {
   const names = listOutboxEntries(dir);
   if (!names.length) return { count: 0, ageMs: 0 };
@@ -161,20 +188,51 @@ function staleLine(dir, { count, ageMs }, why) {
   return `ledger-write-miss: verdict-ledger outbox ${dir} holds ${count} entr${count === 1 ? 'y' : 'ies'}, oldest ${Math.round(ageMs / 60_000)}m old (${why})`;
 }
 
-function readEntry(dir, name, log) {
+/** Log the stale line when the oldest entry is past `staleMs`. Never throws. Returns whether it was stale. */
+function reportIfStale(c, why) {
   try {
-    const e = JSON.parse(readFileSync(join(dir, name), 'utf8'));
-    if (!isPlainObject(e) || typeof e.path !== 'string' || !Array.isArray(e.lines) || !Array.isArray(e.ids) || e.lines.length !== e.ids.length) {
-      throw new Error('malformed entry');
-    }
-    return e;
-  } catch (err) {
-    if (err?.code === 'ENOENT') return null; // flushed by a reclaiming flusher meanwhile
-    // Never silently dropped, never allowed to wedge the queue: set aside under a name the lister ignores.
-    try { renameSync(join(dir, name), join(dir, `.corrupt-${name}`)); } catch { /* best effort */ }
-    log(`ledger-write-miss: verdict-ledger outbox entry ${join(dir, name)} is unreadable (${err.message}); set aside as .corrupt-${name}`);
-    return null;
+    const age = oldestAgeMs(c.dir, c.now());
+    if (age.count && age.ageMs > c.staleMs) { c.log(staleLine(c.dir, age, why)); return true; }
+  } catch (e) {
+    c.log(`ledger-write-miss: verdict-ledger outbox ${c.dir} cannot be inspected (${e?.message ?? e}); ${why}`);
+    return true;
   }
+  return false;
+}
+
+/** Content checks: the serialized events, their ids, their repo and the path must all agree with the sum. */
+function validateEntry(e) {
+  if (!isPlainObject(e) || typeof e.path !== 'string' || typeof e.repo !== 'string' || !Array.isArray(e.lines)
+    || !Array.isArray(e.ids) || !e.lines.length || e.lines.length !== e.ids.length) return 'malformed entry';
+  if (e.sum !== entrySum(e)) return 'integrity sum mismatch';
+  if (e.path !== ledgerGitPath(e.repo)) return `path ${e.path} is not the ledger path of ${e.repo}`;
+  for (let i = 0; i < e.lines.length; i += 1) {
+    let row;
+    try { row = JSON.parse(e.lines[i]); } catch { return `line ${i} is not JSON`; }
+    if (!isPlainObject(row) || row.id !== e.ids[i]) return `line ${i} does not carry id ${e.ids[i]}`;
+    if (row.repo !== e.repo) return `line ${i} is for ${row.repo}, not ${e.repo}`;
+    try { if (ledgerEventId(row) !== e.ids[i]) return `line ${i} id mismatch`; } catch (err) { return `line ${i} invalid: ${err.message}`; }
+  }
+  return null;
+}
+
+/**
+ * Read one entry. `{entry}` usable; `{gone}` flushed meanwhile; `{io}` an I/O error (LEFT IN PLACE: retryable, never
+ * quarantined, audit 2026-10-21); `{corrupt}` malformed content, set aside as `.corrupt-<name>` with a loud line.
+ */
+function readEntry(dir, name, log) {
+  let text;
+  try { text = readFileSync(join(dir, name), 'utf8'); } catch (err) {
+    if (err?.code === 'ENOENT') return { gone: true };
+    return { io: err };
+  }
+  let e = null;
+  let why;
+  try { e = JSON.parse(text); why = validateEntry(e); } catch (err) { why = `not JSON (${err.message})`; }
+  if (!why) return { entry: e };
+  try { renameSync(join(dir, name), join(dir, `.corrupt-${name}`)); } catch (err) { return { io: err }; }
+  log(`ledger-write-miss: verdict-ledger outbox entry ${join(dir, name)} is corrupt (${why}); set aside as .corrupt-${name}`);
+  return { corrupt: true };
 }
 
 const probeLiveness = (entry) => {
@@ -192,10 +250,25 @@ function tryLock(dir, budgetMs) {
   return r.ok ? owner : null;
 }
 
-function unlock(dir, owner) {
-  const lockRoot = outboxLockRoot(dir);
-  const entry = readLockEntry(lockRoot, OUTBOX_LOCK_PATH);
-  if (entry?.owner === owner) releaseLockDirIf(lockRoot, OUTBOX_LOCK_PATH, entry);
+/** Refresh our lease; false when the lock is no longer ours. */
+const stillOwn = (dir, owner) => {
+  try { return heartbeatOwn(outboxLockRoot(dir), OUTBOX_LOCK_PATH, owner, new Date().toISOString()); } catch { return false; }
+};
+
+/**
+ * Release OUR lock. The lease is refreshed first, so the read-then-rename inside `releaseLockDirIf` runs with a
+ * full lease ahead of it: no live-owner reclaim can land in that window (residual: a process stalled for a whole
+ * lease between the two calls — the same window every file-locks consumer has). Never throws.
+ */
+function unlock(dir, owner, log) {
+  try {
+    if (!stillOwn(dir, owner)) return;
+    const lockRoot = outboxLockRoot(dir);
+    const entry = readLockEntry(lockRoot, OUTBOX_LOCK_PATH);
+    if (entry?.owner === owner) releaseLockDirIf(lockRoot, OUTBOX_LOCK_PATH, entry);
+  } catch (e) {
+    log(`verdict-ledger-outbox: releasing the flusher lock on ${dir} failed (${e?.message ?? e}); its lease expires on its own`);
+  }
 }
 
 /** The board-side git env: no inherited repo selectors, the LEDGER app role for the push credential. */
@@ -220,6 +293,8 @@ function readBlobAt(run, board, tip, path, env) {
 /**
  * ONE attempt: fetch, compute every entry's fresh rows against the fetched tip, and push them as ONE commit.
  * Returns per-entry counts; `pushed: false` when the tip already held every row (a replay after a crash).
+ * A failure of the PUSH command itself carries `phase: 'publish'` and the `commit`, so the caller can reconcile:
+ * a push can land on the remote and still report failure (a dropped connection after the remote accepted it).
  */
 function pushBatch({ board, branch, entries, run, allowRef }) {
   const ref = assertPushRef(branch, allowRef);
@@ -249,7 +324,7 @@ function pushBatch({ board, branch, entries, run, allowRef }) {
       });
       counts.set(name, { rows, duplicates: entry.lines.length - rows });
     }
-    if (fresh.length) changes.push({ path, mode, content: `${base}${base && !base.endsWith('\n') ? '\n' : ''}${fresh.join('\n')}\n` });
+    if (fresh.length) changes.push({ path, mode, base, content: `${base}${base && !base.endsWith('\n') ? '\n' : ''}${fresh.join('\n')}\n` });
   }
   if (!changes.length) return { pushed: false, counts };
 
@@ -257,11 +332,11 @@ function pushBatch({ board, branch, entries, run, allowRef }) {
   try {
     const idx = boardEnv(board, { GIT_INDEX_FILE: join(tmp, 'index') });
     run(['read-tree', tip], { cwd: board, env: idx });
-    for (const c of changes) {
+    for (const [i, c] of changes.entries()) {
       // From a FILE, never stdin: a runner that spawns git with stdin ignored would silently hash an EMPTY blob
       // (seen in a test seam) and the push would replace the whole ledger with nothing. `--no-filters`: the bytes
       // are stored exactly as computed, whatever attributes apply to the temp path.
-      const src = join(tmp, `blob-${changes.indexOf(c)}`);
+      const src = join(tmp, `blob-${i}`);
       writeFileSync(src, c.content);
       const blob = String(run(['hash-object', '-w', '--no-filters', '--', src], { cwd: board, env: idx })).trim();
       if (!/^[0-9a-f]{40,64}$/.test(blob)) throw new Error(`verdict-ledger-outbox: hash-object returned no object id for ${c.path}`);
@@ -271,62 +346,124 @@ function pushBatch({ board, branch, entries, run, allowRef }) {
     const message = entries.length === 1 ? entries[0].entry.message
       : `verdict-ledger: append ${entries.length} queued appends (${[...new Set(entries.map((e) => e.entry.repo))].join(', ')})`;
     const commit = String(run(['commit-tree', tree, '-p', tip, '-m', message || 'verdict-ledger: append'], { cwd: board, env: idx })).trim();
-    // A FULL ref, never forced, never a local branch: the remote alone decides whether this lands.
-    run(['push', '--quiet', 'origin', `${commit}:${ref}`], { cwd: board, env });
+    try {
+      // A FULL ref, never forced, never a local branch: the remote alone decides whether this lands.
+      run(['push', '--quiet', 'origin', `${commit}:${ref}`], { cwd: board, env });
+    } catch (e) {
+      e.phase = 'publish';
+      e.commit = commit;
+      throw e;
+    }
   } finally {
-    rmSync(tmp, { recursive: true, force: true });
+    try { rmSync(tmp, { recursive: true, force: true }); } catch { /* a temp dir left behind never undoes a push */ }
   }
   return { pushed: true, counts };
 }
 
 /**
- * Flush while holding the lock: batch everything queued, push, delete what landed, repeat until empty.
- * THROWS `OutboxFlushError` (with the partial `results`) on a non-contention failure or an exhausted budget.
- * Any OTHER throw (e.g. the delete itself) propagates raw — it is a crash, not a push failure.
+ * After a push command FAILED for a non-race reason: did the commit land anyway? `true` landed, `false` provably
+ * not (the refetched tip does not contain it), `null` unknown (the remote cannot be read now).
  */
-function flushHeld({ board, branch, dir, owner, run, now, sleep, random, log, budgetMs, onRetry, removeEntry, allowRef }) {
+function reconcilePush({ board, branch, run, commit }) {
+  if (!commit) return false;
+  const env = boardEnv(board);
+  try {
+    run(['fetch', '--quiet', 'origin', trackingRefspec(branch)], { cwd: board, env });
+  } catch { return null; }
+  try {
+    run(['merge-base', '--is-ancestor', commit, `refs/remotes/origin/${branch}`], { cwd: board, env });
+    return true;
+  } catch (e) {
+    return e?.status === 1 ? false : null;
+  }
+}
+
+/**
+ * Flush while holding the lock: batch everything queued, push, delete what landed, repeat until empty — inside ONE
+ * overall deadline (audit 2026-10-21: a steady stream of successful batches must stop too). Entries are recorded in
+ * `results` BEFORE they are deleted, so a failed delete never reverses a recorded row; it only leaves a replay
+ * (deduped to a no-op) for the next flush.
+ * THROWS `OutboxFlushError` (with the partial `results`; `ambiguous` when a push may have landed) on a
+ * non-race failure or an exhausted budget.
+ */
+function flushHeld({ board, branch, dir, owner, run, now, sleep, random, log, budgetMs, onRetry, removeEntry, allowRef, originKey }) {
   const results = new Map();
   const errors = [];
   let attempts = 0;
   let pushed = false;
+  let stopped = null;
   const deadline = now() + budgetMs;
+  const skippedForeign = new Set();
   for (;;) {
+    if (now() >= deadline) { stopped = 'budget'; break; }
     const names = listOutboxEntries(dir);
     if (!names.length) break;
-    const entries = names.map((name) => ({ name, entry: readEntry(dir, name, log) })).filter((e) => e.entry);
-    if (!entries.length) continue;
+    const entries = [];
+    let ioError = null;
+    for (const name of names) {
+      const r = readEntry(dir, name, log);
+      if (r.io) { ioError = ioError ?? r.io; continue; }
+      if (!r.entry) continue;
+      if (originKey && r.entry.originKey && r.entry.originKey !== originKey) {
+        if (!skippedForeign.has(name)) log(`verdict-ledger-outbox: entry ${name} is for another remote (${r.entry.originKey}); left for its own flusher`);
+        skippedForeign.add(name);
+        continue;
+      }
+      entries.push({ name, entry: r.entry });
+    }
+    if (ioError) log(`verdict-ledger-outbox: some entries in ${dir} are unreadable right now (${ioError.message}); left in place for a later flush`);
+    if (!entries.length) { stopped = ioError ? 'io' : 'nothing-flushable'; break; }
+    let landed = null;
     for (let retry = 1; ; retry += 1) {
-      if (!heartbeatOwn(outboxLockRoot(dir), OUTBOX_LOCK_PATH, owner, new Date(Date.now()).toISOString())) {
+      if (!stillOwn(dir, owner)) {
         // Lease lost (stalled past it): the reclaimer owns the queue now. Stop touching it.
         log(`verdict-ledger-outbox: flusher lease lost on ${dir}; leaving the queue to its new holder`);
-        return { results, attempts, pushed, lostLease: true };
+        return { results, attempts, pushed, stopped: 'lost-lease' };
       }
       attempts += 1;
-      let out;
       try {
-        out = pushBatch({ board, branch, entries, run, allowRef });
+        landed = pushBatch({ board, branch, entries, run, allowRef });
+        break;
       } catch (e) {
         errors.push(e);
         const text = `${e?.message ?? e}\n${e?.stderr ?? ''}`;
-        if (!CONTENTION_RE.test(text) || now() >= deadline) {
-          const why = CONTENTION_RE.test(text) ? `flush budget ${budgetMs}ms exhausted` : 'non-retryable';
+        const race = CONTENTION_RE.test(text);
+        if (!race && e?.phase === 'publish') {
+          const verdict = reconcilePush({ board, branch, run, commit: e.commit });
+          if (verdict === true) {
+            log(`verdict-ledger-outbox: push reported failure but ${e.commit} is on the remote; counted as landed (${String(e?.message ?? e).split('\n')[0]})`);
+            landed = { pushed: true, counts: null };
+            break;
+          }
+          if (verdict === null) {
+            throw new OutboxFlushError(`verdict-ledger-outbox: push outcome UNKNOWN (remote unreadable after a failed push): ${String(e?.message ?? e).split('\n')[0]}`,
+              { errors, attempts, results, kind: 'ambiguous' });
+          }
+        }
+        if (!race || now() >= deadline) {
+          const why = race ? `flush budget ${budgetMs}ms exhausted` : 'non-retryable';
           throw new OutboxFlushError(`verdict-ledger-outbox: flush of ${entries.length} entr${entries.length === 1 ? 'y' : 'ies'} failed (${why}): ${String(e?.message ?? e).split('\n')[0]}`,
             { errors, attempts, results });
         }
         if (onRetry) onRetry({ attempt: attempts, error: e });
         log(`verdict-ledger-outbox: push lost a race, refetching (${String(e?.message ?? e).split('\n')[0].slice(0, 300)})`);
         sleep(Math.min(250 * 2 ** (retry - 1), 4000) + Math.floor(random() * 500));
-        continue;
       }
-      pushed = pushed || out.pushed;
-      for (const { name } of entries) {
-        removeEntry(join(dir, name)); // only after the push (or the tip) proved every row of it is on the remote
-        results.set(name, out.counts.get(name));
-      }
+    }
+    pushed = pushed || landed.pushed;
+    let removeFailed = null;
+    for (const { name, entry } of entries) {
+      // Recorded FIRST: the push (or the tip) proved every row of it is on the remote.
+      results.set(name, landed.counts?.get(name) ?? { rows: entry.lines.length, duplicates: 0 });
+      try { removeEntry(join(dir, name)); } catch (e) { removeFailed = removeFailed ?? e; }
+    }
+    if (removeFailed) {
+      log(`verdict-ledger-outbox: flushed entries could not be removed from ${dir} (${removeFailed.message}); the next flush replays them as a no-op`);
+      stopped = 'remove-failed';
       break;
     }
   }
-  return { results, attempts, pushed };
+  return { results, attempts, pushed, stopped };
 }
 
 const defaultRemove = (abs) => rmSync(abs, { force: true });
@@ -351,8 +488,9 @@ function common(o) {
 }
 
 /**
- * The BACKSTOP (and the post-release re-check): flush whatever is queued if no one else is. Never throws for a
- * push failure — it logs and reports `ok: false`; a stale outbox logs the loud `ledger-write-miss` line.
+ * The BACKSTOP (and the post-release re-check): flush whatever is queued if no one else is. NEVER THROWS: every
+ * failure — a push, the lock directory, the filesystem — is logged and reported `ok: false`, and a stale outbox logs
+ * the loud `ledger-write-miss` line whether or not this call got the lock (audit 2026-10-21).
  * @returns {{ok: boolean, held?: boolean, flushed: number, pushed: boolean, attempts: number, error?: string}}
  */
 export function flushLedgerOutbox(o = {}) {
@@ -360,49 +498,78 @@ export function flushLedgerOutbox(o = {}) {
   let flushed = 0;
   let pushed = false;
   let attempts = 0;
-  for (let round = 0; round < 50; round += 1) {
-    if (!listOutboxEntries(c.dir).length) break;
-    const owner = tryLock(c.dir, c.budgetMs);
-    if (!owner) return { ok: true, held: true, flushed, pushed, attempts };
-    try {
-      const r = flushHeld({ ...c, owner });
+  try {
+    const originKey = o.originKey ?? originKeyFor({ board: c.board, run: c.run });
+    const deadline = c.now() + c.budgetMs;
+    for (let round = 0; round < 50 && c.now() < deadline; round += 1) {
+      if (!listOutboxEntries(c.dir).length) break;
+      const owner = tryLock(c.dir, c.budgetMs);
+      if (!owner) {
+        reportIfStale(c, 'the flusher lock is held and the backlog is not draining');
+        return { ok: true, held: true, flushed, pushed, attempts };
+      }
+      let r;
+      try {
+        r = flushHeld({ ...c, owner, originKey, budgetMs: Math.max(1, deadline - c.now()) });
+      } catch (e) {
+        flushed += e?.results?.size ?? 0;
+        const msg = String(e?.message ?? e).split('\n')[0];
+        if (!reportIfStale(c, msg)) c.log(msg);
+        return { ok: false, flushed, pushed, attempts: attempts + (e?.attempts ?? 0), error: msg };
+      } finally {
+        unlock(c.dir, owner, c.log);
+      }
       flushed += r.results.size;
       pushed = pushed || r.pushed;
       attempts += r.attempts;
-      if (r.lostLease) break;
-    } catch (e) {
-      if (!(e instanceof OutboxFlushError)) throw e;
-      flushed += e.results.size;
-      const age = oldestAgeMs(c.dir, c.now());
-      c.log(age.ageMs > c.staleMs ? staleLine(c.dir, age, e.message) : e.message);
-      return { ok: false, flushed, pushed, attempts: attempts + e.attempts, error: e.message };
-    } finally {
-      unlock(c.dir, owner);
+      if (r.stopped) break;
     }
+    reportIfStale(c, 'entries remain after this flush');
+    return { ok: true, flushed, pushed, attempts };
+  } catch (e) {
+    const msg = `verdict-ledger-outbox: flush of ${c.dir} failed: ${String(e?.message ?? e).split('\n')[0]}`;
+    if (!reportIfStale(c, msg)) c.log(msg);
+    return { ok: false, flushed, pushed, attempts, error: msg };
   }
-  return { ok: true, flushed, pushed, attempts };
 }
 
 /**
  * THE DAEMON BACKSTOP for one board: flush its outbox (settings from the cascade). Nothing queued, or another
- * flusher holding the lock, is a quiet no-op. Never throws for a push failure (see {@link flushLedgerOutbox}).
+ * flusher holding the lock, is a quiet no-op. Never throws (see {@link flushLedgerOutbox}).
  */
-export function flushBoardLedgerOutbox({ board, env = process.env, log, run } = {}) {
+export function flushBoardLedgerOutbox({ board, env = process.env, log = defaultLog, run } = {}) {
   if (!board) return { ok: true, flushed: 0, pushed: false, attempts: 0, skipped: 'no-board' };
-  const settings = resolveOutboxSettings({ repo: readSettings(), env });
-  const dir = outboxDirFor({ board, env, ...(run ? { run } : {}) });
-  return { ...flushLedgerOutbox({ board, dir, settings, log, run, allowRef: 'refs/heads/ops/review-requests' }), dir };
+  let dir = null;
+  try {
+    const settings = resolveOutboxSettings({ repo: readSettings(), env });
+    dir = outboxDirFor({ board, env, ...(run ? { run } : {}) });
+    if (!listOutboxEntries(dir).length) return { ok: true, flushed: 0, pushed: false, attempts: 0, dir };
+    return { ...flushLedgerOutbox({ board, dir, settings, log, run, allowRef: 'refs/heads/ops/review-requests' }), dir };
+  } catch (e) {
+    const msg = `ledger-write-miss: verdict-ledger outbox backstop for ${board} failed: ${String(e?.message ?? e).split('\n')[0]}`;
+    log(msg);
+    return { ok: false, flushed: 0, pushed: false, attempts: 0, dir, error: msg };
+  }
 }
 
 /**
  * The append side: enqueue, then flush if no one else is. See the header for the full contract.
- * @returns {{status: 'appended', queued: boolean, rows: number, duplicates: number, attempts: number, outboxDir: string}}
- * @throws {OutboxFlushError} the flush this call ran failed (its own entry withdrawn), or the outbox is stale.
+ *
+ * OUTCOMES (audit 2026-10-21 — every exception path decides one of these, never by accident):
+ *   · landed            → `{queued: false}` with this call's own row counts.
+ *   · durably queued    → `{queued: true}`: the entry is on disk and someone (the lock holder, the next append, the
+ *                         daemon backstop) will push it. Includes: lock held; lease lost; push outcome unknown; a
+ *                         failure after which the entry could not be provably withdrawn.
+ *   · not recorded      → THROWS `OutboxFlushError`: only when this call still owned the lock (fresh lease) and
+ *                         removed its own entry, or its entry was found corrupt, or the outbox was stale before
+ *                         anything was queued.
  */
 export function appendViaOutbox(o) {
   const c = common(o);
   const { lines, ids, path, repo, message } = o;
-  const entry = { board: resolve(c.board), branch: c.branch, path, repo, message, lines, ids };
+  const originKey = o.originKey ?? originKeyFor({ board: c.board, run: c.run });
+  const entry = { board: resolve(c.board), branch: c.branch, path, repo, message, lines, ids, originKey };
+  const queued = (attempts = 0) => ({ status: 'appended', queued: true, rows: lines.length, duplicates: 0, attempts, outboxDir: c.dir });
   let owner = tryLock(c.dir, c.budgetMs);
   let name;
   if (!owner) {
@@ -415,47 +582,66 @@ export function appendViaOutbox(o) {
     }
     name = enqueueOutboxEntry(c.dir, entry, { now: c.now });
     owner = tryLock(c.dir, c.budgetMs);
-    if (!owner) return { status: 'appended', queued: true, rows: lines.length, duplicates: 0, attempts: 0, outboxDir: c.dir };
+    if (!owner) return queued();
   } else {
-    name = enqueueOutboxEntry(c.dir, entry, { now: c.now });
+    try { name = enqueueOutboxEntry(c.dir, entry, { now: c.now }); } catch (e) { unlock(c.dir, owner, c.log); throw e; }
   }
 
-  let result;
-  try {
-    result = flushHeld({ ...c, owner });
-  } catch (e) {
-    if (!(e instanceof OutboxFlushError)) throw e;
-    const mine = e.results.get(name);
-    if (!mine) {
-      // We hold the lock, so no one else is pushing our entry: withdrawing it keeps "thrown ⇒ not recorded" true.
-      c.removeEntry(join(c.dir, name));
-      const age = oldestAgeMs(c.dir, c.now());
-      if (age.count && age.ageMs > c.staleMs) c.log(staleLine(c.dir, age, e.message));
-      throw e;
+  const own = join(c.dir, name);
+  let result = null;
+  let failure = null;
+  try { result = flushHeld({ ...c, owner, originKey }); } catch (e) { failure = e; }
+
+  let outcome = null;
+  let toThrow = null;
+  const mine = (result ?? failure)?.results?.get?.(name);
+  if (mine) {
+    if (failure) c.log(`${String(failure?.message ?? failure).split('\n')[0]} (this append's own rows had already landed)`);
+    outcome = { status: 'appended', queued: false, rows: mine.rows, duplicates: mine.duplicates, attempts: (result ?? failure).attempts ?? 0, outboxDir: c.dir };
+  } else if (failure) {
+    const msg = String(failure?.message ?? failure).split('\n')[0];
+    let withdrawn = false;
+    if (failure?.kind !== 'ambiguous') {
+      try {
+        // Withdraw ONLY with a freshly refreshed lease: no other flusher can hold, or have read, the queue now.
+        if (stillOwn(c.dir, owner)) { c.removeEntry(own); withdrawn = !existsSync(own); }
+      } catch { withdrawn = false; }
     }
-    c.log(`${e.message} (this append's own rows had already landed)`);
-    result = { results: e.results, attempts: e.attempts, pushed: true };
-  } finally {
-    unlock(c.dir, owner);
+    if (withdrawn) {
+      reportIfStale(c, msg);
+      toThrow = failure instanceof OutboxFlushError ? failure : new OutboxFlushError(msg, { errors: [failure], attempts: 0 });
+    } else {
+      c.log(`ledger-write-miss: verdict-ledger outbox flush failed and this append's entry ${name} could not be withdrawn (${msg}); it stays queued and lands on a later flush`);
+      outcome = queued(failure?.attempts ?? 0);
+    }
+  } else if (existsSync(own)) {
+    outcome = queued(result.attempts); // lease lost, deadline, or unreadable for now: durable, someone flushes it
+  } else if (existsSync(join(c.dir, `.corrupt-${name}`))) {
+    toThrow = new OutboxFlushError(`verdict-ledger-outbox: this append's own entry ${name} was found corrupt and set aside`, { errors: [], attempts: result.attempts });
+  } else {
+    // Gone without our flush: a reclaiming flusher pushed it and removed it.
+    outcome = { status: 'appended', queued: false, rows: lines.length, duplicates: 0, attempts: result.attempts, outboxDir: c.dir };
   }
+  unlock(c.dir, owner, c.log);
+  if (toThrow) throw toThrow;
   // A row queued after our last empty check but before the release would otherwise wait for the next writer.
-  if (listOutboxEntries(c.dir).length) {
-    const again = flushLedgerOutbox({ ...o, settings: undefined, budgetMs: c.budgetMs, staleMs: c.staleMs });
-    if (!again.ok) c.log(`verdict-ledger-outbox: post-release flush failed: ${again.error}`);
+  try {
+    if (listOutboxEntries(c.dir).length) {
+      const again = flushLedgerOutbox({ ...o, settings: undefined, originKey, budgetMs: c.budgetMs, staleMs: c.staleMs });
+      if (!again.ok) c.log(`verdict-ledger-outbox: post-release flush failed: ${again.error}`);
+    }
+  } catch (e) {
+    c.log(`verdict-ledger-outbox: post-release flush failed: ${e?.message ?? e}`);
   }
-  const mine = result.results.get(name);
-  if (!mine) {
-    // Lease lost before our entry was flushed: it is durable in the outbox and the new holder pushes it.
-    return { status: 'appended', queued: true, rows: lines.length, duplicates: 0, attempts: result.attempts, outboxDir: c.dir };
-  }
-  return { status: 'appended', queued: false, rows: mine.rows, duplicates: mine.duplicates, attempts: result.attempts, outboxDir: c.dir };
+  return outcome;
 }
 
 /**
  * THE DIRECT PATH (CI, where an outbox would die with the runner, and unit seams): the SAME plumbing commit and the
  * SAME push site as the flusher, for this call's rows only, retried on a fetched tip up to `attempts` times. The
  * ledger therefore has ONE push shape; the worktree stager in `git-transport-branch.mjs` no longer carries ledger
- * rows at all. THROWS `OutboxFlushError` when every attempt failed.
+ * rows at all. A push that reports failure is reconciled against the remote first. THROWS `OutboxFlushError` when
+ * every attempt failed.
  * @returns {{status: 'appended', attempts: number, rows: number, duplicates: number}}
  */
 export function appendDirect(o) {
@@ -470,6 +656,11 @@ export function appendDirect(o) {
       return { status: 'appended', attempts: attempt, rows: mine.rows, duplicates: mine.duplicates };
     } catch (e) {
       errors.push(e);
+      if (e?.phase === 'publish' && !CONTENTION_RE.test(`${e?.message ?? e}\n${e?.stderr ?? ''}`)
+        && reconcilePush({ board: c.board, branch: c.branch, run: c.run, commit: e.commit }) === true) {
+        c.log(`verdict-ledger: push reported failure but ${e.commit} is on the remote; counted as landed`);
+        return { status: 'appended', attempts: attempt, rows: entry.lines.length, duplicates: 0 };
+      }
       if (attempt >= attempts) {
         throw new OutboxFlushError(`verdict-ledger: direct append failed after ${attempt} attempts: ${String(e?.message ?? e).split('\n')[0]}`, { errors, attempts: attempt });
       }
@@ -479,11 +670,15 @@ export function appendDirect(o) {
   }
 }
 
+/** Every git call is bounded (audit 2026-10-21): a hung push must not hold the flusher lock or the daemon tick. */
+export const GIT_CALL_TIMEOUT_MS = 120_000;
 function defaultGit(args, opts = {}) {
   return execFileSync('git', args, {
     encoding: 'utf8',
     stdio: [opts.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
     maxBuffer: 4 * 1024 * 1024,
+    timeout: GIT_CALL_TIMEOUT_MS,
+    killSignal: 'SIGKILL',
     ...opts,
   });
 }
