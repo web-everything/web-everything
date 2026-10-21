@@ -4112,7 +4112,7 @@ describe('released fix claim + live pid is not live work (PR #5492 replay)', () 
 
   it('helpers: releasedFixClaim reads only the latest marker; assessLiveness without a release is unchanged', () => {
     expect(releasedFixClaim(pr1563({ comments: [begin, end] }))).toMatchObject({ releasedAtMs: Date.parse(RELEASED_AT) });
-    expect(releasedFixClaim(pr1563({ comments: [end, begin] }))).toBeNull();
+    expect(releasedFixClaim(pr1563({ comments: [end, { ...begin, createdAt: '2026-10-20T23:00:00Z' }] }))).toBeNull(); // ordered by createdAt, not array position
     expect(isReleasedClaimSession(spare(), null)).toBe(false);
     expect(assessLiveness([{ agent: spare(), cwd: '/d', sha: SHA }])).toMatchObject({ kind: 'live-process' });
   });
