@@ -8,8 +8,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { withFileLock } from '../../lib/atomic-json-file.mjs';
 import { COORDINATION_ROOT_ENV } from '../../operations/coordination-root.mjs';
@@ -412,6 +411,7 @@ describe('concurrency and durable-before-post, on the real file lock and ledger'
 
   it('every checkout resolves the same ledger directory from the coordination root, never from its cwd', () => {
     expect(claimDir({ [COORDINATION_ROOT_ENV]: '/coord' })).toBe(join('/coord', 'auto-round-grant'));
+    expect(claimDir({})).toBe(join(homedir(), 'workspace', '.operations', 'coordination', 'auto-round-grant'));
   });
   it('a second worker on the same PR while the first is deciding is refused by the lock: no read, no post', () => {
     const dir = mkdtempSync(join(tmpdir(), 'arg-')); const gh = fakeGh(); let inner; let innerReads = 0;
@@ -427,14 +427,41 @@ describe('concurrency and durable-before-post, on the real file lock and ledger'
     expect(call(deps(gh, { ledger: worker(dir) }), later)).toMatchObject({ action: 'granted', count: 2 });
     expect(gh.post).toHaveBeenCalledTimes(2);
     // Control: the same interleaving with no lock lets the second worker into the decision.
-    const open = mkdtempSync(join(tmpdir(), 'arg-')); const gh2 = fakeGh(); innerReads = 0;
+    const open = mkdtempSync(join(tmpdir(), 'arg-')); const gh2 = fakeGh(); let openReads = 0;
     const noLock = (slug, pr, fn) => withPrLedger(slug, pr, fn, { dir: open, lock: (_p, f) => f() });
     gh2.readThread.mockImplementationOnce(() => {
-      inner = call(deps(gh2, { ledger: noLock, readThread: innerGh.readThread }), later);
+      inner = call(deps(gh2, { ledger: noLock, readThread: () => { openReads += 1; return gh2.readThread(); } }), later);
       return { state: gh2.t.state, headRefOid: gh2.t.head, comments: gh2.t.comments };
     });
     call(deps(gh2, { ledger: noLock }));
-    expect(innerReads).toBeGreaterThan(0);
+    expect(openReads).toBeGreaterThan(0);
+  });
+  it('the production default takes the PR\'s file lock around the ledger section', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'arg-')); let held;
+    withPrLedger(WE, 5654, () => { held = existsSync(ledgerPath(dir).replace(/\.json$/, '.lock')); }, { dir });
+    expect(held).toBe(true);
+    expect(existsSync(ledgerPath(dir).replace(/\.json$/, '.lock'))).toBe(false);
+  });
+  it('the ledger is read after the lock is taken: a reservation written while waiting is honoured', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'arg-')); const gh = fakeGh();
+    const key = autoGrantKey({ repo: 'we', note, head: HEAD });
+    // Another worker's reservation lands between this worker's call and its lock acquisition.
+    const lateWriter = (slug, pr, fn) => withPrLedger(slug, pr, fn, { dir, lock: (p, f) => {
+      writeFileSync(ledgerPath(dir), JSON.stringify({ repo: WE, pr: 5654, baseline: 0, entries: [{ key, outcome: 'reserved' }] }));
+      return withFileLock(p, f, { timeoutMs: 150, pollMs: 10 });
+    } });
+    expect(call(deps(gh, { ledger: lateWriter }))).toEqual({ action: 'skip', why: `already claimed: ${key}` });
+    expect(gh.post).not.toHaveBeenCalled();
+  });
+  it('a slow holder that is still alive keeps its lock past the stale age: no read, no post', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'arg-')); const gh = fakeGh();
+    const lockFile = ledgerPath(dir).replace(/\.json$/, '.lock');
+    writeFileSync(lockFile, `${process.ppid}\n`); // a live process other than this one
+    utimesSync(lockFile, new Date(0), new Date(0));
+    expect(call(deps(gh, { ledger: worker(dir, { timeoutMs: 150, pollMs: 10, staleMs: 50 }) })))
+      .toEqual({ action: 'skip', why: expect.stringMatching(/^ledger: withFileLock: timed out/) });
+    expect(gh.readThread).not.toHaveBeenCalled(); expect(gh.post).not.toHaveBeenCalled();
+    expect(readFileSync(lockFile, 'utf8')).toBe(`${process.ppid}\n`);
   });
   it('a second worker at the moment of the post is refused too: the lock spans the post', () => {
     const dir = mkdtempSync(join(tmpdir(), 'arg-')); const gh = fakeGh(); let inner;
@@ -454,7 +481,7 @@ describe('concurrency and durable-before-post, on the real file lock and ledger'
     // Simulate the crash: only the pre-post ledger survives, and the dead process's lock file is left behind.
     writeFileSync(ledgerPath(dir), atPost);
     const lockFile = ledgerPath(dir).replace(/\.json$/, '.lock');
-    writeFileSync(lockFile, `${spawnSync(process.execPath, ['-e', '']).pid}\n`);
+    writeFileSync(lockFile, '999999999\n'); // outside any real pid range: always "no such process"
     utimesSync(lockFile, new Date(0), new Date(0));
     expect(gh.t.comments).toEqual([]);
     const next = worker(dir, { timeoutMs: 2000, pollMs: 10, staleMs: 50 });
