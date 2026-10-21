@@ -47,6 +47,25 @@ export default {
     if (spacedExtensionless.left !== 0) violations.push(`spaced extensionless preload: ${JSON.stringify(spacedExtensionless)}`);
     const rootDir = mkdtempSync(join(tmpdir(), 'review-cap-paths-'));
     try {
+      const opensslConfig = join(rootDir, 'openssl.cnf');
+      writeFileSync(opensslConfig, '');
+      const configured = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () =>
+        [1, 2, 3].map(pr => `${100 + pr} 1 node --openssl-config ${opensslConfig} scripts/operations/review-loop-cli.mjs --pr=${pr}`).join('\n') });
+      if (configured.live !== 3 || configured.left !== 0) violations.push(`OpenSSL config rounds: ${JSON.stringify(configured)}`);
+      const held = runReviewTickAllRepos({
+        repos: [HEALTHY_REPO], liveReviewBudget: configured,
+        authGateOverride: () => ({ paused: false, reason: null }),
+        reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 999 }], refusals: [] }),
+        dispatch: () => ({ agentId: 'unexpected-fourth-review' }),
+        holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 40,
+      });
+      if (held.dispatched.length !== 0 || held.deferredForCap !== 1) violations.push('OpenSSL-configured rounds admitted an additional review');
+      const spacedConfig = join(rootDir, 'config dir', 'openssl.js');
+      mkdirSync(join(rootDir, 'config dir'));
+      writeFileSync(spacedConfig, '');
+      const spacedOptions = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () =>
+        [1, 2, 3].map(pr => `${100 + pr} 1 node --openssl-config ${spacedConfig} scripts/operations/review-loop-cli.mjs --pr=${pr}`).join('\n') });
+      if (spacedOptions.live !== 3 || spacedOptions.left !== 0) violations.push(`spaced OpenSSL config rounds: ${JSON.stringify(spacedOptions)}`);
       const prefix = join(rootDir, 'Review.mjs');
       const job = join(`${prefix} Work`, 'review-job.mjs');
       mkdirSync(`${prefix} Work`);

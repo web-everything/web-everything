@@ -1145,13 +1145,51 @@ export function priorityNamesForLiveProcessPrs(liveProcessPrs) {
  * @param {string[]} lines
  * @param {{isScriptFile?: function(string): boolean}} options Optional absolute-path classifier. Ambiguous
  *   or unreadable candidates throw; the live budget holds dispatch. Relative argv uses lexical conventions.
+ *   isOptionPath additionally recognizes directories used as runtime option values.
  */
-export function countLiveReviewRounds(lines, { isScriptFile = null, countedJobPids = null } = {}) {
+export function countLiveReviewRounds(lines, { isScriptFile = null, isOptionPath = isScriptFile, countedJobPids = null } = {}) {
   // Runtimes that run a script file, and the runtime flags that take their value as the NEXT word (a preload,
   // a loader): those values are not the script. An unknown runtime still counts when its argv[0] is the script.
   const RUNTIME = /(^|\/)(node|nodejs|bun|electron)(\.exe)?$/;
   const VALUE_FLAGS = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader', '--env-file',
-    '-C', '--conditions', '--title', '--input-type', '--experimental-config-file']);
+    '-C', '--conditions', '--title', '--input-type', '--experimental-config-file',
+    '--openssl-config', '--icu-data-dir', '--redirect-warnings', '--diagnostic-dir',
+    '--env-file-if-exists', '--allow-fs-read', '--allow-fs-write', '--build-snapshot-config',
+    '--cpu-prof-dir', '--cpu-prof-interval', '--cpu-prof-name', '--disable-proto', '--disable-warning',
+    '--dns-result-order', '--experimental-default-type', '--experimental-policy', '--experimental-sea-config',
+    '--experimental-specifier-resolution',
+    '--heap-prof-dir', '--heap-prof-interval', '--heap-prof-name', '--heapsnapshot-near-heap-limit',
+    '--heapsnapshot-signal', '--debug-port', '--inspect-port', '--inspect-publish-uid', '--max-http-header-size',
+    '--network-family-autoselection-attempt-timeout', '--policy-integrity', '--report-directory', '--report-dir',
+    '--report-filename', '--report-signal', '--secure-heap', '--secure-heap-min', '--snapshot-blob',
+    '--test-concurrency', '--test-name-pattern', '--test-reporter', '--test-reporter-destination',
+    '--test-shard', '--test-skip-pattern', '--test-timeout', '--tls-cipher-list', '--tls-keylog',
+    '--trace-event-categories', '--trace-event-file-pattern', '--unhandled-rejections', '--use-largepages',
+    '--v8-pool-size', '--watch-path', '--max-old-space-size', '--max-semi-space-size', '--stack-size']);
+  // Only known switches can safely be skipped without consuming a value. New Node/V8 or alternate-runtime
+  // options must not silently turn their value into an entrypoint and hide a review. Unknown arity holds
+  // the budget when the remaining command mentions a review; ordinary unrelated processes stay irrelevant.
+  const SWITCH_FLAGS = new Set(['--no-warnings', '--trace-warnings', '--trace-deprecation', '--no-deprecation',
+    '--throw-deprecation', '--pending-deprecation', '--enable-source-maps', '--preserve-symlinks',
+    '--preserve-symlinks-main', '--experimental-strip-types', '--experimental-transform-types',
+    '--experimental-vm-modules', '--experimental-wasm-modules',
+    '--experimental-require-module', '--experimental-detect-module', '--experimental-permission',
+    '--openssl-legacy-provider', '--openssl-shared-config', '--enable-fips', '--force-fips',
+    '--use-bundled-ca', '--use-openssl-ca', '--use-system-ca', '--watch', '--watch-preserve-output',
+    '--inspect', '--inspect-brk', '--inspect-wait', '--cpu-prof', '--heap-prof', '--prof', '--test',
+    '--test-only', '--test-force-exit', '--experimental-test-coverage', '--no-addons', '--no-global-search-paths',
+    '--expose-gc', '--jitless', '--abort-on-uncaught-exception', '--zero-fill-buffers', '--trace-gc', '--trace-gc-nvp']);
+  // Numeric and enum options cannot contain a second script-looking word in their value. Paths and free
+  // text can: ps would print --openssl-config '/tmp/config dir/openssl.js' without the quotes.
+  const SCALAR_FLAGS = new Set(['--input-type', '--cpu-prof-interval', '--disable-proto', '--dns-result-order',
+    '--experimental-default-type', '--experimental-specifier-resolution', '--heap-prof-interval',
+    '--heapsnapshot-near-heap-limit', '--heapsnapshot-signal', '--debug-port', '--inspect-port',
+    '--inspect-publish-uid', '--max-http-header-size', '--network-family-autoselection-attempt-timeout',
+    '--report-signal', '--secure-heap', '--secure-heap-min', '--test-concurrency', '--test-shard', '--test-timeout',
+    '--unhandled-rejections', '--use-largepages', '--v8-pool-size', '--max-old-space-size', '--max-semi-space-size', '--stack-size']);
+  const INPUT_PATH_FLAGS = new Set(['--openssl-config', '--env-file', '--experimental-config-file',
+    '--experimental-policy', '--experimental-sea-config', '--build-snapshot-config', '--snapshot-blob']);
+  const DIRECTORY_FLAGS = new Set(['--icu-data-dir', '--watch-path']);
   const PRELOAD_FLAGS = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader']);
   const word = (text) => {
     const match = /^(?:"([^"]*)"|'([^']*)'|(\S+))\s*/.exec(text);
@@ -1212,7 +1250,29 @@ export function countLiveReviewRounds(lines, { isScriptFile = null, countedJobPi
     const value = resolved ?? match?.[1] ?? first.value;
     return { value, rest: text.slice(value.length).trimStart() };
   };
+  const optionValue = (text, flag) => {
+    const first = word(text);
+    if (/^["']/.test(text) || SCALAR_FLAGS.has(flag)) return first;
+    const classify = INPUT_PATH_FLAGS.has(flag) ? isScriptFile : DIRECTORY_FLAGS.has(flag) ? isOptionPath : null;
+    if (classify && first.value.startsWith('/')) {
+      const candidates = [];
+      // Check complete absolute values, including custom suffixes and directory values. The bound also
+      // prevents a long verifier file list from causing unbounded filesystem probes.
+      for (const match of text.matchAll(/\s+|$/g)) {
+        const value = text.slice(0, match.index);
+        if (Buffer.byteLength(value) >= 4096) break;
+        if (value && classify(value)) candidates.push(value);
+      }
+      if (candidates.length > 1) throw new Error('ambiguous runtime option value in process listing');
+      if (candidates.length === 1) return { value: candidates[0], rest: text.slice(candidates[0].length).trimStart() };
+    }
+    // Relative paths and arbitrary text cannot be resolved against this cwd. Keep the uncertainty until
+    // the entrypoint is classified: a tail such as "-e" or "--require" might itself belong to the value.
+    return { ...first, ambiguous: /review-(?:job|loop-cli)\.mjs/.test(first.rest) };
+  };
   const script = (command) => {
+    // Ambiguous options in an unrelated process cannot conceal a review entrypoint.
+    if (!/review-(?:job|loop-cli)\.mjs/.test(command)) return '';
     const runtime = word(command);
     if (!RUNTIME.test(runtime.value)) {
       // Only argv[0] can be a direct script; never consume a utility's arguments. Node shebang execution
@@ -1220,24 +1280,54 @@ export function countLiveReviewRounds(lines, { isScriptFile = null, countedJobPi
       return runtime.value.split('/').pop();
     }
     let rest = runtime.rest;
+    let ambiguousValue = false;
+    const finish = (name) => {
+      // A value can itself contain a review filename. Misclassifying a job as a loop would let ancestry
+      // deduplication absorb it, so multiple possible review entrypoints must hold too.
+      const possibleReviews = runtime.rest.matchAll(/review-(?:job|loop-cli)\.mjs/g);
+      const multiple = !possibleReviews.next().done && !possibleReviews.next().done;
+      if (ambiguousValue && (!/^review-(?:job|loop-cli)\.mjs$/.test(name)
+        || multiple)) {
+        throw new Error('ambiguous runtime option value in process listing');
+      }
+      return name;
+    };
     while (rest) {
       const t = word(rest);
-      if (t.value === '--') return path(t.rest).value.split('/').pop();
+      const flag = t.value.replaceAll('_', '-');
+      if (t.value === '--') return finish(path(t.rest).value.split('/').pop());
       // Evaluation modes never execute a script from the remaining argv.
-      if (/^(?:-[ep]|--(?:eval|print)(?:=|$))/.test(t.value)) return '';
+      if (/^(?:-[ep]|--(?:eval|print)(?:=|$))/.test(t.value)) return finish('');
       const equals = rest.indexOf('=');
-      if (equals > 0 && PRELOAD_FLAGS.has(rest.slice(0, equals))) {
+      if (equals > 0 && PRELOAD_FLAGS.has(rest.slice(0, equals).replaceAll('_', '-'))) {
         rest = path(rest.slice(equals + 1), { preload: true }).rest;
         continue;
       }
-      if (VALUE_FLAGS.has(t.value)) {
-        rest = PRELOAD_FLAGS.has(t.value) && /^(?:\/|\.{1,2}\/)/.test(t.rest) ? path(t.rest, { preload: true }).rest : word(t.rest).rest;
+      if (VALUE_FLAGS.has(flag)) {
+        const value = PRELOAD_FLAGS.has(flag)
+          ? (/^(?:\/|\.{1,2}\/)/.test(t.rest) ? path(t.rest, { preload: true }) : word(t.rest))
+          : optionValue(t.rest, flag);
+        ambiguousValue ||= Boolean(value.ambiguous);
+        rest = value.rest;
         continue;
       }
-      if (t.value.startsWith('-')) { rest = t.rest; continue; }
-      return path(rest).value.split('/').pop();
+      if (equals > 0 && VALUE_FLAGS.has(rest.slice(0, equals).replaceAll('_', '-'))) {
+        const value = optionValue(rest.slice(equals + 1), rest.slice(0, equals).replaceAll('_', '-'));
+        ambiguousValue ||= Boolean(value.ambiguous);
+        rest = value.rest;
+        continue;
+      }
+      if (t.value.startsWith('-')) {
+        const name = flag.split('=')[0];
+        if (!SWITCH_FLAGS.has(name) && /review-(?:job|loop-cli)\.mjs/.test(t.rest)) {
+          throw new Error('ambiguous runtime option in process listing');
+        }
+        rest = t.rest;
+        continue;
+      }
+      return finish(path(rest).value.split('/').pop());
     }
-    return '';
+    return finish('');
   };
   const processes = lines.map((line) => {
     const text = String(line).trim();
@@ -1296,17 +1386,19 @@ export function liveReviewRoundBudget({ env = process.env, listCommands = () => 
   let live;
   const countedJobPids = new Set();
   try {
-    live = countLiveReviewRounds(lines, { countedJobPids, isScriptFile: (path) => {
+    const statPath = (path, directories = false) => {
       // Another process's relative paths must never be resolved against the daemon's cwd.
       if (!path.startsWith('/')) return false;
-      try { return statSync(path).isFile(); }
+      try { const stat = statSync(path); return stat.isFile() || (directories && stat.isDirectory()); }
       catch (error) {
         if (['ENOENT', 'ENOTDIR', 'ENAMETOOLONG'].includes(error?.code)) return false;
         throw error;
       }
-    } });
+    };
+    live = countLiveReviewRounds(lines, { countedJobPids, isScriptFile: statPath,
+      isOptionPath: path => statPath(path, true) });
   } catch {
-    return { left: 0, reason: `live review rounds unknown (ambiguous script path); maxLiveReviewRounds=${max} (${src})` };
+    return { left: 0, reason: `live review rounds unknown (ambiguous script path or runtime option); maxLiveReviewRounds=${max} (${src})` };
   }
   return { left: Math.max(0, max - live), live, max, countedJobPids, reason: `live review rounds ${live} of maxLiveReviewRounds=${max} (${src})` };
 }
