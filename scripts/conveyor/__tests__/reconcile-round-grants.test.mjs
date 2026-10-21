@@ -71,14 +71,16 @@ describe('an automatic (standing-ruling) grant frees a round NOW (live #5690)', 
       const seen = [];
       const result = runReconcilePass({ ...options(), enrichStandingRulingGrants: enrichWith(reads, seen) });
       expect(seen[0]).toMatchObject({ repo: 'web-everything/web-everything' });
-      expect(result.dispatch.find(d => d.prNumber === 5169), JSON.stringify(result.refusals)).toMatchObject({ kind: 'fix', attempts: 12 });
+      const row = result.dispatch.find(d => d.prNumber === 5169);
+      expect(row, JSON.stringify(result.refusals)).toMatchObject({ kind: 'fix', attempts: 12 });
+      expect(row.mode).toBeUndefined();
     });
+    // At the cap the pass hands the PR to a takeover (the pass's default round-cap action), never an ordinary round.
     it('without the enrich step, or once the head carries code, the cap holds', async () => {
       const { runReconcilePass } = await import('../reconcile-pass.mjs');
       for (const enrichStandingRulingGrants of [id, enrichWith({ ...reads, cardOnly: () => false })]) {
         const result = runReconcilePass({ ...options(), enrichStandingRulingGrants });
-        expect(result.dispatch.find(d => d.prNumber === 5169)).toBeUndefined();
-        expect(result.refusals.find(r => r.prNumber === 5169 || r.pr === 5169) ?? result.refusals[0]).toMatchObject({ kind: 'cap-exhausted', attempts: 12, cap: 10 });
+        expect(result.dispatch.find(d => d.prNumber === 5169)).toMatchObject({ kind: 'fix', mode: 'takeover', attempts: 12, cap: 10 });
       }
     });
   });

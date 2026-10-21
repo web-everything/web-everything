@@ -109,7 +109,12 @@ export function standingRulingScope({ repo, pr, ruling: given }, {
   if (!ruling) return null;
   const judged = new Map();
   const isCardOnly = (head) => {
-    if (!judged.has(head)) judged.set(head, cardOnly({ repo, number: pr.number, head }) === true);
+    // Any doubt, a throwing judgement included, is not card-only (fail closed).
+    if (!judged.has(head)) {
+      let ok = false;
+      try { ok = cardOnly({ repo, number: pr.number, head }) === true; } catch { ok = false; }
+      judged.set(head, ok);
+    }
     return judged.get(head);
   };
   if (!isCardOnly(current)) return null;
