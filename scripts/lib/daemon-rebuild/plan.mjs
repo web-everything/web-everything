@@ -583,7 +583,9 @@ export async function planRebuild({
         if (adoptedTip && adoptedTip !== ovSha && !establishedRefs.has(ref) && !noPin.has(ref)) {
           const pmt = git(['merge-tree', '--write-tree', '--no-messages', cur, adoptedTip]);
           const ptree = String(pmt.stdout ?? '').split('\n')[0].trim();
-          if (pmt.status === 0 && ptree) {
+          // Adopted content already carried by another overlay (merge changes nothing): no pin — a pin that applies
+          // nothing would be invisible to the smoke fallbacks — so the plain drop below decides, exactly as before.
+          if (pmt.status === 0 && ptree && ptree !== verifyRev(git, `${cur}^{tree}`)) {
             const pin = { ref, pr, adopted: adoptedTip, newTip: ovSha, files };
             alerts.push({
               kind: 'overlay-pinned',
@@ -592,10 +594,6 @@ export async function planRebuild({
                 message: `overlay ${ref}${pr != null ? ` (PR #${pr})` : ''} pinned at its adopted head ${adoptedTip.slice(0, 10)}: new tip ${ovSha.slice(0, 10)} conflicts on ${files.join(', ') || '?'} — the rest of the stack still builds; merge the conflicting overlays (or main) into the branch to advance it`,
               },
             });
-            if (ptree === verifyRev(git, `${cur}^{tree}`)) {
-              decisions.push({ ref, pr, action: 'skip', reason: 'overlay-pinned-contained', sha: adoptedTip, pinned: pin });
-              continue;
-            }
             const pct = git(['commit-tree', ptree, '-p', cur, '-p', adoptedTip, '-m',
               `daemon-rebuild: merge overlay ${ref}${pr != null ? ` (PR #${pr})` : ''} onto ${cur} (pinned at adopted head; new tip ${ovSha} conflicts)`], {
               env: rebuildCommitEnv(git, cur, adoptedTip),
