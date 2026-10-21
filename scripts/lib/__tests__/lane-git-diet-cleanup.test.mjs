@@ -5,9 +5,9 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync, symlinkSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { LANE_DEFAULT_FETCH, LANE_OPS_NEGATIVE_FETCH } from '../lane-git-diet.mjs';
 import { cleanupEligibility, parseCountObjects, projectedFreedBytes } from '../lane-git-diet-cleanup.mjs';
@@ -196,6 +196,44 @@ describe('real git: cleanup CLI', () => {
       expect(readFileSync(join(dir, '.git', 'config'), 'utf8')).toBe(configBefore);
       expect(existsSync(join(dir, '.git', '.lane-lease'))).toBe(false);
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it.each(['absolute', 'relative', 'linked worktree'].flatMap((variant) => [false, true].map((late) => [variant, late])))('protects objects borrowed through a %s Gitfile (late: %s)', (variant, late) => {
+    const dir = lane(9);
+    const borrower = join(root, 'gitfile-borrower');
+    const metadata = join(root, 'metadata', 'borrower git');
+    git(root, 'clone', '-q', up, dir);
+    mkdirSync(join(root, 'metadata'), { recursive: true });
+    git(root, 'clone', '-q', `--separate-git-dir=${metadata}`, up, borrower);
+    if (variant === 'relative') writeFileSync(join(borrower, '.git'), `gitdir: ${relative(borrower, metadata)}\n`);
+    if (variant === 'linked worktree') {
+      const hidden = join(root, 'metadata', 'original');
+      git(borrower, 'worktree', 'add', '--detach', hidden);
+      // Expose only the linked worktree to the bounded borrower scan.
+      rmSync(borrower, { recursive: true, force: true });
+      git(hidden, 'worktree', 'add', '--detach', borrower);
+    }
+    const objects = join(dir, '.git', 'objects');
+    writeFileSync(join(metadata, 'objects', 'info', 'alternates'), `${objects}\n`);
+    const blob = execFileSync('git', ['hash-object', '-w', '--stdin'], { cwd: dir, env, input: 'gitfile borrower only', encoding: 'utf8' }).trim();
+    const old = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    utimesSync(join(objects, blob.slice(0, 2), blob.slice(2)), old, old);
+    git(borrower, 'update-ref', 'refs/keep/borrowed', blob);
+    try {
+      expect(git(borrower, 'cat-file', '-p', blob)).toBe('gitfile borrower only');
+      if (late) rmSync(join(metadata, 'objects', 'info', 'alternates'));
+      const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--apply', '--lanes=9', '--json'], {
+        env: late ? { ...env, VITEST: 'true', LANE_GIT_DIET_TEST_LATE_BORROWER: join(metadata, 'objects') } : env, encoding: 'utf8',
+      }));
+      expect(git(borrower, 'cat-file', '-p', blob)).toBe('gitfile borrower only');
+      expect(out.rows[0].skipped).toMatch(/borrowed by .*gitfile-borrower/);
+      if (late) expect(out.rows[0].skipped).toMatch(/gc skipped/);
+      else expect(refs(dir)).toContain('refs/remotes/origin/ops/review-requests');
+    } finally {
+      rmSync(borrower, { recursive: true, force: true });
+      rmSync(join(root, 'metadata'), { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
+    }
   }, 60_000);
 
   it.each(['quoted absolute', 'quoted relative', 'octal', 'escaped', 'unicode', 'unquoted spaces', 'quoted BOM', 'unquoted BOM'])('protects objects borrowed via %s alternates', (variant) => {

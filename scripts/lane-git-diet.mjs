@@ -56,7 +56,7 @@ if (APPLY && !ONLY) { process.stderr.write('--apply needs an explicit --lanes=N,
 
 // Git env: no inherited repo redirection, plus the lane hardening pins (no fsmonitor/hooks run from lane config).
 const GIT_ENV = laneGitHardeningEnv(Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^GIT_(DIR|WORK_TREE|COMMON_DIR|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|NAMESPACE|CEILING_DIRECTORIES|DISCOVERY_ACROSS_FILESYSTEM)$/.test(k))));
-const git = (dir, args, timeout = 120_000) => execFileSync('git', args, { cwd: dir, env: GIT_ENV, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout, maxBuffer: 64 * 1024 * 1024 });
+const git = (dir, args, timeout = 120_000, encoding = 'utf8') => execFileSync('git', args, { cwd: dir, env: GIT_ENV, encoding, stdio: ['ignore', 'pipe', 'pipe'], timeout, maxBuffer: 64 * 1024 * 1024 });
 const leaseFile = (dir) => join(dir, '.git', LEASE_FILENAME);
 const readLease = (dir) => { try { return JSON.parse(readFileSync(leaseFile(dir), 'utf8')); } catch { return existsSync(leaseFile(dir)) ? { unreadable: true } : null; } };
 const LOCK_NAMES = ['index.lock', 'HEAD.lock', 'packed-refs.lock', 'gc.pid', 'shallow.lock', 'config.lock'];
@@ -65,7 +65,7 @@ const duBytes = (p) => { try { return Number(execFileSync('du', ['-sk', p], { en
 const opsRefs = (dir) => git(dir, ['for-each-ref', '--format=%(refname)', 'refs/remotes/origin/ops/']).split('\n').filter(Boolean);
 const gcHooks = (dir) => { try { return git(dir, ['config', '--get-all', 'gc.recentObjectsHook']).split('\n').filter(Boolean); } catch (e) { if (e.status === 1) return []; throw e; } };
 
-// Who borrows whose objects: every `objects/info/alternates` under <scan-root>/* and <pool-root>/*/*.
+// Who borrows whose objects: repos under <scan-root>/* and <pool-root>/*/*, including Gitfile/common-dir stores.
 function borrowerMap() {
   const map = new Map();
   const candidates = [];
@@ -73,7 +73,16 @@ function borrowerMap() {
   candidates.push(...kids(SCAN_ROOT), ...kids(real(tmpdir()) || tmpdir()));
   for (const pool of kids(POOL_ROOT)) candidates.push(...kids(pool));
   for (const repo of candidates) {
-    for (const objects of [join(repo, '.git', 'objects'), join(repo, 'objects')]) {
+    const stores = [join(repo, '.git', 'objects'), join(repo, 'objects')];
+    let dotGit;
+    try { dotGit = statSync(join(repo, '.git')); } catch (err) { if (!['ENOENT', 'ENOTDIR'].includes(err.code)) throw err; }
+    if (dotGit?.isFile() || existsSync(join(repo, '.git', 'commondir')) || existsSync(join(repo, 'commondir'))) {
+      // Git resolves relative Gitfiles and linked-worktree commondir paths. Keep literal path whitespace;
+      // a failed resolution must abort the scan, never silently authorize pruning an unknown object store.
+      const path = git(repo, ['rev-parse', '--path-format=absolute', '--git-path', 'objects'], 120_000, null);
+      stores.push(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(path).replace(/\n$/, ''));
+    }
+    for (const objects of new Set(stores)) {
       let text;
       try { text = readFileSync(join(objects, 'info', 'alternates')); } catch (err) { if (['ENOENT', 'ENOTDIR'].includes(err.code)) continue; throw err; }
       for (const line of parseGitAlternates(text)) {
