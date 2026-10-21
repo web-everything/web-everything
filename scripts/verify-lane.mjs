@@ -656,7 +656,11 @@ async function runGate(command, args) {
       clearTimeout(grace);
       const timedOut = Boolean(watchdog?.fired());
       if (timedOut) announce();
-      resolveGate({ exitCode: Number.isFinite(code) ? code : 2, signal: timedOut ? 'SIGKILL' : closeSignal || null, ...(timedOut ? { timedOut: true } : {}) });
+      const result = { exitCode: Number.isFinite(code) ? code : 2, signal: timedOut ? 'SIGKILL' : closeSignal || null, ...(timedOut ? { timedOut: true } : {}) };
+      // The tree can close before the escape sweeps finish (an escapee that holds no pipe): the phase, and with it the
+      // slot, is not over until they ran.
+      if (timedOut && watchdog) watchdog.settled().then(() => resolveGate(result));
+      else resolveGate(result);
     };
     const watchdog = Number.isInteger(child.pid) ? startTreeWatchdog({
       pid: child.pid, timeoutMs: PHASE_TIMEOUT_MS,

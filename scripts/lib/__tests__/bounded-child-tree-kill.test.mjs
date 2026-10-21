@@ -6,7 +6,7 @@ import { describe, it, expect } from 'vitest';
 import { spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { descendantPids, killProcessTree, markedPidsFromPs, peerHolderPids, startTreeWatchdog } from '../bounded-child.mjs';
 import { keepAliveScript } from '../test-keepalive.mjs';
@@ -101,7 +101,7 @@ describe('startTreeWatchdog (PR #5768)', () => {
     // A copy of this module, loaded, then overwritten on disk: the watchdog must still run the loaded code.
     const dir = mkdtempSync(join(tmpdir(), 'tree-watchdog-swap-'));
     const copy = join(dir, 'bounded-child.mjs');
-    writeFileSync(copy, readFileSync(new URL('../bounded-child.mjs', import.meta.url)));
+    writeFileSync(copy, readFileSync(resolve(process.cwd(), 'scripts/lib/bounded-child.mjs')));
     const loaded = await import(pathToFileURL(copy).href);
     writeFileSync(copy, 'export const broken = true;\n');
     const victim = spawn(process.execPath, ['-e', keepAliveScript()], { stdio: 'ignore' });
@@ -119,6 +119,30 @@ describe('startTreeWatchdog (PR #5768)', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('a stop() right after the fire does not cut the escape sweep short; settled() waits for it (verify red, attempt 1)', async () => {
+    // The tree root dies at once, so a caller settles on its close and stops the watchdog while the env-marker sweep
+    // (a slow `ps -E`) is still running. Before: stop() terminated the worker mid-sweep and the marked escapee lived.
+    if (!['darwin', 'linux'].includes(process.platform)) return;
+    const marker = `WE_TEST_TREE_WATCHDOG_${process.pid}=${Date.now()}`;
+    const [name, value] = marker.split('=');
+    const escapee = spawn(process.execPath, ['-e', keepAliveScript()], { stdio: 'ignore', detached: true, env: { ...process.env, [name]: value } });
+    escapee.unref();
+    const root = spawn(process.execPath, ['-e', keepAliveScript()], { stdio: 'ignore' });
+    try {
+      await new Promise((r) => setTimeout(r, 300));
+      let watchdog = null;
+      const fired = new Promise((r) => { watchdog = startTreeWatchdog({ pid: root.pid, timeoutMs: 100, kill: { marker }, onFire: r }); });
+      await fired;
+      watchdog.stop();
+      await watchdog.settled();
+      await new Promise((r) => setTimeout(r, 200));
+      expect(() => process.kill(escapee.pid, 0), 'the marked escapee must be killed').toThrow();
+    } finally {
+      try { process.kill(escapee.pid, 'SIGKILL'); } catch { /* gone */ }
+      try { root.kill('SIGKILL'); } catch { /* gone */ }
+    }
+  }, 60_000);
 
   it('stop() before the ceiling disarms it', async () => {
     const child = spawn(process.execPath, ['-e', keepAliveScript()], { stdio: 'ignore' });

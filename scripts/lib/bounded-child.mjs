@@ -18,6 +18,7 @@
  */
 import { spawn, execFileSync } from 'node:child_process';
 import { readdirSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { Worker } from 'node:worker_threads';
 
 /** Default hard ceiling for one child call — generous against a slow real pool, but never "forever". */
@@ -193,7 +194,7 @@ export function descendantPids(rootPid, psText) {
 export function killProcessTree(rootPid, signal = 'SIGKILL', { orphansOfGroup = null, selfPid = process.pid, marker = null, outputFds = [],
   listProcesses = () => execFileSync('ps', ['-A', '-o', 'pid=,ppid=,pgid='], { encoding: 'utf8', timeout: 10_000 }),
   listMarked = (m) => listMarkedPids(m, { selfPid }), listPeerHolders = (fds) => listPeerHolderPids(fds, { selfPid }),
-  kill = process.kill.bind(process) } = {}) {
+  kill = process.kill.bind(process), afterTree = () => {} } = {}) {
   if (!Number.isInteger(rootPid) || rootPid <= 0) return [];
   let tree = [];
   let orphans = [];
@@ -213,6 +214,7 @@ export function killProcessTree(rootPid, signal = 'SIGKILL', { orphansOfGroup = 
     try { kill(pid, signal); signalled.push(pid); } catch { /* already gone */ }
   };
   for (const pid of [...orphans, ...tree, rootPid]) send(pid);
+  try { afterTree(); } catch { /* notification only */ }
   // PR #5768 — a descendant that left BOTH the tree and the group (detached into its own session, reparented to init)
   // is still provably ours by what it inherited: the per-run env `marker`, or the caller's output pipes (`outputFds`).
   // Swept AFTER the tree is down: these listings are slow (`lsof`, `ps -E`), and the tree must not wait for them.
@@ -239,7 +241,8 @@ export function markedPidsFromPs(psText, marker, { selfPid = process.pid } = {})
 /** Every live pid (not `selfPid`, never init) whose environment carries `marker`: `/proc/<pid>/environ` on Linux, `ps -E` on darwin. */
 export function listMarkedPids(marker, { selfPid = process.pid, platform = process.platform } = {}) {
   if (platform === 'darwin') {
-    return markedPidsFromPs(execFileSync('ps', ['-A', '-ww', '-E', '-o', 'pid=,command='], { encoding: 'utf8', timeout: 10_000, maxBuffer: 256 << 20 }), marker, { selfPid });
+    // A loaded host makes this full listing slow; it runs on the watchdog thread, so a generous ceiling costs nothing.
+    return markedPidsFromPs(execFileSync('ps', ['-A', '-ww', '-E', '-o', 'pid=,command='], { encoding: 'utf8', timeout: 30_000, maxBuffer: 256 << 20 }), marker, { selfPid });
   }
   if (platform !== 'linux') return [];
   const out = [];
@@ -287,15 +290,17 @@ export function listPeerHolderPids(fds, { selfPid = process.pid, platform = proc
 // The worker runs THIS module's code as captured when it loaded, as a data: URL — never a fresh read from disk, so a
 // tree switch or edit while a gate runs cannot hand the watchdog different (or missing) code.
 let OWN_SOURCE_URL = null;
-try { OWN_SOURCE_URL = `data:text/javascript;base64,${readFileSync(new URL(import.meta.url)).toString('base64')}`; } catch { /* the fallback timer covers it */ }
+try { OWN_SOURCE_URL = `data:text/javascript;base64,${readFileSync(fileURLToPath(import.meta.url)).toString('base64')}`; } catch { /* the fallback timer covers it */ }
 const WATCHDOG_SOURCE = `const { workerData, parentPort } = require('node:worker_threads');
 import(workerData.module).then((m) => m.runTreeWatchdog(workerData, parentPort));`;
 
-function fireTreeKill({ pid, kill, flag }) {
+// flag[0]: 0 armed, 1 fired (the tree is killed, the escape sweeps are running), 2 swept (the kill is complete).
+function fireTreeKill({ pid, kill, flag, afterTree = () => {} }) {
   Atomics.store(flag, 0, 1);
   const pgid = kill.orphansOfOwnGroup ? ownProcessGroup() : null;
   // Orphans of this group only when this process LEADS it (every member is then provably ours).
-  killProcessTree(pid, 'SIGKILL', { orphansOfGroup: pgid === process.pid ? pgid : null, marker: kill.marker ?? null, outputFds: kill.outputFds ?? [] });
+  killProcessTree(pid, 'SIGKILL', { orphansOfGroup: pgid === process.pid ? pgid : null, marker: kill.marker ?? null, outputFds: kill.outputFds ?? [], afterTree });
+  Atomics.store(flag, 0, 2);
 }
 
 /** Worker entry of {@link startTreeWatchdog}. Not for direct use. */
@@ -303,8 +308,8 @@ export async function runTreeWatchdog({ pid, deadline, kill, heartbeat, flag }, 
   let beat = null;
   setTimeout(() => {
     clearInterval(beat);
-    fireTreeKill({ pid, kill, flag });
-    port.postMessage('fired');
+    fireTreeKill({ pid, kill, flag, afterTree: () => port.postMessage('fired') });
+    port.postMessage('swept');
   }, Math.max(0, deadline - Date.now()));
   if (heartbeat) {
     // The ceiling above is already armed and must survive a heartbeat module that fails to load.
@@ -323,7 +328,7 @@ export async function runTreeWatchdog({ pid, deadline, kill, heartbeat, flag }, 
  * stops, so a caller still stuck after the kill no longer keeps its slot. If the worker cannot run, the same ceiling
  * falls back to a main-thread timer, which a blocked main thread defeats — so that downgrade is logged through `warn`.
  * Unref'd; `stop()` ends it.
- * @returns {{ fired: () => boolean, stop: () => void }}
+ * @returns {{ fired: () => boolean, settled: (maxWaitMs?: number) => Promise<void>, stop: () => void }}
  */
 export function startTreeWatchdog({ pid, timeoutMs, kill = {}, heartbeat = null, onFire = () => {},
   warn = (m) => { try { process.stderr.write(m); } catch { /* logging only */ } }, moduleUrl = OWN_SOURCE_URL }) {
@@ -331,9 +336,12 @@ export function startTreeWatchdog({ pid, timeoutMs, kill = {}, heartbeat = null,
   const deadline = Date.now() + timeoutMs;
   let fallback = null;
   let stopped = false;
-  const fire = () => { if (!stopped && Atomics.load(flag, 0) === 0) { fireTreeKill({ pid, kill, flag }); onFire(); } };
+  let markSwept = () => {};
+  const swept = new Promise((r) => { markSwept = r; });
+  const fire = () => { if (!stopped && Atomics.load(flag, 0) === 0) { fireTreeKill({ pid, kill, flag }); markSwept(); onFire(); } };
   const fallBack = (why) => {
-    if (stopped || fallback || Atomics.load(flag, 0) === 1) return;
+    if (Atomics.load(flag, 0) === 2) markSwept();
+    if (stopped || fallback || Atomics.load(flag, 0) !== 0) return;
     warn(`⚠ tree watchdog: its thread failed (${String(why?.message ?? why).split('\n')[0]}) — the ceiling falls back to a main-thread timer, which a blocked event loop cannot run\n`);
     fallback = setTimeout(fire, Math.max(0, deadline - Date.now()));
     fallback.unref();
@@ -342,15 +350,21 @@ export function startTreeWatchdog({ pid, timeoutMs, kill = {}, heartbeat = null,
   try {
     if (!moduleUrl) throw new Error('own module source unavailable');
     worker = new Worker(WATCHDOG_SOURCE, { eval: true, workerData: { module: moduleUrl, pid, deadline, kill, heartbeat, flag } });
-    worker.on('message', (m) => { if (m === 'fired' && !stopped) onFire(); });
+    worker.on('message', (m) => { if (m === 'fired' && !stopped) onFire(); if (m === 'swept') markSwept(); });
     worker.on('error', fallBack);
+    worker.on('exit', () => markSwept());
     worker.unref();
   } catch (e) {
     fallBack(e);
   }
   return {
-    fired: () => Atomics.load(flag, 0) === 1,
-    stop: () => { stopped = true; clearTimeout(fallback); worker?.terminate().catch(() => {}); },
+    fired: () => Atomics.load(flag, 0) >= 1,
+    // After a fire, the kill is complete only once the escape sweeps ran: a caller must await this before it
+    // reports the phase done or exits (an exit, or `stop()`, would cut the sweeps short). Bounded by `maxWaitMs`.
+    settled: (maxWaitMs = 60_000) => (Atomics.load(flag, 0) === 0 ? Promise.resolve()
+      : Promise.race([swept, new Promise((r) => setTimeout(r, maxWaitMs).unref())])),
+    // Disarms an unfired ceiling. A fired worker is left to finish its sweeps and exit on its own.
+    stop: () => { stopped = true; clearTimeout(fallback); if (Atomics.load(flag, 0) === 0) worker?.terminate().catch(() => {}); },
   };
 }
 
