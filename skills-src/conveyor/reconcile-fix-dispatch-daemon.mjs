@@ -81,6 +81,8 @@ import { fixLauncherAvailable, fixDetachedProvider } from '../../scripts/operati
 import { listFixDispatchClaims } from '../../scripts/conveyor/fix-claim-store.mjs';
 import { refreshLiveFixDispatchClaims } from '../../scripts/conveyor/fix-dispatch-claim.mjs'; // dup-heal-dispatch
 import { planNoteComment, postNoteComment } from '../../scripts/conveyor/reconcile-note-comment.mjs'; // #4191
+import { isInfoNote } from '../../scripts/lib/pr-comment-policy.mjs';
+import { runFinishedSessionReap, formatFinishedSessionReapLines } from '../../scripts/conveyor/finished-session-reap.mjs';
 import { applyReviewStatus } from '../../scripts/conveyor/review-status-tag.mjs'; // #3383 follow-up — tag at dispatch, see runTickAllRepos
 import { planClaudeAuthDispatchGate } from '../../scripts/conveyor/claude-auth-health.mjs'; // card x5kagse
 import { runSupersedeWatch, formatSupersedeLines } from '../../scripts/conveyor/supersede-watch.mjs'; // card xiqtf7w
@@ -386,6 +388,7 @@ export function runReconcileNotesAllRepos({
   repos = FIX_DISPATCH_DAEMON_REPOS, tick = defaultReadNotesForRepo, postComment = postNoteComment, parkToHuman = defaultParkToHuman,
   publish = publishAttention, safety = resolveFixSafety(), autoRoundGrant = defaultAutoRoundGrant, stuckAfterGrant = defaultStuckAfterGrant,
   dryRun = defaultNoteCommentDryRun(), verdictSettings = resolveCiHealVerdictSettings(), readRequiredChecks = defaultReadRequiredChecks,
+  reapFinished = runFinishedSessionReap,
   ...tickOpts
 } = {}) {
   process.stderr.write(`policy · fix.alertAtRoundCap=${safety.value.alertAtRoundCap} (${safety.sources.alertAtRoundCap})\n`);
@@ -398,6 +401,7 @@ export function runReconcileNotesAllRepos({
   const refusals = [];
   const comments = [];
   const autoGrants = [];
+  const infoNotes = [];
   for (const entry of perRepo) {
     if (entry.error) {
       refusals.push({ repo: entry.repo, prNumber: null, kind: 'tick-failed', why: entry.error });
@@ -423,6 +427,9 @@ export function runReconcileNotesAllRepos({
     for (const n of (result?.notes ?? [])) {
       const tagged = { ...n, repo };
       notes.push(tagged);
+      // INFO notes (we:scripts/lib/pr-comment-policy.mjs#INFO_NOTE_KINDS): the daemon log line only — never a PR
+      // comment, never a needs-you event, never parking.
+      if (isInfoNote(n)) { infoNotes.push(tagged); continue; }
       const pr = prsByNumber.get(n.prNumber);
       // The operator's standing ruling (2026-10-19, confirmed 2026-10-20): a card-only PR at its round cap gets +1
       // round automatically, capped per PR (we:scripts/conveyor/auto-round-grant.mjs). A grant raises the cap, so
@@ -498,7 +505,13 @@ export function runReconcileNotesAllRepos({
       });
     }
   }
-  return { repos: perRepo, notes, refusals, comments, autoGrants };
+  // A session ignored as finished (released fix claim, fix-end at this head, no new claim) that stays alive past
+  // `finishedSessionReap.afterMinutes` is stopped (we:scripts/conveyor/finished-session-reap.mjs). Never throws.
+  let finishedSessionReap = { rows: [] };
+  try { finishedSessionReap = reapFinished({ notes: infoNotes, dryRun }); }
+  catch (e) { finishedSessionReap = { rows: [], error: redactedFirstLine(e) }; process.stderr.write(`finished-session-reap failed: ${redactedFirstLine(e)}\n`); }
+  for (const line of formatFinishedSessionReapLines(finishedSessionReap)) process.stderr.write(`${line}\n`);
+  return { repos: perRepo, notes, refusals, comments, autoGrants, finishedSessionReap };
 }
 
 /** The repo's live required-check set (branch protection, cached) — the SAME reader `reconcile-pass.mjs` uses. */
@@ -1037,7 +1050,7 @@ export function formatMissingRunActionLine(a) {
  */
 export function formatNoteLine(n) {
   const prLabel = n?.prNumber == null ? '(no PR)' : `PR #${n.prNumber}`;
-  return `reconcile-fix-dispatch-daemon: note ${n?.kind ?? 'unknown'} ${n?.repo ?? '?'} ${prLabel} — ${n?.text ?? '(no detail recorded)'}`;
+  return `reconcile-fix-dispatch-daemon: ${isInfoNote(n) ? 'info' : 'note'} ${n?.kind ?? 'unknown'} ${n?.repo ?? '?'} ${prLabel} — ${n?.text ?? '(no detail recorded)'}`;
 }
 
 /**

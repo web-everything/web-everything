@@ -37,7 +37,7 @@ import { execFileSync } from 'node:child_process';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import {
-  isRepeatSuppressibleNote, isStatusOnlyNote, loadPrCommentSettings, repeatsLatestComment,
+  isInfoNote, isRepeatSuppressibleNote, isStatusOnlyNote, loadPrCommentSettings, repeatsLatestComment,
 } from '../lib/pr-comment-policy.mjs';
 
 /**
@@ -181,13 +181,15 @@ export function hasPostedNoteComment(comments, note) {
  * independently of this flag.
  * @param {Array<object>|null|undefined} comments - the SAME PR's own `comments`, exactly as `gh` returns them.
  * @param {{mode?:string}} [o] - the `prComments.mode`; defaults to the live setting.
- * @returns {{key:string, body:string, alreadyPosted:boolean, suppressed:(null|'status-only'|'repeat')}}
+ * An INFO note (`INFO_NOTE_KINDS`) is `suppressed: 'info'` in every mode, `all` included: it is not a question.
+ * @returns {{key:string, body:string, alreadyPosted:boolean, suppressed:(null|'info'|'status-only'|'repeat')}}
  */
 export function planNoteComment(note, comments, { mode = loadPrCommentSettings().mode } = {}) {
   const body = buildNoteComment(note);
   const posted = hasPostedNoteComment(comments, note);
   let suppressed = null;
-  if (!posted && mode !== 'all') {
+  if (!posted && isInfoNote(note)) suppressed = 'info';
+  else if (!posted && mode !== 'all') {
     if (isStatusOnlyNote(note)) suppressed = 'status-only';
     else if (isRepeatSuppressibleNote(note) && repeatsLatestComment(comments, body, (b) => b.trimStart().startsWith(NOTE_COMMENT_MARKER))) suppressed = 'repeat';
   }
