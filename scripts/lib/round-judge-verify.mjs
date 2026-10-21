@@ -47,7 +47,9 @@ export function claimTerms(summary) {
 }
 
 const stemOf = (file) => String(file ?? '').split('/').pop().replace(/\.[a-z]+$/i, '');
-const TITLE = /^\s*(?:it|test|describe)(?:\.[a-z]+)?\s*\(\s*(['"`])(.*?)\1/;
+const TITLE = /^\s*(?:it|test|describe)(?:\.(?!skip\b|todo\b|fixme\b)[a-z]+)?\s*\(\s*(['"`])(.*?)\1/;
+/** A skipped / todo test (or a file with a skipped suite) proves nothing: the checker treats the whole file as inconclusive. */
+const SKIPPED = /^\s*(?:(?:it|test|describe)\.(?:skip|todo|fixme)\b|x(?:it|describe|test)\s*\()/m;
 
 function titlesOf(text) {
   const out = [];
@@ -61,7 +63,7 @@ const esc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const wordSet = (l) => new Set(String(l).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean));
 
 const IND = (l) => l.length - l.trimStart().length;
-const TEST_TITLE = /^\s*(?:it|test)(?:\.[a-z]+)?\s*\(\s*(['"`])/;
+const TEST_TITLE = /^\s*(?:it|test)(?:\.(?!skip\b|todo\b|fixme\b)[a-z]+)?\s*\(\s*(['"`])/;
 
 /** Line indexes that sit INSIDE an `it(` / `test(` call body (title line to its closing line). */
 function testBodyLines(lines) {
@@ -87,7 +89,7 @@ function checkCoverage(f, repo) {
   const terms = claimTerms(f.summary).filter((t) => !stemParts.has(t));
   for (const path of repo.tests(stem, ids)) {
     const text = repo.read(path);
-    if (text == null) continue;
+    if (text == null || SKIPPED.test(text)) continue;
     const lines = text.split('\n');
     const body = testBodyLines(lines);
     // 1. the subject identifier is USED inside an it()/test() body: whole word, not an import / comment line.
@@ -116,17 +118,18 @@ const STATUSY = /status\s*:\s*['"]error['"]|\bexitCode\s*=\s*[1-9]|return\s*\{[^
 function catchBlocks(lines) {
   const out = [];
   lines.forEach((l, i) => {
-    const m = /\bcatch\b\s*(?:\([^)]*\))?\s*\{/.exec(l);
-    if (!m) return;
-    let depth = 0, started = false, body = '';
-    for (let r = i; r < lines.length && r < i + 60; r += 1) {
-      const text = r === i ? lines[r].slice(m.index + m[0].length - 1) : lines[r];
-      for (const ch of text) {
-        if (ch === '{') { depth += 1; started = true; if (depth === 1) continue; }
-        if (ch === '}') { depth -= 1; if (started && depth === 0) { out.push({ line: i, body }); return; } }
-        if (depth >= 1) body += ch;
+    for (const m of l.matchAll(/\bcatch\b\s*(?:\([^)]*\))?\s*\{/g)) {
+      let depth = 0, body = '', closed = false;
+      for (let r = i; r < lines.length && r < i + 60 && !closed; r += 1) {
+        const text = r === i ? lines[r].slice(m.index + m[0].length - 1) : lines[r];
+        for (const ch of text) {
+          if (ch === '{') { depth += 1; if (depth === 1) continue; }
+          if (ch === '}') { depth -= 1; if (depth === 0) { closed = true; break; } }
+          if (depth >= 1) body += ch;
+        }
+        if (!closed) body += '\n';
       }
-      body += '\n';
+      out.push({ line: i, body });
     }
   });
   return out;
