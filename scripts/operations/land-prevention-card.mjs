@@ -105,7 +105,7 @@ import {
   remainingAfter,
 } from '../lib/card-dedupe.mjs';
 
-import { readDrainCursor, rotateAfter, writeDrainCursor } from '../lib/prevention-drain-cursor.mjs';
+import { cursorSeed, readDrainCursor, rotateAfter, writeDrainCursor } from '../lib/prevention-drain-cursor.mjs';
 import { raisedByFile, readRaisedBy, parseRaisedBy, raisedByKey } from '../lib/raised-by.mjs';
 
 const HERE = resolve(fileURLToPath(import.meta.url), '..');
@@ -386,7 +386,8 @@ export async function drainPendingPrevention({ lane }, {
   // Optional per-tick cap (the health-watch probe): at most `maxCards` cards are STARTED, none once `deadlineAt` has
   // passed, and `cursorPath` makes each call resume after the last card handled so a card that keeps failing goes
   // behind the others instead of blocking the head. Unset = the whole spool in order, as before.
-  maxCards = Infinity, deadlineAt = Infinity, now = Date.now, cursorPath,
+  // `counter` ({left}) is one card allowance shared with the other drain steps of the same tick.
+  maxCards = Infinity, deadlineAt = Infinity, now = Date.now, cursorPath, counter,
 } = {}) {
   let entries;
   try { entries = readdirSync(pendingDir).filter(name => name.endsWith('.json')).sort(); }
@@ -394,7 +395,7 @@ export async function drainPendingPrevention({ lane }, {
     if (error.code !== 'ENOENT') write(`land-prevention-card: pending spool read failed — ${errorReason(error)}\n`);
     return;
   }
-  if (cursorPath) entries = rotateAfter(entries, readDrainCursor(cursorPath).pending);
+  if (cursorPath) entries = rotateAfter(entries, readDrainCursor(cursorPath).pending, cursorSeed(cursorPath, now));
   let started = 0;
   for (const name of entries) {
     if (now() >= deadlineAt) break;
@@ -407,8 +408,7 @@ export async function drainPendingPrevention({ lane }, {
         if (cursorPath) writeDrainCursor(cursorPath, { pending: name });
         continue;
       }
-      if (started >= maxCards) break;
-      started++;
+      if (counter ? counter.left-- <= 0 : started++ >= maxCards) break;
       const result = await withRecoveryCard(lane, entry.rel, entry.content, () => batch({
         laneDir: lane, cardPath: entry.rel, kind: 'prevention', actor: 'mechanical',
         idemKey: entry.idemKey, source: entry.source,
@@ -511,7 +511,7 @@ async function landPreventionCardImpl(input, {
   loadFilingSettings = loadPreventionBatchSettings,
   sleep: wait = sleep,
   drainLimit = {},
-  skipPendingDrain = false,
+  acquireWait,
 } = {}) {
   const filing = loadFilingSettings();
   write(`${formatPreventionBatchSettings(filing)}\n`);
@@ -561,19 +561,22 @@ async function landPreventionCardImpl(input, {
     let acquired;
     try {
       write(`land-prevention-card: acquiring a lane (session ${input.session})…\n`);
-      // Inside the health-watch tick (`drainLimit.acquireWaitMs`) the acquire may wait only as long as the drain budget has left,
-      // plus slack for the pool scan; otherwise it can alone outlast the tick's watchdog.
-      const waitMs = input.drainPending ? drainLimit.acquireWaitMs : undefined;
+      // Inside the health-watch tick the acquire may wait only as long as the drain budget has left (`drainLimit.acquireWaitMs`
+      // for the spool drain, `acquireWait()` for an owed filing, read right before the acquire), plus slack for the pool scan;
+      // otherwise it can alone outlast the tick's watchdog.
+      const waitMs = input.drainPending ? drainLimit.acquireWaitMs : acquireWait?.();
       acquired = parseRunJsonTail(exec('node', [
         LANE_POOL_CLI, 'acquire', '--purpose=prevention-card', `--session=${input.session}`, '--json',
         ...(waitMs === undefined ? [] : [`--wait-ms=${Math.max(0, Math.floor(waitMs))}`]),
       ], { cwd: REPO_ROOT, timeout: waitMs === undefined ? ACQUIRE_TIMEOUT_MS : Math.max(0, Math.floor(waitMs)) + ACQUIRE_SCAN_SLACK_MS }));
     } catch (e) {
       const reason = String(e?.message || e).split('\n')[0];
-      // A capped drain that simply found no lane in time ends this tick's drain: the cards stay in the spool, no error.
-      if (input.drainPending && drainLimit.acquireWaitMs !== undefined && (e?.killed || e?.code === 'ETIMEDOUT' || /no free lane|timed out|ETIMEDOUT/i.test(reason))) {
-        write(`land-prevention-card: no lane within ${drainLimit.acquireWaitMs}ms; pending drain deferred to the next tick\n`);
-        return { ok: true, step: 'acquire-deferred', deferred: true, pr: null };
+      // A real child failure carries the pool's diagnostic on stderr, after the `Command failed:` line.
+      const text = [e?.message, e?.stderr, e?.stdout].map(part => String(part ?? '')).join('\n');
+      // A capped acquire that found no lane in time ends this tick's drain: the cards stay put (an owed filing stays owed), no error.
+      if (waitMs !== undefined && (e?.killed || e?.code === 'ETIMEDOUT' || /no free lane|timed out|ETIMEDOUT/i.test(text))) {
+        write(`land-prevention-card: no lane within ${waitMs}ms; deferred to the next tick\n`);
+        return { ok: true, skipped: true, deferred: true, step: 'acquire-deferred', pr: null };
       }
       return fail('acquire', reason);
     }
@@ -588,8 +591,8 @@ async function landPreventionCardImpl(input, {
     // one hop further out. A real delivery agent avoids this by `cd $LANE` + a RELATIVE `scripts/...` path; this
     // does the equivalent by building the lane's own absolute path explicitly.
     const laneRunMjs = join(lane, 'scripts', 'operations', 'run.mjs');
-    // Inside the health-watch tick (`drainLimit`/`skipPendingDrain`) the spool is drained in capped slices by the probe itself.
-    if (!skipPendingDrain) await drainPendingPrevention({ lane }, { pendingDir, exec, batch, write, ...(input.drainPending ? drainLimit : {}) });
+    // Inside the health-watch tick `drainLimit` caps this drain (shared card allowance, deadline, cursor).
+    await drainPendingPrevention({ lane }, { pendingDir, exec, batch, write, ...drainLimit });
     if (input.foldOpenSingles) {
       const summary = await foldOpenSingles({ lane }, { exec, batch, write });
       return { ok: true, step: 'folded', ...summary };

@@ -93,6 +93,17 @@ describe('lane acquire under the cap', () => {
     expect(result.ok).toBe(true);
     expect(f.left()).toEqual(['a', 'b', 'c']);
   });
+  it('recognises the pool\'s diagnostic on stderr of a REAL child failure (message holds only the command line)', async () => {
+    const f = fixture();
+    const exec = () => { throw Object.assign(new Error('Command failed: node lane-pool.mjs acquire --purpose=prevention-card'), { status: 1, stderr: Buffer.from('lane-pool: no free lane in pool after 5000ms\n') }); };
+    expect(await landPreventionCard(input, options(f, exec, 5000))).toMatchObject({ ok: true, deferred: true });
+  });
+  it('an owed filing\'s acquire is bounded too, and a deferred one stays owed (skipped, so never marked done)', async () => {
+    const f = fixture([]); const exec = vi.fn(() => { throw Object.assign(new Error('x'), { killed: true }); });
+    const result = await landPreventionCard({ title: 't', session: 's' }, { ...options(f, exec, undefined), owedClaimed: true, acquireWait: () => 7000 });
+    expect(exec.mock.calls[0][1]).toContain('--wait-ms=7000');
+    expect(result).toMatchObject({ ok: true, skipped: true, deferred: true });
+  });
   it('any other acquire failure is still an error', async () => {
     const f = fixture(); const exec = () => { throw new Error('lane-pool crashed'); };
     expect(await landPreventionCard(input, options(f, exec, 1000))).toMatchObject({ ok: false, step: 'acquire' });
@@ -106,6 +117,49 @@ describe('lane acquire under the cap', () => {
     await reconcileCardBatches({ ...common, clock: () => 0, drainBudgetMs: 12_000 });
     expect(drain.mock.calls[1][1].drainLimit.acquireWaitMs).toBe(12_000);
   });
+});
+
+describe('fairness without a writable cursor, and the shared allowance', () => {
+  it('a cursor that cannot be persisted still rotates the start (time-seeded), so a refused head cannot starve the rest', async () => {
+    const f = fixture(); const seen = [];
+    const batch = async input => { const id = input.cardPath.split('/')[1][0]; seen.push(id); if (id === 'a') throw new Error('refused'); return { batched: true }; };
+    const cursorPath = join(f.root, 'no-such-dir', 'cursor.state');
+    for (const now of [0, 60_000, 120_000]) {
+      await drainPendingPrevention({ lane: f.lane }, { pendingDir: f.pendingDir, exec, batch, write: () => {}, maxCards: 1, cursorPath, now: () => now });
+    }
+    expect(seen).toContain('b');
+    expect(f.left()).not.toContain('b');
+  });
+  it('rotateAfter: a seed rotates only when there is no cursor value', () => {
+    expect(rotateAfter(['a', 'b', 'c'], undefined, 1)).toEqual(['b', 'c', 'a']);
+    expect(rotateAfter(['a', 'b', 'c'], undefined, undefined)).toEqual(['a', 'b', 'c']);
+    expect(rotateAfter(['a', 'b', 'c'], 'a', 2)).toEqual(['b', 'c', 'a']);
+  });
+  it('one counter caps pending and owed together', async () => {
+    const f = fixture(['a', 'b']); owedKeys(f); const counter = { left: 1 }; const seen = [];
+    await drainPendingPrevention({ lane: f.lane }, { pendingDir: f.pendingDir, exec, write: () => {}, counter,
+      batch: async input => { seen.push(input.cardPath); return { batched: true }; } });
+    const filed = [];
+    await reconcileOwedPrevention({ stateDir: f.stateDir, counter, file: async input => { filed.push(input.title); return { ok: true, skipped: true }; } });
+    expect(seen).toHaveLength(1);
+    expect(filed).toEqual([]);
+  });
+  it('a filing deferred for want of a lane keeps its place and ends the owed round', async () => {
+    const f = fixture([]); const keys = owedKeys(f); const filed = [];
+    await reconcileOwedPrevention({ stateDir: f.stateDir, cursorPath: f.cursorPath,
+      file: async input => { filed.push(input.title); return { ok: true, skipped: true, deferred: true }; } });
+    expect(filed).toEqual(['1']);
+    expect(readDrainCursor(f.cursorPath).owed).toBeUndefined();
+    expect(keys).toHaveLength(2);
+  });
+  function owedKeys(f) {
+    const dir = join(f.stateDir, 'owed-prevention'); mkdirSync(dir, { recursive: true });
+    return ['1', '2'].map(char => {
+      const key = char.repeat(64);
+      writeFileSync(join(dir, `${key}.json`), JSON.stringify({ key, status: 'owed', input: { owedKey: key, title: char } }));
+      return key;
+    });
+  }
 });
 
 describe('owed filings under the cap', () => {
@@ -144,7 +198,7 @@ describe('the probe tick', () => {
     const drain = vi.fn(async () => { order.push('drain'); return { ok: true }; });
     const seal = vi.fn(async () => { order.push('seal'); return []; });
     await reconcileCardBatches({ ...base(f), seal, drain, loadFilingSettings: settings({ drainCardsPerTick: 3 }), clock: () => 1000, drainBudgetMs: 60_000 });
-    expect(drain.mock.calls[0][1].drainLimit).toMatchObject({ maxCards: 3, deadlineAt: 61_000, cursorPath: f.cursorPath });
+    expect(drain.mock.calls[0][1].drainLimit).toMatchObject({ counter: { left: 3 }, deadlineAt: 61_000, cursorPath: f.cursorPath });
     expect(order).toEqual(['drain', 'seal']);
   });
 
@@ -181,10 +235,40 @@ describe('the probe tick', () => {
     expect(readDrainCursor(f.cursorPath).next).toBe('pending');
   });
 
-  it('skips the owed step\'s own spool drain (the probe drains the spool in its own capped slice)', async () => {
+  it('the owed filing\'s own spool drain shares the tick\'s allowance and deadline instead of being skipped', async () => {
     const f = tickFixture(); owedPending(f); const fileOwed = vi.fn(async () => ({ ok: true, skipped: true }));
-    await reconcileCardBatches({ ...base(f), drain: vi.fn(async () => ({ ok: true })), fileOwed, loadFilingSettings: settings() });
-    expect(fileOwed).toHaveBeenCalledWith(expect.any(Object), expect.objectContaining({ skipPendingDrain: true }));
+    await reconcileCardBatches({ ...base(f), drain: vi.fn(async () => ({ ok: true })), fileOwed, loadFilingSettings: settings(), clock: () => 0 });
+    const options = fileOwed.mock.calls[0][1];
+    expect(options.skipPendingDrain).toBeUndefined();
+    expect(options.drainLimit).toMatchObject({ deadlineAt: 60_000, cursorPath: f.cursorPath });
+    expect(options.acquireWait()).toBe(30_000); // an owed filing's acquire is bounded too
+  });
+
+  it('ONE allowance per tick across both steps: an owed filing that took it leaves the spool drain none', async () => {
+    const f = tickFixture(); owedPending(f);
+    writeFileSync(f.cursorPath, JSON.stringify({ next: 'owed' }));
+    const seen = [];
+    const drain = vi.fn(async (input, options) => { seen.push(options.drainLimit.counter.left); return { ok: true }; });
+    await reconcileCardBatches({ ...base(f), drain, fileOwed: vi.fn(async () => ({ ok: true, skipped: true })), loadFilingSettings: settings() });
+    expect(seen).toEqual([0]);
+  });
+
+  it('the budget counts from the START of the tick: terminal-PR recovery that used it leaves no drain', async () => {
+    const f = tickFixture(); let t = 0;
+    writeFileSync(join(f.stateDir, 'org-slow-prevention.json'), JSON.stringify({ seq: 1, batchRef: 'lane/card-batch-prevention-1', headSha: 'a'.repeat(40),
+      repo: 'org/slow', kind: 'prevention', sealedAt: '2026-10-18T12:00:00Z', pr: 7, seal: { step: 'label-on-green' }, members: [] }));
+    const gh = async () => { t += 70_000; return JSON.stringify({ number: 7, headRefName: 'lane/card-batch-prevention-1', state: 'OPEN' }); };
+    const drain = vi.fn(async () => ({ ok: true }));
+    await reconcileCardBatches({ ...base(f), gh, drain, loadFilingSettings: settings(), clock: () => t });
+    expect(drain).not.toHaveBeenCalled();
+  });
+
+  it('no lane in time ends the drain for this tick: the owed step does not queue for the same pool, and nothing errors', async () => {
+    const f = tickFixture(); owedPending(f); const fileOwed = vi.fn();
+    const drain = vi.fn(async () => ({ ok: true, skipped: true, deferred: true, step: 'acquire-deferred' }));
+    const results = await reconcileCardBatches({ ...base(f), drain, fileOwed, loadFilingSettings: settings() });
+    expect(fileOwed).not.toHaveBeenCalled();
+    expect(results.some(result => result.action === 'error')).toBe(false);
   });
 });
 
