@@ -1,20 +1,21 @@
 ---
+bornAs: xwpncnu
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5668-prevention-add-a-deterministic-card-gate-requiring-each-beha.md"]
-dateOpened: "2026-10-17"
+scope: ["we:backlog/5960-pass-daemons-self-sync-onto-adopted-code-like-the-other-daem.md"]
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Add a check:standards lint that every 'Also raised by' line produced by the approval filer ends w… (from web-everything/web-everything#5515 review)
+# Prevention — Add a planned test named invalid canonical input bypasses legacy compatibility in we:skills-src/c… (from web-everything/web-everything#5392 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/5668-prevention-add-a-deterministic-card-gate-requiring-each-beha.md:53` — Add a check:standards lint that every 'Also raised by' line produced by the approval filer ends with its `· key approval-prevention-key:` suffix. The filer can then dedupe re-runs on that key.
+1. `we:backlog/5960-pass-daemons-self-sync-onto-adopted-code-like-the-other-daem.md` — Add a planned test named `invalid canonical input bypasses legacy compatibility` in we:skills-src/conveyor/__tests__/pass-daemon.test.mjs. Set a lower policy layer to false, supply an invalid nonblank canonical value, and separately enable each legacy opt-in; assert resolution remains false, reports the lower-layer source, and emits the invalid-value diagnostic. This deterministic regression test should fail if invalid canonical input is routed through legacy compatibility.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5515@f8f085ece3227e4dbd3c77e06c58399eb130635e
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5392@4e1a65263c3c0d13a40c22e11b6ab754184c9154
 
 ## Acceptance
 

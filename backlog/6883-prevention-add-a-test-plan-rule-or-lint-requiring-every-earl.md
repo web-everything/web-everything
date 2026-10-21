@@ -1,20 +1,21 @@
 ---
+bornAs: xxw38ev
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/settings/orchestrator-session.json"]
-dateOpened: "2026-10-16"
+scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs"]
+dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Prevention — Add a drift test, or a check:standards rule, asserting that any scripts/settings/*.json leaf matc… (from web-everything/web-everything#5455 review)
+# Prevention — Add a test-plan rule or lint requiring every early-exit hold in the shortcut to have a CLI-fixtur… (from web-everything/web-everything#5480 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/settings/orchestrator-session.json:4` — Add a drift test, or a `check:standards` rule, asserting that any `scripts/settings/*.json` leaf matching a JS standard default is either absent or equal to it. Alternatively, drop the array from the JSON and keep only the documented key.
+1. `we:scripts/merge-ai-prs.mjs:5013` — Add a test-plan rule or lint requiring every early-exit hold in the shortcut to have a CLI-fixture case that does not disable the corresponding feature flag. A parity test could also assert that each hold the full cascade applies is either applied or explicitly listed as intentionally skipped on the shortcut path.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5455@6966e639e5aeab2279d3fc83e33cd6590b23f442
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5480@621ad0f6eed1a9721d3e1b3f0d470de3cd958555
 
 ## Acceptance
 

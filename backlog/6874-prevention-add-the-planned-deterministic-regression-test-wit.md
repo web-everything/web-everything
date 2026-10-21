@@ -1,20 +1,21 @@
 ---
+bornAs: xwotp6l
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5473-prevention-add-the-named-planned-cases-and-a-deterministic-b.md"]
-dateOpened: "2026-10-19"
+scope: ["we:backlog/5303-prevention-add-table-rows-where-head-is-omitted-and-coverage.md"]
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Add a check:standards rule that every 'Also raised by' line on prevention cards ends with a · key… (from web-everything/web-everything#5616 review)
+# Prevention — Add the planned deterministic regression test with exact reason assertions and throwing coercion… (from web-everything/web-everything#5415 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/5473-prevention-add-the-named-planned-cases-and-a-deterministic-b.md:86` — Add a check:standards rule that every 'Also raised by' line on prevention cards ends with a `· key approval-prevention-key:` suffix.
+1. `we:backlog/5303-prevention-add-table-rows-where-head-is-omitted-and-coverage.md` — Add the planned deterministic regression test with exact reason assertions and throwing coercion sentinels for both head and coverage values.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5616@b40393801946c1ea2d0e1fd2a903fb78fad18c8b
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5415@83f4c0d691714c4f5f4aa0936e608582c9174ef7
 
 ## Acceptance
 

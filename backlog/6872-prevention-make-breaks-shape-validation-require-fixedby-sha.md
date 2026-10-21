@@ -1,20 +1,21 @@
 ---
+bornAs: xwj9q3l
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5303-prevention-add-table-rows-where-head-is-omitted-and-coverage.md"]
+scope: ["we:scripts/conveyor/soak/breaks/critical-fix-inherited-route.mjs", "we:scripts/conveyor/soak/breaks/__tests__/critical-fix-inherited-route.test.mjs"]
 dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Add the planned deterministic regression test with exact reason assertions and throwing coercion… (from web-everything/web-everything#5415 review)
+# Prevention — Make breaks-shape validation require fixedBy.sha to match a 7–40 hex pattern, or a list of them,… (from web-everything/web-everything#5382 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/5303-prevention-add-table-rows-where-head-is-omitted-and-coverage.md` — Add the planned deterministic regression test with exact reason assertions and throwing coercion sentinels for both head and coverage values.
+1. `we:scripts/conveyor/soak/breaks/critical-fix-inherited-route.mjs:70` — Make breaks-shape validation require `fixedBy.sha` to match a 7–40 hex pattern, or a list of them, so a floating ref is rejected when the break loads.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5415@83f4c0d691714c4f5f4aa0936e608582c9174ef7
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5382@f5cf6e2c73e6fd675ec1898b17dfd6b136f67e06
 
 ## Acceptance
 

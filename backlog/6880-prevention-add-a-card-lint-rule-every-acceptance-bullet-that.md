@@ -1,22 +1,22 @@
 ---
+bornAs: xxk4413
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/enqueue-on-event.mjs", "we:scripts/lib/__tests__/enqueue-on-event.test.mjs"]
-dateOpened: "2026-10-14"
+scope: ["we:backlog/6273-a-head-whose-red-team-comment-is-owed-is-not-held-by-the-alr.md", "we:scripts/conveyor/review-referral-hold.mjs", "we:scripts/conveyor/__tests__/review-referral-hold.test.mjs"]
+dateOpened: "2026-10-18"
 tags: []
 ---
 
-# Prevention — Add a unit test asserting readCatchUpCandidates issues at most K comment reads, or reads them wit… (from web-everything/web-everything#5241 review)
+# Prevention — Add a card-lint rule: every Acceptance bullet that says 'Must' needs a backticked test name in th… (from web-everything/web-everything#5510 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/enqueue-on-event.mjs:330` — Add a unit test asserting readCatchUpCandidates issues at most K comment reads, or reads them with bounded concurrency, plus a lint against sync exec calls inside async daemon handles. File this as a backlog item.
-2. `we:scripts/lib/enqueue-on-event.mjs:300` — Filter verdict comments to the review bot's login before they feed any priority or ordering decision. Add a unit test that a verdict-looking comment from a non-bot author is ignored. A lint or write-gate on `parseVerdictComment` callers that lack an author check would catch the whole class.
-3. `we:scripts/lib/enqueue-on-event.mjs` — Add a deterministic unit regression with one due event PR, one catch-up candidate, and capacity one, asserting that a successful event enqueue prevents the catch-up spawn; include it in the unit-test gate.
+1. `we:backlog/6273-a-head-whose-red-team-comment-is-owed-is-not-held-by-the-alr.md:23` — Add a card-lint rule: every Acceptance bullet that says 'Must' needs a backticked test name in the same file, or an explicit 'n/a: vacuous' marker.
+2. `we:scripts/conveyor/review-referral-hold.mjs:250` — Add a test-matrix rule or lint for policy cascades: every new boolean policy leaf needs an invalid-value case per layer (tool, platform, env) asserting the logged `ignored invalid` line and the effective value. Failing that, a review-lens note on kill switches that default on.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5241@a68cb19fb55ea02f6d1ac70769c667204cde4efd
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5510@f7e0cef24eecfc9a1cec7cda04c995bb84268273
 
 ## Acceptance
 

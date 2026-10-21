@@ -1,21 +1,23 @@
 ---
+bornAs: xykloz0
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/human-surface-repark.mjs", "we:scripts/conveyor/__tests__/human-surface-repark.test.mjs"]
+scope: ["we:scripts/lib/operator-send-backs.mjs", "we:scripts/conveyor/reconcile-core.mjs", "we:scripts/lib/__tests__/operator-send-backs.test.mjs", "we:scripts/conveyor/__tests__/reconcile-core.test.mjs"]
 dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Select .actor.login in defaultReadLabelEvents and require the latest add to be by the trusted acc… (from web-everything/web-everything#5273 review)
+# Prevention — Add a replay test over threads with a pre-marker send-back followed by a fix-end and an operator… (from web-everything/web-everything#5356 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/human-surface-repark.mjs:148` — Select `.actor.login` in `defaultReadLabelEvents` and require the latest add to be by the trusted account. Add an in-window foreign-add case to the heal tests. A check:standards rule is hard to write for this, so a review lens is the realistic guard.
-2. `we:scripts/conveyor/human-surface-repark.mjs` — Add a deterministic regression test covering foreign remove/re-add events inside the allowed time window, and require the heal to preserve holds when the event sequence cannot establish ownership.
+1. `we:scripts/lib/operator-send-backs.mjs:46` — Add a replay test over threads with a pre-marker send-back followed by a fix-end and an operator accept comment. Decide the intended behaviour explicitly, for example a grandfather cutoff time or treating a later operator acceptance as resolution. Longer term, a fixture-based thread-replay gate for new comment-derived holds.
+2. `we:scripts/conveyor/reconcile-core.mjs:2523` — Add planner tests for a draft PR and a ci-red PR that carry an open send-back, asserting the intended precedence. A deterministic gate that checks a new `dispatch.push` branch has an ordering test against its neighbours would be ideal.
+3. `we:scripts/lib/operator-send-backs.mjs:56` — Require an explicit evidence head or an immutable head recorded at evidence creation, and add a deterministic regression asserting that appending an unrelated push cannot resolve previously insufficient headless evidence.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5273@fcd884b785bc7ca83f4192b32ddb2e0629513c18
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5356@2457ddbd86f3926f688e06cd57bc0bdc602eaee3
 
 ## Acceptance
 

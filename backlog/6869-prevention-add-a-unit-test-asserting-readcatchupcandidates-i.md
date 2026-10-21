@@ -1,20 +1,23 @@
 ---
+bornAs: xw1pxgc
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5960-pass-daemons-self-sync-onto-adopted-code-like-the-other-daem.md"]
-dateOpened: "2026-10-15"
+scope: ["we:scripts/lib/enqueue-on-event.mjs", "we:scripts/lib/__tests__/enqueue-on-event.test.mjs"]
+dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — Add a planned test named invalid canonical input bypasses legacy compatibility in we:skills-src/c… (from web-everything/web-everything#5392 review)
+# Prevention — Add a unit test asserting readCatchUpCandidates issues at most K comment reads, or reads them wit… (from web-everything/web-everything#5241 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/5960-pass-daemons-self-sync-onto-adopted-code-like-the-other-daem.md` — Add a planned test named `invalid canonical input bypasses legacy compatibility` in we:skills-src/conveyor/__tests__/pass-daemon.test.mjs. Set a lower policy layer to false, supply an invalid nonblank canonical value, and separately enable each legacy opt-in; assert resolution remains false, reports the lower-layer source, and emits the invalid-value diagnostic. This deterministic regression test should fail if invalid canonical input is routed through legacy compatibility.
+1. `we:scripts/lib/enqueue-on-event.mjs:330` — Add a unit test asserting readCatchUpCandidates issues at most K comment reads, or reads them with bounded concurrency, plus a lint against sync exec calls inside async daemon handles. File this as a backlog item.
+2. `we:scripts/lib/enqueue-on-event.mjs:300` — Filter verdict comments to the review bot's login before they feed any priority or ordering decision. Add a unit test that a verdict-looking comment from a non-bot author is ignored. A lint or write-gate on `parseVerdictComment` callers that lack an author check would catch the whole class.
+3. `we:scripts/lib/enqueue-on-event.mjs` — Add a deterministic unit regression with one due event PR, one catch-up candidate, and capacity one, asserting that a successful event enqueue prevents the catch-up spawn; include it in the unit-test gate.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5392@4e1a65263c3c0d13a40c22e11b6ab754184c9154
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5241@a68cb19fb55ea02f6d1ac70769c667204cde4efd
 
 ## Acceptance
 

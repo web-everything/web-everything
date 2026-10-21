@@ -1,21 +1,23 @@
 ---
+bornAs: xyui2xf
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/6273-a-head-whose-red-team-comment-is-owed-is-not-held-by-the-alr.md", "we:scripts/conveyor/review-referral-hold.mjs", "we:scripts/conveyor/__tests__/review-referral-hold.test.mjs"]
-dateOpened: "2026-10-18"
+scope: ["we:scripts/conveyor/pending-launches.mjs", "we:scripts/conveyor/build-dispatch-failures.mjs", "we:skills-src/conveyor/__tests__/build-dispatch-non-blocking-launch.test.mjs", "we:scripts/conveyor/__tests__/pending-launches.test.mjs", "we:scripts/conveyor/__tests__/build-dispatch-failures.test.mjs"]
+dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Prevention — Add a card-lint rule: every Acceptance bullet that says 'Must' needs a backticked test name in th… (from web-everything/web-everything#5510 review)
+# Prevention — Add a test that a plain '[tag] message' stderr keeps its text in the launch-died reason. Better,… (from web-everything/web-everything#5472 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/6273-a-head-whose-red-team-comment-is-owed-is-not-held-by-the-alr.md:23` — Add a card-lint rule: every Acceptance bullet that says 'Must' needs a backticked test name in the same file, or an explicit 'n/a: vacuous' marker.
-2. `we:scripts/conveyor/review-referral-hold.mjs:250` — Add a test-matrix rule or lint for policy cascades: every new boolean policy leaf needs an invalid-value case per layer (tool, platform, env) asserting the logged `ignored invalid` line and the effective value. Failing that, a review-lens note on kill switches that default on.
+1. `we:scripts/conveyor/pending-launches.mjs:52` — Add a test that a plain '[tag] message' stderr keeps its text in the launch-died reason. Better, scrub undecodable text with redactSpawnText plus a quote-unescape pass instead of replacing it wholesale.
+2. `we:scripts/conveyor/build-dispatch-failures.mjs:124` — Add a deterministic regression test using a cooldown shorter than the ordinary backoff and assert the resulting retryAfter retains the longer deadline.
+3. `we:skills-src/conveyor/__tests__/build-dispatch-non-blocking-launch.test.mjs` — Extend the named test with threshold 3, asserting no cooldown after the second same-base failure and cooldown after the third; run it as a deterministic test gate.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5510@f7e0cef24eecfc9a1cec7cda04c995bb84268273
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5472@4a3207d3142511079f14ffb51b2ed6f6a5864fdd
 
 ## Acceptance
 

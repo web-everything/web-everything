@@ -1,22 +1,22 @@
 ---
+bornAs: xytmzo9
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/pending-launches.mjs", "we:scripts/conveyor/build-dispatch-failures.mjs", "we:skills-src/conveyor/__tests__/build-dispatch-non-blocking-launch.test.mjs", "we:scripts/conveyor/__tests__/pending-launches.test.mjs", "we:scripts/conveyor/__tests__/build-dispatch-failures.test.mjs"]
-dateOpened: "2026-10-17"
+scope: ["we:scripts/conveyor/human-surface-repark.mjs", "we:scripts/conveyor/__tests__/human-surface-repark.test.mjs"]
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Add a test that a plain '[tag] message' stderr keeps its text in the launch-died reason. Better,… (from web-everything/web-everything#5472 review)
+# Prevention — Select .actor.login in defaultReadLabelEvents and require the latest add to be by the trusted acc… (from web-everything/web-everything#5273 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/pending-launches.mjs:52` — Add a test that a plain '[tag] message' stderr keeps its text in the launch-died reason. Better, scrub undecodable text with redactSpawnText plus a quote-unescape pass instead of replacing it wholesale.
-2. `we:scripts/conveyor/build-dispatch-failures.mjs:124` — Add a deterministic regression test using a cooldown shorter than the ordinary backoff and assert the resulting retryAfter retains the longer deadline.
-3. `we:skills-src/conveyor/__tests__/build-dispatch-non-blocking-launch.test.mjs` — Extend the named test with threshold 3, asserting no cooldown after the second same-base failure and cooldown after the third; run it as a deterministic test gate.
+1. `we:scripts/conveyor/human-surface-repark.mjs:148` — Select `.actor.login` in `defaultReadLabelEvents` and require the latest add to be by the trusted account. Add an in-window foreign-add case to the heal tests. A check:standards rule is hard to write for this, so a review lens is the realistic guard.
+2. `we:scripts/conveyor/human-surface-repark.mjs` — Add a deterministic regression test covering foreign remove/re-add events inside the allowed time window, and require the heal to preserve holds when the event sequence cannot establish ownership.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5472@4a3207d3142511079f14ffb51b2ed6f6a5864fdd
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5273@fcd884b785bc7ca83f4192b32ddb2e0629513c18
 
 ## Acceptance
 

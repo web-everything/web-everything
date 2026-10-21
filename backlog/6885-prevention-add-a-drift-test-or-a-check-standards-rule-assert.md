@@ -1,20 +1,21 @@
 ---
+bornAs: xybk0d8
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/soak/breaks/critical-fix-inherited-route.mjs", "we:scripts/conveyor/soak/breaks/__tests__/critical-fix-inherited-route.test.mjs"]
-dateOpened: "2026-10-15"
+scope: ["we:scripts/settings/orchestrator-session.json"]
+dateOpened: "2026-10-16"
 tags: []
 ---
 
-# Prevention — Make breaks-shape validation require fixedBy.sha to match a 7–40 hex pattern, or a list of them,… (from web-everything/web-everything#5382 review)
+# Prevention — Add a drift test, or a check:standards rule, asserting that any scripts/settings/*.json leaf matc… (from web-everything/web-everything#5455 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/soak/breaks/critical-fix-inherited-route.mjs:70` — Make breaks-shape validation require `fixedBy.sha` to match a 7–40 hex pattern, or a list of them, so a floating ref is rejected when the break loads.
+1. `we:scripts/settings/orchestrator-session.json:4` — Add a drift test, or a `check:standards` rule, asserting that any `scripts/settings/*.json` leaf matching a JS standard default is either absent or equal to it. Alternatively, drop the array from the JSON and keep only the documented key.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5382@f5cf6e2c73e6fd675ec1898b17dfd6b136f67e06
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5455@6966e639e5aeab2279d3fc83e33cd6590b23f442
 
 ## Acceptance
 

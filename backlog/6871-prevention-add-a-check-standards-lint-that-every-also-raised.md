@@ -1,22 +1,21 @@
 ---
+bornAs: xw7r5md
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/operator-send-backs.mjs", "we:scripts/conveyor/reconcile-core.mjs", "we:scripts/lib/__tests__/operator-send-backs.test.mjs", "we:scripts/conveyor/__tests__/reconcile-core.test.mjs"]
-dateOpened: "2026-10-15"
+scope: ["we:backlog/5668-prevention-add-a-deterministic-card-gate-requiring-each-beha.md"]
+dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Prevention — Add a replay test over threads with a pre-marker send-back followed by a fix-end and an operator… (from web-everything/web-everything#5356 review)
+# Prevention — Add a check:standards lint that every 'Also raised by' line produced by the approval filer ends w… (from web-everything/web-everything#5515 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/operator-send-backs.mjs:46` — Add a replay test over threads with a pre-marker send-back followed by a fix-end and an operator accept comment. Decide the intended behaviour explicitly, for example a grandfather cutoff time or treating a later operator acceptance as resolution. Longer term, a fixture-based thread-replay gate for new comment-derived holds.
-2. `we:scripts/conveyor/reconcile-core.mjs:2523` — Add planner tests for a draft PR and a ci-red PR that carry an open send-back, asserting the intended precedence. A deterministic gate that checks a new `dispatch.push` branch has an ordering test against its neighbours would be ideal.
-3. `we:scripts/lib/operator-send-backs.mjs:56` — Require an explicit evidence head or an immutable head recorded at evidence creation, and add a deterministic regression asserting that appending an unrelated push cannot resolve previously insufficient headless evidence.
+1. `we:backlog/5668-prevention-add-a-deterministic-card-gate-requiring-each-beha.md:53` — Add a check:standards lint that every 'Also raised by' line produced by the approval filer ends with its `· key approval-prevention-key:` suffix. The filer can then dedupe re-runs on that key.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5356@2457ddbd86f3926f688e06cd57bc0bdc602eaee3
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5515@f8f085ece3227e4dbd3c77e06c58399eb130635e
 
 ## Acceptance
 

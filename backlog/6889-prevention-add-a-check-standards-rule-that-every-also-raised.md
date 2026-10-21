@@ -1,20 +1,21 @@
 ---
+bornAs: xyofoau
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs"]
-dateOpened: "2026-10-17"
+scope: ["we:backlog/5473-prevention-add-the-named-planned-cases-and-a-deterministic-b.md"]
+dateOpened: "2026-10-19"
 tags: []
 ---
 
-# Prevention — Add a test-plan rule or lint requiring every early-exit hold in the shortcut to have a CLI-fixtur… (from web-everything/web-everything#5480 review)
+# Prevention — Add a check:standards rule that every 'Also raised by' line on prevention cards ends with a · key… (from web-everything/web-everything#5616 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/merge-ai-prs.mjs:5013` — Add a test-plan rule or lint requiring every early-exit hold in the shortcut to have a CLI-fixture case that does not disable the corresponding feature flag. A parity test could also assert that each hold the full cascade applies is either applied or explicitly listed as intentionally skipped on the shortcut path.
+1. `we:backlog/5473-prevention-add-the-named-planned-cases-and-a-deterministic-b.md:86` — Add a check:standards rule that every 'Also raised by' line on prevention cards ends with a `· key approval-prevention-key:` suffix.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5480@621ad0f6eed1a9721d3e1b3f0d470de3cd958555
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5616@b40393801946c1ea2d0e1fd2a903fb78fad18c8b
 
 ## Acceptance
 
