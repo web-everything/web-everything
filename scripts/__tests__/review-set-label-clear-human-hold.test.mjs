@@ -13,7 +13,7 @@ import { resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { readSavedRedTeamResult, savedRedTeamFallback } from '../lib/drain-saved-red-team.mjs';
 const head = 'a'.repeat(40);
 const labels = ['review:accepted', 'ready-to-merge'];
-const clearance = { author: { login: 'web-everything' }, body: `${buildReviewedShaMarker(head)}\n${buildClearedHumanMarker('operator')}` };
+const clearance = { author: { login: 'chalbert' }, body: `${buildReviewedShaMarker(head)}\n${buildClearedHumanMarker('operator')}` };
 
 describe('clear-human hold decision', () => {
   it('requires a label or proven hold', () => {
@@ -96,7 +96,7 @@ describe('clear-human CLI hold ceremony', () => {
       const r = run(false, labels, [result, capped]);
       expect(r.exitCode).toBe(0);
       expect(r.provider.setLabels).toHaveBeenCalled();
-      const ruling = { ...bot, createdAt: '2026-10-18T03:00:00Z', body: r.provider.postComment.mock.calls[0][2] };
+      const ruling = { author: { login: 'chalbert' }, createdAt: '2026-10-18T03:00:00Z', body: r.provider.postComment.mock.calls[0][2] };
       expect(redTeamRulingNeeded(pr([result, capped, ruling]))).toBeNull();
       expect(readRedTeamDisposition({ comments: [result, capped, ruling], pr: 7, head, setting: CONFIRMED_BREAKS_DEFAULTS }).held).toEqual([]);
     });
