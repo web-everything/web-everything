@@ -53,8 +53,8 @@ it('keeps the clone identity when main has no numbering history (no identity is 
 
 it('ignores a look-alike subject: only a full JIT-number subject on main counts as trusted', () => {
   const lines = ['Forger\0f@x\0drain: JIT-number nonsense', 'Real\0r@x\0drain: JIT-number xaaaaaa→#1 at land (#2288)'].join('\n');
-  const git = (a) => (a[0] === 'log' ? lines : a[1] === 'user.name' ? 'Clone' : 'c@x');
-  expect(numberingCommitIdentityArgs('/nowhere', { git })).toEqual(['-c', 'user.name=Real', '-c', 'user.email=r@x']);
+  const git = (a) => (a[0] === 'log' ? lines : 'Clone <c@x> 1792569712 -0400');
+  expect(numberingCommitIdentityArgs('/nowhere', { git })).toEqual(['--author=Real <r@x>']);
 });
 
 // Live replay: main as it stood at 2026-10-21T03:16Z (ffc517506), when #5779's numbering commit f076c85c6 by
@@ -70,16 +70,38 @@ it('live replay #5779: the capped read distrusted the drain identity; the uncapp
   const capped = real(['log', '--max-count=100', '--grep=^drain: JIT-number ', '--format=%an', MAIN]).split('\n');
   expect(capped.includes('Nicolas Gilbert')).toBe(false);
   const git = (a) => (a[0] === 'log' ? real(a.map((x) => (x === 'origin/main' ? MAIN : x)))
-    : a[1] === 'user.name' ? 'Nicolas Gilbert' : 'nic.g.gilbert@gmail.com');
+    : 'Nicolas Gilbert <nic.g.gilbert@gmail.com> 1792569712 -0400');
   expect(numberingCommitIdentityArgs(repo, { git })).toEqual([]);
-  const fresh = (a) => (a[0] === 'log' ? git(a) : a[1] === 'user.name' ? 'Brand New Clone' : 'new@clone');
-  expect(numberingCommitIdentityArgs(repo, { git: fresh })).toEqual(['-c', `user.name=${real(['log', '-1', '--grep=^drain: JIT-number ', '--format=%an', MAIN])}`,
-    '-c', `user.email=${real(['log', '-1', '--grep=^drain: JIT-number ', '--format=%ae', MAIN])}`]);
+  const fresh = (a) => (a[0] === 'log' ? git(a) : 'Brand New Clone <new@clone> 1792569712 -0400');
+  expect(numberingCommitIdentityArgs(repo, { git: fresh })).toEqual([`--author=${real(['log', '-1', '--grep=^drain: JIT-number ', '--format=%an <%ae>', MAIN])}`]);
 });
 
 it('kill switch drain.numberingCommitIdentity=clone keeps the clone identity (today\'s behavior)', () => {
   const lines = 'Real\0r@x\0drain: JIT-number xaaaaaa→#1 at land (#2288)';
-  const git = (a) => (a[0] === 'log' ? lines : a[1] === 'user.name' ? 'Clone' : 'c@x');
+  const git = (a) => (a[0] === 'log' ? lines : 'Clone <c@x> 1792569712 -0400');
   expect(numberingCommitIdentityArgs('/nowhere', { git, setting: { value: 'clone', source: 'env' } })).toEqual([]);
-  expect(numberingCommitIdentityArgs('/nowhere', { git, setting: { value: 'trusted', source: 'standard' } })).toEqual(['-c', 'user.name=Real', '-c', 'user.email=r@x']);
+  expect(numberingCommitIdentityArgs('/nowhere', { git, setting: { value: 'trusted', source: 'standard' } })).toEqual(['--author=Real <r@x>']);
+});
+
+it('Codex audit #5: the EFFECTIVE author decides — GIT_AUTHOR_* env beats user.* and the numbering commit still lands trusted', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'numbering-identity-env-'));
+  const git = (...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' });
+  const saved = { n: process.env.GIT_AUTHOR_NAME, e: process.env.GIT_AUTHOR_EMAIL };
+  try {
+    git('init', '-q'); git('config', 'commit.gpgsign', 'false');
+    git('config', 'user.name', 'Established Drain'); git('config', 'user.email', 'drain@main');
+    mkdirSync(join(cwd, 'backlog')); mkdirSync(join(cwd, '.claude/skills/batch-backlog-items'), { recursive: true });
+    writeFileSync(join(cwd, 'backlog/009-older.md'), '---\nstatus: resolved\n---\n');
+    git('add', '.'); git('commit', '-qm', 'drain: JIT-number xold000→#9 at land (#2288)');
+    git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+    writeFileSync(join(cwd, 'backlog/xabc123-foo.md'), '---\nstatus: open\n---\n');
+    git('add', '.'); git('commit', '-qm', 'card');
+    process.env.GIT_AUTHOR_NAME = 'Env Override'; process.env.GIT_AUTHOR_EMAIL = 'env@override';
+    expect(numberPendingHashes(cwd).committed).toBe(true);
+    expect(git('log', '-1', '--format=%an <%ae>')).toBe('Established Drain <drain@main>\n');
+  } finally {
+    if (saved.n === undefined) delete process.env.GIT_AUTHOR_NAME; else process.env.GIT_AUTHOR_NAME = saved.n;
+    if (saved.e === undefined) delete process.env.GIT_AUTHOR_EMAIL; else process.env.GIT_AUTHOR_EMAIL = saved.e;
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });

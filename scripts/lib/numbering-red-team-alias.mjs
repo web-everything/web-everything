@@ -21,25 +21,38 @@ import { proveNumberingOnlyMove, MAX_NUMBERING_COMMITS } from './numbering-carry
 const HEX40 = /^[0-9a-f]{40}$/;
 
 /**
- * @param {{exec:Function, cwd?:string, head:string, hasEvidence:(sha:string)=>boolean, prove?:Function, max?:number}} o
- * @returns {{head:string, reason:string, pairs:Array<[string,string]>}|null}
+ * Every first-parent ancestor `head` is proven exact drain numbering over, nearest first. Stops at the first step the
+ * proof refuses; any error yields what was proven so far (an empty list = today's exact-head behavior).
+ * @param {{exec:Function, cwd?:string, head:string, prove?:Function, max?:number}} o
+ * @returns {Array<{head:string, reason:string, pairs:Array<[string,string]>}>}
  */
-export function numberingRedTeamAlias({ exec, cwd, head, hasEvidence, prove = proveNumberingOnlyMove, max = MAX_NUMBERING_COMMITS }) {
+export function numberingProvenAncestors({ exec, cwd, head, prove = proveNumberingOnlyMove, max = MAX_NUMBERING_COMMITS }) {
+  const proven = [];
   try {
-    if (typeof exec !== 'function' || typeof hasEvidence !== 'function' || !HEX40.test(String(head ?? ''))) return null;
+    if (typeof exec !== 'function' || !HEX40.test(String(head ?? ''))) return proven;
     const git = (args) => String(exec('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...(cwd === undefined ? {} : { cwd }) }) ?? '').trim();
     try { git(['cat-file', '-e', `${head}^{commit}`]); }
     catch { git(['fetch', '--no-tags', '-q', 'origin', head]); }
     const chain = git(['rev-list', '--first-parent', `--max-count=${max + 1}`, head]).split('\n').filter(Boolean);
-    if (chain[0] !== head) return null;
+    if (chain[0] !== head) return proven;
     for (const ancestor of chain.slice(1)) {
-      if (!HEX40.test(ancestor)) return null;
+      if (!HEX40.test(ancestor)) break;
       const proof = prove({ exec, cwd, fromSha: ancestor, toSha: head });
-      if (!proof?.ok) return null;
-      if (hasEvidence(ancestor)) return { head: ancestor, reason: proof.reason, pairs: proof.pairs };
+      if (!proof?.ok) break;
+      proven.push({ head: ancestor, reason: proof.reason, pairs: proof.pairs });
     }
-    return null;
-  } catch { return null; }
+  } catch { /* what was proven so far stands; nothing more */ }
+  return proven;
+}
+
+/**
+ * The nearest proven numbering ancestor that has red-team evidence, or null.
+ * @param {{exec:Function, cwd?:string, head:string, hasEvidence:(sha:string)=>boolean, prove?:Function, max?:number}} o
+ * @returns {{head:string, reason:string, pairs:Array<[string,string]>}|null}
+ */
+export function numberingRedTeamAlias({ hasEvidence, ...o }) {
+  if (typeof hasEvidence !== 'function') return null;
+  try { return numberingProvenAncestors(o).find((a) => hasEvidence(a.head)) ?? null; } catch { return null; }
 }
 
 /** True when a red-team evidence read shows anything scheduled, running, queued or recorded for its head. */

@@ -707,6 +707,16 @@ describe('recorded hold read-only admission', () => {
       expect(seen[0].runsDir).toBe('/tmp/we-yield-probe-runs');
       vi.unstubAllEnvs();
     });
+    it('Codex audit #3: a cold probe on a head with no red-team trace and no proof yet is unknown (throws — keep yielding), runs no git', () => {
+      const calls = [];
+      const s2 = createDrainMergeStrategy({ localSlug: LOCAL, statePath: 'x', resolved: policyOf('github-merge-queue'),
+        env: { WE_RED_TEAM_TIMING: 'post-accept' }, queueSafety: { value: { waitForRedTeamBeforeEnqueue: true } }, log: { write: () => {} },
+        readFile: () => JSON.stringify(requested()), readRedTeamEvidence: () => ({ scheduled: false, recorded: false, inFlight: false, loopPayload: null }),
+        numberingRedTeamSetting: () => ({ value: true, source: 'test' }),
+        exec: (c, args) => { calls.push(c); return args[0] === 'pr' ? JSON.stringify({ headRefOid: HEAD, labels: ['review:accepted', 'ready-to-merge'] }) : args.includes('--slurp') ? '[[]]' : '{}'; } });
+      expect(() => s2.yieldTargetHold({ num: 5283 }, HEAD)).toThrow(/numbering alias not yet proven/);
+      expect(calls).not.toContain('git');
+    });
     it('aliases that disagree on the request state are unknown (throws — keep yielding)', () => {
       const st = requested();
       st.redTeamPending[`${LOCAL}#5283`] = rec({ requestedAt: undefined }); // no requestedAt
@@ -2414,6 +2424,47 @@ describe('#5742: a head moved only by the drain numbering commit reads red-team 
       expect(r.requests).toEqual([expect.objectContaining({ pr: 5742, head: t.head })]);
       expect(r.logs).toContain('review.carryRedTeamAcrossNumbering=false (env)');
       expect(r.logs).not.toContain('moved only by drain numbering');
+    } finally { rmSync(t.cwd, { recursive: true, force: true }); }
+  });
+  it('Codex audit #1: a confirmed break recorded on the numbered head itself is never replaced by the ancestor', () => {
+    const t = setup();
+    try {
+      const requests = [];
+      const labels = ['review:accepted', 'ready-to-merge'];
+      const comment = { user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({ pr: 5742, rev: t.head,
+        findings: [{ summary: 'break on the numbered head', category: 'security', impactIfUnfixed: 'broken', confirmedByRecheck: true }], recheckStatus: 'ok' }) };
+      const h = harness({ strategy: 'github-merge-queue', labels, gitExec: t.gitExec, evidenceFor: pendingOn(t.accepted), liveComments: [comment],
+        ghView: { 5742: { headRefOid: t.head, labels, isDraft: false } }, requestRedTeam: (i) => { requests.push(i); return { requested: true }; } });
+      const outcome = h.s.enqueue({ num: 5742 }, t.head);
+      expect(outcome.enqueued).toBeFalsy();
+      expect(h.logs.join('')).not.toContain('moved only by drain numbering');
+    } finally { rmSync(t.cwd, { recursive: true, force: true }); }
+  });
+  it('Codex audit #2: evidence that arrives on the numbered head later in the pass wins over a cached alias', () => {
+    const t = setup();
+    try {
+      let headEvidence = { scheduled: false, recorded: false, inFlight: false, loopPayload: null };
+      const reads = [];
+      const evidenceFor = ({ head }) => { reads.push(head); return head === t.accepted ? pendingOn(t.accepted)({ head }) : headEvidence; };
+      const labels = ['review:accepted', 'ready-to-merge'];
+      const h = harness({ strategy: 'github-merge-queue', labels, gitExec: t.gitExec, evidenceFor, liveComments: [],
+        ghView: { 5742: { headRefOid: t.head, labels, isDraft: false } }, requestRedTeam: () => ({ requested: true }) });
+      h.s.enqueue({ num: 5742 }, t.head);
+      expect(reads).toContain(t.accepted);
+      headEvidence = { scheduled: true, recorded: false, inFlight: true, loopPayload: { verdict: { verdict: 'accept' } } };
+      reads.length = 0;
+      const before = h.logs.length;
+      h.s.enqueue({ num: 5742 }, t.head);
+      expect(reads).not.toContain(t.accepted);
+      expect(h.logs.slice(before).join('')).not.toContain('moved only by drain numbering');
+    } finally { rmSync(t.cwd, { recursive: true, force: true }); }
+  });
+  it('Codex audit #4: a finished-but-unusable ancestor result does not block recovery — the exact head is requested as today', () => {
+    const t = setup();
+    try {
+      const done = { scheduled: true, recorded: true, inFlight: false, attempted: true, loopPayload: { verdict: { verdict: 'accept' } } };
+      const r = run({ ...t, evidenceFor: ({ head }) => (head === t.accepted ? done : { scheduled: false, recorded: false, inFlight: false, loopPayload: null }) });
+      expect(r.requests).toEqual([expect.objectContaining({ pr: 5742, head: t.head })]);
     } finally { rmSync(t.cwd, { recursive: true, force: true }); }
   });
   it('the head\'s own evidence always wins over an ancestor', () => {

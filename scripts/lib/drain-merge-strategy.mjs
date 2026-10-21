@@ -42,7 +42,7 @@ import { labelSignature } from './drain-prestage.mjs';
 import { readDrainRedTeamEvidence } from './drain-red-team-evidence.mjs';
 import { redTeamEnabled } from './review-red-team-policy.mjs';
 import { readDrainQueueSafety, postAcceptRedTeamOwed, redTeamEnqueueHold as redTeamEnqueueHoldAtHead, dequeueSentBack, sendBackReason } from './drain-queue-safety.mjs';
-import { numberingRedTeamAlias, hasRedTeamEvidence } from './numbering-red-team-alias.mjs';
+import { numberingProvenAncestors, hasRedTeamEvidence } from './numbering-red-team-alias.mjs';
 import { resolveNumberingRedTeamSetting } from './numbering-carry.mjs';
 import { defaultPostConflictFinding } from './conflict-finding.mjs';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
@@ -284,55 +284,72 @@ export function createDrainMergeStrategy({
   const { policy, note } = resolved;
   const statusProvider = labelProvider ?? createGhProvider({ exec: (args, opts) => exec('gh', args, opts) });
   const say = (line) => { if (!quiet) log.write(`${line}\n`); };
-  // #5742: when the exact head's red-team hold would hold or request, and the head moved only by the drain's own
+  // #5742: when the exact head's red-team hold would hold or request, the exact head carries NO red-team trace at
+  // all (no run/status/saved evidence, no thread record naming it), and the head moved only by the drain's own
   // numbering commit(s) over an ancestor with red-team evidence (numbering-red-team-alias.mjs), that ancestor's
-  // evidence and gate records decide instead, so a pure renumber never requests a red team or a fresh review.
-  // A clear exact-head answer, the head's own evidence, or a failed proof all keep today's exact-head behavior.
+  // evidence and gate records decide, so a pure renumber never requests a red team or a fresh review. Anything on
+  // the exact head (a break, a send-back, a pending recheck) always decides first. Only the git proof is cached;
+  // evidence and the thread are re-read on every decision. A failed proof keeps today's exact-head behavior.
   const readRedTeamEvidenceAtHead = readRedTeamEvidence;
   let numberingRedTeam = { value: false, source: 'unresolved' };
   try { numberingRedTeam = numberingRedTeamSetting(); } catch (e) { say(`  ⚠ review.carryRedTeamAcrossNumbering unreadable (${firstLine(e)}) — exact-head red-team evidence only`); }
   let numberingRedTeamLogged = false;
-  const redTeamAliases = new Map();
-  // Read-only probes (recordedHold, yieldTargetHold) never run git; they reuse an alias this pass already proved.
-  // recordedHold's clear answer is never authorization, so there an unproven alias falls through (null) to the
-  // ordinary enqueue, which may prove it, instead of answering a hold from the exact head.
+  const numberingProofs = new Map(); // repo#pr@head → proven ancestors, nearest first (git proof only)
+  const lastAlias = new Map(); // repo#pr@head → { head, evidence } chosen by the latest hold decision
+  // Read-only probes (recordedHold, yieldTargetHold) never run git; they reuse a proof this pass already made.
+  // Unproven: recordedHold falls through (null) to the ordinary enqueue, whose clear answer is the only authority;
+  // yieldTargetHold throws, which its caller reads as "cannot tell" and keeps today's yield.
   let redTeamAliasReadOnly = false;
   const ALIAS_UNPROVEN = Symbol('numbering alias unproven in a read-only probe');
   const readOnlyRedTeam = (fn, { fallThrough = false } = {}) => {
     const was = redTeamAliasReadOnly; redTeamAliasReadOnly = fallThrough ? 'fall-through' : true;
     try { return fn(); } catch (e) { if (e === ALIAS_UNPROVEN) return null; throw e; } finally { redTeamAliasReadOnly = was; }
   };
-  const redTeamAliasFor = ({ repo, pr, head, env: e = env }) => {
+  const threadNamesHead = (comments, head) => (Array.isArray(comments) ? comments : []).some((c) => {
+    const body = String(c?.body ?? '');
+    return body.includes(head) && /red-team|review-verdict-carried/.test(body);
+  });
+  const redTeamAliasFor = ({ repo, pr, head, comments, env: e = env, ...exactEvidence }) => {
     const key = `${repo}#${pr}@${head}`;
-    if (redTeamAliases.has(key)) return redTeamAliases.get(key);
-    if (redTeamAliasReadOnly === true) return null;
-    if (hasRedTeamEvidence(readRedTeamEvidenceAtHead({ repo, pr, head, env: e }))) { redTeamAliases.set(key, null); return null; }
+    lastAlias.delete(key);
     if (!numberingRedTeamLogged) { numberingRedTeamLogged = true; say(`  policy · review.carryRedTeamAcrossNumbering=${numberingRedTeam.value} (${numberingRedTeam.source})`); }
-    if (!numberingRedTeam.value) { redTeamAliases.set(key, null); return null; }
-    if (redTeamAliasReadOnly === 'fall-through') throw ALIAS_UNPROVEN;
-    const found = numberingRedTeamAlias({ exec, cwd, head,
-      hasEvidence: (sha) => hasRedTeamEvidence(readRedTeamEvidenceAtHead({ repo, pr, head: sha, env: e })) });
-    if (found) say(`  merge-queue: #${pr} head ${String(head).slice(0, 9)} moved only by drain numbering over ${found.head.slice(0, 9)} (${found.reason}); red-team evidence read from ${found.head.slice(0, 9)} — no new red team or review`);
-    redTeamAliases.set(key, found?.head ?? null);
-    return found?.head ?? null;
+    if (!numberingRedTeam.value || !/^[0-9a-f]{40}$/.test(String(head))) return null;
+    // The hold's own input carries the exact head's evidence (every call site spreads it); never re-read it here.
+    if (hasRedTeamEvidence(exactEvidence) || threadNamesHead(comments, head)) return null;
+    let ancestors = numberingProofs.get(key);
+    if (!ancestors) {
+      if (redTeamAliasReadOnly === 'fall-through') throw ALIAS_UNPROVEN;
+      if (redTeamAliasReadOnly) throw new Error(`#${pr} head ${String(head).slice(0, 9)}: numbering alias not yet proven this pass`);
+      ancestors = numberingProvenAncestors({ exec, cwd, head });
+      numberingProofs.set(key, ancestors);
+    }
+    for (const { head: ancestor, reason } of ancestors) {
+      const evidence = readRedTeamEvidenceAtHead({ repo, pr, head: ancestor, env: e });
+      if (!hasRedTeamEvidence(evidence)) continue;
+      say(`  merge-queue: #${pr} head ${String(head).slice(0, 9)} moved only by drain numbering over ${ancestor.slice(0, 9)} (${reason}); red-team evidence read from ${ancestor.slice(0, 9)} — no new red team or review`);
+      lastAlias.set(key, { head: ancestor, evidence });
+      return lastAlias.get(key);
+    }
+    return null;
   };
-  // The ancestor's red team is the one owed (still pending there): never request a second one for the renumbered head.
-  // `requested: true` keeps the gate waiting on that ancestor's result (no never-scheduled escape opens).
+  // A red team still queued or running on the ancestor is the one owed: never request a second for the renumbered
+  // head (`requested: true` keeps the gate waiting on it). Anything else (a finished but unusable result, stranded
+  // work) requests for the exact head as today, so recovery is never blocked.
   const requestRedTeamAtHead = requestRedTeam;
   if (typeof requestRedTeamAtHead === 'function') requestRedTeam = (o) => {
-    const alias = redTeamAliases.get(`${o.repo}#${o.pr}@${o.head}`);
-    if (!alias) return requestRedTeamAtHead(o);
-    say(`  merge-queue: #${o.pr} no red-team request for ${String(o.head).slice(0, 9)} — drain numbering over ${alias.slice(0, 9)}, whose red team decides`);
-    return { requested: true, numberingAlias: alias };
+    const alias = lastAlias.get(`${o.repo}#${o.pr}@${o.head}`);
+    const live = alias && (alias.evidence.inFlight || alias.evidence.queued || (alias.evidence.scheduled && !alias.evidence.recorded));
+    if (!live) return requestRedTeamAtHead(o);
+    say(`  merge-queue: #${o.pr} no red-team request for ${String(o.head).slice(0, 9)} — drain numbering over ${alias.head.slice(0, 9)}, whose red team is still running`);
+    return { requested: true, numberingAlias: alias.head };
   };
   const redTeamEnqueueHold = (o) => {
     const reason = redTeamEnqueueHoldAtHead(o);
     if (!reason) return reason;
     const alias = redTeamAliasFor(o);
     if (!alias) return reason;
-    const evidence = readRedTeamEvidenceAtHead({ repo: o.repo, pr: o.pr, head: alias, env: o.env ?? env });
     return redTeamEnqueueHoldAtHead({ ...o, requestPending: false, scheduled: false, inFlight: false, recorded: false, attempted: false,
-      queued: false, loopPayload: undefined, skipCardOnly: undefined, ...evidence, head: alias });
+      queued: false, loopPayload: undefined, skipCardOnly: undefined, ...alias.evidence, head: alias.head });
   };
   /**
    * Read-modify-write of the shared follow-up state file: under the land lock, RE-READ the file (so an enqueue by

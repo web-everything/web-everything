@@ -600,10 +600,12 @@ export function numberingCommitIdentityArgs(CWD, { git = (a) => quietGit(CWD, a)
   const trusted = String(git(['log', '--grep=^drain: JIT-number ', '--format=%an%x00%ae%x00%s', 'origin/main']) ?? '')
     .split('\n').map((line) => line.split('\0')).filter(([name, email, s]) => name && email && subject.test(s ?? ''));
   if (!trusted.length) return [];
-  const own = [git(['config', 'user.name']), git(['config', 'user.email'])];
-  if (trusted.some(([name, email]) => name === own[0] && email === own[1])) return [];
+  // The EFFECTIVE author (author.* config and GIT_AUTHOR_* env beat user.*), not user.* alone.
+  const own = /^(.*) <([^>]*)> \d+ [+-]\d{4}$/.exec(String(git(['var', 'GIT_AUTHOR_IDENT']) ?? '').trim());
+  if (own && trusted.some(([name, email]) => name === own[1] && email === own[2])) return [];
   const [name, email] = trusted[0];
-  return ['-c', `user.name=${name}`, '-c', `user.email=${email}`];
+  // `--author` overrides config and environment for this one commit; the caller verifies the result.
+  return [`--author=${name} <${email}>`];
 }
 
 /** #2225 — the post-land heal/regen/numbering dirty-probe. These steps `git checkout --detach origin/main`
@@ -1227,8 +1229,10 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1 } = {}) {
   const summary = [...assigned.map((a) => `${a.hash}→#${a.nnn}`), ...dupDropped.map((d) => `${d.hash} duplicate dropped (already ${d.existing.replace(/^backlog\//, '')})`)].join(', ');
   const identitySetting = resolveNumberingCommitIdentitySetting();
   const identityArgs = numberingCommitIdentityArgs(CWD, { setting: identitySetting });
-  process.stderr.write(`policy · drain.numberingCommitIdentity=${identitySetting.value} (${identitySetting.source})${identityArgs.length ? ` → ${identityArgs[1].slice(10)}` : ''}\n`);
-  const committed = quietGit(CWD, [...identityArgs, 'commit', '-m', assertNoClosingKeywordRef(`drain: JIT-number ${summary} at land (#2288)`, 'JIT-number commit message'), '--', ...paths]) != null;
+  process.stderr.write(`policy · drain.numberingCommitIdentity=${identitySetting.value} (${identitySetting.source})${identityArgs.length ? ` → ${identityArgs[0].slice(9)}` : ''}\n`);
+  const committed = quietGit(CWD, ['commit', ...identityArgs, '-m', assertNoClosingKeywordRef(`drain: JIT-number ${summary} at land (#2288)`, 'JIT-number commit message'), '--', ...paths]) != null;
+  if (committed && identityArgs.length && quietGit(CWD, ['log', '-1', '--format=%an <%ae>']) !== identityArgs[0].slice(9))
+    process.stderr.write(`  ⚠ drain.numberingCommitIdentity: the numbering commit's author is not ${identityArgs[0].slice(9)} — CI may not trust it\n`);
   return finish({ assigned, held, committed, unresolvedReferences, droppedDuplicates: dupDropped, renamed: [...renames, ...livePathRenames].map((r) => r.to), changedPaths: paths });
 }
 
