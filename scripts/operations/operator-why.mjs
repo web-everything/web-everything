@@ -2,9 +2,20 @@
 import { op } from './registry.mjs';
 import { compute } from './step-kinds.mjs';
 import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
+import { RED_TEAM_STATUS_LABELS } from '../lib/red-team-status-label-meta.mjs';
 
 export const WHY_OP = 'why';
 const compact = value => String(value ?? '').replace(/[\r\n]+/g, ' ');
+// Remove terminal sequences before controls, normalize to one line, then apply the preview bound.
+export function commentPreview(value) {
+  return String(value ?? '').replace(/<!--[\s\S]*?(?:-->|$)/g, '')
+    .replace(/(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/(?:\x1b\]|\x9d)[\s\S]*?(?:\x07|\x1b\\|\x9c|$)/g, '')
+    .replace(/\x1b[ -/]*[@-~]/g, '')
+    .replace(/[\t\n\v\f\r\x85\u2028\u2029]/g, ' ')
+    .replace(/[\x00-\x1f\x7f-\x9f]/g, '')
+    .replace(/\s+/gu, ' ').trim().slice(0, 260);
+}
 const names = labels => (labels ?? []).map(l => l.name ?? l);
 export function lastMentionLine(text, subject) {
   const id = String(subject.id).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -43,9 +54,11 @@ export function explainWhy(facts) {
     [!isPr && f.prepareFailures?.some(p => p.held && !p.completed), () => row('nobody (parked: prepare failure)', 'prepare failure held', command('retry-prepare'))],
     [!isPr && f.card?.status === 'active' && linked, () => row(linked.explanation?.owner ?? 'unknown', `see why --pr=${linked.number}`)],
     [!isPr && f.card?.status === 'open' && f.card?.queued, () => row('builder', log('builder') || 'queued; builder log has no mention')],
-    [true, () => row('unknown', 'no signal found')],
   ];
-  const result = rules.find(([matches]) => matches)[1]();
+  const redTeamWaitingFor = isPr && RED_TEAM_STATUS_LABELS.some(label => label !== 'red-team:clear' && has(label)) && !f.redTeam?.isLiveHead
+    ? `red team (no result for live head ${String(f.pr?.headRefOid ?? 'unknown').slice(0, 9)})` : null;
+  const matched = rules.find(([matches]) => matches);
+  const result = matched ? matched[1]() : row('unknown', redTeamWaitingFor ?? 'no signal found');
   const section = (name, lines) => ({ name, lines: lines.length ? lines.map(compact) : ['—'] });
   const sections = [
     section('state', isPr ? [`${f.pr?.state ?? 'unknown'}; draft=${f.pr?.isDraft ?? 'unknown'}; mergeable=${f.pr?.mergeable ?? 'unknown'}`, `labels: ${labels.join(', ') || '—'}`]
@@ -65,9 +78,12 @@ export function explainWhy(facts) {
   ];
   // Preserve complete structured evidence; bound only the operator's screen, with explicit omitted counts.
   const screen = [`why ${subject.kind} ${subject.id}`, ...sections.flatMap(s => [s.name, ...s.lines.slice(0, s.name === 'daemons' ? 7 : 3).map(l => `  ${l}`), ...(s.lines.length > (s.name === 'daemons' ? 7 : 3) ? [`  … ${s.lines.length - (s.name === 'daemons' ? 7 : 3)} more (see --json)`] : [])]),
+    ...(isPr ? [`red team: ${f.redTeam ? compact(`${f.redTeam.state}; verdict=${f.redTeam.verdict ?? '—'}; head=${f.redTeam.head}; live=${f.redTeam.isLiveHead}; updated=${f.redTeam.updatedAt}`) : 'unavailable (see gaps)'}`,
+      ...(redTeamWaitingFor ? [`red team waiting for: ${redTeamWaitingFor}`] : []),
+      'recent:', ...((f.recentComments ?? []).length ? f.recentComments.slice(-3).map(c => `  ${commentPreview(c.createdAt)} ${commentPreview(c.author ?? 'unknown')}: ${commentPreview(c.body)}`) : ['  —'])] : []),
     ...(result.suggestedOp ? [`suggested: ${result.suggestedOp}`] : []),
     ...((f.gaps ?? []).length ? ['gaps', ...f.gaps.slice(0, 5).map(g => `  ${compact(g.source)}: ${compact(g.error)}`), ...(f.gaps.length > 5 ? [`  … ${f.gaps.length - 5} more gaps (see --json)`] : [])] : [])].join('\n');
-  return { subject, ...result, sections, screen };
+  return { subject, ...result, redTeam: f.redTeam ?? null, redTeamWaitingFor, sections, screen };
 }
 
 export function whyOperation({ readWhy } = {}) {

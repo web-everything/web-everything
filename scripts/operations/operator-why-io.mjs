@@ -1,6 +1,6 @@
 /** Operator decision 2026-10-13: manual intervention without a worker. All why IO is injectable here. */
 import { execFileSync } from 'node:child_process';
-import { readdirSync, readFileSync, existsSync } from 'node:fs';
+import { readdirSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createClaimReader, REPO_ROOT } from './claim-io.mjs';
@@ -21,11 +21,36 @@ import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { evaluatePr, rulingNeededRow, redTeamRulingRow } from './operator-queue.mjs';
 import { orderReadyCandidates } from '../merge-ai-prs.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
-import { explainWhy, lastMentionLine } from './operator-why.mjs';
+import { explainWhy, lastMentionLine, commentPreview } from './operator-why.mjs';
+import { readRedTeamStatusRecord, redTeamStatusDir } from '../lib/drain-red-team-evidence.mjs';
+
+// Prefer the live head; otherwise retain usable history and report each failed candidate.
+function readWhyRedTeam({ repo, pr, head, env, listFiles, readText, readStat, safe }) {
+  const dir = redTeamStatusDir(env), prefix = `${encodeURIComponent(repo)}-${Number(pr)}-`;
+  const files = listFiles(dir).filter(file => file.startsWith(prefix) && /^[a-f0-9]{40}\.json$/i.test(file.slice(prefix.length)));
+  const liveFile = files.find(file => file.slice(prefix.length, -5) === head);
+  const candidates = (liveFile ? [liveFile] : files).map(file => safe('red team', () => {
+    const candidateHead = file.slice(prefix.length, -5);
+    const candidate = readRedTeamStatusRecord({ repo, pr, head: candidateHead, env, readText, readStat });
+    const { record, at } = candidate;
+    if (record?.repo !== repo || Number(record.pr) !== Number(pr) || record.head !== candidateHead
+      || typeof record.status !== 'string' || !Number.isFinite(at)) throw new Error(`invalid red-team status record: ${file}`);
+    return candidate;
+  }, null)).filter(Boolean).sort((a, b) => b.at - a.at);
+  if (!candidates.length) {
+    if (!files.length) throw new Error('no red-team status record for PR');
+    return null;
+  }
+  const { record, at } = candidates[0];
+  // The writer has no updatedAt field; the drain also uses the status file's mtime.
+  return { head: record.head, state: record.status, verdict: record.result ?? null,
+    updatedAt: new Date(at).toISOString(), isLiveHead: Boolean(head) && record.head === head };
+}
 
 export function createWhyReader({
   root = REPO_ROOT, home = homedir(), coordinationRoot = resolveCoordinationRoot(), run = execFileSync,
   listFiles = readdirSync, readText = path => readFileSync(path, 'utf8'), pathExists = existsSync,
+  env = process.env, readStat = statSync,
   tail = tailFile, listPlists = listDaemonPlistFiles, readPlist = path => readPlistAsJson(path, { exec: run }),
   readCard = createClaimReader({ root, listFiles, readText, exec: run }),
   readComments = (pr, repo) => readCompletePrComments(pr, { repo, exec: run }),
@@ -48,7 +73,11 @@ export function createWhyReader({
     const allPrs = safe(pr ? 'open PRs' : 'linked PRs', () => { const rows = listPrs(repo, { state: pr ? 'open' : 'all' }); if (!Array.isArray(rows)) throw new Error('expected PR array'); if (rows.length >= 10000) gaps.push({ source: pr ? 'open PRs' : 'linked PRs', error: 'listing may be truncated' }); return rows; }, []);
     if (pr) {
       facts.pr = safe('PR state', () => JSON.parse(run('gh', ['pr', 'view', String(pr), '--repo', repo, '--json', 'number,state,isDraft,labels,headRefOid,mergeable,statusCheckRollup'], { encoding: 'utf8', timeout: 60000, maxBuffer: 32 * 1024 * 1024 })), {});
+      facts.redTeam = safe('red team', () => readWhyRedTeam({ repo, pr, head: facts.pr.headRefOid, env, listFiles, readText, readStat, safe }), null);
       const comments = safe('comments', () => readComments(pr, repo), null);
+      facts.recentComments = (comments ?? []).slice(-3).map(c => ({ createdAt: c.createdAt,
+        author: c.author?.login ?? null,
+        body: commentPreview(c.body) }));
       if (comments) {
         facts.pr.comments = comments;
         facts.standDown = safe('stand-down', () => { const c = latestUnresolvedStandDown(comments); return c ? { ...c, reason: standDownReason(c.body) ?? 'unknown' } : null; }, null);
@@ -78,7 +107,7 @@ export function createWhyReader({
       facts.linkedPrs = allPrs.filter(p => String(cardForPr(p)) === subject.id).sort((a, b) => Number(b.state === 'OPEN') - Number(a.state === 'OPEN') || b.number - a.number);
       // A single linked PR uses the same explanation, without enumerating all ownership sessions/lanes.
       if (facts.card.status === 'active' && facts.linkedPrs[0]) {
-        const linkedFacts = createWhyReader({ root, home, coordinationRoot, run, listFiles, readText, pathExists, tail, listPlists, readPlist, readCard, readComments, readRequiredChecks, readChecks, readClaims, readBuildHolds, readBackoffs, readPrepareFailures, readAgents, listPrs, now })({ pr: facts.linkedPrs[0].number, repo });
+        const linkedFacts = createWhyReader({ root, home, coordinationRoot, run, listFiles, readText, pathExists, env, readStat, tail, listPlists, readPlist, readCard, readComments, readRequiredChecks, readChecks, readClaims, readBuildHolds, readBackoffs, readPrepareFailures, readAgents, listPrs, now })({ pr: facts.linkedPrs[0].number, repo });
         facts.linkedPrs[0] = { ...facts.linkedPrs[0], explanation: explainWhy(linkedFacts) };
         gaps.push(...linkedFacts.gaps.map(g => ({ ...g, source: `linked PR ${g.source}` })));
       }

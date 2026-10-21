@@ -13,6 +13,14 @@ import { readRedTeamProbes } from './red-team-gate.mjs';
 export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDir(env)), 'red-team-status');
 const statusPath = ({ repo, pr, head }, env) => join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
 
+/** Read one persisted record without scheduler probes or filesystem mutations. */
+export function readRedTeamStatusRecord({ repo, pr, head, env = process.env,
+  readText = path => readFileSync(path, 'utf8'), readStat = statSync } = {}) {
+  const path = statusPath({ repo, pr, head }, env);
+  const record = JSON.parse(readText(path));
+  return { record, at: readStat(path).mtimeMs };
+}
+
 /** A status is written before settling speculation or starting the sequential pass; crashes leave a dead pid. */
 export function recordRedTeamStatus({ repo, pr, loopPayload, status, result = null }, { env = process.env, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime } = {}) {
   const head = loopPayload?.findings?.read?.netBasis?.rev;
@@ -46,8 +54,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   const owes = run => redTeamEnabled(env) && redTeamOwedFor(run);
   let status, statusAt = 0;
   try {
-    status = JSON.parse(readFileSync(statusPath({ repo, pr, head }, env), 'utf8'));
-    statusAt = statSync(statusPath({ repo, pr, head }, env)).mtimeMs;
+    ({ record: status, at: statusAt } = readRedTeamStatusRecord({ repo, pr, head, env }));
   } catch (e) { if (e.code !== 'ENOENT') throw e; }
   if (status?.repo === repo && Number(status.pr) === Number(pr) && status.head === head) {
     // A finished status from an earlier review of this same head never supersedes a newer accepting run (a re-review
