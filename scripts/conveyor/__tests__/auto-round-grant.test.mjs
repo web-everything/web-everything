@@ -5,9 +5,9 @@
  *   kind), the per-PR cap (ledger seeded from existing grants + reservations), idempotency, the expected-head check
  *   right before the write, redaction, and the daemon hook.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { afterAll, describe, it, expect, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { withFileLock } from '../../lib/atomic-json-file.mjs';
@@ -273,7 +273,10 @@ describe('read-time scope (standing-ruling-io)', () => {
   });
 });
 
-const tmpLedger = () => { const dir = mkdtempSync(join(tmpdir(), 'arg-')); return (slug, pr, fn) => withPrLedger(slug, pr, fn, { dir }); };
+const tmpDirs = [];
+const tmpDir = () => { const dir = mkdtempSync(join(tmpdir(), 'arg-')); tmpDirs.push(dir); return dir; };
+afterAll(() => { for (const dir of tmpDirs) rmSync(dir, { recursive: true, force: true }); });
+const tmpLedger = () => { const dir = tmpDir(); return (slug, pr, fn) => withPrLedger(slug, pr, fn, { dir }); };
 /** A fake GitHub thread: posts append App-authored comments; head can be moved by a test. */
 const fakeGh = ({ comments = [], head = HEAD, state = 'OPEN' } = {}) => {
   const t = { comments: [...comments], head, state };
@@ -414,7 +417,7 @@ describe('concurrency and durable-before-post, on the real file lock and ledger'
     expect(claimDir({})).toBe(join(homedir(), 'workspace', '.operations', 'coordination', 'auto-round-grant'));
   });
   it('a second worker on the same PR while the first is deciding is refused by the lock: no read, no post', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'arg-')); const gh = fakeGh(); let inner; let innerReads = 0;
+    const dir = tmpDir(); const gh = fakeGh(); let inner; let innerReads = 0;
     const innerGh = { readThread: vi.fn(() => { innerReads += 1; return gh.readThread(); }), post: vi.fn() };
     gh.readThread.mockImplementationOnce(() => {
       inner = call(deps(gh, { ledger: worker(dir), readThread: innerGh.readThread, post: innerGh.post }), later);
@@ -427,7 +430,7 @@ describe('concurrency and durable-before-post, on the real file lock and ledger'
     expect(call(deps(gh, { ledger: worker(dir) }), later)).toMatchObject({ action: 'granted', count: 2 });
     expect(gh.post).toHaveBeenCalledTimes(2);
     // Control: the same interleaving with no lock lets the second worker into the decision.
-    const open = mkdtempSync(join(tmpdir(), 'arg-')); const gh2 = fakeGh(); let openReads = 0;
+    const open = tmpDir(); const gh2 = fakeGh(); let openReads = 0;
     const noLock = (slug, pr, fn) => withPrLedger(slug, pr, fn, { dir: open, lock: (_p, f) => f() });
     gh2.readThread.mockImplementationOnce(() => {
       inner = call(deps(gh2, { ledger: noLock, readThread: () => { openReads += 1; return gh2.readThread(); } }), later);
@@ -437,13 +440,13 @@ describe('concurrency and durable-before-post, on the real file lock and ledger'
     expect(openReads).toBeGreaterThan(0);
   });
   it('the production default takes the PR\'s file lock around the ledger section', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'arg-')); let held;
+    const dir = tmpDir(); let held;
     withPrLedger(WE, 5654, () => { held = existsSync(ledgerPath(dir).replace(/\.json$/, '.lock')); }, { dir });
     expect(held).toBe(true);
     expect(existsSync(ledgerPath(dir).replace(/\.json$/, '.lock'))).toBe(false);
   });
   it('the ledger is read after the lock is taken: a reservation written while waiting is honoured', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'arg-')); const gh = fakeGh();
+    const dir = tmpDir(); const gh = fakeGh();
     const key = autoGrantKey({ repo: 'we', note, head: HEAD });
     // Another worker's reservation lands between this worker's call and its lock acquisition.
     const lateWriter = (slug, pr, fn) => withPrLedger(slug, pr, fn, { dir, lock: (p, f) => {
@@ -454,7 +457,7 @@ describe('concurrency and durable-before-post, on the real file lock and ledger'
     expect(gh.post).not.toHaveBeenCalled();
   });
   it('a slow holder that is still alive keeps its lock past the stale age: no read, no post', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'arg-')); const gh = fakeGh();
+    const dir = tmpDir(); const gh = fakeGh();
     const lockFile = ledgerPath(dir).replace(/\.json$/, '.lock');
     writeFileSync(lockFile, `${process.ppid}\n`); // a live process other than this one
     utimesSync(lockFile, new Date(0), new Date(0));
@@ -464,14 +467,14 @@ describe('concurrency and durable-before-post, on the real file lock and ledger'
     expect(readFileSync(lockFile, 'utf8')).toBe(`${process.ppid}\n`);
   });
   it('a second worker at the moment of the post is refused too: the lock spans the post', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'arg-')); const gh = fakeGh(); let inner;
+    const dir = tmpDir(); const gh = fakeGh(); let inner;
     gh.post.mockImplementationOnce((_r, _p, body) => { inner = call(deps(gh, { ledger: worker(dir) }), later); landed(gh, body); });
     expect(call(deps(gh, { ledger: worker(dir) }))).toMatchObject({ action: 'granted' });
     expect(inner).toMatchObject({ action: 'skip', why: expect.stringMatching(/^ledger: withFileLock: timed out/) });
     expect(gh.post).toHaveBeenCalledTimes(1);
   });
   it('the reservation is on disk before the post; a crash at the post still holds the slot for the next worker', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'arg-')); const gh = fakeGh(); let atPost;
+    const dir = tmpDir(); const gh = fakeGh(); let atPost;
     const key = autoGrantKey({ repo: 'we', note, head: HEAD });
     // The post never reaches GitHub; snapshot what a process killed at this instant would leave behind.
     gh.post.mockImplementationOnce(() => { atPost = readFileSync(ledgerPath(dir), 'utf8'); throw new Error('killed'); });
@@ -491,10 +494,61 @@ describe('concurrency and durable-before-post, on the real file lock and ledger'
     expect(existsSync(lockFile)).toBe(false);
   });
   it('an unreadable ledger fails closed before any thread read or post', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'arg-')); const gh = fakeGh();
+    const dir = tmpDir(); const gh = fakeGh();
     writeFileSync(ledgerPath(dir), '{"baseline":');
     expect(call(deps(gh, { ledger: worker(dir) }))).toEqual({ action: 'skip', why: expect.stringContaining('ledger unreadable') });
     expect(gh.readThread).not.toHaveBeenCalled(); expect(gh.post).not.toHaveBeenCalled();
+  });
+
+  // PR #5758 red team (round 6): two daemons hold the same snapshot of a card-only PR at its fix cap. Worker A grants;
+  // worker B's stale note must not publish the round-limit alert, comment, or park the PR to a person.
+  describe('a stale concurrent cap note after another worker answered it', () => {
+    const fixNote = { ...note, capKind: 'fix', parkToHuman: true };
+    const safety = { value: { alertAtRoundCap: true }, sources: { alertAtRoundCap: 'test' } };
+    const snapshot = () => ({ notes: [fixNote], prsByNumber: new Map([[5654, { number: 5654, headRefOid: HEAD, labels: [], comments: [] }]]) });
+    const daemon = (d) => {
+      const effects = { publish: vi.fn(), postComment: vi.fn(() => ({ ok: true })), parkToHuman: vi.fn(() => ({ ok: true })) };
+      const out = runReconcileNotesAllRepos({ repos: ['we'], tick: snapshot, dryRun: false, safety, ...effects,
+        stuckAfterGrant: () => null, autoRoundGrant: (a) => autoRoundGrant(a, d) });
+      return { out, ...effects };
+    };
+    it('worker B, after A granted the same limit hit, parks nothing and publishes nothing', () => {
+      const dir = tmpDir(); const gh = fakeGh();
+      expect(call(deps(gh, { ledger: worker(dir) }), fixNote)).toMatchObject({ action: 'granted' });
+      const b = daemon(deps(gh, { ledger: worker(dir) }));
+      expect(b.out.autoGrants).toEqual([expect.objectContaining({ action: 'already-granted' })]);
+      expect(b.parkToHuman).not.toHaveBeenCalled(); expect(b.publish).not.toHaveBeenCalled(); expect(b.postComment).not.toHaveBeenCalled();
+      expect(gh.post).toHaveBeenCalledTimes(1);
+    });
+    it('worker B while A is still deciding (lock held) defers the note instead of parking', () => {
+      const dir = tmpDir(); const gh = fakeGh(); let b;
+      gh.post.mockImplementationOnce((_r, _p, body) => { b = daemon(deps(gh, { ledger: worker(dir) })); landed(gh, body); });
+      expect(call(deps(gh, { ledger: worker(dir) }), fixNote)).toMatchObject({ action: 'granted' });
+      expect(b.out.autoGrants).toEqual([expect.objectContaining({ action: 'deferred' })]);
+      expect(b.parkToHuman).not.toHaveBeenCalled(); expect(b.publish).not.toHaveBeenCalled(); expect(b.postComment).not.toHaveBeenCalled();
+    });
+    it('a claimed limit hit whose grant never landed (failed post) still alerts and parks', () => {
+      const dir = tmpDir(); const gh = fakeGh();
+      gh.post.mockImplementationOnce(() => { throw new Error('network'); });
+      expect(call(deps(gh, { ledger: worker(dir) }), fixNote)).toMatchObject({ action: 'failed' });
+      const b = daemon(deps(gh, { ledger: worker(dir) }));
+      expect(b.out.autoGrants).toEqual([expect.objectContaining({ action: 'skip', why: expect.stringMatching(/^already claimed/) })]);
+      expect(b.parkToHuman).toHaveBeenCalledTimes(1); expect(b.publish).toHaveBeenCalledTimes(1);
+    });
+    it('an untrusted record for the same limit hit does not make the note moot', () => {
+      const key = autoGrantKey({ repo: 'we', note: fixNote, head: HEAD });
+      const gh = fakeGh({ comments: [{ ...autoGrant({ episode: key }), author: { login: 'mallory' } }, autoGrant({ episode: key, head: HEAD2 })] });
+      const b = daemon(deps(gh));
+      expect(b.out.autoGrants[0].action).not.toBe('already-granted');
+      expect(b.parkToHuman).toHaveBeenCalledTimes(1);
+    });
+    it('a note suppressed by a grant still gets the never-silently-stuck check', () => {
+      const dir = tmpDir(); const gh = fakeGh(); const publish = vi.fn();
+      call(deps(gh, { ledger: worker(dir) }), fixNote);
+      runReconcileNotesAllRepos({ repos: ['we'], tick: snapshot, dryRun: false, safety, publish, postComment: () => ({ ok: true }), parkToHuman: () => ({ ok: true }),
+        stuckAfterGrant: () => 'auto-grant did not free a round: x', autoRoundGrant: (a) => autoRoundGrant(a, deps(gh, { ledger: worker(dir) })) });
+      expect(publish).toHaveBeenCalledWith(expect.objectContaining({ pr: 5654, kind: 'at-round-limit', reason: 'auto-grant did not free a round: x' }));
+    });
   });
 });
 

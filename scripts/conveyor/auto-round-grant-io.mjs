@@ -90,6 +90,8 @@ export function postPrComment(repo, pr, body, { gh = ghApp } = {}) {
 /**
  * The hook. Returns null when the note is not one the ruling covers at all (no reads made), else one of:
  *   { action: 'granted', count, max, key }      — skip the needs-you event; the cap is raised
+ *   { action: 'already-granted', key }          — skip it too: a stale note for a hit another worker's grant answered
+ *   { action: 'deferred', why }                 — skip it this pass: another worker holds this PR's lock
  *   { action: 'cap-reached', used, max, reason } — publish with this reason
  *   { action: 'skip', why }                      — publish unchanged
  *   { action: 'failed', why }                    — publish unchanged (reservation kept; a person decides)
@@ -136,8 +138,14 @@ export function autoRoundGrant({ repo, note, pr }, {
         }
       }
       const seed = seeded ? baseline : 0;
-      if (entries.some((e) => e.key === key)) return { action: 'skip', why: `already claimed: ${key}` };
       const scope = scopeOf({ repo: slug, pr: { number: note.prNumber, headRefOid: thread?.headRefOid, comments }, ruling });
+      if (entries.some((e) => e.key === key)) {
+        // A stale note (another worker's snapshot) for a limit hit already answered by a grant the trusted reader
+        // credits on the fresh thread is moot: never alert or park over it. A claim with no credited grant stays a skip.
+        const answered = roundExtensionGrants(comments, { repo: slug, pr: note.prNumber, standingRuling: scope })
+          .some((g) => g.standingRuling && grantEpisode(comments[g.index]) === key);
+        return answered ? { action: 'already-granted', key } : { action: 'skip', why: `already claimed: ${key}` };
+      }
       const onGitHub = countAutoRoundGrants(comments, { repo: slug, pr: note.prNumber, standingRuling: scope });
       // Conservative: every automation grant record on the thread NOW (verified or not), the ledger (seeded from
       // historical grants) plus every reservation since, and the verified count — the largest wins.
@@ -187,9 +195,17 @@ export function autoRoundGrant({ repo, note, pr }, {
       }
     });
   } catch (e) {
-    // Another worker holds this PR's lock (it is deciding the same PR) or the ledger is unreadable: never grant.
+    // Another worker holds this PR's lock: it is deciding this same PR right now, so this note waits for the next
+    // pass (never alert or park over a grant that may be landing). An unreadable ledger: never grant, alert as usual.
+    if (/^withFileLock: timed out/.test(String(e?.message))) return { action: 'deferred', why: `ledger: ${firstLine(e)}` };
     return { action: 'skip', why: `ledger: ${firstLine(e)}` };
   }
+}
+
+/** The limit-hit key a grant comment's record names, or null. */
+function grantEpisode(comment) {
+  const m = String(comment?.body ?? '').match(/^<!-- round-extension: (.+) -->$/m);
+  try { return m ? JSON.parse(m[1])?.episode ?? null : null; } catch { return null; }
 }
 
 /** How long a PR may stay labelled at its round limit after an automatic grant before a person is told. */

@@ -405,21 +405,8 @@ export function runReconcileNotesAllRepos({
     }
     const { repo, result } = entry;
     const prsByNumber = result?.prsByNumber ?? new Map();
-    // Never silently stuck after an automatic grant: a PR still at its round limit well after one gets its
-    // needs-you event (published even though the grant's own pass suppressed it; the feed dedups per head).
-    if (!dryRun && safety.value.alertAtRoundCap) {
-      const noted = new Set((result?.notes ?? []).map((n) => n.prNumber));
-      for (const pr of prsByNumber.values()) {
-        if (noted.has(pr?.number)) continue;
-        let reason = null;
-        try { reason = stuckAfterGrant({ repo, pr }); } catch (e) { reason = null; process.stderr.write(`auto-round-grant stuck check ${repo}#${pr?.number}: ${redactedFirstLine(e)}\n`); }
-        if (!reason) continue;
-        autoGrants.push({ repo, prNumber: pr.number, action: 'stuck', why: reason });
-        process.stderr.write(`auto-round-grant ${repo}#${pr.number}: stuck — ${reason}\n`);
-        try { publish({ repo: CONSTELLATION_REPOS[repo]?.slug ?? repo, pr: pr.number, head: pr.headRefOid ?? '', kind: 'at-round-limit', reason }); }
-        catch (e) { process.stderr.write(`needs-you publication failed: ${redactedFirstLine(e)}\n`); }
-      }
-    }
+    // PRs whose cap note a grant made moot (this pass's own, another worker's, or one being decided right now).
+    const graceNotes = new Set();
     for (const n of (result?.notes ?? [])) {
       const tagged = { ...n, repo };
       notes.push(tagged);
@@ -434,7 +421,8 @@ export function runReconcileNotesAllRepos({
         if (autoGrant) {
           autoGrants.push({ repo, prNumber: n.prNumber, ...autoGrant });
           process.stderr.write(`auto-round-grant ${repo}#${n.prNumber}: ${autoGrant.action}${autoGrant.why ? ` — ${redactedFirstLine(autoGrant.why)}` : ''}${autoGrant.count ? ` (${autoGrant.count}/${autoGrant.max})` : ''}\n`);
-          if (autoGrant.action === 'granted') continue;
+          // A stale note (another worker already granted this limit hit, or is deciding it now) parks and alerts nothing.
+          if (['granted', 'already-granted', 'deferred'].includes(autoGrant.action)) { graceNotes.add(n.prNumber); continue; }
         }
       }
       if (!dryRun && safety.value.alertAtRoundCap && ['round-cap-exhausted', 'ci-heal-exhausted', 'ruling-dispute', 'ci-heal-escalated'].includes(n.kind)) {
@@ -496,6 +484,22 @@ export function runReconcileNotesAllRepos({
         dryRun: false,
         ...(outcome.ok ? {} : { error: outcome.error }),
       });
+    }
+    // Never silently stuck after an automatic grant: a PR still at its round limit well after one gets its
+    // needs-you event (published even though the grant's own pass suppressed it; the feed dedups per head). A PR
+    // whose note a grant made moot is checked too, so a suppressed stale note can never hide a stuck PR.
+    if (!dryRun && safety.value.alertAtRoundCap) {
+      const noted = new Set((result?.notes ?? []).map((n) => n.prNumber).filter((number) => !graceNotes.has(number)));
+      for (const pr of prsByNumber.values()) {
+        if (noted.has(pr?.number)) continue;
+        let reason = null;
+        try { reason = stuckAfterGrant({ repo, pr }); } catch (e) { reason = null; process.stderr.write(`auto-round-grant stuck check ${repo}#${pr?.number}: ${redactedFirstLine(e)}\n`); }
+        if (!reason) continue;
+        autoGrants.push({ repo, prNumber: pr.number, action: 'stuck', why: reason });
+        process.stderr.write(`auto-round-grant ${repo}#${pr.number}: stuck — ${reason}\n`);
+        try { publish({ repo: CONSTELLATION_REPOS[repo]?.slug ?? repo, pr: pr.number, head: pr.headRefOid ?? '', kind: 'at-round-limit', reason }); }
+        catch (e) { process.stderr.write(`needs-you publication failed: ${redactedFirstLine(e)}\n`); }
+      }
     }
   }
   return { repos: perRepo, notes, refusals, comments, autoGrants };
