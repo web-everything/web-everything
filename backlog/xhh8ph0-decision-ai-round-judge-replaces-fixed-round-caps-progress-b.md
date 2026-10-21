@@ -52,7 +52,28 @@ Related: `we:scripts/operations/extend-rounds.mjs` and `we:scripts/operations/ex
 
 ## Acceptance
 
-- [A1] **Executable** — `node we:scripts/backlog.mjs show xhh8ph0` reports `preparedDate` set and every open question above carries options, tradeoffs and a bold default (the /prepare outcome); the command fails before preparation and passes after.
+- [A1] **Executable** — run the read-only command below from the WE repo root. It exits 1 before preparation and 0 once `preparedDate` is set and all five questions above have prepared forks. Preparation must give each question a `## Fork N` section (N = 1–5, matching the question numbers), with nonempty `Options:` and `Tradeoffs:` lines and a `Default: **recommended option**` line. Review the substance of those options and tradeoffs during /prepare; this command checks their presence.
+
+  ```sh
+  node --input-type=commonjs <<'NODE'
+  const { readFileSync } = require('node:fs');
+  const assert = require('node:assert/strict');
+  const matter = require('gray-matter');
+  const { data, content } = matter(readFileSync('backlog/xhh8ph0-decision-ai-round-judge-replaces-fixed-round-caps-progress-b.md', 'utf8'));
+  assert.ok(data.preparedDate && String(data.preparedDate).trim(), 'preparedDate must be set');
+  const body = content.replace(/^[ \t]*```[^\n]*\n[\s\S]*?^[ \t]*```[ \t]*$/gm, '');
+  for (let n = 1; n <= 5; n++) {
+    const sections = [...body.matchAll(/^## Fork (\d+)\b[^\n]*\n([\s\S]*?)(?=^## |$(?![\s\S]))/gm)].filter(m => Number(m[1]) === n);
+    assert.equal(sections.length, 1, `question ${n}: expected one Fork section`);
+    const fork = sections[0][2];
+    for (const label of ['Options', 'Tradeoffs'])
+      assert.match(fork, new RegExp(`^${label}:[ \\t]*\\S[^\\n]*$`, 'm'), `question ${n}: missing ${label}`);
+    assert.match(fork, /^Default:[ \t]*\*\*[^*\n]*\S[^*\n]*\*\*[ \t]*$/m, `question ${n}: missing bold default`);
+  }
+  console.log('PASS: preparedDate and all five prepared forks present');
+  NODE
+  ```
+
 - [A2] **Executable** — the ruling, once made, is codified in `we:docs/agent/platform-decisions.md` and `codifiedIn` is set on this card.
 - [A3] **Must** — the ruling states what happens when the judge fails, times out or returns malformed output (answer: no grant, round state unchanged, logged).
 - [A4] **Must** — the ruling states which finding classes the judge may never card or grant over (confirmed correctness and security breaks, guard and gate files).
