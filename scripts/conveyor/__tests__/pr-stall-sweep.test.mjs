@@ -306,3 +306,10 @@ describe('wiring', () => {
     expect(off.enqueue).not.toHaveBeenCalled();
   });
 });
+
+describe('stand-down routing default', () => {
+  it('the repo file sends a stood-down fixer to the operator digest (auto would route it to the tooling check)', () => {
+    const s = resolveStallSweepSettings({ env: {}, log: () => {} });
+    expect(s.value.stateLanes).toMatchObject({ 'system:fix-stood-down': 'operator' });
+  });
+});
