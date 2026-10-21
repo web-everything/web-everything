@@ -711,6 +711,8 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
     catch (e) { return { action: 'error', reason: `withdrawal failed: ${errorReason(e)}`, commentPosted: true }; }
   };
   const isRecordOf = (from, to) => (c) => { const r = restampRecord(c); return Boolean(r) && r.from === from && r.to === to; };
+  // A posted record does not say which proof made it: with the accept switch off, never finish an automated accept from it.
+  if (plan.labelsOnly && !plan.human && !acceptSetting.value) return null;
   if (plan.labelsOnly) {
     if (dryRun) return { action: 'would-restamp', from: plan.from, to: plan.to, human: plan.human, actor: plan.actor, labelsOnly: true };
     const live = recheck(true);

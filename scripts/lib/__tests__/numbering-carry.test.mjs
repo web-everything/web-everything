@@ -655,6 +655,9 @@ describe('numbering acceptance restamp', () => {
     const result = run({ state: { labels: ['review:pending'], headRefOid: TO, comments: [rec, restamp] }, dryRun: true,
       acceptSetting: { value: false, source: 'env' }, prove: () => ({ ok: true, reason: 'verified' }) });
     expect(result).toBeNull();
+    const withNetPatch = run({ state: { labels: ['review:pending'], headRefOid: TO, comments: [rec, restamp] }, dryRun: true,
+      netPatchSetting: { value: true, source: 'standard' }, acceptSetting: { value: false, source: 'env' }, prove: () => ({ ok: true, reason: 'verified' }) });
+    expect(withNetPatch).toBeNull();
   });
   describe('a hold that arrives while the proof runs (red team #5233)', () => {
     const ok = () => ({ ok: true, reason: 'verified' });
