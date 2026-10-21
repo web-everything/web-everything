@@ -75,7 +75,7 @@ import { applyReviewStatus } from '../conveyor/review-status-tag.mjs';
 import { spawnCiHealRearm } from '../conveyor/ci-heal-mark.mjs';
 import { staleAcceptanceOwed } from '../conveyor/rearm-review.mjs';
 import { createGhProvider, PR_COMMENTS_PAGE_SIZE } from '../lib/review-label-provider.mjs';
-import { latestAcceptRecord } from '../lib/accept-carry-forward.mjs';
+import { latestAcceptRecord, isKnownMachineBody } from '../lib/accept-carry-forward.mjs';
 import { execFileSync } from 'node:child_process';
 import { readNetDiffAtHead } from '../merge-ai-prs.mjs';
 import { defaultCloneDirFor } from '../conveyor/accept-carry-sweep.mjs';
@@ -185,18 +185,35 @@ export function defaultRearmStaleAcceptance({ repoSlug, prNumber, headSha,
         // release its stale-accept hold; any other refusal (state moved, labels changed) stays a plain refusal.
         // Audit (#5771): content equality alone is not "the accept still stands". Also require the accept to be unsuperseded
         // (no later verdict/hold comment, no standing formal review, complete thread, readable reviews) and no pending review.
-        let covers = false;
+        // Every failed condition is NAMED (the refusal log line prints them): a bare "or review state changed" hid #5771's cause.
+        const failed = [];
+        const need = (ok, why) => { if (!ok) failed.push(why); };
         try {
           const names = (fresh.labels ?? []).map(l => (typeof l === 'string' ? l : l?.name));
           const comments = Array.isArray(fresh.comments) ? fresh.comments : [];
-          const reviews = readReviews(repoSlug, prNumber);
+          let reviews = null;
+          try { reviews = readReviews(repoSlug, prNumber); } catch (e) { failed.push(`reviews read failed: ${String(e?.message ?? e).split('\n')[0].slice(0, 120)}`); }
+          need(fresh.state === 'OPEN', `state=${fresh.state}`);
+          need(fresh.headRefOid === headSha, `head moved to ${String(fresh.headRefOid).slice(0, 8)} (plan row ${String(headSha).slice(0, 8)})`);
+          need(!names.includes('review:pending'), 'review:pending label present');
+          need(comments.length < PR_COMMENTS_PAGE_SIZE, `thread truncated (${comments.length} comments >= ${PR_COMMENTS_PAGE_SIZE})`);
+          need(Array.isArray(reviews), 'formal reviews unreadable');
           const rec = comments.length < PR_COMMENTS_PAGE_SIZE && Array.isArray(reviews) ? latestAcceptRecord(comments, reviews) : null;
-          covers = fresh.state === 'OPEN' && fresh.headRefOid === headSha && !names.includes('review:pending')
-            && !!rec && !rec.laterVerdict && !rec.laterBodyDerivedHold && !rec.reviewsUnreadable && !rec.humanCleared
-            && staleAcceptanceOwed(fresh, { requireProof: false })
-            && !staleAcceptanceOwed({ ...fresh, headDiff: net.text, headContribution: net.text });
-        } catch { covers = false; }
-        return { ok: false, ...(covers ? { covers: true, coveredHead: headSha } : {}), reason: 'acceptance still covers the head, or review state changed' };
+          if (comments.length < PR_COMMENTS_PAGE_SIZE && Array.isArray(reviews)) need(!!rec, 'no accept record found');
+          if (rec) {
+            const later = comments.slice(rec.index + 1);
+            const culprits = later.filter(c => !isKnownMachineBody(c?.body, c)).map(c => `${c?.author?.login ?? c?.user?.login ?? '?'}#${c?.id ?? c?.databaseId ?? '?'}:${JSON.stringify(String(c?.body ?? '').slice(0, 40))}`);
+            need(!rec.laterVerdict, `later non-machine comment(s) after the accept: ${culprits.slice(0, 3).join(' | ') || 'a standing formal review'}`);
+            need(!rec.laterBodyDerivedHold, 'later body-derived hold');
+            need(!rec.reviewsUnreadable, 'reviews unreadable');
+            need(!rec.humanCleared, 'accept is human-cleared');
+          }
+          need(staleAcceptanceOwed(fresh, { requireProof: false }), 'accept no longer owed on the cheap nomination');
+          need(!staleAcceptanceOwed({ ...fresh, headDiff: net.text, headContribution: net.text }), 'live diff does NOT match the accepted diff (accept stale)');
+        } catch (e) { failed.push(`probe threw: ${String(e?.message ?? e).split('\n')[0].slice(0, 120)}`); }
+        const covers = failed.length === 0;
+        return { ok: false, ...(covers ? { covers: true, coveredHead: headSha } : {}),
+          reason: covers ? 'acceptance still covers the head (live diff match, accept unsuperseded)' : `refused, covers=false: ${failed.join('; ')}` };
       }
     }
     return rearm({ repo: repoSlug, pr: prNumber, onlyIfAccepted: true, actor: 'conveyor stale-accept recovery' });
