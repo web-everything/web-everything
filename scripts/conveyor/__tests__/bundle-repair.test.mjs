@@ -1,0 +1,243 @@
+// Bundle repair (prototype, 2026-10-21): the supervised overlay-top repair for a daemon clone held on its last-good
+// build by an overlay conflict. Pins the trigger thresholds, one repair per clone, the kill switch, the brief never
+// carrying a forbidden command, and the escalation path.
+import { describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import {
+  BUNDLE_REPAIR_BOT, BUNDLE_REPAIR_STANDARD, HOLD_RULES, assertBriefSafe, cloneName, heldRefs, holdIdFor,
+  planBundleRepairs, planReconcile, validateOutcome,
+} from '../bundle-repair-core.mjs';
+import {
+  defaultLock, fillRepairBrief, ledgerPath, outcomePath, readLedger, recordOutcome, resolveBundleRepairSettings, runBundleRepairs,
+} from '../bundle-repair-dispatch.mjs';
+
+const MIN = 60_000;
+const NOW = Date.parse('2026-10-21T21:00:00Z');
+const ROOT = '/ws/wev-review-daemon';
+const KEY = '206df80ef82e6401';
+const held = (minutesAgo, reason = 'established-overlay-conflict') => ({
+  since: NOW - minutesAgo * MIN, reason, failed: 'lane/unfreeze-review-top-1021b, lane/ruling-identity: conflict with main', lastGood: 'a'.repeat(40),
+});
+const clone = (minutesAgo, o = {}) => ({ cloneKey: KEY, root: ROOT, held: held(minutesAgo), ...o });
+const on = (o = {}) => ({ ...BUNDLE_REPAIR_STANDARD, enabled: true, mode: 'live', ...o });
+
+describe('planBundleRepairs — trigger and budget', () => {
+  it('does nothing while disabled (the default) or with the kill switch', () => {
+    expect(planBundleRepairs({ clones: [clone(60)], settings: BUNDLE_REPAIR_STANDARD, now: NOW }).off).toBe('disabled');
+    const k = planBundleRepairs({ clones: [clone(60)], settings: on(), killed: true, now: NOW });
+    expect(k.off).toBe('kill-switch');
+    expect(k.dispatch).toEqual([]);
+  });
+
+  it('waits for the trigger minutes, then dispatches once', () => {
+    const under = planBundleRepairs({ clones: [clone(19)], settings: on({ triggerMinutes: 20 }), now: NOW });
+    expect(under.dispatch).toEqual([]);
+    expect(under.held[0].rule).toBe(HOLD_RULES.UNDER_TRIGGER);
+    const over = planBundleRepairs({ clones: [clone(20)], settings: on({ triggerMinutes: 20 }), now: NOW });
+    expect(over.dispatch).toHaveLength(1);
+    expect(over.dispatch[0]).toMatchObject({ cloneKey: KEY, root: ROOT, name: 'review', refs: ['lane/unfreeze-review-top-1021b', 'lane/ruling-identity'] });
+  });
+
+  it('only repairs overlay-conflict holds on selected, known clones', () => {
+    const smoke = planBundleRepairs({ clones: [{ cloneKey: KEY, root: ROOT, held: held(60, 'smoke-rejected') }], settings: on(), now: NOW });
+    expect(smoke.dispatch).toEqual([]);
+    expect(smoke.held[0].rule).toBe(HOLD_RULES.NOT_OVERLAY_HOLD);
+    expect(planBundleRepairs({ clones: [{ cloneKey: KEY, root: ROOT, held: held(60, 'pinned-overlay-conflict') }], settings: on(), now: NOW }).dispatch).toHaveLength(1);
+    expect(planBundleRepairs({ clones: [clone(60)], settings: on({ clones: ['fix'] }), now: NOW }).held[0].rule).toBe(HOLD_RULES.NOT_SELECTED);
+    expect(planBundleRepairs({ clones: [clone(60)], settings: on({ clones: ['review'] }), now: NOW }).dispatch).toHaveLength(1);
+    expect(planBundleRepairs({ clones: [clone(60, { root: null })], settings: on(), now: NOW }).held[0].rule).toBe(HOLD_RULES.UNKNOWN_ROOT);
+  });
+
+  it('one repair per clone, one attempt per hold, max concurrent', () => {
+    const c = clone(60);
+    const running = [{ cloneKey: KEY, holdId: 'older', status: 'running' }];
+    expect(planBundleRepairs({ clones: [c], ledger: running, settings: on(), now: NOW }).held[0].rule).toBe(HOLD_RULES.ONE_PER_CLONE);
+    const done = [{ cloneKey: KEY, holdId: holdIdFor(c, c.held), status: 'escalated' }];
+    expect(planBundleRepairs({ clones: [c], ledger: done, settings: on(), now: NOW }).held[0].rule).toBe(HOLD_RULES.ONE_PER_HOLD);
+    const other = { cloneKey: 'fde6cfdae10394e1', root: '/ws/wev-fix-daemon', held: held(60) };
+    const two = planBundleRepairs({ clones: [c, other], settings: on({ maxConcurrent: 1 }), now: NOW });
+    expect(two.dispatch).toHaveLength(1);
+    expect(two.held[0].rule).toBe(HOLD_RULES.MAX_CONCURRENT);
+  });
+
+  it('names clones the way the operator does', () => {
+    expect(cloneName('/ws/wev-review-daemon')).toBe('review');
+    expect(cloneName('/ws/wev-health-watch')).toBe('health-watch');
+    expect(cloneName('/ws/.lanes/we-drain-daemon/code')).toBe('we-drain-code');
+    expect(heldRefs({ failed: 'lane/a (PR #12), lane/b: conflict with main' })).toEqual(['lane/a', 'lane/b']);
+  });
+});
+
+describe('the brief never carries a forbidden command', () => {
+  const target = { root: ROOT, name: 'review', holdId: 'review-206df80e-x', refs: ['lane/a', 'lane/b'] };
+
+  it('the real template fills cleanly with no conflict override, no force push, no hook bypass', async () => {
+    const { prompt, session } = await fillRepairBrief(target);
+    expect(prompt).not.toMatch(/--allow-conflict/);
+    expect(prompt).not.toMatch(/push[^\n]*(--force|\s-f\b)/);
+    expect(prompt).not.toMatch(/--no-verify/);
+    expect(prompt).not.toMatch(/\{\{/);
+    expect(prompt).toContain(`--clone=${ROOT}`);
+    expect(prompt).toContain(`--allow-no-pr --by=${BUNDLE_REPAIR_BOT}`);
+    expect(prompt).toContain('weakened-twice');
+    expect(session).toBe('bundle-repair-review-206df80e-x');
+  });
+
+  it('refuses a brief that carries one', async () => {
+    expect(() => assertBriefSafe('node daemon-overlay.mjs add --ref=x --allow-conflict --reason=y')).toThrow(/conflict override/);
+    expect(() => assertBriefSafe('LANE_SESSION=s git push --force origin HEAD')).toThrow(/force push/);
+    expect(() => assertBriefSafe('git push origin +HEAD:refs/heads/x')).toThrow(/force push/);
+    expect(() => assertBriefSafe('git commit --no-verify')).toThrow(/hook bypass/);
+    const bad = (r) => `${readFileSync(join(r, 'skills-src/conveyor/bundle-repair-brief.md'), 'utf8')}\nthen add --allow-conflict\n`;
+    await expect(fillRepairBrief(target, { readBrief: bad })).rejects.toThrow(/forbidden/);
+  });
+});
+
+describe('validateOutcome', () => {
+  it('two WEAKENED audits can only be recorded as an escalation', () => {
+    const audits = [{ verdict: 'WEAKENED' }, { verdict: 'WEAKENED' }, { verdict: 'NOT WEAKENED' }];
+    expect(() => validateOutcome({ outcome: 'repaired', top: 'lane/unfreeze-review-top-1021d', audits, detail: 'x' })).toThrow(/weakened-twice/);
+    expect(validateOutcome({ outcome: 'escalate', reason: 'weakened-twice', audits, detail: 'x' }).reason).toBe('weakened-twice');
+    expect(() => validateOutcome({ outcome: 'repaired', top: 'lane/t', audits: [{ verdict: 'WEAKENED' }], detail: 'x' })).toThrow(/final NOT WEAKENED/);
+    expect(() => validateOutcome({ outcome: 'escalate', reason: 'wall-time', audits: [], detail: 'x' })).toThrow(/reason/);
+  });
+});
+
+describe('planReconcile — the escalation path', () => {
+  const c = clone(60);
+  const id = holdIdFor(c, c.held);
+  const entry = (o = {}) => ({ holdId: id, cloneKey: KEY, root: ROOT, status: 'running', startedAt: NOW - 30 * MIN, deadlineAt: NOW + 90 * MIN, ...o });
+
+  it('hold cleared → cleared, no escalation', () => {
+    expect(planReconcile([entry()], { clones: [{ ...c, held: null }], now: NOW })).toEqual([expect.objectContaining({ status: 'cleared', escalate: null, stop: true })]);
+  });
+  it('session escalated → stop + escalate with its reason', () => {
+    const a = planReconcile([entry()], { clones: [c], now: NOW, outcomeFor: () => ({ outcome: 'escalate', reason: 'unresolvable-conflict', detail: 'd' }) });
+    expect(a[0]).toMatchObject({ stop: true, status: 'escalated', escalate: 'unresolvable-conflict' });
+  });
+  it('a conflict override by the bot → escalate, even when the session said repaired', () => {
+    const a = planReconcile([entry()], { clones: [c], now: NOW, overrideFor: () => ({ ref: 'lane/x' }), outcomeFor: () => ({ outcome: 'repaired', top: 'lane/x' }) });
+    expect(a[0].escalate).toBe('conflict-override-used');
+  });
+  it('wall time → escalate; repaired but still held at the wall time → hold-not-cleared', () => {
+    expect(planReconcile([entry({ deadlineAt: NOW })], { clones: [c], now: NOW })[0].escalate).toBe('wall-time');
+    expect(planReconcile([entry({ status: 'repaired', deadlineAt: NOW })], { clones: [c], now: NOW })[0]).toMatchObject({ escalate: 'hold-not-cleared', stop: false });
+  });
+});
+
+describe('runBundleRepairs (IO shell, every seam injected)', () => {
+  const setup = () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bundle-repair-'));
+    const selfSync = [{ cloneKey: KEY, rebuild: { held: held(60) } }];
+    const published = [];
+    const dispatched = [];
+    const stopped = [];
+    const seams = {
+      dir, selfSync, now: NOW, root: process.cwd(),
+      rootsByKey: async () => new Map([[KEY, ROOT]]),
+      killed: () => false,
+      overrideFor: async () => null,
+      dispatch: async (t, o) => { dispatched.push({ t, o }); return { handle: 'h1' }; },
+      stop: async (e) => { stopped.push(e.holdId); },
+      publish: async (item) => { published.push(item); },
+      log: () => {},
+      host: 'test-host',
+    };
+    return { dir, published, dispatched, stopped, seams };
+  };
+  const settings = (o) => ({ settingsResolved: { settings: on(o), sources: {}, invalid: [] } });
+
+  it('live: launches ONE session per clone, and a second tick launches none', async () => {
+    const { dir, dispatched, seams } = setup();
+    const s1 = await runBundleRepairs({ ...seams, ...settings() });
+    expect(s1.dispatched).toHaveLength(1);
+    expect(dispatched[0].o.prompt).not.toMatch(/--allow-conflict/);
+    expect(readLedger(dir)[0]).toMatchObject({ status: 'running', handle: 'h1', deadlineAt: NOW + 120 * MIN });
+    const s2 = await runBundleRepairs({ ...seams, now: NOW + MIN, ...settings() });
+    expect(s2.dispatched).toEqual([]);
+    expect(s2.held[0].rule).toBe(HOLD_RULES.ONE_PER_CLONE);
+    expect(dispatched).toHaveLength(1);
+  });
+
+  it('kill switch: nothing launched', async () => {
+    const { dispatched, seams } = setup();
+    const s = await runBundleRepairs({ ...seams, killed: () => true, ...settings() });
+    expect(s.off).toBe('kill-switch');
+    expect(dispatched).toEqual([]);
+  });
+
+  it('shadow: posts the brief it would launch, once per hold, and launches nothing', async () => {
+    const { dir, dispatched, published, seams } = setup();
+    const s = await runBundleRepairs({ ...seams, ...settings({ mode: 'shadow' }) });
+    expect(dispatched).toEqual([]);
+    expect(s.shadow).toHaveLength(1);
+    const entry = readLedger(dir)[0];
+    expect(entry.status).toBe('shadow');
+    expect(readFileSync(entry.briefPath, 'utf8')).toContain(`--clone=${ROOT}`);
+    expect(published[0]).toMatchObject({ kind: 'bundle-repair-shadow' });
+    await runBundleRepairs({ ...seams, now: NOW + MIN, ...settings({ mode: 'shadow' }) });
+    expect(published).toHaveLength(1);
+  });
+
+  it('escalation: a recorded escalate stops the session and raises ONE needs-you item; never re-dispatched', async () => {
+    const { dir, published, stopped, dispatched, seams } = setup();
+    await runBundleRepairs({ ...seams, ...settings() });
+    const e = readLedger(dir)[0];
+    mkdirSync(join(dir, 'bundle-repair', 'outcomes'), { recursive: true });
+    writeFileSync(outcomePath(dir, e.holdId), JSON.stringify({ outcome: 'escalate', reason: 'weakened-twice', detail: 'audit said WEAKENED twice' }));
+    const s = await runBundleRepairs({ ...seams, now: NOW + 5 * MIN, ...settings() });
+    expect(s.escalated).toEqual([{ holdId: e.holdId, reason: 'weakened-twice' }]);
+    expect(stopped).toEqual([e.holdId]);
+    expect(published).toHaveLength(1);
+    expect(published[0]).toMatchObject({ kind: 'bundle-repair', repo: 'host/test-host', pr: 0 });
+    expect(published[0].reason).toMatch(/weakened-twice/);
+    await runBundleRepairs({ ...seams, now: NOW + 10 * MIN, ...settings() });
+    expect(dispatched).toHaveLength(1);
+    expect(published).toHaveLength(1);
+  });
+
+  it('a pass already holding the ledger lock makes the next pass skip, not double-launch', async () => {
+    const { dir } = setup();
+    let inner = null;
+    await defaultLock(dir, async () => { inner = await defaultLock(dir, async () => 'ran').catch((e) => e.message); });
+    expect(inner).toMatch(/holds the ledger lock/);
+    expect(existsSync(`${ledgerPath(dir)}.lock`)).toBe(false);
+  });
+
+  it('record: only the session holding the capability, once', async () => {
+    const { dir, seams } = setup();
+    let token;
+    await runBundleRepairs({ ...seams, dispatch: async (t, o) => { token = o.token; return { handle: 'h' }; }, ...settings() });
+    const e = readLedger(dir)[0];
+    const input = { outcome: 'repaired', top: 'lane/unfreeze-review-top-1021d', audits: [{ verdict: 'NOT WEAKENED' }], detail: 'ok' };
+    expect(() => recordOutcome({ dir, holdId: e.holdId, session: e.session, input, token: 'wrong' })).toThrow(/capability/);
+    expect(() => recordOutcome({ dir, holdId: e.holdId, session: 'other', input, token })).toThrow(/belongs to/);
+    recordOutcome({ dir, holdId: e.holdId, session: e.session, input, token });
+    expect(() => recordOutcome({ dir, holdId: e.holdId, session: e.session, input, token })).toThrow();
+  });
+});
+
+describe('settings via the cascade', () => {
+  it('standard default is off + shadow; tool and env layers override with their source named; invalid ignored', async () => {
+    const env = { WE_POLICY_CASCADE_LOG: '0' };
+    const std = await resolveBundleRepairSettings({ env, tool: undefined, platform: null });
+    expect(std.settings.mode).toBe('shadow');
+    const log = vi.fn();
+    const r = await resolveBundleRepairSettings({
+      env: { WE_BUNDLE_REPAIR_ENABLED: '1', WE_POLICY_CASCADE_LOG: '1' }, platform: null, log,
+      tool: { enabled: false, triggerMinutes: 45, maxConcurrent: 99, clones: ['review'] },
+    });
+    expect(r.settings).toMatchObject({ enabled: true, triggerMinutes: 45, maxConcurrent: 1, clones: ['review'], mode: 'shadow' });
+    expect(r.sources).toMatchObject({ enabled: 'env', triggerMinutes: 'tool', maxConcurrent: 'standard', mode: 'standard' });
+    expect(r.invalid.join()).toMatch(/maxConcurrent/);
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/^policy-cascade · bundleRepair: .*enabled=true \(env\)/));
+  });
+
+  it('the committed tool file ships disabled, in shadow', () => {
+    const file = JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/bundle-repair.json'), 'utf8'));
+    expect(file.bundleRepair).toMatchObject({ enabled: false, mode: 'shadow' });
+  });
+});
