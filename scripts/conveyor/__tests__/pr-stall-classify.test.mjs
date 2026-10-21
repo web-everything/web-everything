@@ -116,6 +116,32 @@ describe('stale hold setting', () => {
 });
 
 describe('fail closed', () => {
+  it.each([
+    ['null-prototype object', () => Object.create(null)],
+    ['throwing message getter', () => ({ get message() { throw new Error('unreadable message'); } })],
+    ['throwing conversion', () => ({ [Symbol.toPrimitive]() { throw new Error('unreadable value'); } })],
+    ['unreadable message value', () => ({ message: Object.create(null) })],
+    ['revoked proxy', () => { const { proxy, revoke } = Proxy.revocable({}, {}); revoke(); return proxy; }],
+  ])('an unreadable thrown %s still returns an operator item', (_name, makeError) => {
+    const error = makeError();
+    const r = classifyStall({ row: row('fixing'), head: HEAD, get settings() { throw error; } });
+    expect(r).toEqual({ lane: 'operator', action: 'unclassified', reason: 'fail-closed: classifier error (unreadable error)',
+      key: `${REPO}#77@${HEAD.toLowerCase()}:fixing`, command: null, evidence: [] });
+    const fallback = classifyStall({ get settings() { throw error; }, get row() { throw error; } });
+    expect(fallback).toEqual({ ...r, key: '?#0@:unknown' });
+  });
+  it.each([
+    ['error', new Error('readable error'), 'readable error'],
+    ['string', 'readable string', 'readable string'],
+    ['null', null, 'null'],
+    ['undefined', undefined, 'undefined'],
+    ['symbol', Symbol('failure'), 'Symbol(failure)'],
+    ['long message', new Error('x'.repeat(200)), 'x'.repeat(120)],
+  ])('a thrown %s retains its bounded diagnostic', (_name, error, message) => {
+    const r = classifyStall({ get settings() { throw error; } });
+    expect([r.lane, r.action]).toEqual(['operator', 'unclassified']);
+    expect(r.reason).toBe(`fail-closed: classifier error (${message})`);
+  });
   it.each([[null], [{}], [{ repo: REPO, number: '77', waitingOn: 'x', stalled: true }], [{ repo: REPO, number: 77, stalled: true }],
     [row('fixing', { stalled: 'false' })], [{ ...row('fixing'), stalled: undefined }], [row('fixing', { repo: '' })], [row('fixing', { repo: '../..' })], [row('fixing', { repo: 'someone/else' })], [row('fixing', { number: -3 })],
     [row('fixing', { liveJob: undefined })], [row('fixing', { liveJob: 0 })], [row('fixing', { why: { unreadable: true } })],

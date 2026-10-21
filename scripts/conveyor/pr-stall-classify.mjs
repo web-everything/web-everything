@@ -143,7 +143,9 @@ export function classifyStall(o) {
   try { return classifyUnsafe(o); } catch (e) {
     let key = '?#0@:unknown';
     try { const row = o?.row ?? {}; key = keyOf({ repo: row.repo ?? '?', number: row.number ?? 0, waitingOn: row.waitingOn ?? 'unknown' }, o?.head); } catch { /* keep the placeholder */ }
-    return { lane: 'operator', action: 'unclassified', reason: `fail-closed: classifier error (${String(e?.message ?? e).slice(0, 120)})`,
+    let message = 'unreadable error';
+    try { message = String(e?.message ?? e).slice(0, 120); } catch { /* thrown values can have unreadable getters or conversions */ }
+    return { lane: 'operator', action: 'unclassified', reason: `fail-closed: classifier error (${message})`,
       key, command: null, evidence: [] };
   }
 }
