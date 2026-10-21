@@ -14,17 +14,22 @@ import { daemonCloneRoots, isDaemonCloneRealpath } from '../lib/daemon-clone-reg
 import { workspaceOf } from '../lib/automation-home.mjs';
 import { REPO_ROOT, createRecordReferralRulingReader } from './record-referral-ruling-io.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
+import { assertOperatorCliFresh } from '../lib/main-staleness.mjs';
 
 export async function runReferralFindingsCli(argv, { readRulingContext, root = REPO_ROOT,
   env = process.env, cloneRoots = daemonCloneRoots } = {}) {
   let real;
   try { real = realpathSync(root); } catch { real = resolve(root); }
   // The shared reader fetches for freshness; resident clones belong to their gated rebuild.
-  if (env.WE_DAEMON_MANAGED_CLONE === '1' || /(?:^|[/\\])[^/\\]*-daemon(?:[/\\]|$)/.test(real)
+  if (env.WE_DAEMON_MANAGED_CLONE === '1' || /(?:^|[/\\])(?:wev-[^/\\]*|[^/\\]*-daemon[^/\\]*)(?:[/\\]|$)/.test(real)
     || isDaemonCloneRealpath(real, cloneRoots(workspaceOf(real), { env }))) {
     throw new Error('referral-findings refuses daemon clones; run from a lane');
   }
-  readRulingContext ??= createRecordReferralRulingReader();
+  readRulingContext ??= createRecordReferralRulingReader({ root: real, env,
+    // Never fetch in or re-exec from cwd's checkout, even if fallback is enabled by settings/env.
+    assertFresh: () => assertOperatorCliFresh(real, { label: 'referral-findings',
+      env: { ...env, WE_OPERATOR_CLI_FRESH_FALLBACK: 'off' } }),
+  });
   const declaration = referralFindingsOperation({ readRulingContext });
   const registry = createRegistry();
   registry.register(declaration);
@@ -38,7 +43,7 @@ export async function runReferralFindingsCli(argv, { readRulingContext, root = R
       ...findings.flatMap((f) => [`[${f.group}] ${f.file}:${f.line} — ${f.summary}`,
         `--finding=${f.finding}`,
         `standing rulings (newest first): ${f.standing.map((r) => `${r.id} (${r.result})`).join(', ') || 'none'}`,
-        ...(f.group === 'disputed' ? [`blockIds: ${f.blockIds.join(', ')}`] : []), f.command]));
+        ...(f.group === 'disputed' ? [`blockIds: ${f.blockIds.join(', ')}`] : []), f.command, f.cardCommand]));
   }
   return result;
 }

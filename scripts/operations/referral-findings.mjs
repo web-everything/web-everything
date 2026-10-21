@@ -20,11 +20,13 @@ export function assessReferralFindings(read, { repo, pr }) {
   };
   const findings = Object.entries(groups).flatMap(([group, targets]) => targets.map((f) => {
     const standing = [...(f.standing ?? [])].reverse();
-    const command = `node scripts/run-fresh.mjs record-referral-ruling --repo=${quote(repo)} --pr=${pr}`
-      + ` --finding=${quote(f.key)}${group === 'ruled' ? ` --supersedes=${quote(f.standing.at(-1).id)}` : ''}`
-      + ` --ruling=<${OPERATOR_RULING_RESULTS.join('|')}> --actor=<login> --channel=<where> --reason="<operator's words>"`;
+    const prefix = `node scripts/run-fresh.mjs record-referral-ruling --repo=${quote(repo)} --pr=${pr}`
+      + ` --finding=${quote(f.key)}${group === 'ruled' ? ` --supersedes=${quote(f.standing.at(-1).id)}` : ''}`;
+    const operator = ` --actor=<login> --channel=<where> --reason="<operator's words>"`;
+    const command = `${prefix} --ruling=<${OPERATOR_RULING_RESULTS.filter((r) => r !== 'card').join('|')}>${operator}`;
+    const cardCommand = `${prefix} --ruling=card --card=<we:backlog path>${operator}`;
     return { group, finding: f.key, file: f.file, line: f.line, summary: f.summary,
-      standing, rulingIds: standing.map((r) => r.id), ...(group === 'disputed' ? { blockIds: f.blockIds } : {}), command };
+      standing, rulingIds: standing.map((r) => r.id), ...(group === 'disputed' ? { blockIds: f.blockIds } : {}), command, cardCommand };
   }));
   return { repo, pr, head: read.head, findings };
 }
