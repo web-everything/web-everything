@@ -119,12 +119,15 @@ export function withGitError(run) {
       const lines = String(cause?.stderr ?? '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
       const last = lines.filter((line) => /^(fatal:|error:)/.test(line)).at(-1)
         || lines.at(-1) || String(cause?.message ?? cause).split('\n')[0];
-      const kept = lines.filter((line) => KEEP_LINE_RE.test(line) && line !== last).slice(0, 4).map((line) => line.slice(0, 300));
+      // Porcelain-mode status records (`!\t<src>:<dst>\t[rejected] (fetch first)`) arrive on STDOUT: a rejected one is
+      // kept too, first, so the error still says WHY the push was refused.
+      const status = String(cause?.stdout ?? '').split(/\r?\n/).filter((line) => /^!\t/.test(line)).map((line) => line.replace(/\t/g, ' ').trim());
+      const kept = [...status, ...lines.filter((line) => KEEP_LINE_RE.test(line) && line !== last)].slice(0, 4).map((line) => line.slice(0, 300));
       const reason = [...kept, last].join(' | ');
       const error = new Error(`git ${args.join(' ')} failed: ${reason}`, { cause });
       error.status = cause?.status;
       error.stderr = cause?.stderr;
-      error.stdout = cause?.stdout; // `push --porcelain` writes its per-ref status records here
+      error.stdout = cause?.stdout; // a porcelain-mode push reports its per-ref status records on stdout
       throw error;
     }
   };
