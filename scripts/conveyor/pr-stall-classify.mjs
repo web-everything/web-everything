@@ -1,21 +1,14 @@
 /**
  * @file scripts/conveyor/pr-stall-classify.mjs
- * @description THE PURE CLASSIFIER behind the automatic PR stall sweep (operator OK 2026-10-21, slice 1). It takes ONE
- *   stalled row from the `pr-sweep` operation (`we:scripts/operations/pr-sweep-core.mjs#assessPrSweep`) and, for a PR at
- *   a round cap or a referral hold, the shadow round judge's verdict (`we:scripts/lib/round-judge.mjs#judgeRound`), and
- *   says WHO should move it next and with WHICH action:
- *
- *     system   - the tooling fixes it with no person and no ruling: the ledger outbox, a re-asked review daemon, a
- *                re-run red-team gate, or a tooling card through an existing health smell.
- *     policy   - the operator's standing 2026-10-21 rules cover it, acted as `auto-policy` (never the operator's login):
- *                grant rounds inside the 10-round ceiling, rule `card` on coverage-only referrals to an existing
- *                readable card, or block with the judge's concrete fix list.
- *     operator - a person must decide. Every item carries one paste-ready command.
- *
- *   This file never acts and never reads anything. The sweep (`pr-stall-sweep.mjs`) logs or acts on its answer.
- *   FAIL CLOSED: an unknown state, a missing / malformed / fail-closed verdict, unreadable evidence, a guard file, a
- *   grant past the ceiling, or any throw becomes an `operator` item. The policy lane can NEVER produce `not-real`,
- *   `clear-human`, `accept` or `supersede`: those stay with a person whatever the judge says.
+ * @description THE PURE CLASSIFIER behind the automatic PR stall sweep (operator OK 2026-10-21, slice 1). One stalled
+ *   `pr-sweep` row (`we:scripts/operations/pr-sweep-core.mjs#assessPrSweep`), plus the round judge's verdict for a PR at
+ *   a round cap or referral hold (`we:scripts/lib/round-judge.mjs#judgeRound`), becomes WHO moves it next and HOW:
+ *     system   - tooling, no ruling: ledger outbox, ask the review daemon, re-run the red-team gate, a tooling card.
+ *     policy   - the operator's standing rules, as `auto-policy` (never the operator's login): grant inside the ceiling,
+ *                card coverage-only referrals to an existing readable card, block with a concrete fix list.
+ *     operator - a person decides; every item carries one paste-ready command.
+ *   It reads and acts on nothing. FAIL CLOSED: anything unknown, malformed or throwing is an `operator` item, and no
+ *   automatic lane ever produces `not-real`, `clear-human`, `accept` or `supersede`.
  */
 import { validateVerdict, isGuardPath, proposeFix } from '../lib/round-judge.mjs';
 import { MAX_TOTAL_ROUND_EXTENSIONS } from './round-extension-mark.mjs';
@@ -23,17 +16,72 @@ import { nextActions } from '../operations/pr-sweep-core.mjs';
 import { CARD_REF_RE } from '../lib/referral-card-readable.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 
-export const LANES = Object.freeze(['system', 'policy', 'operator']);
 /** Actions no automatic lane may ever take, whatever a verdict says. */
 export const NEVER_AUTOMATIC = Object.freeze(['not-real', 'clear-human', 'accept', 'supersede']);
 export const POLICY_ACTOR = 'auto-policy';
 
-/** The waiting states where the round judge's verdict decides, and the judge trigger each one maps to. */
-export const JUDGED_STATES = Object.freeze({
-  'ruling-needed:referral-hold': 'referral-hold',
-  'ruling-needed:red-team-round-cap': 'red-team-cap',
-  'at-round-limit': 'review-cap',
+/**
+ * Every policy this classifier applies, as a SETTING (operator standing rule 2026-10-21 14:45 ET: no policy is a
+ * constant). The sweep resolves them through the `prStallSweep` cascade and passes them in; these are the standard
+ * values. Each can only make the classifier STRICTER than its built-in mapping, never looser:
+ *   - `stateLanes`: per waiting state, `auto` (the mapping below) or `operator` (always ask a person).
+ *   - `systemActions` / `policyActions`: turn each automatic action on or off; off sends the item to the operator.
+ *   - `grantCeiling`: most rounds granted in total, 1..MAX_TOTAL_ROUND_EXTENSIONS (lowers the shared ceiling, never raises).
+ *   - `maxFixListLines`: the longest fix list a policy block may carry (1..20: it can only lower the standard).
+ *   - `staleHoldAutoResume`: a stale hold is the system's (true) or the operator's (false).
+ */
+export const CLASSIFY_DEFAULTS = Object.freeze({
+  staleHoldAutoResume: false, grantCeiling: MAX_TOTAL_ROUND_EXTENSIONS, maxFixListLines: 20, stateLanes: Object.freeze({}),
+  systemActions: Object.freeze({ 'await-ledger-outbox': true, 'resume-stale-hold': true, 'rerun-red-team-gate': true, 'ask-review-daemon': true, 'tooling-card': true }),
+  policyActions: Object.freeze({ grant: true, card: true, block: true }),
 });
+/** Validators for each classifier setting leaf (shared with the sweep's cascade, so a bad value is refused there too). */
+export const CLASSIFY_VALID = Object.freeze({
+  staleHoldAutoResume: (v) => typeof v === 'boolean',
+  grantCeiling: (v) => Number.isSafeInteger(v) && v >= 1 && v <= MAX_TOTAL_ROUND_EXTENSIONS,
+  maxFixListLines: (v) => Number.isSafeInteger(v) && v >= 1 && v <= 20,
+  stateLanes: (v) => v === 'auto' || v === 'operator',
+  systemActions: (v) => typeof v === 'boolean',
+  policyActions: (v) => typeof v === 'boolean',
+});
+/** A plain record (Object or null prototype): a Date, an array or an object inheriting its fields is not one. */
+const plain = (x) => !!x && typeof x === 'object' && [Object.prototype, null].includes(Object.getPrototypeOf(x));
+/** Deep-copy plain JSON-shaped data, refusing anything that could hide a restriction from validation: a getter, a
+ *  non-enumerable or symbol key, an inherited field, a non-plain prototype, a sparse array, a function. */
+function strictClone(x, depth = 0) {
+  if (x === null || ['string', 'number', 'boolean', 'undefined'].includes(typeof x)) return x;
+  if (depth > 20 || typeof x !== 'object') throw new Error('unreadable input');
+  const isArr = Array.isArray(x);
+  if (Object.getPrototypeOf(x) !== (isArr ? Array.prototype : Object.prototype) && !(!isArr && Object.getPrototypeOf(x) === null)) throw new Error('unreadable input: prototype');
+  const out = isArr ? [] : {};
+  for (const k of Reflect.ownKeys(x)) {
+    if (isArr && k === 'length') continue;
+    const d = Object.getOwnPropertyDescriptor(x, k);
+    if (typeof k !== 'string' || !d.enumerable || !('value' in d) || k === '__proto__' || (isArr && !(/^(0|[1-9]\d*)$/.test(k) && Number(k) < x.length))) throw new Error('unreadable input: not a plain data property');
+    out[k] = strictClone(d.value, depth + 1);
+  }
+  if (isArr && (out.length !== x.length || Object.keys(out).length !== x.length)) throw new Error('unreadable input: sparse array');
+  return out;
+}
+const KNOWN_STATES = () => new Set([...Object.keys(EXPECTED_ACTOR), ...Object.keys(JUDGED_STATES), ...Object.keys(OPERATOR_STATES)]);
+/** Defaults under the caller's values, every leaf validated; anything unknown or invalid throws (fails closed). */
+export function classifySettings(raw = {}) {
+  const top = strictClone(raw); // read once; a getter, hidden key or `__proto__` key is refused
+  if (!plain(top)) throw new Error('unreadable settings');
+  const out = { ...CLASSIFY_DEFAULTS };
+  for (const [k, v] of Object.entries(top)) {
+    // A misspelled or unknown key is refused: silently ignoring it would leave the stricter intent unapplied.
+    if (!Object.hasOwn(CLASSIFY_DEFAULTS, k)) throw new Error(`unknown setting ${k}`);
+    const ok = plain(CLASSIFY_DEFAULTS[k]) ? plain(v) && Object.entries(v).every(([sub, x]) => (k === 'stateLanes' ? KNOWN_STATES().has(sub) : Object.hasOwn(CLASSIFY_DEFAULTS[k], sub)) && CLASSIFY_VALID[k](x)) : CLASSIFY_VALID[k](v);
+    if (!ok) throw new Error(`unreadable setting ${k}`);
+    out[k] = isRec(v) ? { ...CLASSIFY_DEFAULTS[k], ...v } : v;
+  }
+  return out;
+}
+
+/** The waiting states where the round judge's verdict decides, and the judge trigger each one maps to. */
+export const JUDGED_STATES = Object.freeze({ 'ruling-needed:referral-hold': 'referral-hold', 'ruling-needed:red-team-round-cap': 'red-team-cap',
+  'at-round-limit': 'review-cap' });
 
 /** Automation-owned waits: past the threshold with no live job, the TOOLING is broken, so a card is filed through the
  *  existing health smell that owns that wait. Never an operator ask. */
@@ -79,12 +127,12 @@ const strings = (a) => Array.isArray(a) && [...a].every(canonical);
 /** A judge finding the sweep can act on: a named file and a real summary. A sparse or partial list is not. */
 const goodFinding = (f) => isRec(f) && typeof f.file === 'string' && f.file.trim() !== ''
   && typeof f.summary === 'string' && f.summary.trim().length >= 8 && ['broken', 'degraded', 'unconfirmed'].includes(f.cls)
-  && (f.line === null || f.line === undefined || (Number.isSafeInteger(f.line) && f.line > 0));
+  && (f.line === null || f.line === undefined || (Number.isSafeInteger(f.line) && f.line > 0)) && isCount(f.priorAppearances);
 
 /**
  * Classify one stalled row. PURE; never throws.
  * @param {{row:object, head?:string, verdict?:(object|null), files?:string[], card?:({id:string, readable:boolean}|null),
- *   grantsSoFar?:number, settings?:{staleHoldAutoResume?:boolean}}} o
+ *   grantsSoFar?:number, settings?:object}} o  `settings`: see {@link CLASSIFY_DEFAULTS}
  *   `card` is an EXISTING backlog card the sweep matched to the coverage findings and proved readable; `grantsSoFar`
  *   overrides the judge's own count of round grants already spent (the sweep adds policy grants once they exist).
  * @returns {{lane:string, action:string, reason:string, key:string, actor?:string, k?:number, card?:string,
@@ -100,15 +148,21 @@ export function classifyStall(o) {
   }
 }
 
-function classifyUnsafe({ row, head = '', verdict = null, files = [], card = null, grantsSoFar, settings = {} } = {}) {
+function classifyUnsafe(o = {}) {
+  if (!plain(o)) throw new Error('unreadable input');
+  const rawSettings = o.settings; // read once: a getter must not validate one value and serve another
+  const cfg = classifySettings(rawSettings === undefined ? {} : rawSettings);
+  // Every other input is read ONCE into plain data (getters run once, here): what is validated is what is used.
+  const { row, head = '', verdict = null, files = [], card = null, grantsSoFar } = strictClone({ row: o.row, head: o.head, verdict: o.verdict ?? null,
+    files: o.files ?? [], card: o.card ?? null, grantsSoFar: o.grantsSoFar });
   if (!isRec(row) || typeof row.repo !== 'string' || !/^[\w-]+\/[\w-][\w.-]*$/.test(row.repo) || repoKeyForSlug(row.repo) === null
     || !Number.isSafeInteger(row.number) || row.number <= 0 || typeof row.waitingOn !== 'string' || !row.waitingOn) {
     throw new Error('unreadable row');
   }
-  if (!isRec(settings) || !(settings.staleHoldAutoResume === undefined || typeof settings.staleHoldAutoResume === 'boolean')) throw new Error('unreadable settings');
   if (typeof row.stalled !== 'boolean') throw new Error('unreadable row: stalled is not a boolean');
   if (row.liveJob !== null && !(typeof row.liveJob === 'string' && row.liveJob.trim())) throw new Error('unreadable row: liveJob');
-  if (typeof row.why !== 'string' || !Array.isArray(row.evidence) || ![...row.evidence].every((x) => typeof x === 'string')) throw new Error('unreadable row: why / evidence');
+  if (typeof row.why !== 'string' || !Array.isArray(row.evidence) || !row.evidence.every((x) => typeof x === 'string')
+    || !(row.next == null || (isRec(row.next) && (row.next.command == null || typeof row.next.command === 'string')))) throw new Error('unreadable row: why / evidence / next');
   if (!row.stalled) return null;
   if (typeof head !== 'string' || !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(head)) throw new Error('unreadable head');
   const key = keyOf(row, head);
@@ -119,6 +173,11 @@ function classifyUnsafe({ row, head = '', verdict = null, files = [], card = nul
     const r = { lane, action, reason, key, command: null, evidence, ...extra };
     // The last line of defence: no automatic lane may produce an action reserved for a person.
     if (lane !== 'operator' && NEVER_AUTOMATIC.includes(action)) return { ...r, lane: 'operator', reason: `fail-closed: ${action} is never automatic` };
+    // Settings may only send an automatic item to a person: a state forced to the operator, or an action switched off.
+    const toPerson = (why) => ({ ...r, lane: 'operator', reason: `${why}; ${reason}`, command: fill(row.next?.command) });
+    if (lane !== 'operator' && cfg.stateLanes[state] === 'operator') return toPerson(`setting stateLanes.${state}=operator`);
+    if (lane === 'system' && cfg.systemActions[action] !== true) return toPerson(`setting systemActions.${action} is off`);
+    if (lane === 'policy' && cfg.policyActions[action] !== true) return toPerson(`setting policyActions.${action} is off`);
     return r;
   };
   const operator = (action, reason, command = row.next?.command) => out('operator', action, reason, { command: fill(command) });
@@ -133,7 +192,7 @@ function classifyUnsafe({ row, head = '', verdict = null, files = [], card = nul
   if (state === 'system:stale-hold') {
     // Resuming a hold lets the review move on: it needs guard-free file evidence, like any policy action.
     const guardFree = strings(files) && files.length > 0 && !files.some(guarded);
-    return settings.staleHoldAutoResume === true && guardFree
+    return cfg.staleHoldAutoResume === true && guardFree
       ? out('system', 'resume-stale-hold', 'every finding already has a standing ruling; stale-hold auto-resume releases it')
       : operator('stale-hold', 'the hold is stale (every finding is ruled) and stale-hold auto-resume is off', acts.referralRuling.command);
   }
@@ -151,11 +210,11 @@ function classifyUnsafe({ row, head = '', verdict = null, files = [], card = nul
 
   const trigger = JUDGED_STATES[state];
   if (!trigger) return operator('unclassified', `fail-closed: unknown waiting state ${JSON.stringify(state)}`);
-  return judged({ head, verdict, trigger, files, card, grantsSoFar, acts, out, operator });
+  return judged({ head, verdict, trigger, files, card, grantsSoFar, acts, out, operator, cfg });
 }
 
 /** A PR at a round cap / referral hold: the judge's verdict decides, within the standing policy. */
-function judged({ head, verdict, trigger, files, card, grantsSoFar, acts, out, operator }) {
+function judged({ head, verdict, trigger, files, card, grantsSoFar, acts, out, operator, cfg }) {
   if (!isRec(verdict) || !validateVerdict(verdict).ok) return operator('no-verdict', `fail-closed: no valid round-judge verdict (${validateVerdict(verdict).why})`);
   // validateVerdict walks arrays with .some(), which skips holes: densify before trusting the reasons.
   if (![...verdict.reasons].every((r) => typeof r === 'string' && r.trim())) return operator('no-verdict', 'fail-closed: the verdict reasons are malformed');
@@ -194,17 +253,17 @@ function judged({ head, verdict, trigger, files, card, grantsSoFar, acts, out, o
   const guards = [...new Set([...ev.guardFiles, ...files, ...ev.latest.map((f) => f.file)])].filter(guarded);
   if (guards.length) return operator('guard-file-touched', `the PR touches guard code (${guards[0]}); policy does not act on it`);
 
+  if (!isCount(ev.grantsSoFar) || !(grantsSoFar === undefined || isCount(grantsSoFar))) return operator('no-verdict', 'fail-closed: the rounds already granted are unknown');
   const policy = (action, reason, extra) => out('policy', action, reason, { actor: POLICY_ACTOR, trigger, ...extra });
   if (verdict.verdict === 'grant') {
     if (trigger === 'referral-hold') return operator('no-verdict', 'a round grant does not answer a referral hold');
     if (ev.crossBroken !== 0) return operator('no-verdict', 'fail-closed: a break may be open in another source (crossBroken is not 0)');
     // The caller's count may only ADD to the judge's (policy grants the judge cannot see), never lower it.
-    if (!isCount(ev.grantsSoFar) || !(grantsSoFar === undefined || isCount(grantsSoFar))) return operator('no-verdict', 'fail-closed: the rounds already granted are unknown');
     const spent = Math.max(ev.grantsSoFar, grantsSoFar ?? 0);
-    if (spent + verdict.k > MAX_TOTAL_ROUND_EXTENSIONS) {
-      return operator('past-ceiling', `the judge would grant +${verdict.k} but ${spent} of the ${MAX_TOTAL_ROUND_EXTENSIONS}-round ceiling is spent`, acts.roundLimit.command);
+    if (spent + verdict.k > cfg.grantCeiling) {
+      return operator('past-ceiling', `the judge would grant +${verdict.k} but ${spent} of the ${cfg.grantCeiling}-round ceiling is spent`, acts.roundLimit.command);
     }
-    return policy('grant', `findings are converging (${why}); +${verdict.k} round(s) inside the ${MAX_TOTAL_ROUND_EXTENSIONS}-round ceiling`, { k: verdict.k });
+    return policy('grant', `findings are converging (${why}); +${verdict.k} round(s) inside the ${cfg.grantCeiling}-round ceiling`, { k: verdict.k });
   }
 
   const latest = ev.latest;
@@ -230,8 +289,9 @@ function judged({ head, verdict, trigger, files, card, grantsSoFar, acts, out, o
   if (fixList.some((l) => typeof l !== 'string')) return operator('no-verdict', 'fail-closed: a finding states no concrete fix');
   // Every line must read as a concrete fix (`path[:line] - instruction`, the judge's own `proposeFix` shape).
   const pathOf = (l) => /^(\S+?)(?::[1-9]\d{0,6})? - (.{20,})$/.exec(l);
-  const concrete = (l) => { const m = pathOf(l); return !!m && canonical(m[1]) && !/[\0-\x1f\x7f]/.test(m[2]); };
-  if (!fixList.length || fixList.length > 20 || !fixList.every(concrete)) return operator('no-verdict', 'fail-closed: a send-back with no concrete fix list (1-20 fixes)');
+  // ...and each instruction must state a remedy (the same `proposeFix` reading as the no-body path), not a diagnosis.
+  const concrete = (l) => { const m = pathOf(l); return !!m && canonical(m[1]) && !/[\0-\x1f\x7f]/.test(m[2]) && proposeFix({ file: m[1], summary: m[2] }) !== null; };
+  if (!fixList.length || fixList.length > cfg.maxFixListLines || !fixList.every(concrete)) return operator('no-verdict', `fail-closed: a send-back with no concrete fix list (1-${cfg.maxFixListLines} fixes)`);
   const bodyGuard = fixList.map((l) => pathOf(l)[1]).find(guarded);
   if (bodyGuard) return operator('guard-file-touched', `the fix list touches guard code (${bodyGuard}); policy does not act on it`);
   return policy('block', `send back with ${fixList.length} concrete fix(es): ${why}`, { fixList });

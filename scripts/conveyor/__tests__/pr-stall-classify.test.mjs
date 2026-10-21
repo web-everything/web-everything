@@ -119,7 +119,7 @@ describe('fail closed', () => {
   it.each([[null], [{}], [{ repo: REPO, number: '77', waitingOn: 'x', stalled: true }], [{ repo: REPO, number: 77, stalled: true }],
     [row('fixing', { stalled: 'false' })], [{ ...row('fixing'), stalled: undefined }], [row('fixing', { repo: '' })], [row('fixing', { repo: '../..' })], [row('fixing', { repo: 'someone/else' })], [row('fixing', { number: -3 })],
     [row('fixing', { liveJob: undefined })], [row('fixing', { liveJob: 0 })], [row('fixing', { why: { unreadable: true } })],
-    [row('fixing', { evidence: { unreadable: true } })], [row('fixing', { evidence: [1] })], [Object.assign([], row('fixing'))]])('an unreadable row %# is an operator item', (bad) => {
+    [row('fixing', { evidence: { unreadable: true } })], [row('fixing', { evidence: [1] })], [row('fixing', { next: 'unreadable' })], [row('fixing', { evidence: Object.assign(new Array(2), { 1: 'e', '-1': 'e' }) })], [Object.assign([], row('fixing'))]])('an unreadable row %# is an operator item', (bad) => {
     const r = classifyStall({ row: bad, head: HEAD });
     expect([r.lane, r.action]).toEqual(['operator', 'unclassified']);
     expect(r.reason).toMatch(/fail-closed/);
@@ -152,6 +152,8 @@ describe('fail closed', () => {
     ['a finding that is an array', ev('send-back', 'red-team-cap', { latest: [Object.assign([], finding('broken'))] })],
     ['evidence that is an array', { ...verdict('grant'), evidence: Object.assign([], verdict('grant').evidence) }],
     ['malformed judge guard files', ev('grant', 'red-team-cap', { guardFiles: 'scripts/lib/red-team-gate.mjs' })],
+    ['a finding with unreadable prior appearances', ev('grant', 'red-team-cap', { latest: [{ ...finding('broken'), priorAppearances: 'unreadable' }] })],
+    ['a sparse guard list with an extra key', ev('grant', 'red-team-cap', { guardFiles: Object.assign(new Array(1), { extra: 'x' }) })],
     ['files the judge marks unknown', ev('grant', 'red-team-cap', { filesKnown: false })],
     ['a non-boolean filesKnown', ev('grant', 'red-team-cap', { filesKnown: 'false' })],
     ['no judge guard list', ev('grant', 'red-team-cap', { guardFiles: undefined })],
@@ -163,6 +165,12 @@ describe('fail closed', () => {
   ])('%s is an operator item', (_n, v) => {
     const state = v.evidence?.trigger === hold || v.verdict === 'card-the-rest' ? 'ruling-needed:referral-hold' : 'ruling-needed:red-team-round-cap';
     expect(at(state, { verdict: v, card }).lane).toBe('operator');
+  });
+  it('a verdict getter is refused outright, so it cannot pass the ceiling then change', () => {
+    let n = 0; const v = verdict('grant', 'review-cap');
+    Object.defineProperty(v, 'k', { get: () => (n++ === 0 ? 1 : 100), enumerable: true });
+    expect(at('at-round-limit', { verdict: v })).toMatchObject({ lane: 'operator', action: 'unclassified' });
+    expect(n).toBe(0);
   });
   it('a caller count can never lower the judge\'s count below the ceiling', () => {
     expect(at('at-round-limit', { verdict: ev('grant', 'review-cap', { grantsSoFar: MAX_TOTAL_ROUND_EXTENSIONS }), grantsSoFar: 0 }).action).toBe('past-ceiling');
@@ -193,6 +201,26 @@ describe('fail closed', () => {
   });
   it.each([[0], ['true'], [null]])('a malformed failClosed flag %s is an operator item', (flag) => {
     expect(at('ruling-needed:red-team-round-cap', { verdict: ev('grant', 'red-team-cap', { failClosed: flag }) }).lane).toBe('operator');
+  });
+  it.each([['a hidden failClosed', (v) => Object.defineProperty(v.evidence, 'failClosed', { value: true })],
+    ['an inherited failClosed', (v) => { v.evidence = Object.assign(Object.create({ failClosed: true }), v.evidence); }]])('%s is never dropped by the copy', (_n, mutate) => {
+    const v = verdict('grant'); mutate(v);
+    expect(at('ruling-needed:red-team-round-cap', { verdict: v }).lane).toBe('operator');
+  });
+  it.each([['send-back', hold], ['card-the-rest', hold]])('an unreadable grant count blocks a %s too', (v, trig) => {
+    expect(at('ruling-needed:referral-hold', { verdict: ev(v, trig, { grantsSoFar: 'unreadable' }), card }).lane).toBe('operator');
+    expect(at('ruling-needed:referral-hold', { verdict: verdict(v, trig), grantsSoFar: 'unreadable', card }).lane).toBe('operator');
+  });
+  it('an array-wrapped input is unreadable', () => {
+    expect(classifyStall(Object.assign([], { row: row('ruling-needed:red-team-round-cap'), head: HEAD, verdict: verdict('grant'), files: ['a.mjs'] })).lane).toBe('operator');
+  });
+  it('settings are read once', () => {
+    let n = 0; const o = { row: row('ruling-needed:red-team-round-cap'), head: HEAD, verdict: verdict('grant'), files: ['scripts/foo.mjs'] };
+    Object.defineProperty(o, 'settings', { get: () => (n++ === 0 ? { policyActions: { grant: false } } : {}), enumerable: true });
+    expect(classifyStall(o).lane).toBe('operator');
+  });
+  it('null settings fail closed for a policy row too', () => {
+    expect(at('ruling-needed:red-team-round-cap', { verdict: verdict('grant'), settings: null }).lane).toBe('operator');
   });
   it('a non-boolean stale-hold setting is unreadable', () => {
     expect(at('ruling-needed:red-team-round-cap', { verdict: verdict('grant'), settings: { staleHoldAutoResume: 'true' } }).lane).toBe('operator');
@@ -243,7 +271,7 @@ describe('policy guardrails', () => {
     expect(at('ruling-needed:referral-hold', { verdict: { ...verdict('send-back', hold), body: Array.from({ length: 20 }, (_, i) => fix(i)).join('\n') } }).fixList).toHaveLength(20);
     expect(at('ruling-needed:referral-hold', { verdict: { ...verdict('send-back', hold), body: Array.from({ length: 21 }, (_, i) => fix(i)).join('\n') } }).lane).toBe('operator');
     expect(at('ruling-needed:referral-hold', { verdict: { ...verdict('send-back', hold), body: 'scripts/lib/red-team-gate.mjs:4 - release the claim before the push' } }).action).toBe('guard-file-touched');
-    for (const body of ['\u0000', 'x', 'a.mjs:1 - short', 'a.mjs:0 - release the claim before the push', 'a.mjs:99999999 - release the claim before the push', 'no path here at all, just words', 'a.mjs:1 - release the claim before the push\nx']) {
+    for (const body of ['a.mjs:1 - The output is incorrect in production', '\u0000', 'x', 'a.mjs:1 - short', 'a.mjs:0 - release the claim before the push', 'a.mjs:99999999 - release the claim before the push', 'no path here at all, just words', 'a.mjs:1 - release the claim before the push\nx']) {
       expect(at('ruling-needed:referral-hold', { verdict: { ...verdict('send-back', hold), body } }).lane, JSON.stringify(body)).toBe('operator');
     }
     expect(run('ruling-needed:red-team-round-cap', 'send-back').fixList).toEqual(['scripts/foo.mjs:3 - broken: the claim must be released before the push']);
@@ -254,5 +282,38 @@ describe('policy guardrails', () => {
     const r = run('ruling-needed:referral-hold', 'not-real-verified');
     expect(r).toMatchObject({ lane: 'operator', action: 'suggest-not-real' });
     expect(r.command).toMatch(/record-referral-ruling/);
+  });
+});
+
+describe('every policy is a setting, and settings only make it stricter', () => {
+  it('a state forced to the operator never reaches an automatic lane', () => {
+    expect(at('fixing', { settings: { stateLanes: { fixing: 'operator' } } })).toMatchObject({ lane: 'operator', action: 'tooling-card' });
+    expect(at('ruling-needed:red-team-round-cap', { verdict: verdict('grant'), settings: { stateLanes: { 'ruling-needed:red-team-round-cap': 'operator' } } }).lane).toBe('operator');
+    expect(at('fixing', { settings: { stateLanes: { fixing: 'auto' } } }).lane).toBe('system');
+  });
+  it.each([['systemActions', 'tooling-card', 'fixing', null], ['systemActions', 'ask-review-daemon', 'awaiting-review', null],
+    ['policyActions', 'grant', 'ruling-needed:red-team-round-cap', 'grant'], ['policyActions', 'block', 'ruling-needed:red-team-round-cap', 'send-back'],
+    ['policyActions', 'card', 'ruling-needed:referral-hold', 'card-the-rest']])('%s.%s off sends it to the operator', (group, action, state, v) => {
+    const o = { settings: { [group]: { [action]: false } }, card, ...(v ? { verdict: verdict(v, TRIGGER[state]) } : {}) };
+    const r = at(state, o);
+    expect([r.lane, r.action]).toEqual(['operator', action]);
+    expect(r.reason).toMatch(/setting/);
+    expect(typeof r.command).toBe('string');
+  });
+  it('the grant ceiling is a setting that can only lower the shared one', () => {
+    expect(at('at-round-limit', { verdict: verdict('grant', 'review-cap'), grantsSoFar: 2, settings: { grantCeiling: 2 } }).action).toBe('past-ceiling');
+    expect(at('at-round-limit', { verdict: verdict('grant', 'review-cap'), settings: { grantCeiling: MAX_TOTAL_ROUND_EXTENSIONS + 1 } }).lane).toBe('operator');
+  });
+  it('the fix-list length is a setting', () => {
+    const body = ['a.mjs:1 - release the claim before the push', 'b.mjs:1 - release the claim before the push'].join('\n');
+    expect(at('ruling-needed:referral-hold', { verdict: { ...verdict('send-back', hold), body }, settings: { maxFixListLines: 1 } }).lane).toBe('operator');
+  });
+  it.each([[{ stateLanes: { fixing: 'system' } }], [{ systemActions: { 'tooling-card': 'yes' } }], [{ policyActions: { 'not-real': true } }],
+    [{ grantCeiling: 0 }], [{ maxFixListLines: 21 }], [{ policyActions: [] }], [{ systemAction: { 'tooling-card': false } }], [{ garbage: null }],
+    [new Date()], [Object.create({ systemActions: { 'tooling-card': false } })], [{ systemActions: Object.create({ 'tooling-card': false }) }], [{ stateLanes: { fixng: 'operator' } }],
+    [{ systemActions: Object.defineProperty({}, 'tooling-card', { value: false, enumerable: false }) }],
+    [{ stateLanes: Object.defineProperty({}, 'fixing', { get: () => 'operator', enumerable: true }) }],
+[null], [JSON.parse('{"__proto__":null}')], [JSON.parse('{"stateLanes":{"__proto__":"operator"}}')]])('an unreadable setting %# fails closed', (settings) => {
+    expect(at('fixing', { settings })).toMatchObject({ lane: 'operator', action: 'unclassified' });
   });
 });
