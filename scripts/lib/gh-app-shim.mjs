@@ -92,7 +92,7 @@ import {
   OWNER_INSTALLATIONS, MOVED_REPO_OWNERS, canonicalOwner, installationMap, installationForOwner, ownerOfSlug, ownerFromRemoteUrl, ownerFromGhArgv, installationCachePath,
 } from './github-app-installations.mjs';
 import { readGhAuthPolicy } from './github-auth-policy.mjs';
-import { readSettings } from './settings-files.mjs';
+import { readSettings, SETTINGS_DIR, LEGACY_SETTINGS_PATH } from './settings-files.mjs';
 import { primaryCheckout } from '../bootstrap-session.mjs';
 import { DEFAULT_CALLER_ROLES, roleForCaller, readDeliveryIdentity, shimRoleTable, ROLE_ENV } from './github-app-identity.mjs';
 import { controlClonePath } from './automation-home.mjs';
@@ -176,7 +176,7 @@ export function checkoutShimDir({ ghThrottleCliPath = defaultGhThrottleCliPath()
 export function shimFallbackPolicy({ ghThrottleCliPath = defaultGhThrottleCliPath() } = {}) {
   const scripts = dirname(dirname(resolve(ghThrottleCliPath)));
   return readGhAuthPolicy({ daemon: true, env: {},
-    read: () => readSettings({ dir: join(scripts, 'settings'), legacyPath: join(scripts, 'dispatch-settings.json') }),
+    read: () => readSettings({ dir: join(scripts, basename(SETTINGS_DIR)), legacyPath: join(scripts, basename(LEGACY_SETTINGS_PATH)) }),
     // The platform files are named relative to the reading module; read the owner's files of the same names.
     readFile: (path, encoding) => readFileSync(join(scripts, 'lib', basename(path)), encoding) });
 }
