@@ -732,16 +732,21 @@ export async function planRebuild({
   // without because they conflict-dropped. `prepareRebuild` holds the clone on its last-good build instead of building
   // (and later adopting) a tree that lost live hotfixes. A pinned overlay SKIPPED by xpinskip is not counted: that
   // ruling deliberately builds without it (loudly, `pinned-overlay-conflict-skipped`) so the fleet keeps moving.
+  // Live 2026-10-21 ~17:12 ET (review clone): after #5771 merged, the registered top lane/unfreeze-review-top-1021c — a
+  // mechanism-pinned overlay the running build CARRIED — conflicted with main; xpinskip SKIPPED it and the plan built
+  // main + one overlay, dropping the whole live review stack (and the superseded rule would have adopted it). A pinned
+  // overlay skipped by xpinskip counts as lost too when the running build carries it: hold, never build without it.
   const establishedLost = [];
   for (const d of decisions) {
-    if (d.action !== 'drop' || d.reason !== 'conflict') continue;
+    const pinSkipped = d.action === 'skip' && d.reason === 'pinned-overlay-conflict-skipped';
+    if (!pinSkipped && (d.action !== 'drop' || d.reason !== 'conflict')) continue;
     const files = conflictFiles.get(d.ref) ?? [];
     const carriedSurvives = carriedHeads.has(d.ref)
       && carriedHeads.get(d.ref).every((sha) => git(['merge-base', '--is-ancestor', sha, cur]).status === 0);
     // An ESTABLISHED current tip always holds: another carrier preserving only an OLDER recorded tip says nothing
     // about the newer live changes. The carriedSurvives exception applies only to changed-tip newcomers.
     if (establishedRefs.has(d.ref) || (carriedRefs.has(d.ref) && !carriedSurvives)) {
-      establishedLost.push({ ref: d.ref, pr: d.pr, sha: d.sha, reason: 'conflict', files });
+      establishedLost.push({ ref: d.ref, pr: d.pr, sha: d.sha, reason: pinSkipped ? 'pinned-conflict-skipped' : 'conflict', files });
       alerts.push({
         kind: 'established-overlay-dropped',
         detail: {

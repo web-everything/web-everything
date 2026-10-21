@@ -408,6 +408,10 @@ export async function prepareRebuild({
         rejected: state.rejected,
         nowMs: nowMs(),
         maxAgeMs,
+        // the overlays the RUNNING build applies — known only when HEAD is the recorded adopted build
+        liveApplied: state.adopted?.head && state.adopted.head === prevHead ? (state.adopted.applied ?? []) : undefined,
+        carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
+        leftForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
       });
       if (!m.adopt) {
         clearReadyCandidate(root, stEnv);

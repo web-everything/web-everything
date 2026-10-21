@@ -39,6 +39,7 @@ import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
 export function matchReadyCandidate({
   ready, plan, prevHead, treeOf, stillWanted, verifyBuilt = () => false, overlayTip = () => null,
   registered = stillWanted, allowFallback = true, rejected = null, nowMs, maxAgeMs,
+  liveApplied, carries = () => false, leftForMain = () => false,
 }) {
   if (!ready) return { adopt: null, reason: 'none' };
   const passedMs = Date.parse(ready.passedAt || '');
@@ -72,6 +73,16 @@ export function matchReadyCandidate({
     return { adopt, dropRefs: [], match: 'same-tree' };
   }
   if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
+  // Live 2026-10-21 ~17:12 ET (review clone): a superseded build must never DROP an overlay the running build applies.
+  // Each one must be carried by the record (by ref, or its applied sha is an ancestor of the record's build) unless it
+  // left because main now has it. Unknown live set (`liveApplied` not given) refuses: fail closed.
+  if (!Array.isArray(liveApplied)) return { adopt: null, reason: 'superseded-live-set-unknown' };
+  const carriedRefs = new Set((ready.adopt.applied || []).map((a) => a.ref));
+  const omitted = liveApplied.filter((a) => a?.ref && !carriedRefs.has(a.ref) && !leftForMain(a.ref)
+    && !(a.sha && carries(a.sha, ready.adopt.finalSha)));
+  if (omitted.length > 0) {
+    return { adopt: null, reason: `superseded-omits-live-overlay: ${omitted.map((a) => a.ref).join(', ')}`, omitted: omitted.map((a) => a.ref) };
+  }
   if (!verifyBuilt(ready.adopt)) return { adopt: null, reason: 'unverified-build' };
   return { adopt: ready.adopt, dropRefs: [], match: 'superseded' };
 }
