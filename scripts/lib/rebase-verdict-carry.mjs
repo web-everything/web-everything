@@ -204,16 +204,23 @@ export function resolveCarryAcrossRebase({ env = process.env, readFile = readFil
   return { value: 'off', source: 'default' };
 }
 
-/** `readCitedLine` for the carry: line `line` (1-based) of `file` at `sha` via `git show`, or null. The path must be a
- *  plain repo-relative path (no `..`, no leading `/`, no `:`), so it can only name a blob at that commit. */
+/** `readCitedLine` for the carry: the RAW BYTES (hex) of line `line` (1-based) of the BLOB `file` at `sha`, or null.
+ *  The object must be a blob (never a tree), the line must exist (a trailing newline adds no line), and bytes are
+ *  compared undecoded, so different bytes never compare equal. The path must be a plain repo-relative path (no `..`,
+ *  no leading `/`, no `:`). */
 export function gitCitedLineReader(exec) {
   return ({ sha, file, line }) => {
     if (!HEX.test(String(sha ?? '')) || typeof file !== 'string' || !file || file.startsWith('/') || file.includes(':')
       || file.split('/').includes('..') || !Number.isInteger(line) || line < 1) return null;
-    let text;
-    try { text = String(exec('git', ['show', `${sha}:${file}`], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })); } catch { return null; }
-    const lines = text.split('\n');
-    return line <= lines.length ? lines[line - 1] : null;
+    const spec = `${sha}:${file}`;
+    try { if (String(exec('git', ['cat-file', '-t', spec], { encoding: 'utf8' })).trim() !== 'blob') return null; } catch { return null; }
+    let buf;
+    try { buf = exec('git', ['cat-file', 'blob', spec], { encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 }); } catch { return null; }
+    if (!Buffer.isBuffer(buf)) buf = Buffer.from(buf ?? '');
+    const lines = [];
+    let start = 0;
+    for (let i = 0; i < buf.length; i++) if (buf[i] === 0x0a) { lines.push(buf.subarray(start, i)); start = i + 1; }
+    if (start < buf.length) lines.push(buf.subarray(start));
+    return line <= lines.length ? lines[line - 1].toString('hex') : null;
   };
 }
-

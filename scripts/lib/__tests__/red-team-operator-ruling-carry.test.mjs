@@ -114,11 +114,22 @@ describe('operator red-team rulings across a rebase (#5502 shape)', () => {
     expect(posted).toEqual([]);
     expect(disp(comments, edited).result).toBeNull();
   });
+  it('bytes are compared undecoded: two invalid UTF-8 lines never compare equal', () => {
+    const fake = (bytes) => (f, a, o) => (a[0] === 'cat-file' && a[1] === '-t' ? 'blob\n' : Buffer.from(bytes));
+    const x = gitCitedLineReader(fake([0xff, 0x0a]))({ sha: rebased, file: FILE, line: 1 });
+    const y = gitCitedLineReader(fake([0xfe, 0x0a]))({ sha: rebased, file: FILE, line: 1 });
+    expect(x).not.toBe(y);
+    expect(gitCitedLineReader(() => 'tree\n')({ sha: rebased, file: 'scripts', line: 2 })).toBeNull();
+  });
   it('unchangedCitedLines reads real blobs: a changed line or a missing file is never "unchanged"', () => {
     const readLine = (sha, file, line) => gitCitedLineReader(exec)({ sha, file, line });
     const fs = [F(159, 'broken'), F(127, 'degraded'), { ...F(5, 'degraded'), file: 'nope.mjs' }, { ...F(1, 'degraded'), line: null }].map((f, i) => ({ ...f, index: i + 1 }));
     expect(unchangedCitedLines(fs, { fromSha: rebased, toSha: edited, readLine })).toEqual([2]);
     expect(gitCitedLineReader(exec)({ sha: rebased, file: '../etc/passwd', line: 1 })).toBeNull();
+    const r = gitCitedLineReader(exec);
+    expect(r({ sha: rebased, file: '.', line: 1 })).toBeNull();
+    expect(r({ sha: rebased, file: FILE, line: 171 })).toBeNull(); // the trailing newline adds no line
+    expect(r({ sha: rebased, file: FILE, line: 170 })).toBe(Buffer.from('line 170').toString('hex'));
   });
   it('kill switch: carryAcrossRebase off never carries an operator release', () => {
     const { comments } = thread5502(accepted);
