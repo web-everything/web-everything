@@ -28,6 +28,7 @@
  */
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { openReferralFindings } from './record-referral-ruling.mjs';
+import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { PR_SWEEP_OP, STALLED_AFTER_MINUTES_DEFAULT } from './pr-sweep.mjs';
 import { CONFIRMED_BREAKS_DEFAULTS, gateOutcomesForHead, redTeamRulingNeeded, GATE_OUTCOMES } from '../lib/red-team-gate.mjs';
 
@@ -87,7 +88,13 @@ export function referralHoldOpen(comments, { headCommittedAt = null } = {}) {
   return { at: hold.at, count: n ? Number(n[1]) : null, text: bodyOf(hold.c).split('\n')[0].trim(), body: bodyOf(hold.c) };
 }
 
-const PERSISTENCE_FAILED_RE = /referral persistence failed|referral-persistence-failed|ledger-write-miss/i;
+// A failed save is recognised only in the shapes the reviewer itself writes: the hold comment's own words, or the
+// reviewer's "parked" / advisory notice. A trusted comment that merely MENTIONS a ledger miss (another PR, telemetry)
+// must never excuse the operator.
+const PERSISTENCE_FAILED_RE = /referral persistence failed|referral-persistence-failed/i;
+const PARKED_FAILURE_RE = /^\s*Mandatory referral review parked to review:human: mandatory ruling ledger-write-miss/i;
+const failureComment = (body) => PERSISTENCE_FAILED_RE.test(body) || PARKED_FAILURE_RE.test(body);
+const holdCount = (hold) => hold.count ?? ((hold.body.match(/^\s*- `/gm) ?? []).length || null);
 
 /**
  * EVIDENCE BEHIND AN OPEN REFERRAL HOLD. A hold comment says "N referrals need a ruling", but that count can be stale:
@@ -96,14 +103,15 @@ const PERSISTENCE_FAILED_RE = /referral persistence failed|referral-persistence-
  * (`openReferralFindings`), and whether a trusted comment at or after the hold reports a failed save. PURE.
  * @returns {{open: Array<{key:string,file:string,line:(number|null)}>, ruled: number, persistenceFailed: boolean, unreadable: (string|null)}}
  */
-export function holdEvidence(pr, hold) {
+export function holdEvidence(pr, hold, { cardReadable = (ref) => referralCardReadable(ref) } = {}) {
   const persistenceFailed = PERSISTENCE_FAILED_RE.test(hold.body ?? '')
-    || sorted(pr.comments).some((e) => e.at !== null && e.at >= hold.at && trusted(e) && PERSISTENCE_FAILED_RE.test(bodyOf(e.c)));
+    || sorted(pr.comments).some((e) => e.at !== null && e.at >= hold.at && trusted(e) && failureComment(bodyOf(e.c)));
   try {
     const r = openReferralFindings({ comments: pr.comments ?? [], repo: pr.repo, pr: pr.number, head: String(pr.headRefOid ?? '').toLowerCase(),
-      body: pr.body ?? '', createdAt: pr.createdAt ?? '' });
+      body: pr.body ?? '', createdAt: pr.createdAt ?? '', cardReadable });
     return { open: r.open.map((f) => ({ key: f.key, file: f.file, line: f.line })), ruled: r.ruled.length, persistenceFailed,
-      unreadable: r.malformed ? 'the referral thread is malformed' : null };
+      unreadable: r.malformed || r.protectionMalformed || (r.pending ?? []).includes('malformed-operator-ruling')
+        ? 'the referral thread is malformed' : null };
   } catch (e) {
     return { open: [], ruled: 0, persistenceFailed, unreadable: String(e?.message ?? e).split('\n')[0] };
   }
@@ -207,16 +215,18 @@ export function deriveWaitingOn(pr, ctx) {
 
   const hold = referralHoldOpen(pr.comments, { headCommittedAt: pushedAt });
   if (hold) {
-    const ev = holdEvidence(pr, hold);
+    const ev = holdEvidence(pr, hold, ctx.holdOptions);
     const keys = ev.open.map((f) => `${f.file}${f.line ? `:${f.line}` : ''}`);
     const NO_ASK = { summary: 'no operator action: resumes on the next successful review save; the fix is the reviewer\'s outbox', command: null };
     // An unreadable thread is never excused: the operator is asked, as before.
     if (!ev.unreadable && ev.persistenceFailed) return done('system:ledger-write-miss', 'system', hold.at,
       `the review is paused but the reviewer's referral save failed (ledger-write-miss); ${ev.open.length} finding(s) open on the live head${keys.length ? ` (${keys.join(', ')})` : ''}`,
       NO_ASK, ['review-referral-hold comment', 'referral persistence failed']);
-    // STALE needs PROOF: at least one finding with a standing ruling and none open. A thread with no referral record at
-    // all proves nothing (a failed save leaves exactly that, live #5485), so the operator stays asked.
-    if (!ev.unreadable && ev.open.length === 0 && ev.ruled > 0) return done('system:stale-hold', 'system', hold.at,
+    // STALE needs PROOF: the hold names N referrals, none is open, and at least N findings carry a standing ruling. A
+    // thread with no (or fewer) saved records proves nothing: a failed save leaves exactly that (live #5485), and an
+    // older ruled run must not hide newer unsaved referrals. An unknown N is never proof.
+    const named = holdCount(hold);
+    if (!ev.unreadable && ev.open.length === 0 && named !== null && ev.ruled >= named) return done('system:stale-hold', 'system', hold.at,
       'the hold is stale: every finding on the live head already has a standing ruling', NO_ASK, ['review-referral-hold comment', '0 open findings']);
     return done('ruling-needed:referral-hold', 'operator', hold.at,
       `review paused: ${ev.open.length || hold.count || 'some'} open referral(s) need an operator ruling${keys.length ? ` [${keys.join(', ')}]` : ''}${ev.unreadable ? ` (evidence unreadable: ${ev.unreadable})` : ''} (${hold.text})`,
@@ -304,7 +314,7 @@ export function assessPrSweep(read) {
   const thresholdMinutes = Number.isFinite(read.stalledAfterMinutes) && read.stalledAfterMinutes > 0
     ? read.stalledAfterMinutes : STALLED_AFTER_MINUTES_DEFAULT;
   const rows = read.prs.map((pr) => {
-    const d = deriveWaitingOn(pr, { now, drainSkips: read.drainSkips ?? [], liveJobs: read.liveJobs ?? [] });
+    const d = deriveWaitingOn(pr, { now, drainSkips: read.drainSkips ?? [], liveJobs: read.liveJobs ?? [], holdOptions: read.holdOptions });
     const jobs = jobsFor(pr, read.liveJobs, now);
     const live = jobs.length > 0 || (d.state === 'awaiting-ci' && runningChecks(pr));
     const ageMinutes = d.since === null ? null : Math.max(0, Math.round((now - d.since) / 60_000));

@@ -119,6 +119,34 @@ describe('referral hold evidence (#5530: stale or unsaved hold)', () => {
     const forged = c('mallory', '2026-10-21T10:45:20Z', 'ledger-write-miss');
     expect(row(sweep([pr([recordComment, plainHold, forged])]), 5530).actor).toBe('operator');
   });
+  it('a trusted comment that merely mentions a ledger miss (another PR, telemetry) does not excuse the operator', () => {
+    const other = c('plateau-reviewer[bot]', '2026-10-21T09:05:00Z', 'Diagnostics: ledger-write-miss for o/other#7, not for this referral');
+    const r = row(sweep([pr([recordComment, { ...plainHold, createdAt: '2026-10-21T09:00:00Z' }, other])]), 5530);
+    expect(r).toMatchObject({ waitingOn: 'ruling-needed:referral-hold', actor: 'operator', stalled: true });
+  });
+  it('an older ruled run does not hide newer UNSAVED referrals on the same head (#5485 shape with history)', () => {
+    const two = c('plateau-reviewer[bot]', '2026-10-21T09:00:00Z', 'review paused: 2 referrals need a ruling; it resumes on a new push, a ruling, or a send-back');
+    const r = row(sweep([pr([recordComment, operatorRuling, two])]), 5530);
+    expect(r).toMatchObject({ waitingOn: 'ruling-needed:referral-hold', actor: 'operator' });
+  });
+  it('a hold whose count is unknown can not be proven stale', () => {
+    const noCount = c('plateau-reviewer[bot]', '2026-10-21T09:00:00Z', 'review paused: it resumes on a new push, a ruling, or a send-back\n\nWaiting on your ruling');
+    expect(row(sweep([pr([recordComment, operatorRuling, noCount])]), 5530).actor).toBe('operator');
+  });
+  it('a malformed operator-ruling record keeps the operator asked under both system branches', () => {
+    const bad = c('chalbert', '2026-10-21T08:50:00Z', '## Operator ruling on mandatory referrals\n<!-- mandatory-referral-operator-ruling-v1: garbage -->');
+    const stale = { ...plainHold, createdAt: '2026-10-21T09:00:00Z' };
+    expect(row(sweep([pr([recordComment, operatorRuling, bad, stale])]), 5530).actor).toBe('operator');
+    expect(row(sweep([pr([recordComment, bad, failedHold])]), 5530).actor).toBe('operator');
+  });
+  it('a card ruling counts as standing only when its card is readable', () => {
+    const card = c('chalbert', '2026-10-21T08:46:37Z', buildOperatorRulingComment({ version: 1, repo: REPO, pr: 5530, head: HEAD,
+      rulings: [{ runId: 'review-pr-1', key, result: 'card', card: 'we:backlog/xcard.md' }], actor: 'chalbert', channel: 'x', reason: 'card it', at: '2026-10-21T08:46:28Z', clearerId: 's1' }));
+    const stale = { ...plainHold, createdAt: '2026-10-21T09:00:00Z' };
+    const withReader = (cardReadable) => assessPrSweep({ now: NOW, stalledAfterMinutes: 45, prs: [pr([recordComment, card, stale])], holdOptions: { cardReadable } });
+    expect(row(withReader(() => true), 5530)).toMatchObject({ waitingOn: 'system:stale-hold', actor: 'system' });
+    expect(row(withReader(() => false), 5530).actor).toBe('operator');
+  });
   it('a system row is still STALLED once it outlives the threshold with no live job', () => {
     const r = row(sweep([pr([recordComment, failedHold])], { liveJobs: [] }), 5530);
     expect(r.stalled).toBe(true);
