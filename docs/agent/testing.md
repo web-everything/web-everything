@@ -1802,7 +1802,10 @@ issue references, mentions or machine markers. A blank or malformed `WE_BUILD_*`
 never turns a safeguard off (**%s=%j keeps the standard default**). With default settings a
 Claude-executed delivery self-reviews once instead of running converge and parks `review:pending`
 (**with default build settings, a Claude-executed delivery self-reviews once, skips converge and parks
-review:pending**). A review run never self-reviews, resumes or gates itself (**a review run never
+review:pending**). That park replaces only the label-on-green fallthrough: a label the escalation score
+asks for still wins (**with self-review on, %s parks at least as strictly as without it**), and an
+incomplete self-review parks `review:human`. Codex repair-turn failures and a red repair gate reject the
+build (**a real codexDirectTask rejects when %s**). A review run never self-reviews, resumes or gates itself (**a review run never
 self-reviews, resumes or gates itself**).
 
 `finalGate` changes the default of every `verify-lane.mjs` mode, including `request` and the

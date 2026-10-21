@@ -429,7 +429,8 @@ describe('Codex completion wiring', () => {
       const repair = spawns.length > 1;
       const child = new EventEmitter();
       child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
-      child.kill = () => queueMicrotask(() => child.emit('close', null));
+      // The timer fires as the turn exits 0, so only `timedOut` can fail this turn.
+      child.kill = () => queueMicrotask(() => child.emit('close', 0));
       child.stdin = { on() {}, end() {
         if (repair && repairHangs) return;
         queueMicrotask(() => {

@@ -2437,7 +2437,7 @@ describe('decideParkMode (#3627 gap 4 — the real scoreEscalation rubric)', () 
   // Turning the self-review safeguard on must never lower the park label the escalation score asks for.
   it.each([
     ['a statute path', 'docs/agent/platform-decisions.md', 'review:human'],
-    ['a gate-self leash path', '.github/workflows/ci.yml', 'review:human'],
+    ['a permission-change path', '.github/workflows/ci.yml', 'review:human'],
     ['a blast-radius path', 'scripts/lane-pool.mjs', 'review:pending'],
     ['a clean diff', 'reports/2026-09-09-note.md', 'review:pending'],
   ])('with self-review on, %s parks at least as strictly as without it', (_name, file, expected) => {
@@ -2450,6 +2450,15 @@ describe('decideParkMode (#3627 gap 4 — the real scoreEscalation rubric)', () 
     const on = park(true);
     expect(on.label).toBe(expected);
     expect(rank[on.label]).toBeGreaterThanOrEqual(rank[park(false).label]);
+  });
+
+  it('parks review:human when the self-review was incomplete (the diff was over its size bound)', () => {
+    const runFn = (_bin, args) => (args.includes('merge-base') ? 'base\n' : '3\t1\treports/2026-09-09-note.md\0');
+    const result = decideParkMode({
+      report: { outcome: 'done' }, convergeVerdict: { verdict: 'land', selfReview: { rounds: 0, notes: ['too large'], incomplete: true } },
+      filesTouched: ['reports/2026-09-09-note.md'], lanePath: '/lane',
+    }, { run: runFn });
+    expect(result).toMatchObject({ mode: 'park', label: 'review:human', reason: 'self-review incomplete; human review of the full diff is required' });
   });
 
   it('still parks review:human on the agent\'s own needs-human-judgment outcome', () => {
@@ -3612,7 +3621,7 @@ describe('deliverItem (#3627 bug 13 — the success-path result string names the
       { item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999', attemptTag: '', runId: 'dispatch-lane-fixture', effectKey: 'dispatch:0:0' },
       provider, { newSessionId: () => 'uuid-fixed' },
     );
-    expect(result.result).toBe('PR #4321 (review:pending)');
+    expect(result.result).toBe('PR #4321 (review:human)');
     expect(provider.spawn).toHaveBeenCalledOnce();
     const body = readFileSync(join(lane, '.pr-body.md'), 'utf8');
     expect(body).toContain('Self-review incomplete');
@@ -3635,7 +3644,7 @@ describe('deliverItem (#3627 bug 13 — the success-path result string names the
       { item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999', attemptTag: '', runId: 'dispatch-lane-fixture', effectKey: 'dispatch:0:0' },
       { spawn: vi.fn(), vendor: 'claude' }, { newSessionId: () => 'uuid-fixed', reviewBuild },
     );
-    expect(result.result).toBe('PR #4321 (review:pending)');
+    expect(result.result).toBe('PR #4321 (review:human)');
     expect(reviewBuild).not.toHaveBeenCalled();
     expect(readFileSync(join(lane, '.pr-body.md'), 'utf8')).toContain('human review of the full diff is required');
     expect(diffCalls).toHaveLength(1);
@@ -3681,8 +3690,8 @@ describe('deliverItem (#3627 bug 13 — the success-path result string names the
     expect(readFileSync(join(lane, '.pr-body.md'), 'utf8')).toContain('- docs/agent/platform-decisions.md');
   });
 
-  // Same class: the self-check never replaces a human label the escalation score asks for (a gate-self leash path).
-  it('parks review:human with self-review on when the net diff touches a gate-self leash path', async () => {
+  // Same class: the self-check never replaces a human label the escalation score asks for (a permission-change path).
+  it('parks review:human with self-review on when the net diff touches a permission-change path', async () => {
     vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'true');
     const priorExec = execFileSync.getMockImplementation();
     execFileSync.mockImplementation((cmd, args = [], opts) => (cmd === 'git' && args.includes('--numstat')
