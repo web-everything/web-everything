@@ -3,35 +3,39 @@ bornAs: xz73kbf
 kind: story
 size: 1
 status: open
-scope: ["we:scripts/operations/fix-run.mjs", "we:scripts/operations/__tests__/"]
+scope: ["we:scripts/operations/fix-run.mjs", "we:scripts/operations/__tests__/fix-run.test.mjs"]
 dateOpened: "2026-10-12"
 tags: []
 ---
 
 # fix-run: detect unmerged binary paths by status, not numstat
 
-From the PR #4984 review finding (operator ruled card, 2026-10-12): we:scripts/operations/fix-run.mjs (~line 395) detects binary merge conflicts by looking for '-\t-\t' rows in git diff --numstat, but git prints '0\t0\t<path>' for unmerged binary paths, so binary UU conflicts are never caught and the launcher could commit an unresolved binary conflict. Detect unmerged paths with git diff --name-only --diff-filter=U (or git ls-files -u) and refuse/abort the merge with a recorded reason; add a real-git test with a conflicted binary file.
+The reported numstat bug is already addressed in this checkout: porcelain status selects unmerged paths, then attributes and index-stage blobs distinguish binary/non-regular conflicts. The launcher aborts unsupported conflicts before starting the agent.
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
-
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
-
-Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+- [A1] `t=we:scripts/operations/__tests__/fix-run.test.mjs; q=we:scripts/readiness/heavy-admission.mjs; node "${q#we:}" run -- npx vitest run "${t#we:}"` — Existing regression at line 613 creates a real binary UU conflict (whose unmerged numstat is 0/0), asserts merge abort, no agent launch and the recorded binary refusal. Lines 629–649 cover the other stage and merge attributes. This is closure evidence; do not invent a replacement implementation.
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] No binary conflict resolver and no loosening of text conflict safeguards. This CLI adds no receive endpoint; HTTP body limits, rate limits and CSRF are inapplicable.
 
 ## Edge cases this change must handle
 
-One line per class: either the handling, or `n/a: <why>`.
+1. **Untrusted text** — Use NUL-delimited git status and argv-safe paths, including whitespace or shell metacharacters.
+2. **Truncated reads** — A failed status, attribute or blob read must not be treated as an empty successful conflict scan.
+3. **Shared state files** — Only the claimed lane index/worktree is affected; abort the merge without touching another lane.
+4. **Fail closed** — Binary, non-regular and unsupported conflict codes abort before agent execution; preserve refusal recording for source, documentation, config and data alike.
+5. **Identity scoping** — Run every git query and abort against the same claimed lane and PR base.
+6. **State over time** — After refusal, MERGE_HEAD must be gone; subsequent attempts must not inherit a half-merged index.
+7. **Who wrote it** — The launcher records the refusal; model output is not evidence that a binary conflict was resolved.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+## Grounding
+
+- we:scripts/operations/fix-run.mjs:151 parses unmerged status; line 221 classifies binary paths from attributes and stage blobs.
+- we:scripts/operations/fix-run.mjs:731 selects conflicts by status and line 739 aborts unsupported conflicts.
+- we:scripts/operations/__tests__/fix-run.test.mjs:613 exercises real git binary UU conflicts.
+
+## Open questions
+
+STALE: both the implementation and requested real-git regression are present. Should this card be closed as already shipped?

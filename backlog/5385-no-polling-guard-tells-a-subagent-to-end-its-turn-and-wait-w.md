@@ -1,7 +1,7 @@
 ---
 bornAs: x1wxvav
 kind: story
-size: 2
+size: 1
 status: open
 scope: ["we:scripts/guard-bash.mjs", "we:scripts/__tests__/guard-bash-no-polling.test.mjs"]
 dateOpened: "2026-10-08"
@@ -10,24 +10,34 @@ tags: []
 
 # No-polling guard tells a subagent to end its turn and wait, which stalls it forever
 
-The POLLING LOOP refusal says END YOUR TURN and let the harness resume you. A subagent is never resumed, so it sat idle for hours twice. Tell agent sessions to do one bounded check, then continue or finish and report what is pending.
+The reported refusal wording has already been replaced: agent sessions are told to perform one bounded check, continue, or finish and report pending work. Preserve the existing regression coverage; do not invent another behavior change.
 
 ## Done when
 
-1. **Executable** — TODO: a command that fails before this item lands and passes after.
+Commands use the Bash helper `we() { command "${@#we:}"; }` to strip repository prefixes from arguments.
 
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+- [A1] `we node we:scripts/readiness/heavy-admission.mjs run -- npx vitest run we:scripts/__tests__/guard-bash-no-polling.test.mjs` — existing assertions at we:scripts/__tests__/guard-bash-no-polling.test.mjs:149 require ONE bounded check and CONTINUE, and reject the old harness-resume advice for agent loop/long-wait refusals.
+- [A2] `we node we:scripts/readiness/heavy-admission.mjs run -- npx vitest run we:scripts/__tests__/guard-bash-no-polling.test.mjs` — existing decide() and hook-output cases preserve denial and session-specific advice, including the interactive session. These checks already target the shipped fix; there is no honest new red-to-green criterion for the stale premise.
 
-Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+## Non-goals
+
+- [N1] No polling allowlist changes, automatic subagent resumption, daemon redesign or weaker refusal.
 
 ## Edge cases this change must handle
 
-One line per class: either the handling, or `n/a: <why>`.
+1. **Untrusted text** — The refusal is fixed guidance; command text cannot supply an instruction to relax it.
+2. **Truncated reads** — n/a: this wording change does not read logs or partial tool output.
+3. **Shared state files** — n/a: refusal guidance does not write shared state or resume markers.
+4. **Fail closed** — Polling loops and excessive waits remain denied; only recovery advice changes, regardless of whether the pending work is source, docs, config or data.
+5. **Identity scoping** — Agent-session guidance uses existing session detection; interactive sessions must not be promised automatic resumption either.
+6. **State over time** — One bounded check is followed by continuing work or finishing with pending work reported; no indefinite idle turn.
+7. **Who wrote it** — The guard authors the refusal; agent-supplied command text does not authorize waiting. No receive endpoint is involved; HTTP abuse controls are inapplicable.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+## Grounding
+
+- we:scripts/guard-bash.mjs:2447 explicitly says not to end a turn waiting; lines 2448–2454 give bounded-check and finish/report guidance.
+- we:scripts/__tests__/guard-bash-no-polling.test.mjs:149 documents the incident and tests the new advice; line 255 checks the hook output.
+
+## Open questions
+
+STALE: the requested wording and regression coverage already exist. Should this card be closed as shipped, or does a distinct refusal path still reproduce the stall? A concrete remaining path is needed before authorizing more implementation.
