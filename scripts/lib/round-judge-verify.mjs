@@ -148,12 +148,12 @@ function checkSilent(f, repo) {
   if (!blocks.length) return { status: 'inconclusive', evidence: null };
   // EVERY catch in the function must be handled (log / throw / error status) or be a documented empty best-effort one;
   // a catch that does something else (e.g. `void e`) or is a bare `{}` is a real swallow and the claim stands.
-  const handled = blocks.map((b) => ({ ...b, log: LOGGY.test(b.body), status: STATUSY.test(b.body), commented: /\/\*|\/\//.test(b.body) && !b.body.replace(/\/\*.*?\*\/|\/\/.*$/gm, '').trim() }));
+  const offset = (b, re) => { const m = re.exec(b.body); return m ? b.line + b.body.slice(0, m.index).split('\n').length - 1 : null; };
+  const handled = blocks.map((b) => ({ ...b, logLine: offset(b, LOGGY), statusLine: offset(b, STATUSY), log: LOGGY.test(b.body), status: STATUSY.test(b.body), commented: /\/\*|\/\//.test(b.body) && !b.body.replace(/\/\*.*?\*\/|\/\/.*$/gm, '').trim() }));
   if (handled.some((b) => !b.log && !b.status && !b.commented)) return { status: 'inconclusive', evidence: null };
-  const good = handled.find((b) => b.log && b.status) ?? null;
   const logAt = handled.find((b) => b.log); const statusAt = handled.find((b) => b.status);
-  return good || (logAt && statusAt)
-    ? { status: 'refuted', evidence: `${f.file}:${lo + (logAt ?? good).line + 1} logs/throws and ${f.file}:${lo + (statusAt ?? good).line + 1} returns an error status, every catch in the function holding line ${f.line} is handled` }
+  return logAt && statusAt
+    ? { status: 'refuted', evidence: `${f.file}:${lo + logAt.logLine + 1} logs/throws and ${f.file}:${lo + statusAt.statusLine + 1} returns an error status, every catch in the function holding line ${f.line} is handled` }
     : { status: 'inconclusive', evidence: null };
 }
 

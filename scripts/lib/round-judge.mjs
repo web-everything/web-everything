@@ -84,7 +84,7 @@ export function parseReviewFindings(body) {
   for (const line of String(body ?? '').replace(/\r\n/g, '\n').split('\n')) {
     const m = REVIEW_BULLET.exec(line);
     if (!m) continue;
-    const summary = m[3].replace(/_\[[^\]]*\]_/g, '').trim().slice(0, 240);
+    const summary = m[3].replace(/_\[[^\]]*\]_/g, '').trim().slice(0, 700);
     const impact = /_\[impact if unfixed: ([a-z]+)\]_/i.exec(m[3])?.[1]?.toLowerCase() ?? null;
     const coverage = /^COVERAGE\b/i.test(summary);
     out.push({ file: m[1], line: m[2] == null ? null : Number(m[2]), summary, confirmed: true,
@@ -112,7 +112,7 @@ export function extractRounds(comments, pr) {
     if (rt) {
       if (rt.pr !== Number(pr)) return;
       const findings = rt.findings.map((f) => ({ file: f.file, line: f.line, summary: f.summary, confirmed: f.confirmed,
-        impact: f.impact, category: f.category }));
+        impact: f.impact, category: f.category, detail: [f.scenario, f.recheck].filter(Boolean).join(' ').slice(0, 700) }));
       out.push({ source: 'red-team', at: timeOf(c), i, rev: rt.rev, findings });
       return;
     }
@@ -188,6 +188,7 @@ export function validateVerdict(v) {
   if (v.verdict === 'grant') {
     if (!Number.isInteger(v.k) || v.k < 1 || v.k > MAX_JUDGE_GRANTS) return bad('grant needs an integer k in 1..20');
   } else if (v.k !== undefined && v.k !== null) return bad('k is only valid on grant');
+  if (v.body !== undefined && typeof v.body !== 'string') return bad('body must be a string');
   if (!Array.isArray(v.reasons) || !v.reasons.length || v.reasons.some((r) => typeof r !== 'string' || !r.trim())) return bad('reasons must be a non-empty list of strings');
   return { ok: true };
 }
@@ -323,7 +324,13 @@ function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = []
   if (refuted.length) reasons.push(`partially-refuted:${refuted.length}-of-${annotated.length}`);
 
   if (guardFiles.length) reasons.push(`guard-file-touched-noted:${guardFiles[0]}`);
-  if (unfixedAfterSendBacks.length) return done('escalate', [`same-finding-unfixed-after-${unfixedAfterSendBacks[0].priorAppearances}-send-backs:${unfixedAfterSendBacks[0].file}:${unfixedAfterSendBacks[0].line}`]);
+  if (unfixedAfterSendBacks.length) {
+    // Operator 2026-10-21: work out the concrete fix first; escalate only when none can be named.
+    const fixes = unfixedAfterSendBacks.map(proposeFix);
+    const tag = `${unfixedAfterSendBacks[0].priorAppearances}-send-backs:${unfixedAfterSendBacks[0].file}:${unfixedAfterSendBacks[0].line}`;
+    if (fixes.every(Boolean)) return { ...done('send-back', [`same-finding-unfixed-after-${tag}`, 'concrete-fix-proposed']), body: fixes.join('\n') };
+    return done('escalate', [`same-finding-unfixed-after-${tag}`, 'no-concrete-fix-found']);
+  }
   if (weakening.length) return done('send-back', [`possible-guard-weakening:${weakening[0].file}:${weakening[0].line}`]);
   if (!latest && trigger === 'review-cap') {
     const m = mechanicalSpend(comments);
@@ -355,6 +362,18 @@ function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = []
   if (trend === 'repeating') return done('send-back', [`repeating-${repeated.length}-of-${annotated.length}-re-raised`]);
   if (trend === 'shrinking') return done('send-back', [`shrinking-but-${repeated.length}-re-raised`]);
   return done('send-back', ['findings-changing-not-shrinking']);
+}
+
+const REMEDY = /[^.!?\n]*\b(?:should|must|needs? to|ought to|instead of|rather than|replace|release|retain|count|keep|add (?:a|the|an)|use|make|reject|require)\b[^.!?\n]*[.!?]?/gi;
+
+/**
+ * Work out the concrete fix for a finding from its own text (the remedy sentence the reviewer / red team wrote, else a
+ * named test). PURE. Returns a short instruction, or null when the text states none (the judge cannot name a fix).
+ */
+export function proposeFix(f) {
+  const text = `${f.summary ?? ''} ${f.detail ?? ''}`;
+  const hit = [...text.matchAll(REMEDY)].map((m) => m[0].trim()).filter((x) => x.length >= 25).at(-1);
+  return hit ? `${f.file ?? '(file)'}${f.line ? `:${f.line}` : ''} - ${hit.slice(0, 300)}` : null;
 }
 
 /** The one-line log form. PURE. */

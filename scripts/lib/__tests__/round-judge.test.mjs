@@ -98,11 +98,18 @@ describe('verdict paths', () => {
     expect(r.verdict).toBe('escalate');
     expect(r.reasons[0]).toMatch(/card-on-guard-code/);
   });
-  it('escalate: the same finding came back unfixed after more than one send-back', () => {
+  it('same finding back unfixed after >1 send-back: the fix is worked out first and logged as the send-back body', () => {
+    const f = ['a.mjs', 7, 'alpha failure in parser. The parser should reject an empty record instead of returning null.'];
+    const r = judge([rt(H(1), [f]), rt(H(2), [f]), rt(H(9), [f])]);
+    expect(r.verdict).toBe('send-back');
+    expect(r.reasons.join(';')).toMatch(/unfixed-after-2-send-backs.*concrete-fix-proposed/);
+    expect(r.body).toMatch(/a\.mjs:7 - .*should reject an empty record/);
+  });
+  it('escalate only when no concrete fix can be named', () => {
     const f = ['a.mjs', 7, 'alpha failure in parser'];
     const r = judge([rt(H(1), [f]), rt(H(2), [f]), rt(H(9), [f])]);
     expect(r.verdict).toBe('escalate');
-    expect(r.reasons[0]).toMatch(/unfixed-after-2-send-backs/);
+    expect(r.reasons).toEqual(expect.arrayContaining([expect.stringMatching(/unfixed-after-2-send-backs/), 'no-concrete-fix-found']));
   });
   it('a broken finding that reads like a guard being weakened is send-back (unsure), noted', () => {
     const r = judge([rt(H(1), [['a.mjs', 1, 'alpha failure parser']]), rt(H(9), [['b.mjs', 2, 'the new check is fail-open when the ledger is unreadable']])]);

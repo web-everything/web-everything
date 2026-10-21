@@ -138,7 +138,7 @@ export function observeRoundCap({ pr, repo = null, state = null, subject = {}, e
     const line = formatJudgeLine(pr, result);
     const record = write({ ts: new Date(now).toISOString(), pr: Number(pr), repo, head, trigger: cap.trigger, key: cap.key,
       mode: cfg.mode, modeSource: cfg.source, verdict: result.verdict, ...(result.k ? { k: result.k } : {}),
-      ...(result.proof ? { proof: result.proof } : {}), reasons: result.reasons, line, evidence: result.evidence });
+      ...(result.proof ? { proof: result.proof } : {}), ...(result.body ? { body: result.body } : {}), reasons: result.reasons, line, evidence: result.evidence });
     rememberSize(outDir, pr, size);
     return record;
   } catch (e) {

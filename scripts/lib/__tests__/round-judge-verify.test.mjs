@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { claimIdentifiers, claimTerms, makeGitRepo, verifyFinding } from '../round-judge-verify.mjs';
 
 const files = {
-  'scripts/lib/__tests__/git-identity.test.mjs': "describe('x', () => {\n  it('non-leader timeout does not sweep unrelated group orphans', () => {})\n  const env = { WE_VERIFY_SLOT_HEARTBEAT_MS: '1000' }\n})\n",
+  'scripts/lib/__tests__/git-identity.test.mjs': "describe('x', () => {\n  it('non-leader timeout does not sweep unrelated group orphans', () => {\n    const env = { WE_VERIFY_SLOT_HEARTBEAT_MS: '1000' }\n    expect(env).toBeTruthy()\n  })\n})\n",
   'scripts/lib/git-identity.mjs': "export function repair() {\n  try { x() } catch (e) {\n    console.error('hook repair failed', e)\n    return { status: 'error', error: String(e) }\n  }\n}\n",
 };
 const repo = (tests = ['scripts/lib/__tests__/git-identity.test.mjs']) => ({ read: (p) => files[p] ?? null, tests: () => tests });
@@ -38,7 +38,11 @@ describe('verifyFinding', () => {
   });
   it('silent-failure claim: a log and an error-status return near the line refute', () => {
     const r = verifyFinding({ file: 'scripts/lib/git-identity.mjs', line: 2, summary: 'Hook-repair errors are silently discarded.' }, repo());
-    expect(r).toEqual({ status: 'refuted', evidence: 'scripts/lib/git-identity.mjs:3 logs/throws and scripts/lib/git-identity.mjs:4 returns an error status, in the function holding line 2' });
+    expect(r).toEqual({ status: 'refuted', evidence: 'scripts/lib/git-identity.mjs:3 logs/throws and scripts/lib/git-identity.mjs:4 returns an error status, every catch in the function holding line 2 is handled' });
+  });
+  it('the old looser shapes (identifier outside a test body, a swallowing catch) are NOT refuted', () => {
+    const loose = { 'scripts/lib/__tests__/git-identity.test.mjs': "describe('x', () => {\n  it('adds', () => {})\n  const env = { WE_VERIFY_SLOT_HEARTBEAT_MS: '1000' }\n})\n" };
+    expect(verifyFinding({ file: 'a.mjs', line: 1, summary: 'WE_VERIFY_SLOT_HEARTBEAT_MS is untested.' }, { read: (p) => loose[p] ?? null, tests: () => Object.keys(loose) }).status).toBe('inconclusive');
   });
   it('silent-failure claim with only a log -> inconclusive', () => {
     const r = verifyFinding({ file: 'b.mjs', line: 1, summary: 'errors are silently ignored' }, { read: () => 'console.error(1)\n', tests: () => [] });
