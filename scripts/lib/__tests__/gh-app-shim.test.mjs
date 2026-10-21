@@ -32,10 +32,19 @@ import {
 // PR #5729: a selector listed as a value option would be skipped as content, so a host it names would never be read.
 describe('GH_VALUE_OPTIONS never lists a host or repository selector', () => {
   it('has no selector long names, no -R shorthand and no optional-value browse -c', () => {
-    for (const name of ['repo', 'repos', 'hostname', 'host']) expect(GH_VALUE_OPTIONS.long).not.toContain(name);
-    for (const letters of Object.values(GH_VALUE_OPTIONS.short)) expect(letters).not.toContain('R');
-    expect(GH_VALUE_OPTIONS.short.browse).not.toContain('c');
-    expect(GH_VALUE_OPTIONS.longSwitchIn.commit).toContain('browse');
+    for (const [shorts, longs] of Object.values(GH_VALUE_OPTIONS)) {
+      expect(shorts).not.toContain('R');
+      for (const name of ['repo', 'repos', 'hostname', 'host']) expect(longs.split(' ')).not.toContain(name);
+    }
+    expect(GH_VALUE_OPTIONS.browse).toEqual(['b', 'branch']);
+  });
+
+  // gh 2.95 switches whose names are value options in other commands: their next argument stays a target.
+  it.each([
+    ['pr view', 'comments'], ['pr review', 'comment'], ['pr checkout', 'force'], ['extension install', 'force'],
+    ['repo edit', 'template'], ['repo fork', 'remote'], ['workflow run', 'json'], ['label clone', 'force'],
+  ])('lists no switch as a value option (%s --%s)', (command, name) => {
+    expect((GH_VALUE_OPTIONS[command]?.[1] ?? '').split(' ')).not.toContain(name);
   });
 });
 
@@ -1425,6 +1434,13 @@ require(${JSON.stringify(shim)});
     ['pr', 'review', '--comment', 'https://github.corp.example/o/r/pull/1'],
     ['pr', 'checkout', '--force', 'https://github.corp.example/o/r/pull/1'],
     ['repo', 'edit', '--template', 'enterprise/owner/repo'],
+    // Aliases resolve to their command's own options: ext is extension, where --force is a switch.
+    ['ext', 'install', '--force', 'github.corp.example/owner/gh-x'],
+    ['ext', 'install', '--force', 'https://github.corp.example/owner/gh-x'],
+    ['extension', 'install', '--force', 'enterprise/owner/gh-x'],
+    ['ext', 'upgrade', '--force', 'https://github.corp.example/owner/gh-x'],
+    // A value option of another command is not this command's: --notes is release content, not pr view's.
+    ['pr', 'view', '--notes', 'https://github.corp.example/o/r/pull/1'],
   ])('refuses enterprise hosts before using a fresh public App cache: %j', (...argv) => {
     const f = fixture({ fresh: true });
     try {
@@ -1531,6 +1547,10 @@ require(${JSON.stringify(shim)});
     ['pr', 'merge', '123', '--subject', 'https://docs.example.com'],
     ['issue', 'edit', '123', '--milestone', 'https://docs.example.com'],
     ['pr', 'create', '--template', 'https://docs.example.com'],
+    ['repo', 'autolink', 'ls', '-t', 'https://docs.example.com'],
+    ['repo', 'deploy-key', 'ls', '--jq', 'https://docs.example.com'],
+    ['extension', 'search', 'https://docs.example.com'],
+    ['ext', 'search', '-L', '5', 'https://docs.example.com'],
   ])('keeps URLs and host-like option values in content for public calls: %j', (...argv) => {
     const f = fixture({ fresh: true });
     try {

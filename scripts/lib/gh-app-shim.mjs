@@ -231,80 +231,173 @@ const SHIM_REFRESH_BUFFER_MS = 10 * 60 * 1000;
 const SHIM_CAPTURE_MAX_BUFFER = 1024 * 1024 * 1024;
 
 /**
- * The value-taking options of gh 2.95, read from every native command's `--help`. The host guard only
- * reads repository selectors and target positionals as hosts; an option value (`--comment <url>`,
- * `-n <notes>`) is content. `long` names take a value wherever gh defines them, except the commands in
- * `longSwitchIn`, where the same name is a switch and the next argument stays a positional. `short` maps
- * a command to its value shorthands. Selectors (-R/--repo, --hostname, --host) are deliberately absent;
- * optional-value options (browse -c/--commit) are switches here. An option missing from this table is
- * scanned conservatively, so a newer gh can only cause a refusal, never a missed host.
+ * The value-taking options of gh 2.95, read from every native command's `--help`: per command,
+ * [its value shorthands, its value long names]. The host guard reads only repository selectors and
+ * target positionals as hosts; an option value (`--comment <url>`, `-n <notes>`) is content. Only a
+ * (command, option) pair listed here skips its value, so a switch of the same name in another command
+ * (`repo edit --template <repo>`, `pr view --comments <url>`) keeps its next argument a target, and an
+ * option a newer gh adds is scanned conservatively: drift can cause a refusal, never a missed host.
+ * Selectors (-R/--repo, --hostname, --host) and optional-value options (browse -c/--commit) are absent.
  */
 export const GH_VALUE_OPTIONS = {
-  long: [
-    'add', 'add-assignee', 'add-blocked-by', 'add-blocking', 'add-label', 'add-project', 'add-reviewer',
-    'add-sub-issue', 'add-topic', 'after', 'agent', 'app', 'archive', 'assignee', 'attempt', 'author', 'author-date',
-    'author-email', 'author-name', 'base', 'blocked-by', 'blocking', 'body', 'body-file', 'branch', 'branch-repo',
-    'bundle', 'cache', 'category', 'cert-identity', 'cert-identity-regex', 'cert-oidc-issuer', 'checks', 'closed',
-    'codespace', 'color', 'comment', 'commenter', 'comments', 'commit', 'committer', 'committer-date',
-    'committer-email', 'committer-name', 'created', 'custom-agent', 'custom-trusted-root', 'data-type', 'date',
-    'days', 'debug-file', 'default-branch', 'desc', 'description', 'devcontainer-path', 'digest-alg', 'dir',
-    'discussion-category', 'display-name', 'duplicate-of', 'env', 'env-file', 'event', 'exclude', 'extension',
-    'field', 'field-id', 'filename', 'filter', 'followers', 'force', 'fork-name', 'forks', 'format', 'from-file',
-    'git-protocol', 'gitignore', 'good-first-issues', 'hash', 'head', 'header', 'help-wanted-issues', 'homepage',
-    'id', 'idle-timeout', 'include-forks', 'input', 'interactions', 'interval', 'involves', 'iteration-id', 'job',
-    'jq', 'json', 'key', 'label', 'language', 'license', 'limit', 'location', 'machine', 'match', 'match-head-commit',
-    'mention', 'mentions', 'merged-at', 'method', 'milestone', 'name', 'notes', 'notes-file', 'notes-start-tag',
-    'number', 'number-topics', 'order', 'org', 'output', 'owner', 'page', 'parent', 'pattern', 'pin', 'precompiled',
-    'predicate-type', 'preview', 'profile', 'project', 'project-id', 'query', 'raw-field', 'reactions', 'readme',
-    'reason', 'recover', 'ref', 'remote', 'remote-name', 'remove', 'remove-assignee', 'remove-blocked-by',
-    'remove-blocking', 'remove-label', 'remove-project', 'remove-reviewer', 'remove-scopes', 'remove-sub-issue',
-    'remove-topic', 'repo-owner', 'retention-period', 'review', 'review-requested', 'reviewed-by', 'reviewer',
-    'scope', 'scopes', 'search', 'server-port', 'shell', 'signer-digest', 'signer-repo', 'signer-workflow',
-    'single-select-option-id', 'single-select-options', 'size', 'sort', 'source', 'source-digest', 'source-owner',
-    'source-ref', 'squash-merge-commit-message', 'stars', 'state', 'status', 'subject', 'succeed-on-no-caches', 'tag',
-    'target', 'target-owner', 'team', 'team-mentions', 'template', 'text', 'title', 'topic', 'tree', 'tuf-root',
-    'tuf-url', 'type', 'updated', 'upstream-remote-name', 'url', 'user', 'visibility', 'workflow',
-  ],
-  longSwitchIn: {
-    closed: ['project list'], comment: ['pr review'], comments: ['discussion view', 'issue view', 'pr view'],
-    commit: ['browse'], force: ['codespace delete', 'extension install', 'extension upgrade', 'label clone',
-      'label create', 'pr checkout', 'repo sync', 'run cancel', 'skill install', 'skill update'],
-    json: ['workflow run'], remote: ['repo fork'], remove: ['copilot'], shell: ['alias set'], source: ['repo list'],
-    status: ['codespace create'], template: ['repo edit'], user: ['secret delete', 'secret list', 'secret set'],
-  },
-  short: {
-    'agent-task create': 'baF', 'agent-task list': 'qLt', 'agent-task view': 'qt', 'api': 'FHqXpft',
-    'attestation download': 'dLo', 'attestation verify': 'bidqLot', 'auth login': 'phs', 'auth logout': 'hu',
-    'auth refresh': 'hrs', 'auth setup-git': 'fh', 'auth status': 'h', 'auth switch': 'hu', 'auth token': 'hu',
-    'browse': 'b', 'cache delete': 'r', 'cache list': 'qkLOrSt', 'codespace code': 'c',
-    'codespace cp': 'cp', 'codespace create': 'bdlm', 'codespace delete': 'cou', 'codespace edit': 'cdm',
-    'codespace jupyter': 'c', 'codespace list': 'qLotu', 'codespace logs': 'c', 'codespace ports': 'cqt',
-    'codespace rebuild': 'c', 'codespace ssh': 'c', 'codespace stop': 'cou', 'codespace view': 'cqt',
-    'completion': 's', 'config get': 'h', 'config list': 'h', 'config set': 'h', 'discussion comment': 'bF',
-    'discussion create': 'bFclt', 'discussion edit': 'bFct', 'discussion list': 'AcqlLSst', 'discussion view': 'qLt',
-    'extension search': 'qLt', 'gist create': 'df', 'gist edit': 'adfr', 'gist list': 'L', 'gist view': 'f',
-    'gpg-key add': 't', 'issue close': 'cr', 'issue comment': 'bF', 'issue create': 'abFlmpTt', 'issue develop': 'bn',
-    'issue edit': 'bFmt', 'issue list': 'aAqlLmSst', 'issue lock': 'r', 'issue reopen': 'c', 'issue status': 'qt',
-    'issue view': 'qt', 'label create': 'cd', 'label edit': 'cdn', 'label list': 'qLSt', 'org list': 'L',
-    'pr checkout': 'b', 'pr checks': 'iqt', 'pr close': 'c', 'pr comment': 'bF', 'pr create': 'aBbFHlmprTt',
-    'pr diff': 'e', 'pr edit': 'BbFmt', 'pr list': 'aABHqlLSst', 'pr lock': 'r', 'pr merge': 'AbFt', 'pr reopen': 'c',
-    'pr revert': 'bFt', 'pr review': 'bF', 'pr status': 'qt', 'pr view': 'qt', 'project close': 'qt',
-    'project copy': 'qt', 'project create': 'qt', 'project delete': 'qt', 'project edit': 'dqt',
-    'project field-create': 'qt', 'project field-delete': 'qt', 'project field-list': 'qLt', 'project item-add': 'qt',
-    'project item-archive': 'qt', 'project item-create': 'qt', 'project item-delete': 'qt', 'project item-edit': 'qt',
-    'project item-list': 'qLt', 'project link': 'T', 'project list': 'qLt', 'project mark-template': 'qt',
-    'project unlink': 'T', 'project view': 'qt', 'release create': 'nFt', 'release download': 'ADOp',
-    'release edit': 'nFt', 'release list': 'qLOt', 'release verify': 'qt', 'release verify-asset': 'qt',
-    'release view': 'qt', 'repo autolink list': 'qt', 'repo autolink view': 'qt', 'repo clone': 'u',
-    'repo create': 'dghlrstp', 'repo deploy-key add': 't', 'repo deploy-key list': 'qt', 'repo edit': 'dh',
-    'repo list': 'qlLt', 'repo read-dir': 'qt', 'repo read-file': 'qot', 'repo sync': 'bs', 'repo view': 'bqt',
-    'ruleset list': 'Lo', 'ruleset view': 'o', 'run download': 'Dnp', 'run list': 'bceqLstuw', 'run rerun': 'j',
-    'run view': 'ajqt', 'run watch': 'i', 'search code': 'qLt', 'search commits': 'qLt', 'search issues': 'qLt',
-    'search prs': 'BHqLt', 'search repos': 'qLt', 'secret delete': 'aeo', 'secret list': 'aeqot',
-    'secret set': 'abeforv', 'skill list': 'qt', 'skill search': 'qLt', 'ssh-key add': 't', 'status': 'eo',
-    'variable delete': 'eo', 'variable get': 'eqot', 'variable list': 'eqot', 'variable set': 'beforv',
-    'workflow list': 'qLt', 'workflow run': 'Ffr', 'workflow view': 'r',
-  },
+  'agent-task create': ['baF', 'base custom-agent from-file'],
+  'agent-task list': ['qLt', 'jq json limit template'],
+  'agent-task view': ['qt', 'jq json template'],
+  api: ['FHqXpft', 'cache field header input jq method preview raw-field template'],
+  'attestation download': ['dLo', 'digest-alg limit owner predicate-type'],
+  'attestation trusted-root': ['', 'tuf-root tuf-url'],
+  'attestation verify': ['bidqLot', 'bundle cert-identity cert-identity-regex cert-oidc-issuer ' +
+    'custom-trusted-root digest-alg format jq limit owner predicate-type signer-digest signer-repo ' +
+    'signer-workflow source-digest source-ref template'],
+  'auth login': ['phs', 'git-protocol scopes'],
+  'auth logout': ['hu', 'user'],
+  'auth refresh': ['hrs', 'remove-scopes scopes'],
+  'auth setup-git': ['fh', 'force'],
+  'auth status': ['h', 'jq json template'],
+  'auth switch': ['hu', 'user'],
+  'auth token': ['hu', 'user'],
+  browse: ['b', 'branch'],
+  'cache delete': ['r', 'ref succeed-on-no-caches'],
+  'cache list': ['qkLOrSt', 'jq json key limit order ref sort template'],
+  'codespace code': ['c', 'codespace repo-owner'],
+  'codespace cp': ['cp', 'codespace profile repo-owner'],
+  'codespace create': ['bdlm', 'branch devcontainer-path display-name idle-timeout location machine ' +
+    'retention-period'],
+  'codespace delete': ['cou', 'codespace days org repo-owner user'],
+  'codespace edit': ['cdm', 'codespace display-name machine repo-owner'],
+  'codespace jupyter': ['c', 'codespace repo-owner'],
+  'codespace list': ['qLotu', 'jq json limit org template user'],
+  'codespace logs': ['c', 'codespace repo-owner'],
+  'codespace ports': ['cqt', 'codespace jq json repo-owner template'],
+  'codespace rebuild': ['c', 'codespace repo-owner'],
+  'codespace ssh': ['c', 'codespace debug-file profile repo-owner server-port'],
+  'codespace stop': ['cou', 'codespace org repo-owner user'],
+  'codespace view': ['cqt', 'codespace jq json repo-owner template'],
+  completion: ['s', 'shell'],
+  'discussion comment': ['bF', 'body body-file'],
+  'discussion create': ['bFclt', 'body body-file category label title'],
+  'discussion edit': ['bFct', 'add-label body body-file category remove-label title'],
+  'discussion list': ['AcqlLSst', 'after author category jq json label limit order search sort state template'],
+  'discussion view': ['qLt', 'after jq json limit order template'],
+  'extension create': ['', 'precompiled'],
+  'extension install': ['', 'pin'],
+  'extension search': ['qLt', 'jq json license limit order owner sort template'],
+  'gist create': ['df', 'desc filename'],
+  'gist edit': ['adfr', 'add desc filename remove'],
+  'gist list': ['L', 'filter limit'],
+  'gist view': ['f', 'filename'],
+  'gpg-key add': ['t', 'title'],
+  'issue close': ['cr', 'comment duplicate-of reason'],
+  'issue comment': ['bF', 'body body-file'],
+  'issue create': ['abFlmpTt', 'assignee blocked-by blocking body body-file label milestone parent project ' +
+    'recover template title type'],
+  'issue develop': ['bn', 'base branch-repo name'],
+  'issue edit': ['bFmt', 'add-assignee add-blocked-by add-blocking add-label add-project add-sub-issue body ' +
+    'body-file milestone parent remove-assignee remove-blocked-by remove-blocking remove-label remove-project ' +
+    'remove-sub-issue title type'],
+  'issue list': ['aAqlLmSst', 'app assignee author jq json label limit mention milestone search state template ' +
+    'type'],
+  'issue lock': ['r', 'reason'],
+  'issue reopen': ['c', 'comment'],
+  'issue status': ['qt', 'jq json template'],
+  'issue view': ['qt', 'jq json template'],
+  'label create': ['cd', 'color description'],
+  'label edit': ['cdn', 'color description name'],
+  'label list': ['qLSt', 'jq json limit order search sort template'],
+  'org list': ['L', 'limit'],
+  'pr checkout': ['b', 'branch'],
+  'pr checks': ['iqt', 'interval jq json template'],
+  'pr close': ['c', 'comment'],
+  'pr comment': ['bF', 'body body-file'],
+  'pr create': ['aBbFHlmprTt', 'assignee base body body-file head label milestone project recover reviewer ' +
+    'template title'],
+  'pr diff': ['e', 'color exclude'],
+  'pr edit': ['BbFmt', 'add-assignee add-label add-project add-reviewer base body body-file milestone ' +
+    'remove-assignee remove-label remove-project remove-reviewer title'],
+  'pr list': ['aABHqlLSst', 'app assignee author base head jq json label limit search state template'],
+  'pr lock': ['r', 'reason'],
+  'pr merge': ['AbFt', 'author-email body body-file match-head-commit subject'],
+  'pr reopen': ['c', 'comment'],
+  'pr revert': ['bFt', 'body body-file title'],
+  'pr review': ['bF', 'body body-file'],
+  'pr status': ['qt', 'jq json template'],
+  'pr view': ['qt', 'jq json template'],
+  'project close': ['qt', 'format jq owner template'],
+  'project copy': ['qt', 'format jq source-owner target-owner template title'],
+  'project create': ['qt', 'format jq owner template title'],
+  'project delete': ['qt', 'format jq owner template'],
+  'project edit': ['dqt', 'description format jq owner readme template title visibility'],
+  'project field-create': ['qt', 'data-type format jq name owner single-select-options template'],
+  'project field-delete': ['qt', 'format id jq template'],
+  'project field-list': ['qLt', 'format jq limit owner template'],
+  'project item-add': ['qt', 'format jq owner template url'],
+  'project item-archive': ['qt', 'format id jq owner template'],
+  'project item-create': ['qt', 'body format jq owner template title'],
+  'project item-delete': ['qt', 'format id jq owner template'],
+  'project item-edit': ['qt', 'body date field-id format id iteration-id jq number project-id ' +
+    'single-select-option-id template text title'],
+  'project item-list': ['qLt', 'format jq limit owner query template'],
+  'project link': ['T', 'owner team'],
+  'project list': ['qLt', 'format jq limit owner template'],
+  'project mark-template': ['qt', 'format jq owner template'],
+  'project unlink': ['T', 'owner team'],
+  'project view': ['qt', 'format jq owner template'],
+  'release create': ['nFt', 'discussion-category notes notes-file notes-start-tag target title'],
+  'release download': ['ADOp', 'archive dir output pattern'],
+  'release edit': ['nFt', 'discussion-category notes notes-file tag target title'],
+  'release list': ['qLOt', 'jq json limit order template'],
+  'release verify': ['qt', 'format jq template'],
+  'release verify-asset': ['qt', 'format jq template'],
+  'release view': ['qt', 'jq json template'],
+  'repo autolink list': ['qt', 'jq json template'],
+  'repo autolink view': ['qt', 'jq json template'],
+  'repo clone': ['u', 'upstream-remote-name'],
+  'repo create': ['dghlrstp', 'description gitignore homepage license remote source team template'],
+  'repo deploy-key add': ['t', 'title'],
+  'repo deploy-key list': ['qt', 'jq json template'],
+  'repo edit': ['dh', 'add-topic default-branch description homepage remove-topic squash-merge-commit-message ' +
+    'visibility'],
+  'repo fork': ['', 'fork-name org remote-name'],
+  'repo list': ['qlLt', 'jq json language limit template topic visibility'],
+  'repo read-dir': ['qt', 'jq json ref template'],
+  'repo read-file': ['qot', 'jq json output ref template'],
+  'repo sync': ['bs', 'branch source'],
+  'repo view': ['bqt', 'branch jq json template'],
+  'ruleset list': ['Lo', 'limit org'],
+  'ruleset view': ['o', 'org'],
+  'run download': ['Dnp', 'dir name pattern'],
+  'run list': ['bceqLstuw', 'branch commit created event jq json limit status template user workflow'],
+  'run rerun': ['j', 'job'],
+  'run view': ['ajqt', 'attempt job jq json template'],
+  'run watch': ['i', 'interval'],
+  'search code': ['qLt', 'extension filename jq json language limit match owner size template'],
+  'search commits': ['qLt', 'author author-date author-email author-name committer committer-date committer-email ' +
+    'committer-name hash jq json limit order owner parent sort template tree visibility'],
+  'search issues': ['qLt', 'app assignee author closed commenter comments created interactions involves jq json ' +
+    'label language limit match mentions milestone order owner project reactions sort state team-mentions ' +
+    'template updated visibility'],
+  'search prs': ['BHqLt', 'app assignee author base checks closed commenter comments created head interactions ' +
+    'involves jq json label language limit match mentions merged-at milestone order owner project reactions ' +
+    'review review-requested reviewed-by sort state team-mentions template updated visibility'],
+  'search repos': ['qLt', 'created followers forks good-first-issues help-wanted-issues include-forks jq json ' +
+    'language license limit match number-topics order owner size sort stars template topic updated visibility'],
+  'secret delete': ['aeo', 'app env org'],
+  'secret list': ['aeqot', 'app env jq json org template'],
+  'secret set': ['abeforv', 'app body env env-file org visibility'],
+  'skill install': ['', 'agent dir pin scope'],
+  'skill list': ['qt', 'agent dir jq json scope template'],
+  'skill publish': ['', 'tag'],
+  'skill search': ['qLt', 'jq json limit owner page template'],
+  'skill update': ['', 'dir'],
+  'ssh-key add': ['t', 'title type'],
+  status: ['eo', 'exclude org'],
+  'variable delete': ['eo', 'env org'],
+  'variable get': ['eqot', 'env jq json org template'],
+  'variable list': ['eqot', 'env jq json org template'],
+  'variable set': ['beforv', 'body env env-file org visibility'],
+  'workflow list': ['qLt', 'jq json limit template'],
+  'workflow run': ['Ffr', 'field raw-field ref'],
+  'workflow view': ['r', 'ref'],
 };
 
 /**
@@ -766,22 +859,22 @@ function unsupportedTargetHost(argv, env) {
   if (env.GH_HOST && !publicHost(env.GH_HOST)) return String(env.GH_HOST);
   if (env.GH_REPO) { const host = repoHost(env.GH_REPO); if (host) return host; }
   // Only target-bearing positions are URLs. A comment body/title/header may contain any URL.
-  const targetCommand = argv[0] !== 'search'; // native search positionals are query text
-  const valueFlags = new Set(['--body', '--body-file', '--title', '--jq',
-    '--field', '--raw-field', '--header', '--method', '--cache', '--input', '--search', '--label',
-    '--assignee', '--reviewer', '--milestone', '--project', '--base', '--head', '--author', '--owner', '--limit', '--state']);
+  // Native search and extension search positionals are query text.
+  const targetCommand = argv[0] !== 'search' && !(['extension', 'ext'].includes(argv[0]) && argv[1] === 'search');
+  const valueFlags = new Set();
   // Short names change arity between commands: checkout -q/-f and merge -m/-s/-a are booleans.
   // Exempt content values only where their consuming option is known; uncertain URL arguments refuse.
   // Built-in aliases have the same argument arity and target positions as their commands.
   const subcommand = ({ new: 'create', ls: 'list', co: 'checkout', uninstall: 'remove' })[argv[1]]
     || (['secret', 'variable'].includes(argv[0]) && argv[1] === 'remove' ? 'delete' : argv[1]);
-  const command = (argv[0] === 'cs' ? 'codespace' : argv[0]) + ' ' + subcommand;
-  // Option values are content, never targets (--comment <url>, --notes, --description). A name that is
-  // a switch in this command keeps its next argument a positional (repo edit --template <repo>).
-  const commandKeys = [command + ' ' + argv[2], command, argv[0]];
-  for (const name of GH_VALUE_OPTIONS.long) {
-    if (!(GH_VALUE_OPTIONS.longSwitchIn[name] || []).some((c) => commandKeys.includes(c))) valueFlags.add('--' + name);
-  }
+  const top = ({ cs: 'codespace', ext: 'extension' })[argv[0]] || argv[0];
+  const command = top + ' ' + subcommand;
+  // Option values are content, never targets (--comment <url>, --notes, --description). Only this
+  // command's own value options skip their value: a switch of the same name elsewhere keeps its next
+  // argument a positional (repo edit --template <repo>). Three-level commands use the deepest key.
+  const commandKeys = [command + ' ' + (({ ls: 'list' })[argv[2]] || argv[2]), command, top];
+  const valueOptions = commandKeys.map((key) => GH_VALUE_OPTIONS[key]).find(Boolean) || ['', ''];
+  for (const name of valueOptions[1].split(' ').filter(Boolean)) valueFlags.add('--' + name);
   if (argv[0] === 'api') for (const flag of ['-F', '-f', '-H', '-X', '-q', '-t']) valueFlags.add(flag);
   if (['pr create', 'pr edit', 'pr merge', 'issue create', 'issue edit'].includes(command)) {
     for (const flag of ['-b', '-F', '-t']) valueFlags.add(flag);
@@ -841,11 +934,11 @@ function unsupportedTargetHost(argv, env) {
     'search code': 'w', 'search commits': 'w', 'search issues': 'w', 'search prs': 'w', 'search repos': 'w',
     'auth status': 'at',
   }[command] || (argv[0] === 'browse' ? 'anprsw' : '');
-  // Value shorthands (GH_VALUE_OPTIONS.short): inside a bundle they take the rest as content
+  // Value shorthands (GH_VALUE_OPTIONS): inside a bundle they take the rest as content
   // (-BRelease/a/b is a base branch). Any shorthand in neither table is uncertain.
   // Optional-value shorthands (browse -c, \`--commit[=last]\`) never take the rest or the
   // next argument, so they are absent from that table and scanned as uncertain.
-  const valueShorthands = commandKeys.map((key) => GH_VALUE_OPTIONS.short[key]).find((v) => v !== undefined) || '';
+  const valueShorthands = valueOptions[0];
   // After \`--\` gh reads -x/o/r as a repository argument, unless pflag took the \`--\` as the value of an
   // option (\`pr list --app -- -R x/o/r\` still parses -R). Check both readings: every later argument is
   // a positional here, and the option scan below still runs over all of them.
