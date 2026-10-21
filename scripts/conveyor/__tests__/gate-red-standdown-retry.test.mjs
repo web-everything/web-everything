@@ -138,6 +138,14 @@ describe('gate-red stand-down earns ONE own-failure ci-heal per head (live PR #5
     expect(heals(plan(pr5768([standDown('2026-10-21T18:01:26Z'), forged]), ON))).toHaveLength(1);
   });
 
+  it('under a grant the mechanical re-run is allowed, but rejected re-runs count, so they never hold off the ci-heal', () => {
+    const withRetry = (budget) => pr5768([standDown('2026-10-21T18:01:26Z')], {
+      timeoutRetry: { eligible: true, head: HEAD, pr: 5768 }, timeoutRetryBudget: budget });
+    const kinds = (p) => p.dispatch.filter(d => d.prNumber === 5768).map(d => d.kind);
+    expect(kinds(plan(withRetry({ confirmed: 0, rejected: 0 }), ON))).toEqual(['ci-timeout-rerun']);
+    for (const rejected of [2, 1_000_000]) expect(kinds(plan(withRetry({ confirmed: 0, rejected }), ON))).toEqual(['ci-heal']);
+  });
+
   it('a second gate-red stand-down is terminal whatever the allowance (2 or 3)', () => {
     for (const value of [2, 3]) {
       const p = plan(pr5768([standDown('2026-10-21T18:01:26Z'), standDown('2026-10-21T19:10:00Z')]), { value, source: 'tool' });
