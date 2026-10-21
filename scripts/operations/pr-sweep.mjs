@@ -18,10 +18,13 @@ export function prSweepOperation({ readSweep, assess } = {}) {
     input: {
       repo: { type: 'string', required: false },
       pr: { type: 'number', required: false },
-      stalledAfter: { type: 'number', required: false },
+      'stalled-after': { type: 'number', required: false },
     },
     verdictFrom: 'assess',
-    read: compute({ reads: ['input.repo', 'input.pr', 'input.stalledAfter'], fn: ({ input }) => readSweep(input) }),
+    read: compute({ reads: ['input.repo', 'input.pr', 'input.stalled-after'], fn: ({ input }) => {
+      const { 'stalled-after': stalledAfter, ...rest } = input;
+      return readSweep({ ...rest, stalledAfter });
+    } }),
     assess: compute({ reads: ['findings.read'], fn: ({ findings }) => assess(findings.read) }),
   });
 }

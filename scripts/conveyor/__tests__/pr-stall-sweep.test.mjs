@@ -22,8 +22,8 @@ const shadow = (o = {}) => ({ value: { ...STALL_SWEEP_DEFAULTS, mode: 'shadow', 
 
 const old = new Date(NOW - 3 * 3600_000).toISOString();
 const PRS = [
-  { number: 11, title: 'fixer gone', url: 'u', isDraft: false, headRefOid: HEAD, updatedAt: old, createdAt: old, body: '', labels: [{ name: 'review:changes' }], statusCheckRollup: [] },
-  { number: 12, title: 'at the cap', url: 'u', isDraft: false, headRefOid: 'b'.repeat(40), updatedAt: old, createdAt: old, body: '', labels: [{ name: 'status:at-round-limit' }], statusCheckRollup: [] },
+  { number: 11, state: 'OPEN', title: 'fixer gone', url: 'u', isDraft: false, headRefOid: HEAD, updatedAt: old, createdAt: old, body: '', labels: [{ name: 'review:changes' }], statusCheckRollup: [] },
+  { number: 12, state: 'OPEN', title: 'at the cap', url: 'u', isDraft: false, headRefOid: 'b'.repeat(40), updatedAt: old, createdAt: old, body: '', labels: [{ name: 'status:at-round-limit' }], statusCheckRollup: [] },
 ];
 /** A fake `gh` that answers the read verbs and records every call. */
 function fakeGh({ prs = PRS, truncated = false } = {}) {
