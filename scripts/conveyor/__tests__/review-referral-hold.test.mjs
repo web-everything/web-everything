@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createActionStore } from '../../operations/action-store.mjs';
+import { publishAttention, runOnce as pollNeedsYou, unacknowledged, acknowledge } from '../../operations/needs-you-feed.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord, tryReadRun, writeRun } from '../../operations/run-store.mjs';
@@ -8,11 +10,13 @@ import { referralCardReadable } from '../../lib/referral-card-readable.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { runReconcilePass as runReconcilePassWithTiming } from '../reconcile-pass.mjs';
 const runReconcilePass = (options = {}) => runReconcilePassWithTiming({ ...options, env: { WE_REVIEW_START_AFTER: 'ci-green', WE_FIX_JOIN_CI_AND_REVIEW: 'false', ...options.env } });
-import { countFindings } from '../reconcile-core.mjs';
+import { countFindings, planReconcile } from '../reconcile-core.mjs';
 import {
   reviewRunEvidence, readReviewRunEvidence, decideReferralHold, enrichPrsWithReferralHolds,
   notifyReferralHold, REFERRAL_RETRY_MS, decideSameHeadHold, resolveSameHeadMaxReviews, PENDING_REASON_TOKENS,
   GH_LIST_COMMENT_CAP, findResumableParkedRun,
+  VERDICT_COOLDOWN_BASE_MS, VERDICT_COOLDOWN_CAP_MS, VERDICT_COOLDOWN_MAX_RELEASES,
+  resolveNoVerdictRetry, NO_VERDICT_RETRY_STANDARD, raiseNoVerdictNeedsYou, NO_VERDICT_NEEDS_YOU_KIND, needsYouClaimRoot,
 } from '../review-referral-hold.mjs';
 
 const repo = 'web-everything/web-everything';
@@ -122,7 +126,34 @@ describe('attempted mandatory referrals', () => {
     expect(hold(pr({ number: 3507 }))).toBeNull();
     expect(hold(pr(), [{ ...evidence(), repo: 'frontier-ui/frontierui' }])).toBeNull();
     const unfinished = run(); unfinished.stepTimings.pop();
-    expect(reviewRunEvidence(unfinished)).toBeNull();
+    const partial = reviewRunEvidence(unfinished);
+    expect(partial).toMatchObject({ incomplete: true, completedAt: null, parked: false, attempted: false });
+    expect(partial.pending.length).toBeGreaterThan(0); // never evidence of a clean, completed review
+    expect(hold(pr(), [partial])).toBeNull();
+    expect(findResumableParkedRun(pr(), [partial], { repo })).toBeNull();
+    expect(decideSameHeadHold(pr(), [partial], { repo })).toBeNull();
+  });
+  it('only newer attempts on the same PR supersede a parked review', () => {
+    const parked = evidence();
+    const crashed = { ...parked, id: 'crashed', incomplete: true, parked: false, attempted: false,
+      completedAt: null, startedAt: at + 1 };
+    for (const unrelated of [{ ...crashed, pr: 99 }, { ...crashed, repo: 'other/repo' },
+      { ...crashed, startedAt: parked.startedAt - 1 }]) {
+      expect(hold(pr(), [parked, unrelated])).not.toBeNull();
+    }
+    for (const startedAt of [parked.startedAt, at + 1]) {
+      expect(hold(pr(), [parked, { ...crashed, startedAt }])).toBeNull();
+    }
+    // Completing the newer attempt with referrals restores its own referral hold.
+    expect(hold(pr(), [parked, evidence({ id: 'crashed', time: at + 120_000 })])).not.toBeNull();
+    // An older panel finishing late cannot reclaim the release consumed by the newer attempt.
+    const latePark = { ...parked, completedAt: at + 120_000 };
+    const ruled = record();
+    ruled.rulings = [{ id: 'r1', key, reviewerId: ruled.reviewer.id, lens: ruled.reviewer.lens,
+      result: 'not-real', rationale: 'checked', evidence: ['diff'] }];
+    const p = pr({ comments: [comment(renderReferralRecord(ruled), at + 180_000)] });
+    expect(findResumableParkedRun(p, [latePark], { repo })).toEqual({ id: parked.id, head });
+    expect(findResumableParkedRun(p, [latePark, crashed], { repo })).toBeNull();
   });
   // Live 2026-10-10: 3,303 review-pr records (0.8 GB) were re-read and JSON-parsed by EVERY reconcile-pass process —
   // minutes under host load, which timed out the drain rebuild's reconcile/dispatch smoke checks. The projection
@@ -518,11 +549,405 @@ describe('same-head hold never silences a review whose verdict never landed (liv
   it('releases (null) when the only completed run left the PR review:pending with no reviewed-sha marker', () => {
     expect(decideSameHeadHold(labelled(['review:pending', 'review-round:1']), [lost()], { repo, env: {} })).toBeNull();
   });
-  it('is bounded: after the extra automatic runs it holds again and says why', () => {
-    const runs = [lost(), lost({ id: 'b', startedAt: Date.now() - 3600_000 }), lost({ id: 'c', startedAt: Date.now() - 3500_000 })];
-    const held = decideSameHeadHold(labelled(['review:pending']), runs, { repo, env: {} });
-    expect(held).toMatchObject({ kind: 'same-head', count: 3 });
-    expect(held.why).toMatch(/no verdict ever landed/);
+  const lostRuns = count => Array.from({ length: count }, (_, i) => lost({
+    id: `lost-${i}`, completedAt: at - i * 120_000, startedAt: at - i * 120_000 - 60_000,
+  }));
+  const oldWhy = count => `review paused: head ${head.slice(0, 9)} was already reviewed ${count} time(s); it resumes on a new push or an explicit re-arm`
+    + " (no verdict ever landed on the PR for those runs, and the 2 automatic re-runs are spent: a person must look at why the review's write-back fails)";
+  it('holds three no-verdict runs under one hour with retryAt and the due-time text', () => {
+    const held = decideSameHeadHold(labelled(['review:pending']), lostRuns(3), { repo, env: {}, now: at + 30 * 60_000 });
+    expect(VERDICT_COOLDOWN_BASE_MS).toBe(3600_000);
+    expect(held).toMatchObject({ kind: 'same-head', count: 3, retryAt: at + 3600_000,
+      why: `${oldWhy(3)}; the next automatic re-run is due at ${iso(at + 3600_000)}` });
+  });
+  it('releases three no-verdict runs once the one-hour cool-down is due', () => {
+    const p = labelled(['review:pending']), runs = lostRuns(3);
+    for (const elapsed of [3600_000, 3600_001]) {
+      expect(decideSameHeadHold(p, runs, { repo, env: {}, now: at + elapsed })).toBeNull();
+    }
+  });
+  it('requires two hours after one cool-down release (four no-verdict runs)', () => {
+    const p = labelled(['review:pending']), runs = lostRuns(4);
+    expect(decideSameHeadHold(p, runs, { repo, env: {}, now: at + 7200_000 - 1 }))
+      .toMatchObject({ retryAt: at + 7200_000 });
+    expect(decideSameHeadHold(p, runs, { repo, env: {}, now: at + 7200_000 })).toBeNull();
+  });
+  it.each(['operator', 'rearm', 'ruling', 'live-release', 'persistence-retry'])('does not reuse a parked review %s release after pre-advise crashes', release => {
+    const parked = evidence({ failure: release === 'persistence-retry' });
+    const ruled = record();
+    ruled.rulings = [{ id: 'r1', key, reviewerId: ruled.reviewer.id, lens: ruled.reviewer.lens,
+      result: 'not-real', rationale: 'checked', evidence: ['diff'] }];
+    const comments = {
+      operator: [comment('Please review again.', at + 1, 'chalbert')],
+      rearm: [comment(REARM_COMMENT_MARKER, at + 1)],
+      ruling: [comment(renderReferralRecord(ruled), at + 1)],
+      'live-release': [comment(renderReferralRecord(ruled), at - 120_000)],
+      'persistence-retry': [],
+    }[release];
+    const p = labelled(['review:pending'], { comments });
+    const rows = [parked];
+    const decide = now => enrichPrsWithReferralHolds([p], { repo, now,
+      env: { WE_REVIEW_NO_VERDICT_COOLDOWN_RELEASES: '6' }, readRuns: () => rows })[0];
+    expect(decide(at + 30 * 60_000).referralHold).toBeNull(); // the initial release is still owed
+    for (let i = 0; i < 20; i++) {
+      const crashed = run({ id: `review-pr-after-release-${i}`, time: at + (31 + i) * 60_000 });
+      crashed.stepTimings.pop();
+      rows.push(reviewRunEvidence(crashed));
+      if (i === 2) {
+        expect(decide(at + 33 * 60_000).referralHold).toMatchObject({ kind: 'same-head',
+          noVerdict: { exhausted: false } });
+      }
+    }
+    const enriched = decide(at + 365 * 86400_000);
+    expect(enriched.referralHold).toMatchObject({ kind: 'same-head', retryAt: null,
+      noVerdict: { exhausted: true, releasesSpent: 6 } });
+    expect(planReconcile({ repo: 'we', prs: [enriched], agents: [], now: at + 365 * 86400_000,
+      requiredChecks: ['test'], reviewTiming: { startAfter: 'ci-green' } }).dispatch.filter(d => d.kind === 'review')).toEqual([]);
+    expect(findResumableParkedRun(p, rows, { repo })).toBeNull();
+    expect(decideReferralHold(p, rows, { repo })).toBeNull();
+    const wokeAgain = { ...p, comments: [...comments, comment('Try once more.', at + 366 * 86400_000, 'chalbert')] };
+    expect(enrichPrsWithReferralHolds([wokeAgain], { repo, now: at + 367 * 86400_000,
+      readRuns: () => rows })[0].referralHold).toBeNull();
+  });
+  it.each([true, false])('charges pre-advise crashes to growing cooldowns and refuses a seventh release through reconciliation (initial panels completed: %s)', initialCompleted => {
+    const dir = temp(); vi.stubEnv('OPERATION_RUNS_DIR', dir);
+    vi.stubEnv('WE_REVIEW_NO_VERDICT_COOLDOWN_RELEASES', '6');
+    for (let i = 0; i < 3; i++) {
+      const r = run({ id: `review-pr-initial-${i}`, time: at - i * 120_000 + (initialCompleted ? 0 : 60_000) });
+      r.findings.referralVerdict = r.verdict = { verdict: 'accept', pendingReferrals: [] };
+      if (!initialCompleted) r.stepTimings.pop();
+      writeRun(r, dir);
+    }
+    const p = labelled(['review:pending']);
+    const decide = now => enrichPrsWithReferralHolds([p], { repo, now,
+      readRuns: () => readReviewRunEvidence({ dir, memo: new Map() }) })[0];
+    const planned = now => runReconcilePass({ repo, now, readPrs: () => [p], readAgents: () => [],
+      enrich: x => x, enrichMainRed: prs => ({ prs }), enrichAlreadyLanded: x => x, enrichBaseRef: x => x,
+      enrichSystemFix: x => x, enrichFixClaims: x => x, enrichTimeouts: x => x,
+      resolveMainSha: () => null, readRequiredChecks: () => ({ checks: ['test'] }),
+      enrichReferralHolds: () => [decide(now)],
+    }).dispatch.filter(d => d.kind === 'review');
+    expect(decide(at + 30 * 60_000).referralHold).toMatchObject({ count: 3, retryAt: at + VERDICT_COOLDOWN_BASE_MS });
+    expect(planned(at + 30 * 60_000)).toEqual([]);
+    let due = at + VERDICT_COOLDOWN_BASE_MS;
+    for (let release = 1; release <= 6; release++) {
+      expect(planned(due)).toHaveLength(1);
+      const crashed = newRunRecord({ id: `review-pr-crash-${release}`, op: 'review-pr', input: { repo, pr: p.number } });
+      crashed.findings.read = { repo, pr: p.number, netBasis: { rev: head } };
+      crashed.stepTimings = [{ step: 'read', stepIndex: 0, startedAt: iso(due), finishedAt: iso(due + 1), durationMs: 1 }];
+      writeRun(crashed, dir);
+      const held = decide(due + 1).referralHold;
+      expect(held).toMatchObject({ count: 3 + release,
+        noVerdict: { releasesSpent: release, exhausted: release === 6 } });
+      expect(planned(due + 1)).toEqual([]);
+      if (release < 6) {
+        due += Math.min(VERDICT_COOLDOWN_BASE_MS * 2 ** release, VERDICT_COOLDOWN_CAP_MS);
+        expect(held.retryAt).toBe(due);
+        expect(planned(due - 1)).toEqual([]);
+      } else {
+        expect(held.retryAt).toBeNull();
+        expect(planned(due + 365 * 86400_000)).toEqual([]);
+      }
+    }
+    const publish = vi.fn();
+    for (let tick = 0; tick < 3; tick++) raiseNoVerdictNeedsYou({ repo, prNumber: p.number,
+      hold: decide(due + 365 * 86400_000).referralHold, dir, now: due + tick, publish, log: () => {} });
+    expect(publish).toHaveBeenCalledTimes(1);
+  });
+  it.each([3, 9, 20])('bounds %s attempts on a fresh head even if none reach advise', count => {
+    const p = labelled(['review:pending']);
+    const rows = lostRuns(count).map(r => ({ ...r, completedAt: null, incomplete: true }));
+    const opts = { repo, env: {}, now: at, retry: { cooldownReleases: 6, source: 'tool' } };
+    expect(decideSameHeadHold(p, rows, opts)).toMatchObject({ count,
+      retryAt: count === 3 ? at - 60_000 + VERDICT_COOLDOWN_BASE_MS : null,
+      noVerdict: { exhausted: count >= 9, releasesSpent: Math.min(count - 3, 6) } });
+    expect(decideSameHeadHold(p, rows, { ...opts, retry: { cooldownReleases: 0 } }))
+      .toMatchObject({ retryAt: null, noVerdict: { exhausted: true } });
+    expect(decideSameHeadHold({ ...p, comments: [comment(REARM_COMMENT_MARKER, at + 1)] }, rows, opts)).toBeNull();
+    expect(decideSameHeadHold({ ...p, headRefOid: 'b'.repeat(40) }, rows, opts)).toBeNull();
+    expect(decideSameHeadHold(p, rows, { ...opts, env: { WE_REVIEW_SAME_HEAD_MAX_REVIEWS: '0' } })).toBeNull();
+    for (const landed of [labelled(['review:accepted']), labelled(['review:pending', 'review:changes']),
+      labelled(['review:pending'], { comments: [comment(`✅ review — accepted\n<!-- reviewed-sha: ${head} -->`)] })]) {
+      expect(decideSameHeadHold(landed, rows, opts)).toBeNull();
+    }
+  });
+  it('preserves the cooldown baseline when a pre-wake review completes after post-wake crashes', () => {
+    const minute = 60_000;
+    const p = labelled(['review:pending'], { comments: [comment(REARM_COMMENT_MARKER, at + 10 * minute)] });
+    const completed = lost({ startedAt: at, completedAt: at + 100 * minute });
+    const crashes = [20, 30, 40].map(n => ({ ...completed, id: `crash-${n}`,
+      startedAt: at + n * minute, completedAt: null, incomplete: true }));
+    expect(decideSameHeadHold(p, [completed, ...crashes], { repo, env: {}, now: at + 111 * minute,
+      retry: { cooldownReleases: 6, source: 'tool' } }))
+      .toMatchObject({ count: 3, retryAt: at + 160 * minute, noVerdict: { releasesSpent: 0 } });
+  });
+  it('counts incomplete immediate retries once, replaces them on completion, and scopes them to the head and wake', () => {
+    const dir = temp(), p = labelled(['review:pending']);
+    const retry = { cooldownReleases: 6, source: 'tool' }, opts = { repo, env: {}, now: at + 20 * 60_000, retry };
+    const crashed = run({ id: 'review-pr-incomplete', time: at + 120_000 });
+    crashed.stepTimings.pop();
+    writeRun(crashed, dir);
+    const partial = readReviewRunEvidence({ dir, memo: new Map() })[0];
+    expect(partial).toMatchObject({ incomplete: true, completedAt: null });
+    const rows = [lostRuns(1)[0], partial];
+    expect(decideSameHeadHold(p, rows, opts)).toBeNull(); // one immediate retry remains
+    const another = { ...partial, id: 'review-pr-another', startedAt: at + 180_000 };
+    expect(decideSameHeadHold(p, [...rows, another], opts)).toMatchObject({ count: 3, retryAt: at + 180_000 + 3600_000 });
+    for (const foreign of [{ ...another, repo: 'other/repo' }, { ...another, pr: 99 }, { ...another, head: 'b'.repeat(40) }]) {
+      expect(decideSameHeadHold(p, [...rows, foreign], opts)).toBeNull();
+    }
+    expect(decideSameHeadHold({ ...p, comments: [comment(REARM_COMMENT_MARKER, at + 240_000)] }, [...rows, another], opts)).toBeNull();
+    expect(decideSameHeadHold(labelled(['review:accepted']), [lostRuns(1)[0], partial, another], opts))
+      .toMatchObject({ count: 1, retryAt: null }); // completed-review semantics remain unchanged
+    const done = run({ id: crashed.id, time: at + 120_000 });
+    writeRun(done, dir);
+    const completed = readReviewRunEvidence({ dir, memo: new Map() });
+    expect(completed).toHaveLength(1);
+    expect(completed[0].incomplete).toBeUndefined();
+    expect(completed[0].completedAt).toBe(at + 120_000);
+    const invalid = run(); invalid.stepTimings = [];
+    expect(reviewRunEvidence(invalid)).toBeNull();
+    const noHead = run(); delete noHead.findings.read;
+    expect(reviewRunEvidence(noHead)).toBeNull();
+  });
+  it('caps cool-down backoff at eight hours while releases remain', () => {
+    expect(VERDICT_COOLDOWN_CAP_MS).toBe(8 * 3600_000);
+    const p = labelled(['review:pending']);
+    for (const count of [6, 7, 8]) {
+      const runs = lostRuns(count);
+      expect(decideSameHeadHold(p, runs, { repo, env: {}, now: at + 8 * 3600_000 - 1 }))
+        .toMatchObject({ retryAt: at + 8 * 3600_000 });
+      expect(decideSameHeadHold(p, runs, { repo, env: {}, now: at + 8 * 3600_000 })).toBeNull();
+    }
+  });
+  it('keeps the permanent hold and old wording after six cool-down releases', () => {
+    expect(VERDICT_COOLDOWN_MAX_RELEASES).toBe(6);
+    expect(decideSameHeadHold(labelled(['review:pending']), lostRuns(9), { repo, env: {}, now: at + 30 * 86400_000 }))
+      .toMatchObject({ kind: 'same-head', count: 9, retryAt: null, why: oldWhy(9) });
+  });
+  it('keeps landed-verdict holds unchanged for reviewed-sha and verdict labels', () => {
+    const runs = lostRuns(3), opts = { repo, env: {}, now: at + 86400_000 };
+    const landed = [labelled(['review:pending'], { comments: [comment(`✅ review — accepted\n<!-- reviewed-sha: ${head} -->`)] }),
+      ...['review:accepted', 'review:changes', 'review:human'].map(label => labelled([label])),
+      labelled(['review:pending', 'review:changes'])];
+    for (const p of landed) {
+      expect(decideSameHeadHold(p, runs, opts)).toMatchObject({ kind: 'same-head', retryAt: null,
+        why: `review paused: head ${head.slice(0, 9)} was already reviewed 3 time(s); it resumes on a new push or an explicit re-arm` });
+    }
+  });
+  it('preserves the off-switch, persistence-failure exclusion, operator wake and head reset', () => {
+    const p = labelled(['review:pending']), runs = lostRuns(9), opts = { repo, env: {}, now: at + 86400_000 };
+    expect(decideSameHeadHold(p, runs, { ...opts, env: { WE_REVIEW_SAME_HEAD_MAX_REVIEWS: '0' } })).toBeNull();
+    expect(decideSameHeadHold(p, runs.map(r => ({ ...r, persistenceFailed: true })), opts)).toBeNull();
+    expect(decideSameHeadHold({ ...p, comments: [comment(REARM_COMMENT_MARKER, at + 1)] }, runs, opts)).toBeNull();
+    expect(decideSameHeadHold({ ...p, headRefOid: 'b'.repeat(40) }, runs, opts)).toBeNull();
+  });
+  it('posts no repeated same-head notice when a cool-down retryAt is present', () => {
+    const p = labelled(['review:pending']), runs = lostRuns(3), post = vi.fn(), log = vi.fn(), dir = temp();
+    const held = decideSameHeadHold(p, runs, { repo, env: {}, now: at + 30 * 60_000 });
+    for (const now of [at + 30 * 60_000, held.retryAt, held.retryAt + 1]) {
+      notifyReferralHold({ repo, prNumber: p.number, pr: p, hold: held, dir, post, log, now });
+    }
+    expect(post).not.toHaveBeenCalled();
+    expect(log).not.toHaveBeenCalled();
+  });
+  describe('reviewNoVerdictRetry cascade setting (operator 2026-10-20)', () => {
+    const absent = () => ({ WE_PLATFORM_PREFERENCES_FILE: join(temp(), 'absent.json') });
+    it('standard is 0 (main: permanent hold at the third no-verdict run); tool layer sets 6, source logged', () => {
+      expect(NO_VERDICT_RETRY_STANDARD.cooldownReleases).toBe(0);
+      expect(resolveNoVerdictRetry(absent(), { tool: {} })).toEqual({ cooldownReleases: 0, source: 'standard' });
+      expect(resolveNoVerdictRetry(absent())).toEqual({ cooldownReleases: 6, source: 'tool' });
+      const retry = resolveNoVerdictRetry(absent(), { tool: {} });
+      expect(decideSameHeadHold(labelled(['review:pending']), lostRuns(3), { repo, env: {}, now: at + 30 * 86400_000, retry }))
+        .toMatchObject({ kind: 'same-head', count: 3, retryAt: null, why: oldWhy(3), noVerdict: { exhausted: true, releases: 0, source: 'standard' } });
+    });
+    it('bounds: 0..6 accepted; out-of-range / non-integer / wrong type fall back to the standard 0; env wins', () => {
+      for (const ok of [0, 3, 6]) expect(resolveNoVerdictRetry(absent(), { tool: { cooldownReleases: ok } })).toEqual({ cooldownReleases: ok, source: 'tool' });
+      for (const bad of [7, -1, 1.5, '6', null, true, [6], 1e9]) {
+        expect(resolveNoVerdictRetry(absent(), { tool: { cooldownReleases: bad } })).toEqual({ cooldownReleases: 0, source: 'standard' });
+      }
+      for (const tool of [6, [6], 'x', null]) expect(resolveNoVerdictRetry(absent(), { tool })).toEqual({ cooldownReleases: 0, source: 'standard' });
+      expect(resolveNoVerdictRetry({ ...absent(), WE_REVIEW_NO_VERDICT_COOLDOWN_RELEASES: '2' })).toEqual({ cooldownReleases: 2, source: 'env' });
+      for (const bad of ['7', '-1', 'x']) expect(resolveNoVerdictRetry({ ...absent(), WE_REVIEW_NO_VERDICT_COOLDOWN_RELEASES: bad })).toEqual({ cooldownReleases: 6, source: 'tool' });
+      expect(resolveNoVerdictRetry(null)).toEqual({ cooldownReleases: 0, source: 'standard' });
+    });
+    it('the 6th cool-down release is allowed and the 7th attempt is refused (permanent hold), even past any wait', () => {
+      const p = labelled(['review:pending']), retry = { cooldownReleases: 6, source: 'tool' };
+      // count 8 = 5 releases spent: the 6th release is due after the 8 h cap.
+      expect(decideSameHeadHold(p, lostRuns(8), { repo, env: {}, now: at + 8 * 3600_000, retry })).toBeNull();
+      // count 9 = all 6 releases spent: the 7th is refused forever.
+      for (const later of [8 * 3600_000, 30 * 86400_000, 365 * 86400_000]) {
+        expect(decideSameHeadHold(p, lostRuns(9), { repo, env: {}, now: at + later, retry }))
+          .toMatchObject({ retryAt: null, why: oldWhy(9), noVerdict: { exhausted: true, releasesSpent: 6, releases: 6 } });
+      }
+      // A setting above the hard cap can never buy a 7th release.
+      expect(decideSameHeadHold(p, lostRuns(9), { repo, env: {}, now: at + 30 * 86400_000, retry: { cooldownReleases: 99 } }))
+        .toMatchObject({ retryAt: null, noVerdict: { exhausted: true, releases: 0 } });
+    });
+    it('a cool-down hold is not exhausted and raises no needs-you; a landed-verdict hold carries no noVerdict at all', () => {
+      const p = labelled(['review:pending']), retry = { cooldownReleases: 6, source: 'tool' };
+      expect(decideSameHeadHold(p, lostRuns(3), { repo, env: {}, now: at + 30 * 60_000, retry }).noVerdict).toMatchObject({ exhausted: false });
+      expect(decideSameHeadHold(labelled(['review:accepted']), lostRuns(3), { repo, env: {}, now: at + 86400_000, retry }).noVerdict).toBeUndefined();
+      const publish = vi.fn(), dir = temp(), log = vi.fn();
+      const cool = decideSameHeadHold(p, lostRuns(3), { repo, env: {}, now: at + 30 * 60_000, retry });
+      expect(cool.retryAt).toBe(at + 3600_000);
+      notifyReferralHold({ repo, prNumber: p.number, pr: p, hold: cool, dir, post: vi.fn(), log, now: at + 30 * 60_000, publishNeedsYou: publish });
+      expect(publish).not.toHaveBeenCalled();
+    });
+    const exhausted = t0 => decideSameHeadHold(labelled(['review:pending']), lostRuns(9), { repo, env: {}, now: t0, retry: { cooldownReleases: 6, source: 'tool' } });
+    const T0 = at + 30 * 86400_000, LEASE = 10 * 60_000, GRACE = 15 * 60_000;
+    const res = `${repo}#pr:1`;
+    const storeAt = (dir, t) => createActionStore({ root: needsYouClaimRoot(dir), now: () => t });
+    const raise = (dir, t, o = {}) => raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: o.hold ?? exhausted(T0), dir, now: t, log: o.log ?? vi.fn(), publish: o.publish, store: o.store, beforePublish: o.beforePublish });
+    it('keeps the exhausted-hold alert visible across successful queue polls after its claim settles', async () => {
+      const dir = temp(), path = join(dir, 'events.jsonl');
+      const publish = vi.fn(item => publishAttention(item, { path, now: T0 }));
+      expect(raise(dir, T0, { publish })).toBe(true);
+      expect(storeAt(dir, T0).attempts(res)).toEqual([
+        expect.objectContaining({ state: 'terminal', outcome: 'settled' }),
+      ]);
+      const poll = report => pollNeedsYou({
+        checkoutRoot: join(dir, 'workspace/.lanes/we/lane-1'),
+        env: { WE_NEEDS_YOU_FEED: path }, now: T0 + 1, log: vi.fn(),
+        exec: () => JSON.stringify(report),
+      });
+      // The queue cannot represent review-no-verdict, even in a complete successful report.
+      for (const report of [{ ready: [] }, { ready: [], incomplete: true }, { ready: [] }]) {
+        expect((await poll(report)).lines).toEqual([]);
+        expect(unacknowledged({ path })).toEqual([
+          expect.objectContaining({ repo, pr: 1, head, kind: 'review-no-verdict' }),
+        ]);
+      }
+      expect(raise(dir, T0 + 2, { publish })).toBe(false);
+      expect(publish).toHaveBeenCalledTimes(1);
+      acknowledge({ path });
+      expect((await poll({ ready: [] })).lines).toEqual([]);
+      expect(unacknowledged({ path })).toEqual([]);
+    });
+    it.each(['review-no-verdict', 'disk-space'])('preserves event-only %s publication during a queue read and dedupes later publications', async kind => {
+      const dir = temp(), path = join(dir, 'events.jsonl');
+      const item = { repo, pr: 1, head, kind, reason: 'operator attention needed' };
+      const poll = () => pollNeedsYou({
+        checkoutRoot: join(dir, 'workspace/.lanes/we/lane-1'),
+        env: { WE_NEEDS_YOU_FEED: path }, now: T0 + 1, log: vi.fn(),
+        exec: () => {
+          // The report is collected outside the feed lock; a second producer can publish meanwhile.
+          publishAttention(item, { path, now: T0 });
+          return JSON.stringify({ ready: [] });
+        },
+      });
+      expect((await poll()).lines).toEqual([]);
+      expect((await poll()).lines).toEqual([]);
+      expect(unacknowledged({ path })).toEqual([expect.objectContaining(item)]);
+      // The unclaimed fallback also uses publishAttention on every tick: no duplicate event.
+      expect(publishAttention(item, { path, now: T0 + 2 }).lines).toEqual([]);
+      acknowledge({ path });
+      expect((await poll()).lines).toEqual([]);
+      expect(unacknowledged({ path })).toEqual([]);
+    });
+    it.each([
+      ['ready', {}], ['needsYourMerge', {}], ['rulingNeeded', {}],
+      ['rulingNeeded', { reason: 'round-cap' }], ['rulingNeeded', { reason: 'dispute' }],
+      ['stoodDown', {}], ['needsPerson', {}],
+    ])('still clears resolved report-owned alerts from %s (%j)', async (field, extra) => {
+      const dir = temp(), path = join(dir, 'events.jsonl');
+      const poll = report => pollNeedsYou({
+        checkoutRoot: join(dir, 'workspace/.lanes/we/lane-1'),
+        env: { WE_NEEDS_YOU_FEED: path }, now: T0, log: vi.fn(),
+        exec: () => JSON.stringify(report),
+      });
+      expect((await poll({ ready: [], [field]: [{ repo, number: 1, head, ...extra }] })).lines).toHaveLength(1);
+      const resolved = await poll({ ready: [] });
+      expect(resolved.lines).toHaveLength(1);
+      expect(resolved.lines[0]).toMatch(/^NEEDS-YOU-CLEARED /);
+      expect(unacknowledged({ path })).toEqual([]);
+    });
+    it('at-least-once (operator ruling), deduped in the normal path: once across ticks, again for a new head; claim settled in the ledger', () => {
+      const dir = temp(), log = vi.fn(), post = vi.fn(), publish = vi.fn(), p = labelled(['review:pending']), held = exhausted(T0);
+      for (let i = 0; i < 4; i++) notifyReferralHold({ repo, prNumber: p.number, pr: p, hold: held, dir, post, log, now: T0 + i, publishNeedsYou: publish });
+      expect(publish).toHaveBeenCalledTimes(1);
+      expect(publish.mock.calls[0][0]).toMatchObject({ repo, pr: p.number, head, kind: 'review-no-verdict' });
+      expect(log.mock.calls.flat().filter(l => l.includes('NEEDS-YOU review-no-verdict'))).toHaveLength(1);
+      expect(log.mock.calls.flat().find(l => l.includes('NEEDS-YOU'))).toContain('source=tool');
+      const rows = storeAt(dir, T0).attempts(`${repo}#pr:${p.number}`);
+      expect(rows).toEqual([expect.objectContaining({ kind: NO_VERDICT_NEEDS_YOU_KIND, state: 'terminal', outcome: 'settled', evidence: { head } })]);
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: p.number, hold: { ...held, head: 'b'.repeat(40) }, dir, log, publish, now: T0 + 10 })).toBe(true);
+      expect(publish).toHaveBeenCalledTimes(2);
+    });
+    it('interleaved concurrent reclaim of an EXPIRED claim: exactly one reclaimer publishes', () => {
+      const dir = temp(), a = vi.fn(), b = vi.fn();
+      // A crashed owner left an intent claim.
+      expect(storeAt(dir, T0).claim({ resource: res, kind: NO_VERDICT_NEEDS_YOU_KIND, owner: 'crashed', evidence: { head } }).ok).toBe(true);
+      const later = T0 + LEASE + 1;
+      // A reclaims and, while it holds the fresh claim (just before publishing), B runs the same reclaim.
+      expect(raise(dir, later, { publish: a, beforePublish: () => expect(raise(dir, later, { publish: b })).toBe(false) })).toBe(true);
+      expect(a).toHaveBeenCalledTimes(1);
+      expect(b).not.toHaveBeenCalled();
+      // Two reconcilers racing on the same stale record: the store's CAS lets only one win.
+      const d2 = temp(), s2 = storeAt(d2, T0);
+      const stale = s2.claim({ resource: res, kind: NO_VERDICT_NEEDS_YOU_KIND, owner: 'crashed', evidence: { head } }).record;
+      const s3 = storeAt(d2, T0 + LEASE + 1);
+      expect(s3.reconcile(stale, {}).ok).toBe(true);
+      expect(s3.reconcile(stale, {}).ok).toBe(false);
+    });
+    it('paused-then-resumed owner: its claim expired and was taken over, so it does NOT publish; the new owner does', () => {
+      const dir = temp(), paused = vi.fn(), takeover = vi.fn(), log = vi.fn();
+      const pause = () => expect(raise(dir, T0 + LEASE + 1, { publish: takeover })).toBe(true);
+      expect(raise(dir, T0, { publish: paused, beforePublish: pause, log })).toBe(false);
+      expect(paused).not.toHaveBeenCalled();
+      expect(takeover).toHaveBeenCalledTimes(1);
+      expect(log.mock.calls.flat().some(l => l.includes('claim lost before publishing'))).toBe(true);
+    });
+    it('a corrupt or partial claim-ledger entry never silences: the event is published unclaimed (feed dedupes)', () => {
+      for (const content of ['', '{bad', 'null', '{"version":1}']) {
+        const dir = temp(), publish = vi.fn(), log = vi.fn();
+        const rdir = join(needsYouClaimRoot(dir), 'actions', encodeURIComponent(res));
+        mkdirSync(rdir, { recursive: true });
+        writeFileSync(join(rdir, 'attempt-000001.json'), content);
+        expect(raise(dir, T0, { publish, log })).toBe(true);
+        expect(publish).toHaveBeenCalledTimes(1);
+        expect(log.mock.calls.flat().some(l => l.includes('claim ledger unusable'))).toBe(true);
+      }
+    });
+    it('many abandoned claims (crashes before publishing) never exhaust into silence: each expiry allows a fresh claim', () => {
+      const dir = temp(), crash = () => { throw new Error('killed before publishing'); };
+      let t = T0;
+      for (let i = 0; i < 40; i++) {
+        expect(raise(dir, t, { publish: vi.fn(), beforePublish: crash })).toBe(false);
+        expect(raise(dir, t + 1, { publish: vi.fn() })).toBe(false); // the live claim holds until it expires
+        t += LEASE + 1;
+      }
+      const ok = vi.fn();
+      expect(raise(dir, t, { publish: ok })).toBe(true);
+      expect(ok).toHaveBeenCalledTimes(1);
+      expect(storeAt(dir, t).attempts(res).length).toBe(41);
+    });
+    it('a failed publish retries on the next tick', () => {
+      const dir = temp(), flaky = vi.fn().mockImplementationOnce(() => { throw new Error('feed down'); });
+      expect(raise(dir, T0, { publish: flaky })).toBe(false);
+      expect(raise(dir, T0 + 1, { publish: flaky })).toBe(true);
+      expect(raise(dir, T0 + 2, { publish: flaky })).toBe(false);
+      expect(flaky).toHaveBeenCalledTimes(2);
+    });
+    it('at-least-once: a crash after publishing (claim left dispatching) re-raises after expiry + absence grace; a crash after observed does not', () => {
+      const dir = temp(), publish = vi.fn();
+      const failing = to => ({ ...storeAt(dir, T0), transition(r, n, o) { if (o.to === to) throw new Error('killed'); return storeAt(dir, T0).transition(r, n, o); } });
+      expect(raise(dir, T0, { publish, store: failing('observed') })).toBe(true);
+      expect(raise(dir, T0 + LEASE + 1, { publish })).toBe(false); // expired but inside the absence grace: held
+      expect(raise(dir, T0 + LEASE + GRACE + 1, { publish })).toBe(true); // accepted duplicate
+      expect(publish).toHaveBeenCalledTimes(2);
+      const d2 = temp(), p2 = vi.fn();
+      const failing2 = { ...storeAt(d2, T0), transition(r, n, o) { if (o.to === 'terminal' && o.from === 'observed') throw new Error('killed'); return storeAt(d2, T0).transition(r, n, o); } };
+      expect(raise(d2, T0, { publish: p2, store: failing2 })).toBe(true);
+      expect(raise(d2, T0 + LEASE + 1, { publish: p2 })).toBe(false); // reconciled to settled: no re-raise
+      expect(p2).toHaveBeenCalledTimes(1);
+    });
+    it('never writes the real feed from a test without an injected publisher', () => {
+      const dir = temp();
+      const held = decideSameHeadHold(labelled(['review:pending']), lostRuns(9), { repo, env: {}, now: at + 30 * 86400_000, retry: { cooldownReleases: 6 } });
+      expect(raiseNoVerdictNeedsYou({ repo, prNumber: 1, hold: held, dir, log: vi.fn() })).toBe(false);
+      expect(readdirSync(dir)).toEqual([]);
+    });
   });
   it('still holds when a verdict label landed, or the run is too fresh to judge', () => {
     expect(decideSameHeadHold(labelled(['review:pending', 'review:changes']), [lost()], { repo, env: {} })).not.toBeNull();

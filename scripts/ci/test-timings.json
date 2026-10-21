@@ -1148,6 +1148,8 @@
   "scripts/conveyor/soak/breaks/stacked-pr-missing-checks-refused.soak.test.mjs": 0.76,
   "scripts/conveyor/soak/breaks/stale-fixing-label-ci-heal-owed.soak.test.mjs": 30.95,
   "scripts/conveyor/soak/breaks/stalled-label-freezes-whole-build-queue.soak.test.mjs": 0.01,
+  "scripts/conveyor/soak/breaks/stalled-review-feed-poll.soak.test.mjs": 0.05,
+  "scripts/conveyor/soak/breaks/stalled-review-pre-advise-crash.soak.test.mjs": 0.12,
   "scripts/conveyor/soak/breaks/standdown-pr-holds-scope-slot.soak.test.mjs": 80.48,
   "scripts/conveyor/soak/breaks/sticky-smoke-rejection.soak.test.mjs": 253.36,
   "scripts/conveyor/soak/breaks/superseded-pr-dispatched.soak.test.mjs": 10.14,
