@@ -83,7 +83,7 @@ import { salvageEnabled, laneDirsForRepo, findSalvageCommit, pushSalvage } from 
 import { loadFixerLadder } from '../conveyor/fixer-ladder.mjs';
 import { planRoundEscalation } from '../conveyor/fix-resume.mjs';
 import { deliveryDispatchLogPath } from './detached-dispatch.mjs';
-import { buildStandDownComment } from '../conveyor/stand-down.mjs';
+import { buildStandDownComment, buildGateRedRetryRecordComment } from '../conveyor/stand-down.mjs';
 import { readFixLoopRows, appendFixLoopRow, fixLoopConfig, fixLoopState, fixLoopSessionRows, fixLoopDisposition,
   classifyFixRunOutcome, fixDispatchKilled, fixDispatchKillFile, hasFixHoldLabel } from '../conveyor/fix-loop-ledger.mjs';
 
@@ -273,6 +273,9 @@ export async function dispatchCiHeal(planned, {
   routeHeal = routeAvailableCiHeal,
   resolveStrongerRoute = resolveStrongerCiHealRoute,
   pollAttempts = pollHealAttempts,
+  // Live PR #5768 — the durable gate-red retry record, posted BEFORE launch so the one retry is spent even when the
+  // session dies before its own fix-begin. Injectable; a failed post refuses the launch (fail closed).
+  recordGateRedRetry = ({ repo: r, pr, body }) => postFixLoopParkComment({ repoSlug: CONSTELLATION_REPOS[r]?.slug ?? r, pr, body }),
 } = {}) {
   // fix procedure (operator-approved 2026-09-27) — a live FIX CLAIM means another fixer owns this PR's repair;
   // never spawn a ci-heal beside it (the planner already refuses `fix-claimed`; this re-checks at spawn time).
@@ -330,6 +333,15 @@ export async function dispatchCiHeal(planned, {
       console.error(`ci-heal-pr-dispatch: PR #${planned.pr} stronger-model rung (claude) model=${stronger.policyRoute.model} effort=${stronger.policyRoute.effort} (source ${stronger.source})`);
     }
     if (route?.outcome === 'refused') { releaseOurClaim(); return { held: true, reason: route.refusal }; }
+    if (planned.gateRedRetry) {
+      try {
+        recordGateRedRetry({ repo, pr: planned.pr, body: buildGateRedRetryRecordComment({
+          head: planned.gateRedRetry.head ?? planned.headRefOid, allowance: planned.gateRedRetry.allowance, source: planned.gateRedRetry.source }) });
+      } catch (e) {
+        releaseOurClaim();
+        return { held: true, reason: `gate-red-retry-record-failed: ${String(e?.message ?? e).split('\n')[0]} — not launched, so the one retry is not spent unrecorded` };
+      }
+    }
     // The gate-red retry's main-first check lives in the brief section, so it never runs on the brief-less worker.
     const briefOnly = reason === 'codeql' || !!planned.owedMainRule || !!planned.gateRedRetry;
     const out = await sinks[DISPATCH_EFFECT]({

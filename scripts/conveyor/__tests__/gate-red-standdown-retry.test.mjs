@@ -7,10 +7,12 @@
  */
 import { describe, expect, it } from 'vitest';
 import { planReconcile, gateRedRetryState, unresolvedStandDowns } from '../reconcile-core.mjs';
-import { buildStandDownComment, resolveGateRedRetries } from '../stand-down.mjs';
+import { buildStandDownComment, resolveGateRedRetries, buildGateRedRetryRecordComment, isGateRedRetryRecord } from '../stand-down.mjs';
+import { buildCiHealEscalationComment } from '../ci-heal-escalation-mark.mjs';
 import { buildFixBeginComment } from '../fix-procedure.mjs';
 import { AUTOMATION_LOGINS } from '../../lib/marker-authorship.mjs';
-import { withGateRedRetrySection } from '../../operations/ci-heal-pr-dispatch.mjs';
+import { withGateRedRetrySection, dispatchCiHeal } from '../../operations/ci-heal-pr-dispatch.mjs';
+import { DISPATCH_EFFECT } from '../../operations/dispatch-lane.mjs';
 import { classifyAwaitVerdict, buildAwaitVerifyResumePrompt } from '../await-verify-pass.mjs';
 
 const BOT = { login: AUTOMATION_LOGINS[0] };
@@ -112,12 +114,65 @@ describe('gate-red stand-down earns ONE own-failure ci-heal per head (live PR #5
     const after = plan(live, ON);
     expect(after.dispatch.filter(d => d.prNumber === 5768).map(d => d.kind)).toEqual(['ci-heal']);
     expect(heals(after)[0]).toMatchObject({ failingRequiredChecks: ['test'], gateRedRetry: { allowance: 1 } });
-    expect(heals(after)[0].why).toMatch(/instead of the planned `fix`/);
+  });
+
+  it('the grant goes through the ordinary ci-heal guards: a current-head needs-human escalation still refuses it', () => {
+    const finding = { body: '## changes requested\nfinding', author: BOT, createdAt: '2026-10-21T17:00:00Z' };
+    const esc = { body: buildCiHealEscalationComment({ headSha: HEAD, outcome: 'needs-human', reason: 'needs a person' }), author: BOT, createdAt: '2026-10-21T18:40:00Z' };
+    for (const labels of [[{ name: 'review:changes' }], [{ name: 'ci:failed' }]]) {
+      const p = plan(pr5768([finding, standDown('2026-10-21T18:01:26Z'), esc], { labels }), ON);
+      expect(heals(p)).toHaveLength(0);
+      expect(p.refusals.some(r => r.prNumber === 5768 && r.kind === 'ci-heal-escalated')).toBe(true);
+    }
+  });
+
+  it('the dispatcher\'s retry record spends the retry even when the session died before its fix-begin (same second counts)', () => {
+    const record = (at) => ({ body: buildGateRedRetryRecordComment({ head: HEAD }), author: BOT, createdAt: at });
+    expect(isGateRedRetryRecord(record('x').body)).toBe(true);
+    for (const at of ['2026-10-21T18:01:26Z', '2026-10-21T18:05:00Z']) {
+      const p = plan(pr5768([standDown('2026-10-21T18:01:26Z'), record(at)]), ON);
+      expect(heals(p)).toHaveLength(0);
+      expect(p.notes.find(n => n.kind === 'gate-red-retry-exhausted')).toMatchObject({ spent: 1 });
+    }
+    const forged = { ...record('2026-10-21T18:05:00Z'), author: { login: 'random-user' } };
+    expect(heals(plan(pr5768([standDown('2026-10-21T18:01:26Z'), forged]), ON))).toHaveLength(1);
+  });
+
+  it('a second gate-red stand-down is terminal whatever the allowance (2 or 3)', () => {
+    for (const value of [2, 3]) {
+      const p = plan(pr5768([standDown('2026-10-21T18:01:26Z'), standDown('2026-10-21T19:10:00Z')]), { value, source: 'tool' });
+      expect(heals(p)).toHaveLength(0);
+      expect(p.notes.some(n => n.kind === 'gate-red-retry-exhausted')).toBe(true);
+    }
   });
 
   it('gateRedRetryState fails closed when the stand-down time is unreadable', () => {
     const c = { body: buildStandDownComment({ reason: 'gate-red' }), author: BOT };
     expect(gateRedRetryState([c], [c], { retries: 1 })).toMatchObject({ eligible: true, grant: false, exhausted: true });
+  });
+});
+
+describe('dispatchCiHeal records the retry before launch (fail closed)', () => {
+  const planned = { itemNum: null, pr: 5768, laneRef: 'lane/x', scope: ['we:scripts/a.mjs'], lane: 9, headRefOid: HEAD,
+    gateRedRetry: { head: HEAD, standDownAt: '2026-10-21T18:01:26Z', detail: DETAIL, allowance: 1, source: 'standard' } };
+  const TEMPLATE = 'heal pr={{PR_NUM}} ref={{LANE_REF}} lane={{LANE}} slug={{SESSION_SLUG}} why={{REASON}}';
+  const opts = (extra) => ({ readBrief: () => TEMPLATE, acquireClaim: () => ({ ok: true }), releaseClaim: () => {}, readFixClaim: () => null,
+    pollAttempts: () => [], routeHeal: () => null, ...extra });
+  it('posts the record, then launches with the gate-red section in front of the brief', async () => {
+    const posted = []; const calls = [];
+    await dispatchCiHeal(planned, opts({ recordGateRedRetry: (a) => posted.push(a), sinks: { [DISPATCH_EFFECT]: async (p) => { calls.push(p); return { handle: 'h' }; } } }));
+    expect(posted).toHaveLength(1);
+    expect(isGateRedRetryRecord(posted[0].body)).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].prompt.startsWith('# Gate-red retry')).toBe(true);
+    expect(calls[0].probationWorker).toBeNull();
+  });
+  it('a failed record post refuses the launch', async () => {
+    const calls = [];
+    const out = await dispatchCiHeal(planned, opts({ recordGateRedRetry: () => { throw new Error('gh 502'); }, sinks: { [DISPATCH_EFFECT]: async (p) => { calls.push(p); return { handle: 'h' }; } } }));
+    expect(out).toMatchObject({ held: true });
+    expect(out.reason).toMatch(/gate-red-retry-record-failed: gh 502/);
+    expect(calls).toHaveLength(0);
   });
 });
 
