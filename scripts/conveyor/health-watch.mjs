@@ -70,6 +70,7 @@ import { readRecentSamples, appendSample, summarizeSample, findUngatedHeavyRuns 
 import { healthDir, healthSectionLines } from './health-watch-section.mjs';
 import { runDailyReadinessCheck, ledgerReadinessHistoryPath } from '../lib/ledger-readiness-daily.mjs';
 import { runInvestigations } from './health-investigate-dispatch.mjs';
+import { runBundleRepairs } from './bundle-repair-dispatch.mjs';
 import {
   planFileRequests, recordRequested, readLedgerStrict, writeLedger, spliceFilingSection, withLedgerLock,
 } from './health-file-request.mjs';
@@ -1464,6 +1465,16 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     } catch (e) { probeErrors.investigate = scrubText(String(e?.message || e).split('\n')[0]); }
   }
 
+  // Bundle repair (prototype, 2026-10-21) — a daemon clone held on its last-good build by an overlay conflict gets ONE
+  // supervised repair session (or, in shadow, the brief it would launch). Off unless `bundleRepair.enabled`; its own
+  // failure is a probe error, never a failed tick. A fixture tick never touches it unless a test supplies the seam.
+  let bundleRepair = null;
+  if (!flags['no-bundle-repair'] && (!flags['state-root'] || deps.runBundleRepairs) && Array.isArray(probes.selfSync)) {
+    try {
+      bundleRepair = await (deps.runBundleRepairs ?? runBundleRepairs)({ dir, selfSync: probes.selfSync, now, dryRun: !!flags['dry-run'] });
+    } catch (e) { probeErrors.bundleRepair = scrubText(String(e?.message || e).split('\n')[0]); }
+  }
+
   // #4079 — filing requests (slice 5): plan which open episodes get a NEW filing request this tick and append
   // them to the ledger. This ONLY plans + ledgers; it never lands anything itself — the lane-bound landing
   // pass (scripts/operations/health-file-request-land.mjs) is invocable standalone (`node
@@ -1591,7 +1602,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   return scrubDeep({
     now: new Date(now).toISOString(), durationMs, mode: config.mode, stateDir: dir, ghSampled: !!probes.prs, ghJob,
     claudeJobsArchive: claudeJobsArchive ?? null, tmpSweep: tmpSweep ?? null, ghSpend: ghSpend ?? null, probeErrors, transitions: result.transitions.map((t) => ({ type: t.type, key: t.key })),
-    plan: result.plan.map(({ diagnose, ...rest }) => rest), diagnoses, notifications, investigations, reports: written,
+    plan: result.plan.map(({ diagnose, ...rest }) => rest), diagnoses, notifications, investigations, bundleRepair, reports: written,
     section: renderHealthSection(state, { now, reportDir }),
     skipped: result.evaluations.filter((e) => !e.results).map((e) => ({ smell: e.smell.id, missing: e.skipped, error: e.error })),
   });

@@ -1,0 +1,10 @@
+{
+  "bundleRepair": {
+    "enabled": false,
+    "mode": "shadow",
+    "triggerMinutes": 20,
+    "clones": ["*"],
+    "maxConcurrent": 1,
+    "wallTimeMinutes": 120
+  }
+}

@@ -82,7 +82,7 @@ export function overlayFilePath(root, env = process.env) {
 }
 
 /** The append-only audit-trail file for `root`, sibling to its state file. */
-function eventsFilePath(root, env = process.env) {
+export function eventsFilePath(root, env = process.env) {
   return join(overlayDir(env), `${cloneKey(root)}.events.jsonl`);
 }
 
