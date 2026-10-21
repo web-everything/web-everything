@@ -2,7 +2,7 @@
  * Split out of daemon-rebuild.mjs (move-only).
  */
 
-import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV } from './shared.mjs';
+import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } from './shared.mjs';
 import {
   alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate, readReadyCandidate,
 } from './state.mjs';
@@ -363,6 +363,24 @@ export async function prepareRebuild({
     }
   }
 
+  // The overlays a build applies, read from its own rebuild-committed `daemon-rebuild: merge overlay <ref>` records on
+  // its first-parent line above main ({ref, sha}), plus the recorded adopted set when it is that build. Unreadable
+  // history returns undefined (the superseded rule then refuses: fail closed).
+  function liveOverlaysOf(head, mainSha) {
+    if (!head || !mainSha) return undefined;
+    const log = git(['log', '--first-parent', '--format=%P%x09%ce%x09%s', head, '--not', mainSha]);
+    if (log.status !== 0) return undefined;
+    const live = [];
+    for (const l of String(log.stdout ?? '').split('\n').filter(Boolean)) {
+      const [parents, committer, ...rest] = l.split('\t');
+      const ps = String(parents ?? '').split(' ');
+      const hit = rest.join('\t').match(/^daemon-rebuild: merge overlay (\S+) /);
+      if (hit && committer === REBUILD_IDENTITY_ENV.GIT_COMMITTER_EMAIL && ps.length === 2) live.push({ ref: hit[1], sha: ps[1] });
+    }
+    if (state.adopted?.head === head) for (const a of state.adopted.applied ?? []) if (a?.ref && a.sha) live.push({ ref: a.ref, sha: a.sha });
+    return live;
+  }
+
   // ── Step 4: up-to-date / still-rejected short-circuits ──────────────────────────────────────────────
   if (plan.upToDate) {
     if (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held) {
@@ -408,6 +426,11 @@ export async function prepareRebuild({
         rejected: state.rejected,
         nowMs: nowMs(),
         maxAgeMs,
+        // the overlays the RUNNING build applies: its own rebuild-committed merge records above main (hard data — an
+        // empty list for a plain-main HEAD), plus the recorded adopted set when HEAD is that adopted build
+        liveApplied: liveOverlaysOf(prevHead, plan.mainSha),
+        carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
+        leftForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
       });
       if (!m.adopt) {
         clearReadyCandidate(root, stEnv);
