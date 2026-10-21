@@ -97,7 +97,7 @@ import { resolveBuildPolicy, appendBuildRequirements } from '../lib/build-policy
 import {
   runBuildSelfReview, renderSelfReviewNotes, reviewBuildDiff, boundedSelfReviewDiff, selfReviewDiffArgs, SELF_REVIEW_MAX_DIFF_BYTES,
 } from '../lib/build-self-review.mjs';
-import { laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
+import { laneGitHardeningEnv, laneGitConfigArgs, hardenLaneGitArgs } from '../lib/lane-git-hardening.mjs';
 import { resolveCodexTaskRoute } from '../lib/codex-task-route.mjs';
 import { machinePrTitle, readMainCard } from './machine-pr-title.mjs';
 import { sanitizeHoldReason } from './build-dispatch-hold-route-land.mjs';
@@ -2554,10 +2554,14 @@ export function runConverge(
  *  is testable without a real git checkout. Fails soft to an empty/zero reading — a wrapper-side git failure
  *  here must not crash the whole delivery; it just means `scoreEscalation` sees no size/blast-radius signal,
  *  which is the safe direction for a signal that only ever ADDS review capacity, never blocks (#3320). */
-export function computeLaneDiffStats(lanePath, { run: runFn = run, baseRef = 'origin/main' } = {}) {
+export function computeLaneDiffStats(lanePath, { run: runFn = run, baseRef = 'origin/main', strict = false } = {}) {
   try {
-    const mergeBase = runFn('git', ['-C', lanePath, 'merge-base', 'HEAD', baseRef]).trim();
-    const numstat = runFn('git', ['-C', lanePath, 'diff', '--numstat', mergeBase]);
+    // Hardened (the builder controls this lane's git config), commit against commit (no worktree filter runs),
+    // and `--no-renames` so a moved file lists both its old and new path, never a `{a => b}` form.
+    const opts = { env: laneGitHardeningEnv() };
+    const mergeBase = runFn('git', ['-C', lanePath, ...laneGitConfigArgs(), 'merge-base', 'HEAD', baseRef], opts).trim();
+    const numstat = runFn('git', ['-C', lanePath, ...laneGitConfigArgs(), '--no-replace-objects',
+      ...hardenLaneGitArgs(['diff', '--numstat', '--no-renames', mergeBase, 'HEAD', '--'])], opts);
     const changedFiles = [];
     let diffLines = 0;
     for (const line of numstat.split('\n')) {
@@ -2572,7 +2576,8 @@ export function computeLaneDiffStats(lanePath, { run: runFn = run, baseRef = 'or
       if (Number.isFinite(d)) diffLines += d;
     }
     return { changedFiles, diffLines };
-  } catch {
+  } catch (e) {
+    if (strict) throw e;
     return { changedFiles: [], diffLines: 0 };
   }
 }
@@ -2599,8 +2604,13 @@ export function computeLaneDiffStats(lanePath, { run: runFn = run, baseRef = 'or
  * so every existing caller (every test that does not pass it) is byte-identical — this is additive-only.
  */
 export function decideParkMode({ report, convergeVerdict, filesTouched, lanePath, crossRepo = false, executedVendor = 'claude' }, { run: runFn = run } = {}) {
-  // The statute check reads the lane's net diff too: an agent's self-reported file list can omit a path.
-  const diffStats = lanePath ? computeLaneDiffStats(lanePath, { run: runFn }) : { changedFiles: filesTouched || [], diffLines: 0 };
+  // The statute check reads the lane's net diff too: an agent's self-reported file list can omit a path. An
+  // unreadable diff cannot clear that check, so it fails closed to human review.
+  let diffStats = { changedFiles: filesTouched || [], diffLines: 0 };
+  if (lanePath) {
+    try { diffStats = computeLaneDiffStats(lanePath, { run: runFn, strict: true }); }
+    catch { return { mode: 'park', label: 'review:human', reason: 'lane net diff unreadable; the statute/policy-core check cannot clear' }; }
+  }
   const touchesStatute = [...(filesTouched || []), ...diffStats.changedFiles].some((f) => isStatutePath(f) || isPolicyCorePath(f));
   if (touchesStatute) return { mode: 'park', label: 'review:human', reason: 'statute/policy-core path touched' };
   if (report.outcome === 'needs-human-judgment') return { mode: 'park', label: 'review:human', reason: report.reason };

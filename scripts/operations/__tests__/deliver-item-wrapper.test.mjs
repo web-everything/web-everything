@@ -2388,6 +2388,30 @@ describe('decideParkMode (#3627 gap 4 — the real scoreEscalation rubric)', () 
     expect(result).toEqual({ mode: 'park', label: 'review:human', reason: 'statute/policy-core path touched' });
   });
 
+  it('reads the net diff hardened, commit against commit, with renames split so a moved statute file still counts', () => {
+    const calls = [];
+    const runFn = (_bin, args, opts) => {
+      calls.push({ args, opts });
+      return args.includes('merge-base') ? 'base\n' : '0\t5\tdocs/agent/platform-decisions.md\n5\t0\tdocs/agent/moved.md\n';
+    };
+    const result = decideParkMode({
+      report: { outcome: 'done' }, convergeVerdict: { verdict: 'land', selfReview: { notes: [] } },
+      filesTouched: ['docs/agent/moved.md'], lanePath: '/lane',
+    }, { run: runFn });
+    expect(result.label).toBe('review:human');
+    const diff = calls.find(c => c.args.includes('--numstat'));
+    expect(diff.args).toEqual(expect.arrayContaining(['--no-renames', '--no-ext-diff', '--no-textconv', 'core.fsmonitor=false', 'base', 'HEAD']));
+    for (const c of calls) expect(c.opts.env).toEqual(laneGitHardeningEnv());
+  });
+
+  it('parks review:human when the lane\'s net diff cannot be read — an unreadable diff never clears the statute check', () => {
+    const result = decideParkMode({
+      report: { outcome: 'done' }, convergeVerdict: { verdict: 'land', selfReview: { notes: [] } },
+      filesTouched: ['a.mjs'], lanePath: '/lane',
+    }, { run: () => { throw new Error('git exploded'); } });
+    expect(result).toEqual({ mode: 'park', label: 'review:human', reason: 'lane net diff unreadable; the statute/policy-core check cannot clear' });
+  });
+
   it('still parks review:human on the agent\'s own needs-human-judgment outcome', () => {
     const result = decideParkMode({
       report: { outcome: 'needs-human-judgment', reason: 'a genuine taste call' }, convergeVerdict: noVerdict,

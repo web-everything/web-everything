@@ -1758,8 +1758,8 @@ separate shadow count and read completeness.
 
 ### Build completion safeguards
 
-Builder, fixer and Codex briefs embed `reviewer-expectations.md`. Maintain its concrete examples
-from recurring coroner findings. `scripts/settings/build.json` overrides the platform's `build` block:
+Builder, fixer and Codex briefs quote `reviewer-expectations.md` inside a data fence (it is derived
+from untrusted PR and CI text). The coroner proposes its concrete examples from recurring findings by PR. `scripts/settings/build.json` overrides the platform's `build` block:
 `finalGate` defaults to `full` (whole unit tier plus standards through heavy admission), with `related`
 and `none` escape settings; `selfReview.enabled` defaults true and `selfReview.maxRounds` defaults 2
 (0–10). `reviewerExpectations.enabled` defaults true. Sources use the shared policy-cascade formatter.
