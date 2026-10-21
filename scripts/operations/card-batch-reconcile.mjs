@@ -35,7 +35,9 @@ export async function reconcileCardBatches({
   dryRun = false, drainBudgetMs = DRAIN_TICK_BUDGET_MS, fileOwed = landPreventionCard, loadFilingSettings = loadPreventionBatchSettings,
 } = {}) {
   if (!Number.isFinite(leaseMs) || leaseMs <= 0) throw new TypeError('leaseMs must be positive');
-  const tickStart = clock(); // the drain budget counts from the START of the tick, terminal-PR recovery included
+  // The drain budget counts from the START of the health-watch tick: its own sample `now` when that is a recent one (the tick's
+  // sweeps ran before this call), else now. Terminal-PR recovery is inside it either way.
+  const tickStart = (Number.isFinite(now) && now <= clock() && clock() - now < 170_000) ? now : clock();
   // `now` is the cadence/flush sample; lease expiry must follow elapsed wall time during GitHub/Git IO.
   const results = [];
   let files;
@@ -119,7 +121,8 @@ export async function reconcileCardBatches({
           batch: (card, options) => batch(card, { ...options, stateDir }), write: line => log(line.trimEnd()) }),
       });
       for (const result of owed) {
-        if (result.deferred) drainDeferred = true;
+        if (result.deferred && result.step === 'acquire-deferred') drainDeferred = true;
+        else if (result.deferred) results.push({ action: 'deferred', step: 'owed', reason: result.step });
         else if (!result.ok) results.push({ action: 'error', step: 'owed', reason: result.reason });
       }
     } catch (error) { results.push({ action: 'error', step: 'owed', reason: error.message }); }

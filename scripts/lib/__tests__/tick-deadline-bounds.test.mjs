@@ -7,6 +7,7 @@ import { STEP_MIN_MS, boundExec, isBudgetError, makeDeadline, DRAIN_HARD_DEADLIN
 import { fileIntoBatch } from '../../operations/card-batch-file.mjs';
 import { gitIn } from '../../operations/card-batch-io.mjs';
 import { drainPendingPrevention, landPreventionCard } from '../../operations/land-prevention-card.mjs';
+import { readDrainCursor } from '../prevention-drain-cursor.mjs';
 import { reconcileOwedPrevention } from '../prevention-filing-owed.mjs';
 import { reconcileCardBatches } from '../../operations/card-batch-reconcile.mjs';
 import { loadCardBatchPolicy } from '../card-batch-policy.mjs';
@@ -37,6 +38,65 @@ describe('boundExec', () => {
     let seen; const git = gitIn('/x', boundExec((cmd, args, options) => { seen = options.timeout; return ''; }, makeDeadline(30_000, () => 0)));
     git(['rev-parse', 'HEAD']);
     expect(seen).toBe(30_000);
+  });
+});
+
+describe('round-2 bounds', () => {
+  it('boundExec kills with SIGKILL so a child that ignores SIGTERM cannot hold the tick', () => {
+    let seen; boundExec((cmd, args, options) => { seen = options; return ''; }, makeDeadline(10_000, () => 0))('git', ['x']);
+    expect(seen.killSignal).toBe('SIGKILL');
+  });
+  it('an expired budget starts NO git at all in fileIntoBatch (the fetch / rev-parse included)', async () => {
+    const settings = resolveCardBatchSettings({ standard: loadCardBatchPolicy().filing, env: {} });
+    const preventionSettings = resolvePreventionBatchSettings({ standard: loadCardBatchPolicy().prevention, repo: { filingEnabled: true }, env: {} });
+    const admit = vi.fn();
+    // no baseSha and a lane that does not exist: any git call would throw/log instead of returning the budget refusal
+    const result = await fileIntoBatch({ laneDir: '/no/such/lane', cardPath: 'backlog/x1abcde-card.md', kind: 'prevention', actor: 'mechanical', source: { repo: 'org/repo' } },
+      { settings, preventionSettings, log: () => {}, launch: () => {}, stateDir: '/state', admit, deadline: makeDeadline(500, () => 0) });
+    expect(result).toEqual({ batched: false, retryable: true, reason: 'tick budget exhausted before admission' });
+    expect(admit).not.toHaveBeenCalled();
+  });
+  it('the retry gap itself must fit: with many configured retries no sleep runs past the deadline', async () => {
+    const settings = resolveCardBatchSettings({ standard: loadCardBatchPolicy().filing, env: {} });
+    const preventionSettings = resolvePreventionBatchSettings({ standard: loadCardBatchPolicy().prevention, repo: { filingEnabled: true }, env: {} });
+    let t = 0; const deadline = makeDeadline(60_000, () => t);
+    const admit = vi.fn(async () => { t += 3_000; return { action: 'refuse', reason: 'lease-held' }; });
+    const gaps = [];
+    await fileIntoBatch({ laneDir: '/lane', cardPath: 'backlog/x1abcde-card.md', kind: 'prevention', actor: 'mechanical', source: { repo: 'org/repo' } },
+      { settings, preventionSettings, baseSha: 'a'.repeat(40), log: () => {}, launch: () => {}, stateDir: '/state', admit, deadline, retries: 200,
+        pause: async ms => { gaps.push(ms); t += ms; } });
+    expect(t).toBeLessThanOrEqual(60_000);
+    expect(gaps.every(ms => ms > 0)).toBe(true);
+  });
+  it('a card-specific deferral (own-PR / out of time) advances the owed cursor and the NEXT owed filing is still reached; only a pool-wide one ends the round', async () => {
+    const root = tmp(); const dir = join(root, 'owed-prevention'); mkdirSync(dir);
+    const keys = ['7', '8'].map(char => { const key = char.repeat(64); writeFileSync(join(dir, `${key}.json`), JSON.stringify({ key, status: 'owed', input: { owedKey: key, title: char } })); return key; });
+    const filed = []; const cursorPath = join(root, 'cursor.state');
+    await reconcileOwedPrevention({ stateDir: root, cursorPath, file: async input => { filed.push(input.title); return { ok: true, skipped: true, deferred: true, step: input.title === '7' ? 'tick-deferred' : 'tick-deferred' }; } });
+    expect(filed).toEqual(['7', '8']);
+    expect(readDrainCursor(cursorPath).owed).toBe(`${keys[1]}.json`);
+    const poolWide = []; resetDrainCursorMemory();
+    await reconcileOwedPrevention({ stateDir: root, file: async input => { poolWide.push(input.title); return { ok: true, skipped: true, deferred: true, step: 'acquire-deferred' }; } });
+    expect(poolWide).toEqual(['7']);
+  });
+  it('the probe reports a card-specific owed deferral as a visible non-error result', async () => {
+    const root = tmp(); writeFileSync(join(root, 'org-repo-prevention.json'), JSON.stringify({ seq: 9 }));
+    const owedDir = join(root, 'owed-prevention'); mkdirSync(owedDir);
+    const key = '9'.repeat(64); writeFileSync(join(owedDir, `${key}.json`), JSON.stringify({ key, status: 'owed', input: { owedKey: key, title: 'x' } }));
+    const results = await reconcileCardBatches({ stateDir: root, seal: async () => [], log: () => {}, drain: vi.fn(async () => ({ ok: true })),
+      fileOwed: vi.fn(async () => ({ ok: true, skipped: true, deferred: true, step: 'tick-deferred' })), loadFilingSettings: () => ({ filingEnabled: true, drainCardsPerTick: 2 }) });
+    expect(results).toContainEqual({ action: 'deferred', step: 'owed', reason: 'tick-deferred' });
+    expect(results.some(result => result.action === 'error')).toBe(false);
+  });
+  it('the hard deadline counts from the health-watch tick\'s own sample when it is recent, else from now', async () => {
+    const root = tmp(); mkdirSync(join(root, 'pending-prevention')); writeFileSync(join(root, 'pending-prevention/a.json'), '{}');
+    writeFileSync(join(root, 'org-repo-prevention.json'), JSON.stringify({ seq: 9 }));
+    const drain = vi.fn(async () => ({ ok: true }));
+    const common = { stateDir: root, seal: async () => [], log: () => {}, drain, loadFilingSettings: () => ({ filingEnabled: true, drainCardsPerTick: 1 }) };
+    await reconcileCardBatches({ ...common, clock: () => 100_000, now: 90_000 });
+    expect(drain.mock.calls[0][1].drainLimit.hardDeadlineAt).toBe(90_000 + DRAIN_HARD_DEADLINE_MS);
+    await reconcileCardBatches({ ...common, clock: () => 500_000, now: 90_000 }); // a stale sample is not trusted
+    expect(drain.mock.calls[1][1].drainLimit.hardDeadlineAt).toBe(500_000 + DRAIN_HARD_DEADLINE_MS);
   });
 });
 

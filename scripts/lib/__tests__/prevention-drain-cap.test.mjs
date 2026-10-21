@@ -269,7 +269,7 @@ describe('fairness without a writable cursor, and the shared allowance', () => {
   it('a filing deferred for want of a lane keeps its place and ends the owed round', async () => {
     const f = fixture([]); const keys = owedKeys(f); const filed = [];
     await reconcileOwedPrevention({ stateDir: f.stateDir, cursorPath: f.cursorPath,
-      file: async input => { filed.push(input.title); return { ok: true, skipped: true, deferred: true }; } });
+      file: async input => { filed.push(input.title); return { ok: true, skipped: true, deferred: true, step: 'acquire-deferred' }; } });
     expect(filed).toEqual(['1']);
     expect(readDrainCursor(f.cursorPath).owed).toBeUndefined();
     expect(keys).toHaveLength(2);

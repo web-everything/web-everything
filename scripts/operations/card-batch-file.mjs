@@ -93,6 +93,8 @@ export async function fileIntoBatch({
   if (!decision.batch) return { batched: false, reason: decision.reason, ...(kind === 'prevention' ? { disabled: true } : {}) };
   const cardId = cardIdOf(cardPath);
   if (!cardId) return { batched: false, reason: `not a top-level backlog card: ${cardPath}`, ...(kind === 'prevention' ? { disabled: true } : {}) };
+  // Checked before ANY git call (fetch / rev-parse included): an expired budget starts nothing.
+  if (deadline && deadline.left() < STEP_MIN_MS.admit) return { batched: false, retryable: true, reason: 'tick budget exhausted before admission' };
   try {
     const repo = source.repo ?? CONSTELLATION_REPOS.we.slug;
     const base = baseSha ?? (() => {
@@ -111,7 +113,8 @@ export async function fileIntoBatch({
     let result = await admit(input, admitOptions);
     for (let attempt = 1; attempt <= retries && result.action === 'refuse' && RETRYABLE.has(result.reason); attempt += 1) {
       // The lease wait is min(configured, time left): no further attempt once another one cannot fit.
-      if (deadline && deadline.left() < STEP_MIN_MS.admit + 1_000) break;
+      // The gap itself must fit too, so no sleep can run past the deadline however many retries are configured.
+      if (deadline && deadline.left() < STEP_MIN_MS.admit + 2_000 * attempt + 1_000) break;
       await pause(2_000 * attempt);
       if (deadline && deadline.left() < STEP_MIN_MS.admit) break;
       result = await admit(input, admitOptions);

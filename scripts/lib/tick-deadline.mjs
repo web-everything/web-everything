@@ -29,5 +29,6 @@ export function needTime(deadline, minMs, what) {
 export const boundExec = (exec, deadline) => !deadline ? exec : (cmd, args, options = {}) => {
   const left = deadline.left();
   if (left < STEP_MIN_MS.exec) throw budgetError(`${cmd} ${args?.[0] ?? ''}`.trim());
-  return exec(cmd, args, { ...options, timeout: Math.min(options.timeout ?? Infinity, left) });
+  // SIGKILL: a child that ignores SIGTERM must not keep the call (and the tick) waiting past the cap.
+  return exec(cmd, args, { ...options, timeout: Math.min(options.timeout ?? Infinity, left), killSignal: 'SIGKILL' });
 };

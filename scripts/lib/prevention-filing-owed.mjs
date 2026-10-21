@@ -81,8 +81,9 @@ export async function reconcileOwedPrevention({ stateDir = cardBatchStateDir(), 
       if (`${preventionFilingKey(record.input)}.json` !== name) throw Error('owed filing identity mismatch');
       results.push(await fileOwedPrevention(record.input, file, { stateDir }));
     } catch (e) { results.push({ ok: false, step: 'owed', reason: e.message }); }
-    // A filing deferred for want of a lane was never attempted: it keeps its place, and the rest wait for the next tick.
-    if (results.at(-1)?.deferred) break;
+    // No lane in time is POOL-wide: the filing keeps its place and the rest would only wait for the same pool. Any other deferral
+    // (the filing needs its own PR, or ran out of tick time) is about THAT filing: the cursor moves past it so it cannot starve the rest.
+    if (results.at(-1)?.deferred && results.at(-1).step === 'acquire-deferred') break;
     if (cursorPath) writeDrainCursor(cursorPath, { owed: name });
   }
   return results;
