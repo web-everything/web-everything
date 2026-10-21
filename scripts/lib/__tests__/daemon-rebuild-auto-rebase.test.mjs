@@ -325,4 +325,23 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     const unresolved = await planRebuild({ ...base, overlays: [{ ref: 'lane/vanished', pr: 4343 }, ...base.overlays] });
     expect(unresolved.decisions.find((d) => d.ref === 'lane/container')).toMatchObject({ action: 'drop', reason: 'conflict' });
   });
+
+  it('a registered stack whose base sits inside X blocks it even after its branch advanced past X (Codex round 6)', async () => {
+    const f = fixture({ mode: 'on' });
+    const h = f.push('lane/foreign', f.init, { 'foreign.txt': 'foreign behaviour\n' });
+    const x1 = f.push('lane/standing-ruling', h, { [GATE]: lines({ 2: 'grant v1' }) });
+    f.push('lane/foreign', x1, { 'foreign2.txt': 'more\n' }); // the foreign branch advances, now built ON x1
+    f.push('lane/container', x1, { [GATE]: lines({ 2: 'grant v1', 10: 'own' }) });
+    const x2 = f.push('lane/standing-ruling', f.init, { [GATE]: lines({ 2: 'grant v2' }) });
+    f.mergePr(PR, x2, 'lane/standing-ruling');
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const plan = await planRebuild({
+      git: f.runGit, headSha: f.init, mainRef: 'origin/main', stackMode: 'independent',
+      overlays: [{ ref: 'lane/foreign', pr: 5790 }, { ref: 'lane/container', pr: 5801 }],
+      prState: async (pr) => (pr === PR ? 'MERGED' : 'OPEN'), prForcePushes: async (pr) => (pr === PR ? [{ before: x1 }] : []),
+      autoRebase: { mode: 'on', source: 'test' },
+    });
+    expect(plan.alerts.find((a) => a.kind === 'overlay-auto-rebased')?.detail.ref).not.toBe('lane/container');
+    expect(plan.decisions.find((d) => d.ref === 'lane/container')).toMatchObject({ action: 'drop', reason: 'conflict' });
+  });
 });

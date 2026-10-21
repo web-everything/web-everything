@@ -615,7 +615,7 @@ export async function planRebuild({
         // proof (or no clean result) `on` sets it aside below instead of letting x9diisp freeze the whole clone.
         if (autoRebase.mode !== 'off' && git(['merge-tree', '--write-tree', '--no-messages', mainSha, ovSha]).status === 1) {
           const { candidates, mergedPrs } = await mergedPrOldHeads({
-            git, mainSha, ovSha, conflictFiles: files, stateOf, prForcePushes, adoptedHeads,
+            git, mainSha, ovSha, ovPr: pr, conflictFiles: files, stateOf, prForcePushes, adoptedHeads,
             otherHeads: [
               ...adoptedHeads.filter((h) => !h.proven),
               // an unresolvable registered tip is kept as `unresolved` (blocks, fail closed) — never silently ignored
