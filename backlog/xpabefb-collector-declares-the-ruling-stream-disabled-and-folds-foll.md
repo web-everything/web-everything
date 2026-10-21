@@ -4,7 +4,7 @@ size: 3
 parent: "x87psvt"
 status: open
 blockedBy: ["x5nmdnt"]
-scope: ["we:scripts/lib/card-batch-policy.mjs", "we:scripts/lib/card-batch-policy.json", "we:scripts/operations/card-batch-file.mjs", "we:scripts/lib/__tests__/card-batch-policy.test.mjs", "we:scripts/operations/__tests__/card-batch-file.test.mjs"]
+scope: ["we:scripts/lib/card-batch-policy.mjs", "we:scripts/lib/card-batch-policy.json", "we:scripts/operations/card-batch-file.mjs", "we:scripts/lib/card-batch-settings.mjs", "we:scripts/lib/__tests__/card-batch-policy.test.mjs", "we:scripts/lib/__tests__/card-batch-settings.test.mjs", "we:scripts/operations/__tests__/card-batch-file.test.mjs"]
 dateOpened: "2026-10-18"
 tags: []
 ---
@@ -15,10 +15,10 @@ Per decision x5ioz96 forks 1 to 3: add ruling to CARD_BATCH_KINDS with policy en
 
 ## Acceptance
 
-- [A1] **Executable** — `node --test we:scripts/lib/__tests__/card-batch-policy.test.mjs we:scripts/operations/__tests__/card-batch-file.test.mjs` fails before this item lands and passes after. Planned cases, each asserting the shipped defaults with no override:
+- [A1] **Executable** — `node --test we:scripts/lib/__tests__/card-batch-policy.test.mjs we:scripts/lib/__tests__/card-batch-settings.test.mjs we:scripts/operations/__tests__/card-batch-file.test.mjs` fails before this item lands and passes after. Planned cases, each asserting the shipped defaults with no override:
   - `ruling is declared with disabled 8/60 defaults` (we:scripts/lib/__tests__/card-batch-policy.test.mjs) — and prevention stays 10/120, filing 10/60.
   - `count wins simultaneous count and age thresholds` (we:scripts/lib/__tests__/card-batch-policy.test.mjs).
-  - `every stream value is a cascade setting with its source logged` (we:scripts/lib/__tests__/card-batch-policy.test.mjs) — a repo override of ruling's maxCards wins and the log names its source.
+  - `every stream value is a cascade setting with its source logged` (we:scripts/lib/__tests__/card-batch-settings.test.mjs) — a repo override of ruling's maxCards wins and the log names its source. Today the cascade (`effectiveCardBatchPolicy` in we:scripts/lib/card-batch-settings.mjs) maps only filing and prevention, so this card extends it to ruling.
   - `disabled ruling refuses kind-disabled, not unknown kind` (we:scripts/operations/__tests__/card-batch-file.test.mjs).
   - `follow-up and expedite origins route to filing` (we:scripts/operations/__tests__/card-batch-file.test.mjs).
   - `high and urgent bypass with shipped defaults` (we:scripts/operations/__tests__/card-batch-file.test.mjs).

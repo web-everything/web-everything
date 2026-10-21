@@ -21,7 +21,7 @@ PR 5608's round-4 review owed more guards of the same kind (a card promises a gu
 4. **No TODO lines.** A TODO left in Acceptance or in any edge-case line is refused.
 5. **Scope to tests.** Every non-test file in scope has a planned case in a test file for that module, or an `n/a:` line.
 6. **Default flips.** A card that flips a shipped default lists each sibling card's planned case that asserts that default, and says how it replaces it.
-7. **Statute rules.** A codified decision entry's numbered rules each cite a planned or existing case, or are marked unpinned.
+7. **Statute rules.** A codified decision entry added or changed in the diff has each numbered rule cite a planned or existing case by name, or be marked unpinned. Entries the diff does not touch are listed as warnings, never refused.
 
 ## Acceptance
 
@@ -34,7 +34,8 @@ PR 5608's round-4 review owed more guards of the same kind (a card promises a gu
   - `open card with a TODO acceptance or edge-case line is refused` (we:scripts/backlog/__tests__/edge-case-classes.test.mjs).
   - `scope file with no planned case or n/a is refused` (we:scripts/backlog/__tests__/edge-case-classes.test.mjs).
   - `default flip without the replaced sibling cases is refused` (we:scripts/backlog/__tests__/edge-case-classes.test.mjs).
-  - `statute rule with no cited case and no unpinned mark is refused` (we:scripts/backlog/__tests__/edge-case-classes.test.mjs).
+  - `statute rule with no cited case and no unpinned mark is refused` (we:scripts/backlog/__tests__/edge-case-classes.test.mjs) — for an entry the diff adds or changes.
+  - `untouched statute entry without cited cases only warns` (we:scripts/backlog/__tests__/edge-case-classes.test.mjs).
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -42,7 +43,7 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] The lint reads card text only. It does not check that a named case exists in a test file; the slice's own verify does that.
+- [N1] The lint reads card text and, for rule 7 only, the decision entries the diff touches. It does not check that a named case exists in a test file; the slice's own verify does that.
 
 ## Edge cases this change must handle
 
@@ -53,5 +54,5 @@ One line per class: either the handling, or `n/a: <why>`.
 3. **Shared state files** — n/a: the lint is read-only.
 4. **Fail closed** — a card the lint cannot classify is refused, not passed.
 5. **Identity scoping** — rules apply per card; rule 7 applies per decision entry anchor.
-6. **State over time** — the rules refuse only open cards with a Planned cases block; older and resolved cards are listed as warnings, not refused.
+6. **State over time** — the rules refuse only open cards with a Planned cases block, and only decision entries the diff adds or changes; older and resolved cards and untouched entries are listed as warnings, not refused.
 7. **Who wrote it** — n/a: the rules apply equally to any author.

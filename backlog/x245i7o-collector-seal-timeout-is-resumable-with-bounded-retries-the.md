@@ -4,7 +4,7 @@ size: 3
 parent: "x87psvt"
 status: open
 blockedBy: ["x5nmdnt", "x1mmp60"]
-scope: ["we:scripts/operations/card-batch-seal-io.mjs", "we:scripts/operations/card-batch-seal.mjs", "we:scripts/operations/__tests__/card-batch-seal-io.test.mjs"]
+scope: ["we:scripts/operations/card-batch-seal-io.mjs", "we:scripts/operations/card-batch-seal.mjs", "we:scripts/operations/__tests__/card-batch-seal-io.test.mjs", "we:scripts/operations/__tests__/card-batch-seal.test.mjs"]
 dateOpened: "2026-10-18"
 tags: []
 ---
@@ -15,8 +15,9 @@ Per decision x5ioz96 fork 6 skeptic amendment: the root cause of the stuck batch
 
 ## Acceptance
 
-- [A1] **Executable** — `node --test we:scripts/operations/__tests__/card-batch-seal-io.test.mjs` fails before this item lands and passes after. Planned cases:
+- [A1] **Executable** — `node --test we:scripts/operations/__tests__/card-batch-seal-io.test.mjs we:scripts/operations/__tests__/card-batch-seal.test.mjs` fails before this item lands and passes after. Planned cases:
   - `timeout at step ready resumes from the last completed step on the next tick` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs).
+  - `seal plan starts at the step after the last completed one` (we:scripts/operations/__tests__/card-batch-seal.test.mjs) — the pure step plan in we:scripts/operations/card-batch-seal.mjs, given a recorded last completed step, returns the remaining steps only, and an unknown recorded step yields a held reason, not a restart.
   - `retry count is bounded by the setting, with its source logged` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs).
   - `retry exhaustion holds with a named reason` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — the state keeps sealedAt and the held reason names the timed-out step.
   - `timeout during number-members then resume leaves each member numbered exactly once` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — a timeout injected partway through x1mmp60's numbering step, then a resume, leaves every member with exactly one number, no half-renumbered head, and no extra numbers allocated. This is a cross-slice case, so x245i7o lands after x1mmp60.

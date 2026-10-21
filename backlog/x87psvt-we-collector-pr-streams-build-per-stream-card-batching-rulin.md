@@ -13,7 +13,7 @@ Build the ruling of decision x5ioz96 (we:docs/agent/platform-decisions.md#collec
 
 ## Acceptance
 
-- [A1] **Executable** — every planned case named in the [A1] of x5nmdnt, x1mmp60, x245i7o, xf1z2w3, xpabefb and x7nf3f5 exists and passes. Passing the suites alone is not enough: each named case must assert its behaviour. Cases where slices interact are owned by the later slice and listed here so they are tested together: `timeout during number-members then resume leaves each member numbered exactly once` (x245i7o over x1mmp60), `aged-hold archive is never relaunched by the seal scan and keeps its hold label` (xf1z2w3 over x5nmdnt's scan), and the two xpabefb default cases that x7nf3f5 replaces.
+- [A1] **Executable** — every planned case named in the [A1] of x5nmdnt, x1mmp60, x245i7o, xf1z2w3, xpabefb and x7nf3f5 exists and passes. Passing the suites alone is not enough: each named case must assert its behaviour. Cases where slices interact are owned by the later slice and listed here so they are tested together: `timeout during number-members then resume leaves each member numbered exactly once` (x245i7o over x1mmp60), `aged-hold archive is never relaunched by the seal scan and keeps its hold label` (xf1z2w3 over x5nmdnt's scan), and the two xpabefb default cases that x7nf3f5 replaces. Once x7nf3f5 lands, its replacements (`ruling ships enabled with 8/60 defaults`, and `disabled ruling refuses kind-disabled, not unknown kind` with an explicit override) satisfy those two xpabefb cases.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

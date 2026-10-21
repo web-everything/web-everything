@@ -6447,11 +6447,13 @@ as implementation destinations.
 6. **Ownership.** The coordinator owns the collector branch (lease plus state file). A sealed state whose PR is
    merged or closed on GitHub is retired on the next admission; an unreadable PR state keeps it sealed and held.
 
-**Defended by (planned cases, named in each slice's [A1]):** rules 1 to 3 by xpabefb (code is refused
-collection; the ruling stream is declared with 8 / 60 defaults and refuses while disabled; count wins a tie; every
-value is a cascade setting with its source logged; high and urgent bypass); rule 4 by xf1z2w3 (`extracted member
-cannot re-enter a collector`); rule 5 by x1mmp60; rule 6 by x5nmdnt, one case per PR state (open stays sealed,
-merged, closed by a split, closed otherwise with its members archived and surfaced, unreadable), plus a
-fault-injection case for archive-before-retire.
+**Defended by (planned cases, named in each slice's [A1]):** rules 1 to 3 by xpabefb (`code changes refuse
+collection`, `count wins simultaneous count and age thresholds`, `every stream value is a cascade setting with its
+source logged`, `high and urgent bypass with shipped defaults`, `follow-up and expedite origins route to filing`)
+and x7nf3f5 (`ruling ships enabled with 8/60 defaults`, `disabled ruling refuses kind-disabled, not unknown kind`);
+rule 4 by xf1z2w3 (`extracted member cannot re-enter a collector`); rule 5 by x1mmp60 (`numbering failure retains
+the hold and never reaches ready`); rule 6 by x5nmdnt, one case per PR state (open stays sealed, merged, closed by
+a split, closed otherwise with its members archived and surfaced, unreadable), plus the fault-injection case
+`archive failure preserves the active slot and retry preserves every member`.
 
 **Lineage:** `#x5ioz96` (ruled 2026-10-18). Epic x87psvt.

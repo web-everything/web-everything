@@ -19,6 +19,7 @@ Per decision x5ioz96 fork 5 (statute backlog-ids-numbered-before-publish): add a
   - `seal steps run record-sealed, number-members, verify, remove-hold, ready, label-on-green` (we:scripts/operations/__tests__/card-batch-seal.test.mjs).
   - `numbers all siblings in one pass so cross-references resolve` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — two members that name each other both carry the new numbers.
   - `numbering failure retains the hold and never reaches ready` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs).
+  - `crash after the numbering push and before the head is recorded resumes without head-mismatch` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — fault injection: the numbering commit is on the remote but `headSha` is still the pre-numbering head; the next run adopts the numbered head (or re-records it) and continues to verify, never refusing `head-mismatch` and never numbering twice.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -34,7 +35,7 @@ One line per class: either the handling, or `n/a: <why>`.
 
 1. **Untrusted text** — card bodies are rewritten only by the declared numbering operation; the seal step does no text substitution of its own.
 2. **Truncated reads** — numbering output that does not cover every member counts as a failure; the batch stays held.
-3. **Shared state files** — the step runs under the seal lease on the collector branch; the rewritten head is recorded before verify runs on it.
+3. **Shared state files** — the step runs under the seal lease on the collector branch; the rewritten head is recorded before verify runs on it (case `crash after the numbering push and before the head is recorded resumes without head-mismatch`).
 4. **Fail closed** — any numbering failure keeps the batch held and never reaches ready (case `numbering failure retains the hold and never reaches ready`).
 5. **Identity scoping** — numbers are allocated per repo through the declared operation.
 6. **State over time** — a re-run after a timeout must not renumber (x245i7o's case `timeout during number-members then resume leaves each member numbered exactly once`).

@@ -20,6 +20,7 @@ The aged-hold archive carries a `heldForFinding` marker. The seal scan (`sealDue
 - [A1] **Executable** — `node --test we:scripts/operations/__tests__/card-batch-extract.test.mjs we:scripts/operations/__tests__/card-batch.test.mjs we:scripts/operations/__tests__/card-batch-io.test.mjs we:scripts/operations/__tests__/card-batch-seal-io.test.mjs` fails before this item lands and passes after. Planned cases:
   - `expired unextractable hold escalates with the age setting's source logged` (we:scripts/operations/__tests__/card-batch-extract.test.mjs) — a hold older than the setting escalates as needs-you, and the log names the setting's value and source.
   - `hold younger than the age setting keeps blocking admission` (we:scripts/operations/__tests__/card-batch.test.mjs) — admission still refuses `batch-sealed`.
+  - `unreadable hold timestamp keeps blocking admission` (we:scripts/operations/__tests__/card-batch.test.mjs) — a missing or unparseable hold time counts as not aged: admission refuses `batch-sealed` and nothing escalates.
   - `aged unextractable hold admits into a fresh batch` (we:scripts/operations/__tests__/card-batch.test.mjs) — admission returns `admit` with a new batchRef, end to end through the planner.
   - `aged hold keeps its members on the held PR` (we:scripts/operations/__tests__/card-batch-extract.test.mjs) — the held batch's members and hold label are unchanged, and the escalation names the PR.
   - `aged hold archives to sealed/ and frees the active slot` (we:scripts/operations/__tests__/card-batch-io.test.mjs) — through the IO layer, not the planner: the held state is written to `sealed/` with `heldForFinding` and every member, the active slot is retired, and the next real admission creates a fresh batch branch.
@@ -39,7 +40,7 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 One line per class: either the handling, or `n/a: <why>`.
 
 1. **Untrusted text** — n/a: the finding text is not parsed here; the extract module has already decided it is unextractable.
-2. **Truncated reads** — an unreadable hold timestamp counts as not aged, so the hold keeps blocking; it never counts as expired.
+2. **Truncated reads** — an unreadable hold timestamp counts as not aged, so the hold keeps blocking; it never counts as expired (case `unreadable hold timestamp keeps blocking admission`).
 3. **Shared state files** — the archive and slot retirement run under the per-kind lease, archive first, through the same write path as x5nmdnt (its fault-injection case `archive failure preserves the active slot and retry preserves every member` pins the order).
 4. **Fail closed** — if the archive write fails, the slot stays held and admission keeps refusing `batch-sealed`; the seal scan never relaunches an aged-hold archive (case `aged-hold archive is never relaunched by the seal scan and keeps its hold label`).
 5. **Identity scoping** — the hold's age is per batch (repo, kind, PR).
