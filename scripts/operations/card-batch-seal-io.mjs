@@ -347,6 +347,14 @@ function rearmVerify(path, now, seen) {
   } finally { if (tokenOf(lockPath) === lease.token) rmSync(lockPath, { force: true }); }
 }
 
+/**
+ * The seal worker WRITES to the PR (body, hold label, ready/undo), so it must play the worker App role. A read-only
+ * caller (health-watch is the `observer` role, and its auth setup exports WE_GITHUB_APP_ROLE=observer) would otherwise
+ * hand its role to the detached child through the inherited env, and every write fails "Resource not accessible by
+ * integration" forever (live 2026-10-21: #5790 stuck draft-withdrawn, #5794 stuck at record-sealed).
+ */
+export const sealJobEnv = (env = process.env) => ({ ...env, WE_GITHUB_APP_ROLE: 'worker' });
+
 /** Tick only scans and launches; the detached worker owns verification and the admission lease. */
 export async function sealDueBatches({ now = Date.now(), stateDir = CARD_BATCH_STATE_DIR,
   policy = effectiveCardBatchPolicy(), spawn = spawnChild, open = openSync, readHeavyQueue = defaultHeavyQueue } = {}) {
@@ -385,7 +393,7 @@ export async function sealDueBatches({ now = Date.now(), stateDir = CARD_BATCH_S
       let child;
       try {
         child = spawn(process.execPath, [join(ROOT, 'scripts/operations/card-batch-seal-job.mjs'), `--state=${path}`],
-          { cwd: ROOT, detached: true, stdio: ['ignore', log, log] });
+          { cwd: ROOT, detached: true, stdio: ['ignore', log, log], env: sealJobEnv() });
       } finally { if (typeof log === 'number') { try { closeSync(log); } catch { /* the child holds its own copy */ } } }
       // Wait only for OS launch, never child completion/verification. Launch failures reach probeErrors.
       await new Promise((resolve, reject) => {
