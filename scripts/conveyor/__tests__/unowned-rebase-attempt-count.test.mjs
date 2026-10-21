@@ -73,7 +73,9 @@ describe('content-conflict attempt policy', () => {
     });
     expect(result.action).toBe('skip');
     expect(result.reason).toBe(expected ? 'real conflict beyond .lane-manifest.json' : failure);
-    expect(shouldCountRebaseAttempt(result)).toBe(expected);
+    // 1020c unfreeze, Codex weakening audit round 2: every unsuccessful skip spends the cap, precondition skips
+    // included (main's rule) — an excluded skip could retry forever.
+    expect(shouldCountRebaseAttempt(result)).toBe(true);
   });
 
   it.each([
