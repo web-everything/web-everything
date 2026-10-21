@@ -999,4 +999,12 @@ describe('review.extraSeats.pausedLenses — a paused lens gets no seat, no rese
     expect(real.resolveExtraSeatsPausedLenses({ env: {}, file: '/nonexistent' })).toEqual({ value: [], source: 'standard' });
     expect(real.resolveExtraSeatsPausedLenses({ env: { WE_REVIEW_EXTRA_SEATS_PAUSED_LENSES: 'a, b' } }).value).toEqual(['a', 'b']);
   });
+
+  it('a malformed layer (object instead of array) is ignored, never throws', async () => {
+    const real = await vi.importActual('../../lib/review-seat-settings.mjs');
+    const bad = JSON.stringify({ extraSeats: { pausedLenses: { nested: [] } } });
+    expect(real.resolveExtraSeatsPausedLenses({ env: {}, readFile: () => bad })).toEqual({ value: [], source: 'standard' });
+    expect(real.resolveExtraSeatsPausedLenses({ env: {}, file: '/nonexistent', platform: { pausedLenses: { nested: [] } } })).toEqual({ value: [], source: 'standard' });
+    expect(real.resolveExtraSeatsPausedLenses({ env: { WE_REVIEW_EXTRA_SEATS_PAUSED_LENSES: '{"a":1}' }, file: '/nonexistent' }).value).toEqual([]);
+  });
 });

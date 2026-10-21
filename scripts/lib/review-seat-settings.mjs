@@ -196,17 +196,26 @@ export const EXTRA_SEATS_PAUSED_LENSES_ENV = 'WE_REVIEW_EXTRA_SEATS_PAUSED_LENSE
 export function resolveExtraSeatsPausedLenses({ env = process.env, file = REVIEW_SETTINGS_FILE,
   readFile = (p) => readFileSync(p, 'utf8'), platform, log } = {}) {
   const valid = (v) => Array.isArray(v) && v.every((x) => typeof x === 'string' && x.trim());
-  let tool;
-  try { tool = JSON.parse(readFile(file))?.extraSeats; } catch { /* standard/platform still apply */ }
-  let envValue;
-  const raw = env?.[EXTRA_SEATS_PAUSED_LENSES_ENV];
-  if (raw !== undefined && raw !== '') {
-    try { envValue = JSON.parse(raw); } catch { envValue = String(raw).split(',').map((x) => x.trim()).filter(Boolean); }
-  }
-  const r = cascadePolicy('review.extraSeats', tool, {
-    standard: { pausedLenses: [] }, platform, env, ...(log ? { log } : {}),
-    envValues: { pausedLenses: envValue }, valid: { pausedLenses: valid },
-  });
-  const layer = r.sources?.pausedLenses ?? 'standard';
-  return { value: [...new Set((r.value?.pausedLenses ?? []).map((x) => x.trim()))], source: layer === 'tool' ? 'setting' : layer };
+  // Project the WHOLE array per layer before the cascade flattens objects into leaves: a malformed layer
+  // (an object, a non-string member) is dropped, never half-applied, and can never throw.
+  const project = (block) => (valid(block?.pausedLenses) ? { pausedLenses: block.pausedLenses } : undefined);
+  try {
+    let tool;
+    try { tool = project(JSON.parse(readFile(file))?.extraSeats); } catch { /* standard/platform still apply */ }
+    let plat = platform;
+    if (plat === undefined) { try { plat = platformPreference('review.extraSeats', { env }); } catch { plat = undefined; } }
+    let envValue;
+    const raw = env?.[EXTRA_SEATS_PAUSED_LENSES_ENV];
+    if (raw !== undefined && raw !== '') {
+      try { envValue = JSON.parse(raw); } catch { envValue = String(raw).split(',').map((x) => x.trim()).filter(Boolean); }
+    }
+    const r = cascadePolicy('review.extraSeats', tool, {
+      standard: { pausedLenses: [] }, platform: project(plat) ?? {}, env, ...(log ? { log } : {}),
+      envValues: { pausedLenses: envValue }, valid: { pausedLenses: valid },
+    });
+    const list = r.value?.pausedLenses;
+    if (!valid(list)) return { value: [], source: 'standard' };
+    const layer = r.sources?.pausedLenses ?? 'standard';
+    return { value: [...new Set(list.map((x) => x.trim()))], source: layer === 'tool' ? 'setting' : layer };
+  } catch { return { value: [], source: 'standard' }; }
 }
