@@ -2434,6 +2434,24 @@ describe('decideParkMode (#3627 gap 4 — the real scoreEscalation rubric)', () 
     expect(result).toEqual({ mode: 'park', label: 'review:human', reason: 'lane net diff unreadable; the statute/policy-core check cannot clear' });
   });
 
+  // Turning the self-review safeguard on must never lower the park label the escalation score asks for.
+  it.each([
+    ['a statute path', 'docs/agent/platform-decisions.md', 'review:human'],
+    ['a gate-self leash path', '.github/workflows/ci.yml', 'review:human'],
+    ['a blast-radius path', 'scripts/lane-pool.mjs', 'review:pending'],
+    ['a clean diff', 'reports/2026-09-09-note.md', 'review:pending'],
+  ])('with self-review on, %s parks at least as strictly as without it', (_name, file, expected) => {
+    const runFn = (_bin, args) => (args.includes('merge-base') ? 'base\n' : `3\t1\t${file}\0`);
+    const park = selfReview => decideParkMode({
+      report: { outcome: 'done' }, convergeVerdict: { verdict: 'land', dismissed: [], ...(selfReview ? { selfReview: { notes: [] } } : {}) },
+      filesTouched: [file], lanePath: '/lane',
+    }, { run: runFn });
+    const rank = { 'ready-to-merge': 0, 'review:pending': 1, 'review:human': 2 };
+    const on = park(true);
+    expect(on.label).toBe(expected);
+    expect(rank[on.label]).toBeGreaterThanOrEqual(rank[park(false).label]);
+  });
+
   it('still parks review:human on the agent\'s own needs-human-judgment outcome', () => {
     const result = decideParkMode({
       report: { outcome: 'needs-human-judgment', reason: 'a genuine taste call' }, convergeVerdict: noVerdict,
@@ -3661,6 +3679,21 @@ describe('deliverItem (#3627 bug 13 — the success-path result string names the
     expect(provider.spawn).toHaveBeenCalledTimes(2);
     expect(result.result).toBe('PR #4321 (review:human)');
     expect(readFileSync(join(lane, '.pr-body.md'), 'utf8')).toContain('- docs/agent/platform-decisions.md');
+  });
+
+  // Same class: the self-check never replaces a human label the escalation score asks for (a gate-self leash path).
+  it('parks review:human with self-review on when the net diff touches a gate-self leash path', async () => {
+    vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'true');
+    const priorExec = execFileSync.getMockImplementation();
+    execFileSync.mockImplementation((cmd, args = [], opts) => (cmd === 'git' && args.includes('--numstat')
+      ? '3\t1\t.github/workflows/ci.yml\0' : priorExec(cmd, args, opts)));
+    const provider = { spawn: vi.fn(), vendor: 'claude' };
+    tryReadDeliveryReport.mockReturnValue({ status: 'done', outcome: 'done', filesTouched: ['.github/workflows/ci.yml'], reason: 'did it' });
+    const result = await deliverItem(
+      { item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999', attemptTag: '', runId: 'dispatch-lane-fixture', effectKey: 'dispatch:0:0' },
+      provider, { newSessionId: () => 'uuid-fixed', reviewBuild: vi.fn().mockResolvedValue([]) },
+    );
+    expect(result.result).toBe('PR #4321 (review:human)');
   });
 
   // Same class: the repair turn's report must not clear turn 1's own needs-human-judgment park either.

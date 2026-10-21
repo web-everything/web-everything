@@ -401,6 +401,56 @@ describe('Codex completion wiring', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  // A failed repair turn or a red repair gate stops the Codex build; it never returns a report as if repaired.
+  it.each([
+    ['the builder emitted no thread id', { threadId: false }, 'self-review requires the original builder session'],
+    ['the resumed turn exits non-zero', { repairCode: 1 }, 'self-review builder failed'],
+    ['the resumed turn times out', { repairHangs: true }, 'self-review builder failed'],
+    ['the repair gate is red', { repairGateRed: true }, 'self-review repair gate is red'],
+  ])('a real codexDirectTask rejects when %s', async (_name, { threadId = true, repairCode = 0, repairHangs = false, repairGateRed = false }, message) => {
+    const { EventEmitter } = await import('node:events');
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { codexDirectTask } = await import('../../codex-direct-task.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'build-self-review-fail-'));
+    mkdirSync(join(dir, 'scripts'));
+    writeFileSync(join(dir, 'scripts', 'verify-lane.mjs'), '');
+    let gates = 0;
+    const execFn = vi.fn((bin, args) => {
+      if (args.includes('--absolute-git-dir')) return join(dir, '.git');
+      if (args.includes('rev-parse')) return 'builder-start';
+      if (args.includes('diff')) return 'net change';
+      if (bin === 'node' && args.includes('scripts/verify-lane.mjs') && ++gates > 1 && repairGateRed) throw new Error('red');
+      return '';
+    });
+    const spawns = [];
+    const spawnFn = (cli, argv) => {
+      spawns.push(argv);
+      const repair = spawns.length > 1;
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+      child.kill = () => queueMicrotask(() => child.emit('close', null));
+      child.stdin = { on() {}, end() {
+        if (repair && repairHangs) return;
+        queueMicrotask(() => {
+          writeFileSync(argv[argv.indexOf('-o') + 1], 'completion');
+          if (threadId) child.stdout.emit('data', Buffer.from(`${JSON.stringify({ type: 'thread.started', thread_id: 'builder' })}\n`));
+          child.emit('close', repair ? repairCode : 0);
+        });
+      } };
+      return child;
+    };
+    const review = vi.fn(async () => ['file:1 defect']);
+    try {
+      await expect(codexDirectTask({ dir, task: 'change', timeoutMs: repairHangs ? 50 : 0,
+        env: { ...process.env, WE_BUILD_SELF_REVIEW_ENABLED: 'true', WE_BUILD_FINAL_GATE: 'full' },
+        execFn, spawnFn, selfReviewFn: review, readQuotaFn: () => ({ quota: null, rolloutFile: null }), stream: false, log: () => {} }))
+        .rejects.toThrow(message);
+      expect(review).toHaveBeenCalledTimes(1);
+      expect(spawns).toHaveLength(threadId ? 2 : 1);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   // A fake `codex exec`: every turn writes its final message and one thread id, then exits 0.
   const fakeCodex = spawns => (cli, argv) => {
     spawns.push(argv);
