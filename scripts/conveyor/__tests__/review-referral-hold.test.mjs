@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord, tryReadRun, writeRun } from '../../operations/run-store.mjs';
@@ -160,6 +160,25 @@ describe('attempted mandatory referrals', () => {
     expect(third).toHaveBeenCalledTimes(1);
     expect(after.find(e => e.id === 'review-pr-parked').parked).toBe(false);
     expect(readdirSync(dir).filter(n => n.endsWith('.json')).sort()).toEqual(['review-pr-other.json', 'review-pr-parked.json']);
+  });
+  // xwu9oxh S6 — live 2026-10-20 the warm fix daemon re-parsed the ~45 MB projection on every reconcile pass.
+  it('a warm process parses a few new records directly and leaves the on-disk projection alone', () => {
+    const dir = temp(); writeRun(run(), dir);
+    const memo = new Map();
+    readReviewRunEvidence({ dir, memo });
+    const cache = join(dir, readdirSync(dir).find(n => !n.endsWith('.json')));
+    const onDisk = readFileSync(cache, 'utf8');
+    writeRun(run({ id: 'review-pr-other', attempted: false }), dir);
+    const warm = vi.fn(tryReadRun);
+    const after = readReviewRunEvidence({ dir, readRun: warm, memo });
+    expect(warm).toHaveBeenCalledTimes(1);
+    expect(after.map(e => e.id).sort()).toEqual(['review-pr-other', 'review-pr-parked']);
+    expect(readFileSync(cache, 'utf8')).toBe(onDisk);
+    // A cold process still gets the speed-up for what the file holds and parses only the rest — same evidence.
+    const cold = vi.fn(tryReadRun);
+    expect(readReviewRunEvidence({ dir, readRun: cold, memo: new Map() })).toEqual(after);
+    expect(cold).toHaveBeenCalledTimes(1);
+    expect(readFileSync(cache, 'utf8')).not.toBe(onDisk);
   });
   it('a corrupt or foreign on-disk projection is ignored, never trusted', () => {
     const dir = temp(); writeRun(run(), dir);

@@ -121,7 +121,10 @@ function queueChecks(pr) {
  * say), so it shows until a ruling or a new head clears it. `findings` is one line each plus the file.
  */
 export function rulingNeededRow(repo, pr, options = {}) {
-  const paused = pausedReferrals?.pausedReviewRulingNeeded(pr, { repo, ...options });
+  // A throwing paused-referral read must never drop this PR (or the rest of the repo's sections): fall back to the
+  // ordinary ledger read, as before this reader existed.
+  let paused = null;
+  try { paused = pausedReferrals?.pausedReviewRulingNeeded(pr, { repo, ...options }) ?? null; } catch { paused = null; }
   const need = paused ?? rulingLedger?.rulingNeeded(pr, rulingHumanAt === undefined ? {} : { humanAt: rulingHumanAt });
   if (!need) return null;
   return {
@@ -755,7 +758,9 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
           redTeamRow = redTeamRulingRow(repo, pr, redTeamSetting,
             { readSaved: savedRedTeamFallback?.({ repo, pr: pr.number, head: pr.headRefOid }) ?? null });
         } catch (error) { failedRead(`${repo}#${pr.number} red-team ruling`, error); }
-        report.rulingNeeded.push(...mergeRulingRows(rulingNeededRow(repo, pr), redTeamRow));
+        let ledgerRow = null;
+        try { ledgerRow = rulingNeededRow(repo, pr); } catch (error) { failedRead(`${repo}#${pr.number} ruling-needed`, error); }
+        report.rulingNeeded.push(...mergeRulingRows(ledgerRow, redTeamRow));
       }
       for (const pr of prs) {
         if (readyNumbersThisRepo.has(pr.number)) continue;

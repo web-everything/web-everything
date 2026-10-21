@@ -86,6 +86,8 @@ const headCache = new Map();
  *  so a change to {@link reviewRunEvidence} never serves a stale projection. */
 export const REVIEW_EVIDENCE_CACHE_FILE = '.review-run-evidence.cache';
 export const REVIEW_HEAD_CACHE_FILE = '.review-run-heads.cache';
+/** A warm process with at most this many changed records parses them directly instead of the whole on-disk file. */
+export const EVIDENCE_DISK_MIN_MISSES = 32;
 const projectionCode = project => createHash('sha256').update(String(project)).digest('hex').slice(0, 16);
 function readEvidenceDiskCache(file, code) {
   try {
@@ -127,12 +129,25 @@ function readRunProjections({ dir, readRun, memo, persist, project, cacheFile, m
   let disk = null;
   let dirty = false;
   const kept = {};
-  const out = names.filter(n => n.startsWith(REVIEW_RUN_ID_PREFIX) && n.endsWith('.json')).flatMap(name => {
+  // xwu9oxh S6 — the on-disk projection (~45 MB of JSON at ~6.6k records) is for a COLD process. Live 2026-10-20 the
+  // long-lived fix daemon parsed it on every reconcile pass (always once at the end, and again whenever the review
+  // daemon had written even one new record) — ~140 MB of transient heap per pass, several passes per tick. A warm
+  // process now parses its few missed records directly and leaves the file alone; the file is read (and rewritten)
+  // only when this call misses every record or more than EVIDENCE_DISK_MIN_MISSES of them. Same evidence either way.
+  const rows = names.filter(n => n.startsWith(REVIEW_RUN_ID_PREFIX) && n.endsWith('.json')).map(name => {
     const path = join(dir, name);
+    const stat = statSync(path);
+    return { name, path, key: `${stat.mtimeMs}:${stat.size}` };
+  });
+  const misses = rows.filter(r => memo.get(r.path)?.key !== r.key).length;
+  const useDisk = persist && misses > 0 && (misses === rows.length || misses > EVIDENCE_DISK_MIN_MISSES);
+  const out = rows.flatMap(({ name, path }) => {
+    // Re-stat right before use (the count above is only a hint), so each record's key is read at the same moment
+    // relative to its parse as before this change.
     const stat = statSync(path);
     const key = `${stat.mtimeMs}:${stat.size}`;
     let cached = memo.get(path);
-    if (cached?.key !== key && persist) {
+    if (cached?.key !== key && useDisk) {
       disk ??= readEvidenceDiskCache(file, code);
       const hit = disk[name];
       if (hit?.key === key) cached = { key, evidence: hit.evidence ?? null };
@@ -146,7 +161,7 @@ function readRunProjections({ dir, readRun, memo, persist, project, cacheFile, m
     if (!cached.evidence) return [];
     return [isMintedReviewRunId(name.slice(0, -5)) ? cached.evidence : { ...cached.evidence, custom: true }];
   });
-  if (persist) {
+  if (useDisk) {
     disk ??= readEvidenceDiskCache(file, code);
     if (dirty || Object.keys(disk).some(n => !kept[n])) writeEvidenceDiskCache(file, code, kept);
   }
