@@ -336,6 +336,14 @@ describe('fresh per-lane safety check before any destructive action', () => {
     expect(guardLaneAction({ path: '/l', action: 'reset', check: () => ({ hasUnsafeWork: false }), log }).act).toBe(false);
     expect(guardLaneAction({ path: '/l', action: 'reset', exec: git({ status: '', stash: '', 'rev-list': '0' }), log }).act).toBe(true);
   });
+  it('logging never decides: a throwing logger neither blocks a safe lane nor frees an unsafe one', () => {
+    const log = vi.fn(() => { throw new Error('log sink down'); });
+    expect(guardLaneAction({ path: '/l', action: 'reset', exec: git({ status: '', stash: '', 'rev-list': '0' }), log }))
+      .toMatchObject({ act: true });
+    expect(guardLaneAction({ path: '/l', action: 'reset', exec: git({ status: ' M a.mjs\n', stash: '', 'rev-list': '0' }), log }))
+      .toMatchObject({ act: false });
+    expect(log).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('lane action guard with real Git', () => {
@@ -496,5 +504,12 @@ describe('lane scan setting cascade', () => {
     });
   it.each([0, -1, 1.5, '300'])( 'falls back for invalid tool setting %s', value => {
     expect(resolve({ tool: { laneScanIntervalSec: value } })).toMatchObject({ interval: 300, source: 'standard' });
+  });
+  it.each([{}, { seconds: 60 }, [60], [], null])('falls back to standard and reports invalid for a malformed object setting %j', value => {
+    for (const layer of ['platform', 'tool']) {
+      const resolved = resolve({ [layer]: { laneScanIntervalSec: value } });
+      expect(resolved).toMatchObject({ interval: 300, source: 'standard' });
+      expect(resolved.invalid.length).toBeGreaterThan(0);
+    }
   });
 });
