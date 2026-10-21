@@ -617,7 +617,8 @@ async function landPreventionCardImpl(input, {
       // A capped acquire that found no lane in time ends this tick's drain: the cards stay put (an owed filing stays owed), no error.
       if (waitMs !== undefined && (e?.killed || e?.code === 'ETIMEDOUT' || isNoLaneInTime(text) || outOfBudget(e))) {
         // A killed acquire may already have claimed a lane it never reported: release by this run's UNIQUE session (a no-op when none).
-        try { execRaw('node', [LANE_POOL_CLI, 'release', '--all', `--session=${input.session}`], { cwd: REPO_ROOT, timeout: 10_000, killSignal: 'SIGKILL' }); } catch { /* ages out on its TTL */ }
+        // In-tick only: callers without a hard deadline keep the parent behaviour.
+        if (inTick) try { execRaw('node', [LANE_POOL_CLI, 'release', '--all', `--session=${input.session}`], { cwd: REPO_ROOT, timeout: 10_000, killSignal: 'SIGKILL' }); } catch { /* ages out on its TTL */ }
         write(`land-prevention-card: no lane within ${waitMs}ms; deferred to the next tick\n`);
         return { ok: true, skipped: true, deferred: true, step: 'acquire-deferred', pr: null };
       }
@@ -661,8 +662,10 @@ async function landPreventionCardImpl(input, {
     try {
       // The dedupe's gh reads go through the SAME bounded exec: after expiry each further request is refused at once (no fresh
       // one-second floor per call) and a child that ignores SIGTERM is killed.
-      const boundedGh = boundExec((c, a, o) => String(execFileSyncThrottled(c, a, o)), deadline);
-      plan = dedupe(input, { lane, write, ...(inTick ? { readPrCards: dir => readPrHostedCards({ exec: boundedGh, cwd: dir }) } : {}) });
+      // In-tick the dedupe reads NO hosted-PR cards: that path goes through gh-throttle, whose transient retries, rate-limit retries and
+      // personal-token lookup each start their own subprocess and cannot share the tick's deadline. Local open cards still dedupe; a
+      // finding that matches only a card on an open PR is filed instead of mentioned (the same as an unreadable PR list: fewer candidates).
+      plan = dedupe(input, { lane, write, ...(inTick ? { readPrCards: () => [] } : {}) });
     } catch (e) {
       if (outOfBudget(e)) return deferTick('budget-deferred', 'tick time ran out during dedupe');
       write(`land-prevention-card: dedupe failed, filing as before — ${String(e?.message || e).split('\n')[0]}\n`);

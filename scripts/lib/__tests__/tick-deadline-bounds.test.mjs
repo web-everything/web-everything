@@ -103,6 +103,29 @@ describe('round-2 bounds', () => {
   });
 });
 
+describe('round-4 bounds', () => {
+  it('inside the tick the dedupe reads NO hosted-PR cards (no gh-throttle subprocess to escape the deadline); outside it still does', async () => {
+    const seen = [];
+    const settings = resolvePreventionBatchSettings({ standard: loadCardBatchPolicy().prevention, repo: { filingEnabled: true }, env: {} });
+    const exec = (cmd, args) => (args[1] === 'acquire' ? JSON.stringify({ lane: 3, path: '/lane' }) : args[1] === 'file-item' ? JSON.stringify({ verdict: { num: 'x1abcde', rel: 'backlog/x1abcde-card.md' } }) : '');
+    const common = { owedClaimed: true, exec, write: () => {}, pendingDir: tmp(), skipPendingDrain: true, batch: vi.fn(async () => ({ batched: true, batchRef: 'r' })), readFile: () => '#',
+      loadFilingSettings: () => settings, loadPreventionBatchSettings: () => settings, acquireWait: () => 5_000,
+      dedupe: (input, o) => { seen.push(o.readPrCards ? o.readPrCards('/lane') : 'default'); return null; } };
+    const input = { title: 't', kind: 'task', size: '1', digest: 'd', scope: 's', queue: 'q', session: 's1' };
+    await landPreventionCard(input, { ...common, drainLimit: { deadlineAt: 10 ** 9, hardDeadlineAt: 10 ** 9, now: () => 0 } });
+    await landPreventionCard(input, common);
+    expect(seen).toEqual([[], 'default']);
+  });
+  it('the acquire-cleanup release runs only inside a tick', async () => {
+    const calls = [];
+    const exec = (cmd, args) => { calls.push(args); if (args[1] === 'acquire') throw Object.assign(new Error('x'), { killed: true }); return ''; };
+    const settings = resolvePreventionBatchSettings({ standard: loadCardBatchPolicy().prevention, repo: { filingEnabled: true }, env: {} });
+    await landPreventionCard({ title: 't', session: 'sess-uncapped' }, { owedClaimed: true, exec, write: () => {}, pendingDir: tmp(), skipPendingDrain: true,
+      loadFilingSettings: () => settings, loadPreventionBatchSettings: () => settings, acquireWait: () => 5_000 });
+    expect(calls.some(args => args[1] === 'release')).toBe(false);
+  });
+});
+
 describe('round-3 bounds', () => {
   it('a pending card whose work ran out of tick time still moves the cursor past it', async () => {
     const root = tmp(); const pendingDir = join(root, 'p'); mkdirSync(pendingDir);

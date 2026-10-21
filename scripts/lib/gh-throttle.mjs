@@ -1461,7 +1461,7 @@ export function personalGhToken({ bin = 'gh', exec = execFileSync } = {}) {
   try {
     const cleanEnv = { ...process.env };
     for (const k of GH_TOKEN_ENV_KEYS) delete cleanEnv[k];
-    const out = exec(bin, ['auth', 'token'], { env: cleanEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000, killSignal: 'SIGKILL' });
+    const out = exec(bin, ['auth', 'token'], { env: cleanEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     const trimmed = String(out == null ? '' : out).trim();
     token = trimmed || null;
   } catch {
