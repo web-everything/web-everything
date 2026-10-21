@@ -11,7 +11,8 @@ import {
   planBundleRepairs, planReconcile, validateOutcome,
 } from '../bundle-repair-core.mjs';
 import {
-  defaultLock, fillRepairBrief, ledgerPath, outcomePath, readLedger, recordOutcome, resolveBundleRepairSettings, runBundleRepairs,
+  defaultLock, fillRepairBrief, ledgerPath, outcomePath, readLedger, recordOutcome, repairSettingsEnv, resolveBundleRepairSettings,
+  runBundleRepairs, workerSpawnEnv,
 } from '../bundle-repair-dispatch.mjs';
 
 const MIN = 60_000;
@@ -122,6 +123,13 @@ describe('planReconcile — the escalation path', () => {
     const a = planReconcile([entry()], { clones: [c], now: NOW, overrideFor: () => ({ ref: 'lane/x' }), outcomeFor: () => ({ outcome: 'repaired', top: 'lane/x' }) });
     expect(a[0].escalate).toBe('conflict-override-used');
   });
+  it('a mandatory alert outranks a cleared hold; a clone missing from the probe is not "cleared"', () => {
+    const gone = [{ ...c, held: null }];
+    expect(planReconcile([entry()], { clones: gone, now: NOW, overrideFor: () => ({ ref: 'lane/x' }) })[0].escalate).toBe('conflict-override-used');
+    expect(planReconcile([entry()], { clones: gone, now: NOW, outcomeFor: () => ({ outcome: 'escalate', reason: 'weakened-twice', detail: 'd' }) })[0].escalate).toBe('weakened-twice');
+    expect(planReconcile([entry()], { clones: [], now: NOW })).toEqual([]);
+    expect(planReconcile([entry({ deadlineAt: NOW })], { clones: [], now: NOW })[0].escalate).toBe('wall-time');
+  });
   it('wall time → escalate; repaired but still held at the wall time → hold-not-cleared', () => {
     expect(planReconcile([entry({ deadlineAt: NOW })], { clones: [c], now: NOW })[0].escalate).toBe('wall-time');
     expect(planReconcile([entry({ status: 'repaired', deadlineAt: NOW })], { clones: [c], now: NOW })[0]).toMatchObject({ escalate: 'hold-not-cleared', stop: false });
@@ -199,6 +207,43 @@ describe('runBundleRepairs (IO shell, every seam injected)', () => {
     expect(published).toHaveLength(1);
   });
 
+  it('reserves the ledger entry BEFORE launching (a crash mid-launch cannot double-launch)', async () => {
+    const { dir, seams } = setup();
+    let onDisk = null;
+    await runBundleRepairs({ ...seams, dispatch: async () => { onDisk = readLedger(dir); throw new Error('crashed mid-launch'); }, ...settings() });
+    expect(onDisk).toEqual([expect.objectContaining({ status: 'running', indeterminate: true })]);
+    const again = await runBundleRepairs({ ...seams, now: NOW + MIN, ...settings() });
+    expect(again.dispatched).toEqual([]);
+    expect(again.held[0].rule).toBe(HOLD_RULES.ONE_PER_CLONE);
+  });
+
+  it('a failed escalation post is retried next tick, never lost; a failed stop is retried and blocks a new launch', async () => {
+    const { dir, published, dispatched, seams } = setup();
+    await runBundleRepairs({ ...seams, ...settings() });
+    const e = readLedger(dir)[0];
+    mkdirSync(join(dir, 'bundle-repair', 'outcomes'), { recursive: true });
+    writeFileSync(outcomePath(dir, e.holdId), JSON.stringify({ outcome: 'escalate', reason: 'unresolvable-conflict', detail: 'd' }));
+    const failing = { publish: async () => { throw new Error('feed down'); }, stop: async () => { throw new Error('stop failed'); } };
+    await runBundleRepairs({ ...seams, ...failing, now: NOW + MIN, ...settings() });
+    const pending = readLedger(dir)[0];
+    expect(pending).toMatchObject({ status: 'escalated', stopPending: true, escalationPending: { reason: 'unresolvable-conflict' } });
+    // the hold is still there and a later hold id would be new — but a pending stop still counts as a live repair
+    const s = await runBundleRepairs({ ...seams, now: NOW + 2 * MIN, ...settings() });
+    expect(published).toEqual([expect.objectContaining({ kind: 'bundle-repair' })]);
+    const settled = readLedger(dir)[0];
+    expect(settled.escalationPending).toBeUndefined();
+    expect(settled.stopPending).toBeUndefined();
+    expect(s.dispatched).toEqual([]);
+    expect(dispatched).toHaveLength(1);
+  });
+
+  it('off with nothing recorded leaves no files and takes no lock', async () => {
+    const { dir, seams } = setup();
+    const s = await runBundleRepairs({ ...seams, lock: () => { throw new Error('must not lock'); }, settingsResolved: { settings: BUNDLE_REPAIR_STANDARD, sources: {}, invalid: [] } });
+    expect(s.off).toBe('disabled');
+    expect(existsSync(join(dir, 'bundle-repair'))).toBe(false);
+  });
+
   it('a pass already holding the ledger lock makes the next pass skip, not double-launch', async () => {
     const { dir } = setup();
     let inner = null;
@@ -217,6 +262,16 @@ describe('runBundleRepairs (IO shell, every seam injected)', () => {
     expect(() => recordOutcome({ dir, holdId: e.holdId, session: 'other', input, token })).toThrow(/belongs to/);
     recordOutcome({ dir, holdId: e.holdId, session: e.session, input, token });
     expect(() => recordOutcome({ dir, holdId: e.holdId, session: e.session, input, token })).toThrow();
+  });
+});
+
+describe('no operator credential', () => {
+  it('the session spawns as the worker role and its settings env is resolved with the sink\'s worker options', () => {
+    expect(workerSpawnEnv({ WE_GITHUB_APP_ROLE: 'operator', X: '1' })).toEqual({ WE_GITHUB_APP_ROLE: 'worker', X: '1' });
+    const base = vi.fn((cwd, opts) => ({ ROLE: opts?.env?.WE_GITHUB_APP_ROLE ?? 'parent' }));
+    const env = repairSettingsEnv(base, { stateRoot: '/s', token: 't', stateRootEnv: 'S' })('/cwd', { env: workerSpawnEnv({}) });
+    expect(base).toHaveBeenCalledWith('/cwd', { env: { WE_GITHUB_APP_ROLE: 'worker' } });
+    expect(env).toEqual({ ROLE: 'worker', S: '/s', WE_BUNDLE_REPAIR_TOKEN: 't' });
   });
 });
 

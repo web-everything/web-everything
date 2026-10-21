@@ -143,15 +143,23 @@ export async function routeRepair() {
   } catch { return null; }
 }
 
+/** The session's identity: the WORKER App role on the spawn env — never the operator's credential. */
+export const workerSpawnEnv = (env = process.env) => ({ ...env, WE_GITHUB_APP_ROLE: 'worker' });
+
+/** The session's `--settings` env: the sink's base env resolved WITH the sink's own options (which carry the worker
+ *  `spawnEnv`, so the gh-shim settings take the worker role, not this process's), plus the state root and token. */
+export function repairSettingsEnv(base, { stateRoot, token, stateRootEnv }) {
+  return (cwd, opts) => ({ ...(base(cwd, opts) || {}), ...(stateRoot ? { [stateRootEnv]: stateRoot } : {}), [TOKEN_ENV]: token });
+}
+
 /** IO: launch one repair session through the dispatch-lane sink, as the worker App role. */
 export async function dispatchRepair(target, { prompt, session, token, stateRoot, wallTimeMinutes, root = WE_ROOT, env = process.env, sinkOptions = {} }) {
   const io = await import('../operations/dispatch-lane-io.mjs');
   const { DISPATCH_EFFECT } = await import('../operations/dispatch-lane.mjs');
   const { CONVEYOR_STATE_ROOT_ENV } = await import('../lib/daemon-last-good.mjs');
-  const base = sinkOptions.resolveSettingsEnv ?? io.resolveDispatchSettingsEnv;
   const sinks = io.createDispatchSinks({
-    root, extraArgs: io.agentArgsFromEnv(env), spawnEnv: { ...env, WE_GITHUB_APP_ROLE: 'worker' }, ...sinkOptions,
-    resolveSettingsEnv: (cwd) => ({ ...(base(cwd) || {}), ...(stateRoot ? { [CONVEYOR_STATE_ROOT_ENV]: stateRoot } : {}), [TOKEN_ENV]: token }),
+    root, extraArgs: io.agentArgsFromEnv(env), spawnEnv: workerSpawnEnv(env), ...sinkOptions,
+    resolveSettingsEnv: repairSettingsEnv(sinkOptions.resolveSettingsEnv ?? io.resolveDispatchSettingsEnv, { stateRoot, token, stateRootEnv: CONVEYOR_STATE_ROOT_ENV }),
   });
   const out = await sinks[DISPATCH_EFFECT]({
     launchKind: BUNDLE_REPAIR_KIND, prompt, sessionSlug: session, lane: null, scope: [], routing: await routeRepair(),
@@ -228,7 +236,28 @@ export async function runBundleRepairs({
   const summary = { settings, sources, invalid, killed: isKilled, off: false, dispatched: [], shadow: [], held: [], reconciled: [], escalated: [], failed: [] };
 
   const body = async () => {
-    let ledger = readLedger(dir);
+    const ledger = readLedger(dir);
+    const live = () => new Set(clones.filter((c) => c.root && isOverlayHold(c.held)).map((c) => holdIdFor(c, c.held)));
+    const persist = () => { if (!dryRun && (ledger.length || existsSync(ledgerPath(dir)))) writeJsonAtomicSync(ledgerPath(dir), pruneLedger(ledger, { now, liveHoldIds: live() })); };
+    const firstLine = (e) => String(e?.message || e).split('\n')[0];
+    const tryStop = async (entry) => {
+      try { await stop(entry); delete entry.stopPending; delete entry.lastStopError; }
+      catch (e) { entry.stopPending = true; entry.lastStopError = firstLine(e); }
+    };
+    // An escalation is PENDING until the feed accepted it: a failed post is retried every tick, never lost.
+    const tryEscalate = async (entry) => {
+      const { reason, detail } = entry.escalationPending;
+      try {
+        await publish(escalationItem(entry, { reason, detail, host, weRoot: root }), { now });
+        delete entry.escalationPending; delete entry.escalateError; entry.escalatedAt = now;
+      } catch (e) { entry.escalateError = firstLine(e); }
+    };
+
+    // 0. retry what an earlier tick could not finish: a failed stop, an unposted escalation.
+    if (!dryRun) {
+      for (const e of ledger.filter((x) => x.stopPending)) await tryStop(e);
+      for (const e of ledger.filter((x) => x.escalationPending)) await tryEscalate(e);
+    }
     // 1. reconcile
     const outcomes = new Map();
     const overrides = new Map();
@@ -241,17 +270,18 @@ export async function runBundleRepairs({
       const entry = ledger.find((x) => x.holdId === a.holdId);
       summary.reconciled.push({ ...a, dryRun });
       if (dryRun) continue;
-      if (a.stop) { try { await stop(entry); } catch (e) { entry.lastStopError = String(e?.message || e).split('\n')[0]; } }
+      if (a.stop) await tryStop(entry);
       entry.status = a.status;
       entry.endedAt = now;
       entry.endReason = a.escalate ?? a.detail;
       if (a.escalate) {
-        try { await publish(escalationItem(entry, { reason: a.escalate, detail: a.detail, host, weRoot: root }), { now }); entry.escalatedAt = now; }
-        catch (e) { entry.escalateError = String(e?.message || e).split('\n')[0]; }
+        entry.escalationPending = { reason: a.escalate, detail: a.detail };
+        await tryEscalate(entry);
         summary.escalated.push({ holdId: a.holdId, reason: a.escalate });
         log(`bundle-repair: ESCALATED ${entry.name} (${a.escalate}) — ${a.detail}`);
       }
     }
+    persist();
     // 2. plan + launch
     const planned = planBundleRepairs({ clones, ledger, settings, killed: isKilled, now });
     summary.off = planned.off;
@@ -259,7 +289,7 @@ export async function runBundleRepairs({
     for (const t of planned.dispatch) {
       let filled;
       try { filled = await fillRepairBrief(t, { root }); } catch (e) {
-        summary.failed.push({ holdId: t.holdId, error: String(e?.message || e).split('\n')[0] });
+        summary.failed.push({ holdId: t.holdId, error: firstLine(e) });
         continue;
       }
       const base = { holdId: t.holdId, cloneKey: t.cloneKey, root: t.root, name: t.name, holdSince: t.holdSince, startedAt: now, session: filled.session };
@@ -269,6 +299,7 @@ export async function runBundleRepairs({
         const path = shadowPath(dir, t.holdId);
         writeShadow(path, filled.prompt);
         ledger.push({ ...base, status: 'shadow', briefPath: path });
+        persist();
         log(`bundle-repair[shadow]: would launch ${filled.session} for clone ${t.name} (held since ${new Date(t.holdSince).toISOString()}) — brief ${path}`);
         try {
           await publish({ repo: `host/${host}`, pr: 0, head: `bundle-repair-shadow:${t.holdId}`.slice(0, 128), kind: 'bundle-repair-shadow',
@@ -279,29 +310,34 @@ export async function runBundleRepairs({
       if (dryRun) { summary.dispatched.push({ ...base, dryRun }); continue; }
       const token = randomBytes(24).toString('hex');
       const deadlineAt = now + settings.wallTimeMinutes * 60_000;
+      // RESERVE BEFORE LAUNCH: the entry is on disk as an indeterminate running repair before anything spawns, so a
+      // crash mid-launch can never let a later tick launch a second session for this clone/hold.
+      const entry = { ...base, handle: null, deadlineAt, status: 'running', indeterminate: true, tokenHash: sha256(token) };
+      ledger.push(entry);
+      persist();
       try {
         const r = await dispatch(t, { prompt: filled.prompt, session: filled.session, token, stateRoot: resolve(dir, '..', '..'), wallTimeMinutes: settings.wallTimeMinutes });
-        ledger.push({ ...base, handle: r.handle, deadlineAt, status: 'running', tokenHash: sha256(token) });
+        entry.handle = r.handle;
+        delete entry.indeterminate;
         summary.dispatched.push({ ...base, handle: r.handle });
         log(`bundle-repair: launched ${filled.session} for clone ${t.name}`);
       } catch (e) {
-        const error = String(e?.message || e).split('\n')[0];
-        // Not provably un-started: hold the slot; the wall time reaps it by name and escalates.
-        ledger.push(e?.notApplied === true
-          ? { ...base, status: 'dispatch-failed', endedAt: now, endReason: error }
-          : { ...base, handle: null, deadlineAt, status: 'running', indeterminate: true, tokenHash: sha256(token), endReason: error });
+        const error = firstLine(e);
         summary.failed.push({ holdId: t.holdId, error });
+        entry.endReason = error;
+        // Provably not started → settled + escalated. Otherwise keep the slot; the wall time stops it by name.
         if (e?.notApplied === true) {
-          try { await publish(escalationItem(base, { reason: 'dispatch-failed', detail: error, host, weRoot: root }), { now }); } catch { /* logged below */ }
+          Object.assign(entry, { status: 'dispatch-failed', endedAt: now, escalationPending: { reason: 'dispatch-failed', detail: error } });
+          delete entry.indeterminate;
+          await tryEscalate(entry);
           log(`bundle-repair: ESCALATED ${t.name} (dispatch-failed) — ${error}`);
         }
       }
-    }
-    if (!dryRun && (ledger.length || existsSync(ledgerPath(dir)))) {
-      const live = new Set(clones.filter((c) => c.root && isOverlayHold(c.held)).map((c) => holdIdFor(c, c.held)));
-      writeJsonAtomicSync(ledgerPath(dir), pruneLedger(ledger, { now, liveHoldIds: live }));
+      persist();
     }
   };
+  // Off with nothing ever recorded: no lock, no files — the feature leaves no footprint until it is turned on.
+  if (settings.enabled !== true && !existsSync(ledgerPath(dir))) { summary.off = 'disabled'; return summary; }
   if (dryRun) await body(); else await lock(dir, body);
   return summary;
 }
