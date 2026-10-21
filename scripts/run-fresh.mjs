@@ -29,7 +29,7 @@ const SHA_RE = /^[0-9a-f]{40}$/;
 const defaultSpawn = (cmd, args, opts) => spawnSync(cmd, args, { encoding: 'utf8', ...opts });
 const operationGroups = process.platform !== 'win32';
 
-function signalOperation(child, signal) {
+export function signalOperation(child, signal) {
   if (!child) return;
   try {
     if (operationGroups && child.pid) process.kill(-child.pid, signal);
@@ -41,7 +41,7 @@ function signalOperation(child, signal) {
 }
 
 /** An exited operation may have left a writing subprocess behind. Zombies cannot write and need no wait. */
-async function waitForGroupStop(pid) {
+export async function waitForGroupStop(pid) {
   for (;;) {
     try { process.kill(-pid, 0); } catch (error) { if (error.code === 'ESRCH') return; }
     const members = defaultSpawn('ps', ['-ax', '-o', 'pgid=,stat='],
@@ -129,9 +129,10 @@ export function runFresh(argv, { spawn = defaultSpawn, spawnOperation = spawnChi
  */
 export async function withSignalsDeferred(fn, { proc = process } = {}) {
   const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'];
-  const cancellation = { signal: null, child: null };
+  const cancellation = { signal: null, child: null, abort: new AbortController() };
   const handlers = signals.map((signal) => [signal, () => {
     cancellation.signal ??= signal;
+    cancellation.abort.abort();
     signalOperation(cancellation.child, signal);
   }]);
   for (const [signal, handler] of handlers) proc.on(signal, handler);

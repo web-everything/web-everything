@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { depsReady, ensureDeps } from './lib/lane-pool-deps.mjs';
 import { scheduledLaneGc } from './lib/host-load.mjs';
 import { loadHostOverloadSettings } from './lib/host-overload-settings.mjs';
 import { isTerminalStatus } from './lib/backlog-status.cjs';
@@ -658,45 +659,7 @@ function existingPools() {
 }
 
 // ── deps (node_modules) — not shared by --reference, so installed per lane on fresh-clone / lockfile change ──
-const DEPS_MARKER = (dir) => join(dir, '.git', '.lane-pool-deps'); // inside .git ⇒ never tracked or git-cleaned
-function lockHash(dir) {
-  const lock = join(dir, 'package-lock.json');
-  const pkg = join(dir, 'package.json');
-  const file = existsSync(lock) ? lock : existsSync(pkg) ? pkg : null;
-  if (!file) return null;
-  return createHash('sha256').update(readFileSync(file)).digest('hex');
-}
-function depsReady(dir) {
-  const want = lockHash(dir);
-  if (want === null) return 'n/a'; // no package.json → nothing to install
-  if (!existsSync(join(dir, 'node_modules'))) return 'missing';
-  const have = existsSync(DEPS_MARKER(dir)) ? readFileSync(DEPS_MARKER(dir), 'utf8').trim() : null;
-  return have === want ? 'ok' : 'stale';
-}
-// #3461 — `npm ci`/`npm install` here is a DELIBERATE, NAMED EXCEPTION to the heavy-command admission queue
-// (`scripts/readiness/heavy-admission.mjs`), not an oversight. #3456's own ruling is explicit that the cap
-// applies at heavy-command-INVOCATION time, never at lane-ACQUIRE time — "a lane may always be acquired
-// freely" — and `ensureDeps` runs INSIDE `acquire`/`provision`/`refresh` (see the three call sites below), so
-// routing it through the semaphore would violate that guarantee directly: a lane trying to acquire could queue
-// behind check:standards/test:unit runs in OTHER lanes, which is exactly the coupling #3456 ruled out. Passing
-// `--no-install` at every dispatched-agent acquire call site and gating `npm ci` as its own explicit
-// post-acquire step was the alternative #3461 considered and rejected — it would touch every acquire call
-// site (including `delivery-agent-brief.md` and every skill/workflow that provisions a lane), for a command
-// that is comparatively cheap and already deduped by `depsReady`'s lockfile-hash skip (most acquires do
-// nothing here at all). This function stays ungated.
-function ensureDeps(dir) {
-  const state = depsReady(dir);
-  if (state === 'n/a' || state === 'ok') return state;
-  const useCi = existsSync(join(dir, 'package-lock.json'));
-  log(`  deps ${state} → npm ${useCi ? 'ci' : 'install'} in ${dir} …`);
-  // #x5n4zn3 review — npm's stdout goes to OUR stderr (fd 2), never our stdout: `acquire --json` prints its
-  // result on stdout, and a caller that captures it (`orphan-claim-release.mjs`'s `acquireLane`) must parse
-  // pure JSON even on the acquires that actually install. Stays visible on a terminal either way.
-  execFileSync('npm', [useCi ? 'ci' : 'install'], { cwd: dir, stdio: ['inherit', 2, 'inherit'], timeout: NPM_TIMEOUT_MS, killSignal: 'SIGKILL' });
-  writeFileSync(DEPS_MARKER(dir), lockHash(dir));
-  return 'installed';
-}
-
+// Shared with lane-test's post-reset preparation; acquisition keeps the same hash/marker/install policy.
 // ── lease (#2275) — an exclusive hold so a lane is never recycled or double-acquired while in use ─────
 // The marker lives INSIDE `.git` (like DEPS_MARKER) so it is never tracked, never `git clean`-ed, and
 // never seen by `git status --porcelain` (so it doesn't itself make a lane look dirty). A held lane is
