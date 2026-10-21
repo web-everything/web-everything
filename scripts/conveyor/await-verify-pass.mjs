@@ -107,6 +107,14 @@ export function classifyAwaitVerdict({ record, marker, lane, nowMs, ttlMs, limit
     return age > ttlMs ? rerequest('verify-overdue') : { action: 'wait', reason: 'running' };
   }
   if (v.status === 'red') {
+    // Live PR #5768 — a ci-heal's red only on tests that ALSO fail on origin/main's tip, outside the diff (the gate's own
+    // base re-run, `redCause: pre-existing-on-main`, exact sha) is main's red, not this PR's: the gate already lets that
+    // push through (`lane-verify.mjs#verifyGateDecision` ok:true), so the harness pushes it like a green, never a repair.
+    if (isCiHeal(record) && v.ok === true && v.reason === 'verify-red-preexisting') {
+      if (lower(marker?.sha) !== lower(record.sha)) return rerequest('preexisting-for-other-sha');
+      if (!marker?.treeHash || !lane.treeHash || marker.treeHash !== lane.treeHash) return rerequest('tree-unproven');
+      return { action: 'push', reason: 'red-preexisting-on-main' };
+    }
     if (!isNoPushRecord(record) && AWAIT_LOAD_FLAKE_REPO_KEYS.includes(repoKeyOrNull(record.repo)) && isLoadFlakeRed(marker)) return { action: 'resume', reason: 'red-load-flake', resume: 'load-flake' };
     if (!isNoPushRecord(record) && !AWAIT_LOAD_FLAKE_REPO_KEYS.includes(repoKeyOrNull(record.repo)) && isLoadFlakeRed(marker)) return { action: 'resume', reason: 'red-load-flake', resume: 'load-flake-redispatch' };
     if ((record.attempt ?? 1) >= limits.maxReds) return { action: 'resume', reason: `red on attempt ${record.attempt}`, resume: 'escalate' };
@@ -159,7 +167,10 @@ export function buildAwaitVerifyResumePrompt({ kind, record, marker = null, deta
   if (isNoPushRecord(record) && ['green', 'red', 'escalate', 'infra', 'void'].includes(kind)) return buildNoPushResumePrompt({ kind, record, marker, detail, head, next });
   switch (kind) {
     case 'green': {
-      const pushed = `Verify is GREEN for exactly this sha and the harness has PUSHED it to ${record.ref}${detail ? ` (${detail})` : ''}. Do not push ${record.ref} again.`;
+      const verdict = record.pendingResume?.preExisting
+        ? 'Verify is RED for this sha ONLY on tests that also fail on origin/main (pre-existing on main, outside this diff — not this PR\'s failure; say so in the comment and do not edit those tests)'
+        : 'Verify is GREEN for exactly this sha';
+      const pushed = `${verdict} and the harness has PUSHED it to ${record.ref}${detail ? ` (${detail})` : ''}. Do not push ${record.ref} again.`;
       // The two briefs end differently: a CI-heal's only PR write is the restart-surviving tally comment (no evidence comment, no hand-back).
       return isCiHeal(record)
         ? `${head}\n\n${pushed} Continue your ${brief(record)} at step 7: post the durable CI-heal comment (\`ci-heal-mark.mjs\` — the attempt tally that survives restarts), then its completion report (\`--outcome=no-change|healed\`) and fix-end. Touch no label.`
@@ -428,7 +439,7 @@ export async function runAwaitVerifyPass({
         const transientGone = !pushed?.ok && pushed?.transient;
         const salvaged = transientGone ? io.saveSalvage?.({ record, nowMs, reason: pushed.reason }) : null;
         pending = pushed?.ok
-          ? { kind: 'green', detail: record.earlyPush?.ok && lower(record.earlyPush.sha) === lower(record.sha) ? `on ${record.ref} since ${record.earlyPush.at} (push-before-gate), verified at ${new Date(nowMs).toISOString()}` : `pushed at ${new Date(nowMs).toISOString()}`, ...(srOverdue ? { selfReviewOverdue: srOverdue } : {}) }
+          ? { kind: 'green', ...(d.reason === 'red-preexisting-on-main' ? { preExisting: true } : {}), detail: record.earlyPush?.ok && lower(record.earlyPush.sha) === lower(record.sha) ? `on ${record.ref} since ${record.earlyPush.at} (push-before-gate), verified at ${new Date(nowMs).toISOString()}` : `pushed at ${new Date(nowMs).toISOString()}`, ...(srOverdue ? { selfReviewOverdue: srOverdue } : {}) }
           : transientGone
             ? { kind: 'push-transient', detail: `${pushed.reason}${salvaged?.ok ? ' (the verified commit is saved; the harness keeps retrying the push)' : ''}` }
             : { kind: pushed?.moved ? 'push-rejected' : 'push-refused', detail: pushed?.reason ?? 'push failed' };
