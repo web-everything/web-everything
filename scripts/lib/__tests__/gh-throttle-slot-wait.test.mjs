@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { acquireGhSlotSync, ghSlotWaitClass, GH_SLOT_WAIT_STANDARD, resolveGhSlotWait, runGhSync, runGhCliPassthrough, isGhThrottled } from '../gh-throttle.mjs';
+import { acquireGhSlotSync, ghSlotWaitClass, ghSlotWaitMs, GH_SLOT_WAIT_STANDARD, resolveGhSlotWait, runGhSync, runGhCliPassthrough, isGhThrottled } from '../gh-throttle.mjs';
 import { isGhThrottled as sharedIsGhThrottled } from '../gh-deferred.mjs';
 
 const dirs = [];
@@ -88,6 +88,86 @@ it('resolves platform and env knobs with sources and invalid fallback', () => {
     expect(resolveGhSlotWait({ ...env, WE_GH_THROTTLE_BACKGROUND_WAIT_MS: bad, WE_GH_THROTTLE_ON_SLOT_TIMEOUT: 'bad' })).toMatchObject({ backgroundWaitMs: 8000, onSlotTimeout: 'throttled', source: { backgroundWaitMs: 'standard', onSlotTimeout: 'standard' } });
   }
   expect(resolveGhSlotWait(null)).toMatchObject(GH_SLOT_WAIT_STANDARD);
+  expect(resolveGhSlotWait({ WE_PLATFORM_PREFERENCES_FILE: join(temp(), 'absent.json') })).toMatchObject(GH_SLOT_WAIT_STANDARD);
+});
+
+describe('per-caller background slot wait (callerWaitMs cascade, operator 2026-10-20)', () => {
+  const absent = () => ({ WE_PLATFORM_PREFERENCES_FILE: join(temp(), 'absent.json') });
+  const CONFLICT = 'parked-pr-conflict-watch-we';
+  it('standard: no caller override, so the conflict watch waits the standard 8 s background budget', () => {
+    expect(GH_SLOT_WAIT_STANDARD.callerWaitMs).toEqual({});
+    const settings = resolveGhSlotWait(absent(), { tool: {} });
+    expect(ghSlotWaitClass({ caller: CONFLICT, args: READ, settings })).toBe('background');
+    expect(ghSlotWaitMs({ caller: CONFLICT, waitClass: 'background', settings })).toEqual({ waitMs: 8000, source: 'standard', key: 'backgroundWaitMs' });
+  });
+  it('the checked-in tool layer gives the conflict watch 120 s, logged as source=tool, still background class', () => {
+    const settings = resolveGhSlotWait(absent());
+    expect(settings.source['callerWaitMs.^parked-pr-conflict-watch']).toBe('tool');
+    expect(ghSlotWaitClass({ caller: CONFLICT, args: READ, settings })).toBe('background');
+    expect(ghSlotWaitMs({ caller: CONFLICT, waitClass: 'background', settings }))
+      .toEqual({ waitMs: 120000, source: 'tool', key: 'callerWaitMs.^parked-pr-conflict-watch' });
+    // Other background callers keep the standard budget.
+    expect(ghSlotWaitMs({ caller: 'lane-pool-health-watch-we', waitClass: 'background', settings }).waitMs).toBe(8000);
+  });
+  it('a platform-layer caller wait is named as source=platform, and the tool layer wins over it', () => {
+    const path = join(temp(), 'p.json');
+    writeFileSync(path, JSON.stringify({ ghThrottleSlotWait: { callerWaitMs: { '^parked-pr-conflict-watch': 60000 } } }));
+    const plat = resolveGhSlotWait({ WE_PLATFORM_PREFERENCES_FILE: path }, { tool: {} });
+    expect(ghSlotWaitMs({ caller: CONFLICT, waitClass: 'background', settings: plat })).toMatchObject({ waitMs: 60000, source: 'platform' });
+    const tool = resolveGhSlotWait({ WE_PLATFORM_PREFERENCES_FILE: path }, { tool: { callerWaitMs: { '^parked-pr-conflict-watch': 90000 } } });
+    expect(ghSlotWaitMs({ caller: CONFLICT, waitClass: 'background', settings: tool })).toMatchObject({ waitMs: 90000, source: 'tool' });
+  });
+  it('bounds: 0 and 120000 are accepted; out-of-range or non-integer values fall back to the standard 8 s', () => {
+    for (const ok of [0, 120000]) {
+      const settings = resolveGhSlotWait(absent(), { tool: { callerWaitMs: { '^parked-pr-conflict-watch': ok } } });
+      expect(ghSlotWaitMs({ caller: CONFLICT, waitClass: 'background', settings })).toMatchObject({ waitMs: ok, source: 'tool' });
+    }
+    for (const bad of [-1, 120001, 1.5, '120000', null, true, [120000], 1e9]) {
+      const settings = resolveGhSlotWait(absent(), { tool: { callerWaitMs: { '^parked-pr-conflict-watch': bad } } });
+      expect(ghSlotWaitMs({ caller: CONFLICT, waitClass: 'background', settings }))
+        .toEqual({ waitMs: 8000, source: 'standard', key: 'backgroundWaitMs' });
+    }
+  });
+  it('invalid shapes never break a caller: non-object block, malformed regex, priority class untouched', () => {
+    for (const tool of [{ callerWaitMs: 120000 }, { callerWaitMs: ['^parked'] }, { callerWaitMs: { '[': 120000 } }]) {
+      const settings = resolveGhSlotWait(absent(), { tool });
+      expect(ghSlotWaitMs({ caller: CONFLICT, waitClass: 'background', settings }).waitMs).toBe(8000);
+    }
+    const settings = resolveGhSlotWait(absent(), { tool: { callerWaitMs: { '.*': 0 } } });
+    expect(ghSlotWaitMs({ caller: 'review-daemon.mjs', waitClass: 'priority', settings, acquireTimeoutMs: 120000 }).waitMs).toBe(120000);
+  });
+  it('null input is exactly the standard (no file layers): no caller override survives', () => {
+    const standardSources = Object.fromEntries(Object.keys(GH_SLOT_WAIT_STANDARD).map(k => [k, 'standard']));
+    for (const input of [null, 'x', 0]) {
+      expect(resolveGhSlotWait(input)).toEqual({ ...GH_SLOT_WAIT_STANDARD, source: standardSources });
+    }
+    expect(resolveGhSlotWait(null).callerWaitMs).toEqual({});
+    expect(ghSlotWaitMs({ caller: CONFLICT, waitClass: 'background', settings: resolveGhSlotWait(null) }).waitMs).toBe(8000);
+    expect(ghSlotWaitMs({ caller: null, waitClass: 'background', settings: null })).toEqual({ waitMs: 8000, source: 'standard', key: 'backgroundWaitMs' });
+  });
+  it('the env background wait (highest layer) still wins over the tool caller wait', () => {
+    for (const [raw, ms] of [['0', 0], ['5000', 5000]]) {
+      const settings = resolveGhSlotWait({ ...absent(), WE_GH_THROTTLE_BACKGROUND_WAIT_MS: raw });
+      expect(ghSlotWaitMs({ caller: CONFLICT, waitClass: 'background', settings })).toEqual({ waitMs: ms, source: 'env', key: 'backgroundWaitMs' });
+    }
+  });
+  it('the tool layer contributes ONLY callerWaitMs: class lists, onSlotTimeout and backgroundWaitMs stay as on main', () => {
+    const settings = resolveGhSlotWait(absent(), { tool: { onSlotTimeout: 'ungated', backgroundWaitMs: 120000,
+      priorityCallers: ['^lane-pool-health-watch'], backgroundCallers: [], callerWaitMs: { '^parked-pr-conflict-watch': 120000 } } });
+    expect(settings).toMatchObject({ onSlotTimeout: 'throttled', backgroundWaitMs: 8000,
+      priorityCallers: GH_SLOT_WAIT_STANDARD.priorityCallers, backgroundCallers: GH_SLOT_WAIT_STANDARD.backgroundCallers });
+    expect(settings.source).toMatchObject({ onSlotTimeout: 'standard', backgroundWaitMs: 'standard', priorityCallers: 'standard', backgroundCallers: 'standard' });
+    expect(ghSlotWaitClass({ caller: 'lane-pool-health-watch-we', args: READ, settings })).toBe('background');
+  });
+  it('a full pool makes the conflict watch wait its 120 s tool budget and records the wait source', () => {
+    const f = fullPool(CONFLICT);
+    let error;
+    try { runGhSync(READ, { encoding: 'utf8', throttle: f.throttle }); } catch (e) { error = e; }
+    expect(error).toMatchObject({ ghThrottled: { class: 'background', waitedMs: 120000 } });
+    expect(f.elapsed()).toBe(120000);
+    expect(f.rows()[0]).toMatchObject({ outcome: 'slot_throttled', class: 'background', waitMs: 120000,
+      waitSource: 'callerWaitMs.^parked-pr-conflict-watch:tool' });
+  });
 });
 it('recognizes shared throttled markers without confusing deferrals or ordinary failures', () => {
   expect(sharedIsGhThrottled).toBe(isGhThrottled);

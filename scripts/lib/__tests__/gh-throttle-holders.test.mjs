@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { keepAliveScript } from '../test-keepalive.mjs';
 import { acquireGhSlotSync, noteSlotTimeout, runGhSync, runGhCliPassthrough, classifyGhWrite, ghCallerPriority, classifyGhResource } from '../gh-throttle.mjs';
 import { ghHolderMeta, readGhSlotHolders, loadGhThrottleSettings, ghExecOptions, ghCallerKey, redactGhArgs, isGhWatch, ghOpLabel, acquireGhHolderSlot, describeLegacyHolders, ghHoldersSummary } from '../gh-throttle-holders.mjs';
 import { readLockEntry, reserve, releaseLockDir } from '../../readiness/file-locks.mjs';
@@ -283,7 +284,7 @@ describe('hold policy and execution', () => {
     expect(rows().filter((r) => r.outcome === 'call').some((r) => r.unslotted)).toBe(false);
   });
   it('preserves native subprocess timeout fields and logs both execution paths', () => {
-    const args = ['-e', 'setInterval(() => {}, 1000)'];
+    const args = ['-e', keepAliveScript()];
     const nativeOpts = { timeout: 20, killSignal: 'SIGTERM', stdio: 'pipe' };
     let native;
     try { execFileSync(process.execPath, args, nativeOpts); } catch (e) { native = e; }
