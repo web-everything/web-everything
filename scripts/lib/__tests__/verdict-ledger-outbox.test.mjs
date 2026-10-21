@@ -20,7 +20,7 @@ import {
 import {
   flushLedgerOutbox, listOutboxEntries, outboxLockRoot, OUTBOX_LOCK_PATH, resolveOutboxSettings, formatOutboxSettings,
   OUTBOX_ENV, OUTBOX_DIR_ENV, enqueueOutboxEntry, spawnBoardLedgerOutboxFlush, spawnLedgerOutboxBackstop,
-  resetLedgerOutboxBackstopThrottle, classifyPushFailure,
+  resetLedgerOutboxBackstopThrottle, classifyPushFailure, canonicalRemote,
 } from '../verdict-ledger-outbox.mjs';
 import { withGitErrorForTest } from '../git-transport-branch.mjs';
 import { reserve, makeLockEntry } from '../../readiness/file-locks.mjs';
@@ -282,7 +282,7 @@ describe('real git: outbox + plumbing flush', () => {
       ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
       const outboxDir = join(ctx.tmp, 'outbox');
       const run = (args, opts) => {
-        if (args[0] === 'push') { const e = new Error('Command failed'); e.stderr = ' ! [remote rejected] x -> ops/review-requests (pre-receive hook declined)\nerror: failed to push some refs\n'; e.status = 1; throw e; }
+        if (args[0] === 'push') { const e = new Error('Command failed'); e.stdout = `To o\n!\tx:refs/heads/ops/review-requests\t[remote rejected] (pre-receive hook declined)\nDone\n`; e.stderr = 'error: failed to push some refs\n'; e.status = 1; throw e; }
         return realGit(args, opts);
       };
       expect(() => appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(9)], outbox: true, outboxDir, gitRun: run, log: quiet }))
@@ -322,11 +322,17 @@ describe('real git: outbox + plumbing flush', () => {
   });
 
   it('only git\'s per-ref status line classifies a failed push; incidental text proves nothing (round 4)', () => {
-    const err = (stderr) => Object.assign(new Error('git push failed'), { stderr });
-    expect(classifyPushFailure(err(' ! [rejected]        abc -> ops/review-requests (fetch first)\nerror: failed to push some refs\n'))).toBe('race');
-    expect(classifyPushFailure(err(' ! [remote rejected] abc -> ops/review-requests (pre-receive hook declined)\n'))).toBe('refused');
-    expect(classifyPushFailure(err('remote: error: cannot lock ref \'refs/heads/other\'\nfatal: the remote end hung up unexpectedly\n'))).toBe('unknown');
-    expect(classifyPushFailure(err('fatal: unable to access remote\n'))).toBe('unknown');
+    const REF = 'refs/heads/ops/review-requests';
+    const err = (stdout, stderr = '') => Object.assign(new Error(`git push failed: ${stderr}`), { stdout, stderr });
+    expect(classifyPushFailure(err(`To o\n!\tabc:${REF}\t[rejected] (fetch first)\nDone\n`), REF)).toBe('race');
+    expect(classifyPushFailure(err(`To o\n!\tabc:${REF}\t[remote rejected] (pre-receive hook declined)\nDone\n`), REF)).toBe('refused');
+    // Status-SHAPED prose on stderr, or a record for ANOTHER ref, proves nothing about ours.
+    expect(classifyPushFailure(err('', 'remote: notice: ! [remote rejected] diagnostic -> another-ref (hook declined)\nfatal: the remote end hung up unexpectedly\n'), REF)).toBe('unknown');
+    expect(classifyPushFailure(err(`!\tabc:refs/heads/other\t[rejected] (fetch first)\n`), REF)).toBe('unknown');
+    expect(classifyPushFailure(err('', 'fatal: unable to access remote\n'), REF)).toBe('unknown');
+    // One identity per remote, however it is spelled.
+    expect(canonicalRemote('https://github.com/Web-Everything/web-everything.git')).toBe(canonicalRemote('git@github.com:web-everything/web-everything'));
+    expect(canonicalRemote('ssh://git@github.com:22/web-everything/web-everything/')).toBe(canonicalRemote('https://github.com/web-everything/web-everything'));
   });
 
   it('an unanswered push whose noise mentions "cannot lock ref" is still UNKNOWN: kept queued, never thrown', async () => {

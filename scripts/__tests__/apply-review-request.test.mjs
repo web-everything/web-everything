@@ -443,7 +443,7 @@ describe('the ledger push can only fast-forward the transport branch (C3)', () =
 
   it('pushes exactly the one plumbing commit to the transport branch: no force, no plus-refspec, no other ref', () => {
     const pushes = calls.filter((a) => a[0] === 'push');
-    expect(pushes.map((a) => [...a])).toEqual([['push', '--quiet', '--no-follow-tags', 'origin', `${SHA}:refs/heads/${LEDGER_TRANSPORT_BRANCH}`]]);
+    expect(pushes.map((a) => [...a])).toEqual([['push', '--porcelain', '--no-follow-tags', 'origin', `${SHA}:refs/heads/${LEDGER_TRANSPORT_BRANCH}`]]);
     // That commit is the one commit-tree built on the fetched tip, nothing else.
     const commitTree = calls.find((a) => a[0] === 'commit-tree');
     expect([...commitTree].slice(0, 4)).toEqual(['commit-tree', SHA, '-p', SHA]);
@@ -536,7 +536,7 @@ describe('no other code on the ledger path pushes (C3)', () => {
     expect(outbox).not.toMatch(/stageOnTransportBranch\s*\(/);
     const site = pushSites.find((s) => s.startsWith(`${OUTBOX}:`));
     const line = outbox.split('\n')[Number(site.split(':')[1]) - 1];
-    expect(line).toMatch(/\['push', '--quiet', '--no-follow-tags', 'origin', `\$\{commit\}:\$\{ref\}`\]/);
+    expect(line).toMatch(/\['push', '--porcelain', '--no-follow-tags', 'origin', `\$\{commit\}:\$\{ref\}`\]/);
   });
 
   it('finds exactly the known push sites per file, so a new one cannot appear unnoticed', () => {

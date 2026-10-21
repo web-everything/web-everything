@@ -77,12 +77,19 @@ const ENTRY_RE = /^\d{15}-\d+-[0-9a-f]+\.json$/;
  *   'refused' — refused for another reason (hook, protection, permissions): provably not landed; do not retry.
  *   'unknown' — no status line: the remote may or may not hold it.
  */
-const STATUS_LINE_RE = /!\s*\[(remote rejected|rejected)\]([^\n|]*)/i;
 const RACE_REASON_RE = /fetch first|non-fast-forward|stale info|cannot lock ref|incorrect old value/i;
-export function classifyPushFailure(e) {
-  const m = STATUS_LINE_RE.exec(`${e?.stderr ?? ''}\n${e?.message ?? ''}`);
-  if (!m) return 'unknown';
-  return RACE_REASON_RE.test(m[2]) ? 'race' : 'refused';
+/**
+ * Round 5: ONLY a `git push --porcelain` status RECORD on STDOUT for the EXACT destination ref counts — a line of the
+ * form `<flag>\t<src>:<dst>\t<summary>`. Diagnostic prose (stderr, `remote:` lines, the formatted message) never does.
+ */
+export function classifyPushFailure(e, ref = 'refs/heads/ops/review-requests') {
+  for (const line of String(e?.stdout ?? '').split(/\r?\n/)) {
+    const m = /^([ +\-*=!])\t([^\t]*):([^\t]+)\t(.*)$/.exec(line);
+    if (!m || m[3] !== ref) continue;
+    if (m[1] !== '!') return 'unknown'; // a non-rejected record for our ref beside a failed exit: never "not landed"
+    return RACE_REASON_RE.test(m[4]) ? 'race' : 'refused';
+  }
+  return 'unknown';
 }
 
 /** A push-phase failure of the flush. `results` holds the entries that DID land before it. */
@@ -144,9 +151,29 @@ const leaseMinutesFor = (budgetMs) => Math.max(5, Math.ceil((2 * budgetMs) / 60_
 
 /** The origin key of `board`: its origin URL, hashed. Run with repo selectors scrubbed, so cwd alone decides. */
 export function originKeyFor({ board, run = defaultGit } = {}) {
-  const url = String(withGitError(run)(['remote', 'get-url', 'origin'], { cwd: board, env: boardEnv(board) })).trim();
+  const url = String(withGitError(run)(['remote', 'get-url', 'origin'], { cwd: board, env: boardEnv(board), timeout: ORIGIN_LOOKUP_TIMEOUT_MS })).trim();
   if (!url) throw new Error(`verdict-ledger-outbox: ${board} has no origin URL`);
-  return createHash('sha256').update(url).digest('hex').slice(0, 16);
+  return createHash('sha256').update(canonicalRemote(url)).digest('hex').slice(0, 16);
+}
+
+/** Bounded: the origin lookup runs before any flush deadline exists. */
+export const ORIGIN_LOOKUP_TIMEOUT_MS = 5_000;
+
+/**
+ * ONE identity per remote, however it is spelled (round 5: `https://github.com/o/r.git` and `git@github.com:o/r`
+ * must share one outbox, or the backstop never visits one of them). host lowercased, user/port/protocol, `.git` and
+ * trailing slashes dropped. A local path stays a resolved path.
+ */
+export function canonicalRemote(url) {
+  const u = String(url ?? '').trim();
+  let host = null;
+  let path = null;
+  const scp = /^(?:[^@/]+@)?([^:/]+):(?!\/)(.+)$/.exec(u);
+  const proto = /^[a-z][a-z0-9+.-]*:\/\/(?:[^@/]+@)?([^/:]+)(?::\d+)?\/(.+)$/i.exec(u);
+  if (proto) { host = proto[1]; path = proto[2]; }
+  else if (scp && !/^[a-zA-Z]:[\\/]/.test(u)) { host = scp[1]; path = scp[2]; }
+  if (!host) return `file:${resolve(u.replace(/^file:\/\//, ''))}`.replace(/\.git$/, '').replace(/\/+$/, '');
+  return `${host.toLowerCase()}/${path.replace(/\/+$/, '').replace(/\.git$/, '')}`.toLowerCase();
 }
 
 /**
@@ -173,6 +200,13 @@ function fsyncDir(dir) {
   try { fd = openSync(dir, 'r'); fsyncSync(fd); }
   catch (e) { if (!FSYNC_UNSUPPORTED.has(e?.code)) throw e; }
   finally { if (fd !== null) try { closeSync(fd); } catch { /* closed */ } }
+}
+
+/** `dir` and every ancestor of it, innermost first, up to the filesystem root. */
+function ancestry(dir) {
+  const out = [];
+  let d = resolve(dir);
+  for (;;) { out.push(d); const up = dirname(d); if (up === d) return out; d = up; }
 }
 
 /** mkdir -p that also fsyncs every directory it created (and the parent of the topmost), so a crash keeps them. */
@@ -214,9 +248,9 @@ export function enqueueOutboxEntry(dir, entry, { now = Date.now, log = defaultLo
   }
   // Visible to flushers from the rename on, so it can no longer be reported "not queued"; a crash before the next
   // flush could still lose it, which is a write miss and is said so.
-  // EVERY enqueue syncs the entry's directory AND its two ancestors (audit round 4: another writer may have created
-  // the hierarchy and not synced it yet; existence proves nothing about durability).
-  try { for (const d of [dir, dirname(dir), dirname(dirname(dir))]) fsyncDir(d); }
+  // EVERY enqueue syncs the entry's directory AND EVERY ancestor up to the filesystem root (rounds 4-5: another writer
+  // may have created any level of the hierarchy and not synced it yet; existence proves nothing about durability).
+  try { for (const d of ancestry(dir)) fsyncDir(d); }
   catch (e) { log(`ledger-write-miss: verdict-ledger outbox directory fsync under ${dir} failed after queuing ${name} (${e?.message ?? e}); the entry is queued but may not survive a host crash`); }
   return name;
 }
@@ -341,10 +375,10 @@ function readBlobAt(run, board, tip, path, env) {
  * A failure of the PUSH command itself carries `phase: 'publish'` and the `commit`, so the caller can reconcile:
  * a push can land on the remote and still report failure (a dropped connection after the remote accepted it).
  */
-function pushBatch({ board, branch, entries, run, allowRef }) {
+function pushBatch({ board, branch, entries, run, allowRef, sleep = undefined }) {
   const ref = assertPushRef(branch, allowRef);
   const env = boardEnv(board);
-  retryTransientGit(() => run(['fetch', '--quiet', 'origin', trackingRefspec(branch)], { cwd: board, env }));
+  retryTransientGit(() => run(['fetch', '--quiet', 'origin', trackingRefspec(branch)], { cwd: board, env }), sleep ? { sleep } : {});
   const tip = String(run(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}^{commit}`], { cwd: board, env })).trim();
   if (!/^[0-9a-f]{40,64}$/.test(tip)) throw new Error(`verdict-ledger-outbox: origin/${branch} did not resolve to a commit`);
 
@@ -393,7 +427,7 @@ function pushBatch({ board, branch, entries, run, allowRef }) {
     const commit = String(run(['commit-tree', tree, '-p', tip, '-m', message || 'verdict-ledger: append'], { cwd: board, env: idx })).trim();
     try {
       // A FULL ref, never forced, never a local branch: the remote alone decides whether this lands.
-      run(['push', '--quiet', '--no-follow-tags', 'origin', `${commit}:${ref}`], { cwd: board, env });
+      run(['push', '--porcelain', '--no-follow-tags', 'origin', `${commit}:${ref}`], { cwd: board, env });
     } catch (e) {
       e.phase = 'publish';
       e.commit = commit;
@@ -451,8 +485,15 @@ function flushHeldInner({ board, branch, dir, owner, run: rawRun, now, sleep, ra
       e.budget = true;
       throw e;
     }
-    return rawRun(args, { timeout: Math.max(1_000, Math.min(GIT_CALL_TIMEOUT_MS, left)), ...opts });
+    try {
+      return rawRun(args, { timeout: Math.max(1, Math.min(GIT_CALL_TIMEOUT_MS, left)), ...opts });
+    } catch (e) {
+      // A call cut off by (or ending past) the deadline is a SPENT BUDGET, not a verdict on the remote.
+      if (Date.now() >= hardDeadline && e && typeof e === 'object' && e.phase !== 'publish') { try { e.budget = true; } catch { /* frozen */ } }
+      throw e;
+    }
   };
+  const clampedSleep = (ms) => sleep(Math.max(0, Math.min(ms, hardDeadline - Date.now())));
   const errors = [];
   let attempts = 0;
   let pushed = false;
@@ -488,14 +529,14 @@ function flushHeldInner({ board, branch, dir, owner, run: rawRun, now, sleep, ra
       }
       attempts += 1;
       try {
-        landed = pushBatch({ board, branch, entries, run, allowRef });
+        landed = pushBatch({ board, branch, entries, run, allowRef, sleep: clampedSleep });
         break;
       } catch (e) {
         errors.push(e);
-        const verdictOf = e?.phase === 'publish' ? classifyPushFailure(e) : 'pre-push';
+        const verdictOf = e?.phase === 'publish' ? classifyPushFailure(e, assertPushRef(branch, allowRef)) : 'pre-push';
         const race = verdictOf === 'race';
-        if (e?.budget) {
-          throw new OutboxFlushError(String(e.message), { errors, attempts, results, kind: 'budget' });
+        if (e?.budget && e?.phase !== 'publish') {
+          throw new OutboxFlushError(`verdict-ledger-outbox: flush budget ${budgetMs}ms spent before the push (${String(e.message).split('\n')[0]})`, { errors, attempts, results, kind: 'budget' });
         }
         if (verdictOf === 'unknown') {
           // A TRANSPORT failure during the push (no answer from the remote): it may have landed, or may still land
@@ -715,11 +756,14 @@ export function appendViaOutbox(o) {
   const originKey = o.originKey ?? originKeyFor({ board: c.board, run: c.run });
   const entry = { board: resolve(c.board), branch: c.branch, path, repo, message, lines, ids, originKey };
   const queued = (attempts = 0) => ({ status: 'appended', queued: true, rows: lines.length, duplicates: 0, attempts, outboxDir: c.dir });
+  const appendDeadline = Date.now() + c.budgetMs; // ONE budget for the whole append, re-check included (round 5)
   const recheck = () => {
     // A row queued after our last empty check but before the release would otherwise wait for the next writer.
+    const left = appendDeadline - Date.now();
+    if (left <= 0) return; // budget spent: the next append or the daemon backstop picks it up
     try {
       if (listOutboxEntries(c.dir).length) {
-        const again = flushLedgerOutbox({ ...o, settings: undefined, originKey, budgetMs: c.budgetMs, staleMs: c.staleMs });
+        const again = flushLedgerOutbox({ ...o, settings: undefined, originKey, budgetMs: left, staleMs: c.staleMs });
         if (!again.ok) c.log(`verdict-ledger-outbox: post-release flush failed: ${again.error}`);
       }
     } catch (e) { c.log(`verdict-ledger-outbox: post-release flush failed: ${e?.message ?? e}`); }
@@ -821,6 +865,7 @@ export function appendDirect(o) {
   const entry = { path: o.path, repo: o.repo, message: o.message, lines: o.lines, ids: o.ids };
   const errors = [];
   let unresolved = false; // ANY earlier push without an answer keeps the outcome indeterminate, whatever follows
+  const directDeadline = Date.now() + c.budgetMs;
   for (let attempt = 1; ; attempt += 1) {
     try {
       const out = pushBatch({ board: c.board, branch: c.branch, entries: [{ name: 'direct', entry }], run: c.run, allowRef: c.allowRef });
@@ -828,14 +873,14 @@ export function appendDirect(o) {
       return { status: 'appended', attempts: attempt, rows: mine.rows, duplicates: mine.duplicates };
     } catch (e) {
       errors.push(e);
-      if (e?.phase === 'publish' && classifyPushFailure(e) === 'unknown') {
+      if (e?.phase === 'publish' && classifyPushFailure(e, assertPushRef(c.branch, c.allowRef)) === 'unknown') {
         if (reconcilePush({ board: c.board, branch: c.branch, run: c.run, commit: e.commit }) === true) {
           c.log(`verdict-ledger: push reported failure but ${e.commit} is on the remote; counted as landed`);
           return { status: 'appended', attempts: attempt, rows: entry.lines.length, duplicates: 0 };
         }
         unresolved = true;
       }
-      if (attempt >= attempts) {
+      if (attempt >= attempts || Date.now() >= directDeadline) {
         const unknown = unresolved;
         // CI has no durable queue to fall back on: a transport failure DURING the push is reported as an UNKNOWN
         // outcome, never as a proven miss. Rows carry event ids, so the caller's retry can never duplicate.
@@ -877,9 +922,26 @@ async function runBackstopCli(argv) {
       boards = [...new Set(arg('repos').split(',').filter(Boolean).map((r) => { try { return resolveLedgerBoard(r); } catch { return null; } }).filter(Boolean))];
     }
   } catch (e) { defaultLog(`ledger-write-miss: verdict-ledger outbox backstop could not resolve its boards (${e?.message ?? e})`); }
+  const visited = new Set();
+  const roots = new Set();
   for (const board of boards) {
     const r = flushBoardLedgerOutbox({ board });
+    if (r.dir) { visited.add(resolve(r.dir)); roots.add(dirname(resolve(r.dir))); }
     if (r.flushed || r.ok === false) defaultLog(`verdict-ledger-outbox: backstop flush ${JSON.stringify(r)}`);
+  }
+  // Round 5: a queue NO resolved board maps to is never silently skipped — it is reported, loudly once stale.
+  for (const root of roots) {
+    let subdirs = [];
+    try { subdirs = readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => join(root, d.name)); } catch { continue; }
+    for (const d of subdirs) {
+      if (visited.has(resolve(d))) continue;
+      const age = oldestAgeMs(d, Date.now());
+      if (!age.count) continue;
+      const settings = resolveOutboxSettings({ repo: readSettings(), env: process.env });
+      defaultLog(age.ageMs > settings.staleMs
+        ? staleLine(d, age, 'no local board for this remote; nothing on this host can flush it')
+        : `verdict-ledger-outbox: ${d} holds ${age.count} entr${age.count === 1 ? 'y' : 'ies'} for a remote no resolved board matches`);
+    }
   }
 }
 // No top-level await: this module is imported by the io-shell, and must stay a plain synchronous module.

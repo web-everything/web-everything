@@ -124,6 +124,7 @@ export function withGitError(run) {
       const error = new Error(`git ${args.join(' ')} failed: ${reason}`, { cause });
       error.status = cause?.status;
       error.stderr = cause?.stderr;
+      error.stdout = cause?.stdout; // `push --porcelain` writes its per-ref status records here
       throw error;
     }
   };

@@ -46,7 +46,11 @@ describe('appendLedgerRows: bounded retry, loud on exhaustion', () => {
   const failing = (n) => {
     let pushes = 0;
     const run = (args) => {
-      if (args[0] === 'push') { pushes += 1; if (pushes <= n) throw new Error('! [rejected] non-fast-forward'); }
+      if (args[0] === 'push') {
+        pushes += 1;
+        // A real lost race: git's `--porcelain` status record for the ledger ref, on stdout.
+        if (pushes <= n) throw Object.assign(new Error('Command failed'), { stdout: `!\tHEAD:refs/heads/ops/review-requests\t[rejected] (non-fast-forward)\n`, stderr: 'error: failed to push some refs\n', status: 1 });
+      }
       // The plumbing append (2026-10-21): every object-producing call answers an object id; nothing else matters.
       return ['rev-parse', 'hash-object', 'write-tree', 'commit-tree'].includes(args[0]) ? `${'a'.repeat(40)}\n` : '';
     };
@@ -108,7 +112,7 @@ describe('appendLedgerRows: bounded retry, loud on exhaustion', () => {
       appendLedgerRows(base({ run }));
       const push = calls.find((a) => a[0] === 'push');
       // A plumbing commit pushed by its object id to the ONE full ref (2026-10-21); no local branch, no worktree.
-      expect(push).toEqual(['push', '--quiet', '--no-follow-tags', 'origin', `${'a'.repeat(40)}:refs/heads/ops/review-requests`]);
+      expect(push).toEqual(['push', '--porcelain', '--no-follow-tags', 'origin', `${'a'.repeat(40)}:refs/heads/ops/review-requests`]);
       expect(calls.some((a) => a[0] === 'worktree' || a[0] === 'checkout')).toBe(false);
       for (const a of calls.filter((c) => c[0] === 'push').flat()) expect(a).not.toMatch(/^(-f|--force.*|\+.*)$/);
     });
