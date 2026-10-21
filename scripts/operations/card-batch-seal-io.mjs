@@ -86,8 +86,8 @@ export async function publishBatch(input, opts = {}) {
     };
     if (state.sealFailure) { retire(); return { action: 'held', state }; }
     if (state.seal?.step === 'label-on-green') { retire(); return { action: 'sealed', state }; }
-    // A capacity pause is honoured by every caller, not only the tick: the retry belongs to `sealDueBatches`.
-    if (state.verifyRetryAfter && now() < Date.parse(state.verifyRetryAfter)) return { action: 'deferred', state };
+    // A capacity pause is honoured by every caller until `sealDueBatches` re-arms it (that is where the free-slot check lives).
+    if (state.verifyRetryAfter) return { action: 'deferred', state };
     const restoreProtection = async () => {
       if (!state.restoreProtection) return;
       await gh(['pr', 'edit', String(state.pr), '--repo', repo, '--add-label', HOLD_LABEL]);
@@ -270,12 +270,14 @@ async function heavyQueueFree(read) {
   try { return (await read())?.freeCount > 0; } catch { return false; }
 }
 /** Clear the unrun count and pause under the batch lease so a running worker is never raced. */
-function rearmVerify(path, now) {
+function rearmVerify(path, now, seen) {
   const lockPath = `${path}.lock`;
   const lease = acquireLease(lockPath, `rearm:${process.pid}:${randomUUID()}`, now, 60_000);
   if (!lease) return false;
   try {
     const state = readState(path);
+    // Revalidate under the lease: a worker may have renewed the pause (or replaced the batch) since the scan.
+    if (state.batchRef !== seen.batchRef || state.verifyRetryAfter !== seen.verifyRetryAfter || state.sealFailure) return false;
     delete state.verifyUnrun; delete state.verifyRetryAfter; delete state.verifyUnrunReason;
     atomicRecord(path, state);
     return true;
@@ -305,7 +307,7 @@ export async function sealDueBatches({ now = Date.now(), stateDir = CARD_BATCH_S
       if (state.verifyRetryAfter && !state.sealFailure) {
         // Verify could not run (capacity): wait out the pause, then re-arm only when the heavy queue has a free slot.
         if (now < Date.parse(state.verifyRetryAfter) || !(await heavyQueueFree(readHeavyQueue))) continue;
-        if (!rearmVerify(path, now)) continue;
+        if (!rearmVerify(path, now, state)) continue;
       }
       // Any seal reason launches (count beats age in shouldSeal); the lease serialises the worker against inline sealing.
       // A PR whose hold was never confirmed relaunches too, so the unheld-draft window closes without waiting for a seal.
