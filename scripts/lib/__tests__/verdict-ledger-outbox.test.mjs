@@ -20,7 +20,7 @@ import {
 import {
   flushLedgerOutbox, listOutboxEntries, outboxLockRoot, OUTBOX_LOCK_PATH, resolveOutboxSettings, formatOutboxSettings,
   OUTBOX_ENV, OUTBOX_DIR_ENV, enqueueOutboxEntry, spawnBoardLedgerOutboxFlush, spawnLedgerOutboxBackstop,
-  resetLedgerOutboxBackstopThrottle, classifyPushFailure, canonicalRemote,
+  resetLedgerOutboxBackstopThrottle, classifyPushFailure, canonicalRemote, defaultOutboxRoot,
 } from '../verdict-ledger-outbox.mjs';
 import { withGitErrorForTest } from '../git-transport-branch.mjs';
 import { reserve, makeLockEntry } from '../../readiness/file-locks.mjs';
@@ -340,6 +340,12 @@ describe('real git: outbox + plumbing flush', () => {
     expect(canonicalRemote('ssh://git@host/team/Repo.git')).not.toBe(canonicalRemote('ssh://git@host/team/repo.git'));
     expect(canonicalRemote('/srv/repos/example')).not.toBe(canonicalRemote('/srv/repos/example.git'));
     expect(canonicalRemote('../origin.git', '/a/board')).toBe(canonicalRemote('/a/origin.git'));
+    // Round 7: on a generic host, home-relative and absolute SSH paths are DIFFERENT repositories...
+    expect(canonicalRemote('host:repo.git')).not.toBe(canonicalRemote('ssh://host/repo.git'));
+    expect(canonicalRemote('host:/repo.git')).toBe(canonicalRemote('ssh://host/repo.git'));
+    expect(canonicalRemote('host:/repo.git').startsWith('file:')).toBe(false);
+    // ...while a flat-namespace provider folds them.
+    expect(canonicalRemote('git@github.com:o/r.git')).toBe(canonicalRemote('ssh://git@github.com/o/r'));
   });
 
   it('an unanswered push whose noise mentions "cannot lock ref" is still UNKNOWN: kept queued, never thrown', async () => {
@@ -375,6 +381,25 @@ describe('real git: outbox + plumbing flush', () => {
       for (const t of timeouts) expect(t).toBeLessThanOrEqual(1500);
       for (const ms of slept) expect(ms).toBeLessThanOrEqual(1500);
     });
+  });
+
+  it('rows land in APPEND order: a later verdict never lands before an older queued one (round 7)', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const outboxDir = join(ctx.tmp, 'outbox');
+      const older = buildVerdictRecord({ repo: REPO, pr: 77, verdict: 'accepted', at: '2026-10-21T12:00:00.000Z', source: 'test' });
+      const newer = buildVerdictRecord({ repo: REPO, pr: 77, verdict: 'changes', at: '2026-10-21T12:05:00.000Z', source: 'test' });
+      // The older verdict was queued by a lock loser; then a later append wins the lock.
+      enqueueOutboxEntry(outboxDir, { path: ledgerGitPath(REPO), repo: REPO, message: 'm', ...checkLedgerAppendRows([older], REPO) }, { now: () => Date.now() - 1000 });
+      appendLedgerRows({ board: ctx.clone, repo: REPO, records: [newer], outbox: true, outboxDir, log: quiet });
+      const verdicts = ctx.showOnOrigin(LEDGER_TRANSPORT_BRANCH, ledgerGitPath(REPO)).trim().split('\n').map((l) => JSON.parse(l).verdict);
+      expect(verdicts).toEqual(['accepted', 'changes']);
+    });
+  });
+
+  it('the backstop always scans its own workspace outbox root, from a primary-checkout layout too (round 7)', () => {
+    expect(defaultOutboxRoot('/w/repo/scripts/lib/verdict-ledger-outbox.mjs')).toBe('/w/.operations/verdict-ledger-outbox');
+    expect(defaultOutboxRoot('/w/.lanes/web-everything/lane-3/scripts/lib/verdict-ledger-outbox.mjs')).toBe('/w/.operations/verdict-ledger-outbox');
   });
 
   it('the plumbing push never follows tags', async () => {

@@ -167,26 +167,34 @@ export const ORIGIN_LOOKUP_TIMEOUT_MS = 5_000;
  * must share one outbox, or the backstop never visits one of them). host lowercased, user/port/protocol, `.git` and
  * trailing slashes dropped. A local path stays a resolved path.
  */
+/** Hosts whose `host:o/r`, `host:/o/r` and `https://host/o/r` all name ONE repository. */
+const FLAT_PATH_HOSTS = new Set(['github.com', 'ssh.github.com', 'gitlab.com', 'bitbucket.org']);
 export function canonicalRemote(url, base = process.cwd()) {
   // Round 6: merge ONLY spellings of the same endpoint — protocol, user, the scheme's default port, a trailing slash
   // and a trailing `.git` on a HOSTED path. The host is case-folded (DNS); the path keeps its case; a non-default port
   // stays part of the identity; a LOCAL path is resolved against the board and kept exactly (no `.git` folding).
+  // Round 7: an scp-style `host:path` is relative to the remote user's HOME (`~/path`), `ssh://host/path` and
+  // `host:/path` are ABSOLUTE — different repositories on a generic host. Only providers whose paths are known to be
+  // flat (one namespace, whatever the spelling) fold the two.
   const u = String(url ?? '').trim();
-  const proto = /^([a-z][a-z0-9+.-]*):\/\/(?:[^@/]+@)?(\[[^\]]+\]|[^/:]+)(?::(\d+))?\/(.+)$/i.exec(u);
-  const scp = /^(?:[^@/]+@)?([^:/]+):(?!\/)(.+)$/.exec(u);
+  const proto = /^([a-z][a-z0-9+.-]*):\/\/(?:[^@/]+@)?(\[[^\]]+\]|[^/:]+)(?::(\d+))?(\/.*)$/i.exec(u);
+  const scp = /^(?:[^@/]+@)?([^:/\\]+):(.+)$/.exec(u);
   let host = null;
   let port = null;
   let path = null;
   if (proto && proto[1].toLowerCase() !== 'file') {
     const scheme = proto[1].toLowerCase();
-    host = proto[2]; path = proto[4];
+    host = proto[2]; path = proto[4]; // absolute
     const defaults = { ssh: '22', 'git+ssh': '22', 'ssh+git': '22', https: '443', http: '80', git: '9418' };
     port = proto[3] && proto[3] !== defaults[scheme] ? proto[3] : null;
-  } else if (!proto && scp && !/^[a-zA-Z]:[\\/]/.test(u)) {
-    host = scp[1]; path = scp[2];
+  } else if (!proto && scp && !/^[a-zA-Z]:[\\/]/.test(u) && !u.startsWith('/') && !u.startsWith('.')) {
+    host = scp[1];
+    path = scp[2].startsWith('/') ? scp[2] : `~/${scp[2]}`;
   }
   if (!host) return `file:${resolve(base, u.replace(/^file:\/\//, '')).replace(/\/+$/, '')}`;
-  return `${host.toLowerCase()}${port ? `:${port}` : ''}/${path.replace(/\/+$/, '').replace(/\.git$/, '')}`;
+  host = host.toLowerCase();
+  if (FLAT_PATH_HOSTS.has(host)) path = `/${path.replace(/^~\//, '').replace(/^\/+/, '')}`;
+  return `${host}${port ? `:${port}` : ''}${path.startsWith('/') ? '' : '/'}${path.replace(/\/+$/, '').replace(/\.git$/, '')}`;
 }
 
 /**
@@ -503,7 +511,7 @@ function flushHeldInner({ board, branch, dir, owner, run: rawRun, now, sleep, ra
     if (now() >= deadline) { stopped = 'budget'; break; }
     const names = listOutboxEntries(dir);
     if (!names.length && !memory.length) break;
-    const entries = [...memory];
+    const entries = [];
     let ioError = null;
     for (const name of names) {
       const r = readEntry(dir, name, log);
@@ -516,6 +524,11 @@ function flushHeldInner({ board, branch, dir, owner, run: rawRun, now, sleep, ra
       }
       entries.push({ name, entry: r.entry });
     }
+    // ROUND 7: rows land in APPEND order, whatever their source. The ledger fold is order-sensitive (a later verdict
+    // supersedes an earlier one), so this caller's own in-memory rows must never jump ahead of rows queued before
+    // its call. Names start with the append time, so one sort orders disk and memory entries alike.
+    entries.push(...memory);
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     if (ioError) log(`verdict-ledger-outbox: some entries in ${dir} are unreadable right now (${ioError.message}); left in place for a later flush`);
     if (!entries.length) { stopped = ioError ? 'io' : 'nothing-flushable'; break; }
     let landed = null;
@@ -691,6 +704,10 @@ export function spawnLedgerOutboxBackstop({ repos = [], intervalMs = DEFAULT_BAC
     return { ok: false, flushed: 0, error: msg };
   }
 }
+/** The outbox root the backstop always scans for THIS checkout (its workspace's shared `.operations`). */
+export function defaultOutboxRoot(moduleFile = THIS_FILE) {
+  return join(workspaceFor(resolve(dirname(moduleFile), '..', '..')), '.operations', 'verdict-ledger-outbox');
+}
 /** Test seam: forget the throttle. */
 export function resetLedgerOutboxBackstopThrottle() { lastBackstopAt = -Infinity; }
 
@@ -770,7 +787,8 @@ export function appendViaOutbox(o) {
   let owner = tryLock(c.dir, c.budgetMs);
   if (owner) {
     // ── LOCK WON: our rows stay in memory. ──
-    const SELF = '(this append)';
+    // Named like a queue entry, stamped with THIS call's time, so it sorts after everything queued before it.
+    const SELF = `${String(Math.max(0, Math.trunc(c.now()))).padStart(15, '0')}-${process.pid}-memory.json`;
     let result = null;
     let failure = null;
     try { result = flushHeld({ ...c, owner, originKey, inMemory: [{ name: SELF, entry }] }); } catch (e) { failure = e; }
@@ -951,7 +969,7 @@ async function runBackstopCli(argv) {
   } catch (e) { defaultLog(`ledger-write-miss: verdict-ledger outbox backstop could not resolve its boards (${e?.message ?? e})`); }
   const visited = new Set();
   // Roots known independently of board resolution: this checkout's workspace and the env override's parent.
-  const roots = new Set([join(workspaceFor(dirname(THIS_FILE)), '.operations', 'verdict-ledger-outbox')]);
+  const roots = new Set([defaultOutboxRoot()]);
   if (process.env[OUTBOX_DIR_ENV]) roots.add(dirname(resolve(process.env[OUTBOX_DIR_ENV])));
   if (!boards.length) defaultLog(`verdict-ledger-outbox: backstop resolved NO ledger board${argv[2] === 'flush-repos' ? ` for ${arg('repos') || '(no repos)'}` : ''}; reporting queued outboxes only`);
   for (const board of boards) {
