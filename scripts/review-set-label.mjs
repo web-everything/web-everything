@@ -1132,6 +1132,12 @@ export function runReviewLabelCli({
   const judgedHead = to === 'restamp' ? null : binding('judged-head', /^[0-9a-f]{40}$/, 'expected a full 40-hex lowercase SHA');
   const seenArg = judgedHead === null ? null : binding('seen', /^(?:empty|\d{1,9}:[A-Za-z0-9:._-]{8,128})$/, 'expected "empty" or "<n>:<row id>"');
   const runIdArg = binding('run-id', /^[A-Za-z0-9:._-]{1,128}$/, 'expected 1-128 id characters');
+  // Slice 4: `--seen-keys=<id,id,...>` (may be empty) = EXACTLY the question rows the judge was shown; pinned only,
+  // never together with --seen.
+  const seenKeysRaw = judgedHead === null ? null
+    : binding('seen-keys', /^(?:[A-Za-z0-9:._-]{8,128}(?:,[A-Za-z0-9:._-]{8,128}){0,199})?$/, 'expected a comma list of row ids');
+  if (seenKeysRaw !== null && seenArg !== null && targetClears) fail('invalid --seen-keys — exclusive with --seen');
+  const seenKeysArg = seenKeysRaw === null || seenArg !== null ? null : (seenKeysRaw === '' ? [] : seenKeysRaw.split(','));
   if (to === 'restamp' && flagValue('judged-head') !== null) fail('invalid --judged-head — a restamp judges nothing; use --expect-head');
 
   // we:scripts/review-set-label.mjs#runReviewLabelCli — validate every input BEFORE any gh call (fail closed).
@@ -1817,6 +1823,7 @@ export function runReviewLabelCli({
       headSha,
       judgedHead,
       seen: seenArg,
+      seenKeys: seenKeysArg,
       runId: runIdArg,
       reviewedDiff: normalizeDiffFingerprint(reviewedDiff),
       reviewedContribution: normalizeContributionFingerprint(reviewedDiff),

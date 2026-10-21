@@ -52,24 +52,25 @@ function scopedEvents(events, scope) {
  * computed BESIDE today's and never read by any hold rule or decision. OPT-IN (`settings.bindingShadow: true`): only the
  * drain's ledger shadow asks for it, so no live derive (label mirror, merge-gate check) runs it at all. `legacyApprovals`
  * counts approvals with no judgment boundary (`seen`), which stop answering at cutover. Never throws. BOUNDED: a PR with
- * more than {@link BINDING_SHADOW_MAX_ROWS} rows, {@link BINDING_SHADOW_MAX_BYTES} UTF-8 bytes or 8 carried rows is not
+ * more than `caps.maxRows` rows, `caps.maxBytes` UTF-8 bytes or `caps.maxCarries` carried rows (the `ledgerBinding`
+ * settings shadowMax*, passed in by the drain shadow; these standard values otherwise) is not
  * folded (a capped fold measured ≤ ~0.6 s adversarially); a skipped fold, or one that crashed inside, is `skipped`.
  */
 export const BINDING_SHADOW_MAX_ROWS = 2000;
 export const BINDING_SHADOW_MAX_BYTES = 1_000_000;
 export const BINDING_SHADOW_MAX_CARRIES = 8; // carry checks re-fold prefixes; no writer emits `carried` rows yet
-const tooLarge = (mine) => {
-  if (mine.length > BINDING_SHADOW_MAX_ROWS) return true;
-  if (mine.filter((e) => e.verdict === 'carried').length > BINDING_SHADOW_MAX_CARRIES) return true;
+const tooLarge = (mine, { maxRows = BINDING_SHADOW_MAX_ROWS, maxBytes = BINDING_SHADOW_MAX_BYTES, maxCarries = BINDING_SHADOW_MAX_CARRIES } = {}) => {
+  if (mine.length > maxRows) return true;
+  if (mine.filter((e) => e.verdict === 'carried').length > maxCarries) return true;
   let bytes = 0;
-  for (const e of mine) if ((bytes += Buffer.byteLength(JSON.stringify(e), 'utf8')) > BINDING_SHADOW_MAX_BYTES) return true;
+  for (const e of mine) if ((bytes += Buffer.byteLength(JSON.stringify(e), 'utf8')) > maxBytes) return true;
   return false;
 };
-export function bindingShadow(mine, head, now) {
+export function bindingShadow(mine, head, now, caps) {
   let legacyApprovals = null;
   try {
     legacyApprovals = mine.filter((e) => e.type === EVENT_TYPES.APPROVAL && e.seen === undefined).length;
-    if (tooLarge(mine)) return { skipped: 'too-large', legacyApprovals };
+    if (tooLarge(mine, caps)) return { skipped: 'too-large', legacyApprovals };
     const r = ledgerAt(mine, head, { now });
     if (r.holds.some((h) => h.code === 'fold-crashed')) return { skipped: 'crashed', legacyApprovals };
     return { clears: r.clears, holds: r.holds.map((h) => h.code), base: r.base, humanDependent: r.humanDependent, legacyApprovals };
@@ -152,7 +153,7 @@ function derive(events, facts, settings) {
   try { input = settings.bindingShadow === true ? { head: facts?.head?.sha ?? null, now: facts?.now } : null; }
   catch { return result; } // an unreadable opt-in or fact never touches today's answer
   if (!input) return result;
-  return { ...result, binding: bindingShadow(view.events, input.head, input.now) };
+  return { ...result, binding: bindingShadow(view.events, input.head, input.now, settings.bindingCaps) };
 }
 
 /** A derive that cannot trust its input holds the PR in NEEDS-OPERATOR without consulting the core. */

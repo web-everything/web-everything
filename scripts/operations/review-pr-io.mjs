@@ -62,6 +62,10 @@ import { createReferralGhProvider } from '../lib/review-comment-edit.mjs';
 import { ADVISORY_LABEL_META, advisoryCoversHead, labelNames, planAdvisoryLabels } from '../lib/advisory-labels.mjs';
 // #3007 — the real verdict ledger, behind the reserved `verdict-ledger.append` seam. See the LEDGER sink.
 import { EVENT_TYPES, appendVerdict, buildLedgerEvent, buildVerdictRecord, foldRepo, parseLedgerEvents, verdictForLabelTarget, verdictLedgerPath } from '../lib/verdict-ledger.mjs';
+import { readOpenQuestions } from '../lib/ledger-boundary.mjs';
+import { readLedgerBindingSettings } from '../lib/ledger-binding-settings.mjs';
+/** Slice 4: the seenKeys a sink may forward — only a well-formed key list (else nothing: the row stays unbounded). */
+const okKeys = (v) => (Array.isArray(v) && v.length <= 200 && v.every((k) => typeof k === 'string' && /^[A-Za-z0-9:._-]{8,128}$/.test(k)) ? [...v].sort() : null);
 
 // #5492 rebuild slice 2 — a run id is passed on only when well formed, so a malformed one can never turn a verdict
 // write into a refusal: the row is then written without it.
@@ -233,6 +237,8 @@ export function readPr({
   // Inert under test unless injected: the default reads `gh` and the network.
   readStack = isUnderTest() ? () => null : ({ pr: n, cwd: dir }) => readStackBase({ pr: n, root: dir }),
   stackRead = { files: stackNetFiles, text: stackNetDiffText },
+  // #5492 rebuild slice 4 — the PR's open ledger questions at the reviewed head (settings-gated). Inert under test.
+  readQuestions = isUnderTest() ? () => null : defaultOpenQuestions,
 } = {}) {
   // The net-diff helpers take no `cwd`, so it is baked into the injected `exec` (the drain does the same thing
   // for the opposite reason — see the `escCwd` note in `we:scripts/merge-ai-prs.mjs`).
@@ -379,6 +385,8 @@ export function readPr({
     comments: view.comments,
     net: { ...netPaths, revSha },
     latestFix, deltaReview,
+    // #5492 rebuild slice 4 — rendered to the jurors; its `keys` (exactly what is rendered) become the verdict's `seenKeys`.
+    ledgerQuestions: readQuestionsSafely(readQuestions, { repo, pr, head: revSha }),
     diff: netText,
     ...(stackBase ? { stackBase } : {}),
     // Card 5469 — carried only when the shadow is on (or `on`, card 5470), so an `off` read is byte-identical to before.
@@ -387,6 +395,19 @@ export function readPr({
     // set, so an `off` read is byte-identical to before. An unknown round is `null`: the budget never acts on it.
     ...(budget !== ROUND_BUDGET_OFF ? { roundBudget: budget, reviewRound: readReviewRound({ repo, pr, head: revSha, readLedgerRows }) } : {}),
   };
+}
+
+/** Slice 4: a reader that throws is `unknown` (rendered as such, nothing stamped), never an escaped read-step error. */
+export function readQuestionsSafely(read, args) {
+  try { return read(args); } catch (e) { return { status: 'unknown', why: String(e?.message ?? e).split('\n')[0].slice(0, 120) }; }
+}
+
+/** Slice 4: `ledgerBinding.renderOpenQuestions` off → null (no section, no seenKeys); `writeSeen` off → rendered, no keys. */
+export function defaultOpenQuestions({ repo, pr, head }, { settings = readLedgerBindingSettings, read = readOpenQuestions } = {}) {
+  const { renderOpenQuestions, writeSeen } = settings().value;
+  if (!renderOpenQuestions) return null;
+  const q = read({ repo, pr, head });
+  return writeSeen || q.status !== 'ok' ? q : { ...q, keys: null };
 }
 
 /** The repo's verdict-ledger rows (the default reader for the round count and the shadow). Throws when unreadable. */
@@ -819,7 +840,7 @@ const PRE_WRITE_REFUSALS = Object.freeze([
   // #3334 tests so the two cannot drift into a refusal this list no longer recognises.
   'reasonless bounce:',
   // #5492 rebuild slice 2 — head-binding flag checks and the judged-head refusal all run before the first write.
-  'invalid --judged-head', 'invalid --seen', 'invalid --run-id', 'live head differs from --judged-head',
+  'invalid --judged-head', 'invalid --seen', 'invalid --run-id', 'live head differs from --judged-head', 'invalid --seen-keys',
 ]);
 
 // Keep v1's identity-bearing fields intact: old readers recompute the key from them.
@@ -1552,6 +1573,7 @@ export function createReviewPrSinks({
         // #5492 rebuild slice 2 (W1/W2): the judged head, the judgment boundary and this run's id ride to the row.
         ...(/^[0-9a-f]{40}$/.test(payload.reviewedHead ?? '') ? [`--judged-head=${payload.reviewedHead}`] : []),
         ...(okRunId(ctx?.runId) ? [`--run-id=${ctx.runId}`] : []),
+        ...(okKeys(payload.seenKeys) && /^[0-9a-f]{40}$/.test(payload.reviewedHead ?? '') ? [`--seen-keys=${okKeys(payload.seenKeys).join(',')}`] : []),
       ];
       let stdout = '';
       try {
@@ -1662,6 +1684,7 @@ export function createReviewPrSinks({
         findingCount: Array.isArray(payload.findings) ? payload.findings.length : null,
         judgedHead,
         runId,
+        seenKeys: judgedHead ? okKeys(payload.seenKeys) : null,
       }));
       if (!appended.ok) throw notApplied(`verdict-ledger append refused: ${appended.errors.join('; ')}`);
       return { reconciled: false, path: appended.path, verdict: appended.record.verdict, source: 'operation-reconcile' };
@@ -1687,6 +1710,7 @@ export function createReviewPrSinks({
       // the snapshot SHOWN to the judge, and the jurors are not shown the ledger's questions today (open fork), so these
       // rows stay unbounded — they answer nothing in the binding fold, which holds.
       const binding = okRunId(ctx?.runId) ? { runId: ctx.runId } : {};
+      const runSeen = okKeys(payload.seenKeys); // slice 4: the review-run answers referrals only among what its jurors saw
       const rows = [];
       const written = []; const missed = [];
       const keys = Array.isArray(payload.referralKeys) ? payload.referralKeys : [];
@@ -1711,7 +1735,8 @@ export function createReviewPrSinks({
           out(`ledger-write-skip: ${payload.repo}#${payload.pr} block-sync skipped (${reason}); referral and review-run rows will still be recorded`);
         }
       }
-      if (payload.headSha) rows.push({ type: EVENT_TYPES.REVIEW_RUN, headSha: payload.headSha, phase: 'completed', posted: payload.posted === true, ...binding });
+      if (payload.headSha) rows.push({ type: EVENT_TYPES.REVIEW_RUN, headSha: payload.headSha, phase: 'completed', posted: payload.posted === true, ...binding,
+        ...(runSeen && /^[0-9a-f]{40}$/.test(payload.headSha) ? { seenKeys: runSeen } : {}) });
       // An unpinned or degraded read names no head, so there is nothing to key a row on. That is a skipped write,
       // not a quiet success: say so loudly, the same way a write miss does, so the undercount is never silent.
       if (!payload.headSha) out(`ledger-write-skip: ${payload.repo}#${payload.pr} no pinned head, so no review-run row was recorded for this run (it will not count toward the visit cap); comments, labels and decisions are unaffected`);

@@ -75,7 +75,14 @@ function analyze(raw, now) {
   });
   // The judgment boundary: "n:key" names raw entry n, strictly before this row; "empty" = saw nothing; absent = legacy.
   for (const L of rows) {
-    const s = L.r.seen;
+    const s = L.r.seen, ks = L.r.seenKeys;
+    // Slice 4: `seenKeys` = EXACTLY the question rows its judge was shown (each strictly earlier); never with `seen`.
+    if (ks !== undefined) {
+      const prior = new Set(rawKeys.slice(0, L.pos - 1));
+      if (s === undefined && Array.isArray(ks) && ks.length <= 200 && ks.every(k => typeof k === 'string' && /^[A-Za-z0-9:._-]{8,128}$/.test(k) && prior.has(k))) L.seenKeys = new Set(ks);
+      else faults.push({ code: 'bad-seen', ref: L.key, pos: L.pos });
+      continue;
+    }
     if (s === undefined) continue; // absent = legacy; any supplied value must be "empty" or a valid boundary
     if (s === 'empty') { L.bound = 0; continue; }
     const m = /^(\d+):(.+)$/.exec(typeof s === 'string' ? s : '');
@@ -88,7 +95,7 @@ function analyze(raw, now) {
   for (const L of rows) {
     const { runId } = L.r;
     if (typeof runId !== 'string' || !runId || !['verdict', 'review-run'].includes(L.type)) continue;
-    const head = rawHead(L.r) ?? null, seen = L.r.seen ?? null;
+    const head = rawHead(L.r) ?? null, seen = [L.r.seen ?? null, L.r.seenKeys ?? null];
     const ck = L.type === 'verdict' ? [runId, 'verdict'] : [runId, 'review-run', L.r.phase ?? null];
     const p = json(L.type === 'verdict' ? { verdict: L.r.verdict, head, seen }
       : { head, scope: L.r.scope ?? null, raised: L.r.raised ?? null, seen });
@@ -117,7 +124,7 @@ function analyze(raw, now) {
 }
 
 const isV = (L, v) => L.type === 'verdict' && L.r.verdict === v;
-const sees = (A, Q) => A.bound !== null && Q.pos <= A.bound;
+const sees = (A, Q) => (A.seenKeys ? !!Q && A.seenKeys.has(Q.key) && Q.pos < A.pos : A.bound !== null && !!Q && Q.pos <= A.bound);
 function validApproval(ctx, L, H) {
   if (L.type !== 'approval' || L.head !== H || !APPROVAL_KINDS.has(L.r.approval)) return false;
   const d = L.r.delegation;
@@ -232,7 +239,7 @@ function directPaths(ctx, H, ob, lim) {
   if (ob.code === 'referral') {
     return ctx.rows.filter(run => run.type === 'review-run' && run.r.phase === 'completed' && run.r.scope === 'full' && ok(run)
       && run.postedFrom !== null && run.postedFrom < lim && Array.isArray(run.r.raised) && !run.r.raised.includes(ob.K)
-      && (ob.block === null || run.bound >= ob.block)).map(run => mk(run, false));
+      && (ob.block === null || sees(run, ctx.byPos.get(ob.block)))).map(run => mk(run, false));
   }
   const out = ob.sendBack && ctx.released('send-back', Q.key, Q.pos) ? [{ sig: 'release', byApproval: false, human: false }] : [];
   if (ob.kind !== 'human') out.push(...ctx.rows.filter(A => isV(A, 'accepted') && ok(A)).map(A => mk(A, false)));
@@ -265,7 +272,8 @@ function paths(ctx, H, ob, chain, lim = Infinity) {
 }
 const discharge = (ctx, H, ob, chain) => { const ps = paths(ctx, H, ob, chain); return ps.find(p => !p.human) ?? ps[0] ?? null; };
 
-const hold = (code, reason) => ({ code, reason });
+// `key` (slice 4): the identity of the question row behind a hold, so a reviewer can be shown it and answer exactly it.
+const hold = (code, reason, key) => (key === undefined ? { code, reason } : { code, reason, key });
 
 /** `ledgerAt(rows in git append order, liveHead 40 lowercase hex, { now })` → { clears, holds, base, humanDependent }.
  *  `now` is the delegation clock; a missing or invalid one makes every delegated approval invalid. */
@@ -280,17 +288,17 @@ export function ledgerAt(rows, liveHead, opts) {
     if (!b) holds.push(hold('no-clearance', 'no review, human ceremony, exemption or valid carry at this head'));
     let human = !!b?.human;
     for (const o of perHead(ctx, X)) {
-      if (!o.ans) holds.push(hold(o.code, `unanswered ${o.code} at row ${o.pos}`));
+      if (!o.ans) holds.push(hold(o.code, `unanswered ${o.code} at row ${o.pos}`, ctx.byPos.get(o.pos)?.key));
       else human ||= o.ans.byApproval;
     }
     for (const Q of ctx.rows) {
       if (Q.type === 'hold' && !ctx.released(Q.r.holdSource, Q.r.reasonCode, Q.pos)) {
-        holds.push(hold(`hold:${Q.r.holdSource}:${Q.r.reasonCode}`, `operational hold at row ${Q.pos}`));
+        holds.push(hold(`hold:${Q.r.holdSource}:${Q.r.reasonCode}`, `operational hold at row ${Q.pos}`, Q.key));
       }
     }
     for (const ob of [...prLevel(ctx), ...occurrences(ctx)]) {
       const d = discharge(ctx, X, ob, root);
-      if (!d) holds.push(hold(ob.code, `unanswered ${ob.code}${ob.K ? ` ${String(ob.K).slice(0, 16)}` : ''} at row ${ob.pos}`));
+      if (!d) holds.push(hold(ob.code, `unanswered ${ob.code}${ob.K ? ` ${String(ob.K).slice(0, 16)}` : ''} at row ${ob.pos}`, ctx.byPos.get(ob.pos)?.key));
       else human ||= d.human;
     }
     return { clears: holds.length === 0, holds, base: b?.kind ?? null, humanDependent: human };

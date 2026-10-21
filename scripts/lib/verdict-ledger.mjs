@@ -338,8 +338,21 @@ const FULL_SHA_RE = /^[0-9a-f]{40}$/;
 /** READ side of a binding field on a non-verdict event: NEVER invalidates the row (a malformed one must not make today's
  *  tolerant parser drop a hold), kept as a string ('' when not one) for the binding fold to judge. */
 const keptBinding = (max) => (v) => (v === undefined ? undefined : typeof v === 'string' ? v.slice(0, max) : '');
-const bindingOf = (seen, runId, what, judgedHead = null) => {
+/** Slice 4: the read side of `seenKeys` — kept as given ('' when not an array), the fold judges it. Never invalidates. */
+const SEEN_KEYS_MAX = 200;
+const SEEN_KEY_RE = /^[A-Za-z0-9:._-]{8,128}$/;
+// Never REPAIRED: an over-long list or any malformed key keeps the whole field invalid ('' → bad-seen in the fold).
+const keptKeys = (v) => (v === undefined ? undefined
+  : Array.isArray(v) && v.length <= SEEN_KEYS_MAX && v.every((k) => typeof k === 'string' && SEEN_KEY_RE.test(k)) ? [...v] : '');
+const bindingOf = (seen, runId, what, judgedHead = null, seenKeys = null) => {
   const out = {};
+  if (seenKeys != null) {
+    if (!Array.isArray(seenKeys) || seenKeys.length > SEEN_KEYS_MAX || !seenKeys.every((k) => typeof k === 'string' && /^[A-Za-z0-9:._-]{8,128}$/.test(k))) {
+      throw new TypeError(`verdict-ledger: bad \`seenKeys\` on ${what}`);
+    }
+    if (seen != null) throw new TypeError(`verdict-ledger: \`seen\` and \`seenKeys\` are exclusive on ${what}`);
+    out.seenKeys = [...seenKeys].sort();
+  }
   if (judgedHead != null) { if (typeof judgedHead !== 'string' || !FULL_SHA_RE.test(judgedHead)) throw new TypeError(`verdict-ledger: bad \`judgedHead\` on ${what}: ${JSON.stringify(judgedHead)}`); out.judgedHead = judgedHead; }
   if (seen != null) { if (typeof seen !== 'string' || !SEEN_RE.test(seen)) throw new TypeError(`verdict-ledger: bad \`seen\` on ${what}: ${JSON.stringify(seen)}`); out.seen = seen; }
   if (runId != null) { if (typeof runId !== 'string' || !RUN_ID_RE.test(runId)) throw new TypeError(`verdict-ledger: bad \`runId\` on ${what}: ${JSON.stringify(runId)}`); out.runId = runId; }
@@ -386,7 +399,7 @@ export function buildVerdictRecord({
   repo, pr, verdict, at, reason = '',
   headSha = null, reviewedDiff = null, reviewedContribution = null,
   declaredActor = '', session = '', channel = '', independence = null,
-  source, writer = '', findingCount = null, mode, wouldClear, seen = null, runId = null, judgedHead = null,
+  source, writer = '', findingCount = null, mode, wouldClear, seen = null, runId = null, judgedHead = null, seenKeys = null,
 } = {}) {
   if (typeof repo !== 'string' || !REPO_RE.test(repo)) {
     throw new TypeError(`verdict-ledger: \`repo\` must be <owner/name>, got ${JSON.stringify(repo)}`);
@@ -433,7 +446,7 @@ export function buildVerdictRecord({
     writer: oneLine(writer || processWriterId(), 128),
   };
   if (Number.isInteger(findingCount) && findingCount >= 0) record.findingCount = findingCount;
-  Object.assign(record, bindingOf(seen, runId, 'a verdict', judgedHead));
+  Object.assign(record, bindingOf(seen, runId, 'a verdict', judgedHead, seenKeys));
   if (mode !== undefined || wouldClear !== undefined) {
     if (mode !== 'shadow' || verdict !== VERDICTS.OBSERVED || typeof wouldClear !== 'boolean') {
       throw new TypeError('verdict-ledger: shadow predictions require observed, mode: shadow and boolean wouldClear');
@@ -502,6 +515,7 @@ export function validateVerdictRecord(raw) {
   // Kept verbatim when present (any type): the binding fold, not this reader, decides whether it is well formed.
   if (raw.seen !== undefined) record.seen = typeof raw.seen === 'string' ? raw.seen.slice(0, 300) : '';
   if (raw.runId !== undefined) record.runId = typeof raw.runId === 'string' ? raw.runId.slice(0, 128) : '';
+  if (raw.seenKeys !== undefined) record.seenKeys = keptKeys(raw.seenKeys);
   if (raw.judgedHead !== undefined) record.judgedHead = typeof raw.judgedHead === 'string' ? raw.judgedHead.slice(0, 64) : '';
   if (shadow) Object.assign(record, { mode: 'shadow', wouldClear: raw.wouldClear, applied: false, mutated: false });
   if ('id' in raw) record.id = raw.id;
@@ -615,6 +629,7 @@ const EVENT_PAYLOAD = Object.freeze({
     ['posted', (v) => v === null || typeof v === 'boolean', (v) => v],
     ['seen', () => true, keptBinding(300)],
     ['runId', () => true, keptBinding(128)],
+    ['seenKeys', () => true, keptKeys],
   ],
   [EVENT_TYPES.HOLD]: [
     ['reasonCode', isStr, (v) => oneLine(v, 128)],
@@ -692,7 +707,7 @@ export function buildLedgerEvent({
   // The WRITE side is strict (a writer never emits a malformed binding field); the read side keeps any it finds.
   const names = new Set(spec.map(([name]) => name));
   bindingOf(names.has('seen') ? payload.seen : null, names.has('runId') ? payload.runId : null, `a ${type} event`,
-    names.has('judgedHead') ? payload.judgedHead : null);
+    names.has('judgedHead') ? payload.judgedHead : null, names.has('seenKeys') ? payload.seenKeys : null);
   const candidate = {
     v: LEDGER_EVENT_VERSION,
     kind: VERDICT_LEDGER_KIND,
@@ -780,7 +795,9 @@ export function ledgerEventId(row) {
   const v = validateLedgerEvent(row);
   if (!v.valid) throw new TypeError(`invalid ledger event: ${v.errors.join('; ')}`);
   if (v.record.id) return v.record.id;
-  const { id: _id, unlocked: _unlocked, ...record } = v.record;
+  // #5492 rebuild: the head-binding fields (seen, seenKeys, runId, judgedHead) are not identity either, so an id-less
+  // row's identity — which today's readers match against (label-input clearanceBaseline) — is what it was before them.
+  const { id: _id, unlocked: _unlocked, seen: _s, seenKeys: _k, runId: _r, judgedHead: _j, ...record } = v.record;
   const canonical = (value) => {
     if (Array.isArray(value)) return value.map(canonical);
     if (value && typeof value === 'object') {
