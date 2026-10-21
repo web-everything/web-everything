@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /** Standalone merge watcher. --watch polls every minute; one-shot mode is scheduler-friendly.
  * GitHub merged_at is the landed confirmation; no drain mutation or shared conveyor-file edit.
- * Cursor advances after each item succeeds or is quarantined; receipts and retries survive restarts.
+ * Receipts and retries persist per item. The cursor advances once at batch end,
+ * only when no non-quarantined error remains; otherwise the discovery window is retained.
  */
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
