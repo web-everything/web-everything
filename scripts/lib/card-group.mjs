@@ -309,10 +309,15 @@ function readEntry({ ref, path, cwd, run, norm }) {
   let text;
   try { text = Buffer.isBuffer(r.stdout) ? utf8.decode(r.stdout) : String(r.stdout ?? ''); }
   catch { throw new Error(`${path} at ${String(ref).slice(0, 10)} is not valid UTF-8 text`); }
-  return { lines: splitLines(text).map(norm), mode, eol: text === '' || text.endsWith('\n') };
+  // A leading BOM is a property of the file like its mode, not part of line 1 (that would make the first line
+  // a different line and upset the order proof); `bom` carries it.
+  const bom = text.startsWith('﻿');
+  const body = bom ? text.slice(1) : text;
+  return { lines: splitLines(body).map(norm), mode, eol: body === '' || body.endsWith('\n'), bom };
 }
 /** PURE: what a source sets beyond its lines: `mode` / `eol` when its head differs from its merge base (else null). */
-const metaChange = (from, to) => ({ mode: from?.mode === to.mode ? null : to.mode, eol: from && from.eol === to.eol ? null : to.eol });
+const metaChange = (from, to) => ({ mode: from?.mode === to.mode ? null : to.mode, eol: from && from.eol === to.eol ? null : to.eol,
+  bom: (from?.bom ?? false) === to.bom ? null : to.bom });
 /** PURE: `head`'s lines (in order) that `target` still has — the order a source wants kept. */
 const keptOrder = (head, target) => { const have = new Set(target); return head.filter(l => have.has(l)); };
 
@@ -368,7 +373,7 @@ export function verifyUnion({ base, combined, sources, cwd, run = gitRun, refere
     const B = baseEntry?.lines ?? [], C = combinedEntry?.lines ?? null;
     if (C === null) { missing.push({ path, line: '(whole file)' }); continue; }
     // File mode and final newline: the combined file takes the value a source set (sources must agree), else the base's.
-    for (const [key, label] of [['mode', 'file mode'], ['eol', 'final newline']]) {
+    for (const [key, label] of [['mode', 'file mode'], ['eol', 'final newline'], ['bom', 'byte-order mark']]) {
       const set = [...new Set(changes.map(x => x.change.get(path)?.meta?.[key]).filter(v => v != null))];
       if (set.length > 1) { disagree.push({ path, line: `(${label}: ${set.join(' vs ')})` }); continue; }
       const exp = set.length ? set[0] : baseEntry?.[key] ?? combinedEntry[key];
@@ -428,6 +433,7 @@ export function sourceLanded({ ref, source, cwd, run = gitRun, referenceMap = ne
     // A mode-only or final-newline-only change has not landed until main carries it too.
     if (ch.meta?.mode != null && entry.mode !== ch.meta.mode) return { ok: false, reason: `${path} file mode on main is ${entry.mode}, the source sets ${ch.meta.mode}` };
     if (ch.meta?.eol != null && entry.eol !== ch.meta.eol) return { ok: false, reason: `${path} final newline on main differs from the source's` };
+    if (ch.meta?.bom != null && entry.bom !== ch.meta.bom) return { ok: false, reason: `${path} byte-order mark on main differs from the source's` };
     const r = countOf(R);
     for (const l of new Set([...ch.from.keys(), ...ch.to.keys()])) {
       const f = ch.from.get(l) ?? 0, t = ch.to.get(l) ?? 0, have = r.get(l) ?? 0;
