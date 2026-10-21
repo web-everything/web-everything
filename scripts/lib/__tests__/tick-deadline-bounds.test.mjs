@@ -72,12 +72,15 @@ describe('round-2 bounds', () => {
     const root = tmp(); const dir = join(root, 'owed-prevention'); mkdirSync(dir);
     const keys = ['7', '8'].map(char => { const key = char.repeat(64); writeFileSync(join(dir, `${key}.json`), JSON.stringify({ key, status: 'owed', input: { owedKey: key, title: char } })); return key; });
     const filed = []; const cursorPath = join(root, 'cursor.state');
-    await reconcileOwedPrevention({ stateDir: root, cursorPath, file: async input => { filed.push(input.title); return { ok: true, skipped: true, deferred: true, step: input.title === '7' ? 'tick-deferred' : 'tick-deferred' }; } });
+    await reconcileOwedPrevention({ stateDir: root, cursorPath, hardDeadlineAt: 10 ** 12, now: () => 0, file: async input => { filed.push(input.title); return { ok: true, skipped: true, deferred: true, step: 'tick-deferred' }; } });
     expect(filed).toEqual(['7', '8']);
     expect(readDrainCursor(cursorPath).owed).toBe(`${keys[1]}.json`);
     const poolWide = []; resetDrainCursorMemory();
-    await reconcileOwedPrevention({ stateDir: root, file: async input => { poolWide.push(input.title); return { ok: true, skipped: true, deferred: true, step: 'acquire-deferred' }; } });
+    await reconcileOwedPrevention({ stateDir: root, hardDeadlineAt: 10 ** 12, now: () => 0, file: async input => { poolWide.push(input.title); return { ok: true, skipped: true, deferred: true, step: 'acquire-deferred' }; } });
     expect(poolWide).toEqual(['7']);
+    const uncapped = []; resetDrainCursorMemory();
+    await reconcileOwedPrevention({ stateDir: root, file: async input => { uncapped.push(input.title); return { ok: true, skipped: true, deferred: true, step: 'tick-deferred' }; } });
+    expect(uncapped).toEqual(['7']); // callers without a hard deadline keep the original rule: any deferral ends the round
   });
   it('the probe reports a card-specific owed deferral as a visible non-error result', async () => {
     const root = tmp(); writeFileSync(join(root, 'org-repo-prevention.json'), JSON.stringify({ seq: 9 }));
@@ -97,6 +100,25 @@ describe('round-2 bounds', () => {
     expect(drain.mock.calls[0][1].drainLimit.hardDeadlineAt).toBe(90_000 + DRAIN_HARD_DEADLINE_MS);
     await reconcileCardBatches({ ...common, clock: () => 500_000, now: 90_000 }); // a stale sample is not trusted
     expect(drain.mock.calls[1][1].drainLimit.hardDeadlineAt).toBe(500_000 + DRAIN_HARD_DEADLINE_MS);
+  });
+});
+
+describe('round-3 bounds', () => {
+  it('a pending card whose work ran out of tick time still moves the cursor past it', async () => {
+    const root = tmp(); const pendingDir = join(root, 'p'); mkdirSync(pendingDir);
+    for (const name of ['a', 'b']) writeFileSync(join(pendingDir, `${name}.json`), JSON.stringify({ cardId: name, rel: `backlog/${name}-card.md`, content: '#', idemKey: name, source: {} }));
+    const cursorPath = join(root, 'cursor.state'); const budget = Object.assign(new Error('out'), { code: 'TICK_BUDGET' });
+    await drainPendingPrevention({ lane: root }, { pendingDir, exec: () => { throw budget; }, batch: vi.fn(), write: () => {}, maxCards: 1, cursorPath });
+    expect(readDrainCursor(cursorPath).pending).toBe('a.json');
+  });
+  it('a killed acquire releases any lane it claimed without reporting, by this run\'s unique session', async () => {
+    const calls = [];
+    const exec = (cmd, args) => { calls.push(args); if (args[1] === 'acquire') throw Object.assign(new Error('x'), { killed: true }); return ''; };
+    const settings = resolvePreventionBatchSettings({ standard: loadCardBatchPolicy().prevention, repo: { filingEnabled: true }, env: {} });
+    const result = await landPreventionCard({ title: 't', session: 'sess-unique' }, { owedClaimed: true, exec, write: () => {}, pendingDir: tmp(), skipPendingDrain: true,
+      loadFilingSettings: () => settings, loadPreventionBatchSettings: () => settings, drainLimit: { hardDeadlineAt: 10 ** 9, deadlineAt: 10 ** 9, now: () => 0 }, acquireWait: () => 5_000 });
+    expect(result).toMatchObject({ ok: true, deferred: true });
+    expect(calls.some(args => args[1] === 'release' && args.includes('--all') && args.includes('--session=sess-unique'))).toBe(true);
   });
 });
 

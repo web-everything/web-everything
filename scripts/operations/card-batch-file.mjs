@@ -30,7 +30,7 @@ import { closeSync, openSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { admitCard, cardBatchStateDir } from './card-batch-io.mjs';
-import { STEP_MIN_MS } from '../lib/tick-deadline.mjs';
+import { STEP_MIN_MS, budgetError, isBudgetError } from '../lib/tick-deadline.mjs';
 import { bypassesBatch } from '../lib/card-batch-policy.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { effectiveCardBatchPolicy, formatCardBatchSettings, loadCardBatchSettings, formatPreventionBatchSettings, loadPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
@@ -60,7 +60,7 @@ export function cardIdOf(cardPath) {
   return match ? match[1] : null;
 }
 
-const git = (cwd, args, timeout) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024, ...(timeout ? { timeout } : {}) }).trim();
+const git = (cwd, args, timeout) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024, ...(timeout ? { timeout, killSignal: 'SIGKILL' } : {}) }).trim();
 
 /** Start the detached seal worker: it opens/refreshes the batch PR and seals at the count limit. Never waits. */
 export function launchSealJob(statePath, { spawn = spawnChild, open = openSync } = {}) {
@@ -98,8 +98,10 @@ export async function fileIntoBatch({
   try {
     const repo = source.repo ?? CONSTELLATION_REPOS.we.slug;
     const base = baseSha ?? (() => {
-      try { git(laneDir, ['fetch', '--no-tags', '-q', 'origin', 'main'], deadline ? Math.min(30_000, Math.max(1_000, deadline.left())) : undefined); } catch { /* fall back to the lane's last fetch */ }
-      return git(laneDir, ['rev-parse', 'origin/main^{commit}'], deadline ? Math.max(1_000, deadline.left()) : undefined);
+      // In-tick each call is refused once the budget is gone (no fresh floor), capped at the time left, and killed with SIGKILL.
+      const cap = (max) => { if (!deadline) return undefined; if (deadline.left() < 1_000) throw budgetError('git'); return Math.min(max, deadline.left()); };
+      try { git(laneDir, ['fetch', '--no-tags', '-q', 'origin', 'main'], cap(30_000)); } catch (error) { if (isBudgetError(error)) throw error; /* else fall back to the lane's last fetch */ }
+      return git(laneDir, ['rev-parse', 'origin/main^{commit}'], cap(Infinity));
     })();
     const input = {
       kind, cardPath, cardId, idemKey: idemKey ?? `card:${cardId}`, baseSha: base, laneDir,

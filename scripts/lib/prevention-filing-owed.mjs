@@ -83,7 +83,8 @@ export async function reconcileOwedPrevention({ stateDir = cardBatchStateDir(), 
     } catch (e) { results.push({ ok: false, step: 'owed', reason: e.message }); }
     // No lane in time is POOL-wide: the filing keeps its place and the rest would only wait for the same pool. Any other deferral
     // (the filing needs its own PR, or ran out of tick time) is about THAT filing: the cursor moves past it so it cannot starve the rest.
-    if (results.at(-1)?.deferred && results.at(-1).step === 'acquire-deferred') break;
+    // Callers without a hard deadline (CLI, spawned filers) keep the original rule: any deferral ends the round.
+    if (results.at(-1)?.deferred && (hardDeadlineAt === Infinity || results.at(-1).step === 'acquire-deferred')) break;
     if (cursorPath) writeDrainCursor(cursorPath, { owed: name });
   }
   return results;
