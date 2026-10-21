@@ -2618,6 +2618,8 @@ export function decideParkMode({ report, convergeVerdict, filesTouched, lanePath
   if (touchesStatute) return { mode: 'park', label: 'review:human', reason: 'statute/policy-core path touched' };
   if (report.outcome === 'needs-human-judgment') return { mode: 'park', label: 'review:human', reason: report.reason };
   if (convergeVerdict.verdict === 'escalate') return { mode: 'park', label: 'review:human', reason: convergeVerdict.reason };
+  // An incomplete self-check (the diff was over its size bound) read nothing, so its own note's human review applies.
+  if (convergeVerdict.selfReview?.incomplete) return { mode: 'park', label: 'review:human', reason: 'self-review incomplete; human review of the full diff is required' };
 
   const dismissedFindings = Array.isArray(convergeVerdict.dismissed) ? convergeVerdict.dismissed.length : 0;
   const score = scoreEscalation({
@@ -2627,9 +2629,7 @@ export function decideParkMode({ report, convergeVerdict, filesTouched, lanePath
   if (scoreLabel) {
     return { mode: 'park', label: scoreLabel, reason: `scoreEscalation: ${score.reasons.join('; ') || 'escalated'}`, score };
   }
-  // The self-check replaces only the label-on-green fallthrough, never a stricter label the score asked for. An
-  // incomplete self-check (the diff was over its size bound) read nothing, so its own note's human review applies.
-  if (convergeVerdict.selfReview?.incomplete) return { mode: 'park', label: 'review:human', reason: 'self-review incomplete; human review of the full diff is required', score };
+  // The self-check replaces only the label-on-green fallthrough, never a stricter label the score asked for.
   if (convergeVerdict.selfReview) return { mode: 'park', label: 'review:pending', reason: 'pre-review self-check complete; independent review required', score };
   if (executedVendor !== 'claude') {
     return {

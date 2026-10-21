@@ -2452,8 +2452,9 @@ describe('decideParkMode (#3627 gap 4 — the real scoreEscalation rubric)', () 
     expect(rank[on.label]).toBeGreaterThanOrEqual(rank[park(false).label]);
   });
 
-  it('parks review:human when the self-review was incomplete (the diff was over its size bound)', () => {
-    const runFn = (_bin, args) => (args.includes('merge-base') ? 'base\n' : '3\t1\treports/2026-09-09-note.md\0');
+  // An oversized diff usually also trips the score's size signal (review:pending); that must not hide the human park.
+  it.each([['a small', '3\t1'], ['a size-escalating', '12000\t0']])('parks review:human when the self-review was incomplete, with %s numstat', (_name, counts) => {
+    const runFn = (_bin, args) => (args.includes('merge-base') ? 'base\n' : `${counts}\treports/2026-09-09-note.md\0`);
     const result = decideParkMode({
       report: { outcome: 'done' }, convergeVerdict: { verdict: 'land', selfReview: { rounds: 0, notes: ['too large'], incomplete: true } },
       filesTouched: ['reports/2026-09-09-note.md'], lanePath: '/lane',
@@ -3614,6 +3615,8 @@ describe('deliverItem (#3627 bug 13 — the success-path result string names the
     const originalExec = execFileSync.getMockImplementation();
     execFileSync.mockImplementation((cmd, args = [], ...rest) => {
       if (cmd === 'git' && args.includes('origin/main...HEAD')) return 'x'.repeat(512 * 1024 + 1);
+      // The same oversized change also trips the escalation score's size signal (review:pending).
+      if (cmd === 'git' && args.includes('--numstat')) return '12000\t0\treports/big.md\0';
       return originalExec(cmd, args, ...rest);
     });
     const provider = { spawn: vi.fn(), vendor: 'claude' };
