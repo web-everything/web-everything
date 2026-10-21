@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createActionStore } from '../../operations/action-store.mjs';
 import { publishAttention, runOnce as pollNeedsYou, unacknowledged, acknowledge } from '../../operations/needs-you-feed.mjs';
@@ -14,7 +15,7 @@ import { countFindings, planReconcile } from '../reconcile-core.mjs';
 import {
   reviewRunEvidence, readReviewRunEvidence, decideReferralHold, enrichPrsWithReferralHolds,
   notifyReferralHold, REFERRAL_RETRY_MS, decideSameHeadHold, resolveSameHeadMaxReviews, PENDING_REASON_TOKENS,
-  GH_LIST_COMMENT_CAP, findResumableParkedRun,
+  GH_LIST_COMMENT_CAP, findResumableParkedRun, REVIEW_EVIDENCE_CACHE_FILE, readRunProjections,
   VERDICT_COOLDOWN_BASE_MS, VERDICT_COOLDOWN_CAP_MS, VERDICT_COOLDOWN_MAX_RELEASES,
   resolveNoVerdictRetry, NO_VERDICT_RETRY_STANDARD, raiseNoVerdictNeedsYou, NO_VERDICT_NEEDS_YOU_KIND, needsYouClaimRoot,
 } from '../review-referral-hold.mjs';
@@ -26,6 +27,7 @@ const iso = n => new Date(n).toISOString();
 const dirs = [];
 const temp = () => { const dir = mkdtempSync(join(tmpdir(), 'referral-hold-')); dirs.push(dir); return dir; };
 afterEach(() => { vi.unstubAllEnvs(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+const projectionReader = () => readRunProjections;
 const comment = (body, time = at + 1, login = 'web-everything') => ({ body, createdAt: iso(time), author: { login } });
 const original = { summary: 'broken case', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
 const key = referralFindingKey('judge', original);
@@ -173,6 +175,55 @@ describe('attempted mandatory referrals', () => {
     expect(third).toHaveBeenCalledTimes(1);
     expect(after.find(e => e.id === 'review-pr-parked').parked).toBe(false);
     expect(readdirSync(dir).filter(n => n.endsWith('.json')).sort()).toEqual(['review-pr-other.json', 'review-pr-parked.json']);
+  });
+  it('a change to the projection source invalidates disk entries even when the records are unchanged', () => {
+    const dir = temp(); writeRun(run(), dir);
+    const read = projectionReader();
+    const cacheFile = REVIEW_EVIDENCE_CACHE_FILE;
+    const project = r => ({ id: r.id, version: 1 });
+    const changedProject = r => ({ id: r.id, version: 2 });
+    const load = projection => read({ dir, readRun: tryReadRun, memo: new Map(), persist: true, project: projection, cacheFile });
+    expect(load(project)).toEqual([{ id: 'review-pr-parked', version: 1 }]);
+    const before = JSON.parse(readFileSync(join(dir, cacheFile), 'utf8'));
+    const readRun = vi.fn(tryReadRun);
+    expect(read({ dir, readRun, memo: new Map(), persist: true, project: changedProject, cacheFile }))
+      .toEqual([{ id: 'review-pr-parked', version: 2 }]);
+    expect(readRun).toHaveBeenCalledTimes(1);
+    const after = JSON.parse(readFileSync(join(dir, cacheFile), 'utf8'));
+    expect(after.code).not.toBe(before.code);
+    expect(after.code).toBe(createHash('sha256').update(String(changedProject)).digest('hex').slice(0, 16));
+    expect(after.entries['review-pr-parked.json'].key).toBe(before.entries['review-pr-parked.json'].key);
+    readRun.mockClear();
+    expect(read({ dir, readRun, memo: new Map(), persist: true, project: changedProject, cacheFile }))
+      .toEqual([{ id: 'review-pr-parked', version: 2 }]);
+    expect(readRun).not.toHaveBeenCalled();
+  });
+  it('a second projection with its own cache file neither shares nor overwrites evidence entries', () => {
+    const dir = temp(); writeRun(run(), dir);
+    const before = readReviewRunEvidence({ dir, memo: new Map() });
+    const evidenceFile = join(dir, REVIEW_EVIDENCE_CACHE_FILE);
+    const onDisk = readFileSync(evidenceFile, 'utf8');
+    const read = projectionReader();
+    const project = r => ({ id: r.id, secondProjection: true });
+    const cacheFile = '.second-projection.cache';
+    const readRun = vi.fn(tryReadRun);
+    const load = () => read({ dir, readRun, memo: new Map(), persist: true, project, cacheFile });
+    expect(load()).toEqual([{ id: 'review-pr-parked', secondProjection: true }]);
+    expect(readRun).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(readFileSync(join(dir, cacheFile), 'utf8')).entries['review-pr-parked.json'].evidence)
+      .toEqual({ id: 'review-pr-parked', secondProjection: true });
+    expect(readFileSync(evidenceFile, 'utf8')).toBe(onDisk);
+    readRun.mockClear();
+    expect(load()).toEqual([{ id: 'review-pr-parked', secondProjection: true }]);
+    expect(readReviewRunEvidence({ dir, readRun, memo: new Map() })).toEqual(before);
+    expect(readRun).not.toHaveBeenCalled();
+  });
+  it('keeps the evidence reader empty for a missing store and filters non-review records', () => {
+    const dir = temp();
+    expect(readReviewRunEvidence({ dir: join(dir, 'missing'), memo: new Map() })).toEqual([]);
+    writeRun(run(), dir);
+    writeFileSync(join(dir, 'another-operation.json'), '{not a review record');
+    expect(readReviewRunEvidence({ dir, memo: new Map() })).toEqual([evidence()]);
   });
   // xwu9oxh S6 — live 2026-10-20 the warm fix daemon re-parsed the ~45 MB projection on every reconcile pass.
   it('a warm process parses a few new records directly and leaves the on-disk projection alone', () => {

@@ -82,24 +82,31 @@ const evidenceCache = new Map();
 export const REVIEW_EVIDENCE_CACHE_FILE = '.review-run-evidence.cache';
 /** A warm process with at most this many changed records parses them directly instead of the whole on-disk file. */
 export const EVIDENCE_DISK_MIN_MISSES = 32;
-const EVIDENCE_CODE = createHash('sha256').update(String(reviewRunEvidence)).digest('hex').slice(0, 16);
-function readEvidenceDiskCache(file) {
+const projectionCode = project => createHash('sha256').update(String(project)).digest('hex').slice(0, 16);
+function readEvidenceDiskCache(file, code) {
   try {
     const c = JSON.parse(readFileSync(file, 'utf8'));
-    return c?.v === 1 && c.code === EVIDENCE_CODE && c.entries && typeof c.entries === 'object' ? c.entries : {};
+    return c?.v === 1 && c.code === code && c.entries && typeof c.entries === 'object' ? c.entries : {};
   } catch { return {}; }
 }
-function writeEvidenceDiskCache(file, entries) {
+function writeEvidenceDiskCache(file, code, entries) {
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   try {
-    writeFileSync(tmp, JSON.stringify({ v: 1, code: EVIDENCE_CODE, entries }));
+    writeFileSync(tmp, JSON.stringify({ v: 1, code, entries }));
     renameSync(tmp, file);
   } catch { try { unlinkSync(tmp); } catch { /* best effort: the cache is only a speed-up */ } }
 }
 export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryReadRun, memo = evidenceCache, persist = true } = {}) {
+  return readRunProjections({ dir, readRun, memo, persist, project: reviewRunEvidence, cacheFile: REVIEW_EVIDENCE_CACHE_FILE });
+}
+
+/** The cached reader every run-store projection shares: one disk cache per `cacheFile`, keyed by `project`'s own
+ *  source, so a changed projection never serves stale entries. Exported for tests. */
+export function readRunProjections({ dir, readRun, memo, persist, project, cacheFile, missing = () => [] }) {
+  const code = projectionCode(project);
   let names;
-  try { names = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
-  const file = join(dir, REVIEW_EVIDENCE_CACHE_FILE);
+  try { names = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return missing(); throw e; }
+  const file = join(dir, cacheFile);
   let disk = null;
   let dirty = false;
   const kept = {};
@@ -122,12 +129,12 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
     const key = `${stat.mtimeMs}:${stat.size}`;
     let cached = memo.get(path);
     if (cached?.key !== key && useDisk) {
-      disk ??= readEvidenceDiskCache(file);
+      disk ??= readEvidenceDiskCache(file, code);
       const hit = disk[name];
       if (hit?.key === key) cached = { key, evidence: hit.evidence ?? null };
     }
     if (cached?.key !== key) {
-      cached = { key, evidence: reviewRunEvidence(readRun(name.slice(0, -5), dir)) };
+      cached = { key, evidence: project(readRun(name.slice(0, -5), dir)) };
       dirty = true;
     }
     memo.set(path, cached);
@@ -135,8 +142,8 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
     return cached.evidence ? [cached.evidence] : [];
   });
   if (useDisk) {
-    disk ??= readEvidenceDiskCache(file);
-    if (dirty || Object.keys(disk).some(n => !kept[n])) writeEvidenceDiskCache(file, kept);
+    disk ??= readEvidenceDiskCache(file, code);
+    if (dirty || Object.keys(disk).some(n => !kept[n])) writeEvidenceDiskCache(file, code, kept);
   }
   return out;
 }
