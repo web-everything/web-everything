@@ -42,6 +42,7 @@ Review each numbered edge case and each Risks guarantee against an existing test
 
 - Every comment parser must have an outsider payload in `ignores outsider comments and PR bodies for marker kind: %s`, including carried verdicts and red-team false findings, with trusted controls proving those payloads reach their parsers. Exercise both REST and GraphQL author shapes and compare all analytical fields while retaining actors as evidence.
 - A CI-green dispatch boundary requires a successful check for the observed head at completion and no head change through review. Keep paired stale/current-head controls, both completion orderings, unknown-head refusal, and assertions on the resulting gap, cause and journal in `excludes stale-head check completion before review: %s`.
+- Preserve distinct check attempts through hand-off analysis; a later same-head/name rerun must not erase a completed earlier hand-off. Tests: `preserves historical %s hand-offs with a later %s attempt completing at %s` covers success/failure, pending and post-merge reruns, duplicate pages, and collector-to-journal wiring; `uses the newest %s boundary before a shared hand-off` pins supersession before the destination. `invalidates a historical %s boundary only for same-check reruns before its hand-off` covers opposite results, neutral/cancelled/pending attempts, and distinct-name/head controls.
 
 ## Risks and test plan
 

@@ -399,6 +399,75 @@ describe('per PR postmortem', () => {
       if (greenAt !== null) expect(incidents[0]).toMatchObject({minutesLost:Math.round((40-greenAt-6.6)*10)/10,evidence:causes[0].evidence});
     } finally { fs.rmSync(dir,{recursive:true,force:true}); }
   });
+  it.each([
+    ['success', 'success', 350], ['success', 'failure', 350], ['success', null, null], ['success', 'success', 610],
+    ['failure', 'success', 350], ['failure', 'failure', 350], ['failure', null, null], ['failure', 'success', 610],
+    ['timed_out', 'success', 350], ['startup_failure', 'success', 350],
+  ])('preserves historical %s hand-offs with a later %s attempt completing at %s', async (first, later, completed) => {
+    const dir = temp(), f = fixture();
+    const green = first === 'success', kind = green ? 'ci-green-review' : 'ci-red-heal';
+    const name = green ? 'test' : 'build';
+    const runs = [
+      {id:1,name,head_sha:f.commits[0].sha,started_at:at(10),completed_at:at(20),conclusion:first},
+      {id:2,name,head_sha:f.commits[0].sha,started_at:at(340),completed_at:completed === null ? null : at(completed),conclusion:later},
+    ];
+    const gh = collectorGh({
+      '/commits?':[[f.commits[0]]],
+      '/events?':[[300,590].map(m => ({event:'labeled',created_at:at(m),label:{name:'review:running'}}))],
+      // Reverse API order and repeat a row across pages: attempts are distinct by ID, not name.
+      '/check-runs?':[{check_runs:[runs[1],runs[0]]},{check_runs:[runs[0]]}],
+    });
+    const collect = () => collectPrTimeline(f.repo,1,{gh,comments:() => [300,590].map(m => comment(m,'🔒 conveyor fix-begin\n**Who:** `fixer`')),env:{WE_FIX_LOOP_LEDGER:join(dir,'absent')}});
+    try {
+      await runPostmortemPass({repo:f.repo,dir,settings,now:at(700),listMerged:() => [{number:1}],collect});
+      const r = JSON.parse(fs.readFileSync(join(dir,'postmortem-example%2Frepo-1.json')));
+      const boundaries = [[20,300,1]];
+      if (completed === 350 && first === later) boundaries.push([350,590,2]);
+      expect(r.checks).toHaveLength(2);
+      expect(r.gaps.filter(g => g.kind === kind)).toEqual(boundaries.map(([from,to,id]) => expect.objectContaining({from:at(from),to:at(to),minutes:to-from,evidence:expect.arrayContaining([id])})));
+      const causes = r.causes.filter(c => c.cause === `handoff:${kind}`);
+      expect(causes).toHaveLength(boundaries.length);
+      const rows = fs.readFileSync(join(dir,'incidents.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+      expect(rows.filter(row => row.cause === `handoff:${kind}`)).toEqual([expect.objectContaining({
+        minutesLost:Math.round(causes.reduce((sum,c) => sum+c.minutesLost,0)*10)/10,
+        evidence:causes.flatMap(c => c.evidence),
+      })]);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+  it.each(['success','failure'])('uses the newest %s boundary before a shared hand-off', conclusion => {
+    const f = fixture();
+    f.commits = [f.commits[0]];
+    f.labels = [{event:'labeled',created_at:at(300),label:{name:'review:running'}}];
+    f.comments = [comment(300,'🔒 conveyor fix-begin\n**Who:** `fixer`')];
+    f.checks = [20,30].map((m,id) => ({id,name:'test',head_sha:f.commits[0].sha,started_at:at(10),completed_at:at(m),conclusion}));
+    const kind = conclusion === 'success' ? 'ci-green-review' : 'ci-red-heal';
+    expect(buildPostmortem(f).gaps.filter(g => g.kind === kind)).toEqual([expect.objectContaining({from:at(30),to:at(300),minutes:270})]);
+  });
+  it.each(['success','failure'])('invalidates a historical %s boundary only for same-check reruns before its hand-off', conclusion => {
+    const f = fixture();
+    f.commits = [f.commits[0]];
+    f.labels = [{event:'labeled',created_at:at(300),label:{name:'review:running'}}];
+    f.comments = [comment(300,'🔒 conveyor fix-begin\n**Who:** `fixer`')];
+    const first = {id:1,name:'test',head_sha:f.commits[0].sha,started_at:at(10),completed_at:at(20),conclusion};
+    const kind = conclusion === 'success' ? 'ci-green-review' : 'ci-red-heal';
+    for (const later of [conclusion === 'success' ? 'failure' : 'success','neutral','cancelled',null]) {
+      const rerun = {...first,id:2,started_at:at(25),completed_at:later === null ? null : at(30),conclusion:later};
+      expect(buildPostmortem({...f,checks:[first,rerun]}).gaps.filter(g => g.kind === kind)).toEqual([]);
+      // A different name/head must not invalidate this check's historical boundary.
+      for (const other of [{...rerun,name:'other'},{...rerun,head_sha:'b'.repeat(40)}]) {
+        expect(buildPostmortem({...f,checks:[first,other]}).gaps.filter(g => g.kind === kind)).toEqual([expect.objectContaining({from:at(20),to:at(300)})]);
+      }
+    }
+    // A result arriving after the destination must not change how an attempt
+    // already running at that destination invalidates the earlier boundary.
+    for (const completed of [null,350,610]) {
+      const rerun = {...first,id:2,started_at:at(25),completed_at:completed === null ? null : at(completed),conclusion:completed === null ? null : conclusion};
+      expect(buildPostmortem({...f,checks:[first,rerun]}).gaps.filter(g => g.kind === kind)).toEqual([]);
+    }
+    // Overlapping starts still permit a newer opposite completion to invalidate.
+    const overlapping = {...first,id:2,completed_at:at(30),conclusion:conclusion === 'success' ? 'failure' : 'success'};
+    expect(buildPostmortem({...f,checks:[first,overlapping]}).gaps.filter(g => g.kind === kind)).toEqual([]);
+  });
   it.each([{}, [], [null], [[],{}]].map(pages => [pages]))('rejects missing timeline pages: %j', pages => {
     expect(() => collectWith(collectorGh({'/events?':pages}))).toThrow(/incomplete/);
   });

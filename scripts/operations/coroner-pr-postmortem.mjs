@@ -108,7 +108,7 @@ export function buildPostmortem(input, { benchmarks = SETTINGS.handoffP90Minutes
   }
   rounds.sort((a,b) => a.at.localeCompare(b.at)); rounds.forEach((r,i) => { r.round = i+1; });
   const marks = [];
-  const mark = (kind, at, evidence) => { if (Number.isFinite(time(at)) && time(at) >= time(openedAt) && time(at) <= time(mergedAt)) marks.push({ kind, at, evidence }); };
+  const mark = (kind, at, evidence, check) => { if (Number.isFinite(time(at)) && time(at) >= time(openedAt) && time(at) <= time(mergedAt)) marks.push({ kind, at, evidence, check }); };
   for (const e of events.filter(e => e.add)) {
     if (/^review-status:reviewing$|^review:(?:queued|running|in-progress)$/.test(e.name)) mark('review', e.at, e.ref);
     if (e.name === 'review:accepted') mark('accepted', e.at, e.ref);
@@ -126,13 +126,14 @@ export function buildPostmortem(input, { benchmarks = SETTINGS.handoffP90Minutes
     if (/^.*(?:review dispatched|review-begin)/i.test(c.body.split('\n')[0])) mark('review', c.at, c.ref);
     if (/clear-human|cleared-human/.test(c.body.split('\n')[0])) mark('clearance', c.at, c.ref);
   }
-  const finalChecks = new Map();
-  for (const c of [...checks].sort((a,b) => String(a.completed_at).localeCompare(String(b.completed_at)))) finalChecks.set(`${c.head_sha}|${c.name}`,c);
-  for (const c of finalChecks.values()) {
+  // Attempts are historical boundaries, not a final status per head/name. Keep
+  // each distinct check (deduplicated by ID above); gap pairing below supersedes
+  // a boundary only when a newer one precedes its hand-off.
+  for (const c of checks) {
     // A late old-head success must neither start a gap nor supersede a current-head success.
     const completedHead = heads.filter(h => time(h.at) <= time(c.completed_at)).at(-1)?.sha;
-    if (c.name === 'test' && c.conclusion === 'success' && same(c.head_sha,completedHead)) mark('ci-green',c.completed_at,c.html_url ?? c.id);
-    if (!/review.?gate/i.test(c.name) && ['failure','timed_out','startup_failure'].includes(c.conclusion)) mark('ci-red',c.completed_at,c.html_url ?? c.id);
+    if (c.name === 'test' && c.conclusion === 'success' && same(c.head_sha,completedHead)) mark('ci-green',c.completed_at,c.html_url ?? c.id,c);
+    if (!/review.?gate/i.test(c.name) && ['failure','timed_out','startup_failure'].includes(c.conclusion)) mark('ci-red',c.completed_at,c.html_url ?? c.id,c);
   }
   mark('merged', mergedAt, input.url ?? `https://github.com/${repo}/pull/${pr}`);
   const gaps = [];
@@ -141,6 +142,12 @@ export function buildPostmortem(input, { benchmarks = SETTINGS.handoffP90Minutes
     const b = sorted(marks.filter(m => (m.kind === to || (kind === 'clearance-ready' && m.kind === 'enqueued') || (kind === 'ci-red-heal' && m.kind === 'fix')) && time(m.at) >= time(a.at)))[0];
     const superseded = marks.some(m => m.kind === from && time(m.at) > time(a.at) && time(m.at) <= time(b?.at));
     if (!b || superseded) continue;
+    // A different result (or an unfinished rerun) of this check can invalidate
+    // the boundary too, but only if observed before this particular hand-off.
+    if (a.check && checks.some(c => {
+      return c !== a.check && c.head_sha === a.check.head_sha && c.name === a.check.name
+        && [c.started_at ?? c.created_at, c.completed_at].some(at => time(at) > time(a.at) && time(at) <= time(b.at));
+    })) continue;
     // CI green is only a valid dispatch boundary if the head did not change in between.
     if (kind === 'ci-green-review' && heads.some(h => time(h.at) > time(a.at) && time(h.at) <= time(b.at))) continue;
     const duration = minutes(a.at,b.at), p90 = benchmarks[kind];
