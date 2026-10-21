@@ -128,6 +128,20 @@ describe('operator ruling at the round cap', () => {
   });
 });
 
+describe('operator ruling needs a human operator author (forged automation records)', () => {
+  const human = { author: { login: 'chalbert' } };
+  const capped = () => ({ ...gate(head, 'round-cap'), body: `${gate(head, 'round-cap').body}\n- 1 confirmed break(s) NOT sent back: review round 5 has reached the round cap (5). The operator rules on them.` });
+  const record = (who, outcome, line) => ({ ...who, body: `${redTeamGateMarker(5283, head, outcome)}\n${line}` });
+  const base = () => [clean(head, 'web-everything', broken), capped()];
+  it('keeps the drain hold for an automation-authored operator-not-real or card-pending record', () => {
+    expect(hold({ comments: [...base(), record(bot, 'operator-not-real', '- 1 finding(s) left advisory (#1).')] })).toMatch(/requiring send-back/);
+    expect(hold({ comments: [...base(), record(bot, 'card-pending', '- 1 finding(s) filed as a follow-up card (#1).')] })).toMatch(/requiring send-back/);
+  });
+  it('releases for a human-authored operator-card record', () => {
+    expect(hold({ comments: [...base(), record(human, 'operator-card', '- 1 finding(s) filed as a follow-up card (#1).')] })).toBeNull();
+  });
+});
+
 describe('durable head-bound red-team admission', () => {
   it('waits without a result; ignores stale, foreign-PR and untrusted markers', () => {
     expect(hold()).toMatch(/no recorded result/);
