@@ -1,4 +1,5 @@
 ---
+bornAs: xhh8ph0
 kind: decision
 size: 5
 status: open
@@ -59,7 +60,7 @@ Related: `we:scripts/operations/extend-rounds.mjs` and `we:scripts/operations/ex
   const { readFileSync } = require('node:fs');
   const assert = require('node:assert/strict');
   const matter = require('gray-matter');
-  const { data, content } = matter(readFileSync('backlog/xhh8ph0-decision-ai-round-judge-replaces-fixed-round-caps-progress-b.md', 'utf8'));
+  const { data, content } = matter(readFileSync('backlog/6753-decision-ai-round-judge-replaces-fixed-round-caps-progress-b.md', 'utf8'));
   assert.ok(data.preparedDate && String(data.preparedDate).trim(), 'preparedDate must be set');
   const body = content.replace(/^[ \t]*```[^\n]*\n[\s\S]*?^[ \t]*```[ \t]*$/gm, '');
   for (let n = 1; n <= 5; n++) {

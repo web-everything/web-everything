@@ -1,7 +1,8 @@
 ---
+bornAs: xmcukjn
 kind: story
 size: 5
-parent: "xhh8ph0"
+parent: "6753"
 status: open
 scope: ["we:scripts/lib/red-team-gate.mjs", "we:scripts/operations/extend-rounds.mjs", "we:scripts/conveyor/advisory-label-sweep.mjs"]
 dateOpened: "2026-10-21"
@@ -10,12 +11,12 @@ tags: ["review", "red-team", "round-cap", "judge"]
 
 # Round judge prototype (shadow): log grant/send-back/card/split/escalate calls next to the actual decisions
 
-Shadow-mode prototype of the AI round judge from decision xhh8ph0. It only logs its call beside each real round decision. It takes no action. Reuses we:scripts/lib/red-team-gate.mjs sorting and we:scripts/operations/extend-rounds.mjs inputs.
+Shadow-mode prototype of the AI round judge from decision 6753. It only logs its call beside each real round decision. It takes no action. Reuses we:scripts/lib/red-team-gate.mjs sorting and we:scripts/operations/extend-rounds.mjs inputs.
 
 
 ## What to build
 
-A shadow-mode judge, per decision card xhh8ph0. For each real round decision it computes what the judge would have said and writes that call to a log file next to the actual decision. It changes no labels, grants no rounds, files no cards and posts no comments.
+A shadow-mode judge, per decision card 6753. For each real round decision it computes what the judge would have said and writes that call to a log file next to the actual decision. It changes no labels, grants no rounds, files no cards and posts no comments.
 
 Inputs reuse what exists: findings per round, `we:scripts/lib/red-team-gate.mjs` card-vs-sendBack sorting, and the `we:scripts/operations/extend-rounds.mjs` grant records. The `we:scripts/conveyor/advisory-label-sweep.mjs` path is read only, to see when a regate happened.
 
