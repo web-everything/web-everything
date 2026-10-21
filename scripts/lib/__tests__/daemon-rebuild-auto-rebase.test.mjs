@@ -370,8 +370,8 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     addOverlay(f.clone, { ref: 'lane/foreign', pr: 5790 }, { env: f.env });
     addOverlay(f.clone, { ref: 'lane/standing-ruling', pr: PR }, { env: f.env });
     expect(await f.tick()).toMatchObject({ adopted: true }); // the foreign base is stack-contained: not in `applied`
-    await f.tick(); // the next tick remembers every registered tip the adopted build carries
     expect(readRebuildState(f.clone, f.env).adoptedHeads).toEqual(expect.arrayContaining([expect.objectContaining({ pr: 5790, sha: h })]));
+    // no extra tick (Codex round 8): the base is rewritten right after the adopting tick
     f.push('lane/foreign', f.init, { 'foreign.txt': 'rewritten\n' }); // the foreign branch is rewritten away from h
     f.push('lane/container', x1, { [GATE]: lines({ 2: 'grant v1', 10: 'own' }) });
     addOverlay(f.clone, { ref: 'lane/container', pr: 5801 }, { env: f.env });

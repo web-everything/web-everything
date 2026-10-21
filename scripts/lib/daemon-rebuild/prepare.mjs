@@ -235,6 +235,12 @@ export async function prepareRebuild({
     clearReadyCandidate(root, stEnv);
     return terminal({ moved: false, reason: 'clone-recloned', quarantinedTo: cloneRepair.quarantinedTo });
   }
+  // overlay-rebase-on-merge — every registered tip as the clone saw it BEFORE this fetch (what the last tick fetched and
+  // may have built), so a base rewritten between ticks is still remembered (Codex round 8). Remembering more only blocks more.
+  const preFetchTips = (overlaysBefore || []).flatMap((o) => {
+    const tip = o?.ref ? verifyRev(git, `refs/remotes/origin/${o.ref}^{commit}`) : null;
+    return tip ? [{ pr: o.pr != null ? Number(o.pr) : 0, sha: tip }] : [];
+  });
   const fetchResult = fetchMainAndOverlays({ git, overlays: overlaysBefore, edgeResolve });
   if (!fetchResult.ok) {
     if (unsafe.untracked.length > 0) alert('untracked-kept', { paths: unsafe.untracked });
@@ -268,13 +274,12 @@ export async function prepareRebuild({
       ...(typeof a?.sha === 'string' ? [{ pr: a.pr != null ? Number(a.pr) : 0, sha: a.sha }] : []),
       ...(a?.mergedPr != null && typeof a.rebaseBase === 'string' ? [{ pr: Number(a.mergedPr), sha: a.rebaseBase }] : []),
     ]);
-    // …and every REGISTERED overlay whose tip the running adopted build carries — stack bases included, which never
-    // appear in `applied` (Codex round 7): their work inside a merged PR's old head must stay visible as foreign.
-    if (state.adopted?.head && state.adopted.head === prevHead) {
-      for (const o of overlaysBefore || []) {
-        const tip = o?.ref ? verifyRev(git, `refs/remotes/origin/${o.ref}^{commit}`) : null;
-        if (tip && git(['merge-base', '--is-ancestor', tip, prevHead]).status === 0) add.push({ pr: o.pr != null ? Number(o.pr) : 0, sha: tip });
-      }
+    // …and EVERY registered overlay tip, before and after this fetch, built or not — stack bases included, which never
+    // appear in `applied` (Codex rounds 7-8). Over-remembering only makes auto-rebase refuse more, never less.
+    for (const t of preFetchTips) add.push(t);
+    for (const o of overlaysBefore || []) {
+      const tip = o?.ref ? verifyRev(git, `refs/remotes/origin/${o.ref}^{commit}`) : null;
+      if (tip) add.push({ pr: o.pr != null ? Number(o.pr) : 0, sha: tip });
     }
     const seen = new Set();
     const next = [...add, ...prev].filter((h) => Number.isInteger(h.pr) && /^[0-9a-f]{40}$/.test(h.sha)

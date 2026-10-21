@@ -69,7 +69,7 @@ export async function mergedPrOldHeads({
   };
   const foreign = (sha, pr) => otherHeads.some((h) => {
     if (h?.unresolved || (h && !h.sha)) return true; // a head we could not even resolve: fail closed
-    if (!h || Number(h.pr) === pr || h.sha === sha) return false;
+    if (!h || Number(h.pr) === pr) return false; // the same SHA under ANOTHER PR still blocks (Codex round 8)
     if (!FULL_SHA_RE.test(h.sha) || git(['cat-file', '-e', `${h.sha}^{commit}`]).status !== 0) return true;
     if (ovPr != null && Number(h.pr) === Number(ovPr)) {
       const built = ancStrict(sha, h.sha);
