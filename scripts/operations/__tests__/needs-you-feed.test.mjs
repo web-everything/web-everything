@@ -159,6 +159,53 @@ describe('feed', () => {
     expect(log).toHaveBeenCalledWith(expect.stringMatching(/r#1.*head lookup failed/));
     expect(gh).toHaveBeenCalledTimes(2);
   });
+  it('keeps open keys across known→unknown→known reads (#5716)', () => {
+    const live = { ...item, kind: 'at-round-limit', head: 'a36' }, unknown = { ...live, head: '' };
+    const first = diffFeed([], [live], at);
+    expect(first.lines).toHaveLength(1);
+    const blind = diffFeed(first.openKeys, [unknown], at);
+    expect(blind).toEqual({ lines: [], openKeys: first.openKeys });
+    expect(diffFeed(blind.openKeys, [live], at)).toEqual({ lines: [], openKeys: first.openKeys });
+    // All open keys for the condition survive an unknown-only read.
+    const keys = [...first.openKeys, `${item.repo}#12@:at-round-limit`, `${item.repo}#12@b47:at-round-limit`];
+    expect(diffFeed(keys, [unknown], at)).toEqual({ lines: [], openKeys: keys });
+  });
+  it('publishes an unknown head and transitions once when its head becomes known (#5716)', () => {
+    const live = { ...item, kind: 'at-round-limit', head: 'a36' }, unknown = { ...live, head: '' };
+    const first = diffFeed([], [unknown, { ...unknown }], at);
+    expect(first.openKeys).toEqual([`${item.repo}#12@:at-round-limit`]);
+    expect(first.lines.map(parseFeedLine)).toEqual([{ at, ...unknown }]);
+    expect(diffFeed(first.openKeys, [unknown], at)).toEqual({ lines: [], openKeys: first.openKeys });
+    const known = diffFeed(first.openKeys, [live, { ...live }], at);
+    expect(known.openKeys).toEqual([`${item.repo}#12@a36:at-round-limit`]);
+    expect(known.lines.map(parseFeedLine)).toEqual([
+      { at, ...live },
+      { at, kind: 'cleared', repo: item.repo, pr: 12, head: '', was: 'at-round-limit' },
+    ]);
+    expect(diffFeed(known.openKeys, [live], at)).toEqual({ lines: [], openKeys: known.openKeys });
+    expect(diffFeed(known.openKeys, [unknown], at)).toEqual({ lines: [], openKeys: known.openKeys });
+  });
+  it('posts and clears on a real head change and clears an absent condition (#5716)', () => {
+    const live = { ...item, kind: 'at-round-limit', head: 'a36' };
+    const first = diffFeed([], [live], at);
+    const changed = diffFeed(first.openKeys, [{ ...live, head: 'b47' }], at);
+    expect(changed.openKeys).toEqual([`${item.repo}#12@b47:at-round-limit`]);
+    expect(changed.lines.map(parseFeedLine)).toEqual([
+      { at, ...live, head: 'b47' },
+      { at, kind: 'cleared', repo: item.repo, pr: 12, head: 'a36', was: 'at-round-limit' },
+    ]);
+    const gone = diffFeed(changed.openKeys, [], at);
+    expect(gone.openKeys).toEqual([]);
+    expect(gone.lines.map(parseFeedLine)).toEqual([
+      { at, kind: 'cleared', repo: item.repo, pr: 12, head: 'b47', was: 'at-round-limit' },
+    ]);
+  });
+  it.each([false, true])('dedupes known+unknown rows with known first=%s (#5716)', knownFirst => {
+    const live = { ...item, kind: 'at-round-limit', head: 'a36' }, unknown = { ...live, head: '' };
+    const result = diffFeed([], knownFirst ? [live, unknown] : [unknown, live], at);
+    expect(result.openKeys).toEqual([`${item.repo}#12@a36:at-round-limit`]);
+    expect(result.lines.map(parseFeedLine)).toEqual([{ at, ...live }]);
+  });
   it('appends without replacing bytes and replays and acknowledges open events', () => {
     const path = join(temp(), 'events'); writeFileSync(path, 'existing\n');
     appendLines(path, diffFeed([], [item], at).lines);

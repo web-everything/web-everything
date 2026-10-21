@@ -97,19 +97,49 @@ function fromKey(key) {
   if (!m) throw new Error(`needs-you-feed: invalid state key ${key}`);
   return { repo: m[1], pr: Number(m[2]), head: m[3], was: m[4] };
 }
+const conditionOf = i => `${i.repo}#${i.pr}:${i.kind}`;
+/**
+ * Dedupe per PR+condition so failed head lookups cannot flap an open condition (#5716):
+ *  - only unknown heads + that condition already open → keep every open key; publish and clear nothing;
+ *  - only unknown heads + nothing open → publish the head-less key;
+ *  - any known heads → use their distinct keys, ignoring unknown rows for that condition.
+ * A known head replaces an open head-less key by posting the known key and clearing the head-less key.
+ * A real head change likewise posts and clears; a condition absent from a complete read clears normally.
+ */
+function resolveCurrent(prev, items) {
+  const prevByCondition = new Map();
+  for (const key of prev) {
+    const k = fromKey(key), condition = conditionOf({ ...k, kind: k.was });
+    prevByCondition.set(condition, [...(prevByCondition.get(condition) ?? []), key]);
+  }
+  const current = new Map(), carried = new Set();
+  const knownConditions = new Set(items.filter(i => i.head).map(conditionOf));
+  for (const item of items) {
+    const condition = conditionOf(item);
+    if (item.head) current.set(keyOf(item), item);
+    else if (!knownConditions.has(condition)) {
+      const open = prevByCondition.get(condition) ?? [];
+      if (open.length) for (const key of open) carried.add(key);
+      else current.set(keyOf(item), item);
+    }
+  }
+  return { current, carried };
+}
 export function diffFeed(prevOpenKeys, items, now, { incomplete = items.incomplete, clearKinds = null } = {}) {
-  const at = new Date(now).toISOString(), prev = new Set(prevOpenKeys), current = new Map(items.map(sanitizeItem).map(i => [keyOf(i), i]));
+  const at = new Date(now).toISOString(), prev = new Set(prevOpenKeys);
+  const { current, carried } = resolveCurrent(prev, items.map(sanitizeItem));
+  // A partial-scope publisher (clearKinds) never clears kinds it does not own; an incomplete read clears nothing.
   const retained = new Set([...prev].filter(key => incomplete || (clearKinds && !clearKinds.has(fromKey(key).was))));
   const lines = [];
   for (const [key, item] of current) if (!prev.has(key)) {
     const event = { at, ...item };
     lines.push(`NEEDS-YOU ${item.repo}#${item.pr} ${item.kind}: ${item.reason}${item.title ? ` | title (untrusted): ${JSON.stringify(item.title)}` : ''}${item.pick || item.command ? ` | pick: ${item.pick || item.command}` : ''} ${JSON.stringify(event)}`);
   }
-  for (const key of prev) if (!retained.has(key) && !current.has(key)) {
+  for (const key of prev) if (!retained.has(key) && !current.has(key) && !carried.has(key)) {
     const event = { at, kind: 'cleared', ...sanitizeItem(fromKey(key)) };
     lines.push(`NEEDS-YOU-CLEARED ${event.repo}#${event.pr} left ${event.was} ${JSON.stringify(event)}`);
   }
-  return { lines, openKeys: [...new Set([...retained, ...current.keys()])] };
+  return { lines, openKeys: [...new Set([...retained, ...carried, ...current.keys()])] };
 }
 export function parseFeedLine(line) {
   if (!/^NEEDS-YOU(?:-CLEARED)? /.test(line)) return null;
