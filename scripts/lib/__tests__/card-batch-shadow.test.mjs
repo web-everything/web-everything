@@ -7,11 +7,11 @@ const none = () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); };
 
 describe('cardBatchWiden.mode cascade', () => {
   it('standard is off', () => {
-    expect(loadWidenMode({ env: {}, repo: undefined, read: none })).toEqual({ mode: 'off', source: 'standard', invalid: [] });
+    expect(resolveWidenMode({ platform: undefined, repo: undefined, env: {} })).toEqual({ mode: 'off', source: 'standard', invalid: [] });
   });
   it('this repo ships shadow, sourced from the repo layer', () => {
     expect(readSettings().cardBatchWiden.mode).toBe('shadow');
-    expect(loadWidenMode({ env: {}, read: none })).toMatchObject({ mode: 'shadow', source: 'repo' });
+    expect(loadWidenMode({ env: {}, read: none, repo: { mode: 'shadow' } })).toMatchObject({ mode: 'shadow', source: 'repo' });
   });
   it('platform < repo < env; an invalid value is ignored and named', () => {
     expect(resolveWidenMode({ platform: { mode: 'on' }, repo: { mode: 'shadow' }, env: { WE_CARD_BATCH_WIDEN: 'off' } }))
