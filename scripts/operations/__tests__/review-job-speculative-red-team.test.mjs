@@ -3,10 +3,11 @@
  * and keeps it only when the review accepts. No real process, model, git or GitHub call: every effect is a fake.
  */
 import { describe, it, expect } from 'vitest';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnKeepAlive } from '../../lib/test-keepalive.mjs';
 
 import { createReviewJobIo, runReviewJob, settleSpeculativeRedTeam } from '../review-job.mjs';
 import {
@@ -479,7 +480,7 @@ const exited = (child) => new Promise((resolveExit) => { if (child.exitCode !== 
 
 describe('calling a speculative pass off kills real processes', () => {
   it('killActiveSeats kills a running seat CLI\'s own (detached) process group', async () => {
-    const seat = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });
+    const seat = spawnKeepAlive({ detached: true });
     ACTIVE_SEAT_PIDS.add(seat.pid);
     killActiveSeats('SIGKILL');
     await exited(seat);

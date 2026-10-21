@@ -20,7 +20,7 @@ import { prSweepTickAllowed } from './pr-sweep-job.mjs';
 const SELF = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(SELF), '../..');
 const clocks = new Map();
-export const NIGHTLY_DEFAULTS = Object.freeze({ enabled: true, at: '22:17', laneWaitMs: 600000, attempts: 3, retryBackoffMin: 10, deadlineEt: '03:30', alertAfterProbeFailures: 3 });
+export const NIGHTLY_DEFAULTS = Object.freeze({ enabled: true, at: '22:17', laneWaitMs: 600000, attempts: 3, retryBackoffMin: 10, deadlineEt: '03:30', alertAfterProbeFailures: 3, runTimeoutMin: 30 });
 const positiveInt = (v) => Number.isSafeInteger(v) && v > 0;
 const validTime = (v) => typeof v === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(v);
 export function resolveNightlyCoronerSettings({ config = {}, env = process.env, read = readFileSync, log = console.error } = {}) {
@@ -34,7 +34,7 @@ export function resolveNightlyCoronerSettings({ config = {}, env = process.env, 
   if (enabled !== undefined) envValues.enabled = ['1', 'true'].includes(enabled) ? true : ['0', 'false'].includes(enabled) ? false : enabled;
   const out = cascadePolicy('coroner.nightly', { ...tool, ...config.coroner?.nightly }, {
     standard: NIGHTLY_DEFAULTS, platform: platform.prefs.coroner?.nightly ?? {}, envValues,
-    valid: { enabled: (v) => typeof v === 'boolean', at: validTime, laneWaitMs: positiveInt, attempts: positiveInt, retryBackoffMin: positiveInt, deadlineEt: validTime, alertAfterProbeFailures: positiveInt }, env,
+    valid: { enabled: (v) => typeof v === 'boolean', at: validTime, laneWaitMs: positiveInt, attempts: positiveInt, retryBackoffMin: positiveInt, deadlineEt: validTime, alertAfterProbeFailures: positiveInt, runTimeoutMin: positiveInt }, env,
   });
   log(formatCascadeSourcesLine('coroner.nightly', out));
   return { ...out, errors: [...errors, ...platform.errors, ...out.invalid] };
@@ -203,6 +203,8 @@ const command = (args, cwd, { signal, timeout = 30 * 60000 } = {}) => new Promis
 const sweepCoronerLeases = (root, sourceRoot, session, run = command) => run([join(root, 'scripts/lane-pool.mjs'), 'release', '--all-pools',
   `--session=${session}`, `--repo=${sourceRoot}`], sourceRoot, { timeout: RELEASE_TIMEOUT_MS });
 
+/** The exact argv both extractor CLIs receive; each declares --since, --until and --json (contract-tested). */
+export const coronerExtractorArgs = (since, until) => ['--since', since, '--until', until, '--json'];
 /** `signal` aborts the acquire and extractor subprocesses (a stop); the lane release is never given it. */
 export async function extractNightlyCoroner({ night, until, dir, settings, nightly = NIGHTLY_DEFAULTS, sourceRoot = ROOT, laneSession = CORONER_LANE_SESSION }, {
   root = ROOT, home = handoffHome(), statusFeed = feedPath(), run = command, signal,
@@ -239,13 +241,16 @@ export async function extractNightlyCoroner({ night, until, dir, settings, night
     try {
       signal?.throwIfAborted();
       // The extractor imports coroner-rounds.mjs itself; --no-save leaves cursor publication to this job.
-      const args = ['--since', since, '--until', until, '--json'];
+      const args = coronerExtractorArgs(since, until);
+      // Each extractor run is capped by coroner.nightly.runTimeoutMin (cascade; sources logged at resolve) so a
+      // runaway read cannot hold the lane or load the host until the ET deadline stop.
+      const timeout = (positiveInt(nightly.runTimeoutMin) ? nightly.runTimeoutMin : NIGHTLY_DEFAULTS.runTimeoutMin) * 60000;
       // Node resolves main-module symlinks; pass the same physical path to the CLI entry guard.
-      const metrics = JSON.parse(await run([realpathSync(join(lane.path, 'scripts/operations/coroner-extract.mjs')), ...args, '--no-save'], lane.path, { signal }));
+      const metrics = JSON.parse(await run([realpathSync(join(lane.path, 'scripts/operations/coroner-extract.mjs')), ...args, '--no-save'], lane.path, { signal, timeout }));
       let falseFindings = null;
       const optional = join(lane.path, 'scripts/operations/coroner-false-findings.mjs');
       signal?.throwIfAborted();
-      if (existsSync(optional)) falseFindings = JSON.parse(await run([realpathSync(optional), ...args], lane.path, { signal }));
+      if (existsSync(optional)) falseFindings = JSON.parse(await run([realpathSync(optional), ...args], lane.path, { signal, timeout }));
       signal?.throwIfAborted();
       window = { since, until };
       const rate = (value) => value ? `${value.count}/${value.total} (${value.pct}%)` : 'unavailable';
