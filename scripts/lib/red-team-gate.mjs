@@ -469,7 +469,8 @@ function operatorRuled(records, pr, head) {
     want = redTeamResultId(result.parsed);
     const gates = gateRecordsFor(rs, pr, sha, result);
     const cap = gates.filter(r => r.gate.outcome === GATE_OUTCOMES.ROUND_CAP).sort(threadOrder).at(-1);
-    const cleared = lastAt(rs, r => !r.from && CLEAR_HUMAN_RULING_RE.test(recordBody(r).replace(/\r\n/g, '\n').trimStart())
+    // Only a human operator's own clear-human comment is a ruling; an automation-posted copy (even by a trusted bot) is not.
+    const cleared = lastAt(rs, r => !r.from && isHumanOperatorComment(r.c) && CLEAR_HUMAN_RULING_RE.test(recordBody(r).replace(/\r\n/g, '\n').trimStart())
       && parseLatestHumanClearedSha([r.c]) === sha);
     // A clearance cannot approve a later send-back, even if an older/unknown grant snapshot leaves the cap winning.
     // This also keeps existing send-backs held while persisted grant identities migrate to a reader-independent key.
