@@ -40,7 +40,7 @@
  *   node scripts/conveyor/bundle-repair-dispatch.mjs record --hold=<id> --session=<slug> < outcome.json   (the session's one write)
  */
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -105,9 +105,9 @@ export async function cloneRootsByKey({ root = WE_ROOT, env = process.env } = {}
   return map;
 }
 
-/** IO: the first registration by the bot since the repair started that carried a conflict override, or null. */
-export async function readConflictOverride(entry, { env = process.env, readFile = readFileSync } = {}) {
-  const { eventsFilePath } = await import('../lib/daemon-overlays.mjs');
+/** IO (sync): the first registration by the bot since the repair started that carried a conflict override, or null.
+ *  `eventsFilePath` is `daemon-overlays.mjs#eventsFilePath` (preloaded by the pass). */
+export function readConflictOverride(entry, { env = process.env, readFile = readFileSync, eventsFilePath }) {
   let text = '';
   try { text = String(readFile(eventsFilePath(entry.root, env), 'utf8')); } catch { return null; }
   for (const line of text.split('\n').slice(-2000)) {
@@ -119,16 +119,19 @@ export async function readConflictOverride(entry, { env = process.env, readFile 
 
 // ── launch ───────────────────────────────────────────────────────────────────────────────────────────────────
 
-/** PURE-ish: the filled brief for one target (throws on a forbidden command or a placeholder hole). */
-export async function fillRepairBrief(target, { root = WE_ROOT, readBrief = (r) => readFileSync(briefPath(r), 'utf8') } = {}) {
-  const { BRIEF_REQUIRED_BY_KIND, fillBrief, sessionSlugFor } = await import('../operations/dispatch-lane.mjs');
-  const session = sessionSlugFor(target.holdId, BUNDLE_REPAIR_KIND);
-  const { prompt, unknownTokens } = fillBrief(readBrief(root), {
+/** The filled brief for one target (throws on a forbidden command or a placeholder hole). `lane` is the preloaded
+ *  `dispatch-lane.mjs` module. */
+export function fillRepairBriefWith(lane, target, { root = WE_ROOT, readBrief = (r) => readFileSync(briefPath(r), 'utf8') } = {}) {
+  const session = lane.sessionSlugFor(target.holdId, BUNDLE_REPAIR_KIND);
+  const { prompt, unknownTokens } = lane.fillBrief(readBrief(root), {
     CLONE_ROOT: target.root, CLONE_NAME: target.name, HOLD_ID: target.holdId, HELD_REFS: target.refs.join(',') || 'none',
     SESSION_SLUG: session, BOT: BUNDLE_REPAIR_BOT, WE_ROOT: root,
-  }, BRIEF_REQUIRED_BY_KIND[BUNDLE_REPAIR_KIND], []);
+  }, lane.BRIEF_REQUIRED_BY_KIND[BUNDLE_REPAIR_KIND], []);
   assertBriefSafe(prompt);
   return { prompt, session, unknownTokens };
+}
+export async function fillRepairBrief(target, o) {
+  return fillRepairBriefWith(await import('../operations/dispatch-lane.mjs'), target, o);
 }
 
 /** The repair role's route, kept to Claude only (a non-Claude adapter has no `bundle-repair` row). Never throws. */
@@ -169,40 +172,34 @@ export async function dispatchRepair(target, { prompt, session, token, stateRoot
 }
 
 const FINISHED = new Set(['done', 'failed', 'stopped', 'completed', 'killed']);
-async function defaultStop(entry) {
-  const { stopSessionWithRetry } = await import('./session-reaper.mjs');
-  let handle = entry.handle;
-  if (!handle && entry.session) {
-    const { readAgentsStrict } = await import('../lib/lane-salvage.mjs');
-    const agents = readAgentsStrict();
-    // An unreadable listing is UNKNOWN: throw so the stop stays pending, never "nothing to stop".
-    if (!Array.isArray(agents)) throw new Error('bundle-repair: could not list claude agents to resolve the session by name');
-    const row = agents.find((a) => a?.name === entry.session && !FINISHED.has(a.state));
-    handle = row?.id ?? row?.sessionId ?? null;
-    if (row && !handle) throw new Error('bundle-repair: the session is listed but exposes no id to stop');
-  }
-  if (handle) stopSessionWithRetry({ handle });
+/** The real host seams, loaded once per pass (only the ones the caller did not supply) so every step inside the
+ *  ledger lock is synchronous. */
+async function loadHostDeps({ needStop, needPublish, needEvents }) {
+  const [reaper, salvage, feed, overlays, { withFileLock }, lane] = await Promise.all([
+    needStop ? import('./session-reaper.mjs') : null, needStop ? import('../lib/lane-salvage.mjs') : null,
+    needPublish ? import('../operations/needs-you-feed.mjs') : null, needEvents ? import('../lib/daemon-overlays.mjs') : null,
+    import('../lib/atomic-json-file.mjs'), import('../operations/dispatch-lane.mjs'),
+  ]);
+  const stop = needStop ? (entry) => {
+    let handle = entry.handle;
+    if (!handle && entry.session) {
+      const agents = salvage.readAgentsStrict();
+      // An unreadable listing is UNKNOWN: throw so the stop stays pending, never "nothing to stop".
+      if (!Array.isArray(agents)) throw new Error('bundle-repair: could not list claude agents to resolve the session by name');
+      const row = agents.find((a) => a?.name === entry.session && !FINISHED.has(a.state));
+      handle = row?.id ?? row?.sessionId ?? null;
+      if (row && !handle) throw new Error('bundle-repair: the session is listed but exposes no id to stop');
+    }
+    if (handle) reaper.stopSessionWithRetry({ handle });
+  } : null;
+  return { stop, publish: needPublish ? (item, { now }) => feed.publishAttention(item, { now }) : null, eventsFilePath: overlays?.eventsFilePath, withFileLock, lane };
 }
 
-async function defaultPublish(item, { now }) {
-  const { publishAttention } = await import('../operations/needs-you-feed.mjs');
-  return publishAttention(item, { now });
-}
-
-/** An ASYNC-safe exclusive lock around one pass (`withFileLock` releases as soon as a sync fn returns, so it cannot
- *  span the awaited launch). A lock older than 15 min is a crashed pass and is taken over. Another live pass holds
- *  it → this pass skips (the next tick runs). */
-export async function defaultLock(dir, fn, { staleMs = 15 * 60_000 } = {}) {
-  const path = `${ledgerPath(dir)}.lock`;
-  mkdirSync(dirname(path), { recursive: true });
-  try { writeFileSync(path, `${process.pid}\n`, { flag: 'wx' }); } catch (e) {
-    if (e?.code !== 'EEXIST') throw e;
-    let age = 0;
-    try { age = Date.now() - statSync(path).mtimeMs; } catch { /* vanished */ }
-    if (age < staleMs) throw new Error('bundle-repair: another pass holds the ledger lock — skipped this tick');
-    writeFileSync(path, `${process.pid}\n`);
-  }
-  try { return await fn(); } finally { try { unlinkSync(path); } catch { /* best effort */ } }
+/** The ledger lock: the shared `withFileLock` (PID-liveness stale takeover with post-move verification), around a
+ *  SYNCHRONOUS critical section only — the awaited launch happens outside it, after its reservation is on disk. */
+export function defaultLock(dir, fn, { withFileLock, timeoutMs = 30_000 } = {}) {
+  mkdirSync(repairDir(dir), { recursive: true });
+  return withFileLock(`${ledgerPath(dir)}.lock`, fn, { timeoutMs });
 }
 
 function writeJsonAtomicSync(path, value) {
@@ -215,8 +212,10 @@ function writeJsonAtomicSync(path, value) {
 // ── the tick's pass ──────────────────────────────────────────────────────────────────────────────────────────
 
 /**
- * ONE PASS per health tick: reconcile running repairs (stop / clear / escalate), then plan and launch (or, in
- * shadow, post) new ones. `dryRun` decides everything and performs nothing. Never throws for one repair's failure.
+ * ONE PASS per health tick: reconcile running repairs (stop / clear / escalate), then plan and reserve (or, in
+ * shadow, post) new ones — all inside ONE synchronous ledger-locked section — then launch the reserved ones outside
+ * the lock and patch their handles in under the lock again. `dryRun` decides everything and performs nothing.
+ * Seams `stop`, `publish`, `overrideFor` and `lock` are SYNCHRONOUS; `dispatch` is async.
  * @returns {Promise<object>} the summary the tick reports
  */
 export async function runBundleRepairs({
@@ -224,79 +223,101 @@ export async function runBundleRepairs({
   settingsResolved = null,
   rootsByKey = () => cloneRootsByKey({ root, env }),
   killed = () => existsSync(killFilePath(env)),
-  overrideFor = (entry) => readConflictOverride(entry, { env }),
-  dispatch = (target, o) => dispatchRepair(target, { ...o, root, env }),
-  stop = defaultStop,
-  publish = defaultPublish,
-  lock = defaultLock,
+  overrideFor, dispatch = (target, o) => dispatchRepair(target, { ...o, root, env }),
+  stop, publish, lock, readBrief,
   writeShadow = (path, text) => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, text); },
   log = (line) => process.stderr.write(`${line}\n`),
   host = hostname(),
 } = {}) {
   const { settings, sources, invalid } = settingsResolved ?? await resolveBundleRepairSettings({ env });
+  const summary = { settings, sources, invalid, killed: false, off: false, dispatched: [], shadow: [], held: [], reconciled: [], escalated: [], failed: [] };
+  // Off with nothing ever recorded: no lock, no files — the feature leaves no footprint until it is turned on.
+  if (settings.enabled !== true && !existsSync(ledgerPath(dir))) { summary.off = 'disabled'; return summary; }
+  const deps = await loadHostDeps({ needStop: !stop, needPublish: !publish, needEvents: !overrideFor });
+  stop ??= deps.stop;
+  publish ??= deps.publish;
+  overrideFor ??= (entry) => readConflictOverride(entry, { env, eventsFilePath: deps.eventsFilePath });
+  lock ??= (d, fn) => defaultLock(d, fn, { withFileLock: deps.withFileLock });
   const keyToRoot = await rootsByKey();
-  const clones = (selfSync || []).map((c) => ({ cloneKey: c.cloneKey, root: keyToRoot.get(c.cloneKey) ?? null, held: c.rebuild?.held ?? null }));
+  // `held: undefined` = UNKNOWN (no rebuild state could be read) — never read as "not held".
+  const clones = (selfSync || []).map((c) => ({ cloneKey: c.cloneKey, root: keyToRoot.get(c.cloneKey) ?? null, held: c.rebuild ? (c.rebuild.held ?? null) : undefined }));
   const isKilled = (() => { try { return !!killed(); } catch { return false; } })();
-  const summary = { settings, sources, invalid, killed: isKilled, off: false, dispatched: [], shadow: [], held: [], reconciled: [], escalated: [], failed: [] };
+  summary.killed = isKilled;
+  const firstLine = (e) => String(e?.message || e).split('\n')[0];
+  const liveHolds = () => new Set(clones.filter((c) => c.root && isOverlayHold(c.held)).map((c) => holdIdFor(c, c.held)));
+  const persist = (ledger) => { if (!dryRun && (ledger.length || existsSync(ledgerPath(dir)))) writeJsonAtomicSync(ledgerPath(dir), pruneLedger(ledger, { now, liveHoldIds: liveHolds() })); };
 
-  const body = async () => {
+  const tryStop = (entry) => {
+    try {
+      stop(entry);
+      if (entry.stopPending) entry.stopSettledAt = now;
+      delete entry.stopPending; delete entry.lastStopError;
+      return true;
+    } catch (e) { entry.stopPending = true; entry.lastStopError = firstLine(e); return false; }
+  };
+  // An escalation is PENDING until the feed accepted it: a failed post is retried every tick, never lost.
+  const flush = (entry) => {
+    const rest = [];
+    for (const p of entry.escalationPending || []) {
+      try { publish(escalationItem(entry, { reason: p.reason, detail: p.detail, host, weRoot: root }), { now }); entry.escalatedAt = now; }
+      catch (e) { rest.push(p); entry.escalateError = firstLine(e); }
+    }
+    if (rest.length) entry.escalationPending = rest; else { delete entry.escalationPending; delete entry.escalateError; }
+  };
+  const escalate = (entry, reason, detail) => {
+    entry.escalations = [...new Set([...(entry.escalations || []), reason])];
+    entry.escalationPending = [...(entry.escalationPending || []), { reason, detail }];
+    flush(entry);
+    summary.escalated.push({ holdId: entry.holdId, reason });
+    log(`bundle-repair: ESCALATED ${entry.name} (${reason}) — ${detail}`);
+  };
+
+  const reserved = [];
+  const phase1 = () => {
     const ledger = readLedger(dir);
-    const live = () => new Set(clones.filter((c) => c.root && isOverlayHold(c.held)).map((c) => holdIdFor(c, c.held)));
-    const persist = () => { if (!dryRun && (ledger.length || existsSync(ledgerPath(dir)))) writeJsonAtomicSync(ledgerPath(dir), pruneLedger(ledger, { now, liveHoldIds: live() })); };
-    const firstLine = (e) => String(e?.message || e).split('\n')[0];
-    const tryStop = async (entry) => {
-      try {
-        await stop(entry);
-        if (entry.stopPending) entry.stopSettledAt = now; // still checked for an override this tick
-        delete entry.stopPending; delete entry.lastStopError;
-      }
-      catch (e) { entry.stopPending = true; entry.lastStopError = firstLine(e); }
-    };
-    // An escalation is PENDING until the feed accepted it: a failed post is retried every tick, never lost.
-    const tryEscalate = async (entry) => {
-      const { reason, detail } = entry.escalationPending;
-      try {
-        await publish(escalationItem(entry, { reason, detail, host, weRoot: root }), { now });
-        delete entry.escalationPending; delete entry.escalateError; entry.escalatedAt = now;
-      } catch (e) { entry.escalateError = firstLine(e); }
-    };
-
+    const stoppedNow = new Set();
     // 0. retry what an earlier tick could not finish: a failed stop, an unposted escalation.
     if (!dryRun) {
-      for (const e of ledger.filter((x) => x.stopPending)) await tryStop(e);
-      for (const e of ledger.filter((x) => x.escalationPending)) await tryEscalate(e);
+      for (const e of ledger.filter((x) => x.stopPending)) if (tryStop(e)) stoppedNow.add(e.holdId);
+      for (const e of ledger.filter((x) => x.escalationPending?.length)) flush(e);
     }
     // 1. reconcile
+    const watch = (x) => x.status === 'running' || x.status === 'repaired' || x.stopPending || x.stopSettledAt === now;
     const outcomes = new Map();
     const overrides = new Map();
-    for (const e of ledger.filter((x) => x.status === 'running' || x.status === 'repaired' || x.stopPending || x.stopSettledAt === now)) {
+    for (const e of ledger.filter(watch)) {
       outcomes.set(e.holdId, readJson(outcomePath(dir, e.holdId), null));
-      try { overrides.set(e.holdId, await overrideFor(e)); } catch { overrides.set(e.holdId, null); }
+      try { overrides.set(e.holdId, overrideFor(e)); } catch { overrides.set(e.holdId, null); }
     }
     const actions = planReconcile(ledger, { clones, now, outcomeFor: (id) => outcomes.get(id), overrideFor: (e) => overrides.get(e.holdId) });
     for (const a of actions) {
       const entry = ledger.find((x) => x.holdId === a.holdId);
       summary.reconciled.push({ ...a, dryRun });
       if (dryRun) continue;
-      if (a.stop) await tryStop(entry);
+      if (a.stop && tryStop(entry)) stoppedNow.add(entry.holdId);
       entry.status = a.status;
       entry.endedAt ??= now;
       entry.endReason = a.escalate ?? a.detail;
-      if (a.escalate) {
-        entry.escalationPending = { reason: a.escalate, detail: a.detail };
-        await tryEscalate(entry);
-        summary.escalated.push({ holdId: a.holdId, reason: a.escalate });
-        log(`bundle-repair: ESCALATED ${entry.name} (${a.escalate}) — ${a.detail}`);
+      if (a.escalate) escalate(entry, a.escalate, a.detail);
+    }
+    // 1b. the audit trail is re-read AFTER a session is stopped: a registration made between the first read and the
+    //     stop is still caught (once).
+    if (!dryRun) {
+      for (const id of stoppedNow) {
+        const entry = ledger.find((x) => x.holdId === id);
+        if (!entry || (entry.escalations || []).includes('conflict-override-used')) continue;
+        let ov = null;
+        try { ov = overrideFor(entry); } catch { ov = null; }
+        if (ov) { entry.status = 'escalated'; entry.endReason = 'conflict-override-used'; escalate(entry, 'conflict-override-used', `a registration by ${BUNDLE_REPAIR_BOT} carried a conflict override (${ov.ref ?? '?'})`); }
       }
     }
-    persist();
-    // 2. plan + launch
+    // 2. plan + reserve
     const planned = planBundleRepairs({ clones, ledger, settings, killed: isKilled, now });
     summary.off = planned.off;
     summary.held = planned.held;
     for (const t of planned.dispatch) {
       let filled;
-      try { filled = await fillRepairBrief(t, { root }); } catch (e) {
+      try { filled = fillRepairBriefWith(deps.lane, t, { root, ...(readBrief ? { readBrief } : {}) }); } catch (e) {
         summary.failed.push({ holdId: t.holdId, error: firstLine(e) });
         continue;
       }
@@ -307,46 +328,51 @@ export async function runBundleRepairs({
         const path = shadowPath(dir, t.holdId);
         writeShadow(path, filled.prompt);
         ledger.push({ ...base, status: 'shadow', briefPath: path });
-        persist();
         log(`bundle-repair[shadow]: would launch ${filled.session} for clone ${t.name} (held since ${new Date(t.holdSince).toISOString()}) — brief ${path}`);
         try {
-          await publish({ repo: `host/${host}`, pr: 0, head: `bundle-repair-shadow:${t.holdId}`.slice(0, 128), kind: 'bundle-repair-shadow',
+          publish({ repo: `host/${host}`, pr: 0, head: `bundle-repair-shadow:${t.holdId}`.slice(0, 128), kind: 'bundle-repair-shadow',
             reason: `${t.name}: shadow — would launch a bundle repair`.slice(0, 100), episode: t.holdId, pick: `cat ${path}` }, { now });
         } catch { /* the file + log line are the record */ }
         continue;
       }
       if (dryRun) { summary.dispatched.push({ ...base, dryRun }); continue; }
+      // RESERVE BEFORE LAUNCH: on disk (inside this lock) as an indeterminate running repair before anything spawns.
       const token = randomBytes(24).toString('hex');
       const deadlineAt = now + settings.wallTimeMinutes * 60_000;
-      // RESERVE BEFORE LAUNCH: the entry is on disk as an indeterminate running repair before anything spawns, so a
-      // crash mid-launch can never let a later tick launch a second session for this clone/hold.
-      const entry = { ...base, handle: null, deadlineAt, status: 'running', indeterminate: true, tokenHash: sha256(token) };
-      ledger.push(entry);
-      persist();
-      try {
-        const r = await dispatch(t, { prompt: filled.prompt, session: filled.session, token, stateRoot: resolve(dir, '..', '..'), wallTimeMinutes: settings.wallTimeMinutes });
-        entry.handle = r.handle;
-        delete entry.indeterminate;
-        summary.dispatched.push({ ...base, handle: r.handle });
-        log(`bundle-repair: launched ${filled.session} for clone ${t.name}`);
-      } catch (e) {
-        const error = firstLine(e);
-        summary.failed.push({ holdId: t.holdId, error });
-        entry.endReason = error;
-        // Provably not started → settled + escalated. Otherwise keep the slot; the wall time stops it by name.
-        if (e?.notApplied === true) {
-          Object.assign(entry, { status: 'dispatch-failed', endedAt: now, escalationPending: { reason: 'dispatch-failed', detail: error } });
-          delete entry.indeterminate;
-          await tryEscalate(entry);
-          log(`bundle-repair: ESCALATED ${t.name} (dispatch-failed) — ${error}`);
-        }
-      }
-      persist();
+      ledger.push({ ...base, handle: null, deadlineAt, status: 'running', indeterminate: true, tokenHash: sha256(token) });
+      reserved.push({ t, filled, token, base });
     }
+    persist(ledger);
   };
-  // Off with nothing ever recorded: no lock, no files — the feature leaves no footprint until it is turned on.
-  if (settings.enabled !== true && !existsSync(ledgerPath(dir))) { summary.off = 'disabled'; return summary; }
-  if (dryRun) await body(); else await lock(dir, body);
+  if (dryRun) phase1(); else lock(dir, phase1);
+
+  // 3. launch outside the lock; patch each result in under the lock.
+  for (const { t, filled, token, base } of reserved) {
+    let patch;
+    try {
+      const r = await dispatch(t, { prompt: filled.prompt, session: filled.session, token, stateRoot: resolve(dir, '..', '..'), wallTimeMinutes: settings.wallTimeMinutes });
+      patch = { handle: r.handle };
+      summary.dispatched.push({ ...base, handle: r.handle });
+      log(`bundle-repair: launched ${filled.session} for clone ${t.name}`);
+    } catch (e) {
+      const error = firstLine(e);
+      summary.failed.push({ holdId: t.holdId, error });
+      // Provably not started → settled + escalated. Otherwise keep the slot; the wall time stops it by name.
+      patch = e?.notApplied === true ? { failedNotApplied: error } : { endReason: error };
+    }
+    lock(dir, () => {
+      const ledger = readLedger(dir);
+      const entry = ledger.find((x) => x.holdId === t.holdId);
+      if (!entry) return;
+      if (patch.handle !== undefined) { entry.handle = patch.handle; delete entry.indeterminate; }
+      else if (patch.failedNotApplied) {
+        Object.assign(entry, { status: 'dispatch-failed', endedAt: now, endReason: patch.failedNotApplied });
+        delete entry.indeterminate;
+        escalate(entry, 'dispatch-failed', patch.failedNotApplied);
+      } else entry.endReason = patch.endReason;
+      persist(ledger);
+    });
+  }
   return summary;
 }
 

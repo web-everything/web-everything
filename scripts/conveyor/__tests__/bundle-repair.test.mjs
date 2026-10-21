@@ -160,11 +160,19 @@ describe('planReconcile — the escalation path', () => {
     const settledNow = entry({ status: 'cleared', stopSettledAt: NOW });
     expect(planReconcile([settledNow], { clones: [], now: NOW, overrideFor: () => ({ ref: 'lane/x' }) })[0].escalate).toBe('conflict-override-used');
   });
+  it('round 4: a session that cannot be stopped escalates wall-time once, cleared or repaired', () => {
+    const stuck = entry({ status: 'cleared', stopPending: true, deadlineAt: NOW });
+    expect(planReconcile([stuck], { clones: [{ ...c, held: null }], now: NOW })[0]).toMatchObject({ escalate: 'wall-time', stop: true, status: 'cleared' });
+    expect(planReconcile([{ ...stuck, escalations: ['wall-time'] }], { clones: [{ ...c, held: null }], now: NOW })).toEqual([]);
+    const repairedStuck = entry({ status: 'repaired', stopPending: true, deadlineAt: NOW });
+    expect(planReconcile([repairedStuck], { clones: [{ ...c, held: null }], now: NOW })[0].escalate).toBe('wall-time');
+    expect(planReconcile([entry()], { clones: [{ ...c, held: undefined }], now: NOW })).toEqual([]);
+  });
   it('a settled entry whose stop is still pending is still watched for a conflict override (once)', () => {
-    const settled = entry({ status: 'cleared', stopPending: true, endReason: 'the clone left this overlay hold' });
+    const settled = entry({ status: 'cleared', stopPending: true });
     const a = planReconcile([settled], { clones: [{ ...c, held: null }], now: NOW, overrideFor: () => ({ ref: 'lane/x' }) });
     expect(a[0]).toMatchObject({ escalate: 'conflict-override-used', stop: true });
-    expect(planReconcile([{ ...settled, endReason: 'conflict-override-used' }], { clones: [], now: NOW, overrideFor: () => ({ ref: 'lane/x' }) })).toEqual([]);
+    expect(planReconcile([{ ...settled, escalations: ['conflict-override-used'] }], { clones: [], now: NOW, overrideFor: () => ({ ref: 'lane/x' }) })).toEqual([]);
     expect(planReconcile([{ ...settled, stopPending: false }], { clones: [], now: NOW, overrideFor: () => ({ ref: 'lane/x' }) })).toEqual([]);
   });
   it('wall time → escalate; repaired but still held at the wall time → hold-not-cleared', () => {
@@ -184,10 +192,10 @@ describe('runBundleRepairs (IO shell, every seam injected)', () => {
       dir, selfSync, now: NOW, root: process.cwd(),
       rootsByKey: async () => new Map([[KEY, ROOT]]),
       killed: () => false,
-      overrideFor: async () => null,
+      overrideFor: () => null,
       dispatch: async (t, o) => { dispatched.push({ t, o }); return { handle: 'h1' }; },
-      stop: async (e) => { stopped.push(e.holdId); },
-      publish: async (item) => { published.push(item); },
+      stop: (e) => { stopped.push(e.holdId); },
+      publish: (item) => { published.push(item); },
       log: () => {},
       host: 'test-host',
     };
@@ -260,10 +268,10 @@ describe('runBundleRepairs (IO shell, every seam injected)', () => {
     const e = readLedger(dir)[0];
     mkdirSync(join(dir, 'bundle-repair', 'outcomes'), { recursive: true });
     writeFileSync(outcomePath(dir, e.holdId), JSON.stringify({ outcome: 'escalate', reason: 'unresolvable-conflict', detail: 'd' }));
-    const failing = { publish: async () => { throw new Error('feed down'); }, stop: async () => { throw new Error('stop failed'); } };
+    const failing = { publish: () => { throw new Error('feed down'); }, stop: () => { throw new Error('stop failed'); } };
     await runBundleRepairs({ ...seams, ...failing, now: NOW + MIN, ...settings() });
     const pending = readLedger(dir)[0];
-    expect(pending).toMatchObject({ status: 'escalated', stopPending: true, escalationPending: { reason: 'unresolvable-conflict' } });
+    expect(pending).toMatchObject({ status: 'escalated', stopPending: true, escalationPending: [{ reason: 'unresolvable-conflict' }] });
     // the hold is still there and a later hold id would be new — but a pending stop still counts as a live repair
     const s = await runBundleRepairs({ ...seams, now: NOW + 2 * MIN, ...settings() });
     expect(published).toEqual([expect.objectContaining({ kind: 'bundle-repair' })]);
@@ -281,12 +289,42 @@ describe('runBundleRepairs (IO shell, every seam injected)', () => {
     expect(existsSync(join(dir, 'bundle-repair'))).toBe(false);
   });
 
-  it('a pass already holding the ledger lock makes the next pass skip, not double-launch', async () => {
-    const { dir } = setup();
-    let inner = null;
-    await defaultLock(dir, async () => { inner = await defaultLock(dir, async () => 'ran').catch((e) => e.message); });
-    expect(inner).toMatch(/holds the ledger lock/);
+  it('a live pass holding the ledger lock makes another pass fail closed (no launch), and the lock is released after', async () => {
+    const { dir, dispatched, seams } = setup();
+    const { withFileLock } = await import('../../lib/atomic-json-file.mjs');
+    mkdirSync(join(dir, 'bundle-repair'), { recursive: true });
+    writeFileSync(`${ledgerPath(dir)}.lock`, `${process.pid}\n`); // a live holder (this process)
+    const quick = (d, fn) => defaultLock(d, fn, { withFileLock, timeoutMs: 200 });
+    await expect(runBundleRepairs({ ...seams, lock: quick, ...settings() })).rejects.toThrow(/timed out/);
+    expect(dispatched).toEqual([]);
+    const { unlinkSync } = await import('node:fs');
+    unlinkSync(`${ledgerPath(dir)}.lock`);
+    await runBundleRepairs({ ...seams, lock: quick, ...settings() });
+    expect(dispatched).toHaveLength(1);
     expect(existsSync(`${ledgerPath(dir)}.lock`)).toBe(false);
+  });
+
+  it('round 4: unreadable rebuild state is unknown, not cleared', async () => {
+    const { dir, stopped, seams } = setup();
+    await runBundleRepairs({ ...seams, ...settings() });
+    const s = await runBundleRepairs({ ...seams, selfSync: [{ cloneKey: KEY, rebuild: null }], now: NOW + MIN, ...settings() });
+    expect(s.reconciled).toEqual([]);
+    expect(stopped).toEqual([]);
+    expect(readLedger(dir)[0].status).toBe('running');
+  });
+
+  it('round 4: the audit trail is re-read after the stop — an override made just before the stop is still caught', async () => {
+    const { dir, published, seams } = setup();
+    await runBundleRepairs({ ...seams, ...settings() });
+    let stoppedYet = false;
+    const s = await runBundleRepairs({
+      ...seams, selfSync: [{ cloneKey: KEY, rebuild: { held: null } }], now: NOW + MIN, ...settings(),
+      stop: () => { stoppedYet = true; },
+      overrideFor: () => (stoppedYet ? { ref: 'lane/sneaky' } : null),
+    });
+    expect(s.escalated).toEqual([{ holdId: readLedger(dir)[0].holdId, reason: 'conflict-override-used' }]);
+    expect(published.at(-1)).toMatchObject({ kind: 'bundle-repair' });
+    expect(readLedger(dir)[0].status).toBe('escalated');
   });
 
   it('record: only the session holding the capability, once', async () => {
