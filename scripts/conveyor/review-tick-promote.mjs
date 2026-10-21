@@ -124,10 +124,21 @@ export function rearmStaleAcceptsThenReplan({ plan, rawPrs = null, repo, rearm, 
   for (const [pr, headSha] of rows) {
     let result;
     try { result = rearm({ repo, pr, headSha }); } catch (e) { result = { ok: false, reason: oneLine(e) }; }
-    rearms.push({ pr, ok: result?.ok === true, why: result?.ok === true ? 're-armed review of the moved head' : String(result?.reason ?? 're-arm not confirmed') });
+    // #5771: ONE coverage check. A refusal that PROVED the accept still covers the live head (`covers: true`) is not a
+    // reason to keep holding the PR: the plan's row only nominated it, the guarded re-arm checked it. Release the hold.
+    const released = result?.ok !== true && result?.covers === true && String(result?.coveredHead ?? '').toLowerCase() === headSha.toLowerCase();
+    rearms.push({ pr, ok: result?.ok === true, ...(released ? { released: true } : {}),
+      why: result?.ok === true ? 're-armed review of the moved head'
+        : released ? `acceptance verified to still cover the moved head — stale-accept hold released (${String(result?.reason ?? 'covers').slice(0, 120)})`
+          : String(result?.reason ?? 're-arm not confirmed') });
   }
+  // Bound to the PROVED head: a row for a newer head (the PR moved again before a re-plan) is a fresh obligation, never released.
+  const releasedHeads = new Map(rearms.filter((r) => r.released).map((r) => [r.pr, rows.get(r.pr).toLowerCase()]));
+  /** Drop the released PRs' stale-accept rows (never any other row) so nothing holds their red-team request. */
+  const unhold = (p) => (!releasedHeads.size || !Array.isArray(p?.dispatch) ? p : { ...p, dispatch: p.dispatch.filter((d) =>
+    !(d && d.kind === 'restore-review-label' && d.variant === 'stale-accept' && releasedHeads.get(Number(d.prNumber)) === String(d.headRefOid ?? '').toLowerCase())) });
   const rearmed = new Set(rearms.filter((r) => r.ok).map((r) => r.pr));
-  if (!rearmed.size || typeof replan !== 'function') return { plan, rawPrs, rearms, replanError: null };
+  if (!rearmed.size || typeof replan !== 'function') return { plan: unhold(plan), rawPrs, rearms, replanError: null };
 
   const name = (l) => (typeof l === 'string' ? l : l?.name);
   const swap = (labels) => {
@@ -141,8 +152,9 @@ export function rearmStaleAcceptsThenReplan({ plan, rawPrs = null, repo, rearm, 
     // A FRESH read, never the old snapshot with a synthesized label swap: the real swap's exact label result is GitHub's.
     const next = replan(null);
     if (!next || !Array.isArray(next.dispatch)) throw new Error('re-plan returned no dispatch list');
+    // A FRESH plan is never unheld from an earlier proof (audit): its rows are re-proved next pass.
     return { plan: next, rawPrs: nextPrs ?? rawPrs, rearms, replanError: null };
   } catch (e) {
-    return { plan, rawPrs: nextPrs ?? rawPrs, rearms, replanError: oneLine(e) };
+    return { plan: unhold(plan), rawPrs: nextPrs ?? rawPrs, rearms, replanError: oneLine(e) };
   }
 }

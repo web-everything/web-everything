@@ -8,6 +8,8 @@ import { execFileSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
+import { defaultRearmStaleAcceptance } from '../../operations/promote-draft-pr-dispatch.mjs';
+import { normalizeDiffFingerprint } from '../../lib/review-escalation.mjs';
 import { promoteDraftsGuarded, promoteDraftsThenReplan, rearmStaleAcceptanceGuarded, rearmStaleAcceptsThenReplan } from '../review-tick-promote.mjs';
 
 const REPO = 'web-everything/web-everything';
@@ -238,5 +240,87 @@ describe('review daemon: same-pass stale-accept re-arm + review (#5771)', () => 
     expect(r.replanError).toBe('replan down');
     expect(r.rawPrs[0].labels.map((l) => l.name)).toEqual(['ready-to-merge', 'review:pending']);
     expect(r.plan.dispatch[0].kind).toBe('restore-review-label');
+  });
+});
+
+// LIVE 2026-10-21, PR #5771: the planner nominated a stale accept (cheap check, no diff), the guarded re-arm then PROVED the
+// accept still covers the moved head and refused, and the plan went on holding the red-team request forever. One coverage
+// check: a proven-covered refusal releases the hold; every other refusal keeps it.
+describe('stale-accept hold vs guarded re-arm share one coverage verdict (#5771 deadlock)', () => {
+  const REPO_SLUG = REPO, A = 'c'.repeat(40), B = HEAD;
+  const DIFF = 'diff --git a/x.txt b/x.txt\n--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-a\n+b\n';
+  const fp = normalizeDiffFingerprint(DIFF);
+  const pr = {
+    number: 5771, state: 'OPEN', isDraft: false, headRefOid: B, labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }],
+    comments: [{ viewerDidAuthor: true, body: `<!-- reviewed-sha: ${A} -->\n<!-- reviewed-diff: ${fp} -->\n<!-- reviewed-contribution: ${fp} -->` }],
+  };
+  const row = { kind: 'restore-review-label', variant: 'stale-accept', prNumber: 5771, headRefOid: B, label: 'review:pending' };
+  const other = { kind: 'review', prNumber: 9, attempts: 0 };
+  const provider = (text, rearm = vi.fn(() => ({ ok: true })), { prOverride = {}, reviews = [] } = {}) => ({ rearm, fn: () => defaultRearmStaleAcceptance({
+    repoSlug: REPO_SLUG, prNumber: 5771, headSha: B, readPr: () => ({ ...pr, ...prOverride }), rearm, readReviews: () => reviews,
+    readNetDiff: () => ({ scored: true, rev: B, text }) }) });
+
+  it('provider: a live-proven cover refusal carries covers:true and never re-arms', () => {
+    const p = provider(DIFF);
+    expect(p.fn()).toEqual(expect.objectContaining({ ok: false, covers: true }));
+    expect(p.rearm).not.toHaveBeenCalled();
+  });
+  it('provider: a changed live diff re-arms (coverage does NOT hold)', () => {
+    const p = provider(`${DIFF}+smuggled\n`);
+    expect(p.fn()).toEqual({ ok: true });
+    expect(p.rearm).toHaveBeenCalledTimes(1);
+  });
+  it('provider: an unreadable live diff is a plain refusal, never a cover', () => {
+    const r = defaultRearmStaleAcceptance({ repoSlug: REPO_SLUG, prNumber: 5771, headSha: B, readPr: () => pr, rearm: vi.fn(), readReviews: () => [], readNetDiff: () => ({ scored: false }) });
+    expect(r.ok).toBe(false); expect(r.covers).toBeUndefined();
+  });
+  it('tick: the #5771 shape (planner holds, re-arm proves cover) releases the row, keeps other rows, and says why', () => {
+    const r = rearmStaleAcceptsThenReplan({ plan: { dispatch: [row, other], refusals: [] }, rawPrs: [pr], repo: REPO, rearm: provider(DIFF).fn, replan: () => { throw new Error('unreached'); } });
+    expect(r.plan.dispatch).toEqual([other]);
+    expect(r.rearms).toEqual([expect.objectContaining({ pr: 5771, ok: false, released: true, why: expect.stringContaining('hold released') })]);
+  });
+  it('tick: a refusal WITHOUT a proven cover (state moved, unreadable) keeps the hold', () => {
+    const r = rearmStaleAcceptsThenReplan({ plan: { dispatch: [row], refusals: [] }, rawPrs: [pr], repo: REPO, rearm: () => ({ ok: false, reason: 'live acceptance coverage unreadable' }), replan: () => { throw new Error('unreached'); } });
+    expect(r.plan.dispatch).toEqual([row]);
+    expect(r.rearms[0].released).toBeUndefined();
+  });
+  it('tick: coverage that does not hold re-arms and the fresh re-plan proceeds to review', () => {
+    const r = rearmStaleAcceptsThenReplan({ plan: { dispatch: [row], refusals: [] }, rawPrs: [pr], repo: REPO, rearm: provider(`${DIFF}+x\n`).fn, replan: () => ({ dispatch: [{ kind: 'review', prNumber: 5771 }], refusals: [] }) });
+    expect(r.rearms[0].ok).toBe(true);
+    expect(r.plan.dispatch[0].kind).toBe('review');
+  });
+  it('tick: a released PR is no longer blocked, so its red-team request is not held by the plan', () => {
+    const rearm = provider(DIFF).fn;
+    const r = rearmStaleAcceptsThenReplan({ plan: { dispatch: [row], refusals: [] }, rawPrs: [pr], repo: REPO, rearm, replan: () => null });
+    expect([...r.plan.dispatch, ...r.plan.refusals].some((d) => d.prNumber === 5771)).toBe(false);
+  });
+  it('provider (audit): a later hold comment, a pending review label, unreadable reviews, a standing changes-requested review, or a full comment page never prove a cover', () => {
+    const hold = { viewerDidAuthor: true, body: 'review paused: independent review required' };
+    const cases = [
+      { prOverride: { comments: [...pr.comments, hold] } },
+      { prOverride: { labels: [...pr.labels, { name: 'review:pending' }] } },
+      { reviews: null },
+      { reviews: [{ state: 'CHANGES_REQUESTED', user: { login: 'someone' }, submitted_at: '2999-01-01T00:00:00Z' }] },
+      { prOverride: { comments: [...pr.comments, ...Array.from({ length: 100 }, () => ({ viewerDidAuthor: true, body: '<!-- conveyor-note -->' }))] } },
+    ];
+    for (const c of cases) {
+      const r = provider(DIFF, undefined, c).fn();
+      expect(r.covers, JSON.stringify(Object.keys(c))).toBeUndefined();
+    }
+  });
+  it('tick (audit): a row for a NEWER head than the one proved covered is a fresh obligation and is kept', () => {
+    const C = 'd'.repeat(40);
+    const r = rearmStaleAcceptsThenReplan({ plan: { dispatch: [row], refusals: [] }, rawPrs: [pr], repo: REPO,
+      rearm: () => ({ ok: false, covers: true, coveredHead: C, reason: 'x' }), replan: () => null });
+    expect(r.plan.dispatch).toEqual([row]);
+    expect(r.rearms[0].released).toBeUndefined();
+  });
+  it('tick (audit): a fresh re-plan is never unheld from an earlier proof (same-head new obligation survives)', () => {
+    const other2 = { ...pr, number: 8 };
+    const rows2 = (n) => ({ ...row, prNumber: n });
+    const rearm = ({ pr: n }) => (n === 5771 ? { ok: false, covers: true, coveredHead: B, reason: 'x' } : { ok: true });
+    const r = rearmStaleAcceptsThenReplan({ plan: { dispatch: [row, rows2(8)], refusals: [] }, rawPrs: [pr, other2], repo: REPO, rearm,
+      replan: () => ({ dispatch: [row], refusals: [] }) });
+    expect(r.plan.dispatch).toEqual([row]);
   });
 });

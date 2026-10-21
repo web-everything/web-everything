@@ -74,7 +74,8 @@ import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { applyReviewStatus } from '../conveyor/review-status-tag.mjs';
 import { spawnCiHealRearm } from '../conveyor/ci-heal-mark.mjs';
 import { staleAcceptanceOwed } from '../conveyor/rearm-review.mjs';
-import { createGhProvider } from '../lib/review-label-provider.mjs';
+import { createGhProvider, PR_COMMENTS_PAGE_SIZE } from '../lib/review-label-provider.mjs';
+import { latestAcceptRecord } from '../lib/accept-carry-forward.mjs';
 import { execFileSync } from 'node:child_process';
 import { readNetDiffAtHead } from '../merge-ai-prs.mjs';
 import { defaultCloneDirFor } from '../conveyor/accept-carry-sweep.mjs';
@@ -161,6 +162,7 @@ export function defaultReadPrLabels({ repoSlug, prNumber, runGh = runGhSync } = 
  * boundary also refuses when a changes verdict has replaced the acceptance. */
 export function defaultRearmStaleAcceptance({ repoSlug, prNumber, headSha,
   readPr = (repo, number) => createGhProvider().readPrState(repo, number), rearm = spawnCiHealRearm,
+  readReviews = (repo, number) => createGhProvider().readPrReviews(repo, number),
   readNetDiff = () => {
     const cwd = repoKeyForSlug(repoSlug) === 'we' ? THIS_CODE_ROOT : defaultCloneDirFor(repoSlug);
     if (cwd === null) return { scored: false };
@@ -178,7 +180,23 @@ export function defaultRearmStaleAcceptance({ repoSlug, prNumber, headSha,
       fresh = readPr(repoSlug, prNumber);
       if (fresh.state !== 'OPEN' || fresh.headRefOid !== headSha
           || !staleAcceptanceOwed({ ...fresh, headDiff: net.text, headContribution: net.text })) {
-        return { ok: false, reason: 'acceptance still covers the head, or review state changed' };
+        // #5771: `covers: true` only when the live proof ITSELF shows the accept still covers this head (same open PR and
+        // head, accept still owed on the cheap nomination, not owed once the live diff is supplied). The tick reads it to
+        // release its stale-accept hold; any other refusal (state moved, labels changed) stays a plain refusal.
+        // Audit (#5771): content equality alone is not "the accept still stands". Also require the accept to be unsuperseded
+        // (no later verdict/hold comment, no standing formal review, complete thread, readable reviews) and no pending review.
+        let covers = false;
+        try {
+          const names = (fresh.labels ?? []).map(l => (typeof l === 'string' ? l : l?.name));
+          const comments = Array.isArray(fresh.comments) ? fresh.comments : [];
+          const reviews = readReviews(repoSlug, prNumber);
+          const rec = comments.length < PR_COMMENTS_PAGE_SIZE && Array.isArray(reviews) ? latestAcceptRecord(comments, reviews) : null;
+          covers = fresh.state === 'OPEN' && fresh.headRefOid === headSha && !names.includes('review:pending')
+            && !!rec && !rec.laterVerdict && !rec.laterBodyDerivedHold && !rec.reviewsUnreadable && !rec.humanCleared
+            && staleAcceptanceOwed(fresh, { requireProof: false })
+            && !staleAcceptanceOwed({ ...fresh, headDiff: net.text, headContribution: net.text });
+        } catch { covers = false; }
+        return { ok: false, ...(covers ? { covers: true, coveredHead: headSha } : {}), reason: 'acceptance still covers the head, or review state changed' };
       }
     }
     return rearm({ repo: repoSlug, pr: prNumber, onlyIfAccepted: true, actor: 'conveyor stale-accept recovery' });
