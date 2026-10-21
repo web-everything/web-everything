@@ -236,7 +236,8 @@ import { prepareDrainFreeze, drainFreezeSignal, flatText } from './lib/red-main-
 import { resolveRedMainHoldSetting, resolveRedMainMode, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs';
 import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward, laterReviewHold } from './lib/accept-carry-forward.mjs'; // card xu7kxtt (#5472) — an identical net diff keeps the accept
 import { decideQuarantineHold, resolveFixFiles, listedPrFiles } from './lib/red-main-quarantine.mjs'; // mode `quarantine` (OFF by default until its red-team review)
-import { readPinnedChangedFiles } from './lib/merge-queue-enqueue.mjs';
+import { readPinnedChangedFiles, readMergeQueueState } from './lib/merge-queue-enqueue.mjs';
+import { prLifecycleStatus, needsLocalMergeCheck, applyLocalMergeCheck, localMergeTreeCheck, isNonSkipStatus } from './lib/drain-unknown-mergeability.mjs';
 import { decideDrainWorkflowEditHold, resolveDrainWorkflowEditHuman } from './lib/drain-workflow-edit-hold.mjs';
 import { readQuarantine } from './lib/red-main-quarantine-io.mjs'; // the "contain" third of the red-main safety net: while main is red only the main-fix PR(s) land
 export { remoteManifestApiArgs };
@@ -1046,8 +1047,15 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   let queueBlockedRelief = false;
   let queueBlocker = '';
   // Evaluated only at the merge-state arm, after certification, CI and mergeability pass.
+  // Live 2026-10-21 — GitHub left the merge state UNKNOWN but a local merge-tree of the pinned head is clean: conflict
+  // freedom is proven, branch protection is NOT, so the same protection checks the BLOCKED relief runs must pass here
+  // (reviewDecision, and every queue-required check present and green). Never relieved from UNKNOWN alone.
+  // Any locally established MERGEABLE must pass the protection checks, whatever merge state rides with it (Codex re-audit 3).
+  const localUnknownState = pr?.mergeabilityFrom === 'local-merge-tree' && mergeable === 'MERGEABLE';
   const relieveQueueBlocked = () => {
-    if (state !== 'BLOCKED' || !Array.isArray(queueRequiredChecks) || !queueRequiredChecks.length) return false;
+    const hasQueueChecks = Array.isArray(queueRequiredChecks) && queueRequiredChecks.length > 0;
+    // Both reliefs need the live required-check set: unknown/empty requirements fail closed (Codex re-audit).
+    if (!hasQueueChecks || !(state === 'BLOCKED' || localUnknownState)) return false;
     const reviewDecision = String(pr.reviewDecision || '').toUpperCase();
     if (['CHANGES_REQUESTED', 'REVIEW_REQUIRED'].includes(reviewDecision)) {
       queueBlocker = `; reviewDecision=${reviewDecision}`;
@@ -1066,7 +1074,7 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
       queueBlocker = `; ${gate.reason}${gate.affected.length ? `: ${gate.affected.map(({ name, reason }) => `${name} (${reason})`).join(', ')}` : ''}`;
       return false;
     }
-    queueBlockedRelief = true;
+    if (state === 'BLOCKED') queueBlockedRelief = true;
     return true;
   };
   let decision = 'merge';
@@ -1084,7 +1092,11 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
     : humanCleared
       ? 'human-cleared (review:accepted), required check green, cleanly mergeable'
       : 'AI-generated, required check green, cleanly mergeable';
-  if (pr?.requiredCheckReadError) { decision = 'skip'; reason = pr.requiredCheckReadError; }
+  // Live 2026-10-21 (#5798) — a MERGED / CLOSED / merge-queued PR has no GitHub mergeability (it reads UNKNOWN for
+  // good). It is not a skip: it carries a status the pass reports apart from skips. decision stays non-merge (fail closed).
+  const lifecycle = prLifecycleStatus(pr);
+  if (lifecycle) { decision = 'skip'; reason = lifecycle.reason; }
+  else if (pr?.requiredCheckReadError) { decision = 'skip'; reason = pr.requiredCheckReadError; }
   // fix.pushBeforeGate (2026-10-10) — a fixer now pushes BEFORE its local gate is green, so a claimed PR's head may be
   // an unverified intermediate commit. The live fix claim (attached by the caller as `pr.fixClaim`) is the lock: never
   // land while it is held, whatever the labels or CI say. Released on the fixer's green hand-back.
@@ -1095,11 +1107,12 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   else if (offDefaultBase) { decision = 'skip'; reason = `base is not ${defaultBranch || 'the default branch'} (${base})`; }
   else if (!testGreen && !prestagePendingCi) { decision = 'skip'; reason = `required check "${requiredCheck}" is not green`; }
   else if (blockOnCodeQL && isCodeQLFailed(pr)) { decision = 'skip'; codeqlBlocked = true; reason = `CodeQL check failed (new code-scanning alerts in the changed code) — refusing to land; fix the alert and re-push (drainBlocksOnCodeQL)`; }
-  else if (mergeable !== 'MERGEABLE') { decision = 'skip'; reason = `not mergeable (mergeable=${mergeable || 'UNKNOWN'})`; }
+  else if (mergeable !== 'MERGEABLE') { decision = 'skip'; reason = `not mergeable (mergeable=${mergeable || 'UNKNOWN'})${pr?.mergeabilityFrom === 'local-merge-tree' && mergeable === 'CONFLICTING' ? ` — GitHub said UNKNOWN; local merge-tree found conflicts${pr.localConflictFiles?.length ? `: ${pr.localConflictFiles.slice(0, 5).join(', ')}` : ''}` : ''}`; }
   // The reason names the ACTUAL state: the old one-size text always said "BEHIND⇒needs rebase", so a PR that was
   // only BLOCKED (checks red/pending, ci-heal already running: #4235, 2026-10-07) was classified `behind` in the
   // skip-reasons log and read as an unowned rebase.
-  else if (!landableState && !(prestagePendingCi && state === 'BLOCKED' && !['CHANGES_REQUESTED', 'REVIEW_REQUIRED'].includes(pr.reviewDecision)) && !relieveQueueBlocked()) { decision = 'skip'; reason = unlandableStateReason(state) + queueBlocker; }
+  else if (localUnknownState && !relieveQueueBlocked()) { decision = 'skip'; reason = `mergeable=UNKNOWN on GitHub; local merge-tree is clean but branch protection is not proven${queueBlocker || '; live required-check set unavailable'}`; }
+  else if (!localUnknownState && !landableState && !(prestagePendingCi && state === 'BLOCKED' && !['CHANGES_REQUESTED', 'REVIEW_REQUIRED'].includes(pr.reviewDecision)) && !relieveQueueBlocked()) { decision = 'skip'; reason = unlandableStateReason(state) + queueBlocker; }
   // #2324 — refuse to land a PR with an empty/whitespace description, same rule pr-land.mjs enforces before
   // labelling (PR #206 landed bodyless). Checked before the review hold so the more actionable reasons win.
   else if (!hasNonEmptyBody(pr?.body)) { decision = 'skip'; reason = 'empty/whitespace description — refusing to land it (add a real summary of what changed and why; #2324)'; }
@@ -1111,7 +1124,8 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   // held ⇒ a no-op for the common case (#2820-review-fix finding 3 — "checked LAST so earlier reasons win").
   else if (reviewUncleared) { decision = 'skip'; reviewHeld = true; reason = `unsatisfied review hold ("${heldLabel}") present without review:accepted — refusing to merge regardless of "${trustLabel}" (#2820)`; }
   if (queueBlockedRelief && decision === 'merge') reason += `; BLOCKED only by the required merge queue (all ${queueRequiredChecks.length} required checks green) — enqueue`;
-  return { num, title, decision, reason, aiGenerated, certifyLabel, humanCleared, reviewHeld, codeqlBlocked, testGreen, ...(prestagePendingCi ? { prestagePendingCi: true } : {}), state, mergeable, offDefaultBase,
+  if (decision === 'merge' && pr?.mergeabilityFrom === 'local-merge-tree') reason += '; GitHub mergeability stayed UNKNOWN — a local merge-tree check of the pinned head against the base is clean';
+  return { num, title, decision, reason, ...(lifecycle ? { status: lifecycle.status } : {}), ...(pr?.mergeabilityFrom ? { mergeabilityFrom: pr.mergeabilityFrom } : {}), aiGenerated, certifyLabel, humanCleared, reviewHeld, codeqlBlocked, testGreen, ...(prestagePendingCi ? { prestagePendingCi: true } : {}), state, mergeable, offDefaultBase,
     ...(queueBlockedRelief && decision === 'merge' ? { queueBlockedRelief: true } : {}),
     ...(pr?.requiredCheckReadError ? { requiredCheckReadError: pr.requiredCheckReadError } : {}) };
 }
@@ -1187,11 +1201,20 @@ export function resolveUnknownMergeabilityRetry(env = {}, layers = {}) {
  * Fails closed exactly as before: an UNKNOWN that never resolves within the bound returns that same refusal.
  * IO is injected (`read` → the fresh PR or null; `sleep(ms)`), so the bound is testable without GitHub.
  */
-export async function revalidateWithUnknownRetry({ read, opts, setting = UNKNOWN_MERGEABILITY_RETRY, sleep }) {
-  let verdict = revalidateForMerge(await read(), opts);
+export async function revalidateWithUnknownRetry({ read, opts, setting = UNKNOWN_MERGEABILITY_RETRY, sleep, localCheck = null }) {
+  let fresh = await read();
+  let verdict = revalidateForMerge(fresh, opts);
   for (let attempt = 0; attempt < setting.retries && isTransientUnknownMergeability(verdict); attempt += 1) {
     await sleep(setting.delayMs);
-    verdict = revalidateForMerge(await read(), opts);
+    fresh = await read();
+    verdict = revalidateForMerge(fresh, opts);
+  }
+  // Live 2026-10-21 — an OPEN, not-queued PR still UNKNOWN after the bound gets a local merge-tree check of its pinned
+  // head; only that check's clean answer can make it mergeable (never UNKNOWN alone). Queued/merged/closed never get here.
+  if (typeof localCheck === 'function' && isTransientUnknownMergeability(verdict) && needsLocalMergeCheck(fresh)) {
+    let check;
+    try { check = await localCheck(fresh); } catch (e) { check = { error: String(e?.message || e) }; }
+    verdict = revalidateForMerge(applyLocalMergeCheck({ ...fresh }, check), opts);
   }
   return verdict;
 }
@@ -1218,8 +1241,10 @@ export function applyCiLifecycleLabelPlan({ plan, pr, repo = null, slug = repo, 
 }
 
 /** Refresh UNKNOWN listing facts before reading head-bound manifests/commits or classifying the pass. */
-export async function repollUnknownListings({ prsByRepo, read, sleep, setting = UNKNOWN_MERGEABILITY_RETRY, concurrency = 4 }) {
-  const unknown = pr => String(pr.mergeable ?? '').toUpperCase() === 'UNKNOWN';
+export async function repollUnknownListings({ prsByRepo, read, sleep, setting = UNKNOWN_MERGEABILITY_RETRY, concurrency = 4, localCheck = null }) {
+  // A queued / merged / closed PR is answered by the first fresh read (its status, not its mergeability), so it
+  // leaves the re-poll at once instead of burning the whole bound on an UNKNOWN GitHub will never compute.
+  const unknown = pr => String(pr.mergeable ?? '').toUpperCase() === 'UNKNOWN' && !prLifecycleStatus(pr);
   let pending = [...prsByRepo].flatMap(([repo, prs]) => prs.filter(unknown).map(pr => ({ repo, pr })));
   for (let attempt = 0; pending.length && attempt < Math.min(3, setting.retries); attempt++) {
     await sleep(setting.delayMs);
@@ -1230,6 +1255,15 @@ export async function repollUnknownListings({ prsByRepo, read, sleep, setting = 
       return unknown(pr) ? { repo, pr } : null;
     });
     pending = unresolved.filter(Boolean);
+  }
+  // Still UNKNOWN, OPEN and not queued after the bound → the local merge-tree check decides (clean → mergeable,
+  // conflict → CONFLICTING, unreadable → stays UNKNOWN and is refused as before).
+  if (typeof localCheck === 'function') {
+    await mapWithConcurrency(pending.filter(({ pr }) => needsLocalMergeCheck(pr)), concurrency, async ({ repo, pr }) => {
+      let check;
+      try { check = await localCheck(repo, pr); } catch (e) { check = { error: String(e?.message || e) }; }
+      applyLocalMergeCheck(pr, check);
+    });
   }
 }
 
@@ -4743,10 +4777,16 @@ async function runCli() {
   const fetchFreshPrForRevalidation = async (repo, num) => {
     try {
       const { stdout: raw } = await execFileP('gh', ['pr', 'view', String(num), ...repoFlag(repo), '--json',
-        'number,title,body,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,labels,commits'],
+        'number,title,body,state,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,labels,commits'],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
       const data = JSON.parse(raw || '{}');
       if (!data || data.number == null) return null;
+      // Live 2026-10-21 (#5798) — GitHub never computes `mergeable` for a merge-queued PR. On an OPEN UNKNOWN read, ask
+      // the queue (the same membership read the enqueue verification uses); an unreadable answer leaves it unset.
+      if (String(data.state || '').toUpperCase() === 'OPEN' && String(data.mergeable || '').toUpperCase() === 'UNKNOWN') {
+        const q = readMergeQueueState({ repo: repo || localSlug, pr: num, readJson: args => JSON.parse(execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}') });
+        if (typeof q.inQueue === 'boolean') data.isInMergeQueue = q.inQueue;
+      }
       attachLiveFixClaim(data, { claimKey: repoKeyForSlug(repo ?? localSlug), readClaim: readLiveFixClaim });
       return await resolveChecks(repo, data);
     } catch { return null; }
@@ -4754,6 +4794,14 @@ async function runCli() {
   // Live 2026-10-09 — a transient UNKNOWN (GitHub recomputing after this cascade's own previous merge) is
   // re-read a bounded number of times before the refusal stands; see `revalidateWithUnknownRetry`.
   const UNKNOWN_RETRY = resolveUnknownMergeabilityRetry(process.env);
+  // Live 2026-10-21 — the local conflict check for an OPEN, not-queued PR GitHub still reports UNKNOWN after the bound.
+  const localMergeCheck = (repo, pr) => {
+    const cwd = isLocalRepo(repo) ? process.cwd() : siblingCloneDir(repo);
+    const check = localMergeTreeCheck({ cwd, num: pr.number, base: pr.baseRefName, headSha: pr.headRefOid,
+      run: (cmd, args, o) => spawnSync(cmd, args, { ...o, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) });
+    if (!AS_JSON) process.stderr.write(`  ⌥ ${repoTag(repo)}${pr.number} GitHub mergeability still UNKNOWN (open, not queued) — local merge-tree vs ${pr.baseRefName}: ${check.clean ? 'clean' : check.conflict ? `CONFLICTS (${(check.files || []).slice(0, 5).join(', ')})` : `unreadable (${check.error}) — refusing as UNKNOWN`}\n`);
+    return check;
+  };
   const fail = (reason, detail, code) => {
     if (AS_JSON) writeAllSync(1, JSON.stringify({ ok: false, reason, detail }) + '\n');
     else process.stderr.write(`merge-ai-prs ✗ ${reason}: ${detail}\n`);
@@ -5316,7 +5364,7 @@ async function runCli() {
   // fails closed (a coupled impl defers rather than orphan-landing past a carrier the gate cannot see).
   const prsByRepo = narrowPrsByRepo(listings, { onlyPr, onlyRepo, repos: REPOS, isLocalRepo });
   const openPrContext = await repollThenCollectContext({
-    repoll: () => repollUnknownListings({ prsByRepo, read: fetchFreshPrForRevalidation, setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) }),
+    repoll: () => repollUnknownListings({ prsByRepo, read: fetchFreshPrForRevalidation, setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, localCheck: localMergeCheck, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) }),
     collect: () => (RECONCILE ? __t.timeAsync('listing', () => __t.timeAsync('listing.context', () => collectContext(liveListingsByRepo))) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false })),
   });
   // #xc7p3q9 (R2) — the operator escape hatch symmetric to `--no-review-escalation`: `--assume-complete-context`
@@ -5521,7 +5569,7 @@ async function runCli() {
       const pr = await fetchFreshPrForRevalidation(repo, num);
       return retainApprovedHumanQueueHead(pr, { queueOwnsFreshness: mergeStrategy.queueOwnsFreshness(repo),
         hold: pr?.mergeStateStatus === 'BEHIND' && approvedHeadHold({ repo, num }, opts.expectedHeadSha) });
-    }, opts, setting: UNKNOWN_RETRY, sleep: sleepSync,
+    }, opts, setting: UNKNOWN_RETRY, sleep: sleepSync, localCheck: (fresh) => localMergeCheck(repo, fresh),
   });
   const refreshApprovedHead = async (v, options) => {
     let hold = approvedHeadHold(v, options.expectedHead);
@@ -6508,7 +6556,10 @@ async function runCli() {
     return p;
   };
   const toMerge = verdicts.filter((v) => v.decision === 'merge' && !v.prestagePendingCi); // @merge-gate-exempt the FINAL set actually merged; a held PR is `decision:'skip'` and MUST be excluded here — this is the hard AND that never lands a held PR
-  const skipped = verdicts.filter((v) => v.decision === 'skip' && !v.requiredCheckReadError);
+  // Live 2026-10-21 — a merge-queued / merged / closed PR is NOT a skip (no skip comment, no skip row, no drain-hold).
+  const skipped = verdicts.filter((v) => v.decision === 'skip' && !v.requiredCheckReadError && !isNonSkipStatus(v));
+  const nonSkipStatuses = verdicts.filter(isNonSkipStatus);
+  if (!AS_JSON) for (const v of nonSkipStatuses) process.stderr.write(`  ⇢ ${repoTag(v.repo)}${v.num} ${v.status} — ${v.reason}\n`);
   // #xc7p3q9 (R6) — the held couple's members (its `skip` carrier + its deferred impl half — both carry
   // `coupleDeferReason:'held'`) so `decideBatchesIdleExit` can SUBTRACT them from `considered` rather than waive
   // the queue-empty check wholesale.
@@ -6733,7 +6784,7 @@ async function runCli() {
         if (hold) { process.stderr.write(`  card-group: #${c.num} not admitted (${hold.kind}: ${hold.reason})\n`); continue; }
         const r = await revalidateFresh(c.repo, c.num, { queueRequiredChecks: queueRequiredChecksOf(c.repo), requiredCheck: REQUIRED,
           allowPendingReview: false, defaultBranch: defaultBranchOf(c.repo), expectedHeadSha: head });
-        if (r.decision !== 'merge') { process.stderr.write(`  card-group: #${c.num} not admitted (fresh re-read: ${r.reason})\n`); continue; }
+        if (r.decision !== 'merge') { process.stderr.write(`  card-group: #${c.num} ${r.status ? `left out — ${r.status}` : 'not admitted'} (fresh re-read: ${r.reason})\n`); continue; }
         admitted.set(Number(c.num), r.headSha || head);
       } catch (e) { process.stderr.write(`  card-group: #${c.num} not admitted (admission read failed: ${String(e?.message || e).split('\n')[0]})\n`); }
     }
@@ -6807,6 +6858,8 @@ async function runCli() {
     // #2257 — an item is unique per (repo, PR#): match/remove candidates on both so a WE #10 and a FUI #10 never
     // collide in the cascade bookkeeping.
     const sameCand = (a, b) => a.num === b.num && a.repo === b.repo;
+    // A landing's identity: `repo: null` (this clone) and its own slug are the same repo.
+    const sameLanded = (a, b) => Number(a.num) === Number(b.num) && (a.repo || localSlug || null) === (b.repo || localSlug || null);
     let staleLandedOpenItems = [];
     for (;;) {
       // #3004 — RE-DERIVE the negative counter-evidence immediately before every re-plan, from `verdicts`' carriers
@@ -6962,7 +7015,8 @@ async function runCli() {
         // revalidation). Recorded into `merged` so its numbering / resolve-on-land / derived regen runs this pass —
         // those steps are idempotent, and once merged a PR drops off every later pass's open-PR listing.
         const recordAlreadyMerged = () => {
-          merged.push({ num: c.num, repo: c.repo, headSha: c.headSha ?? null });
+          // Live 2026-10-21 ("merged 2 (#5798, #5798)") — one PR is one landing, however many paths confirm it.
+          if (!merged.some((m) => sameLanded(m, c))) merged.push({ num: c.num, repo: c.repo, headSha: c.headSha ?? null });
           progressed = true;
           remaining = remaining.filter((x) => !sameCand(x, c));
           for (const id of landedIdsForCandidate(c, { isLocalRepo, openPrNums: otherOpenPrNums(c.repo, c.num) })) landedThisPass.add(id);
@@ -6995,6 +7049,13 @@ async function runCli() {
               continue;
             }
             const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; // stays blocking its dependents; re-read live next pass
+            // Live 2026-10-21 (#5798) — already in GitHub's merge queue: it is enqueued, not refused (its follow-up
+            // runs when GitHub merges it). A closed PR is simply dropped. Neither is a revalidation abort.
+            if (revalidated.status === 'in-merge-queue' || revalidated.status === 'closed') {
+              if (revalidated.status === 'in-merge-queue') enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'enqueued', already: true });
+              if (!AS_JSON) process.stderr.write(`  ⇢ ${repoTag(c.repo)}${c.num} ${revalidated.status} — ${revalidated.reason}\n`);
+              continue;
+            }
             noteSplit(`fresh re-read refused it: ${revalidated.reason}`);
             // #2198 — a PR this pass just rebuilt has a new head and re-running CI, so it is EXPECTED to fail the
             // re-check; it keeps its "land on a later pass" bucket rather than reading as an aborted merge. Only
@@ -7525,7 +7586,7 @@ async function runCli() {
     const grouping = cardGrouping.form({ outcomes: enqueueOutcomes, verdicts, deferred, admitted: await cardGroupAdmission(verdicts.filter(v => !enqueueOutcomes.some(o => o.outcome === 'enqueued' && Number(o.num) === Number(v.num) && isLocalRepo(o.repo))) ) });
     if (grouping?.reason && !/^(disabled|[01] card-only overlap deferral)/.test(grouping.reason)) process.stderr.write(`  card-group: no group this pass — ${grouping.reason}\n`);
   }
-  const result = { ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, skipReasons, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text, retryable: !!l.err.retryable })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
+  const result = { ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, skipReasons, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text, retryable: !!l.err.retryable })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), ...(nonSkipStatuses.length ? { statuses: nonSkipStatuses.map((v) => ({ num: v.num, repo: v.repo || localSlug, status: v.status, reason: v.reason })) } : {}), timings };
   if (!DRY_RUN && onlyPr == null && throughput.value.carryOverReadyFirst) {
     try { writeCarry(carryPath, carryReady(skipReasons)); }
     catch (e) { process.stderr.write(`drain: carry-over write failed: ${e.message}\n`); }

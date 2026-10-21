@@ -10,6 +10,8 @@
  * drain's own verbatim text; `source` names the bucket it came from.
  */
 
+import { isNonSkipStatus } from './drain-unknown-mergeability.mjs';
+
 export const SKIP_KINDS = Object.freeze([
   'unknown-mergeability', 'conflicting', 'behind', 'checks-pending', 'review-hold', 'cap', 'head-moved',
   'couple-held', 'blocked-by', 'overlap-yield', 'rebuilt-pending-ci', 'merge-failed', 'parked',
@@ -82,7 +84,7 @@ export function buildSkipReasons({ verdicts = [], merged = [], failedMerges = []
   }
   for (const x of parked) put(x, 'parked', (x.reasons || []).join('; '), 'parked');
   for (const v of verdicts) {
-    if (v.decision === 'merge') continue;
+    if (v.decision === 'merge' || isNonSkipStatus(v)) continue; // queued / landed / closed is a status, not a skip
     let kind = classifySkipReason(v.reason);
     if (kind === 'unrecognized-reason' && v.escalated === 'yes') kind = 'escalated';
     put(v, kind, v.reason, 'skipped');

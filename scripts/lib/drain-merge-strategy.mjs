@@ -382,6 +382,7 @@ export function createDrainMergeStrategy({
   const adaptiveBatching = () => batching ??= createAdaptiveBatching({ repo: localSlug, exec, dryRun, log: say });
   const enqueues = (repo) => enqueueMode && !!isLocalRepo(repo);
   const slugOf = (repo) => repo || localSlug;
+  const canonKey = (repo, num) => keyOf(slugOf(repo), num);
 
   // Use the strategy's executor so injected GitHub/git IO stays hermetic too.
   const realFilesRun = (cmd, args, options) => {
@@ -939,10 +940,11 @@ export function createDrainMergeStrategy({
         try { exec('gh', ['pr', 'comment', String(c.num), '--repo', slugOf(c.repo), '--body', buildClearanceComment(headSha)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); stamped = true; }
         catch (e) { say(`  ⚠ ${keyOf(c.repo, c.num)} enqueue clearance stamp failed (${firstLine(e)}) — merge-gate's couple/blockedBy gates will fail closed for it`); }
       }
-      if (!state.pending.some((p) => keyOf(p.repo, p.num) === keyOf(c.repo, c.num))) {
+      // Live 2026-10-21 — `repo: null` and the local slug are one PR: never record it pending twice (it was counted twice).
+      if (!state.pending.some((p) => keyOf(p.repo, p.num) === keyOf(c.repo, c.num) || canonKey(p.repo, p.num) === canonKey(c.repo, c.num))) {
         state.pending.push({ num: c.num, repo: c.repo ?? null, headSha, item: c.item ?? null, hasManifest: !!c.hasManifest, headRef: c.headRef ?? null, title: c.title ?? null, enqueuedAt: new Date().toISOString() });
       }
-      const pending = state.pending.find(p => keyOf(p.repo, p.num) === key);
+      const pending = state.pending.find(p => keyOf(p.repo, p.num) === key) || state.pending.find(p => canonKey(p.repo, p.num) === canonKey(c.repo, c.num));
       Object.assign(pending, { headSha, ...(stamped ? { clearanceHead: headSha } : {}) });
       writeState(statePath, state);
       say(`  ⇢ ${keyOf(c.repo, c.num)} ${r.already ? 'already in' : 'ENQUEUED on'} GitHub's merge queue at ${String(headSha).slice(0, 9)}${r.entry?.position != null ? ` (position ${r.entry.position})` : ''} — GitHub merges it; the drain follows up after`);
@@ -972,7 +974,12 @@ export function createDrainMergeStrategy({
       const facts = [];
       const drop = new Set(); // keys to retire from `pending`; everything else (open, read failure) stays
       const followedUpKeys = new Set(state.followedUp);
+      const followedUpCanon = new Set(state.followedUp.map((k) => (String(k).startsWith('cwd#') ? canonKey(null, String(k).slice(4)) : String(k))));
+      const seenCanon = new Set(); // Live 2026-10-21 — a PR pending under both `cwd#N` and `<slug>#N` is ONE follow-up
       for (const p of state.pending) {
+        const ck = canonKey(p.repo, p.num);
+        if (seenCanon.has(ck)) { drop.add(keyOf(p.repo, p.num)); continue; }
+        seenCanon.add(ck);
         let v;
         try { v = JSON.parse(exec('gh', ['pr', 'view', String(p.num), '--repo', slugOf(p.repo), '--json', 'number,state,mergedAt,mergeCommit,labels'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}'); }
         catch (e) { say(`  ⚠ ${keyOf(p.repo, p.num)} queue follow-up read failed (${firstLine(e)}) — retried next pass`); continue; }
@@ -980,7 +987,7 @@ export function createDrainMergeStrategy({
           try { removeSentBack(p.repo, p.num, v.labels); }
           catch (e) { say(`  ⚠ ${keyOf(p.repo, p.num)} dequeue failed (${firstLine(e)}) — retried next pass`); }
         }
-        if (v?.state === 'MERGED') { if (followedUpKeys.has(keyOf(p.repo, p.num))) drop.add(keyOf(p.repo, p.num)); else facts.push({ p, v }); }
+        if (v?.state === 'MERGED') { if (followedUpKeys.has(keyOf(p.repo, p.num)) || followedUpCanon.has(ck)) drop.add(keyOf(p.repo, p.num)); else facts.push({ p, v }); }
         else if (v?.state === 'CLOSED') { drop.add(keyOf(p.repo, p.num)); say(`  · ${keyOf(p.repo, p.num)} left the merge queue CLOSED without merging — dropped from the follow-up list`); }
       }
       const plan = planQueueFollowUps({ merged: facts.map((f) => ({ number: f.p.num, mergedAt: f.v.mergedAt, mergeCommit: f.v.mergeCommit })) });
@@ -994,7 +1001,7 @@ export function createDrainMergeStrategy({
           continue;
         }
         attempted.add(keyOf(p.repo, p.num));
-        merged.push({ num: p.num, repo: p.repo, headSha: p.headSha ?? null, mergedBy: 'github-merge-queue' });
+        if (!merged.some((m) => canonKey(m.repo, m.num) === canonKey(p.repo, p.num))) merged.push({ num: p.num, repo: p.repo, headSha: p.headSha ?? null, mergedBy: 'github-merge-queue' });
         for (const id of landedIdsFor(p)) landedThisPass.add(id);
         done.push(p);
         say(`  ✓ ${keyOf(p.repo, p.num)} merged by GitHub's merge queue${fu.mergeSha ? ` (${String(fu.mergeSha).slice(0, 9)})` : ''} — running its numbering/resolve/regen follow-up this pass`);

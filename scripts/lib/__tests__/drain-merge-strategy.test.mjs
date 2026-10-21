@@ -284,6 +284,27 @@ describe('drain merge strategy — github-merge-queue', () => {
     expect(m3).toEqual([]);
   });
 
+  it('live 2026-10-21 "merged 2 (#5798, #5798)": one PR pending as cwd#N AND <slug>#N is ONE landing', () => {
+    // The real state left behind: followedUp held both 'cwd#5798' and 'web-everything/web-everything#5798'.
+    const initial = { pending: [{ num: 5798, repo: null, headSha: HEAD }, { num: 5798, repo: LOCAL, headSha: HEAD }], followedUp: [] };
+    const h = harness({ strategy: 'github-merge-queue', initial, ghView: { 5798: MERGED } });
+    const merged = [];
+    const done = h.s.collectQueueMerged({ merged, landedThisPass: new Set() });
+    expect(merged.map((m) => m.num)).toEqual([5798]);
+    h.s.confirmQueueFollowUps(done);
+    expect(h.state().pending).toEqual([]);
+    // a landing another path already recorded this pass (the cascade's already-merged probe) is not pushed again
+    const h2 = harness({ strategy: 'github-merge-queue', initial: { pending: [{ num: 7, repo: LOCAL }], followedUp: [] }, ghView: { 7: MERGED } });
+    const m2 = [{ num: 7, repo: null }];
+    h2.s.collectQueueMerged({ merged: m2, landedThisPass: new Set() });
+    expect(m2).toHaveLength(1);
+    // a legacy `cwd#N` followedUp entry still retires its slug-keyed pending twin
+    const h3 = harness({ strategy: 'github-merge-queue', initial: { pending: [{ num: 9, repo: LOCAL }], followedUp: ['cwd#9'] }, ghView: { 9: MERGED } });
+    const m3 = [];
+    expect(h3.s.collectQueueMerged({ merged: m3, landedThisPass: new Set() })).toEqual([]);
+    expect(m3).toEqual([]);
+  });
+
   it('a failed follow-up `gh pr view` keeps the PR pending, retried next pass (review F2)', () => {
     const initial = { pending: [{ num: 1, repo: null }, { num: 2, repo: null }], followedUp: [] };
     const h = harness({ strategy: 'github-merge-queue', initial, ghView: { 2: MERGED }, viewThrows: [1] });
