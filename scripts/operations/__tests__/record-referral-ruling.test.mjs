@@ -381,7 +381,8 @@ describe('operator finding selectors and follow-up', () => {
     const s = sink();
     await expect(s.run(payload)).resolves.toEqual({ action: 'send-back', sentBack: true, labelCleared: false });
     expect(s.calls[0]).toMatchObject({ exe: process.execPath, body: payload.body, options: { encoding: 'utf8', timeout: 120_000 } });
-    expect(s.calls[0].args).toEqual([expect.stringMatching(/scripts\/review-set-label.mjs$/), '7', '--repo=o/r', '--to=changes', expect.stringMatching(/^--body-file=/), '--actor=chalbert', '--channel=chat']);
+    expect(s.calls[0].args).toEqual([expect.stringMatching(/scripts\/review-set-label.mjs$/), '7', '--repo=o/r', '--to=changes', expect.stringMatching(/^--body-file=/), '--actor=chalbert', '--channel=chat',
+      `--judged-head=${head}`]); // #5492 rebuild slice 2: the bounce row names the head the ruling was planned on
     expect(s.calls).toHaveLength(1);
     expect(existsSync(s.path())).toBe(false);
   });

@@ -93,8 +93,10 @@ export function buildRedTeamCardInput({ repo, pr, head, findings }) {
  * EXACT argv to the writer's own parser: `--to=changes` refuses `--expect-head`, and a sender that added it returned
  * `send-back-failed` for every real break (review of PR #4762).
  */
-export function buildSendBackArgv({ repo, pr, bodyPath }) {
-  return [String(pr), `--repo=${repo}`, '--to=changes', `--body-file=${bodyPath}`, `--actor=${RED_TEAM_GATE_ACTOR}`, `--channel=${RED_TEAM_GATE_CHANNEL}`];
+export function buildSendBackArgv({ repo, pr, bodyPath, head }) {
+  // #5492 rebuild slice 2 (W1): a holding row names the head the gate judged (the label still swaps if it moved).
+  const pin = /^[0-9a-f]{40}$/.test(head ?? '') ? [`--judged-head=${head}`] : [];
+  return [String(pr), `--repo=${repo}`, '--to=changes', `--body-file=${bodyPath}`, `--actor=${RED_TEAM_GATE_ACTOR}`, `--channel=${RED_TEAM_GATE_CHANNEL}`, ...pin];
 }
 
 /** The gate's own record for ONE action on the head. PURE. */
@@ -244,20 +246,22 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
     readRoundAsOf: ({ repo, pr, at, head }) => readReviewRoundAsOf({ repo, pr, at, head }),
     // The live head, read fresh and alone (the PR view above can be minutes old by the time a slow step finishes).
     readHead: ({ repo, pr }) => String(JSON.parse(gh(['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'])).headRefOid ?? ''),
-    sendBack: ({ repo, pr, body }) => {
+    sendBack: ({ repo, pr, head, body }) => {
       const dir = mkdtempSync(join(tmpdir(), 'red-team-gate-'));
       try {
         const path = join(dir, 'body.md');
         writeFileSync(path, body, 'utf8');
-        const r = spawnSync(process.execPath, [join(root, 'scripts', 'review-set-label.mjs'), ...buildSendBackArgv({ repo, pr, bodyPath: path })],
+        const r = spawnSync(process.execPath, [join(root, 'scripts', 'review-set-label.mjs'), ...buildSendBackArgv({ repo, pr, bodyPath: path, head })],
           { cwd: root, encoding: 'utf8', timeout: 180_000, env: { ...env, [ACTOR_ENV]: `red-team-gate-${randomUUID()}` } });
         if (r.status === 0) return { ok: true };
         return { ok: false, error: String(r.stderr || r.stdout || `exit ${r.status}`).trim().split('\n').pop() };
       } finally { rmSync(dir, { recursive: true, force: true }); }
     },
-    appendSendBackEvent: ({ repo, pr }) => appendLedgerEvents([buildLedgerEvent({
+    appendSendBackEvent: ({ repo, pr, head }) => appendLedgerEvents([buildLedgerEvent({
       type: EVENT_TYPES.SEND_BACK, repo, pr, at: new Date().toISOString(), source: 'red-team-gate',
       declaredActor: RED_TEAM_GATE_ACTOR, channel: RED_TEAM_GATE_CHANNEL, cause: 'changes',
+      // #5492 rebuild slice 2: the head sent back (re-read live just before the send-back), so the hold binds to it.
+      ...(/^[0-9a-f]{40}$/.test(head ?? '') ? { judgedHead: head } : {}),
     })]),
     fileCard: (input) => spawnPreventionLandingJob(input, { sessionPrefix: 'red-team-card' }),
     postComment: ({ repo, pr, body }) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body),

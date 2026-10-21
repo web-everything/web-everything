@@ -36,15 +36,16 @@ const PAYLOAD = {
 };
 const headField = v => v === undefined || v === null || typeof v === 'string';
 const wellFormed = r => r && typeof r === 'object' && !Array.isArray(r) && TYPES.has(typeOf(r)) && PAYLOAD[typeOf(r)](r)
-  && headField(r.headSha) && (r.coverage === undefined || headField(r.coverage.headSha))
+  && headField(r.headSha) && headField(r.judgedHead) && (r.coverage === undefined || headField(r.coverage.headSha))
   && (r.id === undefined || str(r.id)) && (r.runId === undefined || str(r.runId));
 const canon = v => (Array.isArray(v) ? v.map(canon)
   : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map(k => [k, canon(v[k])])) : v);
 const json = v => JSON.stringify(canon(v));
 const hash = v => `sha256:${createHash('sha256').update(json(v)).digest('hex')}`;
 const typeOf = r => (r.type === undefined ? 'verdict' : r.type); // only an OMITTED type is a v1 verdict
-/** The head a row names: a verdict's `coverage.headSha` only; other types `headSha`. Never trimmed or case-folded. */
-const rawHead = r => (typeOf(r) === 'verdict' ? r.coverage?.headSha : r.headSha);
+/** The head a row names: the writer's pin `judgedHead` when present (slice 2), else a verdict's `coverage.headSha` or
+ *  another type's `headSha`. Never trimmed or case-folded. */
+const rawHead = r => (r.judgedHead !== undefined ? r.judgedHead : typeOf(r) === 'verdict' ? r.coverage?.headSha : r.headSha);
 const full = v => typeof v === 'string' && SHA40.test(v);
 /** A full head, `'short'` (7–39 hex: never a base or an answer), or null (headless or garbage). */
 const headClass = r => { const h = rawHead(r); return full(h) ? h : typeof h === 'string' && SHORT.test(h) ? 'short' : null; };

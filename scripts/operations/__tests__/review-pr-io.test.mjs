@@ -356,7 +356,8 @@ describe('the ledger and notice sinks', () => {
     // the ledger row. By the time this sink runs the row exists, and appending again would put two rows in an
     // append-only merge authority for one verdict.
     appendVerdict(buildVerdictRecord({
-      repo: 'o/n', pr: 7, verdict: VERDICTS.ACCEPTED, at: '2026-08-10T12:00:00.000Z', source: 'review-set-label',
+      // #5492 rebuild slice 2: the single home now stamps the run id it was handed, and reconciliation keys on it.
+      repo: 'o/n', pr: 7, verdict: VERDICTS.ACCEPTED, at: '2026-08-10T12:00:00.000Z', source: 'review-set-label', runId: CTX.runId,
     }));
     const sinks = createReviewPrSinks({ root });
     const result = await sinks[REVIEW_EFFECTS.LEDGER]({ pr: 7, repo: 'o/n', to: 'accepted' }, CTX);
@@ -436,7 +437,7 @@ describe('the ledger and notice sinks', () => {
       repo: 'o/n', pr: 43, verdict: VERDICTS.CHANGES, at: '2026-08-01T10:00:00.000Z', source: 'review-set-label',
     }));
     appendVerdict(buildVerdictRecord({
-      repo: 'o/n', pr: 43, verdict: VERDICTS.ACCEPTED, at: '2026-08-02T10:00:00.000Z', source: 'review-set-label',
+      repo: 'o/n', pr: 43, verdict: VERDICTS.ACCEPTED, at: '2026-08-02T10:00:00.000Z', source: 'review-set-label', runId: CTX.runId,
     }));
     const sinks = createReviewPrSinks({ root });
     const result = await sinks[REVIEW_EFFECTS.LEDGER]({ pr: 43, repo: 'o/n', to: 'accepted' }, CTX);
