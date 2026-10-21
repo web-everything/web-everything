@@ -26,6 +26,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveCascade, platformPreference, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { isHumanOperatorComment } from './operator-identity.mjs';
 
 import { parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
 import { parseLatestHumanClearedSha, REVIEWED_SHA_MARKER } from './review-escalation.mjs';
@@ -499,6 +500,11 @@ const GATE_ACTION_LINES = [
   ['held', new RegExp(`^- \\d+ confirmed break\\(s\\) NOT sent back: [^\\n]*?(?: ${INDEX_LIST})?\\.$`)],
 ];
 
+/** Action lines that release a finding from the send-back / held set. */
+const RELEASING_ACTIONS = new Set(['card', 'advisory']);
+/** The outcomes automation records for decisions the gate itself made; any other release needs a human operator author. */
+const AUTOMATION_RELEASE_OUTCOMES = new Set([GATE_OUTCOMES.SENT_BACK, GATE_OUTCOMES.CARD_QUEUED]);
+
 /** PURE: the action lines of ONE gate record, read only from the block right after its marker (and heading). */
 function gateActionLines(body) {
   const lines = String(body ?? '').replace(/\r\n/g, '\n').trimStart().split('\n');
@@ -538,6 +544,9 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     const own = new Map();
     for (const r of gates) {
       for (const { action, indices } of gateActionLines(recordBody(r))) {
+        // Only a human operator may release a break held at the round cap; automation lines release only what the gate itself decided.
+        // This is applied per action line (not by dropping the forged comment, which would also drop its restrictive `held` lines).
+        if (RELEASING_ACTIONS.has(action) && !AUTOMATION_RELEASE_OUTCOMES.has(r.gate.outcome) && !isHumanOperatorComment(r.c)) continue;
         if (action === 'held' && !indices.length) legacyHeld = true;
         for (const index of indices) {
           // A stale cap POST cannot overwrite the per-finding send-back that superseded its decision.
