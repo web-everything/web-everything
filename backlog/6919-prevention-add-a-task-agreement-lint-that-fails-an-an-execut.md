@@ -1,22 +1,21 @@
 ---
+bornAs: xzddgza
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/xzr443y-operator-binding-fixer-input-can-be-added-to-a-pr-already-in.md"]
-dateOpened: "2026-10-17"
+scope: ["we:backlog/5967-decide-needs-a-human-before-review-and-reuse-a-same-head-rev.md"]
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Extend we:prep-review.mjs to require each [A#] Acceptance line to name a test file path or test-c… (from web-everything/web-everything#5557 review)
+# Prevention — Add a task-agreement lint that fails an [An] **Executable** item with no backticked or fenced com… (from web-everything/web-everything#5336 review)
 
-Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/xzr443y-operator-binding-fixer-input-can-be-added-to-a-pr-already-in.md:19` — Extend we:prep-review.mjs to require each [A#] Acceptance line to name a test file path or test-case identifier.
-2. `we:backlog/xzr443y-operator-binding-fixer-input-can-be-added-to-a-pr-already-in.md:1` — we:prep-review.mjs already gates on Done-when and edge-case classes. Adding a check for a Risks-to-Test-plan mapping would cover this.
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this PR's latest advisory review named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 3 → #5360, finding 4 → #5360.
+1. `we:backlog/5967-decide-needs-a-human-before-review-and-reuse-a-same-head-rev.md:21` — Add a task-agreement lint that fails an `[An] **Executable**` item with no backticked or fenced command. `we:scripts/backlog/task-agreement.mjs` is the natural home.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5557@5e228ff4d27376ebf07e5f0f9fbfa5bf35bc2f9b
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5336@fcb417ccf9f6e46910311375aea191b0a38fca3e
 
 ## Acceptance
 

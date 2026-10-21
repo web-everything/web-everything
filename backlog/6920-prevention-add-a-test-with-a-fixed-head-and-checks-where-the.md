@@ -1,23 +1,21 @@
 ---
+bornAs: xzeqwdu
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/reconcile-pass.mjs", "we:scripts/conveyor/__tests__/reconcile-core.test.mjs", "we:scripts/conveyor/__tests__/reconcile-pass.test.mjs"]
+scope: ["we:scripts/lib/enqueue-on-event.mjs", "we:scripts/lib/__tests__/enqueue-on-event.test.mjs"]
 dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — Extract the pending-budget decision (hold / escalate / proceed) into one shared helper used by bo… (from web-everything/web-everything#5285 review)
+# Prevention — Add a test with a fixed head and checks where the fast drain stops reporting BLOCKED. Optionally… (from web-everything/web-everything#5267 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/reconcile-core.mjs:2825` — Extract the pending-budget decision (hold / escalate / proceed) into one shared helper used by both call sites. Add a test that runs the stale-pending fixture against both paths.
-2. `we:scripts/conveyor/reconcile-core.mjs:2845` — Either gate the spent fall-through on the head already containing main's tip (aheadByOnMain === 0, or rebase-comment cap exhausted), or add a test asserting that a spent budget on a stale head still yields the rebase-owed refusal. Treat max=0 as off.
-3. `we:scripts/conveyor/reconcile-core.mjs:2830` — Add a boundary test for maxRerunsPerHead=0 and either treat cap===0 as rerun-off (keep the refusal) or reject 0 in the resolver. A table-driven setting-boundary test would catch the whole class.
-4. `we:scripts/conveyor/reconcile-pass.mjs:157` — Add table-driven resolver tests to the required test gate, including malformed configuration and invalid environment overrides; assert the resolved action is off.
+1. `we:scripts/lib/enqueue-on-event.mjs:236` — Add a test with a fixed head and checks where the fast drain stops reporting BLOCKED. Optionally include `reviewDecision` in the signature if the PR read exposes it cheaply.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5285@b878ef4babb5aa1164ac8ac089d66fafb24765cd
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5267@24c7b542555108576b14827362cc2364a63e21a9
 
 ## Acceptance
 

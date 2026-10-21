@@ -1,22 +1,21 @@
 ---
+bornAs: xv9da8a
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/drain-saved-red-team.mjs", "we:docs/agent/testing.md", "we:scripts/lib/__tests__/drain-saved-red-team.test.mjs"]
-dateOpened: "2026-10-18"
+scope: ["we:backlog/5940-dispatcher-leases-the-lane-and-hands-it-to-fix-ci-heal-prepa.md"]
+dateOpened: "2026-10-16"
 tags: []
 ---
 
-# Prevention — Give ran-but-unusable its own pending reason that triggers a re-run request or a bounded retry co… (from web-everything/web-everything#5551 review)
+# Prevention — Reviewer lens only: avoid anaphoric references ('the latter') in card prose that gets edited in p… (from web-everything/web-everything#5466 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/drain-saved-red-team.mjs:72` — Give ran-but-unusable its own pending reason that triggers a re-run request or a bounded retry count and then a human-visible hold. The never-scheduled enqueue would then only be reachable when no run exists. Add a drain-merge-strategy test asserting that an unparseable/error run does not enqueue via the never-scheduled path.
-2. `we:docs/agent/testing.md:88` — Add the named integration test in we:scripts/lib/__tests__/drain-merge-strategy.test.mjs, seeding incomplete saved evidence, then supplying a trusted same-head result and asserting enqueue succeeds and pending state clears.
-3. `we:docs/agent/testing.md:89` — Add 'trusted posted live-head result releases a persisted incomplete saved hold' in we:scripts/lib/__tests__/drain-merge-strategy.test.mjs, asserting enqueue and removal of the persisted pending state.
+1. `we:backlog/5940-dispatcher-leases-the-lane-and-hands-it-to-fix-ci-heal-prepa.md` — Reviewer lens only: avoid anaphoric references ('the latter') in card prose that gets edited in place. A deterministic gate is not practical.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5551@e06e32a0a60029096637651ffa481074eb70c957
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5466@0cd2b4a169b3ac13b6ba47288d5334d614890ee9
 
 ## Acceptance
 

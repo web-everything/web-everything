@@ -1,21 +1,23 @@
 ---
+bornAs: xyuuy6g
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5745-drain-no-merge-while-a-fix-or-ci-heal-claim-is-live.md"]
-dateOpened: "2026-10-14"
+scope: ["we:backlog/xzr443y-operator-binding-fixer-input-can-be-added-to-a-pr-already-in.md"]
+dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Prevention — Add a plan-checklist item, or a lens, requiring new fail-closed lock-store reads to cite the exis… (from web-everything/web-everything#5314 review)
+# Prevention — Extend we:prep-review.mjs to require each [A#] Acceptance line to name a test file path or test-c… (from web-everything/web-everything#5557 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+1. `we:backlog/6263-operator-binding-fixer-input-can-be-added-to-a-pr-already-in.md:19` — Extend we:prep-review.mjs to require each [A#] Acceptance line to name a test file path or test-case identifier.
+2. `we:backlog/6263-operator-binding-fixer-input-can-be-added-to-a-pr-already-in.md:1` — we:prep-review.mjs already gates on Done-when and edge-case classes. Adding a check for a Risks-to-Test-plan mapping would cover this.
 
-1. `we:backlog/5745-drain-no-merge-while-a-fix-or-ci-heal-claim-is-live.md:40` — Add a plan-checklist item, or a lens, requiring new fail-closed lock-store reads to cite the existing grace/TTL for entry-less dirs. Also add a test that an entry-less dir older than the grace does not block indefinitely.
-2. `we:backlog/5745-drain-no-merge-while-a-fix-or-ci-heal-claim-is-live.md:46` — Add a unit case for attachLiveFixClaim with a null claimKey that documents the intended behaviour, either open or closed.
+Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 3 → #5360, finding 4 → #5360.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5314@362d97a2486f66ce0f9068c812898d56124cbb31
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5557@5e228ff4d27376ebf07e5f0f9fbfa5bf35bc2f9b
 
 ## Acceptance
 

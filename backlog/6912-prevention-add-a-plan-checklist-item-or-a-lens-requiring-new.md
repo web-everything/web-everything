@@ -1,20 +1,22 @@
 ---
+bornAs: xvhls33
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5940-dispatcher-leases-the-lane-and-hands-it-to-fix-ci-heal-prepa.md"]
-dateOpened: "2026-10-16"
+scope: ["we:backlog/5745-drain-no-merge-while-a-fix-or-ci-heal-claim-is-live.md"]
+dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — Reviewer lens only: avoid anaphoric references ('the latter') in card prose that gets edited in p… (from web-everything/web-everything#5466 review)
+# Prevention — Add a plan-checklist item, or a lens, requiring new fail-closed lock-store reads to cite the exis… (from web-everything/web-everything#5314 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/5940-dispatcher-leases-the-lane-and-hands-it-to-fix-ci-heal-prepa.md` — Reviewer lens only: avoid anaphoric references ('the latter') in card prose that gets edited in place. A deterministic gate is not practical.
+1. `we:backlog/5745-drain-no-merge-while-a-fix-or-ci-heal-claim-is-live.md:40` — Add a plan-checklist item, or a lens, requiring new fail-closed lock-store reads to cite the existing grace/TTL for entry-less dirs. Also add a test that an entry-less dir older than the grace does not block indefinitely.
+2. `we:backlog/5745-drain-no-merge-while-a-fix-or-ci-heal-claim-is-live.md:46` — Add a unit case for attachLiveFixClaim with a null claimKey that documents the intended behaviour, either open or closed.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5466@0cd2b4a169b3ac13b6ba47288d5334d614890ee9
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5314@362d97a2486f66ce0f9068c812898d56124cbb31
 
 ## Acceptance
 

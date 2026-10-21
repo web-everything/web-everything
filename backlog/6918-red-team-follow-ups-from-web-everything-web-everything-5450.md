@@ -1,4 +1,5 @@
 ---
+bornAs: xzcnvok
 kind: story
 size: 2
 status: open
