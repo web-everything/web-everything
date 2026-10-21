@@ -3,8 +3,10 @@
  *   Incident: 2026-10-05..20 the global git config said `test` / `test@test.com` and nothing flagged it.
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, existsSync, rmSync } from 'node:fs';
+import { resolve, join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { runInNewContext } from 'node:vm';
 import {
   checkGitIdentity, identityVerdict, parseIdent, readGitIdentity, resolveGitIdentityPlaceholders, BUILTIN_PLACEHOLDERS,
@@ -13,6 +15,50 @@ import {
 
 describe('hook repair failures cannot silently disable commit guards', () => {
   const get = ['config', '--show-scope', '--get', 'core.hooksPath'];
+  it('repairs the directory Git actually uses, so a previously skipped real hook executes', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'identity-hooks-'));
+    const env = { PATH: process.env.PATH, HOME: dir, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(dir, 'global-config') };
+    const run = (args) => execFileSync('git', args, { cwd: dir, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    try {
+      writeFileSync(env.GIT_CONFIG_GLOBAL, '');
+      run(['init', '-q']);
+      mkdirSync(join(dir, '.githooks'));
+      writeFileSync(join(dir, '.githooks/pre-commit'), '#!/bin/sh\ntouch hook-ran\n');
+      chmodSync(join(dir, '.githooks/pre-commit'), 0o755);
+      run(['config', '--local', 'core.hooksPath', '.githooks ']);
+      run(['hook', 'run', '--ignore-missing', 'pre-commit']);
+      expect(existsSync(join(dir, 'hook-ran'))).toBe(false);
+      expect(ensureLaneHooksPath(dir, { run, write: false })).toMatchObject({ status: 'override', was: '.githooks ' });
+      expect(run(['config', '--get', 'core.hooksPath'])).toBe('.githooks \n');
+      expect(ensureLaneHooksPath(dir, { run, log: () => {} }).status).toBe('set');
+      run(['hook', 'run', '--ignore-missing', 'pre-commit']);
+      expect(existsSync(join(dir, 'hook-ran'))).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it.each(['.githooks ', ' .githooks', '.githooks\t', '.githooks\r', '.githooks\n', '.githooks\u2028', '.githooks\u00a0'])('preserves the exact hooks directory %j for reporting and repair', (value) => {
+    let effective = value;
+    const calls = [];
+    const run = (args) => {
+      calls.push(args);
+      if (args.join(' ') === get.join(' ')) return `local\t${effective}\n`;
+      expect(args).toEqual(['config', '--local', '--replace-all', 'core.hooksPath', '.githooks']);
+      effective = '.githooks';
+      return '';
+    };
+    expect(ensureLaneHooksPath('/lane', { write: false, exists: () => true, run })).toMatchObject({ status: 'override', was: value });
+    expect(calls).toHaveLength(1);
+    expect(ensureLaneHooksPath('/lane', { exists: () => true, run, log: () => {} })).toMatchObject({ status: 'set', was: value });
+    expect(effective).toBe('.githooks');
+  });
+  it('does not falsely verify a repair that still resolves to a whitespace-suffixed directory', () => {
+    const result = ensureLaneHooksPath('/lane', {
+      exists: () => true, log: () => {},
+      run: (args) => args.join(' ') === get.join(' ') ? 'worktree\t.githooks \n' : '',
+    });
+    expect(result).toMatchObject({ status: 'override', was: '.githooks ', scope: 'worktree' });
+  });
   it('replaces all duplicate local values before verifying the effective value', () => {
     let values = ['/dev/null', '/other-hooks'];
     const result = ensureLaneHooksPath('/lane', {

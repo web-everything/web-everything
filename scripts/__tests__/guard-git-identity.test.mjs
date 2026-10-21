@@ -45,6 +45,14 @@ describe('guardDecision (pure)', () => {
     expect(isLaneRoot('/w/lanes/x')).toBe(false);
     expect(isLaneRoot('/w/.lanes/p/lane-2')).toBe(true);
   });
+  it('recognizes the pool lane name under any root, without an inherited pool environment', () => {
+    expect(isLaneRoot('/custom pool/project/lane-12')).toBe(true);
+    expect(isLaneRoot('C:\\custom pool\\project\\lane-12', '\\')).toBe(true);
+    for (const root of ['/custom/project/lane-12-copy', '/custom/project/lane-x', '/custom/project/lane-12/nested']) {
+      expect(isLaneRoot(root)).toBe(false);
+    }
+    expect(guardDecision({ root: '/custom pool/project/lane-12', identity: { author: placeholder, committer: real } }).allow).toBe(false);
+  });
 });
 
 describe('main() — any unexpected error refuses the commit (fail closed)', () => {
@@ -112,6 +120,18 @@ describe('end to end: real git commit through the hook', () => {
     const r = commit(lane);
     expect(r.status).toBe(0);
     expect(git(lane, ['log', '-1', '--format=%an']).trim()).toBe('Ada Lovelace');
+  });
+
+  it.each([undefined, 'custom pool'])('a custom pool lane refuses placeholders with pool env %s', (poolEnv) => {
+    const lane = makeRepo('custom pool/web-everything/lane-12');
+    setIdent(lane, placeholder);
+    const extra = poolEnv ? { LANE_POOL_ROOT: join(base, poolEnv) } : {};
+    const r = commit(lane, extra);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/commit refused/);
+    expect(() => git(lane, ['rev-parse', 'HEAD'])).toThrow();
+    setIdent(lane, real);
+    expect(commit(lane, extra).status).toBe(0);
   });
 
   it('a placeholder AUTHOR from env (GIT_AUTHOR_*) is caught even with a real config identity', () => {

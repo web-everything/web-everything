@@ -8,7 +8,8 @@
  *   and nothing noticed. Wired via `.githooks/pre-commit` (`core.hooksPath .githooks`, set by the `prepare` npm
  *   script and carried into every lane clone), so it covers an agent's `git commit` in a lane however it is typed.
  *
- *   SCOPE: lane clones only (a checkout under `/.lanes/`), which is where agent commits land. A real identity passes;
+ *   SCOPE: lane clones (a checkout under `/.lanes/` or named `lane-N`, including custom pool roots), which is
+ *   where agent commits land. A real identity passes;
  *   a placeholder / missing identity is refused, and so is ANY unexpected error in the guard (FAIL CLOSED, operator
  *   ruling 2026-10-20) — with a message saying the identity could not be verified.
  *
@@ -20,10 +21,13 @@ import { sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { readGitIdentity, identityVerdict, resolveGitIdentityPlaceholders, GIT_IDENTITY_FIX_HINT } from './lib/git-identity.mjs';
 
-/** PURE: is this checkout root a lane clone? Same locus test as `guard-lane.mjs#isLaneLocus`. */
+/** PURE: recognize the default pool and lane-pool's `lane-N` checkout names under arbitrary pool roots.
+ * Do not depend on LANE_POOL_ROOT: the shell running a later commit need not inherit the provisioner's env.
+ * A checkout named lane-N is conservatively guarded even outside a configured pool.
+ */
 export function isLaneRoot(root, sepChar = sep) {
   const p = String(root || '');
-  return p !== '' && p.includes(`${sepChar}.lanes${sepChar}`);
+  return p !== '' && (p.includes(`${sepChar}.lanes${sepChar}`) || /^lane-[0-9]+$/.test(p.split(sepChar).at(-1)));
 }
 
 /**
@@ -66,7 +70,7 @@ export function main({ cwd = process.cwd(), env = process.env, err = (s) => proc
   const { exec = execFileSync, readIdentity = readGitIdentity, resolveLists = resolveGitIdentityPlaceholders } = deps;
   let decision;
   try {
-    const top = String(exec('git', ['rev-parse', '--show-toplevel'], { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 1024 * 1024 })).trim();
+    const top = String(exec('git', ['rev-parse', '--show-toplevel'], { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 1024 * 1024 })).replace(/\n$/, '');
     let root = top;
     try { root = realpathSync(top); } catch { /* keep the git answer */ }
     if (!isLaneRoot(root) && !isLaneRoot(top)) return 0;

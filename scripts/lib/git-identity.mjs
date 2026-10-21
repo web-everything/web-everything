@@ -222,7 +222,9 @@ export function ensureLaneHooksPath(dir, {
     if (!exists(join(dir, LANE_HOOKS_PATH, 'pre-commit'))) return { status: 'skipped' };
     const effective = () => {
       try {
-        const [scope, ...rest] = String(run(['config', '--show-scope', '--get', 'core.hooksPath'])).trim().split('\t');
+        // Git appends one LF; all whitespace inside the value belongs to the actual directory name.
+        // In particular `.githooks ` and `.githooks\n` must not falsely verify as `.githooks`.
+        const [scope, ...rest] = String(run(['config', '--show-scope', '--get', 'core.hooksPath'])).replace(/\n$/, '').split('\t');
         return { scope, value: rest.join('\t') || null };
       } catch (e) {
         // `git config --get` exits 1 only when the key is absent. A timeout, unreadable config, etc. must
