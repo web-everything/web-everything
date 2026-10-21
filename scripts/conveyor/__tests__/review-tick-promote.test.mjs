@@ -226,8 +226,9 @@ describe('stale-accept hold vs guarded re-arm share one coverage verdict (#5771 
   };
   const row = { kind: 'restore-review-label', variant: 'stale-accept', prNumber: 5771, headRefOid: B, label: 'review:pending' };
   const other = { kind: 'review', prNumber: 9, attempts: 0 };
-  const provider = (text, rearm = vi.fn(() => ({ ok: true }))) => ({ rearm, fn: () => defaultRearmStaleAcceptance({
-    repoSlug: REPO_SLUG, prNumber: 5771, headSha: B, readPr: () => pr, rearm, readNetDiff: () => ({ scored: true, rev: B, text }) }) });
+  const provider = (text, rearm = vi.fn(() => ({ ok: true })), { prOverride = {}, reviews = [] } = {}) => ({ rearm, fn: () => defaultRearmStaleAcceptance({
+    repoSlug: REPO_SLUG, prNumber: 5771, headSha: B, readPr: () => ({ ...pr, ...prOverride }), rearm, readReviews: () => reviews,
+    readNetDiff: () => ({ scored: true, rev: B, text }) }) });
 
   it('provider: a live-proven cover refusal carries covers:true and never re-arms', () => {
     const p = provider(DIFF);
@@ -240,7 +241,7 @@ describe('stale-accept hold vs guarded re-arm share one coverage verdict (#5771 
     expect(p.rearm).toHaveBeenCalledTimes(1);
   });
   it('provider: an unreadable live diff is a plain refusal, never a cover', () => {
-    const r = defaultRearmStaleAcceptance({ repoSlug: REPO_SLUG, prNumber: 5771, headSha: B, readPr: () => pr, rearm: vi.fn(), readNetDiff: () => ({ scored: false }) });
+    const r = defaultRearmStaleAcceptance({ repoSlug: REPO_SLUG, prNumber: 5771, headSha: B, readPr: () => pr, rearm: vi.fn(), readReviews: () => [], readNetDiff: () => ({ scored: false }) });
     expect(r.ok).toBe(false); expect(r.covers).toBeUndefined();
   });
   it('tick: the #5771 shape (planner holds, re-arm proves cover) releases the row, keeps other rows, and says why', () => {
@@ -262,5 +263,26 @@ describe('stale-accept hold vs guarded re-arm share one coverage verdict (#5771 
     const rearm = provider(DIFF).fn;
     const r = rearmStaleAcceptsThenReplan({ plan: { dispatch: [row], refusals: [] }, rawPrs: [pr], repo: REPO, rearm, replan: () => null });
     expect([...r.plan.dispatch, ...r.plan.refusals].some((d) => d.prNumber === 5771)).toBe(false);
+  });
+  it('provider (audit): a later hold comment, a pending review label, unreadable reviews, a standing changes-requested review, or a full comment page never prove a cover', () => {
+    const hold = { viewerDidAuthor: true, body: 'review paused: independent review required' };
+    const cases = [
+      { prOverride: { comments: [...pr.comments, hold] } },
+      { prOverride: { labels: [...pr.labels, { name: 'review:pending' }] } },
+      { reviews: null },
+      { reviews: [{ state: 'CHANGES_REQUESTED', user: { login: 'someone' }, submitted_at: '2999-01-01T00:00:00Z' }] },
+      { prOverride: { comments: [...pr.comments, ...Array.from({ length: 100 }, () => ({ viewerDidAuthor: true, body: '<!-- conveyor-note -->' }))] } },
+    ];
+    for (const c of cases) {
+      const r = provider(DIFF, undefined, c).fn();
+      expect(r.covers, JSON.stringify(Object.keys(c))).toBeUndefined();
+    }
+  });
+  it('tick (audit): a row for a NEWER head than the one proved covered is a fresh obligation and is kept', () => {
+    const C = 'd'.repeat(40);
+    const r = rearmStaleAcceptsThenReplan({ plan: { dispatch: [row], refusals: [] }, rawPrs: [pr], repo: REPO,
+      rearm: () => ({ ok: false, covers: true, coveredHead: C, reason: 'x' }), replan: () => null });
+    expect(r.plan.dispatch).toEqual([row]);
+    expect(r.rearms[0].released).toBeUndefined();
   });
 });
