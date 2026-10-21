@@ -25,8 +25,10 @@ import { platformPreference } from '../lib/policy-cascade.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import {
   buildRoundExtensionComment, countGrantedRoundExtensions, countStandingRulingGrantRecords, MAX_TOTAL_ROUND_EXTENSIONS,
-  standingRulingGrantEpisodes,
+  ROUND_EXTENSION_MARKER, roundExtensionGrants, standingRulingGrantEpisodes,
 } from './round-extension-mark.mjs';
+import { isAutomationAuthored, isOperatorAuthored } from '../lib/marker-authorship.mjs';
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { readStandingRuling, standingRulingScope, redact } from './standing-ruling-io.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 import {
@@ -191,4 +193,40 @@ export function autoRoundGrant({ repo, note, pr }, {
     // Another worker holds this PR's lock (it is deciding the same PR) or the ledger is unreadable: never grant.
     return { action: 'skip', why: `ledger: ${firstLine(e)}` };
   }
+}
+
+/** How long a PR may stay labelled at its round limit after an automatic grant before a person is told. */
+export const STUCK_AFTER_GRANT_MS = 20 * 60_000;
+
+/**
+ * Never silently stuck: a PR still labelled `status:at-round-limit` well after an automatic grant on its CURRENT
+ * head means some reader did not credit the grant (or the grant freed no round). Returns the needs-you reason, or
+ * null. Cheap screen first (label + a cited grant for this head); only then the read-time scope.
+ */
+export function stuckAfterGrant({ repo, pr }, { scopeOf = standingRulingScope, now = Date.now, minAgeMs = STUCK_AFTER_GRANT_MS } = {}) {
+  const labels = (pr?.labels ?? []).map((l) => (typeof l === 'string' ? l : l?.name));
+  const head = String(pr?.headRefOid ?? '');
+  if (!labels.includes('status:at-round-limit') || !/^[0-9a-f]{40}$/.test(head)) return null;
+  const slug = CONSTELLATION_REPOS[repo]?.slug ?? repo;
+  const comments = pr?.comments ?? [];
+  if (!standingRulingGrantEpisodes(comments, { repo: slug, pr: pr.number }).episodes.some((e) => e.includes(`@${head}:`))) return null;
+  let scope = null;
+  try { scope = scopeOf({ repo: slug, pr: { number: pr.number, comments } }); } catch { scope = null; }
+  const mine = roundExtensionGrants(comments, { repo: slug, pr: pr.number, standingRuling: scope }).filter((g) => g.standingRuling && g.head === head);
+  const at = mine.length ? Math.max(...mine.map((g) => Date.parse(g.at))) : NaN;
+  // An uncredited grant (no scope / not trusted) is stuck by definition once it exists on the thread.
+  // Uncredited fallback: ONLY automation-authored standing-ruling grant records for this repo + PR + current head,
+  // timed by GitHub's createdAt (earliest), so no other commenter can restart the grace period.
+  const postedAt = Number.isFinite(at) ? at : Math.min(...comments.filter((c) => {
+    if (!isAutomationAuthored(c) || isOperatorAuthored(c) || !String(c?.body ?? '').startsWith(ROUND_EXTENSION_MARKER + '\n')) return false;
+    const m = [...String(c.body).matchAll(/^<!-- round-extension: (.+) -->$/gm)];
+    if (m.length !== 1) return false;
+    try {
+      const r = JSON.parse(m[0][1]);
+      return !!r?.standingRuling && (CONSTELLATION_REPOS[r.repo]?.slug ?? r.repo) === slug && r.pr === Number(pr.number) && r.head === head;
+    } catch { return false; }
+  }).map((c) => Date.parse(c?.createdAt)).filter(Number.isFinite), Infinity);
+  if (!Number.isFinite(postedAt) || now() - postedAt < minAgeMs) return null;
+  const minutes = Math.round((now() - postedAt) / 60_000);
+  return `auto-grant did not free a round: still at the round limit ${minutes} min after it${mine.length ? '' : ' (grant not credited)'} — a person must check`;
 }

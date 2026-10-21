@@ -3,10 +3,14 @@
  * unconfirmed → advisory, a stale head → ignored, the round cap, dedup — and review-job runs it after the red team.
  */
 import { describe, expect, it } from 'vitest';
+import { createHash } from 'node:crypto';
 import { applyRedTeamGate, buildGateComment, buildRedTeamCardInput, buildSendBackArgv, buildSendBackBody, gateExitCode, renderGateSummary, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
 import { runReviewJob } from '../review-job.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, parseRedTeamComment, parseRedTeamGateMarker, redTeamGateMarker, redTeamQueueReason, redTeamResultId, redTeamRulingNeeded } from '../../lib/red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, gateRoundGrants, parseRedTeamComment, parseRedTeamGateMarker, redTeamGateMarker, redTeamQueueReason, redTeamResultId, redTeamRulingNeeded } from '../../lib/red-team-gate.mjs';
+import { redTeamEnqueueHold } from '../../lib/drain-queue-safety.mjs';
+import { buildReviewedShaMarker, buildClearedHumanMarker } from '../../lib/review-escalation.mjs';
+import { buildVerdictCarriedMarker } from '../../lib/review-verdict-carried-marker.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 import { runReviewLabelCli } from '../../review-set-label.mjs';
 
@@ -198,27 +202,73 @@ describe('applyRedTeamGate', () => {
       body: buildGateComment({ pr: 4722, head: HEAD, outcome: GATE_OUTCOMES.ROUND_CAP, plan: { sendBack: [{ index: 1 }], card: [], advisory: [] },
         round, grantIds, result: redTeamResultId(parseRedTeamComment(comment([F()]).body)) }) });
 
-    // Standing-ruling grants (operator option B): the gate uses the SAME trusted reader, so an App-posted grant
-    // counts only when the io hands it the scope verified from GitHub at this read.
-    const autoGrant = (at = '2026-10-19T12:00:00Z') => ({ id: 'IC_auto', author: { login: 'web-everything' }, createdAt: at,
-      body: buildRoundExtensionComment({ repo: REPO, pr: 4722, by: 1, actor: 'chalbert', channel: 'standing-ruling-auto', reason: 'ruling', at,
-        standingRuling: `${REPO}#5751`, head: HEAD, episode: `${REPO}#4722@${HEAD}:review:12/12` }) });
-    const verified = { id: `${REPO}#5751`, author: 'chalbert', by: 1, maxPerPr: 3, repos: [REPO], cardOnlyHeads: { [HEAD]: true }, uneditedComments: ['IC_auto'] };
-    it('a standing-ruling grant reopens the send-back only under the verified scope', async () => {
-      const comments = [comment([F()]), capRecord(), autoGrant()];
-      const without = fakeIo({ comments, round: 12, readRoundAsOf: () => 12 });
-      expect(await applyRedTeamGate({ repo: REPO, pr: 4722, dryRun: true }, without.io)).toMatchObject({ status: 'already-acted', outcome: 'round-cap' });
-      const unverified = fakeIo({ comments, round: 12, readRoundAsOf: () => 12, standingRuling: () => ({ ...verified, cardOnlyHeads: { [HEAD]: false } }) });
-      expect(await applyRedTeamGate({ repo: REPO, pr: 4722, dryRun: true }, unverified.io)).toMatchObject({ status: 'already-acted', outcome: 'round-cap' });
-      const ok = fakeIo({ comments, round: 12, readRoundAsOf: () => 12, standingRuling: () => verified });
-      expect(await applyRedTeamGate({ repo: REPO, pr: 4722, dryRun: true }, ok.io)).toMatchObject({ status: 'dry-run', reopened: true, cap: 13, outcome: 'sent-back' });
-      // The pure readers treat a verified automatic grant exactly like a manual grant at the same position, and an
-      // unverified one exactly like no grant at all.
-      const pr = { number: 4722, repo: REPO, headRefOid: HEAD, labels: ['review:accepted'], comments };
-      const manual = { ...pr, comments: [comment([F()]), capRecord(), grant(1)] };
-      const none = { ...pr, comments: [comment([F()]), capRecord()] };
-      expect(redTeamRulingNeeded({ ...pr, standingRuling: verified })).toEqual(redTeamRulingNeeded(manual));
-      expect(redTeamRulingNeeded(pr)).toEqual(redTeamRulingNeeded(none));
+    const readerShapes = {
+      complete: c => c,
+      rest: (c, index) => ({ id: index + 100, node_id: c.id, user: c.author, created_at: c.createdAt, body: c.body }),
+      labels: c => ({ author: c.author, createdAt: c.createdAt, body: c.body }),
+      minimal: c => ({ author: c.author, body: c.body }),
+    };
+
+    it.each(Object.keys(readerShapes))('a new send-back retains its enqueue hold through the %s reader after an earlier clearance', async shape => {
+      const clearance = { author: { login: 'web-everything' }, createdAt: '2026-10-18T12:00:00Z',
+        body: ['✅ review — `review:human` cleared via the sanctioned path', '',
+          'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '',
+          buildReviewedShaMarker(HEAD), buildClearedHumanMarker('operator')].join('\n') };
+      const comments = [comment([F()]), capRecord(), clearance, { ...grant(), id: 'IC_grant' }];
+      const { io, calls } = fakeIo({ comments, round: 12, readRoundAsOf: () => 12 });
+      const hold = thread => redTeamEnqueueHold({ comments: thread, pr: 4722, head: HEAD, repo: REPO,
+        confirmedBreaks: CONFIRMED_BREAKS_DEFAULTS, env: {} });
+      expect(hold(comments)).toBeNull();
+      expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'applied', outcome: 'sent-back' });
+      expect(calls.filter(([kind]) => kind === 'sendBack')).toHaveLength(1);
+      const thread = comments.map(readerShapes[shape]);
+      expect(hold(thread)).toMatch(/confirmed a break requiring send-back/);
+      expect(redTeamQueueReason({ number: 4722, repo: REPO, headRefOid: HEAD, labels: ['review:changes'], comments: thread }))
+        .toMatch(/the fixer owns them/);
+      expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, { ...io, readPr: () => ({ headRefOid: HEAD, labels: [], comments: thread }) }))
+        .toMatchObject({ status: 'already-acted', outcome: 'sent-back' });
+      expect(calls.filter(([kind]) => kind === 'sendBack')).toHaveLength(1);
+    });
+
+    it('grant identities survive metadata changes, distinguish copies and invalidate edits', () => {
+      const first = { ...grant(), id: 'IC_grant' };
+      const ids = comments => gateRoundGrants(comments, 4722, REPO).map(g => g.id);
+      const original = ids([first]);
+      for (const shape of Object.values(readerShapes)) expect(ids([first].map(shape))).toEqual(original);
+      const copies = ids([first, { ...first, id: 'IC_copy' }]);
+      expect(new Set(copies).size).toBe(2);
+      expect(ids([first, { ...first, id: 'IC_copy' }].map(readerShapes.labels))).toEqual(copies);
+      expect(ids([{ ...first, body: grant(2).body }])).not.toEqual(original);
+      expect(ids([{ author: first.author, body: 'unrelated' }, first])).toEqual(original);
+    });
+
+    it.each(Object.keys(readerShapes).flatMap(shape => [false, true].map(carried => [shape, carried])))(
+      'an existing grant snapshot keeps its enqueue hold through the %s reader until a newer clearance (carried: %s)', (shape, carried) => {
+      const extension = { ...grant(), id: 'IC_grant' };
+      const key = JSON.stringify([extension.id, extension.createdAt, extension.body]);
+      const oldId = createHash('sha256').update(JSON.stringify([key, 1])).digest('hex').slice(0, 16);
+      const clearance = { author: { login: 'web-everything' },
+        body: ['✅ review — `review:human` cleared via the sanctioned path', '',
+          'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '',
+          buildReviewedShaMarker(HEAD), buildClearedHumanMarker('operator')].join('\n') };
+      const sender = { author: { login: 'web-everything' }, body: buildGateComment({ pr: 4722, head: HEAD,
+        outcome: GATE_OUTCOMES.SENT_BACK, round: 12, grantIds: [oldId],
+        result: redTeamResultId(parseRedTeamComment(comment([F()]).body)),
+        plan: { sendBack: [{ index: 1 }], card: [], advisory: [] } }) };
+      const result = comment([F()]);
+      const prefix = carried ? [
+        { ...result, body: result.body.replaceAll(HEAD, OTHER) },
+        { ...capRecord(), body: capRecord().body.replaceAll(HEAD, OTHER) },
+        { ...clearance, body: clearance.body.replaceAll(HEAD, OTHER) },
+        { ...result, body: [buildVerdictCarriedMarker({ fromSha: OTHER, toSha: HEAD, patchId: 'c'.repeat(40) }),
+          'Review verdict carried across an identical contribution.', result.body].join('\n') },
+      ] : [result];
+      const comments = [...prefix, capRecord(), clearance, extension, sender].map(readerShapes[shape]);
+      const hold = () => redTeamEnqueueHold({ comments, pr: 4722, head: HEAD, repo: REPO,
+        confirmedBreaks: CONFIRMED_BREAKS_DEFAULTS, env: {} });
+      expect(hold()).toMatch(/confirmed a break requiring send-back/);
+      comments.push(readerShapes[shape](clearance, comments.length));
+      expect(hold()).toBeNull();
     });
 
     it('a round-cap record with no later grant stays already-acted (unchanged)', async () => {

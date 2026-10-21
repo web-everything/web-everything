@@ -13,7 +13,7 @@ import {
   AUTO_GRANT_CHANNEL, autoGrantKey, countAutoRoundGrants, decideAutoGrant, isCardOnlyNetDiff,
   resolveAutoRoundGrantSettings, screenAutoGrantNote, STANDING_RULING,
 } from '../auto-round-grant.mjs';
-import { autoRoundGrant, withPrLedger, redact, readPrThread } from '../auto-round-grant-io.mjs';
+import { autoRoundGrant, withPrLedger, redact, readPrThread, stuckAfterGrant, STUCK_AFTER_GRANT_MS } from '../auto-round-grant-io.mjs';
 import { buildRoundExtensionComment, countGrantedRoundExtensions, countStandingRulingGrantRecords, roundExtensionGrants, standingRulingGrantEpisodes } from '../round-extension-mark.mjs';
 import { buildStandingRulingBody, citedGrantHeads, pickStandingRuling, verifyStandingRuling } from '../standing-ruling-mark.mjs';
 import { enrichPrsWithStandingRulingGrants, headIsCardOnly, readStandingRuling, readUneditedCommentIds, standingRulingScope } from '../standing-ruling-io.mjs';
@@ -395,6 +395,36 @@ describe('anchor time of an automatic grant', () => {
       const roundAt = (at) => (Date.parse(at) <= Date.parse('2026-10-20T12:00:00Z') ? 12 : reviewedHeads);
       expect(gateRoundCap({ cap: 5, grants, roundAt })).toBe(13);
     }
+  });
+});
+
+describe('never silently stuck after a grant (live #5690)', () => {
+  const T = Date.parse('2026-10-20T12:00:00Z');
+  const pr = (labels, comments) => ({ number: 5654, headRefOid: HEAD, labels: labels.map((name) => ({ name })), comments });
+  const credit = () => scope();
+  it('a PR still at its round limit well after a grant on this head is reported', () => {
+    const p = pr(['status:at-round-limit'], [autoGrant()]);
+    expect(stuckAfterGrant({ repo: 'we', pr: p }, { scopeOf: credit, now: () => T + STUCK_AFTER_GRANT_MS + 60_000 })).toMatch(/did not free a round/);
+    expect(stuckAfterGrant({ repo: 'we', pr: p }, { scopeOf: () => null, now: () => T + STUCK_AFTER_GRANT_MS + 60_000 })).toMatch(/not credited/);
+  });
+  it('an ordinary commenter mentioning the head cannot postpone an uncredited grant\'s alert', () => {
+    const late = T + STUCK_AFTER_GRANT_MS + 60_000;
+    const mention = { id: 'IC_m', author: { login: 'mallory' }, createdAt: new Date(late - 1000).toISOString(), body: `see @${HEAD}: please wait` };
+    const forged = { ...autoGrant(), author: { login: 'mallory' }, createdAt: new Date(late - 1000).toISOString() };
+    const p = pr(['status:at-round-limit'], [autoGrant(), mention, forged]);
+    expect(stuckAfterGrant({ repo: 'we', pr: p }, { scopeOf: () => null, now: () => late })).toMatch(/not credited/);
+  });
+  it('is quiet before the grace, off the round limit, or for another head', () => {
+    expect(stuckAfterGrant({ repo: 'we', pr: pr(['status:at-round-limit'], [autoGrant()]) }, { scopeOf: credit, now: () => T + 60_000 })).toBeNull();
+    expect(stuckAfterGrant({ repo: 'we', pr: pr(['status:awaiting-review'], [autoGrant()]) }, { scopeOf: credit, now: () => T + 3_600_000 })).toBeNull();
+    expect(stuckAfterGrant({ repo: 'we', pr: pr(['status:at-round-limit'], [autoGrant({ head: HEAD2 })]) }, { scopeOf: credit, now: () => T + 3_600_000 })).toBeNull();
+  });
+  it('the daemon publishes the needs-you for a stuck PR even with no note this pass', () => {
+    const publish = vi.fn();
+    const tick = () => ({ notes: [], prsByNumber: new Map([[5654, { number: 5654, headRefOid: HEAD, labels: [], comments: [] }]]) });
+    runReconcileNotesAllRepos({ repos: ['we'], tick, dryRun: false, publish, safety: { value: { alertAtRoundCap: true }, sources: {} },
+      autoRoundGrant: () => null, stuckAfterGrant: () => 'auto-grant did not free a round: x' });
+    expect(publish).toHaveBeenCalledWith(expect.objectContaining({ pr: 5654, kind: 'at-round-limit', reason: 'auto-grant did not free a round: x' }));
   });
 });
 
