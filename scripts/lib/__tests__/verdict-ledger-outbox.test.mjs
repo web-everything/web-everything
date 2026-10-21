@@ -20,7 +20,7 @@ import {
 import {
   flushLedgerOutbox, listOutboxEntries, outboxLockRoot, OUTBOX_LOCK_PATH, resolveOutboxSettings, formatOutboxSettings,
   OUTBOX_ENV, OUTBOX_DIR_ENV, enqueueOutboxEntry, spawnBoardLedgerOutboxFlush, spawnLedgerOutboxBackstop,
-  resetLedgerOutboxBackstopThrottle, classifyPushFailure, canonicalRemote, defaultOutboxRoot,
+  resetLedgerOutboxBackstopThrottle, classifyPushFailure, canonicalRemote, defaultOutboxRoot, flushBoardLedgerOutbox,
 } from '../verdict-ledger-outbox.mjs';
 import { withGitErrorForTest } from '../git-transport-branch.mjs';
 import { reserve, makeLockEntry } from '../../readiness/file-locks.mjs';
@@ -545,6 +545,13 @@ describe('real git: outbox + plumbing flush', () => {
       expect(d).toMatchObject({ status: 'appended' });
       expect(originRows(ctx).sort((x, y) => x - y)).toEqual([16, 17]);
     });
+  });
+
+  it('the board-level backstop helpers return {ok:false} even when their logger throws (round 13)', () => {
+    const boom = () => { throw new Error('log sink failed'); };
+    const nowhere = join(mkdtempSync(join(tmpdir(), 'nb-')), 'not-a-repo');
+    expect(flushBoardLedgerOutbox({ board: nowhere, env: {}, log: boom })).toMatchObject({ ok: false });
+    expect(spawnBoardLedgerOutboxFlush({ board: nowhere, env: {}, log: boom })).toMatchObject({ ok: false });
   });
 
   it('the plumbing push never follows tags', async () => {

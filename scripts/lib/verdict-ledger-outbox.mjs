@@ -708,7 +708,8 @@ export function flushLedgerOutbox(o = {}) {
  * THE DAEMON BACKSTOP for one board: flush its outbox (settings from the cascade). Nothing queued, or another
  * flusher holding the lock, is a quiet no-op. Never throws (see {@link flushLedgerOutbox}).
  */
-export function flushBoardLedgerOutbox({ board, env = process.env, log = defaultLog, run } = {}) {
+export function flushBoardLedgerOutbox({ board, env = process.env, log: rawLog = defaultLog, run } = {}) {
+  const log = safeLog(rawLog);
   if (!board) return { ok: true, flushed: 0, pushed: false, attempts: 0, skipped: 'no-board' };
   let dir = null;
   try {
@@ -773,7 +774,8 @@ function tickOutboxDir(board, env) {
  * Overlapping spawns are harmless: the flusher lock is non-blocking, so a second one exits as a no-op.
  * Never throws.
  */
-export function spawnBoardLedgerOutboxFlush({ board, env = process.env, log = defaultLog, spawnFn = spawn } = {}) {
+export function spawnBoardLedgerOutboxFlush({ board, env = process.env, log: rawLog = defaultLog, spawnFn = spawn } = {}) {
+  const log = safeLog(rawLog);
   if (!board) return { ok: true, flushed: 0, skipped: 'no-board' };
   let dir = null;
   try {
