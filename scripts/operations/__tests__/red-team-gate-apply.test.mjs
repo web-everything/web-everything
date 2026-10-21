@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import { applyRedTeamGate, buildGateComment, buildRedTeamCardInput, buildSendBackArgv, buildSendBackBody, gateExitCode, renderGateSummary, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
 import { runReviewJob } from '../review-job.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, gateRoundGrants, parseRedTeamComment, parseRedTeamGateMarker, readRedTeamDisposition, redTeamGateMarker, redTeamQueueReason, redTeamResultId, redTeamRulingNeeded } from '../../lib/red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, gateRoundGrants, liveResultGateState, parseRedTeamComment, parseRedTeamGateMarker, readRedTeamDisposition, redTeamGateMarker, redTeamQueueReason, redTeamResultId, redTeamRulingNeeded } from '../../lib/red-team-gate.mjs';
 import { redTeamEnqueueHold } from '../../lib/drain-queue-safety.mjs';
 import { planRedTeamStatusLabels, syncRedTeamStatusLabels } from '../../lib/red-team-status-labels.mjs';
 import { buildReviewedShaMarker, buildClearedHumanMarker } from '../../lib/review-escalation.mjs';
@@ -512,13 +512,17 @@ describe('applyRedTeamGate', () => {
         updated_at: c.createdAt, body: c.body, html_url: `https://github.com/${REPO}/pull/4722#issuecomment-${3400000000 + i}` });
       const labelProvider = (c, i) => ({ id: c.id ?? `IC_lp_${i}`, author: c.author, body: c.body, createdAt: c.createdAt });
       it.each([['GraphQL', graphql], ['raw REST', rest], ['label-provider', labelProvider]])(
-        'one valid unedited grant credits +1 in the %s shape, and the send-back resolver no longer returns round-cap', (_, shape) => {
-          const comments = [comment([F()]), capRecord(), autoGrant].map(shape);
+        'one valid unedited grant credits +1 in the %s shape, and the send-back resolver no longer returns round-cap', async (_, shape) => {
+          const thread = () => [comment([F()]), capRecord(), autoGrant].map(shape);
+          const comments = thread();
           expect(countGrantedRoundExtensions(comments, { repo: REPO, pr: 4722, standingRuling: scope })).toBe(1);
           expect(gateRoundGrants(comments, 4722, REPO, scope)).toEqual([expect.objectContaining({ by: 1, standingRuling: RULING_ID, at: autoGrant.createdAt })]);
-          const read = standingRuling => readRedTeamDisposition({ comments, pr: 4722, head: HEAD, repo: REPO, setting: CONFIRMED_BREAKS_DEFAULTS, env: {}, standingRuling });
-          expect(read(scope).outcome).toBe('sent-back');
-          expect(read(null).outcome).toBe('round-cap');
+          expect(liveResultGateState(comments, 4722, HEAD, REPO, scope)).toMatchObject({ sendBackOutcome: 'round-cap', reopened: true });
+          expect(liveResultGateState(comments, 4722, HEAD, REPO, null)).toMatchObject({ sendBackOutcome: 'round-cap', reopened: false });
+          const gate = (readGrantScope) => applyRedTeamGate({ repo: REPO, pr: 4722 },
+            fakeIo({ comments: thread(), round: 12, readRoundAsOf: () => 12, readGrantScope }).io);
+          expect(await gate(() => scope)).toMatchObject({ status: 'applied', outcome: 'sent-back' });
+          expect(await gate(() => null)).toMatchObject({ status: 'already-acted', outcome: 'round-cap' });
         });
       it('no trust check is loosened in the REST shape', () => {
         const thread = (grant) => [comment([F()]), capRecord(), grant].map(rest);
@@ -540,7 +544,8 @@ describe('applyRedTeamGate', () => {
           channel: 'auto-round-grant', reason: 'r', at: autoGrant.createdAt, standingRuling: RULING_ID, head: HEAD, episode: `${REPO}#4722@${HEAD}:review:${11 + n}/${11 + n}` }) }, n);
         const four = [1, 2, 3, 4].map(nth);
         expect(countGrantedRoundExtensions(four, { repo: REPO, pr: 4722, standingRuling: { ...scope, uneditedComments: ['IC_auto1', 'IC_auto2', 'IC_auto3', 'IC_auto4'] } })).toBe(3);
-        expect(readRedTeamDisposition({ comments: thread(restGrant), pr: 4722, head: HEAD, repo: REPO, setting: CONFIRMED_BREAKS_DEFAULTS, env: {}, standingRuling: scope }).outcome).toBe('sent-back');
+        expect(liveResultGateState(thread(restGrant), 4722, HEAD, REPO, scope).reopened).toBe(true);
+        expect(liveResultGateState(thread({ ...autoGrant, id: 'IC_edited' }), 4722, HEAD, REPO, scope).reopened).toBe(false);
       });
       it('the label provider keeps the comment id (the node id the unedited read returns)', () => {
         expect(GH_ARGV.readComments(REPO, 4722).join(' ')).toMatch(/\{id: \.node_id, url: \.html_url, author: \{login: \.user\.login\}, body, createdAt: \.created_at\}/);
