@@ -52,6 +52,10 @@ describe('resourceVerdict', () => {
     expect(resourceVerdict({ snapshot: snap({ memory: { swapUsedPct: undefined } }), nowMs: NOW }).verdict).toBe(null);
     expect(effectiveVerdict({ gate: 'resources', legacy: 'defer', res: { verdict: null } })).toBe('defer');
   });
+  it('an observed breach defers even when another field is missing', () => {
+    expect(resourceVerdict({ snapshot: snap({ cpu: { idlePct: 8 }, memory: { swapUsedPct: undefined } }), nowMs: NOW }).verdict).toBe('defer');
+    expect(resourceVerdict({ snapshot: snap({ memory: { freePct: 1, swapUsedPct: undefined } }), nowMs: NOW }).verdict).toBe('defer');
+  });
   it('shadowLine carries both verdicts and the numbers', () => {
     const res = resourceVerdict({ snapshot: snap(), nowMs: NOW });
     expect(shadowLine({ legacy: 'defer', legacyReason: LEGACY_DEFER.reason, res }))

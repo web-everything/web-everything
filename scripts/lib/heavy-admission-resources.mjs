@@ -21,22 +21,24 @@ export function resourceVerdict({ snapshot, nowMs = Date.now(), policy, gate = R
   const cpuIdlePct = fin(snapshot?.cpu?.idlePct);
   const minMem = gate.lowerBelowMemFreePct; const maxSwap = gate.lowerAboveSwapUsedPct;
   const sources = `cpu idle/mem pressure: resource-policy standard (${HEAVY_RESOURCE_KIND}); mem free >= ${minMem}% and swap <= ${maxSwap}%: resource-gate standard`;
-  const base = { cpuIdlePct, memFreePct, swapUsedPct, sources };
+  const pressureLevel = fin(snapshot?.memory?.pressureLevel);
+  const base = { cpuIdlePct, memFreePct, swapUsedPct, pressureLevel, sources };
   let d;
   try { d = decideAdmission({ kind: HEAVY_RESOURCE_KIND, snapshot, ...(policy ? { policy } : {}), nowMs }); }
   catch (e) { return { ...base, verdict: null, reason: `resource verdict unavailable: ${String(e?.message ?? e).split('\n')[0]}` }; }
-  if (d.unknown || cpuIdlePct === null || memFreePct === null || swapUsedPct === null || fin(snapshot?.memory?.pressureLevel) === null) {
+  // Stricter-only: an observed breach defers even when another field is missing (audit 2026-10-20).
+  if (!d.unknown && d.verdict !== 'admit') return { ...base, verdict: 'defer', reason: d.reason };
+  if (memFreePct !== null && memFreePct < minMem) return { ...base, verdict: 'defer', reason: `mem free ${memFreePct}% < ${minMem}%` };
+  if (swapUsedPct !== null && swapUsedPct > maxSwap) return { ...base, verdict: 'defer', reason: `swap used ${swapUsedPct}% > ${maxSwap}%` };
+  if (d.unknown || cpuIdlePct === null || memFreePct === null || swapUsedPct === null || pressureLevel === null) {
     return { ...base, verdict: null, reason: d.unknown ? d.reason : 'resource snapshot incomplete (cpu idle, mem free, swap or pressure missing)' };
   }
-  if (d.verdict !== 'admit') return { ...base, verdict: 'defer', reason: d.reason };
-  if (memFreePct < minMem) return { ...base, verdict: 'defer', reason: `mem free ${memFreePct}% < ${minMem}%` };
-  if (swapUsedPct > maxSwap) return { ...base, verdict: 'defer', reason: `swap used ${swapUsedPct}% > ${maxSwap}%` };
   return { ...base, verdict: 'admit', reason: d.reason };
 }
 
 /** The one log line, on every decision (and whenever the pair of verdicts changes while waiting). */
 export function shadowLine({ gate = 'shadow', gateSource = 'standard', legacy, legacyReason, res }) {
-  return `heavy-admission shadow: legacy=${legacy} (${legacyReason}) new=${res.verdict ?? 'unknown (legacy obeyed)'} (cpu idle ${res.cpuIdlePct ?? '?'}%, mem free ${res.memFreePct ?? '?'}%, swap ${res.swapUsedPct ?? '?'}%; ${res.reason}; ${res.sources}) [heavyAdmission.gate=${gate} (${gateSource})]`;
+  return `heavy-admission shadow: legacy=${legacy} (${legacyReason}) new=${res.verdict ?? 'unknown (legacy obeyed)'} (cpu idle ${res.cpuIdlePct ?? '?'}%, mem free ${res.memFreePct ?? '?'}%, swap ${res.swapUsedPct ?? '?'}%, mem pressure ${res.pressureLevel ?? '?'}; ${res.reason}; ${res.sources}) [heavyAdmission.gate=${gate} (${gateSource})]`;
 }
 
 /** Combine per gate mode. Unknown new verdict always falls back to legacy (fail closed). */

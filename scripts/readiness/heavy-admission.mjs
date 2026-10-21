@@ -1218,6 +1218,7 @@ export async function acquireSlotBlocking({
   let hostWaitSource = 'standard';
   let hostLoadBypassed = false;
   let lastShadowKey = null;
+  let resourceHold = false;
   try {
     for (;;) {
       const attempt = now();
@@ -1233,7 +1234,8 @@ export async function acquireSlotBlocking({
         try { res = resourceVerdict({ snapshot: readResourceSnapshot(), nowMs: attempt }); }
         catch (e) { res = { verdict: null, reason: `resource snapshot unreadable: ${String(e?.message ?? e).split('\n')[0]}`, sources: 'none' }; }
         const legacy = host.admitted ? 'admit' : 'defer';
-        const key = `${gate}|${legacy}|${res.verdict}`;
+        const key = `${gate}|${legacy}|${res.verdict}|${Math.floor(attempt / 30_000)}`; // re-logged at least every 30 s while waiting
+        resourceHold = gate === 'resources' && res.verdict === 'defer';
         if (key !== lastShadowKey) {
           lastShadowKey = key;
           try { log(shadowLine({ gate, gateSource: policy.sources?.gate ?? 'standard', legacy, legacyReason: host.reason, res }) + '\n'); } catch { /* logging never gates */ }
@@ -1263,6 +1265,11 @@ export async function acquireSlotBlocking({
         if (remaining > 0) {
           log(`heavy-command admission: waiting for host load: ${host.reason}; ${remaining}ms remaining [host.maxWaitMs=${hostMaxWaitMs} (${hostWaitSource})]\n`);
           await sleep(Math.min(pollMs, remaining));
+          continue;
+        }
+        if (resourceHold) { // a real-overload resource verdict is never bypassed by the wait limit (stricter-only)
+          log(`heavy-command admission: waiting despite host.maxWaitMs: ${host.reason}; the resource ceiling is not bypassed\n`);
+          await sleep(pollMs);
           continue;
         }
         hostLoadBypassed = true;
