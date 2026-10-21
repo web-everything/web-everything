@@ -198,6 +198,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
         if (argv[0] === 'rev-list') return '0\n';
         throw new Error(`unexpected command: ${bin} ${argv.join(' ')}`);
       });
+      gitMocks.push(exec);
       for (const action of ['reclaim', 'reset', 'reuse', 'release-on-behalf']) {
         expect(guardLaneAction({ path: '/l', action, exec, log: vi.fn() })).toMatchObject({
           act: false, fresh: { hasUnsafeWork: true, reason: 'worktree has changes' },
@@ -350,8 +351,9 @@ describe('lane action guard with real Git', () => {
     writeFileSync(join(path, 'tracked.txt'), 'committed content\n');
     writeFileSync(join(path, '.gitignore'), 'ignored.txt\nlocal-data/\n');
     git(['add', 'tracked.txt', '.gitignore']);
-    git(['-c', 'user.name=Guard Fixture', '-c', 'user.email=guard@example.invalid',
+    const commit = () => git(['-c', 'user.name=Guard Fixture', '-c', 'user.email=guard@example.invalid',
       '-c', 'commit.gpgSign=false', '-c', 'core.hooksPath=/dev/null', 'commit', '--quiet', '-m', 'fixture']);
+    commit();
     // Model an already-pushed HEAD using a local ref; no network or remote is needed.
     git(['update-ref', 'refs/remotes/origin/fixture', 'HEAD']);
     for (const action of actions) {
@@ -359,36 +361,64 @@ describe('lane action guard with real Git', () => {
         act: true, fresh: { hasUnsafeWork: false },
       });
     }
-    return { path, git };
+    return { path, git, commit };
   };
 
-  it.each(['--assume-unchanged', '--skip-worktree'])(
-    'refuses every destructive action when real Git %s hides a tracked edit', flag => {
-      const { path, git } = fixture();
-      git(['update-index', flag, 'tracked.txt']);
-      writeFileSync(join(path, 'tracked.txt'), 'uncommitted local edit\n');
+  it.each([
+    { work: 'untracked file', reason: 'worktree has changes', prepare: ({ path, git }) => {
+      writeFileSync(join(path, 'untracked.txt'), 'local data\n');
+      expect(git([...DIRTY_PROBE_ARGS])).toBe('?? untracked.txt\n');
+      return 'untracked.txt';
+    } },
+    { work: 'ignored-but-present file', reason: 'worktree has changes', prepare: ({ path, git }) => {
+      writeFileSync(join(path, 'ignored.txt'), 'local data\n');
+      expect(git(['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none'])).toBe('');
+      expect(git([...DIRTY_PROBE_ARGS])).toBe('!! ignored.txt\n');
+      return 'ignored.txt';
+    } },
+    ...['--assume-unchanged', '--skip-worktree'].map(flag => ({
+      work: flag, reason: 'index flags may hide worktree changes', prepare: ({ path, git }) => {
+        git(['update-index', flag, 'tracked.txt']);
+        writeFileSync(join(path, 'tracked.txt'), 'local data\n');
+        expect(git([...DIRTY_PROBE_ARGS])).toBe('');
+        expect(git(['ls-files', '-v', 'tracked.txt'])).toBe(`${flag === '--assume-unchanged' ? 'h' : 'S'} tracked.txt\n`);
+        return 'tracked.txt';
+      },
+    })),
+    { work: 'modified submodule hidden by Git configuration', reason: 'worktree has changes', prepare: ({ path, git, commit }) => {
+      const child = fixture();
+      git(['-c', 'protocol.file.allow=always', 'submodule', 'add', '--quiet', child.path, 'child']);
+      commit();
+      git(['update-ref', 'refs/remotes/origin/fixture', 'HEAD']);
+      git(['config', 'diff.ignoreSubmodules', 'all']);
+      git(['config', 'submodule.child.ignore', 'all']);
+      expect(freshLaneSafety({ path })).toMatchObject({ hasUnsafeWork: false });
+      writeFileSync(join(path, 'child', 'tracked.txt'), 'local data\n');
+      expect(git(['status', '--porcelain', '--untracked-files=all'])).toBe('');
+      expect(git([...DIRTY_PROBE_ARGS])).toBe(' M child\n');
+      return join('child', 'tracked.txt');
+    } },
+    { work: 'unpushed commit', reason: '1 unpushed commit(s)', prepare: ({ path, git, commit }) => {
+      writeFileSync(join(path, 'tracked.txt'), 'local data\n');
+      git(['add', 'tracked.txt']);
+      commit();
+      // A non-origin remote knows this commit; only origin refs may authorize losing it.
+      git(['update-ref', 'refs/remotes/backup/fixture', 'HEAD']);
       expect(git([...DIRTY_PROBE_ARGS])).toBe('');
-      expect(git(['ls-files', '-v', 'tracked.txt'])).toBe(`${flag === '--assume-unchanged' ? 'h' : 'S'} tracked.txt\n`);
-      for (const action of actions) {
-        expect(guardLaneAction({ path, action, log: vi.fn() })).toMatchObject({
-          act: false, fresh: { hasUnsafeWork: true, reason: 'index flags may hide worktree changes' },
-        });
-      }
-      expect(readFileSync(join(path, 'tracked.txt'), 'utf8')).toBe('uncommitted local edit\n');
-    });
-
-  it('refuses every destructive action for a real ignored file hidden from ordinary status', () => {
-    const { path, git } = fixture();
-    writeFileSync(join(path, 'ignored.txt'), 'local data\n');
-    expect(git(['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none'])).toBe('');
-    expect(git([...DIRTY_PROBE_ARGS])).toBe('!! ignored.txt\n');
+      expect(git(['rev-list', '--count', 'HEAD', '--not', '--remotes=origin'])).toBe('1\n');
+      return 'tracked.txt';
+    } },
+  ])('reports $work unsafe and refuses every destructive action with real Git', ({ prepare, reason }) => {
+    const repo = fixture();
+    const file = prepare(repo);
+    expect(freshLaneSafety({ path: repo.path })).toMatchObject({ hasUnsafeWork: true, fresh: true, reason });
     for (const action of actions) {
-      expect(guardLaneAction({ path, action, log: vi.fn() })).toMatchObject({
-        act: false, fresh: { hasUnsafeWork: true, reason: 'worktree has changes' },
+      expect(guardLaneAction({ path: repo.path, action, log: vi.fn() })).toMatchObject({
+        act: false, fresh: { hasUnsafeWork: true, reason },
       });
     }
-    expect(readFileSync(join(path, 'ignored.txt'), 'utf8')).toBe('local data\n');
-  });
+    expect(readFileSync(join(repo.path, file), 'utf8')).toBe('local data\n');
+  }, 30_000);
 });
 
 describe('stale-state operation factory cache opt-in', () => {
