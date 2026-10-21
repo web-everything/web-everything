@@ -2,43 +2,43 @@
 bornAs: xttbqyt
 kind: task
 status: open
-scope: ["we:scripts/worker-brief.mjs", "we:scripts/readiness/heavy-admission.mjs"]
+scope: ["we:scripts/worker-brief.mjs", "we:scripts/__tests__/worker-brief.test.mjs", "we:scripts/readiness/__tests__/heavy-admission.test.mjs"]
 dateOpened: "2026-10-20"
 tags: []
 ---
 
 # Worker brief: wait for heavy-admission instead of giving up
 
-Four workers on 2026-10-20 stopped with 'heavy-command admission deferred (exit 75), host load ~40/12' and left tests unrun. we:scripts/worker-brief.mjs should tell workers: from the repository root, tests go through we:scripts/readiness/heavy-admission.mjs using the command form below; on exit 75, either wait via the sanctioned bounded wait (if the agent can) or hand back the exact lane, sha and command to the orchestrator. Never stop silently, never sleep-loop.
+Make the worker brief spell out the heavy-wrapper command and an honest exit-75 handback. The wrapper already waits for capacity but can defer immediately on host overload; a finished exit-75 process is not an ongoing action to poll. Permit bounded waiting only while the worker’s own sanctioned queue action is still running, otherwise require the exact lane, full SHA and command with TESTS NOT RUN. Keep admission behavior unchanged.
 
-Command form (replace `...` with the test command and its arguments):
+## Done when
 
-```sh
-node scripts/readiness/heavy-admission.mjs run -- ...
-```
+Commands use the Bash helper `we() { command "${@#we:}"; }` to strip repository prefixes from arguments.
 
-## Acceptance
-
-- [A1] **Executable** — a test on the worker-brief output asserts the printed block names the command prefix above (through `run --`) as the way to run tests from the repository root, and states the exit-75 rule. It fails before this lands and passes after.
-- [A2] **Must** — the brief says: on exit 75, either wait through the sanctioned bounded wait (only if this agent can use it) or hand back the exact lane, sha, and command to the orchestrator in the final report.
-- [A3] **Must** — the brief forbids stopping silently, forbids a sleep loop, and forbids running the tests outside the gate to get around the deferral.
-- [A4] **Must** — a worker that hands back must say tests are NOT run; the brief never lets "deferred" read as "passed".
-- [A5] **Executable** — the brief text and the heavy-admission exit-code meaning are checked together in one test, so a changed exit code breaks the test.
+- [A1] **Executable** — `we node we:scripts/readiness/heavy-admission.mjs run -- npx vitest run we:scripts/__tests__/worker-brief.test.mjs` — assert the rendered brief includes the repository-root command `we node we:scripts/readiness/heavy-admission.mjs run -- npx vitest run <test-file>`, ties exit 75 to TESTS NOT RUN, and puts lane/full SHA/exact retry command first in a deferred report. These text/contract assertions fail against the current brief.
+- [A2] **Executable** — `we node we:scripts/readiness/heavy-admission.mjs run -- npx vitest run we:scripts/readiness/__tests__/heavy-admission.test.mjs` — force host refusal with injected probes and assert ADMISSION_DEFERRED_EXIT is 75 and the child never starts; cross-check the generated brief against that exported constant rather than independently hard-coding its meaning.
+- [A3] Explain that an ongoing owned queue command may be awaited within the existing ten-minute worker bound. Once it exits 75, hand back immediately; never sleep-loop, rerun outside the gate, turn the gate off, or report deferred as passed.
+- [A4] Separate gate deferral from an executed child failure: nonzero/unknown outcomes are never green. Handback requests the orchestrator verify the lane still has the reported SHA before retrying; successful execution must report the observed result.
 
 ## Non-goals
 
-- [N1] Does not change heavy-admission itself (cap, queue, or exit codes).
-- [N2] Does not add a new waiting mechanism; it points at the existing bounded wait.
-- [N3] Does not make the orchestrator re-dispatch handed-back work; that is a separate card.
+- [N1] No new wait mechanism, changed exit codes/caps or automatic orchestrator redispatch.
+- [N2] No promise that a completed exit-75 invocation can resume by polling it.
 
 ## Edge cases this change must handle
 
-One line per class: either the handling, or `n/a: <why>`.
+1. **Untrusted text** — Keep generated path validation; report the retry argv as data, never interpolate arbitrary output into a shell command.
+2. **Truncated reads** — Place lane/SHA/command before optional prose; an incomplete handback must not be treated as executable authorization.
+3. **Shared state files** — n/a: this wording change adds no shared state; the existing queue owns leases.
+4. **Fail closed** — Deferral and unknown outcome are TESTS NOT RUN or FAILED/UNKNOWN, never passed.
+5. **Identity scoping** — Report this worker’s lane, full SHA and exact command so siblings cannot be confused.
+6. **State over time** — A pending owned action has a bounded wait; a stale handback needs a fresh head check before retry.
+7. **Who wrote it** — Use tool-neutral instructions for Claude/Codex; the worker reports observed process status, not inferred success.
 
-1. **Untrusted text** — n/a: the brief is static text from the repo; no external input is put in it.
-2. **Truncated reads** — the handback names lane, sha and command in full; a short or cut-off report must still carry the sha and command, so they go first in the report.
-3. **Shared state files** — n/a: the brief only prints text and writes no state.
-4. **Fail closed** — an unknown exit code from the gate is treated as "not run", and the worker hands back; never as pass.
-5. **Identity scoping** — the handback names the lane and sha of THIS worker, so the orchestrator cannot confuse it with a sibling's.
-6. **State over time** — host load changes; the handback sha may be stale when the orchestrator retries, so the orchestrator re-checks the lane head against the sha before running.
-7. **Who wrote it** — the brief is read by Claude and Codex workers alike; the wording does not assume a tool only one of them has.
+## Grounding
+
+- we:scripts/worker-brief.mjs:88 prints red-green instructions and line 90 names test:unit; line 101 begins the existing bounded-wait rule.
+- we:scripts/readiness/heavy-admission.mjs:217 exports ADMISSION_DEFERRED_EXIT = 75.
+- we:scripts/readiness/heavy-admission.mjs:1188 immediately defers capable callers on host refusal.
+- we:scripts/readiness/heavy-admission.mjs:1605 passes canDefer: true and line 1606 returns before the child execution at line 1617.
+- we:scripts/__tests__/worker-brief.test.mjs:11 is the render test suite. Size 3 covers brief wording plus a cross-module subprocess/exit contract regression.

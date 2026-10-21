@@ -2,41 +2,49 @@
 bornAs: xchfioc
 kind: task
 status: open
-scope: ["we:scripts/lib/daemon-load-overlay.mjs", "we:scripts/lib/daemon-rebuild/", "we:scripts/lib/daemon-overlay-proofs.mjs", "we:scripts/daemon-overlay.mjs", "we:scripts/worker-brief.mjs"]
+scope: ["we:scripts/lib/daemon-overlay-proofs.mjs", "we:scripts/lib/__tests__/daemon-overlay-proofs.test.mjs", "we:scripts/daemon-overlay.mjs", "we:scripts/__tests__/daemon-overlay.test.mjs", "we:scripts/lib/daemon-load-overlay.mjs", "we:scripts/lib/__tests__/daemon-load-overlay.test.mjs", "we:scripts/lib/daemon-rebuild/plan.mjs", "we:scripts/lib/daemon-rebuild/prepare.mjs", "we:scripts/lib/daemon-rebuild/adopt.mjs", "we:scripts/lib/__tests__/daemon-rebuild.test.mjs", "we:scripts/lib/daemon-self-sync.mjs", "we:scripts/lib/daemon-version-runtime.mjs", "we:scripts/worker-brief.mjs", "we:scripts/__tests__/worker-brief.test.mjs"]
 dateOpened: "2026-10-20"
 tags: []
 ---
 
 # Worker brief: hard stop between audit and load
 
-Three times on 2026-10-19/20 a worker registered or loaded a daemon overlay before tests were green or before the read-only Codex audit said NOT WEAKENED (overlap-yield-blocked v1 rolled back; filing-on overlay registered pre-audit, unregistered by the orchestrator). Proposal: registration and every overlay adoption, including automatic refresh, refuse unless trusted records attest a NOT WEAKENED audit and green tests for that overlay and exact full sha. Cover we:scripts/lib/daemon-load-overlay.mjs and we:scripts/daemon-overlay.mjs add, plus the automatic daemon-self-sync → rebuildClone → prepareRebuild → planRebuild path at its shared adoption boundary; we:scripts/worker-brief.mjs states the order. Deterministic, so it belongs in the tool, not in prose.
+Require authenticated green-test and NOT WEAKENED audit proofs for the exact overlay identity/full SHA before registration and every adoption. Put verification at shared rebuild/adoption boundaries as well as add/load entry points, pin the verified commit through application, and retain the last verified build on refusal. A worker-written JSON marker is not authentication; implementing the trusted producers and storage boundary remains an explicit prerequisite to enabling this gate.
 
-## Acceptance
+## Done when
 
-- [A1] **Executable** — a test runs `daemon-overlay add` for a sha with no recorded audit verdict and expects refusal; with a verdict of NOT WEAKENED for that sha but no green test marker, expects refusal; with both for that exact sha, expects admission. Fails before, passes after.
-- [A2] **Must** — a verdict for a different overlay or sha does not count. Resolve the target to an immutable full sha, verify both proofs for that overlay and sha, and apply only that verified sha. A branch tip moving after validation must not substitute an unverified commit.
-- [A3] **Must** — a verdict other than NOT WEAKENED (WEAKENED, unclear, error, empty) refuses.
-- [A4] **Must** — the refusal message names which of the two proofs is missing or invalid and the sha checked.
-- [A5] **Must** — the worker brief states the order: tests green, then read-only audit, then register or load.
-- [A6] **Must** — no override flag; the only way past is to record the real verdict and the real green marker.
-- [A7] **Executable** — register and load audited, tested sha A, then advance the branch to nonconflicting sha B without proofs. Exercise automatic daemon-self-sync → rebuildClone → prepareRebuild → planRebuild: B is refused and A remains loaded. Repeat with only one proof, invalid proofs, a rebuild/retry, and a branch tip moving after validation; none may apply an unverified sha. With both trusted proofs for B, refresh may adopt B without re-registration.
-- [A8] **Executable** — hand-made audit and test records with the accepted writer identities, correct overlay/full sha, and successful results are rejected, including copies placed at worker-controlled paths. Requests by a worker to publish successful proofs through either trusted producer are also rejected. Genuine records from the trusted audit dispatcher and test gate are accepted only for their attested overlay/full sha; copying a genuine record to another overlay or sha fails. Unavailable trusted storage refuses admission and automatic adoption.
+Commands use the Bash helper `we() { command "${@#we:}"; }` to strip repository prefixes from arguments.
+
+- [A1] **Executable** — `we node we:scripts/readiness/heavy-admission.mjs run -- npx vitest run we:scripts/__tests__/daemon-overlay.test.mjs` — add an add-command matrix: no proofs, audit only, tests only, wrong overlay/SHA, malformed/negative verdict and both valid. Only the last registers. These cases fail before proof enforcement exists.
+- [A2] **Executable** — `we node we:scripts/readiness/heavy-admission.mjs run -- npx vitest run we:scripts/lib/__tests__/daemon-rebuild.test.mjs` — register/adopt proven A, advance its branch to B, then exercise automatic self-sync and rebuild. Missing/invalid B proof retains A; both valid B proofs permit B. Repeat through ready-candidate adoption, retry and a branch move after validation, asserting the applied SHA is precisely the proven SHA.
+- [A3] **Executable** — `we node we:scripts/readiness/heavy-admission.mjs run -- npx vitest run we:scripts/lib/__tests__/daemon-load-overlay.test.mjs` — cover direct load and queued/versioned load so neither bypasses proofs. Refusal names the missing/invalid proof and checked SHA; no override may disable the check.
+- [A4] Attack the proof store as the worker: forged writer fields, copied genuine proofs for another overlay/SHA, symlink redirection and requests to trusted producers with fabricated successful results must fail. Genuine producers attest their own completed runs; unavailable trusted storage refuses.
+- [A5] The generated brief orders green tests, read-only audit, then register/load. Consumers accept only a structured NOT WEAKENED enum and a successful test run from independently authorized producers, never a phrase quoted in prose.
 
 ## Non-goals
 
-- [N1] Does not run the audit or the tests; it validates their recorded results, provenance, and overlay/full-sha binding.
-- [N2] Does not change what the Codex audit judges or how it is dispatched.
-- [N3] Does not unregister overlays already loaded; that stays an orchestrator step. Refusing a refresh retains the previously loaded, verified sha; an existing registration does not authorize a newer sha.
-- [N4] Does not cover non-overlay daemon changes.
+- [N1] Do not change the audit rubric, automatically unregister loaded overlays, or gate non-overlay main updates.
+- [N2] The consumer gate validates proofs; it does not run tests or audits itself. Producer integration and authenticated storage are nevertheless required for completion.
 
 ## Edge cases this change must handle
 
-One line per class: either the handling, or `n/a: <why>`.
+1. **Untrusted text** — Parse a fixed verdict schema and validated overlay identity; free audit prose cannot authorize adoption.
+2. **Truncated reads** — Unreadable, incomplete or malformed proofs refuse; no partial record becomes success.
+3. **Shared state files** — Publish proofs atomically in the trusted store and keep checked-SHA adoption under existing clone locks.
+4. **Fail closed** — Missing authentication, inaccessible storage or mismatched SHA refuses and retains the verified running build.
+5. **Identity scoping** — Bind both attestations to repo, overlay, full SHA and actual run identity; same-name overlays in another clone cannot borrow proof.
+6. **State over time** — Every new SHA needs both proofs; revalidate ready candidates, automatic refresh and retries and carry pinned SHAs through application.
+7. **Who wrote it** — Workers must be unable to write/replace the trusted records or invoke a producer with arbitrary results. Same-user writable files plus writer labels are insufficient.
 
-1. **Untrusted text** — the verdict is read as a fixed enum from a structured record, not by searching free audit text for "NOT WEAKENED"; audit prose that quotes the phrase does not count.
-2. **Truncated reads** — a record file cut mid-write fails to parse and counts as no verdict.
-3. **Shared state files** — verdict and test markers are written atomically (temp file then rename) so a reader never sees a partial record.
-4. **Fail closed** — missing, unparsable, unreadable, unauthenticated, or mismatched record, or unavailable trusted storage: refuse registration/adoption; automatic refresh retains the previously loaded, verified sha.
-5. **Identity scoping** — records are keyed by overlay and full sha; one lane's marker cannot satisfy another lane's overlay.
-6. **State over time** — any new commit or rebase needs fresh proofs for its full sha. Every adoption, including automatic refresh, rebuild, recovery, and retry, checks the resolved sha at the shared adoption boundary before applying it; checking only add/load entry points or reusing registration-time authorization is insufficient. Pin the checked sha through application; if the target changes, resolve and validate again before applying.
-7. **Who wrote it** — provenance comes from a worker-inaccessible trusted store, writable only by the audit dispatcher and test gate through authenticated, role-specific access. Plan the trusted store access and producer integration in we:scripts/lib/daemon-overlay-proofs.mjs. Each trusted producer binds its actual run result to the overlay/full sha; workers cannot submit arbitrary successful results through those writers. Consumers read from the fixed trusted store, never a worker-selected path or cwd, and reject worker-controlled files, symlinks, and self-declared writer fields as authentication. Storage isolation must enforce this boundary even when workers share a host; a same-user writable file with an identity field is insufficient. A worker cannot create, alter, replace, or redirect either trusted record; a writer label is metadata only.
+## Grounding
+
+- we:scripts/daemon-overlay.mjs:513 registers the overlay directly with addOverlay.
+- we:scripts/lib/daemon-load-overlay.mjs:634 injects the registration/rebuild effects and line 662 calls the registration effect.
+- we:scripts/lib/daemon-rebuild/prepare.mjs:260 invokes planRebuild; we:scripts/lib/daemon-rebuild/plan.mjs:514 resolves each moving remote overlay tip.
+- we:scripts/lib/daemon-rebuild/rebuild.mjs:105 prepares under the clone write lock; proof checks must also cover ready adoption.
+- we:scripts/worker-brief.mjs:120 starts the edge step without the requested audit-proof sequence. The planned we:scripts/lib/daemon-overlay-proofs.mjs does not exist in this checkout.
+- Size 13 covers multiple adoption routes, hostile-worker tests and trusted producer integration, not a worker-brief wording patch.
+
+## Open questions
+
+Who operates the worker-inaccessible proof producers/store? Options: an isolated service/OS principal authenticating actual audit/test runs, or same-user local receipts. **Pick: isolated producers/store**; local receipts cannot satisfy the stated hostile-worker boundary. Human ownership/deployment choice is required, and the producer files cannot be named honestly until it is made. The scope above covers known consumers and planned proof module; extend it with those producers before dispatch. Slice seams (>8 points): trusted attestation service and producers; registration gate; automatic/ready/versioned adoption plus attack tests. No verified unresolved prerequisite card was found, so no invented blockedBy edge is added.
