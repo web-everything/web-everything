@@ -180,7 +180,7 @@ import { VERIFY_FILENAME, keepMarkerAfterReset, readVerifyMarker } from './lib/l
 // xbdixjc — the lane hold rule: every release/reset/remove/reclaim below asks it (pure rule in lane-lease.mjs).
 import { checkLaneHold, laneHoldJournalFields, clearLaneAwaitRecords } from './lib/lane-hold-io.mjs';
 import { resolveLaneHoldSettings } from './lib/lane-lease.mjs';
-import { applyLaneDietConfig } from './lib/lane-git-diet.mjs';
+import { applyLaneDietConfig, laneDietConfigState } from './lib/lane-git-diet.mjs';
 import { laneGitHardeningEnv, scrubRiskyLaneConfig } from './lib/lane-git-hardening.mjs';
 
 // #2560 — `--scope=a,b,c` → a normalized, repo-qualified array (empty when the flag is absent/blank).
@@ -278,15 +278,15 @@ const FETCH_LOCK_RETRY_BASE_MS = 250;
 // lane-git-diet — before EVERY lane fetch, make sure the lane's local config excludes `ops/*` from the default
 // fetch and keeps fetched objects packed (see ./lib/lane-git-diet.mjs: the ~10 MB verdict-ledger blob landed loose
 // in every lane on every fetch). Idempotent; a config failure never blocks the fetch itself.
-function ensureLaneDietConfig(dir) {
+function ensureLaneDietConfig(dir, current) {
   try {
-    applyLaneDietConfig((args) => git(args, dir, { timeout: LOCAL_GIT_TIMEOUT_MS }));
+    applyLaneDietConfig((args) => git(args, dir, { timeout: LOCAL_GIT_TIMEOUT_MS }), current);
   } catch (e) {
     log(`  ⚠ ${dir}: lane git-diet config not applied (${String(e && e.message ? e.message : e).split('\n')[0]})`);
   }
 }
-function fetchOriginPruneWithRetry(dir) {
-  ensureLaneDietConfig(dir);
+function fetchOriginPruneWithRetry(dir, dietConfig) {
+  ensureLaneDietConfig(dir, dietConfig);
   return retryTransientGit(() => git(['fetch', 'origin', '--prune', '--quiet'], dir, { timeout: NETWORK_GIT_TIMEOUT_MS }), { attempts: FETCH_LOCK_RETRY_ATTEMPTS, baseMs: FETCH_LOCK_RETRY_BASE_MS });
 }
 
@@ -886,10 +886,10 @@ function healSharedStoreFor(repo, err) {
     return false;
   }
 }
-function fetchOriginHealing(repo, n, { allowReclone = false } = {}) {
+function fetchOriginHealing(repo, n, { allowReclone = false, dietConfig } = {}) {
   const dir = laneDir(repo, n);
   try {
-    return fetchOriginPruneWithRetry(dir);
+    return fetchOriginPruneWithRetry(dir, dietConfig);
   } catch (e) {
     // xsxu243 — a commit-graph error may live in the SHARED reference store (read through objects/info/alternates), where
     // no per-lane repair can reach it: regenerate that derived cache once (locked, logged), then retry before any lane-level heal.
@@ -1894,19 +1894,22 @@ function logReclaimedAheadCommits(dir, branch, n) {
 const acquireResetSnapshots = new Map();
 
 function scrubClaimedLaneConfig(dir, reason) {
-  const { removed, kept } = scrubRiskyLaneConfig(dir, { log });
+  let dietConfig;
+  // Reuse an unchanged scrub read for the next fetch. Removing an include can also remove diet settings.
+  const { removed, kept } = scrubRiskyLaneConfig(dir, { log, onConfig: (output) => { dietConfig = laneDietConfigState(output); } });
   if (removed.length) journalLaneEvent(dir, { action: 'config-scrub', removed, kept, reason });
+  return removed.length ? undefined : dietConfig;
 }
 
 function provisionClaimedLane(repo, chosen, targetWasReserved) {
   const dir = laneDir(repo, chosen);
-  scrubClaimedLaneConfig(dir, 'before acquire hand-out');
+  const dietConfig = scrubClaimedLaneConfig(dir, 'before acquire hand-out');
   if (!flags['no-reset'] && !targetWasReserved) {
     // xj1vryw — this process just WON the lane's lease, so it may repair it: a corrupt clone (broken index, missing
     // object, dangling ref) is healed or quarantined + re-provisioned here, so acquire hands out a healthy lane.
     // LAZY on purpose: the health probe costs ~6 git spawns, so a healthy lane (the common case) never pays for it —
     // it runs only once the fetch or the pre-reset checks below actually fail with a corruption-shaped error.
-    fetchOriginHealing(repo, chosen, { allowReclone: true });
+    fetchOriginHealing(repo, chosen, { allowReclone: true, dietConfig });
     const repairUnhealthyClone = () => {
       let health = diagnoseLane(dir);
       if (!health.ok) {

@@ -10,8 +10,9 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync, statSync
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import {
-  LANE_DEFAULT_FETCH, LANE_OPS_NEGATIVE_FETCH, laneDietConfigOps, applyLaneDietConfig, OPS_REF_READERS,
+  LANE_DEFAULT_FETCH, LANE_OPS_NEGATIVE_FETCH, laneDietConfigOps, laneDietConfigState, applyLaneDietConfig, OPS_REF_READERS,
 } from '../lane-git-diet.mjs';
+import { LANE_CONFIG_LIST_ARGS } from '../lane-git-hardening.mjs';
 import { scopedScanFiles } from '../repo-scan-tests.mjs';
 
 const REPO = join(import.meta.dirname, '..', '..', '..');
@@ -39,25 +40,45 @@ describe('laneDietConfigOps (pure)', () => {
     const ops = laneDietConfigOps({ fetchValues: ['+refs/heads/main:refs/remotes/origin/main'], kv: {} });
     expect(ops.some((o) => o.includes(LANE_DEFAULT_FETCH))).toBe(false);
   });
-  it('applyLaneDietConfig reads unset keys as unset (git exit 1) and applies only the missing ops', () => {
+  it('reads all settings in one spawn and applies only the missing ops', () => {
     const calls = [];
     const run = (args) => {
       calls.push(args);
-      if (args[3] === 'remote.origin.fetch') return `${LANE_DEFAULT_FETCH}\n`;
-      if (args[2] === '--get-all') { const e = new Error('exit 1'); e.status = 1; throw e; }
+      if (args.includes('--list')) return `local\0remote.origin.fetch\n${LANE_DEFAULT_FETCH}\0`;
       return '';
     };
     expect(applyLaneDietConfig(run)).toHaveLength(3);
+    expect(calls).toEqual([[...LANE_CONFIG_LIST_ARGS], ...laneDietConfigOps({ fetchValues: [LANE_DEFAULT_FETCH] })]);
   });
-  it('applyLaneDietConfig propagates a non-"unset" read failure instead of re-adding refspecs', () => {
+  it.each([1, null, 128])('propagates a listing failure (status %s) before any write', (status) => {
     const writes = [];
     const run = (args) => {
-      if (args.includes('--get-all')) { const e = new Error('timed out'); e.status = null; throw e; }
+      if (args.includes('--list')) { const e = new Error('read failed'); e.status = status; throw e; }
       writes.push(args);
       return '';
     };
-    expect(() => applyLaneDietConfig(run)).toThrow(/timed out/);
+    expect(() => applyLaneDietConfig(run)).toThrow(/read failed/);
     expect(writes).toEqual([]);
+  });
+  it('reuses a scrub snapshot without spawning another config read', () => {
+    const current = { fetchValues: [LANE_DEFAULT_FETCH, LANE_OPS_NEGATIVE_FETCH], kv: { 'fetch.unpackLimit': '1', 'transfer.unpackLimit': '1' } };
+    expect(applyLaneDietConfig(() => { throw new Error('unexpected git spawn'); }, current)).toEqual([]);
+  });
+  it('parses only local origin settings, preserving duplicate values and embedded newlines', () => {
+    const entry = (scope, key, value) => `${scope}\0${key}\n${value}\0`;
+    const output = entry('global', 'remote.origin.fetch', LANE_OPS_NEGATIVE_FETCH)
+      + entry('local', 'remote.Origin.fetch', '+refs/heads/other:refs/remotes/Origin/other')
+      + entry('local', 'remote.origin.fetch', LANE_DEFAULT_FETCH)
+      + entry('local', 'remote.origin.fetch', LANE_OPS_NEGATIVE_FETCH)
+      + entry('local', 'alias.multiline', 'one\nremote.origin.fetch\nother')
+      + entry('local', 'fetch.unpacklimit', '1') + entry('local', 'fetch.unpacklimit', '1')
+      + entry('command', 'transfer.unpacklimit', '1');
+    const current = laneDietConfigState(output);
+    expect(current).toEqual({ fetchValues: [LANE_DEFAULT_FETCH, LANE_OPS_NEGATIVE_FETCH], kv: { 'fetch.unpackLimit': '1\n1', 'transfer.unpackLimit': '' } });
+    expect(laneDietConfigOps(current)).toEqual([
+      ['config', '--local', '--replace-all', 'fetch.unpackLimit', '1'],
+      ['config', '--local', '--replace-all', 'transfer.unpackLimit', '1'],
+    ]);
   });
 });
 
@@ -119,6 +140,9 @@ describe('real git: negative refspec keeps ops/* out of a default fetch', () => 
     const scratch = join(root, 'diet');
     git(root, 'clone', '-q', up, scratch);
     applyLaneDietConfig((args) => git(scratch, ...args));
+    const reads = [];
+    expect(applyLaneDietConfig((args) => { reads.push(args); return git(scratch, ...args); })).toEqual([]);
+    expect(reads).toEqual([[...LANE_CONFIG_LIST_ARGS]]);
     git(scratch, 'update-ref', '-d', 'refs/remotes/origin/ops/review-requests');
     git(scratch, 'fetch', '-q', '--prune', 'origin');
     expect(refs(scratch).some((r) => r.includes('/ops/'))).toBe(false);

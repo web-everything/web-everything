@@ -21,6 +21,8 @@
  *
  * Pure planning lives here; `we:scripts/lane-pool.mjs` applies it before every lane fetch and after clone.
  */
+import { LANE_CONFIG_LIST_ARGS } from './lane-git-hardening.mjs';
+
 export const LANE_DEFAULT_FETCH = '+refs/heads/*:refs/remotes/origin/*';
 export const LANE_OPS_NEGATIVE_FETCH = '^refs/heads/ops/*';
 /** Local config keys a diet lane must carry, with their values. */
@@ -70,23 +72,32 @@ export function laneDietConfigOps({ fetchValues = [], kv = {} } = {}) {
   return ops;
 }
 
+/** Read the local diet settings from git's scoped, NUL-delimited config listing. Pure. */
+export function laneDietConfigState(output) {
+  const values = new Map();
+  const parts = String(output).split('\0');
+  for (let i = 0; i + 1 < parts.length; i += 2) {
+    if (parts[i] !== 'local') continue;
+    const entry = parts[i + 1], end = entry.indexOf('\n');
+    const key = end < 0 ? entry : entry.slice(0, end);
+    const value = end < 0 ? '' : entry.slice(end + 1);
+    if (!values.has(key)) values.set(key, []);
+    values.get(key).push(value);
+  }
+  return {
+    fetchValues: values.get('remote.origin.fetch') || [],
+    kv: Object.fromEntries(Object.keys(LANE_DIET_KV).map((key) => [key, (values.get(key.toLowerCase()) || []).join('\n').trim()])),
+  };
+}
+
 /**
- * Read a lane's current config and apply {@link laneDietConfigOps}. `run(args)` runs git in the lane and
- * returns stdout. Only git's "key not set" answer (exit status 1) reads as unset; any other failure (a timeout,
- * a locked config) propagates, so a half-read config can never cause duplicate refspecs.
+ * Read a lane's current config in one spawn and apply {@link laneDietConfigOps}. `run(args)` runs git in the
+ * lane and returns stdout. An acquire can supply the snapshot from its immediately preceding config scrub.
+ * Read failures propagate before any writes; absent keys are simply absent from a successful listing.
  * @returns {string[][]} the ops applied
  */
-export function applyLaneDietConfig(run) {
-  const read = (args) => {
-    try { return String(run(args) ?? ''); } catch (e) { if (e && e.status === 1) return ''; throw e; }
-  };
-  const fetchValues = read(['config', '--local', '--get-all', 'remote.origin.fetch']).split('\n');
-  const kv = {};
-  for (const key of Object.keys(LANE_DIET_KV)) {
-    const v = read(['config', '--local', '--get-all', key]).trim();
-    if (v) kv[key] = v; // several values read as "not exactly the diet value" → replaced below
-  }
-  const ops = laneDietConfigOps({ fetchValues, kv });
+export function applyLaneDietConfig(run, current) {
+  const ops = laneDietConfigOps(current ?? laneDietConfigState(run([...LANE_CONFIG_LIST_ARGS])));
   for (const op of ops) run(op);
   return ops;
 }

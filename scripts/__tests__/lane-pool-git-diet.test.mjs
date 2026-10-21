@@ -52,5 +52,19 @@ it('provision + acquire keep ops/* out of a lane while explicit reader fetches s
     git(['fetch', '--quiet', 'origin', '+refs/heads/ops/review-requests:refs/remotes/origin/ops/review-requests'], lane);
     expect(git(['rev-parse', 'origin/ops/review-requests'], lane)).toBe(git(['rev-parse', 'HEAD'], reference));
     run(['release', '--lane=1', '--session=diet-test']);
+
+    // Scrubbing an include invalidates the earlier config snapshot: the included diet settings disappear.
+    git(['config', '--unset', 'remote.origin.fetch', '\\^refs/heads/ops/\\*'], lane);
+    git(['config', '--unset', 'fetch.unpackLimit'], lane);
+    git(['config', '--unset', 'transfer.unpackLimit'], lane);
+    const included = join(base, 'included.config');
+    writeFileSync(included, '[remote "origin"]\nfetch = ^refs/heads/ops/*\n[fetch]\nunpackLimit = 1\n[transfer]\nunpackLimit = 1\n');
+    git(['config', 'include.path', included], lane);
+    const reacquire = run(['acquire', '--lane=1', '--session=diet-test']);
+    expect(reacquire.status, reacquire.stderr).toBe(0);
+    expect(git(['config', '--local', '--get-all', 'remote.origin.fetch'], lane).split('\n')).toContain('^refs/heads/ops/*');
+    expect(git(['config', '--local', '--get', 'fetch.unpackLimit'], lane)).toBe('1');
+    expect(git(['config', '--local', '--get', 'transfer.unpackLimit'], lane)).toBe('1');
+    run(['release', '--lane=1', '--session=diet-test']);
   } finally { rmSync(base, { recursive: true, force: true }); }
 }, 60000);
