@@ -188,12 +188,13 @@ export function canonicalRemote(url, base = process.cwd()) {
     const scheme = proto[1].toLowerCase();
     user = proto[2] ?? null; host = proto[3]; path = proto[5]; // absolute, except git's `ssh://host/~/path`
     transport = /ssh/.test(scheme) ? 'ssh' : scheme === 'git' ? 'git' : 'http';
-    if (transport === 'ssh' && path.startsWith('/~/')) path = path.slice(1);
+    if (transport === 'ssh' && path.startsWith('/~')) path = path.slice(1); // `/~/x` and `/~user/x` are home paths
     const defaults = { ssh: '22', 'git+ssh': '22', 'ssh+git': '22', https: '443', http: '80', git: '9418' };
     port = proto[4] && proto[4] !== defaults[scheme] ? proto[4] : null;
   } else if (!proto && scp && !/^[a-zA-Z]:[\\/]/.test(u) && !u.startsWith('/') && !u.startsWith('.')) {
     user = scp[1] ?? null; host = scp[2]; transport = 'ssh';
-    path = scp[3].startsWith('/') ? scp[3] : `~/${scp[3]}`;
+    // Round 10: an explicit `~` / `~user` is kept as written; only a plain relative path gains the implied `~/`.
+    path = scp[3].startsWith('/') || scp[3].startsWith('~') ? scp[3] : `~/${scp[3]}`;
   }
   if (!host) return `file:${resolve(base, u.replace(/^file:\/\//, '')).replace(/\/+$/, '')}`;
   host = host.toLowerCase();

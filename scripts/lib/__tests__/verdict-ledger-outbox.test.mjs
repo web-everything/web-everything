@@ -10,7 +10,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { spawn, execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
@@ -353,6 +353,12 @@ describe('real git: outbox + plumbing flush', () => {
     expect(canonicalRemote('ssh://alice@gitbox/~/repo.git')).not.toBe(canonicalRemote('ssh://bob@gitbox/~/repo.git'));
     expect(canonicalRemote('ssh://alice@gitbox/~/repo.git')).toBe(canonicalRemote('alice@gitbox:repo.git'));
     expect(canonicalRemote('https://gitbox/srv/repo')).not.toBe(canonicalRemote('ssh://gitbox/srv/repo'));
+    // Round 10: explicit tildes are kept as written: `~/x` and `~/~/x` differ; scp and URI spellings agree.
+    expect(canonicalRemote('alice@gitbox:~/repo.git')).not.toBe(canonicalRemote('ssh://alice@gitbox/~/~/repo.git'));
+    expect(canonicalRemote('alice@gitbox:~/repo.git')).toBe(canonicalRemote('ssh://alice@gitbox/~/repo.git'));
+    expect(canonicalRemote('alice@gitbox:repo.git')).toBe(canonicalRemote('alice@gitbox:~/repo.git'));
+    expect(canonicalRemote('alice@gitbox:~bob/repo.git')).toBe(canonicalRemote('ssh://alice@gitbox/~bob/repo.git'));
+    expect(canonicalRemote('alice@gitbox:~bob/repo.git')).not.toBe(canonicalRemote('alice@gitbox:~/repo.git'));
   });
 
   it('an unanswered push whose noise mentions "cannot lock ref" is still UNKNOWN: kept queued, never thrown', async () => {
@@ -457,18 +463,26 @@ describe('real git: outbox + plumbing flush', () => {
       q(v('changes', 0), -3000);                       // A: flushable
       const bName = q(v('accepted', 1), -2000);        // B: unreadable at first
       const bFile = join(outboxDir, bName);
-      chmodSync(bFile, 0o000);
+      // Deterministically unreadable, root included: a DIRECTORY where the entry file should be (EISDIR).
+      const bBytes = readFileSync(bFile);
+      rmSync(bFile);
+      mkdirSync(bFile);
+      const ats = () => ctx.showOnOrigin(LEDGER_TRANSPORT_BRANCH, ledgerGitPath(REPO)).trim().split('\n').map((l) => JSON.parse(l).at.slice(14, 16));
       let pushes = 0;
+      let firstBatch = null;
       const run = (args, opts) => {
-        if (args[0] === 'push' && ++pushes === 1) { chmodSync(bFile, 0o644); q(v('accepted', 9), +5000); } // B recovers, D queues
-        return realGit(args, opts);
+        const out = realGit(args, opts);
+        if (args[0] === 'push' && ++pushes === 1) {
+          firstBatch = ats();
+          rmSync(bFile, { recursive: true }); writeFileSync(bFile, bBytes); // B recovers...
+          q(v('accepted', 9), +5000);                                     // ...and a newer D queues
+        }
+        return out;
       };
-      try {
-        appendLedgerRows({ board: ctx.clone, repo: REPO, records: [v('changes', 5)], outbox: true, outboxDir, gitRun: run, log: quiet }); // C
-      } finally { try { chmodSync(bFile, 0o644); } catch { /* gone */ } }
+      appendLedgerRows({ board: ctx.clone, repo: REPO, records: [v('changes', 5)], outbox: true, outboxDir, gitRun: run, log: quiet }); // C
       flushLedgerOutbox({ board: ctx.clone, dir: outboxDir, log: quiet });
-      const ats = ctx.showOnOrigin(LEDGER_TRANSPORT_BRANCH, ledgerGitPath(REPO)).trim().split('\n').map((l) => JSON.parse(l).at.slice(14, 16));
-      expect(ats).toEqual(['00', '01', '05', '09']); // A, B, C, D: append order, whatever became readable when
+      expect(firstBatch).toEqual(['00']); // only A passed the unreadable B
+      expect(ats()).toEqual(['00', '01', '05', '09']); // A, B, C, D: append order, whatever became readable when
     });
   });
 
