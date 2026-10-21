@@ -1,78 +1,50 @@
 ---
 bornAs: xwfgsk7
+size: 13
 kind: story
-size: 5
 status: open
-scope: ["we:scripts/readiness/heavy-admission.mjs", "we:scripts/lib/host-overload-settings.mjs", "we:scripts/lib/resource-gate.mjs", "we:scripts/lib/review-seat-settings.mjs", "we:scripts/lib/host-load.mjs"]
+scope: ["we:scripts/lib/resource-policy.mjs", "we:scripts/lib/resource-admission.mjs", "we:scripts/lib/resource-sampler.mjs", "we:scripts/lib/resource-gate.mjs", "we:scripts/readiness/heavy-admission.mjs", "we:scripts/operations/review-seat-runner.mjs", "we:scripts/review-set-label.mjs", "we:scripts/lib/review-seat-settings.mjs", "we:scripts/lib/__tests__/resource-admission.test.mjs", "we:scripts/lib/__tests__/resource-sampler.test.mjs", "we:scripts/readiness/__tests__/heavy-admission.test.mjs", "we:scripts/operations/__tests__/review-seat-runner.test.mjs", "we:scripts/__tests__/review-set-label.test.mjs"]
 dateOpened: "2026-10-20"
 tags: []
 ---
 
 # Admission by per-job resource profile: weight each job kind and admit against its limiting resource (memory, CPU, model quota, GitHub rate)
 
-Admit each job kind against its own limiting resource (memory, CPU, model quota, GitHub rate) using a per-kind resource profile, with load average kept only as a backstop. Follow-up slice to PR #5768 (memory-aware heavy admission). Operator approved 2026-10-20.
+Extend the existing per-kind resource policy with weighted CPU/memory reservations and model/GitHub quota classes, rather than introduce a second admission engine. Existing kinds already have CPU-idle and memory-pressure thresholds; the remaining work is aggregate resource accounting, quota signals, caller integration and a symptom brake. Keep concurrency caps and the host-load backstop. Treat the original 2026-10-20 numbers as proposed replay inputs, not newly verified measurements.
 
-## Problem (measured 2026-10-20)
+## Done when
 
-Load average is a poor admission signal.
+Commands use the Bash helper `we() { command "${@#we:}"; }` to strip repository prefixes from arguments.
 
-- At load 52 the CPU was 23% idle. The host was memory-bound, not CPU-bound.
-- At load 30 the running set was mostly short-lived git/gh calls.
-- Review jobs mostly wait on the model: about 0% CPU, 0.3-0.5 GB RSS each.
-- vitest and verify-lane are CPU and memory heavy: 1-2 GB each.
-- gh calls are tiny but rate-limited.
-
-Today `we:scripts/readiness/heavy-admission.mjs` counts heavy commands and gates on host load and memory pressure the same way for every kind. Review seats (`we:scripts/lib/review-seat-settings.mjs`) are throttled by a separate concurrency count. Neither knows what each job actually costs.
-
-## Proposal
-
-A per-kind resource profile: cpu weight, memory MB, quota class.
-
-| Kind | CPU weight | Memory | Quota class |
-|---|---|---|---|
-| verify / vitest | about 4 | about 1500 MB | none |
-| review seat | about 0.2 | about 400 MB | model quota |
-| red-team seat | similar to review seat | similar | model quota |
-| label write | tiny | tiny | GitHub rate |
-
-Admit each kind against ITS limiting resource budget:
-
-- memory headroom, from vm stats / memory_pressure
-- CPU idle %
-- model quota
-- GitHub rate remaining
-
-Add a symptom brake: the rate of git/gh timeouts and pass-duration spikes tightens all budgets. Keep load average only as a backstop.
-
-Profiles and budgets are cascade settings, runtime-settable via the new runtime settings layer (see the runtime settings build). Every admission decision logs its sources (which layer set each value).
-
-## Acceptance
-
-- [A1] **Executable** — one named test per kind (verify/vitest, review seat, red-team seat, label write) proving it is admitted or held against its own limiting resource.
-- [A2] **Executable** — a replay of the 2026-10-20 samples shows review seats admitted at load 30 / 10 GB free, and verify held at load 52 / 0.6 GB free.
-- [A3] **Executable** — a symptom-brake test: raising the git/gh timeout rate tightens every budget; clearing it restores them.
-- [A4] **Executable** — a runtime override of a profile or budget takes effect without restart, and the decision log names the source layer.
+- [A1] **Executable** — `we node we:scripts/readiness/heavy-admission.mjs run -- npx vitest run we:scripts/lib/__tests__/resource-admission.test.mjs` — add weighted-reservation tests for verify/vitest, review, red-team and label writes: each holds when its own budget is exhausted and remains eligible when an unrelated quota is exhausted. These fail before profile accounting exists; include two concurrent acquisitions competing for the final budget.
+- [A2] Replay explicit fixtures with load 30/free memory 10 GB admitting a review, and load 52/free memory 0.6 GB holding verification. State CPU count, idle percentage, freshness and quota headroom in each fixture so the outcome is reproducible and the backstop is not silently bypassed.
+- [A3] Integrate reservations at the heavy subprocess wrapper, review/red-team seat runner and label-write producer. Release on completion, failed spawn and timeout; recover crashed owners without double refund. A subprocess cannot escape accounting by choosing a cheaper kind.
+- [A4] Test a bounded timeout-rate/pass-duration window tightening all budgets and restoring them after a documented quiet window; record thresholds, measured inputs and reasons with every decision.
+- [A5] Validate finite nonnegative weights and quota units. Runtime changes take effect on the next admission with per-field source attribution; reducing a budget prevents new launches without killing existing jobs. Keep the existing hard concurrency caps.
 
 ## Non-goals
 
-- [N1] No change to the heavy-command capacity cap semantics beyond the new per-kind budgets.
-- [N2] No per-process cgroup or container ceiling (separate opt-in path in heavy-admission).
-- [N3] No removal of the load-average backstop.
+- [N1] No cgroups, process killing or replacement of host sampling.
+- [N2] No quota estimation from load average and no claim that old per-kind thresholds already implement weighted budgets.
 
 ## Edge cases this change must handle
 
-1. **Untrusted text** — n/a: inputs are numeric host samples and settings, not free text.
-2. **Truncated reads** — a short or partial vm_stat / memory_pressure read counts as unknown, not as plenty.
-3. **Shared state files** — samples and rate counters live in the shared host sampler files; reads tolerate concurrent writers and stale files.
-4. **Fail closed** — an unreadable resource signal holds only the kinds that depend on it, with a logged reason; never admits blind.
-5. **Identity scoping** — profiles are keyed by job kind, not by caller; one session cannot spend another kind's budget.
-6. **State over time** — samples are windowed and smoothed so a fork-storm spike does not flap admission.
-7. **Who wrote it** — profile and budget values record which cascade layer (default, file, runtime) set them.
+1. **Untrusted text** — Validate kind enums and numeric settings; reject unknown quota/profile keys instead of treating them as free work.
+2. **Truncated reads** — Partial or capped host/quota reads are unknown, not zero cost or unlimited headroom.
+3. **Shared state files** — Atomically reserve and release host-global budgets under a lock; duplicate completion cannot refund twice.
+4. **Fail closed** — Unavailable required signals hold the dependent kind; unknown kinds use a conservative heavy profile.
+5. **Identity scoping** — Scope model quota by provider/account, GitHub quota by credential identity, and reservations by job/owner; never log credentials.
+6. **State over time** — Expire samples, honor quota resets, smooth the symptom brake and reclaim only demonstrably dead reservations.
+7. **Who wrote it** — Use trusted sampler and producer observations; caller-provided cost claims cannot bypass classification.
 
-## Links
+## Grounding
 
-- PR #5768 (memory-aware heavy admission)
-- The runtime settings build (new runtime layer)
-- Memory epic xwu9oxh (`we:backlog/6641-memory-audit-cut-per-process-rss-and-duplicated-loads-across.md`)
-- Architecture-rules card xglhy4b rule 2 (`we:backlog/6642-standing-architecture-rules-delivery-system.md`)
-- `we:scripts/readiness/heavy-admission.mjs`, `we:scripts/lib/host-overload-settings.mjs`, `we:scripts/lib/resource-gate.mjs`, `we:scripts/lib/review-seat-settings.mjs`
+- we:scripts/lib/resource-policy.mjs:19 already declares per-kind policies; line 58 decides from thresholds, not weighted live reservations.
+- we:scripts/lib/resource-admission.mjs:40 writes snapshots atomically; line 52 loads platform/tool policy.
+- we:scripts/readiness/heavy-admission.mjs:1604 classifies the command and line 1605 acquires before spawning.
+- we:scripts/lib/resource-gate.mjs:178 is the shared cutover decision seam.
+- Size 13 reflects policy/accounting, new quota sampling, three producer integrations and regression coverage; the original five-point estimate omitted those callers.
+
+## Open questions
+
+Which runtime-settings build and authenticated quota source should this use? Options: reuse the operator’s pending settings/quota work, or build another local settings/quota service. **Pick: reuse the shared work**, but its card/interface was not identifiable in this checkout, so no speculative blockedBy is set. Slice seams: CPU/memory profiles and reservations; model/GitHub quota adapters and callers; symptom brake and runtime overrides. Agree those seams before scheduling the >8-point whole.
