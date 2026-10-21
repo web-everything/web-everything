@@ -1,6 +1,5 @@
-// @file Head-binding ledger fold (#5492 rebuild slice 1, design v2). PURE, no callers. May this PR land at live head X
-// (read fresh, never from the ledger)? Rows bear only on their own full head, except PR-level obligations; order is git
-// append order; answers count only inside their judgment boundary (`seen`). Every doubt holds; nothing throws.
+// @file Head-binding ledger fold (#5492 rebuild, design v2). PURE; only the slice-3 shadow calls it. May this PR land at live
+// head X? Rows bind to their own full head (bar PR-level obligations); git append order; answers count only inside `seen`.
 import { createHash } from 'node:crypto';
 
 const SHA40 = /^[0-9a-f]{40}$/;
@@ -98,8 +97,8 @@ function analyze(raw, now) {
     set.add(p); payloads.set(k, set);
     L.judgment = k + p;
   }
-  const released = (source, code, after) => rows.some(x => x.type === 'release' && x.r.holdSource === source
-    && x.r.reasonCode === code && x.pos > after);
+  const lastRelease = new Map(rows.filter(x => x.type === 'release').map(x => [JSON.stringify([x.r.holdSource, x.r.reasonCode]), x.pos]));
+  const released = (source, code, after) => (lastRelease.get(JSON.stringify([source, code])) ?? 0) > after; // indexed: linear, not quadratic
   const byPos = new Map(rows.map(L => [L.pos, L]));
   const ctx = {
     rows, byPos, now, released, memo: new Map(),

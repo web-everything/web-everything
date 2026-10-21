@@ -38,6 +38,8 @@ import { readSettings } from './settings-files.mjs';
 export const SHADOW_OP = 'drain-ledger-shadow';
 export const SHADOW_WRITER = 'merge-ai-prs (drain ledger shadow, #5444)';
 export const LEDGER_READ_TIMEOUT_MS = 20_000;
+/** #5492 rebuild slice 3 — the wall-clock budget all of one pass's binding folds share (each is also size-capped). */
+export const BINDING_PASS_BUDGET_MS = 2000;
 /** Bound on rows kept in one record, so a runaway pass cannot write an unbounded file. Counts stay exact. */
 export const MAX_ROWS = 300;
 
@@ -93,7 +95,7 @@ export function classifyHoldCodes(codes, facts) {
  * @param {{verdict: object, repo: string, events: (object[]|null), now?: string}} o
  *   `events` is the repo's ledger rows, or `null` when the store read failed (unreadable, never empty).
  */
-export function shadowRow({ verdict, repo, events, now = new Date().toISOString() }) {
+export function shadowRow({ verdict, repo, events, now = new Date().toISOString(), binding = true }) {
   const pr = Number(verdict?.num);
   const head = verdict?.listedHeadSha || verdict?.headSha || null;
   const labelsClear = verdict?.decision === 'merge';
@@ -111,13 +113,20 @@ export function shadowRow({ verdict, repo, events, now = new Date().toISOString(
       // A readable ledger with no row for this PR is a HOLD (nothing clears it), never unreadable.
       folded = foldVerdictLedger(verdictRows).get(pr) ?? { pr, repo, current: null, clears: false, history: [], outstandingHolds: [] };
       // Only `head.sha` and `now` are read by the hold rules; the empty lists keep the phase core from crashing on absent facts.
-      derived = derivePrState(events, { pr, repo, head: { sha: head }, now, state: 'OPEN', requiredChecks: [], sessions: [], handoffs: [], refusals: [] });
+      derived = derivePrState(events, { pr, repo, head: { sha: head }, now, state: 'OPEN', requiredChecks: [], sessions: [], handoffs: [], refusals: [] },
+        { bindingShadow: binding }); // #5492 rebuild slice 3: the binding answer beside today's (journaled, never decided on)
     } catch { folded = null; derived = null; }
   }
   const ledger = decideLedgerGate({ folded, derived, head, labelsClear, authority: 'ledger' });
   const noRow = folded && !folded.history?.length && derived?.reviewExempt !== true;
   const ledgerHolds = [...(noRow ? ['no-ledger-row'] : (derived?.holds ?? []).map(h => h?.code ?? 'unknown')), ...factHolds];
-  const result = { ...base, ledgerHolds };
+  // The legacy count comes from the raw rows, so it is exact whatever the derive did (held outright, skipped, budget).
+  let legacy = null;
+  try { legacy = Array.isArray(events) ? events.filter((e) => e?.pr === pr && slug(e.repo) === slug(repo) && e.type === 'approval' && e.seen === undefined).length : null; }
+  catch { legacy = null; } // a malformed row never turns a shadow row into a thrown pass
+  const compared = !Array.isArray(events) ? null : !binding ? { status: 'skipped', skipped: 'pass-budget' }
+    : bindingCompare(derived) ?? { status: 'skipped', skipped: 'no-binding-answer' };
+  const result = { ...base, ledgerHolds, binding: compared && { ...compared, legacyApprovals: legacy } };
   if (ledger.defer) return { ...result, ledgerVerdict: 'unreadable', status: 'unreadable', direction: null, reason: ledger.reason };
   const clears = ledger.clear && !factHolds.length;
   const ledgerVerdict = clears ? 'clear' : 'hold';
@@ -131,6 +140,35 @@ export function shadowRow({ verdict, repo, events, now = new Date().toISOString(
   }
   return { ...result, ledgerVerdict, status: 'disagree',
     direction: labelsClear ? 'ledger-holds-label-clears' : 'ledger-clears-label-holds', reason };
+}
+
+/**
+ * #5492 rebuild slice 3 — today's ledger answer (`derived.clears`) beside the head-binding fold's (`derived.binding`),
+ * like for like: both ledger-only, same rows, same live head. `null` when the ledger was unreadable. Pure.
+ */
+export function bindingCompare(derived) {
+  const b = derived?.binding;
+  if (!derived || !b) return null;
+  if (b.skipped) return { status: 'skipped', skipped: b.skipped, legacyApprovals: b.legacyApprovals };
+  const old = derived.clears === true;
+  return { status: b.clears === old ? 'agree' : 'disagree', direction: b.clears === old ? null : (old ? 'binding-holds-old-clears' : 'binding-clears-old-holds'),
+    oldClears: old, oldHolds: (derived.holds ?? []).map((h) => h?.code ?? 'unknown'), clears: b.clears, holds: b.holds, base: b.base,
+    legacyApprovals: b.legacyApprovals };
+}
+
+/** The binding shadow's roll-up: counts, directions, the holds behind each disagreement, and legacy approvals. Pure. */
+export function summarizeBinding(rows = []) {
+  const s = { compared: 0, agree: 0, disagree: 0, skipped: 0, directions: { 'binding-holds-old-clears': 0, 'binding-clears-old-holds': 0 }, holdCodes: {}, legacyApprovals: 0 };
+  for (const r of rows) {
+    const b = r?.binding;
+    if (!b) continue;
+    if (b.status !== 'skipped') s.compared += 1;
+    s[b.status] += 1;
+    s.legacyApprovals += Number.isInteger(b.legacyApprovals) ? b.legacyApprovals : 0;
+    if (b.direction) s.directions[b.direction] += 1;
+    if (b.status === 'disagree') for (const c of new Set([...(b.clears ? b.oldHolds : b.holds)])) s.holdCodes[c] = (s.holdCodes[c] ?? 0) + 1;
+  }
+  return s;
 }
 
 /** Roll the rows up. Pure. */
@@ -153,7 +191,10 @@ export function buildShadowRunRecord({ id, at, repos = [], rows = [], summary, s
   // Disagreements and unreadables first, so the bound never drops the rows that matter.
   const rank = { disagree: 0, unreadable: 1, transient: 2, agree: 3 };
   const kept = [...rows].sort((a, b) => rank[a.status] - rank[b.status] || a.pr - b.pr).slice(0, MAX_ROWS);
-  rec.findings = { summary, stores, rows: kept, rowsTruncated: rows.length > kept.length };
+  rec.findings = { summary, stores, rows: kept, rowsTruncated: rows.length > kept.length,
+    // Slice 3: EVERY binding disagreement (one per PR the pass compared, so bounded by the pass), plus its roll-up.
+    binding: { summary: summarizeBinding(rows), disagreements: rows.filter((r) => r.binding?.status === 'disagree')
+      .map((r) => ({ pr: r.pr, repo: r.repo, head: r.head, labelVerdict: r.labelVerdict, ...r.binding })) } };
   rec.verdict = summary.disagree || summary.unreadable ? 'drift' : 'clean';
   return rec;
 }
@@ -171,9 +212,11 @@ function withTimeout(promise, ms) {
  *   mintId?: Function, now?: Function, timeoutMs?: number, readiness?: Function}} o
  */
 export async function runLedgerShadow({ verdicts = [], localSlug = null, dryRun = false, readEvents = readLedgerEventsFromStore,
-  write = writeRun, mintId = newRunId, now = () => new Date().toISOString(), timeoutMs = LEDGER_READ_TIMEOUT_MS, readiness = defaultReadiness } = {}) {
+  write = writeRun, mintId = newRunId, now = () => new Date().toISOString(), timeoutMs = LEDGER_READ_TIMEOUT_MS, readiness = defaultReadiness,
+  bindingBudgetMs = BINDING_PASS_BUDGET_MS } = {}) {
   try {
     const at = now();
+    const bindingDeadline = Date.now() + (Number.isFinite(bindingBudgetMs) ? bindingBudgetMs : BINDING_PASS_BUDGET_MS);
     const byRepo = new Map();
     for (const v of verdicts) {
       if (!v || !Number.isInteger(Number(v.num))) continue;
@@ -190,7 +233,8 @@ export async function runLedgerShadow({ verdicts = [], localSlug = null, dryRun 
       const events = read?.status === 'ok' && Array.isArray(read.rows) ? read.rows : null;
       stores[repo] = events ? { status: 'ok', name: read.store?.name ?? null, shared: read.store?.shared === true, rows: events.length }
         : { status: 'unreadable', name: read?.store?.name ?? null, reason: read?.reason ?? 'unknown', error: String(read?.error ?? '').slice(0, 200) };
-      for (const v of vs) rows.push(shadowRow({ verdict: v, repo, events, now: at }));
+      // Slice 3: the binding folds share ONE wall-clock budget per pass; PRs past it are journaled `skipped`, never folded.
+      for (const v of vs) rows.push(shadowRow({ verdict: v, repo, events, now: at, binding: Date.now() < bindingDeadline }));
     }
     const summary = summarizeShadow(rows);
     if (dryRun) return { ok: true, written: false, summary, rows, stores };
@@ -221,8 +265,10 @@ export function formatShadowLine(res) {
   if (!res?.ok) return `merge-ai-prs · ledger shadow: FAILED (${res?.error ?? 'unknown'}) — merge behaviour unaffected`;
   const s = res.summary;
   const dis = (res.rows || []).filter((r) => r.status === 'disagree').slice(0, 10).map((r) => `#${r.pr}(drain:${r.labelVerdict}/ledger:${r.ledgerVerdict})`).join(' ');
+  const b = summarizeBinding(res.rows || []);
   const line = `merge-ai-prs · ledger shadow: compared ${s.compared} · agree ${s.agree} · disagree ${s.disagree} · unreadable ${s.unreadable} · transient ${s.transient ?? 0}`
-    + (dis ? ` · ${dis}` : '') + (res.written ? ` · record ${res.id}` : ' · not recorded');
+    + (dis ? ` · ${dis}` : '') + (res.written ? ` · record ${res.id}` : ' · not recorded')
+    + ` · binding shadow: agree ${b.agree} · disagree ${b.disagree} · skipped ${b.skipped} · legacy approvals ${b.legacyApprovals}`;
   if (!res.readiness) return line;
   const r = res.readiness;
   return line + '\n' + (r.ok === false ? `merge-ai-prs · ledger readiness: FAILED (${r.error ?? 'unknown'})`
