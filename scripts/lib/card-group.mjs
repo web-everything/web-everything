@@ -281,14 +281,23 @@ export const isSubsequence = (needle, hay) => { let i = 0; for (const l of hay) 
  * IO: a file's normalized lines at `ref`, or null when the path is ABSENT there. Absence is proven by an
  * empty `ls-tree`; any git failure (ls-tree or show) THROWS, so a read error can never pass as "absent".
  */
-function readAt({ ref, path, cwd, run, norm }) {
+/**
+ * IO: a file's normalized lines at `ref`, plus what a line comparison cannot see: the tree entry's `mode` (100644, 100755, 120000 …)
+ * and `eol` (the file ends with a newline; an empty file counts as ending with one). Null when absent.
+ */
+function readEntry({ ref, path, cwd, run, norm }) {
   const ls = run('git', ['ls-tree', ref, '--', path], { cwd });
   if (ls.status !== 0) throw new Error(`ls-tree ${String(ref).slice(0, 10)} ${path} failed`);
-  if (!String(ls.stdout ?? '').trim()) return null;
+  const row = String(ls.stdout ?? '').trim();
+  if (!row) return null;
+  const mode = row.split(/\s/)[0];
   const r = run('git', ['show', `${ref}:${path}`], { cwd });
   if (r.status !== 0) throw new Error(`show ${String(ref).slice(0, 10)}:${path} failed`);
-  return splitLines(r.stdout).map(norm);
+  const text = String(r.stdout ?? '');
+  return { lines: splitLines(text).map(norm), mode, eol: text === '' || text.endsWith('\n') };
 }
+/** PURE: what a source sets beyond its lines: `mode` / `eol` when its head differs from its merge base (else null). */
+const metaChange = (from, to) => ({ mode: from?.mode === to.mode ? null : to.mode, eol: from && from.eol === to.eol ? null : to.eol });
 /** PURE: `head`'s lines (in order) that `target` still has — the order a source wants kept. */
 const keptOrder = (head, target) => { const have = new Set(target); return head.filter(l => have.has(l)); };
 
@@ -307,11 +316,13 @@ function sourceChange({ onto, headSha, cwd, run, norm }) {
   const plus = parseDiffLines(d.stdout);
   const out = new Map();
   for (const path of lines(names)) {
-    const fromLines = readAt({ ref: mb, path, cwd, run, norm }) ?? [], toLines = readAt({ ref: headSha, path, cwd, run, norm });
-    if (toLines === null) { out.set(path, { deletedFile: true }); continue; }
+    const fromEntry = readEntry({ ref: mb, path, cwd, run, norm }), toEntry = readEntry({ ref: headSha, path, cwd, run, norm });
+    if (toEntry === null) { out.set(path, { deletedFile: true }); continue; }
+    const fromLines = fromEntry?.lines ?? [], toLines = toEntry.lines;
     const from = countOf(fromLines), to = countOf(toLines);
     const addedSeq = (plus.get(path)?.added ?? []).map(norm).filter(l => (to.get(l) ?? 0) > (from.get(l) ?? 0));
-    out.set(path, { from, to, addedSeq, head: toLines });
+    // A mode-only or final-newline-only change has no differing line, so it is carried separately (`meta`).
+    out.set(path, { from, to, addedSeq, head: toLines, meta: metaChange(fromEntry, toEntry) });
   }
   return out;
 }
@@ -328,7 +339,6 @@ function sourceChange({ onto, headSha, cwd, run, norm }) {
  */
 export function verifyUnion({ base, combined, sources, cwd, run = gitRun, referenceMap = new Map() } = {}) {
   const norm = t => mapHashReferences(t, h => referenceMap.get(h) ?? h);
-  const at = (ref, path) => readAt({ ref, path, cwd, run, norm });
   const missing = [], extra = [], deleted = [], resurrected = [], disagree = [], order = [], outside = [], unsupported = [];
   const perFile = [];
   const changes = sources.map(s => ({ s, change: sourceChange({ onto: base, headSha: s.headSha, cwd, run, norm }) }));
@@ -338,8 +348,16 @@ export function verifyUnion({ base, combined, sources, cwd, run = gitRun, refere
   for (const p of lines(changed)) if (!paths.has(p)) outside.push(p);
   for (const path of [...paths].sort()) {
     if (changes.some(x => x.change.get(path)?.deletedFile)) { unsupported.push(`${path} deleted by a source`); continue; }
-    const B = at(base, path) ?? [], C = at(combined, path);
+    const baseEntry = readEntry({ ref: base, path, cwd, run, norm }), combinedEntry = readEntry({ ref: combined, path, cwd, run, norm });
+    const B = baseEntry?.lines ?? [], C = combinedEntry?.lines ?? null;
     if (C === null) { missing.push({ path, line: '(whole file)' }); continue; }
+    // File mode and final newline: the combined file takes the value a source set (sources must agree), else the base's.
+    for (const [key, label] of [['mode', 'file mode'], ['eol', 'final newline']]) {
+      const set = [...new Set(changes.map(x => x.change.get(path)?.meta?.[key]).filter(v => v != null))];
+      if (set.length > 1) { disagree.push({ path, line: `(${label}: ${set.join(' vs ')})` }); continue; }
+      const exp = set.length ? set[0] : baseEntry?.[key] ?? combinedEntry[key];
+      if (combinedEntry[key] !== exp) (set.length ? missing : extra).push({ path, line: `(${label} ${exp} → ${combinedEntry[key]})`, expected: exp, found: combinedEntry[key] });
+    }
     const b = countOf(B), c = countOf(C);
     const up = new Map(), down = new Map();
     for (const { change } of changes) {
@@ -386,10 +404,14 @@ export function sourceLanded({ ref, source, cwd, run = gitRun, referenceMap = ne
   try { change = sourceChange({ onto: ref, headSha: source.headSha, cwd, run, norm }); }
   catch (e) { return { ok: false, reason: firstLine(e) }; }
   for (const [path, ch] of change) {
-    let R;
-    try { R = readAt({ ref, path, cwd, run, norm }); } catch (e) { return { ok: false, reason: firstLine(e) }; }
-    if (ch.deletedFile) { if (R !== null) return { ok: false, reason: `${path} still on main` }; continue; }
-    if (R === null) return { ok: false, reason: `${path} missing on main` };
+    let entry;
+    try { entry = readEntry({ ref, path, cwd, run, norm }); } catch (e) { return { ok: false, reason: firstLine(e) }; }
+    if (ch.deletedFile) { if (entry !== null) return { ok: false, reason: `${path} still on main` }; continue; }
+    if (entry === null) return { ok: false, reason: `${path} missing on main` };
+    const R = entry.lines;
+    // A mode-only or final-newline-only change has not landed until main carries it too.
+    if (ch.meta?.mode != null && entry.mode !== ch.meta.mode) return { ok: false, reason: `${path} file mode on main is ${entry.mode}, the source sets ${ch.meta.mode}` };
+    if (ch.meta?.eol != null && entry.eol !== ch.meta.eol) return { ok: false, reason: `${path} final newline on main differs from the source's` };
     const r = countOf(R);
     for (const l of new Set([...ch.from.keys(), ...ch.to.keys()])) {
       const f = ch.from.get(l) ?? 0, t = ch.to.get(l) ?? 0, have = r.get(l) ?? 0;

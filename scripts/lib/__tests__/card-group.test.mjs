@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { describe, it, expect, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -166,6 +166,45 @@ describe('buildCombined + verifyUnion (real git)', () => {
     expect(sourceLanded({ ref: base, source: { num: 1, headSha: del }, cwd, run })).toMatchObject({ ok: false });
     expect(sourceLanded({ ref: base, source: { num: 1, headSha: del }, cwd })).toMatchObject({ ok: false, reason: expect.stringMatching(/still on main/) });
     expect(sourceLanded({ ref: del, source: { num: 1, headSha: del }, cwd }).ok).toBe(true);
+  });
+
+  describe('a change with no line difference (file mode, final newline) is part of the source', () => {
+    const noEol = () => writeFileSync(join(cwd0(), CARD), card([1, 2]).replace(/\n$/, ''));
+    let cwd0;
+    it.each([
+      ['only the file mode changes', (cwd) => chmodSync(join(cwd, CARD), 0o755), /file mode/],
+      ['only the final newline changes', () => noEol(), /final newline/],
+      ['a new file is added executable', (cwd) => { writeFileSync(join(cwd, 'backlog/7000-new.md'), card([5])); chmodSync(join(cwd, 'backlog/7000-new.md'), 0o755); }, /file mode/],
+    ])('source closure and the union proof refuse when %s and main lacks it', (_, edit, why) => {
+      const r = repo();
+      git(r.cwd, 'config', 'core.fileMode', 'true');
+      cwd0 = () => r.cwd;
+      const src = r.branch('src', () => edit(r.cwd));
+      // Main as it was: the source's only change is not there, so the source has NOT landed and stays open.
+      const lacking = /new file/.test(_) ? r.branch('lacking', () => writeFileSync(join(r.cwd, 'backlog/7000-new.md'), card([5]))) : r.base;
+      expect(sourceLanded({ ref: lacking, source: { num: 1, headSha: src }, cwd: r.cwd })).toMatchObject({ ok: false, reason: expect.stringMatching(why) });
+      // A combined commit that drops it is refused by the union proof, for that reason.
+      const proof = verifyUnion({ base: r.base, combined: lacking, sources: [{ num: 1, headSha: src }], cwd: r.cwd });
+      expect(proof.ok).toBe(false);
+      expect(proof.missing.map(m => m.line).join(' ')).toMatch(why);
+      // The real combined build carries it, so both checks pass there.
+      const other = r.branch('other', () => writeFileSync(join(r.cwd, 'backlog/5473-other.md'), card([7, 13])));
+      const sources = [{ num: 1, headSha: src }, { num: 2, headSha: other }];
+      const built = buildCombined({ base: r.base, sources, cwd: r.cwd, resolveEnabled: true });
+      expect(built.ok).toBe(true);
+      expect(verifyUnion({ base: r.base, combined: built.commit, sources, cwd: r.cwd }).ok).toBe(true);
+      for (const s of sources) expect(sourceLanded({ ref: built.commit, source: s, cwd: r.cwd }).ok).toBe(true);
+    });
+    it('two sources that set different modes on one file disagree', () => {
+      const r = repo();
+      git(r.cwd, 'config', 'core.fileMode', 'true');
+      const a = r.branch('a', () => { writeFileSync(join(r.cwd, CARD), card([1, 2, 10])); chmodSync(join(r.cwd, CARD), 0o755); });
+      const b = r.branch('b', () => writeFileSync(join(r.cwd, CARD), card([1, 2, 10])));
+      const combined = r.branch('c', () => { writeFileSync(join(r.cwd, CARD), card([1, 2, 10])); chmodSync(join(r.cwd, CARD), 0o755); });
+      // b leaves the mode alone, so a's mode change is the union: accepted. A mode NO source set is refused.
+      expect(verifyUnion({ base: r.base, combined, sources: [{ num: 1, headSha: a }, { num: 2, headSha: b }], cwd: r.cwd }).ok).toBe(true);
+      expect(verifyUnion({ base: r.base, combined, sources: [{ num: 2, headSha: b }], cwd: r.cwd }).ok).toBe(false);
+    });
   });
 
   it('verifyUnion catches a lost line, an extra line and a resurrected deletion', () => {
