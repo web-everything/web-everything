@@ -79,7 +79,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents, isConflictingPr } from '../../scripts/conveyor/reconcile-pass.mjs';
-import { promoteDraftsThenReplan, promoteDraftsGuarded } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
+import { promoteDraftsThenReplan, promoteDraftsGuarded, rearmStaleAcceptanceGuarded, rearmStaleAcceptsThenReplan } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
 import { notifyReferralHold } from '../../scripts/conveyor/review-referral-hold.mjs';
 // card x29vm8a — a scope-bloated PR (stale base) is refreshed onto main through the SAME mechanical path the ci-red
 // recovery watch uses, once per head, before any review reads its diff.
@@ -413,6 +413,11 @@ export function runReviewTick({
   // existing caller unchanged; the real daemon wires `promoteDraftsGuarded`. `notePromotions` reports the rows.
   promoteDrafts = null,
   notePromotions = null,
+  // #5771 — `({repo, pr, headSha}) => {ok, reason}`: execute this pass's `restore-review-label` stale-accept rows through
+  // the guarded re-arm, then re-plan so the new head's review goes out THIS pass. `null` (the default) keeps every
+  // existing caller unchanged; the real daemon wires `rearmStaleAcceptanceGuarded`. `noteRearms` reports the rows.
+  rearmStaleAccepts = null,
+  noteRearms = null,
   onPlan = null,
   // One-line failure causes (status sweep / status tag). The real daemon wires `log.error`; tests inject a spy.
   log = () => {},
@@ -532,6 +537,17 @@ export function runReviewTick({
     ({ plan, rawPrs } = out);
     replanError = out.replanError ?? null;
     if (out.promotions.length) { try { notePromotions?.({ repo, promotions: out.promotions, replanError: out.replanError }); } catch { /* report only */ } }
+  }
+  if (typeof rearmStaleAccepts === 'function') {
+    const out = rearmStaleAcceptsThenReplan({
+      plan, rawPrs, repo, rearm: rearmStaleAccepts,
+      replan: (prs) => (sharedReads && prs
+        ? reconcile({ repo, defaultBranch, readPrs: () => prs, readAgents: () => rawAgents })
+        : reconcile({ repo, defaultBranch })),
+    });
+    ({ plan, rawPrs } = out);
+    replanError = replanError ?? out.replanError ?? null;
+    if (out.rearms.length) { try { noteRearms?.({ repo, rearms: out.rearms, replanError: out.replanError }); } catch { /* report only */ } }
   }
   try { onPlan?.({ repo, plan, rawPrs }); } catch { /* observation never breaks a tick */ }
   // Captured at plan completion, never at log-read time. Only a plan that survived (re)planning is evidence.
@@ -1494,6 +1510,8 @@ export function liveReviewRoundBudget({ env = process.env, listCommands = () => 
 export function buildCliDaemonEffects({
   owner, intervalMs = DEFAULT_INTERVAL_MS, log = console,
   reapSessions = defaultReapSessions,
+  // Keep the production runReview closure testable without replacing its executor bindings.
+  tick = runReviewTick,
   // #3383 bug 3 — the real daemon wires the real `acquirableLanes` effect through by default, so production
   // dispatch is bounded by lane reality; `runReviewTick`'s OWN default stays unbounded (`() => Infinity`) so
   // every pre-existing test of it (which fakes reconcile/dispatch directly, never this) is unaffected.
@@ -1506,6 +1524,7 @@ export function buildCliDaemonEffects({
   runReview = (opts) => {
     const factsProvider = withFactsLabels(createGhProvider());
     return runReviewTickAllRepos({
+      tick,
       log: line => log.error(line),
       acquirableLanes: defaultAcquirableLaneNumbers, readPrs: defaultReadPrs, readAgents: defaultReadAgents,
       liveReviewBudget: liveReviewRoundBudget(),
@@ -1513,6 +1532,11 @@ export function buildCliDaemonEffects({
       refreshScopeBloat: refreshScopeBloatedPr,
       postRefreshMarker: defaultPostRebaseComment,
       promoteDrafts: promoteDraftsGuarded,
+      rearmStaleAccepts: rearmStaleAcceptanceGuarded,
+      noteRearms: ({ repo, rearms, replanError }) => {
+        for (const r of rearms) log.error(`review-daemon: ${repo}#${r.pr} stale-accept re-arm ${r.ok ? 'done' : 'refused'} — ${String(r.why ?? '').replace(/\s+/g, ' ').slice(0, 300)}`);
+        if (replanError) log.error(`review-daemon: ${repo} post-re-arm re-plan failed (review goes out next pass): ${replanError}`);
+      },
       notePromotions: ({ repo, promotions, replanError }) => {
         for (const r of promotions) log.error(`review-daemon: ${repo}#${r.pr} same-pass promote ${r.action} — ${String(r.why ?? '').replace(/\s+/g, ' ').slice(0, 300)}`);
         if (replanError) log.error(`review-daemon: ${repo} same-pass re-plan failed (review goes out next pass): ${replanError}`);
