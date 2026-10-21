@@ -1,0 +1,15 @@
+{
+  "prStallSweep": {
+    "mode": "off",
+    "intervalMinutes": 15,
+    "maxActionsPerSweep": 3,
+    "maxActionsPerHour": 6,
+    "maxActionsPerPrHead": 1,
+    "staleHoldAutoResume": false,
+    "grantCeiling": 10,
+    "maxFixListLines": 20,
+    "stateLanes": {},
+    "systemActions": { "await-ledger-outbox": true, "resume-stale-hold": true, "rerun-red-team-gate": true, "ask-review-daemon": true, "tooling-card": true },
+    "policyActions": { "grant": true, "card": true, "block": true }
+  }
+}
