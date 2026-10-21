@@ -164,3 +164,34 @@ it('tailOf reads a REAL external log without changing the checkout, throws for a
     expect(snapshot(root)).toEqual(before);
   });
 });
+
+describe('stand-down lapse enrichment in the reader', async () => {
+  const { createPrSweepReader } = await import('../pr-sweep-io.mjs');
+  const { STAND_DOWN_MARKER } = await import('../../conveyor/stand-down.mjs');
+  const { AUTOMATION_LOGINS } = await import('../../lib/marker-authorship.mjs');
+  const head = 'd'.repeat(40);
+  const gh = (thread) => (_b, args) => {
+    if (args[1] === 'list') return JSON.stringify([{ number: 7, state: 'OPEN', headRefOid: head, updatedAt: '2026-10-21T10:00:00Z', labels: [] }]);
+    if (args.includes('commits')) return JSON.stringify({ commits: [{ oid: head, committedDate: '2026-10-21T12:00:00Z' }] });
+    if (String(args.at(-1)).includes('/comments')) return JSON.stringify([thread]);
+    return JSON.stringify([[]]);
+  };
+  const make = (thread, lapseContext) => createPrSweepReader({ run: gh(thread), ps: () => '', readText: () => '', settings: () => ({ prSweep: { repos: ['web-everything/web-everything'] } }), lapseContext });
+  it('keeps the comment url and reads the ledger only for a thread with a stand-down', () => {
+    let reads = 0;
+    const plain = make([{ id: 1, html_url: 'https://x/1', user: { login: 'a' }, body: 'hi', created_at: '2026-10-21T11:00:00Z' }], () => { reads += 1; return { rows: [], config: {} }; })({});
+    expect(plain.prs[0].comments[0].url).toBe('https://x/1'); expect(reads).toBe(0);
+    const sd = { id: 2, html_url: 'https://x/2', user: { login: AUTOMATION_LOGINS[0] }, created_at: '2026-10-21T11:00:00Z', body: `${STAND_DOWN_MARKER}\n\nx stopped rather than guessing: y.\n<!-- stand-down reason=gate-red -->` };
+    const out = make([sd], () => { reads += 1; throw new Error('ledger gone'); })({});
+    expect(reads).toBe(1); expect(out.prs).toHaveLength(1);
+  });
+});
+
+describe('ps job start times', async () => {
+  const { parseLiveJobs, etimeSeconds } = await import('../pr-sweep-io.mjs');
+  it('reads etime into a start time', () => {
+    expect(etimeSeconds('01:02')).toBe(62); expect(etimeSeconds('1-02:03:04')).toBe(((24 + 2) * 60 + 3) * 60 + 4); expect(etimeSeconds('x')).toBeNull();
+    const [j] = parseLiveJobs(' 123 01:00:00 node scripts/conveyor/fix-run.mjs --pr=5 --repo=a/b', 10_000_000);
+    expect(j).toMatchObject({ kind: 'fix-run', pr: 5, startedAt: 10_000_000 - 3_600_000 });
+  });
+});
