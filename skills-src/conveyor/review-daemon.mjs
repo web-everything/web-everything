@@ -639,7 +639,12 @@ export function runReviewTick({
       // x26lw6u — a job dispatch that declined to start (a live job already on this PR, or the lane cool-off)
       // did not advance the round, so it gets no round tag — same rule as a failed dispatch.
       if (result?.skipped) {
-        if (reserved) liveReviewBudget.left++;
+        // A refusal that started nothing frees its seat. A live-job skip names a job that may have appeared after this
+        // tick's ps read: it refunds only when that job's pid was already counted (when in doubt, overcount).
+        const counted = liveReviewBudget?.countedJobPids;
+        const refundable = result.skipped !== 'live-job'
+          || (Number.isInteger(result.jobPid) && counted instanceof Set && counted.has(result.jobPid));
+        if (reserved && refundable) liveReviewBudget.left++;
         notStarted.push({ prNumber: d.prNumber, reason: result.skipped });
         continue;
       }
@@ -1141,7 +1146,7 @@ export function priorityNamesForLiveProcessPrs(liveProcessPrs) {
  * @param {{isScriptFile?: function(string): boolean}} options Optional absolute-path classifier. Ambiguous
  *   or unreadable candidates throw; the live budget holds dispatch. Relative argv uses lexical conventions.
  */
-export function countLiveReviewRounds(lines, { isScriptFile = null } = {}) {
+export function countLiveReviewRounds(lines, { isScriptFile = null, countedJobPids = null } = {}) {
   // Runtimes that run a script file, and the runtime flags that take their value as the NEXT word (a preload,
   // a loader): those values are not the script. An unknown runtime still counts when its argv[0] is the script.
   const RUNTIME = /(^|\/)(node|nodejs|bun|electron)(\.exe)?$/;
@@ -1240,20 +1245,33 @@ export function countLiveReviewRounds(lines, { isScriptFile = null } = {}) {
     return { pid: ids?.[1], ppid: ids?.[2], name: script(ids ? ids[3] : text) };
   });
   const byPid = new Map(processes.filter(p => p.pid).map(p => [p.pid, p]));
-  const hasJobAncestor = (process) => {
+  const jobAncestorOf = (process) => {
     const seen = new Set([process.pid]);
     let pid = process.ppid;
     while (pid && !seen.has(pid)) {
       seen.add(pid);
       const parent = byPid.get(pid);
       if (!parent) break;
-      if (parent.name === 'review-job.mjs') return true;
+      if (parent.name === 'review-job.mjs') return parent.pid;
       pid = parent.ppid;
     }
-    return false;
+    return null;
   };
-  return processes.filter(p => p.name === 'review-job.mjs'
-    || (p.name === 'review-loop-cli.mjs' && !hasJobAncestor(p))).length;
+  const jobs = processes.filter(p => p.name === 'review-job.mjs');
+  const loops = processes.filter(p => p.name === 'review-loop-cli.mjs');
+  // A job's own loop is the same round, so each job absorbs AT MOST ONE descendant loop; any further loop under
+  // the same job is counted as its own round (when in doubt, overcount). Never below running HEAD's floor
+  // max(jobs, loops).
+  const absorbed = new Set();
+  let extraLoops = 0;
+  for (const loop of loops) {
+    const job = jobAncestorOf(loop);
+    if (job && !absorbed.has(job)) absorbed.add(job);
+    else extraLoops += 1;
+  }
+  const count = Math.max(jobs.length + extraLoops, jobs.length, loops.length);
+  if (countedJobPids) for (const job of jobs) if (job.pid) countedJobPids.add(Number(job.pid));
+  return count;
 }
 
 /** EMERGENCY 2026-10-20 — the host-wide cap on live review rounds, from the tool layer
@@ -1276,8 +1294,9 @@ export function liveReviewRoundBudget({ env = process.env, listCommands = () => 
   let lines;
   try { lines = String(listCommands()).split('\n'); } catch (e) { return { left: 0, reason: `live review rounds unknown (${String(e?.message ?? e).split('\n')[0]}); maxLiveReviewRounds=${max} (${src})` }; }
   let live;
+  const countedJobPids = new Set();
   try {
-    live = countLiveReviewRounds(lines, { isScriptFile: (path) => {
+    live = countLiveReviewRounds(lines, { countedJobPids, isScriptFile: (path) => {
       // Another process's relative paths must never be resolved against the daemon's cwd.
       if (!path.startsWith('/')) return false;
       try { return statSync(path).isFile(); }
@@ -1289,7 +1308,7 @@ export function liveReviewRoundBudget({ env = process.env, listCommands = () => 
   } catch {
     return { left: 0, reason: `live review rounds unknown (ambiguous script path); maxLiveReviewRounds=${max} (${src})` };
   }
-  return { left: Math.max(0, max - live), live, max, reason: `live review rounds ${live} of maxLiveReviewRounds=${max} (${src})` };
+  return { left: Math.max(0, max - live), live, max, countedJobPids, reason: `live review rounds ${live} of maxLiveReviewRounds=${max} (${src})` };
 }
 
 export function buildCliDaemonEffects({

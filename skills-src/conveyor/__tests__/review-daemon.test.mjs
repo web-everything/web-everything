@@ -708,6 +708,31 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     expect(budget.left).toBe(0);
   });
 
+  // PR #5769 audit: a live-job skip keeps its seat unless this tick's ps count already holds that job.
+  it.each([
+    ['not counted this tick', new Set(), 0],
+    ['already counted this tick', new Set([77]), 1],
+    ['no counted set', undefined, 0],
+  ])('a live-job skip refunds its reservation only when its pid was counted (%s)', (_name, countedJobPids, left) => {
+    const budget = { left: 1, ...(countedJobPids ? { countedJobPids } : {}) };
+    const dispatch = vi.fn(() => ({ mode: 'job', agentId: null, jobPid: 77, skipped: 'live-job' }));
+    const prs = [100].map(number => ({ number, labels: ['review:pending'] }));
+    runReviewTick({ reconcile: () => reviewsPlan(1), dispatch, liveReviewBudget: budget,
+      readPrs: () => prs, readAgents: () => [], acquirableLanes: () => [4],
+      holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+    });
+    expect(budget.left).toBe(left);
+  });
+
+  it('each job absorbs at most one descendant loop, never below max(jobs, loops); counted job pids are reported', () => {
+    const counted = new Set();
+    expect(countLiveReviewRounds(['10 1 node /a/review-job.mjs', '11 10 node /a/review-loop-cli.mjs',
+      '12 10 node /a/review-loop-cli.mjs'], { countedJobPids: counted })).toBe(2);
+    expect([...counted]).toEqual([10]);
+    expect(countLiveReviewRounds(['10 1 node /a/review-job.mjs', '20 1 node /a/review-job.mjs',
+      '11 10 node /a/review-loop-cli.mjs', '12 10 node /a/review-loop-cli.mjs', '13 10 node /a/review-loop-cli.mjs'])).toBe(4);
+  });
+
   it.each([
     ['independent commands without ancestry', [
       'node /a/review-job.mjs run --pr=1', 'node /a/review-job.mjs run --pr=2', 'node /a/review-loop-cli.mjs --pr=3',
