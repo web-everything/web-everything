@@ -115,6 +115,37 @@ describe('operator ruling at the round cap', () => {
     expect(hold({ comments: carried })).toBeNull();
     expect(hold({ comments: [...carried, accept(head), restamp(head)] })).toMatch(/requiring send-back/);
   });
+  it('a carry cannot revive a ruling superseded by a plain accept on its original head', () => {
+    const h1 = 'b'.repeat(40);
+    const comments = [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true), accept(prior)];
+    expect(hold({ head: prior, comments })).toMatch(/requiring send-back/);
+    comments.push(restamp(h1));
+    expect(hold({ head: h1, comments })).toMatch(/no recorded result/);
+    comments.push(carry({ to: h1, findings: broken, gates: ['round-cap'] }));
+    expect(hold({ head: h1, comments })).toMatch(/requiring send-back/);
+  });
+  it.each([
+    ['original head before its carry', prior, 3],
+    ['original head after its carry', prior, 5],
+    ['original head after all carries', prior, 7],
+    ['intermediate head before its carry', 'e'.repeat(40), 5],
+    ['intermediate head after its carry', 'e'.repeat(40), 7],
+    ['live head after all carries', head, 7],
+  ])('keeps a superseded ruling held across a carry chain: %s', (_name, acceptedSha, at) => {
+    const intermediate = 'e'.repeat(40);
+    const comments = [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true),
+      restamp(intermediate), carry({ to: intermediate, findings: broken, gates: ['round-cap'] }),
+      restamp(head), carry({ from: intermediate, findings: broken, gates: ['round-cap'] })];
+    comments.splice(at, 0, accept(acceptedSha));
+    comments.push(restamp(head));
+    expect(hold({ comments })).toMatch(/requiring send-back/);
+    expect(hold({ comments: [...comments, gate(head, 'round-cap'), accept(head, true)] })).toBeNull();
+  });
+  it('a plain accept on an unrelated head does not supersede a carried ruling', () => {
+    const comments = [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true),
+      accept('f'.repeat(40)), restamp(head), carry({ findings: broken, gates: ['round-cap'] })];
+    expect(hold({ comments })).toBeNull();
+  });
   it('a ruling survives a chain of carries (H0 → H1 → head)', () => {
     const h0 = 'e'.repeat(40);
     const ruledOnH0 = [clean(h0, 'web-everything', broken), gate(h0, 'round-cap'), accept(h0, true)];
