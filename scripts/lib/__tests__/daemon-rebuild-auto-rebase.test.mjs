@@ -191,7 +191,7 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     gitOk(f.clone, ['fetch', '-q', 'origin']);
     const plan = await planRebuild({
       git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref: 'lane/container', pr: 5801 }],
-      prState: async () => 'OPEN', prForcePushes: async (pr) => (pr === PR ? [{ before: x1, after: x2 }] : []),
+      prState: async (pr) => (pr === PR ? 'MERGED' : 'OPEN'), prForcePushes: async (pr) => (pr === PR ? [{ before: x1, after: x2 }] : []),
       autoRebase: { mode: 'on', source: 'test' },
     });
     expect(plan.ok).toBe(true);
@@ -211,7 +211,7 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     gitOk(f.clone, ['fetch', '-q', 'origin']);
     const overlays = [{ ref: 'lane/container', pr: 5801 }];
     const plan = await planRebuild({
-      git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays, prState: async () => 'OPEN',
+      git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays, prState: async (pr) => (pr === PR ? 'MERGED' : 'OPEN'),
       prForcePushes: async (pr) => (pr === PR ? [{ before: x1 }] : []), autoRebase: { mode: 'on', source: 'test' },
     });
     expect(plan.autoRebaseCtx.adoptedHeads).toEqual([expect.objectContaining({ pr: PR, sha: x1, proven: true })]);
@@ -234,7 +234,7 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     gitOk(f.clone, ['fetch', '-q', 'origin']);
     const plan = await planRebuild({
       git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref: 'lane/container', pr: 5801 }],
-      prState: async () => 'OPEN', prForcePushes: async (pr) => (pr === PR ? [{ before: x1h }, { before: x1 }] : []),
+      prState: async (pr) => (pr === PR ? 'MERGED' : 'OPEN'), prForcePushes: async (pr) => (pr === PR ? [{ before: x1h }, { before: x1 }] : []),
       autoRebase: { mode: 'on', source: 'test' },
     });
     expect(plan.ok).toBe(true);
@@ -246,5 +246,41 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     expect(gitOk(f.clone, ['show', `${plan.finalSha}:${GATE}`])).toBe(lines({ 2: 'grant v2', 10: 'own' }));
     expect(isAncestor(f.clone, container, plan.finalSha)).toBe(true);
     expect(plan.alerts.find((a) => a.kind === 'overlay-auto-rebased')?.detail.base.sha).not.toBe(x1h);
+  });
+
+  it('another registered overlay\'s work linearly inside the PR head is never treated as the PR\'s — set aside (Codex round 2)', async () => {
+    const f = fixture({ mode: 'on' });
+    const foreign = f.push('lane/foreign', f.init, { 'foreign.txt': 'foreign behaviour\n' });
+    const x1 = f.push('lane/standing-ruling', foreign, { [GATE]: lines({ 2: 'grant v1' }) }); // PR built ON the foreign overlay
+    f.push('lane/container', x1, { [GATE]: lines({ 2: 'grant v1', 10: 'own' }) });
+    const x2 = f.push('lane/standing-ruling', f.init, { [GATE]: lines({ 2: 'grant v2' }) }); // final PR without it
+    f.mergePr(PR, x2, 'lane/standing-ruling');
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const plan = await planRebuild({
+      git: f.runGit, headSha: f.init, mainRef: 'origin/main',
+      overlays: [{ ref: 'lane/foreign', pr: 5790 }, { ref: 'lane/container', pr: 5801 }], stackMode: 'independent',
+      prState: async (pr) => (pr === PR ? 'MERGED' : 'OPEN'), prForcePushes: async (pr) => (pr === PR ? [{ before: x1 }] : []),
+      autoRebase: { mode: 'on', source: 'test' },
+    });
+    expect(plan.decisions.find((d) => d.ref === 'lane/container')).toMatchObject({ action: 'drop', reason: 'conflict' });
+    expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-auto-rebased');
+    expect(plan.alerts.find((a) => a.kind === 'overlay-set-aside')?.detail).toMatchObject({ ref: 'lane/container' });
+    expect(plan.setAside).toEqual(['lane/container']);
+    expect(gitOk(f.clone, ['show', `${plan.finalSha}:foreign.txt`])).toBe('foreign behaviour\n');
+  });
+
+  it('a force-push of a PR GitHub does not say is MERGED is no proof, whatever main\'s merge subjects claim (Codex round 2)', async () => {
+    const f = fixture({ mode: 'on' });
+    const x1 = f.push('lane/standing-ruling', f.init, { [GATE]: lines({ 2: 'grant v1' }) });
+    f.push('lane/container', x1, { [GATE]: lines({ 2: 'grant v1', 10: 'own' }) });
+    const x2 = f.push('lane/standing-ruling', f.init, { [GATE]: lines({ 2: 'grant v2' }) });
+    f.mergePr(PR, x2, 'lane/standing-ruling'); // a merge commit NAMING the PR — but GitHub says it is still OPEN
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const plan = await planRebuild({
+      git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref: 'lane/container', pr: 5801 }],
+      prState: async () => 'OPEN', prForcePushes: async () => [{ before: x1 }], autoRebase: { mode: 'on', source: 'test' },
+    });
+    expect(plan.decisions[0]).toMatchObject({ action: 'drop', reason: 'conflict' });
+    expect(plan.alerts.map((a) => a.kind)).toContain('overlay-set-aside');
   });
 });

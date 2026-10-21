@@ -732,7 +732,12 @@ export async function smokeAndAdopt({
       let failed = planA2.reason ?? 'not planned';
       // x9diisp — setting the culprits aside must never also lose an overlay the running build carries (e.g. one a
       // culprit's change had let apply in the retry pass): such a fallback is refused like prepare refuses it.
-      if (planA2.ok && planA2.establishedLost?.length > 0) {
+      // overlay-rebase-on-merge: a fallback may not set aside an overlay the plan it falls back from did not (its
+      // alerts are never emitted, so that loss would be silent) — refused exactly like a lost established overlay.
+      const a2Aside = planA2.ok ? (planA2.setAside ?? []).filter((r) => !(plan.setAside ?? []).includes(r)) : [];
+      if (planA2.ok && a2Aside.length > 0) {
+        failed = `overlay-set-aside-in-fallback: ${a2Aside.join(', ')}`;
+      } else if (planA2.ok && planA2.establishedLost?.length > 0) {
         failed = `established-overlay-conflict: ${planA2.establishedLost.map((l) => l.ref).join(', ')}`;
       } else if (planA2.ok) {
         alert('overlay-set-aside-attributed', {
@@ -773,7 +778,8 @@ export async function smokeAndAdopt({
     });
     // x9diisp/overlay-pin — like planA2, plain main must never lose an overlay the running build carries (e.g. a
     // pinned head that only merged thanks to a suspect it now leaves out): refused as unplannable instead.
-    const bLost = planB.ok && planB.establishedLost?.length > 0;
+    const bAside = planB.ok ? (planB.setAside ?? []).filter((r) => !(plan.setAside ?? []).includes(r)) : [];
+    const bLost = planB.ok && (planB.establishedLost?.length > 0 || bAside.length > 0);
     if (planB.ok && !bLost) {
       const suspectInfo = suspects.map((ap) => ({ ref: ap.ref, pr: ap.pr }));
       alert('fallback-plain-main', {
@@ -845,7 +851,7 @@ export async function smokeAndAdopt({
       }
     } else {
       alert('fallback-plain-main-unplannable', {
-        reason: bLost ? `established-overlay-conflict: ${planB.establishedLost.map((l) => l.ref).join(', ')}` : planB.reason,
+        reason: bLost ? `${bAside.length ? `overlay-set-aside-in-fallback: ${bAside.join(', ')}` : `established-overlay-conflict: ${planB.establishedLost.map((l) => l.ref).join(', ')}`}` : planB.reason,
       });
     }
   }

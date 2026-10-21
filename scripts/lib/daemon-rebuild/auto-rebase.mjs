@@ -50,13 +50,20 @@ function onlyPrOwnHistory(git, mainSha, sha) {
  * @returns {Promise<{candidates:Array<{sha:string, pr:number, evidence:string}>, mergedPrs:number[]}>}
  */
 export async function mergedPrOldHeads({
-  git, mainSha, ovSha, conflictFiles = [], stateOf = async () => null, prForcePushes = null, adoptedHeads = [],
+  git, mainSha, ovSha, conflictFiles = [], stateOf = async () => null, prForcePushes = null, adoptedHeads = [], otherHeads = [],
 }) {
   const isAnc = (a, b) => git(['merge-base', '--is-ancestor', a, b]).status === 0;
-  const keep = (sha) => FULL_SHA_RE.test(sha) && sha !== ovSha && isAnc(sha, ovSha) && !isAnc(sha, mainSha)
-    && onlyPrOwnHistory(git, mainSha, sha);
+  // Another overlay's work inside X (a registered tip, or a head this clone adopted for a DIFFERENT PR, sharing
+  // history with X beyond main) is not this PR's content: a merge with X as base could drop it, so X is refused.
+  // A head built ON X (X its ancestor — e.g. the overlay being rebased, or one stacked on it) holds X's content plus its
+  // own after it: that is not foreign content INSIDE X.
+  const foreign = (sha, pr) => otherHeads.some((h) => h?.sha && Number(h.pr) !== pr && h.sha !== sha && FULL_SHA_RE.test(h.sha)
+    && !isAnc(sha, h.sha) && lines(git(['merge-base', '--all', sha, h.sha])).some((b) => !isAnc(b, mainSha)));
+  const keep = (sha, pr) => FULL_SHA_RE.test(sha) && sha !== ovSha && isAnc(sha, ovSha) && !isAnc(sha, mainSha)
+    && onlyPrOwnHistory(git, mainSha, sha) && !foreign(sha, pr);
   const found = new Map();
-  const add = (sha, pr, evidence) => { if (!found.has(sha) && keep(sha)) found.set(sha, { sha, pr, evidence }); };
+  const add = (sha, pr, evidence) => { if (!found.has(sha) && keep(sha, pr)) found.set(sha, { sha, pr, evidence }); };
+  const merged = async (pr) => { try { return (await stateOf(pr)) === 'MERGED'; } catch { return false; } };
 
   // PRs main merged since the overlay's base whose merge touched a conflicted file (bounded; newest first).
   const conflictSet = new Set(conflictFiles);
@@ -73,16 +80,16 @@ export async function mergedPrOldHeads({
   // (a) heads of a now-MERGED PR that this clone's own builds adopted (recorded in its rebuild state, never in git text).
   for (const h of Array.isArray(adoptedHeads) ? adoptedHeads : []) {
     const pr = Number(h?.pr);
-    if (!Number.isInteger(pr) || pr <= 0 || typeof h?.sha !== 'string' || found.has(h.sha) || !keep(h.sha)) continue;
+    if (!Number.isInteger(pr) || pr <= 0 || typeof h?.sha !== 'string' || found.has(h.sha) || !keep(h.sha, pr)) continue;
     if (h.proven === true) { add(h.sha, pr, h.evidence ?? 'proven'); continue; }
-    let st = null;
-    try { st = await stateOf(pr); } catch { st = null; }
-    if (st === 'MERGED') add(h.sha, pr, 'adopted-head');
+    if (await merged(pr)) add(h.sha, pr, 'adopted-head');
   }
 
-  // (b) heads GitHub says were force-pushed away from a relevant merged PR.
+  // (b) heads GitHub says were force-pushed away from a relevant PR that GitHub says is MERGED (a merge subject on main
+  //     only picks which PRs to ask about; it is never itself proof).
   if (typeof prForcePushes === 'function') {
     for (const pr of mergedPrs.slice(0, MAX_FORCE_PUSH_READS)) {
+      if (!(await merged(pr))) continue;
       let events = null;
       try { events = await prForcePushes(pr); } catch { events = null; }
       for (const e of Array.isArray(events) ? events : []) if (typeof e?.before === 'string') add(e.before, pr, 'force-pushed');

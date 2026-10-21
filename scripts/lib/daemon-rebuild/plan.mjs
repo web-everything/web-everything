@@ -616,6 +616,10 @@ export async function planRebuild({
         if (autoRebase.mode !== 'off' && git(['merge-tree', '--write-tree', '--no-messages', mainSha, ovSha]).status === 1) {
           const { candidates, mergedPrs } = await mergedPrOldHeads({
             git, mainSha, ovSha, conflictFiles: files, stateOf, prForcePushes, adoptedHeads,
+            otherHeads: [
+              ...adoptedHeads.filter((h) => !h.proven),
+              ...listed.filter((o) => o?.ref && o.ref !== ref).map((o) => ({ pr: o.pr ?? -1, sha: verifyRev(git, `refs/remotes/origin/${o.ref}^{commit}`) })),
+            ],
           });
           const rb = candidates.length ? tryAutoRebase({ git, cur, ovSha, candidates }) : { ok: false };
           const said = { ref, pr, sha: ovSha, mainSha, mergedPrs, hunks: files, mode: autoRebase.mode, source: autoRebase.source };
@@ -850,6 +854,7 @@ export async function planRebuild({
     ok: true, mainSha, finalSha: cur, applied, decisions, alerts, inputsKey, upToDate: cur === headSha, establishedLost,
     // overlay-rebase-on-merge — what the smoke fallbacks need to re-plan under the SAME rules: the mode, the adopted
     // heads, and the bases this plan already proved (so a fallback never quietly reverts to `off`).
+    setAside: [...setAsideOnMain.keys()].filter((r) => decisions.some((d) => d.ref === r && d.action === 'drop')),
     autoRebaseCtx: {
       autoRebase,
       adoptedHeads: [...adoptedHeads, ...applied.filter((a) => a.rebaseBase)
