@@ -1532,7 +1532,9 @@ describe('unattended acceptance safety boundary', () => {
     expect(fileItem).toHaveBeenCalledOnce();
     expect(seen.some(s => s.type === REVIEW_EFFECTS.LABEL)).toBe(true);
   });
-  it('prevention-outstanding with an unruled broken finding cannot accept', async () => {
+  // Live #5608 shape: prevention-outstanding, a `broken` finding, and NO referral record on the PR to rule it. The hold
+  // could never lift, so the loop sends the PR back as `changes` carrying the broken finding — never an accept.
+  it('prevention-outstanding with an unrulable broken finding (no referral record) is sent back as changes, never accepted', async () => {
     const { declaration, registry } = registryFor({ rev: HEAD_A });
     const seen = [];
     const fileItem = vi.fn();
@@ -1541,10 +1543,28 @@ describe('unattended acceptance safety boundary', () => {
       readAcceptancePr: () => ({ headRefOid: HEAD_A, comments: [] }),
       makeJudge: cannedJudge(PREVENTION_ANSWER), mintRunId: () => 'safety-prevention-broken', fileItem });
     expect(out.run.verdict.verdict).toBe('prevention-outstanding');
+    expect(out.stopped).toBe('complete');
+    expect(fileItem).not.toHaveBeenCalled();
+    const labels = seen.filter(s => s.type === REVIEW_EFFECTS.LABEL);
+    expect(labels).toHaveLength(1);
+    expect(JSON.stringify(labels[0].payload)).toMatch(/changes/);
+    expect(JSON.stringify(labels[0].payload)).not.toMatch(/accepted/);
+    // Every broken finding the verdict carries is named (one per seat that raised it) — none is dropped.
+    const broken = out.run.verdict.findings.filter(f => f.impactIfUnfixed === 'broken').length;
+    expect(broken).toBeGreaterThan(0);
+    expect(out.run.input.reason).toContain(`${broken} broken finding(s)`);
+    expect(out.run.input.reason.match(/a magic number should be a named constant/g)).toHaveLength(broken);
+    expect(out.lines.join('\n')).toContain(`sent back as \`changes\` with ${broken} broken finding(s)`);
+  });
+  it('the same broken finding on a moved live head still parks (no send-back on a head it did not review)', async () => {
+    const { declaration, registry } = registryFor({ rev: HEAD_A });
+    const seen = [];
+    const out = await driveReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+      store: createMemoryRunStore(), sinks: recordingSinks(seen),
+      readAcceptancePr: () => ({ headRefOid: HEAD_B, comments: [] }),
+      makeJudge: cannedJudge(PREVENTION_ANSWER), mintRunId: () => 'safety-prevention-broken-moved', fileItem: vi.fn() });
     expect(out.stopped).toBe('confirm');
     expect(seen.some(s => s.type === REVIEW_EFFECTS.LABEL)).toBe(false);
-    expect(fileItem).not.toHaveBeenCalled();
-    expect(out.lines.join('\n')).toMatch(/broken finding is not ruled/);
   });
   it.each([['accept', CLEAN_ANSWER], ['prevention-outstanding', noBroken]])
   ('%s on a live head that moved since the review cannot accept or file', async (verdict, answer) => {
@@ -1611,6 +1631,20 @@ describe('unattended accept reads the live head', () => {
     expect(seen.some(s => s.type === REVIEW_EFFECTS.LABEL)).toBe(cleared);
     expect(fileItem).toHaveBeenCalledTimes(verdict === 'prevention-outstanding' && cleared ? 1 : 0);
     if (!cleared) expect(out.lines.join('\n')).toMatch(/mandatory referrals remain open/);
+  });
+  // A referral record EXISTS (here: on an older head, so nothing is open on the live head): the broken finding has a
+  // ruling path, so the unrulable send-back must NOT fire — the run parks exactly as before.
+  it('a broken finding on a PR that has a referral record keeps parking, unchanged', async () => {
+    const comments = [comment(renderReferralRecord({ ...record, head: HEAD_B }))];
+    const { declaration, registry } = registryFor({ rev: HEAD_A });
+    const seen = [];
+    const out = await driveReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+      store: createMemoryRunStore(), sinks: recordingSinks(seen), cardReadable: () => true,
+      readAcceptancePr: () => ({ headRefOid: HEAD_A, body: record.authorBody, comments }),
+      makeJudge: cannedJudge(PREVENTION_ANSWER), mintRunId: () => 'safety-broken-with-record', fileItem: vi.fn() });
+    expect(out.stopped).toBe('confirm');
+    expect(seen.some(s => s.type === REVIEW_EFFECTS.LABEL)).toBe(false);
+    expect(out.lines.join('\n')).toMatch(/Unattended accept parked: broken finding is not ruled/);
   });
 });
 
