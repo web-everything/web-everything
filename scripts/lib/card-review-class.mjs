@@ -27,11 +27,19 @@ export const CARD_REVIEW_CLASS = Object.freeze({ CARD: 'card', FULL: 'full' });
 
 const RAISED_BY = /^backlog\/raised-by\//;
 
-/** Settings with every invalid field replaced by the standard (a caller handing a bad value never widens). */
+/**
+ * Settings with every invalid field replaced by the standard, and the exclusions FLOORED: `fullKeys` is the union
+ * with the standard's, and the standard `fullMarker` always applies beside a configured one. So a setting can add
+ * exclusions or narrow paths/kinds, never admit a ratified or decision card.
+ */
 function effective(settings) {
   const s = settings && typeof settings === 'object' ? settings : {};
-  return Object.fromEntries(Object.entries(CARD_CLASS_STANDARD).map(([k, d]) => [k, CARD_CLASS_VALID[k](s[k]) ? s[k] : d]));
+  const e = Object.fromEntries(Object.entries(CARD_CLASS_STANDARD).map(([k, d]) => [k, CARD_CLASS_VALID[k](s[k]) ? s[k] : d]));
+  e.fullKeys = [...new Set([...CARD_CLASS_STANDARD.fullKeys, ...e.fullKeys])];
+  e.markers = [...new Set([CARD_CLASS_STANDARD.fullMarker, e.fullMarker])].map((m) => new RegExp(m, 'i'));
+  return e;
 }
+const anyMarker = (markers, text) => markers.some((re) => re.test(text));
 
 /** Split a unified diff into blocks, refusing (null) anything this predicate does not fully understand. */
 function parseBlocks(diffText) {
@@ -91,16 +99,34 @@ function diffFrontmatter({ added, deleted, lines }) {
   return { old: exists.old ? seen.old.slice(1).join('\n') : null, new: exists.new ? seen.new.slice(1).join('\n') : null };
 }
 
+/**
+ * Every diff line that lands inside a side's git-read frontmatter region (`---`, its lines, `---`) must equal the
+ * git line at that position — so a partial frontmatter hunk can never contradict the git reading.
+ */
+function gitMatchesDiff(git, { lines }) {
+  const region = (t) => (typeof t === 'string' ? ['---', ...t.split('\n'), '---'] : []);
+  const want = { old: region(git.old), new: region(git.new) };
+  let o = 0; let n = 0;
+  for (const l of lines) {
+    const hm = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(l);
+    if (hm) { o = Number(hm[1]); n = Number(hm[2]); if (o === 0) o = 1; if (n === 0) n = 1; continue; }
+    const mark = l[0]; const text = l.slice(1);
+    if (mark === ' ' || mark === '-') { if (o <= want.old.length && want.old[o - 1] !== text) return false; o++; }
+    if (mark === ' ' || mark === '+') { if (n <= want.new.length && want.new[n - 1] !== text) return false; n++; }
+  }
+  return true;
+}
+
 /** Is one frontmatter reading plain card metadata under `s`? Any parse doubt is `false`. */
-function plainCardSide(text, s, marker) {
-  if (typeof text !== 'string' || !text.trim() || /<</.test(text) || marker.test(text)) return false;
+function plainCardSide(text, s) {
+  if (typeof text !== 'string' || !text.trim() || /<</.test(text) || anyMarker(s.markers, text)) return false;
   let doc;
   try { doc = yaml.load(text); } catch { return false; }
   if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return false;
   const full = new Set(s.fullKeys.map((k) => k.trim().toLowerCase()));
   const keys = Object.keys(doc).map((k) => String(k).trim().toLowerCase());
   if (keys.some((k) => full.has(k) || k === '<<')) return false;
-  if (marker.test(JSON.stringify(doc))) return false; // after escapes and merges are resolved
+  if (anyMarker(s.markers, JSON.stringify(doc))) return false; // after escapes and merges are resolved
   const kinds = Object.keys(doc).filter((k) => ['kind', 'type'].includes(String(k).trim().toLowerCase())).map((k) => doc[k]);
   const allowed = s.kinds.map((k) => k.trim().toLowerCase());
   return kinds.length > 0 && kinds.every((v) => typeof v === 'string' && allowed.includes(v.trim().toLowerCase()));
@@ -127,8 +153,7 @@ export function cardReviewClass(read, settings = CARD_CLASS_STANDARD) {
   if (off) return full(`${off}: not on review.cardClass.cardPathPatterns`);
   const diffText = String(read.diffText ?? '');
   if (!diffText.trim()) return full('empty diff');
-  const marker = new RegExp(s.fullMarker, 'i');
-  if (marker.test(diffText)) return full('the diff matches review.cardClass.fullMarker');
+  if (anyMarker(s.markers, diffText)) return full('the diff matches review.cardClass.fullMarker');
   const blocks = parseBlocks(diffText);
   if (!blocks) return full('the diff has a header, mode, rename or binary block the card class does not accept');
   const byPath = new Map(blocks.map((b) => [b.path, b]));
@@ -138,7 +163,10 @@ export function cardReviewClass(read, settings = CARD_CLASS_STANDARD) {
   for (const path of files) {
     const block = byPath.get(path);
     if (RAISED_BY.test(path)) {
-      if (!block.added || block.lines.some((l) => l === '+---')) return full(`${path}: a raised-by note must be a new file with no frontmatter`);
+      // A pointer note is new bullet text only: every added line is `- …` or empty, so nothing can parse as frontmatter.
+      if (!block.added || !block.lines.slice(1).every((l, i, a) => (l === '' && i === a.length - 1) || /^\+(?:- .*)?$/.test(l) || l.startsWith('\\'))) {
+        return full(`${path}: a raised-by note must be a new file of bullet lines`);
+      }
       continue;
     }
     const readings = [];
@@ -148,6 +176,7 @@ export function cardReviewClass(read, settings = CARD_CLASS_STANDARD) {
     if (git !== undefined) {
       if (!git || typeof git !== 'object' || !('old' in git) || !('new' in git)) return full(`${path}: malformed git-read frontmatter`);
       if ((git.old === null) !== block.added || (git.new === null) !== block.deleted) return full(`${path}: git read and diff disagree on which sides exist`);
+      if (!gitMatchesDiff(git, block)) return full(`${path}: git-read frontmatter disagrees with the diff`);
       readings.push(git);
     }
     if (!readings.length) return full(`${path}: frontmatter not proved on both sides`);
@@ -155,7 +184,7 @@ export function cardReviewClass(read, settings = CARD_CLASS_STANDARD) {
       for (const side of ['old', 'new']) {
         const exists = side === 'old' ? !block.added : !block.deleted;
         if (!exists) { if (r[side] != null) return full(`${path}: ${side} side should be absent`); continue; }
-        if (!plainCardSide(r[side], s, marker)) return full(`${path}: ${side} side is not a plain ${s.kinds.join('/')} card`);
+        if (!plainCardSide(r[side], s)) return full(`${path}: ${side} side is not a plain ${s.kinds.join('/')} card`);
       }
     }
   }

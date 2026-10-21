@@ -54,6 +54,26 @@ describe('card review class', () => {
     expect(cls(read([A], [`diff --git a/${A} b/${A}`, 'old mode 100644', 'new mode 100755', ''].join('\n'), { cardFrontmatter: { [A]: { old: 'kind: story', new: 'kind: story' } } }))).toBe('full');
     expect(isCardCoverageFinding({ category: 'COVERAGE/SECURITY' })).toBe(false);
   });
+  it('third-round audit escapes → full', () => {
+    const p = 'backlog/raised-by/1/1-aaaaaaaaaaaaaaaaaaaaaaaa.md';
+    const note = (body) => [`diff --git a/${p} b/${p}`, 'new file mode 100644', '--- /dev/null', `+++ b/${p}`, `@@ -0,0 +1,${body.length} @@`, ...body.map((l) => `+${l}`), ''].join('\n');
+    expect(cls(read([p], note(['--- ', 'kind: "deci\\u0073ion"', '--- '])))).toBe('full');
+    expect(cls(read([p], note(['- Also raised by #1'])))).toBe('card');
+    // settings cannot drop the standard exclusions
+    const loose = { ...CARD_CLASS_STANDARD, fullKeys: [], fullMarker: '(?!)' };
+    expect(cardReviewClass(read([A], newCard(A, ['kind: story', 'codifiedIn: x'])), loose).class).toBe('full');
+    expect(cardReviewClass(read([A], newCard(A, ['kind: story', 'rat: 1'])), loose).class).toBe('card');
+    // a partial frontmatter hunk contradicting the git reading
+    const partial = [`diff --git a/${A} b/${A}`, `--- a/${A}`, `+++ b/${A}`, '@@ -1,2 +1,2 @@', ' ---', '-kind: story', '+kind: "deci\\u0073ion"', ''].join('\n');
+    expect(cls(read([A], partial, { cardFrontmatter: { [A]: { old: 'kind: story\ntitle: x', new: 'kind: story\ntitle: x' } } }))).toBe('full');
+    const honest = [`diff --git a/${A} b/${A}`, `--- a/${A}`, `+++ b/${A}`, '@@ -1,3 +1,3 @@', ' ---', ' kind: story', '-title: x', '+title: y', ''].join('\n');
+    expect(cls(read([A], honest, { cardFrontmatter: { [A]: { old: 'kind: story\ntitle: x\nsize: 1', new: 'kind: story\ntitle: y\nsize: 1' } } }))).toBe('card');
+  });
+  it('post-accept timing: the card-class red-team mode does not apply (skipCardOnly rule unchanged)', async () => {
+    const { cardClassRedTeamMode } = await import('../review-red-team-policy.mjs');
+    expect(cardClassRedTeamMode(read([A], newCard(A)), { WE_RED_TEAM_TIMING: 'post-accept' })).toBeNull();
+    expect(cardClassRedTeamMode(read([A], newCard(A)), PANEL)).toBe('off');
+  });
   it('unknown, missing or non-string kind → full (allowlist, not denylist)', () => {
     for (const front of [['kind: proposal'], ['title: x'], ['kind: [story]'], ['kind: {a: 1}']]) expect(cls(read([A], newCard(A, front)))).toBe('full');
   });

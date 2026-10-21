@@ -4900,6 +4900,16 @@ describe('card-only light review', () => {
         expect(run.findings.reduce.deferredAdvisory ?? []).toHaveLength(0);
       }
     });
+    it('a run classified card but reduced under the kill switch (resume after enabled:false) keeps today routing', () => {
+      const r = cardRegistry();
+      let run = advanceWhileRunning(startRun({ op: REVIEW_PR_OP, id: 'cc-resume', input: BASE_INPUT, registry: r }), { registry: r });
+      expect(run.findings.read.cardReview.class).toBe('card');
+      const off = createRegistry();
+      off.register(reviewPrOperation({ readPr: () => { throw new Error('no re-read'); }, cardOnlyLight: true, securitySeat: false,
+        cardClassSettings: { ...CARD_CLASS_STANDARD, enabled: false } }));
+      while (runStatus(run, { registry: off }) === 'awaiting-judge') run = advanceWhileRunning(run, { registry: off, resume: { value: answer(finding('COVERAGE')) } });
+      expect(run.findings.reduce.verdict).toBe('changes');
+    });
     it('a full-roster run (not the light lane) never records a card class', () => {
       const { run } = atConfirm({ registry: registryFor({}).registry, input: BASE_INPUT });
       expect(run.findings.read.cardReview).toBeUndefined();

@@ -5,9 +5,11 @@ import { resolveCardClassSettings } from './review-seat-settings.mjs';
 
 /**
  * The card-class red-team mode for this read — `off` | `advisory` | `on` (`review.cardClass.redTeam`) — or `null`
- * when the head is not in the card class (or the class is switched off), i.e. today's red-team rules apply.
+ * when the head is not in the card class, the class is switched off, or the red team is not on `panel-seat`
+ * timing (post-accept keeps its own `skipCardOnly` rule unchanged), i.e. today's red-team rules apply.
  */
 export function cardClassRedTeamMode(read, env = process.env, settings = resolveCardClassSettings({ env }).value) {
+  if (readRedTeamTiming({ env }).value.timing !== 'panel-seat') return null;
   return cardReviewClass(read, settings).class === CARD_REVIEW_CLASS.CARD ? settings.redTeam : null;
 }
 /** Shared scheduling policy; importing it never loads a review dispatcher or CLI. */

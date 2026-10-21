@@ -2969,7 +2969,11 @@ export function reviewPrOperation({
           // recorded at read so a resume decides the same), test-plan COVERAGE from the correctness seat is a card
           // suggestion, not a referral or a blocking finding. Every other class still blocks; an operator `block`
           // ruling on the same finding still promotes it back (the blocked-referral binding below).
-          const cardCoverage = read.cardReview?.class === CARD_REVIEW_CLASS.CARD && read.cardReview.coverageRoute === 'card-suggestion'
+          // Needs all three: the light lane, the read-time class, and the LIVE settings (kill switch + route) this
+          // declaration was built with, so a resumed run under `enabled: false` restores today's routing.
+          const cardCoverage = read.cardOnlyLight === true && cardOnlyLight && cardClassSettings?.enabled === true
+            && cardClassSettings.coverageRoute === 'card-suggestion'
+            && read.cardReview?.class === CARD_REVIEW_CLASS.CARD && read.cardReview.coverageRoute === 'card-suggestion'
             && seat.lens === 'correctness' && Array.isArray(confirmed.findings)
             ? confirmed.findings.filter(isCardCoverageFinding) : [];
           deferredAdvisory.push(...cardCoverage.map((f) => ({

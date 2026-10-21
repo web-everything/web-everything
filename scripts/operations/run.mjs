@@ -212,7 +212,8 @@ export const OPERATIONS = Object.freeze({
       antigravityReview: antigravityReviewFromEnv() };
     // A saved run keeps the roster it started with at every cursor position (`reviewSeatOptionsForRun`).
     const seats = savedRun?.op === REVIEW_PR_OP
-      ? reviewSeatOptionsForRun(savedRun, seatSettings, live)
+      ? { ...reviewSeatOptionsForRun(savedRun, seatSettings, live),
+        cardClassSettings: savedRun.findings?.read?.cardOnlyLight === true ? resolveCardClassSettings().value : null }
       : { securitySeat, cardOnlyLight, cardClassSettings: cardOnlyLight ? resolveCardClassSettings().value : null, ...live, seatSettings };
     return {
       declaration: reviewPrOperation({
