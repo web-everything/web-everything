@@ -21,6 +21,37 @@ export default {
     const root = process.env.SOAK_TREE_ROOT || fileURLToPath(new URL('../../../../', import.meta.url));
     const { runReviewTickAllRepos, liveReviewRoundBudget } = await import(pathToFileURL(join(root, SOURCE)).href);
     const violations = [];
+    // A relative verifier's changed-file arguments must leave all three seats available.
+    // Exercise the actual budget -> multi-repository dispatch wiring, with ample free lanes.
+    for (const command of [
+      'node scripts/verify-lane.mjs run --files=scripts/operations/review-job.mjs',
+      'node ./scripts/verify-lane.mjs --files=scripts/operations/review-loop-cli.mjs',
+      'node scripts/verify-lane.mjs run --files scripts/operations/review-loop-cli.mjs',
+      'node scripts/verify-lane.mjs run --files=skills-src/Review Work/review-job.mjs',
+      'node -r ./package.json scripts/verify-lane.mjs run --files=scripts/operations/review-job.mjs',
+      'node -r ./package.json -r ./boot.cjs scripts/verify-lane.mjs run --files=scripts/operations/review-job.mjs',
+      'node -r ./package.json --no-warnings scripts/verify-lane.mjs run --files=scripts/operations/review-job.mjs',
+      'node -r ./package.json -- scripts/verify-lane.mjs run --files=scripts/operations/review-loop-cli.mjs',
+      'node --title worker scripts/verify-lane.mjs run --files=scripts/operations/review-job.mjs',
+      'nodejs scripts/verify-lane.mjs run --files=scripts/operations/review-job.mjs',
+      'bun scripts/verify-lane.mjs run --files=scripts/operations/review-loop-cli.mjs',
+    ]) {
+      const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' },
+        listCommands: () => `101 1 ${command}` });
+      const before = { live: budget.live, left: budget.left };
+      let dispatchCalls = 0;
+      const result = runReviewTickAllRepos({
+        repos: [HEALTHY_REPO], liveReviewBudget: budget,
+        authGateOverride: () => ({ paused: false, reason: null }),
+        reconcile: () => ({ dispatch: [1, 2, 3].map(prNumber => ({ kind: 'review', prNumber })), refusals: [] }),
+        dispatch: () => ({ agentId: `review-${++dispatchCalls}` }),
+        holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 40,
+      });
+      if (before.live !== 0 || before.left !== 3 || dispatchCalls !== 3 || result.dispatched.length !== 3
+        || result.deferredForCap !== 0) {
+        violations.push(`relative verifier ${command}: live=${before.live}, left=${before.left}, dispatchCalls=${dispatchCalls}, deferred=${result.deferredForCap}`);
+      }
+    }
     // ps loses the argv boundary after an extension-like directory fragment. Exercise the budget
     // through the all-repository tick so an undercount cannot silently admit three more rounds.
     for (const argv of ['./Review -Work/scripts/operations/review-loop-cli.mjs',

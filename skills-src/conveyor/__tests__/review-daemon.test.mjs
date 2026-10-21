@@ -65,6 +65,62 @@ const reviewStatusCalls = (calls) => calls.filter((c) => !(String(c.spec?.add ??
   || (!c.spec?.add && (c.spec?.remove ?? []).length && c.spec.remove.every((r) => r.startsWith('status:')))));
 
 describe('live review cap with Node configuration options', () => {
+  it.each([
+    'node scripts/verify-lane.mjs run --files=scripts/operations/review-job.mjs',
+    'node ./scripts/verify-lane.mjs run --files=scripts/operations/review-loop-cli.mjs',
+    'node scripts/verify-lane.mjs --files=scripts/operations/review-job.mjs',
+    'node scripts/verify-lane.mjs run --files scripts/operations/review-loop-cli.mjs',
+    'node scripts/verify-lane.mjs run --files="scripts/operations/review-job.mjs"',
+    'node scripts/verify-lane.mjs run --files=skills-src/Review Work/review-job.mjs',
+    'node scripts/verify-lane.mjs run --repo=/tmp/Review Work --files=../Wörk/`source`/review-loop-cli.mjs --json',
+    'node scripts/verify-lane.mjs run --files=Review\rWork/review-job.mjs',
+    'node scripts/verify-lane.mjs run --files=Review\u2028Work/review-job.mjs',
+    'node -r ./package.json scripts/verify-lane.mjs run --files=scripts/operations/review-job.mjs',
+    'node -r ./package.json -r ./boot.cjs scripts/verify-lane.mjs run --files=scripts/operations/review-job.mjs',
+    'node --require=./package.json --import=./boot.mjs scripts/verify-lane.mjs --files=scripts/operations/review-job.mjs',
+    'node -r ./package.json --no-warnings scripts/verify-lane.mjs run --files=scripts/operations/review-job.mjs',
+    'node -r ./package.json -- scripts/verify-lane.mjs run --files=scripts/operations/review-loop-cli.mjs',
+    'node -r ./package.json --stack-size=1024 scripts/verify-lane.mjs --files=scripts/operations/review-job.mjs',
+    'node --title worker scripts/verify-lane.mjs run --files=scripts/operations/review-job.mjs',
+    'node --openssl-config ./openssl.cnf scripts/verify-lane.mjs run --files=scripts/operations/review-loop-cli.mjs',
+    'nodejs scripts/verify-lane.mjs run --files=scripts/operations/review-loop-cli.mjs',
+    'bun scripts/verify-lane.mjs run --files=scripts/operations/review-job.mjs',
+  ])('keeps three review seats available for a relative verifier: %s', async command => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' },
+      listCommands: () => `101 1 ${command}` });
+    const before = { live: budget.live, left: budget.left };
+    const dispatch = vi.fn(() => ({ agentId: 'started-review' }));
+    const tick = runReviewTickAllRepos({ repos: ['review-cap-fixture/healthy'], liveReviewBudget: budget,
+      authGateOverride: () => ({ paused: false, reason: null }),
+      reconcile: () => ({ dispatch: [1, 2, 3].map(prNumber => ({ kind: 'review', prNumber })), refusals: [] }),
+      dispatch, holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+      acquirableLanes: () => 40 });
+    expect({ ...before, dispatched: tick.dispatched.length, deferred: tick.deferredForCap })
+      .toEqual({ live: 0, left: 3, dispatched: 3, deferred: 0 });
+    expect(dispatch).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([
+    'node scripts/verify-lane.mjs Work/scripts/operations/review-job.mjs --files=changed.mjs',
+    'node scripts/verify-lane.mjs Work/scripts/operations/review-job.mjs run --files=changed.mjs',
+    'node -r ./Boot.json Work/boot.cjs scripts/verify-lane.mjs --files=scripts/operations/review-job.mjs',
+    'node -r ./package.json --unknown-option value scripts/verify-lane.mjs --files=scripts/operations/review-job.mjs',
+  ])('keeps unexplained path fragments outside the verifier signature ambiguous: %s', async command => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () => command }))
+      .toMatchObject({ left: 0, reason: expect.stringContaining('unknown') });
+  });
+
+  it('still counts independent reviews beside a relative verifier file list', async () => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () => [
+      '101 1 node scripts/verify-lane.mjs run --files=scripts/operations/review-job.mjs',
+      '102 1 node scripts/operations/review-job.mjs run --pr=1',
+      '103 1 node scripts/operations/review-loop-cli.mjs --pr=2',
+    ].join('\n') })).toMatchObject({ live: 2, left: 1 });
+  });
+
   it('resolves absolute runtime paths without consuming a utility argument and holds conflicting paths', async () => {
     const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
     const root = mkdtempSync(join(tmpdir(), 'review-runtime-paths-'));

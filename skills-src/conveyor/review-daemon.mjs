@@ -1196,9 +1196,54 @@ export function countLiveReviewRounds(lines, { isScriptFile = null, isOptionPath
     const match = /^(?:"([^"]*)"|'([^']*)'|(\S+))\s*/.exec(text);
     return match ? { value: match[1] ?? match[2] ?? match[3], rest: text.slice(match[0].length) } : { value: '', rest: '' };
   };
+  const verifierFileList = (text) => {
+    const entry = word(text);
+    if (!/^(?:\.\/)?scripts\/verify-lane\.mjs$/.test(entry.value)) return false;
+    let rest = entry.rest;
+    const mode = word(rest);
+    if (/^(?:verify|request|check|reset|run)$/.test(mode.value)) rest = mode.rest;
+    let files = false;
+    while (rest) {
+      const flag = /^--([a-z][a-z0-9-]*)(?==|\s|$)/.exec(rest);
+      if (!flag) return false;
+      rest = rest.slice(flag[0].length);
+      const equals = rest.startsWith('=');
+      if (equals || flag[1] === 'files') {
+        rest = (equals ? rest.slice(1) : rest).trimStart();
+        // Values in ps are flattened too: a changed-file path or --repo value may contain spaces.
+        // Within this recognized utility signature, retain the value through the next flag.
+        const boundary = rest.search(/\s+(?=--[a-z][a-z0-9-]*(?:=|\s|$))/);
+        const value = boundary < 0 ? rest : rest.slice(0, boundary);
+        if (!value || value.startsWith('--')) return false;
+        rest = boundary < 0 ? '' : rest.slice(boundary).trimStart();
+      } else rest = rest.trimStart();
+      files ||= flag[1] === 'files';
+    }
+    return files;
+  };
+  const verifierAfterOptions = (text) => {
+    while (text) {
+      if (verifierFileList(text)) return true;
+      const option = word(text);
+      if (option.value === '--') return verifierFileList(option.rest);
+      const flag = option.value.split('=')[0].replaceAll('_', '-');
+      if (SWITCH_FLAGS.has(flag)) { text = option.rest; continue; }
+      if (!VALUE_FLAGS.has(flag)) return false;
+      const equals = text.indexOf('=');
+      const value = word(option.value.includes('=') ? text.slice(equals + 1) : option.rest);
+      if (!value.value || value.value.startsWith('-')) return false;
+      text = value.rest;
+    }
+    return false;
+  };
   const path = (text, { preload = false } = {}) => {
     if (/^["']/.test(text)) return word(text);
     const first = word(text);
+    // ps discards argv boundaries, so arbitrary spaced relative paths cannot be proved from text.
+    // Recognize the canonical repository verifier + file-list signature as an explicit command
+    // boundary convention. Its --files payload names scripts as DATA. Do not generalize this to
+    // arbitrary *.mjs prefixes or --files fragments: those can still be spaced review directories.
+    if (!preload && verifierFileList(text)) return first;
     // require() accepts JSON and native addons too. Use their suffix
     // as a preload boundary so a relative preload cannot swallow the following review script.
     const extension = preload ? '\\.(?:mjs|cjs|js|json|node)' : '\\.(?:mjs|cjs|js)';
@@ -1304,6 +1349,10 @@ export function countLiveReviewRounds(lines, { isScriptFile = null, isOptionPath
       // appears as interpreter + script in ps, so its spaced paths use the runtime branch below.
       return runtime.value.split('/').pop();
     }
+    // Recognize the whole utility signature once, including understood preload/switch chains.
+    // Otherwise each preload would retain ambiguity from the verifier's file-list data (and
+    // rescanning every remaining option chain would add quadratic work).
+    if (verifierAfterOptions(runtime.rest)) return 'verify-lane.mjs';
     let rest = runtime.rest;
     let ambiguousValue = false;
     const finish = (name) => {
