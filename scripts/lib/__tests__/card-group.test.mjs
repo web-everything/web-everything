@@ -825,6 +825,38 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       expect(t.calls.filter(c => c.startsWith('pr list '))).toHaveLength(1);
     });
 
+    it('reconcile ignores foreign groups with colliding PR numbers', () => {
+      // This repo's #77 is closed; the foreign group's #77 is another PR. Nothing is read, closed, commented or dropped.
+      const t = reconcileCase({ repo: 'o/foreign', combined: { state: 'CLOSED' }, sources: { 1: { state: 'CLOSED' } } });
+      expect(t.r).toEqual({ checked: 0 });
+      expect(t.calls).toEqual([]);
+      expect(t.unchanged).toBe(true);
+    });
+
+    it('a foreign drain\'s reconcile never throttles this repository\'s reconcile', () => {
+      const statePath = join(tmp(), 's.json');
+      const group = (id, repo) => ({ id, repo, pr: 77, branch: `lane/card-group-${id}`, createdAt: T0, sources: [{ num: 1, headSha: A }] });
+      writeFileSync(statePath, JSON.stringify({ groups: [group('g', 'o/r'), group('f', 'o/foreign')], failed: {} }));
+      const source = { state: 'OPEN', isDraft: false, headRefOid: A, headRefName: 'lane/x', baseRefName: 'main', labels: accepted };
+      const drain = (localSlug, at) => {
+        const calls = [];
+        const exec = (cmd, args) => {
+          calls.push(args.join(' '));
+          if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify(args[2] === '77' ? { state: 'OPEN', labels: waiting } : source);
+          throw new Error(`unexpected ${args.join(' ')}`);
+        };
+        const r = createCardGrouping({ localSlug, cwd: tmp(), run: () => { throw new Error('no git on this path'); }, exec, statePath, settings, log: { write: () => {} }, now: () => at }).reconcile();
+        return { r, calls };
+      };
+      expect(drain('o/foreign', T0).r).toMatchObject({ checked: 1 });
+      // Inside reconcileSec of the foreign pass, but this repo's groups were never re-read: they are re-read now.
+      expect(drain('o/r', T0 + 60_000).r).toMatchObject({ checked: 1 });
+      // Each repository's own stamp still throttles itself.
+      expect(drain('o/foreign', T0 + 90_000)).toEqual({ r: { checked: 0, throttled: true }, calls: [] });
+      expect(drain('O/R', T0 + 90_000)).toEqual({ r: { checked: 0, throttled: true }, calls: [] });
+      expect(drain('o/r', T0 + 60_000 + 120_000).r).toMatchObject({ checked: 1 });
+    });
+
     it.each([
       ['combined PR closed unmerged', { combined: { state: 'CLOSED', labels: [] } }, /combined PR closed without merging/, false],
       ['combined PR conflicts with main', { combined: { state: 'OPEN', labels: waiting, mergeable: 'CONFLICTING' } }, /combined PR conflicts/, true],

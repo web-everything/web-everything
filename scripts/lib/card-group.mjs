@@ -433,7 +433,10 @@ export function readGroupState(path, readFile = readFileSync) {
     if (!existsSync(path)) return { groups: [], failed: {} };
     const data = JSON.parse(readFile(path, 'utf8'));
     if (!data || !Array.isArray(data.groups)) return { unreadable: true };
-    return { groups: data.groups, failed: data.failed && typeof data.failed === 'object' ? data.failed : {}, lastReconcileAt: data.lastReconcileAt ?? 0 };
+    // `lastReconcileAt` is per repository ({ [repo]: ms }): one drain's pass must never throttle another repo's.
+    // A legacy single number has no owner, so it is dropped (each repo reconciles once more, then stamps its own).
+    const stamps = data.lastReconcileAt && typeof data.lastReconcileAt === 'object' && !Array.isArray(data.lastReconcileAt) ? data.lastReconcileAt : {};
+    return { groups: data.groups, failed: data.failed && typeof data.failed === 'object' ? data.failed : {}, lastReconcileAt: stamps };
   } catch { return { unreadable: true }; }
 }
 
@@ -564,7 +567,7 @@ export function createCardGrouping({
       const st = readGroupState(statePath, readFile);
       if (st.unreadable) return { ok: false, reason: 'state unreadable' };
       const result = fn(st);
-      writeJsonAtomic(statePath, { groups: st.groups, failed: st.failed, lastReconcileAt: st.lastReconcileAt ?? 0 });
+      writeJsonAtomic(statePath, { groups: st.groups, failed: st.failed, lastReconcileAt: st.lastReconcileAt ?? {} });
       return { ok: true, result };
     });
   };
@@ -615,9 +618,10 @@ export function createCardGrouping({
         // PR numbers and group IDs are repository-local, even when coordination state is shared.
         const groups = st.groups.filter(isLocalGroup);
         if (!groups.length) return { checked: 0 };
-        if (!force && now() - (st.lastReconcileAt ?? 0) < setting.reconcileSec * 1000) return { checked: 0, throttled: true };
+        const stampKey = repoIdentity(localSlug);
+        if (!force && now() - (st.lastReconcileAt?.[stampKey] ?? 0) < setting.reconcileSec * 1000) return { checked: 0, throttled: true };
         if (dryRun) return { checked: 0, dryRun: true };
-        mutate(s => { s.lastReconcileAt = now(); });
+        mutate(s => { s.lastReconcileAt = { ...s.lastReconcileAt, [stampKey]: now() }; });
         const done = [], dissolved = [];
         for (const g of groups) {
           const tag = `group ${g.id}${g.pr ? ` (#${g.pr})` : ''}`;

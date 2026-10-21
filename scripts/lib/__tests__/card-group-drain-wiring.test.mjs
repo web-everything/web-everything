@@ -126,11 +126,12 @@ describe('real drain card-group orchestration', () => {
   it('reconciles and attempts formation only on a whole merge-queue pass', () => world(({ run }) => {
     expect(run({ only: true }).state.lastReconcileAt).toBe(0);
     const full = run({ only: false });
-    expect(full.state.lastReconcileAt).toBeGreaterThan(0);
+    // The reconcile stamp is per repository, so another repo's drain never throttles this one.
+    expect(full.state.lastReconcileAt[slug]).toBeGreaterThan(0);
     // A non-card outcome reaches form(), which rejects it without a group or mutation.
     expect(full.state.groups).toHaveLength(1);
     // Reconcile runs under direct merging too (a group formed under the queue must still release its holds).
-    expect(run({ only: false, queue: false }).state.lastReconcileAt).toBeGreaterThan(0);
+    expect(run({ only: false, queue: false }).state.lastReconcileAt[slug]).toBeGreaterThan(0);
     // Malformed state makes form() return a visible reason, even with zero eligible outcomes.
     expect(run({ only: false, unreadable: true }).stderr).toContain('card-group: no group this pass — state unreadable');
     expect(run({ only: true, unreadable: true }).stderr).not.toContain('card-group: no group this pass');
