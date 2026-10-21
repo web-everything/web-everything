@@ -40,7 +40,7 @@ export async function rebuildClone({
   root, env = process.env, log = console, run = gitRun, runSmoke = runLiveSmokeWithRetry,
   prState = (pr) => defaultPrState({ pr, root }), lockOpts = {}, stateOpts = {}, mainOnly = false,
   now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke, readyOnly = false, adoptOnly = false,
-  asJob, admissionWaitMs,
+  asJob, admissionWaitMs, prMerge,
 } = {}) {
   // #4126 — the opted-in daemon's tick never smokes: it adopts a ready candidate (fast) and otherwise starts or
   // watches a detached rebuild JOB (`rebuild-job.mjs`). `asJob` undefined resolves from daemon-rebuild-settings.json
@@ -103,7 +103,7 @@ export async function rebuildClone({
     && pendingReady.prevHead === verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
   const startedMs = now();
   const prep = await withWriteLock(root, () => prepareRebuild({
-    root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider,
+    root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider, ...(prMerge ? { prMerge } : {}),
   }), readyOnHead ? finalizeLockOpts : admissionLockOpts);
 
   if (prep.ok) {

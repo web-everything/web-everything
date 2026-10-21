@@ -105,6 +105,27 @@ function slugFromOriginUrl(url) {
  * @param {{pr:number, root:string}} o
  * @returns {string|null}
  */
+/**
+ * overlay-rebase-on-merge: GitHub's own record of how a PR merged — `{state, baseRefName, mergeCommit}` (mergeCommit =
+ * its oid) — or null on any failure (then auto-rebase has no candidate: fail closed).
+ */
+export function defaultPrMerge({ pr, root }) {
+  if (pr == null) return null;
+  try {
+    const urlRes = spawnSync('git', ['remote', 'get-url', 'origin'], { cwd: root, encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL' });
+    const slug = urlRes.status === 0 ? slugFromOriginUrl(urlRes.stdout) : null;
+    if (!slug) return null;
+    const ghRes = spawnSync('gh', ['pr', 'view', String(pr), '--repo', slug, '--json', 'state,baseRefName,mergeCommit'], {
+      encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL',
+    });
+    if (ghRes.status !== 0) return null;
+    const j = JSON.parse(String(ghRes.stdout || 'null'));
+    return j ? { state: j.state ?? null, baseRefName: j.baseRefName ?? null, mergeCommit: j.mergeCommit?.oid ?? null } : null;
+  } catch {
+    return null;
+  }
+}
+
 export function defaultPrState({ pr, root }) {
   if (pr == null) return null;
   try {

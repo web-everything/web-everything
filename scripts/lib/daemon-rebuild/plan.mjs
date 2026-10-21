@@ -330,7 +330,7 @@ export async function planOverlayStacks({
 export async function planRebuild({
   git, headSha, mainRef, overlays = [], prState, mainOnly = false, edgeResolve = true,
   prBaseChain = null, prForcePushes = null, stackMode = 'tops', stackModeSource = 'standard', keepIndependent = new Set(),
-  noPin = new Set(), autoRebase = { mode: 'off', source: 'default' }, adoptedHeads = [],
+  noPin = new Set(), autoRebase = { mode: 'off', source: 'default' }, adoptedHeads = [], seenHeads = [], prMerge = null,
 }) {
   const mainSha = verifyRev(git, `${mainRef}^{commit}`);
   if (!mainSha) return { ok: false, reason: 'main-unresolved' };
@@ -615,9 +615,9 @@ export async function planRebuild({
         // proof (or no clean result) `on` sets it aside below instead of letting x9diisp freeze the whole clone.
         if (autoRebase.mode !== 'off' && git(['merge-tree', '--write-tree', '--no-messages', mainSha, ovSha]).status === 1) {
           const { candidates, mergedPrs } = await mergedPrOldHeads({
-            git, mainSha, ovSha, ovPr: pr, conflictFiles: files, stateOf, prForcePushes, adoptedHeads,
+            git, mainSha, ovSha, ovPr: pr, prMerge, adoptedHeads,
             otherHeads: [
-              ...adoptedHeads.filter((h) => !h.proven),
+              ...seenHeads, ...adoptedHeads.filter((h) => !h.proven),
               // an unresolvable registered tip is kept as `unresolved` (blocks, fail closed) — never silently ignored
               ...listed.filter((o) => o?.ref && o.ref !== ref).map((o) => {
                 const tip = verifyRev(git, `refs/remotes/origin/${o.ref}^{commit}`);
@@ -769,7 +769,7 @@ export async function planRebuild({
   if (lostBases.length > 0) {
     return planRebuild({
       git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
-      keepIndependent: new Set([...keepIndependent, ...lostBases]), noPin, autoRebase, adoptedHeads,
+      keepIndependent: new Set([...keepIndependent, ...lostBases]), noPin, autoRebase, adoptedHeads, seenHeads, prMerge,
     });
   }
 
@@ -840,7 +840,7 @@ export async function planRebuild({
   if (pinnedRefs.length > 0 && noPin.size === 0) {
     const alt = await planRebuild({
       git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
-      keepIndependent, noPin: new Set(pinnedRefs), autoRebase, adoptedHeads,
+      keepIndependent, noPin: new Set(pinnedRefs), autoRebase, adoptedHeads, seenHeads, prMerge,
     });
     const altApplied = new Set((alt.applied ?? []).map((a) => a.ref));
     if (alt.ok && (alt.establishedLost?.length ?? 0) === 0
@@ -860,7 +860,7 @@ export async function planRebuild({
     // heads, and the bases this plan already proved (so a fallback never quietly reverts to `off`).
     setAside: [...setAsideOnMain.keys()].filter((r) => decisions.some((d) => d.ref === r && d.action === 'drop')),
     autoRebaseCtx: {
-      autoRebase,
+      autoRebase, seenHeads, prMerge,
       adoptedHeads: [...adoptedHeads, ...applied.filter((a) => a.rebaseBase)
         .map((a) => ({ pr: a.mergedPr, sha: a.rebaseBase, proven: true, evidence: 'proven-this-tick' }))],
     },

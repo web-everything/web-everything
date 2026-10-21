@@ -23,7 +23,7 @@ import {
   readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, makePrBaseChain, resolveOverlayStackMode, persistStackBases,
   resolveOverlayAutoRebase,
 } from '../daemon-overlays.mjs';
-import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
+import { fetchMainAndOverlays, recordedEdgeSha, defaultPrMerge } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
 import { repairCloneRefs, holdsCloneWriteLock } from '../lane-repair.mjs';
@@ -40,6 +40,7 @@ import {
  */
 export async function prepareRebuild({
   root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes,
+  prMerge = (pr) => defaultPrMerge({ pr, root }),
 }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
@@ -263,46 +264,52 @@ export async function prepareRebuild({
   // Held item 212 — stacked overlay PRs apply as stacks (only their tops) unless `overlay.stackMode` says independent.
   // The PR base chains come from gh, else from each entry's recorded `stackBases`, else ancestry alone.
   const stack = resolveOverlayStackMode(env);
-  // overlay-rebase-on-merge — the overlay heads this clone's ADOPTED builds applied ({pr, sha}), accumulated from the
-  // rebuild state's own `adopted.applied` (written only at adoption, never read from commit text). NEVER truncated by
-  // count (a forgotten head would turn "foreign work inside X" into permission): an entry leaves only once main itself
-  // contains it, when it can no longer be content beyond main.
+  // overlay-rebase-on-merge — two memories, both from this clone's OWN rebuild state (never commit text), both NEVER
+  // truncated by count (an entry leaves only once main contains it, when it can no longer be content beyond main):
+  //   - `adoptedHeads`: the `{pr, sha}` ADOPTED builds applied (and bases an adopted auto-rebase proved) — the only
+  //     heads that may ever serve as a rebase base;
+  //   - `seenHeads`: every registered overlay tip seen before and after each fetch, built or not, stack bases included,
+  //     plus the adopted ones — used ONLY to refuse a base that shares another overlay's work (Codex rounds 7-9).
+  // A PR-less overlay is remembered as pr 0: never anyone's "own PR", so it always counts as foreign.
   const adoptedHeads = (() => {
-    const prev = Array.isArray(state.adoptedHeads) ? state.adoptedHeads : [];
-    const add = (state.adopted?.applied ?? []).flatMap((a) => [
-      // a PR-less overlay is remembered as pr 0: never anyone's "own PR", so it always counts as foreign
+    const tidy = (list) => {
+      const seen = new Set();
+      return list.filter((h) => Number.isInteger(h.pr) && /^[0-9a-f]{40}$/.test(h.sha)
+        && !seen.has(`${h.pr}:${h.sha}`) && seen.add(`${h.pr}:${h.sha}`)
+        && !(fetchedMainSha && git(['merge-base', '--is-ancestor', h.sha, fetchedMainSha]).status === 0));
+    };
+    const fromApplied = (state.adopted?.applied ?? []).flatMap((a) => [
       ...(typeof a?.sha === 'string' ? [{ pr: a.pr != null ? Number(a.pr) : 0, sha: a.sha }] : []),
       ...(a?.mergedPr != null && typeof a.rebaseBase === 'string' ? [{ pr: Number(a.mergedPr), sha: a.rebaseBase }] : []),
     ]);
-    // …and EVERY registered overlay tip, before and after this fetch, built or not — stack bases included, which never
-    // appear in `applied` (Codex rounds 7-8). Over-remembering only makes auto-rebase refuse more, never less.
-    for (const t of preFetchTips) add.push(t);
-    for (const o of overlaysBefore || []) {
+    const postFetchTips = (overlaysBefore || []).flatMap((o) => {
       const tip = o?.ref ? verifyRev(git, `refs/remotes/origin/${o.ref}^{commit}`) : null;
-      if (tip) add.push({ pr: o.pr != null ? Number(o.pr) : 0, sha: tip });
+      return tip ? [{ pr: o.pr != null ? Number(o.pr) : 0, sha: tip }] : [];
+    });
+    const prevA = Array.isArray(state.adoptedHeads) ? state.adoptedHeads : [];
+    const prevS = Array.isArray(state.seenHeads) ? state.seenHeads : [];
+    const adopted = tidy([...fromApplied, ...prevA]);
+    const seen = tidy([...preFetchTips, ...postFetchTips, ...fromApplied, ...prevS]);
+    if (JSON.stringify(adopted) !== JSON.stringify(prevA) || JSON.stringify(seen) !== JSON.stringify(prevS)) {
+      state.adoptedHeads = adopted; state.seenHeads = seen; writeState();
     }
-    const seen = new Set();
-    const next = [...add, ...prev].filter((h) => Number.isInteger(h.pr) && /^[0-9a-f]{40}$/.test(h.sha)
-      && !seen.has(`${h.pr}:${h.sha}`) && seen.add(`${h.pr}:${h.sha}`)
-      && !(fetchedMainSha && git(['merge-base', '--is-ancestor', h.sha, fetchedMainSha]).status === 0));
-    if (JSON.stringify(next) !== JSON.stringify(prev)) { state.adoptedHeads = next; writeState(); }
     // Keep every remembered head's objects alive (a GC root per head): a collected head could no longer be checked for
     // foreign work, and auto-rebase.mjs would then (correctly, fail closed) refuse every rebase. Best effort.
     try {
       const NS = 'refs/we-adopted-heads/';
       const have = new Set(String(git(['for-each-ref', '--format=%(refname)', NS]).stdout ?? '').split('\n').filter(Boolean));
-      const want = new Set(next.map((h) => `${NS}${h.sha}`));
-      for (const h of next) if (!have.has(`${NS}${h.sha}`)) git(['update-ref', `${NS}${h.sha}`, h.sha]);
+      const want = new Set([...adopted, ...seen].map((h) => `${NS}${h.sha}`));
+      for (const r of want) if (!have.has(r)) git(['update-ref', r, r.slice(NS.length)]);
       for (const r of have) if (!want.has(r)) git(['update-ref', '-d', r]);
     } catch { /* best effort: a missing object only makes auto-rebase fail closed */ }
-    return next;
+    return { adopted, seen };
   })();
   const chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysBefore, env });
   const plan = await planRebuild({
     git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysBefore, prState, mainOnly, edgeResolve,
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
-    autoRebase: resolveOverlayAutoRebase(env), adoptedHeads,
+    autoRebase: resolveOverlayAutoRebase(env), adoptedHeads: adoptedHeads.adopted, seenHeads: adoptedHeads.seen, prMerge,
   });
   // The chains gh answered completely are written back onto the entries (only when they changed), so a rebuild that
   // cannot reach gh later still knows the stacks. Best effort: a busy or unwritable list never fails the rebuild.

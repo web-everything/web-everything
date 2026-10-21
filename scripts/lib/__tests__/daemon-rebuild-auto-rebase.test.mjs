@@ -63,8 +63,11 @@ function fixture({ mode = 'on' } = {}) {
     gitOk(author, ['checkout', '-q', '-B', 'main', 'origin/main']);
     gitOk(author, ['merge', '-q', '--no-ff', '-m', `Merge pull request #${pr} from web-everything/${ref}`, sha]);
     gitOk(author, ['push', '-q', 'origin', 'HEAD:refs/heads/main']);
-    return gitOk(author, ['rev-parse', 'HEAD']).trim();
+    const mc = gitOk(author, ['rev-parse', 'HEAD']).trim();
+    mergeCommits.set(pr, mc);
+    return mc;
   };
+  const mergeCommits = new Map();
   const env = {
     ...process.env,
     WE_DAEMON_STATE_DIR: mktemp('we-auto-rebase-state-'),
@@ -74,13 +77,16 @@ function fixture({ mode = 'on' } = {}) {
   };
   const merged = new Set();
   const prState = async (pr) => (merged.has(pr) ? 'MERGED' : 'OPEN');
+  /** GitHub's record of how a PR merged (state, base, merge commit) — what auto-rebase demands as proof. */
+  const prMerge = async (pr) => (mergeCommits.has(pr) && (merged.has(pr) || pr === PR)
+    ? { state: 'MERGED', baseRefName: 'main', mergeCommit: mergeCommits.get(pr) } : { state: 'OPEN', baseRefName: 'main', mergeCommit: null });
   const logs = [];
   const smoke = vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [{ name: 'reconcile-dry-run', ok: true, ms: 10 }] } }));
-  const tick = () => rebuildClone({ root: clone, env, runSmoke: smoke, prState, log: { error: (m) => logs.push(m) } });
+  const tick = () => rebuildClone({ root: clone, env, runSmoke: smoke, prState, prMerge, log: { error: (m) => logs.push(m) } });
   const head = () => gitOk(clone, ['rev-parse', 'HEAD']).trim();
   const file = (f) => readFileSync(join(clone, f), 'utf8');
   const runGit = (args, opts = {}) => gitRun(args, { cwd: clone, env: { ...env, ...opts.env } });
-  return { clone, env, init, push, mergePr, merged, prState, tick, head, file, logs, smoke, runGit };
+  return { clone, env, init, push, mergePr, merged, prState, prMerge, tick, head, file, logs, smoke, runGit };
 }
 
 /**
@@ -182,7 +188,7 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     expect(second.alerts.map((a) => a.kind).filter((k) => /auto-rebase|set-aside/.test(k))).toEqual([]);
   });
 
-  it('planRebuild: a GitHub force-push `before` of a merged PR is proof too (the clone never ran that head)', async () => {
+  it('planRebuild: an adopted head of a PR GitHub shows merged into this main is proof; the rebase is exact', async () => {
     const f = fixture({ mode: 'on' });
     const x1 = f.push('lane/standing-ruling', f.init, { [GATE]: lines({ 2: 'grant v1' }) });
     const container = f.push('lane/container', x1, { 'container.txt': 'own\n', [GATE]: lines({ 2: 'grant v1', 10: 'own' }) });
@@ -191,12 +197,12 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     gitOk(f.clone, ['fetch', '-q', 'origin']);
     const plan = await planRebuild({
       git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref: 'lane/container', pr: 5801 }],
-      prState: async (pr) => (pr === PR ? 'MERGED' : 'OPEN'), prForcePushes: async (pr) => (pr === PR ? [{ before: x1, after: x2 }] : []),
+      prMerge: f.prMerge, adoptedHeads: [{ pr: PR, sha: x1 }],
       autoRebase: { mode: 'on', source: 'test' },
     });
     expect(plan.ok).toBe(true);
     expect(plan.decisions[0]).toMatchObject({ ref: 'lane/container', action: 'apply', reason: 'applied-auto-rebased' });
-    expect(plan.alerts.find((a) => a.kind === 'overlay-auto-rebased')?.detail.base).toMatchObject({ sha: x1, pr: PR, evidence: 'force-pushed' });
+    expect(plan.alerts.find((a) => a.kind === 'overlay-auto-rebased')?.detail.base).toMatchObject({ sha: x1, pr: PR, evidence: 'adopted-head' });
     expect(gitOk(f.clone, ['show', `${plan.finalSha}:${GATE}`])).toBe(lines({ 2: 'grant v2', 10: 'own' }));
     expect(isAncestor(f.clone, container, plan.finalSha)).toBe(true);
     expect(isAncestor(f.clone, mainSha, plan.finalSha)).toBe(true);
@@ -211,12 +217,14 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     gitOk(f.clone, ['fetch', '-q', 'origin']);
     const overlays = [{ ref: 'lane/container', pr: 5801 }];
     const plan = await planRebuild({
-      git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays, prState: async (pr) => (pr === PR ? 'MERGED' : 'OPEN'),
-      prForcePushes: async (pr) => (pr === PR ? [{ before: x1 }] : []), autoRebase: { mode: 'on', source: 'test' },
+      git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays, prMerge: f.prMerge, adoptedHeads: [{ pr: PR, sha: x1 }],
+      autoRebase: { mode: 'on', source: 'test' },
     });
-    expect(plan.autoRebaseCtx.adoptedHeads).toEqual([expect.objectContaining({ pr: PR, sha: x1, proven: true })]);
+    expect(plan.autoRebaseCtx.adoptedHeads).toEqual(expect.arrayContaining([expect.objectContaining({ pr: PR, sha: x1, proven: true })]));
     // a smoke fallback has no prState / force-push reader: the ctx alone must reproduce the same rebased build
-    const fallback = await planRebuild({ git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays, ...plan.autoRebaseCtx });
+    const fallback = await planRebuild({
+      git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays, ...plan.autoRebaseCtx, prMerge: async () => null,
+    });
     expect(fallback.decisions[0]).toMatchObject({ action: 'apply', reason: 'applied-auto-rebased' });
     expect(fallback.finalSha).toBe(plan.finalSha);
   });
@@ -234,7 +242,7 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     gitOk(f.clone, ['fetch', '-q', 'origin']);
     const plan = await planRebuild({
       git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref: 'lane/container', pr: 5801 }],
-      prState: async (pr) => (pr === PR ? 'MERGED' : 'OPEN'), prForcePushes: async (pr) => (pr === PR ? [{ before: x1h }, { before: x1 }] : []),
+      prMerge: f.prMerge, adoptedHeads: [{ pr: PR, sha: x1h }, { pr: PR, sha: x1 }],
       autoRebase: { mode: 'on', source: 'test' },
     });
     expect(plan.ok).toBe(true);
@@ -259,7 +267,7 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     const plan = await planRebuild({
       git: f.runGit, headSha: f.init, mainRef: 'origin/main',
       overlays: [{ ref: 'lane/foreign', pr: 5790 }, { ref: 'lane/container', pr: 5801 }], stackMode: 'independent',
-      prState: async (pr) => (pr === PR ? 'MERGED' : 'OPEN'), prForcePushes: async (pr) => (pr === PR ? [{ before: x1 }] : []),
+      prMerge: f.prMerge, adoptedHeads: [{ pr: PR, sha: x1 }],
       autoRebase: { mode: 'on', source: 'test' },
     });
     expect(plan.decisions.find((d) => d.ref === 'lane/container')).toMatchObject({ action: 'drop', reason: 'conflict' });
@@ -269,7 +277,7 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     expect(gitOk(f.clone, ['show', `${plan.finalSha}:foreign.txt`])).toBe('foreign behaviour\n');
   });
 
-  it('a force-push of a PR GitHub does not say is MERGED is no proof, whatever main\'s merge subjects claim (Codex round 2)', async () => {
+  it('a PR GitHub does not show merged INTO this main is no proof, whatever main\'s merge subjects claim (Codex rounds 2/9)', async () => {
     const f = fixture({ mode: 'on' });
     const x1 = f.push('lane/standing-ruling', f.init, { [GATE]: lines({ 2: 'grant v1' }) });
     f.push('lane/container', x1, { [GATE]: lines({ 2: 'grant v1', 10: 'own' }) });
@@ -278,7 +286,8 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     gitOk(f.clone, ['fetch', '-q', 'origin']);
     const plan = await planRebuild({
       git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref: 'lane/container', pr: 5801 }],
-      prState: async () => 'OPEN', prForcePushes: async () => [{ before: x1 }], autoRebase: { mode: 'on', source: 'test' },
+      prMerge: async () => ({ state: 'MERGED', baseRefName: 'release', mergeCommit: null }), adoptedHeads: [{ pr: PR, sha: x1 }],
+      autoRebase: { mode: 'on', source: 'test' },
     });
     expect(plan.decisions[0]).toMatchObject({ action: 'drop', reason: 'conflict' });
     expect(plan.alerts.map((a) => a.kind)).toContain('overlay-set-aside');
@@ -297,7 +306,7 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     gitOk(f.clone, ['fetch', '-q', 'origin']);
     const plan = await planRebuild({
       git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref: 'lane/container', pr: 5801 }],
-      prState: async (pr) => (pr === PR ? 'MERGED' : 'OPEN'), prForcePushes: async (pr) => (pr === PR ? [{ before: x1 }] : []),
+      prMerge: f.prMerge, adoptedHeads: [{ pr: PR, sha: x1 }],
       autoRebase: { mode: 'on', source: 'test' },
     });
     expect(plan.decisions[0]).toMatchObject({ action: 'drop', reason: 'conflict' });
@@ -314,11 +323,11 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     gitOk(f.clone, ['fetch', '-q', 'origin']);
     const base = {
       git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref: 'lane/container', pr: 5801 }],
-      prState: async (pr) => (pr === PR ? 'MERGED' : 'OPEN'), prForcePushes: async (pr) => (pr === PR ? [{ before: x1 }] : []),
+      prMerge: f.prMerge, adoptedHeads: [{ pr: PR, sha: x1 }],
       autoRebase: { mode: 'on', source: 'test' },
     };
     expect((await planRebuild(base)).decisions[0]).toMatchObject({ reason: 'applied-auto-rebased' });
-    const gone = await planRebuild({ ...base, adoptedHeads: [{ pr: 4242, sha: 'deadbeef'.repeat(5) }] });
+    const gone = await planRebuild({ ...base, seenHeads: [{ pr: 4242, sha: 'deadbeef'.repeat(5) }] });
     expect(gone.decisions[0]).toMatchObject({ action: 'drop', reason: 'conflict' });
     expect(gone.alerts.map((a) => a.kind)).toContain('overlay-set-aside');
     // a registered overlay whose tip cannot be resolved blocks too (Codex round 5)
@@ -338,7 +347,7 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     const plan = await planRebuild({
       git: f.runGit, headSha: f.init, mainRef: 'origin/main', stackMode: 'independent',
       overlays: [{ ref: 'lane/foreign', pr: 5790 }, { ref: 'lane/container', pr: 5801 }],
-      prState: async (pr) => (pr === PR ? 'MERGED' : 'OPEN'), prForcePushes: async (pr) => (pr === PR ? [{ before: x1 }] : []),
+      prMerge: f.prMerge, adoptedHeads: [{ pr: PR, sha: x1 }],
       autoRebase: { mode: 'on', source: 'test' },
     });
     expect(plan.alerts.find((a) => a.kind === 'overlay-auto-rebased')?.detail.ref).not.toBe('lane/container');
@@ -355,8 +364,8 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     gitOk(f.clone, ['fetch', '-q', 'origin']);
     const plan = await planRebuild({
       git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref: 'lane/container', pr: 5801 }],
-      adoptedHeads: [{ pr: 5801, sha: hq }],
-      prState: async (pr) => (pr === PR ? 'MERGED' : 'OPEN'), prForcePushes: async (pr) => (pr === PR ? [{ before: x1 }] : []),
+      seenHeads: [{ pr: 5801, sha: hq }],
+      prMerge: f.prMerge, adoptedHeads: [{ pr: PR, sha: x1 }],
       autoRebase: { mode: 'on', source: 'test' },
     });
     expect(plan.decisions[0]).toMatchObject({ action: 'drop', reason: 'conflict' });
@@ -370,7 +379,7 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     addOverlay(f.clone, { ref: 'lane/foreign', pr: 5790 }, { env: f.env });
     addOverlay(f.clone, { ref: 'lane/standing-ruling', pr: PR }, { env: f.env });
     expect(await f.tick()).toMatchObject({ adopted: true }); // the foreign base is stack-contained: not in `applied`
-    expect(readRebuildState(f.clone, f.env).adoptedHeads).toEqual(expect.arrayContaining([expect.objectContaining({ pr: 5790, sha: h })]));
+    expect(readRebuildState(f.clone, f.env).seenHeads).toEqual(expect.arrayContaining([expect.objectContaining({ pr: 5790, sha: h })]));
     // no extra tick (Codex round 8): the base is rewritten right after the adopting tick
     f.push('lane/foreign', f.init, { 'foreign.txt': 'rewritten\n' }); // the foreign branch is rewritten away from h
     f.push('lane/container', x1, { [GATE]: lines({ 2: 'grant v1', 10: 'own' }) });
@@ -381,5 +390,28 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     const r = await f.tick();
     expect(r.alerts.map((a) => a.kind)).not.toContain('overlay-auto-rebased');
     expect(r.alerts.map((a) => a.kind)).not.toContain('established-overlay-hold');
+  });
+
+  it('round 9: a head of the rebased overlay AT X blocks; a merely-seen tip is never a base', async () => {
+    const f = fixture({ mode: 'on' });
+    const x1 = f.push('lane/standing-ruling', f.init, { [GATE]: lines({ 2: 'grant v1' }) });
+    f.push('lane/container', x1, { [GATE]: lines({ 2: 'grant v1', 10: 'own' }) });
+    const x2 = f.push('lane/standing-ruling', f.init, { [GATE]: lines({ 2: 'grant v2' }) });
+    f.mergePr(PR, x2, 'lane/standing-ruling');
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const base = {
+      git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref: 'lane/container', pr: 5801 }],
+      prMerge: f.prMerge, autoRebase: { mode: 'on', source: 'test' },
+    };
+    expect((await planRebuild({ ...base, adoptedHeads: [{ pr: PR, sha: x1 }] })).decisions[0]).toMatchObject({ reason: 'applied-auto-rebased' });
+    // the container itself once sat exactly at x1 (its own feature could be x1's content) → blocks
+    const ownAtX = await planRebuild({ ...base, adoptedHeads: [{ pr: PR, sha: x1 }], seenHeads: [{ pr: 5801, sha: x1 }] });
+    expect(ownAtX.decisions[0]).toMatchObject({ action: 'drop', reason: 'conflict' });
+    // only SEEN (never adopted) as the PR's tip → no candidate at all
+    const seenOnly = await planRebuild({ ...base, seenHeads: [{ pr: PR, sha: x1 }] });
+    expect(seenOnly.decisions[0]).toMatchObject({ action: 'drop', reason: 'conflict' });
+    // GitHub unreachable → no proof → set aside
+    const noGh = await planRebuild({ ...base, prMerge: async () => null, adoptedHeads: [{ pr: PR, sha: x1 }] });
+    expect(noGh.decisions[0]).toMatchObject({ action: 'drop', reason: 'conflict' });
   });
 });
