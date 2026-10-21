@@ -372,6 +372,38 @@ describe('ignoredRulings — an older-head block the current-head reviewer ruled
     expect(ignoredRulings({ headRefOid: H3, comments: [...history, comment(record({ head: H2, runId: 'run-2' }), 10), comment(r2, 12),
       comment(record({ head: H3, runId: 'run-3' }), 20)] })?.matches).toHaveLength(1);
   });
+
+  // PR #5762 @5eba5a13 (2026-10-21): the reviewer carried a finding onto the new head for re-check; the head it was
+  // carried from had ruled it not-real with evidence after the old block. That is a pending re-check, not "came back".
+  describe('a re-check carried from a head that ruled the finding not-real', () => {
+    const recheck = (fromHead, rec) => ({ ...rec, referrals: rec.referrals.map((f) => ({ ...f,
+      recheck: { status: 'needs re-check on live head', fromHead, head: rec.head } })) });
+    const r2 = (rulings) => record({ head: H2, runId: 'run-2', rulings });
+    it('raises no dispute, and the finding stays pending (still holds acceptance)', () => {
+      const comments = [...history, comment(r2([]), 10), comment(r2([fixed]), 12), comment(recheck(H2, record({ head: H3, runId: 'run-3' })), 20)];
+      expect(ignoredRulings({ headRefOid: H3, comments })).toBeNull();
+      expect(ignoredRulings({ headRefOid: H3, comments }, { humanAt: 1 })).toBeNull();
+      expect(rulingNeeded({ headRefOid: H3, comments })?.findings).toEqual([expect.objectContaining({ reason: 'pending', file: 'policy/pointer.md' })]);
+    });
+    it('still came back when the source head ruled it block, left it open, or re-blocked it (controls)', () => {
+      const h3 = comment(recheck(H2, record({ head: H3, runId: 'run-3' })), 20);
+      expect(ignoredRulings({ headRefOid: H3, comments: [...history, comment(r2([]), 10), comment(r2([block]), 12), h3] })?.matches).toHaveLength(1);
+      expect(ignoredRulings({ headRefOid: H3, comments: [...history, comment(r2([]), 10), h3] })?.matches).toHaveLength(1);
+      // carried from the block's own head: the block is the latest ruling in its lineage
+      expect(ignoredRulings({ headRefOid: H2, comments: [...history, comment(recheck(H1, record({ head: H2, runId: 'run-2' })), 20)] })?.matches).toHaveLength(1);
+      // a not-real on H2 that came BEFORE a later block (on H2's own run, superseded) does not clear it
+      const reblock = { ...block, supersedes: ['r0'] };
+      expect(ignoredRulings({ headRefOid: H3, comments: [...history, comment(r2([fixed]), 10), comment(r2([fixed, reblock]), 12), h3] })?.matches).toHaveLength(1);
+    });
+    it('replay #5762 @5eba5a13: no false dispute; the re-checked finding is pending', () => {
+      const fx = fixture('pr-5762-5eba5a13-recheck-after-not-real.json');
+      const pr = { number: fx.pr, headRefOid: fx.headRefOid, body: fx.body, createdAt: fx.createdAt, comments: fx.comments };
+      expect(ignoredRulings(pr)).toBeNull();
+      const need = rulingNeeded(pr);
+      expect(need.findings.filter((f) => f.reason === 'dispute')).toEqual([]);
+      expect(need.findings.map((f) => f.summary)).toContain("Reconciliation processes foreign-repository groups using the current repository's PR numbers.");
+    });
+  });
 });
 
 describe('similarity', () => {
