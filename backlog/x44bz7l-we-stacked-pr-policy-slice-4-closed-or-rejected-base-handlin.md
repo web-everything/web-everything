@@ -13,6 +13,8 @@ tags: []
 
 When a stacked child's base PR is closed or rejected, rebase a low-risk child onto main only on a clean rebase with an unchanged delta fingerprint (a setting); every other child goes to the operator as needs-you. Ruled in xv85eqi.
 
+The auto-rebase also removes the closed base from the child's durable stack edge. A Git rebase does not touch it: the edge is the `stackParents` entry in the child's lane manifest, and the drain (`planLabelDrain`) keeps waiting on a parent that never lands. So the recovery removes the closed base from every manifest source the drain reads. That means the PR-body lane manifest (rewritten with the existing `embedManifestInBody`) and, when the body carries none, the legacy head-ref `we:.lane-manifest.json`.
+
 ## Acceptance
 
 - [A1] **Executable** — `node --test` on we:scripts/lib/__tests__/pr-merge-gate-base-closed.test.mjs fails before and passes after. Named tests, one per guarantee:
@@ -22,6 +24,11 @@ When a stacked child's base PR is closed or rejected, rebase a low-risk child on
   - `base closed: a normal or guard child always goes to the operator`.
   - `base closed: gate-feeding settings and mixed docs-plus-guard children go to the operator even when settings and docs are in lowRiskClasses` (reuse slice 1's path-derived class precedence).
   - `base closed: an auto-rebased child receives no review:accepted label or carried approval from the rebase and must pass review, CI and proof-of-land gates for its new head` (integration through the rebase handler and drain, with a clean rebase and unchanged fingerprint; stale acceptance on the old head cannot authorize the new head).
+  - `base closed: an auto-rebased child has the closed base removed from stackParents in every manifest source the drain reads, and planLabelDrain no longer defers it on that base` (integration through the rebase handler and the real `planLabelDrain`, with a clean rebase and unchanged fingerprint. Cover the PR-body manifest and the legacy head-ref manifest. The plan's `deferred` entry for the child names no `waitOn` on the closed base, on either `stackParents` or `blockedBy`).
+  - `base closed: only the closed base's edge is removed; every other stackParents and blockedBy edge of the child is kept`.
+  - `base closed: a child whose blockedBy also names the closed base's item goes to the operator, never an automatic edge removal`.
+  - `base closed: a child sent to the operator keeps its stack edge, so the drain never lands it until the operator acts`.
+  - `base closed: a manifest update that fails, is partial, or does not land with the rebase push sends the child to the operator, never leaving a rebased child that still waits on the closed base`.
   - `base rejected is handled the same as closed`.
   - `the auto-rebase behaviour follows the setting; turning it off sends every child to the operator`.
   - `an unreadable base state fails closed to the operator`.
@@ -49,8 +56,8 @@ One line per class: either the handling, or `n/a: <why>`.
 
 1. **Untrusted text** — class and fingerprint come from the diff and paths, not PR text.
 2. **Truncated reads** — an incomplete diff or state read goes to the operator.
-3. **Shared state files** — adds no new shared file; the operator route uses the existing needs-you channel.
-4. **Fail closed** — any unknown goes to the operator, never to an automatic rebase.
+3. **Shared state files** — adds no new shared file; the operator route uses the existing needs-you channel. The only durable write is removing the closed base from the child's lane manifest (PR body, and the legacy head-ref file when the body has none). The removal lands with the rebase push or the child goes to the operator.
+4. **Fail closed** — any unknown goes to the operator, never to an automatic rebase. A failed or partial stack-edge removal also goes to the operator, and a child routed there keeps its edge.
 5. **Identity scoping** — only trusted same-actor lane PRs are handled automatically.
 6. **State over time** — evaluated when the base closes; a later reopen re-evaluates.
 7. **Who wrote it** — an automation's comment never marks a child low-risk.
