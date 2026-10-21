@@ -142,6 +142,24 @@ export function loadPreventionBatchSettings({
   return resolvePreventionBatchSettings({ standard: loadCardBatchPolicy().prevention, platform, repo, env });
 }
 
+/**
+ * Minutes to wait before re-arming a seal whose verify did not RUN (host capacity, not a code failure). Same layers as
+ * the keys above (standard 15 → platform → repo → env `WE_CARDS_BATCH_VERIFY_RETRY_MINUTES`); invalid layers are skipped.
+ */
+export const DEFAULT_VERIFY_RETRY_MINUTES = 15;
+export function resolveVerifyRetryMinutes({ platform, repo, env } = {}) {
+  let minutes = DEFAULT_VERIFY_RETRY_MINUTES;
+  const raw = env?.WE_CARDS_BATCH_VERIFY_RETRY_MINUTES;
+  for (const layer of [platform, repo, raw === undefined || raw === '' ? undefined : { batchVerifyRetryMinutes: /^\d+$/.test(String(raw)) ? Number(raw) : raw }]) {
+    if (isObject(layer) && validValue('batchVerifyRetryMinutes', layer.batchVerifyRetryMinutes)) minutes = layer.batchVerifyRetryMinutes;
+  }
+  return minutes;
+}
+export function loadVerifyRetryMinutes({ env = process.env, read = readFileSync, platformPath = PLATFORM_PREFERENCES_PATH,
+  repo = (() => { try { return readSettings()?.cards; } catch { return undefined; } })() } = {}) {
+  return resolveVerifyRetryMinutes({ platform: readCards(platformPath, read), repo, env });
+}
+
 /** The full policy with independent filing and prevention settings overlays. */
 export function effectiveCardBatchPolicy(settings = loadCardBatchSettings(), prevention = loadPreventionBatchSettings()) {
   return loadCardBatchPolicy({
