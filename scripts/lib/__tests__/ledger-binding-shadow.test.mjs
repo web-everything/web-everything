@@ -152,6 +152,14 @@ describe('the drain shadow journals binding disagreements and legacy approvals',
     expect(res.ok).toBe(true);
     expect(res.rows[0].binding.status).toBe('agree');
   });
+  it('the budget clock starts at the first fold, not before a slow store read (live drain: every pass skipped)', async () => {
+    const rows = rt([V(VERDICTS.ACCEPTED, A)]);
+    const slowRead = () => new Promise((done) => { setTimeout(() => done({ status: 'ok', rows, store: { name: 'git' } }), 80); });
+    const res = await runLedgerShadow({ verdicts: [{ ...verdict(A), repo: 'o/n' }], dryRun: true, bindingBudgetMs: 30,
+      readEvents: slowRead, readiness: () => ({ ok: true, measure: {} }) });
+    expect(fold.calls).toBe(1);
+    expect(res.rows[0].binding.status).toBe('agree');
+  });
   it('the pass budget is shared: a slow first fold spends it and the next PR is skipped, not folded', async () => {
     const rows = rt([V(VERDICTS.ACCEPTED, A), { ...V(VERDICTS.ACCEPTED, A), pr: 8 }]);
     fold.busyMs = 40;

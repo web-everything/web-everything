@@ -30,6 +30,7 @@
 import { decideLedgerGate, DEFAULT_REVIEW_AUTHORITY } from './pr-merge-gate.mjs';
 import { foldVerdictLedger, readLedgerEventsFromStore } from './verdict-ledger.mjs';
 import { derivePrState } from './pr-state.mjs';
+import { readLedgerBindingSettings } from './ledger-binding-settings.mjs';
 import { newRunRecord } from '../operations/run-record.mjs';
 import { newRunId, writeRun } from '../operations/run-store.mjs';
 import { readShadowRuns, measureReadiness, resolvePromotionSettings, formatReadinessLine } from './ledger-promotion-readiness.mjs';
@@ -95,7 +96,7 @@ export function classifyHoldCodes(codes, facts) {
  * @param {{verdict: object, repo: string, events: (object[]|null), now?: string}} o
  *   `events` is the repo's ledger rows, or `null` when the store read failed (unreadable, never empty).
  */
-export function shadowRow({ verdict, repo, events, now = new Date().toISOString(), binding = true }) {
+export function shadowRow({ verdict, repo, events, now = new Date().toISOString(), binding = true, bindingCaps }) {
   const pr = Number(verdict?.num);
   const head = verdict?.listedHeadSha || verdict?.headSha || null;
   const labelsClear = verdict?.decision === 'merge';
@@ -114,7 +115,7 @@ export function shadowRow({ verdict, repo, events, now = new Date().toISOString(
       folded = foldVerdictLedger(verdictRows).get(pr) ?? { pr, repo, current: null, clears: false, history: [], outstandingHolds: [] };
       // Only `head.sha` and `now` are read by the hold rules; the empty lists keep the phase core from crashing on absent facts.
       derived = derivePrState(events, { pr, repo, head: { sha: head }, now, state: 'OPEN', requiredChecks: [], sessions: [], handoffs: [], refusals: [] },
-        { bindingShadow: binding }); // #5492 rebuild slice 3: the binding answer beside today's (journaled, never decided on)
+        { bindingShadow: binding, bindingCaps }); // #5492 rebuild slice 3: the binding answer beside today's (journaled, never decided on)
     } catch { folded = null; derived = null; }
   }
   const ledger = decideLedgerGate({ folded, derived, head, labelsClear, authority: 'ledger' });
@@ -213,10 +214,17 @@ function withTimeout(promise, ms) {
  */
 export async function runLedgerShadow({ verdicts = [], localSlug = null, dryRun = false, readEvents = readLedgerEventsFromStore,
   write = writeRun, mintId = newRunId, now = () => new Date().toISOString(), timeoutMs = LEDGER_READ_TIMEOUT_MS, readiness = defaultReadiness,
-  bindingBudgetMs = BINDING_PASS_BUDGET_MS } = {}) {
+  bindingBudgetMs, bindingSettings = readLedgerBindingSettings } = {}) {
   try {
     const at = now();
-    const bindingDeadline = Date.now() + (Number.isFinite(bindingBudgetMs) ? bindingBudgetMs : BINDING_PASS_BUDGET_MS);
+    // The budget covers the FOLDS only: its clock starts at the first fold, after the store read (a 17k-row git read
+    // alone outlasted a 2 s budget started here, so every pass skipped every PR — live drain, 2026-10-21).
+    // Budget and caps are `ledgerBinding` settings (cascade, value + source logged); an explicit argument wins (tests).
+    const policy = bindingSettings().value;
+    const budgetMs = Number.isFinite(bindingBudgetMs) ? bindingBudgetMs : policy.shadowPassBudgetMs ?? BINDING_PASS_BUDGET_MS;
+    const bindingCaps = { maxRows: policy.shadowMaxRows, maxBytes: policy.shadowMaxBytes, maxCarries: policy.shadowMaxCarries };
+    let bindingDeadline = null;
+    const foldAllowed = () => Date.now() < (bindingDeadline ??= Date.now() + budgetMs);
     const byRepo = new Map();
     for (const v of verdicts) {
       if (!v || !Number.isInteger(Number(v.num))) continue;
@@ -234,7 +242,7 @@ export async function runLedgerShadow({ verdicts = [], localSlug = null, dryRun 
       stores[repo] = events ? { status: 'ok', name: read.store?.name ?? null, shared: read.store?.shared === true, rows: events.length }
         : { status: 'unreadable', name: read?.store?.name ?? null, reason: read?.reason ?? 'unknown', error: String(read?.error ?? '').slice(0, 200) };
       // Slice 3: the binding folds share ONE wall-clock budget per pass; PRs past it are journaled `skipped`, never folded.
-      for (const v of vs) rows.push(shadowRow({ verdict: v, repo, events, now: at, binding: Date.now() < bindingDeadline }));
+      for (const v of vs) rows.push(shadowRow({ verdict: v, repo, events, now: at, binding: foldAllowed(), bindingCaps }));
     }
     const summary = summarizeShadow(rows);
     if (dryRun) return { ok: true, written: false, summary, rows, stores };
